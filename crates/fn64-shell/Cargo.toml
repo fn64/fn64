@@ -1,0 +1,16 @@
+[package]
+name = "fn64-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "fn64's executable: window, input, audio out, ROM/RecompiledFuncs intake. See docs/DESIGN.md section 1."
+
+[[bin]]
+name = "fn64"
+path = "src/main.rs"
+
+[dependencies]
+fn64-runtime = { path = "../fn64-runtime" }
+fn64-abi = { path = "../fn64-abi" }
+fn64-rt64 = { path = "../fn64-rt64" }
