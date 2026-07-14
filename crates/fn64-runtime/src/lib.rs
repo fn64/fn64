@@ -11,14 +11,18 @@
 
 pub mod executor;
 pub mod mesgqueue;
+pub mod overlay;
 pub mod rdram;
+pub mod rom;
 pub mod thread;
 pub mod timer;
 pub mod trace;
 
 pub use executor::{Executor, ExternalEvent, RecvMesgOutcome, SendMesgOutcome};
 pub use mesgqueue::{Mesg, MesgQueue, RecvResult, SendResult};
+pub use overlay::{FuncEntry, Section, SectionIndex, SectionRegistry};
 pub use rdram::{Rdram, RdramAddr};
+pub use rom::{DmaCompletion, InMemoryRom, PiDma, RomStorage};
 pub use thread::{GameThread, Priority, Resume, RunToken, ThreadState, Yield, OS_PRIORITY_IDLE};
 pub use timer::{TimerId, TimerWheel};
 pub use trace::{
