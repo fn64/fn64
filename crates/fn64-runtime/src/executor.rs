@@ -128,6 +128,13 @@ impl Executor {
         self.trace.events()
     }
 
+    /// Arm incremental crash-safe trace flushing -- see
+    /// `TraceLog::set_sink_file`'s doc comment for why this exists (a
+    /// SIGSEGV mid-boot must not lose the whole session's trace).
+    pub fn set_trace_sink_file(&mut self, path: &str) -> std::io::Result<()> {
+        self.trace.set_sink_file(path)
+    }
+
     pub fn sim_time(&self) -> u64 {
         self.sim_time
     }

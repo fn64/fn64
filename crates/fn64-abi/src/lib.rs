@@ -1543,6 +1543,17 @@ pub fn copy_trace() -> Vec<fn64_runtime::TraceEvent> {
     with_executor(|exec| exec.trace().to_vec())
 }
 
+/// Arm incremental crash-safe trace flushing -- every trace event recorded
+/// from this call onward is appended+flushed to `path` immediately, not
+/// just buffered in memory for `copy_trace`'s end-of-run snapshot. Call
+/// this BEFORE booting thread 0, so a SIGSEGV/abort mid-boot still leaves
+/// every event up to the crash on disk. See
+/// `fn64_runtime::TraceLog::set_sink_file`'s doc comment for the incident
+/// (WM2000 rung-3 frontier) this fixes.
+pub fn set_trace_sink_file(path: &str) -> std::io::Result<()> {
+    with_executor(|exec| exec.set_trace_sink_file(path))
+}
+
 /// The executor's current virtual-clock reading.
 pub fn sim_time() -> u64 {
     with_executor(|exec| exec.sim_time())

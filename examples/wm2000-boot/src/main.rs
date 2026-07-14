@@ -172,6 +172,23 @@ fn main() {
     // per field is an arbitrary but documented choice for this harness.
     fn64_abi::arm_vi_retrace(1000);
 
+    // Arm crash-safe incremental trace flushing BEFORE booting thread 0 --
+    // a SIGSEGV mid-boot (as rung 3 hit) must not lose the whole session's
+    // trace; every event from here on is appended+flushed to disk as it's
+    // recorded, not just buffered for the end-of-run `write_trace_file`
+    // call below (which still runs too, on a clean exit, and rewrites the
+    // same path from the in-memory copy -- harmless, since by then the
+    // incremental sink already has every event that copy will contain).
+    const TRACE_PATH: &str = "/tmp/wm2000-boot-trace.jsonl";
+    if let Err(e) = fn64_abi::set_trace_sink_file(TRACE_PATH) {
+        eprintln!(
+            "[wm2000-boot] WARNING: failed to arm incremental trace sink at {TRACE_PATH}: {e} -- \
+             a crash mid-boot will lose the trace (falling back to end-of-run-only)."
+        );
+    } else {
+        println!("[wm2000-boot] incremental trace sink armed at {TRACE_PATH}");
+    }
+
     // rdram: this process's one shared buffer (docs/DESIGN.md section 3).
     const RDRAM_SIZE: usize = 8 * 1024 * 1024;
     let mut rdram = vec![0u8; RDRAM_SIZE];
@@ -295,8 +312,8 @@ fn main() {
 
     let trace = fn64_abi::copy_trace();
     println!("[wm2000-boot] trace events recorded: {}", trace.len());
-    write_trace_file(&trace, "/tmp/wm2000-boot-trace.jsonl");
-    println!("[wm2000-boot] trace written to /tmp/wm2000-boot-trace.jsonl");
+    write_trace_file(&trace, TRACE_PATH);
+    println!("[wm2000-boot] trace written to {TRACE_PATH}");
 }
 
 /// Hash the fb region (a fixed-size guess: 320x240 RGBA5551 = 153600 bytes,
