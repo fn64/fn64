@@ -7,3 +7,9 @@ repository.workspace = true
 description = "fn64 core: scheduler, OSMesgQueue, timers, PI/SI/VI/AI plumbing, rdram model, overlays. See docs/DESIGN.md."
 
 [dependencies]
+# Stackful coroutines: docs/DESIGN.md section 2 option (b), the load-bearing
+# choice ("Recommendation: (b), single executor + stackful coroutines"). No
+# deviation from what DESIGN.md names -- corosensei gives each OSThread a
+# real machine stack switched to/from cooperatively on one host thread, which
+# is exactly the property that makes rung-18-class races unrepresentable.
+corosensei = "0.3"

@@ -14,3 +14,8 @@ crate-type = ["lib", "staticlib"]
 
 [dependencies]
 fn64-runtime = { path = "../fn64-runtime" }
+# Needed to name `corosensei::Yielder<Resume, Yield>`'s type directly (the
+# active-coroutine-suspend plumbing in src/lib.rs) -- same crate/version
+# fn64-runtime uses, per docs/DESIGN.md section 2's single stackful-
+# coroutine model; not a second, competing coroutine implementation.
+corosensei = "0.3"
