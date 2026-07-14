@@ -842,11 +842,35 @@ pub unsafe extern "C" fn osCartRomInit_recomp(_rdram: *mut u8, _ctx: *mut Recomp
 /// host-side injection point" every other completion source uses
 /// (`docs/DESIGN.md` section 2).
 ///
+/// ## Correction (2026-07-14): must set `ctx.r2` (the `$v0` return value)
+///
+/// A prior wave never wrote a return value at all, leaving `ctx.r2` at
+/// whatever stale value the caller's own earlier computation left there.
+/// Real `osEPiStartDma` returns `s32`: 0 on successful enqueue, -1 if
+/// `!__osPiDevMgr.active` (byte-identical shape confirmed against WCW
+/// Revenge's `func_800219B0`,
+/// `aki-recomp/refs/WCWnWoRevengeRecomp/disasm/libultra.md` ~line 213).
+/// `examples/wm2000-boot`'s real boot run surfaced the consequence: the
+/// chunked-DMA loop in NWXE's `func_80000660`
+/// (`aki-recomp/games/NWXE/RecompiledFuncs/funcs_0.c`, asm
+/// 0x800006E4-0x800006FC) re-issues `osEPiStartDma` while `$v0 != 0` and
+/// only falls through to a blocking `osRecvMesg` once `$v0` reads exactly
+/// 0 -- with `ctx.r2` never written, that test read garbage left over from
+/// an earlier instruction (observed non-zero), so the loop re-issued the
+/// same DMA chunk forever: a real, tens-of-seconds unbounded native loop,
+/// not a missing host model. This shim performs every DMA synchronously
+/// and has no failure path today (`with_pi_dma` panics rather than
+/// returning -1 when no ROM is installed, and `FromRdram` is an explicit
+/// `unimplemented!()`), so every path that reaches the end of this
+/// function represents success -- `ctx.r2 = 0` unconditionally there. A
+/// real `-1` return only matters if/when this shim grows genuine
+/// asynchronous PI-bus contention modeling, out of scope this wave.
+///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
-    let ctx = unsafe { &*ctx };
+    let ctx = unsafe { &mut *ctx };
     let mb_addr = RdramAddr::from_gpr(ctx.r5);
     let direction = if ctx.r6 == 0 {
         DmaDirection::ToRdram
@@ -938,6 +962,12 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
         });
     }
     let _ = completion;
+
+    // Every path reaching here completed the DMA synchronously and
+    // successfully -- see the doc comment's "Correction (2026-07-14)" for
+    // why this must be written at all (a stale, unwritten $v0 caused a
+    // real infinite retry loop in NWXE's chunked-DMA caller).
+    ctx.r2 = 0;
 }
 
 /// `osVirtualToPhysical(void* vaddr) -> u32` -- KSEG0/1 virtual-to-physical
@@ -2235,6 +2265,40 @@ mod tests {
         // offset; the copied bytes confirm the DMA itself used the right
         // dramAddr/devAddr/len too.
         assert_eq!(&rdram[0x5000..0x5004], &[0xAB, 0xAB, 0xAB, 0xAB]);
+    }
+
+    /// Regression test for the real infinite-loop bug `examples/wm2000-boot`
+    /// surfaced (2026-07-14): `osEPiStartDma_recomp` never wrote `ctx.r2`
+    /// ($v0), so NWXE's chunked-DMA caller (`func_80000660`, asm
+    /// 0x800006E4-0x800006FC: `bne $v0, $zero, L_800006E4`) read whatever
+    /// stale value `r2` already held and looped forever instead of falling
+    /// through to `osRecvMesg`. Seed `ctx.r2` with a realistic STALE
+    /// NON-ZERO value beforehand (mirroring the real caller's register
+    /// state at the call site) so a regression that stops writing `ctx.r2`
+    /// would fail this test even though a zero-initialized `ctx` would
+    /// have hidden the bug.
+    #[test]
+    fn os_epi_start_dma_writes_zero_return_value_even_with_stale_nonzero_r2() {
+        load_rom(vec![0xCDu8; 0x1000]);
+
+        let mut rdram = vec![0u8; 0x10000];
+        let mb_offset = 0x2000usize;
+        rdram[mb_offset + 0x4..mb_offset + 0x8].copy_from_slice(&0u32.to_ne_bytes());
+        rdram[mb_offset + 0xC..mb_offset + 0x10].copy_from_slice(&0x8000_5000u32.to_ne_bytes());
+        rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&0u32.to_ne_bytes());
+        rdram[mb_offset + 0x14..mb_offset + 0x18].copy_from_slice(&4u32.to_ne_bytes());
+
+        let mut ctx = ctx_zeroed();
+        ctx.r5 = 0x8000_2000;
+        ctx.r6 = 0; // OS_READ / ToRdram
+        ctx.r2 = 0x1234; // stale non-zero, as a real caller's register would hold
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        assert_eq!(
+            ctx.r2, 0,
+            "osEPiStartDma_recomp must overwrite $v0 with 0 (success) on every \
+             synchronous-completion path, or NWXE's chunked-DMA retry loop spins forever"
+        );
     }
 
     #[test]
