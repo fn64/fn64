@@ -20,7 +20,10 @@
 /// A opaque identifier for whatever unit of execution can be blocked on a
 /// queue (an `OSThread`'s coroutine, in the recommended design). Kept
 /// abstract here so this module has zero dependency on the executor.
-pub type CoroutineId = u32;
+/// Aliased to `trace::ThreadId` (same underlying type) so a `TraceEvent`'s
+/// `QueueOp { thread, .. }` and a `BlockedList` entry are provably the same
+/// identifier space, not two `u32`s that happen to match by convention.
+pub type CoroutineId = crate::trace::ThreadId;
 
 /// One in-flight message. libultra's `OSMesg` is a `void*`-sized opaque
 /// payload; modeled here as the same width without attaching game-specific

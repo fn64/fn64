@@ -361,6 +361,62 @@ pub struct MesgQueue {
   from `do_send`, per the profile.toml writeup, and telling which one was
   responsible for a given mutation was part of what made that rung hard).
 
+### Implementation notes (wave 2/3, 2026-07-14): what building it taught us
+
+This design's recommendation (option (b), `corosensei`) is implemented as
+specified — no deviation from the chosen crate or the core "one host
+thread, stackful coroutines, priority-ordered run queue" shape. Three
+things the implementation surfaced that this doc didn't originally spell
+out, recorded here honestly per `AGENTS.md`'s "mark revisions honestly":
+
+- **`Yield`/`Resume` needed a `may_block` field, not just two "will
+  definitely block" variants.** The original sketch modeled
+  `BlockOnRecv`/`BlockOnSend` as always-blocking suspend points, with the
+  `fn64-abi` shim expected to pre-check via an `Executor` method (e.g.
+  `send_mesg`/`recv_mesg`) whether blocking was actually needed before
+  deciding to yield. That pre-check is exactly what caused the bug below,
+  so the real shape unifies `OS_MESG_BLOCK`/`OS_MESG_NOBLOCK` into ONE
+  suspend point per operation: `Yield::BlockOnRecv { mq_addr, may_block }`/
+  `Yield::BlockOnSend { mq_addr, msg, may_block }`. The executor's
+  `handle_yield` (the only place that safely holds `&mut Executor` at this
+  point) does the check-then-deliver-or-block-or-drop logic uniformly; a
+  new `Resume::WouldBlock` variant carries the `OS_MESG_NOBLOCK`-on-
+  unready-queue outcome back to a coroutine that yielded with
+  `may_block: false`, which never gets parked on any blocked list. This is
+  a strictly more precise version of the same design intent (§2's
+  "Send/recv as coroutine yield points, not thread ops"), not a course
+  reversal.
+- **A real reentrancy bug, caught by this crate's own tests, in exactly the
+  shape the pre-check above created.** `fn64-abi`'s coroutine bodies run
+  physically nested inside `Executor::run_one_step`'s call to
+  `GameThread::resume` — which itself runs inside whatever outer call
+  (`run_one_step`/`run_to_idle`) invoked it. A coroutine body that called
+  back into a `RefCell<Executor>`-guarded accessor (to pre-check "would
+  this send block?") hit a live "RefCell already borrowed" panic on the
+  very first such call, not a theoretical race: the outer borrow was still
+  open on the same call stack. The fix (previous bullet, plus `fn64-abi`
+  never touching its `EXECUTOR` thread-local from inside a coroutine body
+  at all — even "which thread am I" is answered from a second thread-local
+  populated alongside the active `Yielder`, never by asking the executor)
+  is now load-bearing, commented at the fix site in both crates. This is
+  the same *category* of bug rung 18 was — a hidden caller reaching state
+  through an API that looked like a safe accessor — just caught by a type
+  (`RefCell`'s dynamic borrow check) instead of a debugger, and inside this
+  project's own new code rather than the reference runtime's.
+- **`osCreateThread`'s real entry-point dispatch is a separate, larger
+  piece of work than "wire the thread-lifecycle shim."** Calling the
+  actual recompiled function a new `OSThread` should run requires the
+  overlay/`get_function` lookup table (§1's `FuncEntry`/`SectionTableEntry`,
+  wave 3's last listed item) which doesn't exist yet — `osCreateThread_recomp`/
+  `osStartThread_recomp` are implemented as loud, named `unimplemented!()`s
+  for exactly that missing piece (per `AGENTS.md`), not silently-succeeding
+  stubs. Every other piece of thread/queue/timer machinery those two shims
+  would eventually drive (`Executor::create_thread`/`start_thread`/
+  `set_thread_pri`, the whole blocking send/recv/wake path) is implemented
+  and tested for real, exercised end-to-end by this crate's own test
+  harness standing in for the not-yet-written trampoline (see
+  `fn64-abi/src/lib.rs`'s `tests::spawn_test_thread`).
+
 ## 3. Memory model
 
 ### rdram buffer ownership
@@ -595,21 +651,42 @@ files/crates, no shared state):
   every later wave.)
 
 **Wave 2 — `fn64-runtime` core types (parallel sub-tasks, no shared state).**
-- `Rdram` + `MEM_*`-equivalent accessors + `RdramAddr` (§3).
-- `MesgQueue` + `BlockedList` + `EventTable` (§2).
-- The executor/coroutine scheduler skeleton (§2) — priority-ordered
-  resume, yield primitive. (Depends on nothing above but integrates with
-  both once they exist.)
-- Timer wheel (`osSetTimer`/`osStopTimer` semantics, VI-tick-driven).
+**DONE (2026-07-14).**
+- `Rdram` + `MEM_*`-equivalent accessors + `RdramAddr` (§3). Landed wave 1.
+- `MesgQueue` + `BlockedList` + `EventTable` (§2) — `mesgqueue.rs` (landed
+  wave 1) + `executor.rs`'s `event_table` field.
+- The executor/coroutine scheduler (§2) — `executor.rs`'s `Executor`,
+  priority-ordered run queue, `thread.rs`'s `GameThread`/`RunToken`/
+  `Yield`/`Resume`. Rung regression suite (`rung_12_*`/`rung_14_*`/
+  `rung_18_*` + ping-pong/full-queue-block/timer-ordering property tests)
+  in `fn64-runtime/tests/rung_regressions.rs`.
+- Timer wheel (`osSetTimer`/`osStopTimer` semantics, VI-tick-driven) —
+  `timer.rs`'s `TimerWheel`, driven by `Executor::advance_time`'s virtual
+  clock (no wall-clock in core, per this doc's requirement).
+- Differential-trace scaffolding (`trace.rs`'s `TraceEvent`/`TraceKind`/
+  global sequence counter, §4) landed alongside the executor rather than
+  deferred to wave 6, since every executor event needed a place to record
+  to from day one.
+- See "Implementation notes (wave 2/3)" above this section for what
+  building it taught us (the `may_block`/`Resume::WouldBlock` unification;
+  a real ABI-layer reentrancy bug and its fix).
 
 **Wave 3 — `fn64-abi` surface, by ABI-SURFACE.md's own grouping (parallel
 per group once wave 2's matching runtime API exists).**
-- `recomp.h` dispatch helpers (`switch_error`, `do_break`, `pause_self`,
-  `get_function`, `cop0_status_*`) — 7 symbols.
-- Thread lifecycle shims (`osCreateThread_recomp`, `osStartThread_recomp`,
-  `osSetThreadPri_recomp`, `osGetThreadPri`/`osGetThreadId` once reached).
-- Message-queue shims (`osCreateMesgQueue_recomp`, `osSendMesg_recomp`,
-  `osRecvMesg_recomp`, `osSetEventMesg_recomp`, `osJamMesg` once reached).
+- `recomp.h` dispatch helpers: `pause_self` **DONE** (wired to
+  `Yield::PauseSelf`, rung 14's fix). `switch_error`/`do_break`/
+  `get_function`/`cop0_status_*` NOT started.
+- Thread lifecycle shims: `osCreateThread_recomp`/`osStartThread_recomp`
+  **PARTIAL** — real ABI shape + arg marshalling (incl. the o32 stack-passed
+  5th/6th args via the new `RecompContext.r29`) implemented, but both stay
+  a loud, named `unimplemented!()` pending the overlay/`get_function`
+  lookup table this wave's last item builds (see implementation-notes
+  bullet above). `osSetThreadPri_recomp` **DONE** (no dispatch-gap
+  blocker). `osGetThreadPri`/`osGetThreadId` not yet reached.
+- Message-queue shims: `osCreateMesgQueue_recomp`/`osSendMesg_recomp`
+  (rewired onto the real executor, throwaway `thread_local! HashMap`
+  deleted) + `osRecvMesg_recomp` (new this wave) + `osSetEventMesg_recomp`
+  **DONE**. `osJamMesg` not yet reached.
 - PI/SI/EPI DMA shims (`osCreatePiManager_recomp`, `__osSiRawStartDma_recomp`,
   `osEPiStartDma_recomp`, `osVirtualToPhysical_recomp`).
 - VI/AI shims (`osAiSetFrequency_recomp`, the `osVi*` family — currently

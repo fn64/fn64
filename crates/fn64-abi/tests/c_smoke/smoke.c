@@ -14,7 +14,7 @@
 #include <stdlib.h>
 
 typedef struct RecompContext {
-    uint64_t r0, r1, r2, r3, r4, r5, r6, r7;
+    uint64_t r0, r1, r2, r3, r4, r5, r6, r7, r29;
 } RecompContext;
 
 extern void osCreateMesgQueue_recomp(uint8_t *rdram, RecompContext *ctx);

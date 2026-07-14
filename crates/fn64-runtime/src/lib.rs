@@ -9,8 +9,18 @@
 //! Design provenance for every non-obvious semantic choice below is cited
 //! inline; see `docs/DESIGN.md` section 6 for the full provenance table.
 
+pub mod executor;
 pub mod mesgqueue;
 pub mod rdram;
+pub mod thread;
+pub mod timer;
+pub mod trace;
 
+pub use executor::{Executor, ExternalEvent, RecvMesgOutcome, SendMesgOutcome};
 pub use mesgqueue::{Mesg, MesgQueue, RecvResult, SendResult};
 pub use rdram::{Rdram, RdramAddr};
+pub use thread::{GameThread, Priority, Resume, RunToken, ThreadState, Yield, OS_PRIORITY_IDLE};
+pub use timer::{TimerId, TimerWheel};
+pub use trace::{
+    DmaDirection, QueueOpKind, SwitchReason, TaskKind, ThreadId, TraceEvent, TraceKind, TraceLog,
+};
