@@ -54,7 +54,10 @@
 //! ## The executor integration (unchanged from prior waves)
 //!
 //! Exactly one `fn64_runtime::Executor` exists per process, in a
-//! `thread_local!`. Every shim reaches it through `with_executor`. A
+//! `thread_local!`. Every shim reaches it through `with_executor` -- THE
+//! single gateway, see that function's own doc comment for the full
+//! reentrancy audit (what `Yield`/`Resume` already close out at the type
+//! level vs. the one dynamic case `ReentrantCell` still exists for). A
 //! coroutine body never calls `with_executor` to pre-check a
 //! potentially-blocking operation (the reentrancy bug a previous wave
 //! caught and fixed -- see the "reentrancy" note in `suspend_active_coroutine`'s
@@ -221,29 +224,13 @@ impl Default for HostState {
 }
 
 /// Reentrant-safe interior mutability for `Executor`, replacing a plain
-/// `RefCell` (this wave -- see `with_executor`'s doc comment for the real
-/// bug this fixes). A plain `RefCell<Executor>` panics ("already borrowed")
-/// the moment ANY `_recomp` shim that calls `with_executor` runs as part of
-/// resuming a coroutine from INSIDE `Executor::run_one_step`'s own
-/// `with_executor` call -- which is not a rare edge case, it is the NORMAL
-/// path for almost every non-blocking shim (`osCreateThread_recomp`,
-/// `osSetEventMesg_recomp`, every VI setter, etc.), first surfaced for real
-/// by `examples/wm2000-boot`'s boot harness (recomp_entrypoint's very first
-/// real `osCreateThread` call). This is memory-safe despite looking like
-/// aliasing: `run_one_step`'s outer closure holds `&mut Executor` only
-/// nominally across the coroutine-resume call -- it does not read or write
-/// `Executor` state again until the resume call returns, so the two "live"
-/// `&mut` references (outer frame, inner nested `with_executor` call) are
-/// never simultaneously DEREFERENCED, only simultaneously IN SCOPE on the
-/// call stack -- exactly the shape `RefCell`'s purely dynamic (stack-blind)
-/// borrow tracking cannot distinguish from true concurrent aliasing, but
-/// which is sound because this whole crate has exactly one native thread
-/// ever touching this cell (`docs/DESIGN.md` section 2's single-executor
-/// model) and `RunToken` already makes two truly concurrent resumes a
-/// compile error (`thread.rs`). `ReentrantCell` only guards against what
-/// WOULD be a real bug: two overlapping calls trying to actually
-/// dereference the pointer at once, which cannot happen on one thread
-/// without unsafe code elsewhere doing something even more wrong.
+/// `RefCell` (see `with_executor`'s doc comment -- the crate's one gateway
+/// to this cell -- for the real bug this fixes and the audited verdict on
+/// why it is still needed after `Yield`/`Resume` closed the OTHER
+/// reentrancy shape). `ReentrantCell` only guards against what WOULD be a
+/// real bug: two overlapping calls trying to actually dereference the
+/// pointer at once, which cannot happen on one thread without unsafe code
+/// elsewhere doing something even more wrong.
 struct ReentrantCell<T> {
     inner: std::cell::UnsafeCell<T>,
 }
@@ -271,9 +258,10 @@ impl<T> ReentrantCell<T> {
 
 thread_local! {
     /// The one executor instance -- see module doc for why a thread-local
-    /// (not a bare global) is the correct scope. `ReentrantCell`, not
-    /// `RefCell` -- see that type's doc comment for the real reentrancy bug
-    /// this replacement fixes.
+    /// (not a bare global) is the correct scope. Private with no accessor
+    /// other than `with_executor` (below) -- see that function's doc comment
+    /// for the full reentrancy audit, including why `ReentrantCell` (not
+    /// `RefCell`) is the right cell type here.
     static EXECUTOR: ReentrantCell<Executor> = ReentrantCell::new(Executor::new());
 
     /// Overlay/section registry + PI/ROM state -- see `HostState` doc.
@@ -308,6 +296,83 @@ thread_local! {
     static ACTIVE_RDRAM: Cell<*mut u8> = const { Cell::new(std::ptr::null_mut()) };
 }
 
+/// THE single gateway to `EXECUTOR`. Every `_recomp` shim, every host-facing
+/// helper, and every test in this crate that touches the executor goes
+/// through this one function -- `EXECUTOR` itself is a private `thread_local`
+/// with no other accessor, so "does some call site bypass the reentrancy
+/// story below" is a closed question by construction, not a convention to
+/// audit call-site-by-call-site.
+///
+/// ## Audit verdict: `ReentrantCell` is still required (2026-07-14)
+///
+/// The task this wave answers: `Yield`/`Resume` (`thread.rs`) already make
+/// ONE reentrancy shape a compile-time non-issue -- a coroutine can never
+/// directly call back into `Executor::run_one_step`'s own resume loop,
+/// because the only handle that could drive a second resume (`RunToken`) is
+/// non-`Copy`, privately constructed, and issued exactly once per
+/// `run_one_step` call (`thread.rs`'s `RunToken` doc comment). That is a
+/// *scheduling* reentrancy guarantee: no second `GameThread::resume` can ever
+/// be invoked while a first is on the stack.
+///
+/// `ReentrantCell` guards a DIFFERENT, narrower case that the type-level
+/// guarantee above does not and cannot cover, because it isn't a resume at
+/// all -- it's an ordinary nested function call:
+///
+/// - `Executor::run_one_step` calls `with_executor(|exec| ...)` is not
+///   literally true -- rather, `fn64-abi`'s own top-level `run_one_step`
+///   helper (below) calls `with_executor(|exec| exec.run_one_step())`, so
+///   `EXECUTOR`'s borrow is already open when `exec.run_one_step()` starts.
+/// - `run_one_step` calls `GameThread::resume`, which runs the coroutine
+///   body -- ordinary, synchronous, non-yielding Rust code -- until it
+///   either returns or hits a real `Yielder::suspend` point.
+/// - That coroutine body is a real recompiled `OSThread`'s entry point (or,
+///   via `osCreateThread_recomp`, a THREAD IT ITSELF SPAWNS -- see the
+///   `a_running_threads_own_body_can_call_os_create_thread_recomp_...` test),
+///   which is free to call any other `_recomp` shim as an ordinary function
+///   call with no suspend point at all -- `osCreateThread_recomp`,
+///   `osSetEventMesg_recomp`, every VI setter, `osSetTimer_recomp`, etc. all
+///   call `with_executor` themselves, synchronously, with no yield in
+///   between.
+///
+/// This is the residual case: a **synchronous, non-yielding nested call**
+/// into `with_executor` from code already running underneath an outer
+/// `with_executor` call on the same native stack. `Yield`/`Resume` cannot
+/// see this at all -- there is no suspend point here for either type to
+/// govern; the coroutine body never calls `Yielder::suspend`, so from the
+/// executor's/scheduler's point of view nothing about "which thread holds
+/// the `RunToken`" changes mid-call. The hazard is purely about `&mut
+/// Executor` aliasing on the borrow-checker's terms, not about two threads
+/// or two resumes.
+///
+/// It is memory-safe despite looking like aliasing: the OUTER
+/// `with_executor` closure (`run_one_step`'s own body, or `run_to_idle`'s
+/// loop) does not read or write `Executor` state again until the INNER,
+/// nested `with_executor` call returns -- the two "live" `&mut` references
+/// are simultaneously IN SCOPE on the call stack but never simultaneously
+/// DEREFERENCED. `RefCell`'s dynamic, stack-blind borrow tracking cannot
+/// distinguish that from true concurrent aliasing (it panics the instant a
+/// second `borrow_mut()` happens while the first is outstanding, regardless
+/// of whether the first is actually being touched right now) -- which is
+/// exactly the "already borrowed" panic `examples/wm2000-boot`'s boot
+/// harness hit for real (recomp_entrypoint's very first real
+/// `osCreateThread` call, made from inside `run_one_step`'s own resume).
+///
+/// ## Why this can't be funneled away structurally, only made minimal here
+///
+/// A stackless (async/Future) redesign could in principle make "the
+/// coroutine body calls another shim synchronously" impossible by forcing
+/// every shim call to be an awaited suspend point -- but `docs/DESIGN.md`
+/// section 2 already rejected async for this exact workload (recompiled C's
+/// call graph has no natural `.await` points). Short of that redesign, this
+/// crate already does the two things option (a) of this wave's task asks
+/// for: (1) there is exactly ONE gateway (`with_executor`, this function --
+/// not "a documented convention," an structurally closed set, since
+/// `EXECUTOR` has no other accessor) and (2) the residual dynamic case is
+/// named precisely, right here, rather than left as a vague "reentrancy is
+/// possible, be careful" note. `ReentrantCell` is that gateway's
+/// implementation detail, not a second, parallel safety mechanism -- remove
+/// it and this exact function would panic on the nested call this doc
+/// comment describes, with no compile-time signal beforehand.
 fn with_executor<R>(f: impl FnOnce(&mut Executor) -> R) -> R {
     EXECUTOR.with(|e| e.with(f))
 }

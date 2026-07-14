@@ -13,13 +13,14 @@ use std::collections::HashMap;
 use corosensei::CoroutineResult;
 
 use crate::mesgqueue::{Mesg, MesgQueue, RecvResult, SendResult};
+use crate::peripherals::Peripherals;
 use crate::rdram::RdramAddr;
 use crate::rsp::{OsTaskHeader, TaskLog};
 use crate::si::PifModel;
 use crate::thread::{GameThread, Priority, Resume, RunToken, ThreadState, Yield};
 use crate::timer::TimerWheel;
 use crate::trace::{QueueOpKind, SwitchReason, TaskKind, ThreadId, TraceKind, TraceLog};
-use crate::vi::{RetraceSchedule, ViState};
+use crate::vi::ViState;
 
 /// `OS_EVENT_VI`, per the public libultra manual (`ultra64.h`'s documented
 /// event-code table) -- verified against real NWXE call-site evidence too
@@ -75,21 +76,12 @@ pub struct Executor {
     /// per the task's explicit "no wall-clock in core" requirement.
     sim_time: u64,
     trace: TraceLog,
-    /// VI hardware state (mode/features/y-scale/blanked/last-swapped
-    /// framebuffer) -- see `vi.rs` module doc.
-    vi: ViState,
-    /// The periodic retrace ticker, driving `OS_EVENT_VI` delivery from
-    /// `advance_time`. `None` until a host driver calls
-    /// `arm_retrace`/`fn64-shell` picks a real interval -- no default
-    /// interval is invented here (see `vi.rs`'s "not a hardware timing
-    /// model" note); a boot harness that never arms it simply never
-    /// receives VI retrace events, an honest state rather than a fabricated
-    /// default NTSC constant.
-    retrace: Option<RetraceSchedule>,
-    /// Minimal SI/PIF controller-probe model (`si.rs`).
-    pif: PifModel,
-    /// RSP task submissions observed (`rsp.rs`).
-    tasks: TaskLog,
+    /// VI/SI/RSP host-side hardware-model state -- see `peripherals.rs`'s
+    /// module doc for why these are grouped separately from this struct's
+    /// own scheduling/queue/timer state. `Executor`'s own VI/SI/RSP-named
+    /// methods (below) are thin delegations to this field, so
+    /// `fn64-abi`'s call sites are unaffected by this split.
+    peripherals: Peripherals,
 }
 
 /// The single, explicit host-side injection point external completions
@@ -304,9 +296,13 @@ impl Executor {
         for timer in fired {
             self.deliver_or_enqueue(timer.queue_addr, timer.msg, Some(timer.armed_by));
         }
-        if let Some(sched) = &mut self.retrace {
-            let ticks = sched.advance(now);
-            for _ in 0..ticks {
+        // The retrace tick's OWN advance (RetraceSchedule::advance, whether
+        // OS_EVENT_VI fired N times this call) is `Peripherals`' job; actual
+        // message DELIVERY stays here, since only `Executor` can reach
+        // `event_table`/`deliver_or_enqueue` (see `peripherals.rs`'s module
+        // doc for why the event table itself is not a peripheral).
+        if let Some(tick) = self.peripherals.advance_retrace(now) {
+            for _ in 0..tick.event_vi_ticks {
                 // Only deliver if the game has actually registered OS_EVENT_VI
                 // (osSetEventMesg_recomp populates event_table) -- before
                 // that registration exists (early boot), a real VI interrupt
@@ -326,7 +322,7 @@ impl Executor {
                 // table -- both may be registered simultaneously and both
                 // fire on the same retrace tick, matching real hardware's
                 // two genuinely independent notification mechanisms.
-                if let Some((mq_offset, msg)) = self.vi.retrace_target {
+                if let Some((mq_offset, msg)) = tick.retrace_target {
                     self.deliver_or_enqueue(RdramAddr::from_offset(mq_offset), msg, None);
                 }
             }
@@ -337,43 +333,49 @@ impl Executor {
     /// per field. See `vi.rs`'s `RetraceSchedule` doc -- not a hardware-
     /// accurate NTSC/PAL timing value, a host-chosen approximation.
     pub fn arm_retrace(&mut self, interval: u64) {
-        self.retrace = Some(RetraceSchedule::new(interval));
+        self.peripherals.arm_retrace(interval);
     }
 
     // ---- VI (video interface) -------------------------------------------
+    //
+    // Thin delegations to `Peripherals` -- see `peripherals.rs`'s module doc.
+    // No behavior lives here; every method's real implementation is on
+    // `Peripherals`, unchanged from when it was this same method's own body.
 
     pub fn vi(&self) -> &ViState {
-        &self.vi
+        self.peripherals.vi()
     }
 
     pub fn vi_set_mode(&mut self, mode_ptr: u32) {
-        self.vi.set_mode(mode_ptr);
+        self.peripherals.vi_set_mode(mode_ptr);
     }
 
     pub fn vi_set_special_features(&mut self, ptr: u32) {
-        self.vi.set_special_features(ptr);
+        self.peripherals.vi_set_special_features(ptr);
     }
 
     pub fn vi_set_y_scale(&mut self, scale: f32) {
-        self.vi.set_y_scale(scale);
+        self.peripherals.vi_set_y_scale(scale);
     }
 
     /// `osViSetEvent(mq, msg, retraceCount)` -- see `ViState::set_event`'s
     /// doc comment for why this is a separate delivery path from
     /// `osSetEventMesg`/`OS_EVENT_VI`.
     pub fn vi_set_event(&mut self, mq_addr: RdramAddr, msg: Mesg) {
-        self.vi.set_event(mq_addr, msg);
+        self.peripherals.vi_set_event(mq_addr, msg);
     }
 
     pub fn vi_set_black(&mut self, active: bool) {
-        self.vi.set_black(active);
+        self.peripherals.vi_set_black(active);
     }
 
     /// `osViSwapBuffer(frameBufPtr)`. Returns the newly-current framebuffer
     /// address so the caller (the `fn64-abi` shim) can hand it straight to
-    /// the harness's framebuffer-capture hook without a second lookup.
+    /// the harness's framebuffer-capture hook without a second lookup. Trace
+    /// recording stays here (needs `sim_time`, an `Executor`-owned field --
+    /// see `peripherals.rs`'s module doc).
     pub fn vi_swap_buffer(&mut self, frame_buf: RdramAddr) -> RdramAddr {
-        self.vi.swap_buffer(frame_buf);
+        self.peripherals.vi_swap_buffer(frame_buf);
         let sim_time = self.sim_time;
         self.trace.record(
             sim_time,
@@ -388,33 +390,34 @@ impl Executor {
     // ---- SI/PIF (controller probe) ---------------------------------------
 
     pub fn pif(&self) -> &PifModel {
-        &self.pif
+        self.peripherals.pif()
     }
 
     // ---- RSP task submission -----------------------------------------------
 
     pub fn task_log(&self) -> &TaskLog {
-        &self.tasks
+        self.peripherals.task_log()
     }
 
     /// Record an RSP task submission (gfx: acknowledged only; audio: the
     /// caller has already invoked the real translated ucode function before
     /// calling this -- see `fn64-abi`'s `osSpTaskYielded_recomp`/task-submit
     /// shim doc comments for the actual dispatch). Emits the shared
-    /// `TaskSubmit` trace event alongside the fuller `OsTaskHeader` this
-    /// module's own `TaskLog` keeps.
+    /// `TaskSubmit` trace event alongside the fuller `OsTaskHeader`
+    /// `Peripherals`' own `TaskLog` keeps. Trace recording stays here (needs
+    /// `sim_time` -- see `peripherals.rs`'s module doc).
     pub fn submit_task(&mut self, header: OsTaskHeader) {
         let sim_time = self.sim_time;
-        if let Some(kind) = header.kind() {
+        let ucode = header.ucode;
+        if let Some(kind) = self.peripherals.submit_task(header) {
             self.trace.record(
                 sim_time,
                 TraceKind::TaskSubmit {
                     task_kind: kind,
-                    ucode: header.ucode,
+                    ucode,
                 },
             );
         }
-        self.tasks.record(header);
     }
 
     /// `osSetTimer(t, countdown, interval, mq, msg)`.

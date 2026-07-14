@@ -417,6 +417,132 @@ out, recorded here honestly per `AGENTS.md`'s "mark revisions honestly":
   harness standing in for the not-yet-written trampoline (see
   `fn64-abi/src/lib.rs`'s `tests::spawn_test_thread`).
 
+### `Executor`/`Peripherals` module split (structure wave, 2026-07-14)
+
+`fn64-runtime::executor::Executor` had grown into holding both its actual
+job (run queue, `MesgQueue` registrations, timers, the `event_table`, and
+the single `inject_event` door — the scheduling state §2's threading model
+is about) AND host-side hardware-model state for three peripherals that
+have nothing to do with the single-runnable-coroutine invariant: VI
+(mode/y-scale/framebuffer-swap/retrace-ticker), SI/PIF (controller-probe
+response shape), and RSP (task-header capture/counting). Every VI/SI/RSP
+method lived directly in `impl Executor`, touching private `Executor`
+fields (`vi`, `retrace`, `pif`, `tasks`) — a reviewer auditing "does this
+change threaten the single-runnable-thread guarantee" had to read past
+`osViSetMode`/`PifModel::query_response`-adjacent code to find the actual
+scheduling logic, and vice versa.
+
+**The fix**: a new `fn64_runtime::peripherals::Peripherals` struct now owns
+those four fields and every method that only touches them
+(`vi()`/`vi_set_*`/`vi_swap_buffer`/`arm_retrace`/`advance_retrace`,
+`pif()`, `task_log()`/`submit_task`). `Executor` holds exactly one
+`peripherals: Peripherals` field and re-exposes the same public method
+names as one-line delegations, so **no caller outside this crate changed**
+— `fn64-abi`'s `with_executor(|exec| exec.vi_set_mode(...))`-shaped call
+sites are byte-identical before and after this split; only where the
+implementation lives moved.
+
+Two things deliberately did NOT move to `Peripherals`, on purpose, not by
+oversight:
+
+- **`event_table`** (the `osSetEventMesg`-populated `OS_EVENT_*` →
+  `(queue, msg)` table) stays on `Executor`. It is genuinely shared
+  scheduling machinery — a guest `osSetEventMesg` registration and the VI
+  retrace ticker's `OS_EVENT_VI` lookup both go through it, and
+  `inject_event`'s `ExternalEvent::OsEvent` arm has no notion of which
+  peripheral "owns" a given event code. Moving it into `Peripherals` would
+  just relocate the god-object problem one file over instead of resolving
+  it.
+- **Trace recording** (`TraceLog`/`sim_time`) also stays on `Executor`.
+  `Peripherals::vi_swap_buffer`/`submit_task` return the plain data
+  (framebuffer address; task kind) the old single-body versions used to
+  feed straight into `self.trace.record(...)` — `Executor`'s thin wrappers
+  do that recording themselves, since `sim_time` is the executor's virtual
+  clock, not a peripheral's own state.
+
+This was a pure structural move: every `Peripherals` method's body is
+character-for-character what used to be the matching `Executor` method's
+body (see `peripherals.rs`'s module doc for the full mapping); no behavior,
+field default, or trace-event shape changed. The existing test suite
+(`fn64-runtime`'s unit tests, `rung_regressions.rs`, `fn64-abi`'s unit
+tests) passes unchanged in both count and behavior — this is the gate a
+pure-refactor claim like this one has to clear, not merely "it compiles."
+
+### `ReentrantCell` audit verdict (structure wave, 2026-07-14)
+
+The wave 2/3 implementation notes above record a real reentrancy bug fixed
+by replacing `fn64-abi`'s `EXECUTOR: RefCell<Executor>` with
+`EXECUTOR: ReentrantCell<Executor>`. This wave's task: is that cell still
+earning its keep now that `Yield`/`Resume` (§2, `thread.rs`) already make
+one whole class of reentrancy a compile-time non-issue, or was it only ever
+papering over something the type system should be asked to catch instead?
+
+**Verdict: still needed, and it guards a genuinely different hazard than
+the one `Yield`/`Resume` closes — not a residual instance of the same one.**
+
+- **What `Yield`/`Resume` + `RunToken` already prove, at compile time**: no
+  second `GameThread::resume` can ever be invoked while a first is on the
+  stack. `RunToken` is non-`Copy`, privately constructed, and
+  `Executor::run_one_step` is the only place that both issues one and calls
+  `resume` with it (`thread.rs`'s `RunToken` doc comment) — this is a
+  *scheduling* reentrancy guarantee about resumes specifically.
+- **What `ReentrantCell` guards, which is not a resume at all**: a
+  coroutine body, once resumed and running as ordinary synchronous Rust
+  code (no suspend, no yield), is free to call any `_recomp` shim as a
+  plain nested function call — and several real, common shims
+  (`osCreateThread_recomp`, `osSetEventMesg_recomp`, every VI setter,
+  `osSetTimer_recomp`, etc.) themselves call `with_executor`. Since the
+  OUTER `with_executor` call (`fn64-abi`'s own `run_one_step`/`run_to_idle`
+  helpers, which wrap `Executor::run_one_step`/`run_to_idle`) is still
+  nominally on the stack when this happens, the inner call is a **second,
+  nested `with_executor` invocation while the first is still open** — not
+  two threads, not two resumes, just an ordinary call stack `Yield`/`Resume`
+  have no vocabulary for, because there is no suspend point here for either
+  type to govern. `fn64-abi/src/lib.rs`'s
+  `a_running_threads_own_body_can_call_os_create_thread_recomp_without_reentrancy_panic`
+  test is the regression test for exactly this shape, reproducing what
+  `examples/wm2000-boot`'s boot harness hit for real on its very first
+  `osCreateThread` call.
+- **Why this is memory-safe despite looking like `&mut` aliasing**: the
+  outer `with_executor` closure does not read or write `Executor` state
+  again until the inner, nested call returns — the two "live" `&mut`
+  references are simultaneously in scope on the call stack but never
+  simultaneously dereferenced. A plain `RefCell` cannot express that
+  distinction (its borrow tracking is purely dynamic/stack-blind: a second
+  `borrow_mut()` panics the instant it happens, regardless of whether the
+  first borrow is actually being touched concurrently) — which is exactly
+  the "already borrowed" panic that surfaced this bug for real.
+- **Why this can't be pushed into the type system the way `Yield`/`Resume`
+  were**: doing so would require making "a coroutine body calls another
+  shim" itself a suspend point — i.e. a stackless/async redesign where
+  every shim call is an awaited yield the executor's loop mediates.
+  §2 already evaluated and rejected async for this exact workload
+  (recompiled C's call graph has no natural `.await` points; forcing one
+  in would mean hand-rolling the same suspend machinery on a worse
+  primitive, or collapsing back to option (a)'s per-OS-thread hazards).
+  Short of that redesign, this residual case is a property of ordinary
+  synchronous Rust call stacks, not something a coroutine-yield type can
+  see.
+- **What this wave DID do, per the task's option (a)**: confirmed
+  `with_executor` (`fn64-abi/src/lib.rs`) is already, structurally, the ONE
+  gateway — `EXECUTOR` is a private `thread_local` with no other accessor
+  anywhere in the crate, so every one of the ~30 `Executor`-touching call
+  sites (every `_recomp` shim, every host-facing helper, every test) already
+  funnels through it; there was no second, looser path to close. What was
+  missing was the audit itself living at that gateway: `with_executor`'s doc
+  comment now states precisely which reentrancy shape the type system
+  already closes, which dynamic shape survives, and why, so a future reader
+  doesn't have to re-derive this from the bug history to trust the cell is
+  still doing real work and not just historical caution left in place.
+
+`ReentrantCell` is not removed. It is not a second, redundant guard next to
+`Yield`/`Resume` — it is the only mechanism that can cover this particular
+shape at all, given the design this project already committed to (single
+executor, stackful coroutines, synchronous shim calls). Removing it would
+not be "relying on the type system instead" — it would just reintroduce the
+exact panic `examples/wm2000-boot` hit, with no compile-time replacement
+available under this architecture.
+
 ## 3. Memory model
 
 ### rdram buffer ownership
