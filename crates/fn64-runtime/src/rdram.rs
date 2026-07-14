@@ -5,6 +5,36 @@
 //! transcribed from `aki-recomp/runtime/ABI-SURFACE.md` section (c), which
 //! mechanically extracted them from N64Recomp-generated C (MIT-licensed
 //! recompiler output; no vendor runtime implementation was read).
+//!
+//! ## Correction (byte order): `MEM_*` word/halfword accessors are NATIVE-
+//! ## endian, not big-endian
+//!
+//! A previous wave's transcription of `ABI-SURFACE.md` section (c) as "no
+//! byte-lane XOR... sign-extended" for `MEM_W`, and the analogous claim for
+//! `MEM_H`/`MEM_HU` after their XOR, was WRONG about byte ORDER (the XOR
+//! offset math itself was correct). First caught by
+//! `examples/wm2000-boot`'s actual boot run: a spawned thread's real stack
+//! pointer, read through what was then `Rdram`-equivalent logic, came back
+//! exactly byte-swapped (`0x70BE0480` instead of the real `0x8004BE70`).
+//! Verified directly against `recomp.h` (MIT, the ABI this crate serves):
+//! ```text
+//! #define MEM_W(offset, reg) \
+//!     (*(int32_t*)(rdram + ((((reg) + (offset))) - 0xFFFFFFFF80000000)))
+//! #define MEM_H(offset, reg) \
+//!     (*(int16_t*)(rdram + ((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000)))
+//! ```
+//! Both are PLAIN C POINTER DEREFERENCES -- native-endian loads/stores on
+//! whatever host compiles this code (little-endian, for every desktop
+//! target fn64 ships on). The `^2`/`^3` byte-lane XOR on the sub-word
+//! accessors exists PRECISELY BECAUSE the underlying word storage is
+//! native-endian: XORing the sub-word offset is what makes a big-endian-CPU
+//! address land on the correct byte within an otherwise little-endian-
+//! stored word. If `MEM_W` itself were big-endian, the XOR trick would be
+//! unnecessary (a real big-endian backing store needs no lane correction at
+//! all). Every accessor below now uses `from_ne_bytes`/`to_ne_bytes`
+//! (native), not `from_be_bytes`/`to_be_bytes`; single-byte accessors
+//! (`read_b`/`write_b`/`read_bu`/`write_bu`) were already correct (no
+//! multi-byte order question at 1-byte granularity).
 
 /// Default N64 RDRAM capacity (8 MB, the common console configuration both
 /// ported games in `aki-recomp` target). A future multi-console config
@@ -75,37 +105,41 @@ impl Rdram {
         self.bytes.is_empty()
     }
 
-    /// `MEM_W`: int32_t, word-aligned, no byte-lane XOR, sign-extended.
+    /// `MEM_W`: int32_t, word-aligned, no byte-lane XOR, NATIVE byte order,
+    /// sign-extended (native `int32_t`, so sign is inherent, not a separate
+    /// step). See this module's doc comment for why native, not big-endian.
     pub fn read_w(&self, addr: RdramAddr) -> i32 {
         let o = addr.offset() as usize;
-        i32::from_be_bytes(self.bytes[o..o + 4].try_into().unwrap())
+        i32::from_ne_bytes(self.bytes[o..o + 4].try_into().unwrap())
     }
 
     pub fn write_w(&mut self, addr: RdramAddr, value: i32) {
         let o = addr.offset() as usize;
-        self.bytes[o..o + 4].copy_from_slice(&value.to_be_bytes());
+        self.bytes[o..o + 4].copy_from_slice(&value.to_ne_bytes());
     }
 
-    /// `MEM_H`: int16_t, byte-lane XOR `offset ^ 2`, sign-extended.
+    /// `MEM_H`: int16_t, byte-lane XOR `offset ^ 2`, NATIVE byte order at
+    /// the corrected offset, sign-extended.
     pub fn read_h(&self, addr: RdramAddr) -> i16 {
         let o = (addr.offset() ^ 2) as usize;
-        i16::from_be_bytes(self.bytes[o..o + 2].try_into().unwrap())
+        i16::from_ne_bytes(self.bytes[o..o + 2].try_into().unwrap())
     }
 
     pub fn write_h(&mut self, addr: RdramAddr, value: i16) {
         let o = (addr.offset() ^ 2) as usize;
-        self.bytes[o..o + 2].copy_from_slice(&value.to_be_bytes());
+        self.bytes[o..o + 2].copy_from_slice(&value.to_ne_bytes());
     }
 
-    /// `MEM_HU`: uint16_t, byte-lane XOR `offset ^ 2`, zero-extended.
+    /// `MEM_HU`: uint16_t, byte-lane XOR `offset ^ 2`, NATIVE byte order,
+    /// zero-extended.
     pub fn read_hu(&self, addr: RdramAddr) -> u16 {
         let o = (addr.offset() ^ 2) as usize;
-        u16::from_be_bytes(self.bytes[o..o + 2].try_into().unwrap())
+        u16::from_ne_bytes(self.bytes[o..o + 2].try_into().unwrap())
     }
 
     pub fn write_hu(&mut self, addr: RdramAddr, value: u16) {
         let o = (addr.offset() ^ 2) as usize;
-        self.bytes[o..o + 2].copy_from_slice(&value.to_be_bytes());
+        self.bytes[o..o + 2].copy_from_slice(&value.to_ne_bytes());
     }
 
     /// `MEM_B`: int8_t, byte-lane XOR `offset ^ 3`, sign-extended.
@@ -195,9 +229,12 @@ mod tests {
     fn halfword_byte_lane_xor() {
         let mut rdram = Rdram::new(64);
         // offset 0 XOR 2 = 2: the halfword at word-offset 0 within a
-        // big-endian word lands at byte offset 2, not 0.
+        // big-endian-ADDRESSED word lands at byte offset 2, not 0 -- but
+        // the 2 bytes stored there are in NATIVE (little-endian) order,
+        // per this module's corrected doc comment (MEM_H is a native
+        // int16_t* dereference, not a big-endian assembly).
         rdram.write_h(RdramAddr::from_offset(0), 0x1234);
-        assert_eq!(&rdram.bytes[2..4], &[0x12, 0x34]);
+        assert_eq!(&rdram.bytes[2..4], &[0x34, 0x12]);
         assert_eq!(rdram.read_h(RdramAddr::from_offset(0)), 0x1234);
     }
 
