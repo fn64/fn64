@@ -12,6 +12,7 @@
 pub mod executor;
 pub mod mesgqueue;
 pub mod overlay;
+pub mod peripherals;
 pub mod rdram;
 pub mod rom;
 pub mod rsp;
@@ -24,6 +25,7 @@ pub mod vi;
 pub use executor::{Executor, ExternalEvent, RecvMesgOutcome, SendMesgOutcome};
 pub use mesgqueue::{Mesg, MesgQueue, RecvResult, SendResult};
 pub use overlay::{FuncEntry, Section, SectionIndex, SectionRegistry};
+pub use peripherals::Peripherals;
 pub use rdram::{Rdram, RdramAddr};
 pub use rom::{DmaCompletion, InMemoryRom, PiDma, RomStorage};
 pub use rsp::{OsTaskHeader, TaskLog, M_AUDTASK, M_GFXTASK};
