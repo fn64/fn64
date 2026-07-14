@@ -1,0 +1,9 @@
+[package]
+name = "fn64-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "fn64 core: scheduler, OSMesgQueue, timers, PI/SI/VI/AI plumbing, rdram model, overlays. See docs/DESIGN.md."
+
+[dependencies]

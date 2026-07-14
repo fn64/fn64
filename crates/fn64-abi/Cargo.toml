@@ -1,0 +1,16 @@
+[package]
+name = "fn64-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The extern \"C\" surface recompiled N64Recomp game code links against. See docs/DESIGN.md section 1 and aki-recomp/runtime/ABI-SURFACE.md."
+
+[lib]
+# Recompiled RecompiledFuncs/*.c object files link against this as a
+# staticlib; the C smoke test in tests/c_smoke exercises exactly that link
+# shape at a small scale.
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+fn64-runtime = { path = "../fn64-runtime" }

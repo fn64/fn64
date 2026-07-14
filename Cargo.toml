@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fn64-runtime",
+    "crates/fn64-abi",
+    "crates/fn64-shell",
+    "crates/fn64-rt64",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/fn64/fn64"
+
+[profile.dev]
+# Recompiled MIPS call graphs are deep and this is a scheduler/queue-heavy
+# workload; keep debug builds usable without opting every contributor into
+# release-only iteration.
+opt-level = 1

@@ -1,0 +1,10 @@
+[package]
+name = "fn64-rt64"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FFI bridge to RT64 (MIT, C++). All C++ interop is quarantined here -- see README.md and docs/DESIGN.md section 1."
+
+[dependencies]
+fn64-runtime = { path = "../fn64-runtime" }
