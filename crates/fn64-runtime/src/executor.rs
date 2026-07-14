@@ -14,9 +14,18 @@ use corosensei::CoroutineResult;
 
 use crate::mesgqueue::{Mesg, MesgQueue, RecvResult, SendResult};
 use crate::rdram::RdramAddr;
+use crate::rsp::{OsTaskHeader, TaskLog};
+use crate::si::PifModel;
 use crate::thread::{GameThread, Priority, Resume, RunToken, ThreadState, Yield};
 use crate::timer::TimerWheel;
-use crate::trace::{QueueOpKind, SwitchReason, ThreadId, TraceKind, TraceLog};
+use crate::trace::{QueueOpKind, SwitchReason, TaskKind, ThreadId, TraceKind, TraceLog};
+use crate::vi::{RetraceSchedule, ViState};
+
+/// `OS_EVENT_VI`, per the public libultra manual (`ultra64.h`'s documented
+/// event-code table) -- verified against real NWXE call-site evidence too
+/// (`aki-recomp/games/NWXE/profile.toml`'s rung-11 `osCreateViManager`
+/// writeup: `osSetEventMesg(7, mq, &retraceMsg)`).
+pub const OS_EVENT_VI: u32 = 7;
 
 /// The executor: the ONE place in this crate that (a) issues `RunToken`s,
 /// (b) owns every `GameThread`'s state transitions, (c) owns every
@@ -66,6 +75,21 @@ pub struct Executor {
     /// per the task's explicit "no wall-clock in core" requirement.
     sim_time: u64,
     trace: TraceLog,
+    /// VI hardware state (mode/features/y-scale/blanked/last-swapped
+    /// framebuffer) -- see `vi.rs` module doc.
+    vi: ViState,
+    /// The periodic retrace ticker, driving `OS_EVENT_VI` delivery from
+    /// `advance_time`. `None` until a host driver calls
+    /// `arm_retrace`/`fn64-shell` picks a real interval -- no default
+    /// interval is invented here (see `vi.rs`'s "not a hardware timing
+    /// model" note); a boot harness that never arms it simply never
+    /// receives VI retrace events, an honest state rather than a fabricated
+    /// default NTSC constant.
+    retrace: Option<RetraceSchedule>,
+    /// Minimal SI/PIF controller-probe model (`si.rs`).
+    pif: PifModel,
+    /// RSP task submissions observed (`rsp.rs`).
+    tasks: TaskLog,
 }
 
 /// The single, explicit host-side injection point external completions
@@ -219,6 +243,17 @@ impl Executor {
         self.event_table.insert(event, (mq_addr.offset(), msg));
     }
 
+    /// Whether a guest `osSetEventMesg(code, ..)` registration exists yet --
+    /// used by host-driven event sources (VI retrace, SI DMA completion) to
+    /// decide whether to actually post via `inject_event` or silently skip,
+    /// matching real hardware where the interrupt fires either way but only
+    /// has an observable effect once software has hooked it. See
+    /// `advance_time`'s VI-retrace handling and `fn64-abi`'s
+    /// `__osSiRawStartDma_recomp` for the two current callers.
+    pub fn event_table_contains(&self, event: u32) -> bool {
+        self.event_table.contains_key(&event)
+    }
+
     /// THE single, explicit host-side injection point. Every SI/PI/VI/AI
     /// completion, and every fired timer (see `advance_time`), funnels
     /// through this same function -- see `ExternalEvent`'s doc comment and
@@ -247,13 +282,132 @@ impl Executor {
     /// Fires any due timers, posting each one's message through the exact
     /// same `deliver_or_enqueue` path `inject_event` uses -- per
     /// `docs/DESIGN.md` section 2, timer expiry is a host-side scheduling
-    /// input, never a coroutine of its own.
+    /// input, never a coroutine of its own. Also drives the VI retrace
+    /// ticker (if armed via `arm_retrace`) -- a real VI interrupt "posts a
+    /// message and returns to whatever the CPU was doing" (`docs/DESIGN.md`
+    /// section 2's exact framing), which for `OS_EVENT_VI` means routing
+    /// through the SAME `event_table`-registration path a guest
+    /// `osSetEventMesg` call already populates (the `osCreateViManager`
+    /// call site's `osSetEventMesg(7, mq, &retraceMsg)`, per
+    /// `games/NWXE/profile.toml`'s rung-11 evidence cited in `vi.rs`) --
+    /// never a second, VI-specific delivery path.
     pub fn advance_time(&mut self, now: u64) {
         self.sim_time = now;
         let fired = self.timers.advance(now);
         for timer in fired {
             self.deliver_or_enqueue(timer.queue_addr, timer.msg, Some(timer.armed_by));
         }
+        if let Some(sched) = &mut self.retrace {
+            let ticks = sched.advance(now);
+            for _ in 0..ticks {
+                // Only deliver if the game has actually registered OS_EVENT_VI
+                // (osSetEventMesg_recomp populates event_table) -- before
+                // that registration exists (early boot), a real VI interrupt
+                // still fires but nothing is listening; this mirrors that by
+                // silently skipping delivery rather than panicking (an
+                // unregistered event code is the expected pre-registration
+                // state, not a caller bug -- see `inject_event`'s OsEvent
+                // arm, which DOES panic on an unregistered code, because
+                // that path is only ever invoked by test/harness code that
+                // is expected to know a registration already happened).
+                if self.event_table.contains_key(&OS_EVENT_VI) {
+                    self.inject_event(ExternalEvent::OsEvent(OS_EVENT_VI));
+                }
+                // The VI manager's OWN retrace target (osViSetEvent, see
+                // vi.rs's ViState::retrace_target doc comment) is a
+                // SEPARATE delivery path from OS_EVENT_VI's general event
+                // table -- both may be registered simultaneously and both
+                // fire on the same retrace tick, matching real hardware's
+                // two genuinely independent notification mechanisms.
+                if let Some((mq_offset, msg)) = self.vi.retrace_target {
+                    self.deliver_or_enqueue(RdramAddr::from_offset(mq_offset), msg, None);
+                }
+            }
+        }
+    }
+
+    /// Arm the periodic VI retrace ticker at `interval` virtual-time units
+    /// per field. See `vi.rs`'s `RetraceSchedule` doc -- not a hardware-
+    /// accurate NTSC/PAL timing value, a host-chosen approximation.
+    pub fn arm_retrace(&mut self, interval: u64) {
+        self.retrace = Some(RetraceSchedule::new(interval));
+    }
+
+    // ---- VI (video interface) -------------------------------------------
+
+    pub fn vi(&self) -> &ViState {
+        &self.vi
+    }
+
+    pub fn vi_set_mode(&mut self, mode_ptr: u32) {
+        self.vi.set_mode(mode_ptr);
+    }
+
+    pub fn vi_set_special_features(&mut self, ptr: u32) {
+        self.vi.set_special_features(ptr);
+    }
+
+    pub fn vi_set_y_scale(&mut self, scale: f32) {
+        self.vi.set_y_scale(scale);
+    }
+
+    /// `osViSetEvent(mq, msg, retraceCount)` -- see `ViState::set_event`'s
+    /// doc comment for why this is a separate delivery path from
+    /// `osSetEventMesg`/`OS_EVENT_VI`.
+    pub fn vi_set_event(&mut self, mq_addr: RdramAddr, msg: Mesg) {
+        self.vi.set_event(mq_addr, msg);
+    }
+
+    pub fn vi_set_black(&mut self, active: bool) {
+        self.vi.set_black(active);
+    }
+
+    /// `osViSwapBuffer(frameBufPtr)`. Returns the newly-current framebuffer
+    /// address so the caller (the `fn64-abi` shim) can hand it straight to
+    /// the harness's framebuffer-capture hook without a second lookup.
+    pub fn vi_swap_buffer(&mut self, frame_buf: RdramAddr) -> RdramAddr {
+        self.vi.swap_buffer(frame_buf);
+        let sim_time = self.sim_time;
+        self.trace.record(
+            sim_time,
+            TraceKind::TaskSubmit {
+                task_kind: TaskKind::Graphics,
+                ucode: frame_buf.offset(),
+            },
+        );
+        frame_buf
+    }
+
+    // ---- SI/PIF (controller probe) ---------------------------------------
+
+    pub fn pif(&self) -> &PifModel {
+        &self.pif
+    }
+
+    // ---- RSP task submission -----------------------------------------------
+
+    pub fn task_log(&self) -> &TaskLog {
+        &self.tasks
+    }
+
+    /// Record an RSP task submission (gfx: acknowledged only; audio: the
+    /// caller has already invoked the real translated ucode function before
+    /// calling this -- see `fn64-abi`'s `osSpTaskYielded_recomp`/task-submit
+    /// shim doc comments for the actual dispatch). Emits the shared
+    /// `TaskSubmit` trace event alongside the fuller `OsTaskHeader` this
+    /// module's own `TaskLog` keeps.
+    pub fn submit_task(&mut self, header: OsTaskHeader) {
+        let sim_time = self.sim_time;
+        if let Some(kind) = header.kind() {
+            self.trace.record(
+                sim_time,
+                TraceKind::TaskSubmit {
+                    task_kind: kind,
+                    ucode: header.ucode,
+                },
+            );
+        }
+        self.tasks.record(header);
     }
 
     /// `osSetTimer(t, countdown, interval, mq, msg)`.

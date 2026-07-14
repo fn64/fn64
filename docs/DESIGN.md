@@ -738,6 +738,90 @@ display backend exists yet), which is sufficient for THIS gate (a clean
 *link*, not a clean *boot to idle* — that's M1's "boot-to-idle parity"
 milestone in §4, separate and not yet attempted).
 
+**M1 boot-host attempt (2026-07-14): `examples/wm2000-boot`, first real boot
+run against the linked archive.** Per the task's own scope (a headless boot
+host taking `RECOMPILED_DIR`/`RECOMP_H_DIR`/`ROM` env vars, zero game content
+in-repo — `examples/wm2000-boot/build.rs`/`bridge/section_bridge.c`): this is
+the FIRST time the M1-linked archive was actually RUN, not just linked, and
+it surfaced four real, load-bearing bugs the trial-link gate above could not
+have caught (a clean link says nothing about correct runtime behavior):
+
+1. **`fn64-abi`'s `EXECUTOR` reentrancy.** A plain `RefCell<Executor>`
+   panicked ("already borrowed") the moment ANY non-blocking `_recomp` shim
+   (e.g. `osCreateThread_recomp`) ran as part of `Executor::run_one_step`'s
+   own coroutine resume — not a rare edge case, the NORMAL path for a
+   running thread creating another thread. Fixed via `ReentrantCell`, a
+   documented, single-thread-only interior-mutability wrapper (see its doc
+   comment in `fn64-abi/src/lib.rs` for the full soundness argument); a new
+   regression test drives the exact nested shape.
+2. **`osStartThread`/`osSetThreadPri`/`osGetThreadPri` were keyed on the
+   wrong identity.** A prior wave's doc comment asserted real call sites
+   pass the same `OSId` to `osStartThread` that `osCreateThread` received —
+   real disassembly (`funcs_0.c` asm 0x800004AC-0x800004B8) disproves this:
+   both calls pass the SAME `OSThread*` handle, never the `OSId` a second
+   time, and `osSetThreadPri(t=NULL, pri)` means "the calling thread," a
+   documented libultra convention. Fixed via `HostState::thread_handles` (an
+   `OSThread* -> OSId` map populated by `osCreateThread_recomp`) and
+   `resolve_thread_arg`'s null-means-self handling.
+3. **`osCreateThread_recomp` never seeded the new thread's stack pointer.**
+   `entry_ctx.r29` was left zeroed; the real `sp` argument (stack-passed,
+   per `osCreateThread`'s documented signature) was read but discarded. Any
+   real thread entry point touching its own stack (i.e. every one) crashed
+   immediately. Fixed by seeding `entry_ctx.r29` with the real `sp` value.
+4. **`MEM_W`/`MEM_H`/`MEM_HU` are NATIVE-endian, not big-endian.** The
+   single most consequential correction: `fn64-runtime::Rdram`'s word/
+   halfword accessors and `fn64-abi`'s `read_stack_word` all used
+   `from_be_bytes`/`to_be_bytes`, based on a prior wave's mistranscription
+   of `ABI-SURFACE.md` section (c)'s prose summary. The generated `recomp.h`
+   macro itself (quoted directly, MIT) is `*(int32_t*)(rdram + ...)` — a
+   PLAIN NATIVE POINTER DEREFERENCE. The `^2`/`^3` byte-lane XOR on
+   sub-word accessors exists BECAUSE the backing store is native-endian
+   (little-endian on every real fn64 host); it corrects sub-word addressing
+   relative to that, and would be pointless if the store were actually
+   big-endian. First caught when a spawned thread's own real stack pointer
+   came back exactly byte-swapped. Fixed throughout `Rdram`'s accessors and
+   every `fn64-abi` call site that hand-rolled the same assumption
+   (`osRecvMesg_recomp`, `read_os_task_header`, several tests).
+5. **`osEPiStartDma_recomp`'s `dramAddr`/`retQueue` fields need KSEG0
+   translation, and a sibling double-translation bug.** `dramAddr`/
+   `retQueue` are raw vram POINTERS the game computed normally — they need
+   `RdramAddr::from_gpr`'s translation like any other vram value, not
+   `RdramAddr::from_offset` (no translation, silently wrong). Separately,
+   the OTHER `OSIoMesg` fields were being read via `read_stack_word`, which
+   itself re-applies the KSEG0 subtraction to an already-resolved
+   `mb_addr.offset()` — a double subtraction producing garbage. Fixed via a
+   new sibling helper (`read_offset_word`, takes an already-resolved
+   offset, never re-translates) plus correcting the two vram-pointer fields
+   to `from_gpr`.
+
+**Result, honestly reported:** boot now progresses far past every prior
+milestone — thread 0 (`recomp_entrypoint`) runs its real body, spawns and
+starts a second real thread with a correctly-seeded stack, that thread
+(id 6) runs real recompiled code three call-levels deep
+(`func_800222D8` → `func_80003720` → `func_80000660`) into a REAL
+`osEPiStartDma_recomp` PI-DMA call that completes without crashing. Boot
+then reaches a state that runs for tens of seconds of wall-clock CPU time
+inside a single `Executor::run_one_step` call with no crash and no log
+output — i.e. the recompiled code is executing a real (long or unbounded)
+native loop inside `func_800004D0` that this milestone's stubs never
+observed to terminate, most likely because our SI/PIF or PI-DMA completion
+model isn't yet posting whatever the game's own poll loop is waiting for.
+**Not a false "boot to idle"**: this is the honestly-reported frontier —
+three `TraceEvent`s recorded, VI retrace never reached (no `osViSetMode`
+call observed before the stall), zero framebuffer swaps, zero RSP tasks
+submitted. `fn64-abi`'s 4 real bugs above are fixed and regression-tested;
+the stall itself is a new, not-yet-root-caused frontier for the next wave,
+not something papered over. The out-of-tree `wm2000_audio.cpp` (RSPRecomp's
+own generated audio ucode) could not be linked at all in this wave: RSPRecomp's
+codegen template unconditionally emits `#include "librecomp/rsp.hpp"`, which
+lives under `N64ModernRuntime`'s GPL-3.0-licensed tree (verified: that repo's
+top-level `COPYING` is GPL-3.0; `librecomp/` is not under the MIT-carved-out
+`N64Recomp/` subdirectory) — a real, load-bearing clean-room blocker, not
+routed around. `osSpTaskYielded_recomp`'s `M_AUDTASK` dispatch plumbing
+(`set_audio_ucode_fn`) is real and tested against a stand-in function; the
+genuine ucode requires either an MIT-clean RSP interpreter or a forked
+RSPRecomp codegen target, both future work.
+
 **Wave 4 — `fn64-rt64` bridge (parallelizes against wave 3, converges at
 the RSP task boundary).**
 - RSP audio-ucode task submission (the one RESOLVED boundary per
