@@ -138,6 +138,23 @@ impl Rdram {
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.bytes.as_mut_ptr()
     }
+
+    /// Bulk byte copy into the buffer at a plain rdram-relative byte offset
+    /// (no `MEM_*`-style byte-lane XOR -- that XOR is specifically a
+    /// sub-word CPU-load/store artifact per section (c)'s citation; a DMA
+    /// transfers a contiguous byte range exactly as the source presents it,
+    /// matching real cartridge-domain PI DMA's documented behavior of a
+    /// plain sequential byte copy, not per-word-reinterpreted). Used by
+    /// `rom.rs`'s `PiDma::start_dma` -- the one non-`MEM_*` bulk-write path
+    /// this crate has, kept here (not hand-rolled in `rom.rs`) so there is
+    /// still exactly one module that touches `self.bytes` directly.
+    pub fn write_bytes(&mut self, offset: usize, data: &[u8]) {
+        self.bytes[offset..offset + data.len()].copy_from_slice(data);
+    }
+
+    pub fn read_bytes(&self, offset: usize, len: usize) -> &[u8] {
+        &self.bytes[offset..offset + len]
+    }
 }
 
 impl Default for Rdram {

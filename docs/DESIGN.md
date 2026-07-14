@@ -673,28 +673,70 @@ files/crates, no shared state):
 
 **Wave 3 — `fn64-abi` surface, by ABI-SURFACE.md's own grouping (parallel
 per group once wave 2's matching runtime API exists).**
-- `recomp.h` dispatch helpers: `pause_self` **DONE** (wired to
-  `Yield::PauseSelf`, rung 14's fix). `switch_error`/`do_break`/
-  `get_function`/`cop0_status_*` NOT started.
+- `recomp.h` dispatch helpers: `pause_self`/`switch_error`/`do_break`/
+  `get_function` **DONE** (M1 wave, 2026-07-14). This wave discovered and
+  fixed a real signature mismatch from the prior wave's implementation:
+  `pause_self` is `void pause_self(uint8_t *rdram)` (ONE argument, no
+  `ctx`), `switch_error`/`do_break` take no `rdram`/`ctx` at all, and
+  `recomp_context` is the REAL 32-gpr/32-fpr/hi/lo/f_odd/status_reg struct,
+  not the 9-field subset a prior wave modeled — verified directly against
+  `aki-recomp/games/NWXE/RecompiledFuncs/recomp.h` (N64Recomp's own
+  MIT-licensed generated/vendored header) and real call sites, not
+  re-derived from `ABI-SURFACE.md`'s prose alone. `get_function` is backed
+  by the new `fn64-runtime::overlay::SectionRegistry` (§1's long-deferred
+  overlay/`get_function` lookup table, built this wave — see below).
+  `cop0_status_*` NOT started (no call site in either game's corpus per
+  `ABI-SURFACE.md`).
 - Thread lifecycle shims: `osCreateThread_recomp`/`osStartThread_recomp`
-  **PARTIAL** — real ABI shape + arg marshalling (incl. the o32 stack-passed
-  5th/6th args via the new `RecompContext.r29`) implemented, but both stay
-  a loud, named `unimplemented!()` pending the overlay/`get_function`
-  lookup table this wave's last item builds (see implementation-notes
-  bullet above). `osSetThreadPri_recomp` **DONE** (no dispatch-gap
-  blocker). `osGetThreadPri`/`osGetThreadId` not yet reached.
-- Message-queue shims: `osCreateMesgQueue_recomp`/`osSendMesg_recomp`
-  (rewired onto the real executor, throwaway `thread_local! HashMap`
-  deleted) + `osRecvMesg_recomp` (new this wave) + `osSetEventMesg_recomp`
-  **DONE**. `osJamMesg` not yet reached.
-- PI/SI/EPI DMA shims (`osCreatePiManager_recomp`, `__osSiRawStartDma_recomp`,
-  `osEPiStartDma_recomp`, `osVirtualToPhysical_recomp`).
-- VI/AI shims (`osAiSetFrequency_recomp`, the `osVi*` family — currently
-  NWXE-only per `ABI-SURFACE.md`'s "present in only one game" list, flagged
-  there as "the other game's port stage simply hasn't renamed a call site
-  yet," so implement from the union, not either game's current subset).
-- `recomp_overlays.inl` consumption: section-table parsing, `get_function`
-  lookup-table registration (§1's `FuncEntry`/`SectionTableEntry` shapes).
+  **DONE** (M1 wave) — real dispatch via `SectionRegistry::resolve`, no
+  longer `unimplemented!()`. `osSetThreadPri_recomp` **DONE** (prior wave,
+  no dispatch-gap blocker). `osGetThreadPri`/`osGetThreadId` not yet
+  reached.
+- Message-queue shims: `osCreateMesgQueue_recomp`/`osSendMesg_recomp`/
+  `osRecvMesg_recomp`/`osSetEventMesg_recomp`/`osSetTimer_recomp` **DONE**.
+  `osJamMesg`/`osStopTimer_recomp` not yet reached.
+- PI/SI/EPI DMA shims: `osCreatePiManager_recomp`/`osCartRomInit_recomp`/
+  `osEPiStartDma_recomp`/`osVirtualToPhysical_recomp`/`osSetIntMask_recomp`/
+  `osInitialize_recomp`/`osAiSetFrequency_recomp` **DONE** (M1 wave), backed
+  by the new `fn64-runtime::rom` module (`RomStorage` trait, `PiDma`,
+  `InMemoryRom`) — see §3's new "The PI/ROM seam" subsection.
+  `__osSiRawStartDma_recomp`/`osSpTaskYielded_recomp` are loud, named
+  `unimplemented!()`s (no real PIF-controller/RSP-task-execution model
+  exists yet; see their doc comments in `fn64-abi/src/lib.rs` for why a
+  silently-succeeding stub would be worse). `osEPiStartDma_recomp`'s
+  `OSIoMesg` field-offset assumptions are flagged NOT YET byte-verified
+  against a real ROM struct-init call site — honest "not verified," not a
+  false "done," per `AGENTS.md`.
+- VI/AI shims: `osAiSetFrequency_recomp` **DONE**. The `osVi*` family
+  (`osViSetMode`/`osViSetSpecialFeatures`/`osViSetYScale`/`osViSwapBuffer`/
+  `osViBlack`) are loud, named `unimplemented!()`s (T2 per
+  `aki-recomp/runtime/M1-WORKLIST.md` — needed for the boot chain to
+  complete, but no display/VI-hardware backend exists in this crate yet;
+  that's `fn64-shell`'s wave-5 windowing piece). Implemented from the
+  union (not either game's current subset) per this section's original
+  guidance.
+- `recomp_overlays.inl` consumption **DONE** (M1 wave):
+  `fn64-runtime::overlay::SectionRegistry` (`Section`/`FuncEntry`, §1's
+  shapes) resolves `get_function`'s `vram -> recomp_func_t*` lookup,
+  correctly modeling NWXE's REAL bank-switch overlap (sections 2/5 and 3/4
+  both declare the same `ram_addr` range in the actual
+  `recomp_overlays.inl` — verified by reading the generated file directly)
+  via an explicit `loaded: HashSet<SectionIndex>` rather than a flat
+  address map, so only the currently-PI-mapped bank's functions resolve.
+
+**M1 gate (2026-07-14): WM2000 (NWXE) `RecompiledFuncs` links clean against
+`fn64-abi`.** Per `aki-recomp/runtime/M1-WORKLIST.md`'s 23-symbol undefined
+set (16 T1 + 7 T2): all 51 `RecompiledFuncs/*.c` files recompiled fresh from
+source, archived, and trial-linked (`-force_load` + a stub `main`, the same
+method `M1-WORKLIST.md` used to derive the 23-symbol set) against a
+release build of `fn64-abi` — **zero undefined symbols remain** beyond
+ordinary libc/pthread/dyld/Rust-runtime symbols (confirmed via `nm -u` on
+the linked binary, grepped for any `recomp`/`os*`/`switch_error`/`do_break`/
+`get_function`-shaped name: none found). T1 symbols are real, tested
+implementations; T2 VI-family symbols are loud named traps by design (no
+display backend exists yet), which is sufficient for THIS gate (a clean
+*link*, not a clean *boot to idle* — that's M1's "boot-to-idle parity"
+milestone in §4, separate and not yet attempted).
 
 **Wave 4 — `fn64-rt64` bridge (parallelizes against wave 3, converges at
 the RSP task boundary).**

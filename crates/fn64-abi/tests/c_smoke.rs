@@ -75,7 +75,7 @@ fn c_caller_links_and_runs_against_fn64_abi_staticlib() {
 
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
-        stdout.contains("linked and returned OK"),
+        stdout.contains("fn64-abi C smoke test: linked and returned OK"),
         "unexpected smoke test output: {stdout}"
     );
 }
