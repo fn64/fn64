@@ -252,4 +252,82 @@ impl<'a> Rdram<'a> {
         let shifted = val << (24 - misalign * 8);
         self.store_w(word_addr, masked | shifted);
     }
+
+    // --- 64-bit doubleword loads/stores (LD/SD/LLD/SCD) ---
+    //
+    // Clean-roomed from the MIPS III ISA and matching N64Recomp's
+    // `load_doubleword`/`SD` macros exactly: a doubleword is the two 32-bit
+    // words at `vaddr+0` (the high half) and `vaddr+4` (the low half). Each
+    // half goes through the ordinary word path (`load_w`/`store_w`) — word
+    // accesses carry NO sub-word swizzle — so the doubleword byte order comes
+    // out big-endian, high word first, exactly as the game's memory image
+    // holds it.
+
+    /// Load a 64-bit doubleword: `(hi_word << 32) | lo_word` where `hi_word` is
+    /// at `vaddr+0` and `lo_word` at `vaddr+4`.
+    #[inline]
+    pub fn load_d(&self, vaddr: u64) -> u64 {
+        let hi = self.load_w(vaddr) as u32 as u64;
+        let lo = self.load_w(vaddr.wrapping_add(4)) as u32 as u64;
+        (hi << 32) | lo
+    }
+
+    /// Store a 64-bit doubleword: the high word to `vaddr+0`, the low word to
+    /// `vaddr+4`.
+    #[inline]
+    pub fn store_d(&mut self, vaddr: u64, val: u64) {
+        self.store_w(vaddr, (val >> 32) as u32);
+        self.store_w(vaddr.wrapping_add(4), val as u32);
+    }
+
+    // --- Unaligned doubleword loads/stores (LDL/LDR/SDL/SDR) ---
+    //
+    // The 64-bit analogue of LWL/LWR/SWL/SWR: the pair together moves a full
+    // doubleword straddling an 8-byte boundary. Math mirrors N64Recomp's
+    // `do_ldl`/`do_ldr`/`do_sdl`/`do_sdr`, which is the ISA definition. The
+    // aligned dword the shift operates on is at `vaddr & !7`, and the shift
+    // distances use the 3-bit misalignment (0..7).
+
+    /// Load-doubleword-left: merge the high bytes of the addressed doubleword
+    /// into the high end of `initial` (the current register value).
+    #[inline]
+    pub fn load_dl(&self, initial: u64, vaddr: u64) -> u64 {
+        let dword_addr = vaddr & !0x7;
+        let loaded = self.load_d(dword_addr);
+        let misalign = (vaddr & 0x7) as u32;
+        let masked = initial & !(0xFFFF_FFFF_FFFF_FFFFu64 << (misalign * 8));
+        masked | (loaded << (misalign * 8))
+    }
+
+    /// Load-doubleword-right: merge the low bytes into the low end of `initial`.
+    #[inline]
+    pub fn load_dr(&self, initial: u64, vaddr: u64) -> u64 {
+        let dword_addr = vaddr & !0x7;
+        let loaded = self.load_d(dword_addr);
+        let misalign = (vaddr & 0x7) as u32;
+        let masked = initial & !(0xFFFF_FFFF_FFFF_FFFFu64 >> (56 - misalign * 8));
+        masked | (loaded >> (56 - misalign * 8))
+    }
+
+    /// Store-doubleword-left.
+    #[inline]
+    pub fn store_dl(&mut self, vaddr: u64, val: u64) {
+        let dword_addr = vaddr & !0x7;
+        let initial = self.load_d(dword_addr);
+        let misalign = (vaddr & 0x7) as u32;
+        let masked = initial & !(0xFFFF_FFFF_FFFF_FFFFu64 >> (misalign * 8));
+        let shifted = val >> (misalign * 8);
+        self.store_d(dword_addr, masked | shifted);
+    }
+
+    /// Store-doubleword-right.
+    #[inline]
+    pub fn store_dr(&mut self, vaddr: u64, val: u64) {
+        let dword_addr = vaddr & !0x7;
+        let initial = self.load_d(dword_addr);
+        let misalign = (vaddr & 0x7) as u32;
+        let masked = initial & !(0xFFFF_FFFF_FFFF_FFFFu64 << (56 - misalign * 8));
+        let shifted = val << (56 - misalign * 8);
+        self.store_d(dword_addr, masked | shifted);
+    }
 }
