@@ -55,8 +55,8 @@ thread_local! {
     /// `stand_in_target` below. A thread_local (not a plain static) to
     /// match every other piece of per-"thread" state this ABI layer keeps,
     /// even though this test only ever spawns one thread.
-    static SEED_GPRS: RefCell<[u64; 32]> = RefCell::new([0u64; 32]);
-    static MARKER_WRITTEN: RefCell<bool> = RefCell::new(false);
+    static SEED_GPRS: RefCell<[u64; 32]> = const { RefCell::new([0u64; 32]) };
+    static MARKER_WRITTEN: RefCell<bool> = const { RefCell::new(false) };
 }
 
 /// Stand-in for a real recompiled NW4E function (see module doc). Copies
@@ -133,14 +133,21 @@ fn state_transplant_runs_forward_from_a_real_reference_snapshot() {
     let section_size = 0x0001_0000u32;
     let resolved = fn64_diff::resolve_entry_point(resume_pc, &[(entry_vram, section_size)]);
     match resolved {
-        fn64_diff::ResolvedEntry::EnclosingFunction { entry_vram: found, .. } => {
+        fn64_diff::ResolvedEntry::EnclosingFunction {
+            entry_vram: found, ..
+        } => {
             assert_eq!(found, entry_vram)
         }
         other => panic!("expected EnclosingFunction, got {other:?}"),
     }
 
     let section_idx = unsafe {
-        fn64_abi::register_section(0, entry_vram, section_size, &[(0u32, 0u32, stand_in_target)])
+        fn64_abi::register_section(
+            0,
+            entry_vram,
+            section_size,
+            &[(0u32, 0u32, stand_in_target)],
+        )
     };
     fn64_abi::set_section_loaded(section_idx);
 

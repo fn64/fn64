@@ -25,7 +25,11 @@ pub struct Fn64Checkpoint {
 
 impl Fn64Checkpoint {
     pub fn new(label: impl Into<String>, pc: u32) -> Self {
-        Fn64Checkpoint { label: label.into(), pc, gprs: [None; 32] }
+        Fn64Checkpoint {
+            label: label.into(),
+            pc,
+            gprs: [None; 32],
+        }
     }
 
     pub fn with_gpr(mut self, index: usize, value: u64) -> Self {
@@ -44,17 +48,27 @@ impl Fn64Checkpoint {
 /// One field-level mismatch found at a checkpoint.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldDiff {
-    Gpr { index: usize, name: &'static str, ours: u64, reference: u64 },
-    Pc { ours: u32, reference: u32 },
+    Gpr {
+        index: usize,
+        name: &'static str,
+        ours: u64,
+        reference: u64,
+    },
+    Pc {
+        ours: u32,
+        reference: u32,
+    },
 }
 
 impl std::fmt::Display for FieldDiff {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FieldDiff::Gpr { name, ours, reference, .. } => write!(
-                f,
-                "{name}: ours=0x{ours:016x} reference=0x{reference:016x}"
-            ),
+            FieldDiff::Gpr {
+                name,
+                ours,
+                reference,
+                ..
+            } => write!(f, "{name}: ours=0x{ours:016x} reference=0x{reference:016x}"),
             FieldDiff::Pc { ours, reference } => {
                 write!(f, "pc: ours=0x{ours:08x} reference=0x{reference:08x}")
             }
@@ -93,11 +107,17 @@ impl CheckpointResult {
 /// `reference` must already have been queried via
 /// `OracleClient::registers_at(checkpoint.pc)` -- this function is pure and
 /// makes no subprocess calls, so it's cheap to unit test.
-pub fn compare_checkpoint(checkpoint: &Fn64Checkpoint, reference: &OracleRegisters) -> CheckpointResult {
+pub fn compare_checkpoint(
+    checkpoint: &Fn64Checkpoint,
+    reference: &OracleRegisters,
+) -> CheckpointResult {
     let mut diffs = Vec::new();
 
     if checkpoint.pc != reference.pc {
-        diffs.push(FieldDiff::Pc { ours: checkpoint.pc, reference: reference.pc });
+        diffs.push(FieldDiff::Pc {
+            ours: checkpoint.pc,
+            reference: reference.pc,
+        });
     }
 
     for (index, (ours, name)) in checkpoint.gprs.iter().zip(GPR_NAMES.iter()).enumerate() {
@@ -135,7 +155,9 @@ pub struct LockstepReport {
 
 impl LockstepReport {
     pub fn new() -> Self {
-        LockstepReport { checkpoints: Vec::new() }
+        LockstepReport {
+            checkpoints: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, checkpoint: Fn64Checkpoint, result: CheckpointResult) {
@@ -187,7 +209,14 @@ mod tests {
     use super::*;
 
     fn reference(pc: u32, gprs: [u64; 32]) -> OracleRegisters {
-        OracleRegisters { pc, gprs, cp0_status: 0, cp0_cause: 0, cp0_epc: 0, steps: 0 }
+        OracleRegisters {
+            pc,
+            gprs,
+            cp0_status: 0,
+            cp0_cause: 0,
+            cp0_epc: 0,
+            steps: 0,
+        }
     }
 
     #[test]
@@ -212,7 +241,12 @@ mod tests {
                 assert_eq!(diffs.len(), 1);
                 assert_eq!(
                     diffs[0],
-                    FieldDiff::Gpr { index: 29, name: "sp", ours: 0xBAD, reference: 0x8008_d098 }
+                    FieldDiff::Gpr {
+                        index: 29,
+                        name: "sp",
+                        ours: 0xBAD,
+                        reference: 0x8008_d098
+                    }
                 );
             }
             other => panic!("expected Diverged, got {other:?}"),
@@ -238,7 +272,13 @@ mod tests {
         let result = compare_checkpoint(&checkpoint, &reference(0x801187ac, [0u64; 32]));
         match result {
             CheckpointResult::Diverged { diffs } => {
-                assert_eq!(diffs[0], FieldDiff::Pc { ours: 0x801187b0, reference: 0x801187ac });
+                assert_eq!(
+                    diffs[0],
+                    FieldDiff::Pc {
+                        ours: 0x801187b0,
+                        reference: 0x801187ac
+                    }
+                );
             }
             other => panic!("expected Diverged, got {other:?}"),
         }
@@ -251,10 +291,18 @@ mod tests {
         report.push(
             Fn64Checkpoint::new("cp1", 0x1004),
             CheckpointResult::Diverged {
-                diffs: vec![FieldDiff::Gpr { index: 4, name: "a0", ours: 1, reference: 2 }],
+                diffs: vec![FieldDiff::Gpr {
+                    index: 4,
+                    name: "a0",
+                    ours: 1,
+                    reference: 2,
+                }],
             },
         );
-        report.push(Fn64Checkpoint::new("cp2", 0x1008), CheckpointResult::PcNotReached { pc: 0x1008 });
+        report.push(
+            Fn64Checkpoint::new("cp2", 0x1008),
+            CheckpointResult::PcNotReached { pc: 0x1008 },
+        );
 
         let (cp, result) = report.first_divergence().expect("should find a divergence");
         assert_eq!(cp.label, "cp1");

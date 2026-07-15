@@ -54,16 +54,16 @@ const TLB_ENTRY_COUNT: usize = 32;
 /// u32 pfn_even, u8 c_even, u8 d_even, u8 v_even, +1 pad, u32 pfn_odd, u8
 /// c_odd, u8 d_odd, u8 v_odd, u8 r, u32 start_even, u32 end_even, u32
 /// phys_even, u32 start_odd, u32 end_odd, u32 phys_odd.
-const TLB_ENTRY_PACKED_SIZE: usize = 2 + 4 + 1 + 1 + 2 + 4 + 1 + 1 + 1 + 1 + 4 + 1 + 1 + 1 + 1
-    + 4 + 4 + 4 + 4 + 4 + 4;
+const TLB_ENTRY_PACKED_SIZE: usize =
+    2 + 4 + 1 + 1 + 2 + 4 + 1 + 1 + 1 + 1 + 4 + 1 + 1 + 1 + 1 + 4 + 4 + 4 + 4 + 4 + 4;
 
 /// GPR/CP0 register names in R4300/o32 order, matching the oracle's own
 /// `GPR_NAMES` (`roms/NW4E/gates/oracle/src/main.rs`) for cross-checking
 /// printed output by eye.
 pub const GPR_NAMES: [&str; 32] = [
     "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
-    "t7", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp",
-    "fp", "ra",
+    "t7", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp",
+    "ra",
 ];
 
 /// CP0 register indices this crate names explicitly (the ones state
@@ -330,24 +330,28 @@ mod tests {
         buf.extend_from_slice(b"00000000000000000000000000000000".as_slice()[..32].as_ref());
 
         // device-register prefix, all zeroed, sized to match `parse`'s skips.
-        buf.extend(std::iter::repeat(0u8).take(10 * 4 + 4)); // rdram_regs + pad
-        buf.extend(std::iter::repeat(0u8).take(4 + 4 + 4 + 4 + 4 + 4 + 8)); // mi block
-        buf.extend(std::iter::repeat(0u8).take(13 * 4)); // pi
-        buf.extend(std::iter::repeat(0u8).take(4 * 4 + 4 + 4 + 16 + 4 + 4 + 4 + 4 + 4)); // sp
-        buf.extend(std::iter::repeat(0u8).take(4 * 4)); // si
-        buf.extend(std::iter::repeat(0u8).take(14 * 4 + 4)); // vi
-        buf.extend(std::iter::repeat(0u8).take(8 * 4)); // ri
-        buf.extend(std::iter::repeat(0u8).take(6 * 4 + 4 * 4)); // ai
-        buf.extend(std::iter::repeat(0u8).take(
+        buf.extend(std::iter::repeat_n(0u8, 10 * 4 + 4)); // rdram_regs + pad
+        buf.extend(std::iter::repeat_n(0u8, 4 + 4 + 4 + 4 + 4 + 4 + 8)); // mi block
+        buf.extend(std::iter::repeat_n(0u8, 13 * 4)); // pi
+        buf.extend(std::iter::repeat_n(
+            0u8,
+            4 * 4 + 4 + 4 + 16 + 4 + 4 + 4 + 4 + 4,
+        )); // sp
+        buf.extend(std::iter::repeat_n(0u8, 4 * 4)); // si
+        buf.extend(std::iter::repeat_n(0u8, 14 * 4 + 4)); // vi
+        buf.extend(std::iter::repeat_n(0u8, 8 * 4)); // ri
+        buf.extend(std::iter::repeat_n(0u8, 6 * 4 + 4 * 4)); // ai
+        buf.extend(std::iter::repeat_n(
+            0u8,
             4 + 4 + 4 + 4 + 4 + 12 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4,
         )); // dpc/dps
 
-        buf.extend(std::iter::repeat(0xABu8).take(RDRAM_MAX_SIZE));
-        buf.extend(std::iter::repeat(0u8).take(SP_MEM_SIZE));
-        buf.extend(std::iter::repeat(0u8).take(PIF_RAM_SIZE));
-        buf.extend(std::iter::repeat(0u8).take(4 + 4 + 8 + 4 + 4)); // flashram block
-        buf.extend(std::iter::repeat(0u8).take(TLB_LUT_ELEMS * 4 * 2)); // LUT_r + LUT_w
-        buf.extend(std::iter::repeat(0u8).take(4)); // llbit
+        buf.extend(std::iter::repeat_n(0xABu8, RDRAM_MAX_SIZE));
+        buf.extend(std::iter::repeat_n(0u8, SP_MEM_SIZE));
+        buf.extend(std::iter::repeat_n(0u8, PIF_RAM_SIZE));
+        buf.extend(std::iter::repeat_n(0u8, 4 + 4 + 8 + 4 + 4)); // flashram block
+        buf.extend(std::iter::repeat_n(0u8, TLB_LUT_ELEMS * 4 * 2)); // LUT_r + LUT_w
+        buf.extend(std::iter::repeat_n(0u8, 4)); // llbit
 
         for g in gprs {
             buf.extend_from_slice(&g.to_le_bytes());
@@ -357,10 +361,13 @@ mod tests {
         }
         buf.extend_from_slice(&0u64.to_le_bytes()); // mult_lo
         buf.extend_from_slice(&0u64.to_le_bytes()); // mult_hi
-        buf.extend(std::iter::repeat(0u8).take(FPR_COUNT * 8)); // fprs
+        buf.extend(std::iter::repeat_n(0u8, FPR_COUNT * 8)); // fprs
         buf.extend_from_slice(&0u32.to_le_bytes()); // fcr0
         buf.extend_from_slice(&0u32.to_le_bytes()); // fcr31
-        buf.extend(std::iter::repeat(0u8).take(TLB_ENTRY_COUNT * TLB_ENTRY_PACKED_SIZE));
+        buf.extend(std::iter::repeat_n(
+            0u8,
+            TLB_ENTRY_COUNT * TLB_ENTRY_PACKED_SIZE,
+        ));
 
         buf.extend_from_slice(&pc.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // next_interrupt

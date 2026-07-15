@@ -45,14 +45,23 @@ pub struct OracleRegisters {
 #[derive(Debug)]
 pub enum OracleError {
     Spawn(std::io::Error),
-    NonZeroExit { status: i32, stderr: String },
-    UnparseableOutput { stdout: String, reason: &'static str },
+    NonZeroExit {
+        status: i32,
+        stderr: String,
+    },
+    UnparseableOutput {
+        stdout: String,
+        reason: &'static str,
+    },
     /// The oracle's own honest failure mode: the requested `--break-at` PC
     /// was never reached within its step budget (e.g. `ORACLE_STEP_LIMIT`
     /// exhausted, or fn64 diverged onto a PC the real game never visits).
     /// This is itself a meaningful lockstep signal, not a harness bug --
     /// see [`OracleClient::registers_at`]'s doc.
-    BreakpointNeverHit { target_pc: u32, stdout: String },
+    BreakpointNeverHit {
+        target_pc: u32,
+        stdout: String,
+    },
 }
 
 impl std::fmt::Display for OracleError {
@@ -129,7 +138,8 @@ impl OracleClient {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
         if !output.status.success() {
-            if stdout.contains("was not reached within") || stderr.contains("was not reached within")
+            if stdout.contains("was not reached within")
+                || stderr.contains("was not reached within")
             {
                 return Err(OracleError::BreakpointNeverHit { target_pc, stdout });
             }
@@ -175,18 +185,18 @@ fn parse_breakpoint_output(stdout: &str, target_pc: u32) -> Result<OracleRegiste
         reason: "ORACLE_CAPTURE_V1 line is not well-formed JSON",
     })?;
 
-    let pc_str = json
-        .get_str("pc")
-        .ok_or(OracleError::UnparseableOutput {
-            stdout: stdout.to_string(),
-            reason: "capture JSON missing string field 'pc'",
-        })?;
+    let pc_str = json.get_str("pc").ok_or(OracleError::UnparseableOutput {
+        stdout: stdout.to_string(),
+        reason: "capture JSON missing string field 'pc'",
+    })?;
     let pc = parse_hex_u64(pc_str) as u32;
 
-    let gpr_strs = json.get_str_array("gpr").ok_or(OracleError::UnparseableOutput {
-        stdout: stdout.to_string(),
-        reason: "capture JSON missing array field 'gpr'",
-    })?;
+    let gpr_strs = json
+        .get_str_array("gpr")
+        .ok_or(OracleError::UnparseableOutput {
+            stdout: stdout.to_string(),
+            reason: "capture JSON missing array field 'gpr'",
+        })?;
     if gpr_strs.len() != 32 {
         return Err(OracleError::UnparseableOutput {
             stdout: stdout.to_string(),
@@ -210,9 +220,19 @@ fn parse_breakpoint_output(stdout: &str, target_pc: u32) -> Result<OracleRegiste
             reason: "missing or unparseable cp0_status=... line",
         })?;
 
-    debug_assert_eq!(pc, target_pc, "breakpoint reported a different PC than requested");
+    debug_assert_eq!(
+        pc, target_pc,
+        "breakpoint reported a different PC than requested"
+    );
 
-    Ok(OracleRegisters { pc, gprs, cp0_status, cp0_cause, cp0_epc, steps })
+    Ok(OracleRegisters {
+        pc,
+        gprs,
+        cp0_status,
+        cp0_cause,
+        cp0_epc,
+        steps,
+    })
 }
 
 fn parse_cp0_line(line: &str) -> Option<(u32, u32, u32)> {

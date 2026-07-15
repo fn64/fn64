@@ -42,7 +42,7 @@ pub mod lockstep;
 pub mod oracle_client;
 pub mod savestate;
 
-use fn64_runtime::{RdramAddr, Rdram};
+use fn64_runtime::{Rdram, RdramAddr};
 
 pub use savestate::{ParseError, Snapshot, CP0_CAUSE, CP0_EPC, CP0_STATUS, GPR_NAMES};
 
@@ -66,7 +66,12 @@ pub use savestate::{ParseError, Snapshot, CP0_CAUSE, CP0_EPC, CP0_STATUS, GPR_NA
 /// here rather than silently assumed. See `bin/dump_snapshot.rs`'s report
 /// output for the honest caveat surfaced to the operator.
 pub fn to_fn64_rdram(snapshot: &Snapshot) -> Rdram {
-    let mut rdram = Rdram::new(snapshot.rdram.len().max(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE));
+    let mut rdram = Rdram::new(
+        snapshot
+            .rdram
+            .len()
+            .max(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE),
+    );
     let mut swapped = snapshot.rdram.clone();
     for word in swapped.chunks_exact_mut(4) {
         word.swap(0, 3);
@@ -115,7 +120,10 @@ pub enum ResolvedEntry {
     /// its own top, which is a materially different (and likely
     /// incorrect-for-this-invocation) execution than truly resuming
     /// mid-body. Reported honestly, not silently substituted.
-    EnclosingFunction { entry_vram: u32, offset_into_fn: u32 },
+    EnclosingFunction {
+        entry_vram: u32,
+        offset_into_fn: u32,
+    },
     /// No registered function's range contains the resume PC at all.
     NotFound,
 }
@@ -218,6 +226,9 @@ mod tests {
     #[test]
     fn resolve_entry_point_not_found() {
         let entries = [(0x8000_1000, 0x40)];
-        assert_eq!(resolve_entry_point(0x8009_9999, &entries), ResolvedEntry::NotFound);
+        assert_eq!(
+            resolve_entry_point(0x8009_9999, &entries),
+            ResolvedEntry::NotFound
+        );
     }
 }
