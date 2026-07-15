@@ -2458,38 +2458,87 @@ pub unsafe extern "C" fn __osSpSetPc_recomp(_rdram: *mut u8, _ctx: *mut RecompCo
 #[no_mangle]
 pub unsafe extern "C" fn __osSpSetStatus_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
 
-/// `osContGetQuery(int channel, OSContStatus *data) -> s32` -- `a0`=channel
-/// (`ctx->r4`), `a1`=data (`ctx->r5`). Public libultra manual's documented
-/// counterpart to `osContStartQuery`/`__osSiRawStartDma`'s PIF probe --
-/// `OSContStatus` is `{type: u16, status: u8, errno: u8}`, the SAME 3-byte
-/// `[type_hi, type_lo, status]` shape `PifModel::query_response` already
-/// produces for `__osSiRawStartDma_recomp`'s raw PIF-block path (rung 15's
-/// `osContStartQuery`/`osContGetQuery` pair is PadMgr's own higher-level
-/// wrapper over that same raw mechanism, per the public manual). No real
-/// `jal` call site in this corpus's static analysis (function-table slot
-/// only, `recomp_overlays.inl:2934`) -- reached via PadMgr's own internal
-/// polling per BOOT-PLAN.md rung 15, so implemented for real rather than
-/// loud-trapped.
+/// `osContGetQuery(OSContStatus *data)` -- ONE argument, `a0`=data
+/// (`ctx->r4`), returns void. Byte-verified against the OoT decomp
+/// (`oot-decomp/src/libultra/io/contquery.c:31`,
+/// `void osContGetQuery(OSContStatus* data)`) and its real call site
+/// `PadSetup_Init` (`oot-decomp/src/libu64/padsetup.c:19`,
+/// `osContGetQuery(status)` where `status = padMgr->padStatus`, an
+/// `OSContStatus[MAXCONTROLLERS]` array). The generated call site confirms
+/// the shape: `funcs_55.c:2193` sets only `$a0` (`ctx->r4 = ctx->r16`, the
+/// `padStatus` pointer) and leaves `$a1` UNSET -- a prior wave's
+/// `(int channel, OSContStatus* data)` signature read the data pointer from
+/// the stale `$a1`/`ctx->r5` (garbage left by the preceding `osRecvMesg`
+/// whose asm 0x800CD438 sets `$a1 = 0`), then dereferenced it: a real
+/// EXC_BAD_ACCESS deep in `Main -> PadMgr_Init -> PadSetup_Init` on OoT's
+/// first controller-status probe, which is why boot never yielded again
+/// after DmaMgr delivered the code-segment DMA (thread 3 died mid-C, before
+/// the next shim/yield).
+///
+/// Fills the whole `OSContStatus[MAXCONTROLLERS]` array, one entry per port
+/// (`__osContGetInitData`, `oot-decomp/src/libultra/io/controller.c:58`,
+/// iterates all `__osMaxControllers` and advances `data++` each). Each
+/// 4-byte entry is `{type: u16 @0, status: u8 @2, errno: u8 @3}`
+/// (`oot-decomp/include/ultra64/controller.h:121`). The game reads these
+/// back with `MEM_HU`/`MEM_BU` (`funcs_55.c:2205/2214`:
+/// `MEM_BU(reg,3)`=errno, `MEM_HU(reg,0)`=type, compared `== 0x0005`
+/// = `CONT_TYPE_NORMAL`), whose `^2`/`^3` sub-word swizzle
+/// (`refs/N64RecompSource/include/recomp.h:104-108`) requires each logical
+/// N64 struct byte at struct-offset `o` to live in the host buffer at
+/// `(base + o) ^ 3` -- so a present port-0 standard controller must read
+/// `type == 0x0005, errno == 0`, and absent ports 1-3 must read a non-zero
+/// `errno` (`CONT_NO_RESPONSE_ERROR = 0x08`,
+/// `oot-decomp/include/ultra64/controller.h:66`, the value
+/// `CHNL_ERR(no-response) = (0x80 >> 4)` yields) so `PadSetup_Init`'s
+/// `switch (status[i].errno)` skips them.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osContGetQuery_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
-    let channel = ctx.r4 as usize;
-    let data_addr = RdramAddr::from_gpr(ctx.r5).offset() as usize;
-    let resp = with_executor(|exec| exec.pif().query_response(channel));
-    unsafe {
-        // OSContStatus: type (u16, big-endian on real hardware's PIF wire
-        // format, matching query_response's existing [hi, lo, status]
-        // byte order) followed by status/errno bytes.
-        *rdram.add(data_addr) = resp[0];
-        *rdram.add(data_addr + 1) = resp[1];
-        *rdram.add(data_addr + 2) = resp[2];
-        *rdram.add(data_addr + 3) = 0; // errno: no error modeled
+    let data_addr = RdramAddr::from_gpr(ctx.r4).offset() as usize;
+    let pif = with_executor(|exec| *exec.pif());
+    for port in 0..MAXCONTROLLERS {
+        let resp = pif.query_response(port);
+        let absent = (resp[2] & fn64_runtime::si::CONT_ABSENT) != 0;
+        // `query_response` returns the PIF wire bytes `[typeh, typel,
+        // status]`. `__osContGetInitData` assembles the game-visible
+        // `OSContStatus.type` u16 as `typel << 8 | typeh`
+        // (`controller.c:72`), i.e. `(resp[1] << 8) | resp[0]` -- so a
+        // standard controller (`[0x05, 0x00, ..]`) becomes `0x0005 =
+        // CONT_TYPE_NORMAL`, which is what `PadSetup_Init` compares against.
+        // The 4 logical N64 struct bytes are `type` (u16, big-endian: hi @0,
+        // lo @1), `status` @2, `errno` @3. An absent port reports no-response
+        // in `errno` with type/status left zero (matching the decomp's
+        // `if (data->errno) continue;`, which never writes them on error).
+        let type_u16: u16 = ((resp[1] as u16) << 8) | resp[0] as u16;
+        let entry: [u8; 4] = if absent {
+            [0, 0, 0, CONT_NO_RESPONSE_ERROR]
+        } else {
+            [(type_u16 >> 8) as u8, (type_u16 & 0xFF) as u8, resp[2], 0]
+        };
+        let base = data_addr + port * 4;
+        // Store each logical byte at its `^3`-swizzled host position so the
+        // game's MEM_HU/MEM_BU reads (recomp.h) recover the right values --
+        // see the doc comment above for the byte-order derivation.
+        for (o, &b) in entry.iter().enumerate() {
+            unsafe {
+                *rdram.add((base + o) ^ 3) = b;
+            }
+        }
     }
-    ctx.r2 = 0;
 }
+
+/// `CONT_NO_RESPONSE_ERROR` (`oot-decomp/include/ultra64/controller.h:66`):
+/// the `OSContStatus.errno` value an absent/non-responding controller port
+/// reports (`CHNL_ERR` of a PIF no-response = `(CHNL_ERR_NORESP=0x80) >> 4`).
+const CONT_NO_RESPONSE_ERROR: u8 = 0x08;
+
+/// `MAXCONTROLLERS` (`oot-decomp/include/ultra64/controller.h:9`): the N64
+/// has four controller ports; `osContGetQuery` fills one `OSContStatus` per
+/// port.
+const MAXCONTROLLERS: usize = 4;
 
 /// `osContGetReadData(OSContPad *pad) -> s32` -- `a0`=`ctx->r4`. Public
 /// libultra manual's documented `OSContPad` layout: `button` (u16),
@@ -3769,6 +3818,89 @@ mod tests {
             raw as u32 & fn64_runtime::AI_STATUS_BUSY,
             fn64_runtime::AI_STATUS_BUSY
         );
+    }
+
+    /// Regression for the OoT-boot `PadSetup_Init` EXC_BAD_ACCESS: the real
+    /// `osContGetQuery(OSContStatus* data)` takes its ONLY argument (the
+    /// array pointer) in `$a0`/`ctx.r4`; the buggy prior signature read it
+    /// from `$a1`/`ctx.r5`, which the real call site (`funcs_55.c:2193`)
+    /// leaves as stale garbage, so the shim dereferenced a wild pointer.
+    ///
+    /// This test wires `r4` and `r5` to two DIFFERENT, both-valid rdram
+    /// addresses and asserts the OSContStatus array lands at `r4`'s address
+    /// (and that `r5`'s address is untouched) -- so reintroducing the bug
+    /// (reading the pointer from `r5`) makes it fail rather than pass. It
+    /// also checks all four ports are filled with the exact byte-swizzled
+    /// values the game's own MEM_HU/MEM_BU reads recover: port 0 a present
+    /// standard controller (`type == 0x0005 == CONT_TYPE_NORMAL`, `errno ==
+    /// 0`), ports 1-3 absent (`errno == CONT_NO_RESPONSE_ERROR == 0x08`).
+    #[test]
+    fn os_cont_get_query_reads_array_pointer_from_a0_and_fills_all_ports() {
+        // Fresh PIF state (default: port 0 standard, 1-3 absent).
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+
+        let mut buf = vec![0u8; fn64_runtime::RDRAM_MMIO_WINDOW_END as usize];
+
+        // Two distinct, both-valid vram addresses. r4 = the REAL data
+        // pointer the game passes; r5 = a decoy the buggy shim would have
+        // used. Kept 0x40 apart so the 0x10-byte (4 * OSContStatus) write
+        // regions can't overlap.
+        let data_vram: u64 = 0xFFFF_FFFF_8020_0000;
+        let decoy_vram: u64 = 0xFFFF_FFFF_8020_0040;
+        let data_off = RdramAddr::from_gpr(data_vram).offset() as usize;
+        let decoy_off = RdramAddr::from_gpr(decoy_vram).offset() as usize;
+
+        // Pre-poison the decoy region with a sentinel so "untouched" is a
+        // real, checkable statement, not "happened to already be zero".
+        for i in 0..0x10 {
+            buf[decoy_off + i] = 0xAB;
+        }
+
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = data_vram;
+        ctx.r5 = decoy_vram;
+        unsafe { osContGetQuery_recomp(buf.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // Read each OSContStatus exactly as the generated game code does:
+        // MEM_HU(base, 0) = *(u16*)(rdram + (base ^ 2)); MEM_BU(base, 3) =
+        // *(u8*)(rdram + ((base + 3) ^ 3)) (recomp.h). Reading through the
+        // same swizzle the reader uses is what makes this a faithful check
+        // rather than an encoding of whatever byte order the writer chose.
+        let read_type = |base: usize| -> u16 {
+            let a = base ^ 2;
+            u16::from_ne_bytes([buf[a], buf[a + 1]])
+        };
+        let read_errno = |base: usize| -> u8 { buf[(base + 3) ^ 3] };
+
+        // Port 0: present standard controller.
+        let p0 = data_off;
+        assert_eq!(
+            read_type(p0),
+            0x0005,
+            "port 0 type must read as CONT_TYPE_NORMAL (0x0005) via the game's MEM_HU"
+        );
+        assert_eq!(read_errno(p0), 0, "port 0 (present) has no channel error");
+
+        // Ports 1-3: absent -> non-zero errno so PadSetup_Init skips them.
+        for port in 1..4usize {
+            let base = data_off + port * 4;
+            assert_eq!(
+                read_errno(base),
+                0x08,
+                "absent port {port} must report CONT_NO_RESPONSE_ERROR (0x08)"
+            );
+        }
+
+        // The decoy region (r5's address) must be completely untouched --
+        // proves the pointer came from r4, not r5. Under the old bug this
+        // region would have been written (and r4's region left as zeros).
+        for i in 0..0x10 {
+            assert_eq!(
+                buf[decoy_off + i], 0xAB,
+                "byte {i} at the r5/decoy address was written -- the shim read \
+                 its pointer from the wrong register (the reintroduced bug)"
+            );
+        }
     }
 
     #[no_mangle]
