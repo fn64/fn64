@@ -197,6 +197,16 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
         if next_is_leader {
             let _ = writeln!(out, "            pc = {:#010X};", next_vram);
             let _ = writeln!(out, "        }}");
+        } else if next_vram >= func_end {
+            // This straight-line instruction is the LAST word of the function
+            // (e.g. a padding `nop` sitting after a `jr $ra` return, which is
+            // common alignment tail). Its arm was opened but has no successor
+            // to fall through to, so close it explicitly — otherwise the block
+            // dangles into the `_ =>` catch-all and the emitted Rust has an
+            // unbalanced brace. Assign `pc` past the function so the loop's
+            // `_ =>` arm is the (unreachable) terminator.
+            let _ = writeln!(out, "            pc = {:#010X};", next_vram);
+            let _ = writeln!(out, "        }}");
         }
         i += 1;
     }
@@ -819,6 +829,84 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
         }
         CLeD { fs, ft } => {
             line(out, format!("ctx.fpu_cond = ctx.f_d({}) <= ctx.f_d({});", fs, ft))
+        }
+
+        // --- COP0 system control ---
+        //
+        // Count (reg 9) and Compare (reg 11) are the only COP0 registers a
+        // recompiled body legitimately touches (via osGetCount / the timer
+        // path); they live in the typed context as real state. Every other
+        // COP0 register (Status/Cause/EPC/…) is libultra-managed, and the raw
+        // TLB / ERET ops are privileged — those become loud traps, never a
+        // silent nop, so a game that unexpectedly executes one fails audibly.
+        Mfc0 { rt, cop0d } => match cop0d {
+            9 => line(out, format!("ctx.set_r32({}, ctx.cop0_count as i32);", rt)),
+            11 => line(out, format!("ctx.set_r32({}, ctx.cop0_compare as i32);", rt)),
+            other => line(
+                out,
+                format!(
+                    "panic!(\"unsupported mfc0 from COP0 register {} (libultra-managed); \
+                     fn64-recomp-native only models Count(9)/Compare(11)\");",
+                    other
+                ),
+            ),
+        },
+        Mtc0 { rt, cop0d } => match cop0d {
+            9 => line(out, format!("ctx.cop0_count = {};", ru32(rt))),
+            11 => line(out, format!("ctx.cop0_compare = {};", ru32(rt))),
+            other => line(
+                out,
+                format!(
+                    "panic!(\"unsupported mtc0 to COP0 register {} (libultra-managed); \
+                     fn64-recomp-native only models Count(9)/Compare(11)\");",
+                    other
+                ),
+            ),
+        },
+        Dmfc0 { cop0d, .. } => line(
+            out,
+            format!(
+                "panic!(\"unsupported dmfc0 from COP0 register {} (64-bit privileged access)\");",
+                cop0d
+            ),
+        ),
+        Dmtc0 { cop0d, .. } => line(
+            out,
+            format!(
+                "panic!(\"unsupported dmtc0 to COP0 register {} (64-bit privileged access)\");",
+                cop0d
+            ),
+        ),
+        Eret => line(
+            out,
+            "panic!(\"eret executed in recompiled code: exception return is host/libultra territory\");"
+                .to_string(),
+        ),
+        Tlbwi => line(out, "panic!(\"tlbwi: TLB is host-managed, not modeled\");".to_string()),
+        Tlbwr => line(out, "panic!(\"tlbwr: TLB is host-managed, not modeled\");".to_string()),
+        Tlbp => line(out, "panic!(\"tlbp: TLB is host-managed, not modeled\");".to_string()),
+        Tlbr => line(out, "panic!(\"tlbr: TLB is host-managed, not modeled\");".to_string()),
+
+        // --- Cache / sync: no-ops on a coherent host rdram ---
+        Cache { op, .. } => {
+            line(out, format!("// cache op {:#04X}: no-op (host rdram is coherent)", op))
+        }
+        Sync => line(out, "// sync: no-op (single-threaded recompiled context)".to_string()),
+
+        // --- COP2: unused coprocessor, loud trap ---
+        Mfc2 { .. } | Mtc2 { .. } | Cfc2 { .. } | Ctc2 { .. } => line(
+            out,
+            "panic!(\"COP2 access in recompiled code: COP2 is unused on the N64 and not modeled\");"
+                .to_string(),
+        ),
+
+        // --- Traps ---
+        Syscall { code } => line(
+            out,
+            format!("panic!(\"syscall (code {:#X}) executed in recompiled code\");", code),
+        ),
+        Break { code } => {
+            line(out, format!("panic!(\"break (code {:#X}) executed in recompiled code\");", code))
         }
 
         // Control transfers are never emitted here.

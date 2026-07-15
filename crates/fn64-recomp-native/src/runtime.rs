@@ -55,6 +55,15 @@ pub struct RecompContext {
     /// promoted to context state (equivalent: a compare always precedes the
     /// branch that reads it, so lifetime is irrelevant to the result).
     pub fpu_cond: bool,
+    /// COP0 register 9, `Count`: the free-running cycle counter that backs
+    /// `osGetCount`. It is the one COP0 read a recompiled body legitimately
+    /// performs (`MFC0 rt, $9`); the host advances it. Modeled as real state
+    /// rather than trapped, unlike the libultra-managed Status/Cause/EPC.
+    pub cop0_count: u32,
+    /// COP0 register 11, `Compare`: the timer-interrupt threshold written via
+    /// `MTC0 rt, $11` on the `osSetTimer` path. Stored so the write round-trips;
+    /// the interrupt it would schedule is the host's concern.
+    pub cop0_compare: u32,
 }
 
 impl RecompContext {

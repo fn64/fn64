@@ -272,9 +272,16 @@ fn decode_loads_and_stores() {
 #[test]
 fn decode_nop_and_unknown() {
     assert_eq!(decode(0x00000000), Instruction::Nop);
-    // An op we don't cover must decode Unknown, never a wrong op. COP2 (opcode
-    // 0x12) is out of scope for this CPU decoder; 0x48856000 is such a word.
-    assert!(matches!(decode(0x48856000), Instruction::Unknown { .. }));
+    // An op we don't cover must decode Unknown, never a wrong op. Opcode 0x1E
+    // is an unassigned/reserved MIPS III main opcode, so 0x78012345 (opcode
+    // 0x1E) is never a real instruction and must stay Unknown. (Note: the COP2
+    // *move* ops at opcode 0x12 ARE now decoded as named loud-trap stubs by the
+    // cop0 family, so a COP2 move word is no longer Unknown — see
+    // `cop0::decode_cop2_stubs`. This case uses a genuinely reserved opcode.)
+    assert!(matches!(decode(0x78012345), Instruction::Unknown { .. }));
+    // A COP2 sub-op we do not model (rs=0x08 = BC2) is still Unknown, not a
+    // wrong op: 0x49000000 (opcode 0x12, rs 0x08).
+    assert!(matches!(decode(0x49000000), Instruction::Unknown { .. }));
     // A COP1 word with an unimplemented `funct` (e.g. RECIP.S, funct 0x15,
     // which OoT does not emit) is likewise Unknown, not a silent mis-decode.
     // recip.s $f0,$f2 = 0x46001015 (fmt=S, funct=0x15).
