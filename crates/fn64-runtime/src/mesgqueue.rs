@@ -179,6 +179,24 @@ impl MesgQueue {
         SendResult::Delivered
     }
 
+    /// Non-blocking front-insert (`osJamMesg`). Inserts at the HEAD of the
+    /// ring (next to be received) rather than the tail, matching
+    /// libultra `jammesg.c:16-17`: `first = (first + msgCount - 1) % msgCount;
+    /// msg[first] = msg`. Returns `WouldBlock` if the queue is full; the
+    /// caller then blocks like a blocked sender. Mirrors `try_send`'s shape.
+    pub fn try_jam(&mut self, msg: Mesg) -> SendResult {
+        if self.is_full() {
+            return SendResult::WouldBlock;
+        }
+        // Decrement-first-mod-capacity: step `first` back one slot (with
+        // wraparound) and write there, so this message is the next popped.
+        let cap = self.buffer.len();
+        self.first = (self.first + cap - 1) % cap;
+        self.buffer[self.first] = msg;
+        self.valid_count += 1;
+        SendResult::Delivered
+    }
+
     /// Non-blocking recv attempt (mirrors `try_send`).
     pub fn try_recv(&mut self) -> RecvResult {
         if self.is_empty_queue() {
@@ -280,6 +298,26 @@ mod tests {
         let woken = q.wake_one_sender();
         assert_eq!(woken, Some(42));
         assert!(!q.has_blocked_senders());
+    }
+
+    /// `osJamMesg` front-insert: a jammed message must be received BEFORE
+    /// messages already queued (FIFO order is subverted at the head), and
+    /// wrap correctly when `first` is at 0. Fails against a back-insert bug.
+    #[test]
+    fn jam_inserts_at_front_and_wraps() {
+        let mut q = MesgQueue::new(3);
+        assert_eq!(q.try_send(0x1111), SendResult::Delivered);
+        assert_eq!(q.try_send(0x2222), SendResult::Delivered);
+        // Jam a high-priority message: it must jump the queue.
+        assert_eq!(q.try_jam(0x9999), SendResult::Delivered);
+        // Head-of-line: the jammed message comes out first, before 0x1111.
+        assert_eq!(q.try_recv(), RecvResult::Delivered(0x9999));
+        assert_eq!(q.try_recv(), RecvResult::Delivered(0x1111));
+        assert_eq!(q.try_recv(), RecvResult::Delivered(0x2222));
+        // Full queue rejects a jam, like try_send.
+        let mut full = MesgQueue::new(1);
+        assert_eq!(full.try_send(1), SendResult::Delivered);
+        assert_eq!(full.try_jam(2), SendResult::WouldBlock);
     }
 
     /// The bug this session's OoT boot run actually hit: a blocked

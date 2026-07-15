@@ -630,15 +630,24 @@ impl Executor {
     /// "Send/recv as coroutine yield points, not thread ops" -- those two
     /// steps happen back-to-back with nothing else running in between,
     /// because this whole function executes on the single executor thread.
-    fn try_deliver_send(&mut self, sender: ThreadId, mq_addr: RdramAddr, msg: Mesg) -> SendOutcome {
+    fn try_deliver_send(
+        &mut self,
+        sender: ThreadId,
+        mq_addr: RdramAddr,
+        msg: Mesg,
+        jam: bool,
+    ) -> SendOutcome {
         if std::env::var("FN64_DEBUG_SEND").is_ok() {
             eprintln!(
-                "[DEBUG try_deliver_send] sender={sender} mq_addr_offset={:#x} msg={msg:#x}",
+                "[DEBUG try_deliver_send] sender={sender} mq_addr_offset={:#x} msg={msg:#x} \
+                 jam={jam}",
                 mq_addr.offset()
             );
         }
         let queue = self.queue_mut(mq_addr);
         if queue.has_blocked_receivers() {
+            // Direct hand-off to a waiting receiver: identical for send and
+            // jam (there is nothing queued, so head vs tail is moot).
             let waiter = queue
                 .wake_one_receiver()
                 .expect("has_blocked_receivers() was true");
@@ -648,7 +657,13 @@ impl Executor {
             self.mirror_queue_to_rdram(mq_addr);
             return SendOutcome::Delivered;
         }
-        let outcome = match queue.try_send(msg) {
+        // Front-insert for jam (osJamMesg), tail-insert for send.
+        let insert = if jam {
+            queue.try_jam(msg)
+        } else {
+            queue.try_send(msg)
+        };
+        let outcome = match insert {
             SendResult::Delivered => {
                 self.record_queue_op(mq_addr, QueueOpKind::Send, sender);
                 SendOutcome::Delivered
@@ -875,13 +890,14 @@ impl Executor {
                 mq_addr,
                 msg,
                 may_block,
+                jam,
             } => {
                 // Symmetric with BlockOnRecv above: check first, since the
                 // queue may have gained space (or a receiver may already be
                 // waiting) by the time the coroutine actually suspended --
                 // only truly park it if delivery genuinely cannot happen
                 // yet AND the caller allows blocking.
-                match self.try_deliver_send(id, mq_addr, msg) {
+                match self.try_deliver_send(id, mq_addr, msg, jam) {
                     SendOutcome::Delivered => {
                         self.pending_resume.insert(id, Resume::SendUnblocked);
                         if let Some(thread) = self.threads.get_mut(&id) {
@@ -930,7 +946,7 @@ impl Executor {
         msg: Mesg,
         blocking: bool,
     ) -> SendMesgOutcome {
-        match self.try_deliver_send(sender, mq_addr, msg) {
+        match self.try_deliver_send(sender, mq_addr, msg, /* jam */ false) {
             SendOutcome::Delivered => SendMesgOutcome::Delivered,
             SendOutcome::Blocked if blocking => SendMesgOutcome::MustYield,
             SendOutcome::Blocked => SendMesgOutcome::DroppedWouldBlock,

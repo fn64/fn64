@@ -880,6 +880,7 @@ pub unsafe extern "C" fn osSendMesg_recomp(_rdram: *mut u8, ctx: *mut RecompCont
         mq_addr,
         msg,
         may_block,
+        jam: false,
     }) {
         Resume::SendUnblocked => true,
         Resume::WouldBlock => false,
@@ -1431,18 +1432,36 @@ thread_local! {
 #[no_mangle]
 pub unsafe extern "C" fn osInitialize_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
 
-/// `osAiSetFrequency(u32 frequency)` -- configures the audio DAC sample
-/// rate. No audio backend exists in this crate yet (`fn64-rt64`/`fn64-shell`
-/// own that, per `docs/DESIGN.md` section 1) -- stored as plain host state
-/// so a future audio-out wave has a real value to read, rather than
-/// discarded silently.
+/// `osAiSetFrequency(u32 frequency) -> s32` -- configures the audio DAC
+/// sample rate and returns the TRUE playback rate, or -1 if the frequency is
+/// unusable (`dacRate < AI_MIN_DAC_RATE`). No audio backend exists yet, so the
+/// frequency is stored as host state, but the s32 return is load-bearing: the
+/// only decomp caller (heap.c:966) assigns it to `aiSamplingFrequency` and
+/// then DIVIDES by it (heap.c:1002), so a stale/zero $v0 divides by garbage.
+///
+/// Byte-exact to aisetfreq.c:12-36: `dacRate = (osViClock/freq + 0.5)`;
+/// `dacRate < AI_MIN_DAC_RATE(132)` -> -1; else `osViClock / (s32)dacRate`.
+/// `osViClock == VI_NTSC_CLOCK == 48681812` (rcp.h:538), AI_MIN_DAC_RATE=132
+/// (rcp.h:587). Single u32 arg in $a0=r4, return $v0=r2.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osAiSetFrequency_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
-    let ctx = unsafe { &*ctx };
-    AI_FREQUENCY.with(|cell| cell.set(ctx.r4 as u32));
+    let ctx = unsafe { &mut *ctx };
+    let freq = ctx.r4 as u32;
+    AI_FREQUENCY.with(|cell| cell.set(freq));
+
+    // osViClock: the NTSC video clock (aisetfreq.c's `extern s32 osViClock`),
+    // which libultra initializes to VI_NTSC_CLOCK for an NTSC console.
+    const VI_NTSC_CLOCK: i32 = 48_681_812; // rcp.h:538
+    const AI_MIN_DAC_RATE: u32 = 132; // rcp.h:587
+    let dac_rate = (VI_NTSC_CLOCK as f32 / freq as f32 + 0.5) as u32;
+    ctx.r2 = if dac_rate < AI_MIN_DAC_RATE {
+        -1i32 as u32 as u64
+    } else {
+        (VI_NTSC_CLOCK / dac_rate as i32) as u32 as u64
+    };
 }
 
 thread_local! {
@@ -1653,7 +1672,15 @@ pub unsafe extern "C" fn osGetThreadId_recomp(_rdram: *mut u8, ctx: *mut RecompC
 #[no_mangle]
 pub unsafe extern "C" fn osGetTime_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
-    ctx.r2 = with_executor(|exec| exec.sim_time());
+    // OSTime is u64 (time.h:6); an o32 64-bit return splits $v0:$v1 =
+    // HIGH:LOW word, matching this crate's own convention (__ll_div_recomp
+    // etc.: `r2 = result>>32; r3 = result & 0xFFFFFFFF`). Callers reconstruct
+    // the u64 from both words (funcs_56.c ~1152 `sw $v0,0x20; sw $v1,0x24`;
+    // funcs_24.c ~5923) -- writing only r2 left r3 stale and corrupted both
+    // halves of the reconstructed timestamp.
+    let t = with_executor(|exec| exec.sim_time());
+    ctx.r2 = t >> 32;
+    ctx.r3 = t & 0xFFFF_FFFF;
 }
 
 /// `osSpTaskYielded(OSTask *task) -> s32` -- `a0`=`ctx->r4`, an `OSTask_t*`
@@ -1682,15 +1709,15 @@ pub unsafe extern "C" fn osGetTime_recomp(_rdram: *mut u8, ctx: *mut RecompConte
 /// wired up yet, see that crate's module doc). If no backend is
 /// registered at all, the task is still just recorded (trace + count) via
 /// `Executor::submit_task`, same as before this wave -- this function
-/// always sets `ctx.r2 = 1` (task complete, did not yield) so the caller's
-/// `bnel` path proceeds as if the RSP finished the task, matching real
-/// hardware's observable effect on the caller (task done, no further
-/// action expected) regardless of whether a backend actually drew
-/// anything.
+/// always sets `ctx.r2 = 0` (task complete, did NOT yield -- 0 is the
+/// completed value; OS_TASK_YIELDED==1 is the yielded value, sptask.h:20) so
+/// the caller's `beq $v0, $zero` path proceeds as if the RSP finished the
+/// task, matching real hardware's observable effect on the caller (task done,
+/// no re-queue) regardless of whether a backend actually drew anything.
 ///
 /// AUDIO_TASK_NOTE: an audio task (`M_AUDTASK`) causes the translated `wm2000_audio_ucode` function (out-of-tree; see `examples/wm2000-boot`'s harness, which registers it via `set_audio_ucode_fn` below -- `fn64-abi` itself contains no game-derived ucode C, per `README.md`'s "no game content ships in this repo") to be REALLY CALLED with `(rdram, ucode_addr)`, matching `RSPRecomp`'s documented generated signature. Its `RspExitReason` return is not yet interpreted beyond "it ran"; the header is still recorded via `submit_task`.
 ///
-/// UNKNOWN_TASK_NOTE: an unrecognized task type is recorded (so the trace/count still sees it) but not executed, and this function still sets `ctx.r2 = 1` (complete) -- the same "acknowledge, don't fabricate real hardware effects" stance as the gfx path, since this milestone has no evidence for any other task type on NWXE's boot path.
+/// UNKNOWN_TASK_NOTE: an unrecognized task type is recorded (so the trace/count still sees it) but not executed, and this function still sets `ctx.r2 = 0` (complete) -- the same "acknowledge, don't fabricate real hardware effects" stance as the gfx path, since this milestone has no evidence for any other task type on NWXE's boot path.
 ///
 /// # Safety
 /// `ctx`/`rdram` must be valid per every other shim's contract in this file.
@@ -1812,7 +1839,14 @@ pub unsafe extern "C" fn osSpTaskYielded_recomp(rdram: *mut u8, ctx: *mut Recomp
     }
 
     with_executor(|exec| exec.submit_task(header));
-    ctx.r2 = 1; // task complete, did not yield (see doc comment)
+    // Return 0 = task COMPLETED (did not yield). sptaskyielded.c returns
+    // OS_TASK_YIELDED (==1, sptask.h:20) only if the SP status has
+    // SP_STATUS_YIELDED set. This crate dispatches synchronously and runs the
+    // task to completion (never actually yields the SP), so the honest return
+    // is 0. Returning 1 would tell Sched_HandleReply (sched.c:577) the task
+    // yielded, re-queuing an already-finished task to the gfx list head to
+    // be re-run forever (funcs_41.c:1587 branches on this $v0).
+    ctx.r2 = 0;
 }
 
 /// Real `OSTask_t.t.output_buff_size` (`OSTask_t`'s field at offset 0x2C,
@@ -2648,30 +2682,43 @@ pub unsafe extern "C" fn osContInit_recomp(rdram: *mut u8, ctx: *mut RecompConte
     let ctx = unsafe { &mut *ctx };
     let bitpattern_addr = RdramAddr::from_gpr(ctx.r5).offset() as usize;
     let data_addr = RdramAddr::from_gpr(ctx.r6).offset() as usize;
-    let mut mask: u16 = 0;
+    let mut mask: u8 = 0;
     with_executor(|exec| {
         let pif = *exec.pif();
-        for port in 0..4u32 {
-            let resp = pif.query_response(port as usize);
+        for port in 0..4usize {
+            let resp = pif.query_response(port);
             let absent = (resp[2] & fn64_runtime::si::CONT_ABSENT) != 0;
             if !absent {
                 mask |= 1 << port;
-                let off = data_addr + (port as usize) * 4;
+            }
+            // Write each OSContStatus entry SWIZZLED (`^3`), exactly like
+            // osContGetQuery_recomp -- the game reads type/status/errno back
+            // via MEM_HU/MEM_BU (recomp.h), so flat stores would transpose
+            // them. type u16 = (resp[1]<<8)|resp[0] (controller.c:72);
+            // absent ports report no-response in errno with type/status 0.
+            let type_u16: u16 = ((resp[1] as u16) << 8) | resp[0] as u16;
+            let entry: [u8; 4] = if absent {
+                [0, 0, 0, CONT_NO_RESPONSE_ERROR]
+            } else {
+                [(type_u16 >> 8) as u8, (type_u16 & 0xFF) as u8, resp[2], 0]
+            };
+            let base = data_addr + port * 4;
+            for (o, &b) in entry.iter().enumerate() {
                 unsafe {
-                    *rdram.add(off) = resp[0];
-                    *rdram.add(off + 1) = resp[1];
-                    *rdram.add(off + 2) = resp[2];
-                    *rdram.add(off + 3) = 0;
+                    *rdram.add((base + o) ^ 3) = b;
                 }
             }
         }
     });
     unsafe {
-        // OSContStatus's own u16 field the public manual documents this
-        // out-param as writing (present-port bitmask, hi byte first per
-        // the same PIF wire-order convention used throughout this file).
-        *rdram.add(bitpattern_addr) = (mask >> 8) as u8;
-        *rdram.add(bitpattern_addr + 1) = (mask & 0xFF) as u8;
+        // ctlBitfield is a `u8*`: the decomp writes a SINGLE byte
+        // `*ctlBitfield = bits` (controller.c:96), bits<=0x0F. Write one
+        // swizzled byte (^3). A second byte at +1 would (a) be always 0 for a
+        // u16 hi-byte and (b) clobber the adjacent variable -- and the flat
+        // +0 store misses the swizzled sentinel address PadSetup_Init checks
+        // (funcs_55.c 0x800CD414 `bnel $t7,0xFF`), so it would bail and skip
+        // all controller-present stores.
+        *rdram.add(bitpattern_addr ^ 3) = mask;
     }
     ctx.r2 = 0;
 }
@@ -2877,27 +2924,41 @@ pub unsafe extern "C" fn osGetCount_recomp(_rdram: *mut u8, ctx: *mut RecompCont
     ctx.r2 = with_executor(|exec| exec.sim_time()) as u32 as u64;
 }
 
-/// `osJamMesg(OSMesgQueue *mq, OSMesg msg, s32 flag)` -- priority-jump
-/// variant of `osSendMesg` (public libultra manual: inserts at the FRONT
-/// of the queue rather than the back). Zero real call sites in this corpus
-/// and BOOT-PLAN.md's own "not observed on the traced happy path" note
-/// (IrqMgr's PRENMI handling, off the first-frame boot ladder) -- loud-
-/// trapped rather than silently approximated as a plain `osSendMesg`
-/// (`fn64_runtime::MesgQueue`/`Executor` has no front-insert primitive
-/// today; faking one via `try_send`'s back-of-queue semantics would be a
-/// real ordering lie for a queue with >1 pending message, silently wrong
-/// in exactly the multi-message case that would matter).
+/// `osJamMesg(OSMesgQueue *mq, OSMesg msg, s32 flag) -> s32` -- priority-jump
+/// variant of `osSendMesg`: front-inserts the message (jammesg.c:16-17
+/// `first = (first + msgCount - 1) % msgCount; msg[first] = msg`) so it is the
+/// next one received, and returns 0 on enqueue / -1 on a NOBLOCK full queue
+/// (jammesg.c:23 / :12). Reachable via audio DMA: `osEPiStartDma`
+/// (epidma.c:18-20) calls `osJamMesg` when `mb->hdr.pri == 1`, and
+/// `AudioLoad_Dma` FastCopy loads pass `OS_MESG_PRI_HIGH == 1` (load.c:1047,
+/// 1055; pi.h:76). o32: all three args are 32-bit -> mq=$a0=r4, msg=$a1=r5,
+/// flag=$a2=r6, return $v0=r2 -- mirrors `osSendMesg_recomp` exactly, only
+/// the insertion end differs (`jam: true`).
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn osJamMesg_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
-    unimplemented!(
-        "osJamMesg_recomp: no front-of-queue insert primitive exists in fn64_runtime::MesgQueue \
-         yet, and no real call site in games/OOTU/RecompiledFuncs exercises this (BOOT-PLAN.md: \
-         reached only off IrqMgr's PRENMI path, not the first-frame boot ladder) -- a fabricated \
-         back-of-queue insert would silently misorder a queue with >1 pending message."
-    );
+pub unsafe extern "C" fn osJamMesg_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let mq_addr = RdramAddr::from_gpr(ctx.r4);
+    let msg: Mesg = ctx.r5 as u32;
+    let may_block = ctx.r6 == OS_MESG_BLOCK;
+
+    let jammed = match suspend_active_coroutine(Yield::BlockOnSend {
+        mq_addr,
+        msg,
+        may_block,
+        jam: true,
+    }) {
+        Resume::SendUnblocked => true,
+        Resume::WouldBlock => false,
+        other => panic!(
+            "osJamMesg_recomp: resumed from a BlockOnSend yield with an unexpected Resume \
+             variant {other:?}"
+        ),
+    };
+    // $v0: 0 on front-insert, -1 when a NOBLOCK jam found the queue full.
+    ctx.r2 = if jammed { 0 } else { -1i64 as u64 };
 }
 
 /// `osMotorInit(OSMesgQueue *mq, OSPfs *pfs, int channel) -> s32` --
@@ -3852,14 +3913,17 @@ mod tests {
 
     #[test]
     fn os_get_time_tracks_the_executors_virtual_clock() {
+        // OSTime is reconstructed from $v0:$v1 = HIGH:LOW word (o32 64-bit
+        // return); see os_get_time_splits_u64_high_low_across_v0_v1.
+        let ostime = |ctx: &RecompContext| (ctx.r2 << 32) | (ctx.r3 & 0xFFFF_FFFF);
         let mut ctx = ctx_zeroed();
         unsafe { osGetTime_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
-        let t0 = ctx.r2;
+        let t0 = ostime(&ctx);
         with_executor(|exec| exec.advance_time(exec.sim_time() + 500));
         let mut ctx2 = ctx_zeroed();
         unsafe { osGetTime_recomp(std::ptr::null_mut(), &mut ctx2 as *mut _) };
         assert!(
-            ctx2.r2 >= t0 + 500,
+            ostime(&ctx2) >= t0 + 500,
             "osGetTime must track sim_time advancing, not a fixed value"
         );
     }
@@ -4438,7 +4502,7 @@ mod tests {
         ctx.r4 = 0x8000_0000 + header_off as u64;
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
-        assert_eq!(ctx.r2, 1, "task reported complete, not yielded");
+        assert_eq!(ctx.r2, 0, "task reported complete (0), not OS_TASK_YIELDED (1)");
         with_executor(|exec| {
             assert_eq!(exec.task_log().gfx_count(), 1);
             assert_eq!(exec.task_log().audio_count(), 0);
@@ -4622,7 +4686,7 @@ mod tests {
         ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
-        assert_eq!(ctx.r2, 1, "task reported complete, not yielded");
+        assert_eq!(ctx.r2, 0, "task reported complete (0), not OS_TASK_YIELDED (1)");
         assert_eq!(
             last_render_error(),
             None,
@@ -4748,7 +4812,7 @@ mod tests {
         ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
-        assert_eq!(ctx.r2, 1, "task reported complete, not yielded");
+        assert_eq!(ctx.r2, 0, "task reported complete (0), not OS_TASK_YIELDED (1)");
         assert_eq!(
             last_audio_error(),
             None,
@@ -4934,5 +4998,124 @@ mod tests {
             ctx.r6 = 0; // direction = ToRdram
             unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
         }
+    }
+
+    /// osGetTime returns a u64 OSTime split $v0:$v1 = HIGH:LOW word (this
+    /// crate's 64-bit-return convention, __ll_div_recomp). A caller stores
+    /// r2 then r3 as two consecutive words to reconstruct the u64. Fails
+    /// against the bug (r2 = full u64, r3 never written): r2 would truncate
+    /// to the LOW word and r3 stays stale.
+    #[test]
+    fn os_get_time_splits_u64_high_low_across_v0_v1() {
+        // A time whose high and low words are BOTH nonzero and distinct, so a
+        // dropped/swapped half is caught (not masked by a zero word).
+        let t: u64 = 0x1122_3344_5566_7788;
+        with_executor(|exec| exec.advance_time(t));
+
+        let mut ctx = ctx_zeroed();
+        ctx.r3 = 0xDEAD_BEEF; // stale $v1: the bug leaves this untouched.
+        unsafe { osGetTime_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+
+        assert_eq!(ctx.r2, 0x1122_3344, "$v0 = HIGH word");
+        assert_eq!(ctx.r3, 0x5566_7788, "$v1 = LOW word");
+    }
+
+    /// osAiSetFrequency must write the true DAC playback rate to $v0
+    /// (aisetfreq.c: osViClock / dacRate), or -1 for an unusably-low rate.
+    /// Fails against the bug (never writes r2): stale $v0 survives.
+    #[test]
+    fn os_ai_set_frequency_returns_true_dac_rate_in_v0() {
+        // 32000 Hz: dacRate = round(48681812/32000) = round(1521.3) = 1521;
+        // true rate = 48681812 / 1521 = 32006. Distinct from the input.
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 32000;
+        ctx.r2 = 0xBADD_C0DE; // stale $v0 the bug would leave in place.
+        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+        assert_eq!(ctx.r2, 32006, "true DAC rate 48681812/1521");
+
+        // An unusably-high frequency drives dacRate below AI_MIN_DAC_RATE
+        // (132) and must return -1: freq 400000 -> dacRate = round(121.7) =
+        // 122 < 132.
+        let mut ctx = ctx_with(400_000, 0, 0);
+        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+        assert_eq!(ctx.r2, -1i32 as u32 as u64, "dacRate < 132 -> -1");
+    }
+
+    /// osSpTaskYielded, in this crate's synchronous run-to-completion model,
+    /// must report task COMPLETED (0), not OS_TASK_YIELDED (1). Returning 1
+    /// makes the scheduler re-queue an already-finished task forever. Fails
+    /// against the bug (`ctx.r2 = 1`).
+    #[test]
+    fn os_sp_task_yielded_reports_completed_not_yielded() {
+        // Minimal OSTask header at rdram offset 0x40, task_type = 0 (unknown:
+        // recorded but no backend/ucode fired). Buffer covers base+0x38.
+        let mut rdram = vec![0u8; 256];
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0040; // KSEG0 -> offset 0x40
+        ctx.r2 = 0xFFFF_FFFF; // stale $v0.
+        unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+        assert_eq!(ctx.r2, 0, "0 = completed (did not yield); 1 = OS_TASK_YIELDED");
+    }
+
+    /// osContInit: (1) OSContStatus entries must be written SWIZZLED (^3) like
+    /// osContGetQuery, and (2) ctlBitfield is a `u8*` -- a SINGLE swizzled
+    /// byte, no +1 store. Fails against the bug (flat status stores + two
+    /// bitfield bytes at flat +0/+1).
+    #[test]
+    fn os_cont_init_swizzles_status_and_writes_single_bitfield_byte() {
+        // data at offset 0x40 (16 bytes = 4 OSContStatus), bitfield at 0x80.
+        let mut rdram = vec![0xEEu8; 256]; // 0xEE sentinel: catch stray writes.
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0; // mq (unused for the byte layout under test)
+        ctx.r5 = 0x8000_0080; // ctlBitfield
+        ctx.r6 = 0x8000_0040; // data (OSContStatus[4])
+        unsafe { osContInit_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // Port 0 is a standard controller (type 0x0005). The swizzled entry
+        // [type_hi=0x00, type_lo=0x05, status=0x00, pad=0x00] lands at
+        // (0x40+o)^3, so logical byte 1 (0x05) is at host 0x40+ (1^3)=0x40+2.
+        let logical = |base: usize, o: usize| rdram[(base + o) ^ 3];
+        assert_eq!(logical(0x40, 0), 0x00, "port0 type_hi");
+        assert_eq!(logical(0x40, 1), 0x05, "port0 type_lo (CONT_TYPE_STANDARD)");
+        assert_eq!(logical(0x40, 2), 0x00, "port0 status");
+        assert_eq!(logical(0x40, 3), 0x00, "port0 pad");
+        // Port 1 absent -> [0,0,0,CONT_NO_RESPONSE_ERROR] swizzled.
+        assert_eq!(logical(0x44, 3), CONT_NO_RESPONSE_ERROR, "port1 errno");
+
+        // ctlBitfield: a SINGLE swizzled byte = mask (0x01, only port 0). The
+        // flat address 0x80 must stay the 0xEE sentinel (the buggy flat store
+        // would overwrite it), and 0x81 must stay 0xEE (the buggy +1 store
+        // would clobber this adjacent byte).
+        assert_eq!(rdram[0x80 ^ 3], 0x01, "bitfield: single swizzled byte, port0 set");
+        assert_eq!(rdram[0x80], 0xEE, "flat bitfield addr untouched (no flat store)");
+        assert_eq!(rdram[0x81], 0xEE, "adjacent byte untouched (no +1 store)");
+    }
+
+    /// osJamMesg front-inserts (jammesg.c) and returns 0 on enqueue -- it must
+    /// NOT panic (the old unimplemented!()), and a subsequent recv must see
+    /// the jammed message ahead of an already-queued one. Fails against the
+    /// bug (unimplemented!() aborts before any assert).
+    #[test]
+    fn os_jam_mesg_front_inserts_and_returns_zero() {
+        let mq_vram: u64 = 0xFFFF_FFFF_8006_A000;
+        let mq_addr = RdramAddr::from_gpr(mq_vram);
+        let mut create_ctx = ctx_with(mq_vram, 0, 4);
+        unsafe { osCreateMesgQueue_recomp(std::ptr::null_mut(), &mut create_ctx as *mut _) };
+
+        // Pre-queue a normal message, then jam a high-priority one.
+        spawn_test_thread(120, 1, move || {
+            let mut send_ctx = ctx_with(mq_vram, 0x1111, OS_MESG_NOBLOCK);
+            unsafe { osSendMesg_recomp(std::ptr::null_mut(), &mut send_ctx as *mut _) };
+            let mut jam_ctx = ctx_with(mq_vram, 0x9999, OS_MESG_NOBLOCK);
+            unsafe { osJamMesg_recomp(std::ptr::null_mut(), &mut jam_ctx as *mut _) };
+            assert_eq!(jam_ctx.r2, 0, "osJamMesg returns 0 on front-insert");
+        });
+        run_to_idle_with_yielder_plumbing();
+
+        // The jammed 0x9999 must come out BEFORE the earlier 0x1111.
+        with_executor(|exec| {
+            assert_eq!(exec.recv_mesg(0, mq_addr, false), RecvMesgOutcome::Delivered(0x9999));
+            assert_eq!(exec.recv_mesg(0, mq_addr, false), RecvMesgOutcome::Delivered(0x1111));
+        });
     }
 }
