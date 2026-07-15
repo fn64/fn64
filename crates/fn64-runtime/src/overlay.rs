@@ -92,8 +92,12 @@ pub struct Section {
 }
 
 impl Section {
-    fn contains(&self, vram: u32) -> bool {
-        vram >= self.ram_addr && vram < self.ram_addr.wrapping_add(self.size)
+    /// Range check against an explicit load base -- `base` is the section's
+    /// static `ram_addr` for resident/fixed-vram sections, or its runtime
+    /// DMA-relocated heap base for sections in `load_vram` (see that field's
+    /// doc). Offsets in `funcs` are relative to whichever base is in effect.
+    fn contains_at(&self, base: u32, vram: u32) -> bool {
+        vram >= base && vram < base.wrapping_add(self.size)
     }
 }
 
@@ -113,6 +117,22 @@ pub struct SectionRegistry {
     /// NWXE's corpus resolve correctly rather than by declaration-order
     /// accident.
     loaded: HashSet<SectionIndex>,
+    /// Runtime load base for sections the game DMA-loaded and relocated to a
+    /// heap address that differs from the section's static link-time
+    /// `ram_addr`. OoT's gamestate/actor overlays are DMA'd from ROM to a
+    /// SystemArena allocation, then `Overlay_Relocate` rewrites their
+    /// absolute pointers by `+(loadedRamAddr - vramStart)` -- so a
+    /// `LOOKUP_FUNC` after that load arrives with a *heap* vram, not the
+    /// static `ram_addr`. When an index is present here, `resolve` treats
+    /// this value (not `ram_addr`) as the section's base for both range and
+    /// per-func offset math. Absent means "resolve at the static
+    /// `ram_addr`" -- the resident-image sections (0/1/2) and the AKI
+    /// fixed-vram bank-swap overlays, which are not runtime-relocated.
+    /// (`recomp_overlays.inl` declares `num_relocs=0` for every section in
+    /// this build: the section-table reloc field models a *different*
+    /// mechanism than the game's own `Overlay_Relocate`, so we key off the
+    /// game's runtime DMA destination, not the static table.)
+    load_vram: HashMap<SectionIndex, u32>,
     /// Fast path: `vram -> (section, func index)` for already-resolved
     /// addresses, invalidated wholesale on any load/unload (bank switches
     /// are rare relative to `LOOKUP_FUNC` call volume -- 85 call sites in
@@ -146,8 +166,51 @@ impl SectionRegistry {
             index < self.sections.len(),
             "set_section_loaded: no such section index {index}"
         );
+        // A static-vram load supersedes any prior runtime-relocated base for
+        // this same index (resolve at `ram_addr` again).
+        self.load_vram.remove(&index);
         self.loaded.insert(index);
         self.cache.clear();
+    }
+
+    /// Mark a section loaded at a *runtime* base `load_vram` -- the heap vram
+    /// the game DMA'd it to and relocated its runtime data pointers against,
+    /// distinct from the section's static `ram_addr`. Used by the DMA-driven
+    /// overlay-load path (`load_section_at_rom_addr`): after this, `resolve`
+    /// maps addresses in `[load_vram, load_vram+size)` (relocated data
+    /// pointers) AND in `[ram_addr, ram_addr+size)` (static code immediates
+    /// the recompiler didn't relocate) through this section's funcs, so a
+    /// `LOOKUP_FUNC` for either flavor of pointer resolves correctly (see
+    /// `resolve`'s two-base loop for the citation of why both occur).
+    pub fn set_section_loaded_at(&mut self, index: SectionIndex, load_vram: u32) {
+        assert!(
+            index < self.sections.len(),
+            "set_section_loaded_at: no such section index {index}"
+        );
+        self.load_vram.insert(index, load_vram);
+        self.loaded.insert(index);
+        self.cache.clear();
+    }
+
+    /// Honor a game-driven overlay DMA: given the ROM source address and the
+    /// RDRAM/vram destination of a DMA the game just performed, if some
+    /// registered section's `rom_addr` matches `rom_addr` exactly, mark that
+    /// section loaded at `dest_vram` and return its index. Returns `None`
+    /// (a no-op) for any DMA that is not an overlay-section load -- ordinary
+    /// data DMAs (dmadata table, object files, audio banks) must NOT be
+    /// mistaken for code-section loads, so the match is on the exact
+    /// section-start `rom_addr`, never a range containment.
+    ///
+    /// This is the general overlay-load hook: it keys off the game's own DMA
+    /// action rather than the harness hard-coding which overlays to load, so
+    /// every overlay the game DMAs in (gamestate overlays, actor overlays)
+    /// becomes resolvable automatically at its true runtime base. Sections
+    /// the game never DMAs stay unloaded, keeping `resolve`'s loud trap live
+    /// for genuinely-absent code.
+    pub fn load_section_at_rom_addr(&mut self, rom_addr: u32, dest_vram: u32) -> Option<SectionIndex> {
+        let idx = self.sections.iter().position(|s| s.rom_addr == rom_addr)?;
+        self.set_section_loaded_at(idx, dest_vram);
+        Some(idx)
     }
 
     /// Mark a section as no longer resident (the corresponding bank has
@@ -156,6 +219,7 @@ impl SectionRegistry {
     /// not a per-entry check.
     pub fn set_section_unloaded(&mut self, index: SectionIndex) {
         self.loaded.remove(&index);
+        self.load_vram.remove(&index);
         self.cache.clear();
     }
 
@@ -176,13 +240,31 @@ impl SectionRegistry {
         }
         for &idx in &self.loaded {
             let section = &self.sections[idx];
-            if !section.contains(vram) {
-                continue;
-            }
-            let want_offset = vram - section.ram_addr;
-            if let Some(entry) = section.funcs.iter().find(|f| f.offset == want_offset) {
-                self.cache.insert(vram, entry.func_ptr);
-                return entry.func_ptr;
+            // A DMA-relocated overlay is reachable at TWO bases, because the
+            // recompiler and the game disagree on where its functions live:
+            //   1. the runtime heap base the game DMA'd it to -- the value
+            //      the game's own `Overlay_Relocate` rewrites its *runtime
+            //      data* pointers to (e.g. `gGameStateOverlayTable[].init`,
+            //      which arrives at LOOKUP_FUNC as `0x803b4df0`); and
+            //   2. the static link-time `ram_addr` -- what the recompiler
+            //      baked as *code immediates* inside the overlay's own funcs
+            //      (e.g. ConsoleLogo_Init does `lui 0x8080; addiu 0x690` to
+            //      store `gameState->main = 0x80800690`; the recompiler does
+            //      NOT relocate code immediates, so this static vram also
+            //      reaches LOOKUP_FUNC).
+            // Both must resolve to the same FuncEntry list. Resident/fixed-
+            // vram sections (no `load_vram` entry) have only base #2.
+            let static_base = section.ram_addr;
+            let bases = [self.load_vram.get(&idx).copied(), Some(static_base)];
+            for base in bases.into_iter().flatten() {
+                if !section.contains_at(base, vram) {
+                    continue;
+                }
+                let want_offset = vram - base;
+                if let Some(entry) = section.funcs.iter().find(|f| f.offset == want_offset) {
+                    self.cache.insert(vram, entry.func_ptr);
+                    return entry.func_ptr;
+                }
             }
         }
         panic!(
@@ -204,6 +286,27 @@ impl SectionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn section_at_rom(
+        rom_addr: u32,
+        ram_addr: u32,
+        size: u32,
+        funcs: Vec<(u32, usize)>,
+    ) -> Section {
+        Section {
+            rom_addr,
+            ram_addr,
+            size,
+            funcs: funcs
+                .into_iter()
+                .map(|(offset, func_ptr)| FuncEntry {
+                    func_ptr,
+                    offset,
+                    rom_size: 4,
+                })
+                .collect(),
+        }
+    }
 
     fn section(ram_addr: u32, size: u32, funcs: Vec<(u32, usize)>) -> Section {
         Section {
@@ -287,5 +390,76 @@ mod tests {
         reg.set_section_loaded(idx);
         assert_eq!(reg.resolve(0x8000_0400), 0xdead);
         assert_eq!(reg.resolve(0x8000_0400), 0xdead); // cached path
+    }
+
+    /// Address-keyed overlay load: a DMA from a section's exact ROM start to
+    /// a heap vram makes that section resolvable at the DMA destination base.
+    /// Models OoT's ovl_title gamestate load (rom 0x00b9da40 -> heap
+    /// 0x803b4640, ConsoleLogo_Init at static offset 0x7b0 -> relocated
+    /// 0x803b4df0). Distinguishable func ptrs so a wrong-offset or
+    /// wrong-section resolution is caught, not a coincidental 0.
+    #[test]
+    fn dma_load_resolves_relocated_pointer_at_heap_base() {
+        let mut reg = SectionRegistry::new();
+        // Static link-time ram_addr 0x80800000, but DMA'd to heap 0x803b4640.
+        let idx = reg.register_section(section_at_rom(
+            0x00b9_da40,
+            0x8080_0000,
+            0x910,
+            vec![(0x7b0, 0xc0de_1234)],
+        ));
+        // Data DMAs to unrelated ROM offsets must NOT load this section.
+        assert_eq!(reg.load_section_at_rom_addr(0x0000_1000, 0x8020_0000), None);
+        assert!(!reg.is_section_loaded(idx));
+
+        // The game DMAs the overlay from its exact ROM start to a heap addr.
+        assert_eq!(
+            reg.load_section_at_rom_addr(0x00b9_da40, 0x803b_4640),
+            Some(idx)
+        );
+        // The game's Overlay_Relocate produced init = 0x803b4640 + 0x7b0.
+        assert_eq!(reg.resolve(0x803b_4df0), 0xc0de_1234);
+    }
+
+    /// After a DMA load, the SAME section must ALSO resolve at its static
+    /// link-time ram_addr, because the recompiler bakes static vram as code
+    /// immediates (ConsoleLogo_Init stores `gameState->main = 0x80800690`
+    /// via `lui 0x8080; addiu 0x690`, NOT the relocated heap address). Both
+    /// bases hit the same FuncEntry list. This is the exact second trap the
+    /// heap-only model would (and did) hit at 0x80800690.
+    #[test]
+    fn dma_loaded_section_also_resolves_static_code_immediate_base() {
+        let mut reg = SectionRegistry::new();
+        let idx = reg.register_section(section_at_rom(
+            0x00b9_da40,
+            0x8080_0000,
+            0x910,
+            // ConsoleLogo_Init@0x7b0, ConsoleLogo_Main@0x690 -- distinct ptrs.
+            vec![(0x7b0, 0xc0de_1234), (0x690, 0x0bad_c0de)],
+        ));
+        reg.load_section_at_rom_addr(0x00b9_da40, 0x803b_4640).unwrap();
+        let _ = idx;
+        // Relocated heap pointer (from the runtime GameStateOverlay table).
+        assert_eq!(reg.resolve(0x803b_4df0), 0xc0de_1234);
+        // Static code-immediate pointer (baked by the recompiler).
+        assert_eq!(reg.resolve(0x8080_0690), 0x0bad_c0de);
+    }
+
+    /// Unloading a DMA-relocated section drops BOTH its heap and static
+    /// bases -- neither may keep resolving from a stale cache/load_vram.
+    #[test]
+    #[should_panic(expected = "0x803b4df0")]
+    fn unloading_dma_section_stops_heap_base_resolution() {
+        let mut reg = SectionRegistry::new();
+        let idx = reg.register_section(section_at_rom(
+            0x00b9_da40,
+            0x8080_0000,
+            0x910,
+            vec![(0x7b0, 0xc0de_1234)],
+        ));
+        reg.load_section_at_rom_addr(0x00b9_da40, 0x803b_4640).unwrap();
+        assert_eq!(reg.resolve(0x803b_4df0), 0xc0de_1234);
+        reg.set_section_unloaded(idx);
+        reg.resolve(0x803b_4df0); // must panic, not serve stale heap base
     }
 }

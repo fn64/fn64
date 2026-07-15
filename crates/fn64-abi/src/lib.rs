@@ -622,6 +622,17 @@ pub fn set_section_unloaded(index: fn64_runtime::SectionIndex) {
     with_host(|host| host.sections.set_section_unloaded(index));
 }
 
+/// Honor a game-driven overlay DMA at the section registry: if `rom_addr`
+/// is exactly some registered section's ROM start, mark it loaded at
+/// `dest_vram` (the DMA's RDRAM destination as a KSEG0 vram). Returns the
+/// section index if a load happened, else `None` (an ordinary data DMA).
+/// Called from the PI/EPI DMA shims so overlays the game DMAs in become
+/// resolvable at their true relocated base -- see
+/// `SectionRegistry::load_section_at_rom_addr`.
+pub fn note_dma_overlay_load(rom_addr: u32, dest_vram: u32) -> Option<fn64_runtime::SectionIndex> {
+    with_host(|host| host.sections.load_section_at_rom_addr(rom_addr, dest_vram))
+}
+
 /// Install the real ROM bytes the PI/EPI DMA shims read from. Must be
 /// called once before any `osEPiStartDma_recomp`/`osCartRomInit_recomp`
 /// call, per `README.md`'s "no game content ships in this repo" rule --
@@ -1194,6 +1205,17 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
         });
     }
     let _ = completion;
+
+    // Overlay-load hook: if this DMA's ROM source is exactly a registered
+    // code section's start, the game just DMA'd that overlay in. Mark it
+    // loaded at the DMA's RDRAM destination vram so a later LOOKUP_FUNC for
+    // the game's relocated function pointers (Overlay_Relocate rewrites them
+    // to `dest + offset`) resolves. Data DMAs (dmadata, objects) don't match
+    // any section start and are a no-op here. Done AFTER the with_pi_dma /
+    // with_host borrow closes to avoid re-entrant host access.
+    // `dev_addr` is the ROM offset; `dram_addr.offset() | KSEG0` is the vram.
+    let dest_vram = dram_addr.offset() | 0x8000_0000;
+    note_dma_overlay_load(dev_addr, dest_vram);
 
     // Every path reaching here completed the DMA synchronously and
     // successfully -- see the doc comment's "Correction (2026-07-14)" for
