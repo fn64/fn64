@@ -80,6 +80,14 @@ const G_LINE3D: u8 = 0x08;
 const G_SPECIAL_1: u8 = 0xD5;
 const G_DMA_IO: u8 = 0xD6;
 const G_LOAD_UCODE: u8 = 0xDD;
+/// `G_TEXRECT` / `G_TEXRECTFLIP` (gbi.h:126-127). Unlike every other
+/// command in this decoder these are **two** 64-bit words wide (16 bytes):
+/// `gsDPTextureRectangle` (gbi.h:4973) emits a second `Gfx` entry holding
+/// the S/T coords + dsdx/dtdy. The decoder skips the RDP rectangle itself
+/// (no 2D-rect rasterization yet) but MUST consume both words or it reads
+/// the coord word as a bogus opcode and desyncs the stream.
+const G_TEXRECT: u8 = 0xE4;
+const G_TEXRECTFLIP: u8 = 0xE5;
 const G_SETSCISSOR: u8 = 0xED;
 const G_LOADTLUT: u8 = 0xF0;
 const G_SETTILESIZE: u8 = 0xF2;
@@ -505,10 +513,21 @@ fn skip_opcode(opcode: u8) {
 fn opcode_name(opcode: u8) -> &'static str {
     match opcode {
         0x00 => "G_NOOP",
+        G_VTX => "G_VTX",
         G_MODIFYVTX => "G_MODIFYVTX",
         G_CULLDL => "G_CULLDL",
         G_BRANCH_Z => "G_BRANCH_Z",
+        G_TRI1 => "G_TRI1",
+        G_TRI2 => "G_TRI2",
+        G_QUAD => "G_QUAD",
         G_LINE3D => "G_LINE3D",
+        G_TEXRECT => "G_TEXRECT",
+        G_TEXRECTFLIP => "G_TEXRECTFLIP",
+        G_POPMTX => "G_POPMTX",
+        G_MTX => "G_MTX",
+        G_MOVEWORD => "G_MOVEWORD",
+        G_DL => "G_DL",
+        G_ENDDL => "G_ENDDL",
         0xE0 => "G_SPNOOP",
         0xE1 => "G_RDPHALF_1",
         0xE2 => "G_SETOTHERMODE_L",
@@ -959,21 +978,49 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 }
             }
             G_DL => {
-                // F3DEX2 gsSPDisplayList (gbi.h ~2177): w0 = op<<24 |
-                // push<<16; w1 = segmented address of the nested DL. push==0
-                // (G_DL_PUSH) recurses (call); low bit set (G_DL_NOPUSH)
-                // jumps (tail). We recurse for both, bounded by MAX_DL_DEPTH,
-                // and the jump case simply continues after return.
+                // F3DEX2 gsSPDisplayList / gsSPBranchList (gbi.h ~2174-2178):
+                // both pack via gDma1p(G_DL, dl, 0, p) so w0 = op<<24 |
+                // p<<16, w1 = segmented address of the target DL. The `p`
+                // byte at bits 16-23 is the push flag: G_DL_PUSH=0 (gbi.h:966)
+                // is a CALL (push a return address, resume the caller after
+                // the callee's G_ENDDL); G_DL_NOPUSH=1 (gbi.h:967) is a
+                // BRANCH/tail-jump (gsSPBranchList) that REPLACES the current
+                // DL pointer -- the target runs in place of the rest of this
+                // stream and there is NO return to the bytes after the branch.
+                //
+                // BUG FIXED HERE: previously both cases recursed and then
+                // *continued* decoding the current stream after return. For a
+                // BRANCH that is wrong -- the words after a gsSPBranchList are
+                // not commands (typically zero-fill or the next unrelated
+                // buffer), so the decoder walked straight into garbage and
+                // every trailing byte became a bogus "unrecognized opcode",
+                // cascading the whole frame into ~14K junk skips (proven from
+                // a live OoT gameplay task: the root DL's first command is a
+                // gsSPBranchList `w0=0xde01_0000` whose trailing bytes are all
+                // zero). We now recurse into the target and then STOP the
+                // current stream for a branch (mirroring RT64's runDl, which
+                // only pushes a return address when the push bit is clear).
+                let is_branch = ((w0 >> 16) & 0x01) != 0; // G_DL_NOPUSH
                 if state.dl_depth < MAX_DL_DEPTH {
-                    let saved_mv = state.modelview;
-                    state.mv_stack.push(saved_mv);
+                    // NOTE: G_DL is a pure address call/return -- it does NOT
+                    // save or restore the matrix stack. The RSP's modelview/
+                    // projection state is GLOBAL across a nested DL; only
+                    // G_MTX (with G_MTX_PUSH) and G_POPMTX push/pop matrices.
+                    // A previous version wrapped the recursion in a
+                    // modelview push/pop, which corrupted transforms after a
+                    // nested DL returned -- gameplay geometry (deeply nested
+                    // DLs) then projected to ±100k px off-screen. We now
+                    // recurse with shared global matrix state, exactly like
+                    // the hardware call/return (RT64 push/popReturnAddress
+                    // only saves the DL pointer, never the matrix).
                     state.dl_depth += 1;
                     decode_stream(rdram, w1, state);
                     state.dl_depth -= 1;
-                    if let Some(m) = state.mv_stack.pop() {
-                        state.modelview = m;
+                    if is_branch {
+                        // Tail branch: the target replaced this stream; nothing
+                        // valid follows the branch command. Stop here.
+                        break;
                     }
-                    recompute_mvp(state);
                 } else {
                     eprintln!(
                         "[fn64-render-rt64/gbi] G_DL recursion exceeded MAX_DL_DEPTH \
@@ -1093,6 +1140,15 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 // flat/modulated frame doesn't act on yet.
                 let and_mask = w0 & 0x00FF_FFFF;
                 state.geometry_mode = (state.geometry_mode & and_mask) | w1;
+            }
+            G_TEXRECT | G_TEXRECTFLIP => {
+                // 16-byte (two-word) RDP rectangle command (gbi.h:4973). We
+                // don't rasterize 2D texrects yet, but we MUST advance past
+                // the second word (S/T + dsdx/dtdy) so the following command
+                // is read at the right offset -- otherwise the coord word
+                // decodes as a garbage opcode and desyncs the stream.
+                skip_opcode(opcode);
+                pc += 8;
             }
             G_ENDDL => break,
             _ => skip_opcode(opcode),
@@ -1262,6 +1318,213 @@ mod tests {
         let b = (v as u16).to_be_bytes();
         rdram[off ^ 3] = b[0];
         rdram[(off + 1) ^ 3] = b[1];
+    }
+
+    /// Write an aligned logical 32-bit word (recomp `MEM_W`: native-endian,
+    /// no swizzle), matching the decoder's `read_u32`. Used to plant raw
+    /// display-list command words.
+    fn wr_u32(rdram: &mut [u8], off: usize, v: u32) {
+        rdram[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+    }
+
+    /// Plant one 8-byte F3DEX2 command (`w0`, `w1`) at byte offset `off`.
+    fn wr_cmd(rdram: &mut [u8], off: usize, w0: u32, w1: u32) {
+        wr_u32(rdram, off, w0);
+        wr_u32(rdram, off + 4, w1);
+    }
+
+    /// Plant a full 16-byte `Vtx` (`ob` x/y/z at 0/2/4, color at 12) at `off`
+    /// so a `G_VTX` + `G_TRI1` can resolve a real triangle.
+    fn wr_vtx(rdram: &mut [u8], off: usize, x: i16, y: i16, z: i16, rgba: [u8; 4]) {
+        wr_i16(rdram, off, x);
+        wr_i16(rdram, off + 2, y);
+        wr_i16(rdram, off + 4, z);
+        for (i, &c) in rgba.iter().enumerate() {
+            rdram[(off + 12 + i) ^ 3] = c;
+        }
+    }
+
+    // --- G_DL branch (gsSPBranchList) desync regression -----------------
+    //
+    // Fails against the pre-fix decoder: a G_DL with the NOPUSH (branch)
+    // flag used to recurse into the target and then CONTINUE decoding the
+    // parent stream. Because a branch's trailing bytes are not commands
+    // (here: raw garbage), the decoder walked into them and every byte
+    // became a bogus opcode -- the exact ~14K-junk-skip cascade seen on the
+    // real OoT gameplay task. After the fix a branch STOPS the parent stream.
+
+    #[test]
+    fn g_dl_branch_does_not_decode_bytes_after_the_branch() {
+        // Layout:
+        //   0x1000  parent DL: [G_DL NOPUSH -> 0x2000], then GARBAGE, G_ENDDL
+        //   0x2000  target DL: [G_VTX(3) @ 0x3000], [G_TRI1 0,1,2], G_ENDDL
+        //   0x3000  three vertices
+        let mut rdram = vec![0u8; 0x4000];
+
+        // Parent stream at 0x1000.
+        // gsSPBranchList: w0 = G_DL<<24 | G_DL_NOPUSH<<16, w1 = target addr.
+        wr_cmd(
+            &mut rdram,
+            0x1000,
+            ((G_DL as u32) << 24) | (0x01 << 16),
+            0x2000,
+        );
+        // "Garbage" right after the branch that the PRE-FIX decoder would
+        // wrongly execute: a second VTX+TRI1 pair drawing a spurious extra
+        // triangle. (In the real bug these trailing bytes were zero-fill /
+        // an unrelated buffer that cascaded into ~14K junk-opcode skips; a
+        // spurious *triangle* is the same "kept decoding after the branch"
+        // fault, made observable as a hard count assertion.)
+        wr_cmd(
+            &mut rdram,
+            0x1008,
+            ((G_VTX as u32) << 24) | (3 << 12) | (3 << 1),
+            0x3000,
+        );
+        wr_cmd(
+            &mut rdram,
+            0x1010,
+            ((G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1),
+            0,
+        );
+        wr_cmd(&mut rdram, 0x1018, (G_ENDDL as u32) << 24, 0);
+
+        // Target stream at 0x2000: load 3 verts, draw 1 triangle, end.
+        // G_VTX: n=3 in bits 12-19, end=3 in bits 1-7 -> v0 = end - n = 0.
+        wr_cmd(
+            &mut rdram,
+            0x2000,
+            ((G_VTX as u32) << 24) | (3 << 12) | (3 << 1),
+            0x3000,
+        );
+        // G_TRI1: three 7-bit slots at bits 17/9/1 -> slots 0,1,2.
+        wr_cmd(
+            &mut rdram,
+            0x2008,
+            ((G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1),
+            0,
+        );
+        wr_cmd(&mut rdram, 0x2010, (G_ENDDL as u32) << 24, 0);
+
+        // Three vertices (raw screen coords; no transform loaded).
+        wr_vtx(&mut rdram, 0x3000, 10, 10, 0, [255, 0, 0, 255]);
+        wr_vtx(&mut rdram, 0x3010, 20, 10, 0, [0, 255, 0, 255]);
+        wr_vtx(&mut rdram, 0x3020, 15, 20, 0, [0, 0, 255, 255]);
+
+        // Segment 0 is identity here (addresses are already physical).
+        let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
+
+        // Exactly the ONE triangle from the branched-to target -- no extra
+        // garbage triangles, and (the real proof) no unrecognized-opcode
+        // cascade from decoding the bytes after the branch. Pre-fix this
+        // would have walked the 0x1008.. garbage as opcodes.
+        assert_eq!(
+            tris.len(),
+            1,
+            "branch must run the target then stop; got {} triangles \
+             (pre-fix bug decoded post-branch garbage)",
+            tris.len()
+        );
+        // The triangle carries the three planted vertex colors.
+        assert_eq!(tris[0].v[0].r, 255);
+        assert_eq!(tris[0].v[1].g, 255);
+        assert_eq!(tris[0].v[2].b, 255);
+    }
+
+    #[test]
+    fn g_dl_call_resumes_parent_after_target() {
+        // A CALL (G_DL_PUSH=0) must recurse AND resume the parent: parent
+        // draws one tri, calls a sub-DL that draws one tri, then parent draws
+        // a third after the call returns -> 3 triangles total.
+        let mut rdram = vec![0u8; 0x4000];
+
+        // Shared vertices at 0x3000 (0,1,2).
+        wr_vtx(&mut rdram, 0x3000, 10, 10, 0, [255, 0, 0, 255]);
+        wr_vtx(&mut rdram, 0x3010, 20, 10, 0, [0, 255, 0, 255]);
+        wr_vtx(&mut rdram, 0x3020, 15, 20, 0, [0, 0, 255, 255]);
+
+        let vtx = |rd: &mut [u8], off: usize| {
+            wr_cmd(
+                rd,
+                off,
+                ((G_VTX as u32) << 24) | (3 << 12) | (3 << 1),
+                0x3000,
+            );
+        };
+        let tri1 = |rd: &mut [u8], off: usize| {
+            wr_cmd(
+                rd,
+                off,
+                ((G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1),
+                0,
+            );
+        };
+
+        // Parent at 0x1000: VTX, TRI1, G_DL CALL -> 0x2000, TRI1, ENDDL.
+        vtx(&mut rdram, 0x1000);
+        tri1(&mut rdram, 0x1008);
+        wr_cmd(&mut rdram, 0x1010, (G_DL as u32) << 24, 0x2000); // push=0 -> CALL
+        tri1(&mut rdram, 0x1018);
+        wr_cmd(&mut rdram, 0x1020, (G_ENDDL as u32) << 24, 0);
+
+        // Sub-DL at 0x2000: VTX, TRI1, ENDDL.
+        vtx(&mut rdram, 0x2000);
+        tri1(&mut rdram, 0x2008);
+        wr_cmd(&mut rdram, 0x2010, (G_ENDDL as u32) << 24, 0);
+
+        let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
+        assert_eq!(
+            tris.len(),
+            3,
+            "call must resume the parent after the target returns"
+        );
+    }
+
+    #[test]
+    fn g_texrect_consumes_two_words_and_does_not_desync() {
+        // A G_TEXRECT (0xE4) is a 16-byte command. If the decoder advances
+        // only 8 bytes it reads the coord word as a bogus opcode. Here the
+        // texrect's second word is crafted to look like a G_VTX opcode
+        // (0x01..) that, if wrongly decoded, would load a spurious vertex.
+        // A correct 16-byte skip walks straight to the real G_TRI1.
+        let mut rdram = vec![0u8; 0x4000];
+
+        wr_vtx(&mut rdram, 0x3000, 10, 10, 0, [255, 0, 0, 255]);
+        wr_vtx(&mut rdram, 0x3010, 20, 10, 0, [0, 255, 0, 255]);
+        wr_vtx(&mut rdram, 0x3020, 15, 20, 0, [0, 0, 255, 255]);
+
+        // VTX (3 verts).
+        wr_cmd(
+            &mut rdram,
+            0x1000,
+            ((G_VTX as u32) << 24) | (3 << 12) | (3 << 1),
+            0x3000,
+        );
+        // G_TEXRECT word 0 + word 1. The SECOND 8-byte word starts with 0x01
+        // (a G_VTX opcode byte) to catch an under-advance.
+        wr_cmd(
+            &mut rdram,
+            0x1008,
+            ((G_TEXRECT as u32) << 24) | 0x00abcdef,
+            0x12345678,
+        );
+        wr_cmd(&mut rdram, 0x1010, 0x0100_4008, 0x0100_1c00); // texrect 2nd word
+        // Real G_TRI1 after the full 16-byte texrect.
+        wr_cmd(
+            &mut rdram,
+            0x1018,
+            ((G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1),
+            0,
+        );
+        wr_cmd(&mut rdram, 0x1020, (G_ENDDL as u32) << 24, 0);
+
+        let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
+        assert_eq!(
+            tris.len(),
+            1,
+            "texrect must consume both words so the following G_TRI1 is \
+             decoded at the right offset"
+        );
     }
 
     // --- Viewport mapping (priority 1) ----------------------------------
