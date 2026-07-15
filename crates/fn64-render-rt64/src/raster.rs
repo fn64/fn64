@@ -136,10 +136,25 @@ impl Framebuffer {
                 let w1 = edge(c, a, p) / area;
                 let w2 = edge(a, b, p) / area;
                 if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
-                    let r = (w0 * a.r as f32 + w1 * b.r as f32 + w2 * c.r as f32) as u8;
-                    let g = (w0 * a.g as f32 + w1 * b.g as f32 + w2 * c.g as f32) as u8;
-                    let bl = (w0 * a.b as f32 + w1 * b.b as f32 + w2 * c.b as f32) as u8;
-                    let al = (w0 * a.a as f32 + w1 * b.a as f32 + w2 * c.a as f32) as u8;
+                    // Interpolated (screen-linear) shade color.
+                    let mut r = (w0 * a.r as f32 + w1 * b.r as f32 + w2 * c.r as f32) as u8;
+                    let mut g = (w0 * a.g as f32 + w1 * b.g as f32 + w2 * c.g as f32) as u8;
+                    let mut bl = (w0 * a.b as f32 + w1 * b.b as f32 + w2 * c.b as f32) as u8;
+                    let mut al = (w0 * a.a as f32 + w1 * b.a as f32 + w2 * c.a as f32) as u8;
+                    // If a texture is bound, sample it at the interpolated S/T
+                    // and MODULATE (texel * shade / 255) per channel -- the
+                    // default OoT combiner (F3DEX2-CONCEPTS.md §5.2). Screen-
+                    // linear S/T interpolation (perspective-incorrect, §4.1);
+                    // adequate for a first recognizable textured frame.
+                    if let Some(tex) = &tri.texture {
+                        let s = w0 * a.s + w1 * b.s + w2 * c.s;
+                        let t = w0 * a.t + w1 * b.t + w2 * c.t;
+                        let [tr, tg, tb, ta] = tex.sample(s, t);
+                        r = ((tr as u32 * r as u32) / 255) as u8;
+                        g = ((tg as u32 * g as u32) / 255) as u8;
+                        bl = ((tb as u32 * bl as u32) / 255) as u8;
+                        al = ((ta as u32 * al as u32) / 255) as u8;
+                    }
                     if depth_test {
                         // Screen-linear depth interpolation (perspective-
                         // incorrect, adequate for occlusion -- §4.1/§4.3).
@@ -163,7 +178,15 @@ mod tests {
     use super::*;
 
     fn v(x: f32, y: f32, r: u8, g: u8, b: u8, a: u8) -> Vertex {
-        Vertex { x, y, r, g, b, a }
+        Vertex {
+            x,
+            y,
+            r,
+            g,
+            b,
+            a,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -184,6 +207,7 @@ mod tests {
                 v(12.0, 2.0, 255, 0, 0, 255),
                 v(7.0, 12.0, 255, 0, 0, 255),
             ],
+            ..Default::default()
         };
         fb.draw_triangle(&tri);
         assert!(fb.has_non_uniform_content(0, 0, 0, 255));
@@ -198,6 +222,62 @@ mod tests {
     }
 
     #[test]
+    fn textured_triangle_modulates_texel_by_shade() {
+        use crate::gbi::Texture;
+        // 1×1 white texture: modulate leaves the shade color unchanged.
+        let white = Texture {
+            width: 1,
+            height: 1,
+            texels: std::rc::Rc::new(vec![255, 255, 255, 255]),
+            clamp_s: true,
+            clamp_t: true,
+        };
+        let mut fb = Framebuffer::new(16, 16);
+        fb.clear(0, 0, 0, 255);
+        // Green-shaded triangle, all S/T = 0 (samples the one white texel).
+        let mut tri = Triangle {
+            v: [
+                v(2.0, 2.0, 0, 200, 0, 255),
+                v(12.0, 2.0, 0, 200, 0, 255),
+                v(7.0, 12.0, 0, 200, 0, 255),
+            ],
+            ..Default::default()
+        };
+        tri.texture = Some(white);
+        fb.draw_triangle(&tri);
+        let idx = (6u32 * fb.width + 7u32) as usize * 4;
+        // white(255) * shade(200) / 255 == 200: texture didn't tint the shade.
+        assert_eq!(&fb.pixels[idx..idx + 4], &[0, 200, 0, 255]);
+    }
+
+    #[test]
+    fn textured_triangle_paints_texel_color() {
+        use crate::gbi::Texture;
+        // 1×1 red texture under a white shade -> red pixel (modulate).
+        let red = Texture {
+            width: 1,
+            height: 1,
+            texels: std::rc::Rc::new(vec![255, 0, 0, 255]),
+            clamp_s: true,
+            clamp_t: true,
+        };
+        let mut fb = Framebuffer::new(16, 16);
+        fb.clear(0, 0, 0, 255);
+        let mut tri = Triangle {
+            v: [
+                v(2.0, 2.0, 255, 255, 255, 255),
+                v(12.0, 2.0, 255, 255, 255, 255),
+                v(7.0, 12.0, 255, 255, 255, 255),
+            ],
+            ..Default::default()
+        };
+        tri.texture = Some(red);
+        fb.draw_triangle(&tri);
+        let idx = (6u32 * fb.width + 7u32) as usize * 4;
+        assert_eq!(&fb.pixels[idx..idx + 4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
     fn degenerate_triangle_paints_nothing() {
         let mut fb = Framebuffer::new(8, 8);
         fb.clear(1, 2, 3, 4);
@@ -207,6 +287,7 @@ mod tests {
                 v(1.0, 1.0, 9, 9, 9, 9),
                 v(1.0, 1.0, 9, 9, 9, 9),
             ],
+            ..Default::default()
         };
         fb.draw_triangle(&tri);
         assert!(!fb.has_non_uniform_content(1, 2, 3, 4));

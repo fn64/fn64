@@ -216,8 +216,23 @@ impl RenderBackend for ReferenceBackend {
             DecodeMode::F3dex2 => gbi::decode_display_list_f3dex2(rdram, task.data_ptr)?,
         };
         let tri_count = triangles.len();
-        for tri in &triangles {
-            fb.draw_triangle(tri);
+        match self.decode_mode {
+            // Simple reference-fixture path: pure 2D fill, no culling/z-test,
+            // to keep the hand-built fixtures bit-compatible.
+            DecodeMode::Simple => {
+                for tri in &triangles {
+                    fb.draw_triangle(tri);
+                }
+            }
+            // Real F3DEX2 scene path: honor per-triangle back/front-face
+            // culling (from G_GEOMETRYMODE) + z-buffering + texture sampling,
+            // so far geometry is occluded, inside-out back faces don't
+            // overpaint front faces, and textured surfaces show their texels.
+            DecodeMode::F3dex2 => {
+                for tri in &triangles {
+                    fb.draw_triangle_culled(tri, tri.cull);
+                }
+            }
         }
 
         // Auto-dump the rasterized frame if configured (the harness's only
