@@ -160,6 +160,13 @@ impl Peripherals {
         &self.pif
     }
 
+    /// Feed a controller's live button/stick state for `port` -- the host
+    /// side of the input seam (see `si::PifModel::set_input`). A subsequent
+    /// `osContGetReadData` for that port reflects it.
+    pub fn set_controller_input(&mut self, port: usize, input: crate::si::ContInput) {
+        self.pif.set_input(port, input);
+    }
+
     // ---- RSP task submission -----------------------------------------------
 
     pub fn task_log(&self) -> &TaskLog {
