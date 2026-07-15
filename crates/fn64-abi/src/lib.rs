@@ -1287,13 +1287,14 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
     // function pointers, which `resolve` maps through the section's static
     // base. Only for device->RDRAM ROM reads; SRAM/save DMAs never match a
     // code section. See SectionRegistry::plan_static_mirror.
-    if matches!(direction, DmaDirection::ToRdram)
-        && !fn64_runtime::rom::is_sram_dev_addr(dev_addr)
+    if matches!(direction, DmaDirection::ToRdram) && !fn64_runtime::rom::is_sram_dev_addr(dev_addr)
     {
         if let Some(static_off) = with_host(|host| host.sections.plan_static_mirror(dev_addr, len))
         {
             let mut buf = vec![0u8; len as usize];
-            with_pi_dma("osEPiStartDma_recomp", |dma| dma.read_rom_bytes(dev_addr, &mut buf));
+            with_pi_dma("osEPiStartDma_recomp", |dma| {
+                dma.read_rom_bytes(dev_addr, &mut buf)
+            });
             // Same word-swizzle the primary destination write applies, so the
             // mirror is native-word storage the guest reads back via MEM_*.
             for word in buf.chunks_exact_mut(4) {
@@ -1797,7 +1798,7 @@ pub unsafe extern "C" fn osGetTime_recomp(_rdram: *mut u8, ctx: *mut RecompConte
 /// task, matching real hardware's observable effect on the caller (task done,
 /// no re-queue) regardless of whether a backend actually drew anything.
 ///
-/// AUDIO_TASK_NOTE: an audio task (`M_AUDTASK`) causes the translated `wm2000_audio_ucode` function (out-of-tree; see `examples/wm2000-boot`'s harness, which registers it via `set_audio_ucode_fn` below -- `fn64-abi` itself contains no game-derived ucode C, per `README.md`'s "no game content ships in this repo") to be REALLY CALLED with `(rdram, ucode_addr)`, matching `RSPRecomp`'s documented generated signature. Its `RspExitReason` return is not yet interpreted beyond "it ran"; the header is still recorded via `submit_task`.
+/// AUDIO_TASK_NOTE: an audio task (`M_AUDTASK`) causes the registered translated audio ucode function (out-of-tree; e.g. `oot-audio-ucode`'s recompiled OoT aspMain, or WM2000's `wm2000_audio_ucode`, registered via `set_audio_ucode_fn` below -- `fn64-abi` itself contains no game-derived ucode, per `README.md`'s "no game content ships in this repo") to be REALLY CALLED with `(rdram, task_offset)` -- the OSTask's rdram offset, which a recompiled ucode uses to seed its RSP DMEM (see `AudioUcodeFn`'s doc comment). Its `RspExitReason` return is not yet interpreted beyond "it ran"; the header is still recorded via `submit_task`.
 ///
 /// UNKNOWN_TASK_NOTE: an unrecognized task type is recorded (so the trace/count still sees it) but not executed, and this function still sets `ctx.r2 = 0` (complete) -- the same "acknowledge, don't fabricate real hardware effects" stance as the gfx path, since this milestone has no evidence for any other task type on NWXE's boot path.
 ///
@@ -1869,13 +1870,17 @@ pub unsafe extern "C" fn osSpTaskYielded_recomp(rdram: *mut u8, ctx: *mut Recomp
             if let Some(f) = cell.get() {
                 // Safety: `set_audio_ucode_fn`'s doc comment is the
                 // contract -- `f` must be the real translated ucode
-                // function, matching RSPRecomp's documented
-                // `(uint8_t* rdram, uint32_t ucode_addr) -> RspExitReason`
-                // signature. `ucode` (offset 0x10 in the header) is the
-                // ucode text's rdram-relative address per the same field
-                // layout this function already reads.
+                // function. We pass the OSTask's rdram OFFSET `o` (not the
+                // ucode-text address) as the second argument: a real
+                // recompiled ucode has its IMEM text baked in and does not
+                // re-read it from rdram; what it DOES need is the task
+                // structure (rspboot pre-loads the 64-byte OSTask into RSP
+                // DMEM at 0xFC0, and aspMain's first act is `lw 0x18(0xFC0)`
+                // = read `ucode_data`). The recompiled ucode's FFI wrapper
+                // uses this offset to seed DMEM[0xFC0] before running. See
+                // `AudioUcodeFn`'s doc comment for the widened meaning.
                 unsafe {
-                    f(rdram, header.ucode);
+                    f(rdram, o as u32);
                 }
             }
             // No ucode function registered (e.g. a test, or the harness
@@ -2030,14 +2035,14 @@ pub fn last_render_error() -> Option<String> {
     RENDER_LAST_ERROR.with(|cell| cell.borrow().clone())
 }
 
-/// Real translated audio-ucode function signature, per
-/// `aki-recomp/games/NWXE/rsp/wm2000_audio.toml`'s
-/// `output_function_name = "wm2000_audio_ucode"` and its generated C's own
-/// signature (`RspExitReason wm2000_audio_ucode(uint8_t* rdram, uint32_t
-/// ucode_addr)`). `RspExitReason` is an RSPRecomp-defined enum this crate
-/// does not need to interpret (see `osSpTaskYielded_recomp`'s doc comment:
-/// "not yet interpreted beyond 'it ran'") -- represented here as a plain
-/// `u32` return the FFI boundary doesn't need to name further.
+/// Real translated audio-ucode function signature. Matches RSPRecomp's
+/// generated `RspExitReason <name>(uint8_t* rdram, uint32_t)` shape, but the
+/// second `u32` carries the **OSTask rdram offset** (`osSpTaskYielded_recomp`
+/// passes `o`), not the ucode-text address: a recompiled ucode bakes its own
+/// IMEM text in and instead needs the task structure to seed its RSP DMEM
+/// (rspboot loads the 64-byte OSTask into DMEM 0xFC0; the audio ucode reads
+/// `ucode_data`@0x18 from there). `RspExitReason` is an RSPRecomp-defined enum
+/// this crate does not interpret beyond "it ran" -- a plain `u32` return.
 pub type AudioUcodeFn = unsafe extern "C" fn(*mut u8, u32) -> u32;
 
 thread_local! {
@@ -2804,8 +2809,7 @@ pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut Reco
         // A present standard controller reports errno == 0 and its live input;
         // an absent port reports no-response, matching the decomp's
         // `errno = CHNL_ERR(read)` branch (button/stick left zero here).
-        let absent =
-            (pif.query_response(port)[2] & fn64_runtime::si::CONT_ABSENT) != 0;
+        let absent = (pif.query_response(port)[2] & fn64_runtime::si::CONT_ABSENT) != 0;
         // `read_data_response` is the `[button_hi, button_lo, stick_x, stick_y]`
         // PIF wire shape filled from the fed input (idle default).
         let resp = pif.read_data_response(port);
@@ -3570,7 +3574,11 @@ mod tests {
         assert_eq!(unsafe { ctx.f8.u32_halves.1 }, 0xDEAD_0009, "f9 -> f8.u32h");
         // $f7 -> f6.u32h; $f17 -> f16.u32h.
         assert_eq!(unsafe { ctx.f6.u32_halves.1 }, 0xBEEF_0007, "f7 -> f6.u32h");
-        assert_eq!(unsafe { ctx.f16.u32_halves.1 }, 0xCAFE_0017, "f17 -> f16.u32h");
+        assert_eq!(
+            unsafe { ctx.f16.u32_halves.1 },
+            0xCAFE_0017,
+            "f17 -> f16.u32h"
+        );
 
         // The LOW words of those even partners (their own $fN even-register
         // value) must be untouched -- proves the write hit the odd lane, not
@@ -3799,7 +3807,10 @@ mod tests {
         // Drain the pre-filled message, then a NOBLOCK send into the now-open
         // slot must return 0.
         with_executor(|exec| {
-            assert_eq!(exec.recv_mesg(999, mq_addr, false), RecvMesgOutcome::Delivered(0xFEED));
+            assert_eq!(
+                exec.recv_mesg(999, mq_addr, false),
+                RecvMesgOutcome::Delivered(0xFEED)
+            );
         });
         let ok = std::rc::Rc::new(std::cell::RefCell::new(None));
         let ok2 = ok.clone();
@@ -4301,7 +4312,8 @@ mod tests {
         // region would have been written (and r4's region left as zeros).
         for i in 0..0x10 {
             assert_eq!(
-                buf[decoy_off + i], 0xAB,
+                buf[decoy_off + i],
+                0xAB,
                 "byte {i} at the r5/decoy address was written -- the shim read \
                  its pointer from the wrong register (the reintroduced bug)"
             );
@@ -4739,7 +4751,10 @@ mod tests {
         ctx.r4 = 0x8000_0000 + header_off as u64;
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
-        assert_eq!(ctx.r2, 0, "task reported complete (0), not OS_TASK_YIELDED (1)");
+        assert_eq!(
+            ctx.r2, 0,
+            "task reported complete (0), not OS_TASK_YIELDED (1)"
+        );
         with_executor(|exec| {
             assert_eq!(exec.task_log().gfx_count(), 1);
             assert_eq!(exec.task_log().audio_count(), 0);
@@ -4785,8 +4800,7 @@ mod tests {
         // same way the real `Sched_RunTask` call site passes `&spTask->list`.
         let mut rdram = vec![0u8; 128];
         let header_off = 0x10usize;
-        rdram[header_off..header_off + 4]
-            .copy_from_slice(&fn64_runtime::M_GFXTASK.to_ne_bytes());
+        rdram[header_off..header_off + 4].copy_from_slice(&fn64_runtime::M_GFXTASK.to_ne_bytes());
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + header_off as u64;
 
@@ -4837,8 +4851,7 @@ mod tests {
 
         let mut rdram = vec![0u8; 128];
         let header_off = 0x10usize;
-        rdram[header_off..header_off + 4]
-            .copy_from_slice(&fn64_runtime::M_AUDTASK.to_ne_bytes());
+        rdram[header_off..header_off + 4].copy_from_slice(&fn64_runtime::M_AUDTASK.to_ne_bytes());
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + header_off as u64;
 
@@ -4923,7 +4936,10 @@ mod tests {
         ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
-        assert_eq!(ctx.r2, 0, "task reported complete (0), not OS_TASK_YIELDED (1)");
+        assert_eq!(
+            ctx.r2, 0,
+            "task reported complete (0), not OS_TASK_YIELDED (1)"
+        );
         assert_eq!(
             last_render_error(),
             None,
@@ -4966,9 +4982,9 @@ mod tests {
         static CALLED: AtomicBool = AtomicBool::new(false);
         static SEEN_UCODE_ADDR: AtomicU32 = AtomicU32::new(0);
 
-        unsafe extern "C" fn fake_ucode(_rdram: *mut u8, ucode_addr: u32) -> u32 {
+        unsafe extern "C" fn fake_ucode(_rdram: *mut u8, task_offset: u32) -> u32 {
             CALLED.store(true, Ordering::SeqCst);
-            SEEN_UCODE_ADDR.store(ucode_addr, Ordering::SeqCst);
+            SEEN_UCODE_ADDR.store(task_offset, Ordering::SeqCst);
             0
         }
         unsafe { set_audio_ucode_fn(fake_ucode) };
@@ -4986,7 +5002,11 @@ mod tests {
             CALLED.load(Ordering::SeqCst),
             "real ucode fn must be called for M_AUDTASK"
         );
-        assert_eq!(SEEN_UCODE_ADDR.load(Ordering::SeqCst), 0xDEAD);
+        // The second arg is the OSTask's rdram OFFSET (see `AudioUcodeFn`'s
+        // doc comment: a recompiled ucode bakes its IMEM text in and needs the
+        // task structure, not the ucode-text address). Here that's
+        // `header_off` (0x20), the offset of the OSTask within `rdram`.
+        assert_eq!(SEEN_UCODE_ADDR.load(Ordering::SeqCst), header_off as u32);
         with_executor(|exec| assert!(exec.task_log().audio_count() >= 1));
     }
 
@@ -5049,7 +5069,10 @@ mod tests {
         ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
-        assert_eq!(ctx.r2, 0, "task reported complete (0), not OS_TASK_YIELDED (1)");
+        assert_eq!(
+            ctx.r2, 0,
+            "task reported complete (0), not OS_TASK_YIELDED (1)"
+        );
         assert_eq!(
             last_audio_error(),
             None,
@@ -5182,8 +5205,8 @@ mod tests {
         const FUNC_OFF: u32 = 0x15E4; // real Player_InitDefaultIA offset
         const TABLE_FILE_OFF: usize = 0x40; // where the ptr table sits in ROM
         let static_ptr: u32 = SEC_RAM + FUNC_OFF; // 0x808317A4 -- the baked static ptr
-        // The overlay file must be word-aligned and long enough to DMA in one
-        // aligned chunk covering the table.
+                                                  // The overlay file must be word-aligned and long enough to DMA in one
+                                                  // aligned chunk covering the table.
         let file_len: u32 = 0x80;
 
         // Register the section with a FuncEntry at the pointed-at offset, and
@@ -5266,7 +5289,7 @@ mod tests {
         // MEM_BU(dram_off ^ 3) is the guest's byte read; +2 must be 'J'.
         assert_eq!(rdram[(dram_off + 0) ^ 3], 0x5A); // 'Z'
         assert_eq!(rdram[(dram_off + 2) ^ 3], 0x4A); // 'J' -- the region byte
-        // And MEM_W reads the cart word intact (native-endian word storage).
+                                                     // And MEM_W reads the cart word intact (native-endian word storage).
         let w = u32::from_ne_bytes(rdram[dram_off..dram_off + 4].try_into().unwrap());
         assert_eq!(w, 0x5A4C_4A00);
     }
@@ -5454,7 +5477,10 @@ mod tests {
         ctx.r4 = 0x8000_0040; // KSEG0 -> offset 0x40
         ctx.r2 = 0xFFFF_FFFF; // stale $v0.
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
-        assert_eq!(ctx.r2, 0, "0 = completed (did not yield); 1 = OS_TASK_YIELDED");
+        assert_eq!(
+            ctx.r2, 0,
+            "0 = completed (did not yield); 1 = OS_TASK_YIELDED"
+        );
     }
 
     /// osContInit: (1) OSContStatus entries must be written SWIZZLED (^3) like
@@ -5486,8 +5512,15 @@ mod tests {
         // flat address 0x80 must stay the 0xEE sentinel (the buggy flat store
         // would overwrite it), and 0x81 must stay 0xEE (the buggy +1 store
         // would clobber this adjacent byte).
-        assert_eq!(rdram[0x80 ^ 3], 0x01, "bitfield: single swizzled byte, port0 set");
-        assert_eq!(rdram[0x80], 0xEE, "flat bitfield addr untouched (no flat store)");
+        assert_eq!(
+            rdram[0x80 ^ 3],
+            0x01,
+            "bitfield: single swizzled byte, port0 set"
+        );
+        assert_eq!(
+            rdram[0x80], 0xEE,
+            "flat bitfield addr untouched (no flat store)"
+        );
         assert_eq!(rdram[0x81], 0xEE, "adjacent byte untouched (no +1 store)");
     }
 
@@ -5514,8 +5547,14 @@ mod tests {
 
         // The jammed 0x9999 must come out BEFORE the earlier 0x1111.
         with_executor(|exec| {
-            assert_eq!(exec.recv_mesg(0, mq_addr, false), RecvMesgOutcome::Delivered(0x9999));
-            assert_eq!(exec.recv_mesg(0, mq_addr, false), RecvMesgOutcome::Delivered(0x1111));
+            assert_eq!(
+                exec.recv_mesg(0, mq_addr, false),
+                RecvMesgOutcome::Delivered(0x9999)
+            );
+            assert_eq!(
+                exec.recv_mesg(0, mq_addr, false),
+                RecvMesgOutcome::Delivered(0x1111)
+            );
         });
     }
 }

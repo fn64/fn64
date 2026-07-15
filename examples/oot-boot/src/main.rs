@@ -288,8 +288,7 @@ fn main() {
         }
     }
 
-    // Real plumbing, stand-in body (see stand_in_audio_ucode's doc comment).
-    unsafe { fn64_abi::set_audio_ucode_fn(stand_in_audio_ucode) };
+    let _ = stand_in_audio_ucode; // kept for reference; real ucode wired below
 
     // VI retrace: arm a host-chosen approximation (fn64_runtime::vi's doc:
     // not a hardware-accurate NTSC/PAL constant). 1000 virtual-time units
@@ -382,6 +381,19 @@ fn main() {
     println!(
         "[oot-boot] registered fn64-render-rt64 ReferenceBackend (F3DEX2, 320x240, \
          auto-dump /tmp/fn64-oot-render-*.png) as the render backend"
+    );
+
+    // Register the REAL recompiled OoT aspMain audio ucode (typed Rust from
+    // fn64-audio's clean-room RSP recompiler, compiled in the out-of-tree
+    // `oot-audio-ucode` crate). This replaces the stand-in: M_AUDTASK
+    // dispatch now actually runs the translated 1004-instruction ucode
+    // against rdram. The ucode's FFI wrapper rebuilds a bounds-checked
+    // `&mut [u8]` from the raw pointer, so it needs the rdram length first.
+    oot_audio_ucode::set_rdram_len(rdram.len());
+    unsafe { fn64_abi::set_audio_ucode_fn(oot_audio_ucode::oot_audio_ucode) };
+    println!(
+        "[oot-boot] registered recompiled OoT aspMain audio ucode (1004 instrs) \
+         as the real M_AUDTASK ucode function"
     );
 
     println!("[oot-boot] booting thread 0 (recomp_entrypoint)...");
