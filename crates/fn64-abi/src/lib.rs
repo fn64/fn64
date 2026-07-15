@@ -850,7 +850,7 @@ pub unsafe extern "C" fn osCreateMesgQueue_recomp(_rdram: *mut u8, ctx: *mut Rec
 /// Same contract as `osCreateMesgQueue_recomp`.
 #[no_mangle]
 pub unsafe extern "C" fn osSendMesg_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
-    let ctx = unsafe { &*ctx };
+    let ctx = unsafe { &mut *ctx };
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
     let msg: Mesg = ctx.r5 as u32;
     let may_block = ctx.r6 == OS_MESG_BLOCK;
@@ -864,17 +864,23 @@ pub unsafe extern "C" fn osSendMesg_recomp(_rdram: *mut u8, ctx: *mut RecompCont
         );
     }
 
-    match suspend_active_coroutine(Yield::BlockOnSend {
+    let sent = match suspend_active_coroutine(Yield::BlockOnSend {
         mq_addr,
         msg,
         may_block,
     }) {
-        Resume::SendUnblocked | Resume::WouldBlock => {}
+        Resume::SendUnblocked => true,
+        Resume::WouldBlock => false,
         other => panic!(
             "osSendMesg_recomp: resumed from a BlockOnSend yield with an unexpected Resume \
              variant {other:?}"
         ),
-    }
+    };
+    // Return value in $v0: 0 on enqueue, -1 when a NOBLOCK send found the
+    // queue full (libultra's `s32 osSendMesg` contract; ref impl
+    // `mesgqueue.cpp` `return sent ? 0 : -1`). Symmetric with the recv
+    // return above -- previously never written, same class of stale-$v0 bug.
+    ctx.r2 = if sent { 0 } else { -1i64 as u64 };
 }
 
 /// `OS_MESG_NOBLOCK`/`OS_MESG_BLOCK`, per the public libultra manual.
@@ -888,7 +894,7 @@ const OS_MESG_BLOCK: u64 = 1;
 /// `rdram`/`ctx` must be valid per the same contract as every other shim.
 #[no_mangle]
 pub unsafe extern "C" fn osRecvMesg_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
-    let ctx = unsafe { &*ctx };
+    let ctx = unsafe { &mut *ctx };
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
     // Correction (2026-07-14): check the RAW register for null, not the
     // translated `RdramAddr`. A real `msg == NULL` call (public libultra
@@ -930,6 +936,18 @@ pub unsafe extern "C" fn osRecvMesg_recomp(rdram: *mut u8, ctx: *mut RecompConte
             }
         }
     }
+
+    // Return value in $v0 (`ctx.r2`): 0 on delivery, -1 when a NOBLOCK recv
+    // found the queue empty (libultra's documented `s32 osRecvMesg` contract;
+    // ref impl `ultramodern/src/mesgqueue.cpp` `return received ? 0 : -1`).
+    // NOBLOCK drain loops (e.g. OoT's `Sched_HandleNotification`, asm
+    // 0x800A3180 `beq $v0, -1`) test exactly this to detect an empty queue and
+    // stop. Leaving $v0 stale (the prior omission -- `ctx` was borrowed `&*`,
+    // this write was simply never made) makes that loop never see -1, so the
+    // Scheduler thread spins a NOBLOCK poll forever and virtual time never
+    // advances (examples/oot-boot: sim_time stuck at 0, run_one_step always
+    // returns true). Written last, after all field reads.
+    ctx.r2 = if delivered.is_some() { 0 } else { -1i64 as u64 };
 }
 
 /// `osSetEventMesg(OSEvent event, OSMesgQueue *mq, OSMesg msg)`.
@@ -3217,6 +3235,135 @@ mod tests {
         // MEM_W is a native-endian word access, not big-endian.
         let written = i32::from_ne_bytes(rdram[0x20..0x24].try_into().unwrap());
         assert_eq!(written, 0x1234_5678);
+    }
+
+    /// Regression test for the real infinite-spin the OoT boot harness hit
+    /// (2026-07-14): `osRecvMesg_recomp` never wrote `ctx.r2` ($v0), so a
+    /// NOBLOCK-recv drain loop that tests `$v0 == -1` to detect an empty
+    /// queue never saw -1 and spun forever. The concrete caller was OoT's
+    /// Scheduler thread (`Sched_HandleNotification`, asm 0x800A3174 does a
+    /// NOBLOCK `osRecvMesg` then 0x800A3180 `beq $v0, -1` to exit) -- the
+    /// spin pinned `run_one_step` always-runnable, so virtual time never
+    /// advanced (`examples/oot-boot`: sim_time stuck at 0). The libultra
+    /// contract (ref impl `ultramodern/src/mesgqueue.cpp`:
+    /// `return received ? 0 : -1`) is: NOBLOCK recv on an empty queue -> -1.
+    ///
+    /// Seed `ctx.r2` with a realistic STALE non-`-1` value first, so a
+    /// regression that stops writing `$v0` fails here even though a
+    /// zeroed-`ctx` setup would have masked it (0 != -1 by luck, but the
+    /// delivered-path test below pins the 0 case too).
+    #[test]
+    fn noblock_recv_on_empty_queue_returns_minus_one_in_v0_even_with_stale_r2() {
+        let mq_vram: u64 = 0xFFFF_FFFF_800B_0000;
+        let mut create_ctx = ctx_with(mq_vram, 0, 1);
+        unsafe { osCreateMesgQueue_recomp(std::ptr::null_mut(), &mut create_ctx as *mut _) };
+
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed2 = observed.clone();
+        spawn_test_thread(110, 5, move || {
+            let mut recv_ctx = ctx_with(mq_vram, 0, OS_MESG_NOBLOCK);
+            recv_ctx.r2 = 0x1234_5678; // stale non-(-1), as a real caller's $v0 would hold
+            unsafe { osRecvMesg_recomp(std::ptr::null_mut(), &mut recv_ctx as *mut _) };
+            *observed2.borrow_mut() = Some(recv_ctx.r2);
+        });
+        // A NOBLOCK recv on an empty queue never parks: the thread runs to
+        // completion in a single step (this is exactly the yield that made
+        // the Sched thread always-runnable before the fix).
+        run_to_idle_with_yielder_plumbing();
+
+        assert_eq!(
+            observed.borrow().expect("recv thread ran"),
+            -1i64 as u64,
+            "NOBLOCK osRecvMesg on an empty queue must return -1 in $v0, or a \
+             `beq $v0, -1` drain loop (OoT's Sched thread) spins forever"
+        );
+    }
+
+    /// The delivered path must pin `$v0 = 0` (success), again seeding a
+    /// stale non-zero `$v0` so a regression that only writes -1 (or nothing)
+    /// on the empty path but leaves the success path stale is still caught.
+    #[test]
+    fn recv_that_delivers_a_message_returns_zero_in_v0_even_with_stale_r2() {
+        let mq_vram: u64 = 0xFFFF_FFFF_800C_0000;
+        let mq_addr = RdramAddr::from_gpr(mq_vram);
+        let mut create_ctx = ctx_with(mq_vram, 0, 1);
+        unsafe { osCreateMesgQueue_recomp(std::ptr::null_mut(), &mut create_ctx as *mut _) };
+        // Pre-seed one message so the NOBLOCK recv delivers immediately.
+        with_executor(|exec| {
+            assert_eq!(
+                exec.send_mesg(0, mq_addr, 0x0BAD_F00D, false),
+                SendMesgOutcome::Delivered
+            );
+        });
+
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed2 = observed.clone();
+        spawn_test_thread(111, 5, move || {
+            let mut recv_ctx = ctx_with(mq_vram, 0, OS_MESG_NOBLOCK);
+            recv_ctx.r2 = 0x7777_7777; // stale non-zero
+            unsafe { osRecvMesg_recomp(std::ptr::null_mut(), &mut recv_ctx as *mut _) };
+            *observed2.borrow_mut() = Some(recv_ctx.r2);
+        });
+        run_to_idle_with_yielder_plumbing();
+
+        assert_eq!(
+            observed.borrow().expect("recv thread ran"),
+            0,
+            "osRecvMesg that delivers a message must return 0 in $v0"
+        );
+    }
+
+    /// Symmetric return-value pin for `osSendMesg_recomp`: a NOBLOCK send on
+    /// a full queue must return -1 in $v0 (libultra `return sent ? 0 : -1`),
+    /// and a send that enqueues returns 0. Same stale-$v0 seeding discipline.
+    #[test]
+    fn noblock_send_return_value_in_v0_is_minus_one_on_full_zero_on_enqueue() {
+        let mq_vram: u64 = 0xFFFF_FFFF_800D_0000;
+        let mq_addr = RdramAddr::from_gpr(mq_vram);
+        // Capacity-1 queue, pre-filled so the next NOBLOCK send finds it full.
+        let mut create_ctx = ctx_with(mq_vram, 0, 1);
+        unsafe { osCreateMesgQueue_recomp(std::ptr::null_mut(), &mut create_ctx as *mut _) };
+        with_executor(|exec| {
+            assert_eq!(
+                exec.send_mesg(0, mq_addr, 0xFEED, false),
+                SendMesgOutcome::Delivered
+            );
+        });
+
+        let full = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let full2 = full.clone();
+        spawn_test_thread(112, 5, move || {
+            let mut send_ctx = ctx_with(mq_vram, 0x1111, OS_MESG_NOBLOCK);
+            send_ctx.r2 = 0x2222_2222; // stale non-(-1)
+            unsafe { osSendMesg_recomp(std::ptr::null_mut(), &mut send_ctx as *mut _) };
+            *full2.borrow_mut() = Some(send_ctx.r2);
+        });
+        run_to_idle_with_yielder_plumbing();
+        assert_eq!(
+            full.borrow().expect("send thread ran"),
+            -1i64 as u64,
+            "NOBLOCK osSendMesg on a full queue must return -1 in $v0"
+        );
+
+        // Drain the pre-filled message, then a NOBLOCK send into the now-open
+        // slot must return 0.
+        with_executor(|exec| {
+            assert_eq!(exec.recv_mesg(999, mq_addr, false), RecvMesgOutcome::Delivered(0xFEED));
+        });
+        let ok = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let ok2 = ok.clone();
+        spawn_test_thread(113, 5, move || {
+            let mut send_ctx = ctx_with(mq_vram, 0x3333, OS_MESG_NOBLOCK);
+            send_ctx.r2 = 0x4444_4444; // stale non-zero
+            unsafe { osSendMesg_recomp(std::ptr::null_mut(), &mut send_ctx as *mut _) };
+            *ok2.borrow_mut() = Some(send_ctx.r2);
+        });
+        run_to_idle_with_yielder_plumbing();
+        assert_eq!(
+            ok.borrow().expect("send thread ran"),
+            0,
+            "NOBLOCK osSendMesg that enqueues must return 0 in $v0"
+        );
     }
 
     /// Regression test for the coroutine-context-corruption bug the OoT
