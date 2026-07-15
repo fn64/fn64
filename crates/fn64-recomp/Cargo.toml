@@ -1,0 +1,13 @@
+[package]
+name = "fn64-recomp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Recompiler trait: the static-recompile seam per docs/DECOUPLING.md. Includes the N64Recomp shell-out adapter; N64Recomp is named ONLY in this crate."
+
+[dependencies]
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]

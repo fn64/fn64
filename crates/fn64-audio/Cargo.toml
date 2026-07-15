@@ -1,0 +1,12 @@
+[package]
+name = "fn64-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AudioBackend trait: the audio seam per docs/DECOUPLING.md, symmetric with fn64-render. Real cpal sample-delivery backend; ucode EXECUTION is a loud named stub (GPL question pending)."
+
+[dependencies]
+cpal = "0.18"
+
+[dev-dependencies]

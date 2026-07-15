@@ -46,11 +46,29 @@ fn c_caller_links_and_runs_against_fn64_abi_staticlib() {
     let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let out_bin = out_dir.join("fn64_abi_c_smoke");
 
-    let compile = Command::new("cc")
-        .arg(&smoke_c)
-        .arg(&staticlib)
-        .arg("-o")
-        .arg(&out_bin)
+    let mut cc = Command::new("cc");
+    cc.arg(&smoke_c).arg(&staticlib).arg("-o").arg(&out_bin);
+    // fn64-abi now statically links fn64-audio's cpal dependency (the real
+    // CpalBackend, see fn64-audio's crate doc), which on macOS pulls in
+    // CoreAudio/AudioToolbox/objc2 -- a plain `cc a.c lib.a` link needs
+    // those frameworks named explicitly, the same way any other consumer
+    // of a Rust staticlib with platform-audio deps would. Not needed on
+    // other platforms (cpal's non-Darwin backends link via other means
+    // already covered by the .a's own build).
+    if cfg!(target_os = "macos") {
+        cc.args([
+            "-framework",
+            "CoreAudio",
+            "-framework",
+            "AudioToolbox",
+            "-framework",
+            "CoreFoundation",
+            "-framework",
+            "Foundation",
+            "-lobjc",
+        ]);
+    }
+    let compile = cc
         .output()
         .expect("failed to invoke cc -- is a C toolchain installed?");
 
