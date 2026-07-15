@@ -1010,18 +1010,19 @@ pub unsafe extern "C" fn osCartRomInit_recomp(_rdram: *mut u8, _ctx: *mut Recomp
 
 /// `osEPiStartDma(OSPiHandle *handle, OSIoMesg *mb, s32 direction)` --
 /// `a0`=handle (`ctx->r4`, unused per `osCartRomInit_recomp`'s doc comment),
-/// `a1`=mb (`ctx->r5`, an `OSIoMesg*` -- `hdr.pri`/`hdr.retQueue`/`hdr.retMesg`
-/// (queue to post completion to) at offsets documented in the libultra
-/// manual's `OSIoMesg` layout, plus `dramAddr`/`devAddr`/`size`), `a2`=
-/// direction (`ctx->r6`, `OS_READ`=0/`OS_WRITE`=1 per the public manual).
+/// `a1`=mb (`ctx->r5`, an `OSIoMesg*`), `a2`=direction (`ctx->r6`,
+/// `OS_READ`=0/`OS_WRITE`=1 per the public manual).
 ///
-/// This crate's `OSIoMesg` field-offset assumptions (standard o32 struct
-/// layout: `dramAddr` at +0x8, `devAddr` at +0xC, `size` at +0x10 -- the
-/// documented libultra `OSIoMesg` shape after its `OSMesgHdr` header) are
-/// NOT yet byte-verified against a real ROM's struct-init call site in this
-/// milestone (no rung has isolated the exact offsets); this is flagged
-/// honestly here rather than asserted as settled, per `AGENTS.md`'s
-/// "prefer 'not verified' over a false 'done.'" The DMA completion posts
+/// The `OSIoMesg` field offsets are byte-verified against the OoT decomp
+/// header (`oot-decomp/include/ultra64/pi.h`) AND cross-checked against
+/// DmaMgr's own stack-struct build in OOTU `funcs_0.c`
+/// `DmaMgr_DmaRomToRam` (asm 0x800008F0-0x80000900): `OSIoMesgHdr` is only
+/// 0x08 bytes (`type` +0x0, `pri` +0x2, `status` +0x3, `retQueue` +0x4),
+/// so `dramAddr` is at +0x8, `devAddr` at +0xC, `size` at +0x10. A prior
+/// wave wrongly assumed a 0xC (3-word) header and read every body field
+/// +0x4 too high (size fell on the unwritten +0x14, reading 0) -- the OoT
+/// `DmaMgr_Init` dmadata-DMA hang. See the inline comment at the field
+/// reads below for the full store-to-field mapping. The DMA completion posts
 /// through `Executor::inject_event(DirectPost)` -- the same "ONE explicit
 /// host-side injection point" every other completion source uses
 /// (`docs/DESIGN.md` section 2).
@@ -1062,11 +1063,21 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
         DmaDirection::FromRdram
     };
 
-    // OSIoMesg layout (libultra manual, public documentation): OSMesgHdr
-    // (pri: s32, retQueue: OSMesgQueue*, retMesg: OSMesg) occupies the
-    // first 3 words (+0x0/+0x4/+0x8 on o32), followed by dramAddr (+0xC),
-    // devAddr (+0x10), size (+0x14). NOT byte-donor-verified this wave --
-    // see doc comment above.
+    // OSIoMesg layout, byte-verified against the OoT decomp header
+    // `oot-decomp/include/ultra64/pi.h`: `OSIoMesgHdr` is 0x08 bytes
+    // (`u16 type` +0x0, `u8 pri` +0x2, `u8 status` +0x3, `OSMesgQueue*
+    // retQueue` +0x4), NOT the 3-word (0xC) header a prior wave assumed.
+    // The body follows immediately: `dramAddr` +0x8, `devAddr` +0xC,
+    // `size` +0x10, `piHandle` +0x14. This exactly matches DmaMgr's own
+    // struct build in OOTU `funcs_0.c` DmaMgr_DmaRomToRam (mb = $sp+0x70):
+    // `sb $zero,0x72` (pri/status, +0x2), `sw $s6,0x74` (retQueue, +0x4),
+    // `sw $s4,0x78` (dramAddr = a1/RAM dest, +0x8, asm 0x800008FC),
+    // `sw $s2,0x7C` (devAddr = a0/romStart, +0xC, asm 0x800008F8),
+    // `sw $s0,0x80` (size = chunk, +0x10, asm 0x80000900). The prior +0x4-
+    // shifted offsets read dramAddr as retMesg, devAddr as dramAddr, size
+    // as devAddr, and size from unwritten +0x14 (=0) -- the OoT DmaMgr_Init
+    // hang: the dmadata DMA delivered len=0 and MEM_W(dest+4)!=0x1060 ->
+    // Fault_AddHungupAndCrash (assert 0x345). There is no `retMesg` field.
     //
     // Correction (this wave): a prior wave called `read_stack_word` (which
     // itself calls `RdramAddr::from_gpr`, subtracting the KSEG0 base) with
@@ -1084,7 +1095,9 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
     // just this one call site without a differently-named sibling helper
     // would leave the same trap for the next `RdramAddr`-holding caller).
     let ret_queue = read_offset_word(rdram, mb_addr.offset(), 0x4);
-    let ret_mesg = read_offset_word(rdram, mb_addr.offset(), 0x8);
+    // No `retMesg` field exists (OSIoMesgHdr ends at retQueue); DmaMgr's
+    // osRecvMesg waits on retQueue with a NULL msg-out pointer, so post a 0.
+    let ret_mesg = 0u32;
     // dramAddr is a raw vram POINTER the game computed the normal way (e.g.
     // `&someBuffer`), same as any other vram value -- it needs the SAME
     // KSEG0 translation `RdramAddr::from_gpr` performs, not
@@ -1094,9 +1107,9 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
     // address like any other, not a pre-resolved offset) -- caught by this
     // wave's own regression test after the sibling double-translation bug
     // (see the correction note above `read_offset_word`'s introduction).
-    let dram_addr = RdramAddr::from_gpr(read_offset_word(rdram, mb_addr.offset(), 0xC) as u64);
-    let dev_addr = read_offset_word(rdram, mb_addr.offset(), 0x10);
-    let len = read_offset_word(rdram, mb_addr.offset(), 0x14);
+    let dram_addr = RdramAddr::from_gpr(read_offset_word(rdram, mb_addr.offset(), 0x8) as u64);
+    let dev_addr = read_offset_word(rdram, mb_addr.offset(), 0xC);
+    let len = read_offset_word(rdram, mb_addr.offset(), 0x10);
 
     let completion = {
         let mut rt_rdram = fn64_runtime::Rdram::new(0);
@@ -4131,41 +4144,63 @@ mod tests {
     /// would hide the bug -- 0 minus 0 is still 0), and the OSIoMesg
     /// fields are placed at their real rdram offsets relative to that vram
     /// address, not relative to 0.
+    /// Builds an OSIoMesg exactly as OOTU `DmaMgr_DmaRomToRam` does
+    /// (`funcs_0.c` asm 0x800008F0-0x80000900): 0x08-byte `OSIoMesgHdr`
+    /// (retQueue at +0x4), then `dramAddr` +0x8, `devAddr` +0xC, `size`
+    /// +0x10. The prior version of this test placed fields +0x4 too high to
+    /// match the buggy 0xC-header shim, so it passed green against the bug --
+    /// the exact "weak green check" trap. A NON-UNIFORM multi-word ROM
+    /// payload and a NON-ZERO multi-word `size` make a wrong-offset read
+    /// (which would pick up size=0, or the wrong devAddr) fail loudly.
     #[test]
     fn os_epi_start_dma_reads_real_fields_at_a_nonzero_mb_address() {
         // Use a fresh ROM per test (with_pi_dma's HOST state is thread-local
         // per test since each #[test] gets its own OS thread by default).
-        // Distinguishable ROM word at 0x10 so a flat (non-swizzled) DMA fails
-        // this test -- the OoT-DmaMgr regression, not just an addressing check.
+        // Non-uniform big-endian cart words at devAddr 0x40 so a flat
+        // (non-swizzled) DMA, a wrong devAddr, or a truncated len all fail.
         let mut rom = vec![0u8; 0x1000];
-        rom[0x10..0x14].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]); // big-endian cart word
+        let dev_addr: u32 = 0x40;
+        rom[0x40..0x44].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        rom[0x44..0x48].copy_from_slice(&[0x00, 0x00, 0x10, 0x60]); // 0x1060 -- DmaMgr's sentinel
+        rom[0x48..0x4C].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
         load_rom(rom);
 
         let mut rdram = vec![0u8; 0x10000];
         let mb_vram: u64 = 0x8000_2000; // a REAL, nonzero vram address
         let mb_offset = 0x2000usize;
 
-        // OSIoMesg fields at mb_offset + {0x4 (retQueue), 0x8 (retMesg),
-        // 0xC (dramAddr), 0x10 (devAddr), 0x14 (size)} -- native byte order,
-        // per this wave's MEM_W correction.
+        // OSIoMesg fields at mb_offset + {retQueue +0x4, dramAddr +0x8,
+        // devAddr +0xC, size +0x10} -- native byte order, DmaMgr's real
+        // layout (0x08-byte OSIoMesgHdr).
         let dram_target_vram: u32 = 0x8000_5000;
+        let size: u32 = 0xC; // 3 words -- non-zero, multi-word
         rdram[mb_offset + 0x4..mb_offset + 0x8].copy_from_slice(&0u32.to_ne_bytes()); // no retQueue
-        rdram[mb_offset + 0xC..mb_offset + 0x10].copy_from_slice(&dram_target_vram.to_ne_bytes());
-        rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&0x10u32.to_ne_bytes()); // devAddr
-        rdram[mb_offset + 0x14..mb_offset + 0x18].copy_from_slice(&4u32.to_ne_bytes()); // len
+        rdram[mb_offset + 0x8..mb_offset + 0xC].copy_from_slice(&dram_target_vram.to_ne_bytes());
+        rdram[mb_offset + 0xC..mb_offset + 0x10].copy_from_slice(&dev_addr.to_ne_bytes());
+        rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&size.to_ne_bytes());
 
         let mut ctx = ctx_zeroed();
         ctx.r5 = mb_vram;
         ctx.r6 = 0; // OS_READ / ToRdram
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
-        // dramAddr (0x8000_5000) -> rdram offset 0x5000. The DMA must deliver
-        // the big-endian cart word so the guest's MEM_W reads it intact
-        // (0x12345678); rdram is native-word storage, so the physical bytes
-        // are byte-reversed (78 56 34 12). A flat copy would leave 12 34 56 78
-        // and MEM_W would read 0x78563412 -- exactly DmaMgr_Init's hang.
-        let mem_w = u32::from_ne_bytes(rdram[0x5000..0x5004].try_into().unwrap());
-        assert_eq!(mem_w, 0x1234_5678);
+        // dramAddr (0x8000_5000) -> rdram offset 0x5000. Each big-endian
+        // cart word must arrive so the guest's MEM_W reads it intact; rdram
+        // is native-word storage, so physical bytes are byte-reversed. A
+        // wrong offset would read size=0 (delivering nothing) or the wrong
+        // devAddr; a flat copy would byte-reverse the words.
+        let w0 = u32::from_ne_bytes(rdram[0x5000..0x5004].try_into().unwrap());
+        let w1 = u32::from_ne_bytes(rdram[0x5004..0x5008].try_into().unwrap());
+        let w2 = u32::from_ne_bytes(rdram[0x5008..0x500C].try_into().unwrap());
+        assert_eq!(w0, 0x1234_5678, "first ROM word must be delivered intact");
+        assert_eq!(
+            w1, 0x0000_1060,
+            "second word (DmaMgr's 0x1060 sentinel) proves the full size was read, not 0/one word"
+        );
+        assert_eq!(w2, 0xDEAD_BEEF, "third word confirms the exact len (0xC)");
+        // And nothing spilled past the declared length.
+        let after = u32::from_ne_bytes(rdram[0x500C..0x5010].try_into().unwrap());
+        assert_eq!(after, 0, "DMA must not write past size (0xC bytes)");
     }
 
     /// Regression test for the OoT-boot hang (2026-07-14): `osEPiReadIo`
@@ -4217,10 +4252,12 @@ mod tests {
 
         let mut rdram = vec![0u8; 0x10000];
         let mb_offset = 0x2000usize;
+        // DmaMgr's real OSIoMesg layout: retQueue +0x4, dramAddr +0x8,
+        // devAddr +0xC, size +0x10 (0x08-byte OSIoMesgHdr).
         rdram[mb_offset + 0x4..mb_offset + 0x8].copy_from_slice(&0u32.to_ne_bytes());
-        rdram[mb_offset + 0xC..mb_offset + 0x10].copy_from_slice(&0x8000_5000u32.to_ne_bytes());
-        rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&0u32.to_ne_bytes());
-        rdram[mb_offset + 0x14..mb_offset + 0x18].copy_from_slice(&4u32.to_ne_bytes());
+        rdram[mb_offset + 0x8..mb_offset + 0xC].copy_from_slice(&0x8000_5000u32.to_ne_bytes());
+        rdram[mb_offset + 0xC..mb_offset + 0x10].copy_from_slice(&0u32.to_ne_bytes());
+        rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&4u32.to_ne_bytes());
 
         let mut ctx = ctx_zeroed();
         ctx.r5 = 0x8000_2000;
