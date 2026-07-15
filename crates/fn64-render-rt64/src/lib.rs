@@ -169,7 +169,12 @@ impl RenderBackend for ReferenceBackend {
         Ok(())
     }
 
-    fn process_task(&mut self, rdram: &[u8], task: &OsTask) -> Result<FrameStatus, RenderError> {
+    fn process_task(
+        &mut self,
+        rdram: &mut [u8],
+        task: &OsTask,
+        output_addr: u32,
+    ) -> Result<FrameStatus, RenderError> {
         let fb = self
             .fb
             .as_mut()
@@ -212,8 +217,8 @@ impl RenderBackend for ReferenceBackend {
         }
 
         let triangles = match self.decode_mode {
-            DecodeMode::Simple => gbi::decode_display_list(rdram, task.data_ptr)?,
-            DecodeMode::F3dex2 => gbi::decode_display_list_f3dex2(rdram, task.data_ptr)?,
+            DecodeMode::Simple => gbi::decode_display_list(&*rdram, task.data_ptr)?,
+            DecodeMode::F3dex2 => gbi::decode_display_list_f3dex2(&*rdram, task.data_ptr)?,
         };
         let tri_count = triangles.len();
         match self.decode_mode {
@@ -233,6 +238,32 @@ impl RenderBackend for ReferenceBackend {
                     fb.draw_triangle_culled(tri, tri.cull);
                 }
             }
+        }
+
+        // Write the rasterized color image BACK into the game's framebuffer
+        // in rdram, matching real RDP behavior (the RDP writes its color
+        // image into DRAM, which the VI then scans out via osViSwapBuffer).
+        // The reference backend rasterizes into its own RGBA8888 surface, so
+        // here we convert to the framebuffer's native format and copy it into
+        // `rdram[output_addr..]`. WITHOUT this, the backend's pixels never
+        // reach the DRAM region the VI presents, so every VI frame is blank
+        // even though rasterization succeeded.
+        //
+        // Target address (byte-cited): NOT `task.output_buff`. On OoT the gfx
+        // task's `output_buff` is 0x80151640 (the RSP's DRAM command-FIFO
+        // output region), whereas the color framebuffer the game actually
+        // swaps/presents (`osViSwapBuffer`) is at 0x3b5000 / 0x3da800 -- a
+        // different address. So the caller passes the VI's current framebuffer
+        // offset as `output_addr`; `0` means "no known color target" (a
+        // fixture/test path) and we skip the write-back.
+        //
+        // Format (byte-cited): RGBA5551, 16-bit, big-endian halfwords, exactly
+        // matching `examples/oot-boot/src/main.rs`'s `dump_rgba5551_as_png`
+        // (`u16::from_be_bytes`, r5=px>>11, g5=px>>6, b5=px>>1, a1=px&1). The
+        // VI/harness reads the framebuffer as 2-byte big-endian RGBA5551, so
+        // we store each pixel's halfword big-endian to match.
+        if output_addr != 0 {
+            write_rgba5551_framebuffer(rdram, output_addr as usize, fb);
         }
 
         // Auto-dump the rasterized frame if configured (the harness's only
@@ -303,6 +334,46 @@ impl RenderBackend for ReferenceBackend {
     }
 }
 
+/// Convert `fb`'s RGBA8888 pixels to N64 RGBA5551 and write them into
+/// `rdram` starting at byte offset `start`, in the framebuffer's native
+/// on-DRAM layout: 2 bytes per pixel, big-endian halfword, row-major,
+/// top-left origin. This is the exact inverse of
+/// `examples/oot-boot/src/main.rs`'s `dump_rgba5551_as_png`, which reads the
+/// framebuffer back as `u16::from_be_bytes([b0, b1])` with `r5 = px >> 11`,
+/// `g5 = px >> 6`, `b5 = px >> 1`, `a1 = px & 1` -- the same layout the VI
+/// scans out. Storing the halfword big-endian (high byte at `start+2i`, low
+/// at `start+2i+1`) makes the VI-presented frame match what the backend
+/// rasterized. A pixel whose 2 bytes would run past `rdram` is skipped
+/// (bounds-safe; the caller already validated `output_addr` is a real
+/// framebuffer offset, but a wrong width/height must not panic).
+///
+/// The 8->5 bit reduction rounds like the game's inverse of the PNG dump's
+/// 5->8 expansion: `c5 = (c8 * 31 + 127) / 255`. Alpha maps any non-zero
+/// input alpha to the single RGBA5551 alpha/coverage bit.
+fn write_rgba5551_framebuffer(rdram: &mut [u8], start: usize, fb: &Framebuffer) {
+    let px_count = (fb.width * fb.height) as usize;
+    // The framebuffer format is a fixed 2 bytes/pixel; only write pixels the
+    // fb actually has AND that fit within rdram.
+    let to_5 = |c: u8| -> u16 { ((c as u16 * 31 + 127) / 255) & 0x1F };
+    for i in 0..px_count {
+        let dst = start + i * 2;
+        if dst + 2 > rdram.len() {
+            break;
+        }
+        let src = i * 4;
+        let r = fb.pixels[src];
+        let g = fb.pixels[src + 1];
+        let b = fb.pixels[src + 2];
+        let a = fb.pixels[src + 3];
+        let px: u16 =
+            (to_5(r) << 11) | (to_5(g) << 6) | (to_5(b) << 1) | (if a != 0 { 1 } else { 0 });
+        // Big-endian halfword, matching capture_framebuffer's from_be_bytes.
+        let [hi, lo] = px.to_be_bytes();
+        rdram[dst] = hi;
+        rdram[dst + 1] = lo;
+    }
+}
+
 /// The RT64 adapter -- see module doc's "Honest status" section. Every
 /// method is a named, loud stub: no C++ is linked, no window is opened, no
 /// frame is ever produced. This is intentionally NOT a silent no-op that
@@ -348,7 +419,12 @@ impl RenderBackend for Rt64Backend {
         })
     }
 
-    fn process_task(&mut self, _rdram: &[u8], _task: &OsTask) -> Result<FrameStatus, RenderError> {
+    fn process_task(
+        &mut self,
+        _rdram: &mut [u8],
+        _task: &OsTask,
+        _output_addr: u32,
+    ) -> Result<FrameStatus, RenderError> {
         Err(RenderError::NotReady(
             "Rt64Backend::create was never able to succeed (RT64 FFI not wired up)",
         ))
@@ -397,9 +473,9 @@ mod tests {
     #[test]
     fn reference_backend_rejects_process_task_before_create() {
         let mut backend = ReferenceBackend::new();
-        let rdram = vec![0u8; 64];
+        let mut rdram = vec![0u8; 64];
         let err = backend
-            .process_task(&rdram, &OsTask::default())
+            .process_task(&mut rdram, &OsTask::default(), 0)
             .unwrap_err();
         assert!(matches!(err, RenderError::NotReady(_)));
     }

@@ -155,7 +155,7 @@ fn build_f3dex2_rdram() -> (Vec<u8>, u32) {
 
 #[test]
 fn f3dex2_display_list_renders_transformed_triangle_at_expected_pixel() {
-    let (rdram, dl_addr) = build_f3dex2_rdram();
+    let (mut rdram, dl_addr) = build_f3dex2_rdram();
 
     let clear = [7, 7, 7, 255]; // distinct from every vertex color
     let mut backend = ReferenceBackend::new().with_f3dex2().with_clear_color(clear);
@@ -166,7 +166,9 @@ fn f3dex2_display_list_renders_transformed_triangle_at_expected_pixel() {
         data_ptr: dl_addr,
         ..Default::default()
     };
-    let status = backend.process_task(&rdram, &task).expect("process_task ok");
+    let status = backend
+        .process_task(&mut rdram, &task, 0)
+        .expect("process_task ok");
     assert_eq!(status, fn64_render::FrameStatus::Complete);
 
     let fb = backend.framebuffer().expect("fb after create");
@@ -212,7 +214,7 @@ fn f3dex2_display_list_renders_transformed_triangle_at_expected_pixel() {
 fn f3dex2_without_fill_leaves_centroid_clear_proving_fill_is_load_bearing() {
     let (rdram, dl_addr) = build_f3dex2_rdram();
 
-    // Decode to triangles directly (the same call process_task makes) --
+    // Decode to triangles directly (the same call process_task makes, immutable) --
     // there MUST be exactly one triangle from this DL.
     let tris = gbi::decode_display_list_f3dex2(&rdram, dl_addr).unwrap();
     assert_eq!(
