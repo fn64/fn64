@@ -289,6 +289,66 @@ pub fn dispatch(state: &mut VuState, op: VuOp, inv: OpInvocation) -> OpStatus {
             logic::exec_vnop(state);
             OpStatus::Executed
         }
+        // --- Multiply-accumulate family (§6.2) + VSAR (§6.9) ---
+        VuOp::Vmacf
+        | VuOp::Vmacq
+        | VuOp::Vmadh
+        | VuOp::Vmadm
+        | VuOp::Vmadn
+        | VuOp::Vmadl
+        | VuOp::Vsar => super::vu_ops::mac::dispatch_mac(state, op, &inv)
+            .expect("mac family op routed to dispatch_mac"),
+        // --- Select family (§6.6–§6.7): compares/merge/clip ---
+        VuOp::Vlt
+        | VuOp::Veq
+        | VuOp::Vne
+        | VuOp::Vge
+        | VuOp::Vmrg
+        | VuOp::Vch
+        | VuOp::Vcl
+        | VuOp::Vcr => super::vu_ops::select::try_dispatch(state, op, &inv)
+            .expect("select family op routed to select::try_dispatch"),
+        // --- "mul-hi" multiply family (set accumulator, §6.1) ---
+        VuOp::Vmulf => {
+            super::vu_ops::mul_hi::vmulf(state, &inv);
+            OpStatus::Executed
+        }
+        VuOp::Vmulq => {
+            super::vu_ops::mul_hi::vmulq(state, &inv);
+            OpStatus::Executed
+        }
+        VuOp::Vmudh => {
+            super::vu_ops::mul_hi::vmudh(state, &inv);
+            OpStatus::Executed
+        }
+        VuOp::Vmudm => {
+            super::vu_ops::mul_hi::vmudm(state, &inv);
+            OpStatus::Executed
+        }
+        VuOp::Vmudn => {
+            super::vu_ops::mul_hi::vmudn(state, &inv);
+            OpStatus::Executed
+        }
+        VuOp::Vmudl => {
+            super::vu_ops::mul_hi::vmudl(state, &inv);
+            OpStatus::Executed
+        }
+        // --- Add/subtract family (§6.3) + VABS (§6.4) ---
+        VuOp::Vadd | VuOp::Vaddc | VuOp::Vsub | VuOp::Vsubc | VuOp::Vabs => {
+            super::vu_ops::addsub::dispatch_addsub(state, op, &inv)
+                .expect("addsub family op routed to dispatch_addsub")
+        }
+        // --- "recip" family: VMOV (§6.10), VRNDN/VRNDP (§6.11), and the
+        //     reciprocal / inverse-sqrt scalar table ops VRCP/VRCPH/VRSQ/VRSQH
+        //     (§6.12). (VMACQ/VMULQ/VRCPL/VRSQL belong to other groups.) ---
+        VuOp::Vmov
+        | VuOp::Vrndn
+        | VuOp::Vrndp
+        | VuOp::Vrcp
+        | VuOp::Vrcph
+        | VuOp::Vrsq
+        | VuOp::Vrsqh => super::vu_ops::recip::try_dispatch(state, op, &inv)
+            .expect("recip family op routed to recip::try_dispatch"),
         // Other families are implemented by their own op-group modules; until
         // wired here they trap loudly rather than silently miscomputing. The
         // `_ = &inv` keeps the operand fields live for the not-yet-wired arms.
@@ -345,14 +405,17 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_routes_implemented_ops_to_executed() {
-        // Foundation phase this asserted every op was an `Unimplemented` stub;
-        // now the ops phase has filled bodies in, so dispatch must report
-        // `Executed` for a wired op. Use a select-family op (VMRG) which is a
-        // pure register move — safe to run with default (zeroed) state.
+    fn dispatch_stub_reports_unimplemented_by_op() {
         let mut state = VuState::new();
         let inv = OpInvocation::default();
-        assert_eq!(dispatch(&mut state, VuOp::Vmrg, inv), OpStatus::Executed);
+        // Use an op no family module has wired yet, so this still exercises
+        // the loud "unimplemented" trap. (Vmulf/Vrndp are now implemented by
+        // the mul-hi/recip families; the paired low ops Vrcpl/Vrsql remain
+        // unrouted stubs — no group wires them.)
+        assert_eq!(
+            dispatch(&mut state, VuOp::Vrcpl, inv),
+            OpStatus::Unimplemented(VuOp::Vrcpl)
+        );
     }
 
     #[test]
