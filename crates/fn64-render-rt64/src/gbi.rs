@@ -62,15 +62,12 @@ const G_MW_SEGMENT: u16 = 0x06;
 /// `G_MV_VIEWPORT` (gbi.h) -- the `G_MOVEMEM` index that DMAs a `Vp`
 /// (viewport scale/translate) struct into RSP state (F3DEX2-CONCEPTS.md
 /// §1.4/§3.5).
-#[allow(dead_code)] // wired up in the viewport-parse fidelity step
 const G_MV_VIEWPORT: u8 = 8;
 
 // --- F3DEX2 geometry-mode bits (F3DEX2-CONCEPTS.md §2.4) -----------------
 /// Cull front-facing triangles.
-#[allow(dead_code)] // wired up when G_GEOMETRYMODE drives culling
 const G_CULL_FRONT: u32 = 0x0000_0200;
 /// Cull back-facing triangles (the common case).
-#[allow(dead_code)] // wired up when G_GEOMETRYMODE drives culling
 const G_CULL_BACK: u32 = 0x0000_0400;
 
 // --- Additional F3DEX2 opcode bytes, named for the loud-skip log so the
@@ -84,10 +81,15 @@ const G_SPECIAL_1: u8 = 0xD5;
 const G_DMA_IO: u8 = 0xD6;
 const G_LOAD_UCODE: u8 = 0xDD;
 const G_SETSCISSOR: u8 = 0xED;
+const G_LOADTLUT: u8 = 0xF0;
 const G_SETTILESIZE: u8 = 0xF2;
+const G_LOADBLOCK: u8 = 0xF3;
 const G_LOADTILE: u8 = 0xF4;
+const G_SETTILE: u8 = 0xF5;
 const G_SETPRIMCOLOR: u8 = 0xFA;
 const G_SETENVCOLOR: u8 = 0xFB;
+const G_SETCOMBINE: u8 = 0xFC;
+const G_SETTIMG: u8 = 0xFD;
 const G_SETZIMG: u8 = 0xFE;
 const G_SETCIMG: u8 = 0xFF;
 
@@ -107,6 +109,14 @@ pub struct Vertex {
     pub g: u8,
     pub b: u8,
     pub a: u8,
+    /// Texture S/T coordinates in texels: the raw `Vtx` `tc[2]` S10.5
+    /// fixed-point value multiplied by the `G_TEXTURE` S/T scale, then
+    /// converted from the S10.5 encoding to texels (÷32). Only meaningful
+    /// when the emitting triangle carries a `texture`; the rasterizer
+    /// interpolates these per-pixel to address the decoded texel buffer
+    /// (`F3DEX2-CONCEPTS.md` §5). 0.0 on the untextured/reference path.
+    pub s: f32,
+    pub t: f32,
 }
 
 /// Screen-space back/front-face culling selector, derived from the F3DEX2
@@ -126,10 +136,63 @@ pub enum CullMode {
     Both,
 }
 
+/// A decoded texture: RGBA8888 texels (row-major, top-left origin) plus its
+/// dimensions and per-axis wrap mode, ready for the rasterizer to sample.
+/// Reference-counted so many triangles sharing one bound tile don't each
+/// clone the texel buffer. Built at `G_LOADBLOCK`/`G_LOADTILE` time by
+/// decoding the `G_SETTIMG` image through the active tile descriptor
+/// (`F3DEX2-CONCEPTS.md` §5.1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Texture {
+    pub width: u32,
+    pub height: u32,
+    /// RGBA8888, `width * height * 4` bytes, row-major top-left origin.
+    pub texels: std::rc::Rc<Vec<u8>>,
+    /// S-axis wrap: `true` = clamp to edge, `false` = wrap (repeat). Mirror
+    /// is approximated as wrap for a first textured frame.
+    pub clamp_s: bool,
+    /// T-axis wrap (see `clamp_s`).
+    pub clamp_t: bool,
+}
+
+impl Texture {
+    /// Nearest-neighbor sample at texel coords `(s, t)`, applying the tile's
+    /// clamp/wrap mode per axis. Returns RGBA8888. (Point sampling, not
+    /// bilinear -- adequate for a first recognizable textured frame; the RDP
+    /// itself uses point sampling in copy/1-cycle-nofilter modes anyway.)
+    pub fn sample(&self, s: f32, t: f32) -> [u8; 4] {
+        let wrap = |coord: f32, dim: u32, clamp: bool| -> u32 {
+            if dim == 0 {
+                return 0;
+            }
+            let i = coord.floor() as i64;
+            if clamp {
+                i.clamp(0, dim as i64 - 1) as u32
+            } else {
+                // Positive modulo (wrap/repeat).
+                (i.rem_euclid(dim as i64)) as u32
+            }
+        };
+        let x = wrap(s, self.width, self.clamp_s);
+        let y = wrap(t, self.height, self.clamp_t);
+        let o = ((y * self.width + x) * 4) as usize;
+        if o + 4 <= self.texels.len() {
+            [
+                self.texels[o],
+                self.texels[o + 1],
+                self.texels[o + 2],
+                self.texels[o + 3],
+            ]
+        } else {
+            [255, 0, 255, 255] // out-of-range guard: magenta (never expected).
+        }
+    }
+}
+
 /// A decoded, screen-space-ready triangle (three already-resolved
 /// vertices) -- the display-list decoder's actual output, consumed by the
 /// rasterizer in `raster.rs`.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Triangle {
     pub v: [Vertex; 3],
     /// The culling mode in effect (from `G_GEOMETRYMODE`) when this triangle
@@ -137,6 +200,12 @@ pub struct Triangle {
     /// RSP state that can change between `G_TRI*` commands; the rasterizer
     /// reads it to cull by winding. `None` for the simple reference path.
     pub cull: CullMode,
+    /// The texture bound (via `G_TEXTURE` enable + a loaded tile) when this
+    /// triangle was emitted, if any. `None` -> flat-shaded from vertex color
+    /// only (untextured surface, or texturing disabled). The rasterizer
+    /// modulates the sampled texel by the interpolated shade color
+    /// (`F3DEX2-CONCEPTS.md` §5.2, the MODULATE combiner).
+    pub texture: Option<Texture>,
 }
 
 /// The N64 SDK's public per-vertex wire format (`Vtx_t`): 16 bytes --
@@ -224,6 +293,184 @@ fn read_mtx(rdram: &[u8], addr: usize) -> Option<Mat4> {
     Some(m)
 }
 
+/// Read an N64 `Vp` (viewport) struct (16 bytes) at `addr` out of `rdram`
+/// and convert to a pixel-space [`Viewport`]. Layout (F3DEX2-CONCEPTS.md
+/// §1.4/§3.5): 8 big-endian s16 -- `vscale[4]` (x, y, z, w) then
+/// `vtrans[4]` (x, y, z, w), each in the N64 "quarter-pixel" encoding
+/// (÷4 for pixel units). Reads through the recomp `^3`/`MEM_H` swizzle
+/// like every other DMA'd struct. Returns `None` if the 16-byte read runs
+/// off `rdram`.
+fn read_viewport(rdram: &[u8], addr: usize) -> Option<Viewport> {
+    if addr + 16 > rdram.len() {
+        return None;
+    }
+    let vscale_x = read_i16(rdram, addr) as f32;
+    let vscale_y = read_i16(rdram, addr + 2) as f32;
+    let vscale_z = read_i16(rdram, addr + 4) as f32;
+    // addr+6 = vscale.w (unused for screen mapping)
+    let vtrans_x = read_i16(rdram, addr + 8) as f32;
+    let vtrans_y = read_i16(rdram, addr + 10) as f32;
+    let vtrans_z = read_i16(rdram, addr + 12) as f32;
+    // addr+14 = vtrans.w (unused)
+    Some(Viewport {
+        sx: vscale_x / 4.0,
+        sy: vscale_y / 4.0,
+        sz: vscale_z / 4.0,
+        tx: vtrans_x / 4.0,
+        ty: vtrans_y / 4.0,
+        tz: vtrans_z / 4.0,
+    })
+}
+
+// --- Texture format decode (F3DEX2-CONCEPTS.md §5.1) --------------------
+
+/// RDP image formats (`G_IM_FMT_*`) as encoded in the SETTIMG/SETTILE
+/// format field.
+const G_IM_FMT_RGBA: u8 = 0;
+const G_IM_FMT_CI: u8 = 2;
+const G_IM_FMT_IA: u8 = 3;
+const G_IM_FMT_I: u8 = 4;
+
+/// Pixel sizes (`G_IM_SIZ_*`): 4/8/16/32 bits-per-texel selectors.
+const G_IM_SIZ_4B: u8 = 0;
+const G_IM_SIZ_8B: u8 = 1;
+const G_IM_SIZ_16B: u8 = 2;
+const G_IM_SIZ_32B: u8 = 3;
+
+/// Expand a 16-bit RGBA5551 texel to RGBA8888 (5/5/5/1, big-endian --
+/// `pixel16 = R5<<11 | G5<<6 | B5<<1 | A1`, `F3DEX2-CONCEPTS.md` §4.4).
+#[inline]
+fn rgba5551_to_rgba8888(px: u16) -> [u8; 4] {
+    let r5 = ((px >> 11) & 0x1F) as u8;
+    let g5 = ((px >> 6) & 0x1F) as u8;
+    let b5 = ((px >> 1) & 0x1F) as u8;
+    let a1 = (px & 0x01) as u8;
+    // 5-bit -> 8-bit: replicate high bits into the low bits (v<<3 | v>>2).
+    let expand5 = |v: u8| (v << 3) | (v >> 2);
+    [
+        expand5(r5),
+        expand5(g5),
+        expand5(b5),
+        if a1 != 0 { 255 } else { 0 },
+    ]
+}
+
+/// Expand an IA16 texel (8-bit intensity, 8-bit alpha) to RGBA8888.
+#[inline]
+fn ia16_to_rgba8888(hi: u8, lo: u8) -> [u8; 4] {
+    [hi, hi, hi, lo]
+}
+
+/// Expand an IA8 texel (4-bit intensity, 4-bit alpha) to RGBA8888.
+#[inline]
+fn ia8_to_rgba8888(byte: u8) -> [u8; 4] {
+    let i4 = byte >> 4;
+    let a4 = byte & 0x0F;
+    let i = (i4 << 4) | i4;
+    let a = (a4 << 4) | a4;
+    [i, i, i, a]
+}
+
+/// Expand an I8 texel (8-bit intensity; alpha = intensity) to RGBA8888.
+#[inline]
+fn i8_to_rgba8888(byte: u8) -> [u8; 4] {
+    [byte, byte, byte, byte]
+}
+
+/// Decode the texture bound to `tile` from the latched `G_SETTIMG` image out
+/// of RDRAM into an RGBA8888 [`Texture`], sized by the tile's
+/// `G_SETTILESIZE` extent. Returns `None` for an unsupported/zero-size
+/// format so the caller leaves the triangle flat-shaded rather than binding
+/// garbage. Covers the common OoT formats: RGBA16/32, IA16/IA8, I8/I4,
+/// CI8/CI4 (via the loaded TLUT).
+///
+/// This is deliberately NOT a byte-exact 4 KiB TMEM model. A first
+/// recognizable textured frame needs the right texels addressed by the right
+/// texcoords, not cycle-accurate TMEM tiling -- so we read the source image
+/// linearly at `line`-implied width and let the sampler address it by the
+/// interpolated S/T (`F3DEX2-CONCEPTS.md` §5.1, "to sample" bullet).
+fn decode_current_texture(
+    rdram: &[u8],
+    tex: &TexState,
+    segments: &[u32; 16],
+    tile: usize,
+) -> Option<Texture> {
+    let t = &tex.tiles[tile];
+    // Tile extent from SETTILESIZE (S10.5 -> ÷4 texels), inclusive bounds.
+    let w = ((t.lrs / 4).saturating_sub(t.uls / 4) + 1) as u32;
+    let h = ((t.lrt / 4).saturating_sub(t.ult / 4) + 1) as u32;
+    if w == 0 || h == 0 || w > 1024 || h > 1024 {
+        return None;
+    }
+    let base = resolve_addr(segments, tex.timg_addr);
+    let fmt = t.fmt;
+    let siz = t.siz;
+    let mut texels = vec![0u8; (w * h * 4) as usize];
+
+    for ty in 0..h {
+        for tx in 0..w {
+            let texel_index = (ty * w + tx) as usize;
+            let rgba = match (fmt, siz) {
+                (G_IM_FMT_RGBA, G_IM_SIZ_16B) => {
+                    let px = read_u16(rdram, base + texel_index * 2);
+                    rgba5551_to_rgba8888(px)
+                }
+                (G_IM_FMT_RGBA, G_IM_SIZ_32B) => {
+                    let o = base + texel_index * 4;
+                    [
+                        read_u8(rdram, o),
+                        read_u8(rdram, o + 1),
+                        read_u8(rdram, o + 2),
+                        read_u8(rdram, o + 3),
+                    ]
+                }
+                (G_IM_FMT_IA, G_IM_SIZ_16B) => {
+                    let o = base + texel_index * 2;
+                    ia16_to_rgba8888(read_u8(rdram, o), read_u8(rdram, o + 1))
+                }
+                (G_IM_FMT_IA, G_IM_SIZ_8B) => ia8_to_rgba8888(read_u8(rdram, base + texel_index)),
+                (G_IM_FMT_I, G_IM_SIZ_8B) => i8_to_rgba8888(read_u8(rdram, base + texel_index)),
+                (G_IM_FMT_I, G_IM_SIZ_4B) | (G_IM_FMT_IA, G_IM_SIZ_4B) => {
+                    // 4-bit intensity: two texels per byte, high nibble first.
+                    let byte = read_u8(rdram, base + texel_index / 2);
+                    let nib = if texel_index & 1 == 0 {
+                        byte >> 4
+                    } else {
+                        byte & 0x0F
+                    };
+                    let v = (nib << 4) | nib;
+                    [v, v, v, v]
+                }
+                (G_IM_FMT_CI, G_IM_SIZ_8B) => {
+                    let idx = read_u8(rdram, base + texel_index) as usize;
+                    tex.tlut.get(idx).copied().unwrap_or([255, 0, 255, 255])
+                }
+                (G_IM_FMT_CI, G_IM_SIZ_4B) => {
+                    let byte = read_u8(rdram, base + texel_index / 2);
+                    let nib = if texel_index & 1 == 0 {
+                        byte >> 4
+                    } else {
+                        byte & 0x0F
+                    } as usize;
+                    let idx = ((t.palette as usize) << 4) | nib;
+                    tex.tlut.get(idx).copied().unwrap_or([255, 0, 255, 255])
+                }
+                _ => return None, // unsupported format: leave flat-shaded.
+            };
+            let o = texel_index * 4;
+            texels[o..o + 4].copy_from_slice(&rgba);
+        }
+    }
+
+    Some(Texture {
+        width: w,
+        height: h,
+        texels: std::rc::Rc::new(texels),
+        clamp_s: t.clamp_s,
+        clamp_t: t.clamp_t,
+    })
+}
+
 thread_local! {
     /// Per-opcode "already warned once" set, so a real display list with
     /// thousands of identical skipped state ops emits ONE loud line per
@@ -270,14 +517,14 @@ fn opcode_name(opcode: u8) -> &'static str {
         0xE7 => "G_RDPPIPESYNC",
         0xE8 => "G_RDPTILESYNC",
         0xE9 => "G_RDPFULLSYNC",
-        0xF0 => "G_LOADTLUT",
+        G_LOADTLUT => "G_LOADTLUT",
         0xF1 => "G_RDPHALF_2",
-        0xF3 => "G_LOADBLOCK",
+        G_LOADBLOCK => "G_LOADBLOCK",
         G_LOADTILE => "G_LOADTILE",
         G_SETTILESIZE => "G_SETTILESIZE",
-        0xF5 => "G_SETTILE",
-        0xFC => "G_SETCOMBINE",
-        0xFD => "G_SETTIMG",
+        G_SETTILE => "G_SETTILE",
+        G_SETCOMBINE => "G_SETCOMBINE",
+        G_SETTIMG => "G_SETTIMG",
         G_SETPRIMCOLOR => "G_SETPRIMCOLOR",
         G_SETENVCOLOR => "G_SETENVCOLOR",
         G_SETSCISSOR => "G_SETSCISSOR",
@@ -402,9 +649,58 @@ struct DecodeState {
     viewport: Option<Viewport>,
     /// Current F3DEX2 geometry mode (the `G_GEOMETRYMODE` accumulator). Its
     /// `G_CULL_FRONT`/`G_CULL_BACK` bits decide per-triangle culling.
-    #[allow(dead_code)] // read once G_GEOMETRYMODE culling lands
     geometry_mode: u32,
     dl_depth: u32,
+    /// Texture-mapping decode state (SETTIMG image latch, tile descriptors,
+    /// TLUT palette, G_TEXTURE enable/scale, and the currently-decoded
+    /// texture bound to emitted triangles). See [`TexState`].
+    tex: TexState,
+}
+
+/// Texture-pipeline decode state (`F3DEX2-CONCEPTS.md` §5). Kept as a
+/// sub-struct so the transform/geometry state above stays readable.
+#[derive(Clone, Debug, Default)]
+struct TexState {
+    /// `G_SETTIMG`: the source texture image -- segmented addr + format +
+    /// size-code. Latched; no data moves until a `G_LOAD*`.
+    timg_addr: u32,
+    timg_fmt: u8,
+    timg_siz: u8,
+    /// The 8 RDP tile descriptors (`G_SETTILE`/`G_SETTILESIZE`).
+    tiles: [Tile; 8],
+    /// `G_LOADTLUT` palette: up to 256 RGBA8888 entries decoded from the
+    /// TLUT image (CI textures index into this).
+    tlut: Vec<[u8; 4]>,
+    /// `G_TEXTURE`: texturing enabled?
+    tex_enabled: bool,
+    /// `G_TEXTURE`: which tile descriptor is active (0-7).
+    tex_tile: u8,
+    /// `G_TEXTURE` S/T scale (U0.16 -> f32), applied to the raw vertex S/T
+    /// before texel addressing.
+    tex_scale_s: f32,
+    tex_scale_t: f32,
+    /// The most-recently-decoded texture for the active tile, bound to
+    /// emitted triangles while texturing is on. Rebuilt on each `G_LOAD*`.
+    current: Option<Texture>,
+}
+
+/// One RDP tile descriptor (`G_SETTILE` + `G_SETTILESIZE`,
+/// `F3DEX2-CONCEPTS.md` §5.1) -- only the fields the reference sampler needs.
+#[derive(Copy, Clone, Debug, Default)]
+struct Tile {
+    fmt: u8,
+    siz: u8,
+    /// Line stride in 64-bit words (`G_SETTILE` `line`).
+    line: u16,
+    /// TLUT palette bank (CI4 uses this as the high nibble of the index).
+    palette: u8,
+    clamp_s: bool,
+    clamp_t: bool,
+    /// Tile active extent from `G_SETTILESIZE` (S10.5 -> ÷4 texels).
+    uls: u16,
+    ult: u16,
+    lrs: u16,
+    lrt: u16,
 }
 
 /// Parsed viewport: screen scale/translate in pixels (x, y) plus a depth
@@ -472,22 +768,24 @@ pub fn decode_display_list(rdram: &[u8], dl_addr: u32) -> Result<Vec<Triangle>, 
                         g: cn[1],
                         b: cn[2],
                         a: cn[3],
+                        s: 0.0, // simple reference path: untextured
+                        t: 0.0,
                     };
                 }
             }
             G_TRI1 => {
                 let idx = [(w1 >> 16) & 0xFF, (w1 >> 8) & 0xFF, w1 & 0xFF];
-                if let Some(t) = resolve_tri(&vtx_cache, idx) {
+                if let Some(t) = resolve_tri(&vtx_cache, idx, CullMode::None, None) {
                     tris.push(t);
                 }
             }
             G_TRI2 => {
                 let idx_a = [(w0 >> 16) & 0xFF, (w0 >> 8) & 0xFF, w0 & 0xFF];
                 let idx_b = [(w1 >> 16) & 0xFF, (w1 >> 8) & 0xFF, w1 & 0xFF];
-                if let Some(t) = resolve_tri(&vtx_cache, idx_a) {
+                if let Some(t) = resolve_tri(&vtx_cache, idx_a, CullMode::None, None) {
                     tris.push(t);
                 }
-                if let Some(t) = resolve_tri(&vtx_cache, idx_b) {
+                if let Some(t) = resolve_tri(&vtx_cache, idx_b, CullMode::None, None) {
                     tris.push(t);
                 }
             }
@@ -521,6 +819,7 @@ pub fn decode_display_list_f3dex2(
         viewport: None,
         geometry_mode: 0,
         dl_depth: 0,
+        tex: TexState::default(),
     };
     decode_stream(rdram, dl_addr, &mut state);
     Ok(state.tris)
@@ -557,8 +856,10 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 // F3DEX2 G_TRI1 (F3DEX2-CONCEPTS.md §2.2): three 7-bit
                 // vertex-cache-slot fields in w0 at bits 17/9/1 -- each is
                 // already the slot (0-31), no /2 needed.
+                let cull = cull_mode_from(state.geometry_mode);
+                let texture = active_texture(&state.tex);
                 let idx = tri_indices(w0);
-                if let Some(t) = resolve_tri(&state.vtx_cache, idx) {
+                if let Some(t) = resolve_tri(&state.vtx_cache, idx, cull, texture) {
                     state.tris.push(t);
                 }
             }
@@ -566,12 +867,14 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 // F3DEX2 G_TRI2 / G_QUAD (§2.3): triangle A's three 7-bit
                 // slot fields in w0 (bits 17/9/1), triangle B's in w1 at the
                 // SAME bit positions. G_QUAD decodes identically to G_TRI2.
+                let cull = cull_mode_from(state.geometry_mode);
+                let texture = active_texture(&state.tex);
                 let idx_a = tri_indices(w0);
                 let idx_b = tri_indices(w1);
-                if let Some(t) = resolve_tri(&state.vtx_cache, idx_a) {
+                if let Some(t) = resolve_tri(&state.vtx_cache, idx_a, cull, texture.clone()) {
                     state.tris.push(t);
                 }
-                if let Some(t) = resolve_tri(&state.vtx_cache, idx_b) {
+                if let Some(t) = resolve_tri(&state.vtx_cache, idx_b, cull, texture) {
                     state.tris.push(t);
                 }
             }
@@ -679,9 +982,145 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                     );
                 }
             }
+            G_TEXTURE => {
+                // F3DEX2 gsSPTexture (§5.2): on-bit field(w0,1,7), tile
+                // field(w0,8,3), S scale field(w1,16,16), T scale
+                // field(w1,0,16) (both U0.16). Latch enable + tile + scale so
+                // the next G_LOAD*/G_TRI can bind + address a texture.
+                let on = ((w0 >> 1) & 0x7F) != 0;
+                let tile = ((w0 >> 8) & 0x07) as u8;
+                let scale_s = ((w1 >> 16) & 0xFFFF) as f32 / 65536.0;
+                let scale_t = (w1 & 0xFFFF) as f32 / 65536.0;
+                state.tex.tex_enabled = on;
+                state.tex.tex_tile = tile;
+                state.tex.tex_scale_s = scale_s;
+                state.tex.tex_scale_t = scale_t;
+            }
+            G_SETTIMG => {
+                // G_SETTIMG (§5.1): format field(w0,21,3), size field(w0,19,2),
+                // width-1 field(w0,0,12), image addr w1 (segmented). Pointer +
+                // format latch only; no texel data moves until a G_LOAD*.
+                state.tex.timg_fmt = ((w0 >> 21) & 0x07) as u8;
+                state.tex.timg_siz = ((w0 >> 19) & 0x03) as u8;
+                state.tex.timg_addr = w1;
+            }
+            G_SETTILE => {
+                // G_SETTILE (§5.1): w0 = fmt field(w0,21,3), siz field(w0,19,2),
+                // line field(w0,9,9), tmem field(w0,0,9); w1 = tile
+                // field(w1,24,3), palette field(w1,20,4), cmT field(w1,18,2),
+                // cmS field(w1,8,2). The clamp/mirror/wrap mode's bit1
+                // (G_TX_CLAMP=0x2) selects clamp-to-edge.
+                let fmt = ((w0 >> 21) & 0x07) as u8;
+                let siz = ((w0 >> 19) & 0x03) as u8;
+                let line = ((w0 >> 9) & 0x1FF) as u16;
+                let tile = ((w1 >> 24) & 0x07) as usize;
+                let palette = ((w1 >> 20) & 0x0F) as u8;
+                let cm_t = ((w1 >> 18) & 0x03) as u8;
+                let cm_s = ((w1 >> 8) & 0x03) as u8;
+                let t = &mut state.tex.tiles[tile];
+                t.fmt = fmt;
+                t.siz = siz;
+                t.line = line;
+                t.palette = palette;
+                t.clamp_s = cm_s & 0x02 != 0;
+                t.clamp_t = cm_t & 0x02 != 0;
+            }
+            G_SETTILESIZE => {
+                // G_SETTILESIZE (§5.1): w0 = uls field(w0,12,12), ult
+                // field(w0,0,12); w1 = tile field(w1,24,3), lrs field(w1,12,12),
+                // lrt field(w1,0,12). Coords are S10.5 (÷4 for texel extent).
+                let uls = ((w0 >> 12) & 0xFFF) as u16;
+                let ult = (w0 & 0xFFF) as u16;
+                let tile = ((w1 >> 24) & 0x07) as usize;
+                let lrs = ((w1 >> 12) & 0xFFF) as u16;
+                let lrt = (w1 & 0xFFF) as u16;
+                let t = &mut state.tex.tiles[tile];
+                t.uls = uls;
+                t.ult = ult;
+                t.lrs = lrs;
+                t.lrt = lrt;
+            }
+            G_LOADTLUT => {
+                // G_LOADTLUT (§5.1): load a CI palette from the latched TIMG
+                // image. w1 count field(w1,14,10) = (num-1)<<2 in the SDK
+                // macro. TLUT entries are 16-bit RGBA5551 in RDRAM.
+                let count = (((w1 >> 14) & 0x3FF) >> 2) as usize + 1;
+                let n = count.min(256);
+                let base = resolve_addr(&state.segments, state.tex.timg_addr);
+                let mut tlut = Vec::with_capacity(n);
+                for i in 0..n {
+                    let px = read_u16(rdram, base + i * 2);
+                    tlut.push(rgba5551_to_rgba8888(px));
+                }
+                state.tex.tlut = tlut;
+            }
+            G_LOADBLOCK | G_LOADTILE => {
+                // G_LOADBLOCK / G_LOADTILE (§5.1): DMA texels into TMEM. We
+                // instead decode the source TIMG image directly into an
+                // RGBA8888 buffer sized by the active tile's SETTILESIZE
+                // extent, and bind it as `current` so the next G_TRI* samples
+                // it. (A first textured frame needs the right texels at the
+                // right texcoords, not a byte-exact 4KiB TMEM model.)
+                let tile = state.tex.tex_tile as usize;
+                if let Some(tex) =
+                    decode_current_texture(rdram, &state.tex, &state.segments, tile)
+                {
+                    state.tex.current = Some(tex);
+                }
+            }
+            G_MOVEMEM => {
+                // F3DEX2 gsMoveMem (§1.4): w0 low byte = index (which RSP
+                // block), w1 = segmented source address. G_MV_VIEWPORT
+                // (index 8) points at a 16-byte `Vp` we parse into the screen
+                // mapping; other indices (lights, absolute matrices) are
+                // phase-2 and acknowledged-and-skipped.
+                let index = (w0 & 0xFF) as u8;
+                if index == G_MV_VIEWPORT {
+                    let addr = resolve_addr(&state.segments, w1);
+                    if let Some(vp) = read_viewport(rdram, addr) {
+                        state.viewport = Some(vp);
+                    }
+                } else {
+                    skip_opcode(G_MOVEMEM);
+                }
+            }
+            G_GEOMETRYMODE => {
+                // F3DEX2 gsSPGeometryMode (§2.4): one atomic clear+set --
+                // `mode = (mode & field(w0,0,24)) | w1`, where the w0 low 24
+                // bits are the (already-inverted) AND mask. We honor the
+                // CULL_FRONT/CULL_BACK bits per-triangle (see cull_mode_from);
+                // the other bits (shade/lighting/fog) are decode-time state a
+                // flat/modulated frame doesn't act on yet.
+                let and_mask = w0 & 0x00FF_FFFF;
+                state.geometry_mode = (state.geometry_mode & and_mask) | w1;
+            }
             G_ENDDL => break,
             _ => skip_opcode(opcode),
         }
+    }
+}
+
+/// Derive the per-triangle [`CullMode`] from the current F3DEX2 geometry
+/// mode's `G_CULL_FRONT`/`G_CULL_BACK` bits (`F3DEX2-CONCEPTS.md` §2.4).
+fn cull_mode_from(geometry_mode: u32) -> CullMode {
+    let front = geometry_mode & G_CULL_FRONT != 0;
+    let back = geometry_mode & G_CULL_BACK != 0;
+    match (front, back) {
+        (true, true) => CullMode::Both,
+        (true, false) => CullMode::Front,
+        (false, true) => CullMode::Back,
+        (false, false) => CullMode::None,
+    }
+}
+
+/// The texture to bind to triangles emitted right now: the most-recently
+/// decoded tile texture, but only while `G_TEXTURE` has enabled texturing.
+/// `None` -> the triangle stays flat-shaded from vertex color.
+fn active_texture(tex: &TexState) -> Option<Texture> {
+    if tex.tex_enabled {
+        tex.current.clone()
+    } else {
+        None
     }
 }
 
@@ -715,6 +1154,13 @@ fn load_vertices(
         let x = read_i16(rdram, off) as f32;
         let y = read_i16(rdram, off + 2) as f32;
         let z = read_i16(rdram, off + 4) as f32;
+        // tc[2] (offsets 8, 10): raw S/T in S10.5 fixed-point (§2.1). Scale
+        // by the active G_TEXTURE S/T scale, then convert S10.5 -> texels
+        // (÷32). The result is texels the rasterizer addresses directly.
+        let raw_s = read_i16(rdram, off + 8) as f32;
+        let raw_t = read_i16(rdram, off + 10) as f32;
+        let s = raw_s * state.tex.tex_scale_s / 32.0;
+        let t = raw_t * state.tex.tex_scale_t / 32.0;
         let r = read_u8(rdram, off + 12);
         let g = read_u8(rdram, off + 13);
         let b = read_u8(rdram, off + 14);
@@ -729,6 +1175,8 @@ fn load_vertices(
             g,
             b,
             a,
+            s,
+            t,
         };
     }
 }
@@ -780,7 +1228,12 @@ fn tri_indices(w: u32) -> [u32; 3] {
     [(w >> 17) & 0x7F, (w >> 9) & 0x7F, (w >> 1) & 0x7F]
 }
 
-fn resolve_tri(vtx_cache: &[Vertex; 32], idx: [u32; 3]) -> Option<Triangle> {
+fn resolve_tri(
+    vtx_cache: &[Vertex; 32],
+    idx: [u32; 3],
+    cull: CullMode,
+    texture: Option<Texture>,
+) -> Option<Triangle> {
     if idx.iter().any(|&i| i as usize >= vtx_cache.len()) {
         return None;
     }
@@ -790,12 +1243,143 @@ fn resolve_tri(vtx_cache: &[Vertex; 32], idx: [u32; 3]) -> Option<Triangle> {
             vtx_cache[idx[1] as usize],
             vtx_cache[idx[2] as usize],
         ],
-        // Culling not yet driven from G_GEOMETRYMODE (that opcode is still a
-        // loud-skip); default to no culling so geometry isn't wrongly dropped.
-        cull: CullMode::None,
+        cull,
+        texture,
     })
 }
 
 /// This reference backend's one supported ucode family declaration --
 /// shared constant so `lib.rs` and tests agree on it.
 pub const SUPPORTED: &[UcodeId] = &[UcodeId::F3dex2];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write a logical big-endian s16 at `off` through the recomp `^3` byte
+    /// swizzle (mirrors the decoder's `read_i16`/`read_u16` memory model).
+    fn wr_i16(rdram: &mut [u8], off: usize, v: i16) {
+        let b = (v as u16).to_be_bytes();
+        rdram[off ^ 3] = b[0];
+        rdram[(off + 1) ^ 3] = b[1];
+    }
+
+    // --- Viewport mapping (priority 1) ----------------------------------
+
+    #[test]
+    fn read_viewport_divides_quarter_pixel_encoding_by_four() {
+        // OoT's real full-screen viewport: vscale (640,480,z), vtrans same,
+        // in the ×4 "quarter-pixel" encoding -> 160/120 px after ÷4 (§3.5).
+        let mut rdram = vec![0u8; 64];
+        let addr = 0x10;
+        wr_i16(&mut rdram, addr, 640); // vscale.x
+        wr_i16(&mut rdram, addr + 2, 480); // vscale.y
+        wr_i16(&mut rdram, addr + 4, 511); // vscale.z (~127.75 depth)
+        wr_i16(&mut rdram, addr + 8, 640); // vtrans.x
+        wr_i16(&mut rdram, addr + 10, 480); // vtrans.y
+        wr_i16(&mut rdram, addr + 12, 511); // vtrans.z
+        let vp = read_viewport(&rdram, addr).expect("viewport in bounds");
+        assert_eq!(vp.sx, 160.0);
+        assert_eq!(vp.sy, 120.0);
+        assert_eq!(vp.tx, 160.0);
+        assert_eq!(vp.ty, 120.0);
+        assert_eq!(vp.sz, 127.75);
+    }
+
+    #[test]
+    fn viewport_maps_known_ndc_points_to_known_pixels() {
+        // A 320×240 centered viewport (sx=160, tx=160, sy=120, ty=120).
+        // Map the NDC corners the way `project_vertex` does (with the Y-flip).
+        let vp = Viewport {
+            sx: 160.0,
+            sy: 120.0,
+            sz: 127.75,
+            tx: 160.0,
+            ty: 120.0,
+            tz: 127.75,
+        };
+        // NDC origin (0,0) -> screen center (160,120).
+        let map = |nx: f32, ny: f32| (nx * vp.sx + vp.tx, -ny * vp.sy + vp.ty);
+        assert_eq!(map(0.0, 0.0), (160.0, 120.0));
+        // NDC (-1,+1) is top-left on screen after the Y-flip: (0, 0).
+        assert_eq!(map(-1.0, 1.0), (0.0, 0.0));
+        // NDC (+1,-1) is bottom-right: (320, 240).
+        assert_eq!(map(1.0, -1.0), (320.0, 240.0));
+    }
+
+    // --- Culling (priority 2) -------------------------------------------
+
+    #[test]
+    fn cull_mode_from_geometry_mode_bits() {
+        assert_eq!(cull_mode_from(0), CullMode::None);
+        assert_eq!(cull_mode_from(G_CULL_BACK), CullMode::Back);
+        assert_eq!(cull_mode_from(G_CULL_FRONT), CullMode::Front);
+        assert_eq!(cull_mode_from(G_CULL_FRONT | G_CULL_BACK), CullMode::Both);
+        // Unrelated bits (e.g. G_SHADE=0x4, G_ZBUFFER=0x1) don't cull.
+        assert_eq!(cull_mode_from(0x0000_0005), CullMode::None);
+    }
+
+    // --- Texture sampling (priority 3) ----------------------------------
+
+    /// Build a 2×2 RGBA8888 texture: TL=red, TR=green, BL=blue, BR=white.
+    fn checker_2x2(clamp: bool) -> Texture {
+        let texels = vec![
+            255, 0, 0, 255, // (0,0) red
+            0, 255, 0, 255, // (1,0) green
+            0, 0, 255, 255, // (0,1) blue
+            255, 255, 255, 255, // (1,1) white
+        ];
+        Texture {
+            width: 2,
+            height: 2,
+            texels: std::rc::Rc::new(texels),
+            clamp_s: clamp,
+            clamp_t: clamp,
+        }
+    }
+
+    #[test]
+    fn texture_samples_the_right_texel() {
+        let tex = checker_2x2(true);
+        // Each integer texel coordinate lands on its own texel (nearest).
+        assert_eq!(tex.sample(0.0, 0.0), [255, 0, 0, 255]); // TL red
+        assert_eq!(tex.sample(1.0, 0.0), [0, 255, 0, 255]); // TR green
+        assert_eq!(tex.sample(0.0, 1.0), [0, 0, 255, 255]); // BL blue
+        assert_eq!(tex.sample(1.0, 1.0), [255, 255, 255, 255]); // BR white
+        // Fractional coords floor to the containing texel.
+        assert_eq!(tex.sample(0.9, 0.1), [255, 0, 0, 255]); // floor -> (0,0) red
+    }
+
+    #[test]
+    fn texture_sample_floor_addressing() {
+        let tex = checker_2x2(true);
+        // (1.5, 0.9) floors to (1, 0) = green.
+        assert_eq!(tex.sample(1.5, 0.9), [0, 255, 0, 255]);
+        // (0.2, 1.7) floors to (0, 1) = blue.
+        assert_eq!(tex.sample(0.2, 1.7), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn texture_clamp_vs_wrap_addressing() {
+        let clamp = checker_2x2(true);
+        // Out-of-range clamps to the edge texel.
+        assert_eq!(clamp.sample(5.0, 0.0), [0, 255, 0, 255]); // clamp to x=1 green
+        assert_eq!(clamp.sample(-3.0, 1.0), [0, 0, 255, 255]); // clamp to x=0 blue
+
+        let wrap = checker_2x2(false);
+        // Wrap repeats: s=2 -> texel 0, s=3 -> texel 1, s=-1 -> texel 1.
+        assert_eq!(wrap.sample(2.0, 0.0), [255, 0, 0, 255]); // (0,0) red
+        assert_eq!(wrap.sample(3.0, 0.0), [0, 255, 0, 255]); // (1,0) green
+        assert_eq!(wrap.sample(-1.0, 0.0), [0, 255, 0, 255]); // wraps to (1,0)
+    }
+
+    #[test]
+    fn rgba5551_expands_high_bits() {
+        // Pure red (R5=0x1F) -> R8=0xFF; alpha bit set -> 0xFF.
+        assert_eq!(rgba5551_to_rgba8888(0xF801), [255, 0, 0, 255]);
+        // Pure green (G5=0x1F at bits 6..10).
+        assert_eq!(rgba5551_to_rgba8888(0x07C1), [0, 255, 0, 255]);
+        // Black, alpha 0.
+        assert_eq!(rgba5551_to_rgba8888(0x0000), [0, 0, 0, 0]);
+    }
+}
