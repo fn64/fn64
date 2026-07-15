@@ -272,9 +272,16 @@ fn decode_loads_and_stores() {
 #[test]
 fn decode_nop_and_unknown() {
     assert_eq!(decode(0x00000000), Instruction::Nop);
-    // A COP1 op we don't cover yet must decode Unknown, never a wrong op.
-    // mtc1 $a1, $f6 = 0x44856000 (opcode 0x11) -> Unknown for now.
-    assert!(matches!(decode(0x44856000), Instruction::Unknown { .. }));
+    // An op we don't cover must decode Unknown, never a wrong op. COP2 (opcode
+    // 0x12) is out of scope for this CPU decoder; 0x48856000 is such a word.
+    assert!(matches!(decode(0x48856000), Instruction::Unknown { .. }));
+    // A COP1 word with an unimplemented `funct` (e.g. RECIP.S, funct 0x15,
+    // which OoT does not emit) is likewise Unknown, not a silent mis-decode.
+    // recip.s $f0,$f2 = 0x46001015 (fmt=S, funct=0x15).
+    assert!(matches!(decode(0x46001015), Instruction::Unknown { .. }));
+    // MTC1, now covered, must NOT be Unknown (guards against a regression that
+    // drops the whole COP1 family back to Unknown).
+    assert_eq!(decode(0x44856000), Instruction::Mtc1 { rt: 5, fs: 12 });
 }
 
 /// Delay-slot classification: every branch/jump has one; ALU ops do not.
