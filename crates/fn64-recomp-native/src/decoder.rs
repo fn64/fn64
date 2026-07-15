@@ -187,6 +187,63 @@ pub enum Instruction {
     /// Jump-and-link register. `JALR rd, rs` (rd defaults to $ra).
     Jalr { rd: Reg, rs: Reg },
 
+    // --- COP0 system control (opcode 0x10) ---
+    //
+    // The N64 CPU's system coprocessor. On a recompiled title almost all COP0
+    // register state (Status/Cause/EPC/the TLB) is owned by the libultra host,
+    // not the game — so most of these are privileged ops the recompiled body
+    // should never execute, and are emitted as **loud traps**, never a silent
+    // nop. The two that generated code can legitimately reach are Count/Compare
+    // moves (the guts of `osGetCount`/`osSetTimer`), which read/write real
+    // context state. `cop0d` is the register index (rd field, bits 15..11).
+    /// Move-from COP0. `MFC0 rt, cop0d` (32-bit, sign-extended into GPR).
+    Mfc0 { rt: Reg, cop0d: u8 },
+    /// Move-to COP0. `MTC0 rt, cop0d` (32-bit).
+    Mtc0 { rt: Reg, cop0d: u8 },
+    /// Doubleword move-from COP0. `DMFC0 rt, cop0d` (64-bit).
+    Dmfc0 { rt: Reg, cop0d: u8 },
+    /// Doubleword move-to COP0. `DMTC0 rt, cop0d` (64-bit).
+    Dmtc0 { rt: Reg, cop0d: u8 },
+    /// Exception return. `ERET` — privileged; returns from an interrupt/exception.
+    Eret,
+    /// Write indexed TLB entry. `TLBWI` — privileged MMU op.
+    Tlbwi,
+    /// Write random TLB entry. `TLBWR` — privileged MMU op.
+    Tlbwr,
+    /// Probe TLB for matching entry. `TLBP` — privileged MMU op.
+    Tlbp,
+    /// Read indexed TLB entry. `TLBR` — privileged MMU op.
+    Tlbr,
+
+    // --- Cache / synchronization ---
+    /// Cache operation. `CACHE op, off(base)`. On a recompiled title the host
+    /// rdram is already coherent, so this is a semantic no-op (emitted with a
+    /// comment), matching how every N64 static/dynamic recompiler treats it.
+    Cache { op: u8, base: Reg, off: i16 },
+    /// Store-ordering barrier. `SYNC` — a no-op in a single-threaded recompiled
+    /// context (no store buffer to drain).
+    Sync,
+
+    // --- COP2 (unused coprocessor) stubs (opcode 0x12) ---
+    //
+    // COP2 is not wired to anything on the N64; libultra never uses it and no
+    // ordinary game touches it. We decode the move ops so an unexpected COP2
+    // instruction is a *named loud trap* rather than a bare `Unknown` word.
+    /// Move-from COP2. `MFC2 rt, rd`.
+    Mfc2 { rt: Reg, rd: Reg },
+    /// Move-to COP2. `MTC2 rt, rd`.
+    Mtc2 { rt: Reg, rd: Reg },
+    /// Move control-from COP2. `CFC2 rt, rd`.
+    Cfc2 { rt: Reg, rd: Reg },
+    /// Move control-to COP2. `CTC2 rt, rd`.
+    Ctc2 { rt: Reg, rd: Reg },
+
+    // --- Traps (SPECIAL) ---
+    /// System call. `SYSCALL code` — raises an exception; emitted as a loud trap.
+    Syscall { code: u32 },
+    /// Breakpoint. `BREAK code` — raises an exception; emitted as a loud trap.
+    Break { code: u32 },
+
     /// A word we do not (yet) decode. Carries the raw bits so the emitter can
     /// fail loudly instead of silently emitting a nop.
     Unknown { word: u32 },
@@ -230,6 +287,22 @@ fn imm_s(w: u32) -> i16 {
 fn target26(w: u32) -> u32 {
     w & 0x03FF_FFFF
 }
+/// The COP0 register index a MFC0/MTC0/DMFC0/DMTC0 targets: the `rd` field
+/// (bits 15..11), matching `rabbitizer`'s `Get_cop0d()` in N64Recomp.
+#[inline]
+fn cop0d(w: u32) -> u8 {
+    ((w >> 11) & 0x1F) as u8
+}
+/// The 20-bit `code` field of SYSCALL/BREAK (bits 25..6). Diagnostic only.
+#[inline]
+fn code20(w: u32) -> u32 {
+    (w >> 6) & 0x000F_FFFF
+}
+/// The 5-bit cache-operation selector of CACHE (the `rt` field, bits 20..16).
+#[inline]
+fn cache_op(w: u32) -> u8 {
+    ((w >> 16) & 0x1F) as u8
+}
 
 /// Decode a single 32-bit MIPS instruction word.
 ///
@@ -256,6 +329,10 @@ pub fn decode(w: u32) -> Instruction {
             // Jumps.
             0x08 => Jr { rs: rs(w) },
             0x09 => Jalr { rd: rd(w), rs: rs(w) },
+            // Traps + sync (SPECIAL funct 0x0C/0x0D/0x0F).
+            0x0C => Syscall { code: code20(w) },
+            0x0D => Break { code: code20(w) },
+            0x0F => Sync,
             // HI/LO moves.
             0x10 => Mfhi { rd: rd(w) },
             0x11 => Mthi { rs: rs(w) },
@@ -287,6 +364,38 @@ pub fn decode(w: u32) -> Instruction {
             0x03 => Bgezl { rs: rs(w), off: imm_s(w) },
             0x10 => Bltzal { rs: rs(w), off: imm_s(w) },
             0x11 => Bgezal { rs: rs(w), off: imm_s(w) },
+            _ => Unknown { word: w },
+        },
+        // COP0 (opcode 0x10): sub-dispatch on the rs/format field (bits 25..21).
+        // rs bit 25 (the "CO" bit) selects the funct-encoded ops (ERET/TLB*).
+        0x10 => {
+            let fmt = rs(w);
+            if fmt & 0x10 != 0 {
+                // CO=1: TLB / ERET, selected by funct (bits 5..0).
+                match funct(w) {
+                    0x01 => Tlbr,
+                    0x02 => Tlbwi,
+                    0x06 => Tlbwr,
+                    0x08 => Tlbp,
+                    0x18 => Eret,
+                    _ => Unknown { word: w },
+                }
+            } else {
+                match fmt {
+                    0x00 => Mfc0 { rt: rt(w), cop0d: cop0d(w) },
+                    0x01 => Dmfc0 { rt: rt(w), cop0d: cop0d(w) },
+                    0x04 => Mtc0 { rt: rt(w), cop0d: cop0d(w) },
+                    0x05 => Dmtc0 { rt: rt(w), cop0d: cop0d(w) },
+                    _ => Unknown { word: w },
+                }
+            }
+        }
+        // COP2 (opcode 0x12): move ops, sub-dispatched on the rs/format field.
+        0x12 => match rs(w) {
+            0x00 => Mfc2 { rt: rt(w), rd: rd(w) },
+            0x02 => Cfc2 { rt: rt(w), rd: rd(w) },
+            0x04 => Mtc2 { rt: rt(w), rd: rd(w) },
+            0x06 => Ctc2 { rt: rt(w), rd: rd(w) },
             _ => Unknown { word: w },
         },
         // J-type.
@@ -325,6 +434,8 @@ pub fn decode(w: u32) -> Instruction {
         0x2A => Swl { rt: rt(w), base: rs(w), off: imm_s(w) },
         0x2B => Sw { rt: rt(w), base: rs(w), off: imm_s(w) },
         0x2E => Swr { rt: rt(w), base: rs(w), off: imm_s(w) },
+        // Cache operation (I-type: base=rs, op=rt field, signed offset).
+        0x2F => Cache { op: cache_op(w), base: rs(w), off: imm_s(w) },
         _ => Unknown { word: w },
     }
 }
