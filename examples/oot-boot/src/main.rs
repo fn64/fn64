@@ -194,8 +194,30 @@ fn main() {
     }
 
     // rdram: this process's one shared buffer (docs/DESIGN.md section 3).
+    // `.max(RDRAM_MMIO_WINDOW_END)` (same pattern as examples/wm2000-boot's
+    // harness) is REQUIRED, not just extra headroom: OoT's own boot path
+    // (`CIC6105_SaveBootMagicValues`, `RecompiledFuncs/funcs_0.c`) issues a
+    // raw `MEM_W` load at a KSEG1 (uncached) RDRAM address
+    // (`0xA0300000 - 0x4E0C` / `-0x1E40`, verified byte-exact against
+    // `refs/oot-decomp/src/boot/cic6105.c`'s own `IO_READ(0x002FB1F4)` /
+    // `IO_READ(0x002FE1C0)` -- KSEG1's `0xA0300000` base is a plain
+    // uncached alias of physical RDRAM offset `0x00300000`, so this is
+    // real hardware semantics, not a translation bug in `RdramAddr`).
+    // `recomp.h`'s real `MEM_W` macro subtracts the KSEG0 base
+    // unconditionally for every address (verified against
+    // `refs/N64RecompSource/include/recomp.h`), so a KSEG1 address lands
+    // 0x20000000 bytes further into the buffer than the same physical
+    // offset would via KSEG0 -- a flat 8 MB buffer is a real out-of-bounds
+    // read/SIGSEGV here (first hit: this harness's very first
+    // `recomp_entrypoint` call, before any thread/section work even
+    // starts). A plain 8 MB buffer was never big enough for a game that
+    // touches KSEG1-mirrored RDRAM at boot; WM2000/NW4E's own
+    // `RecompiledFuncs` corpora happen not to exercise this address range,
+    // which is why examples/wm2000-boot's identical `.max(...)` guard
+    // never had to fire in that harness's own testing, not because the
+    // sizing itself is game-specific.
     const RDRAM_SIZE: usize = 8 * 1024 * 1024;
-    let mut rdram = vec![0u8; RDRAM_SIZE];
+    let mut rdram = vec![0u8; RDRAM_SIZE.max(fn64_runtime::RDRAM_MMIO_WINDOW_END as usize)];
     let rdram_ptr = rdram.as_mut_ptr();
 
     println!("[oot-boot] booting thread 0 (recomp_entrypoint)...");
