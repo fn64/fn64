@@ -1283,6 +1283,39 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
     let dest_vram = dram_addr.offset() | 0x8000_0000;
     note_dma_overlay_load(dev_addr, dest_vram);
 
+    // Static-link-VRAM mirror: this is a fully-static N64Recomp build (every
+    // section num_relocs=0, zero RELOC_HI16/LO16 in the generated C), so an
+    // overlay's recompiled code reads its own DATA via BAKED absolute link
+    // addresses (e.g. Player_InitItemAction's `lui 0x8085; lw 0x1EA8` reads
+    // sItemActionInitFuncs[] at static 0x80851EA8), NOT the heap address the
+    // game DMA'd the overlay to. Mirror the overlay's raw ROM image to its
+    // static link VRAM so those baked reads find the (un-relocated) static
+    // function pointers, which `resolve` maps through the section's static
+    // base. Only for device->RDRAM ROM reads; SRAM/save DMAs never match a
+    // code section. See SectionRegistry::plan_static_mirror.
+    if matches!(direction, DmaDirection::ToRdram)
+        && !fn64_runtime::rom::is_sram_dev_addr(dev_addr)
+    {
+        if let Some(static_off) = with_host(|host| host.sections.plan_static_mirror(dev_addr, len))
+        {
+            let mut buf = vec![0u8; len as usize];
+            with_pi_dma("osEPiStartDma_recomp", |dma| dma.read_rom_bytes(dev_addr, &mut buf));
+            // Same word-swizzle the primary destination write applies, so the
+            // mirror is native-word storage the guest reads back via MEM_*.
+            for word in buf.chunks_exact_mut(4) {
+                word.swap(0, 3);
+                word.swap(1, 2);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buf.as_ptr(),
+                    rdram.add(static_off as usize),
+                    buf.len(),
+                );
+            }
+        }
+    }
+
     // Every path reaching here completed the DMA synchronously and
     // successfully -- see the doc comment's "Correction (2026-07-14)" for
     // why this must be written at all (a stale, unwritten $v0 caused a
@@ -4962,6 +4995,98 @@ mod tests {
         // And nothing spilled past the declared length.
         let after = u32::from_ne_bytes(rdram[0x500C..0x5010].try_into().unwrap());
         assert_eq!(after, 0, "DMA must not write past size (0xC bytes)");
+    }
+
+    /// Regression test for the fully-static-overlay NULL-function-pointer trap
+    /// (2026-07-15): OoT's Player overlay (section 9) is a STATIC N64Recomp
+    /// build (num_relocs=0, zero RELOC_HI16/LO16), so `Player_InitItemAction`
+    /// reads `sItemActionInitFuncs[]` via a BAKED absolute link address
+    /// (`lui 0x8085; lw 0x1EA8` -> 0x80851EA8, funcs_67.c:1815-1830). The game
+    /// DMAs the overlay to an arena HEAP base and relocates the HEAP copy, but
+    /// the recompiled code dereferences the STATIC link VRAM -- which fn64 left
+    /// unwritten (reads 0) -> `LOOKUP_FUNC(0)` trap. The fix mirrors the
+    /// overlay's raw ROM image to its static link VRAM (holding un-relocated
+    /// static function pointers) so the baked read resolves via the section's
+    /// static base.
+    ///
+    /// This drives the real `osEPiStartDma_recomp` path: register a section at
+    /// a static VRAM, DMA its ROM image to a HEAP vram (as the arena would),
+    /// then assert the guest's own MEM_W read of the data-table entry at the
+    /// STATIC link VRAM returns the static function pointer, and that
+    /// `get_function` resolves it to the registered func. A DISTINCT func_ptr
+    /// (not 0) makes a mirror miss / wrong-offset fail loudly. Without the
+    /// mirror, the static-VRAM word is 0 and `get_function(0)` traps -- the
+    /// exact bug this guards. (Verified fail-against-bug: reverting the mirror
+    /// write makes the MEM_W read 0 and the resolve panic.)
+    #[test]
+    fn static_overlay_data_table_read_resolves_via_static_vram_mirror() {
+        unsafe extern "C" fn player_init_default_ia(_r: *mut u8, _c: *mut RecompContext) {}
+        let func_ptr: RecompFunc = player_init_default_ia;
+
+        // Model section 9: rom 0x00BCDB70, static link VRAM 0x808301C0. The
+        // data-table entry we test points at section offset 0x15E4 (the real
+        // Player_InitDefaultIA offset). Use a compact ROM: the section image
+        // is [text .. data], with the table living at file offset 0x40 and the
+        // pointed-at func at static offset 0x15E4.
+        const SEC_ROM: u32 = 0x00BC_DB70;
+        const SEC_RAM: u32 = 0x8083_01C0;
+        const FUNC_OFF: u32 = 0x15E4; // real Player_InitDefaultIA offset
+        const TABLE_FILE_OFF: usize = 0x40; // where the ptr table sits in ROM
+        let static_ptr: u32 = SEC_RAM + FUNC_OFF; // 0x808317A4 -- the baked static ptr
+        // The overlay file must be word-aligned and long enough to DMA in one
+        // aligned chunk covering the table.
+        let file_len: u32 = 0x80;
+
+        // Register the section with a FuncEntry at the pointed-at offset, and
+        // register a SECOND, unrelated section so a wrong-section resolve is
+        // caught. Only mark section 9 loaded (at its heap base, as the arena
+        // DMA would) so `resolve`'s static-base path is what's exercised.
+        let sec9 =
+            unsafe { register_section(SEC_ROM, SEC_RAM, 0x2_1110, &[(FUNC_OFF, 4, func_ptr)]) };
+
+        // Build a ROM whose section image holds the static pointer (big-endian
+        // cart order) at the table offset.
+        let mut rom = vec![0u8; (SEC_ROM as usize) + (file_len as usize) + 0x10];
+        let tbl_rom = SEC_ROM as usize + TABLE_FILE_OFF;
+        rom[tbl_rom..tbl_rom + 4].copy_from_slice(&static_ptr.to_be_bytes());
+        load_rom(rom);
+
+        // DMA the overlay's ROM image to a HEAP base (as the arena allocates),
+        // via the real osEPiStartDma_recomp shim. Heap base picked to differ
+        // from the static VRAM so a heap-vs-static confusion is caught.
+        let heap_vram: u32 = 0x8038_8b60;
+        let mut rdram = vec![0u8; fn64_runtime::RDRAM_MMIO_WINDOW_END as usize];
+        let mb_off = 0x2000usize;
+        let mb_vram: u64 = 0x8000_2000;
+        rdram[mb_off + 0x4..mb_off + 0x8].copy_from_slice(&0u32.to_ne_bytes()); // retQueue
+        rdram[mb_off + 0x8..mb_off + 0xC].copy_from_slice(&heap_vram.to_ne_bytes()); // dramAddr
+        rdram[mb_off + 0xC..mb_off + 0x10].copy_from_slice(&SEC_ROM.to_ne_bytes()); // devAddr
+        rdram[mb_off + 0x10..mb_off + 0x14].copy_from_slice(&file_len.to_ne_bytes()); // size
+
+        let mut ctx = ctx_zeroed();
+        ctx.r5 = mb_vram;
+        ctx.r6 = 0; // OS_READ / ToRdram
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // The game's baked read: MEM_W at the STATIC link VRAM of the table.
+        // Static VRAM 0x808301C0+TABLE_FILE_OFF -> rdram offset (mask KSEG0).
+        let table_static_vram = SEC_RAM + TABLE_FILE_OFF as u32;
+        let static_off = (table_static_vram & 0x1FFF_FFFF) as usize;
+        let read_ptr = u32::from_ne_bytes(rdram[static_off..static_off + 4].try_into().unwrap());
+        assert_eq!(
+            read_ptr, static_ptr,
+            "static-link-VRAM mirror must place the un-relocated static function pointer \
+             ({static_ptr:#010x}) where the baked `lw` reads it; got {read_ptr:#010x} (0 == \
+             mirror never ran -> the LOOKUP_FUNC(0) trap)"
+        );
+        // And it resolves through the section's static base to the real func.
+        let resolved = get_function(read_ptr as i32);
+        assert_eq!(
+            resolved as usize, func_ptr as usize,
+            "the mirrored static pointer must resolve to the registered FuncEntry"
+        );
+
+        set_section_unloaded(sec9);
     }
 
     /// Regression test for the OoT-boot hang (2026-07-14): `osEPiReadIo`

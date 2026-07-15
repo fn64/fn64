@@ -140,6 +140,19 @@ pub struct SectionRegistry {
     /// rare event, rather than a per-entry staleness check on the hot
     /// path, is the right trade here).
     cache: HashMap<u32, usize>,
+    /// One in-flight static-link-VRAM mirror (see `plan_static_mirror`). An
+    /// overlay's chunked DMA is mirrored to its static link VRAM so the
+    /// baked static-address DATA reads in this fully-static build resolve.
+    static_mirror: Option<StaticMirror>,
+}
+
+/// In-flight state for `plan_static_mirror`: the ROM cursor (where the next
+/// contiguous chunk must start to continue this mirror) and the matching
+/// rdram static-VRAM destination cursor.
+#[derive(Copy, Clone)]
+struct StaticMirror {
+    next_rom: u32,
+    next_static_off: u32,
 }
 
 impl SectionRegistry {
@@ -211,6 +224,74 @@ impl SectionRegistry {
         let idx = self.sections.iter().position(|s| s.rom_addr == rom_addr)?;
         self.set_section_loaded_at(idx, dest_vram);
         Some(idx)
+    }
+
+    /// Plan a static-link-VRAM mirror write for one DMA chunk.
+    ///
+    /// This corpus is a FULLY STATIC N64Recomp build: `recomp_overlays.inl`
+    /// carries `num_relocs = 0` for every section and the generated C emits
+    /// NO `RELOC_HI16`/`RELOC_LO16` macros -- every address is a baked
+    /// absolute link-time literal (verified: `grep RELOC_HI16 games/OOTU/
+    /// RecompiledFuncs/*.c` is empty). So when an overlay's recompiled code
+    /// reads its own DATA -- e.g. `Player_InitItemAction` does
+    /// `lui $t9,0x8085; lw $t9,0x1EA8($t9)` (funcs_67.c) to fetch
+    /// `sItemActionInitFuncs[]` -- it dereferences the *static link VRAM*
+    /// `0x80851EA8`, NOT the runtime heap address the game DMA'd the overlay
+    /// to. But OoT's own loader DMAs the overlay to an arena HEAP base
+    /// (`Actor_Spawn`/`KaleidoManager_LoadOvl` -> `Overlay_Load`) and the
+    /// game's `Overlay_Relocate` rewrites the *heap* copy's pointers; the
+    /// static-link-VRAM region is left unwritten (reads 0) -> the baked
+    /// `lw` reads a NULL function pointer -> `LOOKUP_FUNC(0)` traps.
+    ///
+    /// A static build requires the overlay's image to be resident at its
+    /// static link VRAM, holding the RAW (un-relocated) link-time pointers
+    /// (e.g. `sItemActionInitFuncs[0] = 0x808317A4 = Player_InitDefaultIA`).
+    /// `resolve` already accepts a section's static `ram_addr` as a base
+    /// (base #2, for baked code immediates), so a raw static pointer read
+    /// from the mirror resolves through the very same FuncEntry list. The
+    /// game's separate heap copy + `Overlay_Relocate` still run untouched
+    /// (faithful) -- fn64 just additionally makes the static-VRAM image the
+    /// baked reads target actually present.
+    ///
+    /// The game DMAs an overlay contiguously in chunks (OoT's DmaMgr splits
+    /// into `0x2000` blocks). This tracks one active mirror at a time: it
+    /// STARTS when a chunk's ROM source is exactly a section's `rom_addr`,
+    /// and CONTINUES for each subsequent chunk whose ROM source is exactly
+    /// where the previous chunk ended (contiguous). A non-contiguous chunk
+    /// (an unrelated DMA, or the next overlay) ends the active mirror, so an
+    /// unrelated data DMA following the overlay is never mis-mirrored past
+    /// the overlay's own ROM extent. Returns the rdram DESTINATION offset the
+    /// caller must ALSO write this chunk's (already byte-swizzled) bytes to,
+    /// or `None` if this chunk is not part of an active static-overlay load.
+    pub fn plan_static_mirror(&mut self, dev_addr: u32, len: u32) -> Option<u32> {
+        // Start a new mirror if this chunk begins exactly at a section start.
+        if let Some(idx) = self.sections.iter().position(|s| s.rom_addr == dev_addr) {
+            let ram_addr = self.sections[idx].ram_addr;
+            // Static link VRAM -> rdram offset (KSEG0 mask). The Player
+            // overlay's DATA sits above physical 8MB RDRAM (link 0x808301C0+);
+            // the caller's rdram buffer is oversized to cover it (see
+            // fn64-runtime::Rdram::new_with_mmio / oot-boot's rdram sizing).
+            let static_off = ram_addr & 0x1FFF_FFFF;
+            self.static_mirror = Some(StaticMirror {
+                next_rom: dev_addr.wrapping_add(len),
+                next_static_off: static_off.wrapping_add(len),
+            });
+            return Some(static_off);
+        }
+        // Continue an active mirror only for the exact contiguous next chunk.
+        if let Some(m) = self.static_mirror {
+            if m.next_rom == dev_addr {
+                let dest = m.next_static_off;
+                self.static_mirror = Some(StaticMirror {
+                    next_rom: dev_addr.wrapping_add(len),
+                    next_static_off: dest.wrapping_add(len),
+                });
+                return Some(dest);
+            }
+        }
+        // Any non-contiguous chunk ends the active mirror.
+        self.static_mirror = None;
+        None
     }
 
     /// Mark a section as no longer resident (the corresponding bank has
@@ -461,5 +542,51 @@ mod tests {
         assert_eq!(reg.resolve(0x803b_4df0), 0xc0de_1234);
         reg.set_section_unloaded(idx);
         reg.resolve(0x803b_4df0); // must panic, not serve stale heap base
+    }
+
+    /// `plan_static_mirror` starts a mirror only at an exact section-start
+    /// chunk, then continues for exactly-contiguous chunks, and ends the
+    /// mirror at any non-contiguous chunk. Models the Player overlay's chunked
+    /// DMA (rom 0x00BCDB70, static VRAM 0x808301C0, 0x2000-byte chunks). The
+    /// returned static offsets are the KSEG0-masked static VRAM + accumulated
+    /// chunk length -- distinguishable so a wrong base/cursor is caught.
+    #[test]
+    fn plan_static_mirror_tracks_a_contiguous_chunked_overlay_load() {
+        let mut reg = SectionRegistry::new();
+        // Section 9 geometry. rom 0x00BCDB70, static VRAM 0x808301C0.
+        reg.register_section(section_at_rom(0x00bc_db70, 0x8083_01c0, 0x2_1110, vec![]));
+        // A second, unrelated section start -- must NOT be mistaken for a
+        // continuation of the first mirror.
+        reg.register_section(section_at_rom(0x00bf_ac30, 0x8085_d350, 0x4ef0, vec![]));
+
+        let static_base = 0x0083_01c0u32; // 0x808301C0 & 0x1FFFFFFF
+
+        // A data DMA before the overlay must not start a mirror.
+        assert_eq!(reg.plan_static_mirror(0x0010_0000, 0x100), None);
+
+        // First chunk at the exact section start -> mirror to static base.
+        assert_eq!(reg.plan_static_mirror(0x00bc_db70, 0x2000), Some(static_base));
+        // Contiguous next chunk -> static base + 0x2000.
+        assert_eq!(
+            reg.plan_static_mirror(0x00bc_fb70, 0x2000),
+            Some(static_base + 0x2000)
+        );
+        // Contiguous again -> + 0x4000.
+        assert_eq!(
+            reg.plan_static_mirror(0x00bd_1b70, 0x2000),
+            Some(static_base + 0x4000)
+        );
+
+        // A non-contiguous chunk (an unrelated DMA) ends the mirror: no dest.
+        assert_eq!(reg.plan_static_mirror(0x0020_0000, 0x40), None);
+        // ...and the previously-active mirror does NOT resume on the next
+        // would-be-contiguous address (it was torn down).
+        assert_eq!(reg.plan_static_mirror(0x00bd_3b70, 0x2000), None);
+
+        // A fresh section-start begins a brand-new mirror at ITS static base.
+        assert_eq!(
+            reg.plan_static_mirror(0x00bf_ac30, 0x1000),
+            Some(0x0085_d350)
+        );
     }
 }
