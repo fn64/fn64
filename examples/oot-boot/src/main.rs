@@ -230,6 +230,44 @@ fn main() {
     let mut rdram = vec![0u8; RDRAM_SIZE.max(fn64_runtime::RDRAM_MMIO_WINDOW_END as usize)];
     let rdram_ptr = rdram.as_mut_ptr();
 
+    // Register the headless reference software rasterizer as the render
+    // backend BEFORE booting thread 0, so every M_GFXTASK the game submits
+    // via osSpTaskYielded actually decodes+rasterizes (the ABI's
+    // GFX_RENDER_NOTE path) instead of being counted-and-dropped. It decodes
+    // real F3DEX2 (OoT's ucode family) and auto-dumps each non-clear
+    // rasterized frame to /tmp/fn64-oot-render-*.png -- the harness's only
+    // way to see the backend's output, since set_render_backend takes
+    // ownership of the trait object (which is deliberately not
+    // Any-downcastable, per docs/DECOUPLING.md). rdram_len MUST match the
+    // real backing buffer so the backend's bounds checks and the ABI's
+    // from_raw_parts slice length agree; we pass rdram.len() (which includes
+    // the RDRAM_MMIO_WINDOW_END headroom above) for exactly that reason.
+    //
+    // NOTE (honest): the CONCURRENT display-list-pointer fix has not
+    // necessarily landed, so OoT's live polyOpa/polyXlu display-list head may
+    // still be a garbage pointer this early in boot -- in which case the
+    // decoder reads junk and either finds no triangles or lands geometry
+    // nowhere recognizable. That is expected and reported (blank/garbage),
+    // not faked; the objective rasterizer proof lives in
+    // fn64-render-rt64/tests/f3dex2_replay.rs, independent of this live path.
+    let mut render_backend = fn64_render_rt64::ReferenceBackend::new()
+        .with_f3dex2()
+        .with_clear_color([0, 0, 0, 255])
+        .with_auto_dump("/tmp", "fn64-oot-render", 8);
+    // A common NTSC low-res target; matches capture_framebuffer's assumed
+    // 320x240 (this harness does not yet decode the ROM's real OSViMode).
+    {
+        use fn64_render::RenderBackend as _;
+        if let Err(e) = render_backend.create(&fn64_render::RenderConfig::new(320, 240)) {
+            eprintln!("[oot-boot] WARNING: render backend create() failed: {e}");
+        }
+    }
+    fn64_abi::set_render_backend(Box::new(render_backend), rdram.len());
+    println!(
+        "[oot-boot] registered fn64-render-rt64 ReferenceBackend (F3DEX2, 320x240, \
+         auto-dump /tmp/fn64-oot-render-*.png) as the render backend"
+    );
+
     println!("[oot-boot] booting thread 0 (recomp_entrypoint)...");
     unsafe {
         fn64_abi::boot_thread0(rdram_ptr, recomp_entrypoint, 0, 10);

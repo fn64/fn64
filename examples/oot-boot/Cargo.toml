@@ -25,3 +25,9 @@ cc = "1"
 [dependencies]
 fn64-runtime = { path = "../../crates/fn64-runtime" }
 fn64-abi = { path = "../../crates/fn64-abi" }
+# The graphics seam + its headless reference software rasterizer. Registered
+# via fn64_abi::set_render_backend so submitted M_GFXTASKs actually
+# rasterize (into an off-screen framebuffer we dump as PNG), instead of only
+# hashing the blank VI framebuffer. See main.rs's render-backend section.
+fn64-render = { path = "../../crates/fn64-render" }
+fn64-render-rt64 = { path = "../../crates/fn64-render-rt64" }
