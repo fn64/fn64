@@ -2998,6 +2998,67 @@ pub unsafe extern "C" fn osViGetNextFramebuffer_recomp(_rdram: *mut u8, ctx: *mu
 #[no_mangle]
 pub unsafe extern "C" fn osWritebackDCacheAll_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
 
+/// `__osSpGetStatus(void) -> u32` -- raw RCP `SP_STATUS_REG` read (real
+/// hardware: `IO_READ(SP_STATUS_REG)`). Newly reachable after the
+/// 2026-07-14 stub-set fix (`RcpUtils_PrintRegisterStatus`, a debug-print
+/// helper, is no longer stubbed empty) -- this crate has no RCP
+/// register-file model (`fn64_runtime`'s `Executor` tracks task/DMA state
+/// as typed Rust structs, not raw MMIO bit layout), so a fabricated status
+/// word would be an unearned guess about SP halt/broke/dma-busy bits a
+/// caller could branch on. Loud trap, matching every other unmodeled-
+/// hardware-register shim in this file.
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn __osSpGetStatus_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
+    unimplemented!(
+        "__osSpGetStatus_recomp: no RCP SP_STATUS_REG bit-layout model exists in this crate -- \
+         reachable from RcpUtils_PrintRegisterStatus (games/OOTU/RecompiledFuncs), a debug-print \
+         helper unstubbed by the 2026-07-14 gen_stubs.py false-positive-stub fix. A fabricated \
+         status word would be an unearned guess a real caller could branch on."
+    );
+}
+
+/// `osDpGetStatus(void) -> u32` -- raw RCP `DP_STATUS_REG` read, same shape
+/// as `__osSpGetStatus_recomp` above (RDP half of the pair). Same
+/// newly-reachable-via-`RcpUtils_PrintRegisterStatus` provenance and same
+/// no-register-model reasoning.
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn osDpGetStatus_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
+    unimplemented!(
+        "osDpGetStatus_recomp: no RCP DP_STATUS_REG bit-layout model exists in this crate -- \
+         reachable from RcpUtils_PrintRegisterStatus (games/OOTU/RecompiledFuncs), a debug-print \
+         helper unstubbed by the 2026-07-14 gen_stubs.py false-positive-stub fix. A fabricated \
+         status word would be an unearned guess a real caller could branch on."
+    );
+}
+
+/// `osLeoDiskInit(void) -> s32` -- 64DD (Disk Drive) subsystem init. OoT
+/// (OOTU) is a cartridge-only retail title; `leomain`/`LeoCJCreateLeoManager`
+/// /`LeoCACreateLeoManager` (this symbol's only callers, newly reachable
+/// after the 2026-07-14 stub-set fix) are 64DD-family debug/dev-kit code
+/// paths dead on real retail hardware and never exercised by this crate's
+/// PI/cartridge-only `InMemoryRom` model (`rom.rs`) -- no 64DD drive state
+/// exists to initialize. Loud trap rather than a fabricated "drive present"
+/// success/failure code.
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn osLeoDiskInit_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
+    unimplemented!(
+        "osLeoDiskInit_recomp: no 64DD (Disk Drive) subsystem exists in this crate -- \
+         OOTU is cartridge-only retail; reachable only from leomain/LeoC{{J,A}}CreateLeoManager \
+         (games/OOTU/RecompiledFuncs), 64DD-family dev-kit code paths unstubbed by the \
+         2026-07-14 gen_stubs.py false-positive-stub fix. A fabricated init result would be \
+         an unearned guess about hardware this crate never models."
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
