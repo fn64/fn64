@@ -258,12 +258,94 @@ pub enum OpStatus {
 /// Keeping this exhaustive `match` here means adding/here-implementing an op
 /// is a localized edit and the compiler enforces every `VuOp` is handled.
 pub fn dispatch(state: &mut VuState, op: VuOp, inv: OpInvocation) -> OpStatus {
-    // The foundation phase intentionally implements no op bodies; it proves
-    // the register/accumulator/flag/element/table/memory model instead. The
-    // `_ = (state, inv)` keeps the params live so the seam's types are
-    // exercised (and the signature is the one op bodies will use).
-    let _ = (state, &inv);
-    OpStatus::Unimplemented(op)
+    use super::vu_ops::logic::{self, LogicKind};
+    match op {
+        // --- Logical family (§6.5): VAND/VNAND/VOR/VNOR/VXOR/VNXOR + VNOP ---
+        VuOp::Vand => {
+            logic::exec_logic(state, LogicKind::And, inv.vd, inv.vs, inv.vt, inv.e);
+            OpStatus::Executed
+        }
+        VuOp::Vnand => {
+            logic::exec_logic(state, LogicKind::Nand, inv.vd, inv.vs, inv.vt, inv.e);
+            OpStatus::Executed
+        }
+        VuOp::Vor => {
+            logic::exec_logic(state, LogicKind::Or, inv.vd, inv.vs, inv.vt, inv.e);
+            OpStatus::Executed
+        }
+        VuOp::Vnor => {
+            logic::exec_logic(state, LogicKind::Nor, inv.vd, inv.vs, inv.vt, inv.e);
+            OpStatus::Executed
+        }
+        VuOp::Vxor => {
+            logic::exec_logic(state, LogicKind::Xor, inv.vd, inv.vs, inv.vt, inv.e);
+            OpStatus::Executed
+        }
+        VuOp::Vnxor => {
+            logic::exec_logic(state, LogicKind::Nxor, inv.vd, inv.vs, inv.vt, inv.e);
+            OpStatus::Executed
+        }
+        VuOp::Vnop => {
+            logic::exec_vnop(state);
+            OpStatus::Executed
+        }
+        // --- Multiply-accumulate family (§6.2) + VSAR (§6.9) ---
+        VuOp::Vmacf
+        | VuOp::Vmacq
+        | VuOp::Vmadh
+        | VuOp::Vmadm
+        | VuOp::Vmadn
+        | VuOp::Vmadl
+        | VuOp::Vsar => super::vu_ops::mac::dispatch_mac(state, op, &inv)
+            .expect("mac family op routed to dispatch_mac"),
+        // --- Select family (§6.6–§6.7): compares/merge/clip ---
+        VuOp::Vlt
+        | VuOp::Veq
+        | VuOp::Vne
+        | VuOp::Vge
+        | VuOp::Vmrg
+        | VuOp::Vch
+        | VuOp::Vcl
+        | VuOp::Vcr => super::vu_ops::select::try_dispatch(state, op, &inv)
+            .expect("select family op routed to select::try_dispatch"),
+        // --- "mul-hi" multiply family (set accumulator, §6.1) ---
+        VuOp::Vmulf => {
+            super::vu_ops::mul_hi::vmulf(state, &inv);
+            OpStatus::Executed
+        }
+        VuOp::Vmulq => {
+            super::vu_ops::mul_hi::vmulq(state, &inv);
+            OpStatus::Executed
+        }
+        VuOp::Vmudh => {
+            super::vu_ops::mul_hi::vmudh(state, &inv);
+            OpStatus::Executed
+        }
+        VuOp::Vmudm => {
+            super::vu_ops::mul_hi::vmudm(state, &inv);
+            OpStatus::Executed
+        }
+        VuOp::Vmudn => {
+            super::vu_ops::mul_hi::vmudn(state, &inv);
+            OpStatus::Executed
+        }
+        VuOp::Vmudl => {
+            super::vu_ops::mul_hi::vmudl(state, &inv);
+            OpStatus::Executed
+        }
+        // --- Add/subtract family (§6.3) + VABS (§6.4) ---
+        VuOp::Vadd | VuOp::Vaddc | VuOp::Vsub | VuOp::Vsubc | VuOp::Vabs => {
+            super::vu_ops::addsub::dispatch_addsub(state, op, &inv)
+                .expect("addsub family op routed to dispatch_addsub")
+        }
+        // Other families are implemented by their own op-group modules; until
+        // wired here they trap loudly rather than silently miscomputing. The
+        // `_ = &inv` keeps the operand fields live for the not-yet-wired arms.
+        _ => {
+            let _ = &inv;
+            OpStatus::Unimplemented(op)
+        }
+    }
 }
 
 /// Convenience for the ops phase: apply the element modifier to an op's `Vt`
