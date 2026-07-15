@@ -1880,18 +1880,28 @@ unsafe fn dispatch_gfx_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
 /// # Safety
 /// `rdram` valid for the call; `o` a valid task-header offset within it.
 unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
-    AUDIO_UCODE_FN.with(|cell| {
-        if let Some(f) = cell.get() {
-            // Safety: `set_audio_ucode_fn`'s doc comment is the contract --
-            // `f` must be the real translated ucode function. See this
-            // function's doc comment for why `o` (the OSTask rdram offset) is
-            // the second argument, and `AudioUcodeFn`'s doc comment for the
-            // widened meaning.
-            unsafe {
-                f(rdram, o as u32);
+    // Debug/perf escape hatch: `OOT_SKIP_AUDIO_UCODE` skips running the
+    // recompiled audio ucode (the per-frame RSP synth, currently unoptimized
+    // and the dominant per-swap cost). The CPU-side audio driver
+    // (AudioThread_UpdateImpl) and this task's completion event still run, so
+    // the audio-reset handshake that unblocks Play_Init still completes -- the
+    // ucode only produces the actual samples. Use it to iterate on the RENDERER
+    // at normal boot speed; a real audio run must NOT set it. No sound when set.
+    let skip_ucode = std::env::var_os("OOT_SKIP_AUDIO_UCODE").is_some();
+    if !skip_ucode {
+        AUDIO_UCODE_FN.with(|cell| {
+            if let Some(f) = cell.get() {
+                // Safety: `set_audio_ucode_fn`'s doc comment is the contract --
+                // `f` must be the real translated ucode function. See this
+                // function's doc comment for why `o` (the OSTask rdram offset) is
+                // the second argument, and `AudioUcodeFn`'s doc comment for the
+                // widened meaning.
+                unsafe {
+                    f(rdram, o as u32);
+                }
             }
-        }
-    });
+        });
+    }
     AUDIO_BACKEND.with(|cell| {
         if let Some(backend) = cell.borrow_mut().as_mut() {
             let rdram_len = AUDIO_RDRAM_LEN.with(|cell| cell.get());
