@@ -41,7 +41,7 @@ pub use decoder::{decode, Instruction};
 pub use emit::{
     emit_function, emit_function_resolved, CallResolver, CallTarget, FuncInput, NullResolver,
 };
-pub use module::{emit_module, ModuleFunc, SymbolEntry, SymbolTable};
+pub use module::{emit_module, ModuleFunc, SymbolTable};
 pub use runtime::{
     round_ties_even_f32, round_ties_even_f64, Rdram, RecompContext, RDRAM_LEN, RDRAM_VBASE,
 };
