@@ -4,7 +4,8 @@ members = [
     "crates/fn64-runtime",
     "crates/fn64-abi",
     "crates/fn64-shell",
-    "crates/fn64-rt64",
+    "crates/fn64-render",
+    "crates/fn64-render-rt64",
 ]
 
 [workspace.package]

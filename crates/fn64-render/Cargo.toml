@@ -1,0 +1,9 @@
+[package]
+name = "fn64-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RenderBackend trait: the graphics seam per docs/DECOUPLING.md. Zero backend here -- see fn64-render-rt64."
+
+[dependencies]

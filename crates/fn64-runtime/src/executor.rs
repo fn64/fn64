@@ -131,6 +131,18 @@ impl Executor {
         self.sim_time
     }
 
+    /// `osSetTime(OSTime time)` -- per the public libultra manual, sets the
+    /// system's current time counter. This crate has no wall-clock (only
+    /// virtual `sim_time`, per `docs/DESIGN.md`'s explicit "no wall-clock in
+    /// core" rule), so `osGetTime`'s counterpart reads `sim_time()` and this
+    /// setter reassigns it directly -- the same virtual-clock value both
+    /// `osGetTime`/`osSetTime` and the VI-tick/timer-wheel machinery share,
+    /// matching real hardware's single free-running counter both the OS
+    /// timer API and (indirectly) count-based scheduling read from.
+    pub fn set_sim_time(&mut self, time: u64) {
+        self.sim_time = time;
+    }
+
     // ---- OSThread lifecycle -------------------------------------------
 
     /// `osCreateThread(t, id, entry, arg, stack_top, pri)`. Does not make
@@ -195,6 +207,28 @@ impl Executor {
     pub fn destroy_thread(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.get_mut(&id) {
             thread.set_state(ThreadState::Dead);
+        }
+        self.run_queue.retain(|t| *t != id);
+        if self.running == Some(id) {
+            self.running = None;
+        }
+    }
+
+    /// `osStopThread(t)` -- per the public libultra manual's Thread Manager
+    /// section, distinct from `osDestroyThread`: removes the thread from
+    /// the run queue (it stops being scheduled) but does NOT tear down its
+    /// identity/stack the way destroy does -- a stopped thread can be
+    /// `osStartThread`'d again later, matching real hardware's documented
+    /// "stop, don't destroy" semantics. Implemented as the same run-queue
+    /// removal `destroy_thread` does, but setting `ThreadState::Stopped`
+    /// (the same state `osCreateThread` itself starts a thread in, per
+    /// `GameThread::new`) rather than `Dead`, and leaving
+    /// `HostState::thread_handles`' identity mapping untouched (that's
+    /// `fn64-abi`'s concern, not this module's -- `destroy_thread` doesn't
+    /// touch it either).
+    pub fn stop_thread(&mut self, id: ThreadId) {
+        if let Some(thread) = self.threads.get_mut(&id) {
+            thread.set_state(ThreadState::Stopped);
         }
         self.run_queue.retain(|t| *t != id);
         if self.running == Some(id) {

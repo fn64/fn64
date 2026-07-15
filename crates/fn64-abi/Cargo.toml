@@ -14,8 +14,22 @@ crate-type = ["lib", "staticlib"]
 
 [dependencies]
 fn64-runtime = { path = "../fn64-runtime" }
+# The RenderBackend trait ONLY (docs/DECOUPLING.md) -- fn64-abi routes the
+# gfx half of osSpTaskYielded_recomp through `dyn RenderBackend`, exactly
+# like the audio half already routes through the registered
+# `AudioUcodeFn`. This crate never depends on a concrete backend crate
+# (fn64-render-rt64); the shell registers whichever `Box<dyn RenderBackend>`
+# it constructed, keeping fn64-abi backend-agnostic.
+fn64-render = { path = "../fn64-render" }
 # Needed to name `corosensei::Yielder<Resume, Yield>`'s type directly (the
 # active-coroutine-suspend plumbing in src/lib.rs) -- same crate/version
 # fn64-runtime uses, per docs/DESIGN.md section 2's single stackful-
 # coroutine model; not a second, competing coroutine implementation.
 corosensei = "0.3"
+
+[dev-dependencies]
+# Only for a test proving the gfx-task seam actually reaches a real backend
+# end-to-end (not just the trait in isolation) -- never a non-test
+# dependency, keeping fn64-abi's real dependency graph backend-agnostic per
+# docs/DECOUPLING.md.
+fn64-render-rt64 = { path = "../fn64-render-rt64" }

@@ -97,6 +97,33 @@ impl Rdram {
         }
     }
 
+    /// `Rdram::new`, but with the buffer extended (if needed) to cover the
+    /// `0xA4xxxxxx` hardware-register window `mmio.rs` models
+    /// (`RDRAM_MMIO_WINDOW_END`) -- what a caller that expects generated
+    /// code to issue RAW `MEM_W`/`MEM_H`/`MEM_B` loads/stores against MMIO
+    /// addresses (not exclusively through an `osXxx_recomp` shim) must use
+    /// instead of plain `new`, per `mmio.rs`'s module doc: a raw guest load
+    /// at e.g. `AI_STATUS` is a real, out-of-bounds pointer dereference
+    /// against a buffer sized only for RDRAM proper (see
+    /// `docs/BOOT-NOTES-WM2000.md`'s exact LLDB-confirmed crash this
+    /// constructor exists to make survivable). `size` should still be at
+    /// least `DEFAULT_RDRAM_SIZE` for normal RDRAM content; this only grows
+    /// the buffer, never shrinks it below `size`.
+    ///
+    /// The caller is still responsible for calling
+    /// `MmioSpace::sync_into_rdram(rdram.as_mut_ptr())` at the right points
+    /// (see that method's doc comment) -- this constructor only guarantees
+    /// the byte range is safely addressable, not that it holds live values
+    /// yet (a fresh buffer reads as zero, which happens to already satisfy
+    /// `AI_STATUS`'s "not busy, not full" idle default -- see
+    /// `mmio.rs::AiRegs::status` -- but callers should not rely on that
+    /// coincidence for registers whose idle-zero value isn't itself the
+    /// correct default, e.g. `SpRegs::status`'s halted+broke bits).
+    pub fn new_with_mmio(size: usize) -> Self {
+        let size = size.max(crate::mmio::RDRAM_MMIO_WINDOW_END as usize);
+        Rdram::new(size)
+    }
+
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
@@ -200,6 +227,27 @@ impl Default for Rdram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_with_mmio_covers_the_real_crash_address() {
+        // The exact address docs/BOOT-NOTES-WM2000.md's LLDB backtrace
+        // named: a raw guest lw at AI_STATUS (0xA450000C) must be an
+        // in-bounds read, not a panic, once backed by new_with_mmio.
+        let rdram = Rdram::new_with_mmio(DEFAULT_RDRAM_SIZE);
+        let addr = RdramAddr::from_gpr(0xA450_000C);
+        assert!(
+            (addr.offset() as usize) + 4 <= rdram.len(),
+            "new_with_mmio must size the buffer to cover the real AI_STATUS offset"
+        );
+        // Does not panic -- this is the actual regression test.
+        let _ = rdram.read_w(addr);
+    }
+
+    #[test]
+    fn new_with_mmio_never_shrinks_below_requested_size() {
+        let rdram = Rdram::new_with_mmio(64 * 1024 * 1024);
+        assert!(rdram.len() >= 64 * 1024 * 1024);
+    }
 
     #[test]
     fn rdram_addr_from_gpr_matches_plain_32_bit() {

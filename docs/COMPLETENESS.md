@@ -1,0 +1,333 @@
+# fn64 runtime completeness vs N64ModernRuntime (NMR)
+
+Living document. Parity target = N64ModernRuntime's (GPL, `aki-recomp/vendor/
+N64ModernRuntime`) public `_recomp` shim surface — the reimplementation of
+libultra that generated `RecompiledFuncs/*.c` links against. Read-only,
+clean-room extraction: this doc cites **function names and subsystem
+grouping only**, mechanically pulled from `librecomp/src/*.cpp` **signatures**
+(not bodies) plus N64Recomp's own MIT `symbol_lists.cpp`/`recomp.h`, via
+`aki-recomp/runtime/abi_surface.json` + `ABI-SURFACE.md`. No NMR implementation
+logic was read or is described here.
+
+Regenerate the counts in this doc from:
+- `aki-recomp/runtime/abi_surface.json` (`symbol_lists_cpp_union.reimplemented_funcs`,
+  `a_extern_functions.recomp_shims_*`) — the 116-name canonical shim set + which
+  are reached by NWXE/NW4E's current generated corpus.
+- `fn64/crates/fn64-abi/src/lib.rs` — grep for `_recomp(` definitions.
+- `aki-recomp/runtime/m1_worklist.json` — WM2000 (NWXE) trial-link gate.
+- `aki-recomp/games/*/profile.toml` — per-game boot-rung progress.
+
+Last regenerated: 2026-07-14.
+
+## Method note on the "116"
+
+N64Recomp's `symbol_lists.cpp` (MIT, vendored under `refs/N64RecompSource`)
+declares a `reimplemented_funcs` list of **116** libultra symbol names N64Recomp
+is *capable* of reimplementing when a ROM address gets renamed to one during
+profiling. This is the right denominator for "NMR's full shim set" — it's
+NMR's own declared reimplementation surface, not an artifact of how far any
+one game's boot has progressed. A prior informal count of "~121" was in the
+right ballpark but slightly off; **116 is the byte-verified number** as of
+this extraction (`len(reimplemented_funcs) == 116`).
+
+Separately, `symbol_lists.cpp` also lists **384** `ignored_funcs` (codegen
+skips these entirely — no host impl ever needed, e.g. no-op profiling hooks)
+and **83** `renamed_funcs` (mapped straight to host libc/libm — `memcpy`,
+`sqrtf`, `sprintf`, etc. — trivial by construction, not counted against fn64
+here). Neither list is part of the parity gap.
+
+## 1. The 116 by subsystem
+
+| Subsystem | Count | Names |
+|---|---|---|
+| core/OS | 28 | `__osInitialize_common`, `osInitialize`, `osGetMemSize`, `osSetIntMask`, `__osDisableInt`, `__osRestoreInt`, `osVirtualToPhysical`, `osGetCount`, `osSetCount`, `__osSetFpcCsr`, `osInvalDCache`, `osInvalICache`, `osWritebackDCache`, `osWritebackDCacheAll`, `is_proutSyncPrintf`, `__checkHardware_msp`, `__checkHardware_kmc`, `__checkHardware_isv`, `__osInitialize_msp`, `__osInitialize_kmc`, `__osInitialize_isv`, `__osRdbSend`, `__ull_div`, `__ll_div`, `__ll_mul`, `__ull_rem`, `__ull_to_d`, `__ull_to_f` |
+| Thread scheduler | 7 | `osCreateThread`, `osStartThread`, `osStopThread`, `osDestroyThread`, `osSetThreadPri`, `osGetThreadPri`, `osGetThreadId` |
+| Message queue | 5 | `osCreateMesgQueue`, `osRecvMesg`, `osSendMesg`, `osJamMesg`, `osSetEventMesg` |
+| Timer | 4 | `osGetTime`, `osSetTime`, `osSetTimer`, `osStopTimer` |
+| PI/ROM DMA | 8 | `osCartRomInit`, `osCreatePiManager`, `osPiReadIo`, `osPiStartDma`, `osEPiStartDma`, `osPiGetStatus`, `osEPiRawStartDma`, `osEPiReadIo` |
+| SI / Controller | 6 | `osContInit`, `osContStartReadData`, `osContGetReadData`, `osContStartQuery`, `osContGetQuery`, `osContSetCh` (`__osSiRawStartDma` is a `recomp.h`-adjacent low-level primitive counted with core dispatch, not in this 116 — see below) |
+| EEPROM | 5 | `osEepromProbe`, `osEepromWrite`, `osEepromLongWrite`, `osEepromRead`, `osEepromLongRead` |
+| Flash | 13 | `osFlashInit`, `osFlashReadStatus`, `osFlashReadId`, `osFlashClearStatus`, `osFlashAllErase`, `osFlashAllEraseThrough`, `osFlashSectorErase`, `osFlashSectorEraseThrough`, `osFlashCheckEraseEnd`, `osFlashWriteBuffer`, `osFlashWriteArray`, `osFlashReadArray`, `osFlashChange` |
+| Controller Pak (PFS) | 7 | `osPfsInitPak`, `osPfsFreeBlocks`, `osPfsAllocateFile`, `osPfsDeleteFile`, `osPfsFileState`, `osPfsFindFile`, `osPfsReadWriteFile` |
+| Rumble Pak | 4 | `__osMotorAccess`, `osMotorInit`, `osMotorStart`, `osMotorStop` |
+| AI (audio) | 4 | `osAiGetLength`, `osAiGetStatus`, `osAiSetFrequency`, `osAiSetNextBuffer` |
+| VI/DP (video) | 11 | `osViSetXScale`, `osViSetYScale`, `osCreateViManager`, `osViBlack`, `osViSetSpecialFeatures`, `osViGetCurrentFramebuffer`, `osViGetNextFramebuffer`, `osViSwapBuffer`, `osViSetMode`, `osViSetEvent`, `osDpSetNextBuffer` |
+| RSP/SP (gfx task) | 5 | `osSpTaskLoad`, `osSpTaskStartGo`, `osSpTaskYield`, `osSpTaskYielded`, `__osSpSetPc` |
+| Voice (ISV debug) | 9 | `osVoiceSetWord`, `osVoiceCheckWord`, `osVoiceStopReadData`, `osVoiceInit`, `osVoiceMaskDictionary`, `osVoiceStartReadData`, `osVoiceControlGain`, `osVoiceGetReadData`, `osVoiceClearDictionary` |
+| **Total** | **116** | |
+
+Plus 3 non-libultra **codegen dispatch helpers** declared in `recomp.h` itself
+(not part of the 116, but part of the real link surface every recompiled
+function needs): `get_function`, `switch_error`, `do_break`. And
+`__osSiRawStartDma` — heavily called (26x in both games) but is a `recomp.h`-
+adjacent low-level SI primitive, tracked here under "SI / Controller" for
+subsystem purposes even though it sits slightly outside the strict 116-name
+`symbol_lists.cpp` set.
+
+## 2 & 3. Per-shim status matrix
+
+Status: **REAL** = implemented and exercised by at least one passing
+fn64-abi test/boot run. **TRAP** = named, present, deliberately loud
+`unimplemented!()` (or a real partial with an unimplemented branch).
+**ABSENT** = no `_recomp` symbol defined in fn64-abi at all.
+
+Reaches column: which games' *currently generated* `RecompiledFuncs` corpus
+calls this shim, per `abi_surface.json`'s cross-reference (not "could a game
+theoretically need this" — "does a real call site exist today"). REACHABLE =
+✓ in at least one column.
+
+- **WM2000 (NWXE)**: M1-WORKLIST tier (T1/T2) shown where applicable — this
+  is the trial-link-verified undefined-symbol gate (`m1_worklist.json`,
+  23/23 match confirmed).
+- **No Mercy (NW4E)**: ✓ if `abi_surface.json` shows a real call site in
+  NW4E's generated corpus.
+- **OoT (OOTU)**: bring-up in progress (task in flight); `RecompiledFuncs`
+  exist but have **not yet been trial-linked** against fn64-abi (no
+  undefined-symbol gate run yet, unlike WM2000's M1). Column left as
+  **TBD** throughout — do not read blank/TBD as "not needed by OoT," only as
+  "not yet measured."
+
+| Shim (`_recomp`) | Subsystem | fn64 status | WM2000 | No Mercy | OoT | Reachable |
+|---|---|---|---|---|---|---|
+| `get_function` | dispatch | REAL | T1 | ✓ | TBD | ✓ |
+| `switch_error` | dispatch | REAL | T1 | ✓ | TBD | ✓ |
+| `do_break` | dispatch | REAL | T1 | ✓ (NW4E has 0 call sites currently) | TBD | ✓ |
+| `osInitialize` | core/OS | REAL (no-op) | T1 | ✓ | TBD | ✓ |
+| `osSetIntMask` | core/OS | REAL | T1 | ✓ | TBD | ✓ |
+| `osVirtualToPhysical` | core/OS | REAL | T1 | ✓ | TBD | ✓ |
+| `__osInitialize_common` | core/OS | ABSENT | – | – | TBD | – |
+| `osGetMemSize` | core/OS | ABSENT | – | – | TBD | – |
+| `__osDisableInt` | core/OS | ABSENT | – | – | TBD | – |
+| `__osRestoreInt` | core/OS | ABSENT | – | – | TBD | – |
+| `osGetCount` | core/OS | ABSENT | – | – | TBD | – |
+| `osSetCount` | core/OS | ABSENT | – | – | TBD | – |
+| `__osSetFpcCsr` | core/OS | ABSENT | – | – | TBD | – |
+| `osInvalDCache` | core/OS | ABSENT | – | – | TBD | – |
+| `osInvalICache` | core/OS | ABSENT | – | – | TBD | – |
+| `osWritebackDCache` | core/OS | ABSENT | – | – | TBD | – |
+| `osWritebackDCacheAll` | core/OS | ABSENT | – | – | TBD | – |
+| `is_proutSyncPrintf` | core/OS | ABSENT | – | – | TBD | – |
+| `__checkHardware_msp/kmc/isv` (×3) | core/OS | ABSENT | – | – | TBD | – |
+| `__osInitialize_msp/kmc/isv` (×3) | core/OS | ABSENT | – | – | TBD | – |
+| `__osRdbSend` | core/OS | ABSENT | – | – | TBD | – |
+| `__ull_div/__ll_div/__ll_mul/__ull_rem/__ull_to_d/__ull_to_f` (×6) | core/OS | ABSENT | – | – | TBD | – |
+| `osCreateThread` | thread | REAL | T1 | ✓ | TBD | ✓ |
+| `osStartThread` | thread | REAL | T1 | ✓ | TBD | ✓ |
+| `osSetThreadPri` | thread | REAL | T1 | – (NWXE only today) | TBD | ✓ |
+| `osGetThreadPri` | thread | REAL | – (no direct call site in M1 set) | – | TBD | ✓ (fn64-abi built it ahead of a proven call site) |
+| `osStopThread` | thread | ABSENT | – | – | TBD | – |
+| `osDestroyThread` | thread | ABSENT | – | – | TBD | – |
+| `osGetThreadId` | thread | ABSENT | – | – | TBD | – |
+| `osCreateMesgQueue` | mesgq | REAL | – (NWXE only today) | – | TBD | ✓ |
+| `osSendMesg` | mesgq | REAL | – (NWXE only today) | – | TBD | ✓ |
+| `osRecvMesg` | mesgq | REAL | T1 | ✓ | TBD | ✓ |
+| `osSetEventMesg` | mesgq | REAL | T2 | ✓ | TBD | ✓ |
+| `osJamMesg` | mesgq | ABSENT | – | – | TBD | – |
+| `osSetTimer` | timer | REAL (unverified donor cite, see M1-WORKLIST #23) | T2 | ✓ | TBD | ✓ |
+| `osGetTime` | timer | ABSENT | – | – | TBD | – |
+| `osSetTime` | timer | ABSENT | – | – | TBD | – |
+| `osStopTimer` | timer | ABSENT | – | – | TBD | – |
+| `osCartRomInit` | PI/ROM | REAL | T1 | – (NWXE only today) | TBD | ✓ |
+| `osCreatePiManager` | PI/ROM | REAL | T1 | ✓ | TBD | ✓ |
+| `osEPiStartDma` | PI/ROM | **PARTIAL** (OS_READ real; OS_WRITE branch is a loud `unimplemented!()` — no cartridge-domain write backing store yet) | T1 | – (NWXE only today) | TBD | ✓ |
+| `osPiReadIo` | PI/ROM | ABSENT | – | – | TBD | – |
+| `osPiStartDma` | PI/ROM | ABSENT | – | – | TBD | – |
+| `osPiGetStatus` | PI/ROM | ABSENT | – | – | TBD | – |
+| `osEPiRawStartDma` | PI/ROM | ABSENT | – | – | TBD | – |
+| `osEPiReadIo` | PI/ROM | ABSENT | – | – | TBD | – |
+| `__osSiRawStartDma` | SI/cont | REAL | T1 | ✓ | TBD | ✓ |
+| `osContInit` | SI/cont | ABSENT | – | – | TBD | – |
+| `osContStartReadData` | SI/cont | ABSENT | – | – | TBD | – |
+| `osContGetReadData` | SI/cont | ABSENT | – | – | TBD | – |
+| `osContStartQuery` | SI/cont | ABSENT | – | – | TBD | – |
+| `osContGetQuery` | SI/cont | ABSENT | – | – | TBD | – |
+| `osContSetCh` | SI/cont | ABSENT | – | – | TBD | – |
+| `osEeprom*` (×5) | EEPROM | ABSENT (all 5) | – | – | TBD | – |
+| `osFlash*` (×13) | Flash | ABSENT (all 13) | – | – | TBD | – |
+| `osPfs*` (×7) | PFS/Pak | ABSENT (all 7) | – | – | TBD | – |
+| `__osMotorAccess`/`osMotor*` (×4) | Rumble | ABSENT (all 4) | – | – | TBD | – |
+| `osAiSetFrequency` | AI | REAL | T1 | ✓ | TBD | ✓ |
+| `osAiGetLength` | AI | ABSENT | – | – | TBD | – |
+| `osAiGetStatus` | AI | ABSENT | – | – | TBD | – |
+| `osAiSetNextBuffer` | AI | ABSENT | – | – | TBD | – |
+| `osCreateViManager` | VI/DP | REAL (no-op) | – | – | TBD | – (no direct `_recomp` call site cited yet either game; fn64 built it ahead) |
+| `osViSetEvent` | VI/DP | REAL | – | – | TBD | – |
+| `osViSetMode` | VI/DP | REAL (state-store only, no display backend) | T2 | – (NWXE only today) | TBD | ✓ |
+| `osViSetSpecialFeatures` | VI/DP | REAL (state-store only) | T2 | – (NWXE only today) | TBD | ✓ |
+| `osViSetYScale` | VI/DP | REAL (state-store only) | T2 | – (NWXE only today) | TBD | ✓ |
+| `osViSwapBuffer` | VI/DP | REAL (state-store + framebuffer-addr capture only, **no pixels rendered** — see fn64-rt64 below) | T2 | – (NWXE only today) | TBD | ✓ |
+| `osViBlack` | VI/DP | REAL (state-store only) | T2 | – (NWXE only today) | TBD | ✓ |
+| `osViSetXScale` | VI/DP | ABSENT | – | – | TBD | – |
+| `osViGetCurrentFramebuffer` | VI/DP | ABSENT | – | – | TBD | – |
+| `osViGetNextFramebuffer` | VI/DP | ABSENT | – | – | TBD | – |
+| `osDpSetNextBuffer` | VI/DP | ABSENT | – | – | TBD | – |
+| `osSpTaskYielded` | RSP/SP | REAL | T1 | ✓ | TBD | ✓ |
+| `osSpTaskLoad` | RSP/SP | ABSENT | – | – | TBD | – |
+| `osSpTaskStartGo` | RSP/SP | ABSENT (gfx task handoff — no real call site seen in either game's corpus yet either, per ABI-SURFACE.md open question) | – | – | TBD | – |
+| `osSpTaskYield` | RSP/SP | ABSENT | – | – | TBD | – |
+| `__osSpSetPc` | RSP/SP | ABSENT | – | – | TBD | – |
+| `osVoice*` (×9) | Voice/ISV | ABSENT (all 9 — debug-hardware only, no target game needs these) | – | – | TBD | – |
+
+## 4. Headline numbers
+
+- **fn64 REAL / NMR total: 24 / 116** (20.7%) — counting `osEPiStartDma` as
+  not-REAL since its OS_WRITE branch is a genuine unimplemented trap, not
+  full parity. Add `get_function`/`switch_error`/`do_break` (3 dispatch
+  helpers, not part of the 116 but part of the real link surface) → **27/119**
+  if counting the dispatch trio.
+- **fn64 REAL / REACHABLE (parity-for-purpose): 24 / 22*** — *fn64 has
+  already built slightly MORE than the current reachable set (`osGetThreadPri`,
+  `osCreateViManager`, `osViSetEvent` have no proven call site yet in either
+  game's corpus but are already REAL) — so this ratio exceeds 100%. The
+  cleaner statement: **22/22 of shims proven load-bearing by a real call
+  site today are REAL or at-least-partial** (only `osEPiStartDma`'s write
+  path is a live gap inside an otherwise-reached shim). **0 REACHABLE shims
+  are fully ABSENT.**
+- This is the number that matters for "are we blocked on WM2000/No Mercy
+  boot": **not blocked on shim coverage today** — every M1-WORKLIST symbol
+  (23/23) is implemented, `osEPiStartDma`'s remaining gap (write DMA) has no
+  proven call site yet either (11 NWXE call sites all currently read-only per
+  ROM-DMA boot pattern).
+- OoT's column is **TBD across the board** — it has NOT yet been
+  trial-linked (no undefined-symbol gate run), so it cannot yet move any
+  shim from "not reachable" to "reachable." This is the single biggest
+  known-unknown in this matrix; landing OoT's trial link is the next action
+  that would fill in real ✓/– data instead of TBD placeholders.
+
+## 2026-07-14 update: MMIO backing + save layer + batch shims
+
+This wave closed three items from the prioritized gap list below and the
+WM2000 AI_STATUS crash the "reachable shim" sweep flagged:
+
+- **MMIO register backing (new `fn64_runtime::mmio` module).** WM2000's
+  actual crash was NOT a missing `_recomp` shim call — it was a **raw guest
+  `lw`** (`lui $v0,0xA450; ori $v0,$v0,0xC; lw $v0,0($v0)`, an inlined
+  `MEM_W` read of `AI_STATUS`) with no shim in the call chain at all,
+  confirmed via LLDB (`docs/BOOT-NOTES-WM2000.md`'s exact backtrace). Fixed
+  by: (a) `MmioSpace` (AI/VI/PI/SI/SP/DP/MI register models, faithful
+  "not-busy/not-full" idle defaults so a polling loop never deadlocks), (b)
+  `Rdram::new_with_mmio`, which sizes the backing buffer to cover the real
+  `0xA4xxxxxx` KSEG1 window (`RDRAM_MMIO_WINDOW_END`) instead of a bare
+  8 MB buffer, and (c) `MmioSpace::sync_into_rdram`, called before boot and
+  before each scheduling step in `examples/wm2000-boot`, which writes
+  live register values into those real bytes so a raw guest load observes
+  them. Regression test (`mmio::tests::sync_into_rdram_backs_a_raw_guest_ai_status_load`)
+  reproduces the exact crash address (`RdramAddr::from_gpr(0xA450_000C) ==
+  0x2450_000C`) and asserts it's now a safe, correctly-valued read.
+- **Save layer (new `fn64_runtime::save` module).** `SaveStorage` trait
+  (mirrors `rom.rs::RomStorage`'s "trait seam + real impl at the edge"
+  shape) plus `InMemorySaveStorage` (tests/ephemeral runs) and
+  `FileSaveStorage` (real, flush-per-write, per-game save file). Block/page/
+  erase helpers for EEPROM (8-byte blocks), FlashRAM (4 KiB erase sectors,
+  128-byte pages), and Controller Pak/PFS (32-byte pages) — erased state is
+  the real hardware `0xFF` fill, not a fabricated zero. No `_recomp` shims
+  wired to this yet (no boot rung has reached save-data code in either
+  game's corpus today — this is the backing layer ready for when one does,
+  per this doc's own "don't build ahead of evidence" discipline elsewhere).
+- **Batch shim close (matrix-guided, REACHABLE-only).** Swept
+  `aki-recomp/games/*/RecompiledFuncs/funcs_*.c` for real `<sym>_recomp(`
+  call sites (not just declared `funcs.h`/`recomp_overlays.inl` slots) across
+  every currently-ABSENT shim in the matrix above. Moved **11 ABSENT →
+  REAL**, all confirmed-reachable in OOTU's generated corpus today:
+  `osAiGetStatus`, `osAiGetLength`, `osAiSetNextBuffer` (AI family — the
+  WM2000 frontier's sibling shims), `osGetMemSize`, `osInvalDCache`,
+  `osInvalICache`, `osWritebackDCache`, `__osDisableInt`, `__osRestoreInt`,
+  `osGetThreadId`, `osGetTime`. Every one backed by machinery this crate
+  already had (`Executor::sim_time`, `resolve_thread_arg`, `Rdram`'s
+  no-cache-model reasoning) — no new host state invented beyond what each
+  shim's own doc comment cites. New headline:
+  **fn64 REAL / NMR total: 35 / 116** (30.2%), up from 24/116.
+  `osWritebackDCacheAll`, `osStopThread`, `osDestroyThread`'s wrapper,
+  `osSetTime`, `osStopTimer`, `osJamMesg`, and the SI/VI-extra families were
+  checked and found to have **zero current real call sites** in any target
+  game's generated corpus — correctly left ABSENT/undone rather than built
+  ahead of evidence, per this doc's own rule. (`Executor::stop_thread`/
+  `set_sim_time` were added as real, tested runtime capability ahead of a
+  shim, matching the same "fn64 built slightly more than reachable"
+  pattern `osGetThreadPri`/`osCreateViManager` already established above —
+  not wired to an ABI shim yet since no call site justifies one.)
+- Full gate: `cargo build/test/clippy --all-targets/fmt --all -- --check`
+  all clean on the main workspace (`examples/wm2000-boot` is its own
+  standalone workspace per its `Cargo.toml` header, gated separately by its
+  own N64Recomp regen + harness run, not `--workspace`).
+
+## The prioritized gap list (parity roadmap)
+
+Ordered by (a) is it reachable today, (b) how many target games need it,
+(c) boot-criticality (T1 > T2 > unreached).
+
+1. **`osEPiStartDma` OS_WRITE branch** (PI/ROM DMA) — the ONE live gap
+   inside an already-reached, T1 shim. WM2000 has 11 call sites today, all
+   observed as reads; a write call site would hard-crash on the
+   `unimplemented!()`. Highest priority: it's the only reachable-but-broken
+   shim in the whole matrix.
+2. **VI real display backend** (VI/DP) — `osViSetMode`/`osViSwapBuffer`/etc.
+   are REAL as *state stores* (per fn64-abi's own module doc: "no real
+   display backend exists yet in this crate") but produce **no pixels**.
+   `fn64-rt64`/`fn64-render` (per `docs/DECOUPLING.md`) is the intended
+   quarantine crate for this and is not yet wired to a real renderer.
+   T2-tier, reached by WM2000 today (5 of the 6 VI/DP shims already have
+   NWXE call sites) — this is the actual "first frame" blocker once boot
+   completes, not a shim-naming gap.
+3. **Controller/SI family** (`osContInit`/`osContStartReadData`/
+   `osContGetReadData`/`osContStartQuery`/`osContGetQuery`/`osContSetCh`,
+   6 shims, ABSENT) — no call site in the *current* generated corpus for
+   either game (boot hasn't reached controller-poll depth yet), but every
+   AKI wrestling title and OoT alike will need this to accept player input
+   past boot. Needed by **all 3** target games eventually — the next
+   subsystem the boot ladder will hit once VI/DP is real.
+4. **RSP gfx task handoff** (`osSpTaskLoad`/`osSpTaskStartGo`/`osSpTaskYield`/
+   `__osSpSetPc`, RSP/SP, ABSENT) — flagged in ABI-SURFACE.md's own "open
+   questions" as a real, unresolved gap: no `_recomp` call site has been
+   observed in either game's corpus yet (only `osSpTaskYielded` is reached).
+   This is the seam `fn64-render`'s trait boundary
+   (`docs/DECOUPLING.md` section "Renderer seam") is designed for but not yet
+   fed a real task. Needed by all 3 games once boot reaches first-frame
+   submission — likely co-blocking with item 2.
+5. **EEPROM** (5 shims, ABSENT) — save-game backing store. Not proven
+   load-bearing by any boot rung yet (boot doesn't touch saves), but every
+   AKI title uses EEPROM for save data and OoT uses it too (or Flash,
+   ROM-dependent) — will surface once boot reaches menu/attract-mode
+   persistence checks.
+6. **Flash** (13 shims, ABSENT) — same save-data role as EEPROM but for
+   cartridges wired to Flash instead (largest single-subsystem gap by shim
+   count, 13). Game-specific which of EEPROM/Flash a given ROM's
+   `profile.toml` needs — check each game's save-type byte before assuming
+   both are required.
+7. **Controller Pak / PFS** (7 shims, ABSENT) — deeper save-data tier
+   (memory card file access) than EEPROM/Flash; lower priority than both
+   since it requires a Controller Pak to be "inserted," an optional path
+   most titles gate behind a menu, not boot.
+8. **Rumble Pak** (4 shims, ABSENT) — cosmetic/optional; no boot or core
+   gameplay path depends on it. Lowest priority of the "real accessory"
+   subsystems.
+9. **Voice/ISV debug family** (9 shims, ABSENT) — debug-hardware-only
+   (ISV64 dev unit); no shipping game path calls into this on real
+   hardware. Correctly deprioritized to the bottom — likely never needed for
+   any of the 3 target games.
+10. **Remaining core/OS stragglers** (`osGetThreadId`/`osStopThread`/
+    `osDestroyThread`/`osJamMesg`/`osGetTime`/`osSetTime`/`osStopTimer`/
+    cache-management family/ISV hardware-check family/64-bit division
+    helpers, ~20 shims, ABSENT) — none proven load-bearing by any boot rung
+    yet in either game. Revisit if/when a boot rung's crash trail names one
+    specifically (same discipline `m1_worklist.json` used for the current
+    23) — don't speculatively build ahead of evidence.
+
+## Known caveats on this doc's honesty
+
+- The WM2000/No Mercy "reaches" columns reflect **today's generated corpus**,
+  not the full ROM. As more of each game's `profile.toml` gets renamed
+  (more functions RE'd → renamed → recompiled), previously-ABSENT-and-
+  unreached shims can newly become reachable. This doc will go stale the
+  moment a new rename wave lands — regenerate from `abi_surface.json`
+  rather than trusting this snapshot indefinitely.
+- OoT's column is placeholder TBD, not "OoT needs nothing else" — it is
+  the single largest unknown here and should be the next input to
+  regenerate this doc once its trial link lands (task in flight).
+- "REAL" here means "implemented, wired into the executor, and exercised by
+  at least one test/boot run" per fn64-abi's own module-doc citations — not
+  independently re-verified byte-exact against real hardware behavior in
+  this pass. Several (`osSetTimer`, `osEPiStartDma`'s field-offset
+  assumptions) are explicitly flagged by fn64-abi's own comments as
+  unverified against a byte-donor and should be treated with the same
+  "verify before trusting" discipline as any other unconfirmed RE claim.

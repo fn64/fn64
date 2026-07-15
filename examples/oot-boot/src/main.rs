@@ -1,24 +1,34 @@
-//! WM2000 (NWXE) headless boot harness on fn64. See `build.rs`'s module
-//! doc for the `RECOMPILED_DIR`/`RECOMP_H_DIR`/`ROM` env-var contract this
-//! binary requires -- this crate itself contains zero game content, per
-//! `fn64/README.md`.
+//! OoT (OOTU, NTSC 1.0) headless boot harness on fn64 -- the decomp-driven-
+//! first recompilation lane (aki-recomp/games/OOTU). See `build.rs`'s
+//! module doc for the `RECOMPILED_DIR`/`RECOMP_H_DIR`/`ROM` env-var
+//! contract this binary requires -- this crate itself contains zero game
+//! content, per `fn64/README.md`. Structurally identical to
+//! `examples/wm2000-boot/src/main.rs`; only the always-resident section
+//! set and the audio-ucode stand-in's doc comment differ (see below) --
+//! this is the "does fn64 generalize past the AKI titles" test, so
+//! deliberately reusing the SAME harness code proves that, rather than a
+//! bespoke per-game rewrite.
 //!
 //! ## What this does
 //!
-//! 1. Loads the user's own ROM file (`ROM` env var) into `fn64_abi::load_rom`.
+//! 1. Loads the decomp's OWN BUILD-OUTPUT ROM (`ROM` env var -- NOT the
+//!    retail compressed cartridge image, see build.rs's module doc) into
+//!    `fn64_abi::load_rom`.
 //! 2. Registers every section from the real, out-of-tree-compiled
 //!    `recomp_overlays.inl` (via `bridge/section_bridge.c`'s FFI walk into
 //!    `fn64_register_func`, below) with `fn64_abi::register_section`, then
-//!    marks the always-resident sections (0/1, per the generated table --
-//!    `docs/DESIGN.md`/`fn64_runtime::overlay`'s doc: entry+main) loaded.
+//!    marks the always-resident sections (0/1/2 -- makerom.ent/boot/code,
+//!    per OoT's OWN linker `.map`: everything before the 469 `ovl_*` actor/
+//!    scene overlays, which are heap-loaded on demand via DmaMgr at
+//!    runtime, NOT pre-mapped at boot -- see games/OOTU/profile.toml's
+//!    `[segments]` section) loaded.
 //! 3. Boots thread 0 running `recomp_entrypoint` (the real, linked
 //!    generated symbol) and drives the executor: `run_one_step` while
 //!    runnable, `advance_virtual_time` (which fires the armed VI retrace
 //!    ticker) when idle, for a bounded number of virtual-time ticks.
 //! 4. On every `osViSwapBuffer_recomp` call (observed via
 //!    `fn64_abi::vi_swap_count()` polling), hashes the pointed-to
-//!    framebuffer region and dumps it as a PNG if non-uniform (Task
-//!    requirement 3).
+//!    framebuffer region and dumps it as a PNG if non-uniform.
 //! 5. Emits the trace log to a file and prints a summary ladder.
 
 use std::collections::HashMap;
@@ -77,61 +87,52 @@ thread_local! {
         std::cell::RefCell::new(SectionBuilder::default());
 }
 
-/// Real translated audio ucode stand-in. The GENUINE
-/// `wm2000_audio_ucode` (RSPRecomp-generated, `aki-recomp/games/NWXE/rsp/
-/// wm2000_audio.cpp`) `#include`s `librecomp/rsp.hpp`, which lives under
-/// `N64ModernRuntime`'s GPL-3.0-licensed tree (verified directly: that
-/// repo's top-level `COPYING` is GPL-3.0; `librecomp/rsp.hpp` is NOT under
-/// the MIT-carved-out `N64Recomp/` subdirectory) -- linking it into this
-/// MIT/Apache-2.0 example would violate `fn64/AGENTS.md`'s clean-room
-/// protocol ("Disallowed: reading GPL runtime implementation code... Not
-/// for 'inspiration'"). This is a REAL FINDING, reported honestly rather
-/// than routed around: RSPRecomp's own codegen template (verified in
-/// `N64RecompSource/RSPRecomp/src/rsp_recomp.cpp:1179`) unconditionally
-/// emits `#include "librecomp/rsp.hpp"` into every ucode it generates, so
-/// this is not a per-game choice -- using RSPRecomp's generated C at all
-/// requires the GPL runtime header AS SHIPPED.
-///
-/// Until fn64 has its own MIT-clean RSP interpreter (or a from-scratch fork
-/// of RSPRecomp's codegen template targeting fn64-owned headers), this
-/// stand-in exercises the REAL plumbing this wave built
+/// Audio ucode stand-in. No RSPRecomp pass has been run against OoT's audio
+/// microcode in this bring-up (out of scope for the decomp-driven-recompile
+/// gate this harness proves) -- and even if one had been, the same
+/// clean-room blocker `examples/wm2000-boot/src/main.rs` documents applies
+/// identically: RSPRecomp's own codegen template unconditionally
+/// `#include`s the GPL-3.0-licensed `librecomp/rsp.hpp`
+/// (`N64RecompSource/RSPRecomp/src/rsp_recomp.cpp:1179`), disallowed by
+/// `fn64/AGENTS.md`'s clean-room protocol regardless of which game it's
+/// generated for. This stand-in exercises the REAL plumbing
 /// (`fn64_abi::set_audio_ucode_fn`/`osSpTaskYielded_recomp`'s M_AUDTASK
-/// dispatch) without linking the disallowed dependency. It is clearly
-/// NOT the real ucode -- it does nothing to rdram, just proves the call
+/// dispatch) without linking the disallowed dependency or claiming a real
+/// ucode was ported. It does nothing to rdram, just proves the call
 /// happened.
 unsafe extern "C" fn stand_in_audio_ucode(_rdram: *mut u8, ucode_addr: u32) -> u32 {
     eprintln!(
-        "[wm2000-boot] STAND-IN audio ucode invoked for ucode_addr={ucode_addr:#010x} -- NOT the \
-         real wm2000_audio_ucode (see main.rs's doc comment: the real one requires the GPL-3.0 \
-         librecomp/rsp.hpp header, disallowed by AGENTS.md's clean-room protocol). Plumbing is \
-         real; ucode execution is not."
+        "[oot-boot] STAND-IN audio ucode invoked for ucode_addr={ucode_addr:#010x} -- NOT a real \
+         translated ucode (no RSPRecomp pass has been run for OoT in this bring-up; see main.rs's \
+         doc comment for the clean-room reason a real one couldn't be linked in even if it had \
+         been). Plumbing is real; ucode execution is not."
     );
     0
 }
 
 fn env_path(name: &str) -> std::path::PathBuf {
     std::env::var(name)
-        .unwrap_or_else(|_| panic!("wm2000-boot: required environment variable {name} not set"))
+        .unwrap_or_else(|_| panic!("oot-boot: required environment variable {name} not set"))
         .into()
 }
 
 fn main() {
     let rom_path = env_path("ROM");
-    println!("[wm2000-boot] loading ROM from {}", rom_path.display());
+    println!("[oot-boot] loading ROM from {}", rom_path.display());
     let rom_bytes = std::fs::read(&rom_path).unwrap_or_else(|e| {
         panic!(
-            "wm2000-boot: failed to read ROM {}: {e}",
+            "oot-boot: failed to read ROM {}: {e}",
             rom_path.display()
         )
     });
-    println!("[wm2000-boot] ROM size: {} bytes", rom_bytes.len());
+    println!("[oot-boot] ROM size: {} bytes", rom_bytes.len());
     fn64_abi::load_rom(rom_bytes);
 
     // Register every section from the real recomp_overlays.inl via the
     // bridge's C-side walk (populates SECTION_BUILDER via callbacks).
     unsafe { fn64_bridge_register_all_sections() };
     let num_sections = unsafe { fn64_bridge_num_sections() };
-    println!("[wm2000-boot] bridge reports {num_sections} sections in recomp_overlays.inl");
+    println!("[oot-boot] bridge reports {num_sections} sections in recomp_overlays.inl");
 
     let mut section_indices: HashMap<usize, fn64_runtime::SectionIndex> = HashMap::new();
     SECTION_BUILDER.with(|cell| {
@@ -143,24 +144,27 @@ fn main() {
             let idx = unsafe { fn64_abi::register_section(*rom_addr, *ram_addr, *size, funcs) };
             section_indices.insert(key, idx);
             println!(
-                "[wm2000-boot] registered section {key}: rom={rom_addr:#010x} ram={ram_addr:#010x} \
+                "[oot-boot] registered section {key}: rom={rom_addr:#010x} ram={ram_addr:#010x} \
                  size={size:#x} funcs={}",
                 funcs.len()
             );
         }
     });
 
-    // Per fn64_runtime::overlay's module doc: sections 0 (entry) and 1
-    // (main/resident) are always-loaded; the four overlay banks (2-5) are
-    // NOT loaded at boot (they are PI-bank-switched in later, per
-    // overlays.json) -- this milestone does not yet drive that swap, so
-    // only the always-resident sections are marked loaded, matching real
-    // boot-time hardware state (no overlay bank has been PI-mapped in yet
-    // this early).
-    for section_key in [0usize, 1usize] {
+    // OoT's own linker .map (games/OOTU/profile.toml's [segments]) puts
+    // sections 0/1/2 (makerom.ent/boot/code) as the always-resident image;
+    // the remaining 469 are ovl_* actor/scene overlays, each independently
+    // relocated and heap-loaded on demand via DmaMgr at runtime (see
+    // games/OOTU/docs/decomp-import-notes.md's "Overlay/segment structural
+    // note" -- zero vram collisions across all 469, NOT a fixed 2-5-slot
+    // bank-swap region like the AKI titles' overlay design). This harness
+    // does not yet drive DmaMgr's overlay-load path, so only the
+    // always-resident sections are marked loaded, matching real boot-time
+    // hardware state (no actor overlay has been DMA'd in yet this early).
+    for section_key in [0usize, 1usize, 2usize] {
         if let Some(&idx) = section_indices.get(&section_key) {
             fn64_abi::set_section_loaded(idx);
-            println!("[wm2000-boot] marked section {section_key} (index {idx}) loaded");
+            println!("[oot-boot] marked section {section_key} (index {idx}) loaded");
         }
     }
 
@@ -179,35 +183,22 @@ fn main() {
     // call below (which still runs too, on a clean exit, and rewrites the
     // same path from the in-memory copy -- harmless, since by then the
     // incremental sink already has every event that copy will contain).
-    const TRACE_PATH: &str = "/tmp/wm2000-boot-trace.jsonl";
+    const TRACE_PATH: &str = "/tmp/oot-boot-trace.jsonl";
     if let Err(e) = fn64_abi::set_trace_sink_file(TRACE_PATH) {
         eprintln!(
-            "[wm2000-boot] WARNING: failed to arm incremental trace sink at {TRACE_PATH}: {e} -- \
+            "[oot-boot] WARNING: failed to arm incremental trace sink at {TRACE_PATH}: {e} -- \
              a crash mid-boot will lose the trace (falling back to end-of-run-only)."
         );
     } else {
-        println!("[wm2000-boot] incremental trace sink armed at {TRACE_PATH}");
+        println!("[oot-boot] incremental trace sink armed at {TRACE_PATH}");
     }
 
     // rdram: this process's one shared buffer (docs/DESIGN.md section 3).
-    // Sized to also cover the `0xA4xxxxxx` hardware-register window
-    // (`fn64_runtime::RDRAM_MMIO_WINDOW_END`), not just plain RDRAM content
-    // -- this is the fix for the exact crash this harness hit: a raw guest
-    // `lw` at `AI_STATUS` (`0xA450000C`) previously read 4x past an 8 MB
-    // buffer's end (`docs/BOOT-NOTES-WM2000.md`'s LLDB-confirmed
-    // `EXC_BAD_ACCESS`). See `fn64_runtime::mmio`'s module doc for the full
-    // story.
     const RDRAM_SIZE: usize = 8 * 1024 * 1024;
-    let mut rdram = vec![0u8; RDRAM_SIZE.max(fn64_runtime::RDRAM_MMIO_WINDOW_END as usize)];
+    let mut rdram = vec![0u8; RDRAM_SIZE];
     let rdram_ptr = rdram.as_mut_ptr();
 
-    // Prime the MMIO backing bytes before the guest ever runs, so even a
-    // raw load before any host-side register mutation observes the real
-    // idle-hardware defaults (e.g. AI_STATUS not-busy/not-full,
-    // SP_STATUS halted+broke) rather than zeroed memory.
-    unsafe { fn64_abi::sync_mmio_into_rdram(rdram_ptr) };
-
-    println!("[wm2000-boot] booting thread 0 (recomp_entrypoint)...");
+    println!("[oot-boot] booting thread 0 (recomp_entrypoint)...");
     unsafe {
         fn64_abi::boot_thread0(rdram_ptr, recomp_entrypoint, 0, 10);
     }
@@ -239,25 +230,18 @@ fn main() {
     loop {
         if steps >= MAX_STEPS {
             println!(
-                "[wm2000-boot] step budget ({MAX_STEPS}) exhausted at sim_time={} -- stopping \
+                "[oot-boot] step budget ({MAX_STEPS}) exhausted at sim_time={} -- stopping \
                  (this may mean a thread is spinning without truly blocking, or boot just needs \
                  a larger budget)",
                 fn64_abi::sim_time()
             );
             break;
         }
-        // Re-sync the MMIO model's current values into rdram's real bytes
-        // before every step: a coroutine resumed by this step may issue a
-        // raw guest MMIO load (see this file's earlier comment on
-        // RDRAM_SIZE) at any point, and register state like AI_STATUS's
-        // one-shot busy bit can change between steps via an `osAiXxx_recomp`
-        // shim call the PREVIOUS step made.
-        unsafe { fn64_abi::sync_mmio_into_rdram(rdram_ptr) };
         let stepped = fn64_abi::run_one_step();
         steps += 1;
         if steps % LOG_EVERY == 0 {
             println!(
-                "[wm2000-boot] progress: steps={steps} sim_time={} vi_swaps={} gfx_tasks={} \
+                "[oot-boot] progress: steps={steps} sim_time={} vi_swaps={} gfx_tasks={} \
                  audio_tasks={}",
                 fn64_abi::sim_time(),
                 fn64_abi::vi_swap_count(),
@@ -275,7 +259,7 @@ fn main() {
         // real signal, handled by `stepped`/the idle-tick counter below.
         if !thread0_death_logged && fn64_abi::is_thread_dead(0) {
             println!(
-                "[wm2000-boot] thread 0 (recomp_entrypoint) returned at step {steps} -- expected \
+                "[oot-boot] thread 0 (recomp_entrypoint) returned at step {steps} -- expected \
                  (its own initial call chain unwound); other threads keep running"
             );
             thread0_death_logged = true;
@@ -299,7 +283,7 @@ fn main() {
             consecutive_idle_ticks += 1;
             if consecutive_idle_ticks >= IDLE_TICKS_BEFORE_STOP {
                 println!(
-                    "[wm2000-boot] reached a steady idle state ({IDLE_TICKS_BEFORE_STOP} \
+                    "[oot-boot] reached a steady idle state ({IDLE_TICKS_BEFORE_STOP} \
                      consecutive ticks with nothing runnable) at sim_time={} steps={steps} -- \
                      stopping",
                     fn64_abi::sim_time()
@@ -312,28 +296,28 @@ fn main() {
     }
 
     let (gfx_count, audio_count) = fn64_abi::task_counts();
-    println!("[wm2000-boot] === BOOT SUMMARY ===");
-    println!("[wm2000-boot] virtual ticks run: {}", fn64_abi::sim_time());
+    println!("[oot-boot] === BOOT SUMMARY ===");
+    println!("[oot-boot] virtual ticks run: {}", fn64_abi::sim_time());
     println!(
-        "[wm2000-boot] thread 0 dead: {}",
+        "[oot-boot] thread 0 dead: {}",
         fn64_abi::is_thread_dead(0)
     );
     println!(
-        "[wm2000-boot] VI swaps observed: {}",
+        "[oot-boot] VI swaps observed: {}",
         fn64_abi::vi_swap_count()
     );
-    println!("[wm2000-boot] gfx tasks submitted: {gfx_count}");
-    println!("[wm2000-boot] audio tasks submitted: {audio_count}");
+    println!("[oot-boot] gfx tasks submitted: {gfx_count}");
+    println!("[oot-boot] audio tasks submitted: {audio_count}");
     println!(
-        "[wm2000-boot] non-uniform framebuffers dumped: {} ({:?})",
+        "[oot-boot] non-uniform framebuffers dumped: {} ({:?})",
         fb_dumps.len(),
         fb_dumps
     );
 
     let trace = fn64_abi::copy_trace();
-    println!("[wm2000-boot] trace events recorded: {}", trace.len());
+    println!("[oot-boot] trace events recorded: {}", trace.len());
     write_trace_file(&trace, TRACE_PATH);
-    println!("[wm2000-boot] trace written to {TRACE_PATH}");
+    println!("[oot-boot] trace written to {TRACE_PATH}");
 }
 
 /// Hash the fb region (a fixed-size guess: 320x240 RGBA5551 = 153600 bytes,
@@ -352,7 +336,7 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
     let end = start + FB_BYTES;
     if end > rdram.len() {
         eprintln!(
-            "[wm2000-boot] swap #{swap_index}: framebuffer offset {fb_offset:#x} + assumed size \
+            "[oot-boot] swap #{swap_index}: framebuffer offset {fb_offset:#x} + assumed size \
              {FB_BYTES:#x} exceeds rdram bounds ({} bytes) -- skipping capture, not guessing a \
              smaller region",
             rdram.len()
@@ -365,7 +349,7 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
 
     if uniform {
         println!(
-            "[wm2000-boot] swap #{swap_index}: framebuffer at {fb_offset:#010x} is UNIFORM \
+            "[oot-boot] swap #{swap_index}: framebuffer at {fb_offset:#010x} is UNIFORM \
              (all bytes == {first_byte:#04x}) -- reported as blank, not dumped (per task: \"a \
              blank/uniform fb is reported as blank\")."
         );
@@ -373,16 +357,16 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
     }
 
     println!(
-        "[wm2000-boot] swap #{swap_index}: framebuffer at {fb_offset:#010x} is NON-UNIFORM -- \
+        "[oot-boot] swap #{swap_index}: framebuffer at {fb_offset:#010x} is NON-UNIFORM -- \
          dumping PNG."
     );
     let path = format!("/tmp/fn64-fb-{swap_index}.png");
     match dump_rgba5551_as_png(region, FB_WIDTH, FB_HEIGHT, &path) {
         Ok(()) => {
-            println!("[wm2000-boot] *** NON-UNIFORM FRAMEBUFFER DUMPED: {path} ***");
+            println!("[oot-boot] *** NON-UNIFORM FRAMEBUFFER DUMPED: {path} ***");
             dumps.push(path);
         }
-        Err(e) => eprintln!("[wm2000-boot] failed to write {path}: {e}"),
+        Err(e) => eprintln!("[oot-boot] failed to write {path}: {e}"),
     }
 }
 
@@ -501,7 +485,7 @@ fn write_trace_file(trace: &[fn64_runtime::TraceEvent], path: &str) {
     let mut file = match std::fs::File::create(path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("[wm2000-boot] failed to create trace file {path}: {e}");
+            eprintln!("[oot-boot] failed to create trace file {path}: {e}");
             return;
         }
     };

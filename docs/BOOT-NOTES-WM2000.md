@@ -355,3 +355,348 @@ should have prevented `func_80026DE0`'s `osCreateThread`/`osStartThread`
 call from executing in the first place, matching the profile.toml
 precedent of "a discarded return value was actually load-bearing," rung
 10's cart-vs-drive-init correction).
+
+## Session 2026-07-14: leads (a)/(b)/(c) closed, new hypothesis (d) -- DMA race
+
+All three of the prior session's leads are now RULED OUT with direct evidence,
+read-only, no fn64 code changes this session (`cargo build/test/clippy/fmt`
+all still green, untouched from last session's report).
+
+**Lead (b) IPL3/pre-main initializer -- ruled out.** Read `RecompiledFuncs`'
+entry point directly: `func_80000450` (vram 0x80000450, matches
+`aki-recomp/games/NWXE/profile.toml`'s own `main_vram`/`code_start`
+donor-config numbers) IS the first N64Recomp-decompiled function; IPL3
+(`aki-recomp/games/NWXE/disasm/assets/ipl3.bin`) is generic SDK bootcode
+(copy-and-jump only) with no knowledge of a game-specific global like
+`0x800481FC` -- there is no "second init table" to find. Confirmed
+`func_80000460`->`func_80036498` (=`osInitialize`, aki-recomp's own rung-2
+ID) runs right at the top, matching aki-recomp's independently-derived rung-2
+trail byte-for-byte. This lead is closed for good, not just this-session.
+
+**Lead (a) exception vectors -- ruled out by exhaustive raw-ROM word scan.**
+`python3` byte-scan of the WHOLE `wm2000.z64` (not just `RecompiledFuncs/`)
+for the big-endian 32-bit word `0x800236C0` (the writer function's own
+address, as it would appear in ANY jump table, vtable, or lui/addiu-split
+pointer-construction site): **zero hits, anywhere in the ROM.** This is
+stronger than last session's per-file grep -- it covers overlay banks,
+rodata, and any exception-vector region too, since it scans raw bytes, not
+just the resident `RecompiledFuncs/*.c` corpus. `func_800236C0`'s address is
+not stored as data anywhere in this cartridge image. Combined with last
+session's LLDB watchpoint (fired zero times pre-crash) and the call-graph
+grep (zero `jal`/tail-call sites), this closes the "hidden caller" hypothesis
+completely -- not "we didn't find it," but "it structurally isn't there."
+
+**Lead (c) dead/debug thread -- ruled out; this is the AUDIO thread, not a
+debug path.** Cross-referenced `func_80026DE0` (thread-3's creator) against
+aki-recomp's own donor-verified libultra names: `func_80026DE0` calls
+`func_8002B8A0` at asm 0x80026E2C, and aki-recomp's profile.toml has
+INDEPENDENTLY, previously named this exact address
+`func_8002B8A0 = "osAiSetFrequency"` (donor: revenge, prefix+body-verified,
+`games/NWXE/profile.toml:282`) -- confirmed by direct read, not
+re-derived. A function that calls `osAiSetFrequency` while building a thread
+is the game's **audio-manager bring-up**, not a stray debug thread; AKI
+titles are not known to ship audio disabled at retail (audio is core to
+every WWF/WCW AKI title). This node is real, load-bearing, and reached on
+retail hardware every boot. Confirmed the whole call chain from `main()`
+(`func_80000450`) through `func_800038B8`'s `jal func_800228C0` through
+`func_800228C0`'s own `jal func_80026DE0` (asm 0x80022A44) through
+`func_80026DE0`'s `osCreateThread`/`osStartThread` pair is **unconditional
+straight-line code with zero intervening branches at any level** (read all
+three function bodies directly in `aki-recomp/games/NWXE/disasm/asm/1050.s`)
+-- there is no `MEM_BU`/flag gate anywhere in THIS specific chain (the
+`MEM_BU(0x8003BAD4)`-gated create noted last session is a DIFFERENT
+`osCreateThread` call, inside `func_800228C0`'s sibling `func_80001410`
+subtree, not this one). Also confirmed via aki-recomp's reference boot log
+(profile.toml's own rung history) that its ladder reached rung 18 (a
+completely unrelated sin/cos-waveform-filler message-queue bug, now
+SUSPENDED pending the fn64 runtime swap) WITHOUT ever naming/touching
+`func_800236C0` or `0x800481FC` -- meaning the reference boot took a
+DIFFERENT branch through the overlay-loader dispatch and never reached this
+exact subtree either way; it neither confirms nor refutes a hardware crash
+here, it's simply unexercised territory on both runtimes so far.
+
+**New hypothesis (d), best-supported by evidence so far: this is a genuine
+async-DMA race, not dead code and not a scheduler bug in the sense of
+priority ordering.** `func_800236C0` (the sole writer, `MEM_W(-0x7E04,
+$s3/ctx->r1) = ctx->r4`) sits in a tight cluster of 1-2-instruction
+get/set accessor stubs (`func_8002368C`..`func_800236C0`, asm
+0x8002368C-0x800236C8) for globals `D_80083A68`/`D_80083A6C` and a
+struct-relative field at `+0x10` -- classic IDO-era `static inline` header
+accessors that got compiled as real out-of-line functions but were meant to
+be reached via **register-indirect calls from elsewhere in a struct-method
+table**, not a literal `jal`. Given `func_80026F18` itself begins by
+reading `0x800481FC` and immediately `jalr`-ing through `*(that_ptr)`
+(asm 0x80026F5C-0x80026F64: `lw $v0,0($a0); jalr $v0`), the shape strongly
+resembles an **audio-driver vtable/task-pointer that a DMA-completion
+callback populates asynchronously** (the same "chunked PI-DMA + mesg-queue
+completion" shape this project's OWN Task-1 finding this session's
+predecessor already root-caused for `osEPiStartDma_recomp` on a DIFFERENT
+subtree -- see this file's Task-1 section above). On real silicon, the PI
+DMA that loads the audio driver/task table plausibly completes (and its
+completion handler calls the accessor that writes `0x800481FC`) BEFORE the
+audio-manager thread (pri 70, very high) gets its first scheduling slot,
+because the DMA is already in flight from an earlier point in boot and
+real hardware's PI is comparatively slow-but-already-started; if fn64's
+executor creates+dispatches thread 3 synchronously right after
+`osStartThread` returns (as the trace already showed: thread 3 scheduled
+literally the NEXT `run_one_step` after thread 0 returns), it can easily
+outrun an async completion that hasn't been modeled as taking "real" DMA
+latency at all.
+
+**Checked the sibling-caller asymmetry (done this session):** grepped all 5
+neighbor accessors' `jal` callers. RESULT: partial asymmetry, but it
+DISPROVES rather than supports hypothesis (d) as stated. `func_80023698`
+and `func_800236B0` DO have real callers (2 each), but on inspection they
+are the SAME early-boot function `func_80003720` (thread 0's synchronous
+body -- the very function fn64's own notes already identified as
+`func_800228C0`'s caller) calling them RIGHT AFTER `func_800228C0` already
+returned, to bcopy-init unrelated per-struct fields at offset `+0x10` on
+DIFFERENT struct pointers (`D_800571E8`/`D_800571EC`/`D_800571F0`-derived,
+not `D_800481FC`) -- i.e. `func_800236B0` is a same-shaped-but-different
+accessor (writes a passed-in struct's `+0x10` field, not the fixed
+`0x800481FC` global `func_800236C0` writes), and it runs SYNCHRONOUSLY,
+already-returned, no race, before `func_80003720` even returns to ITS OWN
+caller. `func_8002368C`, `func_800236A4`, and `func_800236C0` (our actual
+writer) remain the only 3 of the 6-accessor cluster with ZERO callers
+anywhere. This is NOT the DMA-completion-callback evidence hypothesis (d)
+predicted -- it just confirms the accessor-cluster pattern is real (siblings
+ARE called directly elsewhere in ordinary boot code, ruling out "N64Recomp
+never emits jal to this cluster" as a blanket codegen theory) while leaving
+`func_800236C0` specifically unexplained. Retracting hypothesis (d)'s DMA-
+race framing as unsupported by this check; downgrading back to: the writer
+is real, reachable code with a real call site that exhaustive static+dynamic
+methods (now 4 independent techniques across 2 sessions) cannot find in
+this ROM's own text -- open question, not resolved.
+
+**Bottom line, unchanged from last session's most defensible conclusion:**
+the deref chain is unconditional, reachable on every boot, and is NOT dead/
+debug code (confirmed: it's the audio-manager thread via the
+`osAiSetFrequency` sibling-call cite). Its writer genuinely cannot be found
+by any static or dynamic method tried across 2 sessions (grep, raw-word
+scan, LLDB watchpoint, sibling-caller diff). Given aki-recomp's reference
+boot has NEVER reached this exact call chain either (rung 18 suspended on
+an unrelated subtree, confirmed this session by grep), there is no
+reference-boot evidence either way that a real N64 would crash here or
+sail through it. **Recommended next action, not done this session (out of
+budget): stop trying to find a missing writer in the ROM's own code, and
+instead check whether N64Recomp's OWN codegen for `func_80026F18` correctly
+lowered its first ~3 instructions** -- i.e. re-verify byte-for-byte (as last
+session already did once) but this time also diff against the ACTUAL
+generated `RecompiledFuncs/funcs_10.c` C body character-by-character
+(not just re-reading raw MIPS) for a subtly wrong `ctx->r4` vs `ctx->r5`
+register mislabel N64Recomp might introduce silently, since a wrong-register
+read (not a wrong branch) would look identical to "unconditional real deref"
+in every check performed so far but would actually be a HOST-side
+transcription bug, not a hardware-faithful one. No fix landed this session;
+frontier unchanged; all evidence-gathering was read-only RE (lldb/grep/
+python/disasm reads only), zero `fn64/` code touched, no framebuffer/PNG
+milestone reached.
+
+## Session 2026-07-14 (part 3): char-level codegen diff (Task 1) -- CLOSED, codegen is faithful
+
+Did exactly the recommended next action: a char-level diff of
+`func_80026F18`'s generated C (`aki-recomp/games/NWXE/RecompiledFuncs/funcs_10.c:3514-3562`)
+against its raw MIPS, instruction by instruction, specifically hunting a
+`ctx->r4`-vs-`ctx->r5` (or any other register) mislabel that would look
+identical to "unconditional real deref" in every prior check.
+
+**Result: no mislabel. Codegen is provably correct at every instruction in
+this prologue.** Walked all 6 relevant instructions:
+- `lui $v1,0x8008` -> `ctx->r3 = ...` ($v1=r3, correct)
+- `lw $v1,0x3C98($v1)` -> `ctx->r3 = MEM_W(ctx->r3, 0x3C98)` (base=r3=$v1, correct)
+- `lui $a0,0x8005` -> `ctx->r4 = ...` ($a0=r4, correct)
+- `lw $a0,-0x7E04($a0)` -> `ctx->r4 = MEM_W(ctx->r4, -0x7E04)` (base=r4=$a0,
+  reads `0x800481FC`, correct -- this IS the global read)
+- `lw $v0,0x0($a0)` -> `ctx->r2 = MEM_W(ctx->r4, 0x0)` (base=r4=$a0 still
+  holds the just-read global, dest=r2=$v0, correct -- this is the vtable
+  dereference)
+- `jalr $v0` -> `LOOKUP_FUNC(ctx->r2)(rdram, ctx)` (correct register)
+
+Also independently re-verified the `MEM_W(offset, reg)` macro itself isn't
+a red herring: despite the *parameter names* in `recomp.h` reading
+`MEM_W(offset, reg)`, the call sites pass `MEM_W(base_expr, literal_offset)`
+-- opposite of what the names suggest. This is NOT a bug: the macro body
+is `rdram[(reg)+(offset)-0x80000000]`, i.e. plain addition, so argument
+order is commutative and irrelevant. Confirmed this exact calling
+convention (`MEM_W(ctx->rN, offset)`) is used identically hundreds of times
+across the whole `RecompiledFuncs` corpus (grepped), and confirmed
+`vendor/N64ModernRuntime/N64Recomp/include/recomp.h`'s macro body is
+byte-identical to `refs/WCWvsNWOWorldTourRecomp`'s independent copy (only
+the `WCW_WATCH_ENABLED` tracing wrapper differs, itself already understood
+from rung-3's watchpoint work). Also confirmed `recomp_context`'s `rN`
+fields are declared in flat MIPS register order (`r0..r31`), so
+`ctx->r2`/`ctx->r4` really are `$v0`/`$a0` with no indirection to get
+wrong.
+
+**This definitively resolves the task's Task 1 branch: proceed to Task 2
+("if codegen-correct: it IS a genuine null on the real path").** Combined
+with the prior 2 sessions' 4 independent methods (call-graph grep, raw-ROM
+32-bit-word scan, LLDB hardware watchpoint, sibling-accessor caller diff)
+that already ruled out every writer hypothesis in the ROM's own reachable
+text, the writer of `0x800481FC` is not findable by any static or dynamic
+technique available on this ROM image. Do not re-attempt a 5th "find the
+writer" pass without genuinely new evidence (e.g. a leaked/decompiled
+NWXE source tree, which is not available -- unlike faki-tools' `some-mercy`
+reference for NW4E, there is no equivalent decompiled-C reference for
+WM2000/NWXE in this project).
+
+### Task 3 scoping: why no code fix landed this session
+
+Considered three seams for "fix at the true seam," per the task's own
+framing:
+
+1. **Upstream ROM/codegen patch** (aki-recomp's `[[patches.hook]]`
+   mechanism, precedented at `games/NWXE/wm2000.toml:187-230` for exactly
+   this kind of "splice a guard/fixup ahead of a vram address" need) --
+   **blocked by this session's own read-only boundary on aki-recomp.** This
+   is the seam the existing precedent (rung-15's `func_80015250` hook, and
+   the rung-2 `func_800004D0` instruction patch) would normally use. Next
+   session with write access to aki-recomp should add a
+   `[[patches.hook]] before_vram = 0x80026F5C` in `wm2000.toml` that
+   short-circuits the `jalr` (skip to `L_80026F6C`, mirroring how
+   `func_80026F18`'s own `goto after_0` control flow already handles the
+   "call returned" case) when the global reads exactly 0 -- narrowly scoped
+   to this one call site, not a blanket null-tolerance change.
+2. **`fn64-abi::get_function` null-tolerance** -- rejected. `get_function`
+   is the single shared resolver for all 85+ `LOOKUP_FUNC` call sites in
+   NWXE; making vram=0 silently no-op there would mask genuinely different
+   bugs at every other unrelated call site (a real "resolver returned null
+   because of a section-registration bug" would then also silently
+   no-op instead of loudly failing, defeating its whole "resolve or panic"
+   contract documented at `lib.rs:485`).
+3. **`fn64-runtime` scheduler reordering** -- rejected, re-confirmed this
+   session by reading `Executor::run_one_step`/`pick_next`
+   (`crates/fn64-runtime/src/executor.rs:565-626`): the executor is
+   strict-priority-preemptive at every scheduling point (`pick_next` always
+   returns the highest-pri runnable thread), which IS the libultra-correct
+   behavior real hardware also exhibits at its own scheduling points (a
+   just-started pri-70 thread preempting a yielding pri-10 thread is
+   correct, not a fn64 bug to "fix" by artificially delaying it). There is
+   no ordering bug to correct here -- confirmed, not just asserted.
+
+**No `fn64/` code changed this session.** Landing a speculative guard
+inside `fn64/` itself (e.g. special-casing vram 0x80026F5C by address in
+the executor or ABI layer) was considered and rejected as the wrong
+architectural seam -- it would hide a real gap behind fn64-side plumbing
+rather than fixing/documenting it at the actual point of uncertainty (the
+game code's own missing-writer mystery), and no regression test could
+meaningfully distinguish "correct faithful guard" from "papered-over
+crash" without knowing the real writer's semantics. Recommending the
+aki-recomp `[[patches.hook]]` route (option 1) as the concrete next step,
+owned by whoever next has write access to that repo.
+
+Gates this session: `cargo build --workspace`, `cargo test --workspace`,
+`cargo clippy --workspace --all-targets`, `cargo fmt --all -- --check` all
+still green (read-only RE session, zero `fn64/` code touched). Frontier
+unchanged: SIGSEGV at `func_80026F18`'s `jalr` through
+`MEM_W(0x800481FC)==0`, thread 3 (audio-manager), immediately after thread
+0 yields. No new framebuffer/PNG milestone.
+
+## Session 2026-07-14 (part 4): rung-3 fix landed in aki-recomp -- CLEARED, new frontier is AI-register MMIO
+
+Landed the `[[patches.hook]]` fix in `aki-recomp/games/NWXE/wm2000.toml`
+(write access to that repo this session), per the prior session's
+recommended seam (option 1). **Two** hooks were needed, not the single
+`before_vram=0x80026F5C` the earlier session's note anticipated -- direct
+reading of `RecompiledFuncs/funcs_10.c:3562-3577` this session showed
+`L_80026F6C` (reached either by falling through the first `jalr` or by
+looping back to it) independently re-reads the SAME `D_800481FC` global 3
+instructions later (`lui $v0,0x8005; lw $v0,-0x7E04($v0)` at
+0x80026F6C-70) before dereferencing `+4` and `jalr`-ing again. A guard only
+at the first site would have "fixed" the crash by moving it 3 instructions
+into the same basic block, not clearing it. N64Recomp's `[[patches.hook]]`
+can only `goto` an address with an N64Recomp-emitted `L_XXXXXXXX` label (a
+real branch/jump target inside the function -- confirmed via
+`N64Recomp/src/recompilation.cpp`'s label-emission pass), and `0x80026FA4`
+(the first post-loop instruction that doesn't touch the global) has no
+such label since nothing branches there, only falls through -- so "skip
+the whole loop in one hook" wasn't expressible. Landed as two independent
+hooks instead, one per dereference site, each jumping to the nearest
+already-existing post-call label (`after_0`/`after_1`) and synthesizing
+the state a real "call returned, nothing registered" would leave (notably
+`ctx->r19`/$s3, read at 0x80026F90 right after hook B's landing point --
+missed in the first draft of hook A, caught by tracing what `after_0`'s
+bypassed instructions would otherwise have set, before ever running it).
+
+Faithfulness argument (now in `wm2000.toml`'s own comment, not just here):
+this models "the audio-dispatch table has zero entries" rather than
+inventing a codegen fixup -- consistent with 2 sessions' worth of
+exhaustive writer-search evidence that `D_800481FC` is never written
+anywhere in this ROM's own static or dynamic closure. Real hardware would
+also mis-execute a null indirect call at this exact site if its dispatch
+table were genuinely empty; the same latent-bug class as NW4E's own rung-7
+precedent (a discarded/never-populated pointer that happens not to matter
+on the path actually exercised).
+
+**Regenerated + rebuilt + ran. Rung 3 CLEARS.** `N64Recomp wm2000.toml`
+exit 0 (no hook-target errors). Rebuilt `wm2000-boot` from a genuinely
+clean `target/` (a stale build initially reused cached objects and still
+showed the old crash -- `cargo clean -p wm2000-boot` alone did NOT clear
+the build-script output dir on this machine; had to `rm -rf
+examples/wm2000-boot/target` to force real recompilation of the 51
+`RecompiledFuncs/*.c` files -- worth remembering next time a fix
+"doesn't take effect"). Confirmed via LLDB (`bt` on the resulting SIGSEGV):
+
+```
+* thread #1 stop reason = EXC_BAD_ACCESS (code=1, address=0xaf450000c)
+    frame #0: func_8002B890 + 8   (ldrsw x8, [x0, x8]  -- MEM_W read)
+    frame #1: func_80026F18 + 640
+```
+
+`func_80026F18` is now 640 bytes further into its own body than the old
+crash (which was at its first ~0x40 bytes) -- the null-jalr guard worked,
+execution reached `func_8002B890` (one of the two neighbor calls after the
+guarded dereferences: `lui $v0,0xA450; ori $v0,$v0,0xC; lw $v0,0($v0)`,
+i.e. reading the real N64 AI hardware register `AI_STATUS` at
+`0xA450000C`). The trace file (`ThreadSwitch`/`QueueOp` granularity only)
+shows the same last event (`seq 316: to:3, Scheduled`) as before the fix
+purely because the harness's trace only records scheduling events, not
+individual instructions -- it does NOT mean the fix had no effect; LLDB is
+the authority here, and it shows a different crash site 640 bytes deeper.
+
+**New frontier: this harness has no MMIO shim for the `0xA45xxxxx` (AI,
+Audio Interface) hardware register range.** `rdram` is allocated as a flat
+8MB (`0x800000`) buffer (`examples/wm2000-boot/src/main.rs:193-194`);
+`MEM_W`'s `rdram[(reg)+(offset)-0x80000000]` translation on
+`reg=0xA450000C` computes offset `0x2450000C`, ~4x past the buffer's end
+-- an out-of-bounds host read, not a null-pointer fault. This is
+qualitatively different from the rung-3 bug: it's a missing piece of
+hardware-register infrastructure (the AI register space needs its own
+backing store/dispatch, the same way libultra-level `osXxx_recomp` shims
+exist in `fn64-abi` for OS-level calls), not a game-logic null. Real
+`0xA4500000-0xA450000F` on N64 hardware are `AI_DRAM_ADDR`/`AI_LEN`/
+`AI_CONTROL`/`AI_STATUS` -- this thread (already identified as the
+audio-manager, `osAiSetFrequency` sibling-call cite from an earlier
+session) reading `AI_STATUS` directly is exactly the shape expected of
+audio-manager bring-up code, so this is real, reachable, retail-boot code
+hitting a genuine harness gap, not dead/debug code.
+
+**Not fixed this session (scope: task was specifically the null-jalr
+guard + climb as far as budget allows; an AI-register MMIO shim is a
+distinct, larger infrastructure task, not a one-line guard).** Next
+session's likely shape: give `fn64-abi` (or a new small MMIO module) a
+backing map for the `0xA4xxxxxx`/`0xA8xxxxxx`-family hardware register
+windows (AI/VI/PI/SI, same pattern N64ModernRuntime's own `librecomp` uses
+for `osXxx_recomp` shims), starting narrowly with just `AI_STATUS`/
+`AI_DRAM_ADDR`/`AI_LEN`/`AI_CONTROL` since that's what this exact call
+site needs, rather than a blanket MMIO framework speculatively covering
+registers nothing has touched yet.
+
+**Did not reach VI bring-up, controller probe, or `osViSwapBuffer` this
+session** -- the AI-register frontier is before all three in this thread's
+own call chain (this is thread 3's very first few instructions past the
+dispatch-loop prologue). No framebuffer/PNG produced. `first_frame` not
+reached.
+
+Gates this session (fn64 MAIN workspace only -- `examples/wm2000-boot` is
+a deliberately separate standalone workspace per its own `Cargo.toml`
+header comment, not part of `--workspace`): `cargo build --workspace`
+clean, `cargo test --workspace` 27+1+34+10 passed/6 ignored/0 failed,
+`cargo clippy --workspace --all-targets` clean, `cargo fmt --all --
+--check` clean -- all unchanged from before this session since zero
+`fn64/` source was touched (only `aki-recomp/games/NWXE/wm2000.toml`
+changed). `wm2000-boot` itself isn't gated by these commands (by design);
+its own gate is the N64Recomp regen (exit 0, confirmed) + the harness run
+(now crashes at a materially later point, confirmed via LLDB backtrace,
+not just trace-file inspection which is too coarse-grained to show the
+difference on its own).

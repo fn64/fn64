@@ -88,9 +88,10 @@
 use std::cell::{Cell, RefCell};
 
 use corosensei::Yielder;
+use fn64_render::RenderBackend;
 use fn64_runtime::{
     DmaDirection, Executor, ExternalEvent, InMemoryRom, Mesg, OsTaskHeader, PiDma, Priority,
-    RdramAddr, Resume, Section, SectionRegistry, ThreadId, Yield, M_AUDTASK,
+    RdramAddr, Resume, Section, SectionRegistry, ThreadId, Yield, M_AUDTASK, M_GFXTASK,
 };
 
 /// MIPS `recomp_context`, the REAL verbatim layout from `recomp.h` (MIT) --
@@ -1248,6 +1249,213 @@ pub unsafe extern "C" fn osAiSetFrequency_recomp(_rdram: *mut u8, ctx: *mut Reco
 
 thread_local! {
     static AI_FREQUENCY: Cell<u32> = const { Cell::new(0) };
+    /// AI/VI/PI/SI/SP/DP/MI hardware-register model (`fn64_runtime::mmio`).
+    /// Backs both the shim-level `osAi*` family below AND (via
+    /// `sync_mmio_into_rdram`, called from `boot_thread0`/before each
+    /// coroutine resume) a raw guest `MEM_W` load at the same address --
+    /// see `mmio.rs`'s module doc for the real crash
+    /// (`docs/BOOT-NOTES-WM2000.md`) this closes.
+    static MMIO: RefCell<fn64_runtime::MmioSpace> = RefCell::new(fn64_runtime::MmioSpace::new());
+}
+
+/// Write every modeled MMIO register's current value into `rdram`'s real
+/// bytes, so a subsequent RAW guest load (not going through any
+/// `osXxx_recomp` shim) observes it. Exposed for a harness
+/// (`examples/wm2000-boot`) to call right after allocating a
+/// `Rdram::new_with_mmio`-sized buffer and before/between coroutine resumes
+/// -- see `fn64_runtime::mmio::MmioSpace::sync_into_rdram`'s doc comment
+/// for exactly when this needs to be called (after any host mutation of
+/// the model, e.g. right after this file's own `osAiSetNextBuffer_recomp`).
+///
+/// # Safety
+/// `rdram` must point to a buffer of at least
+/// `fn64_runtime::RDRAM_MMIO_WINDOW_END` bytes (i.e. allocated via
+/// `Rdram::new_with_mmio`, not plain `Rdram::new`/a bare `Vec::new`).
+pub unsafe fn sync_mmio_into_rdram(rdram: *mut u8) {
+    MMIO.with(|cell| unsafe { cell.borrow_mut().sync_into_rdram(rdram) });
+}
+
+/// `osAiGetStatus() -> u32` -- no arguments; real hardware `AI_STATUS`
+/// register read (`AI_STATUS_BUSY`/`AI_STATUS_FULL` bits, public libultra
+/// manual's AI Manager section). Backed by `fn64_runtime::mmio::AiRegs`,
+/// the same model a raw guest `MEM_W` at the register's real address reads
+/// (see `MMIO`'s doc comment) -- this shim and a raw load return the SAME
+/// value, since both go through `AiRegs::status`'s one-shot-busy logic
+/// (this call also mutates the one-shot flag, exactly like a real register
+/// read would consume the interrupt-pending latch).
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn osAiGetStatus_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let status = MMIO.with(|cell| cell.borrow_mut().ai.status());
+    ctx.r2 = status as u64;
+}
+
+/// `osAiGetLength() -> u32` -- no arguments; real hardware `AI_LEN` register
+/// read (bytes remaining in the current/last DMA). See `AiRegs::length`'s
+/// doc comment for why this crate reports the full latched length rather
+/// than a fabricated mid-drain value.
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn osAiGetLength_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let len = MMIO.with(|cell| cell.borrow().ai.length());
+    ctx.r2 = len as u64;
+}
+
+/// `osAiSetNextBuffer(void *buf, u32 size) -> s32` -- `buf`=`ctx->r4` (an
+/// rdram-relative vram pointer to the audio sample buffer), `size`=`ctx->r5`
+/// (bytes). Real hardware effect: latches the DMA source/length and starts
+/// the transfer; per the public libultra manual, returns 0 on success or
+/// a negative error code if a DMA is already in progress and the queue is
+/// full. This crate's DMA is synchronous-modeled (see `AiRegs::set_next_buffer`'s
+/// doc comment: "DMA proceeds" stance, same as `rom.rs`'s PI DMA), so this
+/// always succeeds (returns 0) -- no evidence yet of a call site needing the
+/// error path.
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn osAiSetNextBuffer_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let buf_addr = RdramAddr::from_gpr(ctx.r4).offset();
+    let size = ctx.r5 as u32;
+    MMIO.with(|cell| cell.borrow_mut().ai.set_next_buffer(buf_addr, size));
+    ctx.r2 = 0;
+}
+
+// ---------------------------------------------------------------------
+// Batch-generated trivial shims: thin wrappers over machinery this crate
+// already has (executor scheduling, cache-op no-ops, thread-handle
+// resolution), scoped to the shims `aki-recomp`'s OOTU generated corpus
+// currently has REAL call sites for (per this wave's `grep -rl
+// "<sym>_recomp("` sweep over `games/*/RecompiledFuncs/funcs_*.c`) --
+// matrix-guided per `docs/COMPLETENESS.md`'s "don't build surface no game
+// calls" rule. Each shim's doc comment below cites its real call site.
+// ---------------------------------------------------------------------
+
+/// `osGetMemSize(void) -> u32` -- no arguments (public libultra manual);
+/// returns the total RDRAM size in bytes. Real call site:
+/// `games/OOTU/RecompiledFuncs/funcs_0.c:142`. This crate's `Rdram` is a
+/// fixed-size buffer (`fn64_runtime::rdram::DEFAULT_RDRAM_SIZE`, 8 MB) --
+/// returning that constant is the real, correct answer (not a fabricated
+/// value), since every target game runs on the same 8 MB console
+/// configuration (`rdram.rs`'s own doc comment).
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn osGetMemSize_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    ctx.r2 = fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u64;
+}
+
+/// `osInvalDCache(void *vaddr, s32 nbytes)` -- real hardware effect:
+/// invalidates a range of the CPU's data cache (no host-visible effect
+/// beyond memory ordering, since this crate has no CPU cache model of its
+/// own -- rdram is a single Rust-owned buffer with no cache layer sitting
+/// in front of it). Real call sites: `games/OOTU/RecompiledFuncs/funcs_0.c`
+/// (x3), `funcs_49.c`. A safe, correct no-op: real N64 cache-maintenance
+/// ops have no architecturally-visible effect other than "subsequent
+/// reads see up-to-date memory," which is already unconditionally true for
+/// a flat host buffer with no caching.
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn osInvalDCache_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
+
+/// `osInvalICache(void *vaddr, s32 nbytes)` -- instruction-cache
+/// counterpart to `osInvalDCache_recomp`; same no-op reasoning (no
+/// instruction cache model in this crate -- generated code is real native
+/// machine code the host CPU already keeps coherent). Real call sites:
+/// `games/OOTU/RecompiledFuncs/funcs_0.c` (x3).
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn osInvalICache_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
+
+/// `osWritebackDCache(void *vaddr, s32 nbytes)` -- writes dirty cache lines
+/// back to RDRAM. Same no-op reasoning as `osInvalDCache_recomp`. Real call
+/// site: `games/OOTU/RecompiledFuncs/funcs_49.c:687`.
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn osWritebackDCache_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
+
+/// `__osDisableInt(void) -> u32` -- real hardware effect: disables CPU
+/// interrupts, returning the previous interrupt-enable state (an `SR`
+/// register snapshot) so a matching `__osRestoreInt` can restore it. This
+/// crate has no interrupt model (`docs/DESIGN.md`'s single-executor,
+/// single-host-thread design means there is no concurrent interrupt
+/// delivery to race against -- see `executor.rs`'s own doc comment on why
+/// that hazard class doesn't exist here) -- returns a fixed "was enabled"
+/// sentinel (`1`, matching `osSetIntMask_recomp`'s existing convention of
+/// returning the previous mask value) since no evidence shows any call
+/// site branching on the exact previous value beyond feeding it back to
+/// `__osRestoreInt`. Real call sites: `games/OOTU/RecompiledFuncs/funcs_0.c`
+/// (x2).
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn __osDisableInt_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    ctx.r2 = 1;
+}
+
+/// `__osRestoreInt(u32 mask)` -- restores the interrupt-enable state a
+/// prior `__osDisableInt` returned. No-op counterpart to
+/// `__osDisableInt_recomp` (see that shim's doc comment for why this crate
+/// has nothing real to restore). Real call sites:
+/// `games/OOTU/RecompiledFuncs/funcs_0.c` (x2).
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn __osRestoreInt_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
+
+/// `osGetThreadId(OSThread *t) -> OSId` -- `a0`=`ctx->r4`. Resolved via
+/// `resolve_thread_arg` (same `NULL`-means-current-thread convention as
+/// `osGetThreadPri_recomp`/`osSetThreadPri_recomp` -- the public libultra
+/// manual documents the same `t == NULL` convention for this call too).
+/// Since this crate's `ThreadId` IS the real `OSId` (see
+/// `HostState::thread_handles`' doc comment: it maps `OSThread*` -> the
+/// `OSId` a real `osCreateThread(t, id, ...)` call supplied), this is a
+/// direct return of the resolved id, not a separate lookup table. Real
+/// call sites: `games/OOTU/RecompiledFuncs/funcs_0.c:4152`, `funcs_56.c:643`.
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn osGetThreadId_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let target = resolve_thread_arg(ctx.r4, "osGetThreadId_recomp");
+    ctx.r2 = target as u64;
+}
+
+/// `osGetTime(void) -> OSTime` -- no arguments; returns the current system
+/// time counter (`u64`). This crate has no wall-clock (only the executor's
+/// virtual `sim_time`, per `docs/DESIGN.md`'s "no wall-clock in core" rule
+/// -- see `Executor::sim_time`'s doc comment), which is the real,
+/// reproducible value to return here: a differential trace comparing two
+/// runs needs `osGetTime` to track the SAME virtual clock every other
+/// timing decision in this crate already uses, not an independent
+/// wall-clock reading. Real call sites: `games/OOTU/RecompiledFuncs/funcs_0.c`
+/// (x2), `funcs_24.c:763`, `funcs_56.c:657`.
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn osGetTime_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    ctx.r2 = with_executor(|exec| exec.sim_time());
 }
 
 /// `osSpTaskYielded(OSTask *task) -> s32` -- `a0`=`ctx->r4`, an `OSTask_t*`
@@ -1267,7 +1475,20 @@ thread_local! {
 ///
 /// ## Real semantics implemented this wave
 ///
-/// GFX_TASK_NOTE: a graphics task (`M_GFXTASK`) is ACKNOWLEDGED, not executed; real rendering is `fn64-rt64`'s next-wave scope, per `docs/DESIGN.md` section 1. The header is recorded via `Executor::submit_task` (trace + count), and this function sets `ctx.r2 = 1` (task complete, did not yield) so the caller's `bnel` path proceeds as if the RSP finished the task, matching real hardware's observable effect on the caller (task done, no further action expected) without a graphics backend actually drawing anything.
+/// GFX_TASK_NOTE: a graphics task (`M_GFXTASK`) is routed through the
+/// single registered `dyn RenderBackend` (`set_render_backend`), per
+/// `docs/DECOUPLING.md`'s renderer seam -- see `GFX_RENDER_NOTE` below at
+/// the actual dispatch call site for the honest current state of what
+/// backend is registered in practice (today: `fn64-render-rt64`'s headless
+/// `ReferenceBackend` for tests/fixtures; a real RT64-backed backend is not
+/// wired up yet, see that crate's module doc). If no backend is
+/// registered at all, the task is still just recorded (trace + count) via
+/// `Executor::submit_task`, same as before this wave -- this function
+/// always sets `ctx.r2 = 1` (task complete, did not yield) so the caller's
+/// `bnel` path proceeds as if the RSP finished the task, matching real
+/// hardware's observable effect on the caller (task done, no further
+/// action expected) regardless of whether a backend actually drew
+/// anything.
 ///
 /// AUDIO_TASK_NOTE: an audio task (`M_AUDTASK`) causes the translated `wm2000_audio_ucode` function (out-of-tree; see `examples/wm2000-boot`'s harness, which registers it via `set_audio_ucode_fn` below -- `fn64-abi` itself contains no game-derived ucode C, per `README.md`'s "no game content ships in this repo") to be REALLY CALLED with `(rdram, ucode_addr)`, matching `RSPRecomp`'s documented generated signature. Its `RspExitReason` return is not yet interpreted beyond "it ran"; the header is still recorded via `submit_task`.
 ///
@@ -1302,10 +1523,121 @@ pub unsafe extern "C" fn osSpTaskYielded_recomp(rdram: *mut u8, ctx: *mut Recomp
             // this process never actually ran its ucode" rather than
             // silently pretending it did.
         });
+    } else if header.task_type == M_GFXTASK {
+        // GFX_RENDER_NOTE: routes through the single registered `dyn
+        // RenderBackend` (`set_render_backend`), the same executor-event-
+        // seam pattern as the audio path above -- fn64-abi never names a
+        // concrete backend crate (docs/DECOUPLING.md: "the backend never
+        // reaches back into runtime state," and symmetrically, this crate
+        // never reaches INTO a specific backend's internals, only the
+        // trait). If no backend was registered (a test, or a harness that
+        // hasn't wired one up), the task is still recorded/counted below,
+        // same honesty stance as the audio path's "no ucode fn registered"
+        // case -- never a silent pretend-success.
+        RENDER_BACKEND.with(|cell| {
+            if let Some(backend) = cell.borrow_mut().as_mut() {
+                let render_end = unsafe { read_output_buff_size(rdram, o) };
+                let task = fn64_render::OsTask {
+                    task_type: header.task_type,
+                    flags: header.flags,
+                    ucode_boot: header.ucode_boot,
+                    ucode_boot_size: header.ucode_boot_size,
+                    ucode: header.ucode,
+                    ucode_size: header.ucode_size,
+                    ucode_data: header.ucode_data,
+                    ucode_data_size: header.ucode_data_size,
+                    dram_stack: header.dram_stack,
+                    dram_stack_size: header.dram_stack_size,
+                    output_buff: header.output_buff,
+                    output_buff_size: render_end,
+                    data_ptr: header.data_ptr,
+                    data_size: header.data_size,
+                };
+                // Safety: `rdram` is valid for this call's duration per
+                // this function's own contract; the backend only reads it
+                // as `&[u8]` for the length the executor's rdram buffer
+                // actually has (`RDRAM_LEN`, set by `set_render_backend`'s
+                // caller alongside the backend itself).
+                let rdram_len = RDRAM_LEN.with(|cell| cell.get());
+                let rdram_slice = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
+                // A backend error (unsupported ucode, bad bounds, backend
+                // not ready) is intentionally NOT propagated as a MIPS-side
+                // fault -- real hardware has no way to report "your gfx
+                // task's ucode isn't implemented" back to the game thread
+                // either; it is surfaced instead via `RENDER_LAST_ERROR`
+                // for a harness/test to inspect, matching this crate's
+                // "loud, not silent" rule without inventing a fake libultra
+                // error path no real ROM's code checks for.
+                let result = backend.process_task(rdram_slice, &task);
+                RENDER_LAST_ERROR.with(|cell| cell.replace(result.err().map(|e| e.to_string())));
+            }
+        });
     }
 
     with_executor(|exec| exec.submit_task(header));
     ctx.r2 = 1; // task complete, did not yield (see doc comment)
+}
+
+/// Real `OSTask_t.t.output_buff_size` (`OSTask_t`'s field at offset 0x2C,
+/// between `output_buff`@0x28 and `data_ptr`@0x30 per the public libultra
+/// manual's documented layout) -- not part of
+/// `fn64_runtime::rsp::OsTaskHeader` (that struct's own doc comment: fields
+/// "unused by any call site this milestone reaches... omitted rather than
+/// guessed"), but needed here because `fn64_render::OsTask` (the render
+/// seam's own task view) does need an output-buffer bound to validate
+/// against `rdram`'s length. Read directly rather than widening the shared
+/// `OsTaskHeader`/`read_os_task_header`, keeping that struct's documented
+/// scope untouched.
+///
+/// # Safety
+/// Same contract as `read_os_task_header`.
+unsafe fn read_output_buff_size(rdram: *mut u8, base: usize) -> u32 {
+    let mut b = [0u8; 4];
+    unsafe { std::ptr::copy_nonoverlapping(rdram.add(base + 0x2C), b.as_mut_ptr(), 4) };
+    u32::from_ne_bytes(b)
+}
+
+thread_local! {
+    /// The single registered graphics backend, if the shell/harness has
+    /// called `set_render_backend`. `RefCell` (not `Cell`, unlike
+    /// `AUDIO_UCODE_FN`) because a `Box<dyn RenderBackend>` is not `Copy`
+    /// and needs `&mut` access across calls to drive its own internal
+    /// state (`create`/`process_task`/`present`).
+    static RENDER_BACKEND: RefCell<Option<Box<dyn RenderBackend>>> = const { RefCell::new(None) };
+    /// The rdram buffer length the registered backend should treat as
+    /// valid, set once by `set_render_backend`'s caller. Needed because
+    /// `osSpTaskYielded_recomp` only receives a raw `*mut u8` (matching
+    /// generated code's own `RECOMP_FUNC` signature), not a length --
+    /// exactly the reason `fn64_runtime::Rdram` exists as an owned buffer
+    /// with a known size elsewhere in this crate; this mirrors that same
+    /// length knowledge for the one raw-pointer call site that needs it.
+    static RDRAM_LEN: Cell<usize> = const { Cell::new(0) };
+    /// The most recent `RenderBackend::process_task` error, if any,
+    /// stringified -- a harness/test observability hook (see
+    /// `GFX_RENDER_NOTE`'s doc comment for why this isn't surfaced as a
+    /// MIPS-side fault instead).
+    static RENDER_LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Register the graphics backend `osSpTaskYielded_recomp` dispatches
+/// `M_GFXTASK` submissions to, and the rdram buffer length it may safely
+/// read (`rdram_len` must match the actual backing buffer's size -- a
+/// mismatch here is a caller bug, not something this function can check
+/// given it only stores a length, not the buffer itself). Mirrors
+/// `set_audio_ucode_fn`'s "the shell wires this once at startup" shape,
+/// generalized to a trait object since a graphics backend is stateful
+/// (unlike a single ucode function pointer).
+pub fn set_render_backend(backend: Box<dyn RenderBackend>, rdram_len: usize) {
+    RENDER_BACKEND.with(|cell| cell.replace(Some(backend)));
+    RDRAM_LEN.with(|cell| cell.set(rdram_len));
+}
+
+/// The most recent registered backend's `process_task` error, if the last
+/// `M_GFXTASK` dispatch failed. `None` if no gfx task has run yet, the last
+/// one succeeded, or no backend is registered at all. A test/harness
+/// observability hook -- see `set_render_backend`'s doc comment.
+pub fn last_render_error() -> Option<String> {
+    RENDER_LAST_ERROR.with(|cell| cell.borrow().clone())
 }
 
 /// Real translated audio-ucode function signature, per
@@ -1903,6 +2235,66 @@ mod tests {
         assert_eq!(ctx.r2, 33);
     }
 
+    #[test]
+    fn get_thread_id_resolves_a_real_handle_to_its_real_osid() {
+        spawn_test_thread(203, 10, || {});
+        register_test_thread_handle(0x8000_0203, 203);
+        let mut ctx = ctx_with(0x8000_0203, 0, 0);
+        unsafe { osGetThreadId_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+        assert_eq!(ctx.r2, 203);
+    }
+
+    #[test]
+    fn get_thread_id_with_null_handle_resolves_current_thread() {
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed2 = observed.clone();
+        spawn_test_thread(204, 10, move || {
+            let mut ctx = ctx_with(0, 0, 0);
+            unsafe { osGetThreadId_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+            *observed2.borrow_mut() = Some(ctx.r2);
+        });
+        run_to_idle_with_yielder_plumbing();
+        assert_eq!(*observed.borrow(), Some(204));
+    }
+
+    #[test]
+    fn os_get_mem_size_reports_the_real_rdram_size() {
+        let mut ctx = ctx_zeroed();
+        unsafe { osGetMemSize_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+        assert_eq!(ctx.r2, fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u64);
+    }
+
+    #[test]
+    fn cache_maintenance_ops_are_safe_callable_noops() {
+        unsafe {
+            osInvalDCache_recomp(std::ptr::null_mut(), &mut ctx_zeroed() as *mut _);
+            osInvalICache_recomp(std::ptr::null_mut(), &mut ctx_zeroed() as *mut _);
+            osWritebackDCache_recomp(std::ptr::null_mut(), &mut ctx_zeroed() as *mut _);
+        }
+    }
+
+    #[test]
+    fn disable_restore_int_are_safe_and_disable_returns_nonzero() {
+        let mut ctx = ctx_zeroed();
+        unsafe { __osDisableInt_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+        assert_ne!(ctx.r2, 0, "a previous-enabled-state sentinel, not zero");
+        unsafe { __osRestoreInt_recomp(std::ptr::null_mut(), &mut ctx_zeroed() as *mut _) };
+    }
+
+    #[test]
+    fn os_get_time_tracks_the_executors_virtual_clock() {
+        let mut ctx = ctx_zeroed();
+        unsafe { osGetTime_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+        let t0 = ctx.r2;
+        with_executor(|exec| exec.advance_time(exec.sim_time() + 500));
+        let mut ctx2 = ctx_zeroed();
+        unsafe { osGetTime_recomp(std::ptr::null_mut(), &mut ctx2 as *mut _) };
+        assert!(
+            ctx2.r2 >= t0 + 500,
+            "osGetTime must track sim_time advancing, not a fixed value"
+        );
+    }
+
     // osStartThread_recomp is a plain `extern "C" fn` -- same subprocess-abort
     // pattern as every other loud-trap test in this file (a panic across an
     // extern "C" boundary aborts, it does not unwind, so `#[should_panic]`
@@ -1963,6 +2355,68 @@ mod tests {
         ctx.r4 = 48000;
         unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
         assert_eq!(AI_FREQUENCY.with(|c| c.get()), 48000);
+    }
+
+    #[test]
+    fn os_ai_set_next_buffer_then_get_status_reports_busy_once() {
+        // Reset MMIO's AI state to a known starting point -- other tests in
+        // this file share the same thread_local, and test order is not
+        // guaranteed.
+        MMIO.with(|cell| *cell.borrow_mut() = fn64_runtime::MmioSpace::new());
+
+        let mut set_ctx = ctx_zeroed();
+        set_ctx.r4 = 0xFFFF_FFFF_8010_0000; // buf, a plausible vram address
+        set_ctx.r5 = 0x100; // size
+        unsafe { osAiSetNextBuffer_recomp(std::ptr::null_mut(), &mut set_ctx as *mut _) };
+        assert_eq!(set_ctx.r2, 0, "osAiSetNextBuffer reports success");
+
+        let mut status_ctx = ctx_zeroed();
+        unsafe { osAiGetStatus_recomp(std::ptr::null_mut(), &mut status_ctx as *mut _) };
+        assert_eq!(
+            status_ctx.r2 as u32 & fn64_runtime::AI_STATUS_BUSY,
+            fn64_runtime::AI_STATUS_BUSY,
+            "first status read after a submit observes busy"
+        );
+
+        let mut second_ctx = ctx_zeroed();
+        unsafe { osAiGetStatus_recomp(std::ptr::null_mut(), &mut second_ctx as *mut _) };
+        assert_eq!(second_ctx.r2, 0, "busy is one-shot");
+    }
+
+    #[test]
+    fn os_ai_get_length_reports_latched_length() {
+        MMIO.with(|cell| *cell.borrow_mut() = fn64_runtime::MmioSpace::new());
+
+        let mut set_ctx = ctx_zeroed();
+        set_ctx.r4 = 0xFFFF_FFFF_8010_0000;
+        set_ctx.r5 = 0x40;
+        unsafe { osAiSetNextBuffer_recomp(std::ptr::null_mut(), &mut set_ctx as *mut _) };
+
+        let mut ctx = ctx_zeroed();
+        unsafe { osAiGetLength_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+        assert_eq!(ctx.r2, 0x40);
+    }
+
+    #[test]
+    fn sync_mmio_into_rdram_backs_a_raw_guest_ai_status_load() {
+        MMIO.with(|cell| *cell.borrow_mut() = fn64_runtime::MmioSpace::new());
+        let mut set_ctx = ctx_zeroed();
+        set_ctx.r4 = 0xFFFF_FFFF_8010_0000;
+        set_ctx.r5 = 0x40;
+        unsafe { osAiSetNextBuffer_recomp(std::ptr::null_mut(), &mut set_ctx as *mut _) };
+
+        let mut buf = vec![0u8; fn64_runtime::RDRAM_MMIO_WINDOW_END as usize];
+        unsafe { sync_mmio_into_rdram(buf.as_mut_ptr()) };
+
+        // The exact real address docs/BOOT-NOTES-WM2000.md's LLDB backtrace
+        // named: a raw guest lw at AI_STATUS (0xA450000C).
+        let ai_status = RdramAddr::from_gpr(0xA450_000C);
+        let o = ai_status.offset() as usize;
+        let raw = i32::from_ne_bytes(buf[o..o + 4].try_into().unwrap());
+        assert_eq!(
+            raw as u32 & fn64_runtime::AI_STATUS_BUSY,
+            fn64_runtime::AI_STATUS_BUSY
+        );
     }
 
     #[no_mangle]
@@ -2256,6 +2710,108 @@ mod tests {
             assert_eq!(exec.task_log().gfx_count(), 1);
             assert_eq!(exec.task_log().audio_count(), 0);
         });
+    }
+
+    /// Proves the executor gfx-task seam actually reaches a real `dyn
+    /// RenderBackend` end-to-end: `set_render_backend` registers a real
+    /// `fn64_render_rt64::ReferenceBackend`, a real F3DEX2-family display
+    /// list (same tiny triangle fixture shape as
+    /// `fn64-render-rt64/tests/fixture_replay.rs` -- see that file's doc
+    /// comment for why this is a hand-built, not ROM-captured, fixture) is
+    /// planted in the SAME `rdram` buffer `osSpTaskYielded_recomp` reads
+    /// its task header from, and the call is made through the real
+    /// `extern "C"` shim, not by calling the backend directly. This is the
+    /// "wire the executor gfx-task seam" gate: the FULL path (recomp shim
+    /// -> registered `dyn RenderBackend` -> rasterizer -> framebuffer) is
+    /// exercised, not just its two halves in isolation.
+    #[test]
+    fn os_sp_task_yielded_routes_gfx_tasks_through_the_registered_render_backend() {
+        use fn64_render::RenderConfig;
+        use fn64_render_rt64::{gbi, ReferenceBackend};
+
+        const RDRAM_LEN: usize = 0x4000;
+        const VTX_ADDR: usize = 0x1000;
+        const DL_ADDR: usize = 0x2000;
+        const HEADER_OFF: usize = 0x10;
+
+        let mut rdram = vec![0u8; RDRAM_LEN];
+
+        // Same 3-vertex red/green/blue triangle shape as the
+        // fn64-render-rt64 fixture: SDK's public 16-byte Vtx_t
+        // position-color layout.
+        let verts: [([i16; 2], [u8; 4]); 3] = [
+            ([8, 8], [255, 0, 0, 255]),
+            ([56, 8], [0, 255, 0, 255]),
+            ([32, 56], [0, 0, 255, 255]),
+        ];
+        for (i, (xy, rgba)) in verts.iter().enumerate() {
+            let off = VTX_ADDR + i * 16;
+            rdram[off..off + 2].copy_from_slice(&xy[0].to_be_bytes());
+            rdram[off + 2..off + 4].copy_from_slice(&xy[1].to_be_bytes());
+            rdram[off + 12..off + 16].copy_from_slice(rgba);
+        }
+
+        let mut dl = Vec::new();
+        let w0 = ((gbi::G_VTX as u32) << 24) | (3u32 << 12);
+        dl.extend_from_slice(&w0.to_be_bytes());
+        dl.extend_from_slice(&(VTX_ADDR as u32).to_be_bytes());
+        let w0 = (gbi::G_TRI1 as u32) << 24;
+        let w1 = (1u32 << 8) | 2u32; // v0 index is 0, so its <<16 term is omitted (identity op)
+        dl.extend_from_slice(&w0.to_be_bytes());
+        dl.extend_from_slice(&w1.to_be_bytes());
+        let w0 = (gbi::G_ENDDL as u32) << 24;
+        dl.extend_from_slice(&w0.to_be_bytes());
+        dl.extend_from_slice(&0u32.to_be_bytes());
+        rdram[DL_ADDR..DL_ADDR + dl.len()].copy_from_slice(&dl);
+
+        // OSTask_t header: type=M_GFXTASK@0x0, data_ptr=DL_ADDR@0x30.
+        rdram[HEADER_OFF..HEADER_OFF + 4].copy_from_slice(&fn64_runtime::M_GFXTASK.to_ne_bytes());
+        rdram[HEADER_OFF + 0x30..HEADER_OFF + 0x34]
+            .copy_from_slice(&(DL_ADDR as u32).to_ne_bytes());
+
+        let mut backend = ReferenceBackend::new().with_clear_color([1, 2, 3, 255]);
+        backend.create(&RenderConfig::new(64, 64)).unwrap();
+        set_render_backend(Box::new(backend), RDRAM_LEN);
+
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
+        unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        assert_eq!(ctx.r2, 1, "task reported complete, not yielded");
+        assert_eq!(
+            last_render_error(),
+            None,
+            "the real backend must not report an error for a valid fixture -- rules out \
+             NotReady/UnsupportedUcode/InvalidTaskBounds, i.e. the seam-routed call really \
+             reached process_task and it really succeeded"
+        );
+
+        // `dyn RenderBackend` deliberately has no `Any` bound (keeping the
+        // shared trait minimal per docs/DECOUPLING.md), so the registered
+        // trait object's framebuffer can't be inspected back out through
+        // this seam. Independently confirm the exact same fixture bytes
+        // DO produce a non-clear frame via a second, directly-owned
+        // `ReferenceBackend` (the same concrete type just registered,
+        // exercised the same way `fn64-render-rt64/tests/fixture_replay.rs`
+        // already proves in isolation) -- combined with the error-free
+        // `ctx.r2 == 1` result above, this closes the loop end-to-end:
+        // the seam call really executed the real decode+rasterize path on
+        // this fixture, not a silent no-op.
+        let mut direct = ReferenceBackend::new().with_clear_color([1, 2, 3, 255]);
+        direct.create(&RenderConfig::new(64, 64)).unwrap();
+        let task = fn64_render::OsTask {
+            task_type: fn64_render::M_GFXTASK,
+            data_ptr: DL_ADDR as u32,
+            ..Default::default()
+        };
+        direct.process_task(&rdram, &task).unwrap();
+        assert!(
+            direct
+                .framebuffer()
+                .unwrap()
+                .has_non_uniform_content(1, 2, 3, 255),
+            "the same fixture bytes must produce a non-clear frame through the reference backend"
+        );
     }
 
     #[test]
