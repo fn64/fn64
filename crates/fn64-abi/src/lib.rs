@@ -1111,6 +1111,23 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
             DmaDirection::ToRdram => {
                 let mut buf = vec![0u8; len as usize];
                 dma.read_rom_bytes(dev_addr, &mut buf);
+                // Word-swizzle big-endian cartridge bytes into rdram's
+                // native-endian-word layout, same as PiDma::dma_write_bytes /
+                // osEPiReadIo. This shim copies through the raw pointer (no
+                // Rdram wrapper), so swizzle the buffer in place first. A flat
+                // copy hung OoT's DmaMgr_Init: it DMAs the dmadata table and
+                // checks MEM_W(dest+4)==0x1060; flat delivered 0x60100000 ->
+                // Fault_AddHungupAndCrash. PI DMA is word-aligned.
+                assert!(
+                    dram_addr.offset() % 4 == 0 && buf.len() % 4 == 0,
+                    "PI DMA must be word-aligned (dram={:#x} len={:#x})",
+                    dram_addr.offset(),
+                    buf.len()
+                );
+                for word in buf.chunks_exact_mut(4) {
+                    word.swap(0, 3);
+                    word.swap(1, 2);
+                }
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         buf.as_ptr(),
@@ -4118,7 +4135,11 @@ mod tests {
     fn os_epi_start_dma_reads_real_fields_at_a_nonzero_mb_address() {
         // Use a fresh ROM per test (with_pi_dma's HOST state is thread-local
         // per test since each #[test] gets its own OS thread by default).
-        load_rom(vec![0xABu8; 0x1000]);
+        // Distinguishable ROM word at 0x10 so a flat (non-swizzled) DMA fails
+        // this test -- the OoT-DmaMgr regression, not just an addressing check.
+        let mut rom = vec![0u8; 0x1000];
+        rom[0x10..0x14].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]); // big-endian cart word
+        load_rom(rom);
 
         let mut rdram = vec![0u8; 0x10000];
         let mb_vram: u64 = 0x8000_2000; // a REAL, nonzero vram address
@@ -4138,13 +4159,13 @@ mod tests {
         ctx.r6 = 0; // OS_READ / ToRdram
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
-        // dramAddr (0x8000_5000) -> rdram offset 0x5000; the DMA should
-        // have copied 4 bytes of 0xAB from ROM offset 0x10 there. Reaching
-        // this point at all (no EXC_BAD_ACCESS) already proves mb_addr's
-        // fields were read from the CORRECT (non-double-translated)
-        // offset; the copied bytes confirm the DMA itself used the right
-        // dramAddr/devAddr/len too.
-        assert_eq!(&rdram[0x5000..0x5004], &[0xAB, 0xAB, 0xAB, 0xAB]);
+        // dramAddr (0x8000_5000) -> rdram offset 0x5000. The DMA must deliver
+        // the big-endian cart word so the guest's MEM_W reads it intact
+        // (0x12345678); rdram is native-word storage, so the physical bytes
+        // are byte-reversed (78 56 34 12). A flat copy would leave 12 34 56 78
+        // and MEM_W would read 0x78563412 -- exactly DmaMgr_Init's hang.
+        let mem_w = u32::from_ne_bytes(rdram[0x5000..0x5004].try_into().unwrap());
+        assert_eq!(mem_w, 0x1234_5678);
     }
 
     /// Regression test for the OoT-boot hang (2026-07-14): `osEPiReadIo`
