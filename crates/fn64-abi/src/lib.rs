@@ -854,6 +854,15 @@ pub unsafe extern "C" fn osSendMesg_recomp(_rdram: *mut u8, ctx: *mut RecompCont
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
     let msg: Mesg = ctx.r5 as u32;
     let may_block = ctx.r6 == OS_MESG_BLOCK;
+    if std::env::var("FN64_DEBUG_SEND").is_ok() {
+        let tid = ACTIVE_THREAD_ID.with(|c| c.get());
+        eprintln!(
+            "[DEBUG osSendMesg_recomp] active_thread={tid:?} mq_offset={:#x} msg={msg:#x} \
+             may_block={may_block} r29(sp)={:#x}",
+            mq_addr.offset(),
+            ctx.r29
+        );
+    }
 
     match suspend_active_coroutine(Yield::BlockOnSend {
         mq_addr,
