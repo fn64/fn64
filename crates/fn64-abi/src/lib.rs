@@ -1840,8 +1840,16 @@ unsafe fn dispatch_gfx_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
                 data_size: header.data_size,
             };
             let rdram_len = RDRAM_LEN.with(|cell| cell.get());
-            let rdram_slice = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
-            let result = backend.process_task(rdram_slice, &task);
+            let rdram_slice = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
+            // The color framebuffer the VI presents (`osViSwapBuffer`'s frame
+            // buffer, e.g. OoT's 0x3b5000/0x3da800) -- NOT `task.output_buff`
+            // (OoT's is 0x80151640, the RSP's DRAM command-FIFO output region,
+            // a different address). The reference backend rasterizes into its
+            // own surface and copies the result here so the VI-presented frame
+            // isn't blank. `0` (no VI framebuffer set yet) tells the backend
+            // "no known color target": it renders to its own surface only.
+            let output_addr = current_vi_framebuffer().unwrap_or(0);
+            let result = backend.process_task(rdram_slice, &task, output_addr);
             RENDER_LAST_ERROR.with(|cell| cell.replace(result.err().map(|e| e.to_string())));
         }
     });
@@ -4942,7 +4950,7 @@ mod tests {
             data_ptr: DL_ADDR as u32,
             ..Default::default()
         };
-        direct.process_task(&rdram, &task).unwrap();
+        direct.process_task(&mut rdram, &task, 0).unwrap();
         assert!(
             direct
                 .framebuffer()
