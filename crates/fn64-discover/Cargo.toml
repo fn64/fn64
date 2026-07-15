@@ -1,0 +1,20 @@
+[package]
+name = "fn64-discover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mechanical, zero-LLM N64 ROM function-metadata discovery frontend, per docs/DISCOVER-DESIGN.md. Proven facts + rejected candidates + an explicit unresolved frontier -- never a guessed symbol file."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+
+[dev-dependencies]
+
+[[bin]]
+name = "gate_b1"
+path = "src/bin/gate_b1.rs"
