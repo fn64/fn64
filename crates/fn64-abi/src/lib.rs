@@ -306,6 +306,39 @@ thread_local! {
     static ACTIVE_RDRAM: Cell<*mut u8> = const { Cell::new(std::ptr::null_mut()) };
 }
 
+/// A registered thread's `(Yielder, rdram)` pair -- see `THREAD_CONTEXTS`.
+type ThreadContext = (*const Yielder<Resume, Yield>, *mut u8);
+
+thread_local! {
+    /// Per-thread `(Yielder, rdram)` registry -- see `run_one_step`'s doc
+    /// comment for the bug this closes (2026-07-14): `with_active_yielder`
+    /// only ever runs ONCE per thread, wrapping that thread's entire body
+    /// closure, so it correctly arms `ACTIVE_YIELDER`/`ACTIVE_THREAD_ID`/
+    /// `ACTIVE_RDRAM` for that thread's FIRST run segment -- but every
+    /// `GameThread` coroutine shares this same native OS thread's
+    /// thread-locals, and a suspended thread's own restore-to-`previous`
+    /// code cannot run again until its body genuinely returns (the thread
+    /// dies). So the moment a SECOND thread starts (or any already-started
+    /// thread is resumed after some OTHER thread most recently ran), the
+    /// active cells are stale, and a `_recomp` shim on the wrong/no
+    /// coroutine's native stack can call `Yielder::suspend` on a `Yielder`
+    /// that does not belong to the stack currently executing -- corrupting
+    /// that other coroutine's saved resume context (the OoT Main-resume
+    /// SIGBUS at PC=0x1: `fn64-diff`'s first-divergence report). This
+    /// registry lets `run_one_step` re-arm the ABOUT-TO-BE-RESUMED thread's
+    /// own `(Yielder, rdram)` immediately before every single resume, not
+    /// just the first. Entries are inserted once (at thread creation, by
+    /// `with_active_yielder`) and never removed -- a `Yielder` pointer
+    /// stays valid for its coroutine's entire lifetime (the coroutine's
+    /// native stack the pointer refers into isn't freed until the
+    /// `GameThread`/`Coroutine` itself is dropped, which outlives every
+    /// `run_one_step` call this registry is consulted from), and a dead
+    /// thread is never picked by `peek_next_thread`/`pick_next` again, so a
+    /// stale entry for a dead thread is simply never looked up.
+    static THREAD_CONTEXTS: RefCell<std::collections::HashMap<ThreadId, ThreadContext>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
 /// THE single gateway to `EXECUTOR`. Every `_recomp` shim, every host-facing
 /// helper, and every test in this crate that touches the executor goes
 /// through this one function -- `EXECUTOR` itself is a private `thread_local`
@@ -393,6 +426,15 @@ fn with_host<R>(f: impl FnOnce(&mut HostState) -> R) -> R {
 
 /// Install `yielder`/`thread_id`/`rdram` as the active ones for the
 /// duration of `f`. See module doc.
+///
+/// Also registers `(yielder, rdram)` in `THREAD_CONTEXTS` under `thread_id`
+/// -- this call only happens ONCE per thread (wrapping that thread's entire
+/// body closure, from `osCreateThread_recomp`/`boot_thread0`/test helpers),
+/// so this is the one place that ever learns a given thread's `Yielder`
+/// pointer. `run_one_step` (below) is what re-arms `ACTIVE_YIELDER`/
+/// `ACTIVE_THREAD_ID`/`ACTIVE_RDRAM` from this registry before every
+/// subsequent resume -- see `THREAD_CONTEXTS`' doc comment for the bug this
+/// closes.
 pub fn with_active_yielder<R>(
     thread_id: ThreadId,
     rdram: *mut u8,
@@ -400,6 +442,38 @@ pub fn with_active_yielder<R>(
     f: impl FnOnce() -> R,
 ) -> R {
     let ptr = yielder as *const Yielder<Resume, Yield>;
+    THREAD_CONTEXTS.with(|cell| cell.borrow_mut().insert(thread_id, (ptr, rdram)));
+    let previous_yielder = ACTIVE_YIELDER.with(|cell| cell.replace(Some(ptr)));
+    let previous_id = ACTIVE_THREAD_ID.with(|cell| cell.replace(Some(thread_id)));
+    let previous_rdram = ACTIVE_RDRAM.with(|cell| cell.replace(rdram));
+    let result = f();
+    ACTIVE_YIELDER.with(|cell| cell.set(previous_yielder));
+    ACTIVE_THREAD_ID.with(|cell| cell.set(previous_id));
+    ACTIVE_RDRAM.with(|cell| cell.set(previous_rdram));
+    result
+}
+
+/// Re-arm `ACTIVE_YIELDER`/`ACTIVE_THREAD_ID`/`ACTIVE_RDRAM` to `thread_id`'s
+/// own registered `(Yielder, rdram)` (from `THREAD_CONTEXTS`, populated once
+/// by that thread's own `with_active_yielder` call at creation), run `f`,
+/// then restore whatever was active before. This is THE fix for the
+/// coroutine-context-corruption bug (see `THREAD_CONTEXTS`' doc comment):
+/// every `GameThread::resume` must go through this so the thread actually
+/// about to run always has ITS OWN context active, never a stale one left
+/// over from whichever thread most recently ran.
+///
+/// If `thread_id` has no registered context yet (this run_one_step is about
+/// to resume a thread's coroutine for the very first time, `Resume::Start`
+/// -- that thread's OWN `with_active_yielder` call hasn't executed yet,
+/// since it lives inside the coroutine body being resumed), this is a
+/// no-op passthrough: the FIRST resume is exactly the case the original,
+/// single `with_active_yielder` call (inside the coroutine body) already
+/// handles correctly by itself.
+fn with_rearmed_context<R>(thread_id: ThreadId, f: impl FnOnce() -> R) -> R {
+    let registered = THREAD_CONTEXTS.with(|cell| cell.borrow().get(&thread_id).copied());
+    let Some((ptr, rdram)) = registered else {
+        return f();
+    };
     let previous_yielder = ACTIVE_YIELDER.with(|cell| cell.replace(Some(ptr)));
     let previous_id = ACTIVE_THREAD_ID.with(|cell| cell.replace(Some(thread_id)));
     let previous_rdram = ACTIVE_RDRAM.with(|cell| cell.replace(rdram));
@@ -2017,13 +2091,38 @@ pub unsafe fn boot_thread0(
 /// Returns `false` when nothing was runnable -- the harness should then
 /// call `advance_virtual_time` to make host-driven progress (VI retrace,
 /// due timers) before trying again.
+///
+/// This is THE seam that re-arms the coroutine-context thread-locals (see
+/// `THREAD_CONTEXTS`' doc comment) to the thread ABOUT to be resumed --
+/// every caller in this crate (including this crate's own tests) must
+/// dispatch a scheduling step through this function (or `run_to_idle`,
+/// below), never a bare `exec.run_one_step()`/`exec.run_to_idle()` inside a
+/// `with_executor` closure, or the re-arm is skipped and the bug this wave
+/// fixed reappears.
 pub fn run_one_step() -> bool {
-    with_executor(|exec| exec.run_one_step())
+    with_executor(|exec| {
+        // `peek_next_thread` is a read-only preview of exactly which thread
+        // `exec.run_one_step()` is about to resume -- read it BEFORE the
+        // resume so the correct thread's context is active for the entire
+        // duration of that resume (including every `_recomp` shim call the
+        // thread's body makes after waking, up to and including its next
+        // suspend). `None` means nothing is runnable -- no resume will
+        // happen, so no context needs arming.
+        match exec.peek_next_thread() {
+            Some(id) => with_rearmed_context(id, || exec.run_one_step()),
+            None => exec.run_one_step(),
+        }
+    })
 }
 
-/// Run until the run queue is idle (every thread finished or blocked).
+/// Run until the run queue is idle (every thread finished or blocked). See
+/// `run_one_step`'s doc comment -- this loops it rather than calling
+/// `Executor::run_to_idle` directly, so every individual resume inside the
+/// loop gets its own correctly-armed context (a single re-arm before the
+/// whole loop would be exactly as wrong as the original bug once a second
+/// thread's turn came up).
 pub fn run_to_idle() {
-    with_executor(|exec| exec.run_to_idle());
+    while run_one_step() {}
 }
 
 /// Whether thread `id` has finished (its coroutine returned or was never
@@ -2920,7 +3019,7 @@ mod tests {
     }
 
     fn run_to_idle_with_yielder_plumbing() {
-        with_executor(|exec| exec.run_to_idle());
+        run_to_idle();
     }
 
     #[test]
@@ -2931,13 +3030,9 @@ mod tests {
             pause_self(std::ptr::null_mut());
             *ran_twice2.borrow_mut() += 1;
         });
-        with_executor(|exec| {
-            assert!(exec.run_one_step());
-        });
+        assert!(run_one_step());
         assert_eq!(*ran_twice.borrow(), 0);
-        with_executor(|exec| {
-            assert!(exec.run_one_step());
-        });
+        assert!(run_one_step());
         assert_eq!(*ran_twice.borrow(), 1);
     }
 
@@ -2979,9 +3074,7 @@ mod tests {
             *delivered_second2.borrow_mut() = true;
         });
 
-        with_executor(|exec| {
-            exec.run_one_step();
-        });
+        run_one_step();
         assert!(!*delivered_second.borrow());
 
         with_executor(|exec| {
@@ -3007,9 +3100,7 @@ mod tests {
             let mut recv_ctx = ctx_with(mq_vram, msg_out_vram, OS_MESG_BLOCK);
             unsafe { osRecvMesg_recomp(rdram_ptr, &mut recv_ctx as *mut _) };
         });
-        with_executor(|exec| {
-            exec.run_one_step();
-        });
+        run_one_step();
 
         with_executor(|exec| {
             let outcome = exec.send_mesg(0, mq_addr, 0x1234_5678, false);
@@ -3021,6 +3112,178 @@ mod tests {
         // MEM_W is a native-endian word access, not big-endian.
         let written = i32::from_ne_bytes(rdram[0x20..0x24].try_into().unwrap());
         assert_eq!(written, 0x1234_5678);
+    }
+
+    /// Regression test for the coroutine-context-corruption bug the OoT
+    /// boot harness hit (Main-resume SIGBUS, PC=0x1 at its 5th `Woken`
+    /// resume, immediately after another thread blocked -- see
+    /// `crates/fn64-diff/docs/2026-07-14-first-divergence-report.md`).
+    ///
+    /// `with_active_yielder` (this file) installed `ACTIVE_YIELDER`/
+    /// `ACTIVE_THREAD_ID`/`ACTIVE_RDRAM` exactly ONCE per thread, wrapping
+    /// the thread's ENTIRE body closure -- correct for the coroutine's own
+    /// suspend calls, but never re-armed on each resume. Because every
+    /// `GameThread` coroutine runs on the SAME native OS thread and shares
+    /// these `thread_local!` cells, once thread A suspends (its body's
+    /// `with_active_yielder` call is paused mid-flight, its restore-to-
+    /// `previous` code never runs until the body truly returns), the cells
+    /// are left pointing at thread A's `Yielder`/id/rdram. If thread B is
+    /// then resumed and calls a `_recomp` shim that suspends, it read
+    /// thread A's stale `ACTIVE_YIELDER` and called `Yielder::suspend` on
+    /// the WRONG coroutine's handle -- corrupting that coroutine's native
+    /// resume context. This reproduces the exact two-thread interleaved
+    /// shape: thread A blocks first (on a full send queue), then thread B
+    /// blocks (on an empty recv queue) while A is still parked -- mirroring
+    /// "thread 18 blocks, then thread 3's next resume lands at PC=0x1."
+    /// Both are then woken and MUST each observe their own identity/rdram,
+    /// not the other's.
+    #[test]
+    fn two_threads_blocked_and_woken_interleaved_each_resume_their_own_context() {
+        // A full queue (capacity 1, already holds one message) so thread A
+        // blocks on send; a separate empty queue so thread B blocks on recv.
+        let send_mq_vram: u64 = 0xFFFF_FFFF_8009_0000;
+        let send_mq_addr = RdramAddr::from_gpr(send_mq_vram);
+        let mut create_send_q = ctx_with(send_mq_vram, 0, 1);
+        unsafe { osCreateMesgQueue_recomp(std::ptr::null_mut(), &mut create_send_q as *mut _) };
+        with_executor(|exec| {
+            assert_eq!(
+                exec.send_mesg(0, send_mq_addr, 0xFFFF_FFFF, false),
+                SendMesgOutcome::Delivered
+            );
+        });
+
+        let recv_mq_vram: u64 = 0xFFFF_FFFF_800A_0000;
+        let mut create_recv_q = ctx_with(recv_mq_vram, 0, 1);
+        unsafe { osCreateMesgQueue_recomp(std::ptr::null_mut(), &mut create_recv_q as *mut _) };
+
+        // Two SEPARATE rdram buffers, each tagged with a value only that
+        // thread's own body should ever be able to observe/write, so any
+        // cross-wire between the two coroutines' contexts is directly
+        // visible rather than needing a crash to notice.
+        let mut rdram_a = vec![0u8; 64];
+        let rdram_a_ptr = rdram_a.as_mut_ptr();
+        let mut rdram_b = vec![0u8; 64];
+        let rdram_b_ptr = rdram_b.as_mut_ptr();
+
+        let observed_a = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed_a2 = observed_a.clone();
+        let observed_b = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed_b2 = observed_b.clone();
+
+        const THREAD_A: ThreadId = 500;
+        const THREAD_B: ThreadId = 501;
+
+        // Thread A: blocks on osSendMesg (queue already full). Once
+        // unblocked, records its OWN thread id (via osGetThreadId_recomp,
+        // which reads ACTIVE_THREAD_ID) and writes a marker into ITS OWN
+        // rdram buffer at a fixed offset.
+        with_executor(|exec| {
+            exec.create_thread(THREAD_A, 5, move |yielder, first_input| {
+                with_active_yielder(THREAD_A, rdram_a_ptr, yielder, || {
+                    let _ = first_input;
+                    let mut send_ctx = ctx_with(send_mq_vram, 0xAAAA, OS_MESG_BLOCK);
+                    unsafe { osSendMesg_recomp(rdram_a_ptr, &mut send_ctx as *mut _) };
+                    let mut id_ctx = ctx_with(0, 0, 0);
+                    unsafe { osGetThreadId_recomp(rdram_a_ptr, &mut id_ctx as *mut _) };
+                    *observed_a2.borrow_mut() = Some(id_ctx.r2);
+                    unsafe {
+                        std::ptr::write(rdram_a_ptr.add(0x30) as *mut u32, 0xA0A0_A0A0u32);
+                    }
+                });
+            });
+            exec.start_thread(THREAD_A);
+        });
+
+        // Thread B: blocks on osRecvMesg (queue empty). Same shape, its own
+        // buffer/marker/expected id.
+        with_executor(|exec| {
+            exec.create_thread(THREAD_B, 5, move |yielder, first_input| {
+                with_active_yielder(THREAD_B, rdram_b_ptr, yielder, || {
+                    let _ = first_input;
+                    let msg_out_vram: u64 = 0xFFFF_FFFF_8000_0040;
+                    let mut recv_ctx = ctx_with(recv_mq_vram, msg_out_vram, OS_MESG_BLOCK);
+                    unsafe { osRecvMesg_recomp(rdram_b_ptr, &mut recv_ctx as *mut _) };
+                    let mut id_ctx = ctx_with(0, 0, 0);
+                    unsafe { osGetThreadId_recomp(rdram_b_ptr, &mut id_ctx as *mut _) };
+                    *observed_b2.borrow_mut() = Some(id_ctx.r2);
+                    unsafe {
+                        std::ptr::write(rdram_b_ptr.add(0x30) as *mut u32, 0xB0B0_B0B0u32);
+                    }
+                });
+            });
+            exec.start_thread(THREAD_B);
+        });
+
+        // Run both threads until they've each hit their blocking yield --
+        // thread A blocks first, THEN thread B blocks while A is still
+        // parked (the exact "thread 18 blocks while thread 3 is blocked,
+        // then thread 3 resumes" interleaving from the divergence report).
+        assert!(run_one_step()); // thread A runs, blocks on send
+        assert!(run_one_step()); // thread B runs, blocks on recv
+        with_executor(|exec| {
+            assert!(!exec.is_thread_dead(THREAD_A));
+            assert!(!exec.is_thread_dead(THREAD_B));
+        });
+
+        // Wake thread A FIRST (drain a slot on its send queue) while
+        // ACTIVE_YIELDER/ACTIVE_THREAD_ID are still stale from thread B --
+        // B was the last thread whose body actually ran `with_active_
+        // yielder`'s install (it started and blocked AFTER A did), so if
+        // the install is never re-armed on resume, A's post-wake
+        // `osGetThreadId_recomp` call will incorrectly read B's id. This is
+        // the precise "thread 18 blocks [here: B], then thread 3 [here: A]
+        // resumes into the wrong saved context" interleaving from the
+        // divergence report.
+        with_executor(|exec| {
+            let outcome = exec.recv_mesg(999, send_mq_addr, false);
+            assert_eq!(outcome, RecvMesgOutcome::Delivered(0xFFFF_FFFF));
+        });
+        assert!(run_one_step()); // resumes A only
+                                 // Now wake and resume B.
+        with_executor(|exec| {
+            let recv_addr = RdramAddr::from_gpr(recv_mq_vram);
+            let outcome = exec.send_mesg(0, recv_addr, 0xBEEF, false);
+            assert_eq!(outcome, SendMesgOutcome::Delivered);
+        });
+        run_to_idle();
+
+        with_executor(|exec| {
+            assert!(exec.is_thread_dead(THREAD_A));
+            assert!(exec.is_thread_dead(THREAD_B));
+        });
+
+        // The actual assertion: each thread must have resumed into ITS OWN
+        // saved context -- its own thread id via ACTIVE_THREAD_ID, and its
+        // own rdram buffer's marker, never the other thread's.
+        assert_eq!(
+            *observed_a.borrow(),
+            Some(THREAD_A as u64),
+            "thread A resumed with a stale/wrong ACTIVE_THREAD_ID -- classic sign of \
+             ACTIVE_YIELDER/ACTIVE_THREAD_ID left pointing at whichever thread suspended \
+             most recently instead of the thread actually being resumed"
+        );
+        assert_eq!(
+            *observed_b.borrow(),
+            Some(THREAD_B as u64),
+            "thread B resumed with a stale/wrong ACTIVE_THREAD_ID"
+        );
+        let marker_a = unsafe { std::ptr::read(rdram_a_ptr.add(0x30) as *const u32) };
+        let marker_b = unsafe { std::ptr::read(rdram_b_ptr.add(0x30) as *const u32) };
+        assert_eq!(
+            marker_a, 0xA0A0_A0A0,
+            "thread A must write into its OWN rdram buffer, not thread B's"
+        );
+        assert_eq!(
+            marker_b, 0xB0B0_B0B0,
+            "thread B must write into its OWN rdram buffer, not thread A's"
+        );
+        // Cross-check the buffers weren't swapped/aliased: A's buffer must
+        // NOT carry B's marker and vice versa.
+        let marker_a_has_b =
+            unsafe { std::ptr::read(rdram_a_ptr.add(0x30) as *const u32) } == 0xB0B0_B0B0u32;
+        let marker_b_has_a =
+            unsafe { std::ptr::read(rdram_b_ptr.add(0x30) as *const u32) } == 0xA0A0_A0A0u32;
+        assert!(!marker_a_has_b && !marker_b_has_a);
     }
 
     /// Test-only helper: register an `OSThread*` handle -> `OSId` mapping,
@@ -3315,7 +3578,7 @@ mod tests {
             start_ctx.r4 = 0x8006_0000;
             osStartThread_recomp(rdram.as_mut_ptr(), &mut start_ctx as *mut _);
         }
-        with_executor(|exec| exec.run_to_idle());
+        run_to_idle();
 
         // The spawned thread wrote 0xCAFE at (sp_vram + 0x18) == rdram
         // offset 0x1018. Reaching this point at all (no EXC_BAD_ACCESS) AND
@@ -3356,9 +3619,7 @@ mod tests {
             start_ctx.r4 = thread_handle_vram;
             osStartThread_recomp(rdram.as_mut_ptr(), &mut start_ctx as *mut _);
         }
-        with_executor(|exec| {
-            exec.run_to_idle();
-        });
+        run_to_idle();
         // If the real entry point ran, it doubled arg=21 into its own ctx.r2
         // -- not observable here (that ctx was thread-local to the closure),
         // but reaching run_to_idle() without panicking already proves
@@ -3404,7 +3665,7 @@ mod tests {
             unsafe { osStartThread_recomp(inner_rdram.as_mut_ptr(), &mut start_ctx as *mut _) };
         });
 
-        with_executor(|exec| exec.run_to_idle());
+        run_to_idle();
         // Reaching here without a "RefCell already borrowed" panic (or the
         // SIGABRT that follows one across an extern "C" boundary) is the
         // whole assertion -- both thread 400 (outer) and thread 401 (spawned

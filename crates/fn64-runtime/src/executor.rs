@@ -43,7 +43,19 @@ pub const OS_EVENT_VI: u32 = 7;
 /// precondition here: there is no second host thread, full stop.
 #[derive(Default)]
 pub struct Executor {
-    threads: HashMap<ThreadId, GameThread>,
+    /// `Box<GameThread>`, NOT a bare `GameThread` -- see `run_one_step`'s
+    /// doc comment for the second block/wake defect this closes (the OoT
+    /// Main-resume SIGBUS): a `GameThread`'s coroutine body can
+    /// synchronously call back into `with_executor` and insert a NEW entry
+    /// into this SAME map (spawning another thread) WHILE `run_one_step` is
+    /// still holding a live `&mut GameThread` into it for the resume that's
+    /// currently executing. A bare-`GameThread`-valued `HashMap` would move
+    /// every existing value on a reallocating insert, invalidating that
+    /// live reference (UB) -- boxing means a reallocation only ever moves
+    /// `Box` HANDLES; each `GameThread` stays at a fixed heap address for
+    /// its entire life, so a reference obtained by dereferencing its `Box`
+    /// before the reentrant insert stays valid through and after it.
+    threads: HashMap<ThreadId, Box<GameThread>>,
     /// The priority-ordered run queue: runnable thread ids. Re-sorted by
     /// priority (descending) whenever a thread becomes runnable, so
     /// `pick_next` is always "the highest-priority entry," matching
@@ -160,7 +172,8 @@ impl Executor {
             !self.threads.contains_key(&id),
             "osCreateThread: thread id {id} already exists"
         );
-        self.threads.insert(id, GameThread::new(id, priority, body));
+        self.threads
+            .insert(id, Box::new(GameThread::new(id, priority, body)));
     }
 
     /// `osStartThread(t)`. Puts the thread on the run queue for the first
@@ -600,6 +613,21 @@ impl Executor {
         self.run_queue.first().copied()
     }
 
+    /// Read-only preview of which `ThreadId` the next `run_one_step` call
+    /// will resume (or `None` if nothing is runnable), with no mutation.
+    /// Needed by `fn64-abi`'s coroutine-context plumbing: the per-thread
+    /// `ACTIVE_YIELDER`/`ACTIVE_THREAD_ID`/`ACTIVE_RDRAM` thread-locals (see
+    /// that crate's module doc) must be re-armed to the ABOUT-TO-BE-RESUMED
+    /// thread's own saved values immediately before every single resume --
+    /// not just once at thread creation -- since every `GameThread`
+    /// coroutine shares that same native OS thread's thread-locals. This
+    /// lets the caller look up "whose context do I need to install" BEFORE
+    /// calling `run_one_step`, without duplicating this crate's scheduling
+    /// policy (still `pick_next`'s exclusive job) outside `Executor`.
+    pub fn peek_next_thread(&self) -> Option<ThreadId> {
+        self.pick_next()
+    }
+
     /// Run exactly one scheduling step: pick the highest-priority runnable
     /// thread and resume it until it yields or finishes, handling the
     /// yield's semantics (pause_self / blocking send / blocking recv)
@@ -643,10 +671,36 @@ impl Executor {
             },
         );
 
-        let result = {
-            let thread = self.threads.get_mut(&id).expect("run queue had stale id");
-            thread.resume(RunToken::issue(), resume_with)
-        };
+        // `self.threads` is keyed to `Box<GameThread>` (not a bare
+        // `GameThread`) specifically so this next line is sound -- see
+        // `threads`' field doc comment for the second block/wake defect
+        // this closes (the OoT Main-resume SIGBUS,
+        // `fn64-diff`'s first-divergence report): `thread.resume(..)` runs
+        // the coroutine body, which may synchronously call BACK into
+        // `with_executor` (e.g. the thread's own body calling
+        // `osCreateThread_recomp` to spawn another thread -- an ordinary,
+        // supported nested call, no second `RunToken` involved -- see
+        // `fn64-abi`'s `ReentrantCell` doc). That nested call can insert a
+        // NEW entry into this SAME map (`create_thread`'s
+        // `self.threads.insert`), and a `HashMap` insert that grows the
+        // table reallocates its bucket array. If the map stored `GameThread`
+        // BY VALUE, that reallocation would MOVE every existing value --
+        // including the very `GameThread`/`Coroutine` whose `resume()` is
+        // executing above us on the call stack right now, out from under
+        // the `&mut GameThread` this line borrows -- a dangling reference
+        // in use for the rest of the resume (real UB, and the actual
+        // failure was delayed rather than immediate: the corrupted
+        // `Coroutine`'s internal resume-target state only got read again,
+        // and crashed with PC landing in unmapped memory, on that SAME
+        // thread's NEXT resume, arbitrarily later -- exactly the OoT
+        // Main-resume SIGBUS's shape). Boxing means the map's bucket array
+        // reallocating only ever moves `Box<GameThread>` HANDLES (pointers)
+        // -- the `GameThread` each one points to stays at a fixed heap
+        // address for its entire life, so a `&mut GameThread` obtained by
+        // dereferencing a `Box` before a reentrant insert remains valid
+        // through and after that insert.
+        let thread = self.threads.get_mut(&id).expect("run queue had stale id");
+        let result = thread.resume(RunToken::issue(), resume_with);
 
         match result {
             CoroutineResult::Return(()) => {
