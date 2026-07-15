@@ -45,6 +45,47 @@ pub struct FuncInput<'a> {
     pub words: &'a [u32],
 }
 
+/// How an inter-function control transfer (a `JAL`/`J` whose target lands
+/// *outside* the current function) is emitted.
+///
+/// This is the ELF/symbol-table front-end's decision, mirroring N64Recomp's
+/// `resolve_jal` (`recompilation.cpp`): a `JAL 0xNNN` whose target vram is a
+/// known function symbol becomes a **direct Rust call** to that named `fn`,
+/// which is what makes the output a whole-*program* recompile with real
+/// cross-function calls rather than a bag of per-function `lookup()` stubs.
+///
+/// - [`CallTarget::Direct`] — the target is a uniquely-known function; emit a
+///   direct `name(ctx, mem)` call (N64Recomp's `JalResolutionResult::Match`).
+/// - [`CallTarget::Indirect`] — the target is unknown, ambiguous, or the call
+///   is register-indirect; emit a runtime `lookup(addr)(ctx, mem)` dispatch
+///   (N64Recomp's `Ambiguous`/`NoMatch`/`LOOKUP_FUNC`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallTarget {
+    /// A direct call to the named recompiled function.
+    Direct(String),
+    /// A runtime-dispatched call (address resolved at run time).
+    Indirect,
+}
+
+/// Resolves a jump/call target vram to how it should be emitted. Implemented by
+/// the symbol-table front-end ([`crate::module::SymbolTable`]); the default
+/// [`NullResolver`] resolves nothing (everything indirect), which reproduces
+/// the per-function foundation behaviour exactly.
+pub trait CallResolver {
+    /// Resolve an absolute (already-computed) call target vram. `Some(name)`
+    /// yields a direct call; `None` (the default) yields an indirect lookup.
+    fn resolve(&self, target_vram: u32) -> CallTarget {
+        let _ = target_vram;
+        CallTarget::Indirect
+    }
+}
+
+/// The trivial resolver: never resolves a name, so every `JAL`/`J` target is an
+/// indirect `lookup()`. This is what [`emit_function`] uses, preserving the
+/// per-function foundation output byte-for-byte.
+pub struct NullResolver;
+impl CallResolver for NullResolver {}
+
 /// Emit a complete Rust module: the `fn <name>` plus a doc header. The emitted
 /// function has signature `fn <name>(ctx: &mut RecompContext, mem: &mut Rdram)`.
 ///
@@ -53,7 +94,20 @@ pub struct FuncInput<'a> {
 /// as a `lookup(target)(ctx, mem)` call so the shape is proven, matching
 /// N64Recomp's `LOOKUP_FUNC`. Straight-line leaf functions (the oracle target)
 /// need none of that.
+///
+/// This is the per-function entry point: every `JAL`/`J` inter-function target
+/// is emitted as an indirect `lookup()`. To resolve targets to direct named
+/// calls (the whole-program front-end), use [`emit_function_resolved`].
 pub fn emit_function(func: &FuncInput) -> String {
+    emit_function_resolved(func, &NullResolver)
+}
+
+/// Emit one function, resolving inter-function `JAL`/`J` targets through
+/// `resolver`. A [`CallTarget::Direct`] target becomes a direct
+/// `name(ctx, mem)` call (or, for `J`, a direct tail call `name(ctx, mem);
+/// return;`); a [`CallTarget::Indirect`] target keeps the `lookup(addr)`
+/// runtime dispatch. This is the codegen half of the symbol-table front-end.
+pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> String {
     let base = func.vram;
     let words = func.words;
 
@@ -122,7 +176,9 @@ pub fn emit_function(func: &FuncInput) -> String {
             // which consumes the delay slot.
             let delay = instrs.get(i + 1).copied();
             let delay_vram = vram + 4;
-            emit_control_transfer(&mut out, instr, vram, delay, delay_vram, base, func_end);
+            emit_control_transfer(
+                &mut out, instr, vram, delay, delay_vram, base, func_end, resolver,
+            );
             // Skip the delay-slot word; it was handled by the transfer.
             i += 2;
             // Close the arm if the next vram is a leader (new arm) or we ran off
@@ -165,6 +221,7 @@ fn branch_target(instr: &Instruction, vram: u32) -> Option<u32> {
             Some(rel(off))
         }
         Bltzal { off, .. } | Bgezal { off, .. } => Some(rel(off)),
+        Bc1t { off } | Bc1f { off } | Bc1tl { off } | Bc1fl { off } => Some(rel(off)),
         // Absolute jumps: target = (delay_slot_pc & 0xF0000000) | (target << 2).
         J { target } | Jal { target } => {
             Some((vram.wrapping_add(4) & 0xF000_0000) | (target << 2))
@@ -261,7 +318,10 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
             line(out, format!("ctx.set_r({}, {} ^ {:#X});", rt, r(rs), imm as u64))
         }
         Lui { rt, imm } => {
-            line(out, format!("ctx.set_r32({}, {:#X}i32);", rt, (imm as i32) << 16))
+            // Emit the constant as a `u32` literal cast to `i32`: a high LUI
+            // (e.g. 0x800F0000) has bit 31 set, so a bare `…i32` literal would
+            // overflow the `i32` range (a rustc `overflowing_literals` error).
+            line(out, format!("ctx.set_r32({}, {:#X}u32 as i32);", rt, ((imm as u32) << 16)))
         }
 
         // --- ALU register ---
@@ -431,6 +491,184 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
             format!("mem.store_wr(Rdram::eff_addr({}, {}), {});", r(base), off, ru32(rt)),
         ),
 
+        // ================================================================
+        // COP1 / FPU.
+        //
+        // All FPU register reads/writes go through typed `RecompContext`
+        // accessors (`f_s`/`set_f_s` single, `f_d`/`set_f_d` double,
+        // `f_bits`/`d_bits` raw) that resolve the FR=0 even/odd pairing
+        // internally — the emitter never open-codes the `f_odd[(N-1)*2]`
+        // pointer arithmetic the C oracle uses. Semantics are clean-roomed
+        // from the MIPS III / VR4300 reference (and cross-checked against the
+        // recomp.h CVT_/TRUNC_ macro definitions, which are the ISA facts).
+        // ================================================================
+
+        // --- GPR <-> FPR moves ---
+        // MFC1: GPR = sign-extend(FPR single low32). Mirrors `(int32_t)f.u32l`.
+        Mfc1 { rt, fs } => {
+            line(out, format!("ctx.set_r32({}, ctx.f_bits({}) as i32);", rt, fs))
+        }
+        // MTC1: FPR single low32 = GPR low32 (raw bits).
+        Mtc1 { rt, fs } => {
+            line(out, format!("ctx.set_f_bits({}, {});", fs, ru32(rt)))
+        }
+        // DMFC1: GPR = FPR full 64 bits.
+        Dmfc1 { rt, fs } => line(out, format!("ctx.set_r({}, ctx.d_bits({}));", rt, fs)),
+        // DMTC1: FPR 64 bits = GPR.
+        Dmtc1 { rt, fs } => line(out, format!("ctx.set_d_bits({}, {});", fs, ru64(rt))),
+        // CFC1/CTC1: control-register moves. The only observable control state
+        // in this runtime is the (nearest-mode-only) FCSR; OoT reads FCR31 to
+        // save/restore it around library calls. We model these as no-ops on
+        // register state beyond routing the GPR (CFC1 yields 0 = the
+        // round-to-nearest/no-flags FCSR the runtime always presents).
+        Cfc1 { rt, .. } => line(out, format!("ctx.set_r32({}, 0);", rt)),
+        Ctc1 { .. } => line(out, "// ctc1: FCSR write (round-to-nearest only; no-op)".to_string()),
+
+        // --- COP1 loads/stores ---
+        Lwc1 { ft, base, off } => line(
+            out,
+            format!(
+                "ctx.set_f_bits({}, mem.load_w(Rdram::eff_addr({}, {})) as u32);",
+                ft,
+                r(base),
+                off
+            ),
+        ),
+        Swc1 { ft, base, off } => line(
+            out,
+            format!("mem.store_w(Rdram::eff_addr({}, {}), ctx.f_bits({}));", r(base), off, ft),
+        ),
+        Ldc1 { ft, base, off } => line(
+            out,
+            format!(
+                "ctx.set_d_bits({}, mem.load_d(Rdram::eff_addr({}, {})));",
+                ft,
+                r(base),
+                off
+            ),
+        ),
+        Sdc1 { ft, base, off } => line(
+            out,
+            format!("mem.store_d(Rdram::eff_addr({}, {}), ctx.d_bits({}));", r(base), off, ft),
+        ),
+
+        // --- Single-precision arithmetic ---
+        AddS { fd, fs, ft } => {
+            line(out, format!("ctx.set_f_s({}, ctx.f_s({}) + ctx.f_s({}));", fd, fs, ft))
+        }
+        SubS { fd, fs, ft } => {
+            line(out, format!("ctx.set_f_s({}, ctx.f_s({}) - ctx.f_s({}));", fd, fs, ft))
+        }
+        MulS { fd, fs, ft } => {
+            line(out, format!("ctx.set_f_s({}, ctx.f_s({}) * ctx.f_s({}));", fd, fs, ft))
+        }
+        DivS { fd, fs, ft } => {
+            line(out, format!("ctx.set_f_s({}, ctx.f_s({}) / ctx.f_s({}));", fd, fs, ft))
+        }
+        AbsS { fd, fs } => line(out, format!("ctx.set_f_s({}, ctx.f_s({}).abs());", fd, fs)),
+        NegS { fd, fs } => line(out, format!("ctx.set_f_s({}, -ctx.f_s({}));", fd, fs)),
+        SqrtS { fd, fs } => line(out, format!("ctx.set_f_s({}, ctx.f_s({}).sqrt());", fd, fs)),
+        // MOV.S is a bit-exact copy (not an arithmetic op): move the raw word.
+        MovS { fd, fs } => line(out, format!("ctx.set_f_bits({}, ctx.f_bits({}));", fd, fs)),
+
+        // --- Double-precision arithmetic ---
+        AddD { fd, fs, ft } => {
+            line(out, format!("ctx.set_f_d({}, ctx.f_d({}) + ctx.f_d({}));", fd, fs, ft))
+        }
+        SubD { fd, fs, ft } => {
+            line(out, format!("ctx.set_f_d({}, ctx.f_d({}) - ctx.f_d({}));", fd, fs, ft))
+        }
+        MulD { fd, fs, ft } => {
+            line(out, format!("ctx.set_f_d({}, ctx.f_d({}) * ctx.f_d({}));", fd, fs, ft))
+        }
+        DivD { fd, fs, ft } => {
+            line(out, format!("ctx.set_f_d({}, ctx.f_d({}) / ctx.f_d({}));", fd, fs, ft))
+        }
+        AbsD { fd, fs } => line(out, format!("ctx.set_f_d({}, ctx.f_d({}).abs());", fd, fs)),
+        NegD { fd, fs } => line(out, format!("ctx.set_f_d({}, -ctx.f_d({}));", fd, fs)),
+        SqrtD { fd, fs } => line(out, format!("ctx.set_f_d({}, ctx.f_d({}).sqrt());", fd, fs)),
+        MovD { fd, fs } => line(out, format!("ctx.set_d_bits({}, ctx.d_bits({}));", fd, fs)),
+
+        // --- Conversions. Float->float use lossless/rounding `as` casts; the
+        //     int destinations write the RAW 32/64 bits of the result into the
+        //     FPR (an int-in-FPR is stored as its two's-complement bit pattern,
+        //     exactly as the C writes `f.u32l = (int32_t)...`). The int source
+        //     of CVT.S.W/CVT.D.W reads the FPR single word AS an i32.
+
+        // int32 (fs single word, read as i32) -> float/double
+        CvtSW { fd, fs } => {
+            line(out, format!("ctx.set_f_s({}, (ctx.f_bits({}) as i32) as f32);", fd, fs))
+        }
+        CvtDW { fd, fs } => {
+            line(out, format!("ctx.set_f_d({}, (ctx.f_bits({}) as i32) as f64);", fd, fs))
+        }
+        // int64 (fs 64 bits, read as i64) -> float/double
+        CvtSL { fd, fs } => {
+            line(out, format!("ctx.set_f_s({}, (ctx.d_bits({}) as i64) as f32);", fd, fs))
+        }
+        CvtDL { fd, fs } => {
+            line(out, format!("ctx.set_f_d({}, (ctx.d_bits({}) as i64) as f64);", fd, fs))
+        }
+        // float <-> double
+        CvtDS { fd, fs } => line(out, format!("ctx.set_f_d({}, ctx.f_s({}) as f64);", fd, fs)),
+        CvtSD { fd, fs } => line(out, format!("ctx.set_f_s({}, ctx.f_d({}) as f32);", fd, fs)),
+
+        // float/double -> int32 (round to nearest, ties to even = FCSR default).
+        // Written as raw bits of the i32 into the FPR single word.
+        CvtWS { fd, fs } => line(
+            out,
+            format!("ctx.set_f_bits({}, round_ties_even_f32(ctx.f_s({})) as i32 as u32);", fd, fs),
+        ),
+        CvtWD { fd, fs } => line(
+            out,
+            format!("ctx.set_f_bits({}, round_ties_even_f64(ctx.f_d({})) as i32 as u32);", fd, fs),
+        ),
+        // float/double -> int64 (round to nearest).
+        CvtLS { fd, fs } => line(
+            out,
+            format!("ctx.set_d_bits({}, round_ties_even_f32(ctx.f_s({})) as i64 as u64);", fd, fs),
+        ),
+        CvtLD { fd, fs } => line(
+            out,
+            format!("ctx.set_d_bits({}, round_ties_even_f64(ctx.f_d({})) as i64 as u64);", fd, fs),
+        ),
+
+        // TRUNC.* -> round toward zero. Rust `f32 as i32` is exactly the C
+        // `(int32_t)val` truncation (both saturate/clamp per IEEE-to-int, and
+        // OoT's inputs are in range), matching the recomp.h TRUNC_W_S macro.
+        TruncWS { fd, fs } => {
+            line(out, format!("ctx.set_f_bits({}, (ctx.f_s({}) as i32) as u32);", fd, fs))
+        }
+        TruncWD { fd, fs } => {
+            line(out, format!("ctx.set_f_bits({}, (ctx.f_d({}) as i32) as u32);", fd, fs))
+        }
+        TruncLS { fd, fs } => {
+            line(out, format!("ctx.set_d_bits({}, (ctx.f_s({}) as i64) as u64);", fd, fs))
+        }
+        TruncLD { fd, fs } => {
+            line(out, format!("ctx.set_d_bits({}, (ctx.f_d({}) as i64) as u64);", fd, fs))
+        }
+
+        // --- FP compares: set the condition flag (FCSR bit 23). ---
+        CEqS { fs, ft } => {
+            line(out, format!("ctx.fpu_cond = ctx.f_s({}) == ctx.f_s({});", fs, ft))
+        }
+        CLtS { fs, ft } => {
+            line(out, format!("ctx.fpu_cond = ctx.f_s({}) < ctx.f_s({});", fs, ft))
+        }
+        CLeS { fs, ft } => {
+            line(out, format!("ctx.fpu_cond = ctx.f_s({}) <= ctx.f_s({});", fs, ft))
+        }
+        CEqD { fs, ft } => {
+            line(out, format!("ctx.fpu_cond = ctx.f_d({}) == ctx.f_d({});", fs, ft))
+        }
+        CLtD { fs, ft } => {
+            line(out, format!("ctx.fpu_cond = ctx.f_d({}) < ctx.f_d({});", fs, ft))
+        }
+        CLeD { fs, ft } => {
+            line(out, format!("ctx.fpu_cond = ctx.f_d({}) <= ctx.f_d({});", fs, ft))
+        }
+
         // Control transfers are never emitted here.
         other => line(out, format!("compile_error!(\"non-straight op reached emit_straight: {:?}\");", other)),
     }
@@ -439,18 +677,24 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
 /// Emit a control transfer (branch/jump) plus its delay slot. The delay slot
 /// runs first (unconditionally for normal branches; only when taken for
 /// branch-likely). Then `pc` is assigned to the successor block.
+#[allow(clippy::too_many_arguments)]
 fn emit_control_transfer(
     out: &mut String,
     instr: Instruction,
     vram: u32,
     delay: Option<Instruction>,
     delay_vram: u32,
-    _base: u32,
-    _func_end: u32,
+    base: u32,
+    func_end: u32,
+    resolver: &dyn CallResolver,
 ) {
     use Instruction::*;
     let target = branch_target(&instr, vram);
     let fallthrough = delay_vram + 4;
+    // Whether an absolute target lands inside THIS function (so it is a local
+    // block, resolved via `pc = ...`), or outside it (an inter-function call
+    // the resolver decides how to emit).
+    let in_func = |t: u32| t >= base && t < func_end;
 
     let emit_delay = |out: &mut String| {
         if let Some(d) = delay {
@@ -470,6 +714,9 @@ fn emit_control_transfer(
             Bgtz { rs, .. } | Bgtzl { rs, .. } => format!("{} > 0", rs64(rs)),
             Bltz { rs, .. } | Bltzl { rs, .. } | Bltzal { rs, .. } => format!("{} < 0", rs64(rs)),
             Bgez { rs, .. } | Bgezl { rs, .. } | Bgezal { rs, .. } => format!("{} >= 0", rs64(rs)),
+            // COP1 branches read the FP condition flag set by the last compare.
+            Bc1t { .. } | Bc1tl { .. } => "ctx.fpu_cond".to_string(),
+            Bc1f { .. } | Bc1fl { .. } => "!ctx.fpu_cond".to_string(),
             _ => return None,
         })
     };
@@ -491,19 +738,44 @@ fn emit_control_transfer(
         J { .. } => {
             emit_delay(out);
             let t = target.unwrap();
-            let _ = writeln!(out, "            pc = {:#010X}; continue 'run;", t);
+            if in_func(t) {
+                // Local jump: transfer control to the block at `t`.
+                let _ = writeln!(out, "            pc = {:#010X}; continue 'run;", t);
+            } else {
+                // Inter-function `J` is a tail call: invoke the target, then
+                // return (the target's `jr $ra` returns to OUR caller).
+                match resolver.resolve(t) {
+                    CallTarget::Direct(name) => {
+                        let _ = writeln!(out, "            {}(ctx, mem); return;", name);
+                    }
+                    CallTarget::Indirect => {
+                        let _ = writeln!(
+                            out,
+                            "            lookup({:#010X})(ctx, mem); return;",
+                            t
+                        );
+                    }
+                }
+            }
         }
         Jal { .. } => {
             // Link: $ra = address after the delay slot.
-            let _ = writeln!(out, "            ctx.set_r32(31, {:#X}i32);", fallthrough as i32);
+            let _ = writeln!(out, "            ctx.set_r32(31, {:#010X}u32 as i32);", fallthrough);
             emit_delay(out);
             let t = target.unwrap();
-            let _ = writeln!(out, "            lookup({:#010X})(ctx, mem);", t);
+            match resolver.resolve(t) {
+                CallTarget::Direct(name) => {
+                    let _ = writeln!(out, "            {}(ctx, mem);", name);
+                }
+                CallTarget::Indirect => {
+                    let _ = writeln!(out, "            lookup({:#010X})(ctx, mem);", t);
+                }
+            }
             let _ = writeln!(out, "            pc = {:#010X}; continue 'run;", fallthrough);
         }
         Jalr { rd, rs } => {
             let link = if rd == 0 { 31 } else { rd };
-            let _ = writeln!(out, "            ctx.set_r32({}, {:#X}i32);", link, fallthrough as i32);
+            let _ = writeln!(out, "            ctx.set_r32({}, {:#010X}u32 as i32);", link, fallthrough);
             emit_delay(out);
             let _ = writeln!(out, "            lookup(ctx.r_u32({}))(ctx, mem);", rs);
             let _ = writeln!(out, "            pc = {:#010X}; continue 'run;", fallthrough);
@@ -513,7 +785,7 @@ fn emit_control_transfer(
             let c = cond(&instr).unwrap();
             let t = target.unwrap();
             let _ = writeln!(out, "            let _take = {};", c);
-            let _ = writeln!(out, "            ctx.set_r32(31, {:#X}i32);", fallthrough as i32);
+            let _ = writeln!(out, "            ctx.set_r32(31, {:#010X}u32 as i32);", fallthrough);
             emit_delay(out);
             let _ = writeln!(
                 out,

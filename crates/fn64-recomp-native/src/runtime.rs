@@ -41,6 +41,20 @@ pub struct RecompContext {
     pub hi: u64,
     /// The LO result register of MULT/DIV.
     pub lo: u64,
+
+    /// The COP1 (FPU) register file, stored as 32 raw 64-bit slots. See the
+    /// [`RecompContext`] FPU accessors for how the FR=0 even/odd pairing maps a
+    /// single-precision register index onto these slots — this mirrors
+    /// `fn64-abi`'s `f_odd` model (an odd `$fN` aliases the HIGH 32-bit word of
+    /// its even partner `$f(N-1)`) so the byte layout matches the recompiled C
+    /// exactly. We keep raw bits (not `f32`/`f64`) so a bit-copy `MOV`/`MTC1`
+    /// never perturbs a NaN payload and the aliasing is pure integer indexing.
+    fpr: [u64; 32],
+    /// The FPU condition flag (FCSR bit 23). Set by the `C.cond.fmt` compares,
+    /// tested by `BC1T`/`BC1F`. This is N64Recomp's per-function `c1cs`
+    /// promoted to context state (equivalent: a compare always precedes the
+    /// branch that reads it, so lifetime is irrelevant to the result).
+    pub fpu_cond: bool,
 }
 
 impl RecompContext {
@@ -98,6 +112,116 @@ impl RecompContext {
     pub fn set_r32(&mut self, idx: u8, val: i32) {
         self.set_r(idx, val as i64 as u64);
     }
+
+    // ================================================================
+    // COP1 / FPU register file.
+    //
+    // # The FR=0 even/odd pairing (the whole reason these aren't 32 plain f32s)
+    //
+    // libultra boots every OSThread with the FPU in FR=0 (32-register) mode.
+    // In that mode a 64-bit value (a double, or a `ldc1`/`sdc1`/`dmtc1` slot)
+    // lives in an *even* register `$f(2k)`, and the odd register `$f(2k+1)`
+    // is NOT independent — it aliases the HIGH 32 bits of that same 64-bit
+    // slot. A single-precision `$f(2k+1)` therefore reads/writes the top word
+    // of `$f(2k)`. This is exactly the `f_odd[(N-1)*2]` addressing the
+    // recompiled C uses (`fn64-abi::RecompContext::arm_fpr_alias`).
+    //
+    // We store the file as 32 `u64` slots and resolve a single-precision index
+    // to (slot, is_high_word). Even N -> (N, low word); odd N -> (N-1, high
+    // word). Double/64-bit ops address the even slot directly. All accessors
+    // move raw *bits* (`f32::from_bits`/`to_bits`), never a lossy cast, so a
+    // `MOV.S`/`MTC1` of a signalling-NaN pattern is preserved bit-exactly.
+    // ================================================================
+
+    /// The 64-bit slot and whether the low (false) or high (true) 32-bit word
+    /// holds single-precision register `idx` under FR=0.
+    #[inline]
+    fn fpr_single_slot(idx: u8) -> (usize, bool) {
+        if idx & 1 == 0 {
+            (idx as usize, false)
+        } else {
+            ((idx - 1) as usize, true)
+        }
+    }
+
+    /// Read single-precision FPR `idx` as raw 32 bits.
+    #[inline]
+    pub fn f_bits(&self, idx: u8) -> u32 {
+        let (slot, high) = Self::fpr_single_slot(idx);
+        if high {
+            (self.fpr[slot] >> 32) as u32
+        } else {
+            self.fpr[slot] as u32
+        }
+    }
+
+    /// Write raw 32 bits into single-precision FPR `idx` (leaving the paired
+    /// word of the even slot untouched).
+    #[inline]
+    pub fn set_f_bits(&mut self, idx: u8, bits: u32) {
+        let (slot, high) = Self::fpr_single_slot(idx);
+        if high {
+            self.fpr[slot] = (self.fpr[slot] & 0x0000_0000_FFFF_FFFF) | ((bits as u64) << 32);
+        } else {
+            self.fpr[slot] = (self.fpr[slot] & 0xFFFF_FFFF_0000_0000) | (bits as u64);
+        }
+    }
+
+    /// Read single-precision FPR `idx` as an `f32`.
+    #[inline]
+    pub fn f_s(&self, idx: u8) -> f32 {
+        f32::from_bits(self.f_bits(idx))
+    }
+
+    /// Write an `f32` into single-precision FPR `idx`.
+    #[inline]
+    pub fn set_f_s(&mut self, idx: u8, val: f32) {
+        self.set_f_bits(idx, val.to_bits());
+    }
+
+    /// Read a doubleword (double / `dmtc1` / `ldc1`) FPR `idx` as raw 64 bits.
+    /// Under FR=0 these use even registers; we index the slot directly.
+    #[inline]
+    pub fn d_bits(&self, idx: u8) -> u64 {
+        self.fpr[idx as usize]
+    }
+
+    /// Write raw 64 bits into doubleword FPR `idx`.
+    #[inline]
+    pub fn set_d_bits(&mut self, idx: u8, bits: u64) {
+        self.fpr[idx as usize] = bits;
+    }
+
+    /// Read double-precision FPR `idx` as an `f64`.
+    #[inline]
+    pub fn f_d(&self, idx: u8) -> f64 {
+        f64::from_bits(self.fpr[idx as usize])
+    }
+
+    /// Write an `f64` into double-precision FPR `idx`.
+    #[inline]
+    pub fn set_f_d(&mut self, idx: u8, val: f64) {
+        self.fpr[idx as usize] = val.to_bits();
+    }
+}
+
+/// Round an `f32` to the nearest integer, ties to even — the FPU's default
+/// (FCSR round-to-nearest) rounding mode, which every OoT thread boots into.
+/// This is the `CVT.W.S`/`CVT.L.S` rounding: N64Recomp routes it through
+/// `lrintf` under the C default rounding mode (round-to-nearest-even). Rust's
+/// [`f32::round_ties_even`] is exactly that, with no global FP-environment
+/// dependency. Returned as `f64` so the caller's `as i32`/`as i64` truncation
+/// of an already-integral value is exact.
+#[inline]
+pub fn round_ties_even_f32(v: f32) -> f64 {
+    v.round_ties_even() as f64
+}
+
+/// Round an `f64` to the nearest integer, ties to even (the `CVT.W.D`/
+/// `CVT.L.D` rounding; see [`round_ties_even_f32`]).
+#[inline]
+pub fn round_ties_even_f64(v: f64) -> f64 {
+    v.round_ties_even()
 }
 
 /// Number of bytes of rdram the N64 exposes (8 MiB with the Expansion Pak,
@@ -199,6 +323,33 @@ impl<'a> Rdram<'a> {
     pub fn store_b(&mut self, vaddr: u64, val: u8) {
         let p = Self::phys(vaddr) ^ 3;
         self.mem[p] = val;
+    }
+
+    /// Load a 64-bit doubleword (for `LDC1`/`LD`). No sub-word XOR: it is two
+    /// big-endian words, the high word at offset+0 and the low word at
+    /// offset+4 — i.e. a straight big-endian 8-byte read. This matches
+    /// N64Recomp's `do_ld` (`hi = MEM_W(0); lo = MEM_W(+4)`), which the
+    /// `load_w`/`store_w` word path already realizes without a byte XOR.
+    #[inline]
+    pub fn load_d(&self, vaddr: u64) -> u64 {
+        let p = Self::phys(vaddr);
+        u64::from_be_bytes([
+            self.mem[p],
+            self.mem[p + 1],
+            self.mem[p + 2],
+            self.mem[p + 3],
+            self.mem[p + 4],
+            self.mem[p + 5],
+            self.mem[p + 6],
+            self.mem[p + 7],
+        ])
+    }
+
+    /// Store a 64-bit doubleword (for `SDC1`/`SD`): straight big-endian.
+    #[inline]
+    pub fn store_d(&mut self, vaddr: u64, val: u64) {
+        let p = Self::phys(vaddr);
+        self.mem[p..p + 8].copy_from_slice(&val.to_be_bytes());
     }
 
     // --- Unaligned word loads/stores (LWL/LWR/SWL/SWR) ---
