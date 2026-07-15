@@ -152,10 +152,10 @@ fn read_mtx(rdram: &[u8], addr: usize) -> Option<Mat4> {
             let elem = r * 4 + c;
             let int_off = addr + elem * 2;
             let frac_off = addr + 32 + elem * 2;
-            let int_part =
-                i16::from_be_bytes([rdram[int_off], rdram[int_off + 1]]) as i32;
-            let frac_part =
-                u16::from_be_bytes([rdram[frac_off], rdram[frac_off + 1]]) as i32;
+            // Swizzled halfword reads (recomp MEM_H): the Mtx was DMA'd from
+            // ROM through the same `^3` per-byte swizzle as everything else.
+            let int_part = read_i16(rdram, int_off) as i32;
+            let frac_part = read_u16(rdram, frac_off) as i32;
             let value = (((int_part << 16) | frac_part) as f32) / 65536.0;
             // Transpose on read (row-vector hardware convention -> our
             // column-vector `transform_point`): store element (r,c) at
@@ -225,6 +225,72 @@ fn opcode_name(opcode: u8) -> &'static str {
 /// long-running harness otherwise only ever sees the first frame's skips).
 pub fn reset_skip_warnings() {
     WARNED_SKIPS.with(|w| w.borrow_mut().clear());
+}
+
+// --- Recomp rdram memory model (swizzled) -------------------------------
+//
+// fn64's `rdram` is NOT a flat big-endian image. The N64Recomp memory
+// macros (`refs/N64RecompSource/include/recomp.h:95-107`) store every
+// aligned 32-bit word in HOST-NATIVE order (`MEM_W` = a bare
+// `*(int32_t*)`, no byteswap) and reach sub-word bytes/halfwords through an
+// address XOR (`MEM_B` uses `^3`, `MEM_H` uses `^2`) -- the standard
+// "byteswap within a native word" trick that makes big-endian sub-word
+// access work over a little-endian word array. The PI-DMA path
+// (`fn64-runtime/src/rdram.rs:243` `dma_write_bytes`) writes cartridge
+// bytes with the SAME per-byte `^3` swizzle, so EVERYTHING in rdram --
+// CPU-built display lists AND DMA'd vertex/matrix data -- obeys this one
+// model. A decoder that reads it as flat big-endian (the old
+// `from_be_bytes`) gets each 32-bit word byte-reversed: OoT's first DL
+// command `0xDE...` (G_DL) read flat-BE became `0x000001DE` (opcode
+// `0x00`), so the whole list decoded as garbage and produced 0 triangles.
+//
+// These helpers read logical values THE WAY THE GAME DOES: an aligned word
+// is a native-endian `u32` (== the logical big-endian word), and any
+// byte/halfword within it is extracted by its logical position. This is
+// exactly equivalent to `MEM_W` / `MEM_HU(^2)` / `MEM_BU(^3)`.
+
+/// Read the logical big-endian 32-bit word at aligned byte `off`
+/// (`off % 4 == 0` expected; misaligned reads still return the containing
+/// word's native value, matching a `MEM_W` on a masked address). Returns 0
+/// if the word runs past `rdram`.
+#[inline]
+fn read_u32(rdram: &[u8], off: usize) -> u32 {
+    if off + 4 > rdram.len() {
+        return 0;
+    }
+    // Native-endian read == the logical big-endian word the game stored
+    // (recomp.h MEM_W is a bare `*(int32_t*)`, no swap).
+    u32::from_ne_bytes([rdram[off], rdram[off + 1], rdram[off + 2], rdram[off + 3]])
+}
+
+/// Read a logical byte at byte offset `off` (recomp `MEM_BU`: physical
+/// index `off ^ 3`). Returns 0 past the end.
+#[inline]
+fn read_u8(rdram: &[u8], off: usize) -> u8 {
+    let p = off ^ 3;
+    if p >= rdram.len() {
+        return 0;
+    }
+    rdram[p]
+}
+
+/// Read a logical signed 16-bit halfword at byte offset `off` (recomp
+/// `MEM_H`). The two logical bytes `off` (MSB) and `off+1` (LSB) are read
+/// through the `^3` byte swizzle and recombined big-endian. Returns 0 past
+/// the end.
+#[inline]
+fn read_i16(rdram: &[u8], off: usize) -> i16 {
+    let hi = read_u8(rdram, off) as u16;
+    let lo = read_u8(rdram, off + 1) as u16;
+    ((hi << 8) | lo) as i16
+}
+
+/// Read a logical unsigned 16-bit halfword at byte offset `off`.
+#[inline]
+fn read_u16(rdram: &[u8], off: usize) -> u16 {
+    let hi = read_u8(rdram, off) as u16;
+    let lo = read_u8(rdram, off + 1) as u16;
+    (hi << 8) | lo
 }
 
 /// Resolve a (possibly segmented) F3DEX2 address to a flat rdram byte
@@ -373,8 +439,11 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
         if pc + 8 > rdram.len() {
             break; // truncated command stream: stop, return what we have.
         }
-        let w0 = u32::from_be_bytes(rdram[pc..pc + 4].try_into().unwrap());
-        let w1 = u32::from_be_bytes(rdram[pc + 4..pc + 8].try_into().unwrap());
+        // Recomp rdram is word-native (see read_u32): each command word is a
+        // logical big-endian u32 stored host-native, NOT a flat big-endian
+        // byte run.
+        let w0 = read_u32(rdram, pc);
+        let w1 = read_u32(rdram, pc + 4);
         let opcode = (w0 >> 24) as u8;
         pc += 8;
 
@@ -427,7 +496,28 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 let addr = resolve_addr(&state.segments, w1);
                 if let Some(mtx) = read_mtx(rdram, addr) {
                     if is_projection {
-                        state.proj = Some(mtx);
+                        // The projection matrix ALSO honors LOAD vs MUL. OoT
+                        // loads the perspective matrix once with LOAD, then
+                        // concatenates the camera/view matrix onto it with
+                        // PROJECTION|MUL (guLookAt output). Treating every
+                        // projection G_MTX as a LOAD (the old bug) let the
+                        // view matrix -- whose 4th row is [0,0,0,1], no
+                        // projective term -- OVERWRITE the real perspective
+                        // matrix (4th row [0,0,-1,0]). The result was w==1
+                        // for every vertex (no perspective divide), so
+                        // eye-space coords like x=-42 were used directly as
+                        // NDC and every triangle projected thousands of
+                        // pixels off-screen -> uniform/blank frames. Verified
+                        // from a live task's three G_MTX loads (perspective
+                        // LOAD, view MUL, model LOAD).
+                        state.proj = Some(if is_load {
+                            mtx
+                        } else {
+                            match state.proj {
+                                Some(p) => mat_mul(&p, &mtx),
+                                None => mtx,
+                            }
+                        });
                     } else {
                         // Modelview: a PUSH saves the current top so a later
                         // G_POPMTX restores it. LOAD replaces, MUL
@@ -526,19 +616,24 @@ fn load_vertices(
         if off + VTX_STRIDE > rdram.len() || v0 + i >= state.vtx_cache.len() {
             break;
         }
-        let x = i16::from_be_bytes([rdram[off], rdram[off + 1]]) as f32;
-        let y = i16::from_be_bytes([rdram[off + 2], rdram[off + 3]]) as f32;
-        let z = i16::from_be_bytes([rdram[off + 4], rdram[off + 5]]) as f32;
-        let cn = &rdram[off + 12..off + 16];
+        // Swizzled reads (recomp MEM_H / MEM_BU): vertex arrays are DMA'd
+        // from ROM through the `^3` per-byte swizzle, same as the DL words.
+        let x = read_i16(rdram, off) as f32;
+        let y = read_i16(rdram, off + 2) as f32;
+        let z = read_i16(rdram, off + 4) as f32;
+        let r = read_u8(rdram, off + 12);
+        let g = read_u8(rdram, off + 13);
+        let b = read_u8(rdram, off + 14);
+        let a = read_u8(rdram, off + 15);
 
         let (sx, sy) = project_vertex(state, x, y, z);
         state.vtx_cache[v0 + i] = Vertex {
             x: sx,
             y: sy,
-            r: cn[0],
-            g: cn[1],
-            b: cn[2],
-            a: cn[3],
+            r,
+            g,
+            b,
+            a,
         };
     }
 }

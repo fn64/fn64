@@ -253,7 +253,13 @@ fn main() {
     let mut render_backend = fn64_render_rt64::ReferenceBackend::new()
         .with_f3dex2()
         .with_clear_color([0, 0, 0, 255])
-        .with_auto_dump("/tmp", "fn64-oot-render", 8);
+        .with_auto_dump("/tmp", "fn64-oot-render", 240);
+    // NOTE: 240 (one full second of NTSC frames) so the capture reaches the
+    // frames where real 3D geometry appears -- the first ~8 gfx tasks are
+    // OoT's boot/logo screens (large flat gradient background quads), and
+    // the recognizable projected geometry (rotating title object, then the
+    // file-select 3D scene) shows up later in the boot sequence. A smaller
+    // limit stops at the gradient logos and misses the geometry proof.
     // A common NTSC low-res target; matches capture_framebuffer's assumed
     // 320x240 (this harness does not yet decode the ROM's real OSViMode).
     {
@@ -285,6 +291,17 @@ fn main() {
     const MAX_STEPS: u64 = 2_000_000;
     const TICK_STEP: u64 = 100;
     const LOG_EVERY: u64 = 50_000;
+    // Feedback-loop speedup: `OOT_MAX_SWAPS=N` stops the boot as soon as N VI
+    // swaps have happened, instead of grinding the full 2M-step budget.
+    // Proving the render path only needs the first few frames, so a render
+    // iteration goes from ~minutes to ~seconds. Unset = run to the full budget
+    // (the durable boot-depth behavior). `OOT_STOP_ON_FRAME=1` additionally
+    // stops the instant a NON-BLANK framebuffer is captured -- the exact
+    // moment there's an image to eye-gate.
+    let max_swaps: Option<u64> = std::env::var("OOT_MAX_SWAPS")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let stop_on_frame: bool = std::env::var("OOT_STOP_ON_FRAME").is_ok();
     // How many consecutive "nothing was runnable, and advancing the
     // virtual clock didn't wake anything either" ticks before concluding
     // boot has reached a genuinely idle steady state (not just a thread
@@ -339,10 +356,29 @@ fn main() {
         // non-uniform (Task requirement 3).
         let swap_count = fn64_abi::vi_swap_count();
         if swap_count > last_swap_count {
+            let dumps_before = fb_dumps.len();
             if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
                 capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);
             }
             last_swap_count = swap_count;
+            // Early-exit hooks (feedback-loop speedup): stop the instant we
+            // have what a render iteration needs, instead of the full budget.
+            if stop_on_frame && fb_dumps.len() > dumps_before {
+                println!(
+                    "[oot-boot] OOT_STOP_ON_FRAME: captured a non-blank framebuffer at swap \
+                     #{swap_count} (step {steps}) -- stopping early"
+                );
+                break;
+            }
+            if let Some(cap) = max_swaps {
+                if swap_count >= cap {
+                    println!(
+                        "[oot-boot] OOT_MAX_SWAPS={cap}: reached swap #{swap_count} (step {steps}) \
+                         -- stopping early"
+                    );
+                    break;
+                }
+            }
         }
 
         if !stepped {
