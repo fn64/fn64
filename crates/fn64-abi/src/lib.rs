@@ -727,6 +727,7 @@ pub unsafe extern "C" fn osCreateThread_recomp(rdram: *mut u8, ctx: *mut RecompC
                 let func_ptr = get_function(entry_vram as i32);
                 let entry: RecompFunc = unsafe { std::mem::transmute(func_ptr) };
                 let mut entry_ctx = RecompContext::zeroed();
+                entry_ctx.arm_fpr_alias();
                 entry_ctx.r4 = arg;
                 // r29 ($sp) MUST be the real stack pointer osCreateThread's
                 // caller supplied (this shim's own `sp` argument, per o32
@@ -2159,6 +2160,7 @@ pub unsafe fn boot_thread0(
             with_active_yielder(thread_id, rdram_ptr, yielder, || {
                 let _ = first_input;
                 let mut ctx = RecompContext::zeroed();
+                ctx.arm_fpr_alias();
                 unsafe { entry(rdram_ptr, &mut ctx as *mut _) };
             });
         });
@@ -2245,12 +2247,12 @@ pub fn sim_time() -> u64 {
 impl RecompContext {
     /// An all-zero `RecompContext` -- used to seed a freshly-dispatched
     /// thread entry point's register state (`osCreateThread_recomp`).
-    /// `f_odd` is a raw pointer with no valid target in this all-zero state
-    /// (null); no shim in this milestone's undefined set touches it (see
-    /// this crate's earlier note: "no direct ctx-> touches of status_reg/
-    /// mips3_float_mode/f_odd were found" per ABI-SURFACE.md section (b)),
-    /// so null is the honest, unfaked value rather than a fabricated
-    /// pointee.
+    ///
+    /// `f_odd` is left null here; it is a SELF-REFERENTIAL pointer into this
+    /// same context's FPR file, so it can only be set once the context has a
+    /// stable address. Every dispatch site MUST call `arm_fpr_alias()` on the
+    /// context (at its final address, before running any recompiled function)
+    /// -- see that method's doc comment.
     pub fn zeroed() -> Self {
         // Safety: RecompContext is a `#[repr(C)]` struct of plain integers
         // and one raw pointer, all of which are valid when all-zero (a
@@ -2258,6 +2260,36 @@ impl RecompContext {
         // `#[repr(C)]` union of plain numeric types, likewise valid
         // zeroed.
         unsafe { std::mem::zeroed() }
+    }
+
+    /// Point `f_odd` at this context's own FPR file so recompiled `mtc1`/
+    /// `sdc1`-to-odd-register stores land in-register instead of faulting.
+    ///
+    /// Generated C addresses an odd float register `$fN` (N odd) as
+    /// `ctx->f_odd[(N-1)*2]`, treating `f_odd` as a `uint32_t*` cursor into
+    /// the `fpr f0..f31` array. With FR=0 (`mips3_float_mode == 0`, the state
+    /// libultra boots every OSThread in), the odd register's bits alias the
+    /// HIGH 32-bit word of its even partner: for `$f9`, index `(9-1)*2 = 16`,
+    /// byte `16*4 = 0x40` past `f_odd`, which must equal `&f8.u32h`. That
+    /// holds exactly when `f_odd == &f0.u32h` (the fpr union's second u32,
+    /// byte 4 of `f0`): `&f0.u32h + 0x40` == byte `0x44` == `f8`'s high word.
+    /// This matches the `recomp.h` fpr layout (`{u32l, u32h}` at bytes 0/4,
+    /// 8-byte stride) the generated C was emitted against.
+    ///
+    /// Was the OoT-boot SIGSEGV-at-0x40 root cause: `f_odd` stayed null from
+    /// `zeroed()`, so `guLookAtHiliteF`'s first `mtc1 $at, $f9`
+    /// (`ctx->f_odd[16] = ...`, funcs_57.c:4519) dereferenced null+0x40.
+    ///
+    /// # Safety
+    /// The pointer aliases `self`; `self` must not move for as long as any
+    /// recompiled code holds/uses this context (guaranteed at the dispatch
+    /// sites, which build the context and immediately run the entry function
+    /// with it, never relocating it mid-run).
+    pub fn arm_fpr_alias(&mut self) {
+        // `u32_halves.1` is the high 32-bit word of `f0` (byte offset 4),
+        // i.e. recomp.h's `f0.u32h` -- the FR=0 base the index math above
+        // requires.
+        self.f_odd = unsafe { &mut self.f0.u32_halves.1 as *mut u32 };
     }
 }
 
@@ -3198,6 +3230,51 @@ mod tests {
         ctx.r5 = r5;
         ctx.r6 = r6;
         ctx
+    }
+
+    /// Regression: `arm_fpr_alias` must make an odd-register `mtc1` (which
+    /// generated C emits as `ctx->f_odd[(N-1)*2] = value`) land in the HIGH
+    /// 32-bit word of register N's even partner (FR=0 lane), not fault
+    /// through a null `f_odd`. This was the OoT-boot SIGSEGV-at-0x40 in
+    /// `guLookAtHiliteF` (funcs_57.c:4519, `mtc1 $at, $f9`): `f_odd` was
+    /// left null by `zeroed()`, so `f_odd[16]` dereferenced 0x40.
+    ///
+    /// Verified to fail against the bug: comment out the `arm_fpr_alias()`
+    /// call below and the test segfaults on the null-pointer write (exactly
+    /// the boot fault) instead of asserting.
+    #[test]
+    fn arm_fpr_alias_routes_odd_mtc1_to_even_partner_high_word() {
+        // The context must live at a stable address for the whole test --
+        // `arm_fpr_alias` stores a self-referential pointer. Box it so the
+        // pointer stays valid across the field reads below.
+        let mut ctx = Box::new(ctx_zeroed());
+        ctx.arm_fpr_alias();
+
+        // Distinguishable per-register sentinels so an off-by-one landing in
+        // the wrong register (or the wrong 32-bit lane) is caught, not just a
+        // "didn't crash" pass.
+        // Generated C for `mtc1 <val>, $fN` (N odd): ctx->f_odd[(N-1)*2] = val
+        let cases: &[(usize, u32)] = &[(9, 0xDEAD_0009), (7, 0xBEEF_0007), (17, 0xCAFE_0017)];
+        for &(n, val) in cases {
+            // Safety: f_odd was just armed to point into this context's own
+            // fpr file; the index math mirrors the generated C exactly.
+            unsafe {
+                *ctx.f_odd.add((n - 1) * 2) = val;
+            }
+        }
+
+        // $f9's bits alias f8's high word (byte 0x44 == &f0.u32h + 0x40).
+        assert_eq!(unsafe { ctx.f8.u32_halves.1 }, 0xDEAD_0009, "f9 -> f8.u32h");
+        // $f7 -> f6.u32h; $f17 -> f16.u32h.
+        assert_eq!(unsafe { ctx.f6.u32_halves.1 }, 0xBEEF_0007, "f7 -> f6.u32h");
+        assert_eq!(unsafe { ctx.f16.u32_halves.1 }, 0xCAFE_0017, "f17 -> f16.u32h");
+
+        // The LOW words of those even partners (their own $fN even-register
+        // value) must be untouched -- proves the write hit the odd lane, not
+        // the even register.
+        assert_eq!(unsafe { ctx.f8.u32_halves.0 }, 0, "f8 low word untouched");
+        assert_eq!(unsafe { ctx.f6.u32_halves.0 }, 0, "f6 low word untouched");
+        assert_eq!(unsafe { ctx.f16.u32_halves.0 }, 0, "f16 low word untouched");
     }
 
     fn spawn_test_thread(id: ThreadId, pri: Priority, body: impl FnOnce() + 'static) {
