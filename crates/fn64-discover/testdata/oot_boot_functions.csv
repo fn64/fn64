@@ -1,4 +1,5 @@
 name,va_start
+entrypoint,80000400
 bootclear,80000460
 bootproc,80000498
 Main_ThreadEntry,800005a0

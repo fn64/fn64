@@ -29,20 +29,37 @@
 //! - [`banks`]: Phase 2, load-image/overlay discovery -- the boot copy
 //!   (hardware-fixed, needs no scanning) and descriptor-table-shaped
 //!   overlay banks (given an explicit table location/shape).
+//! - [`cfg`]: Phase 4, the delay-slot-aware MIPS-III CFG builder -- word
+//!   classification (`proven_code`/`candidate_code`/`proven_data`/
+//!   `candidate_data`/`conflict`/`unknown`), basic blocks, direct calls,
+//!   tail transfers, and the open indirect-site frontier.
+//! - [`partition`]: Phase 5, recursive-descent owner partitioning of a
+//!   [`cfg::Cfg`]'s blocks from its proven roots -- one owner per block per
+//!   bank, ambiguous claims and unowned blocks reported explicitly rather
+//!   than resolved by guessing.
 //! - [`grade_oot`] / [`grade_nw4e`]: grading-only cross-checks against the
 //!   OoT decomp's segment answer key and NW4E's hand-verified
 //!   `overlays.json`. Neither module is reachable from the discovery
 //!   pipeline itself -- they only ever consume its output.
+//! - [`grade_oot_functions`]: grading-only cross-check of Phase 4/5
+//!   function boundaries against the OoT decomp's own linked `boot` bank
+//!   (linker-map-derived, not hand-curated).
+//! - [`grade_nw4e_symbols`]: grading-only cross-check of Phase 4/5 function
+//!   boundaries against aki-recomp's hand-fixed NW4E `symbol_addrs.txt`
+//!   rungs -- the "grind-collapse" measure.
 //!
-//! Candidate harvesting (Phase 3), CFG construction (Phase 4), function
-//! partitioning (Phase 5), indirect-target closure (Phase 6), dynamic
-//! probes (Phase 7), and assembly verification (Phase 8) are not yet
-//! implemented; this crate's public surface will grow into them.
+//! Candidate harvesting (Phase 3), indirect-target closure (Phase 6),
+//! dynamic probes (Phase 7), and assembly verification (Phase 8) are not
+//! yet implemented; this crate's public surface will grow into them.
 
 pub mod banks;
+pub mod cfg;
 pub mod facts;
 pub mod grade_nw4e;
+pub mod grade_nw4e_symbols;
 pub mod grade_oot;
+pub mod grade_oot_functions;
+pub mod partition;
 pub mod rom;
 
 pub use facts::{BankAddr, Fact, FactDb, ProofState};

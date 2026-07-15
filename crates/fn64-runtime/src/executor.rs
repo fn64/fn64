@@ -505,6 +505,12 @@ impl Executor {
         msg: Mesg,
         attributed_thread: Option<ThreadId>,
     ) {
+        if std::env::var("FN64_DEBUG_SEND").is_ok() {
+            eprintln!(
+                "[DEBUG deliver_or_enqueue] queue_offset={:#x} msg={msg:#x} attributed_thread={attributed_thread:?}",
+                queue_addr.offset()
+            );
+        }
         let queue = self.queue_mut(queue_addr);
         if queue.has_blocked_receivers() {
             let waiter = queue
@@ -555,6 +561,12 @@ impl Executor {
     /// steps happen back-to-back with nothing else running in between,
     /// because this whole function executes on the single executor thread.
     fn try_deliver_send(&mut self, sender: ThreadId, mq_addr: RdramAddr, msg: Mesg) -> SendOutcome {
+        if std::env::var("FN64_DEBUG_SEND").is_ok() {
+            eprintln!(
+                "[DEBUG try_deliver_send] sender={sender} mq_addr_offset={:#x} msg={msg:#x}",
+                mq_addr.offset()
+            );
+        }
         let queue = self.queue_mut(mq_addr);
         if queue.has_blocked_receivers() {
             let waiter = queue
@@ -699,8 +711,20 @@ impl Executor {
         // address for its entire life, so a `&mut GameThread` obtained by
         // dereferencing a `Box` before a reentrant insert remains valid
         // through and after that insert.
+        if std::env::var("FN64_DEBUG_SEND").is_ok() {
+            eprintln!("[DEBUG run_one_step] about to resume id={id} resume_with={resume_with:?}");
+        }
         let thread = self.threads.get_mut(&id).expect("run queue had stale id");
         let result = thread.resume(RunToken::issue(), resume_with);
+        if std::env::var("FN64_DEBUG_SEND").is_ok() {
+            eprintln!(
+                "[DEBUG run_one_step] resumed id={id}, result is {}",
+                match &result {
+                    CoroutineResult::Return(()) => "Return".to_string(),
+                    CoroutineResult::Yield(y) => format!("Yield({y:?})"),
+                }
+            );
+        }
 
         match result {
             CoroutineResult::Return(()) => {

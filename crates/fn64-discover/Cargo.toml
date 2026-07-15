@@ -18,3 +18,7 @@ md-5 = "0.10"
 [[bin]]
 name = "gate_b1"
 path = "src/bin/gate_b1.rs"
+
+[[bin]]
+name = "gate_b2"
+path = "src/bin/gate_b2.rs"
