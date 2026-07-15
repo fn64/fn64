@@ -128,6 +128,16 @@ fn main() {
     println!("[oot-boot] ROM size: {} bytes", rom_bytes.len());
     fn64_abi::load_rom(rom_bytes);
 
+    // Register OoT's save-backing store so domain-2 (SRAM, devAddr >=
+    // 0x08000000 / PI_DOM2_ADDR2) PI DMAs have somewhere to go instead of
+    // being (wrongly) read from the ROM image past its end. OoT uses banked
+    // SRAM (32 KiB); Sram_InitSram DMAs the whole 0x8000-byte save in at boot
+    // (funcs_34.c:10636). Ephemeral in-memory store for this boot harness --
+    // a persisted FileSaveStorage is a shell concern, not this bring-up's.
+    fn64_abi::set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+        fn64_runtime::SaveType::SramBanked,
+    )));
+
     // Register every section from the real recomp_overlays.inl via the
     // bridge's C-side walk (populates SECTION_BUILDER via callbacks).
     unsafe { fn64_bridge_register_all_sections() };

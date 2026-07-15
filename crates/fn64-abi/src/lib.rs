@@ -641,6 +641,17 @@ pub fn load_rom(bytes: Vec<u8>) {
     with_host(|host| host.pi_dma = Some(PiDma::new(InMemoryRom::new(bytes))));
 }
 
+/// Register the game's save-backing store (SRAM/EEPROM/Flash) the domain-2
+/// PI-DMA path routes to -- `fn64-shell`/the harness supplies an
+/// `InMemorySaveStorage`/`FileSaveStorage` sized for the game's save device
+/// (OoT: `SaveType::SramBanked`, 32 KiB). Must be called after `load_rom`
+/// (the `PiDma` engine must exist) and before any domain-2 (SRAM) DMA. A
+/// domain-2 DMA with no save registered is a loud trap, not a silent ROM
+/// read past its end (see `PiDma::set_save`).
+pub fn set_save(save: Box<dyn fn64_runtime::SaveStorage>) {
+    with_pi_dma("set_save", |dma| dma.set_save(save));
+}
+
 fn with_pi_dma<R>(shim: &str, f: impl FnOnce(&mut PiDma<InMemoryRom>) -> R) -> R {
     with_host(|host| {
         let dma = host.pi_dma.as_mut().unwrap_or_else(|| {
@@ -1160,17 +1171,28 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
         // osRecvMesg_recomp's existing pattern of not creating a second,
         // competing Rdram instance over borrowed memory.
         let _ = &mut rt_rdram;
+        // Domain-2 (SRAM/save) DMAs route to the save store, not the ROM
+        // image. `devAddr >= SRAM_DOMAIN2_BASE` (0x08000000, PI_DOM2_ADDR2,
+        // OoT rcp.h:714) is a save access -- OoT's SsSram_ReadWrite passes
+        // physical 0x08000000+offset as devAddr (z_sram.c:672 /
+        // funcs_34.c:10632). A ROM-domain devAddr is a small ROM offset.
+        let is_sram = fn64_runtime::rom::is_sram_dev_addr(dev_addr);
         with_pi_dma("osEPiStartDma_recomp", |dma| match direction {
+            // device -> RDRAM (ROM read OR SRAM/save read). Both deliver a
+            // FLAT big-endian/save-order byte buffer that must be
+            // word-swizzled into rdram's native-word storage, because the
+            // guest reads the destination via MEM_BU (`^3` XOR, recomp.h).
+            // Same swizzle for ROM and SRAM; only the SOURCE differs.
             DmaDirection::ToRdram => {
                 let mut buf = vec![0u8; len as usize];
-                dma.read_rom_bytes(dev_addr, &mut buf);
-                // Word-swizzle big-endian cartridge bytes into rdram's
-                // native-endian-word layout, same as PiDma::dma_write_bytes /
-                // osEPiReadIo. This shim copies through the raw pointer (no
-                // Rdram wrapper), so swizzle the buffer in place first. A flat
-                // copy hung OoT's DmaMgr_Init: it DMAs the dmadata table and
-                // checks MEM_W(dest+4)==0x1060; flat delivered 0x60100000 ->
-                // Fault_AddHungupAndCrash. PI DMA is word-aligned.
+                if is_sram {
+                    dma.sram_read_into(dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE, &mut buf);
+                } else {
+                    dma.read_rom_bytes(dev_addr, &mut buf);
+                }
+                // A flat copy hung OoT's DmaMgr_Init (MEM_W(dest+4)==0x1060
+                // check saw 0x60100000) and would corrupt every SRAM byte the
+                // save loader MEM_BU's back. PI DMA is word-aligned.
                 assert!(
                     dram_addr.offset() % 4 == 0 && buf.len() % 4 == 0,
                     "PI DMA must be word-aligned (dram={:#x} len={:#x})",
@@ -1195,11 +1217,44 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
                     len,
                 }
             }
+            // RDRAM -> device. Only the domain-2 (SRAM/save) case is real: the
+            // guest's rdram source holds native-word-swizzled bytes, so
+            // un-swizzle back to flat save order (inverse of the ToRdram
+            // swizzle) before writing the save chip. A ROM-domain write is
+            // still nonsensical (ROM is read-only) -> loud trap.
             DmaDirection::FromRdram => {
-                unimplemented!(
-                    "osEPiStartDma_recomp: OS_WRITE direction (cartridge domain write) has no \
-                     backing store in this milestone -- see PiDma::start_dma's doc comment."
+                if !is_sram {
+                    unimplemented!(
+                        "osEPiStartDma_recomp: OS_WRITE to the cartridge-ROM domain (devAddr \
+                         {dev_addr:#x} < SRAM_DOMAIN2_BASE) -- ROM is read-only. A save write \
+                         uses devAddr >= 0x08000000 and routes to the save store."
+                    );
+                }
+                assert!(
+                    dram_addr.offset() % 4 == 0 && (len as usize) % 4 == 0,
+                    "PI DMA must be word-aligned (dram={:#x} len={:#x})",
+                    dram_addr.offset(),
+                    len
                 );
+                let mut buf = vec![0u8; len as usize];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        rdram.add(dram_addr.offset() as usize),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    );
+                }
+                for word in buf.chunks_exact_mut(4) {
+                    word.swap(0, 3);
+                    word.swap(1, 2);
+                }
+                dma.sram_write_from(dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE, &buf);
+                fn64_runtime::DmaCompletion {
+                    direction,
+                    dram_addr,
+                    dev_addr,
+                    len,
+                }
             }
         })
     };
@@ -4940,6 +4995,77 @@ mod tests {
         // And MEM_W reads the cart word intact (native-endian word storage).
         let w = u32::from_ne_bytes(rdram[dram_off..dram_off + 4].try_into().unwrap());
         assert_eq!(w, 0x5A4C_4A00);
+    }
+
+    /// Regression test for the SRAM-DMA-treated-as-ROM crash (2026-07-15):
+    /// OoT's `Sram_InitSram -> SsSram_ReadWrite -> SsSram_Dma` issues a PI DMA
+    /// with `devAddr = 0x08000000` (PI_DOM2_ADDR2, the SRAM cartridge base --
+    /// rcp.h:714), which the old `osEPiStartDma_recomp` blindly read from the
+    /// ROM image -> `InMemoryRom::read_into` past the 55MB ROM -> loud trap.
+    /// The fix routes domain-2 devAddrs to the registered `SaveStorage`.
+    ///
+    /// Drives the REAL raw-pointer shim path (not `PiDma::start_dma`) for both
+    /// directions: build an OSIoMesg exactly as `SsSram_Dma` does (dramAddr
+    /// +0x8, devAddr +0xC, size +0x10, per pi.h:52-58), OS_WRITE the pattern to
+    /// SRAM, then OS_READ it back into a different rdram region and assert the
+    /// guest's own `MEM_BU`/`MEM_W` accessors read every byte in the SAME
+    /// order. A flat (non-swizzled) copy in either direction fails here.
+    #[test]
+    fn os_epi_start_dma_round_trips_sram_save_domain() {
+        // A ROM whose bytes at offset 0 are DISTINCT from the SRAM pattern, so
+        // a regression that reads the ROM instead of the save is caught.
+        let mut rom = vec![0u8; 0x1000];
+        rom[0..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        load_rom(rom);
+        // OoT uses 32 KiB banked SRAM.
+        set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+            fn64_runtime::SaveType::SramBanked,
+        )));
+
+        let mut rdram = vec![0u8; 0x10000];
+        let mb_offset = 0x2000usize;
+        let mb_vram: u64 = 0x8000_2000;
+        let sram_dev_addr: u32 = 0x0800_0010; // domain-2 base + 0x10
+        let size: u32 = 8;
+
+        // Guest lays 8 distinct bytes at rdram 0x5000 via MEM_BU (byte-lane
+        // `^3`), the way it would build a save record before writing it out.
+        let src = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let src_off = 0x5000usize;
+        for (k, &b) in src.iter().enumerate() {
+            rdram[(src_off + k) ^ 3] = b;
+        }
+        // OSIoMesg for the WRITE (OS_WRITE=1 -> FromRdram).
+        rdram[mb_offset + 0x4..mb_offset + 0x8].copy_from_slice(&0u32.to_ne_bytes());
+        rdram[mb_offset + 0x8..mb_offset + 0xC].copy_from_slice(&0x8000_5000u32.to_ne_bytes());
+        rdram[mb_offset + 0xC..mb_offset + 0x10].copy_from_slice(&sram_dev_addr.to_ne_bytes());
+        rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&size.to_ne_bytes());
+        let mut ctx = ctx_zeroed();
+        ctx.r5 = mb_vram;
+        ctx.r6 = 1; // OS_WRITE
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // OSIoMesg for the READ back into a DIFFERENT region (0x6000).
+        let dst_off = 0x6000usize;
+        rdram[mb_offset + 0x8..mb_offset + 0xC].copy_from_slice(&0x8000_6000u32.to_ne_bytes());
+        let mut ctx = ctx_zeroed();
+        ctx.r5 = mb_vram;
+        ctx.r6 = 0; // OS_READ
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // Guest reads readBuff[k] via MEM_BU((dst)+k) = rdram[(dst+k)^3];
+        // every byte must match the original -- swizzle cancels round-trip.
+        for (k, &b) in src.iter().enumerate() {
+            assert_eq!(
+                rdram[(dst_off + k) ^ 3],
+                b,
+                "SRAM round-trip byte {k}: save DMA must route to the save store, \
+                 word-swizzled, not the ROM"
+            );
+        }
+        // The ROM byte at offset 0 (0xAA) must NOT appear -- proves the read
+        // hit the save store, not the ROM image.
+        assert_ne!(rdram[dst_off ^ 3], 0xAA);
     }
 
     /// Regression test for the real infinite-loop bug `examples/wm2000-boot`
