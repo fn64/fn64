@@ -116,6 +116,116 @@ fn env_path(name: &str) -> std::path::PathBuf {
         .into()
 }
 
+/// One scripted-input step: at VI-swap `frame`, hold `buttons` (an
+/// `OSContPad.button` bitmask, controller.h:4-17) with the analog stick at
+/// `(stick_x, stick_y)`, until the next step changes it.
+#[derive(Debug, Clone, Copy)]
+struct ScriptStep {
+    frame: u64,
+    buttons: u16,
+    stick_x: i8,
+    stick_y: i8,
+}
+
+/// Map a controller.h `BTN_*` name to its `OSContPad.button` bit
+/// (`refs/oot-decomp/include/controller.h:4-17`). Returns 0 for an unknown
+/// name (logged by the caller) so a typo can't silently masquerade as a real
+/// press.
+fn button_bit(name: &str) -> u16 {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "A" => 0x8000,
+        "B" => 0x4000,
+        "Z" => 0x2000,
+        "START" => 0x1000,
+        "DUP" => 0x0800,
+        "DDOWN" => 0x0400,
+        "DLEFT" => 0x0200,
+        "DRIGHT" => 0x0100,
+        "L" => 0x0020,
+        "R" => 0x0010,
+        "CUP" => 0x0008,
+        "CDOWN" => 0x0004,
+        "CLEFT" => 0x0002,
+        "CRIGHT" => 0x0001,
+        "" => 0,
+        other => {
+            eprintln!("[oot-boot] WARNING: unknown button name {other:?} in OOT_INPUT_SCRIPT -- ignored");
+            0
+        }
+    }
+}
+
+/// Build the scripted-input timeline from the environment. Priority:
+/// `OOT_INPUT_SCRIPT` (full grammar, see the harness loop's doc), else
+/// `OOT_SCRIPT_START=N` shorthand (press+release Start around frame N), else
+/// empty (idle). The returned steps are sorted by frame.
+fn build_input_script() -> Vec<ScriptStep> {
+    if let Ok(spec) = std::env::var("OOT_INPUT_SCRIPT") {
+        let mut steps = parse_input_script(&spec);
+        steps.sort_by_key(|s| s.frame);
+        return steps;
+    }
+    if let Ok(n) = std::env::var("OOT_SCRIPT_START") {
+        if let Ok(frame) = n.parse::<u64>() {
+            // Press Start at `frame`, release 4 frames later -- a clean tap.
+            return vec![
+                ScriptStep { frame, buttons: 0x1000, stick_x: 0, stick_y: 0 },
+                ScriptStep { frame: frame + 4, buttons: 0, stick_x: 0, stick_y: 0 },
+            ];
+        }
+    }
+    Vec::new()
+}
+
+/// Parse `OOT_INPUT_SCRIPT`: comma-separated `frame:BTN[+BTN...][@sx/sy]`.
+/// An empty button field (e.g. `50:`) releases all buttons.
+fn parse_input_script(spec: &str) -> Vec<ScriptStep> {
+    let mut steps = Vec::new();
+    for raw in spec.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (frame_str, rest) = match raw.split_once(':') {
+            Some(parts) => parts,
+            None => {
+                eprintln!("[oot-boot] WARNING: OOT_INPUT_SCRIPT step {raw:?} has no ':' -- skipped");
+                continue;
+            }
+        };
+        let frame: u64 = match frame_str.trim().parse() {
+            Ok(f) => f,
+            Err(_) => {
+                eprintln!("[oot-boot] WARNING: OOT_INPUT_SCRIPT step {raw:?} has a bad frame -- skipped");
+                continue;
+            }
+        };
+        // Optional `@stickX/stickY` suffix.
+        let (buttons_part, stick_part) = match rest.split_once('@') {
+            Some((b, s)) => (b, Some(s)),
+            None => (rest, None),
+        };
+        let buttons = buttons_part
+            .split('+')
+            .filter(|s| !s.trim().is_empty())
+            .map(button_bit)
+            .fold(0u16, |acc, b| acc | b);
+        // Stick uses `/` (not `,`) as its X/Y separator, since `,` already
+        // separates whole steps at the top level.
+        let (stick_x, stick_y) = match stick_part {
+            Some(s) => {
+                let mut it = s.split('/');
+                let sx = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0i8);
+                let sy = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0i8);
+                (sx, sy)
+            }
+            None => (0i8, 0i8),
+        };
+        steps.push(ScriptStep { frame, buttons, stick_x, stick_y });
+    }
+    steps
+}
+
 fn main() {
     let rom_path = env_path("ROM");
     println!("[oot-boot] loading ROM from {}", rom_path.display());
@@ -302,6 +412,31 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok());
     let stop_on_frame: bool = std::env::var("OOT_STOP_ON_FRAME").is_ok();
+
+    // Scripted controller input (the INPUT-SEAM deliverable). `OOT_INPUT_SCRIPT`
+    // is a comma-separated list of `frame:BUTTON[+BUTTON...][@stickX/stickY]`
+    // steps, keyed by VI-swap count (one swap ~= one displayed frame). At each
+    // step's frame the named buttons are HELD on port 0 until the next step (or
+    // released by an empty step, e.g. `50:`). Button names match
+    // controller.h's BTN_* (A,B,Z,START,DUP,DDOWN,DLEFT,DRIGHT,L,R,CUP,CDOWN,
+    // CLEFT,CRIGHT). Example: `OOT_INPUT_SCRIPT=40:START,44:,60:START` presses
+    // Start at frame 40, releases at 44, presses again at 60 -- enough to
+    // dismiss the title screen / advance the file-select menu. Unset (or
+    // `OOT_SCRIPT_START=N`, a shorthand that presses+releases Start once at
+    // frame N) leaves the pad idle -- an honest un-driven boot.
+    let input_script = build_input_script();
+    if !input_script.is_empty() {
+        println!(
+            "[oot-boot] scripted input armed: {} step(s) -> {:?}",
+            input_script.len(),
+            input_script
+                .iter()
+                .map(|s| (s.frame, format!("{:#06x}", s.buttons)))
+                .collect::<Vec<_>>()
+        );
+    }
+    let mut next_script_idx = 0usize;
+    let mut last_applied_buttons: u16 = 0;
     // How many consecutive "nothing was runnable, and advancing the
     // virtual clock didn't wake anything either" ticks before concluding
     // boot has reached a genuinely idle steady state (not just a thread
@@ -356,6 +491,25 @@ fn main() {
         // non-uniform (Task requirement 3).
         let swap_count = fn64_abi::vi_swap_count();
         if swap_count > last_swap_count {
+            // Apply any scripted-input steps whose frame we've now reached.
+            // Steps are frame-sorted; the last one at-or-before `swap_count`
+            // wins (a HELD button stays until the next step changes it).
+            while next_script_idx < input_script.len()
+                && input_script[next_script_idx].frame <= swap_count
+            {
+                let step = &input_script[next_script_idx];
+                fn64_abi::set_controller_state(0, step.buttons, step.stick_x, step.stick_y);
+                if step.buttons != last_applied_buttons {
+                    println!(
+                        "[oot-boot] SCRIPTED INPUT @ frame {swap_count}: port0 buttons={:#06x} \
+                         stick=({},{})",
+                        step.buttons, step.stick_x, step.stick_y
+                    );
+                }
+                last_applied_buttons = step.buttons;
+                next_script_idx += 1;
+            }
+
             let dumps_before = fb_dumps.len();
             if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
                 capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);

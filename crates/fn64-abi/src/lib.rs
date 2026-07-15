@@ -2242,6 +2242,24 @@ pub fn arm_vi_retrace(interval: u64) {
     with_executor(|exec| exec.arm_retrace(interval));
 }
 
+/// Host-facing input seam: feed controller `port`'s live button/stick state
+/// so the game's next `osContGetReadData` reflects it. `buttons` is the N64
+/// `OSContPad.button` bitmask (`oot-decomp/include/controller.h:4-17`:
+/// `BTN_A = 0x8000`, `BTN_B = 0x4000`, `BTN_Z = 0x2000`, `BTN_START = 0x1000`,
+/// d-pad `0x0800..0x0100`, `BTN_L = 0x0020`, `BTN_R = 0x0010`, C-buttons
+/// `0x0008..0x0001`); `stick_x`/`stick_y` are the signed analog values
+/// (`OSContPad.stick_x`/`stick_y`, centered at 0). A scripted-input harness
+/// (`examples/oot-boot`) calls this to drive OoT headlessly. Idle by default,
+/// so an un-driven boot sees an honest neutral pad.
+pub fn set_controller_state(port: usize, buttons: u16, stick_x: i8, stick_y: i8) {
+    let input = fn64_runtime::si::ContInput {
+        button: buttons,
+        stick_x,
+        stick_y,
+    };
+    with_executor(|exec| exec.set_controller_input(port, input));
+}
+
 // ---------------------------------------------------------------------
 // Host-facing (non-`_recomp`) helpers.
 // ---------------------------------------------------------------------
@@ -2725,25 +2743,83 @@ const CONT_NO_RESPONSE_ERROR: u8 = 0x08;
 /// port.
 const MAXCONTROLLERS: usize = 4;
 
-/// `osContGetReadData(OSContPad *pad) -> s32` -- `a0`=`ctx->r4`. Public
-/// libultra manual's documented `OSContPad` layout: `button` (u16),
-/// `stick_x`/`stick_y` (s8 each), `errno` (u8) -- the same 4-byte idle
-/// shape `PifModel::read_data_response` already returns for
-/// `__osSiRawStartDma_recomp`'s raw path. Function-table slot only
-/// (`recomp_overlays.inl:2920`), reached via PadMgr's internal polling
-/// (BOOT-PLAN.md rung 15) -- implemented for real.
+/// `osContGetReadData(OSContPad *pad) -> void` -- `a0`=`ctx->r4`, the base of
+/// an `OSContPad[MAXCONTROLLERS]` array (`padMgr->pads`, decomp
+/// `oot-decomp/src/code/padmgr.c:364` `osContGetReadData(padMgr->pads)`).
+/// This is the INPUT SEAM's game-facing half: the per-port button/stick state
+/// a host harness fed via `PifModel::set_input` lands in the pad array the
+/// game reads each retrace to drive Link.
+///
+/// ## OSContPad layout + swizzle (byte-cited)
+///
+/// `oot-decomp/include/ultra64/controller.h:127-132`:
+/// `{ button: u16 @0x00, stick_x: s8 @0x02, stick_y: s8 @0x03, errno: u8 @0x04 }`,
+/// `size = 0x06`. The decomp `osContGetReadData`
+/// (`oot-decomp/src/libultra/io/contreaddata.c:22`) iterates all
+/// `__osMaxControllers`, sets `errno = CHNL_ERR(read)` for each, and ONLY
+/// fills `button`/`stick_x`/`stick_y` when `errno == 0` -- so a present
+/// controller reports `errno == 0` + live input, an absent port reports a
+/// nonzero `errno` (`CONT_NO_RESPONSE_ERROR = 0x08`) with the game leaving the
+/// stale button/stick (padmgr then `bzero`s pads[1]/pads[3] anyway).
+///
+/// The game reads these fields back through the recomp memory macros
+/// (`refs/N64RecompSource/include/recomp.h:104-108`): `button` via `MEM_HU`
+/// (`^2` halfword swizzle), `stick_x`/`stick_y`/`errno` via `MEM_B`/`MEM_BU`
+/// (`^3` byte swizzle). Storing each LOGICAL struct byte at host offset
+/// `(base + o) ^ 3` satisfies both: the two bytes of the big-endian `button`
+/// u16 land at `0^3 = 3` (hi) and `1^3 = 2` (lo), so a native `MEM_HU` read at
+/// `0^2 = 2` recovers `hi<<8 | lo` -- identical to the `^3` per-byte store
+/// `osContGetQuery_recomp` already uses for `OSContStatus`. A flat
+/// (unswizzled) copy, which a prior WIP did, put every field at the wrong lane
+/// and the game saw garbage/no input -- the exact fail this shim's test pins.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
-    let pad_addr = RdramAddr::from_gpr(ctx.r4).offset() as usize;
-    let resp = with_executor(|exec| exec.pif().read_data_response(0));
-    unsafe {
-        std::ptr::copy_nonoverlapping(resp.as_ptr(), rdram.add(pad_addr), 4);
+    let base_addr = RdramAddr::from_gpr(ctx.r4).offset() as usize;
+    let pif = with_executor(|exec| *exec.pif());
+    // Diagnostic (opt-in via FN64_TRACE_CONT): proves PadMgr actually polls
+    // input, and echoes what port-0 state the game is about to see -- the
+    // observable evidence a scripted press reaches the game.
+    if std::env::var_os("FN64_TRACE_CONT").is_some() {
+        let p0 = pif.read_data_response(0);
+        eprintln!(
+            "[fn64-abi] osContGetReadData(pad@{base_addr:#x}): port0 button={:#06x} stick=({},{})",
+            u16::from_be_bytes([p0[0], p0[1]]),
+            p0[2] as i8,
+            p0[3] as i8,
+        );
     }
-    ctx.r2 = 0;
+    for port in 0..MAXCONTROLLERS {
+        // A present standard controller reports errno == 0 and its live input;
+        // an absent port reports no-response, matching the decomp's
+        // `errno = CHNL_ERR(read)` branch (button/stick left zero here).
+        let absent =
+            (pif.query_response(port)[2] & fn64_runtime::si::CONT_ABSENT) != 0;
+        // `read_data_response` is the `[button_hi, button_lo, stick_x, stick_y]`
+        // PIF wire shape filled from the fed input (idle default).
+        let resp = pif.read_data_response(port);
+        // Assemble the 6-byte OSContPad in LOGICAL struct-offset order:
+        // button hi@0, button lo@1, stick_x@2, stick_y@3, errno@4, pad@5.
+        let (button_hi, button_lo, stick_x, stick_y, errno) = if absent {
+            (0, 0, 0, 0, CONT_NO_RESPONSE_ERROR)
+        } else {
+            (resp[0], resp[1], resp[2], resp[3], 0)
+        };
+        let pad: [u8; 6] = [button_hi, button_lo, stick_x, stick_y, errno, 0];
+        let base = base_addr + port * 6;
+        // Store each logical byte at its `^3`-swizzled host position so the
+        // game's MEM_HU(button)/MEM_BU(stick,errno) reads recover the right
+        // values -- see the doc comment for the byte-order derivation.
+        for (o, &b) in pad.iter().enumerate() {
+            unsafe {
+                *rdram.add((base + o) ^ 3) = b;
+            }
+        }
+    }
+    // osContGetReadData returns void; leave $v0 as the decomp does (unset).
 }
 
 /// `osContInit(OSMesgQueue *mq, u8 *bitpattern, OSContStatus *data) -> s32`
@@ -4221,6 +4297,70 @@ mod tests {
                 "byte {i} at the r5/decoy address was written -- the shim read \
                  its pointer from the wrong register (the reintroduced bug)"
             );
+        }
+    }
+
+    /// The INPUT-SEAM contract: a host harness feeds controller state via
+    /// `set_controller_state`, and `osContGetReadData_recomp` writes it into
+    /// the game's `OSContPad[MAXCONTROLLERS]` array at `$a0`/`ctx.r4`, in the
+    /// exact byte-swizzled layout the game's own MEM_HU/MEM_BU reads recover.
+    ///
+    /// Fail-against-the-bug: it reads every field back through the SAME
+    /// swizzle the recompiled game uses (`button` via MEM_HU `^2`, `stick`/
+    /// `errno` via MEM_BU `^3`, recomp.h:104-108). A flat/unswizzled copy (the
+    /// prior WIP) or a wrong button bit lands the bytes at the wrong lanes and
+    /// this fails. It also checks the button HIGH byte carries `BTN_START`
+    /// (0x1000) -- the scripted-boot press -- so an endianness flip fails too.
+    #[test]
+    fn os_cont_get_read_data_writes_swizzled_input_into_pad_array() {
+        // Fresh state, then feed a distinctive input on port 0: Start+A held,
+        // stick pushed. (BTN_A = 0x8000, BTN_START = 0x1000 -> 0x9000.)
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        set_controller_state(0, 0x9000, -50, 70);
+
+        let mut buf = vec![0u8; fn64_runtime::RDRAM_MMIO_WINDOW_END as usize];
+        let pad_vram: u64 = 0xFFFF_FFFF_8020_0000;
+        let pad_off = RdramAddr::from_gpr(pad_vram).offset() as usize;
+
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = pad_vram;
+        unsafe { osContGetReadData_recomp(buf.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // Read each OSContPad field EXACTLY as the recompiled game does:
+        // button via MEM_HU (`^2` halfword), the s8/u8 fields via MEM_BU
+        // (`^3` byte). OSContPad size = 0x06 (controller.h:132).
+        let read_button = |base: usize| -> u16 {
+            let a = base ^ 2;
+            u16::from_ne_bytes([buf[a], buf[a + 1]])
+        };
+        let read_i8 = |base: usize, o: usize| -> i8 { buf[(base + o) ^ 3] as i8 };
+        let read_u8 = |base: usize, o: usize| -> u8 { buf[(base + o) ^ 3] };
+
+        // Port 0: present -> errno 0 and the exact fed input.
+        let p0 = pad_off;
+        assert_eq!(
+            read_button(p0),
+            0x9000,
+            "port 0 button must read back BTN_A|BTN_START (0x9000) via the game's MEM_HU"
+        );
+        assert_ne!(
+            read_button(p0) & 0x1000,
+            0,
+            "BTN_START (0x1000) must be set -- the scripted press must reach the game"
+        );
+        assert_eq!(read_i8(p0, 2), -50, "stick_x");
+        assert_eq!(read_i8(p0, 3), 70, "stick_y");
+        assert_eq!(read_u8(p0, 4), 0, "port 0 (present) errno == 0");
+
+        // Ports 1-3: absent -> nonzero errno so the game ignores them.
+        for port in 1..MAXCONTROLLERS {
+            let base = pad_off + port * 6;
+            assert_eq!(
+                read_u8(base, 4),
+                CONT_NO_RESPONSE_ERROR,
+                "absent port {port} errno must be CONT_NO_RESPONSE_ERROR (0x08)"
+            );
+            assert_eq!(read_button(base), 0, "absent port {port} button zeroed");
         }
     }
 
