@@ -1,0 +1,27 @@
+[package]
+name = "fn64-diff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lockstep/state-transplant harness: parse a reference mupen64plus savestate and feed its CPU+RDRAM state into fn64. See docs/DESIGN.md (fn64) and this crate's module docs."
+
+[dependencies]
+fn64-runtime = { path = "../fn64-runtime" }
+flate2 = "1"
+# Used by bin/lockstep.rs (the end-to-end runnable harness) and tests/
+# transplant.rs (the state-transplant integration test), both of which
+# exercise the real Executor/RecompContext/SectionRegistry machinery.
+# fn64-diff's own LIB code stays fn64-runtime-only (see lib.rs's module doc
+# on crate layering) -- this is only needed by the binary/test targets, not
+# by lib.rs itself.
+fn64-abi = { path = "../fn64-abi" }
+
+[[bin]]
+name = "dump_snapshot"
+path = "src/bin/dump_snapshot.rs"
+
+[[bin]]
+name = "lockstep"
+path = "src/bin/lockstep.rs"
+
