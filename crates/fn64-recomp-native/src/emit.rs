@@ -431,6 +431,158 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
             format!("mem.store_wr(Rdram::eff_addr({}, {}), {});", r(base), off, ru32(rt)),
         ),
 
+        // --- 64-bit doubleword ALU immediate ---
+        // DADDI/DADDIU: full 64-bit add of rs and the sign-extended immediate.
+        // (DADDI's overflow trap is dropped, matching the recomp custom of
+        // treating trapping adds as their non-trapping twin.)
+        Daddi { rt, rs, imm } | Daddiu { rt, rs, imm } => line(
+            out,
+            format!("ctx.set_r({}, ({}).wrapping_add({}i64 as u64));", rt, ru64(rs), imm as i64),
+        ),
+
+        // --- 64-bit doubleword ALU register ---
+        Dadd { rd, rs, rt } | Daddu { rd, rs, rt } => line(
+            out,
+            format!("ctx.set_r({}, ({}).wrapping_add({}));", rd, ru64(rs), ru64(rt)),
+        ),
+        Dsub { rd, rs, rt } | Dsubu { rd, rs, rt } => line(
+            out,
+            format!("ctx.set_r({}, ({}).wrapping_sub({}));", rd, ru64(rs), ru64(rt)),
+        ),
+
+        // --- 64-bit doubleword shifts (results stay full 64-bit) ---
+        // DSLL/DSRL by sa (0..31); logical shifts operate on ToU64, arithmetic
+        // (DSRA) on ToS64 so bit 63 fills.
+        Dsll { rd, rt, sa } => {
+            line(out, format!("ctx.set_r({}, ({}) << {});", rd, ru64(rt), sa))
+        }
+        Dsrl { rd, rt, sa } => {
+            line(out, format!("ctx.set_r({}, ({}) >> {});", rd, ru64(rt), sa))
+        }
+        Dsra { rd, rt, sa } => {
+            line(out, format!("ctx.set_r({}, (({}) >> {}) as u64);", rd, rs64(rt), sa))
+        }
+        // The *32 forms shift by sa + 32 (32..63).
+        Dsll32 { rd, rt, sa } => {
+            line(out, format!("ctx.set_r({}, ({}) << {});", rd, ru64(rt), sa as u32 + 32))
+        }
+        Dsrl32 { rd, rt, sa } => {
+            line(out, format!("ctx.set_r({}, ({}) >> {});", rd, ru64(rt), sa as u32 + 32))
+        }
+        Dsra32 { rd, rt, sa } => {
+            line(out, format!("ctx.set_r({}, (({}) >> {}) as u64);", rd, rs64(rt), sa as u32 + 32))
+        }
+        // Variable doubleword shifts: shift count is the low 6 bits of rs (0..63).
+        Dsllv { rd, rt, rs } => line(
+            out,
+            format!("ctx.set_r({}, ({}) << ({} & 63));", rd, ru64(rt), ru64(rs)),
+        ),
+        Dsrlv { rd, rt, rs } => line(
+            out,
+            format!("ctx.set_r({}, ({}) >> ({} & 63));", rd, ru64(rt), ru64(rs)),
+        ),
+        Dsrav { rd, rt, rs } => line(
+            out,
+            format!("ctx.set_r({}, (({}) >> ({} & 63)) as u64);", rd, rs64(rt), ru64(rs)),
+        ),
+
+        // --- 64-bit doubleword mult/div (write HI/LO as full 64-bit) ---
+        // DMULT/DMULTU: 64x64 -> 128-bit product; LO = low 64, HI = high 64.
+        // Rust's i128/u128 give the full product safely (no unsafe, no
+        // pointer tricks) — the typed analogue of N64Recomp's __int128 DMULT.
+        Dmult { rs, rt } => line(
+            out,
+            format!(
+                "{{ let p = ({} as i128) * ({} as i128); ctx.lo = p as u64; ctx.hi = (p >> 64) as u64; }}",
+                rs64(rs),
+                rs64(rt)
+            ),
+        ),
+        Dmultu { rs, rt } => line(
+            out,
+            format!(
+                "{{ let p = ({} as u128) * ({} as u128); ctx.lo = p as u64; ctx.hi = (p >> 64) as u64; }}",
+                ru64(rs),
+                ru64(rt)
+            ),
+        ),
+        // DDIV: signed 64-bit; guard the INT64_MIN / -1 overflow (quotient
+        // saturates to INT64_MIN, remainder 0) exactly like N64Recomp's DDIV,
+        // and the divide-by-zero case leaves HI/LO unchanged (undefined on
+        // hardware; we mirror the C oracle, which skips the write path when the
+        // recompiled code never relies on it — here we simply guard b != 0).
+        Ddiv { rs, rt } => line(
+            out,
+            format!(
+                "{{ let a = {}; let b = {}; if b != 0 {{ if a == i64::MIN && b == -1 {{ ctx.lo = a as u64; ctx.hi = 0; }} else {{ ctx.lo = a.wrapping_div(b) as u64; ctx.hi = a.wrapping_rem(b) as u64; }} }} }}",
+                rs64(rs),
+                rs64(rt)
+            ),
+        ),
+        Ddivu { rs, rt } => line(
+            out,
+            format!(
+                "{{ let a = {}; let b = {}; if b != 0 {{ ctx.lo = a / b; ctx.hi = a % b; }} }}",
+                ru64(rs),
+                ru64(rt)
+            ),
+        ),
+
+        // --- Doubleword loads ---
+        Ld { rt, base, off } => line(
+            out,
+            format!("ctx.set_r({}, mem.load_d(Rdram::eff_addr({}, {})));", rt, r(base), off),
+        ),
+        // LLD is a plain doubleword load on the single-threaded recompilation
+        // model (no other master can break the link between it and its SCD).
+        Lld { rt, base, off } => line(
+            out,
+            format!("ctx.set_r({}, mem.load_d(Rdram::eff_addr({}, {})));", rt, r(base), off),
+        ),
+        Ldl { rt, base, off } => line(
+            out,
+            format!(
+                "ctx.set_r({}, mem.load_dl(ctx.r({}), Rdram::eff_addr({}, {})));",
+                rt,
+                rt,
+                r(base),
+                off
+            ),
+        ),
+        Ldr { rt, base, off } => line(
+            out,
+            format!(
+                "ctx.set_r({}, mem.load_dr(ctx.r({}), Rdram::eff_addr({}, {})));",
+                rt,
+                rt,
+                r(base),
+                off
+            ),
+        ),
+
+        // --- Doubleword stores ---
+        Sd { rt, base, off } => line(
+            out,
+            format!("mem.store_d(Rdram::eff_addr({}, {}), {});", r(base), off, ru64(rt)),
+        ),
+        Sdl { rt, base, off } => line(
+            out,
+            format!("mem.store_dl(Rdram::eff_addr({}, {}), {});", r(base), off, ru64(rt)),
+        ),
+        Sdr { rt, base, off } => line(
+            out,
+            format!("mem.store_dr(Rdram::eff_addr({}, {}), {});", r(base), off, ru64(rt)),
+        ),
+        // SCD stores the doubleword and, on the single-threaded model, always
+        // reports success by writing 1 into rt.
+        Scd { rt, base, off } => {
+            line(
+                out,
+                format!("mem.store_d(Rdram::eff_addr({}, {}), {});", r(base), off, ru64(rt)),
+            );
+            line(out, format!("ctx.set_r({}, 1);", rt));
+        }
+
         // Control transfers are never emitted here.
         other => line(out, format!("compile_error!(\"non-straight op reached emit_straight: {:?}\");", other)),
     }

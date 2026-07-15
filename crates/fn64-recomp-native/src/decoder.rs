@@ -73,6 +73,80 @@ pub enum Instruction {
     /// Store word right. `SWR rt, off(base)`.
     Swr { rt: Reg, base: Reg, off: i16 },
 
+    // --- 64-bit doubleword loads/stores (MIPS III) ---
+    //
+    // Encodings byte-verified against `mips-linux-gnu-as -mips64 -mabi=64`
+    // (see the decoder tests): LD=opcode 0x37, SD=0x3F, LDL=0x1A, LDR=0x1B,
+    // SDL=0x2C, SDR=0x2D, LLD=0x34, SCD=0x3C.
+    /// Load doubleword. `LD rt, off(base)`.
+    Ld { rt: Reg, base: Reg, off: i16 },
+    /// Store doubleword. `SD rt, off(base)`.
+    Sd { rt: Reg, base: Reg, off: i16 },
+    /// Load doubleword left (unaligned). `LDL rt, off(base)`.
+    Ldl { rt: Reg, base: Reg, off: i16 },
+    /// Load doubleword right (unaligned). `LDR rt, off(base)`.
+    Ldr { rt: Reg, base: Reg, off: i16 },
+    /// Store doubleword left. `SDL rt, off(base)`.
+    Sdl { rt: Reg, base: Reg, off: i16 },
+    /// Store doubleword right. `SDR rt, off(base)`.
+    Sdr { rt: Reg, base: Reg, off: i16 },
+    /// Load-linked doubleword. `LLD rt, off(base)`. On the single-threaded
+    /// recompilation model (no other processor to invalidate the link) this is
+    /// a plain doubleword load; see the emitter note.
+    Lld { rt: Reg, base: Reg, off: i16 },
+    /// Store-conditional doubleword. `SCD rt, off(base)`. On the
+    /// single-threaded recompilation model the conditional store always
+    /// succeeds, so it stores the doubleword and sets rt to 1; see the emitter
+    /// note.
+    Scd { rt: Reg, base: Reg, off: i16 },
+
+    // --- 64-bit doubleword ALU immediate (I-type) ---
+    /// Doubleword add immediate (trap on overflow; treated as DADDIU per the
+    /// recomp custom of ignoring integer-overflow traps). `DADDI rt, rs, imm`.
+    Daddi { rt: Reg, rs: Reg, imm: i16 },
+    /// Doubleword add immediate unsigned (no trap). `DADDIU rt, rs, imm`.
+    Daddiu { rt: Reg, rs: Reg, imm: i16 },
+
+    // --- 64-bit doubleword ALU register (R-type, SPECIAL) ---
+    /// Doubleword add (trap on overflow; treated as DADDU). `DADD rd, rs, rt`.
+    Dadd { rd: Reg, rs: Reg, rt: Reg },
+    /// Doubleword add unsigned. `DADDU rd, rs, rt`.
+    Daddu { rd: Reg, rs: Reg, rt: Reg },
+    /// Doubleword subtract (trap on overflow; treated as DSUBU). `DSUB rd, rs, rt`.
+    Dsub { rd: Reg, rs: Reg, rt: Reg },
+    /// Doubleword subtract unsigned. `DSUBU rd, rs, rt`.
+    Dsubu { rd: Reg, rs: Reg, rt: Reg },
+
+    // --- 64-bit doubleword shifts (R-type, SPECIAL) ---
+    /// Doubleword shift left logical by `sa` (0..31). `DSLL rd, rt, sa`.
+    Dsll { rd: Reg, rt: Reg, sa: u8 },
+    /// Doubleword shift right logical by `sa`. `DSRL rd, rt, sa`.
+    Dsrl { rd: Reg, rt: Reg, sa: u8 },
+    /// Doubleword shift right arithmetic by `sa`. `DSRA rd, rt, sa`.
+    Dsra { rd: Reg, rt: Reg, sa: u8 },
+    /// Doubleword shift left logical by `sa + 32` (32..63). `DSLL32 rd, rt, sa`.
+    Dsll32 { rd: Reg, rt: Reg, sa: u8 },
+    /// Doubleword shift right logical by `sa + 32`. `DSRL32 rd, rt, sa`.
+    Dsrl32 { rd: Reg, rt: Reg, sa: u8 },
+    /// Doubleword shift right arithmetic by `sa + 32`. `DSRA32 rd, rt, sa`.
+    Dsra32 { rd: Reg, rt: Reg, sa: u8 },
+    /// Doubleword shift left logical variable (by `rs & 63`). `DSLLV rd, rt, rs`.
+    Dsllv { rd: Reg, rt: Reg, rs: Reg },
+    /// Doubleword shift right logical variable (by `rs & 63`). `DSRLV rd, rt, rs`.
+    Dsrlv { rd: Reg, rt: Reg, rs: Reg },
+    /// Doubleword shift right arithmetic variable (by `rs & 63`). `DSRAV rd, rt, rs`.
+    Dsrav { rd: Reg, rt: Reg, rs: Reg },
+
+    // --- 64-bit doubleword mult/div (R-type, SPECIAL; write HI/LO) ---
+    /// Doubleword multiply signed (128-bit product into HI:LO). `DMULT rs, rt`.
+    Dmult { rs: Reg, rt: Reg },
+    /// Doubleword multiply unsigned. `DMULTU rs, rt`.
+    Dmultu { rs: Reg, rt: Reg },
+    /// Doubleword divide signed (LO=quotient, HI=remainder). `DDIV rs, rt`.
+    Ddiv { rs: Reg, rt: Reg },
+    /// Doubleword divide unsigned. `DDIVU rs, rt`.
+    Ddivu { rs: Reg, rt: Reg },
+
     // --- ALU immediate (I-type) ---
     /// Add immediate (trap on overflow; we treat as ADDIU per recomp custom).
     Addi { rt: Reg, rs: Reg, imm: i16 },
@@ -253,6 +327,10 @@ pub fn decode(w: u32) -> Instruction {
             0x04 => Sllv { rd: rd(w), rt: rt(w), rs: rs(w) },
             0x06 => Srlv { rd: rd(w), rt: rt(w), rs: rs(w) },
             0x07 => Srav { rd: rd(w), rt: rt(w), rs: rs(w) },
+            // Doubleword variable shifts.
+            0x14 => Dsllv { rd: rd(w), rt: rt(w), rs: rs(w) },
+            0x16 => Dsrlv { rd: rd(w), rt: rt(w), rs: rs(w) },
+            0x17 => Dsrav { rd: rd(w), rt: rt(w), rs: rs(w) },
             // Jumps.
             0x08 => Jr { rs: rs(w) },
             0x09 => Jalr { rd: rd(w), rs: rs(w) },
@@ -266,6 +344,11 @@ pub fn decode(w: u32) -> Instruction {
             0x19 => Multu { rs: rs(w), rt: rt(w) },
             0x1A => Div { rs: rs(w), rt: rt(w) },
             0x1B => Divu { rs: rs(w), rt: rt(w) },
+            // Doubleword mult/div.
+            0x1C => Dmult { rs: rs(w), rt: rt(w) },
+            0x1D => Dmultu { rs: rs(w), rt: rt(w) },
+            0x1E => Ddiv { rs: rs(w), rt: rt(w) },
+            0x1F => Ddivu { rs: rs(w), rt: rt(w) },
             // ALU register.
             0x20 => Add { rd: rd(w), rs: rs(w), rt: rt(w) },
             0x21 => Addu { rd: rd(w), rs: rs(w), rt: rt(w) },
@@ -277,6 +360,19 @@ pub fn decode(w: u32) -> Instruction {
             0x27 => Nor { rd: rd(w), rs: rs(w), rt: rt(w) },
             0x2A => Slt { rd: rd(w), rs: rs(w), rt: rt(w) },
             0x2B => Sltu { rd: rd(w), rs: rs(w), rt: rt(w) },
+            // Doubleword ALU register.
+            0x2C => Dadd { rd: rd(w), rs: rs(w), rt: rt(w) },
+            0x2D => Daddu { rd: rd(w), rs: rs(w), rt: rt(w) },
+            0x2E => Dsub { rd: rd(w), rs: rs(w), rt: rt(w) },
+            0x2F => Dsubu { rd: rd(w), rs: rs(w), rt: rt(w) },
+            // Doubleword immediate shifts. DSLL/DSRL/DSRA use sa (0..31);
+            // the *32 forms add 32 to the shift count (32..63).
+            0x38 => Dsll { rd: rd(w), rt: rt(w), sa: sa(w) },
+            0x3A => Dsrl { rd: rd(w), rt: rt(w), sa: sa(w) },
+            0x3B => Dsra { rd: rd(w), rt: rt(w), sa: sa(w) },
+            0x3C => Dsll32 { rd: rd(w), rt: rt(w), sa: sa(w) },
+            0x3E => Dsrl32 { rd: rd(w), rt: rt(w), sa: sa(w) },
+            0x3F => Dsra32 { rd: rd(w), rt: rt(w), sa: sa(w) },
             _ => Unknown { word: w },
         },
         // REGIMM: dispatch on the rt field (bits 20..16).
@@ -306,6 +402,12 @@ pub fn decode(w: u32) -> Instruction {
         0x0D => Ori { rt: rt(w), rs: rs(w), imm: imm_u(w) },
         0x0E => Xori { rt: rt(w), rs: rs(w), imm: imm_u(w) },
         0x0F => Lui { rt: rt(w), imm: imm_u(w) },
+        // Doubleword ALU immediate.
+        0x18 => Daddi { rt: rt(w), rs: rs(w), imm: imm_s(w) },
+        0x19 => Daddiu { rt: rt(w), rs: rs(w), imm: imm_s(w) },
+        // Doubleword unaligned loads.
+        0x1A => Ldl { rt: rt(w), base: rs(w), off: imm_s(w) },
+        0x1B => Ldr { rt: rt(w), base: rs(w), off: imm_s(w) },
         // Branch-likely.
         0x14 => Beql { rs: rs(w), rt: rt(w), off: imm_s(w) },
         0x15 => Bnel { rs: rs(w), rt: rt(w), off: imm_s(w) },
@@ -325,6 +427,15 @@ pub fn decode(w: u32) -> Instruction {
         0x2A => Swl { rt: rt(w), base: rs(w), off: imm_s(w) },
         0x2B => Sw { rt: rt(w), base: rs(w), off: imm_s(w) },
         0x2E => Swr { rt: rt(w), base: rs(w), off: imm_s(w) },
+        // Doubleword unaligned stores.
+        0x2C => Sdl { rt: rt(w), base: rs(w), off: imm_s(w) },
+        0x2D => Sdr { rt: rt(w), base: rs(w), off: imm_s(w) },
+        // Load-linked / store-conditional doubleword.
+        0x34 => Lld { rt: rt(w), base: rs(w), off: imm_s(w) },
+        0x3C => Scd { rt: rt(w), base: rs(w), off: imm_s(w) },
+        // Aligned doubleword load/store.
+        0x37 => Ld { rt: rt(w), base: rs(w), off: imm_s(w) },
+        0x3F => Sd { rt: rt(w), base: rs(w), off: imm_s(w) },
         _ => Unknown { word: w },
     }
 }
