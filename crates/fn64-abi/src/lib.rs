@@ -1190,25 +1190,19 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
                 } else {
                     dma.read_rom_bytes(dev_addr, &mut buf);
                 }
-                // A flat copy hung OoT's DmaMgr_Init (MEM_W(dest+4)==0x1060
-                // check saw 0x60100000) and would corrupt every SRAM byte the
-                // save loader MEM_BU's back. PI DMA is word-aligned.
-                assert!(
-                    dram_addr.offset() % 4 == 0 && buf.len() % 4 == 0,
-                    "PI DMA must be word-aligned (dram={:#x} len={:#x})",
-                    dram_addr.offset(),
-                    buf.len()
-                );
-                for word in buf.chunks_exact_mut(4) {
-                    word.swap(0, 3);
-                    word.swap(1, 2);
-                }
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        buf.as_ptr(),
-                        rdram.add(dram_addr.offset() as usize),
-                        buf.len(),
-                    );
+                // Per-BYTE lane swizzle into native-word rdram, matching
+                // `Rdram::dma_write_bytes` (`dst[(base+k)^3]=src[k]`). A flat
+                // copy hung OoT's DmaMgr_Init (MEM_W(dest+4)==0x1060 saw
+                // 0x60100000) and would corrupt every SRAM byte the save loader
+                // MEM_BU's back. This shim copies through the raw rdram pointer
+                // (no Rdram wrapper), so swizzle byte-by-byte here. Per-byte,
+                // NOT per-word, so it stays correct for the sub-word / unaligned
+                // transfers OoT's DmaMgr_DmaRomToRam issues (e.g. len=0x86).
+                let base = dram_addr.offset() as usize;
+                for (k, &b) in buf.iter().enumerate() {
+                    unsafe {
+                        *rdram.add((base + k) ^ 3) = b;
+                    }
                 }
                 fn64_runtime::DmaCompletion {
                     direction,

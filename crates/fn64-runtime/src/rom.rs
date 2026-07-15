@@ -280,16 +280,10 @@ impl<R: RomStorage> PiDma<R> {
             // swizzled bytes; un-swizzle back to flat save order (the inverse
             // of dma_write_bytes) before writing the save chip.
             (DmaDirection::FromRdram, true) => {
-                assert!(
-                    base % 4 == 0 && (len as usize) % 4 == 0,
-                    "PI DMA must be word-aligned (dram={base:#x} len={len:#x})"
-                );
-                let swz = rdram.read_bytes(base, len as usize);
-                let mut flat = vec![0u8; len as usize];
-                for (i, word) in swz.chunks_exact(4).enumerate() {
-                    let o = i * 4;
-                    flat[o..o + 4].copy_from_slice(&[word[3], word[2], word[1], word[0]]);
-                }
+                // Un-swizzle native-word rdram back to flat save order via the
+                // per-byte inverse (`flat[k] = rdram[(base+k)^3]`), correct for
+                // any offset/length -- no word-alignment requirement.
+                let flat = rdram.dma_read_bytes_flat(base, len as usize);
                 let sram_offset = dev_addr - SRAM_DOMAIN2_BASE;
                 self.sram_write_from(sram_offset, &flat);
             }
@@ -349,6 +343,38 @@ mod tests {
         // MEM_BU(base+k) returns cart byte k (0xDE,0xAD,0xBE,0xEF), NOT 3-k.
         assert_eq!(rdram.read_bu(RdramAddr::from_offset(0x20)), 0xDE);
         assert_eq!(rdram.read_bu(RdramAddr::from_offset(0x22)), 0xBE);
+    }
+
+    #[test]
+    fn dma_to_rdram_handles_non_word_aligned_length() {
+        // OoT's DmaMgr_DmaRomToRam issues sub-word-length DMAs (e.g. len=0x86);
+        // the per-byte swizzle must place EVERY byte on its correct MEM_BU lane,
+        // including the trailing partial word. A word-chunk-only loop (the old
+        // code) would panic on the alignment assert or drop the tail bytes.
+        let mut rom_bytes = vec![0u8; 0x100];
+        // 6 distinguishable bytes at ROM 0x10 (1.5 words -- crosses a word edge).
+        let src = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66];
+        rom_bytes[0x10..0x16].copy_from_slice(&src);
+        let mut dma = PiDma::new(InMemoryRom::new(rom_bytes));
+        let mut rdram = Rdram::new(64);
+
+        dma.start_dma(
+            &mut rdram,
+            DmaDirection::ToRdram,
+            RdramAddr::from_offset(0x20),
+            0x10,
+            6, // NON-word-aligned length
+        );
+
+        // The guest reads each byte via MEM_BU(base+k); every one must recover
+        // the original cart byte k, including the two tail bytes (k=4,5).
+        for (k, &b) in src.iter().enumerate() {
+            assert_eq!(
+                rdram.read_bu(RdramAddr::from_offset(0x20 + k as u32)),
+                b,
+                "MEM_BU(base+{k}) should recover cart byte {b:#x}"
+            );
+        }
     }
 
     #[test]

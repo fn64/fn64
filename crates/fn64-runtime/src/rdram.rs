@@ -240,19 +240,25 @@ impl Rdram {
     /// `LogUtils_HungupThread`'d. Same class as the CPU-load byteswap this
     /// module already fixed for `MEM_*` -- DMA-in was the remaining hole.
     ///
-    /// N64 PI DMA is word-aligned in address and length; a non-word-aligned
-    /// transfer would need hardware's partial-word rules no shim exercises yet.
+    /// Per-BYTE swizzle (`dst[(offset+k) ^ 3] = data[k]`), not per-word: this
+    /// is the general form that matches `MEM_BU`'s own `^3` lane XOR for ANY
+    /// offset and length, so it stays correct for the sub-word / non-word-
+    /// aligned transfers OoT's `DmaMgr_DmaRomToRam` actually issues (e.g.
+    /// `len=0x86`). For a word-aligned run it is identical to reversing each
+    /// 4-byte group; for a partial tail it swizzles each byte to its own lane
+    /// (a bare word-chunk loop would drop or misplace the leftover bytes).
     pub fn dma_write_bytes(&mut self, offset: usize, data: &[u8]) {
-        assert!(
-            offset % 4 == 0 && data.len() % 4 == 0,
-            "DMA write must be word-aligned (offset={offset:#x} len={:#x}); \
-             non-word-aligned PI DMA is unmodeled",
-            data.len()
-        );
-        for (i, word) in data.chunks_exact(4).enumerate() {
-            let o = offset + i * 4;
-            self.bytes[o..o + 4].copy_from_slice(&[word[3], word[2], word[1], word[0]]);
+        for (k, &b) in data.iter().enumerate() {
+            self.bytes[(offset + k) ^ 3] = b;
         }
+    }
+
+    /// Inverse of `dma_write_bytes`: read `len` bytes out of native-word rdram
+    /// back to FLAT (device/save) byte order, `out[k] = bytes[(offset+k) ^ 3]`.
+    /// For a FromRdram (save-write) DMA whose source is guest rdram. Same
+    /// per-byte lane XOR, so it too is correct for any offset/length.
+    pub fn dma_read_bytes_flat(&self, offset: usize, len: usize) -> Vec<u8> {
+        (0..len).map(|k| self.bytes[(offset + k) ^ 3]).collect()
     }
 
     pub fn read_bytes(&self, offset: usize, len: usize) -> &[u8] {
