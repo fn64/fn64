@@ -41,8 +41,29 @@ pub const OS_EVENT_VI: u32 = 7;
 /// rung-18 failure mode -- a second host thread's recompiled code touching
 /// shared rdram with no lock the scheduler can see -- has no
 /// precondition here: there is no second host thread, full stop.
+/// OSMesgQueue struct field offsets (libultra `include/ultra64/message.h`,
+/// `OSMesgQueue`: `validCount` @ 0x08, `first` @ 0x0C, `msgCount` @ 0x10).
+/// Guest code reads these DIRECTLY out of the struct via the `MQ_GET_COUNT`/
+/// `MQ_IS_FULL`/`MQ_IS_EMPTY` macros (e.g. `IrqMgr_SendMesgToClients`'s
+/// per-client `MQ_IS_FULL(client->queue)` gate) -- fn64 keeps the
+/// authoritative queue state in its own `MesgQueue`, so those struct fields
+/// MUST be mirrored back into rdram after every mutation or guest reads see
+/// stale zeros (a never-initialized queue reads `validCount=0, msgCount=0`,
+/// making `MQ_IS_FULL` = `0 >= 0` = ALWAYS TRUE -- the bug that silently
+/// dropped every retrace forward to the scheduler and froze OoT after 1 swap).
+const MQ_VALIDCOUNT_OFF: u32 = 0x08;
+const MQ_FIRST_OFF: u32 = 0x0C;
+const MQ_MSGCOUNT_OFF: u32 = 0x10;
+
 #[derive(Default)]
 pub struct Executor {
+    /// Base of the one process-wide rdram buffer, set once at boot via
+    /// `set_rdram_base`. Held so queue mutations can mirror `validCount`/
+    /// `first`/`msgCount` back into each `OSMesgQueue`'s real rdram struct
+    /// (see `MQ_*_OFF` above) -- guest code reads those fields directly.
+    /// `None` until set (tests that never boot a real rdram just skip the
+    /// mirror, which is correct: there is no guest struct to keep in sync).
+    rdram_base: Option<*mut u8>,
     /// `Box<GameThread>`, NOT a bare `GameThread` -- see `run_one_step`'s
     /// doc comment for the second block/wake defect this closes (the OoT
     /// Main-resume SIGBUS): a `GameThread`'s coroutine body can
@@ -153,6 +174,46 @@ impl Executor {
     /// timer API and (indirectly) count-based scheduling read from.
     pub fn set_sim_time(&mut self, time: u64) {
         self.sim_time = time;
+    }
+
+    /// Register the process-wide rdram base so queue mutations can mirror
+    /// their `validCount`/`first`/`msgCount` back into the guest's real
+    /// `OSMesgQueue` struct (see `MQ_*_OFF` and `rdram_base`'s field doc).
+    ///
+    /// # Safety
+    /// `base` must point to the single live rdram buffer this executor's
+    /// guest code runs against, valid for the executor's whole lifetime
+    /// (the boot harness's one `rdram` Vec -- same buffer every shim already
+    /// receives). Passing a dangling or wrong-sized base is UB, identical to
+    /// the contract every `*_recomp` shim's `rdram` argument already carries.
+    pub unsafe fn set_rdram_base(&mut self, base: *mut u8) {
+        self.rdram_base = Some(base);
+    }
+
+    /// Mirror a queue's live count/head into its rdram `OSMesgQueue` struct
+    /// so guest `MQ_GET_COUNT`/`MQ_IS_FULL`/`MQ_IS_EMPTY` reads see truth.
+    /// No-op if no rdram base is registered (unit tests) or the queue isn't
+    /// known. `msgCount` (capacity) is written too, defending against a
+    /// guest that reads it before libultra's real `osCreateMesgQueue` would
+    /// have set it -- our `create_mesg_queue` shim replaces that function.
+    fn mirror_queue_to_rdram(&self, mq_addr: RdramAddr) {
+        let Some(base) = self.rdram_base else { return };
+        let Some(queue) = self.queues.get(&mq_addr.offset()) else {
+            return;
+        };
+        let valid = queue.valid_count() as i32;
+        let first = queue.first_index() as i32;
+        let msgcount = queue.capacity() as i32;
+        // Same KSEG0-relative translation MEM_W uses: RdramAddr::offset() is
+        // already the physical rdram byte offset, so write straight there in
+        // native byte order (matching the recomp's `*(int32_t*)` MEM_W).
+        let write = |off: u32, val: i32| unsafe {
+            let o = mq_addr.offset().wrapping_add(off) as usize;
+            std::ptr::copy_nonoverlapping(val.to_ne_bytes().as_ptr(), base.add(o), 4);
+        };
+        write(MQ_VALIDCOUNT_OFF, valid);
+        write(MQ_FIRST_OFF, first);
+        write(MQ_MSGCOUNT_OFF, msgcount);
     }
 
     // ---- OSThread lifecycle -------------------------------------------
@@ -271,6 +332,11 @@ impl Executor {
     pub fn create_mesg_queue(&mut self, mq_addr: RdramAddr, capacity: usize) {
         self.queues
             .insert(mq_addr.offset(), MesgQueue::new(capacity.max(1)));
+        // Initialize the guest's rdram struct (validCount=0, first=0,
+        // msgCount=capacity) so a guest reading MQ_IS_FULL/MQ_GET_COUNT
+        // before ever sending sees a correct empty-with-capacity queue,
+        // not the stale zeros a never-mirrored struct would show.
+        self.mirror_queue_to_rdram(mq_addr);
     }
 
     fn queue_mut(&mut self, mq_addr: RdramAddr) -> &mut MesgQueue {
@@ -518,6 +584,9 @@ impl Executor {
                 .expect("has_blocked_receivers() was true");
             self.record_queue_op(queue_addr, QueueOpKind::Wake, waiter);
             self.wake_thread(waiter, Resume::Delivered(msg));
+            // A direct hand-off to a blocked receiver leaves valid_count
+            // unchanged, but mirror anyway to stay unconditionally in sync.
+            self.mirror_queue_to_rdram(queue_addr);
             return;
         }
         match queue.try_send(msg) {
@@ -535,6 +604,7 @@ impl Executor {
                 // there is nothing else a non-coroutine caller could do.
             }
         }
+        self.mirror_queue_to_rdram(queue_addr);
     }
 
     /// Move a blocked (or newly-woken-by-timer/external-event) thread back
@@ -575,22 +645,25 @@ impl Executor {
             self.record_queue_op(mq_addr, QueueOpKind::Send, sender);
             self.record_queue_op(mq_addr, QueueOpKind::Wake, waiter);
             self.wake_thread(waiter, Resume::Delivered(msg));
+            self.mirror_queue_to_rdram(mq_addr);
             return SendOutcome::Delivered;
         }
-        match queue.try_send(msg) {
+        let outcome = match queue.try_send(msg) {
             SendResult::Delivered => {
                 self.record_queue_op(mq_addr, QueueOpKind::Send, sender);
                 SendOutcome::Delivered
             }
             SendResult::WouldBlock => SendOutcome::Blocked,
-        }
+        };
+        self.mirror_queue_to_rdram(mq_addr);
+        outcome
     }
 
     fn try_deliver_recv(&mut self, receiver: ThreadId, mq_addr: RdramAddr) -> RecvOutcome {
         let queue = self.queue_mut(mq_addr);
         let recv_result = queue.try_recv();
         let has_blocked_senders = queue.has_blocked_senders();
-        match recv_result {
+        let outcome = match recv_result {
             RecvResult::Delivered(msg) => {
                 self.record_queue_op(mq_addr, QueueOpKind::Recv, receiver);
                 if has_blocked_senders {
@@ -604,7 +677,9 @@ impl Executor {
                 RecvOutcome::Delivered(msg)
             }
             RecvResult::WouldBlock => RecvOutcome::Blocked,
-        }
+        };
+        self.mirror_queue_to_rdram(mq_addr);
+        outcome
     }
 
     fn record_queue_op(&mut self, queue_addr: RdramAddr, op: QueueOpKind, thread: ThreadId) {
@@ -939,4 +1014,84 @@ pub enum RecvMesgOutcome {
     MustYield,
     /// `OS_MESG_NOBLOCK` on an empty queue: no message, no yield.
     WouldBlock,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_i32(buf: &[u8], off: usize) -> i32 {
+        i32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    }
+
+    /// Regression: the guest's rdram `OSMesgQueue` struct
+    /// (`validCount`@0x08, `first`@0x0C, `msgCount`@0x10) MUST be kept in
+    /// sync with the executor's authoritative `MesgQueue` after creation and
+    /// every mutation. Guest code reads those fields DIRECTLY via
+    /// `MQ_GET_COUNT`/`MQ_IS_FULL` (e.g. `IrqMgr_SendMesgToClients`'s
+    /// `MQ_IS_FULL(client->queue)` gate). Before this fix, the struct stayed
+    /// zero-initialized, so `MQ_IS_FULL` = `0 >= 0` = ALWAYS TRUE, silently
+    /// dropping every VI-retrace forward to the OoT scheduler and freezing
+    /// boot at exactly 1 framebuffer swap.
+    ///
+    /// Distinguishable values chosen so a regression can't pass by accident:
+    /// capacity 5 (not 0/1), and a partial fill of 3 (not 0, not full).
+    #[test]
+    fn queue_struct_mirrored_into_rdram_on_create_and_send() {
+        // A queue at a byte offset with room for the 0x18-byte struct.
+        const Q_OFF: u32 = 0x1000;
+        const CAPACITY: usize = 5;
+        let mut rdram = vec![0u8; 0x2000];
+
+        let mut exec = Executor::new();
+        unsafe { exec.set_rdram_base(rdram.as_mut_ptr()) };
+
+        let q = RdramAddr::from_offset(Q_OFF);
+        exec.create_mesg_queue(q, CAPACITY);
+
+        // After creation: validCount==0, first==0, msgCount==capacity.
+        let base = Q_OFF as usize;
+        assert_eq!(read_i32(&rdram, base + 0x08), 0, "validCount after create");
+        assert_eq!(read_i32(&rdram, base + 0x0C), 0, "first after create");
+        assert_eq!(
+            read_i32(&rdram, base + 0x10),
+            CAPACITY as i32,
+            "msgCount after create MUST equal capacity, else MQ_IS_FULL reads garbage"
+        );
+
+        // Post three messages via the external/timer path (no blocked
+        // receiver), then confirm validCount tracked each enqueue -- 3, a
+        // value distinct from 0 (empty) and 5 (full).
+        for msg in [0x11u32, 0x22, 0x33] {
+            exec.inject_event(ExternalEvent::DirectPost {
+                queue_addr: q,
+                msg,
+            });
+        }
+        assert_eq!(
+            read_i32(&rdram, base + 0x08),
+            3,
+            "validCount MUST mirror the 3 enqueued messages (so MQ_GET_COUNT/MQ_IS_FULL are correct)"
+        );
+        assert_eq!(read_i32(&rdram, base + 0x10), CAPACITY as i32, "msgCount stays capacity");
+        // MQ_IS_FULL semantics the guest computes: validCount >= msgCount.
+        assert!(
+            read_i32(&rdram, base + 0x08) < read_i32(&rdram, base + 0x10),
+            "a partially-filled queue MUST NOT read as full (the bug: it always did)"
+        );
+    }
+
+    /// Without a registered rdram base (unit-test executors that never boot a
+    /// real rdram), the mirror is a safe no-op -- never a null deref.
+    #[test]
+    fn mirror_is_noop_without_rdram_base() {
+        let mut exec = Executor::new();
+        let q = RdramAddr::from_offset(0x2000);
+        exec.create_mesg_queue(q, 4); // must not panic / deref null
+        exec.inject_event(ExternalEvent::DirectPost {
+            queue_addr: q,
+            msg: 1,
+        });
+        assert_eq!(exec.queue_capacity(q), 4);
+    }
 }

@@ -982,15 +982,22 @@ pub unsafe extern "C" fn osSetEventMesg_recomp(_rdram: *mut u8, ctx: *mut Recomp
 /// struct state, `TimerWheel::set_timer` returns its own `TimerId`, and no
 /// shim here yet needs to map a `t` address back to that id, since nothing
 /// calls `osStopTimer_recomp` in this milestone's undefined-symbol set).
-/// `countdown`=r6 (low word; OSTime's real 64-bit range is not exercised by
-/// this milestone's boot-rung evidence, which only cited a single-timer
-/// role-match with no byte-donor confirmation -- treating it as a plain
-/// 32-bit virtual-tick count is the honest, undecorated reading of what the
-/// call site actually passes, not an invented 64-bit reconstruction with no
-/// evidence behind it), `interval`/`mq`/`msg` stack-passed at
-/// `sp+0x10/0x18/0x1C` (verified against the real call site in
-/// `funcs_13.c`: `MEM_W(0X10,...)`, `MEM_W(0X18,...)`, `MEM_W(0X1C,...)`
-/// immediately preceding the `jal`).
+/// `countdown` is a 64-bit `OSTime`, passed as the o32 register pair a2:a3
+/// (`ctx.r6`=HIGH word, `ctx.r7`=LOW word -- MIPS big-endian even/odd pair
+/// alignment for a 64-bit 2nd argument). Reassembled as `(r6 << 32) | r7`.
+/// Reading only `r6` (the OLD code) got the HIGH word, which is 0 for every
+/// value under 2^32 -- so OoT's own RCP-timeout timer
+/// (`Graph_ExecuteAndDraw`: `osSetTimer(&timer, OS_USEC_TO_CYCLES(3000000),
+/// 0, &gfxCtx->queue, 666)`) armed with countdown=0 and fired IMMEDIATELY
+/// every `advance_time` tick instead of after 3 virtual seconds. Verified
+/// byte-exact against the real call site
+/// (`games/OOTU/RecompiledFuncs/funcs_40.c`, PC 0x800A13C0-0x800A13F4):
+/// `lui $a3,0x861; ori $a3,$a3,0xC468` => a3=0x0861C468 (LOW word, the
+/// 140,378,216-cycle 3s countdown), `addiu $a2,$zero,0x0` => a2=0 (HIGH).
+/// `interval`/`mq`/`msg` stack-passed: interval is likewise a 64-bit pair at
+/// `sp+0x10`(HIGH):`sp+0x14`(LOW), `mq` at `sp+0x18`, `msg` at `sp+0x1C`
+/// (same funcs_40.c call site: `sw $t6,0x10; sw $t7,0x14; sw $a1,0x18;
+/// sw $t5,0x1C`, both interval halves 0 here).
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
@@ -998,8 +1005,10 @@ pub unsafe extern "C" fn osSetEventMesg_recomp(_rdram: *mut u8, ctx: *mut Recomp
 pub unsafe extern "C" fn osSetTimer_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &*ctx };
     let timer_handle = RdramAddr::from_gpr(ctx.r4);
-    let countdown = ctx.r6;
-    let interval = read_stack_word(rdram, ctx.r29, 0x10) as u64;
+    let countdown = ((ctx.r6 & 0xFFFF_FFFF) << 32) | (ctx.r7 & 0xFFFF_FFFF);
+    let interval_hi = read_stack_word(rdram, ctx.r29, 0x10) as u64;
+    let interval_lo = read_stack_word(rdram, ctx.r29, 0x14) as u64;
+    let interval = (interval_hi << 32) | interval_lo;
     let mq_addr = RdramAddr::from_gpr(read_stack_word(rdram, ctx.r29, 0x18) as u64);
     let msg = read_stack_word(rdram, ctx.r29, 0x1C) as Mesg;
     let armed_by = current_thread_id("osSetTimer_recomp");
@@ -2155,6 +2164,13 @@ pub unsafe fn boot_thread0(
 ) {
     let rdram_addr = rdram as usize;
     with_executor(|exec| {
+        // Register the process-wide rdram base so the executor can mirror
+        // each OSMesgQueue's validCount/first/msgCount back into the guest's
+        // real struct after every queue mutation -- guest code reads those
+        // fields directly (MQ_IS_FULL/MQ_GET_COUNT). SAFETY: `rdram` is the
+        // harness's single live rdram buffer, valid for the whole run, the
+        // same buffer every shim already receives.
+        unsafe { exec.set_rdram_base(rdram) };
         exec.create_thread(thread_id, priority, move |yielder, first_input| {
             let rdram_ptr = rdram_addr as *mut u8;
             with_active_yielder(thread_id, rdram_ptr, yielder, || {
@@ -3166,7 +3182,18 @@ pub unsafe extern "C" fn osViGetCurrentFramebuffer_recomp(
 ) {
     let ctx = unsafe { &mut *ctx };
     let fb = with_executor(|exec| exec.vi().current_framebuffer);
-    ctx.r2 = fb.map(|a| a.offset() as u64).unwrap_or(0);
+    // Return the SIGN-EXTENDED KSEG0 pointer the game passed to
+    // osViSwapBuffer, NOT the bare physical offset: Sched_HandleRetrace
+    // compares this `$v0` result `==` against `pendingSwapBuf1->swapBuffer`
+    // (funcs_41.c PC 0x800A3288, `bnel $v1, $v0`), and that operand is loaded
+    // via `MEM_W` = `*(int32_t*)` -- SIGN-extended, so a KSEG0 fb like
+    // 0x803B5000 arrives as 0xFFFFFFFF_803B5000. Returning a zero-extended
+    // u32 (0x00000000_803B5000) made `bnel` see them as unequal and the
+    // framebuffer-swap chain that drives every frame-2+ swap never advanced
+    // (curBuf/pendingSwapBuf1 frozen), stalling boot at exactly 1 swap.
+    // `as i32 as u64` reproduces MEM_W's own sign extension. See
+    // `RdramAddr::to_kseg0`.
+    ctx.r2 = fb.map(|a| a.to_kseg0() as i32 as u64).unwrap_or(0);
 }
 
 /// `osViGetNextFramebuffer(void) -> void*` -- same reasoning/return value
@@ -3180,7 +3207,9 @@ pub unsafe extern "C" fn osViGetCurrentFramebuffer_recomp(
 pub unsafe extern "C" fn osViGetNextFramebuffer_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     let fb = with_executor(|exec| exec.vi().current_framebuffer);
-    ctx.r2 = fb.map(|a| a.offset() as u64).unwrap_or(0);
+    // Sign-extended KSEG0 pointer, same reasoning as
+    // osViGetCurrentFramebuffer_recomp (MEM_W-compatible sign extension).
+    ctx.r2 = fb.map(|a| a.to_kseg0() as i32 as u64).unwrap_or(0);
 }
 
 /// `osWritebackDCacheAll(void)` -- no arguments; writes back the ENTIRE
@@ -4110,6 +4139,89 @@ mod tests {
         let written = u32::from_ne_bytes(rdram[0x1018..0x101C].try_into().unwrap());
         assert_eq!(written, 0xCAFE);
         set_section_unloaded(idx);
+    }
+
+    /// Regression: `osSetTimer`'s `OSTime countdown` is a 64-bit value passed
+    /// in the o32 register pair a2:a3 (`ctx.r6`=HIGH word, `ctx.r7`=LOW word).
+    /// The old shim read only `ctx.r6` (the HIGH word), which is 0 for any
+    /// countdown under 2^32 -- so OoT's own 3-second RCP-timeout timer
+    /// (`Graph_ExecuteAndDraw`, funcs_40.c PC 0x800A13C0: `lui $a3,0x861; ori
+    /// $a3,$a3,0xC468` => a3=0x0861C468, `addiu $a2,$zero,0x0` => a2=0) armed
+    /// with countdown=0 and fired IMMEDIATELY on the very next
+    /// `advance_virtual_time` tick, spinning the Graph thread instead of
+    /// pacing it 3 virtual seconds out.
+    ///
+    /// Distinguishable values: countdown 0x0861_C468 (the real 3s value, high
+    /// word 0), armed at t=0; a probe at t=1000 (well before it) must NOT
+    /// deliver, and a probe at t=0x0861_C468 must. The buggy high-word-only
+    /// read would deliver at t=1000 (countdown seen as 0), failing the first
+    /// assert.
+    #[test]
+    fn os_set_timer_assembles_64bit_countdown_from_a2_a3_register_pair() {
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+
+        // Real rdram so the stack-passed interval/mq/msg reads resolve. Leaked
+        // to a 'static pointer so it stays valid across the spawned coroutine
+        // that arms the timer (the arm must run inside a resumed thread body
+        // so `current_thread_id` has an active id, matching real dispatch).
+        let rdram: &'static mut [u8] =
+            vec![0u8; fn64_runtime::RDRAM_MMIO_WINDOW_END as usize].leak();
+        let rdram_ptr = rdram.as_mut_ptr();
+
+        // The queue the timer posts to, and the message it posts.
+        let mq_vram: u64 = 0xFFFF_FFFF_8006_0000;
+        let mq_addr = RdramAddr::from_gpr(mq_vram);
+        const TIMER_MSG: u32 = 0x1234_5678;
+        with_executor(|exec| exec.create_mesg_queue(mq_addr, 4));
+
+        // arg layout: a0=OSTimer* (r4), countdown 64-bit in a2:a3 (r6:r7),
+        // interval 64-bit at sp+0x10:0x14, mq at sp+0x18, msg at sp+0x1C.
+        const COUNTDOWN: u32 = 0x0861_C468; // OS_USEC_TO_CYCLES(3000000), high word 0
+        let sp: u64 = 0xFFFF_FFFF_8000_4000;
+        {
+            let mut put = |off: u32, v: u32| {
+                let o = RdramAddr::from_gpr(sp.wrapping_add(off as u64)).offset() as usize;
+                rdram[o..o + 4].copy_from_slice(&v.to_ne_bytes());
+            };
+            put(0x10, 0); // interval HIGH = 0
+            put(0x14, 0); // interval LOW  = 0 (one-shot)
+            put(0x18, mq_vram as u32); // mq
+            put(0x1C, TIMER_MSG); // msg
+        }
+
+        // Arm the timer from inside a resumed thread body (installs an active
+        // thread id, as every real _recomp call has).
+        spawn_test_thread(200, 1, move || {
+            let mut ctx = ctx_zeroed();
+            ctx.r4 = 0xFFFF_FFFF_8006_1000; // OSTimer* handle
+            ctx.r6 = 0; // a2 = countdown HIGH word (zero for a <2^32 value)
+            ctx.r7 = COUNTDOWN as u64; // a3 = countdown LOW word
+            ctx.r29 = sp;
+            unsafe { osSetTimer_recomp(rdram_ptr, &mut ctx as *mut _) };
+        });
+        run_to_idle();
+
+        // Probe WELL before the real deadline: nothing may be delivered yet.
+        // (The bug delivered here, having read countdown as 0.)
+        advance_virtual_time(1000);
+        with_executor(|exec| {
+            assert_eq!(
+                exec.recv_mesg(0, mq_addr, false),
+                RecvMesgOutcome::WouldBlock,
+                "a 0x0861C468-cycle countdown must NOT fire at t=1000 -- if it did, the shim \
+                 read only the (zero) HIGH word of the 64-bit countdown"
+            );
+        });
+
+        // Advance to the real deadline: now it must deliver exactly once.
+        advance_virtual_time(COUNTDOWN as u64);
+        with_executor(|exec| {
+            assert_eq!(
+                exec.recv_mesg(0, mq_addr, false),
+                RecvMesgOutcome::Delivered(TIMER_MSG),
+                "the timer must fire at its true 64-bit deadline"
+            );
+        });
     }
 
     #[test]

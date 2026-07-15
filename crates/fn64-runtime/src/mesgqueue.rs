@@ -145,6 +145,18 @@ impl MesgQueue {
         self.buffer.len()
     }
 
+    /// Current number of queued messages -- mirrored into the guest's rdram
+    /// `OSMesgQueue.validCount` (0x08) so guest `MQ_GET_COUNT`/`MQ_IS_FULL`
+    /// reads see truth. See `Executor::mirror_queue_to_rdram`.
+    pub fn valid_count(&self) -> usize {
+        self.valid_count
+    }
+
+    /// Ring-buffer head index -- mirrored into `OSMesgQueue.first` (0x0C).
+    pub fn first_index(&self) -> usize {
+        self.first
+    }
+
     fn is_full(&self) -> bool {
         self.valid_count == self.buffer.len()
     }
