@@ -380,40 +380,31 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
 
         match opcode {
             G_VTX => {
-                // F3DEX2 gsSPVertex (gbi.h ~2150): w0 = op<<24 | (v0*2)<<16 |
-                // ((n<<10)|(sizeof(Vtx)*n - 1)); w1 = segmented vtx array
-                // address. n = (w0>>10)&0x3F, v0 = ((w0>>16)&0xFF)/2.
-                let n = ((w0 >> 10) & 0x3F) as usize;
-                let v0 = (((w0 >> 16) & 0xFF) / 2) as usize;
+                // F3DEX2 G_VTX (F3DEX2-CONCEPTS.md §2.1): the RSP-side wire
+                // layout is n = field(w0,12,8), end-index = field(w0,1,7),
+                // and the destination start slot v0 = end - n. w1 = segmented
+                // vertex-array address. (NOT the F3DEX/SDK-macro `/2` form,
+                // which misplaces vertices -- failure risk #2.)
+                let n = ((w0 >> 12) & 0xFF) as usize;
+                let end = ((w0 >> 1) & 0x7F) as usize;
+                let v0 = end.saturating_sub(n);
                 load_vertices(rdram, state, w1, n, v0);
             }
             G_TRI1 => {
-                // F3DEX2 __gsSP1Triangle_w1 (gbi.h ~2320): indices packed
-                // into w0's low 24 bits, each as (v*2). Divide each byte by 2
-                // to recover the vertex-cache slot.
-                let idx = [
-                    ((w0 >> 16) & 0xFF) / 2,
-                    ((w0 >> 8) & 0xFF) / 2,
-                    (w0 & 0xFF) / 2,
-                ];
+                // F3DEX2 G_TRI1 (F3DEX2-CONCEPTS.md §2.2): three 7-bit
+                // vertex-cache-slot fields in w0 at bits 17/9/1 -- each is
+                // already the slot (0-31), no /2 needed.
+                let idx = tri_indices(w0);
                 if let Some(t) = resolve_tri(&state.vtx_cache, idx) {
                     state.tris.push(t);
                 }
             }
             G_TRI2 | G_QUAD => {
-                // F3DEX2 gsSP2Triangles / gsSP1Quadrangle: triangle A in
-                // w0's low 24 bits, triangle B in w1's low 24 bits, each
-                // index (v*2).
-                let idx_a = [
-                    ((w0 >> 16) & 0xFF) / 2,
-                    ((w0 >> 8) & 0xFF) / 2,
-                    (w0 & 0xFF) / 2,
-                ];
-                let idx_b = [
-                    ((w1 >> 16) & 0xFF) / 2,
-                    ((w1 >> 8) & 0xFF) / 2,
-                    (w1 & 0xFF) / 2,
-                ];
+                // F3DEX2 G_TRI2 / G_QUAD (§2.3): triangle A's three 7-bit
+                // slot fields in w0 (bits 17/9/1), triangle B's in w1 at the
+                // SAME bit positions. G_QUAD decodes identically to G_TRI2.
+                let idx_a = tri_indices(w0);
+                let idx_b = tri_indices(w1);
                 if let Some(t) = resolve_tri(&state.vtx_cache, idx_a) {
                     state.tris.push(t);
                 }
@@ -586,6 +577,13 @@ fn project_vertex(state: &DecodeState, x: f32, y: f32, z: f32) -> (f32, f32) {
             (x, y)
         }
     }
+}
+
+/// Extract the three F3DEX2 triangle vertex-cache slot indices from a
+/// command word: three 7-bit fields at bit offsets 17, 9, 1 (F3DEX2-
+/// CONCEPTS.md §2.2). Each field is already the slot (0-31).
+fn tri_indices(w: u32) -> [u32; 3] {
+    [(w >> 17) & 0x7F, (w >> 9) & 0x7F, (w >> 1) & 0x7F]
 }
 
 fn resolve_tri(vtx_cache: &[Vertex; 32], idx: [u32; 3]) -> Option<Triangle> {
