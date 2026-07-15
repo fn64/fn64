@@ -27,6 +27,7 @@ pub mod dmem;
 pub mod ops;
 pub mod tables;
 pub mod vu;
+pub mod vu_ops;
 
 pub use context::{RspContext, RspExitReason};
 pub use dmem::{Dmem, DMEM_MASK, DMEM_SIZE};
