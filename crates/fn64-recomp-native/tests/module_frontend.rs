@@ -1,0 +1,212 @@
+//! Strong validation for the ELF/symbol **front-end** (`module.rs`): a
+//! synthetic multi-function `RecompConfig`-shaped input is turned into one
+//! module whose functions call each other by **direct Rust call**, and that
+//! module is then *executed* to prove the cross-call semantics land the right
+//! machine state.
+//!
+//! # Why this shape of test
+//!
+//! The front-end is codegen: its product is Rust *source*, not a value. So it
+//! is validated two ways, both strong (never fuzzy):
+//!
+//! 1. **Golden lock** ([`emit_module_matches_golden`]): the live `emit_module`
+//!    must byte-match `goldens/module_crosscall.rs`. That file is the exact
+//!    text the emitter produced for these ROM words; the executable functions
+//!    below are pasted verbatim from it. So executing them here really is
+//!    executing the front-end's product — if the emitter drifts, the golden
+//!    lock fails loudly and the paste must be refreshed.
+//!
+//! 2. **Behavioural cross-call execution** ([`crosscall_executes_to_expected_state`],
+//!    [`tail_call_executes_to_expected_state`]): run the pasted `caller` /
+//!    `tail_caller` against the real [`runtime`] and assert the callee's effect
+//!    (writing `$v0`) is observable in the register file — i.e. the direct
+//!    `callee(ctx, mem)` call the front-end emitted actually invoked the
+//!    sibling function. A per-function `lookup()` recompiler could not produce
+//!    this without the symbol table.
+//!
+//! 3. **Resolution correctness** ([`known_target_is_direct_unknown_is_lookup`]):
+//!    a JAL to a *known* symbol emits a direct call; a JAL to an *unknown*
+//!    address falls back to an indirect `lookup()`, matching N64Recomp's
+//!    `resolve_jal` Match-vs-Ambiguous decision.
+
+use fn64_recomp_native::{emit_module, ModuleFunc, Rdram, RecompContext, SymbolTable};
+
+// --- The synthetic three-function "program" (real MIPS III encodings). ---
+//
+// callee @ 0x80001000:  addiu $v0,$zero,0x2A ; jr $ra ; nop         -> $v0 = 42
+// caller @ 0x80002000:  jal callee ; addiu $a0,$zero,7 (delay) ; jr $ra ; nop
+// tail_caller @ 0x80003000:  j callee ; nop (delay)                 -> tail call
+const CALLEE_VRAM: u32 = 0x8000_1000;
+const CALLER_VRAM: u32 = 0x8000_2000;
+const TAIL_VRAM: u32 = 0x8000_3000;
+
+const CALLEE_WORDS: [u32; 3] = [0x2402_002A, 0x03E0_0008, 0x0000_0000];
+// jal 0x80001000 -> 0x0C000400 (target26 = (0x80001000 & 0x0FFFFFFF) >> 2 = 0x400).
+const CALLER_WORDS: [u32; 4] = [0x0C00_0400, 0x2404_0007, 0x03E0_0008, 0x0000_0000];
+// j   0x80001000 -> 0x08000400.
+const TAIL_WORDS: [u32; 2] = [0x0800_0400, 0x0000_0000];
+
+fn synthetic_symbols() -> SymbolTable {
+    SymbolTable::from_entries([
+        ("callee".to_string(), CALLEE_VRAM),
+        ("caller".to_string(), CALLER_VRAM),
+        ("tail_caller".to_string(), TAIL_VRAM),
+    ])
+}
+
+fn synthetic_module() -> String {
+    let symbols = synthetic_symbols();
+    let funcs = [
+        ModuleFunc { name: "callee", vram: CALLEE_VRAM, words: &CALLEE_WORDS },
+        ModuleFunc { name: "caller", vram: CALLER_VRAM, words: &CALLER_WORDS },
+        ModuleFunc { name: "tail_caller", vram: TAIL_VRAM, words: &TAIL_WORDS },
+    ];
+    emit_module(&funcs, &symbols)
+}
+
+// --- The emitter's output, pasted VERBATIM from goldens/module_crosscall.rs. ---
+//
+// `emit_module_matches_golden` guarantees the live emitter still produces
+// exactly this, so executing it below really executes the front-end's product.
+// A `lookup` shim stands in for the runtime function-pointer dispatch the
+// emitter falls back to for unknown targets; here every target is resolved to a
+// direct call, so `lookup` is never actually reached (a call to it panics,
+// proving the direct path was taken).
+
+#[allow(dead_code)]
+fn lookup(addr: u32) -> fn(&mut RecompContext, &mut Rdram) {
+    panic!("indirect lookup({addr:#010X}) reached: a KNOWN target should have been a direct call");
+}
+
+#[allow(unused_variables, unused_mut, unused_labels, clippy::all)]
+pub fn callee(ctx: &mut RecompContext, mem: &mut Rdram) {
+    let mut pc: u32 = 0x80001000;
+    'run: loop {
+        match pc {
+            0x80001000 => {
+                // 0x80001000: Addiu { rt: 2, rs: 0, imm: 42 }
+                ctx.set_r32(2, (0i32).wrapping_add(42));
+                // 0x80001004: Jr { rs: 31 }
+                // delay: 0x80001008: Nop
+                // nop
+                return;
+            }
+            _ => unreachable!("jumped to unmapped vram {:#X}", pc),
+        }
+    }
+}
+
+#[allow(unused_variables, unused_mut, unused_labels, clippy::all)]
+pub fn caller(ctx: &mut RecompContext, mem: &mut Rdram) {
+    let mut pc: u32 = 0x80002000;
+    'run: loop {
+        match pc {
+            0x80002000 => {
+                // 0x80002000: Jal { target: 1024 }
+                ctx.set_r32(31, 0x80002008u32 as i32);
+                // delay: 0x80002004: Addiu { rt: 4, rs: 0, imm: 7 }
+                ctx.set_r32(4, (0i32).wrapping_add(7));
+                callee(ctx, mem);
+                pc = 0x80002008;
+                continue 'run;
+            }
+            0x80002008 => {
+                // 0x80002008: Jr { rs: 31 }
+                // delay: 0x8000200C: Nop
+                // nop
+                return;
+            }
+            _ => unreachable!("jumped to unmapped vram {:#X}", pc),
+        }
+    }
+}
+
+#[allow(unused_variables, unused_mut, unused_labels, clippy::all)]
+pub fn tail_caller(ctx: &mut RecompContext, mem: &mut Rdram) {
+    let mut pc: u32 = 0x80003000;
+    'run: loop {
+        match pc {
+            0x80003000 => {
+                // 0x80003000: J { target: 1024 }
+                // delay: 0x80003004: Nop
+                // nop
+                callee(ctx, mem);
+                return;
+            }
+            _ => unreachable!("jumped to unmapped vram {:#X}", pc),
+        }
+    }
+}
+
+/// The live `emit_module` output must be byte-identical to the pasted golden,
+/// keeping the executed functions honest (they are copied from this golden).
+#[test]
+fn emit_module_matches_golden() {
+    let emitted = synthetic_module();
+    let golden = include_str!("goldens/module_crosscall.rs");
+    let norm = |s: &str| s.trim_end().replace("\r\n", "\n");
+    assert_eq!(
+        norm(&emitted),
+        norm(golden),
+        "emit_module drifted from goldens/module_crosscall.rs; refresh the golden \
+         and the pasted functions in this file if the change is intended"
+    );
+}
+
+/// The strong behavioural check: executing the front-end's emitted `caller`
+/// must run the direct call into `callee`, leaving `$v0 = 42` (and the delay
+/// slot's `$a0 = 7`). If the JAL had been left as an indirect `lookup()`, the
+/// `lookup` shim above would panic — so a green here proves a resolved direct
+/// call.
+#[test]
+fn crosscall_executes_to_expected_state() {
+    let mut mem_buf = vec![0u8; 64];
+    let mut mem = Rdram::new(&mut mem_buf);
+    let mut ctx = RecompContext::new();
+
+    caller(&mut ctx, &mut mem);
+
+    assert_eq!(ctx.r(2), 42, "$v0 should hold the callee's result after the direct call");
+    assert_eq!(ctx.r(4), 7, "delay-slot $a0 = 7 must have executed before the call");
+    // $ra was linked to the return address after the delay slot.
+    assert_eq!(ctx.r_u32(31), 0x8000_2008, "JAL must link $ra to post-delay-slot pc");
+}
+
+/// The inter-function `J` (tail call) path: `tail_caller` tail-calls `callee`,
+/// so `$v0 = 42` must be observable after it returns.
+#[test]
+fn tail_call_executes_to_expected_state() {
+    let mut mem_buf = vec![0u8; 64];
+    let mut mem = Rdram::new(&mut mem_buf);
+    let mut ctx = RecompContext::new();
+
+    tail_caller(&mut ctx, &mut mem);
+
+    assert_eq!(ctx.r(2), 42, "$v0 should hold the callee's result after the tail call");
+}
+
+/// Resolution correctness against the emitted text: a JAL to a KNOWN symbol
+/// emits a direct `callee(ctx, mem)` call and no `lookup(`; a JAL to an
+/// UNKNOWN address emits an indirect `lookup(...)` and no direct name.
+#[test]
+fn known_target_is_direct_unknown_is_lookup() {
+    // Known-target module: caller -> callee. Must be direct, no lookup.
+    let known = synthetic_module();
+    assert!(known.contains("callee(ctx, mem);"), "known JAL must emit a direct call");
+    assert!(
+        !known.contains("lookup("),
+        "no indirect lookup should appear when every target is a known symbol:\n{known}"
+    );
+
+    // Unknown-target module: caller JALs 0x80009000, which is NOT in the table.
+    // The front-end must fall back to an indirect lookup.
+    let unknown_symbols = SymbolTable::from_entries([("caller".to_string(), CALLER_VRAM)]);
+    // jal 0x80009000 -> target26 = (0x80009000 & 0x0FFFFFFF) >> 2 = 0x2400 -> 0x0C002400.
+    let words: [u32; 4] = [0x0C00_2400, 0x2404_0007, 0x03E0_0008, 0x0000_0000];
+    let funcs = [ModuleFunc { name: "caller", vram: CALLER_VRAM, words: &words }];
+    let unknown = emit_module(&funcs, &unknown_symbols);
+    assert!(
+        unknown.contains("lookup(0x80009000)(ctx, mem);"),
+        "unknown JAL target must emit an indirect lookup:\n{unknown}"
+    );
+}

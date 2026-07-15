@@ -45,6 +45,47 @@ pub struct FuncInput<'a> {
     pub words: &'a [u32],
 }
 
+/// How an inter-function control transfer (a `JAL`/`J` whose target lands
+/// *outside* the current function) is emitted.
+///
+/// This is the ELF/symbol-table front-end's decision, mirroring N64Recomp's
+/// `resolve_jal` (`recompilation.cpp`): a `JAL 0xNNN` whose target vram is a
+/// known function symbol becomes a **direct Rust call** to that named `fn`,
+/// which is what makes the output a whole-*program* recompile with real
+/// cross-function calls rather than a bag of per-function `lookup()` stubs.
+///
+/// - [`CallTarget::Direct`] — the target is a uniquely-known function; emit a
+///   direct `name(ctx, mem)` call (N64Recomp's `JalResolutionResult::Match`).
+/// - [`CallTarget::Indirect`] — the target is unknown, ambiguous, or the call
+///   is register-indirect; emit a runtime `lookup(addr)(ctx, mem)` dispatch
+///   (N64Recomp's `Ambiguous`/`NoMatch`/`LOOKUP_FUNC`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallTarget {
+    /// A direct call to the named recompiled function.
+    Direct(String),
+    /// A runtime-dispatched call (address resolved at run time).
+    Indirect,
+}
+
+/// Resolves a jump/call target vram to how it should be emitted. Implemented by
+/// the symbol-table front-end ([`crate::module::SymbolTable`]); the default
+/// [`NullResolver`] resolves nothing (everything indirect), which reproduces
+/// the per-function foundation behaviour exactly.
+pub trait CallResolver {
+    /// Resolve an absolute (already-computed) call target vram. `Some(name)`
+    /// yields a direct call; `None` (the default) yields an indirect lookup.
+    fn resolve(&self, target_vram: u32) -> CallTarget {
+        let _ = target_vram;
+        CallTarget::Indirect
+    }
+}
+
+/// The trivial resolver: never resolves a name, so every `JAL`/`J` target is an
+/// indirect `lookup()`. This is what [`emit_function`] uses, preserving the
+/// per-function foundation output byte-for-byte.
+pub struct NullResolver;
+impl CallResolver for NullResolver {}
+
 /// Emit a complete Rust module: the `fn <name>` plus a doc header. The emitted
 /// function has signature `fn <name>(ctx: &mut RecompContext, mem: &mut Rdram)`.
 ///
@@ -53,7 +94,20 @@ pub struct FuncInput<'a> {
 /// as a `lookup(target)(ctx, mem)` call so the shape is proven, matching
 /// N64Recomp's `LOOKUP_FUNC`. Straight-line leaf functions (the oracle target)
 /// need none of that.
+///
+/// This is the per-function entry point: every `JAL`/`J` inter-function target
+/// is emitted as an indirect `lookup()`. To resolve targets to direct named
+/// calls (the whole-program front-end), use [`emit_function_resolved`].
 pub fn emit_function(func: &FuncInput) -> String {
+    emit_function_resolved(func, &NullResolver)
+}
+
+/// Emit one function, resolving inter-function `JAL`/`J` targets through
+/// `resolver`. A [`CallTarget::Direct`] target becomes a direct
+/// `name(ctx, mem)` call (or, for `J`, a direct tail call `name(ctx, mem);
+/// return;`); a [`CallTarget::Indirect`] target keeps the `lookup(addr)`
+/// runtime dispatch. This is the codegen half of the symbol-table front-end.
+pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> String {
     let base = func.vram;
     let words = func.words;
 
@@ -122,7 +176,9 @@ pub fn emit_function(func: &FuncInput) -> String {
             // which consumes the delay slot.
             let delay = instrs.get(i + 1).copied();
             let delay_vram = vram + 4;
-            emit_control_transfer(&mut out, instr, vram, delay, delay_vram, base, func_end);
+            emit_control_transfer(
+                &mut out, instr, vram, delay, delay_vram, base, func_end, resolver,
+            );
             // Skip the delay-slot word; it was handled by the transfer.
             i += 2;
             // Close the arm if the next vram is a leader (new arm) or we ran off
@@ -261,7 +317,13 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
             line(out, format!("ctx.set_r({}, {} ^ {:#X});", rt, r(rs), imm as u64))
         }
         Lui { rt, imm } => {
-            line(out, format!("ctx.set_r32({}, {:#X}i32);", rt, (imm as i32) << 16))
+            // `imm << 16` as a bit pattern, cast to i32 (which set_r32 then
+            // sign-extends). Emitting the raw `u32` literal + `as i32` avoids an
+            // out-of-range `i32` literal when bit 31 is set (e.g. 0x800F0000).
+            line(
+                out,
+                format!("ctx.set_r32({}, {:#010X}u32 as i32);", rt, (imm as u32) << 16),
+            )
         }
 
         // --- ALU register ---
@@ -439,18 +501,24 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
 /// Emit a control transfer (branch/jump) plus its delay slot. The delay slot
 /// runs first (unconditionally for normal branches; only when taken for
 /// branch-likely). Then `pc` is assigned to the successor block.
+#[allow(clippy::too_many_arguments)]
 fn emit_control_transfer(
     out: &mut String,
     instr: Instruction,
     vram: u32,
     delay: Option<Instruction>,
     delay_vram: u32,
-    _base: u32,
-    _func_end: u32,
+    base: u32,
+    func_end: u32,
+    resolver: &dyn CallResolver,
 ) {
     use Instruction::*;
     let target = branch_target(&instr, vram);
     let fallthrough = delay_vram + 4;
+    // Whether an absolute target lands inside THIS function (so it is a local
+    // block, resolved via `pc = ...`), or outside it (an inter-function call
+    // the resolver decides how to emit).
+    let in_func = |t: u32| t >= base && t < func_end;
 
     let emit_delay = |out: &mut String| {
         if let Some(d) = delay {
@@ -491,19 +559,54 @@ fn emit_control_transfer(
         J { .. } => {
             emit_delay(out);
             let t = target.unwrap();
-            let _ = writeln!(out, "            pc = {:#010X}; continue 'run;", t);
+            if in_func(t) {
+                // Local jump: transfer control to the block at `t`.
+                let _ = writeln!(out, "            pc = {:#010X}; continue 'run;", t);
+            } else {
+                // Inter-function `J` is a tail call: invoke the target, then
+                // return (the target's `jr $ra` returns to OUR caller).
+                match resolver.resolve(t) {
+                    CallTarget::Direct(name) => {
+                        let _ = writeln!(out, "            {}(ctx, mem); return;", name);
+                    }
+                    CallTarget::Indirect => {
+                        let _ = writeln!(
+                            out,
+                            "            lookup({:#010X})(ctx, mem); return;",
+                            t
+                        );
+                    }
+                }
+            }
         }
         Jal { .. } => {
-            // Link: $ra = address after the delay slot.
-            let _ = writeln!(out, "            ctx.set_r32(31, {:#X}i32);", fallthrough as i32);
+            // Link: $ra = address after the delay slot. Emit the address as a
+            // `u32` literal + `as i32` so a high (bit-31-set) return address
+            // like 0x80002008 is not an out-of-range `i32` literal.
+            let _ = writeln!(
+                out,
+                "            ctx.set_r32(31, {:#010X}u32 as i32);",
+                fallthrough
+            );
             emit_delay(out);
             let t = target.unwrap();
-            let _ = writeln!(out, "            lookup({:#010X})(ctx, mem);", t);
+            match resolver.resolve(t) {
+                CallTarget::Direct(name) => {
+                    let _ = writeln!(out, "            {}(ctx, mem);", name);
+                }
+                CallTarget::Indirect => {
+                    let _ = writeln!(out, "            lookup({:#010X})(ctx, mem);", t);
+                }
+            }
             let _ = writeln!(out, "            pc = {:#010X}; continue 'run;", fallthrough);
         }
         Jalr { rd, rs } => {
             let link = if rd == 0 { 31 } else { rd };
-            let _ = writeln!(out, "            ctx.set_r32({}, {:#X}i32);", link, fallthrough as i32);
+            let _ = writeln!(
+                out,
+                "            ctx.set_r32({}, {:#010X}u32 as i32);",
+                link, fallthrough
+            );
             emit_delay(out);
             let _ = writeln!(out, "            lookup(ctx.r_u32({}))(ctx, mem);", rs);
             let _ = writeln!(out, "            pc = {:#010X}; continue 'run;", fallthrough);
@@ -513,7 +616,11 @@ fn emit_control_transfer(
             let c = cond(&instr).unwrap();
             let t = target.unwrap();
             let _ = writeln!(out, "            let _take = {};", c);
-            let _ = writeln!(out, "            ctx.set_r32(31, {:#X}i32);", fallthrough as i32);
+            let _ = writeln!(
+                out,
+                "            ctx.set_r32(31, {:#010X}u32 as i32);",
+                fallthrough
+            );
             emit_delay(out);
             let _ = writeln!(
                 out,
