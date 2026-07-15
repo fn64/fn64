@@ -98,17 +98,18 @@ fn build_f3dex2_rdram() -> (Vec<u8>, u32) {
     let mtx_seg_addr = ((SEG as u32) << 24) | MTX_SEG_OFF;
     push_cmd(mtx_w0, mtx_seg_addr, &mut dl);
 
-    // 4) G_VTX: load 3 vertices into slots 0..3.
-    //    w0 = op<<24 | (v0*2)<<16 | (n<<10 | 16n-1) ; w1 = segmented addr.
+    // 4) G_VTX: load n=3 vertices into slots 0..3 (F3DEX2-CONCEPTS.md §2.1:
+    //    w0 = op<<24 | n<<12 | end<<1, end = v0+n; v0 = end - n). w1 =
+    //    segmented addr.
     let n: u32 = 3;
     let v0: u32 = 0;
-    let vtx_w0 =
-        ((gbi::G_VTX as u32) << 24) | ((v0 * 2) << 16) | ((n << 10) | (16 * n - 1));
+    let end: u32 = v0 + n;
+    let vtx_w0 = ((gbi::G_VTX as u32) << 24) | (n << 12) | (end << 1);
     let vtx_seg_addr = ((SEG as u32) << 24) | VTX_SEG_OFF;
     push_cmd(vtx_w0, vtx_seg_addr, &mut dl);
 
-    // 5) G_TRI1: indices 0,1,2 each *2 in w0 low 24 bits.
-    let tri_w0 = ((gbi::G_TRI1 as u32) << 24) | ((0 * 2) << 16) | ((1 * 2) << 8) | (2 * 2);
+    // 5) G_TRI1: slots 0,1,2 as three 7-bit fields at bits 17/9/1 (§2.2).
+    let tri_w0 = ((gbi::G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1);
     push_cmd(tri_w0, 0, &mut dl);
 
     // 6) G_ENDDL.

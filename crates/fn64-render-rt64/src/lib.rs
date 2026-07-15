@@ -185,7 +185,13 @@ impl RenderBackend for ReferenceBackend {
             });
         }
 
-        let end = task.output_buff as usize + task.output_buff_size as usize;
+        // `output_buff` is a raw guest pointer -- OoT builds it as a KSEG0
+        // address (`0x80xxxxxx`), NOT a bare rdram offset, so validate the
+        // MASKED physical offset (low 24 bits; F3DEX2-CONCEPTS.md §0.2)
+        // against rdram, not the raw pointer (which always exceeds rdram.len()
+        // and would spuriously trip InvalidTaskBounds on every real frame).
+        let out_phys = (task.output_buff & 0x00FF_FFFF) as usize;
+        let end = out_phys + task.output_buff_size as usize;
         if task.output_buff_size != 0 && end > rdram.len() {
             return Err(RenderError::InvalidTaskBounds {
                 offset: task.output_buff,

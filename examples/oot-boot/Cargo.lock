@@ -190,6 +190,14 @@ name = "fn64-render"
 version = "0.0.0"
 
 [[package]]
+name = "fn64-render-rt64"
+version = "0.0.0"
+dependencies = [
+ "fn64-render",
+ "fn64-runtime",
+]
+
+[[package]]
 name = "fn64-runtime"
 version = "0.0.0"
 dependencies = [
@@ -502,6 +510,8 @@ version = "0.0.0"
 dependencies = [
  "cc",
  "fn64-abi",
+ "fn64-render",
+ "fn64-render-rt64",
  "fn64-runtime",
 ]
 
