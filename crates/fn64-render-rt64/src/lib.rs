@@ -185,17 +185,28 @@ impl RenderBackend for ReferenceBackend {
             });
         }
 
-        // `output_buff` is a raw guest pointer -- OoT builds it as a KSEG0
-        // address (`0x80xxxxxx`), NOT a bare rdram offset, so validate the
-        // MASKED physical offset (low 24 bits; F3DEX2-CONCEPTS.md §0.2)
-        // against rdram, not the raw pointer (which always exceeds rdram.len()
-        // and would spuriously trip InvalidTaskBounds on every real frame).
-        let out_phys = (task.output_buff & 0x00FF_FFFF) as usize;
-        let end = out_phys + task.output_buff_size as usize;
-        if task.output_buff_size != 0 && end > rdram.len() {
+        // `output_buff`/`output_buff_size` are the RSP's DRAM output region.
+        // CRITICAL (was a blank-frame bug): in the public `OSTask_t` layout
+        // (`ultra64/task.h`) `output_buff_size` is declared `u64*` -- a
+        // POINTER TO THE END of the output buffer, NOT a byte count. OoT
+        // fills both as KSEG0 pointers (`output_buff=0x80151640`,
+        // `output_buff_size=0x80169640`, verified from a live task header),
+        // so the real byte length is `end_ptr - start_ptr`, and the previous
+        // code (`out_phys + output_buff_size`) computed
+        // `0x151640 + 0x80169640` -> way past rdram, tripping
+        // InvalidTaskBounds on EVERY real frame and returning before any
+        // decode ran (0 triangles, blank frame). We now mask BOTH pointers
+        // to physical offsets and validate the END offset against rdram.
+        // (The reference backend rasterizes into its own framebuffer and
+        // decodes from `data_ptr`, so this is only a sanity bound, not a
+        // region the decoder reads -- but a wrong bound must not veto the
+        // whole frame.)
+        let out_start = (task.output_buff & 0x00FF_FFFF) as usize;
+        let out_end = (task.output_buff_size & 0x00FF_FFFF) as usize;
+        if task.output_buff_size != 0 && out_end > rdram.len() {
             return Err(RenderError::InvalidTaskBounds {
                 offset: task.output_buff,
-                len: task.output_buff_size,
+                len: out_end.saturating_sub(out_start) as u32,
                 rdram_len: rdram.len(),
             });
         }

@@ -19,6 +19,33 @@
 use fn64_render::{OsTask, RenderBackend, RenderConfig, M_GFXTASK};
 use fn64_render_rt64::{gbi, png_dump, ReferenceBackend};
 
+// --- Swizzled rdram writers (mirror the decoder's recomp memory model) --
+//
+// fn64's rdram stores every aligned 32-bit word host-native and reaches
+// sub-word bytes through a `^3` swizzle (recomp.h MEM_W/MEM_BU; PI-DMA's
+// dma_write_bytes uses the same `^3`). The decoder now reads that model, so
+// this hand-built fixture must WRITE it the same way to stay a faithful
+// stand-in for real recomp rdram (not a flat big-endian image).
+
+/// Write a logical 32-bit word at aligned `off` (native store == the
+/// logical big-endian word, per recomp MEM_W).
+fn wr_u32(rdram: &mut [u8], off: usize, v: u32) {
+    rdram[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+}
+
+/// Write a logical byte at `off` through the `^3` swizzle (recomp MEM_BU).
+fn wr_u8(rdram: &mut [u8], off: usize, v: u8) {
+    rdram[off ^ 3] = v;
+}
+
+/// Write a logical big-endian s16 halfword at `off` (recomp MEM_H): MSB at
+/// logical `off`, LSB at `off+1`, each through the `^3` byte swizzle.
+fn wr_i16(rdram: &mut [u8], off: usize, v: i16) {
+    let b = (v as u16).to_be_bytes();
+    wr_u8(rdram, off, b[0]);
+    wr_u8(rdram, off + 1, b[1]);
+}
+
 const SEG: u8 = 0x06; // arbitrary segment number we route vertex/matrix data through
 const SEG_BASE: u32 = 0x0000_1000; // physical rdram base for segment SEG
 const VTX_SEG_OFF: u32 = 0x0000; // vertex array at segment offset 0
@@ -40,8 +67,8 @@ fn write_scale_mtx(rdram: &mut [u8], off: usize, sx: f32, sy: f32, sz: f32) {
         let fixed = (v * 65536.0) as i32;
         let int_part = (fixed >> 16) as i16;
         let frac_part = (fixed & 0xFFFF) as u16;
-        rdram[off + i * 2..off + i * 2 + 2].copy_from_slice(&int_part.to_be_bytes());
-        rdram[off + 32 + i * 2..off + 32 + i * 2 + 2].copy_from_slice(&frac_part.to_be_bytes());
+        wr_i16(rdram, off + i * 2, int_part);
+        wr_i16(rdram, off + 32 + i * 2, frac_part as i16);
     }
 }
 
@@ -64,10 +91,13 @@ fn build_f3dex2_rdram() -> (Vec<u8>, u32) {
     let vtx_phys = SEG_BASE as usize + VTX_SEG_OFF as usize;
     for (i, (ob, rgba)) in verts.iter().enumerate() {
         let off = vtx_phys + i * 16;
-        rdram[off..off + 2].copy_from_slice(&ob[0].to_be_bytes());
-        rdram[off + 2..off + 4].copy_from_slice(&ob[1].to_be_bytes());
-        rdram[off + 4..off + 6].copy_from_slice(&ob[2].to_be_bytes());
-        rdram[off + 12..off + 16].copy_from_slice(rgba);
+        wr_i16(&mut rdram, off, ob[0]);
+        wr_i16(&mut rdram, off + 2, ob[1]);
+        wr_i16(&mut rdram, off + 4, ob[2]);
+        wr_u8(&mut rdram, off + 12, rgba[0]);
+        wr_u8(&mut rdram, off + 13, rgba[1]);
+        wr_u8(&mut rdram, off + 14, rgba[2]);
+        wr_u8(&mut rdram, off + 15, rgba[3]);
     }
 
     // Projection matrix diag(1/32, 1/32, 1, 1).
@@ -75,10 +105,12 @@ fn build_f3dex2_rdram() -> (Vec<u8>, u32) {
     write_scale_mtx(&mut rdram, mtx_phys, 1.0 / 32.0, 1.0 / 32.0, 1.0);
 
     // --- Build the F3DEX2 command stream ---
-    let mut dl: Vec<u8> = Vec::new();
-    let push_cmd = |w0: u32, w1: u32, dl: &mut Vec<u8>| {
-        dl.extend_from_slice(&w0.to_be_bytes());
-        dl.extend_from_slice(&w1.to_be_bytes());
+    // Collect logical (w0,w1) word pairs; they are written into rdram
+    // swizzled (wr_u32) below so the fixture matches real recomp rdram.
+    let mut dl: Vec<u32> = Vec::new();
+    let push_cmd = |w0: u32, w1: u32, dl: &mut Vec<u32>| {
+        dl.push(w0);
+        dl.push(w1);
     };
 
     // 1) G_MOVEWORD / G_MW_SEGMENT: segment SEG -> SEG_BASE.
@@ -115,7 +147,9 @@ fn build_f3dex2_rdram() -> (Vec<u8>, u32) {
     // 6) G_ENDDL.
     push_cmd((gbi::G_ENDDL as u32) << 24, 0, &mut dl);
 
-    rdram[DL_ADDR as usize..DL_ADDR as usize + dl.len()].copy_from_slice(&dl);
+    for (i, &word) in dl.iter().enumerate() {
+        wr_u32(&mut rdram, DL_ADDR as usize + i * 4, word);
+    }
     (rdram, DL_ADDR)
 }
 
