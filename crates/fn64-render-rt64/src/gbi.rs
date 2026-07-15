@@ -62,12 +62,15 @@ const G_MW_SEGMENT: u16 = 0x06;
 /// `G_MV_VIEWPORT` (gbi.h) -- the `G_MOVEMEM` index that DMAs a `Vp`
 /// (viewport scale/translate) struct into RSP state (F3DEX2-CONCEPTS.md
 /// §1.4/§3.5).
+#[allow(dead_code)] // wired up in the viewport-parse fidelity step
 const G_MV_VIEWPORT: u8 = 8;
 
 // --- F3DEX2 geometry-mode bits (F3DEX2-CONCEPTS.md §2.4) -----------------
 /// Cull front-facing triangles.
+#[allow(dead_code)] // wired up when G_GEOMETRYMODE drives culling
 const G_CULL_FRONT: u32 = 0x0000_0200;
 /// Cull back-facing triangles (the common case).
+#[allow(dead_code)] // wired up when G_GEOMETRYMODE drives culling
 const G_CULL_BACK: u32 = 0x0000_0400;
 
 // --- Additional F3DEX2 opcode bytes, named for the loud-skip log so the
@@ -399,6 +402,7 @@ struct DecodeState {
     viewport: Option<Viewport>,
     /// Current F3DEX2 geometry mode (the `G_GEOMETRYMODE` accumulator). Its
     /// `G_CULL_FRONT`/`G_CULL_BACK` bits decide per-triangle culling.
+    #[allow(dead_code)] // read once G_GEOMETRYMODE culling lands
     geometry_mode: u32,
     dl_depth: u32,
 }
