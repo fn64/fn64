@@ -187,6 +187,139 @@ pub enum Instruction {
     /// Jump-and-link register. `JALR rd, rs` (rd defaults to $ra).
     Jalr { rd: Reg, rs: Reg },
 
+    // ================================================================
+    // COP1 / FPU (opcode 0x11, plus the dedicated COP1 load/store opcodes).
+    //
+    // Field layout for opcode 0x11 (byte-cited from the MIPS III / VR4300
+    // reference): bits 25..21 = `fmt` (the sub-op / format selector, in the
+    // `rs` position), 20..16 = `ft`, 15..11 = `fs`, 10..6 = `fd`, 5..0 =
+    // `funct`. `fmt` values: MFC1=0x00, DMFC1=0x01, CFC1=0x02, MTC1=0x04,
+    // DMTC1=0x05, CTC1=0x06, BC1=0x08, S=0x10, D=0x11, W=0x14, L=0x15.
+    //
+    // We name FPU register indices `fd`/`fs`/`ft` (5-bit, 0..31) to keep them
+    // distinct from the GPR `Reg`s in the same struct.
+    // ================================================================
+
+    // --- COP1 moves between GPR and FPR (fmt sub-dispatch of opcode 0x11) ---
+    /// Move word from COP1: `MFC1 rt, fs` — GPR rt = sign-extend(FPR fs low32).
+    Mfc1 { rt: Reg, fs: Reg },
+    /// Move word to COP1: `MTC1 rt, fs` — FPR fs low32 = GPR rt low32.
+    Mtc1 { rt: Reg, fs: Reg },
+    /// Doubleword move from COP1: `DMFC1 rt, fs` — GPR rt = FPR fs full 64 bits.
+    Dmfc1 { rt: Reg, fs: Reg },
+    /// Doubleword move to COP1: `DMTC1 rt, fs` — FPR fs 64 bits = GPR rt.
+    Dmtc1 { rt: Reg, fs: Reg },
+    /// Move control word from COP1: `CFC1 rt, fs` (reads FCR; fs is the
+    /// control-register index, 0 or 31 in practice).
+    Cfc1 { rt: Reg, fs: Reg },
+    /// Move control word to COP1: `CTC1 rt, fs`.
+    Ctc1 { rt: Reg, fs: Reg },
+
+    // --- COP1 loads/stores (dedicated main opcodes) ---
+    /// Load word to COP1: `LWC1 ft, off(base)` — FPR ft low32 = mem word.
+    Lwc1 { ft: Reg, base: Reg, off: i16 },
+    /// Store word from COP1: `SWC1 ft, off(base)`.
+    Swc1 { ft: Reg, base: Reg, off: i16 },
+    /// Load doubleword to COP1: `LDC1 ft, off(base)` — FPR ft 64 bits = mem dword.
+    Ldc1 { ft: Reg, base: Reg, off: i16 },
+    /// Store doubleword from COP1: `SDC1 ft, off(base)`.
+    Sdc1 { ft: Reg, base: Reg, off: i16 },
+
+    // --- Single-precision (fmt = S = 0x10) arithmetic (funct in 5..0) ---
+    /// `ADD.S fd, fs, ft`.
+    AddS { fd: Reg, fs: Reg, ft: Reg },
+    /// `SUB.S fd, fs, ft`.
+    SubS { fd: Reg, fs: Reg, ft: Reg },
+    /// `MUL.S fd, fs, ft`.
+    MulS { fd: Reg, fs: Reg, ft: Reg },
+    /// `DIV.S fd, fs, ft`.
+    DivS { fd: Reg, fs: Reg, ft: Reg },
+    /// `ABS.S fd, fs`.
+    AbsS { fd: Reg, fs: Reg },
+    /// `NEG.S fd, fs`.
+    NegS { fd: Reg, fs: Reg },
+    /// `SQRT.S fd, fs`.
+    SqrtS { fd: Reg, fs: Reg },
+    /// `MOV.S fd, fs` (bit-exact copy of the 32-bit register).
+    MovS { fd: Reg, fs: Reg },
+
+    // --- Double-precision (fmt = D = 0x11) arithmetic ---
+    /// `ADD.D fd, fs, ft`.
+    AddD { fd: Reg, fs: Reg, ft: Reg },
+    /// `SUB.D fd, fs, ft`.
+    SubD { fd: Reg, fs: Reg, ft: Reg },
+    /// `MUL.D fd, fs, ft`.
+    MulD { fd: Reg, fs: Reg, ft: Reg },
+    /// `DIV.D fd, fs, ft`.
+    DivD { fd: Reg, fs: Reg, ft: Reg },
+    /// `ABS.D fd, fs`.
+    AbsD { fd: Reg, fs: Reg },
+    /// `NEG.D fd, fs`.
+    NegD { fd: Reg, fs: Reg },
+    /// `SQRT.D fd, fs`.
+    SqrtD { fd: Reg, fs: Reg },
+    /// `MOV.D fd, fs` (bit-exact 64-bit copy).
+    MovD { fd: Reg, fs: Reg },
+
+    // --- Conversions. Naming: `Cvt<To><From>`. `W`=32-bit int, `L`=64-bit int,
+    //     `S`=single float, `D`=double float. `Trunc*` = round-toward-zero. ---
+    /// `CVT.S.W fd, fs` — int32 -> single.
+    CvtSW { fd: Reg, fs: Reg },
+    /// `CVT.D.W fd, fs` — int32 -> double.
+    CvtDW { fd: Reg, fs: Reg },
+    /// `CVT.S.D fd, fs` — double -> single.
+    CvtSD { fd: Reg, fs: Reg },
+    /// `CVT.D.S fd, fs` — single -> double.
+    CvtDS { fd: Reg, fs: Reg },
+    /// `CVT.S.L fd, fs` — int64 -> single.
+    CvtSL { fd: Reg, fs: Reg },
+    /// `CVT.D.L fd, fs` — int64 -> double.
+    CvtDL { fd: Reg, fs: Reg },
+    /// `CVT.W.S fd, fs` — single -> int32 (rounds per FCSR mode; here: nearest).
+    CvtWS { fd: Reg, fs: Reg },
+    /// `CVT.W.D fd, fs` — double -> int32 (nearest).
+    CvtWD { fd: Reg, fs: Reg },
+    /// `CVT.L.S fd, fs` — single -> int64 (nearest).
+    CvtLS { fd: Reg, fs: Reg },
+    /// `CVT.L.D fd, fs` — double -> int64 (nearest).
+    CvtLD { fd: Reg, fs: Reg },
+    /// `TRUNC.W.S fd, fs` — single -> int32, toward zero.
+    TruncWS { fd: Reg, fs: Reg },
+    /// `TRUNC.W.D fd, fs` — double -> int32, toward zero.
+    TruncWD { fd: Reg, fs: Reg },
+    /// `TRUNC.L.S fd, fs` — single -> int64, toward zero.
+    TruncLS { fd: Reg, fs: Reg },
+    /// `TRUNC.L.D fd, fs` — double -> int64, toward zero.
+    TruncLD { fd: Reg, fs: Reg },
+
+    // --- FP compares: set the FP condition flag (FCSR bit 23). `fmt`
+    //     distinguishes S (0x10) vs D (0x11); `funct` picks the predicate.
+    //     We cover the ordered EQ/LT/LE predicates (funct 0x32/0x3C/0x3E),
+    //     which are the ones OoT emits; unordered variants map to the same
+    //     comparison in N64Recomp (NaN is asserted-away by NAN_CHECK). ---
+    /// `C.EQ.S fs, ft` — set condition = (fs == ft).
+    CEqS { fs: Reg, ft: Reg },
+    /// `C.LT.S fs, ft` — set condition = (fs < ft).
+    CLtS { fs: Reg, ft: Reg },
+    /// `C.LE.S fs, ft` — set condition = (fs <= ft).
+    CLeS { fs: Reg, ft: Reg },
+    /// `C.EQ.D fs, ft`.
+    CEqD { fs: Reg, ft: Reg },
+    /// `C.LT.D fs, ft`.
+    CLtD { fs: Reg, ft: Reg },
+    /// `C.LE.D fs, ft`.
+    CLeD { fs: Reg, ft: Reg },
+
+    // --- COP1 conditional branches (fmt = BC1 = 0x08; ft bit0 = tf, bit1 = nd). ---
+    /// `BC1T off` — branch if FP condition flag is set.
+    Bc1t { off: i16 },
+    /// `BC1F off` — branch if FP condition flag is clear.
+    Bc1f { off: i16 },
+    /// `BC1TL off` — branch-likely if flag set.
+    Bc1tl { off: i16 },
+    /// `BC1FL off` — branch-likely if flag clear.
+    Bc1fl { off: i16 },
+
     /// A word we do not (yet) decode. Carries the raw bits so the emitter can
     /// fail loudly instead of silently emitting a nop.
     Unknown { word: u32 },
@@ -229,6 +362,26 @@ fn imm_s(w: u32) -> i16 {
 #[inline]
 fn target26(w: u32) -> u32 {
     w & 0x03FF_FFFF
+}
+
+// --- COP1 field extraction. The `fmt` sub-op selector occupies the same bits
+// as `rs` (25..21); `ft`/`fs`/`fd` occupy the `rt`/`rd`/`sa` positions but are
+// FPU register indices. Named separately for clarity at the decode site.
+#[inline]
+fn fmt(w: u32) -> u32 {
+    (w >> 21) & 0x1F
+}
+#[inline]
+fn ft(w: u32) -> Reg {
+    ((w >> 16) & 0x1F) as Reg
+}
+#[inline]
+fn fs(w: u32) -> Reg {
+    ((w >> 11) & 0x1F) as Reg
+}
+#[inline]
+fn fd(w: u32) -> Reg {
+    ((w >> 6) & 0x1F) as Reg
 }
 
 /// Decode a single 32-bit MIPS instruction word.
@@ -289,6 +442,8 @@ pub fn decode(w: u32) -> Instruction {
             0x11 => Bgezal { rs: rs(w), off: imm_s(w) },
             _ => Unknown { word: w },
         },
+        // COP1 (FPU): opcode 0x11, sub-dispatched on `fmt` (bits 25..21).
+        0x11 => decode_cop1(w),
         // J-type.
         0x02 => J { target: target26(w) },
         0x03 => Jal { target: target26(w) },
@@ -325,6 +480,103 @@ pub fn decode(w: u32) -> Instruction {
         0x2A => Swl { rt: rt(w), base: rs(w), off: imm_s(w) },
         0x2B => Sw { rt: rt(w), base: rs(w), off: imm_s(w) },
         0x2E => Swr { rt: rt(w), base: rs(w), off: imm_s(w) },
+        // COP1 loads/stores (dedicated main opcodes).
+        0x31 => Lwc1 { ft: rt(w), base: rs(w), off: imm_s(w) },
+        0x35 => Ldc1 { ft: rt(w), base: rs(w), off: imm_s(w) },
+        0x39 => Swc1 { ft: rt(w), base: rs(w), off: imm_s(w) },
+        0x3D => Sdc1 { ft: rt(w), base: rs(w), off: imm_s(w) },
+        _ => Unknown { word: w },
+    }
+}
+
+/// Decode a COP1 (opcode 0x11) instruction, sub-dispatched on the `fmt` field.
+///
+/// Clean-room from the MIPS III / VR4300 reference: the `fmt` values below are
+/// the documented COP1 format/sub-op encodings (MFC1=0, DMFC1=1, CFC1=2,
+/// MTC1=4, DMTC1=5, CTC1=6, BC1=8, S=0x10, D=0x11, W=0x14, L=0x15). Within the
+/// S/D formats the `funct` field (5..0) picks the operation; the conversion
+/// and compare `funct` values are likewise documented facts.
+fn decode_cop1(w: u32) -> Instruction {
+    use Instruction::*;
+    match fmt(w) {
+        // GPR<->FPR moves.
+        0x00 => Mfc1 { rt: ft(w), fs: fs(w) },
+        0x01 => Dmfc1 { rt: ft(w), fs: fs(w) },
+        0x02 => Cfc1 { rt: ft(w), fs: fs(w) },
+        0x04 => Mtc1 { rt: ft(w), fs: fs(w) },
+        0x05 => Dmtc1 { rt: ft(w), fs: fs(w) },
+        0x06 => Ctc1 { rt: ft(w), fs: fs(w) },
+        // BC1: ft field carries tf (bit 0) and nd (bit 1, branch-likely).
+        0x08 => match ft(w) & 0x3 {
+            0x00 => Bc1f { off: imm_s(w) },
+            0x01 => Bc1t { off: imm_s(w) },
+            0x02 => Bc1fl { off: imm_s(w) },
+            0x03 => Bc1tl { off: imm_s(w) },
+            _ => Unknown { word: w },
+        },
+        // Single-precision format.
+        0x10 => decode_cop1_s(w),
+        // Double-precision format.
+        0x11 => decode_cop1_d(w),
+        // Fixed-point-source conversions: W (int32 source) and L (int64 source).
+        0x14 => match funct(w) {
+            0x20 => CvtSW { fd: fd(w), fs: fs(w) },
+            0x21 => CvtDW { fd: fd(w), fs: fs(w) },
+            _ => Unknown { word: w },
+        },
+        0x15 => match funct(w) {
+            0x20 => CvtSL { fd: fd(w), fs: fs(w) },
+            0x21 => CvtDL { fd: fd(w), fs: fs(w) },
+            _ => Unknown { word: w },
+        },
+        _ => Unknown { word: w },
+    }
+}
+
+/// Single-precision (fmt = S = 0x10) `funct` sub-dispatch.
+fn decode_cop1_s(w: u32) -> Instruction {
+    use Instruction::*;
+    match funct(w) {
+        0x00 => AddS { fd: fd(w), fs: fs(w), ft: ft(w) },
+        0x01 => SubS { fd: fd(w), fs: fs(w), ft: ft(w) },
+        0x02 => MulS { fd: fd(w), fs: fs(w), ft: ft(w) },
+        0x03 => DivS { fd: fd(w), fs: fs(w), ft: ft(w) },
+        0x04 => SqrtS { fd: fd(w), fs: fs(w) },
+        0x05 => AbsS { fd: fd(w), fs: fs(w) },
+        0x06 => MovS { fd: fd(w), fs: fs(w) },
+        0x07 => NegS { fd: fd(w), fs: fs(w) },
+        0x0D => TruncWS { fd: fd(w), fs: fs(w) },
+        0x09 => TruncLS { fd: fd(w), fs: fs(w) },
+        0x21 => CvtDS { fd: fd(w), fs: fs(w) },
+        0x24 => CvtWS { fd: fd(w), fs: fs(w) },
+        0x25 => CvtLS { fd: fd(w), fs: fs(w) },
+        0x32 => CEqS { fs: fs(w), ft: ft(w) },
+        0x3C => CLtS { fs: fs(w), ft: ft(w) },
+        0x3E => CLeS { fs: fs(w), ft: ft(w) },
+        _ => Unknown { word: w },
+    }
+}
+
+/// Double-precision (fmt = D = 0x11) `funct` sub-dispatch.
+fn decode_cop1_d(w: u32) -> Instruction {
+    use Instruction::*;
+    match funct(w) {
+        0x00 => AddD { fd: fd(w), fs: fs(w), ft: ft(w) },
+        0x01 => SubD { fd: fd(w), fs: fs(w), ft: ft(w) },
+        0x02 => MulD { fd: fd(w), fs: fs(w), ft: ft(w) },
+        0x03 => DivD { fd: fd(w), fs: fs(w), ft: ft(w) },
+        0x04 => SqrtD { fd: fd(w), fs: fs(w) },
+        0x05 => AbsD { fd: fd(w), fs: fs(w) },
+        0x06 => MovD { fd: fd(w), fs: fs(w) },
+        0x07 => NegD { fd: fd(w), fs: fs(w) },
+        0x0D => TruncWD { fd: fd(w), fs: fs(w) },
+        0x09 => TruncLD { fd: fd(w), fs: fs(w) },
+        0x20 => CvtSD { fd: fd(w), fs: fs(w) },
+        0x24 => CvtWD { fd: fd(w), fs: fs(w) },
+        0x25 => CvtLD { fd: fd(w), fs: fs(w) },
+        0x32 => CEqD { fs: fs(w), ft: ft(w) },
+        0x3C => CLtD { fs: fs(w), ft: ft(w) },
+        0x3E => CLeD { fs: fs(w), ft: ft(w) },
         _ => Unknown { word: w },
     }
 }
@@ -340,6 +592,7 @@ impl Instruction {
                 | Bltzal { .. } | Bgezal { .. } | Beql { .. } | Bnel { .. } | Blezl { .. }
                 | Bgtzl { .. } | Bltzl { .. } | Bgezl { .. } | J { .. } | Jal { .. }
                 | Jr { .. } | Jalr { .. }
+                | Bc1t { .. } | Bc1f { .. } | Bc1tl { .. } | Bc1fl { .. }
         )
     }
 
@@ -351,6 +604,7 @@ impl Instruction {
         matches!(
             self,
             Beql { .. } | Bnel { .. } | Blezl { .. } | Bgtzl { .. } | Bltzl { .. } | Bgezl { .. }
+                | Bc1tl { .. } | Bc1fl { .. }
         )
     }
 }
