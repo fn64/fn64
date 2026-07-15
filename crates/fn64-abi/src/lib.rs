@@ -1801,6 +1801,52 @@ pub unsafe extern "C" fn osGetTime_recomp(_rdram: *mut u8, ctx: *mut RecompConte
 ///
 /// UNKNOWN_TASK_NOTE: an unrecognized task type is recorded (so the trace/count still sees it) but not executed, and this function still sets `ctx.r2 = 0` (complete) -- the same "acknowledge, don't fabricate real hardware effects" stance as the gfx path, since this milestone has no evidence for any other task type on NWXE's boot path.
 ///
+/// Dispatch a graphics task (`M_GFXTASK`) to the registered `dyn
+/// RenderBackend`, once, at the point the RSP is actually kicked. Extracted so
+/// BOTH task-submission paths can call it: `osSpTaskStartGo_recomp` (the
+/// Load+StartGo path OoT and most retail titles use) and
+/// `osSpTaskYielded_recomp` (the yield/resume path). A prior version dispatched
+/// ONLY from the yield path, so OoT (which never yields the RSP -- it
+/// Load+StartGo's every frame) submitted 232 gfx tasks that the backend never
+/// saw, producing blank frames. Callers guard on `header.task_type ==
+/// M_GFXTASK` and pass the task header's rdram offset `o`.
+///
+/// If no backend is registered the call is a no-op (the task is still
+/// counted by the caller's `submit_task`) -- same "acknowledge, never fake
+/// success" stance as the audio path. A backend error is surfaced via
+/// `RENDER_LAST_ERROR`, never a MIPS-side fault (real hardware can't report a
+/// gfx-ucode failure back to the game thread either).
+///
+/// # Safety
+/// `rdram` valid for the call; `o` a valid task-header offset within it.
+unsafe fn dispatch_gfx_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
+    RENDER_BACKEND.with(|cell| {
+        if let Some(backend) = cell.borrow_mut().as_mut() {
+            let render_end = unsafe { read_output_buff_size(rdram, o) };
+            let task = fn64_render::OsTask {
+                task_type: header.task_type,
+                flags: header.flags,
+                ucode_boot: header.ucode_boot,
+                ucode_boot_size: header.ucode_boot_size,
+                ucode: header.ucode,
+                ucode_size: header.ucode_size,
+                ucode_data: header.ucode_data,
+                ucode_data_size: header.ucode_data_size,
+                dram_stack: header.dram_stack,
+                dram_stack_size: header.dram_stack_size,
+                output_buff: header.output_buff,
+                output_buff_size: render_end,
+                data_ptr: header.data_ptr,
+                data_size: header.data_size,
+            };
+            let rdram_len = RDRAM_LEN.with(|cell| cell.get());
+            let rdram_slice = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
+            let result = backend.process_task(rdram_slice, &task);
+            RENDER_LAST_ERROR.with(|cell| cell.replace(result.err().map(|e| e.to_string())));
+        }
+    });
+}
+
 /// # Safety
 /// `ctx`/`rdram` must be valid per every other shim's contract in this file.
 #[no_mangle]
@@ -1870,54 +1916,7 @@ pub unsafe extern "C" fn osSpTaskYielded_recomp(rdram: *mut u8, ctx: *mut Recomp
             }
         });
     } else if header.task_type == M_GFXTASK {
-        // GFX_RENDER_NOTE: routes through the single registered `dyn
-        // RenderBackend` (`set_render_backend`), the same executor-event-
-        // seam pattern as the audio path above -- fn64-abi never names a
-        // concrete backend crate (docs/DECOUPLING.md: "the backend never
-        // reaches back into runtime state," and symmetrically, this crate
-        // never reaches INTO a specific backend's internals, only the
-        // trait). If no backend was registered (a test, or a harness that
-        // hasn't wired one up), the task is still recorded/counted below,
-        // same honesty stance as the audio path's "no ucode fn registered"
-        // case -- never a silent pretend-success.
-        RENDER_BACKEND.with(|cell| {
-            if let Some(backend) = cell.borrow_mut().as_mut() {
-                let render_end = unsafe { read_output_buff_size(rdram, o) };
-                let task = fn64_render::OsTask {
-                    task_type: header.task_type,
-                    flags: header.flags,
-                    ucode_boot: header.ucode_boot,
-                    ucode_boot_size: header.ucode_boot_size,
-                    ucode: header.ucode,
-                    ucode_size: header.ucode_size,
-                    ucode_data: header.ucode_data,
-                    ucode_data_size: header.ucode_data_size,
-                    dram_stack: header.dram_stack,
-                    dram_stack_size: header.dram_stack_size,
-                    output_buff: header.output_buff,
-                    output_buff_size: render_end,
-                    data_ptr: header.data_ptr,
-                    data_size: header.data_size,
-                };
-                // Safety: `rdram` is valid for this call's duration per
-                // this function's own contract; the backend only reads it
-                // as `&[u8]` for the length the executor's rdram buffer
-                // actually has (`RDRAM_LEN`, set by `set_render_backend`'s
-                // caller alongside the backend itself).
-                let rdram_len = RDRAM_LEN.with(|cell| cell.get());
-                let rdram_slice = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
-                // A backend error (unsupported ucode, bad bounds, backend
-                // not ready) is intentionally NOT propagated as a MIPS-side
-                // fault -- real hardware has no way to report "your gfx
-                // task's ucode isn't implemented" back to the game thread
-                // either; it is surfaced instead via `RENDER_LAST_ERROR`
-                // for a harness/test to inspect, matching this crate's
-                // "loud, not silent" rule without inventing a fake libultra
-                // error path no real ROM's code checks for.
-                let result = backend.process_task(rdram_slice, &task);
-                RENDER_LAST_ERROR.with(|cell| cell.replace(result.err().map(|e| e.to_string())));
-            }
-        });
+        unsafe { dispatch_gfx_task(rdram, o, &header) };
     }
 
     with_executor(|exec| exec.submit_task(header));
@@ -3250,6 +3249,14 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     let o = task_addr.offset() as usize;
     let header = unsafe { read_os_task_header(rdram, o) };
     let is_gfx = header.task_type == M_GFXTASK;
+
+    // Kicking the RSP IS where the task runs in this synchronous model, so a
+    // graphics task rasterizes here -- this is the path OoT uses (Load then
+    // StartGo, never the yield path). Dispatch before injecting the completion
+    // events so the frame is drawn by the time the scheduler is woken.
+    if is_gfx {
+        unsafe { dispatch_gfx_task(rdram, o, &header) };
+    }
 
     with_executor(|exec| {
         if exec.event_table_contains(OS_EVENT_SP) {
