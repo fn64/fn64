@@ -1856,6 +1856,68 @@ unsafe fn dispatch_gfx_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
     });
 }
 
+/// Dispatch an audio task (`M_AUDTASK`) once, at the point the RSP is kicked.
+/// Two halves, both symmetric with `dispatch_gfx_task`:
+///  1. Run the registered translated audio ucode (`AUDIO_UCODE_FN`,
+///     `set_audio_ucode_fn`) with `(rdram, task_offset)` -- `o` is the OSTask's
+///     rdram OFFSET, which the recompiled ucode's FFI wrapper uses to seed RSP
+///     DMEM[0xFC0] (rspboot pre-loads the 64-byte OSTask there; aspMain's first
+///     act is `lw 0x18(0xFC0)` = read `ucode_data`). No ucode registered -> the
+///     task is still counted by the caller's `submit_task`, honestly reflecting
+///     "submitted but this process never ran its ucode."
+///  2. Forward the ucode's AI output buffer (`output_buff`/`output_buff_size`)
+///     to the registered `dyn AudioBackend` (`set_audio_backend`) as interleaved
+///     i16 PCM. No backend -> no fabricated playback.
+///
+/// Extracted so BOTH submission paths dispatch it, exactly like
+/// `dispatch_gfx_task`: `osSpTaskStartGo_recomp` (the Load+StartGo path OoT's
+/// audio driver uses -- `AudioMgr_HandleRetrace` -> scheduler -> `Sched_RunTask`
+/// -> `osSpTaskLoad`+`osSpTaskStartGo`, never the yield path) and
+/// `osSpTaskYielded_recomp`. A prior version dispatched the ucode ONLY from the
+/// yield path, so a real OoT audio task submitted via StartGo would never have
+/// run its ucode -- the same latent bug class the gfx path already hit and fixed.
+///
+/// # Safety
+/// `rdram` valid for the call; `o` a valid task-header offset within it.
+unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
+    AUDIO_UCODE_FN.with(|cell| {
+        if let Some(f) = cell.get() {
+            // Safety: `set_audio_ucode_fn`'s doc comment is the contract --
+            // `f` must be the real translated ucode function. See this
+            // function's doc comment for why `o` (the OSTask rdram offset) is
+            // the second argument, and `AudioUcodeFn`'s doc comment for the
+            // widened meaning.
+            unsafe {
+                f(rdram, o as u32);
+            }
+        }
+    });
+    AUDIO_BACKEND.with(|cell| {
+        if let Some(backend) = cell.borrow_mut().as_mut() {
+            let rdram_len = AUDIO_RDRAM_LEN.with(|cell| cell.get());
+            let render_end = unsafe { read_output_buff_size(rdram, o) };
+            let start = header.output_buff as usize;
+            let end = start + render_end as usize;
+            let result = if rdram_len == 0 || end > rdram_len || !start.is_multiple_of(2) {
+                // No rdram length registered yet, or the task's declared
+                // buffer doesn't fit -- named "not ready" rather than an
+                // out-of-bounds read or a silent skip.
+                Err(AudioError::NotReady(
+                    "audio output buffer bounds unavailable or misaligned",
+                ))
+            } else {
+                let bytes = unsafe { std::slice::from_raw_parts(rdram.add(start), end - start) };
+                let samples: Vec<i16> = bytes
+                    .chunks_exact(2)
+                    .map(|c| i16::from_ne_bytes([c[0], c[1]]))
+                    .collect();
+                backend.queue_samples(&samples)
+            };
+            AUDIO_LAST_ERROR.with(|cell| cell.replace(result.err().map(|e| e.to_string())));
+        }
+    });
+}
+
 /// # Safety
 /// `ctx`/`rdram` must be valid per every other shim's contract in this file.
 #[no_mangle]
@@ -1866,68 +1928,7 @@ pub unsafe extern "C" fn osSpTaskYielded_recomp(rdram: *mut u8, ctx: *mut Recomp
     let header = unsafe { read_os_task_header(rdram, o) };
 
     if header.task_type == M_AUDTASK {
-        AUDIO_UCODE_FN.with(|cell| {
-            if let Some(f) = cell.get() {
-                // Safety: `set_audio_ucode_fn`'s doc comment is the
-                // contract -- `f` must be the real translated ucode
-                // function. We pass the OSTask's rdram OFFSET `o` (not the
-                // ucode-text address) as the second argument: a real
-                // recompiled ucode has its IMEM text baked in and does not
-                // re-read it from rdram; what it DOES need is the task
-                // structure (rspboot pre-loads the 64-byte OSTask into RSP
-                // DMEM at 0xFC0, and aspMain's first act is `lw 0x18(0xFC0)`
-                // = read `ucode_data`). The recompiled ucode's FFI wrapper
-                // uses this offset to seed DMEM[0xFC0] before running. See
-                // `AudioUcodeFn`'s doc comment for the widened meaning.
-                unsafe {
-                    f(rdram, o as u32);
-                }
-            }
-            // No ucode function registered (e.g. a test, or the harness
-            // hasn't wired it yet): the task is still recorded/counted
-            // below, honestly reflecting "an audio task was submitted, but
-            // this process never actually ran its ucode" rather than
-            // silently pretending it did.
-        });
-        // AUDIO_BACKEND_NOTE: routes M_AUDTASK's SAMPLE-DELIVERY half
-        // through the single registered `dyn AudioBackend`
-        // (`set_audio_backend`), the fn64-audio crate's seam, symmetric
-        // with `RENDER_BACKEND` below. This is a SEPARATE half from the
-        // `AUDIO_UCODE_FN` call just above: whatever that call wrote into
-        // `rdram` (real translated ucode output if one is registered, or
-        // untouched bytes if not -- `AudioUcodeFn`'s real FFI signature has
-        // no other return channel per RSPRecomp's generated code) is read
-        // back out of the task's own declared AI DMA output buffer
-        // (`output_buff`/`output_buff_size`, the same header fields the
-        // gfx path already reads for its own output bounds) and forwarded
-        // as interleaved i16 PCM. If no backend is registered, the task is
-        // still recorded/counted below, same "no backend -> no fabricated
-        // playback" honesty stance as the render seam.
-        AUDIO_BACKEND.with(|cell| {
-            if let Some(backend) = cell.borrow_mut().as_mut() {
-                let rdram_len = AUDIO_RDRAM_LEN.with(|cell| cell.get());
-                let render_end = unsafe { read_output_buff_size(rdram, o) };
-                let start = header.output_buff as usize;
-                let end = start + render_end as usize;
-                let result = if rdram_len == 0 || end > rdram_len || !start.is_multiple_of(2) {
-                    // No rdram length registered yet, or the task's
-                    // declared buffer doesn't fit -- named "not ready"
-                    // rather than an out-of-bounds read or a silent skip.
-                    Err(AudioError::NotReady(
-                        "audio output buffer bounds unavailable or misaligned",
-                    ))
-                } else {
-                    let bytes =
-                        unsafe { std::slice::from_raw_parts(rdram.add(start), end - start) };
-                    let samples: Vec<i16> = bytes
-                        .chunks_exact(2)
-                        .map(|c| i16::from_ne_bytes([c[0], c[1]]))
-                        .collect();
-                    backend.queue_samples(&samples)
-                };
-                AUDIO_LAST_ERROR.with(|cell| cell.replace(result.err().map(|e| e.to_string())));
-            }
-        });
+        unsafe { dispatch_audio_task(rdram, o, &header) };
     } else if header.task_type == M_GFXTASK {
         unsafe { dispatch_gfx_task(rdram, o, &header) };
     }
@@ -3338,12 +3339,17 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     let header = unsafe { read_os_task_header(rdram, o) };
     let is_gfx = header.task_type == M_GFXTASK;
 
-    // Kicking the RSP IS where the task runs in this synchronous model, so a
-    // graphics task rasterizes here -- this is the path OoT uses (Load then
-    // StartGo, never the yield path). Dispatch before injecting the completion
-    // events so the frame is drawn by the time the scheduler is woken.
+    // Kicking the RSP IS where the task runs in this synchronous model, so the
+    // task's real effect happens here -- this is the path OoT uses (Load then
+    // StartGo, never the yield path) for BOTH its gfx and its audio tasks.
+    // Dispatch before injecting the completion events so the work is done by the
+    // time the scheduler is woken. A graphics task rasterizes; an audio task
+    // runs its registered ucode + forwards samples (previously dispatched only
+    // from the never-taken yield path -- same latent bug the gfx path hit).
     if is_gfx {
         unsafe { dispatch_gfx_task(rdram, o, &header) };
+    } else if header.task_type == M_AUDTASK {
+        unsafe { dispatch_audio_task(rdram, o, &header) };
     }
 
     with_executor(|exec| {
@@ -5008,6 +5014,47 @@ mod tests {
         // `header_off` (0x20), the offset of the OSTask within `rdram`.
         assert_eq!(SEEN_UCODE_ADDR.load(Ordering::SeqCst), header_off as u32);
         with_executor(|exec| assert!(exec.task_log().audio_count() >= 1));
+    }
+
+    /// Fail-against-bug: OoT's audio driver submits its `M_AUDTASK` via the
+    /// Load+StartGo path (`AudioMgr_HandleRetrace` -> scheduler ->
+    /// `Sched_RunTask` -> `osSpTaskLoad`+`osSpTaskStartGo`), NEVER the yield
+    /// path. Before the fix, `osSpTaskStartGo_recomp` dispatched only
+    /// `M_GFXTASK`, so a real audio task kicked here never ran its ucode -- the
+    /// recompiled aspMain would never execute and no samples would be produced,
+    /// even once the audio thread was submitting tasks. This asserts StartGo
+    /// really invokes the registered ucode for `M_AUDTASK`, symmetric with the
+    /// gfx-from-StartGo fix (commit 73a191a) and the yield-path test above.
+    #[test]
+    fn os_sp_task_start_go_calls_the_registered_audio_ucode_fn_for_real() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        static CALLED: AtomicBool = AtomicBool::new(false);
+        static SEEN_OFFSET: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "C" fn fake_ucode(_rdram: *mut u8, task_offset: u32) -> u32 {
+            CALLED.store(true, Ordering::SeqCst);
+            SEEN_OFFSET.store(task_offset, Ordering::SeqCst);
+            0
+        }
+        unsafe { set_audio_ucode_fn(fake_ucode) };
+
+        let mut rdram = vec![0u8; 128];
+        let header_off = 0x30usize;
+        rdram[header_off..header_off + 4].copy_from_slice(&fn64_runtime::M_AUDTASK.to_ne_bytes());
+
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + header_off as u64;
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        assert!(
+            CALLED.load(Ordering::SeqCst),
+            "osSpTaskStartGo must call the real ucode fn for an M_AUDTASK (the OoT path)"
+        );
+        assert_eq!(
+            SEEN_OFFSET.load(Ordering::SeqCst),
+            header_off as u32,
+            "ucode receives the OSTask rdram offset, same contract as the yield path"
+        );
     }
 
     #[test]

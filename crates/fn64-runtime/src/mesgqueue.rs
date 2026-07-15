@@ -141,6 +141,28 @@ impl MesgQueue {
         }
     }
 
+    /// A zero-capacity queue, modeling a guest `OSMesgQueue` struct that was
+    /// only ever `bzero`'d and never passed to `osCreateMesgQueue` (so its
+    /// `msgCount`/message buffer are 0/NULL). OoT's audio driver has exactly
+    /// one such queue: `gAudioCtx.asyncLoadUnkMediumQueue`, which the decomp
+    /// never creates -- it is bzero'd as part of `gAudioCtx` and then only
+    /// ever NOBLOCK-sent/recv'd (`audio/internal/load.c:1652,1717,1718`),
+    /// relying on both operations returning -1 (full-on-send, empty-on-recv).
+    /// A zero-capacity queue reproduces that exactly: `is_full()` and
+    /// `is_empty_queue()` are both always true, so `try_send`/`try_recv`
+    /// return `WouldBlock` without ever reaching their `% buffer.len()` (which
+    /// would panic on a 0-length buffer). See `Executor::queue_mut`, which
+    /// lazily installs this on first use of an untracked queue.
+    pub fn zero_capacity() -> Self {
+        MesgQueue {
+            buffer: Vec::new().into_boxed_slice(),
+            valid_count: 0,
+            first: 0,
+            blocked_on_recv: BlockedList::default(),
+            blocked_on_send: BlockedSenderList::default(),
+        }
+    }
+
     pub fn capacity(&self) -> usize {
         self.buffer.len()
     }
