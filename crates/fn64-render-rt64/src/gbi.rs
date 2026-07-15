@@ -59,6 +59,35 @@ pub const G_ENDDL: u8 = 0xDF;
 /// segment base-address table used to resolve segmented pointers.
 const G_MW_SEGMENT: u16 = 0x06;
 
+/// `G_MV_VIEWPORT` (gbi.h) -- the `G_MOVEMEM` index that DMAs a `Vp`
+/// (viewport scale/translate) struct into RSP state (F3DEX2-CONCEPTS.md
+/// §1.4/§3.5).
+const G_MV_VIEWPORT: u8 = 8;
+
+// --- F3DEX2 geometry-mode bits (F3DEX2-CONCEPTS.md §2.4) -----------------
+/// Cull front-facing triangles.
+const G_CULL_FRONT: u32 = 0x0000_0200;
+/// Cull back-facing triangles (the common case).
+const G_CULL_BACK: u32 = 0x0000_0400;
+
+// --- Additional F3DEX2 opcode bytes, named for the loud-skip log so the
+// coverage report doesn't understate what a real OoT DL contains. These are
+// acknowledged-and-skipped for a flat-shaded frame (F3DEX2-CONCEPTS.md §7).
+const G_MODIFYVTX: u8 = 0x02;
+const G_CULLDL: u8 = 0x03;
+const G_BRANCH_Z: u8 = 0x04;
+const G_LINE3D: u8 = 0x08;
+const G_SPECIAL_1: u8 = 0xD5;
+const G_DMA_IO: u8 = 0xD6;
+const G_LOAD_UCODE: u8 = 0xDD;
+const G_SETSCISSOR: u8 = 0xED;
+const G_SETTILESIZE: u8 = 0xF2;
+const G_LOADTILE: u8 = 0xF4;
+const G_SETPRIMCOLOR: u8 = 0xFA;
+const G_SETENVCOLOR: u8 = 0xFB;
+const G_SETZIMG: u8 = 0xFE;
+const G_SETCIMG: u8 = 0xFF;
+
 /// One decoded vertex in screen space (after MVP + viewport if a transform
 /// was active, or raw `ob` coords if no matrix/viewport was loaded -- see
 /// `decode_display_list`) plus a flat RGBA color, matching the
@@ -67,10 +96,31 @@ const G_MW_SEGMENT: u16 = 0x06;
 pub struct Vertex {
     pub x: f32,
     pub y: f32,
+    /// Screen-space depth (mapped NDC-z through the viewport, nearer =
+    /// smaller). Used by the z-buffer in `raster.rs`; 0.0 for the raw
+    /// no-transform reference-fixture path (where all geometry is coplanar).
+    pub z: f32,
     pub r: u8,
     pub g: u8,
     pub b: u8,
     pub a: u8,
+}
+
+/// Screen-space back/front-face culling selector, derived from the F3DEX2
+/// `G_GEOMETRYMODE` `G_CULL_FRONT`/`G_CULL_BACK` bits
+/// (`F3DEX2-CONCEPTS.md` §2.4). The rasterizer (`raster.rs`) applies it by
+/// the sign of a triangle's screen-space signed area.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum CullMode {
+    /// No culling (both faces drawn).
+    #[default]
+    None,
+    /// Cull back faces (`G_CULL_BACK`) -- the common OoT case.
+    Back,
+    /// Cull front faces (`G_CULL_FRONT`).
+    Front,
+    /// Cull both (`G_CULL_BOTH`) -- draws nothing.
+    Both,
 }
 
 /// A decoded, screen-space-ready triangle (three already-resolved
@@ -79,6 +129,11 @@ pub struct Vertex {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Triangle {
     pub v: [Vertex; 3],
+    /// The culling mode in effect (from `G_GEOMETRYMODE`) when this triangle
+    /// was emitted. Carried per-triangle because geometry mode is decode-time
+    /// RSP state that can change between `G_TRI*` commands; the rasterizer
+    /// reads it to cull by winding. `None` for the simple reference path.
+    pub cull: CullMode,
 }
 
 /// The N64 SDK's public per-vertex wire format (`Vtx_t`): 16 bytes --
@@ -200,6 +255,10 @@ fn skip_opcode(opcode: u8) {
 fn opcode_name(opcode: u8) -> &'static str {
     match opcode {
         0x00 => "G_NOOP",
+        G_MODIFYVTX => "G_MODIFYVTX",
+        G_CULLDL => "G_CULLDL",
+        G_BRANCH_Z => "G_BRANCH_Z",
+        G_LINE3D => "G_LINE3D",
         0xE0 => "G_SPNOOP",
         0xE1 => "G_RDPHALF_1",
         0xE2 => "G_SETOTHERMODE_L",
@@ -208,11 +267,22 @@ fn opcode_name(opcode: u8) -> &'static str {
         0xE7 => "G_RDPPIPESYNC",
         0xE8 => "G_RDPTILESYNC",
         0xE9 => "G_RDPFULLSYNC",
+        0xF0 => "G_LOADTLUT",
         0xF1 => "G_RDPHALF_2",
         0xF3 => "G_LOADBLOCK",
+        G_LOADTILE => "G_LOADTILE",
+        G_SETTILESIZE => "G_SETTILESIZE",
         0xF5 => "G_SETTILE",
         0xFC => "G_SETCOMBINE",
         0xFD => "G_SETTIMG",
+        G_SETPRIMCOLOR => "G_SETPRIMCOLOR",
+        G_SETENVCOLOR => "G_SETENVCOLOR",
+        G_SETSCISSOR => "G_SETSCISSOR",
+        G_SETZIMG => "G_SETZIMG",
+        G_SETCIMG => "G_SETCIMG",
+        G_SPECIAL_1 => "G_SPECIAL_1",
+        G_DMA_IO => "G_DMA_IO",
+        G_LOAD_UCODE => "G_LOAD_UCODE",
         G_TEXTURE => "G_TEXTURE",
         G_GEOMETRYMODE => "G_GEOMETRYMODE",
         G_MOVEMEM => "G_MOVEMEM",
@@ -321,11 +391,29 @@ struct DecodeState {
     modelview: Mat4,
     mv_stack: Vec<Mat4>,
     /// Viewport scale/translate (screen mapping), if a `G_MOVEMEM` viewport
-    /// was seen. `None` -> NDC is mapped with a default 320x240 half-extent
-    /// only when a projection IS active; with no projection at all the raw
-    /// `ob` coords are used directly.
-    viewport: Option<(f32, f32, f32, f32)>,
+    /// was seen. Fields: `(sx, sy, sz, tx, ty, tz)` -- x/y map NDC to pixels,
+    /// z maps NDC-z to the depth range (all already divided by 4 in
+    /// `read_viewport`). `None` -> NDC is mapped with a default 320x240
+    /// half-extent only when a projection IS active; with no projection at
+    /// all the raw `ob` coords are used directly.
+    viewport: Option<Viewport>,
+    /// Current F3DEX2 geometry mode (the `G_GEOMETRYMODE` accumulator). Its
+    /// `G_CULL_FRONT`/`G_CULL_BACK` bits decide per-triangle culling.
+    geometry_mode: u32,
     dl_depth: u32,
+}
+
+/// Parsed viewport: screen scale/translate in pixels (x, y) plus a depth
+/// scale/translate (z), all already ÷4 from the N64 quarter-pixel encoding
+/// (`F3DEX2-CONCEPTS.md` §3.5).
+#[derive(Copy, Clone, Debug)]
+struct Viewport {
+    sx: f32,
+    sy: f32,
+    sz: f32,
+    tx: f32,
+    ty: f32,
+    tz: f32,
 }
 
 /// Max `G_DL` recursion depth honored, matching the real F3DEX2 display-
@@ -375,6 +463,7 @@ pub fn decode_display_list(rdram: &[u8], dl_addr: u32) -> Result<Vec<Triangle>, 
                     vtx_cache[v0 + i] = Vertex {
                         x,
                         y,
+                        z: 0.0, // simple reference path: coplanar, no depth
                         r: cn[0],
                         g: cn[1],
                         b: cn[2],
@@ -426,6 +515,7 @@ pub fn decode_display_list_f3dex2(
         modelview: identity(),
         mv_stack: Vec::new(),
         viewport: None,
+        geometry_mode: 0,
         dl_depth: 0,
     };
     decode_stream(rdram, dl_addr, &mut state);
@@ -626,10 +716,11 @@ fn load_vertices(
         let b = read_u8(rdram, off + 14);
         let a = read_u8(rdram, off + 15);
 
-        let (sx, sy) = project_vertex(state, x, y, z);
+        let (sx, sy, sz) = project_vertex(state, x, y, z);
         state.vtx_cache[v0 + i] = Vertex {
             x: sx,
             y: sy,
+            z: sz,
             r,
             g,
             b,
@@ -644,32 +735,36 @@ fn load_vertices(
 /// If NO transform is loaded at all, the raw `ob` x/y are already screen
 /// coordinates (the pre-existing reference-fixture convention) and pass
 /// through unchanged.
-fn project_vertex(state: &DecodeState, x: f32, y: f32, z: f32) -> (f32, f32) {
+fn project_vertex(state: &DecodeState, x: f32, y: f32, z: f32) -> (f32, f32, f32) {
     match state.mvp {
         Some(mvp) => {
             let clip = transform_point(&mvp, x, y, z);
+            // Perspective divide: clip -> NDC. Guard w~0 (a vertex on the
+            // camera plane) so a divide-by-zero doesn't fling it to infinity.
             let w = if clip[3].abs() > 1e-6 { clip[3] } else { 1.0 };
             let ndc_x = clip[0] / w;
             let ndc_y = clip[1] / w;
-            match state.viewport {
-                Some((sx, sy, tx, ty)) => {
+            let ndc_z = clip[2] / w;
+            match &state.viewport {
+                Some(vp) => {
                     // vscale/vtrans are in pixels (already /4 in read_viewport).
-                    let px = ndc_x * sx + tx;
+                    let px = ndc_x * vp.sx + vp.tx;
                     // N64 screen Y is top-down; NDC +Y is up, so flip.
-                    let py = -ndc_y * sy + ty;
-                    (px, py)
+                    let py = -ndc_y * vp.sy + vp.ty;
+                    let pz = ndc_z * vp.sz + vp.tz;
+                    (px, py, pz)
                 }
                 None => {
                     // Default viewport: 320x240, origin center.
                     let px = ndc_x * 160.0 + 160.0;
                     let py = -ndc_y * 120.0 + 120.0;
-                    (px, py)
+                    (px, py, ndc_z)
                 }
             }
         }
         None => {
             // No transform: raw screen coords (reference-fixture path).
-            (x, y)
+            (x, y, 0.0)
         }
     }
 }
@@ -691,6 +786,9 @@ fn resolve_tri(vtx_cache: &[Vertex; 32], idx: [u32; 3]) -> Option<Triangle> {
             vtx_cache[idx[1] as usize],
             vtx_cache[idx[2] as usize],
         ],
+        // Culling not yet driven from G_GEOMETRYMODE (that opcode is still a
+        // loud-skip); default to no culling so geometry isn't wrongly dropped.
+        cull: CullMode::None,
     })
 }
 
