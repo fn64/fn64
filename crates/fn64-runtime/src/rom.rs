@@ -193,7 +193,7 @@ impl<R: RomStorage> PiDma<R> {
                 let mut buf = vec![0u8; len as usize];
                 self.rom.read_into(dev_addr, &mut buf);
                 let base = dram_addr.offset() as usize;
-                rdram.write_bytes(base, &buf);
+                rdram.dma_write_bytes(base, &buf);
             }
             DmaDirection::FromRdram => {
                 unimplemented!(
@@ -220,7 +220,14 @@ mod tests {
     use crate::rdram::Rdram;
 
     #[test]
-    fn dma_to_rdram_copies_real_rom_bytes() {
+    fn dma_to_rdram_reads_back_through_mem_accessors_unswapped() {
+        // The big-endian cartridge word `DE AD BE EF` must read back through
+        // the guest's own MEM_* accessors as the SAME word/bytes it was on the
+        // cart -- that is the whole contract. rdram is native-endian-WORD
+        // storage, so start_dma stores it byte-reversed (`EF BE AD DE`); the
+        // test asserts the SEMANTIC outcome (what MEM_W/MEM_BU return), not the
+        // raw storage bytes. A flat DMA copy (the OoT-Locale_Init-hanging bug)
+        // would make MEM_W read `0xEFBEADDE` and MEM_BU(+2) read `0xAD`.
         let mut rom_bytes = vec![0u8; 0x100];
         rom_bytes[0x10..0x14].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
         let mut dma = PiDma::new(InMemoryRom::new(rom_bytes));
@@ -235,7 +242,11 @@ mod tests {
         );
 
         assert_eq!(completion.len, 4);
-        assert_eq!(rdram.read_bytes(0x20, 4), &[0xDE, 0xAD, 0xBE, 0xEF]);
+        // MEM_W reads the big-endian cart word back intact.
+        assert_eq!(rdram.read_w(RdramAddr::from_offset(0x20)) as u32, 0xDEAD_BEEF);
+        // MEM_BU(base+k) returns cart byte k (0xDE,0xAD,0xBE,0xEF), NOT 3-k.
+        assert_eq!(rdram.read_bu(RdramAddr::from_offset(0x20)), 0xDE);
+        assert_eq!(rdram.read_bu(RdramAddr::from_offset(0x22)), 0xBE);
     }
 
     #[test]

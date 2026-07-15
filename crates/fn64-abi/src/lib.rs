@@ -2656,8 +2656,13 @@ pub unsafe extern "C" fn osEPiReadIo_recomp(rdram: *mut u8, ctx: *mut RecompCont
     with_pi_dma("osEPiReadIo_recomp", |dma| {
         let mut buf = [0u8; 4];
         dma.read_rom_bytes(dev_addr, &mut buf);
+        // Same word-swizzle as PiDma::start_dma / Rdram::write_bytes: rdram is
+        // native-endian-WORD storage, so a big-endian cartridge word must be
+        // stored byte-reversed or a later MEM_W/MEM_BU reads it swapped. A flat
+        // copy here is exactly the bug that hung OoT's Locale_Init region check.
+        let swz = [buf[3], buf[2], buf[1], buf[0]];
         unsafe {
-            std::ptr::copy_nonoverlapping(buf.as_ptr(), rdram.add(dram_addr), 4);
+            std::ptr::copy_nonoverlapping(swz.as_ptr(), rdram.add(dram_addr), 4);
         }
     });
     ctx.r2 = 0;
@@ -4140,6 +4145,39 @@ mod tests {
         // offset; the copied bytes confirm the DMA itself used the right
         // dramAddr/devAddr/len too.
         assert_eq!(&rdram[0x5000..0x5004], &[0xAB, 0xAB, 0xAB, 0xAB]);
+    }
+
+    /// Regression test for the OoT-boot hang (2026-07-14): `osEPiReadIo`
+    /// delivered the cartridge word into rdram FLAT, but the guest reads
+    /// individual bytes back through `MEM_BU`'s `^3` byte-lane XOR (rdram is
+    /// native-endian-word storage). `Locale_Init` DMAs the ROM header, `lbu`s
+    /// the region byte, accepts only 'E'/'J', else `LogUtils_HungupThread`s.
+    /// A flat copy delivered the wrong byte -> neither-E-nor-J -> deliberate
+    /// hang. This models that exact read with a distinguishable word so a
+    /// regression to flat semantics fails here, not 8 frames into a boot.
+    #[test]
+    fn os_epi_read_io_word_reads_back_through_mem_bu_unswapped() {
+        // ROM word at devAddr 0x3C = `5A 4C 4A 00` (OoT's real `Z L J \0`);
+        // guest wants MEM_BU(dram+2) == 0x4A ('J').
+        let mut rom = vec![0u8; 0x100];
+        rom[0x3C..0x40].copy_from_slice(&[0x5A, 0x4C, 0x4A, 0x00]);
+        load_rom(rom);
+
+        let mut rdram = vec![0u8; 0x1000];
+        let dram_vram: u64 = 0x8000_0024;
+        let dram_off = 0x24usize;
+
+        let mut ctx = ctx_zeroed();
+        ctx.r5 = 0x3C; // devAddr
+        ctx.r6 = dram_vram; // dramAddr
+        unsafe { osEPiReadIo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // MEM_BU(dram_off ^ 3) is the guest's byte read; +2 must be 'J'.
+        assert_eq!(rdram[(dram_off + 0) ^ 3], 0x5A); // 'Z'
+        assert_eq!(rdram[(dram_off + 2) ^ 3], 0x4A); // 'J' -- the region byte
+        // And MEM_W reads the cart word intact (native-endian word storage).
+        let w = u32::from_ne_bytes(rdram[dram_off..dram_off + 4].try_into().unwrap());
+        assert_eq!(w, 0x5A4C_4A00);
     }
 
     /// Regression test for the real infinite-loop bug `examples/wm2000-boot`

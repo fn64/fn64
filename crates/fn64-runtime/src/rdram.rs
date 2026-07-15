@@ -200,17 +200,44 @@ impl Rdram {
         self.bytes.as_mut_ptr()
     }
 
-    /// Bulk byte copy into the buffer at a plain rdram-relative byte offset
-    /// (no `MEM_*`-style byte-lane XOR -- that XOR is specifically a
-    /// sub-word CPU-load/store artifact per section (c)'s citation; a DMA
-    /// transfers a contiguous byte range exactly as the source presents it,
-    /// matching real cartridge-domain PI DMA's documented behavior of a
-    /// plain sequential byte copy, not per-word-reinterpreted). Used by
-    /// `rom.rs`'s `PiDma::start_dma` -- the one non-`MEM_*` bulk-write path
-    /// this crate has, kept here (not hand-rolled in `rom.rs`) so there is
-    /// still exactly one module that touches `self.bytes` directly.
+    /// Flat bulk byte copy at a plain rdram-relative offset -- no byte-lane
+    /// swizzle. For a caller that already holds bytes in THIS buffer's
+    /// native-endian-word layout (e.g. fn64-diff's savestate transplant, which
+    /// word-swaps the big-endian snapshot itself before writing). Cartridge
+    /// PI DMA does NOT use this -- see `dma_write_bytes`.
     pub fn write_bytes(&mut self, offset: usize, data: &[u8]) {
         self.bytes[offset..offset + data.len()].copy_from_slice(data);
+    }
+
+    /// Bulk DMA write of big-endian cartridge bytes, swizzled to this buffer's
+    /// native-endian-WORD layout so a later sub-word `MEM_*` read lands on the
+    /// correct byte.
+    ///
+    /// `MEM_W` is `from_ne_bytes` and sub-word accessors carry the `^2`/`^3`
+    /// byte-lane XOR precisely because storage is native-endian-word (see this
+    /// module's header). So a big-endian source word `b0 b1 b2 b3` must be
+    /// stored `b3 b2 b1 b0`, as if the guest had done `MEM_W(word)` -- else
+    /// `MEM_W` reads it byteswapped and `MEM_BU(word+k)` reads byte `3-k`.
+    ///
+    /// Caught by OoT boot: `Locale_Init` DMAs the ROM header and `lbu`s the
+    /// region byte; a flat copy delivered `'L'` instead of `'J'`, so the
+    /// region check matched neither E nor J and the game deliberately
+    /// `LogUtils_HungupThread`'d. Same class as the CPU-load byteswap this
+    /// module already fixed for `MEM_*` -- DMA-in was the remaining hole.
+    ///
+    /// N64 PI DMA is word-aligned in address and length; a non-word-aligned
+    /// transfer would need hardware's partial-word rules no shim exercises yet.
+    pub fn dma_write_bytes(&mut self, offset: usize, data: &[u8]) {
+        assert!(
+            offset % 4 == 0 && data.len() % 4 == 0,
+            "DMA write must be word-aligned (offset={offset:#x} len={:#x}); \
+             non-word-aligned PI DMA is unmodeled",
+            data.len()
+        );
+        for (i, word) in data.chunks_exact(4).enumerate() {
+            let o = offset + i * 4;
+            self.bytes[o..o + 4].copy_from_slice(&[word[3], word[2], word[1], word[0]]);
+        }
     }
 
     pub fn read_bytes(&self, offset: usize, len: usize) -> &[u8] {
