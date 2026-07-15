@@ -57,9 +57,45 @@ use raster::Framebuffer;
 /// buffer. "Reference" in the sense of "the thing every future real backend
 /// (RT64 adapter, wgpu HLE) can be A/B-diffed against for seam-level
 /// correctness" -- not a claim of RDP-accurate output (see module doc).
+/// Which display-list encoding `process_task` decodes with.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DecodeMode {
+    /// The original simple F3D-style reference-fixture encoding
+    /// (`gbi::decode_display_list`): raw screen-space `ob` coords,
+    /// non-segmented `w1` addresses, `n<<12|v0` vertex packing. This is what
+    /// the hand-built fixtures and the `fn64-abi` executor-seam test plant,
+    /// so it stays the DEFAULT to keep those working bit-for-bit.
+    Simple,
+    /// Real F3DEX2 (`gbi::decode_display_list_f3dex2`): segment table,
+    /// modelview/projection matrix stack, viewport, nested `G_DL`. Selected
+    /// for decoding actual OoT display lists.
+    F3dex2,
+}
+
 pub struct ReferenceBackend {
     fb: Option<Framebuffer>,
     clear_color: [u8; 4],
+    decode_mode: DecodeMode,
+    /// If set, `process_task` writes the rasterized framebuffer to
+    /// `<dir>/<prefix>-NNNN.png` after each task, and logs whether the frame
+    /// was non-clear. This is how a harness that MOVED the backend into
+    /// `fn64_abi::set_render_backend` (giving up its `&mut` handle, since the
+    /// `dyn RenderBackend` trait object is deliberately not `Any`-downcastable
+    /// per docs/DECOUPLING.md) still gets the rasterized output back out:
+    /// the backend dumps it itself. Bounded by `auto_dump_limit`.
+    auto_dump: Option<AutoDump>,
+}
+
+struct AutoDump {
+    dir: std::path::PathBuf,
+    prefix: String,
+    /// How many gfx tasks have been processed (the PNG index).
+    task_index: u64,
+    /// How many non-clear PNGs have actually been written.
+    written: u64,
+    /// Stop dumping after this many non-clear frames (avoid flooding /tmp on
+    /// a long boot). `u64::MAX` = unbounded.
+    limit: u64,
 }
 
 impl ReferenceBackend {
@@ -67,7 +103,39 @@ impl ReferenceBackend {
         ReferenceBackend {
             fb: None,
             clear_color: [0, 0, 0, 255],
+            decode_mode: DecodeMode::Simple,
+            auto_dump: None,
         }
+    }
+
+    /// Decode subsequent display lists as real F3DEX2 (matrix stack, segment
+    /// table, viewport) instead of the simple reference-fixture encoding.
+    /// Used by the OoT boot harness, whose display lists are genuine F3DEX2.
+    pub fn with_f3dex2(mut self) -> Self {
+        self.decode_mode = DecodeMode::F3dex2;
+        self
+    }
+
+    /// After each `process_task`, write the rasterized framebuffer to
+    /// `<dir>/<prefix>-NNNN.png` (NNNN = the non-clear-frame counter),
+    /// stopping after `limit` non-clear frames. This lets a harness recover
+    /// the backend's output even after `set_render_backend` has taken
+    /// ownership of it. Every dump (and every all-clear skip) is logged so a
+    /// blank boot is reported honestly, never faked.
+    pub fn with_auto_dump(
+        mut self,
+        dir: impl Into<std::path::PathBuf>,
+        prefix: impl Into<String>,
+        limit: u64,
+    ) -> Self {
+        self.auto_dump = Some(AutoDump {
+            dir: dir.into(),
+            prefix: prefix.into(),
+            task_index: 0,
+            written: 0,
+            limit,
+        });
+        self
     }
 
     /// Override the clear color a fresh/resized framebuffer starts from.
@@ -126,9 +194,53 @@ impl RenderBackend for ReferenceBackend {
             });
         }
 
-        let triangles = gbi::decode_display_list(rdram, task.data_ptr)?;
+        let triangles = match self.decode_mode {
+            DecodeMode::Simple => gbi::decode_display_list(rdram, task.data_ptr)?,
+            DecodeMode::F3dex2 => gbi::decode_display_list_f3dex2(rdram, task.data_ptr)?,
+        };
+        let tri_count = triangles.len();
         for tri in &triangles {
             fb.draw_triangle(tri);
+        }
+
+        // Auto-dump the rasterized frame if configured (the harness's only
+        // way to see the output once set_render_backend owns this backend).
+        if let Some(dump) = self.auto_dump.as_mut() {
+            let idx = dump.task_index;
+            dump.task_index += 1;
+            let [cr, cg, cb, ca] = self.clear_color;
+            let non_clear = fb.has_non_uniform_content(cr, cg, cb, ca);
+            if !non_clear {
+                eprintln!(
+                    "[fn64-render-rt64] gfx task #{idx}: decoded {tri_count} triangle(s); \
+                     framebuffer is UNIFORM clear -- reported blank, not dumped."
+                );
+            } else if dump.written >= dump.limit {
+                eprintln!(
+                    "[fn64-render-rt64] gfx task #{idx}: non-clear ({tri_count} tris) but \
+                     auto-dump limit ({}) reached -- not writing another PNG.",
+                    dump.limit
+                );
+            } else {
+                let _ = std::fs::create_dir_all(&dump.dir);
+                let path = dump
+                    .dir
+                    .join(format!("{}-{:04}.png", dump.prefix, dump.written));
+                match png_dump::write_png(&path, fb.width, fb.height, &fb.pixels) {
+                    Ok(()) => {
+                        dump.written += 1;
+                        eprintln!(
+                            "[fn64-render-rt64] gfx task #{idx}: NON-CLEAR ({tri_count} tris) \
+                             -- dumped {}",
+                            path.display()
+                        );
+                    }
+                    Err(e) => eprintln!(
+                        "[fn64-render-rt64] gfx task #{idx}: failed to write {}: {e}",
+                        path.display()
+                    ),
+                }
+            }
         }
         Ok(FrameStatus::Complete)
     }
