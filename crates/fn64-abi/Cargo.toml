@@ -21,6 +21,12 @@ fn64-runtime = { path = "../fn64-runtime" }
 # (fn64-render-rt64); the shell registers whichever `Box<dyn RenderBackend>`
 # it constructed, keeping fn64-abi backend-agnostic.
 fn64-render = { path = "../fn64-render" }
+# The AudioBackend trait ONLY (docs/DECOUPLING.md's fn64-audio crate plan)
+# -- fn64-abi routes M_AUDTASK's sample-delivery half through `dyn
+# AudioBackend`, symmetric with the gfx routing above. Ucode EXECUTION
+# stays on the pre-existing `AudioUcodeFn` seam (unchanged); this is the
+# NEW seam for getting already-decoded samples to a host backend.
+fn64-audio = { path = "../fn64-audio" }
 # Needed to name `corosensei::Yielder<Resume, Yield>`'s type directly (the
 # active-coroutine-suspend plumbing in src/lib.rs) -- same crate/version
 # fn64-runtime uses, per docs/DESIGN.md section 2's single stackful-
