@@ -46,8 +46,8 @@ use fn64_diff::lockstep::{compare_checkpoint, CheckpointResult, Fn64Checkpoint, 
 use fn64_diff::oracle_client::OracleClient;
 
 thread_local! {
-    static SEED_GPRS: RefCell<[u64; 32]> = RefCell::new([0u64; 32]);
-    static REACHED_PCS: RefCell<Vec<(String, u32, [u64; 32])>> = RefCell::new(Vec::new());
+    static SEED_GPRS: RefCell<[u64; 32]> = const { RefCell::new([0u64; 32]) };
+    static REACHED_PCS: RefCell<Vec<(String, u32, [u64; 32])>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Stand-in transplanted entry function -- see module doc's honesty note.
@@ -64,23 +64,28 @@ unsafe extern "C" fn stand_in_target(_rdram: *mut u8, ctx: *mut RecompContext) {
     let mut recorded = [0u64; 32];
     recorded[29] = ctx_ref.r29;
     recorded[31] = ctx_ref.r31;
-    REACHED_PCS.with(|r| r.borrow_mut().push(("transplant-entry".to_string(), pc, recorded)));
+    REACHED_PCS.with(|r| {
+        r.borrow_mut()
+            .push(("transplant-entry".to_string(), pc, recorded))
+    });
 }
 
 thread_local! {
-    static CHECKPOINT_PC: RefCell<u32> = RefCell::new(0);
+    static CHECKPOINT_PC: RefCell<u32> = const { RefCell::new(0) };
 }
 
 struct Args {
     oracle_bin: PathBuf,
     state_path: PathBuf,
     rom_path: Option<PathBuf>,
+    step_limit: u64,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut oracle_bin = None;
     let mut state_path = None;
     let mut rom_path = None;
+    let mut step_limit = 2_000_000u64;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -88,6 +93,12 @@ fn parse_args() -> Result<Args, String> {
             "--oracle" => oracle_bin = args.next().map(PathBuf::from),
             "--state" => state_path = args.next().map(PathBuf::from),
             "--rom" => rom_path = args.next().map(PathBuf::from),
+            "--step-limit" => {
+                step_limit = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--step-limit requires a numeric value")?;
+            }
             other => return Err(format!("unrecognized argument: {other}")),
         }
     }
@@ -96,6 +107,7 @@ fn parse_args() -> Result<Args, String> {
         oracle_bin: oracle_bin.ok_or("missing required --oracle <path to built oracle binary>")?,
         state_path: state_path.ok_or("missing required --state <path to .stN savestate>")?,
         rom_path,
+        step_limit,
     })
 }
 
@@ -104,9 +116,7 @@ fn main() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}");
-            eprintln!(
-                "usage: lockstep --oracle <path> --state <path.stN> [--rom <path>]"
-            );
+            eprintln!("usage: lockstep --oracle <path> --state <path.stN> [--rom <path>]");
             std::process::exit(2);
         }
     };
@@ -119,7 +129,10 @@ fn main() {
         std::process::exit(2);
     }
     if !args.state_path.exists() {
-        eprintln!("error: savestate not found at {}", args.state_path.display());
+        eprintln!(
+            "error: savestate not found at {}",
+            args.state_path.display()
+        );
         std::process::exit(2);
     }
 
@@ -142,12 +155,19 @@ fn main() {
     match fn64_diff::resolve_entry_point(resume_pc, &[(entry_vram, section_size)]) {
         fn64_diff::ResolvedEntry::EnclosingFunction { .. } => {}
         other => {
-            eprintln!("warning: resolve_entry_point returned unexpected {other:?}, proceeding anyway");
+            eprintln!(
+                "warning: resolve_entry_point returned unexpected {other:?}, proceeding anyway"
+            );
         }
     }
 
     let section_idx = unsafe {
-        fn64_abi::register_section(0, entry_vram, section_size, &[(0u32, 0u32, stand_in_target)])
+        fn64_abi::register_section(
+            0,
+            entry_vram,
+            section_size,
+            &[(0u32, 0u32, stand_in_target)],
+        )
     };
     fn64_abi::set_section_loaded(section_idx);
 
@@ -165,6 +185,7 @@ fn main() {
 
     // --- Step 2: for each fn64 checkpoint, ask the oracle for ground truth ---
     let mut client = OracleClient::new(&args.oracle_bin, &args.state_path);
+    client.step_limit = args.step_limit;
     if let Some(rom) = &args.rom_path {
         client = client.with_rom(rom);
     }
@@ -181,7 +202,11 @@ fn main() {
                 let result = compare_checkpoint(&checkpoint, &reference);
                 println!(
                     "{}",
-                    if result.is_match() { "MATCH" } else { "DIVERGED" }
+                    if result.is_match() {
+                        "MATCH"
+                    } else {
+                        "DIVERGED"
+                    }
                 );
                 report.push(checkpoint, result);
             }

@@ -26,9 +26,16 @@ fn main() {
         snap.cp0[8],
         snap.cp0[9],
     );
-    println!("resume_pc() (what state transplant should use): {:#010x}", snap.resume_pc());
+    println!(
+        "resume_pc() (what state transplant should use): {:#010x}",
+        snap.resume_pc()
+    );
 
-    for (i, (name, value)) in savestate::GPR_NAMES.iter().zip(snap.gprs.iter()).enumerate() {
+    for (i, (name, value)) in savestate::GPR_NAMES
+        .iter()
+        .zip(snap.gprs.iter())
+        .enumerate()
+    {
         print!("{name}={:#010x}  ", *value as u32);
         if i % 8 == 7 {
             println!();
