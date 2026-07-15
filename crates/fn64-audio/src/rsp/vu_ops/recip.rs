@@ -19,7 +19,7 @@
 
 use crate::rsp::ops::{OpInvocation, OpStatus, VuOp};
 use crate::rsp::tables::{rcp_seed, rsq_seed};
-use crate::rsp::vu::{clamp_signed, element_select, scalar_source_lane, VuState, LANES};
+use crate::rsp::vu::{clamp_signed, element_select, scalar_source_lane, VuState};
 
 // ---------------------------------------------------------------------------
 // §6.10 VMOV — move one element/lane
