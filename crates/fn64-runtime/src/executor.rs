@@ -340,12 +340,22 @@ impl Executor {
     }
 
     fn queue_mut(&mut self, mq_addr: RdramAddr) -> &mut MesgQueue {
-        self.queues.get_mut(&mq_addr.offset()).unwrap_or_else(|| {
-            panic!(
-                "queue at rdram offset {:#x} used before osCreateMesgQueue",
-                mq_addr.offset()
-            )
-        })
+        // An untracked queue is one the guest never passed to
+        // `osCreateMesgQueue` -- i.e. a bzero'd `OSMesgQueue` struct used
+        // directly. Real libultra honors such a queue as zero-capacity
+        // (`msgCount == 0`): every NOBLOCK send finds it full (-1), every
+        // NOBLOCK recv finds it empty (-1). OoT's audio driver relies on
+        // exactly this for `gAudioCtx.asyncLoadUnkMediumQueue`, which the
+        // decomp never creates (`audio/internal/load.c:1652,1717-1718`). Lazily
+        // install a zero-capacity queue rather than panicking, so we execute
+        // that real behavior faithfully instead of aborting. See
+        // `MesgQueue::zero_capacity`'s doc comment. A genuine harness gap
+        // (a queue that SHOULD have been created with capacity) still surfaces
+        // as its own downstream symptom, not a masked no-op, because a
+        // wrongly-zero-capacity queue makes every send/recv fail visibly.
+        self.queues
+            .entry(mq_addr.offset())
+            .or_insert_with(MesgQueue::zero_capacity)
     }
 
     // ---- osSetEventMesg / external event injection ----------------------
@@ -1102,6 +1112,44 @@ mod tests {
             read_i32(&rdram, base + 0x08) < read_i32(&rdram, base + 0x10),
             "a partially-filled queue MUST NOT read as full (the bug: it always did)"
         );
+    }
+
+    /// Regression: a queue the guest NEVER passed to `osCreateMesgQueue` (a
+    /// bzero'd `OSMesgQueue` struct used directly) must behave as a real
+    /// zero-capacity queue: NOBLOCK send finds it full (dropped), NOBLOCK recv
+    /// finds it empty (would-block) -- BOTH returning the -1 the guest relies
+    /// on. OoT's audio driver depends on exactly this for
+    /// `gAudioCtx.asyncLoadUnkMediumQueue`, which the decomp never creates and
+    /// only ever NOBLOCK-sends/recvs (`audio/internal/load.c:1652,1717-1718`).
+    ///
+    /// Fail-against-bug: before the `queue_mut` lazy-zero-capacity fix, the
+    /// FIRST touch of such a queue PANICKED ("used before osCreateMesgQueue"),
+    /// aborting the whole boot at ~VI swap 2 the moment the (newly un-stubbed)
+    /// audio load path ran. This test would have panicked instead of asserting.
+    #[test]
+    fn untracked_queue_behaves_as_zero_capacity_not_a_panic() {
+        let mut exec = Executor::new();
+        // A queue address that was NEVER created via osCreateMesgQueue.
+        let q = RdramAddr::from_offset(0x4321);
+
+        // NOBLOCK send: a zero-capacity queue is always full -> dropped, not a
+        // panic, not a fake "delivered".
+        assert_eq!(
+            exec.send_mesg(0, q, 0xDEAD, /* blocking */ false),
+            SendMesgOutcome::DroppedWouldBlock,
+            "NOBLOCK send to an untracked (bzero'd) queue must report full/dropped (guest -1)"
+        );
+
+        // NOBLOCK recv: a zero-capacity queue is always empty -> would-block.
+        assert_eq!(
+            exec.recv_mesg(0, q, /* blocking */ false),
+            RecvMesgOutcome::WouldBlock,
+            "NOBLOCK recv from an untracked (bzero'd) queue must report empty (guest -1)"
+        );
+
+        // The lazy install must be genuinely zero-capacity, so it can never
+        // silently accept a message a real bzero'd queue would have rejected.
+        assert_eq!(exec.queue_capacity(q), 0, "untracked queue must be zero-capacity");
     }
 
     /// Without a registered rdram base (unit-test executors that never boot a
