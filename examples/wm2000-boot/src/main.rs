@@ -190,9 +190,22 @@ fn main() {
     }
 
     // rdram: this process's one shared buffer (docs/DESIGN.md section 3).
+    // Sized to also cover the `0xA4xxxxxx` hardware-register window
+    // (`fn64_runtime::RDRAM_MMIO_WINDOW_END`), not just plain RDRAM content
+    // -- this is the fix for the exact crash this harness hit: a raw guest
+    // `lw` at `AI_STATUS` (`0xA450000C`) previously read 4x past an 8 MB
+    // buffer's end (`docs/BOOT-NOTES-WM2000.md`'s LLDB-confirmed
+    // `EXC_BAD_ACCESS`). See `fn64_runtime::mmio`'s module doc for the full
+    // story.
     const RDRAM_SIZE: usize = 8 * 1024 * 1024;
-    let mut rdram = vec![0u8; RDRAM_SIZE];
+    let mut rdram = vec![0u8; RDRAM_SIZE.max(fn64_runtime::RDRAM_MMIO_WINDOW_END as usize)];
     let rdram_ptr = rdram.as_mut_ptr();
+
+    // Prime the MMIO backing bytes before the guest ever runs, so even a
+    // raw load before any host-side register mutation observes the real
+    // idle-hardware defaults (e.g. AI_STATUS not-busy/not-full,
+    // SP_STATUS halted+broke) rather than zeroed memory.
+    unsafe { fn64_abi::sync_mmio_into_rdram(rdram_ptr) };
 
     println!("[wm2000-boot] booting thread 0 (recomp_entrypoint)...");
     unsafe {
@@ -233,6 +246,13 @@ fn main() {
             );
             break;
         }
+        // Re-sync the MMIO model's current values into rdram's real bytes
+        // before every step: a coroutine resumed by this step may issue a
+        // raw guest MMIO load (see this file's earlier comment on
+        // RDRAM_SIZE) at any point, and register state like AI_STATUS's
+        // one-shot busy bit can change between steps via an `osAiXxx_recomp`
+        // shim call the PREVIOUS step made.
+        unsafe { fn64_abi::sync_mmio_into_rdram(rdram_ptr) };
         let stepped = fn64_abi::run_one_step();
         steps += 1;
         if steps % LOG_EVERY == 0 {

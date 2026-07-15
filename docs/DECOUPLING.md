@@ -131,3 +131,37 @@ adapter makes the *dependency* swappable immediately (one crate knows the fork),
 lets both games keep climbing on the working fork, and gives the eventual native
 build a ready-made test harness to prove itself against. Decoupled today,
 rebuilt correctly on our schedule.
+
+---
+
+## Crate plan (2026-07-14) — what earns a crate, what doesn't
+
+A crate marks a **swap boundary** (backend you can replace) or a **cross-tool shared type**.
+Not a topic. MMIO / save / libultra are modules *inside* `fn64-runtime`, not crates.
+
+**Exists:** fn64-runtime, fn64-abi, fn64-render (trait), fn64-render-rt64 (RT64 stub + reference
+raster), fn64-shell.
+
+**To add, prioritized:**
+1. **fn64-audio** — the `AudioBackend` trait (consume AI samples → host stream) + a cpal backend +
+   the RSPRecomp'd-ucode path behind it. Symmetric with fn64-render. Land the audio work AS this
+   crate, not scattered into fn64-abi/runtime. (Refactor wave, on a green tree.)
+2. **fn64-recomp** — the Recompiler adapter trait (see top of this doc). Overdue: N64Recomp
+   shell-out still lives in aki-recomp/aki_profile. Home for fn64-recomp-native later.
+3. **fn64-shell promotion** — NOT a new crate: move the common boot-host logic (load ROM → register
+   sections → install rdram → run entrypoint → drive backends) out of examples/{wm2000,oot}-boot
+   into fn64-shell so the examples become thin mains and the shell is a real product binary.
+4. **fn64-trace** — extract the differential-trace types (thread switch / queue op / DMA / task
+   submit) from fn64-runtime WHEN the A/B comparator exists (a cross-tool shared type). Not before.
+5. **fn64-cpu / semantics spec** — the recomp_context + MEM/sign-extension/COP1 contract that
+   translated instructions target. Extract WHEN fn64-recomp-native starts (it must emit against a
+   spec, not fn64-abi's incidental layout). Not before.
+
+**Deliberately NOT fn64 crates:** the game-profile toolchain (AKI-specific, stays in aki-recomp
+until proven general — keeps fn64 game-agnostic); fn64-mmio / fn64-save (runtime modules, not
+boundaries); fn64-libultra (inseparable from the executor).
+
+**Orchestration rule learned the hard way (2026-07-14):** serialize waves that edit the same
+crate's source. fn64-abi is a shared chokepoint; render + bulk-shim ran parallel on it and left
+the tree non-compiling. Boot ladders and per-game profiles are naturally disjoint; shared fn64
+crates are not — one wave at a time on fn64-abi.

@@ -13,4 +13,5 @@ path = "src/main.rs"
 [dependencies]
 fn64-runtime = { path = "../fn64-runtime" }
 fn64-abi = { path = "../fn64-abi" }
-fn64-rt64 = { path = "../fn64-rt64" }
+fn64-render = { path = "../fn64-render" }
+fn64-render-rt64 = { path = "../fn64-render-rt64" }

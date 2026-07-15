@@ -1,0 +1,11 @@
+[package]
+name = "fn64-render-rt64"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RenderBackend adapter over the MIT RT64 fork (C++, quarantined here) plus a headless reference software backend. See README.md, docs/DESIGN.md section 1, docs/DECOUPLING.md."
+
+[dependencies]
+fn64-runtime = { path = "../fn64-runtime" }
+fn64-render = { path = "../fn64-render" }

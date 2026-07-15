@@ -11,11 +11,13 @@
 
 pub mod executor;
 pub mod mesgqueue;
+pub mod mmio;
 pub mod overlay;
 pub mod peripherals;
 pub mod rdram;
 pub mod rom;
 pub mod rsp;
+pub mod save;
 pub mod si;
 pub mod thread;
 pub mod timer;
@@ -24,11 +26,16 @@ pub mod vi;
 
 pub use executor::{Executor, ExternalEvent, RecvMesgOutcome, SendMesgOutcome};
 pub use mesgqueue::{Mesg, MesgQueue, RecvResult, SendResult};
+pub use mmio::{
+    is_mmio_offset, AiRegs, MmioSpace, AI_STATUS_BUSY, AI_STATUS_FULL, RDRAM_MMIO_WINDOW_END,
+    RDRAM_MMIO_WINDOW_START,
+};
 pub use overlay::{FuncEntry, Section, SectionIndex, SectionRegistry};
 pub use peripherals::Peripherals;
 pub use rdram::{Rdram, RdramAddr};
 pub use rom::{DmaCompletion, InMemoryRom, PiDma, RomStorage};
 pub use rsp::{OsTaskHeader, TaskLog, M_AUDTASK, M_GFXTASK};
+pub use save::{FileSaveStorage, InMemorySaveStorage, SaveStorage, SaveType};
 pub use si::{PifModel, PortState, CONT_ABSENT, CONT_CARD_ON, CONT_TYPE_STANDARD};
 pub use thread::{GameThread, Priority, Resume, RunToken, ThreadState, Yield, OS_PRIORITY_IDLE};
 pub use timer::{TimerId, TimerWheel};

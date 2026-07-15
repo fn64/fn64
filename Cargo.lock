@@ -32,13 +32,20 @@ name = "fn64-abi"
 version = "0.0.0"
 dependencies = [
  "corosensei",
+ "fn64-render",
+ "fn64-render-rt64",
  "fn64-runtime",
 ]
 
 [[package]]
-name = "fn64-rt64"
+name = "fn64-render"
+version = "0.0.0"
+
+[[package]]
+name = "fn64-render-rt64"
 version = "0.0.0"
 dependencies = [
+ "fn64-render",
  "fn64-runtime",
 ]
 
@@ -54,7 +61,8 @@ name = "fn64-shell"
 version = "0.0.0"
 dependencies = [
  "fn64-abi",
- "fn64-rt64",
+ "fn64-render",
+ "fn64-render-rt64",
  "fn64-runtime",
 ]
 
