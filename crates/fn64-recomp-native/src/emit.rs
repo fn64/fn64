@@ -999,7 +999,9 @@ fn emit_control_transfer(
             }
         }
         Jal { .. } => {
-            // Link: $ra = address after the delay slot.
+            // Link: $ra = address after the delay slot. Emit the address as a
+            // `u32` literal + `as i32` so a high (bit-31-set) return address
+            // like 0x80002008 is not an out-of-range `i32` literal.
             let _ = writeln!(out, "            ctx.set_r32(31, {:#010X}u32 as i32);", fallthrough);
             emit_delay(out);
             let t = target.unwrap();

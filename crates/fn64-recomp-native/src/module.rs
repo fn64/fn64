@@ -36,13 +36,6 @@ use std::collections::HashMap;
 
 use crate::emit::{emit_function_resolved, CallResolver, CallTarget, FuncInput};
 
-/// A resolved function symbol: its recompiled Rust name and its entry vram.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SymbolEntry {
-    pub name: String,
-    pub vram: u32,
-}
-
 /// A `vram -> function name` resolver built from a whole config's symbol table.
 ///
 /// Implements [`CallResolver`] so the emitter can turn `JAL`/`J` targets into
