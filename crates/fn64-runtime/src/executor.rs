@@ -742,7 +742,7 @@ impl Executor {
                             thread.set_state(ThreadState::BlockedOnSend);
                         }
                         self.record_queue_op(mq_addr, QueueOpKind::Block, id);
-                        self.queue_mut(mq_addr).block_sender(id);
+                        self.queue_mut(mq_addr).block_sender(id, msg);
                     }
                     SendOutcome::Blocked => {
                         // OS_MESG_NOBLOCK on a full queue: dropped, never

@@ -807,6 +807,23 @@ const OS_MESG_BLOCK: u64 = 1;
 pub unsafe extern "C" fn osRecvMesg_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &*ctx };
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
+    // Correction (2026-07-14): check the RAW register for null, not the
+    // translated `RdramAddr`. A real `msg == NULL` call (public libultra
+    // manual's documented "pass NULL to just wait, discarding the message"
+    // form -- OoT's own boot path uses exactly this: `DmaMgr_DmaRomToRam`'s
+    // real call site, `games/OOTU/RecompiledFuncs/funcs_0.c:975-980`, is
+    // `osRecvMesg(s6, a1=0, 1)`) has `ctx.r5 == 0`, but
+    // `RdramAddr::from_gpr(0)` computes `0u64.wrapping_sub(0xFFFFFFFF80000000)`,
+    // which is `0x8000_0000`, NOT `0` -- the OLD `msg_out_addr.offset() !=
+    // 0` guard below never actually caught a real null pointer, so this
+    // shim wrote the delivered message to rdram OFFSET 0x8000_0000 (a real
+    // out-of-bounds write for any buffer smaller than that, and a silent
+    // wrong-address write even for large enough buffers) every time a real
+    // ROM legitimately passed NULL. First caught by `examples/oot-boot`'s
+    // real boot run (`osRecvMesg_recomp` SIGSEGV at rdram offset
+    // 0x8000_0000-ish inside `DmaMgr_Init`, thread 1's very first blocking
+    // receive). Fixed by testing the UNTRANSLATED register value for zero.
+    let msg_out_is_null = ctx.r5 == 0;
     let msg_out_addr = RdramAddr::from_gpr(ctx.r5);
     let may_block = ctx.r6 == OS_MESG_BLOCK;
 
@@ -820,7 +837,7 @@ pub unsafe extern "C" fn osRecvMesg_recomp(rdram: *mut u8, ctx: *mut RecompConte
     };
 
     if let Some(msg) = delivered {
-        if msg_out_addr.offset() != 0 {
+        if !msg_out_is_null {
             let o = msg_out_addr.offset() as usize;
             // Native byte order, matching MEM_W's real semantics -- see
             // `read_stack_word`'s doc comment for the full correction this

@@ -18,9 +18,30 @@
 //!    and `resume` requires one by value, consumed for the duration of the
 //!    call via a borrow that can't be reentered (see its doc comment).
 
+use corosensei::stack::DefaultStack;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 
 use crate::trace::ThreadId;
+
+/// Native machine-stack size for each `GameThread`'s coroutine.
+/// `corosensei::stack::DefaultStack`'s own `Default` impl (what
+/// `Coroutine::new` used before this constant existed) is a hardcoded 1 MiB
+/// -- fine for the smaller AKI titles' `RecompiledFuncs` corpora, but OoT's
+/// decomp-driven recompile (a much larger, more deeply-nested C call graph;
+/// N64Recomp's goto-based codegen keeps every translated function's full
+/// MIPS stack frame as native locals, so a deep libultra call chain'S
+/// native stack usage is proportionally larger too) blew this 1 MiB budget:
+/// `DmaMgr_ThreadEntry` -> `DmaMgr_ProcessRequest` -> `DmaMgr_DmaRomToRam`
+/// crashed with a corrupted return address (PC jumping to `0x0`/`0x1`)
+/// inside `Executor::run_one_step`'s `resume()` call, the classic signature
+/// of a stack overflow that ran past `DefaultStack`'s guard page before the
+/// fault was raised (ARM64/macOS does not always fault cleanly on the exact
+/// guard-page boundary under heavy stack pressure). 8 MiB matches a
+/// generous native-OS-thread default and is cheap (one mmap per
+/// `GameThread`, reclaimed on thread death) -- not tuned to a measured
+/// high-water mark, just large enough that this failure mode stopped
+/// reproducing across repeated OoT boot runs.
+const COROUTINE_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 /// libultra priority: `osCreateThread`'s `pri` argument / `osSetThreadPri`.
 /// A plain newtype rather than a bare `i32` so a call site can't
@@ -171,9 +192,13 @@ impl GameThread {
             id,
             priority,
             state: ThreadState::Stopped,
-            coroutine: Some(Coroutine::new(move |yielder, first_input| {
-                body(yielder, first_input);
-            })),
+            coroutine: Some(Coroutine::with_stack(
+                DefaultStack::new(COROUTINE_STACK_SIZE)
+                    .expect("failed to allocate GameThread coroutine stack"),
+                move |yielder, first_input| {
+                    body(yielder, first_input);
+                },
+            )),
         }
     }
 

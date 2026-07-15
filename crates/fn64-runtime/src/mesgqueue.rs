@@ -58,6 +58,44 @@ impl BlockedList {
     }
 }
 
+/// Same FIFO shape as `BlockedList`, but for blocked SENDERS: a blocked
+/// sender is waiting to hand off a specific `Mesg` payload, not just an
+/// identity, so the queue must remember what to actually enqueue once a
+/// slot frees. Fixes a real bug this session's OoT boot run hit: the
+/// previous `BlockedList`-based sender queue woke a blocked sender with
+/// `Resume::SendUnblocked` (see `executor.rs`'s `try_deliver_recv`) with NO
+/// corresponding write of that sender's message into the queue's buffer --
+/// silently dropping the message, and leaving `valid_count`/`first`
+/// inconsistent with what both threads believed had happened. A later
+/// `osRecvMesg` on the same queue could then hand a caller garbage/stale
+/// buffer contents believing a real send had occurred -- observed as an
+/// eventual wild jump (PC into unmapped memory) deep inside unrelated
+/// recompiled code that trusted the delivered `Mesg` as a valid pointer/
+/// index.
+#[derive(Default)]
+struct BlockedSenderList {
+    waiters: Vec<(CoroutineId, Mesg)>,
+}
+
+impl BlockedSenderList {
+    fn push(&mut self, id: CoroutineId, msg: Mesg) {
+        self.waiters.push((id, msg));
+    }
+
+    /// FIFO pop, matching libultra's documented per-queue delivery order.
+    fn pop(&mut self) -> Option<(CoroutineId, Mesg)> {
+        if self.waiters.is_empty() {
+            None
+        } else {
+            Some(self.waiters.remove(0))
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.waiters.is_empty()
+    }
+}
+
 /// Outcome of `MesgQueue::try_send`. `WouldBlock` carries no coroutine
 /// registration itself -- per `docs/DESIGN.md` section 2, the caller (the
 /// `fn64-abi` shim, running as the current coroutine) is responsible for
@@ -85,7 +123,7 @@ pub struct MesgQueue {
     valid_count: usize,
     first: usize,
     blocked_on_recv: BlockedList,
-    blocked_on_send: BlockedList,
+    blocked_on_send: BlockedSenderList,
 }
 
 impl MesgQueue {
@@ -99,7 +137,7 @@ impl MesgQueue {
             valid_count: 0,
             first: 0,
             blocked_on_recv: BlockedList::default(),
-            blocked_on_send: BlockedList::default(),
+            blocked_on_send: BlockedSenderList::default(),
         }
     }
 
@@ -141,23 +179,42 @@ impl MesgQueue {
     }
 
     /// Register the current coroutine as blocked waiting to send (queue
-    /// was full). Called by the `fn64-abi` shim after `try_send` returns
-    /// `WouldBlock`, immediately before yielding to the executor -- see
-    /// module doc: registration and yield are sequential steps on the one
-    /// executor thread, never two threads racing this list.
-    pub fn block_sender(&mut self, id: CoroutineId) {
-        self.blocked_on_send.push(id);
+    /// was full), remembering the `Mesg` payload it was trying to send --
+    /// `try_send` never got to run for this message (the queue was full),
+    /// so it must be replayed by `wake_one_sender` once space frees; see
+    /// that method's doc comment. Called by the `fn64-abi` shim after
+    /// `try_send` returns `WouldBlock`, immediately before yielding to the
+    /// executor -- see module doc: registration and yield are sequential
+    /// steps on the one executor thread, never two threads racing this
+    /// list.
+    pub fn block_sender(&mut self, id: CoroutineId, msg: Mesg) {
+        self.blocked_on_send.push(id, msg);
     }
 
     pub fn block_receiver(&mut self, id: CoroutineId) {
         self.blocked_on_recv.push(id);
     }
 
-    /// Called by the executor after a `try_send`/`try_recv` succeeds, to
-    /// find the next waiter (if any) that should be woken because the
-    /// queue's full/empty state just changed.
+    /// Called by the executor after a `try_recv` succeeds (freeing a slot),
+    /// to find the next blocked sender (if any) and actually deliver its
+    /// message into the now-free slot -- this is the real hand-off a
+    /// blocked `osSendMesg` was waiting on, not just a wakeup notification.
+    /// Returns the woken coroutine's id so the executor can resume it with
+    /// `Resume::SendUnblocked`. Panics if the just-freed slot somehow can't
+    /// accept the message (`try_send` failing here would mean this
+    /// queue's `valid_count`/blocked-list bookkeeping is already
+    /// inconsistent -- a real bug, not a legitimate runtime state, since
+    /// the caller only invokes this after confirming
+    /// `has_blocked_senders()` following a successful `try_recv`).
     pub fn wake_one_sender(&mut self) -> Option<CoroutineId> {
-        self.blocked_on_send.pop()
+        let (id, msg) = self.blocked_on_send.pop()?;
+        assert_eq!(
+            self.try_send(msg),
+            SendResult::Delivered,
+            "wake_one_sender: freed slot rejected the blocked sender's message -- queue \
+             bookkeeping is inconsistent"
+        );
+        Some(id)
     }
 
     pub fn wake_one_receiver(&mut self) -> Option<CoroutineId> {
@@ -203,7 +260,7 @@ mod tests {
         let mut q = MesgQueue::new(1);
         assert_eq!(q.try_send(1), SendResult::Delivered);
         assert_eq!(q.try_send(2), SendResult::WouldBlock);
-        q.block_sender(42);
+        q.block_sender(42, 2);
         assert!(q.has_blocked_senders());
 
         // Executor's job: a recv frees a slot, then wake a blocked sender.
@@ -211,5 +268,27 @@ mod tests {
         let woken = q.wake_one_sender();
         assert_eq!(woken, Some(42));
         assert!(!q.has_blocked_senders());
+    }
+
+    /// The bug this session's OoT boot run actually hit: a blocked
+    /// sender's message must be REALLY delivered into the queue, not just
+    /// have its coroutine woken -- a later recv must see it, not stale/
+    /// leftover buffer contents.
+    #[test]
+    fn blocked_sender_message_is_actually_delivered() {
+        let mut q = MesgQueue::new(1);
+        assert_eq!(q.try_send(0xAAAA), SendResult::Delivered);
+        assert_eq!(q.try_send(0xBBBB), SendResult::WouldBlock);
+        q.block_sender(7, 0xBBBB);
+
+        // First recv drains the original message and wakes the blocked
+        // sender, which must land ITS message (0xBBBB) into the queue.
+        assert_eq!(q.try_recv(), RecvResult::Delivered(0xAAAA));
+        assert_eq!(q.wake_one_sender(), Some(7));
+
+        // A second recv must now see the previously-blocked sender's real
+        // message, not 0 (the old, silently-dropped-message bug) or any
+        // other stale value.
+        assert_eq!(q.try_recv(), RecvResult::Delivered(0xBBBB));
     }
 }
