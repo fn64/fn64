@@ -3046,21 +3046,61 @@ pub unsafe extern "C" fn osSpTaskLoad_recomp(rdram: *mut u8, ctx: *mut RecompCon
 }
 
 /// `osSpTaskStartGo(OSSpTask *sptask)` -- the actual RSP-kickoff half of
-/// the pair `osSpTaskLoad_recomp` above bookkeeps. Since this crate's
-/// dispatch model runs a task's real effect (audio ucode call / gfx
-/// backend dispatch) synchronously at `osSpTaskYielded_recomp`, not at
-/// `osSpTaskLoad`/`osSpTaskStartGo` time, this shim's own real effect is
-/// intentionally limited to existing as a callable symbol with no double-
-/// dispatch -- see that function's doc comment for where the actual
-/// ucode/gfx-backend call happens. A real hardware `osSpTaskStartGo`
-/// writes RSP `SP_STATUS`/kicks execution; this crate has no separate
-/// RSP-register model to poke (same reasoning as `__osSpSetStatus_recomp`
-/// above).
+/// the pair `osSpTaskLoad_recomp` above bookkeeps. `a0` = `ctx->r4` is the
+/// `OSTask*` (same pointer shape `osSpTaskLoad`/`osSpTaskYielded` read).
+///
+/// This crate's dispatch model runs a task's real effect (audio ucode
+/// call / gfx backend dispatch) synchronously at `osSpTaskYielded_recomp`,
+/// so there is deliberately no double-dispatch here. What a real
+/// `osSpTaskStartGo` DOES have that this stub was missing: kicking the RSP
+/// eventually raises the SP-done interrupt (and, for a task that drives the
+/// RDP to a `DPFullSync`, the DP-done interrupt), which libultra delivers
+/// as `OS_EVENT_SP` (=4) / `OS_EVENT_DP` (=9) to whatever queue the game
+/// registered via `osSetEventMesg`.
+///
+/// OoT's Scheduler registers exactly those (`sched.c:704-705`:
+/// `osSetEventMesg(OS_EVENT_SP, &sc->interruptQueue, RSP_DONE_MSG=667)` and
+/// `osSetEventMesg(OS_EVENT_DP, &sc->interruptQueue, RDP_DONE_MSG=668)`),
+/// kicks the task here from `Sched_RunTask` (`sched.c:459`), and its
+/// `Sched_ThreadEntry` loop (`sched.c:648`) blocks on `interruptQueue`
+/// waiting for those done-messages. Without them the scheduler thread never
+/// wakes, so `Sched_TaskComplete` (`sched.c:393`) never posts to the gfx
+/// task's `msgQueue` (= `gfxCtx->queue`), so `Graph_ExecuteAndDraw`'s
+/// `osRecvMesg(&gfxCtx->queue, ...)` (`graph.c:234`) blocks forever and
+/// `osViSwapBuffer` (`graph.c:76/78`, via `Sched_SwapFrameBuffer`) is never
+/// reached. Injecting the completion event(s) here closes that gap.
+///
+/// We inject SP-done for every task (any RSP task raises it), and DP-done
+/// additionally for a graphics task (`M_GFXTASK`) -- OoT's gfx task sets
+/// `OS_SC_NEEDS_RDP` (`graph.c:309`) and its scheduler blocks on BOTH
+/// `Sched_TaskComplete`'s `!(state & (OS_SC_DP | OS_SC_SP))` (`sched.c:397`)
+/// before posting the wake. Both events are guarded by
+/// `event_table_contains` so a task submitted before the game registered
+/// the event (or a game/test that never registers it) is a silent skip, not
+/// a panic -- matching `osContStartQuery_recomp`'s `OS_EVENT_SI` guard.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn osSpTaskStartGo_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
+pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
+    const OS_EVENT_SP: u32 = 4; // ultra64/message.h: SP task-done interrupt
+    const OS_EVENT_DP: u32 = 9; // ultra64/message.h: DP full-sync interrupt
+
+    let ctx = unsafe { &*ctx };
+    let task_addr = RdramAddr::from_gpr(ctx.r4);
+    let o = task_addr.offset() as usize;
+    let header = unsafe { read_os_task_header(rdram, o) };
+    let is_gfx = header.task_type == M_GFXTASK;
+
+    with_executor(|exec| {
+        if exec.event_table_contains(OS_EVENT_SP) {
+            exec.inject_event(ExternalEvent::OsEvent(OS_EVENT_SP));
+        }
+        if is_gfx && exec.event_table_contains(OS_EVENT_DP) {
+            exec.inject_event(ExternalEvent::OsEvent(OS_EVENT_DP));
+        }
+    });
+}
 
 /// `osSpTaskYield(void)` -- signals the RSP to yield its current task back
 /// to the CPU, returning immediately (asynchronous request, not a
@@ -4290,6 +4330,118 @@ mod tests {
         with_executor(|exec| {
             assert_eq!(exec.task_log().gfx_count(), 1);
             assert_eq!(exec.task_log().audio_count(), 0);
+        });
+    }
+
+    /// Regression for the "gfx task submitted, framebuffer never swaps"
+    /// deadlock: `osSpTaskStartGo_recomp` MUST post the SP-done (and, for a
+    /// graphics task, the DP-done) completion event to whatever queue the
+    /// game registered via `osSetEventMesg`, mirroring OoT's Scheduler
+    /// (`sched.c:704-705`: `osSetEventMesg(OS_EVENT_SP, &interruptQueue,
+    /// RSP_DONE_MSG=667)` / `osSetEventMesg(OS_EVENT_DP, ..., RDP_DONE_MSG=
+    /// 668)`). Without these, `Sched_ThreadEntry`'s `osRecvMesg` on
+    /// `interruptQueue` (`sched.c:656`) never wakes, `Sched_TaskComplete`
+    /// (`sched.c:393`) never posts to `gfxCtx->queue`, and
+    /// `Graph_ExecuteAndDraw`'s `osRecvMesg` (`graph.c:234`) blocks forever
+    /// -> `osViSwapBuffer` is never reached (observed as `vi_swaps=0` in
+    /// `examples/oot-boot`).
+    ///
+    /// The prior stub was an empty `{}`, so reintroducing it (delete the
+    /// two `inject_event` calls) makes both `recv_mesg` asserts below fail
+    /// with `WouldBlock` -- verified by hand before committing, not a
+    /// green-against-the-bug check.
+    #[test]
+    fn os_sp_task_start_go_posts_sp_and_dp_completion_to_registered_queue() {
+        // OoT's real event->message mapping (sched.c).
+        const OS_EVENT_SP: u32 = 4;
+        const OS_EVENT_DP: u32 = 9;
+        const RSP_DONE_MSG: u32 = 667;
+        const RDP_DONE_MSG: u32 = 668;
+
+        // A distinct queue address so this test can't collide with the
+        // shared thread-local executor's other queues (same isolation
+        // rationale as the rung tests' hand-picked addresses).
+        let interrupt_q = RdramAddr::from_offset(0x0009_0000);
+        with_executor(|exec| {
+            exec.create_mesg_queue(interrupt_q, 4);
+            exec.set_event_mesg(OS_EVENT_SP, interrupt_q, RSP_DONE_MSG);
+            exec.set_event_mesg(OS_EVENT_DP, interrupt_q, RDP_DONE_MSG);
+        });
+
+        // A graphics task header (M_GFXTASK at +0x0), read from ctx.r4 the
+        // same way the real `Sched_RunTask` call site passes `&spTask->list`.
+        let mut rdram = vec![0u8; 128];
+        let header_off = 0x10usize;
+        rdram[header_off..header_off + 4]
+            .copy_from_slice(&fn64_runtime::M_GFXTASK.to_ne_bytes());
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + header_off as u64;
+
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // Both completion messages must now be sitting in the registered
+        // queue, in SP-then-DP order (RSP finishes before RDP). A dummy
+        // receiver id (99) drains them non-blocking; no thread was blocked,
+        // so delivery comes straight from the ring buffer.
+        with_executor(|exec| {
+            assert_eq!(
+                exec.recv_mesg(99, interrupt_q, false),
+                RecvMesgOutcome::Delivered(RSP_DONE_MSG),
+                "osSpTaskStartGo must post OS_EVENT_SP -> RSP_DONE_MSG"
+            );
+            assert_eq!(
+                exec.recv_mesg(99, interrupt_q, false),
+                RecvMesgOutcome::Delivered(RDP_DONE_MSG),
+                "a graphics task's osSpTaskStartGo must ALSO post OS_EVENT_DP -> RDP_DONE_MSG"
+            );
+            // Nothing else was posted.
+            assert_eq!(
+                exec.recv_mesg(99, interrupt_q, false),
+                RecvMesgOutcome::WouldBlock,
+                "exactly two completion messages, no more"
+            );
+        });
+    }
+
+    /// A NON-graphics RSP task (e.g. `M_AUDTASK`) posts ONLY the SP-done
+    /// event, never DP-done -- OoT's audio task doesn't set OS_SC_NEEDS_RDP,
+    /// so injecting a spurious RDP_DONE_MSG would desync the scheduler's
+    /// `curRDPTask` bookkeeping. Reintroducing the `is_gfx` gate as an
+    /// unconditional DP inject makes the final `WouldBlock` assert fail.
+    #[test]
+    fn os_sp_task_start_go_audio_task_posts_only_sp() {
+        const OS_EVENT_SP: u32 = 4;
+        const OS_EVENT_DP: u32 = 9;
+        const RSP_DONE_MSG: u32 = 667;
+        const RDP_DONE_MSG: u32 = 668;
+
+        let interrupt_q = RdramAddr::from_offset(0x0009_1000);
+        with_executor(|exec| {
+            exec.create_mesg_queue(interrupt_q, 4);
+            exec.set_event_mesg(OS_EVENT_SP, interrupt_q, RSP_DONE_MSG);
+            exec.set_event_mesg(OS_EVENT_DP, interrupt_q, RDP_DONE_MSG);
+        });
+
+        let mut rdram = vec![0u8; 128];
+        let header_off = 0x10usize;
+        rdram[header_off..header_off + 4]
+            .copy_from_slice(&fn64_runtime::M_AUDTASK.to_ne_bytes());
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + header_off as u64;
+
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        with_executor(|exec| {
+            assert_eq!(
+                exec.recv_mesg(99, interrupt_q, false),
+                RecvMesgOutcome::Delivered(RSP_DONE_MSG),
+                "an audio task's osSpTaskStartGo posts OS_EVENT_SP"
+            );
+            assert_eq!(
+                exec.recv_mesg(99, interrupt_q, false),
+                RecvMesgOutcome::WouldBlock,
+                "a non-graphics task must NOT post OS_EVENT_DP"
+            );
         });
     }
 
