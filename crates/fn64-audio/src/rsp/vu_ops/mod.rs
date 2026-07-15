@@ -5,14 +5,5 @@
 //! Submodules:
 //! - [`logic`] — the bitwise family `VAND`/`VNAND`/`VOR`/`VNOR`/`VXOR`/`VNXOR`
 //!   plus `VNOP` (RSP-VU-ISA.md §6.5).
-//! - [`mac`] — the multiply-accumulate family `VMACF`/`VMACQ`/`VMADH`/`VMADM`/
-//!   `VMADN`/`VMADL` plus the accumulator reader `VSAR` (RSP-VU-ISA.md §6.2,
-//!   §6.9).
-//! - [`select`] — the compares/merge/clip family `VLT`/`VEQ`/`VNE`/`VGE`/
-//!   `VMRG`/`VCH`/`VCL`/`VCR` plus the VCC/VCO/VCE register-slice accessors
-//!   (RSP-VU-ISA.md §6.6–§6.8).
 
 pub mod logic;
-pub mod mac;
-pub mod mul_hi;
-pub mod select;
