@@ -8,9 +8,13 @@
 This document describes the **behavior** of the Nintendo 64 RSP (Reality Signal
 Processor) Vector Unit (a.k.a. CP2 / VU) instruction set, derived from public
 documentation, chiefly the public SGI *Nintendo 64 RSP Programmer's Guide*,
-Chapter 3 and the instruction appendix (especially pp. 240-245, 260-263,
-272, 285-288, and 301-314). CEN64 and MAME were consulted only to
-cross-check algorithm structure at ambiguous boundaries. Op *semantics* — what each op
+Chapter 3 and the instruction appendix (especially pp. 240-245, 259-270,
+284-288, and 300-314). The independent algorithm cross-check is the
+BSD-3-Clause [CEN64 RSP implementation pinned at
+`e0641c8`](https://github.com/n64dev/cen64/tree/e0641c8452a3ae8edcd2bf4e46794bb4eaafc076),
+with the BSD-3-Clause [MAME RSP interpreter pinned at
+`24b318e`](https://github.com/mamedev/mame/blob/24b318ed57ed4deb5638f9b8347cd8bf8a772a7b/src/devices/cpu/rsp/rsp.cpp)
+as a second check for vector memory. Op *semantics* — what each op
 computes, how the 48-bit accumulator works, the VCO/VCC/VCE flag registers,
 element selection/broadcast, and the clamp/saturation rules — are hardware
 facts, not copyrightable expression, and are restated here in our own words.
@@ -159,8 +163,9 @@ Bit `i` of each half corresponds to lane `i`. Represent as two `u8` (or one
 
 ## 4. Clamp / saturation modes
 
-Three distinct behaviors appear when extracting a result lane from a product or
-the accumulator. Implement all three as helpers:
+Four distinct behaviors appear when extracting a result lane from a product or
+the accumulator. Keep the two unsigned-looking clamps separate: neither is an
+ordinary numeric clamp to `0..=65535`.
 
 1. **Signed clamp (`clamp_signed`)** — clamp a wide signed value to
    `i16` range `[-32768, 32767]`. Used by the "F" and "H"/"M" result
@@ -168,21 +173,25 @@ the accumulator. Implement all three as helpers:
    `VSUB`, `VABS`, ...). Values above `0x7FFF` → `0x7FFF`; below `-0x8000` →
    `0x8000`.
 
-2. **Unsigned clamp (`clamp_unsigned`)** — clamp to unsigned 16-bit range but
-   with the RSP's specific rule: if the signed accumulator value is negative,
-   the result is `0x0000`; if it exceeds `0xFFFF`, the result is `0xFFFF`;
-   otherwise the low 16 bits. Used by the "U" variants (`VMULU`, `VMACU`) and by
-   the "M"/"L" *low-part* extractions where the hardware produces an unsigned
-   fraction. The exact RSP rule: take `acc[47..16]` (the top 32 bits after
-   dropping acc_lo); if that signed 32-bit value is `< 0` → `0`, if
-   `> 0xFFFF` → `0xFFFF`, else the low 16 of acc_mid. (See per-op notes.)
+2. **Fractional unsigned clamp (`clamp_unsigned`)** — used by `VMULU` and
+   `VMACU`. Inspect the signed `ACC >> 16`: negative → `0x0000`, a positive
+   value with the MD sign bit set (`> 0x7FFF`) → `0xFFFF`, otherwise return
+   MD. This follows the HI/MD sign test in CEN64's
+   [`rsp_vmacf_vmacu`](https://github.com/n64dev/cen64/blob/e0641c8452a3ae8edcd2bf4e46794bb4eaafc076/arch/x86_64/rsp/vmac.h),
+   not a numeric `u16` saturation threshold.
 
-3. **No clamp (`truncate`)** — just take the low 16 bits of the relevant
-   accumulator slice, no saturation. Used by `VMUDN`, `VMUDL`, `VMADN`,
-   `VMADL`, `VADDC`, `VSUBC`, and the logical ops.
+3. **Low-slice clamp (`clamp_unsigned_low`)** — used by `VMADN` and `VMADL`.
+   Return LO only when HI equals the sign extension of MD. On an HI/MD sign
+   mismatch, negative overflow → `0x0000` and positive overflow → `0xFFFF`.
+   This is the Guide's low-slice clamp, independently expressed by CEN64's
+   [`rsp_uclamp_acc`](https://github.com/n64dev/cen64/blob/e0641c8452a3ae8edcd2bf4e46794bb4eaafc076/arch/x86_64/rsp/clamp.h).
+
+4. **No clamp (`truncate`)** — just take the low 16 bits of the relevant
+   accumulator slice, no saturation. Used by `VMUDN`, `VMUDL`, `VADDC`,
+   `VSUBC`, and the logical ops.
 
 > The subtle part of every multiply op is precisely *which* slice of ACC the
-> result lane comes from and *which* of these three modes applies. §6 states it
+> result lane comes from and *which* of these four modes applies. §6 states it
 > per op. **Get the clamp mode and the slice right and the op is correct.**
 
 ---
@@ -269,7 +278,7 @@ These **overwrite** ACC with the product, then extract `vd`.
 **`VMULU` — unsigned variant of VMULF.**
 - Same ACC as VMULF (`(p<<1)+0x8000`, signed product).
 - `vd[i] = clamp_unsigned(ACC[i] >> 16)` (mode 2 in §4): negative → `0x0000`,
-  overflow → `0xFFFF`.
+  positive MD with bit 15 set → `0xFFFF`, otherwise MD.
 - Flags: none.
 
 **`VMULQ` — "multiply by Q" oddball.**
@@ -330,9 +339,10 @@ the existing ACC instead of overwriting, then extract `vd`.
   `vd[i] = clamp_unsigned_low(ACC[i])` — **the low-part variant clamps here!**
   VMADN/VMUDN differ: `VMUDN` truncates acc_lo (no clamp), but `VMADN`, because
   the accumulate may overflow acc_lo into acc_mid, extracts the low 16 with the
-  **unsigned-low clamp** (mode 2, §4) based on the sign of `acc[47..16]`.
-  Concretely: if signed `acc[47..16] < 0` → `0x0000`, if `> 0xFFFF` → `0xFFFF`,
-  else `acc_lo`. **(See §7 — subtle: MUDN truncates, MADN clamps.)**
+  **low-slice clamp** (mode 3, §4). Return `acc_lo` when HI is the sign
+  extension of MD; otherwise clamp negative overflow to `0x0000` and positive
+  overflow to `0xFFFF`. A sign-extended negative accumulator is in range and
+  therefore returns LO. **(See §7 — subtle: MUDN truncates, MADN clamps.)**
 - **`VMADL`** — like VMUDL (unsigned×unsigned, `>>16`): `ACC += (p >> 16)`.
   `vd[i] = clamp_unsigned_low(ACC[i])` (same unsigned-low clamp as VMADN).
   Flags: none.
@@ -607,25 +617,24 @@ lo result). Sets acc_lo to broadcast `vt_e` like VMOV.
   (integer-halved shift).
 - `VRSQH`/`VRSQL` play the same high/low latch roles as `VRCPH`/`VRCPL`.
 
-**Table generation (do this, don't copy a table):** For entry `i` in 0..512,
-compute the reciprocal seed as the value that Newton-Raphson would use for
-`1/x` at the normalized mantissa `m = 1 + i/512` (reciprocal) or `1/sqrt(m)`
-(inv-sqrt), quantized to the RSP's 16-bit fraction. The canonical published
-formula:
+**Table generation (do this, don't copy a table):** generate both ROMs with
+integer arithmetic and verify their bytes against the public combined-ROM
+anchors in CEN64's
+[`common/reciprocal.c`](https://github.com/n64dev/cen64/blob/e0641c8452a3ae8edcd2bf4e46794bb4eaafc076/common/reciprocal.c).
+The equations used by fn64 and independently by the differential oracle are:
 ```
-// reciprocal ROM
 for i in 0..512 {
-    let m = (1u64 << 10) + i as u64;                 // 10-bit mantissa 1.x
-    let val = ((1u64 << 34) / m) ;                   // reciprocal in fixed point
-    // round to 16-bit fraction, subtract the implicit leading 1
-    RCP_ROM[i] = (((val + 1) >> 8) as u16) & 0xFFFF; // (bit-exact rounding per HW)
+    let denominator = i + 512;
+    RCP_ROM[i] = ((((1 << 34) / denominator) + 1) >> 8) & 0xFFFF;
+
+    let rsq_denominator = (i >> 1) + 256;
+    RSQ_ROM[i] = (isqrt((1 << (47 + (i & 1))) / rsq_denominator) >> 3) & 0xFFFF;
 }
+RCP_ROM[0] = 0xFFFF;
+RSQ_ROM[1] = 0xFFFF;
 ```
-> The exact rounding constants of the ROM are a documented hardware detail;
-> the safest path is to **derive the table once and unit-test the first/last few
-> entries against a captured hardware/emulator reference**, since the low-bit
-> rounding is where clean-room re-derivations most often disagree. Treat the
-> two ROMs as generated constants with a golden test, not as copied data.
+The inverse-square-root table interleaves its two exponent-parity octaves:
+entries 0..7 are `6A09, FFFF, 6955, FF00, 68A1, FE02, 67EF, FD06`.
 
 Newton refinement: the RSP performs exactly **one** implicit refinement step
 baked into the table + the mantissa shift — there is no separate iterated
@@ -655,8 +664,9 @@ and pin them with dedicated per-branch tests before trusting them:
 
 3. **`VMADN` vs `VMUDN` low-part clamp** (§6.1/§6.2) — the pair that looks
    identical but differs in the result extraction: **`VMUDN` truncates** acc_lo
-   with no clamp, while **`VMADN` applies the unsigned-low clamp** (result = 0 if
-   `acc[47..16] < 0`, `0xFFFF` if `> 0xFFFF`, else acc_lo). The same
+   with no clamp, while **`VMADN` applies the low-slice clamp** (LO is returned
+   when HI sign-extends MD; an HI/MD mismatch saturates according to the HI
+   sign). The same
    truncate-vs-unsigned-clamp trap applies to `VMUDL` vs `VMADL`. Mixing these
    up produces subtly wrong low words that only surface on accumulate overflow.
 
