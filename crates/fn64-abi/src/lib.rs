@@ -95,8 +95,8 @@ use fn64_runtime::{
     RdramAddr, Resume, Section, SectionRegistry, ThreadId, Yield, M_AUDTASK, M_GFXTASK,
 };
 
-#[cfg(feature = "native-recomp")]
-pub mod native;
+#[cfg(feature = "recomp-rs")]
+pub mod recompiled;
 
 /// MIPS `recomp_context`, the REAL verbatim layout from `recomp.h` (MIT) --
 /// see module doc's "Signatures verified directly against real generated C"
@@ -227,17 +227,17 @@ struct HostState {
     /// address `osSetTimer` was given, never the `TimerWheel`-internal
     /// `TimerId` a second time.
     timer_handles: std::collections::HashMap<u32, fn64_runtime::timer::TimerId>,
-    /// Typed-Rust whole-ROM dispatcher installed by a native boot host. When
+    /// Typed-Rust whole-ROM dispatcher installed by an rs-lane boot host. When
     /// present, `osCreateThread` resolves the new OSThread's entry through
-    /// this table and owns a native `RecompContext` inside the SAME executor
+    /// this table and owns an rs-lane `RecompContext` inside the SAME executor
     /// coroutine used by the C path.
-    #[cfg(feature = "native-recomp")]
-    native_lookup: Option<fn(u32) -> fn64_recomp_native::RecompFunc>,
+    #[cfg(feature = "recomp-rs")]
+    recompiled_lookup: Option<fn(u32) -> fn64_recomp_rs::RecompFunc>,
     /// Length of the process-wide RDRAM/MMIO allocation behind `ACTIVE_RDRAM`.
-    /// Required to rebuild the checked native `Rdram` view at a spawned
+    /// Required to rebuild the checked rs-lane `Rdram` view at a spawned
     /// thread's entry without creating a second memory model or allocation.
-    #[cfg(feature = "native-recomp")]
-    native_rdram_len: usize,
+    #[cfg(feature = "recomp-rs")]
+    recompiled_rdram_len: usize,
 }
 
 impl Default for HostState {
@@ -248,10 +248,10 @@ impl Default for HostState {
             cart_rom_handle_vram: None,
             thread_handles: std::collections::HashMap::new(),
             timer_handles: std::collections::HashMap::new(),
-            #[cfg(feature = "native-recomp")]
-            native_lookup: None,
-            #[cfg(feature = "native-recomp")]
-            native_rdram_len: 0,
+            #[cfg(feature = "recomp-rs")]
+            recompiled_lookup: None,
+            #[cfg(feature = "recomp-rs")]
+            recompiled_rdram_len: 0,
         }
     }
 }
@@ -693,7 +693,7 @@ pub use thread::*;
 pub use timer::*;
 pub use vi::*;
 
-#[cfg(feature = "native-recomp")]
+#[cfg(feature = "recomp-rs")]
 pub(crate) use system::INT_MASK;
 
 #[cfg(test)]

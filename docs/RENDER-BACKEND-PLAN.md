@@ -1,7 +1,7 @@
-# Render backend plan: wrap RT64 now, build our own native plugin later
+# Render backend plan: wrap RT64 now, build our own wgpu plugin later
 
 Decision (2026-07-16): fn64 gets a **working RT64 wrapper now** for a fast
-faithful render, **and** plans a **from-scratch Rust native renderer plugin**
+faithful render, **and** plans a **from-scratch Rust/wgpu renderer plugin**
 later — the same two-step pattern that worked for the recompiler (wrap the
 mature external tool first to unblock the runtime, then replace it with a
 clean-room typed-Rust implementation behind the same seam).
@@ -26,7 +26,7 @@ Three implementations behind the one trait:
    `Interpreter::processDisplayLists(raw F3DEX2 DL)`. The fast faithful path.
    FFI quarantined to the `fn64-render-rt64` crate (the existing unsafe-audit
    boundary), MIT-only (do NOT enable the GPL-header mupen target).
-3. **`NativeBackend`** (future) — an all-Rust/wasm-capable RDP renderer, the
+3. **`WgpuBackend`** (future) — an all-Rust/wasm-capable RDP renderer, the
    eventual pure-Rust replacement. Approach (decided 2026-07-16): **PORT RT64
    to Rust, don't reimplement from scratch** — RT64 is MIT, so we can port its
    proven, accurate rendering logic directly (module by module) rather than
@@ -34,9 +34,9 @@ Three implementations behind the one trait:
    state (no C++ reinterpret bugs), fewer allocations, cleaner GPU abstraction,
    wasm/WebGPU target. Differential-tested against the RT64 wrapper the whole
    way (the C++ RT64 becomes the oracle for its own Rust port — exactly as
-   N64Recomp's C output was the oracle for fn64-recomp-native). This is the
-   "own native plugin" half — **deferred, not dropped**; wrap first, port later.
-   NOTE: this is the SAME two-backend model as everywhere else — `NativeBackend`
+   N64Recomp's C output was the oracle for fn64-recomp-rs). This is the
+   "own wgpu plugin" half — **deferred, not dropped**; wrap first, port later.
+   NOTE: this is the SAME two-backend model as everywhere else — `WgpuBackend`
    is "the pure-Rust backend when it grows RDP-accurate," not a third separate
    thing. Today's `ReferenceBackend` (software rasterizer) is its seed + the CI
    oracle; the RT64 port is how it becomes faithful.
@@ -46,10 +46,10 @@ Three implementations behind the one trait:
   emulator. De-prioritize piecemeal RDP-opcode work in ReferenceBackend (it's
   re-deriving what RT64 already does) — but keep ReferenceBackend green as the
   oracle.
-- LATER: `NativeBackend` clean-room Rust renderer, RT64-differential-gated.
+- LATER: `WgpuBackend` clean-room Rust renderer, RT64-differential-gated.
 
 This is the recompiler story retold: [[fn64-whole-rom-recomp-milestone]] wrapped
-N64Recomp, proved the runtime, then fn64-recomp-native replaced it in typed
+N64Recomp, proved the runtime, then fn64-recomp-rs replaced it in typed
 Rust. Same move for the renderer.
 
 ## Implementation status (2026-07-16)

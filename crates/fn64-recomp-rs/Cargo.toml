@@ -1,0 +1,14 @@
+[package]
+name = "fn64-recomp-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "From-scratch Rust MIPS III (VR4300) -> typed-Rust static recompiler. The type-safe Rust sibling of the N64Recomp shell-out adapter (docs/DECOUPLING.md step 5)."
+
+[dependencies]
+fn64-recomp = { path = "../fn64-recomp" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
