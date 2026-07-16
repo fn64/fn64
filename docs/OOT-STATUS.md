@@ -66,26 +66,45 @@ Ordered by leverage, from ground-truth on the reachable file-select 3D scene
 (`/tmp/fn64-depth-nodepth-opaque.png`: recognizable green field + flowers +
 road, but the top half misprojects).
 
-1. **Large-world projection — ROOT-CAUSED to a recompiler-output bug, NOT the
-   render crate (2026-07-16).** The render pipeline is CORRECT — proven 3 ways:
-   `read_mtx` is byte-identical to RT64 `FixedMatrix::fixedToFloat`; the MVP
-   compose matches RT64; the recompiled `guLookAtF` provably negates
-   (`neg.s` + dot stores). The Hyrule Field frame (VI swap ~230) projects only
-   ~8.9% in-frustum because the matrix written to the projection slot (rdram
-   0x1888c8) is a **raw camera-to-world matrix** carrying the raw eye position
-   `(3263,694,5674)` in its translation row, instead of a `guLookAt` view whose
-   translation must be `-(eye·basis) = (6496.7,-786,-711)`. A temporary
-   corrective transform took the frame **8.9%→76.5% in-frustum** and rendered a
-   **coherent, recognizable Hyrule Field** (`/tmp/fn64-lw-after.png`: green
-   field, horizon, Lon Lon Ranch, trees, fence) — proving the pipeline is right
-   once the matrix is. The true fix is UPSTREAM in **aki-recomp's recompiled
-   runtime** (a matrix-WRITE bug — needs rdram-0x1888c8 write-tracing to find
-   which recompiled fn writes raw eye instead of the guLookAt result). This is
-   very likely a **recompilation correctness bug** — folds into the whole-ROM
-   native-recomp effort (a mistranslated float/matrix op). Regression test
-   `large_world_perspective_view_model_projects_in_frustum` landed on
-   `fix/projection-largeworld-mvp` (fail-against-bug proven); the render crate
-   itself needs NO fix.
+1. **Hyrule Field title-camera projection — the claimed raw-eye matrix bug was
+   falsified by writer tracing (2026-07-16).** Physical `0x1888c8` is written
+   only by recompiled `guMtxF2L` (`funcs_57.c:3275-3344`), called by recompiled
+   `guLookAt` at `funcs_57.c:4368`. Immediately before conversion, recompiled
+   `guLookAtF` writes its translation at `funcs_57.c:4166,4251,4280`. The
+   traced inputs are eye `(-4000,-1,5228)`, at `(-4083,10,5263)`, and up
+   `(0.111461,0.992645,-0.0470212)`, supplied unchanged through
+   `Camera_Demo1` (`funcs_15.c:367-379`) → `Camera_Update`
+   (`funcs_15.c:13254`) → `View_LookAt` → `View_ApplyPerspective`
+   (`funcs_35.c:2661`). For that eye and the emitted basis, the three negated
+   dot products are exactly `(3262.99,694.05,5674.78)`. The matrix maps the
+   traced eye to the view-space origin, so it is a valid `guLookAt` view—not a
+   camera-to-world matrix. The proposed `(6496.7,-786,-711.7)` rewrite computes
+   `-translation·basis`, treating the existing translation as a second eye;
+   it moves the camera and therefore cannot validate this path. Its higher
+   76.5% loaded-vertex in-frustum ratio and recognizable overview are an
+   alternate camera view, while 8.8% is not by itself a correctness oracle
+   because the display list loads off-screen geometry. Regression
+   `hyrule_field_live_gu_look_at_translation_matches_traced_eye` locks the
+   exact traced invariant and fails under that rewrite. The remaining visual
+   artifact is **not yet root-caused**; do not resume from the discarded
+   raw-eye premise.
+
+   The source-to-generated-code cross-check agrees at every boundary:
+   `Camera_Demo1` copies the spline eye into `camera->eye` at
+   `z_camera.c:5860-5884` (`funcs_15.c:367,375,379`); `Camera_Update` passes
+   the derived eye/at/up to `View_LookAt` at `z_camera.c:8259-8265`
+   (`funcs_15.c:13254`); `View_LookAt` copies those values into `View` at
+   `z_view.c:84-92` (`funcs_35.c:1122-1159`); and
+   `View_ApplyPerspective` calls `guLookAt` and submits that matrix at
+   `z_view.c:371-406` (`funcs_35.c:2661`). The expected float writer is
+   `lookat.c:39-57`: its three translation expressions at lines 42, 47, and
+   52 correspond to `funcs_57.c:4166,4251,4280` and produce
+   `(3262.99,694.05,5674.78)`. The wrapper at `lookat.c:60-65` then calls the
+   expected fixed-point writer `guMtxF2L` (`funcs_57.c:4368`), whose stores at
+   `funcs_57.c:3275,3281,3340,3344` implement the packing loop in
+   `mtxutil.c:3-19`. Finally, `z_play.c:1173-1188` reads the already-written
+   viewing matrix to derive separate billboard data; it does not overwrite
+   the projection-stack view slot.
 2. **G_SETOTHERMODE_L/H** — currently *not even decoded* (name-table only). No
    blend/render-mode/alpha state exists. Gates alpha-test + blending.
 3. **Alpha-test** (alpha compare) — fixes black-box-around-cutouts on
