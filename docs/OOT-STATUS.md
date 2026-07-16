@@ -27,6 +27,48 @@ at) — not a tracker label. Updated 2026-07-16.
 - Fast loop: `--release` + `OOT_MAX_SWAPS` early-exit (~250x), `./oot` runner,
   observability flags (`OOT_RENDER_STATS`, `OOT_DUMP_PROJ`, `OOT_NO_DEPTH`,
   `OOT_AUDIO_UCODE_TIMING`, `OOT_SKIP_AUDIO_UCODE`, `OOT_STOP_ON_FRAME`).
+- Native real-time profiling: `OOT_PERF_NO_CAPTURE=1` removes only the
+  harness's per-swap diagnostic PNG work, while `OOT_PHASE_TIMING=1`
+  attributes wall time to the executor, software renderer, and audio dispatch.
+  Differential tracing is opt-in with `OOT_TRACE=1` (and remains crash-safe,
+  flushing every event); `./oot trace` enables it automatically. Normal runs
+  do not synchronously format, write, and flush every executor event.
+
+### Native gameplay wall time (2026-07-16, Apple Silicon macOS)
+
+Release-mode samples over controllable gameplay swaps 4200--4300, using the
+scripted input preset and `OOT_PERF_NO_CAPTURE=1`, measured 3.332 ms minimum,
+3.788 ms median, 3.899 ms p95, and 4.038 ms maximum (3.781 ms mean). That is
+comfortably inside the NTSC 16.7 ms VI budget. Before making differential
+trace capture opt-in, the same range measured 7.705/9.287/9.748/10.655 ms
+(min/median/p95/max; 9.195 ms mean): synchronous formatting, writing, and
+flushing of 12,503,295 diagnostic events consumed 58.1% of an Apple `sample`
+profile. Suppressing repeated per-frame copies of identical skipped-opcode
+warnings reduced renderer diagnostics from 57,896 lines to 736 without
+changing rendered output.
+
+Coarse post-change attribution through swap 4300 was 11,298.579 ms in the
+`ReferenceBackend` software renderer and 7,392.424 ms in recompiled guest CPU
+plus executor overhead. A post-change sample attributed approximately 35.8%
+of samples to the renderer (24.1% in rasterization), with guest gameplay code,
+especially collision queries, the largest remaining sink. That historical
+measurement predated the native manifest's translated-audio integration and
+used `OOT_SKIP_AUDIO_UCODE=1`.
+
+After merging the perf work with live audio, the same skip-audio performance
+configuration measured 3.468 ms minimum, 3.867 ms median, 4.071 ms p95, and
+4.230 ms maximum over swaps 4200--4300 (3.874 ms mean). A separate run over
+the identical gameplay window with translated audio enabled measured 4.654 ms
+median (4.695 ms mean), ran all 11,647 submitted audio tasks, and delivered
+14,859,648 AI samples, including 12,108,966 nonzero samples in the bounded
+range `-29,727..=29,376`. Audio ucode accounted for 5,288.28 ms total, or
+0.454 ms per task. Both configurations remain comfortably inside the NTSC
+16.7 ms VI budget.
+
+The behavior guard compared independently built native and C lanes at swap
+499. Both framebuffer PNGs had SHA-256
+`bc19787324497d71c622c2bfd450dc9f2063cb4feb875c576b4c6c34236ec1db` and
+were byte-identical.
 
 ### Recompilers (both from-scratch, typed Rust, no external tool, no GPL)
 - **CPU** `fn64-recomp-native`: MIPS III + COP1/FPU + 64-bit dword + COP0 +
