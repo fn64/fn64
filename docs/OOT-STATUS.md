@@ -53,6 +53,47 @@ at) — not a tracker label. Updated 2026-07-15.
   KSEG0-mask OSTask reads also fixed. (aki-recomp side committed local-only on
   `fix/rsp-aspmain-base-and-endianness`; needs the fixed `fn64-audio`.)
 
+### Native-Rust deep boot (2026-07-16, `fix/native-boot-deeper`)
+
+- **Required one-command emission now consumes its sibling profile.** Before
+  this fix, invoking `recompile_rom --config games/OOTU/oot.toml ...` without
+  a redundant `--profile` emitted only 13,306 clean functions and omitted
+  `AudioHeap_ResetStep` from native dispatch. Boot stopped after 12 swaps at
+  lookup `0x800B4EB4`. The body is ordinary game code: ROM PCs `0x800B4F60`
+  (`018B001A`, `div $zero,$t4,$t3`), `0x800B4F6C` (`15600002`, nonzero-divisor
+  guard), and `0x800B4F74` (`0007000D`, guarded `break 7`) implement decomp
+  `src/audio/internal/heap.c:868-927`'s `2 / sp24` reset state machine. The
+  vetted `force_recompile` evidence already existed in sibling
+  `games/OOTU/profile.toml:156-175`; `recompile_rom.rs` now discovers that
+  sibling when no explicit profile/env override is supplied. The unchanged
+  command emits 13,324 clean functions and clears this rung to swap 231.
+- **A newly loaded overlay replaces the old image at the same runtime base.**
+  The pause and player overlays successively DMA from ROM `0x00BB11E0` and
+  `0x00BCDB70` to the same Kaleido arena `0x80388B60`. Keeping both registry
+  entries loaded made runtime player callback `0x8039D788` canonicalize through
+  stale pause static base `0x808137C0`, yielding interior pause PC `0x808283E8`
+  instead of `Player_Init` `0x80844DE8`; native stopped after swap 231.
+  Resident-ROM PCs `0x80097658`/`0x80097660` contain words
+  `3C048084`/`24844DE8`, constructing that static `Player_Init` address, and
+  `0x800976E8` contains `0320F809` (`jalr $t9`) to consume its relocated
+  result. The generated C preserves the same sequence at
+  `RecompiledFuncs/funcs_36.c:8685-8693,8779-8788`.
+  Decomp `src/code/z_kaleido_manager.c:20-33,85-112` establishes the shared
+  arena/load-offset mechanism, `src/code/z_kaleido_scope_call.c:18-39` shows
+  player replacing the current overlay, and `src/code/z_player_call.c:41-51`
+  consumes the relocated callback. `SectionRegistry::set_section_loaded_at`
+  now evicts any displaced mapping at the destination before publishing the
+  new section; `shared_runtime_base_replaces_prior_overlay` fails against the
+  stale-two-images behavior.
+- **Verified depth:** 10 consecutive release probes, each with
+  `OOT_MAX_SWAPS=250 OOT_SKIP_AUDIO_UCODE=1`, reached 250 VI swaps / 250 gfx
+  tasks and exited 0 with no native execution panic. Swap 250 is a non-uniform
+  title-demo/Hyrule Field framebuffer (`/tmp/fn64-deep-frame.png`), though the
+  known renderer-state gaps below leave it mostly red with dark geometry. A
+  collision-free C-lane probe also reached swap 250, and its swap-250 PNG is
+  byte-identical (SHA-256
+  `a0b354ea3c7056e90f316bc28f24d2c46761ce248b3279b9be1b6a21c320cc6b`).
+
 ### Render — geometry & texture layers
 - Geometry: G_VTX, G_TRI1/TRI2/QUAD, G_MTX (LOAD/MUL/PUSH), G_POPMTX, G_DL
   (call/branch, recursion-limited), G_ENDDL — **implemented**.
@@ -132,10 +173,11 @@ road, but the top half misprojects).
   `extern "C"` blocking shim, where TLS teardown's forced unwind cannot cross
   the ABI boundary. This is harness teardown only; execution still uses the
   same single executor and host thread.
-- Native-Rust boot now reaches **ten VI swaps and ten non-clear render tasks**
-  in a bounded probe; swap 3 is the first non-uniform guest framebuffer. The
-  former `AudioLoad_Dma` unaligned-`SW` frontier was a stale host-call return,
-  not an alignment exception or an SWL/SWR decode: `AudioLoad_Init` preserves
+- Native-Rust boot now reaches the bounded **250 VI swaps and 250 render tasks**
+  in 10/10 consecutive release probes; swap 3 is the first non-uniform guest
+  framebuffer. The former `AudioLoad_Dma` unaligned-`SW` frontier was a stale
+  host-call return, not an alignment exception or an SWL/SWR decode:
+  `AudioLoad_Init` preserves
   `osCartRomInit()` in `gAudioCtx.cartHandle`, but the shim had left `$v0`
   untouched. It now returns OoT's aligned guest `__CartRomHandle` address.
   The first post-fix probe exposed a local `jr` jump-table target inside
@@ -172,7 +214,7 @@ stubs. The AudioLoad repair is grounded in OoT decomp
 `src/libultra/io/cartrominit.c`: guest code dereferences the returned public
 handle, so the host ABI must return the game-linked BSS object rather than an
 opaque token or stale register. Ten consecutive release probes now reach
-swap 10 with exit code 0; swaps 3-10 have non-uniform guest framebuffers. No
+swap 250 with exit code 0; swaps 3-250 have non-uniform guest framebuffers. No
 new loud native frontier appeared through that bound. A one-swap differential
 against the C lane had the same 550 event shapes; the raw trace first differs
 at event 294 only in `sim_time` (0 versus 100), where the native harness

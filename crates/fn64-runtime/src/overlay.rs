@@ -200,6 +200,21 @@ impl SectionRegistry {
             index < self.sections.len(),
             "set_section_loaded_at: no such section index {index}"
         );
+        // A runtime destination can hold only one code image. OoT's
+        // KaleidoManager_LoadOvl reuses one arena first for the pause overlay
+        // and then for the player overlay; retaining both made an address in
+        // the second image canonicalize through the first image's static base.
+        // Remove the displaced section before publishing the new mapping so
+        // resolution never depends on HashSet iteration order.
+        let displaced: Vec<_> = self
+            .load_vram
+            .iter()
+            .filter_map(|(&other, &base)| (other != index && base == load_vram).then_some(other))
+            .collect();
+        for other in displaced {
+            self.load_vram.remove(&other);
+            self.loaded.remove(&other);
+        }
         self.load_vram.insert(index, load_vram);
         self.loaded.insert(index);
         self.cache.clear();
@@ -520,6 +535,31 @@ mod tests {
         assert_eq!(reg.canonical_vram(0x803b_4df0), Some(0x8080_07b0));
         assert_eq!(reg.canonical_vram(0x8080_07b0), None);
         assert_eq!(reg.resolve(0x803b_4df0), 0xc0de_1234);
+    }
+
+    /// OoT's pause and player overlays reuse the same Kaleido arena. Loading
+    /// player at the former pause destination must replace pause atomically;
+    /// otherwise the relocated Player_Init pointer canonicalizes to an
+    /// interior pause PC because both section ranges contain the address.
+    #[test]
+    fn shared_runtime_base_replaces_prior_overlay() {
+        let mut reg = SectionRegistry::new();
+        let pause = reg.register_section(section_at_rom(0x00bb_11e0, 0x8081_37c0, 0x15b90, vec![]));
+        let player = reg.register_section(section_at_rom(
+            0x00bc_db70,
+            0x8083_01c0,
+            0x21110,
+            vec![(0x14c28, 0xfeed_face)],
+        ));
+        let arena = 0x8038_8b60;
+
+        reg.set_section_loaded_at(pause, arena);
+        reg.set_section_loaded_at(player, arena);
+
+        assert!(!reg.is_section_loaded(pause), "displaced image stays stale");
+        assert!(reg.is_section_loaded(player));
+        assert_eq!(reg.canonical_vram(arena + 0x14c28), Some(0x8084_4de8));
+        assert_eq!(reg.resolve(arena + 0x14c28), 0xfeed_face);
     }
 
     /// After a DMA load, the SAME section must ALSO resolve at its static
