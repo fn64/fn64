@@ -9,7 +9,121 @@
 //! anyway, since real RDP silicon isn't part of this project's evidence
 //! base).
 
-use crate::gbi::{AlphaCompare, CullMode, Triangle, Vertex};
+use crate::gbi::{
+    AlphaCompare, AlphaSource, ColorSource, CombinerCycle, CombinerState, CullMode, Triangle,
+    Vertex,
+};
+
+/// Evaluate both programmed RDP color-combiner cycles.
+///
+/// Each cycle computes `(A - B) * C + D` independently for RGB and alpha.
+/// The source meanings follow RT64's MIT `shared/rt64_color_combiner.h`
+/// `fromColorInput`/`fromAlphaInput` (lines 468-540), and the equation/cycle
+/// ordering follows `runCycle` (lines 567-608). Running both cycles is a
+/// useful superset until the separately-owned other-mode job supplies the
+/// hardware cycle-type bit: when cycle 2 ignores COMBINED, cycle 1 cannot
+/// affect the result; OoT's PASS2/`*2` presets consume COMBINED and therefore
+/// get the required two-cycle result now.
+fn evaluate_combiner(state: CombinerState, shade: [u8; 4], texel0: [u8; 4]) -> [u8; 4] {
+    let to_unit = |rgba: [u8; 4]| rgba.map(|v| v as f32 / 255.0);
+    let mut inputs = CombinerInputs {
+        combined: [0.0; 4],
+        // This first texture slice has one decoded tile. TEXEL1 aliases it
+        // until the TMEM/two-tile follow-up exists; all required OoT presets
+        // here use TEXEL0, while the enum preserves TEXEL1's real identity.
+        texel0: to_unit(texel0),
+        texel1: to_unit(texel0),
+        primitive: to_unit(state.primitive),
+        shade: to_unit(shade),
+        environment: to_unit(state.environment),
+        lod_fraction: 0.0,
+        prim_lod_fraction: state.prim_lod_fraction as f32 / 255.0,
+    };
+
+    for cycle in state.mode.cycles {
+        inputs.combined = evaluate_cycle(cycle, &inputs);
+    }
+
+    inputs
+        .combined
+        .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+#[derive(Copy, Clone)]
+struct CombinerInputs {
+    combined: [f32; 4],
+    texel0: [f32; 4],
+    texel1: [f32; 4],
+    primitive: [f32; 4],
+    shade: [f32; 4],
+    environment: [f32; 4],
+    lod_fraction: f32,
+    prim_lod_fraction: f32,
+}
+
+fn evaluate_cycle(cycle: CombinerCycle, inputs: &CombinerInputs) -> [f32; 4] {
+    let a = color_input(cycle.rgb[0], inputs);
+    let b = color_input(cycle.rgb[1], inputs);
+    let c = color_input(cycle.rgb[2], inputs);
+    let d = color_input(cycle.rgb[3], inputs);
+    let mut out = [0.0; 4];
+    for channel in 0..3 {
+        out[channel] = (a[channel] - b[channel]) * c[channel] + d[channel];
+    }
+
+    let aa = alpha_input(cycle.alpha[0], inputs);
+    let ab = alpha_input(cycle.alpha[1], inputs);
+    let ac = alpha_input(cycle.alpha[2], inputs);
+    let ad = alpha_input(cycle.alpha[3], inputs);
+    out[3] = (aa - ab) * ac + ad;
+    out
+}
+
+fn color_input(source: ColorSource, inputs: &CombinerInputs) -> [f32; 3] {
+    let rgb = |rgba: [f32; 4]| [rgba[0], rgba[1], rgba[2]];
+    let splat = |v| [v; 3];
+    match source {
+        ColorSource::Combined => rgb(inputs.combined),
+        ColorSource::Texel0 => rgb(inputs.texel0),
+        ColorSource::Texel1 => rgb(inputs.texel1),
+        ColorSource::Primitive => rgb(inputs.primitive),
+        ColorSource::Shade => rgb(inputs.shade),
+        ColorSource::Environment => rgb(inputs.environment),
+        ColorSource::CombinedAlpha => splat(inputs.combined[3]),
+        ColorSource::Texel0Alpha => splat(inputs.texel0[3]),
+        ColorSource::Texel1Alpha => splat(inputs.texel1[3]),
+        ColorSource::PrimitiveAlpha => splat(inputs.primitive[3]),
+        ColorSource::ShadeAlpha => splat(inputs.shade[3]),
+        ColorSource::EnvironmentAlpha => splat(inputs.environment[3]),
+        ColorSource::LodFraction => splat(inputs.lod_fraction),
+        ColorSource::PrimLodFraction => splat(inputs.prim_lod_fraction),
+        ColorSource::One => [1.0; 3],
+        ColorSource::Zero => [0.0; 3],
+        // Keying/conversion/noise registers are outside this task's state
+        // slice. None of the required OoT presets uses them; retaining named
+        // variants prevents their wire values from being mistaken for ZERO.
+        ColorSource::KeyCenter
+        | ColorSource::KeyScale
+        | ColorSource::Noise
+        | ColorSource::K4
+        | ColorSource::K5 => [0.0; 3],
+    }
+}
+
+fn alpha_input(source: AlphaSource, inputs: &CombinerInputs) -> f32 {
+    match source {
+        AlphaSource::Combined => inputs.combined[3],
+        AlphaSource::Texel0 => inputs.texel0[3],
+        AlphaSource::Texel1 => inputs.texel1[3],
+        AlphaSource::Primitive => inputs.primitive[3],
+        AlphaSource::Shade => inputs.shade[3],
+        AlphaSource::Environment => inputs.environment[3],
+        AlphaSource::LodFraction => inputs.lod_fraction,
+        AlphaSource::PrimLodFraction => inputs.prim_lod_fraction,
+        AlphaSource::One => 1.0,
+        AlphaSource::Zero => 0.0,
+    }
+}
 
 /// TEMP instrumentation (env `OOT_DUMP_PROJ=1`): count z-test passes vs
 /// rejections so a real overlapping-geometry frame can PROVE the z-buffer is
@@ -203,24 +317,25 @@ impl Framebuffer {
                 let w2 = edge(a, b, p) / area;
                 if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
                     // Interpolated (screen-linear) shade color.
-                    let mut r = (w0 * a.r as f32 + w1 * b.r as f32 + w2 * c.r as f32) as u8;
-                    let mut g = (w0 * a.g as f32 + w1 * b.g as f32 + w2 * c.g as f32) as u8;
-                    let mut bl = (w0 * a.b as f32 + w1 * b.b as f32 + w2 * c.b as f32) as u8;
-                    let mut al = (w0 * a.a as f32 + w1 * b.a as f32 + w2 * c.a as f32) as u8;
-                    // If a texture is bound, sample it at the interpolated S/T
-                    // and MODULATE (texel * shade / 255) per channel -- the
-                    // default OoT combiner (F3DEX2-CONCEPTS.md §5.2). Screen-
-                    // linear S/T interpolation (perspective-incorrect, §4.1);
-                    // adequate for a first recognizable textured frame.
-                    if let Some(tex) = &tri.texture {
+                    let shade = [
+                        (w0 * a.r as f32 + w1 * b.r as f32 + w2 * c.r as f32) as u8,
+                        (w0 * a.g as f32 + w1 * b.g as f32 + w2 * c.g as f32) as u8,
+                        (w0 * a.b as f32 + w1 * b.b as f32 + w2 * c.b as f32) as u8,
+                        (w0 * a.a as f32 + w1 * b.a as f32 + w2 * c.a as f32) as u8,
+                    ];
+                    // Screen-linear S/T interpolation (perspective-incorrect,
+                    // §4.1) remains adequate for this reference backend. A
+                    // missing texture supplies white, so shade/primitive/env-
+                    // only formulas and the legacy default MODULATE mode have
+                    // neutral TEXEL0 input rather than turning black.
+                    let texel = if let Some(tex) = &tri.texture {
                         let s = w0 * a.s + w1 * b.s + w2 * c.s;
                         let t = w0 * a.t + w1 * b.t + w2 * c.t;
-                        let [tr, tg, tb, ta] = tex.sample(s, t);
-                        r = ((tr as u32 * r as u32) / 255) as u8;
-                        g = ((tg as u32 * g as u32) / 255) as u8;
-                        bl = ((tb as u32 * bl as u32) / 255) as u8;
-                        al = ((ta as u32 * al as u32) / 255) as u8;
-                    }
+                        tex.sample(s, t)
+                    } else {
+                        [255; 4]
+                    };
+                    let rgba = evaluate_combiner(tri.combiner, shade, texel);
                     // Alpha compare happens after the color combiner has
                     // produced fragment alpha and before color/depth writes.
                     // `G_AC_THRESHOLD` compares against G_SETBLENDCOLOR.a;
@@ -231,16 +346,22 @@ impl Framebuffer {
                     // reproducible while retaining the required stochastic-
                     // coverage behavior (partial-alpha fragments alternate
                     // pass/discard instead of becoming opaque black boxes).
-                    if !alpha_compare_passes(tri.other_mode.alpha_compare(), al, x, y, tri) {
+                    if !alpha_compare_passes(
+                        tri.other_mode.alpha_compare(),
+                        rgba[3],
+                        x,
+                        y,
+                        tri,
+                    ) {
                         continue;
                     }
                     if depth_test {
                         // Screen-linear depth interpolation (perspective-
                         // incorrect, adequate for occlusion -- §4.1/§4.3).
                         let z = w0 * a.z + w1 * b.z + w2 * c.z;
-                        self.set_depth_tested(x, y, z, [r, g, bl, al]);
+                        self.set_depth_tested(x, y, z, rgba);
                     } else {
-                        self.set(x, y, [r, g, bl, al]);
+                        self.set(x, y, rgba);
                     }
                 }
             }
@@ -274,6 +395,23 @@ fn edge(a: Vertex, b: Vertex, c: Vertex) -> f32 {
 mod tests {
     use super::*;
 
+    fn cycle(rgb: [ColorSource; 4], alpha: [AlphaSource; 4]) -> CombinerCycle {
+        CombinerCycle { rgb, alpha }
+    }
+
+    fn repeated_state(
+        cycle: CombinerCycle,
+        primitive: [u8; 4],
+        environment: [u8; 4],
+    ) -> CombinerState {
+        CombinerState {
+            mode: crate::gbi::CombinerMode { cycles: [cycle; 2] },
+            primitive,
+            environment,
+            prim_lod_fraction: 0,
+        }
+    }
+
     fn v(x: f32, y: f32, r: u8, g: u8, b: u8, a: u8) -> Vertex {
         Vertex {
             x,
@@ -292,6 +430,145 @@ mod tests {
         fb.clear(10, 20, 30, 255);
         assert!(!fb.has_non_uniform_content(10, 20, 30, 255));
         assert_eq!(&fb.pixels[0..4], &[10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn combiner_presets_select_decal_primitive_environment_and_shade_sources() {
+        // Fail-against-bug: the old rasterizer always returned TEXEL0*SHADE,
+        // so every assertion except MODULATE below produced the same wrong
+        // color regardless of the decoded primitive/environment registers.
+        let shade = [50, 100, 150, 220];
+        let texel = [128, 64, 255, 180];
+
+        let shade_only = cycle(
+            [
+                ColorSource::Zero,
+                ColorSource::Zero,
+                ColorSource::Zero,
+                ColorSource::Shade,
+            ],
+            [
+                AlphaSource::Zero,
+                AlphaSource::Zero,
+                AlphaSource::Zero,
+                AlphaSource::Shade,
+            ],
+        );
+        assert_eq!(
+            evaluate_combiner(repeated_state(shade_only, [0; 4], [0; 4]), shade, texel),
+            shade
+        );
+
+        let decal = cycle(
+            [
+                ColorSource::Zero,
+                ColorSource::Zero,
+                ColorSource::Zero,
+                ColorSource::Texel0,
+            ],
+            [
+                AlphaSource::Zero,
+                AlphaSource::Zero,
+                AlphaSource::Zero,
+                AlphaSource::Texel0,
+            ],
+        );
+        assert_eq!(
+            evaluate_combiner(repeated_state(decal, [0; 4], [0; 4]), shade, texel),
+            texel
+        );
+
+        let primitive_tint = cycle(
+            [
+                ColorSource::Texel0,
+                ColorSource::Zero,
+                ColorSource::Primitive,
+                ColorSource::Zero,
+            ],
+            [
+                AlphaSource::Texel0,
+                AlphaSource::Zero,
+                AlphaSource::Primitive,
+                AlphaSource::Zero,
+            ],
+        );
+        let primitive = [128, 255, 64, 128];
+        assert_eq!(
+            evaluate_combiner(
+                repeated_state(primitive_tint, primitive, [0; 4]),
+                shade,
+                texel,
+            ),
+            [64, 64, 64, 90]
+        );
+
+        // G_CC_BLENDI: (ENVIRONMENT - SHADE) * TEXEL0 + SHADE.
+        let env_blend = cycle(
+            [
+                ColorSource::Environment,
+                ColorSource::Shade,
+                ColorSource::Texel0,
+                ColorSource::Shade,
+            ],
+            [
+                AlphaSource::Zero,
+                AlphaSource::Zero,
+                AlphaSource::Zero,
+                AlphaSource::Shade,
+            ],
+        );
+        assert_eq!(
+            evaluate_combiner(
+                repeated_state(env_blend, [0; 4], [250, 200, 100, 255]),
+                shade,
+                texel,
+            ),
+            [150, 125, 100, 220]
+        );
+    }
+
+    #[test]
+    fn combiner_second_cycle_consumes_first_cycle_combined_result() {
+        // Cycle 0: TEXEL0*SHADE. Cycle 1: COMBINED*PRIMITIVE. This fails if
+        // only the second programmed tuple is evaluated or COMBINED is not
+        // carried between cycles.
+        let first = cycle(
+            [
+                ColorSource::Texel0,
+                ColorSource::Zero,
+                ColorSource::Shade,
+                ColorSource::Zero,
+            ],
+            [
+                AlphaSource::Texel0,
+                AlphaSource::Zero,
+                AlphaSource::Shade,
+                AlphaSource::Zero,
+            ],
+        );
+        let second = cycle(
+            [
+                ColorSource::Combined,
+                ColorSource::Zero,
+                ColorSource::Primitive,
+                ColorSource::Zero,
+            ],
+            [
+                AlphaSource::Combined,
+                AlphaSource::Zero,
+                AlphaSource::Primitive,
+                AlphaSource::Zero,
+            ],
+        );
+        let state = CombinerState {
+            mode: crate::gbi::CombinerMode {
+                cycles: [first, second],
+            },
+            primitive: [128; 4],
+            environment: [0; 4],
+            prim_lod_fraction: 0,
+        };
+        assert_eq!(evaluate_combiner(state, [128; 4], [200; 4]), [50; 4]);
     }
 
     #[test]
