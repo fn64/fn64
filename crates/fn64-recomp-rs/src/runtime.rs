@@ -611,7 +611,7 @@ impl<'a> Rdram<'a> {
     #[inline]
     pub fn load_w(&self, vaddr: u64) -> i32 {
         let p = Self::phys(vaddr);
-        assert_eq!(p & 3, 0, "unaligned LW at {vaddr:#018x}");
+        debug_assert_eq!(p & 3, 0, "unaligned LW at {vaddr:#018x}");
         i32::from_ne_bytes([
             self.mem[p],
             self.mem[p + 1],
@@ -623,7 +623,7 @@ impl<'a> Rdram<'a> {
     /// Load a sign-extended halfword (byte offset XOR 2).
     #[inline]
     pub fn load_h(&self, vaddr: u64) -> i16 {
-        assert_eq!(vaddr & 1, 0, "unaligned LH at {vaddr:#018x}");
+        debug_assert_eq!(vaddr & 1, 0, "unaligned LH at {vaddr:#018x}");
         let p = Self::phys(vaddr) ^ 2;
         i16::from_ne_bytes([self.mem[p], self.mem[p + 1]])
     }
@@ -654,14 +654,14 @@ impl<'a> Rdram<'a> {
     #[inline]
     pub fn store_w(&mut self, vaddr: u64, val: u32) {
         let p = Self::phys(vaddr);
-        assert_eq!(p & 3, 0, "unaligned SW at {vaddr:#018x}");
+        debug_assert_eq!(p & 3, 0, "unaligned SW at {vaddr:#018x}");
         self.mem[p..p + 4].copy_from_slice(&val.to_ne_bytes());
     }
 
     /// Store the low halfword of `val` (byte offset XOR 2).
     #[inline]
     pub fn store_h(&mut self, vaddr: u64, val: u16) {
-        assert_eq!(vaddr & 1, 0, "unaligned SH at {vaddr:#018x}");
+        debug_assert_eq!(vaddr & 1, 0, "unaligned SH at {vaddr:#018x}");
         let p = Self::phys(vaddr) ^ 2;
         self.mem[p..p + 2].copy_from_slice(&val.to_ne_bytes());
     }
@@ -738,7 +738,7 @@ impl<'a> Rdram<'a> {
     /// at `vaddr+0` and `lo_word` at `vaddr+4`.
     #[inline]
     pub fn load_d(&self, vaddr: u64) -> u64 {
-        assert_eq!(vaddr & 7, 0, "unaligned LD at {vaddr:#018x}");
+        debug_assert_eq!(vaddr & 7, 0, "unaligned LD at {vaddr:#018x}");
         let hi = self.load_w(vaddr) as u32 as u64;
         let lo = self.load_w(vaddr.wrapping_add(4)) as u32 as u64;
         (hi << 32) | lo
@@ -748,7 +748,7 @@ impl<'a> Rdram<'a> {
     /// `vaddr+4`.
     #[inline]
     pub fn store_d(&mut self, vaddr: u64, val: u64) {
-        assert_eq!(vaddr & 7, 0, "unaligned SD at {vaddr:#018x}");
+        debug_assert_eq!(vaddr & 7, 0, "unaligned SD at {vaddr:#018x}");
         self.store_w(vaddr, (val >> 32) as u32);
         self.store_w(vaddr.wrapping_add(4), val as u32);
     }
