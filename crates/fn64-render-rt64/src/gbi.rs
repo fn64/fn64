@@ -1170,6 +1170,17 @@ fn load_light(rdram: &[u8], state: &mut DecodeState, addr: usize, slot: usize) {
     }
 }
 
+/// Decode the F3DEX2 light slot selected by a `G_MOVEMEM G_MV_LIGHT`
+/// destination offset. `gSPLight(..., n)` emits `(n * 24 + 24) / 8` in the
+/// wire field, while DMEM indices 0 and 1 are reserved for the two look-at
+/// vectors. Therefore `LIGHT_1` starts at DMEM index 2 and maps to light slot
+/// 0, matching RT64's `offset / 24 - 2` dispatch.
+fn light_slot_from_movemem_offset(ofs_div8: usize) -> Option<usize> {
+    (ofs_div8 / 3)
+        .checked_sub(2)
+        .filter(|&slot| slot < MAX_LIGHTS)
+}
+
 /// Normalize a 3-vector; returns the zero vector unchanged (guards a 0-length
 /// normal/direction so a bad DMA can't produce NaN).
 #[inline]
@@ -2297,12 +2308,16 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                     }
                 } else if index == G_MV_LIGHT {
                     // gsSPLight (gbi.h:2911): ofs = n*24 + 24 (÷8 on the
-                    // wire), so ofs/8 = 3*(n+1) and the destination light
-                    // SLOT is n = ofs/8/3 - 1. Slot 0..num_dir-1 are
-                    // directional; slot num_dir is the ambient.
-                    let slot = (ofs_div8 / 3).saturating_sub(1);
-                    let addr = resolve_addr(&state.segments, w1);
-                    load_light(rdram, state, addr, slot);
+                    // wire), so ofs/8 = 3*(n+1). DMEM indices 0 and 1 are
+                    // look-at vectors; LIGHT_1 therefore maps from index 2
+                    // to slot 0. Slot 0..num_dir-1 are directional; slot
+                    // num_dir is the ambient.
+                    if let Some(slot) = light_slot_from_movemem_offset(ofs_div8) {
+                        let addr = resolve_addr(&state.segments, w1);
+                        load_light(rdram, state, addr, slot);
+                    } else {
+                        skip_opcode(G_MOVEMEM);
+                    }
                 } else {
                     skip_opcode(G_MOVEMEM);
                 }
@@ -3408,6 +3423,20 @@ mod tests {
         // 2 directional lights: data = 48.
         st.lights.num_dir = (48u32 / 24) as usize;
         assert_eq!(st.lights.num_dir, 2);
+    }
+
+    #[test]
+    fn movemem_light_1_maps_to_directional_slot_zero() {
+        // Fail-against-bug wire evidence: gSPLight(LIGHT_1) encodes
+        // (1*24 + 24)/8 = 6. The old `ofs/3 - 1` mapping returned slot 1,
+        // leaving the real first directional light (slot 0) black/stale and
+        // misclassifying LIGHT_1 as ambient when num_dir == 1.
+        assert_eq!(light_slot_from_movemem_offset(6), Some(0));
+        // LIGHT_2 is the ambient slot when one directional light is active.
+        assert_eq!(light_slot_from_movemem_offset(9), Some(1));
+        // Offsets for the two look-at vectors are not light slots.
+        assert_eq!(light_slot_from_movemem_offset(0), None);
+        assert_eq!(light_slot_from_movemem_offset(3), None);
     }
 
     #[test]

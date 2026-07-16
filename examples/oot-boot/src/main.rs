@@ -43,6 +43,10 @@ mod native_funcs {
 // ---------------------------------------------------------------------
 
 #[cfg(not(fn64_native_recomp))]
+// `RecompContext` is opaque to this C boundary: the generated entry point only
+// receives its address. Its Rust-only tuple fields therefore do not cross the
+// ABI by value, despite rustc's conservative layout warning.
+#[allow(improper_ctypes)]
 extern "C" {
     /// Walks the real, compiled-in `section_table[]`/`FuncEntry[]` (from
     /// the game's own `recomp_overlays.inl`) and calls `fn64_register_func`
@@ -82,10 +86,16 @@ extern "C" fn fn64_register_func(
 }
 
 #[cfg(not(fn64_native_recomp))]
+type SectionFunc = (u32, u32, fn64_abi::RecompFunc);
+
+#[cfg(not(fn64_native_recomp))]
+type SectionRecord = (u32, u32, u32, Vec<SectionFunc>);
+
+#[cfg(not(fn64_native_recomp))]
 #[derive(Default)]
 struct SectionBuilder {
     /// section_index -> (rom_addr, ram_addr, size, funcs)
-    sections: HashMap<usize, (u32, u32, u32, Vec<(u32, u32, fn64_abi::RecompFunc)>)>,
+    sections: HashMap<usize, SectionRecord>,
 }
 
 #[cfg(not(fn64_native_recomp))]
@@ -478,16 +488,21 @@ fn main() {
     // nowhere recognizable. That is expected and reported (blank/garbage),
     // not faked; the objective rasterizer proof lives in
     // fn64-render-rt64/tests/f3dex2_replay.rs, independent of this live path.
+    let render_dump_limit = std::env::var("OOT_RENDER_DUMP_LIMIT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(240);
     let mut render_backend = fn64_render_rt64::ReferenceBackend::new()
         .with_f3dex2()
         .with_clear_color([0, 0, 0, 255])
-        .with_auto_dump("/tmp", "fn64-oot-render", 240);
-    // NOTE: 240 (one full second of NTSC frames) so the capture reaches the
+        .with_auto_dump("/tmp", "fn64-oot-render", render_dump_limit);
+    // NOTE: the default 240 (one full second of NTSC frames) reaches the
     // frames where real 3D geometry appears -- the first ~8 gfx tasks are
     // OoT's boot/logo screens (large flat gradient background quads), and
     // the recognizable projected geometry (rotating title object, then the
     // file-select 3D scene) shows up later in the boot sequence. A smaller
-    // limit stops at the gradient logos and misses the geometry proof.
+    // limit stops at the gradient logos and misses the geometry proof. Set
+    // OOT_RENDER_DUMP_LIMIT=260 to include task 249 in a 250-swap diagnostic.
     // A common NTSC low-res target; matches capture_framebuffer's assumed
     // 320x240 (this harness does not yet decode the ROM's real OSViMode).
     {
@@ -769,20 +784,17 @@ fn main() {
     write_trace_file(&trace, TRACE_PATH);
     println!("[oot-boot] trace written to {TRACE_PATH}");
 
-    #[cfg(fn64_native_recomp)]
-    {
-        // Native threads may be suspended inside an existing `extern "C"`
-        // ABI shim (most commonly blocking osRecvMesg). Rust TLS teardown
-        // would make corosensei force-unwind that stack across the non-unwind
-        // FFI boundary and abort after an otherwise complete bounded probe.
-        // All diagnostic state is explicitly flushed above, so terminate the
-        // harness process without running that invalid coroutine destructor.
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
-        // SAFETY: `_exit` has no memory contract; unlike `exit`, it skips C
-        // atexit/TLS destructors. That distinction is the purpose here.
-        unsafe { libc::_exit(0) }
-    }
+    // Either recompiler lane may leave a game coroutine suspended inside an
+    // `extern "C"` ABI shim (most commonly blocking osRecvMesg). Rust TLS
+    // teardown would make corosensei force-unwind that stack across the
+    // non-unwind FFI boundary and abort after an otherwise complete bounded
+    // probe. All diagnostic state is explicitly flushed above, so terminate
+    // the harness process without running that invalid coroutine destructor.
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: `_exit` has no memory contract; unlike `exit`, it skips C
+    // atexit/TLS destructors. That distinction is the purpose here.
+    unsafe { libc::_exit(0) }
 }
 
 /// Hash the fb region (a fixed-size guess: 320x240 RGBA5551 = 153600 bytes,
