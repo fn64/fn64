@@ -37,10 +37,10 @@
 use std::io::Read;
 
 use flate2::read::GzDecoder;
+use fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as RDRAM_MAX_SIZE;
 
 const MAGIC: &[u8; 8] = b"M64+SAVE";
 const MD5_LEN: usize = 32;
-const RDRAM_MAX_SIZE: usize = 0x0080_0000; // 8 MiB, matches fn64_runtime::DEFAULT_RDRAM_SIZE.
 const SP_MEM_SIZE: usize = 0x2000;
 const PIF_RAM_SIZE: usize = 0x40;
 const TLB_LUT_ELEMS: usize = 0x0010_0000; // count of u32 elements, NOT bytes (savestates.c:431-432).
