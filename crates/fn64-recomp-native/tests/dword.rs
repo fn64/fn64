@@ -118,8 +118,8 @@ const MEM_VRAM: u32 = 0x80200000;
 //   dmultu $a0,$a1 ; mflo $t0     dmultu $a0,$a1 ; mfhi $t1
 //   ddivu  $0,$a0,$a1 ; mflo $t2  ddivu  $0,$a0,$a1 ; mfhi $t3
 //   dsrl $t4,$a0,5   dsll32 $t5,$a1,7   dsra32 $t6,$a0,9
-//   dsrlv $t7,$a1,$a0  dsrav $t8,$a0,$a1  daddi $t9,$a0,0x7F
-//   $v0 = dadd/daddu chain of t0..t9 ; jr $ra ; nop
+//   dsrlv $t7,$a1,$a0  dsrav $t8,$a0,$a1  daddiu $t9,$a0,0x7F
+//   $v0 = daddu chain of t0..t9 ; jr $ra ; nop
 const ALU2_WORDS: [u32; 25] = [
     0x0085001d, // dmultu a0,a1
     0x00004012, // mflo   a4
@@ -134,8 +134,8 @@ const ALU2_WORDS: [u32; 25] = [
     0x0004727f, // dsra32 t2,a0,0x9
     0x00857816, // dsrlv  t3,a1,a0
     0x00a4c017, // dsrav  t8,a0,a1
-    0x6099007f, // daddi  t9,a0,127
-    0x0109102c, // dadd   v0,a4,a5
+    0x6499007f, // daddiu t9,a0,127
+    0x0109102d, // daddu  v0,a4,a5
     0x004a102d, // daddu  v0,v0,a6
     0x004b102d, // daddu  v0,v0,a7
     0x004c102d, // daddu  v0,v0,t0
@@ -178,7 +178,7 @@ pub fn dword_alu(ctx: &mut RecompContext, mem: &mut Rdram) {
                 // 0x80100020: Mflo { rd: 15 }
                 ctx.set_r(15, ctx.lo);
                 // 0x80100024: Ddiv { rs: 4, rt: 5 }
-                { let a = ctx.r_s64(4); let b = ctx.r_s64(5); if b != 0 { if a == i64::MIN && b == -1 { ctx.lo = a as u64; ctx.hi = 0; } else { ctx.lo = a.wrapping_div(b) as u64; ctx.hi = a.wrapping_rem(b) as u64; } } }
+                ctx.div_s64(ctx.r_s64(4), ctx.r_s64(5));
                 // 0x80100028: Mflo { rd: 24 }
                 ctx.set_r(24, ctx.lo);
                 // 0x8010002C: Daddu { rd: 2, rs: 8, rt: 9 }
@@ -232,12 +232,11 @@ pub fn dword_mem(ctx: &mut RecompContext, mem: &mut Rdram) {
                 // 0x80200020: Sdr { rt: 8, base: 4, off: 39 }
                 mem.store_dr(Rdram::eff_addr(ctx.r(4), 39), ctx.r_u64(8));
                 // 0x80200024: Lld { rt: 12, base: 4, off: 40 }
-                ctx.set_r(12, mem.load_d(Rdram::eff_addr(ctx.r(4), 40)));
+                { let a = Rdram::eff_addr(ctx.r(4), 40); let v = mem.load_d(a); ctx.set_r(12, v); ctx.set_ll_reservation(a, 8); }
                 // 0x80200028: Daddiu { rt: 12, rs: 12, imm: 1 }
                 ctx.set_r(12, (ctx.r_u64(12)).wrapping_add(1i64 as u64));
                 // 0x8020002C: Scd { rt: 12, base: 4, off: 40 }
-                mem.store_d(Rdram::eff_addr(ctx.r(4), 40), ctx.r_u64(12));
-                ctx.set_r(12, 1);
+                { let a = Rdram::eff_addr(ctx.r(4), 40); let v = ctx.r_u64(12); if ctx.take_ll_reservation(a, 8) { mem.store_d(a, v); ctx.set_r(12, 1); } else { ctx.set_r(12, 0); } }
                 // 0x80200030: Jr { rs: 31 }
                 // delay: 0x80200034: Nop
                 // nop
@@ -263,11 +262,11 @@ pub fn dword_alu2(ctx: &mut RecompContext, mem: &mut Rdram) {
                 // 0x8030000C: Mfhi { rd: 9 }
                 ctx.set_r(9, ctx.hi);
                 // 0x80300010: Ddivu { rs: 4, rt: 5 }
-                { let a = ctx.r_u64(4); let b = ctx.r_u64(5); if b != 0 { ctx.lo = a / b; ctx.hi = a % b; } }
+                ctx.div_u64(ctx.r_u64(4), ctx.r_u64(5));
                 // 0x80300014: Mflo { rd: 10 }
                 ctx.set_r(10, ctx.lo);
                 // 0x80300018: Ddivu { rs: 4, rt: 5 }
-                { let a = ctx.r_u64(4); let b = ctx.r_u64(5); if b != 0 { ctx.lo = a / b; ctx.hi = a % b; } }
+                ctx.div_u64(ctx.r_u64(4), ctx.r_u64(5));
                 // 0x8030001C: Mfhi { rd: 11 }
                 ctx.set_r(11, ctx.hi);
                 // 0x80300020: Dsrl { rd: 12, rt: 4, sa: 5 }
@@ -280,9 +279,9 @@ pub fn dword_alu2(ctx: &mut RecompContext, mem: &mut Rdram) {
                 ctx.set_r(15, (ctx.r_u64(5)) >> (ctx.r_u64(4) & 63));
                 // 0x80300030: Dsrav { rd: 24, rt: 4, rs: 5 }
                 ctx.set_r(24, ((ctx.r_s64(4)) >> (ctx.r_u64(5) & 63)) as u64);
-                // 0x80300034: Daddi { rt: 25, rs: 4, imm: 127 }
+                // 0x80300034: Daddiu { rt: 25, rs: 4, imm: 127 }
                 ctx.set_r(25, (ctx.r_u64(4)).wrapping_add(127i64 as u64));
-                // 0x80300038: Dadd { rd: 2, rs: 8, rt: 9 }
+                // 0x80300038: Daddu { rd: 2, rs: 8, rt: 9 }
                 ctx.set_r(2, (ctx.r_u64(8)).wrapping_add(ctx.r_u64(9)));
                 // 0x8030003C: Daddu { rd: 2, rs: 2, rt: 10 }
                 ctx.set_r(2, (ctx.r_u64(2)).wrapping_add(ctx.r_u64(10)));
@@ -336,11 +335,7 @@ fn alu_oracle(a0: u64, a1: u64) -> u64 {
     // ddiv: signed 64-bit quotient with INT64_MIN/-1 guard; mflo = quotient.
     let (a, b) = (a0 as i64, a1 as i64);
     let t8 = if b == 0 {
-        // Caller never passes b == 0 to the ddiv path; if it did, hardware LO
-        // is undefined and our emitter leaves LO unchanged (it held t7's
-        // dmult-lo). Mirror that so the oracle stays faithful to the emitter's
-        // documented divide-by-zero behaviour.
-        t7
+        panic!("DDIV zero result is not specified by the public VR4300 manual")
     } else if a == i64::MIN && b == -1 {
         a as u64
     } else {
@@ -375,7 +370,7 @@ fn alu2_oracle(a0: u64, a1: u64) -> u64 {
     // dsrlv by (a0 & 63) logical; dsrav by (a1 & 63) arithmetic.
     let t7 = a1 >> (a0 & 63);
     let t8 = ((a0 as i64) >> (a1 & 63)) as u64;
-    // daddi +0x7F (64-bit add; trap dropped).
+    // daddiu +0x7F (64-bit wrapping add).
     let t9 = a0.wrapping_add(0x7F);
     t0.wrapping_add(t1)
         .wrapping_add(t2)
@@ -388,15 +383,15 @@ fn alu2_oracle(a0: u64, a1: u64) -> u64 {
         .wrapping_add(t9)
 }
 
-// --- Oracle memory model: a parallel plain byte buffer, big-endian, no
+// --- Oracle memory model: a parallel ABI byte buffer, native-endian, no
 //     swizzle for word/doubleword accesses (matching N64Recomp's word-access
 //     path). All doubleword math is straight from `recomp.h`.
 
 fn o_load_w(buf: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
 fn o_store_w(buf: &mut [u8], off: usize, val: u32) {
-    buf[off..off + 4].copy_from_slice(&val.to_be_bytes());
+    buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
 }
 /// `load_doubleword`: hi word at +0, lo word at +4.
 fn o_load_d(buf: &[u8], off: usize) -> u64 {

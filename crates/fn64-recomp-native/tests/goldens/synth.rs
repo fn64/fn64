@@ -16,7 +16,7 @@ pub fn synth_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
             // 0x80100010: AddS { fd: 0, fs: 8, ft: 4 }
             ctx.set_f_s(0, ctx.f_s(8) + ctx.f_s(4));
             // 0x80100014: CLtS { fs: 0, ft: 6 }
-            ctx.fpu_cond = ctx.f_s(0) < ctx.f_s(6);
+            ctx.fpu_compare_s(0, 6, 12);
             // 0x80100018: Bc1t { off: 2 }
             let _take = ctx.fpu_cond;
             // delay: 0x8010001C: Addiu { rt: 2, rs: 0, imm: 1 }
