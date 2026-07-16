@@ -1,5 +1,5 @@
 //! The "recip" VU op family: the reciprocal / inverse-sqrt scalar table ops
-//! (`VRCP`, `VRCPH`, `VRSQ`, `VRSQH`), the single-lane move (`VMOV`), and the
+//! (`VRCP`, `VRCPL`, `VRCPH`, `VRSQ`, `VRSQL`, `VRSQH`), the single-lane move (`VMOV`), and the
 //! accumulator-rounding pair (`VRNDN`/`VRNDP`).
 //!
 //! Clean-room from `RSP-VU-ISA.md` §6.10–§6.12. No GPL implementation
@@ -25,7 +25,7 @@ use crate::rsp::vu::{clamp_signed, element_select, scalar_source_lane, VuState};
 // §6.10 VMOV — move one element/lane
 // ---------------------------------------------------------------------------
 
-/// `VMOV` (§6.10): write the element-selected `vt` lane `src(e, de)` into the
+/// `VMOV` (§6.10): write scalar element `vt[e & 7]` into the
 /// single destination lane `de`, and broadcast the whole element-selected `vt`
 /// into `acc_lo` (the hardware side effect). Flags: none.
 pub fn vmov(state: &mut VuState, vd: usize, de: usize, vt: usize, e: usize) {
@@ -36,7 +36,7 @@ pub fn vmov(state: &mut VuState, vd: usize, de: usize, vt: usize, e: usize) {
         state.acc.write_lo(i, v as u16);
     }
     // Only the de lane of vd is written.
-    state.regs.r[vd][de] = vt_e[de];
+    state.regs.r[vd][de] = state.regs.r[vt][e & 7];
 }
 
 // ---------------------------------------------------------------------------
@@ -47,7 +47,14 @@ pub fn vmov(state: &mut VuState, vd: usize, de: usize, vt: usize, e: usize) {
 /// current ACC >= 0), `false` is `VRNDN` (add when current ACC < 0). `vs_index`
 /// (0/1) selects whether the addend is shifted left 16. Then every lane gets
 /// `vd = clamp_signed(acc >> 16)`. Flags: none.
-fn vrnd(state: &mut VuState, vd: usize, vs_index: usize, vt: usize, e: usize, round_positive: bool) {
+fn vrnd(
+    state: &mut VuState,
+    vd: usize,
+    vs_index: usize,
+    vt: usize,
+    e: usize,
+    round_positive: bool,
+) {
     let vt_e = element_select(&state.regs.r[vt], e);
     for (i, &vt_lane) in vt_e.iter().enumerate() {
         let mut prod = vt_lane as i64;
@@ -95,12 +102,14 @@ struct Normalized {
 
 fn normalize(input: i32) -> Normalized {
     let negative = input < 0;
-    let magnitude: u32 = if input < 0 {
-        if input == i32::MIN {
-            0x7FFF_FFFF
-        } else {
-            (-input) as u32
-        }
+    // The divider uses one's-complement magnitude for double-precision
+    // negatives below -32768; the 16-bit range uses ordinary absolute value.
+    // This distinction is observable in VRCPL/VRSQL after a preceding high
+    // instruction (Programmer's Guide pp. 304-305, 313-314).
+    let magnitude: u32 = if input < -32768 {
+        (!input) as u32
+    } else if input < 0 {
+        (-input) as u32
     } else {
         input as u32
     };
@@ -132,6 +141,9 @@ fn recip_core(input: i32, is_rsq: bool) -> i32 {
         // 1/0 -> saturated. Hardware yields 0x7FFF_FFFF.
         return 0x7FFF_FFFF;
     }
+    if input == -32768 {
+        return 0xFFFF_0000u32 as i32;
+    }
     let n = normalize(input);
     let shift = n.shift;
     let normalized = n.magnitude << shift; // top bit now set (bit 31)
@@ -158,13 +170,17 @@ fn recip_core(input: i32, is_rsq: bool) -> i32 {
 /// 16-bit `vt` lane selected by `e`; writes the low 16 of the result to `vd[de]`
 /// and latches the high 16 into `div_out`. Broadcasts `vt_e` into acc_lo.
 pub fn vrcp(state: &mut VuState, vd: usize, de: usize, vt: usize, e: usize) {
-    recip_scalar(state, vd, de, vt, e, /*is_rsq=*/ false, /*use_latch=*/ false);
+    recip_scalar(
+        state, vd, de, vt, e, /*is_rsq=*/ false, /*use_latch=*/ false,
+    );
 }
 
 /// `VRSQ` (§6.12): single-precision inverse-sqrt. Same shape as VRCP with the
 /// rsq table/shift.
 pub fn vrsq(state: &mut VuState, vd: usize, de: usize, vt: usize, e: usize) {
-    recip_scalar(state, vd, de, vt, e, /*is_rsq=*/ true, /*use_latch=*/ false);
+    recip_scalar(
+        state, vd, de, vt, e, /*is_rsq=*/ true, /*use_latch=*/ false,
+    );
 }
 
 /// Shared body for the single/low reciprocal-family ops. Reads the selected
@@ -226,28 +242,25 @@ fn recip_high(state: &mut VuState, vd: usize, de: usize, vt: usize, e: usize) {
     state.regs.r[vd][de] = state.div_out as i16;
 }
 
-/// Helper used by tests / a future dispatch of the paired low ops (`VRCPL` /
-/// `VRSQL`) — consumes the latch. Exposed here so the recip family's latch
-/// contract is exercised even though VRCPL/VRSQL proper are wired by another
-/// group. Not part of this group's dispatch arms.
-#[allow(dead_code)]
+/// Paired low-op body (`VRCPL` / `VRSQL`) — consumes the high-input latch.
 fn recip_low(state: &mut VuState, vd: usize, de: usize, vt: usize, e: usize, is_rsq: bool) {
     recip_scalar(state, vd, de, vt, e, is_rsq, /*use_latch=*/ true);
 }
 
 /// Route a "recip"-family opcode to its body. Returns `Some(Executed)` for the
-/// ops this module owns (`VMOV`, `VRNDN`/`VRNDP`, `VRCP`/`VRCPH`/`VRSQ`/
-/// `VRSQH`), `None` otherwise so the central dispatcher can try the next
-/// family. Wired into [`crate::rsp::ops::dispatch`] for this group's opcodes
-/// only — `VMACQ`/`VMULQ`/`VRCPL`/`VRSQL` are handled by other groups.
+/// ops this module owns (`VMOV`, `VRNDN`/`VRNDP`, and all six divider
+/// operations), `None` otherwise so the central dispatcher can try the next
+/// family.
 pub fn try_dispatch(state: &mut VuState, op: VuOp, inv: &OpInvocation) -> Option<OpStatus> {
     match op {
         VuOp::Vmov => vmov(state, inv.vd, inv.de, inv.vt, inv.e),
         VuOp::Vrndn => vrndn(state, inv.vd, inv.vs_index, inv.vt, inv.e),
         VuOp::Vrndp => vrndp(state, inv.vd, inv.vs_index, inv.vt, inv.e),
         VuOp::Vrcp => vrcp(state, inv.vd, inv.de, inv.vt, inv.e),
+        VuOp::Vrcpl => recip_low(state, inv.vd, inv.de, inv.vt, inv.e, false),
         VuOp::Vrcph => vrcph(state, inv.vd, inv.de, inv.vt, inv.e),
         VuOp::Vrsq => vrsq(state, inv.vd, inv.de, inv.vt, inv.e),
+        VuOp::Vrsql => recip_low(state, inv.vd, inv.de, inv.vt, inv.e, true),
         VuOp::Vrsqh => vrsqh(state, inv.vd, inv.de, inv.vt, inv.e),
         _ => return None,
     }
@@ -277,14 +290,14 @@ mod tests {
     }
 
     #[test]
-    fn vmov_identity_element_picks_de_lane() {
+    fn vmov_scalar_element_is_independent_of_destination_element() {
         let mut st = VuState::new();
         st.regs.r[2] = [0, 1, 2, 3, 4, 5, 6, 7];
-        // e=0 identity => src(0, de) = de. de=6 -> value 6.
-        vmov(&mut st, 5, 6, 2, 0);
-        assert_eq!(st.regs.r[5][6], 6);
-        // Wrong-lane guard: if source selection were broadcast-lane-0 we'd get 0.
-        assert_ne!(st.regs.r[5][6], 0);
+        // Programmer's Guide p. 272: vd[de] <- vt[e].  The destination
+        // element must not feed back into source selection.
+        vmov(&mut st, 5, 6, 2, 3);
+        assert_eq!(st.regs.r[5][6], 3);
+        assert_ne!(st.regs.r[5][6], 6, "de must not select the source lane");
     }
 
     // -- VRNDN / VRNDP --------------------------------------------------------
@@ -312,7 +325,11 @@ mod tests {
         // vs_index=1 -> addend <<16 = 0x2_0000.
         vrndn(&mut st, 7, 1, 3, 0);
         assert_eq!(st.acc.signed(0), 0x1000, "lane0 must be untouched");
-        assert_eq!(st.acc.signed(1), -0x1000 + 0x2_0000, "lane1 gets shifted add");
+        assert_eq!(
+            st.acc.signed(1),
+            -0x1000 + 0x2_0000,
+            "lane1 gets shifted add"
+        );
         // vd lane1 = clamp_signed(acc>>16) = clamp((0x1F000)>>16)=1.
         assert_eq!(st.regs.r[7][1], 1);
     }
@@ -356,14 +373,12 @@ mod tests {
         let mut posst = VuState::new();
         posst.regs.r[4] = [4, 0, 0, 0, 0, 0, 0, 0];
         vrcp(&mut posst, 6, 0, 4, 0);
-        let pos_full =
-            ((posst.div_out as u32) << 16) | (posst.regs.r[6][0] as u16 as u32);
+        let pos_full = ((posst.div_out as u32) << 16) | (posst.regs.r[6][0] as u16 as u32);
 
         let mut negst = VuState::new();
         negst.regs.r[4] = [-4, 0, 0, 0, 0, 0, 0, 0];
         vrcp(&mut negst, 6, 0, 4, 0);
-        let neg_full =
-            ((negst.div_out as u32) << 16) | (negst.regs.r[6][0] as u16 as u32);
+        let neg_full = ((negst.div_out as u32) << 16) | (negst.regs.r[6][0] as u16 as u32);
 
         // Negative reciprocal is the ones-complement of the positive one.
         assert_eq!(neg_full, !pos_full);
@@ -416,6 +431,37 @@ mod tests {
         // Distinguisher: this must differ from reciprocal-of-zero-latch (0x0000).
         let recip_of_lo_only = recip_core(0x0000, false);
         assert_ne!(got, recip_of_lo_only as u32);
+    }
+
+    #[test]
+    fn dispatch_executes_both_low_divider_opcodes() {
+        for (op, is_rsq) in [(VuOp::Vrcpl, false), (VuOp::Vrsql, true)] {
+            let mut st = VuState::new();
+            st.div_in = 1;
+            st.div_in_loaded = true;
+            st.regs.r[4][3] = 0x2345;
+            let inv = OpInvocation {
+                vd: 6,
+                vt: 4,
+                e: 3,
+                de: 5,
+                ..Default::default()
+            };
+            assert_eq!(try_dispatch(&mut st, op, &inv), Some(OpStatus::Executed));
+            let expected = recip_core(0x0001_2345, is_rsq) as u32;
+            let actual = ((st.div_out as u32) << 16) | st.regs.r[6][5] as u16 as u32;
+            assert_eq!(actual, expected, "{op:?}");
+            assert!(!st.div_in_loaded, "{op:?} consumes the high-input latch");
+        }
+    }
+
+    #[test]
+    fn double_precision_negative_uses_ones_complement_magnitude() {
+        // Programmer's Guide pp. 304-305 divider normalization: negative
+        // double-precision inputs below -32768 use one's complement, not
+        // absolute value.  The distinction is one at this boundary.
+        assert_eq!(normalize(-0x0002_0000).magnitude, 0x0001_FFFF);
+        assert_ne!(normalize(-0x0002_0000).magnitude, 0x0002_0000);
     }
 
     // -- VRSQ -----------------------------------------------------------------

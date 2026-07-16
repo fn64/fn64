@@ -24,7 +24,7 @@
 //! - `VMADH`/`VMADM` extract with the **signed clamp** of `acc[47..16]`.
 
 use super::super::ops::{OpInvocation, OpStatus, VuOp};
-use super::super::vu::{clamp_signed, clamp_unsigned_low, element_select, VuState};
+use super::super::vu::{clamp_signed, clamp_unsigned, clamp_unsigned_low, element_select, VuState};
 
 /// Attempt to execute one of the "mac" family ops. Returns `Some(status)` if
 /// `op` belongs to this family (and it was executed), or `None` if it does not
@@ -33,6 +33,7 @@ use super::super::vu::{clamp_signed, clamp_unsigned_low, element_select, VuState
 pub fn dispatch_mac(state: &mut VuState, op: VuOp, inv: &OpInvocation) -> Option<OpStatus> {
     match op {
         VuOp::Vmacf => vmacf(state, inv),
+        VuOp::Vmacu => vmacu(state, inv),
         VuOp::Vmacq => vmacq(state, inv),
         VuOp::Vmadh => vmadh(state, inv),
         VuOp::Vmadm => vmadm(state, inv),
@@ -42,6 +43,19 @@ pub fn dispatch_mac(state: &mut VuState, op: VuOp, inv: &OpInvocation) -> Option
         _ => return None,
     }
     Some(OpStatus::Executed)
+}
+
+/// `VMACU` — signed fractional multiply-accumulate with unsigned result
+/// clamping (Programmer's Guide, Table 3-4). Unlike `VMULU`, the accumulate
+/// step adds no new rounding constant.
+fn vmacu(state: &mut VuState, inv: &OpInvocation) {
+    let vs = state.regs.r[inv.vs];
+    let vt_e = element_select(&state.regs.r[inv.vt], inv.e);
+    for i in 0..8 {
+        let p = (vs[i] as i32) * (vt_e[i] as i32);
+        state.acc.add(i, (p as i64) << 1);
+        state.regs.r[inv.vd][i] = clamp_unsigned(state.acc.signed(i) >> 16) as i16;
+    }
 }
 
 /// `VMACF` — like `VMULF` but ACCUMULATE: `ACC += (p << 1)` with the signed
@@ -59,28 +73,21 @@ fn vmacf(state: &mut VuState, inv: &OpInvocation) {
 }
 
 /// `VMACQ` — the accumulate step of `VMULQ`. Takes no `vs`/`vt`; it nudges the
-/// existing ACC toward the nearest multiple of `0x20` (based on the current
-/// value's sign/magnitude) then writes `vd[i] = clamp_signed(ACC >> 16) & ~0xF`.
-///
-/// The Q-rounding rule (RSP-VU-ISA.md §6.1/§6.2, §7 — flagged subtle): the
-/// hardware adds `0x20` to ACC if the value is "positive and not already
-/// aligned high enough", or subtracts `0x20` if strongly negative, keying off
-/// bit 5 of the accumulator (`0x20` place). Concretely, matching the widely
-/// documented behavior: if `acc >= 0x20` (bit 5 region positive) and bit 5 is
-/// clear, add `0x20`; if `acc < -0x20` and bit 5 is clear, subtract `0x20`.
+/// existing ACC by `32 << 16` when bits 47..21 are nonzero and bit 21 is
+/// clear: add for a negative accumulator and subtract for a positive one.
+/// Result extraction matches `VMULQ`: signed-clamp ACC bits 32..17, then clear
+/// the low nibble (Programmer's Guide, p. 62).
 fn vmacq(state: &mut VuState, inv: &OpInvocation) {
     for i in 0..8 {
         let acc = state.acc.signed(i);
-        // Q rounding toward the nearest multiple of 0x20, only when the 0x20
-        // bit is not already set (i.e. not already aligned into that place).
-        if acc & 0x20 == 0 {
-            if acc >= 0x20 {
-                state.acc.add(i, 0x20);
-            } else if acc < -0x20 {
-                state.acc.add(i, -0x20);
-            }
+        let upper_nonzero = (acc >> 21) != 0;
+        let bit_21_clear = acc & (1 << 21) == 0;
+        if upper_nonzero && bit_21_clear {
+            state
+                .acc
+                .add(i, if acc < 0 { 32i64 << 16 } else { -(32i64 << 16) });
         }
-        let clamped = clamp_signed(state.acc.signed(i) >> 16);
+        let clamped = clamp_signed(state.acc.signed(i) >> 17);
         state.regs.r[inv.vd][i] = (clamped as u16 & !0xF) as i16;
     }
 }
@@ -159,8 +166,8 @@ fn vsar(state: &mut VuState, inv: &OpInvocation) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::vu::Accumulator;
+    use super::*;
 
     /// Build an invocation with the common register wiring.
     fn inv(vd: usize, vs: usize, vt: usize, e: usize) -> OpInvocation {
@@ -196,8 +203,26 @@ mod tests {
         st.regs.r[3] = [0; 8];
         vmacf(&mut st, &inv(1, 2, 3, 0));
         // Correct: ACC unchanged (added 0), lane0 = clamp(0x8000>>16)=0.
-        assert_eq!(st.regs.r[1][0], 0, "VMACF must NOT add a +0x8000 round bias");
+        assert_eq!(
+            st.regs.r[1][0], 0,
+            "VMACF must NOT add a +0x8000 round bias"
+        );
         assert_eq!(st.acc.read_lo(0), 0x8000);
+    }
+
+    #[test]
+    fn vmacu_accumulates_then_unsigned_clamps() {
+        let mut st = VuState::new();
+        st.acc.set(0, 0x0001_0000_0000);
+        st.acc.set(1, -0x0000_0001_0000);
+        st.regs.r[2] = [0; 8];
+        st.regs.r[3] = [0; 8];
+        vmacu(&mut st, &inv(1, 2, 3, 0));
+        assert_eq!(
+            st.regs.r[1][0] as u16, 0xFFFF,
+            "positive overflow clamps high"
+        );
+        assert_eq!(st.regs.r[1][1] as u16, 0, "negative accumulator clamps low");
     }
 
     #[test]
@@ -215,8 +240,7 @@ mod tests {
         // -> that's 65532, exceeds i16::MAX, must clamp to 0x7FFF.
         vmacf(&mut st, &inv(1, 2, 3, 0));
         assert_eq!(
-            st.regs.r[1][0],
-            0x7FFF,
+            st.regs.r[1][0], 0x7FFF,
             "acc>>16 exceeds i16 range, must signed-clamp not truncate"
         );
     }
@@ -272,8 +296,8 @@ mod tests {
         // vs = -1 (signed), vt = 0x8000 (unsigned = 32768).
         st.regs.r[2] = [-1, 0, 0, 0, 0, 0, 0, 0];
         st.regs.r[3] = [-0x8000i16, 0, 0, 0, 0, 0, 0, 0]; // bits 0x8000 = u16 32768
-        // Correct (vt unsigned): p = -1 * 32768 = -32768 = -0x8000.
-        // ACC += -0x8000. >>16 = -1 (0xFFFF...). clamp_signed(-1) = -1.
+                                                          // Correct (vt unsigned): p = -1 * 32768 = -32768 = -0x8000.
+                                                          // ACC += -0x8000. >>16 = -1 (0xFFFF...). clamp_signed(-1) = -1.
         vmadm(&mut st, &inv(1, 2, 3, 0));
         assert_eq!(st.acc.signed(0), -0x8000);
         assert_eq!(st.regs.r[1][0], clamp_signed(-0x8000 >> 16));
@@ -359,8 +383,8 @@ mod tests {
         // vs = 0xFFFF, vt = 0xFFFF (both unsigned = 65535).
         st.regs.r[2] = [-1i16, 0, 0, 0, 0, 0, 0, 0]; // 0xFFFF
         st.regs.r[3] = [-1i16, 0, 0, 0, 0, 0, 0, 0]; // 0xFFFF
-        // p = 65535*65535 = 0xFFFE_0001. p>>16 = 0xFFFE.
-        // ACC += 0xFFFE. acc[47..16] = 0 (in range) -> vd = acc_lo = 0xFFFE.
+                                                     // p = 65535*65535 = 0xFFFE_0001. p>>16 = 0xFFFE.
+                                                     // ACC += 0xFFFE. acc[47..16] = 0 (in range) -> vd = acc_lo = 0xFFFE.
         vmadl(&mut st, &inv(1, 2, 3, 0));
         assert_eq!(st.acc.read_lo(0), 0xFFFE);
         assert_eq!(st.regs.r[1][0], 0xFFFEu16 as i16);
@@ -427,7 +451,7 @@ mod tests {
     #[test]
     fn vmacq_clears_low_nibble_of_result() {
         let mut st = VuState::new();
-        // ACC>>16 will be 0x1237; result must have low nibble cleared -> 0x1230.
+        // VMACQ extracts ACC bits 32..17, then clears the low nibble.
         st.acc.set(0, 0x1237_0000);
         vmacq(&mut st, &inv(1, 0, 0, 0));
         assert_eq!(
@@ -435,7 +459,22 @@ mod tests {
             0,
             "VMACQ must clear the low nibble of the result"
         );
-        assert_eq!(st.regs.r[1][0], 0x1230u16 as i16);
+        assert_eq!(st.regs.r[1][0], 0x0910u16 as i16);
+    }
+
+    #[test]
+    fn vmacq_oddifies_at_accumulator_bit_21() {
+        let mut positive = VuState::new();
+        positive.acc.set(0, 0x0040_0000); // positive, bit 21 clear
+        vmacq(&mut positive, &inv(1, 0, 0, 0));
+        assert_eq!(positive.acc.signed(0), 0x0020_0000);
+        assert_eq!(positive.regs.r[1][0], 0x0010);
+
+        let mut negative = VuState::new();
+        negative.acc.set(0, -0x0040_0000); // negative, bit 21 clear
+        vmacq(&mut negative, &inv(1, 0, 0, 0));
+        assert_eq!(negative.acc.signed(0), -0x0020_0000);
+        assert_eq!(negative.regs.r[1][0], -0x0010);
     }
 
     #[test]

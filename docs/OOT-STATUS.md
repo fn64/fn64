@@ -36,7 +36,9 @@ at) — not a tracker label. Updated 2026-07-15.
   entrypoint with no unresolved game/project symbol. The dispatcher ABI shape
   follows the MIT N64Recomp `LOOKUP_FUNC`/`get_function` contract
   (`refs/N64RecompSource/include/recomp.h:443-451`).
-- **RSP audio** `fn64-audio`: 46 VU ops + scalar + dispatch. aspMain
+- **RSP audio** `fn64-audio`: all 44 canonical non-reserved VU compute ops,
+  all 23 manual vector loads/stores, the exact 48-op SU subset, COP0, and
+  general delay-slot/indirect-jump/overlay dispatch. aspMain
   recompiles, **runs** (terminates in 112 steps, not the old 5M runaway) and
   **produces PCM**. Verified live in the boot (audio enabled, no hang) and by
   a real-command-list PCM test.
