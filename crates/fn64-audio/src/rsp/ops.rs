@@ -1,9 +1,9 @@
-//! The VU op dispatch table + operand-shape descriptors — a STUB the
-//! ops-phase agents fill in. This module names every CP2 compute op the
+//! The complete VU op dispatch table + operand-shape descriptors. This module
+//! names every non-reserved CP2 compute op the
 //! RSPRecomp codegen emits, records its operand shape (matching
 //! `rsp_recomp.cpp`'s `vector_operands` map), and provides the function-shape
 //! skeleton each op body plugs into. The bodies themselves (the actual DSP
-//! math for all 47 ops) are implemented in the ops phase against the
+//! math for all 44 ops) are implemented against the
 //! `VuState`/`Accumulator`/`Flags` API in [`super::vu`].
 //!
 //! ## What "the generated call" looks like (the contract these ops satisfy)
@@ -35,17 +35,13 @@
 //!   `rsp_recomp.cpp`'s `RspOperand`),
 //! - [`operand_shape`] — the op → shape lookup (the codegen's
 //!   `vector_operands` map),
-//! - [`dispatch`] — a skeleton dispatcher that routes to per-op stubs.
-//!
-//! The per-op bodies are `todo!()`-free stubs today (they trap via
-//! [`OpStatus::Unimplemented`]); the ops phase replaces each stub with real
-//! math without changing this module's public shape.
+//! - [`dispatch`] — an exhaustive dispatcher for all canonical operations.
 
 use super::vu::{Vec8, VuState};
 
 /// Every CP2 compute op the RSPRecomp codegen emits (the `Vd,Vs,Vt` /
 /// `Vd,De,Vt` / `Vd,VsIndex,Vt` / `Vd,Vs` / `Vd` / none groups in
-/// `rsp_recomp.cpp`'s `vector_operands`). 47 ops: the multiply families, the
+/// `rsp_recomp.cpp`'s `vector_operands`). 44 ops: the multiply families, the
 /// add/sub-with-carry family, VABS, the logical ops, the compares + VMRG, the
 /// clip ops, VSAR, VMOV, the VRND pair, and the reciprocal/inverse-sqrt
 /// family, plus VNOP.
@@ -108,6 +104,56 @@ pub enum VuOp {
     // --- No-op (§6.5) ---
     Vnop,
 }
+
+/// The 44 canonical, non-reserved RSP VU compute opcodes from the Programmer's
+/// Guide Tables 3-2 and 3-5 through 3-8. The remaining function encodings in
+/// those tables are reserved; they are not additional instructions.
+pub const ALL_VU_OPS: [VuOp; 44] = [
+    VuOp::Vmulf,
+    VuOp::Vmulu,
+    VuOp::Vrndp,
+    VuOp::Vmulq,
+    VuOp::Vmudl,
+    VuOp::Vmudm,
+    VuOp::Vmudn,
+    VuOp::Vmudh,
+    VuOp::Vmacf,
+    VuOp::Vmacu,
+    VuOp::Vrndn,
+    VuOp::Vmacq,
+    VuOp::Vmadl,
+    VuOp::Vmadm,
+    VuOp::Vmadn,
+    VuOp::Vmadh,
+    VuOp::Vadd,
+    VuOp::Vsub,
+    VuOp::Vabs,
+    VuOp::Vaddc,
+    VuOp::Vsubc,
+    VuOp::Vsar,
+    VuOp::Vlt,
+    VuOp::Veq,
+    VuOp::Vne,
+    VuOp::Vge,
+    VuOp::Vcl,
+    VuOp::Vch,
+    VuOp::Vcr,
+    VuOp::Vmrg,
+    VuOp::Vand,
+    VuOp::Vnand,
+    VuOp::Vor,
+    VuOp::Vnor,
+    VuOp::Vxor,
+    VuOp::Vnxor,
+    VuOp::Vrcp,
+    VuOp::Vrcpl,
+    VuOp::Vrcph,
+    VuOp::Vmov,
+    VuOp::Vrsq,
+    VuOp::Vrsql,
+    VuOp::Vrsqh,
+    VuOp::Vnop,
+];
 
 /// The 3-operand shape of a VU op, mirroring `rsp_recomp.cpp`'s `RspOperand`
 /// tuple in `vector_operands`. Names which of `Vd`/`Vs`/`Vt`/`De`/`VsIndex`
@@ -205,7 +251,12 @@ pub fn operand_shape(op: VuOp) -> OperandShape {
             element_ignored: false,
         },
         // Vd, De, Vt
-        VuOp::Vmov | VuOp::Vrcp | VuOp::Vrcpl | VuOp::Vrcph | VuOp::Vrsq | VuOp::Vrsql
+        VuOp::Vmov
+        | VuOp::Vrcp
+        | VuOp::Vrcpl
+        | VuOp::Vrcph
+        | VuOp::Vrsq
+        | VuOp::Vrsql
         | VuOp::Vrsqh => vd_de_vt,
         // Nop
         VuOp::Vnop => OperandShape {
@@ -237,22 +288,20 @@ pub struct OpInvocation {
     pub vs_index: usize,
 }
 
-/// Result of attempting to execute an op through the dispatcher stub. The ops
-/// phase replaces the per-op `Unimplemented` arms with `Executed`.
+/// Result of attempting to execute an op through the dispatcher. The
+/// compatibility variant remains for generated callers, but the exhaustive
+/// canonical dispatcher never returns it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpStatus {
     /// The op ran and mutated `state` in place.
     Executed,
-    /// The op body is not yet implemented (foundation phase). Names which op
-    /// so a caller that reaches an unimplemented op fails loudly rather than
-    /// silently miscomputing.
+    /// Compatibility trap for generated code built against an older partial
+    /// dispatcher. Names the operation so failure is loud.
     Unimplemented(VuOp),
 }
 
-/// Dispatch skeleton: route a decoded op to its body. Today every arm returns
-/// `OpStatus::Unimplemented(op)` — the ops phase fills the bodies in, calling
-/// into the [`super::vu`] API (element_select, clamp_*, the accumulator and
-/// flag helpers). The signature is the stable seam: an op body takes
+/// Route a decoded canonical op to its complete body. The signature is the
+/// stable seam: an op body takes
 /// `&mut VuState` and the resolved `OpInvocation` and returns `OpStatus`.
 ///
 /// Keeping this exhaustive `match` here means adding/here-implementing an op
@@ -291,6 +340,7 @@ pub fn dispatch(state: &mut VuState, op: VuOp, inv: OpInvocation) -> OpStatus {
         }
         // --- Multiply-accumulate family (§6.2) + VSAR (§6.9) ---
         VuOp::Vmacf
+        | VuOp::Vmacu
         | VuOp::Vmacq
         | VuOp::Vmadh
         | VuOp::Vmadm
@@ -311,6 +361,10 @@ pub fn dispatch(state: &mut VuState, op: VuOp, inv: OpInvocation) -> OpStatus {
         // --- "mul-hi" multiply family (set accumulator, §6.1) ---
         VuOp::Vmulf => {
             super::vu_ops::mul_hi::vmulf(state, &inv);
+            OpStatus::Executed
+        }
+        VuOp::Vmulu => {
+            super::vu_ops::mul_hi::vmulu(state, &inv);
             OpStatus::Executed
         }
         VuOp::Vmulq => {
@@ -345,17 +399,12 @@ pub fn dispatch(state: &mut VuState, op: VuOp, inv: OpInvocation) -> OpStatus {
         | VuOp::Vrndn
         | VuOp::Vrndp
         | VuOp::Vrcp
+        | VuOp::Vrcpl
         | VuOp::Vrcph
         | VuOp::Vrsq
+        | VuOp::Vrsql
         | VuOp::Vrsqh => super::vu_ops::recip::try_dispatch(state, op, &inv)
             .expect("recip family op routed to recip::try_dispatch"),
-        // Other families are implemented by their own op-group modules; until
-        // wired here they trap loudly rather than silently miscomputing. The
-        // `_ = &inv` keeps the operand fields live for the not-yet-wired arms.
-        _ => {
-            let _ = &inv;
-            OpStatus::Unimplemented(op)
-        }
     }
 }
 
@@ -405,17 +454,12 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_stub_reports_unimplemented_by_op() {
+    fn every_canonical_vu_op_is_dispatched() {
         let mut state = VuState::new();
         let inv = OpInvocation::default();
-        // Use an op no family module has wired yet, so this still exercises
-        // the loud "unimplemented" trap. (Vmulf/Vrndp are now implemented by
-        // the mul-hi/recip families; the paired low ops Vrcpl/Vrsql remain
-        // unrouted stubs — no group wires them.)
-        assert_eq!(
-            dispatch(&mut state, VuOp::Vrcpl, inv),
-            OpStatus::Unimplemented(VuOp::Vrcpl)
-        );
+        for op in ALL_VU_OPS {
+            assert_eq!(dispatch(&mut state, op, inv), OpStatus::Executed, "{op:?}");
+        }
     }
 
     #[test]

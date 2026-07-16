@@ -112,7 +112,7 @@ fn main() {
                 );
             }
             if pc == 0x1080 {
-                println!("DISPATCH jr r2 -> 0x{:04X}", m.reg(2) & 0x1FFF);
+                println!("DISPATCH jr r2 -> 0x{:04X}", 0x1000 | (m.reg(2) & 0x0FFF));
             }
         }
         let delay = if idx + 1 < n {
@@ -125,7 +125,10 @@ fn main() {
             recent.remove(0);
         }
         match instr {
-            Instr::Break => break RspExitReason::Broke,
+            Instr::Break => {
+                m.break_rsp();
+                break RspExitReason::Broke;
+            }
             Instr::Nop => pc += 4,
             Instr::Lui { rt, imm } => {
                 m.set_reg(rt, (imm as u32) << 16);
@@ -147,23 +150,6 @@ fn main() {
                 exec_shift(&mut m, op, rd, rt, 0, Some(rs));
                 pc += 4;
             }
-            Instr::CondMove {
-                on_zero,
-                rd,
-                rs,
-                rt,
-            } => {
-                let c = if on_zero {
-                    m.reg(rt) == 0
-                } else {
-                    m.reg(rt) != 0
-                };
-                if c {
-                    let v = m.reg(rs);
-                    m.set_reg(rd, v);
-                }
-                pc += 4;
-            }
             Instr::Load {
                 op,
                 rt,
@@ -182,8 +168,9 @@ fn main() {
                 exec_store(&mut m, op, rt, b, off);
                 pc += 4;
             }
-            Instr::Mfc0 { rt, .. } => {
-                m.set_reg(rt, 0);
+            Instr::Mfc0 { rt, cop0 } => {
+                let value = m.read_cp0(cop0);
+                m.set_reg(rt, value);
                 pc += 4;
             }
             Instr::Mtc0 { rt, cop0 } => {
@@ -265,13 +252,21 @@ fn main() {
                 run_delay(&mut m, delay);
                 pc = if taken { target as u32 } else { pc + 8 };
             }
-            Instr::BranchZ { op, rs, target } => {
+            Instr::BranchZ {
+                op,
+                rs,
+                target,
+                link,
+            } => {
                 let taken = match op {
                     BranchZOp::Blez => (m.reg(rs) as i32) <= 0,
                     BranchZOp::Bgtz => (m.reg(rs) as i32) > 0,
                     BranchZOp::Bltz => (m.reg(rs) as i32) < 0,
                     BranchZOp::Bgez => (m.reg(rs) as i32) >= 0,
                 };
+                if let Some(ret) = link {
+                    m.set_reg(31, ret as u32);
+                }
                 run_delay(&mut m, delay);
                 pc = if taken { target as u32 } else { pc + 8 };
             }
@@ -285,12 +280,12 @@ fn main() {
                 pc = target as u32;
             }
             Instr::Jr { rs } => {
-                let jt = m.reg(rs) & 0x1FFF;
+                let jt = 0x1000 | (m.reg(rs) & 0x0FFF);
                 run_delay(&mut m, delay);
                 pc = jt;
             }
             Instr::Jalr { rd, rs, ret } => {
-                let jt = m.reg(rs) & 0x1FFF;
+                let jt = 0x1000 | (m.reg(rs) & 0x0FFF);
                 m.set_reg(rd, ret as u32);
                 run_delay(&mut m, delay);
                 pc = jt;
@@ -325,7 +320,10 @@ fn run_delay(m: &mut RspMachine, delay: Option<Instr>) {
         Some(Instr::Lui { rt, imm }) => m.set_reg(rt, (imm as u32) << 16),
         // A COP0 status read in a delay slot (the DMA-busy wait loops do exactly
         // this: `bnez a0,.. ; mfc0 a0,SP_DMA_BUSY`) — model as 0 like the emitter.
-        Some(Instr::Mfc0 { rt, .. }) => m.set_reg(rt, 0),
+        Some(Instr::Mfc0 { rt, cop0 }) => {
+            let value = m.read_cp0(cop0);
+            m.set_reg(rt, value);
+        }
         Some(Instr::Load { op, rt, base, off }) => exec_load(m, op, rt, base, off),
         Some(Instr::Store { op, rt, base, off }) => exec_store(m, op, rt, base, off),
         Some(Instr::Mtc0 { rt, cop0 }) => exec_mtc0(m, rt, cop0),
@@ -445,13 +443,5 @@ fn exec_store(
 
 fn exec_mtc0(m: &mut RspMachine, rt: u8, cop0: u8) {
     let v = m.reg(rt);
-    match cop0 {
-        0 => m.set_dma_mem(v),
-        1 => m.set_dma_dram(v),
-        2 => {
-            let _ = m.dma_read(v);
-        }
-        3 => m.dma_write(v),
-        _ => {}
-    }
+    let _ = m.write_cp0(cop0, v);
 }

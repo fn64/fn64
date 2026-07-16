@@ -14,8 +14,8 @@
 //!
 //! ## Provenance
 //!
-//! The vector load/store element semantics are the public, community-
-//! documented RSP behavior (n64brew "RSP" / "Vector loads and stores"): a
+//! The vector load/store element semantics follow the public SGI *Nintendo 64
+//! RSP Programmer's Guide*, Chapter 3 and instruction appendix: a
 //! quad load (`LQV`) fills the vector from the addressed 16-byte-aligned
 //! window; `LDV`/`LLV`/`LSV`/`LBV` fill 8/4/2/1 bytes starting at element
 //! `e`; the packed loads (`LPV`/`LUV`/`LHV`/`LFV`) spread bytes across lanes
@@ -42,6 +42,20 @@ pub struct RspMachine<'a> {
     pub dmem: Dmem,
     /// Main memory (rdram), for DMA. Bounds-checked on every access.
     pub rdram: &'a mut [u8],
+    /// RSP status bits as observed through CP0 $c4. DMA is synchronous in the
+    /// recompiled runtime, so BUSY/FULL never remain set across instructions.
+    sp_status: u32,
+    sp_semaphore: bool,
+    dma_read_length: u32,
+    dma_write_length: u32,
+    dp_start: u32,
+    dp_end: u32,
+    dp_current: u32,
+    dp_status: u32,
+    dp_clock: u32,
+    dp_busy: u32,
+    dp_pipe_busy: u32,
+    dp_tmem_busy: u32,
 }
 
 impl<'a> RspMachine<'a> {
@@ -55,6 +69,18 @@ impl<'a> RspMachine<'a> {
             ctx,
             dmem: Dmem::new(),
             rdram,
+            sp_status: 0,
+            sp_semaphore: false,
+            dma_read_length: 0,
+            dma_write_length: 0,
+            dp_start: 0,
+            dp_end: 0,
+            dp_current: 0,
+            dp_status: 0,
+            dp_clock: 0,
+            dp_busy: 0,
+            dp_pipe_busy: 0,
+            dp_tmem_busy: 0,
         }
     }
 
@@ -134,30 +160,127 @@ impl<'a> RspMachine<'a> {
         let hi = (val >> 8) as u8;
         let lo = val as u8;
         bytes[(e as usize) & 0xF] = hi;
-        // Only e+1 within the register is written; e=15 writes just the one.
-        if (e as usize) + 1 < 16 {
-            bytes[(e as usize) + 1] = lo;
-        }
+        bytes[(e as usize + 1) & 0xF] = lo;
         self.ctx.rsp.regs.r[vs as usize] = bytes_to_vec(&bytes);
     }
 
     /// `cfc2 rt, cd`: read a VU control register (0=VCO, 1=VCC, 2=VCE),
     /// sign-extended to 32 bits (the control regs read as signed 16-bit).
     pub fn cfc2(&self, cd: u8) -> u32 {
-        let v: u16 = match cd & 3 {
+        let v: u16 = match cd {
             0 => self.ctx.rsp.flags.vco,
             1 => self.ctx.rsp.flags.vcc,
-            _ => self.ctx.rsp.flags.vce as u16,
+            2 => self.ctx.rsp.flags.vce as u16,
+            _ => panic!("invalid RSP CFC2 control register c{cd}"),
         };
         v as i16 as i32 as u32
     }
 
     /// `ctc2 rt, cd`: write a VU control register from a scalar reg.
     pub fn ctc2(&mut self, cd: u8, val: u32) {
-        match cd & 3 {
+        match cd {
             0 => self.ctx.rsp.flags.vco = val as u16,
             1 => self.ctx.rsp.flags.vcc = val as u16,
-            _ => self.ctx.rsp.flags.vce = val as u8,
+            2 => self.ctx.rsp.flags.vce = val as u8,
+            _ => panic!("invalid RSP CTC2 control register c{cd}"),
+        }
+    }
+
+    // -- CP0 control registers (Programmer's Guide, Table 4-1) --
+
+    /// Read one of the 16 RSP-view CP0 registers. Reading the semaphore
+    /// returns its previous value and atomically sets it, as on hardware.
+    pub fn read_cp0(&mut self, reg: u8) -> u32 {
+        match reg {
+            0 => self.ctx.dma_mem_address,
+            1 => self.ctx.dma_dram_address,
+            2 => self.dma_read_length,
+            3 => self.dma_write_length,
+            4 => self.sp_status,
+            5 | 6 => 0, // synchronous DMA: FULL and BUSY are clear at boundaries
+            7 => {
+                let previous = u32::from(self.sp_semaphore);
+                self.sp_semaphore = true;
+                previous
+            }
+            8 => self.dp_start,
+            9 => self.dp_end,
+            10 => self.dp_current,
+            11 => self.dp_status,
+            12 => self.dp_clock,
+            13 => self.dp_busy,
+            14 => self.dp_pipe_busy,
+            15 => self.dp_tmem_busy,
+            _ => panic!("invalid RSP MFC0 register c{reg}"),
+        }
+    }
+
+    /// Write one RSP-view CP0 register. A read-DMA into IMEM returns
+    /// `SwapOverlay`; all other writes complete synchronously.
+    pub fn write_cp0(&mut self, reg: u8, value: u32) -> Option<RspExitReason> {
+        match reg {
+            0 => self.set_dma_mem(value),
+            1 => self.set_dma_dram(value),
+            2 => {
+                self.dma_read_length = value;
+                return self.dma_read(value);
+            }
+            3 => {
+                self.dma_write_length = value;
+                self.dma_write(value);
+            }
+            4 => self.write_sp_status(value),
+            5 | 6 | 10 | 12 | 13 | 14 | 15 => {
+                // Architecturally read-only registers ignore writes.
+            }
+            7 => self.sp_semaphore = false,
+            8 => self.dp_start = value & 0x00FF_FFF8,
+            9 => {
+                self.dp_end = value & 0x00FF_FFF8;
+                // No RDP execution engine lives in fn64-audio. Model the
+                // command DMA as instant so polling loops observe idle.
+                self.dp_current = self.dp_end;
+            }
+            11 => self.write_dp_status(value),
+            _ => panic!("invalid RSP MTC0 register c{reg}"),
+        }
+        None
+    }
+
+    /// BREAK sets HALT and BROKE (Programmer's Guide, BREAK and Table 4-2).
+    pub fn break_rsp(&mut self) {
+        self.sp_status |= 0x3;
+    }
+
+    fn write_sp_status(&mut self, command: u32) {
+        set_clear_pair(&mut self.sp_status, command, 0, 1, 0); // HALT
+        if command & (1 << 2) != 0 {
+            self.sp_status &= !(1 << 1); // clear BROKE; no set command exists
+        }
+        set_clear_pair(&mut self.sp_status, command, 5, 6, 5); // single step
+        set_clear_pair(&mut self.sp_status, command, 7, 8, 6); // interrupt on break
+        for signal in 0..8 {
+            let clear = 9 + signal * 2;
+            set_clear_pair(&mut self.sp_status, command, clear, clear + 1, 7 + signal);
+        }
+    }
+
+    fn write_dp_status(&mut self, command: u32) {
+        // RDP status write commands (Programmer's Guide, Table 4-5).
+        set_clear_pair(&mut self.dp_status, command, 0, 1, 0); // XBUS DMEM DMA
+        set_clear_pair(&mut self.dp_status, command, 2, 3, 1); // freeze
+        set_clear_pair(&mut self.dp_status, command, 4, 5, 2); // flush
+        if command & (1 << 6) != 0 {
+            self.dp_tmem_busy = 0;
+        }
+        if command & (1 << 7) != 0 {
+            self.dp_pipe_busy = 0;
+        }
+        if command & (1 << 8) != 0 {
+            self.dp_busy = 0;
+        }
+        if command & (1 << 9) != 0 {
+            self.dp_clock = 0;
         }
     }
 
@@ -196,13 +319,10 @@ impl<'a> RspMachine<'a> {
                 let start = addr & !0xF;
                 let count = (addr - start) as usize;
                 let mut a = start;
-                let mut idx = 16 - count;
-                for _ in 0..count {
-                    if idx < 16 {
-                        bytes[idx] = self.dmem.read_bu(a);
-                    }
+                let first = 16i32 - count as i32 + e as i32;
+                for byte in bytes.iter_mut().skip(first.max(0) as usize) {
+                    *byte = self.dmem.read_bu(a);
                     a = a.wrapping_add(1);
-                    idx += 1;
                 }
             }
             VLoadOp::Lpv | VLoadOp::Luv => {
@@ -211,7 +331,8 @@ impl<'a> RspMachine<'a> {
                 let addr = base_val.wrapping_add((off as i32 * 8) as u32);
                 let mut lanes = [0i16; LANES];
                 for (i, lane) in lanes.iter_mut().enumerate() {
-                    let b = self.dmem.read_bu(addr.wrapping_add(i as u32)) as i16;
+                    let source = ((16 - e + i) & 0xF) as u32;
+                    let b = self.dmem.read_bu(addr.wrapping_add(source)) as i16;
                     *lane = match op {
                         VLoadOp::Lpv => b << 8,
                         _ => b << 7, // LUV
@@ -225,7 +346,8 @@ impl<'a> RspMachine<'a> {
                 let addr = base_val.wrapping_add((off as i32 * 16) as u32);
                 let mut lanes = [0i16; LANES];
                 for (i, lane) in lanes.iter_mut().enumerate() {
-                    let b = self.dmem.read_bu(addr.wrapping_add((i as u32) * 2)) as i16;
+                    let source = ((16 - e + i * 2) & 0xF) as u32;
+                    let b = self.dmem.read_bu(addr.wrapping_add(source)) as i16;
                     *lane = b << 7;
                 }
                 self.ctx.rsp.regs.r[vt as usize] = lanes;
@@ -236,8 +358,9 @@ impl<'a> RspMachine<'a> {
                 let addr = base_val.wrapping_add((off as i32 * 16) as u32);
                 let mut lanes = self.ctx.rsp.regs.r[vt as usize];
                 for i in 0..4usize {
+                    let lane = ((e >> 1) + i) & 7;
                     let b = self.dmem.read_bu(addr.wrapping_add((i as u32) * 4)) as i16;
-                    lanes[i] = b << 7;
+                    lanes[lane] = b << 7;
                 }
                 self.ctx.rsp.regs.r[vt as usize] = lanes;
                 return;
@@ -246,7 +369,7 @@ impl<'a> RspMachine<'a> {
                 // Transpose load: load a row of 8 halfwords into 8 registers
                 // at a rotating element. `vt` is the base of an 8-register
                 // group; `e` selects the starting lane.
-                let addr = base_val.wrapping_add((off as i32 * 16) as u32);
+                let addr = base_val.wrapping_add((off as i32 * 16) as u32) & !0xF;
                 let vt_base = (vt & !7) as usize;
                 for i in 0..LANES {
                     let a = addr.wrapping_add((i as u32) * 2);
@@ -296,7 +419,7 @@ impl<'a> RspMachine<'a> {
                 let end = (addr & !0xF).wrapping_add(16);
                 let mut a = addr;
                 let mut idx = e;
-                while a < end && idx < 16 {
+                while a < end {
                     self.dmem.write_bu(a, bytes[idx & 0xF]);
                     a = a.wrapping_add(1);
                     idx += 1;
@@ -306,22 +429,21 @@ impl<'a> RspMachine<'a> {
                 let addr = base_val.wrapping_add((off as i32 * 16) as u32);
                 let start = addr & !0xF;
                 let count = (addr - start) as usize;
-                let mut a = start;
-                let mut idx = 16 - count;
-                for _ in 0..count {
-                    self.dmem.write_bu(a, bytes[idx & 0xF]);
-                    a = a.wrapping_add(1);
-                    idx += 1;
+                let first = (16 - count + e) & 0xF;
+                for (i, idx) in (first..).take(count).enumerate() {
+                    self.dmem
+                        .write_bu(start.wrapping_add(i as u32), bytes[idx & 0xF]);
                 }
             }
             VStoreOp::Spv | VStoreOp::Suv => {
                 // Packed store: 8 lanes -> 8 bytes.
                 let addr = base_val.wrapping_add((off as i32 * 8) as u32);
                 for i in 0..LANES {
-                    let lane = reg[i] as u16;
-                    let b = match op {
-                        VStoreOp::Spv => (lane >> 8) as u8,
-                        _ => (lane >> 7) as u8, // SUV
+                    let index = (e + i) & 0xF;
+                    let lane = reg[index & 7] as u16;
+                    let b = match (op, index < 8) {
+                        (VStoreOp::Spv, true) | (VStoreOp::Suv, false) => (lane >> 8) as u8,
+                        _ => (lane >> 7) as u8,
                     };
                     self.dmem.write_bu(addr.wrapping_add(i as u32), b);
                 }
@@ -329,28 +451,36 @@ impl<'a> RspMachine<'a> {
             VStoreOp::Shv => {
                 let addr = base_val.wrapping_add((off as i32 * 16) as u32);
                 for i in 0..LANES {
-                    let b = (reg[i] as u16 >> 7) as u8;
+                    let hi = bytes[(e + i * 2) & 0xF];
+                    let lo = bytes[(e + i * 2 + 1) & 0xF];
+                    let b = (hi << 1) | (lo >> 7);
                     self.dmem.write_bu(addr.wrapping_add((i as u32) * 2), b);
                 }
             }
             VStoreOp::Sfv => {
                 let addr = base_val.wrapping_add((off as i32 * 16) as u32);
+                let row = addr & !0xF;
+                let mut row_offset = addr & 0xF;
                 for i in 0..4usize {
-                    let b = (reg[i] as u16 >> 7) as u8;
-                    self.dmem.write_bu(addr.wrapping_add((i as u32) * 4), b);
+                    let lane = ((e >> 1) + i) & 7;
+                    let b = (reg[lane] as u16 >> 7) as u8;
+                    self.dmem.write_bu(row + (row_offset & 0xF), b);
+                    row_offset += 4;
                 }
             }
             VStoreOp::Swv => {
-                // Wrapping store of all 16 bytes starting at element e.
+                // Wrapped store remains within the addressed aligned DMEM row.
                 let addr = base_val.wrapping_add((off as i32 * 16) as u32);
+                let row = addr & !0xF;
+                let row_offset = addr & 0xF;
                 for i in 0..16usize {
                     self.dmem
-                        .write_bu(addr.wrapping_add(i as u32), bytes[(e + i) & 0xF]);
+                        .write_bu(row + ((row_offset + i as u32) & 0xF), bytes[(e + i) & 0xF]);
                 }
             }
             VStoreOp::Stv => {
                 // Transpose store: 8 registers' rotating lanes -> a row.
-                let addr = base_val.wrapping_add((off as i32 * 16) as u32);
+                let addr = base_val.wrapping_add((off as i32 * 16) as u32) & !0xF;
                 let vt_base = (vt & !7) as usize;
                 for i in 0..LANES {
                     let reg_idx = vt_base + ((i + (e >> 1)) & 7);
@@ -397,40 +527,46 @@ impl<'a> RspMachine<'a> {
     /// must resolve — returns `Some(RspExitReason::SwapOverlay)`; the recomp
     /// loop propagates it. Otherwise returns `None`.
     ///
-    /// `len` is the raw `SP_RD_LEN` value; the real hardware length is the low
-    /// 12 bits + 1 (skip/count fields ignored for these simple single-block
-    /// audio DMAs — the audio ucode uses count=0/skip=0 blocks).
+    /// `len` is the raw length/count/skip encoding. The hardware forces the
+    /// low three address bits to zero and the low three length bits to one.
     pub fn dma_read(&mut self, len: u32) -> Option<RspExitReason> {
         if self.ctx.dma_mem_address & 0x1000 != 0 {
             return Some(RspExitReason::SwapOverlay);
         }
-        let count = ((len & 0xFFF) + 1) as usize;
-        let dram = self.ctx.dma_dram_address as usize & 0x00FF_FFFF;
-        let mem = self.ctx.dma_mem_address as usize & (DMEM_SIZE - 1);
-        for i in 0..count {
-            let src = dram + i;
-            if src >= self.rdram.len() {
-                break;
+        let (line_len, lines, skip) = decode_dma_length(len);
+        let mut dram = self.ctx.dma_dram_address as usize & 0x00FF_FFF8;
+        let mut mem = self.ctx.dma_mem_address as usize & (DMEM_SIZE - 8);
+        for _ in 0..lines {
+            for i in 0..line_len {
+                if let Some(&b) = self.rdram.get(dram + i) {
+                    self.dmem.as_bytes_mut()[(mem + i) & (DMEM_SIZE - 1)] = b;
+                }
             }
-            let b = self.rdram[src];
-            self.dmem.as_bytes_mut()[(mem + i) & (DMEM_SIZE - 1)] = b;
+            dram = dram.wrapping_add(line_len + skip);
+            mem = (mem + line_len) & (DMEM_SIZE - 1);
         }
+        self.ctx.dma_dram_address = dram as u32;
+        self.ctx.dma_mem_address = mem as u32;
         None
     }
 
     /// `DO_DMA_WRITE` (`SP_WR_LEN` write): copy `len+1` bytes from DMEM at
     /// `dma_mem_address & 0xFFF` back to rdram at `dma_dram_address`.
     pub fn dma_write(&mut self, len: u32) {
-        let count = ((len & 0xFFF) + 1) as usize;
-        let dram = self.ctx.dma_dram_address as usize & 0x00FF_FFFF;
-        let mem = self.ctx.dma_mem_address as usize & (DMEM_SIZE - 1);
-        for i in 0..count {
-            let dst = dram + i;
-            if dst >= self.rdram.len() {
-                break;
+        let (line_len, lines, skip) = decode_dma_length(len);
+        let mut dram = self.ctx.dma_dram_address as usize & 0x00FF_FFF8;
+        let mut mem = self.ctx.dma_mem_address as usize & (DMEM_SIZE - 8);
+        for _ in 0..lines {
+            for i in 0..line_len {
+                if let Some(dst) = self.rdram.get_mut(dram + i) {
+                    *dst = self.dmem.as_bytes()[(mem + i) & (DMEM_SIZE - 1)];
+                }
             }
-            self.rdram[dst] = self.dmem.as_bytes()[(mem + i) & (DMEM_SIZE - 1)];
+            dram = dram.wrapping_add(line_len + skip);
+            mem = (mem + line_len) & (DMEM_SIZE - 1);
         }
+        self.ctx.dma_dram_address = dram as u32;
+        self.ctx.dma_mem_address = mem as u32;
     }
 
     /// Convenience accessor for the VU state the compute-op dispatcher wants.
@@ -438,6 +574,22 @@ impl<'a> RspMachine<'a> {
     pub fn vu(&mut self) -> &mut VuState {
         &mut self.ctx.rsp
     }
+}
+
+fn set_clear_pair(state: &mut u32, command: u32, clear_cmd: u32, set_cmd: u32, bit: u32) {
+    if command & (1 << clear_cmd) != 0 {
+        *state &= !(1 << bit);
+    }
+    if command & (1 << set_cmd) != 0 {
+        *state |= 1 << bit;
+    }
+}
+
+fn decode_dma_length(value: u32) -> (usize, usize, usize) {
+    let line_len = (((value & 0x0FFF) | 7) + 1) as usize;
+    let lines = (((value >> 12) & 0xFF) + 1) as usize;
+    let skip = ((value >> 20) & 0x0FFF) as usize;
+    (line_len, lines, skip)
 }
 
 /// Convert an 8-lane big-endian vector register into its 16-byte image (lane
@@ -514,6 +666,17 @@ mod tests {
     }
 
     #[test]
+    fn mtc2_and_mfc2_wrap_byte_element_15() {
+        let mut rdram = vec![0u8; 16];
+        let mut m = RspMachine::new(&mut rdram);
+        m.mtc2(7, 15, 0x1234);
+        assert_eq!(m.mfc2(7, 15) as u16, 0x1234);
+        let bytes = vec_to_bytes(&m.ctx.rsp.regs.r[7]);
+        assert_eq!(bytes[15], 0x12);
+        assert_eq!(bytes[0], 0x34);
+    }
+
+    #[test]
     fn cfc2_ctc2_roundtrip_vcc() {
         let mut rdram = vec![0u8; 16];
         let mut m = RspMachine::new(&mut rdram);
@@ -547,6 +710,201 @@ mod tests {
         let mut m = RspMachine::new(&mut rdram);
         m.set_dma_mem(0x1000); // IMEM bit set
         assert_eq!(m.dma_read(0), Some(RspExitReason::SwapOverlay));
+    }
+
+    #[test]
+    fn dma_applies_eight_byte_alignment_count_and_skip() {
+        let mut rdram = vec![0u8; 0x1000];
+        for i in 0..8usize {
+            rdram[0x100 + i] = 0x10 + i as u8;
+            rdram[0x110 + i] = 0x20 + i as u8;
+        }
+        let mut m = RspMachine::new(&mut rdram);
+        m.set_dma_dram(0x103);
+        m.set_dma_mem(0x023);
+        // length=8 bytes, count=2 lines, skip=8 bytes.
+        let descriptor = 7 | (1 << 12) | (8 << 20);
+        assert_eq!(m.dma_read(descriptor), None);
+        assert_eq!(
+            &m.dmem.as_bytes()[0x20..0x28],
+            &(0x10u8..0x18).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &m.dmem.as_bytes()[0x28..0x30],
+            &(0x20u8..0x28).collect::<Vec<_>>()
+        );
+        assert_eq!(m.ctx.dma_mem_address, 0x30);
+        assert_eq!(m.ctx.dma_dram_address, 0x120);
+    }
+
+    #[test]
+    fn cp0_status_break_semaphore_and_dp_registers_are_observable() {
+        let mut rdram = vec![0u8; 16];
+        let mut m = RspMachine::new(&mut rdram);
+
+        // SP_STATUS write commands: set HALT, set SIG0, then clear HALT.
+        assert_eq!(m.write_cp0(4, (1 << 1) | (1 << 10)), None);
+        assert_eq!(m.read_cp0(4) & ((1 << 0) | (1 << 7)), (1 << 0) | (1 << 7));
+        m.write_cp0(4, 1 << 0);
+        assert_eq!(m.read_cp0(4) & 1, 0);
+        m.break_rsp();
+        assert_eq!(m.read_cp0(4) & 3, 3, "BREAK sets HALT and BROKE");
+
+        assert_eq!(m.read_cp0(7), 0, "first semaphore read returns clear");
+        assert_eq!(m.read_cp0(7), 1, "read atomically sets semaphore");
+        m.write_cp0(7, 0xFFFF_FFFF);
+        assert_eq!(m.read_cp0(7), 0, "any semaphore write clears it");
+
+        m.write_cp0(8, 0x12345F);
+        m.write_cp0(9, 0x23456F);
+        assert_eq!(m.read_cp0(8), 0x123458);
+        assert_eq!(m.read_cp0(9), 0x234568);
+        assert_eq!(
+            m.read_cp0(10),
+            0x234568,
+            "RDP command DMA completes synchronously"
+        );
+        assert_eq!(m.read_cp0(5), 0);
+        assert_eq!(m.read_cp0(6), 0);
+    }
+
+    #[test]
+    fn all_fixed_width_vector_load_store_sizes_are_element_addressed() {
+        let mut rdram = vec![0u8; 16];
+        let mut m = RspMachine::new(&mut rdram);
+        let cases = [
+            (VLoadOp::Lbv, VStoreOp::Sbv, 1usize),
+            (VLoadOp::Lsv, VStoreOp::Ssv, 2),
+            (VLoadOp::Llv, VStoreOp::Slv, 4),
+            (VLoadOp::Ldv, VStoreOp::Sdv, 8),
+        ];
+        for (load, store, count) in cases {
+            for i in 0..count {
+                m.dmem.write_bu(0x100 + i as u32, 0x80 + i as u8);
+            }
+            m.ctx.rsp.regs.r[3] = [0; 8];
+            m.vload(load, 3, 4, 0x100, 0);
+            m.vstore(store, 3, 4, 0x180, 0);
+            for i in 0..count {
+                assert_eq!(m.dmem.read_bu(0x180 + i as u32), 0x80 + i as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn quad_and_rest_pair_crosses_an_unaligned_boundary() {
+        let mut rdram = vec![0u8; 16];
+        let mut m = RspMachine::new(&mut rdram);
+        for i in 0..16u32 {
+            m.dmem.write_bu(0x105 + i, i as u8);
+        }
+        m.vload(VLoadOp::Lqv, 4, 0, 0x105, 0);
+        m.vload(VLoadOp::Lrv, 4, 0, 0x115, 0);
+        assert_eq!(
+            vec_to_bytes(&m.ctx.rsp.regs.r[4]),
+            core::array::from_fn(|i| i as u8)
+        );
+
+        m.vstore(VStoreOp::Sqv, 4, 0, 0x305, 0);
+        m.vstore(VStoreOp::Srv, 4, 0, 0x315, 0);
+        for i in 0..16u32 {
+            assert_eq!(m.dmem.read_bu(0x305 + i), i as u8);
+        }
+    }
+
+    #[test]
+    fn quad_and_rest_stores_wrap_nonzero_byte_elements() {
+        let mut rdram = vec![0u8; 16];
+        let mut m = RspMachine::new(&mut rdram);
+        m.ctx.rsp.regs.r[4] = bytes_to_vec(&core::array::from_fn(|i| i as u8));
+
+        m.vstore(VStoreOp::Sqv, 4, 14, 0x305, 0);
+        for i in 0..11u32 {
+            assert_eq!(m.dmem.read_bu(0x305 + i), ((14 + i) & 15) as u8);
+        }
+
+        m.vstore(VStoreOp::Srv, 4, 14, 0x32F, 0);
+        for i in 0..15u32 {
+            assert_eq!(m.dmem.read_bu(0x320 + i), ((15 + i) & 15) as u8);
+        }
+    }
+
+    #[test]
+    fn packed_half_and_fourth_vector_transfers_match_bit_positions() {
+        let mut rdram = vec![0u8; 16];
+        let mut m = RspMachine::new(&mut rdram);
+        for i in 0..8u32 {
+            m.dmem.write_bu(0x100 + i, 0x10 + i as u8);
+            m.dmem.write_bu(0x200 + i * 2, 0x20 + i as u8);
+        }
+        m.vload(VLoadOp::Lpv, 1, 0, 0x100, 0);
+        m.vstore(VStoreOp::Spv, 1, 0, 0x140, 0);
+        m.vload(VLoadOp::Luv, 2, 0, 0x100, 0);
+        m.vstore(VStoreOp::Suv, 2, 0, 0x150, 0);
+        for i in 0..8u32 {
+            assert_eq!(
+                m.ctx.rsp.regs.r[1][i as usize] as u16,
+                (0x10 + i as u16) << 8
+            );
+            assert_eq!(
+                m.ctx.rsp.regs.r[2][i as usize] as u16,
+                (0x10 + i as u16) << 7
+            );
+            assert_eq!(m.dmem.read_bu(0x140 + i), 0x10 + i as u8);
+            assert_eq!(m.dmem.read_bu(0x150 + i), 0x10 + i as u8);
+        }
+
+        m.vload(VLoadOp::Lhv, 3, 0, 0x200, 0);
+        m.vstore(VStoreOp::Shv, 3, 0, 0x240, 0);
+        for i in 0..8u32 {
+            assert_eq!(
+                m.ctx.rsp.regs.r[3][i as usize] as u16,
+                (0x20 + i as u16) << 7
+            );
+            assert_eq!(m.dmem.read_bu(0x240 + i * 2), 0x20 + i as u8);
+        }
+
+        for i in 0..4u32 {
+            m.dmem.write_bu(0x280 + i * 4, 0x30 + i as u8);
+        }
+        m.vload(VLoadOp::Lfv, 4, 8, 0x280, 0);
+        m.vstore(VStoreOp::Sfv, 4, 8, 0x2C0, 0);
+        for i in 0..4u32 {
+            assert_eq!(
+                m.ctx.rsp.regs.r[4][4 + i as usize] as u16,
+                (0x30 + i as u16) << 7
+            );
+            assert_eq!(m.dmem.read_bu(0x2C0 + i * 4), 0x30 + i as u8);
+        }
+    }
+
+    #[test]
+    fn transpose_and_wrapped_store_cover_register_and_row_rotation() {
+        let mut rdram = vec![0u8; 16];
+        let mut m = RspMachine::new(&mut rdram);
+        for i in 0..8u32 {
+            m.dmem.write_h(0x300 + i * 2, (0x4000 + i) as i16);
+        }
+        m.vload(VLoadOp::Ltv, 8, 4, 0x300, 0);
+        for i in 0..8usize {
+            let reg = 8 + ((i + 2) & 7);
+            assert_eq!(m.ctx.rsp.regs.r[reg][i], (0x4000 + i) as i16);
+        }
+        m.vstore(VStoreOp::Stv, 8, 4, 0x340, 0);
+        for i in 0..8u32 {
+            assert_eq!(m.dmem.read_hu(0x340 + i * 2), 0x4000 + i as u16);
+        }
+
+        m.ctx.rsp.regs.r[5] =
+            core::array::from_fn(|i| u16::from_be_bytes([i as u8 * 2, i as u8 * 2 + 1]) as i16);
+        let source = vec_to_bytes(&m.ctx.rsp.regs.r[5]);
+        m.vstore(VStoreOp::Swv, 5, 3, 0x385, 0);
+        for i in 0..16usize {
+            assert_eq!(
+                m.dmem.read_bu(0x380 + ((5 + i) & 0xF) as u32),
+                source[(3 + i) & 0xF]
+            );
+        }
     }
 
     #[test]

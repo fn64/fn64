@@ -3,9 +3,9 @@
 //!
 //! ## Provenance (clean-room)
 //!
-//! Every opcode/funct/field encoding below is byte-cited from the **public**
-//! MIPS-I ISA and the community RSP references, cross-checked against the
-//! **MIT-licensed** rabbitizer *encoding tables* (the `.inc` data tables in
+//! Every opcode/funct/field encoding below is cited from the **public** SGI
+//! *Nintendo 64 RSP Programmer's Guide* instruction appendix and opcode
+//! tables, cross-checked against the **MIT-licensed** rabbitizer encoding tables (the `.inc` data tables in
 //! `N64RecompSource/lib/rabbitizer/tables/tables/instr_id/rsp/`, and the
 //! bit-field getters in `rabbitizer/include/instructions/RabbitizerInstructionRsp.h`).
 //! Those are data/field-layout tables (MIT), not the GPL `librecomp`
@@ -56,14 +56,6 @@ pub enum Instr {
     Shift { op: ShiftOp, rd: u8, rt: u8, sa: u8 },
     /// `rd = rt << (rs & 31)` etc. (sllv/srlv/srav).
     ShiftVar { op: ShiftOp, rd: u8, rt: u8, rs: u8 },
-    /// `movz`/`movn`: `rd = rs` conditional on `rt == 0` / `rt != 0`.
-    CondMove {
-        on_zero: bool,
-        rd: u8,
-        rs: u8,
-        rt: u8,
-    },
-
     // --- Scalar ALU, immediate form ---
     /// `rt = rs OP imm` (addi/addiu/slti/sltiu/andi/ori/xori).
     AluImm {
@@ -100,7 +92,14 @@ pub enum Instr {
         target: u16,
     },
     /// `blez`/`bgtz`/`bltz`/`bgez`: compare rs to 0; branch to `target`.
-    BranchZ { op: BranchZOp, rs: u8, target: u16 },
+    BranchZ {
+        op: BranchZOp,
+        rs: u8,
+        target: u16,
+        /// `Some(pc+8)` for BLTZAL/BGEZAL. The link is written
+        /// unconditionally, even when the branch is not taken.
+        link: Option<u16>,
+    },
     /// `j target` (absolute jump within IMEM).
     Jump { target: u16 },
     /// `jal target`: link into r31, jump.
@@ -147,7 +146,7 @@ pub enum Instr {
         off: i16,
     },
 
-    // --- CP2 compute (the 47 VU ops the framework implements) ---
+    // --- CP2 compute (44 canonical non-reserved VU ops) ---
     /// A CP2 compute op. Carries the [`VuOp`] plus the raw operand fields; the
     /// emitter resolves them via the op's [`crate::rsp::ops::operand_shape`].
     Vu {
@@ -334,20 +333,25 @@ fn vec_offset_raw(word: u32) -> u32 {
 }
 
 /// The absolute IMEM word-address a branch/jump targets. RSP IMEM is 0x1000
-/// bytes; the recompiler masks branch targets with `rsp_mem_mask = 0x1FFF`
-/// (`rsp_recomp.cpp:18`), which we reproduce so an IMEM-relative label is
-/// stable. `pc` is the address of the branch instruction itself.
+/// bytes and its hardware PC is 12 bits (Programmer's Guide pp. 95, 173-176).
+/// We normalize that PC into the 0x1000..0x1fff IMEM address window used by
+/// the emitted match labels. `pc` is the address of the branch itself.
 fn branch_target(pc: u32, imm: u16) -> u16 {
     // Sign-extend the 16-bit immediate, shift by 2, add to the delay-slot PC.
     let delta = (imm as i16 as i32) << 2;
     let dest = (pc.wrapping_add(4) as i32).wrapping_add(delta) as u32;
-    (dest & 0x1FFF) as u16
+    (0x1000 | (dest & 0x0FFF)) as u16
 }
 
 /// The absolute IMEM word-address a `j`/`jal` targets (26-bit field << 2,
 /// masked into RSP mem range).
 fn jump_target(word: u32) -> u16 {
-    ((target26(word) << 2) & 0x1FFF) as u16
+    (0x1000 | ((target26(word) << 2) & 0x0FFF)) as u16
+}
+
+#[inline]
+fn link_address(pc: u32) -> u16 {
+    (pc.wrapping_add(8) & 0x0FFF) as u16
 }
 
 /// Decode one 32-bit big-endian RSP instruction word at IMEM address `pc`.
@@ -367,7 +371,7 @@ pub fn decode(word: u32, pc: u32) -> Instr {
         },
         0x03 => Instr::Jal {
             target: jump_target(word),
-            ret: ((pc.wrapping_add(8)) & 0x1FFF) as u16,
+            ret: link_address(pc),
         },
         0x04 => Instr::Branch {
             op: BranchOp::Beq,
@@ -385,11 +389,13 @@ pub fn decode(word: u32, pc: u32) -> Instr {
             op: BranchZOp::Blez,
             rs: rs(word),
             target: branch_target(pc, imm(word)),
+            link: None,
         },
         0x07 => Instr::BranchZ {
             op: BranchZOp::Bgtz,
             rs: rs(word),
             target: branch_target(pc, imm(word)),
+            link: None,
         },
         0x08 => alu_imm(AluImmOp::Addi, word),
         0x09 => alu_imm(AluImmOp::Addiu, word),
@@ -466,19 +472,7 @@ fn decode_special(word: u32, pc: u32) -> Instr {
         0x09 => Instr::Jalr {
             rd: rd(word),
             rs: rs(word),
-            ret: ((pc.wrapping_add(8)) & 0x1FFF) as u16,
-        },
-        0x0A => Instr::CondMove {
-            on_zero: true,
-            rd: rd(word),
-            rs: rs(word),
-            rt: rt(word),
-        },
-        0x0B => Instr::CondMove {
-            on_zero: false,
-            rd: rd(word),
-            rs: rs(word),
-            rt: rt(word),
+            ret: link_address(pc),
         },
         0x0D => Instr::Break,
         0x20 => alu_reg(AluRegOp::Add, word),
@@ -501,11 +495,25 @@ fn decode_regimm(word: u32, pc: u32) -> Instr {
             op: BranchZOp::Bltz,
             rs: rs(word),
             target: branch_target(pc, imm(word)),
+            link: None,
         },
         0x01 => Instr::BranchZ {
             op: BranchZOp::Bgez,
             rs: rs(word),
             target: branch_target(pc, imm(word)),
+            link: None,
+        },
+        0x10 => Instr::BranchZ {
+            op: BranchZOp::Bltz,
+            rs: rs(word),
+            target: branch_target(pc, imm(word)),
+            link: Some(link_address(pc)),
+        },
+        0x11 => Instr::BranchZ {
+            op: BranchZOp::Bgez,
+            rs: rs(word),
+            target: branch_target(pc, imm(word)),
+            link: Some(link_address(pc)),
         },
         _ => Instr::Unknown { word },
     }
@@ -514,11 +522,11 @@ fn decode_regimm(word: u32, pc: u32) -> Instr {
 fn decode_cop0(word: u32) -> Instr {
     // COP0 sub-op is in the rs field: 0x00 mfc0, 0x04 mtc0 (rsp_cop0.inc).
     match rs(word) {
-        0x00 => Instr::Mfc0 {
+        0x00 if rd(word) <= 15 => Instr::Mfc0 {
             rt: rt(word),
             cop0: rd(word),
         },
-        0x04 => Instr::Mtc0 {
+        0x04 if rd(word) <= 15 => Instr::Mtc0 {
             rt: rt(word),
             cop0: rd(word),
         },
@@ -538,7 +546,7 @@ fn decode_cop2(word: u32) -> Instr {
             vs: vs(word),
             elem: element_low(word),
         },
-        0x02 => Instr::Cfc2 {
+        0x02 if rd(word) <= 2 => Instr::Cfc2 {
             rt: rt(word),
             cd: rd(word),
         },
@@ -547,7 +555,7 @@ fn decode_cop2(word: u32) -> Instr {
             vs: vs(word),
             elem: element_low(word),
         },
-        0x06 => Instr::Ctc2 {
+        0x06 if rd(word) <= 2 => Instr::Ctc2 {
             rt: rt(word),
             cd: rd(word),
         },
@@ -793,7 +801,6 @@ mod tests {
             | (2 << 21) // base
             | (4 << 16) // vt
             | (0x04 << 11) // lwc2 subop lqv
-            | (0 << 7) // element
             | 0x01; // offset raw = 1
         assert_eq!(
             decode(w, 0),
@@ -840,7 +847,8 @@ mod tests {
     #[test]
     fn beq_branch_target_pc_relative() {
         // beq $2,$3, +2 words (imm=1): op=0x04, rs=2, rt=3, imm=1.
-        // target = (pc+4) + (1<<2) = pc+8. At pc=0x40 -> 0x48.
+        // target = (pc+4) + (1<<2) = PC+8. The hardware PC is 12 bits;
+        // emitted addresses normalize that offset into IMEM, so 0x40 -> 0x1048.
         let w = (0x04u32 << 26) | (2 << 21) | (3 << 16) | 0x0001;
         assert_eq!(
             decode(w, 0x40),
@@ -848,9 +856,261 @@ mod tests {
                 op: BranchOp::Beq,
                 rs: 2,
                 rt: 3,
-                target: 0x48
+                target: 0x1048
             }
         );
+    }
+
+    #[test]
+    fn linked_regimm_branches_decode_and_link_pc_plus_8() {
+        // Programmer's Guide pp. 164 and 168: REGIMM rt=0x10/0x11 are
+        // BLTZAL/BGEZAL; both write r31=pc+8 whether or not the branch wins.
+        let bltzal = (0x01u32 << 26) | (5 << 21) | (0x10 << 16) | 1;
+        let bgezal = (0x01u32 << 26) | (6 << 21) | (0x11 << 16) | 1;
+        assert_eq!(
+            decode(bltzal, 0x1000),
+            Instr::BranchZ {
+                op: BranchZOp::Bltz,
+                rs: 5,
+                target: 0x1008,
+                link: Some(0x0008),
+            }
+        );
+        assert_eq!(
+            decode(bgezal, 0x1000),
+            Instr::BranchZ {
+                op: BranchZOp::Bgez,
+                rs: 6,
+                target: 0x1008,
+                link: Some(0x0008),
+            }
+        );
+    }
+
+    #[test]
+    fn all_manual_vector_load_store_subops_decode() {
+        // Programmer's Guide Table 3-1: LWC2 subops 0..9,11 and SWC2
+        // subops 0..11.  LWC2 subop 10 is reserved (there is no manual LWV).
+        let loads = [
+            (0x00, VLoadOp::Lbv),
+            (0x01, VLoadOp::Lsv),
+            (0x02, VLoadOp::Llv),
+            (0x03, VLoadOp::Ldv),
+            (0x04, VLoadOp::Lqv),
+            (0x05, VLoadOp::Lrv),
+            (0x06, VLoadOp::Lpv),
+            (0x07, VLoadOp::Luv),
+            (0x08, VLoadOp::Lhv),
+            (0x09, VLoadOp::Lfv),
+            (0x0B, VLoadOp::Ltv),
+        ];
+        for (subop, expected) in loads {
+            let word = (0x32u32 << 26) | (1 << 21) | (2 << 16) | (subop << 11) | (6 << 7) | 0x7F;
+            assert_eq!(
+                decode(word, 0x1000),
+                Instr::VLoad {
+                    op: expected,
+                    vt: 2,
+                    elem: 6,
+                    base: 1,
+                    off: -1,
+                },
+                "LWC2 subop {subop:#x}"
+            );
+        }
+        let reserved_lwv = (0x32u32 << 26) | (0x0A << 11);
+        assert_eq!(
+            decode(reserved_lwv, 0x1000),
+            Instr::Unknown { word: reserved_lwv }
+        );
+
+        let stores = [
+            (0x00, VStoreOp::Sbv),
+            (0x01, VStoreOp::Ssv),
+            (0x02, VStoreOp::Slv),
+            (0x03, VStoreOp::Sdv),
+            (0x04, VStoreOp::Sqv),
+            (0x05, VStoreOp::Srv),
+            (0x06, VStoreOp::Spv),
+            (0x07, VStoreOp::Suv),
+            (0x08, VStoreOp::Shv),
+            (0x09, VStoreOp::Sfv),
+            (0x0A, VStoreOp::Swv),
+            (0x0B, VStoreOp::Stv),
+        ];
+        for (subop, expected) in stores {
+            let word = (0x3Au32 << 26) | (1 << 21) | (2 << 16) | (subop << 11) | (6 << 7) | 0x7F;
+            assert_eq!(
+                decode(word, 0x1000),
+                Instr::VStore {
+                    op: expected,
+                    vt: 2,
+                    elem: 6,
+                    base: 1,
+                    off: -1,
+                },
+                "SWC2 subop {subop:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_44_non_reserved_vu_function_codes_decode() {
+        // Programmer's Guide Tables 3-5 through 3-8. Reserved holes are
+        // intentionally absent; the architectural instruction count is 44.
+        let functions = [
+            (0x00, VuOp::Vmulf),
+            (0x01, VuOp::Vmulu),
+            (0x02, VuOp::Vrndp),
+            (0x03, VuOp::Vmulq),
+            (0x04, VuOp::Vmudl),
+            (0x05, VuOp::Vmudm),
+            (0x06, VuOp::Vmudn),
+            (0x07, VuOp::Vmudh),
+            (0x08, VuOp::Vmacf),
+            (0x09, VuOp::Vmacu),
+            (0x0A, VuOp::Vrndn),
+            (0x0B, VuOp::Vmacq),
+            (0x0C, VuOp::Vmadl),
+            (0x0D, VuOp::Vmadm),
+            (0x0E, VuOp::Vmadn),
+            (0x0F, VuOp::Vmadh),
+            (0x10, VuOp::Vadd),
+            (0x11, VuOp::Vsub),
+            (0x13, VuOp::Vabs),
+            (0x14, VuOp::Vaddc),
+            (0x15, VuOp::Vsubc),
+            (0x1D, VuOp::Vsar),
+            (0x20, VuOp::Vlt),
+            (0x21, VuOp::Veq),
+            (0x22, VuOp::Vne),
+            (0x23, VuOp::Vge),
+            (0x24, VuOp::Vcl),
+            (0x25, VuOp::Vch),
+            (0x26, VuOp::Vcr),
+            (0x27, VuOp::Vmrg),
+            (0x28, VuOp::Vand),
+            (0x29, VuOp::Vnand),
+            (0x2A, VuOp::Vor),
+            (0x2B, VuOp::Vnor),
+            (0x2C, VuOp::Vxor),
+            (0x2D, VuOp::Vnxor),
+            (0x30, VuOp::Vrcp),
+            (0x31, VuOp::Vrcpl),
+            (0x32, VuOp::Vrcph),
+            (0x33, VuOp::Vmov),
+            (0x34, VuOp::Vrsq),
+            (0x35, VuOp::Vrsql),
+            (0x36, VuOp::Vrsqh),
+            (0x37, VuOp::Vnop),
+        ];
+        assert_eq!(functions.len(), 44);
+        for (function, expected) in functions {
+            let word = (0x12u32 << 26)
+                | (1 << 25)
+                | (8 << 21)
+                | (2 << 16)
+                | (3 << 11)
+                | (4 << 6)
+                | function;
+            assert!(
+                matches!(decode(word, 0x1000), Instr::Vu { op, .. } if op == expected),
+                "VU function {function:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn rsp_excludes_mov_conditional_mult_div_and_64_bit_scalar_ops() {
+        // Programmer's Guide pp. 26-27 and scalar appendix: MOVZ/MOVN,
+        // MULT/DIV/HI/LO, likely branches, and all 64-bit ops are not RSP SU
+        // instructions. They must trap as unknown rather than silently run.
+        let unsupported = [
+            (1 << 21) | (2 << 16) | (3 << 11) | 0x0A, // MOVZ
+            (1 << 21) | (2 << 16) | (3 << 11) | 0x0B, // MOVN
+            (1 << 21) | (2 << 16) | 0x18,             // MULT
+            (1 << 21) | (2 << 16) | 0x1A,             // DIV
+            0x14u32 << 26,                            // BEQL
+            0x37u32 << 26,                            // LD
+        ];
+        for word in unsupported {
+            assert_eq!(decode(word, 0x1000), Instr::Unknown { word });
+        }
+    }
+
+    #[test]
+    fn all_48_manual_scalar_unit_mnemonics_decode() {
+        // Programmer's Guide scalar appendix, pp. 150-231. One representative
+        // legal encoding for every SU mnemonic (NOP included).
+        let r = |funct: u32| (1 << 21) | (2 << 16) | (3 << 11) | funct;
+        let shift = |funct: u32| (2 << 16) | (3 << 11) | (4 << 6) | funct;
+        let i = |opcode: u32| (opcode << 26) | (1 << 21) | (2 << 16) | 1;
+        let regimm = |rt: u32| (0x01 << 26) | (1 << 21) | (rt << 16) | 1;
+        let words = [
+            r(0x20),                                          // ADD
+            i(0x08),                                          // ADDI
+            i(0x09),                                          // ADDIU
+            r(0x21),                                          // ADDU
+            r(0x24),                                          // AND
+            i(0x0C),                                          // ANDI
+            i(0x04),                                          // BEQ
+            regimm(0x01),                                     // BGEZ
+            regimm(0x11),                                     // BGEZAL
+            i(0x07),                                          // BGTZ
+            i(0x06),                                          // BLEZ
+            regimm(0x00),                                     // BLTZ
+            regimm(0x10),                                     // BLTZAL
+            i(0x05),                                          // BNE
+            0x0000_000D,                                      // BREAK
+            0x02 << 26,                                       // J
+            0x03 << 26,                                       // JAL
+            r(0x09),                                          // JALR
+            r(0x08),                                          // JR
+            i(0x20),                                          // LB
+            i(0x24),                                          // LBU
+            i(0x21),                                          // LH
+            i(0x25),                                          // LHU
+            i(0x23),                                          // LW
+            i(0x0F),                                          // LUI
+            (0x10 << 26) | (2 << 16) | (3 << 11),             // MFC0
+            (0x10 << 26) | (4 << 21) | (2 << 16) | (3 << 11), // MTC0
+            0,                                                // NOP
+            r(0x27),                                          // NOR
+            r(0x25),                                          // OR
+            i(0x0D),                                          // ORI
+            i(0x28),                                          // SB
+            i(0x29),                                          // SH
+            shift(0x00),                                      // SLL
+            r(0x04),                                          // SLLV
+            r(0x2A),                                          // SLT
+            i(0x0A),                                          // SLTI
+            i(0x0B),                                          // SLTIU
+            r(0x2B),                                          // SLTU
+            shift(0x03),                                      // SRA
+            r(0x07),                                          // SRAV
+            shift(0x02),                                      // SRL
+            r(0x06),                                          // SRLV
+            r(0x22),                                          // SUB
+            r(0x23),                                          // SUBU
+            i(0x2B),                                          // SW
+            r(0x26),                                          // XOR
+            i(0x0E),                                          // XORI
+        ];
+        assert_eq!(words.len(), 48);
+        for word in words {
+            assert!(
+                !matches!(decode(word, 0x1000), Instr::Unknown { .. }),
+                "{word:#010x}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_cop_register_numbers_are_unknown() {
+        let mfc0_c16 = (0x10u32 << 26) | (2 << 16) | (16 << 11);
+        let cfc2_c3 = (0x12u32 << 26) | (0x02 << 21) | (2 << 16) | (3 << 11);
+        assert_eq!(decode(mfc0_c16, 0), Instr::Unknown { word: mfc0_c16 });
+        assert_eq!(decode(cfc2_c3, 0), Instr::Unknown { word: cfc2_c3 });
     }
 
     #[test]
