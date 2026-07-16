@@ -24,6 +24,7 @@ cc = "1"
 libc = "0.2"
 fn64-runtime = { path = "../../../crates/fn64-runtime" }
 fn64-abi = { path = "../../../crates/fn64-abi", features = ["native-recomp"] }
+fn64-boot-harness = { path = "../../../crates/fn64-boot-harness", default-features = false }
 fn64-recomp-native = { path = "../../../crates/fn64-recomp-native" }
 fn64-render = { path = "../../../crates/fn64-render" }
 fn64-render-rt64 = { path = "../../../crates/fn64-render-rt64" }

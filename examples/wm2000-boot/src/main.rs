@@ -7,9 +7,8 @@
 //!
 //! 1. Loads the user's own ROM file (`ROM` env var) into `fn64_abi::load_rom`.
 //! 2. Registers every section from the real, out-of-tree-compiled
-//!    `recomp_overlays.inl` (via `bridge/section_bridge.c`'s FFI walk into
-//!    `fn64_register_func`, below) with `fn64_abi::register_section`, then
-//!    marks the always-resident sections (0/1, per the generated table --
+//!    `recomp_overlays.inl` through `fn64-boot-harness`'s shared FFI bridge,
+//!    then marks the always-resident sections (0/1, per the generated table --
 //!    `docs/DESIGN.md`/`fn64_runtime::overlay`'s doc: entry+main) loaded.
 //! 3. Boots thread 0 running `recomp_entrypoint` (the real, linked
 //!    generated symbol) and drives the executor: `run_one_step` while
@@ -21,61 +20,7 @@
 //!    requirement 3).
 //! 5. Emits the trace log to a file and prints a summary ladder.
 
-use std::collections::HashMap;
 use std::io::Write;
-
-// ---------------------------------------------------------------------
-// FFI surface into the out-of-tree-compiled bridge (bridge/section_bridge.c)
-// and the real generated recomp_entrypoint symbol.
-// ---------------------------------------------------------------------
-
-extern "C" {
-    /// Walks the real, compiled-in `section_table[]`/`FuncEntry[]` (from
-    /// the game's own `recomp_overlays.inl`) and calls `fn64_register_func`
-    /// once per function -- see `bridge/section_bridge.c`.
-    fn fn64_bridge_register_all_sections();
-    fn fn64_bridge_num_sections() -> usize;
-
-    /// The real generated boot entry point (`RecompiledFuncs/funcs_0.c`).
-    fn recomp_entrypoint(rdram: *mut u8, ctx: *mut fn64_abi::RecompContext);
-}
-
-/// Called from C (`section_bridge.c`'s walk) once per `(section, func)`
-/// pair, in registration order. Buffers into `SECTION_BUILDER` (this
-/// process's one accumulator) rather than calling
-/// `fn64_abi::register_section` directly per-func, since that API takes a
-/// whole section's func list at once (matching `SectionRegistry`'s
-/// batch-registration contract, `fn64-runtime/src/overlay.rs`).
-#[no_mangle]
-extern "C" fn fn64_register_func(
-    section_index: usize,
-    rom_addr: u32,
-    ram_addr: u32,
-    size: u32,
-    offset: u32,
-    rom_size: u32,
-    func: fn64_abi::RecompFunc,
-) {
-    SECTION_BUILDER.with(|cell| {
-        let mut builder = cell.borrow_mut();
-        let entry = builder
-            .sections
-            .entry(section_index)
-            .or_insert_with(|| (rom_addr, ram_addr, size, Vec::new()));
-        entry.3.push((offset, rom_size, func));
-    });
-}
-
-#[derive(Default)]
-struct SectionBuilder {
-    /// section_index -> (rom_addr, ram_addr, size, funcs)
-    sections: HashMap<usize, (u32, u32, u32, Vec<(u32, u32, fn64_abi::RecompFunc)>)>,
-}
-
-thread_local! {
-    static SECTION_BUILDER: std::cell::RefCell<SectionBuilder> =
-        std::cell::RefCell::new(SectionBuilder::default());
-}
 
 /// Real translated audio ucode stand-in. The GENUINE
 /// `wm2000_audio_ucode` (RSPRecomp-generated, `aki-recomp/games/NWXE/rsp/
@@ -127,28 +72,22 @@ fn main() {
     println!("[wm2000-boot] ROM size: {} bytes", rom_bytes.len());
     fn64_abi::load_rom(rom_bytes);
 
-    // Register every section from the real recomp_overlays.inl via the
-    // bridge's C-side walk (populates SECTION_BUILDER via callbacks).
-    unsafe { fn64_bridge_register_all_sections() };
-    let num_sections = unsafe { fn64_bridge_num_sections() };
-    println!("[wm2000-boot] bridge reports {num_sections} sections in recomp_overlays.inl");
-
-    let mut section_indices: HashMap<usize, fn64_runtime::SectionIndex> = HashMap::new();
-    SECTION_BUILDER.with(|cell| {
-        let builder = cell.borrow();
-        let mut keys: Vec<_> = builder.sections.keys().copied().collect();
-        keys.sort_unstable();
-        for key in keys {
-            let (rom_addr, ram_addr, size, funcs) = &builder.sections[&key];
-            let idx = unsafe { fn64_abi::register_section(*rom_addr, *ram_addr, *size, funcs) };
-            section_indices.insert(key, idx);
-            println!(
-                "[wm2000-boot] registered section {key}: rom={rom_addr:#010x} ram={ram_addr:#010x} \
-                 size={size:#x} funcs={}",
-                funcs.len()
-            );
-        }
-    });
+    let registration = fn64_boot_harness::register_linked_sections();
+    println!(
+        "[wm2000-boot] bridge reports {} sections in recomp_overlays.inl",
+        registration.reported_count()
+    );
+    for section in registration.sections() {
+        println!(
+            "[wm2000-boot] registered section {}: rom={:#010x} ram={:#010x} \
+             size={:#x} funcs={}",
+            section.source_index,
+            section.rom_addr,
+            section.ram_addr,
+            section.size,
+            section.function_count
+        );
+    }
 
     // Per fn64_runtime::overlay's module doc: sections 0 (entry) and 1
     // (main/resident) are always-loaded; the four overlay banks (2-5) are
@@ -158,7 +97,7 @@ fn main() {
     // boot-time hardware state (no overlay bank has been PI-mapped in yet
     // this early).
     for section_key in [0usize, 1usize] {
-        if let Some(&idx) = section_indices.get(&section_key) {
+        if let Some(idx) = registration.registry_index(section_key) {
             fn64_abi::set_section_loaded(idx);
             println!("[wm2000-boot] marked section {section_key} (index {idx}) loaded");
         }
@@ -197,8 +136,7 @@ fn main() {
     // buffer's end (`docs/BOOT-NOTES-WM2000.md`'s LLDB-confirmed
     // `EXC_BAD_ACCESS`). See `fn64_runtime::mmio`'s module doc for the full
     // story.
-    const RDRAM_SIZE: usize = 8 * 1024 * 1024;
-    let mut rdram = vec![0u8; RDRAM_SIZE.max(fn64_runtime::RDRAM_MMIO_WINDOW_END as usize)];
+    let mut rdram = fn64_boot_harness::new_rdram();
     let rdram_ptr = rdram.as_mut_ptr();
 
     // Prime the MMIO backing bytes before the guest ever runs, so even a
@@ -209,7 +147,7 @@ fn main() {
 
     println!("[wm2000-boot] booting thread 0 (recomp_entrypoint)...");
     unsafe {
-        fn64_abi::boot_thread0(rdram_ptr, recomp_entrypoint, 0, 10);
+        fn64_abi::boot_thread0(rdram_ptr, fn64_boot_harness::c_recomp_entrypoint(), 0, 10);
     }
 
     // Drive boot for a bounded number of scheduling STEPS, not an unbounded
@@ -248,14 +186,14 @@ fn main() {
         }
         // Re-sync the MMIO model's current values into rdram's real bytes
         // before every step: a coroutine resumed by this step may issue a
-        // raw guest MMIO load (see this file's earlier comment on
-        // RDRAM_SIZE) at any point, and register state like AI_STATUS's
+        // raw guest MMIO load (see this file's earlier RDRAM sizing comment)
+        // at any point, and register state like AI_STATUS's
         // one-shot busy bit can change between steps via an `osAiXxx_recomp`
         // shim call the PREVIOUS step made.
         unsafe { fn64_abi::sync_mmio_into_rdram(rdram_ptr) };
         let stepped = fn64_abi::run_one_step();
         steps += 1;
-        if steps % LOG_EVERY == 0 {
+        if steps.is_multiple_of(LOG_EVERY) {
             println!(
                 "[wm2000-boot] progress: steps={steps} sim_time={} vi_swaps={} gfx_tasks={} \
                  audio_tasks={}",

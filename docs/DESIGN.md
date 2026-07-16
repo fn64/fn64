@@ -13,6 +13,7 @@ libultra manual. No GPL runtime implementation code was read to write this.
 ```
 fn64-runtime   core: scheduler, OSMesgQueue, timers, PI/SI/VI/AI plumbing, rdram model, overlays
 fn64-abi       the extern "C" surface recompiled code links against
+fn64-boot-harness shared generated-section bridge/registration and ABI-sized rdram allocation
 fn64-shell     the executable: window, input, audio out, ROM/RecompiledFuncs intake
 fn64-rt64      FFI bridge to RT64 (C++) -- all C++ interop quarantined here
 ```
@@ -23,6 +24,7 @@ Dependency direction is strictly one-way:
 fn64-shell ──depends on──> fn64-abi ──depends on──> fn64-runtime
     │                                                    ^
     └──────────────────depends on───────────────────────┘
+    └──depends on──> fn64-boot-harness ──depends on──> fn64-abi + fn64-runtime
     └──depends on──> fn64-rt64 ──depends on──> fn64-runtime (types only)
 ```
 
@@ -36,13 +38,22 @@ recompiler backend (not just N64Recomp's C) links against the same core.
 
 `fn64-abi` depends on `fn64-runtime` only. It is the thin, mechanically-
 checkable translation layer: every `#[no_mangle] extern "C"` symbol
-generated `RecompiledFuncs/*.c` calls (`recomp.h` dispatch helpers, the
-`_recomp` shim inventory, `recomp_overlays.inl` registration) lives here,
+generated `RecompiledFuncs/*.c` calls (`recomp.h` dispatch helpers and the
+`_recomp` shim inventory) lives here,
 each one a direct call into an `fn64-runtime` API. This crate is deliberately
 "dumb" -- if a function's `fn64-runtime` counterpart already exists, its
 `fn64-abi` wrapper is a signature-and-marshalling adapter, not a place new
 policy gets invented. Reviewing `fn64-abi` in isolation should answer "does
 this match ABI-SURFACE.md" without needing runtime-internals knowledge.
+
+`fn64-boot-harness` depends on `fn64-abi` and `fn64-runtime`. It owns the
+game-agnostic generated-C boot boundary shared by `fn64-shell` and the
+headless boot examples: the clean-room `recomp_overlays.inl` bridge, its
+`fn64_register_func` callback and section accumulator, registration-order
+adapter, generated `recomp_entrypoint` declaration, and the one RDRAM
+allocation sized for physical RDRAM plus the raw MMIO/KSEG1 window. Which
+sections begin resident and all input/save/render/audio policy remain local
+to each harness because those choices differ by game and host.
 
 `fn64-shell` depends on `fn64-abi`, `fn64-runtime`, and `fn64-rt64`. It owns
 the parts every recompiled game needs but that aren't part of the libultra
@@ -881,7 +892,8 @@ milestone in §4, separate and not yet attempted).
 **M1 boot-host attempt (2026-07-14): `examples/wm2000-boot`, first real boot
 run against the linked archive.** Per the task's own scope (a headless boot
 host taking `RECOMPILED_DIR`/`RECOMP_H_DIR`/`ROM` env vars, zero game content
-in-repo — `examples/wm2000-boot/build.rs`/`bridge/section_bridge.c`): this is
+in-repo — `examples/wm2000-boot/build.rs` and the shared
+`crates/fn64-boot-harness/bridge/section_bridge.c`): this is
 the FIRST time the M1-linked archive was actually RUN, not just linked, and
 it surfaced four real, load-bearing bugs the trial-link gate above could not
 have caught (a clean link says nothing about correct runtime behavior):

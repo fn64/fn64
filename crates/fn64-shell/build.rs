@@ -9,11 +9,10 @@
 //! When `RECOMPILED_DIR`/`RECOMP_H_DIR`/`ROM` ARE set (the exact same
 //! contract as `examples/oot-boot/build.rs` -- see that file's module doc
 //! for the byte-cited rationale on each), this compiles the out-of-tree,
-//! game-derived `RecompiledFuncs/*.c` + this crate's `bridge/
-//! section_bridge.c` glue into a static lib, exactly as oot-boot does, and
-//! emits `cargo:rustc-cfg=fn64_game_linked` so `main.rs`'s FFI extern block
-//! (`recomp_entrypoint`, `fn64_bridge_register_all_sections`) and its live
-//! boot/window loop are compiled in. Without that cfg, the binary has no
+//! game-derived `RecompiledFuncs/*.c` + `fn64-boot-harness`'s shared
+//! `bridge/section_bridge.c` glue into a static lib, exactly as oot-boot does, and
+//! emits `cargo:rustc-cfg=fn64_game_linked` so the shared harness FFI and its
+//! live boot/window loop are compiled in. Without that cfg, the binary has no
 //! game symbols to link against and falls back to the intake-instructions
 //! path -- no unresolved-symbol link error, no game content required.
 //!
@@ -81,12 +80,12 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let bridge_dir = manifest_dir.join("bridge");
+    let bridge_dir = manifest_dir.join("../fn64-boot-harness/bridge");
 
     // RecompiledFuncs/*.c: plain C, generated, no warning hygiene.
     let mut build = cc::Build::new();
     build
-        // bridge/include FIRST: its clean-room stand-in librecomp/sections.h
+        // The shared bridge include comes FIRST: its clean-room sections.h
         // must shadow any real (GPL-3.0) librecomp header on the path.
         .include(bridge_dir.join("include"))
         .include(&recompiled_dir)
@@ -135,7 +134,10 @@ fn main() {
 
     // The game symbols are now linkable: turn on the boot/window path.
     println!("cargo:rustc-cfg=fn64_game_linked");
-    println!("cargo:rerun-if-changed=bridge/section_bridge.c");
+    println!(
+        "cargo:rerun-if-changed={}",
+        bridge_dir.join("section_bridge.c").display()
+    );
     println!("cargo:rerun-if-changed={}", recompiled_dir.display());
 }
 
