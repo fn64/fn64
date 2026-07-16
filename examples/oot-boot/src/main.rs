@@ -26,7 +26,8 @@
 //! 4. On every `osViSwapBuffer_recomp` call (observed via
 //!    `fn64_abi::vi_swap_count()` polling), hashes the pointed-to
 //!    framebuffer region and dumps it as a PNG if non-uniform.
-//! 5. Emits the trace log to a file and prints a summary ladder.
+//! 5. When `OOT_TRACE=1`, emits the trace log to a file; always prints a
+//!    summary ladder.
 
 #[cfg(not(fn64_native_recomp))]
 use std::collections::HashMap;
@@ -494,7 +495,7 @@ fn main() {
     // per field is an arbitrary but documented choice for this harness.
     fn64_abi::arm_vi_retrace(1000);
 
-    // Arm crash-safe incremental trace flushing BEFORE booting thread 0 --
+    // Opt-in crash-safe incremental trace flushing BEFORE booting thread 0 --
     // a SIGSEGV mid-boot (as rung 3 hit) must not lose the whole session's
     // trace; every event from here on is appended+flushed to disk as it's
     // recorded, not just buffered for the end-of-run `write_trace_file`
@@ -502,13 +503,19 @@ fn main() {
     // same path from the in-memory copy -- harmless, since by then the
     // incremental sink already has every event that copy will contain).
     const TRACE_PATH: &str = "/tmp/oot-boot-trace.jsonl";
-    if let Err(e) = fn64_abi::set_trace_sink_file(TRACE_PATH) {
-        eprintln!(
-            "[oot-boot] WARNING: failed to arm incremental trace sink at {TRACE_PATH}: {e} -- \
-             a crash mid-boot will lose the trace (falling back to end-of-run-only)."
-        );
+    let trace_enabled = std::env::var_os("OOT_TRACE").is_some();
+    if trace_enabled {
+        if let Err(e) = fn64_abi::set_trace_sink_file(TRACE_PATH) {
+            eprintln!(
+                "[oot-boot] WARNING: failed to arm incremental trace sink at {TRACE_PATH}: {e} -- \
+                 a crash mid-boot will lose the trace (falling back to end-of-run-only)."
+            );
+        } else {
+            println!("[oot-boot] incremental trace sink armed at {TRACE_PATH}");
+        }
     } else {
-        println!("[oot-boot] incremental trace sink armed at {TRACE_PATH}");
+        fn64_abi::set_trace_enabled(false);
+        println!("[oot-boot] differential trace disabled (set OOT_TRACE=1 to enable)");
     }
 
     // rdram: this process's one shared buffer (docs/DESIGN.md section 3).
@@ -663,6 +670,10 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(MAX_STEPS);
     let stop_on_frame: bool = std::env::var("OOT_STOP_ON_FRAME").is_ok();
+    // Performance probes must not include the harness's per-swap PNG encoder
+    // and filesystem writes. Default capture behavior remains unchanged;
+    // this flag affects diagnostics only, never guest execution or rendering.
+    let perf_no_capture = std::env::var_os("OOT_PERF_NO_CAPTURE").is_some();
 
     // Scripted controller input (the INPUT-SEAM deliverable). `OOT_INPUT_SCRIPT`
     // is a comma-separated list of `frame:BUTTON[+BUTTON...][@stickX/stickY]`
@@ -958,7 +969,7 @@ fn main() {
             }
 
             let dumps_before = fb_dumps.len();
-            if swap_count >= render_dump_start {
+            if !perf_no_capture && swap_count >= render_dump_start {
                 if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
                     capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);
                 }
@@ -1046,16 +1057,38 @@ fn main() {
     if let Some(error) = fn64_abi::last_audio_error() {
         println!("[oot-boot] audio backend last error: {error}");
     }
+    {
+        let timing = fn64_abi::phase_timing();
+        if timing.executor_calls > 0 {
+            let residual_ns = timing
+                .executor_ns
+                .saturating_sub(timing.gfx_ns)
+                .saturating_sub(timing.audio_dispatch_ns);
+            println!(
+                "[oot-boot] phase timing: executor={:.3} ms/{} calls, gfx={:.3} ms/{} tasks, \
+                 audio_dispatch={:.3} ms/{} tasks, cpu+executor_residual={:.3} ms",
+                timing.executor_ns as f64 / 1e6,
+                timing.executor_calls,
+                timing.gfx_ns as f64 / 1e6,
+                timing.gfx_calls,
+                timing.audio_dispatch_ns as f64 / 1e6,
+                timing.audio_dispatch_calls,
+                residual_ns as f64 / 1e6,
+            );
+        }
+    }
     println!(
         "[oot-boot] non-uniform framebuffers dumped: {} ({:?})",
         fb_dumps.len(),
         fb_dumps
     );
 
-    let trace = fn64_abi::copy_trace();
-    println!("[oot-boot] trace events recorded: {}", trace.len());
-    write_trace_file(&trace, TRACE_PATH);
-    println!("[oot-boot] trace written to {TRACE_PATH}");
+    if trace_enabled {
+        let trace = fn64_abi::copy_trace();
+        println!("[oot-boot] trace events recorded: {}", trace.len());
+        write_trace_file(&trace, TRACE_PATH);
+        println!("[oot-boot] trace written to {TRACE_PATH}");
+    }
 
     #[cfg(fn64_native_recomp)]
     {

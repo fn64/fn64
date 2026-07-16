@@ -1534,9 +1534,9 @@ fn opcode_name(opcode: u8) -> &'static str {
     }
 }
 
-/// Reset the once-per-opcode skip-warning memo. Called at the start of each
-/// `decode_display_list` so a fresh frame re-reports its coverage (a
-/// long-running harness otherwise only ever sees the first frame's skips).
+/// Reset the once-per-opcode skip-warning memo. Tests and interactive
+/// diagnostics may request a fresh coverage report explicitly; normal frame
+/// decoding keeps the memo so repeated frames do not repeat identical I/O.
 pub fn reset_skip_warnings() {
     WARNED_SKIPS.with(|w| w.borrow_mut().clear());
 }
@@ -1776,7 +1776,6 @@ const MAX_DL_DEPTH: u32 = 10;
 /// `fn64-abi` executor-seam test plant, so it MUST stay bit-compatible with
 /// them. Real OoT display lists use [`decode_display_list_f3dex2`] instead.
 pub fn decode_display_list(rdram: &[u8], dl_addr: u32) -> Result<Vec<Triangle>, RenderError> {
-    reset_skip_warnings();
     let mut vtx_cache = [Vertex::default(); 32];
     let mut tris = Vec::new();
     let mut pc = dl_addr as usize;
@@ -1878,7 +1877,6 @@ pub fn decode_display_list_f3dex2(
     rdram: &[u8],
     dl_addr: u32,
 ) -> Result<Vec<Triangle>, RenderError> {
-    reset_skip_warnings();
     let mut state = DecodeState {
         vtx_cache: [Vertex::default(); 32],
         tris: Vec::new(),

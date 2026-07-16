@@ -131,8 +131,11 @@ pub struct TraceEvent {
 /// sink is likewise owned by the one `Executor` instance, not ambient
 /// global state a second copy of the runtime (e.g. two independent test
 /// executors running in the same process) could cross-contaminate.
-#[derive(Default)]
 pub struct TraceLog {
+    /// Differential tracing is diagnostic work, not emulated-machine state.
+    /// Runtime users can disable it for production-speed execution without
+    /// changing scheduler, queue, DMA, or task behavior.
+    enabled: bool,
     events: Vec<TraceEvent>,
     /// Optional incremental sink: when set (`set_sink_file`), every
     /// `record()` call appends+flushes this event's `Debug` line to the
@@ -149,8 +152,21 @@ pub struct TraceLog {
     sink: Option<File>,
 }
 
+impl Default for TraceLog {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            events: Vec::new(),
+            sink: None,
+        }
+    }
+}
+
 impl TraceLog {
     pub fn record(&mut self, sim_time: u64, kind: TraceKind) {
+        if !self.enabled {
+            return;
+        }
         let event = TraceEvent {
             seq: next_sequence(),
             sim_time,
@@ -174,6 +190,17 @@ impl TraceLog {
         &self.events
     }
 
+    /// Enable or disable diagnostic event capture. Disabling clears any
+    /// previously captured events and closes the crash-safe sink so a caller
+    /// cannot accidentally keep paying trace I/O after opting out.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.events.clear();
+            self.sink = None;
+        }
+    }
+
     /// Arm incremental disk flushing: every subsequent `record()` call
     /// appends its line to `path` (truncating any prior content) and
     /// flushes before returning, so a SIGSEGV/abort immediately after the
@@ -182,6 +209,7 @@ impl TraceLog {
     /// missing trace file is fatal for their use case (the harness treats
     /// it as a loud warning, not a panic -- see `main.rs`).
     pub fn set_sink_file(&mut self, path: &str) -> std::io::Result<()> {
+        self.enabled = true;
         self.sink = Some(File::create(path)?);
         Ok(())
     }
@@ -290,5 +318,21 @@ mod tests {
         );
         assert_eq!(log.events().len(), 1);
         assert!(log.sink.is_none());
+    }
+
+    #[test]
+    fn disabled_trace_drops_events_without_allocating() {
+        let mut log = TraceLog::default();
+        log.set_enabled(false);
+        log.record(
+            1,
+            TraceKind::ThreadSwitch {
+                from: None,
+                to: 0,
+                reason: SwitchReason::Scheduled,
+            },
+        );
+        assert!(log.events().is_empty());
+        assert_eq!(log.events.capacity(), 0);
     }
 }
