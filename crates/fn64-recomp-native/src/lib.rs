@@ -26,10 +26,10 @@
 //! it is a drop-in alternative to the adapter. It is validated against the
 //! N64Recomp C oracle on a real MIPS function (see the crate tests).
 //!
-//! What remains for full CPU coverage is listed at the bottom of this doc and
-//! in the task report: COP1 (FPU), the 64-bit doubleword ops (DADD/DSLL/LD/SD/
-//! LDL…), COP0 system control, and the ELF/symbol-table front-end that turns a
-//! whole `RecompConfig` into a module of functions with resolved call targets.
+//! The byte-cited distinction between encoding coverage and full architectural
+//! execution is maintained in `crates/fn64-recomp-native/ISA-COVERAGE.md`.
+//! Ordinary integer/control-flow/memory paths are covered; full COP1 floating
+//! environment and privileged exception/MMU effects remain explicitly partial.
 #![forbid(unsafe_code)]
 
 pub mod decoder;

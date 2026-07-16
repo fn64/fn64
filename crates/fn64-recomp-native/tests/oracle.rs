@@ -281,7 +281,7 @@ fn decode_nop_and_unknown() {
     assert!(matches!(decode(0x78012345), Instruction::Unknown { .. }));
     // A COP2 sub-op we do not model (rs=0x08 = BC2) is still Unknown, not a
     // wrong op: 0x49000000 (opcode 0x12, rs 0x08).
-    assert!(matches!(decode(0x49000000), Instruction::Unknown { .. }));
+    assert_eq!(decode(0x49000000), Instruction::Cop2Op { word: 0x49000000 });
     // A COP1 word with an unimplemented `funct` (e.g. RECIP.S, funct 0x15,
     // which OoT does not emit) is likewise Unknown, not a silent mis-decode.
     // recip.s $f0,$f2 = 0x46001015 (fmt=S, funct=0x15).
@@ -310,19 +310,19 @@ fn delay_slot_classification() {
 fn memory_swizzle_matches_macro_semantics() {
     // Lay out a known word at vram 0x80000000 (rdram offset 0).
     let mut buf = vec![0u8; 64];
-    buf[0..4].copy_from_slice(&0x11223344u32.to_be_bytes());
+    buf[0..4].copy_from_slice(&0x11223344u32.to_ne_bytes());
     let mem = Rdram::new(&mut buf);
     let v = 0xFFFF_FFFF_8000_0000u64; // vram 0x80000000 sign-extended
 
-    // Word: straight big-endian read.
+    // Word: straight native-endian ABI-buffer read.
     assert_eq!(mem.load_w(v) as u32, 0x11223344);
-    // Bytes: address ^3 swizzle. Physical bytes are [0x11,0x22,0x33,0x44];
-    // byte at vaddr+0 reads phys (0^3)=3 -> 0x44, vaddr+1 -> (1^3)=2 -> 0x33.
-    assert_eq!(mem.load_bu(v.wrapping_add(0)), 0x44);
-    assert_eq!(mem.load_bu(v.wrapping_add(1)), 0x33);
-    assert_eq!(mem.load_bu(v.wrapping_add(2)), 0x22);
-    assert_eq!(mem.load_bu(v.wrapping_add(3)), 0x11);
-    // Halfword: address ^2 swizzle. vaddr+0 -> phys (0^2)=2..3 -> [0x33,0x44].
-    assert_eq!(mem.load_hu(v.wrapping_add(0)), 0x3344);
-    assert_eq!(mem.load_hu(v.wrapping_add(2)), 0x1122);
+    // On a little-endian host the raw ABI bytes are [44,33,22,11]. XOR 3
+    // presents the guest's big-endian byte order [11,22,33,44].
+    assert_eq!(mem.load_bu(v.wrapping_add(0)), 0x11);
+    assert_eq!(mem.load_bu(v.wrapping_add(1)), 0x22);
+    assert_eq!(mem.load_bu(v.wrapping_add(2)), 0x33);
+    assert_eq!(mem.load_bu(v.wrapping_add(3)), 0x44);
+    // XOR 2 likewise presents guest halfwords 0x1122 and 0x3344.
+    assert_eq!(mem.load_hu(v.wrapping_add(0)), 0x1122);
+    assert_eq!(mem.load_hu(v.wrapping_add(2)), 0x3344);
 }

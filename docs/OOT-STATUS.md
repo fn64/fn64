@@ -124,6 +124,23 @@ road, but the top half misprojects).
 
 ---
 
+## 🔲 Whole-ROM native recompile (task #28 — the "recomp done" milestone, IN PROGRESS)
+fn64-recomp-native (from-scratch Rust MIPS→typed-Rust recompiler) can now recompile
+the WHOLE OoT ROM. Driver `recompile_rom` + config loader (`fn64-recomp/src/load.rs`,
+loads all 472 sections / 13,358 fns from oot.toml+dump.toml) landed on
+`feat/native-whole-rom-driver`. Gap report over the full ROM:
+- **13,188 clean (98.73%)**, 99.06% compilable. Emitted funcs.rs = 122MB / 2.44M lines
+  of typed Rust (the whole ROM). 0 ROM-range errors.
+- FPU conversion gaps (FLOOR.W/CEIL.W/ROUND.W) FOUND + CLOSED with oracle tests.
+- 45 runtime-traps (cop0/break/tlb/eret — libultra/OS fns; should defer to fn64 shims,
+  not the panic-bodies) + 124 config-stubs.
+- 1 unknown-opcode left = `rspbootTextStart` (an RSP blob mislisted as CPU — config-stub).
+- **The ONE real link blocker: the `lookup(u32)->fn` indirect dispatcher** (2,078 call
+  sites, empirically the ONLY undefined symbol). = N64Recomp's `get_function(vram)`.
+  Building it (branch `feat/native-lookup-dispatcher`) is what makes the whole module LINK.
+Remaining to "OoT boots on native Rust": dispatcher → link (0 undefined) → shim-seam for
+the 45 OS fns → boot on funcs.rs instead of the N64Recomp C files.
+
 ## 🔲 Beyond OoT (deferred until it renders faithfully)
 - Generalize the pipeline: fn64 owns discover→decomp→recomp→run generically
   with a plugin architecture; absorb aki-recomp's game-specific logic into
