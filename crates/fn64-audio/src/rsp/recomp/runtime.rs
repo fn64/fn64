@@ -366,17 +366,19 @@ impl<'a> RspMachine<'a> {
                 return;
             }
             VLoadOp::Ltv => {
-                // Transpose load: load a row of 8 halfwords into 8 registers
-                // at a rotating element. `vt` is the base of an 8-register
-                // group; `e` selects the starting lane.
-                let addr = base_val.wrapping_add((off as i32 * 16) as u32) & !0xF;
-                let vt_base = (vt & !7) as usize;
-                for i in 0..LANES {
-                    let a = addr.wrapping_add((i as u32) * 2);
-                    let h = self.dmem.read_hu(a) as i16;
-                    let reg = vt_base + ((i + (e >> 1)) & 7);
-                    let lane = i;
-                    self.ctx.rsp.regs.r[reg][lane] = h;
+                // SGI Guide pp. 54-55 / MAME `LTV`: load at most eight
+                // consecutive registers, rotating the destination element.
+                // The +8 alignment rule is observable when the effective
+                // address is in the upper half of a 16-byte row.
+                let effective = base_val.wrapping_add((off as i32 * 16) as u32);
+                let mut addr = effective.wrapping_add(8) & !0xF;
+                for reg in vt as usize..(vt as usize + LANES).min(32) {
+                    let element = ((8usize.wrapping_sub(e >> 1) + reg - vt as usize) << 1) & 0xF;
+                    let mut reg_bytes = vec_to_bytes(&self.ctx.rsp.regs.r[reg]);
+                    reg_bytes[element] = self.dmem.read_bu(addr);
+                    reg_bytes[(element + 1) & 0xF] = self.dmem.read_bu(addr.wrapping_add(1));
+                    self.ctx.rsp.regs.r[reg] = bytes_to_vec(&reg_bytes);
+                    addr = addr.wrapping_add(2);
                 }
                 return;
             }
@@ -479,14 +481,21 @@ impl<'a> RspMachine<'a> {
                 }
             }
             VStoreOp::Stv => {
-                // Transpose store: 8 registers' rotating lanes -> a row.
-                let addr = base_val.wrapping_add((off as i32 * 16) as u32) & !0xF;
-                let vt_base = (vt & !7) as usize;
-                for i in 0..LANES {
-                    let reg_idx = vt_base + ((i + (e >> 1)) & 7);
-                    let h = self.ctx.rsp.regs.r[reg_idx][i] as u16;
+                // SGI Guide pp. 54-55 / MAME `STV`: walk consecutive vector
+                // registers while rotating both the source element and byte
+                // position within the addressed 16-byte row.
+                let effective = base_val.wrapping_add((off as i32 * 16) as u32);
+                let row = effective & !0xF;
+                let first_element = 8usize.wrapping_sub(e >> 1);
+                let mut row_offset = (effective & 0xF).wrapping_add((first_element * 2) as u32);
+                for (offset, reg_idx) in (vt as usize..(vt as usize + LANES).min(32)).enumerate() {
+                    let element = first_element + offset;
+                    let value = self.ctx.rsp.regs.r[reg_idx][element & 7] as u16;
                     self.dmem
-                        .write_h(addr.wrapping_add((i as u32) * 2), h as i16);
+                        .write_bu(row + (row_offset & 0xF), (value >> 8) as u8);
+                    self.dmem
+                        .write_bu(row + ((row_offset + 1) & 0xF), value as u8);
+                    row_offset += 2;
                 }
             }
         }
@@ -887,12 +896,14 @@ mod tests {
         }
         m.vload(VLoadOp::Ltv, 8, 4, 0x300, 0);
         for i in 0..8usize {
-            let reg = 8 + ((i + 2) & 7);
-            assert_eq!(m.ctx.rsp.regs.r[reg][i], (0x4000 + i) as i16);
+            assert_eq!(m.ctx.rsp.regs.r[8 + i][(6 + i) & 7], (0x4000 + i) as i16);
         }
         m.vstore(VStoreOp::Stv, 8, 4, 0x340, 0);
         for i in 0..8u32 {
-            assert_eq!(m.dmem.read_hu(0x340 + i * 2), 0x4000 + i as u16);
+            assert_eq!(
+                m.dmem.read_hu(0x340 + ((12 + i * 2) & 0xF)),
+                0x4000 + i as u16
+            );
         }
 
         m.ctx.rsp.regs.r[5] =

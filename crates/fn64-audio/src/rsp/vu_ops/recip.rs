@@ -147,16 +147,17 @@ fn recip_core(input: i32, is_rsq: bool) -> i32 {
     let n = normalize(input);
     let shift = n.shift;
     let normalized = n.magnitude << shift; // top bit now set (bit 31)
-    let (index, frac, denorm_shift) = if is_rsq {
-        let idx = (((normalized >> 23) & 0x1FE) | (shift & 1)) as usize;
+    let (frac, denorm_shift) = if is_rsq {
+        // CEN64 `rsp_vrcp_vrsq`: form the reciprocal's 9-bit normalized
+        // index, clear its low bit, then insert exponent parity.
+        let idx = (((normalized >> 22) & 0x1FE) | (shift & 1)) as usize;
         let frac = rsq_seed(idx);
-        (idx, frac, (31 - shift) >> 1)
+        (frac, (31 - shift) >> 1)
     } else {
         let idx = ((normalized >> 22) & 0x1FF) as usize;
         let frac = rcp_seed(idx);
-        (idx, frac, 31 - shift)
+        (frac, 31 - shift)
     };
-    let _ = index;
     // Reconstruct with the implicit leading 1, place, then denormalize.
     let mantissa = (0x1_0000u64 | frac as u64) << 14;
     let mut result = (mantissa >> denorm_shift) as i32;
