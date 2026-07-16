@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# oot -- the mechanical boot-bringup loop in one command.
+#
+# The OoT-on-fn64 debug loop is the SAME every rung: run the fast boot, see
+# where it stops, resolve the crash/loop to a function name, look at the frame.
+# This bakes in the fast-loop env (--release + OOT_MAX_SWAPS) so nobody retypes
+# the 3 env vars, and adds the two things done by hand every rung: resolve a
+# C backtrace line -> function name, and summarize where boot stopped.
+#
+# Usage:
+#   ./oot run [SWAPS]        release boot, capped at SWAPS (default 6); prints summary + PNG paths
+#   ./oot trace [SWAPS]      run + dump the last executor events (what was running at the stop)
+#   ./oot fn FILE:LINE ...   resolve recompiled-C locations to RECOMP_FUNC names
+#   ./oot where              run + report the deepest frame / loud trap (the frontier)
+#
+# Env overrides: RECOMPILED_DIR / RECOMP_H_DIR / ROM default to the aki-recomp OOTU paths.
+# NOTE: no `set -e` on the run paths -- the harness exits 134 on a KNOWN
+# teardown abort (thread-local dtor, AFTER the boot summary prints), which is
+# expected, not a failure. Each run command tolerates it with `|| true`.
+set -uo pipefail
+
+FN64="${FN64:-/Users/jer/Code/fn64}"
+AKI="${AKI:-/Users/jer/Code/aki-recomp}"
+export RECOMPILED_DIR="${RECOMPILED_DIR:-$AKI/games/OOTU/RecompiledFuncs}"
+export RECOMP_H_DIR="${RECOMP_H_DIR:-$AKI/refs/N64RecompSource/include}"
+export ROM="${ROM:-$AKI/games/OOTU/oot-ntsc-1.0.z64}"
+export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
+
+BIN="$FN64/examples/oot-boot/target/release/oot-boot"
+
+build() {
+  ( cd "$FN64/examples/oot-boot" && cargo build --release -q ) || exit 1
+}
+
+# Resolve one FILE:LINE in the recompiled C to its enclosing RECOMP_FUNC name.
+resolve_fn() {
+  local loc="$1" f ln name
+  f="${loc%%:*}"; ln="${loc##*:}"
+  name=$(head -n "$ln" "$RECOMPILED_DIR/$f" 2>/dev/null | grep "RECOMP_FUNC " | tail -1 \
+         | sed -E 's/.*RECOMP_FUNC [a-z0-9_]+ ([A-Za-z0-9_]+).*/\1/')
+  echo "$loc -> ${name:-<not found>}"
+}
+
+cmd="${1:-run}"; shift || true
+case "$cmd" in
+  fn)
+    for loc in "$@"; do resolve_fn "$loc"; done
+    ;;
+  run)
+    build
+    swaps="${1:-6}"
+    OOT_MAX_SWAPS="$swaps" "$BIN" 2>&1 | grep -iE "swap #|VI swaps observed|gfx tasks|NON-CLEAR|dumped|exceeds|get_function|vram 0x|stopping early|panicked|EXIT" | tail -15
+    echo "PNGs: $(ls /tmp/fn64-oot-render-*.png 2>/dev/null | wc -l | tr -d ' ') in /tmp/fn64-oot-render-*.png"
+    ;;
+  where)
+    build
+    # Run, capture, then resolve any recompiled-C backtrace lines to fn names.
+    out=$(OOT_MAX_SWAPS="${1:-200}" "$BIN" 2>&1 || true)
+    echo "$out" | grep -iE "VI swaps observed|get_function|no loaded section|exceeds ROM|panicked at" | tail -5
+    echo "--- frontier (C backtrace -> functions) ---"
+    echo "$out" | grep -oE "funcs_[0-9]+\.c:[0-9]+" | while read -r loc; do resolve_fn "$loc"; done | tail -8
+    ;;
+  trace)
+    build
+    OOT_MAX_SWAPS="${1:-200}" "$BIN" >/dev/null 2>&1 || true
+    echo "last executor events (/tmp/oot-boot-trace.jsonl):"
+    tail -6 /tmp/oot-boot-trace.jsonl 2>/dev/null
+    ;;
+  *)
+    echo "usage: ./oot {run [SWAPS]|trace [SWAPS]|fn FILE:LINE...|where}" >&2; exit 2 ;;
+esac

@@ -190,6 +190,14 @@ name = "fn64-render"
 version = "0.0.0"
 
 [[package]]
+name = "fn64-render-rt64"
+version = "0.0.0"
+dependencies = [
+ "fn64-render",
+ "fn64-runtime",
+]
+
+[[package]]
 name = "fn64-runtime"
 version = "0.0.0"
 dependencies = [
@@ -497,12 +505,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "oot-audio-ucode"
+version = "0.0.0"
+dependencies = [
+ "fn64-audio",
+]
+
+[[package]]
 name = "oot-boot"
 version = "0.0.0"
 dependencies = [
  "cc",
  "fn64-abi",
+ "fn64-render",
+ "fn64-render-rt64",
  "fn64-runtime",
+ "oot-audio-ucode",
 ]
 
 [[package]]

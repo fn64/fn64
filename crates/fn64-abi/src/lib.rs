@@ -622,12 +622,34 @@ pub fn set_section_unloaded(index: fn64_runtime::SectionIndex) {
     with_host(|host| host.sections.set_section_unloaded(index));
 }
 
+/// Honor a game-driven overlay DMA at the section registry: if `rom_addr`
+/// is exactly some registered section's ROM start, mark it loaded at
+/// `dest_vram` (the DMA's RDRAM destination as a KSEG0 vram). Returns the
+/// section index if a load happened, else `None` (an ordinary data DMA).
+/// Called from the PI/EPI DMA shims so overlays the game DMAs in become
+/// resolvable at their true relocated base -- see
+/// `SectionRegistry::load_section_at_rom_addr`.
+pub fn note_dma_overlay_load(rom_addr: u32, dest_vram: u32) -> Option<fn64_runtime::SectionIndex> {
+    with_host(|host| host.sections.load_section_at_rom_addr(rom_addr, dest_vram))
+}
+
 /// Install the real ROM bytes the PI/EPI DMA shims read from. Must be
 /// called once before any `osEPiStartDma_recomp`/`osCartRomInit_recomp`
 /// call, per `README.md`'s "no game content ships in this repo" rule --
 /// `fn64-shell` supplies the user's own loaded ROM file's bytes here.
 pub fn load_rom(bytes: Vec<u8>) {
     with_host(|host| host.pi_dma = Some(PiDma::new(InMemoryRom::new(bytes))));
+}
+
+/// Register the game's save-backing store (SRAM/EEPROM/Flash) the domain-2
+/// PI-DMA path routes to -- `fn64-shell`/the harness supplies an
+/// `InMemorySaveStorage`/`FileSaveStorage` sized for the game's save device
+/// (OoT: `SaveType::SramBanked`, 32 KiB). Must be called after `load_rom`
+/// (the `PiDma` engine must exist) and before any domain-2 (SRAM) DMA. A
+/// domain-2 DMA with no save registered is a loud trap, not a silent ROM
+/// read past its end (see `PiDma::set_save`).
+pub fn set_save(save: Box<dyn fn64_runtime::SaveStorage>) {
+    with_pi_dma("set_save", |dma| dma.set_save(save));
 }
 
 fn with_pi_dma<R>(shim: &str, f: impl FnOnce(&mut PiDma<InMemoryRom>) -> R) -> R {
@@ -716,6 +738,7 @@ pub unsafe extern "C" fn osCreateThread_recomp(rdram: *mut u8, ctx: *mut RecompC
                 let func_ptr = get_function(entry_vram as i32);
                 let entry: RecompFunc = unsafe { std::mem::transmute(func_ptr) };
                 let mut entry_ctx = RecompContext::zeroed();
+                entry_ctx.arm_fpr_alias();
                 entry_ctx.r4 = arg;
                 // r29 ($sp) MUST be the real stack pointer osCreateThread's
                 // caller supplied (this shim's own `sp` argument, per o32
@@ -850,7 +873,7 @@ pub unsafe extern "C" fn osCreateMesgQueue_recomp(_rdram: *mut u8, ctx: *mut Rec
 /// Same contract as `osCreateMesgQueue_recomp`.
 #[no_mangle]
 pub unsafe extern "C" fn osSendMesg_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
-    let ctx = unsafe { &*ctx };
+    let ctx = unsafe { &mut *ctx };
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
     let msg: Mesg = ctx.r5 as u32;
     let may_block = ctx.r6 == OS_MESG_BLOCK;
@@ -864,17 +887,24 @@ pub unsafe extern "C" fn osSendMesg_recomp(_rdram: *mut u8, ctx: *mut RecompCont
         );
     }
 
-    match suspend_active_coroutine(Yield::BlockOnSend {
+    let sent = match suspend_active_coroutine(Yield::BlockOnSend {
         mq_addr,
         msg,
         may_block,
+        jam: false,
     }) {
-        Resume::SendUnblocked | Resume::WouldBlock => {}
+        Resume::SendUnblocked => true,
+        Resume::WouldBlock => false,
         other => panic!(
             "osSendMesg_recomp: resumed from a BlockOnSend yield with an unexpected Resume \
              variant {other:?}"
         ),
-    }
+    };
+    // Return value in $v0: 0 on enqueue, -1 when a NOBLOCK send found the
+    // queue full (libultra's `s32 osSendMesg` contract; ref impl
+    // `mesgqueue.cpp` `return sent ? 0 : -1`). Symmetric with the recv
+    // return above -- previously never written, same class of stale-$v0 bug.
+    ctx.r2 = if sent { 0 } else { -1i64 as u64 };
 }
 
 /// `OS_MESG_NOBLOCK`/`OS_MESG_BLOCK`, per the public libultra manual.
@@ -888,7 +918,7 @@ const OS_MESG_BLOCK: u64 = 1;
 /// `rdram`/`ctx` must be valid per the same contract as every other shim.
 #[no_mangle]
 pub unsafe extern "C" fn osRecvMesg_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
-    let ctx = unsafe { &*ctx };
+    let ctx = unsafe { &mut *ctx };
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
     // Correction (2026-07-14): check the RAW register for null, not the
     // translated `RdramAddr`. A real `msg == NULL` call (public libultra
@@ -930,6 +960,18 @@ pub unsafe extern "C" fn osRecvMesg_recomp(rdram: *mut u8, ctx: *mut RecompConte
             }
         }
     }
+
+    // Return value in $v0 (`ctx.r2`): 0 on delivery, -1 when a NOBLOCK recv
+    // found the queue empty (libultra's documented `s32 osRecvMesg` contract;
+    // ref impl `ultramodern/src/mesgqueue.cpp` `return received ? 0 : -1`).
+    // NOBLOCK drain loops (e.g. OoT's `Sched_HandleNotification`, asm
+    // 0x800A3180 `beq $v0, -1`) test exactly this to detect an empty queue and
+    // stop. Leaving $v0 stale (the prior omission -- `ctx` was borrowed `&*`,
+    // this write was simply never made) makes that loop never see -1, so the
+    // Scheduler thread spins a NOBLOCK poll forever and virtual time never
+    // advances (examples/oot-boot: sim_time stuck at 0, run_one_step always
+    // returns true). Written last, after all field reads.
+    ctx.r2 = if delivered.is_some() { 0 } else { -1i64 as u64 };
 }
 
 /// `osSetEventMesg(OSEvent event, OSMesgQueue *mq, OSMesg msg)`.
@@ -952,15 +994,22 @@ pub unsafe extern "C" fn osSetEventMesg_recomp(_rdram: *mut u8, ctx: *mut Recomp
 /// struct state, `TimerWheel::set_timer` returns its own `TimerId`, and no
 /// shim here yet needs to map a `t` address back to that id, since nothing
 /// calls `osStopTimer_recomp` in this milestone's undefined-symbol set).
-/// `countdown`=r6 (low word; OSTime's real 64-bit range is not exercised by
-/// this milestone's boot-rung evidence, which only cited a single-timer
-/// role-match with no byte-donor confirmation -- treating it as a plain
-/// 32-bit virtual-tick count is the honest, undecorated reading of what the
-/// call site actually passes, not an invented 64-bit reconstruction with no
-/// evidence behind it), `interval`/`mq`/`msg` stack-passed at
-/// `sp+0x10/0x18/0x1C` (verified against the real call site in
-/// `funcs_13.c`: `MEM_W(0X10,...)`, `MEM_W(0X18,...)`, `MEM_W(0X1C,...)`
-/// immediately preceding the `jal`).
+/// `countdown` is a 64-bit `OSTime`, passed as the o32 register pair a2:a3
+/// (`ctx.r6`=HIGH word, `ctx.r7`=LOW word -- MIPS big-endian even/odd pair
+/// alignment for a 64-bit 2nd argument). Reassembled as `(r6 << 32) | r7`.
+/// Reading only `r6` (the OLD code) got the HIGH word, which is 0 for every
+/// value under 2^32 -- so OoT's own RCP-timeout timer
+/// (`Graph_ExecuteAndDraw`: `osSetTimer(&timer, OS_USEC_TO_CYCLES(3000000),
+/// 0, &gfxCtx->queue, 666)`) armed with countdown=0 and fired IMMEDIATELY
+/// every `advance_time` tick instead of after 3 virtual seconds. Verified
+/// byte-exact against the real call site
+/// (`games/OOTU/RecompiledFuncs/funcs_40.c`, PC 0x800A13C0-0x800A13F4):
+/// `lui $a3,0x861; ori $a3,$a3,0xC468` => a3=0x0861C468 (LOW word, the
+/// 140,378,216-cycle 3s countdown), `addiu $a2,$zero,0x0` => a2=0 (HIGH).
+/// `interval`/`mq`/`msg` stack-passed: interval is likewise a 64-bit pair at
+/// `sp+0x10`(HIGH):`sp+0x14`(LOW), `mq` at `sp+0x18`, `msg` at `sp+0x1C`
+/// (same funcs_40.c call site: `sw $t6,0x10; sw $t7,0x14; sw $a1,0x18;
+/// sw $t5,0x1C`, both interval halves 0 here).
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
@@ -968,8 +1017,10 @@ pub unsafe extern "C" fn osSetEventMesg_recomp(_rdram: *mut u8, ctx: *mut Recomp
 pub unsafe extern "C" fn osSetTimer_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &*ctx };
     let timer_handle = RdramAddr::from_gpr(ctx.r4);
-    let countdown = ctx.r6;
-    let interval = read_stack_word(rdram, ctx.r29, 0x10) as u64;
+    let countdown = ((ctx.r6 & 0xFFFF_FFFF) << 32) | (ctx.r7 & 0xFFFF_FFFF);
+    let interval_hi = read_stack_word(rdram, ctx.r29, 0x10) as u64;
+    let interval_lo = read_stack_word(rdram, ctx.r29, 0x14) as u64;
+    let interval = (interval_hi << 32) | interval_lo;
     let mq_addr = RdramAddr::from_gpr(read_stack_word(rdram, ctx.r29, 0x18) as u64);
     let msg = read_stack_word(rdram, ctx.r29, 0x1C) as Mesg;
     let armed_by = current_thread_id("osSetTimer_recomp");
@@ -1010,18 +1061,19 @@ pub unsafe extern "C" fn osCartRomInit_recomp(_rdram: *mut u8, _ctx: *mut Recomp
 
 /// `osEPiStartDma(OSPiHandle *handle, OSIoMesg *mb, s32 direction)` --
 /// `a0`=handle (`ctx->r4`, unused per `osCartRomInit_recomp`'s doc comment),
-/// `a1`=mb (`ctx->r5`, an `OSIoMesg*` -- `hdr.pri`/`hdr.retQueue`/`hdr.retMesg`
-/// (queue to post completion to) at offsets documented in the libultra
-/// manual's `OSIoMesg` layout, plus `dramAddr`/`devAddr`/`size`), `a2`=
-/// direction (`ctx->r6`, `OS_READ`=0/`OS_WRITE`=1 per the public manual).
+/// `a1`=mb (`ctx->r5`, an `OSIoMesg*`), `a2`=direction (`ctx->r6`,
+/// `OS_READ`=0/`OS_WRITE`=1 per the public manual).
 ///
-/// This crate's `OSIoMesg` field-offset assumptions (standard o32 struct
-/// layout: `dramAddr` at +0x8, `devAddr` at +0xC, `size` at +0x10 -- the
-/// documented libultra `OSIoMesg` shape after its `OSMesgHdr` header) are
-/// NOT yet byte-verified against a real ROM's struct-init call site in this
-/// milestone (no rung has isolated the exact offsets); this is flagged
-/// honestly here rather than asserted as settled, per `AGENTS.md`'s
-/// "prefer 'not verified' over a false 'done.'" The DMA completion posts
+/// The `OSIoMesg` field offsets are byte-verified against the OoT decomp
+/// header (`oot-decomp/include/ultra64/pi.h`) AND cross-checked against
+/// DmaMgr's own stack-struct build in OOTU `funcs_0.c`
+/// `DmaMgr_DmaRomToRam` (asm 0x800008F0-0x80000900): `OSIoMesgHdr` is only
+/// 0x08 bytes (`type` +0x0, `pri` +0x2, `status` +0x3, `retQueue` +0x4),
+/// so `dramAddr` is at +0x8, `devAddr` at +0xC, `size` at +0x10. A prior
+/// wave wrongly assumed a 0xC (3-word) header and read every body field
+/// +0x4 too high (size fell on the unwritten +0x14, reading 0) -- the OoT
+/// `DmaMgr_Init` dmadata-DMA hang. See the inline comment at the field
+/// reads below for the full store-to-field mapping. The DMA completion posts
 /// through `Executor::inject_event(DirectPost)` -- the same "ONE explicit
 /// host-side injection point" every other completion source uses
 /// (`docs/DESIGN.md` section 2).
@@ -1062,11 +1114,21 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
         DmaDirection::FromRdram
     };
 
-    // OSIoMesg layout (libultra manual, public documentation): OSMesgHdr
-    // (pri: s32, retQueue: OSMesgQueue*, retMesg: OSMesg) occupies the
-    // first 3 words (+0x0/+0x4/+0x8 on o32), followed by dramAddr (+0xC),
-    // devAddr (+0x10), size (+0x14). NOT byte-donor-verified this wave --
-    // see doc comment above.
+    // OSIoMesg layout, byte-verified against the OoT decomp header
+    // `oot-decomp/include/ultra64/pi.h`: `OSIoMesgHdr` is 0x08 bytes
+    // (`u16 type` +0x0, `u8 pri` +0x2, `u8 status` +0x3, `OSMesgQueue*
+    // retQueue` +0x4), NOT the 3-word (0xC) header a prior wave assumed.
+    // The body follows immediately: `dramAddr` +0x8, `devAddr` +0xC,
+    // `size` +0x10, `piHandle` +0x14. This exactly matches DmaMgr's own
+    // struct build in OOTU `funcs_0.c` DmaMgr_DmaRomToRam (mb = $sp+0x70):
+    // `sb $zero,0x72` (pri/status, +0x2), `sw $s6,0x74` (retQueue, +0x4),
+    // `sw $s4,0x78` (dramAddr = a1/RAM dest, +0x8, asm 0x800008FC),
+    // `sw $s2,0x7C` (devAddr = a0/romStart, +0xC, asm 0x800008F8),
+    // `sw $s0,0x80` (size = chunk, +0x10, asm 0x80000900). The prior +0x4-
+    // shifted offsets read dramAddr as retMesg, devAddr as dramAddr, size
+    // as devAddr, and size from unwritten +0x14 (=0) -- the OoT DmaMgr_Init
+    // hang: the dmadata DMA delivered len=0 and MEM_W(dest+4)!=0x1060 ->
+    // Fault_AddHungupAndCrash (assert 0x345). There is no `retMesg` field.
     //
     // Correction (this wave): a prior wave called `read_stack_word` (which
     // itself calls `RdramAddr::from_gpr`, subtracting the KSEG0 base) with
@@ -1084,7 +1146,9 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
     // just this one call site without a differently-named sibling helper
     // would leave the same trap for the next `RdramAddr`-holding caller).
     let ret_queue = read_offset_word(rdram, mb_addr.offset(), 0x4);
-    let ret_mesg = read_offset_word(rdram, mb_addr.offset(), 0x8);
+    // No `retMesg` field exists (OSIoMesgHdr ends at retQueue); DmaMgr's
+    // osRecvMesg waits on retQueue with a NULL msg-out pointer, so post a 0.
+    let ret_mesg = 0u32;
     // dramAddr is a raw vram POINTER the game computed the normal way (e.g.
     // `&someBuffer`), same as any other vram value -- it needs the SAME
     // KSEG0 translation `RdramAddr::from_gpr` performs, not
@@ -1094,9 +1158,9 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
     // address like any other, not a pre-resolved offset) -- caught by this
     // wave's own regression test after the sibling double-translation bug
     // (see the correction note above `read_offset_word`'s introduction).
-    let dram_addr = RdramAddr::from_gpr(read_offset_word(rdram, mb_addr.offset(), 0xC) as u64);
-    let dev_addr = read_offset_word(rdram, mb_addr.offset(), 0x10);
-    let len = read_offset_word(rdram, mb_addr.offset(), 0x14);
+    let dram_addr = RdramAddr::from_gpr(read_offset_word(rdram, mb_addr.offset(), 0x8) as u64);
+    let dev_addr = read_offset_word(rdram, mb_addr.offset(), 0xC);
+    let len = read_offset_word(rdram, mb_addr.offset(), 0x10);
 
     let completion = {
         let mut rt_rdram = fn64_runtime::Rdram::new(0);
@@ -1107,16 +1171,38 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
         // osRecvMesg_recomp's existing pattern of not creating a second,
         // competing Rdram instance over borrowed memory.
         let _ = &mut rt_rdram;
+        // Domain-2 (SRAM/save) DMAs route to the save store, not the ROM
+        // image. `devAddr >= SRAM_DOMAIN2_BASE` (0x08000000, PI_DOM2_ADDR2,
+        // OoT rcp.h:714) is a save access -- OoT's SsSram_ReadWrite passes
+        // physical 0x08000000+offset as devAddr (z_sram.c:672 /
+        // funcs_34.c:10632). A ROM-domain devAddr is a small ROM offset.
+        let is_sram = fn64_runtime::rom::is_sram_dev_addr(dev_addr);
         with_pi_dma("osEPiStartDma_recomp", |dma| match direction {
+            // device -> RDRAM (ROM read OR SRAM/save read). Both deliver a
+            // FLAT big-endian/save-order byte buffer that must be
+            // word-swizzled into rdram's native-word storage, because the
+            // guest reads the destination via MEM_BU (`^3` XOR, recomp.h).
+            // Same swizzle for ROM and SRAM; only the SOURCE differs.
             DmaDirection::ToRdram => {
                 let mut buf = vec![0u8; len as usize];
-                dma.read_rom_bytes(dev_addr, &mut buf);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        buf.as_ptr(),
-                        rdram.add(dram_addr.offset() as usize),
-                        buf.len(),
-                    );
+                if is_sram {
+                    dma.sram_read_into(dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE, &mut buf);
+                } else {
+                    dma.read_rom_bytes(dev_addr, &mut buf);
+                }
+                // Per-BYTE lane swizzle into native-word rdram, matching
+                // `Rdram::dma_write_bytes` (`dst[(base+k)^3]=src[k]`). A flat
+                // copy hung OoT's DmaMgr_Init (MEM_W(dest+4)==0x1060 saw
+                // 0x60100000) and would corrupt every SRAM byte the save loader
+                // MEM_BU's back. This shim copies through the raw rdram pointer
+                // (no Rdram wrapper), so swizzle byte-by-byte here. Per-byte,
+                // NOT per-word, so it stays correct for the sub-word / unaligned
+                // transfers OoT's DmaMgr_DmaRomToRam issues (e.g. len=0x86).
+                let base = dram_addr.offset() as usize;
+                for (k, &b) in buf.iter().enumerate() {
+                    unsafe {
+                        *rdram.add((base + k) ^ 3) = b;
+                    }
                 }
                 fn64_runtime::DmaCompletion {
                     direction,
@@ -1125,11 +1211,44 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
                     len,
                 }
             }
+            // RDRAM -> device. Only the domain-2 (SRAM/save) case is real: the
+            // guest's rdram source holds native-word-swizzled bytes, so
+            // un-swizzle back to flat save order (inverse of the ToRdram
+            // swizzle) before writing the save chip. A ROM-domain write is
+            // still nonsensical (ROM is read-only) -> loud trap.
             DmaDirection::FromRdram => {
-                unimplemented!(
-                    "osEPiStartDma_recomp: OS_WRITE direction (cartridge domain write) has no \
-                     backing store in this milestone -- see PiDma::start_dma's doc comment."
+                if !is_sram {
+                    unimplemented!(
+                        "osEPiStartDma_recomp: OS_WRITE to the cartridge-ROM domain (devAddr \
+                         {dev_addr:#x} < SRAM_DOMAIN2_BASE) -- ROM is read-only. A save write \
+                         uses devAddr >= 0x08000000 and routes to the save store."
+                    );
+                }
+                assert!(
+                    dram_addr.offset() % 4 == 0 && (len as usize) % 4 == 0,
+                    "PI DMA must be word-aligned (dram={:#x} len={:#x})",
+                    dram_addr.offset(),
+                    len
                 );
+                let mut buf = vec![0u8; len as usize];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        rdram.add(dram_addr.offset() as usize),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    );
+                }
+                for word in buf.chunks_exact_mut(4) {
+                    word.swap(0, 3);
+                    word.swap(1, 2);
+                }
+                dma.sram_write_from(dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE, &buf);
+                fn64_runtime::DmaCompletion {
+                    direction,
+                    dram_addr,
+                    dev_addr,
+                    len,
+                }
             }
         })
     };
@@ -1146,6 +1265,51 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
         });
     }
     let _ = completion;
+
+    // Overlay-load hook: if this DMA's ROM source is exactly a registered
+    // code section's start, the game just DMA'd that overlay in. Mark it
+    // loaded at the DMA's RDRAM destination vram so a later LOOKUP_FUNC for
+    // the game's relocated function pointers (Overlay_Relocate rewrites them
+    // to `dest + offset`) resolves. Data DMAs (dmadata, objects) don't match
+    // any section start and are a no-op here. Done AFTER the with_pi_dma /
+    // with_host borrow closes to avoid re-entrant host access.
+    // `dev_addr` is the ROM offset; `dram_addr.offset() | KSEG0` is the vram.
+    let dest_vram = dram_addr.offset() | 0x8000_0000;
+    note_dma_overlay_load(dev_addr, dest_vram);
+
+    // Static-link-VRAM mirror: this is a fully-static N64Recomp build (every
+    // section num_relocs=0, zero RELOC_HI16/LO16 in the generated C), so an
+    // overlay's recompiled code reads its own DATA via BAKED absolute link
+    // addresses (e.g. Player_InitItemAction's `lui 0x8085; lw 0x1EA8` reads
+    // sItemActionInitFuncs[] at static 0x80851EA8), NOT the heap address the
+    // game DMA'd the overlay to. Mirror the overlay's raw ROM image to its
+    // static link VRAM so those baked reads find the (un-relocated) static
+    // function pointers, which `resolve` maps through the section's static
+    // base. Only for device->RDRAM ROM reads; SRAM/save DMAs never match a
+    // code section. See SectionRegistry::plan_static_mirror.
+    if matches!(direction, DmaDirection::ToRdram) && !fn64_runtime::rom::is_sram_dev_addr(dev_addr)
+    {
+        if let Some(static_off) = with_host(|host| host.sections.plan_static_mirror(dev_addr, len))
+        {
+            let mut buf = vec![0u8; len as usize];
+            with_pi_dma("osEPiStartDma_recomp", |dma| {
+                dma.read_rom_bytes(dev_addr, &mut buf)
+            });
+            // Same word-swizzle the primary destination write applies, so the
+            // mirror is native-word storage the guest reads back via MEM_*.
+            for word in buf.chunks_exact_mut(4) {
+                word.swap(0, 3);
+                word.swap(1, 2);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buf.as_ptr(),
+                    rdram.add(static_off as usize),
+                    buf.len(),
+                );
+            }
+        }
+    }
 
     // Every path reaching here completed the DMA synchronously and
     // successfully -- see the doc comment's "Correction (2026-07-14)" for
@@ -1351,18 +1515,36 @@ thread_local! {
 #[no_mangle]
 pub unsafe extern "C" fn osInitialize_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
 
-/// `osAiSetFrequency(u32 frequency)` -- configures the audio DAC sample
-/// rate. No audio backend exists in this crate yet (`fn64-rt64`/`fn64-shell`
-/// own that, per `docs/DESIGN.md` section 1) -- stored as plain host state
-/// so a future audio-out wave has a real value to read, rather than
-/// discarded silently.
+/// `osAiSetFrequency(u32 frequency) -> s32` -- configures the audio DAC
+/// sample rate and returns the TRUE playback rate, or -1 if the frequency is
+/// unusable (`dacRate < AI_MIN_DAC_RATE`). No audio backend exists yet, so the
+/// frequency is stored as host state, but the s32 return is load-bearing: the
+/// only decomp caller (heap.c:966) assigns it to `aiSamplingFrequency` and
+/// then DIVIDES by it (heap.c:1002), so a stale/zero $v0 divides by garbage.
+///
+/// Byte-exact to aisetfreq.c:12-36: `dacRate = (osViClock/freq + 0.5)`;
+/// `dacRate < AI_MIN_DAC_RATE(132)` -> -1; else `osViClock / (s32)dacRate`.
+/// `osViClock == VI_NTSC_CLOCK == 48681812` (rcp.h:538), AI_MIN_DAC_RATE=132
+/// (rcp.h:587). Single u32 arg in $a0=r4, return $v0=r2.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osAiSetFrequency_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
-    let ctx = unsafe { &*ctx };
-    AI_FREQUENCY.with(|cell| cell.set(ctx.r4 as u32));
+    let ctx = unsafe { &mut *ctx };
+    let freq = ctx.r4 as u32;
+    AI_FREQUENCY.with(|cell| cell.set(freq));
+
+    // osViClock: the NTSC video clock (aisetfreq.c's `extern s32 osViClock`),
+    // which libultra initializes to VI_NTSC_CLOCK for an NTSC console.
+    const VI_NTSC_CLOCK: i32 = 48_681_812; // rcp.h:538
+    const AI_MIN_DAC_RATE: u32 = 132; // rcp.h:587
+    let dac_rate = (VI_NTSC_CLOCK as f32 / freq as f32 + 0.5) as u32;
+    ctx.r2 = if dac_rate < AI_MIN_DAC_RATE {
+        -1i32 as u32 as u64
+    } else {
+        (VI_NTSC_CLOCK / dac_rate as i32) as u32 as u64
+    };
 }
 
 thread_local! {
@@ -1573,7 +1755,15 @@ pub unsafe extern "C" fn osGetThreadId_recomp(_rdram: *mut u8, ctx: *mut RecompC
 #[no_mangle]
 pub unsafe extern "C" fn osGetTime_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
-    ctx.r2 = with_executor(|exec| exec.sim_time());
+    // OSTime is u64 (time.h:6); an o32 64-bit return splits $v0:$v1 =
+    // HIGH:LOW word, matching this crate's own convention (__ll_div_recomp
+    // etc.: `r2 = result>>32; r3 = result & 0xFFFFFFFF`). Callers reconstruct
+    // the u64 from both words (funcs_56.c ~1152 `sw $v0,0x20; sw $v1,0x24`;
+    // funcs_24.c ~5923) -- writing only r2 left r3 stale and corrupted both
+    // halves of the reconstructed timestamp.
+    let t = with_executor(|exec| exec.sim_time());
+    ctx.r2 = t >> 32;
+    ctx.r3 = t & 0xFFFF_FFFF;
 }
 
 /// `osSpTaskYielded(OSTask *task) -> s32` -- `a0`=`ctx->r4`, an `OSTask_t*`
@@ -1602,16 +1792,174 @@ pub unsafe extern "C" fn osGetTime_recomp(_rdram: *mut u8, ctx: *mut RecompConte
 /// wired up yet, see that crate's module doc). If no backend is
 /// registered at all, the task is still just recorded (trace + count) via
 /// `Executor::submit_task`, same as before this wave -- this function
-/// always sets `ctx.r2 = 1` (task complete, did not yield) so the caller's
-/// `bnel` path proceeds as if the RSP finished the task, matching real
-/// hardware's observable effect on the caller (task done, no further
-/// action expected) regardless of whether a backend actually drew
-/// anything.
+/// always sets `ctx.r2 = 0` (task complete, did NOT yield -- 0 is the
+/// completed value; OS_TASK_YIELDED==1 is the yielded value, sptask.h:20) so
+/// the caller's `beq $v0, $zero` path proceeds as if the RSP finished the
+/// task, matching real hardware's observable effect on the caller (task done,
+/// no re-queue) regardless of whether a backend actually drew anything.
 ///
-/// AUDIO_TASK_NOTE: an audio task (`M_AUDTASK`) causes the translated `wm2000_audio_ucode` function (out-of-tree; see `examples/wm2000-boot`'s harness, which registers it via `set_audio_ucode_fn` below -- `fn64-abi` itself contains no game-derived ucode C, per `README.md`'s "no game content ships in this repo") to be REALLY CALLED with `(rdram, ucode_addr)`, matching `RSPRecomp`'s documented generated signature. Its `RspExitReason` return is not yet interpreted beyond "it ran"; the header is still recorded via `submit_task`.
+/// AUDIO_TASK_NOTE: an audio task (`M_AUDTASK`) causes the registered translated audio ucode function (out-of-tree; e.g. `oot-audio-ucode`'s recompiled OoT aspMain, or WM2000's `wm2000_audio_ucode`, registered via `set_audio_ucode_fn` below -- `fn64-abi` itself contains no game-derived ucode, per `README.md`'s "no game content ships in this repo") to be REALLY CALLED with `(rdram, task_offset)` -- the OSTask's rdram offset, which a recompiled ucode uses to seed its RSP DMEM (see `AudioUcodeFn`'s doc comment). Its `RspExitReason` return is not yet interpreted beyond "it ran"; the header is still recorded via `submit_task`.
 ///
-/// UNKNOWN_TASK_NOTE: an unrecognized task type is recorded (so the trace/count still sees it) but not executed, and this function still sets `ctx.r2 = 1` (complete) -- the same "acknowledge, don't fabricate real hardware effects" stance as the gfx path, since this milestone has no evidence for any other task type on NWXE's boot path.
+/// UNKNOWN_TASK_NOTE: an unrecognized task type is recorded (so the trace/count still sees it) but not executed, and this function still sets `ctx.r2 = 0` (complete) -- the same "acknowledge, don't fabricate real hardware effects" stance as the gfx path, since this milestone has no evidence for any other task type on NWXE's boot path.
 ///
+/// Dispatch a graphics task (`M_GFXTASK`) to the registered `dyn
+/// RenderBackend`, once, at the point the RSP is actually kicked. Extracted so
+/// BOTH task-submission paths can call it: `osSpTaskStartGo_recomp` (the
+/// Load+StartGo path OoT and most retail titles use) and
+/// `osSpTaskYielded_recomp` (the yield/resume path). A prior version dispatched
+/// ONLY from the yield path, so OoT (which never yields the RSP -- it
+/// Load+StartGo's every frame) submitted 232 gfx tasks that the backend never
+/// saw, producing blank frames. Callers guard on `header.task_type ==
+/// M_GFXTASK` and pass the task header's rdram offset `o`.
+///
+/// If no backend is registered the call is a no-op (the task is still
+/// counted by the caller's `submit_task`) -- same "acknowledge, never fake
+/// success" stance as the audio path. A backend error is surfaced via
+/// `RENDER_LAST_ERROR`, never a MIPS-side fault (real hardware can't report a
+/// gfx-ucode failure back to the game thread either).
+///
+/// # Safety
+/// `rdram` valid for the call; `o` a valid task-header offset within it.
+unsafe fn dispatch_gfx_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
+    RENDER_BACKEND.with(|cell| {
+        if let Some(backend) = cell.borrow_mut().as_mut() {
+            let render_end = unsafe { read_output_buff_size(rdram, o) };
+            let task = fn64_render::OsTask {
+                task_type: header.task_type,
+                flags: header.flags,
+                ucode_boot: header.ucode_boot,
+                ucode_boot_size: header.ucode_boot_size,
+                ucode: header.ucode,
+                ucode_size: header.ucode_size,
+                ucode_data: header.ucode_data,
+                ucode_data_size: header.ucode_data_size,
+                dram_stack: header.dram_stack,
+                dram_stack_size: header.dram_stack_size,
+                output_buff: header.output_buff,
+                output_buff_size: render_end,
+                data_ptr: header.data_ptr,
+                data_size: header.data_size,
+            };
+            let rdram_len = RDRAM_LEN.with(|cell| cell.get());
+            let rdram_slice = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
+            // The color framebuffer the VI presents (`osViSwapBuffer`'s frame
+            // buffer, e.g. OoT's 0x3b5000/0x3da800) -- NOT `task.output_buff`
+            // (OoT's is 0x80151640, the RSP's DRAM command-FIFO output region,
+            // a different address). The reference backend rasterizes into its
+            // own surface and copies the result here so the VI-presented frame
+            // isn't blank. `0` (no VI framebuffer set yet) tells the backend
+            // "no known color target": it renders to its own surface only.
+            let output_addr = current_vi_framebuffer().unwrap_or(0);
+            let result = backend.process_task(rdram_slice, &task, output_addr);
+            RENDER_LAST_ERROR.with(|cell| cell.replace(result.err().map(|e| e.to_string())));
+        }
+    });
+}
+
+/// Dispatch an audio task (`M_AUDTASK`) once, at the point the RSP is kicked.
+/// Two halves, both symmetric with `dispatch_gfx_task`:
+///  1. Run the registered translated audio ucode (`AUDIO_UCODE_FN`,
+///     `set_audio_ucode_fn`) with `(rdram, task_offset)` -- `o` is the OSTask's
+///     rdram OFFSET, which the recompiled ucode's FFI wrapper uses to seed RSP
+///     DMEM[0xFC0] (rspboot pre-loads the 64-byte OSTask there; aspMain's first
+///     act is `lw 0x18(0xFC0)` = read `ucode_data`). No ucode registered -> the
+///     task is still counted by the caller's `submit_task`, honestly reflecting
+///     "submitted but this process never ran its ucode."
+///  2. Forward the ucode's AI output buffer (`output_buff`/`output_buff_size`)
+///     to the registered `dyn AudioBackend` (`set_audio_backend`) as interleaved
+///     i16 PCM. No backend -> no fabricated playback.
+///
+/// Extracted so BOTH submission paths dispatch it, exactly like
+/// `dispatch_gfx_task`: `osSpTaskStartGo_recomp` (the Load+StartGo path OoT's
+/// audio driver uses -- `AudioMgr_HandleRetrace` -> scheduler -> `Sched_RunTask`
+/// -> `osSpTaskLoad`+`osSpTaskStartGo`, never the yield path) and
+/// `osSpTaskYielded_recomp`. A prior version dispatched the ucode ONLY from the
+/// yield path, so a real OoT audio task submitted via StartGo would never have
+/// run its ucode -- the same latent bug class the gfx path already hit and fixed.
+///
+/// # Safety
+/// `rdram` valid for the call; `o` a valid task-header offset within it.
+unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
+    // Debug/perf escape hatch: `OOT_SKIP_AUDIO_UCODE` skips running the
+    // recompiled audio ucode (the per-frame RSP synth, currently unoptimized
+    // and the dominant per-swap cost). The CPU-side audio driver
+    // (AudioThread_UpdateImpl) and this task's completion event still run, so
+    // the audio-reset handshake that unblocks Play_Init still completes -- the
+    // ucode only produces the actual samples. Use it to iterate on the RENDERER
+    // at normal boot speed; a real audio run must NOT set it. No sound when set.
+    // Diagnostic: dump the exact rdram + task offset of the FIRST audio task so
+    // the recompiled ucode can be replayed offline against the real command
+    // list (env `OOT_DUMP_AUDIO_TASK=<path>`). One-shot.
+    if let Some(path) = std::env::var_os("OOT_DUMP_AUDIO_TASK") {
+        AUDIO_TASK_DUMPED.with(|c| {
+            if !c.get() {
+                let mut rdram_len = AUDIO_RDRAM_LEN.with(|cell| cell.get());
+                if rdram_len == 0 {
+                    rdram_len = RDRAM_LEN.with(|cell| cell.get());
+                }
+                if rdram_len > 0 {
+                    let bytes = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
+                    let p = std::path::Path::new(&path);
+                    let _ = std::fs::write(p, bytes);
+                    let meta = format!("task_offset={o}\nrdram_len={rdram_len}\n");
+                    let _ = std::fs::write(p.with_extension("meta"), meta);
+                    eprintln!("[fn64-abi] dumped audio task rdram ({rdram_len} B) + task_offset={o} to {path:?}");
+                }
+                c.set(true);
+            }
+        });
+    }
+    let skip_ucode = std::env::var_os("OOT_SKIP_AUDIO_UCODE").is_some();
+    if !skip_ucode {
+        AUDIO_UCODE_FN.with(|cell| {
+            if let Some(f) = cell.get() {
+                // Safety: `set_audio_ucode_fn`'s doc comment is the contract --
+                // `f` must be the real translated ucode function. See this
+                // function's doc comment for why `o` (the OSTask rdram offset) is
+                // the second argument, and `AudioUcodeFn`'s doc comment for the
+                // widened meaning.
+                if AUDIO_UCODE_TIMING.with(|c| c.get()) {
+                    let t = std::time::Instant::now();
+                    unsafe {
+                        f(rdram, o as u32);
+                    }
+                    let ns = t.elapsed().as_nanos() as u64;
+                    AUDIO_UCODE_NS.with(|c| c.set(c.get() + ns));
+                    AUDIO_UCODE_CALLS.with(|c| c.set(c.get() + 1));
+                } else {
+                    unsafe {
+                        f(rdram, o as u32);
+                    }
+                }
+            }
+        });
+    }
+    AUDIO_BACKEND.with(|cell| {
+        if let Some(backend) = cell.borrow_mut().as_mut() {
+            let rdram_len = AUDIO_RDRAM_LEN.with(|cell| cell.get());
+            let render_end = unsafe { read_output_buff_size(rdram, o) };
+            let start = header.output_buff as usize;
+            let end = start + render_end as usize;
+            let result = if rdram_len == 0 || end > rdram_len || !start.is_multiple_of(2) {
+                // No rdram length registered yet, or the task's declared
+                // buffer doesn't fit -- named "not ready" rather than an
+                // out-of-bounds read or a silent skip.
+                Err(AudioError::NotReady(
+                    "audio output buffer bounds unavailable or misaligned",
+                ))
+            } else {
+                let bytes = unsafe { std::slice::from_raw_parts(rdram.add(start), end - start) };
+                let samples: Vec<i16> = bytes
+                    .chunks_exact(2)
+                    .map(|c| i16::from_ne_bytes([c[0], c[1]]))
+                    .collect();
+                backend.queue_samples(&samples)
+            };
+            AUDIO_LAST_ERROR.with(|cell| cell.replace(result.err().map(|e| e.to_string())));
+        }
+    });
+}
+
 /// # Safety
 /// `ctx`/`rdram` must be valid per every other shim's contract in this file.
 #[no_mangle]
@@ -1622,117 +1970,20 @@ pub unsafe extern "C" fn osSpTaskYielded_recomp(rdram: *mut u8, ctx: *mut Recomp
     let header = unsafe { read_os_task_header(rdram, o) };
 
     if header.task_type == M_AUDTASK {
-        AUDIO_UCODE_FN.with(|cell| {
-            if let Some(f) = cell.get() {
-                // Safety: `set_audio_ucode_fn`'s doc comment is the
-                // contract -- `f` must be the real translated ucode
-                // function, matching RSPRecomp's documented
-                // `(uint8_t* rdram, uint32_t ucode_addr) -> RspExitReason`
-                // signature. `ucode` (offset 0x10 in the header) is the
-                // ucode text's rdram-relative address per the same field
-                // layout this function already reads.
-                unsafe {
-                    f(rdram, header.ucode);
-                }
-            }
-            // No ucode function registered (e.g. a test, or the harness
-            // hasn't wired it yet): the task is still recorded/counted
-            // below, honestly reflecting "an audio task was submitted, but
-            // this process never actually ran its ucode" rather than
-            // silently pretending it did.
-        });
-        // AUDIO_BACKEND_NOTE: routes M_AUDTASK's SAMPLE-DELIVERY half
-        // through the single registered `dyn AudioBackend`
-        // (`set_audio_backend`), the fn64-audio crate's seam, symmetric
-        // with `RENDER_BACKEND` below. This is a SEPARATE half from the
-        // `AUDIO_UCODE_FN` call just above: whatever that call wrote into
-        // `rdram` (real translated ucode output if one is registered, or
-        // untouched bytes if not -- `AudioUcodeFn`'s real FFI signature has
-        // no other return channel per RSPRecomp's generated code) is read
-        // back out of the task's own declared AI DMA output buffer
-        // (`output_buff`/`output_buff_size`, the same header fields the
-        // gfx path already reads for its own output bounds) and forwarded
-        // as interleaved i16 PCM. If no backend is registered, the task is
-        // still recorded/counted below, same "no backend -> no fabricated
-        // playback" honesty stance as the render seam.
-        AUDIO_BACKEND.with(|cell| {
-            if let Some(backend) = cell.borrow_mut().as_mut() {
-                let rdram_len = AUDIO_RDRAM_LEN.with(|cell| cell.get());
-                let render_end = unsafe { read_output_buff_size(rdram, o) };
-                let start = header.output_buff as usize;
-                let end = start + render_end as usize;
-                let result = if rdram_len == 0 || end > rdram_len || !start.is_multiple_of(2) {
-                    // No rdram length registered yet, or the task's
-                    // declared buffer doesn't fit -- named "not ready"
-                    // rather than an out-of-bounds read or a silent skip.
-                    Err(AudioError::NotReady(
-                        "audio output buffer bounds unavailable or misaligned",
-                    ))
-                } else {
-                    let bytes =
-                        unsafe { std::slice::from_raw_parts(rdram.add(start), end - start) };
-                    let samples: Vec<i16> = bytes
-                        .chunks_exact(2)
-                        .map(|c| i16::from_ne_bytes([c[0], c[1]]))
-                        .collect();
-                    backend.queue_samples(&samples)
-                };
-                AUDIO_LAST_ERROR.with(|cell| cell.replace(result.err().map(|e| e.to_string())));
-            }
-        });
+        unsafe { dispatch_audio_task(rdram, o, &header) };
     } else if header.task_type == M_GFXTASK {
-        // GFX_RENDER_NOTE: routes through the single registered `dyn
-        // RenderBackend` (`set_render_backend`), the same executor-event-
-        // seam pattern as the audio path above -- fn64-abi never names a
-        // concrete backend crate (docs/DECOUPLING.md: "the backend never
-        // reaches back into runtime state," and symmetrically, this crate
-        // never reaches INTO a specific backend's internals, only the
-        // trait). If no backend was registered (a test, or a harness that
-        // hasn't wired one up), the task is still recorded/counted below,
-        // same honesty stance as the audio path's "no ucode fn registered"
-        // case -- never a silent pretend-success.
-        RENDER_BACKEND.with(|cell| {
-            if let Some(backend) = cell.borrow_mut().as_mut() {
-                let render_end = unsafe { read_output_buff_size(rdram, o) };
-                let task = fn64_render::OsTask {
-                    task_type: header.task_type,
-                    flags: header.flags,
-                    ucode_boot: header.ucode_boot,
-                    ucode_boot_size: header.ucode_boot_size,
-                    ucode: header.ucode,
-                    ucode_size: header.ucode_size,
-                    ucode_data: header.ucode_data,
-                    ucode_data_size: header.ucode_data_size,
-                    dram_stack: header.dram_stack,
-                    dram_stack_size: header.dram_stack_size,
-                    output_buff: header.output_buff,
-                    output_buff_size: render_end,
-                    data_ptr: header.data_ptr,
-                    data_size: header.data_size,
-                };
-                // Safety: `rdram` is valid for this call's duration per
-                // this function's own contract; the backend only reads it
-                // as `&[u8]` for the length the executor's rdram buffer
-                // actually has (`RDRAM_LEN`, set by `set_render_backend`'s
-                // caller alongside the backend itself).
-                let rdram_len = RDRAM_LEN.with(|cell| cell.get());
-                let rdram_slice = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
-                // A backend error (unsupported ucode, bad bounds, backend
-                // not ready) is intentionally NOT propagated as a MIPS-side
-                // fault -- real hardware has no way to report "your gfx
-                // task's ucode isn't implemented" back to the game thread
-                // either; it is surfaced instead via `RENDER_LAST_ERROR`
-                // for a harness/test to inspect, matching this crate's
-                // "loud, not silent" rule without inventing a fake libultra
-                // error path no real ROM's code checks for.
-                let result = backend.process_task(rdram_slice, &task);
-                RENDER_LAST_ERROR.with(|cell| cell.replace(result.err().map(|e| e.to_string())));
-            }
-        });
+        unsafe { dispatch_gfx_task(rdram, o, &header) };
     }
 
     with_executor(|exec| exec.submit_task(header));
-    ctx.r2 = 1; // task complete, did not yield (see doc comment)
+    // Return 0 = task COMPLETED (did not yield). sptaskyielded.c returns
+    // OS_TASK_YIELDED (==1, sptask.h:20) only if the SP status has
+    // SP_STATUS_YIELDED set. This crate dispatches synchronously and runs the
+    // task to completion (never actually yields the SP), so the honest return
+    // is 0. Returning 1 would tell Sched_HandleReply (sched.c:577) the task
+    // yielded, re-queuing an already-finished task to the gfx list head to
+    // be re-run forever (funcs_41.c:1587 branches on this $v0).
+    ctx.r2 = 0;
 }
 
 /// Real `OSTask_t.t.output_buff_size` (`OSTask_t`'s field at offset 0x2C,
@@ -1786,6 +2037,24 @@ thread_local! {
     /// The most recent `AudioBackend::queue_samples` error, if any,
     /// stringified. Mirrors `RENDER_LAST_ERROR`.
     static AUDIO_LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+
+    /// Perf profiling: when true (env `OOT_AUDIO_UCODE_TIMING`), the M_AUDTASK
+    /// dispatch times each recompiled-ucode call and accumulates total ns +
+    /// call count for a caller to read via `audio_ucode_timing()`.
+    static AUDIO_UCODE_TIMING: Cell<bool> =
+        Cell::new(std::env::var_os("OOT_AUDIO_UCODE_TIMING").is_some());
+    static AUDIO_UCODE_NS: Cell<u64> = const { Cell::new(0) };
+    static AUDIO_UCODE_CALLS: Cell<u64> = const { Cell::new(0) };
+    static AUDIO_TASK_DUMPED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Total accumulated recompiled-audio-ucode time (ns) and call count since
+/// boot, for perf profiling. Only nonzero when `OOT_AUDIO_UCODE_TIMING` is set.
+pub fn audio_ucode_timing() -> (u64, u64) {
+    (
+        AUDIO_UCODE_NS.with(|c| c.get()),
+        AUDIO_UCODE_CALLS.with(|c| c.get()),
+    )
 }
 
 /// Register the audio backend `osSpTaskYielded_recomp` dispatches
@@ -1827,14 +2096,14 @@ pub fn last_render_error() -> Option<String> {
     RENDER_LAST_ERROR.with(|cell| cell.borrow().clone())
 }
 
-/// Real translated audio-ucode function signature, per
-/// `aki-recomp/games/NWXE/rsp/wm2000_audio.toml`'s
-/// `output_function_name = "wm2000_audio_ucode"` and its generated C's own
-/// signature (`RspExitReason wm2000_audio_ucode(uint8_t* rdram, uint32_t
-/// ucode_addr)`). `RspExitReason` is an RSPRecomp-defined enum this crate
-/// does not need to interpret (see `osSpTaskYielded_recomp`'s doc comment:
-/// "not yet interpreted beyond 'it ran'") -- represented here as a plain
-/// `u32` return the FFI boundary doesn't need to name further.
+/// Real translated audio-ucode function signature. Matches RSPRecomp's
+/// generated `RspExitReason <name>(uint8_t* rdram, uint32_t)` shape, but the
+/// second `u32` carries the **OSTask rdram offset** (`osSpTaskYielded_recomp`
+/// passes `o`), not the ucode-text address: a recompiled ucode bakes its own
+/// IMEM text in and instead needs the task structure to seed its RSP DMEM
+/// (rspboot loads the 64-byte OSTask into DMEM 0xFC0; the audio ucode reads
+/// `ucode_data`@0x18 from there). `RspExitReason` is an RSPRecomp-defined enum
+/// this crate does not interpret beyond "it ran" -- a plain `u32` return.
 pub type AudioUcodeFn = unsafe extern "C" fn(*mut u8, u32) -> u32;
 
 thread_local! {
@@ -2047,6 +2316,24 @@ pub fn arm_vi_retrace(interval: u64) {
     with_executor(|exec| exec.arm_retrace(interval));
 }
 
+/// Host-facing input seam: feed controller `port`'s live button/stick state
+/// so the game's next `osContGetReadData` reflects it. `buttons` is the N64
+/// `OSContPad.button` bitmask (`oot-decomp/include/controller.h:4-17`:
+/// `BTN_A = 0x8000`, `BTN_B = 0x4000`, `BTN_Z = 0x2000`, `BTN_START = 0x1000`,
+/// d-pad `0x0800..0x0100`, `BTN_L = 0x0020`, `BTN_R = 0x0010`, C-buttons
+/// `0x0008..0x0001`); `stick_x`/`stick_y` are the signed analog values
+/// (`OSContPad.stick_x`/`stick_y`, centered at 0). A scripted-input harness
+/// (`examples/oot-boot`) calls this to drive OoT headlessly. Idle by default,
+/// so an un-driven boot sees an honest neutral pad.
+pub fn set_controller_state(port: usize, buttons: u16, stick_x: i8, stick_y: i8) {
+    let input = fn64_runtime::si::ContInput {
+        button: buttons,
+        stick_x,
+        stick_y,
+    };
+    with_executor(|exec| exec.set_controller_input(port, input));
+}
+
 // ---------------------------------------------------------------------
 // Host-facing (non-`_recomp`) helpers.
 // ---------------------------------------------------------------------
@@ -2084,11 +2371,19 @@ pub unsafe fn boot_thread0(
 ) {
     let rdram_addr = rdram as usize;
     with_executor(|exec| {
+        // Register the process-wide rdram base so the executor can mirror
+        // each OSMesgQueue's validCount/first/msgCount back into the guest's
+        // real struct after every queue mutation -- guest code reads those
+        // fields directly (MQ_IS_FULL/MQ_GET_COUNT). SAFETY: `rdram` is the
+        // harness's single live rdram buffer, valid for the whole run, the
+        // same buffer every shim already receives.
+        unsafe { exec.set_rdram_base(rdram) };
         exec.create_thread(thread_id, priority, move |yielder, first_input| {
             let rdram_ptr = rdram_addr as *mut u8;
             with_active_yielder(thread_id, rdram_ptr, yielder, || {
                 let _ = first_input;
                 let mut ctx = RecompContext::zeroed();
+                ctx.arm_fpr_alias();
                 unsafe { entry(rdram_ptr, &mut ctx as *mut _) };
             });
         });
@@ -2175,12 +2470,12 @@ pub fn sim_time() -> u64 {
 impl RecompContext {
     /// An all-zero `RecompContext` -- used to seed a freshly-dispatched
     /// thread entry point's register state (`osCreateThread_recomp`).
-    /// `f_odd` is a raw pointer with no valid target in this all-zero state
-    /// (null); no shim in this milestone's undefined set touches it (see
-    /// this crate's earlier note: "no direct ctx-> touches of status_reg/
-    /// mips3_float_mode/f_odd were found" per ABI-SURFACE.md section (b)),
-    /// so null is the honest, unfaked value rather than a fabricated
-    /// pointee.
+    ///
+    /// `f_odd` is left null here; it is a SELF-REFERENTIAL pointer into this
+    /// same context's FPR file, so it can only be set once the context has a
+    /// stable address. Every dispatch site MUST call `arm_fpr_alias()` on the
+    /// context (at its final address, before running any recompiled function)
+    /// -- see that method's doc comment.
     pub fn zeroed() -> Self {
         // Safety: RecompContext is a `#[repr(C)]` struct of plain integers
         // and one raw pointer, all of which are valid when all-zero (a
@@ -2188,6 +2483,36 @@ impl RecompContext {
         // `#[repr(C)]` union of plain numeric types, likewise valid
         // zeroed.
         unsafe { std::mem::zeroed() }
+    }
+
+    /// Point `f_odd` at this context's own FPR file so recompiled `mtc1`/
+    /// `sdc1`-to-odd-register stores land in-register instead of faulting.
+    ///
+    /// Generated C addresses an odd float register `$fN` (N odd) as
+    /// `ctx->f_odd[(N-1)*2]`, treating `f_odd` as a `uint32_t*` cursor into
+    /// the `fpr f0..f31` array. With FR=0 (`mips3_float_mode == 0`, the state
+    /// libultra boots every OSThread in), the odd register's bits alias the
+    /// HIGH 32-bit word of its even partner: for `$f9`, index `(9-1)*2 = 16`,
+    /// byte `16*4 = 0x40` past `f_odd`, which must equal `&f8.u32h`. That
+    /// holds exactly when `f_odd == &f0.u32h` (the fpr union's second u32,
+    /// byte 4 of `f0`): `&f0.u32h + 0x40` == byte `0x44` == `f8`'s high word.
+    /// This matches the `recomp.h` fpr layout (`{u32l, u32h}` at bytes 0/4,
+    /// 8-byte stride) the generated C was emitted against.
+    ///
+    /// Was the OoT-boot SIGSEGV-at-0x40 root cause: `f_odd` stayed null from
+    /// `zeroed()`, so `guLookAtHiliteF`'s first `mtc1 $at, $f9`
+    /// (`ctx->f_odd[16] = ...`, funcs_57.c:4519) dereferenced null+0x40.
+    ///
+    /// # Safety
+    /// The pointer aliases `self`; `self` must not move for as long as any
+    /// recompiled code holds/uses this context (guaranteed at the dispatch
+    /// sites, which build the context and immediately run the entry function
+    /// with it, never relocating it mid-run).
+    pub fn arm_fpr_alias(&mut self) {
+        // `u32_halves.1` is the high 32-bit word of `f0` (byte offset 4),
+        // i.e. recomp.h's `f0.u32h` -- the FR=0 base the index math above
+        // requires.
+        self.f_odd = unsafe { &mut self.f0.u32_halves.1 as *mut u32 };
     }
 }
 
@@ -2410,58 +2735,164 @@ pub unsafe extern "C" fn __osSpSetPc_recomp(_rdram: *mut u8, _ctx: *mut RecompCo
 #[no_mangle]
 pub unsafe extern "C" fn __osSpSetStatus_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
 
-/// `osContGetQuery(int channel, OSContStatus *data) -> s32` -- `a0`=channel
-/// (`ctx->r4`), `a1`=data (`ctx->r5`). Public libultra manual's documented
-/// counterpart to `osContStartQuery`/`__osSiRawStartDma`'s PIF probe --
-/// `OSContStatus` is `{type: u16, status: u8, errno: u8}`, the SAME 3-byte
-/// `[type_hi, type_lo, status]` shape `PifModel::query_response` already
-/// produces for `__osSiRawStartDma_recomp`'s raw PIF-block path (rung 15's
-/// `osContStartQuery`/`osContGetQuery` pair is PadMgr's own higher-level
-/// wrapper over that same raw mechanism, per the public manual). No real
-/// `jal` call site in this corpus's static analysis (function-table slot
-/// only, `recomp_overlays.inl:2934`) -- reached via PadMgr's own internal
-/// polling per BOOT-PLAN.md rung 15, so implemented for real rather than
-/// loud-trapped.
+/// `osContGetQuery(OSContStatus *data)` -- ONE argument, `a0`=data
+/// (`ctx->r4`), returns void. Byte-verified against the OoT decomp
+/// (`oot-decomp/src/libultra/io/contquery.c:31`,
+/// `void osContGetQuery(OSContStatus* data)`) and its real call site
+/// `PadSetup_Init` (`oot-decomp/src/libu64/padsetup.c:19`,
+/// `osContGetQuery(status)` where `status = padMgr->padStatus`, an
+/// `OSContStatus[MAXCONTROLLERS]` array). The generated call site confirms
+/// the shape: `funcs_55.c:2193` sets only `$a0` (`ctx->r4 = ctx->r16`, the
+/// `padStatus` pointer) and leaves `$a1` UNSET -- a prior wave's
+/// `(int channel, OSContStatus* data)` signature read the data pointer from
+/// the stale `$a1`/`ctx->r5` (garbage left by the preceding `osRecvMesg`
+/// whose asm 0x800CD438 sets `$a1 = 0`), then dereferenced it: a real
+/// EXC_BAD_ACCESS deep in `Main -> PadMgr_Init -> PadSetup_Init` on OoT's
+/// first controller-status probe, which is why boot never yielded again
+/// after DmaMgr delivered the code-segment DMA (thread 3 died mid-C, before
+/// the next shim/yield).
+///
+/// Fills the whole `OSContStatus[MAXCONTROLLERS]` array, one entry per port
+/// (`__osContGetInitData`, `oot-decomp/src/libultra/io/controller.c:58`,
+/// iterates all `__osMaxControllers` and advances `data++` each). Each
+/// 4-byte entry is `{type: u16 @0, status: u8 @2, errno: u8 @3}`
+/// (`oot-decomp/include/ultra64/controller.h:121`). The game reads these
+/// back with `MEM_HU`/`MEM_BU` (`funcs_55.c:2205/2214`:
+/// `MEM_BU(reg,3)`=errno, `MEM_HU(reg,0)`=type, compared `== 0x0005`
+/// = `CONT_TYPE_NORMAL`), whose `^2`/`^3` sub-word swizzle
+/// (`refs/N64RecompSource/include/recomp.h:104-108`) requires each logical
+/// N64 struct byte at struct-offset `o` to live in the host buffer at
+/// `(base + o) ^ 3` -- so a present port-0 standard controller must read
+/// `type == 0x0005, errno == 0`, and absent ports 1-3 must read a non-zero
+/// `errno` (`CONT_NO_RESPONSE_ERROR = 0x08`,
+/// `oot-decomp/include/ultra64/controller.h:66`, the value
+/// `CHNL_ERR(no-response) = (0x80 >> 4)` yields) so `PadSetup_Init`'s
+/// `switch (status[i].errno)` skips them.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osContGetQuery_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
-    let channel = ctx.r4 as usize;
-    let data_addr = RdramAddr::from_gpr(ctx.r5).offset() as usize;
-    let resp = with_executor(|exec| exec.pif().query_response(channel));
-    unsafe {
-        // OSContStatus: type (u16, big-endian on real hardware's PIF wire
-        // format, matching query_response's existing [hi, lo, status]
-        // byte order) followed by status/errno bytes.
-        *rdram.add(data_addr) = resp[0];
-        *rdram.add(data_addr + 1) = resp[1];
-        *rdram.add(data_addr + 2) = resp[2];
-        *rdram.add(data_addr + 3) = 0; // errno: no error modeled
+    let data_addr = RdramAddr::from_gpr(ctx.r4).offset() as usize;
+    let pif = with_executor(|exec| *exec.pif());
+    for port in 0..MAXCONTROLLERS {
+        let resp = pif.query_response(port);
+        let absent = (resp[2] & fn64_runtime::si::CONT_ABSENT) != 0;
+        // `query_response` returns the PIF wire bytes `[typeh, typel,
+        // status]`. `__osContGetInitData` assembles the game-visible
+        // `OSContStatus.type` u16 as `typel << 8 | typeh`
+        // (`controller.c:72`), i.e. `(resp[1] << 8) | resp[0]` -- so a
+        // standard controller (`[0x05, 0x00, ..]`) becomes `0x0005 =
+        // CONT_TYPE_NORMAL`, which is what `PadSetup_Init` compares against.
+        // The 4 logical N64 struct bytes are `type` (u16, big-endian: hi @0,
+        // lo @1), `status` @2, `errno` @3. An absent port reports no-response
+        // in `errno` with type/status left zero (matching the decomp's
+        // `if (data->errno) continue;`, which never writes them on error).
+        let type_u16: u16 = ((resp[1] as u16) << 8) | resp[0] as u16;
+        let entry: [u8; 4] = if absent {
+            [0, 0, 0, CONT_NO_RESPONSE_ERROR]
+        } else {
+            [(type_u16 >> 8) as u8, (type_u16 & 0xFF) as u8, resp[2], 0]
+        };
+        let base = data_addr + port * 4;
+        // Store each logical byte at its `^3`-swizzled host position so the
+        // game's MEM_HU/MEM_BU reads (recomp.h) recover the right values --
+        // see the doc comment above for the byte-order derivation.
+        for (o, &b) in entry.iter().enumerate() {
+            unsafe {
+                *rdram.add((base + o) ^ 3) = b;
+            }
+        }
     }
-    ctx.r2 = 0;
 }
 
-/// `osContGetReadData(OSContPad *pad) -> s32` -- `a0`=`ctx->r4`. Public
-/// libultra manual's documented `OSContPad` layout: `button` (u16),
-/// `stick_x`/`stick_y` (s8 each), `errno` (u8) -- the same 4-byte idle
-/// shape `PifModel::read_data_response` already returns for
-/// `__osSiRawStartDma_recomp`'s raw path. Function-table slot only
-/// (`recomp_overlays.inl:2920`), reached via PadMgr's internal polling
-/// (BOOT-PLAN.md rung 15) -- implemented for real.
+/// `CONT_NO_RESPONSE_ERROR` (`oot-decomp/include/ultra64/controller.h:66`):
+/// the `OSContStatus.errno` value an absent/non-responding controller port
+/// reports (`CHNL_ERR` of a PIF no-response = `(CHNL_ERR_NORESP=0x80) >> 4`).
+const CONT_NO_RESPONSE_ERROR: u8 = 0x08;
+
+/// `MAXCONTROLLERS` (`oot-decomp/include/ultra64/controller.h:9`): the N64
+/// has four controller ports; `osContGetQuery` fills one `OSContStatus` per
+/// port.
+const MAXCONTROLLERS: usize = 4;
+
+/// `osContGetReadData(OSContPad *pad) -> void` -- `a0`=`ctx->r4`, the base of
+/// an `OSContPad[MAXCONTROLLERS]` array (`padMgr->pads`, decomp
+/// `oot-decomp/src/code/padmgr.c:364` `osContGetReadData(padMgr->pads)`).
+/// This is the INPUT SEAM's game-facing half: the per-port button/stick state
+/// a host harness fed via `PifModel::set_input` lands in the pad array the
+/// game reads each retrace to drive Link.
+///
+/// ## OSContPad layout + swizzle (byte-cited)
+///
+/// `oot-decomp/include/ultra64/controller.h:127-132`:
+/// `{ button: u16 @0x00, stick_x: s8 @0x02, stick_y: s8 @0x03, errno: u8 @0x04 }`,
+/// `size = 0x06`. The decomp `osContGetReadData`
+/// (`oot-decomp/src/libultra/io/contreaddata.c:22`) iterates all
+/// `__osMaxControllers`, sets `errno = CHNL_ERR(read)` for each, and ONLY
+/// fills `button`/`stick_x`/`stick_y` when `errno == 0` -- so a present
+/// controller reports `errno == 0` + live input, an absent port reports a
+/// nonzero `errno` (`CONT_NO_RESPONSE_ERROR = 0x08`) with the game leaving the
+/// stale button/stick (padmgr then `bzero`s pads[1]/pads[3] anyway).
+///
+/// The game reads these fields back through the recomp memory macros
+/// (`refs/N64RecompSource/include/recomp.h:104-108`): `button` via `MEM_HU`
+/// (`^2` halfword swizzle), `stick_x`/`stick_y`/`errno` via `MEM_B`/`MEM_BU`
+/// (`^3` byte swizzle). Storing each LOGICAL struct byte at host offset
+/// `(base + o) ^ 3` satisfies both: the two bytes of the big-endian `button`
+/// u16 land at `0^3 = 3` (hi) and `1^3 = 2` (lo), so a native `MEM_HU` read at
+/// `0^2 = 2` recovers `hi<<8 | lo` -- identical to the `^3` per-byte store
+/// `osContGetQuery_recomp` already uses for `OSContStatus`. A flat
+/// (unswizzled) copy, which a prior WIP did, put every field at the wrong lane
+/// and the game saw garbage/no input -- the exact fail this shim's test pins.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
-    let pad_addr = RdramAddr::from_gpr(ctx.r4).offset() as usize;
-    let resp = with_executor(|exec| exec.pif().read_data_response(0));
-    unsafe {
-        std::ptr::copy_nonoverlapping(resp.as_ptr(), rdram.add(pad_addr), 4);
+    let base_addr = RdramAddr::from_gpr(ctx.r4).offset() as usize;
+    let pif = with_executor(|exec| *exec.pif());
+    // Diagnostic (opt-in via FN64_TRACE_CONT): proves PadMgr actually polls
+    // input, and echoes what port-0 state the game is about to see -- the
+    // observable evidence a scripted press reaches the game.
+    if std::env::var_os("FN64_TRACE_CONT").is_some() {
+        let p0 = pif.read_data_response(0);
+        eprintln!(
+            "[fn64-abi] osContGetReadData(pad@{base_addr:#x}): port0 button={:#06x} stick=({},{})",
+            u16::from_be_bytes([p0[0], p0[1]]),
+            p0[2] as i8,
+            p0[3] as i8,
+        );
     }
-    ctx.r2 = 0;
+    for port in 0..MAXCONTROLLERS {
+        // A present standard controller reports errno == 0 and its live input;
+        // an absent port reports no-response, matching the decomp's
+        // `errno = CHNL_ERR(read)` branch (button/stick left zero here).
+        let absent = (pif.query_response(port)[2] & fn64_runtime::si::CONT_ABSENT) != 0;
+        // `read_data_response` is the `[button_hi, button_lo, stick_x, stick_y]`
+        // PIF wire shape filled from the fed input (idle default).
+        let resp = pif.read_data_response(port);
+        // Assemble the 6-byte OSContPad in LOGICAL struct-offset order:
+        // button hi@0, button lo@1, stick_x@2, stick_y@3, errno@4, pad@5.
+        let (button_hi, button_lo, stick_x, stick_y, errno) = if absent {
+            (0, 0, 0, 0, CONT_NO_RESPONSE_ERROR)
+        } else {
+            (resp[0], resp[1], resp[2], resp[3], 0)
+        };
+        let pad: [u8; 6] = [button_hi, button_lo, stick_x, stick_y, errno, 0];
+        let base = base_addr + port * 6;
+        // Store each logical byte at its `^3`-swizzled host position so the
+        // game's MEM_HU(button)/MEM_BU(stick,errno) reads recover the right
+        // values -- see the doc comment for the byte-order derivation.
+        for (o, &b) in pad.iter().enumerate() {
+            unsafe {
+                *rdram.add((base + o) ^ 3) = b;
+            }
+        }
+    }
+    // osContGetReadData returns void; leave $v0 as the decomp does (unset).
 }
 
 /// `osContInit(OSMesgQueue *mq, u8 *bitpattern, OSContStatus *data) -> s32`
@@ -2481,30 +2912,43 @@ pub unsafe extern "C" fn osContInit_recomp(rdram: *mut u8, ctx: *mut RecompConte
     let ctx = unsafe { &mut *ctx };
     let bitpattern_addr = RdramAddr::from_gpr(ctx.r5).offset() as usize;
     let data_addr = RdramAddr::from_gpr(ctx.r6).offset() as usize;
-    let mut mask: u16 = 0;
+    let mut mask: u8 = 0;
     with_executor(|exec| {
         let pif = *exec.pif();
-        for port in 0..4u32 {
-            let resp = pif.query_response(port as usize);
+        for port in 0..4usize {
+            let resp = pif.query_response(port);
             let absent = (resp[2] & fn64_runtime::si::CONT_ABSENT) != 0;
             if !absent {
                 mask |= 1 << port;
-                let off = data_addr + (port as usize) * 4;
+            }
+            // Write each OSContStatus entry SWIZZLED (`^3`), exactly like
+            // osContGetQuery_recomp -- the game reads type/status/errno back
+            // via MEM_HU/MEM_BU (recomp.h), so flat stores would transpose
+            // them. type u16 = (resp[1]<<8)|resp[0] (controller.c:72);
+            // absent ports report no-response in errno with type/status 0.
+            let type_u16: u16 = ((resp[1] as u16) << 8) | resp[0] as u16;
+            let entry: [u8; 4] = if absent {
+                [0, 0, 0, CONT_NO_RESPONSE_ERROR]
+            } else {
+                [(type_u16 >> 8) as u8, (type_u16 & 0xFF) as u8, resp[2], 0]
+            };
+            let base = data_addr + port * 4;
+            for (o, &b) in entry.iter().enumerate() {
                 unsafe {
-                    *rdram.add(off) = resp[0];
-                    *rdram.add(off + 1) = resp[1];
-                    *rdram.add(off + 2) = resp[2];
-                    *rdram.add(off + 3) = 0;
+                    *rdram.add((base + o) ^ 3) = b;
                 }
             }
         }
     });
     unsafe {
-        // OSContStatus's own u16 field the public manual documents this
-        // out-param as writing (present-port bitmask, hi byte first per
-        // the same PIF wire-order convention used throughout this file).
-        *rdram.add(bitpattern_addr) = (mask >> 8) as u8;
-        *rdram.add(bitpattern_addr + 1) = (mask & 0xFF) as u8;
+        // ctlBitfield is a `u8*`: the decomp writes a SINGLE byte
+        // `*ctlBitfield = bits` (controller.c:96), bits<=0x0F. Write one
+        // swizzled byte (^3). A second byte at +1 would (a) be always 0 for a
+        // u16 hi-byte and (b) clobber the adjacent variable -- and the flat
+        // +0 store misses the swizzled sentinel address PadSetup_Init checks
+        // (funcs_55.c 0x800CD414 `bnel $t7,0xFF`), so it would bail and skip
+        // all controller-present stores.
+        *rdram.add(bitpattern_addr ^ 3) = mask;
     }
     ctx.r2 = 0;
 }
@@ -2656,8 +3100,13 @@ pub unsafe extern "C" fn osEPiReadIo_recomp(rdram: *mut u8, ctx: *mut RecompCont
     with_pi_dma("osEPiReadIo_recomp", |dma| {
         let mut buf = [0u8; 4];
         dma.read_rom_bytes(dev_addr, &mut buf);
+        // Same word-swizzle as PiDma::start_dma / Rdram::write_bytes: rdram is
+        // native-endian-WORD storage, so a big-endian cartridge word must be
+        // stored byte-reversed or a later MEM_W/MEM_BU reads it swapped. A flat
+        // copy here is exactly the bug that hung OoT's Locale_Init region check.
+        let swz = [buf[3], buf[2], buf[1], buf[0]];
         unsafe {
-            std::ptr::copy_nonoverlapping(buf.as_ptr(), rdram.add(dram_addr), 4);
+            std::ptr::copy_nonoverlapping(swz.as_ptr(), rdram.add(dram_addr), 4);
         }
     });
     ctx.r2 = 0;
@@ -2705,27 +3154,41 @@ pub unsafe extern "C" fn osGetCount_recomp(_rdram: *mut u8, ctx: *mut RecompCont
     ctx.r2 = with_executor(|exec| exec.sim_time()) as u32 as u64;
 }
 
-/// `osJamMesg(OSMesgQueue *mq, OSMesg msg, s32 flag)` -- priority-jump
-/// variant of `osSendMesg` (public libultra manual: inserts at the FRONT
-/// of the queue rather than the back). Zero real call sites in this corpus
-/// and BOOT-PLAN.md's own "not observed on the traced happy path" note
-/// (IrqMgr's PRENMI handling, off the first-frame boot ladder) -- loud-
-/// trapped rather than silently approximated as a plain `osSendMesg`
-/// (`fn64_runtime::MesgQueue`/`Executor` has no front-insert primitive
-/// today; faking one via `try_send`'s back-of-queue semantics would be a
-/// real ordering lie for a queue with >1 pending message, silently wrong
-/// in exactly the multi-message case that would matter).
+/// `osJamMesg(OSMesgQueue *mq, OSMesg msg, s32 flag) -> s32` -- priority-jump
+/// variant of `osSendMesg`: front-inserts the message (jammesg.c:16-17
+/// `first = (first + msgCount - 1) % msgCount; msg[first] = msg`) so it is the
+/// next one received, and returns 0 on enqueue / -1 on a NOBLOCK full queue
+/// (jammesg.c:23 / :12). Reachable via audio DMA: `osEPiStartDma`
+/// (epidma.c:18-20) calls `osJamMesg` when `mb->hdr.pri == 1`, and
+/// `AudioLoad_Dma` FastCopy loads pass `OS_MESG_PRI_HIGH == 1` (load.c:1047,
+/// 1055; pi.h:76). o32: all three args are 32-bit -> mq=$a0=r4, msg=$a1=r5,
+/// flag=$a2=r6, return $v0=r2 -- mirrors `osSendMesg_recomp` exactly, only
+/// the insertion end differs (`jam: true`).
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn osJamMesg_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
-    unimplemented!(
-        "osJamMesg_recomp: no front-of-queue insert primitive exists in fn64_runtime::MesgQueue \
-         yet, and no real call site in games/OOTU/RecompiledFuncs exercises this (BOOT-PLAN.md: \
-         reached only off IrqMgr's PRENMI path, not the first-frame boot ladder) -- a fabricated \
-         back-of-queue insert would silently misorder a queue with >1 pending message."
-    );
+pub unsafe extern "C" fn osJamMesg_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let mq_addr = RdramAddr::from_gpr(ctx.r4);
+    let msg: Mesg = ctx.r5 as u32;
+    let may_block = ctx.r6 == OS_MESG_BLOCK;
+
+    let jammed = match suspend_active_coroutine(Yield::BlockOnSend {
+        mq_addr,
+        msg,
+        may_block,
+        jam: true,
+    }) {
+        Resume::SendUnblocked => true,
+        Resume::WouldBlock => false,
+        other => panic!(
+            "osJamMesg_recomp: resumed from a BlockOnSend yield with an unexpected Resume \
+             variant {other:?}"
+        ),
+    };
+    // $v0: 0 on front-insert, -1 when a NOBLOCK jam found the queue full.
+    ctx.r2 = if jammed { 0 } else { -1i64 as u64 };
 }
 
 /// `osMotorInit(OSMesgQueue *mq, OSPfs *pfs, int channel) -> s32` --
@@ -2890,21 +3353,74 @@ pub unsafe extern "C" fn osSpTaskLoad_recomp(rdram: *mut u8, ctx: *mut RecompCon
 }
 
 /// `osSpTaskStartGo(OSSpTask *sptask)` -- the actual RSP-kickoff half of
-/// the pair `osSpTaskLoad_recomp` above bookkeeps. Since this crate's
-/// dispatch model runs a task's real effect (audio ucode call / gfx
-/// backend dispatch) synchronously at `osSpTaskYielded_recomp`, not at
-/// `osSpTaskLoad`/`osSpTaskStartGo` time, this shim's own real effect is
-/// intentionally limited to existing as a callable symbol with no double-
-/// dispatch -- see that function's doc comment for where the actual
-/// ucode/gfx-backend call happens. A real hardware `osSpTaskStartGo`
-/// writes RSP `SP_STATUS`/kicks execution; this crate has no separate
-/// RSP-register model to poke (same reasoning as `__osSpSetStatus_recomp`
-/// above).
+/// the pair `osSpTaskLoad_recomp` above bookkeeps. `a0` = `ctx->r4` is the
+/// `OSTask*` (same pointer shape `osSpTaskLoad`/`osSpTaskYielded` read).
+///
+/// This crate's dispatch model runs a task's real effect (audio ucode
+/// call / gfx backend dispatch) synchronously at `osSpTaskYielded_recomp`,
+/// so there is deliberately no double-dispatch here. What a real
+/// `osSpTaskStartGo` DOES have that this stub was missing: kicking the RSP
+/// eventually raises the SP-done interrupt (and, for a task that drives the
+/// RDP to a `DPFullSync`, the DP-done interrupt), which libultra delivers
+/// as `OS_EVENT_SP` (=4) / `OS_EVENT_DP` (=9) to whatever queue the game
+/// registered via `osSetEventMesg`.
+///
+/// OoT's Scheduler registers exactly those (`sched.c:704-705`:
+/// `osSetEventMesg(OS_EVENT_SP, &sc->interruptQueue, RSP_DONE_MSG=667)` and
+/// `osSetEventMesg(OS_EVENT_DP, &sc->interruptQueue, RDP_DONE_MSG=668)`),
+/// kicks the task here from `Sched_RunTask` (`sched.c:459`), and its
+/// `Sched_ThreadEntry` loop (`sched.c:648`) blocks on `interruptQueue`
+/// waiting for those done-messages. Without them the scheduler thread never
+/// wakes, so `Sched_TaskComplete` (`sched.c:393`) never posts to the gfx
+/// task's `msgQueue` (= `gfxCtx->queue`), so `Graph_ExecuteAndDraw`'s
+/// `osRecvMesg(&gfxCtx->queue, ...)` (`graph.c:234`) blocks forever and
+/// `osViSwapBuffer` (`graph.c:76/78`, via `Sched_SwapFrameBuffer`) is never
+/// reached. Injecting the completion event(s) here closes that gap.
+///
+/// We inject SP-done for every task (any RSP task raises it), and DP-done
+/// additionally for a graphics task (`M_GFXTASK`) -- OoT's gfx task sets
+/// `OS_SC_NEEDS_RDP` (`graph.c:309`) and its scheduler blocks on BOTH
+/// `Sched_TaskComplete`'s `!(state & (OS_SC_DP | OS_SC_SP))` (`sched.c:397`)
+/// before posting the wake. Both events are guarded by
+/// `event_table_contains` so a task submitted before the game registered
+/// the event (or a game/test that never registers it) is a silent skip, not
+/// a panic -- matching `osContStartQuery_recomp`'s `OS_EVENT_SI` guard.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn osSpTaskStartGo_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
+pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
+    const OS_EVENT_SP: u32 = 4; // ultra64/message.h: SP task-done interrupt
+    const OS_EVENT_DP: u32 = 9; // ultra64/message.h: DP full-sync interrupt
+
+    let ctx = unsafe { &*ctx };
+    let task_addr = RdramAddr::from_gpr(ctx.r4);
+    let o = task_addr.offset() as usize;
+    let header = unsafe { read_os_task_header(rdram, o) };
+    let is_gfx = header.task_type == M_GFXTASK;
+
+    // Kicking the RSP IS where the task runs in this synchronous model, so the
+    // task's real effect happens here -- this is the path OoT uses (Load then
+    // StartGo, never the yield path) for BOTH its gfx and its audio tasks.
+    // Dispatch before injecting the completion events so the work is done by the
+    // time the scheduler is woken. A graphics task rasterizes; an audio task
+    // runs its registered ucode + forwards samples (previously dispatched only
+    // from the never-taken yield path -- same latent bug the gfx path hit).
+    if is_gfx {
+        unsafe { dispatch_gfx_task(rdram, o, &header) };
+    } else if header.task_type == M_AUDTASK {
+        unsafe { dispatch_audio_task(rdram, o, &header) };
+    }
+
+    with_executor(|exec| {
+        if exec.event_table_contains(OS_EVENT_SP) {
+            exec.inject_event(ExternalEvent::OsEvent(OS_EVENT_SP));
+        }
+        if is_gfx && exec.event_table_contains(OS_EVENT_DP) {
+            exec.inject_event(ExternalEvent::OsEvent(OS_EVENT_DP));
+        }
+    });
+}
 
 /// `osSpTaskYield(void)` -- signals the RSP to yield its current task back
 /// to the CPU, returning immediately (asynchronous request, not a
@@ -2970,7 +3486,18 @@ pub unsafe extern "C" fn osViGetCurrentFramebuffer_recomp(
 ) {
     let ctx = unsafe { &mut *ctx };
     let fb = with_executor(|exec| exec.vi().current_framebuffer);
-    ctx.r2 = fb.map(|a| a.offset() as u64).unwrap_or(0);
+    // Return the SIGN-EXTENDED KSEG0 pointer the game passed to
+    // osViSwapBuffer, NOT the bare physical offset: Sched_HandleRetrace
+    // compares this `$v0` result `==` against `pendingSwapBuf1->swapBuffer`
+    // (funcs_41.c PC 0x800A3288, `bnel $v1, $v0`), and that operand is loaded
+    // via `MEM_W` = `*(int32_t*)` -- SIGN-extended, so a KSEG0 fb like
+    // 0x803B5000 arrives as 0xFFFFFFFF_803B5000. Returning a zero-extended
+    // u32 (0x00000000_803B5000) made `bnel` see them as unequal and the
+    // framebuffer-swap chain that drives every frame-2+ swap never advanced
+    // (curBuf/pendingSwapBuf1 frozen), stalling boot at exactly 1 swap.
+    // `as i32 as u64` reproduces MEM_W's own sign extension. See
+    // `RdramAddr::to_kseg0`.
+    ctx.r2 = fb.map(|a| a.to_kseg0() as i32 as u64).unwrap_or(0);
 }
 
 /// `osViGetNextFramebuffer(void) -> void*` -- same reasoning/return value
@@ -2984,7 +3511,9 @@ pub unsafe extern "C" fn osViGetCurrentFramebuffer_recomp(
 pub unsafe extern "C" fn osViGetNextFramebuffer_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     let fb = with_executor(|exec| exec.vi().current_framebuffer);
-    ctx.r2 = fb.map(|a| a.offset() as u64).unwrap_or(0);
+    // Sign-extended KSEG0 pointer, same reasoning as
+    // osViGetCurrentFramebuffer_recomp (MEM_W-compatible sign extension).
+    ctx.r2 = fb.map(|a| a.to_kseg0() as i32 as u64).unwrap_or(0);
 }
 
 /// `osWritebackDCacheAll(void)` -- no arguments; writes back the ENTIRE
@@ -3074,6 +3603,55 @@ mod tests {
         ctx.r5 = r5;
         ctx.r6 = r6;
         ctx
+    }
+
+    /// Regression: `arm_fpr_alias` must make an odd-register `mtc1` (which
+    /// generated C emits as `ctx->f_odd[(N-1)*2] = value`) land in the HIGH
+    /// 32-bit word of register N's even partner (FR=0 lane), not fault
+    /// through a null `f_odd`. This was the OoT-boot SIGSEGV-at-0x40 in
+    /// `guLookAtHiliteF` (funcs_57.c:4519, `mtc1 $at, $f9`): `f_odd` was
+    /// left null by `zeroed()`, so `f_odd[16]` dereferenced 0x40.
+    ///
+    /// Verified to fail against the bug: comment out the `arm_fpr_alias()`
+    /// call below and the test segfaults on the null-pointer write (exactly
+    /// the boot fault) instead of asserting.
+    #[test]
+    fn arm_fpr_alias_routes_odd_mtc1_to_even_partner_high_word() {
+        // The context must live at a stable address for the whole test --
+        // `arm_fpr_alias` stores a self-referential pointer. Box it so the
+        // pointer stays valid across the field reads below.
+        let mut ctx = Box::new(ctx_zeroed());
+        ctx.arm_fpr_alias();
+
+        // Distinguishable per-register sentinels so an off-by-one landing in
+        // the wrong register (or the wrong 32-bit lane) is caught, not just a
+        // "didn't crash" pass.
+        // Generated C for `mtc1 <val>, $fN` (N odd): ctx->f_odd[(N-1)*2] = val
+        let cases: &[(usize, u32)] = &[(9, 0xDEAD_0009), (7, 0xBEEF_0007), (17, 0xCAFE_0017)];
+        for &(n, val) in cases {
+            // Safety: f_odd was just armed to point into this context's own
+            // fpr file; the index math mirrors the generated C exactly.
+            unsafe {
+                *ctx.f_odd.add((n - 1) * 2) = val;
+            }
+        }
+
+        // $f9's bits alias f8's high word (byte 0x44 == &f0.u32h + 0x40).
+        assert_eq!(unsafe { ctx.f8.u32_halves.1 }, 0xDEAD_0009, "f9 -> f8.u32h");
+        // $f7 -> f6.u32h; $f17 -> f16.u32h.
+        assert_eq!(unsafe { ctx.f6.u32_halves.1 }, 0xBEEF_0007, "f7 -> f6.u32h");
+        assert_eq!(
+            unsafe { ctx.f16.u32_halves.1 },
+            0xCAFE_0017,
+            "f17 -> f16.u32h"
+        );
+
+        // The LOW words of those even partners (their own $fN even-register
+        // value) must be untouched -- proves the write hit the odd lane, not
+        // the even register.
+        assert_eq!(unsafe { ctx.f8.u32_halves.0 }, 0, "f8 low word untouched");
+        assert_eq!(unsafe { ctx.f6.u32_halves.0 }, 0, "f6 low word untouched");
+        assert_eq!(unsafe { ctx.f16.u32_halves.0 }, 0, "f16 low word untouched");
     }
 
     fn spawn_test_thread(id: ThreadId, pri: Priority, body: impl FnOnce() + 'static) {
@@ -3182,6 +3760,138 @@ mod tests {
         // MEM_W is a native-endian word access, not big-endian.
         let written = i32::from_ne_bytes(rdram[0x20..0x24].try_into().unwrap());
         assert_eq!(written, 0x1234_5678);
+    }
+
+    /// Regression test for the real infinite-spin the OoT boot harness hit
+    /// (2026-07-14): `osRecvMesg_recomp` never wrote `ctx.r2` ($v0), so a
+    /// NOBLOCK-recv drain loop that tests `$v0 == -1` to detect an empty
+    /// queue never saw -1 and spun forever. The concrete caller was OoT's
+    /// Scheduler thread (`Sched_HandleNotification`, asm 0x800A3174 does a
+    /// NOBLOCK `osRecvMesg` then 0x800A3180 `beq $v0, -1` to exit) -- the
+    /// spin pinned `run_one_step` always-runnable, so virtual time never
+    /// advanced (`examples/oot-boot`: sim_time stuck at 0). The libultra
+    /// contract (ref impl `ultramodern/src/mesgqueue.cpp`:
+    /// `return received ? 0 : -1`) is: NOBLOCK recv on an empty queue -> -1.
+    ///
+    /// Seed `ctx.r2` with a realistic STALE non-`-1` value first, so a
+    /// regression that stops writing `$v0` fails here even though a
+    /// zeroed-`ctx` setup would have masked it (0 != -1 by luck, but the
+    /// delivered-path test below pins the 0 case too).
+    #[test]
+    fn noblock_recv_on_empty_queue_returns_minus_one_in_v0_even_with_stale_r2() {
+        let mq_vram: u64 = 0xFFFF_FFFF_800B_0000;
+        let mut create_ctx = ctx_with(mq_vram, 0, 1);
+        unsafe { osCreateMesgQueue_recomp(std::ptr::null_mut(), &mut create_ctx as *mut _) };
+
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed2 = observed.clone();
+        spawn_test_thread(110, 5, move || {
+            let mut recv_ctx = ctx_with(mq_vram, 0, OS_MESG_NOBLOCK);
+            recv_ctx.r2 = 0x1234_5678; // stale non-(-1), as a real caller's $v0 would hold
+            unsafe { osRecvMesg_recomp(std::ptr::null_mut(), &mut recv_ctx as *mut _) };
+            *observed2.borrow_mut() = Some(recv_ctx.r2);
+        });
+        // A NOBLOCK recv on an empty queue never parks: the thread runs to
+        // completion in a single step (this is exactly the yield that made
+        // the Sched thread always-runnable before the fix).
+        run_to_idle_with_yielder_plumbing();
+
+        assert_eq!(
+            observed.borrow().expect("recv thread ran"),
+            -1i64 as u64,
+            "NOBLOCK osRecvMesg on an empty queue must return -1 in $v0, or a \
+             `beq $v0, -1` drain loop (OoT's Sched thread) spins forever"
+        );
+    }
+
+    /// The delivered path must pin `$v0 = 0` (success), again seeding a
+    /// stale non-zero `$v0` so a regression that only writes -1 (or nothing)
+    /// on the empty path but leaves the success path stale is still caught.
+    #[test]
+    fn recv_that_delivers_a_message_returns_zero_in_v0_even_with_stale_r2() {
+        let mq_vram: u64 = 0xFFFF_FFFF_800C_0000;
+        let mq_addr = RdramAddr::from_gpr(mq_vram);
+        let mut create_ctx = ctx_with(mq_vram, 0, 1);
+        unsafe { osCreateMesgQueue_recomp(std::ptr::null_mut(), &mut create_ctx as *mut _) };
+        // Pre-seed one message so the NOBLOCK recv delivers immediately.
+        with_executor(|exec| {
+            assert_eq!(
+                exec.send_mesg(0, mq_addr, 0x0BAD_F00D, false),
+                SendMesgOutcome::Delivered
+            );
+        });
+
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed2 = observed.clone();
+        spawn_test_thread(111, 5, move || {
+            let mut recv_ctx = ctx_with(mq_vram, 0, OS_MESG_NOBLOCK);
+            recv_ctx.r2 = 0x7777_7777; // stale non-zero
+            unsafe { osRecvMesg_recomp(std::ptr::null_mut(), &mut recv_ctx as *mut _) };
+            *observed2.borrow_mut() = Some(recv_ctx.r2);
+        });
+        run_to_idle_with_yielder_plumbing();
+
+        assert_eq!(
+            observed.borrow().expect("recv thread ran"),
+            0,
+            "osRecvMesg that delivers a message must return 0 in $v0"
+        );
+    }
+
+    /// Symmetric return-value pin for `osSendMesg_recomp`: a NOBLOCK send on
+    /// a full queue must return -1 in $v0 (libultra `return sent ? 0 : -1`),
+    /// and a send that enqueues returns 0. Same stale-$v0 seeding discipline.
+    #[test]
+    fn noblock_send_return_value_in_v0_is_minus_one_on_full_zero_on_enqueue() {
+        let mq_vram: u64 = 0xFFFF_FFFF_800D_0000;
+        let mq_addr = RdramAddr::from_gpr(mq_vram);
+        // Capacity-1 queue, pre-filled so the next NOBLOCK send finds it full.
+        let mut create_ctx = ctx_with(mq_vram, 0, 1);
+        unsafe { osCreateMesgQueue_recomp(std::ptr::null_mut(), &mut create_ctx as *mut _) };
+        with_executor(|exec| {
+            assert_eq!(
+                exec.send_mesg(0, mq_addr, 0xFEED, false),
+                SendMesgOutcome::Delivered
+            );
+        });
+
+        let full = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let full2 = full.clone();
+        spawn_test_thread(112, 5, move || {
+            let mut send_ctx = ctx_with(mq_vram, 0x1111, OS_MESG_NOBLOCK);
+            send_ctx.r2 = 0x2222_2222; // stale non-(-1)
+            unsafe { osSendMesg_recomp(std::ptr::null_mut(), &mut send_ctx as *mut _) };
+            *full2.borrow_mut() = Some(send_ctx.r2);
+        });
+        run_to_idle_with_yielder_plumbing();
+        assert_eq!(
+            full.borrow().expect("send thread ran"),
+            -1i64 as u64,
+            "NOBLOCK osSendMesg on a full queue must return -1 in $v0"
+        );
+
+        // Drain the pre-filled message, then a NOBLOCK send into the now-open
+        // slot must return 0.
+        with_executor(|exec| {
+            assert_eq!(
+                exec.recv_mesg(999, mq_addr, false),
+                RecvMesgOutcome::Delivered(0xFEED)
+            );
+        });
+        let ok = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let ok2 = ok.clone();
+        spawn_test_thread(113, 5, move || {
+            let mut send_ctx = ctx_with(mq_vram, 0x3333, OS_MESG_NOBLOCK);
+            send_ctx.r2 = 0x4444_4444; // stale non-zero
+            unsafe { osSendMesg_recomp(std::ptr::null_mut(), &mut send_ctx as *mut _) };
+            *ok2.borrow_mut() = Some(send_ctx.r2);
+        });
+        run_to_idle_with_yielder_plumbing();
+        assert_eq!(
+            ok.borrow().expect("send thread ran"),
+            0,
+            "NOBLOCK osSendMesg that enqueues must return 0 in $v0"
+        );
     }
 
     /// Regression test for the coroutine-context-corruption bug the OoT
@@ -3453,14 +4163,17 @@ mod tests {
 
     #[test]
     fn os_get_time_tracks_the_executors_virtual_clock() {
+        // OSTime is reconstructed from $v0:$v1 = HIGH:LOW word (o32 64-bit
+        // return); see os_get_time_splits_u64_high_low_across_v0_v1.
+        let ostime = |ctx: &RecompContext| (ctx.r2 << 32) | (ctx.r3 & 0xFFFF_FFFF);
         let mut ctx = ctx_zeroed();
         unsafe { osGetTime_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
-        let t0 = ctx.r2;
+        let t0 = ostime(&ctx);
         with_executor(|exec| exec.advance_time(exec.sim_time() + 500));
         let mut ctx2 = ctx_zeroed();
         unsafe { osGetTime_recomp(std::ptr::null_mut(), &mut ctx2 as *mut _) };
         assert!(
-            ctx2.r2 >= t0 + 500,
+            ostime(&ctx2) >= t0 + 500,
             "osGetTime must track sim_time advancing, not a fixed value"
         );
     }
@@ -3589,6 +4302,154 @@ mod tests {
         );
     }
 
+    /// Regression for the OoT-boot `PadSetup_Init` EXC_BAD_ACCESS: the real
+    /// `osContGetQuery(OSContStatus* data)` takes its ONLY argument (the
+    /// array pointer) in `$a0`/`ctx.r4`; the buggy prior signature read it
+    /// from `$a1`/`ctx.r5`, which the real call site (`funcs_55.c:2193`)
+    /// leaves as stale garbage, so the shim dereferenced a wild pointer.
+    ///
+    /// This test wires `r4` and `r5` to two DIFFERENT, both-valid rdram
+    /// addresses and asserts the OSContStatus array lands at `r4`'s address
+    /// (and that `r5`'s address is untouched) -- so reintroducing the bug
+    /// (reading the pointer from `r5`) makes it fail rather than pass. It
+    /// also checks all four ports are filled with the exact byte-swizzled
+    /// values the game's own MEM_HU/MEM_BU reads recover: port 0 a present
+    /// standard controller (`type == 0x0005 == CONT_TYPE_NORMAL`, `errno ==
+    /// 0`), ports 1-3 absent (`errno == CONT_NO_RESPONSE_ERROR == 0x08`).
+    #[test]
+    fn os_cont_get_query_reads_array_pointer_from_a0_and_fills_all_ports() {
+        // Fresh PIF state (default: port 0 standard, 1-3 absent).
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+
+        let mut buf = vec![0u8; fn64_runtime::RDRAM_MMIO_WINDOW_END as usize];
+
+        // Two distinct, both-valid vram addresses. r4 = the REAL data
+        // pointer the game passes; r5 = a decoy the buggy shim would have
+        // used. Kept 0x40 apart so the 0x10-byte (4 * OSContStatus) write
+        // regions can't overlap.
+        let data_vram: u64 = 0xFFFF_FFFF_8020_0000;
+        let decoy_vram: u64 = 0xFFFF_FFFF_8020_0040;
+        let data_off = RdramAddr::from_gpr(data_vram).offset() as usize;
+        let decoy_off = RdramAddr::from_gpr(decoy_vram).offset() as usize;
+
+        // Pre-poison the decoy region with a sentinel so "untouched" is a
+        // real, checkable statement, not "happened to already be zero".
+        for i in 0..0x10 {
+            buf[decoy_off + i] = 0xAB;
+        }
+
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = data_vram;
+        ctx.r5 = decoy_vram;
+        unsafe { osContGetQuery_recomp(buf.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // Read each OSContStatus exactly as the generated game code does:
+        // MEM_HU(base, 0) = *(u16*)(rdram + (base ^ 2)); MEM_BU(base, 3) =
+        // *(u8*)(rdram + ((base + 3) ^ 3)) (recomp.h). Reading through the
+        // same swizzle the reader uses is what makes this a faithful check
+        // rather than an encoding of whatever byte order the writer chose.
+        let read_type = |base: usize| -> u16 {
+            let a = base ^ 2;
+            u16::from_ne_bytes([buf[a], buf[a + 1]])
+        };
+        let read_errno = |base: usize| -> u8 { buf[(base + 3) ^ 3] };
+
+        // Port 0: present standard controller.
+        let p0 = data_off;
+        assert_eq!(
+            read_type(p0),
+            0x0005,
+            "port 0 type must read as CONT_TYPE_NORMAL (0x0005) via the game's MEM_HU"
+        );
+        assert_eq!(read_errno(p0), 0, "port 0 (present) has no channel error");
+
+        // Ports 1-3: absent -> non-zero errno so PadSetup_Init skips them.
+        for port in 1..4usize {
+            let base = data_off + port * 4;
+            assert_eq!(
+                read_errno(base),
+                0x08,
+                "absent port {port} must report CONT_NO_RESPONSE_ERROR (0x08)"
+            );
+        }
+
+        // The decoy region (r5's address) must be completely untouched --
+        // proves the pointer came from r4, not r5. Under the old bug this
+        // region would have been written (and r4's region left as zeros).
+        for i in 0..0x10 {
+            assert_eq!(
+                buf[decoy_off + i],
+                0xAB,
+                "byte {i} at the r5/decoy address was written -- the shim read \
+                 its pointer from the wrong register (the reintroduced bug)"
+            );
+        }
+    }
+
+    /// The INPUT-SEAM contract: a host harness feeds controller state via
+    /// `set_controller_state`, and `osContGetReadData_recomp` writes it into
+    /// the game's `OSContPad[MAXCONTROLLERS]` array at `$a0`/`ctx.r4`, in the
+    /// exact byte-swizzled layout the game's own MEM_HU/MEM_BU reads recover.
+    ///
+    /// Fail-against-the-bug: it reads every field back through the SAME
+    /// swizzle the recompiled game uses (`button` via MEM_HU `^2`, `stick`/
+    /// `errno` via MEM_BU `^3`, recomp.h:104-108). A flat/unswizzled copy (the
+    /// prior WIP) or a wrong button bit lands the bytes at the wrong lanes and
+    /// this fails. It also checks the button HIGH byte carries `BTN_START`
+    /// (0x1000) -- the scripted-boot press -- so an endianness flip fails too.
+    #[test]
+    fn os_cont_get_read_data_writes_swizzled_input_into_pad_array() {
+        // Fresh state, then feed a distinctive input on port 0: Start+A held,
+        // stick pushed. (BTN_A = 0x8000, BTN_START = 0x1000 -> 0x9000.)
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        set_controller_state(0, 0x9000, -50, 70);
+
+        let mut buf = vec![0u8; fn64_runtime::RDRAM_MMIO_WINDOW_END as usize];
+        let pad_vram: u64 = 0xFFFF_FFFF_8020_0000;
+        let pad_off = RdramAddr::from_gpr(pad_vram).offset() as usize;
+
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = pad_vram;
+        unsafe { osContGetReadData_recomp(buf.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // Read each OSContPad field EXACTLY as the recompiled game does:
+        // button via MEM_HU (`^2` halfword), the s8/u8 fields via MEM_BU
+        // (`^3` byte). OSContPad size = 0x06 (controller.h:132).
+        let read_button = |base: usize| -> u16 {
+            let a = base ^ 2;
+            u16::from_ne_bytes([buf[a], buf[a + 1]])
+        };
+        let read_i8 = |base: usize, o: usize| -> i8 { buf[(base + o) ^ 3] as i8 };
+        let read_u8 = |base: usize, o: usize| -> u8 { buf[(base + o) ^ 3] };
+
+        // Port 0: present -> errno 0 and the exact fed input.
+        let p0 = pad_off;
+        assert_eq!(
+            read_button(p0),
+            0x9000,
+            "port 0 button must read back BTN_A|BTN_START (0x9000) via the game's MEM_HU"
+        );
+        assert_ne!(
+            read_button(p0) & 0x1000,
+            0,
+            "BTN_START (0x1000) must be set -- the scripted press must reach the game"
+        );
+        assert_eq!(read_i8(p0, 2), -50, "stick_x");
+        assert_eq!(read_i8(p0, 3), 70, "stick_y");
+        assert_eq!(read_u8(p0, 4), 0, "port 0 (present) errno == 0");
+
+        // Ports 1-3: absent -> nonzero errno so the game ignores them.
+        for port in 1..MAXCONTROLLERS {
+            let base = pad_off + port * 6;
+            assert_eq!(
+                read_u8(base, 4),
+                CONT_NO_RESPONSE_ERROR,
+                "absent port {port} errno must be CONT_NO_RESPONSE_ERROR (0x08)"
+            );
+            assert_eq!(read_button(base), 0, "absent port {port} button zeroed");
+        }
+    }
+
     #[no_mangle]
     unsafe extern "C" fn test_func_entry(rdram: *mut u8, ctx: *mut RecompContext) {
         let ctx = unsafe { &mut *ctx };
@@ -3657,6 +4518,89 @@ mod tests {
         let written = u32::from_ne_bytes(rdram[0x1018..0x101C].try_into().unwrap());
         assert_eq!(written, 0xCAFE);
         set_section_unloaded(idx);
+    }
+
+    /// Regression: `osSetTimer`'s `OSTime countdown` is a 64-bit value passed
+    /// in the o32 register pair a2:a3 (`ctx.r6`=HIGH word, `ctx.r7`=LOW word).
+    /// The old shim read only `ctx.r6` (the HIGH word), which is 0 for any
+    /// countdown under 2^32 -- so OoT's own 3-second RCP-timeout timer
+    /// (`Graph_ExecuteAndDraw`, funcs_40.c PC 0x800A13C0: `lui $a3,0x861; ori
+    /// $a3,$a3,0xC468` => a3=0x0861C468, `addiu $a2,$zero,0x0` => a2=0) armed
+    /// with countdown=0 and fired IMMEDIATELY on the very next
+    /// `advance_virtual_time` tick, spinning the Graph thread instead of
+    /// pacing it 3 virtual seconds out.
+    ///
+    /// Distinguishable values: countdown 0x0861_C468 (the real 3s value, high
+    /// word 0), armed at t=0; a probe at t=1000 (well before it) must NOT
+    /// deliver, and a probe at t=0x0861_C468 must. The buggy high-word-only
+    /// read would deliver at t=1000 (countdown seen as 0), failing the first
+    /// assert.
+    #[test]
+    fn os_set_timer_assembles_64bit_countdown_from_a2_a3_register_pair() {
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+
+        // Real rdram so the stack-passed interval/mq/msg reads resolve. Leaked
+        // to a 'static pointer so it stays valid across the spawned coroutine
+        // that arms the timer (the arm must run inside a resumed thread body
+        // so `current_thread_id` has an active id, matching real dispatch).
+        let rdram: &'static mut [u8] =
+            vec![0u8; fn64_runtime::RDRAM_MMIO_WINDOW_END as usize].leak();
+        let rdram_ptr = rdram.as_mut_ptr();
+
+        // The queue the timer posts to, and the message it posts.
+        let mq_vram: u64 = 0xFFFF_FFFF_8006_0000;
+        let mq_addr = RdramAddr::from_gpr(mq_vram);
+        const TIMER_MSG: u32 = 0x1234_5678;
+        with_executor(|exec| exec.create_mesg_queue(mq_addr, 4));
+
+        // arg layout: a0=OSTimer* (r4), countdown 64-bit in a2:a3 (r6:r7),
+        // interval 64-bit at sp+0x10:0x14, mq at sp+0x18, msg at sp+0x1C.
+        const COUNTDOWN: u32 = 0x0861_C468; // OS_USEC_TO_CYCLES(3000000), high word 0
+        let sp: u64 = 0xFFFF_FFFF_8000_4000;
+        {
+            let mut put = |off: u32, v: u32| {
+                let o = RdramAddr::from_gpr(sp.wrapping_add(off as u64)).offset() as usize;
+                rdram[o..o + 4].copy_from_slice(&v.to_ne_bytes());
+            };
+            put(0x10, 0); // interval HIGH = 0
+            put(0x14, 0); // interval LOW  = 0 (one-shot)
+            put(0x18, mq_vram as u32); // mq
+            put(0x1C, TIMER_MSG); // msg
+        }
+
+        // Arm the timer from inside a resumed thread body (installs an active
+        // thread id, as every real _recomp call has).
+        spawn_test_thread(200, 1, move || {
+            let mut ctx = ctx_zeroed();
+            ctx.r4 = 0xFFFF_FFFF_8006_1000; // OSTimer* handle
+            ctx.r6 = 0; // a2 = countdown HIGH word (zero for a <2^32 value)
+            ctx.r7 = COUNTDOWN as u64; // a3 = countdown LOW word
+            ctx.r29 = sp;
+            unsafe { osSetTimer_recomp(rdram_ptr, &mut ctx as *mut _) };
+        });
+        run_to_idle();
+
+        // Probe WELL before the real deadline: nothing may be delivered yet.
+        // (The bug delivered here, having read countdown as 0.)
+        advance_virtual_time(1000);
+        with_executor(|exec| {
+            assert_eq!(
+                exec.recv_mesg(0, mq_addr, false),
+                RecvMesgOutcome::WouldBlock,
+                "a 0x0861C468-cycle countdown must NOT fire at t=1000 -- if it did, the shim \
+                 read only the (zero) HIGH word of the 64-bit countdown"
+            );
+        });
+
+        // Advance to the real deadline: now it must deliver exactly once.
+        advance_virtual_time(COUNTDOWN as u64);
+        with_executor(|exec| {
+            assert_eq!(
+                exec.recv_mesg(0, mq_addr, false),
+                RecvMesgOutcome::Delivered(TIMER_MSG),
+                "the timer must fire at its true 64-bit deadline"
+            );
+        });
     }
 
     #[test]
@@ -3873,10 +4817,123 @@ mod tests {
         ctx.r4 = 0x8000_0000 + header_off as u64;
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
-        assert_eq!(ctx.r2, 1, "task reported complete, not yielded");
+        assert_eq!(
+            ctx.r2, 0,
+            "task reported complete (0), not OS_TASK_YIELDED (1)"
+        );
         with_executor(|exec| {
             assert_eq!(exec.task_log().gfx_count(), 1);
             assert_eq!(exec.task_log().audio_count(), 0);
+        });
+    }
+
+    /// Regression for the "gfx task submitted, framebuffer never swaps"
+    /// deadlock: `osSpTaskStartGo_recomp` MUST post the SP-done (and, for a
+    /// graphics task, the DP-done) completion event to whatever queue the
+    /// game registered via `osSetEventMesg`, mirroring OoT's Scheduler
+    /// (`sched.c:704-705`: `osSetEventMesg(OS_EVENT_SP, &interruptQueue,
+    /// RSP_DONE_MSG=667)` / `osSetEventMesg(OS_EVENT_DP, ..., RDP_DONE_MSG=
+    /// 668)`). Without these, `Sched_ThreadEntry`'s `osRecvMesg` on
+    /// `interruptQueue` (`sched.c:656`) never wakes, `Sched_TaskComplete`
+    /// (`sched.c:393`) never posts to `gfxCtx->queue`, and
+    /// `Graph_ExecuteAndDraw`'s `osRecvMesg` (`graph.c:234`) blocks forever
+    /// -> `osViSwapBuffer` is never reached (observed as `vi_swaps=0` in
+    /// `examples/oot-boot`).
+    ///
+    /// The prior stub was an empty `{}`, so reintroducing it (delete the
+    /// two `inject_event` calls) makes both `recv_mesg` asserts below fail
+    /// with `WouldBlock` -- verified by hand before committing, not a
+    /// green-against-the-bug check.
+    #[test]
+    fn os_sp_task_start_go_posts_sp_and_dp_completion_to_registered_queue() {
+        // OoT's real event->message mapping (sched.c).
+        const OS_EVENT_SP: u32 = 4;
+        const OS_EVENT_DP: u32 = 9;
+        const RSP_DONE_MSG: u32 = 667;
+        const RDP_DONE_MSG: u32 = 668;
+
+        // A distinct queue address so this test can't collide with the
+        // shared thread-local executor's other queues (same isolation
+        // rationale as the rung tests' hand-picked addresses).
+        let interrupt_q = RdramAddr::from_offset(0x0009_0000);
+        with_executor(|exec| {
+            exec.create_mesg_queue(interrupt_q, 4);
+            exec.set_event_mesg(OS_EVENT_SP, interrupt_q, RSP_DONE_MSG);
+            exec.set_event_mesg(OS_EVENT_DP, interrupt_q, RDP_DONE_MSG);
+        });
+
+        // A graphics task header (M_GFXTASK at +0x0), read from ctx.r4 the
+        // same way the real `Sched_RunTask` call site passes `&spTask->list`.
+        let mut rdram = vec![0u8; 128];
+        let header_off = 0x10usize;
+        rdram[header_off..header_off + 4].copy_from_slice(&fn64_runtime::M_GFXTASK.to_ne_bytes());
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + header_off as u64;
+
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // Both completion messages must now be sitting in the registered
+        // queue, in SP-then-DP order (RSP finishes before RDP). A dummy
+        // receiver id (99) drains them non-blocking; no thread was blocked,
+        // so delivery comes straight from the ring buffer.
+        with_executor(|exec| {
+            assert_eq!(
+                exec.recv_mesg(99, interrupt_q, false),
+                RecvMesgOutcome::Delivered(RSP_DONE_MSG),
+                "osSpTaskStartGo must post OS_EVENT_SP -> RSP_DONE_MSG"
+            );
+            assert_eq!(
+                exec.recv_mesg(99, interrupt_q, false),
+                RecvMesgOutcome::Delivered(RDP_DONE_MSG),
+                "a graphics task's osSpTaskStartGo must ALSO post OS_EVENT_DP -> RDP_DONE_MSG"
+            );
+            // Nothing else was posted.
+            assert_eq!(
+                exec.recv_mesg(99, interrupt_q, false),
+                RecvMesgOutcome::WouldBlock,
+                "exactly two completion messages, no more"
+            );
+        });
+    }
+
+    /// A NON-graphics RSP task (e.g. `M_AUDTASK`) posts ONLY the SP-done
+    /// event, never DP-done -- OoT's audio task doesn't set OS_SC_NEEDS_RDP,
+    /// so injecting a spurious RDP_DONE_MSG would desync the scheduler's
+    /// `curRDPTask` bookkeeping. Reintroducing the `is_gfx` gate as an
+    /// unconditional DP inject makes the final `WouldBlock` assert fail.
+    #[test]
+    fn os_sp_task_start_go_audio_task_posts_only_sp() {
+        const OS_EVENT_SP: u32 = 4;
+        const OS_EVENT_DP: u32 = 9;
+        const RSP_DONE_MSG: u32 = 667;
+        const RDP_DONE_MSG: u32 = 668;
+
+        let interrupt_q = RdramAddr::from_offset(0x0009_1000);
+        with_executor(|exec| {
+            exec.create_mesg_queue(interrupt_q, 4);
+            exec.set_event_mesg(OS_EVENT_SP, interrupt_q, RSP_DONE_MSG);
+            exec.set_event_mesg(OS_EVENT_DP, interrupt_q, RDP_DONE_MSG);
+        });
+
+        let mut rdram = vec![0u8; 128];
+        let header_off = 0x10usize;
+        rdram[header_off..header_off + 4].copy_from_slice(&fn64_runtime::M_AUDTASK.to_ne_bytes());
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + header_off as u64;
+
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        with_executor(|exec| {
+            assert_eq!(
+                exec.recv_mesg(99, interrupt_q, false),
+                RecvMesgOutcome::Delivered(RSP_DONE_MSG),
+                "an audio task's osSpTaskStartGo posts OS_EVENT_SP"
+            );
+            assert_eq!(
+                exec.recv_mesg(99, interrupt_q, false),
+                RecvMesgOutcome::WouldBlock,
+                "a non-graphics task must NOT post OS_EVENT_DP"
+            );
         });
     }
 
@@ -3945,7 +5002,10 @@ mod tests {
         ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
-        assert_eq!(ctx.r2, 1, "task reported complete, not yielded");
+        assert_eq!(
+            ctx.r2, 0,
+            "task reported complete (0), not OS_TASK_YIELDED (1)"
+        );
         assert_eq!(
             last_render_error(),
             None,
@@ -3972,7 +5032,7 @@ mod tests {
             data_ptr: DL_ADDR as u32,
             ..Default::default()
         };
-        direct.process_task(&rdram, &task).unwrap();
+        direct.process_task(&mut rdram, &task, 0).unwrap();
         assert!(
             direct
                 .framebuffer()
@@ -3988,9 +5048,9 @@ mod tests {
         static CALLED: AtomicBool = AtomicBool::new(false);
         static SEEN_UCODE_ADDR: AtomicU32 = AtomicU32::new(0);
 
-        unsafe extern "C" fn fake_ucode(_rdram: *mut u8, ucode_addr: u32) -> u32 {
+        unsafe extern "C" fn fake_ucode(_rdram: *mut u8, task_offset: u32) -> u32 {
             CALLED.store(true, Ordering::SeqCst);
-            SEEN_UCODE_ADDR.store(ucode_addr, Ordering::SeqCst);
+            SEEN_UCODE_ADDR.store(task_offset, Ordering::SeqCst);
             0
         }
         unsafe { set_audio_ucode_fn(fake_ucode) };
@@ -4008,8 +5068,53 @@ mod tests {
             CALLED.load(Ordering::SeqCst),
             "real ucode fn must be called for M_AUDTASK"
         );
-        assert_eq!(SEEN_UCODE_ADDR.load(Ordering::SeqCst), 0xDEAD);
+        // The second arg is the OSTask's rdram OFFSET (see `AudioUcodeFn`'s
+        // doc comment: a recompiled ucode bakes its IMEM text in and needs the
+        // task structure, not the ucode-text address). Here that's
+        // `header_off` (0x20), the offset of the OSTask within `rdram`.
+        assert_eq!(SEEN_UCODE_ADDR.load(Ordering::SeqCst), header_off as u32);
         with_executor(|exec| assert!(exec.task_log().audio_count() >= 1));
+    }
+
+    /// Fail-against-bug: OoT's audio driver submits its `M_AUDTASK` via the
+    /// Load+StartGo path (`AudioMgr_HandleRetrace` -> scheduler ->
+    /// `Sched_RunTask` -> `osSpTaskLoad`+`osSpTaskStartGo`), NEVER the yield
+    /// path. Before the fix, `osSpTaskStartGo_recomp` dispatched only
+    /// `M_GFXTASK`, so a real audio task kicked here never ran its ucode -- the
+    /// recompiled aspMain would never execute and no samples would be produced,
+    /// even once the audio thread was submitting tasks. This asserts StartGo
+    /// really invokes the registered ucode for `M_AUDTASK`, symmetric with the
+    /// gfx-from-StartGo fix (commit 73a191a) and the yield-path test above.
+    #[test]
+    fn os_sp_task_start_go_calls_the_registered_audio_ucode_fn_for_real() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        static CALLED: AtomicBool = AtomicBool::new(false);
+        static SEEN_OFFSET: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "C" fn fake_ucode(_rdram: *mut u8, task_offset: u32) -> u32 {
+            CALLED.store(true, Ordering::SeqCst);
+            SEEN_OFFSET.store(task_offset, Ordering::SeqCst);
+            0
+        }
+        unsafe { set_audio_ucode_fn(fake_ucode) };
+
+        let mut rdram = vec![0u8; 128];
+        let header_off = 0x30usize;
+        rdram[header_off..header_off + 4].copy_from_slice(&fn64_runtime::M_AUDTASK.to_ne_bytes());
+
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + header_off as u64;
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        assert!(
+            CALLED.load(Ordering::SeqCst),
+            "osSpTaskStartGo must call the real ucode fn for an M_AUDTASK (the OoT path)"
+        );
+        assert_eq!(
+            SEEN_OFFSET.load(Ordering::SeqCst),
+            header_off as u32,
+            "ucode receives the OSTask rdram offset, same contract as the yield path"
+        );
     }
 
     #[test]
@@ -4071,7 +5176,10 @@ mod tests {
         ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
-        assert_eq!(ctx.r2, 1, "task reported complete, not yielded");
+        assert_eq!(
+            ctx.r2, 0,
+            "task reported complete (0), not OS_TASK_YIELDED (1)"
+        );
         assert_eq!(
             last_audio_error(),
             None,
@@ -4109,37 +5217,259 @@ mod tests {
     /// would hide the bug -- 0 minus 0 is still 0), and the OSIoMesg
     /// fields are placed at their real rdram offsets relative to that vram
     /// address, not relative to 0.
+    /// Builds an OSIoMesg exactly as OOTU `DmaMgr_DmaRomToRam` does
+    /// (`funcs_0.c` asm 0x800008F0-0x80000900): 0x08-byte `OSIoMesgHdr`
+    /// (retQueue at +0x4), then `dramAddr` +0x8, `devAddr` +0xC, `size`
+    /// +0x10. The prior version of this test placed fields +0x4 too high to
+    /// match the buggy 0xC-header shim, so it passed green against the bug --
+    /// the exact "weak green check" trap. A NON-UNIFORM multi-word ROM
+    /// payload and a NON-ZERO multi-word `size` make a wrong-offset read
+    /// (which would pick up size=0, or the wrong devAddr) fail loudly.
     #[test]
     fn os_epi_start_dma_reads_real_fields_at_a_nonzero_mb_address() {
         // Use a fresh ROM per test (with_pi_dma's HOST state is thread-local
         // per test since each #[test] gets its own OS thread by default).
-        load_rom(vec![0xABu8; 0x1000]);
+        // Non-uniform big-endian cart words at devAddr 0x40 so a flat
+        // (non-swizzled) DMA, a wrong devAddr, or a truncated len all fail.
+        let mut rom = vec![0u8; 0x1000];
+        let dev_addr: u32 = 0x40;
+        rom[0x40..0x44].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        rom[0x44..0x48].copy_from_slice(&[0x00, 0x00, 0x10, 0x60]); // 0x1060 -- DmaMgr's sentinel
+        rom[0x48..0x4C].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        load_rom(rom);
 
         let mut rdram = vec![0u8; 0x10000];
         let mb_vram: u64 = 0x8000_2000; // a REAL, nonzero vram address
         let mb_offset = 0x2000usize;
 
-        // OSIoMesg fields at mb_offset + {0x4 (retQueue), 0x8 (retMesg),
-        // 0xC (dramAddr), 0x10 (devAddr), 0x14 (size)} -- native byte order,
-        // per this wave's MEM_W correction.
+        // OSIoMesg fields at mb_offset + {retQueue +0x4, dramAddr +0x8,
+        // devAddr +0xC, size +0x10} -- native byte order, DmaMgr's real
+        // layout (0x08-byte OSIoMesgHdr).
         let dram_target_vram: u32 = 0x8000_5000;
+        let size: u32 = 0xC; // 3 words -- non-zero, multi-word
         rdram[mb_offset + 0x4..mb_offset + 0x8].copy_from_slice(&0u32.to_ne_bytes()); // no retQueue
-        rdram[mb_offset + 0xC..mb_offset + 0x10].copy_from_slice(&dram_target_vram.to_ne_bytes());
-        rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&0x10u32.to_ne_bytes()); // devAddr
-        rdram[mb_offset + 0x14..mb_offset + 0x18].copy_from_slice(&4u32.to_ne_bytes()); // len
+        rdram[mb_offset + 0x8..mb_offset + 0xC].copy_from_slice(&dram_target_vram.to_ne_bytes());
+        rdram[mb_offset + 0xC..mb_offset + 0x10].copy_from_slice(&dev_addr.to_ne_bytes());
+        rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&size.to_ne_bytes());
 
         let mut ctx = ctx_zeroed();
         ctx.r5 = mb_vram;
         ctx.r6 = 0; // OS_READ / ToRdram
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
-        // dramAddr (0x8000_5000) -> rdram offset 0x5000; the DMA should
-        // have copied 4 bytes of 0xAB from ROM offset 0x10 there. Reaching
-        // this point at all (no EXC_BAD_ACCESS) already proves mb_addr's
-        // fields were read from the CORRECT (non-double-translated)
-        // offset; the copied bytes confirm the DMA itself used the right
-        // dramAddr/devAddr/len too.
-        assert_eq!(&rdram[0x5000..0x5004], &[0xAB, 0xAB, 0xAB, 0xAB]);
+        // dramAddr (0x8000_5000) -> rdram offset 0x5000. Each big-endian
+        // cart word must arrive so the guest's MEM_W reads it intact; rdram
+        // is native-word storage, so physical bytes are byte-reversed. A
+        // wrong offset would read size=0 (delivering nothing) or the wrong
+        // devAddr; a flat copy would byte-reverse the words.
+        let w0 = u32::from_ne_bytes(rdram[0x5000..0x5004].try_into().unwrap());
+        let w1 = u32::from_ne_bytes(rdram[0x5004..0x5008].try_into().unwrap());
+        let w2 = u32::from_ne_bytes(rdram[0x5008..0x500C].try_into().unwrap());
+        assert_eq!(w0, 0x1234_5678, "first ROM word must be delivered intact");
+        assert_eq!(
+            w1, 0x0000_1060,
+            "second word (DmaMgr's 0x1060 sentinel) proves the full size was read, not 0/one word"
+        );
+        assert_eq!(w2, 0xDEAD_BEEF, "third word confirms the exact len (0xC)");
+        // And nothing spilled past the declared length.
+        let after = u32::from_ne_bytes(rdram[0x500C..0x5010].try_into().unwrap());
+        assert_eq!(after, 0, "DMA must not write past size (0xC bytes)");
+    }
+
+    /// Regression test for the fully-static-overlay NULL-function-pointer trap
+    /// (2026-07-15): OoT's Player overlay (section 9) is a STATIC N64Recomp
+    /// build (num_relocs=0, zero RELOC_HI16/LO16), so `Player_InitItemAction`
+    /// reads `sItemActionInitFuncs[]` via a BAKED absolute link address
+    /// (`lui 0x8085; lw 0x1EA8` -> 0x80851EA8, funcs_67.c:1815-1830). The game
+    /// DMAs the overlay to an arena HEAP base and relocates the HEAP copy, but
+    /// the recompiled code dereferences the STATIC link VRAM -- which fn64 left
+    /// unwritten (reads 0) -> `LOOKUP_FUNC(0)` trap. The fix mirrors the
+    /// overlay's raw ROM image to its static link VRAM (holding un-relocated
+    /// static function pointers) so the baked read resolves via the section's
+    /// static base.
+    ///
+    /// This drives the real `osEPiStartDma_recomp` path: register a section at
+    /// a static VRAM, DMA its ROM image to a HEAP vram (as the arena would),
+    /// then assert the guest's own MEM_W read of the data-table entry at the
+    /// STATIC link VRAM returns the static function pointer, and that
+    /// `get_function` resolves it to the registered func. A DISTINCT func_ptr
+    /// (not 0) makes a mirror miss / wrong-offset fail loudly. Without the
+    /// mirror, the static-VRAM word is 0 and `get_function(0)` traps -- the
+    /// exact bug this guards. (Verified fail-against-bug: reverting the mirror
+    /// write makes the MEM_W read 0 and the resolve panic.)
+    #[test]
+    fn static_overlay_data_table_read_resolves_via_static_vram_mirror() {
+        unsafe extern "C" fn player_init_default_ia(_r: *mut u8, _c: *mut RecompContext) {}
+        let func_ptr: RecompFunc = player_init_default_ia;
+
+        // Model section 9: rom 0x00BCDB70, static link VRAM 0x808301C0. The
+        // data-table entry we test points at section offset 0x15E4 (the real
+        // Player_InitDefaultIA offset). Use a compact ROM: the section image
+        // is [text .. data], with the table living at file offset 0x40 and the
+        // pointed-at func at static offset 0x15E4.
+        const SEC_ROM: u32 = 0x00BC_DB70;
+        const SEC_RAM: u32 = 0x8083_01C0;
+        const FUNC_OFF: u32 = 0x15E4; // real Player_InitDefaultIA offset
+        const TABLE_FILE_OFF: usize = 0x40; // where the ptr table sits in ROM
+        let static_ptr: u32 = SEC_RAM + FUNC_OFF; // 0x808317A4 -- the baked static ptr
+                                                  // The overlay file must be word-aligned and long enough to DMA in one
+                                                  // aligned chunk covering the table.
+        let file_len: u32 = 0x80;
+
+        // Register the section with a FuncEntry at the pointed-at offset, and
+        // register a SECOND, unrelated section so a wrong-section resolve is
+        // caught. Only mark section 9 loaded (at its heap base, as the arena
+        // DMA would) so `resolve`'s static-base path is what's exercised.
+        let sec9 =
+            unsafe { register_section(SEC_ROM, SEC_RAM, 0x2_1110, &[(FUNC_OFF, 4, func_ptr)]) };
+
+        // Build a ROM whose section image holds the static pointer (big-endian
+        // cart order) at the table offset.
+        let mut rom = vec![0u8; (SEC_ROM as usize) + (file_len as usize) + 0x10];
+        let tbl_rom = SEC_ROM as usize + TABLE_FILE_OFF;
+        rom[tbl_rom..tbl_rom + 4].copy_from_slice(&static_ptr.to_be_bytes());
+        load_rom(rom);
+
+        // DMA the overlay's ROM image to a HEAP base (as the arena allocates),
+        // via the real osEPiStartDma_recomp shim. Heap base picked to differ
+        // from the static VRAM so a heap-vs-static confusion is caught.
+        let heap_vram: u32 = 0x8038_8b60;
+        let mut rdram = vec![0u8; fn64_runtime::RDRAM_MMIO_WINDOW_END as usize];
+        let mb_off = 0x2000usize;
+        let mb_vram: u64 = 0x8000_2000;
+        rdram[mb_off + 0x4..mb_off + 0x8].copy_from_slice(&0u32.to_ne_bytes()); // retQueue
+        rdram[mb_off + 0x8..mb_off + 0xC].copy_from_slice(&heap_vram.to_ne_bytes()); // dramAddr
+        rdram[mb_off + 0xC..mb_off + 0x10].copy_from_slice(&SEC_ROM.to_ne_bytes()); // devAddr
+        rdram[mb_off + 0x10..mb_off + 0x14].copy_from_slice(&file_len.to_ne_bytes()); // size
+
+        let mut ctx = ctx_zeroed();
+        ctx.r5 = mb_vram;
+        ctx.r6 = 0; // OS_READ / ToRdram
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // The game's baked read: MEM_W at the STATIC link VRAM of the table.
+        // Static VRAM 0x808301C0+TABLE_FILE_OFF -> rdram offset (mask KSEG0).
+        let table_static_vram = SEC_RAM + TABLE_FILE_OFF as u32;
+        let static_off = (table_static_vram & 0x1FFF_FFFF) as usize;
+        let read_ptr = u32::from_ne_bytes(rdram[static_off..static_off + 4].try_into().unwrap());
+        assert_eq!(
+            read_ptr, static_ptr,
+            "static-link-VRAM mirror must place the un-relocated static function pointer \
+             ({static_ptr:#010x}) where the baked `lw` reads it; got {read_ptr:#010x} (0 == \
+             mirror never ran -> the LOOKUP_FUNC(0) trap)"
+        );
+        // And it resolves through the section's static base to the real func.
+        let resolved = get_function(read_ptr as i32);
+        assert_eq!(
+            resolved as usize, func_ptr as usize,
+            "the mirrored static pointer must resolve to the registered FuncEntry"
+        );
+
+        set_section_unloaded(sec9);
+    }
+
+    /// Regression test for the OoT-boot hang (2026-07-14): `osEPiReadIo`
+    /// delivered the cartridge word into rdram FLAT, but the guest reads
+    /// individual bytes back through `MEM_BU`'s `^3` byte-lane XOR (rdram is
+    /// native-endian-word storage). `Locale_Init` DMAs the ROM header, `lbu`s
+    /// the region byte, accepts only 'E'/'J', else `LogUtils_HungupThread`s.
+    /// A flat copy delivered the wrong byte -> neither-E-nor-J -> deliberate
+    /// hang. This models that exact read with a distinguishable word so a
+    /// regression to flat semantics fails here, not 8 frames into a boot.
+    #[test]
+    fn os_epi_read_io_word_reads_back_through_mem_bu_unswapped() {
+        // ROM word at devAddr 0x3C = `5A 4C 4A 00` (OoT's real `Z L J \0`);
+        // guest wants MEM_BU(dram+2) == 0x4A ('J').
+        let mut rom = vec![0u8; 0x100];
+        rom[0x3C..0x40].copy_from_slice(&[0x5A, 0x4C, 0x4A, 0x00]);
+        load_rom(rom);
+
+        let mut rdram = vec![0u8; 0x1000];
+        let dram_vram: u64 = 0x8000_0024;
+        let dram_off = 0x24usize;
+
+        let mut ctx = ctx_zeroed();
+        ctx.r5 = 0x3C; // devAddr
+        ctx.r6 = dram_vram; // dramAddr
+        unsafe { osEPiReadIo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // MEM_BU(dram_off ^ 3) is the guest's byte read; +2 must be 'J'.
+        assert_eq!(rdram[(dram_off + 0) ^ 3], 0x5A); // 'Z'
+        assert_eq!(rdram[(dram_off + 2) ^ 3], 0x4A); // 'J' -- the region byte
+                                                     // And MEM_W reads the cart word intact (native-endian word storage).
+        let w = u32::from_ne_bytes(rdram[dram_off..dram_off + 4].try_into().unwrap());
+        assert_eq!(w, 0x5A4C_4A00);
+    }
+
+    /// Regression test for the SRAM-DMA-treated-as-ROM crash (2026-07-15):
+    /// OoT's `Sram_InitSram -> SsSram_ReadWrite -> SsSram_Dma` issues a PI DMA
+    /// with `devAddr = 0x08000000` (PI_DOM2_ADDR2, the SRAM cartridge base --
+    /// rcp.h:714), which the old `osEPiStartDma_recomp` blindly read from the
+    /// ROM image -> `InMemoryRom::read_into` past the 55MB ROM -> loud trap.
+    /// The fix routes domain-2 devAddrs to the registered `SaveStorage`.
+    ///
+    /// Drives the REAL raw-pointer shim path (not `PiDma::start_dma`) for both
+    /// directions: build an OSIoMesg exactly as `SsSram_Dma` does (dramAddr
+    /// +0x8, devAddr +0xC, size +0x10, per pi.h:52-58), OS_WRITE the pattern to
+    /// SRAM, then OS_READ it back into a different rdram region and assert the
+    /// guest's own `MEM_BU`/`MEM_W` accessors read every byte in the SAME
+    /// order. A flat (non-swizzled) copy in either direction fails here.
+    #[test]
+    fn os_epi_start_dma_round_trips_sram_save_domain() {
+        // A ROM whose bytes at offset 0 are DISTINCT from the SRAM pattern, so
+        // a regression that reads the ROM instead of the save is caught.
+        let mut rom = vec![0u8; 0x1000];
+        rom[0..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        load_rom(rom);
+        // OoT uses 32 KiB banked SRAM.
+        set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+            fn64_runtime::SaveType::SramBanked,
+        )));
+
+        let mut rdram = vec![0u8; 0x10000];
+        let mb_offset = 0x2000usize;
+        let mb_vram: u64 = 0x8000_2000;
+        let sram_dev_addr: u32 = 0x0800_0010; // domain-2 base + 0x10
+        let size: u32 = 8;
+
+        // Guest lays 8 distinct bytes at rdram 0x5000 via MEM_BU (byte-lane
+        // `^3`), the way it would build a save record before writing it out.
+        let src = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let src_off = 0x5000usize;
+        for (k, &b) in src.iter().enumerate() {
+            rdram[(src_off + k) ^ 3] = b;
+        }
+        // OSIoMesg for the WRITE (OS_WRITE=1 -> FromRdram).
+        rdram[mb_offset + 0x4..mb_offset + 0x8].copy_from_slice(&0u32.to_ne_bytes());
+        rdram[mb_offset + 0x8..mb_offset + 0xC].copy_from_slice(&0x8000_5000u32.to_ne_bytes());
+        rdram[mb_offset + 0xC..mb_offset + 0x10].copy_from_slice(&sram_dev_addr.to_ne_bytes());
+        rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&size.to_ne_bytes());
+        let mut ctx = ctx_zeroed();
+        ctx.r5 = mb_vram;
+        ctx.r6 = 1; // OS_WRITE
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // OSIoMesg for the READ back into a DIFFERENT region (0x6000).
+        let dst_off = 0x6000usize;
+        rdram[mb_offset + 0x8..mb_offset + 0xC].copy_from_slice(&0x8000_6000u32.to_ne_bytes());
+        let mut ctx = ctx_zeroed();
+        ctx.r5 = mb_vram;
+        ctx.r6 = 0; // OS_READ
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // Guest reads readBuff[k] via MEM_BU((dst)+k) = rdram[(dst+k)^3];
+        // every byte must match the original -- swizzle cancels round-trip.
+        for (k, &b) in src.iter().enumerate() {
+            assert_eq!(
+                rdram[(dst_off + k) ^ 3],
+                b,
+                "SRAM round-trip byte {k}: save DMA must route to the save store, \
+                 word-swizzled, not the ROM"
+            );
+        }
+        // The ROM byte at offset 0 (0xAA) must NOT appear -- proves the read
+        // hit the save store, not the ROM image.
+        assert_ne!(rdram[dst_off ^ 3], 0xAA);
     }
 
     /// Regression test for the real infinite-loop bug `examples/wm2000-boot`
@@ -4158,10 +5488,12 @@ mod tests {
 
         let mut rdram = vec![0u8; 0x10000];
         let mb_offset = 0x2000usize;
+        // DmaMgr's real OSIoMesg layout: retQueue +0x4, dramAddr +0x8,
+        // devAddr +0xC, size +0x10 (0x08-byte OSIoMesgHdr).
         rdram[mb_offset + 0x4..mb_offset + 0x8].copy_from_slice(&0u32.to_ne_bytes());
-        rdram[mb_offset + 0xC..mb_offset + 0x10].copy_from_slice(&0x8000_5000u32.to_ne_bytes());
-        rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&0u32.to_ne_bytes());
-        rdram[mb_offset + 0x14..mb_offset + 0x18].copy_from_slice(&4u32.to_ne_bytes());
+        rdram[mb_offset + 0x8..mb_offset + 0xC].copy_from_slice(&0x8000_5000u32.to_ne_bytes());
+        rdram[mb_offset + 0xC..mb_offset + 0x10].copy_from_slice(&0u32.to_ne_bytes());
+        rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&4u32.to_ne_bytes());
 
         let mut ctx = ctx_zeroed();
         ctx.r5 = 0x8000_2000;
@@ -4196,5 +5528,140 @@ mod tests {
             ctx.r6 = 0; // direction = ToRdram
             unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
         }
+    }
+
+    /// osGetTime returns a u64 OSTime split $v0:$v1 = HIGH:LOW word (this
+    /// crate's 64-bit-return convention, __ll_div_recomp). A caller stores
+    /// r2 then r3 as two consecutive words to reconstruct the u64. Fails
+    /// against the bug (r2 = full u64, r3 never written): r2 would truncate
+    /// to the LOW word and r3 stays stale.
+    #[test]
+    fn os_get_time_splits_u64_high_low_across_v0_v1() {
+        // A time whose high and low words are BOTH nonzero and distinct, so a
+        // dropped/swapped half is caught (not masked by a zero word).
+        let t: u64 = 0x1122_3344_5566_7788;
+        with_executor(|exec| exec.advance_time(t));
+
+        let mut ctx = ctx_zeroed();
+        ctx.r3 = 0xDEAD_BEEF; // stale $v1: the bug leaves this untouched.
+        unsafe { osGetTime_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+
+        assert_eq!(ctx.r2, 0x1122_3344, "$v0 = HIGH word");
+        assert_eq!(ctx.r3, 0x5566_7788, "$v1 = LOW word");
+    }
+
+    /// osAiSetFrequency must write the true DAC playback rate to $v0
+    /// (aisetfreq.c: osViClock / dacRate), or -1 for an unusably-low rate.
+    /// Fails against the bug (never writes r2): stale $v0 survives.
+    #[test]
+    fn os_ai_set_frequency_returns_true_dac_rate_in_v0() {
+        // 32000 Hz: dacRate = round(48681812/32000) = round(1521.3) = 1521;
+        // true rate = 48681812 / 1521 = 32006. Distinct from the input.
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 32000;
+        ctx.r2 = 0xBADD_C0DE; // stale $v0 the bug would leave in place.
+        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+        assert_eq!(ctx.r2, 32006, "true DAC rate 48681812/1521");
+
+        // An unusably-high frequency drives dacRate below AI_MIN_DAC_RATE
+        // (132) and must return -1: freq 400000 -> dacRate = round(121.7) =
+        // 122 < 132.
+        let mut ctx = ctx_with(400_000, 0, 0);
+        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+        assert_eq!(ctx.r2, -1i32 as u32 as u64, "dacRate < 132 -> -1");
+    }
+
+    /// osSpTaskYielded, in this crate's synchronous run-to-completion model,
+    /// must report task COMPLETED (0), not OS_TASK_YIELDED (1). Returning 1
+    /// makes the scheduler re-queue an already-finished task forever. Fails
+    /// against the bug (`ctx.r2 = 1`).
+    #[test]
+    fn os_sp_task_yielded_reports_completed_not_yielded() {
+        // Minimal OSTask header at rdram offset 0x40, task_type = 0 (unknown:
+        // recorded but no backend/ucode fired). Buffer covers base+0x38.
+        let mut rdram = vec![0u8; 256];
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0040; // KSEG0 -> offset 0x40
+        ctx.r2 = 0xFFFF_FFFF; // stale $v0.
+        unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+        assert_eq!(
+            ctx.r2, 0,
+            "0 = completed (did not yield); 1 = OS_TASK_YIELDED"
+        );
+    }
+
+    /// osContInit: (1) OSContStatus entries must be written SWIZZLED (^3) like
+    /// osContGetQuery, and (2) ctlBitfield is a `u8*` -- a SINGLE swizzled
+    /// byte, no +1 store. Fails against the bug (flat status stores + two
+    /// bitfield bytes at flat +0/+1).
+    #[test]
+    fn os_cont_init_swizzles_status_and_writes_single_bitfield_byte() {
+        // data at offset 0x40 (16 bytes = 4 OSContStatus), bitfield at 0x80.
+        let mut rdram = vec![0xEEu8; 256]; // 0xEE sentinel: catch stray writes.
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0; // mq (unused for the byte layout under test)
+        ctx.r5 = 0x8000_0080; // ctlBitfield
+        ctx.r6 = 0x8000_0040; // data (OSContStatus[4])
+        unsafe { osContInit_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+
+        // Port 0 is a standard controller (type 0x0005). The swizzled entry
+        // [type_hi=0x00, type_lo=0x05, status=0x00, pad=0x00] lands at
+        // (0x40+o)^3, so logical byte 1 (0x05) is at host 0x40+ (1^3)=0x40+2.
+        let logical = |base: usize, o: usize| rdram[(base + o) ^ 3];
+        assert_eq!(logical(0x40, 0), 0x00, "port0 type_hi");
+        assert_eq!(logical(0x40, 1), 0x05, "port0 type_lo (CONT_TYPE_STANDARD)");
+        assert_eq!(logical(0x40, 2), 0x00, "port0 status");
+        assert_eq!(logical(0x40, 3), 0x00, "port0 pad");
+        // Port 1 absent -> [0,0,0,CONT_NO_RESPONSE_ERROR] swizzled.
+        assert_eq!(logical(0x44, 3), CONT_NO_RESPONSE_ERROR, "port1 errno");
+
+        // ctlBitfield: a SINGLE swizzled byte = mask (0x01, only port 0). The
+        // flat address 0x80 must stay the 0xEE sentinel (the buggy flat store
+        // would overwrite it), and 0x81 must stay 0xEE (the buggy +1 store
+        // would clobber this adjacent byte).
+        assert_eq!(
+            rdram[0x80 ^ 3],
+            0x01,
+            "bitfield: single swizzled byte, port0 set"
+        );
+        assert_eq!(
+            rdram[0x80], 0xEE,
+            "flat bitfield addr untouched (no flat store)"
+        );
+        assert_eq!(rdram[0x81], 0xEE, "adjacent byte untouched (no +1 store)");
+    }
+
+    /// osJamMesg front-inserts (jammesg.c) and returns 0 on enqueue -- it must
+    /// NOT panic (the old unimplemented!()), and a subsequent recv must see
+    /// the jammed message ahead of an already-queued one. Fails against the
+    /// bug (unimplemented!() aborts before any assert).
+    #[test]
+    fn os_jam_mesg_front_inserts_and_returns_zero() {
+        let mq_vram: u64 = 0xFFFF_FFFF_8006_A000;
+        let mq_addr = RdramAddr::from_gpr(mq_vram);
+        let mut create_ctx = ctx_with(mq_vram, 0, 4);
+        unsafe { osCreateMesgQueue_recomp(std::ptr::null_mut(), &mut create_ctx as *mut _) };
+
+        // Pre-queue a normal message, then jam a high-priority one.
+        spawn_test_thread(120, 1, move || {
+            let mut send_ctx = ctx_with(mq_vram, 0x1111, OS_MESG_NOBLOCK);
+            unsafe { osSendMesg_recomp(std::ptr::null_mut(), &mut send_ctx as *mut _) };
+            let mut jam_ctx = ctx_with(mq_vram, 0x9999, OS_MESG_NOBLOCK);
+            unsafe { osJamMesg_recomp(std::ptr::null_mut(), &mut jam_ctx as *mut _) };
+            assert_eq!(jam_ctx.r2, 0, "osJamMesg returns 0 on front-insert");
+        });
+        run_to_idle_with_yielder_plumbing();
+
+        // The jammed 0x9999 must come out BEFORE the earlier 0x1111.
+        with_executor(|exec| {
+            assert_eq!(
+                exec.recv_mesg(0, mq_addr, false),
+                RecvMesgOutcome::Delivered(0x9999)
+            );
+            assert_eq!(
+                exec.recv_mesg(0, mq_addr, false),
+                RecvMesgOutcome::Delivered(0x1111)
+            );
+        });
     }
 }

@@ -141,8 +141,42 @@ impl MesgQueue {
         }
     }
 
+    /// A zero-capacity queue, modeling a guest `OSMesgQueue` struct that was
+    /// only ever `bzero`'d and never passed to `osCreateMesgQueue` (so its
+    /// `msgCount`/message buffer are 0/NULL). OoT's audio driver has exactly
+    /// one such queue: `gAudioCtx.asyncLoadUnkMediumQueue`, which the decomp
+    /// never creates -- it is bzero'd as part of `gAudioCtx` and then only
+    /// ever NOBLOCK-sent/recv'd (`audio/internal/load.c:1652,1717,1718`),
+    /// relying on both operations returning -1 (full-on-send, empty-on-recv).
+    /// A zero-capacity queue reproduces that exactly: `is_full()` and
+    /// `is_empty_queue()` are both always true, so `try_send`/`try_recv`
+    /// return `WouldBlock` without ever reaching their `% buffer.len()` (which
+    /// would panic on a 0-length buffer). See `Executor::queue_mut`, which
+    /// lazily installs this on first use of an untracked queue.
+    pub fn zero_capacity() -> Self {
+        MesgQueue {
+            buffer: Vec::new().into_boxed_slice(),
+            valid_count: 0,
+            first: 0,
+            blocked_on_recv: BlockedList::default(),
+            blocked_on_send: BlockedSenderList::default(),
+        }
+    }
+
     pub fn capacity(&self) -> usize {
         self.buffer.len()
+    }
+
+    /// Current number of queued messages -- mirrored into the guest's rdram
+    /// `OSMesgQueue.validCount` (0x08) so guest `MQ_GET_COUNT`/`MQ_IS_FULL`
+    /// reads see truth. See `Executor::mirror_queue_to_rdram`.
+    pub fn valid_count(&self) -> usize {
+        self.valid_count
+    }
+
+    /// Ring-buffer head index -- mirrored into `OSMesgQueue.first` (0x0C).
+    pub fn first_index(&self) -> usize {
+        self.first
     }
 
     fn is_full(&self) -> bool {
@@ -163,6 +197,24 @@ impl MesgQueue {
         }
         let idx = (self.first + self.valid_count) % self.buffer.len();
         self.buffer[idx] = msg;
+        self.valid_count += 1;
+        SendResult::Delivered
+    }
+
+    /// Non-blocking front-insert (`osJamMesg`). Inserts at the HEAD of the
+    /// ring (next to be received) rather than the tail, matching
+    /// libultra `jammesg.c:16-17`: `first = (first + msgCount - 1) % msgCount;
+    /// msg[first] = msg`. Returns `WouldBlock` if the queue is full; the
+    /// caller then blocks like a blocked sender. Mirrors `try_send`'s shape.
+    pub fn try_jam(&mut self, msg: Mesg) -> SendResult {
+        if self.is_full() {
+            return SendResult::WouldBlock;
+        }
+        // Decrement-first-mod-capacity: step `first` back one slot (with
+        // wraparound) and write there, so this message is the next popped.
+        let cap = self.buffer.len();
+        self.first = (self.first + cap - 1) % cap;
+        self.buffer[self.first] = msg;
         self.valid_count += 1;
         SendResult::Delivered
     }
@@ -268,6 +320,26 @@ mod tests {
         let woken = q.wake_one_sender();
         assert_eq!(woken, Some(42));
         assert!(!q.has_blocked_senders());
+    }
+
+    /// `osJamMesg` front-insert: a jammed message must be received BEFORE
+    /// messages already queued (FIFO order is subverted at the head), and
+    /// wrap correctly when `first` is at 0. Fails against a back-insert bug.
+    #[test]
+    fn jam_inserts_at_front_and_wraps() {
+        let mut q = MesgQueue::new(3);
+        assert_eq!(q.try_send(0x1111), SendResult::Delivered);
+        assert_eq!(q.try_send(0x2222), SendResult::Delivered);
+        // Jam a high-priority message: it must jump the queue.
+        assert_eq!(q.try_jam(0x9999), SendResult::Delivered);
+        // Head-of-line: the jammed message comes out first, before 0x1111.
+        assert_eq!(q.try_recv(), RecvResult::Delivered(0x9999));
+        assert_eq!(q.try_recv(), RecvResult::Delivered(0x1111));
+        assert_eq!(q.try_recv(), RecvResult::Delivered(0x2222));
+        // Full queue rejects a jam, like try_send.
+        let mut full = MesgQueue::new(1);
+        assert_eq!(full.try_send(1), SendResult::Delivered);
+        assert_eq!(full.try_jam(2), SendResult::WouldBlock);
     }
 
     /// The bug this session's OoT boot run actually hit: a blocked

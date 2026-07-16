@@ -36,7 +36,7 @@ pub use rdram::{Rdram, RdramAddr};
 pub use rom::{DmaCompletion, InMemoryRom, PiDma, RomStorage};
 pub use rsp::{OsTaskHeader, TaskLog, M_AUDTASK, M_GFXTASK};
 pub use save::{FileSaveStorage, InMemorySaveStorage, SaveStorage, SaveType};
-pub use si::{PifModel, PortState, CONT_ABSENT, CONT_CARD_ON, CONT_TYPE_STANDARD};
+pub use si::{ContInput, PifModel, PortState, CONT_ABSENT, CONT_CARD_ON, CONT_TYPE_STANDARD};
 pub use thread::{GameThread, Priority, Resume, RunToken, ThreadState, Yield, OS_PRIORITY_IDLE};
 pub use timer::{TimerId, TimerWheel};
 pub use trace::{

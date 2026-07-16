@@ -209,7 +209,26 @@ pub trait RenderBackend {
     /// vertex/texture/matrix data out of it directly, never through any
     /// runtime API, which is the "never reaches back into runtime state"
     /// invariant made concrete.
-    fn process_task(&mut self, rdram: &[u8], task: &OsTask) -> Result<FrameStatus, RenderError>;
+    ///
+    /// `rdram` is `&mut` because on real hardware the RDP writes the
+    /// rasterized color image back into DRAM (the framebuffer the VI then
+    /// scans out). `output_addr` is the physical rdram byte offset of that
+    /// color framebuffer -- the region the VI presents (`osViSwapBuffer`'s
+    /// frame buffer), NOT the RSP task's `output_buff` field (which on OoT
+    /// is the RSP's DRAM command-FIFO output region at ~0x151640, a
+    /// different address than the game's color image at 0x3b5000/0x3da800).
+    /// A backend that renders into its own private surface must copy the
+    /// result into `rdram[output_addr..]` (in the framebuffer's native
+    /// format, RGBA5551 for OoT's 16-bit mode) so the VI-presented frame is
+    /// not blank. `output_addr == 0` means "no known color target" (a
+    /// fixture/test path with no VI framebuffer): the backend renders into
+    /// its own surface only and writes nothing back.
+    fn process_task(
+        &mut self,
+        rdram: &mut [u8],
+        task: &OsTask,
+        output_addr: u32,
+    ) -> Result<FrameStatus, RenderError>;
 
     /// Present the most recently rendered frame (swap to screen, or for a
     /// headless backend, finalize it as retrievable). Distinct from
@@ -258,8 +277,9 @@ mod tests {
 
         fn process_task(
             &mut self,
-            rdram: &[u8],
+            rdram: &mut [u8],
             task: &OsTask,
+            _output_addr: u32,
         ) -> Result<FrameStatus, RenderError> {
             if !self.ready {
                 return Err(RenderError::NotReady("create() not called"));
@@ -307,7 +327,7 @@ mod tests {
     fn is_dyn_safe_and_usable_through_a_trait_object() {
         let mut backend: Box<dyn RenderBackend> = Box::new(fake(vec![UcodeId::F3dex2]));
         backend.create(&RenderConfig::new(320, 240)).unwrap();
-        let rdram = vec![0u8; 4096];
+        let mut rdram = vec![0u8; 4096];
         let task = OsTask {
             task_type: M_GFXTASK,
             output_buff: 0,
@@ -315,7 +335,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            backend.process_task(&rdram, &task).unwrap(),
+            backend.process_task(&mut rdram, &task, 0).unwrap(),
             FrameStatus::Complete
         );
         backend.present().unwrap();
@@ -324,9 +344,9 @@ mod tests {
     #[test]
     fn process_task_before_create_is_not_ready() {
         let mut backend = fake(vec![UcodeId::F3dex2]);
-        let rdram = vec![0u8; 16];
+        let mut rdram = vec![0u8; 16];
         let err = backend
-            .process_task(&rdram, &OsTask::default())
+            .process_task(&mut rdram, &OsTask::default(), 0)
             .unwrap_err();
         assert!(matches!(err, RenderError::NotReady(_)));
     }
@@ -335,12 +355,12 @@ mod tests {
     fn unlisted_ucode_traps_by_name_not_silently() {
         let mut backend = fake(vec![]); // declares NO supported ucodes
         backend.create(&RenderConfig::new(64, 64)).unwrap();
-        let rdram = vec![0u8; 16];
+        let mut rdram = vec![0u8; 16];
         let task = OsTask {
             ucode: 0x8000_1234,
             ..Default::default()
         };
-        let err = backend.process_task(&rdram, &task).unwrap_err();
+        let err = backend.process_task(&mut rdram, &task, 0).unwrap_err();
         match err {
             RenderError::UnsupportedUcode { ucode_addr } => assert_eq!(ucode_addr, 0x8000_1234),
             other => panic!("expected UnsupportedUcode, got {other:?}"),
@@ -351,13 +371,13 @@ mod tests {
     fn out_of_bounds_output_buffer_is_a_named_error_not_a_panic() {
         let mut backend = fake(vec![UcodeId::F3dex2]);
         backend.create(&RenderConfig::new(64, 64)).unwrap();
-        let rdram = vec![0u8; 16];
+        let mut rdram = vec![0u8; 16];
         let task = OsTask {
             output_buff: 10,
             output_buff_size: 100,
             ..Default::default()
         };
-        let err = backend.process_task(&rdram, &task).unwrap_err();
+        let err = backend.process_task(&mut rdram, &task, 0).unwrap_err();
         assert!(matches!(err, RenderError::InvalidTaskBounds { .. }));
     }
 
