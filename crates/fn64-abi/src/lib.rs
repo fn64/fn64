@@ -1933,6 +1933,20 @@ unsafe fn dispatch_gfx_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
     });
 }
 
+/// Present the registered graphics backend at the guest's real VI swap
+/// boundary. Task submission and VI presentation are distinct on N64; this
+/// call closes that second half of `RenderBackend` without exposing RT64 or
+/// any foreign type outside `fn64-render-rt64`.
+fn present_render_backend() {
+    RENDER_BACKEND.with(|cell| {
+        if let Some(backend) = cell.borrow_mut().as_mut() {
+            if let Err(error) = backend.present() {
+                RENDER_LAST_ERROR.with(|last| last.replace(Some(error.to_string())));
+            }
+        }
+    });
+}
+
 /// Dispatch an audio task (`M_AUDTASK`) once, at the point the RSP is kicked.
 /// Two halves, both symmetric with `dispatch_gfx_task`:
 ///  1. Run the registered translated audio ucode (`AUDIO_UCODE_FN`,
@@ -2353,6 +2367,7 @@ pub unsafe extern "C" fn osViSwapBuffer_recomp(_rdram: *mut u8, ctx: *mut Recomp
     with_executor(|exec| {
         exec.vi_swap_buffer(frame_buf);
     });
+    present_render_backend();
 }
 
 /// `osViBlack(u8 active)` -- `a0` = `ctx->r4` (rung 11: `func_800334A0`,
@@ -5284,6 +5299,51 @@ mod tests {
         unsafe { osViSwapBuffer_recomp(std::ptr::null_mut(), &mut swap_ctx as *mut _) };
         assert_eq!(current_vi_framebuffer(), Some(0x10_0000));
         assert_eq!(vi_swap_count(), 1);
+    }
+
+    #[test]
+    fn os_vi_swap_buffer_presents_the_registered_render_backend() {
+        use fn64_render::{FrameStatus, RenderConfig, RenderError, UcodeId};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        struct CountingBackend(Arc<AtomicU32>);
+
+        impl RenderBackend for CountingBackend {
+            fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn process_task(
+                &mut self,
+                _rdram: &mut [u8],
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+            ) -> Result<FrameStatus, RenderError> {
+                Ok(FrameStatus::Complete)
+            }
+
+            fn present(&mut self) -> Result<(), RenderError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn supported_ucodes(&self) -> &[UcodeId] {
+                &[]
+            }
+        }
+
+        let presents = Arc::new(AtomicU32::new(0));
+        set_render_backend(Box::new(CountingBackend(Arc::clone(&presents))), 0);
+
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8010_0000;
+        unsafe { osViSwapBuffer_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+
+        assert_eq!(presents.load(Ordering::SeqCst), 1);
+        assert_eq!(last_render_error(), None);
     }
 
     /// Regression for OoT native boot's `AudioLoad_Dma` alignment trap.

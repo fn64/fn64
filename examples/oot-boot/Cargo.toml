@@ -18,6 +18,7 @@ description = "Headless boot harness for The Legend of Zelda: Ocarina of Time (O
 [features]
 default = ["oot-audio"]
 oot-audio = ["dep:oot-audio-ucode"]
+rt64 = ["fn64-render-rt64/rt64"]
 
 [[bin]]
 name = "oot-boot"
