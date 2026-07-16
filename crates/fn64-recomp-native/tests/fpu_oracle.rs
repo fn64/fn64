@@ -83,7 +83,7 @@ pub fn truncf_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
         match pc {
             0x800CD930 => {
                 // 0x800CD930: TruncWS { fd: 12, fs: 12 }
-                ctx.set_f_bits(12, (ctx.f_s(12) as i32) as u32);
+                { let v = ctx.f_s(12) as f64; let r = ctx.fpu_to_i32(v, Some(1)); ctx.set_f_bits(12, r as u32); }
                 // 0x800CD934: Jr { rs: 31 }
                 // delay: 0x800CD938: CvtSW { fd: 0, fs: 12 }
                 ctx.set_f_s(0, (ctx.f_bits(12) as i32) as f32);
@@ -211,7 +211,7 @@ struct SynthOut {
 fn run_synth(a0: i32, in_val: f32) -> SynthOut {
     let mut mem_buf = vec![0u8; 256];
     // Place the input float at rdram offset 0x20 (big-endian word).
-    mem_buf[0x20..0x24].copy_from_slice(&in_val.to_bits().to_be_bytes());
+    mem_buf[0x20..0x24].copy_from_slice(&in_val.to_bits().to_ne_bytes());
     let mut mem = Rdram::new(&mut mem_buf);
     let mut ctx = RecompContext::new();
     ctx.set_r32(4, a0); // $a0
@@ -222,7 +222,7 @@ fn run_synth(a0: i32, in_val: f32) -> SynthOut {
 
     let v0 = ctx.r(2);
     let f0 = ctx.f_bits(0);
-    let stored = u32::from_be_bytes([mem_buf[0x30], mem_buf[0x31], mem_buf[0x32], mem_buf[0x33]]);
+    let stored = u32::from_ne_bytes([mem_buf[0x30], mem_buf[0x31], mem_buf[0x32], mem_buf[0x33]]);
     SynthOut { v0, f0, stored }
 }
 
@@ -244,7 +244,7 @@ pub fn synth_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
                 // 0x80100010: AddS { fd: 0, fs: 8, ft: 4 }
                 ctx.set_f_s(0, ctx.f_s(8) + ctx.f_s(4));
                 // 0x80100014: CLtS { fs: 0, ft: 6 }
-                ctx.fpu_cond = ctx.f_s(0) < ctx.f_s(6);
+                ctx.fpu_compare_s(0, 6, 12);
                 // 0x80100018: Bc1t { off: 2 }
                 let _take = ctx.fpu_cond;
                 // delay: 0x8010001C: Addiu { rt: 2, rs: 0, imm: 1 }
@@ -395,7 +395,7 @@ fn cross_call_executes_to_expected_fpu_state() {
         assert_eq!(ctx.f_s(0), expected, "f0 after cross-call for a0={a0}");
         // $ra was linked to the return address after the delay slot.
         assert_eq!(ctx.r_u32(31), 0x8020_0010, "jal linked $ra");
-        let stored = f32::from_bits(u32::from_be_bytes([
+        let stored = f32::from_bits(u32::from_ne_bytes([
             mem_buf[0x40],
             mem_buf[0x41],
             mem_buf[0x42],
