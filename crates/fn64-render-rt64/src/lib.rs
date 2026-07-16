@@ -234,9 +234,22 @@ impl RenderBackend for ReferenceBackend {
             // so far geometry is occluded, inside-out back faces don't
             // overpaint front faces, and textured surfaces show their texels.
             DecodeMode::F3dex2 => {
+                // TEMP (env `OOT_NO_DEPTH=1`): force painter's-order (no
+                // z-test) to A/B-prove the z-buffer is what produces correct
+                // occlusion. Off by default; remove/keep behind the flag.
+                #[cfg(not(test))]
+                let no_depth = std::env::var("OOT_NO_DEPTH").is_ok();
+                #[cfg(test)]
+                let no_depth = false;
                 for tri in &triangles {
-                    fb.draw_triangle_culled(tri, tri.cull);
+                    if no_depth {
+                        fb.draw_triangle_no_depth_culled(tri, tri.cull);
+                    } else {
+                        fb.draw_triangle_culled(tri, tri.cull);
+                    }
                 }
+                #[cfg(not(test))]
+                raster::zstat::summary();
             }
         }
 
