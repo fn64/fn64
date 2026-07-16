@@ -1898,6 +1898,7 @@ pub unsafe extern "C" fn osGetTime_recomp(_rdram: *mut u8, ctx: *mut RecompConte
 /// # Safety
 /// `rdram` valid for the call; `o` a valid task-header offset within it.
 unsafe fn dispatch_gfx_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
+    let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
     RENDER_BACKEND.with(|cell| {
         if let Some(backend) = cell.borrow_mut().as_mut() {
             let render_end = unsafe { read_output_buff_size(rdram, o) };
@@ -1931,6 +1932,16 @@ unsafe fn dispatch_gfx_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
             RENDER_LAST_ERROR.with(|cell| cell.replace(result.err().map(|e| e.to_string())));
         }
     });
+    if let Some(started) = started {
+        GFX_NS.with(|total| {
+            total.set(
+                total
+                    .get()
+                    .saturating_add(started.elapsed().as_nanos() as u64),
+            );
+        });
+        GFX_CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
 }
 
 /// Dispatch an audio task (`M_AUDTASK`) once, at the point the RSP is kicked.
@@ -1957,6 +1968,7 @@ unsafe fn dispatch_gfx_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
 /// # Safety
 /// `rdram` valid for the call; `o` a valid task-header offset within it.
 unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
+    let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
     // Debug/perf escape hatch: `OOT_SKIP_AUDIO_UCODE` skips running the
     // recompiled audio ucode (the per-frame RSP synth, currently unoptimized
     // and the dominant per-swap cost). The CPU-side audio driver
@@ -2035,6 +2047,16 @@ unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
             AUDIO_LAST_ERROR.with(|cell| cell.replace(result.err().map(|e| e.to_string())));
         }
     });
+    if let Some(started) = started {
+        AUDIO_DISPATCH_NS.with(|total| {
+            total.set(
+                total
+                    .get()
+                    .saturating_add(started.elapsed().as_nanos() as u64),
+            );
+        });
+        AUDIO_DISPATCH_CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
 }
 
 /// # Safety
@@ -2123,6 +2145,40 @@ thread_local! {
     static AUDIO_UCODE_NS: Cell<u64> = const { Cell::new(0) };
     static AUDIO_UCODE_CALLS: Cell<u64> = const { Cell::new(0) };
     static AUDIO_TASK_DUMPED: Cell<bool> = const { Cell::new(false) };
+
+    /// Coarse wall-time attribution for the native OoT performance harness.
+    /// Kept behind an environment flag so ordinary execution pays no
+    /// `Instant::now` cost at task or executor boundaries.
+    static PHASE_TIMING: Cell<bool> =
+        Cell::new(std::env::var_os("OOT_PHASE_TIMING").is_some());
+    static EXECUTOR_NS: Cell<u64> = const { Cell::new(0) };
+    static EXECUTOR_CALLS: Cell<u64> = const { Cell::new(0) };
+    static GFX_NS: Cell<u64> = const { Cell::new(0) };
+    static GFX_CALLS: Cell<u64> = const { Cell::new(0) };
+    static AUDIO_DISPATCH_NS: Cell<u64> = const { Cell::new(0) };
+    static AUDIO_DISPATCH_CALLS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Coarse host wall-time totals collected when `OOT_PHASE_TIMING` is set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhaseTiming {
+    pub executor_ns: u64,
+    pub executor_calls: u64,
+    pub gfx_ns: u64,
+    pub gfx_calls: u64,
+    pub audio_dispatch_ns: u64,
+    pub audio_dispatch_calls: u64,
+}
+
+pub fn phase_timing() -> PhaseTiming {
+    PhaseTiming {
+        executor_ns: EXECUTOR_NS.with(Cell::get),
+        executor_calls: EXECUTOR_CALLS.with(Cell::get),
+        gfx_ns: GFX_NS.with(Cell::get),
+        gfx_calls: GFX_CALLS.with(Cell::get),
+        audio_dispatch_ns: AUDIO_DISPATCH_NS.with(Cell::get),
+        audio_dispatch_calls: AUDIO_DISPATCH_CALLS.with(Cell::get),
+    }
 }
 
 /// Total accumulated recompiled-audio-ucode time (ns) and call count since
@@ -2481,7 +2537,8 @@ pub unsafe fn boot_thread0(
 /// `with_executor` closure, or the re-arm is skipped and the bug this wave
 /// fixed reappears.
 pub fn run_one_step() -> bool {
-    with_executor(|exec| {
+    let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
+    let stepped = with_executor(|exec| {
         // `peek_next_thread` is a read-only preview of exactly which thread
         // `exec.run_one_step()` is about to resume -- read it BEFORE the
         // resume so the correct thread's context is active for the entire
@@ -2493,7 +2550,18 @@ pub fn run_one_step() -> bool {
             Some(id) => with_rearmed_context(id, || exec.run_one_step()),
             None => exec.run_one_step(),
         }
-    })
+    });
+    if let Some(started) = started {
+        EXECUTOR_NS.with(|total| {
+            total.set(
+                total
+                    .get()
+                    .saturating_add(started.elapsed().as_nanos() as u64),
+            );
+        });
+        EXECUTOR_CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+    stepped
 }
 
 /// Run until the run queue is idle (every thread finished or blocked). See
@@ -2522,6 +2590,12 @@ pub fn task_counts() -> (u64, u64) {
 /// `TraceEvent` stream to a file.
 pub fn copy_trace() -> Vec<fn64_runtime::TraceEvent> {
     with_executor(|exec| exec.trace().to_vec())
+}
+
+/// Enable or disable differential event capture. This controls diagnostics
+/// only; emulated scheduling and peripheral behavior are unchanged.
+pub fn set_trace_enabled(enabled: bool) {
+    with_executor(|exec| exec.set_trace_enabled(enabled));
 }
 
 /// Arm incremental crash-safe trace flushing -- every trace event recorded
