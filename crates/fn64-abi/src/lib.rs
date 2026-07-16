@@ -95,6 +95,9 @@ use fn64_runtime::{
     RdramAddr, Resume, Section, SectionRegistry, ThreadId, Yield, M_AUDTASK, M_GFXTASK,
 };
 
+#[cfg(feature = "native-recomp")]
+pub mod native;
+
 /// MIPS `recomp_context`, the REAL verbatim layout from `recomp.h` (MIT) --
 /// see module doc's "Signatures verified directly against real generated C"
 /// for why a prior wave's 9-field subset was an ABI mismatch. `fpr` mirrors
@@ -220,6 +223,17 @@ struct HostState {
     /// address `osSetTimer` was given, never the `TimerWheel`-internal
     /// `TimerId` a second time.
     timer_handles: std::collections::HashMap<u32, fn64_runtime::timer::TimerId>,
+    /// Typed-Rust whole-ROM dispatcher installed by a native boot host. When
+    /// present, `osCreateThread` resolves the new OSThread's entry through
+    /// this table and owns a native `RecompContext` inside the SAME executor
+    /// coroutine used by the C path.
+    #[cfg(feature = "native-recomp")]
+    native_lookup: Option<fn(u32) -> fn64_recomp_native::RecompFunc>,
+    /// Length of the process-wide RDRAM/MMIO allocation behind `ACTIVE_RDRAM`.
+    /// Required to rebuild the checked native `Rdram` view at a spawned
+    /// thread's entry without creating a second memory model or allocation.
+    #[cfg(feature = "native-recomp")]
+    native_rdram_len: usize,
 }
 
 impl Default for HostState {
@@ -229,6 +243,10 @@ impl Default for HostState {
             pi_dma: None,
             thread_handles: std::collections::HashMap::new(),
             timer_handles: std::collections::HashMap::new(),
+            #[cfg(feature = "native-recomp")]
+            native_lookup: None,
+            #[cfg(feature = "native-recomp")]
+            native_rdram_len: 0,
         }
     }
 }
@@ -614,6 +632,24 @@ pub unsafe fn register_section(
     })
 }
 
+/// Register section geometry for a native typed module. Function pointers
+/// stay in that module's safe dispatcher; this registry owns only the
+/// ROM/static/runtime-base mapping needed to canonicalize relocated callbacks.
+pub fn register_native_section(
+    rom_addr: u32,
+    ram_addr: u32,
+    size: u32,
+) -> fn64_runtime::SectionIndex {
+    with_host(|host| {
+        host.sections.register_section(Section {
+            rom_addr,
+            ram_addr,
+            size,
+            funcs: Vec::new(),
+        })
+    })
+}
+
 pub fn set_section_loaded(index: fn64_runtime::SectionIndex) {
     with_host(|host| host.sections.set_section_loaded(index));
 }
@@ -735,6 +771,10 @@ pub unsafe extern "C" fn osCreateThread_recomp(rdram: *mut u8, ctx: *mut RecompC
             let rdram_ptr = rdram_addr as *mut u8;
             with_active_yielder(id, rdram_ptr, yielder, || {
                 let _ = first_input; // Resume::Start; nothing to hand back at thread entry
+                #[cfg(feature = "native-recomp")]
+                if unsafe { native::run_registered_entry(rdram_ptr, entry_vram, arg, sp) } {
+                    return;
+                }
                 let func_ptr = get_function(entry_vram as i32);
                 let entry: RecompFunc = unsafe { std::mem::transmute(func_ptr) };
                 let mut entry_ctx = RecompContext::zeroed();
@@ -1225,7 +1265,7 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
                     );
                 }
                 assert!(
-                    dram_addr.offset() % 4 == 0 && (len as usize) % 4 == 0,
+                    dram_addr.offset().is_multiple_of(4) && (len as usize).is_multiple_of(4),
                     "PI DMA must be word-aligned (dram={:#x} len={:#x})",
                     dram_addr.offset(),
                     len
@@ -5394,7 +5434,7 @@ mod tests {
         unsafe { osEPiReadIo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
         // MEM_BU(dram_off ^ 3) is the guest's byte read; +2 must be 'J'.
-        assert_eq!(rdram[(dram_off + 0) ^ 3], 0x5A); // 'Z'
+        assert_eq!(rdram[dram_off ^ 3], 0x5A); // 'Z'
         assert_eq!(rdram[(dram_off + 2) ^ 3], 0x4A); // 'J' -- the region byte
                                                      // And MEM_W reads the cart word intact (native-endian word storage).
         let w = u32::from_ne_bytes(rdram[dram_off..dram_off + 4].try_into().unwrap());

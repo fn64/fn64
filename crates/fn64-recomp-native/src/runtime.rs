@@ -77,6 +77,15 @@ pub struct RecompContext {
     /// CACHE tag operations are host-modeled, so callers that exercise BC0
     /// explicitly supply the observed condition through this field.
     pub cop0_cond: bool,
+    /// COP0 Status (register 12). Privileged libultra entry points are
+    /// host-bound, but their typed adapters still need per-OSThread status
+    /// state for `__osGetSR`/`__osSetSR` and interrupt-mask round trips.
+    pub cop0_status: u32,
+    /// COP0 Cause (register 13). The coroutine executor delivers events at
+    /// explicit yield points rather than synthesizing CPU exceptions, so the
+    /// normal value is zero; keeping the field makes `__osGetCause` an honest
+    /// state read instead of a fabricated constant.
+    pub cop0_cause: u32,
 }
 
 impl RecompContext {
@@ -124,6 +133,20 @@ impl RecompContext {
         if idx != 0 {
             self.r[idx as usize] = val;
         }
+    }
+
+    /// Snapshot all architectural GPRs for the audited native/C ABI adapter.
+    /// The returned copy preserves `$zero == 0` without exposing the backing
+    /// array for unchecked mutation.
+    pub fn gprs(&self) -> [u64; 32] {
+        self.r
+    }
+
+    /// Restore a GPR snapshot after an fn64 host shim returns. `$zero` is
+    /// forced back to zero even if a foreign ABI context contained garbage.
+    pub fn set_gprs(&mut self, mut regs: [u64; 32]) {
+        regs[0] = 0;
+        self.r = regs;
     }
 
     /// Write a 32-bit result into GPR `idx`, sign-extending into the 64-bit
@@ -486,6 +509,8 @@ pub type RecompFunc =
 /// instead of executing a recompiled body (libultra shims, exception/TLB
 /// handling, and other host-owned boundaries).
 pub type HostLookup = fn(u32) -> Option<RecompFunc>;
+/// Cooperative-yield hook for the N64Recomp `pause_self` self-loop rule.
+pub type HostPause = fn();
 
 thread_local! {
     /// Native execution is single-threaded by design (`docs/DESIGN.md` section
@@ -493,6 +518,9 @@ thread_local! {
     /// thread-local `Cell` also lets tests install an isolated resolver
     /// without unsafe global mutation or cross-test serialization.
     static HOST_LOOKUP: std::cell::Cell<Option<HostLookup>> = const {
+        std::cell::Cell::new(None)
+    };
+    static HOST_PAUSE: std::cell::Cell<Option<HostPause>> = const {
         std::cell::Cell::new(None)
     };
 }
@@ -509,10 +537,39 @@ pub fn set_host_lookup(resolver: Option<HostLookup>) -> Option<HostLookup> {
     HOST_LOOKUP.with(|slot| slot.replace(resolver))
 }
 
+/// Install the host's cooperative-yield adapter for translated self-loops.
+pub fn set_host_pause(pause: Option<HostPause>) -> Option<HostPause> {
+    HOST_PAUSE.with(|slot| slot.replace(pause))
+}
+
+/// Yield the active emulated thread at an unconditional branch-to-self.
+pub fn pause_self() {
+    HOST_PAUSE.with(|slot| {
+        slot.get().unwrap_or_else(|| {
+            panic!("pause_self: native host installed no coroutine-yield adapter")
+        })()
+    });
+}
+
 /// Resolve `vram` through the current thread's host-function resolver.
 #[inline]
 pub fn resolve_host_function(vram: u32) -> Option<RecompFunc> {
     HOST_LOOKUP.with(|slot| slot.get().and_then(|resolver| resolver(vram)))
+}
+
+/// Invoke a statically-known native target unless the host resolver overrides
+/// its vram. This is the direct-JAL counterpart of generated `lookup(vram)`:
+/// libultra functions whose bodies contain no privileged instruction still
+/// must enter the executor-backed host shim rather than bypassing it merely
+/// because the native recompiler could translate their machine code.
+#[inline]
+pub fn call_host_or_native(
+    vram: u32,
+    native: RecompFunc,
+    ctx: &mut RecompContext,
+    mem: &mut Rdram<'_>,
+) {
+    resolve_host_function(vram).unwrap_or(native)(ctx, mem);
 }
 
 impl<'a> Rdram<'a> {
@@ -521,6 +578,14 @@ impl<'a> Rdram<'a> {
     /// panic on access) rather than corrupting host memory.
     pub fn new(mem: &'a mut [u8]) -> Self {
         Rdram { mem }
+    }
+
+    /// Borrow the shared backing allocation at the runtime ABI seam. Normal
+    /// emitted code has no reason to use this; fn64's native host adapters use
+    /// it to call the existing, audited `*_recomp` marshalling layer without
+    /// allocating or copying a second RDRAM image.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.mem
     }
 
     /// Translate a sign-extended KSEG0/KSEG1 virtual address (the `reg + off`
