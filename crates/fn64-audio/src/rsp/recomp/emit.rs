@@ -27,8 +27,10 @@
 //!   `RspExitReason::SwapOverlay`, matching RSPRecomp's `do_overlay_swap`.
 //!   OoT's aspMain is a single always-resident overlay (no paging), so this is
 //!   a trap-if-hit path, not a taken one, for that ucode.
-//! - **`break`** — `return RspExitReason::Broke;` (the normal task-done exit).
-//! - **Unknown instruction** — `return trap_unknown(0xADDR, 0xWORD);` — a LOUD,
+//! - **`break`** — `break 'run RspExitReason::Broke;` (the normal task-done
+//!   exit; every terminating path `break 'run`s the labeled loop so the single
+//!   post-loop tail can record `steps` into `m.ctx.steps` for profiling).
+//! - **Unknown instruction** — `break 'run trap_unknown(0xADDR, 0xWORD);` — a LOUD,
 //!   self-identifying trap. Never a silent skip.
 //!
 //! Every emitted statement calls a typed method on `RspMachine`/`VuState`
@@ -71,12 +73,19 @@ pub fn emit_module(words: &[u32], base_vram: u32, fn_name: &str) -> String {
     // A step budget converts a runaway (a branch/delay bug, or a malformed
     // command list the ucode spins on) into a LOUD, diagnosable trap that
     // names the pc it was stuck at — never a silent hang.
+    //
+    // The body is a labeled `'run` loop that `break 'run <reason>`s on every
+    // terminating path (Break, a trap, the fallthrough default). The single
+    // post-loop tail records `steps` into `m.ctx.steps` so a caller can read
+    // how many RSP instructions the ucode executed (perf profiling / runaway
+    // diagnosis) — one write, no per-arm cost. `emit_instr` emits
+    // `break 'run <reason>;` (never a bare `return`) so this tail always runs.
     out.push_str(&format!(
         "    let mut pc: u32 = 0x{:04X};\n\
          \x20   let mut steps: u64 = 0;\n\
-         \x20   loop {{\n\
+         \x20   let reason = 'run: loop {{\n\
          \x20       steps += 1;\n\
-         \x20       if steps > 5_000_000 {{ return trap_unknown(pc, 0); }}\n\
+         \x20       if steps > 5_000_000 {{ break 'run trap_unknown(pc, 0); }}\n\
          \x20       match pc {{\n",
         base_vram & 0x1FFF
     ));
@@ -100,8 +109,10 @@ pub fn emit_module(words: &[u32], base_vram: u32, fn_name: &str) -> String {
     // The fallthrough / unhandled-jump-target arm (RSPRecomp's
     // do_indirect_jump default + ImemOverrun).
     out.push_str(
-        "            _ => return RspExitReason::UnhandledJumpTarget,\n\
-         \x20       }\n    }\n}\n",
+        "            _ => break 'run RspExitReason::UnhandledJumpTarget,\n\
+         \x20       }\n    };\n\
+         \x20   m.ctx.steps = steps;\n\
+         \x20   reason\n}\n",
     );
     out
 }
@@ -122,11 +133,11 @@ fn emit_instr(
             out.push_str(&format!("{ind}pc = 0x{next_pc:04X};\n"));
         }
         Instr::Break => {
-            out.push_str(&format!("{ind}return RspExitReason::Broke;\n"));
+            out.push_str(&format!("{ind}break 'run RspExitReason::Broke;\n"));
         }
         Instr::Unknown { word } => {
             out.push_str(&format!(
-                "{ind}return trap_unknown(0x{pc:04X}, 0x{word:08X});\n"
+                "{ind}break 'run trap_unknown(0x{pc:04X}, 0x{word:08X});\n"
             ));
         }
 
@@ -538,7 +549,7 @@ fn vu_stmt(ind: &str, pc: u32, op: VuOp, vd: u8, vs: u8, vt: u8, e: u8, de: u8) 
     format!(
         "{ind}match dispatch(m.vu(), {variant}, {inv}) {{\n\
          {ind}    OpStatus::Executed => {{}}\n\
-         {ind}    OpStatus::Unimplemented(op) => return trap_unknown_vu(0x{pc:04X}, op),\n\
+         {ind}    OpStatus::Unimplemented(op) => break 'run trap_unknown_vu(0x{pc:04X}, op),\n\
          {ind}}}\n"
     )
 }
@@ -566,7 +577,7 @@ fn emit_mtc0(out: &mut String, ind: &str, rt: u8, cop0: u8, pc: u32, next_pc: u3
             // DO_DMA_READ: may trigger an overlay swap.
             out.push_str(&format!(
                 "{ind}let v = m.reg({rt});\n\
-                 {ind}if let Some(r) = m.dma_read(v) {{ m.ctx.resume_address = 0x{pc:04X}; return r; }}\n"
+                 {ind}if let Some(r) = m.dma_read(v) {{ m.ctx.resume_address = 0x{pc:04X}; break 'run r; }}\n"
             ));
             out.push_str(&format!("{ind}pc = 0x{next_pc:04X};\n"));
         }

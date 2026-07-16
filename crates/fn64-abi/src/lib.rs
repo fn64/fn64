@@ -1887,6 +1887,28 @@ unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
     // the audio-reset handshake that unblocks Play_Init still completes -- the
     // ucode only produces the actual samples. Use it to iterate on the RENDERER
     // at normal boot speed; a real audio run must NOT set it. No sound when set.
+    // Diagnostic: dump the exact rdram + task offset of the FIRST audio task so
+    // the recompiled ucode can be replayed offline against the real command
+    // list (env `OOT_DUMP_AUDIO_TASK=<path>`). One-shot.
+    if let Some(path) = std::env::var_os("OOT_DUMP_AUDIO_TASK") {
+        AUDIO_TASK_DUMPED.with(|c| {
+            if !c.get() {
+                let mut rdram_len = AUDIO_RDRAM_LEN.with(|cell| cell.get());
+                if rdram_len == 0 {
+                    rdram_len = RDRAM_LEN.with(|cell| cell.get());
+                }
+                if rdram_len > 0 {
+                    let bytes = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
+                    let p = std::path::Path::new(&path);
+                    let _ = std::fs::write(p, bytes);
+                    let meta = format!("task_offset={o}\nrdram_len={rdram_len}\n");
+                    let _ = std::fs::write(p.with_extension("meta"), meta);
+                    eprintln!("[fn64-abi] dumped audio task rdram ({rdram_len} B) + task_offset={o} to {path:?}");
+                }
+                c.set(true);
+            }
+        });
+    }
     let skip_ucode = std::env::var_os("OOT_SKIP_AUDIO_UCODE").is_some();
     if !skip_ucode {
         AUDIO_UCODE_FN.with(|cell| {
@@ -1896,8 +1918,18 @@ unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
                 // function's doc comment for why `o` (the OSTask rdram offset) is
                 // the second argument, and `AudioUcodeFn`'s doc comment for the
                 // widened meaning.
-                unsafe {
-                    f(rdram, o as u32);
+                if AUDIO_UCODE_TIMING.with(|c| c.get()) {
+                    let t = std::time::Instant::now();
+                    unsafe {
+                        f(rdram, o as u32);
+                    }
+                    let ns = t.elapsed().as_nanos() as u64;
+                    AUDIO_UCODE_NS.with(|c| c.set(c.get() + ns));
+                    AUDIO_UCODE_CALLS.with(|c| c.set(c.get() + 1));
+                } else {
+                    unsafe {
+                        f(rdram, o as u32);
+                    }
                 }
             }
         });
@@ -2005,6 +2037,24 @@ thread_local! {
     /// The most recent `AudioBackend::queue_samples` error, if any,
     /// stringified. Mirrors `RENDER_LAST_ERROR`.
     static AUDIO_LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+
+    /// Perf profiling: when true (env `OOT_AUDIO_UCODE_TIMING`), the M_AUDTASK
+    /// dispatch times each recompiled-ucode call and accumulates total ns +
+    /// call count for a caller to read via `audio_ucode_timing()`.
+    static AUDIO_UCODE_TIMING: Cell<bool> =
+        Cell::new(std::env::var_os("OOT_AUDIO_UCODE_TIMING").is_some());
+    static AUDIO_UCODE_NS: Cell<u64> = const { Cell::new(0) };
+    static AUDIO_UCODE_CALLS: Cell<u64> = const { Cell::new(0) };
+    static AUDIO_TASK_DUMPED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Total accumulated recompiled-audio-ucode time (ns) and call count since
+/// boot, for perf profiling. Only nonzero when `OOT_AUDIO_UCODE_TIMING` is set.
+pub fn audio_ucode_timing() -> (u64, u64) {
+    (
+        AUDIO_UCODE_NS.with(|c| c.get()),
+        AUDIO_UCODE_CALLS.with(|c| c.get()),
+    )
 }
 
 /// Register the audio backend `osSpTaskYielded_recomp` dispatches
