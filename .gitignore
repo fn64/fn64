@@ -1,4 +1,4 @@
 /target
 examples/*/target
 examples/*/target-c
-/examples/oot-boot/native/recompiled
+/examples/oot-boot/rs/recompiled

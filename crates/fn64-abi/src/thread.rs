@@ -70,8 +70,8 @@ pub unsafe extern "C" fn osCreateThread_recomp(rdram: *mut u8, ctx: *mut RecompC
             let rdram_ptr = rdram_addr as *mut u8;
             with_active_yielder(id, rdram_ptr, yielder, || {
                 let _ = first_input; // Resume::Start; nothing to hand back at thread entry
-                #[cfg(feature = "native-recomp")]
-                if unsafe { native::run_registered_entry(rdram_ptr, entry_vram, arg, sp) } {
+                #[cfg(feature = "recomp-rs")]
+                if unsafe { recompiled::run_registered_entry(rdram_ptr, entry_vram, arg, sp) } {
                     return;
                 }
                 let func_ptr = get_function(entry_vram as i32);

@@ -41,7 +41,7 @@ See `docs/DESIGN.md`'s "M1 boot-host attempt" section for the full,
 byte-cited writeup: this run gets substantially deeper than any prior
 milestone (real thread creation, a real stack pointer, a real PI DMA three
 call-levels deep on a second thread) before stalling inside a long-or-
-unbounded native loop in `func_800004D0` — not yet root-caused. Four real
+unbounded recompiled loop in `func_800004D0` — not yet root-caused. Four real
 bugs (executor reentrancy, thread-identity-by-handle, an unseeded stack
 pointer, and a pervasive native-vs-big-endian `MEM_W` mistranscription)
 were found and fixed along the way, each with a regression test in

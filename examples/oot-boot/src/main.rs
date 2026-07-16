@@ -15,7 +15,7 @@
 //!    retail compressed cartridge image, see build.rs's module doc) into
 //!    `fn64_abi::load_rom`.
 //! 2. Registers every section from either the C lane's real, out-of-tree
-//!    `recomp_overlays.inl` or the native module's emitted section geometry,
+//!    `recomp_overlays.inl` or the rs module's emitted section geometry,
 //!    then marks the always-resident sections (0/1/2 -- makerom.ent/boot/code,
 //!    per OoT's OWN linker `.map`: everything before the 469 `ovl_*` actor/
 //!    scene overlays, which are heap-loaded on demand via DmaMgr at runtime,
@@ -31,8 +31,8 @@
 
 use std::io::Write;
 
-#[cfg(fn64_native_recomp)]
-use oot_native_funcs as native_funcs;
+#[cfg(fn64_recomp_rs)]
+use oot_recompiled as recompiled;
 
 /// Audio ucode stand-in. No RSPRecomp pass has been run against OoT's audio
 /// microcode in this bring-up (out of scope for the decomp-driven-recompile
@@ -256,82 +256,82 @@ fn parse_input_script(spec: &str) -> Vec<ScriptStep> {
 
 /// OoT NTSC 1.0's libultra vrams, from its decomp-derived symbol dump
 /// (`games/OOTU/syms/dump.toml`). Each target is an ordinary safe typed
-/// adapter; the raw C ABI exists only inside `fn64-abi::native`.
-#[cfg(fn64_native_recomp)]
-fn native_host_lookup(vram: u32) -> Option<fn64_recomp_native::RecompFunc> {
-    use fn64_abi::native as n;
+/// adapter; the raw C ABI exists only inside `fn64-abi::recompiled`.
+#[cfg(fn64_recomp_rs)]
+fn recompiled_or_host_lookup(vram: u32) -> Option<fn64_recomp_rs::RecompFunc> {
+    use fn64_abi::recompiled as r;
     let host = match vram {
-        0x8000_1DB0 => n::os_pi_get_access,
-        0x8000_1DF4 => n::os_pi_rel_access,
-        0x8000_1E20 => n::os_send_mesg,
-        0x8000_1F70 => n::os_stop_thread,
-        0x8000_2030 => n::os_recv_mesg,
-        0x8000_21D8 => n::ull_div,
-        0x8000_227C => n::ll_div,
-        0x8000_22D8 => n::ll_mul,
-        0x8000_2D70 => n::os_destroy_thread,
-        0x8000_2F20 => n::os_create_thread,
-        0x8000_3070 => n::os_initialize,
-        0x8000_3420 => n::os_set_sr,
-        0x8000_3430 => n::os_get_sr,
-        0x8000_3440 => n::os_writeback_dcache,
-        0x8000_34C0 => n::os_vi_get_next_framebuffer,
-        0x8000_3500 => n::os_create_pi_manager,
-        0x8000_3B60 => n::os_virtual_to_physical,
-        0x8000_3BE0 => n::os_vi_black,
-        0x8000_3CA0 => n::os_get_thread_id,
-        0x8000_3CC0 => n::os_set_int_mask,
-        0x8000_3D60 => n::os_vi_set_mode,
-        0x8000_3E90 => n::os_get_mem_size,
-        0x8000_3FB0 => n::os_set_event_mesg,
-        0x8000_40C0 => n::os_epi_start_dma,
-        0x8000_41A0 => n::os_inval_icache,
-        0x8000_4220 => n::os_create_mesg_queue,
-        0x8000_4250 => n::os_inval_dcache,
-        0x8000_4330 => n::os_jam_mesg,
-        0x8000_4480 => n::os_set_thread_pri,
-        0x8000_4560 => n::os_get_thread_pri,
-        0x8000_48C0 => n::os_get_time,
-        0x8000_4D50 => n::os_get_count,
-        0x8000_5130 => n::os_disable_int,
-        0x8000_51A0 => n::os_restore_int,
-        0x8000_5630 => n::os_epi_read_io,
-        0x8000_5680 => n::os_cart_rom_init,
-        0x8000_5800 => n::os_epi_write_io,
-        0x8000_5900 => n::os_get_cause,
-        0x8000_5A70 => n::os_set_timer,
-        0x8000_5BA0 => n::os_create_vi_manager,
-        0x8000_5EC0 => n::os_start_thread,
-        0x800C_FE20 => n::os_cont_init,
-        0x800C_F7BC => n::os_sp_task_load,
-        0x800C_F94C => n::os_sp_task_start_go,
-        0x800C_F370 => n::os_get_int_mask,
-        0x800D_0160 => n::os_cont_start_read_data,
-        0x800D_01E4 => n::os_cont_get_read_data,
-        0x800D_0660 => n::os_si_raw_start_dma,
-        0x800D_0710 => n::os_sp_task_yield,
-        0x800D_0CD0 => n::os_stop_timer,
-        0x800D_0DF0 => n::os_cont_start_query,
-        0x800D_0E74 => n::os_cont_get_query,
-        0x800D_2420 => n::os_vi_swap_buffer,
-        0x800D_2690 => n::os_sp_task_yielded,
-        0x800D_2AF0 => n::os_dp_get_status,
-        0x800D_2B00 => n::os_dp_set_status,
-        0x800D_2E40 => n::os_vi_set_special_features,
-        0x800D_3000 => n::os_vi_set_event,
-        0x800D_3270 => n::os_cont_set_ch,
-        0x800D_32E0 => n::os_ai_get_length,
-        0x800D_5A80 => n::os_sp_get_status,
-        0x800D_5A90 => n::os_sp_set_status,
-        0x800D_5AA0 => n::os_writeback_dcache_all,
-        0x800D_5CF0 => n::os_vi_set_y_scale,
-        0x800D_5D50 => n::os_vi_get_current_framebuffer,
-        0x800D_5D90 => n::os_sp_set_pc,
-        0x800B_BE80 => n::os_ai_set_next_buffer,
-        0x800D_2900 => n::os_ai_set_frequency,
+        0x8000_1DB0 => r::os_pi_get_access,
+        0x8000_1DF4 => r::os_pi_rel_access,
+        0x8000_1E20 => r::os_send_mesg,
+        0x8000_1F70 => r::os_stop_thread,
+        0x8000_2030 => r::os_recv_mesg,
+        0x8000_21D8 => r::ull_div,
+        0x8000_227C => r::ll_div,
+        0x8000_22D8 => r::ll_mul,
+        0x8000_2D70 => r::os_destroy_thread,
+        0x8000_2F20 => r::os_create_thread,
+        0x8000_3070 => r::os_initialize,
+        0x8000_3420 => r::os_set_sr,
+        0x8000_3430 => r::os_get_sr,
+        0x8000_3440 => r::os_writeback_dcache,
+        0x8000_34C0 => r::os_vi_get_next_framebuffer,
+        0x8000_3500 => r::os_create_pi_manager,
+        0x8000_3B60 => r::os_virtual_to_physical,
+        0x8000_3BE0 => r::os_vi_black,
+        0x8000_3CA0 => r::os_get_thread_id,
+        0x8000_3CC0 => r::os_set_int_mask,
+        0x8000_3D60 => r::os_vi_set_mode,
+        0x8000_3E90 => r::os_get_mem_size,
+        0x8000_3FB0 => r::os_set_event_mesg,
+        0x8000_40C0 => r::os_epi_start_dma,
+        0x8000_41A0 => r::os_inval_icache,
+        0x8000_4220 => r::os_create_mesg_queue,
+        0x8000_4250 => r::os_inval_dcache,
+        0x8000_4330 => r::os_jam_mesg,
+        0x8000_4480 => r::os_set_thread_pri,
+        0x8000_4560 => r::os_get_thread_pri,
+        0x8000_48C0 => r::os_get_time,
+        0x8000_4D50 => r::os_get_count,
+        0x8000_5130 => r::os_disable_int,
+        0x8000_51A0 => r::os_restore_int,
+        0x8000_5630 => r::os_epi_read_io,
+        0x8000_5680 => r::os_cart_rom_init,
+        0x8000_5800 => r::os_epi_write_io,
+        0x8000_5900 => r::os_get_cause,
+        0x8000_5A70 => r::os_set_timer,
+        0x8000_5BA0 => r::os_create_vi_manager,
+        0x8000_5EC0 => r::os_start_thread,
+        0x800C_FE20 => r::os_cont_init,
+        0x800C_F7BC => r::os_sp_task_load,
+        0x800C_F94C => r::os_sp_task_start_go,
+        0x800C_F370 => r::os_get_int_mask,
+        0x800D_0160 => r::os_cont_start_read_data,
+        0x800D_01E4 => r::os_cont_get_read_data,
+        0x800D_0660 => r::os_si_raw_start_dma,
+        0x800D_0710 => r::os_sp_task_yield,
+        0x800D_0CD0 => r::os_stop_timer,
+        0x800D_0DF0 => r::os_cont_start_query,
+        0x800D_0E74 => r::os_cont_get_query,
+        0x800D_2420 => r::os_vi_swap_buffer,
+        0x800D_2690 => r::os_sp_task_yielded,
+        0x800D_2AF0 => r::os_dp_get_status,
+        0x800D_2B00 => r::os_dp_set_status,
+        0x800D_2E40 => r::os_vi_set_special_features,
+        0x800D_3000 => r::os_vi_set_event,
+        0x800D_3270 => r::os_cont_set_ch,
+        0x800D_32E0 => r::os_ai_get_length,
+        0x800D_5A80 => r::os_sp_get_status,
+        0x800D_5A90 => r::os_sp_set_status,
+        0x800D_5AA0 => r::os_writeback_dcache_all,
+        0x800D_5CF0 => r::os_vi_set_y_scale,
+        0x800D_5D50 => r::os_vi_get_current_framebuffer,
+        0x800D_5D90 => r::os_sp_set_pc,
+        0x800B_BE80 => r::os_ai_set_next_buffer,
+        0x800D_2900 => r::os_ai_set_frequency,
         _ => {
-            let canonical = n::canonical_vram(vram)?;
-            return Some(native_funcs::lookup(canonical));
+            let canonical = r::canonical_vram(vram)?;
+            return Some(recompiled::lookup(canonical));
         }
     };
     Some(host)
@@ -361,9 +361,9 @@ fn main() {
         fn64_runtime::SaveType::SramBanked,
     )));
 
-    #[cfg(not(fn64_native_recomp))]
+    #[cfg(not(fn64_recomp_rs))]
     let registration = fn64_boot_harness::register_linked_sections();
-    #[cfg(not(fn64_native_recomp))]
+    #[cfg(not(fn64_recomp_rs))]
     {
         println!(
             "[oot-boot] bridge reports {} sections in recomp_overlays.inl",
@@ -392,7 +392,7 @@ fn main() {
     // does not yet drive DmaMgr's overlay-load path, so only the
     // always-resident sections are marked loaded, matching real boot-time
     // hardware state (no actor overlay has been DMA'd in yet this early).
-    #[cfg(not(fn64_native_recomp))]
+    #[cfg(not(fn64_recomp_rs))]
     for section_key in [0usize, 1usize, 2usize] {
         if let Some(idx) = registration.registry_index(section_key) {
             fn64_abi::set_section_loaded(idx);
@@ -400,19 +400,19 @@ fn main() {
         }
     }
 
-    #[cfg(fn64_native_recomp)]
+    #[cfg(fn64_recomp_rs)]
     {
-        let section_indices: Vec<_> = native_funcs::NATIVE_SECTION_GEOMETRY
+        let section_indices: Vec<_> = recompiled::RECOMPILED_SECTION_GEOMETRY
             .iter()
             .map(|&(rom_addr, ram_addr, size)| {
-                fn64_abi::register_native_section(rom_addr, ram_addr, size)
+                fn64_abi::register_recompiled_section(rom_addr, ram_addr, size)
             })
             .collect();
         for &section_key in &[0usize, 1, 2] {
             fn64_abi::set_section_loaded(section_indices[section_key]);
         }
         println!(
-            "[oot-boot] registered {} native section geometries; marked 0/1/2 resident",
+            "[oot-boot] registered {} recompiled section geometries; marked 0/1/2 resident",
             section_indices.len()
         );
     }
@@ -564,26 +564,26 @@ fn main() {
     );
 
     println!("[oot-boot] booting thread 0 (recomp_entrypoint)...");
-    #[cfg(fn64_native_recomp)]
+    #[cfg(fn64_recomp_rs)]
     {
-        fn64_recomp_native::set_host_lookup(Some(native_host_lookup));
+        fn64_recomp_rs::set_host_lookup(Some(recompiled_or_host_lookup));
         println!(
-            "[oot-boot] FN64_NATIVE_RECOMP: linked oot-native-funcs crate + host-first native adapters active"
+            "[oot-boot] FN64_RECOMP=rs: linked oot-recompiled crate + host-first recompiled adapters active"
         );
         // SAFETY: `rdram` is the process-wide allocation and remains live
         // until every executor coroutine is dropped at process shutdown.
         unsafe {
-            fn64_abi::native::boot_thread0(
+            fn64_abi::recompiled::boot_thread0(
                 rdram_ptr,
                 rdram.len(),
-                native_funcs::lookup,
-                native_funcs::entrypoint,
+                recompiled::lookup,
+                recompiled::entrypoint,
                 0,
                 10,
             );
         }
     }
-    #[cfg(not(fn64_native_recomp))]
+    #[cfg(not(fn64_recomp_rs))]
     unsafe {
         fn64_abi::boot_thread0(rdram_ptr, fn64_boot_harness::c_recomp_entrypoint(), 0, 10);
     }
@@ -1041,9 +1041,9 @@ fn main() {
         println!("[oot-boot] trace written to {TRACE_PATH}");
     }
 
-    #[cfg(fn64_native_recomp)]
+    #[cfg(fn64_recomp_rs)]
     {
-        // Native threads may be suspended inside an existing `extern "C"`
+        // Recompiled threads may be suspended inside an existing `extern "C"`
         // ABI shim (most commonly blocking osRecvMesg). Rust TLS teardown
         // would make corosensei force-unwind that stack across the non-unwind
         // FFI boundary and abort after an otherwise complete bounded probe.

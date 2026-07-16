@@ -411,7 +411,7 @@ thread_local! {
     pub(crate) static AUDIO_PCM_DUMPED: Cell<bool> = const { Cell::new(false) };
     pub(crate) static AUDIO_OUTPUT_STATS: Cell<AudioOutputStats> = const { Cell::new(AudioOutputStats::new()) };
 
-    /// Coarse wall-time attribution for the native OoT performance harness.
+    /// Coarse wall-time attribution for the rs-lane OoT performance harness.
     /// Kept behind an environment flag so ordinary execution pays no
     /// `Instant::now` cost at task or executor boundaries.
     pub(crate) static PHASE_TIMING: Cell<bool> =

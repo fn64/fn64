@@ -226,17 +226,17 @@ rung-18 failure mode — "a second thread's recompiled code touches shared
 rdram with no lock the scheduler can see" — **unrepresentable**: there is no
 second thread.
 
-The native-Rust recompiler lane uses the same model. Generated functions own
-a safe `fn(&mut fn64_recomp_native::RecompContext, &mut Rdram)` ABI, while
-`fn64-abi::native` is the single adapter at the already-unsafe C host-shim
+The Rust recompiler lane uses the same model. Generated functions own
+a safe `fn(&mut fn64_recomp_rs::RecompContext, &mut Rdram)` ABI, while
+`fn64-abi::recompiled` is the single adapter at the already-unsafe C host-shim
 boundary. It marshals GPR/HI/LO/COP0 status into the legacy host context,
 calls the existing queue/DMA/VI/thread shim, then copies architectural state
-back. `osCreateThread` constructs a native context inside the same
+back. `osCreateThread` constructs a recompiled context inside the same
 `GameThread` coroutine; it does not create another executor, RDRAM image, or
 host thread. The generated module also exports section `(ROM, static VRAM,
 size)` geometry. The existing DMA load registry records relocated heap bases,
 and host-first lookup maps a relocated callback back to its static typed
-function entry. Thus native and C lanes share scheduling, peripherals, and
+function entry. Thus rs and C lanes share scheduling, peripherals, and
 memory ownership without pretending their register structs are layout-
 compatible.
 
@@ -955,7 +955,7 @@ starts a second real thread with a correctly-seeded stack, that thread
 then reaches a state that runs for tens of seconds of wall-clock CPU time
 inside a single `Executor::run_one_step` call with no crash and no log
 output — i.e. the recompiled code is executing a real (long or unbounded)
-native loop inside `func_800004D0` that this milestone's stubs never
+recompiled loop inside `func_800004D0` that this milestone's stubs never
 observed to terminate, most likely because our SI/PIF or PI-DMA completion
 model isn't yet posting whatever the game's own poll loop is waiting for.
 **Not a false "boot to idle"**: this is the honestly-reported frontier —
