@@ -249,6 +249,50 @@ pub struct Rdram<'a> {
     mem: &'a mut [u8],
 }
 
+/// The common signature of every typed-Rust recompiled function.
+///
+/// This is the safe-Rust equivalent of N64Recomp's MIT-licensed
+/// `recomp_func_t = void(uint8_t *rdram, recomp_context *ctx)`
+/// (`refs/N64RecompSource/include/recomp.h:443-451`). The three explicit
+/// higher-ranked lifetimes keep the context borrow, the `Rdram` view borrow,
+/// and the underlying byte-slice borrow independent; no pointer conversion or
+/// lifetime erasure is involved.
+pub type RecompFunc =
+    for<'ctx, 'view, 'rdram> fn(&'ctx mut RecompContext, &'view mut Rdram<'rdram>);
+
+/// Host lookup hook used for functions that must be supplied by the runtime
+/// instead of executing a recompiled body (libultra shims, exception/TLB
+/// handling, and other host-owned boundaries).
+pub type HostLookup = fn(u32) -> Option<RecompFunc>;
+
+thread_local! {
+    /// Native execution is single-threaded by design (`docs/DESIGN.md` section
+    /// 2), so the override belongs to the executing host thread. A
+    /// thread-local `Cell` also lets tests install an isolated resolver
+    /// without unsafe global mutation or cross-test serialization.
+    static HOST_LOOKUP: std::cell::Cell<Option<HostLookup>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Install (or clear) the current thread's host-function resolver, returning
+/// the previous resolver.
+///
+/// Generated dispatchers consult this hook before their sorted native table.
+/// A host can therefore bind a vram to a safe typed adapter over an fn64 shim;
+/// vrams deliberately omitted from the native table fail loudly if the host
+/// has not installed their adapter. The function-pointer seam itself is
+/// entirely safe Rust: no `transmute`, raw pointer, or ABI cast is involved.
+pub fn set_host_lookup(resolver: Option<HostLookup>) -> Option<HostLookup> {
+    HOST_LOOKUP.with(|slot| slot.replace(resolver))
+}
+
+/// Resolve `vram` through the current thread's host-function resolver.
+#[inline]
+pub fn resolve_host_function(vram: u32) -> Option<RecompFunc> {
+    HOST_LOOKUP.with(|slot| slot.get().and_then(|resolver| resolver(vram)))
+}
+
 impl<'a> Rdram<'a> {
     /// Wrap a byte buffer as rdram. The buffer should be [`RDRAM_LEN`] bytes;
     /// shorter buffers simply make more addresses fall out of bounds (a loud
