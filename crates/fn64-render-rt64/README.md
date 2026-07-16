@@ -35,7 +35,12 @@ The default feature set does not invoke CMake, link a graphics library, or
 require a GPU. Constructing `Rt64Backend` without the feature returns a named
 `RenderError::Backend`. With the feature enabled, display/GPU initialization
 failures are converted to the same error type, allowing a caller to install
-`ReferenceBackend` instead.
+`ReferenceBackend` instead. On macOS the RT64 API currently hard-requires a
+swapchain even when `renderToRAM` is enabled. The shim therefore owns a hidden
+SDL Metal surface, passes RT64 the validated native `NSWindow` and
+`CAMetalLayer` handles, and never exposes that window to fn64. Hosts without
+WindowServer or a Metal device fail creation cleanly and take the reference-
+backend path.
 
 ## FFI boundary
 
@@ -46,6 +51,17 @@ processing temporarily points RT64 at fn64's stable 8 MiB RDRAM allocation,
 loads the task's graphics microcode, and submits its raw display list. RT64's
 render-to-RAM mode writes the native framebuffer into the same allocation;
 the shim waits for the submitted workload before returning the Rust borrow.
+The macOS surface is only an initialization dependency of RT64/plume's current
+`Application::setup` path; framebuffer delivery remains render-to-RAM and the
+existing fn64 VI capture, not swapchain readback.
+
+The wrapper CMake build also applies an exact-source-checked Metal ownership fix
+to plume: several convenience-factory results (the command buffer, persistent
+encoders, a formatted-buffer texture descriptor, and stored shader names) had
+no retained ownership despite later manual releases. Without the balancing
+retains, shutdown joined the workload thread while its implicit autorelease pool
+released already-deallocated Metal objects, crashing in `objc_release` after an
+otherwise successful render.
 
 `src/ffi.rs` is the only raw Rust FFI surface. It wraps the opaque pointer in a
 safe, uniquely owned `Context`, documents each unsafe call, and maps every
