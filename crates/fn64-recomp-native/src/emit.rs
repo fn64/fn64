@@ -147,7 +147,10 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
         base,
         words.len()
     );
-    let _ = writeln!(out, "// Emitted by fn64-recomp-native (typed Rust, no unsafe).");
+    let _ = writeln!(
+        out,
+        "// Emitted by fn64-recomp-native (typed Rust, no unsafe)."
+    );
     // A leaf function may not touch memory (or, degenerately, registers); the
     // fixed ABI signature keeps both params, so allow the unused-var lint per
     // function rather than second-guessing which params a body references.
@@ -211,7 +214,10 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
         i += 1;
     }
 
-    let _ = writeln!(out, "        _ => unreachable!(\"jumped to unmapped vram {{:#X}}\", pc),");
+    let _ = writeln!(
+        out,
+        "        _ => unreachable!(\"jumped to unmapped vram {{:#X}}\", pc),"
+    );
     let _ = writeln!(out, "    }} }}");
     let _ = writeln!(out, "}}");
     out
@@ -230,12 +236,13 @@ fn branch_target(instr: &Instruction, vram: u32) -> Option<u32> {
         Bltz { off, .. } | Bgez { off, .. } | Bltzl { off, .. } | Bgezl { off, .. } => {
             Some(rel(off))
         }
-        Bltzal { off, .. } | Bgezal { off, .. } => Some(rel(off)),
-        Bc1t { off } | Bc1f { off } | Bc1tl { off } | Bc1fl { off } => Some(rel(off)),
-        // Absolute jumps: target = (delay_slot_pc & 0xF0000000) | (target << 2).
-        J { target } | Jal { target } => {
-            Some((vram.wrapping_add(4) & 0xF000_0000) | (target << 2))
+        Bltzal { off, .. } | Bgezal { off, .. } | Bltzall { off, .. } | Bgezall { off, .. } => {
+            Some(rel(off))
         }
+        Bc1t { off } | Bc1f { off } | Bc1tl { off } | Bc1fl { off } => Some(rel(off)),
+        Bc0t { off } | Bc0f { off } | Bc0tl { off } | Bc0fl { off } => Some(rel(off)),
+        // Absolute jumps: target = (delay_slot_pc & 0xF0000000) | (target << 2).
+        J { target } | Jal { target } => Some((vram.wrapping_add(4) & 0xF000_0000) | (target << 2)),
         _ => None,
     }
 }
@@ -288,6 +295,42 @@ fn ru64(idx: Reg) -> String {
     }
 }
 
+fn emit_fpu_i32(out: &mut String, fd: Reg, fs: Reg, single: bool, mode: Option<u8>) {
+    let value = if single {
+        format!("ctx.f_s({}) as f64", fs)
+    } else {
+        format!("ctx.f_d({})", fs)
+    };
+    let mode = mode.map_or_else(|| "None".to_string(), |m| format!("Some({})", m));
+    let _ = writeln!(
+        out,
+        "            {{ let v = {}; let r = ctx.fpu_to_i32(v, {}); ctx.set_f_bits({}, r as u32); }}",
+        value, mode, fd
+    );
+}
+
+fn emit_fpu_i64(out: &mut String, fd: Reg, fs: Reg, single: bool, mode: Option<u8>) {
+    let value = if single {
+        format!("ctx.f_s({}) as f64", fs)
+    } else {
+        format!("ctx.f_d({})", fs)
+    };
+    let mode = mode.map_or_else(|| "None".to_string(), |m| format!("Some({})", m));
+    let _ = writeln!(
+        out,
+        "            {{ let v = {}; let r = ctx.fpu_to_i64(v, {}); ctx.set_d_bits({}, r as u64); }}",
+        value, mode, fd
+    );
+}
+
+fn emit_trap(out: &mut String, condition: &str, mnemonic: &str, code: u16) {
+    let _ = writeln!(
+        out,
+        "            if {} {{ panic!(\"MIPS {} trap (code {:#X})\"); }}",
+        condition, mnemonic, code
+    );
+}
+
 /// Emit a straight-line (non-control-transfer) instruction as typed Rust.
 fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
     use Instruction::*;
@@ -298,7 +341,16 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
         Nop => line(out, "// nop".to_string()),
 
         // --- ALU immediate (results are 32-bit, sign-extended into GPR) ---
-        Addi { rt, rs, imm } | Addiu { rt, rs, imm } => line(
+        Addi { rt, rs, imm } => line(
+            out,
+            format!(
+                "ctx.set_r32({}, ({}).checked_add({}).expect(\"MIPS ADDI integer overflow\"));",
+                rt,
+                rs32(rs),
+                imm as i32
+            ),
+        ),
+        Addiu { rt, rs, imm } => line(
             out,
             format!("ctx.set_r32({}, ({}).wrapping_add({}));", rt, rs32(rs), imm as i32),
         ),
@@ -335,11 +387,29 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
         }
 
         // --- ALU register ---
-        Add { rd, rs, rt } | Addu { rd, rs, rt } => line(
+        Add { rd, rs, rt } => line(
+            out,
+            format!(
+                "ctx.set_r32({}, ({}).checked_add({}).expect(\"MIPS ADD integer overflow\"));",
+                rd,
+                rs32(rs),
+                rs32(rt)
+            ),
+        ),
+        Addu { rd, rs, rt } => line(
             out,
             format!("ctx.set_r32({}, ({}).wrapping_add({}));", rd, rs32(rs), rs32(rt)),
         ),
-        Sub { rd, rs, rt } | Subu { rd, rs, rt } => line(
+        Sub { rd, rs, rt } => line(
+            out,
+            format!(
+                "ctx.set_r32({}, ({}).checked_sub({}).expect(\"MIPS SUB integer overflow\"));",
+                rd,
+                rs32(rs),
+                rs32(rt)
+            ),
+        ),
+        Subu { rd, rs, rt } => line(
             out,
             format!("ctx.set_r32({}, ({}).wrapping_sub({}));", rd, rs32(rs), rs32(rt)),
         ),
@@ -398,19 +468,11 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
         ),
         Div { rs, rt } => line(
             out,
-            format!(
-                "{{ let a = {}; let b = {}; if b != 0 {{ ctx.lo = a.wrapping_div(b) as i64 as u64; ctx.hi = a.wrapping_rem(b) as i64 as u64; }} }}",
-                rs32(rs),
-                rs32(rt)
-            ),
+            format!("ctx.div_s32({}, {});", rs32(rs), rs32(rt)),
         ),
         Divu { rs, rt } => line(
             out,
-            format!(
-                "{{ let a = {}; let b = {}; if b != 0 {{ ctx.lo = (a / b) as i32 as i64 as u64; ctx.hi = (a % b) as i32 as i64 as u64; }} }}",
-                ru32(rs),
-                ru32(rt)
-            ),
+            format!("ctx.div_u32({}, {});", ru32(rs), ru32(rt)),
         ),
         Mfhi { rd } => line(out, format!("ctx.set_r({}, ctx.hi);", rd)),
         Mflo { rd } => line(out, format!("ctx.set_r({}, ctx.lo);", rd)),
@@ -421,6 +483,24 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
         Lw { rt, base, off } => line(
             out,
             format!("ctx.set_r32({}, mem.load_w(Rdram::eff_addr({}, {})));", rt, r(base), off),
+        ),
+        Lwu { rt, base, off } => line(
+            out,
+            format!(
+                "ctx.set_r({}, mem.load_w(Rdram::eff_addr({}, {})) as u32 as u64);",
+                rt,
+                r(base),
+                off
+            ),
+        ),
+        Ll { rt, base, off } => line(
+            out,
+            format!(
+                "{{ let a = Rdram::eff_addr({}, {}); let v = mem.load_w(a); ctx.set_r32({}, v); ctx.set_ll_reservation(a, 4); }}",
+                r(base),
+                off,
+                rt
+            ),
         ),
         Lh { rt, base, off } => line(
             out,
@@ -500,22 +580,59 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
             out,
             format!("mem.store_wr(Rdram::eff_addr({}, {}), {});", r(base), off, ru32(rt)),
         ),
+        Sc { rt, base, off } => line(
+            out,
+            format!(
+                "{{ let a = Rdram::eff_addr({}, {}); let v = {}; if ctx.take_ll_reservation(a, 4) {{ mem.store_w(a, v); ctx.set_r({}, 1); }} else {{ ctx.set_r({}, 0); }} }}",
+                r(base),
+                off,
+                ru32(rt),
+                rt,
+                rt
+            ),
+        ),
 
         // --- 64-bit doubleword ALU immediate ---
-        // DADDI/DADDIU: full 64-bit add of rs and the sign-extended immediate.
-        // (DADDI's overflow trap is dropped, matching the recomp custom of
-        // treating trapping adds as their non-trapping twin.)
-        Daddi { rt, rs, imm } | Daddiu { rt, rs, imm } => line(
+        // DADDI/DADDIU: full 64-bit add of rs and the sign-extended immediate;
+        // the trapping form uses checked arithmetic.
+        Daddi { rt, rs, imm } => line(
+            out,
+            format!(
+                "ctx.set_r({}, ({} as i64).checked_add({}i64).expect(\"MIPS DADDI integer overflow\") as u64);",
+                rt,
+                ru64(rs),
+                imm as i64
+            ),
+        ),
+        Daddiu { rt, rs, imm } => line(
             out,
             format!("ctx.set_r({}, ({}).wrapping_add({}i64 as u64));", rt, ru64(rs), imm as i64),
         ),
 
         // --- 64-bit doubleword ALU register ---
-        Dadd { rd, rs, rt } | Daddu { rd, rs, rt } => line(
+        Dadd { rd, rs, rt } => line(
+            out,
+            format!(
+                "ctx.set_r({}, ({}).checked_add({}).expect(\"MIPS DADD integer overflow\") as u64);",
+                rd,
+                rs64(rs),
+                rs64(rt)
+            ),
+        ),
+        Daddu { rd, rs, rt } => line(
             out,
             format!("ctx.set_r({}, ({}).wrapping_add({}));", rd, ru64(rs), ru64(rt)),
         ),
-        Dsub { rd, rs, rt } | Dsubu { rd, rs, rt } => line(
+        Dsub { rd, rs, rt } => line(
+            out,
+            format!(
+                "ctx.set_r({}, ({}).checked_sub({}).expect(\"MIPS DSUB integer overflow\") as u64);",
+                rd,
+                rs64(rs),
+                rs64(rt)
+            ),
+        ),
+        Dsubu { rd, rs, rt } => line(
             out,
             format!("ctx.set_r({}, ({}).wrapping_sub({}));", rd, ru64(rs), ru64(rt)),
         ),
@@ -576,26 +693,15 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
                 ru64(rt)
             ),
         ),
-        // DDIV: signed 64-bit; guard the INT64_MIN / -1 overflow (quotient
-        // saturates to INT64_MIN, remainder 0) exactly like N64Recomp's DDIV,
-        // and the divide-by-zero case leaves HI/LO unchanged (undefined on
-        // hardware; we mirror the C oracle, which skips the write path when the
-        // recompiled code never relies on it — here we simply guard b != 0).
+        // DDIV: signed 64-bit, including INT64_MIN / -1. The runtime helper
+        // traps loudly on the manual-uncertain zero-divisor case.
         Ddiv { rs, rt } => line(
             out,
-            format!(
-                "{{ let a = {}; let b = {}; if b != 0 {{ if a == i64::MIN && b == -1 {{ ctx.lo = a as u64; ctx.hi = 0; }} else {{ ctx.lo = a.wrapping_div(b) as u64; ctx.hi = a.wrapping_rem(b) as u64; }} }} }}",
-                rs64(rs),
-                rs64(rt)
-            ),
+            format!("ctx.div_s64({}, {});", rs64(rs), rs64(rt)),
         ),
         Ddivu { rs, rt } => line(
             out,
-            format!(
-                "{{ let a = {}; let b = {}; if b != 0 {{ ctx.lo = a / b; ctx.hi = a % b; }} }}",
-                ru64(rs),
-                ru64(rt)
-            ),
+            format!("ctx.div_u64({}, {});", ru64(rs), ru64(rt)),
         ),
 
         // --- Doubleword loads ---
@@ -603,11 +709,14 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
             out,
             format!("ctx.set_r({}, mem.load_d(Rdram::eff_addr({}, {})));", rt, r(base), off),
         ),
-        // LLD is a plain doubleword load on the single-threaded recompilation
-        // model (no other master can break the link between it and its SCD).
         Lld { rt, base, off } => line(
             out,
-            format!("ctx.set_r({}, mem.load_d(Rdram::eff_addr({}, {})));", rt, r(base), off),
+            format!(
+                "{{ let a = Rdram::eff_addr({}, {}); let v = mem.load_d(a); ctx.set_r({}, v); ctx.set_ll_reservation(a, 8); }}",
+                r(base),
+                off,
+                rt
+            ),
         ),
         Ldl { rt, base, off } => line(
             out,
@@ -643,15 +752,17 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
             out,
             format!("mem.store_dr(Rdram::eff_addr({}, {}), {});", r(base), off, ru64(rt)),
         ),
-        // SCD stores the doubleword and, on the single-threaded model, always
-        // reports success by writing 1 into rt.
-        Scd { rt, base, off } => {
-            line(
-                out,
-                format!("mem.store_d(Rdram::eff_addr({}, {}), {});", r(base), off, ru64(rt)),
-            );
-            line(out, format!("ctx.set_r({}, 1);", rt));
-        }
+        Scd { rt, base, off } => line(
+            out,
+            format!(
+                "{{ let a = Rdram::eff_addr({}, {}); let v = {}; if ctx.take_ll_reservation(a, 8) {{ mem.store_d(a, v); ctx.set_r({}, 1); }} else {{ ctx.set_r({}, 0); }} }}",
+                r(base),
+                off,
+                ru64(rt),
+                rt,
+                rt
+            ),
+        ),
 
         // ================================================================
         // COP1 / FPU.
@@ -678,13 +789,13 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
         Dmfc1 { rt, fs } => line(out, format!("ctx.set_r({}, ctx.d_bits({}));", rt, fs)),
         // DMTC1: FPR 64 bits = GPR.
         Dmtc1 { rt, fs } => line(out, format!("ctx.set_d_bits({}, {});", fs, ru64(rt))),
-        // CFC1/CTC1: control-register moves. The only observable control state
-        // in this runtime is the (nearest-mode-only) FCSR; OoT reads FCR31 to
-        // save/restore it around library calls. We model these as no-ops on
-        // register state beyond routing the GPR (CFC1 yields 0 = the
-        // round-to-nearest/no-flags FCSR the runtime always presents).
-        Cfc1 { rt, .. } => line(out, format!("ctx.set_r32({}, 0);", rt)),
-        Ctc1 { .. } => line(out, "// ctc1: FCSR write (round-to-nearest only; no-op)".to_string()),
+        // CFC1/CTC1: typed FCR0/FCR31 access. OoT reads and rewrites FCR31
+        // around conversion sequences, including non-nearest RM values.
+        Cfc1 { rt, fs } => line(
+            out,
+            format!("{{ let v = ctx.read_fcr({}); ctx.set_r32({}, v as i32); }}", fs, rt),
+        ),
+        Ctc1 { rt, fs } => line(out, format!("ctx.write_fcr({}, {});", fs, ru32(rt))),
 
         // --- COP1 loads/stores ---
         Lwc1 { ft, base, off } => line(
@@ -777,86 +888,61 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
 
         // float/double -> int32 (round to nearest, ties to even = FCSR default).
         // Written as raw bits of the i32 into the FPR single word.
-        CvtWS { fd, fs } => line(
-            out,
-            format!("ctx.set_f_bits({}, round_ties_even_f32(ctx.f_s({})) as i32 as u32);", fd, fs),
-        ),
-        CvtWD { fd, fs } => line(
-            out,
-            format!("ctx.set_f_bits({}, round_ties_even_f64(ctx.f_d({})) as i32 as u32);", fd, fs),
-        ),
+        CvtWS { fd, fs } => emit_fpu_i32(out, fd, fs, true, None),
+        CvtWD { fd, fs } => emit_fpu_i32(out, fd, fs, false, None),
         // float/double -> int64 (round to nearest).
-        CvtLS { fd, fs } => line(
-            out,
-            format!("ctx.set_d_bits({}, round_ties_even_f32(ctx.f_s({})) as i64 as u64);", fd, fs),
-        ),
-        CvtLD { fd, fs } => line(
-            out,
-            format!("ctx.set_d_bits({}, round_ties_even_f64(ctx.f_d({})) as i64 as u64);", fd, fs),
-        ),
+        CvtLS { fd, fs } => emit_fpu_i64(out, fd, fs, true, None),
+        CvtLD { fd, fs } => emit_fpu_i64(out, fd, fs, false, None),
 
         // TRUNC.* -> round toward zero. Rust `f32 as i32` is exactly the C
         // `(int32_t)val` truncation (both saturate/clamp per IEEE-to-int, and
         // OoT's inputs are in range), matching the recomp.h TRUNC_W_S macro.
-        TruncWS { fd, fs } => {
-            line(out, format!("ctx.set_f_bits({}, (ctx.f_s({}) as i32) as u32);", fd, fs))
-        }
-        TruncWD { fd, fs } => {
-            line(out, format!("ctx.set_f_bits({}, (ctx.f_d({}) as i32) as u32);", fd, fs))
-        }
-        TruncLS { fd, fs } => {
-            line(out, format!("ctx.set_d_bits({}, (ctx.f_s({}) as i64) as u64);", fd, fs))
-        }
-        TruncLD { fd, fs } => {
-            line(out, format!("ctx.set_d_bits({}, (ctx.f_d({}) as i64) as u64);", fd, fs))
-        }
-
-        // FLOOR.W.* -> round toward -inf, then to int32. `f.floor()` is the
-        // IEEE floor; `as i32` then truncates the (already-integral) result,
-        // matching the recomp.h FLOOR_W_S macro's `(int32_t)floorf(val)`.
-        FloorWS { fd, fs } => {
-            line(out, format!("ctx.set_f_bits({}, (ctx.f_s({}).floor() as i32) as u32);", fd, fs))
-        }
-        FloorWD { fd, fs } => {
-            line(out, format!("ctx.set_f_bits({}, (ctx.f_d({}).floor() as i32) as u32);", fd, fs))
-        }
-        // CEIL.W.* -> round toward +inf, then to int32 (`(int32_t)ceilf(val)`).
-        CeilWS { fd, fs } => {
-            line(out, format!("ctx.set_f_bits({}, (ctx.f_s({}).ceil() as i32) as u32);", fd, fs))
-        }
-        CeilWD { fd, fs } => {
-            line(out, format!("ctx.set_f_bits({}, (ctx.f_d({}).ceil() as i32) as u32);", fd, fs))
-        }
-        // ROUND.W.* -> round to nearest, ties to even (RN, the boot FCSR mode),
-        // then to int32. Identical rounding to `CVT.W.*` above, which routes
-        // through `round_ties_even_f{32,64}` per the recomp.h ROUND_W_S macro.
-        RoundWS { fd, fs } => line(
-            out,
-            format!("ctx.set_f_bits({}, round_ties_even_f32(ctx.f_s({})) as i32 as u32);", fd, fs),
-        ),
-        RoundWD { fd, fs } => line(
-            out,
-            format!("ctx.set_f_bits({}, round_ties_even_f64(ctx.f_d({})) as i32 as u32);", fd, fs),
-        ),
+        TruncWS { fd, fs } => emit_fpu_i32(out, fd, fs, true, Some(1)),
+        TruncWD { fd, fs } => emit_fpu_i32(out, fd, fs, false, Some(1)),
+        TruncLS { fd, fs } => emit_fpu_i64(out, fd, fs, true, Some(1)),
+        TruncLD { fd, fs } => emit_fpu_i64(out, fd, fs, false, Some(1)),
+        RoundWS { fd, fs } => emit_fpu_i32(out, fd, fs, true, Some(0)),
+        RoundWD { fd, fs } => emit_fpu_i32(out, fd, fs, false, Some(0)),
+        RoundLS { fd, fs } => emit_fpu_i64(out, fd, fs, true, Some(0)),
+        RoundLD { fd, fs } => emit_fpu_i64(out, fd, fs, false, Some(0)),
+        CeilWS { fd, fs } => emit_fpu_i32(out, fd, fs, true, Some(2)),
+        CeilWD { fd, fs } => emit_fpu_i32(out, fd, fs, false, Some(2)),
+        CeilLS { fd, fs } => emit_fpu_i64(out, fd, fs, true, Some(2)),
+        CeilLD { fd, fs } => emit_fpu_i64(out, fd, fs, false, Some(2)),
+        FloorWS { fd, fs } => emit_fpu_i32(out, fd, fs, true, Some(3)),
+        FloorWD { fd, fs } => emit_fpu_i32(out, fd, fs, false, Some(3)),
+        FloorLS { fd, fs } => emit_fpu_i64(out, fd, fs, true, Some(3)),
+        FloorLD { fd, fs } => emit_fpu_i64(out, fd, fs, false, Some(3)),
+        // (FLOOR/CEIL/ROUND.W.{S,D} are handled by the unified emit_fpu_i32
+        // arms above with the mode arg Some(3)/Some(2)/Some(0); the duplicate
+        // inline arms from main's driver branch were removed as unreachable on
+        // merge -- the emit_fpu_i32 helper and the merged decoder are the
+        // superset, and fpu_oracle.rs verifies the emitted behavior matches.)
 
         // --- FP compares: set the condition flag (FCSR bit 23). ---
         CEqS { fs, ft } => {
-            line(out, format!("ctx.fpu_cond = ctx.f_s({}) == ctx.f_s({});", fs, ft))
+            line(out, format!("ctx.fpu_compare_s({}, {}, 2);", fs, ft))
         }
         CLtS { fs, ft } => {
-            line(out, format!("ctx.fpu_cond = ctx.f_s({}) < ctx.f_s({});", fs, ft))
+            line(out, format!("ctx.fpu_compare_s({}, {}, 12);", fs, ft))
         }
         CLeS { fs, ft } => {
-            line(out, format!("ctx.fpu_cond = ctx.f_s({}) <= ctx.f_s({});", fs, ft))
+            line(out, format!("ctx.fpu_compare_s({}, {}, 14);", fs, ft))
         }
         CEqD { fs, ft } => {
-            line(out, format!("ctx.fpu_cond = ctx.f_d({}) == ctx.f_d({});", fs, ft))
+            line(out, format!("ctx.fpu_compare_d({}, {}, 2);", fs, ft))
         }
         CLtD { fs, ft } => {
-            line(out, format!("ctx.fpu_cond = ctx.f_d({}) < ctx.f_d({});", fs, ft))
+            line(out, format!("ctx.fpu_compare_d({}, {}, 12);", fs, ft))
         }
         CLeD { fs, ft } => {
-            line(out, format!("ctx.fpu_cond = ctx.f_d({}) <= ctx.f_d({});", fs, ft))
+            line(out, format!("ctx.fpu_compare_d({}, {}, 14);", fs, ft))
+        }
+        CCondS { fs, ft, cond } => {
+            line(out, format!("ctx.fpu_compare_s({}, {}, {});", fs, ft, cond))
+        }
+        CCondD { fs, ft, cond } => {
+            line(out, format!("ctx.fpu_compare_d({}, {}, {});", fs, ft, cond))
         }
 
         // --- COP0 system control ---
@@ -922,7 +1008,9 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
         Sync => line(out, "// sync: no-op (single-threaded recompiled context)".to_string()),
 
         // --- COP2: unused coprocessor, loud trap ---
-        Mfc2 { .. } | Mtc2 { .. } | Cfc2 { .. } | Ctc2 { .. } => line(
+        Mfc2 { .. } | Mtc2 { .. } | Cfc2 { .. } | Ctc2 { .. } | Dmfc2 { .. }
+        | Dmtc2 { .. } | Cop2Op { .. } | Lwc2 { .. } | Ldc2 { .. } | Swc2 { .. }
+        | Sdc2 { .. } => line(
             out,
             "panic!(\"COP2 access in recompiled code: COP2 is unused on the N64 and not modeled\");"
                 .to_string(),
@@ -936,6 +1024,18 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
         Break { code } => {
             line(out, format!("panic!(\"break (code {:#X}) executed in recompiled code\");", code))
         }
+        Tge { rs, rt, code } => emit_trap(out, &format!("{} >= {}", rs64(rs), rs64(rt)), "tge", code),
+        Tgeu { rs, rt, code } => emit_trap(out, &format!("{} >= {}", ru64(rs), ru64(rt)), "tgeu", code),
+        Tlt { rs, rt, code } => emit_trap(out, &format!("{} < {}", rs64(rs), rs64(rt)), "tlt", code),
+        Tltu { rs, rt, code } => emit_trap(out, &format!("{} < {}", ru64(rs), ru64(rt)), "tltu", code),
+        Teq { rs, rt, code } => emit_trap(out, &format!("{} == {}", r(rs), r(rt)), "teq", code),
+        Tne { rs, rt, code } => emit_trap(out, &format!("{} != {}", r(rs), r(rt)), "tne", code),
+        Tgei { rs, imm } => emit_trap(out, &format!("{} >= {}i64", rs64(rs), imm as i64), "tgei", 0),
+        Tgeiu { rs, imm } => emit_trap(out, &format!("{} >= {}u64", ru64(rs), imm as i64 as u64), "tgeiu", 0),
+        Tlti { rs, imm } => emit_trap(out, &format!("{} < {}i64", rs64(rs), imm as i64), "tlti", 0),
+        Tltiu { rs, imm } => emit_trap(out, &format!("{} < {}u64", ru64(rs), imm as i64 as u64), "tltiu", 0),
+        Teqi { rs, imm } => emit_trap(out, &format!("{} == {}i64", rs64(rs), imm as i64), "teqi", 0),
+        Tnei { rs, imm } => emit_trap(out, &format!("{} != {}i64", rs64(rs), imm as i64), "tnei", 0),
 
         // Control transfers are never emitted here.
         other => line(out, format!("compile_error!(\"non-straight op reached emit_straight: {:?}\");", other)),
@@ -980,11 +1080,17 @@ fn emit_control_transfer(
             Bnel { rs, rt, .. } => format!("{} != {}", r(rs), r(rt)),
             Blez { rs, .. } | Blezl { rs, .. } => format!("{} <= 0", rs64(rs)),
             Bgtz { rs, .. } | Bgtzl { rs, .. } => format!("{} > 0", rs64(rs)),
-            Bltz { rs, .. } | Bltzl { rs, .. } | Bltzal { rs, .. } => format!("{} < 0", rs64(rs)),
-            Bgez { rs, .. } | Bgezl { rs, .. } | Bgezal { rs, .. } => format!("{} >= 0", rs64(rs)),
+            Bltz { rs, .. } | Bltzl { rs, .. } | Bltzal { rs, .. } | Bltzall { rs, .. } => {
+                format!("{} < 0", rs64(rs))
+            }
+            Bgez { rs, .. } | Bgezl { rs, .. } | Bgezal { rs, .. } | Bgezall { rs, .. } => {
+                format!("{} >= 0", rs64(rs))
+            }
             // COP1 branches read the FP condition flag set by the last compare.
             Bc1t { .. } | Bc1tl { .. } => "ctx.fpu_cond".to_string(),
             Bc1f { .. } | Bc1fl { .. } => "!ctx.fpu_cond".to_string(),
+            Bc0t { .. } | Bc0tl { .. } => "ctx.cop0_cond".to_string(),
+            Bc0f { .. } | Bc0fl { .. } => "!ctx.cop0_cond".to_string(),
             _ => return None,
         })
     };
@@ -1017,11 +1123,7 @@ fn emit_control_transfer(
                         let _ = writeln!(out, "            {}(ctx, mem); return;", name);
                     }
                     CallTarget::Indirect => {
-                        let _ = writeln!(
-                            out,
-                            "            lookup({:#010X})(ctx, mem); return;",
-                            t
-                        );
+                        let _ = writeln!(out, "            lookup({:#010X})(ctx, mem); return;", t);
                     }
                 }
             }
@@ -1030,7 +1132,11 @@ fn emit_control_transfer(
             // Link: $ra = address after the delay slot. Emit the address as a
             // `u32` literal + `as i32` so a high (bit-31-set) return address
             // like 0x80002008 is not an out-of-range `i32` literal.
-            let _ = writeln!(out, "            ctx.set_r32(31, {:#010X}u32 as i32);", fallthrough);
+            let _ = writeln!(
+                out,
+                "            ctx.set_r32(31, {:#010X}u32 as i32);",
+                fallthrough
+            );
             emit_delay(out);
             let t = target.unwrap();
             match resolver.resolve(t) {
@@ -1041,27 +1147,60 @@ fn emit_control_transfer(
                     let _ = writeln!(out, "            lookup({:#010X})(ctx, mem);", t);
                 }
             }
-            let _ = writeln!(out, "            pc = {:#010X}; continue 'run;", fallthrough);
+            let _ = writeln!(
+                out,
+                "            pc = {:#010X}; continue 'run;",
+                fallthrough
+            );
         }
         Jalr { rd, rs } => {
-            let link = if rd == 0 { 31 } else { rd };
-            let _ = writeln!(out, "            ctx.set_r32({}, {:#010X}u32 as i32);", link, fallthrough);
+            // JALR reads the target before writing the link; this matters when
+            // rd == rs. Register zero remains zero (rd=0 discards the link).
+            let _ = writeln!(out, "            let _target = ctx.r_u32({});", rs);
+            let _ = writeln!(
+                out,
+                "            ctx.set_r32({}, {:#010X}u32 as i32);",
+                rd, fallthrough
+            );
             emit_delay(out);
-            let _ = writeln!(out, "            lookup(ctx.r_u32({}))(ctx, mem);", rs);
-            let _ = writeln!(out, "            pc = {:#010X}; continue 'run;", fallthrough);
+            let _ = writeln!(out, "            lookup(_target)(ctx, mem);");
+            let _ = writeln!(
+                out,
+                "            pc = {:#010X}; continue 'run;",
+                fallthrough
+            );
         }
         Bltzal { .. } | Bgezal { .. } => {
             // Conditional branch-and-link.
             let c = cond(&instr).unwrap();
             let t = target.unwrap();
             let _ = writeln!(out, "            let _take = {};", c);
-            let _ = writeln!(out, "            ctx.set_r32(31, {:#010X}u32 as i32);", fallthrough);
+            let _ = writeln!(
+                out,
+                "            ctx.set_r32(31, {:#010X}u32 as i32);",
+                fallthrough
+            );
             emit_delay(out);
             let _ = writeln!(
                 out,
                 "            pc = if _take {{ {:#010X} }} else {{ {:#010X} }}; continue 'run;",
                 t, fallthrough
             );
+        }
+        Bltzall { .. } | Bgezall { .. } => {
+            let c = cond(&instr).unwrap();
+            let t = target.unwrap();
+            let _ = writeln!(
+                out,
+                "            ctx.set_r32(31, {:#010X}u32 as i32);",
+                fallthrough
+            );
+            let _ = writeln!(out, "            if {} {{", c);
+            emit_delay(out);
+            let _ = writeln!(out, "                pc = {:#010X};", t);
+            let _ = writeln!(out, "            }} else {{");
+            let _ = writeln!(out, "                pc = {:#010X};", fallthrough);
+            let _ = writeln!(out, "            }} continue 'run;");
         }
         _ if instr.is_branch_likely() => {
             // Branch-likely: delay slot is executed ONLY when the branch is

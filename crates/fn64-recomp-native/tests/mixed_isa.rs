@@ -241,14 +241,14 @@ fn mixed_isa_execution_matches_oracle() {
             let phys = |vaddr: u32| (vaddr & 0x1FFF_FFFF) as usize;
             // Global pointer at phys(0x80120000 - 0x4600) = 0x11BA00.
             let gp_phys = phys(0x8012_0000u32.wrapping_sub(0x4600));
-            buf[gp_phys..gp_phys + 4].copy_from_slice(&GLOBAL_PTR.to_be_bytes());
+            buf[gp_phys..gp_phys + 4].copy_from_slice(&GLOBAL_PTR.to_ne_bytes());
             // Halfword at phys(GLOBAL_PTR + 0xA74). `load_h` applies the N64
             // big-endian-in-buffer `^2` byte swizzle, so store it swizzled too.
             let hw_phys = phys(GLOBAL_PTR.wrapping_add(0xA74)) ^ 2;
-            buf[hw_phys..hw_phys + 2].copy_from_slice(&hword.to_be_bytes());
+            buf[hw_phys..hw_phys + 2].copy_from_slice(&hword.to_ne_bytes());
             // Actor float at phys(ACTOR_PTR + 0xC).
             let af_phys = phys(ACTOR_PTR.wrapping_add(0xC));
-            buf[af_phys..af_phys + 4].copy_from_slice(&actor_f.to_bits().to_be_bytes());
+            buf[af_phys..af_phys + 4].copy_from_slice(&actor_f.to_bits().to_ne_bytes());
 
             let mut mem = Rdram::new(&mut buf);
             let mut ctx = RecompContext::new();
