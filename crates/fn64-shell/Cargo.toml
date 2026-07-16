@@ -10,8 +10,54 @@ description = "fn64's executable: window, input, audio out, ROM/RecompiledFuncs 
 name = "fn64"
 path = "src/main.rs"
 
+[features]
+# Seam for linking a real out-of-tree audio ucode (the synth that produces
+# samples for the cpal output stream). Currently declares NO dependency --
+# the only ucode crate available (aki-recomp/games/OOTU/rsp-recomp) hard-pins
+# fn64-audio to a sibling worktree, which collides with this workspace's
+# fn64-audio in the lockfile (see [dependencies] note). Enabling this feature
+# today only changes the `wire_audio_ucode` log line; add the `dep:...` here
+# once a ucode crate exists that doesn't cross-pin fn64-audio.
+oot-audio-ucode = []
+
+[build-dependencies]
+# Compiles the out-of-tree RecompiledFuncs/*.c + bridge/section_bridge.c ONLY
+# when RECOMPILED_DIR is set (see build.rs). A no-op otherwise, so a
+# content-free workspace build needs no C toolchain invocation.
+cc = "1"
+
 [dependencies]
 fn64-runtime = { path = "../fn64-runtime" }
 fn64-abi = { path = "../fn64-abi" }
 fn64-render = { path = "../fn64-render" }
 fn64-render-rt64 = { path = "../fn64-render-rt64" }
+# cpal-backed AudioBackend lives here; we register it via
+# fn64_abi::set_audio_backend to wire the audio OUTPUT path.
+fn64-audio = { path = "../fn64-audio" }
+
+# Window + live framebuffer present. Both MIT/Apache-2.0 (permissive).
+# `pixels` is a thin wgpu-backed pixel-buffer presenter -- the simplest way
+# to blit the game's RGBA framebuffer to a resizable window with correct
+# aspect. winit drives the window + keyboard events.
+winit = "0.30"
+pixels = "0.15"
+
+# For `_exit(2)` (immediate process termination): the one global fn64_abi
+# executor holds a booted game's GameThreads, whose Drop panics if run at
+# normal teardown (they wrap guest stacks woven through the linked C
+# RecompiledFuncs). A shell has nothing to persist on exit, so we terminate
+# via `_exit`, which skips ALL destructors (including the macOS pthread-key
+# TLS dtors `std::process::exit` still triggers). Already in the tree
+# transitively; declared direct only to name it. See main.rs `clean_exit`.
+libc = "0.2"
+
+# NOTE: the audio SYNTH (recompiled OoT aspMain ucode, out-of-tree at
+# aki-recomp/games/OOTU/rsp-recomp) is deliberately NOT a dependency here.
+# That crate hard-pins `fn64-audio` to a specific sibling worktree
+# (fn64-audio-wt), which collides with THIS workspace's own fn64-audio in the
+# lockfile. Wiring it as a path dep -- even optional -- forces that collision
+# at resolve time. The shell's deliverable is the audio OUTPUT path (cpal,
+# via fn64-audio::CpalBackend registered with fn64_abi::set_audio_backend),
+# which is fully wired without the ucode. See main.rs `wire_audio_ucode`'s
+# `oot-audio-ucode` feature for the seam to link a real ucode once it no
+# longer cross-pins fn64-audio.
