@@ -1,6 +1,9 @@
 //! B2 gate runner: Phase 4 (delay-slot-aware CFG) + Phase 5 (recursive-
-//! descent owner partitioning) over the real OoT and NW4E ROMs' resident
-//! `boot` banks, graded against:
+//! descent owner partitioning) + Phase 6's bounded HI/LO indirect resolver
+//! (`resolve::build_cfg_closed`) over the real OoT and NW4E ROMs' resident
+//! `boot` banks. Both banks are seeded with ONLY the header entrypoint --
+//! the resident C entry each IPL3 stub `jr`s to is now recovered
+//! mechanically, no hand-supplied "main entry" address. Graded against:
 //!
 //! - OoT's real linked `boot`-bank function boundaries (mechanically
 //!   pulled from the decomp's own linker map; never hand-curated -- see
@@ -17,10 +20,10 @@
 //! mechanism itself.
 
 use fn64_discover::banks::{self, DescriptorTableShape};
-use fn64_discover::cfg::build_cfg;
 use fn64_discover::grade_nw4e_symbols::{grade_grind_collapse, parse_symbol_addrs};
 use fn64_discover::grade_oot_functions::{grade_functions, parse_function_csv};
 use fn64_discover::partition::{partition, same_bank_overlaps, Owner};
+use fn64_discover::resolve::build_cfg_closed;
 use fn64_discover::{run_discovery, DescriptorTableInput};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -39,10 +42,12 @@ const OOT_BOOT_CODE_END: u32 = 0x8000_6230;
 
 const NW4E_ROM: &str = "/Users/jer/Code/aki-recomp/games/NW4E/nomercy.z64";
 /// NW4E's `overlays.json` `resident.main_entry_vram` -- a prior
-/// byte-verified RE fact (scan.py section 2, cited in that file's own
-/// `resident.comment`), supplied here as an explicit external claim per
-/// this crate's discipline (`banks.rs`'s `DescriptorTableShape` doc
-/// comment): never rediscovered by scanning, always cited.
+/// byte-verified RE fact (scan.py section 2). It is NO LONGER a pipeline
+/// input: Phase 6's bounded HI/LO resolver ([`build_cfg_closed`]) now
+/// recovers this exact address mechanically from the IPL3 boot stub's
+/// `lui $t2,0x8000 ; addiu $t2,$t2,0x0460 ; jr $t2` construction. It is kept
+/// here ONLY as a grading assertion -- proof the mechanical resolution
+/// reproduces the hand-verified value -- never as a seed.
 const NW4E_MAIN_ENTRY_VRAM: u32 = 0x8000_0460;
 const NW4E_SYMBOL_ADDRS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -84,11 +89,13 @@ fn main() {
     std::process::exit(exit_code);
 }
 
-/// Build the boot bank's CFG + partition from the real OoT ROM, starting
-/// from the single proven root the header itself supplies (the
-/// entrypoint) -- this crate does not yet implement Phase 3 candidate
-/// harvesting, so no other roots are seeded here. That is an honest,
-/// reported limitation, not a hidden one: see the printed `open` count.
+/// Build the boot bank's CFG + partition from the real OoT ROM, seeding
+/// ONLY the header entrypoint and letting Phase 6's bounded HI/LO resolver
+/// ([`build_cfg_closed`]) recover the resident C entry (`bootproc` at
+/// 0x80000498) mechanically from the IPL3 stub's `lui/addiu -> jr $t2`
+/// construction -- no hand-supplied "main entry" address. Phase 3 candidate
+/// harvesting is still unimplemented, so functions reached only via function
+/// pointers remain `open`; that is a reported limitation, not a hidden one.
 fn run_oot_function_gate() -> Result<(), String> {
     let rom_bytes = std::fs::read(OOT_ROM).map_err(|e| format!("reading {OOT_ROM}: {e}"))?;
     let (rom, db) =
@@ -116,10 +123,19 @@ fn run_oot_function_gate() -> Result<(), String> {
         "  boot bank: rom_start=0x{rom_start:x} va_start=0x{va_start:x} code_end=0x{OOT_BOOT_CODE_END:x} entrypoint=0x{entrypoint:x}"
     );
 
-    let cfg = build_cfg("boot", bank_bytes, va_start, &[entrypoint]);
+    let (cfg, resolved) = build_cfg_closed("boot", bank_bytes, va_start, &[entrypoint]);
     let part = partition(&cfg);
     let overlaps = same_bank_overlaps(&part, &cfg);
 
+    println!(
+        "  Phase 6 resolved {} bounded indirect target(s): {}",
+        resolved.len(),
+        resolved
+            .iter()
+            .map(|r| format!("0x{:x}->0x{:x}", r.site_pc, r.target))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     println!(
         "  CFG: {} blocks, {} direct calls, {} tail transfers, {} indirect sites",
         cfg.blocks.len(),
@@ -151,10 +167,20 @@ fn run_oot_function_gate() -> Result<(), String> {
         );
     }
 
-    let report = grade_functions(&part.owners, &parsed.functions, OOT_BOOT_CODE_END);
+    // A proven `jal` target is a machine-checkable interior callable entry;
+    // an owner rooted there inside a coarser answer-key function is correct
+    // finer-grained discovery, not a mis-split (see grade_oot_functions).
+    let jal_targets: fn64_discover::grade_oot_functions::JalTargets =
+        cfg.direct_calls.iter().map(|(_, t)| *t).collect();
+    let report = grade_functions(
+        &part.owners,
+        &parsed.functions,
+        OOT_BOOT_CODE_END,
+        &jal_targets,
+    );
     println!(
-        "  OoT function-boundary grade: total={} matched_exact={} matched_coarse={} open={} wrong={}",
-        report.total, report.matched_exact, report.matched_coarse, report.open, report.wrong
+        "  OoT function-boundary grade: total={} matched_exact={} matched_coarse={} interior_entries={} open={} wrong={}",
+        report.total, report.matched_exact, report.matched_coarse, report.interior_entries, report.open, report.wrong
     );
     println!(
         "    matched%={:.1}% open%={:.1}%",
@@ -215,25 +241,33 @@ fn run_nw4e_grind_collapse_gate() -> Result<(), String> {
             continue;
         };
         let bank_bytes = &rom.bytes[*rom_start as usize..*rom_end as usize];
-        let roots: Vec<u32> = if bank == banks::BOOT_BANK {
-            // The header entrypoint reaches only its own IPL3-style
-            // BSS-clear stub before an indirect `jr` this crate's Phase 6
-            // (not yet implemented) would need to resolve. NW4E's
-            // `overlays.json` already carries `main_entry_vram` as a
-            // separate, prior byte-verified RE fact (scan.py section 2,
-            // cited in that file) -- an explicit external claim exactly
-            // like the descriptor-table shape below, not a guess. Seeding
-            // it lets this gate demonstrate real recursive-descent
-            // recovery instead of stopping at the same indirect jump
-            // every N64 IPL3 boot stub hits.
-            vec![rom.header.entry_point, NW4E_MAIN_ENTRY_VRAM]
+        // Seed ONLY the header entrypoint. The IPL3 boot stub ends in an
+        // indirect `jr $t2` to the resident C entry; Phase 6's bounded HI/LO
+        // resolver ([`build_cfg_closed`]) now recovers that target
+        // mechanically, so the `main_entry_vram` this gate previously
+        // hand-seeded is no longer a pipeline input. Overlay banks have no
+        // proven candidate root yet (Phase 3 unimplemented) -- an honest
+        // empty seed still produces a valid (possibly empty) CFG.
+        let seed: Vec<u32> = if bank == banks::BOOT_BANK {
+            vec![rom.header.entry_point]
         } else {
-            // No proven candidate roots for overlay banks yet (Phase 3 is
-            // not implemented) -- an honest empty root set still produces
-            // a valid (empty) CFG rather than a fabricated one.
             vec![]
         };
-        let cfg = build_cfg(bank, bank_bytes, *va_start, &roots);
+        let (cfg, resolved) = build_cfg_closed(bank, bank_bytes, *va_start, &seed);
+        if bank == banks::BOOT_BANK {
+            // Prove the mechanical resolution reproduced the hand-verified
+            // resident entry address (grading assertion, not a seed).
+            let recovered_entry = resolved.iter().any(|r| r.target == NW4E_MAIN_ENTRY_VRAM);
+            println!(
+                "  resident boot stub: Phase 6 resolved {} target(s); main entry 0x{NW4E_MAIN_ENTRY_VRAM:x} recovered mechanically: {recovered_entry}",
+                resolved.len()
+            );
+            if !recovered_entry {
+                return Err(format!(
+                    "Phase 6 failed to mechanically recover the resident entry 0x{NW4E_MAIN_ENTRY_VRAM:x} (resolved: {resolved:?})"
+                ));
+            }
+        }
         let part = partition(&cfg);
         let overlaps = same_bank_overlaps(&part, &cfg);
         total_overlaps += overlaps.len();
