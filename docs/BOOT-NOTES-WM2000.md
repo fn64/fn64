@@ -41,7 +41,7 @@ Because r2 is left stale (whatever value it held from an EARLIER computation
 in the caller, non-zero per the observed hang), `func_80000660`'s loop
 condition `v0 != 0` is always true -> infinite reissue of the same DMA chunk,
 never reaching `osRecvMesg`. This matches DESIGN.md's "tens of seconds, no
-crash, no log output" symptom exactly (a real unbounded native loop, not a
+crash, no log output" symptom exactly (a real unbounded recompiled loop, not a
 missing model).
 
 FIX: change `osEPiStartDma_recomp`'s ctx binding to `&mut`, set `ctx.r2 = 0`

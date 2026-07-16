@@ -19,7 +19,7 @@ at) — not a tracker label. Updated 2026-07-16.
 ### Boot & runtime
 - 14+ boot-ladder rungs cleared; OoT reaches real game logic (~8 frames deep,
   4,200+ VI swaps, file-select/new-file creation and controllable gameplay
-  reachable in the native-Rust lane).
+  reachable in the rs lane).
 - Clean-room libultra shim layer (public headers/manuals only), DMA
   word-swizzle, OSTask dispatch, thread/queue model.
 - Windowed harness (`fn64-shell`, winit+pixels+cpal): live framebuffer per
@@ -27,14 +27,14 @@ at) — not a tracker label. Updated 2026-07-16.
 - Fast loop: `--release` + `OOT_MAX_SWAPS` early-exit (~250x), `./oot` runner,
   observability flags (`OOT_RENDER_STATS`, `OOT_DUMP_PROJ`, `OOT_NO_DEPTH`,
   `OOT_AUDIO_UCODE_TIMING`, `OOT_SKIP_AUDIO_UCODE`, `OOT_STOP_ON_FRAME`).
-- Native real-time profiling: `OOT_PERF_NO_CAPTURE=1` removes only the
+- Rs-lane real-time profiling: `OOT_PERF_NO_CAPTURE=1` removes only the
   harness's per-swap diagnostic PNG work, while `OOT_PHASE_TIMING=1`
   attributes wall time to the executor, software renderer, and audio dispatch.
   Differential tracing is opt-in with `OOT_TRACE=1` (and remains crash-safe,
   flushing every event); `./oot trace` enables it automatically. Normal runs
   do not synchronously format, write, and flush every executor event.
 
-### Native gameplay wall time (2026-07-16, Apple Silicon macOS)
+### Rs-lane gameplay wall time (2026-07-16, Apple Silicon macOS)
 
 Release-mode samples over controllable gameplay swaps 4200--4300, using the
 scripted input preset and `OOT_PERF_NO_CAPTURE=1`, measured 3.332 ms minimum,
@@ -52,7 +52,7 @@ Coarse post-change attribution through swap 4300 was 11,298.579 ms in the
 plus executor overhead. A post-change sample attributed approximately 35.8%
 of samples to the renderer (24.1% in rasterization), with guest gameplay code,
 especially collision queries, the largest remaining sink. That historical
-measurement predated the native manifest's translated-audio integration and
+measurement predated the rs manifest's translated-audio integration and
 used `OOT_SKIP_AUDIO_UCODE=1`.
 
 After merging the perf work with live audio, the same skip-audio performance
@@ -65,17 +65,17 @@ range `-29,727..=29,376`. Audio ucode accounted for 5,288.28 ms total, or
 0.454 ms per task. Both configurations remain comfortably inside the NTSC
 16.7 ms VI budget.
 
-The behavior guard compared independently built native and C lanes at swap
+The behavior guard compared independently built rs and C lanes at swap
 499. Both framebuffer PNGs had SHA-256
 `bc19787324497d71c622c2bfd450dc9f2063cb4feb875c576b4c6c34236ec1db` and
 were byte-identical.
 
 ### Recompilers (both from-scratch, typed Rust, no external tool, no GPL)
-- **CPU** `fn64-recomp-native`: MIPS III + COP1/FPU + 64-bit dword + COP0 +
+- **CPU** `fn64-recomp-rs`: MIPS III + COP1/FPU + 64-bit dword + COP0 +
   ELF/symbol front-end. Oracle-validated (differential vs N64Recomp C).
 - **CPU whole-ROM link gate:** OoT emits as one typed-Rust module with 13,190
-  native functions, a sorted safe `vram -> fn` table, and 43 trap bodies held
-  behind a host resolver. A clean out-of-tree build links and calls the native
+  recompiled functions, a sorted safe `vram -> fn` table, and 43 trap bodies held
+  behind a host resolver. A clean out-of-tree build links and calls the recompiled
   entrypoint with no unresolved game/project symbol. The dispatcher ABI shape
   follows the MIT N64Recomp `LOOKUP_FUNC`/`get_function` contract
   (`refs/N64RecompSource/include/recomp.h:443-451`).
@@ -96,12 +96,12 @@ were byte-identical.
   KSEG0-mask OSTask reads also fixed. (aki-recomp side committed local-only on
   `fix/rsp-aspmain-base-and-endianness`; needs the fixed `fn64-audio`.)
 
-### Native-Rust deep boot (2026-07-16, `fix/native-boot-deeper`)
+### Rust-recompiled deep boot (2026-07-16, `fix/native-boot-deeper`)
 
 - **Required one-command emission now consumes its sibling profile.** Before
   this fix, invoking `recompile_rom --config games/OOTU/oot.toml ...` without
   a redundant `--profile` emitted only 13,306 clean functions and omitted
-  `AudioHeap_ResetStep` from native dispatch. Boot stopped after 12 swaps at
+  `AudioHeap_ResetStep` from recompiled dispatch. Boot stopped after 12 swaps at
   lookup `0x800B4EB4`. The body is ordinary game code: ROM PCs `0x800B4F60`
   (`018B001A`, `div $zero,$t4,$t3`), `0x800B4F6C` (`15600002`, nonzero-divisor
   guard), and `0x800B4F74` (`0007000D`, guarded `break 7`) implement decomp
@@ -115,7 +115,7 @@ were byte-identical.
   `0x00BCDB70` to the same Kaleido arena `0x80388B60`. Keeping both registry
   entries loaded made runtime player callback `0x8039D788` canonicalize through
   stale pause static base `0x808137C0`, yielding interior pause PC `0x808283E8`
-  instead of `Player_Init` `0x80844DE8`; native stopped after swap 231.
+  instead of `Player_Init` `0x80844DE8`; rs lane stopped after swap 231.
   Resident-ROM PCs `0x80097658`/`0x80097660` contain words
   `3C048084`/`24844DE8`, constructing that static `Player_Init` address, and
   `0x800976E8` contains `0320F809` (`jalr $t9`) to consume its relocated
@@ -130,14 +130,14 @@ were byte-identical.
   stale-two-images behavior.
 - **Verified depth:** 10 consecutive release probes, each with
   `OOT_MAX_SWAPS=250 OOT_SKIP_AUDIO_UCODE=1`, reached 250 VI swaps / 250 gfx
-  tasks and exited 0 with no native execution panic. Swap 250 is a non-uniform
+  tasks and exited 0 with no recompiled execution panic. Swap 250 is a non-uniform
   title-demo/Hyrule Field framebuffer (`/tmp/fn64-deep-frame.png`), though the
   known renderer-state gaps below leave it mostly red with dark geometry. A
   collision-free C-lane probe also reached swap 250, and its swap-250 PNG is
   byte-identical (SHA-256
   `a0b354ea3c7056e90f316bc28f24d2c46761ce248b3279b9be1b6a21c320cc6b`).
 
-### Native-Rust interactive boot (2026-07-16, `fix/native-boot-interactive`)
+### Rust-recompiled interactive boot (2026-07-16, `fix/native-boot-interactive`)
 
 - **The verified controller route is now a harness preset.**
   `OOT_SCRIPT_INTERACTIVE=1` applies `START` at swaps 250/280; `A` at
@@ -145,10 +145,10 @@ were byte-identical.
   released four swaps later. This creates/selects file 0 and enters normal
   Play at swap 568. From swap 620 it holds stick X=60 and taps `A` for two
   swaps every 25 swaps from 700 through 4150 to advance the opening dialogue
-  and cutscenes. The C lane and native lane follow the same title/file-select
+  and cutscenes. The C lane and rs lane follow the same title/file-select
   states through select-mode 1 at swap 499. The configured C oracle stops
   there because `games/OOTU/oot.toml` deliberately stubs
-  `FileSelect_MoveSelectedFileToTop`; the native profile recompiles its real
+  `FileSelect_MoveSelectedFileToTop`; the rs profile recompiles its real
   body (ROM/static vram `0x80810A1C`) and reaches select-mode 2 at swap 500.
   The two swap-499 framebuffer PNGs compare byte-for-byte equal (SHA-256
   `c54906136189fde8b59b853d3b2f74fc75d7f77753c495d7110e9b950bfdd85e`).
@@ -175,7 +175,7 @@ were byte-identical.
   Classification: **overlay-bank mapping**.
 - **Verified depth:** after the overlay fix, 10/10 consecutive clean release
   probes reached swap 1400 (the former failure window). Longer probes reached
-  swap 3000, 4200, and 5200 with no native trap. The opening sequence returns
+  swap 3000, 4200, and 5200 with no recompiled trap. The opening sequence returns
   to Link's House and releases cutscene control at swap 4196. With stick X=60
   already held, Link moves from approximately `(0, 0, 60)` at swap 4195 to
   `(18, 14, 128)` at swap 4212 before meeting the room collision boundary.
@@ -183,13 +183,13 @@ were byte-identical.
   `OOT_RENDER_DUMP_START=N` suppresses early diagnostic PNGs so this late
   gameplay window can be captured without dumping thousands of boot frames.
 
-### Live native-gameplay audio (2026-07-16, `feat/audio-in-gameplay`)
+### Live rs-gameplay audio (2026-07-16, `feat/audio-in-gameplay`)
 
-- **Real tasks flow and run real aspMain.** The native manifest now links the
+- **Real tasks flow and run real aspMain.** The rs manifest now links the
   out-of-tree generated 1,004-instruction OoT aspMain through a build-only
   adapter. The adapter copies the generated module from sibling `aki-recomp`
   into Cargo `OUT_DIR`; no game-derived bytes/code enter this repository. A
-  scripted native run reached controllable gameplay and swap 5,000 with
+  scripted rs run reached controllable gameplay and swap 5,000 with
   13,747 `M_AUDTASK` submissions / 13,747 timed aspMain calls (6,055.76 ms
   total, 0.441 ms/call average).
 - **The live PCM is nonzero and bounded.** Across that run, OoT submitted
@@ -209,14 +209,14 @@ were byte-identical.
   native-word halfwords in guest order and calls `AudioBackend::queue_samples`.
   The exact zero-output-field task followed by a real AI submit is locked by
   `os_ai_set_next_buffer_routes_live_pcm_to_the_registered_audio_backend`.
-- **Verification bar:** 10/10 consecutive native swap-300 probes each reached
+- **Verification bar:** 10/10 consecutive rs-lane swap-300 probes each reached
   300 swaps, ran exactly 200 audio tasks, and produced exactly 541,952 samples
   (175,857 nonzero, range `-23,166..=23,449`). The AI-to-backend regression
   also passed 10/10 consecutive runs.
 - **Physical cpal playback is not verified on this machine.** Both cpal's
   `default_output_config()` and `supported_output_configs()` fail before
   stream creation with CoreAudio OSStatus `0x216F626A` (`!obj`), and every
-  candidate-rate stream attempt fails identically. The native harness and
+  candidate-rate stream attempt fails identically. The rs harness and
   `fn64-shell` register the same `CpalBackend`; when a stream opens, the now-
   verified AI boundary feeds it. In this environment zero live buffers reached
   cpal, so claiming audible device output would be false.
@@ -308,12 +308,12 @@ road, but the top half misprojects).
   OoT modulate, decal/replace, primitive-tint, environment-blend, and
   shade-only source set. TEXEL1 and key/noise/K/LOD sources remain logged
   approximations until multi-tile/TMEM and the matching registers exist.
-- Native-Rust bounded probes use `_exit(0)` after explicitly flushing the
+- Rs-lane bounded probes use `_exit(0)` after explicitly flushing the
   summary/trace. Suspended coroutines can be stopped inside an existing
   `extern "C"` blocking shim, where TLS teardown's forced unwind cannot cross
   the ABI boundary. This is harness teardown only; execution still uses the
   same single executor and host thread.
-- Native-Rust boot now reaches the bounded **250 VI swaps and 250 render tasks**
+- Rs-lane boot now reaches the bounded **250 VI swaps and 250 render tasks**
   in 10/10 consecutive release probes; swap 3 is the first non-uniform guest
   framebuffer. The former `AudioLoad_Dma` unaligned-`SW` frontier was a stale
   host-call return, not an alignment exception or an SWL/SWR decode:
@@ -321,13 +321,13 @@ road, but the top half misprojects).
   `osCartRomInit()` in `gAudioCtx.cartHandle`, but the shim had left `$v0`
   untouched. It now returns OoT's aligned guest `__CartRomHandle` address.
   The first post-fix probe exposed a local `jr` jump-table target inside
-  `AudioSeq_SequenceChannelProcessScript`; native emission now gives every
+  `AudioSeq_SequenceChannelProcessScript`; Rust emission now gives every
   instruction a dispatch arm in functions containing a non-return `jr`.
 
 ---
 
-## ✅ Whole-ROM native recompile + native boot (task #28)
-fn64-recomp-native (from-scratch Rust MIPS→typed-Rust recompiler) can now recompile
+## ✅ Whole-ROM Rust recompile + rs boot (task #28)
+fn64-recomp-rs (from-scratch Rust MIPS→typed-Rust recompiler) can now recompile
 the WHOLE OoT ROM. Driver `recompile_rom` + config loader (`fn64-recomp/src/load.rs`,
 loads all 472 sections / 13,358 fns from oot.toml+dump.toml) landed on
 `feat/native-whole-rom-driver`. Gap report over the full ROM:
@@ -340,11 +340,11 @@ loads all 472 sections / 13,358 fns from oot.toml+dump.toml) landed on
 - **The ONE real link blocker: the `lookup(u32)->fn` indirect dispatcher** (2,078 call
   sites, empirically the ONLY undefined symbol). = N64Recomp's `get_function(vram)`.
   Building it (branch `feat/native-lookup-dispatcher`) is what makes the whole module LINK.
-The native-boot lane selects the emitted `oot-native-funcs` crate with
-`FN64_NATIVE_RECOMP=1` and skips the C compiler/section bridge. The crate owns
+The rs lane selects the emitted `oot-recompiled` crate with
+`FN64_RECOMP=rs` and skips the C compiler/section bridge. The crate owns
 64 balanced generated submodules and is linked as an rlib dependency rather
 than textually `include!`d into the boot executable, so Cargo can cache it
-independently. `fn64-abi::native` explicitly marshals typed
+independently. `fn64-abi::recompiled` explicitly marshals typed
 GPR/HI/LO/COP0 status at the already-unsafe host boundary, while every spawned
 OSThread stays on the existing executor/coroutine machinery and shared RDRAM.
 The crate exports section geometry so the existing DMA-driven
@@ -366,9 +366,9 @@ stubs. The AudioLoad repair is grounded in OoT decomp
 handle, so the host ABI must return the game-linked BSS object rather than an
 opaque token or stale register. Ten consecutive release probes now reach
 swap 250 with exit code 0; swaps 3-250 have non-uniform guest framebuffers. No
-new loud native frontier appeared through that bound. A one-swap differential
+new loud recompiled frontier appeared through that bound. A one-swap differential
 against the C lane had the same 550 event shapes; the raw trace first differs
-at event 294 only in `sim_time` (0 versus 100), where the native harness
+at event 294 only in `sim_time` (0 versus 100), where the rs harness
 injects its documented idle-loop clock pacing.
 
 ## 🔲 Beyond OoT (deferred until it renders faithfully)

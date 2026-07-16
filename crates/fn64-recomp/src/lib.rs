@@ -23,7 +23,7 @@
 //! `aki_profile` (Python, `aki-recomp/tools/aki_profile`) keeps owning the
 //! real WM2000/NW4E recompile loop today; this crate is the future home
 //! that pipeline's shell-out logic moves behind, and the eventual swap
-//! point for a from-scratch `fn64-recomp-native` implementing the same
+//! point for a from-scratch `fn64-recomp-rs` implementing the same
 //! trait (`docs/DECOUPLING.md` step 5). No full-ROM recompile is attempted
 //! here — see `n64recomp`'s golden serialization test for what IS proven:
 //! a known `RecompConfig`/`RspConfig` round-trips to the exact TOML shape

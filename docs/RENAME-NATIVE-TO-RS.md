@@ -49,11 +49,32 @@ real axis is host-vs-recompiled. -> `call_host_or_recompiled`,
 `NativeBackend` (the FUTURE pure-Rust renderer) -> `WgpuBackend` (it will be
 wgpu-based). Not yet built, so this is just fixing the plan docs.
 
-## Execution
-1. `git mv` the crate dirs; update workspace members + all path deps.
-2. Per-sense sed of the EXACT tokens above (never bare `native`), file-by-file.
-3. Rename env vars in the `oot` runner, build.rs, native manifest, docs.
-4. Gate: `cargo nextest run --workspace` green + `cargo build --workspace` +
-   a C-lane + rs-lane smoke boot. Rename is behavior-preserving; any test
-   change = a missed reference.
-Do it as ONE reviewable mechanical pass; the `-rs` convention makes it durable.
+## Execution — completed 2026-07-16
+
+- [x] Moved the recompiler crate to `fn64-recomp-rs`; updated the workspace,
+  lockfiles, every fn64 path dependency, generated-manifest output, tests, and
+  docs. No `aki-recomp` path or source was changed.
+- [x] Applied the Sense A/B/D map file-by-file. The same semantic pass renamed
+  the ABI adapter module to `recompiled`, its Cargo feature to `recomp-rs`, the
+  standalone OoT manifest directory/package to `rs`/`oot-boot-rs`, and the
+  future renderer plan to `fn64-render-wgpu`/`WgpuBackend`.
+- [x] Replaced the boolean selector with `FN64_RECOMP=rs|c`; unset defaults to
+  `c`, and every other value fails loudly. Renamed the emitted-crate directory
+  and profile variables to `RECOMP_RS_DIR` and `RECOMP_RS_PROFILE`.
+- [x] Preserved Sense C. Final `git grep -i native` census: 183 lines total —
+  104 byte-order/data-format uses, 32 host-platform/runtime uses, 31 entries in
+  this old-to-new plan, 12 immutable historical/script names, and 4 ordinary
+  English words containing the substring (`alternative(s)`/`natively`). No
+  stale Sense A/B/D exact token remains outside this plan.
+- [x] Gates: workspace build succeeded; clippy succeeded with `-D warnings`;
+  nextest passed 591/591 (6 skipped); C-lane and rs-lane release manifests both
+  built successfully. Cargo still prints the pre-existing fn64-shell no-game
+  build-script warning and the `block 0.1.6` future-incompatibility notice; no
+  Rust compiler warning was emitted.
+
+Smoke-command deviation: `scripts/native-emit.sh` still assumes its driver is
+under the repository-local `target/`, so running the helper itself with
+`CARGO_TARGET_DIR=/tmp/fn64-shared-target` cannot find the driver. Preserving
+the pure-rename boundary, the emit ran with that variable unset; the C/rs lane
+builds used `/tmp/fn64-shared-target` as requested. The helper behavior was not
+changed.
