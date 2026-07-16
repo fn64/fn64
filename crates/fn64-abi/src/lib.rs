@@ -88,7 +88,7 @@
 use std::cell::{Cell, RefCell};
 
 use corosensei::Yielder;
-use fn64_audio::{AudioBackend, AudioError};
+use fn64_audio::AudioBackend;
 use fn64_render::RenderBackend;
 use fn64_runtime::{
     DmaDirection, Executor, ExternalEvent, InMemoryRom, Mesg, OsTaskHeader, PiDma, Priority,
@@ -1595,7 +1595,8 @@ pub unsafe extern "C" fn osInitialize_recomp(_rdram: *mut u8, _ctx: *mut RecompC
 /// `osAiSetFrequency(u32 frequency) -> s32` -- configures the audio DAC
 /// sample rate and returns the TRUE playback rate, or -1 if the frequency is
 /// unusable (`dacRate < AI_MIN_DAC_RATE`). No audio backend exists yet, so the
-/// frequency is stored as host state, but the s32 return is load-bearing: the
+/// frequency is stored as host state, while the host output stream is opened
+/// by its shell/harness at startup. The s32 return is load-bearing: the
 /// only decomp caller (heap.c:966) assigns it to `aiSamplingFrequency` and
 /// then DIVIDES by it (heap.c:1002), so a stale/zero $v0 divides by garbage.
 ///
@@ -1685,24 +1686,146 @@ pub unsafe extern "C" fn osAiGetLength_recomp(_rdram: *mut u8, ctx: *mut RecompC
 }
 
 /// `osAiSetNextBuffer(void *buf, u32 size) -> s32` -- `buf`=`ctx->r4` (an
-/// rdram-relative vram pointer to the audio sample buffer), `size`=`ctx->r5`
-/// (bytes). Real hardware effect: latches the DMA source/length and starts
-/// the transfer; per the public libultra manual, returns 0 on success or
+/// rdram-relative vram pointer to the finished interleaved stereo PCM),
+/// `size`=`ctx->r5` (bytes). Real hardware effect: latches the DMA
+/// source/length and starts the transfer; per the public libultra manual,
+/// returns 0 on success or
 /// a negative error code if a DMA is already in progress and the queue is
 /// full. This crate's DMA is synchronous-modeled (see `AiRegs::set_next_buffer`'s
 /// doc comment: "DMA proceeds" stance, same as `rom.rs`'s PI DMA), so this
 /// always succeeds (returns 0) -- no evidence yet of a call site needing the
 /// error path.
 ///
+/// This is also the one correct host-output boundary. A live OoT `M_AUDTASK`
+/// has `OSTask.output_buff == 0`/`output_buff_size == 0`; its `A_SAVEBUFF`
+/// commands write PCM to buffers selected inside the command list, and the CPU
+/// later names the completed buffer here. Routing `OSTask.output_buff` from the
+/// RSP dispatch therefore queued zero samples forever. Delivering this exact
+/// AI DMA range to `AudioBackend` follows the public AI contract and covers
+/// every producer without parsing game-specific audio commands.
+///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn osAiSetNextBuffer_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+pub unsafe extern "C" fn osAiSetNextBuffer_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     let buf_addr = RdramAddr::from_gpr(ctx.r4).offset();
     let size = ctx.r5 as u32;
     MMIO.with(|cell| cell.borrow_mut().ai.set_next_buffer(buf_addr, size));
+    // Host audio is optional. Once a shell/harness registers a bound, every
+    // submitted AI range must satisfy it loudly; an unset bound means no host
+    // consumer was requested, not that a malformed configured range is okay.
+    if AUDIO_RDRAM_LEN.with(Cell::get) != 0 {
+        unsafe { deliver_ai_buffer(rdram, buf_addr as usize, size as usize) };
+    }
     ctx.r2 = 0;
+}
+
+/// Decode fn64's native-word RDRAM representation in guest halfword order and
+/// deliver one real AI DMA buffer to the registered backend.
+///
+/// # Safety
+///
+/// `rdram` must be valid for the length registered through
+/// [`set_audio_rdram_len`].
+unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: usize) {
+    let rdram_len = AUDIO_RDRAM_LEN.with(Cell::get);
+    let end = start.checked_add(byte_len);
+    assert!(
+        !rdram.is_null()
+            && rdram_len.is_multiple_of(4)
+            && end.is_some_and(|end| end <= rdram_len)
+            && start.is_multiple_of(2)
+            && byte_len.is_multiple_of(2),
+        "osAiSetNextBuffer: invalid AI PCM range start={start:#x} bytes={byte_len:#x} rdram_len={rdram_len:#x}"
+    );
+
+    // `MEM_H(addr)` reads a native-endian halfword at `(addr ^ 2)`. Apply
+    // that exact byte-lane rule per sample so stereo order is preserved; a
+    // flat chunks_exact(2) walk swaps every adjacent L/R pair in fn64's
+    // native-word backing representation.
+    let bytes = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
+    let samples: Vec<i16> = (0..byte_len)
+        .step_by(2)
+        .map(|guest_offset| {
+            let physical = (start + guest_offset) ^ 2;
+            i16::from_ne_bytes([bytes[physical], bytes[physical + 1]])
+        })
+        .collect();
+
+    let nonzero = samples.iter().filter(|&&sample| sample != 0).count() as u64;
+    let buffer_min = samples.iter().copied().min();
+    let buffer_max = samples.iter().copied().max();
+    AUDIO_OUTPUT_STATS.with(|cell| {
+        let mut stats = cell.get();
+        stats.ai_buffers += 1;
+        stats.samples += samples.len() as u64;
+        stats.nonzero_samples += nonzero;
+        stats.min = match (stats.min, buffer_min) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (None, value) | (value, None) => value,
+        };
+        stats.max = match (stats.max, buffer_max) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (None, value) | (value, None) => value,
+        };
+        cell.set(stats);
+    });
+
+    // One-shot evidence hook: write the first non-silent live AI buffer as
+    // signed 16-bit little-endian PCM, plus self-describing metadata. Waiting
+    // for nonzero avoids capturing an expected startup-silence buffer and
+    // falsely concluding the synth stayed silent.
+    if nonzero != 0 {
+        if let Some(path) = std::env::var_os("OOT_DUMP_AUDIO_PCM") {
+            AUDIO_PCM_DUMPED.with(|dumped| {
+                if !dumped.get() {
+                    let pcm: Vec<u8> = samples
+                        .iter()
+                        .flat_map(|sample| sample.to_le_bytes())
+                        .collect();
+                    let path = std::path::Path::new(&path);
+                    match std::fs::write(path, pcm) {
+                        Ok(()) => {
+                            let meta = format!(
+                                "format=s16le\nchannels=2\nsamples={}\nframes={}\nrange={}..={}\nnonzero_samples={}\nrdram_offset={start}\n",
+                                samples.len(),
+                                samples.len() / 2,
+                                buffer_min.unwrap_or(0),
+                                buffer_max.unwrap_or(0),
+                                nonzero,
+                            );
+                            if let Err(error) = std::fs::write(path.with_extension("meta"), meta) {
+                                eprintln!("[fn64-abi] failed to write PCM metadata: {error}");
+                            }
+                            eprintln!(
+                                "[fn64-abi] dumped live AI PCM: {} samples, range {}..={} to {path:?}",
+                                samples.len(),
+                                buffer_min.unwrap_or(0),
+                                buffer_max.unwrap_or(0),
+                            );
+                            dumped.set(true);
+                        }
+                        Err(error) => eprintln!("[fn64-abi] failed to dump live AI PCM: {error}"),
+                    }
+                }
+            });
+        }
+    }
+
+    AUDIO_BACKEND.with(|cell| {
+        if let Some(backend) = cell.borrow_mut().as_mut() {
+            let result = backend.queue_samples(&samples);
+            if result.is_ok() {
+                AUDIO_OUTPUT_STATS.with(|cell| {
+                    let mut stats = cell.get();
+                    stats.backend_buffers += 1;
+                    cell.set(stats);
+                });
+            }
+            AUDIO_LAST_ERROR.with(|cell| cell.replace(result.err().map(|error| error.to_string())));
+        }
+    });
 }
 
 // ---------------------------------------------------------------------
@@ -1942,9 +2065,10 @@ unsafe fn dispatch_gfx_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
 ///     act is `lw 0x18(0xFC0)` = read `ucode_data`). No ucode registered -> the
 ///     task is still counted by the caller's `submit_task`, honestly reflecting
 ///     "submitted but this process never ran its ucode."
-///  2. Forward the ucode's AI output buffer (`output_buff`/`output_buff_size`)
-///     to the registered `dyn AudioBackend` (`set_audio_backend`) as interleaved
-///     i16 PCM. No backend -> no fabricated playback.
+///  2. Sample delivery happens later at `osAiSetNextBuffer_recomp`, the public
+///     AI DMA boundary where the CPU names the actual finished PCM range. It
+///     cannot happen here: OoT's live task has zero `OSTask.output_buff`
+///     fields and selects output destinations through `A_SAVEBUFF` commands.
 ///
 /// Extracted so BOTH submission paths dispatch it, exactly like
 /// `dispatch_gfx_task`: `osSpTaskStartGo_recomp` (the Load+StartGo path OoT's
@@ -1956,7 +2080,7 @@ unsafe fn dispatch_gfx_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
 ///
 /// # Safety
 /// `rdram` valid for the call; `o` a valid task-header offset within it.
-unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
+unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize) {
     // Debug/perf escape hatch: `OOT_SKIP_AUDIO_UCODE` skips running the
     // recompiled audio ucode (the per-frame RSP synth, currently unoptimized
     // and the dominant per-swap cost). The CPU-side audio driver
@@ -1974,6 +2098,12 @@ unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
                 if rdram_len == 0 {
                     rdram_len = RDRAM_LEN.with(|cell| cell.get());
                 }
+                // The harness allocation includes a sparse KSEG1/MMIO mirror
+                // hundreds of MiB above physical RDRAM. Audio ucode masks DMA
+                // addresses to the N64's physical RDRAM window, so replay only
+                // needs the real 8 MiB image; dumping the whole host mapping
+                // made one diagnostic task capture 656 MiB.
+                rdram_len = rdram_len.min(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE);
                 if rdram_len > 0 {
                     let bytes = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
                     let p = std::path::Path::new(&path);
@@ -2011,30 +2141,6 @@ unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
             }
         });
     }
-    AUDIO_BACKEND.with(|cell| {
-        if let Some(backend) = cell.borrow_mut().as_mut() {
-            let rdram_len = AUDIO_RDRAM_LEN.with(|cell| cell.get());
-            let render_end = unsafe { read_output_buff_size(rdram, o) };
-            let start = header.output_buff as usize;
-            let end = start + render_end as usize;
-            let result = if rdram_len == 0 || end > rdram_len || !start.is_multiple_of(2) {
-                // No rdram length registered yet, or the task's declared
-                // buffer doesn't fit -- named "not ready" rather than an
-                // out-of-bounds read or a silent skip.
-                Err(AudioError::NotReady(
-                    "audio output buffer bounds unavailable or misaligned",
-                ))
-            } else {
-                let bytes = unsafe { std::slice::from_raw_parts(rdram.add(start), end - start) };
-                let samples: Vec<i16> = bytes
-                    .chunks_exact(2)
-                    .map(|c| i16::from_ne_bytes([c[0], c[1]]))
-                    .collect();
-                backend.queue_samples(&samples)
-            };
-            AUDIO_LAST_ERROR.with(|cell| cell.replace(result.err().map(|e| e.to_string())));
-        }
-    });
 }
 
 /// # Safety
@@ -2047,7 +2153,7 @@ pub unsafe extern "C" fn osSpTaskYielded_recomp(rdram: *mut u8, ctx: *mut Recomp
     let header = unsafe { read_os_task_header(rdram, o) };
 
     if header.task_type == M_AUDTASK {
-        unsafe { dispatch_audio_task(rdram, o, &header) };
+        unsafe { dispatch_audio_task(rdram, o) };
     } else if header.task_type == M_GFXTASK {
         unsafe { dispatch_gfx_task(rdram, o, &header) };
     }
@@ -2103,9 +2209,9 @@ thread_local! {
     /// MIPS-side fault instead).
     static RENDER_LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
 
-    /// The single registered audio backend, if the shell/harness has
-    /// called `set_audio_backend`. Mirrors `RENDER_BACKEND` exactly --
-    /// see `AUDIO_BACKEND_NOTE` at its dispatch call site.
+    /// The single registered audio backend, if the shell/harness has called
+    /// `set_audio_backend`. Finished samples enter it at
+    /// `osAiSetNextBuffer_recomp`, the real AI DMA boundary.
     static AUDIO_BACKEND: RefCell<Option<Box<dyn AudioBackend>>> = const { RefCell::new(None) };
     /// The rdram buffer length the registered audio backend should treat
     /// as valid, set once by `set_audio_backend`'s caller. Mirrors
@@ -2123,6 +2229,36 @@ thread_local! {
     static AUDIO_UCODE_NS: Cell<u64> = const { Cell::new(0) };
     static AUDIO_UCODE_CALLS: Cell<u64> = const { Cell::new(0) };
     static AUDIO_TASK_DUMPED: Cell<bool> = const { Cell::new(false) };
+    static AUDIO_PCM_DUMPED: Cell<bool> = const { Cell::new(false) };
+    static AUDIO_OUTPUT_STATS: Cell<AudioOutputStats> = const { Cell::new(AudioOutputStats::new()) };
+}
+
+/// Aggregate evidence from real `osAiSetNextBuffer` submissions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioOutputStats {
+    pub ai_buffers: u64,
+    pub backend_buffers: u64,
+    pub samples: u64,
+    pub nonzero_samples: u64,
+    pub min: Option<i16>,
+    pub max: Option<i16>,
+}
+
+impl AudioOutputStats {
+    const fn new() -> Self {
+        Self {
+            ai_buffers: 0,
+            backend_buffers: 0,
+            samples: 0,
+            nonzero_samples: 0,
+            min: None,
+            max: None,
+        }
+    }
+}
+
+pub fn audio_output_stats() -> AudioOutputStats {
+    AUDIO_OUTPUT_STATS.with(Cell::get)
 }
 
 /// Total accumulated recompiled-audio-ucode time (ns) and call count since
@@ -2134,20 +2270,23 @@ pub fn audio_ucode_timing() -> (u64, u64) {
     )
 }
 
-/// Register the audio backend `osSpTaskYielded_recomp` dispatches
-/// `M_AUDTASK` sample-delivery through, and the rdram buffer length it may
-/// safely read. Mirrors `set_render_backend`'s shape exactly -- see
-/// `AUDIO_BACKEND_NOTE` at the dispatch call site for what half of the
-/// audio path this covers (sample delivery, not ucode execution).
+/// Register the audio backend `osAiSetNextBuffer_recomp` delivers finished AI
+/// PCM through, and the rdram buffer length it may safely read. This covers
+/// sample delivery, not ucode execution.
 pub fn set_audio_backend(backend: Box<dyn AudioBackend>, rdram_len: usize) {
     AUDIO_BACKEND.with(|cell| cell.replace(Some(backend)));
+    set_audio_rdram_len(rdram_len);
+}
+
+/// Register the shared RDRAM bound for AI-buffer validation and live PCM
+/// evidence even when no host output device is available.
+pub fn set_audio_rdram_len(rdram_len: usize) {
     AUDIO_RDRAM_LEN.with(|cell| cell.set(rdram_len));
 }
 
-/// The most recent registered audio backend's `queue_samples` error, if
-/// the last `M_AUDTASK` sample-delivery dispatch failed. `None` if no
-/// audio task has run yet, the last one succeeded, or no backend is
-/// registered at all. Mirrors `last_render_error`.
+/// The most recent registered audio backend's `queue_samples` error from an AI
+/// buffer submission. `None` if no AI buffer has been delivered yet, the last
+/// one succeeded, or no backend is registered. Mirrors `last_render_error`.
 pub fn last_audio_error() -> Option<String> {
     AUDIO_LAST_ERROR.with(|cell| cell.borrow().clone())
 }
@@ -3486,7 +3625,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     if is_gfx {
         unsafe { dispatch_gfx_task(rdram, o, &header) };
     } else if header.task_type == M_AUDTASK {
-        unsafe { dispatch_audio_task(rdram, o, &header) };
+        unsafe { dispatch_audio_task(rdram, o) };
     }
 
     with_executor(|exec| {
@@ -5194,10 +5333,15 @@ mod tests {
         );
     }
 
+    /// Fail-against-bug: OoT's live audio OSTask has zero
+    /// `output_buff`/`output_buff_size`; aspMain's `A_SAVEBUFF` commands choose
+    /// the PCM destinations, and the CPU later submits the completed range to
+    /// AI through `osAiSetNextBuffer`. Routing the OSTask fields queued an
+    /// empty slice forever. This exact zero-field task shape must not reach the
+    /// backend, while the subsequent AI DMA must preserve sample/channel order.
     #[test]
-    fn os_sp_task_yielded_routes_m_audtask_to_the_registered_audio_backend() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::Arc;
+    fn os_ai_set_next_buffer_routes_live_pcm_to_the_registered_audio_backend() {
+        use std::sync::{Arc, Mutex};
 
         /// A cpal-less fake `AudioBackend` -- proves the seam really
         /// reaches a registered `dyn AudioBackend` (not just that
@@ -5207,23 +5351,33 @@ mod tests {
         /// a real audio device isn't guaranteed in a test/CI sandbox.
         struct CountingBackend {
             ready: bool,
-            frames_seen: Arc<AtomicU32>,
+            samples_seen: Arc<Mutex<Vec<i16>>>,
         }
         impl AudioBackend for CountingBackend {
-            fn create(&mut self, _cfg: &fn64_audio::AudioConfig) -> Result<(), AudioError> {
+            fn create(
+                &mut self,
+                _cfg: &fn64_audio::AudioConfig,
+            ) -> Result<(), fn64_audio::AudioError> {
                 self.ready = true;
                 Ok(())
             }
-            fn queue_samples(&mut self, samples: &[i16]) -> Result<(), AudioError> {
+            fn queue_samples(&mut self, samples: &[i16]) -> Result<(), fn64_audio::AudioError> {
                 if !self.ready {
-                    return Err(AudioError::NotReady("create() not called"));
+                    return Err(fn64_audio::AudioError::NotReady("create() not called"));
                 }
-                self.frames_seen
-                    .fetch_add(samples.len() as u32 / 2, Ordering::SeqCst);
+                self.samples_seen
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .extend_from_slice(samples);
                 Ok(())
             }
-            fn frames_remaining(&self) -> Result<u32, AudioError> {
-                Ok(self.frames_seen.load(Ordering::SeqCst))
+            fn frames_remaining(&self) -> Result<u32, fn64_audio::AudioError> {
+                Ok((self
+                    .samples_seen
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .len()
+                    / 2) as u32)
             }
             fn set_frequency(&mut self, _sample_rate_hz: u32) {}
         }
@@ -5232,17 +5386,19 @@ mod tests {
         let mut rdram = vec![0u8; RDRAM_LEN];
         const HEADER_OFF: usize = 0x40;
         const AI_BUF_OFF: usize = 0x800; // arbitrary in-bounds output buffer
-        const AI_BUF_FRAMES: u32 = 8; // 8 stereo frames = 16 i16 samples = 32 bytes
+        const EXPECTED: [i16; 8] = [-1000, 1000, -500, 500, -250, 250, -125, 125];
         rdram[HEADER_OFF..HEADER_OFF + 4].copy_from_slice(&fn64_runtime::M_AUDTASK.to_ne_bytes());
-        rdram[HEADER_OFF + 0x28..HEADER_OFF + 0x2C]
-            .copy_from_slice(&(AI_BUF_OFF as u32).to_ne_bytes()); // output_buff
-        rdram[HEADER_OFF + 0x2C..HEADER_OFF + 0x30]
-            .copy_from_slice(&(AI_BUF_FRAMES * 2 * 2).to_ne_bytes()); // output_buff_size (bytes, 2 channels * 2 bytes/sample)
+        // output_buff/output_buff_size remain zero, matching the captured live
+        // task at rdram+0x120c90. Seed PCM in fn64's native-word backing order.
+        for (index, sample) in EXPECTED.iter().enumerate() {
+            let physical = (AI_BUF_OFF + index * 2) ^ 2;
+            rdram[physical..physical + 2].copy_from_slice(&sample.to_ne_bytes());
+        }
 
-        let frames_seen = Arc::new(AtomicU32::new(0));
+        let samples_seen = Arc::new(Mutex::new(Vec::new()));
         let mut backend = CountingBackend {
             ready: false,
-            frames_seen: Arc::clone(&frames_seen),
+            samples_seen: Arc::clone(&samples_seen),
         };
         backend
             .create(&fn64_audio::AudioConfig::new(32000, 2))
@@ -5253,22 +5409,37 @@ mod tests {
         ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
+        assert!(
+            samples_seen.lock().unwrap().is_empty(),
+            "zero-sized OSTask output fields are not the AI PCM boundary"
+        );
+
+        AUDIO_OUTPUT_STATS.with(|cell| cell.set(AudioOutputStats::new()));
+        let mut ai_ctx = ctx_zeroed();
+        ai_ctx.r4 = 0x8000_0000 + AI_BUF_OFF as u64;
+        ai_ctx.r5 = (EXPECTED.len() * 2) as u64;
+        unsafe { osAiSetNextBuffer_recomp(rdram.as_mut_ptr(), &mut ai_ctx as *mut _) };
+
         assert_eq!(
-            ctx.r2, 0,
-            "task reported complete (0), not OS_TASK_YIELDED (1)"
+            *samples_seen.lock().unwrap(),
+            EXPECTED,
+            "AI delivery must preserve the guest's interleaved sample order"
         );
         assert_eq!(
             last_audio_error(),
             None,
-            "the real backend must not report an error for a valid fixture -- rules out \
-             NotReady, i.e. the seam-routed call really reached queue_samples and it really \
-             succeeded"
+            "the registered backend accepted the real AI range"
         );
         assert_eq!(
-            frames_seen.load(Ordering::SeqCst),
-            AI_BUF_FRAMES,
-            "queue_samples must really have been called with the task's declared AI buffer, \
-             not skipped"
+            audio_output_stats(),
+            AudioOutputStats {
+                ai_buffers: 1,
+                backend_buffers: 1,
+                samples: EXPECTED.len() as u64,
+                nonzero_samples: EXPECTED.len() as u64,
+                min: Some(-1000),
+                max: Some(1000),
+            }
         );
     }
 

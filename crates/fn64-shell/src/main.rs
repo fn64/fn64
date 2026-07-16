@@ -13,11 +13,9 @@
 //!    `fn64_abi::set_controller_state(0, ..)` so the game's next
 //!    `osContGetReadData` sees it.
 //! 3. **Wires audio output**: registers `fn64_audio::CpalBackend` via
-//!    `fn64_abi::set_audio_backend`, so M_AUDTASK-produced samples reach a
-//!    live cpal output stream. (The audio SYNTH -- the recompiled ucode that
-//!    produces those samples -- is optional, behind the `oot-audio-ucode`
-//!    feature; the perf agent owns making it real-time. Default is silent
-//!    output, path fully wired.)
+//!    `fn64_abi::set_audio_backend`, so `osAiSetNextBuffer`'s finished PCM
+//!    reaches a live cpal output stream. The linked game/harness separately
+//!    registers the recompiled ucode that produces those samples.
 //!
 //! ## Game intake (same contract as oot-boot)
 //!
@@ -247,8 +245,8 @@ mod game {
             println!("[fn64-shell] render backend registered (ReferenceBackend, F3DEX2, 320x240)");
 
             // Audio OUTPUT path: a live cpal output stream. This is the
-            // shell's audio deliverable -- samples produced by M_AUDTASK
-            // dispatch flow here. Gated so a headless/CI env with no audio
+            // shell's audio deliverable -- samples produced by M_AUDTASK and
+            // submitted through osAiSetNextBuffer flow here. Gated so a headless/CI env with no audio
             // device doesn't abort; a create() failure is logged, not fatal.
             wire_audio(rdram.len());
 
@@ -388,13 +386,15 @@ mod game {
             // `Arc<Window>` is `'static + HasWindowHandle`, so the resulting
             // Pixels is `Pixels<'static>` and can be stored alongside the
             // window in `Shell` without a self-referential borrow.
-            let surface =
-                SurfaceTexture::new(win_size.width, win_size.height, Arc::clone(&window));
+            let surface = SurfaceTexture::new(win_size.width, win_size.height, Arc::clone(&window));
             match Pixels::new(FB_WIDTH as u32, FB_HEIGHT as u32, surface) {
                 Ok(px) => {
                     self.pixels = Some(px);
                     self.window = Some(window);
-                    println!("[fn64-shell] window opened ({}x{})", win_size.width, win_size.height);
+                    println!(
+                        "[fn64-shell] window opened ({}x{})",
+                        win_size.width, win_size.height
+                    );
                 }
                 Err(e) => {
                     eprintln!("[fn64-shell] failed to create pixels surface: {e}");
@@ -418,7 +418,8 @@ mod game {
                     if let Some(px) = self.pixels.as_mut() {
                         // Keep the game's 320x240 aspect; pixels letterboxes
                         // the surface to the window automatically.
-                        if let Err(e) = px.resize_surface(new_size.width.max(1), new_size.height.max(1))
+                        if let Err(e) =
+                            px.resize_surface(new_size.width.max(1), new_size.height.max(1))
                         {
                             eprintln!("[fn64-shell] resize_surface failed: {e}");
                         }

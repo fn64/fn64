@@ -2,7 +2,7 @@
 
 OoT (NTSC 1.0) is fn64's correctness oracle. This is the durable status map.
 Every "done" here is verified (byte-exact test, or an actual frame/PCM looked
-at) — not a tracker label. Updated 2026-07-15.
+at) — not a tracker label. Updated 2026-07-16.
 
 ## Verification contract (do not weaken)
 - **Data** (ROM/savestate → verts/faces/matrices/PCM): byte/index-exact tests
@@ -140,6 +140,44 @@ at) — not a tracker label. Updated 2026-07-15.
   This is a live, controllable `PlayState`, not merely a surviving cutscene.
   `OOT_RENDER_DUMP_START=N` suppresses early diagnostic PNGs so this late
   gameplay window can be captured without dumping thousands of boot frames.
+
+### Live native-gameplay audio (2026-07-16, `feat/audio-in-gameplay`)
+
+- **Real tasks flow and run real aspMain.** The native manifest now links the
+  out-of-tree generated 1,004-instruction OoT aspMain through a build-only
+  adapter. The adapter copies the generated module from sibling `aki-recomp`
+  into Cargo `OUT_DIR`; no game-derived bytes/code enter this repository. A
+  scripted native run reached controllable gameplay and swap 5,000 with
+  13,747 `M_AUDTASK` submissions / 13,747 timed aspMain calls (6,055.76 ms
+  total, 0.441 ms/call average).
+- **The live PCM is nonzero and bounded.** Across that run, OoT submitted
+  14,006 AI buffers containing 17,480,448 signed samples; 14,728,612 were
+  nonzero and the aggregate range was `-29,727..=29,376`. The first non-silent
+  `OOT_DUMP_AUDIO_PCM` capture is 1,248 samples / 624 stereo frames, 1,224
+  nonzero, range `-10,985..=11,035`, RMS 4,870.53. It is plausible waveform
+  data, not all-zero output or full-scale garbage.
+- **The former output route was byte-disproved and fixed at the AI boundary.**
+  The first captured live task is at RDRAM offset `0x120C90`: native-endian
+  words show `type=2`, `output_buff=0`, `output_buff_size=0`,
+  `data_ptr=0x801A58C0`, `data_size=0x1E0`; its command list contains real
+  opcode-`0x15` `A_SAVEBUFF` destinations. Therefore `OSTask.output_buff`
+  cannot feed host audio. The public libultra manual's
+  **osAiSetNextBuffer** section names the completed PCM address/byte length;
+  that shim now decodes fn64's `addr ^ 2`
+  native-word halfwords in guest order and calls `AudioBackend::queue_samples`.
+  The exact zero-output-field task followed by a real AI submit is locked by
+  `os_ai_set_next_buffer_routes_live_pcm_to_the_registered_audio_backend`.
+- **Verification bar:** 10/10 consecutive native swap-300 probes each reached
+  300 swaps, ran exactly 200 audio tasks, and produced exactly 541,952 samples
+  (175,857 nonzero, range `-23,166..=23,449`). The AI-to-backend regression
+  also passed 10/10 consecutive runs.
+- **Physical cpal playback is not verified on this machine.** Both cpal's
+  `default_output_config()` and `supported_output_configs()` fail before
+  stream creation with CoreAudio OSStatus `0x216F626A` (`!obj`), and every
+  candidate-rate stream attempt fails identically. The native harness and
+  `fn64-shell` register the same `CpalBackend`; when a stream opens, the now-
+  verified AI boundary feeds it. In this environment zero live buffers reached
+  cpal, so claiming audible device output would be false.
 
 ### Render — geometry & texture layers
 - Geometry: G_VTX, G_TRI1/TRI2/QUAD, G_MTX (LOAD/MUL/PUSH), G_POPMTX, G_DL

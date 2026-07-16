@@ -10,8 +10,8 @@ description = "Native-Rust whole-ROM configuration of the shared OoT boot harnes
 [workspace]
 
 [features]
-default = []
-oot-audio = []
+default = ["oot-audio"]
+oot-audio = ["dep:oot-audio-ucode"]
 
 [[bin]]
 name = "oot-boot"
@@ -27,3 +27,5 @@ fn64-abi = { path = "../../../crates/fn64-abi", features = ["native-recomp"] }
 fn64-recomp-native = { path = "../../../crates/fn64-recomp-native" }
 fn64-render = { path = "../../../crates/fn64-render" }
 fn64-render-rt64 = { path = "../../../crates/fn64-render-rt64" }
+fn64-audio = { path = "../../../crates/fn64-audio" }
+oot-audio-ucode = { path = "../audio-ucode", optional = true }
