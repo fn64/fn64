@@ -180,6 +180,14 @@ impl RenderBackend for ReferenceBackend {
             .as_mut()
             .ok_or(RenderError::NotReady("create() not called"))?;
 
+        #[cfg(not(test))]
+        if std::env::var_os("OOT_RENDER_CLEAR_EACH_TASK").is_some() {
+            // Diagnostic isolation only: real color/depth clears are RDP
+            // commands, not an implicit operation at every RSP task.
+            let [r, g, b, a] = self.clear_color;
+            fb.clear(r, g, b, a);
+        }
+
         if !gbi::SUPPORTED.contains(&UcodeId::F3dex2) {
             // Unreachable given this backend's fixed SUPPORTED list, but
             // written as a real check (not `unreachable!()`) so
@@ -250,6 +258,8 @@ impl RenderBackend for ReferenceBackend {
                 }
                 #[cfg(not(test))]
                 raster::zstat::summary();
+                #[cfg(not(test))]
+                raster::texstat::summary();
             }
         }
 

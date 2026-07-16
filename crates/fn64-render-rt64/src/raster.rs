@@ -56,6 +56,45 @@ pub mod zstat {
     }
 }
 
+#[cfg(not(test))]
+pub mod texstat {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static INIT: AtomicBool = AtomicBool::new(false);
+    static SAMPLES: AtomicU64 = AtomicU64::new(0);
+    static BLACK: AtomicU64 = AtomicU64::new(0);
+    fn on() -> bool {
+        if !INIT.swap(true, Ordering::Relaxed) {
+            ENABLED.store(
+                std::env::var_os("OOT_RENDER_STATS").is_some(),
+                Ordering::Relaxed,
+            );
+        }
+        ENABLED.load(Ordering::Relaxed)
+    }
+    pub fn note(texel: [u8; 4]) {
+        if on() {
+            SAMPLES.fetch_add(1, Ordering::Relaxed);
+            if texel[0] == 0 && texel[1] == 0 && texel[2] == 0 {
+                BLACK.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    pub fn summary() {
+        if !on() {
+            return;
+        }
+        let samples = SAMPLES.swap(0, Ordering::Relaxed);
+        let black = BLACK.swap(0, Ordering::Relaxed);
+        if samples > 0 {
+            eprintln!(
+                "[OOT_RENDER_STATS] texel_samples={samples} black_texels={black} nonblack_texels={}",
+                samples - black
+            );
+        }
+    }
+}
+
 pub struct Framebuffer {
     pub width: u32,
     pub height: u32,
@@ -212,6 +251,8 @@ impl Framebuffer {
                         let s = w0 * a.s + w1 * b.s + w2 * c.s;
                         let t = w0 * a.t + w1 * b.t + w2 * c.t;
                         let [tr, tg, tb, ta] = tex.sample(s, t);
+                        #[cfg(not(test))]
+                        texstat::note([tr, tg, tb, ta]);
                         r = ((tr as u32 * r as u32) / 255) as u8;
                         g = ((tg as u32 * g as u32) / 255) as u8;
                         bl = ((tb as u32 * bl as u32) / 255) as u8;
