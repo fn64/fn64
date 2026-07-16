@@ -11,6 +11,51 @@
 
 use crate::gbi::{CullMode, Triangle, Vertex};
 
+/// TEMP instrumentation (env `OOT_DUMP_PROJ=1`): count z-test passes vs
+/// rejections so a real overlapping-geometry frame can PROVE the z-buffer is
+/// doing occlusion work (rejecting farther fragments) rather than being a
+/// no-op. Gated entirely behind the env var; call `zstat::summary()` after a
+/// frame to print + reset. Remove/keep behind the flag.
+#[cfg(not(test))]
+pub mod zstat {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static INIT: AtomicBool = AtomicBool::new(false);
+    static PASS: AtomicU64 = AtomicU64::new(0);
+    static REJECT: AtomicU64 = AtomicU64::new(0);
+    fn on() -> bool {
+        if !INIT.swap(true, Ordering::Relaxed) {
+            ENABLED.store(std::env::var("OOT_DUMP_PROJ").is_ok(), Ordering::Relaxed);
+        }
+        ENABLED.load(Ordering::Relaxed)
+    }
+    pub fn note_pass() {
+        if on() {
+            PASS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn note_reject() {
+        if on() {
+            REJECT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    /// Print the frame's pass/reject counts and reset for the next frame.
+    pub fn summary() {
+        if !on() {
+            return;
+        }
+        let p = PASS.swap(0, Ordering::Relaxed);
+        let r = REJECT.swap(0, Ordering::Relaxed);
+        if p + r > 0 {
+            eprintln!(
+                "[OOT_DUMP_PROJ] z-test: {p} passes (fragment written) | {r} rejects \
+                 (farther fragment occluded) -- rejects>0 proves the z-buffer is \
+                 doing real occlusion, not a no-op"
+            );
+        }
+    }
+}
+
 pub struct Framebuffer {
     pub width: u32,
     pub height: u32,
@@ -73,8 +118,17 @@ impl Framebuffer {
         if z < self.depth[pix] {
             self.depth[pix] = z;
             self.pixels[pix * 4..pix * 4 + 4].copy_from_slice(&rgba);
+            #[cfg(not(test))]
+            zstat::note_pass();
             true
         } else {
+            // A farther (or equal) fragment landed on an already-written
+            // pixel and was correctly discarded -- the actual occlusion work
+            // the z-buffer does. Counted (env-gated) to PROVE, on a real
+            // overlapping frame, that depth is doing meaningful rejection and
+            // not a no-op. See `OOT_DUMP_PROJ` in gbi.rs.
+            #[cfg(not(test))]
+            zstat::note_reject();
             false
         }
     }
@@ -95,6 +149,14 @@ impl Framebuffer {
     /// faces.
     pub fn draw_triangle_culled(&mut self, tri: &Triangle, cull: CullMode) {
         self.draw_triangle_impl(tri, cull, true);
+    }
+
+    /// Same culling as [`draw_triangle_culled`] but with NO depth test
+    /// (submission/painter's order). Used only by the `OOT_NO_DEPTH` A/B
+    /// instrumentation to prove that correct occlusion comes from the
+    /// z-buffer, not draw order.
+    pub fn draw_triangle_no_depth_culled(&mut self, tri: &Triangle, cull: CullMode) {
+        self.draw_triangle_impl(tri, cull, false);
     }
 
     fn draw_triangle_impl(&mut self, tri: &Triangle, cull: CullMode, depth_test: bool) {
@@ -291,5 +353,139 @@ mod tests {
         };
         fb.draw_triangle(&tri);
         assert!(!fb.has_non_uniform_content(1, 2, 3, 4));
+    }
+
+    // --- Depth / z-buffer occlusion regression ---------------------------
+    //
+    // These prove the z-buffer resolves overlapping geometry by DEPTH, not by
+    // submission (painter's) order, and in the correct DIRECTION (nearer =
+    // smaller `z` wins the `z < depth` compare, matching the OoT viewport z
+    // mapping `pz = ndc_z*sz + tz` with sz>0, verified live: sz=tz=127.75,
+    // ndc_z↑ with distance -> pz↑ with distance -> nearer has smaller pz).
+
+    /// A vertex with an explicit screen-space depth `z`.
+    fn vz(x: f32, y: f32, z: f32, r: u8, g: u8, b: u8, a: u8) -> Vertex {
+        Vertex {
+            x,
+            y,
+            z,
+            r,
+            g,
+            b,
+            a,
+            ..Default::default()
+        }
+    }
+
+    /// Two fully-overlapping triangles at different depths: a NEAR blue one
+    /// (z=1) and a FAR red one (z=9), covering the same pixels. The nearer
+    /// (blue) color must survive at the overlap REGARDLESS of the order they
+    /// are submitted -- proving z-test, not painter's order.
+    #[test]
+    fn nearer_triangle_wins_over_farther_regardless_of_submission_order() {
+        // Same screen footprint for both; only z (and color) differ.
+        let near = Triangle {
+            v: [
+                vz(2.0, 2.0, 1.0, 0, 0, 255, 255),
+                vz(12.0, 2.0, 1.0, 0, 0, 255, 255),
+                vz(7.0, 12.0, 1.0, 0, 0, 255, 255),
+            ],
+            ..Default::default()
+        };
+        let far = Triangle {
+            v: [
+                vz(2.0, 2.0, 9.0, 255, 0, 0, 255),
+                vz(12.0, 2.0, 9.0, 255, 0, 0, 255),
+                vz(7.0, 12.0, 9.0, 255, 0, 0, 255),
+            ],
+            ..Default::default()
+        };
+        let overlap = (6u32 * 16 + 7u32) as usize * 4; // interior pixel (7,6)
+
+        // Order A: far first, then near. Near must overwrite far.
+        let mut fb = Framebuffer::new(16, 16);
+        fb.clear(0, 0, 0, 255);
+        fb.draw_triangle_culled(&far, CullMode::None);
+        fb.draw_triangle_culled(&near, CullMode::None);
+        assert_eq!(
+            &fb.pixels[overlap..overlap + 4],
+            &[0, 0, 255, 255],
+            "near (blue) must win at overlap when drawn AFTER far"
+        );
+
+        // Order B: near first, then far. Near must STILL win (far is z-rejected).
+        let mut fb = Framebuffer::new(16, 16);
+        fb.clear(0, 0, 0, 255);
+        fb.draw_triangle_culled(&near, CullMode::None);
+        fb.draw_triangle_culled(&far, CullMode::None);
+        assert_eq!(
+            &fb.pixels[overlap..overlap + 4],
+            &[0, 0, 255, 255],
+            "near (blue) must STILL win when drawn BEFORE far -- this is what \
+             separates a real z-test from painter's order"
+        );
+    }
+
+    /// The whole point of a z-buffer over painter's order: WITHOUT the depth
+    /// test, submission order decides the overlap (last drawn wins), so the
+    /// far triangle drawn last would incorrectly show through. This documents
+    /// the difference the z-test makes and would catch a regression that
+    /// silently dropped the z-test on the culled path.
+    #[test]
+    fn without_depth_test_painter_order_lets_farther_show_through() {
+        let far = Triangle {
+            v: [
+                vz(2.0, 2.0, 9.0, 255, 0, 0, 255),
+                vz(12.0, 2.0, 9.0, 255, 0, 0, 255),
+                vz(7.0, 12.0, 9.0, 255, 0, 0, 255),
+            ],
+            ..Default::default()
+        };
+        let near = Triangle {
+            v: [
+                vz(2.0, 2.0, 1.0, 0, 0, 255, 255),
+                vz(12.0, 2.0, 1.0, 0, 0, 255, 255),
+                vz(7.0, 12.0, 1.0, 0, 0, 255, 255),
+            ],
+            ..Default::default()
+        };
+        let overlap = (6u32 * 16 + 7u32) as usize * 4;
+        let mut fb = Framebuffer::new(16, 16);
+        fb.clear(0, 0, 0, 255);
+        // No-depth path: near first, far last -> far shows through (WRONG for a
+        // real scene; this is exactly the artifact the z-buffer removes).
+        fb.draw_triangle_no_depth_culled(&near, CullMode::None);
+        fb.draw_triangle_no_depth_culled(&far, CullMode::None);
+        assert_eq!(
+            &fb.pixels[overlap..overlap + 4],
+            &[255, 0, 0, 255],
+            "without depth test, last-drawn (far/red) wins -- the painter's-order \
+             artifact the z-buffer exists to prevent"
+        );
+    }
+
+    /// Directly proves the z-test DIRECTION. `set_depth_tested` returns
+    /// whether it wrote. A nearer z (smaller) must pass over an existing
+    /// farther z; a farther z (larger) must be rejected. If the compare were
+    /// inverted (`z > depth`), the first assert would fail -- so this test
+    /// fails against a sign-flipped z-test bug.
+    #[test]
+    fn set_depth_tested_passes_nearer_rejects_farther() {
+        let mut fb = Framebuffer::new(2, 2);
+        fb.clear(0, 0, 0, 255);
+        // Write a mid-depth fragment.
+        assert!(fb.set_depth_tested(0, 0, 5.0, [1, 1, 1, 1]));
+        // A NEARER (smaller z) fragment must PASS and overwrite.
+        assert!(
+            fb.set_depth_tested(0, 0, 2.0, [2, 2, 2, 2]),
+            "nearer z (2 < 5) must pass -- if this fails the z-test is inverted"
+        );
+        assert_eq!(&fb.pixels[0..4], &[2, 2, 2, 2]);
+        // A FARTHER (larger z) fragment must be REJECTED (color unchanged).
+        assert!(
+            !fb.set_depth_tested(0, 0, 8.0, [3, 3, 3, 3]),
+            "farther z (8 > 2) must be rejected"
+        );
+        assert_eq!(&fb.pixels[0..4], &[2, 2, 2, 2]);
     }
 }
