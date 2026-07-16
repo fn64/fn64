@@ -1,3 +1,5 @@
+#![allow(clippy::identity_op)] // Keep the zero-valued v0 bitfield visible in wire fixtures.
+
 //! Hand-built REAL F3DEX2 display-list replay test.
 //!
 //! Unlike `fixture_replay.rs` (which exercises the simple reference-fixture

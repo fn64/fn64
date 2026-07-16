@@ -17,9 +17,9 @@ facts, not any one implementation's expression.
 - **Facts described:** opcode bytes, argument bit layouts, fixed-point
   matrix/vertex formats, the transform pipeline, segmented addressing, RDP
   edge/coverage/z math, RGBA5551 framebuffer packing.
-- **Priority:** the vertex + matrix + triangle path (this is what produces
-  *visible geometry*). Texture and color-combiner handling are marked
-  **phase-2** and can be stubbed for a first recognizable flat-shaded frame.
+- **Priority:** the vertex + matrix + triangle path produces visible geometry;
+  the implemented texture/color-combiner layer makes that geometry carry the
+  material colors selected by OoT's display lists.
 
 Section 0 gives the two orienting facts (word format + memory map); sections
 1-6 follow the task's structure; section 7 is the cross-reference to what
@@ -493,11 +493,12 @@ coverage and depth.
 
 ---
 
-## 5. Texture / combiner (phase-2 — summarize + stub)
+## 5. Texture / combiner
 
-None of this is needed for a first flat-shaded frame; a decoder should
-**acknowledge-and-skip** each of these (loudly, by name) and render geometry
-from vertex color only. Captured here so phase-2 knows the contract.
+The reference backend implements the common OoT texture and color-combiner
+path described here. Exact TMEM layout, the second texture tile, key/noise/K
+inputs, and cycle selection from other-mode remain later fidelity work; those
+approximations are logged when encountered.
 
 ### 5.1 Texture image + tile + TMEM load
 
@@ -525,13 +526,23 @@ from vertex color only. Captured here so phase-2 knows the contract.
   A/B/C/D are selected from a fixed menu of inputs (combined/texel0/texel1/
   primitive/shade/env colors, etc.). This is *the* op that decides whether a
   pixel's color comes from the texture, the vertex/shade color, a flat prim
-  color, or a blend. **With `G_SETCOMBINE` skipped, use vertex/shade color
-  directly** — which is exactly the flat-shaded first-frame behavior.
+  color, or a blend. The wire packing is the public `gbi.h`
+  `GCCc0w0`/`GCCc1w0`/`GCCc0w1`/`GCCc1w1` layout: cycle-0 and cycle-1 fields
+  are interleaved across both command words. Selector values are also
+  position-dependent (A/B/C/D do not share one numeric table), so decode to
+  semantic sources before evaluating. `gbi.rs` snapshots both cycles onto
+  each emitted triangle; `raster.rs` evaluates cycle 0 then cycle 1, carrying
+  COMBINED between them. This covers OoT's modulate, decal/replace,
+  primitive-tint, environment-blend, shade-only, PASS2, and `*2` presets.
+  The public OoT decomp demonstrates the covered mix directly in
+  `src/code/z_rcp.c:27-225` (shade, decal, modulate, primitive tint, PASS2)
+  and `src/overlays/gamestates/ovl_file_choose/z_file_choose.c:282`
+  (primitive/environment blend).
 - **`G_TEXTURE`** (`0xD7`, RSP): enables texturing and sets the S/T
   coordinate scale applied to vertex texcoords, plus which tile + mip level.
   Fields: on-bit `field(w0,1,7)`, mip level `field(w0,11,3)`, tile
   `field(w0,8,3)`, S scale `field(w1,16,16)`, T scale `field(w1,0,16)` (both
-  U0.16). Skip for flat-shaded; needed to place textures correctly in phase-2.
+  U0.16). The current decoder applies these fields to its decoded tile.
 - **`G_SETOTHERMODE_H/L`** (`0xE3`/`0xE2`): the RDP "other modes" — render
   mode (blend/z-compare/AA/cvg), texture filter, cycle type (1-cycle/2-cycle/
   copy/fill), etc. F3DEX2 encodes a partial update as `length-1` in the low
@@ -553,12 +564,66 @@ from vertex color only. Captured here so phase-2 knows the contract.
   `shaders/RasterPS.hlsl:184,204-211`.
 - **`G_SETPRIMCOLOR`/`G_SETENVCOLOR`/`G_SETFOGCOLOR`/`G_SETFILLCOLOR`/
   `G_SETBLENDCOLOR`** (`0xFA`/`0xFB`/`0xF8`/`0xF7`/`0xF9`): flat color
-  registers fed to the combiner/blender. Phase-2.
+  registers fed to the combiner/blender. Primitive and environment RGBA are
+  decoded now; `G_SETPRIMCOLOR`'s low-byte primitive-LOD fraction is retained
+  as a combiner input. Blend and fog RGBA are decoded for the framebuffer
+  blender; fill color remains outside this slice.
 - **Sync ops** `G_RDPLOADSYNC`/`G_RDPPIPESYNC`/`G_RDPTILESYNC`/
   `G_RDPFULLSYNC` (`0xE6`-`0xE9`) and `G_NOOP`/`G_SPNOOP`
   (`0x00`/`0xE0`): pipeline hazard barriers / no-ops. **Always safe to skip**
   in an HLE decoder — they exist to serialize the real RDP pipeline and have
   no effect on the decoded geometry.
+
+### 5.3 Othermode + framebuffer blender
+
+The RDP framebuffer blender is selected by the two othermode words. OoT uses
+both the full `G_RDPSETOTHERMODE` command (`0xEF`) and F3DEX2's partial
+`G_SETOTHERMODE_L/H` commands (`0xE2`/`0xE3`):
+
+- `G_RDPSETOTHERMODE` replaces the high 24-bit word from `w0[23:0]` and the
+  full low word from `w1` (`gbi.h` lines 3697-3737).
+- A partial setter stores `size-1` in `w0[7:0]` and
+  `32-logical_shift-size` in `w0[15:8]` (`gbi.h` lines 3353-3369). Decode
+  those fields back to a logical bit range and patch only that range.
+- Cycle type is high-othermode bits 20-21: one cycle, two cycles, copy, or
+  fill (`gbi.h` lines 519 and 527-531). Copy/fill bypass the blender.
+- Low-othermode bits 31-16 hold two four-selector tuples. `GBL_c1` places
+  `(P,A,M,B)` at shifts `(30,26,22,18)` and `GBL_c2` at
+  `(28,24,20,16)` (`gbi.h` lines 612-627). Each active cycle evaluates:
+
+  ```text
+  color = P * A + M * B
+  ```
+
+  `P`/`M` can select combined (the incoming fragment in cycle 1, the prior
+  blender result in cycle 2), framebuffer memory, blend color, or fog color.
+  `A` can select combined, fog, shade alpha, or zero; `B` can select one minus
+  A, framebuffer alpha, one, or zero. `FORCE_BL` is low bit `0x4000`
+  (`gbi.h` lines 593-622). Without it the final blender cycle is a P-input
+  pass; in two-cycle mode cycle 1 can still perform fog before that pass.
+
+The standard translucent-surface tuple is
+`IN*A_IN + MEM*(1-A)`, so a half-alpha fragment retains half of the existing
+framebuffer instead of replacing it. The software rasterizer snapshots this
+minimal state per triangle because display lists may change othermode between
+draws. Constant blend/fog colors come from `G_SETBLENDCOLOR`/`G_SETFOGCOLOR`
+(`gbi.h` lines 3640-3656). RT64 independently models the same raw othermode
+shadow, selector ordering, final-cycle bypass, and sequential cycle handoff
+(`shared/rt64_other_mode.h` lines 14-52;
+`shared/rt64_blender.h` lines 45-81 and 366-504). RT64 represents a selected
+framebuffer term as a source color plus a separate blend alpha (lines
+414-424), then its graphics pipeline composites with `SRC1_ALPHA` /
+`INV_SRC1_ALPHA` (`render/rt64_raster_shader.cpp` lines 332-339). This
+software framebuffer performs that last composite directly. `G_BL_A_MEM`
+means coverage alpha, not the stored RGBA byte; because coverage is not yet
+emulated, it is treated as full coverage, matching RT64 lines 351-357.
+
+The blender consumes the alpha produced by the color combiner. Until the
+separate `G_SETCOMBINE`/primitive/environment-color work lands, this renderer's
+"combined alpha" remains the existing shade × texel approximation. The OOTU
+C-lane trace through 1,000 VI swaps produced no fractional combined-alpha
+fragments, so the equation and selector wiring are fixture-verified here but
+live OoT translucency remains visually blocked on that combiner input.
 
 ---
 
@@ -606,10 +671,10 @@ vertex-colored), a decoder must correctly handle:
 6. `G_DL` (push/branch) + `G_ENDDL` (return).
 7. `G_GEOMETRYMODE` — enough to honor **back-face culling**.
 
-Everything else (`G_TEXTURE`, `G_SETTILE`, `G_SETCOMBINE`, `G_SETTIMG`,
-`G_LOAD*`, `G_SETPRIMCOLOR`, all sync ops, lighting)
-can be **acknowledged-and-skipped** for the first frame — geometry renders
-flat-shaded from vertex color.
+That list is the historical first-frame minimum. The reference backend now
+also implements texture/lighting, RDP other-mode and alpha compare, and the
+common color-combiner path above. Scissor, remaining framebuffer state, and
+sync ops can still be acknowledged-and-skipped at this stage.
 
 ---
 
@@ -625,8 +690,9 @@ needs attention against the F3DEX2 contract:
 | `G_TRI1` | `0x05` | 2.2 | Current path extracts three 8-bit bytes and `/2`. The F3DEX2 layout is three **7-bit** fields at bits 17/9/1; each is already the slot. The `/2`-of-a-byte form and the 7-bit-field form agree only if the byte's low bit is 0 — validate. |
 | `G_TRI2` | `0x06` | 2.3 | Two triangles: tri A in `w0`, tri B in `w1`, same field positions. |
 | `G_QUAD` | `0x07` | 2.3 | Decode identically to `G_TRI2`. |
-| `G_TEXTURE` | `0xD7` | 5.2 | Phase-2. Currently skipped (correct for flat-shaded). |
+| `G_TEXTURE` | `0xD7` | 5.2 | Decodes enable, tile, and S/T scales. |
 | `G_SETOTHERMODE_L/H` | `0xE2`/`0xE3` | 5.2 | Implemented: masked F3DEX2 H/L updates are retained in typed render state, snapshotted per triangle, and consumed by alpha compare. |
+| `G_SETCOMBINE` | `0xFC` | 5.2 | Decodes both cycles' position-specific RGB/alpha selectors and snapshots them per triangle. |
 | `G_POPMTX` | `0xD8` | 3.3 | `count = w1 >> 6`; pop that many modelview entries. |
 | `G_GEOMETRYMODE` | `0xD9` | 2.4 | Currently skipped. To get culling, apply `mode = (mode & field(w0,0,24)) | w1` and honor `G_CULL_BACK`. |
 | `G_MTX` | `0xDA` | 3.2 | Un-XOR the push bit (`params = field(w0,0,8) ^ 0x01`), then PROJECTION=`0x04`/LOAD=`0x02`/PUSH=`0x01`. Confirm the transpose-on-read matches the multiply convention (3.1). |
@@ -636,9 +702,10 @@ needs attention against the F3DEX2 contract:
 | `G_ENDDL` | `0xDF` | 1.2 | Return to caller (pop DL stack) or stop. |
 
 The `opcode_name` table in `gbi.rs` additionally names `G_NOOP`, `G_SPNOOP`,
-`G_RDPHALF_1/2`, the four sync ops, `G_LOADBLOCK`, `G_SETTILE`,
-`G_SETCOMBINE`, `G_SETTIMG` — all correctly in the
-"acknowledge-and-skip for a flat-shaded frame" bucket (sections 5).
+`G_RDPHALF_1/2`, `G_SETOTHERMODE_L/H`, the four sync ops, `G_LOADBLOCK`,
+`G_SETTILE`, `G_SETCOMBINE`, and `G_SETTIMG`. The texture, combiner, and
+other-mode commands among these are handled as described in section 5, while
+the remaining framebuffer and sync ops are still named skips.
 
 **Not yet named in `gbi.rs`** but part of the F3DEX2 map, worth adding as
 named skips so coverage isn't overstated: `G_MODIFYVTX` (`0x02`),
