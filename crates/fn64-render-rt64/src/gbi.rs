@@ -271,12 +271,18 @@ fn transform_point(m: &Mat4, x: f32, y: f32, z: f32) -> [f32; 4] {
 /// `int_part + frac_part / 65536`. Elements are stored row-major
 /// (`m[4][4]`). Returns `None` if the 64-byte read would run off `rdram`.
 ///
-/// The N64 stores matrices column-major relative to how it multiplies
-/// `vertex * matrix` (row-vector convention). We read it into `m[row][col]`
-/// and treat the vertex as a COLUMN vector; because the on-chip convention
-/// is row-vector `v*M`, the equivalent column-vector product is `M^T * v`.
-/// We therefore transpose on read so `transform_point` (column-vector) gives
-/// the same result the hardware's `v*M` would.
+/// We store the element (r,c) at `m[r][c]` -- the SAME `[row][col]` layout
+/// the hardware `Mtx` (and RT64's `FixedMatrix::toMatrix4x4`) uses, with NO
+/// transpose. The N64's row-vector convention (`clip = v_row * M`) is then
+/// reproduced by composing the model/view/projection product in hardware
+/// order and applying it to the vertex as a COLUMN vector -- see
+/// `recompute_mvp` and `transform_point`. (A previous version transposed
+/// here AND kept the accumulation in projection-first order; the two cancel
+/// for a single symmetric/diagonal matrix -- which is all the reference
+/// fixture exercised -- but for a real guPerspective * guLookAt * model
+/// product the net result was the TRANSPOSE of the true MVP, giving tiny,
+/// sign-flipping `w` values that flung gameplay geometry ±100k px
+/// off-screen. Verified against a live OoT gameplay task's P/V/M dump.)
 fn read_mtx(rdram: &[u8], addr: usize) -> Option<Mat4> {
     if addr + 64 > rdram.len() {
         return None;
@@ -292,10 +298,8 @@ fn read_mtx(rdram: &[u8], addr: usize) -> Option<Mat4> {
             let int_part = read_i16(rdram, int_off) as i32;
             let frac_part = read_u16(rdram, frac_off) as i32;
             let value = (((int_part << 16) | frac_part) as f32) / 65536.0;
-            // Transpose on read (row-vector hardware convention -> our
-            // column-vector `transform_point`): store element (r,c) at
-            // m[c][r].
-            m[c][r] = value;
+            // Natural row-major store (hardware [row][col]): NO transpose.
+            m[r][c] = value;
         }
     }
     Some(m)
@@ -916,35 +920,41 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                         // loads the perspective matrix once with LOAD, then
                         // concatenates the camera/view matrix onto it with
                         // PROJECTION|MUL (guLookAt output). Treating every
-                        // projection G_MTX as a LOAD (the old bug) let the
+                        // projection G_MTX as a LOAD (a prior bug) let the
                         // view matrix -- whose 4th row is [0,0,0,1], no
                         // projective term -- OVERWRITE the real perspective
-                        // matrix (4th row [0,0,-1,0]). The result was w==1
-                        // for every vertex (no perspective divide), so
-                        // eye-space coords like x=-42 were used directly as
-                        // NDC and every triangle projected thousands of
-                        // pixels off-screen -> uniform/blank frames. Verified
-                        // from a live task's three G_MTX loads (perspective
-                        // LOAD, view MUL, model LOAD).
+                        // matrix (4th row [0,0,-1,0]).
+                        //
+                        // MUL ORDER (hardware/RT64): the incoming matrix
+                        // multiplies on the LEFT of the accumulated
+                        // projection -- `viewProj = new * viewProj` (RT64
+                        // rt64_rsp.cpp:171). So the perspective LOAD gives
+                        // `proj = P`, then the view MUL gives `proj = V * P`,
+                        // and the final MVP below is `M * (V * P)`. This is
+                        // the row-vector hardware product built column-major
+                        // for our column-vector `transform_point`.
                         state.proj = Some(if is_load {
                             mtx
                         } else {
                             match state.proj {
-                                Some(p) => mat_mul(&p, &mtx),
+                                Some(p) => mat_mul(&mtx, &p),
                                 None => mtx,
                             }
                         });
                     } else {
                         // Modelview: a PUSH saves the current top so a later
                         // G_POPMTX restores it. LOAD replaces, MUL
-                        // concatenates onto the current modelview.
+                        // concatenates. MUL puts the incoming matrix on the
+                        // LEFT (`modelview = new * modelview`, RT64
+                        // rt64_rsp.cpp:197) so successive object transforms
+                        // compose in the same order the hardware applies them.
                         if is_push {
                             state.mv_stack.push(state.modelview);
                         }
                         if is_load {
                             state.modelview = mtx;
                         } else {
-                            state.modelview = mat_mul(&state.modelview, &mtx);
+                            state.modelview = mat_mul(&mtx, &state.modelview);
                         }
                     }
                     recompute_mvp(state);
@@ -1180,9 +1190,19 @@ fn active_texture(tex: &TexState) -> Option<Texture> {
     }
 }
 
-/// Recompute the cached projection*modelview matrix from the current stack.
+/// Recompute the cached model-view-projection matrix from the current stack.
+///
+/// `state.proj` already holds the accumulated `view * proj` product (built
+/// left-multiplied in the G_MTX handler, hardware order). The full transform
+/// is `mvp = modelview * (view * proj)` = `M * V * P` -- the incoming vertex
+/// (leftmost in the hardware's row-vector product `v * M * V * P`) is applied
+/// by `transform_point` as a COLUMN vector `mvp * v`, which for our
+/// hardware-`[row][col]` matrices reproduces the hardware result with a
+/// well-behaved positive `w` (the perspective depth). Composing as
+/// `proj * modelview` instead (the old order) yields the TRANSPOSE of the
+/// true MVP and the ±100k-px off-screen explosion this fixes.
 fn recompute_mvp(state: &mut DecodeState) {
-    state.mvp = state.proj.map(|p| mat_mul(&p, &state.modelview));
+    state.mvp = state.proj.map(|p| mat_mul(&state.modelview, &p));
     if state.mvp.is_none() {
         // No projection loaded: use the modelview alone (still lets a
         // model-space-only transform position raw coords).
@@ -1342,6 +1362,125 @@ mod tests {
         for (i, &c) in rgba.iter().enumerate() {
             rdram[(off + 12 + i) ^ 3] = c;
         }
+    }
+
+    /// Write a 64-byte fixed-point `Mtx` at `off` from an f32 `[row][col]`
+    /// matrix, matching `read_mtx`'s layout: element (r,c) integer half at
+    /// `off + (r*4+c)*2`, fractional half at `off + 32 + (r*4+c)*2`, both
+    /// through the recomp `^3` swizzle (via `wr_i16`).
+    fn wr_mtx(rdram: &mut [u8], off: usize, m: [[f32; 4]; 4]) {
+        for r in 0..4 {
+            for c in 0..4 {
+                let elem = r * 4 + c;
+                let fixed = (m[r][c] * 65536.0).round() as i32;
+                let int_half = (fixed >> 16) as i16;
+                let frac_half = (fixed & 0xFFFF) as u16;
+                wr_i16(rdram, off + elem * 2, int_half);
+                wr_i16(rdram, off + 32 + elem * 2, frac_half as i16);
+            }
+        }
+    }
+
+    // --- Perspective * view * model projection regression ----------------
+    //
+    // Fails against the pre-fix decoder, which transposed each `Mtx` on read
+    // AND accumulated the projection product in the wrong (proj-first) order.
+    // The two errors cancel for a single diagonal/symmetric matrix -- all the
+    // older f3dex2_replay fixture exercised -- so the bug slipped through, but
+    // for a real guPerspective * guLookAt * model chain the net composed MVP
+    // came out as the TRANSPOSE of the true one: clip `w` collapsed to tiny,
+    // sign-flipping values (~30, ~-13, ~-59) and the perspective divide flung
+    // a vertex that belongs near screen-center to ~800+ px off the 320x240
+    // screen. This test drives the exact live-OoT-gameplay P/V/M matrices
+    // through the full decode and asserts the vertex now lands on-screen with
+    // a coherent positive `w`.
+    #[test]
+    fn perspective_view_model_projects_vertex_on_screen() {
+        let mut rdram = vec![0u8; 0x8000];
+
+        // Hardware [row][col] matrices captured from a live OoT gameplay gfx
+        // task (swap ~233): guPerspective output (perspective term at [2][3],
+        // depth translate at [3][2]); guLookAt view (rotation 3x3 + camera
+        // translation in the last ROW -- row-vector convention); and a model
+        // matrix that translates the object in front of the camera.
+        let persp = [
+            [1.6104, 0.0, 0.0, 0.0],
+            [0.0, 2.1472, 0.0, 0.0],
+            [0.0, 0.0, -0.7912, -0.7900],
+            [0.0, 0.0, -15.8123, 0.0],
+        ];
+        let view = [
+            [-0.3885, 0.1117, 0.9146, 0.0],
+            [0.0, 0.9926, -0.1212, 0.0],
+            [-0.9214, -0.0471, -0.3857, 0.0],
+            [3262.9629, 694.0505, 5674.7998, 1.0],
+        ];
+        let model = [
+            [1.0, 0.0, 0.0030, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [-0.0030, 0.0, 1.0, 0.0],
+            [-4000.0, -1.0, 5228.0, 1.0],
+        ];
+        // A vertex of the object (model space).
+        wr_vtx(&mut rdram, 0x3000, -64, 64, -64, [255, 0, 0, 255]);
+        wr_vtx(&mut rdram, 0x3010, 0, 64, -64, [0, 255, 0, 255]);
+        wr_vtx(&mut rdram, 0x3020, -64, 0, -64, [0, 0, 255, 255]);
+
+        wr_mtx(&mut rdram, 0x2000, persp);
+        wr_mtx(&mut rdram, 0x2100, view);
+        wr_mtx(&mut rdram, 0x2200, model);
+
+        // G_MTX param bytes (wire = params ^ G_MTX_PUSH):
+        //  perspective LOAD:  PROJECTION|LOAD           = 0x06 -> wire 0x07
+        //  view MUL:          PROJECTION (no LOAD)      = 0x04 -> wire 0x05
+        //  model LOAD:        LOAD (modelview)          = 0x02 -> wire 0x03
+        let mtx_len = ((64u32 - 1) / 8) << 19;
+        let mtx_cmd = |idx: u32| ((G_MTX as u32) << 24) | mtx_len | idx;
+        let mut off = 0x1000;
+        wr_cmd(&mut rdram, off, mtx_cmd(0x07), 0x2000); // persp LOAD
+        off += 8;
+        wr_cmd(&mut rdram, off, mtx_cmd(0x05), 0x2100); // view MUL
+        off += 8;
+        wr_cmd(&mut rdram, off, mtx_cmd(0x03), 0x2200); // model LOAD
+        off += 8;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_VTX as u32) << 24) | (3 << 12) | (3 << 1),
+            0x3000,
+        );
+        off += 8;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1),
+            0,
+        );
+        off += 8;
+        wr_cmd(&mut rdram, off, (G_ENDDL as u32) << 24, 0);
+
+        let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
+        assert_eq!(tris.len(), 1, "expected one transformed triangle");
+        // Default 320x240 viewport (no G_MOVEMEM here): NDC*160+160 / *120+120.
+        // The correct MVP puts this corner vertex near screen center; the
+        // pre-fix transposed MVP put it at px~822 (off the 320-px screen).
+        let v = &tris[0].v[0];
+        assert!(
+            v.x >= 0.0 && v.x < 320.0 && v.y >= 0.0 && v.y < 240.0,
+            "vertex must land on the 320x240 screen after MVP; got ({}, {}) \
+             (pre-fix transposed-MVP bug projected it hundreds of px off-screen)",
+            v.x,
+            v.y
+        );
+        // Tighter anchor so a future re-transpose can't pass by luck: the
+        // correct projection lands this vertex in the upper-center region.
+        assert!(
+            (v.x - 175.7).abs() < 5.0 && (v.y - 104.8).abs() < 5.0,
+            "vertex screen position drifted from the verified on-screen anchor \
+             (~175.7, ~104.8); got ({}, {})",
+            v.x,
+            v.y
+        );
     }
 
     // --- G_DL branch (gsSPBranchList) desync regression -----------------
