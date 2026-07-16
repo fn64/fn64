@@ -4,20 +4,15 @@
 //! and `docs/DECOUPLING.md`'s renderer-seam sequencing step 3 (this crate
 //! IS the renamed `fn64-rt64`, per role).
 //!
-//! ## Honest status (read before assuming RT64 is wired up)
+//! ## RT64 feature boundary
 //!
-//! **RT64 FFI is NOT live.** [`Rt64Backend`] is a named, loud stub: every
-//! method returns `RenderError::NotReady`/`Backend` with a clear TODO
-//! pointing at the exact blocker (see its doc comment) -- it exists so the
-//! trait-shaped call site in `fn64-shell` has something to construct today
-//! without lying about what it does. Building real RT64 FFI needs (a) the
-//! MIT RT64 fork actually vendored/built (`docs/DECOUPLING.md`'s "refs has
-//! RT64 via the game repos; or clone github fn64/rt64" -- not done in this
-//! wave), and (b) the gfx task handoff signature, which the predecessor
-//! `fn64-rt64` README already flagged as unresolved (no `osSpTaskLoad`/
-//! `osSpTaskStartGo` call site observed yet in either game's generated
-//! corpus, per `docs/COMPLETENESS.md` row `osSpTaskStartGo`). Neither
-//! blocker is invented or hand-waved here.
+//! [`Rt64Backend`] is live when this crate's opt-in `rt64` feature is
+//! enabled. Its build script compiles the sibling RT64 checkout's MIT
+//! `rt64` target as a static library and links the crate-local C ABI shim;
+//! the default build remains pure Rust and keeps [`ReferenceBackend`] as the
+//! headless CI oracle. Building without `rt64` makes `Rt64Backend::create`
+//! return a named error so a shell can fall back without pretending a GPU
+//! backend exists.
 //!
 //! **What IS real and tested:** [`ReferenceBackend`], a headless, pure-Rust
 //! software rasterizer implementing the full `RenderBackend` trait against
@@ -38,6 +33,9 @@
 pub mod gbi;
 pub mod png_dump;
 pub mod raster;
+
+#[cfg(feature = "rt64")]
+mod ffi;
 
 // Named (not `_`-discarded) so the intended dependency-for-shared-types-only
 // relationship documented above is visible to `cargo tree`/reviewers, even
@@ -408,28 +406,27 @@ fn write_rgba5551_framebuffer(rdram: &mut [u8], start: usize, fb: &Framebuffer) 
     }
 }
 
-/// The RT64 adapter -- see module doc's "Honest status" section. Every
-/// method is a named, loud stub: no C++ is linked, no window is opened, no
-/// frame is ever produced. This is intentionally NOT a silent no-op that
-/// looks like it might work; every call returns an error that names exactly
-/// what's missing, so a caller can never mistake this for a working
-/// backend.
-///
-/// TODO(rt64-ffi): real implementation needs
-/// (1) the MIT RT64 fork vendored + built (`docs/DECOUPLING.md` step 3's
-///     "clone github fn64/rt64", not done),
-/// (2) a resolved gfx task handoff signature (blocked on a `profile.toml`
-///     rename wave reaching `osSpTaskLoad`/`osSpTaskStartGo`, per
-///     `docs/COMPLETENESS.md`),
-/// (3) `cxx`/bindgen-generated FFI bindings living ONLY in this crate per
-///     `docs/DESIGN.md` section 1's C++ quarantine rule.
+/// RT64's MIT C++ render/HLE core behind one crate-local C ABI boundary.
+/// The feature-gated implementation passes fn64's stable RDRAM allocation,
+/// the task's ucode/display-list addresses, and a private register block to
+/// `RT64::Application::Core`. RT64's render-to-RAM path writes the native
+/// RGBA5551 framebuffer back into the same slice the existing fn64 VI path
+/// presents.
 pub struct Rt64Backend {
+    #[cfg(feature = "rt64")]
+    context: Option<ffi::Context>,
+    #[cfg(not(feature = "rt64"))]
     created: bool,
 }
 
 impl Rt64Backend {
     pub fn new() -> Self {
-        Rt64Backend { created: false }
+        Rt64Backend {
+            #[cfg(feature = "rt64")]
+            context: None,
+            #[cfg(not(feature = "rt64"))]
+            created: false,
+        }
     }
 }
 
@@ -440,40 +437,103 @@ impl Default for Rt64Backend {
 }
 
 impl RenderBackend for Rt64Backend {
-    fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
-        // TODO(rt64-ffi): open a real RT64 device/window here once the
-        // fork is vendored. Until then this is a named stub, not a
-        // pretend-success no-op -- see struct doc comment.
-        self.created = false;
-        Err(RenderError::Backend {
-            backend: "rt64",
-            reason: "RT64 FFI is not wired up yet; see Rt64Backend's doc comment for the two \
-                     concrete blockers (fork not vendored, gfx task handoff signature unresolved)"
-                .to_string(),
-        })
+    fn create(&mut self, cfg: &RenderConfig) -> Result<(), RenderError> {
+        #[cfg(feature = "rt64")]
+        {
+            self.context = None;
+            let context = ffi::Context::create(cfg.width, cfg.height).map_err(|reason| {
+                RenderError::Backend {
+                    backend: "rt64",
+                    reason,
+                }
+            })?;
+            self.context = Some(context);
+            Ok(())
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        {
+            let _ = cfg;
+            self.created = false;
+            Err(RenderError::Backend {
+                backend: "rt64",
+                reason: "fn64-render-rt64 was built without the opt-in `rt64` Cargo feature"
+                    .to_string(),
+            })
+        }
     }
 
     fn process_task(
         &mut self,
-        _rdram: &mut [u8],
-        _task: &OsTask,
-        _output_addr: u32,
+        rdram: &mut [u8],
+        task: &OsTask,
+        output_addr: u32,
     ) -> Result<FrameStatus, RenderError> {
-        Err(RenderError::NotReady(
-            "Rt64Backend::create was never able to succeed (RT64 FFI not wired up)",
-        ))
+        #[cfg(feature = "rt64")]
+        {
+            let context = self
+                .context
+                .as_mut()
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?;
+            context
+                .process_task(rdram, task, output_addr)
+                .map_err(|reason| RenderError::Backend {
+                    backend: "rt64",
+                    reason,
+                })?;
+            Ok(FrameStatus::Complete)
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        {
+            let _ = (rdram, task, output_addr);
+            Err(RenderError::NotReady(
+                "Rt64Backend is unavailable without the `rt64` Cargo feature",
+            ))
+        }
     }
 
     fn present(&mut self) -> Result<(), RenderError> {
-        Err(RenderError::NotReady(
-            "Rt64Backend::create was never able to succeed (RT64 FFI not wired up)",
-        ))
+        #[cfg(feature = "rt64")]
+        {
+            self.context
+                .as_mut()
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
+                .present()
+                .map_err(|reason| RenderError::Backend {
+                    backend: "rt64",
+                    reason,
+                })
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        {
+            Err(RenderError::NotReady(
+                "Rt64Backend is unavailable without the `rt64` Cargo feature",
+            ))
+        }
     }
 
-    fn resize(&mut self, _w: u32, _h: u32) {}
+    fn resize(&mut self, w: u32, h: u32) {
+        #[cfg(feature = "rt64")]
+        if let Some(context) = &mut self.context {
+            context.resize(w, h);
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        let _ = (w, h);
+    }
 
     fn supported_ucodes(&self) -> &[UcodeId] {
-        &[] // deliberately empty: this backend supports nothing yet.
+        #[cfg(feature = "rt64")]
+        {
+            gbi::SUPPORTED
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        {
+            &[]
+        }
     }
 }
 
@@ -482,7 +542,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rt64_backend_create_is_a_named_stub_not_a_silent_success() {
+    #[cfg(not(feature = "rt64"))]
+    fn rt64_backend_without_feature_is_a_named_error_not_a_silent_success() {
         let mut backend = Rt64Backend::new();
         let err = backend.create(&RenderConfig::new(320, 240)).unwrap_err();
         match err {
