@@ -2,7 +2,7 @@
 
 OoT (NTSC 1.0) is fn64's correctness oracle. This is the durable status map.
 Every "done" here is verified (byte-exact test, or an actual frame/PCM looked
-at) — not a tracker label. Updated 2026-07-15.
+at) — not a tracker label. Updated 2026-07-16.
 
 ## Verification contract (do not weaken)
 - **Data** (ROM/savestate → verts/faces/matrices/PCM): byte/index-exact tests
@@ -97,15 +97,20 @@ at) — not a tracker label. Updated 2026-07-15.
 ### Render — geometry & texture layers
 - Geometry: G_VTX, G_TRI1/TRI2/QUAD, G_MTX (LOAD/MUL/PUSH), G_POPMTX, G_DL
   (call/branch, recursion-limited), G_ENDDL — **implemented**.
-- **Depth / Z-test: implemented AND verified correct.** Viewport-mapped NDC-z
+- **Depth math / Z-buffer mechanism: implemented and verified correct.**
+  Viewport-mapped NDC-z
   (`sz=tz=127.75` → screen-z [0,255.5]), nearer wins (`z < depth[pix]`),
   rejects ~124k farther fragments/frame, 42% pixel delta vs painter's-order.
-  Fail-against-bug regression tests in `raster.rs`. (Uses an internal z-array,
-  not G_SETZIMG — functionally correct.)
+  Fail-against-bug regression tests in `raster.rs`. It uses an internal
+  z-array rather than `G_SETZIMG`; selecting compare and update independently
+  from per-triangle other-mode remains TODO below.
 - Textures: G_SETTIMG/SETTILE/SETTILESIZE/LOADTLUT implemented;
   LOADBLOCK/LOADTILE partial (direct decode, not byte-exact TMEM DMA). Texels
-  **are** sampled in the rasterizer (nearest, screen-linear). Formats:
-  RGBA16/32, IA16, I4/IA4, CI8/CI4.
+  **are** sampled in the rasterizer with nearest filtering and
+  perspective-correct S/T (`S/w`, `T/w`, `1/w`, then divide). Formats include
+  RGBA4/8/16/32, I4/8, IA4/8/16, and CI4/8.
+- `G_SETSCISSOR` snapshots quarter-pixel `[upper-left, lower-right)` state per
+  triangle and intersects it with framebuffer raster bounds at pixel centers.
 
 ---
 
@@ -115,8 +120,20 @@ Ordered by leverage, from ground-truth on the reachable file-select 3D scene
 (`/tmp/fn64-depth-nodepth-opaque.png`: recognizable green field + flowers +
 road, but the top half misprojects).
 
-1. **Hyrule Field title-camera projection — the claimed raw-eye matrix bug was
-   falsified by writer tracing (2026-07-16).** Physical `0x1888c8` is written
+1. **Hyrule Field artifact root-caused: per-draw depth policy (2026-07-16).**
+   The exact C-lane task 249 stays red/black after clearing prior-task state or
+   bypassing texture, while bypassing the hardwired depth policy exposes the
+   moon and recognizable field geometry in the oracle's screen regions.
+   Public `gbi.h` defines independent `Z_CMP`/`Z_UPD` bits and OoT alternates
+   z-buffered and non-z-buffered setup lists. Current main decodes and carries
+   those other-mode bits, but the raster write path still compares and updates
+   together for every normal F3DEX2 triangle. The proper follow-up is to honor
+   those two bits independently; `OOT_NO_DEPTH` is only an A/B tool. Full
+   hashes, counts, citations, and falsified candidates are in
+   `docs/OOT-RENDER-ARTIFACT.md`.
+
+   The earlier claimed raw-eye matrix bug was falsified by writer tracing.
+   Physical `0x1888c8` is written
    only by recompiled `guMtxF2L` (`funcs_57.c:3275-3344`), called by recompiled
    `guLookAt` at `funcs_57.c:4368`. Immediately before conversion, recompiled
    `guLookAtF` writes its translation at `funcs_57.c:4166,4251,4280`. The
@@ -162,17 +179,17 @@ road, but the top half misprojects).
    fail-against-bug tests cover state carry, the OoT render-mode macro's
    embedded alpha-dither bits, a transparent cutout texel, depth preservation,
    and mixed dither coverage. The bounded C-file boot reached 250 swaps and
-   produced a changed actual frame sequence; current missing combiner/scissor
-   work still obscures the title-demo foliage in RGB, so the eyes-on dump
-   proves corrected alpha coverage rather than a finished scene.
+   produced a changed actual frame sequence; current depth-policy and
+   fill/color-image gaps still obscure the title-demo foliage in RGB, so the
+   eyes-on dump proves corrected alpha coverage rather than a finished scene.
 3. **Alpha blending: implemented and unit-verified; live visual exercise is
    pending.** Both full and partial other-mode writes feed per-triangle
    `GBL_c1`/`GBL_c2` state. The raster pipeline composites `P*A + M*B` over
    the framebuffer only after combiner, alpha compare, and depth test. The
    bounded boot depth used for this merge may not visibly exercise a
    translucent surface, so an eyes-on blend-specific scene remains TODO.
-4. **G_SETSCISSOR** clip + perspective-correct S/T & depth (HUD split, floor
-   swim).
+4. **Depth interpolation/fill fidelity** remains screen-linear; scissor and
+   perspective-correct S/T are implemented.
 
 ### Partial / loose ends
 - G_GEOMETRYMODE partial (only cull+lighting bits act); G_MOVEMEM/MOVEWORD
@@ -181,8 +198,8 @@ road, but the top half misprojects).
   OoT modulate, decal/replace, primitive-tint, environment-blend, and
   shade-only source set. TEXEL1 and key/noise/K/LOD sources remain logged
   approximations until multi-tile/TMEM and the matching registers exist.
-- Native-Rust bounded probes use `_exit(0)` after explicitly flushing the
-  summary/trace. Suspended coroutines can be stopped inside an existing
+- Bounded C and native-Rust probes use `_exit(0)` after explicitly flushing
+  the summary/trace. Suspended coroutines can be stopped inside an existing
   `extern "C"` blocking shim, where TLS teardown's forced unwind cannot cross
   the ABI boundary. This is harness teardown only; execution still uses the
   same single executor and host thread.

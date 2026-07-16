@@ -167,7 +167,11 @@ Index values (F3DEX2): `G_MV_VIEWPORT = 8`, `G_MV_LIGHT = 10`,
   **fixed-point where the value is pre-multiplied by 4** (the classic N64
   "quarter-pixel" viewport encoding) — divide by 4 to get pixel units. See
   3.5.
-- Lights (`G_MV_LIGHT`) are phase-2.
+- **`G_MV_LIGHT` slot encoding:** the offset field is in eight-byte units.
+  `gSPLight(light, n)` targets byte offset `n * 24 + 24`; DMEM 24-byte indices
+  0 and 1 are the look-at vectors, so `LIGHT_1` (offset 48, wire value 6)
+  maps to light slot 0, `LIGHT_2` maps to slot 1, and so on. In other words,
+  the light slot is `offset_bytes / 24 - 2`, not `- 1`.
 
 ---
 
@@ -740,7 +744,8 @@ RDP framebuffer ops `G_SETCIMG` (`0xFF`) and `G_SETZIMG` (`0xFE`).
 7. `G_GEOMETRYMODE` — only enough to honor `G_CULL_BACK`
 8. `G_SETSCISSOR` — quarter-pixel `[upper-left, lower-right)` raster clip
 
-Everything else acknowledged-and-skipped → flat-shaded from vertex color.
+Remaining opcodes stay acknowledged-and-skipped; decoded texture, lighting,
+other-mode, combiner, blender, and scissor state feed the raster path above.
 
 ### Top 3 things most likely to be wrong/incomplete in a naive rasterizer
 

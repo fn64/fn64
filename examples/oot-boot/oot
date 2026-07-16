@@ -39,7 +39,11 @@ build() {
     CARGO_TARGET_DIR="$FN64/examples/oot-boot/target" \
       cargo build --manifest-path "$FN64/examples/oot-boot/native/Cargo.toml" --release -q || exit 1
   else
-    ( cd "$FN64/examples/oot-boot" && cargo build --release -q ) || exit 1
+    # The same audio-disabled manifest is also the collision-free C lane in a
+    # worktree: with FN64_NATIVE_RECOMP unset/0, build.rs compiles the generated
+    # RecompiledFuncs C and bridge rather than selecting typed-Rust funcs.rs.
+    CARGO_TARGET_DIR="$FN64/examples/oot-boot/target" \
+      cargo build --manifest-path "$FN64/examples/oot-boot/native/Cargo.toml" --release -q || exit 1
   fi
 }
 
