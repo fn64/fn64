@@ -165,8 +165,12 @@ road, but the top half misprojects).
    produced a changed actual frame sequence; current missing combiner/scissor
    work still obscures the title-demo foliage in RGB, so the eyes-on dump
    proves corrected alpha coverage rather than a finished scene.
-3. **Alpha blending** — translucent water/fog/UI (blender currently always
-   overwrites).
+3. **Alpha blending: implemented and unit-verified; live visual exercise is
+   pending.** Both full and partial other-mode writes feed per-triangle
+   `GBL_c1`/`GBL_c2` state. The raster pipeline composites `P*A + M*B` over
+   the framebuffer only after combiner, alpha compare, and depth test. The
+   bounded boot depth used for this merge may not visibly exercise a
+   translucent surface, so an eyes-on blend-specific scene remains TODO.
 4. **G_SETSCISSOR** clip + perspective-correct S/T & depth (HUD split, floor
    swim).
 
