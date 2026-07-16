@@ -78,6 +78,10 @@ pub struct RspContext {
     /// The Vector Unit state (`ctx->rsp`, line 1023) — the register file,
     /// accumulator, flags, and div latch the compute ops operate on.
     pub rsp: VuState,
+    /// Instruction-step (basic-block-entry) counter for perf profiling. Written
+    /// by the generated loop; read by the FFI wrapper. Not part of the RSP
+    /// hardware model — a diagnostic only.
+    pub steps: u64,
 }
 
 impl Default for RspContext {
@@ -90,6 +94,7 @@ impl Default for RspContext {
             resume_address: 0,
             resume_delay: false,
             rsp: VuState::new(),
+            steps: 0,
         }
     }
 }

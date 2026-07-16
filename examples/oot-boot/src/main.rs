@@ -461,6 +461,8 @@ fn main() {
 
     let mut tick = 0u64;
     let mut steps = 0u64;
+    let swap_timing = std::env::var_os("OOT_SWAP_TIMING").is_some();
+    let mut last_swap_instant: Option<std::time::Instant> = None;
     loop {
         if steps >= MAX_STEPS {
             println!(
@@ -503,6 +505,17 @@ fn main() {
         // non-uniform (Task requirement 3).
         let swap_count = fn64_abi::vi_swap_count();
         if swap_count > last_swap_count {
+            // Per-swap wall-clock timing (perf profiling), guarded by
+            // OOT_SWAP_TIMING. Prints ms since the previous swap so a window
+            // (e.g. swaps 233..240) can be averaged.
+            if swap_timing {
+                let now = std::time::Instant::now();
+                if let Some(prev) = last_swap_instant {
+                    let dt = now.duration_since(prev).as_secs_f64() * 1000.0;
+                    println!("[oot-boot] SWAP_TIMING swap={swap_count} dt_ms={dt:.3}");
+                }
+                last_swap_instant = Some(now);
+            }
             // Apply any scripted-input steps whose frame we've now reached.
             // Steps are frame-sorted; the last one at-or-before `swap_count`
             // wins (a HELD button stays until the next step changes it).
@@ -580,6 +593,16 @@ fn main() {
     );
     println!("[oot-boot] gfx tasks submitted: {gfx_count}");
     println!("[oot-boot] audio tasks submitted: {audio_count}");
+    {
+        let (ns, calls) = fn64_abi::audio_ucode_timing();
+        if calls > 0 {
+            println!(
+                "[oot-boot] audio ucode timing: {calls} calls, {:.2} ms total, {:.3} ms/call avg",
+                ns as f64 / 1e6,
+                (ns as f64 / 1e6) / calls as f64
+            );
+        }
+    }
     println!(
         "[oot-boot] non-uniform framebuffers dumped: {} ({:?})",
         fb_dumps.len(),
