@@ -200,16 +200,25 @@ impl SectionRegistry {
             index < self.sections.len(),
             "set_section_loaded_at: no such section index {index}"
         );
-        // A runtime destination can hold only one code image. OoT's
-        // KaleidoManager_LoadOvl reuses one arena first for the pause overlay
-        // and then for the player overlay; retaining both made an address in
-        // the second image canonicalize through the first image's static base.
-        // Remove the displaced section before publishing the new mapping so
-        // resolution never depends on HashSet iteration order.
+        // A runtime byte can hold only one code image. OoT reuses arena spans
+        // at different alignments as well as identical bases: after the
+        // Link's House -> Kokiri transition, the new KiraKira callback was
+        // canonicalized through a stale, partially-overlapping effect span to
+        // 0x80B2CBB0 (inside EffectSsDust_Draw) instead of the exact
+        // EffectSsKiraKira_Init entry at 0x80B2D1B0. Evict every overlapping
+        // runtime range before publishing the new image so HashSet iteration
+        // order cannot select an obsolete translation. OoT NTSC 1.0 ROM
+        // 0x00EA82E0 contains 0x27A40134 at the wrong Dust interior PC, while
+        // KiraKira's exact ROM entry 0x00EA88E0 contains 0xAFA40000.
+        let new_end = u64::from(load_vram) + u64::from(self.sections[index].size);
         let displaced: Vec<_> = self
             .load_vram
             .iter()
-            .filter_map(|(&other, &base)| (other != index && base == load_vram).then_some(other))
+            .filter_map(|(&other, &base)| {
+                let old_end = u64::from(base) + u64::from(self.sections[other].size);
+                (other != index && u64::from(base) < new_end && u64::from(load_vram) < old_end)
+                    .then_some(other)
+            })
             .collect();
         for other in displaced {
             self.load_vram.remove(&other);
@@ -235,7 +244,11 @@ impl SectionRegistry {
     /// becomes resolvable automatically at its true runtime base. Sections
     /// the game never DMAs stay unloaded, keeping `resolve`'s loud trap live
     /// for genuinely-absent code.
-    pub fn load_section_at_rom_addr(&mut self, rom_addr: u32, dest_vram: u32) -> Option<SectionIndex> {
+    pub fn load_section_at_rom_addr(
+        &mut self,
+        rom_addr: u32,
+        dest_vram: u32,
+    ) -> Option<SectionIndex> {
         let idx = self.sections.iter().position(|s| s.rom_addr == rom_addr)?;
         self.set_section_loaded_at(idx, dest_vram);
         Some(idx)
@@ -562,6 +575,38 @@ mod tests {
         assert_eq!(reg.resolve(arena + 0x14c28), 0xfeed_face);
     }
 
+    /// OoT's scene teardown/re-init can reuse only part of an arena span at
+    /// a different aligned base. The prior exact-base eviction left the old
+    /// mapping loaded, so a callback in the overlap canonicalized according
+    /// to whichever HashSet entry happened to be visited first.
+    #[test]
+    fn partially_overlapping_runtime_range_replaces_prior_overlay() {
+        let mut reg = SectionRegistry::new();
+        let stale = reg.register_section(section_at_rom(
+            0x00ea_80b0,
+            0x80b2_c980,
+            0x740,
+            vec![(0x1b4, 0xd057_d057)],
+        ));
+        let current = reg.register_section(section_at_rom(
+            0x00ea_88e0,
+            0x80b2_d1b0,
+            0x5c0,
+            vec![(0, 0xcafe_cafe)],
+        ));
+
+        reg.set_section_loaded_at(stale, 0x801d_a000);
+        reg.set_section_loaded_at(current, 0x801d_a700);
+
+        assert!(
+            !reg.is_section_loaded(stale),
+            "a stale image whose tail overlaps the new allocation must be evicted"
+        );
+        assert!(reg.is_section_loaded(current));
+        assert_eq!(reg.canonical_vram(0x801d_a700), Some(0x80b2_d1b0));
+        assert_eq!(reg.resolve(0x801d_a700), 0xcafe_cafe);
+    }
+
     /// After a DMA load, the SAME section must ALSO resolve at its static
     /// link-time ram_addr, because the recompiler bakes static vram as code
     /// immediates (ConsoleLogo_Init stores `gameState->main = 0x80800690`
@@ -578,7 +623,8 @@ mod tests {
             // ConsoleLogo_Init@0x7b0, ConsoleLogo_Main@0x690 -- distinct ptrs.
             vec![(0x7b0, 0xc0de_1234), (0x690, 0x0bad_c0de)],
         ));
-        reg.load_section_at_rom_addr(0x00b9_da40, 0x803b_4640).unwrap();
+        reg.load_section_at_rom_addr(0x00b9_da40, 0x803b_4640)
+            .unwrap();
         let _ = idx;
         // Relocated heap pointer (from the runtime GameStateOverlay table).
         assert_eq!(reg.resolve(0x803b_4df0), 0xc0de_1234);
@@ -598,7 +644,8 @@ mod tests {
             0x910,
             vec![(0x7b0, 0xc0de_1234)],
         ));
-        reg.load_section_at_rom_addr(0x00b9_da40, 0x803b_4640).unwrap();
+        reg.load_section_at_rom_addr(0x00b9_da40, 0x803b_4640)
+            .unwrap();
         assert_eq!(reg.resolve(0x803b_4df0), 0xc0de_1234);
         reg.set_section_unloaded(idx);
         reg.resolve(0x803b_4df0); // must panic, not serve stale heap base
@@ -625,7 +672,10 @@ mod tests {
         assert_eq!(reg.plan_static_mirror(0x0010_0000, 0x100), None);
 
         // First chunk at the exact section start -> mirror to static base.
-        assert_eq!(reg.plan_static_mirror(0x00bc_db70, 0x2000), Some(static_base));
+        assert_eq!(
+            reg.plan_static_mirror(0x00bc_db70, 0x2000),
+            Some(static_base)
+        );
         // Contiguous next chunk -> static base + 0x2000.
         assert_eq!(
             reg.plan_static_mirror(0x00bc_fb70, 0x2000),
