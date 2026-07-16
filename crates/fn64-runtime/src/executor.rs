@@ -153,6 +153,10 @@ impl Executor {
         self.trace.events()
     }
 
+    pub fn set_trace_enabled(&mut self, enabled: bool) {
+        self.trace.set_enabled(enabled);
+    }
+
     /// Arm incremental crash-safe trace flushing -- see
     /// `TraceLog::set_sink_file`'s doc comment for why this exists (a
     /// SIGSEGV mid-boot must not lose the whole session's trace).
