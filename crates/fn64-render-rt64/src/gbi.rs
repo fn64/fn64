@@ -576,6 +576,11 @@ fn light_vertex(state: &DecodeState, normal: [f32; 3]) -> [u8; 3] {
 }
 
 // --- Texture format decode (F3DEX2-CONCEPTS.md §5.1) --------------------
+//
+// Format/size selector values: OoT `include/ultra64/gbi.h:331-378`.
+// Texel bit layouts and channel expansion: RT64 (MIT)
+// `src/shaders/Formats.hlsli:56-119` and
+// `src/shaders/TextureDecoder.hlsli:30-120,149-204`.
 
 /// RDP image formats (`G_IM_FMT_*`) as encoded in the SETTIMG/SETTILE
 /// format field.
@@ -590,8 +595,9 @@ const G_IM_SIZ_8B: u8 = 1;
 const G_IM_SIZ_16B: u8 = 2;
 const G_IM_SIZ_32B: u8 = 3;
 
-/// Expand a 16-bit RGBA5551 texel to RGBA8888 (5/5/5/1, big-endian --
-/// `pixel16 = R5<<11 | G5<<6 | B5<<1 | A1`, `F3DEX2-CONCEPTS.md` §4.4).
+/// Expand a 16-bit RGBA5551 texel to RGBA8888 (5/5/5/1, big-endian).
+/// RT64 `Formats.hlsli:83-92` gives the exact shifts and 5-to-8 replication;
+/// OoT `gbi.h:334,345` identifies this as `G_IM_FMT_RGBA/G_IM_SIZ_16b`.
 #[inline]
 fn rgba5551_to_rgba8888(px: u16) -> [u8; 4] {
     let r5 = ((px >> 11) & 0x1F) as u8;
@@ -608,13 +614,15 @@ fn rgba5551_to_rgba8888(px: u16) -> [u8; 4] {
     ]
 }
 
-/// Expand an IA16 texel (8-bit intensity, 8-bit alpha) to RGBA8888.
+/// Expand IA16 (8-bit intensity, 8-bit alpha) to RGBA8888, matching RT64
+/// `Formats.hlsli:108-111` (`gbi.h:337,345`).
 #[inline]
 fn ia16_to_rgba8888(hi: u8, lo: u8) -> [u8; 4] {
     [hi, hi, hi, lo]
 }
 
-/// Expand an IA8 texel (4-bit intensity, 4-bit alpha) to RGBA8888.
+/// Expand IA8 (4-bit intensity, 4-bit alpha) to RGBA8888, matching RT64
+/// `Formats.hlsli:75-80` (`gbi.h:337,344`).
 #[inline]
 fn ia8_to_rgba8888(byte: u8) -> [u8; 4] {
     let i4 = byte >> 4;
@@ -624,18 +632,49 @@ fn ia8_to_rgba8888(byte: u8) -> [u8; 4] {
     [i, i, i, a]
 }
 
-/// Expand an I8 texel (8-bit intensity; alpha = intensity) to RGBA8888.
+/// Expand IA4 (3-bit intensity, 1-bit alpha) to RGBA8888, matching RT64
+/// `Formats.hlsli:61-64` (`gbi.h:337,343`).
+#[inline]
+fn ia4_to_rgba8888(nibble: u8) -> [u8; 4] {
+    let i3 = (nibble >> 1) & 0x07;
+    // Exact 3-to-8 replication: abc -> abcabcab.
+    let i = (i3 << 5) | (i3 << 2) | (i3 >> 1);
+    [i, i, i, if nibble & 1 != 0 { 255 } else { 0 }]
+}
+
+/// Expand I8 (8-bit intensity; alpha = intensity) to RGBA8888, matching
+/// RT64 `Formats.hlsli:71-73` (`gbi.h:338,344`).
 #[inline]
 fn i8_to_rgba8888(byte: u8) -> [u8; 4] {
     [byte, byte, byte, byte]
+}
+
+/// Expand I4 (4-bit intensity; alpha = intensity) to RGBA8888, matching
+/// RT64 `Formats.hlsli:56-59` (`gbi.h:338,343`).
+#[inline]
+fn i4_to_rgba8888(nibble: u8) -> [u8; 4] {
+    let i = (nibble << 4) | nibble;
+    [i, i, i, i]
+}
+
+/// Select one 4-bit texel from a packed byte. RT64
+/// `TextureDecoder.hlsli:170-172` selects the high nibble for even columns
+/// and the low nibble for odd columns.
+#[inline]
+fn packed_nibble(byte: u8, texel_index: usize) -> u8 {
+    if texel_index & 1 == 0 {
+        byte >> 4
+    } else {
+        byte & 0x0F
+    }
 }
 
 /// Decode the texture bound to `tile` from the latched `G_SETTIMG` image out
 /// of RDRAM into an RGBA8888 [`Texture`], sized by the tile's
 /// `G_SETTILESIZE` extent. Returns `None` for an unsupported/zero-size
 /// format so the caller leaves the triangle flat-shaded rather than binding
-/// garbage. Covers the common OoT formats: RGBA16/32, IA16/IA8, I8/I4,
-/// CI8/CI4 (via the loaded TLUT).
+/// garbage. Covers the common OoT formats: RGBA16/32, RGBA4/8 hardware
+/// aliases, IA16/IA8/IA4, I8/I4, and CI8/CI4 (via the loaded TLUT).
 ///
 /// This is deliberately NOT a byte-exact 4 KiB TMEM model. A first
 /// recognizable textured frame needs the right texels addressed by the right
@@ -682,30 +721,43 @@ fn decode_current_texture(
                     ia16_to_rgba8888(read_u8(rdram, o), read_u8(rdram, o + 1))
                 }
                 (G_IM_FMT_IA, G_IM_SIZ_8B) => ia8_to_rgba8888(read_u8(rdram, base + texel_index)),
-                (G_IM_FMT_I, G_IM_SIZ_8B) => i8_to_rgba8888(read_u8(rdram, base + texel_index)),
-                (G_IM_FMT_I, G_IM_SIZ_4B) | (G_IM_FMT_IA, G_IM_SIZ_4B) => {
-                    // 4-bit intensity: two texels per byte, high nibble first.
+                (G_IM_FMT_I, G_IM_SIZ_8B) | (G_IM_FMT_RGBA, G_IM_SIZ_8B) => {
+                    // RGBA8 is not a nominal GBI format, but RT64's observed
+                    // hardware path samples it identically to I8
+                    // (`TextureDecoder.hlsli:68-75`).
+                    i8_to_rgba8888(read_u8(rdram, base + texel_index))
+                }
+                (G_IM_FMT_IA, G_IM_SIZ_4B) => {
                     let byte = read_u8(rdram, base + texel_index / 2);
-                    let nib = if texel_index & 1 == 0 {
-                        byte >> 4
-                    } else {
-                        byte & 0x0F
-                    };
-                    let v = (nib << 4) | nib;
-                    [v, v, v, v]
+                    ia4_to_rgba8888(packed_nibble(byte, texel_index))
+                }
+                (G_IM_FMT_I, G_IM_SIZ_4B) | (G_IM_FMT_RGBA, G_IM_SIZ_4B) => {
+                    // RGBA4 likewise aliases I4 on hardware (RT64
+                    // `TextureDecoder.hlsli:45-56`). OoT's real 250-swap
+                    // C-boot trace exercises this otherwise-unsupported pair.
+                    let byte = read_u8(rdram, base + texel_index / 2);
+                    i4_to_rgba8888(packed_nibble(byte, texel_index))
                 }
                 (G_IM_FMT_CI, G_IM_SIZ_8B) => {
+                    // RT64 `TextureDecoder.hlsli:174-184`: an 8-bit CI texel
+                    // is the full TLUT index. OoT uses RGBA16 TLUTs only
+                    // (`oot-decomp/docs/assets/images.md:63-64`).
                     let idx = read_u8(rdram, base + texel_index) as usize;
                     tex.tlut.get(idx).copied().unwrap_or([255, 0, 255, 255])
                 }
                 (G_IM_FMT_CI, G_IM_SIZ_4B) => {
                     let byte = read_u8(rdram, base + texel_index / 2);
-                    let nib = if texel_index & 1 == 0 {
-                        byte >> 4
+                    // RT64 `TextureDecoder.hlsli:176-179`: CI4 prepends the
+                    // tile's four-bit palette bank to the texel nibble in
+                    // TMEM. A 16-entry G_LOADTLUT is stored by this decoder as
+                    // a palette-local Vec (entry zero is that bank's first
+                    // color), while a full TLUT remains globally indexed.
+                    let nib = packed_nibble(byte, texel_index) as usize;
+                    let idx = if tex.tlut.len() <= 16 {
+                        nib
                     } else {
-                        byte & 0x0F
-                    } as usize;
-                    let idx = ((t.palette as usize) << 4) | nib;
+                        ((t.palette as usize) << 4) | nib
+                    };
                     tex.tlut.get(idx).copied().unwrap_or([255, 0, 255, 255])
                 }
                 _ => return None, // unsupported format: leave flat-shaded.
@@ -2383,6 +2435,188 @@ mod tests {
         assert_eq!(rgba5551_to_rgba8888(0x07C1), [0, 255, 0, 255]);
         // Black, alpha 0.
         assert_eq!(rgba5551_to_rgba8888(0x0000), [0, 0, 0, 0]);
+    }
+
+    fn assert_texture_row(
+        bytes: &[u8],
+        width: u16,
+        fmt: u8,
+        siz: u8,
+        palette: u8,
+        tlut: Vec<[u8; 4]>,
+        expected: &[u8],
+    ) {
+        let base = 0x100usize;
+        let mut rdram = vec![0u8; base + bytes.len() + 4];
+        for (i, &byte) in bytes.iter().enumerate() {
+            wr_u8(&mut rdram, base + i, byte);
+        }
+
+        let mut tex = TexState {
+            timg_addr: base as u32,
+            tlut,
+            ..Default::default()
+        };
+        tex.tiles[0] = Tile {
+            fmt,
+            siz,
+            palette,
+            lrs: (width - 1) * 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_current_texture(&rdram, &tex, &[0; 16], 0)
+                .expect("OoT-used texture format must decode")
+                .texels
+                .as_slice(),
+            expected
+        );
+    }
+
+    #[test]
+    fn decode_rgba16_covers_low_channels_and_alpha_edges() {
+        // 0x0001 = opaque black; 0xffff = opaque white; 0x0842 has the
+        // lowest nonzero R/G/B codes and clear alpha. This catches both a
+        // dropped 1-bit alpha and incorrect 5-to-8 scaling at the low edge.
+        assert_texture_row(
+            &[0x00, 0x01, 0xff, 0xff, 0x08, 0x42],
+            3,
+            G_IM_FMT_RGBA,
+            G_IM_SIZ_16B,
+            0,
+            Vec::new(),
+            &[0, 0, 0, 255, 255, 255, 255, 255, 8, 8, 8, 0],
+        );
+    }
+
+    #[test]
+    fn decode_rgba8_uses_observed_hardware_i8_alias() {
+        // Fail-against-bug: this pair previously fell through to None and
+        // left the surface flat. RT64 records that hardware samples it as I8.
+        assert_texture_row(
+            &[0x24, 0xdb],
+            2,
+            G_IM_FMT_RGBA,
+            G_IM_SIZ_8B,
+            0,
+            Vec::new(),
+            &[0x24, 0x24, 0x24, 0x24, 0xdb, 0xdb, 0xdb, 0xdb],
+        );
+    }
+
+    #[test]
+    fn decode_rgba4_uses_observed_hardware_i4_alias() {
+        // Fail-against-bug and live-OoT case: RGBA4 was one of the `_ =>
+        // None` combinations, so every such tile remained flat-shaded.
+        assert_texture_row(
+            &[0x39],
+            2,
+            G_IM_FMT_RGBA,
+            G_IM_SIZ_4B,
+            0,
+            Vec::new(),
+            &[0x33, 0x33, 0x33, 0x33, 0x99, 0x99, 0x99, 0x99],
+        );
+    }
+
+    #[test]
+    fn decode_ia8_splits_four_bit_intensity_and_alpha() {
+        assert_texture_row(
+            &[0x1e, 0xf0],
+            2,
+            G_IM_FMT_IA,
+            G_IM_SIZ_8B,
+            0,
+            Vec::new(),
+            &[0x11, 0x11, 0x11, 0xee, 0xff, 0xff, 0xff, 0x00],
+        );
+    }
+
+    #[test]
+    fn decode_ia4_is_three_bit_intensity_plus_one_bit_alpha() {
+        // Fail-against-bug: the old shared I4/IA4 arm expanded the whole
+        // nibble into every channel. In particular 0x1 became translucent
+        // dark gray and 0xe became opaque light gray. IA4 requires those to
+        // be opaque black and transparent white respectively.
+        assert_texture_row(
+            &[0x1e, 0xa7],
+            4,
+            G_IM_FMT_IA,
+            G_IM_SIZ_4B,
+            0,
+            Vec::new(),
+            &[
+                0, 0, 0, 255, // 0x1: I=0, A=1
+                255, 255, 255, 0, // 0xe: I=7, A=0
+                182, 182, 182, 0, // 0xa: I=5, A=0
+                109, 109, 109, 255, // 0x7: I=3, A=1
+            ],
+        );
+    }
+
+    #[test]
+    fn decode_i8_replicates_intensity_into_rgba() {
+        assert_texture_row(
+            &[0x00, 0x7f, 0xff],
+            3,
+            G_IM_FMT_I,
+            G_IM_SIZ_8B,
+            0,
+            Vec::new(),
+            &[0, 0, 0, 0, 0x7f, 0x7f, 0x7f, 0x7f, 0xff, 0xff, 0xff, 0xff],
+        );
+    }
+
+    #[test]
+    fn decode_ci8_uses_full_byte_as_rgba16_tlut_index() {
+        let mut tlut = vec![[0, 0, 0, 0]; 256];
+        tlut[0] = [1, 2, 3, 4];
+        tlut[0x7f] = [5, 6, 7, 8];
+        tlut[0xff] = [9, 10, 11, 12];
+        assert_texture_row(
+            &[0x00, 0x7f, 0xff],
+            3,
+            G_IM_FMT_CI,
+            G_IM_SIZ_8B,
+            0,
+            tlut,
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        );
+    }
+
+    #[test]
+    fn decode_ci4_combines_palette_bank_with_each_nibble() {
+        let mut tlut = vec![[0, 0, 0, 0]; 0x30];
+        tlut[0x21] = [1, 3, 5, 7];
+        tlut[0x2f] = [2, 4, 6, 8];
+        assert_texture_row(
+            &[0x1f],
+            2,
+            G_IM_FMT_CI,
+            G_IM_SIZ_4B,
+            2,
+            tlut,
+            &[1, 3, 5, 7, 2, 4, 6, 8],
+        );
+    }
+
+    #[test]
+    fn decode_ci4_pal16_load_uses_palette_local_indices() {
+        // Fail-against-bug: G_LOADTLUT stores a 16-entry pal16 load in this
+        // decoder as entries 0..15. The old CI4 arm added palette<<4 again,
+        // indexed past this Vec for every nonzero bank, and returned magenta.
+        let mut tlut = vec![[0, 0, 0, 0]; 16];
+        tlut[1] = [11, 22, 33, 44];
+        tlut[15] = [55, 66, 77, 88];
+        assert_texture_row(
+            &[0x1f],
+            2,
+            G_IM_FMT_CI,
+            G_IM_SIZ_4B,
+            2,
+            tlut,
+            &[11, 22, 33, 44, 55, 66, 77, 88],
+        );
     }
 
     // --- Projection w-sign regression (the "giant triangles from a point"
