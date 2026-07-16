@@ -16,7 +16,7 @@
 //! # Usage
 //!
 //! ```text
-//! recompile_rom --config <oot.toml> --rom <oot.z64> [--out <dir>]
+//! recompile_rom --config <oot.toml> --rom <oot.z64> [--out <dir>] [--profile <profile.toml>]
 //! # or via env:
 //! OOT_CONFIG=<oot.toml> OOT_ROM=<oot.z64> recompile_rom
 //! ```
@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use fn64_recomp::{load_config, Function, RecompConfig, Section};
@@ -62,12 +63,33 @@ fn main() -> std::process::ExitCode {
     eprintln!(
         "loaded config: {} sections, {} functions; ROM {} ({} bytes)",
         cfg.sections.len(),
-        cfg.sections.iter().map(|s| s.functions.len()).sum::<usize>(),
+        cfg.sections
+            .iter()
+            .map(|s| s.functions.len())
+            .sum::<usize>(),
         cfg.rom_file_path.display(),
         rom.len()
     );
 
-    let report = run(&cfg, &rom);
+    let force_recompile = match args.profile.as_deref() {
+        Some(path) => match load_force_recompile(path) {
+            Ok(names) => {
+                eprintln!(
+                    "loaded {} force-recompile overrides from {}",
+                    names.len(),
+                    path.display()
+                );
+                names
+            }
+            Err(e) => {
+                eprintln!("failed to load profile {}: {e}", path.display());
+                return std::process::ExitCode::from(2);
+            }
+        },
+        None => HashSet::new(),
+    };
+
+    let report = run(&cfg, &rom, &force_recompile);
 
     std::fs::create_dir_all(&args.out).ok();
     let module_path = args.out.join("funcs.rs");
@@ -89,13 +111,15 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-const USAGE: &str = "usage: recompile_rom --config <oot.toml> --rom <oot.z64> [--out <dir>]\n\
-                     env fallbacks: OOT_CONFIG, OOT_ROM, OOT_OUT";
+const USAGE: &str = "usage: recompile_rom --config <oot.toml> --rom <oot.z64> [--out <dir>] \
+                     [--profile <profile.toml>]\n\
+                     env fallbacks: OOT_CONFIG, OOT_ROM, OOT_OUT, NATIVE_RECOMP_PROFILE";
 
 struct Args {
     config: PathBuf,
     rom: PathBuf,
     out: PathBuf,
+    profile: Option<PathBuf>,
 }
 
 impl Args {
@@ -103,6 +127,9 @@ impl Args {
         let mut config = std::env::var("OOT_CONFIG").ok().map(PathBuf::from);
         let mut rom = std::env::var("OOT_ROM").ok().map(PathBuf::from);
         let mut out = std::env::var("OOT_OUT").ok().map(PathBuf::from);
+        let mut profile = std::env::var("NATIVE_RECOMP_PROFILE")
+            .ok()
+            .map(PathBuf::from);
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -110,6 +137,7 @@ impl Args {
                 "--config" => config = Some(PathBuf::from(next(&mut it, "--config")?)),
                 "--rom" => rom = Some(PathBuf::from(next(&mut it, "--rom")?)),
                 "--out" => out = Some(PathBuf::from(next(&mut it, "--out")?)),
+                "--profile" => profile = Some(PathBuf::from(next(&mut it, "--profile")?)),
                 "-h" | "--help" => return Err("help".to_string()),
                 other => return Err(format!("unknown argument {other:?}")),
             }
@@ -118,8 +146,26 @@ impl Args {
             config: config.ok_or("--config (or OOT_CONFIG) is required")?,
             rom: rom.ok_or("--rom (or OOT_ROM) is required")?,
             out: out.unwrap_or_else(|| PathBuf::from("recomp-out")),
+            profile,
         })
     }
+}
+
+#[derive(serde::Deserialize)]
+struct RecompileProfile {
+    syms: RecompileProfileSymbols,
+}
+
+#[derive(serde::Deserialize)]
+struct RecompileProfileSymbols {
+    #[serde(default)]
+    force_recompile: Vec<String>,
+}
+
+fn load_force_recompile(path: &std::path::Path) -> Result<HashSet<String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let profile: RecompileProfile = toml::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(profile.syms.force_recompile.into_iter().collect())
 }
 
 fn next(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -168,9 +214,33 @@ struct Report {
     native_symbols: usize,
 }
 
-fn run(cfg: &RecompConfig, rom: &[u8]) -> Report {
-    use std::collections::HashSet;
-    let stubbed: HashSet<&str> = cfg.patches.stubs.iter().map(String::as_str).collect();
+fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Report {
+    // The bootstrap config's stub scan treats every BREAK as privileged. MIPS
+    // compilers also emit two rigid BREAK shapes after integer DIV/DIVU for
+    // divide-by-zero and INT_MIN/-1. Recognize the complete guard sequences,
+    // not just the opcode, so the whole recurring class is admitted while an
+    // arbitrary BREAK remains host-bound/stubbed.
+    let auto_div_guards: HashSet<&str> = cfg
+        .sections
+        .iter()
+        .flat_map(|section| {
+            section.functions.iter().filter_map(move |func| {
+                if !cfg.patches.stubs.iter().any(|name| name == &func.name) {
+                    return None;
+                }
+                let words = read_func_words(rom, section, func)?;
+                let instrs: Vec<_> = words.into_iter().map(decode).collect();
+                compiler_div_guards_only(&instrs).then_some(func.name.as_str())
+            })
+        })
+        .collect();
+    let stubbed: HashSet<&str> = cfg
+        .patches
+        .stubs
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !force_recompile.contains(*name) && !auto_div_guards.contains(*name))
+        .collect();
     let ignored: HashSet<&str> = cfg.patches.ignored.iter().map(String::as_str).collect();
 
     // Runtime-trap functions are absent from the native table: direct JAL and
@@ -181,11 +251,15 @@ fn run(cfg: &RecompConfig, rom: &[u8]) -> Report {
             if stubbed.contains(f.name.as_str()) || ignored.contains(f.name.as_str()) {
                 return None;
             }
+            let forced = force_recompile.contains(f.name.as_str())
+                || auto_div_guards.contains(f.name.as_str());
             let words = read_func_words(rom, s, f)?;
             let mut decoded = words.iter().map(|&word| decode(word));
             decoded
                 .all(|instr| {
-                    !matches!(instr, Instruction::Unknown { .. }) && trap_kind(&instr).is_none()
+                    !matches!(instr, Instruction::Unknown { .. })
+                        && (forced && matches!(instr, Instruction::Break { .. })
+                            || trap_kind(&instr).is_none())
                 })
                 .then(|| (f.name.clone(), f.vram))
         })
@@ -196,10 +270,13 @@ fn run(cfg: &RecompConfig, rom: &[u8]) -> Report {
     module.push_str(
         "// Only CLEAN native functions are included; host-owned trap functions route through lookup.\n",
     );
-    module.push_str("#![allow(clippy::all, unused, non_snake_case)]\n");
+    // An outer module attribute works both when funcs.rs is compiled as a
+    // crate root and when a boot harness `include!`s it inside its own module.
+    // An inner `#![allow]` is rejected in the latter context.
+    module.push_str("#[allow(clippy::all, unused, non_snake_case)]\nmod generated {\n");
     module.push_str("#[allow(unused_imports)]\n");
     module.push_str(
-        "use fn64_recomp_native::{resolve_host_function, RecompContext, RecompFunc, Rdram, round_ties_even_f32, round_ties_even_f64};\n\n",
+        "use fn64_recomp_native::{call_host_or_native, pause_self, resolve_host_function, RecompContext, RecompFunc, Rdram, round_ties_even_f32, round_ties_even_f64};\n\n",
     );
 
     let mut results = Vec::new();
@@ -232,8 +309,23 @@ fn run(cfg: &RecompConfig, rom: &[u8]) -> Report {
                     _ => None,
                 })
                 .collect();
-            let trap_kinds: Vec<&'static str> =
-                instrs.iter().filter_map(trap_kind).collect::<Vec<_>>();
+            // Profile-vetted force-recompile entries are compiler-generated
+            // divide guards: retain their BREAK as a loud path-local panic,
+            // but do not discard the entire otherwise ordinary function.
+            // Any other privileged/trapping instruction still host-binds the
+            // body even if the profile names it.
+            let forced = force_recompile.contains(func.name.as_str())
+                || auto_div_guards.contains(func.name.as_str());
+            let trap_kinds: Vec<&'static str> = instrs
+                .iter()
+                .filter_map(|instr| {
+                    if forced && matches!(instr, Instruction::Break { .. }) {
+                        None
+                    } else {
+                        trap_kind(instr)
+                    }
+                })
+                .collect();
 
             let outcome = if !unknown_words.is_empty() {
                 Outcome::UnknownOpcode
@@ -273,6 +365,21 @@ fn run(cfg: &RecompConfig, rom: &[u8]) -> Report {
     }
 
     module.push_str(&emit_lookup_dispatcher(&symbols));
+    module.push_str(
+        "\n/// (ROM address, static vram, byte size) in config section order.\n\
+         pub static NATIVE_SECTION_GEOMETRY: &[(u32, u32, u32)] = &[\n",
+    );
+    for section in &cfg.sections {
+        let _ = std::fmt::Write::write_fmt(
+            &mut module,
+            format_args!(
+                "    ({:#010X}, {:#010X}, {:#010X}),\n",
+                section.rom, section.vram, section.size
+            ),
+        );
+    }
+    module.push_str("];\n");
+    module.push_str("}\npub use generated::*;\n");
 
     Report {
         module,
@@ -280,6 +387,42 @@ fn run(cfg: &RecompConfig, rom: &[u8]) -> Report {
         lookup_sites,
         native_symbols: symbols.len(),
     }
+}
+
+fn compiler_div_guards_only(instrs: &[Instruction]) -> bool {
+    let mut saw_break = false;
+    for (i, instr) in instrs.iter().enumerate() {
+        if matches!(instr, Instruction::Unknown { .. }) {
+            return false;
+        }
+        let Some(kind) = trap_kind(instr) else {
+            continue;
+        };
+        if kind != "break" {
+            return false;
+        }
+        saw_break = true;
+        let divide_by_zero = i >= 2
+            && matches!(instrs[i - 2], Instruction::Bne { rt: 0, off: 2, .. })
+            && matches!(instrs[i - 1], Instruction::Nop);
+        let signed_overflow = i >= 5
+            && matches!(
+                instrs[i - 5],
+                Instruction::Addiu {
+                    rt: 1,
+                    rs: 0,
+                    imm: -1
+                }
+            )
+            && matches!(instrs[i - 4], Instruction::Bne { rt: 1, off: 4, .. })
+            && matches!(instrs[i - 3], Instruction::Lui { rt: 1, imm: 0x8000 })
+            && matches!(instrs[i - 2], Instruction::Bne { rt: 1, off: 2, .. })
+            && matches!(instrs[i - 1], Instruction::Nop);
+        if !divide_by_zero && !signed_overflow {
+            return false;
+        }
+    }
+    saw_break
 }
 
 impl FuncResult {
@@ -424,6 +567,23 @@ impl Report {
         }
         s.push('\n');
 
+        s.push_str("### Complete host-bound inventory\n\n");
+        s.push_str("| function | vram | section | trap kinds |\n|---|---:|---|---|\n");
+        for r in self
+            .results
+            .iter()
+            .filter(|r| r.outcome == Outcome::RuntimeTrap)
+        {
+            s.push_str(&format!(
+                "| `{}` | `{:#010X}` | `{}` | {} |\n",
+                r.name,
+                r.vram,
+                r.section,
+                r.trap_kinds.join(", ")
+            ));
+        }
+        s.push('\n');
+
         // Unknown-opcode breakdown (the genuine decoder gaps).
         s.push_str("## Unknown-opcode functions (GENUINE decoder/emitter gaps)\n\n");
         s.push_str(
@@ -558,8 +718,7 @@ impl Report {
              entries and omitted trap bodies fail loudly unless the boot host binds them. The \
              table and callback use ordinary safe `fn` pointers: no `unsafe`, pointer cast, or \
              `transmute`.\n\n",
-            self.lookup_sites,
-            self.native_symbols,
+            self.lookup_sites, self.native_symbols,
         ));
 
         s
@@ -618,6 +777,43 @@ mod tests {
     }
 
     #[test]
+    fn only_complete_compiler_divide_guard_breaks_are_auto_vetted() {
+        let div_zero = [
+            Instruction::Bne {
+                rs: 11,
+                rt: 0,
+                off: 2,
+            },
+            Instruction::Nop,
+            Instruction::Break { code: 0x1c00 },
+        ];
+        assert!(compiler_div_guards_only(&div_zero));
+
+        let overflow = [
+            Instruction::Addiu {
+                rt: 1,
+                rs: 0,
+                imm: -1,
+            },
+            Instruction::Bne {
+                rs: 11,
+                rt: 1,
+                off: 4,
+            },
+            Instruction::Lui { rt: 1, imm: 0x8000 },
+            Instruction::Bne {
+                rs: 25,
+                rt: 1,
+                off: 2,
+            },
+            Instruction::Nop,
+            Instruction::Break { code: 0x1800 },
+        ];
+        assert!(compiler_div_guards_only(&overflow));
+        assert!(!compiler_div_guards_only(&[Instruction::Break { code: 7 }]));
+    }
+
+    #[test]
     fn runtime_trap_is_host_bound_for_direct_and_indirect_dispatch() {
         // caller: jal osSendMesg; nop; jr ra; nop
         // osSendMesg: break 0x1c00; jr ra; nop
@@ -661,12 +857,10 @@ mod tests {
             patches: Patches::default(),
         };
 
-        let report = run(&cfg, &rom);
+        let report = run(&cfg, &rom, &HashSet::new());
         assert!(report.module.contains("lookup(0x80000010)(ctx, mem);"));
         assert!(!report.module.contains("pub fn osSendMesg"));
-        assert!(report
-            .module
-            .contains("(0x80000000, caller as RecompFunc)"));
+        assert!(report.module.contains("(0x80000000, caller as RecompFunc)"));
         assert!(!report
             .module
             .contains("(0x80000010, osSendMesg as RecompFunc)"));
@@ -680,5 +874,46 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn profile_override_recompiles_a_stubbed_divide_guard() {
+        // addiu v0,zero,1; break 7; jr ra; nop. The profile is the evidence
+        // that BREAK is a compiler guard in this named function; if reached,
+        // the generated panic remains loud.
+        let words = [0x2402_0001u32, 0x0000_01CD, 0x03E0_0008, 0x0000_0000];
+        let rom = words
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect::<Vec<_>>();
+        let cfg = RecompConfig {
+            entrypoint: 0x8000_0000,
+            rom_file_path: PathBuf::from("synthetic.z64"),
+            bss_section_suffix: "_bss".to_string(),
+            output_func_path: PathBuf::from("out"),
+            trace_mode: false,
+            sections: vec![Section {
+                name: "code".to_string(),
+                rom: 0,
+                vram: 0x8000_0000,
+                size: rom.len() as u32,
+                functions: vec![Function {
+                    name: "guarded_div".to_string(),
+                    vram: 0x8000_0000,
+                    size: rom.len() as u32,
+                }],
+            }],
+            patches: Patches {
+                stubs: vec!["guarded_div".to_string()],
+                ..Patches::default()
+            },
+        };
+        let forced = HashSet::from(["guarded_div".to_string()]);
+
+        let report = run(&cfg, &rom, &forced);
+
+        assert!(report.module.contains("pub fn guarded_div"));
+        assert!(report.module.contains("panic!(\"break (code"));
+        assert!(report.results[0].outcome == Outcome::Clean);
     }
 }

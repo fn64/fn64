@@ -127,20 +127,22 @@ road, but the top half misprojects).
 ### Partial / loose ends
 - G_GEOMETRYMODE partial (only cull+lighting bits act); G_MOVEMEM/MOVEWORD
   partial; G_SETZIMG/SETCIMG/TEXRECT stubs.
-- Process-exit teardown panic (`_Fault_ThreadEntry`/`panic_cannot_unwind`
-  during executor drop) — pre-existing, audio-independent, cosmetic.
-- Native-Rust boot currently executes the typed OoT entrypoint through the
-  dispatcher and reaches the first host-owned boundary, `__osGetSR` at
-  `0x80003430`. Both direct JAL and computed JALR calls to omitted trap bodies
-  take `lookup(vram)`, which asks the thread-local host resolver before its
-  native table and otherwise fails loudly. Completing this path requires safe
-  typed adapters for the missing COP0/exception services (starting with
-  `__osGetSR`), sharing the native context/RDRAM model with the executor, and
-  selecting the Rust module in `examples/oot-boot` instead of its C bridge.
+- Native-Rust bounded probes use `_exit(0)` after explicitly flushing the
+  summary/trace. Suspended coroutines can be stopped inside an existing
+  `extern "C"` blocking shim, where TLS teardown's forced unwind cannot cross
+  the ABI boundary. This is harness teardown only; execution still uses the
+  same single executor and host thread.
+- Native-Rust boot now reaches **two VI swaps and two non-clear render tasks**.
+  The first rendered task contains 96 triangles and is preserved as
+  `/tmp/fn64-nboot-frame.png` (early black/debug frame, not a faithful title
+  image). The next loud frontier is an unaligned `SW` at `0x8012564A` in
+  `AudioLoad_Dma` on the third audio retrace. It has not been papered over:
+  the address suggests a corrupted/unexpected stack pointer and needs a
+  register/stack trace against the C lane before relaxing typed alignment.
 
 ---
 
-## 🔲 Whole-ROM native recompile (task #28 — the "recomp done" milestone, IN PROGRESS)
+## ✅ Whole-ROM native recompile + native boot (task #28)
 fn64-recomp-native (from-scratch Rust MIPS→typed-Rust recompiler) can now recompile
 the WHOLE OoT ROM. Driver `recompile_rom` + config loader (`fn64-recomp/src/load.rs`,
 loads all 472 sections / 13,358 fns from oot.toml+dump.toml) landed on
@@ -154,8 +156,21 @@ loads all 472 sections / 13,358 fns from oot.toml+dump.toml) landed on
 - **The ONE real link blocker: the `lookup(u32)->fn` indirect dispatcher** (2,078 call
   sites, empirically the ONLY undefined symbol). = N64Recomp's `get_function(vram)`.
   Building it (branch `feat/native-lookup-dispatcher`) is what makes the whole module LINK.
-Remaining to "OoT boots on native Rust": dispatcher → link (0 undefined) → shim-seam for
-the 45 OS fns → boot on funcs.rs instead of the N64Recomp C files.
+The native-boot lane selects `funcs.rs` with `FN64_NATIVE_RECOMP=1` and skips
+the C compiler/section bridge. `fn64-abi::native` explicitly marshals typed
+GPR/HI/LO/COP0 status at the already-unsafe host boundary, while every spawned
+OSThread stays on the existing executor/coroutine machinery and shared RDRAM.
+The module exports section geometry so the existing DMA-driven
+`SectionRegistry` can canonicalize relocated overlay callbacks.
+
+The current profile-aware/guard-swept result is **13,324 clean + 25
+host-bound = 13,349/13,358 (99.93%) linkable**, with nine genuine config
+stubs. Ten consecutive release probes reached swap 1 and the same non-clear
+96-triangle render with exit code 0. The deepest probe reached swap 2 before
+the alignment frontier above. A one-swap differential against the C lane had
+the same 550 event shapes; the raw trace first differs at event 294 only in
+`sim_time` (0 versus 100), where the native harness injects its documented
+idle-loop clock pacing.
 
 ## 🔲 Beyond OoT (deferred until it renders faithfully)
 - Generalize the pipeline: fn64 owns discover→decomp→recomp→run generically

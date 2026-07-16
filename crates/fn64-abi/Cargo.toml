@@ -12,6 +12,10 @@ description = "The extern \"C\" surface recompiled N64Recomp game code links aga
 # shape at a small scale.
 crate-type = ["lib", "staticlib"]
 
+[features]
+default = []
+native-recomp = ["dep:fn64-recomp-native"]
+
 [dependencies]
 fn64-runtime = { path = "../fn64-runtime" }
 # The RenderBackend trait ONLY (docs/DECOUPLING.md) -- fn64-abi routes the
@@ -32,6 +36,7 @@ fn64-audio = { path = "../fn64-audio" }
 # fn64-runtime uses, per docs/DESIGN.md section 2's single stackful-
 # coroutine model; not a second, competing coroutine implementation.
 corosensei = "0.3"
+fn64-recomp-native = { path = "../fn64-recomp-native", optional = true }
 
 [dev-dependencies]
 # Only for a test proving the gfx-task seam actually reaches a real backend

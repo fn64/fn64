@@ -359,6 +359,24 @@ impl SectionRegistry {
         );
     }
 
+    /// Translate a loaded overlay's relocated heap address back to its
+    /// static link-time vram. Native typed modules key their function table
+    /// by that canonical vram, while the game's relocation pass stores heap
+    /// addresses in callback tables. Static/resident addresses return `None`
+    /// so a host-first lookup cannot recurse on an unchanged address.
+    pub fn canonical_vram(&self, vram: u32) -> Option<u32> {
+        for &idx in &self.loaded {
+            let section = &self.sections[idx];
+            let Some(load_base) = self.load_vram.get(&idx).copied() else {
+                continue;
+            };
+            if load_base != section.ram_addr && section.contains_at(load_base, vram) {
+                return Some(section.ram_addr.wrapping_add(vram - load_base));
+            }
+        }
+        None
+    }
+
     pub fn section_count(&self) -> usize {
         self.sections.len()
     }
@@ -499,6 +517,8 @@ mod tests {
             Some(idx)
         );
         // The game's Overlay_Relocate produced init = 0x803b4640 + 0x7b0.
+        assert_eq!(reg.canonical_vram(0x803b_4df0), Some(0x8080_07b0));
+        assert_eq!(reg.canonical_vram(0x8080_07b0), None);
         assert_eq!(reg.resolve(0x803b_4df0), 0xc0de_1234);
     }
 

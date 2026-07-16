@@ -1,0 +1,29 @@
+[package]
+name = "oot-boot-native"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+build = "../build.rs"
+description = "Native-Rust whole-ROM configuration of the shared OoT boot harness"
+
+[workspace]
+
+[features]
+default = []
+oot-audio = []
+
+[[bin]]
+name = "oot-boot"
+path = "../src/main.rs"
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+libc = "0.2"
+fn64-runtime = { path = "../../../crates/fn64-runtime" }
+fn64-abi = { path = "../../../crates/fn64-abi", features = ["native-recomp"] }
+fn64-recomp-native = { path = "../../../crates/fn64-recomp-native" }
+fn64-render = { path = "../../../crates/fn64-render" }
+fn64-render-rt64 = { path = "../../../crates/fn64-render-rt64" }

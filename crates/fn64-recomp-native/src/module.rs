@@ -194,7 +194,7 @@ pub fn emit_module(funcs: &[ModuleFunc], symbols: &SymbolTable) -> String {
     out.push_str("// Typed Rust, no unsafe, no pointer casts.\n");
     out.push_str("#![allow(clippy::all, unused, non_snake_case)]\n");
     out.push_str(
-        "use fn64_recomp_native::{resolve_host_function, RecompContext, RecompFunc, Rdram};\n\n",
+        "use fn64_recomp_native::{call_host_or_native, pause_self, resolve_host_function, RecompContext, RecompFunc, Rdram};\n\n",
     );
     for f in funcs {
         let input = FuncInput {
