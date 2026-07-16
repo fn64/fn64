@@ -1,7 +1,7 @@
 //! `rsp_recompile` — the RSP → typed-Rust recompiler CLI.
 //!
-//! Reads a raw big-endian RSP ucode text image (e.g. OoT's `aspMainText`
-//! incbin), decodes every 32-bit word with the clean-room decoder, and either
+//! Reads a raw big-endian RSP ucode text image, decodes every 32-bit word with
+//! the clean-room decoder, and either
 //! reports the opcode histogram + any decode gaps, or emits a typed-Rust
 //! module implementing the ucode.
 //!
@@ -17,7 +17,10 @@ use fn64_audio::rsp::emit::emit_module;
 
 fn read_words(path: &str) -> Vec<u32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    assert!(bytes.len() % 4 == 0, "ucode text length not word-aligned");
+    assert!(
+        bytes.len().is_multiple_of(4),
+        "ucode text length not word-aligned"
+    );
     bytes
         .chunks_exact(4)
         .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
@@ -31,13 +34,6 @@ fn mnemonic(i: &Instr) -> String {
         Instr::AluReg { op, .. } => format!("{op:?}").to_lowercase(),
         Instr::Shift { op, .. } => format!("{op:?}").to_lowercase(),
         Instr::ShiftVar { op, .. } => format!("{op:?}v").to_lowercase(),
-        Instr::CondMove { on_zero, .. } => {
-            if *on_zero {
-                "movz".into()
-            } else {
-                "movn".into()
-            }
-        }
         Instr::AluImm { op, .. } => format!("{op:?}").to_lowercase(),
         Instr::Lui { .. } => "lui".into(),
         Instr::Load { op, .. } => format!("{op:?}").to_lowercase(),
@@ -81,7 +77,7 @@ fn main() -> ExitCode {
             let mut hist: BTreeMap<String, usize> = BTreeMap::new();
             let mut unknown: Vec<(u32, u32)> = Vec::new();
             for (i, &w) in words.iter().enumerate() {
-                let pc = (base & 0x1FFF) + (i as u32) * 4;
+                let pc = (0x1000 | (base & 0x0FFF)) + (i as u32) * 4;
                 let instr = decode(w, pc);
                 *hist.entry(mnemonic(&instr)).or_default() += 1;
                 if let Instr::Unknown { word } = instr {
@@ -91,7 +87,7 @@ fn main() -> ExitCode {
             println!(
                 "# {} instructions, base IMEM 0x{:04X}",
                 words.len(),
-                base & 0x1FFF
+                0x1000 | (base & 0x0FFF)
             );
             println!("# opcode histogram:");
             for (m, c) in &hist {
@@ -109,10 +105,7 @@ fn main() -> ExitCode {
             }
         }
         "emit" => {
-            let fn_name = args
-                .get(3)
-                .map(|s| s.as_str())
-                .unwrap_or("oot_aspmain_ucode");
+            let fn_name = args.get(3).map(|s| s.as_str()).unwrap_or("rsp_ucode");
             let base = args
                 .get(4)
                 .map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap())

@@ -7,9 +7,10 @@
 
 This document describes the **behavior** of the Nintendo 64 RSP (Reality Signal
 Processor) Vector Unit (a.k.a. CP2 / VU) instruction set, derived from public
-documentation: the N64 programming manual's RSP/SP chapter, the widely-published
-community RSP vector-op references (n64brew wiki "RSP" and "Coprocessor 2"
-pages), and the general MIPS-derived RSP ISA. Op *semantics* — what each op
+documentation, chiefly the public SGI *Nintendo 64 RSP Programmer's Guide*,
+Chapter 3 and the instruction appendix (especially pp. 240-245, 260-263,
+272, 285-288, and 301-314). CEN64 and MAME were consulted only to
+cross-check algorithm structure at ambiguous boundaries. Op *semantics* — what each op
 computes, how the 48-bit accumulator works, the VCO/VCC/VCE flag registers,
 element selection/broadcast, and the clamp/saturation rules — are hardware
 facts, not copyrightable expression, and are restated here in our own words.
@@ -272,14 +273,11 @@ These **overwrite** ACC with the product, then extract `vd`.
 - Flags: none.
 
 **`VMULQ` — "multiply by Q" oddball.**
-- Product `p = vs[i] * vt_e[i]` (signed). If `p < 0`, add `0x1F` (rounding bias)
-  before the shift. ACC ← `p << 16`? — hardware detail: VMULQ sets
-  `acc = (p with the low bits masked)`; `vd[i] = clamp_signed(acc >> 16)` with
-  the low 4 bits of the result forced to 0 (`& ~0xF`). VMULQ is rarely used;
-  the testable behavior is: signed product, negative-bias rounding, result
-  masked to a multiple of 16 (low nibble cleared), signed-clamped.
-- Flags: none. **(See §7 — one of the subtle ones; verify against a trace if a
-  microcode actually uses it.)**
+- Product `p = vs[i] * vt_e[i]` (signed).
+- `ACC = (p << 16) + (p < 0 ? (31 << 16) : 0)`.
+- `vd[i] = clamp_signed(ACC[i] >> 17) & 0xFFF0`.
+- Flags: none. This is the exact Programmer's Guide pp. 285-286 operation;
+  the negative bias occurs in accumulator bit position 16.
 
 **`VMUDH` — signed × signed, high (integer) part.**
 - Product `p = vs[i] * vt_e[i]` (signed 32-bit).
@@ -319,9 +317,11 @@ the existing ACC instead of overwriting, then extract `vd`.
   `2*p`). `vd[i] = clamp_signed(ACC[i] >> 16)`. Flags: none.
 - **`VMACU`** — like VMACF accumulate, `vd[i] = clamp_unsigned(ACC[i] >> 16)`.
 - **`VMACQ`** — accumulate step of VMULQ; **takes no vs/vt** (recompiler calls
-  `VMACQ(vd)` only). It adjusts ACC toward the nearest multiple of `0x20` based
-  on the current acc value's sign/magnitude and writes `vd[i] =
-  clamp_signed(ACC[i] >> 16) & ~0xF`. `e` ignored. **(See §7 — subtle.)**
+  `VMACQ(vd)` only). If ACC bits 47..21 are nonzero and bit 21 is clear, add
+  `32 << 16` for a negative ACC or subtract `32 << 16` for a positive ACC;
+  otherwise leave ACC unchanged. Then write `vd[i] =
+  clamp_signed(ACC[i] >> 17) & 0xFFF0`. `e` is ignored (Programmer's Guide
+  pp. 260-261).
 - **`VMADH`** — like VMUDH: `ACC += (p << 16)` (signed product into mid:hi).
   `vd[i] = clamp_signed(ACC[i] >> 16)`. Flags: none.
 - **`VMADM`** — like VMUDM (signed×unsigned): `ACC += sign_ext(p)`.
@@ -463,13 +463,12 @@ Per lane, using the flags left by `VCH` (`carry=VCO.carry[i]`, `ne=VCO.ne[i]`,
 `vce=VCE[i]`, and the two VCC bits):
 - If `carry` (was opposite-sign in VCH):
   - If `!ne`:
-    - If `vce`: `VCC.low[i] = ((s + t) & 0x1FFFF == 0x1FFFF) || (s + t == 0)`
-      → practically `VCC.low[i] = (s + t <= 0)`-style extension using vce.
-    - Else: `VCC.low[i] = (s + t == 0)` combined with unsigned compare.
-    The precise rule: with `carry` set, `VCC.low[i]` is chosen so that
-    `vd[i] = VCC.low[i] ? -t : s`, matching the exact clip boundary that VCH
-    couldn't decide without the low bits. Implement via the unsigned comparison
-    of `(u16)s` vs `(u16)t` plus the `vce` extension bit.
+    - Let `sum = (u16)s + (u16)t`, `zero = ((sum & 0xFFFF) == 0)`, and
+      `no_carry = (sum <= 0xFFFF)`.
+    - If `vce`: `VCC.low[i] = zero || no_carry`.
+    - Else: `VCC.low[i] = zero && no_carry`.
+    This is the boolean form of the Programmer's Guide pp. 244-245 carry/VCE
+    rule and distinguishes sums `0x10000` and `0x10001`.
   - Else (`ne` set): keep VCC.low unchanged.
   - `vd[i] = acc_lo[i] = VCC.low[i] ? -t : s`.
 - Else (`carry` clear, same-sign path):
@@ -524,14 +523,13 @@ passes it; you may ignore it).
 
 ### 6.10 VMOV — move one lane
 
-**`VMOV`** — `vd[de] = vt_element(vt, e, ...)` for the single selected lane.
-- Source lane = `vt` lane chosen by `e` (masked 0..7 using the same shuffle
-  logic; for VMOV the element field picks one source lane).
+**`VMOV`** — `vd[de] = vt[e & 7]` for the single selected lane.
+- Source lane = `e & 7`, independent of `de` (Programmer's Guide p. 272).
 - Destination lane = `de & 7`.
 - `vd[de] = vt[src]`; also `acc_lo` is loaded from `vt_e` across all lanes as a
   side effect (hardware loads the whole broadcasted `vt_e` into acc_lo, but only
   the `de` lane of `vd` is written). For fidelity: `for i in 0..8 { acc_lo[i] =
-  vt_element(vt,e,i) }; vd[de] = acc_lo[de]`.
+  vt_element(vt,e,i) }; vd[de] = vt[e & 7]`.
 - Flags: none.
 
 ### 6.11 VRND — accumulator rounding (`VRNDN`, `VRNDP`)
@@ -551,7 +549,8 @@ a 1-bit index (`vs & 1`) selecting the shift amount:
 
 These are the scalar table-lookup ops. They operate on **one source lane** of
 `vt` (selected by `e`, masked 0..7) and write **one destination lane** of `vd`
-(`de & 7`); they also broadcast the full result into acc_lo like VMOV. The
+(`de & 7`); they also load the element-selected source vector into acc_lo like
+VMOV. The
 32-bit input is assembled across a *pair* of instructions (`…H` supplies the
 high 16 bits, then `…`/`…L` supplies the low 16 and produces the result), via a
 small internal 16-bit latch `div_in` / `div_out`.
@@ -563,13 +562,15 @@ copyrightable data; regenerate them from the algorithm below rather than copying
 any file.
 
 **Common front-end (compute the 32-bit input and its normalized form):**
-1. Read the 16-bit source `in16 = vt_element(vt, e, sel)`.
+1. Read the 16-bit source `in16 = vt[e & 7]`.
 2. For the `…L`/plain single-op form, the 32-bit operand is
    `input = (div_in_hi << 16) | (u16)in16` if a preceding `…H` set the latch,
    else `input = sign_extend16(in16)`.
-3. Let `data = input`. If `data < 0`: `data = (data == i32::MIN) ? 0x7FFF_FFFF :
-   -data` (take absolute value, with the INT_MIN guard). Track the original
-   sign.
+3. Track the original sign. For negative input in the 16-bit range, use
+   `data = -input`; for double-precision input below `-32768`, use one's
+   complement `data = ~input`. The exact `input == -32768` result is
+   `0xFFFF0000`; zero produces `0x7FFFFFFF` (Programmer's Guide pp. 301-305,
+   310-314).
 4. Count leading zeros / find the shift so the value is normalized: let
    `shift = clz(data)` (number of leading zero bits of the 32-bit magnitude).
    `index = ((data << shift) >> 22) & 0x1FF` for reciprocal

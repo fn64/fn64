@@ -130,7 +130,9 @@ where
 /// `cond = (vs < vt) || (eq && ne && carry)` — the equal-but-flagged case
 /// reproduces the RSP's exact behavior after a preceding `VSUBC`.
 pub fn vlt(state: &mut VuState, inv: &OpInvocation) {
-    compare(state, inv, |a, b, eq, ne, carry| a < b || (eq && ne && carry));
+    compare(state, inv, |a, b, eq, ne, carry| {
+        a < b || (eq && ne && carry)
+    });
 }
 
 /// `VEQ` — set-if-equal. §6.6. `cond = eq && !ne`.
@@ -146,7 +148,9 @@ pub fn vne(state: &mut VuState, inv: &OpInvocation) {
 /// `VGE` — set-if-greater-or-equal (signed). §6.6.
 /// `cond = (vs > vt) || (eq && !(ne && carry))`.
 pub fn vge(state: &mut VuState, inv: &OpInvocation) {
-    compare(state, inv, |a, b, eq, ne, carry| a > b || (eq && !(ne && carry)));
+    compare(state, inv, |a, b, eq, ne, carry| {
+        a > b || (eq && !(ne && carry))
+    });
 }
 
 /// `VMRG` — merge/select by `VCC.low`. §6.6.
@@ -156,7 +160,11 @@ pub fn vmrg(state: &mut VuState, inv: &OpInvocation) {
     let vt_e = element_select(&state.regs.r[inv.vt], inv.e);
     let mut vd = [0i16; 8];
     for i in 0..8 {
-        let result = if state.flags.vcc_low(i) { vs[i] } else { vt_e[i] };
+        let result = if state.flags.vcc_low(i) {
+            vs[i]
+        } else {
+            vt_e[i]
+        };
         vd[i] = result;
         state.acc.write_lo(i, result as u16);
     }
@@ -242,15 +250,19 @@ pub fn vcl(state: &mut VuState, inv: &OpInvocation) {
                 // ge = (u16)s >= (u16)(-t); the sum s+t as a 17-bit unsigned add
                 // carrying out tells us s >= -t (unsigned). Recompute directly.
                 let sum = su as u32 + tu as u32; // low-16 unsigned add
-                let carry_out = (sum >> 16) & 1 != 0; // s + t overflowed 16 bits
-                let sum_zero = (sum & 0xFFFF) == 0;
-                // VCE distinguishes the boundary: with vce, accept when the sum
-                // is 0 OR produced a 16-bit carry; without vce, accept only the
-                // exact-equal (sum == 0, no carry) case.
+                let low = sum as u16;
+                let sum_zero = low == 0;
+                // The hardware comparison is equivalent to comparing the
+                // wrapping sum with unsigned-saturating(s+t). This is true
+                // without carry and for the special 0x1ffff sum, but false for
+                // the other overflowing sums. VCE selects OR versus AND with
+                // the zero test (Programmer's Guide pp. 72-73; independently
+                // cross-checked against CEN64's vector algorithm).
+                let no_carry = sum <= 0xFFFF;
                 let new_low = if vce {
-                    sum_zero || carry_out
+                    sum_zero || no_carry
                 } else {
-                    sum_zero && !carry_out
+                    sum_zero && no_carry
                 };
                 state.flags.set_vcc_low(i, new_low);
             }
@@ -472,7 +484,7 @@ mod tests {
         let mut st = VuState::new();
         st.regs.r[1] = [10, 11, 12, 13, 14, 15, 16, 17]; // vs
         st.regs.r[2] = [20, 21, 22, 23, 24, 25, 26, 27]; // vt
-        // VCC.low pattern: pick vs on even lanes.
+                                                         // VCC.low pattern: pick vs on even lanes.
         for i in 0..8 {
             st.flags.set_vcc_low(i, i % 2 == 0);
         }
@@ -611,6 +623,23 @@ mod tests {
         vcl(&mut st_vce, &inv(3, 1, 2));
         assert!(st_vce.flags.vcc_low(0), "VCE -> clip_low true");
         assert_eq!(st_vce.regs.r[3][0], 3, "clip to -t = 3");
+    }
+
+    #[test]
+    fn vcl_vce_distinguishes_wrapped_zero_from_next_sum() {
+        let mut st = VuState::new();
+        st.regs.r[1] = [0x7FFF, 0x7FFF, 0, 0, 0, 0, 0, 0];
+        st.regs.r[2] = [-0x7FFF, -0x7FFE, 0, 0, 0, 0, 0, 0];
+        for lane in 0..2 {
+            st.flags.set_vco_carry(lane, true);
+            st.flags.set_vco_ne(lane, false);
+            st.flags.set_vce(lane, true);
+        }
+        vcl(&mut st, &inv(3, 1, 2));
+        assert!(st.flags.vcc_low(0), "0x7fff + 0x8001 wraps exactly to zero");
+        assert!(!st.flags.vcc_low(1), "0x7fff + 0x8002 wraps to one");
+        assert_eq!(st.regs.r[3][0], 0x7FFF);
+        assert_eq!(st.regs.r[3][1], 0x7FFF);
     }
 
     #[test]
