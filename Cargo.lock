@@ -585,6 +585,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fn64-boot-harness"
+version = "0.0.0"
+dependencies = [
+ "fn64-abi",
+ "fn64-runtime",
+]
+
+[[package]]
 name = "fn64-diff"
 version = "0.0.0"
 dependencies = [
@@ -647,6 +655,7 @@ dependencies = [
  "cc",
  "fn64-abi",
  "fn64-audio",
+ "fn64-boot-harness",
  "fn64-render",
  "fn64-render-rt64",
  "fn64-runtime",

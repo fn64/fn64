@@ -29,70 +29,10 @@
 //! 5. When `OOT_TRACE=1`, emits the trace log to a file; always prints a
 //!    summary ladder.
 
-#[cfg(not(fn64_native_recomp))]
-use std::collections::HashMap;
 use std::io::Write;
 
 #[cfg(fn64_native_recomp)]
 use oot_native_funcs as native_funcs;
-
-// ---------------------------------------------------------------------
-// FFI surface into the out-of-tree-compiled bridge (bridge/section_bridge.c)
-// and the real generated recomp_entrypoint symbol.
-// ---------------------------------------------------------------------
-
-#[cfg(not(fn64_native_recomp))]
-#[allow(improper_ctypes)] // RecompContext layout is the generated recomp.h ABI, including FPR pairs.
-extern "C" {
-    /// Walks the real, compiled-in `section_table[]`/`FuncEntry[]` (from
-    /// the game's own `recomp_overlays.inl`) and calls `fn64_register_func`
-    /// once per function -- see `bridge/section_bridge.c`.
-    fn fn64_bridge_register_all_sections();
-    fn fn64_bridge_num_sections() -> usize;
-
-    /// The real generated boot entry point (`RecompiledFuncs/funcs_0.c`).
-    fn recomp_entrypoint(rdram: *mut u8, ctx: *mut fn64_abi::RecompContext);
-}
-
-/// Called from C (`section_bridge.c`'s walk) once per `(section, func)`
-/// pair, in registration order. Buffers into `SECTION_BUILDER` (this
-/// process's one accumulator) rather than calling
-/// `fn64_abi::register_section` directly per-func, since that API takes a
-/// whole section's func list at once (matching `SectionRegistry`'s
-/// batch-registration contract, `fn64-runtime/src/overlay.rs`).
-#[cfg(not(fn64_native_recomp))]
-#[no_mangle]
-extern "C" fn fn64_register_func(
-    section_index: usize,
-    rom_addr: u32,
-    ram_addr: u32,
-    size: u32,
-    offset: u32,
-    rom_size: u32,
-    func: fn64_abi::RecompFunc,
-) {
-    SECTION_BUILDER.with(|cell| {
-        let mut builder = cell.borrow_mut();
-        let entry = builder
-            .sections
-            .entry(section_index)
-            .or_insert_with(|| (rom_addr, ram_addr, size, Vec::new()));
-        entry.3.push((offset, rom_size, func));
-    });
-}
-
-#[cfg(not(fn64_native_recomp))]
-#[derive(Default)]
-struct SectionBuilder {
-    /// section_index -> (rom_addr, ram_addr, size, funcs)
-    sections: HashMap<usize, (u32, u32, u32, Vec<(u32, u32, fn64_abi::RecompFunc)>)>,
-}
-
-#[cfg(not(fn64_native_recomp))]
-thread_local! {
-    static SECTION_BUILDER: std::cell::RefCell<SectionBuilder> =
-        std::cell::RefCell::new(SectionBuilder::default());
-}
 
 /// Audio ucode stand-in. No RSPRecomp pass has been run against OoT's audio
 /// microcode in this bring-up (out of scope for the decomp-driven-recompile
@@ -421,35 +361,26 @@ fn main() {
         fn64_runtime::SaveType::SramBanked,
     )));
 
-    // Register every section from the real recomp_overlays.inl via the
-    // bridge's C-side walk (populates SECTION_BUILDER via callbacks).
     #[cfg(not(fn64_native_recomp))]
-    unsafe {
-        fn64_bridge_register_all_sections()
-    };
+    let registration = fn64_boot_harness::register_linked_sections();
     #[cfg(not(fn64_native_recomp))]
-    let num_sections = unsafe { fn64_bridge_num_sections() };
-    #[cfg(not(fn64_native_recomp))]
-    println!("[oot-boot] bridge reports {num_sections} sections in recomp_overlays.inl");
-
-    #[cfg(not(fn64_native_recomp))]
-    let mut section_indices: HashMap<usize, fn64_runtime::SectionIndex> = HashMap::new();
-    #[cfg(not(fn64_native_recomp))]
-    SECTION_BUILDER.with(|cell| {
-        let builder = cell.borrow();
-        let mut keys: Vec<_> = builder.sections.keys().copied().collect();
-        keys.sort_unstable();
-        for key in keys {
-            let (rom_addr, ram_addr, size, funcs) = &builder.sections[&key];
-            let idx = unsafe { fn64_abi::register_section(*rom_addr, *ram_addr, *size, funcs) };
-            section_indices.insert(key, idx);
+    {
+        println!(
+            "[oot-boot] bridge reports {} sections in recomp_overlays.inl",
+            registration.reported_count()
+        );
+        for section in registration.sections() {
             println!(
-                "[oot-boot] registered section {key}: rom={rom_addr:#010x} ram={ram_addr:#010x} \
-                 size={size:#x} funcs={}",
-                funcs.len()
+                "[oot-boot] registered section {}: rom={:#010x} ram={:#010x} \
+                 size={:#x} funcs={}",
+                section.source_index,
+                section.rom_addr,
+                section.ram_addr,
+                section.size,
+                section.function_count
             );
         }
-    });
+    }
 
     // OoT's own linker .map (games/OOTU/profile.toml's [segments]) puts
     // sections 0/1/2 (makerom.ent/boot/code) as the always-resident image;
@@ -463,7 +394,7 @@ fn main() {
     // hardware state (no actor overlay has been DMA'd in yet this early).
     #[cfg(not(fn64_native_recomp))]
     for section_key in [0usize, 1usize, 2usize] {
-        if let Some(&idx) = section_indices.get(&section_key) {
+        if let Some(idx) = registration.registry_index(section_key) {
             fn64_abi::set_section_loaded(idx);
             println!("[oot-boot] marked section {section_key} (index {idx}) loaded");
         }
@@ -539,8 +470,7 @@ fn main() {
     // which is why examples/wm2000-boot's identical `.max(...)` guard
     // never had to fire in that harness's own testing, not because the
     // sizing itself is game-specific.
-    const RDRAM_SIZE: usize = 8 * 1024 * 1024;
-    let mut rdram = vec![0u8; RDRAM_SIZE.max(fn64_runtime::RDRAM_MMIO_WINDOW_END as usize)];
+    let mut rdram = fn64_boot_harness::new_rdram();
     let rdram_ptr = rdram.as_mut_ptr();
 
     // Register the headless reference software rasterizer as the render
@@ -636,7 +566,7 @@ fn main() {
     }
     #[cfg(not(fn64_native_recomp))]
     unsafe {
-        fn64_abi::boot_thread0(rdram_ptr, recomp_entrypoint, 0, 10);
+        fn64_abi::boot_thread0(rdram_ptr, fn64_boot_harness::c_recomp_entrypoint(), 0, 10);
     }
 
     // Drive boot for a bounded number of scheduling STEPS, not an unbounded

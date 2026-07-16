@@ -24,6 +24,7 @@ cc = "1"
 libc = "0.2"
 fn64-runtime = { path = "../../../crates/fn64-runtime" }
 fn64-abi = { path = "../../../crates/fn64-abi", features = ["native-recomp"] }
+fn64-boot-harness = { path = "../../../crates/fn64-boot-harness", default-features = false }
 fn64-recomp-native = { path = "../../../crates/fn64-recomp-native" }
 # `examples/oot-boot/oot` refreshes this ignored symlink from
 # NATIVE_RECOMPILED_DIR before Cargo resolves the graph. Cargo dependencies
