@@ -5,13 +5,14 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
 build = "../build.rs"
-description = "Native-Rust whole-ROM configuration of the shared OoT boot harness"
+description = "Audio-free workspace configuration of the shared OoT boot harness, used by native-Rust and fast C-lane probes"
 
 [workspace]
 
 [features]
 default = []
 oot-audio = []
+rt64 = ["fn64-render-rt64/rt64"]
 
 [[bin]]
 name = "oot-boot"

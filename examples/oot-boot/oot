@@ -16,6 +16,7 @@
 # Env overrides: RECOMPILED_DIR / RECOMP_H_DIR / ROM default to the aki-recomp OOTU paths.
 # FN64_NATIVE_RECOMP=1 selects NATIVE_RECOMPILED_DIR/funcs.rs and disables the
 # out-of-tree audio feature for the fast OOT_SKIP_AUDIO_UCODE probe.
+# FN64_RENDER=rt64 enables the feature-gated RT64 static backend build.
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -31,15 +32,24 @@ export NATIVE_RECOMPILED_DIR="${NATIVE_RECOMPILED_DIR:-/tmp/fn64-native-oot}"
 BIN="$FN64/examples/oot-boot/target/release/oot-boot"
 
 build() {
-  if [[ "${FN64_NATIVE_RECOMP:-0}" == "1" ]]; then
-    # The native-only manifest reuses this harness's build.rs/main.rs but does
+  if [[ "${FN64_NATIVE_RECOMP:-0}" == "1" || "${OOT_SKIP_AUDIO_UCODE:-0}" == "1" ]]; then
+    # The audio-free manifest reuses this harness's build.rs/main.rs but does
     # not resolve the optional out-of-tree audio crate. In a git worktree that
     # crate points at the main checkout's path-distinct fn64-audio package,
     # which Cargo cannot represent beside this worktree's package in one lock.
+    local features=()
+    if [[ "${FN64_RENDER:-reference}" == "rt64" ]]; then
+      features+=(--features rt64)
+    fi
     CARGO_TARGET_DIR="$FN64/examples/oot-boot/target" \
-      cargo build --manifest-path "$FN64/examples/oot-boot/native/Cargo.toml" --release -q || exit 1
+      cargo build --manifest-path "$FN64/examples/oot-boot/native/Cargo.toml" \
+        --release -q "${features[@]}" || exit 1
   else
-    ( cd "$FN64/examples/oot-boot" && cargo build --release -q ) || exit 1
+    local features=()
+    if [[ "${FN64_RENDER:-reference}" == "rt64" ]]; then
+      features+=(--features rt64)
+    fi
+    ( cd "$FN64/examples/oot-boot" && cargo build --release -q "${features[@]}" ) || exit 1
   fi
 }
 

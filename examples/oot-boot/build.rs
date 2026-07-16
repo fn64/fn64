@@ -126,7 +126,14 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let bridge_dir = manifest_dir.join("bridge");
+    let bridge_dir = if manifest_dir.join("bridge").is_dir() {
+        manifest_dir.join("bridge")
+    } else {
+        // The audio-free/native manifest is one directory below the shared
+        // C-lane harness. It normally returns above for native recompilation,
+        // but OOT_SKIP_AUDIO_UCODE uses it for a C-lane worktree probe too.
+        manifest_dir.join("../bridge")
+    };
 
     let mut build = cc::Build::new();
     build

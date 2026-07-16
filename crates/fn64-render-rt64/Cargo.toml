@@ -6,6 +6,12 @@ license.workspace = true
 repository.workspace = true
 description = "RenderBackend adapter over the MIT RT64 fork (C++, quarantined here) plus a headless reference software backend. See README.md, docs/DESIGN.md section 1, docs/DECOUPLING.md."
 
+[features]
+default = []
+# Builds the sibling RT64 checkout's static `rt64` core/HLE target and the
+# crate-local C ABI shim. The default remains pure Rust for CI/no-GPU hosts.
+rt64 = []
+
 [dependencies]
 fn64-runtime = { path = "../fn64-runtime" }
 fn64-render = { path = "../fn64-render" }

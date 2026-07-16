@@ -43,6 +43,7 @@ mod native_funcs {
 // ---------------------------------------------------------------------
 
 #[cfg(not(fn64_native_recomp))]
+#[allow(improper_ctypes)]
 extern "C" {
     /// Walks the real, compiled-in `section_table[]`/`FuncEntry[]` (from
     /// the game's own `recomp_overlays.inl`) and calls `fn64_register_func`
@@ -458,18 +459,12 @@ fn main() {
     let mut rdram = vec![0u8; RDRAM_SIZE.max(fn64_runtime::RDRAM_MMIO_WINDOW_END as usize)];
     let rdram_ptr = rdram.as_mut_ptr();
 
-    // Register the headless reference software rasterizer as the render
-    // backend BEFORE booting thread 0, so every M_GFXTASK the game submits
-    // via osSpTaskYielded actually decodes+rasterizes (the ABI's
-    // GFX_RENDER_NOTE path) instead of being counted-and-dropped. It decodes
-    // real F3DEX2 (OoT's ucode family) and auto-dumps each non-clear
-    // rasterized frame to /tmp/fn64-oot-render-*.png -- the harness's only
-    // way to see the backend's output, since set_render_backend takes
-    // ownership of the trait object (which is deliberately not
-    // Any-downcastable, per docs/DECOUPLING.md). rdram_len MUST match the
-    // real backing buffer so the backend's bounds checks and the ABI's
-    // from_raw_parts slice length agree; we pass rdram.len() (which includes
-    // the RDRAM_MMIO_WINDOW_END headroom above) for exactly that reason.
+    // Select the renderer before boot. `FN64_RENDER=rt64` requests the
+    // feature-gated RT64 path; an unavailable display/GPU or a binary built
+    // without `--features rt64` returns a named create error and falls back
+    // to the reference oracle. rdram_len MUST match the real backing buffer
+    // so both backends' bounds checks and the ABI's from_raw_parts slice
+    // length agree.
     //
     // NOTE (honest): the CONCURRENT display-list-pointer fix has not
     // necessarily landed, so OoT's live polyOpa/polyXlu display-list head may
@@ -478,28 +473,51 @@ fn main() {
     // nowhere recognizable. That is expected and reported (blank/garbage),
     // not faked; the objective rasterizer proof lives in
     // fn64-render-rt64/tests/f3dex2_replay.rs, independent of this live path.
-    let mut render_backend = fn64_render_rt64::ReferenceBackend::new()
-        .with_f3dex2()
-        .with_clear_color([0, 0, 0, 255])
-        .with_auto_dump("/tmp", "fn64-oot-render", 240);
-    // NOTE: 240 (one full second of NTSC frames) so the capture reaches the
-    // frames where real 3D geometry appears -- the first ~8 gfx tasks are
-    // OoT's boot/logo screens (large flat gradient background quads), and
-    // the recognizable projected geometry (rotating title object, then the
-    // file-select 3D scene) shows up later in the boot sequence. A smaller
-    // limit stops at the gradient logos and misses the geometry proof.
-    // A common NTSC low-res target; matches capture_framebuffer's assumed
-    // 320x240 (this harness does not yet decode the ROM's real OSViMode).
-    {
-        use fn64_render::RenderBackend as _;
-        if let Err(e) = render_backend.create(&fn64_render::RenderConfig::new(320, 240)) {
-            eprintln!("[oot-boot] WARNING: render backend create() failed: {e}");
-        }
-    }
-    fn64_abi::set_render_backend(Box::new(render_backend), rdram.len());
+    use fn64_render::RenderBackend as _;
+    let create_reference = || -> Box<dyn fn64_render::RenderBackend> {
+        let mut backend = fn64_render_rt64::ReferenceBackend::new()
+            .with_f3dex2()
+            .with_clear_color([0, 0, 0, 255])
+            .with_auto_dump("/tmp", "fn64-oot-render", 240);
+        backend
+            .create(&fn64_render::RenderConfig::new(320, 240))
+            .expect("ReferenceBackend create must be infallible for 320x240");
+        Box::new(backend)
+    };
+    let requested_renderer = std::env::var("FN64_RENDER")
+        .unwrap_or_else(|_| "reference".to_string())
+        .to_ascii_lowercase();
+    let (render_backend, active_renderer): (Box<dyn fn64_render::RenderBackend>, &'static str) =
+        if requested_renderer == "rt64" {
+            let mut backend = fn64_render_rt64::Rt64Backend::new();
+            match backend.create(&fn64_render::RenderConfig::new(320, 240)) {
+                Ok(()) => (Box::new(backend), "rt64"),
+                Err(e) => {
+                    eprintln!(
+                        "[oot-boot] WARNING: RT64 create failed ({e}); falling back to the \
+                         ReferenceBackend oracle"
+                    );
+                    (create_reference(), "reference-fallback")
+                }
+            }
+        } else {
+            if requested_renderer != "reference" {
+                eprintln!(
+                    "[oot-boot] WARNING: unknown FN64_RENDER={requested_renderer:?}; using \
+                     ReferenceBackend"
+                );
+            }
+            (create_reference(), "reference")
+        };
+    let latest_frame_path = if active_renderer == "rt64" {
+        "/tmp/fn64-rt64-frame.png"
+    } else {
+        "/tmp/fn64-reference-frame.png"
+    };
+    fn64_abi::set_render_backend(render_backend, rdram.len());
     println!(
-        "[oot-boot] registered fn64-render-rt64 ReferenceBackend (F3DEX2, 320x240, \
-         auto-dump /tmp/fn64-oot-render-*.png) as the render backend"
+        "[oot-boot] registered {active_renderer} renderer (320x240); latest non-uniform VI \
+         frame will be written to {latest_frame_path}"
     );
 
     // Register the REAL recompiled OoT aspMain audio ucode (typed Rust from
@@ -683,7 +701,13 @@ fn main() {
 
             let dumps_before = fb_dumps.len();
             if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
-                capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);
+                capture_framebuffer(
+                    &rdram,
+                    fb_offset,
+                    swap_count,
+                    &mut fb_dumps,
+                    latest_frame_path,
+                );
             }
             last_swap_count = swap_count;
             // Early-exit hooks (feedback-loop speedup): stop the instant we
@@ -748,6 +772,10 @@ fn main() {
     );
     println!("[oot-boot] gfx tasks submitted: {gfx_count}");
     println!("[oot-boot] audio tasks submitted: {audio_count}");
+    println!("[oot-boot] active renderer: {active_renderer}");
+    if let Some(error) = fn64_abi::last_render_error() {
+        println!("[oot-boot] last render error: {error}");
+    }
     {
         let (ns, calls) = fn64_abi::audio_ucode_timing();
         if calls > 0 {
@@ -792,7 +820,13 @@ fn main() {
 /// not modeled yet). If ANY byte differs from the first (non-uniform),
 /// convert RGBA5551 -> RGBA8888 and dump a PNG. A uniform/blank buffer is
 /// reported as blank, never faked as containing real content.
-fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mut Vec<String>) {
+fn capture_framebuffer(
+    rdram: &[u8],
+    fb_offset: u32,
+    swap_index: u64,
+    dumps: &mut Vec<String>,
+    latest_frame_path: &str,
+) {
     const FB_WIDTH: usize = 320;
     const FB_HEIGHT: usize = 240;
     const FB_BYTES: usize = FB_WIDTH * FB_HEIGHT * 2; // RGBA5551, 2 bytes/px
@@ -830,6 +864,12 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
         Ok(()) => {
             println!("[oot-boot] *** NON-UNIFORM FRAMEBUFFER DUMPED: {path} ***");
             dumps.push(path);
+            match dump_rgba5551_as_png(region, FB_WIDTH, FB_HEIGHT, latest_frame_path) {
+                Ok(()) => {
+                    println!("[oot-boot] updated renderer comparison frame: {latest_frame_path}")
+                }
+                Err(e) => eprintln!("[oot-boot] failed to update {latest_frame_path}: {e}"),
+            }
         }
         Err(e) => eprintln!("[oot-boot] failed to write {path}: {e}"),
     }
