@@ -73,7 +73,7 @@ case "$cmd" in
     ;;
   trace)
     build
-    OOT_MAX_SWAPS="${1:-200}" "$BIN" >/dev/null 2>&1 || true
+    OOT_TRACE=1 OOT_MAX_SWAPS="${1:-200}" "$BIN" >/dev/null 2>&1 || true
     echo "last executor events (/tmp/oot-boot-trace.jsonl):"
     tail -6 /tmp/oot-boot-trace.jsonl 2>/dev/null
     ;;
