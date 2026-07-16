@@ -101,10 +101,10 @@ pub unsafe fn register_section(
     })
 }
 
-/// Register section geometry for a native typed module. Function pointers
+/// Register section geometry for a typed recompiled module. Function pointers
 /// stay in that module's safe dispatcher; this registry owns only the
 /// ROM/static/runtime-base mapping needed to canonicalize relocated callbacks.
-pub fn register_native_section(
+pub fn register_recompiled_section(
     rom_addr: u32,
     ram_addr: u32,
     size: u32,

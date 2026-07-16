@@ -594,7 +594,7 @@ version = "0.0.0"
 dependencies = [
  "corosensei",
  "fn64-audio",
- "fn64-recomp-native",
+ "fn64-recomp-rs",
  "fn64-render",
  "fn64-render-rt64",
  "fn64-runtime",
@@ -644,7 +644,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fn64-recomp-native"
+name = "fn64-recomp-rs"
 version = "0.0.0"
 dependencies = [
  "fn64-recomp",

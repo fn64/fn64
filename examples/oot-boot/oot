@@ -14,7 +14,7 @@
 #   ./oot where              run + report the deepest frame / loud trap (the frontier)
 #
 # Env overrides: RECOMPILED_DIR / RECOMP_H_DIR / ROM default to the aki-recomp OOTU paths.
-# FN64_NATIVE_RECOMP=1 selects the crate at NATIVE_RECOMPILED_DIR. The native
+# FN64_RECOMP=rs selects the crate at RECOMP_RS_DIR; `c` is the default. The rs
 # manifest links the out-of-tree audio ucode by default; OOT_SKIP_AUDIO_UCODE=1
 # remains an explicit render-iteration speed switch.
 # FN64_RENDER=rt64 enables the feature-gated RT64 static backend build.
@@ -28,7 +28,8 @@ export RECOMPILED_DIR="${RECOMPILED_DIR:-$AKI/games/OOTU/RecompiledFuncs}"
 export RECOMP_H_DIR="${RECOMP_H_DIR:-$AKI/refs/N64RecompSource/include}"
 export ROM="${ROM:-$AKI/games/OOTU/oot-ntsc-1.0.z64}"
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
-export NATIVE_RECOMPILED_DIR="${NATIVE_RECOMPILED_DIR:-/tmp/fn64-native-oot}"
+export FN64_RECOMP="${FN64_RECOMP:-c}"
+export RECOMP_RS_DIR="${RECOMP_RS_DIR:-/tmp/fn64-recomp-rs-oot}"
 
 BIN="$FN64/examples/oot-boot/target/release/oot-boot"
 
@@ -37,21 +38,24 @@ build() {
   if [[ "${FN64_RENDER:-reference}" == "rt64" ]]; then
     features+=(--features rt64)
   fi
-  if [[ "${FN64_NATIVE_RECOMP:-0}" == "1" ]]; then
-    # The native-only manifest reuses this harness's build.rs/main.rs and its
+  if [[ "$FN64_RECOMP" == "rs" ]]; then
+    # The rs-only manifest reuses this harness's build.rs/main.rs and its
     # build-only audio adapter, so the generated ucode resolves fn64-audio from
     # this same worktree rather than colliding with another worktree's package.
-    native_link="$FN64/examples/oot-boot/native/recompiled"
-    if [[ ( -e "$native_link" || -L "$native_link" ) && ! -L "$native_link" ]]; then
-      echo "oot: $native_link exists and is not a symlink; refusing to replace it" >&2
+    recompiled_link="$FN64/examples/oot-boot/rs/recompiled"
+    if [[ ( -e "$recompiled_link" || -L "$recompiled_link" ) && ! -L "$recompiled_link" ]]; then
+      echo "oot: $recompiled_link exists and is not a symlink; refusing to replace it" >&2
       exit 2
     fi
-    ln -sfn "$NATIVE_RECOMPILED_DIR" "$native_link" || exit 1
+    ln -sfn "$RECOMP_RS_DIR" "$recompiled_link" || exit 1
     CARGO_TARGET_DIR="$FN64/examples/oot-boot/target" \
-      cargo build --manifest-path "$FN64/examples/oot-boot/native/Cargo.toml" \
+      cargo build --manifest-path "$FN64/examples/oot-boot/rs/Cargo.toml" \
         --release -q "${features[@]}" || exit 1
-  else
+  elif [[ "$FN64_RECOMP" == "c" ]]; then
     ( cd "$FN64/examples/oot-boot" && cargo build --release -q "${features[@]}" ) || exit 1
+  else
+    echo "oot: FN64_RECOMP must be 'rs' or 'c', got '$FN64_RECOMP'" >&2
+    exit 2
   fi
 }
 

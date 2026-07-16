@@ -9,7 +9,7 @@ This crate contains both fn64 graphics backends:
 
 The C++ and every Rust `unsafe` block used to call it are quarantined here, as
 required by `docs/DESIGN.md` section 1. `fn64-render`, `fn64-runtime`, and the
-native recompiler remain unaware of RT64 types and continue to forbid unsafe
+Rust recompiler remain unaware of RT64 types and continue to forbid unsafe
 code.
 
 ## Building the RT64 path

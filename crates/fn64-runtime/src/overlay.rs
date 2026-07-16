@@ -388,7 +388,7 @@ impl SectionRegistry {
     }
 
     /// Translate a loaded overlay's relocated heap address back to its
-    /// static link-time vram. Native typed modules key their function table
+    /// static link-time vram. Typed recompiled modules key their function table
     /// by that canonical vram, while the game's relocation pass stores heap
     /// addresses in callback tables. Static/resident addresses return `None`
     /// so a host-first lookup cannot recurse on an unchanged address.

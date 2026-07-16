@@ -67,7 +67,7 @@ fn with_pi_dma<R>(shim: &str, f: impl FnOnce(&mut PiDma<InMemoryRom>) -> R) -> R
 /// aligned `sw $t1, 0x14($a0)` consumed `gAudioCtx.cartHandle`, which
 /// `AudioLoad_Init` had populated from this return value. Leaving `$v0`
 /// untouched propagated a stale, unaligned address into that store. The C
-/// lane's raw memory macro tolerated the host-unaligned write; native Rust's
+/// lane's raw memory macro tolerated the host-unaligned write; typed Rust's
 /// alignment trap correctly refused it.
 ///
 /// # Safety
@@ -122,7 +122,7 @@ pub unsafe extern "C" fn osCartRomInit_recomp(_rdram: *mut u8, ctx: *mut RecompC
 /// only falls through to a blocking `osRecvMesg` once `$v0` reads exactly
 /// 0 -- with `ctx.r2` never written, that test read garbage left over from
 /// an earlier instruction (observed non-zero), so the loop re-issued the
-/// same DMA chunk forever: a real, tens-of-seconds unbounded native loop,
+/// same DMA chunk forever: a real, tens-of-seconds unbounded recompiled loop,
 /// not a missing host model. This shim performs every DMA synchronously
 /// and has no failure path today (`with_pi_dma` panics rather than
 /// returning -1 when no ROM is installed, and `FromRdram` is an explicit
@@ -517,7 +517,7 @@ mod tests {
         assert_eq!(ctx.r2, 0x0000_5678);
     }
 
-    /// Regression for OoT native boot's `AudioLoad_Dma` alignment trap.
+    /// Regression for OoT rs boot's `AudioLoad_Dma` alignment trap.
     /// `AudioLoad_Init` stores `osCartRomInit()`'s `$v0` into
     /// `gAudioCtx.cartHandle`; ROM PC 0x800B824C later executes the ordinary
     /// aligned `sw $t1, 0x14($a0)` through that pointer. The old shim left

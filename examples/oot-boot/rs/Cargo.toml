@@ -1,0 +1,42 @@
+[package]
+name = "oot-boot-rs"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+build = "../build.rs"
+description = "Rust-recompiled whole-ROM configuration of the shared OoT boot harness"
+
+[workspace]
+
+[features]
+default = ["oot-audio"]
+oot-audio = ["dep:oot-audio-ucode"]
+rt64 = ["fn64-render-rt64/rt64"]
+
+[[bin]]
+name = "oot-boot"
+path = "../src/main.rs"
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+libc = "0.2"
+fn64-runtime = { path = "../../../crates/fn64-runtime" }
+fn64-abi = { path = "../../../crates/fn64-abi", features = ["recomp-rs"] }
+# The rs lane still uses the shared C section-bridge (register_linked_sections
+# + c_recomp_entrypoint live behind the `c-bridge` feature), so it must NOT be
+# disabled -- main.rs calls both unconditionally. (default-features=false here
+# was a boot-seam-dedup regression that broke the rs build.)
+fn64-boot-harness = { path = "../../../crates/fn64-boot-harness" }
+fn64-recomp-rs = { path = "../../../crates/fn64-recomp-rs" }
+# `examples/oot-boot/oot` refreshes this ignored symlink from
+# RECOMP_RS_DIR before Cargo resolves the graph. Cargo dependencies
+# cannot interpolate environment variables in `path`, so the link is the
+# explicit bridge from the env-selected out-of-tree crate to this manifest.
+oot-recompiled = { path = "recompiled" }
+fn64-render = { path = "../../../crates/fn64-render" }
+fn64-render-rt64 = { path = "../../../crates/fn64-render-rt64" }
+fn64-audio = { path = "../../../crates/fn64-audio" }
+oot-audio-ucode = { path = "../audio-ucode", optional = true }
