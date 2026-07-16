@@ -34,7 +34,7 @@
 //! Explicitly acknowledged-and-skipped (logged by name via `skip_opcode`,
 //! never a silent no-op): remaining framebuffer/sync state and any
 //! unrecognized byte. Texture, lighting, RDP other-mode, alpha compare, and
-//! the color-combiner inputs needed by OoT are decoded. Skips are
+//! the color-combiner and framebuffer-blender inputs needed by OoT are decoded. Skips are
 //! rate-limited-per-opcode so a real DL doesn't spam
 //! thousands of identical lines, but every distinct skipped opcode is
 //! reported at least once.
@@ -117,12 +117,15 @@ const G_TEXRECT: u8 = 0xE4;
 const G_TEXRECTFLIP: u8 = 0xE5;
 const G_SETOTHERMODE_L: u8 = 0xE2;
 const G_SETOTHERMODE_H: u8 = 0xE3;
+/// Full RDP other-mode write (`gsDPSetOtherMode`; gbi.h:3724-3737).
+const G_RDPSETOTHERMODE: u8 = 0xEF;
 const G_SETSCISSOR: u8 = 0xED;
 const G_LOADTLUT: u8 = 0xF0;
 const G_SETTILESIZE: u8 = 0xF2;
 const G_LOADBLOCK: u8 = 0xF3;
 const G_LOADTILE: u8 = 0xF4;
 const G_SETTILE: u8 = 0xF5;
+const G_SETFOGCOLOR: u8 = 0xF8;
 const G_SETBLENDCOLOR: u8 = 0xF9;
 const G_SETPRIMCOLOR: u8 = 0xFA;
 const G_SETENVCOLOR: u8 = 0xFB;
@@ -772,6 +775,116 @@ pub struct Triangle {
     /// when this triangle was emitted. Kept per-triangle for the same reason
     /// as texture/cull state: later display-list commands may change it.
     pub combiner: CombinerState,
+    /// RDP framebuffer blender state in effect when this triangle was emitted.
+    /// This is derived from the same other-mode snapshot: cycle type,
+    /// `FORCE_BL`, the two `GBL_c1`/`GBL_c2` selector tuples, and the constant
+    /// colors those tuples can address.
+    pub blender: BlenderState,
+}
+
+/// One color input selected for the RDP blender's `P` or `M` term.
+/// Values are the public `G_BL_CLR_*` encodings (gbi.h:612-615).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum BlendColorInput {
+    #[default]
+    Combined,
+    Framebuffer,
+    Blend,
+    Fog,
+}
+
+/// The multiplier selected for the blender's `A` term (`G_BL_A_*`,
+/// gbi.h:618-622).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum BlendAlphaInput {
+    #[default]
+    Combined,
+    Fog,
+    Shade,
+    Zero,
+}
+
+/// The multiplier selected for the blender's `B` term (`G_BL_1MA`,
+/// `G_BL_A_MEM`, `G_BL_1`, `G_BL_0`; gbi.h:616-622).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum BlendBInput {
+    #[default]
+    OneMinusA,
+    FramebufferAlpha,
+    One,
+    Zero,
+}
+
+/// One `GBL_c1`/`GBL_c2` tuple, evaluated as `P*A + M*B`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlendCycle {
+    pub p: BlendColorInput,
+    pub a: BlendAlphaInput,
+    pub m: BlendColorInput,
+    pub b: BlendBInput,
+}
+
+/// Minimal, per-triangle RDP blender snapshot.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlenderState {
+    /// 0 for copy/fill (blender bypass), 1 for `G_CYC_1CYCLE`, 2 for
+    /// `G_CYC_2CYCLE` (gbi.h:527-531).
+    pub cycle_count: u8,
+    pub force_blend: bool,
+    pub cycles: [BlendCycle; 2],
+    pub blend_color: [u8; 4],
+    pub fog_color: [u8; 4],
+}
+
+impl BlenderState {
+    fn from_other_mode(low: u32, high: u32, blend_color: [u8; 4], fog_color: [u8; 4]) -> Self {
+        let color = |bits: u32| match bits & 3 {
+            0 => BlendColorInput::Combined,
+            1 => BlendColorInput::Framebuffer,
+            2 => BlendColorInput::Blend,
+            _ => BlendColorInput::Fog,
+        };
+        let alpha = |bits: u32| match bits & 3 {
+            0 => BlendAlphaInput::Combined,
+            1 => BlendAlphaInput::Fog,
+            2 => BlendAlphaInput::Shade,
+            _ => BlendAlphaInput::Zero,
+        };
+        let b = |bits: u32| match bits & 3 {
+            0 => BlendBInput::OneMinusA,
+            1 => BlendBInput::FramebufferAlpha,
+            2 => BlendBInput::One,
+            _ => BlendBInput::Zero,
+        };
+        let cycle_type = (high >> 20) & 3;
+        BlenderState {
+            cycle_count: match cycle_type {
+                0 => 1,
+                1 => 2,
+                _ => 0,
+            },
+            force_blend: low & 0x0000_4000 != 0,
+            // gbi.h:624-627: c1 fields at 30/26/22/18, c2 at
+            // 28/24/20/16. Keeping that order visible makes merges with the
+            // fuller othermode decoder mechanical.
+            cycles: [
+                BlendCycle {
+                    p: color(low >> 30),
+                    a: alpha(low >> 26),
+                    m: color(low >> 22),
+                    b: b(low >> 18),
+                },
+                BlendCycle {
+                    p: color(low >> 28),
+                    a: alpha(low >> 24),
+                    m: color(low >> 20),
+                    b: b(low >> 16),
+                },
+            ],
+            blend_color,
+            fog_color,
+        }
+    }
 }
 
 /// The N64 SDK's public per-vertex wire format (`Vtx_t`): 16 bytes --
@@ -1343,12 +1456,14 @@ fn opcode_name(opcode: u8) -> &'static str {
         0xE7 => "G_RDPPIPESYNC",
         0xE8 => "G_RDPTILESYNC",
         0xE9 => "G_RDPFULLSYNC",
+        G_RDPSETOTHERMODE => "G_RDPSETOTHERMODE",
         G_LOADTLUT => "G_LOADTLUT",
         0xF1 => "G_RDPHALF_2",
         G_LOADBLOCK => "G_LOADBLOCK",
         G_LOADTILE => "G_LOADTILE",
         G_SETTILESIZE => "G_SETTILESIZE",
         G_SETTILE => "G_SETTILE",
+        G_SETFOGCOLOR => "G_SETFOGCOLOR",
         G_SETBLENDCOLOR => "G_SETBLENDCOLOR",
         G_SETCOMBINE => "G_SETCOMBINE",
         G_SETTIMG => "G_SETTIMG",
@@ -1483,6 +1598,10 @@ struct DecodeState {
     /// RDP color-combiner + primitive/environment register state. This is
     /// independent of other-mode/render state, but snapshotted beside it.
     combiner: CombinerState,
+    /// Constant blender inputs. `blend_color.a` is mirrored into `other_mode`
+    /// for alpha compare; the full RGBA values feed the framebuffer blender.
+    blend_color: [u8; 4],
+    fog_color: [u8; 4],
     dl_depth: u32,
     /// Texture-mapping decode state (SETTIMG image latch, tile descriptors,
     /// TLUT palette, G_TEXTURE enable/scale, and the currently-decoded
@@ -1658,6 +1777,7 @@ pub fn decode_display_list(rdram: &[u8], dl_addr: u32) -> Result<Vec<Triangle>, 
                     None,
                     OtherMode::default(),
                     CombinerState::default(),
+                    BlenderState::default(),
                 ) {
                     tris.push(t);
                 }
@@ -1672,6 +1792,7 @@ pub fn decode_display_list(rdram: &[u8], dl_addr: u32) -> Result<Vec<Triangle>, 
                     None,
                     OtherMode::default(),
                     CombinerState::default(),
+                    BlenderState::default(),
                 ) {
                     tris.push(t);
                 }
@@ -1682,6 +1803,7 @@ pub fn decode_display_list(rdram: &[u8], dl_addr: u32) -> Result<Vec<Triangle>, 
                     None,
                     OtherMode::default(),
                     CombinerState::default(),
+                    BlenderState::default(),
                 ) {
                     tris.push(t);
                 }
@@ -1717,6 +1839,8 @@ pub fn decode_display_list_f3dex2(
         geometry_mode: 0,
         other_mode: OtherMode::default(),
         combiner: CombinerState::default(),
+        blend_color: [0; 4],
+        fog_color: [0; 4],
         dl_depth: 0,
         tex: TexState::default(),
         lights: LightState::default(),
@@ -1762,6 +1886,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 // already the slot (0-31), no /2 needed.
                 let cull = cull_mode_from(state.geometry_mode);
                 let texture = active_texture(&state.tex);
+                let blender = active_blender(state);
                 let idx = tri_indices(w0);
                 if let Some(t) = resolve_tri(
                     &state.vtx_cache,
@@ -1770,6 +1895,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                     texture,
                     state.other_mode,
                     state.combiner,
+                    blender,
                 ) {
                     state.tris.push(t);
                 }
@@ -1780,6 +1906,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 // SAME bit positions. G_QUAD decodes identically to G_TRI2.
                 let cull = cull_mode_from(state.geometry_mode);
                 let texture = active_texture(&state.tex);
+                let blender = active_blender(state);
                 let idx_a = tri_indices(w0);
                 let idx_b = tri_indices(w1);
                 if let Some(t) = resolve_tri(
@@ -1789,6 +1916,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                     texture.clone(),
                     state.other_mode,
                     state.combiner,
+                    blender,
                 ) {
                     state.tris.push(t);
                 }
@@ -1799,6 +1927,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                     texture,
                     state.other_mode,
                     state.combiner,
+                    blender,
                 ) {
                     state.tris.push(t);
                 }
@@ -1977,6 +2106,13 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 state.tex.tex_scale_s = scale_s;
                 state.tex.tex_scale_t = scale_t;
             }
+            G_RDPSETOTHERMODE => {
+                // Full expert-mode write: high 24 bits live in w0's payload,
+                // low 32 bits in w1 (gbi.h:3697-3737). OoT's setup DLs use
+                // this path as well as the F3DEX2 partial setters.
+                state.other_mode.high = w0 & 0x00FF_FFFF;
+                state.other_mode.low = w1;
+            }
             G_SETOTHERMODE_H => {
                 // F3DEX2 gSPSetOtherMode (`gbi.h:3353-3369`) stores
                 // `32-shift-len` at w0[15:8] and `len-1` at w0[7:0]. Rebuild
@@ -2001,7 +2137,9 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 // 7..0. Threshold alpha compare uses precisely this component
                 // (OoT z_rcp.c:815-835; RT64 RasterPS.hlsl:209-211).
                 state.other_mode.blend_color_alpha = w1 as u8;
+                state.blend_color = w1.to_be_bytes();
             }
+            G_SETFOGCOLOR => state.fog_color = w1.to_be_bytes(),
             G_SETTIMG => {
                 // G_SETTIMG (§5.1): format field(w0,21,3), size field(w0,19,2),
                 // width-1 field(w0,0,12), image addr w1 (segmented). Pointer +
@@ -2190,6 +2328,15 @@ fn active_texture(tex: &TexState) -> Option<Texture> {
     }
 }
 
+fn active_blender(state: &DecodeState) -> BlenderState {
+    BlenderState::from_other_mode(
+        state.other_mode.raw_low(),
+        state.other_mode.raw_high(),
+        state.blend_color,
+        state.fog_color,
+    )
+}
+
 /// Recompute the cached model-view-projection matrix from the current stack.
 ///
 /// `state.proj` already holds the accumulated `view * proj` product (built
@@ -2364,6 +2511,7 @@ fn resolve_tri(
     texture: Option<Texture>,
     other_mode: OtherMode,
     combiner: CombinerState,
+    blender: BlenderState,
 ) -> Option<Triangle> {
     if idx.iter().any(|&i| i as usize >= vtx_cache.len()) {
         return None;
@@ -2392,6 +2540,7 @@ fn resolve_tri(
         texture,
         other_mode,
         combiner,
+        blender,
     })
 }
 
@@ -2400,8 +2549,9 @@ fn resolve_tri(
 pub const SUPPORTED: &[UcodeId] = &[UcodeId::F3dex2];
 
 #[cfg(test)]
-// Matrix fixtures retain trace-derived f32 literals and explicit wire-field
-// expressions; keeping those forms makes the public-gbi provenance auditable.
+// Wire-encoding tests intentionally spell zero-valued bitfields, fixed 4x4
+// indices, and traced f32 literals in their source form so the evidence stays
+// directly comparable to the cited command/matrix layouts.
 #[allow(
     clippy::excessive_precision,
     clippy::identity_op,
@@ -2660,6 +2810,79 @@ mod tests {
         let mode = OtherMode::from_raw(0, updated, 0);
         assert_eq!(mode.alpha_compare(), AlphaCompare::Dither);
         assert!(mode.depth_compare_enabled());
+    }
+
+    /// Fails against the original decoder, which loudly skipped opcode 0xEF
+    /// and emitted every triangle with overwrite-only default state.
+    #[test]
+    fn full_othermode_command_snapshots_both_blender_cycles_on_triangle() {
+        let mut rdram = vec![0u8; 0x4000];
+        wr_vtx(&mut rdram, 0x2000, 2, 2, 0, [255, 255, 255, 128]);
+        wr_vtx(&mut rdram, 0x2010, 12, 2, 0, [255, 255, 255, 128]);
+        wr_vtx(&mut rdram, 0x2020, 7, 12, 0, [255, 255, 255, 128]);
+
+        // G_CYC_2CYCLE plus the standard XLU tuple in both cycles:
+        // IN*A_IN + MEM*(1-A). Selector positions are exactly GBL_c1/c2
+        // (gbi.h:624-627); FORCE_BL is gbi.h:609.
+        let high = 1 << 20;
+        let low = (1 << 22) | (1 << 20) | 0x4000;
+        let mut off = 0x1000;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_RDPSETOTHERMODE as u32) << 24) | high,
+            low,
+        );
+        off += 8;
+        wr_cmd(&mut rdram, off, (G_SETBLENDCOLOR as u32) << 24, 0x1020_3040);
+        off += 8;
+        wr_cmd(&mut rdram, off, (G_SETFOGCOLOR as u32) << 24, 0x5060_7080);
+        off += 8;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_VTX as u32) << 24) | (3 << 12) | (3 << 1),
+            0x2000,
+        );
+        off += 8;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1),
+            0,
+        );
+        off += 8;
+        wr_cmd(&mut rdram, off, (G_ENDDL as u32) << 24, 0);
+
+        let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
+        assert_eq!(tris.len(), 1);
+        let blender = tris[0].blender;
+        assert_eq!(blender.cycle_count, 2);
+        assert!(blender.force_blend);
+        assert_eq!(blender.blend_color, [0x10, 0x20, 0x30, 0x40]);
+        assert_eq!(blender.fog_color, [0x50, 0x60, 0x70, 0x80]);
+        for cycle in blender.cycles {
+            assert_eq!(cycle.p, BlendColorInput::Combined);
+            assert_eq!(cycle.a, BlendAlphaInput::Combined);
+            assert_eq!(cycle.m, BlendColorInput::Framebuffer);
+            assert_eq!(cycle.b, BlendBInput::OneMinusA);
+        }
+    }
+
+    /// Partial setters use F3DEX2's inverted shift field, not the older F3D
+    /// direct shift. These exact words are what gDPSetCycleType and
+    /// gDPSetRenderMode emit through gSPSetOtherMode (gbi.h:3353-3369).
+    #[test]
+    fn partial_othermode_commands_patch_the_logical_bit_ranges() {
+        let cycle_type_w0 = ((0xE3u32) << 24) | (10 << 8) | 1;
+        let high = update_other_mode_word(0, cycle_type_w0, 1 << 20).unwrap();
+        assert_eq!((high >> 20) & 3, 1);
+
+        let render_mode_w0 = ((0xE2u32) << 24) | 28;
+        let render_mode = (1 << 22) | (1 << 20) | 0x4000;
+        let low = update_other_mode_word(0b101, render_mode_w0, render_mode).unwrap();
+        assert_eq!(low & 0b111, 0b101, "bits below render mode stay intact");
+        assert_eq!(low & !0b111, render_mode);
     }
 
     // --- Perspective * view * model projection regression ----------------
@@ -3035,6 +3258,8 @@ mod tests {
             geometry_mode: 0,
             other_mode: OtherMode::default(),
             combiner: CombinerState::default(),
+            blend_color: [0; 4],
+            fog_color: [0; 4],
             dl_depth: 0,
             tex: TexState::default(),
             lights: LightState::default(),
@@ -3208,6 +3433,7 @@ mod tests {
                 None,
                 OtherMode::default(),
                 CombinerState::default(),
+                BlenderState::default(),
             )
             .is_none(),
             "triangle touching a behind-camera vertex must be dropped"
@@ -3221,6 +3447,7 @@ mod tests {
             None,
             OtherMode::default(),
             CombinerState::default(),
+            BlenderState::default(),
         )
         .is_some());
     }

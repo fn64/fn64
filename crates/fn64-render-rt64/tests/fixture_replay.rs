@@ -167,7 +167,7 @@ fn process_task_writes_rgba5551_framebuffer_to_output_addr() {
     const W: u32 = 4;
     const H: u32 = 4;
     const OUTPUT_ADDR: usize = 0x800; // clear of the DL/vertex data below
-    // rdram: big enough for the fixture data AND the 4x4x2-byte fb at 0x800.
+                                      // rdram: big enough for the fixture data AND the 4x4x2-byte fb at 0x800.
     let mut rdram = vec![0u8; 0x1000];
 
     // A tiny green triangle covering the whole 4x4 frame, so the write-back
@@ -232,7 +232,10 @@ fn process_task_writes_rgba5551_framebuffer_to_output_addr() {
             ),
         }
     }
-    assert!(saw_clear, "no clear-color pixel written back -- write-back missing");
+    assert!(
+        saw_clear,
+        "no clear-color pixel written back -- write-back missing"
+    );
     assert!(
         saw_green,
         "no triangle pixel written back -- only the clear color reached rdram, so the \
