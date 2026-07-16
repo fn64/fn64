@@ -209,6 +209,10 @@ struct HostState {
     /// loudly (see `with_pi_dma`) rather than silently no-op'ing, matching
     /// `AGENTS.md`'s "loud traps."
     pi_dma: Option<PiDma<InMemoryRom>>,
+    /// Guest-visible `OSPiHandle*` returned by `osCartRomInit`. The handle
+    /// storage is game-owned BSS, so the boot host supplies its link address;
+    /// leaving it unset is a loud trap rather than returning a stale `$v0`.
+    cart_rom_handle_vram: Option<u32>,
     /// `OSThread*` (rdram-relative offset) -> `OSId`, populated by
     /// `osCreateThread_recomp`. Needed because real call sites pass the SAME
     /// `OSThread*` handle to `osStartThread`/`osSetThreadPri`/etc, NOT the
@@ -241,6 +245,7 @@ impl Default for HostState {
         HostState {
             sections: SectionRegistry::new(),
             pi_dma: None,
+            cart_rom_handle_vram: None,
             thread_handles: std::collections::HashMap::new(),
             timer_handles: std::collections::HashMap::new(),
             #[cfg(feature = "native-recomp")]
@@ -677,6 +682,24 @@ pub fn load_rom(bytes: Vec<u8>) {
     with_host(|host| host.pi_dma = Some(PiDma::new(InMemoryRom::new(bytes))));
 }
 
+/// Register the guest BSS address of libultra's cartridge `OSPiHandle`.
+///
+/// `osCartRomInit` returns an `OSPiHandle*` that ordinary recompiled game code
+/// may dereference before passing it back to an EPI shim. The address therefore
+/// cannot be an opaque host token: it must be the aligned, guest-visible BSS
+/// object from this particular ROM's link map.
+pub fn set_cart_rom_handle_vram(vram: u32) {
+    assert!(
+        (0x8000_0000..0xC000_0000).contains(&vram),
+        "cart OSPiHandle must be a KSEG0/KSEG1 guest address, got {vram:#010x}"
+    );
+    assert!(
+        vram.is_multiple_of(4),
+        "cart OSPiHandle must be word-aligned, got {vram:#010x}"
+    );
+    with_host(|host| host.cart_rom_handle_vram = Some(vram));
+}
+
 /// Register the game's save-backing store (SRAM/EEPROM/Flash) the domain-2
 /// PI-DMA path routes to -- `fn64-shell`/the harness supplies an
 /// `InMemorySaveStorage`/`FileSaveStorage` sized for the game's save device
@@ -1083,20 +1106,34 @@ pub unsafe extern "C" fn osSetTimer_recomp(rdram: *mut u8, ctx: *mut RecompConte
 
 /// `osCartRomInit(void) -> OSPiHandle*` -- no arguments (verified: every
 /// real call site is `osCartRomInit_recomp(rdram, ctx)` with no register
-/// setup beforehand). Rung 10b's exact fix target: a valid handle must
-/// exist before the first real `osEPiStartDma`. This crate has no
-/// `OSPiHandle` struct of its own (PI-DMA shims below identify the ROM by
-/// "the one installed via `load_rom`," not by a handle pointer this
-/// function would return) -- so this is a real, tested no-op beyond
-/// asserting a ROM is installed, matching the documented one-time
-/// bring-up role without inventing handle-struct fields no shim in this
-/// milestone's undefined set actually consumes.
+/// setup beforehand). The PI engine remains host-owned, but the returned
+/// pointer is not optional or opaque: guest code dereferences the handle's
+/// public `transferInfo` fields before calling the host DMA shim. Return the
+/// game-owned BSS address registered by [`set_cart_rom_handle_vram`].
+///
+/// OoT exposed the old no-op at `AudioLoad_Dma` ROM PC `0x800B824C`: its
+/// aligned `sw $t1, 0x14($a0)` consumed `gAudioCtx.cartHandle`, which
+/// `AudioLoad_Init` had populated from this return value. Leaving `$v0`
+/// untouched propagated a stale, unaligned address into that store. The C
+/// lane's raw memory macro tolerated the host-unaligned write; native Rust's
+/// alignment trap correctly refused it.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn osCartRomInit_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
+pub unsafe extern "C" fn osCartRomInit_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     with_pi_dma("osCartRomInit_recomp", |_dma| {});
+    let handle_vram = with_host(|host| {
+        host.cart_rom_handle_vram.unwrap_or_else(|| {
+            panic!(
+                "osCartRomInit_recomp: no guest OSPiHandle address registered -- call \
+                 fn64_abi::set_cart_rom_handle_vram with the ROM's aligned __CartRomHandle \
+                 BSS address before boot"
+            )
+        })
+    });
+    let ctx = unsafe { &mut *ctx };
+    ctx.r2 = (handle_vram as i32 as i64) as u64;
 }
 
 /// `osEPiStartDma(OSPiHandle *handle, OSIoMesg *mb, s32 direction)` --
@@ -5247,6 +5284,26 @@ mod tests {
         unsafe { osViSwapBuffer_recomp(std::ptr::null_mut(), &mut swap_ctx as *mut _) };
         assert_eq!(current_vi_framebuffer(), Some(0x10_0000));
         assert_eq!(vi_swap_count(), 1);
+    }
+
+    /// Regression for OoT native boot's `AudioLoad_Dma` alignment trap.
+    /// `AudioLoad_Init` stores `osCartRomInit()`'s `$v0` into
+    /// `gAudioCtx.cartHandle`; ROM PC 0x800B824C later executes the ordinary
+    /// aligned `sw $t1, 0x14($a0)` through that pointer. The old shim left
+    /// `$v0` untouched. Seed the exact stale value observed at the failing
+    /// boot so that implementation returns `0x80125636` and fails this test,
+    /// while the fixed shim returns the configured aligned guest handle.
+    #[test]
+    fn os_cart_rom_init_replaces_stale_unaligned_v0_with_guest_handle() {
+        load_rom(vec![0u8; 0x100]);
+        set_cart_rom_handle_vram(0x8000_9EA0);
+
+        let mut ctx = ctx_zeroed();
+        ctx.r2 = 0xFFFF_FFFF_8012_5636;
+        unsafe { osCartRomInit_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+
+        assert_eq!(ctx.r2, 0xFFFF_FFFF_8000_9EA0);
+        assert_eq!(ctx.r2 & 3, 0, "returned OSPiHandle must be word-aligned");
     }
 
     /// Regression test for the real double-KSEG0-translation bug
