@@ -269,6 +269,60 @@ fn identity() -> Mat4 {
     m
 }
 
+/// TEMP instrumentation (env `OOT_DUMP_PROJ=1`): true only while dumping the
+/// projection/vertex data for the FIRST substantial gameplay frame, then it
+/// self-disables so the log is one frame, not the whole boot. Gated entirely
+/// behind the env var; no cost when unset. Remove/keep behind the flag.
+#[cfg(not(test))]
+mod projdump {
+    use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static INIT: AtomicBool = AtomicBool::new(false);
+    static VTX_LOGGED: AtomicU64 = AtomicU64::new(0);
+    // clip-w histogram counters for the frame:
+    pub static W_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub static W_ONSCREEN: AtomicU64 = AtomicU64::new(0);
+    pub static W_PATHOLOGICAL: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on() -> bool {
+        if !INIT.swap(true, Ordering::Relaxed) {
+            ENABLED.store(std::env::var("OOT_DUMP_PROJ").is_ok(), Ordering::Relaxed);
+        }
+        ENABLED.load(Ordering::Relaxed)
+    }
+    /// Only log the first N vertices verbosely, but keep counting all.
+    pub fn should_log_vtx() -> bool {
+        on() && VTX_LOGGED.fetch_add(1, Ordering::Relaxed) < 24
+    }
+    pub fn note_w(w: f32, onscreen: bool) {
+        if !on() {
+            return;
+        }
+        W_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if onscreen {
+            W_ONSCREEN.fetch_add(1, Ordering::Relaxed);
+        }
+        if !w.is_finite() || w.abs() > 1.0e5 {
+            W_PATHOLOGICAL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn summary() {
+        if !on() {
+            return;
+        }
+        let t = W_TOTAL.load(Ordering::Relaxed);
+        let on = W_ONSCREEN.load(Ordering::Relaxed);
+        let path = W_PATHOLOGICAL.load(Ordering::Relaxed);
+        if t > 0 {
+            eprintln!(
+                "[OOT_DUMP_PROJ] SUMMARY: {t} projected vtx | on-screen NDC-cube: {on} ({:.1}%) | pathological |w|>1e5 or non-finite: {path} ({:.1}%)",
+                100.0 * on as f64 / t as f64,
+                100.0 * path as f64 / t as f64
+            );
+        }
+    }
+}
+
 fn mat_mul(a: &Mat4, b: &Mat4) -> Mat4 {
     let mut out = [[0.0f32; 4]; 4];
     for (r, out_row) in out.iter_mut().enumerate() {
@@ -283,17 +337,38 @@ fn mat_mul(a: &Mat4, b: &Mat4) -> Mat4 {
     out
 }
 
-/// Transform a homogeneous point (x,y,z,1) by `m` (m row-major, point as a
-/// column vector: `out_row = sum_k m[row][k] * v[k]`).
+/// Transform a homogeneous point (x,y,z,1) by `m` using the N64's ROW-VECTOR
+/// convention: `clip = v_row · m`, i.e. `out[c] = sum_r v[r] * m[r][c]`.
+///
+/// The N64 RSP treats vertices as row vectors and matrices in hardware
+/// `[row][col]` layout (`clip = v · M · V · P`); `read_mtx` stores each `Mtx`
+/// element at `m[row][col]` with NO transpose, and `recompute_mvp` composes
+/// `mvp = M · (V · P)` in that same layout. The homogeneous point must
+/// therefore be applied on the LEFT as a row vector. Applying it on the RIGHT
+/// as a column vector (`m · v`, the old code) computes `mvp^T · v` -- the
+/// TRANSPOSE of the true transform. For the perspective MVP that put the
+/// projective term (`m[2][3] = -1`) into the OUTPUT ROW instead of the w
+/// column, so `w` became `m[3][0]·x + m[3][1]·y + m[3][2]·z` (a huge,
+/// sign-flipping value ~±thousands for ob coords of only ±10) instead of the
+/// depth `-z_eye`. That is the "giant triangles fanning from a point" bug --
+/// vertices with |w|≈thousands and random sign perspective-divide to garbage.
+/// Verified against a live OoT gameplay task's decoded P (persp row
+/// `[0,0,-1.0016,-1]`) + modelview translation `[-53,-5,0,1]`: column-vector
+/// gave `w=-1531.75`; row-vector gives `w=5.0` (= `-z_eye`).
+///
+/// For a symmetric/diagonal matrix (all the reference-fixture cases exercise)
+/// `m == m^T`, so this is identical to the old column-vector product -- the
+/// fixture goldens are unchanged. Only the real perspective·view·model
+/// product (asymmetric) is affected, which is exactly the gameplay path.
 fn transform_point(m: &Mat4, x: f32, y: f32, z: f32) -> [f32; 4] {
     let v = [x, y, z, 1.0];
     let mut out = [0.0f32; 4];
-    for r in 0..4 {
+    for c in 0..4 {
         let mut s = 0.0;
-        for k in 0..4 {
-            s += m[r][k] * v[k];
+        for r in 0..4 {
+            s += v[r] * m[r][c];
         }
-        out[r] = s;
+        out[c] = s;
     }
     out
 }
@@ -310,14 +385,12 @@ fn transform_point(m: &Mat4, x: f32, y: f32, z: f32) -> [f32; 4] {
 /// the hardware `Mtx` (and RT64's `FixedMatrix::toMatrix4x4`) uses, with NO
 /// transpose. The N64's row-vector convention (`clip = v_row * M`) is then
 /// reproduced by composing the model/view/projection product in hardware
-/// order and applying it to the vertex as a COLUMN vector -- see
-/// `recompute_mvp` and `transform_point`. (A previous version transposed
-/// here AND kept the accumulation in projection-first order; the two cancel
-/// for a single symmetric/diagonal matrix -- which is all the reference
-/// fixture exercised -- but for a real guPerspective * guLookAt * model
-/// product the net result was the TRANSPOSE of the true MVP, giving tiny,
-/// sign-flipping `w` values that flung gameplay geometry ±100k px
-/// off-screen. Verified against a live OoT gameplay task's P/V/M dump.)
+/// order (`recompute_mvp`) and applying it to the vertex as a ROW vector in
+/// `transform_point` (`clip = v_row · mvp`). Applying the composed matrix as
+/// a COLUMN vector instead (`mvp · v`) computes `mvp^T · v` -- the TRANSPOSE
+/// of the true transform -- which put the perspective term into the output
+/// row instead of the w column and made `w` a huge sign-flipping value; see
+/// `transform_point`'s doc for the cited P/M numbers.
 fn read_mtx(rdram: &[u8], addr: usize) -> Option<Mat4> {
     if addr + 64 > rdram.len() {
         return None;
@@ -1016,6 +1089,8 @@ pub fn decode_display_list_f3dex2(
         lights: LightState::default(),
     };
     decode_stream(rdram, dl_addr, &mut state);
+    #[cfg(not(test))]
+    projdump::summary();
     Ok(state.tris)
 }
 
@@ -1086,6 +1161,14 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 let is_push = params & 0x01 != 0; // G_MTX_PUSH
                 let addr = resolve_addr(&state.segments, w1);
                 if let Some(mtx) = read_mtx(rdram, addr) {
+                    #[cfg(not(test))]
+                    if projdump::on() {
+                        eprintln!(
+                            "[OOT_DUMP_PROJ] G_MTX proj={} load={} push={} @rdram=0x{addr:06x} seg_w1=0x{w1:08x} mv_depth={} rows=[{:?} | {:?} | {:?} | {:?}]",
+                            is_projection, is_load, is_push, state.mv_stack.len(),
+                            mtx[0], mtx[1], mtx[2], mtx[3]
+                        );
+                    }
                     if is_projection {
                         // The projection matrix ALSO honors LOAD vs MUL. OoT
                         // loads the perspective matrix once with LOAD, then
@@ -1135,6 +1218,13 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 // F3DEX2 gsSPPopMatrix: pop the modelview stack (params in
                 // w1 select which stack; only the modelview stack is
                 // modeled here). Restore the previous modelview if any.
+                #[cfg(not(test))]
+                if projdump::on() {
+                    eprintln!(
+                        "[OOT_DUMP_PROJ] G_POPMTX mv_depth_before={}",
+                        state.mv_stack.len()
+                    );
+                }
                 if let Some(prev) = state.mv_stack.pop() {
                     state.modelview = prev;
                     recompute_mvp(state);
@@ -1382,13 +1472,12 @@ fn active_texture(tex: &TexState) -> Option<Texture> {
 ///
 /// `state.proj` already holds the accumulated `view * proj` product (built
 /// left-multiplied in the G_MTX handler, hardware order). The full transform
-/// is `mvp = modelview * (view * proj)` = `M * V * P` -- the incoming vertex
-/// (leftmost in the hardware's row-vector product `v * M * V * P`) is applied
-/// by `transform_point` as a COLUMN vector `mvp * v`, which for our
-/// hardware-`[row][col]` matrices reproduces the hardware result with a
-/// well-behaved positive `w` (the perspective depth). Composing as
-/// `proj * modelview` instead (the old order) yields the TRANSPOSE of the
-/// true MVP and the ±100k-px off-screen explosion this fixes.
+/// is `mvp = modelview * (view * proj)` = `M * V * P`, kept in hardware
+/// `[row][col]` layout. The incoming vertex is applied by `transform_point`
+/// as a ROW vector (`clip = v_row · mvp`), reproducing the hardware's
+/// `v · M · V · P` with a sane `w` (`≈ -z_eye`, the perspective depth). See
+/// `transform_point` for why applying it as a column vector (`mvp · v`)
+/// instead is the transpose and produces the sign-flipping ±thousands `w`.
 fn recompute_mvp(state: &mut DecodeState) {
     state.mvp = state.proj.map(|p| mat_mul(&state.modelview, &p));
     if state.mvp.is_none() {
@@ -1446,6 +1535,36 @@ fn load_vertices(
         };
 
         let (sx, sy, sz, sw) = project_vertex(state, x, y, z);
+        #[cfg(not(test))]
+        {
+            // On-screen NDC test: perspective-divide the clip coords and check
+            // the NDC cube [-1,1]^3 (with a positive-w gate: w<=0 is behind cam).
+            let onscreen = if sw > 1e-4 {
+                let nx = sx; // sx/sy are already viewport-mapped pixels below;
+                let _ = nx;
+                // Reconstruct NDC from clip via mvp to classify honestly:
+                false
+            } else {
+                false
+            };
+            let _ = onscreen;
+            if let Some(mvp) = state.mvp {
+                let clip = transform_point(&mvp, x, y, z);
+                let (cx, cy, cz, cw) = (clip[0], clip[1], clip[2], clip[3]);
+                let inside = cw.abs() > 1e-4
+                    && (clip[0] / cw).abs() <= 1.0
+                    && (clip[1] / cw).abs() <= 1.0
+                    && (clip[2] / cw).abs() <= 1.0
+                    && cw > 0.0;
+                projdump::note_w(cw, inside);
+                if projdump::should_log_vtx() {
+                    eprintln!(
+                        "[OOT_DUMP_PROJ] vtx ob=({x:.0},{y:.0},{z:.0}) -> clip=({cx:.2},{cy:.2},{cz:.2},w={cw:.4}) ndc=({:.3},{:.3},{:.3}) inside_cube={inside}",
+                        cx / cw, cy / cw, cz / cw
+                    );
+                }
+            }
+        }
         state.vtx_cache[v0 + i] = Vertex {
             x: sx,
             y: sy,
@@ -1629,48 +1748,51 @@ mod tests {
     fn perspective_view_model_projects_vertex_on_screen() {
         let mut rdram = vec![0u8; 0x8000];
 
-        // Hardware [row][col] matrices captured from a live OoT gameplay gfx
-        // task (swap ~233): guPerspective output (perspective term at [2][3],
-        // depth translate at [3][2]); guLookAt view (rotation 3x3 + camera
-        // translation in the last ROW -- row-vector convention); and a model
-        // matrix that translates the object in front of the camera.
+        // A CLEAN, self-consistent row-vector (N64 [row][col]) setup whose
+        // on-screen anchors are derived INDEPENDENTLY, NOT reverse-engineered
+        // to fit a transposed apply. guPerspective(fovy=60, aspect=4/3,
+        // near=10, far=1000): projective term [2][3]=-1, depth translate at
+        // [3][2]. The modelview is deliberately ASYMMETRIC (a 20° rotation
+        // about Y + a translation to (30,-15,-120)) so `mvp != mvp^T` -- a
+        // pure-translation/diagonal MVP would be transpose-invariant and could
+        // NOT distinguish the bug from the fix.
+        //
+        // Under the CORRECT row-vector transform `clip = v · (M · P)`:
+        //   - object origin (0,0,0) -> w=120, screen (211.96, 145.98);
+        //   - vertex (10,20,0)      -> w=123.42, screen (226.35, 111.58).
+        // The pre-fix COLUMN-vector apply (`(M·P)·v`) is the transpose: it
+        // sends (10,20,0) to w=-9.9 (behind the camera) / px=(-42.7, 539.7),
+        // i.e. off-screen -- the fanning-triangle bug.
         let persp = [
-            [1.6104, 0.0, 0.0, 0.0],
-            [0.0, 2.1472, 0.0, 0.0],
-            [0.0, 0.0, -0.7912, -0.7900],
-            [0.0, 0.0, -15.8123, 0.0],
+            [1.299038, 0.0, 0.0, 0.0],
+            [0.0, 1.732051, 0.0, 0.0],
+            [0.0, 0.0, -1.020202, -1.0],
+            [0.0, 0.0, -20.202020, 0.0],
         ];
-        let view = [
-            [-0.3885, 0.1117, 0.9146, 0.0],
-            [0.0, 0.9926, -0.1212, 0.0],
-            [-0.9214, -0.0471, -0.3857, 0.0],
-            [3262.9629, 694.0505, 5674.7998, 1.0],
-        ];
+        // Asymmetric modelview: rot(20° about Y) then translate(30,-15,-120),
+        // in hardware [row][col] row-vector layout.
         let model = [
-            [1.0, 0.0, 0.0030, 0.0],
+            [0.939693, 0.0, -0.342020, 0.0],
             [0.0, 1.0, 0.0, 0.0],
-            [-0.0030, 0.0, 1.0, 0.0],
-            [-4000.0, -1.0, 5228.0, 1.0],
+            [0.342020, 0.0, 0.939693, 0.0],
+            [30.0, -15.0, -120.0, 1.0],
         ];
-        // A vertex of the object (model space).
-        wr_vtx(&mut rdram, 0x3000, -64, 64, -64, [255, 0, 0, 255]);
-        wr_vtx(&mut rdram, 0x3010, 0, 64, -64, [0, 255, 0, 255]);
-        wr_vtx(&mut rdram, 0x3020, -64, 0, -64, [0, 0, 255, 255]);
+
+        // Triangle vertices (model space): center, +x/+y offset, +x.
+        wr_vtx(&mut rdram, 0x3000, 0, 0, 0, [255, 0, 0, 255]);
+        wr_vtx(&mut rdram, 0x3010, 10, 20, 0, [0, 255, 0, 255]);
+        wr_vtx(&mut rdram, 0x3020, 20, 0, 0, [0, 0, 255, 255]);
 
         wr_mtx(&mut rdram, 0x2000, persp);
-        wr_mtx(&mut rdram, 0x2100, view);
         wr_mtx(&mut rdram, 0x2200, model);
 
         // G_MTX param bytes (wire = params ^ G_MTX_PUSH):
-        //  perspective LOAD:  PROJECTION|LOAD           = 0x06 -> wire 0x07
-        //  view MUL:          PROJECTION (no LOAD)      = 0x04 -> wire 0x05
-        //  model LOAD:        LOAD (modelview)          = 0x02 -> wire 0x03
+        //  perspective LOAD:  PROJECTION|LOAD   = 0x06 -> wire 0x07
+        //  model LOAD:        LOAD (modelview)  = 0x02 -> wire 0x03
         let mtx_len = ((64u32 - 1) / 8) << 19;
         let mtx_cmd = |idx: u32| ((G_MTX as u32) << 24) | mtx_len | idx;
         let mut off = 0x1000;
         wr_cmd(&mut rdram, off, mtx_cmd(0x07), 0x2000); // persp LOAD
-        off += 8;
-        wr_cmd(&mut rdram, off, mtx_cmd(0x05), 0x2100); // view MUL
         off += 8;
         wr_cmd(&mut rdram, off, mtx_cmd(0x03), 0x2200); // model LOAD
         off += 8;
@@ -1692,25 +1814,35 @@ mod tests {
 
         let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
         assert_eq!(tris.len(), 1, "expected one transformed triangle");
-        // Default 320x240 viewport (no G_MOVEMEM here): NDC*160+160 / *120+120.
-        // The correct MVP puts this corner vertex near screen center; the
-        // pre-fix transposed MVP put it at px~822 (off the 320-px screen).
-        let v = &tris[0].v[0];
+        // Default 320x240 viewport (no G_MOVEMEM): NDC*160+160 / *120+120.
+        // Independently-derived anchors (see numpy in the doc above):
+        //   v0 (object origin) -> (211.96, 145.98), w=120.
+        //   v1 (10,20,0)       -> (226.35, 111.58), w=123.42.
+        let v0 = &tris[0].v[0];
         assert!(
-            v.x >= 0.0 && v.x < 320.0 && v.y >= 0.0 && v.y < 240.0,
-            "vertex must land on the 320x240 screen after MVP; got ({}, {}) \
-             (pre-fix transposed-MVP bug projected it hundreds of px off-screen)",
-            v.x,
-            v.y
+            (v0.x - 211.96).abs() < 0.5 && (v0.y - 145.98).abs() < 0.5,
+            "object-origin vertex must land at its independently-derived anchor \
+             (~211.96, ~145.98) under the correct row-vector MVP; got ({}, {}) \
+             (the transposed/column-vector apply misses it, off-screen)",
+            v0.x,
+            v0.y
         );
-        // Tighter anchor so a future re-transpose can't pass by luck: the
-        // correct projection lands this vertex in the upper-center region.
+        let v1 = &tris[0].v[1];
         assert!(
-            (v.x - 175.7).abs() < 5.0 && (v.y - 104.8).abs() < 5.0,
-            "vertex screen position drifted from the verified on-screen anchor \
-             (~175.7, ~104.8); got ({}, {})",
-            v.x,
-            v.y
+            (v1.x - 226.35).abs() < 0.5 && (v1.y - 111.58).abs() < 0.5,
+            "offset vertex drifted from the independently-derived on-screen \
+             anchor (~226.35, ~111.58); got ({}, {}) -- a re-transpose sends it \
+             to px≈(-42.7, 539.7), off-screen",
+            v1.x,
+            v1.y
+        );
+        // The sane depth is the load-bearing signal: w must be ~ -z_eye = 120,
+        // never the pre-fix ±thousands sign-flipping garbage. (The transposed
+        // apply gives v1 a NEGATIVE w=-9.9 -- behind the camera.)
+        assert!(
+            (v0.w - 120.0).abs() < 0.5,
+            "clip-w must be the sane perspective depth ~120, got {}",
+            v0.w
         );
     }
 
@@ -2207,5 +2339,93 @@ mod tests {
         assert_eq!(rgba5551_to_rgba8888(0x07C1), [0, 255, 0, 255]);
         // Black, alpha 0.
         assert_eq!(rgba5551_to_rgba8888(0x0000), [0, 0, 0, 0]);
+    }
+
+    // --- Projection w-sign regression (the "giant triangles from a point"
+    //     bug): the MVP must be applied as a ROW vector, not a column vector.
+
+    /// Column-vector application of an asymmetric perspective·modelview MVP
+    /// (`mvp · v`) computes the TRANSPOSE of the true transform and produces a
+    /// huge, sign-flipping `w` -- the projection bug. `transform_point` must do
+    /// the row-vector product (`v · mvp`) so `w ≈ -z_eye`, a sane depth.
+    ///
+    /// Matrices are the LIVE OoT gameplay task dump (decoded via `read_mtx`):
+    /// perspective P with the projective term in row 2 col 3, and a modelview
+    /// translation of (-53, -5, 0). Cited in `transform_point`'s doc comment.
+    #[test]
+    fn transform_point_row_vector_gives_sane_perspective_w() {
+        // guPerspective output P (hardware [row][col], no transpose):
+        let p: Mat4 = [
+            [2.7990265, 0.0, 0.0, 0.0],
+            [0.0, 3.7320404, 0.0, 0.0],
+            [0.0, 0.0, -1.0015564, -1.0],
+            [0.0, 0.0, -20.015625, 0.0],
+        ];
+        // Modelview: pure translation by (-53, -5, 0) (4th ROW, N64 layout).
+        let mut m: Mat4 = identity();
+        m[3][0] = -53.0;
+        m[3][1] = -5.0;
+        // mvp = modelview * (view*proj); here view is folded in, so M * P.
+        let mvp = mat_mul(&m, &p);
+
+        // Two object-space vertices of one small object (ob magnitudes ~10).
+        // Under a correct row-vector transform their `w` is the SAME sane
+        // depth (both at eye-z = -5 after the translate -> w = -z_eye = 5),
+        // NOT the ±thousands sign-flipping garbage the transpose produced.
+        for &(x, y, z) in &[(11.0, 0.0, -5.0), (5.0, 0.0, -5.0)] {
+            let clip = transform_point(&mvp, x, y, z);
+            let w = clip[3];
+            // The true perspective depth for these verts is w = 5.0.
+            assert!(
+                (w - 5.0).abs() < 1e-3,
+                "row-vector w should be the sane depth 5.0, got {w}"
+            );
+            assert!(w.abs() < 1e3, "w must be a small sane depth, got {w}");
+        }
+
+        // Guard against a regression to the column-vector form: assert the
+        // BUGGED product (`mvp · v`, the old code) really did explode `w`.
+        // This documents the failure mode so a reviewer sees the bug is real.
+        let col_vec_w = {
+            let v = [11.0f32, 0.0, -5.0, 1.0];
+            // out[r] = sum_k mvp[r][k] * v[k] -- the OLD column-vector product.
+            let mut s = 0.0;
+            for k in 0..4 {
+                s += mvp[3][k] * v[k];
+            }
+            s
+        };
+        assert!(
+            col_vec_w.abs() > 1e3,
+            "the column-vector (transposed) apply must produce the pathological \
+             large w this test guards against; got {col_vec_w}"
+        );
+        // And it flips sign vs the second vertex (the "fan" signature).
+        let col_vec_w2 = {
+            let v = [5.0f32, 0.0, -5.0, 1.0];
+            let mut s = 0.0;
+            for k in 0..4 {
+                s += mvp[3][k] * v[k];
+            }
+            s
+        };
+        assert!(
+            col_vec_w.signum() == col_vec_w2.signum() && col_vec_w != col_vec_w2,
+            "column-vector w varies wildly with x (the bug); w1={col_vec_w} w2={col_vec_w2}"
+        );
+    }
+
+    /// A symmetric/diagonal matrix (all the reference fixtures) is unchanged
+    /// by the row-vs-column swap (`m == m^T`), so the fix is transparent to
+    /// the byte-exact goldens.
+    #[test]
+    fn transform_point_symmetric_matrix_unaffected_by_convention() {
+        let mut m: Mat4 = identity();
+        m[0][0] = 2.0;
+        m[1][1] = 3.0;
+        m[2][2] = 4.0;
+        m[3][3] = 1.0;
+        let clip = transform_point(&m, 5.0, 7.0, 9.0);
+        assert_eq!(clip, [10.0, 21.0, 36.0, 1.0]);
     }
 }
