@@ -208,6 +208,20 @@ unsafe fn dispatch_gfx_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
     }
 }
 
+/// Present the registered graphics backend at the guest's real VI swap
+/// boundary. Task submission and VI presentation are distinct on N64; this
+/// closes the second half of `RenderBackend` without exposing RT64 or any
+/// foreign type outside `fn64-render-rt64`.
+pub(crate) fn present_render_backend() {
+    RENDER_BACKEND.with(|cell| {
+        if let Some(backend) = cell.borrow_mut().as_mut() {
+            if let Err(error) = backend.present() {
+                RENDER_LAST_ERROR.with(|last| last.replace(Some(error.to_string())));
+            }
+        }
+    });
+}
+
 /// Dispatch an audio task (`M_AUDTASK`) once, at the point the RSP is kicked.
 /// Two halves, both symmetric with `dispatch_gfx_task`:
 ///  1. Run the registered translated audio ucode (`AUDIO_UCODE_FN`,

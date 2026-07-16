@@ -1,34 +1,57 @@
-# fn64-rt64
+# fn64-render-rt64
 
-Empty placeholder crate. This is deliberate, not an oversight.
+This crate contains both fn64 graphics backends:
 
-`docs/DESIGN.md` section 1 explains why all C++/RT64 interop is quarantined
-in its own crate rather than mixed into `fn64-runtime`. Section 1's
-rationale point 2 is why this crate has no real implementation yet: the RSP
-**gfx** task handoff signature RT64 needs to consume is, per
-`aki-recomp/runtime/ABI-SURFACE.md` section (e), **not yet visible from
-generated code in either ported game's current corpus** — no
-`osSpTaskLoad`/`osSpTaskStartGo` `_recomp` call site has been reached by a
-`profile.toml` rename wave yet. That document is explicit that this is "a
-real gap, not a resolved ABI point."
+- `ReferenceBackend` is the deterministic, pure-Rust software rasterizer used
+  by the default build and headless CI.
+- `Rt64Backend` is an opt-in C ABI wrapper around RT64's MIT C++ render/HLE
+  library. It is enabled with the crate's `rt64` Cargo feature.
 
-Writing this crate's real content now would mean guessing a call shape
-instead of extracting it mechanically the way every other ABI surface
-symbol in this project was — exactly the kind of unevidenced claim
-`AGENTS.md` rules out ("Cite actual bytes/addresses/commits, not a
-plausible-sounding story," per the sibling `faki-tools` project's stricter
-version of the same rule, which this project inherits in spirit).
+The C++ and every Rust `unsafe` block used to call it are quarantined here, as
+required by `docs/DESIGN.md` section 1. `fn64-render`, `fn64-runtime`, and the
+native recompiler remain unaware of RT64 types and continue to forbid unsafe
+code.
 
-**What is already resolved and can land whenever this crate gets its first
-real wave** (see `docs/DESIGN.md` section 5, wave 4): the RSP **audio**
-ucode task boundary. `ABI-SURFACE.md` section (e) has the full byte-verified
-config (`text_offset`, `text_size`, `text_address`, indirect branch targets)
-sourced from `games/NWXE/rsp/wm2000_audio.toml`. Audio task submission is
-unblocked today; gfx task submission is blocked on new evidence, specifically
-a `profile.toml` rename wave reaching an `osSpTaskLoad`/`osSpTaskStartGo`
-call site so its real signature can be extracted the same mechanical way as
-everything else in `ABI-SURFACE.md`.
+## Building the RT64 path
 
-Until then: this crate compiles, exposes nothing, and exists so the
-workspace's dependency graph (`fn64-shell -> fn64-rt64 -> fn64-runtime`) is
-real and buildable rather than aspirational.
+The build expects the sibling RT64 checkout at
+`../no-mercy-recompiled/third_party/rt64` relative to this repository. Set
+`FN64_RT64_DIR` to use another checkout:
+
+```sh
+FN64_RT64_DIR=/path/to/rt64 cargo build -p fn64-render-rt64 --features rt64
+```
+
+`build.rs` checks that the checkout carries RT64's MIT license, configures the
+checked-in wrapper CMake project with `RT64_STATIC=ON`, and builds only the
+`fn64_rt64_shim` target. That target pulls in RT64's static `rt64` render/HLE
+target and its permissively licensed static dependencies (`re-spirv`, `nfd`,
+`zstd`, and `plume`). The current RT64 tree defines no mupen plugin target; its
+GPL mupen64plus subtree is neither compiled nor linked. RT64's shader compiler
+helpers still run at build time because the core render library embeds its
+generated shaders.
+
+The default feature set does not invoke CMake, link a graphics library, or
+require a GPU. Constructing `Rt64Backend` without the feature returns a named
+`RenderError::Backend`. With the feature enabled, display/GPU initialization
+failures are converted to the same error type, allowing a caller to install
+`ReferenceBackend` instead.
+
+## FFI boundary
+
+`ffi/fn64_rt64_shim.cpp` exposes an opaque context through five C functions:
+create, process an `OSTask`, present, resize, and destroy. Create supplies
+private DMEM, IMEM, DPC, and VI storage to `RT64::Application::Core`. Task
+processing temporarily points RT64 at fn64's stable 8 MiB RDRAM allocation,
+loads the task's graphics microcode, and submits its raw display list. RT64's
+render-to-RAM mode writes the native framebuffer into the same allocation;
+the shim waits for the submitted workload before returning the Rust borrow.
+
+`src/ffi.rs` is the only raw Rust FFI surface. It wraps the opaque pointer in a
+safe, uniquely owned `Context`, documents each unsafe call, and maps every
+recoverable C++ failure to a Rust `Result`.
+
+The `oot-boot` harness selects the implementation with
+`FN64_RENDER=reference` (default) or `FN64_RENDER=rt64`. Requesting RT64 also
+enables the Cargo feature in its `oot` helper script. If creation fails, the
+harness logs the exact reason and continues with `ReferenceBackend`.

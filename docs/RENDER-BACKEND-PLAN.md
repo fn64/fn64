@@ -21,7 +21,7 @@ Three implementations behind the one trait:
    bootstrap seam-proof; KEEP IT as the headless CI/test oracle + wasm/no-GPU
    fallback. All the render work built up this session (combiner/blend/alpha/
    textures/scissor) lives here and stays useful as the differential oracle.
-2. **`Rt64Backend`** (stub → being wired) — FFI wrapper over RT64's MIT C++
+2. **`Rt64Backend`** (feature-gated wrapper implemented) — FFI wrapper over RT64's MIT C++
    render lib. `RT64::Application::Core` (rdram/DMEM/IMEM + DPC/VI regs) +
    `Interpreter::processDisplayLists(raw F3DEX2 DL)`. The fast faithful path.
    FFI quarantined to the `fn64-render-rt64` crate (the existing unsafe-audit
@@ -51,3 +51,27 @@ Three implementations behind the one trait:
 This is the recompiler story retold: [[fn64-whole-rom-recomp-milestone]] wrapped
 N64Recomp, proved the runtime, then fn64-recomp-native replaced it in typed
 Rust. Same move for the renderer.
+
+## Implementation status (2026-07-16)
+
+`fn64-render-rt64` now has an opt-in `rt64` Cargo feature. Its `build.rs`
+configures a wrapper CMake project with `RT64_STATIC=ON` and builds only
+`fn64_rt64_shim`; that target pulls in the static RT64 render/HLE target
+`rt64` and the permissive `re-spirv`, `nfd`, `zstd`, and `plume` dependencies.
+The evaluated RT64 source tree defines no mupen plugin target, so no source or
+library from its GPL mupen64plus subtree is compiled or linked. The default
+feature set remains the pure-Rust `ReferenceBackend` build and does not invoke
+CMake.
+
+The crate-local C shim owns `RT64::Application`, private DMEM/IMEM and DPC/VI
+register storage, accepts fn64's RDRAM pointer plus the public `OSTask` field
+shape, calls `loadUCodeGBI` and `Application::processDisplayLists`, and waits
+for RT64's render-to-RAM workload before returning. `fn64-abi` invokes the
+trait's `present` method at the real `osViSwapBuffer` boundary. All raw FFI and
+unsafe Rust remain confined to `fn64-render-rt64`.
+
+`examples/oot-boot` accepts `FN64_RENDER=rt64`; failure to initialize SDL or a
+supported graphics device is a named create error and causes an explicit
+fallback to `ReferenceBackend`. Frame verification and any host-specific GPU
+blocker are recorded with the implementation commit rather than asserted by
+this plan document.
