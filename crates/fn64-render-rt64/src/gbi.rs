@@ -2472,4 +2472,177 @@ mod tests {
         let clip = transform_point(&m, 5.0, 7.0, 9.0);
         assert_eq!(clip, [10.0, 21.0, 36.0, 1.0]);
     }
+
+    /// Regression for the exact fixed-point `guLookAt` matrix observed in the
+    /// Hyrule Field title-camera task. The writer trace establishes that
+    /// `guLookAtF` receives eye `(-4000,-1,5228)`; its translation therefore
+    /// is `(3263,694,5675) = -(eye · basis)`. Those translation values are
+    /// camera-space coordinates of the world origin, not the world-space eye.
+    ///
+    /// Replacing them with `-translation · basis` (the discarded diagnostic
+    /// transform) moves the camera to a different world-space eye. This test
+    /// fails under that rewrite because the traced eye no longer maps to the
+    /// view-space origin.
+    #[test]
+    fn hyrule_field_live_gu_look_at_translation_matches_traced_eye() {
+        // Decoded from the 64-byte Mtx written at physical 0x1888c8. The
+        // fixed-point quantization accounts for the small origin tolerance.
+        let view: Mat4 = [
+            [-0.3885498, 0.11167908, 0.9146271, 0.0],
+            [-1.5258789e-5, 0.99261475, -0.12121582, 0.0],
+            [-0.92141724, -0.04710388, -0.38568115, 0.0],
+            [3262.9912, 694.052, 5674.783, 1.0],
+        ];
+        let eye = [-4000.0, -1.0, 5228.0];
+
+        for c in 0..3 {
+            let expected_translation =
+                -(eye[0] * view[0][c] + eye[1] * view[1][c] + eye[2] * view[2][c]);
+            assert!(
+                (view[3][c] - expected_translation).abs() < 0.1,
+                "translation[{c}] must be -(eye · basis[{c}]): got {}, expected {expected_translation}",
+                view[3][c]
+            );
+        }
+
+        let eye_in_view = transform_point(&view, eye[0], eye[1], eye[2]);
+        for (axis, value) in eye_in_view[..3].iter().enumerate() {
+            assert!(
+                value.abs() < 0.1,
+                "traced eye must map to the view-space origin; axis {axis} was {value}"
+            );
+        }
+        assert!((eye_in_view[3] - 1.0).abs() < f32::EPSILON);
+    }
+
+    // --- Synthetic large-world projection regression ---------------------
+    //
+    // This synthetic scene has a camera at world ~(3000,700,5600) and an
+    // object translated to ~-4000, so both sides carry LARGE world
+    // coordinates. It drives the full decode path -- fixed-point `Mtx`
+    // bytes (`read_mtx`) -> projection LOAD(persp) then PROJECTION|MUL(view)
+    // -> modelview LOAD -> `recompute_mvp` (`M · (V · P)`) -> row-vector
+    // `transform_point` -> the default 320x240 viewport map -- for the exact
+    // large-world matrix shapes and asserts every vertex lands in-frustum
+    // with a sane POSITIVE `w` (~ -z_eye ~= +7000), never the negative /
+    // sign-flipping `w` and ±4000 screen-z of the mis-projection.
+    //
+    // The synthetic view is a proper `guLookAt` matrix: its translation row is
+    // `-(eye · basis)` = (5419.7, -367.3, -3367.7), NOT the raw eye. That is
+    // the load-bearing distinction -- feed the raw eye (3000,700,5600) into
+    // row 3 instead and the origin vertex flips to `w = -1921` (behind the
+    // camera). This asserts the decode+compose of a correct synthetic
+    // large-world view/model/perspective chain.
+    //
+    // It fails against the historical transpose bug too: a re-introduced
+    // `Mtx` transpose-on-read or a column-vector apply turns the asymmetric
+    // large-world MVP into its transpose and collapses `w` to garbage.
+    #[test]
+    fn large_world_perspective_view_model_projects_in_frustum() {
+        let mut rdram = vec![0u8; 0x8000];
+
+        // guPerspective(fovy=60, aspect=4/3, near=100, far=12800), hardware
+        // [row][col]: projective term [2][3]=-1, depth translate [3][2].
+        let persp = [
+            [1.2990381, 0.0, 0.0, 0.0],
+            [0.0, 1.7320508, 0.0, 0.0],
+            [0.0, 0.0, -1.0157480, -1.0],
+            [0.0, 0.0, -201.57480, 0.0],
+        ];
+        // PROPER guLookAt view: 3x3 = camera basis (right/up/look as columns),
+        // translation ROW = -(eye · basis). Eye world ~(3000,700,5600) looking
+        // toward (-4000,0,5200). (Raw eye in row 3 would be the bug.)
+        let view = [
+            [0.05704979, -0.09918146, 0.99343261, 0.0],
+            [0.0, 0.99505322, 0.09934326, 0.0],
+            [-0.99837133, -0.00566751, 0.05676758, 0.0],
+            [5419.7300, -367.25479, -3367.7366, 1.0],
+        ];
+        // Large-world object modelview: rot(15° about Y) then translate to
+        // world (-4000, 0, 5200) -- asymmetric so `mvp != mvp^T`.
+        let model = [
+            [0.96592583, 0.0, -0.25881905, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.25881905, 0.0, 0.96592583, 0.0],
+            [-4000.0, 0.0, 5200.0, 1.0],
+        ];
+
+        // Object-space vertices (small, ob magnitudes ~50).
+        wr_vtx(&mut rdram, 0x3000, 0, 0, 0, [255, 0, 0, 255]);
+        wr_vtx(&mut rdram, 0x3010, 50, 30, 0, [0, 255, 0, 255]);
+        wr_vtx(&mut rdram, 0x3020, -50, 0, 40, [0, 0, 255, 255]);
+
+        wr_mtx(&mut rdram, 0x2000, persp);
+        wr_mtx(&mut rdram, 0x2100, view);
+        wr_mtx(&mut rdram, 0x2200, model);
+
+        // G_MTX wire = params ^ G_MTX_PUSH:
+        //   persp PROJECTION|LOAD        = 0x06 -> wire 0x07
+        //   view  PROJECTION|MUL(NOPUSH) = 0x04 -> wire 0x05
+        //   model LOAD (modelview)       = 0x02 -> wire 0x03
+        let mtx_len = ((64u32 - 1) / 8) << 19;
+        let mtx_cmd = |idx: u32| ((G_MTX as u32) << 24) | mtx_len | idx;
+        let mut off = 0x1000;
+        wr_cmd(&mut rdram, off, mtx_cmd(0x07), 0x2000); // persp LOAD
+        off += 8;
+        wr_cmd(&mut rdram, off, mtx_cmd(0x05), 0x2100); // view PROJECTION|MUL
+        off += 8;
+        wr_cmd(&mut rdram, off, mtx_cmd(0x03), 0x2200); // model LOAD
+        off += 8;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_VTX as u32) << 24) | (3 << 12) | (3 << 1),
+            0x3000,
+        );
+        off += 8;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1),
+            0,
+        );
+        off += 8;
+        wr_cmd(&mut rdram, off, (G_ENDDL as u32) << 24, 0);
+
+        let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
+        assert_eq!(tris.len(), 1, "expected one transformed triangle");
+
+        // Every vertex must project to a sane POSITIVE depth ~7000 and land
+        // inside the default 320x240 screen ([0,320] x [0,240]). The origin
+        // vertex maps to screen center (~160, 120). The mis-projection gave
+        // negative `w` and NDC well outside [-1,1] (pz swinging ±4000).
+        for (i, v) in tris[0].v.iter().enumerate() {
+            assert!(
+                v.w > 1.0,
+                "large-world vertex {i} must have a sane positive clip-w \
+                 (~7000, = -z_eye), got w={} (negative/tiny w is the \
+                 mis-projection this test guards)",
+                v.w
+            );
+            assert!(
+                (5000.0..9000.0).contains(&v.w),
+                "large-world clip-w must be the coherent perspective depth \
+                 (~7000), got w={} -- a decode transpose / wrong MVP order \
+                 turns it into garbage",
+                v.w
+            );
+            assert!(
+                (0.0..=320.0).contains(&v.x) && (0.0..=240.0).contains(&v.y),
+                "large-world vertex {i} must land inside the 320x240 screen, \
+                 got ({}, {}) -- out-of-frustum is the ±4000 pz mis-projection",
+                v.x,
+                v.y
+            );
+        }
+        // Origin vertex at screen center is the crisp anchor.
+        let v0 = &tris[0].v[0];
+        assert!(
+            (v0.x - 160.0).abs() < 1.0 && (v0.y - 120.0).abs() < 1.0,
+            "object-origin vertex must land at screen center (~160, ~120) \
+             under the correct large-world MVP; got ({}, {})",
+            v0.x,
+            v0.y
+        );
+    }
 }
