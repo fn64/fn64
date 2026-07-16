@@ -25,6 +25,11 @@ libc = "0.2"
 fn64-runtime = { path = "../../../crates/fn64-runtime" }
 fn64-abi = { path = "../../../crates/fn64-abi", features = ["native-recomp"] }
 fn64-recomp-native = { path = "../../../crates/fn64-recomp-native" }
+# `examples/oot-boot/oot` refreshes this ignored symlink from
+# NATIVE_RECOMPILED_DIR before Cargo resolves the graph. Cargo dependencies
+# cannot interpolate environment variables in `path`, so the link is the
+# explicit bridge from the env-selected out-of-tree crate to this manifest.
+oot-native-funcs = { path = "recompiled" }
 fn64-render = { path = "../../../crates/fn64-render" }
 fn64-render-rt64 = { path = "../../../crates/fn64-render-rt64" }
 fn64-audio = { path = "../../../crates/fn64-audio" }
