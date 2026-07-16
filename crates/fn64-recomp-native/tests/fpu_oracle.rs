@@ -609,14 +609,20 @@ fn floor_ceil_w_emit() {
         let input = FuncInput { name: "t", vram: 0x8000_0000, words: &[word, 0x03E00008, 0] };
         emit_function(&input)
     };
-    assert!(emit1(0x4600630F).contains("ctx.set_f_bits(12, (ctx.f_s(12).floor() as i32) as u32);"));
-    assert!(emit1(0x4600630E).contains("ctx.set_f_bits(12, (ctx.f_s(12).ceil() as i32) as u32);"));
-    assert!(emit1(0x4620630F).contains("ctx.set_f_bits(12, (ctx.f_d(12).floor() as i32) as u32);"));
-    assert!(emit1(0x4620630E).contains("ctx.set_f_bits(12, (ctx.f_d(12).ceil() as i32) as u32);"));
-    assert!(emit1(0x4600630C)
-        .contains("ctx.set_f_bits(12, round_ties_even_f32(ctx.f_s(12)) as i32 as u32);"));
-    assert!(emit1(0x4620630C)
-        .contains("ctx.set_f_bits(12, round_ties_even_f64(ctx.f_d(12)) as i32 as u32);"));
+    // Post-merge: FLOOR/CEIL/ROUND.W route through the unified `fpu_to_i32(v,
+    // Some(mode))` runtime helper (floor=3, ceil=2, round-ties-even=0), which
+    // -- unlike the earlier inline `.floor() as i32` -- honors the FCSR mode
+    // and raises the inexact/invalid FP flags per the VR4300. Assert the mode
+    // arg + source-width for each; behavior is bit-checked in
+    // `floor_ceil_w_execute_matches_oracle` and the ISA rounding sweep.
+    assert!(emit1(0x4600630F).contains("ctx.fpu_to_i32(v, Some(3))")); // FLOOR.W.S
+    assert!(emit1(0x4600630F).contains("ctx.f_s(12) as f64"));
+    assert!(emit1(0x4600630E).contains("ctx.fpu_to_i32(v, Some(2))")); // CEIL.W.S
+    assert!(emit1(0x4620630F).contains("ctx.fpu_to_i32(v, Some(3))")); // FLOOR.W.D
+    assert!(emit1(0x4620630F).contains("ctx.f_d(12)"));
+    assert!(emit1(0x4620630E).contains("ctx.fpu_to_i32(v, Some(2))")); // CEIL.W.D
+    assert!(emit1(0x4600630C).contains("ctx.fpu_to_i32(v, Some(0))")); // ROUND.W.S
+    assert!(emit1(0x4620630C).contains("ctx.fpu_to_i32(v, Some(0))")); // ROUND.W.D
 }
 
 /// Execute-and-oracle: model OoT `floorf`/`ceilf` (`floor.w.s $f0,$f12`;

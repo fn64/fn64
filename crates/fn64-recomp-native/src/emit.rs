@@ -913,34 +913,11 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
         FloorWD { fd, fs } => emit_fpu_i32(out, fd, fs, false, Some(3)),
         FloorLS { fd, fs } => emit_fpu_i64(out, fd, fs, true, Some(3)),
         FloorLD { fd, fs } => emit_fpu_i64(out, fd, fs, false, Some(3)),
-
-        // FLOOR.W.* -> round toward -inf, then to int32. `f.floor()` is the
-        // IEEE floor; `as i32` then truncates the (already-integral) result,
-        // matching the recomp.h FLOOR_W_S macro's `(int32_t)floorf(val)`.
-        FloorWS { fd, fs } => {
-            line(out, format!("ctx.set_f_bits({}, (ctx.f_s({}).floor() as i32) as u32);", fd, fs))
-        }
-        FloorWD { fd, fs } => {
-            line(out, format!("ctx.set_f_bits({}, (ctx.f_d({}).floor() as i32) as u32);", fd, fs))
-        }
-        // CEIL.W.* -> round toward +inf, then to int32 (`(int32_t)ceilf(val)`).
-        CeilWS { fd, fs } => {
-            line(out, format!("ctx.set_f_bits({}, (ctx.f_s({}).ceil() as i32) as u32);", fd, fs))
-        }
-        CeilWD { fd, fs } => {
-            line(out, format!("ctx.set_f_bits({}, (ctx.f_d({}).ceil() as i32) as u32);", fd, fs))
-        }
-        // ROUND.W.* -> round to nearest, ties to even (RN, the boot FCSR mode),
-        // then to int32. Identical rounding to `CVT.W.*` above, which routes
-        // through `round_ties_even_f{32,64}` per the recomp.h ROUND_W_S macro.
-        RoundWS { fd, fs } => line(
-            out,
-            format!("ctx.set_f_bits({}, round_ties_even_f32(ctx.f_s({})) as i32 as u32);", fd, fs),
-        ),
-        RoundWD { fd, fs } => line(
-            out,
-            format!("ctx.set_f_bits({}, round_ties_even_f64(ctx.f_d({})) as i32 as u32);", fd, fs),
-        ),
+        // (FLOOR/CEIL/ROUND.W.{S,D} are handled by the unified emit_fpu_i32
+        // arms above with the mode arg Some(3)/Some(2)/Some(0); the duplicate
+        // inline arms from main's driver branch were removed as unreachable on
+        // merge -- the emit_fpu_i32 helper and the merged decoder are the
+        // superset, and fpu_oracle.rs verifies the emitted behavior matches.)
 
         // --- FP compares: set the condition flag (FCSR bit 23). ---
         CEqS { fs, ft } => {
