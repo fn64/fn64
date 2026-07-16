@@ -811,6 +811,34 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
             line(out, format!("ctx.set_d_bits({}, (ctx.f_d({}) as i64) as u64);", fd, fs))
         }
 
+        // FLOOR.W.* -> round toward -inf, then to int32. `f.floor()` is the
+        // IEEE floor; `as i32` then truncates the (already-integral) result,
+        // matching the recomp.h FLOOR_W_S macro's `(int32_t)floorf(val)`.
+        FloorWS { fd, fs } => {
+            line(out, format!("ctx.set_f_bits({}, (ctx.f_s({}).floor() as i32) as u32);", fd, fs))
+        }
+        FloorWD { fd, fs } => {
+            line(out, format!("ctx.set_f_bits({}, (ctx.f_d({}).floor() as i32) as u32);", fd, fs))
+        }
+        // CEIL.W.* -> round toward +inf, then to int32 (`(int32_t)ceilf(val)`).
+        CeilWS { fd, fs } => {
+            line(out, format!("ctx.set_f_bits({}, (ctx.f_s({}).ceil() as i32) as u32);", fd, fs))
+        }
+        CeilWD { fd, fs } => {
+            line(out, format!("ctx.set_f_bits({}, (ctx.f_d({}).ceil() as i32) as u32);", fd, fs))
+        }
+        // ROUND.W.* -> round to nearest, ties to even (RN, the boot FCSR mode),
+        // then to int32. Identical rounding to `CVT.W.*` above, which routes
+        // through `round_ties_even_f{32,64}` per the recomp.h ROUND_W_S macro.
+        RoundWS { fd, fs } => line(
+            out,
+            format!("ctx.set_f_bits({}, round_ties_even_f32(ctx.f_s({})) as i32 as u32);", fd, fs),
+        ),
+        RoundWD { fd, fs } => line(
+            out,
+            format!("ctx.set_f_bits({}, round_ties_even_f64(ctx.f_d({})) as i32 as u32);", fd, fs),
+        ),
+
         // --- FP compares: set the condition flag (FCSR bit 23). ---
         CEqS { fs, ft } => {
             line(out, format!("ctx.fpu_cond = ctx.f_s({}) == ctx.f_s({});", fs, ft))
