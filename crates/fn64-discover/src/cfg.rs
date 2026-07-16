@@ -251,7 +251,9 @@ pub struct Cfg {
     pub tail_transfers: Vec<(u32, u32)>, // (source pc, target)
     pub indirect_sites: Vec<IndirectSite>,
     /// Addresses that are proven callable roots because something reached
-    /// them via `jal`/`j`/an explicit seed root, in first-seen order.
+    /// them via `jal` or supplied them as an explicit seed root, in
+    /// first-seen order. A plain `j` proves its target is code, but not that
+    /// it is a function boundary: it may be an intra-function label.
     pub proven_roots: Vec<u32>,
 }
 
@@ -374,8 +376,15 @@ pub fn build_cfg(bank: &str, bank_bytes: &[u8], va_start: u32, roots: &[u32]) ->
                     let delay_pc = pc.wrapping_add(4);
                     mark(&mut word_class, delay_pc, WordClass::ProvenCode);
                     tail_transfers.push((pc, target));
-                    if in_range(target) && proven_roots_seen.insert(target) {
-                        proven_roots.push(target);
+                    // An unconditional `j` proves code reachability, not a
+                    // callable function boundary. NWXE contains ordinary
+                    // intra-function `j` targets that spimdisasm correctly
+                    // represents as `alabel`s. Promoting every such target
+                    // to an owner root over-splits those functions. Traverse
+                    // the target now; partitioning will keep it with the
+                    // caller unless independent evidence (`jal` or an
+                    // explicit seed) proves the target is a real root.
+                    if in_range(target) {
                         worklist.push_back(target);
                     }
                     blocks.push(BasicBlock {
@@ -639,7 +648,8 @@ mod tests {
         let cfg = build_cfg("boot", &bytes, 0x8000_0000, &[0x8000_0000]);
         assert_eq!(cfg.tail_transfers, vec![(0x8000_0000, j_target)]);
         assert!(cfg.direct_calls.is_empty());
-        assert!(cfg.proven_roots.contains(&j_target));
+        assert!(!cfg.proven_roots.contains(&j_target));
+        assert_eq!(cfg.word_class[&j_target], WordClass::ProvenCode);
     }
 
     #[test]
