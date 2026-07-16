@@ -163,8 +163,8 @@ fn main() {
          generated RecompiledFuncs/*.c output.",
         recompiled_dir.display()
     );
-    println!(
-        "cargo:warning=oot-boot: compiling {c_file_count} RecompiledFuncs/*.c files from {}",
+    eprintln!(
+        "oot-boot: compiling {c_file_count} RecompiledFuncs/*.c files from {}",
         recompiled_dir.display()
     );
 

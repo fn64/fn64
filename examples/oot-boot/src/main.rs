@@ -43,6 +43,7 @@ mod native_funcs {
 // ---------------------------------------------------------------------
 
 #[cfg(not(fn64_native_recomp))]
+#[allow(improper_ctypes)] // RecompContext layout is the generated recomp.h ABI, including FPR pairs.
 extern "C" {
     /// Walks the real, compiled-in `section_table[]`/`FuncEntry[]` (from
     /// the game's own `recomp_overlays.inl`) and calls `fn64_register_func`
@@ -156,14 +157,17 @@ fn button_bit(name: &str) -> u16 {
         "CRIGHT" => 0x0001,
         "" => 0,
         other => {
-            eprintln!("[oot-boot] WARNING: unknown button name {other:?} in OOT_INPUT_SCRIPT -- ignored");
+            eprintln!(
+                "[oot-boot] WARNING: unknown button name {other:?} in OOT_INPUT_SCRIPT -- ignored"
+            );
             0
         }
     }
 }
 
 /// Build the scripted-input timeline from the environment. Priority:
-/// `OOT_INPUT_SCRIPT` (full grammar, see the harness loop's doc), else
+/// `OOT_INPUT_SCRIPT` (full grammar, see the harness loop's doc), else the
+/// discovered `OOT_SCRIPT_INTERACTIVE=1` title-to-gameplay route, else
 /// `OOT_SCRIPT_START=N` shorthand (press+release Start around frame N), else
 /// empty (idle). The returned steps are sorted by frame.
 fn build_input_script() -> Vec<ScriptStep> {
@@ -172,16 +176,55 @@ fn build_input_script() -> Vec<ScriptStep> {
         steps.sort_by_key(|s| s.frame);
         return steps;
     }
+    if std::env::var_os("OOT_SCRIPT_INTERACTIVE").is_some() {
+        return interactive_input_script();
+    }
     if let Ok(n) = std::env::var("OOT_SCRIPT_START") {
         if let Ok(frame) = n.parse::<u64>() {
             // Press Start at `frame`, release 4 frames later -- a clean tap.
             return vec![
-                ScriptStep { frame, buttons: 0x1000, stick_x: 0, stick_y: 0 },
-                ScriptStep { frame: frame + 4, buttons: 0, stick_x: 0, stick_y: 0 },
+                ScriptStep {
+                    frame,
+                    buttons: 0x1000,
+                    stick_x: 0,
+                    stick_y: 0,
+                },
+                ScriptStep {
+                    frame: frame + 4,
+                    buttons: 0,
+                    stick_x: 0,
+                    stick_y: 0,
+                },
             ];
         }
     }
     Vec::new()
+}
+
+/// OoT NTSC 1.0's verified title -> file-select -> new-file -> controllable
+/// Link route. The named-button steps were localized against the C lane at
+/// each menu transition; after gameplay starts, the repeated A taps advance
+/// the opening dialogue/cutscenes while the held stick proves player motion.
+fn interactive_input_script() -> Vec<ScriptStep> {
+    let mut steps = parse_input_script(
+        "250:START,254:,280:START,284:,360:A,364:,400:A,404:,420:START,424:,\
+         440:A,444:,490:A,494:,540:A,544:,620:@60/0",
+    );
+    for frame in (700..=4_150).step_by(25) {
+        steps.push(ScriptStep {
+            frame,
+            buttons: button_bit("A"),
+            stick_x: 60,
+            stick_y: 0,
+        });
+        steps.push(ScriptStep {
+            frame: frame + 2,
+            buttons: 0,
+            stick_x: 60,
+            stick_y: 0,
+        });
+    }
+    steps
 }
 
 /// Parse `OOT_INPUT_SCRIPT`: comma-separated `frame:BTN[+BTN...][@sx/sy]`.
@@ -196,14 +239,18 @@ fn parse_input_script(spec: &str) -> Vec<ScriptStep> {
         let (frame_str, rest) = match raw.split_once(':') {
             Some(parts) => parts,
             None => {
-                eprintln!("[oot-boot] WARNING: OOT_INPUT_SCRIPT step {raw:?} has no ':' -- skipped");
+                eprintln!(
+                    "[oot-boot] WARNING: OOT_INPUT_SCRIPT step {raw:?} has no ':' -- skipped"
+                );
                 continue;
             }
         };
         let frame: u64 = match frame_str.trim().parse() {
             Ok(f) => f,
             Err(_) => {
-                eprintln!("[oot-boot] WARNING: OOT_INPUT_SCRIPT step {raw:?} has a bad frame -- skipped");
+                eprintln!(
+                    "[oot-boot] WARNING: OOT_INPUT_SCRIPT step {raw:?} has a bad frame -- skipped"
+                );
                 continue;
             }
         };
@@ -228,7 +275,12 @@ fn parse_input_script(spec: &str) -> Vec<ScriptStep> {
             }
             None => (0i8, 0i8),
         };
-        steps.push(ScriptStep { frame, buttons, stick_x, stick_y });
+        steps.push(ScriptStep {
+            frame,
+            buttons,
+            stick_x,
+            stick_y,
+        });
     }
     steps
 }
@@ -319,12 +371,8 @@ fn native_host_lookup(vram: u32) -> Option<fn64_recomp_native::RecompFunc> {
 fn main() {
     let rom_path = env_path("ROM");
     println!("[oot-boot] loading ROM from {}", rom_path.display());
-    let rom_bytes = std::fs::read(&rom_path).unwrap_or_else(|e| {
-        panic!(
-            "oot-boot: failed to read ROM {}: {e}",
-            rom_path.display()
-        )
-    });
+    let rom_bytes = std::fs::read(&rom_path)
+        .unwrap_or_else(|e| panic!("oot-boot: failed to read ROM {}: {e}", rom_path.display()));
     println!("[oot-boot] ROM size: {} bytes", rom_bytes.len());
     fn64_abi::load_rom(rom_bytes);
     // OoT NTSC 1.0's osCartRomInit materializes and returns __CartRomHandle
@@ -347,7 +395,9 @@ fn main() {
     // Register every section from the real recomp_overlays.inl via the
     // bridge's C-side walk (populates SECTION_BUILDER via callbacks).
     #[cfg(not(fn64_native_recomp))]
-    unsafe { fn64_bridge_register_all_sections() };
+    unsafe {
+        fn64_bridge_register_all_sections()
+    };
     #[cfg(not(fn64_native_recomp))]
     let num_sections = unsafe { fn64_bridge_num_sections() };
     #[cfg(not(fn64_native_recomp))]
@@ -478,10 +528,15 @@ fn main() {
     // nowhere recognizable. That is expected and reported (blank/garbage),
     // not faked; the objective rasterizer proof lives in
     // fn64-render-rt64/tests/f3dex2_replay.rs, independent of this live path.
+    let render_dump_start = std::env::var("OOT_RENDER_DUMP_START")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let mut render_backend = fn64_render_rt64::ReferenceBackend::new()
         .with_f3dex2()
         .with_clear_color([0, 0, 0, 255])
-        .with_auto_dump("/tmp", "fn64-oot-render", 240);
+        .with_auto_dump("/tmp", "fn64-oot-render", 240)
+        .with_auto_dump_skip(render_dump_start);
     // NOTE: 240 (one full second of NTSC frames) so the capture reaches the
     // frames where real 3D geometry appears -- the first ~8 gfx tasks are
     // OoT's boot/logo screens (large flat gradient background quads), and
@@ -562,13 +617,19 @@ fn main() {
     // Feedback-loop speedup: `OOT_MAX_SWAPS=N` stops the boot as soon as N VI
     // swaps have happened, instead of grinding the full 2M-step budget.
     // Proving the render path only needs the first few frames, so a render
-    // iteration goes from ~minutes to ~seconds. Unset = run to the full budget
+    // iteration goes from ~minutes to ~seconds. `OOT_MAX_STEPS=N` raises the
+    // executor budget for longer cutscenes without changing the default probe.
+    // Unset = run to the full budget
     // (the durable boot-depth behavior). `OOT_STOP_ON_FRAME=1` additionally
     // stops the instant a NON-BLANK framebuffer is captured -- the exact
     // moment there's an image to eye-gate.
     let max_swaps: Option<u64> = std::env::var("OOT_MAX_SWAPS")
         .ok()
         .and_then(|s| s.parse().ok());
+    let max_steps = std::env::var("OOT_MAX_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MAX_STEPS);
     let stop_on_frame: bool = std::env::var("OOT_STOP_ON_FRAME").is_ok();
 
     // Scripted controller input (the INPUT-SEAM deliverable). `OOT_INPUT_SCRIPT`
@@ -578,10 +639,11 @@ fn main() {
     // released by an empty step, e.g. `50:`). Button names match
     // controller.h's BTN_* (A,B,Z,START,DUP,DDOWN,DLEFT,DRIGHT,L,R,CUP,CDOWN,
     // CLEFT,CRIGHT). Example: `OOT_INPUT_SCRIPT=40:START,44:,60:START` presses
-    // Start at frame 40, releases at 44, presses again at 60 -- enough to
-    // dismiss the title screen / advance the file-select menu. Unset (or
-    // `OOT_SCRIPT_START=N`, a shorthand that presses+releases Start once at
-    // frame N) leaves the pad idle -- an honest un-driven boot.
+    // Start at frame 40, releases at 44, presses again at 60. The discovered
+    // `OOT_SCRIPT_INTERACTIVE=1` preset drives OoT NTSC 1.0 through file
+    // creation and its opening cutscenes, holding stick X=60 until Link can
+    // move. Unset (or `OOT_SCRIPT_START=N`, a shorthand that taps Start once
+    // at frame N) leaves the pad idle -- an honest un-driven boot.
     let input_script = build_input_script();
     if !input_script.is_empty() {
         println!(
@@ -594,7 +656,7 @@ fn main() {
         );
     }
     let mut next_script_idx = 0usize;
-    let mut last_applied_buttons: u16 = 0;
+    let mut last_applied_pad = (0u16, 0i8, 0i8);
     // How many consecutive "nothing was runnable, and advancing the
     // virtual clock didn't wake anything either" ticks before concluding
     // boot has reached a genuinely idle steady state (not just a thread
@@ -608,11 +670,18 @@ fn main() {
     let mut tick = 0u64;
     let mut steps = 0u64;
     let swap_timing = std::env::var_os("OOT_SWAP_TIMING").is_some();
+    let state_trace = std::env::var_os("OOT_STATE_TRACE").is_some();
+    let mut last_oot_state = None;
+    let mut file_select_state_offset = None;
+    let mut last_file_select_state = None;
+    let mut play_state_offset = None;
+    let mut last_player_state = None;
+    let mut last_control_state = None;
     let mut last_swap_instant: Option<std::time::Instant> = None;
     loop {
-        if steps >= MAX_STEPS {
+        if steps >= max_steps {
             println!(
-                "[oot-boot] step budget ({MAX_STEPS}) exhausted at sim_time={} -- stopping \
+                "[oot-boot] step budget ({max_steps}) exhausted at sim_time={} -- stopping \
                  (this may mean a thread is spinning without truly blocking, or boot just needs \
                  a larger budget)",
                 fn64_abi::sim_time()
@@ -670,15 +739,190 @@ fn main() {
             {
                 let step = &input_script[next_script_idx];
                 fn64_abi::set_controller_state(0, step.buttons, step.stick_x, step.stick_y);
-                if step.buttons != last_applied_buttons {
+                let pad = (step.buttons, step.stick_x, step.stick_y);
+                if pad != last_applied_pad {
                     println!(
                         "[oot-boot] SCRIPTED INPUT @ frame {swap_count}: port0 buttons={:#06x} \
                          stick=({},{})",
                         step.buttons, step.stick_x, step.stick_y
                     );
                 }
-                last_applied_buttons = step.buttons;
+                last_applied_pad = pad;
                 next_script_idx += 1;
+            }
+
+            // Opt-in menu/gameplay frontier trace. OoT NTSC 1.0's linker map
+            // places `gSaveContext` at 0x8011A5D0
+            // (`refs/oot-decomp/build/ntsc-1.0/oot-ntsc-1.0.map:23819`), and
+            // its public decomp layout puts `Save.entranceIndex`, `fileNum`,
+            // and `gameMode` at offsets 0x0000, 0x1354, and 0x135C
+            // (`refs/oot-decomp/include/save.h:270-284`). The generated
+            // `MEM_W` contract is a native-endian word load, so read exactly
+            // that representation here. Logging only changes makes long
+            // scripted probes useful without changing guest behavior.
+            if state_trace {
+                const SAVE_CONTEXT: usize = 0x0011_A5D0;
+                let state = (
+                    read_guest_u32(&rdram, SAVE_CONTEXT),
+                    read_guest_u32(&rdram, SAVE_CONTEXT + 0x1354),
+                    read_guest_u32(&rdram, SAVE_CONTEXT + 0x135C),
+                );
+                if last_oot_state != Some(state) {
+                    println!(
+                        "[oot-boot] OOT STATE @ swap {swap_count}: entrance={:#010x} \
+                         file_num={:#010x} game_mode={} ({}) file_select_overlay={:#010x}",
+                        state.0,
+                        state.1,
+                        state.2,
+                        match state.2 {
+                            0 => "normal",
+                            1 => "title",
+                            2 => "file-select",
+                            3 => "end-credits",
+                            _ => "unknown",
+                        },
+                        read_guest_u32(&rdram, 0x000F_1340 + 5 * 0x30),
+                    );
+                    last_oot_state = Some(state);
+                }
+
+                // While file-select is resident, derive its relocated
+                // `FileSelect_Main` state from GameStateOverlay.loadedRamAddr
+                // (table entry 5), then find the one GameState whose `main`
+                // field contains static vram 0x80811760. The generated C
+                // stores that literal at ROM PCs 0x8081245C-0x8081246C
+                // (`RecompiledFuncs/funcs_65.c:3291-3302`); function lookup
+                // canonicalizes it only when called. GameState.main is +0x04
+                // (`refs/oot-decomp/include/game.h:15-26`).
+                if state.2 == 2 && file_select_state_offset.is_none() {
+                    const GAMESTATE_OVERLAY_TABLE: usize = 0x000F_1340;
+                    const FILE_SELECT_ENTRY: usize = GAMESTATE_OVERLAY_TABLE + 5 * 0x30;
+                    const FILE_SELECT_MAIN: u32 = 0x8081_1760;
+                    let loaded_base = read_guest_u32(&rdram, FILE_SELECT_ENTRY);
+                    if loaded_base != 0 {
+                        file_select_state_offset = find_guest_word(&rdram, FILE_SELECT_MAIN)
+                            .and_then(|main_field| main_field.checked_sub(4));
+                        if let Some(base) = file_select_state_offset {
+                            println!(
+                                "[oot-boot] OOT FILE-SELECT STATE located at rdram+{base:#x} \
+                                 (overlay={loaded_base:#010x}, main={FILE_SELECT_MAIN:#010x})"
+                            );
+                        }
+                    }
+                }
+                if let Some(base) = file_select_state_offset {
+                    // NTSC 1.0's emitted field offsets are byte-grounded in
+                    // FileSelect_UpdateMainMenu and FileSelect_InitContext.
+                    // For example ROM PC 0x8080C2C8 forms base+0x10000 and
+                    // PC 0x8080C2AC extends that base to +0x18000, and PC
+                    // 0x8080C2CC reads buttonIndex at another +0x4A2A
+                    // (`RecompiledFuncs/funcs_64.c:10212-10217`). These are
+                    // 0xE below the current decomp header comments because
+                    // NTSC omits the PAL-only objectMagSegment field.
+                    let file_state = (
+                        read_guest_u16(&rdram, base + 0x1CA2A), // buttonIndex
+                        read_guest_u16(&rdram, base + 0x1CA2E), // menuMode
+                        read_guest_u16(&rdram, base + 0x1CA30), // configMode
+                        read_guest_u16(&rdram, base + 0x1CA36), // selectMode
+                        read_guest_u16(&rdram, base + 0x1CABA), // kbdButton
+                        read_guest_u16(&rdram, base + 0x1CAC2), // kbdX
+                        read_guest_u16(&rdram, base + 0x1CAC4), // kbdY
+                        read_guest_u16(&rdram, base + 0x1CAC6), // name length
+                    );
+                    if last_file_select_state != Some(file_state) {
+                        println!(
+                            "[oot-boot] OOT FILE-SELECT @ swap {swap_count}: button={} menu={} \
+                             config={} select={} kbd_button={:#06x} kbd=({},{}) name_len={}",
+                            file_state.0,
+                            file_state.1,
+                            file_state.2,
+                            file_state.3,
+                            file_state.4,
+                            file_state.5,
+                            file_state.6,
+                            file_state.7,
+                        );
+                        last_file_select_state = Some(file_state);
+                    }
+                }
+
+                // A normal-mode GameState whose main callback is Play_Main is
+                // a live PlayState. The NTSC 1.0 symbol dump places Play_Main
+                // at 0x8009CAC8 (`games/OOTU/syms/dump.toml:2022`), while the
+                // generated Play_Init path loads the player pointer from
+                // play+0x1C44 at ROM PC 0x8009AE38
+                // (`RecompiledFuncs/funcs_37.c:6001`). Actor.world.pos is
+                // +0x24 (`refs/oot-decomp/include/actor.h:187-200`). These
+                // byte-grounded fields let a headless run prove that analog
+                // input moved Link instead of merely surviving in Play_Main.
+                if state.2 == 0 && play_state_offset.is_none() {
+                    const PLAY_MAIN: u32 = 0x8009_CAC8;
+                    play_state_offset = find_guest_word(&rdram, PLAY_MAIN)
+                        .and_then(|main_field| main_field.checked_sub(4));
+                    if let Some(base) = play_state_offset {
+                        println!(
+                            "[oot-boot] OOT PLAY STATE located at rdram+{base:#x} \
+                             (main={PLAY_MAIN:#010x})"
+                        );
+                    }
+                }
+                if let Some(base) = play_state_offset {
+                    // CutsceneContext.state/curFrame are play+0x1D6C/+0x1D74
+                    // (`refs/oot-decomp/include/play_state.h:72` and
+                    // `include/cutscene.h:500-515`). MessageContext.textId/
+                    // msgMode are play+0x103D0/+0x103DC
+                    // (`include/play_state.h:76`, `include/message.h:136-168`).
+                    let control_state = (
+                        read_guest_u8(&rdram, base + 0x1D6C),
+                        read_guest_u16(&rdram, base + 0x1D74),
+                        read_guest_u16(&rdram, base + 0x103D0),
+                        read_guest_u8(&rdram, base + 0x103DC),
+                    );
+                    if last_control_state.map(|last: (u8, u16, u16, u8)| {
+                        (last.0, last.2, last.3)
+                            != (control_state.0, control_state.2, control_state.3)
+                    }) != Some(false)
+                        || swap_count.is_multiple_of(100)
+                    {
+                        println!(
+                            "[oot-boot] OOT CONTROL @ swap {swap_count}: cs_state={} \
+                             cs_frame={} text_id={:#06x} msg_mode={}",
+                            control_state.0, control_state.1, control_state.2, control_state.3,
+                        );
+                    }
+                    last_control_state = Some(control_state);
+
+                    let player_vram = read_guest_u32(&rdram, base + 0x1C44);
+                    let player_offset = (player_vram & 0x1FFF_FFFF) as usize;
+                    if player_vram != 0 && player_offset + 0x30 <= rdram.len() {
+                        let player_state = (
+                            read_guest_u16(&rdram, base + 0xA4),
+                            player_vram,
+                            read_guest_u32(&rdram, player_offset + 0x24),
+                            read_guest_u32(&rdram, player_offset + 0x28),
+                            read_guest_u32(&rdram, player_offset + 0x2C),
+                        );
+                        let moved =
+                            last_player_state.is_none_or(|last: (u16, u32, u32, u32, u32)| {
+                                let dx = f32::from_bits(player_state.2) - f32::from_bits(last.2);
+                                let dy = f32::from_bits(player_state.3) - f32::from_bits(last.3);
+                                let dz = f32::from_bits(player_state.4) - f32::from_bits(last.4);
+                                dx * dx + dy * dy + dz * dz >= 1.0
+                            });
+                        if moved || swap_count.is_multiple_of(100) {
+                            println!(
+                                "[oot-boot] OOT PLAYER @ swap {swap_count}: scene={} \
+                                 actor={:#010x} pos=({:.3},{:.3},{:.3})",
+                                player_state.0,
+                                player_state.1,
+                                f32::from_bits(player_state.2),
+                                f32::from_bits(player_state.3),
+                                f32::from_bits(player_state.4),
+                            );
+                            last_player_state = Some(player_state);
+                        }
+                    }
+                }
             }
 
             let dumps_before = fb_dumps.len();
@@ -738,10 +982,7 @@ fn main() {
     let (gfx_count, audio_count) = fn64_abi::task_counts();
     println!("[oot-boot] === BOOT SUMMARY ===");
     println!("[oot-boot] virtual ticks run: {}", fn64_abi::sim_time());
-    println!(
-        "[oot-boot] thread 0 dead: {}",
-        fn64_abi::is_thread_dead(0)
-    );
+    println!("[oot-boot] thread 0 dead: {}", fn64_abi::is_thread_dead(0));
     println!(
         "[oot-boot] VI swaps observed: {}",
         fn64_abi::vi_swap_count()
@@ -783,6 +1024,37 @@ fn main() {
         // atexit/TLS destructors. That distinction is the purpose here.
         unsafe { libc::_exit(0) }
     }
+}
+
+fn read_guest_u32(rdram: &[u8], offset: usize) -> u32 {
+    let bytes: [u8; 4] = rdram[offset..offset + 4]
+        .try_into()
+        .expect("OoT state trace address must fit the shared RDRAM buffer");
+    u32::from_ne_bytes(bytes)
+}
+
+fn read_guest_u16(rdram: &[u8], offset: usize) -> u16 {
+    let physical = offset ^ 2;
+    let bytes: [u8; 2] = rdram[physical..physical + 2]
+        .try_into()
+        .expect("OoT state trace address must fit the shared RDRAM buffer");
+    u16::from_ne_bytes(bytes)
+}
+
+fn read_guest_u8(rdram: &[u8], offset: usize) -> u8 {
+    rdram[offset ^ 3]
+}
+
+fn find_guest_word(rdram: &[u8], needle: u32) -> Option<usize> {
+    rdram[..8 * 1024 * 1024]
+        .chunks_exact(4)
+        .enumerate()
+        .find_map(|(word_index, bytes)| {
+            let main_field = word_index * 4;
+            let base = main_field.checked_sub(4)?;
+            let value = u32::from_ne_bytes(bytes.try_into().expect("four-byte chunk"));
+            (value == needle && read_guest_u32(rdram, base + 0x98) == 1).then_some(main_field)
+        })
 }
 
 /// Hash the fb region (a fixed-size guess: 320x240 RGBA5551 = 153600 bytes,
@@ -957,5 +1229,30 @@ fn write_trace_file(trace: &[fn64_runtime::TraceEvent], path: &str) {
     for event in trace {
         let line = format!("{event:?}\n");
         let _ = file.write_all(line.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_script_contains_verified_menu_route_and_held_motion() {
+        let steps = interactive_input_script();
+        assert_eq!(steps.len(), 295);
+        assert!(steps.windows(2).all(|pair| pair[0].frame <= pair[1].frame));
+
+        let at = |frame| {
+            steps
+                .iter()
+                .find(|step| step.frame == frame)
+                .expect("verified script frame")
+        };
+        assert_eq!(at(250).buttons, button_bit("START"));
+        assert_eq!(at(360).buttons, button_bit("A"));
+        assert_eq!(at(420).buttons, button_bit("START"));
+        assert_eq!(at(540).buttons, button_bit("A"));
+        assert_eq!((at(620).stick_x, at(620).stick_y), (60, 0));
+        assert_eq!((at(4_152).buttons, at(4_152).stick_x), (0, 60));
     }
 }
