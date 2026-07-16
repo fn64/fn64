@@ -124,6 +124,36 @@ fn env_path(name: &str) -> std::path::PathBuf {
         .into()
 }
 
+/// Open a real host output stream and register it at fn64's AI DMA boundary.
+/// RDRAM bounds are registered even when no device exists so live PCM stats
+/// and `OOT_DUMP_AUDIO_PCM` remain available in headless runs.
+fn wire_audio_output(rdram_len: usize) {
+    fn64_abi::set_audio_rdram_len(rdram_len);
+    if std::env::var_os("FN64_NO_AUDIO").is_some() {
+        println!("[oot-boot] FN64_NO_AUDIO set -- cpal output disabled");
+        return;
+    }
+
+    use fn64_audio::{AudioBackend as _, AudioConfig, CpalBackend};
+    const CANDIDATE_RATES_HZ: [u32; 4] = [32000, 48000, 44100, 22050];
+    for rate in CANDIDATE_RATES_HZ {
+        let mut backend = CpalBackend::new();
+        match backend.create(&AudioConfig::new(rate, 2)) {
+            Ok(()) => {
+                fn64_abi::set_audio_backend(Box::new(backend), rdram_len);
+                println!("[oot-boot] audio output wired (cpal, {rate} Hz stereo)");
+                return;
+            }
+            Err(error) => eprintln!(
+                "[oot-boot] audio: {rate} Hz output unavailable ({error}) -- trying next rate"
+            ),
+        }
+    }
+    eprintln!(
+        "[oot-boot] audio output unavailable at every candidate rate; live PCM stats/dump remain enabled"
+    );
+}
+
 /// One scripted-input step: at VI-swap `frame`, hold `buttons` (an
 /// `OSContPad.button` bitmask, controller.h:4-17) with the analog stick at
 /// `(stick_x, stick_y)`, until the next step changes it.
@@ -557,6 +587,8 @@ fn main() {
          auto-dump /tmp/fn64-oot-render-*.png) as the render backend"
     );
 
+    wire_audio_output(rdram.len());
+
     // Register the REAL recompiled OoT aspMain audio ucode (typed Rust from
     // fn64-audio's clean-room RSP recompiler, compiled in the out-of-tree
     // `oot-audio-ucode` crate). This replaces the stand-in: M_AUDTASK
@@ -926,8 +958,10 @@ fn main() {
             }
 
             let dumps_before = fb_dumps.len();
-            if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
-                capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);
+            if swap_count >= render_dump_start {
+                if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
+                    capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);
+                }
             }
             last_swap_count = swap_count;
             // Early-exit hooks (feedback-loop speedup): stop the instant we
@@ -998,6 +1032,19 @@ fn main() {
                 (ns as f64 / 1e6) / calls as f64
             );
         }
+    }
+    let audio = fn64_abi::audio_output_stats();
+    println!(
+        "[oot-boot] AI audio output: {} buffers / {} samples ({} nonzero), range {:?}..={:?}; {} buffers reached AudioBackend",
+        audio.ai_buffers,
+        audio.samples,
+        audio.nonzero_samples,
+        audio.min,
+        audio.max,
+        audio.backend_buffers,
+    );
+    if let Some(error) = fn64_abi::last_audio_error() {
+        println!("[oot-boot] audio backend last error: {error}");
     }
     println!(
         "[oot-boot] non-uniform framebuffers dumped: {} ({:?})",
