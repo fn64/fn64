@@ -1,3 +1,5 @@
+#![allow(clippy::identity_op)] // Keep the zero-valued v0 bitfield visible in wire fixtures.
+
 //! Hand-built REAL F3DEX2 display-list replay test.
 //!
 //! Unlike `fixture_replay.rs` (which exercises the simple reference-fixture
@@ -158,7 +160,9 @@ fn f3dex2_display_list_renders_transformed_triangle_at_expected_pixel() {
     let (mut rdram, dl_addr) = build_f3dex2_rdram();
 
     let clear = [7, 7, 7, 255]; // distinct from every vertex color
-    let mut backend = ReferenceBackend::new().with_f3dex2().with_clear_color(clear);
+    let mut backend = ReferenceBackend::new()
+        .with_f3dex2()
+        .with_clear_color(clear);
     backend.create(&RenderConfig::new(320, 240)).unwrap();
 
     let task = OsTask {
@@ -227,7 +231,9 @@ fn f3dex2_without_fill_leaves_centroid_clear_proving_fill_is_load_bearing() {
     // remain the clear color -- i.e. the pass in the sibling test is due to
     // the fill, not a pre-painted buffer.
     let clear = [7u8, 7, 7, 255];
-    let mut backend = ReferenceBackend::new().with_f3dex2().with_clear_color(clear);
+    let mut backend = ReferenceBackend::new()
+        .with_f3dex2()
+        .with_clear_color(clear);
     backend.create(&RenderConfig::new(320, 240)).unwrap();
     let fb = backend.framebuffer().unwrap();
     let (cx, cy) = (160u32, 130u32);
@@ -242,4 +248,3 @@ fn f3dex2_without_fill_leaves_centroid_clear_proving_fill_is_load_bearing() {
         "with no fill, the whole frame must be uniform clear"
     );
 }
-
