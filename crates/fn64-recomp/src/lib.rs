@@ -31,11 +31,13 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod load;
 pub mod n64recomp;
 
 use std::fmt;
 
 pub use config::{Function, Hook, InstructionPatch, Patches, RecompConfig, RspConfig, Section};
+pub use load::{load_config, load_symbols, LoadError};
 
 /// The fn64 ABI version a recompiler's generated C targets, checked against
 /// `fn64-abi` at plug-in time (`docs/DECOUPLING.md`: "any impl must emit
