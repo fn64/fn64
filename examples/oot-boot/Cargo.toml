@@ -15,6 +15,10 @@ license = "MIT OR Apache-2.0"
 publish = false
 description = "Headless boot harness for The Legend of Zelda: Ocarina of Time (OOTU, NTSC 1.0) on fn64 -- decomp-driven-first recompilation lane. Contains zero game content -- see build.rs's module doc for the RECOMPILED_DIR/RECOMP_H_DIR/ROM env-var contract."
 
+[features]
+default = ["oot-audio"]
+oot-audio = ["dep:oot-audio-ucode"]
+
 [[bin]]
 name = "oot-boot"
 path = "src/main.rs"
@@ -23,8 +27,10 @@ path = "src/main.rs"
 cc = "1"
 
 [dependencies]
+libc = "0.2"
 fn64-runtime = { path = "../../crates/fn64-runtime" }
-fn64-abi = { path = "../../crates/fn64-abi" }
+fn64-abi = { path = "../../crates/fn64-abi", features = ["native-recomp"] }
+fn64-recomp-native = { path = "../../crates/fn64-recomp-native" }
 # The graphics seam + its headless reference software rasterizer. Registered
 # via fn64_abi::set_render_backend so submitted M_GFXTASKs actually
 # rasterize (into an off-screen framebuffer we dump as PNG), instead of only
@@ -35,4 +41,4 @@ fn64-render-rt64 = { path = "../../crates/fn64-render-rt64" }
 # clean-room RSP recompiler), kept out of the fn64 tree next to OOTU's other
 # game-derived material. Registered via fn64_abi::set_audio_ucode_fn so
 # M_AUDTASK dispatch really runs it.
-oot-audio-ucode = { path = "../../../aki-recomp/games/OOTU/rsp-recomp" }
+oot-audio-ucode = { path = "../../../aki-recomp/games/OOTU/rsp-recomp", optional = true }

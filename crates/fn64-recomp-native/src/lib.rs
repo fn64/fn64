@@ -43,8 +43,9 @@ pub use emit::{
 };
 pub use module::{emit_lookup_dispatcher, emit_module, ModuleFunc, SymbolTable};
 pub use runtime::{
-    resolve_host_function, round_ties_even_f32, round_ties_even_f64, set_host_lookup, HostLookup,
-    Rdram, RecompContext, RecompFunc, RDRAM_LEN, RDRAM_VBASE,
+    call_host_or_native, pause_self, resolve_host_function, round_ties_even_f32,
+    round_ties_even_f64, set_host_lookup, set_host_pause, HostLookup, HostPause, Rdram,
+    RecompContext, RecompFunc, RDRAM_LEN, RDRAM_VBASE,
 };
 
 use fn64_recomp::{AbiVersion, RecompConfig, RecompError, RecompOutput, Recompiler, RspConfig};
@@ -110,7 +111,7 @@ impl Recompiler for NativeRecompiler {
         body.push_str("#![allow(clippy::all, unused, non_snake_case)]\n");
         body.push_str("#[allow(unused_imports)]\n");
         body.push_str(
-            "use fn64_recomp_native::{resolve_host_function, RecompContext, RecompFunc, Rdram, round_ties_even_f32, round_ties_even_f64};\n\n",
+            "use fn64_recomp_native::{call_host_or_native, pause_self, resolve_host_function, RecompContext, RecompFunc, Rdram, round_ties_even_f32, round_ties_even_f64};\n\n",
         );
 
         let mut recompiled = Vec::new();

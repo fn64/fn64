@@ -44,6 +44,10 @@
 //! colleague's home directory) -- missing/wrong env vars fail the build
 //! loudly with instructions, per `AGENTS.md`'s "loud traps, no silent
 //! shrugs."
+//!
+//! `FN64_NATIVE_RECOMP=1` selects the typed-Rust lane. In that mode
+//! `NATIVE_RECOMPILED_DIR` must contain the out-of-tree `funcs.rs` emitted by
+//! `fn64-recomp-native`; no C file or section bridge is compiled.
 
 use std::env;
 use std::path::PathBuf;
@@ -67,6 +71,34 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RECOMPILED_DIR");
     println!("cargo:rerun-if-env-changed=RECOMP_H_DIR");
     println!("cargo:rerun-if-env-changed=ROM");
+    println!("cargo:rerun-if-env-changed=FN64_NATIVE_RECOMP");
+    println!("cargo:rerun-if-env-changed=NATIVE_RECOMPILED_DIR");
+    println!("cargo:rustc-check-cfg=cfg(fn64_native_recomp)");
+
+    let native = env::var_os("FN64_NATIVE_RECOMP").is_some_and(|v| v != "0");
+
+    // ROM is shared by both lanes and validated but not read here.
+    let _ = required_env(
+        "ROM",
+        "Point it at the zeldaret/oot decomp's OWN build-output ROM (decompressed).",
+    );
+
+    if native {
+        let native_dir = required_env(
+            "NATIVE_RECOMPILED_DIR",
+            "Point it at fn64-recomp-native's out-of-tree output directory containing funcs.rs.",
+        );
+        let funcs = native_dir.join("funcs.rs");
+        assert!(
+            funcs.is_file(),
+            "oot-boot build.rs: NATIVE_RECOMPILED_DIR={} has no funcs.rs",
+            native_dir.display()
+        );
+        println!("cargo:rustc-cfg=fn64_native_recomp");
+        println!("cargo:rustc-env=FN64_NATIVE_FUNCS_RS={}", funcs.display());
+        println!("cargo:rerun-if-changed={}", funcs.display());
+        return;
+    }
 
     let recompiled_dir = required_env(
         "RECOMPILED_DIR",
@@ -78,17 +110,6 @@ fn main() {
         "Point it at the directory containing N64Recomp's MIT-licensed recomp.h + \
          librecomp/sections.h (e.g. aki-recomp/refs/N64RecompSource/include).",
     );
-    // ROM is validated but not read here -- see module doc. Must be the
-    // decomp's DECOMPRESSED BUILD OUTPUT z64, not the retail compressed ROM.
-    let _ = required_env(
-        "ROM",
-        "Point it at the zeldaret/oot decomp's OWN build-output ROM (decompressed, e.g. \
-         aki-recomp/refs/oot-decomp/build/ntsc-1.0/oot-ntsc-1.0.z64) -- NOT the retail compressed \
-         cartridge image, whose byte layout does not match the linker .map's rom offsets past the \
-         first Yaz0-compressed block. Not read by this build script (only by the compiled binary \
-         at startup) -- checked here so a missing ROM fails fast with a clear message.",
-    );
-
     if !recompiled_dir.join("recomp_overlays.inl").exists() {
         panic!(
             "oot-boot build.rs: RECOMPILED_DIR={} does not contain recomp_overlays.inl -- \

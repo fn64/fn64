@@ -39,7 +39,7 @@ pub fn bg_breakwall_lava_cover_move(ctx: &mut RecompContext, mem: &mut Rdram) {
             ctx.set_r32(31, 0x809016D8u32 as i32);
             // delay: 0x809016D4: Nop
             // nop
-            Math_StepToF(ctx, mem);
+            call_host_or_native(0x8006385C, Math_StepToF, ctx, mem);
             pc = 0x809016D8; continue 'run;
         }
         0x809016D8 => {

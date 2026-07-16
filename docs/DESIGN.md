@@ -215,6 +215,20 @@ rung-18 failure mode — "a second thread's recompiled code touches shared
 rdram with no lock the scheduler can see" — **unrepresentable**: there is no
 second thread.
 
+The native-Rust recompiler lane uses the same model. Generated functions own
+a safe `fn(&mut fn64_recomp_native::RecompContext, &mut Rdram)` ABI, while
+`fn64-abi::native` is the single adapter at the already-unsafe C host-shim
+boundary. It marshals GPR/HI/LO/COP0 status into the legacy host context,
+calls the existing queue/DMA/VI/thread shim, then copies architectural state
+back. `osCreateThread` constructs a native context inside the same
+`GameThread` coroutine; it does not create another executor, RDRAM image, or
+host thread. The generated module also exports section `(ROM, static VRAM,
+size)` geometry. The existing DMA load registry records relocated heap bases,
+and host-first lookup maps a relocated callback back to its static typed
+function entry. Thus native and C lanes share scheduling, peripherals, and
+memory ownership without pretending their register structs are layout-
+compatible.
+
 **(c) async (Rust `Future`s / an async runtime).** Model each `OSThread` as
 an `async fn`, yielding at `.await` points, driven by a single-threaded
 executor (e.g. a `LocalSet` / current-thread runtime). Shares (b)'s core

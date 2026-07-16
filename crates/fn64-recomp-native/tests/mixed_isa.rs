@@ -38,7 +38,8 @@
 //!   `cvt.s.w`, `add.s`, `mfc1`,
 //! - **ELF/JAL resolution** (`feature/native-elf-frontend-iso`): the `jal
 //!   0x8006385C` is resolved through a [`SymbolTable`] to a **direct
-//!   `Math_StepToF(ctx, mem)` call**, not an indirect `lookup()`.
+//!   host-first call with `Math_StepToF` as its typed fallback**, not an
+//!   indirect `lookup()`.
 //!
 //! (The 64-bit-doubleword family and COP0 are each covered by their own
 //! per-family oracle suites; this test targets the FPU×integer×direct-call mix,
@@ -95,8 +96,8 @@ const MATH_STEPTOF_VRAM: u32 = 0x8006385C;
 // The executed emitter output. Body pasted verbatim from
 // `tests/goldens/mixed_breakwall.rs`; pinned by
 // `emitter_output_matches_mixed_golden` so this stays the emitter's real
-// product. The `jal` became a DIRECT `Math_StepToF(ctx, mem)` call — that is
-// the ELF front-end resolver at work, the thing this test exists to prove.
+// product. The `jal` became a host-first call with the direct typed fallback —
+// that is the ELF front-end resolver at work, the thing this test proves.
 // ----------------------------------------------------------------------------
 
 /// Stub for the resolved callee. The real `Math_StepToF` steps `*$a0` toward
@@ -117,10 +118,10 @@ struct CallSpy {
     a3: u64,
 }
 
-// The pasted golden body, with the direct call routed through the spy. This is
-// the emitter output character-for-character except that `Math_StepToF(ctx,
-// mem)` is spelled `math_step_to_f_stub(ctx, mem, spy)` so the callee is
-// observable — the control-flow/codegen under test is unchanged.
+// The pasted golden body, with the typed fallback routed through the spy. This
+// is the emitter output's native path except that the host-first wrapper and
+// fallback are spelled `math_step_to_f_stub(ctx, mem, spy)` so the callee is
+// observable; exact wrapper codegen is pinned separately by the golden.
 #[allow(unused_variables)]
 fn bg_breakwall_lava_cover_move(ctx: &mut RecompContext, mem: &mut Rdram, spy: &mut CallSpy) {
     let mut pc: u32 = 0x80901694;
@@ -187,10 +188,10 @@ fn norm(s: &str) -> String {
 }
 
 /// The emitter, run with the symbol-table resolver, must still produce exactly
-/// the pasted golden — including the DIRECT `Math_StepToF(ctx, mem)` call that
-/// proves the ELF front-end resolved the `jal`. If this drifts, the executed
-/// body below is no longer the emitter's product and the differential test is
-/// meaningless; refresh `tests/goldens/mixed_breakwall.rs` deliberately.
+/// the pasted golden — including the host-first direct-call wrapper that proves
+/// the ELF front-end resolved the `jal` while retaining the host override seam.
+/// If this drifts, the executed body below is no longer the emitter's product
+/// and the differential test is meaningless; refresh the golden deliberately.
 #[test]
 fn emitter_output_matches_mixed_golden() {
     let symbols = SymbolTable::from_entries([("Math_StepToF", MATH_STEPTOF_VRAM)]);
@@ -204,10 +205,10 @@ fn emitter_output_matches_mixed_golden() {
         "mixed-ISA emitter output drifted from goldens/mixed_breakwall.rs; \
          regenerate it deliberately if this change is intended"
     );
-    // The resolver must have turned the jal into a direct call, not a lookup.
+    // Resolved calls keep the direct function but must offer host lookup first.
     assert!(
-        out.contains("Math_StepToF(ctx, mem);"),
-        "jal 0x8006385C was not resolved to a direct Math_StepToF call: {out}"
+        out.contains("call_host_or_native(0x8006385C, Math_StepToF, ctx, mem);"),
+        "jal 0x8006385C lacks its host-first direct Math_StepToF call: {out}"
     );
     assert!(
         !out.contains("lookup(0x8006385C"),
