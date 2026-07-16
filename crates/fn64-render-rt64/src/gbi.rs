@@ -30,11 +30,9 @@
 //! display list), `G_ENDDL` (stop).
 //!
 //! Explicitly acknowledged-and-skipped (logged by name via `skip_opcode`,
-//! never a silent no-op): texture/combiner/other-mode/sync/geometry-mode
-//! ops and any unrecognized byte. A skipped state op means the geometry is
-//! flat-shaded from vertex color only (textures/lighting are NOT applied) --
-//! this is a seam/first-image proof, not RDP fidelity (see `lib.rs` module
-//! doc). Skips are rate-limited-per-opcode so a real DL doesn't spam
+//! never a silent no-op): remaining other-mode/sync state and any unrecognized
+//! byte. Texture, lighting, and the RDP color-combiner inputs needed by OoT
+//! are decoded. Skips are rate-limited-per-opcode so a real DL doesn't spam
 //! thousands of identical lines, but every distinct skipped opcode is
 //! reported at least once.
 use fn64_render::{RenderError, UcodeId};
@@ -179,6 +177,231 @@ pub enum CullMode {
     Both,
 }
 
+/// One semantic RGB input to the RDP color-combiner equation
+/// `(A - B) * C + D`.
+///
+/// The raw numeric selector is position-dependent: selector `6`, for
+/// example, means ONE in input A/D but KEY_CENTER/KEY_SCALE in B/C. The
+/// decoder therefore resolves the wire value to this semantic enum at
+/// `G_SETCOMBINE` time. Source values and position-specific meanings are
+/// from OoT's public `ultra64/gbi.h:383-404` and RT64's MIT
+/// `shared/rt64_color_combiner.h:59-151`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ColorSource {
+    Combined,
+    Texel0,
+    Texel1,
+    Primitive,
+    Shade,
+    Environment,
+    KeyCenter,
+    KeyScale,
+    CombinedAlpha,
+    Texel0Alpha,
+    Texel1Alpha,
+    PrimitiveAlpha,
+    ShadeAlpha,
+    EnvironmentAlpha,
+    LodFraction,
+    PrimLodFraction,
+    Noise,
+    K4,
+    K5,
+    One,
+    Zero,
+}
+
+/// One semantic alpha input to the RDP color-combiner equation.
+/// Selector values come from public `gbi.h:406-416`; the distinct C-input
+/// mapping (where zero selects LOD fraction) is corroborated by RT64's MIT
+/// `shared/rt64_color_combiner.h:153-193`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AlphaSource {
+    Combined,
+    Texel0,
+    Texel1,
+    Primitive,
+    Shade,
+    Environment,
+    LodFraction,
+    PrimLodFraction,
+    One,
+    Zero,
+}
+
+/// The eight selectors for one RDP combiner cycle: four RGB and four alpha.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CombinerCycle {
+    pub rgb: [ColorSource; 4],
+    pub alpha: [AlphaSource; 4],
+}
+
+/// Both cycles programmed by one `G_SETCOMBINE` command.
+///
+/// Bit locations are the public `GCCc0w0`/`GCCc1w0`/`GCCc0w1`/`GCCc1w1`
+/// packing macros (`ultra64/gbi.h:3543-3565`) and match RT64's MIT parse
+/// helpers (`shared/rt64_color_combiner.h:195-240`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CombinerMode {
+    pub cycles: [CombinerCycle; 2],
+}
+
+impl CombinerMode {
+    fn decode(w0: u32, w1: u32) -> Self {
+        CombinerMode {
+            cycles: [
+                CombinerCycle {
+                    rgb: [
+                        decode_color_a((w0 >> 20) & 0x0f),
+                        decode_color_b((w1 >> 28) & 0x0f),
+                        decode_color_c((w0 >> 15) & 0x1f),
+                        decode_color_d((w1 >> 15) & 0x07),
+                    ],
+                    alpha: [
+                        decode_alpha_abd((w0 >> 12) & 0x07),
+                        decode_alpha_abd((w1 >> 12) & 0x07),
+                        decode_alpha_c((w0 >> 9) & 0x07),
+                        decode_alpha_abd((w1 >> 9) & 0x07),
+                    ],
+                },
+                CombinerCycle {
+                    rgb: [
+                        decode_color_a((w0 >> 5) & 0x0f),
+                        decode_color_b((w1 >> 24) & 0x0f),
+                        decode_color_c(w0 & 0x1f),
+                        decode_color_d((w1 >> 6) & 0x07),
+                    ],
+                    alpha: [
+                        decode_alpha_abd((w1 >> 21) & 0x07),
+                        decode_alpha_abd((w1 >> 3) & 0x07),
+                        decode_alpha_c((w1 >> 18) & 0x07),
+                        decode_alpha_abd(w1 & 0x07),
+                    ],
+                },
+            ],
+        }
+    }
+}
+
+impl Default for CombinerMode {
+    fn default() -> Self {
+        // Neutral legacy/default path: TEXEL0 * SHADE for RGB and alpha.
+        // A missing texture is supplied as white by the software evaluator,
+        // preserving the original untextured shade-only fixture behavior.
+        let modulate = CombinerCycle {
+            rgb: [
+                ColorSource::Texel0,
+                ColorSource::Zero,
+                ColorSource::Shade,
+                ColorSource::Zero,
+            ],
+            alpha: [
+                AlphaSource::Texel0,
+                AlphaSource::Zero,
+                AlphaSource::Shade,
+                AlphaSource::Zero,
+            ],
+        };
+        CombinerMode {
+            cycles: [modulate; 2],
+        }
+    }
+}
+
+/// RDP color state snapshotted onto each emitted triangle.
+///
+/// This stays separate from the render/other-mode state being added on the
+/// neighboring job: it contains only `G_SETCOMBINE`, primitive/environment
+/// RGBA, and primitive LOD fraction inputs to the color equation.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CombinerState {
+    pub mode: CombinerMode,
+    pub primitive: [u8; 4],
+    pub environment: [u8; 4],
+    pub prim_lod_fraction: u8,
+}
+
+fn decode_color_common(value: u32) -> ColorSource {
+    match value {
+        0 => ColorSource::Combined,
+        1 => ColorSource::Texel0,
+        2 => ColorSource::Texel1,
+        3 => ColorSource::Primitive,
+        4 => ColorSource::Shade,
+        5 => ColorSource::Environment,
+        _ => ColorSource::Zero,
+    }
+}
+
+fn decode_color_a(value: u32) -> ColorSource {
+    match value {
+        0..=5 => decode_color_common(value),
+        6 => ColorSource::One,
+        7 => ColorSource::Noise,
+        _ => ColorSource::Zero,
+    }
+}
+
+fn decode_color_b(value: u32) -> ColorSource {
+    match value {
+        0..=5 => decode_color_common(value),
+        6 => ColorSource::KeyCenter,
+        7 => ColorSource::K4,
+        _ => ColorSource::Zero,
+    }
+}
+
+fn decode_color_c(value: u32) -> ColorSource {
+    match value {
+        0..=5 => decode_color_common(value),
+        6 => ColorSource::KeyScale,
+        7 => ColorSource::CombinedAlpha,
+        8 => ColorSource::Texel0Alpha,
+        9 => ColorSource::Texel1Alpha,
+        10 => ColorSource::PrimitiveAlpha,
+        11 => ColorSource::ShadeAlpha,
+        12 => ColorSource::EnvironmentAlpha,
+        13 => ColorSource::LodFraction,
+        14 => ColorSource::PrimLodFraction,
+        15 => ColorSource::K5,
+        _ => ColorSource::Zero,
+    }
+}
+
+fn decode_color_d(value: u32) -> ColorSource {
+    match value {
+        0..=5 => decode_color_common(value),
+        6 => ColorSource::One,
+        _ => ColorSource::Zero,
+    }
+}
+
+fn decode_alpha_abd(value: u32) -> AlphaSource {
+    match value {
+        0 => AlphaSource::Combined,
+        1 => AlphaSource::Texel0,
+        2 => AlphaSource::Texel1,
+        3 => AlphaSource::Primitive,
+        4 => AlphaSource::Shade,
+        5 => AlphaSource::Environment,
+        6 => AlphaSource::One,
+        _ => AlphaSource::Zero,
+    }
+}
+
+fn decode_alpha_c(value: u32) -> AlphaSource {
+    match value {
+        0 => AlphaSource::LodFraction,
+        1 => AlphaSource::Texel0,
+        2 => AlphaSource::Texel1,
+        3 => AlphaSource::Primitive,
+        4 => AlphaSource::Shade,
+        5 => AlphaSource::Environment,
+        6 => AlphaSource::PrimLodFraction,
+        _ => AlphaSource::Zero,
+    }
+}
+
 /// A decoded texture: RGBA8888 texels (row-major, top-left origin) plus its
 /// dimensions and per-axis wrap mode, ready for the rasterizer to sample.
 /// Reference-counted so many triangles sharing one bound tile don't each
@@ -249,6 +472,10 @@ pub struct Triangle {
     /// modulates the sampled texel by the interpolated shade color
     /// (`F3DEX2-CONCEPTS.md` §5.2, the MODULATE combiner).
     pub texture: Option<Texture>,
+    /// Color-combiner mode and its primitive/environment inputs in effect
+    /// when this triangle was emitted. Kept per-triangle for the same reason
+    /// as texture/cull state: later display-list commands may change it.
+    pub combiner: CombinerState,
 }
 
 /// The N64 SDK's public per-vertex wire format (`Vtx_t`): 16 bytes --
@@ -731,6 +958,45 @@ thread_local! {
     /// static Mutex) to stay lock-free and match the rest of this crate's
     /// single-threaded reference-backend model.
     static WARNED_SKIPS: RefCell<HashSet<u8>> = RefCell::new(HashSet::new());
+    /// Unsupported combiner sub-sources are warned per distinct raw mode,
+    /// rather than silently collapsing to the reference evaluator's current
+    /// neutral approximation.
+    static WARNED_COMBINERS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+}
+
+fn warn_approximated_combiner_sources(mode: CombinerMode, w0: u32, w1: u32) {
+    let color_approximated = |source: ColorSource| {
+        matches!(
+            source,
+            ColorSource::Texel1
+                | ColorSource::Texel1Alpha
+                | ColorSource::KeyCenter
+                | ColorSource::KeyScale
+                | ColorSource::LodFraction
+                | ColorSource::Noise
+                | ColorSource::K4
+                | ColorSource::K5
+        )
+    };
+    let alpha_approximated =
+        |source: AlphaSource| matches!(source, AlphaSource::Texel1 | AlphaSource::LodFraction);
+    if !mode.cycles.iter().any(|cycle| {
+        cycle.rgb.iter().copied().any(color_approximated)
+            || cycle.alpha.iter().copied().any(alpha_approximated)
+    }) {
+        return;
+    }
+
+    let key = ((w0 as u64 & 0x00ff_ffff) << 32) | w1 as u64;
+    WARNED_COMBINERS.with(|warned| {
+        if warned.borrow_mut().insert(key) {
+            eprintln!(
+                "[fn64-render-rt64/gbi] G_SETCOMBINE mode {key:#014x} uses a source not yet \
+                 modeled exactly (TEXEL1 aliases TEXEL0; key/noise/K/LOD inputs are zero). \
+                 Common OoT modulate/decal/primitive/environment/shade sources remain exact."
+            );
+        }
+    });
 }
 
 /// Log an acknowledged-but-unimplemented opcode ONCE per distinct opcode
@@ -914,6 +1180,10 @@ struct DecodeState {
     /// Current F3DEX2 geometry mode (the `G_GEOMETRYMODE` accumulator). Its
     /// `G_CULL_FRONT`/`G_CULL_BACK` bits decide per-triangle culling.
     geometry_mode: u32,
+    /// RDP color-combiner + primitive/environment register state. This is
+    /// intentionally independent of other-mode/render state for a clean
+    /// merge with that separately-owned job.
+    combiner: CombinerState,
     dl_depth: u32,
     /// Texture-mapping decode state (SETTIMG image latch, tile descriptors,
     /// TLUT palette, G_TEXTURE enable/scale, and the currently-decoded
@@ -1082,17 +1352,35 @@ pub fn decode_display_list(rdram: &[u8], dl_addr: u32) -> Result<Vec<Triangle>, 
             }
             G_TRI1 => {
                 let idx = [(w1 >> 16) & 0xFF, (w1 >> 8) & 0xFF, w1 & 0xFF];
-                if let Some(t) = resolve_tri(&vtx_cache, idx, CullMode::None, None) {
+                if let Some(t) = resolve_tri(
+                    &vtx_cache,
+                    idx,
+                    CullMode::None,
+                    None,
+                    CombinerState::default(),
+                ) {
                     tris.push(t);
                 }
             }
             G_TRI2 => {
                 let idx_a = [(w0 >> 16) & 0xFF, (w0 >> 8) & 0xFF, w0 & 0xFF];
                 let idx_b = [(w1 >> 16) & 0xFF, (w1 >> 8) & 0xFF, w1 & 0xFF];
-                if let Some(t) = resolve_tri(&vtx_cache, idx_a, CullMode::None, None) {
+                if let Some(t) = resolve_tri(
+                    &vtx_cache,
+                    idx_a,
+                    CullMode::None,
+                    None,
+                    CombinerState::default(),
+                ) {
                     tris.push(t);
                 }
-                if let Some(t) = resolve_tri(&vtx_cache, idx_b, CullMode::None, None) {
+                if let Some(t) = resolve_tri(
+                    &vtx_cache,
+                    idx_b,
+                    CullMode::None,
+                    None,
+                    CombinerState::default(),
+                ) {
                     tris.push(t);
                 }
             }
@@ -1125,6 +1413,7 @@ pub fn decode_display_list_f3dex2(
         mv_stack: Vec::new(),
         viewport: None,
         geometry_mode: 0,
+        combiner: CombinerState::default(),
         dl_depth: 0,
         tex: TexState::default(),
         lights: LightState::default(),
@@ -1171,7 +1460,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 let cull = cull_mode_from(state.geometry_mode);
                 let texture = active_texture(&state.tex);
                 let idx = tri_indices(w0);
-                if let Some(t) = resolve_tri(&state.vtx_cache, idx, cull, texture) {
+                if let Some(t) = resolve_tri(&state.vtx_cache, idx, cull, texture, state.combiner) {
                     state.tris.push(t);
                 }
             }
@@ -1183,10 +1472,17 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 let texture = active_texture(&state.tex);
                 let idx_a = tri_indices(w0);
                 let idx_b = tri_indices(w1);
-                if let Some(t) = resolve_tri(&state.vtx_cache, idx_a, cull, texture.clone()) {
+                if let Some(t) = resolve_tri(
+                    &state.vtx_cache,
+                    idx_a,
+                    cull,
+                    texture.clone(),
+                    state.combiner,
+                ) {
                     state.tris.push(t);
                 }
-                if let Some(t) = resolve_tri(&state.vtx_cache, idx_b, cull, texture) {
+                if let Some(t) = resolve_tri(&state.vtx_cache, idx_b, cull, texture, state.combiner)
+                {
                     state.tris.push(t);
                 }
             }
@@ -1472,6 +1768,26 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 let and_mask = w0 & 0x00FF_FFFF;
                 state.geometry_mode = (state.geometry_mode & and_mask) | w1;
             }
+            G_SETCOMBINE => {
+                // Public gbi.h GCCc*w* packing macros (lines 3543-3565)
+                // distribute both cycles' RGB/alpha A/B/C/D selectors across
+                // w0/w1. `CombinerMode::decode` resolves those raw selectors
+                // to semantic sources using the position-specific mux tables.
+                state.combiner.mode = CombinerMode::decode(w0, w1);
+                warn_approximated_combiner_sources(state.combiner.mode, w0, w1);
+            }
+            G_SETPRIMCOLOR => {
+                // gDPSetPrimColor (gbi.h:3672-3682): w0 low byte is the
+                // primitive LOD fraction; w1 is RGBA8888. The min-level byte
+                // is texture-LOD state and is outside this combiner slice.
+                state.combiner.prim_lod_fraction = (w0 & 0xff) as u8;
+                state.combiner.primitive = w1.to_be_bytes();
+            }
+            G_SETENVCOLOR => {
+                // gDPSetEnvColor -> DPRGBColor (gbi.h:3626-3644): w1 packs
+                // RGBA in bits 31..0, one byte per component.
+                state.combiner.environment = w1.to_be_bytes();
+            }
             G_TEXRECT | G_TEXRECTFLIP => {
                 // 16-byte (two-word) RDP rectangle command (gbi.h:4973). We
                 // don't rasterize 2D texrects yet, but we MUST advance past
@@ -1689,6 +2005,7 @@ fn resolve_tri(
     idx: [u32; 3],
     cull: CullMode,
     texture: Option<Texture>,
+    combiner: CombinerState,
 ) -> Option<Triangle> {
     if idx.iter().any(|&i| i as usize >= vtx_cache.len()) {
         return None;
@@ -1715,6 +2032,7 @@ fn resolve_tri(
         ],
         cull,
         texture,
+        combiner,
     })
 }
 
@@ -1723,6 +2041,13 @@ fn resolve_tri(
 pub const SUPPORTED: &[UcodeId] = &[UcodeId::F3dex2];
 
 #[cfg(test)]
+// Matrix fixtures retain trace-derived f32 literals and explicit wire-field
+// expressions; keeping those forms makes the public-gbi provenance auditable.
+#[allow(
+    clippy::excessive_precision,
+    clippy::identity_op,
+    clippy::needless_range_loop
+)]
 mod tests {
     use super::*;
 
@@ -1745,6 +2070,120 @@ mod tests {
     fn wr_cmd(rdram: &mut [u8], off: usize, w0: u32, w1: u32) {
         wr_u32(rdram, off, w0);
         wr_u32(rdram, off + 4, w1);
+    }
+
+    /// Pack raw `gsDPSetCombineLERP` selectors exactly like public gbi.h's
+    /// `GCCc0w0`/`GCCc1w0`/`GCCc0w1`/`GCCc1w1` macros (lines 3543-3565).
+    fn combine_cmd(
+        rgb0: [u32; 4],
+        alpha0: [u32; 4],
+        rgb1: [u32; 4],
+        alpha1: [u32; 4],
+    ) -> (u32, u32) {
+        let w0 = ((G_SETCOMBINE as u32) << 24)
+            | ((rgb0[0] & 0x0f) << 20)
+            | ((rgb0[2] & 0x1f) << 15)
+            | ((alpha0[0] & 0x07) << 12)
+            | ((alpha0[2] & 0x07) << 9)
+            | ((rgb1[0] & 0x0f) << 5)
+            | (rgb1[2] & 0x1f);
+        let w1 = ((rgb0[1] & 0x0f) << 28)
+            | ((rgb1[1] & 0x0f) << 24)
+            | ((alpha1[0] & 0x07) << 21)
+            | ((alpha1[2] & 0x07) << 18)
+            | ((rgb0[3] & 0x07) << 15)
+            | ((alpha0[1] & 0x07) << 12)
+            | ((alpha0[3] & 0x07) << 9)
+            | ((rgb1[3] & 0x07) << 6)
+            | ((alpha1[1] & 0x07) << 3)
+            | (alpha1[3] & 0x07);
+        (w0, w1)
+    }
+
+    #[test]
+    fn setcombine_and_color_registers_are_snapshotted_on_triangles() {
+        // Fail-against-bug: before this change all three commands fell into
+        // the skip arm, so Triangle had no mode/primitive/environment state
+        // and the rasterizer could only hardwire TEXEL0*SHADE.
+        let mut rdram = vec![0u8; 0x4000];
+        wr_vtx(&mut rdram, 0x3000, 2, 2, 0, [255, 255, 255, 255]);
+        wr_vtx(&mut rdram, 0x3010, 12, 2, 0, [255, 255, 255, 255]);
+        wr_vtx(&mut rdram, 0x3020, 7, 12, 0, [255, 255, 255, 255]);
+
+        // Cycle 0 G_CC_BLENDI RGB: (ENV-SHADE)*TEXEL0+SHADE.
+        // Alpha: TEXEL0*PRIMITIVE. Cycle 1 deliberately uses distinct
+        // non-zero selectors in every field so a shifted/masked decode fails.
+        let (cc0, cc1) = combine_cmd([5, 4, 1, 4], [1, 7, 3, 7], [3, 5, 11, 1], [5, 4, 6, 3]);
+        let mut off = 0x1000;
+        wr_cmd(&mut rdram, off, cc0, cc1);
+        off += 8;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_SETPRIMCOLOR as u32) << 24) | 0x7f,
+            0x11_22_33_44,
+        );
+        off += 8;
+        wr_cmd(&mut rdram, off, (G_SETENVCOLOR as u32) << 24, 0xa0_b0_c0_d0);
+        off += 8;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_VTX as u32) << 24) | (3 << 12) | (3 << 1),
+            0x3000,
+        );
+        off += 8;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1),
+            0,
+        );
+        off += 8;
+        wr_cmd(&mut rdram, off, (G_ENDDL as u32) << 24, 0);
+
+        let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
+        assert_eq!(tris.len(), 1);
+        let cc = tris[0].combiner;
+        assert_eq!(cc.primitive, [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(cc.environment, [0xa0, 0xb0, 0xc0, 0xd0]);
+        assert_eq!(cc.prim_lod_fraction, 0x7f);
+        assert_eq!(
+            cc.mode.cycles[0].rgb,
+            [
+                ColorSource::Environment,
+                ColorSource::Shade,
+                ColorSource::Texel0,
+                ColorSource::Shade,
+            ]
+        );
+        assert_eq!(
+            cc.mode.cycles[0].alpha,
+            [
+                AlphaSource::Texel0,
+                AlphaSource::Zero,
+                AlphaSource::Primitive,
+                AlphaSource::Zero,
+            ]
+        );
+        assert_eq!(
+            cc.mode.cycles[1].rgb,
+            [
+                ColorSource::Primitive,
+                ColorSource::Environment,
+                ColorSource::ShadeAlpha,
+                ColorSource::Texel0,
+            ]
+        );
+        assert_eq!(
+            cc.mode.cycles[1].alpha,
+            [
+                AlphaSource::Environment,
+                AlphaSource::Shade,
+                AlphaSource::PrimLodFraction,
+                AlphaSource::Primitive,
+            ]
+        );
     }
 
     /// Plant a full 16-byte `Vtx` (`ob` x/y/z at 0/2/4, color at 12) at `off`
@@ -2150,6 +2589,7 @@ mod tests {
             mv_stack: Vec::new(),
             viewport: None,
             geometry_mode: 0,
+            combiner: CombinerState::default(),
             dl_depth: 0,
             tex: TexState::default(),
             lights: LightState::default(),
@@ -2313,12 +2753,26 @@ mod tests {
         cache[1] = vtx_w(1.0);
         cache[2] = vtx_w(-0.5); // behind the near plane
         assert!(
-            resolve_tri(&cache, [0, 1, 2], CullMode::None, None).is_none(),
+            resolve_tri(
+                &cache,
+                [0, 1, 2],
+                CullMode::None,
+                None,
+                CombinerState::default(),
+            )
+            .is_none(),
             "triangle touching a behind-camera vertex must be dropped"
         );
         // All three in front -> kept.
         cache[2] = vtx_w(2.0);
-        assert!(resolve_tri(&cache, [0, 1, 2], CullMode::None, None).is_some());
+        assert!(resolve_tri(
+            &cache,
+            [0, 1, 2],
+            CullMode::None,
+            None,
+            CombinerState::default(),
+        )
+        .is_some());
     }
 
     // --- Texture sampling (priority 4) ----------------------------------
