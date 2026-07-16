@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "oot-audio-ucode"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+build = "build.rs"
+description = "Out-of-tree adapter for the generated OoT aspMain module; no game-derived bytes are stored here"
+
+[dependencies]
+fn64-audio = { path = "../../../crates/fn64-audio" }
