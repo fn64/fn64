@@ -1,0 +1,7 @@
+# cargo-nextest config. nextest runs each test in its OWN process, which fixes
+# the fn64-abi subprocess-abort exit-code race that makes `cargo test`'s
+# aggregate exit unreliable (it flaked 101/0/0 with 0 real failures). Use
+# `cargo nextest run --workspace` as the authoritative "is it green?" gate.
+[profile.default]
+# Fail fast is OFF: we want the full pass/fail picture, not first-failure.
+fail-fast = false

@@ -31,9 +31,23 @@ fn find_staticlib() -> PathBuf {
             return candidate;
         }
     }
+    // `cargo test` builds the staticlib crate-type as a side effect, but
+    // `cargo nextest` builds only the test binaries -- so under nextest the
+    // staticlib may not exist yet. Build it explicitly (idempotent, cached)
+    // so the test is runner-agnostic instead of assuming cargo test's layout.
+    let status = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["build", "-p", "fn64-abi"])
+        .status()
+        .expect("spawn cargo build -p fn64-abi for the staticlib");
+    assert!(status.success(), "cargo build -p fn64-abi failed");
+    for dir in [deps_dir, profile_dir] {
+        let candidate = dir.join("libfn64_abi.a");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
     panic!(
-        "libfn64_abi.a not found under {:?} or {:?} -- \
-         expected `cargo test` to have already built the staticlib crate-type",
+        "libfn64_abi.a not found under {:?} or {:?} even after `cargo build -p fn64-abi`",
         deps_dir, profile_dir
     );
 }
