@@ -152,7 +152,28 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let bridge_dir = manifest_dir.join("../../crates/fn64-boot-harness/bridge");
+    // This build.rs is shared by BOTH the main oot-boot manifest
+    // (examples/oot-boot/) and the native-only manifest (examples/oot-boot/
+    // native/, one level deeper). A fixed `../../` breaks for the native one,
+    // so walk up until we find the shared bridge dir (moved here by the
+    // boot-seam dedup). Robust to either manifest depth.
+    let bridge_dir = {
+        let rel = "crates/fn64-boot-harness/bridge";
+        let mut d = manifest_dir.as_path();
+        loop {
+            let candidate = d.join(rel);
+            if candidate.join("section_bridge.c").exists() {
+                break candidate;
+            }
+            match d.parent() {
+                Some(p) => d = p,
+                None => panic!(
+                    "could not locate {rel} walking up from {}",
+                    manifest_dir.display()
+                ),
+            }
+        }
+    };
 
     let mut build = cc::Build::new();
     build
