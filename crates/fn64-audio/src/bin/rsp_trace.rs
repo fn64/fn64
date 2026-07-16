@@ -174,7 +174,10 @@ fn main() {
                 pc += 4;
             }
             Instr::Mtc0 { rt, cop0 } => {
-                exec_mtc0(&mut m, rt, cop0);
+                if let Some(reason) = exec_mtc0(&mut m, rt, cop0) {
+                    m.ctx.resume_address = pc + 4;
+                    break reason;
+                }
                 pc += 4;
             }
             Instr::Mfc2 { rt, vs, elem } => {
@@ -249,8 +252,11 @@ fn main() {
                     BranchOp::Beq => m.reg(rs) == m.reg(rt),
                     BranchOp::Bne => m.reg(rs) != m.reg(rt),
                 };
-                run_delay(&mut m, delay);
-                pc = if taken { target as u32 } else { pc + 8 };
+                let next_pc = if taken { target as u32 } else { pc + 8 };
+                if let Some(reason) = run_delay(&mut m, delay, pc + 4, next_pc) {
+                    break reason;
+                }
+                pc = next_pc;
             }
             Instr::BranchZ {
                 op,
@@ -267,27 +273,40 @@ fn main() {
                 if let Some(ret) = link {
                     m.set_reg(31, ret as u32);
                 }
-                run_delay(&mut m, delay);
-                pc = if taken { target as u32 } else { pc + 8 };
+                let next_pc = if taken { target as u32 } else { pc + 8 };
+                if let Some(reason) = run_delay(&mut m, delay, pc + 4, next_pc) {
+                    break reason;
+                }
+                pc = next_pc;
             }
             Instr::Jump { target } => {
-                run_delay(&mut m, delay);
-                pc = target as u32;
+                let next_pc = target as u32;
+                if let Some(reason) = run_delay(&mut m, delay, pc + 4, next_pc) {
+                    break reason;
+                }
+                pc = next_pc;
             }
             Instr::Jal { target, ret } => {
                 m.set_reg(31, ret as u32);
-                run_delay(&mut m, delay);
-                pc = target as u32;
+                let next_pc = target as u32;
+                if let Some(reason) = run_delay(&mut m, delay, pc + 4, next_pc) {
+                    break reason;
+                }
+                pc = next_pc;
             }
             Instr::Jr { rs } => {
                 let jt = 0x1000 | (m.reg(rs) & 0x0FFF);
-                run_delay(&mut m, delay);
+                if let Some(reason) = run_delay(&mut m, delay, pc + 4, jt) {
+                    break reason;
+                }
                 pc = jt;
             }
             Instr::Jalr { rd, rs, ret } => {
                 let jt = 0x1000 | (m.reg(rs) & 0x0FFF);
                 m.set_reg(rd, ret as u32);
-                run_delay(&mut m, delay);
+                if let Some(reason) = run_delay(&mut m, delay, pc + 4, jt) {
+                    break reason;
+                }
                 pc = jt;
             }
             Instr::Unknown { word } => {
@@ -311,25 +330,75 @@ fn main() {
     }
 }
 
-fn run_delay(m: &mut RspMachine, delay: Option<Instr>) {
+fn run_delay(
+    m: &mut RspMachine,
+    delay: Option<Instr>,
+    delay_pc: u32,
+    resume_pc: u32,
+) -> Option<RspExitReason> {
     match delay {
-        Some(Instr::AluImm { op, rt, rs, imm }) => exec_alu_imm(m, op, rt, rs, imm),
-        Some(Instr::AluReg { op, rd, rs, rt }) => exec_alu_reg(m, op, rd, rs, rt),
-        Some(Instr::Shift { op, rd, rt, sa }) => exec_shift(m, op, rd, rt, sa as u32, None),
-        Some(Instr::ShiftVar { op, rd, rt, rs }) => exec_shift(m, op, rd, rt, 0, Some(rs)),
-        Some(Instr::Lui { rt, imm }) => m.set_reg(rt, (imm as u32) << 16),
+        None | Some(Instr::Nop) => None,
+        Some(Instr::AluImm { op, rt, rs, imm }) => {
+            exec_alu_imm(m, op, rt, rs, imm);
+            None
+        }
+        Some(Instr::AluReg { op, rd, rs, rt }) => {
+            exec_alu_reg(m, op, rd, rs, rt);
+            None
+        }
+        Some(Instr::Shift { op, rd, rt, sa }) => {
+            exec_shift(m, op, rd, rt, sa as u32, None);
+            None
+        }
+        Some(Instr::ShiftVar { op, rd, rt, rs }) => {
+            exec_shift(m, op, rd, rt, 0, Some(rs));
+            None
+        }
+        Some(Instr::Lui { rt, imm }) => {
+            m.set_reg(rt, (imm as u32) << 16);
+            None
+        }
         // A COP0 status read in a delay slot (the DMA-busy wait loops do exactly
         // this: `bnez a0,.. ; mfc0 a0,SP_DMA_BUSY`) — model as 0 like the emitter.
         Some(Instr::Mfc0 { rt, cop0 }) => {
             let value = m.read_cp0(cop0);
             m.set_reg(rt, value);
+            None
         }
-        Some(Instr::Load { op, rt, base, off }) => exec_load(m, op, rt, base, off),
-        Some(Instr::Store { op, rt, base, off }) => exec_store(m, op, rt, base, off),
-        Some(Instr::Mtc0 { rt, cop0 }) => exec_mtc0(m, rt, cop0),
+        Some(Instr::Load { op, rt, base, off }) => {
+            exec_load(m, op, rt, base, off);
+            None
+        }
+        Some(Instr::Store { op, rt, base, off }) => {
+            exec_store(m, op, rt, base, off);
+            None
+        }
+        Some(Instr::Mtc0 { rt, cop0 }) => {
+            let reason = exec_mtc0(m, rt, cop0);
+            if reason.is_some() {
+                m.ctx.resume_address = resume_pc;
+            }
+            reason
+        }
+        Some(Instr::Mfc2 { rt, vs, elem }) => {
+            let value = m.mfc2(vs, elem);
+            m.set_reg(rt, value);
+            None
+        }
         Some(Instr::Mtc2 { rt, vs, elem }) => {
             let v = m.reg(rt);
             m.mtc2(vs, elem, v);
+            None
+        }
+        Some(Instr::Cfc2 { rt, cd }) => {
+            let value = m.cfc2(cd);
+            m.set_reg(rt, value);
+            None
+        }
+        Some(Instr::Ctc2 { rt, cd }) => {
+            let value = m.reg(rt);
+            m.ctc2(cd, value);
+            None
         }
         Some(Instr::VLoad {
             op,
@@ -340,6 +409,7 @@ fn run_delay(m: &mut RspMachine, delay: Option<Instr>) {
         }) => {
             let bv = m.reg(base);
             m.vload(op, vt, elem, bv, off);
+            None
         }
         Some(Instr::VStore {
             op,
@@ -350,8 +420,50 @@ fn run_delay(m: &mut RspMachine, delay: Option<Instr>) {
         }) => {
             let bv = m.reg(base);
             m.vstore(op, vt, elem, bv, off);
+            None
         }
-        _ => {}
+        Some(Instr::Vu {
+            op,
+            vd,
+            vs,
+            vt,
+            e,
+            de,
+        }) => {
+            let invocation = OpInvocation {
+                vd: vd as usize,
+                vs: vs as usize,
+                vt: vt as usize,
+                e: e as usize,
+                de: de as usize,
+                vs_index: vs as usize,
+            };
+            match dispatch(m.vu(), op, invocation) {
+                OpStatus::Executed => None,
+                OpStatus::Unimplemented(op) => {
+                    println!("TRAP unimplemented VU {op:?} at 0x{delay_pc:04X}");
+                    Some(RspExitReason::Unsupported)
+                }
+            }
+        }
+        Some(Instr::Break) => {
+            m.break_rsp();
+            Some(RspExitReason::Broke)
+        }
+        Some(Instr::Unknown { word }) => {
+            println!("TRAP unknown 0x{word:08X} in delay slot at 0x{delay_pc:04X}");
+            Some(RspExitReason::Unsupported)
+        }
+        Some(
+            illegal @ (Instr::Branch { .. }
+            | Instr::BranchZ { .. }
+            | Instr::Jump { .. }
+            | Instr::Jal { .. }
+            | Instr::Jr { .. }
+            | Instr::Jalr { .. }),
+        ) => panic!(
+            "unsupported RSP control transfer {illegal:?} in delay slot at IMEM 0x{delay_pc:04X}"
+        ),
     }
 }
 
@@ -441,7 +553,7 @@ fn exec_store(
     }
 }
 
-fn exec_mtc0(m: &mut RspMachine, rt: u8, cop0: u8) {
+fn exec_mtc0(m: &mut RspMachine, rt: u8, cop0: u8) -> Option<RspExitReason> {
     let v = m.reg(rt);
-    let _ = m.write_cp0(cop0, v);
+    m.write_cp0(cop0, v)
 }

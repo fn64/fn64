@@ -52,6 +52,31 @@ instruction and state types form the comparison seam.
   comparison covers the entire vector register file and all 4096 logical DMEM
   bytes.
 
+## Delay-slot oracle parity
+
+The recompiler round-trip tests and `rsp_trace` use a decoded-instruction
+interpreter over the same typed `RspMachine` that emitted Rust calls. This is a
+control-flow parity oracle rather than the independent VU semantic model above:
+for each branch or jump, it must execute the same delay-slot operation the
+emitter inlines before transferring control.
+
+The delay-slot match is exhaustive over `Instr`. It executes scalar ALU,
+shifts, loads and stores; MFC0/MTC0; MFC2/MTC2/CFC2/CTC2; vector loads and
+stores; VU compute; and BREAK. MTC0 preserves the resolved post-branch resume
+address if an IMEM DMA swaps overlays. Unknown words trap with their instruction
+address, and a nested control transfer in a delay slot panics during both
+interpretation and code generation instead of becoming a no-op.
+
+Before the delay-slot correctness fix, the round-trip interpreter handled only
+ALU-immediate, ALU-register, LUI, scalar load, and MFC0. It silently omitted
+scalar stores, fixed and variable shifts, MTC0, all four CP2 scalar-transfer
+forms, vector loads/stores, VU compute, BREAK, unknown words, and nested control
+transfers. (`Nop` was also unmatched, but omitting it is its correct effect.)
+`delay_slot_store_executes_and_matches_emitter` places SW in a taken BEQ's
+delay slot, verifies the interpreter's DMEM write, and verifies that the emitter
+inlines the matching typed `store_w` call. Against the old handler its DMEM
+assertion reads zero and fails.
+
 ## Disagreements resolved
 
 1. **fn64 bug — inverse-square-root ROM/index parity.** The generated RSQ ROM
@@ -92,5 +117,5 @@ and RDP behavior remain outside this harness.
 ## Validation
 
 - `cargo clippy -p fn64-audio --all-targets -- -D warnings`: clean.
-- `cargo test -p fn64-audio`: 10 consecutive clean runs, each with 164 unit
+- `cargo test -p fn64-audio`: 10 consecutive clean runs, each with 165 unit
   tests and four differential integration tests passing, with zero warnings.
