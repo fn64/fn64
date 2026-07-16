@@ -295,25 +295,25 @@ fn emit_instr(
         }
         Instr::Jump { target } => {
             let resume = format!("0x{target:04X}");
-            emit_delay(out, ind, delay, &resume);
+            emit_delay(out, ind, delay, pc + 4, &resume);
             out.push_str(&format!("{ind}pc = 0x{target:04X};\n"));
         }
         Instr::Jal { target, ret } => {
             out.push_str(&format!("{ind}m.set_reg(31, 0x{ret:04X});\n"));
             let resume = format!("0x{target:04X}");
-            emit_delay(out, ind, delay, &resume);
+            emit_delay(out, ind, delay, pc + 4, &resume);
             out.push_str(&format!("{ind}pc = 0x{target:04X};\n"));
         }
         Instr::Jr { rs } => {
             out.push_str(&format!("{ind}let jt = 0x1000 | (m.reg({rs}) & 0x0FFF);\n"));
-            emit_delay(out, ind, delay, "jt");
+            emit_delay(out, ind, delay, pc + 4, "jt");
             out.push_str(&format!("{ind}pc = jt;\n"));
         }
         Instr::Jalr { rd, rs, ret } => {
             out.push_str(&format!(
                 "{ind}let jt = 0x1000 | (m.reg({rs}) & 0x0FFF); m.set_reg({rd}, 0x{ret:04X});\n"
             ));
-            emit_delay(out, ind, delay, "jt");
+            emit_delay(out, ind, delay, pc + 4, "jt");
             out.push_str(&format!("{ind}pc = jt;\n"));
         }
     }
@@ -333,29 +333,28 @@ fn emit_conditional_branch(
 ) {
     out.push_str(&format!("{ind}if {cond} {{\n"));
     let taken_resume = format!("0x{target:04X}");
-    emit_delay(out, ind, delay, &taken_resume);
+    emit_delay(out, ind, delay, next_pc - 4, &taken_resume);
     out.push_str(&format!("{ind}    pc = 0x{target:04X};\n{ind}}} else {{\n"));
     let fallthrough_resume = format!("0x{next_pc:04X}");
-    emit_delay(out, ind, delay, &fallthrough_resume);
+    emit_delay(out, ind, delay, next_pc - 4, &fallthrough_resume);
     out.push_str(&format!("{ind}    pc = 0x{next_pc:04X};\n{ind}}}\n"));
 }
 
 /// Emit ONLY the side-effecting statement of a delay-slot instruction (no
 /// pc assignment — the branch owns pc). A nop delay slot emits nothing.
-fn emit_delay(out: &mut String, ind: &str, delay: Option<&Instr>, resume: &str) {
+fn emit_delay(out: &mut String, ind: &str, delay: Option<&Instr>, delay_pc: u32, resume: &str) {
     let Some(d) = delay else { return };
-    let stmt = delay_stmt(d, resume);
+    let stmt = delay_stmt(d, delay_pc, resume);
     if let Some(s) = stmt {
         out.push_str(&format!("{ind}    {s}\n"));
     }
 }
 
 /// The pure side-effect statement for an instruction placed in a delay slot.
-/// Delay slots in well-formed ucode never contain a second branch/jump, so we
-/// only handle the value-producing ops here; a branch-in-delay-slot returns
-/// `None` and the emitter's `Unknown`/trap path would have caught truly odd
-/// encodings at the primary arm.
-fn delay_stmt(d: &Instr, resume: &str) -> Option<String> {
+/// Delay slots in well-formed ucode never contain a second branch/jump. Keep
+/// this match exhaustive so newly decoded operations cannot become silent
+/// omissions; unsupported control transfers fail during code generation.
+fn delay_stmt(d: &Instr, delay_pc: u32, resume: &str) -> Option<String> {
     Some(match d {
         Instr::Nop => return None,
         Instr::AluReg { op, rd, rs, rt } => alu_reg_stmt(*op, *rd, *rs, *rt),
@@ -409,7 +408,7 @@ fn delay_stmt(d: &Instr, resume: &str) -> Option<String> {
                 "{{ {} }}",
                 vu_stmt(
                     "",
-                    0,
+                    delay_pc,
                     *op,
                     OpInvocation {
                         vd: *vd as usize,
@@ -424,8 +423,18 @@ fn delay_stmt(d: &Instr, resume: &str) -> Option<String> {
             )
         }
         Instr::Mtc0 { rt, cop0 } => mtc0_effect(*rt, *cop0, resume),
-        // A branch/jump/break/unknown in a delay slot is not well-formed here.
-        _ => return None,
+        Instr::Break => "m.break_rsp(); break 'run RspExitReason::Broke;".to_owned(),
+        Instr::Unknown { word } => {
+            format!("break 'run trap_unknown(0x{delay_pc:04X}, 0x{word:08X});")
+        }
+        illegal @ (Instr::Branch { .. }
+        | Instr::BranchZ { .. }
+        | Instr::Jump { .. }
+        | Instr::Jal { .. }
+        | Instr::Jr { .. }
+        | Instr::Jalr { .. }) => panic!(
+            "unsupported RSP control transfer {illegal:?} in delay slot at IMEM 0x{delay_pc:04X}"
+        ),
     })
 }
 
