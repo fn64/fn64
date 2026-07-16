@@ -25,3 +25,14 @@ cc = "1"
 [dependencies]
 fn64-runtime = { path = "../../crates/fn64-runtime" }
 fn64-abi = { path = "../../crates/fn64-abi" }
+# The graphics seam + its headless reference software rasterizer. Registered
+# via fn64_abi::set_render_backend so submitted M_GFXTASKs actually
+# rasterize (into an off-screen framebuffer we dump as PNG), instead of only
+# hashing the blank VI framebuffer. See main.rs's render-backend section.
+fn64-render = { path = "../../crates/fn64-render" }
+fn64-render-rt64 = { path = "../../crates/fn64-render-rt64" }
+# The recompiled OoT aspMain audio ucode (typed Rust from fn64-audio's
+# clean-room RSP recompiler), kept out of the fn64 tree next to OOTU's other
+# game-derived material. Registered via fn64_abi::set_audio_ucode_fn so
+# M_AUDTASK dispatch really runs it.
+oot-audio-ucode = { path = "../../../aki-recomp/games/OOTU/rsp-recomp" }

@@ -44,6 +44,8 @@
 //! that boundary isn't accidentally erased or forgotten later.
 #![forbid(unsafe_code)]
 
+pub mod rsp;
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex};

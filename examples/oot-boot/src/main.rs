@@ -116,6 +116,116 @@ fn env_path(name: &str) -> std::path::PathBuf {
         .into()
 }
 
+/// One scripted-input step: at VI-swap `frame`, hold `buttons` (an
+/// `OSContPad.button` bitmask, controller.h:4-17) with the analog stick at
+/// `(stick_x, stick_y)`, until the next step changes it.
+#[derive(Debug, Clone, Copy)]
+struct ScriptStep {
+    frame: u64,
+    buttons: u16,
+    stick_x: i8,
+    stick_y: i8,
+}
+
+/// Map a controller.h `BTN_*` name to its `OSContPad.button` bit
+/// (`refs/oot-decomp/include/controller.h:4-17`). Returns 0 for an unknown
+/// name (logged by the caller) so a typo can't silently masquerade as a real
+/// press.
+fn button_bit(name: &str) -> u16 {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "A" => 0x8000,
+        "B" => 0x4000,
+        "Z" => 0x2000,
+        "START" => 0x1000,
+        "DUP" => 0x0800,
+        "DDOWN" => 0x0400,
+        "DLEFT" => 0x0200,
+        "DRIGHT" => 0x0100,
+        "L" => 0x0020,
+        "R" => 0x0010,
+        "CUP" => 0x0008,
+        "CDOWN" => 0x0004,
+        "CLEFT" => 0x0002,
+        "CRIGHT" => 0x0001,
+        "" => 0,
+        other => {
+            eprintln!("[oot-boot] WARNING: unknown button name {other:?} in OOT_INPUT_SCRIPT -- ignored");
+            0
+        }
+    }
+}
+
+/// Build the scripted-input timeline from the environment. Priority:
+/// `OOT_INPUT_SCRIPT` (full grammar, see the harness loop's doc), else
+/// `OOT_SCRIPT_START=N` shorthand (press+release Start around frame N), else
+/// empty (idle). The returned steps are sorted by frame.
+fn build_input_script() -> Vec<ScriptStep> {
+    if let Ok(spec) = std::env::var("OOT_INPUT_SCRIPT") {
+        let mut steps = parse_input_script(&spec);
+        steps.sort_by_key(|s| s.frame);
+        return steps;
+    }
+    if let Ok(n) = std::env::var("OOT_SCRIPT_START") {
+        if let Ok(frame) = n.parse::<u64>() {
+            // Press Start at `frame`, release 4 frames later -- a clean tap.
+            return vec![
+                ScriptStep { frame, buttons: 0x1000, stick_x: 0, stick_y: 0 },
+                ScriptStep { frame: frame + 4, buttons: 0, stick_x: 0, stick_y: 0 },
+            ];
+        }
+    }
+    Vec::new()
+}
+
+/// Parse `OOT_INPUT_SCRIPT`: comma-separated `frame:BTN[+BTN...][@sx/sy]`.
+/// An empty button field (e.g. `50:`) releases all buttons.
+fn parse_input_script(spec: &str) -> Vec<ScriptStep> {
+    let mut steps = Vec::new();
+    for raw in spec.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (frame_str, rest) = match raw.split_once(':') {
+            Some(parts) => parts,
+            None => {
+                eprintln!("[oot-boot] WARNING: OOT_INPUT_SCRIPT step {raw:?} has no ':' -- skipped");
+                continue;
+            }
+        };
+        let frame: u64 = match frame_str.trim().parse() {
+            Ok(f) => f,
+            Err(_) => {
+                eprintln!("[oot-boot] WARNING: OOT_INPUT_SCRIPT step {raw:?} has a bad frame -- skipped");
+                continue;
+            }
+        };
+        // Optional `@stickX/stickY` suffix.
+        let (buttons_part, stick_part) = match rest.split_once('@') {
+            Some((b, s)) => (b, Some(s)),
+            None => (rest, None),
+        };
+        let buttons = buttons_part
+            .split('+')
+            .filter(|s| !s.trim().is_empty())
+            .map(button_bit)
+            .fold(0u16, |acc, b| acc | b);
+        // Stick uses `/` (not `,`) as its X/Y separator, since `,` already
+        // separates whole steps at the top level.
+        let (stick_x, stick_y) = match stick_part {
+            Some(s) => {
+                let mut it = s.split('/');
+                let sx = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0i8);
+                let sy = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0i8);
+                (sx, sy)
+            }
+            None => (0i8, 0i8),
+        };
+        steps.push(ScriptStep { frame, buttons, stick_x, stick_y });
+    }
+    steps
+}
+
 fn main() {
     let rom_path = env_path("ROM");
     println!("[oot-boot] loading ROM from {}", rom_path.display());
@@ -127,6 +237,16 @@ fn main() {
     });
     println!("[oot-boot] ROM size: {} bytes", rom_bytes.len());
     fn64_abi::load_rom(rom_bytes);
+
+    // Register OoT's save-backing store so domain-2 (SRAM, devAddr >=
+    // 0x08000000 / PI_DOM2_ADDR2) PI DMAs have somewhere to go instead of
+    // being (wrongly) read from the ROM image past its end. OoT uses banked
+    // SRAM (32 KiB); Sram_InitSram DMAs the whole 0x8000-byte save in at boot
+    // (funcs_34.c:10636). Ephemeral in-memory store for this boot harness --
+    // a persisted FileSaveStorage is a shell concern, not this bring-up's.
+    fn64_abi::set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+        fn64_runtime::SaveType::SramBanked,
+    )));
 
     // Register every section from the real recomp_overlays.inl via the
     // bridge's C-side walk (populates SECTION_BUILDER via callbacks).
@@ -168,8 +288,7 @@ fn main() {
         }
     }
 
-    // Real plumbing, stand-in body (see stand_in_audio_ucode's doc comment).
-    unsafe { fn64_abi::set_audio_ucode_fn(stand_in_audio_ucode) };
+    let _ = stand_in_audio_ucode; // kept for reference; real ucode wired below
 
     // VI retrace: arm a host-chosen approximation (fn64_runtime::vi's doc:
     // not a hardware-accurate NTSC/PAL constant). 1000 virtual-time units
@@ -220,6 +339,63 @@ fn main() {
     let mut rdram = vec![0u8; RDRAM_SIZE.max(fn64_runtime::RDRAM_MMIO_WINDOW_END as usize)];
     let rdram_ptr = rdram.as_mut_ptr();
 
+    // Register the headless reference software rasterizer as the render
+    // backend BEFORE booting thread 0, so every M_GFXTASK the game submits
+    // via osSpTaskYielded actually decodes+rasterizes (the ABI's
+    // GFX_RENDER_NOTE path) instead of being counted-and-dropped. It decodes
+    // real F3DEX2 (OoT's ucode family) and auto-dumps each non-clear
+    // rasterized frame to /tmp/fn64-oot-render-*.png -- the harness's only
+    // way to see the backend's output, since set_render_backend takes
+    // ownership of the trait object (which is deliberately not
+    // Any-downcastable, per docs/DECOUPLING.md). rdram_len MUST match the
+    // real backing buffer so the backend's bounds checks and the ABI's
+    // from_raw_parts slice length agree; we pass rdram.len() (which includes
+    // the RDRAM_MMIO_WINDOW_END headroom above) for exactly that reason.
+    //
+    // NOTE (honest): the CONCURRENT display-list-pointer fix has not
+    // necessarily landed, so OoT's live polyOpa/polyXlu display-list head may
+    // still be a garbage pointer this early in boot -- in which case the
+    // decoder reads junk and either finds no triangles or lands geometry
+    // nowhere recognizable. That is expected and reported (blank/garbage),
+    // not faked; the objective rasterizer proof lives in
+    // fn64-render-rt64/tests/f3dex2_replay.rs, independent of this live path.
+    let mut render_backend = fn64_render_rt64::ReferenceBackend::new()
+        .with_f3dex2()
+        .with_clear_color([0, 0, 0, 255])
+        .with_auto_dump("/tmp", "fn64-oot-render", 240);
+    // NOTE: 240 (one full second of NTSC frames) so the capture reaches the
+    // frames where real 3D geometry appears -- the first ~8 gfx tasks are
+    // OoT's boot/logo screens (large flat gradient background quads), and
+    // the recognizable projected geometry (rotating title object, then the
+    // file-select 3D scene) shows up later in the boot sequence. A smaller
+    // limit stops at the gradient logos and misses the geometry proof.
+    // A common NTSC low-res target; matches capture_framebuffer's assumed
+    // 320x240 (this harness does not yet decode the ROM's real OSViMode).
+    {
+        use fn64_render::RenderBackend as _;
+        if let Err(e) = render_backend.create(&fn64_render::RenderConfig::new(320, 240)) {
+            eprintln!("[oot-boot] WARNING: render backend create() failed: {e}");
+        }
+    }
+    fn64_abi::set_render_backend(Box::new(render_backend), rdram.len());
+    println!(
+        "[oot-boot] registered fn64-render-rt64 ReferenceBackend (F3DEX2, 320x240, \
+         auto-dump /tmp/fn64-oot-render-*.png) as the render backend"
+    );
+
+    // Register the REAL recompiled OoT aspMain audio ucode (typed Rust from
+    // fn64-audio's clean-room RSP recompiler, compiled in the out-of-tree
+    // `oot-audio-ucode` crate). This replaces the stand-in: M_AUDTASK
+    // dispatch now actually runs the translated 1004-instruction ucode
+    // against rdram. The ucode's FFI wrapper rebuilds a bounds-checked
+    // `&mut [u8]` from the raw pointer, so it needs the rdram length first.
+    oot_audio_ucode::set_rdram_len(rdram.len());
+    unsafe { fn64_abi::set_audio_ucode_fn(oot_audio_ucode::oot_audio_ucode) };
+    println!(
+        "[oot-boot] registered recompiled OoT aspMain audio ucode (1004 instrs) \
+         as the real M_AUDTASK ucode function"
+    );
+
     println!("[oot-boot] booting thread 0 (recomp_entrypoint)...");
     unsafe {
         fn64_abi::boot_thread0(rdram_ptr, recomp_entrypoint, 0, 10);
@@ -237,6 +413,42 @@ fn main() {
     const MAX_STEPS: u64 = 2_000_000;
     const TICK_STEP: u64 = 100;
     const LOG_EVERY: u64 = 50_000;
+    // Feedback-loop speedup: `OOT_MAX_SWAPS=N` stops the boot as soon as N VI
+    // swaps have happened, instead of grinding the full 2M-step budget.
+    // Proving the render path only needs the first few frames, so a render
+    // iteration goes from ~minutes to ~seconds. Unset = run to the full budget
+    // (the durable boot-depth behavior). `OOT_STOP_ON_FRAME=1` additionally
+    // stops the instant a NON-BLANK framebuffer is captured -- the exact
+    // moment there's an image to eye-gate.
+    let max_swaps: Option<u64> = std::env::var("OOT_MAX_SWAPS")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let stop_on_frame: bool = std::env::var("OOT_STOP_ON_FRAME").is_ok();
+
+    // Scripted controller input (the INPUT-SEAM deliverable). `OOT_INPUT_SCRIPT`
+    // is a comma-separated list of `frame:BUTTON[+BUTTON...][@stickX/stickY]`
+    // steps, keyed by VI-swap count (one swap ~= one displayed frame). At each
+    // step's frame the named buttons are HELD on port 0 until the next step (or
+    // released by an empty step, e.g. `50:`). Button names match
+    // controller.h's BTN_* (A,B,Z,START,DUP,DDOWN,DLEFT,DRIGHT,L,R,CUP,CDOWN,
+    // CLEFT,CRIGHT). Example: `OOT_INPUT_SCRIPT=40:START,44:,60:START` presses
+    // Start at frame 40, releases at 44, presses again at 60 -- enough to
+    // dismiss the title screen / advance the file-select menu. Unset (or
+    // `OOT_SCRIPT_START=N`, a shorthand that presses+releases Start once at
+    // frame N) leaves the pad idle -- an honest un-driven boot.
+    let input_script = build_input_script();
+    if !input_script.is_empty() {
+        println!(
+            "[oot-boot] scripted input armed: {} step(s) -> {:?}",
+            input_script.len(),
+            input_script
+                .iter()
+                .map(|s| (s.frame, format!("{:#06x}", s.buttons)))
+                .collect::<Vec<_>>()
+        );
+    }
+    let mut next_script_idx = 0usize;
+    let mut last_applied_buttons: u16 = 0;
     // How many consecutive "nothing was runnable, and advancing the
     // virtual clock didn't wake anything either" ticks before concluding
     // boot has reached a genuinely idle steady state (not just a thread
@@ -249,6 +461,8 @@ fn main() {
 
     let mut tick = 0u64;
     let mut steps = 0u64;
+    let swap_timing = std::env::var_os("OOT_SWAP_TIMING").is_some();
+    let mut last_swap_instant: Option<std::time::Instant> = None;
     loop {
         if steps >= MAX_STEPS {
             println!(
@@ -291,10 +505,59 @@ fn main() {
         // non-uniform (Task requirement 3).
         let swap_count = fn64_abi::vi_swap_count();
         if swap_count > last_swap_count {
+            // Per-swap wall-clock timing (perf profiling), guarded by
+            // OOT_SWAP_TIMING. Prints ms since the previous swap so a window
+            // (e.g. swaps 233..240) can be averaged.
+            if swap_timing {
+                let now = std::time::Instant::now();
+                if let Some(prev) = last_swap_instant {
+                    let dt = now.duration_since(prev).as_secs_f64() * 1000.0;
+                    println!("[oot-boot] SWAP_TIMING swap={swap_count} dt_ms={dt:.3}");
+                }
+                last_swap_instant = Some(now);
+            }
+            // Apply any scripted-input steps whose frame we've now reached.
+            // Steps are frame-sorted; the last one at-or-before `swap_count`
+            // wins (a HELD button stays until the next step changes it).
+            while next_script_idx < input_script.len()
+                && input_script[next_script_idx].frame <= swap_count
+            {
+                let step = &input_script[next_script_idx];
+                fn64_abi::set_controller_state(0, step.buttons, step.stick_x, step.stick_y);
+                if step.buttons != last_applied_buttons {
+                    println!(
+                        "[oot-boot] SCRIPTED INPUT @ frame {swap_count}: port0 buttons={:#06x} \
+                         stick=({},{})",
+                        step.buttons, step.stick_x, step.stick_y
+                    );
+                }
+                last_applied_buttons = step.buttons;
+                next_script_idx += 1;
+            }
+
+            let dumps_before = fb_dumps.len();
             if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
                 capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);
             }
             last_swap_count = swap_count;
+            // Early-exit hooks (feedback-loop speedup): stop the instant we
+            // have what a render iteration needs, instead of the full budget.
+            if stop_on_frame && fb_dumps.len() > dumps_before {
+                println!(
+                    "[oot-boot] OOT_STOP_ON_FRAME: captured a non-blank framebuffer at swap \
+                     #{swap_count} (step {steps}) -- stopping early"
+                );
+                break;
+            }
+            if let Some(cap) = max_swaps {
+                if swap_count >= cap {
+                    println!(
+                        "[oot-boot] OOT_MAX_SWAPS={cap}: reached swap #{swap_count} (step {steps}) \
+                         -- stopping early"
+                    );
+                    break;
+                }
+            }
         }
 
         if !stepped {
@@ -330,6 +593,16 @@ fn main() {
     );
     println!("[oot-boot] gfx tasks submitted: {gfx_count}");
     println!("[oot-boot] audio tasks submitted: {audio_count}");
+    {
+        let (ns, calls) = fn64_abi::audio_ucode_timing();
+        if calls > 0 {
+            println!(
+                "[oot-boot] audio ucode timing: {calls} calls, {:.2} ms total, {:.3} ms/call avg",
+                ns as f64 / 1e6,
+                (ns as f64 / 1e6) / calls as f64
+            );
+        }
+    }
     println!(
         "[oot-boot] non-uniform framebuffers dumped: {} ({:?})",
         fb_dumps.len(),

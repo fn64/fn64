@@ -52,6 +52,26 @@ pub enum PortState {
     Absent,
 }
 
+/// A single controller's live button/stick state -- the four values a real
+/// `osContGetReadData` read-buttons response carries, in the game-visible
+/// `OSContPad` layout (`oot-decomp/include/ultra64/controller.h:127`:
+/// `button` u16, `stick_x`/`stick_y` s8, `errno` u8). This is the input SEAM:
+/// a host harness (`fn64-shell`, or a scripted boot harness) writes this and
+/// the PIF read-data response reflects it, without the SI/PIF protocol-
+/// formatting code below needing to know where the bytes came from. Defaults
+/// to a genuinely idle controller (no buttons, sticks centered) so an
+/// un-driven boot sees an honest neutral pad, not a fabricated input.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContInput {
+    /// The 16 N64 face/shoulder/dpad button bits (`OSContPad.button`), high
+    /// byte first per the PIF wire order the read-data response uses.
+    pub button: u16,
+    /// Analog stick X, signed (`OSContPad.stick_x`), centered at 0.
+    pub stick_x: i8,
+    /// Analog stick Y, signed (`OSContPad.stick_y`), centered at 0.
+    pub stick_y: i8,
+}
+
 /// The minimal PIF/SI model: which of the 4 controller ports are populated.
 /// Per the task ("minimal PIF model reporting one standard controller, no
 /// pak"), port 0 defaults to `StandardControllerNoPak`, ports 1-3 to
@@ -60,6 +80,11 @@ pub enum PortState {
 #[derive(Copy, Clone, Debug)]
 pub struct PifModel {
     ports: [PortState; 4],
+    /// Live button/stick state per port -- what `read_data_response` returns.
+    /// The input seam: a host harness sets these (`set_input`) and the game's
+    /// `osContGetReadData` sees them. Ports with no controller keep the idle
+    /// default, which is inert anyway (the game checks `errno`/absence first).
+    inputs: [ContInput; 4],
 }
 
 impl Default for PifModel {
@@ -71,6 +96,7 @@ impl Default for PifModel {
                 PortState::Absent,
                 PortState::Absent,
             ],
+            inputs: [ContInput::default(); 4],
         }
     }
 }
@@ -82,6 +108,24 @@ impl PifModel {
 
     pub fn port_state(&self, port: usize) -> PortState {
         self.ports.get(port).copied().unwrap_or(PortState::Absent)
+    }
+
+    /// Feed a controller's live button/stick state for `port` -- the host-
+    /// facing half of the input seam. A subsequent `read_data_response(port)`
+    /// (i.e. the game's next `osContGetReadData`) reflects it. An out-of-range
+    /// port is ignored (there are only 4 physical ports); this never touches
+    /// the port's present/absent identity, only what a present controller
+    /// reports.
+    pub fn set_input(&mut self, port: usize, input: ContInput) {
+        if let Some(slot) = self.inputs.get_mut(port) {
+            *slot = input;
+        }
+    }
+
+    /// The current input state for `port` (idle default if never set / out of
+    /// range) -- lets a harness read back what it fed.
+    pub fn input(&self, port: usize) -> ContInput {
+        self.inputs.get(port).copied().unwrap_or_default()
     }
 
     /// `osContStartQuery`/`__osSiRawStartDma`'s status-query response for
@@ -99,16 +143,18 @@ impl PifModel {
         }
     }
 
-    /// `osContStartReadData`/`osContGetReadData`'s button/stick response: an
-    /// idle controller (no buttons held, sticks centered) -- the documented
-    /// 4-byte `[button_hi, button_lo, stick_x, stick_y]` PIF response shape,
-    /// all zero for an idle standard controller. `Absent` ports have no
-    /// meaningful read-data response; this returns all-zero for them too
-    /// (a caller must check `query_response`'s `CONT_ABSENT` bit first,
-    /// matching real libultra's own documented usage pattern of querying
-    /// before reading).
-    pub fn read_data_response(&self, _port: usize) -> [u8; 4] {
-        [0, 0, 0, 0]
+    /// `osContStartReadData`/`osContGetReadData`'s button/stick response for
+    /// `port`: the documented 4-byte `[button_hi, button_lo, stick_x, stick_y]`
+    /// PIF response shape, filled from the live input state a host harness fed
+    /// via `set_input` (idle/all-neutral by default -- an honest un-driven
+    /// controller, not a fabricated button-mash). `Absent` ports still return
+    /// their (idle) input here; a caller must check `query_response`'s
+    /// `CONT_ABSENT` bit / the pad's `errno` first, matching real libultra's
+    /// own documented query-before-read usage pattern.
+    pub fn read_data_response(&self, port: usize) -> [u8; 4] {
+        let input = self.input(port);
+        let [bhi, blo] = input.button.to_be_bytes();
+        [bhi, blo, input.stick_x as u8, input.stick_y as u8]
     }
 }
 
@@ -139,6 +185,44 @@ mod tests {
     #[test]
     fn idle_read_data_is_all_neutral() {
         let pif = PifModel::new();
+        assert_eq!(pif.read_data_response(0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn set_input_flows_into_read_data_response() {
+        // The input seam: what a host harness feeds is what the read-data
+        // response reports, in the `[button_hi, button_lo, stick_x, stick_y]`
+        // PIF wire shape.
+        let mut pif = PifModel::new();
+        pif.set_input(
+            0,
+            ContInput {
+                button: 0x1234,
+                stick_x: -40,
+                stick_y: 55,
+            },
+        );
+        assert_eq!(
+            pif.read_data_response(0),
+            [0x12, 0x34, (-40i8) as u8, 55u8],
+            "read-data must reflect the fed input, button high-byte first"
+        );
+        // Un-driven ports stay idle -- feeding port 0 doesn't bleed into 1.
+        assert_eq!(pif.read_data_response(1), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn set_input_out_of_range_port_is_ignored_not_a_panic() {
+        let mut pif = PifModel::new();
+        pif.set_input(
+            9,
+            ContInput {
+                button: 0xFFFF,
+                stick_x: 1,
+                stick_y: 1,
+            },
+        );
+        // No panic, and no real port was disturbed.
         assert_eq!(pif.read_data_response(0), [0, 0, 0, 0]);
     }
 

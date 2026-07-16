@@ -79,6 +79,21 @@ impl RdramAddr {
     pub const fn offset(self) -> u32 {
         self.0
     }
+
+    /// The KSEG0 virtual address a MIPS `lw`/`sw` would use to reach this
+    /// rdram offset -- the inverse of the `MEM_*` base subtraction for a
+    /// cached (KSEG0) RDRAM address. Needed when a shim must RETURN a
+    /// pointer that guest code then compares against another pointer it
+    /// already holds in KSEG0 form (e.g. `osViGetCurrentFramebuffer`, whose
+    /// result `Sched_HandleRetrace` compares `==` against
+    /// `pendingSwapBuf1->swapBuffer`, a KSEG0 `gfxCtx->curFrameBuffer`):
+    /// returning the bare physical `offset()` there would never compare
+    /// equal to the game's own KSEG0 framebuffer pointer, stalling the
+    /// framebuffer-swap chain. Truncated to 32 bits (the width a `void*`
+    /// return lands in `$v0` as), matching how the game stores/compares it.
+    pub const fn to_kseg0(self) -> u32 {
+        self.0 | 0x8000_0000
+    }
 }
 
 /// Owns the single rdram allocation. Every consumer (`fn64-abi` shims, the
@@ -200,17 +215,50 @@ impl Rdram {
         self.bytes.as_mut_ptr()
     }
 
-    /// Bulk byte copy into the buffer at a plain rdram-relative byte offset
-    /// (no `MEM_*`-style byte-lane XOR -- that XOR is specifically a
-    /// sub-word CPU-load/store artifact per section (c)'s citation; a DMA
-    /// transfers a contiguous byte range exactly as the source presents it,
-    /// matching real cartridge-domain PI DMA's documented behavior of a
-    /// plain sequential byte copy, not per-word-reinterpreted). Used by
-    /// `rom.rs`'s `PiDma::start_dma` -- the one non-`MEM_*` bulk-write path
-    /// this crate has, kept here (not hand-rolled in `rom.rs`) so there is
-    /// still exactly one module that touches `self.bytes` directly.
+    /// Flat bulk byte copy at a plain rdram-relative offset -- no byte-lane
+    /// swizzle. For a caller that already holds bytes in THIS buffer's
+    /// native-endian-word layout (e.g. fn64-diff's savestate transplant, which
+    /// word-swaps the big-endian snapshot itself before writing). Cartridge
+    /// PI DMA does NOT use this -- see `dma_write_bytes`.
     pub fn write_bytes(&mut self, offset: usize, data: &[u8]) {
         self.bytes[offset..offset + data.len()].copy_from_slice(data);
+    }
+
+    /// Bulk DMA write of big-endian cartridge bytes, swizzled to this buffer's
+    /// native-endian-WORD layout so a later sub-word `MEM_*` read lands on the
+    /// correct byte.
+    ///
+    /// `MEM_W` is `from_ne_bytes` and sub-word accessors carry the `^2`/`^3`
+    /// byte-lane XOR precisely because storage is native-endian-word (see this
+    /// module's header). So a big-endian source word `b0 b1 b2 b3` must be
+    /// stored `b3 b2 b1 b0`, as if the guest had done `MEM_W(word)` -- else
+    /// `MEM_W` reads it byteswapped and `MEM_BU(word+k)` reads byte `3-k`.
+    ///
+    /// Caught by OoT boot: `Locale_Init` DMAs the ROM header and `lbu`s the
+    /// region byte; a flat copy delivered `'L'` instead of `'J'`, so the
+    /// region check matched neither E nor J and the game deliberately
+    /// `LogUtils_HungupThread`'d. Same class as the CPU-load byteswap this
+    /// module already fixed for `MEM_*` -- DMA-in was the remaining hole.
+    ///
+    /// Per-BYTE swizzle (`dst[(offset+k) ^ 3] = data[k]`), not per-word: this
+    /// is the general form that matches `MEM_BU`'s own `^3` lane XOR for ANY
+    /// offset and length, so it stays correct for the sub-word / non-word-
+    /// aligned transfers OoT's `DmaMgr_DmaRomToRam` actually issues (e.g.
+    /// `len=0x86`). For a word-aligned run it is identical to reversing each
+    /// 4-byte group; for a partial tail it swizzles each byte to its own lane
+    /// (a bare word-chunk loop would drop or misplace the leftover bytes).
+    pub fn dma_write_bytes(&mut self, offset: usize, data: &[u8]) {
+        for (k, &b) in data.iter().enumerate() {
+            self.bytes[(offset + k) ^ 3] = b;
+        }
+    }
+
+    /// Inverse of `dma_write_bytes`: read `len` bytes out of native-word rdram
+    /// back to FLAT (device/save) byte order, `out[k] = bytes[(offset+k) ^ 3]`.
+    /// For a FromRdram (save-write) DMA whose source is guest rdram. Same
+    /// per-byte lane XOR, so it too is correct for any offset/length.
+    pub fn dma_read_bytes_flat(&self, offset: usize, len: usize) -> Vec<u8> {
+        (0..len).map(|k| self.bytes[(offset + k) ^ 3]).collect()
     }
 
     pub fn read_bytes(&self, offset: usize, len: usize) -> &[u8] {
@@ -262,6 +310,35 @@ mod tests {
         // gpr may carry it (per ABI-SURFACE.md section (b)).
         let extended = RdramAddr::from_gpr(0xFFFF_FFFF_8000_1234);
         assert_eq!(extended.offset(), 0x1234);
+    }
+
+    /// Regression: `to_kseg0` must round-trip the KSEG0 form that a
+    /// `from_gpr(sign-extended)` came from, AND the value a shim RETURNS in
+    /// `$v0` from it must SIGN-extend to match a guest-side `MEM_W` load of
+    /// the same pointer. `osViGetCurrentFramebuffer` returns this; OoT's
+    /// `Sched_HandleRetrace` (funcs_41.c 0x800A3288, `bnel $v1, $v0`)
+    /// compares it against `pendingSwapBuf1->swapBuffer` loaded via `MEM_W`
+    /// (`*(int32_t*)`, sign-extended). A KSEG0 framebuffer like 0x803B5000
+    /// has bit 31 set, so the return value MUST become 0xFFFFFFFF_803B5000,
+    /// not 0x00000000_803B5000 -- the zero-extended form made the `bnel`
+    /// mismatch and froze the framebuffer-swap chain at exactly 1 swap.
+    #[test]
+    fn to_kseg0_high_bit_set_sign_extends_like_mem_w() {
+        // 0x3B5000 physical -> 0x803B5000 KSEG0 (bit 31 set).
+        let fb = RdramAddr::from_offset(0x003B_5000);
+        assert_eq!(fb.to_kseg0(), 0x803B_5000);
+        // Inverse of from_gpr's sign-extended form must be consistent.
+        assert_eq!(RdramAddr::from_gpr(0xFFFF_FFFF_803B_5000).offset(), 0x003B_5000);
+        // The $v0 return a shim computes (`to_kseg0() as i32 as u64`) must
+        // equal what a guest MEM_W load of the same stored pointer yields
+        // (i32 sign-extended into a u64 gpr) -- distinguishable from the
+        // buggy zero-extended value.
+        let returned = fb.to_kseg0() as i32 as u64;
+        assert_eq!(returned, 0xFFFF_FFFF_803B_5000);
+        assert_ne!(
+            returned, 0x0000_0000_803B_5000,
+            "zero-extended return is the bug: it never compares equal to a MEM_W-loaded fb ptr"
+        );
     }
 
     #[test]

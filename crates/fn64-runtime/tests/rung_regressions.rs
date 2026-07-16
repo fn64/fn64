@@ -349,6 +349,7 @@ fn ping_pong_n_coroutines_random_priorities_all_complete_exactly_once() {
                 mq_addr: addr(0xB000),
                 msg: i,
                 may_block: true,
+                jam: false,
             });
             loop {
                 if let Resume::Delivered(msg) = yielder.suspend(Yield::BlockOnRecv {
@@ -377,6 +378,7 @@ fn ping_pong_n_coroutines_random_priorities_all_complete_exactly_once() {
                 mq_addr: addr(0xB004),
                 msg: ping,
                 may_block: true,
+                jam: false,
             });
             *completed_b.borrow_mut() += 1;
         });
@@ -416,6 +418,7 @@ fn full_queue_blocking_send_actually_blocks_and_is_woken_by_a_recv() {
             mq_addr: addr(0xC000),
             msg: 2,
             may_block: true,
+            jam: false,
         });
         *sent2.borrow_mut() = true;
     });
@@ -476,6 +479,7 @@ fn nonblocking_yield_never_parks_and_never_reenters_the_executor() {
             mq_addr: addr(0xE000),
             msg: 2,
             may_block: false,
+            jam: false,
         });
         *send_result2.borrow_mut() = Some(resumed);
     });

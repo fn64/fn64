@@ -105,11 +105,16 @@ pub enum Yield {
         may_block: bool,
     },
     /// `osSendMesg` on the named queue, carrying the message being sent.
-    /// Same `may_block` semantics as `BlockOnRecv`.
+    /// Same `may_block` semantics as `BlockOnRecv`. `jam` selects the
+    /// front-insert path (`osJamMesg`, jammesg.c) instead of the tail-insert
+    /// `osSendMesg` -- both share the identical blocked-receiver hand-off and
+    /// full-queue blocking behavior, differing only in where a delivered
+    /// message lands in the ring.
     BlockOnSend {
         mq_addr: crate::RdramAddr,
         msg: crate::Mesg,
         may_block: bool,
+        jam: bool,
     },
 }
 

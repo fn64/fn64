@@ -57,9 +57,45 @@ use raster::Framebuffer;
 /// buffer. "Reference" in the sense of "the thing every future real backend
 /// (RT64 adapter, wgpu HLE) can be A/B-diffed against for seam-level
 /// correctness" -- not a claim of RDP-accurate output (see module doc).
+/// Which display-list encoding `process_task` decodes with.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DecodeMode {
+    /// The original simple F3D-style reference-fixture encoding
+    /// (`gbi::decode_display_list`): raw screen-space `ob` coords,
+    /// non-segmented `w1` addresses, `n<<12|v0` vertex packing. This is what
+    /// the hand-built fixtures and the `fn64-abi` executor-seam test plant,
+    /// so it stays the DEFAULT to keep those working bit-for-bit.
+    Simple,
+    /// Real F3DEX2 (`gbi::decode_display_list_f3dex2`): segment table,
+    /// modelview/projection matrix stack, viewport, nested `G_DL`. Selected
+    /// for decoding actual OoT display lists.
+    F3dex2,
+}
+
 pub struct ReferenceBackend {
     fb: Option<Framebuffer>,
     clear_color: [u8; 4],
+    decode_mode: DecodeMode,
+    /// If set, `process_task` writes the rasterized framebuffer to
+    /// `<dir>/<prefix>-NNNN.png` after each task, and logs whether the frame
+    /// was non-clear. This is how a harness that MOVED the backend into
+    /// `fn64_abi::set_render_backend` (giving up its `&mut` handle, since the
+    /// `dyn RenderBackend` trait object is deliberately not `Any`-downcastable
+    /// per docs/DECOUPLING.md) still gets the rasterized output back out:
+    /// the backend dumps it itself. Bounded by `auto_dump_limit`.
+    auto_dump: Option<AutoDump>,
+}
+
+struct AutoDump {
+    dir: std::path::PathBuf,
+    prefix: String,
+    /// How many gfx tasks have been processed (the PNG index).
+    task_index: u64,
+    /// How many non-clear PNGs have actually been written.
+    written: u64,
+    /// Stop dumping after this many non-clear frames (avoid flooding /tmp on
+    /// a long boot). `u64::MAX` = unbounded.
+    limit: u64,
 }
 
 impl ReferenceBackend {
@@ -67,7 +103,39 @@ impl ReferenceBackend {
         ReferenceBackend {
             fb: None,
             clear_color: [0, 0, 0, 255],
+            decode_mode: DecodeMode::Simple,
+            auto_dump: None,
         }
+    }
+
+    /// Decode subsequent display lists as real F3DEX2 (matrix stack, segment
+    /// table, viewport) instead of the simple reference-fixture encoding.
+    /// Used by the OoT boot harness, whose display lists are genuine F3DEX2.
+    pub fn with_f3dex2(mut self) -> Self {
+        self.decode_mode = DecodeMode::F3dex2;
+        self
+    }
+
+    /// After each `process_task`, write the rasterized framebuffer to
+    /// `<dir>/<prefix>-NNNN.png` (NNNN = the non-clear-frame counter),
+    /// stopping after `limit` non-clear frames. This lets a harness recover
+    /// the backend's output even after `set_render_backend` has taken
+    /// ownership of it. Every dump (and every all-clear skip) is logged so a
+    /// blank boot is reported honestly, never faked.
+    pub fn with_auto_dump(
+        mut self,
+        dir: impl Into<std::path::PathBuf>,
+        prefix: impl Into<String>,
+        limit: u64,
+    ) -> Self {
+        self.auto_dump = Some(AutoDump {
+            dir: dir.into(),
+            prefix: prefix.into(),
+            task_index: 0,
+            written: 0,
+            limit,
+        });
+        self
     }
 
     /// Override the clear color a fresh/resized framebuffer starts from.
@@ -101,7 +169,12 @@ impl RenderBackend for ReferenceBackend {
         Ok(())
     }
 
-    fn process_task(&mut self, rdram: &[u8], task: &OsTask) -> Result<FrameStatus, RenderError> {
+    fn process_task(
+        &mut self,
+        rdram: &mut [u8],
+        task: &OsTask,
+        output_addr: u32,
+    ) -> Result<FrameStatus, RenderError> {
         let fb = self
             .fb
             .as_mut()
@@ -117,18 +190,120 @@ impl RenderBackend for ReferenceBackend {
             });
         }
 
-        let end = task.output_buff as usize + task.output_buff_size as usize;
-        if task.output_buff_size != 0 && end > rdram.len() {
+        // `output_buff`/`output_buff_size` are the RSP's DRAM output region.
+        // CRITICAL (was a blank-frame bug): in the public `OSTask_t` layout
+        // (`ultra64/task.h`) `output_buff_size` is declared `u64*` -- a
+        // POINTER TO THE END of the output buffer, NOT a byte count. OoT
+        // fills both as KSEG0 pointers (`output_buff=0x80151640`,
+        // `output_buff_size=0x80169640`, verified from a live task header),
+        // so the real byte length is `end_ptr - start_ptr`, and the previous
+        // code (`out_phys + output_buff_size`) computed
+        // `0x151640 + 0x80169640` -> way past rdram, tripping
+        // InvalidTaskBounds on EVERY real frame and returning before any
+        // decode ran (0 triangles, blank frame). We now mask BOTH pointers
+        // to physical offsets and validate the END offset against rdram.
+        // (The reference backend rasterizes into its own framebuffer and
+        // decodes from `data_ptr`, so this is only a sanity bound, not a
+        // region the decoder reads -- but a wrong bound must not veto the
+        // whole frame.)
+        let out_start = (task.output_buff & 0x00FF_FFFF) as usize;
+        let out_end = (task.output_buff_size & 0x00FF_FFFF) as usize;
+        if task.output_buff_size != 0 && out_end > rdram.len() {
             return Err(RenderError::InvalidTaskBounds {
                 offset: task.output_buff,
-                len: task.output_buff_size,
+                len: out_end.saturating_sub(out_start) as u32,
                 rdram_len: rdram.len(),
             });
         }
 
-        let triangles = gbi::decode_display_list(rdram, task.data_ptr)?;
-        for tri in &triangles {
-            fb.draw_triangle(tri);
+        let triangles = match self.decode_mode {
+            DecodeMode::Simple => gbi::decode_display_list(&*rdram, task.data_ptr)?,
+            DecodeMode::F3dex2 => gbi::decode_display_list_f3dex2(&*rdram, task.data_ptr)?,
+        };
+        let tri_count = triangles.len();
+        match self.decode_mode {
+            // Simple reference-fixture path: pure 2D fill, no culling/z-test,
+            // to keep the hand-built fixtures bit-compatible.
+            DecodeMode::Simple => {
+                for tri in &triangles {
+                    fb.draw_triangle(tri);
+                }
+            }
+            // Real F3DEX2 scene path: honor per-triangle back/front-face
+            // culling (from G_GEOMETRYMODE) + z-buffering + texture sampling,
+            // so far geometry is occluded, inside-out back faces don't
+            // overpaint front faces, and textured surfaces show their texels.
+            DecodeMode::F3dex2 => {
+                for tri in &triangles {
+                    fb.draw_triangle_culled(tri, tri.cull);
+                }
+            }
+        }
+
+        // Write the rasterized color image BACK into the game's framebuffer
+        // in rdram, matching real RDP behavior (the RDP writes its color
+        // image into DRAM, which the VI then scans out via osViSwapBuffer).
+        // The reference backend rasterizes into its own RGBA8888 surface, so
+        // here we convert to the framebuffer's native format and copy it into
+        // `rdram[output_addr..]`. WITHOUT this, the backend's pixels never
+        // reach the DRAM region the VI presents, so every VI frame is blank
+        // even though rasterization succeeded.
+        //
+        // Target address (byte-cited): NOT `task.output_buff`. On OoT the gfx
+        // task's `output_buff` is 0x80151640 (the RSP's DRAM command-FIFO
+        // output region), whereas the color framebuffer the game actually
+        // swaps/presents (`osViSwapBuffer`) is at 0x3b5000 / 0x3da800 -- a
+        // different address. So the caller passes the VI's current framebuffer
+        // offset as `output_addr`; `0` means "no known color target" (a
+        // fixture/test path) and we skip the write-back.
+        //
+        // Format (byte-cited): RGBA5551, 16-bit, big-endian halfwords, exactly
+        // matching `examples/oot-boot/src/main.rs`'s `dump_rgba5551_as_png`
+        // (`u16::from_be_bytes`, r5=px>>11, g5=px>>6, b5=px>>1, a1=px&1). The
+        // VI/harness reads the framebuffer as 2-byte big-endian RGBA5551, so
+        // we store each pixel's halfword big-endian to match.
+        if output_addr != 0 {
+            write_rgba5551_framebuffer(rdram, output_addr as usize, fb);
+        }
+
+        // Auto-dump the rasterized frame if configured (the harness's only
+        // way to see the output once set_render_backend owns this backend).
+        if let Some(dump) = self.auto_dump.as_mut() {
+            let idx = dump.task_index;
+            dump.task_index += 1;
+            let [cr, cg, cb, ca] = self.clear_color;
+            let non_clear = fb.has_non_uniform_content(cr, cg, cb, ca);
+            if !non_clear {
+                eprintln!(
+                    "[fn64-render-rt64] gfx task #{idx}: decoded {tri_count} triangle(s); \
+                     framebuffer is UNIFORM clear -- reported blank, not dumped."
+                );
+            } else if dump.written >= dump.limit {
+                eprintln!(
+                    "[fn64-render-rt64] gfx task #{idx}: non-clear ({tri_count} tris) but \
+                     auto-dump limit ({}) reached -- not writing another PNG.",
+                    dump.limit
+                );
+            } else {
+                let _ = std::fs::create_dir_all(&dump.dir);
+                let path = dump
+                    .dir
+                    .join(format!("{}-{:04}.png", dump.prefix, dump.written));
+                match png_dump::write_png(&path, fb.width, fb.height, &fb.pixels) {
+                    Ok(()) => {
+                        dump.written += 1;
+                        eprintln!(
+                            "[fn64-render-rt64] gfx task #{idx}: NON-CLEAR ({tri_count} tris) \
+                             -- dumped {}",
+                            path.display()
+                        );
+                    }
+                    Err(e) => eprintln!(
+                        "[fn64-render-rt64] gfx task #{idx}: failed to write {}: {e}",
+                        path.display()
+                    ),
+                }
+            }
         }
         Ok(FrameStatus::Complete)
     }
@@ -156,6 +331,46 @@ impl RenderBackend for ReferenceBackend {
 
     fn supported_ucodes(&self) -> &[UcodeId] {
         gbi::SUPPORTED
+    }
+}
+
+/// Convert `fb`'s RGBA8888 pixels to N64 RGBA5551 and write them into
+/// `rdram` starting at byte offset `start`, in the framebuffer's native
+/// on-DRAM layout: 2 bytes per pixel, big-endian halfword, row-major,
+/// top-left origin. This is the exact inverse of
+/// `examples/oot-boot/src/main.rs`'s `dump_rgba5551_as_png`, which reads the
+/// framebuffer back as `u16::from_be_bytes([b0, b1])` with `r5 = px >> 11`,
+/// `g5 = px >> 6`, `b5 = px >> 1`, `a1 = px & 1` -- the same layout the VI
+/// scans out. Storing the halfword big-endian (high byte at `start+2i`, low
+/// at `start+2i+1`) makes the VI-presented frame match what the backend
+/// rasterized. A pixel whose 2 bytes would run past `rdram` is skipped
+/// (bounds-safe; the caller already validated `output_addr` is a real
+/// framebuffer offset, but a wrong width/height must not panic).
+///
+/// The 8->5 bit reduction rounds like the game's inverse of the PNG dump's
+/// 5->8 expansion: `c5 = (c8 * 31 + 127) / 255`. Alpha maps any non-zero
+/// input alpha to the single RGBA5551 alpha/coverage bit.
+fn write_rgba5551_framebuffer(rdram: &mut [u8], start: usize, fb: &Framebuffer) {
+    let px_count = (fb.width * fb.height) as usize;
+    // The framebuffer format is a fixed 2 bytes/pixel; only write pixels the
+    // fb actually has AND that fit within rdram.
+    let to_5 = |c: u8| -> u16 { ((c as u16 * 31 + 127) / 255) & 0x1F };
+    for i in 0..px_count {
+        let dst = start + i * 2;
+        if dst + 2 > rdram.len() {
+            break;
+        }
+        let src = i * 4;
+        let r = fb.pixels[src];
+        let g = fb.pixels[src + 1];
+        let b = fb.pixels[src + 2];
+        let a = fb.pixels[src + 3];
+        let px: u16 =
+            (to_5(r) << 11) | (to_5(g) << 6) | (to_5(b) << 1) | (if a != 0 { 1 } else { 0 });
+        // Big-endian halfword, matching capture_framebuffer's from_be_bytes.
+        let [hi, lo] = px.to_be_bytes();
+        rdram[dst] = hi;
+        rdram[dst + 1] = lo;
     }
 }
 
@@ -204,7 +419,12 @@ impl RenderBackend for Rt64Backend {
         })
     }
 
-    fn process_task(&mut self, _rdram: &[u8], _task: &OsTask) -> Result<FrameStatus, RenderError> {
+    fn process_task(
+        &mut self,
+        _rdram: &mut [u8],
+        _task: &OsTask,
+        _output_addr: u32,
+    ) -> Result<FrameStatus, RenderError> {
         Err(RenderError::NotReady(
             "Rt64Backend::create was never able to succeed (RT64 FFI not wired up)",
         ))
@@ -253,9 +473,9 @@ mod tests {
     #[test]
     fn reference_backend_rejects_process_task_before_create() {
         let mut backend = ReferenceBackend::new();
-        let rdram = vec![0u8; 64];
+        let mut rdram = vec![0u8; 64];
         let err = backend
-            .process_task(&rdram, &OsTask::default())
+            .process_task(&mut rdram, &OsTask::default(), 0)
             .unwrap_err();
         assert!(matches!(err, RenderError::NotReady(_)));
     }
