@@ -11,7 +11,7 @@
 
 use crate::gbi::{
     AlphaCompare, AlphaSource, BlendAlphaInput, BlendBInput, BlendColorInput, BlenderState,
-    ColorSource, CombinerCycle, CombinerState, CullMode, Triangle, Vertex,
+    ColorSource, CombinerCycle, CombinerState, CullMode, ScissorRect, Triangle, Vertex,
 };
 
 /// Evaluate both programmed RDP color-combiner cycles.
@@ -315,10 +315,39 @@ impl Framebuffer {
 
     fn draw_triangle_impl(&mut self, tri: &Triangle, cull: CullMode, depth_test: bool) {
         let [a, b, c] = tri.v;
-        let min_x = a.x.min(b.x).min(c.x).floor().max(0.0) as i32;
-        let max_x = a.x.max(b.x).max(c.x).ceil().min(self.width as f32) as i32;
-        let min_y = a.y.min(b.y).min(c.y).floor().max(0.0) as i32;
-        let max_y = a.y.max(b.y).max(c.y).ceil().min(self.height as f32) as i32;
+        if tri.texture.is_some() {
+            assert!(
+                [a.w, b.w, c.w].iter().all(|&w| w > 1e-4),
+                "textured triangle reached perspective interpolation with non-positive clip w; \
+                 F3DEX2 decode must near-plane-cull it before rasterization"
+            );
+        }
+        let scissor = tri.scissor.unwrap_or(ScissorRect {
+            ulx: 0.0,
+            uly: 0.0,
+            lrx: self.width as f32,
+            lry: self.height as f32,
+        });
+        // The loop samples pixel centers. The first accepted integer x/y is
+        // therefore ceil(upper_left - 0.5), and the exclusive loop end is
+        // ceil(lower_right - 0.5). This preserves quarter-pixel scissor edges
+        // while integer edges reduce to the familiar [ul, lr) pixel range.
+        let clip_min_x = (scissor.ulx - 0.5).ceil() as i32;
+        let clip_max_x = (scissor.lrx - 0.5).ceil() as i32;
+        let clip_min_y = (scissor.uly - 0.5).ceil() as i32;
+        let clip_max_y = (scissor.lry - 0.5).ceil() as i32;
+        let min_x = (a.x.min(b.x).min(c.x).floor() as i32)
+            .max(clip_min_x)
+            .clamp(0, self.width as i32);
+        let max_x = (a.x.max(b.x).max(c.x).ceil() as i32)
+            .min(clip_max_x)
+            .clamp(0, self.width as i32);
+        let min_y = (a.y.min(b.y).min(c.y).floor() as i32)
+            .max(clip_min_y)
+            .clamp(0, self.height as i32);
+        let max_y = (a.y.max(b.y).max(c.y).ceil() as i32)
+            .min(clip_max_y)
+            .clamp(0, self.height as i32);
 
         let area = edge(a, b, c);
         if area == 0.0 {
@@ -364,14 +393,18 @@ impl Framebuffer {
                         (w0 * a.a as f32 + w1 * b.a as f32 + w2 * c.a as f32) as u8,
                     ];
                     let shade_alpha = shade[3];
-                    // Screen-linear S/T interpolation (perspective-incorrect,
-                    // §4.1) remains adequate for this reference backend. A
-                    // missing texture supplies white, so shade/primitive/env-
-                    // only formulas and the legacy default MODULATE mode have
+                    // Interpolate S/w, T/w, and 1/w, then divide before
+                    // sampling. The perspective-correct texel remains TEXEL0
+                    // for the programmed combiner; a missing texture supplies
+                    // white so shade/primitive/environment-only formulas have
                     // neutral TEXEL0 input rather than turning black.
                     let texel = if let Some(tex) = &tri.texture {
-                        let s = w0 * a.s + w1 * b.s + w2 * c.s;
-                        let t = w0 * a.t + w1 * b.t + w2 * c.t;
+                        let rw0 = w0 / a.w;
+                        let rw1 = w1 / b.w;
+                        let rw2 = w2 / c.w;
+                        let reciprocal_w = rw0 + rw1 + rw2;
+                        let s = (rw0 * a.s + rw1 * b.s + rw2 * c.s) / reciprocal_w;
+                        let t = (rw0 * a.t + rw1 * b.t + rw2 * c.t) / reciprocal_w;
                         tex.sample(s, t)
                     } else {
                         [255; 4]
@@ -553,7 +586,7 @@ fn edge(a: Vertex, b: Vertex, c: Vertex) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gbi::BlendCycle;
+    use crate::gbi::{BlendCycle, ScissorRect};
 
     fn cycle(rgb: [ColorSource; 4], alpha: [AlphaSource; 4]) -> CombinerCycle {
         CombinerCycle { rgb, alpha }
@@ -576,6 +609,7 @@ mod tests {
         Vertex {
             x,
             y,
+            w: 1.0,
             r,
             g,
             b,
@@ -768,6 +802,45 @@ mod tests {
         // A far corner should remain untouched (still clear color).
         let idx0 = 0usize;
         assert_eq!(&fb.pixels[idx0..idx0 + 4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn setscissor_bounds_triangle_writes_to_exclusive_rect() {
+        let mut fb = Framebuffer::new(16, 16);
+        fb.clear(0, 0, 0, 255);
+        let tri = Triangle {
+            v: [
+                v(0.0, 0.0, 255, 0, 0, 255),
+                v(16.0, 0.0, 255, 0, 0, 255),
+                v(0.0, 16.0, 255, 0, 0, 255),
+            ],
+            scissor: Some(ScissorRect {
+                ulx: 4.25,
+                uly: 3.75,
+                lrx: 9.25,
+                lry: 8.75,
+            }),
+            ..Default::default()
+        };
+
+        fb.draw_triangle(&tri);
+
+        let inside = (5usize * 16 + 5) * 4;
+        assert_eq!(&fb.pixels[inside..inside + 4], &[255, 0, 0, 255]);
+        for y in 0..16usize {
+            for x in 0..16usize {
+                // Pixel centers select x=4..8 and y=4..8 for those
+                // quarter-pixel edges; lower-right remains exclusive.
+                if !(4..9).contains(&x) || !(4..9).contains(&y) {
+                    let i = (y * 16 + x) * 4;
+                    assert_eq!(
+                        &fb.pixels[i..i + 4],
+                        &[0, 0, 0, 255],
+                        "triangle wrote outside exclusive scissor at ({x},{y})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1006,6 +1079,56 @@ mod tests {
         assert_eq!(
             blend_fragment([0, 0, 255, 255], [0, 255, 0, 255], 64, fog_then_pass),
             [64, 0, 191, 255]
+        );
+    }
+
+    #[test]
+    fn perspective_correct_st_uses_reciprocal_clip_w() {
+        use crate::gbi::Texture;
+
+        let mut texels = vec![0u8; 4 * 4 * 4];
+        texels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        let green = 20usize; // texel (1,1) in a 4-wide RGBA8888 texture
+        texels[green..green + 4].copy_from_slice(&[0, 255, 0, 255]);
+        let texture = Texture {
+            width: 4,
+            height: 4,
+            texels: std::rc::Rc::new(texels),
+            clamp_s: true,
+            clamp_t: true,
+        };
+        let textured = |x: f32, y: f32, s: f32, t: f32, w: f32| Vertex {
+            x,
+            y,
+            s,
+            t,
+            w,
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+            ..Default::default()
+        };
+        let tri = Triangle {
+            v: [
+                textured(0.0, 0.0, 0.0, 0.0, 1.0),
+                textured(8.0, 0.0, 3.0, 3.0, 4.0),
+                textured(0.0, 8.0, 0.0, 0.0, 1.0),
+            ],
+            texture: Some(texture),
+            ..Default::default()
+        };
+
+        let mut fb = Framebuffer::new(8, 8);
+        fb.clear(0, 0, 0, 255);
+        fb.draw_triangle(&tri);
+
+        let sample = 4usize * 4;
+        assert_eq!(
+            &fb.pixels[sample..sample + 4],
+            &[255, 0, 0, 255],
+            "at pixel center (4.5,0.5), reciprocal-w interpolation gives S/T≈0.73 \
+             (red texel 0,0); screen-linear S/T≈1.69 incorrectly samples green 1,1"
         );
     }
 
