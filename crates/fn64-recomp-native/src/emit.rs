@@ -182,11 +182,26 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
             emit_control_transfer(
                 &mut out, instr, vram, delay, delay_vram, base, func_end, resolver,
             );
-            // Skip the delay-slot word; it was handled by the transfer.
-            i += 2;
-            // Close the arm if the next vram is a leader (new arm) or we ran off
-            // the end.
             let _ = writeln!(out, "        }}");
+
+            // A branch may target another branch's delay-slot address. The
+            // delay instruction is duplicated in N64Recomp's emitted C at the
+            // target label (the ordinary execution path also executes it as
+            // the parent's delay slot). Give that address its own arm too;
+            // the parent's post-delay address is always a leader.
+            if leaders.contains(&delay_vram) {
+                let _ = writeln!(out, "        {delay_vram:#010X} => {{");
+                if let Some(delay_instr) = delay {
+                    let _ = writeln!(out, "            // {delay_vram:#010X}: {delay_instr:?}");
+                    emit_straight(&mut out, delay_instr, delay_vram);
+                }
+                let _ = writeln!(out, "            pc = {:#010X};", delay_vram + 4);
+                let _ = writeln!(out, "        }}");
+            }
+
+            // Skip the delay-slot word; its normal execution was handled by
+            // the transfer, and any independently reachable copy is above.
+            i += 2;
             continue;
         } else {
             emit_straight(&mut out, instr, vram);
@@ -1071,6 +1086,20 @@ fn emit_control_transfer(
         }
     };
 
+    // N64Recomp's MIT `recompilation.cpp:489-496` treats an unconditional
+    // `j`/pseudo-`b` to its own address as the cooperative idle-loop boundary
+    // `pause_self`, rather than burning the host CPU forever. Preserve the
+    // delay slot and branch back after each resume so the typed coroutine path
+    // has the same repeated-yield semantics.
+    let self_pause = target == Some(vram)
+        && (matches!(instr, J { .. }) || matches!(instr, Beq { rs: 0, rt: 0, .. }));
+    if self_pause {
+        let _ = writeln!(out, "            pause_self();");
+        emit_delay(out);
+        let _ = writeln!(out, "            pc = {vram:#010X}; continue 'run;");
+        return;
+    }
+
     // Condition expression (Rust bool) for conditional branches.
     let cond = |instr: &Instruction| -> Option<String> {
         Some(match *instr {
@@ -1102,11 +1131,17 @@ fn emit_control_transfer(
             if rs == 31 {
                 let _ = writeln!(out, "            return;");
             } else {
+                // N64Recomp lowers a recognized local jump table to `goto`
+                // labels inside this function (`recompilation.cpp:462-483`).
+                // Preserve the general machine-level form: a computed target
+                // in this function resumes our local pc dispatcher; only an
+                // address outside the body is an indirect function tail-call.
+                let _ = writeln!(out, "            let _target = ctx.r_u32({});", rs);
                 let _ = writeln!(
                     out,
-                    "            lookup(ctx.r_u32({}))(ctx, mem); return;",
-                    rs
+                    "            if _target >= {base:#010X} && _target < {func_end:#010X} {{ pc = _target; continue 'run; }}"
                 );
+                let _ = writeln!(out, "            lookup(_target)(ctx, mem); return;");
             }
         }
         J { .. } => {
@@ -1120,7 +1155,11 @@ fn emit_control_transfer(
                 // return (the target's `jr $ra` returns to OUR caller).
                 match resolver.resolve(t) {
                     CallTarget::Direct(name) => {
-                        let _ = writeln!(out, "            {}(ctx, mem); return;", name);
+                        let _ = writeln!(
+                            out,
+                            "            call_host_or_native({:#010X}, {}, ctx, mem); return;",
+                            t, name
+                        );
                     }
                     CallTarget::Indirect => {
                         let _ = writeln!(out, "            lookup({:#010X})(ctx, mem); return;", t);
@@ -1141,7 +1180,11 @@ fn emit_control_transfer(
             let t = target.unwrap();
             match resolver.resolve(t) {
                 CallTarget::Direct(name) => {
-                    let _ = writeln!(out, "            {}(ctx, mem);", name);
+                    let _ = writeln!(
+                        out,
+                        "            call_host_or_native({:#010X}, {}, ctx, mem);",
+                        t, name
+                    );
                 }
                 CallTarget::Indirect => {
                     let _ = writeln!(out, "            lookup({:#010X})(ctx, mem);", t);

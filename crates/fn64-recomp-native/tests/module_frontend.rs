@@ -30,8 +30,8 @@
 //!    `resolve_jal` Match-vs-Ambiguous decision.
 
 use fn64_recomp_native::{
-    emit_module, resolve_host_function, set_host_lookup, ModuleFunc, Rdram, RecompContext,
-    RecompFunc, SymbolTable,
+    call_host_or_native, emit_module, resolve_host_function, set_host_lookup, ModuleFunc, Rdram,
+    RecompContext, RecompFunc, SymbolTable,
 };
 
 // --- The synthetic three-function "program" (real MIPS III encodings). ---
@@ -103,7 +103,7 @@ pub fn caller(ctx: &mut RecompContext, mem: &mut Rdram) {
                 ctx.set_r32(31, 0x80002008u32 as i32);
                 // delay: 0x80002004: Addiu { rt: 4, rs: 0, imm: 7 }
                 ctx.set_r32(4, (0i32).wrapping_add(7));
-                callee(ctx, mem);
+                call_host_or_native(0x80001000, callee, ctx, mem);
                 pc = 0x80002008;
                 continue 'run;
             }
@@ -127,7 +127,7 @@ pub fn tail_caller(ctx: &mut RecompContext, mem: &mut Rdram) {
                 // 0x80003000: J { target: 1024 }
                 // delay: 0x80003004: Nop
                 // nop
-                callee(ctx, mem);
+                call_host_or_native(0x80001000, callee, ctx, mem);
                 return;
             }
             _ => unreachable!("jumped to unmapped vram {:#X}", pc),
@@ -200,13 +200,15 @@ fn tail_call_executes_to_expected_state() {
 }
 
 /// Resolution correctness against the emitted text: a JAL to a KNOWN symbol
-/// emits a direct `callee(ctx, mem)` call and no `lookup(`; a JAL to an
+/// emits a statically typed `callee` fallback through the host-first seam and
+/// no `lookup(`; a JAL to an
 /// UNKNOWN address emits an indirect `lookup(...)` and no direct name.
 #[test]
 fn known_target_is_direct_unknown_is_lookup() {
     // Known-target module: caller -> callee. Must be direct, no lookup.
     let known = synthetic_module();
-    assert!(known.contains("callee(ctx, mem);"), "known JAL must emit a direct call");
+    assert!(known.contains("call_host_or_native(0x80001000, callee, ctx, mem);"),
+            "known JAL must emit a typed native fallback through the host seam");
     assert!(
         !known.contains("            lookup("),
         "no indirect lookup CALL should appear when every target is a known symbol:\n{known}"

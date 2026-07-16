@@ -2,7 +2,7 @@
 // Whole-program: inter-function JAL/J resolve to direct Rust calls.
 // Typed Rust, no unsafe, no pointer casts.
 #![allow(clippy::all, unused, non_snake_case)]
-use fn64_recomp_native::{resolve_host_function, RecompContext, RecompFunc, Rdram};
+use fn64_recomp_native::{call_host_or_native, pause_self, resolve_host_function, RecompContext, RecompFunc, Rdram};
 
 // Recompiled from MIPS function `callee` @ 0x80001000 (3 instructions).
 // Emitted by fn64-recomp-native (typed Rust, no unsafe).
@@ -33,7 +33,7 @@ pub fn caller(ctx: &mut RecompContext, mem: &mut Rdram) {
             ctx.set_r32(31, 0x80002008u32 as i32);
             // delay: 0x80002004: Addiu { rt: 4, rs: 0, imm: 7 }
             ctx.set_r32(4, (0i32).wrapping_add(7));
-            callee(ctx, mem);
+            call_host_or_native(0x80001000, callee, ctx, mem);
             pc = 0x80002008; continue 'run;
         }
         0x80002008 => {
@@ -56,7 +56,7 @@ pub fn tail_caller(ctx: &mut RecompContext, mem: &mut Rdram) {
             // 0x80003000: J { target: 1024 }
             // delay: 0x80003004: Nop
             // nop
-            callee(ctx, mem); return;
+            call_host_or_native(0x80001000, callee, ctx, mem); return;
         }
         _ => unreachable!("jumped to unmapped vram {:#X}", pc),
     } }
