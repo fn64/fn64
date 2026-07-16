@@ -21,26 +21,61 @@ fn read_words(path: &str) -> Vec<u32> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let path = &args[1];
-    let base: u32 = 0x1080;
+    let base: u32 = args
+        .get(3)
+        .map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap())
+        .unwrap_or(0x1000);
     let cap: u64 = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(2000);
     let words = read_words(path);
     let n = words.len();
 
     let mut rdram = vec![0u8; 0x0080_0000];
-    // Seed a minimal but well-formed-ish task at 0x1000.
-    let task = 0x1000usize;
-    rdram[task + 0x18..task + 0x1C].copy_from_slice(&0x2000u32.to_be_bytes()); // ucode_data
-    rdram[task + 0x1C..task + 0x20].copy_from_slice(&0x0800u32.to_be_bytes());
-    rdram[task + 0x30..task + 0x34].copy_from_slice(&0x4000u32.to_be_bytes()); // data_ptr
-    rdram[task + 0x34..task + 0x38].copy_from_slice(&0x0000u32.to_be_bytes()); // data_size=0
+    // Native-endian OSTask (fn64 rdram is native-endian word storage).
+    let put_w = |rd: &mut [u8], off: usize, v: u32| {
+        rd[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+    };
+    let task = 0x2000usize;
+    let ucode_data = 0x3000usize;
+    let cmd_list = 0x5000usize;
+    let src_pcm = 0x6000usize;
 
-    // ucode_data image lives at rdram 0x2000 in this synthetic setup.
+    // Seed the real DMEM data image (jump table) from ASPMAIN_DATA if provided.
+    // The incbin is big-endian (ROM order); in the live game it reaches rdram
+    // via the C runtime's `^3`-swizzled DMA (fn64 rdram is native-endian word
+    // storage). Replicate that `^3` swizzle so the RSP's `^2`/`^3` DMEM
+    // accessors read the jump table on the correct lanes.
+    if let Some(dp) = std::env::var_os("ASPMAIN_DATA") {
+        let d = std::fs::read(&dp).unwrap();
+        for (k, &b) in d.iter().enumerate() {
+            rdram[(ucode_data + k) ^ 3] = b;
+        }
+        put_w(&mut rdram, task + 0x1C, d.len() as u32);
+    } else {
+        put_w(&mut rdram, task + 0x1C, 0x0800);
+    }
+    // Nonzero source PCM ramp.
+    for i in 0..0x100usize {
+        rdram[src_pcm + i] = (i as u8).wrapping_add(1) | 0x40;
+    }
+    // A_LOADBUFF (20) then A_SAVEBUFF (21), 0x100 bytes through DMEM 0x0A0.
+    let cmds: [u32; 4] = [
+        (20u32 << 24) | ((0x100u32 >> 4) << 16) | 0x0A0,
+        src_pcm as u32,
+        (21u32 << 24) | ((0x100u32 >> 4) << 16) | 0x0A0,
+        0x7000u32,
+    ];
+    for (i, &w) in cmds.iter().enumerate() {
+        put_w(&mut rdram, cmd_list + i * 4, w);
+    }
+    put_w(&mut rdram, task + 0x18, ucode_data as u32); // ucode_data
+    put_w(&mut rdram, task + 0x30, cmd_list as u32); // data_ptr
+    put_w(&mut rdram, task + 0x34, (cmds.len() * 4) as u32); // data_size
+
     let mut m = RspMachine::new(&mut rdram);
     for i in 0..0x40usize {
         m.dmem.as_bytes_mut()[0xFC0 + i] = m.rdram[task + i];
     }
     // DMA the ucode_data image (0xF80 bytes) into DMEM 0x0000.
-    let ucode_data = 0x2000usize;
     for i in 0..0xF80usize {
         m.dmem.as_bytes_mut()[i] = m.rdram.get(ucode_data + i).copied().unwrap_or(0);
     }
@@ -59,9 +94,27 @@ fn main() {
         }
         let idx = ((pc.wrapping_sub(base)) / 4) as usize;
         if idx >= n {
+            println!("UNMAPPED jump target pc=0x{pc:04X} (idx {idx} >= n {n})");
             break RspExitReason::UnhandledJumpTarget;
         }
         let instr = decode(words[idx], pc);
+        // Optional per-command-fetch / dispatch trace (RSP_TRACE_DISPATCH=1):
+        // aspMain's command loop fetches at 0x1058 and dispatches via `jr r2`
+        // at 0x1080; logging r2 there shows whether the jump-table lookup lands
+        // on a valid handler (the DMEM-swizzle / base bugs both show up here).
+        if std::env::var_os("RSP_TRACE_DISPATCH").is_some() {
+            if pc == 0x1058 {
+                println!(
+                    "FETCH sp=0x{:03X} cmd_w0=0x{:08X} count(r30)={}",
+                    m.reg(29),
+                    m.load_w(m.reg(29)),
+                    m.reg(30) as i32
+                );
+            }
+            if pc == 0x1080 {
+                println!("DISPATCH jr r2 -> 0x{:04X}", m.reg(2) & 0x1FFF);
+            }
+        }
         let delay = if idx + 1 < n {
             Some(decode(words[idx + 1], pc + 4))
         } else {
@@ -270,6 +323,9 @@ fn run_delay(m: &mut RspMachine, delay: Option<Instr>) {
         Some(Instr::Shift { op, rd, rt, sa }) => exec_shift(m, op, rd, rt, sa as u32, None),
         Some(Instr::ShiftVar { op, rd, rt, rs }) => exec_shift(m, op, rd, rt, 0, Some(rs)),
         Some(Instr::Lui { rt, imm }) => m.set_reg(rt, (imm as u32) << 16),
+        // A COP0 status read in a delay slot (the DMA-busy wait loops do exactly
+        // this: `bnez a0,.. ; mfc0 a0,SP_DMA_BUSY`) — model as 0 like the emitter.
+        Some(Instr::Mfc0 { rt, .. }) => m.set_reg(rt, 0),
         Some(Instr::Load { op, rt, base, off }) => exec_load(m, op, rt, base, off),
         Some(Instr::Store { op, rt, base, off }) => exec_store(m, op, rt, base, off),
         Some(Instr::Mtc0 { rt, cop0 }) => exec_mtc0(m, rt, cop0),

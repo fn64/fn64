@@ -77,7 +77,7 @@ fn main() -> ExitCode {
             let base = args
                 .get(3)
                 .map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap())
-                .unwrap_or(0x1080);
+                .unwrap_or(0x1000);
             let mut hist: BTreeMap<String, usize> = BTreeMap::new();
             let mut unknown: Vec<(u32, u32)> = Vec::new();
             for (i, &w) in words.iter().enumerate() {
@@ -116,7 +116,7 @@ fn main() -> ExitCode {
             let base = args
                 .get(4)
                 .map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap())
-                .unwrap_or(0x1080);
+                .unwrap_or(0x1000);
             print!("{}", emit_module(&words, base, fn_name));
             ExitCode::SUCCESS
         }
