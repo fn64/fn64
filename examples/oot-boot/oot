@@ -17,6 +17,7 @@
 # FN64_NATIVE_RECOMP=1 selects the crate at NATIVE_RECOMPILED_DIR. The native
 # manifest links the out-of-tree audio ucode by default; OOT_SKIP_AUDIO_UCODE=1
 # remains an explicit render-iteration speed switch.
+# FN64_RENDER=rt64 enables the feature-gated RT64 static backend build.
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -32,6 +33,10 @@ export NATIVE_RECOMPILED_DIR="${NATIVE_RECOMPILED_DIR:-/tmp/fn64-native-oot}"
 BIN="$FN64/examples/oot-boot/target/release/oot-boot"
 
 build() {
+  local features=()
+  if [[ "${FN64_RENDER:-reference}" == "rt64" ]]; then
+    features+=(--features rt64)
+  fi
   if [[ "${FN64_NATIVE_RECOMP:-0}" == "1" ]]; then
     # The native-only manifest reuses this harness's build.rs/main.rs and its
     # build-only audio adapter, so the generated ucode resolves fn64-audio from
@@ -43,9 +48,10 @@ build() {
     fi
     ln -sfn "$NATIVE_RECOMPILED_DIR" "$native_link" || exit 1
     CARGO_TARGET_DIR="$FN64/examples/oot-boot/target" \
-      cargo build --manifest-path "$FN64/examples/oot-boot/native/Cargo.toml" --release -q || exit 1
+      cargo build --manifest-path "$FN64/examples/oot-boot/native/Cargo.toml" \
+        --release -q "${features[@]}" || exit 1
   else
-    ( cd "$FN64/examples/oot-boot" && cargo build --release -q ) || exit 1
+    ( cd "$FN64/examples/oot-boot" && cargo build --release -q "${features[@]}" ) || exit 1
   fi
 }
 
