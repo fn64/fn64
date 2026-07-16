@@ -21,6 +21,11 @@
 //! OOT_CONFIG=<oot.toml> OOT_ROM=<oot.z64> recompile_rom
 //! ```
 //!
+//! When `--profile`/`NATIVE_RECOMP_PROFILE` is absent, the driver loads a
+//! sibling `profile.toml` if one exists. This keeps the mechanical one-command
+//! lane profile-aware while preserving bare N64Recomp configs that have no
+//! companion profile.
+//!
 //! The config and ROM live OUT-OF-TREE (game-derived content); this binary
 //! only ever reads their paths from args/env, never vendoring them.
 
@@ -71,7 +76,8 @@ fn main() -> std::process::ExitCode {
         rom.len()
     );
 
-    let force_recompile = match args.profile.as_deref() {
+    let profile = resolve_profile_path(&args.config, args.profile, |path| path.is_file());
+    let force_recompile = match profile.as_deref() {
         Some(path) => match load_force_recompile(path) {
             Ok(names) => {
                 eprintln!(
@@ -113,7 +119,8 @@ fn main() -> std::process::ExitCode {
 
 const USAGE: &str = "usage: recompile_rom --config <oot.toml> --rom <oot.z64> [--out <dir>] \
                      [--profile <profile.toml>]\n\
-                     env fallbacks: OOT_CONFIG, OOT_ROM, OOT_OUT, NATIVE_RECOMP_PROFILE";
+                     env fallbacks: OOT_CONFIG, OOT_ROM, OOT_OUT, NATIVE_RECOMP_PROFILE; \
+                     otherwise loads sibling profile.toml when present";
 
 struct Args {
     config: PathBuf,
@@ -149,6 +156,17 @@ impl Args {
             profile,
         })
     }
+}
+
+fn resolve_profile_path(
+    config: &std::path::Path,
+    explicit: Option<PathBuf>,
+    exists: impl FnOnce(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    explicit.or_else(|| {
+        let sibling = config.with_file_name("profile.toml");
+        exists(&sibling).then_some(sibling)
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -759,6 +777,28 @@ fn read_func_words(rom: &[u8], section: &Section, func: &Function) -> Option<Vec
 mod tests {
     use super::*;
     use fn64_recomp::Patches;
+
+    #[test]
+    fn absent_profile_flag_discovers_sibling_profile() {
+        let config = std::path::Path::new("/games/OOTU/oot.toml");
+        let expected = PathBuf::from("/games/OOTU/profile.toml");
+
+        let resolved = resolve_profile_path(config, None, |path| path == expected);
+
+        assert_eq!(resolved, Some(expected));
+    }
+
+    #[test]
+    fn explicit_profile_overrides_sibling_discovery() {
+        let config = std::path::Path::new("/games/OOTU/oot.toml");
+        let explicit = PathBuf::from("/profiles/alternate.toml");
+
+        let resolved = resolve_profile_path(config, Some(explicit.clone()), |_| {
+            panic!("explicit profile must bypass sibling discovery")
+        });
+
+        assert_eq!(resolved, Some(explicit));
+    }
 
     #[test]
     fn modeled_cop0_count_and_compare_are_not_runtime_traps() {
