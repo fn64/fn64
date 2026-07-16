@@ -15,3 +15,10 @@ rt64 = []
 [dependencies]
 fn64-runtime = { path = "../fn64-runtime" }
 fn64-render = { path = "../fn64-render" }
+
+[dev-dependencies]
+# Snapshot testing for render output. A render test captures a STRUCTURAL
+# digest (dims, tri count, non-clear pixel count, framebuffer hash) as a
+# reviewable snapshot; `cargo insta review` blesses an intentional render
+# change instead of hand-editing a golden. No giant PNG committed.
+insta = "1"
