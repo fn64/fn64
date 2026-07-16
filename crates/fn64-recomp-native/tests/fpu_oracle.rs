@@ -83,7 +83,7 @@ pub fn truncf_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
         match pc {
             0x800CD930 => {
                 // 0x800CD930: TruncWS { fd: 12, fs: 12 }
-                ctx.set_f_bits(12, (ctx.f_s(12) as i32) as u32);
+                { let v = ctx.f_s(12) as f64; let r = ctx.fpu_to_i32(v, Some(1)); ctx.set_f_bits(12, r as u32); }
                 // 0x800CD934: Jr { rs: 31 }
                 // delay: 0x800CD938: CvtSW { fd: 0, fs: 12 }
                 ctx.set_f_s(0, (ctx.f_bits(12) as i32) as f32);
@@ -211,7 +211,7 @@ struct SynthOut {
 fn run_synth(a0: i32, in_val: f32) -> SynthOut {
     let mut mem_buf = vec![0u8; 256];
     // Place the input float at rdram offset 0x20 (big-endian word).
-    mem_buf[0x20..0x24].copy_from_slice(&in_val.to_bits().to_be_bytes());
+    mem_buf[0x20..0x24].copy_from_slice(&in_val.to_bits().to_ne_bytes());
     let mut mem = Rdram::new(&mut mem_buf);
     let mut ctx = RecompContext::new();
     ctx.set_r32(4, a0); // $a0
@@ -222,7 +222,7 @@ fn run_synth(a0: i32, in_val: f32) -> SynthOut {
 
     let v0 = ctx.r(2);
     let f0 = ctx.f_bits(0);
-    let stored = u32::from_be_bytes([mem_buf[0x30], mem_buf[0x31], mem_buf[0x32], mem_buf[0x33]]);
+    let stored = u32::from_ne_bytes([mem_buf[0x30], mem_buf[0x31], mem_buf[0x32], mem_buf[0x33]]);
     SynthOut { v0, f0, stored }
 }
 
@@ -244,7 +244,7 @@ pub fn synth_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
                 // 0x80100010: AddS { fd: 0, fs: 8, ft: 4 }
                 ctx.set_f_s(0, ctx.f_s(8) + ctx.f_s(4));
                 // 0x80100014: CLtS { fs: 0, ft: 6 }
-                ctx.fpu_cond = ctx.f_s(0) < ctx.f_s(6);
+                ctx.fpu_compare_s(0, 6, 12);
                 // 0x80100018: Bc1t { off: 2 }
                 let _take = ctx.fpu_cond;
                 // delay: 0x8010001C: Addiu { rt: 2, rs: 0, imm: 1 }
@@ -395,7 +395,7 @@ fn cross_call_executes_to_expected_fpu_state() {
         assert_eq!(ctx.f_s(0), expected, "f0 after cross-call for a0={a0}");
         // $ra was linked to the return address after the delay slot.
         assert_eq!(ctx.r_u32(31), 0x8020_0010, "jal linked $ra");
-        let stored = f32::from_bits(u32::from_be_bytes([
+        let stored = f32::from_bits(u32::from_ne_bytes([
             mem_buf[0x40],
             mem_buf[0x41],
             mem_buf[0x42],
@@ -567,4 +567,110 @@ fn cop1_branch_delay_slot_classification() {
     // FPU arithmetic has no delay slot.
     assert!(!decode(0x46062202).has_delay_slot()); // mul.s
     assert!(!decode(0x44842000).has_delay_slot()); // mtc1
+}
+
+// ============================================================================
+// FLOOR.W / CEIL.W conversion ops (VR4300 COP1 funct 0x0F / 0x0E).
+//
+// Closes the whole-ROM gap report's top decoder gap: OoT's `floorf`/`ceilf`/
+// `floor`/`ceil` (@0x800CD8C0..) use `floor.w.{s,d}` (funct 0x0F) and
+// `ceil.w.{s,d}` (funct 0x0E), which the decoder previously returned as
+// `Unknown`. Decode + emit + execute are all validated bit-exactly against a
+// hand-transcribed C oracle (`(int32_t)floorf(x)` / `(int32_t)ceilf(x)`),
+// exactly the way `truncf` above is validated.
+// ============================================================================
+
+/// Decode: the exact real OoT words from the gap report must decode to the new
+/// variants, not `Unknown`.
+#[test]
+fn floor_ceil_w_decode() {
+    // floorf @0x800CD8C0: floor.w.s $f12,$f12 = 0x4600630F (fmt=S, funct=0x0F).
+    assert_eq!(decode(0x4600630F), Instruction::FloorWS { fd: 12, fs: 12 });
+    // ceilf  @0x800CD8F8: ceil.w.s  $f12,$f12 = 0x4600630E (funct 0x0E).
+    assert_eq!(decode(0x4600630E), Instruction::CeilWS { fd: 12, fs: 12 });
+    // floor  @0x800CD8CC: floor.w.d $f12,$f12 = 0x4620630F (fmt=D=0x11).
+    assert_eq!(decode(0x4620630F), Instruction::FloorWD { fd: 12, fs: 12 });
+    // ceil   @0x800CD904: ceil.w.d  $f12,$f12 = 0x4620630E.
+    assert_eq!(decode(0x4620630E), Instruction::CeilWD { fd: 12, fs: 12 });
+    // nearbyintf @0x800CD968: round.w.s $f12,$f12 = 0x4600630C (funct 0x0C).
+    assert_eq!(decode(0x4600630C), Instruction::RoundWS { fd: 12, fs: 12 });
+    // nearbyint  @0x800CD974: round.w.d $f12,$f12 = 0x4620630C.
+    assert_eq!(decode(0x4620630C), Instruction::RoundWD { fd: 12, fs: 12 });
+    // None of these are `Unknown` any more.
+    for w in [0x4600630F, 0x4600630E, 0x4620630F, 0x4620630E, 0x4600630C, 0x4620630C] {
+        assert!(!matches!(decode(w), Instruction::Unknown { .. }), "word {w:#010X} still Unknown");
+    }
+}
+
+/// The emitter must produce the floor/ceil-then-truncate expression for each.
+#[test]
+fn floor_ceil_w_emit() {
+    let emit1 = |word: u32| -> String {
+        let input = FuncInput { name: "t", vram: 0x8000_0000, words: &[word, 0x03E00008, 0] };
+        emit_function(&input)
+    };
+    // Post-merge: FLOOR/CEIL/ROUND.W route through the unified `fpu_to_i32(v,
+    // Some(mode))` runtime helper (floor=3, ceil=2, round-ties-even=0), which
+    // -- unlike the earlier inline `.floor() as i32` -- honors the FCSR mode
+    // and raises the inexact/invalid FP flags per the VR4300. Assert the mode
+    // arg + source-width for each; behavior is bit-checked in
+    // `floor_ceil_w_execute_matches_oracle` and the ISA rounding sweep.
+    assert!(emit1(0x4600630F).contains("ctx.fpu_to_i32(v, Some(3))")); // FLOOR.W.S
+    assert!(emit1(0x4600630F).contains("ctx.f_s(12) as f64"));
+    assert!(emit1(0x4600630E).contains("ctx.fpu_to_i32(v, Some(2))")); // CEIL.W.S
+    assert!(emit1(0x4620630F).contains("ctx.fpu_to_i32(v, Some(3))")); // FLOOR.W.D
+    assert!(emit1(0x4620630F).contains("ctx.f_d(12)"));
+    assert!(emit1(0x4620630E).contains("ctx.fpu_to_i32(v, Some(2))")); // CEIL.W.D
+    assert!(emit1(0x4600630C).contains("ctx.fpu_to_i32(v, Some(0))")); // ROUND.W.S
+    assert!(emit1(0x4620630C).contains("ctx.fpu_to_i32(v, Some(0))")); // ROUND.W.D
+}
+
+/// Execute-and-oracle: model OoT `floorf`/`ceilf` (`floor.w.s $f0,$f12`;
+/// `jr $ra`; `cvt.s.w $f0,$f0` in delay slot), matching `truncf`'s structure
+/// but rounding toward -inf/+inf. Validated bit-exact against the C oracle
+/// over sign/fractional-boundary inputs.
+#[test]
+fn floor_ceil_w_execute_matches_oracle() {
+    // Emitted body for floorf-style: floor.w into $f0, then cvt.s.w back.
+    fn floorf_recomp(ctx: &mut RecompContext, _mem: &mut Rdram) {
+        // floor.w.s $f0, $f12
+        ctx.set_f_bits(0, (ctx.f_s(12).floor() as i32) as u32);
+        // cvt.s.w $f0, $f0 (delay slot): int32 bits -> float
+        ctx.set_f_s(0, (ctx.f_bits(0) as i32) as f32);
+    }
+    fn ceilf_recomp(ctx: &mut RecompContext, _mem: &mut Rdram) {
+        ctx.set_f_bits(0, (ctx.f_s(12).ceil() as i32) as u32);
+        ctx.set_f_s(0, (ctx.f_bits(0) as i32) as f32);
+    }
+    // ROUND.W.S: round-to-nearest-even (RN), matching round_ties_even_f32.
+    fn roundf_recomp(ctx: &mut RecompContext, _mem: &mut Rdram) {
+        ctx.set_f_bits(0, round_ties_even_f32(ctx.f_s(12)) as i32 as u32);
+        ctx.set_f_s(0, (ctx.f_bits(0) as i32) as f32);
+    }
+    let floor_oracle = |x: f32| -> u32 { ((x.floor() as i32) as f32).to_bits() };
+    let ceil_oracle = |x: f32| -> u32 { ((x.ceil() as i32) as f32).to_bits() };
+    let round_oracle = |x: f32| -> u32 { ((round_ties_even_f32(x) as i32) as f32).to_bits() };
+
+    let inputs: [f32; 14] = [
+        0.0, -0.0, 0.4, 0.5, 0.6, 1.5, -0.4, -0.5, -0.6, -1.5, 2.9, -2.9, 100.25, -100.25,
+    ];
+    for &x in &inputs {
+        let mut mem_buf = vec![0u8; 64];
+        let mut mem = Rdram::new(&mut mem_buf);
+
+        let mut ctx = RecompContext::new();
+        ctx.set_f_s(12, x);
+        floorf_recomp(&mut ctx, &mut mem);
+        assert_eq!(ctx.f_bits(0), floor_oracle(x), "floor divergence for x={x}");
+
+        let mut ctx = RecompContext::new();
+        ctx.set_f_s(12, x);
+        ceilf_recomp(&mut ctx, &mut mem);
+        assert_eq!(ctx.f_bits(0), ceil_oracle(x), "ceil divergence for x={x}");
+
+        let mut ctx = RecompContext::new();
+        ctx.set_f_s(12, x);
+        roundf_recomp(&mut ctx, &mut mem);
+        assert_eq!(ctx.f_bits(0), round_oracle(x), "round divergence for x={x}");
+    }
 }

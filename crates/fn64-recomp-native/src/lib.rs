@@ -26,10 +26,10 @@
 //! it is a drop-in alternative to the adapter. It is validated against the
 //! N64Recomp C oracle on a real MIPS function (see the crate tests).
 //!
-//! What remains for full CPU coverage is listed at the bottom of this doc and
-//! in the task report: COP1 (FPU), the 64-bit doubleword ops (DADD/DSLL/LD/SD/
-//! LDL…), COP0 system control, and the ELF/symbol-table front-end that turns a
-//! whole `RecompConfig` into a module of functions with resolved call targets.
+//! The byte-cited distinction between encoding coverage and full architectural
+//! execution is maintained in `crates/fn64-recomp-native/ISA-COVERAGE.md`.
+//! Ordinary integer/control-flow/memory paths are covered; full COP1 floating
+//! environment and privileged exception/MMU effects remain explicitly partial.
 #![forbid(unsafe_code)]
 
 pub mod decoder;
@@ -41,9 +41,10 @@ pub use decoder::{decode, Instruction};
 pub use emit::{
     emit_function, emit_function_resolved, CallResolver, CallTarget, FuncInput, NullResolver,
 };
-pub use module::{emit_module, ModuleFunc, SymbolTable};
+pub use module::{emit_lookup_dispatcher, emit_module, ModuleFunc, SymbolTable};
 pub use runtime::{
-    round_ties_even_f32, round_ties_even_f64, Rdram, RecompContext, RDRAM_LEN, RDRAM_VBASE,
+    resolve_host_function, round_ties_even_f32, round_ties_even_f64, set_host_lookup, HostLookup,
+    Rdram, RecompContext, RecompFunc, RDRAM_LEN, RDRAM_VBASE,
 };
 
 use fn64_recomp::{AbiVersion, RecompConfig, RecompError, RecompOutput, Recompiler, RspConfig};
@@ -106,10 +107,10 @@ impl Recompiler for NativeRecompiler {
         body.push_str(
             "// Whole-program: inter-function JAL/J resolve to direct Rust calls where known.\n",
         );
-        body.push_str("#![allow(clippy::all)]\n");
+        body.push_str("#![allow(clippy::all, unused, non_snake_case)]\n");
         body.push_str("#[allow(unused_imports)]\n");
         body.push_str(
-            "use fn64_recomp_native::{RecompContext, Rdram, round_ties_even_f32, round_ties_even_f64};\n\n",
+            "use fn64_recomp_native::{resolve_host_function, RecompContext, RecompFunc, Rdram, round_ties_even_f32, round_ties_even_f64};\n\n",
         );
 
         let mut recompiled = Vec::new();
@@ -135,6 +136,8 @@ impl Recompiler for NativeRecompiler {
                 recompiled.push(func.name.clone());
             }
         }
+
+        body.push_str(&module::emit_lookup_dispatcher(&symbols));
 
         let out_path = cfg.output_func_path.join("funcs.rs");
         Ok(RecompOutput {

@@ -30,6 +30,12 @@ at) — not a tracker label. Updated 2026-07-15.
 ### Recompilers (both from-scratch, typed Rust, no external tool, no GPL)
 - **CPU** `fn64-recomp-native`: MIPS III + COP1/FPU + 64-bit dword + COP0 +
   ELF/symbol front-end. Oracle-validated (differential vs N64Recomp C).
+- **CPU whole-ROM link gate:** OoT emits as one typed-Rust module with 13,190
+  native functions, a sorted safe `vram -> fn` table, and 43 trap bodies held
+  behind a host resolver. A clean out-of-tree build links and calls the native
+  entrypoint with no unresolved game/project symbol. The dispatcher ABI shape
+  follows the MIT N64Recomp `LOOKUP_FUNC`/`get_function` contract
+  (`refs/N64RecompSource/include/recomp.h:443-451`).
 - **RSP audio** `fn64-audio`: all 44 canonical non-reserved VU compute ops,
   all 23 manual vector loads/stores, the exact 48-op SU subset, COP0, and
   general delay-slot/indirect-jump/overlay dispatch. aspMain
@@ -68,14 +74,45 @@ Ordered by leverage, from ground-truth on the reachable file-select 3D scene
 (`/tmp/fn64-depth-nodepth-opaque.png`: recognizable green field + flowers +
 road, but the top half misprojects).
 
-1. **Projection on large-world scenes (SECOND projection bug).** The
-   file-select scene projects only ~8.9% of verts in-frustum; `pz` swings
-   ±4000, many with negative `w`, when camera (~world 3263,694,5674) and
-   objects (~-4000) both carry large translations. The transpose fix handled
-   simple frames; this doesn't. Prime suspects: fixed-point `read_mtx`
-   int-half precision for large translation values, or MVP accumulation with
-   big camera offsets. **Highest leverage — texturing garbage geometry buys
-   nothing.**
+1. **Hyrule Field title-camera projection — the claimed raw-eye matrix bug was
+   falsified by writer tracing (2026-07-16).** Physical `0x1888c8` is written
+   only by recompiled `guMtxF2L` (`funcs_57.c:3275-3344`), called by recompiled
+   `guLookAt` at `funcs_57.c:4368`. Immediately before conversion, recompiled
+   `guLookAtF` writes its translation at `funcs_57.c:4166,4251,4280`. The
+   traced inputs are eye `(-4000,-1,5228)`, at `(-4083,10,5263)`, and up
+   `(0.111461,0.992645,-0.0470212)`, supplied unchanged through
+   `Camera_Demo1` (`funcs_15.c:367-379`) → `Camera_Update`
+   (`funcs_15.c:13254`) → `View_LookAt` → `View_ApplyPerspective`
+   (`funcs_35.c:2661`). For that eye and the emitted basis, the three negated
+   dot products are exactly `(3262.99,694.05,5674.78)`. The matrix maps the
+   traced eye to the view-space origin, so it is a valid `guLookAt` view—not a
+   camera-to-world matrix. The proposed `(6496.7,-786,-711.7)` rewrite computes
+   `-translation·basis`, treating the existing translation as a second eye;
+   it moves the camera and therefore cannot validate this path. Its higher
+   76.5% loaded-vertex in-frustum ratio and recognizable overview are an
+   alternate camera view, while 8.8% is not by itself a correctness oracle
+   because the display list loads off-screen geometry. Regression
+   `hyrule_field_live_gu_look_at_translation_matches_traced_eye` locks the
+   exact traced invariant and fails under that rewrite. The remaining visual
+   artifact is **not yet root-caused**; do not resume from the discarded
+   raw-eye premise.
+
+   The source-to-generated-code cross-check agrees at every boundary:
+   `Camera_Demo1` copies the spline eye into `camera->eye` at
+   `z_camera.c:5860-5884` (`funcs_15.c:367,375,379`); `Camera_Update` passes
+   the derived eye/at/up to `View_LookAt` at `z_camera.c:8259-8265`
+   (`funcs_15.c:13254`); `View_LookAt` copies those values into `View` at
+   `z_view.c:84-92` (`funcs_35.c:1122-1159`); and
+   `View_ApplyPerspective` calls `guLookAt` and submits that matrix at
+   `z_view.c:371-406` (`funcs_35.c:2661`). The expected float writer is
+   `lookat.c:39-57`: its three translation expressions at lines 42, 47, and
+   52 correspond to `funcs_57.c:4166,4251,4280` and produce
+   `(3262.99,694.05,5674.78)`. The wrapper at `lookat.c:60-65` then calls the
+   expected fixed-point writer `guMtxF2L` (`funcs_57.c:4368`), whose stores at
+   `funcs_57.c:3275,3281,3340,3344` implement the packing loop in
+   `mtxutil.c:3-19`. Finally, `z_play.c:1173-1188` reads the already-written
+   viewing matrix to derive separate billboard data; it does not overwrite
+   the projection-stack view slot.
 2. **G_SETOTHERMODE_L/H** — currently *not even decoded* (name-table only). No
    blend/render-mode/alpha state exists. Gates alpha-test + blending.
 3. **Alpha-test** (alpha compare) — fixes black-box-around-cutouts on
@@ -92,8 +129,33 @@ road, but the top half misprojects).
   partial; G_SETZIMG/SETCIMG/TEXRECT stubs.
 - Process-exit teardown panic (`_Fault_ThreadEntry`/`panic_cannot_unwind`
   during executor drop) — pre-existing, audio-independent, cosmetic.
+- Native-Rust boot currently executes the typed OoT entrypoint through the
+  dispatcher and reaches the first host-owned boundary, `__osGetSR` at
+  `0x80003430`. Both direct JAL and computed JALR calls to omitted trap bodies
+  take `lookup(vram)`, which asks the thread-local host resolver before its
+  native table and otherwise fails loudly. Completing this path requires safe
+  typed adapters for the missing COP0/exception services (starting with
+  `__osGetSR`), sharing the native context/RDRAM model with the executor, and
+  selecting the Rust module in `examples/oot-boot` instead of its C bridge.
 
 ---
+
+## 🔲 Whole-ROM native recompile (task #28 — the "recomp done" milestone, IN PROGRESS)
+fn64-recomp-native (from-scratch Rust MIPS→typed-Rust recompiler) can now recompile
+the WHOLE OoT ROM. Driver `recompile_rom` + config loader (`fn64-recomp/src/load.rs`,
+loads all 472 sections / 13,358 fns from oot.toml+dump.toml) landed on
+`feat/native-whole-rom-driver`. Gap report over the full ROM:
+- **13,188 clean (98.73%)**, 99.06% compilable. Emitted funcs.rs = 122MB / 2.44M lines
+  of typed Rust (the whole ROM). 0 ROM-range errors.
+- FPU conversion gaps (FLOOR.W/CEIL.W/ROUND.W) FOUND + CLOSED with oracle tests.
+- 45 runtime-traps (cop0/break/tlb/eret — libultra/OS fns; should defer to fn64 shims,
+  not the panic-bodies) + 124 config-stubs.
+- 1 unknown-opcode left = `rspbootTextStart` (an RSP blob mislisted as CPU — config-stub).
+- **The ONE real link blocker: the `lookup(u32)->fn` indirect dispatcher** (2,078 call
+  sites, empirically the ONLY undefined symbol). = N64Recomp's `get_function(vram)`.
+  Building it (branch `feat/native-lookup-dispatcher`) is what makes the whole module LINK.
+Remaining to "OoT boots on native Rust": dispatcher → link (0 undefined) → shim-seam for
+the 45 OS fns → boot on funcs.rs instead of the N64Recomp C files.
 
 ## 🔲 Beyond OoT (deferred until it renders faithfully)
 - Generalize the pipeline: fn64 owns discover→decomp→recomp→run generically

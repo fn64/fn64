@@ -29,7 +29,10 @@
 //!    address falls back to an indirect `lookup()`, matching N64Recomp's
 //!    `resolve_jal` Match-vs-Ambiguous decision.
 
-use fn64_recomp_native::{emit_module, ModuleFunc, Rdram, RecompContext, SymbolTable};
+use fn64_recomp_native::{
+    emit_module, resolve_host_function, set_host_lookup, ModuleFunc, Rdram, RecompContext,
+    RecompFunc, SymbolTable,
+};
 
 // --- The synthetic three-function "program" (real MIPS III encodings). ---
 //
@@ -68,15 +71,9 @@ fn synthetic_module() -> String {
 //
 // `emit_module_matches_golden` guarantees the live emitter still produces
 // exactly this, so executing it below really executes the front-end's product.
-// A `lookup` shim stands in for the runtime function-pointer dispatch the
-// emitter falls back to for unknown targets; here every target is resolved to a
-// direct call, so `lookup` is never actually reached (a call to it panics,
-// proving the direct path was taken).
-
-#[allow(dead_code)]
-fn lookup(addr: u32) -> fn(&mut RecompContext, &mut Rdram) {
-    panic!("indirect lookup({addr:#010X}) reached: a KNOWN target should have been a direct call");
-}
+// The dispatcher at the bottom is also pasted verbatim from the golden. The
+// direct-call tests inspect their emitted bodies so the dispatcher's own
+// definition/table do not masquerade as an indirect call site.
 
 #[allow(unused_variables, unused_mut, unused_labels, clippy::all)]
 pub fn callee(ctx: &mut RecompContext, mem: &mut Rdram) {
@@ -138,6 +135,23 @@ pub fn tail_caller(ctx: &mut RecompContext, mem: &mut Rdram) {
     }
 }
 
+// Safe LOOKUP_FUNC/get_function equivalent: sorted vram -> typed fn table.
+static LOOKUP_TABLE: &[(u32, RecompFunc)] = &[
+    (0x80001000, callee as RecompFunc),
+    (0x80002000, caller as RecompFunc),
+    (0x80003000, tail_caller as RecompFunc),
+];
+
+pub fn lookup(vram: u32) -> RecompFunc {
+    if let Some(func) = resolve_host_function(vram) {
+        return func;
+    }
+    match LOOKUP_TABLE.binary_search_by_key(&vram, |(addr, _)| *addr) {
+        Ok(index) => LOOKUP_TABLE[index].1,
+        Err(_) => panic!("lookup: no native function or host shim at vram {vram:#010X}"),
+    }
+}
+
 /// The live `emit_module` output must be byte-identical to the pasted golden,
 /// keeping the executed functions honest (they are copied from this golden).
 #[test]
@@ -194,8 +208,8 @@ fn known_target_is_direct_unknown_is_lookup() {
     let known = synthetic_module();
     assert!(known.contains("callee(ctx, mem);"), "known JAL must emit a direct call");
     assert!(
-        !known.contains("lookup("),
-        "no indirect lookup should appear when every target is a known symbol:\n{known}"
+        !known.contains("            lookup("),
+        "no indirect lookup CALL should appear when every target is a known symbol:\n{known}"
     );
 
     // Unknown-target module: caller JALs 0x80009000, which is NOT in the table.
@@ -209,4 +223,32 @@ fn known_target_is_direct_unknown_is_lookup() {
         unknown.contains("lookup(0x80009000)(ctx, mem);"),
         "unknown JAL target must emit an indirect lookup:\n{unknown}"
     );
+}
+
+#[test]
+fn generated_lookup_resolves_native_function() {
+    let mut bytes = [0u8; 64];
+    let mut mem = Rdram::new(&mut bytes);
+    let mut ctx = RecompContext::new();
+    lookup(CALLEE_VRAM)(&mut ctx, &mut mem);
+    assert_eq!(ctx.r(2), 42);
+}
+
+fn host_callee(ctx: &mut RecompContext, _mem: &mut Rdram) {
+    ctx.set_r32(2, 99);
+}
+
+fn host_resolver(vram: u32) -> Option<RecompFunc> {
+    (vram == CALLEE_VRAM).then_some(host_callee as RecompFunc)
+}
+
+#[test]
+fn host_lookup_overrides_native_table_without_unsafe() {
+    let previous = set_host_lookup(Some(host_resolver));
+    let mut bytes = [0u8; 64];
+    let mut mem = Rdram::new(&mut bytes);
+    let mut ctx = RecompContext::new();
+    lookup(CALLEE_VRAM)(&mut ctx, &mut mem);
+    set_host_lookup(previous);
+    assert_eq!(ctx.r(2), 99);
 }
