@@ -91,6 +91,10 @@ struct AutoDump {
     prefix: String,
     /// How many gfx tasks have been processed (the PNG index).
     task_index: u64,
+    /// Do not write PNGs for tasks before this index. The task counter still
+    /// advances, so a long-running harness can capture a bounded late window
+    /// without flooding the output directory with boot frames.
+    skip_before_task: u64,
     /// How many non-clear PNGs have actually been written.
     written: u64,
     /// Stop dumping after this many non-clear frames (avoid flooding /tmp on
@@ -132,9 +136,23 @@ impl ReferenceBackend {
             dir: dir.into(),
             prefix: prefix.into(),
             task_index: 0,
+            skip_before_task: 0,
             written: 0,
             limit,
         });
+        self
+    }
+
+    /// Start auto-dumping at gfx task index `first_task`.
+    ///
+    /// Call this after [`Self::with_auto_dump`]. Tasks before the requested
+    /// index are still rendered and written back to guest RDRAM; only their
+    /// diagnostic PNG output is suppressed.
+    pub fn with_auto_dump_skip(mut self, first_task: u64) -> Self {
+        self.auto_dump
+            .as_mut()
+            .expect("with_auto_dump_skip requires with_auto_dump first")
+            .skip_before_task = first_task;
         self
     }
 
@@ -284,6 +302,9 @@ impl RenderBackend for ReferenceBackend {
         if let Some(dump) = self.auto_dump.as_mut() {
             let idx = dump.task_index;
             dump.task_index += 1;
+            if idx < dump.skip_before_task {
+                return Ok(FrameStatus::Complete);
+            }
             let [cr, cg, cb, ca] = self.clear_color;
             let non_clear = fb.has_non_uniform_content(cr, cg, cb, ca);
             if !non_clear {
@@ -491,5 +512,17 @@ mod tests {
             .process_task(&mut rdram, &OsTask::default(), 0)
             .unwrap_err();
         assert!(matches!(err, RenderError::NotReady(_)));
+    }
+
+    #[test]
+    fn reference_backend_auto_dump_can_skip_to_a_late_task_window() {
+        let backend = ReferenceBackend::new()
+            .with_auto_dump("/tmp", "fn64-render-test", 3)
+            .with_auto_dump_skip(4_180);
+        let dump = backend.auto_dump.unwrap();
+        assert_eq!(dump.task_index, 0);
+        assert_eq!(dump.skip_before_task, 4_180);
+        assert_eq!(dump.written, 0);
+        assert_eq!(dump.limit, 3);
     }
 }

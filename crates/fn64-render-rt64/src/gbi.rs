@@ -3861,11 +3861,18 @@ mod tests {
         ];
         let eye = [-4000.0, -1.0, 5228.0];
 
-        for (c, translation) in view[3][..3].iter().enumerate() {
+        for (c, (((&basis_x, &basis_y), &basis_z), &translation)) in view[0]
+            .iter()
+            .zip(view[1].iter())
+            .zip(view[2].iter())
+            .zip(view[3].iter())
+            .take(3)
+            .enumerate()
+        {
             let expected_translation =
-                -(eye[0] * view[0][c] + eye[1] * view[1][c] + eye[2] * view[2][c]);
+                -(eye[0] * basis_x + eye[1] * basis_y + eye[2] * basis_z);
             assert!(
-                (*translation - expected_translation).abs() < 0.1,
+                (translation - expected_translation).abs() < 0.1,
                 "translation[{c}] must be -(eye · basis[{c}]): got {}, expected {expected_translation}",
                 translation
             );
