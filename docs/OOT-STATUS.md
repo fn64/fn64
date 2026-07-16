@@ -30,6 +30,12 @@ at) — not a tracker label. Updated 2026-07-15.
 ### Recompilers (both from-scratch, typed Rust, no external tool, no GPL)
 - **CPU** `fn64-recomp-native`: MIPS III + COP1/FPU + 64-bit dword + COP0 +
   ELF/symbol front-end. Oracle-validated (differential vs N64Recomp C).
+- **CPU whole-ROM link gate:** OoT emits as one typed-Rust module with 13,190
+  native functions, a sorted safe `vram -> fn` table, and 43 trap bodies held
+  behind a host resolver. A clean out-of-tree build links and calls the native
+  entrypoint with no unresolved game/project symbol. The dispatcher ABI shape
+  follows the MIT N64Recomp `LOOKUP_FUNC`/`get_function` contract
+  (`refs/N64RecompSource/include/recomp.h:443-451`).
 - **RSP audio** `fn64-audio`: 46 VU ops + scalar + dispatch. aspMain
   recompiles, **runs** (terminates in 112 steps, not the old 5M runaway) and
   **produces PCM**. Verified live in the boot (audio enabled, no hang) and by
@@ -90,6 +96,14 @@ road, but the top half misprojects).
   partial; G_SETZIMG/SETCIMG/TEXRECT stubs.
 - Process-exit teardown panic (`_Fault_ThreadEntry`/`panic_cannot_unwind`
   during executor drop) — pre-existing, audio-independent, cosmetic.
+- Native-Rust boot currently executes the typed OoT entrypoint through the
+  dispatcher and reaches the first host-owned boundary, `__osGetSR` at
+  `0x80003430`. Both direct JAL and computed JALR calls to omitted trap bodies
+  take `lookup(vram)`, which asks the thread-local host resolver before its
+  native table and otherwise fails loudly. Completing this path requires safe
+  typed adapters for the missing COP0/exception services (starting with
+  `__osGetSR`), sharing the native context/RDRAM model with the executor, and
+  selecting the Rust module in `examples/oot-boot` instead of its C bridge.
 
 ---
 
