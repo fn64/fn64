@@ -125,6 +125,14 @@ mod round_trip_tests {
                     exec_alu_reg(m, op, rd, rs, rt);
                     pc += 4;
                 }
+                Instr::Shift { op, rd, rt, sa } => {
+                    exec_shift(m, op, rd, rt, sa as u32, None);
+                    pc += 4;
+                }
+                Instr::ShiftVar { op, rd, rt, rs } => {
+                    exec_shift(m, op, rd, rt, 0, Some(rs));
+                    pc += 4;
+                }
                 Instr::Store {
                     op,
                     rt,
@@ -148,8 +156,11 @@ mod round_trip_tests {
                         crate::rsp::decode::BranchOp::Beq => m.reg(rs) == m.reg(rt),
                         crate::rsp::decode::BranchOp::Bne => m.reg(rs) != m.reg(rt),
                     };
-                    run_delay(m, delay);
-                    pc = if taken { target as u32 } else { pc + 8 };
+                    let next_pc = if taken { target as u32 } else { pc + 8 };
+                    if let Some(reason) = run_delay(m, delay, pc + 4, next_pc) {
+                        return reason;
+                    }
+                    pc = next_pc;
                 }
                 Instr::BranchZ {
                     op,
@@ -168,8 +179,11 @@ mod round_trip_tests {
                     if let Some(ret) = link {
                         m.set_reg(31, ret as u32);
                     }
-                    run_delay(m, delay);
-                    pc = if taken { target as u32 } else { pc + 8 };
+                    let next_pc = if taken { target as u32 } else { pc + 8 };
+                    if let Some(reason) = run_delay(m, delay, pc + 4, next_pc) {
+                        return reason;
+                    }
+                    pc = next_pc;
                 }
                 Instr::Vu {
                     op,
@@ -228,45 +242,193 @@ mod round_trip_tests {
                     }
                     pc += 4;
                 }
+                Instr::Mfc2 { rt, vs, elem } => {
+                    let value = m.mfc2(vs, elem);
+                    m.set_reg(rt, value);
+                    pc += 4;
+                }
+                Instr::Mtc2 { rt, vs, elem } => {
+                    let value = m.reg(rt);
+                    m.mtc2(vs, elem, value);
+                    pc += 4;
+                }
+                Instr::Cfc2 { rt, cd } => {
+                    let value = m.cfc2(cd);
+                    m.set_reg(rt, value);
+                    pc += 4;
+                }
+                Instr::Ctc2 { rt, cd } => {
+                    let value = m.reg(rt);
+                    m.ctc2(cd, value);
+                    pc += 4;
+                }
                 // Control transfers with the delay slot run on the fallthrough
                 // path (well-formed ucode never nests a branch in a delay slot).
                 Instr::Jump { target } => {
-                    run_delay(m, delay);
-                    pc = target as u32;
+                    let next_pc = target as u32;
+                    if let Some(reason) = run_delay(m, delay, pc + 4, next_pc) {
+                        return reason;
+                    }
+                    pc = next_pc;
                 }
                 Instr::Jal { target, ret } => {
                     m.set_reg(31, ret as u32);
-                    run_delay(m, delay);
-                    pc = target as u32;
+                    let next_pc = target as u32;
+                    if let Some(reason) = run_delay(m, delay, pc + 4, next_pc) {
+                        return reason;
+                    }
+                    pc = next_pc;
                 }
                 Instr::Jr { rs } => {
                     let jt = 0x1000 | (m.reg(rs) & 0x0FFF);
-                    run_delay(m, delay);
+                    if let Some(reason) = run_delay(m, delay, pc + 4, jt) {
+                        return reason;
+                    }
                     pc = jt;
                 }
                 Instr::Jalr { rd, rs, ret } => {
                     let jt = 0x1000 | (m.reg(rs) & 0x0FFF);
                     m.set_reg(rd, ret as u32);
-                    run_delay(m, delay);
+                    if let Some(reason) = run_delay(m, delay, pc + 4, jt) {
+                        return reason;
+                    }
                     pc = jt;
                 }
                 Instr::Unknown { word } => return trap_unknown(pc, word),
-                other => panic!("interpreter missing arm for {other:?}"),
             }
         }
     }
 
-    fn run_delay(m: &mut RspMachine, delay: Option<Instr>) {
+    /// Execute every non-control instruction the emitter accepts in a delay
+    /// slot. This match stays exhaustive so a newly decoded instruction cannot
+    /// silently widen the interpreter/emitter oracle gap.
+    fn run_delay(
+        m: &mut RspMachine,
+        delay: Option<Instr>,
+        delay_pc: u32,
+        resume_pc: u32,
+    ) -> Option<RspExitReason> {
         match delay {
-            Some(Instr::AluImm { op, rt, rs, imm }) => exec_alu_imm(m, op, rt, rs, imm),
-            Some(Instr::AluReg { op, rd, rs, rt }) => exec_alu_reg(m, op, rd, rs, rt),
-            Some(Instr::Lui { rt, imm }) => m.set_reg(rt, (imm as u32) << 16),
-            Some(Instr::Load { op, rt, base, off }) => exec_load(m, op, rt, base, off),
+            None | Some(Instr::Nop) => None,
+            Some(Instr::AluImm { op, rt, rs, imm }) => {
+                exec_alu_imm(m, op, rt, rs, imm);
+                None
+            }
+            Some(Instr::AluReg { op, rd, rs, rt }) => {
+                exec_alu_reg(m, op, rd, rs, rt);
+                None
+            }
+            Some(Instr::Shift { op, rd, rt, sa }) => {
+                exec_shift(m, op, rd, rt, sa as u32, None);
+                None
+            }
+            Some(Instr::ShiftVar { op, rd, rt, rs }) => {
+                exec_shift(m, op, rd, rt, 0, Some(rs));
+                None
+            }
+            Some(Instr::Lui { rt, imm }) => {
+                m.set_reg(rt, (imm as u32) << 16);
+                None
+            }
+            Some(Instr::Load { op, rt, base, off }) => {
+                exec_load(m, op, rt, base, off);
+                None
+            }
+            Some(Instr::Store { op, rt, base, off }) => {
+                exec_store(m, op, rt, base, off);
+                None
+            }
             Some(Instr::Mfc0 { rt, cop0 }) => {
                 let value = m.read_cp0(cop0);
                 m.set_reg(rt, value);
+                None
             }
-            _ => {}
+            Some(Instr::Mtc0 { rt, cop0 }) => {
+                let value = m.reg(rt);
+                let reason = m.write_cp0(cop0, value);
+                if reason.is_some() {
+                    m.ctx.resume_address = resume_pc;
+                }
+                reason
+            }
+            Some(Instr::Mfc2 { rt, vs, elem }) => {
+                let value = m.mfc2(vs, elem);
+                m.set_reg(rt, value);
+                None
+            }
+            Some(Instr::Mtc2 { rt, vs, elem }) => {
+                let value = m.reg(rt);
+                m.mtc2(vs, elem, value);
+                None
+            }
+            Some(Instr::Cfc2 { rt, cd }) => {
+                let value = m.cfc2(cd);
+                m.set_reg(rt, value);
+                None
+            }
+            Some(Instr::Ctc2 { rt, cd }) => {
+                let value = m.reg(rt);
+                m.ctc2(cd, value);
+                None
+            }
+            Some(Instr::VLoad {
+                op,
+                vt,
+                elem,
+                base,
+                off,
+            }) => {
+                let value = m.reg(base);
+                m.vload(op, vt, elem, value, off);
+                None
+            }
+            Some(Instr::VStore {
+                op,
+                vt,
+                elem,
+                base,
+                off,
+            }) => {
+                let value = m.reg(base);
+                m.vstore(op, vt, elem, value, off);
+                None
+            }
+            Some(Instr::Vu {
+                op,
+                vd,
+                vs,
+                vt,
+                e,
+                de,
+            }) => {
+                let invocation = OpInvocation {
+                    vd: vd as usize,
+                    vs: vs as usize,
+                    vt: vt as usize,
+                    e: e as usize,
+                    de: de as usize,
+                    vs_index: vs as usize,
+                };
+                match dispatch(m.vu(), op, invocation) {
+                    OpStatus::Executed => None,
+                    OpStatus::Unimplemented(op) => Some(trap_unknown_vu(delay_pc, op)),
+                }
+            }
+            Some(Instr::Break) => {
+                m.break_rsp();
+                Some(RspExitReason::Broke)
+            }
+            Some(Instr::Unknown { word }) => Some(trap_unknown(delay_pc, word)),
+            Some(
+                illegal @ (Instr::Branch { .. }
+                | Instr::BranchZ { .. }
+                | Instr::Jump { .. }
+                | Instr::Jal { .. }
+                | Instr::Jr { .. }
+                | Instr::Jalr { .. }),
+            ) => panic!(
+                "unsupported RSP control transfer {illegal:?} in delay slot at IMEM 0x{delay_pc:04X}"
+            ),
         }
     }
 
@@ -315,6 +477,24 @@ mod round_trip_tests {
             Sltu => (m.reg(rs) < m.reg(rt)) as u32,
         };
         m.set_reg(rd, v);
+    }
+
+    fn exec_shift(
+        m: &mut RspMachine,
+        op: crate::rsp::decode::ShiftOp,
+        rd: u8,
+        rt: u8,
+        sa: u32,
+        rs: Option<u8>,
+    ) {
+        use crate::rsp::decode::ShiftOp::*;
+        let amount = rs.map_or(sa, |reg| m.reg(reg) & 31);
+        let value = match op {
+            Sll => m.reg(rt) << amount,
+            Srl => m.reg(rt) >> amount,
+            Sra => ((m.reg(rt) as i32) >> amount) as u32,
+        };
+        m.set_reg(rd, value);
     }
 
     fn exec_store(m: &mut RspMachine, op: crate::rsp::decode::StoreOp, rt: u8, base: u8, off: i16) {
@@ -376,6 +556,31 @@ mod round_trip_tests {
         assert_eq!(m.reg(2), 0x1234_5678);
         // Word stored at DMEM 0x100.
         assert_eq!(m.load_w(0x100), 0x1234_5678);
+    }
+
+    /// Fail-against-bug: `run_delay` used to omit `Store`, even though the
+    /// emitter inlined the same instruction as a typed `store_w` call.
+    #[test]
+    fn delay_slot_store_executes_and_matches_emitter() {
+        let base = 0x1000u32;
+        let beq = (0x04u32 << 26) | 2; // beq r0,r0,0x100c
+        let prog = [beq, sw(2, 3, 0), brk(), brk()];
+        let mut rdram = vec![0u8; 0x1000];
+        let mut m = RspMachine::new(&mut rdram);
+        m.set_reg(2, 0x1234_5678);
+        m.set_reg(3, 0x100);
+
+        assert_eq!(run(&prog, base, &mut m), RspExitReason::Broke);
+        assert_eq!(
+            m.load_w(0x100),
+            0x1234_5678,
+            "the interpreter must execute a scalar store in the branch delay slot"
+        );
+
+        let source = emit_module(&prog, base, "delay_store_test");
+        assert!(source.contains(
+            "let a = m.reg(3).wrapping_add(0x00000000); let v = m.reg(2); m.store_w(a, v);"
+        ));
     }
 
     #[test]
