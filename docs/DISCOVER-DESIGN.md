@@ -273,6 +273,17 @@ an `open` result.
 
 ## Phase 6: resolve indirect transfers to a fixed point
 
+> Implementation status: the **bounded HI/LO case** (step 2 below) is
+> implemented in `fn64-discover`'s `resolve` module and driven to a fixed
+> point by `resolve::build_cfg_closed`. It mechanically resolves the
+> `lui`/`addiu`(/`ori`) `-> jr $reg` address-materialization every N64 IPL3
+> boot stub uses to reach the resident C entrypoint, then re-runs CFG +
+> ownership closure with the resolved target seeded as a root. This alone
+> takes OoT's boot bank from 1 discovered owner to 46, and recovers NW4E's
+> resident entry (`0x80000460`) that was previously hand-supplied. Jump
+> tables (step 3/4), value-set analysis for non-constant registers, and the
+> dynamic-trace path (step 7) remain unimplemented.
+
 For every computed `jr` or `jalr`:
 
 1. Perform constant propagation and bounded value-set analysis.

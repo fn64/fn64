@@ -15,6 +15,13 @@
 use crate::partition::Owner;
 use std::collections::BTreeSet;
 
+/// The set of VAs that some instruction reaches via a direct `jal` (a
+/// proven, machine-checkable callable-entry fact). An owner rooted at such a
+/// VA is a *legitimate* interior callable entry even when a coarser answer
+/// key merges it into an enclosing symbol -- see [`grade_functions`]'s
+/// `InteriorEntry` classification.
+pub type JalTargets = BTreeSet<u32>;
+
 /// One answer-key row: a function name and its start VA. The *end* of each
 /// function is derived as the next row's start VA (the CSV is emitted in
 /// ascending address order by construction -- see the extraction script),
@@ -87,8 +94,16 @@ pub enum FunctionGrade {
     /// No proven owner's extent contains this function's start at all.
     Open,
     /// A proven owner's root_va falls strictly inside this answer-key
-    /// function's interval, i.e. we split a real function into two owners
-    /// -- a real mis-split, counted as `wrong`.
+    /// function's interval, AND that root is itself a proven `jal` target --
+    /// a legitimately-discovered interior callable entry that the (coarser)
+    /// answer key happens to merge into one symbol. Per the design doc's
+    /// "interior callable entries remain explicit," this is CORRECT
+    /// mechanical output, not a mis-split, so it does NOT count as `wrong`.
+    InteriorEntry { owner_root: u32 },
+    /// A proven owner's root_va falls strictly inside this answer-key
+    /// function's interval and is NOT a proven `jal` target -- i.e. we split
+    /// a real function at an address nothing actually calls, a genuine
+    /// mis-split from bad decoding, counted as `wrong`.
     WrongSplit { owner_root: u32 },
 }
 
@@ -97,6 +112,9 @@ pub struct FunctionGradeReport {
     pub total: usize,
     pub matched_exact: usize,
     pub matched_coarse: usize,
+    /// Answer-key functions the discovery split at a proven `jal` target
+    /// (correct finer-grained interior entries, not errors).
+    pub interior_entries: usize,
     pub open: usize,
     pub wrong: usize,
     pub per_function: Vec<(String, FunctionGrade)>,
@@ -119,6 +137,7 @@ pub fn grade_functions(
     owners: &[Owner],
     answer_key: &[AnswerFunction],
     bank_end: u32,
+    jal_targets: &JalTargets,
 ) -> FunctionGradeReport {
     let owner_roots: BTreeSet<u32> = owners.iter().map(|o| o.root_va).collect();
     let answer_intervals = intervals(answer_key, bank_end);
@@ -126,26 +145,40 @@ pub fn grade_functions(
     let mut per_function = Vec::new();
     let mut matched_exact = 0;
     let mut matched_coarse = 0;
+    let mut interior_entries = 0;
     let mut open = 0;
     let mut wrong = 0;
 
     for (start, end, name) in &answer_intervals {
         // Checked first and independent of the function's own start match:
-        // an owner rooted strictly inside (start, end) is a mis-split
-        // regardless of whether this function's start also happens to be
-        // an owner root -- "matched at your own boundary" does not excuse
-        // "and also split in half by a spurious extra root."
+        // an owner rooted strictly inside (start, end) either splits a real
+        // function at an address nothing calls (a genuine mis-split =
+        // `wrong`) OR splits it at a proven `jal` target (a correct interior
+        // callable entry the coarser answer key merged = `InteriorEntry`,
+        // NOT wrong). "Matched at your own boundary" does not excuse a
+        // spurious extra root, but a jal-proven interior entry is not
+        // spurious -- it is machine-checkable ground truth.
         let split_owner = owners
             .iter()
             .find(|o| o.root_va > *start && o.root_va < *end);
         if let Some(o) = split_owner {
-            wrong += 1;
-            per_function.push((
-                name.to_string(),
-                FunctionGrade::WrongSplit {
-                    owner_root: o.root_va,
-                },
-            ));
+            if jal_targets.contains(&o.root_va) {
+                interior_entries += 1;
+                per_function.push((
+                    name.to_string(),
+                    FunctionGrade::InteriorEntry {
+                        owner_root: o.root_va,
+                    },
+                ));
+            } else {
+                wrong += 1;
+                per_function.push((
+                    name.to_string(),
+                    FunctionGrade::WrongSplit {
+                        owner_root: o.root_va,
+                    },
+                ));
+            }
             continue;
         }
 
@@ -181,6 +214,7 @@ pub fn grade_functions(
         total: answer_intervals.len(),
         matched_exact,
         matched_coarse,
+        interior_entries,
         open,
         wrong,
         per_function,
@@ -225,7 +259,7 @@ mod tests {
             owner("boot", 0x8000_0000, 0x8000_0010),
             owner("boot", 0x8000_0010, 0x8000_0020),
         ];
-        let report = grade_functions(&owners, &key, 0x8000_0020);
+        let report = grade_functions(&owners, &key, 0x8000_0020, &JalTargets::new());
         assert_eq!(report.matched_exact, 2);
         assert_eq!(report.wrong, 0);
         assert_eq!(report.open, 0);
@@ -247,7 +281,7 @@ mod tests {
             },
         ];
         let owners = vec![owner("boot", 0x8000_0000, 0x8000_0020)];
-        let report = grade_functions(&owners, &key, 0x8000_0020);
+        let report = grade_functions(&owners, &key, 0x8000_0020, &JalTargets::new());
         assert_eq!(report.matched_exact, 1); // f1
         assert_eq!(report.matched_coarse, 1); // f2, swallowed
         assert_eq!(report.wrong, 0);
@@ -272,9 +306,38 @@ mod tests {
             owner("boot", 0x8000_0008, 0x8000_0010),
             owner("boot", 0x8000_0010, 0x8000_0020),
         ];
-        let report = grade_functions(&owners, &key, 0x8000_0020);
+        // 0x8 is NOT a jal target -> genuine mis-split -> wrong.
+        let report = grade_functions(&owners, &key, 0x8000_0020, &JalTargets::new());
         assert_eq!(report.wrong, 1); // f1 was split by the spurious 0x8 owner
         assert_eq!(report.matched_exact, 1); // only f2 exact-matches cleanly
+    }
+
+    #[test]
+    fn owner_root_inside_a_function_that_is_a_jal_target_is_interior_entry_not_wrong() {
+        // Same split shape as the mis-split test, but now 0x8 IS a proven
+        // jal target -- a legitimate interior callable entry the coarse
+        // answer key merged. Must be `InteriorEntry`, never `wrong`.
+        let key = vec![
+            AnswerFunction {
+                name: "f1".into(),
+                va_start: 0x8000_0000,
+            },
+            AnswerFunction {
+                name: "f2".into(),
+                va_start: 0x8000_0010,
+            },
+        ];
+        let owners = vec![
+            owner("boot", 0x8000_0000, 0x8000_0008),
+            owner("boot", 0x8000_0008, 0x8000_0010),
+            owner("boot", 0x8000_0010, 0x8000_0020),
+        ];
+        let mut jal = JalTargets::new();
+        jal.insert(0x8000_0008);
+        let report = grade_functions(&owners, &key, 0x8000_0020, &jal);
+        assert_eq!(report.wrong, 0);
+        assert_eq!(report.interior_entries, 1);
+        assert_eq!(report.matched_exact, 1); // f2 still exact
     }
 
     #[test]
@@ -284,7 +347,7 @@ mod tests {
             va_start: 0x8000_0000,
         }];
         let owners: Vec<Owner> = vec![];
-        let report = grade_functions(&owners, &key, 0x8000_0010);
+        let report = grade_functions(&owners, &key, 0x8000_0010, &JalTargets::new());
         assert_eq!(report.open, 1);
         assert_eq!(report.wrong, 0);
     }

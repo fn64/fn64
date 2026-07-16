@@ -37,6 +37,12 @@
 //!   [`cfg::Cfg`]'s blocks from its proven roots -- one owner per block per
 //!   bank, ambiguous claims and unowned blocks reported explicitly rather
 //!   than resolved by guessing.
+//! - [`resolve`]: Phase 6's cheapest bounded case -- mechanically resolve a
+//!   `jr`/`jalr` whose target register was built by a bounded HI/LO
+//!   (`lui`+`addiu`/`ori`) construction, and iterate the CFG to a fixed
+//!   point ([`resolve::build_cfg_closed`]). This is what turns the header
+//!   entrypoint of a stripped IPL3 boot stub into the resident C entry root
+//!   with no hand-supplied "main entry" address.
 //! - [`grade_oot`] / [`grade_nw4e`]: grading-only cross-checks against the
 //!   OoT decomp's segment answer key and NW4E's hand-verified
 //!   `overlays.json`. Neither module is reachable from the discovery
@@ -48,7 +54,8 @@
 //!   boundaries against aki-recomp's hand-fixed NW4E `symbol_addrs.txt`
 //!   rungs -- the "grind-collapse" measure.
 //!
-//! Candidate harvesting (Phase 3), indirect-target closure (Phase 6),
+//! Candidate harvesting (Phase 3), the rest of indirect-target closure
+//! (Phase 6 beyond the bounded HI/LO `jr` case [`resolve`] now handles),
 //! dynamic probes (Phase 7), and assembly verification (Phase 8) are not
 //! yet implemented; this crate's public surface will grow into them.
 
@@ -60,6 +67,7 @@ pub mod grade_nw4e_symbols;
 pub mod grade_oot;
 pub mod grade_oot_functions;
 pub mod partition;
+pub mod resolve;
 pub mod rom;
 
 pub use facts::{BankAddr, Fact, FactDb, ProofState};
