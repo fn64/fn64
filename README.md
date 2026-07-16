@@ -36,6 +36,7 @@ One workspace, separate crates, each publishable alone:
 |---|---|
 | `fn64-runtime` | Core: scheduler, OS message queues, timers, PI/SI/VI/AI plumbing, rdram model, overlays |
 | `fn64-abi` | The `extern "C"` surface recompiled code links against |
+| `fn64-boot-harness` | Shared generated-section bridge, registration callback, and RDRAM allocation for boot hosts |
 | `fn64-shell` | The executable: window, input, audio out, ROM intake |
 | `fn64-rt64` | FFI bridge to [RT64](https://github.com/fn64/rt64) (MIT, C++) — all C++ interop quarantined here |
 

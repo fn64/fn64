@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["audio-ucode", "native"]
 # Standalone workspace, deliberately NOT a member of the main fn64
 # workspace's Cargo.toml -- this crate's build.rs requires RECOMPILED_DIR/
 # RECOMP_H_DIR/ROM env vars pointing at out-of-tree, game-derived material
@@ -30,6 +31,7 @@ cc = "1"
 libc = "0.2"
 fn64-runtime = { path = "../../crates/fn64-runtime" }
 fn64-abi = { path = "../../crates/fn64-abi", features = ["native-recomp"] }
+fn64-boot-harness = { path = "../../crates/fn64-boot-harness" }
 fn64-recomp-native = { path = "../../crates/fn64-recomp-native" }
 # The graphics seam + its headless reference software rasterizer. Registered
 # via fn64_abi::set_render_backend so submitted M_GFXTASKs actually

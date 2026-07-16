@@ -1,0 +1,15 @@
+[package]
+name = "fn64-boot-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared generated-C registration and RDRAM boot seam for fn64 harnesses."
+
+[features]
+default = ["c-bridge"]
+c-bridge = []
+
+[dependencies]
+fn64-abi = { path = "../fn64-abi" }
+fn64-runtime = { path = "../fn64-runtime" }

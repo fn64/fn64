@@ -80,7 +80,6 @@ fn main() {
 mod game {
     use crate::framebuffer::{self, FB_BYTES, FB_HEIGHT, FB_WIDTH};
     use crate::input_map::PadState;
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use pixels::{Pixels, SurfaceTexture};
@@ -91,70 +90,11 @@ mod game {
     use winit::keyboard::{KeyCode, PhysicalKey};
     use winit::window::{Window, WindowId};
 
-    // ---------------------------------------------------------------------
-    // FFI into the out-of-tree-compiled bridge + the real recomp_entrypoint,
-    // identical to examples/oot-boot/src/main.rs. Only reachable in a
-    // game-linked build.
-    // ---------------------------------------------------------------------
-    // `improper_ctypes`: `RecompContext` holds `(f32, f32)` tuples (unspecified
-    // layout), which is the EXACT type `fn64_abi::RecompFunc` (the ABI's own
-    // `unsafe extern "C" fn(*mut u8, *mut RecompContext)`) and every
-    // RecompiledFuncs/*.c function already crosses -- this extern block just
-    // re-uses that established ABI type, it doesn't introduce a new boundary.
-    // Allowed here for the same reason oot-boot's identical FFI does.
-    #[allow(improper_ctypes)]
-    extern "C" {
-        fn fn64_bridge_register_all_sections();
-        fn fn64_bridge_num_sections() -> usize;
-        fn recomp_entrypoint(rdram: *mut u8, ctx: *mut fn64_abi::RecompContext);
-    }
-
-    #[no_mangle]
-    extern "C" fn fn64_register_func(
-        section_index: usize,
-        rom_addr: u32,
-        ram_addr: u32,
-        size: u32,
-        offset: u32,
-        rom_size: u32,
-        func: fn64_abi::RecompFunc,
-    ) {
-        SECTION_BUILDER.with(|cell| {
-            let mut builder = cell.borrow_mut();
-            let entry = builder
-                .sections
-                .entry(section_index)
-                .or_insert_with(|| (rom_addr, ram_addr, size, Vec::new()));
-            entry.3.push((offset, rom_size, func));
-        });
-    }
-
-    /// `(rom_addr, ram_addr, size, funcs)` where each func is
-    /// `(offset, rom_size, RecompFunc)` -- the shape the C bridge callback
-    /// feeds in, matching `fn64_abi::register_section`'s batch contract.
-    type SectionEntry = (u32, u32, u32, Vec<(u32, u32, fn64_abi::RecompFunc)>);
-
-    #[derive(Default)]
-    struct SectionBuilder {
-        sections: HashMap<usize, SectionEntry>,
-    }
-
-    thread_local! {
-        static SECTION_BUILDER: std::cell::RefCell<SectionBuilder> =
-            std::cell::RefCell::new(SectionBuilder::default());
-    }
-
     fn env_path(name: &str) -> std::path::PathBuf {
         std::env::var(name)
             .unwrap_or_else(|_| panic!("fn64-shell: required environment variable {name} not set"))
             .into()
     }
-
-    /// rdram sizing: same `.max(RDRAM_MMIO_WINDOW_END)` guard oot-boot
-    /// documents at length -- OoT's boot path issues a KSEG1 (uncached)
-    /// RDRAM access that lands 0x20000000 past the physical offset, so a flat
-    /// 8 MB buffer would SIGSEGV. Not extra headroom; a correctness fix.
-    const RDRAM_SIZE: usize = 8 * 1024 * 1024;
 
     /// Boot the game and hold everything the window loop touches every frame.
     struct Shell {
@@ -195,27 +135,15 @@ mod game {
                 fn64_runtime::SaveType::SramBanked,
             )));
 
-            // Register every section from recomp_overlays.inl via the C walk.
-            unsafe { fn64_bridge_register_all_sections() };
-            let num_sections = unsafe { fn64_bridge_num_sections() };
-            println!("[fn64-shell] bridge reports {num_sections} sections");
-
-            let mut section_indices: HashMap<usize, fn64_runtime::SectionIndex> = HashMap::new();
-            SECTION_BUILDER.with(|cell| {
-                let builder = cell.borrow();
-                let mut keys: Vec<_> = builder.sections.keys().copied().collect();
-                keys.sort_unstable();
-                for key in keys {
-                    let (rom_addr, ram_addr, size, funcs) = &builder.sections[&key];
-                    let idx =
-                        unsafe { fn64_abi::register_section(*rom_addr, *ram_addr, *size, funcs) };
-                    section_indices.insert(key, idx);
-                }
-            });
+            let registration = fn64_boot_harness::register_linked_sections();
+            println!(
+                "[fn64-shell] bridge reports {} sections",
+                registration.reported_count()
+            );
             // Always-resident sections 0/1/2 (makerom.ent/boot/code), same as
             // oot-boot -- the ovl_* overlays are DMA-loaded on demand.
             for section_key in [0usize, 1usize, 2usize] {
-                if let Some(&idx) = section_indices.get(&section_key) {
+                if let Some(idx) = registration.registry_index(section_key) {
                     fn64_abi::set_section_loaded(idx);
                 }
             }
@@ -223,7 +151,7 @@ mod game {
             // VI retrace ticker (host-chosen approximation, same as oot-boot).
             fn64_abi::arm_vi_retrace(1000);
 
-            let mut rdram = vec![0u8; RDRAM_SIZE.max(fn64_runtime::RDRAM_MMIO_WINDOW_END as usize)];
+            let mut rdram = fn64_boot_harness::new_rdram();
             let rdram_ptr = rdram.as_mut_ptr();
 
             // Render backend: the real headless software rasterizer, which
@@ -257,7 +185,7 @@ mod game {
 
             println!("[fn64-shell] booting thread 0 (recomp_entrypoint)...");
             unsafe {
-                fn64_abi::boot_thread0(rdram_ptr, recomp_entrypoint, 0, 10);
+                fn64_abi::boot_thread0(rdram_ptr, fn64_boot_harness::c_recomp_entrypoint(), 0, 10);
             }
 
             Shell {
