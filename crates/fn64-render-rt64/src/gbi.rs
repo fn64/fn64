@@ -2473,14 +2473,53 @@ mod tests {
         assert_eq!(clip, [10.0, 21.0, 36.0, 1.0]);
     }
 
-    // --- Large-world projection regression (SECOND projection bug) -------
+    /// Regression for the exact fixed-point `guLookAt` matrix observed in the
+    /// Hyrule Field title-camera task. The writer trace establishes that
+    /// `guLookAtF` receives eye `(-4000,-1,5228)`; its translation therefore
+    /// is `(3263,694,5675) = -(eye · basis)`. Those translation values are
+    /// camera-space coordinates of the world origin, not the world-space eye.
+    ///
+    /// Replacing them with `-translation · basis` (the discarded diagnostic
+    /// transform) moves the camera to a different world-space eye. This test
+    /// fails under that rewrite because the traced eye no longer maps to the
+    /// view-space origin.
+    #[test]
+    fn hyrule_field_live_gu_look_at_translation_matches_traced_eye() {
+        // Decoded from the 64-byte Mtx written at physical 0x1888c8. The
+        // fixed-point quantization accounts for the small origin tolerance.
+        let view: Mat4 = [
+            [-0.3885498, 0.11167908, 0.9146271, 0.0],
+            [-1.5258789e-5, 0.99261475, -0.12121582, 0.0],
+            [-0.92141724, -0.04710388, -0.38568115, 0.0],
+            [3262.9912, 694.052, 5674.783, 1.0],
+        ];
+        let eye = [-4000.0, -1.0, 5228.0];
+
+        for c in 0..3 {
+            let expected_translation =
+                -(eye[0] * view[0][c] + eye[1] * view[1][c] + eye[2] * view[2][c]);
+            assert!(
+                (view[3][c] - expected_translation).abs() < 0.1,
+                "translation[{c}] must be -(eye · basis[{c}]): got {}, expected {expected_translation}",
+                view[3][c]
+            );
+        }
+
+        let eye_in_view = transform_point(&view, eye[0], eye[1], eye[2]);
+        for (axis, value) in eye_in_view[..3].iter().enumerate() {
+            assert!(
+                value.abs() < 0.1,
+                "traced eye must map to the view-space origin; axis {axis} was {value}"
+            );
+        }
+        assert!((eye_in_view[3] - 1.0).abs() < f32::EPSILON);
+    }
+
+    // --- Synthetic large-world projection regression ---------------------
     //
-    // The OoT opening-cutscene / Hyrule-Field frame projects a scene where
-    // BOTH the camera (`guLookAt` eye at world ~(3000,700,5600)) AND the
-    // objects (modelview translations of ~-4000) carry LARGE world
-    // coordinates -- unlike the earlier gameplay frame (object coords ~10,
-    // camera folded into a small modelview) that the transpose fix above
-    // handled. This test drives the full decode path -- fixed-point `Mtx`
+    // This synthetic scene has a camera at world ~(3000,700,5600) and an
+    // object translated to ~-4000, so both sides carry LARGE world
+    // coordinates. It drives the full decode path -- fixed-point `Mtx`
     // bytes (`read_mtx`) -> projection LOAD(persp) then PROJECTION|MUL(view)
     // -> modelview LOAD -> `recompute_mvp` (`M · (V · P)`) -> row-vector
     // `transform_point` -> the default 320x240 viewport map -- for the exact
@@ -2488,14 +2527,12 @@ mod tests {
     // with a sane POSITIVE `w` (~ -z_eye ~= +7000), never the negative /
     // sign-flipping `w` and ±4000 screen-z of the mis-projection.
     //
-    // The view here is a PROPER `guLookAt` matrix: its translation ROW is
+    // The synthetic view is a proper `guLookAt` matrix: its translation row is
     // `-(eye · basis)` = (5419.7, -367.3, -3367.7), NOT the raw eye. That is
     // the load-bearing distinction -- feed the raw eye (3000,700,5600) into
     // row 3 instead and the origin vertex flips to `w = -1921` (behind the
-    // camera). A camera-to-world matrix carrying the raw eye reaching this
-    // path (an upstream matrix-write bug) is exactly what mis-projected the
-    // real frame; here we assert the decode+compose of a CORRECT large-world
-    // view/model/persp chain is sound.
+    // camera). This asserts the decode+compose of a correct synthetic
+    // large-world view/model/perspective chain.
     //
     // It fails against the historical transpose bug too: a re-introduced
     // `Mtx` transpose-on-read or a column-vector apply turns the asymmetric
