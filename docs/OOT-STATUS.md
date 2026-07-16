@@ -160,14 +160,16 @@ road, but the top half misprojects).
    grass/trees/grates.
 4. **Alpha blending** — translucent water/fog/UI (blender currently always
    overwrites).
-5. **G_SETCOMBINE + G_SETPRIMCOLOR/G_SETENVCOLOR** — combiner hardwired to
-   texel×shade MODULATE; real CC formula + prim/env colors ignored (STUB).
-6. **G_SETSCISSOR** clip + perspective-correct S/T & depth (HUD split, floor
+5. **G_SETSCISSOR** clip + perspective-correct S/T & depth (HUD split, floor
    swim).
 
 ### Partial / loose ends
 - G_GEOMETRYMODE partial (only cull+lighting bits act); G_MOVEMEM/MOVEWORD
   partial; G_SETZIMG/SETCIMG/TEXRECT stubs.
+- G_SETCOMBINE + primitive/environment RGBA are implemented for the common
+  OoT modulate, decal/replace, primitive-tint, environment-blend, and
+  shade-only source set. TEXEL1 and key/noise/K/LOD sources remain logged
+  approximations until multi-tile/TMEM and the matching registers exist.
 - Native-Rust bounded probes use `_exit(0)` after explicitly flushing the
   summary/trace. Suspended coroutines can be stopped inside an existing
   `extern "C"` blocking shim, where TLS teardown's forced unwind cannot cross
