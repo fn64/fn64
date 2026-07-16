@@ -521,6 +521,17 @@ fn load_light(rdram: &[u8], state: &mut DecodeState, addr: usize, slot: usize) {
     }
 }
 
+/// Decode the F3DEX2 light slot selected by a `G_MOVEMEM G_MV_LIGHT`
+/// destination offset. `gSPLight(..., n)` emits `(n * 24 + 24) / 8` in the
+/// wire field, while DMEM indices 0 and 1 are reserved for the two look-at
+/// vectors. Therefore `LIGHT_1` starts at DMEM index 2 and maps to light slot
+/// 0, matching RT64's `offset / 24 - 2` dispatch.
+fn light_slot_from_movemem_offset(ofs_div8: usize) -> Option<usize> {
+    (ofs_div8 / 3)
+        .checked_sub(2)
+        .filter(|&slot| slot < MAX_LIGHTS)
+}
+
 /// Normalize a 3-vector; returns the zero vector unchanged (guards a 0-length
 /// normal/direction so a bad DMA can't produce NaN).
 #[inline]
@@ -923,6 +934,109 @@ struct DecodeState {
     /// `G_MW_NUMLIGHT` count). Applied at `G_VTX` time when the geometry
     /// mode's `G_LIGHTING` bit is set. See [`LightState`].
     lights: LightState,
+    diagnostics: Diagnostics,
+    stats: DecodeStats,
+}
+
+#[derive(Clone, Debug)]
+struct Diagnostics {
+    enabled: bool,
+    raw_cn: bool,
+    no_near_cull: bool,
+    no_cull: bool,
+    no_texture: bool,
+    legacy_light_slot: bool,
+    max_dl_depth: u32,
+}
+
+impl Default for Diagnostics {
+    fn default() -> Self {
+        #[cfg(not(test))]
+        {
+            Diagnostics {
+                enabled: std::env::var_os("OOT_RENDER_STATS").is_some(),
+                raw_cn: std::env::var_os("OOT_RENDER_RAW_CN").is_some(),
+                no_near_cull: std::env::var_os("OOT_RENDER_NO_NEAR_CULL").is_some(),
+                no_cull: std::env::var_os("OOT_RENDER_NO_CULL").is_some(),
+                no_texture: std::env::var_os("OOT_RENDER_NO_TEXTURE").is_some(),
+                legacy_light_slot: std::env::var_os("OOT_RENDER_LEGACY_LIGHT_SLOT").is_some(),
+                max_dl_depth: std::env::var("OOT_RENDER_MAX_DL_DEPTH")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(MAX_DL_DEPTH),
+            }
+        }
+        #[cfg(test)]
+        {
+            Diagnostics {
+                enabled: false,
+                raw_cn: false,
+                no_near_cull: false,
+                no_cull: false,
+                no_texture: false,
+                legacy_light_slot: false,
+                max_dl_depth: MAX_DL_DEPTH,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct DecodeStats {
+    vtx_commands: usize,
+    vertices: usize,
+    lit_vertices: usize,
+    black_lit_vertices: usize,
+    raw_vertices: usize,
+    triangle_candidates: usize,
+    near_dropped: usize,
+    dl_calls: usize,
+    dl_branches: usize,
+    max_dl_depth: u32,
+    dl_depth_limited: usize,
+    light_loads: usize,
+    segment_writes: usize,
+}
+
+impl DecodeStats {
+    fn summary(&self, diagnostics: &Diagnostics, triangles: &[Triangle]) {
+        if !diagnostics.enabled {
+            return;
+        }
+        let textured = triangles.iter().filter(|tri| tri.texture.is_some()).count();
+        let raster_culled = triangles
+            .iter()
+            .filter(|tri| {
+                let area = (tri.v[1].x - tri.v[0].x) * (tri.v[2].y - tri.v[0].y)
+                    - (tri.v[1].y - tri.v[0].y) * (tri.v[2].x - tri.v[0].x);
+                match tri.cull {
+                    CullMode::None => false,
+                    CullMode::Back => area > 0.0,
+                    CullMode::Front => area < 0.0,
+                    CullMode::Both => true,
+                }
+            })
+            .count();
+        eprintln!(
+            "[OOT_RENDER_STATS] vtx_cmds={} vertices={} lit={} black_lit={} raw={} tri_candidates={} near_dropped={} emitted={} textured={} raster_culled={} dl_calls={} dl_branches={} max_dl_depth={} depth_limited={} light_loads={} segment_writes={}",
+            self.vtx_commands,
+            self.vertices,
+            self.lit_vertices,
+            self.black_lit_vertices,
+            self.raw_vertices,
+            self.triangle_candidates,
+            self.near_dropped,
+            triangles.len(),
+            textured,
+            raster_culled,
+            self.dl_calls,
+            self.dl_branches,
+            self.max_dl_depth,
+            self.dl_depth_limited,
+            self.light_loads,
+            self.segment_writes
+        );
+    }
 }
 
 /// F3DEX2 vertex-lighting decode state (`F3DEX2-CONCEPTS.md` §2.4). The
@@ -1128,10 +1242,13 @@ pub fn decode_display_list_f3dex2(
         dl_depth: 0,
         tex: TexState::default(),
         lights: LightState::default(),
+        diagnostics: Diagnostics::default(),
+        stats: DecodeStats::default(),
     };
     #[cfg(not(test))]
     projdump::reset_frame();
     decode_stream(rdram, dl_addr, &mut state);
+    state.stats.summary(&state.diagnostics, &state.tris);
     #[cfg(not(test))]
     projdump::summary();
     Ok(state.tris)
@@ -1162,33 +1279,44 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 let n = ((w0 >> 12) & 0xFF) as usize;
                 let end = ((w0 >> 1) & 0x7F) as usize;
                 let v0 = end.saturating_sub(n);
+                state.stats.vtx_commands += 1;
                 load_vertices(rdram, state, w1, n, v0);
             }
             G_TRI1 => {
                 // F3DEX2 G_TRI1 (F3DEX2-CONCEPTS.md §2.2): three 7-bit
                 // vertex-cache-slot fields in w0 at bits 17/9/1 -- each is
                 // already the slot (0-31), no /2 needed.
-                let cull = cull_mode_from(state.geometry_mode);
-                let texture = active_texture(&state.tex);
+                let cull = if state.diagnostics.no_cull {
+                    CullMode::None
+                } else {
+                    cull_mode_from(state.geometry_mode)
+                };
+                let texture = if state.diagnostics.no_texture {
+                    None
+                } else {
+                    active_texture(&state.tex)
+                };
                 let idx = tri_indices(w0);
-                if let Some(t) = resolve_tri(&state.vtx_cache, idx, cull, texture) {
-                    state.tris.push(t);
-                }
+                emit_tri(state, idx, cull, texture);
             }
             G_TRI2 | G_QUAD => {
                 // F3DEX2 G_TRI2 / G_QUAD (§2.3): triangle A's three 7-bit
                 // slot fields in w0 (bits 17/9/1), triangle B's in w1 at the
                 // SAME bit positions. G_QUAD decodes identically to G_TRI2.
-                let cull = cull_mode_from(state.geometry_mode);
-                let texture = active_texture(&state.tex);
+                let cull = if state.diagnostics.no_cull {
+                    CullMode::None
+                } else {
+                    cull_mode_from(state.geometry_mode)
+                };
+                let texture = if state.diagnostics.no_texture {
+                    None
+                } else {
+                    active_texture(&state.tex)
+                };
                 let idx_a = tri_indices(w0);
                 let idx_b = tri_indices(w1);
-                if let Some(t) = resolve_tri(&state.vtx_cache, idx_a, cull, texture.clone()) {
-                    state.tris.push(t);
-                }
-                if let Some(t) = resolve_tri(&state.vtx_cache, idx_b, cull, texture) {
-                    state.tris.push(t);
-                }
+                emit_tri(state, idx_a, cull, texture.clone());
+                emit_tri(state, idx_b, cull, texture);
             }
             G_MTX => {
                 // F3DEX2 gsSPMatrix (gbi.h ~2106): w0 = op<<24 |
@@ -1286,6 +1414,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                         // Base is a physical rdram address; strip any KSEG
                         // high bits, keep the low 24 (segments span rdram).
                         state.segments[seg] = w1 & 0x00FF_FFFF;
+                        state.stats.segment_writes += 1;
                     }
                 } else if index == G_MW_NUMLIGHT {
                     // F3DEX2 gsSPNumLights (gbi.h:2887): data = NUML(n) =
@@ -1322,7 +1451,9 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 // current stream for a branch (mirroring RT64's runDl, which
                 // only pushes a return address when the push bit is clear).
                 let is_branch = ((w0 >> 16) & 0x01) != 0; // G_DL_NOPUSH
-                if state.dl_depth < MAX_DL_DEPTH {
+                state.stats.dl_calls += 1;
+                state.stats.dl_branches += usize::from(is_branch);
+                if state.dl_depth < state.diagnostics.max_dl_depth {
                     // NOTE: G_DL is a pure address call/return -- it does NOT
                     // save or restore the matrix stack. The RSP's modelview/
                     // projection state is GLOBAL across a nested DL; only
@@ -1335,6 +1466,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                     // the hardware call/return (RT64 push/popReturnAddress
                     // only saves the DL pointer, never the matrix).
                     state.dl_depth += 1;
+                    state.stats.max_dl_depth = state.stats.max_dl_depth.max(state.dl_depth);
                     decode_stream(rdram, w1, state);
                     state.dl_depth -= 1;
                     if is_branch {
@@ -1343,6 +1475,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                         break;
                     }
                 } else {
+                    state.stats.dl_depth_limited += 1;
                     eprintln!(
                         "[fn64-render-rt64/gbi] G_DL recursion exceeded MAX_DL_DEPTH \
                          ({MAX_DL_DEPTH}) -- refusing to recurse further (possible corrupt \
@@ -1452,12 +1585,22 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                     }
                 } else if index == G_MV_LIGHT {
                     // gsSPLight (gbi.h:2911): ofs = n*24 + 24 (÷8 on the
-                    // wire), so ofs/8 = 3*(n+1) and the destination light
-                    // SLOT is n = ofs/8/3 - 1. Slot 0..num_dir-1 are
-                    // directional; slot num_dir is the ambient.
-                    let slot = (ofs_div8 / 3).saturating_sub(1);
-                    let addr = resolve_addr(&state.segments, w1);
-                    load_light(rdram, state, addr, slot);
+                    // wire), so ofs/8 = 3*(n+1). DMEM indices 0 and 1 are
+                    // look-at vectors; LIGHT_1 therefore maps from index 2
+                    // to slot 0. Slot 0..num_dir-1 are directional; slot
+                    // num_dir is the ambient.
+                    let slot = if state.diagnostics.legacy_light_slot {
+                        Some((ofs_div8 / 3).saturating_sub(1))
+                    } else {
+                        light_slot_from_movemem_offset(ofs_div8)
+                    };
+                    if let Some(slot) = slot.filter(|&slot| slot < MAX_LIGHTS) {
+                        let addr = resolve_addr(&state.segments, w1);
+                        load_light(rdram, state, addr, slot);
+                        state.stats.light_loads += 1;
+                    } else {
+                        skip_opcode(G_MOVEMEM);
+                    }
                 } else {
                     skip_opcode(G_MOVEMEM);
                 }
@@ -1568,7 +1711,15 @@ fn load_vertices(
             let ny = (read_u8(rdram, off + 13) as i8) as f32 / 127.0;
             let nz = (read_u8(rdram, off + 14) as i8) as f32 / 127.0;
             let [lr, lg, lb] = light_vertex(state, [nx, ny, nz]);
-            (lr, lg, lb)
+            if state.diagnostics.raw_cn {
+                (
+                    read_u8(rdram, off + 12),
+                    read_u8(rdram, off + 13),
+                    read_u8(rdram, off + 14),
+                )
+            } else {
+                (lr, lg, lb)
+            }
         } else {
             (
                 read_u8(rdram, off + 12),
@@ -1576,6 +1727,13 @@ fn load_vertices(
                 read_u8(rdram, off + 14),
             )
         };
+        state.stats.vertices += 1;
+        if state.geometry_mode & G_LIGHTING != 0 {
+            state.stats.lit_vertices += 1;
+            state.stats.black_lit_vertices += usize::from(r == 0 && g == 0 && b == 0);
+        } else {
+            state.stats.raw_vertices += 1;
+        }
 
         let (sx, sy, sz, sw) = project_vertex(state, x, y, z);
         #[cfg(not(test))]
@@ -1718,6 +1876,30 @@ fn resolve_tri(
     })
 }
 
+fn emit_tri(
+    state: &mut DecodeState,
+    idx: [u32; 3],
+    cull: CullMode,
+    texture: Option<Texture>,
+) {
+    state.stats.triangle_candidates += 1;
+    if idx.iter().any(|&i| i as usize >= state.vtx_cache.len()) {
+        return;
+    }
+    let v = [
+        state.vtx_cache[idx[0] as usize],
+        state.vtx_cache[idx[1] as usize],
+        state.vtx_cache[idx[2] as usize],
+    ];
+    if v.iter().any(behind_near_plane) {
+        state.stats.near_dropped += 1;
+        if !state.diagnostics.no_near_cull {
+            return;
+        }
+    }
+    state.tris.push(Triangle { v, cull, texture });
+}
+
 /// This reference backend's one supported ucode family declaration --
 /// shared constant so `lib.rs` and tests agree on it.
 pub const SUPPORTED: &[UcodeId] = &[UcodeId::F3dex2];
@@ -1763,10 +1945,10 @@ mod tests {
     /// `off + (r*4+c)*2`, fractional half at `off + 32 + (r*4+c)*2`, both
     /// through the recomp `^3` swizzle (via `wr_i16`).
     fn wr_mtx(rdram: &mut [u8], off: usize, m: [[f32; 4]; 4]) {
-        for r in 0..4 {
-            for c in 0..4 {
+        for (r, row) in m.iter().enumerate() {
+            for (c, &value) in row.iter().enumerate() {
                 let elem = r * 4 + c;
-                let fixed = (m[r][c] * 65536.0).round() as i32;
+                let fixed = (value * 65536.0).round() as i32;
                 let int_half = (fixed >> 16) as i16;
                 let frac_half = (fixed & 0xFFFF) as u16;
                 wr_i16(rdram, off + elem * 2, int_half);
@@ -1811,7 +1993,7 @@ mod tests {
             [1.299038, 0.0, 0.0, 0.0],
             [0.0, 1.732051, 0.0, 0.0],
             [0.0, 0.0, -1.020202, -1.0],
-            [0.0, 0.0, -20.202020, 0.0],
+            [0.0, 0.0, -20.202_02, 0.0],
         ];
         // Asymmetric modelview: rot(20° about Y) then translate(30,-15,-120),
         // in hardware [row][col] row-vector layout.
@@ -1850,7 +2032,7 @@ mod tests {
         wr_cmd(
             &mut rdram,
             off,
-            ((G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1),
+            ((G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1),
             0,
         );
         off += 8;
@@ -1930,7 +2112,7 @@ mod tests {
         wr_cmd(
             &mut rdram,
             0x1010,
-            ((G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1),
+            ((G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1),
             0,
         );
         wr_cmd(&mut rdram, 0x1018, (G_ENDDL as u32) << 24, 0);
@@ -1947,7 +2129,7 @@ mod tests {
         wr_cmd(
             &mut rdram,
             0x2008,
-            ((G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1),
+            ((G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1),
             0,
         );
         wr_cmd(&mut rdram, 0x2010, (G_ENDDL as u32) << 24, 0);
@@ -2153,6 +2335,8 @@ mod tests {
             dl_depth: 0,
             tex: TexState::default(),
             lights: LightState::default(),
+            diagnostics: Diagnostics::default(),
+            stats: DecodeStats::default(),
         }
     }
 
@@ -2163,6 +2347,20 @@ mod tests {
         // 2 directional lights: data = 48.
         st.lights.num_dir = (48u32 / 24) as usize;
         assert_eq!(st.lights.num_dir, 2);
+    }
+
+    #[test]
+    fn movemem_light_1_maps_to_directional_slot_zero() {
+        // Fail-against-bug wire evidence: gSPLight(LIGHT_1) encodes
+        // (1*24 + 24)/8 = 6. The old `ofs/3 - 1` mapping returned slot 1,
+        // leaving the real first directional light (slot 0) black/stale and
+        // misclassifying LIGHT_1 as ambient when num_dir == 1.
+        assert_eq!(light_slot_from_movemem_offset(6), Some(0));
+        // LIGHT_2 is the ambient slot when one directional light is active.
+        assert_eq!(light_slot_from_movemem_offset(9), Some(1));
+        // Offsets for the two look-at vectors are not light slots.
+        assert_eq!(light_slot_from_movemem_offset(0), None);
+        assert_eq!(light_slot_from_movemem_offset(3), None);
     }
 
     #[test]
@@ -2495,11 +2693,11 @@ mod tests {
         ];
         let eye = [-4000.0, -1.0, 5228.0];
 
-        for c in 0..3 {
+        for (c, &translation) in view[3][..3].iter().enumerate() {
             let expected_translation =
                 -(eye[0] * view[0][c] + eye[1] * view[1][c] + eye[2] * view[2][c]);
             assert!(
-                (view[3][c] - expected_translation).abs() < 0.1,
+                (translation - expected_translation).abs() < 0.1,
                 "translation[{c}] must be -(eye · basis[{c}]): got {}, expected {expected_translation}",
                 view[3][c]
             );
@@ -2544,26 +2742,26 @@ mod tests {
         // guPerspective(fovy=60, aspect=4/3, near=100, far=12800), hardware
         // [row][col]: projective term [2][3]=-1, depth translate [3][2].
         let persp = [
-            [1.2990381, 0.0, 0.0, 0.0],
+            [1.299_038, 0.0, 0.0, 0.0],
             [0.0, 1.7320508, 0.0, 0.0],
-            [0.0, 0.0, -1.0157480, -1.0],
-            [0.0, 0.0, -201.57480, 0.0],
+            [0.0, 0.0, -1.015_748, -1.0],
+            [0.0, 0.0, -201.574_8, 0.0],
         ];
         // PROPER guLookAt view: 3x3 = camera basis (right/up/look as columns),
         // translation ROW = -(eye · basis). Eye world ~(3000,700,5600) looking
         // toward (-4000,0,5200). (Raw eye in row 3 would be the bug.)
         let view = [
-            [0.05704979, -0.09918146, 0.99343261, 0.0],
+            [0.05704979, -0.09918146, 0.993_432_6, 0.0],
             [0.0, 0.99505322, 0.09934326, 0.0],
-            [-0.99837133, -0.00566751, 0.05676758, 0.0],
-            [5419.7300, -367.25479, -3367.7366, 1.0],
+            [-0.998_371_3, -0.00566751, 0.05676758, 0.0],
+            [5_419.73, -367.254_8, -3367.7366, 1.0],
         ];
         // Large-world object modelview: rot(15° about Y) then translate to
         // world (-4000, 0, 5200) -- asymmetric so `mvp != mvp^T`.
         let model = [
-            [0.96592583, 0.0, -0.25881905, 0.0],
+            [0.965_925_8, 0.0, -0.25881905, 0.0],
             [0.0, 1.0, 0.0, 0.0],
-            [0.25881905, 0.0, 0.96592583, 0.0],
+            [0.25881905, 0.0, 0.965_925_8, 0.0],
             [-4000.0, 0.0, 5200.0, 1.0],
         ];
 
@@ -2599,7 +2797,7 @@ mod tests {
         wr_cmd(
             &mut rdram,
             off,
-            ((G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1),
+            ((G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1),
             0,
         );
         off += 8;

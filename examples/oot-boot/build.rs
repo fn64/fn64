@@ -126,7 +126,26 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let bridge_dir = manifest_dir.join("bridge");
+    // `native/Cargo.toml` is also the collision-free, audio-disabled C-lane
+    // manifest for worktrees. Its package root is one directory below this
+    // shared build script and bridge, so resolve that explicit layout before
+    // compiling instead of silently pointing cc at a nonexistent directory.
+    let local_bridge_dir = manifest_dir.join("bridge");
+    let bridge_dir = if local_bridge_dir.is_dir() {
+        local_bridge_dir
+    } else {
+        let shared_bridge_dir = manifest_dir
+            .parent()
+            .expect("oot-boot build.rs: manifest directory has no parent")
+            .join("bridge");
+        assert!(
+            shared_bridge_dir.is_dir(),
+            "oot-boot build.rs: neither manifest-local bridge directory {} nor shared bridge directory {} exists",
+            manifest_dir.join("bridge").display(),
+            shared_bridge_dir.display()
+        );
+        shared_bridge_dir
+    };
 
     let mut build = cc::Build::new();
     build

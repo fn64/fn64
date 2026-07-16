@@ -43,6 +43,10 @@ mod native_funcs {
 // ---------------------------------------------------------------------
 
 #[cfg(not(fn64_native_recomp))]
+// `RecompContext` is opaque to this C boundary: the generated entry point only
+// receives its address. Its Rust-only tuple fields therefore do not cross the
+// ABI by value, despite rustc's conservative layout warning.
+#[allow(improper_ctypes)]
 extern "C" {
     /// Walks the real, compiled-in `section_table[]`/`FuncEntry[]` (from
     /// the game's own `recomp_overlays.inl`) and calls `fn64_register_func`
@@ -478,16 +482,20 @@ fn main() {
     // nowhere recognizable. That is expected and reported (blank/garbage),
     // not faked; the objective rasterizer proof lives in
     // fn64-render-rt64/tests/f3dex2_replay.rs, independent of this live path.
+    let render_dump_limit = std::env::var("OOT_RENDER_DUMP_LIMIT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(240);
     let mut render_backend = fn64_render_rt64::ReferenceBackend::new()
         .with_f3dex2()
         .with_clear_color([0, 0, 0, 255])
-        .with_auto_dump("/tmp", "fn64-oot-render", 240);
-    // NOTE: 240 (one full second of NTSC frames) so the capture reaches the
+        .with_auto_dump("/tmp", "fn64-oot-render", render_dump_limit);
+    // NOTE: the default 240 (one full second of NTSC frames) reaches the
     // frames where real 3D geometry appears -- the first ~8 gfx tasks are
     // OoT's boot/logo screens (large flat gradient background quads), and
     // the recognizable projected geometry (rotating title object, then the
-    // file-select 3D scene) shows up later in the boot sequence. A smaller
-    // limit stops at the gradient logos and misses the geometry proof.
+    // file-select 3D scene) shows up later in the boot sequence. Set
+    // OOT_RENDER_DUMP_LIMIT=260 to include task 249 in a 250-swap diagnostic.
     // A common NTSC low-res target; matches capture_framebuffer's assumed
     // 320x240 (this harness does not yet decode the ROM's real OSViMode).
     {

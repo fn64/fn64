@@ -115,8 +115,22 @@ Ordered by leverage, from ground-truth on the reachable file-select 3D scene
 (`/tmp/fn64-depth-nodepth-opaque.png`: recognizable green field + flowers +
 road, but the top half misprojects).
 
-1. **Hyrule Field title-camera projection — the claimed raw-eye matrix bug was
-   falsified by writer tracing (2026-07-16).** Physical `0x1888c8` is written
+1. **Hyrule Field artifact root-caused: skipped RDP othermode makes every
+   triangle compare/update depth (2026-07-16).** The exact C-lane task 249 is
+   red/black by default; clearing prior-task state or bypassing texture leaves
+   it red, while bypassing the hardwired depth policy immediately exposes the
+   moon and recognizable field geometry in the same screen regions as a
+   black-box emulator frame. This does not invalidate the depth math: public
+   `gbi.h` assigns separate `Z_CMP`/`Z_UPD` render-mode bits, OoT alternates
+   setup display lists with and without z-buffering, and RT64 derives compare
+   and write independently from othermode. fn64 skips `G_SETOTHERMODE_L/H` and
+   applies its correct less-than depth operation to every triangle. The proper
+   fix belongs to the RDP state-layer job; `OOT_NO_DEPTH` and per-task clears
+   remain diagnostics, not fixes. Full hashes, counts, source citations, and
+   candidate falsification are in `docs/OOT-RENDER-ARTIFACT.md`.
+
+   The earlier claimed raw-eye matrix bug was
+   falsified by writer tracing. Physical `0x1888c8` is written
    only by recompiled `guMtxF2L` (`funcs_57.c:3275-3344`), called by recompiled
    `guLookAt` at `funcs_57.c:4368`. Immediately before conversion, recompiled
    `guLookAtF` writes its translation at `funcs_57.c:4166,4251,4280`. The
@@ -154,8 +168,9 @@ road, but the top half misprojects).
    `mtxutil.c:3-19`. Finally, `z_play.c:1173-1188` reads the already-written
    viewing matrix to derive separate billboard data; it does not overwrite
    the projection-stack view slot.
-2. **G_SETOTHERMODE_L/H** — currently *not even decoded* (name-table only). No
-   blend/render-mode/alpha state exists. Gates alpha-test + blending.
+2. **G_SETOTHERMODE_L/H** — currently *not even decoded* (name-table only).
+   It now gates correctness of per-draw depth compare/update as well as alpha
+   test and blending; see the task-249 differential above.
 3. **Alpha-test** (alpha compare) — fixes black-box-around-cutouts on
    grass/trees/grates.
 4. **Alpha blending** — translucent water/fog/UI (blender currently always
