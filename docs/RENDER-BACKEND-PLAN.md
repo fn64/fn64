@@ -26,11 +26,20 @@ Three implementations behind the one trait:
    `Interpreter::processDisplayLists(raw F3DEX2 DL)`. The fast faithful path.
    FFI quarantined to the `fn64-render-rt64` crate (the existing unsafe-audit
    boundary), MIT-only (do NOT enable the GPL-header mupen target).
-3. **`NativeBackend`** (future) — a from-scratch clean-room Rust RDP renderer,
-   the eventual all-Rust/wasm-capable replacement. Built later behind the same
-   trait, differential-tested against RT64 (RT64 becomes ITS oracle, exactly
-   as N64Recomp's C output was the oracle for fn64-recomp-native). This is the
-   "own native plugin" half of the decision — deferred, not dropped.
+3. **`NativeBackend`** (future) — an all-Rust/wasm-capable RDP renderer, the
+   eventual pure-Rust replacement. Approach (decided 2026-07-16): **PORT RT64
+   to Rust, don't reimplement from scratch** — RT64 is MIT, so we can port its
+   proven, accurate rendering logic directly (module by module) rather than
+   re-deriving RDP behavior from specs the hard way. Port it **better**: typed
+   state (no C++ reinterpret bugs), fewer allocations, cleaner GPU abstraction,
+   wasm/WebGPU target. Differential-tested against the RT64 wrapper the whole
+   way (the C++ RT64 becomes the oracle for its own Rust port — exactly as
+   N64Recomp's C output was the oracle for fn64-recomp-native). This is the
+   "own native plugin" half — **deferred, not dropped**; wrap first, port later.
+   NOTE: this is the SAME two-backend model as everywhere else — `NativeBackend`
+   is "the pure-Rust backend when it grows RDP-accurate," not a third separate
+   thing. Today's `ReferenceBackend` (software rasterizer) is its seed + the CI
+   oracle; the RT64 port is how it becomes faithful.
 
 ## Sequencing
 - NOW: wire `Rt64Backend` (RT64 FFI) → faithful OoT render, eyes-verified vs
