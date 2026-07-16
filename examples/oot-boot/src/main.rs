@@ -327,6 +327,12 @@ fn main() {
     });
     println!("[oot-boot] ROM size: {} bytes", rom_bytes.len());
     fn64_abi::load_rom(rom_bytes);
+    // OoT NTSC 1.0's osCartRomInit materializes and returns __CartRomHandle
+    // at this guest BSS address (ROM disassembly 0x80005698-0x8000569C and
+    // return path 0x800057BC). AudioLoad_Dma later dereferences the public
+    // OSPiHandle transferInfo at 0x800B824C, so the host shim must return the
+    // real guest-visible object rather than an opaque token.
+    fn64_abi::set_cart_rom_handle_vram(0x8000_9EA0);
 
     // Register OoT's save-backing store so domain-2 (SRAM, devAddr >=
     // 0x08000000 / PI_DOM2_ADDR2) PI DMAs have somewhere to go instead of
