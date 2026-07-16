@@ -535,17 +535,69 @@ from vertex color only. Captured here so phase-2 knows the contract.
 - **`G_SETOTHERMODE_H/L`** (`0xE3`/`0xE2`): the RDP "other modes" — render
   mode (blend/z-compare/AA/cvg), texture filter, cycle type (1-cycle/2-cycle/
   copy/fill), etc. The **render mode** (in the low word) is what actually
-  enables z-compare and alpha blending. For a first opaque frame you can skip
-  it (assume opaque, z-less, 1-cycle); needed for correct transparency/decal
-  ordering in phase-2.
+  enables z-compare and alpha blending. The renderer now decodes the minimum
+  cycle/blender subset described in 5.3; the remaining othermode fields belong
+  to the fuller othermode pass.
 - **`G_SETPRIMCOLOR`/`G_SETENVCOLOR`/`G_SETFOGCOLOR`/`G_SETFILLCOLOR`/
   `G_SETBLENDCOLOR`** (`0xFA`/`0xFB`/`0xF8`/`0xF7`/`0xF9`): flat color
-  registers fed to the combiner/blender. Phase-2.
+  registers fed to the combiner/blender. Blend and fog colors are now decoded
+  for 5.3; primitive/environment/fill colors remain combiner work.
 - **Sync ops** `G_RDPLOADSYNC`/`G_RDPPIPESYNC`/`G_RDPTILESYNC`/
   `G_RDPFULLSYNC` (`0xE6`-`0xE9`) and `G_NOOP`/`G_SPNOOP`
   (`0x00`/`0xE0`): pipeline hazard barriers / no-ops. **Always safe to skip**
   in an HLE decoder — they exist to serialize the real RDP pipeline and have
   no effect on the decoded geometry.
+
+### 5.3 Othermode + framebuffer blender
+
+The RDP framebuffer blender is selected by the two othermode words. OoT uses
+both the full `G_RDPSETOTHERMODE` command (`0xEF`) and F3DEX2's partial
+`G_SETOTHERMODE_L/H` commands (`0xE2`/`0xE3`):
+
+- `G_RDPSETOTHERMODE` replaces the high 24-bit word from `w0[23:0]` and the
+  full low word from `w1` (`gbi.h` lines 3697-3737).
+- A partial setter stores `size-1` in `w0[7:0]` and
+  `32-logical_shift-size` in `w0[15:8]` (`gbi.h` lines 3353-3369). Decode
+  those fields back to a logical bit range and patch only that range.
+- Cycle type is high-othermode bits 20-21: one cycle, two cycles, copy, or
+  fill (`gbi.h` lines 519 and 527-531). Copy/fill bypass the blender.
+- Low-othermode bits 31-16 hold two four-selector tuples. `GBL_c1` places
+  `(P,A,M,B)` at shifts `(30,26,22,18)` and `GBL_c2` at
+  `(28,24,20,16)` (`gbi.h` lines 612-627). Each active cycle evaluates:
+
+  ```text
+  color = P * A + M * B
+  ```
+
+  `P`/`M` can select combined (the incoming fragment in cycle 1, the prior
+  blender result in cycle 2), framebuffer memory, blend color, or fog color.
+  `A` can select combined, fog, shade alpha, or zero; `B` can select one minus
+  A, framebuffer alpha, one, or zero. `FORCE_BL` is low bit `0x4000`
+  (`gbi.h` lines 593-622). Without it the final blender cycle is a P-input
+  pass; in two-cycle mode cycle 1 can still perform fog before that pass.
+
+The standard translucent-surface tuple is
+`IN*A_IN + MEM*(1-A)`, so a half-alpha fragment retains half of the existing
+framebuffer instead of replacing it. The software rasterizer snapshots this
+minimal state per triangle because display lists may change othermode between
+draws. Constant blend/fog colors come from `G_SETBLENDCOLOR`/`G_SETFOGCOLOR`
+(`gbi.h` lines 3640-3656). RT64 independently models the same raw othermode
+shadow, selector ordering, final-cycle bypass, and sequential cycle handoff
+(`shared/rt64_other_mode.h` lines 14-52;
+`shared/rt64_blender.h` lines 45-81 and 366-504). RT64 represents a selected
+framebuffer term as a source color plus a separate blend alpha (lines
+414-424), then its graphics pipeline composites with `SRC1_ALPHA` /
+`INV_SRC1_ALPHA` (`render/rt64_raster_shader.cpp` lines 332-339). This
+software framebuffer performs that last composite directly. `G_BL_A_MEM`
+means coverage alpha, not the stored RGBA byte; because coverage is not yet
+emulated, it is treated as full coverage, matching RT64 lines 351-357.
+
+The blender consumes the alpha produced by the color combiner. Until the
+separate `G_SETCOMBINE`/primitive/environment-color work lands, this renderer's
+"combined alpha" remains the existing shade × texel approximation. The OOTU
+C-lane trace through 1,000 VI swaps produced no fractional combined-alpha
+fragments, so the equation and selector wiring are fixture-verified here but
+live OoT translucency remains visually blocked on that combiner input.
 
 ---
 
