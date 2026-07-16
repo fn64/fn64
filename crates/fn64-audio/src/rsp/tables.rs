@@ -23,12 +23,11 @@
 //! **Inverse sqrt** — the 9-bit index folds the parity of the exponent
 //! (1/sqrt splits by even/odd magnitude exponent, §6.12), so adjacent table
 //! entries interleave two mantissa octaves via
-//! `a = ((i & 1) << 8) + (i >> 1) + 256`, then `entry = (isqrt(2^48 / a) >> 3)`
+//! `a = (i >> 1) + 256`, then `entry = isqrt(2^(47 + (i & 1)) / a) >> 3`
 //! masked to 16 bits, with index 0
-//! again the `1/sqrt(1.0)` overflow storing `0xFFFF`. This reproduces the
-//! documented inverse-sqrt seed sequence (spot-checked below): the even-index
-//! octave gives rsq at 0/2/4/6 = 0xFFFF/0xFF00/0xFE02/0xFD06, and both octaves
-//! are monotone decreasing.
+//! selecting the `1/sqrt(2)` octave and index 1 selecting the
+//! `1/sqrt(1.0)` overflow (`0xFFFF`). This reproduces CEN64's BSD-licensed
+//! `rsp_reciprocal_rom[512..]` ordering.
 //!
 //! The spot-check tests are the contract: if a future refinement of the
 //! rounding disagrees on a low bit, the tests catch it against these known
@@ -75,11 +74,12 @@ fn generate_rcp_rom() -> [u16; RCP_ROM_LEN] {
 fn generate_rsq_rom() -> [u16; RSQ_ROM_LEN] {
     let mut rom = [0u16; RSQ_ROM_LEN];
     for (i, slot) in rom.iter_mut().enumerate() {
-        let a = (((i as u64) & 1) << 8) + ((i as u64) >> 1) + 256;
-        let val = isqrt_u64((1u64 << 48) / a);
+        let a = ((i as u64) >> 1) + 256;
+        let numerator_shift = 47 + (i & 1);
+        let val = isqrt_u64((1u64 << numerator_shift) / a);
         *slot = ((val >> 3) & 0xFFFF) as u16;
     }
-    rom[0] = 0xFFFF;
+    rom[1] = 0xFFFF;
     rom
 }
 
@@ -140,12 +140,15 @@ mod tests {
     #[test]
     fn inverse_sqrt_known_anchor_entries() {
         let rom = rsq_rom();
-        // The even-index octave reproduces the documented inverse-sqrt seed
-        // sequence; index 0 is the 1/sqrt(1.0) overflow -> 0xFFFF.
-        assert_eq!(rom[0], 0xFFFF, "rsq[0]");
-        assert_eq!(rom[2], 0xFF00, "rsq[2]");
-        assert_eq!(rom[4], 0xFE02, "rsq[4]");
-        assert_eq!(rom[6], 0xFD06, "rsq[6]");
+        // CEN64 `common/reciprocal.c`, entries 512..519 (BSD-3-Clause).
+        assert_eq!(rom[0], 0x6A09, "rsq[0]");
+        assert_eq!(rom[1], 0xFFFF, "rsq[1]");
+        assert_eq!(rom[2], 0x6955, "rsq[2]");
+        assert_eq!(rom[3], 0xFF00, "rsq[3]");
+        assert_eq!(rom[4], 0x68A1, "rsq[4]");
+        assert_eq!(rom[5], 0xFE02, "rsq[5]");
+        assert_eq!(rom[6], 0x67EF, "rsq[6]");
+        assert_eq!(rom[7], 0xFD06, "rsq[7]");
     }
 
     #[test]

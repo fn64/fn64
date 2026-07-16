@@ -318,37 +318,36 @@ pub fn clamp_signed(value: i64) -> i16 {
     }
 }
 
-/// Unsigned clamp per the RSP's specific rule (RSP-VU-ISA.md §4 mode 2), used
-/// by the "U" multiply variants (`VMULU`/`VMACU`). The input is the value
-/// being extracted (`acc >> 16`); if that signed value is negative → `0x0000`,
-/// if it exceeds `0xFFFF` → `0xFFFF`, else its low 16 bits. Returned as the
-/// `u16` result lane (op stores it as `i16` bit-for-bit).
+/// Unsigned fractional clamp used by `VMULU`/`VMACU`. Their signed product is
+/// interpreted as an unsigned fraction: negative accumulators clamp to zero,
+/// positive values whose MD sign bit is set clamp to `0xFFFF`, and the
+/// remaining positive range returns MD. This is the HI/MD sign test in
+/// CEN64's `rsp_vmacf_vmacu`, not an ordinary 0..=65535 integer clamp.
 #[inline]
 pub fn clamp_unsigned(value: i64) -> u16 {
     if value < 0 {
         0x0000
-    } else if value > 0xFFFF {
+    } else if value > i16::MAX as i64 {
         0xFFFF
     } else {
         (value & 0xFFFF) as u16
     }
 }
 
-/// The unsigned-low clamp (RSP-VU-ISA.md §4 mode 2 as applied by
-/// `VMADN`/`VMADL`, §6.2, §7): decide by the sign/magnitude of the top 32
-/// bits `acc[47..16]`. If that signed 32-bit value is `< 0` → `0x0000`, if
-/// `> 0xFFFF` → `0xFFFF`, else the raw `acc_lo`. This is the accumulate-time
-/// low-part clamp that distinguishes `VMADN` (clamps) from `VMUDN`
-/// (truncates).
+/// The low-slice clamp used by `VMADN`/`VMADL`. LO is returned only when HI is
+/// a sign extension of MD. Otherwise negative overflow clamps to zero and
+/// positive overflow to `0xFFFF` (SGI guide's `Clamp_Signed(ACC15..0)`,
+/// independently structured as CEN64's `rsp_uclamp_acc`).
 #[inline]
 pub fn clamp_unsigned_low(acc: &Accumulator, lane: usize) -> u16 {
-    let hi_mid = acc.read_hi_mid_signed(lane);
-    if hi_mid < 0 {
-        0x0000
-    } else if hi_mid > 0xFFFF {
-        0xFFFF
-    } else {
+    let hi = acc.read_hi(lane) as i16;
+    let mid = acc.read_mid(lane) as i16;
+    if hi == (mid >> 15) {
         acc.read_lo(lane)
+    } else if hi < 0 {
+        0
+    } else {
+        0xFFFF
     }
 }
 
@@ -446,20 +445,22 @@ mod tests {
     #[test]
     fn clamp_unsigned_rule() {
         assert_eq!(clamp_unsigned(-1), 0x0000);
-        assert_eq!(clamp_unsigned(0x1_0000), 0xFFFF);
         assert_eq!(clamp_unsigned(0x1234), 0x1234);
-        assert_eq!(clamp_unsigned(0xFFFF), 0xFFFF);
+        assert_eq!(clamp_unsigned(0x7FFF), 0x7FFF);
+        assert_eq!(clamp_unsigned(0x8000), 0xFFFF);
     }
 
     #[test]
     fn clamp_unsigned_low_decides_by_hi_mid() {
         let mut acc = Accumulator::default();
-        // acc[47..16] negative -> 0
-        acc.set(0, -0x1_0000); // top32 = -1
-        assert_eq!(clamp_unsigned_low(&acc, 0), 0x0000);
-        // acc[47..16] > 0xFFFF -> 0xFFFF
+        // A sign-extended negative accumulator is in range and returns LO.
+        acc.set(0, -1);
+        assert_eq!(clamp_unsigned_low(&acc, 0), 0xFFFF);
+        // Positive and negative HI/MD sign mismatches clamp outward.
         acc.set(0, 0x1_0000_0000); // top32 = 0x1_0000
         assert_eq!(clamp_unsigned_low(&acc, 0), 0xFFFF);
+        acc.set(0, -(0x8001i64 << 16));
+        assert_eq!(clamp_unsigned_low(&acc, 0), 0x0000);
         // in range -> raw acc_lo
         acc.set(0, 0x0000_1234_5678); // top32 = 0x1234, lo = 0x5678
         assert_eq!(clamp_unsigned_low(&acc, 0), 0x5678);
