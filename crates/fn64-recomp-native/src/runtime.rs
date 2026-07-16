@@ -20,8 +20,9 @@
 //! - A KSEG0/KSEG1 virtual address `v` maps to rdram byte offset
 //!   `v - 0xFFFF_FFFF_8000_0000` (i.e. strip the sign-extended `0x8000_0000`
 //!   base). This is the `- 0xFFFFFFFF80000000` in the C macros.
-//! - Sub-word accesses XOR the byte offset: halfword `^2`, byte `^3`. This is
-//!   the N64's big-endian-in-a-little-endian-buffer convention. It is applied
+//! - Word accesses use the host-native representation used by the ABI buffer;
+//!   sub-word accesses XOR the byte offset: halfword `^2`, byte `^3`. This is
+//!   the N64's big-endian view over a little-endian host buffer. It is applied
 //!   here in one spot, in [`Rdram`].
 
 /// The recompiled-CPU register context: 32 general-purpose registers plus the
@@ -55,6 +56,14 @@ pub struct RecompContext {
     /// promoted to context state (equivalent: a compare always precedes the
     /// branch that reads it, so lifetime is irrelevant to the result).
     pub fpu_cond: bool,
+    /// FCSR bits other than condition bit 23, which is kept in `fpu_cond` so
+    /// generated branch code can read it directly. VR4300 User's Manual
+    /// section 6.3.2.2 defines FS(24), Cause(17:12), Enables(11:7),
+    /// Flags(6:2), and RM(1:0); reserved bits read as zero.
+    fcsr: u32,
+    /// Address/width of the most recent LL/LLD reservation. There is only one
+    /// architectural LLbit. A mismatched SC/SCD must fail and clear it.
+    ll_reservation: Option<(u64, u8)>,
     /// COP0 register 9, `Count`: the free-running cycle counter that backs
     /// `osGetCount`. It is the one COP0 read a recompiled body legitimately
     /// performs (`MFC0 rt, $9`); the host advances it. Modeled as real state
@@ -64,6 +73,10 @@ pub struct RecompContext {
     /// `MTC0 rt, $11` on the `osSetTimer` path. Stored so the write round-trips;
     /// the interrupt it would schedule is the host's concern.
     pub cop0_compare: u32,
+    /// COP0 condition bit used by BC0*. On VR4300 this reflects Status.CH.
+    /// CACHE tag operations are host-modeled, so callers that exercise BC0
+    /// explicitly supply the observed condition through this field.
+    pub cop0_cond: bool,
 }
 
 impl RecompContext {
@@ -122,13 +135,208 @@ impl RecompContext {
         self.set_r(idx, val as i64 as u64);
     }
 
+    /// Read FCR0/FCR31. The VR4300 implements only those two control
+    /// registers (User's Manual section 6.3.2); reserved FCRs read as zero.
+    #[inline]
+    pub fn read_fcr(&self, idx: u8) -> u32 {
+        match idx {
+            // VR4300 implementation number 0x0B, revision zero.
+            0 => 0x0000_0B00,
+            31 => (self.fcsr & !(1 << 23)) | ((self.fpu_cond as u32) << 23),
+            _ => panic!("reserved COP1 control register FCR{idx}"),
+        }
+    }
+
+    /// Write FCR31. Writes to FCR0/reserved FCRs have no architectural
+    /// effect. Reserved bits are discarded rather than becoming hidden state.
+    #[inline]
+    pub fn write_fcr(&mut self, idx: u8, value: u32) {
+        assert_eq!(
+            idx, 31,
+            "write to read-only/reserved COP1 control register FCR{idx}"
+        );
+        const WRITABLE: u32 = (1 << 24) | (1 << 23) | 0x0003_FFFF;
+        self.fpu_cond = value & (1 << 23) != 0;
+        self.fcsr = value & WRITABLE & !(1 << 23);
+    }
+
+    /// Establish the single architectural LLbit reservation.
+    #[inline]
+    pub fn set_ll_reservation(&mut self, vaddr: u64, width: u8) {
+        self.ll_reservation = Some((vaddr, width));
+    }
+
+    /// Test and clear the LLbit for SC/SCD. The VR4300 User's Manual LL/SC
+    /// descriptions require the linked access to target the same block; this
+    /// typed runtime uses the stricter same-address/same-width condition.
+    #[inline]
+    pub fn take_ll_reservation(&mut self, vaddr: u64, width: u8) -> bool {
+        self.ll_reservation.take() == Some((vaddr, width))
+    }
+
+    /// VR4300 signed word division, including the implementation-defined
+    /// divide-by-zero results documented in User's Manual appendix D.2.
+    pub fn div_s32(&mut self, dividend: i32, divisor: i32) {
+        if divisor == 0 {
+            self.lo = if dividend < 0 {
+                0xFFFF_FFFF_8000_0001
+            } else {
+                0x0000_0000_7FFF_FFFF
+            };
+            self.hi = dividend as i64 as u64;
+        } else {
+            self.lo = dividend.wrapping_div(divisor) as i64 as u64;
+            self.hi = dividend.wrapping_rem(divisor) as i64 as u64;
+        }
+    }
+
+    /// VR4300 unsigned word division. Word HI/LO results are sign-extended,
+    /// including the all-ones quotient on divide by zero.
+    pub fn div_u32(&mut self, dividend: u32, divisor: u32) {
+        if let Some(quotient) = dividend.checked_div(divisor) {
+            self.lo = quotient as i32 as i64 as u64;
+            self.hi = (dividend % divisor) as i32 as i64 as u64;
+        } else {
+            self.lo = u64::MAX;
+            self.hi = (dividend as i32) as i64 as u64;
+        }
+    }
+
+    /// Signed doubleword division. INT64_MIN/-1 produces the architectural
+    /// wrapped quotient and zero remainder. The public VR4300 appendix prints
+    /// only word-sized divide-by-zero results, so DDIV-by-zero traps loudly
+    /// rather than inventing a 64-bit constant.
+    pub fn div_s64(&mut self, dividend: i64, divisor: i64) {
+        assert_ne!(
+            divisor, 0,
+            "DDIV by zero: result is not specified by the public VR4300 manual"
+        );
+        if dividend == i64::MIN && divisor == -1 {
+            self.lo = dividend as u64;
+            self.hi = 0;
+        } else {
+            self.lo = dividend.wrapping_div(divisor) as u64;
+            self.hi = dividend.wrapping_rem(divisor) as u64;
+        }
+    }
+
+    /// Unsigned doubleword division. See [`RecompContext::div_s64`] for why a
+    /// zero divisor is a loud uncertainty trap.
+    pub fn div_u64(&mut self, dividend: u64, divisor: u64) {
+        assert_ne!(
+            divisor, 0,
+            "DDIVU by zero: result is not specified by the public VR4300 manual"
+        );
+        self.lo = dividend / divisor;
+        self.hi = dividend % divisor;
+    }
+
+    /// Convert a floating value to an integer using FCSR.RM (or a fixed mode
+    /// for ROUND/TRUNC/CEIL/FLOOR). Cause bits are per-operation and Flag bits
+    /// accumulate as specified by VR4300 User's Manual section 6.3.2.2.
+    pub fn fpu_to_i32(&mut self, value: f64, fixed_mode: Option<u8>) -> i32 {
+        let rounded = self.round_for_mode(value, fixed_mode);
+        if !rounded.is_finite() || !(-2_147_483_648.0..2_147_483_648.0).contains(&rounded) {
+            self.raise_fpu(4);
+            i32::MIN
+        } else {
+            if rounded != value {
+                self.raise_fpu(0);
+            }
+            rounded as i32
+        }
+    }
+
+    /// 64-bit counterpart of [`RecompContext::fpu_to_i32`].
+    pub fn fpu_to_i64(&mut self, value: f64, fixed_mode: Option<u8>) -> i64 {
+        let rounded = self.round_for_mode(value, fixed_mode);
+        // i64::MAX is not exactly representable as f64; 2^63 itself is the
+        // exclusive upper bound, while -2^63 is representable and valid.
+        if !rounded.is_finite()
+            || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&rounded)
+        {
+            self.raise_fpu(4);
+            i64::MIN
+        } else {
+            if rounded != value {
+                self.raise_fpu(0);
+            }
+            rounded as i64
+        }
+    }
+
+    #[inline]
+    fn round_for_mode(&mut self, value: f64, fixed_mode: Option<u8>) -> f64 {
+        // Cause is rewritten by every arithmetic/conversion operation.
+        self.fcsr &= !(0x3F << 12);
+        match fixed_mode.unwrap_or((self.fcsr & 3) as u8) {
+            0 => value.round_ties_even(),
+            1 => value.trunc(),
+            2 => value.ceil(),
+            3 => value.floor(),
+            _ => unreachable!("FCSR.RM and fixed rounding modes are two bits"),
+        }
+    }
+
+    #[inline]
+    fn raise_fpu(&mut self, exception: u8) {
+        // exception 0..4 = Inexact, Underflow, Overflow, Divide-by-zero,
+        // Invalid. Cause adds bit 12; sticky Flag adds bit 2.
+        self.fcsr |= 1 << (12 + exception);
+        self.fcsr |= 1 << (2 + exception);
+        if self.fcsr & (1 << (7 + exception)) != 0 {
+            panic!("enabled COP1 exception {}", exception);
+        }
+    }
+
+    /// Evaluate any of the sixteen C.cond.fmt predicates. The low three funct
+    /// bits select unordered/equal/less participation; bit 3 selects signaling
+    /// behavior. Quiet compares still signal on an SNaN.
+    pub fn fpu_compare(&mut self, lhs: f64, rhs: f64, lhs_snan: bool, rhs_snan: bool, cond: u8) {
+        self.fcsr &= !(0x3F << 12);
+        let unordered = lhs.is_nan() || rhs.is_nan();
+        if (unordered && cond & 0x8 != 0) || lhs_snan || rhs_snan {
+            self.raise_fpu(4);
+        }
+        self.fpu_cond = (unordered && cond & 1 != 0)
+            || (!unordered && lhs == rhs && cond & 2 != 0)
+            || (!unordered && lhs < rhs && cond & 4 != 0);
+    }
+
+    #[inline]
+    pub fn fpu_compare_s(&mut self, fs: u8, ft: u8, cond: u8) {
+        let a = self.f_bits(fs);
+        let b = self.f_bits(ft);
+        self.fpu_compare(
+            f32::from_bits(a) as f64,
+            f32::from_bits(b) as f64,
+            is_snan32(a),
+            is_snan32(b),
+            cond,
+        );
+    }
+
+    #[inline]
+    pub fn fpu_compare_d(&mut self, fs: u8, ft: u8, cond: u8) {
+        let a = self.d_bits(fs);
+        let b = self.d_bits(ft);
+        self.fpu_compare(
+            f64::from_bits(a),
+            f64::from_bits(b),
+            is_snan64(a),
+            is_snan64(b),
+            cond,
+        );
+    }
+
     // ================================================================
     // COP1 / FPU register file.
     //
     // # The FR=0 even/odd pairing (the whole reason these aren't 32 plain f32s)
     //
-    // libultra boots every OSThread with the FPU in FR=0 (32-register) mode.
-    // In that mode a 64-bit value (a double, or a `ldc1`/`sdc1`/`dmtc1` slot)
+    // libultra boots every OSThread with the FPU in FR=0 mode: 16 paired
+    // 64-bit FGRs addressed by even register numbers. In that mode a 64-bit
+    // value (a double, or a `ldc1`/`sdc1`/`dmtc1` slot)
     // lives in an *even* register `$f(2k)`, and the odd register `$f(2k+1)`
     // is NOT independent — it aliases the HIGH 32 bits of that same 64-bit
     // slot. A single-precision `$f(2k+1)` therefore reads/writes the top word
@@ -192,26 +400,40 @@ impl RecompContext {
     /// Under FR=0 these use even registers; we index the slot directly.
     #[inline]
     pub fn d_bits(&self, idx: u8) -> u64 {
+        assert_eq!(idx & 1, 0, "FR=0 doubleword read from odd FPR f{idx}");
         self.fpr[idx as usize]
     }
 
     /// Write raw 64 bits into doubleword FPR `idx`.
     #[inline]
     pub fn set_d_bits(&mut self, idx: u8, bits: u64) {
+        assert_eq!(idx & 1, 0, "FR=0 doubleword write to odd FPR f{idx}");
         self.fpr[idx as usize] = bits;
     }
 
     /// Read double-precision FPR `idx` as an `f64`.
     #[inline]
     pub fn f_d(&self, idx: u8) -> f64 {
-        f64::from_bits(self.fpr[idx as usize])
+        f64::from_bits(self.d_bits(idx))
     }
 
     /// Write an `f64` into double-precision FPR `idx`.
     #[inline]
     pub fn set_f_d(&mut self, idx: u8, val: f64) {
-        self.fpr[idx as usize] = val.to_bits();
+        self.set_d_bits(idx, val.to_bits());
     }
+}
+
+#[inline]
+fn is_snan32(bits: u32) -> bool {
+    bits & 0x7F80_0000 == 0x7F80_0000 && bits & 0x007F_FFFF != 0 && bits & 0x0040_0000 == 0
+}
+
+#[inline]
+fn is_snan64(bits: u64) -> bool {
+    bits & 0x7FF0_0000_0000_0000 == 0x7FF0_0000_0000_0000
+        && bits & 0x000F_FFFF_FFFF_FFFF != 0
+        && bits & 0x0008_0000_0000_0000 == 0
 }
 
 /// Round an `f32` to the nearest integer, ties to even — the FPU's default
@@ -266,12 +488,11 @@ impl<'a> Rdram<'a> {
         vaddr.wrapping_sub(RDRAM_VBASE) as usize
     }
 
-    /// Effective virtual address of a `off(base)` operand: 32-bit-wrapping add
-    /// of the base register's low word and the sign-extended offset, then
-    /// sign-extended back to 64 bits (matches how the C forms `reg + offset`).
+    /// Effective virtual address of a `off(base)` operand: full-width MIPS III
+    /// addition of the 64-bit base and sign-extended 16-bit offset.
     #[inline]
     pub fn eff_addr(base_val: u64, off: i16) -> u64 {
-        (base_val as u32).wrapping_add(off as i32 as u32) as i32 as i64 as u64
+        base_val.wrapping_add(off as i64 as u64)
     }
 
     // --- Aligned loads ---
@@ -281,14 +502,21 @@ impl<'a> Rdram<'a> {
     #[inline]
     pub fn load_w(&self, vaddr: u64) -> i32 {
         let p = Self::phys(vaddr);
-        i32::from_be_bytes([self.mem[p], self.mem[p + 1], self.mem[p + 2], self.mem[p + 3]])
+        assert_eq!(p & 3, 0, "unaligned LW at {vaddr:#018x}");
+        i32::from_ne_bytes([
+            self.mem[p],
+            self.mem[p + 1],
+            self.mem[p + 2],
+            self.mem[p + 3],
+        ])
     }
 
     /// Load a sign-extended halfword (byte offset XOR 2).
     #[inline]
     pub fn load_h(&self, vaddr: u64) -> i16 {
+        assert_eq!(vaddr & 1, 0, "unaligned LH at {vaddr:#018x}");
         let p = Self::phys(vaddr) ^ 2;
-        i16::from_be_bytes([self.mem[p], self.mem[p + 1]])
+        i16::from_ne_bytes([self.mem[p], self.mem[p + 1]])
     }
 
     /// Load a zero-extended halfword (byte offset XOR 2).
@@ -317,14 +545,16 @@ impl<'a> Rdram<'a> {
     #[inline]
     pub fn store_w(&mut self, vaddr: u64, val: u32) {
         let p = Self::phys(vaddr);
-        self.mem[p..p + 4].copy_from_slice(&val.to_be_bytes());
+        assert_eq!(p & 3, 0, "unaligned SW at {vaddr:#018x}");
+        self.mem[p..p + 4].copy_from_slice(&val.to_ne_bytes());
     }
 
     /// Store the low halfword of `val` (byte offset XOR 2).
     #[inline]
     pub fn store_h(&mut self, vaddr: u64, val: u16) {
+        assert_eq!(vaddr & 1, 0, "unaligned SH at {vaddr:#018x}");
         let p = Self::phys(vaddr) ^ 2;
-        self.mem[p..p + 2].copy_from_slice(&val.to_be_bytes());
+        self.mem[p..p + 2].copy_from_slice(&val.to_ne_bytes());
     }
 
     /// Store the low byte of `val` (byte offset XOR 3).
@@ -391,15 +621,15 @@ impl<'a> Rdram<'a> {
     // Clean-roomed from the MIPS III ISA and matching N64Recomp's
     // `load_doubleword`/`SD` macros exactly: a doubleword is the two 32-bit
     // words at `vaddr+0` (the high half) and `vaddr+4` (the low half). Each
-    // half goes through the ordinary word path (`load_w`/`store_w`) — word
-    // accesses carry NO sub-word swizzle — so the doubleword byte order comes
-    // out big-endian, high word first, exactly as the game's memory image
-    // holds it.
+    // half goes through the ordinary native-endian word path
+    // (`load_w`/`store_w`) with no sub-word swizzle. Logically, the high guest
+    // word remains at `vaddr+0` and the low guest word at `vaddr+4`.
 
     /// Load a 64-bit doubleword: `(hi_word << 32) | lo_word` where `hi_word` is
     /// at `vaddr+0` and `lo_word` at `vaddr+4`.
     #[inline]
     pub fn load_d(&self, vaddr: u64) -> u64 {
+        assert_eq!(vaddr & 7, 0, "unaligned LD at {vaddr:#018x}");
         let hi = self.load_w(vaddr) as u32 as u64;
         let lo = self.load_w(vaddr.wrapping_add(4)) as u32 as u64;
         (hi << 32) | lo
@@ -409,6 +639,7 @@ impl<'a> Rdram<'a> {
     /// `vaddr+4`.
     #[inline]
     pub fn store_d(&mut self, vaddr: u64, val: u64) {
+        assert_eq!(vaddr & 7, 0, "unaligned SD at {vaddr:#018x}");
         self.store_w(vaddr, (val >> 32) as u32);
         self.store_w(vaddr.wrapping_add(4), val as u32);
     }

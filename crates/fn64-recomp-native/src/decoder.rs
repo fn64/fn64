@@ -38,7 +38,7 @@
 pub type Reg = u8;
 
 /// The decoded operation plus its typed operands. One variant per ISA op we
-/// cover. Unrecognized words decode to [`Instruction::Unknown`] carrying the
+/// recognize. Unrecognized/reserved words decode to [`Instruction::Unknown`] carrying the
 /// raw bits (loud failure, never a silent nop).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Instruction {
@@ -47,31 +47,85 @@ pub enum Instruction {
 
     // --- Loads (I-type: base=rs, dest/src=rt, signed 16-bit offset) ---
     /// Load byte (sign-extended). `LB rt, off(base)`.
-    Lb { rt: Reg, base: Reg, off: i16 },
+    Lb {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Load byte unsigned. `LBU rt, off(base)`.
-    Lbu { rt: Reg, base: Reg, off: i16 },
+    Lbu {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Load halfword (sign-extended). `LH rt, off(base)`.
-    Lh { rt: Reg, base: Reg, off: i16 },
+    Lh {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Load halfword unsigned. `LHU rt, off(base)`.
-    Lhu { rt: Reg, base: Reg, off: i16 },
+    Lhu {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Load word (sign-extended into the 64-bit GPR). `LW rt, off(base)`.
-    Lw { rt: Reg, base: Reg, off: i16 },
+    Lw {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
+    /// Load word unsigned (zero-extended into the 64-bit GPR). `LWU rt, off(base)`.
+    Lwu {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Load word left (unaligned). `LWL rt, off(base)`.
-    Lwl { rt: Reg, base: Reg, off: i16 },
+    Lwl {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Load word right (unaligned). `LWR rt, off(base)`.
-    Lwr { rt: Reg, base: Reg, off: i16 },
+    Lwr {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
 
     // --- Stores ---
     /// Store byte. `SB rt, off(base)`.
-    Sb { rt: Reg, base: Reg, off: i16 },
+    Sb {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Store halfword. `SH rt, off(base)`.
-    Sh { rt: Reg, base: Reg, off: i16 },
+    Sh {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Store word. `SW rt, off(base)`.
-    Sw { rt: Reg, base: Reg, off: i16 },
+    Sw {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Store word left. `SWL rt, off(base)`.
-    Swl { rt: Reg, base: Reg, off: i16 },
+    Swl {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Store word right. `SWR rt, off(base)`.
-    Swr { rt: Reg, base: Reg, off: i16 },
+    Swr {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
 
     // --- 64-bit doubleword loads/stores (MIPS III) ---
     //
@@ -79,187 +133,478 @@ pub enum Instruction {
     // (see the decoder tests): LD=opcode 0x37, SD=0x3F, LDL=0x1A, LDR=0x1B,
     // SDL=0x2C, SDR=0x2D, LLD=0x34, SCD=0x3C.
     /// Load doubleword. `LD rt, off(base)`.
-    Ld { rt: Reg, base: Reg, off: i16 },
+    Ld {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Store doubleword. `SD rt, off(base)`.
-    Sd { rt: Reg, base: Reg, off: i16 },
+    Sd {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Load doubleword left (unaligned). `LDL rt, off(base)`.
-    Ldl { rt: Reg, base: Reg, off: i16 },
+    Ldl {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Load doubleword right (unaligned). `LDR rt, off(base)`.
-    Ldr { rt: Reg, base: Reg, off: i16 },
+    Ldr {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Store doubleword left. `SDL rt, off(base)`.
-    Sdl { rt: Reg, base: Reg, off: i16 },
+    Sdl {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Store doubleword right. `SDR rt, off(base)`.
-    Sdr { rt: Reg, base: Reg, off: i16 },
-    /// Load-linked doubleword. `LLD rt, off(base)`. On the single-threaded
-    /// recompilation model (no other processor to invalidate the link) this is
-    /// a plain doubleword load; see the emitter note.
-    Lld { rt: Reg, base: Reg, off: i16 },
-    /// Store-conditional doubleword. `SCD rt, off(base)`. On the
-    /// single-threaded recompilation model the conditional store always
-    /// succeeds, so it stores the doubleword and sets rt to 1; see the emitter
-    /// note.
-    Scd { rt: Reg, base: Reg, off: i16 },
+    Sdr {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
+    /// Load-linked doubleword. `LLD rt, off(base)`.
+    Lld {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
+    /// Store-conditional doubleword. `SCD rt, off(base)`.
+    Scd {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
+    /// Load-linked word. `LL rt, off(base)`.
+    Ll {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
+    /// Store-conditional word. `SC rt, off(base)`.
+    Sc {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
 
     // --- 64-bit doubleword ALU immediate (I-type) ---
-    /// Doubleword add immediate (trap on overflow; treated as DADDIU per the
-    /// recomp custom of ignoring integer-overflow traps). `DADDI rt, rs, imm`.
-    Daddi { rt: Reg, rs: Reg, imm: i16 },
+    /// Doubleword add immediate (trap on overflow). `DADDI rt, rs, imm`.
+    Daddi {
+        rt: Reg,
+        rs: Reg,
+        imm: i16,
+    },
     /// Doubleword add immediate unsigned (no trap). `DADDIU rt, rs, imm`.
-    Daddiu { rt: Reg, rs: Reg, imm: i16 },
+    Daddiu {
+        rt: Reg,
+        rs: Reg,
+        imm: i16,
+    },
 
     // --- 64-bit doubleword ALU register (R-type, SPECIAL) ---
-    /// Doubleword add (trap on overflow; treated as DADDU). `DADD rd, rs, rt`.
-    Dadd { rd: Reg, rs: Reg, rt: Reg },
+    /// Doubleword add (trap on overflow). `DADD rd, rs, rt`.
+    Dadd {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
     /// Doubleword add unsigned. `DADDU rd, rs, rt`.
-    Daddu { rd: Reg, rs: Reg, rt: Reg },
-    /// Doubleword subtract (trap on overflow; treated as DSUBU). `DSUB rd, rs, rt`.
-    Dsub { rd: Reg, rs: Reg, rt: Reg },
+    Daddu {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
+    /// Doubleword subtract (trap on overflow). `DSUB rd, rs, rt`.
+    Dsub {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
     /// Doubleword subtract unsigned. `DSUBU rd, rs, rt`.
-    Dsubu { rd: Reg, rs: Reg, rt: Reg },
+    Dsubu {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
 
     // --- 64-bit doubleword shifts (R-type, SPECIAL) ---
     /// Doubleword shift left logical by `sa` (0..31). `DSLL rd, rt, sa`.
-    Dsll { rd: Reg, rt: Reg, sa: u8 },
+    Dsll {
+        rd: Reg,
+        rt: Reg,
+        sa: u8,
+    },
     /// Doubleword shift right logical by `sa`. `DSRL rd, rt, sa`.
-    Dsrl { rd: Reg, rt: Reg, sa: u8 },
+    Dsrl {
+        rd: Reg,
+        rt: Reg,
+        sa: u8,
+    },
     /// Doubleword shift right arithmetic by `sa`. `DSRA rd, rt, sa`.
-    Dsra { rd: Reg, rt: Reg, sa: u8 },
+    Dsra {
+        rd: Reg,
+        rt: Reg,
+        sa: u8,
+    },
     /// Doubleword shift left logical by `sa + 32` (32..63). `DSLL32 rd, rt, sa`.
-    Dsll32 { rd: Reg, rt: Reg, sa: u8 },
+    Dsll32 {
+        rd: Reg,
+        rt: Reg,
+        sa: u8,
+    },
     /// Doubleword shift right logical by `sa + 32`. `DSRL32 rd, rt, sa`.
-    Dsrl32 { rd: Reg, rt: Reg, sa: u8 },
+    Dsrl32 {
+        rd: Reg,
+        rt: Reg,
+        sa: u8,
+    },
     /// Doubleword shift right arithmetic by `sa + 32`. `DSRA32 rd, rt, sa`.
-    Dsra32 { rd: Reg, rt: Reg, sa: u8 },
+    Dsra32 {
+        rd: Reg,
+        rt: Reg,
+        sa: u8,
+    },
     /// Doubleword shift left logical variable (by `rs & 63`). `DSLLV rd, rt, rs`.
-    Dsllv { rd: Reg, rt: Reg, rs: Reg },
+    Dsllv {
+        rd: Reg,
+        rt: Reg,
+        rs: Reg,
+    },
     /// Doubleword shift right logical variable (by `rs & 63`). `DSRLV rd, rt, rs`.
-    Dsrlv { rd: Reg, rt: Reg, rs: Reg },
+    Dsrlv {
+        rd: Reg,
+        rt: Reg,
+        rs: Reg,
+    },
     /// Doubleword shift right arithmetic variable (by `rs & 63`). `DSRAV rd, rt, rs`.
-    Dsrav { rd: Reg, rt: Reg, rs: Reg },
+    Dsrav {
+        rd: Reg,
+        rt: Reg,
+        rs: Reg,
+    },
 
     // --- 64-bit doubleword mult/div (R-type, SPECIAL; write HI/LO) ---
     /// Doubleword multiply signed (128-bit product into HI:LO). `DMULT rs, rt`.
-    Dmult { rs: Reg, rt: Reg },
+    Dmult {
+        rs: Reg,
+        rt: Reg,
+    },
     /// Doubleword multiply unsigned. `DMULTU rs, rt`.
-    Dmultu { rs: Reg, rt: Reg },
+    Dmultu {
+        rs: Reg,
+        rt: Reg,
+    },
     /// Doubleword divide signed (LO=quotient, HI=remainder). `DDIV rs, rt`.
-    Ddiv { rs: Reg, rt: Reg },
+    Ddiv {
+        rs: Reg,
+        rt: Reg,
+    },
     /// Doubleword divide unsigned. `DDIVU rs, rt`.
-    Ddivu { rs: Reg, rt: Reg },
+    Ddivu {
+        rs: Reg,
+        rt: Reg,
+    },
 
     // --- ALU immediate (I-type) ---
-    /// Add immediate (trap on overflow; we treat as ADDIU per recomp custom).
-    Addi { rt: Reg, rs: Reg, imm: i16 },
+    /// Add immediate (trap on overflow).
+    Addi {
+        rt: Reg,
+        rs: Reg,
+        imm: i16,
+    },
     /// Add immediate unsigned (no trap). `ADDIU rt, rs, imm`.
-    Addiu { rt: Reg, rs: Reg, imm: i16 },
+    Addiu {
+        rt: Reg,
+        rs: Reg,
+        imm: i16,
+    },
     /// Set-on-less-than immediate (signed). `SLTI rt, rs, imm`.
-    Slti { rt: Reg, rs: Reg, imm: i16 },
+    Slti {
+        rt: Reg,
+        rs: Reg,
+        imm: i16,
+    },
     /// Set-on-less-than immediate unsigned. `SLTIU rt, rs, imm`.
-    Sltiu { rt: Reg, rs: Reg, imm: i16 },
+    Sltiu {
+        rt: Reg,
+        rs: Reg,
+        imm: i16,
+    },
     /// And immediate (zero-extended). `ANDI rt, rs, imm`.
-    Andi { rt: Reg, rs: Reg, imm: u16 },
+    Andi {
+        rt: Reg,
+        rs: Reg,
+        imm: u16,
+    },
     /// Or immediate (zero-extended). `ORI rt, rs, imm`.
-    Ori { rt: Reg, rs: Reg, imm: u16 },
+    Ori {
+        rt: Reg,
+        rs: Reg,
+        imm: u16,
+    },
     /// Xor immediate (zero-extended). `XORI rt, rs, imm`.
-    Xori { rt: Reg, rs: Reg, imm: u16 },
+    Xori {
+        rt: Reg,
+        rs: Reg,
+        imm: u16,
+    },
     /// Load upper immediate. `LUI rt, imm` (imm << 16, sign-extended).
-    Lui { rt: Reg, imm: u16 },
+    Lui {
+        rt: Reg,
+        imm: u16,
+    },
 
     // --- ALU register (R-type, SPECIAL) ---
-    /// Add (trap on overflow; treated as ADD). `ADD rd, rs, rt`.
-    Add { rd: Reg, rs: Reg, rt: Reg },
+    /// Add (trap on overflow). `ADD rd, rs, rt`.
+    Add {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
     /// Add unsigned. `ADDU rd, rs, rt`.
-    Addu { rd: Reg, rs: Reg, rt: Reg },
+    Addu {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
     /// Subtract. `SUB rd, rs, rt`.
-    Sub { rd: Reg, rs: Reg, rt: Reg },
+    Sub {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
     /// Subtract unsigned. `SUBU rd, rs, rt`.
-    Subu { rd: Reg, rs: Reg, rt: Reg },
+    Subu {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
     /// Bitwise and. `AND rd, rs, rt`.
-    And { rd: Reg, rs: Reg, rt: Reg },
+    And {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
     /// Bitwise or. `OR rd, rs, rt`.
-    Or { rd: Reg, rs: Reg, rt: Reg },
+    Or {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
     /// Bitwise xor. `XOR rd, rs, rt`.
-    Xor { rd: Reg, rs: Reg, rt: Reg },
+    Xor {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
     /// Bitwise nor. `NOR rd, rs, rt`.
-    Nor { rd: Reg, rs: Reg, rt: Reg },
+    Nor {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
     /// Set-on-less-than (signed). `SLT rd, rs, rt`.
-    Slt { rd: Reg, rs: Reg, rt: Reg },
+    Slt {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
     /// Set-on-less-than unsigned. `SLTU rd, rs, rt`.
-    Sltu { rd: Reg, rs: Reg, rt: Reg },
+    Sltu {
+        rd: Reg,
+        rs: Reg,
+        rt: Reg,
+    },
 
     // --- Shifts (R-type, SPECIAL) ---
     /// Shift left logical (by immediate sa). `SLL rd, rt, sa`.
-    Sll { rd: Reg, rt: Reg, sa: u8 },
+    Sll {
+        rd: Reg,
+        rt: Reg,
+        sa: u8,
+    },
     /// Shift right logical (by immediate sa). `SRL rd, rt, sa`.
-    Srl { rd: Reg, rt: Reg, sa: u8 },
+    Srl {
+        rd: Reg,
+        rt: Reg,
+        sa: u8,
+    },
     /// Shift right arithmetic (by immediate sa). `SRA rd, rt, sa`.
-    Sra { rd: Reg, rt: Reg, sa: u8 },
+    Sra {
+        rd: Reg,
+        rt: Reg,
+        sa: u8,
+    },
     /// Shift left logical variable (by rs). `SLLV rd, rt, rs`.
-    Sllv { rd: Reg, rt: Reg, rs: Reg },
+    Sllv {
+        rd: Reg,
+        rt: Reg,
+        rs: Reg,
+    },
     /// Shift right logical variable. `SRLV rd, rt, rs`.
-    Srlv { rd: Reg, rt: Reg, rs: Reg },
+    Srlv {
+        rd: Reg,
+        rt: Reg,
+        rs: Reg,
+    },
     /// Shift right arithmetic variable. `SRAV rd, rt, rs`.
-    Srav { rd: Reg, rt: Reg, rs: Reg },
+    Srav {
+        rd: Reg,
+        rt: Reg,
+        rs: Reg,
+    },
 
     // --- Mult/Div (R-type, SPECIAL; write HI/LO) ---
     /// Multiply signed. `MULT rs, rt`.
-    Mult { rs: Reg, rt: Reg },
+    Mult {
+        rs: Reg,
+        rt: Reg,
+    },
     /// Multiply unsigned. `MULTU rs, rt`.
-    Multu { rs: Reg, rt: Reg },
+    Multu {
+        rs: Reg,
+        rt: Reg,
+    },
     /// Divide signed. `DIV rs, rt`.
-    Div { rs: Reg, rt: Reg },
+    Div {
+        rs: Reg,
+        rt: Reg,
+    },
     /// Divide unsigned. `DIVU rs, rt`.
-    Divu { rs: Reg, rt: Reg },
+    Divu {
+        rs: Reg,
+        rt: Reg,
+    },
     /// Move from HI. `MFHI rd`.
-    Mfhi { rd: Reg },
+    Mfhi {
+        rd: Reg,
+    },
     /// Move from LO. `MFLO rd`.
-    Mflo { rd: Reg },
+    Mflo {
+        rd: Reg,
+    },
     /// Move to HI. `MTHI rs`.
-    Mthi { rs: Reg },
+    Mthi {
+        rs: Reg,
+    },
     /// Move to LO. `MTLO rs`.
-    Mtlo { rs: Reg },
+    Mtlo {
+        rs: Reg,
+    },
 
     // --- Branches (I-type; branch-relative 16-bit offset in words) ---
     /// Branch if equal. `BEQ rs, rt, off`.
-    Beq { rs: Reg, rt: Reg, off: i16 },
+    Beq {
+        rs: Reg,
+        rt: Reg,
+        off: i16,
+    },
     /// Branch if not equal. `BNE rs, rt, off`.
-    Bne { rs: Reg, rt: Reg, off: i16 },
+    Bne {
+        rs: Reg,
+        rt: Reg,
+        off: i16,
+    },
     /// Branch if <= 0. `BLEZ rs, off`.
-    Blez { rs: Reg, off: i16 },
+    Blez {
+        rs: Reg,
+        off: i16,
+    },
     /// Branch if > 0. `BGTZ rs, off`.
-    Bgtz { rs: Reg, off: i16 },
+    Bgtz {
+        rs: Reg,
+        off: i16,
+    },
     /// Branch if < 0 (REGIMM). `BLTZ rs, off`.
-    Bltz { rs: Reg, off: i16 },
+    Bltz {
+        rs: Reg,
+        off: i16,
+    },
     /// Branch if >= 0 (REGIMM). `BGEZ rs, off`.
-    Bgez { rs: Reg, off: i16 },
+    Bgez {
+        rs: Reg,
+        off: i16,
+    },
     /// Branch-and-link if < 0 (REGIMM). `BLTZAL rs, off`.
-    Bltzal { rs: Reg, off: i16 },
+    Bltzal {
+        rs: Reg,
+        off: i16,
+    },
     /// Branch-and-link if >= 0 (REGIMM). `BGEZAL rs, off`.
-    Bgezal { rs: Reg, off: i16 },
+    Bgezal {
+        rs: Reg,
+        off: i16,
+    },
+    /// Branch-and-link-likely if < 0. `BLTZALL rs, off`.
+    Bltzall {
+        rs: Reg,
+        off: i16,
+    },
+    /// Branch-and-link-likely if >= 0. `BGEZALL rs, off`.
+    Bgezall {
+        rs: Reg,
+        off: i16,
+    },
 
     // --- Branch-likely variants (nullify delay slot when NOT taken) ---
     /// Branch-likely equal. `BEQL rs, rt, off`.
-    Beql { rs: Reg, rt: Reg, off: i16 },
+    Beql {
+        rs: Reg,
+        rt: Reg,
+        off: i16,
+    },
     /// Branch-likely not equal. `BNEL rs, rt, off`.
-    Bnel { rs: Reg, rt: Reg, off: i16 },
+    Bnel {
+        rs: Reg,
+        rt: Reg,
+        off: i16,
+    },
     /// Branch-likely <= 0. `BLEZL rs, off`.
-    Blezl { rs: Reg, off: i16 },
+    Blezl {
+        rs: Reg,
+        off: i16,
+    },
     /// Branch-likely > 0. `BGTZL rs, off`.
-    Bgtzl { rs: Reg, off: i16 },
+    Bgtzl {
+        rs: Reg,
+        off: i16,
+    },
     /// Branch-likely < 0 (REGIMM). `BLTZL rs, off`.
-    Bltzl { rs: Reg, off: i16 },
+    Bltzl {
+        rs: Reg,
+        off: i16,
+    },
     /// Branch-likely >= 0 (REGIMM). `BGEZL rs, off`.
-    Bgezl { rs: Reg, off: i16 },
+    Bgezl {
+        rs: Reg,
+        off: i16,
+    },
 
     // --- Jumps ---
     /// Jump (absolute, 26-bit target). `J target`.
-    J { target: u32 },
+    J {
+        target: u32,
+    },
     /// Jump-and-link (absolute). `JAL target`.
-    Jal { target: u32 },
+    Jal {
+        target: u32,
+    },
     /// Jump register. `JR rs`.
-    Jr { rs: Reg },
-    /// Jump-and-link register. `JALR rd, rs` (rd defaults to $ra).
-    Jalr { rd: Reg, rs: Reg },
+    Jr {
+        rs: Reg,
+    },
+    /// Jump-and-link register. `JALR rd, rs` (`rd=$ra` is an assembler default,
+    /// not a decoder substitution).
+    Jalr {
+        rd: Reg,
+        rs: Reg,
+    },
 
     // ================================================================
     // COP1 / FPU (opcode 0x11, plus the dedicated COP1 load/store opcodes).
@@ -276,140 +621,351 @@ pub enum Instruction {
 
     // --- COP1 moves between GPR and FPR (fmt sub-dispatch of opcode 0x11) ---
     /// Move word from COP1: `MFC1 rt, fs` — GPR rt = sign-extend(FPR fs low32).
-    Mfc1 { rt: Reg, fs: Reg },
+    Mfc1 {
+        rt: Reg,
+        fs: Reg,
+    },
     /// Move word to COP1: `MTC1 rt, fs` — FPR fs low32 = GPR rt low32.
-    Mtc1 { rt: Reg, fs: Reg },
+    Mtc1 {
+        rt: Reg,
+        fs: Reg,
+    },
     /// Doubleword move from COP1: `DMFC1 rt, fs` — GPR rt = FPR fs full 64 bits.
-    Dmfc1 { rt: Reg, fs: Reg },
+    Dmfc1 {
+        rt: Reg,
+        fs: Reg,
+    },
     /// Doubleword move to COP1: `DMTC1 rt, fs` — FPR fs 64 bits = GPR rt.
-    Dmtc1 { rt: Reg, fs: Reg },
+    Dmtc1 {
+        rt: Reg,
+        fs: Reg,
+    },
     /// Move control word from COP1: `CFC1 rt, fs` (reads FCR; fs is the
     /// control-register index, 0 or 31 in practice).
-    Cfc1 { rt: Reg, fs: Reg },
+    Cfc1 {
+        rt: Reg,
+        fs: Reg,
+    },
     /// Move control word to COP1: `CTC1 rt, fs`.
-    Ctc1 { rt: Reg, fs: Reg },
+    Ctc1 {
+        rt: Reg,
+        fs: Reg,
+    },
 
     // --- COP1 loads/stores (dedicated main opcodes) ---
     /// Load word to COP1: `LWC1 ft, off(base)` — FPR ft low32 = mem word.
-    Lwc1 { ft: Reg, base: Reg, off: i16 },
+    Lwc1 {
+        ft: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Store word from COP1: `SWC1 ft, off(base)`.
-    Swc1 { ft: Reg, base: Reg, off: i16 },
+    Swc1 {
+        ft: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Load doubleword to COP1: `LDC1 ft, off(base)` — FPR ft 64 bits = mem dword.
-    Ldc1 { ft: Reg, base: Reg, off: i16 },
+    Ldc1 {
+        ft: Reg,
+        base: Reg,
+        off: i16,
+    },
     /// Store doubleword from COP1: `SDC1 ft, off(base)`.
-    Sdc1 { ft: Reg, base: Reg, off: i16 },
+    Sdc1 {
+        ft: Reg,
+        base: Reg,
+        off: i16,
+    },
 
     // --- Single-precision (fmt = S = 0x10) arithmetic (funct in 5..0) ---
     /// `ADD.S fd, fs, ft`.
-    AddS { fd: Reg, fs: Reg, ft: Reg },
+    AddS {
+        fd: Reg,
+        fs: Reg,
+        ft: Reg,
+    },
     /// `SUB.S fd, fs, ft`.
-    SubS { fd: Reg, fs: Reg, ft: Reg },
+    SubS {
+        fd: Reg,
+        fs: Reg,
+        ft: Reg,
+    },
     /// `MUL.S fd, fs, ft`.
-    MulS { fd: Reg, fs: Reg, ft: Reg },
+    MulS {
+        fd: Reg,
+        fs: Reg,
+        ft: Reg,
+    },
     /// `DIV.S fd, fs, ft`.
-    DivS { fd: Reg, fs: Reg, ft: Reg },
+    DivS {
+        fd: Reg,
+        fs: Reg,
+        ft: Reg,
+    },
     /// `ABS.S fd, fs`.
-    AbsS { fd: Reg, fs: Reg },
+    AbsS {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `NEG.S fd, fs`.
-    NegS { fd: Reg, fs: Reg },
+    NegS {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `SQRT.S fd, fs`.
-    SqrtS { fd: Reg, fs: Reg },
+    SqrtS {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `MOV.S fd, fs` (bit-exact copy of the 32-bit register).
-    MovS { fd: Reg, fs: Reg },
+    MovS {
+        fd: Reg,
+        fs: Reg,
+    },
 
     // --- Double-precision (fmt = D = 0x11) arithmetic ---
     /// `ADD.D fd, fs, ft`.
-    AddD { fd: Reg, fs: Reg, ft: Reg },
+    AddD {
+        fd: Reg,
+        fs: Reg,
+        ft: Reg,
+    },
     /// `SUB.D fd, fs, ft`.
-    SubD { fd: Reg, fs: Reg, ft: Reg },
+    SubD {
+        fd: Reg,
+        fs: Reg,
+        ft: Reg,
+    },
     /// `MUL.D fd, fs, ft`.
-    MulD { fd: Reg, fs: Reg, ft: Reg },
+    MulD {
+        fd: Reg,
+        fs: Reg,
+        ft: Reg,
+    },
     /// `DIV.D fd, fs, ft`.
-    DivD { fd: Reg, fs: Reg, ft: Reg },
+    DivD {
+        fd: Reg,
+        fs: Reg,
+        ft: Reg,
+    },
     /// `ABS.D fd, fs`.
-    AbsD { fd: Reg, fs: Reg },
+    AbsD {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `NEG.D fd, fs`.
-    NegD { fd: Reg, fs: Reg },
+    NegD {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `SQRT.D fd, fs`.
-    SqrtD { fd: Reg, fs: Reg },
+    SqrtD {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `MOV.D fd, fs` (bit-exact 64-bit copy).
-    MovD { fd: Reg, fs: Reg },
+    MovD {
+        fd: Reg,
+        fs: Reg,
+    },
 
     // --- Conversions. Naming: `Cvt<To><From>`. `W`=32-bit int, `L`=64-bit int,
     //     `S`=single float, `D`=double float. `Trunc*` = round-toward-zero. ---
     /// `CVT.S.W fd, fs` — int32 -> single.
-    CvtSW { fd: Reg, fs: Reg },
+    CvtSW {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `CVT.D.W fd, fs` — int32 -> double.
-    CvtDW { fd: Reg, fs: Reg },
+    CvtDW {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `CVT.S.D fd, fs` — double -> single.
-    CvtSD { fd: Reg, fs: Reg },
+    CvtSD {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `CVT.D.S fd, fs` — single -> double.
-    CvtDS { fd: Reg, fs: Reg },
+    CvtDS {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `CVT.S.L fd, fs` — int64 -> single.
-    CvtSL { fd: Reg, fs: Reg },
+    CvtSL {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `CVT.D.L fd, fs` — int64 -> double.
-    CvtDL { fd: Reg, fs: Reg },
-    /// `CVT.W.S fd, fs` — single -> int32 (rounds per FCSR mode; here: nearest).
-    CvtWS { fd: Reg, fs: Reg },
-    /// `CVT.W.D fd, fs` — double -> int32 (nearest).
-    CvtWD { fd: Reg, fs: Reg },
-    /// `CVT.L.S fd, fs` — single -> int64 (nearest).
-    CvtLS { fd: Reg, fs: Reg },
-    /// `CVT.L.D fd, fs` — double -> int64 (nearest).
-    CvtLD { fd: Reg, fs: Reg },
+    CvtDL {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `CVT.W.S fd, fs` — single -> int32 (rounds per FCSR mode).
+    CvtWS {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `CVT.W.D fd, fs` — double -> int32 (rounds per FCSR mode).
+    CvtWD {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `CVT.L.S fd, fs` — single -> int64 (rounds per FCSR mode).
+    CvtLS {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `CVT.L.D fd, fs` — double -> int64 (rounds per FCSR mode).
+    CvtLD {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `TRUNC.W.S fd, fs` — single -> int32, toward zero.
-    TruncWS { fd: Reg, fs: Reg },
+    TruncWS {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `TRUNC.W.D fd, fs` — double -> int32, toward zero.
-    TruncWD { fd: Reg, fs: Reg },
+    TruncWD {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `TRUNC.L.S fd, fs` — single -> int64, toward zero.
-    TruncLS { fd: Reg, fs: Reg },
+    TruncLS {
+        fd: Reg,
+        fs: Reg,
+    },
     /// `TRUNC.L.D fd, fs` — double -> int64, toward zero.
-    TruncLD { fd: Reg, fs: Reg },
-    /// `FLOOR.W.S fd, fs` — single -> int32, toward -inf (VR4300 COP1 funct
-    /// 0x0F; MIPS III "Floor Convert to Single Fixed-Point Word").
-    FloorWS { fd: Reg, fs: Reg },
-    /// `FLOOR.W.D fd, fs` — double -> int32, toward -inf (COP1 funct 0x0F).
-    FloorWD { fd: Reg, fs: Reg },
-    /// `CEIL.W.S fd, fs` — single -> int32, toward +inf (VR4300 COP1 funct
-    /// 0x0E; MIPS III "Ceiling Convert to Single Fixed-Point Word").
-    CeilWS { fd: Reg, fs: Reg },
-    /// `CEIL.W.D fd, fs` — double -> int32, toward +inf (COP1 funct 0x0E).
-    CeilWD { fd: Reg, fs: Reg },
-    /// `ROUND.W.S fd, fs` — single -> int32, round to nearest/even (VR4300
-    /// COP1 funct 0x0C; "Round Convert to Single Fixed-Point Word"). Uses the
-    /// FCSR rounding mode, which every OoT thread boots into RN (nearest-even)
-    /// — the same mode `CVT.W.*` already assumes here.
-    RoundWS { fd: Reg, fs: Reg },
-    /// `ROUND.W.D fd, fs` — double -> int32, round to nearest/even (funct 0x0C).
-    RoundWD { fd: Reg, fs: Reg },
+    TruncLD {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `ROUND.W.S fd, fs` — nearest, ties to even.
+    RoundWS {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `CEIL.W.S fd, fs` — toward +infinity.
+    CeilWS {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `FLOOR.W.S fd, fs` — toward -infinity.
+    FloorWS {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `ROUND.L.S fd, fs`.
+    RoundLS {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `CEIL.L.S fd, fs`.
+    CeilLS {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `FLOOR.L.S fd, fs`.
+    FloorLS {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `ROUND.W.D fd, fs`.
+    RoundWD {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `CEIL.W.D fd, fs`.
+    CeilWD {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `FLOOR.W.D fd, fs`.
+    FloorWD {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `ROUND.L.D fd, fs`.
+    RoundLD {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `CEIL.L.D fd, fs`.
+    CeilLD {
+        fd: Reg,
+        fs: Reg,
+    },
+    /// `FLOOR.L.D fd, fs`.
+    FloorLD {
+        fd: Reg,
+        fs: Reg,
+    },
 
     // --- FP compares: set the FP condition flag (FCSR bit 23). `fmt`
     //     distinguishes S (0x10) vs D (0x11); `funct` picks the predicate.
-    //     We cover the ordered EQ/LT/LE predicates (funct 0x32/0x3C/0x3E),
-    //     which are the ones OoT emits; unordered variants map to the same
-    //     comparison in N64Recomp (NaN is asserted-away by NAN_CHECK). ---
+    //     All sixteen funct values 0x30..0x3F are decoded. ---
     /// `C.EQ.S fs, ft` — set condition = (fs == ft).
-    CEqS { fs: Reg, ft: Reg },
+    CEqS {
+        fs: Reg,
+        ft: Reg,
+    },
     /// `C.LT.S fs, ft` — set condition = (fs < ft).
-    CLtS { fs: Reg, ft: Reg },
+    CLtS {
+        fs: Reg,
+        ft: Reg,
+    },
     /// `C.LE.S fs, ft` — set condition = (fs <= ft).
-    CLeS { fs: Reg, ft: Reg },
+    CLeS {
+        fs: Reg,
+        ft: Reg,
+    },
     /// `C.EQ.D fs, ft`.
-    CEqD { fs: Reg, ft: Reg },
+    CEqD {
+        fs: Reg,
+        ft: Reg,
+    },
     /// `C.LT.D fs, ft`.
-    CLtD { fs: Reg, ft: Reg },
+    CLtD {
+        fs: Reg,
+        ft: Reg,
+    },
     /// `C.LE.D fs, ft`.
-    CLeD { fs: Reg, ft: Reg },
+    CLeD {
+        fs: Reg,
+        ft: Reg,
+    },
+    /// Any other documented `C.cond.S`; `cond` is funct bits 3..0.
+    CCondS {
+        fs: Reg,
+        ft: Reg,
+        cond: u8,
+    },
+    /// Any other documented `C.cond.D`; `cond` is funct bits 3..0.
+    CCondD {
+        fs: Reg,
+        ft: Reg,
+        cond: u8,
+    },
 
     // --- COP1 conditional branches (fmt = BC1 = 0x08; ft bit0 = tf, bit1 = nd). ---
     /// `BC1T off` — branch if FP condition flag is set.
-    Bc1t { off: i16 },
+    Bc1t {
+        off: i16,
+    },
     /// `BC1F off` — branch if FP condition flag is clear.
-    Bc1f { off: i16 },
+    Bc1f {
+        off: i16,
+    },
     /// `BC1TL off` — branch-likely if flag set.
-    Bc1tl { off: i16 },
+    Bc1tl {
+        off: i16,
+    },
     /// `BC1FL off` — branch-likely if flag clear.
-    Bc1fl { off: i16 },
+    Bc1fl {
+        off: i16,
+    },
 
     // --- COP0 system control (opcode 0x10) ---
     //
@@ -421,13 +977,38 @@ pub enum Instruction {
     // moves (the guts of `osGetCount`/`osSetTimer`), which read/write real
     // context state. `cop0d` is the register index (rd field, bits 15..11).
     /// Move-from COP0. `MFC0 rt, cop0d` (32-bit, sign-extended into GPR).
-    Mfc0 { rt: Reg, cop0d: u8 },
+    Mfc0 {
+        rt: Reg,
+        cop0d: u8,
+    },
     /// Move-to COP0. `MTC0 rt, cop0d` (32-bit).
-    Mtc0 { rt: Reg, cop0d: u8 },
+    Mtc0 {
+        rt: Reg,
+        cop0d: u8,
+    },
     /// Doubleword move-from COP0. `DMFC0 rt, cop0d` (64-bit).
-    Dmfc0 { rt: Reg, cop0d: u8 },
+    Dmfc0 {
+        rt: Reg,
+        cop0d: u8,
+    },
     /// Doubleword move-to COP0. `DMTC0 rt, cop0d` (64-bit).
-    Dmtc0 { rt: Reg, cop0d: u8 },
+    Dmtc0 {
+        rt: Reg,
+        cop0d: u8,
+    },
+    /// Branch on the COP0 condition bit (Status.CH on VR4300).
+    Bc0f {
+        off: i16,
+    },
+    Bc0t {
+        off: i16,
+    },
+    Bc0fl {
+        off: i16,
+    },
+    Bc0tl {
+        off: i16,
+    },
     /// Exception return. `ERET` — privileged; returns from an interrupt/exception.
     Eret,
     /// Write indexed TLB entry. `TLBWI` — privileged MMU op.
@@ -443,7 +1024,11 @@ pub enum Instruction {
     /// Cache operation. `CACHE op, off(base)`. On a recompiled title the host
     /// rdram is already coherent, so this is a semantic no-op (emitted with a
     /// comment), matching how every N64 static/dynamic recompiler treats it.
-    Cache { op: u8, base: Reg, off: i16 },
+    Cache {
+        op: u8,
+        base: Reg,
+        off: i16,
+    },
     /// Store-ordering barrier. `SYNC` — a no-op in a single-threaded recompiled
     /// context (no store buffer to drain).
     Sync,
@@ -454,23 +1039,132 @@ pub enum Instruction {
     // ordinary game touches it. We decode the move ops so an unexpected COP2
     // instruction is a *named loud trap* rather than a bare `Unknown` word.
     /// Move-from COP2. `MFC2 rt, rd`.
-    Mfc2 { rt: Reg, rd: Reg },
+    Mfc2 {
+        rt: Reg,
+        rd: Reg,
+    },
     /// Move-to COP2. `MTC2 rt, rd`.
-    Mtc2 { rt: Reg, rd: Reg },
+    Mtc2 {
+        rt: Reg,
+        rd: Reg,
+    },
     /// Move control-from COP2. `CFC2 rt, rd`.
-    Cfc2 { rt: Reg, rd: Reg },
+    Cfc2 {
+        rt: Reg,
+        rd: Reg,
+    },
     /// Move control-to COP2. `CTC2 rt, rd`.
-    Ctc2 { rt: Reg, rd: Reg },
+    Ctc2 {
+        rt: Reg,
+        rd: Reg,
+    },
+    /// Doubleword move-from COP2. `DMFC2 rt, rd` (loud unusable-coprocessor trap).
+    Dmfc2 {
+        rt: Reg,
+        rd: Reg,
+    },
+    /// Doubleword move-to COP2. `DMTC2 rt, rd`.
+    Dmtc2 {
+        rt: Reg,
+        rd: Reg,
+    },
+    /// Any COP2 branch or coprocessor operation, retained as a named trap.
+    Cop2Op {
+        word: u32,
+    },
+    /// COP2 load/store primary opcodes, all unusable on the N64.
+    Lwc2 {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
+    Ldc2 {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
+    Swc2 {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
+    Sdc2 {
+        rt: Reg,
+        base: Reg,
+        off: i16,
+    },
+
+    // --- Integer conditional traps (MIPS III, full-width GPR operands) ---
+    Tge {
+        rs: Reg,
+        rt: Reg,
+        code: u16,
+    },
+    Tgeu {
+        rs: Reg,
+        rt: Reg,
+        code: u16,
+    },
+    Tlt {
+        rs: Reg,
+        rt: Reg,
+        code: u16,
+    },
+    Tltu {
+        rs: Reg,
+        rt: Reg,
+        code: u16,
+    },
+    Teq {
+        rs: Reg,
+        rt: Reg,
+        code: u16,
+    },
+    Tne {
+        rs: Reg,
+        rt: Reg,
+        code: u16,
+    },
+    Tgei {
+        rs: Reg,
+        imm: i16,
+    },
+    Tgeiu {
+        rs: Reg,
+        imm: i16,
+    },
+    Tlti {
+        rs: Reg,
+        imm: i16,
+    },
+    Tltiu {
+        rs: Reg,
+        imm: i16,
+    },
+    Teqi {
+        rs: Reg,
+        imm: i16,
+    },
+    Tnei {
+        rs: Reg,
+        imm: i16,
+    },
 
     // --- Traps (SPECIAL) ---
     /// System call. `SYSCALL code` — raises an exception; emitted as a loud trap.
-    Syscall { code: u32 },
+    Syscall {
+        code: u32,
+    },
     /// Breakpoint. `BREAK code` — raises an exception; emitted as a loud trap.
-    Break { code: u32 },
+    Break {
+        code: u32,
+    },
 
     /// A word we do not (yet) decode. Carries the raw bits so the emitter can
     /// fail loudly instead of silently emitting a nop.
-    Unknown { word: u32 },
+    Unknown {
+        word: u32,
+    },
 }
 
 // --- Field extraction (public ISA bit positions) ---
@@ -522,6 +1216,11 @@ fn cop0d(w: u32) -> u8 {
 fn code20(w: u32) -> u32 {
     (w >> 6) & 0x000F_FFFF
 }
+/// The 10-bit diagnostic code on SPECIAL trap instructions (bits 15..6).
+#[inline]
+fn code10(w: u32) -> u16 {
+    ((w >> 6) & 0x03FF) as u16
+}
 /// The 5-bit cache-operation selector of CACHE (the `rt` field, bits 20..16).
 #[inline]
 fn cache_op(w: u32) -> u8 {
@@ -564,19 +1263,58 @@ pub fn decode(w: u32) -> Instruction {
         // SPECIAL: dispatch on funct (bits 5..0).
         0x00 => match funct(w) {
             // Shifts by immediate sa. (SLL $0,$0,0 is caught above as Nop.)
-            0x00 => Sll { rd: rd(w), rt: rt(w), sa: sa(w) },
-            0x02 => Srl { rd: rd(w), rt: rt(w), sa: sa(w) },
-            0x03 => Sra { rd: rd(w), rt: rt(w), sa: sa(w) },
-            0x04 => Sllv { rd: rd(w), rt: rt(w), rs: rs(w) },
-            0x06 => Srlv { rd: rd(w), rt: rt(w), rs: rs(w) },
-            0x07 => Srav { rd: rd(w), rt: rt(w), rs: rs(w) },
+            0x00 => Sll {
+                rd: rd(w),
+                rt: rt(w),
+                sa: sa(w),
+            },
+            0x02 => Srl {
+                rd: rd(w),
+                rt: rt(w),
+                sa: sa(w),
+            },
+            0x03 => Sra {
+                rd: rd(w),
+                rt: rt(w),
+                sa: sa(w),
+            },
+            0x04 => Sllv {
+                rd: rd(w),
+                rt: rt(w),
+                rs: rs(w),
+            },
+            0x06 => Srlv {
+                rd: rd(w),
+                rt: rt(w),
+                rs: rs(w),
+            },
+            0x07 => Srav {
+                rd: rd(w),
+                rt: rt(w),
+                rs: rs(w),
+            },
             // Doubleword variable shifts.
-            0x14 => Dsllv { rd: rd(w), rt: rt(w), rs: rs(w) },
-            0x16 => Dsrlv { rd: rd(w), rt: rt(w), rs: rs(w) },
-            0x17 => Dsrav { rd: rd(w), rt: rt(w), rs: rs(w) },
+            0x14 => Dsllv {
+                rd: rd(w),
+                rt: rt(w),
+                rs: rs(w),
+            },
+            0x16 => Dsrlv {
+                rd: rd(w),
+                rt: rt(w),
+                rs: rs(w),
+            },
+            0x17 => Dsrav {
+                rd: rd(w),
+                rt: rt(w),
+                rs: rs(w),
+            },
             // Jumps.
             0x08 => Jr { rs: rs(w) },
-            0x09 => Jalr { rd: rd(w), rs: rs(w) },
+            0x09 => Jalr {
+                rd: rd(w),
+                rs: rs(w),
+            },
             // Traps + sync (SPECIAL funct 0x0C/0x0D/0x0F).
             0x0C => Syscall { code: code20(w) },
             0x0D => Break { code: code20(w) },
@@ -587,49 +1325,234 @@ pub fn decode(w: u32) -> Instruction {
             0x12 => Mflo { rd: rd(w) },
             0x13 => Mtlo { rs: rs(w) },
             // Mult/Div.
-            0x18 => Mult { rs: rs(w), rt: rt(w) },
-            0x19 => Multu { rs: rs(w), rt: rt(w) },
-            0x1A => Div { rs: rs(w), rt: rt(w) },
-            0x1B => Divu { rs: rs(w), rt: rt(w) },
+            0x18 => Mult {
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x19 => Multu {
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x1A => Div {
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x1B => Divu {
+                rs: rs(w),
+                rt: rt(w),
+            },
             // Doubleword mult/div.
-            0x1C => Dmult { rs: rs(w), rt: rt(w) },
-            0x1D => Dmultu { rs: rs(w), rt: rt(w) },
-            0x1E => Ddiv { rs: rs(w), rt: rt(w) },
-            0x1F => Ddivu { rs: rs(w), rt: rt(w) },
+            0x1C => Dmult {
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x1D => Dmultu {
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x1E => Ddiv {
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x1F => Ddivu {
+                rs: rs(w),
+                rt: rt(w),
+            },
             // ALU register.
-            0x20 => Add { rd: rd(w), rs: rs(w), rt: rt(w) },
-            0x21 => Addu { rd: rd(w), rs: rs(w), rt: rt(w) },
-            0x22 => Sub { rd: rd(w), rs: rs(w), rt: rt(w) },
-            0x23 => Subu { rd: rd(w), rs: rs(w), rt: rt(w) },
-            0x24 => And { rd: rd(w), rs: rs(w), rt: rt(w) },
-            0x25 => Or { rd: rd(w), rs: rs(w), rt: rt(w) },
-            0x26 => Xor { rd: rd(w), rs: rs(w), rt: rt(w) },
-            0x27 => Nor { rd: rd(w), rs: rs(w), rt: rt(w) },
-            0x2A => Slt { rd: rd(w), rs: rs(w), rt: rt(w) },
-            0x2B => Sltu { rd: rd(w), rs: rs(w), rt: rt(w) },
+            0x20 => Add {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x21 => Addu {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x22 => Sub {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x23 => Subu {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x24 => And {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x25 => Or {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x26 => Xor {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x27 => Nor {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x2A => Slt {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x2B => Sltu {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
             // Doubleword ALU register.
-            0x2C => Dadd { rd: rd(w), rs: rs(w), rt: rt(w) },
-            0x2D => Daddu { rd: rd(w), rs: rs(w), rt: rt(w) },
-            0x2E => Dsub { rd: rd(w), rs: rs(w), rt: rt(w) },
-            0x2F => Dsubu { rd: rd(w), rs: rs(w), rt: rt(w) },
+            0x2C => Dadd {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x2D => Daddu {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x2E => Dsub {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
+            0x2F => Dsubu {
+                rd: rd(w),
+                rs: rs(w),
+                rt: rt(w),
+            },
+            // Conditional traps; code is bits 15..6 (MIPS IV ISA A-39).
+            0x30 => Tge {
+                rs: rs(w),
+                rt: rt(w),
+                code: code10(w),
+            },
+            0x31 => Tgeu {
+                rs: rs(w),
+                rt: rt(w),
+                code: code10(w),
+            },
+            0x32 => Tlt {
+                rs: rs(w),
+                rt: rt(w),
+                code: code10(w),
+            },
+            0x33 => Tltu {
+                rs: rs(w),
+                rt: rt(w),
+                code: code10(w),
+            },
+            0x34 => Teq {
+                rs: rs(w),
+                rt: rt(w),
+                code: code10(w),
+            },
+            0x36 => Tne {
+                rs: rs(w),
+                rt: rt(w),
+                code: code10(w),
+            },
             // Doubleword immediate shifts. DSLL/DSRL/DSRA use sa (0..31);
             // the *32 forms add 32 to the shift count (32..63).
-            0x38 => Dsll { rd: rd(w), rt: rt(w), sa: sa(w) },
-            0x3A => Dsrl { rd: rd(w), rt: rt(w), sa: sa(w) },
-            0x3B => Dsra { rd: rd(w), rt: rt(w), sa: sa(w) },
-            0x3C => Dsll32 { rd: rd(w), rt: rt(w), sa: sa(w) },
-            0x3E => Dsrl32 { rd: rd(w), rt: rt(w), sa: sa(w) },
-            0x3F => Dsra32 { rd: rd(w), rt: rt(w), sa: sa(w) },
+            0x38 => Dsll {
+                rd: rd(w),
+                rt: rt(w),
+                sa: sa(w),
+            },
+            0x3A => Dsrl {
+                rd: rd(w),
+                rt: rt(w),
+                sa: sa(w),
+            },
+            0x3B => Dsra {
+                rd: rd(w),
+                rt: rt(w),
+                sa: sa(w),
+            },
+            0x3C => Dsll32 {
+                rd: rd(w),
+                rt: rt(w),
+                sa: sa(w),
+            },
+            0x3E => Dsrl32 {
+                rd: rd(w),
+                rt: rt(w),
+                sa: sa(w),
+            },
+            0x3F => Dsra32 {
+                rd: rd(w),
+                rt: rt(w),
+                sa: sa(w),
+            },
             _ => Unknown { word: w },
         },
         // REGIMM: dispatch on the rt field (bits 20..16).
         0x01 => match rt(w) {
-            0x00 => Bltz { rs: rs(w), off: imm_s(w) },
-            0x01 => Bgez { rs: rs(w), off: imm_s(w) },
-            0x02 => Bltzl { rs: rs(w), off: imm_s(w) },
-            0x03 => Bgezl { rs: rs(w), off: imm_s(w) },
-            0x10 => Bltzal { rs: rs(w), off: imm_s(w) },
-            0x11 => Bgezal { rs: rs(w), off: imm_s(w) },
+            0x00 => Bltz {
+                rs: rs(w),
+                off: imm_s(w),
+            },
+            0x01 => Bgez {
+                rs: rs(w),
+                off: imm_s(w),
+            },
+            0x02 => Bltzl {
+                rs: rs(w),
+                off: imm_s(w),
+            },
+            0x03 => Bgezl {
+                rs: rs(w),
+                off: imm_s(w),
+            },
+            0x08 => Tgei {
+                rs: rs(w),
+                imm: imm_s(w),
+            },
+            0x09 => Tgeiu {
+                rs: rs(w),
+                imm: imm_s(w),
+            },
+            0x0A => Tlti {
+                rs: rs(w),
+                imm: imm_s(w),
+            },
+            0x0B => Tltiu {
+                rs: rs(w),
+                imm: imm_s(w),
+            },
+            0x0C => Teqi {
+                rs: rs(w),
+                imm: imm_s(w),
+            },
+            0x0E => Tnei {
+                rs: rs(w),
+                imm: imm_s(w),
+            },
+            0x10 => Bltzal {
+                rs: rs(w),
+                off: imm_s(w),
+            },
+            0x11 => Bgezal {
+                rs: rs(w),
+                off: imm_s(w),
+            },
+            0x12 => Bltzall {
+                rs: rs(w),
+                off: imm_s(w),
+            },
+            0x13 => Bgezall {
+                rs: rs(w),
+                off: imm_s(w),
+            },
             _ => Unknown { word: w },
         },
         // COP1 (FPU): opcode 0x11, sub-dispatched on `fmt` (bits 25..21).
@@ -650,80 +1573,326 @@ pub fn decode(w: u32) -> Instruction {
                 }
             } else {
                 match fmt {
-                    0x00 => Mfc0 { rt: rt(w), cop0d: cop0d(w) },
-                    0x01 => Dmfc0 { rt: rt(w), cop0d: cop0d(w) },
-                    0x04 => Mtc0 { rt: rt(w), cop0d: cop0d(w) },
-                    0x05 => Dmtc0 { rt: rt(w), cop0d: cop0d(w) },
+                    0x00 => Mfc0 {
+                        rt: rt(w),
+                        cop0d: cop0d(w),
+                    },
+                    0x01 => Dmfc0 {
+                        rt: rt(w),
+                        cop0d: cop0d(w),
+                    },
+                    0x04 => Mtc0 {
+                        rt: rt(w),
+                        cop0d: cop0d(w),
+                    },
+                    0x05 => Dmtc0 {
+                        rt: rt(w),
+                        cop0d: cop0d(w),
+                    },
+                    0x08 => match rt(w) & 0x3 {
+                        0 => Bc0f { off: imm_s(w) },
+                        1 => Bc0t { off: imm_s(w) },
+                        2 => Bc0fl { off: imm_s(w) },
+                        3 => Bc0tl { off: imm_s(w) },
+                        _ => unreachable!(),
+                    },
                     _ => Unknown { word: w },
                 }
             }
         }
         // COP2 (opcode 0x12): move ops, sub-dispatched on the rs/format field.
         0x12 => match rs(w) {
-            0x00 => Mfc2 { rt: rt(w), rd: rd(w) },
-            0x02 => Cfc2 { rt: rt(w), rd: rd(w) },
-            0x04 => Mtc2 { rt: rt(w), rd: rd(w) },
-            0x06 => Ctc2 { rt: rt(w), rd: rd(w) },
-            _ => Unknown { word: w },
+            0x00 => Mfc2 {
+                rt: rt(w),
+                rd: rd(w),
+            },
+            0x01 => Dmfc2 {
+                rt: rt(w),
+                rd: rd(w),
+            },
+            0x02 => Cfc2 {
+                rt: rt(w),
+                rd: rd(w),
+            },
+            0x04 => Mtc2 {
+                rt: rt(w),
+                rd: rd(w),
+            },
+            0x05 => Dmtc2 {
+                rt: rt(w),
+                rd: rd(w),
+            },
+            0x06 => Ctc2 {
+                rt: rt(w),
+                rd: rd(w),
+            },
+            _ => Cop2Op { word: w },
         },
         // J-type.
-        0x02 => J { target: target26(w) },
-        0x03 => Jal { target: target26(w) },
+        0x02 => J {
+            target: target26(w),
+        },
+        0x03 => Jal {
+            target: target26(w),
+        },
         // Branches (I-type).
-        0x04 => Beq { rs: rs(w), rt: rt(w), off: imm_s(w) },
-        0x05 => Bne { rs: rs(w), rt: rt(w), off: imm_s(w) },
-        0x06 => Blez { rs: rs(w), off: imm_s(w) },
-        0x07 => Bgtz { rs: rs(w), off: imm_s(w) },
+        0x04 => Beq {
+            rs: rs(w),
+            rt: rt(w),
+            off: imm_s(w),
+        },
+        0x05 => Bne {
+            rs: rs(w),
+            rt: rt(w),
+            off: imm_s(w),
+        },
+        0x06 => Blez {
+            rs: rs(w),
+            off: imm_s(w),
+        },
+        0x07 => Bgtz {
+            rs: rs(w),
+            off: imm_s(w),
+        },
         // ALU immediate.
-        0x08 => Addi { rt: rt(w), rs: rs(w), imm: imm_s(w) },
-        0x09 => Addiu { rt: rt(w), rs: rs(w), imm: imm_s(w) },
-        0x0A => Slti { rt: rt(w), rs: rs(w), imm: imm_s(w) },
-        0x0B => Sltiu { rt: rt(w), rs: rs(w), imm: imm_s(w) },
-        0x0C => Andi { rt: rt(w), rs: rs(w), imm: imm_u(w) },
-        0x0D => Ori { rt: rt(w), rs: rs(w), imm: imm_u(w) },
-        0x0E => Xori { rt: rt(w), rs: rs(w), imm: imm_u(w) },
-        0x0F => Lui { rt: rt(w), imm: imm_u(w) },
+        0x08 => Addi {
+            rt: rt(w),
+            rs: rs(w),
+            imm: imm_s(w),
+        },
+        0x09 => Addiu {
+            rt: rt(w),
+            rs: rs(w),
+            imm: imm_s(w),
+        },
+        0x0A => Slti {
+            rt: rt(w),
+            rs: rs(w),
+            imm: imm_s(w),
+        },
+        0x0B => Sltiu {
+            rt: rt(w),
+            rs: rs(w),
+            imm: imm_s(w),
+        },
+        0x0C => Andi {
+            rt: rt(w),
+            rs: rs(w),
+            imm: imm_u(w),
+        },
+        0x0D => Ori {
+            rt: rt(w),
+            rs: rs(w),
+            imm: imm_u(w),
+        },
+        0x0E => Xori {
+            rt: rt(w),
+            rs: rs(w),
+            imm: imm_u(w),
+        },
+        0x0F => Lui {
+            rt: rt(w),
+            imm: imm_u(w),
+        },
         // Doubleword ALU immediate.
-        0x18 => Daddi { rt: rt(w), rs: rs(w), imm: imm_s(w) },
-        0x19 => Daddiu { rt: rt(w), rs: rs(w), imm: imm_s(w) },
+        0x18 => Daddi {
+            rt: rt(w),
+            rs: rs(w),
+            imm: imm_s(w),
+        },
+        0x19 => Daddiu {
+            rt: rt(w),
+            rs: rs(w),
+            imm: imm_s(w),
+        },
         // Doubleword unaligned loads.
-        0x1A => Ldl { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x1B => Ldr { rt: rt(w), base: rs(w), off: imm_s(w) },
+        0x1A => Ldl {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x1B => Ldr {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
         // Branch-likely.
-        0x14 => Beql { rs: rs(w), rt: rt(w), off: imm_s(w) },
-        0x15 => Bnel { rs: rs(w), rt: rt(w), off: imm_s(w) },
-        0x16 => Blezl { rs: rs(w), off: imm_s(w) },
-        0x17 => Bgtzl { rs: rs(w), off: imm_s(w) },
+        0x14 => Beql {
+            rs: rs(w),
+            rt: rt(w),
+            off: imm_s(w),
+        },
+        0x15 => Bnel {
+            rs: rs(w),
+            rt: rt(w),
+            off: imm_s(w),
+        },
+        0x16 => Blezl {
+            rs: rs(w),
+            off: imm_s(w),
+        },
+        0x17 => Bgtzl {
+            rs: rs(w),
+            off: imm_s(w),
+        },
         // Loads.
-        0x20 => Lb { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x21 => Lh { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x22 => Lwl { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x23 => Lw { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x24 => Lbu { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x25 => Lhu { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x26 => Lwr { rt: rt(w), base: rs(w), off: imm_s(w) },
+        0x20 => Lb {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x21 => Lh {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x22 => Lwl {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x23 => Lw {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x24 => Lbu {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x25 => Lhu {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x26 => Lwr {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x27 => Lwu {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
         // Stores.
-        0x28 => Sb { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x29 => Sh { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x2A => Swl { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x2B => Sw { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x2E => Swr { rt: rt(w), base: rs(w), off: imm_s(w) },
+        0x28 => Sb {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x29 => Sh {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x2A => Swl {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x2B => Sw {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x2E => Swr {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
         // Doubleword unaligned stores.
-        0x2C => Sdl { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x2D => Sdr { rt: rt(w), base: rs(w), off: imm_s(w) },
+        0x2C => Sdl {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x2D => Sdr {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
         // Cache operation (I-type: base=rs, op=rt field, signed offset).
-        0x2F => Cache { op: cache_op(w), base: rs(w), off: imm_s(w) },
-        // Load-linked / store-conditional doubleword.
-        0x34 => Lld { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x3C => Scd { rt: rt(w), base: rs(w), off: imm_s(w) },
+        0x2F => Cache {
+            op: cache_op(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        // Load-linked / store-conditional word and doubleword.
+        0x30 => Ll {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x38 => Sc {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x34 => Lld {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x3C => Scd {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
         // Aligned doubleword load/store.
-        0x37 => Ld { rt: rt(w), base: rs(w), off: imm_s(w) },
-        0x3F => Sd { rt: rt(w), base: rs(w), off: imm_s(w) },
+        0x37 => Ld {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x3F => Sd {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
         // COP1 loads/stores (dedicated main opcodes).
-        0x31 => Lwc1 { ft: rt(w), base: rs(w), off: imm_s(w) },
-        0x35 => Ldc1 { ft: rt(w), base: rs(w), off: imm_s(w) },
-        0x39 => Swc1 { ft: rt(w), base: rs(w), off: imm_s(w) },
-        0x3D => Sdc1 { ft: rt(w), base: rs(w), off: imm_s(w) },
+        0x31 => Lwc1 {
+            ft: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x35 => Ldc1 {
+            ft: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x39 => Swc1 {
+            ft: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x3D => Sdc1 {
+            ft: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        // COP2 memory encodings are architectural even though COP2 is absent.
+        0x32 => Lwc2 {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x36 => Ldc2 {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x3A => Swc2 {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
+        0x3E => Sdc2 {
+            rt: rt(w),
+            base: rs(w),
+            off: imm_s(w),
+        },
         _ => Unknown { word: w },
     }
 }
@@ -739,12 +1908,30 @@ fn decode_cop1(w: u32) -> Instruction {
     use Instruction::*;
     match fmt(w) {
         // GPR<->FPR moves.
-        0x00 => Mfc1 { rt: ft(w), fs: fs(w) },
-        0x01 => Dmfc1 { rt: ft(w), fs: fs(w) },
-        0x02 => Cfc1 { rt: ft(w), fs: fs(w) },
-        0x04 => Mtc1 { rt: ft(w), fs: fs(w) },
-        0x05 => Dmtc1 { rt: ft(w), fs: fs(w) },
-        0x06 => Ctc1 { rt: ft(w), fs: fs(w) },
+        0x00 => Mfc1 {
+            rt: ft(w),
+            fs: fs(w),
+        },
+        0x01 => Dmfc1 {
+            rt: ft(w),
+            fs: fs(w),
+        },
+        0x02 => Cfc1 {
+            rt: ft(w),
+            fs: fs(w),
+        },
+        0x04 => Mtc1 {
+            rt: ft(w),
+            fs: fs(w),
+        },
+        0x05 => Dmtc1 {
+            rt: ft(w),
+            fs: fs(w),
+        },
+        0x06 => Ctc1 {
+            rt: ft(w),
+            fs: fs(w),
+        },
         // BC1: ft field carries tf (bit 0) and nd (bit 1, branch-likely).
         0x08 => match ft(w) & 0x3 {
             0x00 => Bc1f { off: imm_s(w) },
@@ -759,13 +1946,25 @@ fn decode_cop1(w: u32) -> Instruction {
         0x11 => decode_cop1_d(w),
         // Fixed-point-source conversions: W (int32 source) and L (int64 source).
         0x14 => match funct(w) {
-            0x20 => CvtSW { fd: fd(w), fs: fs(w) },
-            0x21 => CvtDW { fd: fd(w), fs: fs(w) },
+            0x20 => CvtSW {
+                fd: fd(w),
+                fs: fs(w),
+            },
+            0x21 => CvtDW {
+                fd: fd(w),
+                fs: fs(w),
+            },
             _ => Unknown { word: w },
         },
         0x15 => match funct(w) {
-            0x20 => CvtSL { fd: fd(w), fs: fs(w) },
-            0x21 => CvtDL { fd: fd(w), fs: fs(w) },
+            0x20 => CvtSL {
+                fd: fd(w),
+                fs: fs(w),
+            },
+            0x21 => CvtDL {
+                fd: fd(w),
+                fs: fs(w),
+            },
             _ => Unknown { word: w },
         },
         _ => Unknown { word: w },
@@ -776,25 +1975,103 @@ fn decode_cop1(w: u32) -> Instruction {
 fn decode_cop1_s(w: u32) -> Instruction {
     use Instruction::*;
     match funct(w) {
-        0x00 => AddS { fd: fd(w), fs: fs(w), ft: ft(w) },
-        0x01 => SubS { fd: fd(w), fs: fs(w), ft: ft(w) },
-        0x02 => MulS { fd: fd(w), fs: fs(w), ft: ft(w) },
-        0x03 => DivS { fd: fd(w), fs: fs(w), ft: ft(w) },
-        0x04 => SqrtS { fd: fd(w), fs: fs(w) },
-        0x05 => AbsS { fd: fd(w), fs: fs(w) },
-        0x06 => MovS { fd: fd(w), fs: fs(w) },
-        0x07 => NegS { fd: fd(w), fs: fs(w) },
-        0x0D => TruncWS { fd: fd(w), fs: fs(w) },
-        0x09 => TruncLS { fd: fd(w), fs: fs(w) },
-        0x0C => RoundWS { fd: fd(w), fs: fs(w) },
-        0x0E => CeilWS { fd: fd(w), fs: fs(w) },
-        0x0F => FloorWS { fd: fd(w), fs: fs(w) },
-        0x21 => CvtDS { fd: fd(w), fs: fs(w) },
-        0x24 => CvtWS { fd: fd(w), fs: fs(w) },
-        0x25 => CvtLS { fd: fd(w), fs: fs(w) },
-        0x32 => CEqS { fs: fs(w), ft: ft(w) },
-        0x3C => CLtS { fs: fs(w), ft: ft(w) },
-        0x3E => CLeS { fs: fs(w), ft: ft(w) },
+        0x00 => AddS {
+            fd: fd(w),
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x01 => SubS {
+            fd: fd(w),
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x02 => MulS {
+            fd: fd(w),
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x03 => DivS {
+            fd: fd(w),
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x04 => SqrtS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x05 => AbsS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x06 => MovS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x07 => NegS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x08 => RoundLS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x09 => TruncLS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x0A => CeilLS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x0B => FloorLS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x0C => RoundWS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x0D => TruncWS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x0E => CeilWS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x0F => FloorWS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x21 => CvtDS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x24 => CvtWS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x25 => CvtLS {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x32 => CEqS {
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x3C => CLtS {
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x3E => CLeS {
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x30..=0x3F => CCondS {
+            fs: fs(w),
+            ft: ft(w),
+            cond: (funct(w) & 0x0F) as u8,
+        },
         _ => Unknown { word: w },
     }
 }
@@ -803,25 +2080,103 @@ fn decode_cop1_s(w: u32) -> Instruction {
 fn decode_cop1_d(w: u32) -> Instruction {
     use Instruction::*;
     match funct(w) {
-        0x00 => AddD { fd: fd(w), fs: fs(w), ft: ft(w) },
-        0x01 => SubD { fd: fd(w), fs: fs(w), ft: ft(w) },
-        0x02 => MulD { fd: fd(w), fs: fs(w), ft: ft(w) },
-        0x03 => DivD { fd: fd(w), fs: fs(w), ft: ft(w) },
-        0x04 => SqrtD { fd: fd(w), fs: fs(w) },
-        0x05 => AbsD { fd: fd(w), fs: fs(w) },
-        0x06 => MovD { fd: fd(w), fs: fs(w) },
-        0x07 => NegD { fd: fd(w), fs: fs(w) },
-        0x0D => TruncWD { fd: fd(w), fs: fs(w) },
-        0x09 => TruncLD { fd: fd(w), fs: fs(w) },
-        0x0C => RoundWD { fd: fd(w), fs: fs(w) },
-        0x0E => CeilWD { fd: fd(w), fs: fs(w) },
-        0x0F => FloorWD { fd: fd(w), fs: fs(w) },
-        0x20 => CvtSD { fd: fd(w), fs: fs(w) },
-        0x24 => CvtWD { fd: fd(w), fs: fs(w) },
-        0x25 => CvtLD { fd: fd(w), fs: fs(w) },
-        0x32 => CEqD { fs: fs(w), ft: ft(w) },
-        0x3C => CLtD { fs: fs(w), ft: ft(w) },
-        0x3E => CLeD { fs: fs(w), ft: ft(w) },
+        0x00 => AddD {
+            fd: fd(w),
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x01 => SubD {
+            fd: fd(w),
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x02 => MulD {
+            fd: fd(w),
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x03 => DivD {
+            fd: fd(w),
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x04 => SqrtD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x05 => AbsD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x06 => MovD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x07 => NegD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x08 => RoundLD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x09 => TruncLD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x0A => CeilLD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x0B => FloorLD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x0C => RoundWD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x0D => TruncWD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x0E => CeilWD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x0F => FloorWD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x20 => CvtSD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x24 => CvtWD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x25 => CvtLD {
+            fd: fd(w),
+            fs: fs(w),
+        },
+        0x32 => CEqD {
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x3C => CLtD {
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x3E => CLeD {
+            fs: fs(w),
+            ft: ft(w),
+        },
+        0x30..=0x3F => CCondD {
+            fs: fs(w),
+            ft: ft(w),
+            cond: (funct(w) & 0x0F) as u8,
+        },
         _ => Unknown { word: w },
     }
 }
@@ -833,11 +2188,34 @@ impl Instruction {
         use Instruction::*;
         matches!(
             self,
-            Beq { .. } | Bne { .. } | Blez { .. } | Bgtz { .. } | Bltz { .. } | Bgez { .. }
-                | Bltzal { .. } | Bgezal { .. } | Beql { .. } | Bnel { .. } | Blezl { .. }
-                | Bgtzl { .. } | Bltzl { .. } | Bgezl { .. } | J { .. } | Jal { .. }
-                | Jr { .. } | Jalr { .. }
-                | Bc1t { .. } | Bc1f { .. } | Bc1tl { .. } | Bc1fl { .. }
+            Beq { .. }
+                | Bne { .. }
+                | Blez { .. }
+                | Bgtz { .. }
+                | Bltz { .. }
+                | Bgez { .. }
+                | Bltzal { .. }
+                | Bgezal { .. }
+                | Bltzall { .. }
+                | Bgezall { .. }
+                | Beql { .. }
+                | Bnel { .. }
+                | Blezl { .. }
+                | Bgtzl { .. }
+                | Bltzl { .. }
+                | Bgezl { .. }
+                | J { .. }
+                | Jal { .. }
+                | Jr { .. }
+                | Jalr { .. }
+                | Bc1t { .. }
+                | Bc1f { .. }
+                | Bc1tl { .. }
+                | Bc1fl { .. }
+                | Bc0t { .. }
+                | Bc0f { .. }
+                | Bc0tl { .. }
+                | Bc0fl { .. }
         )
     }
 
@@ -848,8 +2226,18 @@ impl Instruction {
         use Instruction::*;
         matches!(
             self,
-            Beql { .. } | Bnel { .. } | Blezl { .. } | Bgtzl { .. } | Bltzl { .. } | Bgezl { .. }
-                | Bc1tl { .. } | Bc1fl { .. }
+            Beql { .. }
+                | Bnel { .. }
+                | Blezl { .. }
+                | Bgtzl { .. }
+                | Bltzl { .. }
+                | Bgezl { .. }
+                | Bltzall { .. }
+                | Bgezall { .. }
+                | Bc1tl { .. }
+                | Bc1fl { .. }
+                | Bc0tl { .. }
+                | Bc0fl { .. }
         )
     }
 }

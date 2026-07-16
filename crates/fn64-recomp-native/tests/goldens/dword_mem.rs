@@ -24,12 +24,11 @@ pub fn dword_mem(ctx: &mut RecompContext, mem: &mut Rdram) {
             // 0x80200020: Sdr { rt: 8, base: 4, off: 39 }
             mem.store_dr(Rdram::eff_addr(ctx.r(4), 39), ctx.r_u64(8));
             // 0x80200024: Lld { rt: 12, base: 4, off: 40 }
-            ctx.set_r(12, mem.load_d(Rdram::eff_addr(ctx.r(4), 40)));
+            { let a = Rdram::eff_addr(ctx.r(4), 40); let v = mem.load_d(a); ctx.set_r(12, v); ctx.set_ll_reservation(a, 8); }
             // 0x80200028: Daddiu { rt: 12, rs: 12, imm: 1 }
             ctx.set_r(12, (ctx.r_u64(12)).wrapping_add(1i64 as u64));
             // 0x8020002C: Scd { rt: 12, base: 4, off: 40 }
-            mem.store_d(Rdram::eff_addr(ctx.r(4), 40), ctx.r_u64(12));
-            ctx.set_r(12, 1);
+            { let a = Rdram::eff_addr(ctx.r(4), 40); let v = ctx.r_u64(12); if ctx.take_ll_reservation(a, 8) { mem.store_d(a, v); ctx.set_r(12, 1); } else { ctx.set_r(12, 0); } }
             // 0x80200030: Jr { rs: 31 }
             // delay: 0x80200034: Nop
             // nop

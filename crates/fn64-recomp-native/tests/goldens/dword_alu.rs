@@ -24,7 +24,7 @@ pub fn dword_alu(ctx: &mut RecompContext, mem: &mut Rdram) {
             // 0x80100020: Mflo { rd: 15 }
             ctx.set_r(15, ctx.lo);
             // 0x80100024: Ddiv { rs: 4, rt: 5 }
-            { let a = ctx.r_s64(4); let b = ctx.r_s64(5); if b != 0 { if a == i64::MIN && b == -1 { ctx.lo = a as u64; ctx.hi = 0; } else { ctx.lo = a.wrapping_div(b) as u64; ctx.hi = a.wrapping_rem(b) as u64; } } }
+            ctx.div_s64(ctx.r_s64(4), ctx.r_s64(5));
             // 0x80100028: Mflo { rd: 24 }
             ctx.set_r(24, ctx.lo);
             // 0x8010002C: Daddu { rd: 2, rs: 8, rt: 9 }

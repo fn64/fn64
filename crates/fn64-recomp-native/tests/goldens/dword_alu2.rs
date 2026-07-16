@@ -14,11 +14,11 @@ pub fn dword_alu2(ctx: &mut RecompContext, mem: &mut Rdram) {
             // 0x8030000C: Mfhi { rd: 9 }
             ctx.set_r(9, ctx.hi);
             // 0x80300010: Ddivu { rs: 4, rt: 5 }
-            { let a = ctx.r_u64(4); let b = ctx.r_u64(5); if b != 0 { ctx.lo = a / b; ctx.hi = a % b; } }
+            ctx.div_u64(ctx.r_u64(4), ctx.r_u64(5));
             // 0x80300014: Mflo { rd: 10 }
             ctx.set_r(10, ctx.lo);
             // 0x80300018: Ddivu { rs: 4, rt: 5 }
-            { let a = ctx.r_u64(4); let b = ctx.r_u64(5); if b != 0 { ctx.lo = a / b; ctx.hi = a % b; } }
+            ctx.div_u64(ctx.r_u64(4), ctx.r_u64(5));
             // 0x8030001C: Mfhi { rd: 11 }
             ctx.set_r(11, ctx.hi);
             // 0x80300020: Dsrl { rd: 12, rt: 4, sa: 5 }
@@ -31,9 +31,9 @@ pub fn dword_alu2(ctx: &mut RecompContext, mem: &mut Rdram) {
             ctx.set_r(15, (ctx.r_u64(5)) >> (ctx.r_u64(4) & 63));
             // 0x80300030: Dsrav { rd: 24, rt: 4, rs: 5 }
             ctx.set_r(24, ((ctx.r_s64(4)) >> (ctx.r_u64(5) & 63)) as u64);
-            // 0x80300034: Daddi { rt: 25, rs: 4, imm: 127 }
+            // 0x80300034: Daddiu { rt: 25, rs: 4, imm: 127 }
             ctx.set_r(25, (ctx.r_u64(4)).wrapping_add(127i64 as u64));
-            // 0x80300038: Dadd { rd: 2, rs: 8, rt: 9 }
+            // 0x80300038: Daddu { rd: 2, rs: 8, rt: 9 }
             ctx.set_r(2, (ctx.r_u64(8)).wrapping_add(ctx.r_u64(9)));
             // 0x8030003C: Daddu { rd: 2, rs: 2, rt: 10 }
             ctx.set_r(2, (ctx.r_u64(2)).wrapping_add(ctx.r_u64(10)));
