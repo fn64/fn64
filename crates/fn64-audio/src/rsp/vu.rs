@@ -292,16 +292,13 @@ pub fn element_select(vt: &Vec8, e: usize) -> Vec8 {
 }
 
 /// The single source lane a scalar op (VRCP/VRSQ/VMOV) reads from `vt` for a
-/// given element field `e`. Per RSP-VU-ISA.md §5, for these ops `e` (masked
-/// to 0..7 via the same shuffle applied to the natural lane) selects one
-/// source lane. Hardware uses `element_source(e, e & 7)`'s result; concretely
-/// the selected lane is `element_source(e, 7)` for whole-broadcast `e`, but
-/// the RSP scalar ops read the lane picked by the low 3 bits under the same
-/// table. We expose it as the shuffle applied to lane `de` so the op layer
-/// stays consistent with `element_select`.
+/// given element field `e`. Scalar VMOV/VRCP/VRSQ instructions interpret the
+/// field as a direct element number, independent of the destination element
+/// (`de`), so the source is simply `e & 7` rather than the arithmetic-op
+/// element-selection shuffle.
 #[inline]
-pub fn scalar_source_lane(e: usize, de: usize) -> usize {
-    element_source(e, de)
+pub fn scalar_source_lane(e: usize, _de: usize) -> usize {
+    e & 7
 }
 
 // ---------------------------------------------------------------------------

@@ -30,7 +30,9 @@ at) — not a tracker label. Updated 2026-07-15.
 ### Recompilers (both from-scratch, typed Rust, no external tool, no GPL)
 - **CPU** `fn64-recomp-native`: MIPS III + COP1/FPU + 64-bit dword + COP0 +
   ELF/symbol front-end. Oracle-validated (differential vs N64Recomp C).
-- **RSP audio** `fn64-audio`: 46 VU ops + scalar + dispatch. aspMain
+- **RSP audio** `fn64-audio`: all 44 canonical non-reserved VU compute ops,
+  all 23 manual vector loads/stores, the exact 48-op SU subset, COP0, and
+  general delay-slot/indirect-jump/overlay dispatch. aspMain
   recompiles, **runs** (terminates in 112 steps, not the old 5M runaway) and
   **produces PCM**. Verified live in the boot (audio enabled, no hang) and by
   a real-command-list PCM test.

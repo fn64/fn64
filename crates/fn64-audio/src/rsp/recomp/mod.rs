@@ -83,7 +83,14 @@ mod round_trip_tests {
     /// or an unknown op. Returns the exit reason.
     fn run(words: &[u32], base: u32, m: &mut RspMachine) -> RspExitReason {
         let n = words.len();
-        let mut pc = base;
+        let base = 0x1000 | (base & 0x0FFF);
+        let mut pc = if m.ctx.resume_address != 0 {
+            let resume = 0x1000 | (m.ctx.resume_address & 0x0FFF);
+            m.ctx.resume_address = 0;
+            resume
+        } else {
+            base
+        };
         let mut steps = 0;
         loop {
             steps += 1;
@@ -101,7 +108,10 @@ mod round_trip_tests {
                 None
             };
             match instr {
-                Instr::Break => return RspExitReason::Broke,
+                Instr::Break => {
+                    m.break_rsp();
+                    return RspExitReason::Broke;
+                }
                 Instr::Nop => pc += 4,
                 Instr::Lui { rt, imm } => {
                     m.set_reg(rt, (imm as u32) << 16);
@@ -141,7 +151,12 @@ mod round_trip_tests {
                     run_delay(m, delay);
                     pc = if taken { target as u32 } else { pc + 8 };
                 }
-                Instr::BranchZ { op, rs, target } => {
+                Instr::BranchZ {
+                    op,
+                    rs,
+                    target,
+                    link,
+                } => {
                     use crate::rsp::decode::BranchZOp::*;
                     let v = m.reg(rs) as i32;
                     let taken = match op {
@@ -150,6 +165,9 @@ mod round_trip_tests {
                         Bltz => v < 0,
                         Bgez => v >= 0,
                     };
+                    if let Some(ret) = link {
+                        m.set_reg(31, ret as u32);
+                    }
                     run_delay(m, delay);
                     pc = if taken { target as u32 } else { pc + 8 };
                 }
@@ -197,6 +215,19 @@ mod round_trip_tests {
                     m.vstore(op, vt, elem, bv, off);
                     pc += 4;
                 }
+                Instr::Mfc0 { rt, cop0 } => {
+                    let value = m.read_cp0(cop0);
+                    m.set_reg(rt, value);
+                    pc += 4;
+                }
+                Instr::Mtc0 { rt, cop0 } => {
+                    let value = m.reg(rt);
+                    if let Some(reason) = m.write_cp0(cop0, value) {
+                        m.ctx.resume_address = pc + 4;
+                        return reason;
+                    }
+                    pc += 4;
+                }
                 // Control transfers with the delay slot run on the fallthrough
                 // path (well-formed ucode never nests a branch in a delay slot).
                 Instr::Jump { target } => {
@@ -209,7 +240,13 @@ mod round_trip_tests {
                     pc = target as u32;
                 }
                 Instr::Jr { rs } => {
-                    let jt = m.reg(rs) & 0x1FFF;
+                    let jt = 0x1000 | (m.reg(rs) & 0x0FFF);
+                    run_delay(m, delay);
+                    pc = jt;
+                }
+                Instr::Jalr { rd, rs, ret } => {
+                    let jt = 0x1000 | (m.reg(rs) & 0x0FFF);
+                    m.set_reg(rd, ret as u32);
                     run_delay(m, delay);
                     pc = jt;
                 }
@@ -225,9 +262,10 @@ mod round_trip_tests {
             Some(Instr::AluReg { op, rd, rs, rt }) => exec_alu_reg(m, op, rd, rs, rt),
             Some(Instr::Lui { rt, imm }) => m.set_reg(rt, (imm as u32) << 16),
             Some(Instr::Load { op, rt, base, off }) => exec_load(m, op, rt, base, off),
-            // A COP0 status read in a delay slot (RSP DMA-busy wait loops do
-            // exactly this) — model as 0, matching the emitter's `mfc0`→0.
-            Some(Instr::Mfc0 { rt, .. }) => m.set_reg(rt, 0),
+            Some(Instr::Mfc0 { rt, cop0 }) => {
+                let value = m.read_cp0(cop0);
+                m.set_reg(rt, value);
+            }
             _ => {}
         }
     }
@@ -474,7 +512,9 @@ mod round_trip_tests {
         let mut rdram = vec![0u8; 0x1000];
         let mut m = RspMachine::new(&mut rdram);
         m.set_reg(30, 3); // three commands to process
-        m.set_reg(2, 0x1018); // handler address the "jump table" would supply
+                          // The hardware PC is 12 bits, so a jump table may store either the
+                          // bare PC offset or an IMEM-window address. Exercise the bare form.
+        m.set_reg(2, 0x0018);
         let reason = run(&prog, base, &mut m);
         assert_eq!(
             reason,
@@ -484,5 +524,90 @@ mod round_trip_tests {
         );
         // The count drove termination: r30 decremented to 0.
         assert_eq!(m.reg(30), 0);
+    }
+
+    #[test]
+    fn branch_fallthrough_executes_delay_once_then_advances_pc_plus_8() {
+        let base = 0x1000u32;
+        let beq = |rs: u8, rt: u8, target: u32, pc: u32| {
+            let off = (((target as i32) - (pc as i32 + 4)) >> 2) as u16;
+            (0x04u32 << 26) | ((rs as u32) << 21) | ((rt as u32) << 16) | off as u32
+        };
+        let prog = [
+            beq(2, 3, 0x1010, 0x1000),
+            addi(4, 4, 1),
+            addi(4, 4, 10),
+            brk(),
+            brk(),
+        ];
+        let mut rdram = vec![0u8; 16];
+        let mut m = RspMachine::new(&mut rdram);
+        m.set_reg(2, 1);
+        m.set_reg(3, 2);
+        assert_eq!(run(&prog, base, &mut m), RspExitReason::Broke);
+        assert_eq!(
+            m.reg(4),
+            11,
+            "delay slot executes once, then pc+8 instruction runs"
+        );
+
+        let source = emit_module(&prog, base, "branch_delay_test");
+        let branch_start = source
+            .find("if m.reg(2) == m.reg(3)")
+            .expect("emitted conditional branch");
+        let else_start = branch_start
+            + source[branch_start..]
+                .find("} else {")
+                .expect("emitted branch has fallthrough");
+        let fallthrough = &source[else_start..source.len().min(else_start + 240)];
+        assert!(fallthrough.contains("pc = 0x1008;"));
+        assert!(!fallthrough.contains("pc = 0x1004;"));
+    }
+
+    #[test]
+    fn linked_regimm_branch_writes_ra_even_when_not_taken() {
+        let base = 0x1000u32;
+        let bltzal = (0x01u32 << 26) | (2 << 21) | (0x10 << 16) | 1;
+        let prog = [bltzal, 0, brk(), brk()];
+        let mut rdram = vec![0u8; 16];
+        let mut m = RspMachine::new(&mut rdram);
+        m.set_reg(2, 1); // positive: BLTZAL is not taken
+        assert_eq!(run(&prog, base, &mut m), RspExitReason::Broke);
+        assert_eq!(m.reg(31), 0x0008);
+    }
+
+    #[test]
+    fn emitted_overlay_resume_handles_sequential_and_delay_slot_dma() {
+        let mtc0 = |rt: u8, rd: u8| {
+            (0x10u32 << 26) | (0x04 << 21) | ((rt as u32) << 16) | ((rd as u32) << 11)
+        };
+        let sequential = emit_module(&[mtc0(3, 2), brk()], 0x1000, "overlay_seq");
+        assert!(sequential.contains("m.ctx.resume_address = 0x1004;"));
+        assert!(sequential.contains("let resume = 0x1000 | (m.ctx.resume_address & 0x0FFF);"));
+
+        let delayed = emit_module(&[jr(2), mtc0(3, 2)], 0x1000, "overlay_delay");
+        assert!(delayed.contains("m.ctx.resume_address = jt; break 'run r;"));
+    }
+
+    #[test]
+    fn a_second_overlay_resumes_after_the_dma_trigger() {
+        let mtc0 = |rt: u8, rd: u8| {
+            (0x10u32 << 26) | (0x04 << 21) | ((rt as u32) << 16) | ((rd as u32) << 11)
+        };
+        let first_overlay = [mtc0(2, 0), mtc0(3, 2), brk(), brk()];
+        let second_overlay = [0, 0, addiu(4, 0, 42), brk()];
+        let mut rdram = vec![0u8; 32];
+        let mut m = RspMachine::new(&mut rdram);
+        m.set_reg(2, 0x1000); // SP_MEM_ADDR selects IMEM
+        m.set_reg(3, 7); // one aligned eight-byte DMA line
+
+        assert_eq!(
+            run(&first_overlay, 0x1000, &mut m),
+            RspExitReason::SwapOverlay
+        );
+        assert_eq!(m.ctx.resume_address, 0x1008);
+        assert_eq!(run(&second_overlay, 0x1000, &mut m), RspExitReason::Broke);
+        assert_eq!(m.reg(4), 42, "replacement IMEM image resumes after MTC0");
+        assert_eq!(m.ctx.resume_address, 0);
     }
 }

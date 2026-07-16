@@ -1,6 +1,7 @@
 //! The clean-room RSP scalar/VU execution framework the audio ucode runs on.
 //!
-//! This is the FOUNDATION the 47 VU op bodies build on. It replaces BOTH GPL
+//! This is the complete framework the 44 canonical VU op bodies build on. It
+//! replaces BOTH GPL
 //! headers the RSPRecomp-generated audio-ucode C `#include`s
 //! (`librecomp/rsp.hpp` + `librecomp/rsp_vu_impl.hpp`, `rsp_recomp.cpp` lines
 //! 1179-1180) with our own clean-room, spec-derived implementation, per
@@ -17,8 +18,7 @@
 //!   clamp helpers. **This is the API the op impls call.**
 //! - [`tables`] — the generated VRCP/VRSQ 512-entry seed ROMs (with
 //!   spot-check tests against known hardware entries).
-//! - [`ops`] — the op enum + operand-shape descriptors + dispatch skeleton the
-//!   ops phase fills in.
+//! - [`ops`] — the op enum + operand-shape descriptors + exhaustive dispatch.
 //!
 //! Everything is portable scalar Rust (`i16`/`i32`/`i64` lanes), no SIMD.
 
