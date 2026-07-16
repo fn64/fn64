@@ -365,6 +365,23 @@ pub enum Instruction {
     TruncLS { fd: Reg, fs: Reg },
     /// `TRUNC.L.D fd, fs` — double -> int64, toward zero.
     TruncLD { fd: Reg, fs: Reg },
+    /// `FLOOR.W.S fd, fs` — single -> int32, toward -inf (VR4300 COP1 funct
+    /// 0x0F; MIPS III "Floor Convert to Single Fixed-Point Word").
+    FloorWS { fd: Reg, fs: Reg },
+    /// `FLOOR.W.D fd, fs` — double -> int32, toward -inf (COP1 funct 0x0F).
+    FloorWD { fd: Reg, fs: Reg },
+    /// `CEIL.W.S fd, fs` — single -> int32, toward +inf (VR4300 COP1 funct
+    /// 0x0E; MIPS III "Ceiling Convert to Single Fixed-Point Word").
+    CeilWS { fd: Reg, fs: Reg },
+    /// `CEIL.W.D fd, fs` — double -> int32, toward +inf (COP1 funct 0x0E).
+    CeilWD { fd: Reg, fs: Reg },
+    /// `ROUND.W.S fd, fs` — single -> int32, round to nearest/even (VR4300
+    /// COP1 funct 0x0C; "Round Convert to Single Fixed-Point Word"). Uses the
+    /// FCSR rounding mode, which every OoT thread boots into RN (nearest-even)
+    /// — the same mode `CVT.W.*` already assumes here.
+    RoundWS { fd: Reg, fs: Reg },
+    /// `ROUND.W.D fd, fs` — double -> int32, round to nearest/even (funct 0x0C).
+    RoundWD { fd: Reg, fs: Reg },
 
     // --- FP compares: set the FP condition flag (FCSR bit 23). `fmt`
     //     distinguishes S (0x10) vs D (0x11); `funct` picks the predicate.
@@ -769,6 +786,9 @@ fn decode_cop1_s(w: u32) -> Instruction {
         0x07 => NegS { fd: fd(w), fs: fs(w) },
         0x0D => TruncWS { fd: fd(w), fs: fs(w) },
         0x09 => TruncLS { fd: fd(w), fs: fs(w) },
+        0x0C => RoundWS { fd: fd(w), fs: fs(w) },
+        0x0E => CeilWS { fd: fd(w), fs: fs(w) },
+        0x0F => FloorWS { fd: fd(w), fs: fs(w) },
         0x21 => CvtDS { fd: fd(w), fs: fs(w) },
         0x24 => CvtWS { fd: fd(w), fs: fs(w) },
         0x25 => CvtLS { fd: fd(w), fs: fs(w) },
@@ -793,6 +813,9 @@ fn decode_cop1_d(w: u32) -> Instruction {
         0x07 => NegD { fd: fd(w), fs: fs(w) },
         0x0D => TruncWD { fd: fd(w), fs: fs(w) },
         0x09 => TruncLD { fd: fd(w), fs: fs(w) },
+        0x0C => RoundWD { fd: fd(w), fs: fs(w) },
+        0x0E => CeilWD { fd: fd(w), fs: fs(w) },
+        0x0F => FloorWD { fd: fd(w), fs: fs(w) },
         0x20 => CvtSD { fd: fd(w), fs: fs(w) },
         0x24 => CvtWD { fd: fd(w), fs: fs(w) },
         0x25 => CvtLD { fd: fd(w), fs: fs(w) },
