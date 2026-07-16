@@ -69,6 +69,32 @@ const G_MV_VIEWPORT: u8 = 8;
 const G_CULL_FRONT: u32 = 0x0000_0200;
 /// Cull back-facing triangles (the common case).
 const G_CULL_BACK: u32 = 0x0000_0400;
+/// Enable vertex lighting. When set, a vertex's `cn[0..3]` bytes are a signed
+/// s8 NORMAL (x,y,z), not an RGB color -- the vertex color is COMPUTED from
+/// the loaded lights (ambient + per-directional N·L·color) instead of taken
+/// from `cn` (`F3DEX2-CONCEPTS.md` §2.4; OoT gbi.h `G_LIGHTING`). Reading the
+/// normal bytes as a flat color (the pre-lighting path) produced the
+/// characteristic "rainbow fan" -- signed normal components reinterpreted as
+/// unsigned color channels.
+const G_LIGHTING: u32 = 0x0002_0000;
+
+// --- F3DEX2 lighting: G_MOVEMEM/G_MOVEWORD indices + Light layout --------
+/// `G_MV_LIGHT` (OoT gbi.h:1169) -- the `G_MOVEMEM` index that DMAs a `Light`
+/// struct (diffuse color + direction, or an ambient color) into an RSP light
+/// slot. F3DEX2 `gsSPLight` (gbi.h:2911) encodes `idx = G_MV_LIGHT` in the
+/// w0 low byte and `ofs = n*24 + 24` (÷8 in the wire) in `field(w0,8,8)`.
+const G_MV_LIGHT: u8 = 0x0a;
+/// `G_MW_NUMLIGHT` (OoT gbi.h:1210) -- the `G_MOVEWORD` index that sets the
+/// directional-light count. F3DEX2 `gsSPNumLights` (gbi.h:2887) writes
+/// `NUML(n) = n*24` as the data word, so `numDirectional = w1 / 24`. The
+/// AMBIENT light is the slot AFTER the directional ones (gbi.h:2902 note:
+/// "the highest numbered light is always the ambient light").
+const G_MW_NUMLIGHT: u16 = 0x02;
+/// One `Light_t` on the wire is 16 bytes (OoT gbi.h:1311 -- `col[3]`, pad,
+/// `colc[3]`, pad, `dir[3]`, pad), padded to a 16-byte `Light` union.
+const LIGHT_STRIDE: usize = 16;
+/// Max simultaneous lights F3DEX2 supports (7 directional + 1 ambient).
+const MAX_LIGHTS: usize = 8;
 
 // --- Additional F3DEX2 opcode bytes, named for the loud-skip log so the
 // coverage report doesn't understate what a real OoT DL contains. These are
@@ -125,6 +151,15 @@ pub struct Vertex {
     /// (`F3DEX2-CONCEPTS.md` §5). 0.0 on the untextured/reference path.
     pub s: f32,
     pub t: f32,
+    /// The homogeneous clip-space `w` this vertex was divided by (before the
+    /// perspective divide). `w <= 0` means the vertex is AT or BEHIND the
+    /// camera's near plane -- projecting it divides by a non-positive number
+    /// and flings it to the opposite side of the screen, which is the "fan/
+    /// bowtie from a central point" artifact. A triangle with any such vertex
+    /// is dropped (coarse near-plane cull, see `behind_near_plane`) rather
+    /// than drawn as a giant wrong-side polygon. `1.0` on the raw/reference
+    /// path (no projection, everything in front).
+    pub w: f32,
 }
 
 /// Screen-space back/front-face culling selector, derived from the F3DEX2
@@ -228,21 +263,21 @@ type Mat4 = [[f32; 4]; 4];
 
 fn identity() -> Mat4 {
     let mut m = [[0.0f32; 4]; 4];
-    for i in 0..4 {
-        m[i][i] = 1.0;
+    for (i, row) in m.iter_mut().enumerate() {
+        row[i] = 1.0;
     }
     m
 }
 
 fn mat_mul(a: &Mat4, b: &Mat4) -> Mat4 {
     let mut out = [[0.0f32; 4]; 4];
-    for r in 0..4 {
-        for c in 0..4 {
+    for (r, out_row) in out.iter_mut().enumerate() {
+        for (c, out_cell) in out_row.iter_mut().enumerate() {
             let mut s = 0.0;
             for k in 0..4 {
                 s += a[r][k] * b[k][c];
             }
-            out[r][c] = s;
+            *out_cell = s;
         }
     }
     out
@@ -288,8 +323,8 @@ fn read_mtx(rdram: &[u8], addr: usize) -> Option<Mat4> {
         return None;
     }
     let mut m = [[0.0f32; 4]; 4];
-    for r in 0..4 {
-        for c in 0..4 {
+    for (r, row) in m.iter_mut().enumerate() {
+        for (c, cell) in row.iter_mut().enumerate() {
             let elem = r * 4 + c;
             let int_off = addr + elem * 2;
             let frac_off = addr + 32 + elem * 2;
@@ -299,7 +334,7 @@ fn read_mtx(rdram: &[u8], addr: usize) -> Option<Mat4> {
             let frac_part = read_u16(rdram, frac_off) as i32;
             let value = (((int_part << 16) | frac_part) as f32) / 65536.0;
             // Natural row-major store (hardware [row][col]): NO transpose.
-            m[r][c] = value;
+            *cell = value;
         }
     }
     Some(m)
@@ -332,6 +367,98 @@ fn read_viewport(rdram: &[u8], addr: usize) -> Option<Viewport> {
         ty: vtrans_y / 4.0,
         tz: vtrans_z / 4.0,
     })
+}
+
+// --- Vertex lighting (F3DEX2-CONCEPTS.md §2.4) --------------------------
+
+/// Read a `Light_t` (16 bytes, OoT gbi.h:1311 -- `col[3]` u8, pad, `colc[3]`
+/// u8, pad, `dir[3]` s8, pad) out of `rdram` at `addr` and install it into
+/// light `slot`. Directional slots keep both direction (unit, s8÷127) and
+/// color; the ambient slot (`slot == num_dir`) has no meaningful direction,
+/// so we ALSO copy its color into `ambient` -- the RSP treats the highest
+/// light as pure ambient regardless of its `dir` bytes (gbi.h:2902). Reads
+/// through the recomp `^3`/`MEM_B` swizzle like every other DMA'd struct.
+fn load_light(rdram: &[u8], state: &mut DecodeState, addr: usize, slot: usize) {
+    if slot >= MAX_LIGHTS {
+        return;
+    }
+    // Guard the whole 16-byte Light_t read (recomp `^3` swizzle can touch
+    // `addr + LIGHT_STRIDE - 1`); a truncated DMA leaves the slot untouched.
+    if addr + LIGHT_STRIDE > rdram.len() {
+        return;
+    }
+    // col[0..3] at bytes 0..3; dir[3] (s8) at bytes 8..11.
+    let cr = read_u8(rdram, addr) as f32 / 255.0;
+    let cg = read_u8(rdram, addr + 1) as f32 / 255.0;
+    let cb = read_u8(rdram, addr + 2) as f32 / 255.0;
+    // dir is signed s8 ÷127 -> a (roughly) unit direction (RSPProcessCS.hlsl
+    // `srcNorm / 127`).
+    let dx = (read_u8(rdram, addr + 8) as i8) as f32 / 127.0;
+    let dy = (read_u8(rdram, addr + 9) as i8) as f32 / 127.0;
+    let dz = (read_u8(rdram, addr + 10) as i8) as f32 / 127.0;
+    state.lights.dir[slot] = DirLight {
+        dir: [dx, dy, dz],
+        col: [cr, cg, cb],
+    };
+    // If this slot is the ambient slot (the one just past the directional
+    // count), mirror its color into `ambient`.
+    if slot == state.lights.num_dir {
+        state.lights.ambient = [cr, cg, cb];
+    }
+}
+
+/// Normalize a 3-vector; returns the zero vector unchanged (guards a 0-length
+/// normal/direction so a bad DMA can't produce NaN).
+#[inline]
+fn normalize3(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len > 1e-6 {
+        [v[0] / len, v[1] / len, v[2] / len]
+    } else {
+        [0.0, 0.0, 0.0]
+    }
+}
+
+/// Rotate a direction (w=0) by the 3x3 upper-left of a `Mat4` (row-major,
+/// column-vector convention like `transform_point`). Used to bring a light
+/// direction from world/eye space into the vertex's local space, matching
+/// RT64's `computeDirLight` (`mul(float4(dir,0), worldMat)`), which multiplies
+/// by the modelview so N·L is evaluated in the same space as the (untransformed)
+/// vertex normal.
+#[inline]
+fn rotate_dir(m: &Mat4, d: [f32; 3]) -> [f32; 3] {
+    let mut out = [0.0f32; 3];
+    for (r, o) in out.iter_mut().enumerate() {
+        *o = m[r][0] * d[0] + m[r][1] * d[1] + m[r][2] * d[2];
+    }
+    out
+}
+
+/// Compute a lit vertex color from a NORMAL (`cn` reinterpreted as s8÷127),
+/// the loaded lights, and the current modelview (light-space transform).
+/// Ambient + Σ over directionals of `max(N·L, 0) * lightColor`, clamped to
+/// [0,1] per channel, returned as u8 RGB. This mirrors RT64's
+/// `RSPProcessCS.hlsl` lighting branch (ambient is the base, each directional
+/// adds `computeDirLight`, result `min(.,1)`), the microcode-faithful model.
+fn light_vertex(state: &DecodeState, normal: [f32; 3]) -> [u8; 3] {
+    let n = normalize3(normal);
+    let mut c = state.lights.ambient;
+    for i in 0..state.lights.num_dir {
+        let light = &state.lights.dir[i];
+        // Bring the light direction into the vertex's (model) space via the
+        // modelview, normalize, then N·L (clamped at 0 -- unlit back side
+        // contributes nothing).
+        let ld = normalize3(rotate_dir(&state.modelview, light.dir));
+        let ndotl = (n[0] * ld[0] + n[1] * ld[1] + n[2] * ld[2]).max(0.0);
+        c[0] += ndotl * light.col[0];
+        c[1] += ndotl * light.col[1];
+        c[2] += ndotl * light.col[2];
+    }
+    [
+        (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+    ]
 }
 
 // --- Texture format decode (F3DEX2-CONCEPTS.md §5.1) --------------------
@@ -678,6 +805,48 @@ struct DecodeState {
     /// TLUT palette, G_TEXTURE enable/scale, and the currently-decoded
     /// texture bound to emitted triangles). See [`TexState`].
     tex: TexState,
+    /// Vertex-lighting decode state (`G_MV_LIGHT` diffuse/ambient structs +
+    /// `G_MW_NUMLIGHT` count). Applied at `G_VTX` time when the geometry
+    /// mode's `G_LIGHTING` bit is set. See [`LightState`].
+    lights: LightState,
+}
+
+/// F3DEX2 vertex-lighting decode state (`F3DEX2-CONCEPTS.md` §2.4). The
+/// RSP holds up to 7 directional lights plus one ambient; `num_dir` selects
+/// how many directional slots are active, and the ambient light is the slot
+/// at index `num_dir`. Directions are stored NORMALIZED in eye/model space
+/// (s8 ÷127); the light-space transform uses the current modelview.
+#[derive(Clone, Debug)]
+struct LightState {
+    /// Diffuse light slots (`G_MV_LIGHT`): direction (unit, s8÷127) + RGB
+    /// color (0..1). Slot `num_dir` doubles as the ambient's color carrier
+    /// when written, but ambient is read via `ambient` below.
+    dir: [DirLight; MAX_LIGHTS],
+    /// Ambient light color (0..1) -- the highest-numbered light slot.
+    ambient: [f32; 3],
+    /// Number of active directional lights (`G_MW_NUMLIGHT` / 24).
+    num_dir: usize,
+}
+
+impl Default for LightState {
+    fn default() -> Self {
+        LightState {
+            dir: [DirLight::default(); MAX_LIGHTS],
+            // A conservative default: no ambient, no directionals, so a DL
+            // that enables G_LIGHTING but (somehow) loaded no lights renders
+            // dark rather than garbage -- but real OoT always loads both.
+            ambient: [0.0, 0.0, 0.0],
+            num_dir: 0,
+        }
+    }
+}
+
+/// One decoded directional light: a unit direction (light-space, s8÷127) and
+/// an RGB diffuse color (0..1).
+#[derive(Copy, Clone, Debug, Default)]
+struct DirLight {
+    dir: [f32; 3],
+    col: [f32; 3],
 }
 
 /// Texture-pipeline decode state (`F3DEX2-CONCEPTS.md` §5). Kept as a
@@ -793,6 +962,7 @@ pub fn decode_display_list(rdram: &[u8], dl_addr: u32) -> Result<Vec<Triangle>, 
                         a: cn[3],
                         s: 0.0, // simple reference path: untextured
                         t: 0.0,
+                        w: 1.0, // simple path: everything in front of camera
                     };
                 }
             }
@@ -843,6 +1013,7 @@ pub fn decode_display_list_f3dex2(
         geometry_mode: 0,
         dl_depth: 0,
         tex: TexState::default(),
+        lights: LightState::default(),
     };
     decode_stream(rdram, dl_addr, &mut state);
     Ok(state.tris)
@@ -983,6 +1154,13 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                         // high bits, keep the low 24 (segments span rdram).
                         state.segments[seg] = w1 & 0x00FF_FFFF;
                     }
+                } else if index == G_MW_NUMLIGHT {
+                    // F3DEX2 gsSPNumLights (gbi.h:2887): data = NUML(n) =
+                    // n*24, so the directional-light count is w1/24. The
+                    // ambient light lives in slot `num_dir` (gbi.h:2902:
+                    // "the highest numbered light is always the ambient").
+                    let n = (w1 / 24) as usize;
+                    state.lights.num_dir = n.min(MAX_LIGHTS - 1);
                 } else {
                     skip_opcode(G_MOVEWORD);
                 }
@@ -1127,16 +1305,26 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
             }
             G_MOVEMEM => {
                 // F3DEX2 gsMoveMem (§1.4): w0 low byte = index (which RSP
-                // block), w1 = segmented source address. G_MV_VIEWPORT
-                // (index 8) points at a 16-byte `Vp` we parse into the screen
-                // mapping; other indices (lights, absolute matrices) are
-                // phase-2 and acknowledged-and-skipped.
+                // block), field(w0,8,8) = offset/8, w1 = segmented source
+                // address. G_MV_VIEWPORT (index 8) points at a 16-byte `Vp`;
+                // G_MV_LIGHT (index 0x0a) points at a 16-byte `Light` DMA'd
+                // into the slot the offset selects. Other indices (absolute
+                // matrices, lookat) are acknowledged-and-skipped.
                 let index = (w0 & 0xFF) as u8;
+                let ofs_div8 = ((w0 >> 8) & 0xFF) as usize;
                 if index == G_MV_VIEWPORT {
                     let addr = resolve_addr(&state.segments, w1);
                     if let Some(vp) = read_viewport(rdram, addr) {
                         state.viewport = Some(vp);
                     }
+                } else if index == G_MV_LIGHT {
+                    // gsSPLight (gbi.h:2911): ofs = n*24 + 24 (÷8 on the
+                    // wire), so ofs/8 = 3*(n+1) and the destination light
+                    // SLOT is n = ofs/8/3 - 1. Slot 0..num_dir-1 are
+                    // directional; slot num_dir is the ambient.
+                    let slot = (ofs_div8 / 3).saturating_sub(1);
+                    let addr = resolve_addr(&state.segments, w1);
+                    load_light(rdram, state, addr, slot);
                 } else {
                     skip_opcode(G_MOVEMEM);
                 }
@@ -1145,9 +1333,9 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 // F3DEX2 gsSPGeometryMode (§2.4): one atomic clear+set --
                 // `mode = (mode & field(w0,0,24)) | w1`, where the w0 low 24
                 // bits are the (already-inverted) AND mask. We honor the
-                // CULL_FRONT/CULL_BACK bits per-triangle (see cull_mode_from);
-                // the other bits (shade/lighting/fog) are decode-time state a
-                // flat/modulated frame doesn't act on yet.
+                // CULL_FRONT/CULL_BACK bits per-triangle (see cull_mode_from)
+                // and the G_LIGHTING bit at G_VTX time (cn = normal -> lit
+                // color, see load_vertices); fog/shade-smooth are not acted on.
                 let and_mask = w0 & 0x00FF_FFFF;
                 state.geometry_mode = (state.geometry_mode & and_mask) | w1;
             }
@@ -1237,12 +1425,27 @@ fn load_vertices(
         let raw_t = read_i16(rdram, off + 10) as f32;
         let s = raw_s * state.tex.tex_scale_s / 32.0;
         let t = raw_t * state.tex.tex_scale_t / 32.0;
-        let r = read_u8(rdram, off + 12);
-        let g = read_u8(rdram, off + 13);
-        let b = read_u8(rdram, off + 14);
+        // cn[4] at offsets 12..16. The alpha byte is always alpha. The RGB
+        // bytes are EITHER a flat vertex color (G_LIGHTING off) OR a signed
+        // s8 NORMAL (G_LIGHTING on) that must be LIT into a color -- reading
+        // a normal as a color is what produced the "rainbow fan" (signed
+        // normal components read as unsigned channels). See G_LIGHTING.
         let a = read_u8(rdram, off + 15);
+        let (r, g, b) = if state.geometry_mode & G_LIGHTING != 0 {
+            let nx = (read_u8(rdram, off + 12) as i8) as f32 / 127.0;
+            let ny = (read_u8(rdram, off + 13) as i8) as f32 / 127.0;
+            let nz = (read_u8(rdram, off + 14) as i8) as f32 / 127.0;
+            let [lr, lg, lb] = light_vertex(state, [nx, ny, nz]);
+            (lr, lg, lb)
+        } else {
+            (
+                read_u8(rdram, off + 12),
+                read_u8(rdram, off + 13),
+                read_u8(rdram, off + 14),
+            )
+        };
 
-        let (sx, sy, sz) = project_vertex(state, x, y, z);
+        let (sx, sy, sz, sw) = project_vertex(state, x, y, z);
         state.vtx_cache[v0 + i] = Vertex {
             x: sx,
             y: sy,
@@ -1253,6 +1456,7 @@ fn load_vertices(
             a,
             s,
             t,
+            w: sw,
         };
     }
 }
@@ -1263,13 +1467,17 @@ fn load_vertices(
 /// If NO transform is loaded at all, the raw `ob` x/y are already screen
 /// coordinates (the pre-existing reference-fixture convention) and pass
 /// through unchanged.
-fn project_vertex(state: &DecodeState, x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+fn project_vertex(state: &DecodeState, x: f32, y: f32, z: f32) -> (f32, f32, f32, f32) {
     match state.mvp {
         Some(mvp) => {
             let clip = transform_point(&mvp, x, y, z);
-            // Perspective divide: clip -> NDC. Guard w~0 (a vertex on the
-            // camera plane) so a divide-by-zero doesn't fling it to infinity.
-            let w = if clip[3].abs() > 1e-6 { clip[3] } else { 1.0 };
+            // Keep the true clip-space w for near-plane culling (a vertex with
+            // w <= 0 is at/behind the camera). Guard only the DIVIDE against a
+            // near-zero w so the perspective divide doesn't overflow; the
+            // decision to draw is made from the un-guarded `clip[3]` (returned
+            // as the 4th component) in resolve_tri.
+            let true_w = clip[3];
+            let w = if true_w.abs() > 1e-6 { true_w } else { 1e-6 };
             let ndc_x = clip[0] / w;
             let ndc_y = clip[1] / w;
             let ndc_z = clip[2] / w;
@@ -1280,19 +1488,20 @@ fn project_vertex(state: &DecodeState, x: f32, y: f32, z: f32) -> (f32, f32, f32
                     // N64 screen Y is top-down; NDC +Y is up, so flip.
                     let py = -ndc_y * vp.sy + vp.ty;
                     let pz = ndc_z * vp.sz + vp.tz;
-                    (px, py, pz)
+                    (px, py, pz, true_w)
                 }
                 None => {
                     // Default viewport: 320x240, origin center.
                     let px = ndc_x * 160.0 + 160.0;
                     let py = -ndc_y * 120.0 + 120.0;
-                    (px, py, ndc_z)
+                    (px, py, ndc_z, true_w)
                 }
             }
         }
         None => {
-            // No transform: raw screen coords (reference-fixture path).
-            (x, y, 0.0)
+            // No transform: raw screen coords (reference-fixture path). w=1 so
+            // the near-plane cull never rejects the raw/fixture geometry.
+            (x, y, 0.0, 1.0)
         }
     }
 }
@@ -1304,6 +1513,14 @@ fn tri_indices(w: u32) -> [u32; 3] {
     [(w >> 17) & 0x7F, (w >> 9) & 0x7F, (w >> 1) & 0x7F]
 }
 
+/// A vertex is at/behind the near plane when its clip-space `w` is not
+/// positive. Projecting such a vertex divides by a non-positive number and
+/// flings it across the screen; a triangle touching one is dropped.
+#[inline]
+fn behind_near_plane(v: &Vertex) -> bool {
+    v.w <= 1e-4
+}
+
 fn resolve_tri(
     vtx_cache: &[Vertex; 32],
     idx: [u32; 3],
@@ -1311,6 +1528,20 @@ fn resolve_tri(
     texture: Option<Texture>,
 ) -> Option<Triangle> {
     if idx.iter().any(|&i| i as usize >= vtx_cache.len()) {
+        return None;
+    }
+    let v = [
+        vtx_cache[idx[0] as usize],
+        vtx_cache[idx[1] as usize],
+        vtx_cache[idx[2] as usize],
+    ];
+    // Coarse near-plane cull: if ANY vertex is at/behind the camera, the
+    // perspective-divided screen position is meaningless (it lands on the
+    // wrong side), so drop the whole triangle rather than draw the giant
+    // wrong-side "fan" polygon. Proper clipping would split the triangle at
+    // the near plane; dropping is the correct-image-preserving subset of that
+    // (it removes the artifact without inventing geometry).
+    if v.iter().any(behind_near_plane) {
         return None;
     }
     Some(Triangle {
@@ -1721,7 +1952,200 @@ mod tests {
         assert_eq!(cull_mode_from(0x0000_0005), CullMode::None);
     }
 
-    // --- Texture sampling (priority 3) ----------------------------------
+    // --- Vertex lighting (priority 3) -----------------------------------
+
+    /// Write a byte at logical offset `off` through the recomp `^3` swizzle
+    /// (mirrors `read_u8`'s memory model), so tests plant Light_t/Vtx bytes
+    /// the way a real DMA would.
+    fn wr_u8(rdram: &mut [u8], off: usize, v: u8) {
+        rdram[off ^ 3] = v;
+    }
+
+    /// A `DecodeState` with identity modelview and no MVP -- the minimal
+    /// harness for exercising the light math directly.
+    fn lit_state() -> DecodeState {
+        DecodeState {
+            vtx_cache: [Vertex::default(); 32],
+            tris: Vec::new(),
+            segments: [0u32; 16],
+            mvp: None,
+            proj: None,
+            modelview: identity(),
+            mv_stack: Vec::new(),
+            viewport: None,
+            geometry_mode: 0,
+            dl_depth: 0,
+            tex: TexState::default(),
+            lights: LightState::default(),
+        }
+    }
+
+    #[test]
+    fn num_lights_from_moveword_divides_by_24() {
+        // gsSPNumLights writes NUML(n) = n*24; num_dir = data/24.
+        let mut st = lit_state();
+        // 2 directional lights: data = 48.
+        st.lights.num_dir = (48u32 / 24) as usize;
+        assert_eq!(st.lights.num_dir, 2);
+    }
+
+    #[test]
+    fn load_light_decodes_color_and_signed_direction() {
+        // Light_t: col[3] u8 @0..3, dir[3] s8 @8..11. Plant a red light
+        // pointing along -Z (dir byte 0x81 == -127 -> ~-1.0 after /127).
+        let mut rdram = vec![0u8; 64];
+        let addr = 0x10;
+        wr_u8(&mut rdram, addr, 255); // col.r
+        wr_u8(&mut rdram, addr + 1, 0); // col.g
+        wr_u8(&mut rdram, addr + 2, 0); // col.b
+        wr_u8(&mut rdram, addr + 8, 0); // dir.x
+        wr_u8(&mut rdram, addr + 9, 0); // dir.y
+        wr_u8(&mut rdram, addr + 10, 0x81); // dir.z = -127
+        let mut st = lit_state();
+        st.lights.num_dir = 1; // slot 0 is directional here
+        load_light(&rdram, &mut st, addr, 0);
+        let l = st.lights.dir[0];
+        assert_eq!(l.col, [1.0, 0.0, 0.0]);
+        assert!((l.dir[2] - (-127.0 / 127.0)).abs() < 1e-6);
+        assert_eq!(l.dir[0], 0.0);
+    }
+
+    #[test]
+    fn light_vertex_face_on_light_is_full_diffuse_plus_ambient() {
+        // One white directional light pointing at the surface normal (+Z),
+        // plus a dim gray ambient. A normal facing the light (+Z) gets full
+        // N·L=1 -> ambient + light color, clamped.
+        let mut st = lit_state();
+        st.lights.num_dir = 1;
+        st.lights.ambient = [0.1, 0.1, 0.1];
+        st.lights.dir[0] = DirLight {
+            dir: [0.0, 0.0, 1.0],
+            col: [0.8, 0.8, 0.8],
+        };
+        // Normal directly toward the light: N·L = 1.
+        let c = light_vertex(&st, [0.0, 0.0, 1.0]);
+        // 0.1 + 1.0*0.8 = 0.9 -> 229.
+        assert_eq!(c, [229, 229, 229]);
+    }
+
+    #[test]
+    fn light_vertex_back_face_gets_ambient_only() {
+        // A normal facing AWAY from the light (N·L < 0, clamped to 0) is lit
+        // by ambient alone -- the diffuse term must not go negative (that
+        // was the failure mode a naive dot without a max(.,0) would hit).
+        let mut st = lit_state();
+        st.lights.num_dir = 1;
+        st.lights.ambient = [0.2, 0.2, 0.2];
+        st.lights.dir[0] = DirLight {
+            dir: [0.0, 0.0, 1.0],
+            col: [1.0, 1.0, 1.0],
+        };
+        // Normal pointing away from the +Z light.
+        let c = light_vertex(&st, [0.0, 0.0, -1.0]);
+        assert_eq!(c, [51, 51, 51]); // 0.2*255 = 51, no negative diffuse.
+    }
+
+    #[test]
+    fn light_vertex_is_not_the_raw_normal_bytes() {
+        // Fail-against-bug: the OLD path read the s8 normal bytes AS a flat
+        // color. A normal of (0,0,+1) with a green light must NOT come out as
+        // the raw normal-as-color (which would be ~[0,0,255] from cn bytes);
+        // it must be the LIT color (green from the light). This is exactly the
+        // "rainbow fan" bug: signed normals misread as unsigned color.
+        let mut st = lit_state();
+        st.lights.num_dir = 1;
+        st.lights.ambient = [0.0, 0.0, 0.0];
+        st.lights.dir[0] = DirLight {
+            dir: [0.0, 0.0, 1.0],
+            col: [0.0, 1.0, 0.0], // green
+        };
+        let c = light_vertex(&st, [0.0, 0.0, 1.0]);
+        assert_eq!(c, [0, 255, 0]); // green, from the LIGHT -- not the normal.
+    }
+
+    #[test]
+    fn light_vertex_half_angle_scales_diffuse() {
+        // A 45° normal to a +Z light: N·L = cos(45°) ≈ 0.707, so a white
+        // light yields ~0.707 -> ~180 (screen-linear, no gamma).
+        let mut st = lit_state();
+        st.lights.num_dir = 1;
+        st.lights.ambient = [0.0, 0.0, 0.0];
+        st.lights.dir[0] = DirLight {
+            dir: [0.0, 0.0, 1.0],
+            col: [1.0, 1.0, 1.0],
+        };
+        let inv_sqrt2 = 1.0 / 2.0_f32.sqrt();
+        let c = light_vertex(&st, [inv_sqrt2, 0.0, inv_sqrt2]);
+        // 0.707 * 255 ≈ 180.
+        assert!((c[0] as i32 - 180).abs() <= 1, "got {}", c[0]);
+    }
+
+    #[test]
+    fn light_vertex_modelview_rotates_light_into_local_space() {
+        // computeDirLight brings the light dir into local space via the
+        // modelview. With a 90° rotation about Y, a light along +X ends up
+        // along the axis a +Z-facing normal is lit by. Concretely: rotate the
+        // world +X light so it aligns with the vertex normal's frame, giving
+        // full N·L where an unrotated dot would give 0.
+        let mut st = lit_state();
+        st.lights.num_dir = 1;
+        st.lights.ambient = [0.0, 0.0, 0.0];
+        st.lights.dir[0] = DirLight {
+            dir: [1.0, 0.0, 0.0], // light along world +X
+            col: [1.0, 1.0, 1.0],
+        };
+        // modelview that rotates +X -> +Z under rotate_dir (row-major,
+        // column-vector): out.z = m[2][0]*x. Set m[2][0]=1, m[0][0]=0.
+        let mut mv = identity();
+        mv[0][0] = 0.0;
+        mv[2][0] = 1.0;
+        mv[2][2] = 0.0;
+        st.modelview = mv;
+        // Normal along +Z now sees the rotated light head-on.
+        let c = light_vertex(&st, [0.0, 0.0, 1.0]);
+        assert_eq!(c, [255, 255, 255]);
+        // Sanity: WITHOUT the rotation (identity), the +X light and +Z normal
+        // are orthogonal -> no diffuse.
+        st.modelview = identity();
+        let c0 = light_vertex(&st, [0.0, 0.0, 1.0]);
+        assert_eq!(c0, [0, 0, 0]);
+    }
+
+    // --- Near-plane culling (the "fan from a point" fix) ----------------
+
+    fn vtx_w(w: f32) -> Vertex {
+        Vertex {
+            w,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn behind_near_plane_flags_nonpositive_w() {
+        assert!(behind_near_plane(&vtx_w(-1.0)), "w<0 is behind camera");
+        assert!(behind_near_plane(&vtx_w(0.0)), "w==0 is on the camera plane");
+        assert!(!behind_near_plane(&vtx_w(1.0)), "w>0 is in front");
+    }
+
+    #[test]
+    fn resolve_tri_drops_triangle_with_a_behind_camera_vertex() {
+        // Fail-against-bug: a triangle with one vertex at w<=0 is the "fan
+        // from a point" artifact (projecting it flings it across the screen).
+        // resolve_tri must DROP it, not emit a giant wrong-side polygon.
+        let mut cache = [Vertex::default(); 32];
+        cache[0] = vtx_w(1.0);
+        cache[1] = vtx_w(1.0);
+        cache[2] = vtx_w(-0.5); // behind the near plane
+        assert!(
+            resolve_tri(&cache, [0, 1, 2], CullMode::None, None).is_none(),
+            "triangle touching a behind-camera vertex must be dropped"
+        );
+        // All three in front -> kept.
+        cache[2] = vtx_w(2.0);
+        assert!(resolve_tri(&cache, [0, 1, 2], CullMode::None, None).is_some());
+    }
+
+    // --- Texture sampling (priority 4) ----------------------------------
 
     /// Build a 2×2 RGBA8888 texture: TL=red, TR=green, BL=blue, BR=white.
     fn checker_2x2(clamp: bool) -> Texture {
