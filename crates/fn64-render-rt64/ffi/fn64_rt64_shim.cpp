@@ -10,6 +10,11 @@
 #include <string>
 
 #include <SDL.h>
+#if defined(__APPLE__)
+#include <SDL_syswm.h>
+#include <Metal/Metal.hpp>
+#include <pthread.h>
+#endif
 
 #include "hle/rt64_application.h"
 #include "hle/rt64_present_queue.h"
@@ -55,6 +60,11 @@ struct Fn64Rt64Context {
     std::array<uint8_t, 4096> imem{};
     std::unique_ptr<uint8_t[]> placeholder_rdram;
     std::array<uint32_t, 24> registers{};
+#if defined(__APPLE__)
+    SDL_Window *host_window = nullptr;
+    SDL_MetalView metal_view = nullptr;
+    plume::RenderWindow render_window{};
+#endif
     std::unique_ptr<RT64::Application> application;
     uint8_t *active_rdram = nullptr;
     size_t active_rdram_len = 0;
@@ -74,10 +84,22 @@ struct Fn64Rt64Context {
         if (setup_complete && application) {
             application->end();
         }
+        application.reset();
+#if defined(__APPLE__)
+        if (metal_view != nullptr) {
+            SDL_Metal_DestroyView(metal_view);
+        }
+        if (host_window != nullptr) {
+            SDL_DestroyWindow(host_window);
+        }
+#endif
     }
 
     RT64::Application::Core make_core() {
         RT64::Application::Core core{};
+#if defined(__APPLE__)
+        core.window = render_window;
+#endif
         core.HEADER = header.data();
         core.RDRAM = placeholder_rdram.get();
         core.DMEM = dmem.data();
@@ -109,6 +131,75 @@ struct Fn64Rt64Context {
         return core;
     }
 
+#if defined(__APPLE__)
+    bool create_hidden_metal_surface(char *error, size_t error_capacity) {
+        // AppKit objects must be created and messaged on the process's main
+        // thread. Returning before SDL/RT64 touches Cocoa makes a worker-thread
+        // embedder a recoverable backend error instead of an Objective-C crash.
+        if (pthread_main_np() == 0) {
+            set_error(error, error_capacity, "RT64 Metal initialization must run on the macOS main thread");
+            return false;
+        }
+
+        if (SDL_VideoInit(nullptr) != 0) {
+            set_error(error, error_capacity, std::string("SDL video initialization failed: ") + SDL_GetError());
+            return false;
+        }
+
+        // plume's MetalDevice constructor dereferences the system device
+        // before its isValid() check. Probe it here so a headless/no-GPU host
+        // returns through the C ABI rather than messaging a null MTL::Device.
+        MTL::Device *device = MTL::CreateSystemDefaultDevice();
+        if (device == nullptr) {
+            set_error(error, error_capacity, "no Metal system-default device is available");
+            return false;
+        }
+        device->release();
+
+        host_window = SDL_CreateWindow(
+            "fn64 RT64 hidden render surface",
+            SDL_WINDOWPOS_UNDEFINED,
+            SDL_WINDOWPOS_UNDEFINED,
+            static_cast<int>(width),
+            static_cast<int>(height),
+            SDL_WINDOW_HIDDEN | SDL_WINDOW_METAL);
+        if (host_window == nullptr) {
+            set_error(error, error_capacity, std::string("hidden Metal surface creation failed: ") + SDL_GetError());
+            return false;
+        }
+
+        SDL_SysWMinfo wm_info{};
+        SDL_VERSION(&wm_info.version);
+        if (SDL_GetWindowWMInfo(host_window, &wm_info) != SDL_TRUE) {
+            set_error(error, error_capacity, std::string("Cocoa window lookup failed: ") + SDL_GetError());
+            return false;
+        }
+        if (wm_info.info.cocoa.window == nullptr) {
+            set_error(error, error_capacity, "SDL returned a null Cocoa NSWindow for the hidden Metal surface");
+            return false;
+        }
+
+        metal_view = SDL_Metal_CreateView(host_window);
+        if (metal_view == nullptr) {
+            set_error(error, error_capacity, std::string("CAMetalLayer view creation failed: ") + SDL_GetError());
+            return false;
+        }
+        void *metal_layer = SDL_Metal_GetLayer(metal_view);
+        if (metal_layer == nullptr) {
+            set_error(error, error_capacity, "SDL returned a null CAMetalLayer for the hidden Metal surface");
+            return false;
+        }
+
+        // RT64's own macOS window path stores SDL_Window* in this field, but
+        // plume::CocoaWindow bridges it to NSWindow* and sends contentView,
+        // which is the exact objc_msgSend crash this shim must bypass. Supply
+        // SDL's native NSWindow and CAMetalLayer handles instead.
+        render_window.window = wm_info.info.cocoa.window;
+        render_window.view = metal_layer;
+        return true;
+    }
+#endif
+
     void update_vi() {
         registers[9] = VI_STATUS_16_BIT;
         // RT64 compensates for the VI origin convention by subtracting one
@@ -136,6 +227,12 @@ extern "C" Fn64Rt64Context *fn64_rt64_create(
             return nullptr;
         }
 
+        auto context = std::make_unique<Fn64Rt64Context>(width, height);
+#if defined(__APPLE__)
+        if (!context->create_hidden_metal_surface(error, error_capacity)) {
+            return nullptr;
+        }
+#else
         // RT64's internal window helper asserts after these failures. Probe
         // the same headless/display prerequisites first so an unavailable
         // display degrades to a Rust error instead of reaching that assert.
@@ -148,8 +245,7 @@ extern "C" Fn64Rt64Context *fn64_rt64_create(
             set_error(error, error_capacity, std::string("no usable display is available: ") + SDL_GetError());
             return nullptr;
         }
-
-        auto context = std::make_unique<Fn64Rt64Context>(width, height);
+#endif
         context->update_vi();
 
         RT64::ApplicationConfiguration configuration;
