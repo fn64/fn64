@@ -15,9 +15,9 @@
 //!
 //! **Zero backend lives here.** `fn64-render-rt64` is the first adapter
 //! (RT64 FFI, quarantined per `docs/DESIGN.md` section 1's C++ boundary
-//! rule) and also home to a headless reference software rasterizer used to
-//! prove the seam end-to-end before real RT64 wiring lands -- see that
-//! crate's README for exactly how far each has gotten.
+//! rule) and also home to a headless reference software rasterizer used as
+//! the deterministic CI oracle for the feature-gated RT64 path -- see that
+//! crate's README for each backend's build and fallback contract.
 //!
 //! ## Why `OsTask` is redefined here instead of reusing `fn64_runtime::rsp::OsTaskHeader`
 //!
