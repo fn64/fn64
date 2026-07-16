@@ -9,7 +9,7 @@
 //! anyway, since real RDP silicon isn't part of this project's evidence
 //! base).
 
-use crate::gbi::{CullMode, Triangle, Vertex};
+use crate::gbi::{AlphaCompare, CullMode, Triangle, Vertex};
 
 /// TEMP instrumentation (env `OOT_DUMP_PROJ=1`): count z-test passes vs
 /// rejections so a real overlapping-geometry frame can PROVE the z-buffer is
@@ -187,6 +187,10 @@ impl Framebuffer {
             return;
         }
 
+        if tri.other_mode.alpha_compare() == AlphaCompare::Reserved {
+            panic!("G_SETOTHERMODE_L selected reserved alpha-compare mode 2");
+        }
+
         for y in min_y..max_y {
             for x in min_x..max_x {
                 let p = Vertex {
@@ -217,6 +221,19 @@ impl Framebuffer {
                         bl = ((tb as u32 * bl as u32) / 255) as u8;
                         al = ((ta as u32 * al as u32) / 255) as u8;
                     }
+                    // Alpha compare happens after the color combiner has
+                    // produced fragment alpha and before color/depth writes.
+                    // `G_AC_THRESHOLD` compares against G_SETBLENDCOLOR.a;
+                    // `G_AC_DITHER` compares against a varying threshold
+                    // (public gbi.h:584-587; RT64 RasterPS.hlsl:184,204-211).
+                    // A deterministic 4x4 Bayer threshold stands in for the
+                    // hardware random source so tests/frame dumps remain
+                    // reproducible while retaining the required stochastic-
+                    // coverage behavior (partial-alpha fragments alternate
+                    // pass/discard instead of becoming opaque black boxes).
+                    if !alpha_compare_passes(tri.other_mode.alpha_compare(), al, x, y, tri) {
+                        continue;
+                    }
                     if depth_test {
                         // Screen-linear depth interpolation (perspective-
                         // incorrect, adequate for occlusion -- §4.1/§4.3).
@@ -227,6 +244,24 @@ impl Framebuffer {
                     }
                 }
             }
+        }
+    }
+}
+
+fn alpha_compare_passes(mode: AlphaCompare, alpha: u8, x: i32, y: i32, tri: &Triangle) -> bool {
+    match mode {
+        AlphaCompare::None => true,
+        AlphaCompare::Threshold => alpha >= tri.other_mode.blend_color_alpha,
+        AlphaCompare::Dither => {
+            const BAYER_4X4: [[u8; 4]; 4] =
+                [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+            let threshold = BAYER_4X4[y.rem_euclid(4) as usize][x.rem_euclid(4) as usize]
+                .saturating_mul(16)
+                .saturating_add(8);
+            alpha >= threshold
+        }
+        AlphaCompare::Reserved => {
+            unreachable!("reserved alpha compare is rejected before rasterization")
         }
     }
 }
@@ -337,6 +372,104 @@ mod tests {
         fb.draw_triangle(&tri);
         let idx = (6u32 * fb.width + 7u32) as usize * 4;
         assert_eq!(&fb.pixels[idx..idx + 4], &[255, 0, 0, 255]);
+    }
+
+    /// Fails against the pre-alpha-compare rasterizer: the transparent black
+    /// half of a cutout texture used to overwrite the clear color as an opaque
+    /// black box. With G_AC_THRESHOLD + blend alpha 128, it is discarded while
+    /// the opaque half still draws.
+    #[test]
+    fn threshold_alpha_compare_cuts_out_transparent_texels() {
+        use crate::gbi::Texture;
+
+        let cutout = Texture {
+            width: 2,
+            height: 1,
+            texels: std::rc::Rc::new(vec![0, 0, 0, 0, 255, 255, 255, 255]),
+            clamp_s: true,
+            clamp_t: true,
+        };
+        let mut tri = Triangle {
+            v: [
+                v(0.0, 0.0, 255, 255, 255, 255),
+                v(8.0, 0.0, 255, 255, 255, 255),
+                v(0.0, 8.0, 255, 255, 255, 255),
+            ],
+            texture: Some(cutout),
+            other_mode: crate::gbi::OtherMode::from_raw(0, 1, 128),
+            ..Default::default()
+        };
+        tri.v[0].s = 0.0;
+        tri.v[1].s = 2.0;
+        tri.v[2].s = 0.0;
+
+        let mut fb = Framebuffer::new(8, 8);
+        fb.clear(9, 8, 7, 255);
+        fb.draw_triangle(&tri);
+
+        let transparent = (fb.width + 1) as usize * 4;
+        let opaque = (fb.width + 5) as usize * 4;
+        assert_eq!(&fb.pixels[transparent..transparent + 4], &[9, 8, 7, 255]);
+        assert_eq!(&fb.pixels[opaque..opaque + 4], &[255, 255, 255, 255]);
+    }
+
+    /// Alpha rejection must precede both color and z writes. Otherwise a
+    /// transparent near cutout poisons depth and wrongly occludes opaque
+    /// geometry behind it even though its color was discarded.
+    #[test]
+    fn rejected_alpha_does_not_update_depth() {
+        let near_cutout = Triangle {
+            v: [
+                vz(2.0, 2.0, 1.0, 0, 0, 0, 0),
+                vz(12.0, 2.0, 1.0, 0, 0, 0, 0),
+                vz(7.0, 12.0, 1.0, 0, 0, 0, 0),
+            ],
+            other_mode: crate::gbi::OtherMode::from_raw(0, 1, 128),
+            ..Default::default()
+        };
+        let far_opaque = Triangle {
+            v: [
+                vz(2.0, 2.0, 9.0, 255, 0, 0, 255),
+                vz(12.0, 2.0, 9.0, 255, 0, 0, 255),
+                vz(7.0, 12.0, 9.0, 255, 0, 0, 255),
+            ],
+            ..Default::default()
+        };
+
+        let mut fb = Framebuffer::new(16, 16);
+        fb.clear(0, 0, 0, 255);
+        fb.draw_triangle_culled(&near_cutout, CullMode::None);
+        fb.draw_triangle_culled(&far_opaque, CullMode::None);
+        let overlap = (6u32 * fb.width + 7) as usize * 4;
+        assert_eq!(&fb.pixels[overlap..overlap + 4], &[255, 0, 0, 255]);
+        assert_eq!(fb.depth[overlap / 4], 9.0);
+    }
+
+    /// G_AC_DITHER is not a binary threshold against blend color: partial
+    /// alpha must produce a repeatable mixture of accepted and discarded
+    /// samples. Fully transparent/opaque behavior is covered by the same
+    /// comparison endpoints.
+    #[test]
+    fn dither_alpha_compare_produces_mixed_coverage() {
+        let tri = Triangle {
+            v: [
+                v(0.0, 0.0, 255, 255, 255, 128),
+                v(16.0, 0.0, 255, 255, 255, 128),
+                v(0.0, 16.0, 255, 255, 255, 128),
+            ],
+            other_mode: crate::gbi::OtherMode::from_raw(0, 3, 0),
+            ..Default::default()
+        };
+        let mut fb = Framebuffer::new(16, 16);
+        fb.clear(0, 0, 0, 255);
+        fb.draw_triangle(&tri);
+
+        let painted = fb.pixels.chunks_exact(4).filter(|px| px[3] == 128).count();
+        assert!(painted > 0, "half-alpha dither must accept some samples");
+        assert!(
+            painted < 120,
+            "half-alpha dither must also discard some covered samples"
+        );
     }
 
     #[test]

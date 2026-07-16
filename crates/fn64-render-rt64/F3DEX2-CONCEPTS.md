@@ -534,10 +534,23 @@ from vertex color only. Captured here so phase-2 knows the contract.
   U0.16). Skip for flat-shaded; needed to place textures correctly in phase-2.
 - **`G_SETOTHERMODE_H/L`** (`0xE3`/`0xE2`): the RDP "other modes" — render
   mode (blend/z-compare/AA/cvg), texture filter, cycle type (1-cycle/2-cycle/
-  copy/fill), etc. The **render mode** (in the low word) is what actually
-  enables z-compare and alpha blending. For a first opaque frame you can skip
-  it (assume opaque, z-less, 1-cycle); needed for correct transparency/decal
-  ordering in phase-2.
+  copy/fill), etc. F3DEX2 encodes a partial update as `length-1` in the low
+  byte of `w0` and `32-shift-length` in bits 8..15; the decoder reconstructs
+  the selected H/L mask, updates the persistent words, and snapshots them on
+  every emitted triangle. Typed accessors expose the public `G_MDSFT_*`,
+  `CVG_DST_*`, `ZMODE_*`, and `GBL_c1`/`GBL_c2` fields. The public encoding is
+  `include/ultra64/gbi.h:497-627,3353-3369`; the matching RT64 field layout
+  and partial-update structure are `shared/rt64_other_mode.h:14-101` and
+  `hle/rt64_rsp.cpp:1026-1037`.
+- **Alpha compare** is selected by low bits 0..1: `G_AC_NONE=0`,
+  `G_AC_THRESHOLD=1`, and `G_AC_DITHER=3` (`gbi.h:500,584-587`). Threshold
+  mode discards post-combiner fragments below `G_SETBLENDCOLOR.a`; dither mode
+  uses a deterministic 4×4 Bayer threshold in the software rasterizer so
+  partial-alpha coverage is reproducible. Rejected fragments update neither
+  color nor depth. OoT's setup display list selects threshold comparison at
+  `src/code/z_rcp.c:815-818` and programs blend alpha 8 at `z_rcp.c:824-835`.
+  RT64 performs the comparison after combiner alpha in
+  `shaders/RasterPS.hlsl:184,204-211`.
 - **`G_SETPRIMCOLOR`/`G_SETENVCOLOR`/`G_SETFOGCOLOR`/`G_SETFILLCOLOR`/
   `G_SETBLENDCOLOR`** (`0xFA`/`0xFB`/`0xF8`/`0xF7`/`0xF9`): flat color
   registers fed to the combiner/blender. Phase-2.
@@ -594,7 +607,7 @@ vertex-colored), a decoder must correctly handle:
 7. `G_GEOMETRYMODE` — enough to honor **back-face culling**.
 
 Everything else (`G_TEXTURE`, `G_SETTILE`, `G_SETCOMBINE`, `G_SETTIMG`,
-`G_LOAD*`, `G_SETOTHERMODE_*`, `G_SETPRIMCOLOR`, all sync ops, lighting)
+`G_LOAD*`, `G_SETPRIMCOLOR`, all sync ops, lighting)
 can be **acknowledged-and-skipped** for the first frame — geometry renders
 flat-shaded from vertex color.
 
@@ -613,6 +626,7 @@ needs attention against the F3DEX2 contract:
 | `G_TRI2` | `0x06` | 2.3 | Two triangles: tri A in `w0`, tri B in `w1`, same field positions. |
 | `G_QUAD` | `0x07` | 2.3 | Decode identically to `G_TRI2`. |
 | `G_TEXTURE` | `0xD7` | 5.2 | Phase-2. Currently skipped (correct for flat-shaded). |
+| `G_SETOTHERMODE_L/H` | `0xE2`/`0xE3` | 5.2 | Implemented: masked F3DEX2 H/L updates are retained in typed render state, snapshotted per triangle, and consumed by alpha compare. |
 | `G_POPMTX` | `0xD8` | 3.3 | `count = w1 >> 6`; pop that many modelview entries. |
 | `G_GEOMETRYMODE` | `0xD9` | 2.4 | Currently skipped. To get culling, apply `mode = (mode & field(w0,0,24)) | w1` and honor `G_CULL_BACK`. |
 | `G_MTX` | `0xDA` | 3.2 | Un-XOR the push bit (`params = field(w0,0,8) ^ 0x01`), then PROJECTION=`0x04`/LOAD=`0x02`/PUSH=`0x01`. Confirm the transpose-on-read matches the multiply convention (3.1). |
@@ -622,8 +636,8 @@ needs attention against the F3DEX2 contract:
 | `G_ENDDL` | `0xDF` | 1.2 | Return to caller (pop DL stack) or stop. |
 
 The `opcode_name` table in `gbi.rs` additionally names `G_NOOP`, `G_SPNOOP`,
-`G_RDPHALF_1/2`, `G_SETOTHERMODE_L/H`, the four sync ops, `G_LOADBLOCK`,
-`G_SETTILE`, `G_SETCOMBINE`, `G_SETTIMG` — all correctly in the
+`G_RDPHALF_1/2`, the four sync ops, `G_LOADBLOCK`, `G_SETTILE`,
+`G_SETCOMBINE`, `G_SETTIMG` — all correctly in the
 "acknowledge-and-skip for a flat-shaded frame" bucket (sections 5).
 
 **Not yet named in `gbi.rs`** but part of the F3DEX2 map, worth adding as
