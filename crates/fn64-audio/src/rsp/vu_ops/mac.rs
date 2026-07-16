@@ -333,19 +333,18 @@ mod tests {
     }
 
     #[test]
-    fn vmadn_low_clamp_saturates_on_negative_hi_mid() {
-        // Set ACC so acc[47..16] is negative -> unsigned-low clamp gives 0,
-        // NOT the raw acc_lo (which would be nonzero). This is the MADN-clamps
-        // vs MUDN-truncates distinguishing case.
+    fn vmadn_low_clamp_saturates_on_negative_overflow() {
+        // HI=0xFFFE is not a sign extension of negative MD=0x8000, so this is
+        // negative overflow and clamps to zero rather than returning LO.
         let mut st = VuState::new();
-        st.acc.set(0, -0x1_0000 | 0x1234); // top32 = -1 (negative), lo = 0x1234
+        st.acc.set(0, 0xFFFE_8000_1234);
         st.regs.r[2] = [0; 8];
         st.regs.r[3] = [0; 8];
-        // p = 0, so ACC unchanged. Correct clamp: acc[47..16] < 0 -> 0x0000.
+        // p = 0, so ACC is unchanged.
         vmadn(&mut st, &inv(1, 2, 3, 0));
         assert_eq!(
             st.regs.r[1][0], 0,
-            "VMADN clamps (not truncates): negative hi-mid -> 0x0000"
+            "VMADN clamps negative HI/MD overflow to 0x0000"
         );
         // The raw acc_lo is 0x1234 — a truncate BUG would return that.
         assert_eq!(st.acc.read_lo(0), 0x1234);
@@ -354,10 +353,10 @@ mod tests {
     #[test]
     #[should_panic]
     fn vmadn_bug_check_truncate_would_differ() {
-        // Prove the clamp is distinguishable from a truncate: with negative
-        // hi-mid, a truncating (VMUDN-style) BUG returns raw acc_lo = 0x1234.
+        // Prove the clamp is distinguishable from a truncate: a truncating
+        // (VMUDN-style) bug returns raw acc_lo = 0x1234 on negative overflow.
         let mut st = VuState::new();
-        st.acc.set(0, -0x1_0000 | 0x1234);
+        st.acc.set(0, 0xFFFE_8000_1234);
         st.regs.r[2] = [0; 8];
         st.regs.r[3] = [0; 8];
         vmadn(&mut st, &inv(1, 2, 3, 0));
