@@ -6,9 +6,10 @@
 //!
 //! # Why this one case first
 //!
-//! Every N64 IPL3 boot stub ends the same way: it clears BSS, materializes
+//! Each of the three independently graded N64 IPL3 boot stubs ends the same
+//! way: it clears BSS, materializes
 //! the resident C entrypoint's absolute address into a register with a
-//! `lui`/`addiu` pair, and does `jr` to it. Concretely, in both ROMs this
+//! `lui`/`addiu` pair, and does `jr` to it. Concretely, in all three ROMs this
 //! crate grades:
 //!
 //! ```text
@@ -17,6 +18,10 @@
 //!       0x8000042c: jr    $t2             ; 01400008  (bootproc)
 //!
 //! NW4E  0x80000428: lui   $t2, 0x8000     ; 3c0a8000
+//!       0x8000042c: addiu $t2, $t2, 0x0460 ; 254a0460  -> $t2 = 0x80000460
+//!       0x80000434: jr    $t2             ; 01400008  (main entry)
+//!
+//! NWXE  0x80000428: lui   $t2, 0x8000     ; 3c0a8000
 //!       0x8000042c: addiu $t2, $t2, 0x0460 ; 254a0460  -> $t2 = 0x80000460
 //!       0x80000434: jr    $t2             ; 01400008  (main entry)
 //! ```
