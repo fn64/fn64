@@ -138,6 +138,20 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
         }
     }
 
+    // A register-indirect `jr` may be a compiler-generated local jump table.
+    // Its targets are data, not immediates in the instruction stream, so the
+    // static pass above cannot discover them. The dispatcher below accepts any
+    // in-function target; give every aligned instruction address an arm when
+    // such a transfer exists so that promise is true. OoT's
+    // AudioSeq_SequenceChannelProcessScript jumps to 0x800C0898, which is a
+    // straight-line instruction and therefore was not otherwise a leader.
+    if instrs
+        .iter()
+        .any(|instr| matches!(instr, Instruction::Jr { rs } if *rs != 31))
+    {
+        leaders.extend((0..words.len()).map(|i| base + (i as u32) * 4));
+    }
+
     // 3. Emit.
     let mut out = String::new();
     let _ = writeln!(

@@ -132,13 +132,15 @@ road, but the top half misprojects).
   `extern "C"` blocking shim, where TLS teardown's forced unwind cannot cross
   the ABI boundary. This is harness teardown only; execution still uses the
   same single executor and host thread.
-- Native-Rust boot now reaches **two VI swaps and two non-clear render tasks**.
-  The first rendered task contains 96 triangles and is preserved as
-  `/tmp/fn64-nboot-frame.png` (early black/debug frame, not a faithful title
-  image). The next loud frontier is an unaligned `SW` at `0x8012564A` in
-  `AudioLoad_Dma` on the third audio retrace. It has not been papered over:
-  the address suggests a corrupted/unexpected stack pointer and needs a
-  register/stack trace against the C lane before relaxing typed alignment.
+- Native-Rust boot now reaches **ten VI swaps and ten non-clear render tasks**
+  in a bounded probe; swap 3 is the first non-uniform guest framebuffer. The
+  former `AudioLoad_Dma` unaligned-`SW` frontier was a stale host-call return,
+  not an alignment exception or an SWL/SWR decode: `AudioLoad_Init` preserves
+  `osCartRomInit()` in `gAudioCtx.cartHandle`, but the shim had left `$v0`
+  untouched. It now returns OoT's aligned guest `__CartRomHandle` address.
+  The first post-fix probe exposed a local `jr` jump-table target inside
+  `AudioSeq_SequenceChannelProcessScript`; native emission now gives every
+  instruction a dispatch arm in functions containing a non-return `jr`.
 
 ---
 
@@ -165,12 +167,16 @@ The module exports section geometry so the existing DMA-driven
 
 The current profile-aware/guard-swept result is **13,324 clean + 25
 host-bound = 13,349/13,358 (99.93%) linkable**, with nine genuine config
-stubs. Ten consecutive release probes reached swap 1 and the same non-clear
-96-triangle render with exit code 0. The deepest probe reached swap 2 before
-the alignment frontier above. A one-swap differential against the C lane had
-the same 550 event shapes; the raw trace first differs at event 294 only in
-`sim_time` (0 versus 100), where the native harness injects its documented
-idle-loop clock pacing.
+stubs. The AudioLoad repair is grounded in OoT decomp
+`src/audio/internal/load.c` (`AudioLoad_Init` and `AudioLoad_Dma`) and
+`src/libultra/io/cartrominit.c`: guest code dereferences the returned public
+handle, so the host ABI must return the game-linked BSS object rather than an
+opaque token or stale register. Ten consecutive release probes now reach
+swap 10 with exit code 0; swaps 3-10 have non-uniform guest framebuffers. No
+new loud native frontier appeared through that bound. A one-swap differential
+against the C lane had the same 550 event shapes; the raw trace first differs
+at event 294 only in `sim_time` (0 versus 100), where the native harness
+injects its documented idle-loop clock pacing.
 
 ## 🔲 Beyond OoT (deferred until it renders faithfully)
 - Generalize the pipeline: fn64 owns discover→decomp→recomp→run generically
