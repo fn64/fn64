@@ -461,3 +461,25 @@ fn jalr_snapshots_target_and_honors_encoded_rd_zero() {
     assert!(emitted.contains("lookup(_target)(ctx, mem);"));
     assert!(!emitted.contains("ctx.set_r32(31,"));
 }
+
+#[test]
+fn local_jr_jump_table_can_enter_a_straight_line_instruction() {
+    // Before the `jr $t9` fix, 0x80100004 was folded into the entry arm because
+    // no static branch named it. The emitted local-target range check accepted
+    // that address and then fell into the dispatcher's unmapped-vram trap.
+    let emitted = emit_function(&FuncInput {
+        name: "local_jump_table",
+        vram: 0x8010_0000,
+        words: &[
+            0x2402_0001, // addiu $v0, $zero, 1
+            0x2442_0001, // addiu $v0, $v0, 1 -- computed target
+            0x0320_0008, // jr $t9
+            0x0000_0000, // nop
+        ],
+    });
+
+    assert!(
+        emitted.contains("        0x80100004 => {"),
+        "computed local target lacks a dispatcher arm:\n{emitted}"
+    );
+}
