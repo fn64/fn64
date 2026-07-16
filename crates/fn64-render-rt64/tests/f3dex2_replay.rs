@@ -141,7 +141,7 @@ fn build_f3dex2_rdram() -> (Vec<u8>, u32) {
     push_cmd(vtx_w0, vtx_seg_addr, &mut dl);
 
     // 5) G_TRI1: slots 0,1,2 as three 7-bit fields at bits 17/9/1 (§2.2).
-    let tri_w0 = ((gbi::G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1);
+    let tri_w0 = ((gbi::G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1);
     push_cmd(tri_w0, 0, &mut dl);
 
     // 6) G_ENDDL.
@@ -158,7 +158,9 @@ fn f3dex2_display_list_renders_transformed_triangle_at_expected_pixel() {
     let (mut rdram, dl_addr) = build_f3dex2_rdram();
 
     let clear = [7, 7, 7, 255]; // distinct from every vertex color
-    let mut backend = ReferenceBackend::new().with_f3dex2().with_clear_color(clear);
+    let mut backend = ReferenceBackend::new()
+        .with_f3dex2()
+        .with_clear_color(clear);
     backend.create(&RenderConfig::new(320, 240)).unwrap();
 
     let task = OsTask {
@@ -227,7 +229,9 @@ fn f3dex2_without_fill_leaves_centroid_clear_proving_fill_is_load_bearing() {
     // remain the clear color -- i.e. the pass in the sibling test is due to
     // the fill, not a pre-painted buffer.
     let clear = [7u8, 7, 7, 255];
-    let mut backend = ReferenceBackend::new().with_f3dex2().with_clear_color(clear);
+    let mut backend = ReferenceBackend::new()
+        .with_f3dex2()
+        .with_clear_color(clear);
     backend.create(&RenderConfig::new(320, 240)).unwrap();
     let fb = backend.framebuffer().unwrap();
     let (cx, cy) = (160u32, 130u32);
@@ -242,4 +246,3 @@ fn f3dex2_without_fill_leaves_centroid_clear_proving_fill_is_load_bearing() {
         "with no fill, the whole frame must be uniform clear"
     );
 }
-

@@ -154,15 +154,22 @@ road, but the top half misprojects).
    `mtxutil.c:3-19`. Finally, `z_play.c:1173-1188` reads the already-written
    viewing matrix to derive separate billboard data; it does not overwrite
    the projection-stack view slot.
-2. **G_SETOTHERMODE_L/H** — currently *not even decoded* (name-table only). No
-   blend/render-mode/alpha state exists. Gates alpha-test + blending.
-3. **Alpha-test** (alpha compare) — fixes black-box-around-cutouts on
-   grass/trees/grates.
-4. **Alpha blending** — translucent water/fog/UI (blender currently always
+2. **G_SETOTHERMODE_L/H + alpha compare: implemented.** F3DEX2 masked H/L
+   updates now produce typed cycle/filter/dither/render/Z/coverage/blender
+   state, snapshotted per triangle. `G_AC_THRESHOLD` compares post-combiner
+   alpha with `G_SETBLENDCOLOR.a`; `G_AC_DITHER` uses a deterministic varying
+   threshold. Rejected fragments leave both color and depth untouched. The
+   fail-against-bug tests cover state carry, the OoT render-mode macro's
+   embedded alpha-dither bits, a transparent cutout texel, depth preservation,
+   and mixed dither coverage. The bounded C-file boot reached 250 swaps and
+   produced a changed actual frame sequence; current missing combiner/scissor
+   work still obscures the title-demo foliage in RGB, so the eyes-on dump
+   proves corrected alpha coverage rather than a finished scene.
+3. **Alpha blending** — translucent water/fog/UI (blender currently always
    overwrites).
-5. **G_SETCOMBINE + G_SETPRIMCOLOR/G_SETENVCOLOR** — combiner hardwired to
+4. **G_SETCOMBINE + G_SETPRIMCOLOR/G_SETENVCOLOR** — combiner hardwired to
    texel×shade MODULATE; real CC formula + prim/env colors ignored (STUB).
-6. **G_SETSCISSOR** clip + perspective-correct S/T & depth (HUD split, floor
+5. **G_SETSCISSOR** clip + perspective-correct S/T & depth (HUD split, floor
    swim).
 
 ### Partial / loose ends
