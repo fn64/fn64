@@ -24,8 +24,8 @@ cargo run
 ## What it does
 
 1. Loads the ROM, registers every section from the real
-   `recomp_overlays.inl` (via `bridge/section_bridge.c`'s C-side walk into
-   Rust), marks the always-resident sections loaded.
+   `recomp_overlays.inl` via `fn64-boot-harness`'s shared C-side walk into
+   Rust, then marks the always-resident sections loaded.
 2. Boots thread 0 running the real `recomp_entrypoint` symbol and drives
    the executor: `run_one_step` while runnable, `advance_virtual_time`
    (which fires the armed VI retrace ticker) when idle, up to a bounded

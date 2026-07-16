@@ -1,6 +1,6 @@
 //! Build script: compiles OoT's out-of-tree, game-derived
 //! `RecompiledFuncs/*.c` (N64Recomp's own MIT-licensed generated output)
-//! plus this example's hand-written `bridge/section_bridge.c` glue into a
+//! plus `fn64-boot-harness`'s shared `bridge/section_bridge.c` glue into a
 //! static lib the harness links against.
 //!
 //! Identical shape to `examples/wm2000-boot/build.rs` (that file's doc
@@ -126,14 +126,14 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let bridge_dir = manifest_dir.join("bridge");
+    let bridge_dir = manifest_dir.join("../../crates/fn64-boot-harness/bridge");
 
     let mut build = cc::Build::new();
     build
-        // bridge/include comes FIRST: it holds this harness's clean-room
+        // The shared bridge include comes FIRST: it holds fn64's clean-room
         // stand-in librecomp/sections.h, which must shadow any real
         // (GPL-3.0-licensed) librecomp/include on the search path -- see
-        // that header's doc comment and bridge/section_bridge.c's.
+        // that header's doc comment and section_bridge.c's.
         .include(bridge_dir.join("include"))
         .include(&recompiled_dir)
         .include(&recomp_h_dir)
@@ -187,6 +187,9 @@ fn main() {
         .file(bridge_dir.join("section_bridge.c"));
     bridge_build.compile("oot_bridge");
 
-    println!("cargo:rerun-if-changed=bridge/section_bridge.c");
+    println!(
+        "cargo:rerun-if-changed={}",
+        bridge_dir.join("section_bridge.c").display()
+    );
     println!("cargo:rerun-if-changed={}", recompiled_dir.display());
 }
