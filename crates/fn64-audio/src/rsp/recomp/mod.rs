@@ -141,6 +141,18 @@ mod round_trip_tests {
                     run_delay(m, delay);
                     pc = if taken { target as u32 } else { pc + 8 };
                 }
+                Instr::BranchZ { op, rs, target } => {
+                    use crate::rsp::decode::BranchZOp::*;
+                    let v = m.reg(rs) as i32;
+                    let taken = match op {
+                        Blez => v <= 0,
+                        Bgtz => v > 0,
+                        Bltz => v < 0,
+                        Bgez => v >= 0,
+                    };
+                    run_delay(m, delay);
+                    pc = if taken { target as u32 } else { pc + 8 };
+                }
                 Instr::Vu {
                     op,
                     vd,
@@ -185,6 +197,22 @@ mod round_trip_tests {
                     m.vstore(op, vt, elem, bv, off);
                     pc += 4;
                 }
+                // Control transfers with the delay slot run on the fallthrough
+                // path (well-formed ucode never nests a branch in a delay slot).
+                Instr::Jump { target } => {
+                    run_delay(m, delay);
+                    pc = target as u32;
+                }
+                Instr::Jal { target, ret } => {
+                    m.set_reg(31, ret as u32);
+                    run_delay(m, delay);
+                    pc = target as u32;
+                }
+                Instr::Jr { rs } => {
+                    let jt = m.reg(rs) & 0x1FFF;
+                    run_delay(m, delay);
+                    pc = jt;
+                }
                 Instr::Unknown { word } => return trap_unknown(pc, word),
                 other => panic!("interpreter missing arm for {other:?}"),
             }
@@ -196,6 +224,10 @@ mod round_trip_tests {
             Some(Instr::AluImm { op, rt, rs, imm }) => exec_alu_imm(m, op, rt, rs, imm),
             Some(Instr::AluReg { op, rd, rs, rt }) => exec_alu_reg(m, op, rd, rs, rt),
             Some(Instr::Lui { rt, imm }) => m.set_reg(rt, (imm as u32) << 16),
+            Some(Instr::Load { op, rt, base, off }) => exec_load(m, op, rt, base, off),
+            // A COP0 status read in a delay slot (RSP DMA-busy wait loops do
+            // exactly this) — model as 0, matching the emitter's `mfc0`→0.
+            Some(Instr::Mfc0 { rt, .. }) => m.set_reg(rt, 0),
             _ => {}
         }
     }
@@ -382,5 +414,75 @@ mod round_trip_tests {
         assert!(!src.contains("as *mut"));
         assert!(!src.contains("as *const"));
         assert!(!src.contains("transmute"));
+    }
+
+    // -- assemble helpers for the dispatch-loop regression test --
+    fn j(target: u32) -> u32 {
+        (0x02u32 << 26) | ((target >> 2) & 0x03FF_FFFF)
+    }
+    fn jr(rs: u8) -> u32 {
+        ((rs as u32) << 21) | 0x08
+    }
+    fn bgtz(rs: u8, target: u32, pc: u32) -> u32 {
+        let off = (((target as i32) - (pc as i32 + 4)) >> 2) as u16;
+        (0x07u32 << 26) | ((rs as u32) << 21) | off as u32
+    }
+    fn addi(rt: u8, rs: u8, imm: i16) -> u32 {
+        (0x08u32 << 26) | ((rs as u32) << 21) | ((rt as u32) << 16) | (imm as u16) as u32
+    }
+
+    /// Regression for the aspMain dispatch runaway (fixed on branch
+    /// `fix/rsp-dispatch-loop-*`): OoT's real aspMain is a `jr`-dispatched
+    /// command-list loop whose per-command handlers end in `j <loop_top>` and
+    /// whose whole task ends via `break` once the command COUNT is exhausted.
+    /// The bug shipped the recompiled module at IMEM base 0x1080 instead of the
+    /// true 0x1000, shifting every absolute `j`/jump-table target by 0x80 so
+    /// the loop-back `j` never reached the count check — a 6-instruction
+    /// unconditional runaway that trapped at the 5M-step ceiling and produced
+    /// zero PCM.
+    ///
+    /// This builds that exact SHAPE at base 0x1000 — loop top decrements the
+    /// count, `bgtz` continues to a `jr`-dispatched handler, the handler `j`s
+    /// back to the loop top, and the loop `break`s when the count hits 0 — and
+    /// asserts it TERMINATES (`Broke`) in BOUNDED steps. The interpreter here
+    /// mirrors the emitter's absolute-address control flow, so a base/target
+    /// mismap would spin exactly as the shipped bug did; the run() interpreter's
+    /// own 100_000-step ceiling panics ("interpreter ran away") on a runaway,
+    /// making this test fail-red against the reintroduced bug rather than hang.
+    #[test]
+    fn jr_dispatched_command_loop_terminates_on_count() {
+        // Program layout at base 0x1000 (word index -> IMEM addr):
+        //   0x1000 loop_top: bgtz r30, 0x100C   (count>0 -> dispatch; else fall)
+        //   0x1004           nop  (delay)
+        //   0x1008           break                (count exhausted -> task done)
+        //   0x100C dispatch:  addi r30,r30,-1      (consume one command)
+        //   0x1010           jr r2                 (indirect: r2 = handler addr)
+        //   0x1014           nop  (delay)
+        //   0x1018 handler:   j 0x1000             (back to loop top)
+        //   0x101C           nop  (delay)
+        let base = 0x1000u32;
+        let prog = [
+            bgtz(30, 0x100C, 0x1000), // 0x1000
+            0,                        // 0x1004 nop (delay)
+            brk(),                    // 0x1008
+            addi(30, 30, -1),         // 0x100C
+            jr(2),                    // 0x1010
+            0,                        // 0x1014 nop (delay)
+            j(0x1000),                // 0x1018
+            0,                        // 0x101C nop (delay)
+        ];
+        let mut rdram = vec![0u8; 0x1000];
+        let mut m = RspMachine::new(&mut rdram);
+        m.set_reg(30, 3); // three commands to process
+        m.set_reg(2, 0x1018); // handler address the "jump table" would supply
+        let reason = run(&prog, base, &mut m);
+        assert_eq!(
+            reason,
+            RspExitReason::Broke,
+            "jr-dispatched command loop must reach the task-done BREAK once the \
+             command count is exhausted — a base/target mismap spins forever"
+        );
+        // The count drove termination: r30 decremented to 0.
+        assert_eq!(m.reg(30), 0);
     }
 }
