@@ -118,19 +118,19 @@ impl Partition {
 }
 
 /// Partition `cfg`'s blocks into owners, one per entry in `cfg.proven_roots`
-/// (the CFG builder already recorded every `jal`/`j` target and every seed
+/// (the CFG builder already recorded every `jal` target and explicit seed
 /// root as `proven_roots`, in first-seen order -- this function does not
 /// invent new roots, it only decides ownership of blocks the CFG already
 /// built).
 ///
 /// Ownership follows fallthrough and branch edges (both arms of a branch
 /// stay with the same owner -- a branch is intra-function control flow),
-/// but a `Tail` edge's target is NOT absorbed: it is only reached if it is
-/// itself a root elsewhere (already true by construction, since the CFG
-/// builder pushes every `j`/`jal` target onto `proven_roots`). This
-/// encodes "tail transfers may cross owners" and "every direct call target
-/// is a callable entry" simultaneously: a tail-called function is owned by
-/// its own root's traversal, not folded into the tail-caller.
+/// A `Tail` edge crosses owners only when its target is independently proven
+/// as a root. Otherwise the edge stays within the current owner: a plain `j`
+/// cannot distinguish a tail call from an intra-function jump to a local
+/// label, so splitting without corroboration would fabricate a boundary.
+/// This preserves "tail transfers may cross owners" while failing closed to
+/// a coarser owner when no callable-entry evidence exists.
 pub fn partition(cfg: &Cfg) -> Partition {
     let blocks_by_start: BTreeMap<u32, &BasicBlock> =
         cfg.blocks.iter().map(|b| (b.start_va, b)).collect();
@@ -152,9 +152,10 @@ pub fn partition(cfg: &Cfg) -> Partition {
             claims.entry(start).or_default().insert(root);
             match &block.terminator {
                 BlockTerminator::Fallthrough { next } => stack.push(*next),
-                BlockTerminator::Tail { .. } => {
-                    // Tail transfer leaves this owner's closure -- the
-                    // target is owned (if at all) by its own root.
+                BlockTerminator::Tail { target } => {
+                    if !cfg.proven_roots.contains(target) {
+                        stack.push(*target);
+                    }
                 }
                 BlockTerminator::Call { next, .. } => stack.push(*next),
                 BlockTerminator::Branch {
@@ -349,15 +350,35 @@ mod tests {
         bytes[0x80..0x84].copy_from_slice(&JR_RA.to_be_bytes());
         bytes[0x84..0x88].copy_from_slice(&NOP.to_be_bytes());
 
-        let cfg = build_cfg("boot", &bytes, 0x8000_0000, &[0x8000_0000]);
+        // Independent evidence supplies `target` as a root; the `j` alone
+        // would not be enough to make that claim.
+        let cfg = build_cfg("boot", &bytes, 0x8000_0000, &[0x8000_0000, target]);
         let part = partition(&cfg);
 
-        // Both the caller root and the tail target are proven_roots (the
-        // CFG builder seeds `j` targets), so both should be independent
-        // owners with no overlap.
+        // Both the caller and independently-proven tail target are roots, so
+        // both should be independent owners with no overlap.
         assert_eq!(part.owners.len(), 2);
         let overlaps = same_bank_overlaps(&part, &cfg);
         assert!(overlaps.is_empty());
+    }
+
+    #[test]
+    fn uncorroborated_j_target_stays_with_the_current_owner() {
+        // A `j` can be an intra-function jump to a local label. With no jal
+        // or explicit seed proving the target callable, it must not create a
+        // second owner.
+        let target: u32 = 0x8000_0080;
+        let j = 0x0800_0000 | ((target >> 2) & 0x03ff_ffff);
+        let mut bytes = asm(&[j, NOP]);
+        bytes.resize(0x100, 0);
+        bytes[0x80..0x84].copy_from_slice(&JR_RA.to_be_bytes());
+        bytes[0x84..0x88].copy_from_slice(&NOP.to_be_bytes());
+
+        let cfg = build_cfg("boot", &bytes, 0x8000_0000, &[0x8000_0000]);
+        let part = partition(&cfg);
+        assert_eq!(part.owners.len(), 1);
+        assert!(part.owners[0].block_starts.contains(&target));
+        assert!(part.unowned.is_empty());
     }
 
     #[test]

@@ -53,6 +53,9 @@
 //! - [`grade_nw4e_symbols`]: grading-only cross-check of Phase 4/5 function
 //!   boundaries against aki-recomp's hand-fixed NW4E `symbol_addrs.txt`
 //!   rungs -- the "grind-collapse" measure.
+//! - [`grade_nwxe_functions`]: grading-only cross-check against the complete
+//!   WM2000/NWXE resident-bank function extents mechanically extracted from
+//!   aki-recomp's generated `syms/dump.toml`.
 //!
 //! Candidate harvesting (Phase 3), the rest of indirect-target closure
 //! (Phase 6 beyond the bounded HI/LO `jr` case [`resolve`] now handles),
@@ -64,6 +67,7 @@ pub mod cfg;
 pub mod facts;
 pub mod grade_nw4e;
 pub mod grade_nw4e_symbols;
+pub mod grade_nwxe_functions;
 pub mod grade_oot;
 pub mod grade_oot_functions;
 pub mod partition;

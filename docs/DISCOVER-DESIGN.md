@@ -284,6 +284,22 @@ an `open` result.
 > tables (step 3/4), value-set analysis for non-constant registers, and the
 > dynamic-trace path (step 7) remain unimplemented.
 
+The third-ROM NWXE answer-key run (2026-07-16) confirmed that the bounded
+HI/LO resolver itself generalizes unchanged: from the header entrypoint
+`0x80000400` alone, it resolves the stub's `lui $t2,0x8000` /
+`addiu $t2,$t2,0x0460` / `jr $t2` sequence to resident entry
+`0x80000460`. It did expose a separate generic Phase 4/5 over-split:
+`build_cfg` promoted every direct `j` target to a callable root, but NWXE has
+ordinary intra-function `j` targets that its generated disassembly records as
+`alabel`s (for example `0x8002B92C` inside `osAiSetFrequency`). A direct `j`
+proves code reachability, not a function boundary. The generic rule is now:
+traverse a `j` target within the current owner unless independent evidence
+(an explicit seed or direct `jal`) already proves that target is a callable
+root. Corroborated tail calls still cross owners; uncorroborated jumps fail
+closed as a coarser owner. On NWXE this removed five false splits and reduced
+49 ambiguous blocks to zero without changing the resolver or adding any
+game-specific discovery rule.
+
 For every computed `jr` or `jalr`:
 
 1. Perform constant propagation and bounded value-set analysis.
