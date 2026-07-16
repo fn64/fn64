@@ -25,7 +25,11 @@ cc = "1"
 libc = "0.2"
 fn64-runtime = { path = "../../../crates/fn64-runtime" }
 fn64-abi = { path = "../../../crates/fn64-abi", features = ["native-recomp"] }
-fn64-boot-harness = { path = "../../../crates/fn64-boot-harness", default-features = false }
+# The native lane still uses the shared C section-bridge (register_linked_sections
+# + c_recomp_entrypoint live behind the `c-bridge` feature), so it must NOT be
+# disabled -- main.rs calls both unconditionally. (default-features=false here
+# was a boot-seam-dedup regression that broke the native build.)
+fn64-boot-harness = { path = "../../../crates/fn64-boot-harness" }
 fn64-recomp-native = { path = "../../../crates/fn64-recomp-native" }
 # `examples/oot-boot/oot` refreshes this ignored symlink from
 # NATIVE_RECOMPILED_DIR before Cargo resolves the graph. Cargo dependencies
