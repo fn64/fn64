@@ -340,12 +340,23 @@ loads all 472 sections / 13,358 fns from oot.toml+dump.toml) landed on
 - **The ONE real link blocker: the `lookup(u32)->fn` indirect dispatcher** (2,078 call
   sites, empirically the ONLY undefined symbol). = N64Recomp's `get_function(vram)`.
   Building it (branch `feat/native-lookup-dispatcher`) is what makes the whole module LINK.
-The native-boot lane selects `funcs.rs` with `FN64_NATIVE_RECOMP=1` and skips
-the C compiler/section bridge. `fn64-abi::native` explicitly marshals typed
+The native-boot lane selects the emitted `oot-native-funcs` crate with
+`FN64_NATIVE_RECOMP=1` and skips the C compiler/section bridge. The crate owns
+64 balanced generated submodules and is linked as an rlib dependency rather
+than textually `include!`d into the boot executable, so Cargo can cache it
+independently. `fn64-abi::native` explicitly marshals typed
 GPR/HI/LO/COP0 status at the already-unsafe host boundary, while every spawned
 OSThread stays on the existing executor/coroutine machinery and shared RDRAM.
-The module exports section geometry so the existing DMA-driven
+The crate exports section geometry so the existing DMA-driven
 `SectionRegistry` can canonicalize relocated overlay callbacks.
+
+The emitted-crate build was measured on the same machine and clean release
+target as the former 139,728,579-byte textual include: **380.73 s before,
+110.26 s after** (3.45x faster; the cached rebuild is 0.08 s). Both preserved
+executables reached swap 499 with exit code 0 and emitted byte-identical
+307,528-byte framebuffer PNGs (SHA-256
+`f029be05de404a8a5eedb1944069c9eb844c7daac66de0f430f1f15468ec4cbc`). The
+crate-linked executable has no unresolved fn64/recompiler/libultra symbols.
 
 The current profile-aware/guard-swept result is **13,324 clean + 25
 host-bound = 13,349/13,358 (99.93%) linkable**, with nine genuine config

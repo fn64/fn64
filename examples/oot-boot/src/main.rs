@@ -34,9 +34,7 @@ use std::collections::HashMap;
 use std::io::Write;
 
 #[cfg(fn64_native_recomp)]
-mod native_funcs {
-    include!(env!("FN64_NATIVE_FUNCS_RS"));
-}
+use oot_native_funcs as native_funcs;
 
 // ---------------------------------------------------------------------
 // FFI surface into the out-of-tree-compiled bridge (bridge/section_bridge.c)
@@ -621,7 +619,7 @@ fn main() {
     {
         fn64_recomp_native::set_host_lookup(Some(native_host_lookup));
         println!(
-            "[oot-boot] FN64_NATIVE_RECOMP: typed funcs.rs + host-first native adapters active"
+            "[oot-boot] FN64_NATIVE_RECOMP: linked oot-native-funcs crate + host-first native adapters active"
         );
         // SAFETY: `rdram` is the process-wide allocation and remains live
         // until every executor coroutine is dropped at process shutdown.

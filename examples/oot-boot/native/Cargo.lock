@@ -542,6 +542,14 @@ dependencies = [
  "fn64-runtime",
  "libc",
  "oot-audio-ucode",
+ "oot-native-funcs",
+]
+
+[[package]]
+name = "oot-native-funcs"
+version = "0.0.0"
+dependencies = [
+ "fn64-recomp-native",
 ]
 
 [[package]]

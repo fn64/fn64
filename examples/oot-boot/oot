@@ -14,7 +14,7 @@
 #   ./oot where              run + report the deepest frame / loud trap (the frontier)
 #
 # Env overrides: RECOMPILED_DIR / RECOMP_H_DIR / ROM default to the aki-recomp OOTU paths.
-# FN64_NATIVE_RECOMP=1 selects NATIVE_RECOMPILED_DIR/funcs.rs. The native
+# FN64_NATIVE_RECOMP=1 selects the crate at NATIVE_RECOMPILED_DIR. The native
 # manifest links the out-of-tree audio ucode by default; OOT_SKIP_AUDIO_UCODE=1
 # remains an explicit render-iteration speed switch.
 set -uo pipefail
@@ -36,6 +36,12 @@ build() {
     # The native-only manifest reuses this harness's build.rs/main.rs and its
     # build-only audio adapter, so the generated ucode resolves fn64-audio from
     # this same worktree rather than colliding with another worktree's package.
+    native_link="$FN64/examples/oot-boot/native/recompiled"
+    if [[ ( -e "$native_link" || -L "$native_link" ) && ! -L "$native_link" ]]; then
+      echo "oot: $native_link exists and is not a symlink; refusing to replace it" >&2
+      exit 2
+    fi
+    ln -sfn "$NATIVE_RECOMPILED_DIR" "$native_link" || exit 1
     CARGO_TARGET_DIR="$FN64/examples/oot-boot/target" \
       cargo build --manifest-path "$FN64/examples/oot-boot/native/Cargo.toml" --release -q || exit 1
   else

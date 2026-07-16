@@ -46,8 +46,8 @@
 //! shrugs."
 //!
 //! `FN64_NATIVE_RECOMP=1` selects the typed-Rust lane. In that mode
-//! `NATIVE_RECOMPILED_DIR` must contain the out-of-tree `funcs.rs` emitted by
-//! `fn64-recomp-native`; no C file or section bridge is compiled.
+//! `NATIVE_RECOMPILED_DIR` must contain the out-of-tree standalone crate
+//! emitted by `fn64-recomp-native`; no C file or section bridge is compiled.
 
 use std::env;
 use std::path::PathBuf;
@@ -86,17 +86,43 @@ fn main() {
     if native {
         let native_dir = required_env(
             "NATIVE_RECOMPILED_DIR",
-            "Point it at fn64-recomp-native's out-of-tree output directory containing funcs.rs.",
+            "Point it at fn64-recomp-native's out-of-tree crate output directory.",
         );
-        let funcs = native_dir.join("funcs.rs");
+        let manifest = native_dir.join("Cargo.toml");
+        let lib = native_dir.join("src/lib.rs");
         assert!(
-            funcs.is_file(),
-            "oot-boot build.rs: NATIVE_RECOMPILED_DIR={} has no funcs.rs",
+            manifest.is_file() && lib.is_file(),
+            "oot-boot build.rs: NATIVE_RECOMPILED_DIR={} is not an emitted native function crate (expected Cargo.toml + src/lib.rs)",
             native_dir.display()
         );
+        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        let dependency_link = manifest_dir.join("recompiled");
+        let selected = native_dir.canonicalize().unwrap_or_else(|e| {
+            panic!(
+                "oot-boot build.rs: failed to canonicalize NATIVE_RECOMPILED_DIR={}: {e}",
+                native_dir.display()
+            )
+        });
+        let linked = dependency_link.canonicalize().unwrap_or_else(|e| {
+            panic!(
+                "oot-boot build.rs: native dependency link {} is unavailable: {e}; invoke examples/oot-boot/oot so it can point the path dependency at NATIVE_RECOMPILED_DIR",
+                dependency_link.display()
+            )
+        });
+        assert_eq!(
+            linked,
+            selected,
+            "oot-boot build.rs: native path dependency resolves to {}, but NATIVE_RECOMPILED_DIR resolves to {}; rerun through examples/oot-boot/oot to refresh it",
+            linked.display(),
+            selected.display()
+        );
         println!("cargo:rustc-cfg=fn64_native_recomp");
-        println!("cargo:rustc-env=FN64_NATIVE_FUNCS_RS={}", funcs.display());
-        println!("cargo:rerun-if-changed={}", funcs.display());
+        println!("cargo:rerun-if-changed={}", manifest.display());
+        println!("cargo:rerun-if-changed={}", lib.display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            native_dir.join("src").display()
+        );
         return;
     }
 

@@ -4,8 +4,8 @@
 //! [`fn64_recomp::load_config`], then runs the native recompiler over EVERY
 //! function in the ROM — **without bailing on the first bad function**. Each
 //! function is classified (clean / stubbed / ROM-range error / unknown
-//! opcode / runtime-trap), the clean bodies are emitted into one module file,
-//! and a full gap report is written and printed.
+//! opcode / runtime-trap), the clean bodies are emitted as a standalone Rust
+//! library crate, and a full gap report is written and printed.
 //!
 //! This is the link gate for the "prove `fn64-recomp-native` can recompile the
 //! whole OoT ROM" milestone: it emits the clean bodies together with their
@@ -97,11 +97,19 @@ fn main() -> std::process::ExitCode {
 
     let report = run(&cfg, &rom, &force_recompile);
 
-    std::fs::create_dir_all(&args.out).ok();
-    let module_path = args.out.join("funcs.rs");
-    if let Err(e) = std::fs::write(&module_path, &report.module) {
-        eprintln!("failed to write module {}: {e}", module_path.display());
+    if let Err(e) = std::fs::create_dir_all(args.out.join("src")) {
+        eprintln!(
+            "failed to create emitted crate directory {}: {e}",
+            args.out.display()
+        );
         return std::process::ExitCode::from(2);
+    }
+    for (relative_path, contents) in &report.crate_files {
+        let path = args.out.join(relative_path);
+        if let Err(e) = std::fs::write(&path, contents) {
+            eprintln!("failed to write emitted crate file {}: {e}", path.display());
+            return std::process::ExitCode::from(2);
+        }
     }
     let report_path = args.out.join("gap-report.md");
     if let Err(e) = std::fs::write(&report_path, report.render_markdown(&cfg)) {
@@ -111,7 +119,11 @@ fn main() -> std::process::ExitCode {
 
     // Console summary.
     eprintln!("\n{}", report.render_summary());
-    eprintln!("module written to {}", module_path.display());
+    eprintln!(
+        "aggregate generated source: {} bytes across {NATIVE_PART_COUNT} balanced parts",
+        report.module.len()
+    );
+    eprintln!("native function crate written to {}", args.out.display());
     eprintln!("gap report written to {}", report_path.display());
 
     std::process::ExitCode::SUCCESS
@@ -226,11 +238,25 @@ struct FuncResult {
 }
 
 struct Report {
+    /// The historical single-module rendering retained for the gap-report and
+    /// unit tests that assert directly on emitted function text. The on-disk
+    /// product is `crate_files`; oot-boot never parses this string.
     module: String,
+    /// Standalone Cargo package files, relative to the requested output root.
+    /// Generated game content stays out-of-tree and is compiled once as an
+    /// rlib dependency instead of being textually included by every consumer.
+    crate_files: Vec<(PathBuf, String)>,
     results: Vec<FuncResult>,
     lookup_sites: usize,
     native_symbols: usize,
 }
+
+/// Enough buckets to keep generated codegen units balanced without producing
+/// hundreds of tiny files for OoT's 472 sections. Function bodies are assigned
+/// deterministically by greedy byte-size bin packing below.
+const NATIVE_PART_COUNT: usize = 64;
+
+const GENERATED_USE: &str = "use fn64_recomp_native::{call_host_or_native, pause_self, resolve_host_function, RecompContext, RecompFunc, Rdram, round_ties_even_f32, round_ties_even_f64};\n\n";
 
 fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Report {
     // The bootstrap config's stub scan treats every BREAK as privileged. MIPS
@@ -299,6 +325,7 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
 
     let mut results = Vec::new();
     let mut lookup_sites = 0usize;
+    let mut part_bodies = vec![String::new(); NATIVE_PART_COUNT];
 
     for section in &cfg.sections {
         for func in &section.functions {
@@ -366,6 +393,18 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
                 lookup_sites += body.matches("lookup(").count();
                 module.push_str(&body);
                 module.push('\n');
+
+                // Close the recurring giant-section failure mode by putting
+                // each body in the currently smallest bucket, rather than
+                // assuming config section sizes are roughly uniform.
+                let bucket = part_bodies
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, bodies)| bodies.len())
+                    .map(|(index, _)| index)
+                    .expect("NATIVE_PART_COUNT is non-zero");
+                part_bodies[bucket].push_str(&body);
+                part_bodies[bucket].push('\n');
             }
 
             let mut trap_kinds = trap_kinds;
@@ -399,12 +438,79 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
     module.push_str("];\n");
     module.push_str("}\npub use generated::*;\n");
 
+    let mut crate_files = Vec::with_capacity(NATIVE_PART_COUNT + 2);
+    crate_files.push((PathBuf::from("Cargo.toml"), render_generated_manifest()));
+    for (index, bodies) in part_bodies.into_iter().enumerate() {
+        let mut part = String::new();
+        part.push_str("// Generated by fn64-recomp-native whole-ROM driver (recompile_rom).\n");
+        part.push_str("// One balanced bucket of typed recompiled function bodies.\n");
+        part.push_str("#[allow(unused_imports)]\nuse crate::*;\n");
+        part.push_str("#[allow(unused_imports)]\n");
+        part.push_str(GENERATED_USE);
+        part.push_str(&bodies);
+        crate_files.push((PathBuf::from(format!("src/part_{index:03}.rs")), part));
+    }
+    crate_files.push((
+        PathBuf::from("src/lib.rs"),
+        render_generated_lib(&symbols, &cfg.sections),
+    ));
+
     Report {
         module,
+        crate_files,
         results,
         lookup_sites,
         native_symbols: symbols.len(),
     }
+}
+
+fn render_generated_manifest() -> String {
+    let runtime_path = env!("CARGO_MANIFEST_DIR");
+    let quoted_path = toml::Value::String(runtime_path.to_owned()).to_string();
+    format!(
+        "# Generated by fn64-recomp-native whole-ROM driver (recompile_rom).\n\
+         [package]\n\
+         name = \"oot-native-funcs\"\n\
+         version = \"0.0.0\"\n\
+         edition = \"2021\"\n\
+         license = \"MIT OR Apache-2.0\"\n\
+         publish = false\n\n\
+         [dependencies]\n\
+         fn64-recomp-native = {{ path = {quoted_path} }}\n"
+    )
+}
+
+fn render_generated_lib(symbols: &SymbolTable, sections: &[Section]) -> String {
+    let mut root = String::new();
+    root.push_str("// Generated by fn64-recomp-native whole-ROM driver (recompile_rom).\n");
+    root.push_str(
+        "// Standalone generated crate: consumers link this rlib, never include! its source.\n",
+    );
+    root.push_str("#![forbid(unsafe_code)]\n");
+    root.push_str("#![allow(clippy::all, unused, non_snake_case)]\n\n");
+    for index in 0..NATIVE_PART_COUNT {
+        root.push_str(&format!(
+            "mod part_{index:03};\npub use part_{index:03}::*;\n"
+        ));
+    }
+    root.push_str("\n#[allow(unused_imports)]\n");
+    root.push_str(GENERATED_USE);
+    root.push_str(&emit_lookup_dispatcher(symbols));
+    root.push_str(
+        "\n/// (ROM address, static vram, byte size) in config section order.\n\
+         pub static NATIVE_SECTION_GEOMETRY: &[(u32, u32, u32)] = &[\n",
+    );
+    for section in sections {
+        let _ = std::fmt::Write::write_fmt(
+            &mut root,
+            format_args!(
+                "    ({:#010X}, {:#010X}, {:#010X}),\n",
+                section.rom, section.vram, section.size
+            ),
+        );
+    }
+    root.push_str("];\n");
+    root
 }
 
 fn compiler_div_guards_only(instrs: &[Instruction]) -> bool {
@@ -906,6 +1012,43 @@ mod tests {
             .contains("(0x80000010, osSendMesg as RecompFunc)"));
         assert_eq!(report.lookup_sites, 1);
         assert_eq!(report.native_symbols, 1);
+        let manifest = report
+            .crate_files
+            .iter()
+            .find(|(path, _)| path == std::path::Path::new("Cargo.toml"))
+            .map(|(_, contents)| contents)
+            .expect("generated crate manifest");
+        assert!(manifest.contains("name = \"oot-native-funcs\""));
+        assert!(manifest.contains("fn64-recomp-native = { path = "));
+        let lib = report
+            .crate_files
+            .iter()
+            .find(|(path, _)| path == std::path::Path::new("src/lib.rs"))
+            .map(|(_, contents)| contents)
+            .expect("generated crate root");
+        assert!(lib.contains("#![forbid(unsafe_code)]"));
+        assert!(lib.contains("pub fn lookup(vram: u32) -> RecompFunc"));
+        assert!(lib.contains("pub static NATIVE_SECTION_GEOMETRY"));
+        assert_eq!(
+            report
+                .crate_files
+                .iter()
+                .filter(|(path, _)| {
+                    path.parent() == Some(std::path::Path::new("src"))
+                        && path
+                            .file_name()
+                            .is_some_and(|name| name.to_string_lossy().starts_with("part_"))
+                })
+                .count(),
+            NATIVE_PART_COUNT
+        );
+        assert!(report.crate_files.iter().any(|(path, contents)| {
+            path.parent() == Some(std::path::Path::new("src"))
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("part_"))
+                && contents.contains("pub fn caller")
+        }));
         assert_eq!(
             report
                 .results
