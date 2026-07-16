@@ -32,7 +32,12 @@ BIN="$FN64/examples/oot-boot/target/release/oot-boot"
 
 build() {
   if [[ "${FN64_NATIVE_RECOMP:-0}" == "1" ]]; then
-    ( cd "$FN64/examples/oot-boot" && cargo build --release --no-default-features -q ) || exit 1
+    # The native-only manifest reuses this harness's build.rs/main.rs but does
+    # not resolve the optional out-of-tree audio crate. In a git worktree that
+    # crate points at the main checkout's path-distinct fn64-audio package,
+    # which Cargo cannot represent beside this worktree's package in one lock.
+    CARGO_TARGET_DIR="$FN64/examples/oot-boot/target" \
+      cargo build --manifest-path "$FN64/examples/oot-boot/native/Cargo.toml" --release -q || exit 1
   else
     ( cd "$FN64/examples/oot-boot" && cargo build --release -q ) || exit 1
   fi
