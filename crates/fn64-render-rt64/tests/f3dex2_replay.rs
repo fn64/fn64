@@ -141,7 +141,7 @@ fn build_f3dex2_rdram() -> (Vec<u8>, u32) {
     push_cmd(vtx_w0, vtx_seg_addr, &mut dl);
 
     // 5) G_TRI1: slots 0,1,2 as three 7-bit fields at bits 17/9/1 (§2.2).
-    let tri_w0 = ((gbi::G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1);
+    let tri_w0 = ((gbi::G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1);
     push_cmd(tri_w0, 0, &mut dl);
 
     // 6) G_ENDDL.
@@ -242,4 +242,3 @@ fn f3dex2_without_fill_leaves_centroid_clear_proving_fill_is_load_bearing() {
         "with no fill, the whole frame must be uniform clear"
     );
 }
-

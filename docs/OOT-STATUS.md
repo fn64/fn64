@@ -18,7 +18,8 @@ at) — not a tracker label. Updated 2026-07-15.
 
 ### Boot & runtime
 - 14+ boot-ladder rungs cleared; OoT reaches real game logic (~8 frames deep,
-  30+ VI swaps, file-select scene reachable).
+  4,200+ VI swaps, file-select/new-file creation and controllable gameplay
+  reachable in the native-Rust lane).
 - Clean-room libultra shim layer (public headers/manuals only), DMA
   word-swizzle, OSTask dispatch, thread/queue model.
 - Windowed harness (`fn64-shell`, winit+pixels+cpal): live framebuffer per
@@ -93,6 +94,52 @@ at) — not a tracker label. Updated 2026-07-15.
   collision-free C-lane probe also reached swap 250, and its swap-250 PNG is
   byte-identical (SHA-256
   `a0b354ea3c7056e90f316bc28f24d2c46761ce248b3279b9be1b6a21c320cc6b`).
+
+### Native-Rust interactive boot (2026-07-16, `fix/native-boot-interactive`)
+
+- **The verified controller route is now a harness preset.**
+  `OOT_SCRIPT_INTERACTIVE=1` applies `START` at swaps 250/280; `A` at
+  360/400; `START` at 420; and `A` at 440/490/540, with every named press
+  released four swaps later. This creates/selects file 0 and enters normal
+  Play at swap 568. From swap 620 it holds stick X=60 and taps `A` for two
+  swaps every 25 swaps from 700 through 4150 to advance the opening dialogue
+  and cutscenes. The C lane and native lane follow the same title/file-select
+  states through select-mode 1 at swap 499. The configured C oracle stops
+  there because `games/OOTU/oot.toml` deliberately stubs
+  `FileSelect_MoveSelectedFileToTop`; the native profile recompiles its real
+  body (ROM/static vram `0x80810A1C`) and reaches select-mode 2 at swap 500.
+  The two swap-499 framebuffer PNGs compare byte-for-byte equal (SHA-256
+  `c54906136189fde8b59b853d3b2f74fc75d7f77753c495d7110e9b950bfdd85e`).
+- **Partially overlapping overlay allocations now replace stale images.**
+  The first long scripted transition previously trapped nondeterministically
+  after swap 1270 at lookup `0x80B2CBB0`, an interior address in
+  `EffectSsDust_Draw`, while spawning fairy sparkles through
+  `EffectSsKiraKira_SpawnDispersed`. The section dump identifies Dust as ROM
+  `0x00EA80B0`, static vram `0x80B2C980`, size `0x740`, and KiraKira as ROM
+  `0x00EA88E0`, static vram `0x80B2D1B0`, size `0x5C0`. Decomp
+  `src/code/z_effect_soft_sprite.c:182-254` loads the selected overlay and
+  invokes `profile->init`; KiraKira's profile names that function at
+  `src/overlays/effects/ovl_Effect_Ss_KiraKira/z_eff_ss_kirakira.c:36-47`.
+  ROM `0x00EA82E0` contains words `27A40134 27A60074 0C023B6E 00A12821` at
+  the wrong `0x80B2CBB0` Dust interior PC; exact KiraKira entry ROM
+  `0x00EA88E0` contains `AFA40000 AFA50004 8CEF0000 3C0100FF`. Therefore the
+  callback must resolve to `0x80B2D1B0`. `SectionRegistry::set_section_loaded_at` used to
+  evict only an old mapping with the same runtime base, leaving a stale image
+  when the arena reused a partially overlapping range at a different base.
+  It now evicts every overlapping half-open runtime range before publishing
+  the new mapping. Regression
+  `partially_overlapping_runtime_range_replaces_prior_overlay` uses the exact
+  ROM/static section geometry and fails against the former exact-base rule.
+  Classification: **overlay-bank mapping**.
+- **Verified depth:** after the overlay fix, 10/10 consecutive clean release
+  probes reached swap 1400 (the former failure window). Longer probes reached
+  swap 3000, 4200, and 5200 with no native trap. The opening sequence returns
+  to Link's House and releases cutscene control at swap 4196. With stick X=60
+  already held, Link moves from approximately `(0, 0, 60)` at swap 4195 to
+  `(18, 14, 128)` at swap 4212 before meeting the room collision boundary.
+  This is a live, controllable `PlayState`, not merely a surviving cutscene.
+  `OOT_RENDER_DUMP_START=N` suppresses early diagnostic PNGs so this late
+  gameplay window can be captured without dumping thousands of boot frames.
 
 ### Render — geometry & texture layers
 - Geometry: G_VTX, G_TRI1/TRI2/QUAD, G_MTX (LOAD/MUL/PUSH), G_POPMTX, G_DL

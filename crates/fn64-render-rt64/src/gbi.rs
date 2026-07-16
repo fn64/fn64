@@ -1763,10 +1763,10 @@ mod tests {
     /// `off + (r*4+c)*2`, fractional half at `off + 32 + (r*4+c)*2`, both
     /// through the recomp `^3` swizzle (via `wr_i16`).
     fn wr_mtx(rdram: &mut [u8], off: usize, m: [[f32; 4]; 4]) {
-        for r in 0..4 {
-            for c in 0..4 {
+        for (r, row) in m.iter().enumerate() {
+            for (c, value) in row.iter().enumerate() {
                 let elem = r * 4 + c;
-                let fixed = (m[r][c] * 65536.0).round() as i32;
+                let fixed = (*value * 65536.0).round() as i32;
                 let int_half = (fixed >> 16) as i16;
                 let frac_half = (fixed & 0xFFFF) as u16;
                 wr_i16(rdram, off + elem * 2, int_half);
@@ -1811,7 +1811,7 @@ mod tests {
             [1.299038, 0.0, 0.0, 0.0],
             [0.0, 1.732051, 0.0, 0.0],
             [0.0, 0.0, -1.020202, -1.0],
-            [0.0, 0.0, -20.202020, 0.0],
+            [0.0, 0.0, -20.202_02, 0.0],
         ];
         // Asymmetric modelview: rot(20° about Y) then translate(30,-15,-120),
         // in hardware [row][col] row-vector layout.
@@ -1850,7 +1850,7 @@ mod tests {
         wr_cmd(
             &mut rdram,
             off,
-            ((G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1),
+            ((G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1),
             0,
         );
         off += 8;
@@ -1930,7 +1930,7 @@ mod tests {
         wr_cmd(
             &mut rdram,
             0x1010,
-            ((G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1),
+            ((G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1),
             0,
         );
         wr_cmd(&mut rdram, 0x1018, (G_ENDDL as u32) << 24, 0);
@@ -1947,7 +1947,7 @@ mod tests {
         wr_cmd(
             &mut rdram,
             0x2008,
-            ((G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1),
+            ((G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1),
             0,
         );
         wr_cmd(&mut rdram, 0x2010, (G_ENDDL as u32) << 24, 0);
@@ -2495,13 +2495,20 @@ mod tests {
         ];
         let eye = [-4000.0, -1.0, 5228.0];
 
-        for c in 0..3 {
+        for (c, (((&basis_x, &basis_y), &basis_z), &translation)) in view[0]
+            .iter()
+            .zip(view[1].iter())
+            .zip(view[2].iter())
+            .zip(view[3].iter())
+            .take(3)
+            .enumerate()
+        {
             let expected_translation =
-                -(eye[0] * view[0][c] + eye[1] * view[1][c] + eye[2] * view[2][c]);
+                -(eye[0] * basis_x + eye[1] * basis_y + eye[2] * basis_z);
             assert!(
-                (view[3][c] - expected_translation).abs() < 0.1,
+                (translation - expected_translation).abs() < 0.1,
                 "translation[{c}] must be -(eye · basis[{c}]): got {}, expected {expected_translation}",
-                view[3][c]
+                translation
             );
         }
 
@@ -2544,26 +2551,26 @@ mod tests {
         // guPerspective(fovy=60, aspect=4/3, near=100, far=12800), hardware
         // [row][col]: projective term [2][3]=-1, depth translate [3][2].
         let persp = [
-            [1.2990381, 0.0, 0.0, 0.0],
+            [1.299_038, 0.0, 0.0, 0.0],
             [0.0, 1.7320508, 0.0, 0.0],
-            [0.0, 0.0, -1.0157480, -1.0],
-            [0.0, 0.0, -201.57480, 0.0],
+            [0.0, 0.0, -1.015_748, -1.0],
+            [0.0, 0.0, -201.574_8, 0.0],
         ];
         // PROPER guLookAt view: 3x3 = camera basis (right/up/look as columns),
         // translation ROW = -(eye · basis). Eye world ~(3000,700,5600) looking
         // toward (-4000,0,5200). (Raw eye in row 3 would be the bug.)
         let view = [
-            [0.05704979, -0.09918146, 0.99343261, 0.0],
+            [0.05704979, -0.09918146, 0.993_432_6, 0.0],
             [0.0, 0.99505322, 0.09934326, 0.0],
-            [-0.99837133, -0.00566751, 0.05676758, 0.0],
-            [5419.7300, -367.25479, -3367.7366, 1.0],
+            [-0.998_371_3, -0.00566751, 0.05676758, 0.0],
+            [5_419.73, -367.254_8, -3367.7366, 1.0],
         ];
         // Large-world object modelview: rot(15° about Y) then translate to
         // world (-4000, 0, 5200) -- asymmetric so `mvp != mvp^T`.
         let model = [
-            [0.96592583, 0.0, -0.25881905, 0.0],
+            [0.965_925_8, 0.0, -0.25881905, 0.0],
             [0.0, 1.0, 0.0, 0.0],
-            [0.25881905, 0.0, 0.96592583, 0.0],
+            [0.25881905, 0.0, 0.965_925_8, 0.0],
             [-4000.0, 0.0, 5200.0, 1.0],
         ];
 
@@ -2599,7 +2606,7 @@ mod tests {
         wr_cmd(
             &mut rdram,
             off,
-            ((G_TRI1 as u32) << 24) | (0 << 17) | (1 << 9) | (2 << 1),
+            ((G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1),
             0,
         );
         off += 8;
