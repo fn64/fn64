@@ -171,6 +171,86 @@ and scope limits that make an open item meaningful.
   do not close R5 on a single fix that merely improves it — close it by ear,
   foreground and backgrounded.
 
+  **THE REQUIREMENT IS FAITHFUL RATE — not "audio stops hissing"** (user,
+  2026-07-17). The game must run at the SAME SPEED as hardware with audio and
+  video both paced to it. Static is a symptom of a free-running producer; the
+  over-speed feel is the same disease. Do not close R5 on quiet audio at the
+  wrong speed. Close it only when BOTH hold, each with its own evidence:
+  - **Video**: VI swaps land at 60 Hz NTSC (~16.67 ms) over a long run —
+    median + p95, measured, not felt.
+  - **Audio**: ~1 AI buffer per swap, ring depth stable rather than pegged at
+    its 12000-frame cap, and right by ear (foreground AND backgrounded).
+
+  **THE TWO CLOCKS (the thing to understand before probing).** R7 made the
+  shell pace its PUMP on wall-clock — `crates/fn64-shell/src/main.rs:529`,
+  `FRAME = 16_666_667ns` via `ControlFlow::WaitUntil`. That governs when the
+  shell asks the game to advance. It does NOT govern how often the guest's VI
+  RETRACE fires. If the retrace ticker over-delivers, the audio thread runs
+  its produce cycle too often AND the game logic advances too fast — one
+  cause, both symptoms. That is probe 3, and it is the only hypothesis on the
+  list that explains everything with one mechanism.
+
+  **TOOLING — what exists, and the gap (answer this before iterating).**
+  - EXISTS: `OOT_SWAP_TIMING=1` prints `SWAP_TIMING swap=N dt_ms=X` per swap
+    (`examples/oot-boot/src/main.rs:588,643`). But the headless harness runs
+    flat out, so this measures COMPUTE COST, not delivery cadence. Useful as a
+    budget check (rs gameplay is ~3.8 ms median, far inside 16.67), useless as
+    a rate check.
+  - EXISTS: the shell's 60-swap heartbeat (`main.rs:406`) and `ring_frames`,
+    which is how the pegged-ring evidence was gathered.
+  - **MISSING: nothing measures VI retrace cadence — the clock actually under
+    suspicion.** No instrument answers "how many retrace messages per wall
+    second does the guest receive?" Build that first; it is a counter and a
+    timestamp, and without it probe 3 is unfalsifiable. That is the iteration
+    mechanism this item needs and does not have.
+
+  **A REFERENCE CAPTURE — yes, but capture it, never download it** (user
+  asked 2026-07-17). A golden WAV of the intro pulled from the web is
+  copyrighted game audio and breaks this repo's own rule (README/AGENTS: no
+  game content, no ROM-derived bytes, ever). Capturing it yourself from an
+  emulator running YOUR ROM is the same footing as the ROM you already
+  recompile locally, and gets the same handling as `.eyegate/` frame captures:
+  evidence-only, gitignored, never committed. That is the established pattern
+  — R3's eye-gate compared fn64 PNGs against the emulator side-by-side.
+
+  But note WHAT it answers. R5's bug is RATE, and a reference recording does
+  not detect a pegged ring — the retrace-cadence counter above does. A capture
+  earns its keep in two places:
+  - **Now, mechanically**: fn64 already dumps PCM (`FN64_DUMP_AUDIO_PCM`
+    writes s16le + a `.meta` sidecar with sample count/range/nonzero). Two
+    dumps over the same swap window — fn64's and the emulator's — give a
+    DURATION RATIO, which proves or disproves over-speed numerically instead
+    of by feel. That directly fills the "by ear" hole in this item's close
+    condition.
+  - **Later, for faithfulness**: once the rate is right, "does it sound
+    correct" is the remaining question, and that is what a reference answers.
+
+  **START HERE — four things changed under this item on 2026-07-17:**
+  1. **Use the rs lane, not C.** V1a proved the C lane silently no-ops 127
+     stubbed functions; if any sits on the audio path you would chase a ghost
+     that exists only in the oracle. `FN64_RECOMP=rs`.
+  2. **Knobs renamed** (H2b): `FN64_SKIP_AUDIO_UCODE`, `FN64_PHASE_TIMING`,
+     `FN64_DUMP_AUDIO_PCM`, `FN64_AUDIO_UCODE_TIMING`. Stale `OOT_*` spellings
+     now panic naming their replacement instead of silently no-oping.
+  3. **`FN64_GAME_DIR` has no default** (H1b); export it or `./oot` exits with
+     instructions. `./oot run` also works again on stock macOS bash.
+  4. **Probe 1 forks the investigation and is cheap.** Evidence already says
+     the producer ignores backpressure (ring pegged from ~swap 250; ~3 AI
+     buffers/frame vs ~1; the AI_LEN fix changed nothing). So: does the guest
+     CALL `osAiGetLength` at all? NEVER CALLED -> the AI_LEN work was
+     irrelevant, go to probe 2. CALLED AND IGNORED -> go straight to probe 3.
+  Superseded note (kept for history): the static was first blamed on
+  sample-rate mismatch alone, and before that on App Nap alone. Both were
+  real contributors; neither was sufficient.
+  fn64-shell's ladder opened the stream at 48 kHz FIRST while the game
+  produces 32 kHz with no resampler anywhere, so the ring starved ~1/3 of
+  the time and the callback zero-fill rendered as static (backgrounding
+  worsened it by throttling the producer). Fix: CpalBackend negotiates the
+  stream rate with the device and linear-resamples producer-side;
+  set_frequency is now real; osAiSetFrequency forwards the true DAC rate;
+  both harness ladders replaced with one guest-rate create. Verify by ear
+  (foreground + backgrounded) to close.
+
 - [ ] **R8 rdram word-swizzle is a recurring bug class, not three bugs.**
   Surfaced a third time in the R7 shell work (green-tinted, noisy logo in the
   window presenter); previously in DMA and framebuffer capture. Each time it
