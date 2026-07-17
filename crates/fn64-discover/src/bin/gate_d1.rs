@@ -266,6 +266,25 @@ fn print_report(
     db: &fn64_discover::FactDb,
     key: &fn64_discover::grade_candidates::CandidateAnswerKey,
 ) {
+    let mut indirect = BTreeMap::new();
+    for fact in db.facts() {
+        if let fn64_discover::Fact::IndirectTransferAnalysis {
+            via_call,
+            state,
+            kind,
+            ..
+        } = fact
+        {
+            *indirect
+                .entry(format!(
+                    "{}:{state:?}:{}",
+                    if *via_call { "call" } else { "jump" },
+                    kind.map_or_else(|| "None".to_string(), |kind| format!("{kind:?}"))
+                ))
+                .or_insert(0usize) += 1;
+        }
+    }
+    println!("  Phase 6 indirect sites: {indirect:?}");
     let report = grade_candidates(db, key);
     println!(
         "{label}: answer_key={} functions / {} sections",
@@ -301,4 +320,14 @@ fn print_detector(grade: &DetectorGrade) {
         grade.metrics.recall() * 100.0,
         grade.ungradable,
     );
+    if grade.metrics.false_positives != 0 {
+        let breakdown = &grade.false_positive_breakdown;
+        println!(
+            "    fp breakdown: target_interior={} target_outside_functions={} source_inside_function={} source_outside_functions={}",
+            breakdown.target_interior,
+            breakdown.target_outside_functions,
+            breakdown.source_inside_function,
+            breakdown.source_outside_functions,
+        );
+    }
 }

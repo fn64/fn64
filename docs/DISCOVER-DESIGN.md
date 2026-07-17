@@ -346,16 +346,34 @@ an `open` result.
 
 ## Phase 6: resolve indirect transfers to a fixed point
 
-> Implementation status: the **bounded HI/LO case** (step 2 below) is
-> implemented in `fn64-discover`'s `resolve` module and driven to a fixed
-> point by `resolve::build_cfg_closed`. It mechanically resolves the
-> `lui`/`addiu`(/`ori`) `-> jr $reg` address-materialization every N64 IPL3
-> boot stub uses to reach the resident C entrypoint, then re-runs CFG +
-> ownership closure with the resolved target seeded as a root. This alone
-> takes OoT's boot bank from 1 discovered owner to 46, and recovers NW4E's
-> resident entry (`0x80000460`) that was previously hand-supplied. Jump
-> tables (step 3/4), value-set analysis for non-constant registers, and the
-> dynamic-trace path (step 7) remain unimplemented.
+> Implementation status (D2, 2026-07-16): static steps 1-5 are implemented in
+> `fn64-discover::resolve` and driven to a fixed point by
+> `build_cfg_value_set_closed`. The existing bounded HI/LO boot transfer is
+> now one case in a finite abstract interpreter: up to 256 concrete values,
+> register copies/arithmetic/shifts, exact stack/global word stores and loads,
+> and joins across CFG blocks. A block that keeps growing after eight visits
+> widens registers and tracked memory to unknown, which can only turn a site
+> `open`; it cannot invent a target. These limits are mechanism, not tuning
+> against an answer key.
+>
+> Switch recovery recognizes a `sltiu` upper bound selected by a dominating
+> `beq`/`bne` edge, including the common compiler schedule where the scaled
+> index (`sll index,2`) occupies the branch delay slot. HI/LO and GP-relative
+> bases then produce a finite set of mapped word addresses; every entry must
+> close to an aligned in-bank code target before the set becomes
+> `exhaustive`. Partially usable finite sets are `bounded` and do not feed the
+> CFG. A recovered `jr` table contributes ordinary intra-owner successors;
+> its cases never enter `proven_roots` or the function-candidate stream. Only
+> an exhaustive `jalr` set creates callable roots. Every reachable indirect
+> site, including `bounded` and `open`, is serialized as an
+> `IndirectTransferAnalysis` fact with construction kind, targets, and memory
+> sources.
+>
+> This is derived from this document's Phase-6 rules plus public MIPS-III
+> instruction/delay-slot behavior and the already-proven Phase-2 load-image
+> bytes. No reference-runtime implementation source was consulted. Runtime
+> observations (step 7) and mutable callback fields whose values arrive only
+> through unknown arguments remain unimplemented and stay open.
 
 The third-ROM NWXE answer-key run (2026-07-16) confirmed that the bounded
 HI/LO resolver itself generalizes unchanged: from the header entrypoint
@@ -372,6 +390,43 @@ root. Corroborated tail calls still cross owners; uncorroborated jumps fail
 closed as a coarser owner. On NWXE this removed five false splits and reduced
 49 ambiguous blocks to zero without changing the resolver or adding any
 game-specific discovery rule.
+
+The D2 grading-only run over D1.5's same 469 proven OoT load images reports
+230 exhaustive jump tables, 30 bounded constant computed jumps withheld from
+closure, 105 open computed jumps, nine exhaustive constant indirect calls,
+and 569 open indirect calls. Candidate precision/recall moved as follows:
+
+- `JalTarget`: 5,486 candidates / 4,505 matches / 981 false positives /
+  82.118119% precision before; 4,604 / 4,501 / 103 / 97.762815% after.
+- `IndirectCallTarget` (new separate detector): 2 / 2 / 0 / 100%.
+- `ProloguePattern`: unchanged at 8,637 / 8,612 / 25 / 99.710548%.
+- Combined: 10,667 / 9,661 / 1,006 / 90.569045% precision and 72.323701%
+  recall before; 9,789 / 9,661 / 128 / 98.692410% precision and the same
+  72.323701% recall after. Ungradable claims fell from three to zero.
+
+The grading-only false-positive audit did not feed discovery. Its dominant
+finding was identity, not opcode decoding: calls from later overlays into the
+resident-address range had been assigned to IPL3's initial one-megabyte boot
+copy even when the later resident `code` image owning that VA is not among the
+Phase-2 mappings. Cross-image calls now fail closed unless a non-boot mapping
+exists; a reachable call may retain the initial-copy identity only for a
+structurally delimited straight-line leaf. Raw `jal` words additionally need
+two independent sites or a structural target boundary once multiple load
+images exist. Of the 103 remaining `JalTarget` false positives, grading
+classifies 41 as interior entries and 62 outside keyed function extents; 95
+originate outside keyed function extents and eight inside. The former three
+ungradable claims were targets in VRAM-only tails beyond their images'
+VROM-backed bytes and are now withheld.
+
+The recall result is deliberately reported as flat, not improved. Recovered
+switch cases expose real CFG/ownership closure, but D1.5's linear `jal` and
+prologue providers had already scanned those words. The two exhaustive OoT
+indirect-call targets duplicate entries those providers already found. The
+next honest OoT recall step remains the resident `code`/`n64dd` Phase-2
+mapping frontier or new proof for the 569 argument/mutable-memory-derived open
+calls; neither can be guessed inside Phase 6. NW4E improves from 89.040698% to
+89.709302% combined recall and from 44.689233% to 48.438236% precision; NWXE
+remains exactly 28.501229% recall / 36.363636% precision.
 
 For every computed `jr` or `jalr`:
 
