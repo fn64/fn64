@@ -32,5 +32,20 @@ export FN64_RECOMP=rs
 # build via examples/oot-boot/rs/Cargo.toml (crate emit compiles in parallel,
 # incremental after the modcrate fix) -> run ./oot
 ```
+
+## Late gameplay state/task differential
+
+`OOT_STATE_TRACE=1` revalidates the live `Play_Main` allocation on every swap
+and reports control, player, and generated-C-grounded `RoomContext` load state.
+To compare selected RT64 task indices without committing game data, add:
+
+```sh
+export FN64_GFX_TASK_DUMP=4149,4289
+export FN64_GFX_TASK_DUMP_DIR="$PWD/.eyegate/r6"
+```
+
+Each report contains the `OSTask`, independent reference triangle count, full
+F3DEX2 command walk, resolved segment/DL targets, and bounded content
+fingerprints. `.eyegate/` is evidence-only and remains untracked.
 Dispatch every rs-lane job with these exports; it reuses the cached
 emit + the shared compiled deps instead of redoing both.
