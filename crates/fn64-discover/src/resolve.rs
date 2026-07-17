@@ -48,8 +48,15 @@
 //! the bounded case needs; anything else clears the touched register rather
 //! than pretend to know it.
 
-use crate::cfg::{build_cfg, BlockTerminator, Cfg};
-use std::collections::BTreeSet;
+use crate::cfg::{build_cfg_with_indirect, BasicBlock, BlockTerminator, Cfg};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+const MAX_VALUE_SET: usize = 256;
+// A loop may otherwise grow a finite set one element per trip. Widening every
+// non-zero register and tracked store to Unknown after this bound can only
+// turn a site into `open`; it cannot fabricate an exhaustive target.
+const MAX_BLOCK_REVISITS: usize = 8;
 
 /// The subset of MIPS-III integer ops this bounded constant tracker models.
 /// Every other opcode is treated as "clobbers its destination register with
@@ -151,6 +158,46 @@ pub struct ResolvedTarget {
     /// First instruction included in the bounded straight-line constant
     /// construction. This is provenance for Phase 3's resolved-jalr claim.
     pub construction_start: u32,
+}
+
+/// Phase 6's discrete exhaustiveness result for one computed transfer.
+/// Only `Exhaustive` records are allowed to feed CFG closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndirectProofState {
+    Exhaustive,
+    Bounded,
+    Open,
+}
+
+/// The machine-checkable construction that closed an indirect target set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndirectResolutionKind {
+    Constant,
+    MemoryValueSet,
+    JumpTable,
+}
+
+/// One indirect site's finite target-set result. Jump-table targets are CFG
+/// successors, never callable entries; `via_call` is the sole authority for
+/// promoting exhaustive targets to function roots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndirectResolution {
+    pub site_pc: u32,
+    pub via_call: bool,
+    pub state: IndirectProofState,
+    pub kind: Option<IndirectResolutionKind>,
+    pub targets: Vec<u32>,
+    /// Concrete load addresses whose values formed the target set. Empty for
+    /// register-only constant constructions.
+    pub memory_sources: Vec<u32>,
+}
+
+/// A Phase 4-6 fixed point: CFG reachability plus every indirect site's
+/// explicit proof state, including sites that remain open.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClosureResult {
+    pub cfg: Cfg,
+    pub indirect: Vec<IndirectResolution>,
 }
 
 /// Track register constants forward across a single straight-line block and,
@@ -274,6 +321,755 @@ fn set(reg: &mut [Option<u32>; 32], i: u8, v: Option<u32>) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AbstractValue {
+    Unknown,
+    Concrete(BTreeSet<u32>),
+    Stack { root: u32, offsets: BTreeSet<i32> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrackedValue {
+    value: AbstractValue,
+    memory_sources: BTreeSet<u32>,
+    bounded_index: bool,
+    through_memory: bool,
+    from_static_memory: bool,
+}
+
+impl TrackedValue {
+    fn unknown() -> Self {
+        Self {
+            value: AbstractValue::Unknown,
+            memory_sources: BTreeSet::new(),
+            bounded_index: false,
+            through_memory: false,
+            from_static_memory: false,
+        }
+    }
+
+    fn constant(value: u32) -> Self {
+        Self::concrete([value])
+    }
+
+    fn concrete(values: impl IntoIterator<Item = u32>) -> Self {
+        let values: BTreeSet<u32> = values.into_iter().collect();
+        if values.is_empty() || values.len() > MAX_VALUE_SET {
+            return Self::unknown();
+        }
+        Self {
+            value: AbstractValue::Concrete(values),
+            memory_sources: BTreeSet::new(),
+            bounded_index: false,
+            through_memory: false,
+            from_static_memory: false,
+        }
+    }
+
+    fn stack(root: u32, offset: i32) -> Self {
+        Self {
+            value: AbstractValue::Stack {
+                root,
+                offsets: BTreeSet::from([offset]),
+            },
+            memory_sources: BTreeSet::new(),
+            bounded_index: false,
+            through_memory: false,
+            from_static_memory: false,
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let value = match (&self.value, &other.value) {
+            (AbstractValue::Concrete(left), AbstractValue::Concrete(right)) => {
+                let union: BTreeSet<u32> = left.union(right).copied().collect();
+                if union.len() <= MAX_VALUE_SET {
+                    AbstractValue::Concrete(union)
+                } else {
+                    AbstractValue::Unknown
+                }
+            }
+            (
+                AbstractValue::Stack {
+                    root: left_root,
+                    offsets: left,
+                },
+                AbstractValue::Stack {
+                    root: right_root,
+                    offsets: right,
+                },
+            ) if left_root == right_root => {
+                let union: BTreeSet<i32> = left.union(right).copied().collect();
+                if union.len() <= MAX_VALUE_SET {
+                    AbstractValue::Stack {
+                        root: *left_root,
+                        offsets: union,
+                    }
+                } else {
+                    AbstractValue::Unknown
+                }
+            }
+            _ => AbstractValue::Unknown,
+        };
+        if matches!(value, AbstractValue::Unknown) {
+            return Self::unknown();
+        }
+        Self {
+            value,
+            memory_sources: self
+                .memory_sources
+                .union(&other.memory_sources)
+                .copied()
+                .collect(),
+            bounded_index: self.bounded_index && other.bounded_index,
+            through_memory: self.through_memory || other.through_memory,
+            from_static_memory: self.from_static_memory || other.from_static_memory,
+        }
+    }
+
+    fn concrete_values(&self) -> Option<&BTreeSet<u32>> {
+        match &self.value {
+            AbstractValue::Concrete(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    fn map_concrete(&self, op: impl Fn(u32) -> u32) -> Self {
+        let Some(values) = self.concrete_values() else {
+            return Self::unknown();
+        };
+        let mut result = Self::concrete(values.iter().copied().map(op));
+        result.memory_sources = self.memory_sources.clone();
+        result.bounded_index = self.bounded_index;
+        result.through_memory = self.through_memory;
+        result.from_static_memory = self.from_static_memory;
+        result
+    }
+
+    fn add_immediate(&self, immediate: i32) -> Self {
+        match &self.value {
+            AbstractValue::Concrete(values) => {
+                let mut result = Self::concrete(
+                    values
+                        .iter()
+                        .map(|value| value.wrapping_add(immediate as u32)),
+                );
+                result.memory_sources = self.memory_sources.clone();
+                result.bounded_index = self.bounded_index;
+                result.through_memory = self.through_memory;
+                result.from_static_memory = self.from_static_memory;
+                result
+            }
+            AbstractValue::Stack { root, offsets } => {
+                let offsets: BTreeSet<i32> = offsets
+                    .iter()
+                    .map(|offset| offset.wrapping_add(immediate))
+                    .collect();
+                if offsets.len() > MAX_VALUE_SET {
+                    Self::unknown()
+                } else {
+                    Self {
+                        value: AbstractValue::Stack {
+                            root: *root,
+                            offsets,
+                        },
+                        memory_sources: self.memory_sources.clone(),
+                        bounded_index: self.bounded_index,
+                        through_memory: self.through_memory,
+                        from_static_memory: self.from_static_memory,
+                    }
+                }
+            }
+            AbstractValue::Unknown => Self::unknown(),
+        }
+    }
+
+    fn binary(&self, other: &Self, op: impl Fn(u32, u32) -> u32) -> Self {
+        let (Some(left), Some(right)) = (self.concrete_values(), other.concrete_values()) else {
+            return Self::unknown();
+        };
+        if left.len().saturating_mul(right.len()) > MAX_VALUE_SET {
+            return Self::unknown();
+        }
+        let values = left
+            .iter()
+            .flat_map(|left| right.iter().map(|right| op(*left, *right)));
+        let mut result = Self::concrete(values);
+        result.memory_sources = self
+            .memory_sources
+            .union(&other.memory_sources)
+            .copied()
+            .collect();
+        result.bounded_index = self.bounded_index || other.bounded_index;
+        result.through_memory = self.through_memory || other.through_memory;
+        result.from_static_memory = self.from_static_memory || other.from_static_memory;
+        result
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum MemoryLocation {
+    Concrete(u32),
+    Stack { root: u32, offset: i32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnalysisState {
+    registers: [TrackedValue; 32],
+    memory: BTreeMap<MemoryLocation, TrackedValue>,
+}
+
+impl AnalysisState {
+    fn at_root(root: u32) -> Self {
+        let mut registers = std::array::from_fn(|_| TrackedValue::unknown());
+        registers[0] = TrackedValue::constant(0);
+        registers[29] = TrackedValue::stack(root, 0);
+        Self {
+            registers,
+            memory: BTreeMap::new(),
+        }
+    }
+
+    fn set_register(&mut self, register: u8, value: TrackedValue) {
+        if register != 0 {
+            self.registers[register as usize] = value;
+        }
+        self.registers[0] = TrackedValue::constant(0);
+    }
+
+    fn widened() -> Self {
+        let mut registers = std::array::from_fn(|_| TrackedValue::unknown());
+        registers[0] = TrackedValue::constant(0);
+        Self {
+            registers,
+            memory: BTreeMap::new(),
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let registers =
+            std::array::from_fn(|index| self.registers[index].join(&other.registers[index]));
+        let memory = self
+            .memory
+            .iter()
+            .filter_map(|(location, left)| {
+                other
+                    .memory
+                    .get(location)
+                    .map(|right| (location.clone(), left.join(right)))
+            })
+            .collect();
+        Self { registers, memory }
+    }
+
+    fn refine_unsigned_upper_bound(&mut self, register: u8, upper: u32) {
+        if upper == 0 || upper as usize > MAX_VALUE_SET {
+            return;
+        }
+        let range: BTreeSet<u32> = (0..upper).collect();
+        let values = match self.registers[register as usize].concrete_values() {
+            Some(existing) => existing.intersection(&range).copied().collect(),
+            None => range,
+        };
+        let mut refined = TrackedValue::concrete(values);
+        refined.bounded_index = true;
+        self.set_register(register, refined);
+    }
+
+    fn clobber_callers(&mut self) {
+        for register in [
+            1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 31,
+        ] {
+            self.set_register(register, TrackedValue::unknown());
+        }
+        // An unknown callee may mutate any memory reachable through globals
+        // or pointer arguments. Keeping pre-call stores would turn a stale
+        // value into a fabricated exhaustive target set.
+        self.memory.clear();
+    }
+}
+
+fn value_locations(value: &TrackedValue) -> Option<Vec<MemoryLocation>> {
+    match &value.value {
+        AbstractValue::Concrete(values) => Some(
+            values
+                .iter()
+                .copied()
+                .map(MemoryLocation::Concrete)
+                .collect(),
+        ),
+        AbstractValue::Stack { root, offsets } => Some(
+            offsets
+                .iter()
+                .copied()
+                .map(|offset| MemoryLocation::Stack {
+                    root: *root,
+                    offset,
+                })
+                .collect(),
+        ),
+        AbstractValue::Unknown => None,
+    }
+}
+
+fn read_static_word(bank_bytes: &[u8], va_start: u32, address: u32) -> Option<u32> {
+    let offset = address.checked_sub(va_start)? as usize;
+    let bytes = bank_bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_be_bytes(bytes.try_into().ok()?))
+}
+
+fn load_word(
+    state: &AnalysisState,
+    address: &TrackedValue,
+    bank_bytes: &[u8],
+    va_start: u32,
+) -> TrackedValue {
+    let Some(locations) = value_locations(address) else {
+        return TrackedValue::unknown();
+    };
+    if locations.is_empty() || locations.len() > MAX_VALUE_SET {
+        return TrackedValue::unknown();
+    }
+
+    let mut loaded: Option<TrackedValue> = None;
+    let mut sources = BTreeSet::new();
+    let mut read_static = false;
+    for location in locations {
+        let value = match &location {
+            MemoryLocation::Concrete(address) => {
+                sources.insert(*address);
+                if let Some(value) = state.memory.get(&location).cloned() {
+                    Some(value)
+                } else {
+                    read_static = true;
+                    read_static_word(bank_bytes, va_start, *address).map(TrackedValue::constant)
+                }
+            }
+            MemoryLocation::Stack { .. } => state.memory.get(&location).cloned(),
+        };
+        let Some(value) = value else {
+            return TrackedValue::unknown();
+        };
+        loaded = Some(match loaded {
+            Some(previous) => previous.join(&value),
+            None => value,
+        });
+    }
+
+    let mut loaded = loaded.unwrap_or_else(TrackedValue::unknown);
+    if matches!(loaded.value, AbstractValue::Unknown) {
+        return loaded;
+    }
+    loaded.memory_sources.extend(sources);
+    loaded.bounded_index |= address.bounded_index;
+    loaded.through_memory = true;
+    loaded.from_static_memory |= read_static;
+    loaded
+}
+
+fn store_word(state: &mut AnalysisState, address: &TrackedValue, value: TrackedValue) {
+    let Some(locations) = value_locations(address) else {
+        // The store may alias any exact stack/global value we retained.
+        // Forgetting those values is the only sound bounded response.
+        state.memory.clear();
+        return;
+    };
+    if locations.len() != 1 {
+        state.memory.clear();
+        return;
+    }
+    state.memory.insert(locations[0].clone(), value);
+}
+
+fn execute_instruction(
+    state: &mut AnalysisState,
+    pc: u32,
+    word: u32,
+    bank_bytes: &[u8],
+    va_start: u32,
+) {
+    let opcode = (word >> 26) & 0x3f;
+    let rs = ((word >> 21) & 0x1f) as u8;
+    let rt = ((word >> 16) & 0x1f) as u8;
+    let rd = ((word >> 11) & 0x1f) as u8;
+    let shift = (word >> 6) & 0x1f;
+    let immediate = (word & 0xffff) as i16 as i32;
+
+    match opcode {
+        0x00 => match word & 0x3f {
+            0x00 => {
+                let value = state.registers[rt as usize].map_concrete(|value| value << shift);
+                state.set_register(rd, value);
+            }
+            0x02 => {
+                let value = state.registers[rt as usize].map_concrete(|value| value >> shift);
+                state.set_register(rd, value);
+            }
+            0x20 | 0x21 | 0x2c | 0x2d => {
+                let value = state.registers[rs as usize]
+                    .binary(&state.registers[rt as usize], u32::wrapping_add);
+                state.set_register(rd, value);
+            }
+            0x22 | 0x23 | 0x2e | 0x2f => {
+                let value = state.registers[rs as usize]
+                    .binary(&state.registers[rt as usize], u32::wrapping_sub);
+                state.set_register(rd, value);
+            }
+            0x25 => {
+                let value = state.registers[rs as usize]
+                    .binary(&state.registers[rt as usize], |left, right| left | right);
+                state.set_register(rd, value);
+            }
+            0x09 => state.set_register(rd, TrackedValue::constant(pc.wrapping_add(8))),
+            0x08 | 0x0c | 0x0d => {}
+            _ if rd != 0 => state.set_register(rd, TrackedValue::unknown()),
+            _ => {}
+        },
+        0x0f => state.set_register(rt, TrackedValue::constant((word & 0xffff) << 16)),
+        0x08 | 0x09 | 0x18 | 0x19 => {
+            let value = state.registers[rs as usize].add_immediate(immediate);
+            state.set_register(rt, value);
+        }
+        0x0c => {
+            let mask = word & 0xffff;
+            let value = state.registers[rs as usize].map_concrete(|value| value & mask);
+            state.set_register(rt, value);
+        }
+        0x0d => {
+            let immediate = word & 0xffff;
+            let value = state.registers[rs as usize].map_concrete(|value| value | immediate);
+            state.set_register(rt, value);
+        }
+        0x0e => {
+            let immediate = word & 0xffff;
+            let value = state.registers[rs as usize].map_concrete(|value| value ^ immediate);
+            state.set_register(rt, value);
+        }
+        0x23 | 0x27 => {
+            let address = state.registers[rs as usize].add_immediate(immediate);
+            let value = load_word(state, &address, bank_bytes, va_start);
+            state.set_register(rt, value);
+        }
+        0x2b => {
+            let address = state.registers[rs as usize].add_immediate(immediate);
+            let value = state.registers[rt as usize].clone();
+            store_word(state, &address, value);
+        }
+        0x03 => state.set_register(31, TrackedValue::constant(pc.wrapping_add(8))),
+        0x01 if matches!(rt, 0x10..=0x13) => {
+            state.set_register(31, TrackedValue::constant(pc.wrapping_add(8)));
+        }
+        0x0a | 0x0b | 0x20..=0x22 | 0x24..=0x26 | 0x30 | 0x34 | 0x37 | 0x38 | 0x3c => {
+            state.set_register(rt, TrackedValue::unknown());
+        }
+        0x10..=0x13 if matches!(rs, 0x00..=0x02) => {
+            state.set_register(rt, TrackedValue::unknown());
+        }
+        _ => {}
+    }
+}
+
+fn read_block_words(block: &BasicBlock, bank_bytes: &[u8], va_start: u32) -> Vec<(u32, u32)> {
+    let mut words = Vec::new();
+    let mut pc = block.start_va;
+    while pc < block.end_va {
+        let Some(offset) = pc.checked_sub(va_start).map(|offset| offset as usize) else {
+            break;
+        };
+        let Some(bytes) = bank_bytes.get(offset..offset.saturating_add(4)) else {
+            break;
+        };
+        words.push((pc, u32::from_be_bytes(bytes.try_into().unwrap())));
+        pc = pc.wrapping_add(4);
+    }
+    words
+}
+
+fn written_gpr(word: u32) -> Option<u8> {
+    let opcode = word >> 26;
+    let rs = ((word >> 21) & 0x1f) as u8;
+    let rt = ((word >> 16) & 0x1f) as u8;
+    let rd = ((word >> 11) & 0x1f) as u8;
+    match opcode {
+        0x00 => (rd != 0).then_some(rd),
+        0x01 if matches!(rt, 0x10..=0x13) => Some(31),
+        0x03 => Some(31),
+        0x08..=0x0f | 0x18..=0x1b | 0x20..=0x27 | 0x30..=0x37 => (rt != 0).then_some(rt),
+        0x10..=0x13 if matches!(rs, 0x00..=0x02) => (rt != 0).then_some(rt),
+        _ => None,
+    }
+}
+
+fn branch_bound(words: &[(u32, u32)], terminator: &BlockTerminator) -> Option<(u32, u8, u32)> {
+    let (target, fallthrough) = match terminator {
+        BlockTerminator::Branch {
+            target,
+            fallthrough,
+        }
+        | BlockTerminator::BranchLikely {
+            target,
+            fallthrough,
+        } => (*target, *fallthrough),
+        _ => return None,
+    };
+    let &(_, branch) = words.get(words.len().checked_sub(2)?)?;
+    let opcode = branch >> 26;
+    if !matches!(opcode, 0x04 | 0x05) {
+        return None;
+    }
+    let branch_rs = ((branch >> 21) & 0x1f) as u8;
+    let branch_rt = ((branch >> 16) & 0x1f) as u8;
+    let predicate = if branch_rs == 0 {
+        branch_rt
+    } else if branch_rt == 0 {
+        branch_rs
+    } else {
+        return None;
+    };
+    let before_branch = &words[..words.len().saturating_sub(2)];
+    let sltiu_index = before_branch
+        .iter()
+        .rposition(|(_, word)| written_gpr(*word) == Some(predicate))?;
+    let (_, sltiu) = before_branch[sltiu_index];
+    if sltiu >> 26 != 0x0b {
+        return None;
+    }
+    let index = ((sltiu >> 21) & 0x1f) as u8;
+    if index == predicate
+        || before_branch[sltiu_index + 1..]
+            .iter()
+            .any(|(_, word)| written_gpr(*word) == Some(index))
+    {
+        return None;
+    }
+    let upper = sltiu & 0xffff;
+    let valid_successor = if opcode == 0x04 { fallthrough } else { target };
+    Some((valid_successor, index, upper))
+}
+
+fn block_successors(block: &BasicBlock) -> Vec<u32> {
+    match &block.terminator {
+        BlockTerminator::Fallthrough { next } => vec![*next],
+        BlockTerminator::Tail { target } => vec![*target],
+        BlockTerminator::Call { next, .. } => vec![*next],
+        BlockTerminator::Branch {
+            target,
+            fallthrough,
+        }
+        | BlockTerminator::BranchLikely {
+            target,
+            fallthrough,
+        } => vec![*target, *fallthrough],
+        BlockTerminator::ResolvedIndirect {
+            targets,
+            via_call: false,
+        } => targets.clone(),
+        BlockTerminator::ResolvedIndirect { via_call: true, .. } => vec![block.end_va],
+        BlockTerminator::Indirect { via_call: true } => vec![block.end_va],
+        BlockTerminator::Return
+        | BlockTerminator::Indirect { via_call: false }
+        | BlockTerminator::Trap
+        | BlockTerminator::RanOffEnd => Vec::new(),
+    }
+}
+
+fn resolution_from_value(site_pc: u32, via_call: bool, value: &TrackedValue) -> IndirectResolution {
+    let memory_sources: Vec<u32> = value.memory_sources.iter().copied().collect();
+    let Some(targets) = value.concrete_values() else {
+        return IndirectResolution {
+            site_pc,
+            via_call,
+            state: IndirectProofState::Open,
+            kind: None,
+            targets: Vec::new(),
+            memory_sources,
+        };
+    };
+    let is_jump_table = memory_sources.len() > 1 && value.bounded_index;
+    if value.from_static_memory && !is_jump_table {
+        // Load-image bytes prove only an initial value for arbitrary mutable
+        // memory. Without a dominating table bound or an exact tracked store,
+        // the runtime target universe is not closed.
+        return IndirectResolution {
+            site_pc,
+            via_call,
+            state: IndirectProofState::Open,
+            kind: None,
+            targets: Vec::new(),
+            memory_sources,
+        };
+    }
+    let kind = if is_jump_table {
+        IndirectResolutionKind::JumpTable
+    } else if value.through_memory {
+        IndirectResolutionKind::MemoryValueSet
+    } else {
+        IndirectResolutionKind::Constant
+    };
+    IndirectResolution {
+        site_pc,
+        via_call,
+        state: IndirectProofState::Exhaustive,
+        kind: Some(kind),
+        targets: targets.iter().copied().collect(),
+        memory_sources,
+    }
+}
+
+/// Run bounded forward value-set analysis over the currently reachable CFG.
+/// Joins that exceed [`MAX_VALUE_SET`] become `open`; no widening guesses a
+/// target. Bounds from `sltiu` + dominating `beq`/`bne` edges refine only the
+/// guarded successor, so a path that bypasses the check joins back to `open`.
+pub fn resolve_value_sets(cfg: &Cfg, bank_bytes: &[u8], va_start: u32) -> Vec<IndirectResolution> {
+    resolve_value_sets_from_roots(cfg, bank_bytes, va_start, &cfg.proven_roots)
+}
+
+fn resolve_value_sets_from_roots(
+    cfg: &Cfg,
+    bank_bytes: &[u8],
+    va_start: u32,
+    analysis_roots: &[u32],
+) -> Vec<IndirectResolution> {
+    let blocks: BTreeMap<u32, &BasicBlock> = cfg
+        .blocks
+        .iter()
+        .map(|block| (block.start_va, block))
+        .collect();
+    let mut incoming: BTreeMap<u32, AnalysisState> = BTreeMap::new();
+    let mut worklist = VecDeque::new();
+    for &root in analysis_roots {
+        if !blocks.contains_key(&root) {
+            continue;
+        }
+        let root_state = AnalysisState::at_root(root);
+        let next = incoming
+            .get(&root)
+            .map_or_else(|| root_state.clone(), |state| state.join(&root_state));
+        if incoming.get(&root) != Some(&next) {
+            incoming.insert(root, next);
+            worklist.push_back(root);
+        }
+    }
+
+    let mut resolutions: BTreeMap<u32, IndirectResolution> = BTreeMap::new();
+    let mut visits: BTreeMap<u32, usize> = BTreeMap::new();
+    while let Some(start) = worklist.pop_front() {
+        let Some(block) = blocks.get(&start) else {
+            continue;
+        };
+        let Some(mut state) = incoming.get(&start).cloned() else {
+            continue;
+        };
+        let visit = visits.entry(start).or_default();
+        *visit += 1;
+        if *visit > MAX_BLOCK_REVISITS {
+            let widened = AnalysisState::widened();
+            if state == widened {
+                continue;
+            }
+            incoming.insert(start, widened.clone());
+            state = widened;
+        }
+        let words = read_block_words(block, bank_bytes, va_start);
+        let bound = branch_bound(&words, &block.terminator);
+        let transfer_pc = block.end_va.checked_sub(8);
+        let delay_pc = block.end_va.checked_sub(4);
+        let mut before_delay = None;
+        for &(pc, word) in &words {
+            if Some(pc) == delay_pc {
+                before_delay = Some(state.clone());
+            }
+            if Some(pc) == transfer_pc {
+                if let BlockTerminator::Indirect { via_call }
+                | BlockTerminator::ResolvedIndirect { via_call, .. } = &block.terminator
+                {
+                    let register = ((word >> 21) & 0x1f) as usize;
+                    let candidate =
+                        resolution_from_value(pc, *via_call, &state.registers[register]);
+                    resolutions
+                        .entry(pc)
+                        .and_modify(|existing| {
+                            if *existing != candidate {
+                                existing.state = IndirectProofState::Open;
+                                existing.kind = None;
+                                existing.targets.clear();
+                            }
+                        })
+                        .or_insert(candidate);
+                }
+            }
+            execute_instruction(&mut state, pc, word, bank_bytes, va_start);
+        }
+
+        let is_call = matches!(
+            block.terminator,
+            BlockTerminator::Call { .. }
+                | BlockTerminator::Indirect { via_call: true }
+                | BlockTerminator::ResolvedIndirect { via_call: true, .. }
+        );
+        if is_call {
+            state.clobber_callers();
+        }
+        for successor in block_successors(block) {
+            if !blocks.contains_key(&successor) {
+                continue;
+            }
+            let mut outgoing = state.clone();
+            if let Some((valid_successor, register, upper)) = bound {
+                if successor == valid_successor {
+                    // The branch condition is decided before its delay slot.
+                    // Refine on the selected edge first, then execute the slot
+                    // so a compiler-scheduled `sll index,2` inherits the
+                    // proven finite set instead of remaining open.
+                    if let (Some(mut refined), Some(&(delay_pc, delay_word))) =
+                        (before_delay.clone(), words.last())
+                    {
+                        refined.refine_unsigned_upper_bound(register, upper);
+                        execute_instruction(
+                            &mut refined,
+                            delay_pc,
+                            delay_word,
+                            bank_bytes,
+                            va_start,
+                        );
+                        outgoing = refined;
+                    } else {
+                        outgoing.refine_unsigned_upper_bound(register, upper);
+                    }
+                }
+            }
+            if matches!(
+                block.terminator,
+                BlockTerminator::BranchLikely { fallthrough, .. } if successor == fallthrough
+            ) {
+                // A not-taken likely branch annuls its delay slot.
+                if let Some(pre_delay) = &before_delay {
+                    outgoing = pre_delay.clone();
+                }
+            }
+            let next = incoming
+                .get(&successor)
+                .map_or_else(|| outgoing.clone(), |current| current.join(&outgoing));
+            if incoming.get(&successor) != Some(&next) {
+                incoming.insert(successor, next);
+                worklist.push_back(successor);
+            }
+        }
+    }
+
+    for site in &cfg.indirect_sites {
+        resolutions.entry(site.pc).or_insert(IndirectResolution {
+            site_pc: site.pc,
+            via_call: site.via_call,
+            state: IndirectProofState::Open,
+            kind: None,
+            targets: Vec::new(),
+            memory_sources: Vec::new(),
+        });
+    }
+    resolutions.into_values().collect()
+}
+
 /// Read the register a `jr`/`jalr` terminator transfers through, directly
 /// from the terminator instruction word at `end_va - 8` (the transfer word;
 /// its delay slot is at `end_va - 4`). Returns `(rs, via_call)`.
@@ -374,34 +1170,101 @@ pub fn build_cfg_closed(
     va_start: u32,
     seed_roots: &[u32],
 ) -> (Cfg, Vec<ResolvedTarget>) {
-    let mut roots: BTreeSet<u32> = seed_roots.iter().copied().collect();
-    let mut resolved_all: Vec<ResolvedTarget> = Vec::new();
-    let mut resolved_seen: BTreeSet<u32> = BTreeSet::new();
+    let closure = build_cfg_value_set_closed(bank, bank_bytes, va_start, seed_roots);
+    let block_starts: BTreeMap<u32, u32> = closure
+        .cfg
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            closure
+                .indirect
+                .iter()
+                .filter(move |resolution| {
+                    resolution.site_pc >= block.start_va && resolution.site_pc < block.end_va
+                })
+                .map(move |resolution| (resolution.site_pc, block.start_va))
+        })
+        .collect();
+    let mut legacy = Vec::new();
+    for resolution in &closure.indirect {
+        if resolution.state != IndirectProofState::Exhaustive {
+            continue;
+        }
+        for &target in &resolution.targets {
+            legacy.push(ResolvedTarget {
+                site_pc: resolution.site_pc,
+                target,
+                via_call: resolution.via_call,
+                construction_start: block_starts
+                    .get(&resolution.site_pc)
+                    .copied()
+                    .unwrap_or(resolution.site_pc),
+            });
+        }
+    }
+    legacy.sort_by_key(|resolution| (resolution.site_pc, resolution.target));
+    (closure.cfg, legacy)
+}
 
-    // A finite fixed point: each iteration can only ever add roots (targets
-    // are bounded by bank size), and roots are a monotonically growing set, so
-    // this terminates in at most (bank_words) iterations -- in practice one or
-    // two, since one boot stub resolves one entry that then reaches everything
-    // by direct calls.
+/// Build CFG + bounded value-set closure to a fixed point. Exhaustive
+/// computed jumps add ordinary intra-owner successors; exhaustive computed
+/// calls add callable roots. Bounded/open sites remain explicit records and
+/// never enter the successor map.
+pub fn build_cfg_value_set_closed(
+    bank: &str,
+    bank_bytes: &[u8],
+    va_start: u32,
+    seed_roots: &[u32],
+) -> ClosureResult {
+    let mut roots: BTreeSet<u32> = seed_roots.iter().copied().collect();
+    let va_end = va_start.wrapping_add(bank_bytes.len() as u32);
+    let in_bank = |target: u32| {
+        target >= va_start && target < va_end && (target - va_start).is_multiple_of(4)
+    };
+    let mut exhaustive: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+
     loop {
         let root_vec: Vec<u32> = roots.iter().copied().collect();
-        let cfg = build_cfg(bank, bank_bytes, va_start, &root_vec);
-        let resolved = resolve_indirect_sites(&cfg, bank_bytes, va_start);
-
-        let mut added_new = false;
-        for r in &resolved {
-            if resolved_seen.insert(r.site_pc) {
-                resolved_all.push(*r);
+        let cfg = build_cfg_with_indirect(bank, bank_bytes, va_start, &root_vec, &exhaustive);
+        let mut resolutions = resolve_value_sets_from_roots(&cfg, bank_bytes, va_start, &root_vec);
+        for resolution in &mut resolutions {
+            if resolution.state != IndirectProofState::Exhaustive {
+                continue;
             }
-            if roots.insert(r.target) {
-                added_new = true;
+            let targets_are_usable = !resolution.targets.is_empty()
+                && resolution.targets.iter().all(|target| {
+                    target.is_multiple_of(4) && (resolution.via_call || in_bank(*target))
+                });
+            if !targets_are_usable {
+                resolution.state = IndirectProofState::Bounded;
             }
         }
 
-        if !added_new {
-            resolved_all.sort_by_key(|r| r.site_pc);
-            return (cfg, resolved_all);
+        let next: BTreeMap<u32, Vec<u32>> = resolutions
+            .iter()
+            .filter(|resolution| resolution.state == IndirectProofState::Exhaustive)
+            .map(|resolution| (resolution.site_pc, resolution.targets.clone()))
+            .collect();
+        let mut added_root = false;
+        for resolution in &resolutions {
+            if resolution.state == IndirectProofState::Exhaustive
+                && !resolution.via_call
+                && resolution.kind == Some(IndirectResolutionKind::Constant)
+            {
+                for &target in &resolution.targets {
+                    if in_bank(target) && roots.insert(target) {
+                        added_root = true;
+                    }
+                }
+            }
         }
+        if next == exhaustive && !added_root {
+            return ClosureResult {
+                cfg,
+                indirect: resolutions,
+            };
+        }
+        exhaustive = next;
     }
 }
 
@@ -428,6 +1291,7 @@ pub fn build_cfg_closed_with_facts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfg::build_cfg;
 
     fn asm(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|w| w.to_be_bytes()).collect()
@@ -604,5 +1468,296 @@ mod tests {
         let (_c1, r1) = build_cfg_closed("boot", &bytes, 0x8000_0000, &[0x8000_0000]);
         let (_c2, r2) = build_cfg_closed("boot", &bytes, 0x8000_0000, &[0x8000_0000]);
         assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn bounded_jump_table_targets_are_reachable_but_not_function_roots() {
+        // sltiu $at,$a0,3 ; beq $at,$zero,default ; nop
+        // sll $t0,$a0,2 ; lui $t1,0x8000 ; addu $t1,$t1,$t0
+        // lw $t9,0x40($t1) ; jr $t9 ; nop
+        let sltiu = (0x0bu32 << 26) | (4 << 21) | (1 << 16) | 3;
+        let beq_default = (0x04u32 << 26) | (1 << 21) | 7;
+        let sll = (4u32 << 16) | (8 << 11) | (2 << 6);
+        let lui_t1 = 0x3c09_8000;
+        let addu = (9u32 << 21) | (8 << 16) | (9 << 11) | 0x21;
+        let lw_t9 = (0x23u32 << 26) | (9 << 21) | (25 << 16) | 0x40;
+        let jr_t9 = (25u32 << 21) | 0x08;
+        let jr_ra = 0x03e0_0008;
+        let mut bytes = asm(&[
+            sltiu,
+            beq_default,
+            NOP,
+            sll,
+            lui_t1,
+            addu,
+            lw_t9,
+            jr_t9,
+            NOP,
+            jr_ra,
+            NOP,
+        ]);
+        bytes.resize(0xc0, 0);
+        for (offset, target) in [
+            (0x40, 0x8000_0080u32),
+            (0x44, 0x8000_0090),
+            (0x48, 0x8000_00a0),
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&target.to_be_bytes());
+            let target_offset = (target - 0x8000_0000) as usize;
+            bytes[target_offset..target_offset + 4].copy_from_slice(&jr_ra.to_be_bytes());
+            bytes[target_offset + 4..target_offset + 8].copy_from_slice(&NOP.to_be_bytes());
+        }
+
+        let closure = build_cfg_value_set_closed("switch", &bytes, 0x8000_0000, &[0x8000_0000]);
+        let table = closure
+            .indirect
+            .iter()
+            .find(|resolution| resolution.site_pc == 0x8000_001c)
+            .unwrap();
+        assert_eq!(table.state, IndirectProofState::Exhaustive);
+        assert_eq!(table.kind, Some(IndirectResolutionKind::JumpTable));
+        assert_eq!(table.targets, vec![0x8000_0080, 0x8000_0090, 0x8000_00a0]);
+        assert_eq!(
+            table.memory_sources,
+            vec![0x8000_0040, 0x8000_0044, 0x8000_0048]
+        );
+        for target in &table.targets {
+            assert!(closure
+                .cfg
+                .blocks
+                .iter()
+                .any(|block| block.start_va == *target));
+            assert!(!closure.cfg.proven_roots.contains(target));
+        }
+        let partition = crate::partition::partition(&closure.cfg);
+        assert_eq!(partition.owners.len(), 1);
+    }
+
+    #[test]
+    fn gp_relative_shifted_jump_table_closes_from_a_dominating_bound() {
+        let sltiu = (0x0bu32 << 26) | (2 << 21) | (1 << 16) | 2;
+        let beq_default = (0x04u32 << 26) | (1 << 21) | 7;
+        let sll = (2u32 << 16) | (8 << 11) | (2 << 6);
+        let addu = (28u32 << 21) | (8 << 16) | (9 << 11) | 0x21;
+        let lw_t9 = (0x23u32 << 26) | (9 << 21) | (25 << 16) | 0x40;
+        let jr_t9 = (25u32 << 21) | 0x08;
+        let jr_ra = 0x03e0_0008;
+        let mut bytes = asm(&[
+            0x3c1c_8000, // lui $gp,0x8000
+            sltiu,
+            beq_default,
+            NOP,
+            sll,
+            addu,
+            lw_t9,
+            jr_t9,
+            NOP,
+            jr_ra,
+            NOP,
+        ]);
+        bytes.resize(0xa0, 0);
+        for (offset, target) in [(0x40, 0x8000_0080u32), (0x44, 0x8000_0090)] {
+            bytes[offset..offset + 4].copy_from_slice(&target.to_be_bytes());
+            let target_offset = (target - 0x8000_0000) as usize;
+            bytes[target_offset..target_offset + 4].copy_from_slice(&jr_ra.to_be_bytes());
+            bytes[target_offset + 4..target_offset + 8].copy_from_slice(&NOP.to_be_bytes());
+        }
+
+        let closure = build_cfg_value_set_closed("switch", &bytes, 0x8000_0000, &[0x8000_0000]);
+        let table = closure
+            .indirect
+            .iter()
+            .find(|resolution| resolution.site_pc == 0x8000_001c)
+            .unwrap();
+        assert_eq!(table.state, IndirectProofState::Exhaustive);
+        assert_eq!(table.kind, Some(IndirectResolutionKind::JumpTable));
+        assert_eq!(table.targets, vec![0x8000_0080, 0x8000_0090]);
+    }
+
+    #[test]
+    fn bound_reaches_a_shift_scheduled_in_the_branch_delay_slot() {
+        let sltiu = (0x0bu32 << 26) | (4 << 21) | (1 << 16) | 2;
+        let beq_default = (0x04u32 << 26) | (1 << 21) | 7;
+        let sll_delay = (4u32 << 16) | (8 << 11) | (2 << 6);
+        let addu = (9u32 << 21) | (8 << 16) | (9 << 11) | 0x21;
+        let lw_t9 = (0x23u32 << 26) | (9 << 21) | (25 << 16) | 0x40;
+        let jr_t9 = (25u32 << 21) | 0x08;
+        let jr_ra = 0x03e0_0008;
+        let mut bytes = asm(&[
+            sltiu,
+            beq_default,
+            sll_delay,
+            0x3c09_8000,
+            addu,
+            lw_t9,
+            jr_t9,
+            NOP,
+            NOP,
+            jr_ra,
+            NOP,
+        ]);
+        bytes.resize(0xa0, 0);
+        for (offset, target) in [(0x40, 0x8000_0080u32), (0x44, 0x8000_0090)] {
+            bytes[offset..offset + 4].copy_from_slice(&target.to_be_bytes());
+            let target_offset = (target - 0x8000_0000) as usize;
+            bytes[target_offset..target_offset + 4].copy_from_slice(&jr_ra.to_be_bytes());
+            bytes[target_offset + 4..target_offset + 8].copy_from_slice(&NOP.to_be_bytes());
+        }
+
+        let closure = build_cfg_value_set_closed("switch", &bytes, 0x8000_0000, &[0x8000_0000]);
+        let table = closure
+            .indirect
+            .iter()
+            .find(|resolution| resolution.site_pc == 0x8000_0018)
+            .unwrap();
+        assert_eq!(table.state, IndirectProofState::Exhaustive);
+        assert_eq!(table.kind, Some(IndirectResolutionKind::JumpTable));
+        assert_eq!(table.targets, vec![0x8000_0080, 0x8000_0090]);
+    }
+
+    #[test]
+    fn indirect_call_pointer_survives_a_stack_store_and_reload() {
+        let addiu_sp = 0x27bd_fff0;
+        let lui_t0 = 0x3c08_8000;
+        let addiu_t0 = 0x2508_0080;
+        let sw_t0 = 0xafa8_0000;
+        let lw_t9 = 0x8fb9_0000;
+        let jalr_t9 = (25u32 << 21) | (31 << 11) | 0x09;
+        let jr_ra = 0x03e0_0008;
+        let mut bytes = asm(&[
+            addiu_sp, lui_t0, addiu_t0, sw_t0, lw_t9, jalr_t9, NOP, jr_ra, NOP,
+        ]);
+        bytes.resize(0xa0, 0);
+        bytes[0x80..0x84].copy_from_slice(&jr_ra.to_be_bytes());
+        bytes[0x84..0x88].copy_from_slice(&NOP.to_be_bytes());
+
+        let closure = build_cfg_value_set_closed("calls", &bytes, 0x8000_0000, &[0x8000_0000]);
+        let call = closure
+            .indirect
+            .iter()
+            .find(|resolution| resolution.site_pc == 0x8000_0014)
+            .unwrap();
+        assert_eq!(call.state, IndirectProofState::Exhaustive);
+        assert_eq!(call.kind, Some(IndirectResolutionKind::MemoryValueSet));
+        assert_eq!(call.targets, vec![0x8000_0080]);
+        assert!(closure.cfg.proven_roots.contains(&0x8000_0080));
+    }
+
+    #[test]
+    fn bounded_code_pointer_array_proves_each_call_root() {
+        let sltiu = (0x0bu32 << 26) | (4 << 21) | (1 << 16) | 2;
+        let beq_default = (0x04u32 << 26) | (1 << 21) | 7;
+        let sll_delay = (4u32 << 16) | (8 << 11) | (2 << 6);
+        let addu = (9u32 << 21) | (8 << 16) | (9 << 11) | 0x21;
+        let lw_t9 = (0x23u32 << 26) | (9 << 21) | (25 << 16) | 0x40;
+        let jalr_t9 = (25u32 << 21) | (31 << 11) | 0x09;
+        let jr_ra = 0x03e0_0008;
+        let mut bytes = asm(&[
+            sltiu,
+            beq_default,
+            sll_delay,
+            0x3c09_8000,
+            addu,
+            lw_t9,
+            jalr_t9,
+            NOP,
+            jr_ra,
+            jr_ra,
+            NOP,
+        ]);
+        bytes.resize(0xa0, 0);
+        for (offset, target) in [(0x40, 0x8000_0080u32), (0x44, 0x8000_0090)] {
+            bytes[offset..offset + 4].copy_from_slice(&target.to_be_bytes());
+            let target_offset = (target - 0x8000_0000) as usize;
+            bytes[target_offset..target_offset + 4].copy_from_slice(&jr_ra.to_be_bytes());
+            bytes[target_offset + 4..target_offset + 8].copy_from_slice(&NOP.to_be_bytes());
+        }
+
+        let closure = build_cfg_value_set_closed("callbacks", &bytes, 0x8000_0000, &[0x8000_0000]);
+        let call = closure
+            .indirect
+            .iter()
+            .find(|resolution| resolution.site_pc == 0x8000_0018)
+            .unwrap();
+        assert!(call.via_call);
+        assert_eq!(call.state, IndirectProofState::Exhaustive);
+        assert_eq!(call.kind, Some(IndirectResolutionKind::JumpTable));
+        assert_eq!(call.targets, vec![0x8000_0080, 0x8000_0090]);
+        for target in &call.targets {
+            assert!(closure.cfg.proven_roots.contains(target));
+        }
+    }
+
+    #[test]
+    fn singleton_load_image_pointer_stays_open() {
+        let jalr_t9 = (25u32 << 21) | (31 << 11) | 0x09;
+        let mut bytes = asm(&[
+            0x3c08_8000, // lui $t0,0x8000
+            0x8d19_0020, // lw $t9,0x20($t0)
+            jalr_t9,
+            NOP,
+        ]);
+        bytes.resize(0x40, 0);
+        bytes[0x20..0x24].copy_from_slice(&0x8000_0030u32.to_be_bytes());
+        bytes[0x30..0x34].copy_from_slice(&0x03e0_0008u32.to_be_bytes());
+
+        let closure = build_cfg_value_set_closed("pointers", &bytes, 0x8000_0000, &[0x8000_0000]);
+        let call = closure
+            .indirect
+            .iter()
+            .find(|resolution| resolution.site_pc == 0x8000_0008)
+            .unwrap();
+        assert_eq!(call.state, IndirectProofState::Open);
+        assert_eq!(call.kind, None);
+        assert!(call.targets.is_empty());
+        assert!(!closure.cfg.proven_roots.contains(&0x8000_0030));
+    }
+
+    #[test]
+    fn overwritten_index_invalidates_a_prior_switch_bound() {
+        let sltiu = (0x0bu32 << 26) | (4 << 21) | (1 << 16) | 2;
+        let overwrite_a0 = (5u32 << 21) | (4 << 11) | 0x21; // addu $a0,$a1,$zero
+        let beq_default = (0x04u32 << 26) | (1 << 21) | 7;
+        let sll = (4u32 << 16) | (8 << 11) | (2 << 6);
+        let addu = (9u32 << 21) | (8 << 16) | (9 << 11) | 0x21;
+        let lw_t9 = (0x23u32 << 26) | (9 << 21) | (25 << 16) | 0x40;
+        let jr_t9 = (25u32 << 21) | 0x08;
+        let bytes = asm(&[
+            sltiu,
+            overwrite_a0,
+            beq_default,
+            NOP,
+            sll,
+            0x3c09_8000,
+            addu,
+            lw_t9,
+            jr_t9,
+            NOP,
+            0x03e0_0008,
+            NOP,
+        ]);
+
+        let closure = build_cfg_value_set_closed("switch", &bytes, 0x8000_0000, &[0x8000_0000]);
+        let table = closure
+            .indirect
+            .iter()
+            .find(|resolution| resolution.site_pc == 0x8000_0020)
+            .unwrap();
+        assert_eq!(table.state, IndirectProofState::Open);
+        assert_eq!(table.kind, None);
+    }
+
+    #[test]
+    fn unbounded_table_index_keeps_the_indirect_site_open() {
+        let sll = (4u32 << 16) | (8 << 11) | (2 << 6);
+        let lui_t1 = 0x3c09_8000;
+        let addu = (9u32 << 21) | (8 << 16) | (9 << 11) | 0x21;
+        let lw_t9 = (0x23u32 << 26) | (9 << 21) | (25 << 16) | 0x40;
+        let jr_t9 = (25u32 << 21) | 0x08;
+        let bytes = asm(&[sll, lui_t1, addu, lw_t9, jr_t9, NOP]);
+        let closure = build_cfg_value_set_closed("open", &bytes, 0x8000_0000, &[0x8000_0000]);
+        assert_eq!(closure.indirect.len(), 1);
+        assert_eq!(closure.indirect[0].state, IndirectProofState::Open);
+        assert!(closure.indirect[0].targets.is_empty());
     }
 }

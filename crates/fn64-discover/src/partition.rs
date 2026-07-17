@@ -172,8 +172,19 @@ pub fn partition(cfg: &Cfg) -> Partition {
                     stack.push(*target);
                     stack.push(*fallthrough);
                 }
+                BlockTerminator::ResolvedIndirect {
+                    targets,
+                    via_call: false,
+                } => stack.extend(targets.iter().copied()),
+                BlockTerminator::ResolvedIndirect { via_call: true, .. }
+                | BlockTerminator::Indirect { via_call: true } => {
+                    // Computed calls return to the block after their delay
+                    // slot. Their targets are separate callable roots,
+                    // never caller-owned blocks.
+                    stack.push(block.end_va);
+                }
                 BlockTerminator::Return
-                | BlockTerminator::Indirect { .. }
+                | BlockTerminator::Indirect { via_call: false }
                 | BlockTerminator::Trap
                 | BlockTerminator::RanOffEnd => {
                     // Terminal: no successor to own.
@@ -337,6 +348,48 @@ mod tests {
             .find(|o| o.root_va == 0x8000_0000)
             .unwrap();
         assert!(!caller.block_starts.contains(&target));
+    }
+
+    #[test]
+    fn computed_call_return_stays_with_caller_and_target_is_separate() {
+        let cfg = Cfg {
+            bank: "boot".to_string(),
+            word_class: BTreeMap::new(),
+            blocks: vec![
+                BasicBlock {
+                    start_va: 0x8000_0000,
+                    end_va: 0x8000_0008,
+                    terminator: BlockTerminator::ResolvedIndirect {
+                        targets: vec![0x8000_0020],
+                        via_call: true,
+                    },
+                },
+                BasicBlock {
+                    start_va: 0x8000_0008,
+                    end_va: 0x8000_0010,
+                    terminator: BlockTerminator::Return,
+                },
+                BasicBlock {
+                    start_va: 0x8000_0020,
+                    end_va: 0x8000_0028,
+                    terminator: BlockTerminator::Return,
+                },
+            ],
+            direct_calls: vec![],
+            tail_transfers: vec![],
+            indirect_sites: vec![],
+            proven_roots: vec![0x8000_0000, 0x8000_0020],
+        };
+
+        let part = partition(&cfg);
+        let caller = part
+            .owners
+            .iter()
+            .find(|owner| owner.root_va == 0x8000_0000)
+            .unwrap();
+        assert_eq!(caller.block_starts, vec![0x8000_0000, 0x8000_0008]);
+        assert!(!caller.block_starts.contains(&0x8000_0020));
+        assert!(part.unowned.is_empty());
     }
 
     #[test]
