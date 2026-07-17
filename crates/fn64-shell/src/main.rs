@@ -72,6 +72,13 @@ fn main() {
     game::run();
 }
 
+/// OoT's host-first rs-lane lookup table, shared verbatim with the headless
+/// harness (game-profile data beside the OoT harness, not duplicated here —
+/// see that file's module doc).
+#[cfg(fn64_recomp_rs)]
+#[path = "../../../examples/oot-boot/src/host_lookup.rs"]
+mod host_lookup;
+
 /// Everything that requires the linked game symbols lives here, gated on the
 /// `fn64_game_linked` cfg `build.rs` sets only when it compiled the
 /// RecompiledFuncs. Keeping it in one `cfg`'d module means the content-free
@@ -81,6 +88,9 @@ mod game {
     use crate::framebuffer::{self, FB_BYTES, FB_HEIGHT, FB_WIDTH};
     use crate::input_map::PadState;
     use std::sync::Arc;
+
+    #[cfg(fn64_recomp_rs)]
+    use oot_recompiled as recompiled;
 
     use pixels::{Pixels, SurfaceTexture};
     use winit::application::ApplicationHandler;
@@ -135,17 +145,36 @@ mod game {
                 fn64_runtime::SaveType::SramBanked,
             )));
 
-            let registration = fn64_boot_harness::register_linked_sections();
-            println!(
-                "[fn64-shell] bridge reports {} sections",
-                registration.reported_count()
-            );
-            // Always-resident sections 0/1/2 (makerom.ent/boot/code), same as
-            // oot-boot -- the ovl_* overlays are DMA-loaded on demand.
-            for section_key in [0usize, 1usize, 2usize] {
-                if let Some(idx) = registration.registry_index(section_key) {
-                    fn64_abi::set_section_loaded(idx);
+            #[cfg(not(fn64_recomp_rs))]
+            {
+                let registration = fn64_boot_harness::register_linked_sections();
+                println!(
+                    "[fn64-shell] bridge reports {} sections",
+                    registration.reported_count()
+                );
+                // Always-resident sections 0/1/2 (makerom.ent/boot/code), same
+                // as oot-boot -- the ovl_* overlays are DMA-loaded on demand.
+                for section_key in [0usize, 1usize, 2usize] {
+                    if let Some(idx) = registration.registry_index(section_key) {
+                        fn64_abi::set_section_loaded(idx);
+                    }
                 }
+            }
+            #[cfg(fn64_recomp_rs)]
+            {
+                let section_indices: Vec<_> = recompiled::RECOMPILED_SECTION_GEOMETRY
+                    .iter()
+                    .map(|&(rom_addr, ram_addr, size)| {
+                        fn64_abi::register_recompiled_section(rom_addr, ram_addr, size)
+                    })
+                    .collect();
+                for &section_key in &[0usize, 1, 2] {
+                    fn64_abi::set_section_loaded(section_indices[section_key]);
+                }
+                println!(
+                    "[fn64-shell] registered {} recompiled section geometries; marked 0/1/2 resident",
+                    section_indices.len()
+                );
             }
 
             // VI retrace ticker (host-chosen approximation, same as oot-boot).
@@ -154,23 +183,56 @@ mod game {
             let mut rdram = fn64_boot_harness::new_rdram();
             let rdram_ptr = rdram.as_mut_ptr();
 
-            // Render backend: the real headless software rasterizer, which
-            // writes rasterized triangles back into rdram (the projection
-            // agent's work) -- we then present that rdram framebuffer.
-            let mut render_backend = fn64_render_rt64::ReferenceBackend::new()
-                .with_f3dex2()
-                .with_clear_color([0, 0, 0, 255]);
-            {
-                use fn64_render::RenderBackend as _;
-                if let Err(e) = render_backend.create(&fn64_render::RenderConfig::new(
+            // Render backend selection (same contract as oot-boot):
+            // FN64_RENDER=rt64 uses the RT64 static backend (the eyes-verified
+            // faithful renderer; requires the `rt64` feature), which writes
+            // its frame back into the rdram VI framebuffer we present. The
+            // default remains the software ReferenceBackend (the CI oracle).
+            use fn64_render::RenderBackend as _;
+            let create_reference = || -> Box<dyn fn64_render::RenderBackend> {
+                let mut backend = fn64_render_rt64::ReferenceBackend::new()
+                    .with_f3dex2()
+                    .with_clear_color([0, 0, 0, 255]);
+                if let Err(e) = backend.create(&fn64_render::RenderConfig::new(
                     FB_WIDTH as u32,
                     FB_HEIGHT as u32,
                 )) {
                     eprintln!("[fn64-shell] WARNING: render backend create() failed: {e}");
                 }
-            }
-            fn64_abi::set_render_backend(Box::new(render_backend), rdram.len());
-            println!("[fn64-shell] render backend registered (ReferenceBackend, F3DEX2, 320x240)");
+                Box::new(backend)
+            };
+            let requested_renderer = std::env::var("FN64_RENDER")
+                .unwrap_or_else(|_| "reference".to_string())
+                .to_ascii_lowercase();
+            let (render_backend, active_renderer): (
+                Box<dyn fn64_render::RenderBackend>,
+                &'static str,
+            ) = if requested_renderer == "rt64" {
+                let mut backend = fn64_render_rt64::Rt64Backend::new();
+                match backend.create(&fn64_render::RenderConfig::new(
+                    FB_WIDTH as u32,
+                    FB_HEIGHT as u32,
+                )) {
+                    Ok(()) => (Box::new(backend), "rt64"),
+                    Err(error) => {
+                        eprintln!(
+                            "[fn64-shell] WARNING: RT64 create failed ({error}); falling back \
+                             to the ReferenceBackend oracle"
+                        );
+                        (create_reference(), "reference-fallback")
+                    }
+                }
+            } else {
+                if requested_renderer != "reference" {
+                    eprintln!(
+                        "[fn64-shell] WARNING: unknown FN64_RENDER={requested_renderer:?}; \
+                         using ReferenceBackend"
+                    );
+                }
+                (create_reference(), "reference")
+            };
+            fn64_abi::set_render_backend(render_backend, rdram.len());
+            println!("[fn64-shell] render backend registered ({active_renderer}, 320x240)");
 
             // Audio OUTPUT path: a live cpal output stream. This is the
             // shell's audio deliverable -- samples produced by M_AUDTASK and
@@ -184,6 +246,30 @@ mod game {
             wire_audio_ucode(rdram.len());
 
             println!("[fn64-shell] booting thread 0 (recomp_entrypoint)...");
+            #[cfg(fn64_recomp_rs)]
+            {
+                fn64_recomp_rs::set_host_lookup(Some(
+                    crate::host_lookup::recompiled_or_host_lookup,
+                ));
+                println!(
+                    "[fn64-shell] FN64_RECOMP=rs: linked oot-recompiled crate + host-first \
+                     recompiled adapters active"
+                );
+                // SAFETY: `rdram` is owned by the returned Shell, which lives
+                // until process exit (`clean_exit` terminates via `_exit`, so
+                // no coroutine outlives it).
+                unsafe {
+                    fn64_abi::recompiled::boot_thread0(
+                        rdram_ptr,
+                        rdram.len(),
+                        recompiled::lookup,
+                        recompiled::entrypoint,
+                        0,
+                        10,
+                    );
+                }
+            }
+            #[cfg(not(fn64_recomp_rs))]
             unsafe {
                 fn64_abi::boot_thread0(rdram_ptr, fn64_boot_harness::c_recomp_entrypoint(), 0, 10);
             }
@@ -526,6 +612,20 @@ mod game {
     /// only reports the wiring status. Enabling the `oot-audio-ucode` feature
     /// flips the message; the actual `set_audio_ucode_fn` call lands here when
     /// a non-cross-pinning ucode crate becomes a real dependency.
+    #[cfg(all(fn64_recomp_rs, feature = "oot-audio"))]
+    fn wire_audio_ucode(rdram_len: usize) {
+        // The rs manifest links the recompiled OoT aspMain ucode via the
+        // harness-local build adapter (same crate oot-boot's rs lane uses),
+        // so M_AUDTASK dispatch really synthesizes PCM for the cpal stream.
+        oot_audio_ucode::set_rdram_len(rdram_len);
+        unsafe { fn64_abi::set_audio_ucode_fn(oot_audio_ucode::oot_audio_ucode) };
+        println!(
+            "[fn64-shell] registered recompiled OoT aspMain audio ucode as the real \
+             M_AUDTASK ucode function"
+        );
+    }
+
+    #[cfg(not(all(fn64_recomp_rs, feature = "oot-audio")))]
     fn wire_audio_ucode(_rdram_len: usize) {
         if cfg!(feature = "oot-audio-ucode") {
             println!(
@@ -536,7 +636,7 @@ mod game {
         } else {
             println!(
                 "[fn64-shell] no audio ucode linked -- cpal output path is wired but receives no \
-                 samples (silent). The audio SYNTH is the perf agent's separate deliverable."
+                 samples (silent). The rs manifest (crates/fn64-shell/rs) links the real ucode."
             );
         }
     }
