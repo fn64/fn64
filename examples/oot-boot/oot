@@ -46,6 +46,10 @@ export RECOMP_RS_DIR="${RECOMP_RS_DIR:-/tmp/fn64-recomp-rs-oot}"
 BIN="$FN64/examples/oot-boot/target/release/oot-boot"
 
 build() {
+  # bash 3.2 (macOS default) counts an EMPTY array as unbound under `set -u`,
+  # so a bare "${features[@]}" aborts every default (FN64_RENDER=reference)
+  # run. Expand via ${features[@]+...} instead -- this whole runner was
+  # broken on stock macOS bash until 2026-07-17.
   local features=()
   if [[ "${FN64_RENDER:-reference}" == "rt64" ]]; then
     features+=(--features rt64)
@@ -62,9 +66,9 @@ build() {
     ln -sfn "$RECOMP_RS_DIR" "$recompiled_link" || exit 1
     CARGO_TARGET_DIR="$FN64/examples/oot-boot/target" \
       cargo build --manifest-path "$FN64/examples/oot-boot/rs/Cargo.toml" \
-        --release -q "${features[@]}" || exit 1
+        --release -q ${features[@]+"${features[@]}"} || exit 1
   elif [[ "$FN64_RECOMP" == "c" ]]; then
-    ( cd "$FN64/examples/oot-boot" && cargo build --release -q "${features[@]}" ) || exit 1
+    ( cd "$FN64/examples/oot-boot" && cargo build --release -q ${features[@]+"${features[@]}"} ) || exit 1
   else
     echo "oot: FN64_RECOMP must be 'rs' or 'c', got '$FN64_RECOMP'" >&2
     exit 2
