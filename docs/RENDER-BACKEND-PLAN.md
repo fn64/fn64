@@ -75,3 +75,8 @@ supported graphics device is a named create error and causes an explicit
 fallback to `ReferenceBackend`. Frame verification and any host-specific GPU
 blocker are recorded with the implementation commit rather than asserted by
 this plan document.
+
+EYES-VERIFIED (2026-07-16): a 7-frame RT64-lane batch (swaps 400-1300,
+true-color post fn64#1 swizzle fix, Metal active, deterministic boot) of the
+Hyrule Field title/attract sequence was judged faithful by the user. Scope so
+far: title/attract camera; the gameplay-scene batch is ROADMAP R3b.
