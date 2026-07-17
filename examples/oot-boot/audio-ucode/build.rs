@@ -1,14 +1,24 @@
+//! Copies the generated, game-derived aspMain module into `OUT_DIR`.
+//!
+//! Locating it: `OOT_ASPMAIN` (a full path to the file) wins; otherwise
+//! `$FN64_GAME_DIR/games/OOTU/rsp-recomp/src/oot_aspmain.rs`. There is NO
+//! relative-path fallback, deliberately: a relative guess silently assumes the
+//! game workspace sits at a fixed offset from this manifest, which is false in
+//! any git worktree and for any contributor. Ask for a path; never guess one.
+//!
+//! The module is ROM-derived (recompiled aspMain ucode), so unlike `recomp.h`
+//! it can never be vendored -- it must stay out-of-tree per the
+//! no-game-content rule. To build without it, disable the `oot-audio` feature
+//! (`--no-default-features`); `main.rs` already has a
+//! `cfg(not(feature = "oot-audio"))` path that installs the synth stand-in.
+
 use std::path::PathBuf;
 
 fn main() {
-    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let generated =
-        manifest_dir.join("../../../../aki-recomp/games/OOTU/rsp-recomp/src/oot_aspmain.rs");
-    assert!(
-        generated.is_file(),
-        "OoT audio adapter: generated aspMain module not found at {}",
-        generated.display()
-    );
+    println!("cargo:rerun-if-env-changed=OOT_ASPMAIN");
+    println!("cargo:rerun-if-env-changed=FN64_GAME_DIR");
+
+    let generated = locate();
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("oot_aspmain.rs");
     let source = std::fs::read_to_string(&generated)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", generated.display()));
@@ -23,4 +33,47 @@ fn main() {
     std::fs::write(&out, source)
         .unwrap_or_else(|error| panic!("failed to write {}: {error}", out.display()));
     println!("cargo:rerun-if-changed={}", generated.display());
+}
+
+/// Resolve the generated module, or panic naming every place we looked and how
+/// to proceed. A loud, actionable trap -- never a silent stand-in, which would
+/// mean shipping the synth while claiming real audio (AGENTS.md: no silent
+/// shrugs, and R5 is an open audio bug where that lie would be expensive).
+fn locate() -> PathBuf {
+    const REL: &str = "games/OOTU/rsp-recomp/src/oot_aspmain.rs";
+
+    if let Some(explicit) = std::env::var_os("OOT_ASPMAIN") {
+        let p = PathBuf::from(explicit);
+        assert!(
+            p.is_file(),
+            "OoT audio adapter: OOT_ASPMAIN={} is not a file.",
+            p.display()
+        );
+        return p;
+    }
+
+    // FN64_GAME_DIR: the workspace holding a user's own ROM-derived material.
+    if let Some(dir) = std::env::var_os("FN64_GAME_DIR") {
+        let p = PathBuf::from(dir).join(REL);
+        if p.is_file() {
+            return p;
+        }
+        panic!(
+            "OoT audio adapter: FN64_GAME_DIR is set but {} does not exist.\n\
+             Set OOT_ASPMAIN to the generated module's full path, or build with \
+             --no-default-features to use the synth stand-in instead.",
+            p.display()
+        );
+    }
+
+    panic!(
+        "OoT audio adapter: cannot locate the generated aspMain module.\n\
+         It is ROM-derived, so it never ships in this repo (see the vendor README for \
+         what CAN be vendored).\n\
+         Set one of:\n\
+         \x20 OOT_ASPMAIN=/path/to/oot_aspmain.rs   (the file itself)\n\
+         \x20 FN64_GAME_DIR=/path/to/game-workspace (then {REL})\n\
+         Or build with --no-default-features to drop the `oot-audio` feature and use the \
+         synth stand-in."
+    );
 }
