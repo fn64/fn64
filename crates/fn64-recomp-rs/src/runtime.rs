@@ -608,16 +608,18 @@ impl<'a> Rdram<'a> {
 
     /// Load a sign-extended word. Returns the `i32` the caller sign-extends
     /// into a GPR.
+    ///
+    /// Perf: read the 4 bytes as ONE slice range (`self.mem[p..p+4]`) rather
+    /// than four `self.mem[p+i]` indexes. The range form does a SINGLE bounds
+    /// check and lets the compiler emit one aligned 32-bit load; the byte-at-
+    /// a-time form did 4 bounds checks + a byte-assemble in the hot loop
+    /// (millions of accesses in collision init). Same value, safe indexing,
+    /// still `#![forbid(unsafe_code)]`.
     #[inline]
     pub fn load_w(&self, vaddr: u64) -> i32 {
         let p = Self::phys(vaddr);
         debug_assert_eq!(p & 3, 0, "unaligned LW at {vaddr:#018x}");
-        i32::from_ne_bytes([
-            self.mem[p],
-            self.mem[p + 1],
-            self.mem[p + 2],
-            self.mem[p + 3],
-        ])
+        i32::from_ne_bytes(self.mem[p..p + 4].try_into().unwrap())
     }
 
     /// Load a sign-extended halfword (byte offset XOR 2).
@@ -625,7 +627,7 @@ impl<'a> Rdram<'a> {
     pub fn load_h(&self, vaddr: u64) -> i16 {
         debug_assert_eq!(vaddr & 1, 0, "unaligned LH at {vaddr:#018x}");
         let p = Self::phys(vaddr) ^ 2;
-        i16::from_ne_bytes([self.mem[p], self.mem[p + 1]])
+        i16::from_ne_bytes(self.mem[p..p + 2].try_into().unwrap())
     }
 
     /// Load a zero-extended halfword (byte offset XOR 2).
