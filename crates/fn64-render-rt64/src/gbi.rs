@@ -1655,6 +1655,9 @@ struct DecodeState {
     blend_color: [u8; 4],
     fog_color: [u8; 4],
     dl_depth: u32,
+    /// Total commands decoded this frame (all streams), checked against
+    /// [`MAX_DL_COMMANDS`] so a cyclic branch list terminates.
+    cmds_decoded: u32,
     /// Texture-mapping decode state (SETTIMG image latch, tile descriptors,
     /// TLUT palette, G_TEXTURE enable/scale, and the currently-decoded
     /// texture bound to emitted triangles). See [`TexState`].
@@ -1762,11 +1765,18 @@ struct Viewport {
     tz: f32,
 }
 
-/// Max `G_DL` recursion depth honored, matching the real F3DEX2 display-
-/// list stack size (10 entries, public SDK `GBI` documentation) -- a
-/// runaway/corrupt DL that would recurse forever is bounded here rather
-/// than blowing the host stack.
-const MAX_DL_DEPTH: u32 = 10;
+/// Max `G_DL` *call* (G_DL_PUSH) recursion depth honored, matching the real
+/// F3DEX2 display-list return stack (18 entries; the older 10-entry figure
+/// is F3D/F3DEX). Only pushes count -- a gsSPBranchList tail-jump replaces
+/// the DL pointer and consumes NO stack entry on hardware, so branch chains
+/// (which OoT uses liberally) must not count against this.
+const MAX_DL_DEPTH: u32 = 18;
+
+/// Whole-decode command budget: bounds a cyclic/corrupt DL (e.g. a branch
+/// list that branches to itself), which the hardware would spin on forever.
+/// A real OoT frame decodes on the order of 10^4 commands; 2^20 is far above
+/// any legitimate frame while still terminating promptly on a cycle.
+const MAX_DL_COMMANDS: u32 = 1 << 20;
 
 /// The simple ("reference-fixture") F3D-style decoder retained for backward
 /// compatibility: `G_VTX`/`G_TRI1`/`G_TRI2`/`G_ENDDL` with raw screen-space
@@ -1892,6 +1902,7 @@ pub fn decode_display_list_f3dex2(
         blend_color: [0; 4],
         fog_color: [0; 4],
         dl_depth: 0,
+        cmds_decoded: 0,
         tex: TexState::default(),
         lights: LightState::default(),
     };
@@ -1909,6 +1920,17 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
     loop {
         if pc + 8 > rdram.len() {
             break; // truncated command stream: stop, return what we have.
+        }
+        state.cmds_decoded += 1;
+        if state.cmds_decoded > MAX_DL_COMMANDS {
+            if state.cmds_decoded == MAX_DL_COMMANDS + 1 {
+                eprintln!(
+                    "[fn64-render-rt64/gbi] decode exceeded MAX_DL_COMMANDS \
+                     ({MAX_DL_COMMANDS}) -- stopping (cyclic or corrupt \
+                     display list)."
+                );
+            }
+            break;
         }
         // Recomp rdram is word-native (see read_u32): each command word is a
         // logical big-endian u32 stored host-native, NOT a flat big-endian
@@ -2114,6 +2136,17 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 // current stream for a branch (mirroring RT64's runDl, which
                 // only pushes a return address when the push bit is clear).
                 let is_branch = ((w0 >> 16) & 0x01) != 0; // G_DL_NOPUSH
+                if is_branch {
+                    // Tail branch: the target REPLACES the current DL
+                    // pointer -- on hardware this consumes NO return-stack
+                    // entry, so it must not recurse or count against
+                    // MAX_DL_DEPTH (OoT chains branch lists deeper than any
+                    // fixed cap; the old recursing version falsely tripped
+                    // it). A self-referencing branch cycle is bounded by
+                    // MAX_DL_COMMANDS at the loop top.
+                    pc = resolve_addr(&state.segments, w1);
+                    continue;
+                }
                 if state.dl_depth < MAX_DL_DEPTH {
                     // NOTE: G_DL is a pure address call/return -- it does NOT
                     // save or restore the matrix stack. The RSP's modelview/
@@ -2129,11 +2162,6 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                     state.dl_depth += 1;
                     decode_stream(rdram, w1, state);
                     state.dl_depth -= 1;
-                    if is_branch {
-                        // Tail branch: the target replaced this stream; nothing
-                        // valid follows the branch command. Stop here.
-                        break;
-                    }
                 } else {
                     eprintln!(
                         "[fn64-render-rt64/gbi] G_DL recursion exceeded MAX_DL_DEPTH \
@@ -3182,6 +3210,69 @@ mod tests {
     }
 
     #[test]
+    fn g_dl_branch_chain_longer_than_call_stack_decodes_fully() {
+        // A chain of 40 tail branches (gsSPBranchList) ending in a DL that
+        // draws one triangle. On hardware a branch consumes NO return-stack
+        // entry, so any chain length is legal. The pre-fix decoder recursed
+        // per branch and counted it against MAX_DL_DEPTH, so a chain longer
+        // than the cap silently dropped the tail (this exact "G_DL recursion
+        // exceeded" warning fired on real OoT field frames).
+        const CHAIN: usize = 40;
+        let mut rdram = vec![0u8; 0x8000];
+
+        wr_vtx(&mut rdram, 0x3000, 10, 10, 0, [255, 0, 0, 255]);
+        wr_vtx(&mut rdram, 0x3010, 20, 10, 0, [0, 255, 0, 255]);
+        wr_vtx(&mut rdram, 0x3020, 15, 20, 0, [0, 0, 255, 255]);
+
+        // Links at 0x1000, 0x1010, 0x1020, ... each: [branch -> next], and
+        // garbage would follow (nothing does -- a branch never returns).
+        for i in 0..CHAIN {
+            let at = 0x1000 + i * 0x10;
+            let next = (0x1000 + (i + 1) * 0x10) as u32;
+            wr_cmd(&mut rdram, at, ((G_DL as u32) << 24) | (0x01 << 16), next);
+        }
+        // Terminal DL after the last link: VTX, TRI1, ENDDL.
+        let end = 0x1000 + CHAIN * 0x10;
+        wr_cmd(
+            &mut rdram,
+            end,
+            ((G_VTX as u32) << 24) | (3 << 12) | (3 << 1),
+            0x3000,
+        );
+        wr_cmd(
+            &mut rdram,
+            end + 8,
+            ((G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1),
+            0,
+        );
+        wr_cmd(&mut rdram, end + 16, (G_ENDDL as u32) << 24, 0);
+
+        let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
+        assert_eq!(
+            tris.len(),
+            1,
+            "a {CHAIN}-deep branch chain must reach its terminal DL \
+             (branches consume no stack entry)"
+        );
+    }
+
+    #[test]
+    fn g_dl_cyclic_branch_terminates() {
+        // A branch list that branches to ITSELF: hardware would spin
+        // forever; the decoder must terminate via the whole-decode command
+        // budget and return what it has (nothing here).
+        let mut rdram = vec![0u8; 0x2000];
+        wr_cmd(
+            &mut rdram,
+            0x1000,
+            ((G_DL as u32) << 24) | (0x01 << 16),
+            0x1000,
+        );
+        let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
+        assert!(tris.is_empty());
+    }
+
+    #[test]
     fn g_texrect_consumes_two_words_and_does_not_desync() {
         // A G_TEXRECT (0xE4) is a 16-byte command. If the decoder advances
         // only 8 bytes it reads the coord word as a bogus opcode. Here the
@@ -3311,6 +3402,7 @@ mod tests {
             blend_color: [0; 4],
             fog_color: [0; 4],
             dl_depth: 0,
+            cmds_decoded: 0,
             tex: TexState::default(),
             lights: LightState::default(),
         }
@@ -3867,8 +3959,7 @@ mod tests {
             .take(3)
             .enumerate()
         {
-            let expected_translation =
-                -(eye[0] * basis_x + eye[1] * basis_y + eye[2] * basis_z);
+            let expected_translation = -(eye[0] * basis_x + eye[1] * basis_y + eye[2] * basis_z);
             assert!(
                 (translation - expected_translation).abs() < 0.1,
                 "translation[{c}] must be -(eye · basis[{c}]): got {}, expected {expected_translation}",
