@@ -167,7 +167,11 @@ Index values (F3DEX2): `G_MV_VIEWPORT = 8`, `G_MV_LIGHT = 10`,
   **fixed-point where the value is pre-multiplied by 4** (the classic N64
   "quarter-pixel" viewport encoding) — divide by 4 to get pixel units. See
   3.5.
-- Lights (`G_MV_LIGHT`) are phase-2.
+- **`G_MV_LIGHT` slot encoding:** the offset field is in eight-byte units.
+  `gSPLight(light, n)` targets byte offset `n * 24 + 24`; DMEM 24-byte indices
+  0 and 1 are the look-at vectors, so `LIGHT_1` (offset 48, wire value 6)
+  maps to light slot 0, `LIGHT_2` maps to slot 1, and so on. In other words,
+  the light slot is `offset_bytes / 24 - 2`, not `- 1`.
 
 ---
 
@@ -443,10 +447,21 @@ coverage and depth.
   (`x+0.5, y+0.5`). This is exactly the textbook Pineda edge-function fill and
   is not N64-specific.
 - **Attribute interpolation:** compute barycentric weights from the edge
-  functions and interpolate vertex color (and, phase-2, S/T and depth)
-  perspective-*in*correctly for a first frame (screen-linear). True
-  perspective-correct interpolation divides attributes by `w` per-pixel;
-  defer that to phase-2 (it mainly matters for textures at glancing angles).
+  functions. Vertex color and the current approximate depth remain
+  screen-linear. Texture coordinates are perspective-correct: interpolate
+  `S/w`, `T/w`, and `1/w`, then divide the first two results by the third.
+  This matches RT64's raster path, which preserves homogeneous `w`
+  (`shaders/RasterVS.hlsl:21,36-38`) and emits UV as ordinary TEXCOORD with
+  the default perspective interpolation
+  (`render/rt64_raster_shader.cpp:254-260,280-286`).
+- **Scissor:** `G_SETSCISSOR` (`0xED`) packs unsigned 12-bit upper-left X/Y in
+  `w0[23:12]/w0[11:0]` and lower-right X/Y in the same fields of `w1`; all
+  four are quarter-pixels (`ultra64/gbi.h:4819-4826`). The lower-right edge
+  is exclusive (OoT `src/code/PreRender.c:137` passes stored inclusive
+  `lrx + 1, lry + 1`). Snapshot the current rectangle on each emitted
+  triangle and intersect its pixel-center raster bounds with `[ul, lr)`.
+  RT64 stores the fixed rectangle in `hle/rt64_rdp.cpp:974-980` and performs
+  the triangle/scissor intersection in `hle/rt64_rsp.cpp:1140-1154`.
 
 ### 4.2 Degenerate / cull handling
 
@@ -673,8 +688,8 @@ vertex-colored), a decoder must correctly handle:
 
 That list is the historical first-frame minimum. The reference backend now
 also implements texture/lighting, RDP other-mode and alpha compare, and the
-common color-combiner path above. Scissor, remaining framebuffer state, and
-sync ops can still be acknowledged-and-skipped at this stage.
+common color-combiner and scissor paths above. Remaining framebuffer state
+and sync ops can still be acknowledged-and-skipped at this stage.
 
 ---
 
@@ -700,6 +715,7 @@ needs attention against the F3DEX2 contract:
 | `G_MOVEMEM` | `0xDC` | 1.4 | Currently skipped → viewport falls back to a 320×240 default. To honor OoT's real viewport, handle `G_MV_VIEWPORT` (index `field(w0,0,8)==8`) and parse the `Vp` (÷4). |
 | `G_DL` | `0xDE` | 1.1 | Push flag = `field(w0,16,8)` bit `0x01`. **Do not push/pop the matrix stack across `G_DL`** — only the return address is saved; matrix state is intentionally global (see 1.1). |
 | `G_ENDDL` | `0xDF` | 1.2 | Return to caller (pop DL stack) or stop. |
+| `G_SETSCISSOR` | `0xED` | 4.1 | Decode all four 12-bit quarter-pixel edges, snapshot the rect per triangle, and clip raster bounds to its exclusive lower-right edge. |
 
 The `opcode_name` table in `gbi.rs` additionally names `G_NOOP`, `G_SPNOOP`,
 `G_RDPHALF_1/2`, `G_SETOTHERMODE_L/H`, the four sync ops, `G_LOADBLOCK`,
@@ -711,8 +727,7 @@ the remaining framebuffer and sync ops are still named skips.
 named skips so coverage isn't overstated: `G_MODIFYVTX` (`0x02`),
 `G_CULLDL` (`0x03`), `G_BRANCH_Z` (`0x04`), `G_LINE3D` (`0x08`),
 `G_LOAD_UCODE` (`0xDD`), `G_SPECIAL_1` (`0xD5`), `G_DMA_IO` (`0xD6`), and the
-RDP framebuffer ops `G_SETCIMG` (`0xFF`), `G_SETZIMG` (`0xFE`),
-`G_SETSCISSOR` (`0xED`).
+RDP framebuffer ops `G_SETCIMG` (`0xFF`) and `G_SETZIMG` (`0xFE`).
 
 ---
 
@@ -727,8 +742,10 @@ RDP framebuffer ops `G_SETCIMG` (`0xFF`), `G_SETZIMG` (`0xFE`),
 5. `G_TRI1` / `G_TRI2` / `G_QUAD` (three 7-bit index fields at bits 17/9/1)
 6. `G_DL` (push/branch) and `G_ENDDL` (return)
 7. `G_GEOMETRYMODE` — only enough to honor `G_CULL_BACK`
+8. `G_SETSCISSOR` — quarter-pixel `[upper-left, lower-right)` raster clip
 
-Everything else acknowledged-and-skipped → flat-shaded from vertex color.
+Remaining opcodes stay acknowledged-and-skipped; decoded texture, lighting,
+other-mode, combiner, blender, and scissor state feed the raster path above.
 
 ### Top 3 things most likely to be wrong/incomplete in a naive rasterizer
 
