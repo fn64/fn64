@@ -139,6 +139,13 @@ mod game {
             println!("[fn64-shell] ROM size: {} bytes", rom_bytes.len());
             fn64_abi::load_rom(rom_bytes);
 
+            // OoT NTSC 1.0's aligned __CartRomHandle BSS address: guest code
+            // dereferences osCartRomInit's returned handle, so the shim must
+            // return the game-linked object, not an opaque token (same
+            // registration as oot-boot main.rs -- its absence aborts boot in
+            // bootproc's osCartRomInit call).
+            fn64_abi::set_cart_rom_handle_vram(0x8000_9EA0);
+
             // Save-backing store (banked SRAM), same as oot-boot -- domain-2
             // PI DMAs need somewhere to land.
             fn64_abi::set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
