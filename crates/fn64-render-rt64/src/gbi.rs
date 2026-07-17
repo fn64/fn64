@@ -714,6 +714,11 @@ pub struct Texture {
     pub clamp_s: bool,
     /// T-axis wrap (see `clamp_s`).
     pub clamp_t: bool,
+    /// Tile-coordinate origin in texels (`uls/ult` quarter-texel fields).
+    /// Vertex S/T are expressed in the image's coordinate domain, so the
+    /// sampled coordinate is relative to this loaded tile origin.
+    pub origin_s: f32,
+    pub origin_t: f32,
 }
 
 /// Per-triangle snapshot of the RDP scissor rectangle, in screen pixels.
@@ -744,19 +749,22 @@ impl Texture {
                 (i.rem_euclid(dim as i64)) as u32
             }
         };
-        let x = wrap(s, self.width, self.clamp_s);
-        let y = wrap(t, self.height, self.clamp_t);
+        let x = wrap(s - self.origin_s, self.width, self.clamp_s);
+        let y = wrap(t - self.origin_t, self.height, self.clamp_t);
         let o = ((y * self.width + x) * 4) as usize;
-        if o + 4 <= self.texels.len() {
-            [
-                self.texels[o],
-                self.texels[o + 1],
-                self.texels[o + 2],
-                self.texels[o + 3],
-            ]
-        } else {
-            [255, 0, 255, 255] // out-of-range guard: magenta (never expected).
-        }
+        assert!(
+            o + 4 <= self.texels.len(),
+            "texture sample ({x}, {y}) exceeds {}x{} RGBA buffer of {} bytes",
+            self.width,
+            self.height,
+            self.texels.len()
+        );
+        [
+            self.texels[o],
+            self.texels[o + 1],
+            self.texels[o + 2],
+            self.texels[o + 3],
+        ]
     }
 }
 
@@ -1337,6 +1345,33 @@ fn packed_nibble(byte: u8, texel_index: usize) -> u8 {
     }
 }
 
+/// Decode `G_LOADTLUT`'s 10-bit count field. Public `gbi.h` packs
+/// `count - 1` directly at bits 14..23; the low two bits are part of the
+/// count, not fixed-point padding.
+fn load_tlut_count(w1: u32) -> usize {
+    let count = ((w1 >> 14) & 0x3ff) as usize + 1;
+    assert!(
+        count <= 256,
+        "G_LOADTLUT requested {count} entries, exceeding the 256-entry TLUT"
+    );
+    count
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TextureLoad {
+    Block,
+    Tile { source_x: u32, source_y: u32 },
+}
+
+fn palette_color(tlut: &[[u8; 4]], index: usize, format: &str) -> [u8; 4] {
+    *tlut.get(index).unwrap_or_else(|| {
+        panic!(
+            "{format} texel index {index} exceeds the loaded {}-entry TLUT",
+            tlut.len()
+        )
+    })
+}
+
 /// Decode the texture bound to `tile` from the latched `G_SETTIMG` image out
 /// of RDRAM into an RGBA8888 [`Texture`], sized by the tile's
 /// `G_SETTILESIZE` extent. Returns `None` for an unsupported/zero-size
@@ -1344,16 +1379,17 @@ fn packed_nibble(byte: u8, texel_index: usize) -> u8 {
 /// garbage. Covers the common OoT formats: RGBA16/32, RGBA4/8 hardware
 /// aliases, IA16/IA8/IA4, I8/I4, and CI8/CI4 (via the loaded TLUT).
 ///
-/// This is deliberately NOT a byte-exact 4 KiB TMEM model. A first
-/// recognizable textured frame needs the right texels addressed by the right
-/// texcoords, not cycle-accurate TMEM tiling -- so we read the source image
-/// linearly at `line`-implied width and let the sampler address it by the
-/// interpolated S/T (`F3DEX2-CONCEPTS.md` §5.1, "to sample" bullet).
+/// This is deliberately NOT a byte-exact 4 KiB TMEM model. `G_LOADBLOCK`
+/// remains a linear decode, while `G_LOADTILE` addresses its rectangular
+/// source through the `G_SETTIMG` row width and load origin. The sampler then
+/// makes the copied tile local by subtracting its render-tile origin
+/// (`F3DEX2-CONCEPTS.md` §5.1).
 fn decode_current_texture(
     rdram: &[u8],
     tex: &TexState,
     segments: &[u32; 16],
     tile: usize,
+    load: TextureLoad,
 ) -> Option<Texture> {
     let t = &tex.tiles[tile];
     // Tile extent from SETTILESIZE (S10.5 -> ÷4 texels), inclusive bounds.
@@ -1366,17 +1402,29 @@ fn decode_current_texture(
     let fmt = t.fmt;
     let siz = t.siz;
     let mut texels = vec![0u8; (w * h * 4) as usize];
+    if matches!(load, TextureLoad::Tile { .. }) {
+        assert_ne!(
+            tex.timg_width, 0,
+            "G_LOADTILE decoded before G_SETTIMG latched a source width"
+        );
+    }
 
     for ty in 0..h {
         for tx in 0..w {
             let texel_index = (ty * w + tx) as usize;
+            let source_index = match load {
+                TextureLoad::Block => texel_index,
+                TextureLoad::Tile { source_x, source_y } => {
+                    ((source_y + ty) * u32::from(tex.timg_width) + source_x + tx) as usize
+                }
+            };
             let rgba = match (fmt, siz) {
                 (G_IM_FMT_RGBA, G_IM_SIZ_16B) => {
-                    let px = read_u16(rdram, base + texel_index * 2);
+                    let px = read_u16(rdram, base + source_index * 2);
                     rgba5551_to_rgba8888(px)
                 }
                 (G_IM_FMT_RGBA, G_IM_SIZ_32B) => {
-                    let o = base + texel_index * 4;
+                    let o = base + source_index * 4;
                     [
                         read_u8(rdram, o),
                         read_u8(rdram, o + 1),
@@ -1385,48 +1433,48 @@ fn decode_current_texture(
                     ]
                 }
                 (G_IM_FMT_IA, G_IM_SIZ_16B) => {
-                    let o = base + texel_index * 2;
+                    let o = base + source_index * 2;
                     ia16_to_rgba8888(read_u8(rdram, o), read_u8(rdram, o + 1))
                 }
-                (G_IM_FMT_IA, G_IM_SIZ_8B) => ia8_to_rgba8888(read_u8(rdram, base + texel_index)),
+                (G_IM_FMT_IA, G_IM_SIZ_8B) => ia8_to_rgba8888(read_u8(rdram, base + source_index)),
                 (G_IM_FMT_I, G_IM_SIZ_8B) | (G_IM_FMT_RGBA, G_IM_SIZ_8B) => {
                     // RGBA8 is not a nominal GBI format, but RT64's observed
                     // hardware path samples it identically to I8
                     // (`TextureDecoder.hlsli:68-75`).
-                    i8_to_rgba8888(read_u8(rdram, base + texel_index))
+                    i8_to_rgba8888(read_u8(rdram, base + source_index))
                 }
                 (G_IM_FMT_IA, G_IM_SIZ_4B) => {
-                    let byte = read_u8(rdram, base + texel_index / 2);
-                    ia4_to_rgba8888(packed_nibble(byte, texel_index))
+                    let byte = read_u8(rdram, base + source_index / 2);
+                    ia4_to_rgba8888(packed_nibble(byte, source_index))
                 }
                 (G_IM_FMT_I, G_IM_SIZ_4B) | (G_IM_FMT_RGBA, G_IM_SIZ_4B) => {
                     // RGBA4 likewise aliases I4 on hardware (RT64
                     // `TextureDecoder.hlsli:45-56`). OoT's real 250-swap
                     // C-boot trace exercises this otherwise-unsupported pair.
-                    let byte = read_u8(rdram, base + texel_index / 2);
-                    i4_to_rgba8888(packed_nibble(byte, texel_index))
+                    let byte = read_u8(rdram, base + source_index / 2);
+                    i4_to_rgba8888(packed_nibble(byte, source_index))
                 }
                 (G_IM_FMT_CI, G_IM_SIZ_8B) => {
                     // RT64 `TextureDecoder.hlsli:174-184`: an 8-bit CI texel
                     // is the full TLUT index. OoT uses RGBA16 TLUTs only
                     // (`oot-decomp/docs/assets/images.md:63-64`).
-                    let idx = read_u8(rdram, base + texel_index) as usize;
-                    tex.tlut.get(idx).copied().unwrap_or([255, 0, 255, 255])
+                    let idx = read_u8(rdram, base + source_index) as usize;
+                    palette_color(&tex.tlut, idx, "CI8")
                 }
                 (G_IM_FMT_CI, G_IM_SIZ_4B) => {
-                    let byte = read_u8(rdram, base + texel_index / 2);
+                    let byte = read_u8(rdram, base + source_index / 2);
                     // RT64 `TextureDecoder.hlsli:176-179`: CI4 prepends the
                     // tile's four-bit palette bank to the texel nibble in
                     // TMEM. A 16-entry G_LOADTLUT is stored by this decoder as
                     // a palette-local Vec (entry zero is that bank's first
                     // color), while a full TLUT remains globally indexed.
-                    let nib = packed_nibble(byte, texel_index) as usize;
+                    let nib = packed_nibble(byte, source_index) as usize;
                     let idx = if tex.tlut.len() <= 16 {
                         nib
                     } else {
                         ((t.palette as usize) << 4) | nib
                     };
-                    tex.tlut.get(idx).copied().unwrap_or([255, 0, 255, 255])
+                    palette_color(&tex.tlut, idx, "CI4")
                 }
                 _ => return None, // unsupported format: leave flat-shaded.
             };
@@ -1441,6 +1489,8 @@ fn decode_current_texture(
         texels: std::rc::Rc::new(texels),
         clamp_s: t.clamp_s,
         clamp_t: t.clamp_t,
+        origin_s: t.uls as f32 / 4.0,
+        origin_t: t.ult as f32 / 4.0,
     })
 }
 
@@ -1748,6 +1798,7 @@ struct TexState {
     timg_addr: u32,
     timg_fmt: u8,
     timg_siz: u8,
+    timg_width: u16,
     /// The 8 RDP tile descriptors (`G_SETTILE`/`G_SETTILESIZE`).
     tiles: [Tile; 8],
     /// `G_LOADTLUT` palette: up to 256 RGBA8888 entries decoded from the
@@ -2261,6 +2312,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 // format latch only; no texel data moves until a G_LOAD*.
                 state.tex.timg_fmt = ((w0 >> 21) & 0x07) as u8;
                 state.tex.timg_siz = ((w0 >> 19) & 0x03) as u8;
+                state.tex.timg_width = ((w0 & 0x0fff) + 1) as u16;
                 state.tex.timg_addr = w1;
             }
             G_SETTILE => {
@@ -2301,13 +2353,13 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
             }
             G_LOADTLUT => {
                 // G_LOADTLUT (§5.1): load a CI palette from the latched TIMG
-                // image. w1 count field(w1,14,10) = (num-1)<<2 in the SDK
-                // macro. TLUT entries are 16-bit RGBA5551 in RDRAM.
-                let count = (((w1 >> 14) & 0x3FF) >> 2) as usize + 1;
-                let n = count.min(256);
+                // image. Public gbi.h packs `num - 1` directly into the
+                // 10-bit field at bits 14..23. TLUT entries are 16-bit
+                // RGBA5551 in RDRAM.
+                let count = load_tlut_count(w1);
                 let base = resolve_addr(&state.segments, state.tex.timg_addr);
-                let mut tlut = Vec::with_capacity(n);
-                for i in 0..n {
+                let mut tlut = Vec::with_capacity(count);
+                for i in 0..count {
                     let px = read_u16(rdram, base + i * 2);
                     tlut.push(rgba5551_to_rgba8888(px));
                 }
@@ -2321,7 +2373,16 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 // it. (A first textured frame needs the right texels at the
                 // right texcoords, not a byte-exact 4KiB TMEM model.)
                 let tile = state.tex.tex_tile as usize;
-                if let Some(tex) = decode_current_texture(rdram, &state.tex, &state.segments, tile)
+                let load = if opcode == G_LOADTILE {
+                    TextureLoad::Tile {
+                        source_x: ((w0 >> 12) & 0x0fff) / 4,
+                        source_y: (w0 & 0x0fff) / 4,
+                    }
+                } else {
+                    TextureLoad::Block
+                };
+                if let Some(tex) =
+                    decode_current_texture(rdram, &state.tex, &state.segments, tile, load)
                 {
                     state.tex.current = Some(tex);
                 }
@@ -3730,6 +3791,8 @@ mod tests {
             texels: std::rc::Rc::new(texels),
             clamp_s: clamp,
             clamp_t: clamp,
+            origin_s: 0.0,
+            origin_t: 0.0,
         }
     }
 
@@ -3779,6 +3842,65 @@ mod tests {
         assert_eq!(rgba5551_to_rgba8888(0x0000), [0, 0, 0, 0]);
     }
 
+    #[test]
+    fn load_tlut_count_uses_all_ten_wire_bits() {
+        // Public gbi.h encodes `count - 1` directly, without quarter-texel
+        // scaling. Discarding the low two bits turns the normal 256-entry CI8
+        // palette into 64 entries.
+        assert_eq!(load_tlut_count(255 << 14), 256);
+        assert_eq!(load_tlut_count(15 << 14), 16);
+    }
+
+    #[test]
+    fn load_tile_uses_settimg_stride_and_tile_coordinate_origin() {
+        // A synthetic 4x2 CI8 source. Load the rightmost two texels of row 1
+        // as a 2x1 tile whose render coordinates begin at (2, 1).
+        let base = 0x100usize;
+        let mut rdram = vec![0u8; base + 12];
+        for (i, index) in (0u8..8).enumerate() {
+            wr_u8(&mut rdram, base + i, index);
+        }
+        let mut tlut = vec![[0, 0, 0, 255]; 8];
+        tlut[6] = [60, 61, 62, 255];
+        tlut[7] = [70, 71, 72, 255];
+        let mut tex = TexState {
+            timg_addr: base as u32,
+            timg_width: 4,
+            tlut,
+            ..Default::default()
+        };
+        tex.tiles[0] = Tile {
+            fmt: G_IM_FMT_CI,
+            siz: G_IM_SIZ_8B,
+            uls: 2 * 4,
+            ult: 4,
+            lrs: 3 * 4,
+            lrt: 4,
+            clamp_s: true,
+            clamp_t: true,
+            ..Default::default()
+        };
+
+        let decoded = decode_current_texture(
+            &rdram,
+            &tex,
+            &[0; 16],
+            0,
+            TextureLoad::Tile {
+                source_x: 2,
+                source_y: 1,
+            },
+        )
+        .expect("CI8 tile must decode");
+
+        assert_eq!(
+            decoded.texels.as_slice(),
+            &[60, 61, 62, 255, 70, 71, 72, 255]
+        );
+        assert_eq!(decoded.sample(2.0, 1.0), [60, 61, 62, 255]);
+        assert_eq!(decoded.sample(3.0, 1.0), [70, 71, 72, 255]);
+    }
+
     fn assert_texture_row(
         bytes: &[u8],
         width: u16,
@@ -3807,7 +3929,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            decode_current_texture(&rdram, &tex, &[0; 16], 0)
+            decode_current_texture(&rdram, &tex, &[0; 16], 0, TextureLoad::Block)
                 .expect("OoT-used texture format must decode")
                 .texels
                 .as_slice(),
