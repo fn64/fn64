@@ -20,9 +20,13 @@ the work that closes it is rotting on stale pre-rename branches.
   post-rename main as fresh commits. Must preserve the G_DL tail-jump
   semantics landed in fn64#2. Gate: render-rt64 tests + snapshot + bounded
   reference-backend boot, 10 clean runs.
-- [ ] **R2 projection artifact**: root-cause the Hyrule Field large-world
-  title-camera projection artifact (OOT-STATUS.md "render fidelity" #1; the
-  raw-eye-matrix hypothesis is already falsified — don't re-test it).
+- [x] **R2 "projection" artifact** (merged 2026-07-16): root cause was NOT
+  projection — the ReferenceBackend quartered G_LOADTLUT counts and decoded
+  every G_LOADTILE rect from the source-image origin (CI palette + tiled
+  source layout). Proven via libultra wire layouts + swap-1299 traces;
+  synthetic regressions added; magenta third gone, sky/cloud/horizon
+  visible. Remaining oracle coarseness stays under the existing
+  loose-ends list (reference is the oracle; RT64 is the faithful lane).
 - [ ] **R3 eye-gate (user)**: batched side-by-side — RT64 frames + reference
   frames vs mupen64plus ground truth at fixed swaps, native res. No agent
   self-certifies this.
