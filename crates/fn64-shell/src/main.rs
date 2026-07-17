@@ -340,6 +340,16 @@ mod game {
                 Some(o) => o as usize,
                 None => return,
             };
+            // The `^ 2` halfword decode in rgba5551_to_rgba8888 assumes a
+            // word-aligned framebuffer base (every real VI fb is). Loud, not
+            // silent, if that ever breaks.
+            if fb_offset % 4 != 0 {
+                eprintln!(
+                    "[fn64-shell] VI framebuffer at {fb_offset:#x} is not word-aligned -- \
+                     skipping present (decode assumption violated)"
+                );
+                return;
+            }
             let end = fb_offset + FB_BYTES;
             let region: &[u8] = if end <= self.rdram.len() {
                 &self.rdram[fb_offset..end]
