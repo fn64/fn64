@@ -217,9 +217,9 @@ impl Rdram {
 
     /// Flat bulk byte copy at a plain rdram-relative offset -- no byte-lane
     /// swizzle. For a caller that already holds bytes in THIS buffer's
-    /// native-endian-word layout (e.g. fn64-diff's savestate transplant, which
-    /// word-swaps the big-endian snapshot itself before writing). Cartridge
-    /// PI DMA does NOT use this -- see `dma_write_bytes`.
+    /// native-endian-word layout, i.e. one that has word-swapped a
+    /// big-endian source image itself before writing. Cartridge PI DMA does
+    /// NOT use this -- see `dma_write_bytes`.
     pub fn write_bytes(&mut self, offset: usize, data: &[u8]) {
         self.bytes[offset..offset + data.len()].copy_from_slice(data);
     }

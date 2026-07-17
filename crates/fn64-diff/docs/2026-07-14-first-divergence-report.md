@@ -1,6 +1,22 @@
 # fn64-diff lockstep: first-divergence report (2026-07-14)
 
-## 1. Harness proof (NW4E, real oracle, real fixture)
+> **HISTORICAL RECORD — the §1 harness no longer exists (removed 2026-07-17).**
+> This report is kept for §2, which is cited from `fn64-abi/src/mesgqueue.rs`
+> as the provenance of the coroutine-context-corruption bug it localized, and
+> whose regression test still guards that fix. Do not treat §1 as a runnable
+> recipe or as a description of the current crate.
+>
+> The savestate parser, the faki-tools `oracle` subprocess client, and the
+> `lockstep`/`dump_snapshot` binaries described in §1 were deleted: the oracle
+> client was a client for another project's CLI (`docs/DESIGN.md` §1.0), and
+> the instruction-exact transplant path it drove is **not representable**
+> against a recompiler-shaped runtime (`docs/DESIGN.md` §1.0's
+> no-mid-function-resume finding — read it before proposing to rebuild any of
+> this). What survives in `crates/fn64-diff` is the pure comparator alone.
+> References below to `bin/lockstep.rs`, `tests/transplant.rs` and the
+> savestate/oracle modules describe code as it stood on 2026-07-14.
+
+## 1. Harness proof (NW4E, real oracle, real fixture) — REMOVED, see header
 
 `cargo run -p fn64-diff --release --bin lockstep -- --oracle <faki-tools oracle> --state <NW4E .st5>`
 runs end-to-end: parses a real oracle savestate, transplants RDRAM+GPRs into a real
@@ -25,8 +41,8 @@ seeds r29/r31), since no real NW4E `RecompiledFuncs` corpus is linked into this 
 The moment a real corpus is linked at this entry point, the same harness (unchanged)
 reports genuinely deep divergences. This proves the mechanism (subprocess protocol,
 savestate parse, RDRAM/GPR transplant, per-field diff, first-divergence selection) is
-real and load-bearing — see `crates/fn64-diff/tests/transplant.rs` for the underlying
-transplant machinery this reuses.
+real and load-bearing — the underlying transplant machinery this reuses lived in the
+crate's own transplant integration test (deleted 2026-07-17; see this file's header).
 
 ## 2. Real-bug localization: OoT boot, Main-resume SIGBUS
 
