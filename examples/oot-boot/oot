@@ -16,7 +16,7 @@
 # Env overrides: RECOMPILED_DIR / ROM default under $FN64_GAME_DIR (your ROM-derived
 # workspace). recomp.h is vendored in-tree, so RECOMP_H_DIR is not defaulted.
 # FN64_RECOMP=rs selects the crate at RECOMP_RS_DIR; `c` is the default. The rs
-# manifest links the out-of-tree audio ucode by default; OOT_SKIP_AUDIO_UCODE=1
+# manifest links the out-of-tree audio ucode by default; FN64_SKIP_AUDIO_UCODE=1
 # remains an explicit render-iteration speed switch.
 # FN64_RENDER=rt64 enables the feature-gated RT64 static backend build.
 set -uo pipefail

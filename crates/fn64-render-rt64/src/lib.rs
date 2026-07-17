@@ -34,6 +34,24 @@ pub mod gbi;
 pub mod png_dump;
 pub mod raster;
 
+/// Read a `FN64_*` debug knob, trapping if its retired `OOT_*` name is set.
+///
+/// These knobs are generic observability, not game-specific state; they were
+/// renamed off the `OOT_` prefix so a second game cannot fork them (ROADMAP
+/// H2b). An unset var means "feature off", so a bare rename would make an
+/// existing `OOT_DUMP_PROJ=1` invocation silently do nothing -- the exact
+/// silent shrug AGENTS.md bans. Every read of a renamed knob goes through
+/// here so the old spelling stays loud instead of no-op.
+#[cfg(not(test))]
+pub(crate) fn debug_flag(name: &str) -> bool {
+    let legacy = format!("OOT_{}", name.strip_prefix("FN64_").unwrap_or(name));
+    assert!(
+        std::env::var_os(&legacy).is_none(),
+        "{legacy} was renamed to {name}; it is no longer read. Re-run with {name} set."
+    );
+    std::env::var_os(name).is_some()
+}
+
 #[cfg(feature = "rt64")]
 mod ffi;
 
@@ -250,11 +268,11 @@ impl RenderBackend for ReferenceBackend {
             // so far geometry is occluded, inside-out back faces don't
             // overpaint front faces, and textured surfaces show their texels.
             DecodeMode::F3dex2 => {
-                // TEMP (env `OOT_NO_DEPTH=1`): force painter's-order (no
+                // TEMP (env `FN64_NO_DEPTH=1`): force painter's-order (no
                 // z-test) to A/B-prove the z-buffer is what produces correct
                 // occlusion. Off by default; remove/keep behind the flag.
                 #[cfg(not(test))]
-                let no_depth = std::env::var("OOT_NO_DEPTH").is_ok();
+                let no_depth = crate::debug_flag("FN64_NO_DEPTH");
                 #[cfg(test)]
                 let no_depth = false;
                 for tri in &triangles {

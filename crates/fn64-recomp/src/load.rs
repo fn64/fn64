@@ -322,6 +322,17 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
+    /// The `OOT_*` spellings of these knobs are gone; an unset var means "off",
+    /// so a silent rename would let a stale `OOT_CONFIG=…` skip this test
+    /// instead of running it.
+    fn reject_legacy_env() {
+        for (old, new) in [("OOT_CONFIG", "FN64_CONFIG")] {
+            if std::env::var_os(old).is_some() {
+                panic!("{old} was renamed to {new}; unset {old} and set {new} instead");
+            }
+        }
+    }
+
     fn write(dir: &Path, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
         let mut f = std::fs::File::create(&path).unwrap();
@@ -502,8 +513,10 @@ text = "{ ctx.r4 = 0; }"
     /// stays green.
     #[test]
     fn loads_real_oot_symbols_when_present() {
+        reject_legacy_env();
+
         let candidates = [
-            std::env::var("OOT_CONFIG").ok().map(PathBuf::from),
+            std::env::var("FN64_CONFIG").ok().map(PathBuf::from),
             Some(PathBuf::from(
                 "/Users/jer/Code/aki-recomp/games/OOTU/oot.toml",
             )),

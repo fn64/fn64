@@ -65,7 +65,7 @@ fn env_path(name: &str) -> std::path::PathBuf {
 
 /// Open a real host output stream and register it at fn64's AI DMA boundary.
 /// RDRAM bounds are registered even when no device exists so live PCM stats
-/// and `OOT_DUMP_AUDIO_PCM` remain available in headless runs.
+/// and `FN64_DUMP_AUDIO_PCM` remain available in headless runs.
 fn wire_audio_output(rdram_len: usize) {
     fn64_abi::set_audio_rdram_len(rdram_len);
     if std::env::var_os("FN64_NO_AUDIO").is_some() {
@@ -486,7 +486,7 @@ fn main() {
     }
     #[cfg(not(feature = "oot-audio"))]
     println!(
-        "[oot-boot] oot-audio feature disabled; use OOT_SKIP_AUDIO_UCODE=1 for this boot probe"
+        "[oot-boot] oot-audio feature disabled; use FN64_SKIP_AUDIO_UCODE=1 for this boot probe"
     );
 
     println!("[oot-boot] booting thread 0 (recomp_entrypoint)...");
