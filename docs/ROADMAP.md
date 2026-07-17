@@ -72,15 +72,38 @@ claims makes all the greens beneath it worth less.
   which is fine, but nothing else covers correctness end-to-end, so the gate's
   green overstates what is known. V1 is the cheapest real correctness signal
   to add beside it.
-- [ ] **V3 the differential mechanism AGENTS.md REQUIRES may not run.**
-  AGENTS.md: "Runtime behavior changes emit the shared event trace and get
-  diffed against the reference runtime over identical recompiled code." That
-  mechanism is `crates/fn64-diff` (1,605 lines). Verified 2026-07-17: its
-  `lockstep` binary is wired into no test and no gate, and it depends on a
-  faki-tools oracle subprocess whose checkout is effectively empty. If it
-  cannot run, AGENTS.md's differential requirement is unenforceable and the
-  contract overstates the process. Under investigation; resolve by wiring it
-  to a gate, or by cutting it and amending AGENTS.md to match reality.
+- [ ] **V3 `fn64-diff` — the boundary is wrong, not the code.** CORRECTION
+  2026-07-17: an earlier pass here claimed the faki-tools oracle checkout was
+  "effectively empty". FALSE — that was a bad `head -2` catching `__pycache__`.
+  faki-tools is a live project with its own AGENTS.md, engine, ROMs, and real
+  oracle tooling. Do not repeat that claim.
+
+  The crate is 1,791 lines of three different things, and only one is fn64's:
+  - `lockstep.rs` (321) + 17 tests — the comparator (first-divergence,
+    unset-GPR handling, PC-mismatch as its own diff kind). **fn64's. Keep.**
+  - `oracle_client.rs` (340) — a subprocess wrapper for faki-tools' `oracle`
+    CLI. fn64's build graph should not carry a client for another project's
+    command line. **Belongs on the far side of the boundary.**
+  - `savestate.rs` (433) — parses **mupen64plus** savestate format. Foreign
+    reference-emulator format knowledge, in fn64, for no reason fn64 needs.
+    **Move or drop.**
+
+  Why nothing runs it (the real finding, in its own module doc): instruction-
+  exact savestate transplant is **not representable** against a recompiler-
+  shaped runtime. Functions are the smallest resumable unit
+  (`SectionRegistry::resolve` matches only exact entry offsets, by design),
+  and a snapshot's PC lands mid-function essentially always. So lockstep-at-PC
+  was never going to work — the crate is honest about this and resolves to the
+  ENCLOSING function instead. That negative result is worth more than the code
+  and must survive any move.
+
+  Consequence for AGENTS.md: it REQUIRES that "runtime behavior changes emit
+  the shared event trace and get diffed against the reference runtime." That
+  mechanism is wired to no gate. Either wire the comparator to one, or amend
+  the contract to say what actually gates (today: `scripts/lane-parity.sh` and
+  `fn64-abi`'s `c_smoke`). A contract describing a process the project does
+  not run is the same class of defect as a doc citing a file that does not
+  exist.
 
 ## Phase R — close the "OoT renders faithfully" gate
 
