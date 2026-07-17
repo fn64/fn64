@@ -25,7 +25,7 @@ at) — not a tracker label. Updated 2026-07-16.
 - Windowed harness (`fn64-shell`, winit+pixels+cpal): live framebuffer per
   swap, keyboard→controller, audio-out wired.
 - Fast loop: `--release` + `OOT_MAX_SWAPS` early-exit (~250x), `./oot` runner,
-  observability flags (`OOT_RENDER_STATS`, `OOT_DUMP_PROJ`, `OOT_NO_DEPTH`,
+  observability flags (`OOT_RENDER_DUMP_START`, `OOT_DUMP_PROJ`, `OOT_NO_DEPTH`,
   `OOT_AUDIO_UCODE_TIMING`, `OOT_SKIP_AUDIO_UCODE`, `OOT_STOP_ON_FRAME`).
 - Rs-lane real-time profiling: `OOT_PERF_NO_CAPTURE=1` removes only the
   harness's per-swap diagnostic PNG work, while `OOT_PHASE_TIMING=1`
