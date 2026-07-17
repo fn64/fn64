@@ -483,6 +483,17 @@ pub fn audio_ucode_timing() -> (u64, u64) {
     )
 }
 
+/// Forward the game's true AI DAC rate (`osAiSetFrequency`'s successful
+/// return value) to the registered backend so its producer-side resample
+/// ratio tracks the guest. No-op when no backend is registered.
+pub(crate) fn notify_audio_frequency(sample_rate_hz: u32) {
+    AUDIO_BACKEND.with(|cell| {
+        if let Some(backend) = cell.borrow_mut().as_mut() {
+            backend.set_frequency(sample_rate_hz);
+        }
+    });
+}
+
 /// Register the audio backend `osAiSetNextBuffer_recomp` delivers finished AI
 /// PCM through, and the rdram buffer length it may safely read. This covers
 /// sample delivery, not ucode execution.
