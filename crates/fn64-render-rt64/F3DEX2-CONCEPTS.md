@@ -526,10 +526,15 @@ approximations are logged when encountered.
   index, and the S/T clamp/mirror/wrap + mask/shift parameters. Up to 8 tiles.
 - **`G_LOADBLOCK`** (`0xF3`) / **`G_LOADTILE`** (`0xF4`): DMA texel data from
   the `G_SETTIMG` image into TMEM for a tile. `G_LOADBLOCK` loads a linear run
-  (fast, whole texture); `G_LOADTILE` loads a rectangular sub-region.
-  `G_SETTILESIZE` (`0xF2`) sets the tile's active S/T extent.
+  (fast, whole texture); `G_LOADTILE` loads a rectangular sub-region. Its
+  ULS/ULT source origin is addressed using the `G_SETTIMG` image width as the
+  row stride; it is not a packed stand-alone rectangle. `G_SETTILESIZE`
+  (`0xF2`) sets the tile's active S/T extent, whose ULS/ULT origin must be
+  removed when mapping vertex S/T into the copied tile.
 - **`G_LOADTLUT`** (`0xF0`): load a color palette into TMEM for CI (color-
-  indexed) textures.
+  indexed) textures. The public `gDPLoadTLUTCmd` wire layout stores
+  `count - 1` directly in bits 14..23; unlike S/T fields, this count has no
+  quarter-texel scaling.
 - To *sample*: take the vertex S/T (S10.5 fixed-point from the `Vtx`), apply
   the tile's shift/mask/clamp, address TMEM, decode the texel per the tile
   format. OoT textures are commonly 4-bit/8-bit CI and 16-bit RGBA5551/IA.
