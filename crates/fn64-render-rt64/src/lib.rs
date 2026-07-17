@@ -100,6 +100,10 @@ pub struct ReferenceBackend {
     /// per docs/DECOUPLING.md) still gets the rasterized output back out:
     /// the backend dumps it itself. Bounded by `auto_dump_limit`.
     auto_dump: Option<AutoDump>,
+    /// Counts every gfx task this backend processes, independent of
+    /// `auto_dump` being configured, so `FN64_GFX_TASK_DUMP` selects the same
+    /// task index whether or not PNG auto-dumping is on.
+    diag_task_index: u64,
 }
 
 struct AutoDump {
@@ -125,6 +129,7 @@ impl ReferenceBackend {
             clear_color: [0, 0, 0, 255],
             decode_mode: DecodeMode::Simple,
             auto_dump: None,
+            diag_task_index: 0,
         }
     }
 
@@ -255,6 +260,45 @@ impl RenderBackend for ReferenceBackend {
             DecodeMode::F3dex2 => gbi::decode_display_list_f3dex2(&*rdram, task.data_ptr)?,
         };
         let tri_count = triangles.len();
+        // The FN64_GFX_TASK_DUMP diagnostic was originally reachable only from
+        // Rt64Backend, but the A/B lane-parity gate (scripts/lane-parity.sh)
+        // runs the DEFAULT build, which has no `rt64` feature and therefore
+        // lands here -- so the documented recipe silently produced no dump on
+        // the exact configuration it was needed for. Same env-var contract,
+        // same trace function; task indices are per-backend.
+        #[cfg(not(test))]
+        {
+            let dump_index = self.diag_task_index;
+            self.diag_task_index += 1;
+            if let Some(spec) = std::env::var_os("FN64_GFX_TASK_DUMP") {
+                let selected = spec.to_string_lossy().split(',').any(|entry| {
+                    entry.trim().parse::<u64>().unwrap_or_else(|error| {
+                        panic!("FN64_GFX_TASK_DUMP entry {entry:?} is not a u64 task index: {error}")
+                    }) == dump_index
+                });
+                if selected {
+                    let directory = std::env::var_os("FN64_GFX_TASK_DUMP_DIR")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/fn64-gfx-task-dumps"));
+                    std::fs::create_dir_all(&directory).unwrap_or_else(|error| {
+                        panic!("failed to create FN64_GFX_TASK_DUMP_DIR {directory:?}: {error}")
+                    });
+                    let command_trace = gbi::trace_display_list_f3dex2(&*rdram, task.data_ptr);
+                    let report = format!(
+                        "task_index={dump_index}\noutput_addr={output_addr:#010x}\n\
+                         reference_triangle_count={tri_count}\ntask={task:#?}\n{command_trace}",
+                    );
+                    let path = directory.join(format!("task-{dump_index:04}.txt"));
+                    std::fs::write(&path, report).unwrap_or_else(|error| {
+                        panic!("failed to write gfx task diagnostic {path:?}: {error}")
+                    });
+                    eprintln!(
+                        "[fn64-render-rt64] dumped gfx task #{dump_index} ({tri_count} reference \
+                         triangles) to {path:?}"
+                    );
+                }
+            }
+        }
         match self.decode_mode {
             // Simple reference-fixture path: pure 2D fill, no culling/z-test,
             // to keep the hand-built fixtures bit-compatible.
