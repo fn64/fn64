@@ -111,13 +111,21 @@ adapter first (we need the reference to diff against).
 
 ## Sequencing (small steps, tests at each)
 
-1. **Define the traits** (`fn64-recomp`, `fn64-render`) with the typed configs +
-   the ABI/ucode version checks. No behavior yet. Compiles, documented.
-2. **Wrap the recompiler fork** as `fn64-recomp-n64recomp`; move `aki_profile`'s
-   shell-out logic behind it; golden + round-trip tests. `aki_profile` now calls
-   the trait. **N64Recomp is named in exactly one crate.**
-3. **Rename `fn64-rt64` (→ `fn64-render-rt64`) → `fn64-render-rt64`** behind the `RenderBackend` trait when
-   the first-frame wave gives us a real task to render; fixture-replay tests.
+**Status 2026-07-17: steps 1 and 3 shipped; step 2 was overtaken by events.**
+This list is kept for the rationale, not as a work queue — read the annotations
+before following it.
+
+1. ~~**Define the traits**~~ **DONE.** `fn64-render`'s `RenderBackend` lives at
+   `crates/fn64-render/src/lib.rs`; the recomp side landed as the `c`/`rs` lane
+   split (DESIGN.md §1.1).
+2. ~~**Wrap the recompiler fork** as `fn64-recomp-n64recomp`~~ **NOT DONE, and
+   not the plan any more.** No such crate exists or should be created. The
+   project went further than wrapping: `fn64-recomp`/`fn64-recomp-rs` are our
+   own Rust-emitting recompiler, and the fork is consumed as the `c` lane
+   instead of being adapter-wrapped. `aki_profile` is legacy (ROADMAP Phase H).
+3. ~~**Rename `fn64-rt64` → `fn64-render-rt64`**~~ **DONE**, behind the
+   `RenderBackend` trait; fixture-replay tests live in
+   `crates/fn64-render-rt64/tests/`.
 4. **Rebrand the forks by role**: `fn64/n64recomp` stays (it's literally a fork,
    honest name), but our crates and docs speak in fn64-recomp / fn64-render terms
    so the *project's* vocabulary is already decoupled before the code is.
