@@ -15,6 +15,29 @@ Found by auditing what the gates actually check. These are first because they
 undermine every other item's evidence: a bar that does not measure what it
 claims makes all the greens beneath it worth less.
 
+- [ ] **V1a THE LANES DIVERGE — DESIGN.md §4's A/B premise is FALSE past swap
+  231.** Found and independently reproduced 2026-07-17 by
+  `scripts/lane-parity.sh 240` (dispatcher re-ran it; SHAs match the finder's
+  exactly). The c and rs lanes are byte-identical through swap 231, then
+  differ at **swap 234** onward (266 of 497 framebuffers differ by 499). Run
+  `scripts/lane-parity.sh 240` for the per-swap SHAs — they are not pasted
+  here because a hash in a doc is decorative unless something re-checks it
+  (V0); the script IS the check.
+
+  It is a **guest-side** bug, not a renderer bug: at gfx task #232 the C lane
+  emits **900 triangles**, rs emits **903** — the recompiled CPU built a
+  different display list, so the culprit is in the recompiled function set.
+  Onset coincides with `game_mode=1` (title) at swaps 229-231.
+
+  Confounds eliminated by measurement: audio (reproduces with
+  `FN64_SKIP_AUDIO_UCODE=1`), scripted input (first event is frame 250, AFTER
+  onset), nondeterminism (each lane is self-identical across repeat runs), and
+  stale PNGs (negative control: deleted, regenerated).
+
+  Everything the project A/Bs beyond swap ~231 is comparing two different
+  things. This outranks R5. Next step, NOT done: dump task #232's display list
+  from both lanes, diff to the first differing GBI command, trace back to the
+  emitting function.
 - [ ] **V0 doc hashes are now linted; 5 were unbacked.** `lint-docs.py` fails
   when a doc asserts a *content* hash no test contains (commit pins are
   provenance and exempt). All five in OOT-STATUS.md were unbacked — verified
