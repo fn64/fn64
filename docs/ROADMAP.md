@@ -148,7 +148,7 @@ ONE has a permanent reason to be out-of-tree:
 |---|---|---|
 | `refs/N64RecompSource/include` (`recomp.h`) | 72K | **Vendor.** MIT, from fn64's own upstream fork. |
 | `games/OOTU/oot.toml` | 156 lines | **Own it.** Recompiler config, not game bytes; its header calls itself a scaffold. |
-| `runtime/ABI-SURFACE.md` + `abi_surface.json` | 204K | **Needs a human clean-room call** (H2). |
+| `runtime/ABI-SURFACE.md` + `abi_surface.json` | 204K | **Not needed.** Nothing consumes it; the live oracle is `fn64-abi`'s `c_smoke` link test (H2). |
 | `games/*/syms/dump.toml`, `refs/oot-decomp/**/segments.csv` | — | **Dies with Phase D.** D4 emits fn64's own pack; D-gate proves it. |
 | `games/*/*.z64` | — | **Stays out-of-tree forever.** But that is a plain `ROM=` path, never `$AKI`-shaped. |
 
@@ -162,15 +162,30 @@ path. Do NOT rename it; delete the need for it.
   the `$AKI`-derived ROM defaults with a plain `ROM=`/`OOT_ROM=` that has no
   legacy path baked in. After this, an rs-lane boot needs a ROM and nothing
   else from aki-recomp.
-- [ ] **H2 decide where `ABI-SURFACE.md` lives — human call, clean-room.**
-  It is AGENTS.md read-order item 3 (mandatory), currently in a dead repo, so
-  a fresh clone cannot satisfy the contract. It is *extracted from* ROM-derived
-  generated C but is itself a symbol/signature inventory, not game bytes —
-  plausibly in-tree-able under `docs/`, which would close the read-order hole.
-  That is exactly the clean-room judgment AGENTS.md reserves for a human; an
-  agent must not decide it. If it stays out-of-tree, AGENTS.md's read order
-  must stop citing it as mandatory. Blocks: AGENTS.md item 3,
-  `COMPLETENESS.md:280` (same wrong repo-local citation).
+- [x] **H2 `ABI-SURFACE.md` — RESOLVED 2026-07-17: fn64 does not need it, and
+  the clean-room question never had to be answered.** It was AGENTS.md
+  read-order item 3 (mandatory) while living in a legacy repo, so a fresh clone
+  could not satisfy its own contract. The fix was neither copying it in nor
+  demoting it — it was noticing the entry had become cargo cult:
+  - **Nothing consumes `abi_surface.json`.** Zero hits across all `.rs`/`.sh`/
+    `.toml`/`.py`. The `nm`-based completeness gate DESIGN.md §4 describes is
+    aspirational; the one `nm` mention in code is a comment about a past
+    observation.
+  - **The live oracle is a test that runs.** `crates/fn64-abi/tests/c_smoke.rs`
+    compiles a real C caller against the staticlib and executes it, proving the
+    extern symbols link and are callable exactly as generated `RecompiledFuncs`
+    would call them. Its own doc comment calls it "the mechanical check that the
+    ABI-SURFACE.md shape is honored". 62/62 pass.
+  - **The ~45 citations are provenance, not lookups.** They record which allowed
+    source a claim came from, per the clean-room protocol. They stay honest
+    whether or not the file is reachable — a footnote does not break when the
+    library closes.
+
+  It WAS a live oracle during transcription (`rdram.rs:12` and `lib.rs:617`
+  both record waves mistranscribing it), which is why the read-order entry
+  existed and why it outlived its job. Read order now points at `fn64-abi` and
+  its tests. Kept as a closed item — the reasoning is the point; delete once
+  Phase H lands.
 - [ ] **H3 `fn64-discover` gates cannot run off the author's machine.** Not
   env vars with defaults — compile-time `const`s: `gate_b1.rs:18/20-22`,
   `gate_d1.rs:18-19/24-27`, `gate_b2.rs:39/51` hold

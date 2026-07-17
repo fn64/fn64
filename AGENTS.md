@@ -9,16 +9,19 @@ including you. This file is short on purpose. Read it all.
 
 1. `README.md` — what this is and why.
 2. `docs/DESIGN.md` — architecture, threading model, A/B migration plan.
-3. `runtime/ABI-SURFACE.md` in the out-of-tree aki-recomp checkout — the extern
-   surface recompiled code expects (mechanically extracted; regenerate rather
-   than hand-edit; `runtime/abi_surface.json` is the machine-readable form).
-   It is NOT in this repo and cannot be: it is extracted from ROM-derived
-   generated C, and the no-game-content rule below keeps it out of git. Locate
-   the checkout via `$AKI` (`scripts/` currently default it to a path on the
-   author's machine — see ROADMAP "H1"; if it is unset and you need this file,
-   ask rather than guess).
+3. `crates/fn64-abi` and its tests — the extern surface recompiled code links
+   against. `tests/c_smoke.rs` is the live oracle: it compiles a real C caller
+   against the staticlib and runs it, so the ABI shape is proven by a test that
+   runs, not by prose. Read the code, not a description of it.
 4. The docs referenced by whatever you're touching. Docs here are load-bearing:
    if you change behavior, you change its doc in the same commit.
+
+`ABI-SURFACE.md` (in the legacy aki-recomp checkout) is cited ~45 times across
+this repo as clean-room provenance — "this claim came from that allowed
+source." Those citations are history and stay honest whether or not you can
+reach the file. It was a live oracle while the surface was being transcribed;
+it is not one now, and you do not need it to work here. Don't go hunting for
+it (see ROADMAP Phase H).
 
 ## Clean-room protocol (non-negotiable)
 
