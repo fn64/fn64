@@ -38,18 +38,31 @@ One workspace, separate crates, each publishable alone:
 | `fn64-abi` | The `extern "C"` surface recompiled code links against |
 | `fn64-boot-harness` | Shared generated-section bridge, registration callback, and RDRAM allocation for boot hosts |
 | `fn64-shell` | The executable: window, input, audio out, ROM intake |
-| `fn64-rt64` | FFI bridge to [RT64](https://github.com/fn64/rt64) (MIT, C++) — all C++ interop quarantined here |
+| `fn64-render` | Backend-agnostic render seam + the pure-Rust `ReferenceBackend` (headless CI oracle) |
+| `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/fn64/rt64) (MIT, C++) — all C++ interop quarantined here |
+| `fn64-recomp` / `fn64-recomp-rs` | The Rust-emitting recompiler and its whole-ROM driver — the `rs` lane |
+| `fn64-audio` | RSP audio ucode execution |
+| `fn64-diff` | Trace/state differential tooling |
+| `fn64-discover` | ROM discovery: symbol/section metadata without a decomp |
 
-Planned: `fn64-recomp`, a Rust-emitting recompiler, once the runtime earns it.
+`fn64-recomp` was once "planned, once the runtime earns it" — it exists and
+boots OoT. See `docs/DESIGN.md` §1.1 for the two lanes it introduces.
 
 ## Status
 
-Pre-alpha, design phase — but not speculative. The proving ground is a live
-port effort (WWF WrestleMania 2000 and WWF No Mercy, the AKI wrestling
-engine), currently deep in boot bring-up on the reference runtime. Both
-runtimes link the *identical* recompiled code, so every fn64 behavior gets
-A/B'd against reality before the swap. The boot ladder is the test suite; it
-does not grade on a curve.
+Pre-alpha, but not speculative and no longer design-only: fn64 boots OoT with
+the RT64 renderer, real audio ucode, and input, in a windowed shell. The
+graded target is **Ocarina of Time** — the zeldaret decomp's 10,833 named
+functions make it a rare answer key to grade discovery and recompilation
+against. (The original proving ground was a WM2000/No Mercy port effort on the
+AKI engine; that lineage is why `aki-recomp` appears in older docs. It is a
+legacy checkout fn64 is cutting loose — see ROADMAP Phase H.)
+
+fn64 and the reference runtime link the *identical* recompiled code, so every
+fn64 behavior gets A/B'd against reality before the swap. The boot ladder is
+the test suite; it does not grade on a curve. What is NOT done is tracked
+honestly in `docs/ROADMAP.md` — audio is still broken (R5) and the outdoor
+gameplay eye-gate is unmet (R3b).
 
 ## How we work
 

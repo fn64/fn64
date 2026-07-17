@@ -100,6 +100,39 @@ No longer planned-only: `fn64-recomp`/`fn64-recomp-rs`, the Rust-emitting
 recompiler `README.md` deferred until the runtime earned it, are built and
 boot OoT. They add the second lane below.
 
+### 1.0 The outer boundary: fn64 owns its toolchain
+
+The rules above govern crate-to-crate concerns. They say nothing about the
+boundary between fn64 and everything outside it, and that omission has a
+scar: a legacy sibling checkout (`aki-recomp`) became load-bearing without
+violating a single written rule — it is not a crate, so dependency direction
+never caught it; it is not C++, so the quarantine never caught it. It was
+found 2026-07-17 and is being cut (ROADMAP Phase H). The rule that would have
+prevented it:
+
+**Everything needed to build and run fn64 lives in fn64, except a user's own
+game content.** Exactly one class of input is legitimately out-of-tree — ROMs
+and anything ROM-derived, which the no-game-content rule bars from git
+forever. Everything else — recompiler configs, upstream MIT headers, tooling,
+metadata — is either owned here, vendored here, or generated here.
+
+Corollaries, each earned the hard way:
+
+- **A path to another project is not a dependency mechanism.** If fn64 needs
+  an artifact, vendor it, submodule it, or generate it. Reaching into a
+  sibling working directory couples fn64 to one machine's layout and, worse,
+  to another project's lifetime.
+- **Out-of-tree inputs are named and declared, never defaulted to someone's
+  home directory.** A default path that only resolves on the author's machine
+  is a silent shrug: it works for exactly one person and fails or — worse —
+  silently reads something stale for everyone else. (`native-emit.sh` did
+  exactly this: it hashed a stale driver into a cache key when the repo-local
+  and `CARGO_TARGET_DIR` copies diverged.)
+- **Test/gate fixtures obey this too.** A gate whose inputs are compile-time
+  `const` paths into a personal directory (`fn64-discover`'s `gate_*.rs`,
+  ROADMAP H3) produces numbers exactly one person can reproduce. Unreproducible
+  evidence is not evidence — see AGENTS.md's validation bars.
+
 ### 1.1 The two lanes: how the game arrives, and what draws it
 
 Two independent switches select a build configuration. They are orthogonal,

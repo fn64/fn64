@@ -26,7 +26,12 @@ CACHE_ROOT="${FN64_EMIT_CACHE:-/tmp/fn64-emit-cache}"
 # Build the driver once (cheap, cached by cargo) and hash it into the key so a
 # recompiler change invalidates the cache.
 cargo build --release -q -p fn64-recomp-rs --bin recompile_rom >/dev/null 2>&1
-DRIVER="$FN64_ROOT/target/release/recompile_rom"
+# Ask cargo where it put the binary rather than assuming repo-local target/:
+# FAST-LOOP.md tells every rs-lane job to export CARGO_TARGET_DIR, which moves
+# it. Guessing $FN64_ROOT/target silently hashed a STALE driver into the cache
+# key when both copies existed, and failed outright on a fresh clone.
+DRIVER="${CARGO_TARGET_DIR:-$FN64_ROOT/target}/release/recompile_rom"
+[ -x "$DRIVER" ] || { echo "native-emit: driver not at $DRIVER (cargo build failed?)" >&2; exit 3; }
 
 key=$( { md5 -q "$OOT_ROM"; md5 -q "$OOT_CONFIG"; md5 -q "$DRIVER"; } | md5 -q )
 OUT="$CACHE_ROOT/$key"
