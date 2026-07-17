@@ -272,43 +272,28 @@ Ordered by (a) is it reachable today, (b) how many target games need it,
    observed as reads; a write call site would hard-crash on the
    `unimplemented!()`. Highest priority: it's the only reachable-but-broken
    shim in the whole matrix.
-2. ~~**VI real display backend**~~ **STALE — CLOSED.** Recorded as "produces
-   no pixels / not yet wired to a real renderer". Both hosts now construct a
-   real `Box<dyn fn64_render::RenderBackend>` (`crates/fn64-shell/src/main.rs`,
-   `examples/oot-boot/src/main.rs`) and `fn64-render-rt64` implements
-   `process_task`. OoT renders eye-gated frames (ROADMAP R3).
-3. ~~**Controller/SI family** (6 shims, ABSENT)~~ **STALE — WRONG WHEN
-   WRITTEN.** The shims exist in `crates/fn64-abi/src/si.rs` (13 `_recomp`
-   matches) over `crates/fn64-runtime/src/si.rs`. This entry is the direct
-   artifact of the broken regen recipe above: the module split moved them out
-   of `lib.rs`, the `lib.rs`-only grep stopped seeing them, and the doc
-   recorded "ABSENT" for code that was already written.
-4. ~~**RSP gfx task handoff** (ABSENT)~~ **STALE — CLOSED.** The gfx task path
-   is live end-to-end: `FN64_GFX_TASK_DUMP` walks real submitted F3DEX2 command
-   graphs by task index (`docs/FAST-LOOP.md`), and ROADMAP R6 diffed two real
-   tasks (4149/4289) down to triangle counts.
-5. **EEPROM** (5 shims, ABSENT) — save-game backing store. Not proven
+2. **EEPROM** (5 shims, ABSENT) — save-game backing store. Not proven
    load-bearing by any boot rung yet (boot doesn't touch saves), but every
    AKI title uses EEPROM for save data and OoT uses it too (or Flash,
    ROM-dependent) — will surface once boot reaches menu/attract-mode
    persistence checks.
-6. **Flash** (13 shims, ABSENT) — same save-data role as EEPROM but for
+3. **Flash** (13 shims, ABSENT) — same save-data role as EEPROM but for
    cartridges wired to Flash instead (largest single-subsystem gap by shim
    count, 13). Game-specific which of EEPROM/Flash a given ROM's
    `profile.toml` needs — check each game's save-type byte before assuming
    both are required.
-7. **Controller Pak / PFS** (7 shims, ABSENT) — deeper save-data tier
+4. **Controller Pak / PFS** (7 shims, ABSENT) — deeper save-data tier
    (memory card file access) than EEPROM/Flash; lower priority than both
    since it requires a Controller Pak to be "inserted," an optional path
    most titles gate behind a menu, not boot.
-8. **Rumble Pak** (4 shims, ABSENT) — cosmetic/optional; no boot or core
+5. **Rumble Pak** (4 shims, ABSENT) — cosmetic/optional; no boot or core
    gameplay path depends on it. Lowest priority of the "real accessory"
    subsystems.
-9. **Voice/ISV debug family** (9 shims, ABSENT) — debug-hardware-only
+6. **Voice/ISV debug family** (9 shims, ABSENT) — debug-hardware-only
    (ISV64 dev unit); no shipping game path calls into this on real
    hardware. Correctly deprioritized to the bottom — likely never needed for
    any of the 3 target games.
-10. **Remaining core/OS stragglers** (`osGetThreadId`/`osStopThread`/
+7. **Remaining core/OS stragglers** (`osGetThreadId`/`osStopThread`/
     `osDestroyThread`/`osJamMesg`/`osGetTime`/`osSetTime`/`osStopTimer`/
     cache-management family/ISV hardware-check family/64-bit division
     helpers, ~20 shims, ABSENT) — none proven load-bearing by any boot rung
