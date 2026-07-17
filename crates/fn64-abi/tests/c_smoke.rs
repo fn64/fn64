@@ -35,10 +35,11 @@ fn find_staticlib() -> PathBuf {
     // `cargo nextest` builds only the test binaries -- so under nextest the
     // staticlib may not exist yet. Build it explicitly (idempotent, cached)
     // so the test is runner-agnostic instead of assuming cargo test's layout.
-    let status = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-        .args(["build", "-p", "fn64-abi"])
-        .status()
-        .expect("spawn cargo build -p fn64-abi for the staticlib");
+    let status =
+        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args(["build", "-p", "fn64-abi"])
+            .status()
+            .expect("spawn cargo build -p fn64-abi for the staticlib");
     assert!(status.success(), "cargo build -p fn64-abi failed");
     for dir in [deps_dir, profile_dir] {
         let candidate = dir.join("libfn64_abi.a");

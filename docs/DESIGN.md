@@ -62,6 +62,10 @@ adapter, generated `recomp_entrypoint` declaration, and the one RDRAM
 allocation sized for physical RDRAM plus the raw MMIO/KSEG1 window. Which
 sections begin resident and all input/save/render/audio policy remain local
 to each harness because those choices differ by game and host.
+The allocation API requires a typed `TvType` (`Pal`/`Ntsc`/`Mpal`) and writes
+the IPL-owned `osTvType` boot global before thread 0 runs. A zero-filled buffer
+is not valid console boot state: generated initialization reads this global to
+choose region-dependent VI/audio parameters before any ABI shim can repair it.
 
 `fn64-shell` depends on `fn64-abi`, `fn64-runtime`, and `fn64-rt64`. It owns
 the parts every recompiled game needs but that aren't part of the libultra
@@ -69,6 +73,14 @@ ABI surface itself: windowing, input device polling, audio output backend,
 loading a user's own locally-recompiled ROM output (per `README.md`'s "no
 game content in this repo" rule -- the shell is where a user's own build
 artifacts get linked/loaded, never anything checked into fn64).
+
+The shell's audio backend keeps two clocks and two queue views explicit. AI
+DMA buffers arrive at the true DAC rate returned by `osAiSetFrequency`; cpal
+may run at a different device rate and resamples at that boundary. `AI_LEN`
+reports only the current emulated DMA. The host output prebuffer is separate,
+starts after two AI DMAs are queued, and exists only to absorb callback jitter;
+letting its depth leak into `AI_LEN` would make guest buffer sizing depend on
+host latency rather than N64 hardware state.
 
 `fn64-rt64` depends on `fn64-runtime` (for the shared types the gfx task
 handoff needs to name -- e.g. an rdram-relative address newtype, task
@@ -740,16 +752,15 @@ available under this architecture.
 
 ### rdram buffer ownership
 
-The 8briefly MB (or however large the target console's RDRAM is configured;
-N64 = 4/8 MB) `rdram` buffer is owned by exactly one place: `fn64-runtime`'s
-`Rdram` type, a single heap allocation (`Box<[u8]>` sized at emulated RDRAM
-capacity) created once at boot and never resized or moved. Every consumer —
-`fn64-abi` shims, the executor, `fn64-rt64`'s gfx task marshalling — borrows
-it, never owns a copy or a second allocation. This matches the ABI contract
-directly: every `RECOMP_FUNC`/`_recomp` shim receives `uint8_t* rdram` as an
-argument (per `ABI-SURFACE.md`'s function-signature evidence throughout
-section (a)/(c)), i.e. the generated C's own contract is "one buffer,
-passed by reference to everyone," not "each caller has its own view."
+The 8 MB (or however large the target console's RDRAM is configured; N64 =
+4/8 MB) `rdram` buffer is one stable allocation created by
+`fn64-boot-harness::new_rdram(TvType)` and owned by the process harness for the whole
+guest lifetime. `fn64-runtime::Rdram` owns the same layout in isolated core
+tests and runtime-only configurations. Every consumer — `fn64-abi` shims, the
+executor, and render task marshalling — borrows that one allocation; no
+consumer makes a translated framebuffer/DMA copy and later treats it as
+RDRAM. This matches the ABI contract directly: every `RECOMP_FUNC`/`_recomp`
+shim receives the same `uint8_t* rdram` argument.
 
 ### The `MEM_*` accessor contract
 
@@ -767,14 +778,28 @@ save-state code) must reproduce exactly:
 | `MEM_BU` | u8 | `offset ^ 3` | zero-extended |
 
 The byte-lane XOR is real, load-bearing big-endian behavior (N64 MIPS is
-big-endian; host rdram storage here is a flat little-endian-addressed byte
-array, so a sub-word read/write must correct for lane order) — not a bug
-to "simplify away." `fn64-runtime` exposes this as typed methods on `Rdram`
-(`read_w`/`read_h`/`read_b`/`read_hu`/`read_bu` and the `write_*` mirrors),
-each one a direct, tested transcription of the table above, so `fn64-abi`
-code (and any future diagnostic tooling) never hand-rolls the XOR/sign-
-extension math at a second call site — one correct implementation, reused,
-matching the "mechanism over patch" rule in `AGENTS.md`.
+big-endian; host RDRAM storage is native-endian by 32-bit word, so sub-word
+access corrects the lane) — not a bug to "simplify away." The N64Recomp ABI
+shape requires a little-endian host; `rdram.rs` rejects other targets at
+compile time instead of pretending the native-endian dereferences plus XORs
+are portable there.
+
+`fn64-runtime` is the sole owner of the mapping:
+
+- `RdramView` / `RdramViewMut` borrow a sized storage slice and accept only
+  logical `RdramAddr`s. Host adapters, framebuffer conversion, diagnostics,
+  and device bulk copies use these safe views.
+- `RdramPtr` is the deliberately unsafe form for `_recomp` shims whose C ABI
+  supplies a raw pointer but no length. It centralizes the same mapping while
+  making the missing bounds proof explicit at construction/access.
+- Owning `Rdram` methods delegate to the views; DMA, controller structs,
+  audio PCM, both framebuffer capture paths, and the ReferenceBackend writer
+  therefore exercise one implementation.
+
+`scripts/lint-rdram-layout.py` sweeps production Rust for a hand-written
+`^2`/`^3`, raw indexed RDRAM write, or raw-pointer RDRAM write outside
+`rdram.rs`. Its self-test includes the former flat-big-endian framebuffer
+writer, so the regression shape is mechanically rejected before a live boot.
 
 ### `RdramAddr` newtype
 
@@ -802,12 +827,12 @@ impl RdramAddr {
 }
 ```
 
-Every rdram-touching API in `fn64-runtime` (queue buffers, DMA targets,
-the diagnostic hooks below) takes `RdramAddr`, never a bare `u32`/`u64` —
-this is the "types before audits" rule from `AGENTS.md` applied directly:
-an invariant (correct KSEG0 translation) that could be silently gotten
-wrong at any of dozens of call sites is instead computed once, in one
-constructor, and every other call site's type signature makes bypassing it
+Every layout-aware RDRAM API in `fn64-runtime` takes `RdramAddr`, never a bare
+`u32`/`u64`; only allocation sizing and raw-storage construction operate on
+host integers/slices. This is the "types before audits" rule from `AGENTS.md`
+applied directly: an invariant (correct KSEG0 translation) that could be
+silently gotten wrong at any of dozens of call sites is instead computed once,
+in one constructor, and every other call site's type signature makes bypassing it
 impossible.
 
 ### First-class watch/diagnostic hooks

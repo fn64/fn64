@@ -52,11 +52,7 @@ fn build_fixture_rdram() -> (Vec<u8>, u32) {
 /// A stable, human-readable digest of a rendered framebuffer. Deterministic
 /// per render, so a regression is a visible one-line diff in the snapshot.
 fn framebuffer_digest(fb: &fn64_render_rt64::raster::Framebuffer, clear: [u8; 4]) -> String {
-    let non_clear = fb
-        .pixels
-        .chunks_exact(4)
-        .filter(|px| *px != clear)
-        .count();
+    let non_clear = fb.pixels.chunks_exact(4).filter(|px| *px != clear).count();
     // FNV-1a over the pixels — a stable content hash without pulling a crate.
     let mut hash: u64 = 0xcbf29ce484222325;
     for &b in &fb.pixels {
@@ -94,7 +90,10 @@ fn fixture_triangle_render_digest_snapshot() {
     // Guard against a degenerate fixture: a blank frame must FAIL loudly, never
     // be snapshotted as green emptiness (weak-check anti-pattern).
     let non_clear = fb.pixels.chunks_exact(4).filter(|px| *px != clear).count();
-    assert!(non_clear > 0, "fixture rendered a blank frame -- fixture is broken, not a valid snapshot");
+    assert!(
+        non_clear > 0,
+        "fixture rendered a blank frame -- fixture is broken, not a valid snapshot"
+    );
 
     // The reviewable golden: `cargo insta review` blesses an intentional
     // render change; a regression fails with a one-line digest diff.

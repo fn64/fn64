@@ -217,12 +217,16 @@ fn process_task_writes_rgba5551_framebuffer_to_output_addr() {
     //    green triangle color (r5=0,g5=31,b5=0,a1=1 -> 0x07C1). No pixel is
     //    all-zero (which would mean nothing was written) and none has a
     //    byte-swapped encoding.
-    let fb_bytes = &rdram[OUTPUT_ADDR..OUTPUT_ADDR + (W * H * 2) as usize];
+    let fb = fn64_runtime::RdramView::from_storage(&rdram);
+    let fb_start = fn64_runtime::RdramAddr::from_offset(OUTPUT_ADDR as u32);
     let mut saw_clear = false;
     let mut saw_green = false;
-    for chunk in fb_bytes.chunks_exact(2) {
-        // Read back exactly the way the VI/harness does: big-endian halfword.
-        let px = u16::from_be_bytes([chunk[0], chunk[1]]);
+    for index in 0..(W * H) {
+        let px = fb.read_u16(
+            fb_start
+                .checked_add(index * 2)
+                .expect("fixture framebuffer logical address overflow"),
+        );
         match px {
             0xF801 => saw_clear = true,
             0x07C1 => saw_green = true,

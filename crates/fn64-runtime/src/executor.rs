@@ -771,6 +771,20 @@ impl Executor {
         self.pick_next()
     }
 
+    /// Priority of the thread the next [`run_one_step`](Self::run_one_step)
+    /// will resume. Host drivers use this to recognize the libultra idle
+    /// thread as quiescence instead of burning an arbitrary scheduling-step
+    /// budget repeatedly resuming its voluntary-yield loop.
+    pub fn peek_next_priority(&self) -> Option<Priority> {
+        let id = self.pick_next()?;
+        Some(
+            self.threads
+                .get(&id)
+                .expect("run queue had stale id")
+                .priority,
+        )
+    }
+
     /// Run exactly one scheduling step: pick the highest-priority runnable
     /// thread and resume it until it yields or finishes, handling the
     /// yield's semantics (pause_self / blocking send / blocking recv)
@@ -1081,6 +1095,22 @@ mod tests {
         i32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
     }
 
+    #[test]
+    fn peek_next_priority_distinguishes_work_from_the_idle_thread() {
+        let mut exec = Executor::new();
+        exec.create_thread(1, crate::thread::OS_PRIORITY_IDLE, |_yielder, _resume| {});
+        exec.create_thread(2, 10, |_yielder, _resume| {});
+        exec.start_thread(1);
+        exec.start_thread(2);
+
+        assert_eq!(exec.peek_next_priority(), Some(10));
+        assert!(exec.run_one_step());
+        assert_eq!(
+            exec.peek_next_priority(),
+            Some(crate::thread::OS_PRIORITY_IDLE)
+        );
+    }
+
     /// Regression: the guest's rdram `OSMesgQueue` struct
     /// (`validCount`@0x08, `first`@0x0C, `msgCount`@0x10) MUST be kept in
     /// sync with the executor's authoritative `MesgQueue` after creation and
@@ -1120,17 +1150,18 @@ mod tests {
         // receiver), then confirm validCount tracked each enqueue -- 3, a
         // value distinct from 0 (empty) and 5 (full).
         for msg in [0x11u32, 0x22, 0x33] {
-            exec.inject_event(ExternalEvent::DirectPost {
-                queue_addr: q,
-                msg,
-            });
+            exec.inject_event(ExternalEvent::DirectPost { queue_addr: q, msg });
         }
         assert_eq!(
             read_i32(&rdram, base + 0x08),
             3,
             "validCount MUST mirror the 3 enqueued messages (so MQ_GET_COUNT/MQ_IS_FULL are correct)"
         );
-        assert_eq!(read_i32(&rdram, base + 0x10), CAPACITY as i32, "msgCount stays capacity");
+        assert_eq!(
+            read_i32(&rdram, base + 0x10),
+            CAPACITY as i32,
+            "msgCount stays capacity"
+        );
         // MQ_IS_FULL semantics the guest computes: validCount >= msgCount.
         assert!(
             read_i32(&rdram, base + 0x08) < read_i32(&rdram, base + 0x10),
@@ -1173,7 +1204,11 @@ mod tests {
 
         // The lazy install must be genuinely zero-capacity, so it can never
         // silently accept a message a real bzero'd queue would have rejected.
-        assert_eq!(exec.queue_capacity(q), 0, "untracked queue must be zero-capacity");
+        assert_eq!(
+            exec.queue_capacity(q),
+            0,
+            "untracked queue must be zero-capacity"
+        );
     }
 
     /// Without a registered rdram base (unit-test executors that never boot a

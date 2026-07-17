@@ -174,7 +174,11 @@ pub fn dword_alu(ctx: &mut RecompContext, mem: &mut Rdram) {
                 // 0x80100018: Daddiu { rt: 14, rs: 4, imm: 256 }
                 ctx.set_r(14, (ctx.r_u64(4)).wrapping_add(256i64 as u64));
                 // 0x8010001C: Dmult { rs: 4, rt: 5 }
-                { let p = (ctx.r_s64(4) as i128) * (ctx.r_s64(5) as i128); ctx.lo = p as u64; ctx.hi = (p >> 64) as u64; }
+                {
+                    let p = (ctx.r_s64(4) as i128) * (ctx.r_s64(5) as i128);
+                    ctx.lo = p as u64;
+                    ctx.hi = (p >> 64) as u64;
+                }
                 // 0x80100020: Mflo { rd: 15 }
                 ctx.set_r(15, ctx.lo);
                 // 0x80100024: Ddiv { rs: 4, rt: 5 }
@@ -232,11 +236,25 @@ pub fn dword_mem(ctx: &mut RecompContext, mem: &mut Rdram) {
                 // 0x80200020: Sdr { rt: 8, base: 4, off: 39 }
                 mem.store_dr(Rdram::eff_addr(ctx.r(4), 39), ctx.r_u64(8));
                 // 0x80200024: Lld { rt: 12, base: 4, off: 40 }
-                { let a = Rdram::eff_addr(ctx.r(4), 40); let v = mem.load_d(a); ctx.set_r(12, v); ctx.set_ll_reservation(a, 8); }
+                {
+                    let a = Rdram::eff_addr(ctx.r(4), 40);
+                    let v = mem.load_d(a);
+                    ctx.set_r(12, v);
+                    ctx.set_ll_reservation(a, 8);
+                }
                 // 0x80200028: Daddiu { rt: 12, rs: 12, imm: 1 }
                 ctx.set_r(12, (ctx.r_u64(12)).wrapping_add(1i64 as u64));
                 // 0x8020002C: Scd { rt: 12, base: 4, off: 40 }
-                { let a = Rdram::eff_addr(ctx.r(4), 40); let v = ctx.r_u64(12); if ctx.take_ll_reservation(a, 8) { mem.store_d(a, v); ctx.set_r(12, 1); } else { ctx.set_r(12, 0); } }
+                {
+                    let a = Rdram::eff_addr(ctx.r(4), 40);
+                    let v = ctx.r_u64(12);
+                    if ctx.take_ll_reservation(a, 8) {
+                        mem.store_d(a, v);
+                        ctx.set_r(12, 1);
+                    } else {
+                        ctx.set_r(12, 0);
+                    }
+                }
                 // 0x80200030: Jr { rs: 31 }
                 // delay: 0x80200034: Nop
                 // nop
@@ -254,11 +272,19 @@ pub fn dword_alu2(ctx: &mut RecompContext, mem: &mut Rdram) {
         match pc {
             0x80300000 => {
                 // 0x80300000: Dmultu { rs: 4, rt: 5 }
-                { let p = (ctx.r_u64(4) as u128) * (ctx.r_u64(5) as u128); ctx.lo = p as u64; ctx.hi = (p >> 64) as u64; }
+                {
+                    let p = (ctx.r_u64(4) as u128) * (ctx.r_u64(5) as u128);
+                    ctx.lo = p as u64;
+                    ctx.hi = (p >> 64) as u64;
+                }
                 // 0x80300004: Mflo { rd: 8 }
                 ctx.set_r(8, ctx.lo);
                 // 0x80300008: Dmultu { rs: 4, rt: 5 }
-                { let p = (ctx.r_u64(4) as u128) * (ctx.r_u64(5) as u128); ctx.lo = p as u64; ctx.hi = (p >> 64) as u64; }
+                {
+                    let p = (ctx.r_u64(4) as u128) * (ctx.r_u64(5) as u128);
+                    ctx.lo = p as u64;
+                    ctx.hi = (p >> 64) as u64;
+                }
                 // 0x8030000C: Mfhi { rd: 9 }
                 ctx.set_r(9, ctx.hi);
                 // 0x80300010: Ddivu { rs: 4, rt: 5 }
@@ -465,7 +491,11 @@ fn emitter_output_matches_goldens() {
     use fn64_recomp_rs::{emit_function, FuncInput};
     let norm = |s: &str| s.trim_end().replace("\r\n", "\n");
 
-    let alu = emit_function(&FuncInput { name: "dword_alu", vram: ALU_VRAM, words: &ALU_WORDS });
+    let alu = emit_function(&FuncInput {
+        name: "dword_alu",
+        vram: ALU_VRAM,
+        words: &ALU_WORDS,
+    });
     assert_eq!(
         norm(&alu),
         norm(include_str!("goldens/dword_alu.rs")),
@@ -473,7 +503,11 @@ fn emitter_output_matches_goldens() {
          AND the pasted `dword_alu` fn together"
     );
 
-    let mem = emit_function(&FuncInput { name: "dword_mem", vram: MEM_VRAM, words: &MEM_WORDS });
+    let mem = emit_function(&FuncInput {
+        name: "dword_mem",
+        vram: MEM_VRAM,
+        words: &MEM_WORDS,
+    });
     assert_eq!(
         norm(&mem),
         norm(include_str!("goldens/dword_mem.rs")),
@@ -481,7 +515,11 @@ fn emitter_output_matches_goldens() {
          AND the pasted `dword_mem` fn together"
     );
 
-    let alu2 = emit_function(&FuncInput { name: "dword_alu2", vram: ALU2_VRAM, words: &ALU2_WORDS });
+    let alu2 = emit_function(&FuncInput {
+        name: "dword_alu2",
+        vram: ALU2_VRAM,
+        words: &ALU2_WORDS,
+    });
     assert_eq!(
         norm(&alu2),
         norm(include_str!("goldens/dword_alu2.rs")),
@@ -502,15 +540,15 @@ fn dword_alu_matches_oracle() {
     let samples: [u64; 12] = [
         0,
         1,
-        0xFFFF_FFFF_FFFF_FFFF,   // -1
-        0x8000_0000_0000_0000,   // INT64_MIN
-        0x7FFF_FFFF_FFFF_FFFF,   // INT64_MAX
-        0x0000_0001_0000_0000,   // > u32, positive
-        0xFFFF_FFFF_8000_0000,   // sign-extended INT32_MIN
+        0xFFFF_FFFF_FFFF_FFFF, // -1
+        0x8000_0000_0000_0000, // INT64_MIN
+        0x7FFF_FFFF_FFFF_FFFF, // INT64_MAX
+        0x0000_0001_0000_0000, // > u32, positive
+        0xFFFF_FFFF_8000_0000, // sign-extended INT32_MIN
         0x1234_5678_9ABC_DEF0,
         0xDEAD_BEEF_CAFE_BABE,
         42,
-        0x0000_0000_8000_0000,   // +2^31 (NOT negative in 64-bit)
+        0x0000_0000_8000_0000, // +2^31 (NOT negative in 64-bit)
         0xAAAA_AAAA_AAAA_AAAA,
     ];
 
@@ -633,25 +671,116 @@ fn dword_mem_matches_oracle() {
 
 #[test]
 fn decode_dword_alu_register() {
-    assert_eq!(decode(0x0085402d), Instruction::Daddu { rd: 8, rs: 4, rt: 5 });
-    assert_eq!(decode(0x0085482f), Instruction::Dsubu { rd: 9, rs: 4, rt: 5 });
+    assert_eq!(
+        decode(0x0085402d),
+        Instruction::Daddu {
+            rd: 8,
+            rs: 4,
+            rt: 5
+        }
+    );
+    assert_eq!(
+        decode(0x0085482f),
+        Instruction::Dsubu {
+            rd: 9,
+            rs: 4,
+            rt: 5
+        }
+    );
     // dadd/dsub (the trapping twins): funct 0x2C/0x2E.
-    assert_eq!(decode(0x0085102c), Instruction::Dadd { rd: 2, rs: 4, rt: 5 });
-    assert_eq!(decode(0x0085102e), Instruction::Dsub { rd: 2, rs: 4, rt: 5 });
+    assert_eq!(
+        decode(0x0085102c),
+        Instruction::Dadd {
+            rd: 2,
+            rs: 4,
+            rt: 5
+        }
+    );
+    assert_eq!(
+        decode(0x0085102e),
+        Instruction::Dsub {
+            rd: 2,
+            rs: 4,
+            rt: 5
+        }
+    );
 }
 
 #[test]
 fn decode_dword_shifts() {
-    assert_eq!(decode(0x000450f8), Instruction::Dsll { rd: 10, rt: 4, sa: 3 });
-    assert_eq!(decode(0x000558bb), Instruction::Dsra { rd: 11, rt: 5, sa: 2 });
-    assert_eq!(decode(0x0004613e), Instruction::Dsrl32 { rd: 12, rt: 4, sa: 4 });
-    assert_eq!(decode(0x00856814), Instruction::Dsllv { rd: 13, rt: 5, rs: 4 });
+    assert_eq!(
+        decode(0x000450f8),
+        Instruction::Dsll {
+            rd: 10,
+            rt: 4,
+            sa: 3
+        }
+    );
+    assert_eq!(
+        decode(0x000558bb),
+        Instruction::Dsra {
+            rd: 11,
+            rt: 5,
+            sa: 2
+        }
+    );
+    assert_eq!(
+        decode(0x0004613e),
+        Instruction::Dsrl32 {
+            rd: 12,
+            rt: 4,
+            sa: 4
+        }
+    );
+    assert_eq!(
+        decode(0x00856814),
+        Instruction::Dsllv {
+            rd: 13,
+            rt: 5,
+            rs: 4
+        }
+    );
     // dsrl/dsra/dsll32/dsra32/dsrlv/dsrav spot checks.
-    assert_eq!(decode(0x000410fa), Instruction::Dsrl { rd: 2, rt: 4, sa: 3 }); // dsrl v0,a0,3
-    assert_eq!(decode(0x000410fc), Instruction::Dsll32 { rd: 2, rt: 4, sa: 3 }); // dsll32 v0,a0,3
-    assert_eq!(decode(0x000410ff), Instruction::Dsra32 { rd: 2, rt: 4, sa: 3 }); // dsra32 v0,a0,3
-    assert_eq!(decode(0x00a41016), Instruction::Dsrlv { rd: 2, rt: 4, rs: 5 }); // dsrlv v0,a0,a1
-    assert_eq!(decode(0x00a41017), Instruction::Dsrav { rd: 2, rt: 4, rs: 5 }); // dsrav v0,a0,a1
+    assert_eq!(
+        decode(0x000410fa),
+        Instruction::Dsrl {
+            rd: 2,
+            rt: 4,
+            sa: 3
+        }
+    ); // dsrl v0,a0,3
+    assert_eq!(
+        decode(0x000410fc),
+        Instruction::Dsll32 {
+            rd: 2,
+            rt: 4,
+            sa: 3
+        }
+    ); // dsll32 v0,a0,3
+    assert_eq!(
+        decode(0x000410ff),
+        Instruction::Dsra32 {
+            rd: 2,
+            rt: 4,
+            sa: 3
+        }
+    ); // dsra32 v0,a0,3
+    assert_eq!(
+        decode(0x00a41016),
+        Instruction::Dsrlv {
+            rd: 2,
+            rt: 4,
+            rs: 5
+        }
+    ); // dsrlv v0,a0,a1
+    assert_eq!(
+        decode(0x00a41017),
+        Instruction::Dsrav {
+            rd: 2,
+            rt: 4,
+            rs: 5
+        }
+    ); // dsrav v0,a0,a1
 }
 
 #[test]
@@ -660,31 +789,119 @@ fn decode_dword_muldiv_and_immediate() {
     assert_eq!(decode(0x0085001d), Instruction::Dmultu { rs: 4, rt: 5 });
     assert_eq!(decode(0x0085001e), Instruction::Ddiv { rs: 4, rt: 5 });
     assert_eq!(decode(0x0085001f), Instruction::Ddivu { rs: 4, rt: 5 });
-    assert_eq!(decode(0x648e0100), Instruction::Daddiu { rt: 14, rs: 4, imm: 256 });
+    assert_eq!(
+        decode(0x648e0100),
+        Instruction::Daddiu {
+            rt: 14,
+            rs: 4,
+            imm: 256
+        }
+    );
     // daddi opcode 0x18: daddi v0,a0,0x32.
-    assert_eq!(decode(0x60820032), Instruction::Daddi { rt: 2, rs: 4, imm: 0x32 });
+    assert_eq!(
+        decode(0x60820032),
+        Instruction::Daddi {
+            rt: 2,
+            rs: 4,
+            imm: 0x32
+        }
+    );
     // negative immediate sign-extends.
-    assert_eq!(decode(0x6482ffff), Instruction::Daddiu { rt: 2, rs: 4, imm: -1 });
+    assert_eq!(
+        decode(0x6482ffff),
+        Instruction::Daddiu {
+            rt: 2,
+            rs: 4,
+            imm: -1
+        }
+    );
 }
 
 #[test]
 fn decode_dword_memory() {
-    assert_eq!(decode(0xdc880000), Instruction::Ld { rt: 8, base: 4, off: 0 });
-    assert_eq!(decode(0xfc8a0010), Instruction::Sd { rt: 10, base: 4, off: 16 });
-    assert_eq!(decode(0x688b0003), Instruction::Ldl { rt: 11, base: 4, off: 3 });
-    assert_eq!(decode(0x6c8b000a), Instruction::Ldr { rt: 11, base: 4, off: 10 });
-    assert_eq!(decode(0xb0880020), Instruction::Sdl { rt: 8, base: 4, off: 32 });
-    assert_eq!(decode(0xb4880027), Instruction::Sdr { rt: 8, base: 4, off: 39 });
-    assert_eq!(decode(0xd08c0028), Instruction::Lld { rt: 12, base: 4, off: 40 });
-    assert_eq!(decode(0xf08c0028), Instruction::Scd { rt: 12, base: 4, off: 40 });
+    assert_eq!(
+        decode(0xdc880000),
+        Instruction::Ld {
+            rt: 8,
+            base: 4,
+            off: 0
+        }
+    );
+    assert_eq!(
+        decode(0xfc8a0010),
+        Instruction::Sd {
+            rt: 10,
+            base: 4,
+            off: 16
+        }
+    );
+    assert_eq!(
+        decode(0x688b0003),
+        Instruction::Ldl {
+            rt: 11,
+            base: 4,
+            off: 3
+        }
+    );
+    assert_eq!(
+        decode(0x6c8b000a),
+        Instruction::Ldr {
+            rt: 11,
+            base: 4,
+            off: 10
+        }
+    );
+    assert_eq!(
+        decode(0xb0880020),
+        Instruction::Sdl {
+            rt: 8,
+            base: 4,
+            off: 32
+        }
+    );
+    assert_eq!(
+        decode(0xb4880027),
+        Instruction::Sdr {
+            rt: 8,
+            base: 4,
+            off: 39
+        }
+    );
+    assert_eq!(
+        decode(0xd08c0028),
+        Instruction::Lld {
+            rt: 12,
+            base: 4,
+            off: 40
+        }
+    );
+    assert_eq!(
+        decode(0xf08c0028),
+        Instruction::Scd {
+            rt: 12,
+            base: 4,
+            off: 40
+        }
+    );
     // negative offset sign-extends.
-    assert_eq!(decode(0xdc82fff8), Instruction::Ld { rt: 2, base: 4, off: -8 });
+    assert_eq!(
+        decode(0xdc82fff8),
+        Instruction::Ld {
+            rt: 2,
+            base: 4,
+            off: -8
+        }
+    );
 }
 
 /// None of the doubleword ops has a delay slot (they are all ALU/memory ops).
 #[test]
 fn dword_ops_have_no_delay_slot() {
-    for &w in ALU_WORDS.iter().chain(MEM_WORDS.iter()).chain(ALU2_WORDS.iter()) {
+    for &w in ALU_WORDS
+        .iter()
+        .chain(MEM_WORDS.iter())
+        .chain(ALU2_WORDS.iter())
+    {
         let instr = decode(w);
         if matches!(instr, Instruction::Jr { .. } | Instruction::Nop) {
             continue;

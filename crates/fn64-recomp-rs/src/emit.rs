@@ -161,10 +161,7 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
         base,
         words.len()
     );
-    let _ = writeln!(
-        out,
-        "// Emitted by fn64-recomp-rs (typed Rust, no unsafe)."
-    );
+    let _ = writeln!(out, "// Emitted by fn64-recomp-rs (typed Rust, no unsafe).");
     // A leaf function may not touch memory (or, degenerately, registers); the
     // fixed ABI signature keeps both params, so allow the unused-var lint per
     // function rather than second-guessing which params a body references.

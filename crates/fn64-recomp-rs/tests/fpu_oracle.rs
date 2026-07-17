@@ -83,7 +83,11 @@ pub fn truncf_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
         match pc {
             0x800CD930 => {
                 // 0x800CD930: TruncWS { fd: 12, fs: 12 }
-                { let v = ctx.f_s(12) as f64; let r = ctx.fpu_to_i32(v, Some(1)); ctx.set_f_bits(12, r as u32); }
+                {
+                    let v = ctx.f_s(12) as f64;
+                    let r = ctx.fpu_to_i32(v, Some(1));
+                    ctx.set_f_bits(12, r as u32);
+                }
                 // 0x800CD934: Jr { rs: 31 }
                 // delay: 0x800CD938: CvtSW { fd: 0, fs: 12 }
                 ctx.set_f_s(0, (ctx.f_bits(12) as i32) as f32);
@@ -99,7 +103,11 @@ pub fn truncf_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
 /// the executed code stays honest.
 #[test]
 fn truncf_emitter_output_matches_pasted_function() {
-    let input = FuncInput { name: "truncf_recomp", vram: TRUNCF_VRAM, words: &TRUNCF_WORDS };
+    let input = FuncInput {
+        name: "truncf_recomp",
+        vram: TRUNCF_VRAM,
+        words: &TRUNCF_WORDS,
+    };
     let emitted = emit_function(&input);
     let pasted = include_str!("goldens/truncf.rs");
     let norm = |s: &str| s.trim_end().replace("\r\n", "\n");
@@ -116,8 +124,8 @@ fn truncf_emitter_output_matches_pasted_function() {
 #[test]
 fn truncf_matches_c_oracle() {
     let inputs: [f32; 16] = [
-        0.0, -0.0, 0.4, 0.5, 0.6, 1.5, -0.4, -0.5, -0.6, -1.5, 2.9, -2.9, 100.0, -100.0,
-        123456.75, -123456.75,
+        0.0, -0.0, 0.4, 0.5, 0.6, 1.5, -0.4, -0.5, -0.6, -1.5, 2.9, -2.9, 100.0, -100.0, 123456.75,
+        -123456.75,
     ];
     for &x in &inputs {
         let mut mem_buf = vec![0u8; 64];
@@ -196,7 +204,10 @@ fn synth_matches_oracle() {
         let (exp_v0, exp_f0, exp_store) = synth_oracle(a0, in_val);
         assert_eq!(out.v0, exp_v0, "v0 mismatch for a0={a0}, in={in_val}");
         assert_eq!(out.f0, exp_f0, "f0 mismatch for a0={a0}, in={in_val}");
-        assert_eq!(out.stored, exp_store, "store mismatch for a0={a0}, in={in_val}");
+        assert_eq!(
+            out.stored, exp_store,
+            "store mismatch for a0={a0}, in={in_val}"
+        );
     }
 }
 
@@ -274,11 +285,19 @@ pub fn synth_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
 /// pasted body byte-for-byte.
 #[test]
 fn synth_emitter_output_matches_golden() {
-    let input = FuncInput { name: "synth_recomp", vram: SYNTH_VRAM, words: &SYNTH_WORDS };
+    let input = FuncInput {
+        name: "synth_recomp",
+        vram: SYNTH_VRAM,
+        words: &SYNTH_WORDS,
+    };
     let emitted = emit_function(&input);
     let pasted = include_str!("goldens/synth.rs");
     let norm = |s: &str| s.trim_end().replace("\r\n", "\n");
-    assert_eq!(norm(&emitted), norm(pasted), "synth emitter output drifted from goldens/synth.rs");
+    assert_eq!(
+        norm(&emitted),
+        norm(pasted),
+        "synth emitter output drifted from goldens/synth.rs"
+    );
 }
 
 // ============================================================================
@@ -406,7 +425,11 @@ fn cross_call_executes_to_expected_fpu_state() {
     // Silence unused-const warnings for the callee word table (it backs the
     // structural expectation of the caller's lookup target).
     let _ = (XCALLEE_WORDS, XCALLEE_VRAM);
-    let _ = emit_function(&FuncInput { name: "xcallee", vram: XCALLEE_VRAM, words: &XCALLEE_WORDS });
+    let _ = emit_function(&FuncInput {
+        name: "xcallee",
+        vram: XCALLEE_VRAM,
+        words: &XCALLEE_WORDS,
+    });
 }
 
 // ============================================================================
@@ -423,15 +446,27 @@ fn fr0_odd_single_aliases_even_partner_high_word() {
     // Write the even double $f4 = a known 64-bit pattern.
     ctx.set_d_bits(4, 0x1122_3344_5566_7788);
     // The even single $f4 reads the LOW word; the odd single $f5 reads the HIGH.
-    assert_eq!(ctx.f_bits(4), 0x5566_7788, "even single = low word of the slot");
-    assert_eq!(ctx.f_bits(5), 0x1122_3344, "odd single = high word of the even partner");
+    assert_eq!(
+        ctx.f_bits(4),
+        0x5566_7788,
+        "even single = low word of the slot"
+    );
+    assert_eq!(
+        ctx.f_bits(5),
+        0x1122_3344,
+        "odd single = high word of the even partner"
+    );
 
     // Writing the odd single $f5 must land in the HIGH word, leaving the low
     // word (even single $f4) untouched — the mtc1-to-odd case that was the
     // OoT-boot SIGSEGV-at-0x40 in fn64-abi.
     ctx.set_f_bits(5, 0xDEAD_BEEF);
     assert_eq!(ctx.d_bits(4), 0xDEAD_BEEF_5566_7788);
-    assert_eq!(ctx.f_bits(4), 0x5566_7788, "low word preserved by an odd-register write");
+    assert_eq!(
+        ctx.f_bits(4),
+        0x5566_7788,
+        "low word preserved by an odd-register write"
+    );
 }
 
 /// The rounding-mode helpers used by CVT.W/CVT.L must round to nearest, ties to
@@ -471,25 +506,81 @@ fn decode_cop1_moves() {
 #[test]
 fn decode_cop1_loads_stores() {
     // lwc1 $f6, 0($a1)  = 0xC4A60000
-    assert_eq!(decode(0xC4A60000), Instruction::Lwc1 { ft: 6, base: 5, off: 0 });
+    assert_eq!(
+        decode(0xC4A60000),
+        Instruction::Lwc1 {
+            ft: 6,
+            base: 5,
+            off: 0
+        }
+    );
     // swc1 $f0, 0($a2)  = 0xE4C00000
-    assert_eq!(decode(0xE4C00000), Instruction::Swc1 { ft: 0, base: 6, off: 0 });
+    assert_eq!(
+        decode(0xE4C00000),
+        Instruction::Swc1 {
+            ft: 0,
+            base: 6,
+            off: 0
+        }
+    );
     // ldc1 $f4, 0x8($sp) = 0xD7A40008
-    assert_eq!(decode(0xD7A40008), Instruction::Ldc1 { ft: 4, base: 29, off: 8 });
+    assert_eq!(
+        decode(0xD7A40008),
+        Instruction::Ldc1 {
+            ft: 4,
+            base: 29,
+            off: 8
+        }
+    );
     // sdc1 $f20, -0x8($fp) = 0xF7D4FFF8
-    assert_eq!(decode(0xF7D4FFF8), Instruction::Sdc1 { ft: 20, base: 30, off: -8 });
+    assert_eq!(
+        decode(0xF7D4FFF8),
+        Instruction::Sdc1 {
+            ft: 20,
+            base: 30,
+            off: -8
+        }
+    );
 }
 
 #[test]
 fn decode_cop1_single_arith() {
     // add.s $f0, $f2, $f4 = 0x46041000  (fmt=S ft=f4 fs=f2 fd=f0 funct=0)
-    assert_eq!(decode(0x46041000), Instruction::AddS { fd: 0, fs: 2, ft: 4 });
+    assert_eq!(
+        decode(0x46041000),
+        Instruction::AddS {
+            fd: 0,
+            fs: 2,
+            ft: 4
+        }
+    );
     // sub.s $f0, $f2, $f4 = 0x46041001
-    assert_eq!(decode(0x46041001), Instruction::SubS { fd: 0, fs: 2, ft: 4 });
+    assert_eq!(
+        decode(0x46041001),
+        Instruction::SubS {
+            fd: 0,
+            fs: 2,
+            ft: 4
+        }
+    );
     // mul.s $f8, $f4, $f6 = 0x46062202
-    assert_eq!(decode(0x46062202), Instruction::MulS { fd: 8, fs: 4, ft: 6 });
+    assert_eq!(
+        decode(0x46062202),
+        Instruction::MulS {
+            fd: 8,
+            fs: 4,
+            ft: 6
+        }
+    );
     // div.s $f0, $f2, $f4 = 0x46041003
-    assert_eq!(decode(0x46041003), Instruction::DivS { fd: 0, fs: 2, ft: 4 });
+    assert_eq!(
+        decode(0x46041003),
+        Instruction::DivS {
+            fd: 0,
+            fs: 2,
+            ft: 4
+        }
+    );
     // sqrt.s $f0, $f12 = 0x46006004
     assert_eq!(decode(0x46006004), Instruction::SqrtS { fd: 0, fs: 12 });
     // abs.s $f0, $f2 = 0x46001005
@@ -503,9 +594,23 @@ fn decode_cop1_single_arith() {
 #[test]
 fn decode_cop1_double_arith() {
     // add.d $f0, $f2, $f4 = 0x46241000  (fmt=D=0x11)
-    assert_eq!(decode(0x46241000), Instruction::AddD { fd: 0, fs: 2, ft: 4 });
+    assert_eq!(
+        decode(0x46241000),
+        Instruction::AddD {
+            fd: 0,
+            fs: 2,
+            ft: 4
+        }
+    );
     // mul.d $f0, $f2, $f4 = 0x46241002
-    assert_eq!(decode(0x46241002), Instruction::MulD { fd: 0, fs: 2, ft: 4 });
+    assert_eq!(
+        decode(0x46241002),
+        Instruction::MulD {
+            fd: 0,
+            fs: 2,
+            ft: 4
+        }
+    );
     // sqrt.d $f0, $f2 = 0x46201004
     assert_eq!(decode(0x46201004), Instruction::SqrtD { fd: 0, fs: 2 });
     // mov.d $f0, $f2 = 0x46201006
@@ -564,7 +669,7 @@ fn cop1_branch_delay_slot_classification() {
     assert!(decode(0x45030003).is_branch_likely()); // bc1tl
     assert!(decode(0x45020003).is_branch_likely()); // bc1fl
     assert!(!decode(0x45010002).is_branch_likely()); // bc1t is NOT likely
-    // FPU arithmetic has no delay slot.
+                                                     // FPU arithmetic has no delay slot.
     assert!(!decode(0x46062202).has_delay_slot()); // mul.s
     assert!(!decode(0x44842000).has_delay_slot()); // mtc1
 }
@@ -597,8 +702,13 @@ fn floor_ceil_w_decode() {
     // nearbyint  @0x800CD974: round.w.d $f12,$f12 = 0x4620630C.
     assert_eq!(decode(0x4620630C), Instruction::RoundWD { fd: 12, fs: 12 });
     // None of these are `Unknown` any more.
-    for w in [0x4600630F, 0x4600630E, 0x4620630F, 0x4620630E, 0x4600630C, 0x4620630C] {
-        assert!(!matches!(decode(w), Instruction::Unknown { .. }), "word {w:#010X} still Unknown");
+    for w in [
+        0x4600630F, 0x4600630E, 0x4620630F, 0x4620630E, 0x4600630C, 0x4620630C,
+    ] {
+        assert!(
+            !matches!(decode(w), Instruction::Unknown { .. }),
+            "word {w:#010X} still Unknown"
+        );
     }
 }
 
@@ -606,7 +716,11 @@ fn floor_ceil_w_decode() {
 #[test]
 fn floor_ceil_w_emit() {
     let emit1 = |word: u32| -> String {
-        let input = FuncInput { name: "t", vram: 0x8000_0000, words: &[word, 0x03E00008, 0] };
+        let input = FuncInput {
+            name: "t",
+            vram: 0x8000_0000,
+            words: &[word, 0x03E00008, 0],
+        };
         emit_function(&input)
     };
     // Post-merge: FLOOR/CEIL/ROUND.W route through the unified `fpu_to_i32(v,

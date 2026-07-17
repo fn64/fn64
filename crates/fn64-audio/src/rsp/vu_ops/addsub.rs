@@ -206,7 +206,11 @@ mod tests {
         assert_eq!(st.regs.r[1][2], -0x8000, "lane2 vd clamps low");
         // acc_lo is the WRAPPED sum, distinct from vd on every clamped lane.
         assert_eq!(st.acc.read_lo(0), 0xE000, "lane0 acc_lo wraps (not clamp)");
-        assert_eq!(st.acc.read_lo(1), 0x8001, "lane1 acc_lo carries the carry-in");
+        assert_eq!(
+            st.acc.read_lo(1),
+            0x8001,
+            "lane1 acc_lo carries the carry-in"
+        );
         assert_eq!(st.acc.read_lo(2), 0x7FFF, "lane2 acc_lo wraps");
         // Distinguishing assertions: vd != acc_lo on the clamped lanes proves
         // we did NOT green-against-a-truncate bug.
@@ -241,7 +245,7 @@ mod tests {
         // lane2: 0x0001 + 0x0002 = 0x0003 -> low 3, carry 0.
         st.regs.r[2] = [-1i16, -0x8000, 1, 0, 0, 0, 0, 0]; // 0xFFFF, 0x8000, 1
         st.regs.r[3] = [2, -0x8000, 2, 0, 0, 0, 0, 0]; // 2, 0x8000, 2
-        // pre-set an ne bit to confirm VADDC clears it.
+                                                       // pre-set an ne bit to confirm VADDC clears it.
         st.flags.set_vco_ne(0, true);
         vaddc(&mut st, &inv(1, 2, 3, 0));
         assert_eq!(st.regs.r[1][0] as u16, 0x0001, "lane0 truncated low");
@@ -302,7 +306,10 @@ mod tests {
         assert_eq!(st.regs.r[1][2] as u16, 0x7FFF, "lane2 low");
         assert!(st.flags.vco_carry(0), "lane0 borrow (3<5)");
         assert!(!st.flags.vco_carry(1), "lane1 no borrow (equal)");
-        assert!(!st.flags.vco_carry(2), "lane2 no borrow: 0x8000 > 1 UNSIGNED");
+        assert!(
+            !st.flags.vco_carry(2),
+            "lane2 no borrow: 0x8000 > 1 UNSIGNED"
+        );
         assert!(st.flags.vco_ne(0), "lane0 ne (differ)");
         assert!(!st.flags.vco_ne(1), "lane1 not-ne (equal)");
         assert!(st.flags.vco_ne(2), "lane2 ne (differ)");

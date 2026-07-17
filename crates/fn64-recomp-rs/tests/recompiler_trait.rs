@@ -3,9 +3,7 @@
 //! alternative to the N64Recomp adapter (same trait, same `RecompOutput`
 //! shape) and that stub/ignore lists and the ABI-version handshake are honored.
 
-use fn64_recomp::{
-    AbiVersion, Function, Patches, RecompConfig, Recompiler, Section,
-};
+use fn64_recomp::{AbiVersion, Function, Patches, RecompConfig, Recompiler, Section};
 use fn64_recomp_rs::RsRecompiler;
 
 /// Assemble a tiny two-function ROM image and recompile it through the trait.
@@ -44,8 +42,16 @@ fn recompile_produces_typed_rust_module() {
             vram: 0x8000_0000,
             size: rom.len() as u32,
             functions: vec![
-                Function { name: "f_ret".to_string(), vram: 0x8000_0000, size: 0x8 },
-                Function { name: "f_addu".to_string(), vram: 0x8000_0008, size: 0xC },
+                Function {
+                    name: "f_ret".to_string(),
+                    vram: 0x8000_0000,
+                    size: 0x8,
+                },
+                Function {
+                    name: "f_addu".to_string(),
+                    vram: 0x8000_0008,
+                    size: 0xC,
+                },
             ],
         }],
         patches: Patches::default(),
@@ -70,9 +76,18 @@ fn recompile_produces_typed_rust_module() {
     // No `unsafe` blocks/fns and no pointer casts in the generated code. (The
     // banner comment says "no unsafe", so match the keyword usage, not the
     // word.)
-    assert!(!src.contains("unsafe {"), "emitted code must never open an `unsafe` block");
-    assert!(!src.contains("unsafe fn"), "emitted code must never define an `unsafe fn`");
-    assert!(!src.contains("as *"), "emitted code must never cast a pointer");
+    assert!(
+        !src.contains("unsafe {"),
+        "emitted code must never open an `unsafe` block"
+    );
+    assert!(
+        !src.contains("unsafe fn"),
+        "emitted code must never define an `unsafe fn`"
+    );
+    assert!(
+        !src.contains("as *"),
+        "emitted code must never cast a pointer"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -117,10 +132,9 @@ fn stubbed_function_is_skipped() {
     let out = RsRecompiler::default().recompile(&cfg).unwrap();
     assert!(out.recompiled_functions.is_empty());
     assert!(!out.generated_files[0].1.contains("pub fn stubbed"));
-    let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!(
-        "fn64_recomp_rs_stub_{}",
-        std::process::id()
-    )));
+    let _ = std::fs::remove_dir_all(
+        std::env::temp_dir().join(format!("fn64_recomp_rs_stub_{}", std::process::id())),
+    );
 }
 
 /// RSP recompile is out of scope for this CPU recompiler and must decline

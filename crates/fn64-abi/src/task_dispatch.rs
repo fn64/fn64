@@ -39,6 +39,92 @@ fn legacy_env_var_message(old: &str, new: &str) -> String {
     )
 }
 
+const AUDIO_STREAM_DUMP_SECONDS: u64 = 12;
+
+struct AudioStreamDump {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    sample_rate_hz: u32,
+    samples_written: u64,
+    buffers_written: u64,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct AudioTaskDumpState {
+    seen: u64,
+    dumped: bool,
+}
+
+fn dump_audio_pcm_stream(samples: &[i16]) {
+    use std::io::Write as _;
+
+    let Some(path) = std::env::var_os("FN64_DUMP_AUDIO_STREAM_PCM") else {
+        return;
+    };
+    AUDIO_PCM_STREAM_DUMP.with(|cell| {
+        let mut state = cell.borrow_mut();
+        if state.is_none() {
+            let path = std::path::PathBuf::from(path);
+            match std::fs::File::create(&path) {
+                Ok(file) => {
+                    let sample_rate_hz = AUDIO_GUEST_RATE.with(Cell::get);
+                    eprintln!(
+                        "[fn64-abi] capturing up to {AUDIO_STREAM_DUMP_SECONDS}s of pre-resample stereo PCM at {sample_rate_hz} Hz to {path:?}"
+                    );
+                    *state = Some(AudioStreamDump {
+                        file,
+                        path,
+                        sample_rate_hz,
+                        samples_written: 0,
+                        buffers_written: 0,
+                    });
+                }
+                Err(error) => {
+                    eprintln!("[fn64-abi] failed to create streaming PCM dump: {error}");
+                    return;
+                }
+            }
+        }
+
+        let dump = state.as_mut().expect("stream dump initialized above");
+        let max_samples = u64::from(dump.sample_rate_hz)
+            .saturating_mul(2)
+            .saturating_mul(AUDIO_STREAM_DUMP_SECONDS);
+        let remaining = max_samples.saturating_sub(dump.samples_written);
+        let take = usize::try_from(remaining.min(samples.len() as u64)).unwrap_or(samples.len());
+        if take == 0 {
+            return;
+        }
+        let bytes: Vec<u8> = samples[..take]
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        if let Err(error) = dump.file.write_all(&bytes) {
+            eprintln!("[fn64-abi] failed to append streaming PCM dump: {error}");
+            return;
+        }
+        dump.samples_written += take as u64;
+        dump.buffers_written += 1;
+        let meta = format!(
+            "format=s16le\nchannels=2\nsample_rate_hz={}\nsamples={}\nframes={}\nbuffers={}\nseconds={:.6}\n",
+            dump.sample_rate_hz,
+            dump.samples_written,
+            dump.samples_written / 2,
+            dump.buffers_written,
+            dump.samples_written as f64 / 2.0 / f64::from(dump.sample_rate_hz),
+        );
+        if let Err(error) = std::fs::write(dump.path.with_extension("meta"), meta) {
+            eprintln!("[fn64-abi] failed to update streaming PCM metadata: {error}");
+        }
+        if dump.samples_written == max_samples {
+            eprintln!(
+                "[fn64-abi] completed {AUDIO_STREAM_DUMP_SECONDS}s pre-resample PCM capture at {:?}",
+                dump.path
+            );
+        }
+    });
+}
+
 /// Decode fn64's native-word RDRAM representation in guest halfword order and
 /// deliver one real AI DMA buffer to the registered backend.
 ///
@@ -59,23 +145,27 @@ pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: u
         "osAiSetNextBuffer: invalid AI PCM range start={start:#x} bytes={byte_len:#x} rdram_len={rdram_len:#x}"
     );
 
-    // `MEM_H(addr)` reads a native-endian halfword at `(addr ^ 2)`. Apply
-    // that exact byte-lane rule per sample so stereo order is preserved; a
-    // flat chunks_exact(2) walk swaps every adjacent L/R pair in fn64's
-    // native-word backing representation.
     let bytes = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
+    let view = fn64_runtime::RdramView::from_storage(bytes);
+    let start_addr =
+        RdramAddr::from_offset(u32::try_from(start).expect("AI PCM RDRAM start exceeds u32"));
     let samples: Vec<i16> = (0..byte_len)
         .step_by(2)
         .map(|guest_offset| {
-            let physical = (start + guest_offset) ^ 2;
-            i16::from_ne_bytes([bytes[physical], bytes[physical + 1]])
+            view.read_i16(
+                start_addr
+                    .checked_add(
+                        u32::try_from(guest_offset).expect("AI PCM buffer length exceeds u32"),
+                    )
+                    .expect("AI PCM logical address overflow"),
+            )
         })
         .collect();
 
     let nonzero = samples.iter().filter(|&&sample| sample != 0).count() as u64;
     let buffer_min = samples.iter().copied().min();
     let buffer_max = samples.iter().copied().max();
-    AUDIO_OUTPUT_STATS.with(|cell| {
+    let ai_index = AUDIO_OUTPUT_STATS.with(|cell| {
         let mut stats = cell.get();
         stats.ai_buffers += 1;
         stats.samples += samples.len() as u64;
@@ -88,8 +178,19 @@ pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: u
             (Some(a), Some(b)) => Some(a.max(b)),
             (None, value) | (value, None) => value,
         };
+        let ai_index = stats.ai_buffers;
         cell.set(stats);
+        ai_index
     });
+
+    if std::env::var_os("FN64_TRACE_AI_BUFFERS").is_some() {
+        eprintln!(
+            "[fn64-abi] ai_buffer #{ai_index}: start={start:#x} bytes={byte_len:#x} samples={} nonzero={nonzero} range={}..={}",
+            samples.len(),
+            buffer_min.unwrap_or(0),
+            buffer_max.unwrap_or(0),
+        );
+    }
 
     // One-shot evidence hook: write the first non-silent live AI buffer as
     // signed 16-bit little-endian PCM, plus self-describing metadata. Waiting
@@ -131,6 +232,11 @@ pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: u
             });
         }
     }
+
+    // Opt-in bounded evidence across AI-buffer seams. Unlike the one-shot
+    // hook above, this preserves startup silence and joins enough consecutive
+    // DMAs to expose periodic clicks/buzz before host resampling.
+    dump_audio_pcm_stream(&samples);
 
     AUDIO_BACKEND.with(|cell| {
         if let Some(backend) = cell.borrow_mut().as_mut() {
@@ -300,12 +406,27 @@ unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
     // the audio-reset handshake that unblocks Play_Init still completes -- the
     // ucode only produces the actual samples. Use it to iterate on the RENDERER
     // at normal boot speed; a real audio run must NOT set it. No sound when set.
-    // Diagnostic: dump the exact rdram + task offset of the FIRST audio task so
-    // the recompiled ucode can be replayed offline against the real command
-    // list (env `FN64_DUMP_AUDIO_TASK=<path>`). One-shot.
+    // Diagnostic: dump the exact rdram + task offset of one audio task so the
+    // recompiled ucode can be replayed offline against the real command list.
+    // `FN64_DUMP_AUDIO_TASK_INDEX` is one-based and defaults to the first task;
+    // use a later task to capture audible music instead of startup silence.
     if let Some(path) = std::env::var_os("FN64_DUMP_AUDIO_TASK") {
-        AUDIO_TASK_DUMPED.with(|c| {
-            if !c.get() {
+        let target_index = std::env::var("FN64_DUMP_AUDIO_TASK_INDEX")
+            .ok()
+            .map(|raw| {
+                raw.parse::<u64>().unwrap_or_else(|_| {
+                    panic!("FN64_DUMP_AUDIO_TASK_INDEX must be a positive integer, got {raw:?}")
+                })
+            })
+            .unwrap_or(1);
+        assert!(
+            target_index != 0,
+            "FN64_DUMP_AUDIO_TASK_INDEX is one-based; got 0"
+        );
+        AUDIO_TASK_DUMP.with(|dump| {
+            let mut state = dump.get();
+            state.seen = state.seen.saturating_add(1);
+            if !state.dumped && state.seen == target_index {
                 let mut rdram_len = AUDIO_RDRAM_LEN.with(|cell| cell.get());
                 if rdram_len == 0 {
                     rdram_len = RDRAM_LEN.with(|cell| cell.get());
@@ -320,12 +441,14 @@ unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
                     let bytes = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
                     let p = std::path::Path::new(&path);
                     let _ = std::fs::write(p, bytes);
-                    let meta = format!("task_offset={o}\nrdram_len={rdram_len}\n");
+                    let meta =
+                        format!("task_offset={o}\nrdram_len={rdram_len}\ntask_index={}\n", state.seen);
                     let _ = std::fs::write(p.with_extension("meta"), meta);
-                    eprintln!("[fn64-abi] dumped audio task rdram ({rdram_len} B) + task_offset={o} to {path:?}");
+                    eprintln!("[fn64-abi] dumped audio task #{} rdram ({rdram_len} B) + task_offset={o} to {path:?}", state.seen);
                 }
-                c.set(true);
+                state.dumped = true;
             }
+            dump.set(state);
         });
     }
     let skip_ucode = std::env::var_os("FN64_SKIP_AUDIO_UCODE").is_some();
@@ -450,8 +573,10 @@ thread_local! {
         Cell::new(std::env::var_os("FN64_AUDIO_UCODE_TIMING").is_some());
     pub(crate) static AUDIO_UCODE_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_UCODE_CALLS: Cell<u64> = const { Cell::new(0) };
-    pub(crate) static AUDIO_TASK_DUMPED: Cell<bool> = const { Cell::new(false) };
+    static AUDIO_TASK_DUMP: Cell<AudioTaskDumpState> =
+        const { Cell::new(AudioTaskDumpState { seen: 0, dumped: false }) };
     pub(crate) static AUDIO_PCM_DUMPED: Cell<bool> = const { Cell::new(false) };
+    static AUDIO_PCM_STREAM_DUMP: RefCell<Option<AudioStreamDump>> = const { RefCell::new(None) };
     pub(crate) static AUDIO_OUTPUT_STATS: Cell<AudioOutputStats> = const { Cell::new(AudioOutputStats::new()) };
 
     /// Coarse wall-time attribution for the rs-lane OoT performance harness.
@@ -493,8 +618,8 @@ impl AudioOutputStats {
 
 /// Frames currently buffered in the registered backend's output ring, or
 /// `None` when no backend is registered (or it reports an error). This is
-/// the shell's audio master clock: pumping the game only while the ring is
-/// below a target depth locks video pacing to the device's true drain rate.
+/// host-delivery telemetry only; the emulated `AI_LEN` register reports the
+/// current DMA through `audio_remaining_guest_bytes` instead.
 pub fn audio_frames_remaining() -> Option<u32> {
     AUDIO_BACKEND.with(|cell| {
         cell.borrow()
@@ -505,6 +630,23 @@ pub fn audio_frames_remaining() -> Option<u32> {
 
 pub fn audio_output_stats() -> AudioOutputStats {
     AUDIO_OUTPUT_STATS.with(Cell::get)
+}
+
+pub fn audio_stream_health() -> Option<fn64_audio::AudioStreamHealth> {
+    AUDIO_BACKEND.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|backend| backend.stream_health())
+    })
+}
+
+pub fn audio_rates() -> Option<(u32, u32)> {
+    let guest_rate = AUDIO_GUEST_RATE.with(Cell::get);
+    AUDIO_BACKEND.with(|cell| {
+        let borrowed = cell.borrow();
+        let stream_rate = borrowed.as_ref()?.stream_rate_hz()?;
+        Some((guest_rate, stream_rate))
+    })
 }
 
 /// Coarse host wall-time totals collected when `FN64_PHASE_TIMING` is set.
@@ -540,8 +682,8 @@ pub fn audio_ucode_timing() -> (u64, u64) {
 
 /// Forward the game's true AI DAC rate (`osAiSetFrequency`'s successful
 /// return value) to the registered backend so its producer-side resample
-/// ratio tracks the guest, and remember it for `osAiGetLength`'s
-/// drain-aware readback conversion. No-op when no backend is registered.
+/// ratio tracks the guest, and remember it for rate telemetry. No-op when no
+/// backend is registered.
 pub(crate) fn notify_audio_frequency(sample_rate_hz: u32) {
     AUDIO_GUEST_RATE.with(|cell| cell.set(sample_rate_hz));
     AUDIO_BACKEND.with(|cell| {
@@ -557,32 +699,15 @@ thread_local! {
     pub(crate) static AUDIO_GUEST_RATE: Cell<u32> = const { Cell::new(0) };
 }
 
-/// The live audio backlog expressed in GUEST-rate BYTES (stereo 16-bit
-/// frames, 4 bytes each) -- i.e. what real hardware's `AI_LEN` register
-/// counts down as the DAC drains. `None` when no backend is registered,
-/// the backend doesn't know its stream rate, or the game hasn't set a DAC
-/// rate yet -- callers fall back to the latched-register model.
-///
-/// This closes the hardware feedback loop games use to pace audio
-/// production: OoT's AudioMgr reads `osAiGetLength` each retrace and skips
-/// queueing when enough is buffered. A static latched value severs that
-/// loop and the audio thread free-runs (observed: ~3 AI buffers per VI
-/// frame, ring pinned at its cap, playback perpetually skip-dropping).
+/// Bytes remaining in the current emulated AI DMA -- i.e. what hardware's
+/// `AI_LEN` register counts down as the DAC drains. Host stream prebuffering
+/// is intentionally excluded: exposing the whole cpal ring here made guest
+/// buffer sizing depend on host latency instead of the N64 DMA boundary.
 pub(crate) fn audio_remaining_guest_bytes() -> Option<u32> {
-    let guest_rate = AUDIO_GUEST_RATE.with(Cell::get);
-    if guest_rate == 0 {
-        return None;
-    }
     AUDIO_BACKEND.with(|cell| {
         let borrowed = cell.borrow();
         let backend = borrowed.as_ref()?;
-        let stream_rate = backend.stream_rate_hz()?;
-        let frames = backend.frames_remaining().ok()?;
-        if stream_rate == 0 {
-            return None;
-        }
-        let guest_frames = frames as u64 * guest_rate as u64 / stream_rate as u64;
-        Some((guest_frames * 4) as u32)
+        backend.current_dma_bytes_remaining()
     })
 }
 

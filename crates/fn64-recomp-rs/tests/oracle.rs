@@ -157,11 +157,11 @@ fn dynapoly_matches_c_oracle() {
         50,
         51,
         100,
-        0xFFFF_FFFF,             // -1 as low32, but as u64 this is +4294967295
-        0xFFFF_FFFF_FFFF_FFFF,   // -1 (64-bit) -> negative branch
-        0x8000_0000,             // +2^31 in 64-bit terms (NOT negative)
-        0xFFFF_FFFF_8000_0000,   // sign-extended INT32_MIN -> negative
-        0x0000_0001_0000_0000,   // > u32, positive, >= 0x32
+        0xFFFF_FFFF,           // -1 as low32, but as u64 this is +4294967295
+        0xFFFF_FFFF_FFFF_FFFF, // -1 (64-bit) -> negative branch
+        0x8000_0000,           // +2^31 in 64-bit terms (NOT negative)
+        0xFFFF_FFFF_8000_0000, // sign-extended INT32_MIN -> negative
+        0x0000_0001_0000_0000, // > u32, positive, >= 0x32
     ];
 
     for &a0 in &inputs {
@@ -186,34 +186,111 @@ fn dynapoly_matches_c_oracle() {
 #[test]
 fn decode_alu_immediate() {
     // addiu $v0, $zero, 0x1  = 0x24020001
-    assert_eq!(decode(0x24020001), Instruction::Addiu { rt: 2, rs: 0, imm: 1 });
+    assert_eq!(
+        decode(0x24020001),
+        Instruction::Addiu {
+            rt: 2,
+            rs: 0,
+            imm: 1
+        }
+    );
     // slti  $at, $a0, 0x32   = 0x28810032
-    assert_eq!(decode(0x28810032), Instruction::Slti { rt: 1, rs: 4, imm: 0x32 });
+    assert_eq!(
+        decode(0x28810032),
+        Instruction::Slti {
+            rt: 1,
+            rs: 4,
+            imm: 0x32
+        }
+    );
     // lui   $a0, 0x800F      = 0x3C04800F
     assert_eq!(decode(0x3C04800F), Instruction::Lui { rt: 4, imm: 0x800F });
     // ori   $t0, $t0, 0x6830 = 0x35086830
-    assert_eq!(decode(0x35086830), Instruction::Ori { rt: 8, rs: 8, imm: 0x6830 });
+    assert_eq!(
+        decode(0x35086830),
+        Instruction::Ori {
+            rt: 8,
+            rs: 8,
+            imm: 0x6830
+        }
+    );
     // andi  $v1, $v1, 0x1FFF = 0x30631FFF
-    assert_eq!(decode(0x30631FFF), Instruction::Andi { rt: 3, rs: 3, imm: 0x1FFF });
+    assert_eq!(
+        decode(0x30631FFF),
+        Instruction::Andi {
+            rt: 3,
+            rs: 3,
+            imm: 0x1FFF
+        }
+    );
 }
 
 #[test]
 fn decode_alu_register() {
     // or   $v0, $zero, $zero = 0x00001025
-    assert_eq!(decode(0x00001025), Instruction::Or { rd: 2, rs: 0, rt: 0 });
+    assert_eq!(
+        decode(0x00001025),
+        Instruction::Or {
+            rd: 2,
+            rs: 0,
+            rt: 0
+        }
+    );
     // addu $t0, $a2, $t7     = 0x00CF4021
-    assert_eq!(decode(0x00CF4021), Instruction::Addu { rd: 8, rs: 6, rt: 15 });
+    assert_eq!(
+        decode(0x00CF4021),
+        Instruction::Addu {
+            rd: 8,
+            rs: 6,
+            rt: 15
+        }
+    );
     // sll  $t7, $t6, 4       = 0x000E7900
-    assert_eq!(decode(0x000E7900), Instruction::Sll { rd: 15, rt: 14, sa: 4 });
+    assert_eq!(
+        decode(0x000E7900),
+        Instruction::Sll {
+            rd: 15,
+            rt: 14,
+            sa: 4
+        }
+    );
     // sra  $v1, $v1, 16      = 0x00031C03
-    assert_eq!(decode(0x00031C03), Instruction::Sra { rd: 3, rt: 3, sa: 16 });
+    assert_eq!(
+        decode(0x00031C03),
+        Instruction::Sra {
+            rd: 3,
+            rt: 3,
+            sa: 16
+        }
+    );
     // subu, sltu spot checks
     // subu $v0,$a0,$a1 (funct 0x23) = 0x00851023
-    assert_eq!(decode(0x00851023), Instruction::Subu { rd: 2, rs: 4, rt: 5 });
+    assert_eq!(
+        decode(0x00851023),
+        Instruction::Subu {
+            rd: 2,
+            rs: 4,
+            rt: 5
+        }
+    );
     // sub  $v0,$a0,$a1 (funct 0x22) = 0x00851022
-    assert_eq!(decode(0x00851022), Instruction::Sub { rd: 2, rs: 4, rt: 5 });
+    assert_eq!(
+        decode(0x00851022),
+        Instruction::Sub {
+            rd: 2,
+            rs: 4,
+            rt: 5
+        }
+    );
     // sltu $v0,$a0,$a1 (funct 0x2B) = 0x0085102B
-    assert_eq!(decode(0x0085102B), Instruction::Sltu { rd: 2, rs: 4, rt: 5 });
+    assert_eq!(
+        decode(0x0085102B),
+        Instruction::Sltu {
+            rd: 2,
+            rs: 4,
+            rt: 5
+        }
+    );
 }
 
 #[test]
@@ -237,11 +314,32 @@ fn decode_branches_and_jumps() {
     // bgez $a0, +3       = 0x04810003 (REGIMM rt=1)
     assert_eq!(decode(0x04810003), Instruction::Bgez { rs: 4, off: 3 });
     // bne  $at, $zero,+3 = 0x14200003
-    assert_eq!(decode(0x14200003), Instruction::Bne { rs: 1, rt: 0, off: 3 });
+    assert_eq!(
+        decode(0x14200003),
+        Instruction::Bne {
+            rs: 1,
+            rt: 0,
+            off: 3
+        }
+    );
     // beq  $a0, $a1, +5  = 0x10850005
-    assert_eq!(decode(0x10850005), Instruction::Beq { rs: 4, rt: 5, off: 5 });
+    assert_eq!(
+        decode(0x10850005),
+        Instruction::Beq {
+            rs: 4,
+            rt: 5,
+            off: 5
+        }
+    );
     // bnel $v1, $t6, +6  = 0x546E0006 (opcode 0x15)
-    assert_eq!(decode(0x546E0006), Instruction::Bnel { rs: 3, rt: 14, off: 6 });
+    assert_eq!(
+        decode(0x546E0006),
+        Instruction::Bnel {
+            rs: 3,
+            rt: 14,
+            off: 6
+        }
+    );
     // jr   $ra           = 0x03E00008
     assert_eq!(decode(0x03E00008), Instruction::Jr { rs: 31 });
     // jal  0x80063CCC -> target26 = (0x80063CCC & 0x0FFFFFFF) >> 2 = 0x18F33
@@ -256,17 +354,59 @@ fn decode_branches_and_jumps() {
 #[test]
 fn decode_loads_and_stores() {
     // lw   $t2, 0x48($sp) = 0x8FAA0048
-    assert_eq!(decode(0x8FAA0048), Instruction::Lw { rt: 10, base: 29, off: 0x48 });
+    assert_eq!(
+        decode(0x8FAA0048),
+        Instruction::Lw {
+            rt: 10,
+            base: 29,
+            off: 0x48
+        }
+    );
     // lh   $v1, 0xA4($a0) = 0x8483_00A4
-    assert_eq!(decode(0x848300A4), Instruction::Lh { rt: 3, base: 4, off: 0xA4 });
+    assert_eq!(
+        decode(0x848300A4),
+        Instruction::Lh {
+            rt: 3,
+            base: 4,
+            off: 0xA4
+        }
+    );
     // lbu  $t7, 0x2($a2)  = 0x90CF0002
-    assert_eq!(decode(0x90CF0002), Instruction::Lbu { rt: 15, base: 6, off: 2 });
+    assert_eq!(
+        decode(0x90CF0002),
+        Instruction::Lbu {
+            rt: 15,
+            base: 6,
+            off: 2
+        }
+    );
     // sw   $s0, 0x20($sp) = 0xAFB00020
-    assert_eq!(decode(0xAFB00020), Instruction::Sw { rt: 16, base: 29, off: 0x20 });
+    assert_eq!(
+        decode(0xAFB00020),
+        Instruction::Sw {
+            rt: 16,
+            base: 29,
+            off: 0x20
+        }
+    );
     // sb   $t7, 0x27($sp) = 0xA3AF0027
-    assert_eq!(decode(0xA3AF0027), Instruction::Sb { rt: 15, base: 29, off: 0x27 });
+    assert_eq!(
+        decode(0xA3AF0027),
+        Instruction::Sb {
+            rt: 15,
+            base: 29,
+            off: 0x27
+        }
+    );
     // negative offset: lw $t0, -0x8($t1) = 0x8D28FFF8
-    assert_eq!(decode(0x8D28FFF8), Instruction::Lw { rt: 8, base: 9, off: -8 });
+    assert_eq!(
+        decode(0x8D28FFF8),
+        Instruction::Lw {
+            rt: 8,
+            base: 9,
+            off: -8
+        }
+    );
 }
 
 #[test]

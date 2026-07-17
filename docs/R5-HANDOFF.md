@@ -1,5 +1,48 @@
 # R5/R8 handoff — swizzle regression blocking timing verification
 
+Status 2026-07-17: root cause found and live-window correction visually
+verified. The torn-read lead below was disproved because guest pumping and
+redraw run serially on the winit event thread. The actual mismatch was
+`ReferenceBackend::write_rgba5551_framebuffer`: it wrote flat big-endian
+halfwords, while the OoT shell/headless decoders read N64Recomp's native-word
+RDRAM storage. That producer/consumer mismatch created the bands.
+
+The correction is not another site patch: `RdramView`, `RdramViewMut`, and
+the ABI-only unsafe `RdramPtr` now own logical-address to storage translation
+in `fn64-runtime`; framebuffer write/read, DMA, controller structs, audio PCM,
+renderer reads, and diagnostics use them. `scripts/lint-rdram-layout.py`
+rejects production manual lane XORs and raw RDRAM writes outside that owner.
+Pre/post live screenshots are local evidence at `/tmp/fn64-before.png` and
+`/tmp/fn64-after.png` (never committed game-derived output).
+
+Working-tree validation: 10/10 consecutive integrated nextest runs clean;
+630/630 workspace tests; strict clippy clean; layout/doc lints clean; and the
+C/rs lane differential matched all 58 captured non-uniform framebuffers
+through swap 60. The live post-fix image was inspected, not inferred from the
+heartbeat. R8 stays open in ROADMAP only because `[x]` means merged+verified.
+
+Post-fix timing was subsequently closed at the mechanism level. The ~31 ms
+pump was the priority-0 idle thread being resumed to an arbitrary step cap;
+typed priority inspection now treats its second consecutive turn as guest
+quiescence. A separate trace found that returning from a pump at the first VI
+swap left same-retrace AudioMgr work runnable, so the next pump advanced VI
+too early and OoT coalesced one queued audio notification in three.
+`RetraceDrain` now makes swap observation-only and pins that invariant in a
+unit test. The boot harness also requires a typed `TvType` and seeds the
+IPL-owned `osTvType` global, preventing a PAL audio configuration under the
+shell's NTSC VI clock.
+
+Audio hardware feedback and host buffering are no longer conflated:
+`osAiGetLength` sees only the current emulated AI DMA, while cpal keeps an
+independent two-DMA jitter prebuffer and resamples 32,006 Hz guest output to
+the device's 48 kHz stream. Live rs+RT64 evidence through swap 900 held 60.0
+windowed retraces/sec, stable 2.6–3.1k host frames, no overflow, and zero
+callback underrun samples. `/tmp/fn64-timing-audio-fixed.png` is the inspected
+live-window capture. The final tree passed 10/10 consecutive whole-workspace
+nextest runs (635/635 each), strict clippy, both repository lints, and C/rs
+framebuffer parity through swap 60. ROADMAP R5 remains open only for
+foreground/backgrounded listening confirmation.
+
 Written 2026-07-17 after a session that chased this live and burned the
 user's patience doing it out loud. This doc exists so the next session
 doesn't repeat the same dead ends. Read it before touching code.
@@ -117,20 +160,13 @@ combined with a manual `^ 2` or similar swizzle, in `fn64-abi`, `fn64-shell`,
 
 ## Separately, and only after the above is real: R5 audio/video timing
 
-The pump-timing fix in `0611d35` (deriving VI retrace from the wall-clock
-pump instead of from work done) is believed correct in principle but is
-UNVERIFIED — every measurement gathered this session was taken against a
-window that was already rendering garbage from the bug above, so the
-numbers (retrace_hz readings, ring_frames behavior) should be distrusted
-until re-measured on a corrected frame source. Re-run the same measurement
-protocol (`docs/ROADMAP.md`'s R5 section has the heartbeat log format) once
-the swizzle bug is fixed, and only then decide whether the retrace-rate fix
-actually holds up. There is also a known-but-unverified second timing bug
-noted in `0611d35`'s commit message: the clock advance was moved to the top
-of `pump_one_frame` specifically because placing it after the loop was
-skipped by any pump that produced a frame (an early `return true`) — that
-fix landed but was never re-measured before this session got derailed by
-the framebuffer corruption.
+This is now re-measured on the corrected frame source. One wall deadline
+advances exactly one VI interval; the pump drains that retrace to typed guest
+quiescence even if a swap occurs; then presentation observes the completed
+state. The shell heartbeat is the acceptance probe: current-window Hz,
+interval/pump/present median+p95, scheduler steps, AI submissions, host depth,
+and callback underrun samples. ROADMAP R5 contains the current numbers and the
+remaining by-ear validation bar.
 
 ## Ground rules for this investigation (learned expensively this session)
 
