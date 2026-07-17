@@ -14,7 +14,7 @@ Status legend: `[ ]` open, `[~]` dispatched/in-flight, `[x]` merged+verified
 The standing milestone gate (OOT-STATUS.md "Beyond OoT") is unmet on main;
 the work that closes it is rotting on stale pre-rename branches.
 
-- [ ] **R1 salvage**: re-apply the combiner/blender/scissor/perspective-ST
+- [x] **R1 salvage** (merged 2026-07-16): re-applied the combiner/blender/scissor/perspective-ST
   deltas from the `merge/render-final` stack (merge-base `f252c1e`, tip
   `e7ebf22`; the load-bearing delta is `raster.rs` +44, `gbi.rs` +13) onto
   post-rename main as fresh commits. Must preserve the G_DL tail-jump
