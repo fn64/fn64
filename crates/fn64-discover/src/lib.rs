@@ -21,7 +21,7 @@
 //! rejected candidates, and an explicit open/unresolved frontier -- never
 //! only the first.
 //!
-//! # This crate's current scope (B1: foundation)
+//! # This crate's current scope
 //!
 //! - [`rom`]: Phase 1, ROM normalization + identity.
 //! - [`facts`]: the monotonic fact database and discrete [`facts::ProofState`]
@@ -29,6 +29,10 @@
 //! - [`banks`]: Phase 2, load-image/overlay discovery -- the boot copy
 //!   (hardware-fixed, needs no scanning) and descriptor-table-shaped
 //!   overlay banks (given an explicit table location/shape).
+//! - [`harvest`]: Phase 3, parallel deterministic candidate providers for
+//!   direct/resolved calls, classic and leaf prologues, and code-pointer
+//!   entries exposed by already-discovered tables. Claims merge through
+//!   [`facts::FactDb`] and retain detector-specific evidence.
 //! - [`cfg`]: Phase 4, the delay-slot-aware MIPS-III CFG builder -- word
 //!   classification (`proven_code`/`candidate_code`/`proven_data`/
 //!   `candidate_data`/`conflict`/`unknown`), basic blocks, direct calls,
@@ -57,19 +61,20 @@
 //!   WM2000/NWXE resident-bank function extents mechanically extracted from
 //!   aki-recomp's generated `syms/dump.toml`.
 //!
-//! Candidate harvesting (Phase 3), the rest of indirect-target closure
-//! (Phase 6 beyond the bounded HI/LO `jr` case [`resolve`] now handles),
-//! dynamic probes (Phase 7), and assembly verification (Phase 8) are not
-//! yet implemented; this crate's public surface will grow into them.
+//! The rest of indirect-target closure (Phase 6 beyond the bounded HI/LO
+//! `jr`/`jalr` case [`resolve`] now handles), dynamic probes (Phase 7), and
+//! assembly verification (Phase 8) are not yet implemented.
 
 pub mod banks;
 pub mod cfg;
 pub mod facts;
+pub mod grade_candidates;
 pub mod grade_nw4e;
 pub mod grade_nw4e_symbols;
 pub mod grade_nwxe_functions;
 pub mod grade_oot;
 pub mod grade_oot_functions;
+pub mod harvest;
 pub mod partition;
 pub mod resolve;
 pub mod rom;
@@ -83,7 +88,7 @@ pub use rom::{normalize, NormalizedRom, RomByteOrder, RomRejectReason};
 pub type DescriptorTableInput = (banks::DescriptorTableShape, fn(u32) -> String);
 
 /// Run every currently-implemented discovery phase (1: normalize, 2: boot
-/// bank + optional descriptor-table scan) over `rom_bytes` and return the
+/// bank + optional descriptor-table scan, 3: candidate harvest) over `rom_bytes` and return the
 /// resulting fact database. This is the crate's single deterministic
 /// entry point: calling it twice on byte-identical input must produce a
 /// byte-identical `FactDb` (enforced by `tests/determinism.rs`).
@@ -102,6 +107,8 @@ pub fn run_discovery(
     if let Some((shape, bank_name)) = descriptor_table {
         banks::scan_descriptor_table(&rom, shape, bank_name, &mut db);
     }
+    harvest::harvest_discovered_candidates(&rom, &mut db)
+        .expect("Phase 2 produced a malformed load-image mapping");
     Ok((rom, db))
 }
 

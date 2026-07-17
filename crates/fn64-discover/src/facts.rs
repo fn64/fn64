@@ -7,11 +7,11 @@
 //! by convention -- [`FactDb::insert`] is append-only, and promoting a
 //! fact's `ProofState` can only ever move it to a state at least as strong
 //! (see [`ProofState::supersedes`]); an attempt to downgrade a `Proven`
-//! fact is a logic error the caller must handle, not something the DB does
-//! silently.
+//! fact is a logic error. Contradictory evidence may move it to `Conflict`,
+//! which preserves rather than overwrites the disagreement.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A bank-qualified address: identity is `(bank, pc)`, never `pc` alone,
 /// per the design doc's "Function identity must be bank-qualified from the
@@ -20,6 +20,47 @@ use std::collections::BTreeMap;
 pub struct BankAddr {
     pub bank: String,
     pub pc: u32,
+}
+
+/// The deterministic Phase 3 provider that produced a function-entry claim.
+/// These values are part of serialized provenance, so adding a provider must
+/// add a new variant rather than reusing a free-form string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CandidateDetector {
+    JalTarget,
+    ProloguePattern,
+    TableDerived,
+}
+
+/// The prologue shape that justified a [`CandidateDetector::ProloguePattern`]
+/// claim. A leaf claim requires a matched stack restore and `jr $ra`; a stack
+/// adjustment by itself is deliberately insufficient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ProloguePattern {
+    SavesReturnAddress,
+    LeafWithMatchedRestore,
+}
+
+/// Machine-readable evidence carried by every Phase 3 function-entry claim.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum FunctionEntryEvidence {
+    DirectJal {
+        call_site: BankAddr,
+    },
+    ResolvedJalr {
+        call_site: BankAddr,
+        construction_start: BankAddr,
+    },
+    Prologue {
+        stack_adjust: BankAddr,
+        frame_size: u32,
+        pattern: ProloguePattern,
+        corroborating_site: BankAddr,
+    },
+    TableEntry {
+        table: BankAddr,
+        index: u32,
+    },
 }
 
 impl BankAddr {
@@ -63,6 +104,23 @@ pub enum Fact {
         va_start: u32,
         va_end: u32,
     },
+    /// A code-pointer entry exposed by a descriptor table or vector that an
+    /// earlier phase has already identified. Phase 3 consumes this fact; it
+    /// never guesses table locations or semantics from raw bytes.
+    TableEntry {
+        table: BankAddr,
+        index: u32,
+        target: BankAddr,
+    },
+    /// One immutable Phase 3 provider result. `proposed_state` is the
+    /// provider's own evidentiary strength; the `fn:<bank>:<pc>` conclusion
+    /// is derived from all claims for the target by deterministic merge.
+    FunctionEntryClaim {
+        target: BankAddr,
+        detector: CandidateDetector,
+        evidence: FunctionEntryEvidence,
+        proposed_state: ProofState,
+    },
     /// Free-text provenance for a `RomMapping` or other claim -- e.g. "PI
     /// DMA descriptor at ROM 0x539a0, record 0" -- kept as a fact so the
     /// evidence trail survives independent of any derived report.
@@ -79,6 +137,8 @@ impl Fact {
             Fact::LoadsFrom { site, .. } => Some(&site.bank),
             Fact::ObservedIndirectTarget { site, .. } => Some(&site.bank),
             Fact::RomMapping { bank, .. } => Some(bank),
+            Fact::TableEntry { table, .. } => Some(&table.bank),
+            Fact::FunctionEntryClaim { target, .. } => Some(&target.bank),
             Fact::Evidence { subject, .. } => Some(&subject.bank),
         }
     }
@@ -107,20 +167,33 @@ pub enum ProofState {
 
 impl ProofState {
     /// True if transitioning from `self` to `next` is a legal monotonic
-    /// update: never move a `Proven` conclusion to anything else. All
-    /// other transitions are allowed -- new evidence may raise a
+    /// update: never move a `Proven` conclusion to anything weaker. A
+    /// contradiction may move it to `Conflict`, which surfaces the new
+    /// incompatible evidence without letting a heuristic win. All other
+    /// transitions are allowed -- new evidence may raise a
     /// `Candidate` to `Proven`, demote a `Candidate` to `Rejected` when a
     /// stronger fact contradicts it, or turn `Open` into `Conflict` when
     /// two incompatible proofs arrive at once. `Rejected` and `Conflict`
     /// are not "better than Candidate" in evidentiary terms -- they are
-    /// alternate terminal outcomes -- but only `Proven` is unconditionally
-    /// protected from a further transition.
+    /// alternate terminal outcomes. A proven conclusion is protected from
+    /// weakening while still allowing contradictory evidence to surface as
+    /// `Conflict`.
     pub fn supersedes(self, next: ProofState) -> bool {
         if self == ProofState::Proven {
-            return next == ProofState::Proven;
+            return matches!(next, ProofState::Proven | ProofState::Conflict);
         }
         true
     }
+}
+
+/// Stable conclusion key for a bank-qualified function entry.
+pub fn function_entry_subject(address: &BankAddr) -> String {
+    format!("fn:{}:0x{:08x}", address.bank, address.pc)
+}
+
+/// Stable conclusion key for one upstream table/vector entry.
+pub fn table_entry_subject(table: &BankAddr, index: u32) -> String {
+    format!("table-entry:{}:0x{:08x}:{index}", table.bank, table.pc)
 }
 
 /// A derived conclusion tracked with its proof state and the fact
@@ -243,6 +316,47 @@ impl FactDb {
             })
             .collect()
     }
+
+    /// Record an entry exposed by an already-identified table or vector.
+    /// The caller supplies the table evidence's proof state; Phase 3 carries
+    /// it forward and validates the target against discovered load images.
+    pub fn record_table_entry(
+        &mut self,
+        table: BankAddr,
+        index: u32,
+        target: BankAddr,
+        state: ProofState,
+        rule: impl Into<String>,
+    ) -> Result<usize, MonotonicityViolation> {
+        let subject = table_entry_subject(&table, index);
+        let fact = self.insert(Fact::TableEntry {
+            table,
+            index,
+            target,
+        });
+        self.conclude(subject, state, vec![fact], rule)?;
+        Ok(fact)
+    }
+
+    /// Function entries whose merged Phase 3 conclusion is authoritative.
+    /// Candidate/supported/conflict entries remain visible in the database
+    /// but cannot become CFG roots through this API.
+    pub fn proven_function_entries(&self, bank: &str) -> Vec<u32> {
+        let mut entries = BTreeSet::new();
+        for fact in &self.facts {
+            let Fact::FunctionEntryClaim { target, .. } = fact else {
+                continue;
+            };
+            if target.bank == bank
+                && self
+                    .conclusion(&function_entry_subject(target))
+                    .is_some_and(|conclusion| conclusion.state == ProofState::Proven)
+            {
+                entries.insert(target.pc);
+            }
+        }
+        entries.into_iter().collect()
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +435,57 @@ mod tests {
             db.conclusion("fn:boot:0x80000400").unwrap().state,
             ProofState::Proven
         );
+    }
+
+    #[test]
+    fn conclude_surfaces_a_conflict_with_proven_evidence() {
+        let mut db = FactDb::new();
+        let f = db.insert(Fact::BlockStart {
+            bank: "boot".into(),
+            pc: 0x8000_0400,
+        });
+        db.conclude("x", ProofState::Proven, vec![f], "proof")
+            .unwrap();
+        db.conclude("x", ProofState::Conflict, vec![f], "contradiction")
+            .unwrap();
+        assert_eq!(db.conclusion("x").unwrap().state, ProofState::Conflict);
+    }
+
+    #[test]
+    fn table_entries_and_proven_function_roots_remain_bank_qualified() {
+        let mut db = FactDb::new();
+        let table = BankAddr::new("boot", 0x8000_1000);
+        let target = BankAddr::new("overlay", 0x8010_0040);
+        db.record_table_entry(
+            table.clone(),
+            3,
+            target.clone(),
+            ProofState::Proven,
+            "proven_vector",
+        )
+        .unwrap();
+        assert_eq!(
+            db.conclusion(&table_entry_subject(&table, 3))
+                .unwrap()
+                .state,
+            ProofState::Proven
+        );
+
+        let claim = db.insert(Fact::FunctionEntryClaim {
+            target: target.clone(),
+            detector: CandidateDetector::TableDerived,
+            evidence: FunctionEntryEvidence::TableEntry { table, index: 3 },
+            proposed_state: ProofState::Proven,
+        });
+        db.conclude(
+            function_entry_subject(&target),
+            ProofState::Proven,
+            vec![claim],
+            "table_entry_merge",
+        )
+        .unwrap();
+        assert_eq!(db.proven_function_entries("overlay"), vec![0x8010_0040]);
+        assert!(db.proven_function_entries("boot").is_empty());
     }
 
     #[test]
