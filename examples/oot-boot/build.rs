@@ -23,11 +23,11 @@
 //!   generated `RecompiledFuncs/*.c`, `recomp_overlays.inl`, `recomp.h`,
 //!   `funcs.h` for OoT (OOTU). In the reference dev environment, this is
 //!   `aki-recomp/games/OOTU/RecompiledFuncs`.
-//! - `RECOMP_H_DIR` -- path to the directory containing N64Recomp's own
-//!   MIT-licensed `recomp.h`/`librecomp/sections.h` headers (the ABI this
-//!   crate serves, per `docs/DESIGN.md` section 1's provenance table). In
-//!   the reference dev environment, this is
-//!   `aki-recomp/refs/N64RecompSource/include`.
+//! - `RECOMP_H_DIR` -- OPTIONAL. N64Recomp's MIT-licensed `recomp.h` (the ABI
+//!   this crate serves, per `docs/DESIGN.md` section 1's provenance table) is
+//!   vendored at `crates/fn64-boot-harness/bridge/include/vendor/`; set this
+//!   only to build against a different fork. (`librecomp/sections.h` is
+//!   fn64's OWN clean-room header and never came from N64Recomp.)
 //! - `ROM` -- path to the decomp's OWN BUILD-OUTPUT ROM (NOT the retail
 //!   compressed cartridge image -- OoT's linker `.map`-derived symbol rom
 //!   offsets only line up against the decomp's decompressed build output;
@@ -52,6 +52,40 @@
 
 use std::env;
 use std::path::PathBuf;
+
+/// Locate `crates/fn64-boot-harness/bridge` by walking up from this manifest.
+/// Shared by BOTH the main manifest (examples/oot-boot/) and the rs-only one
+/// (examples/oot-boot/rs/, a level deeper), so a fixed `../../` breaks.
+fn bridge_dir() -> PathBuf {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let rel = "crates/fn64-boot-harness/bridge";
+    let mut d = manifest_dir.as_path();
+    loop {
+        let candidate = d.join(rel);
+        if candidate.join("section_bridge.c").exists() {
+            return candidate;
+        }
+        match d.parent() {
+            Some(p) => d = p,
+            None => panic!(
+                "could not locate {rel} walking up from {}",
+                manifest_dir.display()
+            ),
+        }
+    }
+}
+
+/// The vendored MIT `recomp.h`, used unless RECOMP_H_DIR overrides it.
+fn vendored_recomp_h_dir() -> PathBuf {
+    let d = bridge_dir().join("include/vendor");
+    assert!(
+        d.join("recomp.h").is_file(),
+        "oot-boot build.rs: vendored recomp.h missing at {} -- it ships in this repo (MIT, \
+         see LICENSE-N64Recomp beside it); set RECOMP_H_DIR to override.",
+        d.display()
+    );
+    d
+}
 
 fn required_env(name: &str, hint: &str) -> PathBuf {
     match env::var(name) {
@@ -142,11 +176,12 @@ fn main() {
         "Point it at a directory containing OoT (OOTU)'s N64Recomp-generated \
          RecompiledFuncs/*.c + recomp_overlays.inl (e.g. aki-recomp/games/OOTU/RecompiledFuncs).",
     );
-    let recomp_h_dir = required_env(
-        "RECOMP_H_DIR",
-        "Point it at the directory containing N64Recomp's MIT-licensed recomp.h + \
-         librecomp/sections.h (e.g. aki-recomp/refs/N64RecompSource/include).",
-    );
+    // recomp.h is MIT (N64Recomp, (c) 2024 Wiseguy) and contains no game
+    // content, so it is vendored at bridge/include/vendor/ -- see ROADMAP H1.
+    // RECOMP_H_DIR still overrides, for testing against a different fork.
+    let recomp_h_dir = env::var("RECOMP_H_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| vendored_recomp_h_dir());
     if !recompiled_dir.join("recomp_overlays.inl").exists() {
         panic!(
             "oot-boot build.rs: RECOMPILED_DIR={} does not contain recomp_overlays.inl -- \
@@ -162,29 +197,7 @@ fn main() {
         );
     }
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    // This build.rs is shared by BOTH the main oot-boot manifest
-    // (examples/oot-boot/) and the rs-only manifest (examples/oot-boot/rs/,
-    // one level deeper). A fixed `../../` breaks for the rs one,
-    // so walk up until we find the shared bridge dir (moved here by the
-    // boot-seam dedup). Robust to either manifest depth.
-    let bridge_dir = {
-        let rel = "crates/fn64-boot-harness/bridge";
-        let mut d = manifest_dir.as_path();
-        loop {
-            let candidate = d.join(rel);
-            if candidate.join("section_bridge.c").exists() {
-                break candidate;
-            }
-            match d.parent() {
-                Some(p) => d = p,
-                None => panic!(
-                    "could not locate {rel} walking up from {}",
-                    manifest_dir.display()
-                ),
-            }
-        }
-    };
+    let bridge_dir = bridge_dir();
 
     let mut build = cc::Build::new();
     build

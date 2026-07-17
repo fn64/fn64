@@ -21,8 +21,10 @@
 //! - `RECOMPILED_DIR` -- dir with the N64Recomp-generated `RecompiledFuncs/
 //!   *.c`, `recomp_overlays.inl`, `recomp.h`, `funcs.h` (e.g.
 //!   `aki-recomp/games/OOTU/RecompiledFuncs`).
-//! - `RECOMP_H_DIR` -- dir with N64Recomp's MIT-licensed `recomp.h` +
-//!   `librecomp/sections.h` (e.g. `aki-recomp/refs/N64RecompSource/include`).
+//! - `RECOMP_H_DIR` -- OPTIONAL. N64Recomp's MIT `recomp.h` is vendored at
+//!   `fn64-boot-harness/bridge/include/vendor/`; set this only to build
+//!   against a different fork. (`librecomp/sections.h` is fn64's own
+//!   clean-room header, not N64Recomp's -- it never came from there.)
 //! - `ROM` -- the decomp's OWN decompressed BUILD-OUTPUT z64 (NOT the retail
 //!   compressed cartridge -- see oot-boot/build.rs). Read only by the binary
 //!   at startup, validated here so a missing ROM fails the build early.
@@ -68,18 +70,20 @@ fn main() {
         return;
     };
 
-    let recomp_h_dir = required_env(
-        "RECOMP_H_DIR",
-        "Point it at the directory containing N64Recomp's MIT-licensed recomp.h + \
-         librecomp/sections.h (e.g. aki-recomp/refs/N64RecompSource/include).",
-    );
+    // recomp.h is MIT (N64Recomp, (c) 2024 Wiseguy) and contains no game
+    // content, so it is vendored in-tree -- see ROADMAP H1. RECOMP_H_DIR still
+    // overrides, for building against a different fork.
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let bridge_dir = manifest_dir.join("../fn64-boot-harness/bridge");
+    let recomp_h_dir = env::var("RECOMP_H_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| bridge_dir.join("include/vendor"));
     // ROM validated (not read) here so a missing ROM fails fast, matching
     // oot-boot/build.rs.
     let _ = required_env(
         "ROM",
-        "Point it at the decomp's OWN decompressed build-output z64 (e.g. \
-         aki-recomp/refs/oot-decomp/build/ntsc-1.0/oot-ntsc-1.0.z64) -- NOT the retail compressed \
-         cartridge image.",
+        "Point it at the decomp's OWN decompressed build-output z64 -- NOT the retail \
+         compressed cartridge image.",
     );
 
     if !recompiled_dir.join("recomp_overlays.inl").exists() {
@@ -91,14 +95,11 @@ fn main() {
     }
     if !recomp_h_dir.join("recomp.h").exists() {
         panic!(
-            "fn64-shell build.rs: RECOMP_H_DIR={} does not contain recomp.h -- expected \
-             N64Recomp's include/ directory.",
+            "fn64-shell build.rs: no recomp.h at {} -- the vendored copy ships in this repo \
+             (MIT, see LICENSE-N64Recomp beside it); set RECOMP_H_DIR only to override it.",
             recomp_h_dir.display()
         );
     }
-
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let bridge_dir = manifest_dir.join("../fn64-boot-harness/bridge");
 
     // RecompiledFuncs/*.c: plain C, generated, no warning hygiene.
     let mut build = cc::Build::new();
