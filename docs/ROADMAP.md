@@ -144,91 +144,39 @@ fn64. This phase is not "declare the dependency" — it is delete it.
 Inventoried 2026-07-17. Five things are pulled from the legacy checkout; only
 ONE has a permanent reason to be out-of-tree:
 
-| What | Size | Verdict |
-|---|---|---|
-| `refs/N64RecompSource/include` (`recomp.h`) | 475 lines | **VENDORED 2026-07-17** at `crates/fn64-boot-harness/bridge/include/vendor/` (MIT, (c) 2024 Wiseguy, license beside it). Only `recomp.h` was ever needed — `librecomp/sections.h` is fn64's own clean-room header and always was. |
-| `games/OOTU/oot.toml` | 156 lines | **Stays out-of-tree — H1's original verdict was WRONG.** Its paths are relative to its own directory and point at `oot-ntsc-1.0.z64` and `syms/dump.toml` (989K of decomp-derived symbols). In-tree it would be a config reaching back into the legacy checkout. It dies with the oracle metadata at D-gate, not before. |
-| `runtime/ABI-SURFACE.md` + `abi_surface.json` | 204K | **Not needed.** Nothing consumes it; the live oracle is `fn64-abi`'s `c_smoke` link test (H2). |
-| `games/*/syms/dump.toml`, `refs/oot-decomp/**/segments.csv` | — | **Dies with Phase D.** D4 emits fn64's own pack; D-gate proves it. |
-| `games/OOTU/rsp-recomp/src/oot_aspmain.rs` | 186K | **Missed by the first inventory; found 2026-07-17 building H1.** ROM-derived (recompiled aspMain ucode), so it cannot be vendored. Worse than a hardcoded path: `examples/oot-boot/audio-ucode/build.rs` reaches it via `../../../../aki-recomp/...`, which assumes fn64 and aki-recomp are on-disk SIBLINGS. It breaks in any worktree (they nest deeper) and for any contributor. Needs an env var + loud skip, like H3. |
-| `games/*/*.z64` | — | **Stays out-of-tree forever.** But that is a plain `ROM=` path, never `$AKI`-shaped. |
+What fn64 still pulls from it, and why each is allowed to stay:
 
-So `$AKI` is not a domain concept needing a better name — it is "the old
-project's working directory", four artifacts fn64 should own plus one ROM
-path. Do NOT rename it; delete the need for it.
+| What | Why it stays out-of-tree |
+|---|---|
+| `games/*/*.z64` | ROM. Forever out-of-tree; a plain `ROM=` path. |
+| `games/OOTU/rsp-recomp/src/oot_aspmain.rs` | ROM-derived ucode. Can't be vendored; `OOT_ASPMAIN`/`FN64_GAME_DIR` locate it (H1b). |
+| `games/OOTU/RecompiledFuncs/` | ROM-derived generated C. `RECOMPILED_DIR`. |
+| `games/OOTU/oot.toml` | Its relative paths reach the ROM + `syms/dump.toml`; in-tree it would point back out. Dies at D-gate. |
+| `games/*/syms/dump.toml`, `refs/oot-decomp/**/segments.csv` | Oracle metadata. Dies at D-gate — D4 emits fn64's own pack. |
 
-- [x] **H1 vendor `recomp.h`** (done 2026-07-17). `crates/fn64-boot-harness/
-  bridge/include/vendor/recomp.h` + `LICENSE-N64Recomp`. `RECOMP_H_DIR` now
-  defaults to it and only overrides (a bogus override still fails loudly — no
-  silent fallback). Verified: the C lane builds the whole generated corpus with
-  `RECOMP_H_DIR` unset; override still honored; 621/621 workspace tests pass.
+Everything else is now owned here. After D-gate, only a user's own ROM remains.
 
-  Two things the original inventory got wrong, both found by doing it:
-  - Only `recomp.h` was ever needed. `librecomp/sections.h` is fn64's OWN
-    clean-room header (`bridge/include/librecomp/sections.h`) and always was —
-    the build.rs hints saying otherwise were wrong, and are fixed.
-  - `oot.toml` must NOT move in-tree (see table above).
-- [x] **H1b audio-ucode path + the `AKI` variable** (done 2026-07-17). The
-  adapter reached `oot_aspmain.rs` via `../../../../aki-recomp/...`, assuming
-  fn64 and the game workspace were on-disk siblings — false in every worktree.
-  Now: `OOT_ASPMAIN` (explicit file) or `$FN64_GAME_DIR/games/OOTU/...`, with
-  NO relative fallback and a loud, actionable panic naming both options plus
-  `--no-default-features`. The module is ROM-derived so it can never be
-  vendored; only the *lookup* was fixable.
+- [x] **H1 vendor `recomp.h`** (2026-07-17) — in-tree at
+  `bridge/include/vendor/`; `RECOMP_H_DIR` now only overrides.
+- [x] **H1b audio-ucode lookup + prune `AKI`** (2026-07-17) — `OOT_ASPMAIN` or
+  `$FN64_GAME_DIR`, no relative fallback, no default, loud on unset.
+- [x] **H2 `ABI-SURFACE.md` not needed** (2026-07-17) — nothing consumes it;
+  `fn64-abi`'s `c_smoke` link test is the live oracle. Read order now points at
+  the code (AGENTS.md carries the reasoning).
+- [ ] **H2b `OOT_*` debug knobs read inside game-agnostic core crates.** README
+  promises the core has "zero game-specific assumptions"; by behavior that
+  holds, but ~15 game-named vars are read in core code —
+  `fn64-abi/src/task_dispatch.rs` (`OOT_SKIP_AUDIO_UCODE`, `OOT_DUMP_AUDIO_PCM`,
+  `OOT_DUMP_AUDIO_TASK`, `OOT_AUDIO_UCODE_TIMING`, `OOT_PHASE_TIMING`) and
+  `fn64-render-rt64` (`OOT_DUMP_PROJ`, `OOT_NO_DEPTH`). Nothing about dumping a
+  projection matrix is OoT-specific. The moment a second game wants one, the
+  var is renamed or DUPLICATED — and duplication is how a game-agnostic core
+  becomes a two-game core. Rename to `FN64_*` in one sweep; `OOT_*` stays
+  correct in `examples/oot-boot/`, which is game-specific by design.
 
-  `AKI` is pruned repo-wide from code and scripts, no back-compat: it named a
-  legacy checkout, and `oot`/`native-emit.sh` baked
-  `/Users/jer/Code/aki-recomp` in as a default that worked on one machine.
-  Replaced by **`FN64_GAME_DIR`** — named for what it holds (your ROM-derived
-  material), not whose project it is — and it has **no default**: both entry
-  points now exit loudly telling you what to set. Verified: audio ucode builds
-  in a worktree via FN64_GAME_DIR; `AKI` alone now panics; both scripts exit
-  with an actionable message when unset; 621/621 tests; lint clean.
-- [x] **H2 `ABI-SURFACE.md` — RESOLVED 2026-07-17: fn64 does not need it, and
-  the clean-room question never had to be answered.** It was AGENTS.md
-  read-order item 3 (mandatory) while living in a legacy repo, so a fresh clone
-  could not satisfy its own contract. The fix was neither copying it in nor
-  demoting it — it was noticing the entry had become cargo cult:
-  - **Nothing consumes `abi_surface.json`.** Zero hits across all `.rs`/`.sh`/
-    `.toml`/`.py`. The `nm`-based completeness gate DESIGN.md §4 describes is
-    aspirational; the one `nm` mention in code is a comment about a past
-    observation.
-  - **The live oracle is a test that runs.** `crates/fn64-abi/tests/c_smoke.rs`
-    compiles a real C caller against the staticlib and executes it, proving the
-    extern symbols link and are callable exactly as generated `RecompiledFuncs`
-    would call them. Its own doc comment calls it "the mechanical check that the
-    ABI-SURFACE.md shape is honored". 62/62 pass.
-  - **The ~45 citations are provenance, not lookups.** They record which allowed
-    source a claim came from, per the clean-room protocol. They stay honest
-    whether or not the file is reachable — a footnote does not break when the
-    library closes.
-
-  It WAS a live oracle during transcription (`rdram.rs:12` and `lib.rs:617`
-  both record waves mistranscribing it), which is why the read-order entry
-  existed and why it outlived its job. Read order now points at `fn64-abi` and
-  its tests. Kept as a closed item — the reasoning is the point; delete once
-  Phase H lands.
-- [ ] **H2b `OOT_*` debug knobs are read INSIDE game-agnostic core crates.**
-  Found 2026-07-17. README promises "fn64's core has zero game-specific
-  assumptions" and by *behavior* that holds — but ~15 game-named env vars are
-  read in core code: `fn64-abi/src/task_dispatch.rs`
-  (`OOT_SKIP_AUDIO_UCODE`, `OOT_DUMP_AUDIO_PCM`, `OOT_DUMP_AUDIO_TASK`,
-  `OOT_AUDIO_UCODE_TIMING`, `OOT_PHASE_TIMING`) and `fn64-render-rt64`
-  (`OOT_DUMP_PROJ` in `gbi.rs`/`raster.rs`, `OOT_NO_DEPTH` in `lib.rs`).
-  Nothing about dumping a projection matrix is OoT-specific; these are generic
-  observability knobs that were born during OoT bring-up and kept the name.
-
-  Naming is how the next agent learns what a crate may know. The moment WM2000
-  wants a projection dump, `OOT_DUMP_PROJ` is either renamed or DUPLICATED —
-  and duplication is how a game-agnostic core quietly becomes a two-game core.
-  Fix: rename to `FN64_*` in core crates. `OOT_*` stays correct in
-  `examples/oot-boot/`, which is game-specific by design (that is why it is an
-  example, not a crate). Mechanical; do it as one sweep, not per-var.
-
-  NOT a violation, leave alone: panic messages citing `games/OOTU/
-  RecompiledFuncs` as evidence for an unimplemented shim (`si.rs`, `pi.rs`,
-  `softmath.rs`, `system.rs`, `sp_dp.rs`). Those are loud traps naming the
-  corpus that proves the gap — AGENTS.md working as designed.
+  Leave alone: panic messages citing `games/OOTU/RecompiledFuncs` as evidence
+  for an unimplemented shim. Those are loud traps naming the corpus that proves
+  the gap.
 - [ ] **H3 `fn64-discover` gates cannot run off the author's machine.** Not
   env vars with defaults — compile-time `const`s: `gate_b1.rs:18/20-22`,
   `gate_d1.rs:18-19/24-27`, `gate_b2.rs:39/51` hold
