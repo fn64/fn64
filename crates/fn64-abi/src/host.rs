@@ -12,8 +12,24 @@ pub fn inject_external_event(event: ExternalEvent) {
 }
 
 /// Host-side virtual-clock driver.
+///
+/// Also samples the VI retrace cadence probe (ROADMAP R5 probe 3): this is the
+/// only place the host advances the guest's virtual clock, so it is the one
+/// seam where wall-clock and fired-tick counts can be correlated. The delta is
+/// read back from the executor rather than predicted, so the probe counts what
+/// actually fired, not what the caller expected to fire.
 pub fn advance_virtual_time(now: u64) {
-    with_executor(|exec| exec.advance_time(now));
+    let fired = with_executor(|exec| {
+        let before = exec.retrace_ticks_fired();
+        exec.advance_time(now);
+        exec.retrace_ticks_fired().saturating_sub(before)
+    });
+    if fired > 0 {
+        // u32 is the tick-count width everywhere upstream (RetraceTick);
+        // saturating rather than `as` so an absurd delta can never wrap to a
+        // small number and understate the rate we are trying to measure.
+        crate::vi::note_retrace_ticks(u32::try_from(fired).unwrap_or(u32::MAX));
+    }
 }
 
 /// Create and start thread 0 running `recomp_entrypoint` -- the harness's
