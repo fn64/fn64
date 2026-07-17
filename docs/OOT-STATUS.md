@@ -324,11 +324,14 @@ road, but the top half misprojects).
   OoT modulate, decal/replace, primitive-tint, environment-blend, and
   shade-only source set. TEXEL1 and key/noise/K/LOD sources remain logged
   approximations until multi-tile/TMEM and the matching registers exist.
-- Rs-lane bounded probes use `_exit(0)` after explicitly flushing the
-  summary/trace. Suspended coroutines can be stopped inside an existing
+- Bounded probes in BOTH lanes use `_exit(0)` after explicitly flushing the
+  summary/trace (2026-07-16; was rs-lane-only, so C-lane probes aborted with
+  exit 134 in TLS teardown after a clean summary and probe exit codes were
+  untrustworthy). Suspended coroutines can be stopped inside an existing
   `extern "C"` blocking shim, where TLS teardown's forced unwind cannot cross
   the ABI boundary. This is harness teardown only; execution still uses the
-  same single executor and host thread.
+  same single executor and host thread. Exit 0 is now the probe-success
+  signal for both lanes.
 - Rs-lane boot now reaches the bounded **250 VI swaps and 250 render tasks**
   in 10/10 consecutive release probes; swap 3 is the first non-uniform guest
   framebuffer. The former `AudioLoad_Dma` unaligned-`SW` frontier was a stale
