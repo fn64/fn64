@@ -15,39 +15,48 @@ Found by auditing what the gates actually check. These are first because they
 undermine every other item's evidence: a bar that does not measure what it
 claims makes all the greens beneath it worth less.
 
-- [ ] **V1a ROOT-CAUSED: the C lane silently no-ops 127 real game functions.**
-  The c/rs divergence (byte-identical through swap 231, differs from 234) is
-  NOT an opcode bug and NOT the renderer. **The rs lane is correct; the C lane
-  is broken** — the opposite of this item's original framing.
+- [ ] **V1a ROOT-CAUSED: fn64's recompiler is RIGHT; the C-lane oracle is
+  systematically wrong.** The c/rs divergence (identical through swap 231,
+  differs from 234) is not an opcode bug and not the renderer.
 
-  Proven 2026-07-17, verified independently by the dispatcher at the source:
-  `Letterbox_Update` is listed in `$FN64_GAME_DIR/games/OOTU/oot.toml`'s
-  `[patches] stubs` (line 120), so N64Recomp emits a body with NO statements
-  (`RecompiledFuncs/funcs_37.c:1654-1657`) while the game still calls it
-  (`funcs_37.c:9090`). Effect on the letterbox size feeding
-  `Setup_View`'s `gDPFillRectangle` (decomp `z_rcp.c:1576`): rs steps
-  32→22→12→2→0 (matching `Letterbox_Update`'s `step = 10` + clamp); C is
-  pinned at 32 forever. First differing GBI command is that `G_FILLRECT`.
+  Both lanes read the same `oot.toml`, whose `[patches] stubs` lists **127**
+  functions under the rule "any cop0/cache/cop2/**break** opcode -> stub". A
+  branch-guarded `break` (a compiler divide-by-zero assert, reachable only on
+  pathological input) is perfectly recompilable, so most are FALSE POSITIVES.
+  `gen_stubs.py` says so about itself: it calls the rule "a blunt bootstrap
+  heuristic" and keeps a hand-maintained `force_recompile` escape hatch for
+  whichever cases someone noticed.
 
-  **The class, not the instance:** oot.toml stubs **127** functions, and the
-  generator's rule is "any cop0/cache/cop2/**break** opcode -> stub". Most are
-  false positives — a `break` that is BRANCH-GUARDED (a compiler
-  divide-by-zero assert, reachable only on pathological input) is perfectly
-  recompilable. Casualties include `Interface_Draw`, `Camera_Normal1`,
-  `KaleidoScope_Update`, `Message_DrawMain`, `TitleCard_Draw`. This is a mass
-  silent shrug of exactly the kind AGENTS.md forbids.
+  **fn64 already fixed this and the legacy tool did not.**
+  `recompile_rom.rs`'s `compiler_div_guards_only()` (:532) disassembles each
+  stubbed function and auto-un-stubs it when its only traps are guarded
+  div/overflow asserts (`auto_div_guards`, :288-311). N64Recomp has no such
+  recovery, so it emits a body with NO statements for `Letterbox_Update`
+  (`RecompiledFuncs/funcs_37.c:1654`) while the game calls it (:9090). The
+  letterbox feeds `Setup_View`'s `gDPFillRectangle` (decomp `z_rcp.c:1576`):
+  rs steps 32->22->12->2->0 (its real `step = 10` + clamp), C is pinned at 32
+  forever. That `G_FILLRECT` is the first differing GBI command. Casualties
+  also include `Interface_Draw`, `Camera_Normal1`, `KaleidoScope_Update`,
+  `Message_DrawMain`, `TitleCard_Draw` — the C lane silently no-ops the HUD,
+  camera, and pause menu.
 
-  `gen_stubs.py` DOCUMENTS this failure mode against itself: it calls the rule
-  "a blunt bootstrap heuristic", describes "a `break` behind a real guard
-  branch" precisely, and its `force_recompile` list is a hand-maintained
-  escape hatch for the cases someone happened to notice. It even records a
-  prior instance (`func_8000CC78`) where stubbing silently no-oped pointer
-  writes and crashed many calls later. Fix: teach the scan that a guarded
-  `break` is not unrecompilable, then regenerate — that likely empties most of
-  the 127 at once. The file is aki-recomp's (legacy, Phase H), so this may be
-  better fixed by fn64 owning the config (H1's `oot.toml` note).
+  **Do NOT "fix" aki-recomp for fn64's sake.** Nothing here needs a change in
+  the legacy tree: the rs lane is correct, and P1 retires the C lane to
+  CI-oracle-only. The real cost is to METHOD, not to output —
 
-  NOT proven: that no OTHER stub contributes before task 232. With 127 on the
+- [ ] **V1b DESIGN.md §4's A/B is compromised: the oracle is wrong in a known
+  direction.** §4 says diff the lanes and investigate disagreements. But past
+  the title screen the C lane is missing bodies for ~127 functions that fn64
+  correctly recompiles, so every future disagreement opens with "is this our
+  bug, or stub #94?" A differential whose reference is systematically degraded
+  cannot arbitrate. Options: (a) run the A/B with `force_recompile` covering
+  the auto-un-stubbed set so both lanes carry the same bodies; (b) bound the
+  A/B to swaps < 232, where they provably agree, and say so; (c) retire the
+  C-lane A/B early and lean on `scripts/lane-parity.sh` only as a regression
+  detector, not an arbiter. Until one is chosen, DESIGN.md §4 overstates what
+  the A/B can prove.
+
+  Not proven: that no OTHER stub contributes before task 232. With 127 on the
   same footing, others are plausibly live on this path.
 - [ ] **V0 doc hashes are now linted; 5 were unbacked.** `lint-docs.py` fails
   when a doc asserts a *content* hash no test contains (commit pins are
