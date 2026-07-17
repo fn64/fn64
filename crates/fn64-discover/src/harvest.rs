@@ -23,12 +23,12 @@ struct ProviderClaim {
 }
 
 #[derive(Debug, Clone)]
-struct LoadImage<'a> {
+struct LoadImage {
     bank: String,
     rom_start: u32,
     va_start: u32,
     va_end: u32,
-    bytes: &'a [u8],
+    bytes: Vec<u8>,
 }
 
 /// One merged function-entry conclusion returned to callers after facts are
@@ -60,6 +60,10 @@ pub enum HarvestError {
         rom_len: u32,
         va_len: u32,
     },
+    MappingBytesUnavailable {
+        bank: String,
+        detail: String,
+    },
     Monotonicity(MonotonicityViolation),
 }
 
@@ -81,7 +85,11 @@ impl std::fmt::Display for HarvestError {
                 va_len,
             } => write!(
                 f,
-                "Phase 3 mapping for bank {bank:?} has unequal ROM/VA lengths: 0x{rom_len:x} vs 0x{va_len:x}"
+                "Phase 3 mapping for bank {bank:?} has a VRAM range shorter than its ROM image: 0x{va_len:x} vs 0x{rom_len:x}"
+            ),
+            HarvestError::MappingBytesUnavailable { bank, detail } => write!(
+                f,
+                "Phase 3 could not materialize bytes for bank {bank:?}: {detail}"
             ),
             HarvestError::Monotonicity(error) => error.fmt(f),
         }
@@ -145,14 +153,12 @@ pub fn harvest_discovered_candidates(
     merge_claims(db, &claims)
 }
 
-fn load_images<'a>(
-    rom: &'a NormalizedRom,
-    db: &FactDb,
-) -> Result<Vec<LoadImage<'a>>, HarvestError> {
+fn load_images(rom: &NormalizedRom, db: &FactDb) -> Result<Vec<LoadImage>, HarvestError> {
     let mut images = Vec::new();
     for mapping in db.proven_rom_mappings() {
         let Fact::RomMapping {
             bank,
+            rom_space,
             rom_start,
             rom_end,
             va_start,
@@ -163,21 +169,19 @@ fn load_images<'a>(
         };
         let rom_len = rom_end.saturating_sub(*rom_start);
         let va_len = va_end.saturating_sub(*va_start);
-        if rom_len != va_len {
+        if va_len < rom_len {
             return Err(HarvestError::MappingLengthMismatch {
                 bank: bank.clone(),
                 rom_len,
                 va_len,
             });
         }
-        let Some(bytes) = rom.bytes.get(*rom_start as usize..*rom_end as usize) else {
-            return Err(HarvestError::MappingOutsideRom {
+        let bytes = crate::banks::materialize_rom_range(rom, db, *rom_space, *rom_start, *rom_end)
+            .map_err(|detail| HarvestError::MappingBytesUnavailable {
                 bank: bank.clone(),
-                rom_start: *rom_start,
-                rom_end: *rom_end,
-                rom_len: rom.len(),
-            });
-        };
+                detail,
+            })?
+            .bytes;
         images.push(LoadImage {
             bank: bank.clone(),
             rom_start: *rom_start,
@@ -192,7 +196,7 @@ fn load_images<'a>(
     Ok(images)
 }
 
-fn detect_jal_targets(images: &[LoadImage<'_>]) -> Vec<ProviderClaim> {
+fn detect_jal_targets(images: &[LoadImage]) -> Vec<ProviderClaim> {
     let mut claims = Vec::new();
     for image in images {
         for (index, bytes) in image.bytes.chunks_exact(4).enumerate() {
@@ -214,7 +218,7 @@ fn detect_jal_targets(images: &[LoadImage<'_>]) -> Vec<ProviderClaim> {
             }
         }
 
-        for resolved in resolve_linear_jalr_sites(image.bytes, image.va_start) {
+        for resolved in resolve_linear_jalr_sites(&image.bytes, image.va_start) {
             for target_image in target_images(images, image, resolved.target) {
                 claims.push(ProviderClaim {
                     target: BankAddr::new(&target_image.bank, resolved.target),
@@ -237,10 +241,10 @@ fn detect_jal_targets(images: &[LoadImage<'_>]) -> Vec<ProviderClaim> {
 /// candidates; otherwise same-VA mutually-exclusive overlays would create
 /// fabricated cross-bank claims for every bank sharing the address.
 fn target_images<'a>(
-    images: &'a [LoadImage<'_>],
-    source: &'a LoadImage<'_>,
+    images: &'a [LoadImage],
+    source: &'a LoadImage,
     target: u32,
-) -> Vec<&'a LoadImage<'a>> {
+) -> Vec<&'a LoadImage> {
     if target >= source.va_start && target < source.va_end {
         return vec![source];
     }
@@ -261,7 +265,7 @@ fn target_images<'a>(
         .collect()
 }
 
-fn detect_prologues(images: &[LoadImage<'_>]) -> Vec<ProviderClaim> {
+fn detect_prologues(images: &[LoadImage]) -> Vec<ProviderClaim> {
     let mut claims = Vec::new();
     for image in images {
         let words: Vec<u32> = image
@@ -315,7 +319,7 @@ fn detect_prologues(images: &[LoadImage<'_>]) -> Vec<ProviderClaim> {
 }
 
 fn detect_table_entries(
-    images: &[LoadImage<'_>],
+    images: &[LoadImage],
     entries: &[(BankAddr, u32, BankAddr, ProofState)],
 ) -> Vec<ProviderClaim> {
     entries
@@ -594,6 +598,7 @@ mod tests {
         let mut db = FactDb::new();
         let mapping = db.insert(Fact::RomMapping {
             bank: "boot".into(),
+            rom_space: crate::facts::RomAddressSpace::Physical,
             rom_start: 0x1000,
             rom_end: rom.len() as u32,
             va_start: 0x8000_0400,

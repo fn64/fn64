@@ -246,6 +246,7 @@ fn mappings_by_bank(db: &FactDb) -> BTreeMap<String, Vec<Mapping>> {
             rom_end,
             va_start,
             va_end,
+            ..
         } = fact
         else {
             unreachable!("proven_rom_mappings returned non-mapping")
@@ -328,6 +329,7 @@ functions = [
         let mut db = FactDb::new();
         let mapping = db.insert(Fact::RomMapping {
             bank: "boot".into(),
+            rom_space: crate::facts::RomAddressSpace::Physical,
             rom_start: 0x1000,
             rom_end: 0x1020,
             va_start: 0x8000_0400,

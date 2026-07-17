@@ -222,6 +222,7 @@ mod tests {
         let mut db = FactDb::new();
         let f = db.insert(Fact::RomMapping {
             bank: bank.to_string(),
+            rom_space: crate::facts::RomAddressSpace::Physical,
             rom_start,
             rom_end,
             va_start,

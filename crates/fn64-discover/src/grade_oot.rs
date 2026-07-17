@@ -272,6 +272,7 @@ mod tests {
         let mut db = FactDb::new();
         let f = db.insert(Fact::RomMapping {
             bank: bank.to_string(),
+            rom_space: crate::facts::RomAddressSpace::Physical,
             rom_start: 0x1000,
             rom_end: 0x1000 + va_len,
             va_start,
@@ -370,6 +371,7 @@ mod tests {
         let mut db = db_with_proven_bank("bank_a", 0x8000_0000, 0x2000);
         let f = db.insert(Fact::RomMapping {
             bank: "bank_b".to_string(),
+            rom_space: crate::facts::RomAddressSpace::Physical,
             rom_start: 0x2000,
             rom_end: 0x4000,
             va_start: 0x8000_0000,
