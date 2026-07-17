@@ -23,9 +23,13 @@ the work that closes it is rotting on stale pre-rename branches.
 - [ ] **R2 projection artifact**: root-cause the Hyrule Field large-world
   title-camera projection artifact (OOT-STATUS.md "render fidelity" #1; the
   raw-eye-matrix hypothesis is already falsified — don't re-test it).
-- [ ] **R3 eye-gate (user)**: batched side-by-side — RT64 frames + reference
-  frames vs mupen64plus ground truth at fixed swaps, native res. No agent
-  self-certifies this.
+- [x] **R3 eye-gate (user) — PASSED for the title/attract field window**
+  (2026-07-16): 7 RT64-lane true-color frames at swaps 400-1300 (dawn ->
+  daylight Hyrule Field title/attract) judged faithful by the user
+  ("frames look great"). Scope: title/attract camera only.
+- [ ] **R3b gameplay-scene eye-gate (user)**: same batch format from the
+  scripted-input path (file-select -> in-game, PlayState reached ~swap
+  4200) so the gate covers live gameplay camera/scenes, not just attract.
 - [ ] **R4 branch hygiene**: after R1 lands, close/prune the five stale
   render worktrees+branches (they are then strictly-worse duplicates).
 - [ ] **R5 audio out**: physical cpal playback WORKS (user report,
