@@ -302,6 +302,16 @@ road, but the top half misprojects).
    swim).
 
 ### Partial / loose ends
+- ~~`G_DL recursion exceeded MAX_DL_DEPTH (10)` spam during field render~~
+  FIXED (2026-07-16, fn64#2): gsSPBranchList is a tail jump that consumes no
+  return-stack entry, but the decoder recursed and counted it against the
+  call cap, silently dropping every branch chain deeper than 10. Branch now
+  reassigns the DL pointer; the call (G_DL_PUSH) cap is F3DEX2's 18; a
+  2^20-command whole-decode budget bounds cyclic DLs. Evidence: deterministic
+  1300-swap reference-backend A/B 4,207 warnings -> 0 with identical boot
+  progression; 10/10 consecutive clean release runs post-merge. Note: this
+  decoder runs only under the ReferenceBackend (the oracle/fallback) — RT64
+  walks display lists in its own code.
 - G_GEOMETRYMODE partial (only cull+lighting bits act); G_MOVEMEM/MOVEWORD
   partial; G_SETZIMG/SETCIMG/TEXRECT stubs.
 - G_SETCOMBINE + primitive/environment RGBA are implemented for the common
