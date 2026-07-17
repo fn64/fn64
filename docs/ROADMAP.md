@@ -27,9 +27,22 @@ the work that closes it is rotting on stale pre-rename branches.
   (2026-07-16): 7 RT64-lane true-color frames at swaps 400-1300 (dawn ->
   daylight Hyrule Field title/attract) judged faithful by the user
   ("frames look great"). Scope: title/attract camera only.
-- [ ] **R3b gameplay-scene eye-gate (user)**: same batch format from the
-  scripted-input path (file-select -> in-game, PlayState reached ~swap
-  4200) so the gate covers live gameplay camera/scenes, not just attract.
+- [~] **R3b gameplay-scene eye-gate**: batch captured + delivered
+  (2026-07-16, rs lane + RT64, swaps 4100-4300 via OOT_SCRIPT_INTERACTIVE).
+  Finding: INDOOR scenes (Link's house, Navi cutscene) render faithfully;
+  the OUTDOOR Kokiri Forest scene draws only HUD/minimap/Link — world
+  geometry is silently absent (green noise = unwritten framebuffer; no
+  RT64/render errors logged). Awaiting user verdict + root-cause below.
+- [ ] **R6 outdoor gameplay world geometry absent (RT64 lane)**: root-cause
+  why the Kokiri Forest room/world DLs draw nothing at swaps ~4200-4300
+  while HUD/actors do. Candidates: room mesh segment not loaded (rs-lane
+  overlay/DMA state), scene DL kind RT64's HLE skips, or the game state
+  itself (scripted input mashing A) — verify game-side state before
+  blaming the renderer.
+- [ ] **R5 clue (2026-07-16)**: run log shows `audio: 32000 Hz output
+  unavailable (cpal build_output_stream: Sample rate 32000 Hz is not
+  supported) -- trying next rate` — a rate fallback without resampling is
+  the prime suspect for the user-reported background static.
 - [ ] **R4 branch hygiene**: after R1 lands, close/prune the five stale
   render worktrees+branches (they are then strictly-worse duplicates).
 - [ ] **R5 audio out**: physical cpal playback WORKS (user report,
