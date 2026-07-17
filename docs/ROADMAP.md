@@ -60,6 +60,15 @@ the work that closes it is rotting on stale pre-rename branches.
   both harness ladders replaced with one guest-rate create. Verify by ear
   (foreground + backgrounded) to close.
 
+- [x] **R7 playable shell assembles the verified halves** (2026-07-16):
+  fn64-shell now takes `FN64_RECOMP=rs` (via the standalone
+  `crates/fn64-shell/rs/` manifest, same pattern as oot-boot/rs) and
+  `FN64_RENDER=rt64` (feature `rt64`), and the rs configuration links the
+  real aspMain audio ucode — so the windowed shell can run the
+  eyes-verified renderer + the gameplay-capable lane + real music, instead
+  of being pinned to C-lane + ReferenceBackend + silent synth. Launch:
+  see crates/fn64-shell/rs/Cargo.toml header. User play-test pending.
+
 ## Phase D — fn64 owns discover → decomp
 
 Today OoT symbol/section metadata comes entirely from the zeldaret decomp
