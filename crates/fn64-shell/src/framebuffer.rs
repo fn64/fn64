@@ -1,9 +1,14 @@
 //! N64 VI framebuffer -> window pixel-buffer conversion, factored out so the
 //! RGBA5551->RGBA8888 unpack is unit-testable without a live window.
 //!
-//! The game renders into rdram as **RGBA5551 big-endian halfwords**
-//! (`RRRRRGGGGGBBBBBA`, one 16-bit pixel = 2 bytes, MSB first) -- the exact
-//! format `examples/oot-boot`'s `dump_rgba5551_as_png` reads. `pixels`
+//! The game's pixels are logical **RGBA5551 halfwords** (`RRRRRGGGGGBBBBBA`),
+//! but fn64's rdram is native-endian-WORD storage: pixel `i`'s halfword
+//! lives at byte offset `(2*i) ^ 2` within a word-aligned framebuffer and is
+//! read native-endian -- the exact rule `examples/oot-boot`'s (fn64#1-fixed)
+//! `dump_rgba5551_as_png` and the runtime's `MEM_H` accessors use. Decoding
+//! flat big-endian instead scrambles the halfword pair inside every 32-bit
+//! word: colors shift fields (green tint) and neighboring pixels interleave
+//! (pixel noise). `pixels`
 //! (wgpu's `Rgba8UnormSrgb` texture) wants a tightly-packed RGBA8888 buffer,
 //! one byte each R,G,B,A in that order. This converts one into the other.
 
@@ -34,11 +39,14 @@ fn expand5(v: u16) -> u8 {
 /// source pixels actually converted.
 pub fn rgba5551_to_rgba8888(src: &[u8], dst: &mut [u8]) -> usize {
     debug_assert_eq!(dst.len(), FB_WIDTH * FB_HEIGHT * 4);
-    let pixels = (src.len() / 2).min(FB_WIDTH * FB_HEIGHT);
+    // Whole words only: the `^ 2` byte-lane rule pairs halfwords within a
+    // 4-byte word, so a trailing 2-byte remnant has no in-bounds partner.
+    let pixels = ((src.len() / 4) * 2).min(FB_WIDTH * FB_HEIGHT);
     for i in 0..pixels {
-        let hi = src[i * 2];
-        let lo = src[i * 2 + 1];
-        let px = u16::from_be_bytes([hi, lo]);
+        // Pixel `i` lives at `(2*i) ^ 2` in native-word rdram storage (the
+        // caller passes a word-aligned framebuffer slice), read native-endian.
+        let at = (i * 2) ^ 2;
+        let px = u16::from_ne_bytes([src[at], src[at + 1]]);
         let r5 = (px >> 11) & 0x1F;
         let g5 = (px >> 6) & 0x1F;
         let b5 = (px >> 1) & 0x1F;
@@ -73,54 +81,71 @@ mod tests {
         vec![0u8; FB_WIDTH * FB_HEIGHT * 4]
     }
 
+    /// Build a word-aligned framebuffer holding `px` values at pixels 0..n,
+    /// in fn64's native-word storage: pixel i at byte `(2*i) ^ 2`, native-endian.
+    fn fb_with(pixels_in: &[u16]) -> Vec<u8> {
+        let words = pixels_in.len().div_ceil(2);
+        let mut buf = vec![0u8; words * 4];
+        for (i, px) in pixels_in.iter().enumerate() {
+            let at = (i * 2) ^ 2;
+            buf[at..at + 2].copy_from_slice(&px.to_ne_bytes());
+        }
+        buf
+    }
+
     #[test]
     fn pure_red_pixel_unpacks_to_ff0000ff() {
         // RGBA5551 pure red: R=31,G=0,B=0,A=1 -> 0b11111_00000_00000_1 = 0xF801.
-        let src = [0xF8, 0x01];
+        let src = fb_with(&[0xF801]);
         let mut dst = blank_dst();
-        assert_eq!(rgba5551_to_rgba8888(&src, &mut dst), 1);
+        assert!(rgba5551_to_rgba8888(&src, &mut dst) >= 1);
         assert_eq!(&dst[0..4], &[255, 0, 0, 255]);
     }
 
     #[test]
     fn pure_green_and_blue() {
-        // Green: G=31 -> 0b00000_11111_00000_0 = 0x07C0.
+        // Green: G=31 -> 0x07C0. Blue: B=31 -> 0x003E.
         let mut dst = blank_dst();
-        rgba5551_to_rgba8888(&[0x07, 0xC0], &mut dst);
+        rgba5551_to_rgba8888(&fb_with(&[0x07C0]), &mut dst);
         assert_eq!(&dst[0..4], &[0, 255, 0, 255]);
-        // Blue: B=31 -> 0b00000_00000_11111_0 = 0x003E.
         let mut dst = blank_dst();
-        rgba5551_to_rgba8888(&[0x00, 0x3E], &mut dst);
+        rgba5551_to_rgba8888(&fb_with(&[0x003E]), &mut dst);
         assert_eq!(&dst[0..4], &[0, 0, 255, 255]);
     }
 
     #[test]
-    fn big_endian_halfword_order() {
-        // 0xF801 stored big-endian is [0xF8, 0x01]; swapping the bytes
-        // ([0x01, 0xF8]) must NOT decode as red -- guards the byte order.
+    fn word_swizzle_pairs_pixels_correctly() {
+        // Regression for the green-tinted/noisy N64 logo: pixels 0 and 1
+        // (red then blue) share one word with their halfwords SWAPPED in
+        // storage. A flat big-endian walk decodes them in the wrong order
+        // and with scrambled fields; the `^ 2` native read must yield
+        // red at pixel 0 and blue at pixel 1.
+        let src = fb_with(&[0xF801, 0x003E]);
         let mut dst = blank_dst();
-        rgba5551_to_rgba8888(&[0x01, 0xF8], &mut dst);
-        assert_ne!(&dst[0..4], &[255, 0, 0, 255]);
+        assert!(rgba5551_to_rgba8888(&src, &mut dst) >= 2);
+        assert_eq!(&dst[0..4], &[255, 0, 0, 255], "pixel 0 must decode red");
+        assert_eq!(&dst[4..8], &[0, 0, 255, 255], "pixel 1 must decode blue");
     }
 
     #[test]
     fn alpha_always_opaque() {
         // Even a pixel with the 1-bit alpha clear presents opaque.
         let mut dst = blank_dst();
-        rgba5551_to_rgba8888(&[0xF8, 0x00], &mut dst); // red, A=0
+        rgba5551_to_rgba8888(&fb_with(&[0xF800]), &mut dst); // red, A=0
         assert_eq!(dst[3], 255);
     }
 
     #[test]
     fn truncated_source_leaves_rest_black_no_panic() {
-        // One pixel of source into a full-frame dst: pixel 0 set, rest 0.
+        // One word of source into a full-frame dst: pixels 0-1 set, rest
+        // untouched; a sub-word remnant is skipped, never read OOB.
         let mut dst = vec![7u8; FB_WIDTH * FB_HEIGHT * 4];
-        let n = rgba5551_to_rgba8888(&[0xF8, 0x01], &mut dst);
-        assert_eq!(n, 1);
+        let n = rgba5551_to_rgba8888(&fb_with(&[0xF801, 0xF801]), &mut dst);
+        assert_eq!(n, 2);
         assert_eq!(&dst[0..4], &[255, 0, 0, 255]);
-        // Untouched tail keeps its prior contents (we don't clear it here);
-        // the loop simply didn't write past pixel 0.
-        assert_eq!(dst[4], 7);
+        assert_eq!(dst[8], 7);
+        // 2-byte remnant (half a word): zero pixels, no panic.
+        assert_eq!(rgba5551_to_rgba8888(&[0xF8, 0x01], &mut dst), 0);
     }
 
     #[test]
