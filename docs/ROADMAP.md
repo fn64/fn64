@@ -28,8 +28,11 @@ the work that closes it is rotting on stale pre-rename branches.
   self-certifies this.
 - [ ] **R4 branch hygiene**: after R1 lands, close/prune the five stale
   render worktrees+branches (they are then strictly-worse duplicates).
-- [ ] **R5 audio out (user)**: physical cpal playback verification (needs
-  ears; CoreAudio fails before stream creation on this machine so far).
+- [ ] **R5 audio out**: physical cpal playback WORKS (user report,
+  2026-07-16 — supersedes the earlier CoreAudio pre-stream failure note),
+  but has STATIC when the app runs in the background: likely the audio
+  callback starving under macOS App Nap / occlusion throttling (buffer
+  underrun). Investigate output buffering / process activity policy.
 
 ## Phase D — fn64 owns discover → decomp
 
