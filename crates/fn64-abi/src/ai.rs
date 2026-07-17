@@ -5,11 +5,14 @@ use crate::task_dispatch::{deliver_ai_buffer, AUDIO_RDRAM_LEN};
 
 /// `osAiSetFrequency(u32 frequency) -> s32` -- configures the audio DAC
 /// sample rate and returns the TRUE playback rate, or -1 if the frequency is
-/// unusable (`dacRate < AI_MIN_DAC_RATE`). No audio backend exists yet, so the
-/// frequency is stored as host state, while the host output stream is opened
-/// by its shell/harness at startup. The s32 return is load-bearing: the
-/// only decomp caller (heap.c:966) assigns it to `aiSamplingFrequency` and
-/// then DIVIDES by it (heap.c:1002), so a stale/zero $v0 divides by garbage.
+/// unusable (`dacRate < AI_MIN_DAC_RATE`). The true DAC rate is stored as
+/// host state AND forwarded to any registered `AudioBackend` via
+/// `set_frequency`, so the backend's producer-side resample ratio tracks
+/// the game (the host stream itself is opened by the shell/harness at
+/// startup and keeps its negotiated device rate). The s32 return is
+/// load-bearing: the only decomp caller (heap.c:966) assigns it to
+/// `aiSamplingFrequency` and then DIVIDES by it (heap.c:1002), so a
+/// stale/zero $v0 divides by garbage.
 ///
 /// Byte-exact to aisetfreq.c:12-36: `dacRate = (osViClock/freq + 0.5)`;
 /// `dacRate < AI_MIN_DAC_RATE(132)` -> -1; else `osViClock / (s32)dacRate`.
@@ -32,7 +35,9 @@ pub unsafe extern "C" fn osAiSetFrequency_recomp(_rdram: *mut u8, ctx: *mut Reco
     ctx.r2 = if dac_rate < AI_MIN_DAC_RATE {
         -1i32 as u32 as u64
     } else {
-        (VI_NTSC_CLOCK / dac_rate as i32) as u32 as u64
+        let true_rate = (VI_NTSC_CLOCK / dac_rate as i32) as u32;
+        crate::task_dispatch::notify_audio_frequency(true_rate);
+        true_rate as u64
     };
 }
 
@@ -336,5 +341,57 @@ mod tests {
         let mut ctx = ctx_with(400_000, 0, 0);
         unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
         assert_eq!(ctx.r2, -1i32 as u32 as u64, "dacRate < 132 -> -1");
+    }
+
+    /// A successful osAiSetFrequency must forward the TRUE DAC rate to the
+    /// registered backend's `set_frequency` (the producer-side resample
+    /// ratio), and a failed one (-1) must not. Fails against the bug where
+    /// the shim only stored host state and the backend ratio went stale.
+    #[test]
+    fn os_ai_set_frequency_forwards_true_rate_to_backend() {
+        use std::sync::{Arc, Mutex};
+
+        struct RateRecorder {
+            rates: Arc<Mutex<Vec<u32>>>,
+        }
+        impl AudioBackend for RateRecorder {
+            fn create(
+                &mut self,
+                _cfg: &fn64_audio::AudioConfig,
+            ) -> Result<(), fn64_audio::AudioError> {
+                Ok(())
+            }
+            fn queue_samples(&mut self, _samples: &[i16]) -> Result<(), fn64_audio::AudioError> {
+                Ok(())
+            }
+            fn frames_remaining(&self) -> Result<u32, fn64_audio::AudioError> {
+                Ok(0)
+            }
+            fn set_frequency(&mut self, sample_rate_hz: u32) {
+                self.rates
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(sample_rate_hz);
+            }
+        }
+
+        let rates = Arc::new(Mutex::new(Vec::new()));
+        crate::set_audio_backend(
+            Box::new(RateRecorder {
+                rates: Arc::clone(&rates),
+            }),
+            4096,
+        );
+
+        let mut ctx = ctx_with(32_000, 0, 0);
+        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+        let mut ctx = ctx_with(400_000, 0, 0); // -1 path: must NOT forward
+        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+
+        assert_eq!(
+            *rates.lock().unwrap_or_else(|error| error.into_inner()),
+            vec![32006],
+            "exactly one forward, carrying the true DAC rate"
+        );
     }
 }

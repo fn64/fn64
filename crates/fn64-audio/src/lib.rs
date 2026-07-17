@@ -209,6 +209,18 @@ pub struct CpalBackend {
     ring: SampleRing,
     channels: u16,
     stream: Option<Stream>,
+    /// The rate the host stream actually runs at, negotiated in [`create`]:
+    /// the requested guest rate when the device accepts it, else the
+    /// device's default output rate (macOS commonly rejects the N64's
+    /// 32 kHz). Playing guest-rate samples on a faster stream without
+    /// conversion starves the ring ~proportionally and the callback's
+    /// zero-fill turns that into loud static — hence [`LinearResampler`].
+    stream_rate_hz: u32,
+    /// The guest-side production rate the queued samples arrive at. Seeded
+    /// from the `create` config, updated live by `set_frequency`
+    /// (`osAiSetFrequency`).
+    guest_rate_hz: u32,
+    resampler: LinearResampler,
 }
 
 impl Default for CpalBackend {
@@ -223,7 +235,94 @@ impl CpalBackend {
             ring: Arc::new(Mutex::new(VecDeque::new())),
             channels: 2,
             stream: None,
+            stream_rate_hz: 0,
+            guest_rate_hz: 0,
+            resampler: LinearResampler::new(),
         }
+    }
+
+    /// The negotiated host stream rate, once `create` has succeeded.
+    pub fn stream_rate_hz(&self) -> Option<u32> {
+        self.stream.as_ref().map(|_| self.stream_rate_hz)
+    }
+}
+
+/// Stateful linear resampler over interleaved `i16` frames. Carries the
+/// last input frame and the fractional read position across calls, so
+/// chunked `queue_samples` input splices without discontinuities (a seam
+/// pop per AI buffer would itself be audible crackle).
+struct LinearResampler {
+    /// Last input frame seen (len = channels); empty until first input.
+    carry: Vec<i16>,
+    /// Fractional read position in [0, 1) measured from `carry`.
+    phase: f64,
+}
+
+impl LinearResampler {
+    fn new() -> Self {
+        LinearResampler {
+            carry: Vec::new(),
+            phase: 0.0,
+        }
+    }
+
+    /// Convert `input` (interleaved, `channels` per frame, produced at
+    /// `in_hz`) to `out_hz`, appending to `out`. Equal rates pass through
+    /// unchanged (byte-identical to the pre-resampler behavior).
+    fn process(&mut self, input: &[i16], channels: usize, in_hz: u32, out_hz: u32, out: &mut Vec<i16>) {
+        debug_assert!(channels > 0 && in_hz > 0 && out_hz > 0);
+        let in_frames = input.len() / channels;
+        if in_hz == out_hz {
+            // Keep the carry coherent so a mid-stream rate change (a game
+            // calling osAiSetFrequency) still splices continuously.
+            if in_frames > 0 {
+                self.carry.clear();
+                self.carry
+                    .extend_from_slice(&input[(in_frames - 1) * channels..in_frames * channels]);
+            }
+            out.extend_from_slice(input);
+            return;
+        }
+
+        let carry = std::mem::take(&mut self.carry);
+        let have_carry = !carry.is_empty();
+        // Virtual input timeline: the carry frame (if any) at index 0, then
+        // this call's frames. Interpolation needs two frames.
+        let total = in_frames + usize::from(have_carry);
+        let frame_at = |i: usize| -> &[i16] {
+            if have_carry && i == 0 {
+                &carry
+            } else {
+                let j = i - usize::from(have_carry);
+                &input[j * channels..(j + 1) * channels]
+            }
+        };
+        if total < 2 {
+            if in_frames > 0 {
+                self.carry = frame_at(total - 1).to_vec();
+            } else {
+                self.carry = carry; // nothing new; keep prior state
+            }
+            return;
+        }
+
+        let step = in_hz as f64 / out_hz as f64;
+        let mut pos = self.phase;
+        let last = (total - 1) as f64;
+        while pos < last {
+            let i = pos as usize;
+            let frac = pos - i as f64;
+            let a = frame_at(i);
+            let b = frame_at(i + 1);
+            for ch in 0..channels {
+                let s = f64::from(a[ch]) + (f64::from(b[ch]) - f64::from(a[ch])) * frac;
+                out.push(s.round() as i16);
+            }
+            pos += step;
+        }
+        // Rebase onto the final frame, which becomes the next call's carry.
+        self.phase = pos - last;
+        self.carry = frame_at(total - 1).to_vec();
     }
 }
 
@@ -235,35 +334,71 @@ impl AudioBackend for CpalBackend {
             reason: "no default output device".to_string(),
         })?;
 
-        let stream_config = StreamConfig {
-            channels: cfg.channels,
-            sample_rate: cfg.sample_rate_hz,
-            buffer_size: cpal::BufferSize::Default,
+        let build = |rate_hz: u32| {
+            let stream_config = StreamConfig {
+                channels: cfg.channels,
+                sample_rate: rate_hz,
+                buffer_size: cpal::BufferSize::Default,
+            };
+            let ring = Arc::clone(&self.ring);
+            device
+                .build_output_stream(
+                    stream_config,
+                    move |data: &mut [i16], _info: &cpal::OutputCallbackInfo| {
+                        let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
+                        for slot in data.iter_mut() {
+                            *slot = ring.pop_front().unwrap_or(0);
+                        }
+                    },
+                    move |err| {
+                        // cpal stream error callback: no runtime state to
+                        // report it into (matches `RenderError`'s stance that
+                        // a backend failure is surfaced for a caller to poll,
+                        // not force-propagated); logged so it isn't silent.
+                        eprintln!("fn64-audio: cpal stream error: {err}");
+                    },
+                    None,
+                )
         };
 
-        let ring = Arc::clone(&self.ring);
-        let stream = device
-            .build_output_stream(
-                stream_config,
-                move |data: &mut [i16], _info: &cpal::OutputCallbackInfo| {
-                    let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
-                    for slot in data.iter_mut() {
-                        *slot = ring.pop_front().unwrap_or(0);
-                    }
-                },
-                move |err| {
-                    // cpal stream error callback: no runtime state to
-                    // report it into (matches `RenderError`'s stance that
-                    // a backend failure is surfaced for a caller to poll,
-                    // not force-propagated); logged so it isn't silent.
-                    eprintln!("fn64-audio: cpal stream error: {err}");
-                },
-                None,
-            )
-            .map_err(|e| AudioError::Backend {
-                backend: "cpal",
-                reason: format!("build_output_stream failed: {e}"),
-            })?;
+        // Prefer a stream at the guest's own rate (no conversion). Devices
+        // are allowed to refuse it (macOS CoreAudio commonly rejects the
+        // N64's 32 kHz); then run at the device's default rate and let
+        // `queue_samples` resample. Never play guest-rate samples on a
+        // different-rate stream: the rate mismatch chronically starves or
+        // floods the ring and the callback's zero-fill renders that as
+        // loud static.
+        let (stream, stream_rate_hz) = match build(cfg.sample_rate_hz) {
+            Ok(stream) => (stream, cfg.sample_rate_hz),
+            Err(requested_err) => {
+                let default_cfg =
+                    device
+                        .default_output_config()
+                        .map_err(|e| AudioError::Backend {
+                            backend: "cpal",
+                            reason: format!(
+                                "build_output_stream failed at {} Hz ({requested_err}) and \
+                                 default_output_config failed: {e}",
+                                cfg.sample_rate_hz
+                            ),
+                        })?;
+                let fallback_hz = default_cfg.sample_rate();
+                eprintln!(
+                    "fn64-audio: device rejected {} Hz ({requested_err}); opening at \
+                     device-default {fallback_hz} Hz with linear resampling",
+                    cfg.sample_rate_hz
+                );
+                let stream = build(fallback_hz).map_err(|e| AudioError::Backend {
+                    backend: "cpal",
+                    reason: format!(
+                        "build_output_stream failed at requested {} Hz and at \
+                         device-default {fallback_hz} Hz: {e}",
+                        cfg.sample_rate_hz
+                    ),
+                })?;
+                (stream, fallback_hz)
+            }
+        };
 
         stream.play().map_err(|e| AudioError::Backend {
             backend: "cpal",
@@ -271,6 +406,9 @@ impl AudioBackend for CpalBackend {
         })?;
 
         self.channels = cfg.channels;
+        self.stream_rate_hz = stream_rate_hz;
+        self.guest_rate_hz = cfg.sample_rate_hz;
+        self.resampler = LinearResampler::new();
         self.stream = Some(stream);
         Ok(())
     }
@@ -279,8 +417,16 @@ impl AudioBackend for CpalBackend {
         if self.stream.is_none() {
             return Err(AudioError::NotReady("create() not called"));
         }
+        let mut converted = Vec::with_capacity(samples.len());
+        self.resampler.process(
+            samples,
+            self.channels.max(1) as usize,
+            self.guest_rate_hz,
+            self.stream_rate_hz,
+            &mut converted,
+        );
         let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
-        ring.extend(samples.iter().copied());
+        ring.extend(converted);
         Ok(())
     }
 
@@ -294,13 +440,15 @@ impl AudioBackend for CpalBackend {
     }
 
     fn set_frequency(&mut self, sample_rate_hz: u32) {
-        // Real hardware allows `osAiSetFrequency` mid-game; honoring it on
-        // a live cpal stream means rebuilding the stream at the new rate.
-        // Not yet wired (no call site needs it in this workspace today) --
-        // matching `RenderBackend::resize`'s "infallible, backend reports
-        // trouble at next real call" contract, this silently no-ops for
-        // now rather than tearing down the live stream on every call.
-        let _ = sample_rate_hz;
+        // Real hardware allows `osAiSetFrequency` mid-game. The live cpal
+        // stream keeps its negotiated rate; only the producer-side resample
+        // ratio changes, so this is cheap and infallible (matching
+        // `RenderBackend::resize`'s contract). A zero rate is a caller bug
+        // upstream (`osAiSetFrequency` returns -1 before reaching us) and
+        // is ignored rather than poisoning the ratio.
+        if sample_rate_hz != 0 {
+            self.guest_rate_hz = sample_rate_hz;
+        }
     }
 }
 
@@ -418,5 +566,83 @@ mod tests {
         // not exist in a headless CI/sandbox environment.
         let backend: Box<dyn AudioBackend> = Box::new(CpalBackend::new());
         drop(backend);
+    }
+
+    // --- LinearResampler (the static-fix core; device-less, pure) --------
+
+    #[test]
+    fn resampler_equal_rates_pass_through_unchanged() {
+        let mut rs = LinearResampler::new();
+        let input: Vec<i16> = (0..64).collect();
+        let mut out = Vec::new();
+        rs.process(&input, 2, 32000, 32000, &mut out);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn resampler_32k_to_48k_produces_three_frames_per_two() {
+        // 32000 -> 48000 is exactly 2:3. 200 stereo input frames must yield
+        // ~300 output frames (± the carried boundary frame).
+        let mut rs = LinearResampler::new();
+        let input: Vec<i16> = (0..400).collect(); // 200 stereo frames
+        let mut out = Vec::new();
+        rs.process(&input, 2, 32000, 48000, &mut out);
+        let frames_out = out.len() / 2;
+        assert!(
+            (298..=300).contains(&frames_out),
+            "expected ~300 output frames for 200 input frames at 2:3, got {frames_out}"
+        );
+    }
+
+    #[test]
+    fn resampler_preserves_stereo_channel_identity() {
+        // L = constant 1000, R = constant -2000: linear interpolation of
+        // constants is the constant, so ANY cross-channel mixup (the L/R
+        // interleave bug class) shows up as a wrong value immediately.
+        let mut rs = LinearResampler::new();
+        let mut input = Vec::new();
+        for _ in 0..100 {
+            input.push(1000i16);
+            input.push(-2000i16);
+        }
+        let mut out = Vec::new();
+        rs.process(&input, 2, 32000, 48000, &mut out);
+        assert!(!out.is_empty());
+        for frame in out.chunks_exact(2) {
+            assert_eq!(frame, [1000, -2000]);
+        }
+    }
+
+    #[test]
+    fn resampler_chunked_input_equals_single_call() {
+        // Continuity across queue_samples boundaries: splitting the same
+        // input into arbitrary chunks must produce the identical output
+        // stream (a per-chunk phase/carry reset = an audible seam pop).
+        let input: Vec<i16> = (0..600).map(|i| ((i * 37) % 5000) as i16).collect();
+
+        let mut whole = Vec::new();
+        LinearResampler::new().process(&input, 2, 32000, 48000, &mut whole);
+
+        let mut chunked = Vec::new();
+        let mut rs = LinearResampler::new();
+        for chunk in [&input[..106], &input[106..340], &input[340..]] {
+            rs.process(chunk, 2, 32000, 48000, &mut chunked);
+        }
+        assert_eq!(whole, chunked);
+    }
+
+    #[test]
+    fn resampler_downsamples_toward_slower_stream() {
+        // 32000 -> 22050 (a slower device): fewer frames out than in.
+        let mut rs = LinearResampler::new();
+        let input: Vec<i16> = (0..400).collect(); // 200 stereo frames
+        let mut out = Vec::new();
+        rs.process(&input, 2, 32000, 22050, &mut out);
+        let frames_out = out.len() / 2;
+        let expected = (200.0 * 22050.0 / 32000.0) as usize; // ~137
+        assert!(
+            frames_out.abs_diff(expected) <= 2,
+            "expected ~{expected} output frames, got {frames_out}"
+        );
     }
 }
