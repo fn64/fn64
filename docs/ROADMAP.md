@@ -167,6 +167,55 @@ fn64-discover has Phases 1/2/4/5 + bounded-6; the rest is design-only
   decomp-metadata build. Then produce the WM2000 pack with zero
   game-specific code.
 
+## Phase H — cut the aki-recomp tether (blocks going public)
+
+`/Users/jer/Code/aki-recomp` is a **legacy project** (user, 2026-07-17), yet
+fn64 cannot boot OoT without it. Everything the toolchain needs should live in
+fn64. This phase is not "declare the dependency" — it is delete it.
+
+Inventoried 2026-07-17. Five things are pulled from the legacy checkout; only
+ONE has a permanent reason to be out-of-tree:
+
+| What | Size | Verdict |
+|---|---|---|
+| `refs/N64RecompSource/include` (`recomp.h`) | 72K | **Vendor.** MIT, from fn64's own upstream fork. |
+| `games/OOTU/oot.toml` | 156 lines | **Own it.** Recompiler config, not game bytes; its header calls itself a scaffold. |
+| `runtime/ABI-SURFACE.md` + `abi_surface.json` | 204K | **Needs a human clean-room call** (H2). |
+| `games/*/syms/dump.toml`, `refs/oot-decomp/**/segments.csv` | — | **Dies with Phase D.** D4 emits fn64's own pack; D-gate proves it. |
+| `games/*/*.z64` | — | **Stays out-of-tree forever.** But that is a plain `ROM=` path, never `$AKI`-shaped. |
+
+So `$AKI` is not a domain concept needing a better name — it is "the old
+project's working directory", four artifacts fn64 should own plus one ROM
+path. Do NOT rename it; delete the need for it.
+
+- [ ] **H1 vendor/own the three non-oracle artifacts.** Vendor `recomp.h` +
+  `recompiler/` from the MIT N64Recomp fork (submodule or checked-in copy —
+  it is 72K); move `oot.toml` into fn64 (it is config, no game bytes); replace
+  the `$AKI`-derived ROM defaults with a plain `ROM=`/`OOT_ROM=` that has no
+  legacy path baked in. After this, an rs-lane boot needs a ROM and nothing
+  else from aki-recomp.
+- [ ] **H2 decide where `ABI-SURFACE.md` lives — human call, clean-room.**
+  It is AGENTS.md read-order item 3 (mandatory), currently in a dead repo, so
+  a fresh clone cannot satisfy the contract. It is *extracted from* ROM-derived
+  generated C but is itself a symbol/signature inventory, not game bytes —
+  plausibly in-tree-able under `docs/`, which would close the read-order hole.
+  That is exactly the clean-room judgment AGENTS.md reserves for a human; an
+  agent must not decide it. If it stays out-of-tree, AGENTS.md's read order
+  must stop citing it as mandatory. Blocks: AGENTS.md item 3,
+  `COMPLETENESS.md:280` (same wrong repo-local citation).
+- [ ] **H3 `fn64-discover` gates cannot run off the author's machine.** Not
+  env vars with defaults — compile-time `const`s: `gate_b1.rs:18/20-22`,
+  `gate_d1.rs:18-19/24-27`, `gate_b2.rs:39/51` hold
+  `/Users/jer/Downloads/...z64` and `/Users/jer/Code/aki-recomp/...`. The
+  D1/B1 grading numbers cited in Phase D are reproducible by exactly one
+  person. Fix: env var + a loud, named skip when unset (never a silent pass —
+  that is the "silent shrug" AGENTS.md bans).
+
+Nothing here blocks R5/Phase D on the author's machine, which is why it has
+survived this long.
+
+## Phase P — pure-Rust endgame (after R-gate + D-gate)
+
 ## Phase P — pure-Rust endgame (after R-gate + D-gate)
 
 - [ ] **P1**: retire the C lane to CI-oracle-only (DESIGN.md M3); relicense

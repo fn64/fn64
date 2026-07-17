@@ -2,3 +2,10 @@
 examples/*/target
 examples/*/target-c
 /examples/oot-boot/rs/recompiled
+# Agent scratch: worktrees + per-user settings. settings.local.json is
+# per-machine by design; .claude/worktrees holds live checkouts.
+/.claude/
+# Eye-gate captures: frame PNGs from a user's own ROM. FAST-LOOP.md calls
+# these evidence-only/untracked -- this is what enforces it (no game content
+# in git, per AGENTS.md).
+/.eyegate/

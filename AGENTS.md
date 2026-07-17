@@ -9,8 +9,14 @@ including you. This file is short on purpose. Read it all.
 
 1. `README.md` — what this is and why.
 2. `docs/DESIGN.md` — architecture, threading model, A/B migration plan.
-3. `docs/ABI-SURFACE.md` — the extern surface recompiled code expects
-   (mechanically extracted; regenerate rather than hand-edit).
+3. `runtime/ABI-SURFACE.md` in the out-of-tree aki-recomp checkout — the extern
+   surface recompiled code expects (mechanically extracted; regenerate rather
+   than hand-edit; `runtime/abi_surface.json` is the machine-readable form).
+   It is NOT in this repo and cannot be: it is extracted from ROM-derived
+   generated C, and the no-game-content rule below keeps it out of git. Locate
+   the checkout via `$AKI` (`scripts/` currently default it to a path on the
+   author's machine — see ROADMAP "H1"; if it is unset and you need this file,
+   ask rather than guess).
 4. The docs referenced by whatever you're touching. Docs here are load-bearing:
    if you change behavior, you change its doc in the same commit.
 
