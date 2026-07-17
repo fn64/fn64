@@ -758,9 +758,18 @@ mod tests {
             // bearing assertion here is that with_pi_dma panics because no
             // ROM was ever installed in this fresh subprocess, not that the
             // (deliberately trivial) transfer parameters are realistic.
+            //
+            // `mb` must be a real KSEG0 vram address with a buffer behind it:
+            // a bare `r5 = 0` is NOT "rdram offset 0". `RdramAddr::from_gpr(0)`
+            // computes `0 - 0xFFFFFFFF_80000000` = 0x80000000, so this shim's
+            // `mb`-relative read of `retQueue` (+0x4) dereferenced ~2 GiB past
+            // a 64-byte Vec and killed the child with SIGBUS *before* reaching
+            // the `no ROM installed` panic -- the test still "passed" on
+            // `!status.success()` while proving nothing about the trap.
+            const MB_VRAM: u64 = 0xFFFF_FFFF_8000_0000;
             let mut ctx = ctx_zeroed();
-            let mut rdram = vec![0u8; 64];
-            ctx.r5 = 0; // mb address 0
+            let mut rdram = rdram_for_vram(MB_VRAM + 0x14); // OSIoMesg ends at +0x14
+            ctx.r5 = MB_VRAM;
             ctx.r6 = 0; // direction = ToRdram
             unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
         }

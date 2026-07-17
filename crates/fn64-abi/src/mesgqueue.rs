@@ -437,9 +437,13 @@ mod tests {
         // thread's own body should ever be able to observe/write, so any
         // cross-wire between the two coroutines' contexts is directly
         // visible rather than needing a crash to notice.
-        let mut rdram_a = vec![0u8; 64];
+        // Sized from the guest addresses these buffers are actually indexed
+        // by, not hand-picked: thread B's `msg_out_vram` (KSEG0+0x40, below)
+        // makes `osRecvMesg_recomp` store a word AT rdram offset 0x40, which
+        // a `vec![0u8; 64]` ends one word short of -- see `rdram_for_vram`.
+        let mut rdram_a = rdram_for_vram(0xFFFF_FFFF_8000_0040);
         let rdram_a_ptr = rdram_a.as_mut_ptr();
-        let mut rdram_b = vec![0u8; 64];
+        let mut rdram_b = rdram_for_vram(0xFFFF_FFFF_8000_0040);
         let rdram_b_ptr = rdram_b.as_mut_ptr();
 
         let observed_a = std::rc::Rc::new(std::cell::RefCell::new(None));

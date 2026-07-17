@@ -109,6 +109,79 @@ def check_env_vars() -> None:
                     fail(f"{rel}:{lineno}", f"documents {var}, which appears nowhere in code")
 
 
+# --- 3b. closed roadmap items stay short -------------------------------------
+# A finished item's detail belongs in git, not in the doc every session reads.
+# This check exists because prose did not work: the policy is stated IN
+# ROADMAP.md, and the session that wrote it then filed two 15-line completion
+# records within the hour. An invariant enforced by review is a bug with a
+# delay timer (AGENTS.md), so it is enforced here instead.
+CLOSED_ITEM_MAX_LINES = 4
+
+
+def _scan_closed_items(lines: list[str]) -> None:
+    start, label = None, ""
+    for i, line in enumerate(lines):
+        # An item ends at the next item, or at the next top-level block.
+        if start is not None and (line.startswith("- [") or (line and not line[0].isspace())):
+            if i - start > CLOSED_ITEM_MAX_LINES:
+                fail(
+                    f"docs/ROADMAP.md:{start + 1}",
+                    f"closed item {label!r} is {i - start} lines (max {CLOSED_ITEM_MAX_LINES}) -- "
+                    f"summarize it; the detail is in git",
+                )
+            start = None
+        if line.startswith("- [x]"):
+            start, label = i, line[5:47].strip(" *")
+
+
+def check_closed_roadmap_items() -> None:
+    roadmap = ROOT / "docs/ROADMAP.md"
+    if roadmap.exists():
+        _scan_closed_items(roadmap.read_text().splitlines())
+
+
+# --- 3c. a doc asserting a hash must have a test that checks it ---------------
+# A SHA in a doc claims a REPRODUCIBLE fact ("these two lanes render
+# byte-identically at swap 499"). Verified once by hand and never again, it is
+# decorative: it cannot fail, so it cannot warn. All 5 hashes in docs/ were
+# unbacked when this check was written (ROADMAP V1) -- including the framebuffer
+# SHA that is fn64's central c/rs lane-parity claim.
+#
+# ponytail: a hash is either load-bearing (then a test owns it) or prose (then
+# do not write it as evidence). This check forces that choice.
+HASH = re.compile(r"\b[0-9a-f]{40,64}\b")
+
+
+def check_doc_hashes_are_tested() -> None:
+    src = subprocess.run(
+        ["git", "grep", "-hoE", r"[0-9a-f]{40,64}", "--", "*.rs", "*.sh", "*.py"],
+        cwd=ROOT, capture_output=True, text=True,
+    ).stdout
+    tested = set(src.split())
+    for doc in docs():
+        for lineno, line in enumerate(doc.read_text().splitlines(), 1):
+            low = line.lower()
+            # A COMMIT PIN is provenance ("checked against CEN64 at e0641c8"),
+            # not a reproducible measurement -- it is exactly the clean-room
+            # citation AGENTS.md requires, and no test should own it. Only
+            # CONTENT hashes (a framebuffer SHA, a golden digest) assert a fact
+            # a test can re-check. Distinguish by context, not by the hash.
+            if any(k in low for k in ("commit", "github.com", "pinned", "tree/", "blob/")):
+                continue
+            # An explicitly-unverified claim is honest prose, not a false gate.
+            if "not tested" in low or "no test" in low:
+                continue
+            for h in HASH.findall(line):
+                if h in tested:
+                    continue
+                rel = doc.relative_to(ROOT)
+                fail(
+                    f"{rel}:{lineno}",
+                    f"asserts content hash {h[:12]}… that no test checks -- either gate it "
+                    f"or stop citing it as evidence",
+                )
+
+
 # --- 4. COMPLETENESS's own regen recipe must not be blind --------------------
 # It once grepped lib.rs alone; the crate had been split into modules, so it
 # matched ZERO of 73 shims and "regenerating" re-asserted a falsehood. A doc
@@ -136,6 +209,28 @@ def check_scripts() -> None:
                     fail(str(doc.relative_to(ROOT)), f"cites {ref}, which is not executable")
 
 
+def _closed_item_check_fires() -> bool:
+    """Feed the closed-item check a bloated item and assert it complains.
+    Reconstructs the exact mistake this check exists to catch: a [x] item that
+    carries its verification detail instead of a summary."""
+    global errors
+    saved, errors = errors, []
+    try:
+        bloated = [
+            "- [x] **H1 vendor `recomp.h`** (2026-07-17) — in-tree.",
+            "  Verified: the C lane builds with RECOMP_H_DIR unset;",
+            "  override still honored; 621/621 workspace tests pass;",
+            "  vendored copy byte-identical to upstream a8e2200.",
+            "  Two things the inventory got wrong, found by doing it:",
+            "  only recomp.h was needed, and oot.toml must not move.",
+            "- [ ] **H3 next item**",
+        ]
+        _scan_closed_items(bloated)
+        return len(errors) == 1
+    finally:
+        errors = saved
+
+
 def selftest() -> int:
     """Prove the checks can FAIL. A linter that passes because it isn't looking
     is worse than none -- the first cut of REF excluded backticks, matched 4
@@ -152,6 +247,8 @@ def selftest() -> int:
          lambda: all("*" in r for r in REF.findall("`crates/*/tests/`"))),
         ("env var regex", "catches a fake var",
          lambda: ENV.findall("set `FN64_TOTALLY_FAKE=1`") == ["FN64_TOTALLY_FAKE"]),
+        ("closed-item cap fires", "a bloated [x] item must fail",
+         _closed_item_check_fires),
     ]
     bad = [name for name, why, fn in cases if not fn()]
     for name in bad:
@@ -166,6 +263,7 @@ def main() -> int:
     if "--selftest" in sys.argv:
         return selftest()
     for fn in (check_refs, check_readme_crates, check_env_vars,
+               check_closed_roadmap_items, check_doc_hashes_are_tested,
                check_completeness_recipe, check_scripts):
         fn()
     if errors:

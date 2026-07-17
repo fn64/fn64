@@ -9,6 +9,45 @@ gate** (see DELEGATION.md).
 Status legend: `[ ]` open, `[~]` dispatched/in-flight, `[x]` merged+verified
 (AGENTS.md bars). Update this file in the same commit as the work it tracks.
 
+## Phase V — the verification gaps (open findings, 2026-07-17)
+
+Found by auditing what the gates actually check. These are first because they
+undermine every other item's evidence: a bar that does not measure what it
+claims makes all the greens beneath it worth less.
+
+- [ ] **V0 doc hashes are now linted; 5 were unbacked.** `lint-docs.py` fails
+  when a doc asserts a *content* hash no test contains (commit pins are
+  provenance and exempt). All five in OOT-STATUS.md were unbacked — verified
+  once by hand, re-checked by nothing, unable to fail and therefore unable to
+  warn. Marked honestly for now; gating them is V1's job. The generalization:
+  a hash in a doc is either load-bearing (a test owns it) or prose (don't cite
+  it as evidence).
+- [ ] **V1 the c/rs lane parity — fn64's central A/B claim — is NOT tested.**
+  DESIGN.md §4 and §1.1 rest on the two lanes linking identical recompiled
+  semantics, so they A/B each other. OOT-STATUS.md cites framebuffer SHA-256
+  `bc19787…6ec1db` byte-identical between lanes at swap 499. Verified
+  2026-07-17: **that SHA appears in no test.** It was checked once, by hand,
+  and nothing re-checks it. Fix: a bounded per-lane framebuffer SHA compare in
+  a test (the harness already dumps `/tmp/fn64-fb-{swap}.png`;
+  `OOT_MAX_SWAPS`/`OOT_STOP_ON_FRAME` bound it). Skip loudly when game content
+  is absent, per `boot_depth.rs`'s existing pattern.
+- [ ] **V2 the only integration gate asserts liveness, not correctness.**
+  `examples/oot-boot/tests/boot_depth.rs:27,91` asserts only
+  `swaps >= MIN_EXPECTED_SWAPS` (200). OoT could render pure garbage for 200
+  swaps and pass. It is a floor against regression-to-dead, nothing more —
+  which is fine, but nothing else covers correctness end-to-end, so the gate's
+  green overstates what is known. V1 is the cheapest real correctness signal
+  to add beside it.
+- [ ] **V3 the differential mechanism AGENTS.md REQUIRES may not run.**
+  AGENTS.md: "Runtime behavior changes emit the shared event trace and get
+  diffed against the reference runtime over identical recompiled code." That
+  mechanism is `crates/fn64-diff` (1,605 lines). Verified 2026-07-17: its
+  `lockstep` binary is wired into no test and no gate, and it depends on a
+  faki-tools oracle subprocess whose checkout is effectively empty. If it
+  cannot run, AGENTS.md's differential requirement is unenforceable and the
+  contract overstates the process. Under investigation; resolve by wiring it
+  to a gate, or by cutting it and amending AGENTS.md to match reality.
+
 ## Phase R — close the "OoT renders faithfully" gate
 
 The standing milestone gate (OOT-STATUS.md "Beyond OoT"). The renderer lands
@@ -163,20 +202,10 @@ Everything else is now owned here. After D-gate, only a user's own ROM remains.
 - [x] **H2 `ABI-SURFACE.md` not needed** (2026-07-17) — nothing consumes it;
   `fn64-abi`'s `c_smoke` link test is the live oracle. Read order now points at
   the code (AGENTS.md carries the reasoning).
-- [ ] **H2b `OOT_*` debug knobs read inside game-agnostic core crates.** README
-  promises the core has "zero game-specific assumptions"; by behavior that
-  holds, but ~15 game-named vars are read in core code —
-  `fn64-abi/src/task_dispatch.rs` (`OOT_SKIP_AUDIO_UCODE`, `OOT_DUMP_AUDIO_PCM`,
-  `OOT_DUMP_AUDIO_TASK`, `OOT_AUDIO_UCODE_TIMING`, `OOT_PHASE_TIMING`) and
-  `fn64-render-rt64` (`OOT_DUMP_PROJ`, `OOT_NO_DEPTH`). Nothing about dumping a
-  projection matrix is OoT-specific. The moment a second game wants one, the
-  var is renamed or DUPLICATED — and duplication is how a game-agnostic core
-  becomes a two-game core. Rename to `FN64_*` in one sweep; `OOT_*` stays
-  correct in `examples/oot-boot/`, which is game-specific by design.
-
-  Leave alone: panic messages citing `games/OOTU/RecompiledFuncs` as evidence
-  for an unimplemented shim. Those are loud traps naming the corpus that proves
-  the gap.
+- [x] **H2b `OOT_*` debug knobs read inside game-agnostic core crates.** Core
+  knobs are now `FN64_*`; `fn64-render-rt64`'s `debug_flag()` and `fn64-abi`'s
+  `assert_no_legacy_env_vars()` panic on a retired `OOT_*` spelling so an old
+  invocation cannot silently no-op. `examples/` keeps `OOT_*` by design.
 - [ ] **H3 `fn64-discover` gates cannot run off the author's machine.** Not
   env vars with defaults — compile-time `const`s: `gate_b1.rs:18/20-22`,
   `gate_d1.rs:18-19/24-27`, `gate_b2.rs:39/51` hold
@@ -185,12 +214,29 @@ Everything else is now owned here. After D-gate, only a user's own ROM remains.
   person. Fix: env var + a loud, named skip when unset (never a silent pass —
   that is the "silent shrug" AGENTS.md bans).
 
-Nothing here blocks R5/Phase D on the author's machine, which is why it has
-survived this long.
+- [ ] **H4 `cargo test -p fn64-abi` flakes ~60%; nextest does NOT.** Measured
+  2026-07-17 across the day: `cargo test -p fn64-abi --lib` ->
+  101/0/0/0/101/101/101/101/101/0 (6 of 10 red, zero real assertion failures).
+  `cargo nextest run --workspace` -> 622/622 green, repeatedly; it gives each
+  test its own process. So the DELEGATION.md merge gate is SOUND; `cargo test`
+  is the broken lane. Do not "fix" this by weakening what the tests assert:
+  the `__*_abort_subprocess_entry` tests exist to prove fn64's loud traps
+  really abort.
 
-## Phase P — pure-Rust endgame (after R-gate + D-gate)
+  Standing hypothesis (still the only measured one): `assert_subprocess_aborts`
+  (`test_support.rs:41`) spawns children that `abort()`, and the child's
+  status/signal races into the parent runner's exit code.
 
-## Phase P — pure-Rust endgame (after R-gate + D-gate)
+  Two dead ends, recorded so nobody re-derives them: (1) a wave blamed a test
+  calling `std::env::set_var` and tripping the H2b rename trap in parallel
+  siblings. That test was real but was *this session's own* transient bug,
+  since removed — and the flake persists at 6/10 WITHOUT it, so it was an
+  aggravator, never the cause. (2) `--test-threads=1` was claimed to fail
+  deterministically; measured 0/101/0. Trust nothing here that is not a
+  re-measured exit code.
+
+  Lesson, kept: **treat exit-101 as investigate, not assume-flake** — an abort
+  killing the runner looks exactly like a real regression.
 
 - [ ] **P1**: retire the C lane to CI-oracle-only (DESIGN.md M3); relicense
   checkpoint.

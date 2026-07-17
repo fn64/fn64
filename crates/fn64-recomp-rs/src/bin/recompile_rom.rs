@@ -18,7 +18,7 @@
 //! ```text
 //! recompile_rom --config <oot.toml> --rom <oot.z64> [--out <dir>] [--profile <profile.toml>]
 //! # or via env:
-//! OOT_CONFIG=<oot.toml> OOT_ROM=<oot.z64> recompile_rom
+//! FN64_CONFIG=<oot.toml> FN64_ROM=<oot.z64> recompile_rom
 //! ```
 //!
 //! When `--profile`/`RECOMP_RS_PROFILE` is absent, the driver loads a
@@ -131,7 +131,7 @@ fn main() -> std::process::ExitCode {
 
 const USAGE: &str = "usage: recompile_rom --config <oot.toml> --rom <oot.z64> [--out <dir>] \
                      [--profile <profile.toml>]\n\
-                     env fallbacks: OOT_CONFIG, OOT_ROM, OOT_OUT, RECOMP_RS_PROFILE; \
+                     env fallbacks: FN64_CONFIG, FN64_ROM, FN64_OUT, RECOMP_RS_PROFILE; \
                      otherwise loads sibling profile.toml when present";
 
 struct Args {
@@ -141,11 +141,27 @@ struct Args {
     profile: Option<PathBuf>,
 }
 
+/// The `OOT_*` spellings of these knobs are gone; an unset var means "off", so
+/// a silent rename would turn a stale `OOT_CONFIG=…` invocation into a no-op.
+fn reject_legacy_env() {
+    for (old, new) in [
+        ("OOT_CONFIG", "FN64_CONFIG"),
+        ("OOT_ROM", "FN64_ROM"),
+        ("OOT_OUT", "FN64_OUT"),
+    ] {
+        if std::env::var_os(old).is_some() {
+            panic!("{old} was renamed to {new}; unset {old} and set {new} instead");
+        }
+    }
+}
+
 impl Args {
     fn parse() -> Result<Self, String> {
-        let mut config = std::env::var("OOT_CONFIG").ok().map(PathBuf::from);
-        let mut rom = std::env::var("OOT_ROM").ok().map(PathBuf::from);
-        let mut out = std::env::var("OOT_OUT").ok().map(PathBuf::from);
+        reject_legacy_env();
+
+        let mut config = std::env::var("FN64_CONFIG").ok().map(PathBuf::from);
+        let mut rom = std::env::var("FN64_ROM").ok().map(PathBuf::from);
+        let mut out = std::env::var("FN64_OUT").ok().map(PathBuf::from);
         let mut profile = std::env::var("RECOMP_RS_PROFILE")
             .ok()
             .map(PathBuf::from);
@@ -162,8 +178,8 @@ impl Args {
             }
         }
         Ok(Args {
-            config: config.ok_or("--config (or OOT_CONFIG) is required")?,
-            rom: rom.ok_or("--rom (or OOT_ROM) is required")?,
+            config: config.ok_or("--config (or FN64_CONFIG) is required")?,
+            rom: rom.ok_or("--rom (or FN64_ROM) is required")?,
             out: out.unwrap_or_else(|| PathBuf::from("recomp-out")),
             profile,
         })
