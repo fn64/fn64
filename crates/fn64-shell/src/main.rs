@@ -129,6 +129,16 @@ mod game {
     /// VI frame is well under this; the cap only bounds a pathological spin.
     const STEPS_PER_PUMP: u64 = 200_000;
 
+    /// Virtual-time units per VI field. Passed to `arm_vi_retrace`, and added
+    /// to the guest clock exactly once per pump -- the two MUST match, because
+    /// that identity is what makes the guest's retrace rate equal the pump's
+    /// wall-clock rate (`FRAME` in `about_to_wait`, 16.67 ms => ~60 Hz NTSC).
+    ///
+    /// The value itself is arbitrary (it is a host-chosen approximation, not a
+    /// hardware constant -- see `fn64_runtime::vi`'s module doc); what is NOT
+    /// arbitrary is that one pump advances the clock by exactly one interval.
+    const RETRACE_INTERVAL: u64 = 1000;
+
     impl Shell {
         fn boot() -> Self {
             let rom_path = env_path("ROM");
@@ -184,8 +194,10 @@ mod game {
                 );
             }
 
-            // VI retrace ticker (host-chosen approximation, same as oot-boot).
-            fn64_abi::arm_vi_retrace(1000);
+            // VI retrace ticker. MUST be the same constant `pump_one_frame`
+            // advances the clock by each pump: one pump (one 16.67 ms wall
+            // deadline) == one interval == one retrace == ~60 Hz NTSC.
+            fn64_abi::arm_vi_retrace(RETRACE_INTERVAL);
 
             let mut rdram = fn64_boot_harness::new_rdram();
             let rdram_ptr = rdram.as_mut_ptr();
@@ -302,8 +314,22 @@ mod game {
         fn pump_one_frame(&mut self) -> bool {
             let start_swaps = fn64_abi::vi_swap_count();
             let mut idle_ticks = 0u32;
-            let mut tick = fn64_abi::sim_time();
             let mut steps = 0u64;
+
+            // Advance the guest clock by exactly one retrace interval FIRST,
+            // unconditionally, because the caller only enters here when the
+            // 16.67 ms wall deadline is due (`about_to_wait`'s FRAME). One
+            // pump == one NTSC field == one retrace, whatever happens below.
+            //
+            // Doing it at the TOP is load-bearing: the swap check below
+            // `return`s the moment a frame lands, so an advance placed after
+            // the loop is skipped by every pump that actually produces a
+            // frame -- measured as ~30 Hz instead of 60 (only the non-
+            // producing pumps advanced). Retrace must not depend on whether
+            // the game happened to finish a frame this pump.
+            let tick = fn64_abi::sim_time() + RETRACE_INTERVAL;
+            fn64_abi::advance_virtual_time(tick);
+
             loop {
                 if steps >= STEPS_PER_PUMP {
                     break;
@@ -319,8 +345,6 @@ mod game {
                     return true;
                 }
                 if !stepped {
-                    tick += 100;
-                    fn64_abi::advance_virtual_time(tick);
                     idle_ticks += 1;
                     if idle_ticks >= 200 {
                         // Genuinely idle -- nothing will produce a frame this
@@ -329,19 +353,19 @@ mod game {
                     }
                 } else {
                     idle_ticks = 0;
-                    // A voluntary `pause_self` idle loop is runnable by
-                    // definition (the rs lane's idle thread spins instead of
-                    // blocking), so gating host time on `!stepped` starves
-                    // the VI retrace forever: the window freezes on the first
-                    // frame and no audio task ever runs. Same host clock
-                    // injection as oot-boot's drive loop: pace every 100
-                    // scheduling steps.
-                    if steps.is_multiple_of(100) {
-                        tick += 100;
-                        fn64_abi::advance_virtual_time(tick);
-                    }
                 }
             }
+            // NOTE: the clock advance happens at the TOP of this fn, not here.
+            // The old rule derived virtual time from WORK -- `tick += 100` per
+            // idle iteration and again every 100 scheduling steps -- so its
+            // rate tracked how hard the game was working, not the clock. Idle
+            // early boot landed near 60 Hz by luck; once gameplay got busy
+            // `steps % 100` fired far more often and the clock accelerated:
+            // 59.9 Hz at swap 60 -> 122.1 Hz by swap 480, still climbing
+            // (ROADMAP R5 probe 3). The audio thread produces one buffer per
+            // retrace, so that over-produced ~2:1, pegged the ring at its cap,
+            // and drop-oldest skipped playback = the static; the same
+            // over-delivery advanced game logic too fast = the over-speed.
             fn64_abi::vi_swap_count() > start_swaps
         }
 
