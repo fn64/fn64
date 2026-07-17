@@ -198,23 +198,48 @@ and scope limits that make an open item meaningful.
     a rate check.
   - EXISTS: the shell's 60-swap heartbeat (`main.rs:406`) and `ring_frames`,
     which is how the pegged-ring evidence was gathered.
-  - **BUILT 2026-07-17: `fn64_abi::retrace_cadence()`** -> `(ticks, secs, hz)`
-    since the first tick, or `None` before any (never a fake 0 Hz). Counted in
+  - **BUILT + MEASURED 2026-07-17. PROBE 3 IS CONFIRMED.**
+    `fn64_abi::retrace_cadence()` -> `(ticks, secs, hz)` since the first tick,
+    or `None` before any (never a fake 0 Hz). Counted in
     `Executor::advance_time` where ticks really fire; correlated with wall-clock
-    in `fn64-abi` because `fn64-runtime` is wall-clock-free by design. Reported
-    by the harness summary and, more importantly, on the shell's heartbeat line
-    NEXT TO `ring_frames` — that pairing is the experiment.
-    First reading, headless, 60 swaps: **59 ticks in 0.314s = 184.9 Hz**. The
-    59:60 tick:swap ratio confirms the probe watches the right clock. The rate
-    itself proves nothing here — headless runs unpaced, so ~3x is expected. THE
-    NUMBER THAT DECIDES PROBE 3 IS THE SHELL'S, which paces its pump at 60 Hz:
-    retrace_hz >> 60 there = ticker over-delivers = probe 3 CONFIRMED, one
-    cause for both symptoms. retrace_hz ~= 60 with a pegged ring = probe 3
-    REFUTED, cause is downstream in the producer. Either way the hypothesis
-    stops being unfalsifiable.
-    Suspicious but unproven: headless runs ~3x fast, and R5's evidence is ~3 AI
-    buffers/frame where ~1 is expected. Do not read that as confirmation —
-    headless SHOULD run fast. Measure the shell.
+    in `fn64-abi` (`fn64-runtime` is wall-clock-free by design). Reported on the
+    shell heartbeat next to `ring_frames`.
+
+    Real shell run (C lane, reference backend, 25s). retrace_hz is CUMULATIVE
+    since the first tick, so these are averages — the instantaneous rate at the
+    end is worse:
+
+        swap  #60: retrace_hz=59.9   ring=8518    ai_buffers=58
+        swap #120: retrace_hz=60.0   ring=12000   ai_buffers=118
+        swap #180: retrace_hz=60.0   ring=11912   ai_buffers=178
+        swap #240: retrace_hz=63.9   ring=12000   ai_buffers=254
+        swap #300: retrace_hz=87.2   ring=12000   ai_buffers=434
+        swap #480: retrace_hz=122.1  ring=12000   ai_buffers=974
+
+    **The ticker starts CORRECT (59.9 Hz) and runs away** — ~2x target by swap
+    480, still climbing. So this is NOT a wrong `arm_vi_retrace(1000)` constant:
+    a bad interval would be wrong from swap #1. Something makes delivery
+    ACCELERATE.
+
+    The causal chain is in one table. Through #180 retrace holds ~60 and
+    ai_buffers tracks swaps 1:1 (118/120). The moment retrace departs at #240,
+    ai_buffers outpaces swaps, reaching 974/480 (~2:1) — matching the ~2x
+    retrace rate. The audio thread produces PER RETRACE, so an over-delivering
+    ticker over-produces audio; the ring pegs at its 12000 cap and drop-oldest
+    skips playback = the static. Same mechanism drives the over-speed feel.
+    This explains R5's original "~3 AI buffers/frame where ~1 is expected".
+
+    Caveats, stated rather than glossed: `nonzero=0` because the C lane links
+    no audio ucode — the PACING bug is upstream of sample content, but the rs
+    lane is where the ucode runs and where R5's 3x was first measured. And a
+    windowed (not cumulative) rate would sharpen the onset.
+
+    NEXT: find why delivery accelerates. `RetraceSchedule::advance`
+    (`fn64-runtime/src/vi.rs`) fires on GUEST VIRTUAL time and reports every
+    interval crossed; the shell advances virtual time from its idle loop
+    (`fn64-shell/src/main.rs`). As the game gets busier that relationship
+    drifts — which is the shape of an accelerating rate. Suspect the
+    virtual-time advance rule, not the interval constant.
 
   **A REFERENCE CAPTURE — yes, but capture it, never download it** (user
   asked 2026-07-17). A golden WAV of the intro pulled from the web is
