@@ -108,6 +108,10 @@ pub struct Executor {
     /// entry point for VI-tick-equivalent progress) -- never wall-clock,
     /// per the task's explicit "no wall-clock in core" requirement.
     sim_time: u64,
+    /// Cumulative OS_EVENT_VI ticks `advance_time` has fired since boot.
+    /// A COUNT, never a rate: rates need wall-clock, which this crate does not
+    /// have by design. `fn64-abi` pairs it with `Instant` (ROADMAP R5 probe 3).
+    retrace_ticks_fired: u64,
     trace: TraceLog,
     /// VI/SI/RSP host-side hardware-model state -- see `peripherals.rs`'s
     /// module doc for why these are grouped separately from this struct's
@@ -166,6 +170,13 @@ impl Executor {
 
     pub fn sim_time(&self) -> u64 {
         self.sim_time
+    }
+
+    /// Cumulative OS_EVENT_VI retrace ticks fired since boot (ROADMAP R5
+    /// probe 3). Pair with host wall-clock to get a rate -- this crate cannot,
+    /// and must not, do that itself.
+    pub fn retrace_ticks_fired(&self) -> u64 {
+        self.retrace_ticks_fired
     }
 
     /// `osSetTime(OSTime time)` -- per the public libultra manual, sets the
@@ -429,6 +440,15 @@ impl Executor {
         // `event_table`/`deliver_or_enqueue` (see `peripherals.rs`'s module
         // doc for why the event table itself is not a peripheral).
         if let Some(tick) = self.peripherals.advance_retrace(now) {
+            // Cumulative count of OS_EVENT_VI ticks the schedule has fired.
+            // Counted here (not in Peripherals) because this is the seam that
+            // knows a tick was really produced. Deliberately a COUNT and not a
+            // rate: a rate needs wall-clock, and this crate is wall-clock-free
+            // by design (DESIGN.md §1) -- fn64-abi correlates it against
+            // Instant to answer R5 probe 3.
+            self.retrace_ticks_fired = self
+                .retrace_ticks_fired
+                .saturating_add(u64::from(tick.event_vi_ticks));
             for _ in 0..tick.event_vi_ticks {
                 // Only deliver if the game has actually registered OS_EVENT_VI
                 // (osSetEventMesg_recomp populates event_table) -- before

@@ -407,8 +407,22 @@ mod game {
                     // whether the game is producing PCM (ai_buffers/nonzero)
                     // and whether it reaches the backend (backend_buffers).
                     let audio = fn64_abi::audio_output_stats();
+                    // R5 probe 3 on the same line as ring_frames, deliberately:
+                    // this pairing IS the experiment. The shell paces its pump
+                    // at 60 Hz (FRAME below), so retrace_hz materially above 60
+                    // means the guest's VI ticker outruns the pump -- which
+                    // would explain BOTH symptoms at once (audio produces per
+                    // retrace -> ring pegs at its cap -> static; game logic
+                    // advances per retrace -> over-speed). At ~60 Hz with a
+                    // pegged ring, probe 3 is REFUTED and the cause is
+                    // downstream in the producer.
+                    let cadence = match fn64_abi::retrace_cadence() {
+                        Some((_, _, hz)) => format!("{hz:.1}"),
+                        None => "n/a".to_string(),
+                    };
                     println!(
-                        "[fn64-shell] present heartbeat: VI swap #{swaps} ({state}); audio: \
+                        "[fn64-shell] present heartbeat: VI swap #{swaps} ({state}); \
+                         retrace_hz={cadence} (target ~60); audio: \
                          ai_buffers={} samples={} nonzero={} backend_buffers={} ring_frames={:?}",
                         audio.ai_buffers,
                         audio.samples,
