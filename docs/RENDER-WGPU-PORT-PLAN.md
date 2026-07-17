@@ -9,8 +9,11 @@ frame is eye-verified** (the wrapper is the port's differential oracle).
 Crate name: **`fn64-render-wgpu`** (parallel to `fn64-render-rt64`, exactly
 as `fn64-recomp-rs` parallels the N64Recomp adapter).
 
-See `RT64-GAP-REGISTER.md` for the cited gap list and `RENDER-BACKEND-PLAN.md`
-for the wrap-then-port decision.
+See `RT64-GAP-REGISTER.md` for the cited gap list. The wrap-then-port decision
+shipped (2026-07-16): wrap RT64 first for a faithful render now, port it to
+Rust later behind the same `RenderBackend` seam — the recompiler story retold
+(wrap N64Recomp, prove the runtime, then replace it in typed Rust with the
+wrapper as oracle). `DESIGN.md` §1 owns the license boundary that port inherits.
 
 ## Guiding principle: oracle-faithful BEHAVIOR, idiomatic Rust STRUCTURE
 Same model that made `fn64-recomp-rs` work: the *behavior* is bit-exact

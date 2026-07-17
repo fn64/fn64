@@ -123,7 +123,7 @@ fn alpha_input(source: AlphaSource, inputs: &CombinerInputs) -> f32 {
     }
 }
 
-/// TEMP instrumentation (env `OOT_DUMP_PROJ=1`): count z-test passes vs
+/// TEMP instrumentation (env `FN64_DUMP_PROJ=1`): count z-test passes vs
 /// rejections so a real overlapping-geometry frame can PROVE the z-buffer is
 /// doing occlusion work (rejecting farther fragments) rather than being a
 /// no-op. Gated entirely behind the env var; call `zstat::summary()` after a
@@ -137,7 +137,7 @@ pub mod zstat {
     static REJECT: AtomicU64 = AtomicU64::new(0);
     fn on() -> bool {
         if !INIT.swap(true, Ordering::Relaxed) {
-            ENABLED.store(std::env::var("OOT_DUMP_PROJ").is_ok(), Ordering::Relaxed);
+            ENABLED.store(crate::debug_flag("FN64_DUMP_PROJ"), Ordering::Relaxed);
         }
         ENABLED.load(Ordering::Relaxed)
     }
@@ -160,7 +160,7 @@ pub mod zstat {
         let r = REJECT.swap(0, Ordering::Relaxed);
         if p + r > 0 {
             eprintln!(
-                "[OOT_DUMP_PROJ] z-test: {p} passes (fragment written) | {r} rejects \
+                "[FN64_DUMP_PROJ] z-test: {p} passes (fragment written) | {r} rejects \
                  (farther fragment occluded) -- rejects>0 proves the z-buffer is \
                  doing real occlusion, not a no-op"
             );
@@ -248,7 +248,7 @@ impl Framebuffer {
             // pixel and was correctly discarded -- the actual occlusion work
             // the z-buffer does. Counted (env-gated) to PROVE, on a real
             // overlapping frame, that depth is doing meaningful rejection and
-            // not a no-op. See `OOT_DUMP_PROJ` in gbi.rs.
+            // not a no-op. See `FN64_DUMP_PROJ` in gbi.rs.
             #[cfg(not(test))]
             zstat::note_reject();
             false
@@ -306,7 +306,7 @@ impl Framebuffer {
     }
 
     /// Same culling as [`draw_triangle_culled`] but with NO depth test
-    /// (submission/painter's order). Used only by the `OOT_NO_DEPTH` A/B
+    /// (submission/painter's order). Used only by the `FN64_NO_DEPTH` A/B
     /// instrumentation to prove that correct occlusion comes from the
     /// z-buffer, not draw order.
     pub fn draw_triangle_no_depth_culled(&mut self, tri: &Triangle, cull: CullMode) {

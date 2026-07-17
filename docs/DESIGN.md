@@ -96,6 +96,47 @@ call into RT64's C++ API. Rationale, three reasons:
    `fn64-rt64`; `cargo test -p fn64-runtime -p fn64-abi` stays pure-Rust and
    fast in CI.
 
+#### License boundary: what the RT64 wrap is allowed to link (LIVE CONSTRAINT)
+
+fn64's linked binary stays MIT/Apache-clean **only because the RT64 build is
+scoped to its render/HLE path.** This is a standing build constraint, not a
+one-time finding — re-check it whenever the RT64 pin moves or the wrapper's
+CMake scope changes.
+
+**The rule: build RT64 as a static lib for its render/HLE target only, and do
+NOT enable the mupen64plus plugin target.** `mupen64plus-core` is **GPLv2**
+(source: `third_party/rt64/src/contrib/mupen64plus-core/LICENSES`, "licensed
+under the GNU General Public License version 2"). It is not linked today:
+RT64 puts only `.../mupen64plus-core/src/api` on the *include path*
+(`third_party/rt64/CMakeLists.txt:421`) to consume the mupen plugin ABI
+headers (`m64p_*` descriptor types), and no RT64 source outside `contrib/`
+`#include`s an `m64p` header in the evaluated tree. That include exists for
+RT64's own future emulator-plugin build — a feature its `README.md:6` says is
+"not available in this repository yet." Enabling that target is what would
+pull GPL into fn64's binary.
+
+Everything else RT64 links is permissive, audited 2026-07-16 against the
+`no-mercy-recompiled/third_party/rt64` @ `f0728a2` checkout: RT64 itself MIT
+(`third_party/rt64/LICENSE`); `plume` GPU abstraction + `re-spirv` MIT
+(`src/contrib/plume/LICENSE`, `src/contrib/re-spirv/LICENSE`);
+`imgui`/`implot`/`im3d`/`hlslpp`/`VulkanMemoryAllocator`/`stb`/`ddspp` MIT or
+public-domain; `xxHash`/`zstd` BSD; `nativefiledialog-extended` Zlib;
+`spirv-cross` Apache-2.0; `dxc` LLVM/Apache-with-exception and build-time only
+(a shader compiler binary, not linked into the runtime —
+`third_party/rt64/CMakeLists.txt:39-61`).
+
+The same one-crate quarantine that bounds the unsafe audit bounds this license
+audit: there is exactly one crate to check.
+
+**Provenance note (clean-room):** RT64 is HLE "directly reverse engineered by
+observing console behavior" (its `README.md`) — it studied *hardware output*,
+not copyrighted game code. That is different in kind from the matching
+decompilations this project rejects, and consuming it as an MIT dependency does
+not touch fn64's own from-ROM-bytes provenance for game code. `raster.rs:17-24`
+already cites RT64's MIT `shared/rt64_color_combiner.h` as its algorithm
+source; reading MIT RT64 is an allowed source under AGENTS.md, GPL runtime
+internals are not.
+
 No longer planned-only: `fn64-recomp`/`fn64-recomp-rs`, the Rust-emitting
 recompiler `README.md` deferred until the runtime earned it, are built and
 boot OoT. They add the second lane below.
@@ -166,8 +207,11 @@ is the rule you are about to break.
 
 **Render backend — `FN64_RENDER=reference|rt64`** (feature `rt64`):
 `ReferenceBackend` is the pure-Rust, headless CI/seam-test backend and A/B
-oracle; RT64 (§1's `fn64-render-rt64`) is the faithful lane. Per
-`RT64-WRAP-EVAL.md`, keep both — the oracle is not obsolete once RT64 works.
+oracle; RT64 (§1's `fn64-render-rt64`) is the faithful lane. **Keep both — the
+oracle is not obsolete once RT64 works.** ReferenceBackend is what keeps
+`cargo test` GPU-free (RT64 needs Vulkan/D3D12/Metal, so headless CI would
+otherwise need a GPU or software Vulkan), and it is the differential oracle the
+wgpu port is gated against (ROADMAP P2).
 
 Operational detail (emit caching, the shared target dir, the `./oot` loop)
 lives in `FAST-LOOP.md`; this section is only the shape and the why.

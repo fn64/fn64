@@ -29,7 +29,7 @@
 //! ```text
 //! RECOMPILED_DIR=.../OOTU/RecompiledFuncs \
 //! ROM=.../oot-ntsc-1.0.z64 \
-//! OOT_SKIP_AUDIO_UCODE=1 \
+//! FN64_SKIP_AUDIO_UCODE=1 \
 //! cargo run -p fn64-shell
 //! ```
 
@@ -56,7 +56,7 @@ fn main() {
          \n\
          \x20 RECOMPILED_DIR=.../OOTU/RecompiledFuncs \\\n\
          \x20 ROM=.../oot-ntsc-1.0.z64 \\\n\
-         \x20 OOT_SKIP_AUDIO_UCODE=1 \\\n\
+         \x20 FN64_SKIP_AUDIO_UCODE=1 \\\n\
          \x20 cargo run -p fn64-shell\n\
          \n\
          (Add --features oot-audio-ucode to link the recompiled audio ucode so the wired\n\
