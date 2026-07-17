@@ -83,38 +83,9 @@ claims makes all the greens beneath it worth less.
   Cheapest fix: have `dispatch.sh` write a completion marker, and teach
   `wt.sh` a READY state (branch ahead of main + no live job + gates recorded).
   Without it, delegated work silently rots at exactly the rate we dispatch it.
-- [ ] **V3 `fn64-diff` — the boundary is wrong, not the code.** CORRECTION
-  2026-07-17: an earlier pass here claimed the faki-tools oracle checkout was
-  "effectively empty". FALSE — that was a bad `head -2` catching `__pycache__`.
-  faki-tools is a live project with its own AGENTS.md, engine, ROMs, and real
-  oracle tooling. Do not repeat that claim.
-
-  The crate is 1,791 lines of three different things, and only one is fn64's:
-  - `lockstep.rs` (321) + 17 tests — the comparator (first-divergence,
-    unset-GPR handling, PC-mismatch as its own diff kind). **fn64's. Keep.**
-  - `oracle_client.rs` (340) — a subprocess wrapper for faki-tools' `oracle`
-    CLI. fn64's build graph should not carry a client for another project's
-    command line. **Belongs on the far side of the boundary.**
-  - `savestate.rs` (433) — parses **mupen64plus** savestate format. Foreign
-    reference-emulator format knowledge, in fn64, for no reason fn64 needs.
-    **Move or drop.**
-
-  Why nothing runs it (the real finding, in its own module doc): instruction-
-  exact savestate transplant is **not representable** against a recompiler-
-  shaped runtime. Functions are the smallest resumable unit
-  (`SectionRegistry::resolve` matches only exact entry offsets, by design),
-  and a snapshot's PC lands mid-function essentially always. So lockstep-at-PC
-  was never going to work — the crate is honest about this and resolves to the
-  ENCLOSING function instead. That negative result is worth more than the code
-  and must survive any move.
-
-  Consequence for AGENTS.md: it REQUIRES that "runtime behavior changes emit
-  the shared event trace and get diffed against the reference runtime." That
-  mechanism is wired to no gate. Either wire the comparator to one, or amend
-  the contract to say what actually gates (today: `scripts/lane-parity.sh` and
-  `fn64-abi`'s `c_smoke`). A contract describing a process the project does
-  not run is the same class of defect as a doc citing a file that does not
-  exist.
+- [x] **V3 `fn64-diff` split** (done 2026-07-17) — 1791 -> 405 lines: the
+  comparator stays, the faki-tools oracle client and mupen savestate parser
+  are gone. AGENTS.md now cites differentials that run.
 
 ## Phase R — close the "OoT renders faithfully" gate
 
@@ -217,8 +188,8 @@ fn64-discover has Phases 1/2/4/5 + bounded-6; the rest is design-only
 (DISCOVER-DESIGN.md).
 
 Current grading (D1+D1.5, 2026-07-16, `gate_d1` — but see H3: these numbers
-are reproducible on one machine only): OoT 90.6% precision / 72.3% recall;
-NW4E 44.7%/89.0%; NWXE 36.4%/28.5%.
+are reproducible on one machine only): OoT 98.7% precision / 72.3% recall;
+NW4E 48.4%/89.7%; NWXE 36.4%/28.5% (D1+D1.5+D2).
 
 Two findings worth not rediscovering:
 - **Recall is a Phase-2 problem, not a detector problem.** OoT recall was
@@ -230,21 +201,8 @@ Two findings worth not rediscovering:
   prove load-images, not entry points. Not a bug; don't "fix" it.
 
 Still open from D1.5: resident `code`/`n64dd` destination discovery.
-- [~] **D2 Phase-6 completion**: jump tables + value-set analysis for
-  indirect targets (the bounded HI/LO case already works). **IMPLEMENTED BUT
-  UNMERGED — do not redo it.** `wave/d2-detector-closure` (commit `5d06f68`,
-  2026-07-17) carries 1,811 lines closing this: Phase-6 jump-table recovery +
-  bounded value-set analysis with exhaustive/bounded/open facts, feeding
-  exhaustive computed jumps into intra-owner CFG closure. Its dispatch log
-  reports `gate_b1`/`gate_b2`/`gate_d1` all passing, `gate_d1` 10/10
-  byte-identical. The job finished cleanly and stopped (correct per
-  DELEGATION.md: it must not push or merge); nobody picked it up.
-
-  To land: it is now 40+ commits behind main, so rebase and RE-GATE — those
-  numbers were measured against a main that no longer exists, and H2b/V1a
-  touched `fn64-discover`'s neighbors. Verify against ROADMAP H3 too: that
-  crate's gate binaries hold personal paths as compile-time consts, so the
-  grading numbers are reproducible on one machine only.
+- [x] **D2 Phase-6 completion** (merged 2026-07-17) — jump tables +
+  value-set analysis; OoT precision 90.6% -> 98.7%.
 - [ ] **D3 Phases 7-8**: targeted dynamic probes; assembly/relink
   verification.
 - [ ] **D4 pack emission**: emit fn64-owned `dump.toml`-equivalent
