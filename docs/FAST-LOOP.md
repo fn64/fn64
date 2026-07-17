@@ -26,6 +26,7 @@ rs manifest sidesteps it; the shared target does not change that.
 
 ## The combined fast rs-boot loop
 ```
+export FN64_GAME_DIR=/path/to/your/rom-derived/workspace  # no default: set it
 export CARGO_TARGET_DIR=/tmp/fn64-shared-target
 export RECOMP_RS_DIR="$(./scripts/native-emit.sh)"
 export FN64_RECOMP=rs

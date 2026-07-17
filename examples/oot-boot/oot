@@ -13,7 +13,8 @@
 #   ./oot fn FILE:LINE ...   resolve recompiled-C locations to RECOMP_FUNC names
 #   ./oot where              run + report the deepest frame / loud trap (the frontier)
 #
-# Env overrides: RECOMPILED_DIR / RECOMP_H_DIR / ROM default to the aki-recomp OOTU paths.
+# Env overrides: RECOMPILED_DIR / ROM default under $FN64_GAME_DIR (your ROM-derived
+# workspace). recomp.h is vendored in-tree, so RECOMP_H_DIR is not defaulted.
 # FN64_RECOMP=rs selects the crate at RECOMP_RS_DIR; `c` is the default. The rs
 # manifest links the out-of-tree audio ucode by default; OOT_SKIP_AUDIO_UCODE=1
 # remains an explicit render-iteration speed switch.
@@ -22,11 +23,22 @@ set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 FN64="${FN64:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
-AKI="${AKI:-/Users/jer/Code/aki-recomp}"
+# FN64_GAME_DIR: the workspace holding YOUR ROM-derived material (ROM,
+# RecompiledFuncs, generated ucode). Named for what it holds, not for whose
+# project it is. No default: a path baked in here works for exactly one machine
+# and fails confusingly everywhere else. Set it, or set RECOMPILED_DIR/ROM
+# directly.
+if [ -z "${FN64_GAME_DIR:-}" ] && { [ -z "${RECOMPILED_DIR:-}" ] || [ -z "${ROM:-}" ]; }; then
+  echo "oot: set FN64_GAME_DIR to your ROM-derived workspace (it holds games/OOTU/...)," >&2
+  echo "     or set RECOMPILED_DIR and ROM directly. No game content ships in this repo." >&2
+  exit 2
+fi
+export FN64_GAME_DIR
 export PATH="$HOME/.cargo/bin:$PATH"
-export RECOMPILED_DIR="${RECOMPILED_DIR:-$AKI/games/OOTU/RecompiledFuncs}"
-export RECOMP_H_DIR="${RECOMP_H_DIR:-$AKI/refs/N64RecompSource/include}"
-export ROM="${ROM:-$AKI/games/OOTU/oot-ntsc-1.0.z64}"
+export RECOMPILED_DIR="${RECOMPILED_DIR:-$FN64_GAME_DIR/games/OOTU/RecompiledFuncs}"
+# RECOMP_H_DIR intentionally NOT defaulted: recomp.h is vendored in-tree (H1).
+# Set it only to build against a different N64Recomp fork.
+export ROM="${ROM:-$FN64_GAME_DIR/games/OOTU/oot-ntsc-1.0.z64}"
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 export FN64_RECOMP="${FN64_RECOMP:-c}"
 export RECOMP_RS_DIR="${RECOMP_RS_DIR:-/tmp/fn64-recomp-rs-oot}"
