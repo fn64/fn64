@@ -74,23 +74,27 @@ fn wire_audio_output(rdram_len: usize) {
     }
 
     use fn64_audio::{AudioBackend as _, AudioConfig, CpalBackend};
-    const CANDIDATE_RATES_HZ: [u32; 4] = [32000, 48000, 44100, 22050];
-    for rate in CANDIDATE_RATES_HZ {
-        let mut backend = CpalBackend::new();
-        match backend.create(&AudioConfig::new(rate, 2)) {
-            Ok(()) => {
-                fn64_abi::set_audio_backend(Box::new(backend), rdram_len);
-                println!("[oot-boot] audio output wired (cpal, {rate} Hz stereo)");
-                return;
-            }
-            Err(error) => eprintln!(
-                "[oot-boot] audio: {rate} Hz output unavailable ({error}) -- trying next rate"
-            ),
+    // OoT's boot-time AI rate; osAiSetFrequency forwards the true DAC rate
+    // to the backend later, so this is a starting ratio, not a commitment.
+    // The backend negotiates the host stream rate with the device itself
+    // (falling back to the device default + linear resampling), so the old
+    // multi-rate retry ladder here is gone -- playing 32 kHz samples on a
+    // 48 kHz stream without conversion was the "background static" bug.
+    const OOT_BOOT_AI_RATE_HZ: u32 = 32_000;
+    let mut backend = CpalBackend::new();
+    match backend.create(&AudioConfig::new(OOT_BOOT_AI_RATE_HZ, 2)) {
+        Ok(()) => {
+            let stream_rate = backend.stream_rate_hz().unwrap_or(OOT_BOOT_AI_RATE_HZ);
+            fn64_abi::set_audio_backend(Box::new(backend), rdram_len);
+            println!(
+                "[oot-boot] audio output wired (cpal, guest {OOT_BOOT_AI_RATE_HZ} Hz -> \
+                 stream {stream_rate} Hz stereo)"
+            );
         }
+        Err(error) => eprintln!(
+            "[oot-boot] audio output unavailable ({error}); live PCM stats/dump remain enabled"
+        ),
     }
-    eprintln!(
-        "[oot-boot] audio output unavailable at every candidate rate; live PCM stats/dump remain enabled"
-    );
 }
 
 /// One scripted-input step: at VI-swap `frame`, hold `buttons` (an

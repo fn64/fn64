@@ -49,11 +49,16 @@ the work that closes it is rotting on stale pre-rename branches.
   the prime suspect for the user-reported background static.
 - [ ] **R4 branch hygiene**: after R1 lands, close/prune the five stale
   render worktrees+branches (they are then strictly-worse duplicates).
-- [ ] **R5 audio out**: physical cpal playback WORKS (user report,
-  2026-07-16 — supersedes the earlier CoreAudio pre-stream failure note),
-  but has STATIC when the app runs in the background: likely the audio
-  callback starving under macOS App Nap / occlusion throttling (buffer
-  underrun). Investigate output buffering / process activity policy.
+- [~] **R5 audio out — static root-caused + fixed, awaiting user's ears**
+  (2026-07-16): the static was a sample-rate mismatch, not App Nap alone.
+  fn64-shell's ladder opened the stream at 48 kHz FIRST while the game
+  produces 32 kHz with no resampler anywhere, so the ring starved ~1/3 of
+  the time and the callback zero-fill rendered as static (backgrounding
+  worsened it by throttling the producer). Fix: CpalBackend negotiates the
+  stream rate with the device and linear-resamples producer-side;
+  set_frequency is now real; osAiSetFrequency forwards the true DAC rate;
+  both harness ladders replaced with one guest-rate create. Verify by ear
+  (foreground + backgrounded) to close.
 
 ## Phase D — fn64 owns discover → decomp
 

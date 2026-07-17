@@ -491,33 +491,31 @@ mod game {
             return;
         }
         use fn64_audio::{AudioBackend as _, AudioConfig, CpalBackend};
-        // `CpalBackend::create` bakes the requested rate straight into the
-        // output StreamConfig, and a given device only supports certain rates
-        // (this machine's default rejected 32 kHz). N64 stereo is 2-channel;
-        // try the widely-supported host rates in turn until one opens. Samples
-        // are interleaved i16 (rate-agnostic at the queue seam); a mismatch
-        // between the N64 DAC rate and the stream rate is a pitch/resample
-        // concern for the audio SYNTH agent, not the OUTPUT-path wiring here.
-        const CANDIDATE_RATES_HZ: [u32; 4] = [48000, 44100, 32000, 22050];
-        for &rate in &CANDIDATE_RATES_HZ {
-            let mut backend = CpalBackend::new();
-            match backend.create(&AudioConfig::new(rate, 2)) {
-                Ok(()) => {
-                    fn64_abi::set_audio_backend(Box::new(backend), rdram_len);
-                    println!("[fn64-shell] audio output wired (cpal, {rate} Hz stereo)");
-                    return;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[fn64-shell] audio: {rate} Hz output unavailable ({e}) -- trying next rate"
-                    );
-                }
+        // Request the guest's own rate; `CpalBackend::create` negotiates
+        // with the device itself (falling back to the device-default rate
+        // plus producer-side linear resampling), and `osAiSetFrequency`
+        // keeps the ratio tracking the game afterward. The old ladder here
+        // tried 48 kHz FIRST: on hosts that accept it, the stream then
+        // drained 1.5x faster than the N64's 32 kHz production, the ring
+        // chronically starved, and the callback's zero-fill was audible as
+        // loud static (worse when backgrounded, as App Nap throttles the
+        // producer further).
+        const N64_BOOT_AI_RATE_HZ: u32 = 32_000;
+        let mut backend = CpalBackend::new();
+        match backend.create(&AudioConfig::new(N64_BOOT_AI_RATE_HZ, 2)) {
+            Ok(()) => {
+                let stream_rate = backend.stream_rate_hz().unwrap_or(N64_BOOT_AI_RATE_HZ);
+                fn64_abi::set_audio_backend(Box::new(backend), rdram_len);
+                println!(
+                    "[fn64-shell] audio output wired (cpal, guest {N64_BOOT_AI_RATE_HZ} Hz -> \
+                     stream {stream_rate} Hz stereo)"
+                );
             }
+            Err(e) => eprintln!(
+                "[fn64-shell] audio output unavailable ({e}) -- continuing SILENT \
+                 (window/input unaffected). Set FN64_NO_AUDIO to silence this."
+            ),
         }
-        eprintln!(
-            "[fn64-shell] audio output unavailable at any candidate rate -- continuing SILENT \
-             (window/input unaffected). Set FN64_NO_AUDIO to silence this."
-        );
     }
 
     /// The audio SYNTH seam. The cpal OUTPUT path (`wire_audio`) is already
