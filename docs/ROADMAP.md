@@ -70,14 +70,39 @@ the work that closes it is rotting on stale pre-rename branches.
   cause. No renderer/runtime fix is made in R6; the gameplay capture route
   must deliberately trigger and verify the exterior transition before a real
   outdoor eye-gate.
-- [ ] **R5 clue (2026-07-16)**: run log shows `audio: 32000 Hz output
-  unavailable (cpal build_output_stream: Sample rate 32000 Hz is not
-  supported) -- trying next rate` — a rate fallback without resampling is
-  the prime suspect for the user-reported background static.
 - [ ] **R4 branch hygiene**: after R1 lands, close/prune the five stale
   render worktrees+branches (they are then strictly-worse duplicates).
-- [~] **R5 audio out — static root-caused + fixed, awaiting user's ears**
-  (2026-07-16): the static was a sample-rate mismatch, not App Nap alone.
+- [ ] **R5 audio out — STILL BROKEN (static + over-speed); two causes found
+  and fixed, at least one remains.** Status 2026-07-17. Do NOT treat the
+  landed fixes as closing this; the user still hears static.
+
+  FIXED + verified so far: (a) rate mismatch — the harness ladders opened
+  the stream at 48 kHz while the game produces 32 kHz with no converter, so
+  the ring starved ~1/3 of the time and the callback zero-fill was static
+  (CpalBackend now negotiates + linear-resamples producer-side); (b) the
+  AI_LEN feedback loop was severed — osAiGetLength returned a static latched
+  value, so the game could not pace production (now reports live ring depth
+  converted to guest-rate bytes; regression-tested).
+
+  NOT FIXED — the open frontier: the game STILL overproduces. Live evidence
+  (heartbeat `ring_frames`, rs+rt64 shell, 40 s): ring pegged at exactly
+  12000 frames (its 250 ms cap) from ~swap 250 to the end of the run, with
+  ~180 AI buffers per 60 VI swaps (~3 per frame, where ~1 is expected).
+  The drop-oldest ring cap then skips playback continuously = the static the
+  user hears. So the AI_LEN fix did NOT change the producer's behavior.
+  Next probes, in order: (1) confirm the guest actually CALLS osAiGetLength
+  in the rs lane (its vram 0x800D32E0 IS in the host-lookup table, but that
+  proves wiring, not calls) — log call count + returned value; (2) if it is
+  called and ignored, read decomp `AudioMgr_ThreadEntry`/`AudioMgr_HandleRetrace`
+  for what actually gates queueing (likely an osAiGetStatus AI_STATUS_FULL
+  bit, or a retrace-message cadence our VI ticker over-delivers); (3) suspect
+  the VI retrace ticker itself — if retrace messages arrive faster than
+  60 Hz, the audio thread runs its whole produce cycle too often, which
+  would ALSO explain the user-reported over-speed feel.
+
+  Superseded note (kept for history): the static was first blamed on
+  sample-rate mismatch alone, and before that on App Nap alone. Both were
+  real contributors; neither was sufficient.
   fn64-shell's ladder opened the stream at 48 kHz FIRST while the game
   produces 32 kHz with no resampler anywhere, so the ring starved ~1/3 of
   the time and the callback zero-fill rendered as static (backgrounding
@@ -94,7 +119,17 @@ the work that closes it is rotting on stale pre-rename branches.
   real aspMain audio ucode — so the windowed shell can run the
   eyes-verified renderer + the gameplay-capable lane + real music, instead
   of being pinned to C-lane + ReferenceBackend + silent synth. Launch:
-  see crates/fn64-shell/rs/Cargo.toml header. User play-test pending.
+  see crates/fn64-shell/rs/Cargo.toml header.
+
+  Play-test findings (2026-07-16/17), all landed: the shell needed
+  set_cart_rom_handle_vram (both lanes aborted in osCartRomInit); the window
+  presenter needed the rdram word swizzle (green-tinted, noisy logo — third
+  instance of that bug class); the pump had to inject host clock while the
+  rs idle thread spins (frozen first frame = the 'black screen'); pacing is
+  now wall-clock 60 Hz via ControlFlow::WaitUntil (no thread sleep on the
+  event loop). REMAINING: the user reports the game still runs too fast and
+  audio is staticy — tracked as R5 above (same root: the audio producer is
+  free-running; a VI-retrace over-delivery would explain both symptoms).
 
 ## Phase D — fn64 owns discover → decomp
 
