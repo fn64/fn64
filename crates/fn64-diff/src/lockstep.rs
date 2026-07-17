@@ -1,21 +1,55 @@
 //! The first-divergence report: compare fn64's own claimed register state
-//! at a checkpoint PC against the oracle's ground-truth state at that same
-//! PC (from the same starting snapshot), and report the FIRST field that
-//! disagrees -- not a fuzzy/aggregate score. See `oracle_client`'s module
-//! doc for why "checkpoint PC" (not single MIPS instruction) is this
-//! harness's real unit of comparison, given fn64's function-granularity
-//! execution model.
-use crate::oracle_client::OracleRegisters;
-use crate::savestate::GPR_NAMES;
+//! at a checkpoint PC against a reference runtime's ground-truth state at
+//! that same PC (from the same starting conditions), and report the FIRST
+//! field that disagrees -- not a fuzzy/aggregate score.
+//!
+//! "Checkpoint PC", not "single MIPS instruction", is the unit of comparison
+//! here, and that is forced rather than chosen: fn64 executes at whole-
+//! recompiled-function granularity, so there is no PC at which fn64 and an
+//! instruction-stepping reference are simultaneously "mid-instruction" in a
+//! comparable sense. See `docs/DESIGN.md` §1.0's no-mid-function-resume
+//! finding for why this is a property of the runtime's shape and not a
+//! limitation to be engineered away.
+//!
+//! This module is pure: every function here is a comparison over values the
+//! caller supplies. Acquiring the reference state is deliberately not this
+//! crate's business.
 
-/// One fn64-side observation to check against the oracle: the PC fn64's
-/// executor/stand-in claims to have reached, plus whatever register state
-/// it can report at that instant. `None` entries in `gprs` mean "fn64 does
-/// not track/expose this register at this checkpoint" (e.g. a stand-in
-/// that only seeds/reads back a couple of fields, per `tests/
-/// transplant.rs`'s honest-stand-in precedent) -- such entries are skipped
-/// during comparison rather than compared against zero, so an intentionally
-/// partial checkpoint never manufactures a false divergence.
+/// GPR names in R4300/o32 register-file order. Public hardware
+/// documentation (the MIPS o32 ABI's register conventions), used to make a
+/// diff readable by a human -- `sp` rather than `r29`.
+pub const GPR_NAMES: [&str; 32] = [
+    "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
+    "t7", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp",
+    "ra",
+];
+
+/// A plain MIPS register snapshot: the ground-truth side of a comparison.
+///
+/// Deliberately not tied to any particular producer -- it describes a
+/// register set, nothing more. Whatever a caller can fill this in from (a
+/// reference runtime, a trace replay, a hand-written fixture) is a valid
+/// reference for [`compare_checkpoint`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegisterSnapshot {
+    pub pc: u32,
+    /// Sign-extended 64-bit register contents, matching `RecompContext`'s
+    /// own r-field convention (e.g. `sp` reads as `0xffffffff8008d098`).
+    pub gprs: [u64; 32],
+    pub cp0_status: u32,
+    pub cp0_cause: u32,
+    pub cp0_epc: u32,
+    /// Steps the reference took to reach `pc`, when its producer tracks
+    /// that; `0` when unknown. Diagnostic only -- never compared.
+    pub steps: u64,
+}
+
+/// One fn64-side observation to check against the reference: the PC fn64's
+/// executor claims to have reached, plus whatever register state it can
+/// report at that instant. `None` entries in `gprs` mean "fn64 does not
+/// track/expose this register at this checkpoint" -- such entries are
+/// skipped during comparison rather than compared against zero, so an
+/// intentionally partial checkpoint never manufactures a false divergence.
 #[derive(Debug, Clone)]
 pub struct Fn64Checkpoint {
     pub label: String,
@@ -76,24 +110,24 @@ impl std::fmt::Display for FieldDiff {
     }
 }
 
-/// Outcome of comparing one [`Fn64Checkpoint`] against the oracle.
+/// Outcome of comparing one [`Fn64Checkpoint`] against the reference.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CheckpointResult {
-    /// Every field fn64 reported at this checkpoint matched the oracle
+    /// Every field fn64 reported at this checkpoint matched the reference
     /// exactly. Not proof of full correctness (fn64 may report few fields,
     /// or the checkpoint PC may itself be wrong -- see `PcNotReached`) but
     /// a real, honest "no disagreement observed" result.
     Match,
     /// At least one field disagreed. `diffs` is ordered register-file-order
     /// (PC first, then r0..r31) so "first divergence" means "first entry
-    /// in this list", matching the task's "first divergence" framing.
+    /// in this list".
     Diverged { diffs: Vec<FieldDiff> },
-    /// fn64 claims execution reached `pc`, but the oracle -- stepping
-    /// forward from the SAME starting snapshot -- never reaches that PC at
-    /// all within its step budget. This is itself the strongest possible
-    /// divergence signal (fn64 went somewhere the real machine provably
-    /// does not go), reported as its own honest variant rather than folded
-    /// into `Diverged` (there is no "reference value" to diff against).
+    /// fn64 claims execution reached `pc`, but the reference -- run forward
+    /// from the SAME starting conditions -- never reaches that PC at all
+    /// within its budget. This is itself the strongest possible divergence
+    /// signal (fn64 went somewhere the real machine provably does not go),
+    /// reported as its own variant rather than folded into `Diverged`
+    /// (there is no "reference value" to diff against).
     PcNotReached { pc: u32 },
 }
 
@@ -103,13 +137,14 @@ impl CheckpointResult {
     }
 }
 
-/// Compare one fn64 checkpoint against its ground-truth oracle counterpart.
-/// `reference` must already have been queried via
-/// `OracleClient::registers_at(checkpoint.pc)` -- this function is pure and
-/// makes no subprocess calls, so it's cheap to unit test.
+/// Compare one fn64 checkpoint against its ground-truth counterpart.
+/// `reference` must be the reference runtime's state at `checkpoint.pc`
+/// (same PC, same starting conditions) -- supplying a reference captured at
+/// some other PC compares two unrelated instants and the `Pc` diff is the
+/// only honest thing this can then report. Pure: no I/O, no subprocess.
 pub fn compare_checkpoint(
     checkpoint: &Fn64Checkpoint,
-    reference: &OracleRegisters,
+    reference: &RegisterSnapshot,
 ) -> CheckpointResult {
     let mut diffs = Vec::new();
 
@@ -122,11 +157,12 @@ pub fn compare_checkpoint(
 
     for (index, (ours, name)) in checkpoint.gprs.iter().zip(GPR_NAMES.iter()).enumerate() {
         let Some(ours) = ours else { continue };
-        // GPRs are compared as sign-extended 64-bit values, matching both
-        // sides' own convention (`RecompContext`'s r-fields are u64; the
-        // oracle's `ORACLE_CAPTURE_V1` gpr strings are the raw 64-bit
-        // sign-extended register contents -- see `oracle_client`'s test
-        // fixture, e.g. sp prints as `0xffffffff8008d098`).
+        // GPRs are compared as sign-extended 64-bit values: that is
+        // `RecompContext`'s own r-field convention, so a reference producer
+        // must sign-extend to match (e.g. sp reads as 0xffffffff8008d098,
+        // not 0x8008d098). Comparing a zero-extended reference against a
+        // sign-extended checkpoint reports every negative-address register
+        // as a divergence.
         let reference_value = reference.gprs[index];
         if *ours != reference_value {
             diffs.push(FieldDiff::Gpr {
@@ -147,7 +183,8 @@ pub fn compare_checkpoint(
 
 /// A full lockstep run's report: one [`CheckpointResult`] per checkpoint fn64
 /// reported, in execution order, plus a convenience pointer to the FIRST
-/// non-match (the whole point of this harness -- see module/task doc).
+/// non-match -- the whole point of this crate. Later divergences are usually
+/// consequences of the first one, so only the earliest is actionable.
 #[derive(Debug)]
 pub struct LockstepReport {
     pub checkpoints: Vec<(Fn64Checkpoint, CheckpointResult)>,
@@ -173,17 +210,16 @@ impl LockstepReport {
             .map(|(cp, result)| (cp, result))
     }
 
-    /// Human-readable summary, formatted the way the task asks for a
-    /// finding to read: "@PC X, ours FIELD=Y ref FIELD=Z".
+    /// Human-readable summary, reading as "@PC X, ours FIELD=Y ref FIELD=Z".
     pub fn summarize(&self) -> String {
         match self.first_divergence() {
             None => format!(
-                "LOCKSTEP HELD: all {} checkpoint(s) matched the oracle exactly, no divergence observed",
+                "LOCKSTEP HELD: all {} checkpoint(s) matched the reference exactly, no divergence observed",
                 self.checkpoints.len()
             ),
             Some((cp, CheckpointResult::PcNotReached { pc })) => format!(
-                "FIRST DIVERGENCE @ checkpoint '{}': fn64 reached PC 0x{pc:08x}, but the oracle \
-                 (stepping forward from the same starting snapshot) never reaches that PC at all",
+                "FIRST DIVERGENCE @ checkpoint '{}': fn64 reached PC 0x{pc:08x}, but the reference \
+                 (run forward from the same starting conditions) never reaches that PC at all",
                 cp.label
             ),
             Some((cp, CheckpointResult::Diverged { diffs })) => {
@@ -208,8 +244,10 @@ impl Default for LockstepReport {
 mod tests {
     use super::*;
 
-    fn reference(pc: u32, gprs: [u64; 32]) -> OracleRegisters {
-        OracleRegisters {
+    fn reference(pc: u32, gprs: [u64; 32]) -> RegisterSnapshot {
+        RegisterSnapshot {
+            // cp0_*/steps are diagnostic-only; the comparator never reads
+            // them, so a fixture leaving them zero is honest, not lazy.
             pc,
             gprs,
             cp0_status: 0,
