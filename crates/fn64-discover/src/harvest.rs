@@ -7,9 +7,13 @@
 
 use crate::facts::{
     function_entry_subject, table_entry_subject, BankAddr, CandidateDetector, Fact, FactDb,
-    FunctionEntryEvidence, MonotonicityViolation, ProloguePattern, ProofState,
+    FunctionEntryEvidence, IndirectCallEvidenceKind, IndirectTransferKind, IndirectTransferState,
+    MonotonicityViolation, ProloguePattern, ProofState,
 };
-use crate::resolve::resolve_linear_jalr_sites;
+use crate::resolve::{
+    build_cfg_value_set_closed, resolve_linear_jalr_sites, IndirectProofState,
+    IndirectResolutionKind,
+};
 use crate::rom::NormalizedRom;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -130,15 +134,13 @@ pub fn harvest_discovered_candidates(
         })
         .collect();
 
-    let (jal_claims, prologue_claims, table_claims) = std::thread::scope(|scope| {
-        let jal = scope.spawn(|| detect_jal_targets(&images));
-        let prologue = scope.spawn(|| detect_prologues(&images));
+    let prologue_claims = detect_prologues(&images);
+    let ((jal_claims, indirect_facts), table_claims) = std::thread::scope(|scope| {
+        let jal = scope
+            .spawn(|| detect_reachable_call_targets(&images, &prologue_claims, &table_entries));
         let table = scope.spawn(|| detect_table_entries(&images, &table_entries));
         (
             jal.join().expect("jal-target candidate provider panicked"),
-            prologue
-                .join()
-                .expect("prologue candidate provider panicked"),
             table
                 .join()
                 .expect("table-entry candidate provider panicked"),
@@ -150,6 +152,9 @@ pub fn harvest_discovered_candidates(
     claims.extend(table_claims);
     claims.sort();
     claims.dedup();
+    for fact in indirect_facts {
+        db.insert(fact);
+    }
     merge_claims(db, &claims)
 }
 
@@ -196,17 +201,91 @@ fn load_images(rom: &NormalizedRom, db: &FactDb) -> Result<Vec<LoadImage>, Harve
     Ok(images)
 }
 
-fn detect_jal_targets(images: &[LoadImage]) -> Vec<ProviderClaim> {
+fn detect_reachable_call_targets(
+    images: &[LoadImage],
+    prologue_claims: &[ProviderClaim],
+    table_entries: &[(BankAddr, u32, BankAddr, ProofState)],
+) -> (Vec<ProviderClaim>, Vec<Fact>) {
     let mut claims = Vec::new();
+    let mut indirect_facts = Vec::new();
     for image in images {
+        let mut roots: BTreeSet<u32> = prologue_claims
+            .iter()
+            .filter(|claim| {
+                claim.target.bank == image.bank
+                    && is_structural_entry_boundary(image, claim.target.pc)
+            })
+            .map(|claim| claim.target.pc)
+            .collect();
+        roots.extend(
+            table_entries
+                .iter()
+                .filter(|(_, _, target, state)| {
+                    target.bank == image.bank && *state == ProofState::Proven
+                })
+                .map(|(_, _, target, _)| target.pc),
+        );
+        if image.bank == crate::banks::BOOT_BANK {
+            roots.insert(image.va_start);
+        }
+        let mut corroborated_raw_roots: BTreeMap<BankAddr, BTreeSet<u32>> = BTreeMap::new();
         for (index, bytes) in image.bytes.chunks_exact(4).enumerate() {
             let word = u32::from_be_bytes(bytes.try_into().unwrap());
-            if (word >> 26) != 0x03 {
+            if word >> 26 != 0x03 {
                 continue;
             }
             let site_pc = image.va_start.wrapping_add((index * 4) as u32);
             let target = (site_pc.wrapping_add(4) & 0xf000_0000) | ((word & 0x03ff_ffff) << 2);
             for target_image in target_images(images, image, target) {
+                corroborated_raw_roots
+                    .entry(BankAddr::new(&target_image.bank, target))
+                    .or_default()
+                    .insert(site_pc);
+            }
+        }
+        for (target, sites) in &corroborated_raw_roots {
+            let target_has_boundary = images.iter().any(|target_image| {
+                target_image.bank == target.bank
+                    && is_structural_entry_boundary(target_image, target.pc)
+            });
+            if target.bank == image.bank && (sites.len() >= 2 || target_has_boundary) {
+                roots.insert(target.pc);
+            }
+        }
+        if roots.is_empty() {
+            continue;
+        }
+
+        let closure = build_cfg_value_set_closed(
+            &image.bank,
+            &image.bytes,
+            image.va_start,
+            &roots.into_iter().collect::<Vec<_>>(),
+        );
+        indirect_facts.extend(closure.indirect.iter().map(|resolution| {
+            Fact::IndirectTransferAnalysis {
+                site: BankAddr::new(&image.bank, resolution.site_pc),
+                via_call: resolution.via_call,
+                state: match resolution.state {
+                    IndirectProofState::Exhaustive => IndirectTransferState::Exhaustive,
+                    IndirectProofState::Bounded => IndirectTransferState::Bounded,
+                    IndirectProofState::Open => IndirectTransferState::Open,
+                },
+                kind: resolution.kind.map(|kind| match kind {
+                    IndirectResolutionKind::Constant => IndirectTransferKind::Constant,
+                    IndirectResolutionKind::MemoryValueSet => IndirectTransferKind::MemoryValueSet,
+                    IndirectResolutionKind::JumpTable => IndirectTransferKind::JumpTable,
+                }),
+                targets: resolution.targets.clone(),
+                memory_sources: resolution.memory_sources.clone(),
+            }
+        }));
+        for &(site_pc, target) in &closure.cfg.direct_calls {
+            let mut target_images = target_images(images, image, target);
+            if target_images.is_empty() && image.bank != crate::banks::BOOT_BANK {
+                target_images = initial_copy_leaf_targets(images, target);
+            }
+            for target_image in target_images {
                 claims.push(ProviderClaim {
                     target: BankAddr::new(&target_image.bank, target),
                     detector: CandidateDetector::JalTarget,
@@ -218,50 +297,183 @@ fn detect_jal_targets(images: &[LoadImage]) -> Vec<ProviderClaim> {
             }
         }
 
+        // A raw `jal` word outside the reachable closure is not enough: it
+        // may be embedded data. Two distinct call sites independently naming
+        // the same bank-qualified target are corroborating evidence and
+        // restore frameless/unseeded callees without reopening the one-word
+        // data false-positive class.
+        let mut raw_calls: BTreeMap<BankAddr, BTreeSet<u32>> = BTreeMap::new();
+        for (index, bytes) in image.bytes.chunks_exact(4).enumerate() {
+            let word = u32::from_be_bytes(bytes.try_into().unwrap());
+            if word >> 26 != 0x03 {
+                continue;
+            }
+            let site_pc = image.va_start.wrapping_add((index * 4) as u32);
+            let target = (site_pc.wrapping_add(4) & 0xf000_0000) | ((word & 0x03ff_ffff) << 2);
+            for target_image in target_images(images, image, target) {
+                raw_calls
+                    .entry(BankAddr::new(&target_image.bank, target))
+                    .or_default()
+                    .insert(site_pc);
+            }
+        }
+        for (target, sites) in raw_calls {
+            let target_has_boundary = images.iter().any(|target_image| {
+                target_image.bank == target.bank
+                    && is_structural_entry_boundary(target_image, target.pc)
+            });
+            let boot_is_only_image = image.bank == crate::banks::BOOT_BANK && images.len() == 1;
+            if !boot_is_only_image && sites.len() < 2 && !target_has_boundary {
+                continue;
+            }
+            for site_pc in sites {
+                claims.push(ProviderClaim {
+                    target: target.clone(),
+                    detector: CandidateDetector::JalTarget,
+                    evidence: FunctionEntryEvidence::DirectJal {
+                        call_site: BankAddr::new(&image.bank, site_pc),
+                    },
+                    proposed_state: ProofState::Candidate,
+                });
+            }
+        }
+
+        for resolution in closure.indirect.iter().filter(|resolution| {
+            resolution.via_call && resolution.state == IndirectProofState::Exhaustive
+        }) {
+            let Some(kind) = resolution.kind.map(|kind| match kind {
+                IndirectResolutionKind::Constant => IndirectCallEvidenceKind::Constant,
+                IndirectResolutionKind::MemoryValueSet => IndirectCallEvidenceKind::MemoryValueSet,
+                IndirectResolutionKind::JumpTable => IndirectCallEvidenceKind::JumpTable,
+            }) else {
+                continue;
+            };
+            for &target in &resolution.targets {
+                for target_image in target_images(images, image, target) {
+                    claims.push(ProviderClaim {
+                        target: BankAddr::new(&target_image.bank, target),
+                        detector: CandidateDetector::IndirectCallTarget,
+                        evidence: FunctionEntryEvidence::ExhaustiveIndirectCall {
+                            call_site: BankAddr::new(&image.bank, resolution.site_pc),
+                            kind,
+                            memory_sources: resolution
+                                .memory_sources
+                                .iter()
+                                .map(|address| BankAddr::new(&image.bank, *address))
+                                .collect(),
+                        },
+                        proposed_state: ProofState::Candidate,
+                    });
+                }
+            }
+        }
+
+        // Retain the original bounded straight-line HI/LO proof for sites
+        // outside candidate-root reachability. The multi-block value-set
+        // pass subsumes reachable sites; deterministic merge deduplicates
+        // the overlap by target + evidence.
         for resolved in resolve_linear_jalr_sites(&image.bytes, image.va_start) {
             for target_image in target_images(images, image, resolved.target) {
                 claims.push(ProviderClaim {
                     target: BankAddr::new(&target_image.bank, resolved.target),
-                    detector: CandidateDetector::JalTarget,
-                    evidence: FunctionEntryEvidence::ResolvedJalr {
+                    detector: CandidateDetector::IndirectCallTarget,
+                    evidence: FunctionEntryEvidence::ExhaustiveIndirectCall {
                         call_site: BankAddr::new(&image.bank, resolved.site_pc),
-                        construction_start: BankAddr::new(&image.bank, resolved.construction_start),
+                        kind: IndirectCallEvidenceKind::Constant,
+                        memory_sources: Vec::new(),
                     },
                     proposed_state: ProofState::Candidate,
                 });
             }
         }
     }
-    claims
+    (claims, indirect_facts)
+}
+
+/// Candidate prologues are excellent function-entry evidence but can also be
+/// stack adjustments inside a larger function. CFG traversal uses only the
+/// subset that begins the image or immediately follows a delay-slot-bearing
+/// terminal transfer. The full prologue candidate set is still reported; this
+/// filter only prevents an interior adjustment from authorizing arbitrary
+/// downstream words as call instructions.
+fn is_structural_entry_boundary(image: &LoadImage, pc: u32) -> bool {
+    let Some(offset) = pc.checked_sub(image.va_start).map(|offset| offset as usize) else {
+        return false;
+    };
+    if offset == 0 {
+        return true;
+    }
+    let Some(transfer_offset) = offset.checked_sub(8) else {
+        return false;
+    };
+    let Some(bytes) = image.bytes.get(transfer_offset..transfer_offset + 4) else {
+        return false;
+    };
+    let word = u32::from_be_bytes(bytes.try_into().unwrap());
+    let opcode = word >> 26;
+    opcode == 0x02 || (opcode == 0 && matches!(word & 0x3f, 0x08 | 0x0c | 0x0d))
+}
+
+fn initial_copy_leaf_targets(images: &[LoadImage], target: u32) -> Vec<&LoadImage> {
+    images
+        .iter()
+        .filter(|image| image.bank == crate::banks::BOOT_BANK)
+        .filter(|image| is_structural_entry_boundary(image, target))
+        .filter(|image| {
+            let Some(offset) = target
+                .checked_sub(image.va_start)
+                .map(|offset| offset as usize)
+            else {
+                return false;
+            };
+            let words = image
+                .bytes
+                .get(offset..)
+                .unwrap_or_default()
+                .chunks_exact(4)
+                .take(32);
+            for (index, bytes) in words.enumerate() {
+                let word = u32::from_be_bytes(bytes.try_into().unwrap());
+                if index == 0 && word == 0 {
+                    return false;
+                }
+                if word == 0x03e0_0008 {
+                    return true;
+                }
+                if is_call(word)
+                    || is_control_transfer(word)
+                    || is_unconditional_transfer_or_trap(word)
+                {
+                    return false;
+                }
+            }
+            false
+        })
+        .collect()
 }
 
 /// A call whose target lies inside its source load image stays bank-local.
-/// An out-of-image target prefers the always-resident boot image before any
-/// other match. Only when neither is possible do all matching images remain
-/// candidates; otherwise same-VA mutually-exclusive overlays would create
-/// fabricated cross-bank claims for every bank sharing the address.
+/// Cross-image calls require an independently discovered non-boot mapping.
+/// IPL3's one-megabyte initial copy is activation evidence for boot, not proof
+/// that every byte remains the owner after later DMA loads; assigning an
+/// overlay's call to that physical prefix would fabricate identity when a
+/// resident code image occupying the same VA has not yet been discovered.
 fn target_images<'a>(
     images: &'a [LoadImage],
     source: &'a LoadImage,
     target: u32,
 ) -> Vec<&'a LoadImage> {
-    if target >= source.va_start && target < source.va_end {
+    let contains_backed_target = |image: &&LoadImage| {
+        let byte_end = image.va_start.wrapping_add(image.bytes.len() as u32);
+        target >= image.va_start && target < image.va_end && target < byte_end
+    };
+    if contains_backed_target(&source) {
         return vec![source];
-    }
-    let resident: Vec<_> = images
-        .iter()
-        .filter(|candidate| {
-            candidate.bank == crate::banks::BOOT_BANK
-                && target >= candidate.va_start
-                && target < candidate.va_end
-        })
-        .collect();
-    if !resident.is_empty() {
-        return resident;
     }
     images
         .iter()
-        .filter(|candidate| target >= candidate.va_start && target < candidate.va_end)
+        .filter(|candidate| candidate.bank != crate::banks::BOOT_BANK)
+        .filter(contains_backed_target)
         .collect()
 }
 
@@ -622,12 +834,16 @@ mod tests {
         let mut db = mapped_db(&rom);
         let report = harvest_discovered_candidates(&rom, &mut db).unwrap();
 
-        for target in [direct_target, 0x8000_0448] {
-            assert!(report.entries.iter().any(|entry| {
-                entry.target == BankAddr::new("boot", target)
-                    && entry.detectors.contains(&CandidateDetector::JalTarget)
-            }));
-        }
+        assert!(report.entries.iter().any(|entry| {
+            entry.target == BankAddr::new("boot", direct_target)
+                && entry.detectors.contains(&CandidateDetector::JalTarget)
+        }));
+        assert!(report.entries.iter().any(|entry| {
+            entry.target == BankAddr::new("boot", 0x8000_0448)
+                && entry
+                    .detectors
+                    .contains(&CandidateDetector::IndirectCallTarget)
+        }));
         assert!(db.facts().iter().any(|fact| matches!(
             fact,
             Fact::FunctionEntryClaim {
@@ -638,9 +854,18 @@ mod tests {
         assert!(db.facts().iter().any(|fact| matches!(
             fact,
             Fact::FunctionEntryClaim {
-                evidence: FunctionEntryEvidence::ResolvedJalr { call_site, .. },
+                evidence: FunctionEntryEvidence::ExhaustiveIndirectCall { call_site, .. },
                 ..
             } if call_site.pc == 0x8000_0410
+        )));
+        assert!(db.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::IndirectTransferAnalysis {
+                site,
+                state: IndirectTransferState::Exhaustive,
+                via_call: true,
+                ..
+            } if site.pc == 0x8000_0410
         )));
     }
 

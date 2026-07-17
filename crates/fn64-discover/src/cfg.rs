@@ -221,6 +221,12 @@ pub enum BlockTerminator {
     /// unresolved by this phase -- Phase 6's job. Recorded as an open
     /// indirect site here, not silently dropped.
     Indirect { via_call: bool },
+    /// Phase 6 proved an exhaustive finite target set for this computed
+    /// transfer. Computed jumps keep their targets inside the current owner;
+    /// computed calls prove callable roots while their return edge remains in
+    /// the caller. Keeping this distinct from `Tail`/`Call` prevents switch
+    /// cases from becoming function-entry candidates.
+    ResolvedIndirect { targets: Vec<u32>, via_call: bool },
     /// `break`/`syscall`: terminates the block, no successor.
     Trap,
     /// Ran off the end of the decodable/bank region without a terminator.
@@ -228,8 +234,7 @@ pub enum BlockTerminator {
 }
 
 /// One indirect control-transfer site the CFG could not resolve -- carried
-/// forward for Phase 6 (this crate does not implement Phase 6 yet; this
-/// struct is the fact record it will consume).
+/// forward as Phase 6's explicit open frontier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndirectSite {
     pub pc: u32,
@@ -281,6 +286,19 @@ fn read_word(bank_bytes: &[u8], off: usize) -> Option<u32> {
 /// another bank is exactly the kind of thing this phase must survive
 /// without crashing.
 pub fn build_cfg(bank: &str, bank_bytes: &[u8], va_start: u32, roots: &[u32]) -> Cfg {
+    build_cfg_with_indirect(bank, bank_bytes, va_start, roots, &BTreeMap::new())
+}
+
+/// Build a CFG while consuming Phase 6's exhaustive indirect successors.
+/// The map is keyed by transfer-site PC. A missing or empty target set leaves
+/// the site open; callers must never put partially-resolved sets here.
+pub fn build_cfg_with_indirect(
+    bank: &str,
+    bank_bytes: &[u8],
+    va_start: u32,
+    roots: &[u32],
+    exhaustive_indirect: &BTreeMap<u32, Vec<u32>>,
+) -> Cfg {
     let va_end = va_start.wrapping_add(bank_bytes.len() as u32);
     let in_range = |va: u32| va >= va_start && va < va_end && (va - va_start).is_multiple_of(4);
 
@@ -428,6 +446,19 @@ pub fn build_cfg(bank: &str, bank_bytes: &[u8], va_start: u32, roots: &[u32]) ->
                     let is_return = rs == 31; // $ra
                     let terminator = if is_return {
                         BlockTerminator::Return
+                    } else if let Some(targets) = exhaustive_indirect
+                        .get(&pc)
+                        .filter(|targets| !targets.is_empty())
+                    {
+                        for &target in targets {
+                            if in_range(target) {
+                                worklist.push_back(target);
+                            }
+                        }
+                        BlockTerminator::ResolvedIndirect {
+                            targets: targets.clone(),
+                            via_call: false,
+                        }
                     } else {
                         indirect_sites.push(IndirectSite {
                             pc,
@@ -447,14 +478,31 @@ pub fn build_cfg(bank: &str, bank_bytes: &[u8], va_start: u32, roots: &[u32]) ->
                     let delay_pc = pc.wrapping_add(4);
                     mark(&mut word_class, delay_pc, WordClass::ProvenCode);
                     let next = delay_pc.wrapping_add(4);
-                    indirect_sites.push(IndirectSite { pc, via_call: true });
+                    let terminator = if let Some(targets) = exhaustive_indirect
+                        .get(&pc)
+                        .filter(|targets| !targets.is_empty())
+                    {
+                        for &target in targets {
+                            if in_range(target) && proven_roots_seen.insert(target) {
+                                proven_roots.push(target);
+                                worklist.push_back(target);
+                            }
+                        }
+                        BlockTerminator::ResolvedIndirect {
+                            targets: targets.clone(),
+                            via_call: true,
+                        }
+                    } else {
+                        indirect_sites.push(IndirectSite { pc, via_call: true });
+                        BlockTerminator::Indirect { via_call: true }
+                    };
                     if in_range(next) {
                         worklist.push_back(next);
                     }
                     blocks.push(BasicBlock {
                         start_va: block_start,
                         end_va: next,
-                        terminator: BlockTerminator::Indirect { via_call: true },
+                        terminator,
                     });
                     break;
                 }

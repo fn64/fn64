@@ -46,8 +46,31 @@ pub enum MappingAddressSpace {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CandidateDetector {
     JalTarget,
+    IndirectCallTarget,
     ProloguePattern,
     TableDerived,
+}
+
+/// The exhaustive static construction behind an indirect-call target claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum IndirectCallEvidenceKind {
+    Constant,
+    MemoryValueSet,
+    JumpTable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum IndirectTransferState {
+    Exhaustive,
+    Bounded,
+    Open,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum IndirectTransferKind {
+    Constant,
+    MemoryValueSet,
+    JumpTable,
 }
 
 /// The prologue shape that justified a [`CandidateDetector::ProloguePattern`]
@@ -68,6 +91,11 @@ pub enum FunctionEntryEvidence {
     ResolvedJalr {
         call_site: BankAddr,
         construction_start: BankAddr,
+    },
+    ExhaustiveIndirectCall {
+        call_site: BankAddr,
+        kind: IndirectCallEvidenceKind,
+        memory_sources: Vec<BankAddr>,
     },
     Prologue {
         stack_adjust: BankAddr,
@@ -110,6 +138,17 @@ pub enum Fact {
         site: BankAddr,
         target: BankAddr,
         trace: String,
+    },
+    /// Static Phase 6 result for one reachable `jr`/`jalr`. Only an
+    /// exhaustive record may contribute CFG successors; bounded/open records
+    /// preserve the unresolved frontier without guessing.
+    IndirectTransferAnalysis {
+        site: BankAddr,
+        via_call: bool,
+        state: IndirectTransferState,
+        kind: Option<IndirectTransferKind>,
+        targets: Vec<u32>,
+        memory_sources: Vec<u32>,
     },
     /// A proven ROM-interval -> runtime-VA-interval mapping: the bank
     /// identity itself. `rom_start`/`rom_end` are ROM byte offsets in the
@@ -172,6 +211,7 @@ impl Fact {
             Fact::BlockStart { bank, .. } => Some(bank),
             Fact::LoadsFrom { site, .. } => Some(&site.bank),
             Fact::ObservedIndirectTarget { site, .. } => Some(&site.bank),
+            Fact::IndirectTransferAnalysis { site, .. } => Some(&site.bank),
             Fact::RomMapping { bank, .. } => Some(bank),
             Fact::LoadImageTableRecord { bank, .. } => bank.as_deref(),
             Fact::TableEntry { table, .. } => Some(&table.bank),

@@ -42,12 +42,12 @@
 //!   [`cfg::Cfg`]'s blocks from its proven roots -- one owner per block per
 //!   bank, ambiguous claims and unowned blocks reported explicitly rather
 //!   than resolved by guessing.
-//! - [`resolve`]: Phase 6's cheapest bounded case -- mechanically resolve a
-//!   `jr`/`jalr` whose target register was built by a bounded HI/LO
-//!   (`lui`+`addiu`/`ori`) construction, and iterate the CFG to a fixed
-//!   point ([`resolve::build_cfg_closed`]). This is what turns the header
-//!   entrypoint of a stripped IPL3 boot stub into the resident C entry root
-//!   with no hand-supplied "main entry" address.
+//! - [`resolve`]: Phase 6 bounded value-set closure -- HI/LO and GP-relative
+//!   address construction, exact register/memory propagation, dominating
+//!   switch bounds, exhaustive jump tables, and fixed-point CFG feedback.
+//!   Computed-jump table entries remain intra-owner code successors; only
+//!   exhaustive computed calls become callable roots. Every unresolved site
+//!   is retained as bounded/open evidence in the fact database.
 //! - [`grade_oot`] / [`grade_nw4e`]: grading-only cross-checks against the
 //!   OoT decomp's segment answer key and NW4E's hand-verified
 //!   `overlays.json`. Neither module is reachable from the discovery
@@ -62,8 +62,7 @@
 //!   WM2000/NWXE resident-bank function extents mechanically extracted from
 //!   aki-recomp's generated `syms/dump.toml`.
 //!
-//! The rest of indirect-target closure (Phase 6 beyond the bounded HI/LO
-//! `jr`/`jalr` case [`resolve`] now handles), dynamic probes (Phase 7), and
+//! Dynamic indirect observations/callback-field semantics (Phase 6/7) and
 //! assembly verification (Phase 8) are not yet implemented.
 
 pub mod banks;

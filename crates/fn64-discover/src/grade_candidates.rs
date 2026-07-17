@@ -5,7 +5,9 @@
 //! `RomMapping` facts into `(ROM offset, runtime VA)` before comparison, so
 //! overlapping overlay VAs cannot earn false matches by address alone.
 
-use crate::facts::{function_entry_subject, CandidateDetector, Fact, FactDb, ProofState};
+use crate::facts::{
+    function_entry_subject, CandidateDetector, Fact, FactDb, FunctionEntryEvidence, ProofState,
+};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,6 +23,15 @@ pub struct CandidateAnswerKey {
     pub function_count: usize,
     pub section_count: usize,
     multiplicity: BTreeMap<PhysicalEntry, usize>,
+    extents: Vec<FunctionExtent>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FunctionExtent {
+    rom_start: u32,
+    rom_end: u32,
+    vram_start: u32,
+    vram_end: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +66,7 @@ pub fn parse_symbol_dump(text: &str) -> Result<CandidateAnswerKey, String> {
     let mut entries = BTreeSet::new();
     let mut multiplicity = BTreeMap::new();
     let mut function_count = 0usize;
+    let mut extents = Vec::new();
 
     for section in doc.section {
         for function in section.functions {
@@ -84,6 +96,16 @@ pub fn parse_symbol_dump(text: &str) -> Result<CandidateAnswerKey, String> {
             };
             entries.insert(entry);
             *multiplicity.entry(entry).or_insert(0) += 1;
+            extents.push(FunctionExtent {
+                rom_start: rom,
+                rom_end: rom.checked_add(function.size).ok_or_else(|| {
+                    format!("function {:?} ROM extent overflows u32", function.name)
+                })?,
+                vram_start: function.vram,
+                vram_end: function.vram.checked_add(function.size).ok_or_else(|| {
+                    format!("function {:?} VRAM extent overflows u32", function.name)
+                })?,
+            });
         }
     }
 
@@ -92,6 +114,7 @@ pub fn parse_symbol_dump(text: &str) -> Result<CandidateAnswerKey, String> {
         function_count,
         section_count,
         multiplicity,
+        extents,
     })
 }
 
@@ -133,6 +156,25 @@ pub struct DetectorGrade {
     /// discovered bank mapping. They count neither as matches nor candidates;
     /// the count is explicit so a broken mapping cannot hide in the grade.
     pub ungradable: usize,
+    pub false_positive_breakdown: FalsePositiveBreakdown,
+}
+
+/// Grading-only explanation of false candidates. These categories never feed
+/// discovery; they identify whether the target was an interior label/gap and
+/// whether any detector source instruction lies in an answer-key function.
+#[derive(Debug, Clone, Default)]
+pub struct FalsePositiveBreakdown {
+    pub target_interior: usize,
+    pub target_outside_functions: usize,
+    pub source_inside_function: usize,
+    pub source_outside_functions: usize,
+    pub samples: Vec<FalsePositiveSample>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FalsePositiveSample {
+    pub target: PhysicalEntry,
+    pub sources: Vec<PhysicalEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,11 +200,16 @@ pub fn grade_candidates(db: &FactDb, key: &CandidateAnswerKey) -> CandidateGrade
     let mut per_detector_candidates: BTreeMap<CandidateDetector, BTreeSet<PhysicalEntry>> =
         BTreeMap::from([
             (CandidateDetector::JalTarget, BTreeSet::new()),
+            (CandidateDetector::IndirectCallTarget, BTreeSet::new()),
             (CandidateDetector::ProloguePattern, BTreeSet::new()),
             (CandidateDetector::TableDerived, BTreeSet::new()),
         ]);
     let mut per_detector_ungradable: BTreeMap<CandidateDetector, BTreeSet<(String, u32)>> =
         BTreeMap::new();
+    let mut per_detector_sources: BTreeMap<
+        CandidateDetector,
+        BTreeMap<PhysicalEntry, BTreeSet<PhysicalEntry>>,
+    > = BTreeMap::new();
     let mut combined_targets: BTreeSet<(String, u32)> = BTreeSet::new();
 
     for fact in db.facts() {
@@ -184,6 +231,24 @@ pub fn grade_candidates(db: &FactDb, key: &CandidateAnswerKey) -> CandidateGrade
                     .entry(*detector)
                     .or_default()
                     .insert(entry);
+                let source = match fact {
+                    Fact::FunctionEntryClaim {
+                        evidence:
+                            FunctionEntryEvidence::DirectJal { call_site }
+                            | FunctionEntryEvidence::ResolvedJalr { call_site, .. }
+                            | FunctionEntryEvidence::ExhaustiveIndirectCall { call_site, .. },
+                        ..
+                    } => translate(&call_site.bank, call_site.pc, &mappings),
+                    _ => None,
+                };
+                if let Some(source) = source {
+                    per_detector_sources
+                        .entry(*detector)
+                        .or_default()
+                        .entry(entry)
+                        .or_default()
+                        .insert(source);
+                }
             }
             None => {
                 per_detector_ungradable
@@ -202,12 +267,17 @@ pub fn grade_candidates(db: &FactDb, key: &CandidateAnswerKey) -> CandidateGrade
 
     let per_detector = per_detector_candidates
         .into_iter()
-        .map(|(detector, candidates)| DetectorGrade {
-            detector,
-            metrics: metrics(&candidates, key),
-            ungradable: per_detector_ungradable
-                .get(&detector)
-                .map_or(0, BTreeSet::len),
+        .map(|(detector, candidates)| {
+            let false_positive_breakdown =
+                false_positive_breakdown(&candidates, per_detector_sources.get(&detector), key);
+            DetectorGrade {
+                detector,
+                metrics: metrics(&candidates, key),
+                ungradable: per_detector_ungradable
+                    .get(&detector)
+                    .map_or(0, BTreeSet::len),
+                false_positive_breakdown,
+            }
         })
         .collect();
 
@@ -228,6 +298,53 @@ pub fn grade_candidates(db: &FactDb, key: &CandidateAnswerKey) -> CandidateGrade
         combined: metrics(&combined_candidates, key),
         combined_ungradable,
     }
+}
+
+fn contains(extent: &FunctionExtent, entry: PhysicalEntry) -> bool {
+    entry.rom >= extent.rom_start
+        && entry.rom < extent.rom_end
+        && entry.vram >= extent.vram_start
+        && entry.vram < extent.vram_end
+}
+
+fn false_positive_breakdown(
+    candidates: &BTreeSet<PhysicalEntry>,
+    sources: Option<&BTreeMap<PhysicalEntry, BTreeSet<PhysicalEntry>>>,
+    key: &CandidateAnswerKey,
+) -> FalsePositiveBreakdown {
+    let mut breakdown = FalsePositiveBreakdown::default();
+    for candidate in candidates.difference(&key.entries) {
+        if key
+            .extents
+            .iter()
+            .any(|extent| contains(extent, *candidate))
+        {
+            breakdown.target_interior += 1;
+        } else {
+            breakdown.target_outside_functions += 1;
+        }
+        let source_inside = sources
+            .and_then(|sources| sources.get(candidate))
+            .is_some_and(|sources| {
+                sources
+                    .iter()
+                    .any(|source| key.extents.iter().any(|extent| contains(extent, *source)))
+            });
+        if source_inside {
+            breakdown.source_inside_function += 1;
+        } else {
+            breakdown.source_outside_functions += 1;
+        }
+        if breakdown.samples.len() < 12 {
+            breakdown.samples.push(FalsePositiveSample {
+                target: *candidate,
+                sources: sources
+                    .and_then(|sources| sources.get(candidate))
+                    .map_or_else(Vec::new, |sources| sources.iter().copied().collect()),
+            });
+        }
+    }
+    breakdown
 }
 
 fn is_positive(state: ProofState) -> bool {
