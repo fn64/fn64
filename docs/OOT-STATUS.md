@@ -245,9 +245,47 @@ Ordered by leverage, from ground-truth on the reachable file-select 3D scene
 (`/tmp/fn64-depth-nodepth-opaque.png`: recognizable green field + flowers +
 road, but the top half misprojects).
 
-1. **Hyrule Field title-camera projection — the claimed raw-eye matrix bug was
-   falsified by writer tracing (2026-07-16).** Physical `0x1888c8` is written
-   only by recompiled `guMtxF2L` (`funcs_57.c:3275-3344`), called by recompiled
+1. **Large-world ReferenceBackend artifact — ROOT-CAUSED AND FIXED in texture
+   loading, not projection.** Swap-1299 instrumentation separated geometry
+   from shading. The first 26 emitted triangles have finite positive clip W,
+   legal viewport coordinates, and tessellate the expected 320x240 sky
+   rectangle. Rendering those triangles without texture produces the same
+   correctly placed full-screen mesh, so neither the matrix transform nor
+   raster screen mapping can cause the bands or right-side magenta region.
+
+   The texture command trace proves two independent decoder defects. First,
+   live CI8 palette loads encode 256 entries (`count - 1 = 255`), while the
+   decoder shifted that field right by another two bits and loaded only 64;
+   36,166 such commands were observed through swap 1299 (and 11,759 16-entry
+   loads were likewise truncated to four). CI8 indices beyond the short vector
+   became the decoder's magenta sentinel—133 of the sampled 32x32 diagnostic
+   tile's texels—accounting for the magenta region directly. The public
+   libultra `gDPLoadTLUTCmd` layout stores `count - 1` directly at bits 14..23;
+   it is not an S/T quarter-texel field.
+
+   Second, the sky is a 128-texel-wide CI8 source loaded as successive 32x32
+   `G_LOADTILE` rectangles at distinct ULS/ULT positions. The old direct
+   decoder addressed every rectangle as `ty * tile_width + tx`, ignoring both
+   the `G_SETTIMG` width and load origin, so every sky patch reread the source's
+   top-left rectangle. That repeated rectangle is the horizontal banding. The
+   public `gDPSetTextureImage`/`gDPLoadTile` layouts instead require
+   `(source_y + ty) * image_width + source_x + tx`; sampling then subtracts
+   the render tile's ULS/ULT origin from vertex S/T. The decoder now preserves
+   that image width and both origins, decodes the complete TLUT, and traps on
+   an out-of-range palette/sample invariant instead of painting magenta.
+   Synthetic regressions `load_tlut_count_uses_all_ten_wire_bits` and
+   `load_tile_uses_settimg_stride_and_tile_coordinate_origin` reproduce the
+   old failures without game data. The corrected swap-1299 dump is a continuous
+   blue-to-dawn sky gradient with cloud/horizon detail and no magenta third;
+   coarse ReferenceBackend texture/raster detail and absent terrain remain
+   later fidelity work, not evidence of the former decoder failure. Ten of ten
+   consecutive release probes reached swap 1300 at deterministic step 170788
+   with rc=0 and byte-identical dumps (SHA-256
+   `586eae90fe194222fe149f4450626df4bc2ca07de812a3353bc065c0551d4df8`).
+
+   The earlier claimed raw-eye matrix bug remains **falsified by writer tracing
+   (2026-07-16).** Physical `0x1888c8` is written only by recompiled
+   `guMtxF2L` (`funcs_57.c:3275-3344`), called by recompiled
    `guLookAt` at `funcs_57.c:4368`. Immediately before conversion, recompiled
    `guLookAtF` writes its translation at `funcs_57.c:4166,4251,4280`. The
    traced inputs are eye `(-4000,-1,5228)`, at `(-4083,10,5263)`, and up

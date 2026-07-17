@@ -873,6 +873,8 @@ mod tests {
             texels: std::rc::Rc::new(vec![255, 255, 255, 255]),
             clamp_s: true,
             clamp_t: true,
+            origin_s: 0.0,
+            origin_t: 0.0,
         };
         let mut fb = Framebuffer::new(16, 16);
         fb.clear(0, 0, 0, 255);
@@ -902,6 +904,8 @@ mod tests {
             texels: std::rc::Rc::new(vec![255, 0, 0, 255]),
             clamp_s: true,
             clamp_t: true,
+            origin_s: 0.0,
+            origin_t: 0.0,
         };
         let mut fb = Framebuffer::new(16, 16);
         fb.clear(0, 0, 0, 255);
@@ -933,6 +937,8 @@ mod tests {
             texels: std::rc::Rc::new(texels),
             clamp_s: true,
             clamp_t: true,
+            origin_s: 0.0,
+            origin_t: 0.0,
         };
         let textured = |x: f32, y: f32, s: f32, t: f32, w: f32| Vertex {
             x,
@@ -983,6 +989,8 @@ mod tests {
             texels: std::rc::Rc::new(vec![0, 0, 0, 0, 255, 255, 255, 255]),
             clamp_s: true,
             clamp_t: true,
+            origin_s: 0.0,
+            origin_t: 0.0,
         };
         let mut tri = Triangle {
             v: [
