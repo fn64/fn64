@@ -29,7 +29,7 @@
 //! (segment table writes, `G_MW_SEGMENT`), `G_DL` (call/jump into a nested
 //! display list), `G_SETOTHERMODE_H/L` (RDP cycle/filter/dither/render/alpha/
 //! coverage/depth/blender state), `G_SETBLENDCOLOR` (alpha-test threshold),
-//! and `G_ENDDL` (stop).
+//! `G_SETSCISSOR` (per-triangle raster clip rectangle), and `G_ENDDL` (stop).
 //!
 //! Explicitly acknowledged-and-skipped (logged by name via `skip_opcode`,
 //! never a silent no-op): remaining framebuffer/sync state and any
@@ -716,6 +716,16 @@ pub struct Texture {
     pub clamp_t: bool,
 }
 
+/// Per-triangle snapshot of the RDP scissor rectangle, in screen pixels.
+/// Lower-right edges are exclusive.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ScissorRect {
+    pub ulx: f32,
+    pub uly: f32,
+    pub lrx: f32,
+    pub lry: f32,
+}
+
 impl Texture {
     /// Nearest-neighbor sample at texel coords `(s, t)`, applying the tile's
     /// clamp/wrap mode per axis. Returns RGBA8888. (Point sampling, not
@@ -756,6 +766,9 @@ impl Texture {
 #[derive(Clone, Debug, Default)]
 pub struct Triangle {
     pub v: [Vertex; 3],
+    /// RDP scissor active when this triangle was emitted. `None` preserves
+    /// framebuffer-only clipping for the legacy fixture decoder.
+    pub scissor: Option<ScissorRect>,
     /// The culling mode in effect (from `G_GEOMETRYMODE`) when this triangle
     /// was emitted. Carried per-triangle because geometry mode is decode-time
     /// RSP state that can change between `G_TRI*` commands; the rasterizer
@@ -1155,6 +1168,25 @@ fn load_light(rdram: &[u8], state: &mut DecodeState, addr: usize, slot: usize) {
     if slot == state.lights.num_dir {
         state.lights.ambient = [cr, cg, cb];
     }
+}
+
+/// Decode the F3DEX2 light slot selected by a `G_MOVEMEM G_MV_LIGHT`
+/// destination offset. `gSPLight(..., n)` emits `(n * 24 + 24) / 8` in the
+/// wire field, while DMEM indices 0 and 1 are reserved for the two look-at
+/// vectors. Therefore `LIGHT_1` starts at DMEM index 2 and maps to light slot
+/// 0, matching RT64's `offset / 24 - 2` dispatch.
+fn light_slot_from_movemem_offset(ofs_div8: usize) -> Option<usize> {
+    #[cfg(not(test))]
+    let reserved_slots = if std::env::var_os("FN64_DIAG_OLD_LIGHT_SLOT").is_some() {
+        1
+    } else {
+        2
+    };
+    #[cfg(test)]
+    let reserved_slots = 2;
+    (ofs_div8 / 3)
+        .checked_sub(reserved_slots)
+        .filter(|&slot| slot < MAX_LIGHTS)
 }
 
 /// Normalize a 3-vector; returns the zero vector unchanged (guards a 0-length
@@ -1641,6 +1673,7 @@ struct DecodeState {
     /// half-extent only when a projection IS active; with no projection at
     /// all the raw `ob` coords are used directly.
     viewport: Option<Viewport>,
+    scissor: Option<ScissorRect>,
     /// Current F3DEX2 geometry mode (the `G_GEOMETRYMODE` accumulator). Its
     /// `G_CULL_FRONT`/`G_CULL_BACK` bits decide per-triangle culling.
     geometry_mode: u32,
@@ -1896,6 +1929,7 @@ pub fn decode_display_list_f3dex2(
         modelview: identity(),
         mv_stack: Vec::new(),
         viewport: None,
+        scissor: None,
         geometry_mode: 0,
         other_mode: OtherMode::default(),
         combiner: CombinerState::default(),
@@ -1960,7 +1994,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 let texture = active_texture(&state.tex);
                 let blender = active_blender(state);
                 let idx = tri_indices(w0);
-                if let Some(t) = resolve_tri(
+                if let Some(mut t) = resolve_tri(
                     &state.vtx_cache,
                     idx,
                     cull,
@@ -1969,6 +2003,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                     state.combiner,
                     blender,
                 ) {
+                    t.scissor = state.scissor;
                     state.tris.push(t);
                 }
             }
@@ -1981,7 +2016,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 let blender = active_blender(state);
                 let idx_a = tri_indices(w0);
                 let idx_b = tri_indices(w1);
-                if let Some(t) = resolve_tri(
+                if let Some(mut t) = resolve_tri(
                     &state.vtx_cache,
                     idx_a,
                     cull,
@@ -1990,9 +2025,10 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                     state.combiner,
                     blender,
                 ) {
+                    t.scissor = state.scissor;
                     state.tris.push(t);
                 }
-                if let Some(t) = resolve_tri(
+                if let Some(mut t) = resolve_tri(
                     &state.vtx_cache,
                     idx_b,
                     cull,
@@ -2001,6 +2037,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                     state.combiner,
                     blender,
                 ) {
+                    t.scissor = state.scissor;
                     state.tris.push(t);
                 }
             }
@@ -2305,12 +2342,16 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                     }
                 } else if index == G_MV_LIGHT {
                     // gsSPLight (gbi.h:2911): ofs = n*24 + 24 (÷8 on the
-                    // wire), so ofs/8 = 3*(n+1) and the destination light
-                    // SLOT is n = ofs/8/3 - 1. Slot 0..num_dir-1 are
-                    // directional; slot num_dir is the ambient.
-                    let slot = (ofs_div8 / 3).saturating_sub(1);
-                    let addr = resolve_addr(&state.segments, w1);
-                    load_light(rdram, state, addr, slot);
+                    // wire), so ofs/8 = 3*(n+1). DMEM indices 0 and 1 are
+                    // look-at vectors; LIGHT_1 therefore maps from index 2
+                    // to slot 0. Slot 0..num_dir-1 are directional; slot
+                    // num_dir is the ambient.
+                    if let Some(slot) = light_slot_from_movemem_offset(ofs_div8) {
+                        let addr = resolve_addr(&state.segments, w1);
+                        load_light(rdram, state, addr, slot);
+                    } else {
+                        skip_opcode(G_MOVEMEM);
+                    }
                 } else {
                     skip_opcode(G_MOVEMEM);
                 }
@@ -2344,6 +2385,21 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 // gDPSetEnvColor -> DPRGBColor (gbi.h:3626-3644): w1 packs
                 // RGBA in bits 31..0, one byte per component.
                 state.combiner.environment = w1.to_be_bytes();
+            }
+            G_SETSCISSOR => {
+                // Public GBI packing (OoT ultra64/gbi.h:4819-4826): all four
+                // edges are unsigned 12-bit quarter-pixels. The lower-right
+                // edge is exclusive: OoT PreRender.c:137 passes `lrx + 1` /
+                // `lry + 1` when converting its inclusive stored bounds.
+                // RT64 likewise stores the fixed rect (rt64_rdp.cpp:974-980)
+                // and intersects triangle bounds with it
+                // (rt64_rsp.cpp:1140-1154).
+                state.scissor = Some(ScissorRect {
+                    ulx: ((w0 >> 12) & 0x0FFF) as f32 / 4.0,
+                    uly: (w0 & 0x0FFF) as f32 / 4.0,
+                    lrx: ((w1 >> 12) & 0x0FFF) as f32 / 4.0,
+                    lry: (w1 & 0x0FFF) as f32 / 4.0,
+                });
             }
             G_TEXRECT | G_TEXRECTFLIP => {
                 // 16-byte (two-word) RDP rectangle command (gbi.h:4973). We
@@ -2614,6 +2670,7 @@ fn resolve_tri(
             vtx_cache[idx[1] as usize],
             vtx_cache[idx[2] as usize],
         ],
+        scissor: None,
         cull,
         texture,
         other_mode,
@@ -2961,6 +3018,54 @@ mod tests {
         let low = update_other_mode_word(0b101, render_mode_w0, render_mode).unwrap();
         assert_eq!(low & 0b111, 0b101, "bits below render mode stay intact");
         assert_eq!(low & !0b111, render_mode);
+    }
+
+    #[test]
+    fn setscissor_decodes_quarter_pixel_edges_on_emitted_triangle() {
+        let mut rdram = vec![0u8; 0x4000];
+        wr_vtx(&mut rdram, 0x2000, 2, 3, 0, [255, 0, 0, 255]);
+        wr_vtx(&mut rdram, 0x2010, 12, 3, 0, [0, 255, 0, 255]);
+        wr_vtx(&mut rdram, 0x2020, 2, 13, 0, [0, 0, 255, 255]);
+
+        let raw_ulx = 5u32; // 1.25 px
+        let raw_uly = 10u32; // 2.5 px
+        let raw_lrx = 43u32; // 10.75 px
+        let raw_lry = 48u32; // 12 px
+        let mut off = 0x1000;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_SETSCISSOR as u32) << 24) | (raw_ulx << 12) | raw_uly,
+            (raw_lrx << 12) | raw_lry,
+        );
+        off += 8;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_VTX as u32) << 24) | (3 << 12) | (3 << 1),
+            0x2000,
+        );
+        off += 8;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1),
+            0,
+        );
+        off += 8;
+        wr_cmd(&mut rdram, off, (G_ENDDL as u32) << 24, 0);
+
+        let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
+        assert_eq!(tris.len(), 1);
+        assert_eq!(
+            tris[0].scissor,
+            Some(ScissorRect {
+                ulx: 1.25,
+                uly: 2.5,
+                lrx: 10.75,
+                lry: 12.0,
+            })
+        );
     }
 
     // --- Perspective * view * model projection regression ----------------
@@ -3396,6 +3501,7 @@ mod tests {
             modelview: identity(),
             mv_stack: Vec::new(),
             viewport: None,
+            scissor: None,
             geometry_mode: 0,
             other_mode: OtherMode::default(),
             combiner: CombinerState::default(),
@@ -3415,6 +3521,20 @@ mod tests {
         // 2 directional lights: data = 48.
         st.lights.num_dir = (48u32 / 24) as usize;
         assert_eq!(st.lights.num_dir, 2);
+    }
+
+    #[test]
+    fn movemem_light_1_maps_to_directional_slot_zero() {
+        // Fail-against-bug wire evidence: gSPLight(LIGHT_1) encodes
+        // (1*24 + 24)/8 = 6. The old `ofs/3 - 1` mapping returned slot 1,
+        // leaving the real first directional light (slot 0) black/stale and
+        // misclassifying LIGHT_1 as ambient when num_dir == 1.
+        assert_eq!(light_slot_from_movemem_offset(6), Some(0));
+        // LIGHT_2 is the ambient slot when one directional light is active.
+        assert_eq!(light_slot_from_movemem_offset(9), Some(1));
+        // Offsets for the two look-at vectors are not light slots.
+        assert_eq!(light_slot_from_movemem_offset(0), None);
+        assert_eq!(light_slot_from_movemem_offset(3), None);
     }
 
     #[test]

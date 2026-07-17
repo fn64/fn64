@@ -231,8 +231,11 @@ were byte-identical.
   not G_SETZIMG — functionally correct.)
 - Textures: G_SETTIMG/SETTILE/SETTILESIZE/LOADTLUT implemented;
   LOADBLOCK/LOADTILE partial (direct decode, not byte-exact TMEM DMA). Texels
-  **are** sampled in the rasterizer (nearest, screen-linear). Formats:
+  **are** sampled in the rasterizer with nearest filtering and
+  perspective-correct S/T (`S/w`, `T/w`, `1/w`, then divide). Formats:
   RGBA16/32, IA16, I4/IA4, CI8/CI4.
+- `G_SETSCISSOR` snapshots quarter-pixel `[upper-left, lower-right)` state per
+  triangle and intersects it with framebuffer raster bounds at pixel centers.
 
 ---
 
@@ -289,17 +292,20 @@ road, but the top half misprojects).
    fail-against-bug tests cover state carry, the OoT render-mode macro's
    embedded alpha-dither bits, a transparent cutout texel, depth preservation,
    and mixed dither coverage. The bounded C-file boot reached 250 swaps and
-   produced a changed actual frame sequence; current missing combiner/scissor
-   work still obscures the title-demo foliage in RGB, so the eyes-on dump
-   proves corrected alpha coverage rather than a finished scene.
+   produced a changed actual frame sequence. The eyes-on dump proves corrected
+   alpha coverage rather than a finished scene.
 3. **Alpha blending: implemented and unit-verified; live visual exercise is
    pending.** Both full and partial other-mode writes feed per-triangle
    `GBL_c1`/`GBL_c2` state. The raster pipeline composites `P*A + M*B` over
    the framebuffer only after combiner, alpha compare, and depth test. The
    bounded boot depth used for this merge may not visibly exercise a
    translucent surface, so an eyes-on blend-specific scene remains TODO.
-4. **G_SETSCISSOR** clip + perspective-correct S/T & depth (HUD split, floor
-   swim).
+4. **Scissor and perspective-correct S/T: implemented and unit-verified;
+   live visual exercise is pending.** `G_SETSCISSOR` clips pixel-center raster
+   bounds to its quarter-pixel, exclusive-lower-right rectangle. Textured
+   triangles interpolate `S/w`, `T/w`, and `1/w` before sampling. Depth
+   interpolation remains screen-linear, and the later human eye-gate must
+   still inspect HUD splits and glancing-angle floor texture stability.
 
 ### Partial / loose ends
 - ~~`G_DL recursion exceeded MAX_DL_DEPTH (10)` spam during field render~~
