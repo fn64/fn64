@@ -122,7 +122,7 @@ mod game {
         pixels: Option<Pixels<'static>>,
         reported_first_frame: bool,
         last_heartbeat_swap: u64,
-        /// Wall-clock deadline for the next presented frame (~60 Hz pacing).
+        /// Wall-clock deadline for the next pumped frame (~60 Hz pacing).
         next_frame_deadline: std::time::Instant,
     }
 
@@ -247,7 +247,10 @@ mod game {
             // shell's audio deliverable -- samples produced by M_AUDTASK and
             // submitted through osAiSetNextBuffer flow here. Gated so a headless/CI env with no audio
             // device doesn't abort; a create() failure is logged, not fatal.
-            wire_audio(rdram.len());
+            // Return value (the negotiated stream rate) is already logged by
+            // wire_audio; pacing no longer needs it -- osAiGetLength's live
+            // readback lets the game self-pace audio production.
+            let _ = wire_audio(rdram.len());
 
             // Audio SYNTH (ucode): optional, behind the feature. Without it,
             // M_AUDTASK dispatch runs no ucode (silent) but the output path
@@ -408,11 +411,12 @@ mod game {
                     let audio = fn64_abi::audio_output_stats();
                     println!(
                         "[fn64-shell] present heartbeat: VI swap #{swaps} ({state}); audio: \
-                         ai_buffers={} samples={} nonzero={} backend_buffers={}",
+                         ai_buffers={} samples={} nonzero={} backend_buffers={} ring_frames={:?}",
                         audio.ai_buffers,
                         audio.samples,
                         audio.nonzero_samples,
-                        audio.backend_buffers
+                        audio.backend_buffers,
+                        fn64_abi::audio_frames_remaining()
                     );
                     self.last_heartbeat_swap = swaps;
                 }
@@ -513,32 +517,36 @@ mod game {
             }
         }
 
-        fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-            // Advance the game one frame's worth, then ask for a redraw so the
-            // freshly-swapped framebuffer is presented.
-            let swapped = self.pump_one_frame();
-            let now = fn64_abi::vi_swap_count();
-            if swapped {
-                self.last_swap_count = now;
-                // Real-time pacing: one VI swap per NTSC field (~16.67 ms).
-                // The pump advances the game as fast as the host can step,
-                // which is a headless-probe virtue but makes a PLAYED game
-                // run many times over-speed. Sleep off the remainder of this
-                // frame's wall-clock budget; if we're behind, reset the
-                // deadline instead of accumulating debt (no fast-forward
-                // catch-up bursts).
-                const FRAME: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
-                let now_t = std::time::Instant::now();
-                if now_t < self.next_frame_deadline {
-                    std::thread::sleep(self.next_frame_deadline - now_t);
-                    self.next_frame_deadline += FRAME;
-                } else {
-                    self.next_frame_deadline = now_t + FRAME;
+        fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+            // Real-time pacing WITHOUT blocking the event thread: pump one
+            // game frame when the ~16.67 ms wall deadline is due, then hand
+            // the loop a WaitUntil so input/close events keep flowing while
+            // we wait. Audio stays synchronized WITHOUT being the pacing
+            // master here: `osAiGetLength` reports the live ring backlog, so
+            // the game's own AudioMgr skips/queues buffers against real
+            // drain exactly as on hardware (the ring cap + the heartbeat's
+            // ring_frames are the backstop and the evidence).
+            const FRAME: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
+
+            let now_t = std::time::Instant::now();
+            if now_t >= self.next_frame_deadline {
+                let swapped = self.pump_one_frame();
+                if swapped {
+                    self.last_swap_count = fn64_abi::vi_swap_count();
+                }
+                // Catch-up-free schedule: hold cadence while we keep up,
+                // re-anchor (dropping missed frames) when we fall behind.
+                self.next_frame_deadline =
+                    if now_t.saturating_duration_since(self.next_frame_deadline) < FRAME {
+                        self.next_frame_deadline + FRAME
+                    } else {
+                        now_t + FRAME
+                    };
+                if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
                 }
             }
-            if let Some(w) = self.window.as_ref() {
-                w.request_redraw();
-            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_deadline));
         }
     }
 
@@ -627,11 +635,13 @@ mod game {
 
     /// Register the cpal output stream as the audio backend. A create()
     /// failure (no device, headless CI) is logged, not fatal -- the game
-    /// still runs and presents; only sound is unavailable.
-    fn wire_audio(rdram_len: usize) {
+    /// still runs and presents; only sound is unavailable. Returns the
+    /// negotiated host stream rate when audio is live: the window loop uses
+    /// it as the frame-pacing master clock.
+    fn wire_audio(rdram_len: usize) -> Option<u32> {
         if std::env::var_os("FN64_NO_AUDIO").is_some() {
             println!("[fn64-shell] FN64_NO_AUDIO set -- audio output disabled");
-            return;
+            return None;
         }
         use fn64_audio::{AudioBackend as _, AudioConfig, CpalBackend};
         // Request the guest's own rate; `CpalBackend::create` negotiates
@@ -653,11 +663,15 @@ mod game {
                     "[fn64-shell] audio output wired (cpal, guest {N64_BOOT_AI_RATE_HZ} Hz -> \
                      stream {stream_rate} Hz stereo)"
                 );
+                Some(stream_rate)
             }
-            Err(e) => eprintln!(
-                "[fn64-shell] audio output unavailable ({e}) -- continuing SILENT \
-                 (window/input unaffected). Set FN64_NO_AUDIO to silence this."
-            ),
+            Err(e) => {
+                eprintln!(
+                    "[fn64-shell] audio output unavailable ({e}) -- continuing SILENT \
+                     (window/input unaffected). Set FN64_NO_AUDIO to silence this."
+                );
+                None
+            }
         }
     }
 
