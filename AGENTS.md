@@ -61,7 +61,10 @@ it, don't read it. Every design claim states which allowed source it came from.
   delay timer.
 - **Mechanism over patch.** If you fix an instance of a bug class, build the
   sweep that finds the rest of the class. One-off fixes to recurring shapes
-  get bounced in review.
+  get bounced in review. Doc drift is such a class and now has its sweep:
+  `scripts/lint-docs.py` (dangling refs, README crate coverage, phantom env
+  vars, a blind regen recipe). Run it alongside the tests; if you change a
+  doc's shape, teach the linter rather than exempt the doc.
 
 ## Scope & hygiene
 
