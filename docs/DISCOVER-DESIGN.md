@@ -173,6 +173,38 @@ invalid edges, and address collisions.
 
 ## Phase 3: harvest candidates
 
+> Implementation status (D1, 2026-07-16): `fn64-discover::harvest` now runs
+> three zero-LLM providers concurrently over immutable, Phase-2-proven load
+> images: (1) a linear `jal` scan plus bounded HI/LO-resolved `jalr` targets,
+> with the call site retained as evidence; (2) classic
+> `addiu`/`daddiu $sp,$sp,-N` + in-frame `sw $ra` prologues and the stricter
+> leaf variant requiring a matching stack restore at `jr $ra`; and (3)
+> `TableEntry` facts exposed by an already-identified descriptor table or
+> vector. The third provider does not scan blindly for table locations.
+> Providers return immutable claims; the merge sorts and deduplicates before
+> touching `FactDb`, so host thread scheduling cannot affect serialized
+> output. Independent positive providers produce `supported`; any positive
+> versus rejected/conflicting provider evidence produces `conflict`, never a
+> winner chosen by detector order. Only a merged `proven` entry can seed
+> `resolve::build_cfg_closed_with_facts` and the existing partitioner;
+> `candidate`/`supported` prologues cannot silently become authoritative
+> owners.
+>
+> The grading-only `gate_d1` compares physical `(ROM offset, runtime VA)`
+> identities after discovery, so overlapping overlay VAs cannot earn false
+> matches. Against the zeldaret-derived OoT key (472 sections / 13,358
+> function rows), using only the boot load image Phase 2 currently discovers:
+> direct/resolved calls produce 147 candidates, 85 matches, 57.823129%
+> precision, and 0.636323% recall; prologues produce 76 candidates, 72
+> matches, 94.736842% precision, and 0.539003% recall; the table provider has
+> no OoT input facts and therefore emits 0 candidates; the combined union is
+> 175 candidates / 109 matches, 62.285714% precision, and 0.815990% recall.
+> The low full-key recall is the explicit Phase-2 frontier (OoT overlay load
+> images are not yet discovered), not answer-key input to the detectors.
+> Recursive entrypoint traversal, branch/tail roots, callback discovery,
+> signatures, external-tool providers, dynamic PCs, and unresolved-interval
+> linear decoding remain design-only.
+
 Run independent candidate providers in parallel:
 
 - Recursive traversal from the ROM entrypoint.
