@@ -27,8 +27,9 @@
 //! - [`facts`]: the monotonic fact database and discrete [`facts::ProofState`]
 //!   values every conclusion in this crate is expressed in.
 //! - [`banks`]: Phase 2, load-image/overlay discovery -- the boot copy
-//!   (hardware-fixed, needs no scanning) and descriptor-table-shaped
-//!   overlay banks (given an explicit table location/shape).
+//!   (hardware-fixed, needs no scanning), descriptor-table-shaped overlay
+//!   banks, and configurable ROM/VROM range tables (including file-table
+//!   backed compressed overlay images).
 //! - [`harvest`]: Phase 3, parallel deterministic candidate providers for
 //!   direct/resolved calls, classic and leaf prologues, and code-pointer
 //!   entries exposed by already-discovered tables. Claims merge through
@@ -79,7 +80,7 @@ pub mod partition;
 pub mod resolve;
 pub mod rom;
 
-pub use facts::{BankAddr, Fact, FactDb, ProofState};
+pub use facts::{BankAddr, Fact, FactDb, ProofState, RomAddressSpace};
 pub use rom::{normalize, NormalizedRom, RomByteOrder, RomRejectReason};
 
 /// An explicit, cited descriptor-table location/shape plus the naming
@@ -101,12 +102,24 @@ pub fn run_discovery(
     rom_bytes: &[u8],
     descriptor_table: Option<DescriptorTableInput>,
 ) -> Result<(NormalizedRom, FactDb), RomRejectReason> {
+    run_discovery_with_load_image_tables(rom_bytes, descriptor_table, &[])
+}
+
+/// Run discovery with additional explicitly-located generalized Phase-2
+/// mapping tables. Answer keys are not accepted by this API: inputs contain
+/// only table geometry and deterministic bank naming.
+pub fn run_discovery_with_load_image_tables(
+    rom_bytes: &[u8],
+    descriptor_table: Option<DescriptorTableInput>,
+    load_image_tables: &[banks::LoadImageTableInput],
+) -> Result<(NormalizedRom, FactDb), RomRejectReason> {
     let rom = rom::normalize(rom_bytes)?;
     let mut db = FactDb::new();
     banks::discover_boot_bank(&rom, &mut db);
     if let Some((shape, bank_name)) = descriptor_table {
         banks::scan_descriptor_table(&rom, shape, bank_name, &mut db);
     }
+    banks::scan_load_image_tables(&rom, load_image_tables, &mut db);
     harvest::harvest_discovered_candidates(&rom, &mut db)
         .expect("Phase 2 produced a malformed load-image mapping");
     Ok((rom, db))
