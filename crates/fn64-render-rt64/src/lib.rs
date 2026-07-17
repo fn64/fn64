@@ -414,6 +414,8 @@ fn write_rgba5551_framebuffer(rdram: &mut [u8], start: usize, fb: &Framebuffer) 
 /// presents.
 pub struct Rt64Backend {
     #[cfg(feature = "rt64")]
+    task_index: u64,
+    #[cfg(feature = "rt64")]
     context: Option<ffi::Context>,
     #[cfg(not(feature = "rt64"))]
     created: bool,
@@ -422,6 +424,8 @@ pub struct Rt64Backend {
 impl Rt64Backend {
     pub fn new() -> Self {
         Rt64Backend {
+            #[cfg(feature = "rt64")]
+            task_index: 0,
             #[cfg(feature = "rt64")]
             context: None,
             #[cfg(not(feature = "rt64"))]
@@ -440,6 +444,7 @@ impl RenderBackend for Rt64Backend {
     fn create(&mut self, cfg: &RenderConfig) -> Result<(), RenderError> {
         #[cfg(feature = "rt64")]
         {
+            self.task_index = 0;
             self.context = None;
             let context = ffi::Context::create(cfg.width, cfg.height).map_err(|reason| {
                 RenderError::Backend {
@@ -471,6 +476,44 @@ impl RenderBackend for Rt64Backend {
     ) -> Result<FrameStatus, RenderError> {
         #[cfg(feature = "rt64")]
         {
+            let task_index = self.task_index;
+            self.task_index += 1;
+            if let Some(spec) = std::env::var_os("FN64_GFX_TASK_DUMP") {
+                let selected = spec.to_string_lossy().split(',').any(|entry| {
+                    entry.trim().parse::<u64>().unwrap_or_else(|error| {
+                        panic!(
+                            "FN64_GFX_TASK_DUMP entry {entry:?} is not a u64 task index: {error}"
+                        )
+                    }) == task_index
+                });
+                if selected {
+                    let directory = std::env::var_os("FN64_GFX_TASK_DUMP_DIR")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/fn64-gfx-task-dumps"));
+                    std::fs::create_dir_all(&directory).unwrap_or_else(|error| {
+                        panic!("failed to create FN64_GFX_TASK_DUMP_DIR {directory:?}: {error}")
+                    });
+                    let triangles = gbi::decode_display_list_f3dex2(rdram, task.data_ptr)
+                        .unwrap_or_else(|error| {
+                            panic!("failed to decode diagnostic gfx task {task_index}: {error}")
+                        });
+                    let command_trace = gbi::trace_display_list_f3dex2(rdram, task.data_ptr);
+                    let report = format!(
+                        "task_index={task_index}\noutput_addr={output_addr:#010x}\n\
+                         reference_triangle_count={}\ntask={task:#?}\n{command_trace}",
+                        triangles.len(),
+                    );
+                    let path = directory.join(format!("task-{task_index:04}.txt"));
+                    std::fs::write(&path, report).unwrap_or_else(|error| {
+                        panic!("failed to write gfx task diagnostic {path:?}: {error}")
+                    });
+                    eprintln!(
+                        "[fn64-render-rt64] dumped gfx task #{task_index} ({} reference \
+                         triangles) to {path:?}",
+                        triangles.len()
+                    );
+                }
+            }
             let context = self
                 .context
                 .as_mut()

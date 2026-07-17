@@ -593,6 +593,7 @@ fn main() {
     let mut play_state_offset = None;
     let mut last_player_state = None;
     let mut last_control_state = None;
+    let mut last_room_state = None;
     let mut last_swap_instant: Option<std::time::Instant> = None;
     loop {
         if steps >= max_steps {
@@ -771,8 +772,22 @@ fn main() {
                 // +0x24 (`refs/oot-decomp/include/actor.h:187-200`). These
                 // byte-grounded fields let a headless run prove that analog
                 // input moved Link instead of merely surviving in Play_Main.
+                const PLAY_MAIN: u32 = 0x8009_CAC8;
+                if let Some(base) = play_state_offset {
+                    if read_guest_u32(&rdram, base + 0x04) != PLAY_MAIN
+                        || read_guest_u32(&rdram, base + 0x98) != 1
+                    {
+                        println!(
+                            "[oot-boot] OOT PLAY STATE retired at swap {swap_count}: \
+                             rdram+{base:#x} no longer has live Play_Main"
+                        );
+                        play_state_offset = None;
+                        last_player_state = None;
+                        last_control_state = None;
+                        last_room_state = None;
+                    }
+                }
                 if state.2 == 0 && play_state_offset.is_none() {
-                    const PLAY_MAIN: u32 = 0x8009_CAC8;
                     play_state_offset = find_guest_word(&rdram, PLAY_MAIN)
                         .and_then(|main_field| main_field.checked_sub(4));
                     if let Some(base) = play_state_offset {
@@ -807,6 +822,49 @@ fn main() {
                         );
                     }
                     last_control_state = Some(control_state);
+
+                    // `Play_Init` passes play+0x11CBC to `Room_Init`
+                    // (generated C PC 0x8009CE90-0x8009CEA0). The generated
+                    // `Room_RequestNewRoom`/`Room_ProcessRoomRequest` path
+                    // establishes the load invariant directly: +0x31 is the
+                    // async-request flag, completion copies DMA destination
+                    // +0x34 to current-room segment +0x0C, then
+                    // `Scene_ExecuteCommands` populates the room-shape pointer
+                    // at +0x08 (PCs 0x80080A54-0x80080BFC). `Room_Draw` skips
+                    // the room only when +0x0C is null and otherwise dispatches
+                    // through the shape type at *+0x08 (PCs
+                    // 0x80080C50-0x80080C84). These generated-C fields let the
+                    // opt-in trace distinguish an unloaded room from a renderer
+                    // failure without importing game headers or content.
+                    let room = base + 0x11CBC;
+                    let room_state = (
+                        read_guest_u8(&rdram, room) as i8,
+                        read_guest_u32(&rdram, room + 0x08),
+                        read_guest_u32(&rdram, room + 0x0C),
+                        read_guest_u8(&rdram, room + 0x14) as i8,
+                        read_guest_u32(&rdram, room + 0x1C),
+                        read_guest_u32(&rdram, room + 0x20),
+                        read_guest_u8(&rdram, room + 0x30),
+                        read_guest_u8(&rdram, room + 0x31),
+                        read_guest_u32(&rdram, room + 0x34),
+                    );
+                    if last_room_state != Some(room_state) || swap_count.is_multiple_of(100) {
+                        println!(
+                            "[oot-boot] OOT ROOM @ swap {swap_count}: cur={} shape={:#010x} \
+                             segment={:#010x} prev={} prev_shape={:#010x} \
+                             prev_segment={:#010x} buffer={} load_active={} dma_dest={:#010x}",
+                            room_state.0,
+                            room_state.1,
+                            room_state.2,
+                            room_state.3,
+                            room_state.4,
+                            room_state.5,
+                            room_state.6,
+                            room_state.7,
+                            room_state.8,
+                        );
+                        last_room_state = Some(room_state);
+                    }
 
                     let player_vram = read_guest_u32(&rdram, base + 0x1C44);
                     let player_offset = (player_vram & 0x1FFF_FFFF) as usize;
