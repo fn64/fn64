@@ -4,24 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Lockstep/state-transplant harness: parse a reference mupen64plus savestate and feed its CPU+RDRAM state into fn64. See docs/DESIGN.md (fn64) and this crate's module docs."
+description = "The first-divergence comparator: diff fn64's claimed register state at a checkpoint PC against a reference runtime's ground truth and report the first field that disagrees. Pure -- no I/O. See docs/DESIGN.md §1.0 and §4."
 
+# Deliberately empty. This crate is a pure comparator over values its callers
+# supply; acquiring the reference state is not its business. The fn64-runtime,
+# fn64-abi and flate2 deps -- and both [[bin]] targets -- were dropped
+# 2026-07-17 along with the mupen64plus savestate parser and the faki-tools
+# oracle subprocess client. Read lib.rs's module doc before adding any back:
+# the path they served is not representable, not merely unimplemented.
 [dependencies]
-fn64-runtime = { path = "../fn64-runtime" }
-flate2 = "1"
-# Used by bin/lockstep.rs (the end-to-end runnable harness) and tests/
-# transplant.rs (the state-transplant integration test), both of which
-# exercise the real Executor/RecompContext/SectionRegistry machinery.
-# fn64-diff's own LIB code stays fn64-runtime-only (see lib.rs's module doc
-# on crate layering) -- this is only needed by the binary/test targets, not
-# by lib.rs itself.
-fn64-abi = { path = "../fn64-abi" }
-
-[[bin]]
-name = "dump_snapshot"
-path = "src/bin/dump_snapshot.rs"
-
-[[bin]]
-name = "lockstep"
-path = "src/bin/lockstep.rs"
-

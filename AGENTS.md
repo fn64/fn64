@@ -55,9 +55,25 @@ it, don't read it. Every design claim states which allowed source it came from.
   symbol name and call context. Never emit a silent no-op, a defensive
   null-guard that hides corruption, or a fallback that masks a missing
   feature. If you're tempted to guard, you haven't found the bug yet.
-- **Differential evidence.** Runtime behavior changes emit the shared event
-  trace and get diffed against the reference runtime over identical recompiled
-  code. Attach the diff (or its absence) to your claim.
+- **Differential evidence.** Behavior changes get diffed, and you attach the
+  diff (or its absence) to your claim. Use a differential that actually runs:
+  - `scripts/lane-parity.sh N` — the c and rs lanes over identical ROM, per-swap
+    framebuffer SHAs. The real A/B. **Caveat (ROADMAP V1a/V1b): the C lane is
+    missing bodies for ~127 stubbed functions that fn64 recompiles correctly,
+    so past swap ~231 the lanes legitimately disagree.** Below 232 they are
+    byte-identical, so a diff there is a real regression. Above it, the C lane
+    is not an arbiter.
+  - `cargo nextest run -p fn64-abi` — `c_smoke` links a real C caller against
+    the staticlib, so the ABI shape is proven by a test, not by prose.
+  - `crates/fn64-recomp-rs/tests/oracle.rs` + friends — per-instruction
+    differential of fn64's emitted bodies against N64Recomp's C. Note its
+    blind spot: it compares CODEGEN, so anything applied above codegen (a
+    config stub, a patch) is invisible to it.
+
+  Diffing against the reference *runtime* (ultramodern et al.) is NOT a
+  mechanism this repo has — `fn64-diff` implements a comparator but the
+  savestate-transplant path it needed cannot work (see DESIGN.md: functions are
+  the smallest resumable unit). Do not cite a differential you did not run.
 - **Types before audits.** If an invariant can live in the type system —
   ownership of a queue, the single-runnable-thread token, an rdram address
   newtype — put it there. An invariant enforced by review is a bug with a

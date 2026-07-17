@@ -42,7 +42,7 @@ One workspace, separate crates, each publishable alone:
 | `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/fn64/rt64) (MIT, C++) — all C++ interop quarantined here |
 | `fn64-recomp` / `fn64-recomp-rs` | The Rust-emitting recompiler and its whole-ROM driver — the `rs` lane |
 | `fn64-audio` | RSP audio ucode execution |
-| `fn64-diff` | Trace/state differential tooling |
+| `fn64-diff` | The first-divergence comparator (pure; no I/O) |
 | `fn64-discover` | ROM discovery: symbol/section metadata without a decomp |
 
 `fn64-recomp` was once "planned, once the runtime earns it" — it exists and
@@ -79,9 +79,12 @@ tribal:
 - **Validation bars with teeth.** Deterministic fix: 10 consecutive clean
   runs. Concurrency fix: 20+. One green run proves nothing and we treat it
   that way.
-- **Differential testing.** New runtime behavior emits the shared event trace
-  (thread switches, queue ops, DMA, task submits) and gets diffed against the
-  reference over identical recompiled code.
+- **Differential testing.** Behavior changes get diffed against something that
+  actually runs: `scripts/lane-parity.sh` A/Bs our two recompiler lanes over
+  identical ROM by per-swap framebuffer SHA, `c_smoke` link-tests the ABI with
+  a real C caller, and the recompiler has a per-instruction oracle suite. Each
+  has a documented blind spot, named where it's used — a differential you can't
+  run isn't evidence.
 - **Types carry the invariants.** One-runnable-game-thread, queue ownership,
   rdram addressing — modeled so misuse fails to compile where possible, and
   fails *loudly* where not.

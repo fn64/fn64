@@ -19,7 +19,7 @@ fn64-render    backend-agnostic render seam + the pure-Rust ReferenceBackend (A/
 fn64-render-rt64 FFI bridge to RT64 (C++) -- all C++ interop quarantined here
 fn64-recomp / fn64-recomp-rs  the Rust-emitting recompiler and its whole-ROM driver (§1.1's `rs` lane)
 fn64-audio     RSP audio ucode execution
-fn64-diff      trace/state differential tooling (§4's comparator lane)
+fn64-diff      the first-divergence comparator, pure/no-I/O (§4's comparator lane)
 fn64-discover  ROM discovery: symbol/section metadata without a decomp (Phase D)
 ```
 
@@ -173,6 +173,50 @@ Corollaries, each earned the hard way:
   `const` paths into a personal directory (`fn64-discover`'s `gate_*.rs`,
   ROADMAP H3) produces numbers exactly one person can reproduce. Unreproducible
   evidence is not evidence — see AGENTS.md's validation bars.
+
+#### Instruction-exact savestate transplant is NOT REPRESENTABLE here (negative result, 2026-07-14)
+
+This is an architecture fact about the runtime's shape, kept here because the
+code that discovered it has been deleted (see below) and a future session must
+not re-derive it the expensive way — or, worse, re-add a mupen64plus savestate
+parser believing it closes a gap. It does not. There is no gap; there is a
+representability wall.
+
+fn64 (like N64Recomp itself) compiles each MIPS function to one native
+function. `SectionRegistry::resolve` (`fn64-runtime/src/overlay.rs`) matches
+only a vram address that is an EXACT function-entry offset, **by design**:
+`LOOKUP_FUNC`'s only real call shape is a whole-function indirect call.
+A savestate's saved PC lands wherever an instruction happened to be
+executing — essentially never exactly at a function's first instruction.
+
+Therefore true instruction-exact transplant ("resume at PC") is **not merely
+unimplemented — it is not representable by a recompiler-shaped runtime at
+all**, without either:
+
+- (a) sub-function-granularity call targets, which N64Recomp's own codegen
+  does not produce; or
+- (b) a bytecode/threaded-interpreter fallback for the remainder of the
+  interrupted function.
+
+The deleted code was honest about this rather than faking it: its
+`resolve_entry_point` reported the ENCLOSING function (nearest registered
+function whose vram range contains the resume PC) plus the offset into it,
+rather than silently pretending an exact resume had happened. Starting the
+enclosing function from its own top is a materially different — and for that
+invocation, near-certainly incorrect — execution.
+
+Consequence for the comparator lane (§4): the unit of comparison against a
+reference runtime can only be a **checkpoint PC reached by whole-function
+execution**, never a single MIPS instruction. `fn64-diff` is scoped to exactly
+that comparison and nothing more.
+
+Provenance of the removal: `crates/fn64-diff` once carried a subprocess client
+for the *faki-tools* `oracle` CLI plus a mupen64plus `.m64p` savestate parser,
+to drive this transplant path. Both were removed 2026-07-17 — the oracle client
+because a client for another project's command line is precisely what §1.0
+above forbids, and the savestate parser because the path it fed cannot work,
+for the reason stated here. The historical run they produced is preserved in
+`crates/fn64-diff/docs/2026-07-14-first-divergence-report.md`.
 
 ### 1.1 The two lanes: how the game arrives, and what draws it
 
