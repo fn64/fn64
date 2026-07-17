@@ -122,6 +122,8 @@ mod game {
         pixels: Option<Pixels<'static>>,
         reported_first_frame: bool,
         last_heartbeat_swap: u64,
+        /// Wall-clock deadline for the next presented frame (~60 Hz pacing).
+        next_frame_deadline: std::time::Instant,
     }
 
     /// How many executor steps to run per window pump before yielding back to
@@ -290,6 +292,7 @@ mod game {
                 pixels: None,
                 reported_first_frame: false,
                 last_heartbeat_swap: 0,
+                next_frame_deadline: std::time::Instant::now(),
             }
         }
 
@@ -325,6 +328,17 @@ mod game {
                     }
                 } else {
                     idle_ticks = 0;
+                    // A voluntary `pause_self` idle loop is runnable by
+                    // definition (the rs lane's idle thread spins instead of
+                    // blocking), so gating host time on `!stepped` starves
+                    // the VI retrace forever: the window freezes on the first
+                    // frame and no audio task ever runs. Same host clock
+                    // injection as oot-boot's drive loop: pace every 100
+                    // scheduling steps.
+                    if steps.is_multiple_of(100) {
+                        tick += 100;
+                        fn64_abi::advance_virtual_time(tick);
+                    }
                 }
             }
             fn64_abi::vi_swap_count() > start_swaps
@@ -388,7 +402,18 @@ mod game {
                 let swaps = fn64_abi::vi_swap_count();
                 if swaps >= self.last_heartbeat_swap + 60 {
                     let state = if blank { "blank" } else { "NON-BLANK" };
-                    println!("[fn64-shell] present heartbeat: VI swap #{swaps} ({state})");
+                    // Audio counters in the same line: shows at a glance
+                    // whether the game is producing PCM (ai_buffers/nonzero)
+                    // and whether it reaches the backend (backend_buffers).
+                    let audio = fn64_abi::audio_output_stats();
+                    println!(
+                        "[fn64-shell] present heartbeat: VI swap #{swaps} ({state}); audio: \
+                         ai_buffers={} samples={} nonzero={} backend_buffers={}",
+                        audio.ai_buffers,
+                        audio.samples,
+                        audio.nonzero_samples,
+                        audio.backend_buffers
+                    );
                     self.last_heartbeat_swap = swaps;
                 }
             }
@@ -495,6 +520,21 @@ mod game {
             let now = fn64_abi::vi_swap_count();
             if swapped {
                 self.last_swap_count = now;
+                // Real-time pacing: one VI swap per NTSC field (~16.67 ms).
+                // The pump advances the game as fast as the host can step,
+                // which is a headless-probe virtue but makes a PLAYED game
+                // run many times over-speed. Sleep off the remainder of this
+                // frame's wall-clock budget; if we're behind, reset the
+                // deadline instead of accumulating debt (no fast-forward
+                // catch-up bursts).
+                const FRAME: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
+                let now_t = std::time::Instant::now();
+                if now_t < self.next_frame_deadline {
+                    std::thread::sleep(self.next_frame_deadline - now_t);
+                    self.next_frame_deadline += FRAME;
+                } else {
+                    self.next_frame_deadline = now_t + FRAME;
+                }
             }
             if let Some(w) = self.window.as_ref() {
                 w.request_redraw();
