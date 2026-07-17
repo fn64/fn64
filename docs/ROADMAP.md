@@ -11,67 +11,52 @@ Status legend: `[ ]` open, `[~]` dispatched/in-flight, `[x]` merged+verified
 
 ## Phase R — close the "OoT renders faithfully" gate
 
-The standing milestone gate (OOT-STATUS.md "Beyond OoT") is unmet on main;
-the work that closes it is rotting on stale pre-rename branches.
+The standing milestone gate (OOT-STATUS.md "Beyond OoT"). The renderer lands
+faithful frames for title/attract; the open frontier is audio (R5) and the
+outdoor gameplay eye-gate (R3b).
 
-- [x] **R1 salvage** (merged 2026-07-16): re-applied the combiner/blender/scissor/perspective-ST
-  deltas from the `merge/render-final` stack (merge-base `f252c1e`, tip
-  `e7ebf22`; the load-bearing delta is `raster.rs` +44, `gbi.rs` +13) onto
-  post-rename main as fresh commits. Must preserve the G_DL tail-jump
-  semantics landed in fn64#2. Gate: render-rt64 tests + snapshot + bounded
-  reference-backend boot, 10 clean runs.
-- [x] **R2 "projection" artifact** (merged 2026-07-16): root cause was NOT
-  projection — the ReferenceBackend quartered G_LOADTLUT counts and decoded
-  every G_LOADTILE rect from the source-image origin (CI palette + tiled
-  source layout). Proven via libultra wire layouts + swap-1299 traces;
-  synthetic regressions added; magenta third gone, sky/cloud/horizon
-  visible. Remaining oracle coarseness stays under the existing
-  loose-ends list (reference is the oracle; RT64 is the faithful lane).
-- [x] **R3 eye-gate (user) — PASSED for the title/attract field window**
-  (2026-07-16): 7 RT64-lane true-color frames at swaps 400-1300 (dawn ->
-  daylight Hyrule Field title/attract) judged faithful by the user
-  ("frames look great"). Scope: title/attract camera only.
-- [~] **R3b gameplay-scene eye-gate**: batch captured + delivered
-  (2026-07-16, rs lane + RT64, swaps 4100-4300 via OOT_SCRIPT_INTERACTIVE).
-  Finding: INDOOR scenes (Link's house, Navi cutscene) render faithfully;
-  the OUTDOOR Kokiri Forest scene draws only HUD/minimap/Link — world
-  geometry is silently absent (green noise = unwritten framebuffer; no
-  RT64/render errors logged). Awaiting user verdict + root-cause below.
-- [x] **R6 apparent outdoor gameplay world geometry absence — scripted-route
-  artifact, not an RT64 room-DL failure** (2026-07-16): the swaps ~4200-4300
-  never enter a newly loaded outdoor PlayState/room. The opt-in guest trace
-  now retires a cached PlayState address unless its generated-C-grounded
-  `GameState.main`/running fields still identify a live `Play_Main`, then logs
-  the generated `RoomContext` load fields. In the current PlayState lifetime,
-  swaps 4200 and 4300 remain normal Play (`cs_state=0`, no message), room 0
-  remains fully loaded but unchanged (`shape=0x80219B00`,
-  `segment=dma_dest=0x80219A60`, `load_active=0`), and Link continues moving.
-  No PlayState retirement/re-init or room request occurs in that window. The
-  script has driven Link/camera beyond the visible Link's-house interior
-  without taking a scene/room transition; the apparent Kokiri view is not a
-  loaded Kokiri room.
+Closed-item policy: a finished item is deleted, not archived — git has the
+history. What survives below is only what changes what the next session DOES:
+negative results (a ruled-out cause someone would otherwise re-investigate)
+and scope limits that make an open item meaningful.
 
-  The independent task differential agrees. Opt-in `FN64_GFX_TASK_DUMP`
-  walked the public F3DEX2 command graph and fingerprinted every referenced
-  RDRAM range for task 4149 (good swap 4150) and task 4289 (bad swap 4290).
-  Both tasks submit the same populated segment-3 room graph
-  (`G_DL 0x030023A8 -> 0x0021BE08`, identical seven nested mesh lists and
-  nonzero vertex fingerprints); the bad task is not empty or dangling and
-  independently decodes 737 triangles (good: 1006). A PI-DMA trace recorded
-  no new room/scene load after swap 4015 through 4300. This disproves an
-  rs-lane missing-payload handoff and an RT64 HLE skip of a newly submitted
-  outdoor graph: there is no outdoor graph in the input to skip.
+- **R2 — the artifact was NOT projection** (closed 2026-07-16). Kept because
+  the name misleads: root cause was the ReferenceBackend quartering
+  G_LOADTLUT counts and decoding every G_LOADTILE rect from the source-image
+  origin (CI palette + tiled source layout). Do not re-open a projection
+  hunt. Reference is the oracle; RT64 is the faithful lane.
+- **R3 eye-gate PASSED — scope: title/attract camera ONLY** (2026-07-16).
+  Kept because it bounds R3b: 7 RT64-lane frames at swaps 400-1300 judged
+  faithful by the user. Gameplay cameras are NOT covered by this pass.
+- [ ] **R3b outdoor gameplay eye-gate — blocked on the capture route, NOT on
+  the renderer.** Indoor scenes (Link's house, Navi cutscene) render
+  faithfully. The "missing Kokiri Forest world geometry" was investigated at
+  length (R6, 2026-07-16) and the renderer is **exonerated** — do not re-open
+  it as a render bug:
 
-  The green speckle is a secondary symptom. The bad task alone switches to
-  S2DEX2 and issues `G_BG_COPY` after the stale room graph. A one-command
-  black-box differential that no-oped only that copy changed speckle to black
-  while Link/HUD remained and world geometry did not appear, isolating the
-  noise to a copy from unwritten background data without changing the root
-  cause. No renderer/runtime fix is made in R6; the gameplay capture route
-  must deliberately trigger and verify the exterior transition before a real
-  outdoor eye-gate.
-- [ ] **R4 branch hygiene**: after R1 lands, close/prune the five stale
-  render worktrees+branches (they are then strictly-worse duplicates).
+  - The scripted route never takes a scene/room transition. Across swaps
+    4200-4300 the PlayState stays a live `Play_Main`, room 0 stays loaded and
+    unchanged, `load_active=0`, and a PI-DMA trace shows no room/scene load
+    after swap 4015. The apparent Kokiri view is not a loaded Kokiri room —
+    the script drove Link/camera out of the Link's-house interior.
+  - An independent task differential agrees: tasks 4149 (good) and 4289 (bad)
+    submit the *same* populated segment-3 room graph; the bad task decodes 737
+    triangles (good: 1006). There is no outdoor graph in the input to skip, so
+    neither an rs-lane payload handoff nor an RT64 HLE skip can be the cause.
+  - The green speckle is secondary: the bad task switches to S2DEX2 and issues
+    `G_BG_COPY` from unwritten background data. No-oping just that copy turned
+    speckle black without revealing geometry.
+
+  To close: make the capture route deliberately trigger and verify an exterior
+  transition, then re-gate. Evidence: `FN64_GFX_TASK_DUMP`, `OOT_STATE_TRACE`
+  (see FAST-LOOP.md).
+- [ ] **R4 branch hygiene — do NOT blanket-prune.** Checked 2026-07-17:
+  `fix/render-combiner`, `fix/render-blend`, `fix/render-othermode`, and
+  `fix/render-texfmt` are fully merged to main (0 unmerged commits — safe to
+  delete). But **`fix/render-scissor` still has 1 commit not in main**; triage
+  it before deleting anything. `scripts/wt.sh prune` is the safe tool (it
+  refuses unmerged/dirty/live-job worktrees). ~35 remote branches exist total;
+  most predate the rename.
 - [ ] **R5 audio out — STILL BROKEN (static + over-speed); two causes found
   and fixed, at least one remains.** Status 2026-07-17. Do NOT treat the
   landed fixes as closing this; the user still hears static.
@@ -100,36 +85,21 @@ the work that closes it is rotting on stale pre-rename branches.
   60 Hz, the audio thread runs its whole produce cycle too often, which
   would ALSO explain the user-reported over-speed feel.
 
-  Superseded note (kept for history): the static was first blamed on
-  sample-rate mismatch alone, and before that on App Nap alone. Both were
-  real contributors; neither was sufficient.
-  fn64-shell's ladder opened the stream at 48 kHz FIRST while the game
-  produces 32 kHz with no resampler anywhere, so the ring starved ~1/3 of
-  the time and the callback zero-fill rendered as static (backgrounding
-  worsened it by throttling the producer). Fix: CpalBackend negotiates the
-  stream rate with the device and linear-resamples producer-side;
-  set_frequency is now real; osAiSetFrequency forwards the true DAC rate;
-  both harness ladders replaced with one guest-rate create. Verify by ear
-  (foreground + backgrounded) to close.
+  Ruled out as *sufficient* causes — each was real, each was fixed, static
+  survived all of them: App Nap throttling the producer; the 48 kHz/32 kHz
+  rate mismatch; the severed AI_LEN feedback loop. The pattern to resist:
+  every one of these looked like the whole answer at the time. A fourth
+  plausible-and-partial cause is the expected shape of the next finding, so
+  do not close R5 on a single fix that merely improves it — close it by ear,
+  foreground and backgrounded.
 
-- [x] **R7 playable shell assembles the verified halves** (2026-07-16):
-  fn64-shell now takes `FN64_RECOMP=rs` (via the standalone
-  `crates/fn64-shell/rs/` manifest, same pattern as oot-boot/rs) and
-  `FN64_RENDER=rt64` (feature `rt64`), and the rs configuration links the
-  real aspMain audio ucode — so the windowed shell can run the
-  eyes-verified renderer + the gameplay-capable lane + real music, instead
-  of being pinned to C-lane + ReferenceBackend + silent synth. Launch:
-  see crates/fn64-shell/rs/Cargo.toml header.
-
-  Play-test findings (2026-07-16/17), all landed: the shell needed
-  set_cart_rom_handle_vram (both lanes aborted in osCartRomInit); the window
-  presenter needed the rdram word swizzle (green-tinted, noisy logo — third
-  instance of that bug class); the pump had to inject host clock while the
-  rs idle thread spins (frozen first frame = the 'black screen'); pacing is
-  now wall-clock 60 Hz via ControlFlow::WaitUntil (no thread sleep on the
-  event loop). REMAINING: the user reports the game still runs too fast and
-  audio is staticy — tracked as R5 above (same root: the audio producer is
-  free-running; a VI-retrace over-delivery would explain both symptoms).
+- [ ] **R8 rdram word-swizzle is a recurring bug class, not three bugs.**
+  Surfaced a third time in the R7 shell work (green-tinted, noisy logo in the
+  window presenter); previously in DMA and framebuffer capture. Each time it
+  was fixed at the site. AGENTS.md ("mechanism over patch") wants the sweep
+  that finds the rest of the class, not a fourth one-off: every host<->rdram
+  byte-order boundary should be enumerated and typed so the next instance
+  fails to compile. Open because the fixes landed but the mechanism did not.
 
 ## Phase D — fn64 owns discover → decomp
 
@@ -139,22 +109,20 @@ answer key (10,833 named fns) makes OoT the perfect graded target.
 fn64-discover has Phases 1/2/4/5 + bounded-6; the rest is design-only
 (DISCOVER-DESIGN.md).
 
-- [x] **D1 Phase-3 candidate harvesting** (merged 2026-07-16): three
-  deterministic providers (jal/jalr-target, prologue patterns,
-  table-derived) feeding the proof-state model, graded via `gate_d1`.
-  OoT combined 62.3% precision / 0.82% recall; NW4E 44.7%/89.0%;
-  NWXE 36.4%/28.5%. STRUCTURAL FINDING: OoT recall is bounded by Phase 2 —
-  only the boot bank is a discovered load-image (OoT overlays load via DMA
-  tables, not descriptor tables), so detectors had ~nothing to hunt in.
-  Table-derived is an honest 0 everywhere (descriptor tables prove
-  load-images, not entry points).
-- [x] **D1.5 Phase-2 load-image discovery for DMA-table overlays** (landed
-  2026-07-16): generalized physical-ROM/VROM range-table input plus proven
-  file-table backing and deterministic Yaz0 materialization. OoT now exposes
-  468 table-derived overlay images (actor/effect/gamestate/Kaleido) and moves
-  combined D1 grading from 62.285714% precision / 0.815990% recall to
-  90.569045% / 72.323701%. NW4E/NWXE D1 numbers are unchanged. Resident
-  `code`/`n64dd` destination discovery and later detector closure remain open.
+Current grading (D1+D1.5, 2026-07-16, `gate_d1` — but see H3: these numbers
+are reproducible on one machine only): OoT 90.6% precision / 72.3% recall;
+NW4E 44.7%/89.0%; NWXE 36.4%/28.5%.
+
+Two findings worth not rediscovering:
+- **Recall is a Phase-2 problem, not a detector problem.** OoT recall was
+  0.82% until D1.5 taught Phase 2 to discover DMA-table overlay load-images
+  (OoT loads overlays via DMA tables, not descriptor tables), which alone
+  took it to 72.3%. If recall stalls again, look at what Phase 2 exposes
+  before tuning detectors — they can only hunt inside discovered images.
+- **Table-derived candidates are an honest 0 everywhere.** Descriptor tables
+  prove load-images, not entry points. Not a bug; don't "fix" it.
+
+Still open from D1.5: resident `code`/`n64dd` destination discovery.
 - [ ] **D2 Phase-6 completion**: jump tables + value-set analysis for
   indirect targets (the bounded HI/LO case already works).
 - [ ] **D3 Phases 7-8**: targeted dynamic probes; assembly/relink
