@@ -1,5 +1,44 @@
 use super::*;
 
+/// The `OOT_*` spellings these knobs shipped under before they were renamed to
+/// the game-agnostic `FN64_*` prefix. Nothing about dumping PCM or skipping
+/// audio ucode is OoT-specific; the names were bring-up residue.
+///
+/// An unset env var means "feature off", so a bare rename would make a stale
+/// `OOT_SKIP_AUDIO_UCODE=1` invocation silently do nothing -- the run would
+/// look fine and quietly measure the wrong thing. Trap it instead.
+const RENAMED_ENV_VARS: &[(&str, &str)] = &[
+    ("OOT_SKIP_AUDIO_UCODE", "FN64_SKIP_AUDIO_UCODE"),
+    ("OOT_DUMP_AUDIO_PCM", "FN64_DUMP_AUDIO_PCM"),
+    ("OOT_DUMP_AUDIO_TASK", "FN64_DUMP_AUDIO_TASK"),
+    ("OOT_AUDIO_UCODE_TIMING", "FN64_AUDIO_UCODE_TIMING"),
+    ("OOT_PHASE_TIMING", "FN64_PHASE_TIMING"),
+];
+
+/// Panic if any pre-rename `OOT_*` knob is still set, naming its replacement.
+///
+/// Called from the audio task/AI-buffer seams rather than a `thread_local!`
+/// initializer: an initializer only runs when its flag is first read, so a
+/// stale `OOT_DUMP_AUDIO_PCM` -- whose new name is never consulted on a run
+/// that sets only the old one -- would never trip the check.
+pub(crate) fn assert_no_legacy_env_vars() {
+    for (old, new) in RENAMED_ENV_VARS {
+        if std::env::var_os(old).is_some() {
+            panic!("{}", legacy_env_var_message(old, new));
+        }
+    }
+}
+
+/// The trap's message, split out so a test can assert the wording without
+/// mutating the shared test process's environment -- doing that trips this
+/// very trap inside every sibling test that dispatches an audio task.
+fn legacy_env_var_message(old: &str, new: &str) -> String {
+    format!(
+        "{old} was renamed to {new}; the old name is ignored, so this run \
+         would silently not do what you asked. Set {new} instead."
+    )
+}
+
 /// Decode fn64's native-word RDRAM representation in guest halfword order and
 /// deliver one real AI DMA buffer to the registered backend.
 ///
@@ -8,6 +47,7 @@ use super::*;
 /// `rdram` must be valid for the length registered through
 /// [`set_audio_rdram_len`].
 pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: usize) {
+    assert_no_legacy_env_vars();
     let rdram_len = AUDIO_RDRAM_LEN.with(Cell::get);
     let end = start.checked_add(byte_len);
     assert!(
@@ -56,7 +96,7 @@ pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: u
     // for nonzero avoids capturing an expected startup-silence buffer and
     // falsely concluding the synth stayed silent.
     if nonzero != 0 {
-        if let Some(path) = std::env::var_os("OOT_DUMP_AUDIO_PCM") {
+        if let Some(path) = std::env::var_os("FN64_DUMP_AUDIO_PCM") {
             AUDIO_PCM_DUMPED.with(|dumped| {
                 if !dumped.get() {
                     let pcm: Vec<u8> = samples
@@ -249,8 +289,11 @@ pub(crate) fn present_render_backend() {
 /// `header` the task header read from that offset.
 unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
     debug_assert_eq!(header.task_type, M_AUDTASK);
+    // Before PHASE_TIMING's thread_local initializer reads the NEW name: a run
+    // that set only the old spelling must trap here, not silently proceed.
+    assert_no_legacy_env_vars();
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
-    // Debug/perf escape hatch: `OOT_SKIP_AUDIO_UCODE` skips running the
+    // Debug/perf escape hatch: `FN64_SKIP_AUDIO_UCODE` skips running the
     // recompiled audio ucode (the per-frame RSP synth, currently unoptimized
     // and the dominant per-swap cost). The CPU-side audio driver
     // (AudioThread_UpdateImpl) and this task's completion event still run, so
@@ -259,8 +302,8 @@ unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
     // at normal boot speed; a real audio run must NOT set it. No sound when set.
     // Diagnostic: dump the exact rdram + task offset of the FIRST audio task so
     // the recompiled ucode can be replayed offline against the real command
-    // list (env `OOT_DUMP_AUDIO_TASK=<path>`). One-shot.
-    if let Some(path) = std::env::var_os("OOT_DUMP_AUDIO_TASK") {
+    // list (env `FN64_DUMP_AUDIO_TASK=<path>`). One-shot.
+    if let Some(path) = std::env::var_os("FN64_DUMP_AUDIO_TASK") {
         AUDIO_TASK_DUMPED.with(|c| {
             if !c.get() {
                 let mut rdram_len = AUDIO_RDRAM_LEN.with(|cell| cell.get());
@@ -285,7 +328,7 @@ unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
             }
         });
     }
-    let skip_ucode = std::env::var_os("OOT_SKIP_AUDIO_UCODE").is_some();
+    let skip_ucode = std::env::var_os("FN64_SKIP_AUDIO_UCODE").is_some();
     if !skip_ucode {
         AUDIO_UCODE_FN.with(|cell| {
             if let Some(f) = cell.get() {
@@ -400,11 +443,11 @@ thread_local! {
     /// stringified. Mirrors `RENDER_LAST_ERROR`.
     pub(crate) static AUDIO_LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
 
-    /// Perf profiling: when true (env `OOT_AUDIO_UCODE_TIMING`), the M_AUDTASK
+    /// Perf profiling: when true (env `FN64_AUDIO_UCODE_TIMING`), the M_AUDTASK
     /// dispatch times each recompiled-ucode call and accumulates total ns +
     /// call count for a caller to read via `audio_ucode_timing()`.
     pub(crate) static AUDIO_UCODE_TIMING: Cell<bool> =
-        Cell::new(std::env::var_os("OOT_AUDIO_UCODE_TIMING").is_some());
+        Cell::new(std::env::var_os("FN64_AUDIO_UCODE_TIMING").is_some());
     pub(crate) static AUDIO_UCODE_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_UCODE_CALLS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_TASK_DUMPED: Cell<bool> = const { Cell::new(false) };
@@ -415,7 +458,7 @@ thread_local! {
     /// Kept behind an environment flag so ordinary execution pays no
     /// `Instant::now` cost at task or executor boundaries.
     pub(crate) static PHASE_TIMING: Cell<bool> =
-        Cell::new(std::env::var_os("OOT_PHASE_TIMING").is_some());
+        Cell::new(std::env::var_os("FN64_PHASE_TIMING").is_some());
     pub(crate) static EXECUTOR_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static EXECUTOR_CALLS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static GFX_NS: Cell<u64> = const { Cell::new(0) };
@@ -464,7 +507,7 @@ pub fn audio_output_stats() -> AudioOutputStats {
     AUDIO_OUTPUT_STATS.with(Cell::get)
 }
 
-/// Coarse host wall-time totals collected when `OOT_PHASE_TIMING` is set.
+/// Coarse host wall-time totals collected when `FN64_PHASE_TIMING` is set.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PhaseTiming {
     pub executor_ns: u64,
@@ -487,7 +530,7 @@ pub fn phase_timing() -> PhaseTiming {
 }
 
 /// Total accumulated recompiled-audio-ucode time (ns) and call count since
-/// boot, for perf profiling. Only nonzero when `OOT_AUDIO_UCODE_TIMING` is set.
+/// boot, for perf profiling. Only nonzero when `FN64_AUDIO_UCODE_TIMING` is set.
 pub fn audio_ucode_timing() -> (u64, u64) {
     (
         AUDIO_UCODE_NS.with(|c| c.get()),
@@ -771,6 +814,23 @@ mod tests {
     use super::*;
     use crate::test_support::*;
     use fn64_runtime::RecvMesgOutcome;
+
+    /// The rename is only honest if the retired spelling is LOUD: an unset var
+    /// means "feature off", so a silently-ignored `OOT_*` name would let a
+    /// stale invocation look like a clean run while measuring the wrong thing.
+    /// Every retired name must reach a message naming its replacement -- that
+    /// string is the whole trap, and a typo'd table entry would gut it.
+    #[test]
+    fn every_legacy_env_var_names_its_replacement() {
+        for (old, new) in RENAMED_ENV_VARS {
+            assert!(old.starts_with("OOT_") && new.starts_with("FN64_"));
+            let message = legacy_env_var_message(old, new);
+            assert!(
+                message.contains(new),
+                "the trap for {old} must name {new}, or the operator cannot act on it"
+            );
+        }
+    }
 
     #[test]
     fn os_sp_task_yielded_records_gfx_task_and_acks_complete() {

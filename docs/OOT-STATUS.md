@@ -25,10 +25,10 @@ at) — not a tracker label. Updated 2026-07-16.
 - Windowed harness (`fn64-shell`, winit+pixels+cpal): live framebuffer per
   swap, keyboard→controller, audio-out wired.
 - Fast loop: `--release` + `OOT_MAX_SWAPS` early-exit (~250x), `./oot` runner,
-  observability flags (`OOT_RENDER_DUMP_START`, `OOT_DUMP_PROJ`, `OOT_NO_DEPTH`,
-  `OOT_AUDIO_UCODE_TIMING`, `OOT_SKIP_AUDIO_UCODE`, `OOT_STOP_ON_FRAME`).
+  observability flags (`OOT_RENDER_DUMP_START`, `FN64_DUMP_PROJ`, `FN64_NO_DEPTH`,
+  `FN64_AUDIO_UCODE_TIMING`, `FN64_SKIP_AUDIO_UCODE`, `OOT_STOP_ON_FRAME`).
 - Rs-lane real-time profiling: `OOT_PERF_NO_CAPTURE=1` removes only the
-  harness's per-swap diagnostic PNG work, while `OOT_PHASE_TIMING=1`
+  harness's per-swap diagnostic PNG work, while `FN64_PHASE_TIMING=1`
   attributes wall time to the executor, software renderer, and audio dispatch.
   Differential tracing is opt-in with `OOT_TRACE=1` (and remains crash-safe,
   flushing every event); `./oot trace` enables it automatically. Normal runs
@@ -53,7 +53,7 @@ plus executor overhead. A post-change sample attributed approximately 35.8%
 of samples to the renderer (24.1% in rasterization), with guest gameplay code,
 especially collision queries, the largest remaining sink. That historical
 measurement predated the rs manifest's translated-audio integration and
-used `OOT_SKIP_AUDIO_UCODE=1`.
+used `FN64_SKIP_AUDIO_UCODE=1`.
 
 After merging the perf work with live audio, the same skip-audio performance
 configuration measured 3.468 ms minimum, 3.867 ms median, 4.071 ms p95, and
@@ -65,10 +65,12 @@ range `-29,727..=29,376`. Audio ucode accounted for 5,288.28 ms total, or
 0.454 ms per task. Both configurations remain comfortably inside the NTSC
 16.7 ms VI budget.
 
-The behavior guard compared independently built rs and C lanes at swap
-499. Both framebuffer PNGs had SHA-256
-`bc19787324497d71c622c2bfd450dc9f2063cb4feb875c576b4c6c34236ec1db` and
-were byte-identical.
+A ONE-TIME hand check compared independently built rs and C lanes at swap
+499: both framebuffer PNGs had SHA-256
+`bc19787324497d71c622c2bfd450dc9f2063cb4feb875c576b4c6c34236ec1db`, no test
+checks it, and were byte-identical. It is not a guard: nothing re-verifies it
+as either lane changes. Automating it is ROADMAP V1; until then this is a
+historical observation, not a standing claim.
 
 ### Recompilers (both from-scratch, typed Rust, no external tool, no GPL)
 - **CPU** `fn64-recomp-rs`: MIPS III + COP1/FPU + 64-bit dword + COP0 +
@@ -129,13 +131,13 @@ were byte-identical.
   new section; `shared_runtime_base_replaces_prior_overlay` fails against the
   stale-two-images behavior.
 - **Verified depth:** 10 consecutive release probes, each with
-  `OOT_MAX_SWAPS=250 OOT_SKIP_AUDIO_UCODE=1`, reached 250 VI swaps / 250 gfx
+  `OOT_MAX_SWAPS=250 FN64_SKIP_AUDIO_UCODE=1`, reached 250 VI swaps / 250 gfx
   tasks and exited 0 with no recompiled execution panic. Swap 250 is a non-uniform
   title-demo/Hyrule Field framebuffer (`/tmp/fn64-deep-frame.png`), though the
   known renderer-state gaps below leave it mostly red with dark geometry. A
   collision-free C-lane probe also reached swap 250, and its swap-250 PNG is
   byte-identical (SHA-256
-  `a0b354ea3c7056e90f316bc28f24d2c46761ce248b3279b9be1b6a21c320cc6b`).
+  `a0b354ea3c7056e90f316bc28f24d2c46761ce248b3279b9be1b6a21c320cc6b`, no test checks it).
 
 ### Rust-recompiled interactive boot (2026-07-16, `fix/native-boot-interactive`)
 
@@ -151,7 +153,7 @@ were byte-identical.
   `FileSelect_MoveSelectedFileToTop`; the rs profile recompiles its real
   body (ROM/static vram `0x80810A1C`) and reaches select-mode 2 at swap 500.
   The two swap-499 framebuffer PNGs compare byte-for-byte equal (SHA-256
-  `c54906136189fde8b59b853d3b2f74fc75d7f77753c495d7110e9b950bfdd85e`).
+  `c54906136189fde8b59b853d3b2f74fc75d7f77753c495d7110e9b950bfdd85e`, no test checks it).
 - **Partially overlapping overlay allocations now replace stale images.**
   The first long scripted transition previously trapped nondeterministically
   after swap 1270 at lookup `0x80B2CBB0`, an interior address in
@@ -195,7 +197,7 @@ were byte-identical.
 - **The live PCM is nonzero and bounded.** Across that run, OoT submitted
   14,006 AI buffers containing 17,480,448 signed samples; 14,728,612 were
   nonzero and the aggregate range was `-29,727..=29,376`. The first non-silent
-  `OOT_DUMP_AUDIO_PCM` capture is 1,248 samples / 624 stereo frames, 1,224
+  `FN64_DUMP_AUDIO_PCM` capture is 1,248 samples / 624 stereo frames, 1,224
   nonzero, range `-10,985..=11,035`, RMS 4,870.53. It is plausible waveform
   data, not all-zero output or full-scale garbage.
 - **The former output route was byte-disproved and fixed at the AI boundary.**
@@ -281,7 +283,7 @@ road, but the top half misprojects).
    later fidelity work, not evidence of the former decoder failure. Ten of ten
    consecutive release probes reached swap 1300 at deterministic step 170788
    with rc=0 and byte-identical dumps (SHA-256
-   `586eae90fe194222fe149f4450626df4bc2ca07de812a3353bc065c0551d4df8`).
+   `586eae90fe194222fe149f4450626df4bc2ca07de812a3353bc065c0551d4df8`, no test checks it).
 
    The earlier claimed raw-eye matrix bug remains **falsified by writer tracing
    (2026-07-16).** Physical `0x1888c8` is written only by recompiled
@@ -412,7 +414,7 @@ target as the former 139,728,579-byte textual include: **380.73 s before,
 110.26 s after** (3.45x faster; the cached rebuild is 0.08 s). Both preserved
 executables reached swap 499 with exit code 0 and emitted byte-identical
 307,528-byte framebuffer PNGs (SHA-256
-`f029be05de404a8a5eedb1944069c9eb844c7daac66de0f430f1f15468ec4cbc`). The
+`f029be05de404a8a5eedb1944069c9eb844c7daac66de0f430f1f15468ec4cbc`, no test checks it). The
 crate-linked executable has no unresolved fn64/recompiler/libultra symbols.
 
 The current profile-aware/guard-swept result is **13,324 clean + 25

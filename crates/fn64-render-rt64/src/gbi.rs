@@ -928,7 +928,7 @@ fn identity() -> Mat4 {
     m
 }
 
-/// TEMP instrumentation (env `OOT_DUMP_PROJ=1`): true only while dumping the
+/// TEMP instrumentation (env `FN64_DUMP_PROJ=1`): true only while dumping the
 /// projection/vertex data for the FIRST substantial gameplay frame, then it
 /// self-disables so the log is one frame, not the whole boot. Gated entirely
 /// behind the env var; no cost when unset. Remove/keep behind the flag.
@@ -960,7 +960,7 @@ mod projdump {
 
     pub fn on() -> bool {
         if !INIT.swap(true, Ordering::Relaxed) {
-            ENABLED.store(std::env::var("OOT_DUMP_PROJ").is_ok(), Ordering::Relaxed);
+            ENABLED.store(crate::debug_flag("FN64_DUMP_PROJ"), Ordering::Relaxed);
         }
         ENABLED.load(Ordering::Relaxed)
     }
@@ -1004,7 +1004,7 @@ mod projdump {
             let pzmin = (PZ_MIN.load(Ordering::Relaxed) as i64 - (1i64 << 40)) as f64 / 1000.0;
             let pzmax = (PZ_MAX.load(Ordering::Relaxed) as i64 - (1i64 << 40)) as f64 / 1000.0;
             eprintln!(
-                "[OOT_DUMP_PROJ] SUMMARY: {t} projected vtx | on-screen NDC-cube: {on} ({:.1}%) | pathological |w|>1e5 or non-finite: {path} ({:.1}%) | screen-z(pz) range [{pzmin:.2}, {pzmax:.2}] (nearer=smaller, z-test is `z<depth`)",
+                "[FN64_DUMP_PROJ] SUMMARY: {t} projected vtx | on-screen NDC-cube: {on} ({:.1}%) | pathological |w|>1e5 or non-finite: {path} ({:.1}%) | screen-z(pz) range [{pzmin:.2}, {pzmax:.2}] (nearer=smaller, z-test is `z<depth`)",
                 100.0 * on as f64 / t as f64,
                 100.0 * path as f64 / t as f64
             );
@@ -1130,9 +1130,9 @@ fn read_viewport(rdram: &[u8], addr: usize) -> Option<Viewport> {
         tz: vtrans_z / 4.0,
     };
     #[cfg(not(test))]
-    if std::env::var("OOT_DUMP_PROJ").is_ok() {
+    if crate::debug_flag("FN64_DUMP_PROJ") {
         eprintln!(
-            "[OOT_DUMP_PROJ] viewport: sz={} tz={} => screen-z range [{}, {}] (near->far)",
+            "[FN64_DUMP_PROJ] viewport: sz={} tz={} => screen-z range [{}, {}] (near->far)",
             vp.sz,
             vp.tz,
             -vp.sz + vp.tz,
@@ -2264,7 +2264,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                     #[cfg(not(test))]
                     if projdump::on() {
                         eprintln!(
-                            "[OOT_DUMP_PROJ] G_MTX proj={} load={} push={} @rdram=0x{addr:06x} seg_w1=0x{w1:08x} mv_depth={} rows=[{:?} | {:?} | {:?} | {:?}]",
+                            "[FN64_DUMP_PROJ] G_MTX proj={} load={} push={} @rdram=0x{addr:06x} seg_w1=0x{w1:08x} mv_depth={} rows=[{:?} | {:?} | {:?} | {:?}]",
                             is_projection, is_load, is_push, state.mv_stack.len(),
                             mtx[0], mtx[1], mtx[2], mtx[3]
                         );
@@ -2321,7 +2321,7 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 #[cfg(not(test))]
                 if projdump::on() {
                     eprintln!(
-                        "[OOT_DUMP_PROJ] G_POPMTX mv_depth_before={}",
+                        "[FN64_DUMP_PROJ] G_POPMTX mv_depth_before={}",
                         state.mv_stack.len()
                     );
                 }
@@ -2773,7 +2773,7 @@ fn load_vertices(rdram: &[u8], state: &mut DecodeState, arr_addr: u32, n: usize,
                 projdump::note_w(cw, inside);
                 if projdump::should_log_vtx() {
                     eprintln!(
-                        "[OOT_DUMP_PROJ] vtx ob=({x:.0},{y:.0},{z:.0}) -> clip=({cx:.2},{cy:.2},{cz:.2},w={cw:.4}) ndc=({:.3},{:.3},{:.3}) inside_cube={inside}",
+                        "[FN64_DUMP_PROJ] vtx ob=({x:.0},{y:.0},{z:.0}) -> clip=({cx:.2},{cy:.2},{cz:.2},w={cw:.4}) ndc=({:.3},{:.3},{:.3}) inside_cube={inside}",
                         cx / cw, cy / cw, cz / cw
                     );
                 }

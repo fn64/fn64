@@ -7,7 +7,7 @@
 #   native-emit.sh          -> prints the cache dir (emits only on a miss)
 #   native-emit.sh --force  -> re-emit even on a hit
 #
-# Env: OOT_CONFIG (default aki-recomp OOTU oot.toml), OOT_ROM (from the config),
+# Env: FN64_CONFIG (default aki-recomp OOTU oot.toml), FN64_ROM (from the config),
 # FN64_ROOT (default: repo root). Cache lives in $FN64_EMIT_CACHE (default
 # /tmp/fn64-emit-cache/<hash>).
 # ponytail: a content-addressed cache, nothing fancier. No eviction policy —
@@ -17,12 +17,21 @@ cd "$(git rev-parse --show-toplevel)"
 FN64_ROOT="$(pwd)"
 # FN64_GAME_DIR: the workspace holding YOUR ROM-derived material. No default --
 # a path baked in here works for one machine and fails confusingly elsewhere.
-OOT_CONFIG="${OOT_CONFIG:-${FN64_GAME_DIR:?set FN64_GAME_DIR (your ROM-derived workspace), or set OOT_CONFIG and OOT_ROM directly}/games/OOTU/oot.toml}"
-OOT_ROM="${OOT_ROM:-${FN64_GAME_DIR:?set FN64_GAME_DIR, or set OOT_ROM directly}/games/OOTU/oot-ntsc-1.0.z64}"
+# An unset var just means "use the default", so a silent rename would let a
+# stale OOT_CONFIG=... point at one config while we emit from another.
+for legacy in OOT_CONFIG OOT_ROM OOT_OUT; do
+  if [ -n "${!legacy:-}" ]; then
+    echo "native-emit: $legacy was renamed to FN64_${legacy#OOT_}; unset $legacy and set FN64_${legacy#OOT_} instead" >&2
+    exit 2
+  fi
+done
+
+FN64_CONFIG="${FN64_CONFIG:-${FN64_GAME_DIR:?set FN64_GAME_DIR (your ROM-derived workspace), or set FN64_CONFIG and FN64_ROM directly}/games/OOTU/oot.toml}"
+FN64_ROM="${FN64_ROM:-${FN64_GAME_DIR:?set FN64_GAME_DIR, or set FN64_ROM directly}/games/OOTU/oot-ntsc-1.0.z64}"
 CACHE_ROOT="${FN64_EMIT_CACHE:-/tmp/fn64-emit-cache}"
 
-[ -f "$OOT_CONFIG" ] || { echo "no config: $OOT_CONFIG" >&2; exit 2; }
-[ -f "$OOT_ROM" ]    || { echo "no ROM: $OOT_ROM" >&2; exit 2; }
+[ -f "$FN64_CONFIG" ] || { echo "no config: $FN64_CONFIG" >&2; exit 2; }
+[ -f "$FN64_ROM" ]    || { echo "no ROM: $FN64_ROM" >&2; exit 2; }
 
 # Build the driver once (cheap, cached by cargo) and hash it into the key so a
 # recompiler change invalidates the cache.
@@ -34,7 +43,7 @@ cargo build --release -q -p fn64-recomp-rs --bin recompile_rom >/dev/null 2>&1
 DRIVER="${CARGO_TARGET_DIR:-$FN64_ROOT/target}/release/recompile_rom"
 [ -x "$DRIVER" ] || { echo "native-emit: driver not at $DRIVER (cargo build failed?)" >&2; exit 3; }
 
-key=$( { md5 -q "$OOT_ROM"; md5 -q "$OOT_CONFIG"; md5 -q "$DRIVER"; } | md5 -q )
+key=$( { md5 -q "$FN64_ROM"; md5 -q "$FN64_CONFIG"; md5 -q "$DRIVER"; } | md5 -q )
 OUT="$CACHE_ROOT/$key"
 
 if [ "${1:-}" != "--force" ] && [ -f "$OUT/Cargo.toml" ] && [ -f "$OUT/src/lib.rs" ]; then
@@ -45,5 +54,5 @@ fi
 
 echo "recomp-rs-emit: cache MISS $key -- emitting..." >&2
 mkdir -p "$OUT"
-"$DRIVER" --config "$OOT_CONFIG" --rom "$OOT_ROM" --out "$OUT" >&2
+"$DRIVER" --config "$FN64_CONFIG" --rom "$FN64_ROM" --out "$OUT" >&2
 echo "$OUT"
