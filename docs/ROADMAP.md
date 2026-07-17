@@ -15,29 +15,40 @@ Found by auditing what the gates actually check. These are first because they
 undermine every other item's evidence: a bar that does not measure what it
 claims makes all the greens beneath it worth less.
 
-- [ ] **V1a THE LANES DIVERGE — DESIGN.md §4's A/B premise is FALSE past swap
-  231.** Found and independently reproduced 2026-07-17 by
-  `scripts/lane-parity.sh 240` (dispatcher re-ran it; SHAs match the finder's
-  exactly). The c and rs lanes are byte-identical through swap 231, then
-  differ at **swap 234** onward (266 of 497 framebuffers differ by 499). Run
-  `scripts/lane-parity.sh 240` for the per-swap SHAs — they are not pasted
-  here because a hash in a doc is decorative unless something re-checks it
-  (V0); the script IS the check.
+- [ ] **V1a ROOT-CAUSED: the C lane silently no-ops 127 real game functions.**
+  The c/rs divergence (byte-identical through swap 231, differs from 234) is
+  NOT an opcode bug and NOT the renderer. **The rs lane is correct; the C lane
+  is broken** — the opposite of this item's original framing.
 
-  It is a **guest-side** bug, not a renderer bug: at gfx task #232 the C lane
-  emits **900 triangles**, rs emits **903** — the recompiled CPU built a
-  different display list, so the culprit is in the recompiled function set.
-  Onset coincides with `game_mode=1` (title) at swaps 229-231.
+  Proven 2026-07-17, verified independently by the dispatcher at the source:
+  `Letterbox_Update` is listed in `$FN64_GAME_DIR/games/OOTU/oot.toml`'s
+  `[patches] stubs` (line 120), so N64Recomp emits a body with NO statements
+  (`RecompiledFuncs/funcs_37.c:1654-1657`) while the game still calls it
+  (`funcs_37.c:9090`). Effect on the letterbox size feeding
+  `Setup_View`'s `gDPFillRectangle` (decomp `z_rcp.c:1576`): rs steps
+  32→22→12→2→0 (matching `Letterbox_Update`'s `step = 10` + clamp); C is
+  pinned at 32 forever. First differing GBI command is that `G_FILLRECT`.
 
-  Confounds eliminated by measurement: audio (reproduces with
-  `FN64_SKIP_AUDIO_UCODE=1`), scripted input (first event is frame 250, AFTER
-  onset), nondeterminism (each lane is self-identical across repeat runs), and
-  stale PNGs (negative control: deleted, regenerated).
+  **The class, not the instance:** oot.toml stubs **127** functions, and the
+  generator's rule is "any cop0/cache/cop2/**break** opcode -> stub". Most are
+  false positives — a `break` that is BRANCH-GUARDED (a compiler
+  divide-by-zero assert, reachable only on pathological input) is perfectly
+  recompilable. Casualties include `Interface_Draw`, `Camera_Normal1`,
+  `KaleidoScope_Update`, `Message_DrawMain`, `TitleCard_Draw`. This is a mass
+  silent shrug of exactly the kind AGENTS.md forbids.
 
-  Everything the project A/Bs beyond swap ~231 is comparing two different
-  things. This outranks R5. Next step, NOT done: dump task #232's display list
-  from both lanes, diff to the first differing GBI command, trace back to the
-  emitting function.
+  `gen_stubs.py` DOCUMENTS this failure mode against itself: it calls the rule
+  "a blunt bootstrap heuristic", describes "a `break` behind a real guard
+  branch" precisely, and its `force_recompile` list is a hand-maintained
+  escape hatch for the cases someone happened to notice. It even records a
+  prior instance (`func_8000CC78`) where stubbing silently no-oped pointer
+  writes and crashed many calls later. Fix: teach the scan that a guarded
+  `break` is not unrecompilable, then regenerate — that likely empties most of
+  the 127 at once. The file is aki-recomp's (legacy, Phase H), so this may be
+  better fixed by fn64 owning the config (H1's `oot.toml` note).
+
+  NOT proven: that no OTHER stub contributes before task 232. With 127 on the
+  same footing, others are plausibly live on this path.
 - [ ] **V0 doc hashes are now linted; 5 were unbacked.** `lint-docs.py` fails
   when a doc asserts a *content* hash no test contains (commit pins are
   provenance and exempt). All five in OOT-STATUS.md were unbacked — verified
@@ -45,15 +56,6 @@ claims makes all the greens beneath it worth less.
   warn. Marked honestly for now; gating them is V1's job. The generalization:
   a hash in a doc is either load-bearing (a test owns it) or prose (don't cite
   it as evidence).
-- [ ] **V1 the c/rs lane parity — fn64's central A/B claim — is NOT tested.**
-  DESIGN.md §4 and §1.1 rest on the two lanes linking identical recompiled
-  semantics, so they A/B each other. OOT-STATUS.md cites framebuffer SHA-256
-  `bc19787…6ec1db` byte-identical between lanes at swap 499. Verified
-  2026-07-17: **that SHA appears in no test.** It was checked once, by hand,
-  and nothing re-checks it. Fix: a bounded per-lane framebuffer SHA compare in
-  a test (the harness already dumps `/tmp/fn64-fb-{swap}.png`;
-  `OOT_MAX_SWAPS`/`OOT_STOP_ON_FRAME` bound it). Skip loudly when game content
-  is absent, per `boot_depth.rs`'s existing pattern.
 - [ ] **V2 the only integration gate asserts liveness, not correctness.**
   `examples/oot-boot/tests/boot_depth.rs:27,91` asserts only
   `swaps >= MIN_EXPECTED_SWAPS` (200). OoT could render pure garbage for 200
