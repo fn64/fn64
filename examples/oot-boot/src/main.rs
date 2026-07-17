@@ -1111,6 +1111,12 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
         );
         return;
     }
+    // The RGBA5551 decode below reads each pixel through the rdram word swizzle
+    // `(2*i) ^ 2`, which is only correct when the framebuffer base is
+    // word-aligned (the swizzle is relative to a 32-bit word boundary). N64
+    // framebuffers are DMA/cache-line aligned so this always holds; assert it
+    // rather than silently mis-decode if a future fb_offset breaks the rule.
+    debug_assert_eq!(start % 4, 0, "framebuffer offset {start:#x} not word-aligned; swizzle decode would be wrong");
     let region = &rdram[start..end];
     let first_byte = region[0];
     let uniform = region.iter().all(|&b| b == first_byte);
@@ -1138,11 +1144,18 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
     }
 }
 
-/// Convert N64 RGBA5551 (big-endian halfwords: RRRRRGGGGGBBBBBA) to
-/// RGBA8888 and write a minimal, dependency-free PNG (a hand-rolled
-/// uncompressed-DEFLATE encoder -- no `png`/`image` crate dependency for
-/// this one-shot dump, keeping this example's dependency footprint at just
-/// `cc` for the C bridge).
+/// Convert N64 RGBA5551 (RRRRRGGGGGBBBBBA halfwords) to RGBA8888 and write a
+/// minimal, dependency-free PNG (a hand-rolled uncompressed-DEFLATE encoder --
+/// no `png`/`image` crate dependency for this one-shot dump, keeping this
+/// example's dependency footprint at just `cc` for the C bridge).
+///
+/// `data` is a slice of fn64's rdram, which is native-endian-**word** storage
+/// (see fn64-recomp-rs runtime.rs): a halfword at logical byte offset `o` lives
+/// at the swizzled offset `o ^ 2` and is read native-endian. Pixel `i` is the
+/// halfword at logical offset `2*i`, so its two bytes are at `(2*i) ^ 2`.
+/// Reading sequentially with `from_be_bytes` (no swizzle) scrambles the
+/// halfword pairs within each 32-bit word and shifts every color -- that was
+/// the purple/dithered cast in the captured frames.
 fn dump_rgba5551_as_png(
     data: &[u8],
     width: usize,
@@ -1150,8 +1163,9 @@ fn dump_rgba5551_as_png(
     path: &str,
 ) -> std::io::Result<()> {
     let mut rgba = Vec::with_capacity(width * height * 4);
-    for chunk in data.chunks_exact(2) {
-        let px = u16::from_be_bytes([chunk[0], chunk[1]]);
+    for i in 0..width * height {
+        let p = (i * 2) ^ 2;
+        let px = u16::from_ne_bytes([data[p], data[p + 1]]);
         let r5 = (px >> 11) & 0x1F;
         let g5 = (px >> 6) & 0x1F;
         let b5 = (px >> 1) & 0x1F;
