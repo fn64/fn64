@@ -22,6 +22,24 @@ pub struct BankAddr {
     pub pc: u32,
 }
 
+/// Which ROM coordinate system a load-image range uses. N64 titles may put
+/// executable bytes directly at physical cartridge offsets, or name files by
+/// a virtual ROM (VROM) interval that a separate DMA table resolves to a
+/// physical, possibly-compressed file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RomAddressSpace {
+    Physical,
+    Virtual,
+}
+
+/// Address spaces connected by a configurable Phase-2 range table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum MappingAddressSpace {
+    PhysicalRom,
+    VirtualRom,
+    Vram,
+}
+
 /// The deterministic Phase 3 provider that produced a function-entry claim.
 /// These values are part of serialized provenance, so adding a provider must
 /// add a new variant rather than reusing a free-form string.
@@ -99,10 +117,28 @@ pub enum Fact {
     /// addresses; both exclusive of `_end`.
     RomMapping {
         bank: String,
+        rom_space: RomAddressSpace,
         rom_start: u32,
         rom_end: u32,
         va_start: u32,
         va_end: u32,
+    },
+    /// One parsed record from an explicitly-located Phase-2 mapping table.
+    /// This typed fact is the provenance for both VROM-to-physical-file
+    /// mappings and ROM/VROM-to-VRAM load images: table identity and record
+    /// index remain machine-readable rather than living only in prose.
+    LoadImageTableRecord {
+        table: String,
+        bank: Option<String>,
+        table_space: RomAddressSpace,
+        table_offset: u32,
+        index: u32,
+        source_space: MappingAddressSpace,
+        source_start: u32,
+        source_end: u32,
+        destination_space: MappingAddressSpace,
+        destination_start: u32,
+        destination_end: u32,
     },
     /// A code-pointer entry exposed by a descriptor table or vector that an
     /// earlier phase has already identified. Phase 3 consumes this fact; it
@@ -137,6 +173,7 @@ impl Fact {
             Fact::LoadsFrom { site, .. } => Some(&site.bank),
             Fact::ObservedIndirectTarget { site, .. } => Some(&site.bank),
             Fact::RomMapping { bank, .. } => Some(bank),
+            Fact::LoadImageTableRecord { bank, .. } => bank.as_deref(),
             Fact::TableEntry { table, .. } => Some(&table.bank),
             Fact::FunctionEntryClaim { target, .. } => Some(&target.bank),
             Fact::Evidence { subject, .. } => Some(&subject.bank),
@@ -194,6 +231,11 @@ pub fn function_entry_subject(address: &BankAddr) -> String {
 /// Stable conclusion key for one upstream table/vector entry.
 pub fn table_entry_subject(table: &BankAddr, index: u32) -> String {
     format!("table-entry:{}:0x{:08x}:{index}", table.bank, table.pc)
+}
+
+/// Stable conclusion key for one Phase-2 load-image/file-table record.
+pub fn load_image_table_record_subject(table: &str, index: u32) -> String {
+    format!("load-image-table:{table}:{index}")
 }
 
 /// A derived conclusion tracked with its proof state and the fact
@@ -313,6 +355,30 @@ impl FactDb {
                 if self.conclusion(&format!("bank:{bank}"))
                     .map(|c| c.state == ProofState::Proven)
                     .unwrap_or(false))
+            })
+            .collect()
+    }
+
+    /// Proven VROM-to-physical-ROM file mappings supplied by Phase 2. These
+    /// are the byte-backing evidence used to materialize VROM load images;
+    /// rejected/conflicting records cannot leak into detector input.
+    pub fn proven_vrom_file_mappings(&self) -> Vec<(usize, &Fact)> {
+        self.facts
+            .iter()
+            .enumerate()
+            .filter(|(_, fact)| {
+                matches!(
+                    fact,
+                    Fact::LoadImageTableRecord {
+                        table,
+                        index,
+                        source_space: MappingAddressSpace::VirtualRom,
+                        destination_space: MappingAddressSpace::PhysicalRom,
+                        ..
+                    } if self
+                        .conclusion(&load_image_table_record_subject(table, *index))
+                        .is_some_and(|conclusion| conclusion.state == ProofState::Proven)
+                )
             })
             .collect()
     }
@@ -526,6 +592,7 @@ mod tests {
         let mut db = FactDb::new();
         let f0 = db.insert(Fact::RomMapping {
             bank: "boot".into(),
+            rom_space: RomAddressSpace::Physical,
             rom_start: 0x1000,
             rom_end: 0x2000,
             va_start: 0x8000_0400,
@@ -533,6 +600,7 @@ mod tests {
         });
         let f1 = db.insert(Fact::RomMapping {
             bank: "overlay_1".into(),
+            rom_space: RomAddressSpace::Physical,
             rom_start: 0x3000,
             rom_end: 0x4000,
             va_start: 0x8010_0000,
