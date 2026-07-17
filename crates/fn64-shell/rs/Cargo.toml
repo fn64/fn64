@@ -1,0 +1,52 @@
+# The rs-lane configuration of fn64-shell: the SAME src/main.rs and build.rs,
+# but the game arrives as the emitted `oot-recompiled` typed-Rust crate
+# instead of compiled RecompiledFuncs C. A standalone workspace (like
+# examples/oot-boot/rs) because `oot-recompiled` is out-of-tree game-derived
+# material that must never enter the main workspace graph.
+#
+# Build (the recompiled symlink is refreshed from RECOMP_RS_DIR first, same
+# contract as examples/oot-boot's `oot` runner):
+#   ln -sfn "$RECOMP_RS_DIR" crates/fn64-shell/rs/recompiled
+#   FN64_RECOMP=rs ROM=... cargo build --manifest-path crates/fn64-shell/rs/Cargo.toml \
+#     --release --features rt64
+[package]
+name = "fn64-shell-rs"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+build = "../build.rs"
+description = "Rust-recompiled whole-ROM configuration of the fn64 windowed shell"
+
+[workspace]
+
+[features]
+default = ["oot-audio"]
+oot-audio = ["dep:oot-audio-ucode"]
+oot-audio-ucode = []
+rt64 = ["fn64-render-rt64/rt64"]
+
+[[bin]]
+name = "fn64"
+path = "../src/main.rs"
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+libc = "0.2"
+winit = "0.30"
+pixels = "0.15"
+fn64-runtime = { path = "../../fn64-runtime" }
+fn64-abi = { path = "../../fn64-abi", features = ["recomp-rs"] }
+fn64-boot-harness = { path = "../../fn64-boot-harness" }
+fn64-recomp-rs = { path = "../../fn64-recomp-rs" }
+fn64-render = { path = "../../fn64-render" }
+fn64-render-rt64 = { path = "../../fn64-render-rt64" }
+fn64-audio = { path = "../../fn64-audio" }
+# Refreshed symlink to the env-selected out-of-tree emitted crate (Cargo
+# `path` cannot interpolate env vars) -- same bridge as oot-boot/rs.
+oot-recompiled = { path = "recompiled" }
+# The recompiled OoT aspMain ucode, via oot-boot's harness-local build
+# adapter (resolves fn64-audio from THIS tree, no cross-pin).
+oot-audio-ucode = { path = "../../../examples/oot-boot/audio-ucode", optional = true }

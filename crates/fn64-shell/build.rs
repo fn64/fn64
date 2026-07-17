@@ -34,9 +34,27 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RECOMPILED_DIR");
     println!("cargo:rerun-if-env-changed=RECOMP_H_DIR");
     println!("cargo:rerun-if-env-changed=ROM");
+    println!("cargo:rerun-if-env-changed=FN64_RECOMP");
     // Declared so a clean `#[cfg(fn64_game_linked)]` doesn't warn as an
     // unexpected cfg under `-Wunexpected_cfgs` (Rust 1.80+ lint).
     println!("cargo:rustc-check-cfg=cfg(fn64_game_linked)");
+    println!("cargo:rustc-check-cfg=cfg(fn64_recomp_rs)");
+
+    // FN64_RECOMP=rs (same contract as oot-boot/build.rs): the game comes
+    // from the linked `oot-recompiled` typed-Rust crate (the rs manifest at
+    // crates/fn64-shell/rs/), so there is no C to compile -- ROM is still
+    // required at runtime. Only the rs manifest carries the rs deps, so
+    // this branch is unreachable from the plain workspace build.
+    if env::var("FN64_RECOMP").as_deref() == Ok("rs") {
+        let _ = required_env(
+            "ROM",
+            "Point it at the decomp's OWN decompressed build-output z64 -- NOT the retail \
+             compressed cartridge image.",
+        );
+        println!("cargo:rustc-cfg=fn64_recomp_rs");
+        println!("cargo:rustc-cfg=fn64_game_linked");
+        return;
+    }
 
     let Some(recompiled_dir) = env::var_os("RECOMPILED_DIR").map(PathBuf::from) else {
         // No game env: the content-free path. The shell still builds and
