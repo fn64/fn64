@@ -15,9 +15,10 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 FN64_ROOT="$(pwd)"
-AKI="${AKI:-/Users/jer/Code/aki-recomp}"
-OOT_CONFIG="${OOT_CONFIG:-$AKI/games/OOTU/oot.toml}"
-OOT_ROM="${OOT_ROM:-$AKI/games/OOTU/oot-ntsc-1.0.z64}"
+# FN64_GAME_DIR: the workspace holding YOUR ROM-derived material. No default --
+# a path baked in here works for one machine and fails confusingly elsewhere.
+OOT_CONFIG="${OOT_CONFIG:-${FN64_GAME_DIR:?set FN64_GAME_DIR (your ROM-derived workspace), or set OOT_CONFIG and OOT_ROM directly}/games/OOTU/oot.toml}"
+OOT_ROM="${OOT_ROM:-${FN64_GAME_DIR:?set FN64_GAME_DIR, or set OOT_ROM directly}/games/OOTU/oot-ntsc-1.0.z64}"
 CACHE_ROOT="${FN64_EMIT_CACHE:-/tmp/fn64-emit-cache}"
 
 [ -f "$OOT_CONFIG" ] || { echo "no config: $OOT_CONFIG" >&2; exit 2; }
