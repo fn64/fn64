@@ -72,6 +72,17 @@ claims makes all the greens beneath it worth less.
   which is fine, but nothing else covers correctness end-to-end, so the gate's
   green overstates what is known. V1 is the cheapest real correctness signal
   to add beside it.
+- [ ] **V4 the delegation loop has no "done, awaiting merge" state.** Found
+  2026-07-17: `wave/d2-detector-closure` finished, self-gated green, and sat
+  unmerged for 8 hours while the roadmap still listed D2 as open — invisible
+  to everyone. `dispatch.sh` launches a job; the job correctly stops without
+  pushing (DELEGATION.md keeps supervision with the dispatcher); and then
+  nothing surfaces that a branch is READY. The information exists —
+  `scripts/wt.sh` shows ahead/dirty/job-alive per worktree — but only if
+  someone runs it, and a finished job looks identical to an abandoned one.
+  Cheapest fix: have `dispatch.sh` write a completion marker, and teach
+  `wt.sh` a READY state (branch ahead of main + no live job + gates recorded).
+  Without it, delegated work silently rots at exactly the rate we dispatch it.
 - [ ] **V3 `fn64-diff` — the boundary is wrong, not the code.** CORRECTION
   2026-07-17: an earlier pass here claimed the faki-tools oracle checkout was
   "effectively empty". FALSE — that was a bad `head -2` catching `__pycache__`.
@@ -219,8 +230,21 @@ Two findings worth not rediscovering:
   prove load-images, not entry points. Not a bug; don't "fix" it.
 
 Still open from D1.5: resident `code`/`n64dd` destination discovery.
-- [ ] **D2 Phase-6 completion**: jump tables + value-set analysis for
-  indirect targets (the bounded HI/LO case already works).
+- [~] **D2 Phase-6 completion**: jump tables + value-set analysis for
+  indirect targets (the bounded HI/LO case already works). **IMPLEMENTED BUT
+  UNMERGED — do not redo it.** `wave/d2-detector-closure` (commit `5d06f68`,
+  2026-07-17) carries 1,811 lines closing this: Phase-6 jump-table recovery +
+  bounded value-set analysis with exhaustive/bounded/open facts, feeding
+  exhaustive computed jumps into intra-owner CFG closure. Its dispatch log
+  reports `gate_b1`/`gate_b2`/`gate_d1` all passing, `gate_d1` 10/10
+  byte-identical. The job finished cleanly and stopped (correct per
+  DELEGATION.md: it must not push or merge); nobody picked it up.
+
+  To land: it is now 40+ commits behind main, so rebase and RE-GATE — those
+  numbers were measured against a main that no longer exists, and H2b/V1a
+  touched `fn64-discover`'s neighbors. Verify against ROADMAP H3 too: that
+  crate's gate binaries hold personal paths as compile-time consts, so the
+  grading numbers are reproducible on one machine only.
 - [ ] **D3 Phases 7-8**: targeted dynamic probes; assembly/relink
   verification.
 - [ ] **D4 pack emission**: emit fn64-owned `dump.toml`-equivalent
