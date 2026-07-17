@@ -19,6 +19,13 @@ path = "src/main.rs"
 # today only changes the `wire_audio_ucode` log line; add the `dep:...` here
 # once a ucode crate exists that doesn't cross-pin fn64-audio.
 oot-audio-ucode = []
+# RT64 static backend passthrough (FN64_RENDER=rt64 at runtime needs the
+# backend compiled in). Same shape as oot-boot's feature.
+rt64 = ["fn64-render-rt64/rt64"]
+# Declared empty here so `cfg(feature = "oot-audio")` compiles cleanly in the
+# workspace build; the rs manifest (crates/fn64-shell/rs/Cargo.toml) redefines
+# it as the real `dep:oot-audio-ucode` link.
+oot-audio = []
 
 [build-dependencies]
 # Compiles the out-of-tree RecompiledFuncs/*.c plus fn64-boot-harness's shared
