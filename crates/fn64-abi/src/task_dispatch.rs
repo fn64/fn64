@@ -448,6 +448,18 @@ impl AudioOutputStats {
     }
 }
 
+/// Frames currently buffered in the registered backend's output ring, or
+/// `None` when no backend is registered (or it reports an error). This is
+/// the shell's audio master clock: pumping the game only while the ring is
+/// below a target depth locks video pacing to the device's true drain rate.
+pub fn audio_frames_remaining() -> Option<u32> {
+    AUDIO_BACKEND.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|backend| backend.frames_remaining().ok())
+    })
+}
+
 pub fn audio_output_stats() -> AudioOutputStats {
     AUDIO_OUTPUT_STATS.with(Cell::get)
 }
@@ -485,13 +497,50 @@ pub fn audio_ucode_timing() -> (u64, u64) {
 
 /// Forward the game's true AI DAC rate (`osAiSetFrequency`'s successful
 /// return value) to the registered backend so its producer-side resample
-/// ratio tracks the guest. No-op when no backend is registered.
+/// ratio tracks the guest, and remember it for `osAiGetLength`'s
+/// drain-aware readback conversion. No-op when no backend is registered.
 pub(crate) fn notify_audio_frequency(sample_rate_hz: u32) {
+    AUDIO_GUEST_RATE.with(|cell| cell.set(sample_rate_hz));
     AUDIO_BACKEND.with(|cell| {
         if let Some(backend) = cell.borrow_mut().as_mut() {
             backend.set_frequency(sample_rate_hz);
         }
     });
+}
+
+thread_local! {
+    /// The true AI DAC rate last forwarded by `notify_audio_frequency`
+    /// (0 = the game has not set a frequency yet).
+    pub(crate) static AUDIO_GUEST_RATE: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The live audio backlog expressed in GUEST-rate BYTES (stereo 16-bit
+/// frames, 4 bytes each) -- i.e. what real hardware's `AI_LEN` register
+/// counts down as the DAC drains. `None` when no backend is registered,
+/// the backend doesn't know its stream rate, or the game hasn't set a DAC
+/// rate yet -- callers fall back to the latched-register model.
+///
+/// This closes the hardware feedback loop games use to pace audio
+/// production: OoT's AudioMgr reads `osAiGetLength` each retrace and skips
+/// queueing when enough is buffered. A static latched value severs that
+/// loop and the audio thread free-runs (observed: ~3 AI buffers per VI
+/// frame, ring pinned at its cap, playback perpetually skip-dropping).
+pub(crate) fn audio_remaining_guest_bytes() -> Option<u32> {
+    let guest_rate = AUDIO_GUEST_RATE.with(Cell::get);
+    if guest_rate == 0 {
+        return None;
+    }
+    AUDIO_BACKEND.with(|cell| {
+        let borrowed = cell.borrow();
+        let backend = borrowed.as_ref()?;
+        let stream_rate = backend.stream_rate_hz()?;
+        let frames = backend.frames_remaining().ok()?;
+        if stream_rate == 0 {
+            return None;
+        }
+        let guest_frames = frames as u64 * guest_rate as u64 / stream_rate as u64;
+        Some((guest_frames * 4) as u32)
+    })
 }
 
 /// Register the audio backend `osAiSetNextBuffer_recomp` delivers finished AI
