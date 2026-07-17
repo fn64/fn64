@@ -41,6 +41,8 @@
 use fn64_render::{RenderError, UcodeId};
 use std::cell::RefCell;
 use std::collections::HashSet;
+#[cfg(any(feature = "rt64", test))]
+use std::{collections::BTreeMap, fmt::Write as _};
 
 // --- Opcode bytes: F3DEX_GBI_2 branch of the public ultra64/gbi.h ---
 pub const G_VTX: u8 = 0x01;
@@ -1999,6 +2001,159 @@ pub fn decode_display_list_f3dex2(
     Ok(state.tris)
 }
 
+/// Produce a lossless command-word walk of an F3DEX2 display-list graph for
+/// differential diagnostics. This follows the same public `G_DL` call versus
+/// branch rules and `G_MOVEWORD/G_MW_SEGMENT` address updates as the decoder,
+/// but does not interpret rendering state. Pointer-bearing commands include a
+/// bounded content fingerprint at their resolved RDRAM target, so a trace can
+/// distinguish a valid submitted graph from a dangling/empty DMA range without
+/// copying game data into this repository. The caller owns where the returned
+/// text is written; the RT64 task-dump hook writes only to an explicitly
+/// requested untracked diagnostic directory.
+#[cfg(any(feature = "rt64", test))]
+pub(crate) fn trace_display_list_f3dex2(rdram: &[u8], dl_addr: u32) -> String {
+    struct TraceState {
+        segments: [u32; 16],
+        commands: u32,
+        opcodes: BTreeMap<u8, u32>,
+        text: String,
+    }
+
+    fn fingerprint(rdram: &[u8], start: usize, requested_len: usize) -> String {
+        if start >= rdram.len() {
+            return format!("target={start:#08x} OUT_OF_BOUNDS");
+        }
+        let end = start.saturating_add(requested_len).min(rdram.len());
+        let bytes = &rdram[start..end];
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let nonzero = bytes.iter().filter(|&&byte| byte != 0).count();
+        format!(
+            "target={start:#08x} bytes={} nonzero={} fnv1a64={hash:016x}",
+            bytes.len(),
+            nonzero
+        )
+    }
+
+    fn trace_stream(rdram: &[u8], dl_addr: u32, depth: u32, state: &mut TraceState) {
+        let mut pc = resolve_addr(&state.segments, dl_addr);
+        writeln!(
+            state.text,
+            "ENTER depth={depth} segmented={dl_addr:#010x} resolved={pc:#08x}"
+        )
+        .expect("writing a display-list trace to String cannot fail");
+
+        loop {
+            if pc + 8 > rdram.len() {
+                writeln!(state.text, "STOP depth={depth} pc={pc:#08x} OUT_OF_BOUNDS")
+                    .expect("writing a display-list trace to String cannot fail");
+                break;
+            }
+            state.commands += 1;
+            if state.commands > MAX_DL_COMMANDS {
+                writeln!(
+                    state.text,
+                    "STOP depth={depth} command_budget={MAX_DL_COMMANDS} exceeded"
+                )
+                .expect("writing a display-list trace to String cannot fail");
+                break;
+            }
+
+            let command_pc = pc;
+            let w0 = read_u32(rdram, pc);
+            let w1 = read_u32(rdram, pc + 4);
+            let opcode = (w0 >> 24) as u8;
+            pc += 8;
+            *state.opcodes.entry(opcode).or_default() += 1;
+
+            let reference = match opcode {
+                G_VTX => {
+                    let n = ((w0 >> 12) & 0xFF) as usize;
+                    Some(fingerprint(
+                        rdram,
+                        resolve_addr(&state.segments, w1),
+                        n.saturating_mul(16),
+                    ))
+                }
+                G_MTX => Some(fingerprint(rdram, resolve_addr(&state.segments, w1), 64)),
+                G_MOVEMEM | G_SETTIMG | G_DL => {
+                    Some(fingerprint(rdram, resolve_addr(&state.segments, w1), 64))
+                }
+                _ => None,
+            };
+            writeln!(
+                state.text,
+                "CMD depth={depth} pc={command_pc:#08x} op={opcode:#04x} w0={w0:#010x} \
+                 w1={w1:#010x}{}",
+                reference
+                    .as_deref()
+                    .map(|value| format!(" {value}"))
+                    .unwrap_or_default(),
+            )
+            .expect("writing a display-list trace to String cannot fail");
+
+            match opcode {
+                G_MOVEWORD => {
+                    let index = ((w0 >> 16) & 0xFF) as u16;
+                    let offset = (w0 & 0xFFFF) as u16;
+                    if index == G_MW_SEGMENT {
+                        let segment = (offset / 4) as usize;
+                        if segment < state.segments.len() {
+                            state.segments[segment] = w1 & 0x00FF_FFFF;
+                            writeln!(
+                                state.text,
+                                "SEG depth={depth} segment={segment} base={:#08x}",
+                                state.segments[segment]
+                            )
+                            .expect("writing a display-list trace to String cannot fail");
+                        }
+                    }
+                }
+                G_DL => {
+                    let is_branch = ((w0 >> 16) & 1) != 0;
+                    if is_branch {
+                        pc = resolve_addr(&state.segments, w1);
+                        writeln!(state.text, "BRANCH depth={depth} target={pc:#08x}")
+                            .expect("writing a display-list trace to String cannot fail");
+                    } else if depth < MAX_DL_DEPTH {
+                        trace_stream(rdram, w1, depth + 1, state);
+                    } else {
+                        writeln!(
+                            state.text,
+                            "STOP depth={depth} call_depth={MAX_DL_DEPTH} exceeded"
+                        )
+                        .expect("writing a display-list trace to String cannot fail");
+                    }
+                }
+                G_ENDDL => {
+                    writeln!(state.text, "RETURN depth={depth}")
+                        .expect("writing a display-list trace to String cannot fail");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut state = TraceState {
+        segments: [0; 16],
+        commands: 0,
+        opcodes: BTreeMap::new(),
+        text: String::new(),
+    };
+    trace_stream(rdram, dl_addr, 0, &mut state);
+    writeln!(state.text, "SUMMARY commands={}", state.commands)
+        .expect("writing a display-list trace to String cannot fail");
+    for (opcode, count) in state.opcodes {
+        writeln!(state.text, "OPCODE op={opcode:#04x} count={count}")
+            .expect("writing a display-list trace to String cannot fail");
+    }
+    state.text
+}
+
 fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
     let mut pc = resolve_addr(&state.segments, dl_addr);
 
@@ -2775,6 +2930,36 @@ mod tests {
     fn wr_cmd(rdram: &mut [u8], off: usize, w0: u32, w1: u32) {
         wr_u32(rdram, off, w0);
         wr_u32(rdram, off + 4, w1);
+    }
+
+    #[test]
+    fn command_trace_follows_segmented_calls_and_fingerprints_targets() {
+        let mut rdram = vec![0u8; 0x4000];
+        wr_cmd(
+            &mut rdram,
+            0x1000,
+            ((G_MOVEWORD as u32) << 24) | ((G_MW_SEGMENT as u32) << 16) | 0x0c,
+            0x8000_3000,
+        );
+        wr_cmd(&mut rdram, 0x1008, (G_DL as u32) << 24, 0x0300_0100);
+        wr_cmd(&mut rdram, 0x1010, (G_ENDDL as u32) << 24, 0);
+        wr_cmd(
+            &mut rdram,
+            0x3100,
+            ((G_VTX as u32) << 24) | (1 << 12) | (1 << 1),
+            0x0300_0200,
+        );
+        wr_cmd(&mut rdram, 0x3108, (G_ENDDL as u32) << 24, 0);
+        rdram[0x3200] = 0x5a;
+
+        let trace = trace_display_list_f3dex2(&rdram, 0x1000);
+        assert!(trace.contains("SEG depth=0 segment=3 base=0x003000"));
+        assert!(trace.contains(
+            "ENTER depth=1 segmented=0x03000100 resolved=0x003100"
+        ));
+        assert!(trace.contains("target=0x003200 bytes=16 nonzero=1"));
+        assert!(trace.contains("SUMMARY commands=5"));
+        assert!(trace.contains("OPCODE op=0xdf count=2"));
     }
 
     /// Pack raw `gsDPSetCombineLERP` selectors exactly like public gbi.h's

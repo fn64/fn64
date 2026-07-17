@@ -37,12 +37,39 @@ the work that closes it is rotting on stale pre-rename branches.
   the OUTDOOR Kokiri Forest scene draws only HUD/minimap/Link — world
   geometry is silently absent (green noise = unwritten framebuffer; no
   RT64/render errors logged). Awaiting user verdict + root-cause below.
-- [ ] **R6 outdoor gameplay world geometry absent (RT64 lane)**: root-cause
-  why the Kokiri Forest room/world DLs draw nothing at swaps ~4200-4300
-  while HUD/actors do. Candidates: room mesh segment not loaded (rs-lane
-  overlay/DMA state), scene DL kind RT64's HLE skips, or the game state
-  itself (scripted input mashing A) — verify game-side state before
-  blaming the renderer.
+- [x] **R6 apparent outdoor gameplay world geometry absence — scripted-route
+  artifact, not an RT64 room-DL failure** (2026-07-16): the swaps ~4200-4300
+  never enter a newly loaded outdoor PlayState/room. The opt-in guest trace
+  now retires a cached PlayState address unless its generated-C-grounded
+  `GameState.main`/running fields still identify a live `Play_Main`, then logs
+  the generated `RoomContext` load fields. In the current PlayState lifetime,
+  swaps 4200 and 4300 remain normal Play (`cs_state=0`, no message), room 0
+  remains fully loaded but unchanged (`shape=0x80219B00`,
+  `segment=dma_dest=0x80219A60`, `load_active=0`), and Link continues moving.
+  No PlayState retirement/re-init or room request occurs in that window. The
+  script has driven Link/camera beyond the visible Link's-house interior
+  without taking a scene/room transition; the apparent Kokiri view is not a
+  loaded Kokiri room.
+
+  The independent task differential agrees. Opt-in `FN64_GFX_TASK_DUMP`
+  walked the public F3DEX2 command graph and fingerprinted every referenced
+  RDRAM range for task 4149 (good swap 4150) and task 4289 (bad swap 4290).
+  Both tasks submit the same populated segment-3 room graph
+  (`G_DL 0x030023A8 -> 0x0021BE08`, identical seven nested mesh lists and
+  nonzero vertex fingerprints); the bad task is not empty or dangling and
+  independently decodes 737 triangles (good: 1006). A PI-DMA trace recorded
+  no new room/scene load after swap 4015 through 4300. This disproves an
+  rs-lane missing-payload handoff and an RT64 HLE skip of a newly submitted
+  outdoor graph: there is no outdoor graph in the input to skip.
+
+  The green speckle is a secondary symptom. The bad task alone switches to
+  S2DEX2 and issues `G_BG_COPY` after the stale room graph. A one-command
+  black-box differential that no-oped only that copy changed speckle to black
+  while Link/HUD remained and world geometry did not appear, isolating the
+  noise to a copy from unwritten background data without changing the root
+  cause. No renderer/runtime fix is made in R6; the gameplay capture route
+  must deliberately trigger and verify the exterior transition before a real
+  outdoor eye-gate.
 - [ ] **R5 clue (2026-07-16)**: run log shows `audio: 32000 Hz output
   unavailable (cpal build_output_stream: Sample rate 32000 Hz is not
   supported) -- trying next rate` — a rate fallback without resampling is
