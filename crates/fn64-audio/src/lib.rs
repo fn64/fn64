@@ -142,6 +142,15 @@ pub trait AudioBackend {
     /// should surface that at the next `queue_samples` call via
     /// `AudioError`, not here.
     fn set_frequency(&mut self, sample_rate_hz: u32);
+
+    /// The host stream's actual rate, when the backend knows it. Lets the
+    /// AI-register model convert ring depth to guest-rate bytes so
+    /// `osAiGetLength` can report a REAL drain-aware value (the feedback
+    /// loop games use to pace audio production on hardware). Default `None`
+    /// keeps existing/fake backends contract-compatible.
+    fn stream_rate_hz(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Names the RSP audio-ucode EXECUTION boundary as an explicit, loud stub —
@@ -221,6 +230,9 @@ pub struct CpalBackend {
     /// (`osAiSetFrequency`).
     guest_rate_hz: u32,
     resampler: LinearResampler,
+    /// One-shot flag so ring-overflow drops are reported loudly exactly once
+    /// per stream, not once per queue call.
+    warned_overflow: bool,
 }
 
 impl Default for CpalBackend {
@@ -238,6 +250,7 @@ impl CpalBackend {
             stream_rate_hz: 0,
             guest_rate_hz: 0,
             resampler: LinearResampler::new(),
+            warned_overflow: false,
         }
     }
 
@@ -245,6 +258,20 @@ impl CpalBackend {
     pub fn stream_rate_hz(&self) -> Option<u32> {
         self.stream.as_ref().map(|_| self.stream_rate_hz)
     }
+}
+
+/// Drop the OLDEST samples so `ring` holds at most `cap` samples; returns
+/// how many were dropped. Bounding the ring keeps output latency finite when
+/// the producer outruns the drain (a paused/App-Napped callback, or a
+/// headless probe pumping the game far faster than real time -- previously
+/// an unbounded memory leak). Dropping the oldest skips playback ahead
+/// instead of letting it lag ever further behind the game.
+fn cap_ring(ring: &mut VecDeque<i16>, cap: usize) -> usize {
+    let excess = ring.len().saturating_sub(cap);
+    if excess > 0 {
+        ring.drain(..excess);
+    }
+    excess
 }
 
 /// Stateful linear resampler over interleaved `i16` frames. Carries the
@@ -341,11 +368,24 @@ impl AudioBackend for CpalBackend {
                 buffer_size: cpal::BufferSize::Default,
             };
             let ring = Arc::clone(&self.ring);
+            let mut first_pull = true;
             device
                 .build_output_stream(
                     stream_config,
                     move |data: &mut [i16], _info: &cpal::OutputCallbackInfo| {
                         let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
+                        if first_pull {
+                            first_pull = false;
+                            // One line per stream: proves the realtime
+                            // callback actually runs (a created-and-played
+                            // stream whose callback never fires is silent
+                            // with no error anywhere else).
+                            eprintln!(
+                                "fn64-audio: output callback live (first pull: {} samples,                                  ring holds {})",
+                                data.len(),
+                                ring.len()
+                            );
+                        }
                         for slot in data.iter_mut() {
                             *slot = ring.pop_front().unwrap_or(0);
                         }
@@ -427,6 +467,17 @@ impl AudioBackend for CpalBackend {
         );
         let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
         ring.extend(converted);
+        // Bound output latency: ~250 ms of stream audio. The shell's
+        // audio-clocked pacing keeps the ring an order of magnitude below
+        // this; the cap is the backstop for unpaced producers.
+        let cap = (self.stream_rate_hz as usize / 4).max(1) * self.channels.max(1) as usize;
+        let dropped = cap_ring(&mut ring, cap);
+        if dropped > 0 && !self.warned_overflow {
+            self.warned_overflow = true;
+            eprintln!(
+                "fn64-audio: output ring exceeded {cap} samples; dropped {dropped} oldest                  (producer outrunning the drain -- reported once)"
+            );
+        }
         Ok(())
     }
 
@@ -449,6 +500,10 @@ impl AudioBackend for CpalBackend {
         if sample_rate_hz != 0 {
             self.guest_rate_hz = sample_rate_hz;
         }
+    }
+
+    fn stream_rate_hz(&self) -> Option<u32> {
+        CpalBackend::stream_rate_hz(self)
     }
 }
 
@@ -629,6 +684,18 @@ mod tests {
             rs.process(chunk, 2, 32000, 48000, &mut chunked);
         }
         assert_eq!(whole, chunked);
+    }
+
+    #[test]
+    fn cap_ring_drops_oldest_keeps_newest() {
+        let mut ring: VecDeque<i16> = (0..100).collect();
+        assert_eq!(cap_ring(&mut ring, 40), 60);
+        assert_eq!(ring.len(), 40);
+        assert_eq!(*ring.front().unwrap(), 60, "oldest dropped, newest kept");
+        assert_eq!(*ring.back().unwrap(), 99);
+        // Under cap: untouched.
+        assert_eq!(cap_ring(&mut ring, 40), 0);
+        assert_eq!(ring.len(), 40);
     }
 
     #[test]
