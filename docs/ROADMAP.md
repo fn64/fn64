@@ -39,10 +39,17 @@ answer key (10,833 named fns) makes OoT the perfect graded target.
 fn64-discover has Phases 1/2/4/5 + bounded-6; the rest is design-only
 (DISCOVER-DESIGN.md).
 
-- [ ] **D1 Phase-3 candidate harvesting**: parallel deterministic detectors
-  (prologue patterns, jal-target closure, table-derived entries) feeding the
-  proof-state model; graded vs the OoT answer key via `fn64-discover`'s
-  existing grade modules.
+- [x] **D1 Phase-3 candidate harvesting** (merged 2026-07-16): three
+  deterministic providers (jal/jalr-target, prologue patterns,
+  table-derived) feeding the proof-state model, graded via `gate_d1`.
+  OoT combined 62.3% precision / 0.82% recall; NW4E 44.7%/89.0%;
+  NWXE 36.4%/28.5%. STRUCTURAL FINDING: OoT recall is bounded by Phase 2 —
+  only the boot bank is a discovered load-image (OoT overlays load via DMA
+  tables, not descriptor tables), so detectors had ~nothing to hunt in.
+  Table-derived is an honest 0 everywhere (descriptor tables prove
+  load-images, not entry points).
+- [ ] **D1.5 Phase-2 load-image discovery for DMA-table overlays** (the OoT
+  shape): required before OoT detector recall can be meaningful; feeds D2.
 - [ ] **D2 Phase-6 completion**: jump tables + value-set analysis for
   indirect targets (the bounded HI/LO case already works).
 - [ ] **D3 Phases 7-8**: targeted dynamic probes; assembly/relink

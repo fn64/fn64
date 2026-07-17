@@ -101,6 +101,10 @@ fn classify_const(word: u32) -> ConstOp {
             imm: (imm16 as i16) as i32,
         },
         0x0d => ConstOp::Ori { rt, rs, imm: imm16 },
+        // These immediate forms write `rt`, but this bounded tracker does
+        // not model their value. Leaving a previous constant live would
+        // fabricate an indirect target after a real clobber.
+        0x0a | 0x0b | 0x0c | 0x0e => ConstOp::Clobber { rd: rt },
         0x00 => {
             let funct = word & 0x3f;
             match funct {
@@ -109,15 +113,26 @@ fn classify_const(word: u32) -> ConstOp {
                 // Any other SPECIAL op with a real rd clobbers it; jr/jalr/
                 // syscall/break and shifts-of-zero don't concern us, but a
                 // plain "write rd from something we don't track" must clear.
-                0x08 | 0x09 | 0x0c | 0x0d => ConstOp::NoDest, // jr/jalr/syscall/break: no GPR const dest
+                0x08 | 0x0c | 0x0d => ConstOp::NoDest, // jr/syscall/break: no GPR const dest
+                0x09 if rd != 0 => ConstOp::Clobber { rd }, // jalr writes its link register
+                0x09 => ConstOp::NoDest,
                 _ if rd != 0 => ConstOp::Clobber { rd },
                 _ => ConstOp::NoDest,
             }
         }
         // Loads (opcode 0x20..=0x27, 0x37, ...) write rt with a memory value
         // we cannot constant-fold in this bounded case: clobber rt.
-        0x20..=0x27 | 0x37 | 0x1a | 0x1b => ConstOp::Clobber { rd: rt },
-        // Stores, branches, j/jal, coprocessor: no GPR destination we track.
+        0x20..=0x27 | 0x30 | 0x34 | 0x37 | 0x1a | 0x1b => ConstOp::Clobber { rd: rt },
+        // `jal` and branch-and-link write `$ra`. The exact link value is
+        // PC-dependent and deliberately outside this narrow tracker.
+        0x03 => ConstOp::Clobber { rd: 31 },
+        0x01 if matches!(rt, 0x10..=0x13) => ConstOp::Clobber { rd: 31 },
+        // Move/control-from-coprocessor forms write `rt`; move/control-to and
+        // ordinary coprocessor operations do not write a GPR.
+        0x10..=0x13 if matches!(rs, 0x00..=0x02) => ConstOp::Clobber { rd: rt },
+        // Store-conditional writes success/failure back to `rt`.
+        0x38 | 0x3c => ConstOp::Clobber { rd: rt },
+        // Stores, ordinary branches, `j`, coprocessor: no GPR destination.
         _ => ConstOp::NoDest,
     }
 }
@@ -133,6 +148,9 @@ pub struct ResolvedTarget {
     /// True when the site was `jalr` (a call: fallthrough returns), false for
     /// `jr` (a tail transfer / computed jump).
     pub via_call: bool,
+    /// First instruction included in the bounded straight-line constant
+    /// construction. This is provenance for Phase 3's resolved-jalr claim.
+    pub construction_start: u32,
 }
 
 /// Track register constants forward across a single straight-line block and,
@@ -180,7 +198,72 @@ fn resolve_block_target(
         site_pc,
         target,
         via_call,
+        construction_start: words.first().map_or(site_pc, |(pc, _)| *pc),
     })
+}
+
+/// True when `word` ends a straight-line constant-propagation region. The
+/// instruction after its delay slot starts with an unknown register file;
+/// carrying constants across either arm of a branch or across a call would
+/// turn a bounded proof into a guess.
+fn ends_linear_region(word: u32) -> bool {
+    let opcode = (word >> 26) & 0x3f;
+    match opcode {
+        0x00 => matches!(word & 0x3f, 0x08 | 0x09 | 0x0c | 0x0d),
+        0x01..=0x07 | 0x14..=0x17 => true,
+        0x11 => ((word >> 21) & 0x1f) == 0x08,
+        _ => false,
+    }
+}
+
+/// Linearly scan a discovered load image for `jalr` sites whose source
+/// register is resolved by the same bounded HI/LO tracker used by CFG
+/// closure. Results are word-aligned; the Phase 3 bank model decides which
+/// discovered load image, if any, owns each target. Unknown/clobbered
+/// registers remain absent rather than producing a guess.
+pub fn resolve_linear_jalr_sites(bank_bytes: &[u8], va_start: u32) -> Vec<ResolvedTarget> {
+    let words: Vec<u32> = bank_bytes
+        .chunks_exact(4)
+        .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
+        .collect();
+    let mut region_start = 0usize;
+    let mut next_region_start = None;
+    let mut out = Vec::new();
+
+    for (index, &word) in words.iter().enumerate() {
+        if next_region_start == Some(index) {
+            region_start = index;
+            next_region_start = None;
+        }
+
+        if (word >> 26) == 0 && (word & 0x3f) == 0x09 {
+            let rs = ((word >> 21) & 0x1f) as u8;
+            let site_pc = va_start.wrapping_add((index * 4) as u32);
+            let construction: Vec<(u32, u32)> = words[region_start..index]
+                .iter()
+                .enumerate()
+                .map(|(relative, &instruction)| {
+                    (
+                        va_start.wrapping_add(((region_start + relative) * 4) as u32),
+                        instruction,
+                    )
+                })
+                .collect();
+            if let Some(resolved) = resolve_block_target(&construction, site_pc, rs, true) {
+                if resolved.target.is_multiple_of(4) {
+                    out.push(resolved);
+                }
+            }
+        }
+
+        if ends_linear_region(word) {
+            next_region_start = Some(index.saturating_add(2));
+        }
+    }
+
+    out.sort_by_key(|target| target.site_pc);
+    out.dedup();
+    out
 }
 
 /// Set GPR `i`, keeping `$zero` pinned to 0 (a write to `$zero` is discarded
@@ -230,8 +313,7 @@ pub fn resolve_indirect_sites(cfg: &Cfg, bank_bytes: &[u8], va_start: u32) -> Ve
             BlockTerminator::Indirect { via_call } => via_call,
             _ => continue,
         };
-        let Some((jr_rs, term_via_call)) =
-            terminator_register(bank_bytes, va_start, block.end_va)
+        let Some((jr_rs, term_via_call)) = terminator_register(bank_bytes, va_start, block.end_va)
         else {
             continue;
         };
@@ -321,6 +403,26 @@ pub fn build_cfg_closed(
             return (cfg, resolved_all);
         }
     }
+}
+
+/// Build fixed-point CFG closure with authoritative Phase 3 entries from the
+/// shared fact database. Candidate, supported, rejected, conflict, and open
+/// conclusions are intentionally not promoted to roots.
+pub fn build_cfg_closed_with_facts(
+    db: &crate::facts::FactDb,
+    bank: &str,
+    bank_bytes: &[u8],
+    va_start: u32,
+    seed_roots: &[u32],
+) -> (Cfg, Vec<ResolvedTarget>) {
+    let mut roots: BTreeSet<u32> = seed_roots.iter().copied().collect();
+    roots.extend(db.proven_function_entries(bank));
+    build_cfg_closed(
+        bank,
+        bank_bytes,
+        va_start,
+        &roots.into_iter().collect::<Vec<_>>(),
+    )
 }
 
 #[cfg(test)]
@@ -424,8 +526,8 @@ mod tests {
         // lui $t0,0x8000 ; addiu $t0,$t0,0x0100 ; move $t2,$t0 (or $t2,$t0,$zero) ; jr $t2
         let lui = 0x3c08_8000u32; // lui $t0
         let addiu = 0x2508_0100u32; // addiu $t0,$t0,0x100
-        // or $t2, $t0, $zero  -> rd=10, rs=8, rt=0 (the shifted-0 field is
-        // elided to satisfy clippy::identity_op), funct=0x25
+                                    // or $t2, $t0, $zero  -> rd=10, rs=8, rt=0 (the shifted-0 field is
+                                    // elided to satisfy clippy::identity_op), funct=0x25
         let mov = (8u32 << 21) | (10u32 << 11) | 0x25;
         let jr_t2 = (10u32 << 21) | 0x08;
         let mut bytes = asm(&[lui, addiu, mov, jr_t2, NOP]);
@@ -434,6 +536,62 @@ mod tests {
         let resolved = resolve_indirect_sites(&cfg, &bytes, 0x8000_0000);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].target, 0x8000_0100);
+    }
+
+    #[test]
+    fn linear_jalr_scan_resolves_bounded_target_and_rejects_a_clobber() {
+        let lui = 0x3c19_8000u32; // lui $t9, 0x8000
+        let addiu = 0x2739_0100u32; // addiu $t9, $t9, 0x100
+        let jalr = (25u32 << 21) | (31u32 << 11) | 0x09;
+        let mut resolvable = asm(&[lui, addiu, jalr, NOP]);
+        resolvable.resize(0x200, 0);
+        let resolved = resolve_linear_jalr_sites(&resolvable, 0x8000_0000);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].target, 0x8000_0100);
+        assert_eq!(resolved[0].construction_start, 0x8000_0000);
+
+        let andi_t9 = 0x3339_ffffu32;
+        let mut clobbered = asm(&[lui, addiu, andi_t9, jalr, NOP]);
+        clobbered.resize(0x200, 0);
+        assert!(resolve_linear_jalr_sites(&clobbered, 0x8000_0000).is_empty());
+    }
+
+    #[test]
+    fn fact_integrated_closure_seeds_only_proven_entries() {
+        use crate::facts::{
+            function_entry_subject, BankAddr, CandidateDetector, Fact, FactDb,
+            FunctionEntryEvidence, ProofState,
+        };
+
+        let target = 0x8000_0100;
+        let jr_ra = 0x03e0_0008u32;
+        let mut bytes = asm(&[jr_ra, NOP]);
+        bytes.resize(0x200, 0);
+        bytes[0x100..0x104].copy_from_slice(&jr_ra.to_be_bytes());
+
+        let mut db = FactDb::new();
+        for (pc, state) in [
+            (target, ProofState::Proven),
+            (0x8000_0180, ProofState::Candidate),
+        ] {
+            let address = BankAddr::new("boot", pc);
+            let fact = db.insert(Fact::FunctionEntryClaim {
+                target: address.clone(),
+                detector: CandidateDetector::TableDerived,
+                evidence: FunctionEntryEvidence::TableEntry {
+                    table: BankAddr::new("boot", 0x8000_0080),
+                    index: 0,
+                },
+                proposed_state: state,
+            });
+            db.conclude(function_entry_subject(&address), state, vec![fact], "test")
+                .unwrap();
+        }
+
+        let (cfg, _) =
+            build_cfg_closed_with_facts(&db, "boot", &bytes, 0x8000_0000, &[0x8000_0000]);
+        assert!(cfg.proven_roots.contains(&target));
+        assert!(!cfg.proven_roots.contains(&0x8000_0180));
     }
 
     #[test]

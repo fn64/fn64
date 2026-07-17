@@ -1,6 +1,6 @@
 //! B2 gate runner: Phase 4 (delay-slot-aware CFG) + Phase 5 (recursive-
 //! descent owner partitioning) + Phase 6's bounded HI/LO indirect resolver
-//! (`resolve::build_cfg_closed`) over the real OoT, NW4E, and NWXE ROMs'
+//! (`resolve::build_cfg_closed_with_facts`) over the real OoT, NW4E, and NWXE ROMs'
 //! resident `boot` banks. Every bank is seeded with ONLY the header
 //! entrypoint --
 //! the resident C entry each IPL3 stub `jr`s to is now recovered
@@ -31,7 +31,7 @@ use fn64_discover::grade_nwxe_functions::{
 };
 use fn64_discover::grade_oot_functions::{grade_functions, parse_function_csv};
 use fn64_discover::partition::{partition, same_bank_overlaps, Owner};
-use fn64_discover::resolve::build_cfg_closed;
+use fn64_discover::resolve::build_cfg_closed_with_facts;
 use fn64_discover::{run_discovery, DescriptorTableInput};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -51,7 +51,7 @@ const OOT_BOOT_CODE_END: u32 = 0x8000_6230;
 const NW4E_ROM: &str = "/Users/jer/Code/aki-recomp/games/NW4E/nomercy.z64";
 /// NW4E's `overlays.json` `resident.main_entry_vram` -- a prior
 /// byte-verified RE fact (scan.py section 2). It is NO LONGER a pipeline
-/// input: Phase 6's bounded HI/LO resolver ([`build_cfg_closed`]) now
+/// input: Phase 6's bounded HI/LO resolver ([`build_cfg_closed_with_facts`]) now
 /// recovers this exact address mechanically from the IPL3 boot stub's
 /// `lui $t2,0x8000 ; addiu $t2,$t2,0x0460 ; jr $t2` construction. It is kept
 /// here ONLY as a grading assertion -- proof the mechanical resolution
@@ -122,11 +122,12 @@ fn main() {
 
 /// Build the boot bank's CFG + partition from the real OoT ROM, seeding
 /// ONLY the header entrypoint and letting Phase 6's bounded HI/LO resolver
-/// ([`build_cfg_closed`]) recover the resident C entry (`bootproc` at
+/// ([`build_cfg_closed_with_facts`]) recover the resident C entry (`bootproc` at
 /// 0x80000498) mechanically from the IPL3 stub's `lui/addiu -> jr $t2`
-/// construction -- no hand-supplied "main entry" address. Phase 3 candidate
-/// harvesting is still unimplemented, so functions reached only via function
-/// pointers remain `open`; that is a reported limitation, not a hidden one.
+/// construction -- no hand-supplied "main entry" address. Phase 3 candidates
+/// remain non-authoritative unless their merged proof state is `Proven`, so
+/// unresolved function pointers remain `open`; that is a reported limitation,
+/// not a hidden one.
 fn run_oot_function_gate() -> Result<(), String> {
     let rom_bytes = std::fs::read(OOT_ROM).map_err(|e| format!("reading {OOT_ROM}: {e}"))?;
     let (rom, db) =
@@ -154,7 +155,8 @@ fn run_oot_function_gate() -> Result<(), String> {
         "  boot bank: rom_start=0x{rom_start:x} va_start=0x{va_start:x} code_end=0x{OOT_BOOT_CODE_END:x} entrypoint=0x{entrypoint:x}"
     );
 
-    let (cfg, resolved) = build_cfg_closed("boot", bank_bytes, va_start, &[entrypoint]);
+    let (cfg, resolved) =
+        build_cfg_closed_with_facts(&db, "boot", bank_bytes, va_start, &[entrypoint]);
     let part = partition(&cfg);
     let overlaps = same_bank_overlaps(&part, &cfg);
 
@@ -243,7 +245,8 @@ fn run_oot_function_gate() -> Result<(), String> {
 /// set, same honest limitation as the OoT gate above) plus each overlay
 /// bank's own descriptor-table-proven mapping, then diff owners against
 /// the hand-fixed rungs. Reports the recovery count; does not require it
-/// to be 36/36 (Phase 3/6 aren't implemented yet), matching the design
+/// to be 36/36 (the remaining table/value-set Phase 6 cases are not yet
+/// implemented), matching the design
 /// doc's "honest limit" -- what's gated here is that the mechanism runs
 /// end-to-end on real bytes and reports a real, non-fabricated count.
 fn run_nw4e_grind_collapse_gate() -> Result<(), String> {
@@ -274,17 +277,18 @@ fn run_nw4e_grind_collapse_gate() -> Result<(), String> {
         let bank_bytes = &rom.bytes[*rom_start as usize..*rom_end as usize];
         // Seed ONLY the header entrypoint. The IPL3 boot stub ends in an
         // indirect `jr $t2` to the resident C entry; Phase 6's bounded HI/LO
-        // resolver ([`build_cfg_closed`]) now recovers that target
+        // resolver ([`build_cfg_closed_with_facts`]) now recovers that target
         // mechanically, so the `main_entry_vram` this gate previously
         // hand-seeded is no longer a pipeline input. Overlay banks have no
-        // proven candidate root yet (Phase 3 unimplemented) -- an honest
-        // empty seed still produces a valid (possibly empty) CFG.
+        // proven candidate root yet. Phase 3's heuristic jal/prologue claims
+        // deliberately remain Candidate/Supported, so an honest empty seed
+        // still produces a valid (possibly empty) CFG.
         let seed: Vec<u32> = if bank == banks::BOOT_BANK {
             vec![rom.header.entry_point]
         } else {
             vec![]
         };
-        let (cfg, resolved) = build_cfg_closed(bank, bank_bytes, *va_start, &seed);
+        let (cfg, resolved) = build_cfg_closed_with_facts(&db, bank, bank_bytes, *va_start, &seed);
         if bank == banks::BOOT_BANK {
             // Prove the mechanical resolution reproduced the hand-verified
             // resident entry address (grading assertion, not a seed).
@@ -339,19 +343,18 @@ fn run_nw4e_grind_collapse_gate() -> Result<(), String> {
     println!("    recovered%={:.1}%", report.recovered_fraction() * 100.0);
     if report.recovered == 0 {
         // Honest, expected result at B2's current scope, not a failure:
-        // every one of these 36 rungs is either (a) in an overlay bank,
-        // where this gate seeds zero candidate roots because Phase 3
-        // (candidate harvesting) is not implemented yet, or (b) in the
-        // resident bank but reached only via a function pointer / thread
-        // registration this crate cannot yet resolve (Phase 6, also not
-        // implemented). Verified directly: none of the 8 resident-bank
+        // every one of these 36 rungs is either (a) in an overlay bank with
+        // no Proven table-entry claim (heuristic Phase 3 claims cannot become
+        // partition roots), or (b) in the resident bank but reached only via
+        // a function pointer / thread registration the remaining Phase 6
+        // value-set work cannot yet resolve. Verified directly: none of the 8 resident-bank
         // rungs fall inside any block this run's recursive descent
         // reaches at all. Reporting 0/36 truthfully is exactly the
         // "honest limit" the design doc requires -- fabricating a
         // recovery here would be the guessed-symbol-file failure mode
         // this crate exists to prevent.
         println!(
-            "    (0 recovered is expected at B2's scope: these rungs need Phase 3/6, not yet implemented)"
+            "    (0 recovered is expected: these rungs need Proven table entries or later Phase 6 value-set closure)"
         );
     }
 
@@ -407,7 +410,8 @@ fn run_nwxe_function_gate() -> Result<(), String> {
         "  boot bank: rom=[0x{rom_start:x},0x{rom_end:x}) va=[0x{va_start:x},0x{va_end:x}) entrypoint=0x{entrypoint:x}"
     );
 
-    let (cfg, resolved) = build_cfg_closed("boot", bank_bytes, va_start, &[entrypoint]);
+    let (cfg, resolved) =
+        build_cfg_closed_with_facts(&db, "boot", bank_bytes, va_start, &[entrypoint]);
     let recovered_entry = resolved
         .iter()
         .any(|target| target.target == NWXE_MAIN_ENTRY_VRAM);
