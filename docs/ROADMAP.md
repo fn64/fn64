@@ -55,8 +55,13 @@ fn64-discover has Phases 1/2/4/5 + bounded-6; the rest is design-only
   tables, not descriptor tables), so detectors had ~nothing to hunt in.
   Table-derived is an honest 0 everywhere (descriptor tables prove
   load-images, not entry points).
-- [ ] **D1.5 Phase-2 load-image discovery for DMA-table overlays** (the OoT
-  shape): required before OoT detector recall can be meaningful; feeds D2.
+- [x] **D1.5 Phase-2 load-image discovery for DMA-table overlays** (landed
+  2026-07-16): generalized physical-ROM/VROM range-table input plus proven
+  file-table backing and deterministic Yaz0 materialization. OoT now exposes
+  468 table-derived overlay images (actor/effect/gamestate/Kaleido) and moves
+  combined D1 grading from 62.285714% precision / 0.815990% recall to
+  90.569045% / 72.323701%. NW4E/NWXE D1 numbers are unchanged. Resident
+  `code`/`n64dd` destination discovery and later detector closure remain open.
 - [ ] **D2 Phase-6 completion**: jump tables + value-set analysis for
   indirect targets (the bounded HI/LO case already works).
 - [ ] **D3 Phases 7-8**: targeted dynamic probes; assembly/relink

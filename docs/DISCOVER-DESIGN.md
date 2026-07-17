@@ -146,6 +146,39 @@ digest.
 
 ## Phase 2: discover load images before functions
 
+> Implementation status (D1.5, 2026-07-16): Phase 2 now accepts an explicit,
+> generalized range-table shape: table location in physical ROM or VROM,
+> record count/stride, configurable source start/end fields in ROM or VROM,
+> and configurable destination start/end fields in physical ROM or VRAM.
+> A destination end may be explicit, derived from source length, or use the
+> file-table convention where a zero end means an uncompressed equal-length
+> file. The same mechanism therefore represents VROM file tables,
+> VROM-to-VRAM overlay tables, and physical-ROM descriptor tables; the older
+> `DescriptorTableInput` remains supported. Table locations and bank naming
+> are caller-supplied data, never guessed by a detector.
+>
+> Every parsed record is a typed `LoadImageTableRecord` fact naming its table
+> and record index, with an independent proof-state conclusion. A proven
+> overlay bank's `RomMapping` conclusion cites that record and, for VROM, the
+> proven file-table record that supplies its bytes. Physical file mappings are
+> validated against normalized-ROM bounds; compressed VROM files are
+> deterministically materialized with a bounded decoder derived from the
+> allowed N64Recomp-generated `Yaz0_DecompressImpl` C, and the stream's
+> declared size must match the VROM interval. Malformed/blank records are `rejected`,
+> missing backing is `open`, and records whose source and destination ranges
+> conflict are moved to `conflict` (including every member of a multi-record
+> conflict), so none can feed Phase 3 as proven input.
+>
+> `gate_d1` supplies OoT NTSC 1.0's file, effect, actor, gamestate, and
+> Kaleido/player table geometry as shape/data input. Proven records are 1,509
+> file mappings, 36 effect images, 426 actor images, four gamestate images,
+> and two Kaleido images; blank/sentinel table slots remain rejected. Together
+> with the boot copy this yields 469 proven load images. The input geometry is
+> cited to allowed N64Recomp-generated C/section data (`DmaMgr_Init`'s file
+> table load, the generated code-section VROM/VRAM mapping, and the table
+> consumers' field loads/counts/strides), not to the grading key. `dump.toml`
+> is opened only after discovery.
+
 A ROM offset is not inherently tied to one runtime address. Discover candidate
 ROM-to-RDRAM mappings from:
 
@@ -190,17 +223,25 @@ invalid edges, and address collisions.
 > `candidate`/`supported` prologues cannot silently become authoritative
 > owners.
 >
-> The grading-only `gate_d1` compares physical `(ROM offset, runtime VA)`
+> The grading-only `gate_d1` compares logical `(ROM/VROM offset, runtime VA)`
 > identities after discovery, so overlapping overlay VAs cannot earn false
 > matches. Against the zeldaret-derived OoT key (472 sections / 13,358
-> function rows), using only the boot load image Phase 2 currently discovers:
+> function rows), the pre-D1.5 boot-only baseline was:
 > direct/resolved calls produce 147 candidates, 85 matches, 57.823129%
 > precision, and 0.636323% recall; prologues produce 76 candidates, 72
 > matches, 94.736842% precision, and 0.539003% recall; the table provider has
 > no OoT input facts and therefore emits 0 candidates; the combined union is
 > 175 candidates / 109 matches, 62.285714% precision, and 0.815990% recall.
-> The low full-key recall is the explicit Phase-2 frontier (OoT overlay load
-> images are not yet discovered), not answer-key input to the detectors.
+> With D1.5's Phase-2 table inputs, direct/resolved calls produce 5,486
+> candidates / 4,505 matches, 82.118119% precision, and 33.725109% recall;
+> prologues produce 8,637 / 8,612, 99.710548% precision, and 64.470729%
+> recall; table-derived remains an honest zero because load-image records do
+> not prove function entrypoints; the combined union is 10,667 / 9,661,
+> 90.569045% precision, and 72.323701% recall. Three positive call claims fall
+> in the VRAM-only tail beyond their images' VROM bytes and are reported as
+> ungradable. The remaining recall frontier is primarily Phase 3 detector
+> coverage inside known images plus the resident `code`/`n64dd` images, whose
+> VRAM destinations are not supplied by these overlay/file tables.
 > Recursive entrypoint traversal, branch/tail roots, callback discovery,
 > signatures, external-tool providers, dynamic PCs, and unresolved-interval
 > linear decoding remain design-only.
