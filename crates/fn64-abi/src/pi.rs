@@ -136,6 +136,7 @@ pub unsafe extern "C" fn osCartRomInit_recomp(_rdram: *mut u8, ctx: *mut RecompC
 #[no_mangle]
 pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     let mb_addr = RdramAddr::from_gpr(ctx.r5);
     let direction = if ctx.r6 == 0 {
         DmaDirection::ToRdram
@@ -219,18 +220,19 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
                 } else {
                     dma.read_rom_bytes(dev_addr, &mut buf);
                 }
-                // Per-BYTE lane swizzle into native-word rdram, matching
-                // `Rdram::dma_write_bytes` (`dst[(base+k)^3]=src[k]`). A flat
+                // Logical-byte write into native-word rdram. A flat
                 // copy hung OoT's DmaMgr_Init (MEM_W(dest+4)==0x1060 saw
                 // 0x60100000) and would corrupt every SRAM byte the save loader
-                // MEM_BU's back. This shim copies through the raw rdram pointer
-                // (no Rdram wrapper), so swizzle byte-by-byte here. Per-byte,
-                // NOT per-word, so it stays correct for the sub-word / unaligned
-                // transfers OoT's DmaMgr_DmaRomToRam issues (e.g. len=0x86).
-                let base = dram_addr.offset() as usize;
+                // MEM_BU's back. RdramPtr owns the same mapping as RdramView;
+                // this ABI shim never applies a lane XOR itself.
                 for (k, &b) in buf.iter().enumerate() {
                     unsafe {
-                        *rdram.add((base + k) ^ 3) = b;
+                        storage.write_u8(
+                            dram_addr
+                                .checked_add(u32::try_from(k).expect("PI DMA length exceeds u32"))
+                                .expect("PI DMA logical address overflow"),
+                            b,
+                        );
                     }
                 }
                 fn64_runtime::DmaCompletion {
@@ -260,16 +262,14 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
                     len
                 );
                 let mut buf = vec![0u8; len as usize];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        rdram.add(dram_addr.offset() as usize),
-                        buf.as_mut_ptr(),
-                        buf.len(),
-                    );
-                }
-                for word in buf.chunks_exact_mut(4) {
-                    word.swap(0, 3);
-                    word.swap(1, 2);
+                for (k, byte) in buf.iter_mut().enumerate() {
+                    unsafe {
+                        *byte = storage.read_u8(
+                            dram_addr
+                                .checked_add(u32::try_from(k).expect("PI DMA length exceeds u32"))
+                                .expect("PI DMA logical address overflow"),
+                        );
+                    }
                 }
                 dma.sram_write_from(dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE, &buf);
                 fn64_runtime::DmaCompletion {
@@ -324,18 +324,16 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
             with_pi_dma("osEPiStartDma_recomp", |dma| {
                 dma.read_rom_bytes(dev_addr, &mut buf)
             });
-            // Same word-swizzle the primary destination write applies, so the
-            // mirror is native-word storage the guest reads back via MEM_*.
-            for word in buf.chunks_exact_mut(4) {
-                word.swap(0, 3);
-                word.swap(1, 2);
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    buf.as_ptr(),
-                    rdram.add(static_off as usize),
-                    buf.len(),
-                );
+            let mirror = RdramAddr::from_offset(static_off);
+            for (k, &byte) in buf.iter().enumerate() {
+                unsafe {
+                    storage.write_u8(
+                        mirror
+                            .checked_add(u32::try_from(k).expect("PI mirror length exceeds u32"))
+                            .expect("PI mirror logical address overflow"),
+                        byte,
+                    );
+                }
             }
         }
     }

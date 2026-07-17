@@ -30,8 +30,8 @@
 //!    `resolve_jal` Match-vs-Ambiguous decision.
 
 use fn64_recomp_rs::{
-    call_host_or_recompiled, emit_module, resolve_host_function, set_host_lookup, ModuleFunc, Rdram,
-    RecompContext, RecompFunc, SymbolTable,
+    call_host_or_recompiled, emit_module, resolve_host_function, set_host_lookup, ModuleFunc,
+    Rdram, RecompContext, RecompFunc, SymbolTable,
 };
 
 // --- The synthetic three-function "program" (real MIPS III encodings). ---
@@ -60,9 +60,21 @@ fn synthetic_symbols() -> SymbolTable {
 fn synthetic_module() -> String {
     let symbols = synthetic_symbols();
     let funcs = [
-        ModuleFunc { name: "callee", vram: CALLEE_VRAM, words: &CALLEE_WORDS },
-        ModuleFunc { name: "caller", vram: CALLER_VRAM, words: &CALLER_WORDS },
-        ModuleFunc { name: "tail_caller", vram: TAIL_VRAM, words: &TAIL_WORDS },
+        ModuleFunc {
+            name: "callee",
+            vram: CALLEE_VRAM,
+            words: &CALLEE_WORDS,
+        },
+        ModuleFunc {
+            name: "caller",
+            vram: CALLER_VRAM,
+            words: &CALLER_WORDS,
+        },
+        ModuleFunc {
+            name: "tail_caller",
+            vram: TAIL_VRAM,
+            words: &TAIL_WORDS,
+        },
     ];
     emit_module(&funcs, &symbols)
 }
@@ -180,10 +192,22 @@ fn crosscall_executes_to_expected_state() {
 
     caller(&mut ctx, &mut mem);
 
-    assert_eq!(ctx.r(2), 42, "$v0 should hold the callee's result after the direct call");
-    assert_eq!(ctx.r(4), 7, "delay-slot $a0 = 7 must have executed before the call");
+    assert_eq!(
+        ctx.r(2),
+        42,
+        "$v0 should hold the callee's result after the direct call"
+    );
+    assert_eq!(
+        ctx.r(4),
+        7,
+        "delay-slot $a0 = 7 must have executed before the call"
+    );
     // $ra was linked to the return address after the delay slot.
-    assert_eq!(ctx.r_u32(31), 0x8000_2008, "JAL must link $ra to post-delay-slot pc");
+    assert_eq!(
+        ctx.r_u32(31),
+        0x8000_2008,
+        "JAL must link $ra to post-delay-slot pc"
+    );
 }
 
 /// The inter-function `J` (tail call) path: `tail_caller` tail-calls `callee`,
@@ -196,7 +220,11 @@ fn tail_call_executes_to_expected_state() {
 
     tail_caller(&mut ctx, &mut mem);
 
-    assert_eq!(ctx.r(2), 42, "$v0 should hold the callee's result after the tail call");
+    assert_eq!(
+        ctx.r(2),
+        42,
+        "$v0 should hold the callee's result after the tail call"
+    );
 }
 
 /// Resolution correctness against the emitted text: a JAL to a KNOWN symbol
@@ -207,8 +235,10 @@ fn tail_call_executes_to_expected_state() {
 fn known_target_is_direct_unknown_is_lookup() {
     // Known-target module: caller -> callee. Must be direct, no lookup.
     let known = synthetic_module();
-    assert!(known.contains("call_host_or_recompiled(0x80001000, callee, ctx, mem);"),
-            "known JAL must emit a typed recompiled fallback through the host seam");
+    assert!(
+        known.contains("call_host_or_recompiled(0x80001000, callee, ctx, mem);"),
+        "known JAL must emit a typed recompiled fallback through the host seam"
+    );
     assert!(
         !known.contains("            lookup("),
         "no indirect lookup CALL should appear when every target is a known symbol:\n{known}"
@@ -219,7 +249,11 @@ fn known_target_is_direct_unknown_is_lookup() {
     let unknown_symbols = SymbolTable::from_entries([("caller".to_string(), CALLER_VRAM)]);
     // jal 0x80009000 -> target26 = (0x80009000 & 0x0FFFFFFF) >> 2 = 0x2400 -> 0x0C002400.
     let words: [u32; 4] = [0x0C00_2400, 0x2404_0007, 0x03E0_0008, 0x0000_0000];
-    let funcs = [ModuleFunc { name: "caller", vram: CALLER_VRAM, words: &words }];
+    let funcs = [ModuleFunc {
+        name: "caller",
+        vram: CALLER_VRAM,
+        words: &words,
+    }];
     let unknown = emit_module(&funcs, &unknown_symbols);
     assert!(
         unknown.contains("lookup(0x80009000)(ctx, mem);"),

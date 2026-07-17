@@ -136,7 +136,7 @@ fn main() {
     // buffer's end (`docs/BOOT-NOTES-WM2000.md`'s LLDB-confirmed
     // `EXC_BAD_ACCESS`). See `fn64_runtime::mmio`'s module doc for the full
     // story.
-    let mut rdram = fn64_boot_harness::new_rdram();
+    let mut rdram = fn64_boot_harness::new_rdram(fn64_boot_harness::TvType::Ntsc);
     let rdram_ptr = rdram.as_mut_ptr();
 
     // Prime the MMIO backing bytes before the guest ever runs, so even a
@@ -315,7 +315,7 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
          dumping PNG."
     );
     let path = format!("/tmp/fn64-fb-{swap_index}.png");
-    match dump_rgba5551_as_png(region, FB_WIDTH, FB_HEIGHT, &path) {
+    match dump_rgba5551_as_png(rdram, start, FB_WIDTH, FB_HEIGHT, &path) {
         Ok(()) => {
             println!("[wm2000-boot] *** NON-UNIFORM FRAMEBUFFER DUMPED: {path} ***");
             dumps.push(path);
@@ -324,20 +324,34 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
     }
 }
 
-/// Convert N64 RGBA5551 (big-endian halfwords: RRRRRGGGGGBBBBBA) to
-/// RGBA8888 and write a minimal, dependency-free PNG (a hand-rolled
+/// Convert logical N64 RGBA5551 halfwords (RRRRRGGGGGBBBBBA) from fn64's
+/// native-word RDRAM storage to RGBA8888 and write a minimal PNG (a hand-rolled
 /// uncompressed-DEFLATE encoder -- no `png`/`image` crate dependency for
 /// this one-shot dump, keeping this example's dependency footprint at just
 /// `cc` for the C bridge).
 fn dump_rgba5551_as_png(
-    data: &[u8],
+    rdram: &[u8],
+    start: usize,
     width: usize,
     height: usize,
     path: &str,
 ) -> std::io::Result<()> {
     let mut rgba = Vec::with_capacity(width * height * 4);
-    for chunk in data.chunks_exact(2) {
-        let px = u16::from_be_bytes([chunk[0], chunk[1]]);
+    let view = fn64_runtime::RdramView::from_storage(rdram);
+    let start = fn64_runtime::RdramAddr::from_offset(
+        u32::try_from(start).expect("framebuffer RDRAM offset exceeds u32"),
+    );
+    assert!(
+        start.offset().is_multiple_of(4),
+        "framebuffer offset {:#x} is not word-aligned",
+        start.offset()
+    );
+    for i in 0..width * height {
+        let px = view.read_u16(
+            start
+                .checked_add(u32::try_from(i * 2).expect("framebuffer byte offset exceeds u32"))
+                .expect("framebuffer logical address overflow"),
+        );
         let r5 = (px >> 11) & 0x1F;
         let g5 = (px >> 6) & 0x1F;
         let b5 = (px >> 1) & 0x1F;

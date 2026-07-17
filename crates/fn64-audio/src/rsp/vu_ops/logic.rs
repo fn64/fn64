@@ -28,7 +28,7 @@
 //! Everything here is portable scalar Rust — `[i16; 8]` lanes, per-lane `u16`
 //! bit math, no SIMD.
 
-use super::super::vu::{element_select, LANES, Vec8, VuState};
+use super::super::vu::{element_select, Vec8, VuState, LANES};
 
 /// The specific bitwise combination a logic op performs on the two raw 16-bit
 /// lane patterns. Kept as one enum + one combine function so all six ops share
@@ -100,8 +100,8 @@ pub fn exec_vnop(_state: &mut VuState) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::vu::VuState;
+    use super::*;
 
     /// Build a VuState with vs in reg 1 and vt in reg 2, run `kind` with
     /// element modifier `e` into reg 3, and return (vd, acc_lo array).
@@ -195,10 +195,16 @@ mod tests {
         // A pattern where a mistaken i16-vs-u16 complement, or clamping, would
         // change the result. NAND of 0x0000 & anything -> 0xFFFF (all ones).
         let (vd, _) = run(LogicKind::Nand, broadcast(0x0000), broadcast(0x1234), 0);
-        assert_eq!(vd, [0xFFFFu16 as i16; LANES], "NAND with a zero operand is all ones (-1)");
+        assert_eq!(
+            vd, [0xFFFFu16 as i16; LANES],
+            "NAND with a zero operand is all ones (-1)"
+        );
         // NOR of two zeros -> 0xFFFF as well; confirms full-width inversion.
         let (vd2, _) = run(LogicKind::Nor, broadcast(0x0000), broadcast(0x0000), 0);
-        assert_eq!(vd2, [-1i16; LANES], "NOR(0,0) = 0xFFFF = -1, full 16-bit invert");
+        assert_eq!(
+            vd2, [-1i16; LANES],
+            "NOR(0,0) = 0xFFFF = -1, full 16-bit invert"
+        );
     }
 
     #[test]
@@ -207,8 +213,19 @@ mod tests {
         // OR(vs[i], vt[0]) must use vt[0] for every lane, proving element
         // selection is applied to vt (a wrong "identity" impl would OR vs[i]
         // with vt[i] and give a different vector).
-        let vs = [0x0001, 0x0002, 0x0004, 0x0008, 0x0010, 0x0020, 0x0040, 0x0080];
-        let vt = [0x8000u16 as i16, 0x0100, 0x0200, 0x0400, 0x0800, 0x1000, 0x2000, 0x4000];
+        let vs = [
+            0x0001, 0x0002, 0x0004, 0x0008, 0x0010, 0x0020, 0x0040, 0x0080,
+        ];
+        let vt = [
+            0x8000u16 as i16,
+            0x0100,
+            0x0200,
+            0x0400,
+            0x0800,
+            0x1000,
+            0x2000,
+            0x4000,
+        ];
         let (vd, _) = run(LogicKind::Or, vs, vt, 8); // broadcast vt lane 0 = 0x8000
         let expected: Vec8 = core::array::from_fn(|i| (vs[i] as u16 | 0x8000u16) as i16);
         assert_eq!(vd, expected, "e=8 must OR each lane with vt[0]");

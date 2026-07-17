@@ -32,7 +32,7 @@ pub use mmio::{
 };
 pub use overlay::{FuncEntry, Section, SectionIndex, SectionRegistry};
 pub use peripherals::Peripherals;
-pub use rdram::{Rdram, RdramAddr};
+pub use rdram::{Rdram, RdramAddr, RdramPtr, RdramView, RdramViewMut};
 pub use rom::{DmaCompletion, InMemoryRom, PiDma, RomStorage};
 pub use rsp::{OsTaskHeader, TaskLog, M_AUDTASK, M_GFXTASK};
 pub use save::{FileSaveStorage, InMemorySaveStorage, SaveStorage, SaveType};

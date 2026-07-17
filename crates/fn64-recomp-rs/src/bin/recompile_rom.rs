@@ -123,7 +123,10 @@ fn main() -> std::process::ExitCode {
         "aggregate generated source: {} bytes across {RECOMPILED_PART_COUNT} balanced parts",
         report.module.len()
     );
-    eprintln!("recompiled function crate written to {}", args.out.display());
+    eprintln!(
+        "recompiled function crate written to {}",
+        args.out.display()
+    );
     eprintln!("gap report written to {}", report_path.display());
 
     std::process::ExitCode::SUCCESS
@@ -162,9 +165,7 @@ impl Args {
         let mut config = std::env::var("FN64_CONFIG").ok().map(PathBuf::from);
         let mut rom = std::env::var("FN64_ROM").ok().map(PathBuf::from);
         let mut out = std::env::var("FN64_OUT").ok().map(PathBuf::from);
-        let mut profile = std::env::var("RECOMP_RS_PROFILE")
-            .ok()
-            .map(PathBuf::from);
+        let mut profile = std::env::var("RECOMP_RS_PROFILE").ok().map(PathBuf::from);
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {

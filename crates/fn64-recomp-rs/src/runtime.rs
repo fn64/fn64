@@ -545,9 +545,9 @@ pub fn set_host_pause(pause: Option<HostPause>) -> Option<HostPause> {
 /// Yield the active emulated thread at an unconditional branch-to-self.
 pub fn pause_self() {
     HOST_PAUSE.with(|slot| {
-        slot.get().unwrap_or_else(|| {
-            panic!("pause_self: rs host installed no coroutine-yield adapter")
-        })()
+        slot.get()
+            .unwrap_or_else(|| panic!("pause_self: rs host installed no coroutine-yield adapter"))(
+        )
     });
 }
 

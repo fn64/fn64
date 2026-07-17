@@ -396,7 +396,7 @@ fn main() {
     // which is why examples/wm2000-boot's identical `.max(...)` guard
     // never had to fire in that harness's own testing, not because the
     // sizing itself is game-specific.
-    let mut rdram = fn64_boot_harness::new_rdram();
+    let mut rdram = fn64_boot_harness::new_rdram(fn64_boot_harness::TvType::Ntsc);
     let rdram_ptr = rdram.as_mut_ptr();
 
     // Select the renderer before boot. `FN64_RENDER=rt64` requests the
@@ -1056,22 +1056,21 @@ fn main() {
 }
 
 fn read_guest_u32(rdram: &[u8], offset: usize) -> u32 {
-    let bytes: [u8; 4] = rdram[offset..offset + 4]
-        .try_into()
-        .expect("OoT state trace address must fit the shared RDRAM buffer");
-    u32::from_ne_bytes(bytes)
+    fn64_runtime::RdramView::from_storage(rdram).read_u32(fn64_runtime::RdramAddr::from_offset(
+        u32::try_from(offset).expect("OoT state trace address exceeds u32"),
+    ))
 }
 
 fn read_guest_u16(rdram: &[u8], offset: usize) -> u16 {
-    let physical = offset ^ 2;
-    let bytes: [u8; 2] = rdram[physical..physical + 2]
-        .try_into()
-        .expect("OoT state trace address must fit the shared RDRAM buffer");
-    u16::from_ne_bytes(bytes)
+    fn64_runtime::RdramView::from_storage(rdram).read_u16(fn64_runtime::RdramAddr::from_offset(
+        u32::try_from(offset).expect("OoT state trace address exceeds u32"),
+    ))
 }
 
 fn read_guest_u8(rdram: &[u8], offset: usize) -> u8 {
-    rdram[offset ^ 3]
+    fn64_runtime::RdramView::from_storage(rdram).read_u8(fn64_runtime::RdramAddr::from_offset(
+        u32::try_from(offset).expect("OoT state trace address exceeds u32"),
+    ))
 }
 
 fn find_guest_word(rdram: &[u8], needle: u32) -> Option<usize> {
@@ -1114,7 +1113,11 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
     // word-aligned (the swizzle is relative to a 32-bit word boundary). N64
     // framebuffers are DMA/cache-line aligned so this always holds; assert it
     // rather than silently mis-decode if a future fb_offset breaks the rule.
-    debug_assert_eq!(start % 4, 0, "framebuffer offset {start:#x} not word-aligned; swizzle decode would be wrong");
+    debug_assert_eq!(
+        start % 4,
+        0,
+        "framebuffer offset {start:#x} not word-aligned; swizzle decode would be wrong"
+    );
     let region = &rdram[start..end];
     let first_byte = region[0];
     let uniform = region.iter().all(|&b| b == first_byte);
@@ -1133,7 +1136,7 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
          dumping PNG."
     );
     let path = format!("/tmp/fn64-fb-{swap_index}.png");
-    match dump_rgba5551_as_png(region, FB_WIDTH, FB_HEIGHT, &path) {
+    match dump_rgba5551_as_png(rdram, start, FB_WIDTH, FB_HEIGHT, &path) {
         Ok(()) => {
             println!("[oot-boot] *** NON-UNIFORM FRAMEBUFFER DUMPED: {path} ***");
             dumps.push(path);
@@ -1155,15 +1158,24 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
 /// halfword pairs within each 32-bit word and shifts every color -- that was
 /// the purple/dithered cast in the captured frames.
 fn dump_rgba5551_as_png(
-    data: &[u8],
+    rdram: &[u8],
+    start: usize,
     width: usize,
     height: usize,
     path: &str,
 ) -> std::io::Result<()> {
     let mut rgba = Vec::with_capacity(width * height * 4);
+    let view = fn64_runtime::RdramView::from_storage(rdram);
+    let start = fn64_runtime::RdramAddr::from_offset(
+        u32::try_from(start).expect("framebuffer RDRAM offset exceeds u32"),
+    );
     for i in 0..width * height {
-        let p = (i * 2) ^ 2;
-        let px = u16::from_ne_bytes([data[p], data[p + 1]]);
+        let byte_offset = u32::try_from(i * 2).expect("framebuffer byte offset exceeds u32");
+        let px = view.read_u16(
+            start
+                .checked_add(byte_offset)
+                .expect("framebuffer logical address overflow"),
+        );
         let r5 = (px >> 11) & 0x1F;
         let g5 = (px >> 6) & 0x1F;
         let b5 = (px >> 1) & 0x1F;

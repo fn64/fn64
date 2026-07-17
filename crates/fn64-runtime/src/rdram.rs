@@ -36,6 +36,11 @@
 //! (`read_b`/`write_b`/`read_bu`/`write_bu`) were already correct (no
 //! multi-byte order question at 1-byte granularity).
 
+#[cfg(not(target_endian = "little"))]
+compile_error!(
+    "fn64's N64Recomp ABI storage contract requires a little-endian host: MEM_W is native-endian while MEM_H/MEM_B use ^2/^3 lane mapping"
+);
+
 /// Default N64 RDRAM capacity (8 MB, the common console configuration both
 /// ported games in `aki-recomp` target). A future multi-console config
 /// point, not a magic constant scattered through call sites.
@@ -94,6 +99,230 @@ impl RdramAddr {
     pub const fn to_kseg0(self) -> u32 {
         self.0 | 0x8000_0000
     }
+
+    /// Advance a logical guest byte address without losing its RDRAM-domain
+    /// type. Host adapters should use this instead of converting back to a
+    /// bare integer and hand-applying the `^2`/`^3` storage mapping.
+    pub const fn checked_add(self, bytes: u32) -> Option<Self> {
+        match self.0.checked_add(bytes) {
+            Some(offset) => Some(Self(offset)),
+            None => None,
+        }
+    }
+}
+
+/// Read-only view of fn64's native-word RDRAM storage.
+///
+/// The slice is the ABI-visible storage passed to generated code; addresses
+/// accepted by this type are logical guest byte addresses. Keeping that
+/// distinction in the type is the mechanism that prevents host adapters from
+/// open-coding a fourth variant of the lane mapping.
+#[derive(Clone, Copy)]
+pub struct RdramView<'a> {
+    storage: &'a [u8],
+}
+
+impl<'a> RdramView<'a> {
+    pub const fn from_storage(storage: &'a [u8]) -> Self {
+        Self { storage }
+    }
+
+    pub const fn len(self) -> usize {
+        self.storage.len()
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.storage.is_empty()
+    }
+
+    fn range(
+        self,
+        addr: RdramAddr,
+        width: usize,
+        lane_xor: usize,
+        op: &str,
+    ) -> std::ops::Range<usize> {
+        let logical = addr.offset() as usize;
+        let start = logical ^ lane_xor;
+        let end = start.checked_add(width).unwrap_or_else(|| {
+            panic!("{op}: RDRAM address overflow at logical offset {logical:#x}")
+        });
+        assert!(
+            end <= self.storage.len(),
+            "{op}: logical RDRAM range {logical:#x}..{:#x} maps outside {} storage bytes",
+            logical.saturating_add(width),
+            self.storage.len()
+        );
+        start..end
+    }
+
+    pub fn read_u32(self, addr: RdramAddr) -> u32 {
+        assert!(
+            addr.offset().is_multiple_of(4),
+            "RDRAM u32 read at unaligned logical address {:#x}",
+            addr.offset()
+        );
+        u32::from_ne_bytes(
+            self.storage[self.range(addr, 4, 0, "read_u32")]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    pub fn read_i32(self, addr: RdramAddr) -> i32 {
+        self.read_u32(addr) as i32
+    }
+
+    pub fn read_u16(self, addr: RdramAddr) -> u16 {
+        assert!(
+            addr.offset().is_multiple_of(2),
+            "RDRAM u16 read at unaligned logical address {:#x}",
+            addr.offset()
+        );
+        u16::from_ne_bytes(
+            self.storage[self.range(addr, 2, 2, "read_u16")]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    pub fn read_i16(self, addr: RdramAddr) -> i16 {
+        self.read_u16(addr) as i16
+    }
+
+    pub fn read_u8(self, addr: RdramAddr) -> u8 {
+        self.storage[self.range(addr, 1, 3, "read_u8").start]
+    }
+
+    pub fn read_i8(self, addr: RdramAddr) -> i8 {
+        self.read_u8(addr) as i8
+    }
+
+    /// Copy a device/struct byte sequence out in logical guest order.
+    pub fn copy_logical_bytes(self, addr: RdramAddr, out: &mut [u8]) {
+        for (index, byte) in out.iter_mut().enumerate() {
+            let offset = u32::try_from(index).expect("logical RDRAM copy length exceeds u32");
+            *byte = self.read_u8(
+                addr.checked_add(offset)
+                    .expect("logical RDRAM copy address overflow"),
+            );
+        }
+    }
+}
+
+/// Mutable counterpart to [`RdramView`]. All writes accept logical guest
+/// addresses and perform the one canonical native-word storage mapping.
+pub struct RdramViewMut<'a> {
+    storage: &'a mut [u8],
+}
+
+/// Typed raw-pointer form of the same storage contract for the unavoidable
+/// generated-C ABI seam. Construction and access stay unsafe because a raw
+/// pointer carries no allocation length; the lane mapping itself is still
+/// centralized and cannot be reimplemented differently by each shim.
+#[derive(Clone, Copy)]
+pub struct RdramPtr(std::ptr::NonNull<u8>);
+
+impl RdramPtr {
+    /// # Safety
+    /// `storage` must be non-null and remain valid for every logical address
+    /// subsequently accessed through the returned pointer.
+    pub unsafe fn from_storage_ptr(storage: *mut u8) -> Self {
+        Self(std::ptr::NonNull::new(storage).expect("RDRAM storage pointer must not be null"))
+    }
+
+    /// # Safety
+    /// The allocation must cover `addr.offset() ^ 3`.
+    pub unsafe fn read_u8(self, addr: RdramAddr) -> u8 {
+        unsafe { *self.0.as_ptr().add((addr.offset() ^ 3) as usize) }
+    }
+
+    /// # Safety
+    /// The allocation must cover `addr.offset() ^ 3`.
+    pub unsafe fn write_u8(self, addr: RdramAddr, value: u8) {
+        unsafe { *self.0.as_ptr().add((addr.offset() ^ 3) as usize) = value };
+    }
+
+    /// # Safety
+    /// The allocation must cover the native halfword at `addr.offset() ^ 2`.
+    pub unsafe fn read_u16(self, addr: RdramAddr) -> u16 {
+        assert!(
+            addr.offset().is_multiple_of(2),
+            "RDRAM raw u16 read at unaligned logical address {:#x}",
+            addr.offset()
+        );
+        unsafe {
+            (self.0.as_ptr().add((addr.offset() ^ 2) as usize) as *const u16).read_unaligned()
+        }
+    }
+
+    /// # Safety
+    /// The allocation must cover the native halfword at `addr.offset() ^ 2`.
+    pub unsafe fn write_u16(self, addr: RdramAddr, value: u16) {
+        assert!(
+            addr.offset().is_multiple_of(2),
+            "RDRAM raw u16 write at unaligned logical address {:#x}",
+            addr.offset()
+        );
+        unsafe {
+            (self.0.as_ptr().add((addr.offset() ^ 2) as usize) as *mut u16).write_unaligned(value)
+        };
+    }
+}
+
+impl<'a> RdramViewMut<'a> {
+    pub fn from_storage(storage: &'a mut [u8]) -> Self {
+        Self { storage }
+    }
+
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.storage.is_empty()
+    }
+
+    pub fn as_view(&self) -> RdramView<'_> {
+        RdramView::from_storage(self.storage)
+    }
+
+    pub fn write_u32(&mut self, addr: RdramAddr, value: u32) {
+        assert!(
+            addr.offset().is_multiple_of(4),
+            "RDRAM u32 write at unaligned logical address {:#x}",
+            addr.offset()
+        );
+        let range = self.as_view().range(addr, 4, 0, "write_u32");
+        self.storage[range].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    pub fn write_u16(&mut self, addr: RdramAddr, value: u16) {
+        assert!(
+            addr.offset().is_multiple_of(2),
+            "RDRAM u16 write at unaligned logical address {:#x}",
+            addr.offset()
+        );
+        let range = self.as_view().range(addr, 2, 2, "write_u16");
+        self.storage[range].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    pub fn write_u8(&mut self, addr: RdramAddr, value: u8) {
+        let index = self.as_view().range(addr, 1, 3, "write_u8").start;
+        self.storage[index] = value;
+    }
+
+    /// Copy flat device/host bytes into storage in logical guest order.
+    pub fn write_logical_bytes(&mut self, addr: RdramAddr, data: &[u8]) {
+        for (index, &byte) in data.iter().enumerate() {
+            let offset = u32::try_from(index).expect("logical RDRAM copy length exceeds u32");
+            self.write_u8(
+                addr.checked_add(offset)
+                    .expect("logical RDRAM copy address overflow"),
+                byte,
+            );
+        }
+    }
 }
 
 /// Owns the single rdram allocation. Every consumer (`fn64-abi` shims, the
@@ -151,59 +380,49 @@ impl Rdram {
     /// sign-extended (native `int32_t`, so sign is inherent, not a separate
     /// step). See this module's doc comment for why native, not big-endian.
     pub fn read_w(&self, addr: RdramAddr) -> i32 {
-        let o = addr.offset() as usize;
-        i32::from_ne_bytes(self.bytes[o..o + 4].try_into().unwrap())
+        RdramView::from_storage(&self.bytes).read_i32(addr)
     }
 
     pub fn write_w(&mut self, addr: RdramAddr, value: i32) {
-        let o = addr.offset() as usize;
-        self.bytes[o..o + 4].copy_from_slice(&value.to_ne_bytes());
+        RdramViewMut::from_storage(&mut self.bytes).write_u32(addr, value as u32);
     }
 
     /// `MEM_H`: int16_t, byte-lane XOR `offset ^ 2`, NATIVE byte order at
     /// the corrected offset, sign-extended.
     pub fn read_h(&self, addr: RdramAddr) -> i16 {
-        let o = (addr.offset() ^ 2) as usize;
-        i16::from_ne_bytes(self.bytes[o..o + 2].try_into().unwrap())
+        RdramView::from_storage(&self.bytes).read_i16(addr)
     }
 
     pub fn write_h(&mut self, addr: RdramAddr, value: i16) {
-        let o = (addr.offset() ^ 2) as usize;
-        self.bytes[o..o + 2].copy_from_slice(&value.to_ne_bytes());
+        RdramViewMut::from_storage(&mut self.bytes).write_u16(addr, value as u16);
     }
 
     /// `MEM_HU`: uint16_t, byte-lane XOR `offset ^ 2`, NATIVE byte order,
     /// zero-extended.
     pub fn read_hu(&self, addr: RdramAddr) -> u16 {
-        let o = (addr.offset() ^ 2) as usize;
-        u16::from_ne_bytes(self.bytes[o..o + 2].try_into().unwrap())
+        RdramView::from_storage(&self.bytes).read_u16(addr)
     }
 
     pub fn write_hu(&mut self, addr: RdramAddr, value: u16) {
-        let o = (addr.offset() ^ 2) as usize;
-        self.bytes[o..o + 2].copy_from_slice(&value.to_ne_bytes());
+        RdramViewMut::from_storage(&mut self.bytes).write_u16(addr, value);
     }
 
     /// `MEM_B`: int8_t, byte-lane XOR `offset ^ 3`, sign-extended.
     pub fn read_b(&self, addr: RdramAddr) -> i8 {
-        let o = (addr.offset() ^ 3) as usize;
-        self.bytes[o] as i8
+        RdramView::from_storage(&self.bytes).read_i8(addr)
     }
 
     pub fn write_b(&mut self, addr: RdramAddr, value: i8) {
-        let o = (addr.offset() ^ 3) as usize;
-        self.bytes[o] = value as u8;
+        RdramViewMut::from_storage(&mut self.bytes).write_u8(addr, value as u8);
     }
 
     /// `MEM_BU`: uint8_t, byte-lane XOR `offset ^ 3`, zero-extended.
     pub fn read_bu(&self, addr: RdramAddr) -> u8 {
-        let o = (addr.offset() ^ 3) as usize;
-        self.bytes[o]
+        RdramView::from_storage(&self.bytes).read_u8(addr)
     }
 
     pub fn write_bu(&mut self, addr: RdramAddr, value: u8) {
-        let o = (addr.offset() ^ 3) as usize;
-        self.bytes[o] = value;
+        RdramViewMut::from_storage(&mut self.bytes).write_u8(addr, value);
     }
 
     /// Raw pointer to the start of the buffer, for `fn64-abi` to hand to
@@ -248,9 +467,9 @@ impl Rdram {
     /// 4-byte group; for a partial tail it swizzles each byte to its own lane
     /// (a bare word-chunk loop would drop or misplace the leftover bytes).
     pub fn dma_write_bytes(&mut self, offset: usize, data: &[u8]) {
-        for (k, &b) in data.iter().enumerate() {
-            self.bytes[(offset + k) ^ 3] = b;
-        }
+        let addr =
+            RdramAddr::from_offset(u32::try_from(offset).expect("DMA RDRAM offset exceeds u32"));
+        RdramViewMut::from_storage(&mut self.bytes).write_logical_bytes(addr, data);
     }
 
     /// Inverse of `dma_write_bytes`: read `len` bytes out of native-word rdram
@@ -258,7 +477,11 @@ impl Rdram {
     /// For a FromRdram (save-write) DMA whose source is guest rdram. Same
     /// per-byte lane XOR, so it too is correct for any offset/length.
     pub fn dma_read_bytes_flat(&self, offset: usize, len: usize) -> Vec<u8> {
-        (0..len).map(|k| self.bytes[(offset + k) ^ 3]).collect()
+        let addr =
+            RdramAddr::from_offset(u32::try_from(offset).expect("DMA RDRAM offset exceeds u32"));
+        let mut flat = vec![0; len];
+        RdramView::from_storage(&self.bytes).copy_logical_bytes(addr, &mut flat);
+        flat
     }
 
     pub fn read_bytes(&self, offset: usize, len: usize) -> &[u8] {
@@ -328,7 +551,10 @@ mod tests {
         let fb = RdramAddr::from_offset(0x003B_5000);
         assert_eq!(fb.to_kseg0(), 0x803B_5000);
         // Inverse of from_gpr's sign-extended form must be consistent.
-        assert_eq!(RdramAddr::from_gpr(0xFFFF_FFFF_803B_5000).offset(), 0x003B_5000);
+        assert_eq!(
+            RdramAddr::from_gpr(0xFFFF_FFFF_803B_5000).offset(),
+            0x003B_5000
+        );
         // The $v0 return a shim computes (`to_kseg0() as i32 as u64`) must
         // equal what a guest MEM_W load of the same stored pointer yields
         // (i32 sign-extended into a u64 gpr) -- distinguishable from the
@@ -372,5 +598,53 @@ mod tests {
         assert_eq!(rdram.read_bu(RdramAddr::from_offset(0)), 0xFE);
         // read_b sign-extends; read_bu zero-extends -- same bits, different result.
         assert_eq!(rdram.read_b(RdramAddr::from_offset(0)), -2i8);
+    }
+
+    #[test]
+    fn one_logical_value_agrees_across_word_halfword_and_byte_accesses() {
+        let mut storage = [0u8; 8];
+        let mut view = RdramViewMut::from_storage(&mut storage);
+        view.write_u32(RdramAddr::from_offset(0), 0x1122_3344);
+        let view = view.as_view();
+
+        assert_eq!(view.read_u32(RdramAddr::from_offset(0)), 0x1122_3344);
+        assert_eq!(view.read_u16(RdramAddr::from_offset(0)), 0x1122);
+        assert_eq!(view.read_u16(RdramAddr::from_offset(2)), 0x3344);
+        assert_eq!(
+            (0..4)
+                .map(|offset| view.read_u8(RdramAddr::from_offset(offset)))
+                .collect::<Vec<_>>(),
+            [0x11, 0x22, 0x33, 0x44]
+        );
+        assert_eq!(storage[..4], [0x44, 0x33, 0x22, 0x11]);
+    }
+
+    #[test]
+    fn logical_bulk_copy_roundtrips_across_unaligned_word_boundaries() {
+        let logical = [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76];
+        let start = RdramAddr::from_offset(1);
+        let mut storage = [0u8; 12];
+        RdramViewMut::from_storage(&mut storage).write_logical_bytes(start, &logical);
+
+        let mut copied = [0u8; 7];
+        RdramView::from_storage(&storage).copy_logical_bytes(start, &mut copied);
+        assert_eq!(copied, logical);
+    }
+
+    #[test]
+    fn raw_abi_pointer_agrees_with_bounded_views() {
+        let mut storage = [0u8; 8];
+        let raw = unsafe { RdramPtr::from_storage_ptr(storage.as_mut_ptr()) };
+
+        unsafe {
+            raw.write_u16(RdramAddr::from_offset(0), 0x1234);
+            raw.write_u8(RdramAddr::from_offset(2), 0x56);
+        }
+
+        let view = RdramView::from_storage(&storage);
+        assert_eq!(view.read_u16(RdramAddr::from_offset(0)), 0x1234);
+        assert_eq!(view.read_u8(RdramAddr::from_offset(2)), 0x56);
+        assert_eq!(unsafe { raw.read_u16(RdramAddr::from_offset(0)) }, 0x1234);
+        assert_eq!(unsafe { raw.read_u8(RdramAddr::from_offset(2)) }, 0x56);
     }
 }

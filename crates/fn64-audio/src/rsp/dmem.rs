@@ -6,13 +6,13 @@
 //!
 //! The RSPRecomp codegen emits sub-word memory accesses as `RSP_MEM_B(off,
 //! base)`, `RSP_MEM_H_LOAD(off, base)`, `RSP_MEM_W_LOAD(off, base)` etc.
-//! (`rsp_recomp.cpp` lines 457-481). Its GPL runtime backs those with a DMEM
-//! byte array whose word storage is host-native-endian, so a big-endian guest
+//! Per the MIT-licensed RSPRecomp-generated C ABI and fn64-runtime's RDRAM
+//! contract, word storage is host-native-endian, so a big-endian guest
 //! byte/halfword address must be XOR-corrected onto the right lane within the
 //! little-endian-stored word — exactly the `^2` (halfword) / `^3` (byte)
 //! trick fn64-runtime's `rdram.rs` already documents and uses for main-RDRAM
 //! `MEM_*`. We replicate the SAME lane math here for the 0x1000-byte DMEM so
-//! a later port of the generated audio-ucode C lands on identical bytes.
+//! the generated audio-ucode entry points observe identical bytes.
 //!
 //! Words (`RSP_MEM_W_*`) are native-endian with NO lane XOR (word-aligned,
 //! `from_ne_bytes`); halfwords carry `^2`; bytes carry `^3` — the same three

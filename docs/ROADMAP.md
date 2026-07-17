@@ -135,37 +135,75 @@ and scope limits that make an open item meaningful.
   it before deleting anything. `scripts/wt.sh prune` is the safe tool (it
   refuses unmerged/dirty/live-job worktrees). ~35 remote branches exist total;
   most predate the rename.
-- [ ] **R5 audio out — STILL BROKEN (static + over-speed); two causes found
-  and fixed, at least one remains.** Status 2026-07-17. Do NOT treat the
-  landed fixes as closing this; the user still hears static.
+- [ ] **R5 audio out — implementation and deterministic bar complete; by-ear
+  validation still open.** Status 2026-07-17. Three coupled runtime defects
+  were measured:
+  (a) the host device rejected 32 kHz and drained at 48 kHz without conversion;
+  (b) a VI swap incorrectly ended the scheduler pump, so the following pump
+  advanced retrace before finishing same-retrace work and OoT coalesced exactly
+  one queued AudioMgr notification in three; (c) zero-filled boot RDRAM left
+  `osTvType` at PAL while the shell supplied an NTSC VI clock/retrace. Together
+  these produced either chronic underrun or a pegged/drop-oldest ring depending
+  on which partial fix was active.
 
-  FIXED + verified so far: (a) rate mismatch — the harness ladders opened
-  the stream at 48 kHz while the game produces 32 kHz with no converter, so
-  the ring starved ~1/3 of the time and the callback zero-fill was static
-  (CpalBackend now negotiates + linear-resamples producer-side); (b) the
-  AI_LEN feedback loop was severed — osAiGetLength returned a static latched
-  value, so the game could not pace production (now reports live ring depth
-  converted to guest-rate bytes; regression-tested).
+  The mechanism now makes each boundary explicit: `RetraceDrain` treats swap
+  as an observation and ends only at guest quiescence; `TvType` is a required
+  boot-harness input and seeds the IPL-owned global before thread 0; cpal
+  resamples guest rate to device rate; and the audio backend distinguishes the
+  current AI DMA (what `AI_LEN` exposes) from its host jitter prebuffer. Playback
+  starts only after the N64-equivalent two-DMA queue is primed.
 
-  NOT FIXED — the open frontier: the game STILL overproduces. Live evidence
-  (heartbeat `ring_frames`, rs+rt64 shell, 40 s): ring pegged at exactly
-  12000 frames (its 250 ms cap) from ~swap 250 to the end of the run, with
-  ~180 AI buffers per 60 VI swaps (~3 per frame, where ~1 is expected).
-  The drop-oldest ring cap then skips playback continuously = the static the
-  user hears. So the AI_LEN fix did NOT change the producer's behavior.
-  Next probes, in order: (1) confirm the guest actually CALLS osAiGetLength
-  in the rs lane (its vram 0x800D32E0 IS in the host-lookup table, but that
-  proves wiring, not calls) — log call count + returned value; (2) if it is
-  called and ignored, read decomp `AudioMgr_ThreadEntry`/`AudioMgr_HandleRetrace`
-  for what actually gates queueing (likely an osAiGetStatus AI_STATUS_FULL
-  bit, or a retrace-message cadence our VI ticker over-delivers); (3) suspect
-  the VI retrace ticker itself — if retrace messages arrive faster than
-  60 Hz, the audio thread runs its whole produce cycle too often, which
-  would ALSO explain the user-reported over-speed feel.
+  Current live rs+RT64 evidence before the host-resampler quality pass: 60.0
+  windowed retraces/sec, pump p95 about
+  5.5 ms, present about 0.6 ms, 180 AI buffers per 180 retraces after the title
+  transition, stable host depth about 2.6–3.1k frames, no overflow warning, and
+  exactly zero callback underrun samples from stream start through swap 900.
+  The live title window was inspected in `/tmp/fn64-timing-audio-fixed.png`.
+  The final working tree passed 10/10 consecutive whole-workspace nextest runs
+  (635/635 each), strict clippy, doc/layout lints, and the C/rs framebuffer
+  differential through swap 60. User listening still reported faint buzz after
+  these mechanical timing fixes, so R5 stayed open. The next measured defect was
+  the fallback host resampler: linear interpolation suppressed underruns but
+  left a measurable image near 20 kHz when converting valid ~32 kHz guest audio
+  to a 48 kHz device stream. `fn64-audio` now uses a stateful windowed-sinc
+  resampler with a spectral regression test.
+
+  Live rs+RT64 rerun after the resampler pass, optimized shell, 2026-07-17:
+  device rejected 32 kHz, opened at 48 kHz with band-limited resampling; visual
+  screenshot inspected at `/tmp/fn64-live-release-bandlimited.png` (title/horse
+  sequence coherent, no horizontal banding); foreground held 60.0 windowed Hz
+  with zero callback underruns through swap 1740; backgrounded by activating
+  Terminal and continued clean through swap 4380. Representative final window:
+  interval median/p95 16.67/17.41 ms, pump 1.49/4.84 ms, present 0.50/0.54 ms,
+  ring depth 2851 frames, `underrun_samples=0 (+0 window)`, guest/stream
+  32006/48000 Hz. Do not mark R5 complete until the user confirms the new build
+  is right by ear in foreground and background.
+
+  Follow-up after a float CoreAudio callback: the user still heard unchanged
+  crackle. That rules out the final host sample-format conversion as sufficient.
+  The current frontier is upstream PCM production: RSP audio-task replay,
+  RDRAM/DMEM byte-lane boundaries, and AI-buffer decode. `FN64_DUMP_AUDIO_TASK`
+  now accepts one-based `FN64_DUMP_AUDIO_TASK_INDEX`; task #435 was captured
+  from the live shell with normal OSTask fields and command-list shape for
+  offline replay.
+
+  Root cause found: the out-of-tree generated OoT `oot_aspmain.rs` was stale
+  relative to current fn64-audio codegen. Its not-taken conditional branches
+  inlined the delay-slot instruction and then resumed at the delay-slot label
+  (`pc+4`) instead of after it (`pc+8`), so the delay slot ran twice. In task
+  #435, generated-vs-interpreter replay first diverged at RSP DMA #8:
+  generated wrote from DMEM `0x680` while the interpreter wrote from `0x660`;
+  final RDRAM then differed inside the AI PCM buffer. Regenerating aspMain with
+  the current emitter made `/tmp/fn64-task-435-generated-default.rdram` and
+  `/tmp/fn64-task-435-interp.rdram` byte-identical (`cmp=0`). The
+  `oot-audio-ucode` build script now traps the known stale OoT generated shape,
+  and fn64-audio has a regression asserting conditional-branch fallthrough
+  skips the already-inlined delay slot.
 
   Ruled out as *sufficient* causes — each was real, each was fixed, static
   survived all of them: App Nap throttling the producer; the 48 kHz/32 kHz
-  rate mismatch; the severed AI_LEN feedback loop. The pattern to resist:
+  rate mismatch; the severed AI_LEN feedback loop; linear host resampler image
+  bands; the final host i16 callback path. The pattern to resist:
   every one of these looked like the whole answer at the time. A fourth
   plausible-and-partial cause is the expected shape of the next finding, so
   do not close R5 on a single fix that merely improves it — close it by ear,
@@ -176,10 +214,13 @@ and scope limits that make an open item meaningful.
   video both paced to it. Static is a symptom of a free-running producer; the
   over-speed feel is the same disease. Do not close R5 on quiet audio at the
   wrong speed. Close it only when BOTH hold, each with its own evidence:
-  - **Video**: VI swaps land at 60 Hz NTSC (~16.67 ms) over a long run —
-    median + p95, measured, not felt.
-  - **Audio**: ~1 AI buffer per swap, ring depth stable rather than pegged at
-    its 12000-frame cap, and right by ear (foreground AND backgrounded).
+  - **Video clock**: VI retrace ticks land at 60 Hz NTSC (~16.67 ms) over a
+    long run — windowed median + p95, measured, not felt. Do not require 60
+    framebuffer swaps/second: OoT legitimately submits a new frame every
+    three retraces in its 20 fps title/game path.
+  - **Audio**: production tracks retraces rather than framebuffer swaps, ring
+    depth is stable rather than pegged at its 12000-frame cap, and output is
+    right by ear (foreground AND backgrounded).
 
   **THE TWO CLOCKS (the thing to understand before probing).** R7 made the
   shell pace its PUMP on wall-clock — `crates/fn64-shell/src/main.rs:529`,
@@ -196,9 +237,11 @@ and scope limits that make an open item meaningful.
     flat out, so this measures COMPUTE COST, not delivery cadence. Useful as a
     budget check (rs gameplay is ~3.8 ms median, far inside 16.67), useless as
     a rate check.
-  - EXISTS: the shell's 60-swap heartbeat (`main.rs:406`) and `ring_frames`,
-    which is how the pegged-ring evidence was gathered.
-  - **BUILT + MEASURED 2026-07-17. PROBE 3 IS CONFIRMED.**
+  - EXISTS: the shell's 60-swap heartbeat and `ring_frames`, which is how the
+    pegged-ring evidence was gathered. It now also reports a bounded window's
+    retrace interval, pump, and present median/p95 plus windowed Hz; this
+    separates cumulative-rate history from the current bottleneck.
+  - **ORIGINAL MEASUREMENT 2026-07-17. PROBE 3 WAS CONFIRMED.**
     `fn64_abi::retrace_cadence()` -> `(ticks, secs, hz)` since the first tick,
     or `None` before any (never a fake 0 Hz). Counted in
     `Executor::advance_time` where ticks really fire; correlated with wall-clock
@@ -234,12 +277,25 @@ and scope limits that make an open item meaningful.
     lane is where the ucode runs and where R5's 3x was first measured. And a
     windowed (not cumulative) rate would sharpen the onset.
 
-    NEXT: find why delivery accelerates. `RetraceSchedule::advance`
-    (`fn64-runtime/src/vi.rs`) fires on GUEST VIRTUAL time and reports every
-    interval crossed; the shell advances virtual time from its idle loop
-    (`fn64-shell/src/main.rs`). As the game gets busier that relationship
-    drifts — which is the shape of an accelerating rate. Suspect the
-    virtual-time advance rule, not the interval constant.
+    **SUPERSEDED INTERMEDIATE MEASUREMENT (kept as causal evidence).**
+    Re-measured after the R8 fix, rs lane, reference renderer, no audio:
+    Commit `0611d35` closed the runaway: one wall-paced pump now advances
+    exactly one retrace interval, so the rate never accelerates above 60.
+    The new windowed probe exposes a different limit after the title path
+    begins doing one swap per three retraces:
+
+        swaps 60/120/180: interval median 16.67 ms, p95 <=18.53 ms,
+                          pump median <=0.46 ms, windowed 60.0 Hz
+        swap 240:         interval 16.82/42.59 ms median/p95,
+                          pump 0.40/42.00 ms, windowed 59.4 Hz
+        swaps 300..480:   interval median 31.23..31.73 ms,
+                          pump median 30.74..31.23 ms, windowed 31.5..32.0 Hz
+                          present median 0.50..0.51 ms
+
+    The later trace showed that this was the priority-0 idle thread being
+    resumed to the arbitrary 200,000-step cap, not render work. The typed
+    idle/quiescence boundary removed that spin; the faithful RT64 lane now has
+    pump p95 around 5.5 ms and holds 60.0 windowed retraces/sec.
 
   **A REFERENCE CAPTURE — yes, but capture it, never download it** (user
   asked 2026-07-17). A golden WAV of the intro pulled from the web is
@@ -262,7 +318,7 @@ and scope limits that make an open item meaningful.
   - **Later, for faithfulness**: once the rate is right, "does it sound
     correct" is the remaining question, and that is what a reference answers.
 
-  **START HERE — four things changed under this item on 2026-07-17:**
+  **HISTORICAL START POINT (probes below are completed; kept for provenance):**
   1. **Use the rs lane, not C.** V1a proved the C lane silently no-ops 127
      stubbed functions; if any sits on the audio path you would chase a ghost
      that exists only in the oracle. `FN64_RECOMP=rs`.
@@ -288,13 +344,18 @@ and scope limits that make an open item meaningful.
   both harness ladders replaced with one guest-rate create. Verify by ear
   (foreground + backgrounded) to close.
 
-- [ ] **R8 rdram word-swizzle is a recurring bug class, not three bugs.**
-  Surfaced a third time in the R7 shell work (green-tinted, noisy logo in the
-  window presenter); previously in DMA and framebuffer capture. Each time it
-  was fixed at the site. AGENTS.md ("mechanism over patch") wants the sweep
-  that finds the rest of the class, not a fourth one-off: every host<->rdram
-  byte-order boundary should be enumerated and typed so the next instance
-  fails to compile. Open because the fixes landed but the mechanism did not.
+- [ ] **R8 rdram word-swizzle class — implementation verified, merge pending.**
+  The fourth instance was `ReferenceBackend` writing flat big-endian RGBA5551
+  halfwords into N64Recomp's native-word RDRAM storage. The window's read was
+  serial with guest execution, so the suspected torn read was not possible.
+  The working-tree correction centralizes logical addressing in
+  `RdramView`/`RdramViewMut` plus the explicitly unsafe ABI-only `RdramPtr`;
+  all found framebuffer, DMA, controller, PCM, renderer, and diagnostic
+  boundaries use those types. `scripts/lint-rdram-layout.py` rejects new
+  production manual lane XOR/raw writes. Evidence: live before/after window
+  screenshots inspected, 10/10 integrated deterministic runs, 630/630
+  workspace tests, strict clippy, and C/rs parity across 58 captured frames
+  through swap 60. Mark `[x]` only once this working tree is merged.
 
 ## Phase D — fn64 owns discover → decomp
 

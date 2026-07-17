@@ -43,6 +43,10 @@ pub unsafe extern "C" fn osAiSetFrequency_recomp(_rdram: *mut u8, ctx: *mut Reco
 
 thread_local! {
     static AI_FREQUENCY: Cell<u32> = const { Cell::new(0) };
+    static AI_STATUS_READS: Cell<u64> = const { Cell::new(0) };
+    static AI_STATUS_BUSY_RETURNS: Cell<u64> = const { Cell::new(0) };
+    static AI_LENGTH_READS: Cell<u64> = const { Cell::new(0) };
+    static AI_LENGTH_LAST: Cell<u32> = const { Cell::new(0) };
     /// AI/VI/PI/SI/SP/DP/MI hardware-register model (`fn64_runtime::mmio`).
     /// Backs both the shim-level `osAi*` family below AND (via
     /// `sync_mmio_into_rdram`, called from `boot_thread0`/before each
@@ -84,16 +88,26 @@ pub unsafe fn sync_mmio_into_rdram(rdram: *mut u8) {
 pub unsafe extern "C" fn osAiGetStatus_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     let status = MMIO.with(|cell| cell.borrow_mut().ai.status());
+    AI_STATUS_READS.with(|cell| cell.set(cell.get() + 1));
+    if status & fn64_runtime::AI_STATUS_BUSY != 0 {
+        AI_STATUS_BUSY_RETURNS.with(|cell| cell.set(cell.get() + 1));
+    }
     ctx.r2 = status as u64;
+}
+
+pub fn ai_status_stats() -> (u64, u64) {
+    (
+        AI_STATUS_READS.with(Cell::get),
+        AI_STATUS_BUSY_RETURNS.with(Cell::get),
+    )
 }
 
 /// `osAiGetLength() -> u32` -- no arguments; real hardware `AI_LEN` register
 /// read (bytes remaining in the current/last DMA, counting DOWN as the DAC
 /// drains). When a live audio backend exists, this reports the REAL
-/// drain-aware backlog (`task_dispatch::audio_remaining_guest_bytes`) --
-/// games pace audio production off this readback (OoT's AudioMgr skips
-/// queueing when enough is buffered), so a static latched value makes the
-/// audio thread free-run and overproduce. Without a backend (headless
+/// drain-aware current-DMA length
+/// (`task_dispatch::audio_remaining_guest_bytes`). Host playback prebuffer
+/// is not part of AI_LEN. Without a backend (headless
 /// probes with audio off), the latched-register model remains, per
 /// `AiRegs::length`'s no-fabricated-value stance.
 ///
@@ -104,7 +118,16 @@ pub unsafe extern "C" fn osAiGetLength_recomp(_rdram: *mut u8, ctx: *mut RecompC
     let ctx = unsafe { &mut *ctx };
     let len = crate::task_dispatch::audio_remaining_guest_bytes()
         .unwrap_or_else(|| MMIO.with(|cell| cell.borrow().ai.length()));
+    AI_LENGTH_READS.with(|cell| cell.set(cell.get() + 1));
+    AI_LENGTH_LAST.with(|cell| cell.set(len));
     ctx.r2 = len as u64;
+}
+
+pub fn ai_length_stats() -> (u64, u32) {
+    (
+        AI_LENGTH_READS.with(Cell::get),
+        AI_LENGTH_LAST.with(Cell::get),
+    )
 }
 
 /// `osAiSetNextBuffer(void *buf, u32 size) -> s32` -- `buf`=`ctx->r4` (an
@@ -401,15 +424,12 @@ mod tests {
         );
     }
 
-    /// With a live backend that knows its stream rate, osAiGetLength must
-    /// report the REAL backlog converted to guest-rate bytes (the hardware
-    /// AI_LEN feedback loop games pace audio production with) -- and fall
-    /// back to the latched register model when the game has not set a DAC
-    /// rate. Fails against the free-running bug (static latched readback).
+    /// With a live backend, osAiGetLength reports only the current emulated
+    /// DMA's remaining guest bytes, never the host playback prebuffer.
     #[test]
     fn os_ai_get_length_reports_drain_aware_guest_bytes() {
         struct RingBackend {
-            frames: u32,
+            dma_bytes: u32,
         }
         impl AudioBackend for RingBackend {
             fn create(
@@ -422,35 +442,23 @@ mod tests {
                 Ok(())
             }
             fn frames_remaining(&self) -> Result<u32, fn64_audio::AudioError> {
-                Ok(self.frames)
+                Ok(4800)
             }
             fn set_frequency(&mut self, _sample_rate_hz: u32) {}
             fn stream_rate_hz(&self) -> Option<u32> {
                 Some(48_000)
             }
+            fn current_dma_bytes_remaining(&self) -> Option<u32> {
+                Some(self.dma_bytes)
+            }
         }
 
-        crate::set_audio_backend(Box::new(RingBackend { frames: 4800 }), 4096);
-        crate::task_dispatch::AUDIO_GUEST_RATE.with(|cell| cell.set(0));
-
-        // No DAC rate set yet -> latched model (0 here: nothing latched).
-        let mut ctx = ctx_zeroed();
-        ctx.r2 = 0xDEAD;
-        unsafe { osAiGetLength_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
-        let latched = ctx.r2;
-
-        // Set the DAC rate through the real shim (stores + forwards 32006).
-        let mut ctx = ctx_with(32_000, 0, 0);
-        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
-
-        // 4800 stream frames @48k -> 4800 * 32006 / 48000 = 3200 guest
-        // frames (integer division) -> 12803 -> *4 bytes = 12802*... compute
-        // exactly: 4800*32006/48000 = 3200.6 -> 3200 frames -> 12800 bytes.
+        crate::set_audio_backend(Box::new(RingBackend { dma_bytes: 1536 }), 4096);
         let mut ctx = ctx_zeroed();
         unsafe { osAiGetLength_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
         assert_eq!(
-            ctx.r2, 12800,
-            "live backlog must convert stream frames to guest-rate bytes              (latched fallback was {latched})"
+            ctx.r2, 1536,
+            "AI_LEN must not expose the backend's unrelated 4800-frame host prebuffer"
         );
     }
 }

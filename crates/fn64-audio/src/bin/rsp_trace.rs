@@ -20,62 +20,44 @@ fn read_words(path: &str) -> Vec<u32> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = &args[1];
-    let base: u32 = args
-        .get(3)
-        .map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap())
-        .unwrap_or(0x1000);
-    let cap: u64 = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(2000);
-    let words = read_words(path);
-    let n = words.len();
-
-    let mut rdram = vec![0u8; 0x0080_0000];
-    // Native-endian OSTask (fn64 rdram is native-endian word storage).
-    let put_w = |rd: &mut [u8], off: usize, v: u32| {
-        rd[off..off + 4].copy_from_slice(&v.to_ne_bytes());
-    };
-    let task = 0x2000usize;
-    let ucode_data = 0x3000usize;
-    let cmd_list = 0x5000usize;
-    let src_pcm = 0x6000usize;
-
-    // Seed the real DMEM data image (jump table) from ASPMAIN_DATA if provided.
-    // The incbin is big-endian (ROM order); in the live game it reaches rdram
-    // via the C runtime's `^3`-swizzled DMA (fn64 rdram is native-endian word
-    // storage). Replicate that `^3` swizzle so the RSP's `^2`/`^3` DMEM
-    // accessors read the jump table on the correct lanes.
-    if let Some(dp) = std::env::var_os("ASPMAIN_DATA") {
-        let d = std::fs::read(&dp).unwrap();
-        for (k, &b) in d.iter().enumerate() {
-            rdram[(ucode_data + k) ^ 3] = b;
-        }
-        put_w(&mut rdram, task + 0x1C, d.len() as u32);
+    let (words, mut rdram, task, base, cap) = if args.get(1).is_some_and(|s| s == "--task-dump") {
+        let path = args
+            .get(2)
+            .expect("usage: rsp_trace --task-dump rdram meta [cap]");
+        let meta = args
+            .get(3)
+            .expect("usage: rsp_trace --task-dump rdram meta [cap]");
+        let cap = args.get(4).map(|s| s.parse().unwrap()).unwrap_or(1_000_000);
+        let rdram = std::fs::read(path).unwrap();
+        let task = read_task_offset(meta) as usize;
+        let ucode = (read_native_u32(&rdram, task + 0x10) & 0x00FF_FFFF) as usize;
+        let ucode_size = read_native_u32(&rdram, task + 0x14) as usize;
+        let words = (0..ucode_size)
+            .step_by(4)
+            .map(|offset| read_guest_u32(&rdram, ucode + offset))
+            .collect();
+        (words, rdram, task, 0x1000, cap)
     } else {
-        put_w(&mut rdram, task + 0x1C, 0x0800);
-    }
-    // Nonzero source PCM ramp.
-    for i in 0..0x100usize {
-        rdram[src_pcm + i] = (i as u8).wrapping_add(1) | 0x40;
-    }
-    // A_LOADBUFF (20) then A_SAVEBUFF (21), 0x100 bytes through DMEM 0x0A0.
-    let cmds: [u32; 4] = [
-        (20u32 << 24) | ((0x100u32 >> 4) << 16) | 0x0A0,
-        src_pcm as u32,
-        (21u32 << 24) | ((0x100u32 >> 4) << 16) | 0x0A0,
-        0x7000u32,
-    ];
-    for (i, &w) in cmds.iter().enumerate() {
-        put_w(&mut rdram, cmd_list + i * 4, w);
-    }
-    put_w(&mut rdram, task + 0x18, ucode_data as u32); // ucode_data
-    put_w(&mut rdram, task + 0x30, cmd_list as u32); // data_ptr
-    put_w(&mut rdram, task + 0x34, (cmds.len() * 4) as u32); // data_size
+        let path = &args[1];
+        let base: u32 = args
+            .get(3)
+            .map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap())
+            .unwrap_or(0x1000);
+        let cap: u64 = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(2000);
+        let words = read_words(path);
+
+        let mut rdram = vec![0u8; 0x0080_0000];
+        seed_synthetic_task(&mut rdram);
+        (words, rdram, 0x2000usize, base, cap)
+    };
+    let n = words.len();
 
     let mut m = RspMachine::new(&mut rdram);
     for i in 0..0x40usize {
         m.dmem.as_bytes_mut()[0xFC0 + i] = m.rdram[task + i];
     }
     // DMA the ucode_data image (0xF80 bytes) into DMEM 0x0000.
+    let ucode_data = (read_native_u32(m.rdram, task + 0x18) & 0x00FF_FFFF) as usize;
     for i in 0..0xF80usize {
         m.dmem.as_bytes_mut()[i] = m.rdram.get(ucode_data + i).copied().unwrap_or(0);
     }
@@ -328,6 +310,75 @@ fn main() {
     for (p, c) in hot.iter().take(20) {
         println!("  0x{p:04X}: {c} visits");
     }
+    if let Some(path) = std::env::var_os("RSP_TRACE_WRITE_RDRAM") {
+        std::fs::write(&path, m.rdram).unwrap();
+        println!("wrote_rdram={path:?}");
+    }
+}
+
+fn seed_synthetic_task(rdram: &mut [u8]) {
+    // Native-endian OSTask (fn64 rdram is native-endian word storage).
+    let put_w = |rd: &mut [u8], off: usize, v: u32| {
+        rd[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+    };
+    let task = 0x2000usize;
+    let ucode_data = 0x3000usize;
+    let cmd_list = 0x5000usize;
+    let src_pcm = 0x6000usize;
+
+    // Seed the real DMEM data image (jump table) from ASPMAIN_DATA if provided.
+    // The incbin is big-endian (ROM order); in the live game it reaches rdram
+    // via generated `^3`-swizzled DMA into fn64's native-word storage. Replicate
+    // that lane mapping so the RSP's DMEM accessors read the jump table.
+    if let Some(dp) = std::env::var_os("ASPMAIN_DATA") {
+        let d = std::fs::read(&dp).unwrap();
+        for (k, &b) in d.iter().enumerate() {
+            rdram[(ucode_data + k) ^ 3] = b;
+        }
+        put_w(rdram, task + 0x1C, d.len() as u32);
+    } else {
+        put_w(rdram, task + 0x1C, 0x0800);
+    }
+    // Nonzero source PCM ramp.
+    for i in 0..0x100usize {
+        rdram[src_pcm + i] = (i as u8).wrapping_add(1) | 0x40;
+    }
+    // A_LOADBUFF (20) then A_SAVEBUFF (21), 0x100 bytes through DMEM 0x0A0.
+    let cmds: [u32; 4] = [
+        (20u32 << 24) | ((0x100u32 >> 4) << 16) | 0x0A0,
+        src_pcm as u32,
+        (21u32 << 24) | ((0x100u32 >> 4) << 16) | 0x0A0,
+        0x7000u32,
+    ];
+    for (i, &w) in cmds.iter().enumerate() {
+        put_w(rdram, cmd_list + i * 4, w);
+    }
+    put_w(rdram, task + 0x18, ucode_data as u32); // ucode_data
+    put_w(rdram, task + 0x30, cmd_list as u32); // data_ptr
+    put_w(rdram, task + 0x34, (cmds.len() * 4) as u32); // data_size
+}
+
+fn read_task_offset(path: &str) -> u32 {
+    let meta = std::fs::read_to_string(path).unwrap();
+    for line in meta.lines() {
+        if let Some(value) = line.strip_prefix("task_offset=") {
+            return value.parse().unwrap();
+        }
+    }
+    panic!("{path} does not contain task_offset=");
+}
+
+fn read_native_u32(rdram: &[u8], offset: usize) -> u32 {
+    u32::from_ne_bytes(rdram[offset..offset + 4].try_into().unwrap())
+}
+
+fn read_guest_u32(rdram: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes([
+        rdram[offset ^ 3],
+        rdram[(offset + 1) ^ 3],
+        rdram[(offset + 2) ^ 3],
+        rdram[(offset + 3) ^ 3],
+    ])
 }
 
 fn run_delay(

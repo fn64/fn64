@@ -184,7 +184,12 @@ fn mixed_oracle(actor_ptr: u32, actor_f: f32, hword: i16) -> (u64, u32, u64) {
 /// Normalize whitespace so trailing-newline / indentation differences don't
 /// make the golden comparison brittle.
 fn norm(s: &str) -> String {
-    s.lines().map(str::trim_end).collect::<Vec<_>>().join("\n").trim_end().to_string()
+    s.lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string()
 }
 
 /// The emitter, run with the symbol-table resolver, must still produce exactly
@@ -196,7 +201,11 @@ fn norm(s: &str) -> String {
 fn emitter_output_matches_mixed_golden() {
     let symbols = SymbolTable::from_entries([("Math_StepToF", MATH_STEPTOF_VRAM)]);
     let out = emit_function_resolved(
-        &FuncInput { name: "bg_breakwall_lava_cover_move", vram: VRAM, words: &WORDS },
+        &FuncInput {
+            name: "bg_breakwall_lava_cover_move",
+            vram: VRAM,
+            words: &WORDS,
+        },
         &symbols,
     );
     assert_eq!(
@@ -307,26 +316,131 @@ fn decode_table_has_no_slot_collisions() {
     // (raw word, expected decoded op) — ground-truth assembled encodings.
     let cases: &[(u32, Instruction)] = &[
         // SPECIAL funct 0x2C..0x2F: doubleword ALU register.
-        (0x00a6202c, Dadd { rd: 4, rs: 5, rt: 6 }),
-        (0x00a6202d, Daddu { rd: 4, rs: 5, rt: 6 }),
-        (0x00a6202e, Dsub { rd: 4, rs: 5, rt: 6 }),
-        (0x00a6202f, Dsubu { rd: 4, rs: 5, rt: 6 }),
+        (
+            0x00a6202c,
+            Dadd {
+                rd: 4,
+                rs: 5,
+                rt: 6,
+            },
+        ),
+        (
+            0x00a6202d,
+            Daddu {
+                rd: 4,
+                rs: 5,
+                rt: 6,
+            },
+        ),
+        (
+            0x00a6202e,
+            Dsub {
+                rd: 4,
+                rs: 5,
+                rt: 6,
+            },
+        ),
+        (
+            0x00a6202f,
+            Dsubu {
+                rd: 4,
+                rs: 5,
+                rt: 6,
+            },
+        ),
         // main-opcode 0x2C/0x2D: SDL/SDR (a DIFFERENT table from SPECIAL funct).
-        (0xb0a40008, Sdl { rt: 4, base: 5, off: 8 }),
-        (0xb4a40008, Sdr { rt: 4, base: 5, off: 8 }),
+        (
+            0xb0a40008,
+            Sdl {
+                rt: 4,
+                base: 5,
+                off: 8,
+            },
+        ),
+        (
+            0xb4a40008,
+            Sdr {
+                rt: 4,
+                base: 5,
+                off: 8,
+            },
+        ),
         // main-opcode 0x2F: CACHE — must NOT be confused with SPECIAL funct
         // 0x2F (DSUBU) above.
-        (0xbca20008, Cache { op: 2, base: 5, off: 8 }),
+        (
+            0xbca20008,
+            Cache {
+                op: 2,
+                base: 5,
+                off: 8,
+            },
+        ),
         // main-opcode doubleword mem.
-        (0xdca40008, Ld { rt: 4, base: 5, off: 8 }),
-        (0xfca40008, Sd { rt: 4, base: 5, off: 8 }),
-        (0xd0a40008, Lld { rt: 4, base: 5, off: 8 }),
-        (0xf0a40008, Scd { rt: 4, base: 5, off: 8 }),
+        (
+            0xdca40008,
+            Ld {
+                rt: 4,
+                base: 5,
+                off: 8,
+            },
+        ),
+        (
+            0xfca40008,
+            Sd {
+                rt: 4,
+                base: 5,
+                off: 8,
+            },
+        ),
+        (
+            0xd0a40008,
+            Lld {
+                rt: 4,
+                base: 5,
+                off: 8,
+            },
+        ),
+        (
+            0xf0a40008,
+            Scd {
+                rt: 4,
+                base: 5,
+                off: 8,
+            },
+        ),
         // COP1 loads/stores (distinct dedicated main opcodes).
-        (0xc4a40008, Lwc1 { ft: 4, base: 5, off: 8 }),
-        (0xd4a40008, Ldc1 { ft: 4, base: 5, off: 8 }),
-        (0xe4a40008, Swc1 { ft: 4, base: 5, off: 8 }),
-        (0xf4a40008, Sdc1 { ft: 4, base: 5, off: 8 }),
+        (
+            0xc4a40008,
+            Lwc1 {
+                ft: 4,
+                base: 5,
+                off: 8,
+            },
+        ),
+        (
+            0xd4a40008,
+            Ldc1 {
+                ft: 4,
+                base: 5,
+                off: 8,
+            },
+        ),
+        (
+            0xe4a40008,
+            Swc1 {
+                ft: 4,
+                base: 5,
+                off: 8,
+            },
+        ),
+        (
+            0xf4a40008,
+            Sdc1 {
+                ft: 4,
+                base: 5,
+                off: 8,
+            },
+        ),
         // SPECIAL traps / sync (cop0 family) — distinct SPECIAL functs.
         (0x0000000c, Syscall { code: 0 }),
         (0x0000000d, Break { code: 0 }),

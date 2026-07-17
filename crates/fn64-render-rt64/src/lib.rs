@@ -103,6 +103,7 @@ pub struct ReferenceBackend {
     /// Counts every gfx task this backend processes, independent of
     /// `auto_dump` being configured, so `FN64_GFX_TASK_DUMP` selects the same
     /// task index whether or not PNG auto-dumping is on.
+    #[cfg(not(test))]
     diag_task_index: u64,
 }
 
@@ -129,6 +130,7 @@ impl ReferenceBackend {
             clear_color: [0, 0, 0, 255],
             decode_mode: DecodeMode::Simple,
             auto_dump: None,
+            #[cfg(not(test))]
             diag_task_index: 0,
         }
     }
@@ -273,7 +275,9 @@ impl RenderBackend for ReferenceBackend {
             if let Some(spec) = std::env::var_os("FN64_GFX_TASK_DUMP") {
                 let selected = spec.to_string_lossy().split(',').any(|entry| {
                     entry.trim().parse::<u64>().unwrap_or_else(|error| {
-                        panic!("FN64_GFX_TASK_DUMP entry {entry:?} is not a u64 task index: {error}")
+                        panic!(
+                            "FN64_GFX_TASK_DUMP entry {entry:?} is not a u64 task index: {error}"
+                        )
                     }) == dump_index
                 });
                 if selected {
@@ -348,11 +352,9 @@ impl RenderBackend for ReferenceBackend {
         // offset as `output_addr`; `0` means "no known color target" (a
         // fixture/test path) and we skip the write-back.
         //
-        // Format (byte-cited): RGBA5551, 16-bit, big-endian halfwords, exactly
-        // matching `examples/oot-boot/src/main.rs`'s `dump_rgba5551_as_png`
-        // (`u16::from_be_bytes`, r5=px>>11, g5=px>>6, b5=px>>1, a1=px&1). The
-        // VI/harness reads the framebuffer as 2-byte big-endian RGBA5551, so
-        // we store each pixel's halfword big-endian to match.
+        // Format: logical RGBA5551 halfwords written through fn64-runtime's
+        // canonical RDRAM view. The view owns the ABI's native-word storage
+        // mapping; this renderer never applies `^2` or byte order by hand.
         if output_addr != 0 {
             write_rgba5551_framebuffer(rdram, output_addr as usize, fb);
         }
@@ -429,15 +431,10 @@ impl RenderBackend for ReferenceBackend {
 }
 
 /// Convert `fb`'s RGBA8888 pixels to N64 RGBA5551 and write them into
-/// `rdram` starting at byte offset `start`, in the framebuffer's native
-/// on-DRAM layout: 2 bytes per pixel, big-endian halfword, row-major,
-/// top-left origin. This is the exact inverse of
-/// `examples/oot-boot/src/main.rs`'s `dump_rgba5551_as_png`, which reads the
-/// framebuffer back as `u16::from_be_bytes([b0, b1])` with `r5 = px >> 11`,
-/// `g5 = px >> 6`, `b5 = px >> 1`, `a1 = px & 1` -- the same layout the VI
-/// scans out. Storing the halfword big-endian (high byte at `start+2i`, low
-/// at `start+2i+1`) makes the VI-presented frame match what the backend
-/// rasterized. A pixel whose 2 bytes would run past `rdram` is skipped
+/// `rdram` starting at logical byte offset `start`, row-major with a top-left
+/// origin. [`fn64_runtime::RdramViewMut`] is the sole translation from those
+/// logical halfwords to N64Recomp's native-word ABI storage. A pixel whose 2
+/// bytes would run past `rdram` is skipped
 /// (bounds-safe; the caller already validated `output_addr` is a real
 /// framebuffer offset, but a wrong width/height must not panic).
 ///
@@ -449,9 +446,22 @@ fn write_rgba5551_framebuffer(rdram: &mut [u8], start: usize, fb: &Framebuffer) 
     // The framebuffer format is a fixed 2 bytes/pixel; only write pixels the
     // fb actually has AND that fit within rdram.
     let to_5 = |c: u8| -> u16 { ((c as u16 * 31 + 127) / 255) & 0x1F };
+    let start = fn64_runtime::RdramAddr::from_offset(
+        u32::try_from(start).expect("framebuffer RDRAM offset exceeds u32"),
+    );
+    assert!(
+        start.offset().is_multiple_of(4),
+        "RGBA5551 framebuffer base must be word-aligned, got {:#x}",
+        start.offset()
+    );
+    let mut view = fn64_runtime::RdramViewMut::from_storage(rdram);
     for i in 0..px_count {
-        let dst = start + i * 2;
-        if dst + 2 > rdram.len() {
+        let byte_offset = u32::try_from(i.checked_mul(2).expect("framebuffer size overflow"))
+            .expect("framebuffer byte offset exceeds u32");
+        let Some(dst) = start.checked_add(byte_offset) else {
+            break;
+        };
+        if dst.offset() as usize + 2 > view.len() {
             break;
         }
         let src = i * 4;
@@ -461,10 +471,7 @@ fn write_rgba5551_framebuffer(rdram: &mut [u8], start: usize, fb: &Framebuffer) 
         let a = fb.pixels[src + 3];
         let px: u16 =
             (to_5(r) << 11) | (to_5(g) << 6) | (to_5(b) << 1) | (if a != 0 { 1 } else { 0 });
-        // Big-endian halfword, matching capture_framebuffer's from_be_bytes.
-        let [hi, lo] = px.to_be_bytes();
-        rdram[dst] = hi;
-        rdram[dst + 1] = lo;
+        view.write_u16(dst, px);
     }
 }
 
@@ -690,5 +697,32 @@ mod tests {
         assert_eq!(dump.skip_before_task, 4_180);
         assert_eq!(dump.written, 0);
         assert_eq!(dump.limit, 3);
+    }
+
+    #[test]
+    fn framebuffer_writer_and_runtime_view_agree_on_logical_pixel_order() {
+        let mut framebuffer = Framebuffer::new(2, 1);
+        framebuffer.pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        framebuffer.pixels[4..8].copy_from_slice(&[0, 0, 255, 255]);
+        let mut storage = [0u8; 4];
+
+        write_rgba5551_framebuffer(&mut storage, 0, &framebuffer);
+
+        let view = fn64_runtime::RdramView::from_storage(&storage);
+        assert_eq!(
+            view.read_u16(fn64_runtime::RdramAddr::from_offset(0)),
+            0xF801,
+            "pixel 0 must be logical RGBA5551 red"
+        );
+        assert_eq!(
+            view.read_u16(fn64_runtime::RdramAddr::from_offset(2)),
+            0x003F,
+            "pixel 1 must be logical RGBA5551 blue"
+        );
+        assert_eq!(
+            storage,
+            [0x3F, 0x00, 0x01, 0xF8],
+            "native-word storage must contain the two logical halfwords in lane-mapped order"
+        );
     }
 }

@@ -27,6 +27,9 @@ use crate::rsp::context::{RspContext, RspExitReason};
 use crate::rsp::decode::{VLoadOp, VStoreOp};
 use crate::rsp::dmem::{Dmem, DMEM_SIZE};
 use crate::rsp::vu::{Vec8, VuState, LANES};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static DMA_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The full RSP machine state the recompiled ucode runs against: scalar regs
 /// + DMA context (in [`RspContext`]), the 4 KiB DMEM, and the VU state.
@@ -545,6 +548,16 @@ impl<'a> RspMachine<'a> {
         let (line_len, lines, skip) = decode_dma_length(len);
         let mut dram = self.ctx.dma_dram_address as usize & 0x00FF_FFF8;
         let mut mem = self.ctx.dma_mem_address as usize & (DMEM_SIZE - 8);
+        trace_dma(DmaTrace {
+            direction: "read",
+            dram,
+            mem,
+            descriptor: len,
+            line_len,
+            lines,
+            skip,
+            checksum: checksum_rdram(self.rdram, dram, line_len, lines, skip),
+        });
         for _ in 0..lines {
             for i in 0..line_len {
                 if let Some(&b) = self.rdram.get(dram + i) {
@@ -565,6 +578,16 @@ impl<'a> RspMachine<'a> {
         let (line_len, lines, skip) = decode_dma_length(len);
         let mut dram = self.ctx.dma_dram_address as usize & 0x00FF_FFF8;
         let mut mem = self.ctx.dma_mem_address as usize & (DMEM_SIZE - 8);
+        trace_dma(DmaTrace {
+            direction: "write",
+            dram,
+            mem,
+            descriptor: len,
+            line_len,
+            lines,
+            skip,
+            checksum: checksum_dmem(&self.dmem, mem, line_len, lines),
+        });
         for _ in 0..lines {
             for i in 0..line_len {
                 if let Some(dst) = self.rdram.get_mut(dram + i) {
@@ -599,6 +622,67 @@ fn decode_dma_length(value: u32) -> (usize, usize, usize) {
     let lines = (((value >> 12) & 0xFF) + 1) as usize;
     let skip = ((value >> 20) & 0x0FFF) as usize;
     (line_len, lines, skip)
+}
+
+struct DmaTrace {
+    direction: &'static str,
+    dram: usize,
+    mem: usize,
+    descriptor: u32,
+    line_len: usize,
+    lines: usize,
+    skip: usize,
+    checksum: u64,
+}
+
+fn trace_dma(trace: DmaTrace) {
+    if std::env::var_os("RSP_TRACE_DMA").is_none() {
+        return;
+    }
+    let seq = DMA_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let DmaTrace {
+        direction,
+        dram,
+        mem,
+        descriptor,
+        line_len,
+        lines,
+        skip,
+        checksum,
+    } = trace;
+    eprintln!(
+        "[fn64-audio/rsp] dma#{seq} {direction} dram=0x{dram:06x} mem=0x{mem:03x} desc=0x{descriptor:08x} line_len={line_len} lines={lines} skip={skip} checksum=0x{checksum:016x}"
+    );
+}
+
+fn checksum_rdram(
+    rdram: &[u8],
+    mut dram: usize,
+    line_len: usize,
+    lines: usize,
+    skip: usize,
+) -> u64 {
+    let mut checksum = 0xcbf2_9ce4_8422_2325u64;
+    for _ in 0..lines {
+        for i in 0..line_len {
+            checksum ^= u64::from(rdram.get(dram + i).copied().unwrap_or(0));
+            checksum = checksum.wrapping_mul(0x100_0000_01b3);
+        }
+        dram = dram.wrapping_add(line_len + skip);
+    }
+    checksum
+}
+
+fn checksum_dmem(dmem: &Dmem, mut mem: usize, line_len: usize, lines: usize) -> u64 {
+    let mut checksum = 0xcbf2_9ce4_8422_2325u64;
+    for _ in 0..lines {
+        for i in 0..line_len {
+            checksum ^= u64::from(dmem.as_bytes()[(mem + i) & (DMEM_SIZE - 1)]);
+            checksum = checksum.wrapping_mul(0x100_0000_01b3);
+        }
+        mem = (mem + line_len) & (DMEM_SIZE - 1);
+    }
+    checksum
 }
 
 /// Convert an 8-lane big-endian vector register into its 16-byte image (lane
@@ -714,6 +798,46 @@ mod tests {
     }
 
     #[test]
+    fn dma_read_preserves_guest_byte_order_between_native_word_stores() {
+        let mut rdram = vec![0u8; 0x1000];
+        write_rdram_word(&mut rdram, 0x200, 0xAABB_CCDD);
+        write_rdram_word(&mut rdram, 0x204, 0x1122_3344);
+
+        let mut m = RspMachine::new(&mut rdram);
+        m.set_dma_dram(0x200);
+        m.set_dma_mem(0x080);
+        assert_eq!(m.dma_read(7), None);
+
+        assert_eq!(m.load_w(0x080), 0xAABB_CCDD);
+        assert_eq!(m.load_hu(0x080), 0xAABB);
+        assert_eq!(m.load_hu(0x082), 0xCCDD);
+        assert_eq!(
+            [0x080, 0x081, 0x082, 0x083].map(|addr| m.load_bu(addr) as u8),
+            [0xAA, 0xBB, 0xCC, 0xDD],
+            "raw DMA is correct only if RSP DMEM and RDRAM expose the same logical byte order"
+        );
+    }
+
+    #[test]
+    fn dma_write_preserves_guest_byte_order_for_rdram_consumers() {
+        let mut rdram = vec![0u8; 0x1000];
+        let mut m = RspMachine::new(&mut rdram);
+        m.store_w(0x080, 0x7F01_80FF);
+        m.store_w(0x084, 0x1234_FEDC);
+        m.set_dma_mem(0x080);
+        m.set_dma_dram(0x200);
+        m.dma_write(7);
+
+        assert_eq!(read_rdram_i16(m.rdram, 0x200), 0x7F01);
+        assert_eq!(read_rdram_i16(m.rdram, 0x202) as u16, 0x80FF);
+        assert_eq!(
+            [0x200, 0x201, 0x202, 0x203].map(|addr| read_rdram_u8(m.rdram, addr)),
+            [0x7F, 0x01, 0x80, 0xFF],
+            "AI/RDRAM readers must observe the PCM bytes in guest order after RSP DMA write"
+        );
+    }
+
+    #[test]
     fn dma_read_into_imem_signals_overlay_swap() {
         let mut rdram = vec![0u8; 0x1000];
         let mut m = RspMachine::new(&mut rdram);
@@ -775,6 +899,19 @@ mod tests {
         );
         assert_eq!(m.read_cp0(5), 0);
         assert_eq!(m.read_cp0(6), 0);
+    }
+
+    fn write_rdram_word(rdram: &mut [u8], offset: usize, value: u32) {
+        rdram[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn read_rdram_i16(rdram: &[u8], offset: usize) -> i16 {
+        let o = offset ^ 2;
+        i16::from_ne_bytes([rdram[o], rdram[o + 1]])
+    }
+
+    fn read_rdram_u8(rdram: &[u8], offset: usize) -> u8 {
+        rdram[offset ^ 3]
     }
 
     #[test]

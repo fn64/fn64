@@ -12,6 +12,8 @@
 //! (wgpu's `Rgba8UnormSrgb` texture) wants a tightly-packed RGBA8888 buffer,
 //! one byte each R,G,B,A in that order. This converts one into the other.
 
+use fn64_runtime::{RdramAddr, RdramView};
+
 /// N64 low-res NTSC framebuffer dimensions. Matches oot-boot's
 /// `capture_framebuffer` assumption; this shell does not yet decode the
 /// ROM's real `OSViMode` mode table (same limitation `fn64_runtime::vi`
@@ -37,16 +39,21 @@ fn expand5(v: u16) -> u8 {
 /// (e.g. a truncated capture near an rdram bound), the missing pixels are
 /// left black rather than reading out of bounds. Returns the number of
 /// source pixels actually converted.
-pub fn rgba5551_to_rgba8888(src: &[u8], dst: &mut [u8]) -> usize {
+pub fn rgba5551_to_rgba8888(rdram: RdramView<'_>, start: RdramAddr, dst: &mut [u8]) -> usize {
     debug_assert_eq!(dst.len(), FB_WIDTH * FB_HEIGHT * 4);
-    // Whole words only: the `^ 2` byte-lane rule pairs halfwords within a
-    // 4-byte word, so a trailing 2-byte remnant has no in-bounds partner.
-    let pixels = ((src.len() / 4) * 2).min(FB_WIDTH * FB_HEIGHT);
+    assert!(
+        start.offset().is_multiple_of(4),
+        "RGBA5551 framebuffer base must be word-aligned, got {:#x}",
+        start.offset()
+    );
+    let available = rdram.len().saturating_sub(start.offset() as usize);
+    let pixels = ((available / 4) * 2).min(FB_WIDTH * FB_HEIGHT);
     for i in 0..pixels {
-        // Pixel `i` lives at `(2*i) ^ 2` in native-word rdram storage (the
-        // caller passes a word-aligned framebuffer slice), read native-endian.
-        let at = (i * 2) ^ 2;
-        let px = u16::from_ne_bytes([src[at], src[at + 1]]);
+        let byte_offset = u32::try_from(i * 2).expect("framebuffer byte offset exceeds u32");
+        let addr = start
+            .checked_add(byte_offset)
+            .expect("framebuffer logical address overflow");
+        let px = rdram.read_u16(addr);
         let r5 = (px >> 11) & 0x1F;
         let g5 = (px >> 6) & 0x1F;
         let b5 = (px >> 1) & 0x1F;
@@ -73,6 +80,15 @@ pub fn is_uniform(region: &[u8]) -> bool {
     }
 }
 
+/// Stable diagnostic fingerprint of the decoded RGBA frame. Unlike the old
+/// `NON-BLANK` label this makes two capture paths mechanically comparable;
+/// it is evidence of equality, not a claim that either image is faithful.
+pub fn rgba_hash(rgba: &[u8]) -> u64 {
+    rgba.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01B3)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,11 +102,15 @@ mod tests {
     fn fb_with(pixels_in: &[u16]) -> Vec<u8> {
         let words = pixels_in.len().div_ceil(2);
         let mut buf = vec![0u8; words * 4];
+        let mut view = fn64_runtime::RdramViewMut::from_storage(&mut buf);
         for (i, px) in pixels_in.iter().enumerate() {
-            let at = (i * 2) ^ 2;
-            buf[at..at + 2].copy_from_slice(&px.to_ne_bytes());
+            view.write_u16(RdramAddr::from_offset((i * 2) as u32), *px);
         }
         buf
+    }
+
+    fn decode(src: &[u8], dst: &mut [u8]) -> usize {
+        rgba5551_to_rgba8888(RdramView::from_storage(src), RdramAddr::from_offset(0), dst)
     }
 
     #[test]
@@ -98,7 +118,7 @@ mod tests {
         // RGBA5551 pure red: R=31,G=0,B=0,A=1 -> 0b11111_00000_00000_1 = 0xF801.
         let src = fb_with(&[0xF801]);
         let mut dst = blank_dst();
-        assert!(rgba5551_to_rgba8888(&src, &mut dst) >= 1);
+        assert!(decode(&src, &mut dst) >= 1);
         assert_eq!(&dst[0..4], &[255, 0, 0, 255]);
     }
 
@@ -106,10 +126,10 @@ mod tests {
     fn pure_green_and_blue() {
         // Green: G=31 -> 0x07C0. Blue: B=31 -> 0x003E.
         let mut dst = blank_dst();
-        rgba5551_to_rgba8888(&fb_with(&[0x07C0]), &mut dst);
+        decode(&fb_with(&[0x07C0]), &mut dst);
         assert_eq!(&dst[0..4], &[0, 255, 0, 255]);
         let mut dst = blank_dst();
-        rgba5551_to_rgba8888(&fb_with(&[0x003E]), &mut dst);
+        decode(&fb_with(&[0x003E]), &mut dst);
         assert_eq!(&dst[0..4], &[0, 0, 255, 255]);
     }
 
@@ -122,7 +142,7 @@ mod tests {
         // red at pixel 0 and blue at pixel 1.
         let src = fb_with(&[0xF801, 0x003E]);
         let mut dst = blank_dst();
-        assert!(rgba5551_to_rgba8888(&src, &mut dst) >= 2);
+        assert!(decode(&src, &mut dst) >= 2);
         assert_eq!(&dst[0..4], &[255, 0, 0, 255], "pixel 0 must decode red");
         assert_eq!(&dst[4..8], &[0, 0, 255, 255], "pixel 1 must decode blue");
     }
@@ -131,7 +151,7 @@ mod tests {
     fn alpha_always_opaque() {
         // Even a pixel with the 1-bit alpha clear presents opaque.
         let mut dst = blank_dst();
-        rgba5551_to_rgba8888(&fb_with(&[0xF800]), &mut dst); // red, A=0
+        decode(&fb_with(&[0xF800]), &mut dst); // red, A=0
         assert_eq!(dst[3], 255);
     }
 
@@ -140,12 +160,12 @@ mod tests {
         // One word of source into a full-frame dst: pixels 0-1 set, rest
         // untouched; a sub-word remnant is skipped, never read OOB.
         let mut dst = vec![7u8; FB_WIDTH * FB_HEIGHT * 4];
-        let n = rgba5551_to_rgba8888(&fb_with(&[0xF801, 0xF801]), &mut dst);
+        let n = decode(&fb_with(&[0xF801, 0xF801]), &mut dst);
         assert_eq!(n, 2);
         assert_eq!(&dst[0..4], &[255, 0, 0, 255]);
         assert_eq!(dst[8], 7);
         // 2-byte remnant (half a word): zero pixels, no panic.
-        assert_eq!(rgba5551_to_rgba8888(&[0xF8, 0x01], &mut dst), 0);
+        assert_eq!(decode(&[0xF8, 0x01], &mut dst), 0);
     }
 
     #[test]
@@ -153,5 +173,12 @@ mod tests {
         assert!(is_uniform(&[0, 0, 0, 0]));
         assert!(is_uniform(&[]));
         assert!(!is_uniform(&[0, 0, 1, 0]));
+    }
+
+    #[test]
+    fn rgba_hash_is_stable_and_content_sensitive() {
+        assert_eq!(rgba_hash(&[]), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(rgba_hash(&[0, 1, 2, 3]), 0x4475_327f_98e0_5411);
+        assert_ne!(rgba_hash(&[0, 1, 2, 3]), rgba_hash(&[0, 1, 3, 2]));
     }
 }

@@ -145,7 +145,11 @@ fn mtc0_compare_round_trips() {
     // mtc0 $a0, $11 = opcode 0x10, rs=0x04 (MTC0), rt=4 ($a0), rd=11 (Compare).
     // 0x40 | (0x04<<21) | (4<<16) | (11<<11) = 0x40845800.
     let words: [u32; 3] = [0x40845800, 0x03E00008, 0x00000000];
-    let input = FuncInput { name: "set_compare", vram: 0x80001000, words: &words };
+    let input = FuncInput {
+        name: "set_compare",
+        vram: 0x80001000,
+        words: &words,
+    };
     let emitted = emit_function(&input);
     assert!(
         emitted.contains("ctx.cop0_compare = ctx.r_u32(4);"),
@@ -155,10 +159,7 @@ fn mtc0_compare_round_trips() {
     // And executing it (via a local paste of the emitted shape) must land the
     // value. We assert the decode + emit intent here; execution parity is
     // covered by the osGetCount differential above (same set_r32/context path).
-    assert_eq!(
-        decode(0x40845800),
-        Instruction::Mtc0 { rt: 4, cop0d: 11 }
-    );
+    assert_eq!(decode(0x40845800), Instruction::Mtc0 { rt: 4, cop0d: 11 });
 }
 
 // --- Decoder unit tests (known word -> right op), fail-against-bug. ---
@@ -202,13 +203,21 @@ fn decode_cache_and_sync() {
     //   (0x2F<<26)=0xBC000000, (4<<21)=0x00800000 -> 0xBC800000.
     assert_eq!(
         decode(0xBC800000),
-        Instruction::Cache { op: 0, base: 4, off: 0 }
+        Instruction::Cache {
+            op: 0,
+            base: 4,
+            off: 0
+        }
     );
     // cache 0x14, 0x10($t0): op field = 0x14 (rt), base=8, off=0x10
     //   0xBC000000 | (8<<21) | (0x14<<16) | 0x10 = 0xBD140010
     assert_eq!(
         decode(0xBD140010),
-        Instruction::Cache { op: 0x14, base: 8, off: 0x10 }
+        Instruction::Cache {
+            op: 0x14,
+            base: 8,
+            off: 0x10
+        }
     );
     // sync  = SPECIAL funct 0x0F = 0x0000000F
     assert_eq!(decode(0x0000000F), Instruction::Sync);
@@ -261,26 +270,75 @@ fn privileged_ops_emit_loud_traps() {
         needle: &'static str,
     }
     let cases = [
-        Case { word: 0x40086000, needle: "unsupported mfc0 from COP0 register 12" }, // mfc0 Status
-        Case { word: 0x40886000, needle: "unsupported mtc0 to COP0 register 12" },   // mtc0 Status
-        Case { word: 0x40224800, needle: "unsupported dmfc0" },                      // dmfc0
-        Case { word: 0x40A24800, needle: "unsupported dmtc0" },                      // dmtc0
-        Case { word: 0x42000018, needle: "eret executed in recompiled code" },       // eret
-        Case { word: 0x42000002, needle: "tlbwi" },                                  // tlbwi
-        Case { word: 0x42000006, needle: "tlbwr" },                                  // tlbwr
-        Case { word: 0x42000008, needle: "tlbp" },                                   // tlbp
-        Case { word: 0x42000001, needle: "tlbr" },                                   // tlbr
-        Case { word: 0x48021800, needle: "COP2 access in recompiled code" },         // mfc2
-        Case { word: 0x48821800, needle: "COP2 access in recompiled code" },         // mtc2
-        Case { word: 0x48421800, needle: "COP2 access in recompiled code" },         // cfc2
-        Case { word: 0x48C21800, needle: "COP2 access in recompiled code" },         // ctc2
-        Case { word: 0x0000000C, needle: "syscall (code 0x0) executed" },            // syscall
-        Case { word: 0x0000000D, needle: "break (code 0x0) executed" },              // break
+        Case {
+            word: 0x40086000,
+            needle: "unsupported mfc0 from COP0 register 12",
+        }, // mfc0 Status
+        Case {
+            word: 0x40886000,
+            needle: "unsupported mtc0 to COP0 register 12",
+        }, // mtc0 Status
+        Case {
+            word: 0x40224800,
+            needle: "unsupported dmfc0",
+        }, // dmfc0
+        Case {
+            word: 0x40A24800,
+            needle: "unsupported dmtc0",
+        }, // dmtc0
+        Case {
+            word: 0x42000018,
+            needle: "eret executed in recompiled code",
+        }, // eret
+        Case {
+            word: 0x42000002,
+            needle: "tlbwi",
+        }, // tlbwi
+        Case {
+            word: 0x42000006,
+            needle: "tlbwr",
+        }, // tlbwr
+        Case {
+            word: 0x42000008,
+            needle: "tlbp",
+        }, // tlbp
+        Case {
+            word: 0x42000001,
+            needle: "tlbr",
+        }, // tlbr
+        Case {
+            word: 0x48021800,
+            needle: "COP2 access in recompiled code",
+        }, // mfc2
+        Case {
+            word: 0x48821800,
+            needle: "COP2 access in recompiled code",
+        }, // mtc2
+        Case {
+            word: 0x48421800,
+            needle: "COP2 access in recompiled code",
+        }, // cfc2
+        Case {
+            word: 0x48C21800,
+            needle: "COP2 access in recompiled code",
+        }, // ctc2
+        Case {
+            word: 0x0000000C,
+            needle: "syscall (code 0x0) executed",
+        }, // syscall
+        Case {
+            word: 0x0000000D,
+            needle: "break (code 0x0) executed",
+        }, // break
     ];
     for c in &cases {
         // op ; jr $ra ; nop
         let words = [c.word, 0x03E00008, 0x00000000];
-        let input = FuncInput { name: "t", vram: 0x80001000, words: &words };
+        let input = FuncInput {
+            name: "t",
+            vram: 0x80001000,
+            words: &words,
+        };
         let emitted = emit_function(&input);
         assert!(
             emitted.contains("panic!"),
@@ -303,17 +361,37 @@ fn privileged_ops_emit_loud_traps() {
 fn cache_and_sync_emit_noops() {
     // cache 0x14, 0x10($t0)
     let words = [0xBD140010u32, 0x03E00008, 0x00000000];
-    let input = FuncInput { name: "t", vram: 0x80001000, words: &words };
+    let input = FuncInput {
+        name: "t",
+        vram: 0x80001000,
+        words: &words,
+    };
     let emitted = emit_function(&input);
-    assert!(emitted.contains("// cache op 0x14: no-op"), "cache should no-op:\n{emitted}");
-    assert!(!emitted.contains("panic!"), "cache must not trap:\n{emitted}");
+    assert!(
+        emitted.contains("// cache op 0x14: no-op"),
+        "cache should no-op:\n{emitted}"
+    );
+    assert!(
+        !emitted.contains("panic!"),
+        "cache must not trap:\n{emitted}"
+    );
 
     // sync
     let words = [0x0000000Fu32, 0x03E00008, 0x00000000];
-    let input = FuncInput { name: "t2", vram: 0x80001000, words: &words };
+    let input = FuncInput {
+        name: "t2",
+        vram: 0x80001000,
+        words: &words,
+    };
     let emitted = emit_function(&input);
-    assert!(emitted.contains("// sync: no-op"), "sync should no-op:\n{emitted}");
-    assert!(!emitted.contains("panic!"), "sync must not trap:\n{emitted}");
+    assert!(
+        emitted.contains("// sync: no-op"),
+        "sync should no-op:\n{emitted}"
+    );
+    assert!(
+        !emitted.contains("panic!"),
+        "sync must not trap:\n{emitted}"
+    );
 }
 
 /// A `mfc0` from an unsupported (libultra-managed) register decodes fine but
@@ -324,7 +402,11 @@ fn unsupported_cop0_read_names_the_register() {
     // mfc0 $t0, $13 (Cause) : rt=8, rd=13 -> 0x40086800
     assert_eq!(decode(0x40086800), Instruction::Mfc0 { rt: 8, cop0d: 13 });
     let words = [0x40086800u32, 0x03E00008, 0x00000000];
-    let input = FuncInput { name: "t", vram: 0x80001000, words: &words };
+    let input = FuncInput {
+        name: "t",
+        vram: 0x80001000,
+        words: &words,
+    };
     let emitted = emit_function(&input);
     assert!(
         emitted.contains("unsupported mfc0 from COP0 register 13"),

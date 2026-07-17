@@ -18,6 +18,7 @@ existing fast-loop infra; adds only a dispatch wrapper.
    card; run the gates yourself — never trust the job's own claim:
    - per-crate: `cargo test -p <crate>` + `cargo clippy -p <crate> --all-targets`
    - workspace: `cargo nextest run --workspace` (the authoritative gate)
+   - invariants: `scripts/lint-docs.py` + `scripts/lint-rdram-layout.py`
    - task-specific probe (e.g. bounded `./oot run` with warning greps)
    - AGENTS.md bars: 10 consecutive clean runs for deterministic fixes,
      20+ named-interleaving for concurrency.

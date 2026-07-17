@@ -1652,23 +1652,33 @@ pub fn reset_skip_warnings() {
 /// if the word runs past `rdram`.
 #[inline]
 fn read_u32(rdram: &[u8], off: usize) -> u32 {
-    if off + 4 > rdram.len() {
+    let Some(aligned) = complete_storage_word(rdram, off) else {
         return 0;
-    }
-    // Native-endian read == the logical big-endian word the game stored
-    // (recomp.h MEM_W is a bare `*(int32_t*)`, no swap).
-    u32::from_ne_bytes([rdram[off], rdram[off + 1], rdram[off + 2], rdram[off + 3]])
+    };
+    fn64_runtime::RdramView::from_storage(rdram).read_u32(fn64_runtime::RdramAddr::from_offset(
+        u32::try_from(aligned).expect("GBI RDRAM address exceeds u32"),
+    ))
+}
+
+#[inline]
+fn complete_storage_word(rdram: &[u8], off: usize) -> Option<usize> {
+    let aligned = off & !3;
+    aligned
+        .checked_add(4)
+        .filter(|&end| end <= rdram.len())
+        .map(|_| aligned)
 }
 
 /// Read a logical byte at byte offset `off` (recomp `MEM_BU`: physical
 /// index `off ^ 3`). Returns 0 past the end.
 #[inline]
 fn read_u8(rdram: &[u8], off: usize) -> u8 {
-    let p = off ^ 3;
-    if p >= rdram.len() {
+    if complete_storage_word(rdram, off).is_none() {
         return 0;
     }
-    rdram[p]
+    fn64_runtime::RdramView::from_storage(rdram).read_u8(fn64_runtime::RdramAddr::from_offset(
+        u32::try_from(off).expect("GBI RDRAM address exceeds u32"),
+    ))
 }
 
 /// Read a logical signed 16-bit halfword at byte offset `off` (recomp
@@ -1677,17 +1687,23 @@ fn read_u8(rdram: &[u8], off: usize) -> u8 {
 /// the end.
 #[inline]
 fn read_i16(rdram: &[u8], off: usize) -> i16 {
-    let hi = read_u8(rdram, off) as u16;
-    let lo = read_u8(rdram, off + 1) as u16;
-    ((hi << 8) | lo) as i16
+    if !off.is_multiple_of(2) || complete_storage_word(rdram, off).is_none() {
+        return 0;
+    }
+    fn64_runtime::RdramView::from_storage(rdram).read_i16(fn64_runtime::RdramAddr::from_offset(
+        u32::try_from(off).expect("GBI RDRAM address exceeds u32"),
+    ))
 }
 
 /// Read a logical unsigned 16-bit halfword at byte offset `off`.
 #[inline]
 fn read_u16(rdram: &[u8], off: usize) -> u16 {
-    let hi = read_u8(rdram, off) as u16;
-    let lo = read_u8(rdram, off + 1) as u16;
-    (hi << 8) | lo
+    if !off.is_multiple_of(2) || complete_storage_word(rdram, off).is_none() {
+        return 0;
+    }
+    fn64_runtime::RdramView::from_storage(rdram).read_u16(fn64_runtime::RdramAddr::from_offset(
+        u32::try_from(off).expect("GBI RDRAM address exceeds u32"),
+    ))
 }
 
 /// Resolve a (possibly segmented) F3DEX2 address to a flat rdram byte
@@ -2952,9 +2968,7 @@ mod tests {
 
         let trace = trace_display_list_f3dex2(&rdram, 0x1000);
         assert!(trace.contains("SEG depth=0 segment=3 base=0x003000"));
-        assert!(trace.contains(
-            "ENTER depth=1 segmented=0x03000100 resolved=0x003100"
-        ));
+        assert!(trace.contains("ENTER depth=1 segmented=0x03000100 resolved=0x003100"));
         assert!(trace.contains("target=0x003200 bytes=16 nonzero=1"));
         assert!(trace.contains("SUMMARY commands=5"));
         assert!(trace.contains("OPCODE op=0xdf count=2"));

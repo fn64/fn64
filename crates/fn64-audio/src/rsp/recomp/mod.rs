@@ -583,6 +583,27 @@ mod round_trip_tests {
         ));
     }
 
+    /// Fail-against-bug: stale generated aspMain had the branch delay slot
+    /// inlined into the not-taken arm, then set `pc` to the delay-slot label
+    /// itself. That executes the delay slot twice on fallthrough and shifts
+    /// later audio DMA source pointers by one loop body.
+    #[test]
+    fn emitted_conditional_branch_fallthrough_skips_inlined_delay_slot() {
+        let base = 0x1000u32;
+        let bne_not_taken = 0x1400_0001; // bne r0,r0,0x1008; delay slot at 0x1004
+        let prog = [bne_not_taken, sw(2, 3, 0), brk()];
+
+        let source = emit_module(&prog, base, "delay_fallthrough_test");
+        assert!(
+            source.contains("} else {\n                    let a = m.reg(3).wrapping_add(0x00000000); let v = m.reg(2); m.store_w(a, v);\n                    pc = 0x1008;"),
+            "not-taken branch must resume at pc+8 after the inlined delay slot, not at the delay slot label:\n{source}"
+        );
+        assert!(
+            !source.contains("} else {\n                    let a = m.reg(3).wrapping_add(0x00000000); let v = m.reg(2); m.store_w(a, v);\n                    pc = 0x1004;"),
+            "fallthrough to pc+4 would execute the delay slot twice"
+        );
+    }
+
     #[test]
     fn round_trip_vector_add_accumulates_lanes() {
         // Build two vector regs via MTC2-free direct set, add them with VADD,

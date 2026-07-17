@@ -42,6 +42,8 @@
 mod framebuffer;
 #[allow(dead_code)]
 mod input_map;
+#[allow(dead_code)]
+mod timing;
 
 #[cfg(not(fn64_game_linked))]
 fn main() {
@@ -85,6 +87,7 @@ mod host_lookup;
 mod game {
     use crate::framebuffer::{self, FB_BYTES, FB_HEIGHT, FB_WIDTH};
     use crate::input_map::PadState;
+    use crate::timing::{DrainDecision, RetraceDrain, RetraceOutcome, TimingWindow};
     use std::sync::Arc;
 
     #[cfg(fn64_recomp_rs)]
@@ -122,6 +125,15 @@ mod game {
         last_heartbeat_swap: u64,
         /// Wall-clock deadline for the next pumped frame (~60 Hz pacing).
         next_frame_deadline: std::time::Instant,
+        last_pump_started: Option<std::time::Instant>,
+        frame_intervals: TimingWindow,
+        pump_times: TimingWindow,
+        present_times: TimingWindow,
+        pump_steps_total: u64,
+        pump_steps_max: u64,
+        pump_step_samples: u64,
+        last_audio_underrun_samples: u64,
+        last_audio_late_callbacks: u64,
     }
 
     /// How many executor steps to run per window pump before yielding back to
@@ -199,7 +211,7 @@ mod game {
             // deadline) == one interval == one retrace == ~60 Hz NTSC.
             fn64_abi::arm_vi_retrace(RETRACE_INTERVAL);
 
-            let mut rdram = fn64_boot_harness::new_rdram();
+            let mut rdram = fn64_boot_harness::new_rdram(fn64_boot_harness::TvType::Ntsc);
             let rdram_ptr = rdram.as_mut_ptr();
 
             // Render backend selection (same contract as oot-boot):
@@ -257,10 +269,9 @@ mod game {
             // shell's audio deliverable -- samples produced by M_AUDTASK and
             // submitted through osAiSetNextBuffer flow here. Gated so a headless/CI env with no audio
             // device doesn't abort; a create() failure is logged, not fatal.
-            // Return value (the negotiated stream rate) is already logged by
-            // wire_audio; pacing no longer needs it -- osAiGetLength's live
-            // readback lets the game self-pace audio production.
-            let _ = wire_audio(rdram.len());
+            // The negotiated stream rate is logged by wire_audio; it does not
+            // drive VI pacing or guest-visible AI DMA state.
+            wire_audio(rdram.len());
 
             // Audio SYNTH (ucode): optional, behind the feature. Without it,
             // M_AUDTASK dispatch runs no ucode (silent) but the output path
@@ -306,53 +317,72 @@ mod game {
                 reported_first_frame: false,
                 last_heartbeat_swap: 0,
                 next_frame_deadline: std::time::Instant::now(),
+                last_pump_started: None,
+                frame_intervals: TimingWindow::default(),
+                pump_times: TimingWindow::default(),
+                present_times: TimingWindow::default(),
+                pump_steps_total: 0,
+                pump_steps_max: 0,
+                pump_step_samples: 0,
+                last_audio_underrun_samples: 0,
+                last_audio_late_callbacks: 0,
             }
         }
 
-        /// Drive the executor until the next VI swap (or the per-pump step
-        /// budget is hit). Returns true if a new VI swap happened this pump.
-        fn pump_one_frame(&mut self) -> bool {
+        /// Advance one VI retrace and drive every runnable non-idle guest
+        /// thread to quiescence. Reports whether that retrace swapped.
+        fn pump_one_frame(&mut self) -> RetraceOutcome {
             let start_swaps = fn64_abi::vi_swap_count();
-            let mut idle_ticks = 0u32;
-            let mut steps = 0u64;
+            let mut drain = RetraceDrain::new(start_swaps);
 
             // Advance the guest clock by exactly one retrace interval FIRST,
             // unconditionally, because the caller only enters here when the
             // 16.67 ms wall deadline is due (`about_to_wait`'s FRAME). One
             // pump == one NTSC field == one retrace, whatever happens below.
             //
-            // Doing it at the TOP is load-bearing: the swap check below
-            // `return`s the moment a frame lands, so an advance placed after
-            // the loop is skipped by every pump that actually produces a
-            // frame -- measured as ~30 Hz instead of 60 (only the non-
-            // producing pumps advanced). Retrace must not depend on whether
-            // the game happened to finish a frame this pump.
+            // Doing it at the TOP is load-bearing: retrace must not depend on
+            // whether the game happens to finish a frame during this pump.
             let tick = fn64_abi::sim_time() + RETRACE_INTERVAL;
             fn64_abi::advance_virtual_time(tick);
 
             loop {
-                if steps >= STEPS_PER_PUMP {
+                let next_priority = fn64_abi::next_runnable_priority();
+                if drain.before_step(next_priority) == DrainDecision::Quiescent {
+                    // Exact closed loop: after retrace work blocks, OoT's
+                    // priority-0 idle thread calls pause_self, which makes it
+                    // runnable again. The old driver treated every such yield
+                    // as progress and resumed it 200,000 times on each of the
+                    // two legitimate no-swap retraces in OoT's 20 fps path.
+                    // That consumed ~31 ms, halved VI delivery, and starved
+                    // audio. One idle resume preserves its observable turn;
+                    // seeing it again means no higher-priority guest work is
+                    // runnable until the next external event/retrace.
                     break;
                 }
+                assert!(
+                    drain.steps() < STEPS_PER_PUMP,
+                    "fn64-shell: non-idle guest work exceeded {STEPS_PER_PUMP} scheduling steps in one retrace pump"
+                );
                 // Feed live input before the game polls the controller this
                 // step. Cheap; keeps the pad current within the frame.
                 let (buttons, sx, sy) = self.pad.resolve();
                 fn64_abi::set_controller_state(0, buttons, sx, sy);
 
                 let stepped = fn64_abi::run_one_step();
-                steps += 1;
-                if fn64_abi::vi_swap_count() > start_swaps {
-                    return true;
-                }
+                drain.record_step(next_priority.expect("drain authorized a step without work"));
+                // A VI swap is an observation, not a scheduling boundary.
+                // Returning here used to leave AudioMgr's same-retrace work
+                // runnable. The next pump advanced VI first, so a new retrace
+                // queued behind the unfinished one; OoT deliberately coalesces
+                // queued retraces, dropping one audio update per three after
+                // its title path changes to one framebuffer swap per three
+                // retraces. Drain this retrace to quiescence before time can
+                // advance again; presentation still happens once below.
                 if !stepped {
-                    idle_ticks += 1;
-                    if idle_ticks >= 200 {
-                        // Genuinely idle -- nothing will produce a frame this
-                        // pump. Yield to winit so the window stays responsive.
-                        break;
-                    }
-                } else {
-                    idle_ticks = 0;
+                    // Nothing is runnable and virtual time advances only at
+                    // the top of the next pump, so retrying cannot make
+                    // progress on this event-loop turn.
+                    break;
                 }
             }
             // NOTE: the clock advance happens at the TOP of this fn, not here.
@@ -366,12 +396,13 @@ mod game {
             // retrace, so that over-produced ~2:1, pegged the ring at its cap,
             // and drop-oldest skipped playback = the static; the same
             // over-delivery advanced game logic too fast = the over-speed.
-            fn64_abi::vi_swap_count() > start_swaps
+            drain.finish(fn64_abi::vi_swap_count())
         }
 
         /// Blit the current VI framebuffer (rdram) into the pixels surface and
         /// present. Reports blank/uniform frames honestly.
         fn present(&mut self) {
+            let present_started = std::time::Instant::now();
             let Some(pixels) = self.pixels.as_mut() else {
                 return;
             };
@@ -399,12 +430,18 @@ mod game {
             };
 
             let blank = framebuffer::is_uniform(region);
-            framebuffer::rgba5551_to_rgba8888(region, &mut self.rgba);
+            framebuffer::rgba5551_to_rgba8888(
+                fn64_runtime::RdramView::from_storage(&self.rdram),
+                fn64_runtime::RdramAddr::from_offset(fb_offset as u32),
+                &mut self.rgba,
+            );
+            let rgba_hash = framebuffer::rgba_hash(&self.rgba);
             pixels.frame_mut().copy_from_slice(&self.rgba);
             if let Err(e) = pixels.render() {
                 eprintln!("[fn64-shell] pixels.render() failed: {e}");
                 return;
             }
+            self.present_times.record(present_started.elapsed());
 
             if !self.reported_first_frame {
                 let swaps = fn64_abi::vi_swap_count();
@@ -416,8 +453,9 @@ mod game {
                     );
                 } else {
                     println!(
-                        "[fn64-shell] presenting VI framebuffer (swap #{swaps}) -- NON-BLANK \
-                         content."
+                        "[fn64-shell] presenting VI framebuffer (swap #{swaps}) -- non-uniform, \
+                         rgba_hash={rgba_hash:016x} (hash is a comparison key, not a correctness \
+                         claim)."
                     );
                 }
                 self.reported_first_frame = true;
@@ -426,7 +464,7 @@ mod game {
                 // advancing frames (VI swaps climbing), not stuck on swap #1.
                 let swaps = fn64_abi::vi_swap_count();
                 if swaps >= self.last_heartbeat_swap + 60 {
-                    let state = if blank { "blank" } else { "NON-BLANK" };
+                    let state = if blank { "uniform" } else { "non-uniform" };
                     // Audio counters in the same line: shows at a glance
                     // whether the game is producing PCM (ai_buffers/nonzero)
                     // and whether it reaches the backend (backend_buffers).
@@ -444,10 +482,69 @@ mod game {
                         Some((_, _, hz)) => format!("{hz:.1}"),
                         None => "n/a".to_string(),
                     };
+                    let interval = self
+                        .frame_intervals
+                        .take_stats()
+                        .expect("heartbeat must follow at least one pump interval");
+                    let pump = self
+                        .pump_times
+                        .take_stats()
+                        .expect("heartbeat must follow at least one pump");
+                    let present = self
+                        .present_times
+                        .take_stats()
+                        .expect("heartbeat must follow at least one present");
+                    let window_hz = 1000.0 / interval.median_ms;
+                    let average_steps =
+                        self.pump_steps_total as f64 / self.pump_step_samples.max(1) as f64;
+                    let audio_health = fn64_abi::audio_stream_health();
+                    let (
+                        audio_callbacks,
+                        audio_underruns,
+                        window_underruns,
+                        audio_late_callbacks,
+                        window_late_callbacks,
+                        max_callback_gap_us,
+                    ) = audio_health
+                        .map(|health| {
+                            (
+                                health.callbacks,
+                                health.underrun_samples,
+                                health
+                                    .underrun_samples
+                                    .saturating_sub(self.last_audio_underrun_samples),
+                                health.late_callbacks,
+                                health
+                                    .late_callbacks
+                                    .saturating_sub(self.last_audio_late_callbacks),
+                                health.max_callback_gap_us,
+                            )
+                        })
+                        .unwrap_or((0, 0, 0, 0, 0, 0));
+                    let (ai_status_reads, ai_busy_returns) = fn64_abi::ai_status_stats();
+                    let (ai_length_reads, ai_length_last) = fn64_abi::ai_length_stats();
+                    let audio_rates = fn64_abi::audio_rates();
                     println!(
-                        "[fn64-shell] present heartbeat: VI swap #{swaps} ({state}); \
-                         retrace_hz={cadence} (target ~60); audio: \
-                         ai_buffers={} samples={} nonzero={} backend_buffers={} ring_frames={:?}",
+                        "[fn64-shell] present heartbeat: VI swap #{swaps} ({state}, \
+                         rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
+                         retrace_hz={cadence} cumulative, window_hz={window_hz:.1}; \
+                         timing_ms median/p95: interval={:.2}/{:.2} pump={:.2}/{:.2} \
+                         present={:.2}/{:.2} (n={}); pump_steps avg/max={average_steps:.1}/{}; audio: \
+                         ai_buffers={} samples={} nonzero={} backend_buffers={} ring_frames={:?} \
+                         callbacks={audio_callbacks} underrun_samples={audio_underruns} \
+                         (+{window_underruns} window) late_callbacks={audio_late_callbacks} \
+                         (+{window_late_callbacks} window) max_callback_gap_us={max_callback_gap_us} \
+                         ai_status_reads/busy={ai_status_reads}/{ai_busy_returns} \
+                         ai_length_reads/last={ai_length_reads}/{ai_length_last} \
+                         guest/stream_hz={audio_rates:?}",
+                        interval.median_ms,
+                        interval.p95_ms,
+                        pump.median_ms,
+                        pump.p95_ms,
+                        present.median_ms,
+                        present.p95_ms,
+                        interval.samples,
+                        self.pump_steps_max,
                         audio.ai_buffers,
                         audio.samples,
                         audio.nonzero_samples,
@@ -455,6 +552,11 @@ mod game {
                         fn64_abi::audio_frames_remaining()
                     );
                     self.last_heartbeat_swap = swaps;
+                    self.pump_steps_total = 0;
+                    self.pump_steps_max = 0;
+                    self.pump_step_samples = 0;
+                    self.last_audio_underrun_samples = audio_underruns;
+                    self.last_audio_late_callbacks = audio_late_callbacks;
                 }
             }
         }
@@ -558,16 +660,22 @@ mod game {
             // game frame when the ~16.67 ms wall deadline is due, then hand
             // the loop a WaitUntil so input/close events keep flowing while
             // we wait. Audio stays synchronized WITHOUT being the pacing
-            // master here: `osAiGetLength` reports the live ring backlog, so
-            // the game's own AudioMgr skips/queues buffers against real
-            // drain exactly as on hardware (the ring cap + the heartbeat's
-            // ring_frames are the backstop and the evidence).
+            // master here: `osAiGetLength` reports only the current emulated
+            // AI DMA, while the independent host ring absorbs callback jitter.
+            // Heartbeat DMA/ring/underrun counters expose both boundaries.
             const FRAME: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
 
             let now_t = std::time::Instant::now();
             if now_t >= self.next_frame_deadline {
-                let swapped = self.pump_one_frame();
-                if swapped {
+                if let Some(previous) = self.last_pump_started.replace(now_t) {
+                    self.frame_intervals.record(now_t.duration_since(previous));
+                }
+                let outcome = self.pump_one_frame();
+                self.pump_times.record(now_t.elapsed());
+                self.pump_steps_total = self.pump_steps_total.saturating_add(outcome.steps);
+                self.pump_steps_max = self.pump_steps_max.max(outcome.steps);
+                self.pump_step_samples += 1;
+                if outcome.swapped {
                     self.last_swap_count = fn64_abi::vi_swap_count();
                 }
                 // Catch-up-free schedule: hold cadence while we keep up,
@@ -660,7 +768,7 @@ mod game {
         // Step a few frames with the input held to show the game runs with it
         // applied (not a hang), then stop.
         for _ in 0..3 {
-            shell.pump_one_frame();
+            let _ = shell.pump_one_frame();
         }
         println!(
             "[fn64-shell] INPUT PROBE OK: keyboard->controller reached fn64_abi and the game \
@@ -671,13 +779,12 @@ mod game {
 
     /// Register the cpal output stream as the audio backend. A create()
     /// failure (no device, headless CI) is logged, not fatal -- the game
-    /// still runs and presents; only sound is unavailable. Returns the
-    /// negotiated host stream rate when audio is live: the window loop uses
-    /// it as the frame-pacing master clock.
-    fn wire_audio(rdram_len: usize) -> Option<u32> {
+    /// still runs and presents; only sound is unavailable. The negotiated
+    /// host rate is telemetry; VI remains paced by the wall-time retrace.
+    fn wire_audio(rdram_len: usize) {
         if std::env::var_os("FN64_NO_AUDIO").is_some() {
             println!("[fn64-shell] FN64_NO_AUDIO set -- audio output disabled");
-            return None;
+            return;
         }
         use fn64_audio::{AudioBackend as _, AudioConfig, CpalBackend};
         // Request the guest's own rate; `CpalBackend::create` negotiates
@@ -699,14 +806,12 @@ mod game {
                     "[fn64-shell] audio output wired (cpal, guest {N64_BOOT_AI_RATE_HZ} Hz -> \
                      stream {stream_rate} Hz stereo)"
                 );
-                Some(stream_rate)
             }
             Err(e) => {
                 eprintln!(
                     "[fn64-shell] audio output unavailable ({e}) -- continuing SILENT \
                      (window/input unaffected). Set FN64_NO_AUDIO to silence this."
                 );
-                None
             }
         }
     }

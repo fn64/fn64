@@ -168,6 +168,7 @@ pub fn set_controller_state(port: usize, buttons: u16, stick_x: i8, stick_y: i8)
 pub unsafe extern "C" fn osContGetQuery_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     let data_addr = RdramAddr::from_gpr(ctx.r4).offset() as usize;
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     let pif = with_executor(|exec| *exec.pif());
     for port in 0..MAXCONTROLLERS {
         let resp = pif.query_response(port);
@@ -194,7 +195,12 @@ pub unsafe extern "C" fn osContGetQuery_recomp(rdram: *mut u8, ctx: *mut RecompC
         // see the doc comment above for the byte-order derivation.
         for (o, &b) in entry.iter().enumerate() {
             unsafe {
-                *rdram.add((base + o) ^ 3) = b;
+                storage.write_u8(
+                    RdramAddr::from_offset(
+                        u32::try_from(base + o).expect("OSContStatus RDRAM address exceeds u32"),
+                    ),
+                    b,
+                );
             }
         }
     }
@@ -246,6 +252,7 @@ const MAXCONTROLLERS: usize = 4;
 pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     let base_addr = RdramAddr::from_gpr(ctx.r4).offset() as usize;
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     let pif = with_executor(|exec| *exec.pif());
     // Diagnostic (opt-in via FN64_TRACE_CONT): proves PadMgr actually polls
     // input, and echoes what port-0 state the game is about to see -- the
@@ -281,7 +288,12 @@ pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut Reco
         // values -- see the doc comment for the byte-order derivation.
         for (o, &b) in pad.iter().enumerate() {
             unsafe {
-                *rdram.add((base + o) ^ 3) = b;
+                storage.write_u8(
+                    RdramAddr::from_offset(
+                        u32::try_from(base + o).expect("OSContPad RDRAM address exceeds u32"),
+                    ),
+                    b,
+                );
             }
         }
     }
@@ -305,6 +317,7 @@ pub unsafe extern "C" fn osContInit_recomp(rdram: *mut u8, ctx: *mut RecompConte
     let ctx = unsafe { &mut *ctx };
     let bitpattern_addr = RdramAddr::from_gpr(ctx.r5).offset() as usize;
     let data_addr = RdramAddr::from_gpr(ctx.r6).offset() as usize;
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     let mut mask: u8 = 0;
     with_executor(|exec| {
         let pif = *exec.pif();
@@ -328,7 +341,13 @@ pub unsafe extern "C" fn osContInit_recomp(rdram: *mut u8, ctx: *mut RecompConte
             let base = data_addr + port * 4;
             for (o, &b) in entry.iter().enumerate() {
                 unsafe {
-                    *rdram.add((base + o) ^ 3) = b;
+                    storage.write_u8(
+                        RdramAddr::from_offset(
+                            u32::try_from(base + o)
+                                .expect("OSContStatus RDRAM address exceeds u32"),
+                        ),
+                        b,
+                    );
                 }
             }
         }
@@ -341,7 +360,13 @@ pub unsafe extern "C" fn osContInit_recomp(rdram: *mut u8, ctx: *mut RecompConte
         // +0 store misses the swizzled sentinel address PadSetup_Init checks
         // (funcs_55.c 0x800CD414 `bnel $t7,0xFF`), so it would bail and skip
         // all controller-present stores.
-        *rdram.add(bitpattern_addr ^ 3) = mask;
+        storage.write_u8(
+            RdramAddr::from_offset(
+                u32::try_from(bitpattern_addr)
+                    .expect("controller bitpattern RDRAM address exceeds u32"),
+            ),
+            mask,
+        );
     }
     ctx.r2 = 0;
 }

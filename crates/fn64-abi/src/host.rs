@@ -114,6 +114,14 @@ pub fn run_one_step() -> bool {
     stepped
 }
 
+/// Priority the next [`run_one_step`] will dispatch, or `None` when the run
+/// queue is empty. The window driver uses `OS_PRIORITY_IDLE` as the explicit
+/// quiescence boundary documented by libultra rather than guessing from a
+/// wall-time or step-count threshold.
+pub fn next_runnable_priority() -> Option<Priority> {
+    with_executor(|exec| exec.peek_next_priority())
+}
+
 /// Run until the run queue is idle (every thread finished or blocked). See
 /// `run_one_step`'s doc comment -- this loops it rather than calling
 /// `Executor::run_to_idle` directly, so every individual resume inside the

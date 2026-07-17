@@ -12,6 +12,18 @@ use std::collections::HashMap;
 
 pub use fn64_runtime::rdram::DEFAULT_RDRAM_SIZE;
 
+/// Console television standard written by the IPL into libultra's
+/// `osTvType` boot global at `0x8000_0300` before game code starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum TvType {
+    Pal = 0,
+    Ntsc = 1,
+    Mpal = 2,
+}
+
+const OS_TV_TYPE: fn64_runtime::RdramAddr = fn64_runtime::RdramAddr::from_offset(0x300);
+
 /// Length required by generated `MEM_*` accesses during boot.
 pub const fn rdram_len() -> usize {
     let mmio_end = fn64_runtime::RDRAM_MMIO_WINDOW_END as usize;
@@ -23,9 +35,12 @@ pub const fn rdram_len() -> usize {
 }
 
 /// Allocate the process's single RDRAM buffer, including the raw MMIO/KSEG1
-/// window generated code can address directly.
-pub fn new_rdram() -> Vec<u8> {
-    vec![0; rdram_len()]
+/// window generated code can address directly, and seed the IPL-owned boot
+/// globals that libultra/game initialization reads before any shim runs.
+pub fn new_rdram(tv_type: TvType) -> Vec<u8> {
+    let mut rdram = vec![0; rdram_len()];
+    fn64_runtime::RdramViewMut::from_storage(&mut rdram).write_u32(OS_TV_TYPE, tv_type as u32);
+    rdram
 }
 
 #[cfg(feature = "c-bridge")]
@@ -177,5 +192,16 @@ mod tests {
     fn rdram_length_covers_physical_memory_and_raw_mmio_window() {
         assert!(rdram_len() >= DEFAULT_RDRAM_SIZE);
         assert!(rdram_len() >= fn64_runtime::RDRAM_MMIO_WINDOW_END as usize);
+    }
+
+    #[test]
+    fn television_standard_is_explicit_boot_state_not_zero_fill_accident() {
+        for (tv_type, expected) in [(TvType::Pal, 0), (TvType::Ntsc, 1), (TvType::Mpal, 2)] {
+            let rdram = new_rdram(tv_type);
+            assert_eq!(
+                fn64_runtime::RdramView::from_storage(&rdram).read_u32(OS_TV_TYPE),
+                expected
+            );
+        }
     }
 }
