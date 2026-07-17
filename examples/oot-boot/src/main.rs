@@ -965,6 +965,20 @@ fn main() {
     );
     println!("[oot-boot] gfx tasks submitted: {gfx_count}");
     println!("[oot-boot] audio tasks submitted: {audio_count}");
+    // R5 probe 3: the guest's VI retrace rate. NTSC wants ~60 Hz. Materially
+    // above it means the ticker over-delivers, which would explain BOTH R5
+    // symptoms at once (the audio thread produces per retrace -> ring pegs ->
+    // static; game logic advances per retrace -> over-speed). Headless runs
+    // flat out, so a high number HERE only means virtual time outruns wall
+    // time unpaced -- the number that judges the shipped product is the
+    // shell's, which paces its pump on wall-clock.
+    match fn64_abi::retrace_cadence() {
+        Some((ticks, secs, hz)) => println!(
+            "[oot-boot] VI retrace cadence: {ticks} ticks in {secs:.3}s = {hz:.1} Hz \
+             (NTSC target ~60; unpaced headless runs are expected to exceed it)"
+        ),
+        None => println!("[oot-boot] VI retrace cadence: no ticks fired (ticker never armed?)"),
+    }
     println!("[oot-boot] active renderer: {active_renderer}");
     if let Some(error) = fn64_abi::last_render_error() {
         println!("[oot-boot] last render error: {error}");

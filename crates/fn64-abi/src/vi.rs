@@ -154,6 +154,118 @@ pub fn arm_vi_retrace(interval: u64) {
     with_executor(|exec| exec.arm_retrace(interval));
 }
 
+// ---- retrace cadence probe (ROADMAP R5 probe 3) -------------------------
+//
+// R5's open frontier is whether the guest's VI retrace fires at 60 Hz. The
+// game's audio thread produces on every retrace, so an over-delivering ticker
+// would explain BOTH R5 symptoms with one cause: static (the ring pegs at its
+// cap and drop-oldest skips playback) and the over-speed feel (game logic
+// advances too fast). That hypothesis was unfalsifiable because nothing
+// measured the rate -- OOT_SWAP_TIMING times the harness's compute, and the
+// shell's WaitUntil paces its own PUMP, neither of which is this clock.
+//
+// The two clocks this separates:
+//   - RetraceSchedule::advance fires on GUEST VIRTUAL time and reports every
+//     interval crossed (fn64-runtime/src/vi.rs) -- it has no wall-clock notion
+//     and cannot self-check.
+//   - Wall time only exists host-side. So the correlation lives here, in
+//     fn64-abi: fn64-runtime is deliberately wall-clock-free (DESIGN.md §1),
+//     and instrumenting it there would break that property for a diagnostic.
+//
+// Counts only; never gates or paces anything. Report with retrace_cadence().
+
+use std::cell::Cell;
+use std::time::Instant;
+
+thread_local! {
+    /// Total OS_EVENT_VI ticks the schedule has fired since the first one.
+    static RETRACE_TICKS: Cell<u64> = const { Cell::new(0) };
+    /// Wall-clock at the FIRST tick -- the baseline every rate is measured
+    /// against. Deliberately not process start: arming happens after boot
+    /// setup, so process start would dilute the rate with startup time.
+    static RETRACE_FIRST: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Record `n` retrace ticks as fired. Called from the delivery seam, so it
+/// counts what the GUEST actually receives -- not what the schedule computed
+/// and not what the host pump requested.
+pub(crate) fn note_retrace_ticks(n: u32) {
+    if n == 0 {
+        return;
+    }
+    RETRACE_FIRST.with(|f| {
+        if f.get().is_none() {
+            f.set(Some(Instant::now()));
+        }
+    });
+    RETRACE_TICKS.with(|c| c.set(c.get() + u64::from(n)));
+}
+
+/// Observed VI retrace cadence: `(ticks, elapsed_secs, hz)` since the first
+/// tick, or `None` before any fired.
+///
+/// `hz` is the number to read: NTSC wants ~60. Materially above it means the
+/// ticker over-delivers and R5 probe 3 is confirmed; at ~60 the cause is
+/// elsewhere and probe 3 is REFUTED -- which is worth just as much, since it
+/// is currently the leading hypothesis.
+///
+/// Returns None (not a zeroed struct) before the first tick, so "not armed
+/// yet" can never be misread as "0 Hz".
+pub fn retrace_cadence() -> Option<(u64, f64, f64)> {
+    let first = RETRACE_FIRST.with(Cell::get)?;
+    let ticks = RETRACE_TICKS.with(Cell::get);
+    let secs = first.elapsed().as_secs_f64();
+    // The first tick starts the clock, so it is the baseline, not a sample:
+    // N ticks span N-1 intervals. At N=1 there is no interval yet -> 0.0 Hz
+    // rather than a divide-by-zero or a fabricated rate.
+    let hz = if secs > 0.0 {
+        (ticks.saturating_sub(1)) as f64 / secs
+    } else {
+        0.0
+    };
+    Some((ticks, secs, hz))
+}
+
+#[cfg(test)]
+mod retrace_cadence_tests {
+    use super::*;
+
+    #[test]
+    fn no_ticks_reports_none_rather_than_zero_hz() {
+        RETRACE_FIRST.with(|f| f.set(None));
+        RETRACE_TICKS.with(|c| c.set(0));
+        assert!(
+            retrace_cadence().is_none(),
+            "before the first tick the probe must say 'no data', never 0 Hz -- \
+             an unarmed ticker misread as a stalled one would send R5 chasing a \
+             ghost"
+        );
+    }
+
+    #[test]
+    fn ticks_accumulate_and_report_a_rate() {
+        RETRACE_FIRST.with(|f| f.set(None));
+        RETRACE_TICKS.with(|c| c.set(0));
+        note_retrace_ticks(1);
+        note_retrace_ticks(3);
+        let (ticks, secs, _hz) = retrace_cadence().expect("armed after a tick");
+        assert_eq!(ticks, 4, "every fired tick counts, including batched ones");
+        assert!(secs >= 0.0);
+    }
+
+    #[test]
+    fn zero_ticks_does_not_arm_the_baseline() {
+        RETRACE_FIRST.with(|f| f.set(None));
+        RETRACE_TICKS.with(|c| c.set(0));
+        note_retrace_ticks(0);
+        assert!(
+            retrace_cadence().is_none(),
+            "a 0-tick call means the schedule fired nothing; it must not start \
+             the clock, or the measured window would begin before any retrace"
+        );
+    }
+}
+
 /// `osViGetCurrentFramebuffer(void) -> void*` -- no arguments; returns the
 /// currently-displayed (not next-queued) framebuffer's vram pointer.
 /// Function-table slot only (`recomp_overlays.inl:2974`). This crate's

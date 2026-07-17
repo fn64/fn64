@@ -198,11 +198,23 @@ and scope limits that make an open item meaningful.
     a rate check.
   - EXISTS: the shell's 60-swap heartbeat (`main.rs:406`) and `ring_frames`,
     which is how the pegged-ring evidence was gathered.
-  - **MISSING: nothing measures VI retrace cadence — the clock actually under
-    suspicion.** No instrument answers "how many retrace messages per wall
-    second does the guest receive?" Build that first; it is a counter and a
-    timestamp, and without it probe 3 is unfalsifiable. That is the iteration
-    mechanism this item needs and does not have.
+  - **BUILT 2026-07-17: `fn64_abi::retrace_cadence()`** -> `(ticks, secs, hz)`
+    since the first tick, or `None` before any (never a fake 0 Hz). Counted in
+    `Executor::advance_time` where ticks really fire; correlated with wall-clock
+    in `fn64-abi` because `fn64-runtime` is wall-clock-free by design. Reported
+    by the harness summary and, more importantly, on the shell's heartbeat line
+    NEXT TO `ring_frames` — that pairing is the experiment.
+    First reading, headless, 60 swaps: **59 ticks in 0.314s = 184.9 Hz**. The
+    59:60 tick:swap ratio confirms the probe watches the right clock. The rate
+    itself proves nothing here — headless runs unpaced, so ~3x is expected. THE
+    NUMBER THAT DECIDES PROBE 3 IS THE SHELL'S, which paces its pump at 60 Hz:
+    retrace_hz >> 60 there = ticker over-delivers = probe 3 CONFIRMED, one
+    cause for both symptoms. retrace_hz ~= 60 with a pegged ring = probe 3
+    REFUTED, cause is downstream in the producer. Either way the hypothesis
+    stops being unfalsifiable.
+    Suspicious but unproven: headless runs ~3x fast, and R5's evidence is ~3 AI
+    buffers/frame where ~1 is expected. Do not read that as confirmation —
+    headless SHOULD run fast. Measure the shell.
 
   **A REFERENCE CAPTURE — yes, but capture it, never download it** (user
   asked 2026-07-17). A golden WAV of the intro pulled from the web is
