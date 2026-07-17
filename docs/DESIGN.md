@@ -15,8 +15,16 @@ fn64-runtime   core: scheduler, OSMesgQueue, timers, PI/SI/VI/AI plumbing, rdram
 fn64-abi       the extern "C" surface recompiled code links against
 fn64-boot-harness shared generated-section bridge/registration and ABI-sized rdram allocation
 fn64-shell     the executable: window, input, audio out, ROM/RecompiledFuncs intake
-fn64-rt64      FFI bridge to RT64 (C++) -- all C++ interop quarantined here
+fn64-render    backend-agnostic render seam + the pure-Rust ReferenceBackend (A/B oracle)
+fn64-render-rt64 FFI bridge to RT64 (C++) -- all C++ interop quarantined here
+fn64-recomp / fn64-recomp-rs  the Rust-emitting recompiler and its whole-ROM driver (§1.1's `rs` lane)
+fn64-audio     RSP audio ucode execution
+fn64-diff      trace/state differential tooling (§4's comparator lane)
+fn64-discover  ROM discovery: symbol/section metadata without a decomp (Phase D)
 ```
+
+(`fn64-rt64` is this doc's older name for `fn64-render-rt64`; the crate is
+`fn64-render-rt64` and §1's later prose still uses the short form.)
 
 Dependency direction is strictly one-way:
 
@@ -88,9 +96,48 @@ call into RT64's C++ API. Rationale, three reasons:
    `fn64-rt64`; `cargo test -p fn64-runtime -p fn64-abi` stays pure-Rust and
    fast in CI.
 
-Planned, not built now: `fn64-recomp`, a Rust-emitting recompiler, once the
-runtime has earned enough real mileage to specify what it wants generated
-code to look like (per `README.md`).
+No longer planned-only: `fn64-recomp`/`fn64-recomp-rs`, the Rust-emitting
+recompiler `README.md` deferred until the runtime earned it, are built and
+boot OoT. They add the second lane below.
+
+### 1.1 The two lanes: how the game arrives, and what draws it
+
+Two independent switches select a build configuration. They are orthogonal,
+and a symptom is only diagnosable once you know which lane produced it — the
+same visual artifact means different things in each.
+
+**Recomp lane — `FN64_RECOMP=c|rs`.** Which *form the game arrives in*:
+
+- `c` (default): N64Recomp's emitted `RecompiledFuncs/*.c`, compiled and
+  linked as before.
+- `rs`: `fn64-recomp-rs` emits the whole ROM as a typed-Rust crate
+  (`recompile_rom`), linked directly.
+
+Both lanes are the same recompiled semantics in two forms, so they A/B each
+other. This is a *different axis* from §4's A/B, which swaps which **runtime**
+implements the `_recomp` surface under an identical game; this swaps the
+**game's form** under an identical runtime. §4's `nm`-based completeness gate
+applies to the `c` lane's archive; the `rs` lane resolves the same surface
+through Rust linkage instead.
+
+The emitted crate is out-of-tree, game-derived material, and per `AGENTS.md`
+it must never enter git or the main workspace graph. That constraint — not
+taste — is why the rs lane builds through **standalone manifests carrying
+their own `[workspace]`** (`examples/oot-boot/rs/Cargo.toml`,
+`crates/fn64-shell/rs/Cargo.toml`) that reuse the sibling `src/main.rs` and
+`build.rs` rather than duplicating them. A gitignored `recompiled` symlink is
+refreshed from `RECOMP_RS_DIR` before Cargo resolves the graph. A standalone
+manifest is the seam that keeps game-derived code out of the workspace; if
+you find yourself adding the emitted crate as a normal path dependency, that
+is the rule you are about to break.
+
+**Render backend — `FN64_RENDER=reference|rt64`** (feature `rt64`):
+`ReferenceBackend` is the pure-Rust, headless CI/seam-test backend and A/B
+oracle; RT64 (§1's `fn64-render-rt64`) is the faithful lane. Per
+`RT64-WRAP-EVAL.md`, keep both — the oracle is not obsolete once RT64 works.
+
+Operational detail (emit caching, the shared target dir, the `./oot` loop)
+lives in `FAST-LOOP.md`; this section is only the shape and the why.
 
 ## 2. Threading model
 
