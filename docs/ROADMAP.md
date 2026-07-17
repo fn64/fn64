@@ -146,22 +146,35 @@ ONE has a permanent reason to be out-of-tree:
 
 | What | Size | Verdict |
 |---|---|---|
-| `refs/N64RecompSource/include` (`recomp.h`) | 72K | **Vendor.** MIT, from fn64's own upstream fork. |
-| `games/OOTU/oot.toml` | 156 lines | **Own it.** Recompiler config, not game bytes; its header calls itself a scaffold. |
+| `refs/N64RecompSource/include` (`recomp.h`) | 475 lines | **VENDORED 2026-07-17** at `crates/fn64-boot-harness/bridge/include/vendor/` (MIT, (c) 2024 Wiseguy, license beside it). Only `recomp.h` was ever needed — `librecomp/sections.h` is fn64's own clean-room header and always was. |
+| `games/OOTU/oot.toml` | 156 lines | **Stays out-of-tree — H1's original verdict was WRONG.** Its paths are relative to its own directory and point at `oot-ntsc-1.0.z64` and `syms/dump.toml` (989K of decomp-derived symbols). In-tree it would be a config reaching back into the legacy checkout. It dies with the oracle metadata at D-gate, not before. |
 | `runtime/ABI-SURFACE.md` + `abi_surface.json` | 204K | **Not needed.** Nothing consumes it; the live oracle is `fn64-abi`'s `c_smoke` link test (H2). |
 | `games/*/syms/dump.toml`, `refs/oot-decomp/**/segments.csv` | — | **Dies with Phase D.** D4 emits fn64's own pack; D-gate proves it. |
+| `games/OOTU/rsp-recomp/src/oot_aspmain.rs` | 186K | **Missed by the first inventory; found 2026-07-17 building H1.** ROM-derived (recompiled aspMain ucode), so it cannot be vendored. Worse than a hardcoded path: `examples/oot-boot/audio-ucode/build.rs` reaches it via `../../../../aki-recomp/...`, which assumes fn64 and aki-recomp are on-disk SIBLINGS. It breaks in any worktree (they nest deeper) and for any contributor. Needs an env var + loud skip, like H3. |
 | `games/*/*.z64` | — | **Stays out-of-tree forever.** But that is a plain `ROM=` path, never `$AKI`-shaped. |
 
 So `$AKI` is not a domain concept needing a better name — it is "the old
 project's working directory", four artifacts fn64 should own plus one ROM
 path. Do NOT rename it; delete the need for it.
 
-- [ ] **H1 vendor/own the three non-oracle artifacts.** Vendor `recomp.h` +
-  `recompiler/` from the MIT N64Recomp fork (submodule or checked-in copy —
-  it is 72K); move `oot.toml` into fn64 (it is config, no game bytes); replace
-  the `$AKI`-derived ROM defaults with a plain `ROM=`/`OOT_ROM=` that has no
-  legacy path baked in. After this, an rs-lane boot needs a ROM and nothing
-  else from aki-recomp.
+- [x] **H1 vendor `recomp.h`** (done 2026-07-17). `crates/fn64-boot-harness/
+  bridge/include/vendor/recomp.h` + `LICENSE-N64Recomp`. `RECOMP_H_DIR` now
+  defaults to it and only overrides (a bogus override still fails loudly — no
+  silent fallback). Verified: the C lane builds the whole generated corpus with
+  `RECOMP_H_DIR` unset; override still honored; 621/621 workspace tests pass.
+
+  Two things the original inventory got wrong, both found by doing it:
+  - Only `recomp.h` was ever needed. `librecomp/sections.h` is fn64's OWN
+    clean-room header (`bridge/include/librecomp/sections.h`) and always was —
+    the build.rs hints saying otherwise were wrong, and are fixed.
+  - `oot.toml` must NOT move in-tree (see table above).
+- [ ] **H1b the audio-ucode sibling-path assumption.** `examples/oot-boot/
+  audio-ucode/build.rs` hardcodes `../../../../aki-recomp/games/OOTU/rsp-recomp/
+  src/oot_aspmain.rs` — it assumes fn64 and aki-recomp are on-disk siblings, so
+  it breaks in ANY worktree and for any contributor. The file is ROM-derived
+  (186K of recompiled aspMain) so it cannot be vendored; it needs an env var
+  plus a loud, named skip, exactly like H3. `--no-default-features` (or
+  `OOT_SKIP_AUDIO_UCODE`) is the current workaround.
 - [x] **H2 `ABI-SURFACE.md` — RESOLVED 2026-07-17: fn64 does not need it, and
   the clean-room question never had to be answered.** It was AGENTS.md
   read-order item 3 (mandatory) while living in a legacy repo, so a fresh clone

@@ -28,7 +28,6 @@
 //! Run it (OoT, with the perf-friendly audio-ucode skip):
 //! ```text
 //! RECOMPILED_DIR=.../OOTU/RecompiledFuncs \
-//! RECOMP_H_DIR=.../N64RecompSource/include \
 //! ROM=.../oot-ntsc-1.0.z64 \
 //! OOT_SKIP_AUDIO_UCODE=1 \
 //! cargo run -p fn64-shell
@@ -55,8 +54,7 @@ fn main() {
          To get a live, playable window, rebuild with the game intake env vars set (same\n\
          contract as examples/oot-boot), e.g. for OoT:\n\
          \n\
-         \x20 RECOMPILED_DIR=.../aki-recomp/games/OOTU/RecompiledFuncs \\\n\
-         \x20 RECOMP_H_DIR=.../aki-recomp/refs/N64RecompSource/include \\\n\
+         \x20 RECOMPILED_DIR=.../OOTU/RecompiledFuncs \\\n\
          \x20 ROM=.../oot-ntsc-1.0.z64 \\\n\
          \x20 OOT_SKIP_AUDIO_UCODE=1 \\\n\
          \x20 cargo run -p fn64-shell\n\
