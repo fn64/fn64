@@ -41,7 +41,6 @@
 use fn64_render::{RenderError, UcodeId};
 use std::cell::RefCell;
 use std::collections::HashSet;
-#[cfg(any(feature = "rt64", test))]
 use std::{collections::BTreeMap, fmt::Write as _};
 
 // --- Opcode bytes: F3DEX_GBI_2 branch of the public ultra64/gbi.h ---
@@ -2010,7 +2009,6 @@ pub fn decode_display_list_f3dex2(
 /// copying game data into this repository. The caller owns where the returned
 /// text is written; the RT64 task-dump hook writes only to an explicitly
 /// requested untracked diagnostic directory.
-#[cfg(any(feature = "rt64", test))]
 pub(crate) fn trace_display_list_f3dex2(rdram: &[u8], dl_addr: u32) -> String {
     struct TraceState {
         segments: [u32; 16],
