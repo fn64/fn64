@@ -1238,6 +1238,79 @@ mod tests {
     }
 
     #[test]
+    fn exhaustive_jalr_target_is_an_authoritative_entry() {
+        // An exhaustive computed CALL (`jalr $ra, $t9`) whose proven target set
+        // is represented in the CFG promotes that target to an authoritative
+        // callable root, exactly like a direct `jal`. The target carries no
+        // entry fact of its own: its authority comes solely from being a proven
+        // reachable computed-call destination.
+        let jalr_ra_t9 = (25u32 << 21) | (31u32 << 11) | 0x09;
+        let mut bytes = asm(&[jalr_ra_t9, NOP, JR_RA, NOP]);
+        bytes.resize(0x28, 0);
+        bytes[0x20..0x24].copy_from_slice(&JR_RA.to_be_bytes());
+        bytes[0x24..0x28].copy_from_slice(&NOP.to_be_bytes());
+        let target = BASE + 0x20;
+        let mut exhaustive = BTreeMap::new();
+        exhaustive.insert(BASE, vec![target]);
+        let cfg = build_cfg_with_indirect("bank", &bytes, BASE, &[BASE], &exhaustive);
+        let partition = partition(&cfg);
+        // Only the caller BASE has an entry fact; the target does not.
+        let mut facts = facts_for(bytes.len() as u32, &[BASE]);
+        facts.insert(Fact::IndirectTransferAnalysis {
+            site: BankAddr::new("bank", BASE),
+            via_call: true,
+            state: IndirectTransferState::Exhaustive,
+            kind: Some(IndirectTransferKind::Constant),
+            targets: vec![target],
+            memory_sources: vec![],
+        });
+
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
+        let target_assessment = report
+            .assessments
+            .iter()
+            .find(|assessment| assessment.entry().pc == target)
+            .expect("the exhaustive-call target is assessed");
+        assert!(
+            matches!(target_assessment, OwnerAssessment::Proven { .. }),
+            "exhaustive computed-call target should be a proven owner: {target_assessment:?}"
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_jalr_target_is_not_authoritative() {
+        // Same computed call, but the site is NOT exhaustively resolved: the
+        // CFG keeps it an open `Indirect`, so its runtime destination is
+        // unproven. A block that merely looks like a function at BASE+0x20 must
+        // NOT be admitted as an owner — it lacks any authoritative entry.
+        let jalr_ra_t9 = (25u32 << 21) | (31u32 << 11) | 0x09;
+        let mut bytes = asm(&[jalr_ra_t9, NOP, JR_RA, NOP]);
+        bytes.resize(0x28, 0);
+        bytes[0x20..0x24].copy_from_slice(&JR_RA.to_be_bytes());
+        bytes[0x24..0x28].copy_from_slice(&NOP.to_be_bytes());
+        let target = BASE + 0x20;
+        // No exhaustive map entry: the `jalr` stays an open indirect site.
+        // Seed the target as a traversal root so it is still assessed, proving
+        // that traversal reach alone never confers entry authority.
+        let cfg = build_cfg("bank", &bytes, BASE, &[BASE, target]);
+        let partition = partition(&cfg);
+        let facts = facts_for(bytes.len() as u32, &[BASE]);
+
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
+        let target_assessment = report
+            .assessments
+            .iter()
+            .find(|assessment| assessment.entry().pc == target)
+            .expect("the seeded target is assessed");
+        assert!(
+            frontier(target_assessment)
+                .blockers
+                .contains(&OwnerBlocker::EntryNotAuthoritative),
+            "a non-exhaustive computed-call target must not be authoritative: {target_assessment:?}"
+        );
+    }
+
+    #[test]
     fn competing_root_closure_is_ambiguous() {
         let bytes = asm(&[NOP, NOP, JR_RA, NOP]);
         let cfg = build_cfg("bank", &bytes, BASE, &[BASE, BASE + 4]);

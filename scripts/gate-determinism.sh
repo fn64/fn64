@@ -41,7 +41,7 @@ expected_d1_overlays=9b0dc15f92aac10586edf98a02873c0acfc57f4ff6f00f857546fcb1ec1
 # recovered VROM overlays vs hand-supplied table geometry). B reaches
 # 99.46%/48.45% — 67% of C's hand-geometry recall at matching precision.
 # Held-out (OoT dump opens after all three discovery runs).
-expected_d1_oot_overlays=ac60619581fa8b5526549929f320ebe19d84a02908ec43e2fa34dc1e2412ede9
+expected_d1_oot_overlays=f14c646ea096dcc1ec38a58fbf3aeb2b2cde396762ac1baa00e1968eb7491e6f
 # gate_owners_overlays: exact-owner proof on the recovered NWXE overlay banks
 # (6 owners, 0 wrong extents). Dump is grading-only, opened after proof. The
 # digest moved when Phase-6 indirect closure strengthened: unresolved_indirect
@@ -54,7 +54,7 @@ expected_owners_overlays=ad9100231545eb7bbaab4f492531c2e5be7500b08be9778f5825342
 # SM64 stays the correct no-overlay negative control (0 admissions); GE/PD
 # ungraded. Digest is fixed only with the full OoT+GE+PD+SM64 ROM set (unset
 # ROMs are loud skips that change output), so it is guarded on those vars.
-expected_overlay_generalize=5401e638c9c233b79ed788a824fd0666d3ad31537657f140fdf09e80fb0a9106
+expected_overlay_generalize=b05d47d78e79ce3c49ff037356ad42cd9c72b525fa6ebe2894cc6e8f1b5ff3c2
 # gate_coverage renders the metric ladder for every supplied ROM; its digest is
 # only fixed when all three ROM vars are set, since an unset var is a loud skip
 # line that legitimately changes the output.

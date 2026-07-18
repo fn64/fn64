@@ -52,6 +52,77 @@ use crate::execution::{
 };
 use crate::runtime::{Rdram, RecompContext};
 
+/// A hardware-register (KSEG1 MMIO) access the interpreter recognizes as
+/// *not* backed RDRAM and routes to a modeled device instead of faulting.
+///
+/// # Why this is a trait, and why it lives here
+///
+/// The interpreter (`fn64-recomp-rs`) must reach the runtime's modeled device
+/// state (`fn64-runtime`'s `DeviceFabric`/`MmioSpace`) to give a guest MMIO
+/// load a modeled register value and a guest MMIO store a modeled effect. But
+/// `fn64-recomp-rs` must not depend on `fn64-runtime` (the dependency edge runs
+/// the other way — `docs/DESIGN.md` §1, and `fn64-runtime/Cargo.toml`'s note on
+/// the one-way direction). So the seam is a *port trait* owned here and
+/// *implemented* on the runtime side over the SAME peripheral state the AOT/
+/// shim lanes use: there is no second device authority, only a typed door
+/// through which the interpreter reaches the one that already exists.
+///
+/// # The load-bearing safety property lives in `None`
+///
+/// A port is the sole authority on which addresses are its MMIO window. A
+/// `read_w`/`write_w` returning [`MmioOutcome::NotMmio`] means "this effective
+/// address is not a register I model" — the interpreter then falls through to
+/// the ordinary [`Rdram::try_load_w`]/[`Rdram::try_store_w`] accessor, which
+/// faults typed if the address is also outside backed RDRAM. An MMIO window
+/// therefore never makes an arbitrary out-of-RDRAM address "succeed": only the
+/// exact register offsets the port claims are diverted; everything else stays a
+/// [`CpuFaultKind::MemoryFault`], exactly as before this seam existed.
+pub trait MmioPort {
+    /// Word read of the KSEG1 effective address `vaddr` (full 64-bit,
+    /// sign-extended, as the guest computed it).
+    fn read_w(&mut self, vaddr: u64) -> MmioOutcome<u32>;
+    /// Word store of `value` to the KSEG1 effective address `vaddr`.
+    fn write_w(&mut self, vaddr: u64, value: u32) -> MmioOutcome<()>;
+}
+
+/// The result of offering a word access to an [`MmioPort`].
+///
+/// Deliberately three-valued so the "in the window but the device rejected it"
+/// case (an unmodeled register, a misaligned MMIO address, a device fault)
+/// stays a *loud typed* outcome rather than collapsing into either a silent nop
+/// or a spurious RDRAM fault. The interpreter surfaces [`MmioOutcome::Fault`] as
+/// a [`CpuFaultKind::MemoryFault`] naming the faulting address — never a panic
+/// or a nop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmioOutcome<T> {
+    /// The address is not in this port's modeled MMIO window; the interpreter
+    /// must handle it as ordinary memory (backed RDRAM, or a typed fault).
+    NotMmio,
+    /// A modeled register access; `T` is the read value (`u32`) or `()` for a
+    /// store whose modeled effect has been applied.
+    Handled(T),
+    /// The address is in the port's window but the device could not service it
+    /// (unmodeled register, misaligned, or a device-level fault). Carries the
+    /// faulting effective address for a typed [`CpuFaultKind::MemoryFault`].
+    Fault { addr: u64 },
+}
+
+/// The no-device port: every access is [`MmioOutcome::NotMmio`], so the
+/// interpreter behaves *exactly* as it did before the MMIO seam existed (word
+/// loads/stores go straight to backed RDRAM, and an out-of-RDRAM address is a
+/// typed [`CpuFaultKind::MemoryFault`]). [`run_bank`] uses this, which is why
+/// adding the seam is byte-identical for every caller that does not opt in.
+pub struct NoMmio;
+
+impl MmioPort for NoMmio {
+    fn read_w(&mut self, _vaddr: u64) -> MmioOutcome<u32> {
+        MmioOutcome::NotMmio
+    }
+    fn write_w(&mut self, _vaddr: u64, _value: u32) -> MmioOutcome<()> {
+        MmioOutcome::NotMmio
+    }
+}
+
 /// Why one interpreter step could not execute an instruction whose *encoding*
 /// the shared decoder recognizes but whose *architecture* this slice does not
 /// yet model. Distinct from a guest [`CpuFault`]: this is a translator/runtime
@@ -124,8 +195,30 @@ pub fn run_bank(
     ctx: &mut RecompContext,
     mem: &mut Rdram<'_>,
 ) -> Result<BlockRun, UnsupportedOp> {
-    let mut interp = Interp { catalog, bank };
-    interp.run(entry, budget, ctx, mem)
+    run_bank_with_mmio(catalog, bank, entry, budget, ctx, mem, &mut NoMmio)
+}
+
+/// [`run_bank`] with a hardware-register ([`MmioPort`]) door installed.
+///
+/// Identical to [`run_bank`] except that a word load/store whose effective
+/// address the `port` claims as a modeled register is routed to the port
+/// instead of backed RDRAM: an interpreted `lw` of a device register gets the
+/// port's modeled value, and an interpreted `sw` updates the port's modeled
+/// state, through the SAME peripheral authority the AOT/shim lanes use. Every
+/// other access — including any address the port does not claim — is handled
+/// exactly as [`run_bank`] handles it, so hole-stays-a-fault is untouched:
+/// [`run_bank`] itself is just this function with a [`NoMmio`] port.
+pub fn run_bank_with_mmio(
+    catalog: &CodeCatalog,
+    bank: BankId,
+    entry: ExecutionKey,
+    budget: InstructionBudget,
+    ctx: &mut RecompContext,
+    mem: &mut Rdram<'_>,
+    port: &mut dyn MmioPort,
+) -> Result<BlockRun, UnsupportedOp> {
+    let interp = Interp { catalog, bank };
+    interp.run(entry, budget, ctx, mem, port)
 }
 
 /// The interpreter bound to one immutable bank inside a catalog.
@@ -136,11 +229,12 @@ struct Interp<'a> {
 
 impl Interp<'_> {
     fn run(
-        &mut self,
+        &self,
         entry: ExecutionKey,
         budget: InstructionBudget,
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
+        port: &mut dyn MmioPort,
     ) -> Result<BlockRun, UnsupportedOp> {
         // Bank/alignment admission mirrors the AOT runner prologue exactly: an
         // unknown bank or unaligned entry PC faults with zero instructions.
@@ -198,7 +292,8 @@ impl Interp<'_> {
                     }
                 };
 
-                match self.control_transfer(pc, instr, delay_pc, delay_word, delay, ctx, mem) {
+                match self.control_transfer(pc, instr, delay_pc, delay_word, delay, ctx, mem, port)
+                {
                     Ok(Step::Exit { exit, retired }) => {
                         let executed = executed + retired;
                         return Ok(BlockRun::new(exit, executed));
@@ -217,7 +312,7 @@ impl Interp<'_> {
             }
 
             // Ordinary straight-line instruction.
-            match self.straight(pc, word, instr, ctx, mem) {
+            match self.straight(pc, word, instr, ctx, mem, port) {
                 Ok(Step::Fallthrough { next, retired }) => {
                     executed += retired;
                     if self.contains(next) {
@@ -311,6 +406,7 @@ impl Interp<'_> {
         delay: Instruction,
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
+        port: &mut dyn MmioPort,
     ) -> Result<Step, StepFault> {
         use Instruction::*;
 
@@ -318,9 +414,14 @@ impl Interp<'_> {
         let target = branch_target(&instr, pc);
 
         // Run the delay slot as an ordinary instruction. It may fault (memory)
-        // or be unsupported; either annuls the branch and propagates typed.
-        let run_delay = |ctx: &mut RecompContext, mem: &mut Rdram<'_>| -> Result<(), StepFault> {
-            match self.straight(delay_pc, delay_word, delay, ctx, mem)? {
+        // or be unsupported; either annuls the branch and propagates typed. The
+        // delay slot is itself an ordinary instruction, so it too may be an MMIO
+        // load/store: it is routed through the same `port`.
+        let run_delay = |ctx: &mut RecompContext,
+                         mem: &mut Rdram<'_>,
+                         port: &mut dyn MmioPort|
+         -> Result<(), StepFault> {
+            match self.straight(delay_pc, delay_word, delay, ctx, mem, port)? {
                 Step::Fallthrough { .. } => Ok(()),
                 Step::Exit { .. } => {
                     unreachable!("a delay-slot instruction is never itself a control transfer")
@@ -334,7 +435,7 @@ impl Interp<'_> {
         let self_pause = target == Some(pc)
             && (matches!(instr, J { .. }) || matches!(instr, Beq { rs: 0, rt: 0, .. }));
         if self_pause {
-            run_delay(ctx, mem)?;
+            run_delay(ctx, mem, port)?;
             return Ok(Step::Exit {
                 exit: BlockExit::Yield(self.key(pc)),
                 retired: 2,
@@ -346,22 +447,22 @@ impl Interp<'_> {
                 // Snapshot the target BEFORE the delay slot: a delay instruction
                 // that writes `rs` must not redirect the already-issued jump.
                 let target = ctx.r_u32(rs);
-                run_delay(ctx, mem)?;
+                run_delay(ctx, mem, port)?;
                 self.runtime_transfer(target)
             }
             Jalr { rd, rs } => {
                 let target = ctx.r_u32(rs);
                 ctx.set_r32(rd, fallthrough as i32);
-                run_delay(ctx, mem)?;
+                run_delay(ctx, mem, port)?;
                 self.runtime_transfer(target)
             }
             J { .. } => {
-                run_delay(ctx, mem)?;
+                run_delay(ctx, mem, port)?;
                 self.proven_or_resolved(target.expect("J has a static target"))
             }
             Jal { .. } => {
                 ctx.set_r32(31, fallthrough as i32);
-                run_delay(ctx, mem)?;
+                run_delay(ctx, mem, port)?;
                 self.proven_or_resolved(target.expect("JAL has a static target"))
             }
             Bltzal { .. } | Bgezal { .. } | Bltzall { .. } | Bgezall { .. } => {
@@ -373,13 +474,13 @@ impl Interp<'_> {
                 if instr.is_branch_likely() {
                     // Branch-likely: the delay slot runs ONLY when taken.
                     if take {
-                        run_delay(ctx, mem)?;
+                        run_delay(ctx, mem, port)?;
                         self.proven_or_resolved(target)
                     } else {
                         self.proven_or_resolved(fallthrough)
                     }
                 } else {
-                    run_delay(ctx, mem)?;
+                    run_delay(ctx, mem, port)?;
                     self.proven_or_resolved(if take { target } else { fallthrough })
                 }
             }
@@ -387,7 +488,7 @@ impl Interp<'_> {
                 let take = branch_condition(&instr, ctx).expect("likely branch has a condition");
                 let target = target.expect("likely branch has a static target");
                 if take {
-                    run_delay(ctx, mem)?;
+                    run_delay(ctx, mem, port)?;
                     self.proven_or_resolved(target)
                 } else {
                     self.proven_or_resolved(fallthrough)
@@ -398,7 +499,7 @@ impl Interp<'_> {
                 // delay slot (a delay instruction may overwrite an operand).
                 let take = branch_condition(&instr, ctx).expect("branch has a condition");
                 let target = target.expect("branch has a static target");
-                run_delay(ctx, mem)?;
+                run_delay(ctx, mem, port)?;
                 self.proven_or_resolved(if take { target } else { fallthrough })
             }
         };
@@ -416,6 +517,7 @@ impl Interp<'_> {
         instr: Instruction,
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
+        port: &mut dyn MmioPort,
     ) -> Result<Step, StepFault> {
         let next = pc.wrapping_add(4);
         let ok = Ok(Step::Fallthrough { next, retired: 1 });
@@ -432,6 +534,41 @@ impl Interp<'_> {
                 word,
             })
         };
+
+        // The MMIO seam: a word load/store is offered to the device `port`
+        // FIRST. The port is the sole authority on which effective addresses are
+        // modeled registers (`MmioOutcome::NotMmio` for everything else), so this
+        // diverts ONLY register accesses to the modeled device and leaves every
+        // other address — backed RDRAM or an out-of-RDRAM hole — to
+        // `exec_straight`'s `try_*` accessor, unchanged. That is why the seam
+        // cannot turn an arbitrary out-of-RDRAM address into a success: the port
+        // says `NotMmio` and the address still faults typed. Only `Lw`/`Sw` are
+        // routed here (the one proven device-word interaction); every other
+        // width/op stays on the plain RDRAM path — a deliberately narrow first
+        // slice (`docs/UNIVERSAL-RUNTIME-PLAN.md` U2).
+        match instr {
+            Instruction::Lw { rt, base, off } => {
+                let addr = Rdram::eff_addr(ctx.r(base), off);
+                match port.read_w(addr) {
+                    MmioOutcome::Handled(v) => {
+                        ctx.set_r32(rt, v as i32);
+                        return ok;
+                    }
+                    MmioOutcome::Fault { addr } => return Err(mem_fault(addr)),
+                    MmioOutcome::NotMmio => {}
+                }
+            }
+            Instruction::Sw { rt, base, off } => {
+                let addr = Rdram::eff_addr(ctx.r(base), off);
+                match port.write_w(addr, ctx.r_u32(rt)) {
+                    MmioOutcome::Handled(()) => return ok,
+                    MmioOutcome::Fault { addr } => return Err(mem_fault(addr)),
+                    MmioOutcome::NotMmio => {}
+                }
+            }
+            _ => {}
+        }
+
         exec_straight(instr, ctx, mem, &mem_fault, &unsupported)?;
         ok
     }
@@ -985,5 +1122,206 @@ mod tests {
             7,
             "the self-loop delay slot runs before the yield"
         );
+    }
+
+    // -- MMIO seam (interpreter side) --------------------------------------
+    //
+    // A minimal in-crate mock port standing in for the runtime's real device
+    // model: it owns ONE modeled register value and claims exactly ONE KSEG1
+    // window (`0xFFFF_FFFF_A460_0000..A460_1000`, the PI block). Everything
+    // outside that window is `NotMmio`, so it exercises the load-bearing
+    // property that an MMIO window does not make arbitrary addresses succeed.
+    // The runtime-side integration test (`fn64-runtime/tests/`) proves the SAME
+    // seam against the crate's actual `DeviceFabric`/`MmioSpace` state.
+    struct MockPiPort {
+        /// The one modeled register's value (a PI_STATUS-like word).
+        reg: u32,
+        /// Reads/writes observed, for asserting the port was actually hit.
+        reads: u32,
+        writes: u32,
+    }
+
+    // The single register this mock models: PI_STATUS at KSEG1 0xA460_0010,
+    // sign-extended to the 64-bit effective address the guest computes.
+    const PI_STATUS_VADDR: u64 = 0xFFFF_FFFF_A460_0010;
+    const PI_WINDOW_LO: u64 = 0xFFFF_FFFF_A460_0000;
+    const PI_WINDOW_HI: u64 = 0xFFFF_FFFF_A460_1000;
+
+    impl MmioPort for MockPiPort {
+        fn read_w(&mut self, vaddr: u64) -> MmioOutcome<u32> {
+            if !(PI_WINDOW_LO..PI_WINDOW_HI).contains(&vaddr) {
+                return MmioOutcome::NotMmio;
+            }
+            if vaddr == PI_STATUS_VADDR {
+                self.reads += 1;
+                MmioOutcome::Handled(self.reg)
+            } else {
+                // In-window but unmodeled register: a loud typed fault, never a
+                // silent 0 (mirrors MmioSpace::read_w's panic-to-fault stance).
+                MmioOutcome::Fault { addr: vaddr }
+            }
+        }
+        fn write_w(&mut self, vaddr: u64, value: u32) -> MmioOutcome<()> {
+            if !(PI_WINDOW_LO..PI_WINDOW_HI).contains(&vaddr) {
+                return MmioOutcome::NotMmio;
+            }
+            if vaddr == PI_STATUS_VADDR {
+                self.writes += 1;
+                self.reg = value;
+                MmioOutcome::Handled(())
+            } else {
+                MmioOutcome::Fault { addr: vaddr }
+            }
+        }
+    }
+
+    #[test]
+    fn interpreted_mmio_load_gets_the_modeled_register_value() {
+        // lui $t0,0xA460 ; lw $v0,0x10($t0) ; jr $ra ; nop
+        // The lw's effective address is the modeled PI_STATUS; the interpreter
+        // must return the port's value, not read RDRAM (which would fault).
+        let catalog = catalog_of(&[0x3C08_A460, 0x8D02_0010, 0x03E0_0008, 0x0000_0000]);
+        let mut port = MockPiPort {
+            reg: 0xDEAD_BEEF,
+            reads: 0,
+            writes: 0,
+        };
+        let mut storage = vec![0u8; 64];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        let run = run_bank_with_mmio(
+            &catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(8).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut port,
+        )
+        .unwrap();
+        assert_eq!(port.reads, 1, "the modeled register was read once");
+        // Word register value sign-extends into the GPR exactly as a real LW.
+        assert_eq!(ctx.r(2), 0xFFFF_FFFF_DEAD_BEEF);
+        assert!(matches!(run.exit, BlockExit::ResolveTransfer { .. }));
+    }
+
+    #[test]
+    fn interpreted_mmio_store_updates_the_modeled_register_state() {
+        // lui $t0,0xA460 ; ori $v0,$zero,0 ; sw $v0,0x10($t0) ; jr $ra ; nop
+        // A store of 0 to PI_STATUS updates the modeled state through the port.
+        let catalog = catalog_of(&[
+            0x3C08_A460, // lui $t0,0xA460
+            0x3402_0000, // ori $v0,$zero,0
+            0xAD02_0010, // sw $v0,0x10($t0)
+            0x03E0_0008, // jr $ra
+            0x0000_0000, // nop
+        ]);
+        let mut port = MockPiPort {
+            reg: 0b11, // busy+error set, as after a DMA start
+            reads: 0,
+            writes: 0,
+        };
+        let mut storage = vec![0u8; 64];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        run_bank_with_mmio(
+            &catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(8).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut port,
+        )
+        .unwrap();
+        assert_eq!(port.writes, 1, "the modeled register was written once");
+        assert_eq!(port.reg, 0, "the store updated modeled device state");
+    }
+
+    #[test]
+    fn a_non_mmio_out_of_rdram_load_still_faults_typed_with_a_port_present() {
+        // The load-bearing safety property: an MMIO window present must NOT make
+        // an arbitrary out-of-RDRAM address succeed. lui $t0,0x8000 ; lw
+        // $v0,0x40($t0) reads 0x8000_0040 — outside the 16-byte rdram AND
+        // outside the port's PI window — so it must be a typed MemoryFault, the
+        // same as with no port at all.
+        let catalog = catalog_of(&[0x3C08_8000, 0x8D02_0040, 0x03E0_0008, 0x0000_0000]);
+        let mut port = MockPiPort {
+            reg: 0xDEAD_BEEF,
+            reads: 0,
+            writes: 0,
+        };
+        let mut storage = vec![0u8; 16];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        let run = run_bank_with_mmio(
+            &catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(8).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut port,
+        )
+        .unwrap();
+        match run.exit {
+            BlockExit::Fault(CpuFault {
+                kind: CpuFaultKind::MemoryFault { addr },
+                ..
+            }) => assert_eq!(addr, 0xFFFF_FFFF_8000_0040),
+            other => panic!("expected typed MemoryFault, got {other:?}"),
+        }
+        assert_eq!(port.reads, 0, "the port was not consulted-as-handled");
+        assert_eq!(ctx.r(2), 0, "the faulting load wrote no register");
+    }
+
+    #[test]
+    fn an_in_window_unmodeled_register_is_a_typed_fault_not_a_nop() {
+        // A load in the PI window but at an unmodeled offset (0x14) is a typed
+        // MemoryFault (the port's Fault outcome), never a silent success.
+        // lui $t0,0xA460 ; lw $v0,0x14($t0)
+        let catalog = catalog_of(&[0x3C08_A460, 0x8D02_0014, 0x03E0_0008, 0x0000_0000]);
+        let mut port = MockPiPort {
+            reg: 0,
+            reads: 0,
+            writes: 0,
+        };
+        let mut storage = vec![0u8; 16];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        let run = run_bank_with_mmio(
+            &catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(8).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut port,
+        )
+        .unwrap();
+        match run.exit {
+            BlockExit::Fault(CpuFault {
+                kind: CpuFaultKind::MemoryFault { addr },
+                ..
+            }) => assert_eq!(addr, 0xFFFF_FFFF_A460_0014),
+            other => panic!("expected typed MemoryFault for unmodeled register, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_bank_default_no_mmio_still_faults_an_mmio_address() {
+        // Without a port (plain run_bank), an MMIO-window load is just an
+        // out-of-RDRAM MemoryFault — proving the seam is opt-in and the default
+        // path is byte-identical to before it existed.
+        let catalog = catalog_of(&[0x3C08_A460, 0x8D02_0010, 0x03E0_0008, 0x0000_0000]);
+        let mut ctx = RecompContext::new();
+        let run = run(&catalog, VA, 8, &mut ctx).unwrap();
+        assert!(matches!(
+            run.exit,
+            BlockExit::Fault(CpuFault {
+                kind: CpuFaultKind::MemoryFault { .. },
+                ..
+            })
+        ));
     }
 }
