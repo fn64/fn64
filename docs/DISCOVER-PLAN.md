@@ -154,9 +154,10 @@ terminators, and per-block digests without ROM words. Materialization
 re-verifies the normalized ROM and every block digest, then feeds disjoint
 spans directly to the typed sparse arbitrary-PC emitter. The real NWXE gate
 emits 197 blocks / 1,039 words, obtains pack SHA-256
-`5944f1a0c63523591cbef33c4856c594b2cca38466945bc63da35a7459dace44` (no test
-re-checks this digest until ROADMAP H3 makes `gate_b2`'s compile-time input
-paths reproducible), and compiles the generated runner with `rustc`. Addresses in gaps receive no
+`5944f1a0c63523591cbef33c4856c594b2cca38466945bc63da35a7459dace44`
+(re-checked by `scripts/gate-determinism.sh`, whose `gate_b2` stdout digest
+covers this pack line now that H3 made the gate's inputs env-declared), and
+compiles the generated runner with `rustc`. Addresses in gaps receive no
 dispatch arm; static and computed transfers into them remain unresolved.
 The gate no longer stops at "rustc accepted": it links the emitted runner
 into a host binary and executes it against the real pack — duplicate
@@ -523,6 +524,130 @@ candidates.
 4. Run CFG-structure homology on the byte-homology unmatched remainder.
 5. Re-run NWXE, NW4E, and OoT grades, then hold out another AKI ROM for the
    first no-descriptor evaluation.
+## Prioritized unblocking roadmap (any-ROM decomp/recomp/ports)
+
+Ranked by expected slope toward running, then decompiling, an arbitrary N64
+ROM. Items already scheduled elsewhere cite their home; new items state what
+must exist before they can start. Ranking is a bet, not a proof — each item
+must still clear the same measurement bar as every experiment above, and a
+rejected result gets recorded with its numbers exactly like the
+aligned-pointer-run rejection.
+
+1. **Instrumented trace producer** (extends stage 4; U7's evidence engine).
+   Every hard static frontier — open indirect calls (569 on OoT), overlay
+   activation, runtime-built tables, selector state — becomes an observation
+   under execution. The ingestion schema and typed observations already
+   exist (`trace.rs`); the missing half is a repeatable headless producer
+   emitting bank-qualified PCs, PI DMA, and indirect targets, then
+   savestate-forking, coverage-guided exploration with explicit
+   natural-versus-forced reachability labels. The debugger-driven
+   Mupen64Plus probe is the manual precursor; the product is a scripted one.
+2. **`dynamic_mips` fallback** (defined in this plan's closure taxonomy;
+   unimplemented). The interpreter lane that makes execution closure
+   universal: any bank-qualified destination static admission cannot prove
+   runs instrumented instead of faulting. With it, "port any ROM" stops
+   depending on discovery completeness at all — AOT coverage becomes an
+   optimization, and every fallback execution emits promotion traces that
+   feed item 1's evidence loop back into AOT admission.
+3. **Corpus-scale homology** (extends stage 7). Pairwise relocation-masked
+   matching already measures 98.75–99.64% precision. Generalize to an
+   N-ROM mutual-labeling fact corpus: every N64 ROM links one of a small
+   set of libultra/SDK builds, engine families share most of their code,
+   and each onboarded ROM both consumes and contributes identities. This is
+   also the clean-room-safe substitute for signature databases.
+4. **Compiler-idiom-exact recognizers** (new; needs a per-ROM compiler
+   classifier first). Nearly all N64 code came from IDO 5.3/7.1 or a known
+   GCC; per-compiler prologue/jump-table/scheduling idioms are
+   near-deterministic, unlike the generic patterns that scored 25.9%
+   prologue precision on NWXE. Detect the compiler, then apply its exact
+   idioms as candidate providers — measured against the answer keys before
+   adoption, like every provider.
+5. **Relocation recovery by differential comparison** (new; feeds the
+   Decomp Pack). The same overlay observed at two load addresses — or the
+   same engine code across ROM revisions — mechanically reveals pointer
+   words: values differing by exactly the load delta are relocations.
+   The AKI family's shared-engine corpus is the natural first target.
+6. **Decompressor provenance via dynamic execution** (unblocks compressed
+   ROMs generally; depends on items 1–2). Run the ROM's own decompressor
+   in the instrumented lane and bind output bytes to source bytes — the
+   proof-carrying materialization transform the snapshot design requires
+   before virtual/compressed backing can enter `ProgramSnapshotV1`.
+7. **Cache-op text bounds and thread-entry harvesting** (extends stage 3 /
+   Phase 3). `osInvalICache`-range slicing proves text extents; the NW4E
+   thread-registration shape (entry address materialized into `$a2` for a
+   create/start pair) generalizes into a callback-entry harvester once
+   item 3 identifies the thread-create callee per ROM.
+
+**Brute-force enumeration lane** (cross-cutting; MIPS-III's fixed-width
+aligned encoding makes exhaustive hypothesis enumeration cheap, and the
+rule is always enumerate-then-constrain, never promote-by-score):
+
+- **Delta-voting mapping inference** (queued for the wave after the trace
+  producer): for a candidate region, enumerate VA-delta hypotheses —
+  narrowed by the region's `lui` upper-half histogram, with a full aligned
+  sweep as fallback — and score mapping-independent constraints: absolute
+  `jal`/`j` targets landing on prologues or known entries, `%hi/%lo` pairs
+  landing in mapped space, branch targets staying in-region. This is the
+  mechanized form of the NW4E selector VA disambiguation (twelve `jal`
+  prologue votes selected delta `0x7fff_f400` over the recorded
+  `0x8000_0000`). Promotion requires constraint uniqueness; a region with
+  two surviving deltas stays open. Targets NWXE's "overlays are absent"
+  limitation; graded held-out against the known AKI overlay tables.
+- **Forced micro-execution sweep** (with items 1–2): execute every
+  candidate block under synthesized states in the instrumented lane to
+  observe computed-jump targets; results carry the forced-synthetic label
+  and never claim natural reachability.
+- **All-window rolling-hash corpus matching** (with item 3): reloc-masked
+  hashes of every aligned 64-word window across the corpus find shared
+  code without needing function boundaries first.
+
+The cautionary precedent stands: the aligned-pointer-run rejection (3.10%
+precision) is what enumeration WITHOUT constraint validation produces; the
+lane exists because enumeration output feeds validation, not because
+enumeration is evidence.
+
+Standing background track, unchanged by this ranking: U2–U6 device/RSP/RDP
+closure in `UNIVERSAL-RUNTIME-PLAN.md` — ports need runtime fidelity
+regardless of how discovery evidence arrives.
+
+Explicitly not on this list: content-statistics promotion (rejected twice by
+measurement: the aligned-pointer-run collapse and the region-score boundary
+miss) and LLM-derived facts (the pipeline's zero-LLM property is what makes
+its proofs auditable).
+
+## Experiment impact ledger
+
+One row per experiment, one column per ROM, cells holding the measured
+deltas that experiment produced on that ROM (combined candidate
+precision/recall unless stated). "n/m" = not measured there — absence of a
+measurement is recorded, never implied. Dispositions: **adopted** (feeds the
+canonical pipeline), **candidate-only** (produces candidate/exploratory
+evidence, never authoritative facts), **external-evidence** (measured with
+caller-supplied inputs the engine does not infer yet), **rejected** (kept
+only as its kill numbers). Sources: the experiment paragraphs above; this
+table consolidates, it does not re-measure.
+
+| Experiment | OoT | NW4E | NWXE | Disposition |
+|---|---|---|---|---|
+| D1.5 load-image/file tables | combined 62.29%/0.82% → 90.57%/72.32% | n/m (uses descriptor path) | n/m | adopted |
+| D2 value-set closure + identity audit | precision 90.57% → 98.69%, recall flat 72.32% (JalTarget 82.12% → 97.76%) | 44.69% → 48.44% prec, 89.04% → 89.71% recall | no change (36.36%/28.50%) | adopted |
+| Descriptor-table mapping | n/m | 48.44%/89.74% (baseline of its rows) | 49.95%/86.86% vs 36.40%/28.54% boot-only | adopted (shape is data input) |
+| Held-out text-interval filter | n/m | +33.97pts prec / −1.60pts recall (82.41%/88.11%) | +31.36pts prec / −2.74pts recall (81.31%/84.11%) | external-evidence (inference open) |
+| Aligned-pointer-run harvest | n/m | 3.10% precision | 2.34% precision | rejected |
+| Multi-scale region scores | n/m | n/m | resident text end missed by 0xbc0 at best scale | rejected as promotion rule; candidate view retained |
+| Cross-ROM byte homology | n/m | ←99.64% prec / ≥15.99% recall LB | ←98.75% prec / ≥22.65% recall LB | adopted (candidate provider) |
+| spimdisasm adapter | n/m | n/m | entries 91.99%/97.64%; extents 80.53% exact | candidate-only |
+| Entry-stub recognizer | n/m (OoT boot closed via HI/LO jr) | BSS + main entry derived | BSS + main entry derived | adopted |
+| Selector VA correction + xref sweep | n/m | dispatcher identity fixed (+0xC00 error), 8-store inventory graded | n/m | adopted (evidence, no P/R metric) |
+| Reached-closure executable regions | 32/45 owners admitted (boot bank) | n/m | exact owners 0 → 20/27, wrong=0 held | adopted |
+| Pack execution harness | n/m | n/m | round trip executed; typed faults/budget/hole validated (depth, not P/R) | adopted (validation) |
+| Ghidra conformance | synthetic banks only so far | n/m | n/m | candidate-only |
+
+Maintenance rule: every future experiment lands a row here in the same
+commit as its adoption or rejection, with its per-ROM cells filled or
+explicitly n/m. An experiment measured on one ROM is not presumed to
+transfer; the empty cells are the transfer-measurement backlog.
+
 # Phase unlock ledger
 
 Every ROM run must report physical, logical, executable, owner, and function
@@ -613,6 +738,25 @@ needs either a debugger-enabled emulator build or the project's own
 headless trace producer. Captures live outside the repository. Overlay
 store sites are candidate cross-references on proven load-image bytes;
 executable permission and natural reachability of those sites remain open.
+
+The debugger-enabled follow-up (2026-07-18, same day) closed the tooling
+half of that frontier: mupen64plus-core tag 2.6.0 (commit `b0d68c2`) built
+from source with `DEBUGGER=1 NO_ASM=1` accepts `--debug`, and a small driver
+against the publicly documented `m64p_debug` API (dlopen/dlsym, no static
+linking, no GPL implementation source read) read live RDRAM at the flag and
+mode-byte addresses during NW4E boot, deterministically across ten runs.
+Steady-state observations: flag `0x0` (the dispatcher's zero-init) and mode
+byte `0x00` then `0x03` — both inside the statically predicted sets, with
+the mode sequence matching the documented R2-branch value. One transient
+out-of-set word (`0x20004002` ≈ 2 ms after interpreter start) decodes as a
+MIPS instruction and precedes any plausible dispatcher execution, so it is
+attributed to the boot-stage segment copy transiting that address, not a
+flag store. Deep-boot flag transitions were NOT reached: the macOS arm64
+build runs as a pure interpreter (upstream's own forced `NO_ASM`), too slow
+to leave the logo screens within the observed budget. Open next steps:
+a longer unattended run, an x86_64/Rosetta core for dynarec speed, or a
+`DebugBreakpointCommand` write watchpoint instead of polling. No
+selector-state coverage is claimed beyond the values actually observed.
 
 An aligned-pointer-run experiment (four or more words targeting one load image)
 was measured and rejected from the canonical harvest: it produced only 3.10%
