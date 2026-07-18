@@ -40,6 +40,28 @@ fn nw4e_descriptor() -> DescriptorTableInput {
     )
 }
 
+/// NWXE (WM2000) overlay bank table, statically recovered in
+/// aki-recomp/games/NWXE/overlays.json (2026-07-13): reader func_800222D8
+/// loads 4 records of 9 words [rom_start, rom_end, text_start, text_dup,
+/// data_start, data_dup, bss_start, bss_dup, bss_end]. Byte-verified
+/// 2026-07-17 against the ROM: records begin at ROM 0x48a80 (record 1 =
+/// [0x4c160, 0x73390, 0x800e1b90, ...]); the word after record 4 is
+/// 0x00000001, not a fifth record. Banks 1/4 and 2/3 share destination VA
+/// slots but have disjoint ROM ranges, so records stay independently proven.
+fn nwxe_descriptor() -> DescriptorTableInput {
+    (
+        DescriptorTableShape {
+            table_rom_offset: 0x48a80,
+            record_count: 4,
+            record_stride: 0x24,
+            field_rom_start: 0x00,
+            field_rom_end: 0x04,
+            field_vram_dest: 0x08,
+        },
+        |index| format!("bank{}", index + 1),
+    )
+}
+
 /// OoT NTSC 1.0 table geometry, supplied as shape/data input. Locations and
 /// field use come from the allowed N64Recomp-generated C/section table:
 /// DmaMgr_Init names physical dmadata at 0x7430; the generated code section
@@ -170,7 +192,7 @@ fn main() {
 
     for (label, rom, dump, descriptor) in [
         ("NW4E", NW4E_ROM, NW4E_DUMP, Some(nw4e_descriptor())),
-        ("NWXE", NWXE_ROM, NWXE_DUMP, None),
+        ("NWXE", NWXE_ROM, NWXE_DUMP, Some(nwxe_descriptor())),
     ] {
         if !Path::new(rom).exists() || !Path::new(dump).exists() {
             println!("{label}: optional grade skipped (ROM or answer key absent)\n");

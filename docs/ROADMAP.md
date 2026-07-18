@@ -365,9 +365,11 @@ answer key (10,833 named fns) makes OoT the perfect graded target.
 fn64-discover has Phases 1/2/4/5 + bounded-6; the rest is design-only
 (DISCOVER-DESIGN.md).
 
-Current grading (D1+D1.5, 2026-07-16, `gate_d1` — but see H3: these numbers
-are reproducible on one machine only): OoT 98.7% precision / 72.3% recall;
-NW4E 48.4%/89.7%; NWXE 36.4%/28.5% (D1+D1.5+D2).
+Current grading (D1+D1.5+D2, 2026-07-17, `gate_d1` — but see H3: these
+numbers are reproducible on one machine only): OoT 98.7% precision / 72.3%
+recall; NW4E 48.4%/89.7%; NWXE 50.0%/86.9% (NWXE was 36.4%/28.5% until its
+overlay bank table geometry was wired into the gate — the Phase-2 recall
+lesson below, confirmed a second time).
 
 Two findings worth not rediscovering:
 - **Recall is a Phase-2 problem, not a detector problem.** OoT recall was
