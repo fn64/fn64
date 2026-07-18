@@ -127,6 +127,40 @@ candidates while precision rises 13.579582 points. Its stdout is
 byte-identical across 10/10 runs (SHA-256
 `9b0dc15f92aac10586edf98a02873c0acfc57f4ff6f00f857546fcb1ec1c4440`).
 
+**Overlay recovery now crosses engine families (2026-07-18).** The AKI search
+was physical-offset-only, so `gate_overlay_generalize` first found zero tables
+on OoT/GoldenEye/Perfect Dark — a diagnosed VROM-addressing shape gap, not a
+logic gap. `file_table.rs` closes it: it mechanically recovers a ROM's file
+table (dmadata-shape `(vrom_start, vrom_end, rom_start, rom_end)` records —
+ordered contiguous VROM, in-bounds physical backing, identity record required,
+admit on uniqueness), giving a VROM→physical translation, and
+`overlay_regions.rs` then runs the descriptor-family search over VROM-located
+tables resolved through it. On OoT it recovers the file table at physical
+`0x7430` (matching `dmadata`) and **414 overlay regions at 100% precision /
+88.5% recall** (actor and Kaleido descriptor tables admitted; the physical
+`dmadata` too), all held-out — the dump opens only after recovery. SM64 (a
+single static image) correctly admits **zero overlay tables** — the
+negative control holds, no hallucination. GoldenEye and Perfect Dark recover
+nothing and are reported ungraded (no vendored key). The AKI physical path is
+untouched: `gate_overlay_regions` (`471181f2…`) and `gate_d1_overlays`
+(`9b0dc15f…`) are byte-identical. Honest open frontier: OoT's effect and
+gamestate descriptor families are enumerated but yield fewer than the
+two-region admission floor, so they stay open rather than force-promoted.
+`gate_overlay_generalize` is 10/10 byte-identical with the full OoT+GE+PD+SM64
+set (SHA-256 `5401e638…`).
+
+Phase-6 indirect closure was then strengthened on the recovered NWXE overlay
+banks (three sound `sltiu`-bounded switch-table recognizers, each with a
+near-miss test proving no over-admission): `unresolved_indirect` occurrences
+fell 19,196 → 16,366 (−2,830, ~15%) with exact owners held at 6 and wrong
+extents at 0, and no candidate-grade regression (OoT/NW4E exhaustive jump
+tables rose 230→240 / 223→227). The finding this surfaces: indirect closure is
+no longer the binding constraint on the three zero-owner overlays — they are
+dominated by `entry_not_authoritative` (987), `owner_missing` (567), and
+`partition_ambiguity` (895), which is where owner recovery goes next. Several
+remaining indirect sites are irreducibly open (index/base arriving through
+function arguments or mutable memory the static analysis cannot bound).
+
 The first integrated run also exposed an existing Phase-6 fixed-point cycle:
 NWXE's fourth overlay alternated forever between 96 and 97 exhaustive
 indirect sites. Closure now detects a repeated edge-set state, retains only
@@ -744,7 +778,9 @@ table consolidates, it does not re-measure.
 | GP-base voting | n/m | OPEN (0 real $gp constructions; 25 off($gp) = data-as-code noise) | OPEN (7 accesses; unaligned histogram winner rejected) | mechanism adopted; no base to recover on these ROMs |
 | Overlay region discovery (descriptor-family search) | n/m | 5/5 regions recovered from ROM alone (table @0x53988 found without being handed it), delta_vote 5/5 correct | **4 overlay regions recovered @table 0x48a68, 100%/100%, delta_vote 4/4 correct, 0 wrong; integrated D1 36.396867%/28.542179% → 49.976448%/86.895987%; a 2nd candidate table correctly rejected** | adopted — mechanically opens NWXE overlays |
 | Exact-owner proof on recovered NWXE overlays | n/m | n/m | 6 exact owners (from 0), 0 wrong extents; 22,562 reached blocks, 475,740 proven-executable bytes; dominant blocker unresolved-indirect (614 sole) | adopted — first proof-qualified overlay ownership |
-| Non-AKI overlay generalization (OoT/GE/PD/SM64) | 0 tables admitted (VROM-addressing shape gap, diagnosed) | n/m | n/m | negative-with-diagnosis: search is physical-offset-only; OoT tables live in VROM; SM64 correctly 0 (no overlays) — motivates VROM-resolution stage |
+| VROM overlay recovery (file-table resolution) | **OoT: file table @0x7430 recovered (=dmadata); 414 overlay regions, 100% precision / 88.5% recall (actor+kaleido tables admitted)**; SM64 correctly 0 (negative control); GE/PD 0 ungraded | n/m (AKI physical path unchanged) | n/m (unchanged) | adopted — overlay recovery now crosses engine families (AKI + OoT); effect/gamestate tables below 2-region floor stay open |
+| Phase-6 indirect closure (switch-table precision) | jump tables 230→240 exhaustive, precision/recall unchanged | 223→227 exhaustive, unchanged | unresolved_indirect 19196→16366 occurrences (−2830), exact_owners 6→6, wrong 0 | adopted — sound (3 near-miss soundness tests); remaining sites blocked by entry_not_authoritative/owner_missing/partition_ambiguity, not indirect |
+| dynamic_mips → live executor seam | n/m | n/m | n/m | adopted (groundwork): ExecutorAction maps BlockExit→scheduling decision from exit variant only (AOT/interp indistinguishability is type-level); executor drives fallback in one GameThread resume; hole-stays-fault + single-runnable proven; rung suite unchanged |
 | dynamic_mips fallback dispatcher | n/m | n/m | n/m | adopted (groundwork): interpreter wired behind BlockExit, byte-equivalent to AOT lane; hole-stays-a-fault safety proven; typed EvidenceClass; FPU/COP0/exceptions typed-unsupported |
 | dynamic_mips interpreter (first slice) | n/m | n/m | n/m | adopted (groundwork): integer/control/memory ops, byte-equivalent to the AOT lane by differential test; FPU/COP0/exceptions typed-unsupported (open) |
 | Answer-key corpus intake | n/m | n/m | n/m | infrastructure only: Banjo 60-row override key parsed (55 fn), PD key absent upstream — no grading yet (ROMs not present) |

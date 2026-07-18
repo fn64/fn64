@@ -35,6 +35,17 @@
 //! Every function here is a pure function of the ROM bytes and the search
 //! configuration: no I/O, no randomness, byte-identical output across runs.
 //!
+//! # VROM-located descriptor tables
+//!
+//! [`recover_vrom_overlay_regions`] is a separate two-stage path for engines
+//! whose descriptor table itself lives in VROM. It first invokes
+//! [`crate::file_table`] to recover one physical
+//! `(vrom_start,vrom_end,rom_start,rom_end)` table, then materializes each
+//! VROM file and applies the same adjacent source-range/destination family and
+//! `delta_vote` validation. Keeping this result separate is load-bearing: the
+//! established physical [`recover_overlay_regions`] output and AKI gates are
+//! unchanged, while every VROM table location is explicitly typed as virtual.
+//!
 //! # The PI-DMA route, and why it does not provide these regions
 //!
 //! [`crate::pi_dma`] slices `osPiStartDma`/`osEPiStartDma` calls for constant
@@ -59,8 +70,11 @@
 //! destination disagreements remain conflict/open facts.
 
 use crate::delta_vote::{infer_region_delta, DeltaVoteConfig, DeltaVoteOutcome};
+use crate::file_table::{
+    recover_file_table, CandidateFileTable, FileTableRecovery, FileTableSearchConfig,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Bounds and predicates the family search validates each record against.
 /// Every field is part of the reported result's meaning; a gate must print
@@ -105,6 +119,21 @@ impl SearchConfig {
             ],
             min_records: 3,
         }
+    }
+
+    /// The same descriptor fields and region-size constraints in a VROM
+    /// source domain. Overlay link addresses are not necessarily resident
+    /// physical-RDRAM addresses: relocation-capable N64 linkers commonly use
+    /// the wider `0x8000_0000..0x8100_0000` kseg0 link window even though the
+    /// loaded image occupies less physical RDRAM at runtime. `delta_vote`
+    /// still has to derive the unique address for every admitted region.
+    pub fn vrom_family() -> Self {
+        let mut config = Self::aki_family();
+        // Small effect/utility overlays remain real code images; delta_vote,
+        // not a 4 KiB AKI size floor, is the discriminating evidence.
+        config.min_region_len = 0x100;
+        config.vram_hi = 0x8100_0000;
+        config
     }
 }
 
@@ -391,6 +420,248 @@ pub fn recover_overlay_regions(
     }
 }
 
+/// A descriptor-family table whose location is in VROM. Its records retain
+/// logical VROM source intervals; only the location field differs from the
+/// physical [`CandidateTable`] path above.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VromCandidateTable {
+    pub table_vrom_offset: u32,
+    pub record_stride: u32,
+    pub field_rom_start: u32,
+    pub field_rom_end: u32,
+    pub field_vram_dest: u32,
+    pub records: Vec<CandidateRecord>,
+}
+
+impl VromCandidateTable {
+    pub fn interval_set(&self) -> Vec<(u32, u32)> {
+        let mut intervals: Vec<_> = self
+            .records
+            .iter()
+            .map(|record| (record.rom_start, record.rom_end))
+            .collect();
+        intervals.sort_unstable();
+        intervals.dedup();
+        intervals
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VromTableAdmission {
+    pub table: VromCandidateTable,
+    pub region_deltas: Vec<Option<(u32, u32)>>,
+    pub mapped_regions: u32,
+    /// Engine-independent evidence minimum supplied by the caller, matching
+    /// the unchanged physical descriptor-family path.
+    pub required_mapped_regions: u32,
+    pub admitted: bool,
+}
+
+/// Result of the two-stage VROM path. The physical AKI recovery remains a
+/// separate, unchanged result so callers cannot accidentally reinterpret a
+/// physical table location as VROM (or perturb its existing gate output).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VromOverlayRecovery {
+    pub file_table: FileTableRecovery,
+    pub config: SearchConfig,
+    pub delta_config: DeltaVoteConfig,
+    pub vrom_min_records: u32,
+    pub min_mapped_regions: u32,
+    pub candidate_tables: Vec<VromCandidateTable>,
+    pub admissions: Vec<VromTableAdmission>,
+}
+
+impl VromOverlayRecovery {
+    pub fn admitted_intervals(&self) -> Vec<(u32, u32)> {
+        let mut intervals: Vec<_> = self
+            .admissions
+            .iter()
+            .filter(|admission| admission.admitted)
+            .flat_map(|admission| admission.table.interval_set())
+            .collect();
+        intervals.sort_unstable();
+        intervals.dedup();
+        intervals
+    }
+}
+
+fn vrom_record_valid(
+    record: &CandidateRecord,
+    file_table: &CandidateFileTable,
+    config: &SearchConfig,
+) -> bool {
+    record.rom_start >= config.min_rom_offset
+        && record.rom_end > record.rom_start
+        && record.rom_start.is_multiple_of(4)
+        && record.rom_end.is_multiple_of(4)
+        && record.byte_len() >= config.min_region_len
+        && record.byte_len() <= config.max_region_len
+        && file_table.contains_vrom_range(record.rom_start, record.rom_end)
+        && record.vram_dest >= config.vram_lo
+        && record.vram_dest < config.vram_hi
+        && record.vram_dest.is_multiple_of(4)
+}
+
+fn enumerate_vrom_family_tables(
+    rom_bytes: &[u8],
+    file_table: &CandidateFileTable,
+    config: &SearchConfig,
+    vrom_min_records: u32,
+) -> Vec<VromCandidateTable> {
+    let mut raw = Vec::new();
+
+    for file_record in &file_table.records {
+        let Ok(file_bytes) = file_table.materialize_vrom_range(
+            rom_bytes,
+            file_record.vrom_start,
+            file_record.vrom_end,
+        ) else {
+            continue;
+        };
+        let file_len = file_bytes.len() as u32;
+
+        // The three semantic fields are adjacent. Enumerate each plausible
+        // triple once, then form constant-stride runs from this sparse map;
+        // rescanning every decompressed byte once per stride/field phase would
+        // multiply work without adding a distinct interval hypothesis. The
+        // canonical VROM location is the first parsed source field (phase 0).
+        let mut valid_triples = BTreeMap::new();
+        let mut fields_offset = 0u32;
+        while fields_offset <= file_len.saturating_sub(12) {
+            let record = CandidateRecord {
+                rom_start: read_u32_be(&file_bytes, fields_offset as usize).unwrap(),
+                rom_end: read_u32_be(&file_bytes, (fields_offset + 4) as usize).unwrap(),
+                vram_dest: read_u32_be(&file_bytes, (fields_offset + 8) as usize).unwrap(),
+            };
+            if vrom_record_valid(&record, file_table, config) {
+                valid_triples.insert(fields_offset, record);
+            }
+            fields_offset += 4;
+        }
+
+        for &stride in &config.strides {
+            if stride < 12 || !stride.is_multiple_of(4) {
+                continue;
+            }
+            for &start in valid_triples.keys() {
+                if start
+                    .checked_sub(stride)
+                    .is_some_and(|previous| valid_triples.contains_key(&previous))
+                {
+                    continue;
+                }
+                let mut records = Vec::new();
+                let mut offset = start;
+                while let Some(record) = valid_triples.get(&offset) {
+                    records.push(*record);
+                    let Some(next) = offset.checked_add(stride) else {
+                        break;
+                    };
+                    offset = next;
+                }
+                if records.len() as u32 >= vrom_min_records && intervals_non_overlapping(&records) {
+                    raw.push(VromCandidateTable {
+                        table_vrom_offset: file_record.vrom_start + start,
+                        record_stride: stride,
+                        field_rom_start: 0,
+                        field_rom_end: 4,
+                        field_vram_dest: 8,
+                        records,
+                    });
+                }
+            }
+        }
+    }
+
+    raw.sort_by(|a, b| {
+        a.table_vrom_offset
+            .cmp(&b.table_vrom_offset)
+            .then(a.record_stride.cmp(&b.record_stride))
+            .then(a.field_rom_start.cmp(&b.field_rom_start))
+    });
+    let mut seen = BTreeSet::new();
+    let mut canonical = Vec::new();
+    for table in raw {
+        if seen.insert(table.interval_set()) {
+            canonical.push(table);
+        }
+    }
+    canonical.sort_by_key(VromCandidateTable::interval_set);
+    canonical
+}
+
+/// Recover the physical file table, resolve every materializable VROM file,
+/// and run the descriptor-family search over those virtual table locations.
+///
+/// `vrom_min_records` is explicit because two records are enough only when
+/// both independently satisfy `delta_vote`; physical AKI callers retain their
+/// established three-record family minimum. `min_mapped_regions` has exactly
+/// the same meaning as [`recover_overlay_regions`].
+pub fn recover_vrom_overlay_regions(
+    rom_bytes: &[u8],
+    config: &SearchConfig,
+    delta_config: &DeltaVoteConfig,
+    file_table_config: &FileTableSearchConfig,
+    vrom_min_records: u32,
+    min_mapped_regions: u32,
+) -> VromOverlayRecovery {
+    assert!(vrom_min_records >= 2, "a one-record run is not a table");
+    let file_table = recover_file_table(rom_bytes, file_table_config);
+    let candidate_tables = file_table
+        .admitted_table
+        .as_ref()
+        .map_or_else(Vec::new, |table| {
+            enumerate_vrom_family_tables(rom_bytes, table, config, vrom_min_records)
+        });
+    let admissions = candidate_tables
+        .iter()
+        .map(|table| {
+            let admitted_file_table = file_table
+                .admitted_table
+                .as_ref()
+                .expect("VROM candidates require one admitted file table");
+            let mut mapped_regions = 0u32;
+            let region_deltas = table
+                .records
+                .iter()
+                .map(|record| {
+                    let outcome = admitted_file_table
+                        .materialize_vrom_range(rom_bytes, record.rom_start, record.rom_end)
+                        .ok()
+                        .map(|bytes| {
+                            infer_region_delta(&bytes, record.rom_start, &[], delta_config).outcome
+                        });
+                    match outcome {
+                        Some(DeltaVoteOutcome::Admitted { delta, va_start }) => {
+                            mapped_regions += 1;
+                            Some((delta, va_start))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            let required_mapped_regions = min_mapped_regions;
+            VromTableAdmission {
+                admitted: mapped_regions >= required_mapped_regions,
+                mapped_regions,
+                required_mapped_regions,
+                region_deltas,
+                table: table.clone(),
+            }
+        })
+        .collect();
+
+    VromOverlayRecovery {
+        file_table,
+        config: config.clone(),
+        delta_config: *delta_config,
+        vrom_min_records,
+        min_mapped_regions,
+        candidate_tables,
+        admissions,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,22 +686,38 @@ mod tests {
         /// Fill `[rom_start, rom_start+len)` with a region mapped to `va_start`
         /// that delta_vote admits: three distinct jals to prologues plus lui.
         fn plant_admissible_region(&mut self, rom_start: u32, len: u32, va_start: u32) {
+            self.plant_admissible_bytes(rom_start, len, va_start);
+        }
+        fn plant_admissible_bytes(&mut self, physical_start: u32, len: u32, va_start: u32) {
             const PROLOGUE: u32 = 0x27bd_ffe0; // addiu $sp,$sp,-0x20
             let lui = 0x3c04_0000 | (va_start >> 16); // lui $a0, hi(va)
             let jal = |target: u32| 0x0c00_0000 | ((target >> 2) & 0x03ff_ffff);
             // Prologues at non-uniform offsets so no second delta aliases.
             let prologues = [0x40u32, 0x90, 0x100];
-            self.put_u32(rom_start, jal(va_start + prologues[0]));
-            self.put_u32(rom_start + 8, jal(va_start + prologues[1]));
-            self.put_u32(rom_start + 16, jal(va_start + prologues[2]));
+            self.put_u32(physical_start, jal(va_start + prologues[0]));
+            self.put_u32(physical_start + 8, jal(va_start + prologues[1]));
+            self.put_u32(physical_start + 16, jal(va_start + prologues[2]));
             for k in 0..4u32 {
-                self.put_u32(rom_start + 24 + k * 4, lui);
+                self.put_u32(physical_start + 24 + k * 4, lui);
             }
             for &p in &prologues {
                 if p + 4 <= len {
-                    self.put_u32(rom_start + p, PROLOGUE);
+                    self.put_u32(physical_start + p, PROLOGUE);
                 }
             }
+        }
+
+        fn plant_file_record(
+            &mut self,
+            offset: u32,
+            vrom_start: u32,
+            vrom_end: u32,
+            rom_start: u32,
+        ) {
+            self.put_u32(offset, vrom_start);
+            self.put_u32(offset + 4, vrom_end);
+            self.put_u32(offset + 8, rom_start);
+            self.put_u32(offset + 12, 0);
         }
     }
 
@@ -612,5 +899,98 @@ mod tests {
             serde_json::to_string(&first).unwrap(),
             serde_json::to_string(&second).unwrap()
         );
+    }
+
+    #[test]
+    fn virtual_table_is_resolved_through_recovered_file_table() {
+        let mut rom = RomBuilder {
+            bytes: vec![0xff; 0x20_000],
+        };
+        let file_table_offset = 0x2000u32;
+        let files = [
+            (0x0000, 0x1000, 0x0000),
+            (0x1000, 0x2000, 0x4000),
+            (0x2000, 0x6000, 0x8000),
+            (0x6000, 0xa000, 0xc000),
+            (0xa000, 0xe000, 0x10000),
+        ];
+        for (index, &(vrom_start, vrom_end, physical_start)) in files.iter().enumerate() {
+            rom.plant_file_record(
+                file_table_offset + index as u32 * 0x10,
+                vrom_start,
+                vrom_end,
+                physical_start,
+            );
+        }
+
+        let overlays = [
+            (0x2000, 0x6000, 0x8000, 0x8010_0000),
+            (0x6000, 0xa000, 0xc000, 0x8020_0000),
+            (0xa000, 0xe000, 0x10000, 0x8030_0000),
+        ];
+        for (index, &(vrom_start, vrom_end, physical_start, va_start)) in
+            overlays.iter().enumerate()
+        {
+            let descriptor = 0x4000 + index as u32 * 0x10;
+            rom.put_u32(descriptor, vrom_start);
+            rom.put_u32(descriptor + 4, vrom_end);
+            rom.put_u32(descriptor + 8, va_start);
+            rom.plant_admissible_bytes(physical_start, vrom_end - vrom_start, va_start);
+        }
+
+        let recovery = recover_vrom_overlay_regions(
+            &rom.bytes,
+            &SearchConfig::aki_family(),
+            &DeltaVoteConfig::default(),
+            &FileTableSearchConfig::n64_family(),
+            2,
+            2,
+        );
+        let file_table = recovery.file_table.admitted_table.as_ref().unwrap();
+        assert_eq!(file_table.table_rom_offset, file_table_offset);
+        assert_eq!(file_table.translate_uncompressed(0x1000), Some(0x4000));
+
+        let expected = vec![(0x2000, 0x6000), (0x6000, 0xa000), (0xa000, 0xe000)];
+        let admission = recovery
+            .admissions
+            .iter()
+            .find(|admission| admission.table.interval_set() == expected)
+            .expect("VROM-located descriptor table recovered");
+        assert!(admission.admitted);
+        assert_eq!(admission.mapped_regions, 3);
+        assert_eq!(recovery.admitted_intervals(), expected);
+    }
+
+    #[test]
+    fn single_image_file_table_does_not_manufacture_an_overlay_table() {
+        let mut rom = RomBuilder {
+            bytes: vec![0xff; 0x10_000],
+        };
+        for (index, &(vrom_start, vrom_end, physical_start)) in [
+            (0x0000, 0x1000, 0x0000),
+            (0x1000, 0x2000, 0x4000),
+            (0x2000, 0x3000, 0x5000),
+        ]
+        .iter()
+        .enumerate()
+        {
+            rom.plant_file_record(
+                0x2000 + index as u32 * 0x10,
+                vrom_start,
+                vrom_end,
+                physical_start,
+            );
+        }
+        let recovery = recover_vrom_overlay_regions(
+            &rom.bytes,
+            &SearchConfig::aki_family(),
+            &DeltaVoteConfig::default(),
+            &FileTableSearchConfig::n64_family(),
+            2,
+            2,
+        );
+        assert!(recovery.file_table.admitted_table.is_some());
+        assert!(recovery.candidate_tables.is_empty());
+        assert!(recovery.admitted_intervals().is_empty());
     }
 }

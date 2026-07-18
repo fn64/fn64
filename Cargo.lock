@@ -664,6 +664,7 @@ name = "fn64-runtime"
 version = "0.0.0"
 dependencies = [
  "corosensei",
+ "fn64-recomp-rs",
 ]
 
 [[package]]

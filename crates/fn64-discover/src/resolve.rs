@@ -335,6 +335,13 @@ struct TrackedValue {
     bounded_index: bool,
     through_memory: bool,
     from_static_memory: bool,
+    /// When this value is the 0/1 result of a `sltiu index_reg, upper`, records
+    /// `(index_reg, upper)`. A dominating `beq`/`bne $this,$zero` then proves
+    /// `index_reg < upper` on its guarded edge, even when the `sltiu` and the
+    /// branch land in different basic blocks (a common compiler schedule).
+    /// Cleared the instant `index_reg` is rewritten (see `set_register`), so the
+    /// tag can never refer to a stale index.
+    sltiu_bound: Option<(u8, u32)>,
 }
 
 impl TrackedValue {
@@ -345,6 +352,21 @@ impl TrackedValue {
             bounded_index: false,
             through_memory: false,
             from_static_memory: false,
+            sltiu_bound: None,
+        }
+    }
+
+    /// The 0/1 abstract result of `sltiu index_reg, upper`. Numerically
+    /// unknown -- only the recorded `(index_reg, upper)` bound matters, and it
+    /// is consumed by a dominating `beq`/`bne $pred,$zero`.
+    fn sltiu_flag(index_reg: u8, upper: u32) -> Self {
+        Self {
+            value: AbstractValue::Unknown,
+            memory_sources: BTreeSet::new(),
+            bounded_index: false,
+            through_memory: false,
+            from_static_memory: false,
+            sltiu_bound: Some((index_reg, upper)),
         }
     }
 
@@ -363,6 +385,7 @@ impl TrackedValue {
             bounded_index: false,
             through_memory: false,
             from_static_memory: false,
+            sltiu_bound: None,
         }
     }
 
@@ -376,6 +399,7 @@ impl TrackedValue {
             bounded_index: false,
             through_memory: false,
             from_static_memory: false,
+            sltiu_bound: None,
         }
     }
 
@@ -424,6 +448,13 @@ impl TrackedValue {
             bounded_index: self.bounded_index && other.bounded_index,
             through_memory: self.through_memory || other.through_memory,
             from_static_memory: self.from_static_memory || other.from_static_memory,
+            // A joined value is no longer a single sltiu flag; only a value that
+            // both sides agree is the same sltiu result keeps the bound.
+            sltiu_bound: if self.sltiu_bound == other.sltiu_bound {
+                self.sltiu_bound
+            } else {
+                None
+            },
         }
     }
 
@@ -477,6 +508,7 @@ impl TrackedValue {
                         bounded_index: self.bounded_index,
                         through_memory: self.through_memory,
                         from_static_memory: self.from_static_memory,
+                        sltiu_bound: None,
                     }
                 }
             }
@@ -533,6 +565,16 @@ impl AnalysisState {
     fn set_register(&mut self, register: u8, value: TrackedValue) {
         if register != 0 {
             self.registers[register as usize] = value;
+            // Any pending `sltiu` flag whose index register is the one we just
+            // overwrote no longer proves a bound on the new value. Invalidate
+            // it so a dominating branch can never refine a stale index.
+            for slot in &mut self.registers {
+                if let Some((index_reg, _)) = slot.sltiu_bound {
+                    if index_reg == register {
+                        slot.sltiu_bound = None;
+                    }
+                }
+            }
         }
         self.registers[0] = TrackedValue::constant(0);
     }
@@ -567,9 +609,25 @@ impl AnalysisState {
             return;
         }
         let range: BTreeSet<u32> = (0..upper).collect();
-        let values = match self.registers[register as usize].concrete_values() {
-            Some(existing) => existing.intersection(&range).copied().collect(),
-            None => range,
+        let current = &self.registers[register as usize];
+        // A `sltiu index,upper` proves only `index < upper` at runtime. When the
+        // index's abstract value is a genuine compile-time register constant we
+        // may intersect it with `[0,upper)` and select the exact case. But when
+        // the index reached us *through a load* -- most commonly a mutable
+        // global whose load-image byte was folded to a singleton by
+        // `read_static_word` -- that singleton is only the initial value, not a
+        // proven runtime value. The proven runtime universe is the whole
+        // `[0,upper)` the compiler's own bound check guarantees. Trusting the
+        // static singleton would both under-recover the table (one case instead
+        // of the full switch) and, worse, could fabricate a wrong exhaustive
+        // target if the initial byte selected a different case than runtime.
+        // Widening a memory-derived index to the guaranteed range is therefore
+        // strictly more sound and recovers the full jump table.
+        let values: BTreeSet<u32> = match current.concrete_values() {
+            Some(existing) if !current.through_memory => {
+                existing.intersection(&range).copied().collect()
+            }
+            _ => range,
         };
         let mut refined = TrackedValue::concrete(values);
         refined.bounded_index = true;
@@ -759,7 +817,14 @@ fn execute_instruction(
         0x01 if matches!(rt, 0x10..=0x13) => {
             state.set_register(31, TrackedValue::constant(pc.wrapping_add(8)));
         }
-        0x0a | 0x0b | 0x20..=0x22 | 0x24..=0x26 | 0x30 | 0x34 | 0x37 | 0x38 | 0x3c => {
+        0x0b => {
+            // `sltiu $rt, $rs, imm16` -- the standard bounded-switch guard. Its
+            // 0/1 result carries an `$rs < imm16` bound (imm16 zero-extended)
+            // that a dominating `beq`/`bne $rt,$zero` consumes to refine `$rs`,
+            // even across a block boundary. Numerically the flag is unknown.
+            state.set_register(rt, TrackedValue::sltiu_flag(rs, word & 0xffff));
+        }
+        0x0a | 0x20..=0x22 | 0x24..=0x26 | 0x30 | 0x34 | 0x37 | 0x38 | 0x3c => {
             state.set_register(rt, TrackedValue::unknown());
         }
         0x10..=0x13 if matches!(rs, 0x00..=0x02) => {
@@ -798,6 +863,52 @@ fn written_gpr(word: u32) -> Option<u8> {
         0x10..=0x13 if matches!(rs, 0x00..=0x02) => (rt != 0).then_some(rt),
         _ => None,
     }
+}
+
+/// The guarded successor and `(index_register, upper)` bound proved by a block
+/// terminating in `beq`/`bne $pred,$zero` whose `$pred` is the abstract result
+/// of a `sltiu index,upper`. `state` is the register file immediately before
+/// the branch's delay slot -- the point at which `$pred` still holds the value
+/// the branch tested. Reading the bound from `$pred`'s tracked provenance,
+/// rather than by scanning this block's own words, lets the `sltiu` sit in a
+/// dominating predecessor block (a compiler schedule the word-local scan
+/// misses) without ever losing soundness: the tag is cleared the instant its
+/// index register is rewritten, and a join of disagreeing tags drops it.
+fn threaded_branch_bound(
+    state: &AnalysisState,
+    words: &[(u32, u32)],
+    terminator: &BlockTerminator,
+) -> Option<(u32, u8, u32)> {
+    let (target, fallthrough) = match terminator {
+        BlockTerminator::Branch {
+            target,
+            fallthrough,
+        }
+        | BlockTerminator::BranchLikely {
+            target,
+            fallthrough,
+        } => (*target, *fallthrough),
+        _ => return None,
+    };
+    let &(_, branch) = words.get(words.len().checked_sub(2)?)?;
+    let opcode = branch >> 26;
+    if !matches!(opcode, 0x04 | 0x05) {
+        return None;
+    }
+    let branch_rs = ((branch >> 21) & 0x1f) as u8;
+    let branch_rt = ((branch >> 16) & 0x1f) as u8;
+    let predicate = if branch_rs == 0 {
+        branch_rt
+    } else if branch_rt == 0 {
+        branch_rs
+    } else {
+        return None;
+    };
+    let (index, upper) = state.registers[predicate as usize].sltiu_bound?;
+    // beq $pred,$zero takes the branch when the sltiu returned 0 (index >=
+    // upper): the in-bounds edge is the fallthrough. bne is the mirror image.
+    let valid_successor = if opcode == 0x04 { fallthrough } else { target };
+    Some((valid_successor, index, upper))
 }
 
 fn branch_bound(words: &[(u32, u32)], terminator: &BlockTerminator) -> Option<(u32, u8, u32)> {
@@ -964,6 +1075,7 @@ fn resolve_value_sets_from_roots(
         };
         let visit = visits.entry(start).or_default();
         *visit += 1;
+        let mut widened_visit = false;
         if *visit > MAX_BLOCK_REVISITS {
             let widened = AnalysisState::widened();
             if state == widened {
@@ -971,9 +1083,9 @@ fn resolve_value_sets_from_roots(
             }
             incoming.insert(start, widened.clone());
             state = widened;
+            widened_visit = true;
         }
         let words = read_block_words(block, bank_bytes, va_start);
-        let bound = branch_bound(&words, &block.terminator);
         let transfer_pc = block.end_va.checked_sub(8);
         let delay_pc = block.end_va.checked_sub(4);
         let mut before_delay = None;
@@ -981,7 +1093,16 @@ fn resolve_value_sets_from_roots(
             if Some(pc) == delay_pc {
                 before_delay = Some(state.clone());
             }
-            if Some(pc) == transfer_pc {
+            if Some(pc) == transfer_pc && !widened_visit {
+                // Record the site verdict from every *real* (non-widened) visit
+                // and meet them: disagreeing observations fall to `Open`. A
+                // widened visit is skipped because its all-`unknown` state is a
+                // termination over-approximation, never new runtime evidence --
+                // it can only introduce a spurious `Open`. Crucially, widening
+                // only ever *loses* boundedness it previously had; it never
+                // exposes a target a real visit missed, so skipping it cannot
+                // hide a reachable edge (soundness) while preventing a real
+                // exhaustive proof from being erased (precision).
                 if let BlockTerminator::Indirect { via_call }
                 | BlockTerminator::ResolvedIndirect { via_call, .. } = &block.terminator
                 {
@@ -1002,6 +1123,14 @@ fn resolve_value_sets_from_roots(
             }
             execute_instruction(&mut state, pc, word, bank_bytes, va_start);
         }
+
+        // The branch tests `$pred` before its delay slot runs, so the bound is
+        // read from the pre-delay register file. Falling back to the word-local
+        // scan keeps behavior for any branch shape the threaded reader declines.
+        let bound = before_delay
+            .as_ref()
+            .and_then(|pre| threaded_branch_bound(pre, &words, &block.terminator))
+            .or_else(|| branch_bound(&words, &block.terminator));
 
         let is_call = matches!(
             block.terminator,
@@ -1855,5 +1984,312 @@ mod tests {
             retain_cycle_stable_entries(&[state_a, state_b]),
             BTreeMap::from([(0x8000_0010, vec![0x8000_0100])])
         );
+    }
+
+    /// A switch whose index is loaded from a mutable global (folded to its
+    /// load-image initial value) must not select a single case from that stale
+    /// byte: the `sltiu` bound proves the runtime index spans the whole
+    /// `[0,upper)`, so the full table closes. This is the dominant NWXE
+    /// recovered-overlay shape (`lui;lw glob;...;sltiu;beq;sll;addu;lw;jr`).
+    #[test]
+    fn static_memory_switch_index_widens_to_the_full_bounded_table() {
+        // lui $v0,0x8000 ; lw $v0,0xf0($v0) ; addiu $v1,$v0,0 ;
+        // sltiu $v0,$v1,3 ; beq $v0,$zero,default ; sll $v0,$v1,2 (delay) ;
+        // lui $at,0x8000 ; addu $at,$at,$v0 ; lw $v0,0x40($at) ; jr $v0
+        let lui_v0 = 0x3c02_8000u32;
+        let lw_glob = 0x8c42_00f0u32;
+        let addiu_v1 = 0x2443_0000u32;
+        let sltiu = 0x2c62_0003u32; // bound 3
+        let beq_default = 0x1040_0006u32;
+        let sll = 0x0003_1080u32;
+        let lui_at = 0x3c01_8000u32;
+        let addu_at = 0x0022_0821u32;
+        let lw_v0 = 0x8c22_0040u32;
+        let jr_v0 = 0x0040_0008u32;
+        let jr_ra = 0x03e0_0008u32;
+        let mut bytes = asm(&[
+            lui_v0,
+            lw_glob,
+            addiu_v1,
+            sltiu,
+            beq_default,
+            sll,
+            lui_at,
+            addu_at,
+            lw_v0,
+            jr_v0,
+            NOP,
+            jr_ra,
+            NOP,
+        ]);
+        bytes.resize(0x100, 0);
+        // The stale image byte encodes index 1 -- if trusted, only one case
+        // would resolve. The bound proves all three are reachable.
+        bytes[0xf0..0xf4].copy_from_slice(&1u32.to_be_bytes());
+        for (i, target) in [0x8000_0080u32, 0x8000_0090, 0x8000_00a0]
+            .into_iter()
+            .enumerate()
+        {
+            let off = 0x40 + i * 4;
+            bytes[off..off + 4].copy_from_slice(&target.to_be_bytes());
+            let t = (target - 0x8000_0000) as usize;
+            bytes[t..t + 4].copy_from_slice(&jr_ra.to_be_bytes());
+        }
+
+        let closure = build_cfg_value_set_closed("switch", &bytes, 0x8000_0000, &[0x8000_0000]);
+        let table = closure
+            .indirect
+            .iter()
+            .find(|resolution| resolution.site_pc == 0x8000_0024)
+            .unwrap();
+        assert_eq!(table.state, IndirectProofState::Exhaustive);
+        assert_eq!(table.kind, Some(IndirectResolutionKind::JumpTable));
+        assert_eq!(table.targets, vec![0x8000_0080, 0x8000_0090, 0x8000_00a0]);
+    }
+
+    /// Near-miss for the static-memory switch: one table slot holds an
+    /// out-of-bank word, so the finite set is only partially usable. It must
+    /// stay bounded/open and never feed a fabricated case.
+    #[test]
+    fn static_memory_switch_with_an_out_of_bank_entry_stays_unresolved() {
+        let lui_v0 = 0x3c02_8000u32;
+        let lw_glob = 0x8c42_00f0u32;
+        let addiu_v1 = 0x2443_0000u32;
+        let sltiu = 0x2c62_0003u32;
+        let beq_default = 0x1040_0006u32;
+        let sll = 0x0003_1080u32;
+        let lui_at = 0x3c01_8000u32;
+        let addu_at = 0x0022_0821u32;
+        let lw_v0 = 0x8c22_0040u32;
+        let jr_v0 = 0x0040_0008u32;
+        let jr_ra = 0x03e0_0008u32;
+        let mut bytes = asm(&[
+            lui_v0,
+            lw_glob,
+            addiu_v1,
+            sltiu,
+            beq_default,
+            sll,
+            lui_at,
+            addu_at,
+            lw_v0,
+            jr_v0,
+            NOP,
+            jr_ra,
+            NOP,
+        ]);
+        bytes.resize(0x100, 0);
+        bytes[0xf0..0xf4].copy_from_slice(&1u32.to_be_bytes());
+        // Entry 2 points far outside this bank: the switch cannot close.
+        for (i, target) in [0x8000_0080u32, 0x8000_0090, 0x8fff_0000]
+            .into_iter()
+            .enumerate()
+        {
+            let off = 0x40 + i * 4;
+            bytes[off..off + 4].copy_from_slice(&target.to_be_bytes());
+        }
+        for t in [0x80usize, 0x90] {
+            bytes[t..t + 4].copy_from_slice(&jr_ra.to_be_bytes());
+        }
+
+        let closure = build_cfg_value_set_closed("switch", &bytes, 0x8000_0000, &[0x8000_0000]);
+        let table = closure
+            .indirect
+            .iter()
+            .find(|resolution| resolution.site_pc == 0x8000_0024)
+            .unwrap();
+        assert_ne!(table.state, IndirectProofState::Exhaustive);
+        assert!(!closure.cfg.proven_roots.contains(&0x8fff_0000));
+        assert!(!closure
+            .cfg
+            .blocks
+            .iter()
+            .any(|block| block.start_va == 0x8fff_0000));
+    }
+
+    /// The `sltiu` bound and the `beq` that consumes it may sit in different
+    /// basic blocks (a compiler schedule the word-local scan misses). The
+    /// register-threaded bound must still close the table, since the `sltiu`
+    /// result flows through the register file into the branch block.
+    #[test]
+    fn cross_block_sltiu_bound_closes_the_switch() {
+        // The `sltiu` ends one block and the `beq` starts the next -- NWXE's
+        // real switch at 0x8012bae8 is split this way, with the `sltiu` in a
+        // dominating predecessor. Here an unconditional `j` to the beq forces
+        // the split while keeping a single predecessor, so the `sltiu` flag
+        // must thread through the register file across the block edge.
+        let sltiu = 0x2ca2_0002u32; // sltiu $v0,$a1,2
+        let j_beq = 0x0800_0003u32; // j 0x8000_000c (the beq block leader)
+        let beq_default = 0x1040_0006u32; // beq $v0,$zero,default(0x28)
+        let sll = 0x0005_1080u32; // sll $v0,$a1,2
+        let lui_at = 0x3c01_8000u32;
+        let addu_at = 0x0022_0821u32;
+        let lw_v0 = 0x8c22_0040u32;
+        let jr_v0 = 0x0040_0008u32;
+        let jr_ra = 0x03e0_0008u32;
+        // 0x00 sltiu ; 0x04 j 0x0c ; 0x08 nop(delay) ; 0x0c beq ;
+        // 0x10 sll(delay) ; 0x14 lui ; 0x18 addu ; 0x1c lw ; 0x20 jr ;
+        // 0x24 nop ; 0x28 jr_ra(default)
+        let mut bytes = asm(&[
+            sltiu,
+            j_beq,
+            NOP,
+            beq_default,
+            sll,
+            lui_at,
+            addu_at,
+            lw_v0,
+            jr_v0,
+            NOP,
+            jr_ra,
+            NOP,
+        ]);
+        bytes.resize(0x100, 0);
+        for (i, target) in [0x8000_0080u32, 0x8000_0090].into_iter().enumerate() {
+            let off = 0x40 + i * 4;
+            bytes[off..off + 4].copy_from_slice(&target.to_be_bytes());
+            let t = (target - 0x8000_0000) as usize;
+            bytes[t..t + 4].copy_from_slice(&jr_ra.to_be_bytes());
+        }
+
+        let closure = build_cfg_value_set_closed("switch", &bytes, 0x8000_0000, &[0x8000_0000]);
+        // Confirm the beq really begins its own block (split from the sltiu).
+        assert!(closure
+            .cfg
+            .blocks
+            .iter()
+            .any(|block| block.start_va == 0x8000_000c));
+        let table = closure
+            .indirect
+            .iter()
+            .find(|resolution| resolution.site_pc == 0x8000_0020)
+            .unwrap();
+        assert_eq!(table.state, IndirectProofState::Exhaustive);
+        assert_eq!(table.kind, Some(IndirectResolutionKind::JumpTable));
+        assert_eq!(table.targets, vec![0x8000_0080, 0x8000_0090]);
+    }
+
+    /// Near-miss for the cross-block bound: the index register is rewritten
+    /// between the `sltiu` and the `beq`, so the bound no longer describes the
+    /// value the `sll` scales. The tag is invalidated and the site stays open.
+    #[test]
+    fn cross_block_bound_dropped_when_index_is_rewritten() {
+        let sltiu = 0x2ca2_0002u32; // sltiu $v0,$a1,2
+        let clobber_a1 = 0x0080_2821u32; // addu $a1,$a0,$zero  (rewrites index $a1)
+        let j_beq = 0x0800_0004u32; // j 0x8000_0010 (the beq block leader)
+        let beq_default = 0x1040_0006u32; // beq $v0,$zero,default(0x2c)
+        let sll = 0x0005_1080u32; // sll $v0,$a1,2
+        let lui_at = 0x3c01_8000u32;
+        let addu_at = 0x0022_0821u32;
+        let lw_v0 = 0x8c22_0040u32;
+        let jr_v0 = 0x0040_0008u32;
+        let jr_ra = 0x03e0_0008u32;
+        // 0x00 sltiu ; 0x04 clobber $a1 ; 0x08 j 0x10 ; 0x0c nop(delay) ;
+        // 0x10 beq ; 0x14 sll(delay) ; 0x18 lui ; 0x1c addu ; 0x20 lw ;
+        // 0x24 jr ; 0x28 nop ; 0x2c jr_ra(default)
+        let mut bytes = asm(&[
+            sltiu,
+            clobber_a1,
+            j_beq,
+            NOP,
+            beq_default,
+            sll,
+            lui_at,
+            addu_at,
+            lw_v0,
+            jr_v0,
+            NOP,
+            jr_ra,
+            NOP,
+        ]);
+        bytes.resize(0x100, 0);
+        for (i, target) in [0x8000_0080u32, 0x8000_0090].into_iter().enumerate() {
+            let off = 0x40 + i * 4;
+            bytes[off..off + 4].copy_from_slice(&target.to_be_bytes());
+        }
+
+        let closure = build_cfg_value_set_closed("switch", &bytes, 0x8000_0000, &[0x8000_0000]);
+        let table = closure
+            .indirect
+            .iter()
+            .find(|resolution| resolution.site_pc == 0x8000_0024)
+            .unwrap();
+        assert_ne!(table.state, IndirectProofState::Exhaustive);
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    fn asm(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_be_bytes()).collect()
+    }
+    const NOP: u32 = 0;
+
+    #[test]
+    fn probe_static_index() {
+        // index arrives from a static (load-image) global, then sltiu-bounded.
+        //   lui   $v0,0x8000
+        //   lw    $v0, 0x00f0($v0)   ; static global initialized to 3 in image
+        //   addiu $v1,$v0,0x00
+        //   sltiu $v0,$v1,0x1d       ; bound 29
+        //   beq   $v0,$zero,default
+        //   sll   $v0,$v1,2          (delay)
+        //   lui   $at,0x8000
+        //   addu  $at,$at,$v0
+        //   lw    $v0, 0x40($at)
+        //   jr    $v0 ; nop
+        // default: jr $ra ; nop
+        let lui_v0 = 0x3c02_8000u32;
+        let lw_glob = 0x8c42_00f0u32; // lw $v0,0xf0($v0)
+        let addiu_v1 = 0x2443_0000u32; // addiu $v1,$v0,0
+        let sltiu = 0x2c62_001du32;
+        let beq_default = 0x1040_0006u32;
+        let sll = 0x0003_1080u32;
+        let lui_at = 0x3c01_8000u32;
+        let addu_at = 0x0022_0821u32;
+        let lw_v0 = 0x8c22_0040u32;
+        let jr_v0 = 0x0040_0008u32;
+        let jr_ra = 0x03e0_0008u32;
+        let mut bytes = asm(&[
+            lui_v0,
+            lw_glob,
+            addiu_v1,
+            sltiu,
+            beq_default,
+            sll,
+            lui_at,
+            addu_at,
+            lw_v0,
+            jr_v0,
+            NOP,
+            jr_ra,
+            NOP,
+        ]);
+        bytes.resize(0x200, 0);
+        // static global at 0xf0 = 3
+        bytes[0xf0..0xf4].copy_from_slice(&3u32.to_be_bytes());
+        // 29-entry table at 0x40, all -> valid aligned in-bank targets 0x100..
+        for i in 0..29usize {
+            let off = 0x40 + i * 4;
+            let tgt = 0x8000_0100u32 + (i as u32) * 4;
+            bytes[off..off + 4].copy_from_slice(&tgt.to_be_bytes());
+        }
+        // put jr_ra at each target
+        for i in 0..29usize {
+            let t = 0x100 + i * 4;
+            bytes[t..t + 4].copy_from_slice(&jr_ra.to_be_bytes());
+        }
+        let closure = build_cfg_value_set_closed("p", &bytes, 0x8000_0000, &[0x8000_0000]);
+        for r in &closure.indirect {
+            eprintln!(
+                "site 0x{:08x} state={:?} kind={:?} ntargets={} nmem={}",
+                r.site_pc,
+                r.state,
+                r.kind,
+                r.targets.len(),
+                r.memory_sources.len()
+            );
+        }
     }
 }

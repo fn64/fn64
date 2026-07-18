@@ -38,14 +38,18 @@ expected_overlay_regions=471181f20c5add3b7478e7ea65626bc8417126b33e6b9c0a5e200dd
 # The dump is grading-only and opens after both discovery runs complete.
 expected_d1_overlays=9b0dc15f92aac10586edf98a02873c0acfc57f4ff6f00f857546fcb1ec1c4440
 # gate_owners_overlays: exact-owner proof on the recovered NWXE overlay banks
-# (6 owners, 0 wrong extents). Dump is grading-only, opened after proof.
-expected_owners_overlays=843248d5182e7a2cebdac4597f54a0ede9cb0d723c6d7f16825d4984a6ca5d27
-# gate_overlay_generalize: the AKI family search run against four NON-AKI ROMs
-# (OoT/GE/PD/SM64) — all admit zero tables (a diagnosed VROM-addressing shape
-# gap; SM64 is the correct no-overlay negative control). Digest is fixed only
-# with the full OoT+GE+PD+SM64 ROM set (unset ROMs are loud skips that change
-# output), so it is guarded on the non-AKI ROM vars below.
-expected_overlay_generalize=c9cc0216e768ae9496a4e3332d5385caae514e3e5e1a81f41b78b1cc5335a78e
+# (6 owners, 0 wrong extents). Dump is grading-only, opened after proof. The
+# digest moved when Phase-6 indirect closure strengthened: unresolved_indirect
+# occurrences fell 19196→16366 and more blocks reached; exact_owners/wrong
+# unchanged (6/0).
+expected_owners_overlays=ad9100231545eb7bbaab4f492531c2e5be7500b08be9778f58253424346a3717
+# gate_overlay_generalize: the family search (now with VROM resolution) run
+# against four NON-AKI ROMs (OoT/GE/PD/SM64). OoT now recovers 414 overlay
+# regions (100% precision / 88.5% recall) via file-table VROM translation;
+# SM64 stays the correct no-overlay negative control (0 admissions); GE/PD
+# ungraded. Digest is fixed only with the full OoT+GE+PD+SM64 ROM set (unset
+# ROMs are loud skips that change output), so it is guarded on those vars.
+expected_overlay_generalize=5401e638c9c233b79ed788a824fd0666d3ad31537657f140fdf09e80fb0a9106
 # gate_coverage renders the metric ladder for every supplied ROM; its digest is
 # only fixed when all three ROM vars are set, since an unset var is a loud skip
 # line that legitimately changes the output.

@@ -1,59 +1,21 @@
-//! Generalization test: does the descriptor-family overlay-region search
-//! (`overlay_regions::SearchConfig::aki_family` + `delta_vote`) recover
-//! anything on NON-AKI-engine titles?
+//! Generalization gate for the two-stage file-table/VROM overlay search on
+//! non-AKI engines. The unchanged physical descriptor path is reported beside
+//! the new path so an off-engine physical table remains observable too.
 //!
-//! NW4E and NWXE (graded by `gate_overlay_regions`/`gate_d1_overlays`) both
-//! share the AKI engine's overlay-loader shape: a single flat table of
-//! `(rom_start, rom_end, vram_dest)` triples read directly out of physical
-//! ROM bytes by a table-driven copy loop. Their 100% overlay-recovery success
-//! might be an artifact of that shared shape rather than evidence the
-//! pipeline generalizes. This gate runs the identical, unmodified family
-//! search against four non-AKI titles and reports exactly what happens for
-//! each:
+//! Recovery first enumerates physical
+//! `(vrom_start,vrom_end,rom_start,rom_end)` file-table families and admits
+//! only one distinct contiguous mapping run. It then resolves/materializes
+//! VROM files and applies the descriptor family plus `delta_vote` there. No
+//! ROM identity, table offset, stride, or field layout is supplied per title.
 //!
-//!  - OoT: uses overlay tables (actor, effect, gamestate, kaleido) but with a
-//!    different table shape than AKI's -- the real generalization test, and
-//!    the only one of the four with a held-out grading key available here.
-//!  - GoldenEye 007 / Perfect Dark: RARE's engine, its own overlay/section
-//!    structure, distinct from both AKI and OoT. No answer-key dump is wired
-//!    up for these titles in this crate, so their recovery is reported
-//!    ungraded -- raw candidate/admission counts and regions only, clearly
-//!    labeled "ungraded, no key".
-//!  - Super Mario 64: a single static image with NO overlay tables at all.
-//!    The honest, correct outcome here is that the family search finds
-//!    nothing to admit -- a negative-control check that the search does not
-//!    hallucinate a table where none exists.
-//!
-//! # What is held out
-//!
-//! The family search runs on raw ROM bytes only: no table offset, stride, or
-//! field layout is supplied per title. For OoT,
-//! `oot_reference::oot_load_image_tables` (OoT's real, byte-verified table
-//! geometry) is opened ONLY after the search and delta_vote admission are
-//! complete, and used exclusively to grade whether any admitted region
-//! happens to correspond to a real OoT overlay load image. It is never fed
-//! into the search. GoldenEye, Perfect Dark, and SM64 have no such reference
-//! wired into this crate, so their results are reported as raw recovery
-//! output with no grading step at all (not even an attempted one).
-//!
-//! # Honest outcomes per ROM (see module doc in `overlay_regions.rs` for the
-//! discipline this gate is bound by)
-//!
-//! (a) Admitted regions match real overlay load images -> the pipeline
-//!     generalizes beyond the AKI engine family for that title (strong
-//!     positive). Only checkable for OoT here.
-//! (b) The family search finds no qualifying table (or finds tables that
-//!     don't match the title's known geometry, where known) -> the
-//!     descriptor family as coded is AKI-shaped for that title; for OoT this
-//!     gate reports the precise shape gap against
-//!     `oot_reference::oot_load_image_tables`. For SM64 this is the EXPECTED
-//!     and correct outcome (no overlays exist to find).
-//! (c) The search finds candidate tables but delta_vote correctly declines to
-//!     admit them -> the discipline holds even off-distribution (also a good
-//!     sign, reported as such).
-//!
-//! None of these is forced. The exit code is 0 in every case; this is a
-//! measurement, not a pass/fail gate over an outcome we don't get to pick.
+//! OoT is graded only after recovery against its byte-verified dmadata and
+//! effect/actor/gamestate/Kaleido geometry. The held-out comparison reports
+//! dmadata agreement, load-table count, and exact
+//! `(VROM start,VROM end,VRAM destination)` region precision/recall. GoldenEye
+//! and Perfect Dark have no key wired into this crate and remain explicitly
+//! ungraded raw measurements. Super Mario 64 is the hard negative control:
+//! because it has no overlays, any admission in either address-space path is
+//! a precision regression and exits nonzero.
 //!
 //! Usage:
 //!   FN64_DISCOVER_OOT_ROM=<oot.z64> FN64_DISCOVER_OOT_DUMP=<oot dump.toml> \
@@ -66,10 +28,16 @@
 //! only for a stated, fully-populated set of these env vars; a run with
 //! fewer ROMs present legitimately produces different (shorter) output.
 
+use fn64_discover::banks::{DestinationEnd, LoadImageTableInput};
 use fn64_discover::delta_vote::DeltaVoteConfig;
+use fn64_discover::file_table::FileTableSearchConfig;
 use fn64_discover::normalize;
 use fn64_discover::oot_reference::oot_load_image_tables;
-use fn64_discover::overlay_regions::{recover_overlay_regions, OverlayRecovery, SearchConfig};
+use fn64_discover::overlay_regions::{
+    recover_overlay_regions, recover_vrom_overlay_regions, OverlayRecovery, SearchConfig,
+    VromOverlayRecovery,
+};
+use std::collections::BTreeSet;
 
 /// One title to run the family search against.
 struct RomTarget {
@@ -83,12 +51,14 @@ struct RomTarget {
 
 enum Graded {
     /// OoT: `FN64_DISCOVER_OOT_DUMP` names a reference dump.toml; opened only
-    /// after discovery, and only `oot_reference::oot_load_image_tables` (not
-    /// the dump itself) is needed for the shape-gap/overlap report.
+    /// after both recovery stages complete. Geometry is never search input.
     Oot { dump_env: &'static str },
     /// No answer key wired into this crate for this title: report raw
     /// recovery only, explicitly labeled ungraded.
     None,
+    /// SM64 has no overlays. Any admission in either address-space path is a
+    /// precision regression and fails loudly.
+    NegativeControl,
 }
 
 const TARGETS: &[RomTarget] = &[
@@ -112,7 +82,7 @@ const TARGETS: &[RomTarget] = &[
     RomTarget {
         label: "Super Mario 64",
         rom_env: "FN64_DISCOVER_SM64_ROM",
-        graded: Graded::None,
+        graded: Graded::NegativeControl,
     },
 ];
 
@@ -132,7 +102,9 @@ fn min_mapped(records: usize) -> u32 {
 
 fn run() -> Result<(), String> {
     let config = SearchConfig::aki_family();
+    let vrom_config = SearchConfig::vrom_family();
     let delta_config = DeltaVoteConfig::default();
+    let file_table_config = FileTableSearchConfig::n64_family();
 
     println!(
         "gate_overlay_generalize: does the AKI-derived descriptor-family search generalize beyond the AKI engine family?"
@@ -148,6 +120,13 @@ fn run() -> Result<(), String> {
         config.min_records,
     );
     println!(
+        "VROM search: region_len=[0x{:x},0x{:x}] link_va=[0x{:08x},0x{:08x}) min_records=2",
+        vrom_config.min_region_len,
+        vrom_config.max_region_len,
+        vrom_config.vram_lo,
+        vrom_config.vram_hi,
+    );
+    println!(
         "delta_vote: alignment=0x{:x} min_votes={} domination_factor={}",
         delta_config.alignment, delta_config.min_votes, delta_config.domination_factor
     );
@@ -158,7 +137,13 @@ shortens output."
     );
 
     for target in TARGETS {
-        run_target(target, &config, &delta_config)?;
+        run_target(
+            target,
+            &config,
+            &vrom_config,
+            &delta_config,
+            &file_table_config,
+        )?;
     }
 
     println!(
@@ -171,8 +156,10 @@ here): this gate only exercises route 1, the descriptor-family search."
 
 fn run_target(
     target: &RomTarget,
-    config: &SearchConfig,
+    physical_config: &SearchConfig,
+    vrom_config: &SearchConfig,
     delta_config: &DeltaVoteConfig,
+    file_table_config: &FileTableSearchConfig,
 ) -> Result<(), String> {
     let rom_path = match std::env::var(target.rom_env) {
         Ok(path) => path,
@@ -188,31 +175,60 @@ fn run_target(
     println!("\n=== {} ===", target.label);
     println!("ROM SHA-256 {}", rom.sha256);
 
-    let recovery = recover_overlay_regions(
+    let physical = recover_overlay_regions(
         &rom.bytes,
-        config,
+        physical_config,
         delta_config,
-        min_mapped(config.min_records as usize),
+        min_mapped(physical_config.min_records as usize),
     );
-    report_recovery(&recovery);
+    let vrom = recover_vrom_overlay_regions(
+        &rom.bytes,
+        vrom_config,
+        delta_config,
+        file_table_config,
+        2,
+        2,
+    );
+    println!("\n--- physical-ROM descriptor path (unchanged AKI path) ---");
+    report_recovery(&physical);
+    report_file_table(&vrom);
+    report_vrom_recovery(&vrom);
 
     match &target.graded {
-        Graded::Oot { dump_env } => grade_against_oot(dump_env, &recovery)?,
+        Graded::Oot { dump_env } => grade_against_oot(dump_env, &rom.bytes, &vrom)?,
         Graded::None => {
-            let admitted = recovery.admitted_intervals().len();
+            let physical_admitted = physical.admitted_intervals().len();
+            let vrom_admitted = vrom.admitted_intervals().len();
             println!(
                 "\nRESULT ({}): ungraded, no key -- no answer-key table geometry is wired into \
-this crate for this title. Reporting raw recovery only: {} raw candidate table(s), {admitted} \
-admitted region interval(s). {}",
+this crate for this title. Reporting raw recovery only: physical raw/admitted={}/{}, VROM \
+raw/admitted={}/{}. {}",
                 target.label,
-                recovery.candidate_tables.len(),
-                if admitted == 0 {
+                physical.candidate_tables.len(),
+                physical_admitted,
+                vrom.candidate_tables.len(),
+                vrom_admitted,
+                if physical_admitted + vrom_admitted == 0 {
                     "Outcome (b)-shaped: the search proposed nothing the delta_vote discipline \
 would admit."
                 } else {
                     "Admitted intervals exist but cannot be checked against a real load image \
 without a reference dump for this title -- reported as a candidate, not a finding."
                 }
+            );
+        }
+        Graded::NegativeControl => {
+            let physical_admitted = physical.admitted_intervals().len();
+            let vrom_admitted = vrom.admitted_intervals().len();
+            if physical_admitted != 0 || vrom_admitted != 0 {
+                return Err(format!(
+                    "SM64 NEGATIVE-CONTROL FAILURE: admitted {physical_admitted} physical and \
+{vrom_admitted} VROM overlay intervals in a title with no overlays"
+                ));
+            }
+            println!(
+                "\nRESULT (Super Mario 64): PASS negative control -- zero physical and zero \
+VROM overlay intervals admitted (file-table recovery is reported independently above)."
             );
         }
     }
@@ -225,8 +241,16 @@ without a reference dump for this title -- reported as a candidate, not a findin
 /// grading-key file is present; the actual comparison uses
 /// `oot_reference::oot_load_image_tables`, which is the byte-verified table
 /// shape this crate already carries for OoT and is not search input.
-fn grade_against_oot(dump_env: &str, recovery: &OverlayRecovery) -> Result<(), String> {
+fn grade_against_oot(
+    dump_env: &str,
+    rom_bytes: &[u8],
+    recovery: &VromOverlayRecovery,
+) -> Result<(), String> {
     let known_tables = oot_load_image_tables();
+    let dump_path = std::env::var(dump_env)
+        .map_err(|_| format!("{dump_env} is required when grading an OoT ROM"))?;
+    let dump = std::fs::read_to_string(&dump_path)
+        .map_err(|error| format!("reading held-out OoT dump {dump_path}: {error}"))?;
     println!("\n--- held-out comparison: OoT's real table geometry (opened after discovery) ---");
     for table in &known_tables {
         let loc = table.shape.location;
@@ -246,60 +270,265 @@ source(space={:?}, +0x{:x}..+0x{:x}) dest(space={:?}, +0x{:x})",
         );
     }
 
-    let dump_path_check = match std::env::var(dump_env) {
-        Ok(path) => std::fs::metadata(&path).is_ok(),
-        Err(_) => false,
-    };
     println!(
-        "\nOoT dump.toml presence check (grading key, opened but not required beyond geometry above): {}",
-        if dump_path_check { "present" } else { "MISSING" }
+        "\nOoT dump.toml grading key opened after recovery: present ({} bytes)",
+        dump.len()
     );
 
-    let admitted_intervals = recovery.admitted_intervals();
-    if admitted_intervals.is_empty() {
+    let known_dmadata = &known_tables[0];
+    let file_match = recovery
+        .file_table
+        .admitted_table
+        .as_ref()
+        .is_some_and(|table| {
+            table.table_rom_offset == known_dmadata.shape.location.offset
+                && table.record_stride == known_dmadata.shape.record_stride
+                && table.field_vrom_start == known_dmadata.shape.source.field_start
+                && table.field_vrom_end == known_dmadata.shape.source.field_end
+                && table.field_rom_start == known_dmadata.shape.destination.field_start
+                && matches!(
+                    known_dmadata.shape.destination.end,
+                    DestinationEnd::FieldOrSourceLength(field) if table.field_rom_end == field
+                )
+        });
+    println!(
+        "file table recovered: {} (matches dmadata geometry: {})",
+        if recovery.file_table.admitted_table.is_some() {
+            "yes"
+        } else {
+            "no"
+        },
+        if file_match { "yes" } else { "NO" }
+    );
+
+    let known_overlay_tables = &known_tables[1..];
+    let candidate_table_count = known_overlay_tables
+        .iter()
+        .filter(|known| candidate_table(known, recovery))
+        .count();
+    let admitted_table_count = known_overlay_tables
+        .iter()
+        .filter(|known| recovered_table(known, recovery))
+        .count();
+    for known in known_overlay_tables {
         println!(
-            "\nRESULT (OoT): (b) the family search admitted ZERO region intervals. \
-Raw candidate tables: {}. See shape-gap analysis below.",
-            recovery.candidate_tables.len()
+            "  overlay table '{}': candidate_geometry={} delta_admitted={}",
+            known.name,
+            candidate_table(known, recovery),
+            recovered_table(known, recovery)
         );
-    } else {
-        println!(
-            "\nRESULT (OoT): family search admitted {} region interval(s). Cross-checking \
-against known table geometry below.",
-            admitted_intervals.len()
-        );
-        for &(start, end) in &admitted_intervals {
-            // dmadata is the only table located in physical ROM space in
-            // oot_load_image_tables(); its records are VROM entries and its
-            // own table location is physical, so we can directly compare.
-            let overlaps_dmadata_table = known_tables.iter().any(|table| {
-                table.name == "dmadata"
-                    && table.shape.location.offset < end
-                    && start < table_end_estimate(table)
-            });
-            println!(
-                "  admitted [0x{start:06x},0x{end:06x}): overlaps dmadata table location range = {overlaps_dmadata_table}"
-            );
-        }
     }
 
-    println!("\n--- shape-gap analysis (AKI family search vs OoT known geometry) ---");
-    print_shape_gap(&SearchConfig::aki_family(), &known_tables);
+    let key_regions = known_oot_regions(rom_bytes, recovery, known_overlay_tables)?;
+    let recovered_regions: BTreeSet<_> = recovery
+        .admissions
+        .iter()
+        .filter(|admission| admission.admitted)
+        .flat_map(|admission| {
+            admission
+                .table
+                .records
+                .iter()
+                .map(|record| (record.rom_start, record.rom_end, record.vram_dest))
+        })
+        .collect();
+    let true_positive = recovered_regions.intersection(&key_regions).count();
+    let spurious = recovered_regions.len() - true_positive;
+    let missed = key_regions.len() - true_positive;
+    let precision = if recovered_regions.is_empty() {
+        0.0
+    } else {
+        100.0 * true_positive as f64 / recovered_regions.len() as f64
+    };
+    let recall = if key_regions.is_empty() {
+        0.0
+    } else {
+        100.0 * true_positive as f64 / key_regions.len() as f64
+    };
+    println!(
+        "OoT candidate load-table geometry recovered: {}/5 (dmadata={} + overlay descriptor tables={}/4)",
+        usize::from(file_match) + candidate_table_count,
+        usize::from(file_match),
+        candidate_table_count,
+    );
+    println!(
+        "OoT delta-admitted load tables: {}/5 (dmadata={} + overlay descriptor tables={}/4)",
+        usize::from(file_match) + admitted_table_count,
+        usize::from(file_match),
+        admitted_table_count,
+    );
+    println!(
+        "OoT regions: recovered={} true_positive={} spurious={} key={} missed={}",
+        recovered_regions.len(),
+        true_positive,
+        spurious,
+        key_regions.len(),
+        missed,
+    );
+    println!("OoT region precision={precision:.4}% recall={recall:.4}%");
 
     Ok(())
 }
 
-/// Rough end-of-table physical byte estimate for the overlap check above --
-/// intentionally coarse (a generous upper bound), used only to decide whether
-/// an admitted interval's *start* falls inside the table's own footprint, not
-/// to claim record-level agreement.
-fn table_end_estimate(table: &fn64_discover::banks::LoadImageTableInput) -> u32 {
-    table.shape.location.offset.saturating_add(
-        table
+fn recovered_table(known: &LoadImageTableInput, recovery: &VromOverlayRecovery) -> bool {
+    recovery
+        .admissions
+        .iter()
+        .filter(|admission| admission.admitted)
+        .any(|admission| table_location_matches(known, &admission.table))
+}
+
+fn candidate_table(known: &LoadImageTableInput, recovery: &VromOverlayRecovery) -> bool {
+    recovery
+        .candidate_tables
+        .iter()
+        .any(|candidate| table_location_matches(known, candidate))
+}
+
+fn table_location_matches(
+    known: &LoadImageTableInput,
+    candidate: &fn64_discover::overlay_regions::VromCandidateTable,
+) -> bool {
+    let first_source = known.shape.location.offset + known.shape.source.field_start;
+    let table_end = known.shape.location.offset.saturating_add(
+        known
             .shape
             .record_count
-            .saturating_mul(table.shape.record_stride),
-    )
+            .saturating_mul(known.shape.record_stride),
+    );
+    let candidate_source = candidate.table_vrom_offset + candidate.field_rom_start;
+    candidate.record_stride == known.shape.record_stride
+        && candidate_source >= first_source
+        && candidate_source < table_end
+        && (candidate_source - first_source).is_multiple_of(known.shape.record_stride)
+}
+
+fn known_oot_regions(
+    rom_bytes: &[u8],
+    recovery: &VromOverlayRecovery,
+    tables: &[LoadImageTableInput],
+) -> Result<BTreeSet<(u32, u32, u32)>, String> {
+    let file_table = recovery.file_table.admitted_table.as_ref().ok_or_else(|| {
+        "cannot materialize held-out OoT tables without a unique recovered file table".to_string()
+    })?;
+    let mut regions = BTreeSet::new();
+    for table in tables {
+        let shape = table.shape;
+        let destination_end_field = match shape.destination.end {
+            DestinationEnd::Field(field) | DestinationEnd::FieldOrSourceLength(field) => field,
+            DestinationEnd::SourceLength => shape.destination.field_start,
+        };
+        let max_field = [
+            shape.source.field_start,
+            shape.source.field_end,
+            shape.destination.field_start,
+            destination_end_field,
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+        let table_len = shape
+            .record_count
+            .saturating_sub(1)
+            .saturating_mul(shape.record_stride)
+            .saturating_add(max_field)
+            .saturating_add(4);
+        let table_bytes = file_table.materialize_vrom_range(
+            rom_bytes,
+            shape.location.offset,
+            shape.location.offset.saturating_add(table_len),
+        )?;
+        for index in 0..shape.record_count {
+            let base = (index * shape.record_stride) as usize;
+            let read = |field: u32| -> Option<u32> {
+                let offset = base.checked_add(field as usize)?;
+                Some(u32::from_be_bytes(
+                    table_bytes.get(offset..offset + 4)?.try_into().ok()?,
+                ))
+            };
+            let (Some(source_start), Some(source_end), Some(destination_start)) = (
+                read(shape.source.field_start),
+                read(shape.source.field_end),
+                read(shape.destination.field_start),
+            ) else {
+                continue;
+            };
+            let destination_end = match shape.destination.end {
+                DestinationEnd::Field(field) => read(field),
+                DestinationEnd::SourceLength => {
+                    destination_start.checked_add(source_end.saturating_sub(source_start))
+                }
+                DestinationEnd::FieldOrSourceLength(field) => read(field).and_then(|end| {
+                    if end == 0 {
+                        destination_start.checked_add(source_end.saturating_sub(source_start))
+                    } else {
+                        Some(end)
+                    }
+                }),
+            };
+            if source_end > source_start
+                && destination_end.is_some_and(|end| end > destination_start)
+                && file_table.contains_vrom_range(source_start, source_end)
+            {
+                regions.insert((source_start, source_end, destination_start));
+            }
+        }
+    }
+    Ok(regions)
+}
+
+fn report_file_table(recovery: &VromOverlayRecovery) {
+    println!("\n--- physical file-table recovery ---");
+    println!(
+        "file-table tightening: {} distinct candidate(s) -> admitted={}",
+        recovery.file_table.candidate_tables.len(),
+        recovery.file_table.admitted_table.is_some(),
+    );
+    for table in &recovery.file_table.candidate_tables {
+        println!(
+            "file table @ROM 0x{:x} stride=0x{:x} vrom_alignment=0x{:x} fields(vrom=+0x{:x}..+0x{:x},rom=+0x{:x}..+0x{:x}) records={} max_vrom=0x{:x}",
+            table.table_rom_offset,
+            table.record_stride,
+            table.vrom_alignment,
+            table.field_vrom_start,
+            table.field_vrom_end,
+            table.field_rom_start,
+            table.field_rom_end,
+            table.records.len(),
+            table.max_vrom_end(),
+        );
+    }
+}
+
+fn report_vrom_recovery(recovery: &VromOverlayRecovery) {
+    println!("\n--- VROM-located descriptor path ---");
+    let admitted_tables = recovery
+        .admissions
+        .iter()
+        .filter(|admission| admission.admitted)
+        .count();
+    println!(
+        "tightening: {} raw VROM family table(s) -> {admitted_tables} delta_vote-admitted table(s) ({} distinct admitted region interval(s)); min_records={} mapped_floor={}",
+        recovery.candidate_tables.len(),
+        recovery.admitted_intervals().len(),
+        recovery.vrom_min_records,
+        recovery.min_mapped_regions,
+    );
+    for admission in &recovery.admissions {
+        println!(
+            "table @VROM 0x{:x} stride=0x{:x} fields(start=+0x{:x},end=+0x{:x},vram=+0x{:x}) records={} mapped={}/{} required={} admitted={}",
+            admission.table.table_vrom_offset,
+            admission.table.record_stride,
+            admission.table.field_rom_start,
+            admission.table.field_rom_end,
+            admission.table.field_vram_dest,
+            admission.table.records.len(),
+            admission.mapped_regions,
+            admission.table.records.len(),
+            admission.required_mapped_regions,
+            admission.admitted,
+        );
+    }
 }
 
 fn report_recovery(recovery: &OverlayRecovery) {
@@ -349,47 +578,5 @@ in physical ROM bytes. Stated as evidence, not forced.",
                 dv
             );
         }
-    }
-}
-
-/// Print the precise mismatch between what the AKI family search enumerates
-/// and OoT's known table shapes, field by field. This is the actionable
-/// finding when outcome (b) holds.
-fn print_shape_gap(
-    config: &SearchConfig,
-    known_tables: &[fn64_discover::banks::LoadImageTableInput],
-) {
-    for table in known_tables {
-        let loc = table.shape.location;
-        let stride_in_family = config.strides.contains(&table.shape.record_stride);
-        println!(
-            "  '{}': location.space={:?} (family search reads ONLY physical rom_bytes offsets; \
-Virtual/VROM offsets require resolving through the file table first -- structurally out of \
-reach of a flat byte-offset scan) | stride=0x{:x} in searched strides {:x?}? {} | \
-record_count={} (family min_records={}, {}) | source.field=+0x{:x}..+0x{:x} in {:?} space \
-(family assumes rom_start/rom_end are the FIRST TWO consecutive u32 fields, sliding phase \
-0..stride-12, in the SAME physical-ROM space as the table itself) | destination.field=+0x{:x} \
-in {:?} space (family assumes the destination is ALWAYS a resident RDRAM VA at \
-field_rom_end+4, i.e. immediately after rom_end; OoT's non-dmadata tables place it there too, \
-but dmadata's destination is PhysicalRom, not Vram -- a space the family search's \
-vram_lo/vram_hi window would reject outright)",
-            table.name,
-            loc.space,
-            table.shape.record_stride,
-            config.strides,
-            stride_in_family,
-            table.shape.record_count,
-            config.min_records,
-            if table.shape.record_count >= config.min_records {
-                "satisfies min_records"
-            } else {
-                "BELOW min_records"
-            },
-            table.shape.source.field_start,
-            table.shape.source.field_end,
-            table.shape.source.space,
-            table.shape.destination.field_start,
-            table.shape.destination.space,
-        );
     }
 }

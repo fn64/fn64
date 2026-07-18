@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 
 pub mod decoder;
+pub mod drive;
 pub mod emit;
 pub mod execution;
 pub mod fallback;
@@ -41,6 +42,7 @@ pub mod module;
 pub mod runtime;
 
 pub use decoder::{decode, Instruction};
+pub use drive::ExecutorAction;
 pub use emit::{
     classify_bank_words, emit_bank_runner, emit_function, emit_function_resolved,
     emit_sparse_bank_runner, BankBlockInput, BankInput, BankWordCatalog, BankWordKind, BankWordRun,
