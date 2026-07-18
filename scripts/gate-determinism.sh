@@ -25,6 +25,12 @@ expected_loaders=5a67f5e471bad44bbb85aba27decd4ac831d93f2a24f0de1b329c3393bfec92
 expected_selector=b53b25c7dd0a92dda59182f78f5c3ac0e0147124ea19941516da92a391679290
 # gate_keys in the ROMs-absent (parse-only) configuration.
 expected_keys=d3c0dfbeb85b3042b55f4d896d69c111d5e8d7c0ec3fe513ac7dfd679903af71
+# gate_delta_vote: NW4E overlay VA-delta inference, graded held-out (needs
+# FN64_DISCOVER_NW4E_ROM, already required above).
+expected_delta_vote=4910c27983a0344115a11c8537f4a507d585ad9e3e35d8ebe108ea2fb539f4e6
+# gate_gp_base: NW4E + NWXE resident $gp-base inference (both OPEN — no
+# recoverable gp-small-data base in either AKI title).
+expected_gp_base=d1e267035c94488b2d47df60038031ab9fc345a4daf00b68eb5b8f948abcaf6a
 # gate_coverage renders the metric ladder for every supplied ROM; its digest is
 # only fixed when all three ROM vars are set, since an unset var is a loud skip
 # line that legitimately changes the output.
@@ -60,10 +66,19 @@ check_gate() {
 
 check_gate gate_loaders "$expected_loaders"
 check_gate gate_selector "$expected_selector"
+check_gate gate_delta_vote "$expected_delta_vote"
 # gate_keys parses the vendored answer-key tables; with the grading ROMs
 # absent (FN64_DISCOVER_BANJO_ROM/PD_ROM unset) it is a deterministic
 # parse-and-count run whose digest is fixed by the vendored table bytes.
 check_gate gate_keys "$expected_keys"
+
+# gate_gp_base needs both AKI ROMs and their dumps (it cross-checks _gp
+# symbols); guard on the NWXE dump being present.
+if [ "${FN64_DISCOVER_NWXE_DUMP:-}" != "" ]; then
+    check_gate gate_gp_base "$expected_gp_base"
+else
+    echo "gate_gp_base: skipped (FN64_DISCOVER_NWXE_DUMP unset)"
+fi
 
 if [ "${FN64_DISCOVER_OOT_ROM:-}" != "" ]; then
     check_gate gate_coverage "$expected_coverage"

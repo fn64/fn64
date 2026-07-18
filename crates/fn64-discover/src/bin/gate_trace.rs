@@ -1,16 +1,22 @@
 //! Trace-ingestion gate: one real, digest-bound NW4E boot trace through the
-//! canonical `trace::ingest_jsonl` path, plus a measured classification of
-//! every observed PC against the resident bank's existing static evidence.
+//! canonical `trace::ingest_jsonl` path, a measured classification of every
+//! observed PC against the resident bank's existing static evidence, and the
+//! real measured `FactDb` delta from folding those observations in.
 //!
-//! What this gate does NOT do: promote anything. `trace::ingest_jsonl`
-//! yields typed [`fn64_discover::trace::ObservedTraceFact`]s that are, per
-//! that module's own doc comment, "ready for a later adapter into `FactDb`"
-//! -- no such adapter exists yet, so the measured FactDb delta of ingestion
-//! is exactly zero facts and this gate says so. What it measures instead is
-//! corroboration: how many observed PCs land inside already-proven code,
-//! inside candidate code (execution evidence agreeing with a heuristic
-//! claim), or on previously-unclassified resident-bank words (new
-//! code-existence evidence the frontier adapter could consume).
+//! What this gate does NOT do: promote anything beyond the one sound rule
+//! `trace::fold_executed_pcs_into_fact_db` implements -- a known-bank
+//! executed-PC observation becomes bank-scoped dynamic code-existence
+//! evidence (`Fact::ObservedExecutedCode`, `ProofState::Supported`), never a
+//! proven owner and never CFG-reachability proof. `IndirectTransfer`,
+//! `PiDma`, and `WatchedTableWrite` facts still have no FactDb adapter and
+//! stay at delta zero; bounded-exhaustiveness-aware indirect-target
+//! corroboration remains a frontier. Before folding, this gate also reports
+//! the same corroboration breakdown as before the adapter existed: how many
+//! observed PCs land inside already-proven code, inside candidate code
+//! (execution evidence agreeing with a heuristic claim), on
+//! previously-unclassified resident-bank words, or on a word statically
+//! classified as something other than code (loud conflict, never silently
+//! resolved).
 //!
 //! Inputs (out-of-tree, loud when absent):
 //!   FN64_DISCOVER_NW4E_ROM   -- the NW4E .z64
@@ -65,7 +71,7 @@ fn report(rom_bytes: &[u8], trace_path: &str) -> Result<String, String> {
         aki_reference::NW4E_DESCRIPTOR_TABLE,
         aki_reference::nw4e_bank_name,
     );
-    let (rom, db) = run_discovery(rom_bytes, Some(descriptor))
+    let (rom, mut db) = run_discovery(rom_bytes, Some(descriptor))
         .map_err(|error| format!("normalizing NW4E ROM: {error}"))?;
     writeln!(out, "NW4E ROM: {} bytes, sha256={}", rom.len(), rom.sha256).unwrap();
 
@@ -278,12 +284,58 @@ fn report(rom_bytes: &[u8], trace_path: &str) -> Result<String, String> {
         .unwrap();
     }
 
+    // Fold every known-bank ExecutedPc observation into the FactDb as typed
+    // ObservedExecutedCode evidence and report the real measured delta --
+    // this is the adapter trace.rs's own doc comment called a frontier.
+    // Static lookup mirrors the classification above: exploratory_cfg is the
+    // superset (proven-closure + candidate coverage), falling back to
+    // proven_cfg for words the exploratory pass never reached at all.
+    let static_word_class = |bank: &str, va: u32| -> Option<WordClass> {
+        if bank != banks::BOOT_BANK {
+            return None;
+        }
+        exploratory_cfg
+            .word_class
+            .get(&va)
+            .or_else(|| proven_cfg.word_class.get(&va))
+            .copied()
+    };
+    let fold_report = fn64_discover::trace::fold_executed_pcs_into_fact_db(
+        &mut db,
+        &ingest.header.trace_id,
+        &ingest.facts,
+        static_word_class,
+    );
     writeln!(
         out,
-        "FactDb delta from ingestion: 0 facts (trace facts have no FactDb adapter yet; frontier: \
-         an adapter admitting observed PCs as bank-scoped code-existence evidence, and \
-         bounded-exhaustiveness-aware indirect-target corroboration)"
+        "FactDb delta from ingestion: {} facts added ({} words newly asserting code-existence, \
+         {} corroborations of an already-observed word, {} static-data-vs-observed-code conflicts, \
+         {} unknown-bank observations skipped)",
+        fold_report.facts_added,
+        fold_report.new_code_existence.len(),
+        fold_report.corroborated.len(),
+        fold_report.conflicts.len(),
+        fold_report.unknown_bank_skipped,
     )
     .unwrap();
+    if let (Some(min), Some(max)) = (
+        fold_report.new_code_existence.iter().min(),
+        fold_report.new_code_existence.iter().max(),
+    ) {
+        writeln!(
+            out,
+            "  new code-existence span: [0x{:08x}, 0x{:08x}]",
+            min.pc, max.pc
+        )
+        .unwrap();
+    }
+    for conflict in &fold_report.conflicts {
+        writeln!(
+            out,
+            "  CONFLICT: trace={:?} seq={} observed-executed PC 0x{:08x} is statically ProvenData",
+            conflict.trace_id, conflict.sequence, conflict.site.pc
+        )
+        .unwrap();
+    }
     Ok(out)
 }

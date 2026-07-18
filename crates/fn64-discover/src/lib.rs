@@ -69,6 +69,16 @@
 //!   Computed-jump table entries remain intra-owner code successors; only
 //!   exhaustive computed calls become callable roots. Every unresolved site
 //!   is retained as bounded/open evidence in the fact database.
+//! - [`delta_vote`]: mapping inference for a code region with an unknown VA
+//!   base -- lui-histogram-narrowed delta hypotheses scored by distinct
+//!   `jal`-target-to-prologue coincidences, admitted only on a unique
+//!   dominating winner (the mechanized NW4E selector VA correction).
+//!   Admitted deltas are candidate mappings, never proven `RomMapping`s.
+//! - [`gp_base`]: IDO small-data `$gp` base recovery by constrained voting
+//!   (boot `lui`/`addiu` constructions, or a bounded access-offset histogram
+//!   fallback), admitted only on a unique dominating winner, then surfaces the
+//!   gp-relative data accesses `xref.rs` cannot see. Emitted xref sites are
+//!   candidate evidence; the admitted base is a typed program-level fact.
 //! - [`homology`]: bounded relocation-masked cross-ROM n-gram lookup with
 //!   collision-safe full-body validation and explicit ambiguous/unmatched
 //!   results. Homology emits candidates only.
@@ -116,8 +126,10 @@ pub mod block_proof;
 pub mod cfg;
 pub mod cfg_homology;
 pub mod coverage;
+pub mod delta_vote;
 pub mod evidence;
 pub mod facts;
+pub mod gp_base;
 pub mod grade_candidates;
 pub mod grade_nw4e;
 pub mod grade_nw4e_symbols;
