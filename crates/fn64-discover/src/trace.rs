@@ -598,6 +598,135 @@ pub fn ingest_jsonl<R: BufRead>(
     })
 }
 
+/// One `ExecutedPc` observation landing on a word static analysis had
+/// already called `ProvenData`. Dynamic evidence (this word ran) and static
+/// evidence (this word is proven non-code) genuinely disagree; per
+/// `facts.rs`'s monotonic-fact invariant, neither side may silently
+/// overwrite the other, so this is a typed finding, not an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticDataConflict {
+    pub site: crate::facts::BankAddr,
+    pub trace_id: String,
+    pub sequence: u64,
+}
+
+/// The measured effect of folding one trace's `ExecutedPc` observations into
+/// a [`crate::facts::FactDb`] as bank-scoped dynamic code-existence evidence
+/// ([`crate::facts::Fact::ObservedExecutedCode`]). Every count here is a
+/// direct measurement of what [`fold_executed_pcs_into_fact_db`] actually did
+/// to `db` -- never an estimate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactDbFoldReport {
+    /// Total `Fact::ObservedExecutedCode` records appended to the database
+    /// (one per known-bank `ExecutedPc` observation folded).
+    pub facts_added: u64,
+    /// `(bank, pc)` words that had no prior code-existence conclusion of any
+    /// kind before this fold and now carry one from this evidence class.
+    pub new_code_existence: BTreeSet<crate::facts::BankAddr>,
+    /// `(bank, pc)` words that already carried a code-existence conclusion
+    /// (from this or an earlier fold, static or dynamic) and this
+    /// observation corroborates -- a second-or-later independent sighting of
+    /// the same word, not new evidence of existence.
+    pub corroborated: BTreeSet<crate::facts::BankAddr>,
+    /// Observations that landed on a word static analysis had already
+    /// proven `ProvenData`. Reported, never resolved by fiat.
+    pub conflicts: Vec<StaticDataConflict>,
+    /// `ExecutedPc` observations skipped because their bank was
+    /// `BankContext::Unknown`. Never promoting, per this module's mandate
+    /// that unknown-bank identity is preserved rather than guessed.
+    pub unknown_bank_skipped: u64,
+}
+
+/// Fold every known-bank `ExecutedPc` observation in `facts` into `db` as
+/// [`crate::facts::Fact::ObservedExecutedCode`] evidence, and return the
+/// exact measured delta.
+///
+/// This is deliberately the *only* class of trace fact this adapter
+/// promotes: an executed PC in a known bank proves that word is code that
+/// ran once -- weaker than a proven owner, weaker than CFG-reachability
+/// proof, but a real, distinct, auditable evidence class (`observed_executed`
+/// / dynamic code existence). `IndirectTransfer`, `PiDma`, and
+/// `WatchedTableWrite` facts are untouched here; they remain, as `trace.rs`'s
+/// module doc says, observations without an admission rule of their own yet.
+///
+/// `static_word_class` looks up whatever static classification the caller
+/// already has for `(bank, va)` (e.g. from a `cfg::Cfg::word_class` built by
+/// `resolve::build_cfg_closed_with_facts`/`build_cfg_exploratory_with_candidates`).
+/// It is a caller-supplied lookup, not a CFG this module builds itself, so
+/// `trace.rs` stays decoupled from bank-materialization and CFG
+/// construction. Returning `None` means "no static code/data claim at this
+/// word" and is never treated as a conflict.
+///
+/// Idempotent per `(bank, pc)`: observing the same PC twice inserts two
+/// `Fact::ObservedExecutedCode` records (distinct provenance, exact-duplicate
+/// facts are harmless per `FactDb::insert`'s contract) but only ever
+/// concludes the `(bank, pc)` subject once, growing its `justified_by` list
+/// -- "one fact[-conclusion] with two provenance records."
+pub fn fold_executed_pcs_into_fact_db(
+    db: &mut crate::facts::FactDb,
+    trace_id: &str,
+    facts: &[ObservedTraceFact],
+    static_word_class: impl Fn(&str, u32) -> Option<crate::cfg::WordClass>,
+) -> FactDbFoldReport {
+    use crate::cfg::WordClass;
+    use crate::facts::{observed_executed_code_subject, BankAddr, Fact, ProofState};
+
+    let mut report = FactDbFoldReport::default();
+    for observed in facts {
+        let ObservedTraceFact::ExecutedPc { sequence, pc } = observed else {
+            continue;
+        };
+        let BankContext::Known { bank, .. } = &pc.bank else {
+            report.unknown_bank_skipped += 1;
+            continue;
+        };
+        let site = BankAddr::new(bank.clone(), pc.address);
+        let subject = observed_executed_code_subject(&site.bank, site.pc);
+        let already_concluded = db.conclusion(&subject).is_some();
+
+        let fact_index = db.insert(Fact::ObservedExecutedCode {
+            site: site.clone(),
+            trace: trace_id.to_string(),
+            sequence: *sequence,
+        });
+        report.facts_added += 1;
+
+        let mut justified_by = db
+            .conclusion(&subject)
+            .map(|conclusion| conclusion.justified_by.clone())
+            .unwrap_or_default();
+        justified_by.push(fact_index);
+        db.conclude(
+            subject,
+            ProofState::Supported,
+            justified_by,
+            "trace_observed_executed_pc",
+        )
+        .expect(
+            "ObservedExecutedCode never proposes Proven, so it can never fail to supersede \
+             an existing conclusion for the same subject",
+        );
+
+        if already_concluded {
+            report.corroborated.insert(site.clone());
+        } else {
+            report.new_code_existence.insert(site.clone());
+        }
+
+        if matches!(
+            static_word_class(&site.bank, site.pc),
+            Some(WordClass::ProvenData)
+        ) {
+            report.conflicts.push(StaticDataConflict {
+                site,
+                trace_id: trace_id.to_string(),
+                sequence: *sequence,
+            });
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,5 +879,177 @@ mod tests {
         assert!(NormalizedRomDigest::try_from("0".repeat(63)).is_err());
         assert!(NormalizedRomDigest::try_from("A".repeat(64)).is_err());
         assert!(NormalizedRomDigest::try_from("g".repeat(64)).is_err());
+    }
+
+    mod fold_into_fact_db {
+        use super::*;
+        use crate::cfg::WordClass;
+        use crate::facts::{observed_executed_code_subject, BankAddr, Fact, FactDb, ProofState};
+
+        fn known_pc(bank: &str, address: u32, activation: u64) -> ObservedAddress {
+            ObservedAddress {
+                address,
+                bank: BankContext::Known {
+                    bank: bank.to_string(),
+                    activation,
+                },
+            }
+        }
+
+        fn unknown_pc(address: u32) -> ObservedAddress {
+            ObservedAddress {
+                address,
+                bank: BankContext::Unknown,
+            }
+        }
+
+        fn no_static_class(_bank: &str, _va: u32) -> Option<WordClass> {
+            None
+        }
+
+        #[test]
+        fn known_bank_observation_adds_a_code_existence_fact() {
+            let mut db = FactDb::new();
+            let facts = vec![ObservedTraceFact::ExecutedPc {
+                sequence: 1,
+                pc: known_pc("boot", 0x8000_0400, 0),
+            }];
+
+            let report =
+                fold_executed_pcs_into_fact_db(&mut db, "trace-a", &facts, no_static_class);
+
+            assert_eq!(report.facts_added, 1);
+            let site = BankAddr::new("boot", 0x8000_0400);
+            assert_eq!(report.new_code_existence, [site.clone()].into());
+            assert!(report.corroborated.is_empty());
+            assert!(report.conflicts.is_empty());
+            assert_eq!(report.unknown_bank_skipped, 0);
+
+            assert_eq!(db.facts().len(), 1);
+            assert!(matches!(
+                &db.facts()[0],
+                Fact::ObservedExecutedCode { site: s, trace, sequence: 1 }
+                    if *s == site && trace == "trace-a"
+            ));
+            let conclusion = db
+                .conclusion(&observed_executed_code_subject("boot", 0x8000_0400))
+                .unwrap();
+            assert_eq!(conclusion.state, ProofState::Supported);
+            assert_eq!(conclusion.justified_by, vec![0]);
+        }
+
+        #[test]
+        fn repeated_observation_of_the_same_pc_adds_one_conclusion_two_provenance_records() {
+            let mut db = FactDb::new();
+            let facts = vec![
+                ObservedTraceFact::ExecutedPc {
+                    sequence: 1,
+                    pc: known_pc("boot", 0x8000_0400, 0),
+                },
+                ObservedTraceFact::ExecutedPc {
+                    sequence: 2,
+                    pc: known_pc("boot", 0x8000_0400, 0),
+                },
+            ];
+
+            let report =
+                fold_executed_pcs_into_fact_db(&mut db, "trace-a", &facts, no_static_class);
+
+            assert_eq!(report.facts_added, 2);
+            let site = BankAddr::new("boot", 0x8000_0400);
+            // First sighting is new evidence; the second is a corroboration
+            // of that same word, not a second new-evidence word.
+            assert_eq!(report.new_code_existence, [site.clone()].into());
+            assert_eq!(report.corroborated, [site.clone()].into());
+
+            // Two distinct Fact::ObservedExecutedCode records (provenance)...
+            assert_eq!(db.facts().len(), 2);
+            let sequences: Vec<u64> = db
+                .facts()
+                .iter()
+                .map(|f| match f {
+                    Fact::ObservedExecutedCode { sequence, .. } => *sequence,
+                    _ => panic!("unexpected fact variant"),
+                })
+                .collect();
+            assert_eq!(sequences, vec![1, 2]);
+
+            // ...but exactly one conclusion for the (bank, pc) subject, whose
+            // justified_by names both provenance facts.
+            assert_eq!(db.conclusions().count(), 1);
+            let conclusion = db
+                .conclusion(&observed_executed_code_subject("boot", 0x8000_0400))
+                .unwrap();
+            assert_eq!(conclusion.justified_by, vec![0, 1]);
+        }
+
+        #[test]
+        fn observed_executed_word_that_is_statically_proven_data_raises_a_conflict() {
+            let mut db = FactDb::new();
+            let facts = vec![ObservedTraceFact::ExecutedPc {
+                sequence: 7,
+                pc: known_pc("boot", 0x8000_0800, 0),
+            }];
+            let static_class = |bank: &str, va: u32| -> Option<WordClass> {
+                (bank == "boot" && va == 0x8000_0800).then_some(WordClass::ProvenData)
+            };
+
+            let report = fold_executed_pcs_into_fact_db(&mut db, "trace-b", &facts, static_class);
+
+            assert_eq!(report.facts_added, 1);
+            assert_eq!(report.conflicts.len(), 1);
+            assert_eq!(report.conflicts[0].site, BankAddr::new("boot", 0x8000_0800));
+            assert_eq!(report.conflicts[0].trace_id, "trace-b");
+            assert_eq!(report.conflicts[0].sequence, 7);
+            // The conflict is surfaced, not resolved: the observation still
+            // becomes Supported evidence rather than being dropped, and
+            // nothing here mutates or removes the static ProvenData claim
+            // (which this test's closure stands in for -- it is never
+            // touched by the adapter at all).
+            let conclusion = db
+                .conclusion(&observed_executed_code_subject("boot", 0x8000_0800))
+                .unwrap();
+            assert_eq!(conclusion.state, ProofState::Supported);
+        }
+
+        #[test]
+        fn unknown_bank_observation_adds_nothing() {
+            let mut db = FactDb::new();
+            let facts = vec![ObservedTraceFact::ExecutedPc {
+                sequence: 1,
+                pc: unknown_pc(0x8000_0400),
+            }];
+
+            let report =
+                fold_executed_pcs_into_fact_db(&mut db, "trace-a", &facts, no_static_class);
+
+            assert_eq!(report.facts_added, 0);
+            assert_eq!(report.unknown_bank_skipped, 1);
+            assert!(report.new_code_existence.is_empty());
+            assert!(report.corroborated.is_empty());
+            assert!(report.conflicts.is_empty());
+            assert!(db.facts().is_empty());
+            assert_eq!(db.conclusions().count(), 0);
+        }
+
+        #[test]
+        fn non_executed_pc_facts_are_left_untouched() {
+            let mut db = FactDb::new();
+            let facts = vec![ObservedTraceFact::PiDma {
+                sequence: 1,
+                direction: PiDmaDirection::CartToRdram,
+                cart_address: 0x1000_0000,
+                dram_address: 0x400,
+                byte_len: 64,
+                active_bank: BankContext::Unknown,
+            }];
+
+            let report =
+                fold_executed_pcs_into_fact_db(&mut db, "trace-a", &facts, no_static_class);
+
+            assert_eq!(report.facts_added, 0);
+            assert_eq!(report.unknown_bank_skipped, 0);
+            assert!(db.facts().is_empty());
+        }
     }
 }

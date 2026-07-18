@@ -144,6 +144,18 @@ pub enum Fact {
         target: BankAddr,
         trace: String,
     },
+    /// A dynamic trace observed the instruction at `site` execute. This is
+    /// bank-scoped dynamic code-existence evidence -- strictly weaker than a
+    /// proven owner or a CFG-reachability proof: it proves one word decoded
+    /// and ran once in the named bank's activation, never that the trace's
+    /// observed set is exhaustive (see `trace.rs`). `trace`/`sequence` pin
+    /// this fact to one exact record of one exact capture so the evidence
+    /// stays auditable.
+    ObservedExecutedCode {
+        site: BankAddr,
+        trace: String,
+        sequence: u64,
+    },
     /// Static Phase 6 result for one reachable `jr`/`jalr`. Only an
     /// exhaustive record may contribute CFG successors; bounded/open records
     /// preserve the unresolved frontier without guessing.
@@ -224,6 +236,7 @@ impl Fact {
             Fact::BlockStart { bank, .. } => Some(bank),
             Fact::LoadsFrom { site, .. } => Some(&site.bank),
             Fact::ObservedIndirectTarget { site, .. } => Some(&site.bank),
+            Fact::ObservedExecutedCode { site, .. } => Some(&site.bank),
             Fact::IndirectTransferAnalysis { site, .. } => Some(&site.bank),
             Fact::RomMapping { bank, .. } => Some(bank),
             Fact::ExecutableRange { bank, .. } => Some(bank),
@@ -295,6 +308,12 @@ pub fn load_image_table_record_subject(table: &str, index: u32) -> String {
 /// Stable conclusion key for one bank-qualified executable interval.
 pub fn executable_range_subject(bank: &str, va_start: u32, va_end: u32) -> String {
     format!("executable-range:{bank}:0x{va_start:08x}:0x{va_end:08x}")
+}
+
+/// Stable conclusion key for one bank-qualified word's dynamic
+/// execution-observed evidence (`trace::fold_into_fact_db`'s subject).
+pub fn observed_executed_code_subject(bank: &str, pc: u32) -> String {
+    format!("observed-executed:{bank}:0x{pc:08x}")
 }
 
 /// A derived conclusion tracked with its proof state and the fact

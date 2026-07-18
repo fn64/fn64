@@ -607,17 +607,36 @@ aligned-pointer-run rejection.
 aligned encoding makes exhaustive hypothesis enumeration cheap, and the
 rule is always enumerate-then-constrain, never promote-by-score):
 
-- **Delta-voting mapping inference** (queued for the wave after the trace
-  producer): for a candidate region, enumerate VA-delta hypotheses —
+- **Delta-voting mapping inference** (`delta_vote.rs` / `gate_delta_vote`,
+  landed 2026-07-18): for a candidate region, enumerate VA-delta hypotheses —
   narrowed by the region's `lui` upper-half histogram, with a full aligned
-  sweep as fallback — and score mapping-independent constraints: absolute
-  `jal`/`j` targets landing on prologues or known entries, `%hi/%lo` pairs
-  landing in mapped space, branch targets staying in-region. This is the
-  mechanized form of the NW4E selector VA disambiguation (twelve `jal`
-  prologue votes selected delta `0x7fff_f400` over the recorded
-  `0x8000_0000`). Promotion requires constraint uniqueness; a region with
-  two surviving deltas stays open. Targets NWXE's "overlays are absent"
-  limitation; graded held-out against the known AKI overlay tables.
+  sweep as fallback — and vote over mapping-independent constraints: absolute
+  `jal`/`j` targets landing on `addiu $sp,-N` prologues or known entries
+  (votes counted over *distinct* targets, so a popular callee cannot
+  manufacture domination), `%hi/%lo` pairs landing in mapped space
+  (corroboration only, plateau-shaped), branch targets staying in-region
+  (delta-invariant, used as a filter not a discriminator). This is the
+  mechanized form of the NW4E selector VA disambiguation. Admission requires
+  the unique top with ≥3 prologue votes AND ≥2× the runner-up; a near-tie
+  stays open. **Graded held-out on NW4E's five overlays (`va_start` used only
+  to grade, never fed to inference): 5/5 admitted-correct, 0 open, 0 wrong,
+  margins 3.1×–9.7×; full-sweep mode admits the identical deltas, so the
+  narrowing loses nothing.** NWXE is not graded — its overlay ROM intervals
+  need a byte-verified descriptor table or a descriptor-free recovery that
+  does not yet exist, so the gate states that frontier rather than guessing
+  regions (that recovery is the remaining step toward NWXE's "overlays are
+  absent" limitation).
+- **GP-base voting** (`gp_base.rs` / `gate_gp_base`, landed 2026-07-18):
+  recover the IDO small-data `$gp` base by voting over boot `lui/addiu $gp`
+  constructions or an access-offset histogram, admitting the unique
+  dominating base only. **Both AKI titles grade OPEN**, and that is the
+  disciplined result: NW4E and NWXE resident code contain zero real `$gp`
+  constructions and only 6–7 `off($gp)` decodes each, which are data
+  misread as code (an unaligned NWXE histogram winner was rejected by a
+  word-alignment gate rather than promoted by score). The mechanism's
+  positive path is proven by synthetic tests; on these ROMs there is simply
+  no gp-relative small-data base to recover, reported as OPEN with numbers
+  rather than fabricated.
 - **Forced micro-execution sweep** (with items 1–2): execute every
   candidate block under synthesized states in the instrumented lane to
   observe computed-jump targets; results carry the forced-synthetic label
@@ -667,7 +686,10 @@ table consolidates, it does not re-measure.
 | Reached-closure executable regions | 32/45 owners admitted (boot bank) | n/m | exact owners 0 → 20/27, wrong=0 held | adopted |
 | Pack execution harness | n/m | n/m | round trip executed; typed faults/budget/hole validated (depth, not P/R) | adopted (validation) |
 | Ghidra conformance | synthetic banks only so far | n/m | n/m | candidate-only |
-| Trace producer v1 (500k-step boot window) | n/m | 639 proven-code PCs re-observed, 1,035 candidate words corroborated, 194 previously-unclassified words, 0 conflicts | n/m | adopted (candidate/observed evidence; no FactDb adapter yet) |
+| Trace producer v1 (500k-step boot window) | n/m | 1,868 executed resident PCs; 639 in proven code, 1,035 candidates corroborated, 194 previously-unclassified; 0 conflicts | n/m | adopted (observed evidence) |
+| Trace→FactDb adapter | n/m | ingestion delta 0 → 499,997 facts / 1,868 Supported code-existence conclusions / 478 corroborations / 0 static-data conflicts | n/m | adopted (Supported, distinct evidence class) |
+| Delta-voting VA-mapping inference | n/m | 5/5 overlays admitted-correct, 0 open, 0 wrong (margins 3.1x-9.7x) | not graded (no NWXE overlay regions yet) | adopted |
+| GP-base voting | n/m | OPEN (0 real $gp constructions; 25 off($gp) = data-as-code noise) | OPEN (7 accesses; unaligned histogram winner rejected) | mechanism adopted; no base to recover on these ROMs |
 | Answer-key corpus intake | n/m | n/m | n/m | infrastructure only: Banjo 60-row override key parsed (55 fn), PD key absent upstream — no grading yet (ROMs not present) |
 
 Maintenance rule: every future experiment lands a row here in the same
