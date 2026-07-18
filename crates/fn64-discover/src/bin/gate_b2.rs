@@ -38,6 +38,7 @@ use fn64_discover::partition::{partition, same_bank_overlaps, Owner};
 use fn64_discover::resolve::{build_cfg_closed_with_facts, build_cfg_exploratory_with_candidates};
 use fn64_discover::snapshot::{compose_materialized_bank_v1, MaterializedBankInput};
 use fn64_discover::{run_discovery, DescriptorTableInput};
+use fn64_recomp_rs::{decode, Instruction};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -518,6 +519,8 @@ fn run_nwxe_function_gate() -> Result<(), String> {
     let sparse_runner = emit_materialized_bank_runner(&materialized_pack[0], "run_nwxe_boot");
     let sparse_runner_sha256 = format!("{:x}", Sha256::digest(sparse_runner.as_bytes()));
     compile_sparse_runner(&sparse_runner)?;
+    let harness_report =
+        execute_sparse_runner_harness(&sparse_runner, &materialized_pack[0], hole)?;
     let cfg = &bank_snapshot.closure.cfg;
     let part = &bank_snapshot.partition;
     let recovered_entry = bank_snapshot
@@ -544,6 +547,9 @@ fn run_nwxe_function_gate() -> Result<(), String> {
         hole,
         sparse_runner_sha256,
     );
+    for line in harness_report.lines() {
+        println!("  runner harness: {line}");
+    }
     if !recovered_entry {
         return Err(format!(
             "Phase 6 failed to mechanically recover resident entry 0x{NWXE_MAIN_ENTRY_VRAM:x} from header-entry-only seed (resolved: {:?})",
@@ -637,6 +643,389 @@ fn run_nwxe_function_gate() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Conservative "register-only" word predicate: true only when `word`
+/// decodes and its execution can touch nothing outside GPR/HI/LO state.
+/// Excluded by major-opcode/function field (public MIPS-III opcode map,
+/// same provenance as `fn64_recomp_rs::decode`):
+///
+/// - `0x10..=0x13`: every COP0-3 op (moves, cache control, CP branches);
+/// - `0x1A`/`0x1B` and `0x20..=0x3F`: every load/store shape, CACHE,
+///   LL/SC, and coprocessor load/store — anything that dereferences a
+///   register-derived address;
+/// - SPECIAL `syscall`/`break`/`sync`, the conditional-trap group
+///   (funct `0x30..=0x36`), and the divides (`div[u]`/`ddiv[u]`, whose
+///   divide-by-zero is a host-side hazard, not a typed guest fault);
+/// - REGIMM trap-immediates (`rt 0x08..=0x0E`).
+///
+/// Control transfers (`jr`, branches, `j`/`jal`) are deliberately NOT
+/// excluded here; [`derive_leaf_interior_pc`] treats them as window
+/// terminators, and the emitted runner exits typed at every one of them.
+fn is_register_only_word(word: u32) -> bool {
+    if matches!(decode(word), Instruction::Unknown { .. }) {
+        return false;
+    }
+    let op = word >> 26;
+    match op {
+        0x00 => {
+            let funct = word & 0x3f;
+            !matches!(
+                funct,
+                0x0c | 0x0d | 0x0f | 0x1a | 0x1b | 0x1e | 0x1f | 0x30..=0x36
+            )
+        }
+        0x01 => {
+            let rt = (word >> 16) & 0x1f;
+            !matches!(rt, 0x08..=0x0e)
+        }
+        0x10..=0x13 | 0x1a | 0x1b => false,
+        _ if op >= 0x20 => false,
+        _ => true,
+    }
+}
+
+/// Derive, purely from pack content, an interior PC that is sound to enter
+/// with a fresh register file: the first strictly-interior block offset
+/// whose straight-line window — the remaining words up to and including
+/// the block's first control transfer plus its delay slot — is entirely
+/// register-only per [`is_register_only_word`]. The emitted sparse runner
+/// executes exactly that window from such a PC and then exits typed
+/// (`Transfer`/`ResolveTransfer`/`Fault`), so the run cannot depend on
+/// skipped register setup reaching memory. First match in block/offset
+/// order keeps the choice deterministic; no hand-picked PC.
+fn derive_leaf_interior_pc(
+    bank: &fn64_discover::block_pack::MaterializedPackedBank,
+) -> Result<u32, String> {
+    for block in &bank.blocks {
+        let decoded: Vec<Instruction> = block.words.iter().map(|word| decode(*word)).collect();
+        for start in 1..block.words.len() {
+            let mut index = start;
+            let leaf = loop {
+                if index >= block.words.len() {
+                    break false;
+                }
+                if decoded[index].has_delay_slot() {
+                    break index + 1 < block.words.len()
+                        && is_register_only_word(block.words[index + 1])
+                        && !decoded[index + 1].has_delay_slot();
+                }
+                if !is_register_only_word(block.words[index]) {
+                    break false;
+                }
+                index += 1;
+            };
+            if leaf {
+                return Ok(block.start_va + start as u32 * 4);
+            }
+        }
+    }
+    Err(format!(
+        "no register-only leaf window in any of {} pack blocks: cannot derive a self-contained interior entry PC",
+        bank.blocks.len()
+    ))
+}
+
+/// Compile the emitted NWXE sparse runner into a host **binary** together
+/// with the pack's span geometry and actually execute it: registration via
+/// the emitted helper (plus a duplicate-registration rejection), an entry
+/// run and a derived self-contained interior-PC run on real ROM-derived
+/// code ([`derive_leaf_interior_pc`]), typed hole/unaligned/unknown-bank
+/// faults, an indivisible-unit budget checkpoint, a bounded transfer-
+/// following dispatch loop, and an explicit U4-frontier probe: entering at
+/// `entry+4` skips the entry stub's `lui` half of a `lui/addiu` pair, so
+/// the following store goes far outside RDRAM and today panics the HOST
+/// instead of returning a typed VR4300 memory fault
+/// (docs/UNIVERSAL-RUNTIME-PLAN.md, U4). The probe asserts that panic still
+/// happens; when U4 lands it fails loudly so the doc claim gets updated.
+/// Returns the harness's stdout, which the gate prints so the round trip's
+/// observed behavior is part of the deterministic gate output. The
+/// generated source and binary live only in a temp directory (game-derived,
+/// never committed).
+fn execute_sparse_runner_harness(
+    runner: &str,
+    bank: &fn64_discover::block_pack::MaterializedPackedBank,
+    hole: u32,
+) -> Result<String, String> {
+    let executable_dir = std::env::current_exe()
+        .map_err(|error| format!("finding B2 executable: {error}"))?
+        .parent()
+        .ok_or("B2 executable has no parent directory")?
+        .to_path_buf();
+    let deps = if executable_dir.ends_with("deps") {
+        executable_dir
+    } else {
+        executable_dir.join("deps")
+    };
+    let rlib = current_recomp_rlib(&deps)?;
+    let temp = std::env::temp_dir().join(format!("fn64-nwxe-b2-run-{}", std::process::id()));
+    std::fs::create_dir_all(&temp)
+        .map_err(|error| format!("creating sparse-runner harness directory: {error}"))?;
+
+    let mut spans = String::new();
+    for block in &bank.blocks {
+        use std::fmt::Write;
+        let words = block
+            .words
+            .iter()
+            .map(|word| format!("{word:#010X}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(spans, "        ({:#010X}, &[{words}]),", block.start_va)
+            .expect("writing span table");
+    }
+    let bank_id = bank.bank_id;
+    let entry_pc = bank.blocks[0].start_va;
+    let interior_pc = derive_leaf_interior_pc(bank)?;
+    // The U4 probe's premise is that entry+4 is NOT self-contained (it skips
+    // the entry `lui`); if the pack ever changes such that entry+4 becomes a
+    // register-only leaf window, the probe below would assert a panic that
+    // can no longer happen — surface that staleness here instead.
+    let probe_pc = entry_pc + 4;
+    if interior_pc == probe_pc {
+        return Err(format!(
+            "U4 probe premise is stale: {probe_pc:#010x} derived as a self-contained leaf window"
+        ));
+    }
+    let source = format!(
+        r#"#![allow(clippy::all, unused)]
+use fn64_recomp_rs::{{
+    BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeSpan, CpuFault,
+    CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget,
+    ProgramError, Rdram, RecompContext,
+}};
+
+{runner}
+
+const SPANS: &[(u32, &[u32])] = &[
+{spans}
+];
+
+fn code_bank() -> CodeBank {{
+    let id = BankId::new({bank_id:#018X});
+    let spans = SPANS
+        .iter()
+        .map(|(va, words)| CodeSpan::new(id, GuestPc::new(*va), words.to_vec()).unwrap())
+        .collect();
+    CodeBank::from_spans(id, spans).unwrap()
+}}
+
+fn fresh_ctx() -> RecompContext {{
+    let mut ctx = RecompContext::new();
+    // A real thread would own a stack; park it high in RDRAM so prologue
+    // stores land inside storage. $ra=0 makes a final return resolve to an
+    // unmapped VA, a typed boundary rather than a wild pointer.
+    ctx.set_r(29, 0x8070_0000);
+    ctx
+}}
+
+fn main() {{
+    let bank = BankId::new({bank_id:#018X});
+    let mut program = BlockProgram::new();
+    register_run_nwxe_boot(&mut program, code_bank()).unwrap();
+    match register_run_nwxe_boot(&mut program, code_bank()) {{
+        Err(ProgramError::DuplicateBank {{ .. }}) => {{
+            println!("duplicate registration rejected (DuplicateBank)")
+        }}
+        other => panic!("duplicate registration was not rejected: {{other:?}}"),
+    }}
+
+    let mut storage = vec![0u8; 8 * 1024 * 1024];
+    let mut mem = Rdram::new(&mut storage);
+
+    let mut ctx = fresh_ctx();
+    let run = program.run(
+        ExecutionKey::new(bank, GuestPc::new({entry_pc:#010X})),
+        InstructionBudget::new(4096).unwrap(),
+        &mut ctx,
+        &mut mem,
+    );
+    assert!(run.instructions > 0, "entry run made no progress");
+    println!(
+        "entry {entry_pc:#010x}: {{}} instructions, exit={{:?}}",
+        run.instructions, run.exit
+    );
+
+    let mut ctx = fresh_ctx();
+    let run = program.run(
+        ExecutionKey::new(bank, GuestPc::new({interior_pc:#010X})),
+        InstructionBudget::new(4096).unwrap(),
+        &mut ctx,
+        &mut mem,
+    );
+    assert!(run.instructions > 0, "interior run made no progress");
+    println!(
+        "interior {interior_pc:#010x} (derived register-only leaf window): {{}} instructions, exit={{:?}}",
+        run.instructions, run.exit
+    );
+
+    // Entering at entry+4 skips the `lui` half of the entry stub's
+    // lui/addiu pair, so the following store targets a wild address. The
+    // runtime has no typed VR4300 memory fault yet (U4 in
+    // docs/UNIVERSAL-RUNTIME-PLAN.md): today this panics the HOST. Pin that
+    // frontier: assert the panic still happens, silently (hook swap keeps
+    // gate output deterministic), and fail loudly the day it stops.
+    let saved_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {{}}));
+    let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{
+        let mut storage = vec![0u8; 8 * 1024 * 1024];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = fresh_ctx();
+        program.run(
+            ExecutionKey::new(bank, GuestPc::new({probe_pc:#010X})),
+            InstructionBudget::new(4096).unwrap(),
+            &mut ctx,
+            &mut mem,
+        )
+    }}));
+    std::panic::set_hook(saved_hook);
+    match probed {{
+        Err(_) => println!(
+            "probe {probe_pc:#010x} (skips entry lui): host panic instead of typed VR4300 memory fault - open U4 frontier"
+        ),
+        Ok(run) => panic!(
+            "U4 probe at {probe_pc:#010x} no longer panics (got {{:?}} after {{}} instructions); typed memory faults may have landed - update UNIVERSAL-RUNTIME-PLAN.md U4 and retire this probe",
+            run.exit, run.instructions
+        ),
+    }}
+
+    let mut ctx = fresh_ctx();
+    let hole_run = program.run(
+        ExecutionKey::new(bank, GuestPc::new({hole:#010X})),
+        InstructionBudget::new(64).unwrap(),
+        &mut ctx,
+        &mut mem,
+    );
+    assert!(matches!(
+        hole_run.exit,
+        BlockExit::Fault(CpuFault {{ kind: CpuFaultKind::UnmappedPc {{ .. }}, .. }})
+    ));
+    assert_eq!(hole_run.instructions, 0);
+    println!("hole {hole:#010x}: typed UnmappedPc fault, 0 instructions");
+
+    let unaligned = program.run(
+        ExecutionKey::new(bank, GuestPc::new({entry_pc:#010X} + 2)),
+        InstructionBudget::new(64).unwrap(),
+        &mut ctx,
+        &mut mem,
+    );
+    assert!(matches!(
+        unaligned.exit,
+        BlockExit::Fault(CpuFault {{ kind: CpuFaultKind::UnalignedPc, .. }})
+    ));
+    println!("unaligned entry: typed UnalignedPc fault");
+
+    let wrong_bank = program.run(
+        ExecutionKey::new(BankId::new({bank_id:#018X} ^ 1), GuestPc::new({entry_pc:#010X})),
+        InstructionBudget::new(64).unwrap(),
+        &mut ctx,
+        &mut mem,
+    );
+    assert!(matches!(
+        wrong_bank.exit,
+        BlockExit::Fault(CpuFault {{ kind: CpuFaultKind::UnknownBank, .. }})
+    ));
+    println!("wrong bank id: typed UnknownBank fault");
+
+    // A budget must never split a branch/delay pair. The type floor already
+    // makes a one-instruction budget unrepresentable (InstructionBudget::MIN
+    // is the indivisible-unit size); verify the floor, then verify a
+    // minimum-budget run checkpoints deterministically within it.
+    assert!(InstructionBudget::new(InstructionBudget::MIN - 1).is_none());
+    let mut ctx = fresh_ctx();
+    let tight = program.run(
+        ExecutionKey::new(bank, GuestPc::new({entry_pc:#010X})),
+        InstructionBudget::new(InstructionBudget::MIN).unwrap(),
+        &mut ctx,
+        &mut mem,
+    );
+    assert!(tight.instructions <= InstructionBudget::MIN);
+    println!(
+        "budget=MIN({{}}) at entry: {{}} instructions, exit={{:?}}",
+        InstructionBudget::MIN, tight.instructions, tight.exit
+    );
+
+    // Bounded transfer-following dispatch over the real pack: follow
+    // in-bank transfers and mapping-resolvable computed targets until a
+    // boundary the pack cannot serve.
+    let mut ctx = fresh_ctx();
+    let mut key = ExecutionKey::new(bank, GuestPc::new({entry_pc:#010X}));
+    let mut total: u64 = 0;
+    let mut boundaries = 0usize;
+    let boundary = loop {{
+        let run = program.run(
+            key,
+            InstructionBudget::new(4096).unwrap(),
+            &mut ctx,
+            &mut mem,
+        );
+        total += u64::from(run.instructions);
+        boundaries += 1;
+        if boundaries > 64 {{
+            break format!("stopped after 64 dispatch turns");
+        }}
+        match run.exit {{
+            BlockExit::Transfer(next) => key = next,
+            BlockExit::Checkpoint(next) => key = next,
+            BlockExit::Yield(next) => key = next,
+            BlockExit::ResolveTransfer {{ source_bank, target_pc }} => {{
+                let next = ExecutionKey::new(source_bank, target_pc);
+                if program.code().resolve(next).is_ok() {{
+                    key = next;
+                }} else {{
+                    break format!(
+                        "computed transfer to unadmitted {{:#010x}}",
+                        target_pc.get()
+                    );
+                }}
+            }}
+            BlockExit::HostCall {{ vram, .. }} => {{
+                break format!("host call at {{:#010x}}", vram.get());
+            }}
+            BlockExit::Fault(fault) => break format!("fault {{fault}}"),
+        }}
+    }};
+    println!(
+        "dispatch loop: {{total}} instructions over {{boundaries}} turns, boundary: {{boundary}}"
+    );
+}}
+"#
+    );
+
+    let source_path = temp.join("harness.rs");
+    let binary_path = temp.join("harness");
+    std::fs::write(&source_path, source)
+        .map_err(|error| format!("writing sparse-runner harness source: {error}"))?;
+    let compile = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .arg("--edition=2021")
+        .arg("--crate-type=bin")
+        .arg(&source_path)
+        .arg("--extern")
+        .arg(format!("fn64_recomp_rs={}", rlib.display()))
+        .arg("-L")
+        .arg(format!("dependency={}", deps.display()))
+        .arg("-o")
+        .arg(&binary_path)
+        .output()
+        .map_err(|error| format!("invoking rustc for sparse-runner harness: {error}"))?;
+    if !compile.status.success() {
+        return Err(format!(
+            "NWXE sparse-runner harness did not compile:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        ));
+    }
+    let run = Command::new(&binary_path)
+        .output()
+        .map_err(|error| format!("running sparse-runner harness: {error}"))?;
+    if !run.status.success() {
+        return Err(format!(
+            "NWXE sparse-runner harness failed at runtime:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&run.stdout).into_owned())
 }
 
 fn compile_sparse_runner(runner: &str) -> Result<(), String> {

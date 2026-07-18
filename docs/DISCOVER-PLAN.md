@@ -128,6 +128,16 @@ emits 197 blocks / 1,039 words, obtains pack SHA-256
 re-checks this digest until ROADMAP H3 makes `gate_b2`'s compile-time input
 paths reproducible), and compiles the generated runner with `rustc`. Addresses in gaps receive no
 dispatch arm; static and computed transfers into them remain unresolved.
+The gate no longer stops at "rustc accepted": it links the emitted runner
+into a host binary and executes it against the real pack — duplicate
+registration rejected, the entry PC run to its first typed transfer, a
+mechanically derived register-only interior PC entered mid-block, the pack
+hole/unaligned/unknown-bank entries all faulting typed, a minimum-budget
+checkpoint, and a bounded transfer-following dispatch loop. A separate
+probe enters `entry+4` (skipping the entry stub's `lui`) and asserts that
+the resulting wild store still panics the host — the open U4 typed-memory-
+fault frontier in `UNIVERSAL-RUNTIME-PLAN.md`, pinned so it fails loudly
+when U4 lands.
 
 This orders the next work. First recover proof-carrying resident executable
 regions; it can admit 25 otherwise-closed owners immediately.
@@ -145,8 +155,9 @@ real gate re-resolves every packed NWXE word and proves that hole `0x8000043c`
 faults as unmapped. `BlockProgram` now atomically pairs a `CodeBank` with the
 bank identity embedded in its generated function, rejects mismatches and
 duplicates before mutation, and resolves the sparse entry before invocation.
-The emitter supplies the registration helper and its compile/run gate enters
-an interior PC through that program. Live executor/shell ownership remains
+The emitter supplies the registration helper, and the gate's executed
+harness (above) enters both the entry PC and a derived interior PC through
+that program. Live executor/shell ownership remains
 open; the shell does not yet dispatch guest execution through this lane.
 
 The ROM-only multi-scale region gate is now runnable with no manifest, and
@@ -180,6 +191,36 @@ separate:
 Function-entry precision is exact correct starts divided by emitted candidate
 starts. Entry recall is distinct correct starts found divided by known starts.
 Neither metric says anything about function ends or total ROM bytes.
+
+### Coverage gate
+
+`gate_coverage` renders the ladder as deterministic text lines from the real
+pipeline, one report per supplied ROM. It reads ROM paths from named, declared
+env vars — `FN64_DISCOVER_NW4E_ROM`, `FN64_DISCOVER_NWXE_ROM`,
+`FN64_DISCOVER_OOT_ROM` — and prints a loud `skip` line for any that is unset,
+never a silent omission. There are no default paths into a home directory.
+
+Every quantity comes from the fact database `run_discovery` produces over cited,
+answer-key-free table geometry; no per-ROM constant lives in the engine. Each
+report prints, on stable-ordered integer-only lines: physical ROM bytes;
+physical bytes assigned to a direct load image or a known file; logical
+load-image bytes (bank-qualified, overlapping overlays counted independently);
+executable bytes and executable banks; entry-conclusion counts across every
+proof state (open / candidate / supported / rejected / conflict / proven);
+owner-proof coverage (exact vs candidate vs ambiguous, with blocker counts); and
+pack blocks/words plus a content digest where a `BlockPack` exists. The
+rendering path (`coverage::render_report` / `coverage::pack_coverage`) has unit
+tests asserting exact expected strings.
+
+Measured coverage is not proof. A mapped or executable byte count reports what
+evidence established for an interval, not that the interval is authoritative for
+emission — the owner-proof and block-proof gates remain the arbiters of that.
+Running the generic pipeline, `gate_coverage` reports `owner_proof not_run` and
+`pack none`; those lines populate only when a later phase has done the
+game-specific per-bank interval selection those proofs require. Ten consecutive
+runs over all three ROMs produce byte-identical output (SHA-256
+`6153e54d4f04af85645795c5e2a5a2192391b4eeb6978dd2d88b44aaedcd07c6`),
+re-checkable via `scripts/gate-determinism.sh` when all three ROM vars are set.
 
 ## Invariants
 
@@ -510,7 +551,21 @@ states set the flag.
 
 Ten consecutive `gate_selector` runs produced identical output, SHA-256
 `b53b25c7dd0a92dda59182f78f5c3ac0e0147124ea19941516da92a391679290`,
-re-checkable via `scripts/gate-determinism.sh`. Overlay
+re-checkable via `scripts/gate-determinism.sh`.
+
+Black-box emulator corroboration (2026-07-18): Mupen64Plus 2.6.0
+(`--nosaveoptions --sshotdir <tmp> --testshots 60,120,180,240`, Rice video,
+HLE RSP, pure-interpreter core) boots the same NW4E ROM and rendered four
+verified non-blank frames (per-channel stdev 44-99, hundreds-to-thousands of
+unique colors; legal-disclaimer and THQ/JAKKS logo screens inspected
+visually), so the boot path the selector dispatcher belongs to demonstrably
+runs. The selector flag word itself was NOT observable: the Homebrew-bottled
+core rejects `--debug` ("can't use --debug feature with this Mupen64Plus
+core library" — the tool's own black-box error), and `--help` documents no
+other memory-inspection interface. No selector-state coverage is claimed;
+runtime flag observation remains a stage-4 trace-ingestion frontier and
+needs either a debugger-enabled emulator build or the project's own
+headless trace producer. Captures live outside the repository. Overlay
 store sites are candidate cross-references on proven load-image bytes;
 executable permission and natural reachability of those sites remain open.
 
