@@ -41,7 +41,11 @@
 #[allow(dead_code)]
 mod framebuffer;
 #[allow(dead_code)]
+mod gamepad;
+#[allow(dead_code)]
 mod input_map;
+#[allow(dead_code)]
+mod overlay;
 #[allow(dead_code)]
 mod timing;
 
@@ -86,7 +90,9 @@ mod host_lookup;
 #[cfg(fn64_game_linked)]
 mod game {
     use crate::framebuffer::{self, FB_BYTES, FB_HEIGHT, FB_WIDTH};
-    use crate::input_map::PadState;
+    use crate::gamepad::Gamepads;
+    use crate::input_map::{InputConfig, PadState};
+    use crate::overlay::{Capture, Overlay};
     use crate::timing::{DrainDecision, RetraceDrain, RetraceOutcome, TimingWindow};
     use std::sync::Arc;
 
@@ -111,6 +117,11 @@ mod game {
     struct Shell {
         rdram: Vec<u8>,
         pad: PadState,
+        /// User bindings + deadzone, loaded from ~/.config/fn64/input.toml
+        /// and edited live by the settings overlay.
+        config: InputConfig,
+        gamepads: Gamepads,
+        overlay: Overlay,
         last_swap_count: u64,
         /// Scratch RGBA8888 buffer the VI framebuffer unpacks into before
         /// blitting to the pixels surface -- allocated once, reused per frame.
@@ -310,6 +321,9 @@ mod game {
             Shell {
                 rdram,
                 pad: PadState::new(),
+                config: InputConfig::load(),
+                gamepads: Gamepads::new(),
+                overlay: Overlay::new(),
                 last_swap_count: 0,
                 rgba: vec![0u8; FB_WIDTH * FB_HEIGHT * 4],
                 window: None,
@@ -365,7 +379,7 @@ mod game {
                 );
                 // Feed live input before the game polls the controller this
                 // step. Cheap; keeps the pad current within the frame.
-                let (buttons, sx, sy) = self.pad.resolve();
+                let (buttons, sx, sy) = self.merged_input();
                 fn64_abi::set_controller_state(0, buttons, sx, sy);
 
                 let stepped = fn64_abi::run_one_step();
@@ -397,6 +411,24 @@ mod game {
             // and drop-oldest skipped playback = the static; the same
             // over-delivery advanced game logic too fast = the over-speed.
             drain.finish(fn64_abi::vi_swap_count())
+        }
+
+        /// Keyboard + gamepad, merged into the game-facing pad state.
+        /// Buttons OR together; the gamepad stick wins over keyboard while
+        /// deflected (a real stick beats binary keys). Neutral while the
+        /// settings overlay is open, so remapping never leaks into gameplay.
+        fn merged_input(&self) -> (u16, i8, i8) {
+            if self.overlay.open {
+                return (0, 0, 0);
+            }
+            let (kb_buttons, kb_x, kb_y) = self.pad.resolve();
+            let (gp_buttons, gp_x, gp_y) = self.gamepads.resolve(&self.config);
+            let (sx, sy) = if gp_x != 0 || gp_y != 0 {
+                (gp_x, gp_y)
+            } else {
+                (kb_x, kb_y)
+            };
+            (kb_buttons | gp_buttons, sx, sy)
         }
 
         /// Blit the current VI framebuffer (rdram) into the pixels surface and
@@ -437,7 +469,22 @@ mod game {
             );
             let rgba_hash = framebuffer::rgba_hash(&self.rgba);
             pixels.frame_mut().copy_from_slice(&self.rgba);
-            if let Err(e) = pixels.render() {
+            // End the `as_mut` borrow: the overlay path re-borrows the
+            // pixels/window fields immutably alongside `&mut self.config`.
+            let render_result = if self.overlay.open {
+                let window = self.window.as_ref().expect("window exists with pixels");
+                let size = window.inner_size();
+                self.overlay.render_over(
+                    self.pixels.as_ref().expect("checked above"),
+                    (size.width.max(1), size.height.max(1)),
+                    window.scale_factor() as f32,
+                    &mut self.config,
+                    &self.gamepads,
+                )
+            } else {
+                self.pixels.as_ref().expect("checked above").render()
+            };
+            if let Err(e) = render_result {
                 eprintln!("[fn64-shell] pixels.render() failed: {e}");
                 return;
             }
@@ -607,6 +654,12 @@ mod game {
             _id: WindowId,
             event: WindowEvent,
         ) {
+            // The overlay consumes mouse events (the game has no mouse
+            // input); a no-op while closed.
+            if let Some(window) = self.window.as_ref() {
+                self.overlay
+                    .on_window_event(&event, window.scale_factor() as f32);
+            }
             match event {
                 WindowEvent::CloseRequested => {
                     println!("[fn64-shell] window close requested -- exiting");
@@ -628,13 +681,50 @@ mod game {
                         return;
                     }
                     if let PhysicalKey::Code(code) = event.physical_key {
-                        if code == KeyCode::Escape && event.state == ElementState::Pressed {
+                        let pressed = event.state == ElementState::Pressed;
+                        // Shell chords, never game input: F1 settings,
+                        // F11 fullscreen.
+                        if code == KeyCode::F1 && pressed {
+                            self.overlay.toggle();
+                            if self.overlay.open {
+                                // Keys held at open would otherwise stay
+                                // latched into the game across the overlay.
+                                self.pad.clear();
+                            }
+                            return;
+                        }
+                        if code == KeyCode::F11 && pressed {
+                            if let Some(window) = self.window.as_ref() {
+                                let next = match window.fullscreen() {
+                                    Some(_) => None,
+                                    None => Some(winit::window::Fullscreen::Borderless(None)),
+                                };
+                                window.set_fullscreen(next);
+                            }
+                            return;
+                        }
+                        if self.overlay.open {
+                            if !pressed {
+                                return;
+                            }
+                            if code == KeyCode::Escape {
+                                // Armed capture? Cancel it. Otherwise close.
+                                if self.overlay.capture.is_some() {
+                                    self.overlay.capture = None;
+                                } else {
+                                    self.overlay.toggle();
+                                }
+                                return;
+                            }
+                            self.overlay.apply_key_capture(&mut self.config, code);
+                            return;
+                        }
+                        if code == KeyCode::Escape && pressed {
                             println!("[fn64-shell] Esc pressed -- exiting");
                             event_loop.exit();
                             return;
                         }
-                        let pressed = event.state == ElementState::Pressed;
-                        if self.pad.apply(code, pressed) {
+                        if self.pad.apply(&self.config, code, pressed) {
                             // Log every real change so the keyboard->controller
                             // path is observable in the run log (the state
                             // pushed here is what set_controller_state feeds the
@@ -656,6 +746,18 @@ mod game {
         }
 
         fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+            // Gamepad events every tick (gilrs state only advances when its
+            // queue is drained). Presses are consumed by an armed overlay
+            // capture and discarded otherwise, so arming a capture never
+            // binds a stale press from seconds ago.
+            self.gamepads.poll();
+            let pad_press = self.gamepads.take_pressed();
+            if matches!(self.overlay.capture, Some(Capture::Pad(_))) {
+                if let Some(button) = pad_press {
+                    self.overlay.apply_pad_capture(&mut self.config, button);
+                }
+            }
+
             // Real-time pacing WITHOUT blocking the event thread: pump one
             // game frame when the ~16.67 ms wall deadline is due, then hand
             // the loop a WaitUntil so input/close events keep flowing while
@@ -753,7 +855,7 @@ mod game {
             return;
         };
         println!("[fn64-shell] INPUT PROBE: simulating key-down {code:?}");
-        let changed = shell.pad.apply(code, true);
+        let changed = shell.pad.apply(&shell.config, code, true);
         let (buttons, sx, sy) = shell.pad.resolve();
         // This is the exact call the live window loop makes each pump.
         fn64_abi::set_controller_state(0, buttons, sx, sy);
