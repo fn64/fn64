@@ -344,7 +344,7 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
                 let _ = writeln!(out, "        {delay_vram:#010X} => {{");
                 if let Some(delay_instr) = delay {
                     let _ = writeln!(out, "            // {delay_vram:#010X}: {delay_instr:?}");
-                    emit_straight(&mut out, delay_instr, delay_vram);
+                    emit_straight(&mut out, delay_instr, delay_vram, &MemFault::Panic);
                 }
                 let _ = writeln!(out, "            pc = {:#010X};", delay_vram + 4);
                 let _ = writeln!(out, "        }}");
@@ -355,7 +355,7 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
             i += 2;
             continue;
         } else {
-            emit_straight(&mut out, instr, vram);
+            emit_straight(&mut out, instr, vram, &MemFault::Panic);
         }
 
         // Fall-through: if the NEXT instruction starts a new block, close this
@@ -479,7 +479,15 @@ pub fn emit_bank_runner(bank: &BankInput<'_>) -> String {
             let _ = writeln!(out, "            executed += 2;");
             emit_bank_control_transfer(&mut out, instr, vram, delay, vram + 4, bank.bank, &domain);
         } else {
-            emit_straight(&mut out, instr, vram);
+            emit_straight(
+                &mut out,
+                instr,
+                vram,
+                &MemFault::Fault {
+                    pc: vram,
+                    retired: "executed",
+                },
+            );
             let _ = writeln!(out, "            executed += 1;");
             let next = vram + 4;
             if domain.contains(next) {
@@ -678,7 +686,15 @@ pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
                 &mut out, instr, vram, delay, delay_vram, bank.bank, &domain,
             );
         } else {
-            emit_straight(&mut out, instr, vram);
+            emit_straight(
+                &mut out,
+                instr,
+                vram,
+                &MemFault::Fault {
+                    pc: vram,
+                    retired: "executed",
+                },
+            );
             let _ = writeln!(out, "            executed += 1;");
             let next = vram
                 .checked_add(4)
@@ -801,7 +817,19 @@ fn emit_bank_control_transfer(
     let emit_delay = |out: &mut String| {
         if let Some(delay) = delay {
             let _ = writeln!(out, "            // delay: {delay_vram:#010X}: {delay:?}");
-            emit_straight(out, delay, delay_vram);
+            // A fault in the delay slot annuls the branch it delays: the runner
+            // has already charged the branch/delay pair (`executed += 2`) before
+            // this point, so report `executed - 2` — only instructions that
+            // retired before the branch. See `MemFault::Fault`.
+            emit_straight(
+                out,
+                delay,
+                delay_vram,
+                &MemFault::Fault {
+                    pc: delay_vram,
+                    retired: "(executed - 2)",
+                },
+            );
         }
     };
 
@@ -1074,8 +1102,162 @@ fn emit_trap(out: &mut String, condition: &str, mnemonic: &str, code: u16) {
     );
 }
 
+/// How a guest load/store outside backed RDRAM is emitted.
+///
+/// The historical whole-function lane keeps the unchecked accessors and the
+/// host panic they raise ([`MemFault::Panic`]) — its codegen is byte-identical
+/// to before U4. The block/sparse runner lane raises a typed VR4300 memory
+/// fault instead ([`MemFault::Fault`]): each access uses `Rdram::try_*` and, on
+/// an out-of-bounds effective address, returns `BlockRun` with
+/// `BlockExit::Fault(CpuFault { kind: MemoryFault { addr }, .. })` through the
+/// `finish!` macro the runner body defines.
+#[derive(Clone, Copy)]
+enum MemFault {
+    /// Function lane: `mem.load_*/store_*`; out-of-bounds is a host panic.
+    Panic,
+    /// Block lane: `mem.try_*`; out-of-bounds is a typed `MemoryFault`.
+    ///
+    /// `pc` is the faulting instruction's vram (reported as the fault's PC).
+    /// `retired` is the Rust expression for the instruction count to report:
+    /// the count of instructions that fully retired *before* the faulting one.
+    /// For a straight-line access that is `"executed"` (not yet incremented for
+    /// this instruction). For an access in a branch delay slot it is
+    /// `"(executed - 2)"`, because the runner charges the branch/delay pair
+    /// (`executed += 2`) before emitting the delay slot, yet a delay-slot fault
+    /// annuls the branch: neither the branch nor the delay slot retire.
+    Fault { pc: u32, retired: &'static str },
+}
+
+impl MemFault {
+    /// The `finish!(...)` statement a checked access runs on an out-of-bounds
+    /// effective address bound to `__fa`. Only valid for [`MemFault::Fault`].
+    fn finish(&self) -> String {
+        match *self {
+            MemFault::Panic => {
+                unreachable!("MemFault::Panic has no typed-fault finish statement")
+            }
+            MemFault::Fault { pc, retired } => format!(
+                "return BlockRun::new(BlockExit::Fault(CpuFault {{ at: ExecutionKey::new(expected_bank, GuestPc::new({pc:#010X})), kind: CpuFaultKind::MemoryFault {{ addr: __fa }} }}), {retired});"
+            ),
+        }
+    }
+
+    /// Emit a store. `unchecked` is the full function-lane statement, verbatim
+    /// (e.g. `mem.store_w(A, V);`); `checked` is the corresponding `try_` call
+    /// expression (e.g. `mem.try_store_w(A, V)`) that returns `Result<(), u64>`.
+    fn store(&self, out: &mut String, unchecked: &str, checked: &str) {
+        match self {
+            MemFault::Panic => {
+                let _ = writeln!(out, "            {unchecked}");
+            }
+            MemFault::Fault { .. } => {
+                let _ = writeln!(
+                    out,
+                    "            if let Err(__fa) = {checked} {{ {} }}",
+                    self.finish()
+                );
+            }
+        }
+    }
+
+    /// Emit a load whose value feeds `consume(value_expr)`. `unchecked` is the
+    /// full function-lane value expression, verbatim (e.g. `mem.load_w(A)`);
+    /// `checked` is the `try_` call (e.g. `mem.try_load_w(A)`) returning
+    /// `Result<T, u64>`. For the block lane the load is lifted to a `match`
+    /// that faults on out-of-bounds and binds the value for `consume`.
+    fn load(
+        &self,
+        out: &mut String,
+        unchecked: &str,
+        checked: &str,
+        consume: impl FnOnce(&str) -> String,
+    ) {
+        match self {
+            MemFault::Panic => {
+                let _ = writeln!(out, "            {}", consume(unchecked));
+            }
+            MemFault::Fault { .. } => {
+                let _ = writeln!(
+                    out,
+                    "            let __mv = match {checked} {{ Ok(v) => v, Err(__fa) => {{ {} }} }}; {}",
+                    self.finish(),
+                    consume("__mv")
+                );
+            }
+        }
+    }
+}
+
+/// Emit LL (load-linked word). Compound because it also arms the LL/SC
+/// reservation, so it does not fit the single-expression [`MemFault::load`].
+fn emit_ll(out: &mut String, mem_fault: &MemFault, rt: Reg, base: Reg, off: i16) {
+    let a = format!("Rdram::eff_addr({}, {})", r(base), off);
+    match mem_fault {
+        MemFault::Panic => {
+            let _ = writeln!(
+                out,
+                "            {{ let a = {a}; let v = mem.load_w(a); ctx.set_r32({rt}, v); ctx.set_ll_reservation(a, 4); }}"
+            );
+        }
+        MemFault::Fault { .. } => {
+            let _ = writeln!(
+                out,
+                "            {{ let a = {a}; let v = match mem.try_load_w(a) {{ Ok(v) => v, Err(__fa) => {{ {} }} }}; ctx.set_r32({rt}, v); ctx.set_ll_reservation(a, 4); }}",
+                mem_fault.finish()
+            );
+        }
+    }
+}
+
+/// Emit LLD (load-linked doubleword).
+fn emit_ll_d(out: &mut String, mem_fault: &MemFault, rt: Reg, base: Reg, off: i16) {
+    let a = format!("Rdram::eff_addr({}, {})", r(base), off);
+    match mem_fault {
+        MemFault::Panic => {
+            let _ = writeln!(
+                out,
+                "            {{ let a = {a}; let v = mem.load_d(a); ctx.set_r({rt}, v); ctx.set_ll_reservation(a, 8); }}"
+            );
+        }
+        MemFault::Fault { .. } => {
+            let _ = writeln!(
+                out,
+                "            {{ let a = {a}; let v = match mem.try_load_d(a) {{ Ok(v) => v, Err(__fa) => {{ {} }} }}; ctx.set_r({rt}, v); ctx.set_ll_reservation(a, 8); }}",
+                mem_fault.finish()
+            );
+        }
+    }
+}
+
+/// Emit SC (store-conditional word) or SCD (doubleword when `double`). The
+/// store executes only when the reservation still holds; a held reservation to
+/// an unbacked address is a typed memory fault in the block lane.
+fn emit_sc(out: &mut String, mem_fault: &MemFault, rt: Reg, base: Reg, off: i16, double: bool) {
+    let a = format!("Rdram::eff_addr({}, {})", r(base), off);
+    let (val, width, store, try_store) = if double {
+        (ru64(rt), 8, "store_d", "try_store_d")
+    } else {
+        (ru32(rt), 4, "store_w", "try_store_w")
+    };
+    match mem_fault {
+        MemFault::Panic => {
+            let _ = writeln!(
+                out,
+                "            {{ let a = {a}; let v = {val}; if ctx.take_ll_reservation(a, {width}) {{ mem.{store}(a, v); ctx.set_r({rt}, 1); }} else {{ ctx.set_r({rt}, 0); }} }}"
+            );
+        }
+        MemFault::Fault { .. } => {
+            let _ = writeln!(
+                out,
+                "            {{ let a = {a}; let v = {val}; if ctx.take_ll_reservation(a, {width}) {{ if let Err(__fa) = mem.{try_store}(a, v) {{ {} }} ctx.set_r({rt}, 1); }} else {{ ctx.set_r({rt}, 0); }} }}",
+                mem_fault.finish()
+            );
+        }
+    }
+}
+
 /// Emit a straight-line (non-control-transfer) instruction as typed Rust.
-fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
+fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &MemFault) {
     use Instruction::*;
     let line = |out: &mut String, s: String| {
         let _ = writeln!(out, "            {}", s);
@@ -1223,117 +1405,83 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
         Mtlo { rs } => line(out, format!("ctx.lo = {};", r(rs))),
 
         // --- Loads ---
-        Lw { rt, base, off } => line(
+        Lw { rt, base, off } => mem_fault.load(
             out,
-            format!("ctx.set_r32({}, mem.load_w(Rdram::eff_addr({}, {})));", rt, r(base), off),
+            &format!("mem.load_w(Rdram::eff_addr({}, {}))", r(base), off),
+            &format!("mem.try_load_w(Rdram::eff_addr({}, {}))", r(base), off),
+            |v| format!("ctx.set_r32({rt}, {v});"),
         ),
-        Lwu { rt, base, off } => line(
+        Lwu { rt, base, off } => mem_fault.load(
             out,
-            format!(
-                "ctx.set_r({}, mem.load_w(Rdram::eff_addr({}, {})) as u32 as u64);",
-                rt,
-                r(base),
-                off
-            ),
+            &format!("mem.load_w(Rdram::eff_addr({}, {}))", r(base), off),
+            &format!("mem.try_load_w(Rdram::eff_addr({}, {}))", r(base), off),
+            |v| format!("ctx.set_r({rt}, {v} as u32 as u64);"),
         ),
-        Ll { rt, base, off } => line(
+        Ll { rt, base, off } => emit_ll(out, mem_fault, rt, base, off),
+        Lh { rt, base, off } => mem_fault.load(
             out,
-            format!(
-                "{{ let a = Rdram::eff_addr({}, {}); let v = mem.load_w(a); ctx.set_r32({}, v); ctx.set_ll_reservation(a, 4); }}",
-                r(base),
-                off,
-                rt
-            ),
+            &format!("mem.load_h(Rdram::eff_addr({}, {}))", r(base), off),
+            &format!("mem.try_load_h(Rdram::eff_addr({}, {}))", r(base), off),
+            |v| format!("ctx.set_r32({rt}, {v} as i32);"),
         ),
-        Lh { rt, base, off } => line(
+        Lhu { rt, base, off } => mem_fault.load(
             out,
-            format!(
-                "ctx.set_r32({}, mem.load_h(Rdram::eff_addr({}, {})) as i32);",
-                rt,
-                r(base),
-                off
-            ),
+            &format!("mem.load_hu(Rdram::eff_addr({}, {}))", r(base), off),
+            &format!("mem.try_load_hu(Rdram::eff_addr({}, {}))", r(base), off),
+            |v| format!("ctx.set_r({rt}, {v} as u64);"),
         ),
-        Lhu { rt, base, off } => line(
+        Lb { rt, base, off } => mem_fault.load(
             out,
-            format!(
-                "ctx.set_r({}, mem.load_hu(Rdram::eff_addr({}, {})) as u64);",
-                rt,
-                r(base),
-                off
-            ),
+            &format!("mem.load_b(Rdram::eff_addr({}, {}))", r(base), off),
+            &format!("mem.try_load_b(Rdram::eff_addr({}, {}))", r(base), off),
+            |v| format!("ctx.set_r32({rt}, {v} as i32);"),
         ),
-        Lb { rt, base, off } => line(
+        Lbu { rt, base, off } => mem_fault.load(
             out,
-            format!(
-                "ctx.set_r32({}, mem.load_b(Rdram::eff_addr({}, {})) as i32);",
-                rt,
-                r(base),
-                off
-            ),
+            &format!("mem.load_bu(Rdram::eff_addr({}, {}))", r(base), off),
+            &format!("mem.try_load_bu(Rdram::eff_addr({}, {}))", r(base), off),
+            |v| format!("ctx.set_r({rt}, {v} as u64);"),
         ),
-        Lbu { rt, base, off } => line(
+        Lwl { rt, base, off } => mem_fault.load(
             out,
-            format!(
-                "ctx.set_r({}, mem.load_bu(Rdram::eff_addr({}, {})) as u64);",
-                rt,
-                r(base),
-                off
-            ),
+            &format!("mem.load_wl(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
+            &format!("mem.try_load_wl(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
+            |v| format!("ctx.set_r32({rt}, {v});"),
         ),
-        Lwl { rt, base, off } => line(
+        Lwr { rt, base, off } => mem_fault.load(
             out,
-            format!(
-                "ctx.set_r32({}, mem.load_wl(ctx.r({}), Rdram::eff_addr({}, {})));",
-                rt,
-                rt,
-                r(base),
-                off
-            ),
-        ),
-        Lwr { rt, base, off } => line(
-            out,
-            format!(
-                "ctx.set_r32({}, mem.load_wr(ctx.r({}), Rdram::eff_addr({}, {})));",
-                rt,
-                rt,
-                r(base),
-                off
-            ),
+            &format!("mem.load_wr(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
+            &format!("mem.try_load_wr(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
+            |v| format!("ctx.set_r32({rt}, {v});"),
         ),
 
         // --- Stores ---
-        Sw { rt, base, off } => line(
+        Sw { rt, base, off } => mem_fault.store(
             out,
-            format!("mem.store_w(Rdram::eff_addr({}, {}), {});", r(base), off, ru32(rt)),
+            &format!("mem.store_w(Rdram::eff_addr({}, {}), {});", r(base), off, ru32(rt)),
+            &format!("mem.try_store_w(Rdram::eff_addr({}, {}), {})", r(base), off, ru32(rt)),
         ),
-        Sh { rt, base, off } => line(
+        Sh { rt, base, off } => mem_fault.store(
             out,
-            format!("mem.store_h(Rdram::eff_addr({}, {}), {} as u16);", r(base), off, ru32(rt)),
+            &format!("mem.store_h(Rdram::eff_addr({}, {}), {} as u16);", r(base), off, ru32(rt)),
+            &format!("mem.try_store_h(Rdram::eff_addr({}, {}), {} as u16)", r(base), off, ru32(rt)),
         ),
-        Sb { rt, base, off } => line(
+        Sb { rt, base, off } => mem_fault.store(
             out,
-            format!("mem.store_b(Rdram::eff_addr({}, {}), {} as u8);", r(base), off, ru32(rt)),
+            &format!("mem.store_b(Rdram::eff_addr({}, {}), {} as u8);", r(base), off, ru32(rt)),
+            &format!("mem.try_store_b(Rdram::eff_addr({}, {}), {} as u8)", r(base), off, ru32(rt)),
         ),
-        Swl { rt, base, off } => line(
+        Swl { rt, base, off } => mem_fault.store(
             out,
-            format!("mem.store_wl(Rdram::eff_addr({}, {}), {});", r(base), off, ru32(rt)),
+            &format!("mem.store_wl(Rdram::eff_addr({}, {}), {});", r(base), off, ru32(rt)),
+            &format!("mem.try_store_wl(Rdram::eff_addr({}, {}), {})", r(base), off, ru32(rt)),
         ),
-        Swr { rt, base, off } => line(
+        Swr { rt, base, off } => mem_fault.store(
             out,
-            format!("mem.store_wr(Rdram::eff_addr({}, {}), {});", r(base), off, ru32(rt)),
+            &format!("mem.store_wr(Rdram::eff_addr({}, {}), {});", r(base), off, ru32(rt)),
+            &format!("mem.try_store_wr(Rdram::eff_addr({}, {}), {})", r(base), off, ru32(rt)),
         ),
-        Sc { rt, base, off } => line(
-            out,
-            format!(
-                "{{ let a = Rdram::eff_addr({}, {}); let v = {}; if ctx.take_ll_reservation(a, 4) {{ mem.store_w(a, v); ctx.set_r({}, 1); }} else {{ ctx.set_r({}, 0); }} }}",
-                r(base),
-                off,
-                ru32(rt),
-                rt,
-                rt
-            ),
-        ),
+        Sc { rt, base, off } => emit_sc(out, mem_fault, rt, base, off, false),
 
         // --- 64-bit doubleword ALU immediate ---
         // DADDI/DADDIU: full 64-bit add of rs and the sign-extended immediate;
@@ -1448,64 +1596,43 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
         ),
 
         // --- Doubleword loads ---
-        Ld { rt, base, off } => line(
+        Ld { rt, base, off } => mem_fault.load(
             out,
-            format!("ctx.set_r({}, mem.load_d(Rdram::eff_addr({}, {})));", rt, r(base), off),
+            &format!("mem.load_d(Rdram::eff_addr({}, {}))", r(base), off),
+            &format!("mem.try_load_d(Rdram::eff_addr({}, {}))", r(base), off),
+            |v| format!("ctx.set_r({rt}, {v});"),
         ),
-        Lld { rt, base, off } => line(
+        Lld { rt, base, off } => emit_ll_d(out, mem_fault, rt, base, off),
+        Ldl { rt, base, off } => mem_fault.load(
             out,
-            format!(
-                "{{ let a = Rdram::eff_addr({}, {}); let v = mem.load_d(a); ctx.set_r({}, v); ctx.set_ll_reservation(a, 8); }}",
-                r(base),
-                off,
-                rt
-            ),
+            &format!("mem.load_dl(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
+            &format!("mem.try_load_dl(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
+            |v| format!("ctx.set_r({rt}, {v});"),
         ),
-        Ldl { rt, base, off } => line(
+        Ldr { rt, base, off } => mem_fault.load(
             out,
-            format!(
-                "ctx.set_r({}, mem.load_dl(ctx.r({}), Rdram::eff_addr({}, {})));",
-                rt,
-                rt,
-                r(base),
-                off
-            ),
-        ),
-        Ldr { rt, base, off } => line(
-            out,
-            format!(
-                "ctx.set_r({}, mem.load_dr(ctx.r({}), Rdram::eff_addr({}, {})));",
-                rt,
-                rt,
-                r(base),
-                off
-            ),
+            &format!("mem.load_dr(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
+            &format!("mem.try_load_dr(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
+            |v| format!("ctx.set_r({rt}, {v});"),
         ),
 
         // --- Doubleword stores ---
-        Sd { rt, base, off } => line(
+        Sd { rt, base, off } => mem_fault.store(
             out,
-            format!("mem.store_d(Rdram::eff_addr({}, {}), {});", r(base), off, ru64(rt)),
+            &format!("mem.store_d(Rdram::eff_addr({}, {}), {});", r(base), off, ru64(rt)),
+            &format!("mem.try_store_d(Rdram::eff_addr({}, {}), {})", r(base), off, ru64(rt)),
         ),
-        Sdl { rt, base, off } => line(
+        Sdl { rt, base, off } => mem_fault.store(
             out,
-            format!("mem.store_dl(Rdram::eff_addr({}, {}), {});", r(base), off, ru64(rt)),
+            &format!("mem.store_dl(Rdram::eff_addr({}, {}), {});", r(base), off, ru64(rt)),
+            &format!("mem.try_store_dl(Rdram::eff_addr({}, {}), {})", r(base), off, ru64(rt)),
         ),
-        Sdr { rt, base, off } => line(
+        Sdr { rt, base, off } => mem_fault.store(
             out,
-            format!("mem.store_dr(Rdram::eff_addr({}, {}), {});", r(base), off, ru64(rt)),
+            &format!("mem.store_dr(Rdram::eff_addr({}, {}), {});", r(base), off, ru64(rt)),
+            &format!("mem.try_store_dr(Rdram::eff_addr({}, {}), {})", r(base), off, ru64(rt)),
         ),
-        Scd { rt, base, off } => line(
-            out,
-            format!(
-                "{{ let a = Rdram::eff_addr({}, {}); let v = {}; if ctx.take_ll_reservation(a, 8) {{ mem.store_d(a, v); ctx.set_r({}, 1); }} else {{ ctx.set_r({}, 0); }} }}",
-                r(base),
-                off,
-                ru64(rt),
-                rt,
-                rt
-            ),
-        ),
+        Scd { rt, base, off } => emit_sc(out, mem_fault, rt, base, off, true),
 
         // ================================================================
         // COP1 / FPU.
@@ -1541,31 +1668,27 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32) {
         Ctc1 { rt, fs } => line(out, format!("ctx.write_fcr({}, {});", fs, ru32(rt))),
 
         // --- COP1 loads/stores ---
-        Lwc1 { ft, base, off } => line(
+        Lwc1 { ft, base, off } => mem_fault.load(
             out,
-            format!(
-                "ctx.set_f_bits({}, mem.load_w(Rdram::eff_addr({}, {})) as u32);",
-                ft,
-                r(base),
-                off
-            ),
+            &format!("mem.load_w(Rdram::eff_addr({}, {}))", r(base), off),
+            &format!("mem.try_load_w(Rdram::eff_addr({}, {}))", r(base), off),
+            |v| format!("ctx.set_f_bits({ft}, {v} as u32);"),
         ),
-        Swc1 { ft, base, off } => line(
+        Swc1 { ft, base, off } => mem_fault.store(
             out,
-            format!("mem.store_w(Rdram::eff_addr({}, {}), ctx.f_bits({}));", r(base), off, ft),
+            &format!("mem.store_w(Rdram::eff_addr({}, {}), ctx.f_bits({}));", r(base), off, ft),
+            &format!("mem.try_store_w(Rdram::eff_addr({}, {}), ctx.f_bits({}))", r(base), off, ft),
         ),
-        Ldc1 { ft, base, off } => line(
+        Ldc1 { ft, base, off } => mem_fault.load(
             out,
-            format!(
-                "ctx.set_d_bits({}, mem.load_d(Rdram::eff_addr({}, {})));",
-                ft,
-                r(base),
-                off
-            ),
+            &format!("mem.load_d(Rdram::eff_addr({}, {}))", r(base), off),
+            &format!("mem.try_load_d(Rdram::eff_addr({}, {}))", r(base), off),
+            |v| format!("ctx.set_d_bits({ft}, {v});"),
         ),
-        Sdc1 { ft, base, off } => line(
+        Sdc1 { ft, base, off } => mem_fault.store(
             out,
-            format!("mem.store_d(Rdram::eff_addr({}, {}), ctx.d_bits({}));", r(base), off, ft),
+            &format!("mem.store_d(Rdram::eff_addr({}, {}), ctx.d_bits({}));", r(base), off, ft),
+            &format!("mem.try_store_d(Rdram::eff_addr({}, {}), ctx.d_bits({}))", r(base), off, ft),
         ),
 
         // --- Single-precision arithmetic ---
@@ -1810,7 +1933,7 @@ fn emit_control_transfer(
     let emit_delay = |out: &mut String| {
         if let Some(d) = delay {
             let _ = writeln!(out, "            // delay: {:#010X}: {:?}", delay_vram, d);
-            emit_straight(out, d, delay_vram);
+            emit_straight(out, d, delay_vram, &MemFault::Panic);
         }
     };
 

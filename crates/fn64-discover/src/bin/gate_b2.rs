@@ -948,12 +948,12 @@ fn derive_leaf_interior_pc(
 /// run and a derived self-contained interior-PC run on real ROM-derived
 /// code ([`derive_leaf_interior_pc`]), typed hole/unaligned/unknown-bank
 /// faults, an indivisible-unit budget checkpoint, a bounded transfer-
-/// following dispatch loop, and an explicit U4-frontier probe: entering at
+/// following dispatch loop, and an explicit U4 memory-fault probe: entering at
 /// `entry+4` skips the entry stub's `lui` half of a `lui/addiu` pair, so
-/// the following store goes far outside RDRAM and today panics the HOST
-/// instead of returning a typed VR4300 memory fault
-/// (docs/UNIVERSAL-RUNTIME-PLAN.md, U4). The probe asserts that panic still
-/// happens; when U4 lands it fails loudly so the doc claim gets updated.
+/// the following store computes a wild effective address far outside RDRAM.
+/// The block lane now returns a typed VR4300 `MemoryFault`
+/// (docs/UNIVERSAL-RUNTIME-PLAN.md, U4) rather than panicking the host; the
+/// probe asserts the exact fault kind and its wild guest address.
 /// Returns the harness's stdout, which the gate prints so the round trip's
 /// observed behavior is part of the deterministic gate output. The
 /// generated source and binary live only in a temp directory (game-derived,
@@ -1076,32 +1076,35 @@ fn main() {{
     );
 
     // Entering at entry+4 skips the `lui` half of the entry stub's
-    // lui/addiu pair, so the following store targets a wild address. The
-    // runtime has no typed VR4300 memory fault yet (U4 in
-    // docs/UNIVERSAL-RUNTIME-PLAN.md): today this panics the HOST. Pin that
-    // frontier: assert the panic still happens, silently (hook swap keeps
-    // gate output deterministic), and fail loudly the day it stops.
-    let saved_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {{}}));
-    let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{
-        let mut storage = vec![0u8; 8 * 1024 * 1024];
-        let mut mem = Rdram::new(&mut storage);
-        let mut ctx = fresh_ctx();
-        program.run(
-            ExecutionKey::new(bank, GuestPc::new({probe_pc:#010X})),
-            InstructionBudget::new(4096).unwrap(),
-            &mut ctx,
-            &mut mem,
-        )
-    }}));
-    std::panic::set_hook(saved_hook);
-    match probed {{
-        Err(_) => println!(
-            "probe {probe_pc:#010x} (skips entry lui): host panic instead of typed VR4300 memory fault - open U4 frontier"
-        ),
-        Ok(run) => panic!(
-            "U4 probe at {probe_pc:#010x} no longer panics (got {{:?}} after {{}} instructions); typed memory faults may have landed - update UNIVERSAL-RUNTIME-PLAN.md U4 and retire this probe",
-            run.exit, run.instructions
+    // lui/addiu pair, so the following store computes its effective address
+    // from a base register that never received its high half: the store
+    // targets a wild guest address far outside backed RDRAM. This is now a
+    // typed VR4300 memory fault (U4 in docs/UNIVERSAL-RUNTIME-PLAN.md), not a
+    // host panic: assert the exact fault kind and that the reported guest
+    // address is the wild one the truncated base produces.
+    let mut ctx = fresh_ctx();
+    let probed = program.run(
+        ExecutionKey::new(bank, GuestPc::new({probe_pc:#010X})),
+        InstructionBudget::new(4096).unwrap(),
+        &mut ctx,
+        &mut mem,
+    );
+    match probed.exit {{
+        BlockExit::Fault(CpuFault {{ at, kind: CpuFaultKind::MemoryFault {{ addr }} }}) => {{
+            // The base register was never loaded (skipped `lui`), so the
+            // effective address is wild: outside the 8 MiB backed window.
+            assert!(
+                addr.wrapping_sub(0xFFFF_FFFF_8000_0000) >= 8 * 1024 * 1024,
+                "probe fault address {{addr:#018x}} is inside backed RDRAM; the U4 probe premise is stale"
+            );
+            println!(
+                "probe {probe_pc:#010x} (skips entry lui): typed VR4300 MemoryFault at pc={{}} addr={{addr:#018x}} ({{}} instructions retired)",
+                at.pc, probed.instructions
+            );
+        }}
+        other => panic!(
+            "U4 probe at {probe_pc:#010x} expected a typed MemoryFault (skipped-lui wild store); got {{other:?}} after {{}} instructions",
+            probed.instructions
         ),
     }}
 
