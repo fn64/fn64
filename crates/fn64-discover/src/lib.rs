@@ -141,6 +141,7 @@ pub mod spimdisasm_adapter;
 pub mod tool_adapter;
 pub mod tool_claims;
 pub mod trace;
+pub mod xref;
 
 pub use facts::{BankAddr, Fact, FactDb, ProofState, RomAddressSpace};
 pub use rom::{normalize, NormalizedRom, RomByteOrder, RomRejectReason};
