@@ -35,6 +35,7 @@
 pub mod decoder;
 pub mod emit;
 pub mod execution;
+pub mod interp;
 pub mod module;
 pub mod runtime;
 
@@ -50,6 +51,7 @@ pub use execution::{
     ExecutionKey, GeneratedBankFn, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError,
     ResolvedInstruction, TransferResolver,
 };
+pub use interp::{run_bank, UnsupportedOp};
 pub use module::{emit_lookup_dispatcher, emit_module, ModuleFunc, SymbolTable};
 pub use runtime::{
     call_host_or_recompiled, pause_self, resolve_host_function, round_ties_even_f32,
