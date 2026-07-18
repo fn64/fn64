@@ -241,8 +241,12 @@ impl InputConfig {
             return Self::default();
         };
         match std::fs::read_to_string(&path) {
-            Ok(text) => match toml::from_str(&text) {
-                Ok(config) => {
+            Ok(text) => match toml::from_str::<InputConfig>(&text) {
+                Ok(mut config) => {
+                    // A hand-edited deadzone outside the slider's range
+                    // breaks apply_deadzone (1.0 divides by zero; >1.0 kills
+                    // the stick). Clamp to what the UI allows.
+                    config.deadzone = config.deadzone.clamp(0.0, 0.5);
                     println!("[fn64-shell] input config loaded from {}", path.display());
                     config
                 }
@@ -362,6 +366,10 @@ pub struct PadState {
     /// Held stick contributions, summed then clamped at resolve time.
     stick_x: i32,
     stick_y: i32,
+    /// Keys with a latched press, so a release without one (e.g. after
+    /// `clear()` ran at overlay-open with the key still physically held)
+    /// can't subtract a stick delta that was never added.
+    held: std::collections::HashSet<KeyCode>,
 }
 
 impl PadState {
@@ -374,6 +382,15 @@ impl PadState {
     /// state changed, so a caller can skip a redundant
     /// `set_controller_state` call.
     pub fn apply(&mut self, config: &InputConfig, key: KeyCode, pressed: bool) -> bool {
+        // The +/- stick accumulator below only balances if every release is
+        // paired with a latched press: drop repeats and unpaired releases.
+        if pressed {
+            if !self.held.insert(key) {
+                return false;
+            }
+        } else if !self.held.remove(&key) {
+            return false;
+        }
         let before = self.resolve();
         if let Some(bit) = config.button_for_key(key) {
             if pressed {
@@ -486,9 +503,35 @@ mod tests {
     }
 
     #[test]
+    fn release_without_latched_press_is_ignored() {
+        // The overlay-open path clears the pad while a stick key may still
+        // be physically held; the eventual release after the overlay closes
+        // must not drive the stick negative.
+        let c = InputConfig::default();
+        let mut pad = PadState::new();
+        pad.apply(&c, KeyCode::KeyW, true);
+        pad.clear();
+        assert!(!pad.apply(&c, KeyCode::KeyW, false));
+        assert_eq!(pad.resolve(), (0, 0, 0));
+    }
+
+    #[test]
+    fn repeated_press_does_not_accumulate() {
+        let c = InputConfig::default();
+        let mut pad = PadState::new();
+        pad.apply(&c, KeyCode::KeyW, true);
+        assert!(!pad.apply(&c, KeyCode::KeyW, true));
+        // One release fully returns to neutral.
+        pad.apply(&c, KeyCode::KeyW, false);
+        assert_eq!(pad.resolve(), (0, 0, 0));
+    }
+
+    #[test]
     fn config_roundtrips_through_toml() {
-        let mut c = InputConfig::default();
-        c.deadzone = 0.25;
+        let mut c = InputConfig {
+            deadzone: 0.25,
+            ..Default::default()
+        };
         c.bind_key(BindTarget::Button(N64Button::A), KeyCode::Space);
         c.bind_pad(N64Button::CDown, gilrs::Button::East);
         let text = toml::to_string_pretty(&c).expect("serializes");
