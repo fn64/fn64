@@ -37,8 +37,9 @@ fn main() {
     let (_baseline_rom, baseline_db) =
         run_discovery_with_load_image_tables(&rom_bytes, None, &oot_tables)
             .expect("baseline OOT discovery with load tables");
-    let (bound_ranges, unresolved) = bind_ranges_to_fact_db_partial(&dump, &dump_path, &baseline_db)
-        .expect("binding OOT ranges to native mappings");
+    let (bound_ranges, unresolved) =
+        bind_ranges_to_fact_db_partial(&dump, &dump_path, &baseline_db)
+            .expect("binding OOT ranges to native mappings");
     let bound_count = bound_ranges.len();
     let unresolved_count = unresolved.len();
     let manifest = EvidenceManifest {

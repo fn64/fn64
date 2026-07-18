@@ -648,6 +648,31 @@ commit as its adoption or rejection, with its per-ROM cells filled or
 explicitly n/m. An experiment measured on one ROM is not presumed to
 transfer; the empty cells are the transfer-measurement backlog.
 
+## Research intake (2026-07-18)
+
+License-verified external resources, fetched from each project's canonical
+LICENSE file (not asserted from memory):
+
+| Source | License | Clean-room status | Role |
+|---|---|---|---|
+| ares | ISC | readable | reference-accuracy emulator; oracle + trace hooks |
+| paraLLEl-RDP | MIT | readable (its Angrylion reference lineage is unlicensed — excluded) | LLE RDP candidate for U6 |
+| n64-systemtest | MIT | readable + vendorable | CPU/COP1/RSP/RDP/TLB/exception conformance ROMs (self-checking; real-hardware provenance of expected values is unverified either way) |
+| libdragon | Unlicense | readable | probe-ROM authoring; endorses ares for validation |
+| MAME | GPL-2.0+ whole | source excluded; documented Lua/debugger interfaces usable black-box | secondary tracer at best — its own N64 driver is flagged `MACHINE_NOT_WORKING` |
+| angr | BSD-2 | readable | MIPS64-BE VSA/symbolic reference (R4300-specific fidelity unverified) |
+| ddisasm | AGPL-3.0 | concepts-only (paper, never code) | published validation of the monotonic-fact-DB disassembly architecture |
+
+Answer-key corpus expansion, graded by artifact quality and license: 
+Banjo-Kazooie (CC0, 100% complete, `symbol_addrs.*.txt`) and Perfect Dark
+(MIT, ~97.5%, `symbol_addrs.*.txt`) are clean direct-hit keys; Super Mario
+64 (CC0, 100%) needs linker-map parsing; Diddy Kong Racing (CC0, ~97.75%)
+is a strong alternate. Paper Mario and Majora's Mask have the best splat
+tooling but **no license** — symbol-metadata extraction from them is held
+until a rights check; GoldenEye is ranked last (89.1%, no license, active
+rights disputes around the title). Keys require the user's own ROMs to
+grade against; ingestion tooling ships with loud env-declared skips.
+
 # Phase unlock ledger
 
 Every ROM run must report physical, logical, executable, owner, and function
