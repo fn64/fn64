@@ -137,6 +137,7 @@ pub mod coverage;
 pub mod delta_vote;
 pub mod evidence;
 pub mod facts;
+pub mod file_table;
 pub mod gp_base;
 pub mod grade_candidates;
 pub mod grade_nw4e;
