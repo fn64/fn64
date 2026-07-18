@@ -9,6 +9,7 @@
 //! Design provenance for every non-obvious semantic choice below is cited
 //! inline; see `docs/DESIGN.md` section 6 for the full provenance table.
 
+pub mod device;
 pub mod executor;
 pub mod mesgqueue;
 pub mod mmio;
@@ -24,6 +25,11 @@ pub mod timer;
 pub mod trace;
 pub mod vi;
 
+pub use device::{
+    Cycles, DeviceFabric, DeviceFault, DeviceNotification, DeviceSnapshot, DeviceTraceEvent,
+    DeviceTraceKind, InterruptSource, MmioAddr, PiDmaRequest, PiDomain, PiDomainTiming,
+    PiTimingModel, PI_STATUS_DMA_BUSY, PI_STATUS_ERROR, PI_STATUS_IO_BUSY,
+};
 pub use executor::{Executor, ExternalEvent, RecvMesgOutcome, SendMesgOutcome};
 pub use mesgqueue::{Mesg, MesgQueue, RecvResult, SendResult};
 pub use mmio::{

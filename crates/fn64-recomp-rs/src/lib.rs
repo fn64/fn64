@@ -34,12 +34,21 @@
 
 pub mod decoder;
 pub mod emit;
+pub mod execution;
 pub mod module;
 pub mod runtime;
 
 pub use decoder::{decode, Instruction};
 pub use emit::{
-    emit_function, emit_function_resolved, CallResolver, CallTarget, FuncInput, NullResolver,
+    classify_bank_words, emit_bank_runner, emit_function, emit_function_resolved,
+    emit_sparse_bank_runner, BankBlockInput, BankInput, BankWordCatalog, BankWordKind, BankWordRun,
+    CallResolver, CallTarget, FuncInput, NullResolver, SparseBankInput,
+};
+pub use execution::{
+    dispatch_until_boundary, BankError, BankId, BlockExit, BlockProgram, BlockRun, BlockRunner,
+    CodeBank, CodeCatalog, CodeSpan, CpuFault, CpuFaultKind, DispatchError, DispatchRun,
+    ExecutionKey, GeneratedBankFn, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError,
+    ResolvedInstruction, TransferResolver,
 };
 pub use module::{emit_lookup_dispatcher, emit_module, ModuleFunc, SymbolTable};
 pub use runtime::{

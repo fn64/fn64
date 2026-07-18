@@ -186,6 +186,8 @@ pub fn partition(cfg: &Cfg) -> Partition {
                 BlockTerminator::Return
                 | BlockTerminator::Indirect { via_call: false }
                 | BlockTerminator::Trap
+                | BlockTerminator::InvalidInstruction { .. }
+                | BlockTerminator::MissingDelaySlot { .. }
                 | BlockTerminator::RanOffEnd => {
                     // Terminal: no successor to own.
                 }

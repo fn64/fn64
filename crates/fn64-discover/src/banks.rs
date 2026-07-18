@@ -22,9 +22,11 @@
 //! state per bank rather than re-deriving mapping validity themselves.
 
 use crate::facts::{
-    load_image_table_record_subject, Fact, FactDb, MappingAddressSpace, ProofState, RomAddressSpace,
+    function_entry_subject, load_image_table_record_subject, BankAddr, CandidateDetector, Fact,
+    FactDb, FunctionEntryEvidence, MappingAddressSpace, ProofState, RomAddressSpace,
 };
 use crate::rom::NormalizedRom;
+use serde::{Deserialize, Serialize};
 
 /// IPL3's fixed boot-copy size on real N64 hardware: the first 0x100000
 /// ROM bytes (after the 0x1000-byte header+IPL3 region) are DMA'd to RDRAM
@@ -72,6 +74,21 @@ pub fn discover_boot_bank(rom: &NormalizedRom, db: &mut FactDb) {
         "boot_copy_from_header",
     )
     .expect("boot bank is the first conclusion for this subject; cannot violate monotonicity");
+
+    let entry = BankAddr::new(BOOT_BANK, va_start);
+    let entry_fact = db.insert(Fact::FunctionEntryClaim {
+        target: entry.clone(),
+        detector: CandidateDetector::HardwareEntrypoint,
+        evidence: FunctionEntryEvidence::RomHeaderEntrypoint,
+        proposed_state: ProofState::Proven,
+    });
+    db.conclude(
+        function_entry_subject(&entry),
+        ProofState::Proven,
+        vec![mapping, evidence, entry_fact],
+        "rom_header_entry_after_ipl3_boot_copy",
+    )
+    .expect("boot entry is the first conclusion for this subject; cannot violate monotonicity");
 }
 
 /// One fixed-shape descriptor-table record location, in ROM-record-field
@@ -84,7 +101,7 @@ pub fn discover_boot_bank(rom: &NormalizedRom, db: &mut FactDb) {
 /// file" discipline -- so this function accepts the location as an input,
 /// records exactly where it came from, and only promotes what parses
 /// consistently within it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DescriptorTableShape {
     /// ROM byte offset of the first record.
     pub table_rom_offset: u32,
@@ -229,14 +246,14 @@ pub fn scan_descriptor_table(
 
 /// Location of a table in either physical cartridge ROM or the VROM
 /// namespace resolved by an earlier file-table record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableLocation {
     pub space: RomAddressSpace,
     pub offset: u32,
 }
 
 /// Field offsets for the source interval in one table record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRangeFields {
     pub space: RomAddressSpace,
     pub field_start: u32,
@@ -244,7 +261,8 @@ pub struct SourceRangeFields {
 }
 
 /// Address space named by a table record's destination interval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DestinationSpace {
     PhysicalRom,
     Vram,
@@ -252,7 +270,8 @@ pub enum DestinationSpace {
 
 /// How to obtain a destination interval's exclusive end. `FieldOrSourceLength`
 /// models DMA file tables whose zero physical end denotes an uncompressed file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DestinationEnd {
     Field(u32),
     SourceLength,
@@ -260,7 +279,7 @@ pub enum DestinationEnd {
 }
 
 /// Field offsets for the destination interval in one table record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DestinationRangeFields {
     pub space: DestinationSpace,
     pub field_start: u32,
@@ -271,7 +290,7 @@ pub struct DestinationRangeFields {
 /// physical ROM file or a VRAM load range. The same shape describes OoT-style
 /// file tables and overlay tables; a physical-ROM-to-VRAM shape also subsumes
 /// the older AKI descriptor-table form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadImageTableShape {
     pub location: TableLocation,
     pub record_count: u32,
@@ -280,13 +299,39 @@ pub struct LoadImageTableShape {
     pub destination: DestinationRangeFields,
 }
 
+/// Deterministic, serializable bank naming for records in one table. Keeping
+/// this as data rather than a function pointer lets the same validated input
+/// come from an inferred fact pack or an external ROM-bound manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BankNamePattern {
+    pub prefix: String,
+    #[serde(default)]
+    pub suffix: String,
+    #[serde(default)]
+    pub index_base: u32,
+}
+
+impl BankNamePattern {
+    pub fn new(prefix: impl Into<String>, index_base: u32, suffix: impl Into<String>) -> Self {
+        Self {
+            prefix: prefix.into(),
+            suffix: suffix.into(),
+            index_base,
+        }
+    }
+
+    pub fn name(&self, index: u32) -> String {
+        format!("{}{}{}", self.prefix, index + self.index_base, self.suffix)
+    }
+}
+
 /// Explicit per-title data for one mapping table. `bank_name` is required for
 /// VRAM destinations and absent for VROM-to-physical file tables.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadImageTableInput {
-    pub name: &'static str,
+    pub name: String,
     pub shape: LoadImageTableShape,
-    pub bank_name: Option<fn(u32) -> String>,
+    pub bank_name: Option<BankNamePattern>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,7 +442,7 @@ pub fn scan_load_image_tables(
     ordered.sort_by_key(|input| {
         (
             input.shape.location.space == RomAddressSpace::Virtual,
-            input.name,
+            input.name.as_str(),
         )
     });
     let mut accepted_banks = Vec::new();
@@ -433,7 +478,7 @@ pub fn scan_load_image_tables(
             Ok(materialized) => materialized,
             Err(error) => {
                 let evidence = db.insert(Fact::Evidence {
-                    subject: crate::facts::BankAddr::new(input.name, shape.location.offset),
+                    subject: crate::facts::BankAddr::new(&input.name, shape.location.offset),
                     note: format!("table bytes unavailable: {error}"),
                 });
                 db.conclude(
@@ -448,7 +493,7 @@ pub fn scan_load_image_tables(
         };
 
         for index in 0..shape.record_count {
-            let record_subject = load_image_table_record_subject(input.name, index);
+            let record_subject = load_image_table_record_subject(&input.name, index);
             let base = (index * shape.record_stride) as usize;
             let read = |field: u32| -> Option<u32> {
                 let start = base.checked_add(field as usize)?;
@@ -507,7 +552,7 @@ pub fn scan_load_image_tables(
                 .expect("first conclusion for this record");
                 continue;
             };
-            let bank = input.bank_name.map(|name| name(index));
+            let bank = input.bank_name.as_ref().map(|pattern| pattern.name(index));
             let source_space = match shape.source.space {
                 RomAddressSpace::Physical => MappingAddressSpace::PhysicalRom,
                 RomAddressSpace::Virtual => MappingAddressSpace::VirtualRom,
@@ -578,7 +623,7 @@ pub fn scan_load_image_tables(
                 Err(error) => {
                     let unavailable = db.insert(Fact::Evidence {
                         subject: crate::facts::BankAddr::new(
-                            bank.as_deref().unwrap_or(input.name),
+                            bank.as_deref().unwrap_or(&input.name),
                             source_start,
                         ),
                         note: format!(
@@ -1058,7 +1103,7 @@ mod tests {
 
     fn file_table_input(count: u32) -> LoadImageTableInput {
         LoadImageTableInput {
-            name: "files",
+            name: "files".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Physical,
@@ -1114,7 +1159,7 @@ mod tests {
         write_u32(&mut rom_bytes, 0x201c, 0);
 
         let overlay = LoadImageTableInput {
-            name: "effects",
+            name: "effects".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Virtual,
@@ -1133,11 +1178,12 @@ mod tests {
                     end: DestinationEnd::Field(0xc),
                 },
             },
-            bank_name: Some(|index| format!("effect_{index}")),
+            bank_name: Some(BankNamePattern::new("effect_", 0, "")),
         };
         let rom = normalize(&rom_bytes).unwrap();
         let mut db = FactDb::new();
-        let accepted = scan_load_image_tables(&rom, &[overlay, file_table_input(2)], &mut db);
+        let accepted =
+            scan_load_image_tables(&rom, &[overlay.clone(), file_table_input(2)], &mut db);
 
         assert_eq!(accepted, ["effect_0"]);
         assert_eq!(
@@ -1199,7 +1245,7 @@ mod tests {
             write_u32(&mut rom_bytes, base + 0xc, vram_end);
         }
         let input = LoadImageTableInput {
-            name: "overlays",
+            name: "overlays".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Physical,
@@ -1218,7 +1264,7 @@ mod tests {
                     end: DestinationEnd::Field(0xc),
                 },
             },
-            bank_name: Some(|index| format!("overlay_{index}")),
+            bank_name: Some(BankNamePattern::new("overlay_", 0, "")),
         };
         let rom = normalize(&rom_bytes).unwrap();
         let mut db = FactDb::new();

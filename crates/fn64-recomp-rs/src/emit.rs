@@ -34,7 +34,8 @@
 //! to guarantee.
 
 use crate::decoder::{decode, Instruction, Reg};
-use std::collections::BTreeSet;
+use crate::execution::BankId;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 /// One MIPS function to recompile: its name, its start vram, and its words
@@ -43,6 +44,145 @@ pub struct FuncInput<'a> {
     pub name: &'a str,
     pub vram: u32,
     pub words: &'a [u32],
+}
+
+/// One immutable executable interval for the arbitrary-PC block lane.
+pub struct BankInput<'a> {
+    pub name: &'a str,
+    pub bank: BankId,
+    pub vram: u32,
+    pub words: &'a [u32],
+}
+
+/// Decoder-level classification for a complete aligned bank scan. This is
+/// deliberately weaker than executable ownership: ROM data can decode as a
+/// valid instruction, and an `Unknown` word may be unreachable data.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BankWordKind {
+    Straight,
+    ControlTransfer,
+    Unknown,
+}
+
+/// Compact, bank-local classification table for every aligned word. The
+/// table is intentionally independent of function boundaries and can be
+/// queried by an arbitrary guest PC without a generated match expression.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BankWordCatalog {
+    base: u32,
+    words: Vec<BankWordKind>,
+}
+
+/// Run-length encoded view of a bank classification.  The decoder still
+/// classifies every word, but the dispatcher stores only transitions between
+/// classes rather than one host-language arm per PC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BankWordRun {
+    pub first_word: u32,
+    pub len: u32,
+    pub kind: BankWordKind,
+}
+
+impl BankWordCatalog {
+    /// Build the compact transition list used by table-backed dispatch.
+    pub fn runs(&self) -> Vec<BankWordRun> {
+        let mut runs: Vec<BankWordRun> = Vec::new();
+        for (index, &kind) in self.words.iter().enumerate() {
+            let index = index as u32;
+            if let Some(last) = runs.last_mut() {
+                if last.kind == kind && last.first_word + last.len == index {
+                    last.len += 1;
+                    continue;
+                }
+            }
+            runs.push(BankWordRun {
+                first_word: index,
+                len: 1,
+                kind,
+            });
+        }
+        runs
+    }
+
+    /// Resolve a PC through the compact run list.  `None` means unaligned or
+    /// outside the admitted bank; it never turns a bounding-range hole into
+    /// executable code.
+    pub fn kind_at_compact(&self, pc: u32) -> Option<BankWordKind> {
+        let offset = pc.checked_sub(self.base)?;
+        if !offset.is_multiple_of(4) {
+            return None;
+        }
+        let word = offset / 4;
+        self.runs()
+            .into_iter()
+            .find(|run| word >= run.first_word && word < run.first_word + run.len)
+            .map(|run| run.kind)
+    }
+}
+
+impl BankWordCatalog {
+    pub fn new(base: u32, words: &[u32]) -> Self {
+        assert!(base.is_multiple_of(4), "catalog base must be aligned");
+        Self {
+            base,
+            words: classify_bank_words(words),
+        }
+    }
+
+    pub const fn base(&self) -> u32 {
+        self.base
+    }
+
+    pub fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    pub fn kind_at(&self, pc: u32) -> Option<BankWordKind> {
+        let offset = pc.checked_sub(self.base)?;
+        if !offset.is_multiple_of(4) {
+            return None;
+        }
+        self.words.get((offset / 4) as usize).copied()
+    }
+}
+
+/// Classify every aligned word without generating one host-language arm per
+/// address. The resulting compact catalog is the input to the universal
+/// table-backed dispatcher and keeps code/data/decoder gaps explicit.
+pub fn classify_bank_words(words: &[u32]) -> Vec<BankWordKind> {
+    words
+        .iter()
+        .copied()
+        .map(decode)
+        .map(|instruction| {
+            if matches!(instruction, Instruction::Unknown { .. }) {
+                BankWordKind::Unknown
+            } else if instruction.has_delay_slot() {
+                BankWordKind::ControlTransfer
+            } else {
+                BankWordKind::Straight
+            }
+        })
+        .collect()
+}
+
+/// One disjoint proven-code span in a sparse executable bank.
+pub struct BankBlockInput<'a> {
+    pub vram: u32,
+    pub words: &'a [u32],
+}
+
+/// Function-boundary-independent bank input containing only admitted code
+/// spans. Addresses in holes are never decoded or emitted.
+pub struct SparseBankInput<'a> {
+    pub name: &'a str,
+    pub bank: BankId,
+    pub blocks: &'a [BankBlockInput<'a>],
 }
 
 /// How an inter-function control transfer (a `JAL`/`J` whose target lands
@@ -249,6 +389,561 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
     out
 }
 
+/// Emit a bank-qualified runner that accepts every aligned instruction as an
+/// entry and executes until the next control transfer.
+///
+/// Unlike [`emit_function`], this mode does not need or trust function
+/// boundaries. Every instruction has a dispatch arm. Straight-line execution
+/// stays in the local loop; a branch/jump executes its delay slot and returns a
+/// typed [`crate::BlockExit`] to the outer dispatcher. Targets inside this
+/// immutable interval are already proven bank-qualified; computed or outside
+/// targets remain [`crate::BlockExit::ResolveTransfer`] until the active
+/// mapping layer resolves them.
+pub fn emit_bank_runner(bank: &BankInput<'_>) -> String {
+    let base = bank.vram;
+    let byte_len = u32::try_from(bank.words.len())
+        .expect("bank instruction count exceeds u32")
+        .checked_mul(4)
+        .expect("bank byte length exceeds u32");
+    let bank_end = base
+        .checked_add(byte_len)
+        .expect("bank virtual interval exceeds u32");
+    let instrs: Vec<Instruction> = bank.words.iter().copied().map(decode).collect();
+    let ranges = [(base, bank_end)];
+    let domain = ExecutionDomain {
+        ranges: &ranges,
+        runtime_predicate: None,
+    };
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "// Bank-qualified MIPS runner `{}`: {} @ {base:#010X} ({} instructions).",
+        bank.name,
+        bank.bank,
+        bank.words.len()
+    );
+    let _ = writeln!(out, "#[allow(unused_variables, unused_mut, unused_labels)]");
+    let _ = writeln!(
+        out,
+        "pub fn {}(entry: ExecutionKey, budget: InstructionBudget, ctx: &mut RecompContext, mem: &mut Rdram) -> BlockRun {{",
+        bank.name
+    );
+    let _ = writeln!(out, "    let mut executed = 0u32;");
+    let _ = writeln!(out, "    macro_rules! finish {{");
+    let _ = writeln!(
+        out,
+        "        ($exit:expr) => {{ return BlockRun::new($exit, executed) }};"
+    );
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(
+        out,
+        "    let expected_bank = BankId::new({:#018X});",
+        bank.bank.get()
+    );
+    let _ = writeln!(out, "    if entry.bank != expected_bank {{");
+    let _ = writeln!(
+        out,
+        "        finish!(BlockExit::Fault(CpuFault {{ at: entry, kind: CpuFaultKind::UnknownBank }}));"
+    );
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "    if !entry.pc.is_instruction_aligned() {{");
+    let _ = writeln!(
+        out,
+        "        finish!(BlockExit::Fault(CpuFault {{ at: entry, kind: CpuFaultKind::UnalignedPc }}));"
+    );
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "    let mut pc = entry.pc.get();");
+    let _ = writeln!(out, "    'run: loop {{ match pc {{");
+
+    for (index, instr) in instrs.iter().copied().enumerate() {
+        let vram = base + index as u32 * 4;
+        let _ = writeln!(out, "        {vram:#010X} => {{");
+        let _ = writeln!(out, "            // {vram:#010X}: {instr:?}");
+        if instr.has_delay_slot() {
+            let delay = Some(*instrs.get(index + 1).unwrap_or_else(|| {
+                panic!(
+                    "bank {} ends with control transfer at {vram:#010X} and omits its delay slot",
+                    bank.bank
+                )
+            }));
+            let _ = writeln!(
+                out,
+                "            if executed != 0 && executed + 2 > budget.get() {{"
+            );
+            let _ = writeln!(
+                out,
+                "                finish!(BlockExit::Checkpoint(ExecutionKey::new(expected_bank, GuestPc::new(pc))));"
+            );
+            let _ = writeln!(out, "            }}");
+            let _ = writeln!(out, "            executed += 2;");
+            emit_bank_control_transfer(&mut out, instr, vram, delay, vram + 4, bank.bank, &domain);
+        } else {
+            emit_straight(&mut out, instr, vram);
+            let _ = writeln!(out, "            executed += 1;");
+            let next = vram + 4;
+            if domain.contains(next) {
+                let _ = writeln!(out, "            if executed >= budget.get() {{");
+                let _ = writeln!(
+                    out,
+                    "                finish!(BlockExit::Checkpoint(ExecutionKey::new(expected_bank, GuestPc::new({next:#010X}))));"
+                );
+                let _ = writeln!(out, "            }}");
+                let _ = writeln!(out, "            pc = {next:#010X}; continue 'run;");
+            } else {
+                emit_resolve_transfer(&mut out, bank.bank, next, 12);
+            }
+        }
+        let _ = writeln!(out, "        }}");
+    }
+
+    let _ = writeln!(out, "        _ => finish!(BlockExit::Fault(CpuFault {{");
+    let _ = writeln!(
+        out,
+        "            at: ExecutionKey::new(expected_bank, GuestPc::new(pc)),"
+    );
+    let _ = writeln!(
+        out,
+        "            kind: CpuFaultKind::UnmappedPc {{ bank_start: {base:#010X}, bank_end: {bank_end:#010X} }},"
+    );
+    let _ = writeln!(out, "        }})),");
+    let _ = writeln!(out, "    }} }}");
+    let _ = writeln!(out, "}}");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "pub fn register_{}(program: &mut BlockProgram, code: CodeBank) -> Result<(), ProgramError> {{",
+        bank.name
+    );
+    let _ = writeln!(
+        out,
+        "    program.register(code, GeneratedBankRunner::new(BankId::new({:#018X}), {}))",
+        bank.bank.get(),
+        bank.name
+    );
+    let _ = writeln!(out, "}}");
+    out
+}
+
+/// Emit a bank-qualified arbitrary-PC runner from disjoint proven-code spans.
+///
+/// Only supplied words receive dispatch arms. A transfer into an interval
+/// between spans is unresolved even when that address lies between the bank's
+/// lowest and highest admitted addresses. This is the code/data boundary the
+/// contiguous [`emit_bank_runner`] input cannot express.
+pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
+    assert!(
+        !bank.blocks.is_empty(),
+        "sparse bank {} contains no proven code spans",
+        bank.bank
+    );
+
+    let mut blocks: Vec<&BankBlockInput<'_>> = bank.blocks.iter().collect();
+    blocks.sort_by_key(|block| block.vram);
+    let mut ranges = Vec::with_capacity(blocks.len());
+    let mut instrs = BTreeMap::new();
+    let mut previous_end = None;
+    for block in blocks {
+        assert!(
+            block.vram.is_multiple_of(4),
+            "sparse bank {} has unaligned span at {:#010X}",
+            bank.bank,
+            block.vram
+        );
+        assert!(
+            !block.words.is_empty(),
+            "sparse bank {} has empty span at {:#010X}",
+            bank.bank,
+            block.vram
+        );
+        let byte_len = u32::try_from(block.words.len())
+            .expect("sparse bank instruction count exceeds u32")
+            .checked_mul(4)
+            .expect("sparse bank byte length exceeds u32");
+        let end = block
+            .vram
+            .checked_add(byte_len)
+            .expect("sparse bank virtual span exceeds u32");
+        if let Some(previous_end) = previous_end {
+            assert!(
+                block.vram >= previous_end,
+                "sparse bank {} has overlapping spans at {previous_end:#010X} and {:#010X}",
+                bank.bank,
+                block.vram
+            );
+        }
+        for (index, word) in block.words.iter().copied().enumerate() {
+            let pc = block.vram + index as u32 * 4;
+            assert!(
+                instrs.insert(pc, decode(word)).is_none(),
+                "sparse bank {} contains duplicate instruction at {pc:#010X}",
+                bank.bank
+            );
+        }
+        if let Some((_, previous_end)) = ranges.last_mut() {
+            if *previous_end == block.vram {
+                *previous_end = end;
+            } else {
+                ranges.push((block.vram, end));
+            }
+        } else {
+            ranges.push((block.vram, end));
+        }
+        previous_end = Some(end);
+    }
+
+    let domain = ExecutionDomain {
+        ranges: &ranges,
+        runtime_predicate: Some("admitted"),
+    };
+    let (bank_start, bank_end) = domain.bounds();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "// Sparse bank-qualified MIPS runner `{}`: {} ({} spans, {} instructions).",
+        bank.name,
+        bank.bank,
+        ranges.len(),
+        instrs.len()
+    );
+    let _ = writeln!(out, "#[allow(unused_variables, unused_mut, unused_labels)]");
+    let _ = writeln!(
+        out,
+        "pub fn {}(entry: ExecutionKey, budget: InstructionBudget, ctx: &mut RecompContext, mem: &mut Rdram) -> BlockRun {{",
+        bank.name
+    );
+    let _ = writeln!(out, "    let mut executed = 0u32;");
+    let _ = writeln!(out, "    macro_rules! finish {{");
+    let _ = writeln!(
+        out,
+        "        ($exit:expr) => {{ return BlockRun::new($exit, executed) }};"
+    );
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(
+        out,
+        "    let expected_bank = BankId::new({:#018X});",
+        bank.bank.get()
+    );
+    let _ = writeln!(out, "    if entry.bank != expected_bank {{");
+    let _ = writeln!(
+        out,
+        "        finish!(BlockExit::Fault(CpuFault {{ at: entry, kind: CpuFaultKind::UnknownBank }}));"
+    );
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "    if !entry.pc.is_instruction_aligned() {{");
+    let _ = writeln!(
+        out,
+        "        finish!(BlockExit::Fault(CpuFault {{ at: entry, kind: CpuFaultKind::UnalignedPc }}));"
+    );
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "    let mut pc = entry.pc.get();");
+    let admitted_patterns = ranges
+        .iter()
+        .map(|(start, end)| {
+            let inclusive_end = end - 1;
+            format!("{start:#010X}..={inclusive_end:#010X}")
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let _ = writeln!(
+        out,
+        "    let admitted = |target: u32| matches!(target, {admitted_patterns});"
+    );
+    let _ = writeln!(out, "    'run: loop {{ match pc {{");
+
+    for (&vram, &instr) in &instrs {
+        let _ = writeln!(out, "        {vram:#010X} => {{");
+        let _ = writeln!(out, "            // {vram:#010X}: {instr:?}");
+        if instr.has_delay_slot() {
+            let delay_vram = vram
+                .checked_add(4)
+                .expect("sparse bank delay-slot address exceeds u32");
+            let delay = Some(*instrs.get(&delay_vram).unwrap_or_else(|| {
+                panic!(
+                    "sparse bank {} control transfer at {vram:#010X} omits its delay slot at {delay_vram:#010X}",
+                    bank.bank
+                )
+            }));
+            let _ = writeln!(
+                out,
+                "            if executed != 0 && executed + 2 > budget.get() {{"
+            );
+            let _ = writeln!(
+                out,
+                "                finish!(BlockExit::Checkpoint(ExecutionKey::new(expected_bank, GuestPc::new(pc))));"
+            );
+            let _ = writeln!(out, "            }}");
+            let _ = writeln!(out, "            executed += 2;");
+            emit_bank_control_transfer(
+                &mut out, instr, vram, delay, delay_vram, bank.bank, &domain,
+            );
+        } else {
+            emit_straight(&mut out, instr, vram);
+            let _ = writeln!(out, "            executed += 1;");
+            let next = vram
+                .checked_add(4)
+                .expect("sparse bank fallthrough address exceeds u32");
+            if domain.contains(next) {
+                let _ = writeln!(out, "            if executed >= budget.get() {{");
+                let _ = writeln!(
+                    out,
+                    "                finish!(BlockExit::Checkpoint(ExecutionKey::new(expected_bank, GuestPc::new({next:#010X}))));"
+                );
+                let _ = writeln!(out, "            }}");
+                let _ = writeln!(out, "            pc = {next:#010X}; continue 'run;");
+            } else {
+                emit_resolve_transfer(&mut out, bank.bank, next, 12);
+            }
+        }
+        let _ = writeln!(out, "        }}");
+    }
+
+    let _ = writeln!(out, "        _ => finish!(BlockExit::Fault(CpuFault {{");
+    let _ = writeln!(
+        out,
+        "            at: ExecutionKey::new(expected_bank, GuestPc::new(pc)),"
+    );
+    let _ = writeln!(
+        out,
+        "            kind: CpuFaultKind::UnmappedPc {{ bank_start: {bank_start:#010X}, bank_end: {bank_end:#010X} }},"
+    );
+    let _ = writeln!(out, "        }})),");
+    let _ = writeln!(out, "    }} }}");
+    let _ = writeln!(out, "}}");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "pub fn register_{}(program: &mut BlockProgram, code: CodeBank) -> Result<(), ProgramError> {{",
+        bank.name
+    );
+    let _ = writeln!(
+        out,
+        "    program.register(code, GeneratedBankRunner::new(BankId::new({:#018X}), {}))",
+        bank.bank.get(),
+        bank.name
+    );
+    let _ = writeln!(out, "}}");
+    out
+}
+
+struct ExecutionDomain<'a> {
+    ranges: &'a [(u32, u32)],
+    runtime_predicate: Option<&'a str>,
+}
+
+impl ExecutionDomain<'_> {
+    fn contains(&self, target: u32) -> bool {
+        self.ranges
+            .iter()
+            .any(|&(start, end)| target >= start && target < end)
+    }
+
+    fn bounds(&self) -> (u32, u32) {
+        (
+            self.ranges.first().expect("nonempty execution domain").0,
+            self.ranges.last().expect("nonempty execution domain").1,
+        )
+    }
+
+    fn runtime_condition(&self, target: &str) -> String {
+        if let Some(predicate) = self.runtime_predicate {
+            return format!("{predicate}({target})");
+        }
+        self.ranges
+            .iter()
+            .map(|(start, end)| format!("({target} >= {start:#010X} && {target} < {end:#010X})"))
+            .collect::<Vec<_>>()
+            .join(" || ")
+    }
+}
+
+fn emit_proven_or_resolved_transfer(
+    out: &mut String,
+    bank: BankId,
+    target: u32,
+    domain: &ExecutionDomain<'_>,
+    indent: usize,
+) {
+    let pad = " ".repeat(indent);
+    if domain.contains(target) {
+        let _ = writeln!(
+            out,
+            "{pad}finish!(BlockExit::Transfer(ExecutionKey::new(BankId::new({:#018X}), GuestPc::new({target:#010X}))));",
+            bank.get()
+        );
+    } else {
+        emit_resolve_transfer(out, bank, target, indent);
+    }
+}
+
+fn emit_resolve_transfer(out: &mut String, bank: BankId, target: u32, indent: usize) {
+    let pad = " ".repeat(indent);
+    let _ = writeln!(
+        out,
+        "{pad}finish!(BlockExit::ResolveTransfer {{ source_bank: BankId::new({:#018X}), target_pc: GuestPc::new({target:#010X}) }});",
+        bank.get()
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_bank_control_transfer(
+    out: &mut String,
+    instr: Instruction,
+    vram: u32,
+    delay: Option<Instruction>,
+    delay_vram: u32,
+    bank: BankId,
+    domain: &ExecutionDomain<'_>,
+) {
+    use Instruction::*;
+    let target = branch_target(&instr, vram);
+    let fallthrough = delay_vram + 4;
+    let emit_delay = |out: &mut String| {
+        if let Some(delay) = delay {
+            let _ = writeln!(out, "            // delay: {delay_vram:#010X}: {delay:?}");
+            emit_straight(out, delay, delay_vram);
+        }
+    };
+
+    let self_pause = target == Some(vram)
+        && (matches!(instr, J { .. }) || matches!(instr, Beq { rs: 0, rt: 0, .. }));
+    if self_pause {
+        emit_delay(out);
+        let _ = writeln!(
+            out,
+            "            finish!(BlockExit::Yield(ExecutionKey::new(BankId::new({:#018X}), GuestPc::new({vram:#010X}))));",
+            bank.get()
+        );
+        return;
+    }
+
+    match instr {
+        Jr { rs } => {
+            // The target is read before the delay slot. A delay instruction
+            // that writes `rs` must not redirect the already-issued jump.
+            let _ = writeln!(out, "            let target = ctx.r_u32({rs});");
+            emit_delay(out);
+            emit_runtime_transfer(out, bank, domain, 12);
+        }
+        Jalr { rd, rs } => {
+            let _ = writeln!(out, "            let target = ctx.r_u32({rs});");
+            let _ = writeln!(
+                out,
+                "            ctx.set_r32({rd}, {fallthrough:#010X}u32 as i32);"
+            );
+            emit_delay(out);
+            emit_runtime_transfer(out, bank, domain, 12);
+        }
+        J { .. } => {
+            emit_delay(out);
+            emit_proven_or_resolved_transfer(out, bank, target.expect("J has target"), domain, 12);
+        }
+        Jal { .. } => {
+            let _ = writeln!(
+                out,
+                "            ctx.set_r32(31, {fallthrough:#010X}u32 as i32);"
+            );
+            emit_delay(out);
+            emit_proven_or_resolved_transfer(
+                out,
+                bank,
+                target.expect("JAL has target"),
+                domain,
+                12,
+            );
+        }
+        Bltzal { .. } | Bgezal { .. } | Bltzall { .. } | Bgezall { .. } => {
+            let condition = branch_condition(&instr).expect("link branch has condition");
+            let target = target.expect("link branch has target");
+            let _ = writeln!(out, "            let take = {condition};");
+            let _ = writeln!(
+                out,
+                "            ctx.set_r32(31, {fallthrough:#010X}u32 as i32);"
+            );
+            if instr.is_branch_likely() {
+                let _ = writeln!(out, "            if take {{");
+                emit_delay(out);
+                emit_proven_or_resolved_transfer(out, bank, target, domain, 16);
+                let _ = writeln!(out, "            }}");
+                emit_proven_or_resolved_transfer(out, bank, fallthrough, domain, 12);
+            } else {
+                emit_delay(out);
+                emit_conditional_transfer(out, bank, target, fallthrough, domain);
+            }
+        }
+        _ if instr.is_branch_likely() => {
+            let condition = branch_condition(&instr).expect("likely branch has condition");
+            let target = target.expect("likely branch has target");
+            let _ = writeln!(out, "            if {condition} {{");
+            emit_delay(out);
+            emit_proven_or_resolved_transfer(out, bank, target, domain, 16);
+            let _ = writeln!(out, "            }}");
+            emit_proven_or_resolved_transfer(out, bank, fallthrough, domain, 12);
+        }
+        _ => {
+            let condition = branch_condition(&instr).expect("branch has condition");
+            let target = target.expect("branch has target");
+            let _ = writeln!(out, "            let take = {condition};");
+            emit_delay(out);
+            emit_conditional_transfer(out, bank, target, fallthrough, domain);
+        }
+    }
+}
+
+fn emit_runtime_transfer(
+    out: &mut String,
+    bank: BankId,
+    domain: &ExecutionDomain<'_>,
+    indent: usize,
+) {
+    let pad = " ".repeat(indent);
+    let _ = writeln!(out, "{pad}if target & 3 != 0 {{");
+    let _ = writeln!(
+        out,
+        "{pad}    let at = ExecutionKey::new(BankId::new({:#018X}), GuestPc::new(target));",
+        bank.get()
+    );
+    let _ = writeln!(
+        out,
+        "{pad}    finish!(BlockExit::Fault(CpuFault {{ at, kind: CpuFaultKind::UnalignedPc }}));"
+    );
+    let _ = writeln!(out, "{pad}}}");
+    let condition = domain.runtime_condition("target");
+    let _ = writeln!(out, "{pad}if {condition} {{");
+    let _ = writeln!(out, "{pad}    finish!(BlockExit::Transfer(ExecutionKey::new(BankId::new({:#018X}), GuestPc::new(target))));", bank.get());
+    let _ = writeln!(out, "{pad}}}");
+    let _ = writeln!(out, "{pad}finish!(BlockExit::ResolveTransfer {{ source_bank: BankId::new({:#018X}), target_pc: GuestPc::new(target) }});", bank.get());
+}
+
+fn emit_conditional_transfer(
+    out: &mut String,
+    bank: BankId,
+    target: u32,
+    fallthrough: u32,
+    domain: &ExecutionDomain<'_>,
+) {
+    let target_expr = transfer_expression(bank, target, domain);
+    let fallthrough_expr = transfer_expression(bank, fallthrough, domain);
+    let _ = writeln!(
+        out,
+        "            finish!(if take {{ {target_expr} }} else {{ {fallthrough_expr} }});"
+    );
+}
+
+fn transfer_expression(bank: BankId, target: u32, domain: &ExecutionDomain<'_>) -> String {
+    if domain.contains(target) {
+        format!(
+            "BlockExit::Transfer(ExecutionKey::new(BankId::new({:#018X}), GuestPc::new({target:#010X})))",
+            bank.get()
+        )
+    } else {
+        format!(
+            "BlockExit::ResolveTransfer {{ source_bank: BankId::new({:#018X}), target_pc: GuestPc::new({target:#010X}) }}",
+            bank.get()
+        )
+    }
+}
+
 /// The (in-function) target vram of a branch/jump instruction, if it has a
 /// statically known one. `jr`/`jalr` (register-indirect) return `None`.
 fn branch_target(instr: &Instruction, vram: u32) -> Option<u32> {
@@ -271,6 +966,28 @@ fn branch_target(instr: &Instruction, vram: u32) -> Option<u32> {
         J { target } | Jal { target } => Some((vram.wrapping_add(4) & 0xF000_0000) | (target << 2)),
         _ => None,
     }
+}
+
+/// Rust condition expression for a conditional branch.
+fn branch_condition(instr: &Instruction) -> Option<String> {
+    use Instruction::*;
+    Some(match *instr {
+        Beq { rs, rt, .. } | Beql { rs, rt, .. } => format!("{} == {}", r(rs), r(rt)),
+        Bne { rs, rt, .. } | Bnel { rs, rt, .. } => format!("{} != {}", r(rs), r(rt)),
+        Blez { rs, .. } | Blezl { rs, .. } => format!("{} <= 0", rs64(rs)),
+        Bgtz { rs, .. } | Bgtzl { rs, .. } => format!("{} > 0", rs64(rs)),
+        Bltz { rs, .. } | Bltzl { rs, .. } | Bltzal { rs, .. } | Bltzall { rs, .. } => {
+            format!("{} < 0", rs64(rs))
+        }
+        Bgez { rs, .. } | Bgezl { rs, .. } | Bgezal { rs, .. } | Bgezall { rs, .. } => {
+            format!("{} >= 0", rs64(rs))
+        }
+        Bc1t { .. } | Bc1tl { .. } => "ctx.fpu_cond".to_string(),
+        Bc1f { .. } | Bc1fl { .. } => "!ctx.fpu_cond".to_string(),
+        Bc0t { .. } | Bc0tl { .. } => "ctx.cop0_cond".to_string(),
+        Bc0f { .. } | Bc0fl { .. } => "!ctx.cop0_cond".to_string(),
+        _ => return None,
+    })
 }
 
 /// Register read expression as typed Rust. `$zero` folds to a literal `0`.
@@ -1111,35 +1828,11 @@ fn emit_control_transfer(
         return;
     }
 
-    // Condition expression (Rust bool) for conditional branches.
-    let cond = |instr: &Instruction| -> Option<String> {
-        Some(match *instr {
-            Beq { rs, rt, .. } => format!("{} == {}", r(rs), r(rt)),
-            Bne { rs, rt, .. } => format!("{} != {}", r(rs), r(rt)),
-            Beql { rs, rt, .. } => format!("{} == {}", r(rs), r(rt)),
-            Bnel { rs, rt, .. } => format!("{} != {}", r(rs), r(rt)),
-            Blez { rs, .. } | Blezl { rs, .. } => format!("{} <= 0", rs64(rs)),
-            Bgtz { rs, .. } | Bgtzl { rs, .. } => format!("{} > 0", rs64(rs)),
-            Bltz { rs, .. } | Bltzl { rs, .. } | Bltzal { rs, .. } | Bltzall { rs, .. } => {
-                format!("{} < 0", rs64(rs))
-            }
-            Bgez { rs, .. } | Bgezl { rs, .. } | Bgezal { rs, .. } | Bgezall { rs, .. } => {
-                format!("{} >= 0", rs64(rs))
-            }
-            // COP1 branches read the FP condition flag set by the last compare.
-            Bc1t { .. } | Bc1tl { .. } => "ctx.fpu_cond".to_string(),
-            Bc1f { .. } | Bc1fl { .. } => "!ctx.fpu_cond".to_string(),
-            Bc0t { .. } | Bc0tl { .. } => "ctx.cop0_cond".to_string(),
-            Bc0f { .. } | Bc0fl { .. } => "!ctx.cop0_cond".to_string(),
-            _ => return None,
-        })
-    };
-
     match instr {
         Jr { rs } => {
             // `jr $ra` is a return; any other register is an indirect tail call.
-            emit_delay(out);
             if rs == 31 {
+                emit_delay(out);
                 let _ = writeln!(out, "            return;");
             } else {
                 // N64Recomp lowers a recognized local jump table to `goto`
@@ -1148,6 +1841,9 @@ fn emit_control_transfer(
                 // in this function resumes our local pc dispatcher; only an
                 // address outside the body is an indirect function tail-call.
                 let _ = writeln!(out, "            let _target = ctx.r_u32({});", rs);
+                // The jump target is captured before the delay slot. This
+                // ordering matters when the delay instruction writes `rs`.
+                emit_delay(out);
                 let _ = writeln!(
                     out,
                     "            if _target >= {base:#010X} && _target < {func_end:#010X} {{ pc = _target; continue 'run; }}"
@@ -1226,7 +1922,7 @@ fn emit_control_transfer(
         }
         Bltzal { .. } | Bgezal { .. } => {
             // Conditional branch-and-link.
-            let c = cond(&instr).unwrap();
+            let c = branch_condition(&instr).unwrap();
             let t = target.unwrap();
             let _ = writeln!(out, "            let _take = {};", c);
             let _ = writeln!(
@@ -1242,7 +1938,7 @@ fn emit_control_transfer(
             );
         }
         Bltzall { .. } | Bgezall { .. } => {
-            let c = cond(&instr).unwrap();
+            let c = branch_condition(&instr).unwrap();
             let t = target.unwrap();
             let _ = writeln!(
                 out,
@@ -1260,7 +1956,7 @@ fn emit_control_transfer(
             // Branch-likely: delay slot is executed ONLY when the branch is
             // taken. Evaluate condition, then run delay slot inside the taken
             // arm.
-            let c = cond(&instr).unwrap();
+            let c = branch_condition(&instr).unwrap();
             let t = target.unwrap();
             let _ = writeln!(out, "            if {} {{", c);
             emit_delay(out);
@@ -1271,7 +1967,7 @@ fn emit_control_transfer(
         }
         _ => {
             // Normal conditional branch: delay slot runs unconditionally.
-            let c = cond(&instr).unwrap();
+            let c = branch_condition(&instr).unwrap();
             let t = target.unwrap();
             let _ = writeln!(out, "            let _take = {};", c);
             emit_delay(out);

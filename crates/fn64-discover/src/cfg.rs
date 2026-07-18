@@ -1,21 +1,19 @@
 //! Phase 4 (docs/DISCOVER-DESIGN.md "construct the CFG"): a delay-slot-aware
-//! MIPS-III decoder and control-flow graph builder, scoped to exactly the
-//! control-transfer classification the design doc requires -- this is not a
-//! general disassembler or semantic decoder. Every word in a bank is
+//! control-flow graph builder over fn64's shared MIPS-III decoder.
+//! Every word in a bank is
 //! classified into one of the six states the doc names:
 //!
 //! ```text
 //! proven_code | candidate_code | proven_data | candidate_data | conflict | unknown
 //! ```
 //!
-//! # Why a from-scratch decoder
+//! # Shared ISA authority
 //!
-//! No MIPS decoder exists anywhere in this workspace (`fn64-recomp` shells
-//! out to N64Recomp rather than decoding itself). Writing one here is
-//! unavoidable for CFG construction, but it is deliberately minimal: enough
-//! to classify branches, jumps, calls, delay slots, and branch-likely
-//! annulment, not to interpret arithmetic/load-store semantics (that's
-//! `fn64-recomp`'s job, on the far side of proof).
+//! Discovery must not have a weaker decoder than recompilation: treating a
+//! reserved word as ordinary fallthrough would let data become `ProvenCode`
+//! and could unsafely satisfy exact-owner admission. [`classify_control`]
+//! therefore consumes [`fn64_recomp_rs::decode`]. Unknown instructions and
+//! malformed delay slots terminate the CFG as typed blockers.
 //!
 //! # Determinism and monotonicity
 //!
@@ -25,6 +23,7 @@
 //! even if an earlier speculative decode called it `CandidateCode` or
 //! `Unknown` (see [`WordClass::merge`]).
 
+use fn64_recomp_rs::{decode, Instruction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -45,14 +44,16 @@ pub enum ControlOp {
     /// `jalr $rd, $rs`: computed call.
     Jalr { rd: u8, rs: u8 },
     /// Ordinary (non-likely) conditional branch to a PC-relative target.
-    Branch { target: u32 },
+    Branch { target: u32, link: bool },
     /// Branch-likely: the delay slot is annulled (not executed) when the
     /// branch is not taken, per MIPS-III semantics. This changes whether
     /// the delay-slot word is itself always-reached code.
-    BranchLikely { target: u32 },
+    BranchLikely { target: u32, link: bool },
     /// `break`/`syscall`: exception-producing, terminates the block but is
     /// not a transfer to a decodable target.
     Trap,
+    /// Reserved or unsupported instruction. It is never ordinary code.
+    Invalid { word: u32 },
 }
 
 /// Decode one big-endian MIPS-III word's control-flow shape. Returns `None`
@@ -61,65 +62,49 @@ pub enum ControlOp {
 /// here specifically flags "not decodable as *any* recognized encoding",
 /// which is different from "decodable and ordinary" -- see [`decode_word`]).
 fn classify_control(word: u32) -> ControlOp {
-    let opcode = (word >> 26) & 0x3f;
-    let rs = ((word >> 21) & 0x1f) as u8;
-    let rt = ((word >> 16) & 0x1f) as u8;
-    let target26 = word & 0x03ff_ffff;
-    let imm16 = (word & 0xffff) as i16;
+    use Instruction::*;
 
-    match opcode {
-        // SPECIAL (opcode 0): jr/jalr live here.
-        0x00 => {
-            let funct = word & 0x3f;
-            match funct {
-                0x08 => ControlOp::Jr { rs }, // jr
-                0x09 => {
-                    // jalr rd, rs (rd defaults to $ra=31 when the encoded
-                    // field is 0 in the two-operand assembler form, but the
-                    // machine encoding always carries an explicit rd field).
-                    let rd = ((word >> 11) & 0x1f) as u8;
-                    ControlOp::Jalr { rd, rs }
-                }
-                0x0c => ControlOp::Trap, // syscall
-                0x0d => ControlOp::Trap, // break
-                _ => ControlOp::Plain,
-            }
-        }
-        0x02 => ControlOp::J {
-            target: target26, // caller resolves the pseudo-region + <<2
+    match decode(word) {
+        J { target } => ControlOp::J { target },
+        Jal { target } => ControlOp::Jal { target },
+        Jr { rs } => ControlOp::Jr { rs },
+        Jalr { rd, rs } => ControlOp::Jalr { rd, rs },
+        Beq { off, .. }
+        | Bne { off, .. }
+        | Blez { off, .. }
+        | Bgtz { off, .. }
+        | Bltz { off, .. }
+        | Bgez { off, .. }
+        | Bc0f { off }
+        | Bc0t { off }
+        | Bc1f { off }
+        | Bc1t { off } => ControlOp::Branch {
+            target: off as i32 as u32,
+            link: false,
         },
-        0x03 => ControlOp::Jal { target: target26 },
-        // Ordinary conditional branches (non-likely).
-        0x04..=0x07 /* beq/bne/blez/bgtz */ => {
-            ControlOp::Branch { target: imm16 as i32 as u32 }
-        }
-        0x01 => {
-            // REGIMM: bltz/bgez family + their "likely" siblings, by rt.
-            match rt {
-                0x00 | 0x01 => ControlOp::Branch { target: imm16 as i32 as u32 }, // bltz/bgez
-                0x02 | 0x03 => ControlOp::BranchLikely { target: imm16 as i32 as u32 }, // bltzl/bgezl
-                0x10 | 0x11 => ControlOp::Branch { target: imm16 as i32 as u32 }, // bltzal/bgezal
-                0x12 | 0x13 => ControlOp::BranchLikely { target: imm16 as i32 as u32 }, // bltzall/bgezall
-                _ => ControlOp::Plain,
-            }
-        }
-        // Branch-likely forms.
-        0x14..=0x17 /* beql/bnel/blezl/bgtzl */ => {
-            ControlOp::BranchLikely { target: imm16 as i32 as u32 }
-        }
-        0x11 => {
-            // COP1 (FPU): bc1f/bc1t/bc1fl/bc1tl live under a sub-opcode.
-            let sub = (word >> 21) & 0x1f;
-            if sub == 0x08 {
-                let nd_tf = (word >> 16) & 0x3;
-                match nd_tf {
-                    0x0 | 0x1 => ControlOp::Branch { target: imm16 as i32 as u32 },
-                    _ => ControlOp::BranchLikely { target: imm16 as i32 as u32 },
-                }
-            } else {
-                ControlOp::Plain
-            }
-        }
+        Bltzal { off, .. } | Bgezal { off, .. } => ControlOp::Branch {
+            target: off as i32 as u32,
+            link: true,
+        },
+        Beql { off, .. }
+        | Bnel { off, .. }
+        | Blezl { off, .. }
+        | Bgtzl { off, .. }
+        | Bltzl { off, .. }
+        | Bgezl { off, .. }
+        | Bc0fl { off }
+        | Bc0tl { off }
+        | Bc1fl { off }
+        | Bc1tl { off } => ControlOp::BranchLikely {
+            target: off as i32 as u32,
+            link: false,
+        },
+        Bltzall { off, .. } | Bgezall { off, .. } => ControlOp::BranchLikely {
+            target: off as i32 as u32,
+            link: true,
+        },
+        Syscall { .. } | Break { .. } => ControlOp::Trap,
+        Unknown { word } => ControlOp::Invalid { word },
         _ => ControlOp::Plain,
     }
 }
@@ -229,6 +214,12 @@ pub enum BlockTerminator {
     ResolvedIndirect { targets: Vec<u32>, via_call: bool },
     /// `break`/`syscall`: terminates the block, no successor.
     Trap,
+    /// The shared decoder rejected this word. The word is included in the
+    /// block extent for diagnostics but is deliberately not `ProvenCode`.
+    InvalidInstruction { pc: u32, word: u32 },
+    /// A control transfer was the final word in the materialized bank, so
+    /// its architecturally required delay slot could not be decoded.
+    MissingDelaySlot { control_pc: u32 },
     /// Ran off the end of the decodable/bank region without a terminator.
     RanOffEnd,
 }
@@ -267,6 +258,37 @@ pub struct Cfg {
 fn read_word(bank_bytes: &[u8], off: usize) -> Option<u32> {
     let b = bank_bytes.get(off..off + 4)?;
     Some(u32::from_be_bytes(b.try_into().unwrap()))
+}
+
+/// Validate the architecturally required word after a control transfer.
+/// The returned end address includes an invalid delay word when present so
+/// diagnostics retain its location, but callers must only mark `Ok` slots as
+/// code.
+fn validate_delay_slot(
+    bank_bytes: &[u8],
+    va_start: u32,
+    control_pc: u32,
+) -> Result<u32, (u32, BlockTerminator)> {
+    let delay_pc = control_pc.wrapping_add(4);
+    let Some(off) = delay_pc.checked_sub(va_start).map(|off| off as usize) else {
+        return Err((
+            control_pc.wrapping_add(4),
+            BlockTerminator::MissingDelaySlot { control_pc },
+        ));
+    };
+    let Some(word) = read_word(bank_bytes, off) else {
+        return Err((
+            control_pc.wrapping_add(4),
+            BlockTerminator::MissingDelaySlot { control_pc },
+        ));
+    };
+    if matches!(classify_control(word), ControlOp::Invalid { .. }) {
+        return Err((
+            delay_pc.wrapping_add(4),
+            BlockTerminator::InvalidInstruction { pc: delay_pc, word },
+        ));
+    }
+    Ok(delay_pc)
 }
 
 /// Build the CFG for one bank by recursive-descent traversal from `roots`
@@ -354,6 +376,29 @@ pub fn build_cfg_with_indirect(
                 break;
             };
             let op = classify_control(word);
+            // A decoded control transfer is only proof of its own word. Its
+            // delay slot becomes code after the shared decoder accepts it;
+            // otherwise this path stops at a typed blocker. This closes the
+            // interleaving where a valid branch plus adjacent data used to
+            // promote that data to `ProvenCode` without decoding it.
+            macro_rules! valid_delay {
+                () => {{
+                    match validate_delay_slot(bank_bytes, va_start, pc) {
+                        Ok(delay_pc) => {
+                            mark(&mut word_class, delay_pc, WordClass::ProvenCode);
+                            delay_pc
+                        }
+                        Err((end_va, terminator)) => {
+                            blocks.push(BasicBlock {
+                                start_va: block_start,
+                                end_va,
+                                terminator,
+                            });
+                            break;
+                        }
+                    }
+                }};
+            }
 
             match op {
                 ControlOp::Plain => {
@@ -388,11 +433,18 @@ pub fn build_cfg_with_indirect(
                     });
                     break;
                 }
+                ControlOp::Invalid { word } => {
+                    blocks.push(BasicBlock {
+                        start_va: block_start,
+                        end_va: pc.wrapping_add(4),
+                        terminator: BlockTerminator::InvalidInstruction { pc, word },
+                    });
+                    break;
+                }
                 ControlOp::J { target } => {
                     let target = region_target(pc, target);
                     mark(&mut word_class, pc, WordClass::ProvenCode);
-                    let delay_pc = pc.wrapping_add(4);
-                    mark(&mut word_class, delay_pc, WordClass::ProvenCode);
+                    let delay_pc = valid_delay!();
                     tail_transfers.push((pc, target));
                     // An unconditional `j` proves code reachability, not a
                     // callable function boundary. NWXE contains ordinary
@@ -415,8 +467,7 @@ pub fn build_cfg_with_indirect(
                 ControlOp::Jal { target } => {
                     let target = region_target(pc, target);
                     mark(&mut word_class, pc, WordClass::ProvenCode);
-                    let delay_pc = pc.wrapping_add(4);
-                    mark(&mut word_class, delay_pc, WordClass::ProvenCode);
+                    let delay_pc = valid_delay!();
                     let next = delay_pc.wrapping_add(4);
                     direct_calls.push((pc, target));
                     if in_range(target) && proven_roots_seen.insert(target) {
@@ -440,8 +491,7 @@ pub fn build_cfg_with_indirect(
                 }
                 ControlOp::Jr { rs } => {
                     mark(&mut word_class, pc, WordClass::ProvenCode);
-                    let delay_pc = pc.wrapping_add(4);
-                    mark(&mut word_class, delay_pc, WordClass::ProvenCode);
+                    let delay_pc = valid_delay!();
                     let end = delay_pc.wrapping_add(4);
                     let is_return = rs == 31; // $ra
                     let terminator = if is_return {
@@ -473,30 +523,35 @@ pub fn build_cfg_with_indirect(
                     });
                     break;
                 }
-                ControlOp::Jalr { rd: _, rs: _ } => {
+                ControlOp::Jalr { rd, rs: _ } => {
                     mark(&mut word_class, pc, WordClass::ProvenCode);
-                    let delay_pc = pc.wrapping_add(4);
-                    mark(&mut word_class, delay_pc, WordClass::ProvenCode);
+                    let delay_pc = valid_delay!();
                     let next = delay_pc.wrapping_add(4);
+                    // `jalr $zero, $rs` discards the link and is therefore a
+                    // computed jump, not a call. Treating it as a call would
+                    // invent both a return edge and callable owner roots.
+                    let via_call = rd != 0;
                     let terminator = if let Some(targets) = exhaustive_indirect
                         .get(&pc)
                         .filter(|targets| !targets.is_empty())
                     {
                         for &target in targets {
-                            if in_range(target) && proven_roots_seen.insert(target) {
-                                proven_roots.push(target);
+                            if in_range(target) {
                                 worklist.push_back(target);
+                                if via_call && proven_roots_seen.insert(target) {
+                                    proven_roots.push(target);
+                                }
                             }
                         }
                         BlockTerminator::ResolvedIndirect {
                             targets: targets.clone(),
-                            via_call: true,
+                            via_call,
                         }
                     } else {
-                        indirect_sites.push(IndirectSite { pc, via_call: true });
-                        BlockTerminator::Indirect { via_call: true }
+                        indirect_sites.push(IndirectSite { pc, via_call });
+                        BlockTerminator::Indirect { via_call }
                     };
-                    if in_range(next) {
+                    if via_call && in_range(next) {
                         worklist.push_back(next);
                     }
                     blocks.push(BasicBlock {
@@ -506,17 +561,22 @@ pub fn build_cfg_with_indirect(
                     });
                     break;
                 }
-                ControlOp::Branch { target } => {
+                ControlOp::Branch { target, link } => {
                     let target = branch_target(pc, target);
                     mark(&mut word_class, pc, WordClass::ProvenCode);
-                    let delay_pc = pc.wrapping_add(4);
+                    let delay_pc = valid_delay!();
                     // Ordinary branch: delay slot always executes (both
                     // taken and not-taken paths run it), so it's
                     // unconditionally proven code.
-                    mark(&mut word_class, delay_pc, WordClass::ProvenCode);
                     let fallthrough = delay_pc.wrapping_add(4);
                     if in_range(target) {
                         worklist.push_back(target);
+                        if link && proven_roots_seen.insert(target) {
+                            proven_roots.push(target);
+                        }
+                    }
+                    if link {
+                        direct_calls.push((pc, target));
                     }
                     if in_range(fallthrough) {
                         worklist.push_back(fallthrough);
@@ -531,10 +591,10 @@ pub fn build_cfg_with_indirect(
                     });
                     break;
                 }
-                ControlOp::BranchLikely { target } => {
+                ControlOp::BranchLikely { target, link } => {
                     let target = branch_target(pc, target);
                     mark(&mut word_class, pc, WordClass::ProvenCode);
-                    let delay_pc = pc.wrapping_add(4);
+                    let delay_pc = valid_delay!();
                     // Branch-likely annulment: the delay slot only executes
                     // on the TAKEN path. It is still proven code (reached
                     // via the taken edge) but must not be treated as
@@ -542,10 +602,15 @@ pub fn build_cfg_with_indirect(
                     // needing that distinction should consult the
                     // `BranchLikely` terminator, not assume `ProvenCode`
                     // implies "always executes".
-                    mark(&mut word_class, delay_pc, WordClass::ProvenCode);
                     let fallthrough = delay_pc.wrapping_add(4);
                     if in_range(target) {
                         worklist.push_back(target);
+                        if link && proven_roots_seen.insert(target) {
+                            proven_roots.push(target);
+                        }
+                    }
+                    if link {
+                        direct_calls.push((pc, target));
                     }
                     if in_range(fallthrough) {
                         worklist.push_back(fallthrough);
@@ -564,6 +629,8 @@ pub fn build_cfg_with_indirect(
         }
     }
 
+    canonicalize_blocks(&mut blocks);
+
     Cfg {
         bank: bank.to_string(),
         word_class,
@@ -572,6 +639,25 @@ pub fn build_cfg_with_indirect(
         tail_transfers,
         indirect_sites,
         proven_roots,
+    }
+}
+
+/// Recursive descent can discover a branch target after an earlier scan has
+/// already crossed that address. Every discovered block start is nonetheless
+/// a mandatory leader: truncate any earlier overlapping span into an ordinary
+/// fallthrough prefix. The later block retains the real terminator, producing
+/// a disjoint canonical graph without re-decoding or inventing an edge.
+fn canonicalize_blocks(blocks: &mut [BasicBlock]) {
+    blocks.sort_by_key(|block| block.start_va);
+    let starts: Vec<u32> = blocks.iter().map(|block| block.start_va).collect();
+    for block in blocks.iter_mut() {
+        if let Some(&leader) = starts
+            .iter()
+            .find(|&&start| start > block.start_va && start < block.end_va)
+        {
+            block.end_va = leader;
+            block.terminator = BlockTerminator::Fallthrough { next: leader };
+        }
     }
 }
 
@@ -652,6 +738,86 @@ mod tests {
     }
 
     #[test]
+    fn jalr_zero_is_a_computed_jump_without_fallthrough() {
+        // jalr $zero, $t9; nop; invalid. The invalid word would be visited if
+        // discovery invented a call-return edge after a link-discarding jalr.
+        let jalr_zero = (25u32 << 21) | 0x09;
+        let unknown = 0x7801_2345;
+        let bytes = asm(&[jalr_zero, NOP, unknown]);
+        let cfg = build_cfg("boot", &bytes, 0x8000_0000, &[0x8000_0000]);
+        assert_eq!(cfg.indirect_sites.len(), 1);
+        assert!(!cfg.indirect_sites[0].via_call);
+        assert!(matches!(
+            cfg.blocks[0].terminator,
+            BlockTerminator::Indirect { via_call: false }
+        ));
+        assert!(!cfg.word_class.contains_key(&0x8000_0008));
+    }
+
+    #[test]
+    fn regimm_link_branch_proves_its_direct_callable_target() {
+        // bltzal $at, +3; nop. The conditional link branch has both ordinary
+        // branch successors and a direct callable edge to 0x80000010.
+        let bltzal = (1u32 << 26) | (1u32 << 21) | (0x10u32 << 16) | 3;
+        let bytes = asm(&[bltzal, NOP, NOP, NOP, NOP, NOP]);
+        let cfg = build_cfg("boot", &bytes, 0x8000_0000, &[0x8000_0000]);
+        assert_eq!(cfg.direct_calls, vec![(0x8000_0000, 0x8000_0010)]);
+        assert!(cfg.proven_roots.contains(&0x8000_0010));
+        assert!(matches!(
+            cfg.blocks[0].terminator,
+            BlockTerminator::Branch {
+                target: 0x8000_0010,
+                fallthrough: 0x8000_0008
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_root_word_is_not_proven_code() {
+        let unknown = 0x7801_2345;
+        let cfg = build_cfg("boot", &asm(&[unknown]), 0x8000_0000, &[0x8000_0000]);
+        assert!(!cfg.word_class.contains_key(&0x8000_0000));
+        assert!(matches!(
+            cfg.blocks[0].terminator,
+            BlockTerminator::InvalidInstruction {
+                pc: 0x8000_0000,
+                word: 0x7801_2345
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_delay_word_is_not_proven_code() {
+        let jr_ra = 0x03e0_0008u32;
+        let unknown = 0x7801_2345;
+        let cfg = build_cfg("boot", &asm(&[jr_ra, unknown]), 0x8000_0000, &[0x8000_0000]);
+        assert_eq!(
+            cfg.word_class.get(&0x8000_0000),
+            Some(&WordClass::ProvenCode)
+        );
+        assert!(!cfg.word_class.contains_key(&0x8000_0004));
+        assert!(matches!(
+            cfg.blocks[0].terminator,
+            BlockTerminator::InvalidInstruction {
+                pc: 0x8000_0004,
+                word: 0x7801_2345
+            }
+        ));
+    }
+
+    #[test]
+    fn final_control_word_reports_missing_delay_slot() {
+        let jr_ra = 0x03e0_0008u32;
+        let cfg = build_cfg("boot", &asm(&[jr_ra]), 0x8000_0000, &[0x8000_0000]);
+        assert!(matches!(
+            cfg.blocks[0].terminator,
+            BlockTerminator::MissingDelaySlot {
+                control_pc: 0x8000_0000
+            }
+        ));
+    }
+
+    #[test]
     fn branch_delay_slot_is_always_proven_code_and_both_edges_enqueued() {
         // beq $zero, $zero, +2 (skip one word) ; nop (delay slot, always
         // executes) ; nop (fallthrough target if not taken -- always taken
@@ -684,6 +850,35 @@ mod tests {
         assert!(matches!(
             cfg.blocks[0].terminator,
             BlockTerminator::BranchLikely { .. }
+        ));
+    }
+
+    #[test]
+    fn later_discovered_leader_splits_an_earlier_overlapping_scan() {
+        // The taken block at 0x10 is queued before fallthrough 0x08. Without
+        // canonicalization, scanning from 0x08 crosses 0x10 and overlaps the
+        // already-built taken block through the return.
+        let beq_to_10 = 0x1000_0003u32;
+        let jr_ra = 0x03e0_0008u32;
+        let bytes = asm(&[beq_to_10, NOP, NOP, NOP, NOP, jr_ra, NOP]);
+        let cfg = build_cfg("boot", &bytes, 0x8000_0000, &[0x8000_0000]);
+        let starts_and_ends: Vec<_> = cfg
+            .blocks
+            .iter()
+            .map(|block| (block.start_va, block.end_va))
+            .collect();
+        assert!(starts_and_ends
+            .windows(2)
+            .all(|pair| pair[0].1 <= pair[1].0));
+        let prefix = cfg
+            .blocks
+            .iter()
+            .find(|block| block.start_va == 0x8000_0008)
+            .unwrap();
+        assert_eq!(prefix.end_va, 0x8000_0010);
+        assert!(matches!(
+            prefix.terminator,
+            BlockTerminator::Fallthrough { next: 0x8000_0010 }
         ));
     }
 

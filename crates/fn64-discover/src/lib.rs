@@ -30,6 +30,23 @@
 //!   (hardware-fixed, needs no scanning), descriptor-table-shaped overlay
 //!   banks, and configurable ROM/VROM range tables (including file-table
 //!   backed compressed overlay images).
+//! - [`evidence`]: schema-versioned, normalized-ROM-bound external mapping
+//!   and executable-range evidence, with provenance and range validation.
+//! - [`coverage`]: distinct physical-ROM, logical-load, executable, bank, and
+//!   entry-state coverage measures; it never collapses them into one number.
+//! - [`regions`]: deterministic multi-scale code/data/pointer/statistical
+//!   views and boundary candidates. Scores are never promoted by themselves.
+//! - [`loaders`]: strict MIPS entry-stub and PI ROM-load observations, with
+//!   typed address domains, explicit candidate/proven strength, and loud
+//!   rejection of unsupported shapes.
+//! - [`load_table_use`]: descriptor-free affine overlay-table recovery from
+//!   immutable semantic load uses plus independently proven loop bounds.
+//!   Consecutive observations without exact enumeration remain candidates.
+//! - [`pi_dma`]: bounded static `osPiStartDma` and `osEPiStartDma`
+//!   call-operand slicing. Their distinct ABIs have distinct result types;
+//!   exact operands and unresolved blockers are typed separately, and static
+//!   geometry remains candidate evidence until handle mapping and completion
+//!   exist.
 //! - [`harvest`]: Phase 3, parallel deterministic candidate providers for
 //!   direct/resolved calls, classic and leaf prologues, and code-pointer
 //!   entries exposed by already-discovered tables. Claims merge through
@@ -42,12 +59,38 @@
 //!   [`cfg::Cfg`]'s blocks from its proven roots -- one owner per block per
 //!   bank, ambiguous claims and unowned blocks reported explicitly rather
 //!   than resolved by guessing.
+//! - [`owner_proof`]: the conservative Phase 5 proof boundary. Exact extents
+//!   are a distinct type available only after entry authority, CFG shape,
+//!   ROM backing, executable coverage, incoming edges, and indirect closure
+//!   all pass; every other result remains candidate or ambiguous.
 //! - [`resolve`]: Phase 6 bounded value-set closure -- HI/LO and GP-relative
 //!   address construction, exact register/memory propagation, dominating
 //!   switch bounds, exhaustive jump tables, and fixed-point CFG feedback.
 //!   Computed-jump table entries remain intra-owner code successors; only
 //!   exhaustive computed calls become callable roots. Every unresolved site
 //!   is retained as bounded/open evidence in the fact database.
+//! - [`homology`]: bounded relocation-masked cross-ROM n-gram lookup with
+//!   collision-safe full-body validation and explicit ambiguous/unmatched
+//!   results. Homology emits candidates only.
+//! - [`cfg_homology`]: address-free typed CFG fingerprints with conservative
+//!   unique-to-unique matching. Structural collisions remain ambiguous.
+//! - [`trace`]: digest-bound, strictly sequenced dynamic trace ingestion with
+//!   explicit unknown banks and bounded instrumentation guarantees separated
+//!   from observations.
+//! - [`probe`]: emulator-neutral, budgeted frontier probes with deterministic
+//!   expected-information-gain scheduling and bank-aware overlap rejection.
+//! - [`headless`]: content-bound black-box emulator run bundles and strict
+//!   probe-filtered observation normalization into the trace schema.
+//! - [`tool_adapter`]: strict bank-local external-tool interchange with exact
+//!   input/lineage binding and a type-level candidate-only proof ceiling.
+//! - [`tool_claims`]: a canonical snapshot-bound sidecar for external-tool
+//!   candidates. It is structurally unable to mutate or promote native
+//!   [`facts::FactDb`] conclusions.
+//! - [`spimdisasm_adapter`]: pure-Rust normalization of pinned spimdisasm
+//!   function-info CSV into that strict candidate-only interchange.
+//! - [`snapshot`]: the byte-verified one-bank composition boundary that runs
+//!   closure, fact integration, partitioning, owner proof, and coverage into
+//!   one deterministic artifact. Traversal seeds never imply entry proof.
 //! - [`grade_oot`] / [`grade_nw4e`]: grading-only cross-checks against the
 //!   OoT decomp's segment answer key and NW4E's hand-verified
 //!   `overlays.json`. Neither module is reachable from the discovery
@@ -65,8 +108,14 @@
 //! Dynamic indirect observations/callback-field semantics (Phase 6/7) and
 //! assembly verification (Phase 8) are not yet implemented.
 
+pub mod aki_reference;
 pub mod banks;
+pub mod block_pack;
+pub mod block_proof;
 pub mod cfg;
+pub mod cfg_homology;
+pub mod coverage;
+pub mod evidence;
 pub mod facts;
 pub mod grade_candidates;
 pub mod grade_nw4e;
@@ -75,12 +124,45 @@ pub mod grade_nwxe_functions;
 pub mod grade_oot;
 pub mod grade_oot_functions;
 pub mod harvest;
+pub mod headless;
+pub mod homology;
+pub mod load_table_use;
+pub mod loaders;
+pub mod oot_reference;
+pub mod owner_proof;
 pub mod partition;
+pub mod pi_dma;
+pub mod probe;
+pub mod regions;
 pub mod resolve;
 pub mod rom;
+pub mod snapshot;
+pub mod spimdisasm_adapter;
+pub mod tool_adapter;
+pub mod tool_claims;
+pub mod trace;
 
 pub use facts::{BankAddr, Fact, FactDb, ProofState, RomAddressSpace};
 pub use rom::{normalize, NormalizedRom, RomByteOrder, RomRejectReason};
+
+#[derive(Debug)]
+pub enum DiscoveryError {
+    Rom(RomRejectReason),
+    Evidence(evidence::EvidenceError),
+    Harvest(harvest::HarvestError),
+}
+
+impl std::fmt::Display for DiscoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rom(error) => error.fmt(f),
+            Self::Evidence(error) => error.fmt(f),
+            Self::Harvest(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for DiscoveryError {}
 
 /// An explicit, cited descriptor-table location/shape plus the naming
 /// function for the banks it yields (see [`banks::scan_descriptor_table`]).
@@ -124,6 +206,26 @@ pub fn run_discovery_with_load_image_tables(
     Ok((rom, db))
 }
 
+/// Run discovery from a serializable external evidence manifest. The
+/// manifest is checked against the normalized ROM SHA-256 before any claim is
+/// consumed. It may describe mappings and executable intervals, but never
+/// function answers; those remain outputs of the discovery pipeline.
+pub fn run_discovery_with_manifest(
+    rom_bytes: &[u8],
+    manifest: &evidence::EvidenceManifest,
+) -> Result<(NormalizedRom, FactDb), DiscoveryError> {
+    let rom = rom::normalize(rom_bytes).map_err(DiscoveryError::Rom)?;
+    manifest
+        .validate_identity(&rom)
+        .map_err(DiscoveryError::Evidence)?;
+    let mut db = FactDb::new();
+    banks::discover_boot_bank(&rom, &mut db);
+    evidence::apply_mapping_evidence(&rom, manifest, &mut db).map_err(DiscoveryError::Evidence)?;
+    evidence::apply_executable_evidence(manifest, &mut db).map_err(DiscoveryError::Evidence)?;
+    harvest::harvest_discovered_candidates(&rom, &mut db).map_err(DiscoveryError::Harvest)?;
+    Ok((rom, db))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +247,16 @@ mod tests {
             db.conclusion("bank:boot").unwrap().state,
             ProofState::Proven
         );
+        assert_eq!(db.proven_function_entries("boot"), vec![0x8000_0400]);
+        assert!(db.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::FunctionEntryClaim {
+                detector: facts::CandidateDetector::HardwareEntrypoint,
+                evidence: facts::FunctionEntryEvidence::RomHeaderEntrypoint,
+                proposed_state: ProofState::Proven,
+                ..
+            }
+        )));
     }
 
     #[test]
