@@ -34,13 +34,16 @@ use fn64_discover::grade_nwxe_functions::{
     grade_functions as grade_nwxe_functions, parse_function_csv as parse_nwxe_function_csv,
 };
 use fn64_discover::grade_oot_functions::{grade_functions, parse_function_csv};
+use fn64_discover::owner_proof::{OwnerAssessment, OwnerProofReport};
 use fn64_discover::partition::{partition, same_bank_overlaps, Owner};
 use fn64_discover::resolve::{build_cfg_closed_with_facts, build_cfg_exploratory_with_candidates};
-use fn64_discover::snapshot::{compose_materialized_bank_v1, MaterializedBankInput};
+use fn64_discover::snapshot::{
+    compose_materialized_bank_v1, BankSnapshotV1, MaterializedBankInput, ProgramSnapshotV1,
+};
 use fn64_discover::{run_discovery, DescriptorTableInput};
 use fn64_recomp_rs::{decode, Instruction};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -126,6 +129,124 @@ fn main() {
     }
 
     std::process::exit(exit_code);
+}
+
+/// What an answer key's end addresses mean, which decides when a proven
+/// owner's end "agrees" with it.
+#[derive(Clone, Copy)]
+enum KeyEndRule {
+    /// The key carries real per-function sizes (NWXE `dump.toml`): the
+    /// proven end must equal the key end exactly.
+    Exact,
+    /// The key derives each end from the next symbol's start ("one
+    /// contiguous region per named symbol, no gaps" — the OoT linker map),
+    /// so key extents include trailing padding and literal data that are
+    /// not function code. Agreement is the exact start plus an end inside
+    /// the key slot; crossing the next symbol is wrong.
+    NextSymbolSlot,
+}
+
+/// The hard extent gate's tally over admitted (`Proven`) owners.
+struct ProvenExtentGrade {
+    admitted: usize,
+    exact_key_matches: usize,
+    interior: usize,
+    wrong: Vec<String>,
+}
+
+/// Hard gate: every admitted exact owner must agree with the answer key.
+/// Agreement is either (a) the entry is a key start and the proven end
+/// agrees per `end_rule`, or (b) the entry is a mechanically proven `jal`
+/// target strictly inside one key function and the proven extent stays
+/// inside it (correct finer-grained discovery, mirroring the grade
+/// modules' interior-entry rule). Anything else is a wrong extent: a gate
+/// failure, never a statistic.
+fn grade_proven_extents(
+    report: &OwnerProofReport,
+    key_extents: &BTreeMap<u32, u32>,
+    jal_targets: &BTreeSet<u32>,
+    end_rule: KeyEndRule,
+) -> ProvenExtentGrade {
+    let mut grade = ProvenExtentGrade {
+        admitted: 0,
+        exact_key_matches: 0,
+        interior: 0,
+        wrong: Vec::new(),
+    };
+    for assessment in &report.assessments {
+        let OwnerAssessment::Proven { owner } = assessment else {
+            continue;
+        };
+        grade.admitted += 1;
+        let entry = owner.entry.pc;
+        if let Some(&key_end) = key_extents.get(&entry) {
+            let agrees = match end_rule {
+                KeyEndRule::Exact => owner.va_end == key_end,
+                KeyEndRule::NextSymbolSlot => owner.va_end > entry && owner.va_end <= key_end,
+            };
+            if agrees {
+                grade.exact_key_matches += 1;
+            } else {
+                grade.wrong.push(format!(
+                    "0x{entry:08x}..0x{:08x} (key end 0x{key_end:08x})",
+                    owner.va_end
+                ));
+            }
+            continue;
+        }
+        match key_extents.range(..=entry).next_back() {
+            Some((&start, &end))
+                if entry > start
+                    && entry < end
+                    && jal_targets.contains(&entry)
+                    && owner.va_end <= end =>
+            {
+                grade.interior += 1;
+            }
+            _ => grade.wrong.push(format!(
+                "0x{entry:08x}..0x{:08x} (no agreeing key extent)",
+                owner.va_end
+            )),
+        }
+    }
+    grade
+}
+
+/// Deterministic owner-proof admission lines shared by the OoT and NWXE
+/// sections: admission counts, the reached-executable evidence the snapshot
+/// derived, and the remaining blocker histogram.
+fn print_owner_admission(
+    snapshot: &ProgramSnapshotV1,
+    bank_snapshot: &BankSnapshotV1,
+) -> Result<(), String> {
+    let mut exact = 0usize;
+    let mut candidate = 0usize;
+    let mut ambiguous = 0usize;
+    for assessment in &bank_snapshot.owner_proof.assessments {
+        match assessment {
+            OwnerAssessment::Proven { .. } => exact += 1,
+            OwnerAssessment::Candidate { .. } => candidate += 1,
+            OwnerAssessment::Ambiguous { .. } => ambiguous += 1,
+        }
+    }
+    let ranges = snapshot
+        .facts
+        .proven_executable_ranges(&bank_snapshot.input.bank);
+    let range_bytes: u64 = ranges
+        .iter()
+        .map(|&(start, end)| u64::from(end - start))
+        .sum();
+    println!(
+        "  owner proof: exact={exact} candidate={candidate} ambiguous={ambiguous} ({} assessed); proven executable evidence: {} interval(s), {range_bytes} bytes",
+        bank_snapshot.owner_proof.assessments.len(),
+        ranges.len(),
+    );
+    println!(
+        "  remaining owner blockers={}",
+        serde_json::to_string(&bank_snapshot.blocker_histogram)
+            .map_err(|error| format!("serializing blocker histogram: {error}"))?
+    );
+    Ok(())
 }
 
 /// Build the boot bank's CFG + partition from the real OoT ROM, seeding
@@ -243,6 +364,67 @@ fn run_oot_function_gate() -> Result<(), String> {
         return Err(format!(
             "gate requires wrong=0, got {} (examples: {wrong_examples:?})",
             report.wrong
+        ));
+    }
+
+    // Same proof-carrying treatment as the NWXE section: compose the
+    // byte-verified snapshot (value-set closure), which derives reached
+    // proven-code executable evidence and re-proves owners against it.
+    let snapshot = compose_materialized_bank_v1(
+        &rom,
+        &db,
+        MaterializedBankInput {
+            bank: banks::BOOT_BANK,
+            va_start,
+            bytes: bank_bytes,
+            seed_roots: std::slice::from_ref(&entrypoint),
+        },
+    )
+    .map_err(|error| format!("composing OoT program snapshot: {error}"))?;
+    let bank_snapshot = &snapshot.banks[0];
+    println!(
+        "  ProgramSnapshot v{}: block proof={}/{} blocks ({} bytes)",
+        snapshot.schema_version,
+        bank_snapshot.block_proof.proven_blocks,
+        bank_snapshot.block_proof.assessments.len(),
+        bank_snapshot.block_proof.proven_bytes
+    );
+    print_owner_admission(&snapshot, bank_snapshot)?;
+
+    // Hard extent gate over admitted owners against the linker-map key.
+    // Function ends derive from the next row's start; the last row ends at
+    // the cited code end — the same construction the linker map itself used.
+    let mut key_extents = BTreeMap::new();
+    for pair in parsed.functions.windows(2) {
+        key_extents.insert(pair[0].va_start, pair[1].va_start);
+    }
+    if let Some(last) = parsed.functions.last() {
+        key_extents.insert(last.va_start, OOT_BOOT_CODE_END);
+    }
+    let snapshot_jal_targets: BTreeSet<u32> = bank_snapshot
+        .closure
+        .cfg
+        .direct_calls
+        .iter()
+        .map(|&(_, target)| target)
+        .collect();
+    let extent_grade = grade_proven_extents(
+        &bank_snapshot.owner_proof,
+        &key_extents,
+        &snapshot_jal_targets,
+        KeyEndRule::NextSymbolSlot,
+    );
+    println!(
+        "  admitted owner extents vs linker map: admitted={} exact_key={} interior={} wrong={}",
+        extent_grade.admitted,
+        extent_grade.exact_key_matches,
+        extent_grade.interior,
+        extent_grade.wrong.len()
+    );
+    if !extent_grade.wrong.is_empty() {
+        return Err(format!(
+            "admitted OoT owner extents disagree with the linker map: {:?}",
+            extent_grade.wrong
         ));
     }
 
@@ -558,15 +740,14 @@ fn run_nwxe_function_gate() -> Result<(), String> {
     }
 
     println!(
-        "  ProgramSnapshot v{}: sha256={} (10/10 byte-identical), block proof={}/{} blocks ({} bytes), owner blockers={}",
+        "  ProgramSnapshot v{}: sha256={} (10/10 byte-identical), block proof={}/{} blocks ({} bytes)",
         snapshot.schema_version,
         snapshot_sha256,
         bank_snapshot.block_proof.proven_blocks,
         bank_snapshot.block_proof.assessments.len(),
         bank_snapshot.block_proof.proven_bytes,
-        serde_json::to_string(&bank_snapshot.blocker_histogram)
-            .map_err(|error| format!("serializing NWXE blocker histogram: {error}"))?
     );
+    print_owner_admission(&snapshot, bank_snapshot)?;
     let overlaps = same_bank_overlaps(part, cfg);
     println!(
         "  CFG: {} blocks, {} direct calls, {} tail transfers, {} indirect sites",
@@ -640,6 +821,41 @@ fn run_nwxe_function_gate() -> Result<(), String> {
             NWXE_MIN_MATCHED_FRACTION * 100.0,
             report.matched_fraction() * 100.0
         ));
+    }
+
+    // Hard extent gate over admitted owners against the dump-derived key.
+    // Reached-executable derivation is expected to admit owners here; zero
+    // admissions would mean the mechanism silently regressed.
+    let key_extents: BTreeMap<u32, u32> = parsed
+        .functions
+        .iter()
+        .map(|function| (function.va_start, function.va_end()))
+        .collect();
+    let extent_grade = grade_proven_extents(
+        &bank_snapshot.owner_proof,
+        &key_extents,
+        &jal_targets,
+        KeyEndRule::Exact,
+    );
+    println!(
+        "  admitted owner extents vs dump key: admitted={} exact_key={} interior={} wrong={}",
+        extent_grade.admitted,
+        extent_grade.exact_key_matches,
+        extent_grade.interior,
+        extent_grade.wrong.len()
+    );
+    if !extent_grade.wrong.is_empty() {
+        return Err(format!(
+            "admitted NWXE owner extents disagree with the dump key: {:?}",
+            extent_grade.wrong
+        ));
+    }
+    if extent_grade.admitted == 0 {
+        return Err(
+            "reached-executable derivation admitted zero NWXE owners; expected the \
+             not_proven_executable frontier to close for extents inside reached code"
+                .into(),
+        );
     }
 
     Ok(())
