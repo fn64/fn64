@@ -3,12 +3,14 @@
 //! and function-entry proof states answer different questions and must never
 //! be collapsed into one percentage.
 
+use crate::block_pack::BlockPackV1;
 use crate::facts::{
     executable_range_subject, function_entry_subject, Fact, FactDb, MappingAddressSpace,
     ProofState, RomAddressSpace,
 };
 use crate::owner_proof::{OwnerAssessment, OwnerBlocker, OwnerProofReport};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,9 +385,163 @@ fn union_len(mut ranges: Vec<(u32, u32)>) -> u64 {
     total
 }
 
+/// Deterministic summary of a [`BlockPackV1`]: how many independent blocks it
+/// carries, how many aligned instruction words those blocks cover, and a
+/// content digest that folds every block identity and byte hash. The digest is
+/// derived only from pack contents (never a timestamp or ordering accident),
+/// so two byte-identical packs produce the same digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackCoverage {
+    pub schema_version: u32,
+    pub banks: u64,
+    pub blocks: u64,
+    /// Aligned 32-bit instruction words across all packed blocks. Each block's
+    /// word count is `(rom_end - rom_start) / 4`; block geometry is validated
+    /// four-byte-aligned when the pack is emitted.
+    pub words: u64,
+    pub digest: String,
+}
+
+/// Fold a pack into a deterministic coverage summary. The digest commits to the
+/// schema version, the normalized ROM identity, and every packed block's
+/// `(bank, bank_id, start_va, end_va, rom_start, rom_end, bytes_sha256,
+/// terminator)`. Banks and blocks are already emitted in stable order by
+/// [`crate::block_pack::emit_block_pack_v1`]; this reads them in that order.
+pub fn pack_coverage(pack: &BlockPackV1) -> PackCoverage {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fn64:pack-coverage:v1\n");
+    hasher.update(pack.schema_version.to_be_bytes());
+    hasher.update(pack.normalized_rom_sha256.as_bytes());
+    hasher.update(b"\n");
+    let mut blocks = 0u64;
+    let mut words = 0u64;
+    for bank in &pack.banks {
+        hasher.update(b"bank\n");
+        hasher.update(bank.bank.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(bank.bank_id.to_be_bytes());
+        for block in &bank.blocks {
+            blocks += 1;
+            words += u64::from(block.rom_end.saturating_sub(block.rom_start)) / 4;
+            hasher.update(block.start_va.to_be_bytes());
+            hasher.update(block.end_va.to_be_bytes());
+            hasher.update(block.rom_start.to_be_bytes());
+            hasher.update(block.rom_end.to_be_bytes());
+            hasher.update(block.bytes_sha256.as_bytes());
+            hasher.update(b"\n");
+            hasher.update(format!("{:?}", block.terminator).as_bytes());
+            hasher.update(b"\n");
+        }
+    }
+    PackCoverage {
+        schema_version: pack.schema_version,
+        banks: pack.banks.len() as u64,
+        blocks,
+        words,
+        digest: hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    }
+}
+
+/// Identity of the ROM a coverage report was produced from, rendered verbatim
+/// so a report line is self-describing without any global state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RomIdentity {
+    pub label: String,
+    pub sha256: String,
+}
+
+/// Render a coverage report as deterministic text lines. Ordering is fixed,
+/// every quantity is an integer printed in base-10 or fixed-width hex, and no
+/// timestamps, floats, or locale-sensitive formatting appear. Feeding the same
+/// report and pack coverage always yields the same `Vec<String>`.
+///
+/// The metric ladder (docs/DISCOVER-PLAN.md) is deliberately kept as separate
+/// lines: physical, logical, executable, owner, entry-conclusion, and pack
+/// coverage answer different questions and must never be collapsed into a
+/// single percentage. Measured coverage is not proof: a mapped or executable
+/// byte count reports what evidence established, not that the interval is
+/// authoritative for emission.
+pub fn render_report(
+    identity: &RomIdentity,
+    phase: &str,
+    report: &CoverageReport,
+    pack: Option<&PackCoverage>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("rom {} sha256={}", identity.label, identity.sha256));
+    lines.push(format!("phase {phase}"));
+    lines.push(format!("physical_rom_bytes {}", report.total_rom_bytes));
+    lines.push(format!(
+        "physical_assigned_bytes direct_load={} known_file={}",
+        report.direct_physical_load_bytes, report.known_file_backing_bytes
+    ));
+    lines.push(format!(
+        "logical_load_image_bytes {} mapped_banks={}",
+        report.logical_load_image_bytes, report.mapped_banks
+    ));
+    lines.push(format!(
+        "executable_bytes {} executable_banks={}",
+        report.executable_bytes, report.executable_banks
+    ));
+
+    // Entry-conclusion counts across every proof state, always printed for
+    // every state so an absent state reads as an explicit zero, not an omission.
+    let entries = &report.function_entries_by_state;
+    let state_count = |state: ProofState| entries.get(&state).copied().unwrap_or(0);
+    lines.push(format!(
+        "entry_conclusions open={} candidate={} supported={} rejected={} conflict={} proven={}",
+        state_count(ProofState::Open),
+        state_count(ProofState::Candidate),
+        state_count(ProofState::Supported),
+        state_count(ProofState::Rejected),
+        state_count(ProofState::Conflict),
+        state_count(ProofState::Proven),
+    ));
+
+    let owners = &report.function_owners;
+    match owners.state {
+        OwnerProofRunState::NotRun => {
+            lines.push("owner_proof not_run".to_string());
+        }
+        OwnerProofRunState::Run => {
+            lines.push(format!(
+                "owner_proof run banks={} assessed={} exact={} candidate={} ambiguous={} exact_bytes={}",
+                owners.analyzed_banks,
+                owners.assessed_entries,
+                owners.exact_owners,
+                owners.candidate_owners,
+                owners.ambiguous_owners,
+                owners.exact_owner_bytes,
+            ));
+            for blocker in &owners.blockers {
+                lines.push(format!(
+                    "owner_blocker {} {:?}",
+                    blocker.assessments, blocker.blocker
+                ));
+            }
+        }
+    }
+
+    match pack {
+        None => lines.push("pack none".to_string()),
+        Some(pack) => lines.push(format!(
+            "pack schema={} banks={} blocks={} words={} digest={}",
+            pack.schema_version, pack.banks, pack.blocks, pack.words, pack.digest
+        )),
+    }
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_pack::{BlockPackV1, PackedBankV1, PackedBlockV1};
+    use crate::cfg::BlockTerminator;
     use crate::facts::{BankAddr, CandidateDetector, FunctionEntryEvidence};
     use crate::owner_proof::{
         ExactFunctionOwner, OwnerAssessment, OwnerFrontier, OwnerProofReport,
@@ -553,5 +709,139 @@ mod tests {
         assert_eq!(coverage.exact_owners, 2);
         assert_eq!(coverage.exact_owner_bytes, 20);
         assert!(coverage.blockers.is_empty());
+    }
+
+    fn synthetic_report() -> CoverageReport {
+        let mut entries = BTreeMap::new();
+        entries.insert(ProofState::Proven, 7);
+        entries.insert(ProofState::Candidate, 3);
+        CoverageReport {
+            total_rom_bytes: 0x0080_0000,
+            direct_physical_load_bytes: 0x0010_0000,
+            known_file_backing_bytes: 0x0020_0000,
+            logical_load_image_bytes: 0x0030_0000,
+            executable_bytes: 0x0004_0000,
+            mapped_banks: 4,
+            executable_banks: 2,
+            function_entries_by_state: entries,
+            function_owners: OwnerProofCoverage::not_run(),
+        }
+    }
+
+    fn synthetic_pack() -> BlockPackV1 {
+        BlockPackV1 {
+            schema_version: 1,
+            normalized_rom_sha256: "a".repeat(64),
+            banks: vec![PackedBankV1 {
+                bank: "boot".into(),
+                bank_id: 0xdead_beef,
+                blocks: vec![
+                    PackedBlockV1 {
+                        start_va: 0x8000_0000,
+                        end_va: 0x8000_0010,
+                        rom_start: 0x1000,
+                        rom_end: 0x1010,
+                        bytes_sha256: "b".repeat(64),
+                        terminator: BlockTerminator::Return,
+                    },
+                    PackedBlockV1 {
+                        start_va: 0x8000_0010,
+                        end_va: 0x8000_0020,
+                        rom_start: 0x1010,
+                        rom_end: 0x1020,
+                        bytes_sha256: "c".repeat(64),
+                        terminator: BlockTerminator::Fallthrough { next: 0x8000_0020 },
+                    },
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn render_emits_exact_stable_lines_without_pack() {
+        let report = synthetic_report();
+        let identity = RomIdentity {
+            label: "SYNTH".into(),
+            sha256: "d".repeat(64),
+        };
+        let lines = render_report(&identity, "phase-3-harvest", &report, None);
+        assert_eq!(
+            lines,
+            vec![
+                format!("rom SYNTH sha256={}", "d".repeat(64)),
+                "phase phase-3-harvest".to_string(),
+                "physical_rom_bytes 8388608".to_string(),
+                "physical_assigned_bytes direct_load=1048576 known_file=2097152".to_string(),
+                "logical_load_image_bytes 3145728 mapped_banks=4".to_string(),
+                "executable_bytes 262144 executable_banks=2".to_string(),
+                "entry_conclusions open=0 candidate=3 supported=0 rejected=0 conflict=0 proven=7"
+                    .to_string(),
+                "owner_proof not_run".to_string(),
+                "pack none".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_emits_owner_and_pack_lines_when_present() {
+        let mut report = synthetic_report();
+        report.function_owners = OwnerProofCoverage {
+            state: OwnerProofRunState::Run,
+            analyzed_banks: 1,
+            assessed_entries: 3,
+            exact_owners: 1,
+            candidate_owners: 1,
+            ambiguous_owners: 1,
+            exact_owner_bytes: 12,
+            blockers: vec![
+                OwnerBlockerCount {
+                    blocker: OwnerBlocker::BankNotProven,
+                    assessments: 2,
+                },
+                OwnerBlockerCount {
+                    blocker: OwnerBlocker::PartitionOverlap { other_root: 0x40 },
+                    assessments: 1,
+                },
+            ],
+        };
+        let identity = RomIdentity {
+            label: "SYNTH".into(),
+            sha256: "d".repeat(64),
+        };
+        let pack = pack_coverage(&synthetic_pack());
+        let lines = render_report(&identity, "phase-5-owner", &report, Some(&pack));
+        assert_eq!(
+            lines[7],
+            "owner_proof run banks=1 assessed=3 exact=1 candidate=1 ambiguous=1 exact_bytes=12"
+        );
+        assert_eq!(lines[8], "owner_blocker 2 BankNotProven");
+        assert_eq!(
+            lines[9],
+            "owner_blocker 1 PartitionOverlap { other_root: 64 }"
+        );
+        assert_eq!(
+            lines[10],
+            format!(
+                "pack schema=1 banks=1 blocks=2 words=8 digest={}",
+                pack.digest
+            )
+        );
+    }
+
+    #[test]
+    fn pack_coverage_counts_words_and_is_digest_stable() {
+        let pack = synthetic_pack();
+        let a = pack_coverage(&pack);
+        let b = pack_coverage(&pack);
+        assert_eq!(a, b);
+        assert_eq!(a.banks, 1);
+        assert_eq!(a.blocks, 2);
+        assert_eq!(a.words, 8);
+        assert_eq!(a.digest.len(), 64);
+
+        // A changed block byte hash must move the digest.
+        let mut mutated = pack;
+        mutated.banks[0].blocks[0].bytes_sha256 = "e".repeat(64);
+        assert_ne!(pack_coverage(&mutated).digest, a.digest);
     }
 }

@@ -7,6 +7,7 @@
 # Inputs are named and declared, never defaulted (DESIGN.md section 1.0):
 #   FN64_DISCOVER_NW4E_ROM   path to a WWF No Mercy (U) v1.1 .z64
 #   FN64_DISCOVER_NWXE_ROM   path to a WWF WrestleMania 2000 (U) .z64
+#   FN64_DISCOVER_OOT_ROM    path to an OoT NTSC 1.0 .z64 (gate_coverage only)
 #
 # Usage: scripts/gate-determinism.sh [runs]   (default 10)
 set -eu
@@ -22,6 +23,10 @@ runs=${1:-10}
 # the same commit, with the evidence for why the output moved.
 expected_loaders=5a67f5e471bad44bbb85aba27decd4ac831d93f2a24f0de1b329c3393bfec921
 expected_selector=b53b25c7dd0a92dda59182f78f5c3ac0e0147124ea19941516da92a391679290
+# gate_coverage renders the metric ladder for every supplied ROM; its digest is
+# only fixed when all three ROM vars are set, since an unset var is a loud skip
+# line that legitimately changes the output.
+expected_coverage=6153e54d4f04af85645795c5e2a5a2192391b4eeb6978dd2d88b44aaedcd07c6
 
 sha_stdout() {
     shasum -a 256 | awk '{print $1}'
@@ -45,5 +50,11 @@ check_gate() {
 
 check_gate gate_loaders "$expected_loaders"
 check_gate gate_selector "$expected_selector"
+
+if [ "${FN64_DISCOVER_OOT_ROM:-}" != "" ]; then
+    check_gate gate_coverage "$expected_coverage"
+else
+    echo "gate_coverage: skipped (FN64_DISCOVER_OOT_ROM unset; digest not checkable)"
+fi
 
 echo "gate-determinism: all gates stable over $runs runs"

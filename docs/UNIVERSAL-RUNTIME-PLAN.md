@@ -180,10 +180,16 @@ Working-tree frontier: `dispatch_until_boundary` follows direct and
 mapping-resolved transfers without losing bank identity, preserves cumulative
 work on resolver faults, checkpoints before a next indivisible unit, and
 rejects zero-progress or over-budget runner defects. `BlockPackV1` feeds a
-sparse emitter and `CodeCatalog`; the real NWXE gate compiles 197 blocks and
-re-resolves all 1,039 admitted words while rejecting a real gap. Generated
-registration is now bank-checked and atomic inside `BlockProgram`, with an
-emitted helper exercised by the compile/run gate. Live dispatcher ownership
+sparse emitter and `CodeCatalog`; the real NWXE gate compiles 197 blocks,
+re-resolves all 1,039 admitted words while rejecting a real gap, and now
+executes the generated runner as a host binary: duplicate registration
+rejected, entry and derived register-only interior-PC runs exiting typed,
+hole/unaligned/unknown-bank entries faulting typed, a minimum-budget
+checkpoint, and a bounded transfer-following dispatch loop over real pack
+code. The same harness pins U4's opening explicitly: entering `entry+4`
+skips the entry stub's `lui`, the resulting wild store panics the host
+instead of raising a typed VR4300 memory fault, and the probe asserts that
+panic so it fails loudly the day U4 lands. Live dispatcher ownership
 and guest-cycle charging remain open.
 
 ### U2 — deterministic PI/device vertical slice

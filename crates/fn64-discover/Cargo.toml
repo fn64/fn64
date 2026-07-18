@@ -53,3 +53,7 @@ path = "src/bin/gate_static_closure.rs"
 [[bin]]
 name = "gate_oot_reference"
 path = "src/bin/gate_oot_reference.rs"
+
+[[bin]]
+name = "gate_coverage"
+path = "src/bin/gate_coverage.rs"
