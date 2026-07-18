@@ -28,14 +28,7 @@ const NW4E_OVERLAYS_JSON: &str = "/Users/jer/Code/aki-recomp/games/NW4E/overlays
 /// byte-verified RE), supplied here as input -- never rediscovered by
 /// scanning, per this crate's "no guessed table location" discipline.
 fn nw4e_descriptor_table_shape() -> DescriptorTableShape {
-    DescriptorTableShape {
-        table_rom_offset: 0x0539a0,
-        record_count: 5,
-        record_stride: 0x24,
-        field_rom_start: 0x00,
-        field_rom_end: 0x04,
-        field_vram_dest: 0x08,
-    }
+    fn64_discover::aki_reference::NW4E_DESCRIPTOR_TABLE
 }
 
 fn main() {

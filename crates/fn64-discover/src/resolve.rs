@@ -869,6 +869,8 @@ fn block_successors(block: &BasicBlock) -> Vec<u32> {
         BlockTerminator::Return
         | BlockTerminator::Indirect { via_call: false }
         | BlockTerminator::Trap
+        | BlockTerminator::InvalidInstruction { .. }
+        | BlockTerminator::MissingDelaySlot { .. }
         | BlockTerminator::RanOffEnd => Vec::new(),
     }
 }
@@ -1216,7 +1218,7 @@ pub fn build_cfg_value_set_closed(
     va_start: u32,
     seed_roots: &[u32],
 ) -> ClosureResult {
-    let mut roots: BTreeSet<u32> = seed_roots.iter().copied().collect();
+    let roots: BTreeSet<u32> = seed_roots.iter().copied().collect();
     let va_end = va_start.wrapping_add(bank_bytes.len() as u32);
     let in_bank = |target: u32| {
         target >= va_start && target < va_end && (target - va_start).is_multiple_of(4)
@@ -1245,20 +1247,7 @@ pub fn build_cfg_value_set_closed(
             .filter(|resolution| resolution.state == IndirectProofState::Exhaustive)
             .map(|resolution| (resolution.site_pc, resolution.targets.clone()))
             .collect();
-        let mut added_root = false;
-        for resolution in &resolutions {
-            if resolution.state == IndirectProofState::Exhaustive
-                && !resolution.via_call
-                && resolution.kind == Some(IndirectResolutionKind::Constant)
-            {
-                for &target in &resolution.targets {
-                    if in_bank(target) && roots.insert(target) {
-                        added_root = true;
-                    }
-                }
-            }
-        }
-        if next == exhaustive && !added_root {
+        if next == exhaustive {
             return ClosureResult {
                 cfg,
                 indirect: resolutions,
@@ -1280,6 +1269,27 @@ pub fn build_cfg_closed_with_facts(
 ) -> (Cfg, Vec<ResolvedTarget>) {
     let mut roots: BTreeSet<u32> = seed_roots.iter().copied().collect();
     roots.extend(db.proven_function_entries(bank));
+    build_cfg_closed(
+        bank,
+        bank_bytes,
+        va_start,
+        &roots.into_iter().collect::<Vec<_>>(),
+    )
+}
+
+/// Exploratory counterpart to [`build_cfg_closed_with_facts`]. It seeds the
+/// fixed-point walk with candidate/supported entries so coverage can be
+/// measured, but its output must remain candidate evidence and cannot feed
+/// exact-owner admission.
+pub fn build_cfg_exploratory_with_candidates(
+    db: &crate::facts::FactDb,
+    bank: &str,
+    bank_bytes: &[u8],
+    va_start: u32,
+    seed_roots: &[u32],
+) -> (Cfg, Vec<ResolvedTarget>) {
+    let mut roots: BTreeSet<u32> = seed_roots.iter().copied().collect();
+    roots.extend(db.candidate_function_entries(bank));
     build_cfg_closed(
         bank,
         bank_bytes,
@@ -1323,10 +1333,10 @@ mod tests {
     }
 
     #[test]
-    fn fixed_point_seeds_resolved_target_as_a_real_root() {
-        // Boot stub jumps to 0x80000100, which itself just returns. After the
-        // fixed point, the target must be a proven root (i.e. the CFG built
-        // with it seeded reaches it).
+    fn fixed_point_traverses_resolved_jump_without_inventing_callable_root() {
+        // Boot stub jumps to 0x80000100, which itself just returns. The
+        // exhaustive successor must be traversed, but a link-free `jr` does
+        // not prove that target is a callable function entry.
         let lui = 0x3c0a_8000u32;
         let addiu = 0x254a_0100u32;
         let jr_t2 = (10u32 << 21) | 0x08;
@@ -1338,11 +1348,12 @@ mod tests {
 
         let (cfg, resolved) = build_cfg_closed("boot", &bytes, 0x8000_0000, &[0x8000_0000]);
         assert_eq!(resolved.len(), 1);
-        assert!(
-            cfg.proven_roots.contains(&0x8000_0100),
-            "resolved target must be seeded as a root: {:?}",
-            cfg.proven_roots
+        assert!(!cfg.proven_roots.contains(&0x8000_0100));
+        assert_eq!(
+            cfg.word_class.get(&0x8000_0100),
+            Some(&crate::cfg::WordClass::ProvenCode)
         );
+        assert!(cfg.blocks.iter().any(|block| block.start_va == 0x8000_0100));
     }
 
     #[test]

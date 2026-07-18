@@ -4,13 +4,15 @@
 //! their local ROM/key files are present.
 
 use fn64_discover::banks::{
-    DescriptorTableShape, DestinationEnd, DestinationRangeFields, DestinationSpace,
-    LoadImageTableInput, LoadImageTableShape, SourceRangeFields, TableLocation,
+    BankNamePattern, DestinationEnd, DestinationRangeFields, DestinationSpace, LoadImageTableInput,
+    LoadImageTableShape, SourceRangeFields, TableLocation,
 };
+use fn64_discover::evidence::EvidenceManifest;
 use fn64_discover::facts::load_image_table_record_subject;
 use fn64_discover::grade_candidates::{grade_candidates, parse_symbol_dump, DetectorGrade};
 use fn64_discover::{
-    run_discovery, run_discovery_with_load_image_tables, DescriptorTableInput, RomAddressSpace,
+    run_discovery, run_discovery_with_load_image_tables, run_discovery_with_manifest,
+    DescriptorTableInput, RomAddressSpace,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -28,15 +30,8 @@ const NWXE_DUMP: &str = "/Users/jer/Code/aki-recomp/games/NWXE/syms/dump.toml";
 
 fn nw4e_descriptor() -> DescriptorTableInput {
     (
-        DescriptorTableShape {
-            table_rom_offset: 0x0539a0,
-            record_count: 5,
-            record_stride: 0x24,
-            field_rom_start: 0x00,
-            field_rom_end: 0x04,
-            field_vram_dest: 0x08,
-        },
-        |index| format!("R{}", index + 1),
+        fn64_discover::aki_reference::NW4E_DESCRIPTOR_TABLE,
+        fn64_discover::aki_reference::nw4e_bank_name,
     )
 }
 
@@ -49,7 +44,7 @@ fn nw4e_descriptor() -> DescriptorTableInput {
 fn oot_load_image_tables() -> [LoadImageTableInput; 5] {
     [
         LoadImageTableInput {
-            name: "dmadata",
+            name: "dmadata".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Physical,
@@ -71,7 +66,7 @@ fn oot_load_image_tables() -> [LoadImageTableInput; 5] {
             bank_name: None,
         },
         LoadImageTableInput {
-            name: "effect_overlays",
+            name: "effect_overlays".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Virtual,
@@ -90,10 +85,10 @@ fn oot_load_image_tables() -> [LoadImageTableInput; 5] {
                     end: DestinationEnd::Field(0x0c),
                 },
             },
-            bank_name: Some(|index| format!("effect_overlay_{index}")),
+            bank_name: Some(BankNamePattern::new("effect_overlay_", 0, "")),
         },
         LoadImageTableInput {
-            name: "actor_overlays",
+            name: "actor_overlays".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Virtual,
@@ -112,10 +107,10 @@ fn oot_load_image_tables() -> [LoadImageTableInput; 5] {
                     end: DestinationEnd::Field(0x0c),
                 },
             },
-            bank_name: Some(|index| format!("actor_overlay_{index}")),
+            bank_name: Some(BankNamePattern::new("actor_overlay_", 0, "")),
         },
         LoadImageTableInput {
-            name: "gamestate_overlays",
+            name: "gamestate_overlays".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Virtual,
@@ -134,10 +129,10 @@ fn oot_load_image_tables() -> [LoadImageTableInput; 5] {
                     end: DestinationEnd::Field(0x10),
                 },
             },
-            bank_name: Some(|index| format!("gamestate_overlay_{index}")),
+            bank_name: Some(BankNamePattern::new("gamestate_overlay_", 0, "")),
         },
         LoadImageTableInput {
-            name: "kaleido_overlays",
+            name: "kaleido_overlays".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Virtual,
@@ -156,7 +151,7 @@ fn oot_load_image_tables() -> [LoadImageTableInput; 5] {
                     end: DestinationEnd::Field(0x10),
                 },
             },
-            bank_name: Some(|index| format!("kaleido_overlay_{index}")),
+            bank_name: Some(BankNamePattern::new("kaleido_overlay_", 0, "")),
         },
     ]
 }
@@ -176,11 +171,38 @@ fn main() {
             println!("{label}: optional grade skipped (ROM or answer key absent)\n");
             continue;
         }
-        match grade_one(label, rom, dump, descriptor) {
+        let evidence_var = format!("FN64_DISCOVER_{label}_EVIDENCE");
+        let result = match std::env::var_os(&evidence_var) {
+            Some(path) => grade_one_with_manifest(label, rom, dump, Path::new(&path)),
+            None => grade_one(label, rom, dump, descriptor),
+        };
+        match result {
             Ok(()) => {}
             Err(error) => println!("{label}: optional grade unavailable: {error}\n"),
         }
     }
+}
+
+fn grade_one_with_manifest(
+    label: &str,
+    rom_path: &str,
+    dump_path: &str,
+    evidence_path: &Path,
+) -> Result<(), String> {
+    let rom_bytes =
+        std::fs::read(rom_path).map_err(|error| format!("reading {rom_path}: {error}"))?;
+    let evidence_text = std::fs::read_to_string(evidence_path)
+        .map_err(|error| format!("reading {}: {error}", evidence_path.display()))?;
+    let manifest =
+        EvidenceManifest::from_toml(&evidence_text).map_err(|error| error.to_string())?;
+    let (_rom, db) =
+        run_discovery_with_manifest(&rom_bytes, &manifest).map_err(|error| error.to_string())?;
+    let key_text = std::fs::read_to_string(dump_path)
+        .map_err(|error| format!("reading {dump_path}: {error}"))?;
+    let key = parse_symbol_dump(&key_text)?;
+    println!("{label}: evidence manifest {}", evidence_path.display());
+    print_report(label, &db, &key);
+    Ok(())
 }
 
 fn grade_oot() -> Result<(), String> {

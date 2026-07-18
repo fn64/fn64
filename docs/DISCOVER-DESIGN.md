@@ -1,7 +1,10 @@
 # Mechanical Function-Metadata Discovery for N64 ROMs
 
-Status: design note  
-Date: 2026-07-14
+Status: design plus incremental implementation note
+Date: 2026-07-17
+
+The active measurements, implementation order, and experiment log live in
+[`DISCOVER-PLAN.md`](DISCOVER-PLAN.md).
 
 ## Executive summary
 
@@ -146,6 +149,17 @@ digest.
 
 ## Phase 2: discover load images before functions
 
+> Implementation status (2026-07-17): load mappings and executable intervals
+> are now distinct facts. A normalized-ROM-SHA-256-bound TOML evidence
+> manifest can supply descriptor/load-table shapes and cited executable
+> intervals without adding per-ROM branches to the Rust engine. Bank naming is
+> serializable data rather than a function pointer. Manifest ranges must be
+> aligned, non-overlapping per bank, contained in exactly one proven and
+> ROM-backed load image, and carry nonempty provenance. If executable ranges
+> exist for a bank, Phase 3 scans only those bytes; absence retains the legacy
+> whole-image candidate scan but does not represent the whole image as proven
+> executable code.
+
 > Implementation status (D1.5, 2026-07-16): Phase 2 now accepts an explicit,
 > generalized range-table shape: table location in physical ROM or VROM,
 > record count/stride, configurable source start/end fields in ROM or VROM,
@@ -189,6 +203,16 @@ ROM-to-RDRAM mappings from:
 - Compression and decompression destinations.
 - Runtime PI DMA traces.
 - ROM regions repeatedly loaded into shared virtual-address ranges.
+
+The descriptor-free `load_table_use` proof stage now consumes normalized
+immutable word loads after semantic dataflow has assigned the public overlay
+roles. It recovers biased record bases, stable field offsets, and constant
+stride, then checks ROM/text/data/BSS range relations. Exact loop enumeration
+is a separate required input: a consecutive observed subset without proven
+table base, count, and stride stays candidate. Even a proven result authorizes
+table geometry only; executable ranges still require their own evidence. The
+real interprocedural producer and unique source-bank mapping translation are
+not connected yet.
 
 Each distinct mapping becomes a bank or load image with:
 
@@ -270,6 +294,17 @@ candidates until exact address, byte, and callsite evidence validates them:
 
 <https://github.com/shygoo/n64sym>
 
+The implemented interchange freezes accepted external results into a
+`ToolClaimSetV1` sidecar bound to the exact `ProgramSnapshotV1` digest and
+bank-input/mapping digests. Sources, semantic claims, provider record IDs,
+sequences, and provider-output digests are canonical and revalidated after
+deserialization. The sidecar is deliberately not a `FactDb` member: no generic
+conclusion key can turn tool agreement into native proof, and disabling one
+source removes exactly that source's claims without mutating the snapshot.
+The current spimdisasm function-info adapter reaches this boundary for entry
+and extent candidates; richer references, blocks, data objects, and types are
+still open.
+
 Each claim records its origin rather than overwriting earlier claims:
 
 ```json
@@ -298,6 +333,19 @@ understand:
 - Calls to interior block entries.
 - Handwritten assembly without standard stack frames.
 
+> Implementation status (2026-07-18): `fn64-discover::cfg` consumes the same
+> `fn64-recomp-rs::decode` authority used by recompilation. A reserved or
+> unsupported word is an `InvalidInstruction` terminator and is never marked
+> `proven_code`; every control transfer's delay word is decoded before it can
+> become code, with a separate `MissingDelaySlot` blocker at bank end.
+> REGIMM link branches retain their callable edge, while `jalr $zero,$rs` is
+> a computed jump with no fabricated return edge or callable target. These
+> are admission-safety rules, not detector scores: a weaker discovery decoder
+> could otherwise turn adjacent data into exact-owner code. The multi-scale
+> region scorer also derives jump/branch/return statistics from this decoder
+> (including COP0, COP1, and REGIMM branches); its boundary output remains
+> candidate evidence and is never promoted by score alone.
+
 Stack frames, register-save patterns, and alignment are candidate evidence,
 not proof.
 
@@ -314,6 +362,52 @@ unknown
 
 Facts must be monotonic. A heuristic cannot overwrite contradictory proven
 evidence.
+
+### Composed proof snapshot
+
+`fn64-discover::snapshot::compose_materialized_bank_v1` is the first thin
+composition boundary over the existing passes. V1 accepts one resident,
+physical-ROM-backed bank, verifies its bytes against the normalized ROM and
+the unique proven mapping, then runs value-set closure, integrates direct and
+indirect transfer facts, partitions blocks, proves owners, and reports
+coverage from that same fact snapshot. It serializes geometry and a byte
+digest, never ROM content.
+
+The snapshot also carries the separate `block_proof` view. This admits
+ROM-backed blocks reached from authoritative entries without claiming a
+contiguous historical function or a global executable section. It is the
+typed input for `BlockPackV1`, not a shortcut around exact owner proof. The
+portable pack contains bank/content identities, block geometry, terminators,
+and digests but no ROM words. Materialization re-verifies the normalized ROM
+and each block digest before exposing words in memory. Its adapter preserves
+the disjoint spans when invoking the typed sparse arbitrary-PC emitter: a data
+gap never becomes executable from the bank's bounding interval, and a static
+or computed transfer into that gap returns to mapping resolution. The real
+NWXE gate emits 197 blocks / 1,039 words and requires the generated Rust to
+compile.
+
+CFG block starts are canonical leaders. Fixed-point discovery may find a new
+target inside an earlier straight-line scan; the earlier block is then split
+at that target. Without this normalization, nominal basic blocks overlap and
+cannot form a sound pack even if owner overlap happens to be zero.
+
+Traversal seeds remain reachability inputs only. They do not become
+authoritative entries merely because the CFG visited them. The full owner
+report remains in the snapshot and a payload-independent blocker histogram
+adds fast feedback without discarding site-specific evidence. Each category
+also reports how many assessments have no other blocker, so a pass can be
+prioritized by its immediate exact-owner payoff. Virtual or
+compressed backing is rejected in V1 until a proof-carrying materialization
+transform can bind its output bytes to source bytes; accepting an unverified
+slice would defeat the snapshot's purpose.
+
+The boot bank's normalized ROM-header entry is a typed, authoritative
+`HardwareEntrypoint` / `RomHeaderEntrypoint` claim justified by the same IPL3
+copy evidence as its mapping. In contrast, an exhaustive link-free `jr`
+target is traversed as an intra-owner successor and is not inserted into the
+callable-root set. On the real NWXE bank this distinction removes the false
+owner ambiguity at the mechanically recovered `0x80000460` transfer without
+using that address as input.
 
 ## Phase 5: partition blocks into owners
 
@@ -488,6 +582,12 @@ should precede an isolated leaf-function ambiguity.
 
 ## Phase 8: verify accepted metadata
 
+Assembly or relink equality is necessary byte and relocation validation, but
+it is not a proof of function boundaries. Arbitrarily different aligned
+partitions can reassemble to the same byte stream. Callable-entry and CFG-owner
+evidence must establish boundaries; round trips only reject partitions that
+fail byte, relocation, coverage, or placement checks.
+
 For every accepted owner:
 
 1. Emit matching assembly.
@@ -596,19 +696,16 @@ Most ordinary functions should close before expensive analysis begins.
 ## Proposed CLI
 
 ```bash
-faki-port discover \
-  --rom game.z64 \
-  --output discovery/
+fn64-discover game.z64 \
+  --evidence evidence.toml \
+  --trace boot.jsonl \
+  --out discovery.json
 
 faki-port audit-discovery discovery/
 
 faki-port plan-probes \
   --discovery discovery/ \
   --output probes.json
-
-faki-port ingest-trace \
-  --discovery discovery/ \
-  --trace trace.json
 
 faki-port close-discovery \
   --discovery discovery/ \

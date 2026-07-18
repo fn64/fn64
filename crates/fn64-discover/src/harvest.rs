@@ -35,6 +35,47 @@ struct LoadImage {
     bytes: Vec<u8>,
 }
 
+/// Deterministic coarse interval index for bank images. A target query visits
+/// only images intersecting its 4 KiB VA page, then applies exact interval and
+/// bank rules. This replaces the prior all-images scan at every raw `jal`.
+#[derive(Debug, Clone)]
+struct LoadImageIndex {
+    by_va_page: BTreeMap<u32, Vec<usize>>,
+}
+
+impl LoadImageIndex {
+    const PAGE_SHIFT: u32 = 12;
+
+    fn new(images: &[LoadImage]) -> Self {
+        let mut by_va_page: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (index, image) in images.iter().enumerate() {
+            let byte_end = image.va_start.saturating_add(image.bytes.len() as u32);
+            if byte_end <= image.va_start {
+                continue;
+            }
+            let first = image.va_start >> Self::PAGE_SHIFT;
+            let last = byte_end.saturating_sub(1) >> Self::PAGE_SHIFT;
+            for page in first..=last {
+                by_va_page.entry(page).or_default().push(index);
+            }
+        }
+        Self { by_va_page }
+    }
+
+    fn containing<'a>(&self, images: &'a [LoadImage], target: u32) -> Vec<&'a LoadImage> {
+        self.by_va_page
+            .get(&(target >> Self::PAGE_SHIFT))
+            .into_iter()
+            .flatten()
+            .filter_map(|&index| images.get(index))
+            .filter(|image| {
+                let byte_end = image.va_start.saturating_add(image.bytes.len() as u32);
+                target >= image.va_start && target < image.va_end && target < byte_end
+            })
+            .collect()
+    }
+}
+
 /// One merged function-entry conclusion returned to callers after facts are
 /// committed. Evidence indices point into the same [`FactDb`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +156,7 @@ pub fn harvest_discovered_candidates(
     db: &mut FactDb,
 ) -> Result<HarvestReport, HarvestError> {
     let images = load_images(rom, db)?;
+    let image_index = LoadImageIndex::new(&images);
     let table_entries: Vec<(BankAddr, u32, BankAddr, ProofState)> = db
         .facts()
         .iter()
@@ -136,8 +178,9 @@ pub fn harvest_discovered_candidates(
 
     let prologue_claims = detect_prologues(&images);
     let ((jal_claims, indirect_facts), table_claims) = std::thread::scope(|scope| {
-        let jal = scope
-            .spawn(|| detect_reachable_call_targets(&images, &prologue_claims, &table_entries));
+        let jal = scope.spawn(|| {
+            detect_reachable_call_targets(&images, &image_index, &prologue_claims, &table_entries)
+        });
         let table = scope.spawn(|| detect_table_entries(&images, &table_entries));
         (
             jal.join().expect("jal-target candidate provider panicked"),
@@ -187,13 +230,36 @@ fn load_images(rom: &NormalizedRom, db: &FactDb) -> Result<Vec<LoadImage>, Harve
                 detail,
             })?
             .bytes;
-        images.push(LoadImage {
-            bank: bank.clone(),
-            rom_start: *rom_start,
-            va_start: *va_start,
-            va_end: *va_end,
-            bytes,
-        });
+        let executable_ranges = db.proven_executable_ranges(bank);
+        if executable_ranges.is_empty() {
+            images.push(LoadImage {
+                bank: bank.clone(),
+                rom_start: *rom_start,
+                va_start: *va_start,
+                va_end: *va_end,
+                bytes,
+            });
+            continue;
+        }
+        for (code_start, code_end) in executable_ranges {
+            let start = code_start.saturating_sub(*va_start) as usize;
+            let end = code_end.saturating_sub(*va_start) as usize;
+            let code_bytes = bytes.get(start..end).ok_or_else(|| {
+                HarvestError::MappingBytesUnavailable {
+                    bank: bank.clone(),
+                    detail: format!(
+                        "proven executable range [0x{code_start:x},0x{code_end:x}) is outside the ROM-backed portion of the load image"
+                    ),
+                }
+            })?;
+            images.push(LoadImage {
+                bank: bank.clone(),
+                rom_start: rom_start.saturating_add(start as u32),
+                va_start: code_start,
+                va_end: code_end,
+                bytes: code_bytes.to_vec(),
+            });
+        }
     }
     images.sort_by(|a, b| {
         (&a.bank, a.rom_start, a.va_start).cmp(&(&b.bank, b.rom_start, b.va_start))
@@ -203,6 +269,7 @@ fn load_images(rom: &NormalizedRom, db: &FactDb) -> Result<Vec<LoadImage>, Harve
 
 fn detect_reachable_call_targets(
     images: &[LoadImage],
+    image_index: &LoadImageIndex,
     prologue_claims: &[ProviderClaim],
     table_entries: &[(BankAddr, u32, BankAddr, ProofState)],
 ) -> (Vec<ProviderClaim>, Vec<Fact>) {
@@ -236,7 +303,7 @@ fn detect_reachable_call_targets(
             }
             let site_pc = image.va_start.wrapping_add((index * 4) as u32);
             let target = (site_pc.wrapping_add(4) & 0xf000_0000) | ((word & 0x03ff_ffff) << 2);
-            for target_image in target_images(images, image, target) {
+            for target_image in target_images(images, image_index, image, target) {
                 corroborated_raw_roots
                     .entry(BankAddr::new(&target_image.bank, target))
                     .or_default()
@@ -281,7 +348,7 @@ fn detect_reachable_call_targets(
             }
         }));
         for &(site_pc, target) in &closure.cfg.direct_calls {
-            let mut target_images = target_images(images, image, target);
+            let mut target_images = target_images(images, image_index, image, target);
             if target_images.is_empty() && image.bank != crate::banks::BOOT_BANK {
                 target_images = initial_copy_leaf_targets(images, target);
             }
@@ -310,7 +377,7 @@ fn detect_reachable_call_targets(
             }
             let site_pc = image.va_start.wrapping_add((index * 4) as u32);
             let target = (site_pc.wrapping_add(4) & 0xf000_0000) | ((word & 0x03ff_ffff) << 2);
-            for target_image in target_images(images, image, target) {
+            for target_image in target_images(images, image_index, image, target) {
                 raw_calls
                     .entry(BankAddr::new(&target_image.bank, target))
                     .or_default()
@@ -349,7 +416,7 @@ fn detect_reachable_call_targets(
                 continue;
             };
             for &target in &resolution.targets {
-                for target_image in target_images(images, image, target) {
+                for target_image in target_images(images, image_index, image, target) {
                     claims.push(ProviderClaim {
                         target: BankAddr::new(&target_image.bank, target),
                         detector: CandidateDetector::IndirectCallTarget,
@@ -373,7 +440,7 @@ fn detect_reachable_call_targets(
         // pass subsumes reachable sites; deterministic merge deduplicates
         // the overlap by target + evidence.
         for resolved in resolve_linear_jalr_sites(&image.bytes, image.va_start) {
-            for target_image in target_images(images, image, resolved.target) {
+            for target_image in target_images(images, image_index, image, resolved.target) {
                 claims.push(ProviderClaim {
                     target: BankAddr::new(&target_image.bank, resolved.target),
                     detector: CandidateDetector::IndirectCallTarget,
@@ -460,6 +527,7 @@ fn initial_copy_leaf_targets(images: &[LoadImage], target: u32) -> Vec<&LoadImag
 /// resident code image occupying the same VA has not yet been discovered.
 fn target_images<'a>(
     images: &'a [LoadImage],
+    image_index: &LoadImageIndex,
     source: &'a LoadImage,
     target: u32,
 ) -> Vec<&'a LoadImage> {
@@ -470,10 +538,12 @@ fn target_images<'a>(
     if contains_backed_target(&source) {
         return vec![source];
     }
-    images
-        .iter()
-        .filter(|candidate| candidate.bank != crate::banks::BOOT_BANK)
-        .filter(contains_backed_target)
+    image_index
+        .containing(images, target)
+        .into_iter()
+        .filter(|candidate| {
+            candidate.bank != crate::banks::BOOT_BANK || candidate.bank == source.bank
+        })
         .collect()
 }
 
