@@ -9,3 +9,7 @@ examples/*/target-c
 # these evidence-only/untracked -- this is what enforces it (no game content
 # in git, per AGENTS.md).
 /.eyegate/
+
+# Compiled mupen debug/trace drivers (build artifacts, never committed)
+tools/mupen-bfs/mupen_bfs
+tools/mupen-trace/mupen_trace

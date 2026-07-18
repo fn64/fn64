@@ -31,6 +31,10 @@ name = "gate_d1"
 path = "src/bin/gate_d1.rs"
 
 [[bin]]
+name = "gate_d1_overlays"
+path = "src/bin/gate_d1_overlays.rs"
+
+[[bin]]
 name = "fn64-discover"
 path = "src/bin/fn64_discover.rs"
 

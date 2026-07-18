@@ -334,6 +334,221 @@ pub struct LoadImageTableInput {
     pub bank_name: Option<BankNamePattern>,
 }
 
+/// Turn one uniquely admitted ROM-only overlay-table recovery into the same
+/// proven bank-qualified load-image representation as an explicitly located
+/// descriptor table.
+///
+/// Recovery is authoritative only when exactly one distinct table survives.
+/// Within that table, a record becomes a proven mapping only when its own
+/// delta vote is admitted and the inferred VA exactly equals the destination
+/// independently parsed from the descriptor record. A delta vote by itself
+/// remains candidate evidence; the agreement of two separately derived
+/// fields under a unique table admission is the proof rule.
+pub fn scan_recovered_overlay_regions(
+    rom: &NormalizedRom,
+    recovery: &crate::overlay_regions::OverlayRecovery,
+    table_name: &str,
+    bank_name: &BankNamePattern,
+    db: &mut FactDb,
+) -> Vec<String> {
+    assert!(
+        !table_name.trim().is_empty(),
+        "recovered overlay table name must not be empty"
+    );
+
+    let admitted: Vec<_> = recovery
+        .admissions
+        .iter()
+        .filter(|admission| admission.admitted)
+        .collect();
+    let table_subject = format!("load-image-table:{table_name}");
+    let selection = db.insert(Fact::Evidence {
+        subject: BankAddr::new(
+            table_name,
+            admitted
+                .first()
+                .map_or(0, |admission| admission.table.table_rom_offset),
+        ),
+        note: format!(
+            "ROM-only descriptor-family recovery: {} distinct candidate table(s), {} admitted by delta_vote",
+            recovery.candidate_tables.len(),
+            admitted.len()
+        ),
+    });
+
+    let [admission] = admitted.as_slice() else {
+        let (state, rule) = if admitted.is_empty() {
+            (
+                ProofState::Open,
+                "recovered_overlay_table_has_no_unique_admission",
+            )
+        } else {
+            (
+                ProofState::Conflict,
+                "recovered_overlay_table_has_multiple_admissions",
+            )
+        };
+        db.conclude(table_subject, state, vec![selection], rule)
+            .expect("first conclusion for recovered overlay table");
+        return Vec::new();
+    };
+
+    assert_eq!(
+        admission.table.records.len(),
+        admission.region_deltas.len(),
+        "overlay recovery must report one delta outcome per record"
+    );
+    assert_eq!(
+        admission.mapped_regions as usize,
+        admission
+            .region_deltas
+            .iter()
+            .filter(|delta| delta.is_some())
+            .count(),
+        "overlay recovery mapped_regions must match its delta outcomes"
+    );
+
+    let table = &admission.table;
+    let mut accepted_banks = Vec::new();
+    let mut table_evidence = vec![selection];
+    for (index, (record, delta_outcome)) in table
+        .records
+        .iter()
+        .zip(&admission.region_deltas)
+        .enumerate()
+    {
+        let index = index as u32;
+        let bank = bank_name.name(index);
+        let record_subject = load_image_table_record_subject(table_name, index);
+        let Some(byte_len) = record.rom_end.checked_sub(record.rom_start) else {
+            conclude_record_and_bank(
+                db,
+                &record_subject,
+                Some(&bank),
+                ProofState::Rejected,
+                vec![selection],
+                "recovered_overlay_record_inverted",
+            );
+            continue;
+        };
+        let destination_end = record.vram_dest.checked_add(byte_len);
+        let interval_valid = byte_len != 0
+            && record.rom_end <= rom.len() as u32
+            && record.rom_start.is_multiple_of(4)
+            && record.rom_end.is_multiple_of(4)
+            && record.vram_dest.is_multiple_of(4)
+            && destination_end.is_some();
+        let destination_end = destination_end.unwrap_or(record.vram_dest);
+
+        let record_fact = db.insert(Fact::LoadImageTableRecord {
+            table: table_name.to_string(),
+            bank: Some(bank.clone()),
+            table_space: RomAddressSpace::Physical,
+            table_offset: table.table_rom_offset,
+            index,
+            source_space: MappingAddressSpace::PhysicalRom,
+            source_start: record.rom_start,
+            source_end: record.rom_end,
+            destination_space: MappingAddressSpace::Vram,
+            destination_start: record.vram_dest,
+            destination_end,
+        });
+        let delta_note = match delta_outcome {
+            Some((delta, va_start)) => {
+                format!("delta=0x{delta:08x}, inferred VA=0x{va_start:08x}")
+            }
+            None => "delta_vote remained open".to_string(),
+        };
+        let provenance = db.insert(Fact::Evidence {
+            subject: BankAddr::new(&bank, record.vram_dest),
+            note: format!(
+                "uniquely admitted ROM-only descriptor table at 0x{:x}, record {index}: ROM [0x{:x},0x{:x}) -> descriptor VA 0x{:08x}; {delta_note}",
+                table.table_rom_offset,
+                record.rom_start,
+                record.rom_end,
+                record.vram_dest,
+            ),
+        });
+        let mut evidence = vec![selection, record_fact, provenance];
+        table_evidence.extend([record_fact, provenance]);
+
+        if !interval_valid {
+            conclude_record_and_bank(
+                db,
+                &record_subject,
+                Some(&bank),
+                ProofState::Rejected,
+                evidence,
+                "recovered_overlay_record_malformed",
+            );
+            continue;
+        }
+
+        let Some((delta, va_start)) = *delta_outcome else {
+            conclude_record_and_bank(
+                db,
+                &record_subject,
+                Some(&bank),
+                ProofState::Open,
+                evidence,
+                "recovered_overlay_record_delta_open",
+            );
+            continue;
+        };
+        if record.rom_start.wrapping_add(delta) != va_start || va_start != record.vram_dest {
+            conclude_record_and_bank(
+                db,
+                &record_subject,
+                Some(&bank),
+                ProofState::Conflict,
+                evidence,
+                "recovered_overlay_delta_conflicts_with_descriptor_destination",
+            );
+            continue;
+        }
+
+        let mapping = db.insert(Fact::RomMapping {
+            bank: bank.clone(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: record.rom_start,
+            rom_end: record.rom_end,
+            va_start,
+            va_end: destination_end,
+        });
+        evidence.push(mapping);
+        db.conclude(
+            &record_subject,
+            ProofState::Proven,
+            evidence.clone(),
+            "unique_recovered_overlay_record_with_matching_delta_and_destination",
+        )
+        .expect("first conclusion for recovered overlay record");
+        db.conclude(
+            format!("bank:{bank}"),
+            ProofState::Proven,
+            evidence,
+            "unique_recovered_overlay_record_with_matching_delta_and_destination",
+        )
+        .expect("first conclusion for recovered overlay bank");
+        surface_mapping_conflicts(db, record_fact);
+        if db
+            .conclusion(&format!("bank:{bank}"))
+            .is_some_and(|conclusion| conclusion.state == ProofState::Proven)
+        {
+            accepted_banks.push(bank);
+        }
+    }
+
+    db.conclude(
+        table_subject,
+        ProofState::Proven,
+        table_evidence,
+        "unique_recovered_overlay_table_admission",
+    )
+    .expect("first conclusion for recovered overlay table");
+    accepted_banks
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializedRomRange {
     pub bytes: Vec<u8>,
@@ -1284,6 +1499,141 @@ mod tests {
                 ProofState::Conflict
             );
         }
+        assert!(db.proven_rom_mappings().is_empty());
+    }
+
+    fn recovered_table(
+        table_rom_offset: u32,
+        rom_start: u32,
+        vram_dest: u32,
+        inferred_va: u32,
+    ) -> crate::overlay_regions::TableAdmission {
+        let table = crate::overlay_regions::CandidateTable {
+            table_rom_offset,
+            record_stride: 0x24,
+            field_rom_start: 0x18,
+            field_rom_end: 0x1c,
+            field_vram_dest: 0x20,
+            records: vec![crate::overlay_regions::CandidateRecord {
+                rom_start,
+                rom_end: rom_start + 0x1000,
+                vram_dest,
+            }],
+        };
+        crate::overlay_regions::TableAdmission {
+            table,
+            region_deltas: vec![Some((inferred_va.wrapping_sub(rom_start), inferred_va))],
+            mapped_regions: 1,
+            admitted: true,
+        }
+    }
+
+    fn recovery_with(
+        admissions: Vec<crate::overlay_regions::TableAdmission>,
+    ) -> crate::overlay_regions::OverlayRecovery {
+        crate::overlay_regions::OverlayRecovery {
+            config: crate::overlay_regions::SearchConfig::aki_family(),
+            delta_config: crate::delta_vote::DeltaVoteConfig::default(),
+            min_mapped_regions: 1,
+            candidate_tables: admissions
+                .iter()
+                .map(|admission| admission.table.clone())
+                .collect(),
+            admissions,
+        }
+    }
+
+    #[test]
+    fn unique_recovered_table_with_matching_delta_proves_load_image() {
+        let rom = make_test_rom(0x8000_0400, 0x5000);
+        let recovery = recovery_with(vec![recovered_table(
+            0x1800,
+            0x2000,
+            0x8010_0000,
+            0x8010_0000,
+        )]);
+        let mut db = FactDb::new();
+        let banks = scan_recovered_overlay_regions(
+            &rom,
+            &recovery,
+            "recovered_overlays",
+            &BankNamePattern::new("overlay_", 0, ""),
+            &mut db,
+        );
+
+        assert_eq!(banks, ["overlay_0"]);
+        assert_eq!(
+            db.conclusion("bank:overlay_0").unwrap().state,
+            ProofState::Proven
+        );
+        assert_eq!(
+            db.conclusion(&load_image_table_record_subject("recovered_overlays", 0))
+                .unwrap()
+                .state,
+            ProofState::Proven
+        );
+        assert!(db.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::RomMapping {
+                bank,
+                rom_start: 0x2000,
+                rom_end: 0x3000,
+                va_start: 0x8010_0000,
+                va_end: 0x8010_1000,
+                ..
+            } if bank == "overlay_0"
+        )));
+    }
+
+    #[test]
+    fn recovered_delta_disagreeing_with_descriptor_stays_conflict() {
+        let rom = make_test_rom(0x8000_0400, 0x5000);
+        let recovery = recovery_with(vec![recovered_table(
+            0x1800,
+            0x2000,
+            0x8010_0000,
+            0x8010_1000,
+        )]);
+        let mut db = FactDb::new();
+        let banks = scan_recovered_overlay_regions(
+            &rom,
+            &recovery,
+            "recovered_overlays",
+            &BankNamePattern::new("overlay_", 0, ""),
+            &mut db,
+        );
+
+        assert!(banks.is_empty());
+        assert_eq!(
+            db.conclusion("bank:overlay_0").unwrap().state,
+            ProofState::Conflict
+        );
+        assert!(db.proven_rom_mappings().is_empty());
+    }
+
+    #[test]
+    fn multiple_recovered_table_admissions_map_nothing() {
+        let rom = make_test_rom(0x8000_0400, 0x5000);
+        let recovery = recovery_with(vec![
+            recovered_table(0x1800, 0x2000, 0x8010_0000, 0x8010_0000),
+            recovered_table(0x1900, 0x3000, 0x8020_0000, 0x8020_0000),
+        ]);
+        let mut db = FactDb::new();
+        let banks = scan_recovered_overlay_regions(
+            &rom,
+            &recovery,
+            "recovered_overlays",
+            &BankNamePattern::new("overlay_", 0, ""),
+            &mut db,
+        );
+
+        assert!(banks.is_empty());
+        assert_eq!(
+            db.conclusion("load-image-table:recovered_overlays")
+                .unwrap()
+                .state,
+            ProofState::Conflict
+        );
         assert!(db.proven_rom_mappings().is_empty());
     }
 }
