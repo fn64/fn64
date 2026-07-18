@@ -409,6 +409,31 @@ mapping translation are still open.
 - Treat observed indirect targets as non-exhaustive.
 - Generate targeted scenarios from the unresolved frontier.
 
+Producer v1 exists (2026-07-18): `tools/mupen-trace/mupen_trace.c` drives the
+DEBUGGER=1 mupen64plus-core 2.6.0 build in documented single-step mode through
+the public `m64p_debug` API only, and emits schema-v1 JSONL — digest-bound
+header, bounded executed-PC window from the entrypoint, watched-value
+transition records for the NW4E selector flag/mode cells (observed values
+only, no fabricated write-PC attribution), and a completion record whose
+exhaustiveness claim covers executed PCs alone. A 500,000-step NW4E boot
+capture is byte-identical across three runs (SHA-256 `c19fd46c…`). The
+watched cells hold boot-copy residue until the entry stub's zero-fill sweeps
+them (mode at sequence 167,912, flag at 191,088) — independently confirming
+the earlier "transient" explanation; the dispatcher's own stores lie beyond
+this bounded window. `gate_trace` (env-declared ROM + trace paths, 10/10
+byte-identical) ingests 500,004 facts through the existing path and
+classifies 1,868 unique observed resident PCs against the static baseline:
+639 inside proven-closure code, 1,035 corroborating exploratory candidate
+words, 194 previously-unclassified words of new code-existence evidence, and
+zero static-versus-execution conflicts; three unknown-bank PCs are the
+general exception vector. Honest frontier: trace observations still have no
+`FactDb` adapter (measured ingestion delta on the database is zero facts);
+reaching overlay loads and dispatcher flag stores needs a
+breakpoint-accelerated skip phase (~10 µs/step makes deep single-stepping
+impractical); write-PC attribution needs the untried write-breakpoint
+mechanism. Traces contain executed-PC sequences from a user's ROM and stay
+out of git.
+
 ### 5. Function entries and ownership
 
 - Promote direct calls only when their source instruction is proven code.
@@ -642,6 +667,8 @@ table consolidates, it does not re-measure.
 | Reached-closure executable regions | 32/45 owners admitted (boot bank) | n/m | exact owners 0 → 20/27, wrong=0 held | adopted |
 | Pack execution harness | n/m | n/m | round trip executed; typed faults/budget/hole validated (depth, not P/R) | adopted (validation) |
 | Ghidra conformance | synthetic banks only so far | n/m | n/m | candidate-only |
+| Trace producer v1 (500k-step boot window) | n/m | 639 proven-code PCs re-observed, 1,035 candidate words corroborated, 194 previously-unclassified words, 0 conflicts | n/m | adopted (candidate/observed evidence; no FactDb adapter yet) |
+| Answer-key corpus intake | n/m | n/m | n/m | infrastructure only: Banjo 60-row override key parsed (55 fn), PD key absent upstream — no grading yet (ROMs not present) |
 
 Maintenance rule: every future experiment lands a row here in the same
 commit as its adoption or rejection, with its per-ROM cells filled or
@@ -672,6 +699,20 @@ tooling but **no license** — symbol-metadata extraction from them is held
 until a rights check; GoldenEye is ranked last (89.1%, no license, active
 rights disputes around the title). Keys require the user's own ROMs to
 grade against; ingestion tooling ships with loud env-declared skips.
+
+Corrections measured during intake (2026-07-18, same day): Perfect Dark has
+NO splat `symbol_addrs` table at its repo root — the survey's claim was
+falsified by direct fetch (its symbols live in `ld/*.inc` for an armips
+build; map/linker-script extraction is the follow-up). Banjo-Kazooie's root
+`symbol_addrs.us.v10.txt` is a 60-row hand-maintained override list, not the
+full per-function boundary table; it is vendored with provenance
+(`testdata/answer_keys/LICENSES.md`) and parsed by `gate_keys`, but full
+Banjo boundary ground truth also needs deeper extraction. ares v148 has no
+headless video mode, no CLI trace toggle, no savestate-save trigger, and no
+input-replay subsystem (verified by reading its ISC source), and its
+first-launch Gatekeeper prompt blocked sandboxed execution entirely, so
+n64-systemtest results under ares remain uncollected; the DEBUGGER=1
+mupen64plus core stays the working automation vehicle.
 
 # Phase unlock ledger
 

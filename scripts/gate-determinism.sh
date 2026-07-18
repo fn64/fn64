@@ -23,6 +23,8 @@ runs=${1:-10}
 # the same commit, with the evidence for why the output moved.
 expected_loaders=5a67f5e471bad44bbb85aba27decd4ac831d93f2a24f0de1b329c3393bfec921
 expected_selector=b53b25c7dd0a92dda59182f78f5c3ac0e0147124ea19941516da92a391679290
+# gate_keys in the ROMs-absent (parse-only) configuration.
+expected_keys=d3c0dfbeb85b3042b55f4d896d69c111d5e8d7c0ec3fe513ac7dfd679903af71
 # gate_coverage renders the metric ladder for every supplied ROM; its digest is
 # only fixed when all three ROM vars are set, since an unset var is a loud skip
 # line that legitimately changes the output.
@@ -58,6 +60,10 @@ check_gate() {
 
 check_gate gate_loaders "$expected_loaders"
 check_gate gate_selector "$expected_selector"
+# gate_keys parses the vendored answer-key tables; with the grading ROMs
+# absent (FN64_DISCOVER_BANJO_ROM/PD_ROM unset) it is a deterministic
+# parse-and-count run whose digest is fixed by the vendored table bytes.
+check_gate gate_keys "$expected_keys"
 
 if [ "${FN64_DISCOVER_OOT_ROM:-}" != "" ]; then
     check_gate gate_coverage "$expected_coverage"
