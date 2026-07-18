@@ -175,6 +175,17 @@ pub type DescriptorTableInput = (banks::DescriptorTableShape, fn(u32) -> String)
 /// resulting fact database. This is the crate's single deterministic
 /// entry point: calling it twice on byte-identical input must produce a
 /// byte-identical `FactDb` (enforced by `tests/determinism.rs`).
+/// Resolve a required out-of-tree input path from the environment, loudly.
+///
+/// Gate binaries consume user-owned inputs (ROMs, reference dumps) that must
+/// never default to someone's home directory (DESIGN.md section 1.0: named
+/// and declared, or absent with a loud error). `what` names the expected
+/// content so the error message is actionable.
+pub fn required_env_path(variable: &str, what: &str) -> Result<String, String> {
+    std::env::var(variable)
+        .map_err(|_| format!("{variable} is required: set it to the path of {what}"))
+}
+
 ///
 /// `descriptor_table` is optional because not every N64 title has one
 /// (OoT does not; NW4E and other AKI-family titles do) -- passing `None`

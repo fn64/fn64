@@ -15,11 +15,9 @@ use fn64_discover::grade_oot::{grade_against_oot, parse_segments_csv};
 use fn64_discover::{banks, run_discovery, DescriptorTableInput};
 use std::path::Path;
 
-const OOT_ROM: &str = "/Users/jer/Downloads/Legend of Zelda, The - Ocarina of Time (USA).z64";
-const OOT_SEGMENTS_CSV: &str =
-    "/Users/jer/Code/aki-recomp/refs/oot-decomp/baseroms/ntsc-1.0/segments.csv";
-const NW4E_ROM: &str = "/Users/jer/Code/aki-recomp/games/NW4E/nomercy.z64";
-const NW4E_OVERLAYS_JSON: &str = "/Users/jer/Code/aki-recomp/games/NW4E/overlays.json";
+fn required(variable: &str, what: &str) -> Result<String, String> {
+    fn64_discover::required_env_path(variable, what)
+}
 
 /// NW4E's overlay descriptor table, per `games/NW4E/overlays.json`'s own
 /// provenance comment: five fixed 9-word x 0x24-byte records at ROM
@@ -69,7 +67,8 @@ fn main() {
 }
 
 fn run_oot_gate() -> Result<f64, String> {
-    let rom_bytes = std::fs::read(OOT_ROM).map_err(|e| format!("reading {OOT_ROM}: {e}"))?;
+    let oot_rom = required("FN64_DISCOVER_OOT_ROM", "an OoT NTSC 1.0 .z64")?;
+    let rom_bytes = std::fs::read(&oot_rom).map_err(|e| format!("reading {oot_rom}: {e}"))?;
     let (rom, db) =
         run_discovery(&rom_bytes, None).map_err(|e| format!("normalizing OoT ROM: {e}"))?;
 
@@ -79,8 +78,12 @@ fn run_oot_gate() -> Result<f64, String> {
         rom.header.entry_point, rom.header.name
     );
 
-    let csv = std::fs::read_to_string(OOT_SEGMENTS_CSV)
-        .map_err(|e| format!("reading {OOT_SEGMENTS_CSV}: {e}"))?;
+    let segments_csv = required(
+        "FN64_DISCOVER_OOT_SEGMENTS_CSV",
+        "the OoT decomp baserom segments.csv answer key",
+    )?;
+    let csv = std::fs::read_to_string(&segments_csv)
+        .map_err(|e| format!("reading {segments_csv}: {e}"))?;
     let answer_key = parse_segments_csv(&csv);
     if !answer_key.skipped.is_empty() {
         println!(
@@ -102,10 +105,11 @@ fn run_oot_gate() -> Result<f64, String> {
 }
 
 fn run_nw4e_gate() -> Result<(), String> {
-    if !Path::new(NW4E_ROM).exists() {
-        return Err(format!("{NW4E_ROM} not found"));
+    let nw4e_rom = required("FN64_DISCOVER_NW4E_ROM", "the NW4E .z64")?;
+    if !Path::new(&nw4e_rom).exists() {
+        return Err(format!("{nw4e_rom} not found"));
     }
-    let rom_bytes = std::fs::read(NW4E_ROM).map_err(|e| format!("reading {NW4E_ROM}: {e}"))?;
+    let rom_bytes = std::fs::read(&nw4e_rom).map_err(|e| format!("reading {nw4e_rom}: {e}"))?;
     let shape = nw4e_descriptor_table_shape();
     let (rom, db) = run_discovery(&rom_bytes, Some((shape, |i| format!("R{}", i + 1))))
         .map_err(|e| format!("normalizing NW4E ROM: {e}"))?;
@@ -121,8 +125,9 @@ fn run_nw4e_gate() -> Result<(), String> {
             .map(|c| c.state)
     );
 
-    let json = std::fs::read_to_string(NW4E_OVERLAYS_JSON)
-        .map_err(|e| format!("reading {NW4E_OVERLAYS_JSON}: {e}"))?;
+    let overlays_json = required("FN64_DISCOVER_NW4E_OVERLAYS", "the NW4E overlays.json")?;
+    let json = std::fs::read_to_string(&overlays_json)
+        .map_err(|e| format!("reading {overlays_json}: {e}"))?;
     let answer_banks = parse_overlays_json(&json).map_err(|e| e.to_string())?;
 
     let report = cross_check_nw4e(&db, &answer_banks);
@@ -138,11 +143,13 @@ fn run_nw4e_gate() -> Result<(), String> {
 }
 
 fn run_determinism_gate() -> Result<(), String> {
+    let oot_rom = required("FN64_DISCOVER_OOT_ROM", "an OoT NTSC 1.0 .z64")?;
+    let nw4e_rom = required("FN64_DISCOVER_NW4E_ROM", "the NW4E .z64")?;
     for (label, path, descriptor) in [
-        ("OoT", OOT_ROM, None::<DescriptorTableInput>),
+        ("OoT", oot_rom.as_str(), None::<DescriptorTableInput>),
         (
             "NW4E",
-            NW4E_ROM,
+            nw4e_rom.as_str(),
             Some((
                 nw4e_descriptor_table_shape(),
                 (|i: u32| format!("R{}", i + 1)) as fn(u32) -> String,

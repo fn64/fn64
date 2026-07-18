@@ -47,7 +47,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const OOT_ROM: &str = "/Users/jer/Downloads/Legend of Zelda, The - Ocarina of Time (USA).z64";
+fn required(variable: &str, what: &str) -> Result<String, String> {
+    fn64_discover::required_env_path(variable, what)
+}
 const OOT_BOOT_FUNCTIONS_CSV: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/testdata/oot_boot_functions.csv"
@@ -59,7 +61,6 @@ const OOT_BOOT_FUNCTIONS_CSV: &str = concat!(
 /// ends, not a discovered value).
 const OOT_BOOT_CODE_END: u32 = 0x8000_6230;
 
-const NW4E_ROM: &str = "/Users/jer/Code/aki-recomp/games/NW4E/nomercy.z64";
 /// NW4E's `overlays.json` `resident.main_entry_vram` -- a prior
 /// byte-verified RE fact (scan.py section 2). It is NO LONGER a pipeline
 /// input: Phase 6's bounded HI/LO resolver ([`build_cfg_closed_with_facts`]) now
@@ -73,7 +74,6 @@ const NW4E_SYMBOL_ADDRS: &str = concat!(
     "/testdata/nw4e_hand_fixed_symbol_addrs.txt"
 );
 
-const NWXE_ROM: &str = "/Users/jer/Code/aki-recomp/games/NWXE/wm2000.z64";
 const NWXE_MD5: &str = "d9030ca30e4d1af805acce1bfed988cc";
 const NWXE_MAIN_ENTRY_VRAM: u32 = 0x8000_0460;
 const NWXE_BOOT_FUNCTIONS_CSV: &str = concat!(
@@ -258,7 +258,8 @@ fn print_owner_admission(
 /// unresolved function pointers remain `open`; that is a reported limitation,
 /// not a hidden one.
 fn run_oot_function_gate() -> Result<(), String> {
-    let rom_bytes = std::fs::read(OOT_ROM).map_err(|e| format!("reading {OOT_ROM}: {e}"))?;
+    let oot_rom = required("FN64_DISCOVER_OOT_ROM", "an OoT NTSC 1.0 .z64")?;
+    let rom_bytes = std::fs::read(&oot_rom).map_err(|e| format!("reading {oot_rom}: {e}"))?;
     let (rom, db) =
         run_discovery(&rom_bytes, None).map_err(|e| format!("normalizing OoT ROM: {e}"))?;
     println!("OoT ROM: {} bytes, sha256={}", rom.len(), rom.sha256);
@@ -440,10 +441,11 @@ fn run_oot_function_gate() -> Result<(), String> {
 /// doc's "honest limit" -- what's gated here is that the mechanism runs
 /// end-to-end on real bytes and reports a real, non-fabricated count.
 fn run_nw4e_grind_collapse_gate() -> Result<(), String> {
-    if !Path::new(NW4E_ROM).exists() {
-        return Err(format!("{NW4E_ROM} not found"));
+    let nw4e_rom = required("FN64_DISCOVER_NW4E_ROM", "the NW4E .z64")?;
+    if !Path::new(&nw4e_rom).exists() {
+        return Err(format!("{nw4e_rom} not found"));
     }
-    let rom_bytes = std::fs::read(NW4E_ROM).map_err(|e| format!("reading {NW4E_ROM}: {e}"))?;
+    let rom_bytes = std::fs::read(&nw4e_rom).map_err(|e| format!("reading {nw4e_rom}: {e}"))?;
     let shape = nw4e_descriptor_table_shape();
     let descriptor: DescriptorTableInput = (shape, |i: u32| format!("R{}", i + 1));
     let (rom, db) = run_discovery(&rom_bytes, Some(descriptor))
@@ -570,10 +572,11 @@ fn run_nw4e_grind_collapse_gate() -> Result<(), String> {
 /// header entrypoint seeds the CFG. The expected resident entry and symbol
 /// catalog are assertions over the resulting output, never discovery input.
 fn run_nwxe_function_gate() -> Result<(), String> {
-    if !Path::new(NWXE_ROM).exists() {
-        return Err(format!("{NWXE_ROM} not found"));
+    let nwxe_rom = required("FN64_DISCOVER_NWXE_ROM", "the NWXE .z64")?;
+    if !Path::new(&nwxe_rom).exists() {
+        return Err(format!("{nwxe_rom} not found"));
     }
-    let rom_bytes = std::fs::read(NWXE_ROM).map_err(|e| format!("reading {NWXE_ROM}: {e}"))?;
+    let rom_bytes = std::fs::read(&nwxe_rom).map_err(|e| format!("reading {nwxe_rom}: {e}"))?;
     let (rom, db) =
         run_discovery(&rom_bytes, None).map_err(|e| format!("normalizing NWXE ROM: {e}"))?;
     println!(
