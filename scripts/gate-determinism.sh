@@ -37,6 +37,11 @@ expected_overlay_regions=471181f20c5add3b7478e7ea65626bc8417126b33e6b9c0a5e200dd
 # gate_d1_overlays: NWXE boot-only versus mechanically recovered overlays.
 # The dump is grading-only and opens after both discovery runs complete.
 expected_d1_overlays=9b0dc15f92aac10586edf98a02873c0acfc57f4ff6f00f857546fcb1ec1c4440
+# gate_d1_oot_overlays: OoT three-way A/B/C grade (boot-only vs mechanically
+# recovered VROM overlays vs hand-supplied table geometry). B reaches
+# 99.46%/48.45% — 67% of C's hand-geometry recall at matching precision.
+# Held-out (OoT dump opens after all three discovery runs).
+expected_d1_oot_overlays=ac60619581fa8b5526549929f320ebe19d84a02908ec43e2fa34dc1e2412ede9
 # gate_owners_overlays: exact-owner proof on the recovered NWXE overlay banks
 # (6 owners, 0 wrong extents). Dump is grading-only, opened after proof. The
 # digest moved when Phase-6 indirect closure strengthened: unresolved_indirect
@@ -137,6 +142,11 @@ fi
 if [ "${FN64_DISCOVER_OOT_ROM:-}" != "" ]; then
     check_gate gate_coverage "$expected_coverage"
     check_gate gate_b2 "$expected_b2"
+    if [ "${FN64_DISCOVER_OOT_DUMP:-}" != "" ]; then
+        check_gate gate_d1_oot_overlays "$expected_d1_oot_overlays"
+    else
+        echo "gate_d1_oot_overlays: skipped (FN64_DISCOVER_OOT_DUMP unset)"
+    fi
     b2_out=$(cargo run --quiet --manifest-path "$repo/Cargo.toml" -p fn64-discover --bin gate_b2)
     case "$b2_out" in
         *"sha256=$expected_nwxe_pack"*)
