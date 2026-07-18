@@ -78,6 +78,9 @@ impl Overlay {
     pub fn toggle(&mut self) {
         self.open = !self.open;
         self.capture = None;
+        // Undrained mouse events from the closing frame would replay into
+        // the next open.
+        self.events.clear();
     }
 
     /// Translate the few winit window events egui needs. Call for every
