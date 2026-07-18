@@ -35,6 +35,10 @@ name = "gate_d1_overlays"
 path = "src/bin/gate_d1_overlays.rs"
 
 [[bin]]
+name = "gate_d1_oot_overlays"
+path = "src/bin/gate_d1_oot_overlays.rs"
+
+[[bin]]
 name = "gate_owners_overlays"
 path = "src/bin/gate_owners_overlays.rs"
 

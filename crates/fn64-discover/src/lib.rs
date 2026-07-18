@@ -205,6 +205,21 @@ pub struct RecoveredOverlayInput {
     pub bank_name: banks::BankNamePattern,
 }
 
+/// Configuration and deterministic naming for the two-stage file-table/VROM
+/// overlay recovery path. Every table location and record geometry consumed
+/// downstream is copied from [`overlay_regions::VromOverlayRecovery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredVromOverlayInput {
+    pub search: overlay_regions::SearchConfig,
+    pub delta_vote: delta_vote::DeltaVoteConfig,
+    pub file_table_search: file_table::FileTableSearchConfig,
+    pub vrom_min_records: u32,
+    pub min_mapped_regions: u32,
+    pub file_table_name: String,
+    pub table_name: String,
+    pub bank_name: banks::BankNamePattern,
+}
+
 /// Run every currently-implemented discovery phase (1: normalize, 2: boot
 /// bank + optional descriptor-table scan, 3: candidate harvest) over `rom_bytes` and return the
 /// resulting fact database. This is the crate's single deterministic
@@ -282,6 +297,132 @@ pub fn run_discovery_with_recovered_overlay_regions(
     Ok((rom, db, recovery))
 }
 
+/// Run discovery with VROM-located overlay tables recovered mechanically
+/// through a mechanically recovered physical file table.
+///
+/// The recovery stage admits descriptor tables through its delta-vote rule.
+/// This adapter then expresses only records whose own delta-derived VA agrees
+/// exactly with the independently parsed descriptor destination, plus the
+/// uniquely admitted file table that makes their VROM bytes materializable,
+/// as generalized load-image shapes already consumed by Phase 2. No table
+/// location, stride, field offset, record count, or destination address is a
+/// caller-supplied game fact.
+pub fn run_discovery_with_recovered_vrom_overlay_regions(
+    rom_bytes: &[u8],
+    input: &RecoveredVromOverlayInput,
+) -> Result<(NormalizedRom, FactDb, overlay_regions::VromOverlayRecovery), RomRejectReason> {
+    use banks::{
+        DestinationEnd, DestinationRangeFields, DestinationSpace, LoadImageTableInput,
+        LoadImageTableShape, SourceRangeFields, TableLocation,
+    };
+
+    let rom = rom::normalize(rom_bytes)?;
+    let recovery = overlay_regions::recover_vrom_overlay_regions(
+        &rom.bytes,
+        &input.search,
+        &input.delta_vote,
+        &input.file_table_search,
+        input.vrom_min_records,
+        input.min_mapped_regions,
+    );
+    let mut recovered_inputs = Vec::new();
+
+    if let Some(table) = &recovery.file_table.admitted_table {
+        recovered_inputs.push(LoadImageTableInput {
+            name: input.file_table_name.clone(),
+            shape: LoadImageTableShape {
+                location: TableLocation {
+                    space: RomAddressSpace::Physical,
+                    offset: table.table_rom_offset,
+                },
+                record_count: table.records.len() as u32,
+                record_stride: table.record_stride,
+                source: SourceRangeFields {
+                    space: RomAddressSpace::Virtual,
+                    field_start: table.field_vrom_start,
+                    field_end: table.field_vrom_end,
+                },
+                destination: DestinationRangeFields {
+                    space: DestinationSpace::PhysicalRom,
+                    field_start: table.field_rom_start,
+                    end: DestinationEnd::FieldOrSourceLength(table.field_rom_end),
+                },
+            },
+            bank_name: None,
+        });
+    }
+
+    let mut recovered_bank_index = 0u32;
+    for (table_index, admission) in recovery
+        .admissions
+        .iter()
+        .filter(|admission| admission.admitted)
+        .enumerate()
+    {
+        let table = &admission.table;
+        assert_eq!(
+            table.records.len(),
+            admission.region_deltas.len(),
+            "VROM overlay recovery must report one delta outcome per record"
+        );
+        for (record_index, (record, delta_outcome)) in table
+            .records
+            .iter()
+            .zip(&admission.region_deltas)
+            .enumerate()
+        {
+            let Some((delta, va_start)) = *delta_outcome else {
+                continue;
+            };
+            if record.rom_start.wrapping_add(delta) != va_start || va_start != record.vram_dest {
+                continue;
+            }
+            let record_offset = (record_index as u32)
+                .checked_mul(table.record_stride)
+                .and_then(|offset| table.table_vrom_offset.checked_add(offset))
+                .expect("recovered VROM table record location overflowed u32");
+            recovered_inputs.push(LoadImageTableInput {
+                name: format!("{}_{}_{}", input.table_name, table_index, record_index),
+                shape: LoadImageTableShape {
+                    location: TableLocation {
+                        space: RomAddressSpace::Virtual,
+                        offset: record_offset,
+                    },
+                    record_count: 1,
+                    record_stride: table.record_stride,
+                    source: SourceRangeFields {
+                        space: RomAddressSpace::Virtual,
+                        field_start: table.field_rom_start,
+                        field_end: table.field_rom_end,
+                    },
+                    destination: DestinationRangeFields {
+                        space: DestinationSpace::Vram,
+                        field_start: table.field_vram_dest,
+                        end: DestinationEnd::SourceLength,
+                    },
+                },
+                bank_name: Some(banks::BankNamePattern {
+                    prefix: input.bank_name.prefix.clone(),
+                    suffix: input.bank_name.suffix.clone(),
+                    index_base: input
+                        .bank_name
+                        .index_base
+                        .checked_add(recovered_bank_index)
+                        .expect("recovered overlay bank index overflowed u32"),
+                }),
+            });
+            recovered_bank_index += 1;
+        }
+    }
+
+    let mut db = FactDb::new();
+    banks::discover_boot_bank(&rom, &mut db);
+    banks::scan_load_image_tables(&rom, &recovered_inputs, &mut db);
+    harvest::harvest_discovered_candidates(&rom, &mut db)
+        .expect("Phase 2 produced a malformed recovered VROM overlay mapping");
+    Ok((rom, db, recovery))
+}
+
 /// Run discovery from a serializable external evidence manifest. The
 /// manifest is checked against the normalized ROM SHA-256 before any claim is
 /// consumed. It may describe mappings and executable intervals, but never
@@ -313,6 +454,31 @@ mod tests {
         buf[0x20..0x24].copy_from_slice(b"TEST");
         buf[0x3b..0x3f].copy_from_slice(b"CTSE");
         buf
+    }
+
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn plant_delta_admissible_region(bytes: &mut [u8], physical_start: usize, va_start: u32) {
+        let jal = |target: u32| 0x0c00_0000 | ((target >> 2) & 0x03ff_ffff);
+        for (offset, target_offset) in [(0, 0x40), (8, 0x90), (16, 0x100)] {
+            put_u32(
+                bytes,
+                physical_start + offset,
+                jal(va_start + target_offset),
+            );
+        }
+        for offset in [0x40, 0x90, 0x100] {
+            put_u32(bytes, physical_start + offset, 0x27bd_ffe0);
+        }
+        for offset in [0x20, 0x24, 0x28, 0x2c] {
+            put_u32(
+                bytes,
+                physical_start + offset,
+                0x3c04_0000 | (va_start >> 16),
+            );
+        }
     }
 
     #[test]
@@ -349,5 +515,75 @@ mod tests {
         let json_a = serde_json::to_string(&db_a).unwrap();
         let json_b = serde_json::to_string(&db_b).unwrap();
         assert_eq!(json_a, json_b);
+    }
+
+    #[test]
+    fn recovered_vrom_path_composes_file_table_and_strict_overlay_banks() {
+        let mut bytes = vec![0u8; 0xe000];
+        put_u32(&mut bytes, 0, 0x8037_1240);
+        put_u32(&mut bytes, 8, 0x8000_0400);
+
+        // Three-record physical file table: the identity image, one file
+        // carrying the descriptor table, and one carrying both overlays.
+        for (index, fields) in [
+            [0x0000, 0x3000, 0x0000, 0x0000],
+            [0x3000, 0x6000, 0x8000, 0x0000],
+            [0x6000, 0x9000, 0xb000, 0x0000],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (field, value) in fields.into_iter().enumerate() {
+                put_u32(&mut bytes, 0x2000 + index * 0x10 + field * 4, value);
+            }
+        }
+
+        let descriptors = [(0x6000, 0x6800, 0x8002_0000), (0x7000, 0x7800, 0x8003_0000)];
+        for (index, (vrom_start, vrom_end, vram)) in descriptors.into_iter().enumerate() {
+            let base = 0x8000 + index * 0x1c;
+            put_u32(&mut bytes, base, vrom_start);
+            put_u32(&mut bytes, base + 4, vrom_end);
+            put_u32(&mut bytes, base + 8, vram);
+            let physical = 0xb000 + (vrom_start - 0x6000) as usize;
+            plant_delta_admissible_region(&mut bytes, physical, vram);
+        }
+
+        let input = RecoveredVromOverlayInput {
+            search: overlay_regions::SearchConfig::vrom_family(),
+            delta_vote: delta_vote::DeltaVoteConfig::default(),
+            file_table_search: file_table::FileTableSearchConfig::n64_family(),
+            vrom_min_records: 2,
+            min_mapped_regions: 2,
+            file_table_name: "recovered_files".into(),
+            table_name: "recovered_overlays".into(),
+            bank_name: banks::BankNamePattern::new("recovered_", 0, ""),
+        };
+        let (_, db, recovery) =
+            run_discovery_with_recovered_vrom_overlay_regions(&bytes, &input).unwrap();
+
+        assert_eq!(
+            recovery
+                .file_table
+                .admitted_table
+                .as_ref()
+                .map(|table| table.table_rom_offset),
+            Some(0x2000)
+        );
+        assert_eq!(recovery.admitted_intervals().len(), 2);
+        let overlay_mappings: Vec<_> = db
+            .proven_rom_mappings()
+            .into_iter()
+            .filter(
+                |fact| matches!(fact, Fact::RomMapping { bank, .. } if bank != banks::BOOT_BANK),
+            )
+            .collect();
+        assert_eq!(overlay_mappings.len(), 2);
+        assert!(overlay_mappings.iter().all(|fact| matches!(
+            fact,
+            Fact::RomMapping {
+                rom_space: RomAddressSpace::Virtual,
+                ..
+            }
+        )));
     }
 }

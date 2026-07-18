@@ -149,6 +149,24 @@ two-region admission floor, so they stay open rather than force-promoted.
 `gate_overlay_generalize` is 10/10 byte-identical with the full OoT+GE+PD+SM64
 set (SHA-256 `5401e638…`).
 
+**End-to-end payoff — OoT graded with mechanically-recovered overlays**
+(`gate_d1_oot_overlays`, held-out, 10/10 byte-identical `ac606195…`). OoT's
+existing 99.567%/72.331% grade uses hand-supplied `oot_load_image_tables`
+geometry (a per-game input the engine did not infer). Running the identical
+function-entry grade through the *mechanically recovered* overlays instead
+answers whether automation can replace that hand geometry. The three-way
+result: (A) boot-only 62.500%/0.823%; (B) mechanically recovered
+99.462%/48.450%; (C) hand geometry 99.567%/72.331%. **B reaches 66.98% of C's
+recall at matching precision (99.46% vs 99.57%) — two-thirds of the
+hand-geometry benefit, recovered from ROM bytes alone, with no precision
+loss.** The per-family answer-key accounting locates the remaining gap
+precisely: kaleido fully recovered (594/594 functions); actor 167 of 426
+sub-banks recovered (5,935 of 9,213 functions — 3,278 missed); effect and
+gamestate stayed below the two-region admission floor (0 of 236 functions).
+So the recall gap is dominated by *actor sub-bank coverage* (3,278 functions),
+not the two dropped tables (236) — the next lever is recovering more actor
+overlay records, not lowering the admission floor.
+
 Phase-6 indirect closure was then strengthened on the recovered NWXE overlay
 banks (three sound `sltiu`-bounded switch-table recognizers, each with a
 near-miss test proving no over-admission): `unresolved_indirect` occurrences
@@ -779,6 +797,7 @@ table consolidates, it does not re-measure.
 | Overlay region discovery (descriptor-family search) | n/m | 5/5 regions recovered from ROM alone (table @0x53988 found without being handed it), delta_vote 5/5 correct | **4 overlay regions recovered @table 0x48a68, 100%/100%, delta_vote 4/4 correct, 0 wrong; integrated D1 36.396867%/28.542179% → 49.976448%/86.895987%; a 2nd candidate table correctly rejected** | adopted — mechanically opens NWXE overlays |
 | Exact-owner proof on recovered NWXE overlays | n/m | n/m | 6 exact owners (from 0), 0 wrong extents; 22,562 reached blocks, 475,740 proven-executable bytes; dominant blocker unresolved-indirect (614 sole) | adopted — first proof-qualified overlay ownership |
 | VROM overlay recovery (file-table resolution) | **OoT: file table @0x7430 recovered (=dmadata); 414 overlay regions, 100% precision / 88.5% recall (actor+kaleido tables admitted)**; SM64 correctly 0 (negative control); GE/PD 0 ungraded | n/m (AKI physical path unchanged) | n/m (unchanged) | adopted — overlay recovery now crosses engine families (AKI + OoT); effect/gamestate tables below 2-region floor stay open |
+| OoT end-to-end with recovered overlays (gate_d1_oot_overlays) | **B mechanical: 99.462%/48.450%; C hand-geometry: 99.567%/72.331% → B reaches 66.98% of C recall at matching precision**; gap = 3,278 unrecovered actor sub-banks + effect/gamestate (236 fns) | n/m | n/m | held-out: mechanical recovery replaces 2/3 of hand geometry with no precision loss; recall gap is actor sub-bank coverage, not the 2 dropped tables |
 | Phase-6 indirect closure (switch-table precision) | jump tables 230→240 exhaustive, precision/recall unchanged | 223→227 exhaustive, unchanged | unresolved_indirect 19196→16366 occurrences (−2830), exact_owners 6→6, wrong 0 | adopted — sound (3 near-miss soundness tests); remaining sites blocked by entry_not_authoritative/owner_missing/partition_ambiguity, not indirect |
 | dynamic_mips → live executor seam | n/m | n/m | n/m | adopted (groundwork): ExecutorAction maps BlockExit→scheduling decision from exit variant only (AOT/interp indistinguishability is type-level); executor drives fallback in one GameThread resume; hole-stays-fault + single-runnable proven; rung suite unchanged |
 | dynamic_mips fallback dispatcher | n/m | n/m | n/m | adopted (groundwork): interpreter wired behind BlockExit, byte-equivalent to AOT lane; hole-stays-a-fault safety proven; typed EvidenceClass; FPU/COP0/exceptions typed-unsupported |
