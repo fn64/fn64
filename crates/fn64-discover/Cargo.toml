@@ -35,6 +35,10 @@ name = "gate_d1_overlays"
 path = "src/bin/gate_d1_overlays.rs"
 
 [[bin]]
+name = "gate_owners_overlays"
+path = "src/bin/gate_owners_overlays.rs"
+
+[[bin]]
 name = "fn64-discover"
 path = "src/bin/fn64_discover.rs"
 
@@ -61,3 +65,7 @@ path = "src/bin/gate_oot_reference.rs"
 [[bin]]
 name = "gate_coverage"
 path = "src/bin/gate_coverage.rs"
+
+[[bin]]
+name = "gate_overlay_generalize"
+path = "src/bin/gate_overlay_generalize.rs"

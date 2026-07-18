@@ -128,10 +128,16 @@ fn run_title(title: &Title) -> Result<(), String> {
         }
     };
     let Some(table) = table else {
-        return Err(format!(
-            "{} is set but no answer key is vendored for {} — cannot grade",
+        // The ROM is present but no key is vendored yet. This is a skip, not an
+        // error: FN64_DISCOVER_PD_ROM (and future ROM vars) are shared with
+        // other gates (e.g. gate_overlay_generalize), so a set ROM var without
+        // a vendored key here is a legitimate "cannot grade yet" state, not a
+        // misconfiguration.
+        println!(
+            "  grade SKIPPED: {} is set but no answer key is vendored for {} yet",
             title.rom_env, title.label
-        ));
+        );
+        return Ok(());
     };
     let Some(expected) = &title.expected else {
         return Err(format!(

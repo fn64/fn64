@@ -107,6 +107,18 @@ pub enum CpuFaultKind {
     MemoryFault {
         addr: u64,
     },
+    /// An admitted instruction whose *encoding* the shared decoder recognizes
+    /// but whose *architecture* the executing lane does not yet model (the
+    /// FPU/COP0/COP2/TLB/exception frontier — `docs/UNIVERSAL-RUNTIME-PLAN.md`
+    /// U4). Only the `dynamic_mips` interpreter fallback can raise this: the AOT
+    /// lane emits a host `panic!` for the same words at build time, so it never
+    /// reaches a runner. Carrying the raw `word` names the exact opcode without
+    /// coupling this typed boundary to the decoder's `Instruction` shape. This
+    /// is a translator/runtime coverage boundary surfaced as a typed fault, not
+    /// a silent nop or a panic.
+    UnsupportedInstruction {
+        word: u32,
+    },
 }
 
 /// A guest CPU fault with the exact bank-qualified destination that caused it.
@@ -132,6 +144,12 @@ impl fmt::Display for CpuFault {
             CpuFaultKind::MemoryFault { addr } => write!(
                 f,
                 "guest memory access outside backed RDRAM at {}; effective address {addr:#018X}",
+                self.at
+            ),
+            CpuFaultKind::UnsupportedInstruction { word } => write!(
+                f,
+                "unsupported instruction {word:#010X} at {}; encoding decodes but its \
+                 architecture is not modeled by the executing lane",
                 self.at
             ),
         }
@@ -228,6 +246,14 @@ impl GeneratedBankRunner {
 
     pub const fn bank(self) -> BankId {
         self.bank
+    }
+
+    /// The raw callable this runner wraps. Its embedded bank identity is
+    /// available separately via [`GeneratedBankRunner::bank`]; a caller that has
+    /// already validated identity (as [`BlockProgram::register`] does) may take
+    /// the function pointer to store it in its own lane table.
+    pub const fn into_fn(self) -> GeneratedBankFn {
+        self.run
     }
 }
 

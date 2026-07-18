@@ -37,6 +37,15 @@ expected_overlay_regions=471181f20c5add3b7478e7ea65626bc8417126b33e6b9c0a5e200dd
 # gate_d1_overlays: NWXE boot-only versus mechanically recovered overlays.
 # The dump is grading-only and opens after both discovery runs complete.
 expected_d1_overlays=9b0dc15f92aac10586edf98a02873c0acfc57f4ff6f00f857546fcb1ec1c4440
+# gate_owners_overlays: exact-owner proof on the recovered NWXE overlay banks
+# (6 owners, 0 wrong extents). Dump is grading-only, opened after proof.
+expected_owners_overlays=843248d5182e7a2cebdac4597f54a0ede9cb0d723c6d7f16825d4984a6ca5d27
+# gate_overlay_generalize: the AKI family search run against four NON-AKI ROMs
+# (OoT/GE/PD/SM64) — all admit zero tables (a diagnosed VROM-addressing shape
+# gap; SM64 is the correct no-overlay negative control). Digest is fixed only
+# with the full OoT+GE+PD+SM64 ROM set (unset ROMs are loud skips that change
+# output), so it is guarded on the non-AKI ROM vars below.
+expected_overlay_generalize=c9cc0216e768ae9496a4e3332d5385caae514e3e5e1a81f41b78b1cc5335a78e
 # gate_coverage renders the metric ladder for every supplied ROM; its digest is
 # only fixed when all three ROM vars are set, since an unset var is a loud skip
 # line that legitimately changes the output.
@@ -70,13 +79,33 @@ check_gate() {
     echo "$gate: $runs/$runs runs byte-identical, sha256=$expected"
 }
 
+# gate_keys' recorded digest is the parse-only (no grading ROM) configuration.
+# Its grading ROM vars (BANJO/PD) are SHARED with other gates, so scrub them
+# for this gate specifically to keep its digest stable no matter what the
+# caller set for gate_overlay_generalize etc.
+check_gate_keys_parseonly() {
+    expected=$1
+    i=1
+    while [ "$i" -le "$runs" ]; do
+        got=$(env -u FN64_DISCOVER_BANJO_ROM -u FN64_DISCOVER_PD_ROM \
+            cargo run --quiet --manifest-path "$repo/Cargo.toml" \
+            -p fn64-discover --bin gate_keys | sha_stdout)
+        if [ "$got" != "$expected" ]; then
+            echo "gate_keys run $i/$runs: output sha256 $got != expected $expected" >&2
+            exit 1
+        fi
+        i=$((i + 1))
+    done
+    echo "gate_keys: $runs/$runs runs byte-identical (parse-only), sha256=$expected"
+}
+
 check_gate gate_loaders "$expected_loaders"
 check_gate gate_selector "$expected_selector"
 check_gate gate_delta_vote "$expected_delta_vote"
 # gate_keys parses the vendored answer-key tables; with the grading ROMs
-# absent (FN64_DISCOVER_BANJO_ROM/PD_ROM unset) it is a deterministic
-# parse-and-count run whose digest is fixed by the vendored table bytes.
-check_gate gate_keys "$expected_keys"
+# absent it is a deterministic parse-and-count run whose digest is fixed by
+# the vendored table bytes (its ROM vars are scrubbed since they are shared).
+check_gate_keys_parseonly "$expected_keys"
 
 # gate_gp_base needs both AKI ROMs and their dumps (it cross-checks _gp
 # symbols); guard on the NWXE dump being present.
@@ -84,10 +113,21 @@ if [ "${FN64_DISCOVER_NWXE_DUMP:-}" != "" ]; then
     check_gate gate_gp_base "$expected_gp_base"
     check_gate gate_overlay_regions "$expected_overlay_regions"
     check_gate gate_d1_overlays "$expected_d1_overlays"
+    check_gate gate_owners_overlays "$expected_owners_overlays"
 else
     echo "gate_gp_base: skipped (FN64_DISCOVER_NWXE_DUMP unset)"
     echo "gate_overlay_regions: skipped (FN64_DISCOVER_NWXE_DUMP unset)"
     echo "gate_d1_overlays: skipped (FN64_DISCOVER_NWXE_DUMP unset)"
+    echo "gate_owners_overlays: skipped (FN64_DISCOVER_NWXE_DUMP unset)"
+fi
+
+# gate_overlay_generalize runs the AKI family search on the non-AKI corpus;
+# its digest is fixed only with the full OoT+GE+PD+SM64 ROM set present.
+if [ "${FN64_DISCOVER_GE_ROM:-}" != "" ] && [ "${FN64_DISCOVER_PD_ROM:-}" != "" ] \
+    && [ "${FN64_DISCOVER_SM64_ROM:-}" != "" ] && [ "${FN64_DISCOVER_OOT_ROM:-}" != "" ]; then
+    check_gate gate_overlay_generalize "$expected_overlay_generalize"
+else
+    echo "gate_overlay_generalize: skipped (needs OoT+GE+PD+SM64 ROM vars)"
 fi
 
 if [ "${FN64_DISCOVER_OOT_ROM:-}" != "" ]; then

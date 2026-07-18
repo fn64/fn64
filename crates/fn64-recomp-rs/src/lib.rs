@@ -35,6 +35,7 @@
 pub mod decoder;
 pub mod emit;
 pub mod execution;
+pub mod fallback;
 pub mod interp;
 pub mod module;
 pub mod runtime;
@@ -51,6 +52,7 @@ pub use execution::{
     ExecutionKey, GeneratedBankFn, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError,
     ResolvedInstruction, TransferResolver,
 };
+pub use fallback::{EvidenceClass, FallbackProgram, FallbackRunner};
 pub use interp::{run_bank, UnsupportedOp};
 pub use module::{emit_lookup_dispatcher, emit_module, ModuleFunc, SymbolTable};
 pub use runtime::{

@@ -1,7 +1,7 @@
 //! Deterministic composition of discovery's existing phase outputs into one
 //! proof-carrying program artifact.
 //!
-//! V1 intentionally materializes one physical ROM-backed bank. It verifies
+//! V1 intentionally materializes one proven physical ROM-backed bank. It verifies
 //! the supplied bytes against [`NormalizedRom`] before analysis, runs Phase
 //! 4-6 closure, writes closure-derived facts into a cloned [`FactDb`], then
 //! partitions and proves owners from that same fact snapshot. Reached
@@ -31,8 +31,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const PROGRAM_SNAPSHOT_SCHEMA_V1: u32 = 1;
 
-/// Runtime image supplied to the one-bank V1 composer. `seed_roots` are
-/// traversal hints only; owner proof still requires independent authority.
+/// Runtime image supplied to the one-bank V1 composer. The bank may be the
+/// resident image or an overlay; its identity and physical backing must be
+/// proven in `base_facts`. `seed_roots` are traversal hints only; owner proof
+/// still requires independent authority.
 pub struct MaterializedBankInput<'a> {
     pub bank: &'a str,
     pub va_start: u32,
@@ -320,7 +322,8 @@ struct CoveringMapping {
     va_end: u32,
 }
 
-/// Compose one byte-verified resident bank through exact-owner proof.
+/// Compose one byte-verified, proven physical ROM-backed bank through
+/// exact-owner proof.
 pub fn compose_materialized_bank_v1(
     rom: &NormalizedRom,
     base_facts: &FactDb,
@@ -684,6 +687,65 @@ mod tests {
         assert_eq!(snapshot.banks[0].block_proof.proven_blocks, 1);
         assert!(snapshot.banks[0].blocker_histogram.is_empty());
         assert_eq!(snapshot.banks[0].input.rom_start, ROM_START);
+    }
+
+    #[test]
+    fn proven_nonresident_physical_bank_composes_without_resident_special_case() {
+        let bytes = asm(&[JR_RA, NOP]);
+        let rom = rom_with_bank(&bytes);
+        let mut facts = FactDb::new();
+        let mapping = facts.insert(Fact::RomMapping {
+            bank: "overlay".into(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: ROM_START,
+            rom_end: ROM_START + bytes.len() as u32,
+            va_start: BASE,
+            va_end: BASE + bytes.len() as u32,
+        });
+        facts
+            .conclude(
+                "bank:overlay",
+                ProofState::Proven,
+                vec![mapping],
+                "test_overlay_mapping",
+            )
+            .unwrap();
+        let target = BankAddr::new("overlay", BASE);
+        let entry = facts.insert(Fact::FunctionEntryClaim {
+            target: target.clone(),
+            detector: CandidateDetector::ProloguePattern,
+            evidence: FunctionEntryEvidence::Prologue {
+                stack_adjust: target.clone(),
+                frame_size: 16,
+                pattern: ProloguePattern::LeafWithMatchedRestore,
+                corroborating_site: BankAddr::new("overlay", BASE + 4),
+            },
+            proposed_state: ProofState::Proven,
+        });
+        facts
+            .conclude(
+                function_entry_subject(&target),
+                ProofState::Proven,
+                vec![entry],
+                "test_overlay_entry",
+            )
+            .unwrap();
+
+        let snapshot = compose_materialized_bank_v1(
+            &rom,
+            &facts,
+            MaterializedBankInput {
+                bank: "overlay",
+                va_start: BASE,
+                bytes: &bytes,
+                seed_roots: &[BASE],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.banks[0].input.bank, "overlay");
+        assert_eq!(snapshot.banks[0].owner_proof.bank, "overlay");
+        assert_eq!(snapshot.coverage.function_owners.exact_owners, 1);
     }
 
     #[test]
