@@ -1212,6 +1212,40 @@ pub fn build_cfg_closed(
 /// computed jumps add ordinary intra-owner successors; exhaustive computed
 /// calls add callable roots. Bounded/open sites remain explicit records and
 /// never enter the successor map.
+fn retain_cycle_stable_entries(states: &[BTreeMap<u32, Vec<u32>>]) -> BTreeMap<u32, Vec<u32>> {
+    let Some(first) = states.first() else {
+        return BTreeMap::new();
+    };
+    first
+        .iter()
+        .filter(|(site, targets)| {
+            states
+                .iter()
+                .skip(1)
+                .all(|state| state.get(site) == Some(*targets))
+        })
+        .map(|(site, targets)| (*site, targets.clone()))
+        .collect()
+}
+
+fn reject_unusable_targets(resolutions: &mut [IndirectResolution], va_start: u32, va_end: u32) {
+    let in_bank = |target: u32| {
+        target >= va_start && target < va_end && (target - va_start).is_multiple_of(4)
+    };
+    for resolution in resolutions {
+        if resolution.state != IndirectProofState::Exhaustive {
+            continue;
+        }
+        let targets_are_usable = !resolution.targets.is_empty()
+            && resolution.targets.iter().all(|target| {
+                target.is_multiple_of(4) && (resolution.via_call || in_bank(*target))
+            });
+        if !targets_are_usable {
+            resolution.state = IndirectProofState::Bounded;
+        }
+    }
+}
+
 pub fn build_cfg_value_set_closed(
     bank: &str,
     bank_bytes: &[u8],
@@ -1220,27 +1254,14 @@ pub fn build_cfg_value_set_closed(
 ) -> ClosureResult {
     let roots: BTreeSet<u32> = seed_roots.iter().copied().collect();
     let va_end = va_start.wrapping_add(bank_bytes.len() as u32);
-    let in_bank = |target: u32| {
-        target >= va_start && target < va_end && (target - va_start).is_multiple_of(4)
-    };
     let mut exhaustive: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut history = vec![exhaustive.clone()];
 
     loop {
         let root_vec: Vec<u32> = roots.iter().copied().collect();
         let cfg = build_cfg_with_indirect(bank, bank_bytes, va_start, &root_vec, &exhaustive);
         let mut resolutions = resolve_value_sets_from_roots(&cfg, bank_bytes, va_start, &root_vec);
-        for resolution in &mut resolutions {
-            if resolution.state != IndirectProofState::Exhaustive {
-                continue;
-            }
-            let targets_are_usable = !resolution.targets.is_empty()
-                && resolution.targets.iter().all(|target| {
-                    target.is_multiple_of(4) && (resolution.via_call || in_bank(*target))
-                });
-            if !targets_are_usable {
-                resolution.state = IndirectProofState::Bounded;
-            }
-        }
+        reject_unusable_targets(&mut resolutions, va_start, va_end);
 
         let next: BTreeMap<u32, Vec<u32>> = resolutions
             .iter()
@@ -1253,6 +1274,52 @@ pub fn build_cfg_value_set_closed(
                 indirect: resolutions,
             };
         }
+        if let Some(cycle_start) = history.iter().position(|state| state == &next) {
+            // Adding one exhaustive indirect edge can expose a path that
+            // invalidates that same edge on the next analysis pass. NWXE's
+            // fourth recovered overlay produced the concrete two-cycle
+            // 96 -> 97 -> 96 forever. Choosing either side would fabricate
+            // exhaustiveness. Keep only entries identical throughout the
+            // cycle, then monotonically remove any that the reduced graph no
+            // longer confirms; every oscillating/new site stays explicitly
+            // Open in the returned evidence.
+            let mut conservative = retain_cycle_stable_entries(&history[cycle_start..]);
+            loop {
+                let cfg =
+                    build_cfg_with_indirect(bank, bank_bytes, va_start, &root_vec, &conservative);
+                let mut resolutions =
+                    resolve_value_sets_from_roots(&cfg, bank_bytes, va_start, &root_vec);
+                reject_unusable_targets(&mut resolutions, va_start, va_end);
+                let resolved: BTreeMap<u32, Vec<u32>> = resolutions
+                    .iter()
+                    .filter(|resolution| resolution.state == IndirectProofState::Exhaustive)
+                    .map(|resolution| (resolution.site_pc, resolution.targets.clone()))
+                    .collect();
+                let confirmed: BTreeMap<u32, Vec<u32>> = conservative
+                    .iter()
+                    .filter(|(site, targets)| resolved.get(site) == Some(*targets))
+                    .map(|(site, targets)| (*site, targets.clone()))
+                    .collect();
+                if confirmed != conservative {
+                    conservative = confirmed;
+                    continue;
+                }
+                for resolution in &mut resolutions {
+                    if resolution.state == IndirectProofState::Exhaustive
+                        && conservative.get(&resolution.site_pc) != Some(&resolution.targets)
+                    {
+                        resolution.state = IndirectProofState::Open;
+                        resolution.kind = None;
+                        resolution.targets.clear();
+                    }
+                }
+                return ClosureResult {
+                    cfg,
+                    indirect: resolutions,
+                };
+            }
+        }
+        history.push(next.clone());
         exhaustive = next;
     }
 }
@@ -1770,5 +1837,23 @@ mod tests {
         assert_eq!(closure.indirect.len(), 1);
         assert_eq!(closure.indirect[0].state, IndirectProofState::Open);
         assert!(closure.indirect[0].targets.is_empty());
+    }
+
+    #[test]
+    fn closure_cycle_keeps_only_entries_identical_in_every_state() {
+        let state_a = BTreeMap::from([
+            (0x8000_0010, vec![0x8000_0100]),
+            (0x8000_0020, vec![0x8000_0200]),
+        ]);
+        let state_b = BTreeMap::from([
+            (0x8000_0010, vec![0x8000_0100]),
+            (0x8000_0020, vec![0x8000_0300]),
+            (0x8000_0030, vec![0x8000_0400]),
+        ]);
+
+        assert_eq!(
+            retain_cycle_stable_entries(&[state_a, state_b]),
+            BTreeMap::from([(0x8000_0010, vec![0x8000_0100])])
+        );
     }
 }

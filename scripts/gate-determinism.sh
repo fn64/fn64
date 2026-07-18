@@ -34,6 +34,9 @@ expected_gp_base=d1e267035c94488b2d47df60038031ab9fc345a4daf00b68eb5b8f948abcaf6
 # gate_overlay_regions: mechanical overlay-descriptor-table discovery. Needs
 # both AKI ROMs + dumps (grades held-out against the dump layout).
 expected_overlay_regions=471181f20c5add3b7478e7ea65626bc8417126b33e6b9c0a5e200dd5f1cfd920
+# gate_d1_overlays: NWXE boot-only versus mechanically recovered overlays.
+# The dump is grading-only and opens after both discovery runs complete.
+expected_d1_overlays=9b0dc15f92aac10586edf98a02873c0acfc57f4ff6f00f857546fcb1ec1c4440
 # gate_coverage renders the metric ladder for every supplied ROM; its digest is
 # only fixed when all three ROM vars are set, since an unset var is a loud skip
 # line that legitimately changes the output.
@@ -80,9 +83,11 @@ check_gate gate_keys "$expected_keys"
 if [ "${FN64_DISCOVER_NWXE_DUMP:-}" != "" ]; then
     check_gate gate_gp_base "$expected_gp_base"
     check_gate gate_overlay_regions "$expected_overlay_regions"
+    check_gate gate_d1_overlays "$expected_d1_overlays"
 else
     echo "gate_gp_base: skipped (FN64_DISCOVER_NWXE_DUMP unset)"
     echo "gate_overlay_regions: skipped (FN64_DISCOVER_NWXE_DUMP unset)"
+    echo "gate_d1_overlays: skipped (FN64_DISCOVER_NWXE_DUMP unset)"
 fi
 
 if [ "${FN64_DISCOVER_OOT_ROM:-}" != "" ]; then

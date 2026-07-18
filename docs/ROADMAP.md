@@ -377,6 +377,12 @@ text intervals, so they measure the payoff from correct executable regions,
 not mechanical recovery of those regions. Mapping-only baselines and byte
 coverage remain separate in `DISCOVER-PLAN.md`.
 
+NWXE's mapping-only overlay gap is now closed mechanically: ROM-only
+descriptor-family recovery plus unique delta/destination agreement produces
+four proven load images, taking the held-out D1 grade from 36.396867% /
+28.542179% boot-only to 49.976448% / 86.895987%. Whole-image data scanning is
+still why this sits below the external-text-filter result above.
+
 Two findings worth not rediscovering:
 - **Recall is a Phase-2 problem, not a detector problem.** OoT recall was
   0.82% until D1.5 taught Phase 2 to discover DMA-table overlay load-images

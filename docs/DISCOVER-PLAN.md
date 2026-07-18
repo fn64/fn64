@@ -47,7 +47,8 @@ byte ownership.
 | OoT, generalized load tables | 99.5672% | 72.3312% | 469 load images; resident `code`/`n64dd` mapping remains incomplete |
 | NW4E, descriptor mapping | 48.4387% | 89.7384% | mapped data is still scanned as code |
 | NW4E, descriptor plus text intervals | 82.4089% | 88.1105% | text intervals are external evidence, not inferred yet |
-| NWXE, boot mapping only | 36.3969% | 28.5422% | overlays WERE absent — now mechanically recovered (see below), integration into the D1 grade pending |
+| NWXE, boot mapping only | 36.3969% | 28.5422% | overlays absent from this preserved baseline |
+| NWXE, mechanically recovered overlays | 49.9764% | 86.8960% | four ROM-only recovered mappings; mapped data is still scanned as code |
 | NWXE, descriptor mapping only | 49.9529% | 86.8550% | overlay data is scanned as code |
 | NWXE, descriptor plus text intervals | 81.3143% | 84.1114% | text intervals are external evidence, not inferred yet |
 
@@ -116,9 +117,22 @@ non-contributing for these titles: the AKI overlay loader reads
 rom_start/rom_end/vram out of a descriptor record through registers (not
 `osPiStartDma` immediates), so the descriptor route is the one that recovers
 the triples. Ten `gate_overlay_regions` runs are byte-identical (SHA-256
-`471181f2…`). Remaining step: wire region-discovery → `delta_vote` mapping →
-harvest/owner-proof into the NWXE D1/B2 grade and measure the recall lift off
-the pre-registered 36.40%/28.54% baseline (precision must not collapse).
+`471181f2…`). The recovered table is now wired into Phase 2 by a proof rule
+that requires exactly one admitted table and exact agreement between each
+record's delta-derived VA and its independently parsed descriptor destination.
+`gate_d1_overlays` opens the dump only after both discovery runs finish. The
+four resulting proven banks move NWXE from **36.396867% / 28.542179%** to
+**49.976448% / 86.895987%**, adding 1,425 recalled functions and 2,331 total
+candidates while precision rises 13.579582 points. Its stdout is
+byte-identical across 10/10 runs (SHA-256
+`9b0dc15f92aac10586edf98a02873c0acfc57f4ff6f00f857546fcb1ec1c4440`).
+
+The first integrated run also exposed an existing Phase-6 fixed-point cycle:
+NWXE's fourth overlay alternated forever between 96 and 97 exhaustive
+indirect sites. Closure now detects a repeated edge-set state, retains only
+entries identical throughout the cycle, monotonically revalidates that
+intersection, and leaves every oscillating site `Open`. It does not choose a
+cycle side by score or iteration order.
 
 The byte-verified `ProgramSnapshotV1` now closes the native resident-bank
 passes into one artifact. With only the NWXE header entry as a traversal seed,
@@ -449,13 +463,28 @@ classifies 1,868 unique observed resident PCs against the static baseline:
 639 inside proven-closure code, 1,035 corroborating exploratory candidate
 words, 194 previously-unclassified words of new code-existence evidence, and
 zero static-versus-execution conflicts; three unknown-bank PCs are the
-general exception vector. Honest frontier: trace observations still have no
-`FactDb` adapter (measured ingestion delta on the database is zero facts);
-reaching overlay loads and dispatcher flag stores needs a
-breakpoint-accelerated skip phase (~10 µs/step makes deep single-stepping
-impractical); write-PC attribution needs the untried write-breakpoint
-mechanism. Traces contain executed-PC sequences from a user's ROM and stay
-out of git.
+general exception vector. The `FactDb` adapter that this originally lacked
+now exists (`trace::fold_executed_pcs_into_fact_db`): the same 500k capture
+folds into 499,997 facts / 1,868 Supported code-existence conclusions.
+
+A breakpoint-accelerated driver (`tools/mupen-bfs/mupen_bfs.c`) was built to
+reach past the ~500k single-step wall to the selector dispatcher's flag
+stores. Measured negative finding, recorded so it is not re-attempted the
+same way: on this DEBUGGER=1 / pure-interpreter / NO_ASM macOS-arm64 core
+build, `M64P_DBG_RUNSTATE_RUNNING` does NOT free-run once a breakpoint is
+installed — `sample` backtraces show it parks on a per-instruction semaphore
+and only `DebugStep()` advances it, so every instruction still costs one
+step round trip. Execution breakpoints at the byte-verified dispatcher PCs
+plus a write watchpoint on `0x800a10b0` do fire correctly and
+deterministically (4/4 byte-identical runs): the driver reaches the init
+store and the R2 flag load with flag/mode at their zero-init values, but a
+114M-step / ~10-minute run never reached the R3/R5/loop branches or any
+overlay flag store — the interpreter spends that time in a hardware-timing
+poll loop. Deep selector-state observation is therefore blocked by
+interpreter speed, not driver correctness; the next attempt needs a
+dynarec-capable core (x86_64/Rosetta) or a coarser skip mechanism, not more
+breakpoints. Traces contain executed-PC sequences from a user's ROM and stay
+out of git; compiled drivers are gitignored build artifacts.
 
 ### 5. Function entries and ownership
 
@@ -713,7 +742,7 @@ table consolidates, it does not re-measure.
 | Trace→FactDb adapter | n/m | ingestion delta 0 → 499,997 facts / 1,868 Supported code-existence conclusions / 478 corroborations / 0 static-data conflicts | n/m | adopted (Supported, distinct evidence class) |
 | Delta-voting VA-mapping inference | n/m | 5/5 overlays admitted-correct, 0 open, 0 wrong (margins 3.1x-9.7x) | not graded (no NWXE overlay regions yet) | adopted |
 | GP-base voting | n/m | OPEN (0 real $gp constructions; 25 off($gp) = data-as-code noise) | OPEN (7 accesses; unaligned histogram winner rejected) | mechanism adopted; no base to recover on these ROMs |
-| Overlay region discovery (descriptor-family search) | n/m | 5/5 regions recovered from ROM alone (table @0x53988 found without being handed it), delta_vote 5/5 correct | **4 overlay regions recovered @table 0x48a68, 100%/100%, delta_vote 4/4 correct, 0 wrong; a 2nd candidate table correctly rejected** | adopted — mechanically opens NWXE overlays |
+| Overlay region discovery (descriptor-family search) | n/m | 5/5 regions recovered from ROM alone (table @0x53988 found without being handed it), delta_vote 5/5 correct | **4 overlay regions recovered @table 0x48a68, 100%/100%, delta_vote 4/4 correct, 0 wrong; integrated D1 36.396867%/28.542179% → 49.976448%/86.895987%; a 2nd candidate table correctly rejected** | adopted — mechanically opens NWXE overlays |
 | dynamic_mips interpreter (first slice) | n/m | n/m | n/m | adopted (groundwork): integer/control/memory ops, byte-equivalent to the AOT lane by differential test; FPU/COP0/exceptions typed-unsupported (open) |
 | Answer-key corpus intake | n/m | n/m | n/m | infrastructure only: Banjo 60-row override key parsed (55 fn), PD key absent upstream — no grading yet (ROMs not present) |
 

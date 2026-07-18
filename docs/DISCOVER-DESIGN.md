@@ -168,8 +168,11 @@ digest.
 > file-table convention where a zero end means an uncompressed equal-length
 > file. The same mechanism therefore represents VROM file tables,
 > VROM-to-VRAM overlay tables, and physical-ROM descriptor tables; the older
-> `DescriptorTableInput` remains supported. Table locations and bank naming
-> are caller-supplied data, never guessed by a detector.
+> `DescriptorTableInput` remains supported. Its table locations and bank
+> naming are caller-supplied data. The separate ROM-only overlay-family path
+> enumerates every admissible location/shape and promotes no mapping unless
+> exactly one table survives and each record's unique delta-derived VA equals
+> its independently parsed descriptor destination.
 >
 > Every parsed record is a typed `LoadImageTableRecord` fact naming its table
 > and record index, with an independent proof-state conclusion. A proven
@@ -192,6 +195,20 @@ digest.
 > table load, the generated code-section VROM/VRAM mapping, and the table
 > consumers' field loads/counts/strides), not to the grading key. `dump.toml`
 > is opened only after discovery.
+
+> Implementation status (recovered AKI overlays, 2026-07-18):
+> `run_discovery_with_recovered_overlay_regions` normalizes the ROM, runs the
+> descriptor-family search and `delta_vote`, and records the unique admitted
+> table as typed `LoadImageTableRecord` plus proven bank-qualified
+> `RomMapping` facts. A delta vote alone is not sufficient. The proof rule is
+> unique table admission plus exact per-record agreement between the inferred
+> VA and the descriptor destination. `gate_d1_overlays` keeps NWXE's dump
+> held out until both discovery runs finish. Boot-only combined precision /
+> recall is 36.396867% / 28.542179%; recovered overlays produce 49.976448% /
+> 86.895987%. The four added mappings raise recalled functions by 1,425 while
+> precision rises 13.579582 points. Ten complete gate runs have byte-identical
+> stdout, SHA-256
+> `9b0dc15f92aac10586edf98a02873c0acfc57f4ff6f00f857546fcb1ec1c4440`.
 
 A ROM offset is not inherently tied to one runtime address. Discover candidate
 ROM-to-RDRAM mappings from:

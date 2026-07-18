@@ -62,11 +62,20 @@
  *   - which breakpoint(s) triggered (DebugBreakpointTriggeredBy)
  *   - the flag word (DebugMemRead32 0x800a10b0) and mode byte
  *     (DebugMemRead8 0x80097fd8)
- * and appends one JSON-lines record, then resumes RUNNING.
+ * and, only for a NAMED hit (a real breakpoint match) or the initial
+ * baseline pause, appends one JSON-lines record; then resumes STEPPING.
  *
  * Determinism: same pure-interpreter, same dummy gfx/audio/input plugins,
  * no timestamps in the record stream -- only sequence numbers -- so repeat
- * runs must be byte-identical (checked externally, 3x minimum per the task).
+ * runs must be byte-identical. Observed: 4 consecutive runs to max_hits=2
+ * (baseline + init_store + r2_load) produced byte-identical output
+ * (MD5 fd80d8c3f364b5842cba24e2be5f7c56 all four times); the task's 10x bar
+ * was not completed in-session because each run's wall-clock time to reach
+ * even hit #2 varies widely (observed 1s to 160s) under this build's real
+ * VI/PI-timing-paced boot waits, and a longer run chasing hit #3 (R3/R5)
+ * ran 114M+ single-stepped instructions over 10 minutes without reaching
+ * it -- see the R2/R3/R5-not-reached note in the report this driver
+ * shipped with.
  *
  * Clean room: public m64p_debugger.h/m64p_types.h/m64p_common.h/
  * m64p_frontend.h API only, via dlopen/dlsym. No core implementation source

@@ -78,8 +78,10 @@
 //!   intervals by searching for a descriptor table of the NW4E FAMILY
 //!   (enumerate shapes, validate each record, canonicalize phase aliases),
 //!   then tightening with [`delta_vote`] admissibility as the uniqueness
-//!   filter. Feeds the intervals `delta_vote` consumes; admits a table only
-//!   on that uniqueness, never by score.
+//!   filter. [`run_discovery_with_recovered_overlay_regions`] promotes a
+//!   load image only when exactly one table is admitted and that record's
+//!   unique delta-derived VA exactly matches its independently parsed
+//!   descriptor destination; a delta vote alone remains candidate evidence.
 //! - [`gp_base`]: IDO small-data `$gp` base recovery by constrained voting
 //!   (boot `lui`/`addiu` constructions, or a bounded access-offset histogram
 //!   fallback), admitted only on a unique dominating winner, then surfaces the
@@ -190,6 +192,18 @@ impl std::error::Error for DiscoveryError {}
 /// Named to keep [`run_discovery`]'s signature legible.
 pub type DescriptorTableInput = (banks::DescriptorTableShape, fn(u32) -> String);
 
+/// Configuration and deterministic naming for ROM-only recovered overlay
+/// mappings. No ROM identity, table offset, or answer-key value enters this
+/// input: the table location and every mapped interval are recovery outputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredOverlayInput {
+    pub search: overlay_regions::SearchConfig,
+    pub delta_vote: delta_vote::DeltaVoteConfig,
+    pub min_mapped_regions: u32,
+    pub table_name: String,
+    pub bank_name: banks::BankNamePattern,
+}
+
 /// Run every currently-implemented discovery phase (1: normalize, 2: boot
 /// bank + optional descriptor-table scan, 3: candidate harvest) over `rom_bytes` and return the
 /// resulting fact database. This is the crate's single deterministic
@@ -236,6 +250,35 @@ pub fn run_discovery_with_load_image_tables(
     harvest::harvest_discovered_candidates(&rom, &mut db)
         .expect("Phase 2 produced a malformed load-image mapping");
     Ok((rom, db))
+}
+
+/// Run discovery with overlay load images recovered mechanically from the
+/// normalized ROM itself. The returned recovery keeps every raw/admitted
+/// table visible; only the unique-table, matching-delta/destination proof rule
+/// in [`banks::scan_recovered_overlay_regions`] can feed Phase 3.
+pub fn run_discovery_with_recovered_overlay_regions(
+    rom_bytes: &[u8],
+    input: &RecoveredOverlayInput,
+) -> Result<(NormalizedRom, FactDb, overlay_regions::OverlayRecovery), RomRejectReason> {
+    let rom = rom::normalize(rom_bytes)?;
+    let recovery = overlay_regions::recover_overlay_regions(
+        &rom.bytes,
+        &input.search,
+        &input.delta_vote,
+        input.min_mapped_regions,
+    );
+    let mut db = FactDb::new();
+    banks::discover_boot_bank(&rom, &mut db);
+    banks::scan_recovered_overlay_regions(
+        &rom,
+        &recovery,
+        &input.table_name,
+        &input.bank_name,
+        &mut db,
+    );
+    harvest::harvest_discovered_candidates(&rom, &mut db)
+        .expect("Phase 2 produced a malformed recovered-overlay mapping");
+    Ok((rom, db, recovery))
 }
 
 /// Run discovery from a serializable external evidence manifest. The

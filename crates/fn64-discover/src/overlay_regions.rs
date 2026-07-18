@@ -48,6 +48,15 @@
 //! descriptor-table route recovers exactly those triples directly. `gate_
 //! overlay_regions` states this cross-check rather than wiring a pi_dma pass
 //! that structurally cannot resolve a table-driven copy.
+//!
+//! # Downstream proof boundary
+//!
+//! An admitted delta remains candidate mapping evidence in isolation.
+//! [`crate::banks::scan_recovered_overlay_regions`] requires exactly one
+//! admitted table and exact agreement between each record's delta-derived VA
+//! and its independently parsed descriptor destination before producing a
+//! proven bank-qualified load image. Multiple admissions, open deltas, and
+//! destination disagreements remain conflict/open facts.
 
 use crate::delta_vote::{infer_region_delta, DeltaVoteConfig, DeltaVoteOutcome};
 use serde::{Deserialize, Serialize};
