@@ -109,6 +109,7 @@
 //! assembly verification (Phase 8) are not yet implemented.
 
 pub mod aki_reference;
+pub mod answer_keys;
 pub mod banks;
 pub mod block_pack;
 pub mod block_proof;
