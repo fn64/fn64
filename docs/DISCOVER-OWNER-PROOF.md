@@ -1,6 +1,7 @@
 # Exact function-owner proof
 
-Status: implemented conservative proof boundary, 2026-07-17.
+Status: implemented conservative proof boundary, 2026-07-17; boundary
+attribution rules and reached-code executable derivation, 2026-07-18.
 
 `fn64-discover::partition` computes useful candidate ownership from CFG
 reachability. Candidate ownership is not emitter-ready metadata. The
@@ -16,9 +17,30 @@ mechanically established:
   coverage;
 - no competing root, overlapping owner, foreign incoming edge, observed
   interior entry, or interior callable root exists;
+- no unrefuted candidate/supported function-entry claim lies strictly inside
+  the span (`interior_candidate_entry`): the span may cover multiple
+  historical functions, e.g. fallthrough after a call to a non-returning
+  callee smearing into the next function's prologue, until the claim is
+  proven or rejected;
+- the bytes immediately after the span are attributed
+  (`trailing_unattributed_code` otherwise): the walk from the proposed end
+  must reach proven code, a function-entry claim site, or the image end
+  crossing only zero padding. Unreached non-zero words there are plausible
+  code no mechanism owns; NWXE measurement found byte-identical trailing
+  `jr $ra; nop` neighborhoods whose ground-truth attribution differs (a
+  dead tail of the previous function at `0x80031810`, a standalone stub
+  function at `0x80036770`), so no content rule can decide the boundary and
+  exactness is withheld;
 - no path runs off the decoded image; and
 - every indirect transfer in the bank is exhaustive, with the CFG target set
   matching one unambiguous exhaustive fact.
+
+The two boundary-attribution rules consume heuristic claims only in the
+withholding direction: a candidate claim can prevent an exact claim or
+attribute a neighboring boundary, but never itself becomes an owner, and a
+rejected claim stops blocking. `prove_exact_owners` therefore takes the
+materialized image bytes: the trailing walk inspects words the CFG never
+decoded.
 
 The last rule is deliberately stronger than ordinary CFG reachability. An
 open computed transfer elsewhere in the active bank could enter the proposed
@@ -63,6 +85,23 @@ historical function boundaries can block function AOT without blocking an
 already-reached code block. Unresolved indirect exits remain visible for the
 bank-qualified dispatcher; block proof does not claim their target set is
 closed.
+
+## Reached-code executable derivation
+
+`block_proof::conclude_reached_executable_ranges` turns the proven reached
+blocks into typed, evidence-carrying `ExecutableRange` facts (conclusion rule
+`reached_proven_code_closure`): a word proven reachable by CFG closure from an
+authoritative entry is demonstrably executed under the proven mapping, so it
+is proven executable. Exactly the reached bytes are claimed — adjacent proven
+blocks merge into one interval, gaps between reached blocks are never
+bridged, and region scores or content statistics play no role (a
+score-threshold promotion rule was measured and rejected; see
+`DISCOVER-PLAN.md`). A range subject already `Rejected`/`Conflict` is not
+silently promoted; the new reachability evidence is recorded and the
+conclusion surfaces as `Conflict`. `snapshot` composition runs this
+derivation between an authority-only owner pass and the final owner pass, so
+the former `not_proven_executable` blocker is discharged exactly where an
+assessment's full extent lies inside reached proven code.
 
 `BlockPackV1` is the serialization boundary for admitted blocks. It carries
 only bank identity, geometry, terminators, and content digests. Re-

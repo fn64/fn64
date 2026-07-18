@@ -118,6 +118,26 @@ pub enum OwnerBlocker {
     InteriorCallableEntry {
         pc: u32,
     },
+    /// An unrefuted (candidate/supported) function-entry claim lies strictly
+    /// inside the proposed extent. The extent may span multiple historical
+    /// functions — e.g. fallthrough after a call to a non-returning callee
+    /// smearing into the next function's prologue — so exactness is withheld
+    /// until the claim is proven (becoming an interior callable entry) or
+    /// rejected.
+    InteriorCandidateEntry {
+        pc: u32,
+    },
+    /// The first bytes after the proposed end that are unreached, non-zero,
+    /// and carry no function-entry claim. Such bytes are plausible code with
+    /// no attributed owner boundary: the historical function may continue
+    /// into them (compilers emit unreachable tails), and byte-identical
+    /// neighborhoods have been measured with opposite ground-truth
+    /// attributions, so no content rule can decide this. The right boundary
+    /// stays unproven.
+    TrailingUnattributedCode {
+        pc: u32,
+        word: u32,
+    },
     IncomingEdge {
         source: u32,
         target: u32,
@@ -208,10 +228,20 @@ struct Backing {
 
 /// Prove exact extents for every root represented by `cfg` or `partition`.
 ///
-/// `cfg` and `partition` must describe the same bank. Function-entry
-/// authority comes only from a `Proven` fact conclusion, a direct call from
-/// proven code, or an exhaustive computed call represented in the CFG.
-pub fn prove_exact_owners(cfg: &Cfg, partition: &Partition, facts: &FactDb) -> OwnerProofReport {
+/// `cfg` and `partition` must describe the same bank, and `image_bytes` at
+/// `image_va_start` must be the same materialized image the CFG was built
+/// from — the right-boundary rule inspects the unreached bytes immediately
+/// after each proposed extent, which the CFG itself never decoded.
+/// Function-entry authority comes only from a `Proven` fact conclusion, a
+/// direct call from proven code, or an exhaustive computed call represented
+/// in the CFG.
+pub fn prove_exact_owners(
+    cfg: &Cfg,
+    partition: &Partition,
+    facts: &FactDb,
+    image_bytes: &[u8],
+    image_va_start: u32,
+) -> OwnerProofReport {
     let mut roots: BTreeSet<u32> = cfg.proven_roots.iter().copied().collect();
     roots.extend(partition.owners.iter().map(|owner| owner.root_va));
     roots.extend(
@@ -243,6 +273,13 @@ pub fn prove_exact_owners(cfg: &Cfg, partition: &Partition, facts: &FactDb) -> O
         .proven_function_entries(&cfg.bank)
         .into_iter()
         .collect();
+    // Every unrefuted entry claim (candidate, supported, or proven). A claim
+    // attributes an owner boundary without itself proving an owner.
+    let entry_claims: BTreeSet<u32> = facts
+        .candidate_function_entries(&cfg.bank)
+        .into_iter()
+        .chain(proven_entries.iter().copied())
+        .collect();
     let bank_is_proven = facts
         .conclusion(&format!("bank:{}", cfg.bank))
         .is_some_and(|conclusion| conclusion.state == ProofState::Proven);
@@ -260,8 +297,11 @@ pub fn prove_exact_owners(cfg: &Cfg, partition: &Partition, facts: &FactDb) -> O
                 &duplicate_blocks,
                 &owner_of_block,
                 &proven_entries,
+                &entry_claims,
                 bank_is_proven,
                 &overlaps,
+                image_bytes,
+                image_va_start,
             )
         })
         .collect();
@@ -282,8 +322,11 @@ fn assess_root(
     duplicate_blocks: &BTreeSet<u32>,
     owner_of_block: &BTreeMap<u32, u32>,
     proven_entries: &BTreeSet<u32>,
+    entry_claims: &BTreeSet<u32>,
     bank_is_proven: bool,
     overlaps: &[(u32, u32)],
+    image_bytes: &[u8],
+    image_va_start: u32,
 ) -> OwnerAssessment {
     let entry = BankAddr::new(&cfg.bank, root);
     let mut blockers = BTreeSet::new();
@@ -374,6 +417,21 @@ fn assess_root(
             blockers.insert(OwnerBlocker::NotProvenExecutable);
         }
 
+        for &claim in entry_claims {
+            if claim > root && claim < owner.extent_end && !proven_entries.contains(&claim) {
+                blockers.insert(OwnerBlocker::InteriorCandidateEntry { pc: claim });
+            }
+        }
+        if let Some((pc, word)) = trailing_unattributed_code(
+            owner.extent_end,
+            cfg,
+            entry_claims,
+            image_bytes,
+            image_va_start,
+        ) {
+            blockers.insert(OwnerBlocker::TrailingUnattributedCode { pc, word });
+        }
+
         validate_incoming(
             owner,
             cfg,
@@ -409,6 +467,45 @@ fn assess_root(
         OwnerAssessment::Ambiguous { frontier }
     } else {
         OwnerAssessment::Candidate { frontier }
+    }
+}
+
+/// Walk the unreached bytes immediately after `extent_end` and return the
+/// first word that no mechanism attributes: not reached proven code, not the
+/// site of any function-entry claim, and not zero padding. `None` means the
+/// right boundary is closed — the walk hit reached code, an entry claim, the
+/// end of the materialized image, or the address-space end, with only zero
+/// words in between.
+fn trailing_unattributed_code(
+    extent_end: u32,
+    cfg: &Cfg,
+    entry_claims: &BTreeSet<u32>,
+    image_bytes: &[u8],
+    image_va_start: u32,
+) -> Option<(u32, u32)> {
+    let mut va = extent_end;
+    loop {
+        let offset = va.checked_sub(image_va_start)? as usize;
+        if offset.checked_add(4)? > image_bytes.len() {
+            // Ran past the materialized image: no bytes left to attribute.
+            return None;
+        }
+        if cfg.word_class.get(&va) == Some(&WordClass::ProvenCode) {
+            return None;
+        }
+        if entry_claims.contains(&va) {
+            return None;
+        }
+        let word = u32::from_be_bytes(
+            image_bytes[offset..offset + 4]
+                .try_into()
+                .expect("four bytes were just bounds-checked"),
+        );
+        if word != 0 {
+            return Some((va, word));
+        }
+        // Address-space end with only padding seen: boundary is closed.
+        va = va.checked_add(4)?;
     }
 }
 
@@ -915,7 +1012,7 @@ mod tests {
         let partition = partition(&cfg);
         let facts = facts_for(bytes.len() as u32, &[BASE]);
 
-        let report = prove_exact_owners(&cfg, &partition, &facts);
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         let OwnerAssessment::Proven { owner } = &report.assessments[0] else {
             panic!("expected exact owner: {:?}", report.assessments[0]);
         };
@@ -933,7 +1030,7 @@ mod tests {
         let partition = partition(&cfg);
         let facts = facts_for(bytes.len() as u32, &[]);
 
-        let report = prove_exact_owners(&cfg, &partition, &facts);
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         assert!(matches!(
             report.assessments[0],
             OwnerAssessment::Candidate { .. }
@@ -954,7 +1051,7 @@ mod tests {
             .conclude(subject, ProofState::Conflict, vec![], "test_conflict")
             .unwrap();
 
-        let report = prove_exact_owners(&cfg, &partition, &facts);
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         assert!(frontier(&report.assessments[0])
             .blockers
             .contains(&OwnerBlocker::NotProvenExecutable));
@@ -972,7 +1069,7 @@ mod tests {
         let partition = partition(&cfg);
         let facts = facts_for(bytes.len() as u32, &[BASE]);
 
-        let report = prove_exact_owners(&cfg, &partition, &facts);
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         let target_assessment = report
             .assessments
             .iter()
@@ -988,7 +1085,7 @@ mod tests {
         let partition = partition(&cfg);
         let facts = facts_for(bytes.len() as u32, &[BASE]);
 
-        let report = prove_exact_owners(&cfg, &partition, &facts);
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         assert!(frontier(&report.assessments[0])
             .blockers
             .contains(&OwnerBlocker::RanOffEnd { block_start: BASE }));
@@ -1002,7 +1099,7 @@ mod tests {
         let partition = partition(&cfg);
         let facts = facts_for(bytes.len() as u32, &[BASE]);
 
-        let report = prove_exact_owners(&cfg, &partition, &facts);
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         assert!(frontier(&report.assessments[0]).blockers.contains(
             &OwnerBlocker::InvalidInstruction {
                 pc: BASE,
@@ -1018,7 +1115,7 @@ mod tests {
         let partition = partition(&cfg);
         let facts = facts_for(bytes.len() as u32, &[BASE]);
 
-        let report = prove_exact_owners(&cfg, &partition, &facts);
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         assert!(frontier(&report.assessments[0])
             .blockers
             .contains(&OwnerBlocker::MissingDelaySlot { control_pc: BASE }));
@@ -1039,7 +1136,7 @@ mod tests {
             va_end: BASE + 8,
         });
 
-        let report = prove_exact_owners(&cfg, &partition, &facts);
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         assert!(matches!(
             report.assessments[0],
             OwnerAssessment::Ambiguous { .. }
@@ -1060,7 +1157,7 @@ mod tests {
             target: BankAddr::new("bank", BASE + 4),
         });
 
-        let report = prove_exact_owners(&cfg, &partition, &facts);
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         assert!(matches!(
             report.assessments[0],
             OwnerAssessment::Ambiguous { .. }
@@ -1087,7 +1184,7 @@ mod tests {
         let partition = partition(&cfg);
         let facts = facts_for(bytes.len() as u32, &[BASE]);
 
-        let report = prove_exact_owners(&cfg, &partition, &facts);
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         let caller = report
             .assessments
             .iter()
@@ -1111,7 +1208,7 @@ mod tests {
         let partition = partition(&cfg);
         let mut facts = facts_for(bytes.len() as u32, &[BASE]);
 
-        let missing = prove_exact_owners(&cfg, &partition, &facts);
+        let missing = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         assert!(frontier(&missing.assessments[0])
             .blockers
             .contains(&OwnerBlocker::ResolvedIndirectNotExhaustive { site: BASE }));
@@ -1133,7 +1230,7 @@ mod tests {
             memory_sources: vec![],
         });
 
-        let closed = prove_exact_owners(&cfg, &partition, &facts);
+        let closed = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         assert!(matches!(
             closed.assessments[0],
             OwnerAssessment::Proven { .. }
@@ -1147,7 +1244,7 @@ mod tests {
         let partition = partition(&cfg);
         let facts = facts_for(bytes.len() as u32, &[BASE, BASE + 4]);
 
-        let report = prove_exact_owners(&cfg, &partition, &facts);
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         assert!(report
             .assessments
             .iter()
@@ -1173,7 +1270,7 @@ mod tests {
             trace: "synthetic".into(),
         });
 
-        let report = prove_exact_owners(&cfg, &partition, &facts);
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         assert!(matches!(
             report.assessments[0],
             OwnerAssessment::Ambiguous { .. }
@@ -1194,7 +1291,7 @@ mod tests {
         let partition = partition(&cfg);
         let facts = facts_for(bytes.len() as u32, &[BASE]);
 
-        let report = prove_exact_owners(&cfg, &partition, &facts);
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         assert!(frontier(&report.assessments[0]).blockers.contains(
             &OwnerBlocker::WordNotProvenCode {
                 pc: BASE + 4,
@@ -1204,13 +1301,129 @@ mod tests {
     }
 
     #[test]
+    fn interior_candidate_entry_claim_withholds_exactness_until_resolved() {
+        let bytes = asm(&[NOP, NOP, JR_RA, NOP]);
+        let cfg = build_cfg("bank", &bytes, BASE, &[BASE]);
+        let partition = partition(&cfg);
+        let mut facts = facts_for(bytes.len() as u32, &[BASE]);
+        let interior = BankAddr::new("bank", BASE + 8);
+        let claim = facts.insert(Fact::FunctionEntryClaim {
+            target: interior.clone(),
+            detector: CandidateDetector::ProloguePattern,
+            evidence: FunctionEntryEvidence::Prologue {
+                stack_adjust: interior.clone(),
+                frame_size: 16,
+                pattern: ProloguePattern::LeafWithMatchedRestore,
+                corroborating_site: BankAddr::new("bank", BASE + 12),
+            },
+            proposed_state: ProofState::Candidate,
+        });
+        facts
+            .conclude(
+                function_entry_subject(&interior),
+                ProofState::Candidate,
+                vec![claim],
+                "test_interior_candidate",
+            )
+            .unwrap();
+
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
+        assert!(matches!(
+            report.assessments[0],
+            OwnerAssessment::Candidate { .. }
+        ));
+        assert!(frontier(&report.assessments[0])
+            .blockers
+            .contains(&OwnerBlocker::InteriorCandidateEntry { pc: BASE + 8 }));
+
+        // Rejecting the claim discharges the blocker: the extent is exact.
+        facts
+            .conclude(
+                function_entry_subject(&interior),
+                ProofState::Rejected,
+                vec![claim],
+                "test_refuted",
+            )
+            .unwrap();
+        let resolved = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
+        assert!(matches!(
+            resolved.assessments[0],
+            OwnerAssessment::Proven { .. }
+        ));
+    }
+
+    #[test]
+    fn trailing_unattributed_code_blocks_the_right_boundary() {
+        // The function returns at +4/+8; the unreached word after it is a
+        // bare `jr $ra` with no entry claim — plausible code attributed to
+        // nothing, so the proposed end stays unproven.
+        let bytes = asm(&[JR_RA, NOP, JR_RA, NOP]);
+        let cfg = build_cfg("bank", &bytes, BASE, &[BASE]);
+        let partition = partition(&cfg);
+        let mut facts = facts_for(bytes.len() as u32, &[BASE]);
+
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
+        assert!(matches!(
+            report.assessments[0],
+            OwnerAssessment::Candidate { .. }
+        ));
+        assert!(frontier(&report.assessments[0]).blockers.contains(
+            &OwnerBlocker::TrailingUnattributedCode {
+                pc: BASE + 8,
+                word: JR_RA,
+            }
+        ));
+
+        // An entry claim at exactly the boundary attributes the trailing
+        // bytes and closes the right edge.
+        let neighbor = BankAddr::new("bank", BASE + 8);
+        let claim = facts.insert(Fact::FunctionEntryClaim {
+            target: neighbor.clone(),
+            detector: CandidateDetector::JalTarget,
+            evidence: FunctionEntryEvidence::DirectJal {
+                call_site: BankAddr::new("bank", BASE + 0x100),
+            },
+            proposed_state: ProofState::Candidate,
+        });
+        facts
+            .conclude(
+                function_entry_subject(&neighbor),
+                ProofState::Candidate,
+                vec![claim],
+                "test_boundary_claim",
+            )
+            .unwrap();
+        let closed = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
+        assert!(matches!(
+            closed.assessments[0],
+            OwnerAssessment::Proven { .. }
+        ));
+    }
+
+    #[test]
+    fn zero_padding_to_the_image_end_keeps_the_right_boundary_closed() {
+        let bytes = asm(&[JR_RA, NOP, 0, 0]);
+        let cfg = build_cfg("bank", &bytes, BASE, &[BASE]);
+        let partition = partition(&cfg);
+        let facts = facts_for(bytes.len() as u32, &[BASE]);
+
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
+        assert!(matches!(
+            report.assessments[0],
+            OwnerAssessment::Proven { .. }
+        ));
+    }
+
+    #[test]
     fn report_is_byte_deterministic() {
         let bytes = asm(&[NOP, JR_RA, NOP]);
         let cfg = build_cfg("bank", &bytes, BASE, &[BASE]);
         let partition = partition(&cfg);
         let facts = facts_for(bytes.len() as u32, &[BASE]);
-        let left = serde_json::to_vec(&prove_exact_owners(&cfg, &partition, &facts)).unwrap();
-        let right = serde_json::to_vec(&prove_exact_owners(&cfg, &partition, &facts)).unwrap();
+        let left = serde_json::to_vec(&prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE))
+            .unwrap();
+        let right = serde_json::to_vec(&prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE))
+            .unwrap();
         assert_eq!(left, right);
     }
 }

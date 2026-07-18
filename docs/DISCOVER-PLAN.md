@@ -101,15 +101,45 @@ The byte-verified `ProgramSnapshotV1` now closes the native resident-bank
 passes into one artifact. With only the NWXE header entry as a traversal seed,
 the real-ROM gate produces 197 blocks, 27 owner assessments, zero partition
 ambiguities/overlaps, and 26 exact + 3 coarse answer-key grading matches with
-zero wrong splits. Ten complete compositions serialize byte-identically. Its
-owner frontier is more useful than a blended score:
+zero wrong splits. Ten complete compositions serialize byte-identically.
+
+Composition now derives proof-carrying executable evidence from the closure
+itself: the union of reached proven-code block intervals becomes typed,
+`Proven`-concluded `ExecutableRange` facts (rule
+`reached_proven_code_closure`), and owners are re-proven against them. A word
+reached by CFG closure from the authoritative entry is demonstrably executed
+under the proven mapping; exactly those bytes are claimed — adjacent blocks
+merge, but a gap between reached blocks is never bridged, and region scores
+play no role (already rejected as a promotion rule). This discharged the
+former `not_proven_executable` sole-blocker frontier (27 assessments, sole
+blocker for 25). Grading the newly admitted extents end-to-end against the
+dump key then exposed two over-claims — one owner truncated before an
+unreached trailing `jr $ra; nop` the key attributes to it, one owner smeared
+across a non-returning call's fallthrough into the next function's prologue —
+so exact-owner proof gained two typed withholding rules:
+`interior_candidate_entry` (an unrefuted candidate entry claim strictly
+inside the extent) and `trailing_unattributed_code` (unreached non-zero
+bytes at the extent end that no entry claim or reached code attributes;
+byte-identical neighborhoods were measured with opposite ground-truth
+attributions, so no content rule can decide them). The measured NWXE owner
+frontier is now:
 
 ```text
-not_proven_executable   27 assessments (sole blocker for 25)
-owner_not_contiguous     2 assessments
-malformed_block          1 assessment / 31 sites
-word_not_proven_code     1 assessment / 9 sites
+exact owners                20 of 27 assessments; all 20 extents equal the dump key (hard gate wrong=0)
+trailing_unattributed_code   5 assessments (sole blocker for 4)
+interior_candidate_entry     2 assessments (sole blocker for 1)
+owner_not_contiguous         2 assessments
+malformed_block              1 assessment / 31 sites
+word_not_proven_code         1 assessment / 9 sites
+not_proven_executable        1 assessment (the gap-spanning non-contiguous owner)
 ```
+
+The OoT boot bank gets the same treatment in `gate_b2`: its snapshot proves
+301/306 reached blocks (6,744 bytes, 35 intervals) and admits 32 of 45 owner
+assessments (31 at exact linker-map starts within their key slots plus one
+proven-`jal`-target interior split, hard gate wrong=0; the linker map derives
+each end from the next symbol start, so key extents include trailing padding
+and literal data that a code-extent proof must not claim).
 
 The parallel function-independent gate proves all 197 currently reached NWXE
 blocks (4,156 bytes) with exact ROM backing. Every discovered block start is
@@ -139,9 +169,11 @@ the resulting wild store still panics the host — the open U4 typed-memory-
 fault frontier in `UNIVERSAL-RUNTIME-PLAN.md`, pinned so it fails loudly
 when U4 lands.
 
-This orders the next work. First recover proof-carrying resident executable
-regions; it can admit 25 otherwise-closed owners immediately.
-Then replace the assumption that a function is one contiguous all-code byte
+This orders the next work. Proof-carrying resident executable regions are
+recovered (above): reached-code closure now feeds typed executable facts and
+exact owners are admitted and extent-graded, so the frontier has moved from
+"nothing is proven executable" to the boundary-attribution blockers listed in
+the histogram. Next, replace the assumption that a function is one contiguous all-code byte
 interval with the canonical block/data-object region model already planned in
 `DISCOVER-STORAGE.md`. Non-contiguous block ownership is normal when local
 jump tables, literal pools, unreachable padding, or split assembly regions lie
@@ -506,6 +538,17 @@ from `0/36` recovered to `13/36` exact, `16/36` partial, and `7/36`
 unrecovered. It also exposed 39 exploratory overlaps; those remain a
 diagnostic and the exact-owner gate still rejects them. This is the intended
 separation between coverage exploration and proof-qualified admission.
+
+Exact owners are no longer zero. With reached-proven-code executable
+derivation in `ProgramSnapshotV1` composition, the `gate_b2` snapshots admit
+20 of 27 NWXE boot-bank assessments (4,156 reached executable bytes in 24
+intervals) and 32 of 45 OoT boot-bank assessments (6,744 reached executable
+bytes in 35 intervals), every admitted extent agreeing with its answer key
+under a hard `wrong=0` gate. What remains blocked is typed:
+`trailing_unattributed_code` and `interior_candidate_entry` boundary
+attribution, non-contiguous owners, and the malformed/unproven-word cases the
+NWXE histogram above enumerates. NW4E still admits no exact owner — its resident
+grading path runs the exploratory CFG, not snapshot composition.
 
 The table is a reporting contract, not a static answer key. Gate binaries must
 emit the same fields for every phase so that a new rule can be evaluated by

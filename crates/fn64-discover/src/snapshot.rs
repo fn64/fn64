@@ -4,10 +4,17 @@
 //! V1 intentionally materializes one physical ROM-backed bank. It verifies
 //! the supplied bytes against [`NormalizedRom`] before analysis, runs Phase
 //! 4-6 closure, writes closure-derived facts into a cloned [`FactDb`], then
-//! partitions and proves owners from that same fact snapshot. Traversal seeds
-//! guide reachability but never become entry authority by themselves.
+//! partitions and proves owners from that same fact snapshot. Reached
+//! proven-code blocks additionally become typed `ExecutableRange` facts
+//! (exactly the reached bytes, gaps never bridged — see
+//! [`conclude_reached_executable_ranges`]) before the final owner pass, so
+//! executable coverage over reached code is evidence, not an input
+//! assumption. Traversal seeds guide reachability but never become entry
+//! authority by themselves.
 
-use crate::block_proof::{prove_reachable_blocks, BlockProofReport};
+use crate::block_proof::{
+    conclude_reached_executable_ranges, prove_reachable_blocks, BlockProofReport,
+};
 use crate::coverage::{report_with_owner_proofs, CoverageReport, OwnerProofCoverageError};
 use crate::facts::{
     BankAddr, Fact, FactDb, IndirectTransferKind, IndirectTransferState, RomAddressSpace,
@@ -90,6 +97,8 @@ pub enum OwnerBlockerKind {
     MultipleRomBackings,
     NotProvenExecutable,
     InteriorCallableEntry,
+    InteriorCandidateEntry,
+    TrailingUnattributedCode,
     IncomingEdge,
     ObservedInteriorEntry,
     ResolvedJumpLeavesOwner,
@@ -122,6 +131,8 @@ impl From<&OwnerBlocker> for OwnerBlockerKind {
             OwnerBlocker::MultipleRomBackings => Self::MultipleRomBackings,
             OwnerBlocker::NotProvenExecutable => Self::NotProvenExecutable,
             OwnerBlocker::InteriorCallableEntry { .. } => Self::InteriorCallableEntry,
+            OwnerBlocker::InteriorCandidateEntry { .. } => Self::InteriorCandidateEntry,
+            OwnerBlocker::TrailingUnattributedCode { .. } => Self::TrailingUnattributedCode,
             OwnerBlocker::IncomingEdge { .. } => Self::IncomingEdge,
             OwnerBlocker::ObservedInteriorEntry { .. } => Self::ObservedInteriorEntry,
             OwnerBlocker::ResolvedJumpLeavesOwner { .. } => Self::ResolvedJumpLeavesOwner,
@@ -492,8 +503,30 @@ pub fn compose_materialized_bank_v1(
     }
 
     let partition = partition(&closure.cfg);
-    let owner_proof = prove_exact_owners(&closure.cfg, &partition, &facts);
-    let block_proof = prove_reachable_blocks(&closure.cfg, &partition, &owner_proof, &facts);
+    // First owner pass supplies entry authority to block proof; executable
+    // evidence may not exist yet, so its `NotProvenExecutable` blockers are
+    // provisional and it is never serialized.
+    let authority_proof = prove_exact_owners(
+        &closure.cfg,
+        &partition,
+        &facts,
+        input.bytes,
+        input.va_start,
+    );
+    let block_proof = prove_reachable_blocks(&closure.cfg, &partition, &authority_proof, &facts);
+    // Bytes reached as proven code from an authoritative entry are proven
+    // executable — exactly those bytes, never the gaps between them. Record
+    // them as typed facts, then re-prove owners against the enriched
+    // evidence. Block proof itself does not consume executable ranges, and
+    // entry authority is unaffected, so no further fixpoint iteration exists.
+    conclude_reached_executable_ranges(&block_proof, &mut facts);
+    let owner_proof = prove_exact_owners(
+        &closure.cfg,
+        &partition,
+        &facts,
+        input.bytes,
+        input.va_start,
+    );
     let blocker_histogram = owner_blocker_histogram(&owner_proof);
     let coverage = report_with_owner_proofs(rom.len(), &facts, std::slice::from_ref(&owner_proof))?;
     let bank = BankSnapshotV1 {
@@ -561,6 +594,24 @@ mod tests {
     }
 
     fn facts_for(byte_len: u32, authoritative_entries: &[u32]) -> FactDb {
+        let mut facts = facts_without_executable(byte_len, authoritative_entries);
+        let executable = facts.insert(Fact::ExecutableRange {
+            bank: "bank".into(),
+            va_start: BASE,
+            va_end: BASE + byte_len,
+        });
+        facts
+            .conclude(
+                executable_range_subject("bank", BASE, BASE + byte_len),
+                ProofState::Proven,
+                vec![executable],
+                "test_executable",
+            )
+            .unwrap();
+        facts
+    }
+
+    fn facts_without_executable(byte_len: u32, authoritative_entries: &[u32]) -> FactDb {
         let mut facts = FactDb::new();
         let mapping = facts.insert(Fact::RomMapping {
             bank: "bank".into(),
@@ -576,19 +627,6 @@ mod tests {
                 ProofState::Proven,
                 vec![mapping],
                 "test_mapping",
-            )
-            .unwrap();
-        let executable = facts.insert(Fact::ExecutableRange {
-            bank: "bank".into(),
-            va_start: BASE,
-            va_end: BASE + byte_len,
-        });
-        facts
-            .conclude(
-                executable_range_subject("bank", BASE, BASE + byte_len),
-                ProofState::Proven,
-                vec![executable],
-                "test_executable",
             )
             .unwrap();
         for &entry in authoritative_entries {
@@ -708,6 +746,51 @@ mod tests {
         assert_eq!(snapshot.coverage.function_owners.exact_owners, 0);
         assert_eq!(snapshot.banks[0].block_proof.proven_blocks, 1);
         assert_eq!(snapshot.banks[0].block_proof.proven_bytes, 8);
+    }
+
+    #[test]
+    fn reached_closure_derives_executable_evidence_and_admits_owner() {
+        let bytes = asm(&[JR_RA, NOP]);
+        let rom = rom_with_bank(&bytes);
+        let facts = facts_without_executable(bytes.len() as u32, &[BASE]);
+        let snapshot = compose(&rom, &facts, &bytes, &[BASE]).unwrap();
+
+        // No executable evidence was supplied; the reached proven-code block
+        // itself became the typed proven range and admitted the owner.
+        assert_eq!(
+            snapshot.facts.proven_executable_ranges("bank"),
+            vec![(BASE, BASE + 8)]
+        );
+        assert_eq!(snapshot.coverage.function_owners.exact_owners, 1);
+        assert!(snapshot.banks[0].blocker_histogram.is_empty());
+    }
+
+    #[test]
+    fn owner_spanning_unreached_gap_stays_blocked() {
+        // `j` over two unreached words to a return block: closure reaches
+        // [BASE,BASE+8) and [BASE+0x10,BASE+0x18) but never the gap between.
+        let j_over_gap = 0x0800_0000 | (((BASE + 0x10) >> 2) & 0x03ff_ffff);
+        let bytes = asm(&[j_over_gap, NOP, NOP, NOP, JR_RA, NOP]);
+        let rom = rom_with_bank(&bytes);
+        let facts = facts_without_executable(bytes.len() as u32, &[BASE]);
+        let snapshot = compose(&rom, &facts, &bytes, &[BASE]).unwrap();
+
+        // Both reached blocks became proven executable ranges; the gap
+        // between them was not smeared over.
+        assert_eq!(
+            snapshot.facts.proven_executable_ranges("bank"),
+            vec![(BASE, BASE + 8), (BASE + 0x10, BASE + 0x18)]
+        );
+        // The owner's proposed extent spans the gap, so admission stays
+        // blocked: derived ranges prove reached bytes, never the extent.
+        assert_eq!(snapshot.coverage.function_owners.exact_owners, 0);
+        let histogram = &snapshot.banks[0].blocker_histogram;
+        assert!(histogram
+            .iter()
+            .any(|summary| summary.kind == OwnerBlockerKind::NotProvenExecutable));
+        assert!(histogram
+            .iter()
+            .any(|summary| summary.kind == OwnerBlockerKind::OwnerNotContiguous));
     }
 
     #[test]
