@@ -34,7 +34,7 @@ are not an implementation source.
 
 | Area | Present mechanism | Closure gap | Mechanical gate |
 |---|---|---|---|
-| CPU decode | Documented MIPS III encodings decode in `fn64-recomp-rs`; ordinary integer, control, memory, delay-slot, and much COP1 behavior exists. | Exceptions, CP0/TLB, interrupt entry, and exact FPU environment are incomplete. Several faulting operations still panic as host failures. | Per-instruction differential plus architectural exception-state tests. |
+| CPU decode | Documented MIPS III encodings decode in `fn64-recomp-rs`; ordinary integer, control, memory, delay-slot, and much COP1 behavior exists. In the bank/sparse runner lane a guest load/store outside backed RDRAM is now a typed `CpuFaultKind::MemoryFault { addr }` (`BlockExit::Fault`) naming the faulting PC and guest address, not a host panic. | Exceptions, CP0/TLB, interrupt entry, and exact FPU environment are incomplete. The memory fault models "outside backed RDRAM"; real address-error/TLB semantics (BadVAddr, EPC, vectoring) are absent, and the whole-function lane still panics on such accesses. | Per-instruction differential plus architectural exception-state tests. |
 | CPU dispatch | The function lane remains function-entry based. The working-tree bank lane emits every admitted aligned entry, preserves sparse code/data holes, and returns typed transfer/fault outcomes; a typed outer dispatcher follows direct/resolved transfers under one total instruction budget. `BlockProgram` atomically pairs disjoint bank-bound spans with the generated callable and checks sparse admission before invocation. | The owned program is not connected to the live executor and global function lookup is still bare VRAM. | Enter any aligned interior PC; reject a bounding hole; distinguish two same-VA banks; typed cross-bank exits; integrate without changing ordinary-entry results. |
 | Dynamic code | PI DMA activates pre-registered overlays. | No runtime code admission, generation identity, translation, or executable-write invalidation. | Upload/execute/rewrite the same virtual page and prove the new generation runs. |
 | Clock/checkpoints | The coroutine executor owns ordered virtual time and explicit yield points. | Long functions and raw polling loops cannot observe device progress or interrupt preemption at instruction/block boundaries. | Cycle-budgeted blocks stop at deterministic deadlines and service a higher-priority wakeup. |
@@ -186,11 +186,11 @@ executes the generated runner as a host binary: duplicate registration
 rejected, entry and derived register-only interior-PC runs exiting typed,
 hole/unaligned/unknown-bank entries faulting typed, a minimum-budget
 checkpoint, and a bounded transfer-following dispatch loop over real pack
-code. The same harness pins U4's opening explicitly: entering `entry+4`
-skips the entry stub's `lui`, the resulting wild store panics the host
-instead of raising a typed VR4300 memory fault, and the probe asserts that
-panic so it fails loudly the day U4 lands. Live dispatcher ownership
-and guest-cycle charging remain open.
+code. The same harness exercises U4's first slice: entering `entry+4`
+skips the entry stub's `lui`, and the resulting wild store now raises a
+typed VR4300 `MemoryFault` naming the faulting PC and wild guest address
+instead of panicking the host — the probe asserts that exact fault. Live
+dispatcher ownership and guest-cycle charging remain open.
 
 ### U2 — deterministic PI/device vertical slice
 
@@ -228,6 +228,27 @@ and prove no stale block can run.
 
 Gate: zero unsupported documented CPU encodings/effects in the executable
 corpus plus focused hardware/manual-derived architectural vectors.
+
+First slice (landed): the bank/sparse runner lane no longer panics the host
+on a guest data access outside backed RDRAM. Emitted loads/stores call
+`Rdram::try_*` checked accessors; an out-of-bounds effective address returns
+`BlockRun { exit: BlockExit::Fault(CpuFault { at, kind: MemoryFault { addr } }), .. }`,
+where `at` names the faulting `(BankId, PC)` and `addr` is the full-width
+guest virtual effective address. The reported `instructions` count excludes
+the faulting instruction (only instructions that fully retired before it); a
+fault in a branch delay slot annuls the branch, so neither the branch nor the
+delay slot is counted and no `Transfer` is emitted. Covered by
+`fn64-recomp-rs` `tests/bank_runner.rs` (store, load, and delay-slot cases)
+and the NWXE `gate_b2` probe. The whole-function (oracle) lane is deliberately
+unchanged: it keeps the unchecked `Rdram` accessors and their host panic, and
+its codegen stays byte-identical.
+
+Still open in U4: this models only "outside backed RDRAM storage". It is not
+address-error/TLB semantics — there is no `BadVAddr`/`EPC`/`Cause` capture, no
+TLB-miss versus address-error distinction, no exception vectoring, and no
+alignment (`AdEL`/`AdES`) faulting. Those, plus CP0/Count/Compare, privilege,
+BD/EPC, interrupt arbitration, and the COP1 environment items above, remain
+open.
 
 ### U5 — device closure
 

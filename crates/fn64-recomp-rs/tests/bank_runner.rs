@@ -392,6 +392,208 @@ fn legacy_function_runner_snapshots_computed_jr_before_delay_slot() {
     );
 }
 
+/// Compile a generated bank runner plus a `main` body into a host binary and
+/// run it, asserting a clean exit. Returns the harness stdout. Mirrors the
+/// infrastructure in [`emitted_bank_runner_compiles_and_executes_from_arbitrary_pcs`]
+/// so the memory-fault probes execute real generated code rather than matching
+/// on emitted text.
+fn compile_and_run(emitted: &str, main_body: &str) -> String {
+    let source = format!(
+        r#"#![allow(unused_imports)]
+use fn64_recomp_rs::{{
+    BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeSpan, CpuFault,
+    CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget,
+    ProgramError, Rdram, RecompContext,
+}};
+
+{emitted}
+
+fn main() {{
+{main_body}
+}}
+"#
+    );
+
+    let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let stamp = format!("{:?}", std::time::SystemTime::now());
+    let key: String = stamp.chars().filter(char::is_ascii_alphanumeric).collect();
+    let source_path = out_dir.join(format!("fn64_mem_fault_gate_{key}.rs"));
+    let binary_path = out_dir.join(format!("fn64_mem_fault_gate_{key}"));
+    std::fs::write(&source_path, source).expect("write generated fault-gate source");
+
+    let deps = std::env::current_exe()
+        .expect("current integration-test executable")
+        .parent()
+        .expect("target deps directory")
+        .to_path_buf();
+    let rlib = current_rlib(&deps);
+    let compile = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .arg("--edition=2021")
+        .arg(&source_path)
+        .arg("--extern")
+        .arg(format!("fn64_recomp_rs={}", rlib.display()))
+        .arg("-L")
+        .arg(format!("dependency={}", deps.display()))
+        .arg("-o")
+        .arg(&binary_path)
+        .output()
+        .expect("invoke rustc for generated fault gate");
+    assert!(
+        compile.status.success(),
+        "generated fault gate did not compile:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&binary_path)
+        .output()
+        .expect("run generated fault gate");
+    assert!(
+        run.status.success(),
+        "generated fault gate failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    String::from_utf8_lossy(&run.stdout).into_owned()
+}
+
+// A synthetic bank whose entry stub loads a high base ($t0 = 0xFFFFFFFF_80000000
+// via LUI) and then touches offset 0x40 into it — guest VA 0xFFFFFFFF_80000040,
+// physical byte 0x40. Run against an Rdram far smaller than 0x40 bytes, that
+// access is outside backed storage: the block lane must raise a typed
+// MemoryFault instead of the host slice-range panic the function lane keeps.
+const FAULT_BASE: u32 = 0x8000_1000;
+// Effective address of the faulting access: LUI $t0,0x8000 leaves $t0 =
+// sign-extended 0xFFFFFFFF_80000000, plus the +0x40 store/load offset.
+const FAULT_ADDR: u64 = 0xFFFF_FFFF_8000_0040;
+
+#[test]
+fn bank_store_outside_backed_rdram_is_a_typed_memory_fault() {
+    // lui $t0,0x8000 ; sw $v0,0x40($t0) ; jr $ra ; nop
+    let words = [0x3C08_8000u32, 0xAD02_0040, 0x03E0_0008, 0x0000_0000];
+    let emitted = emit_bank_runner(&BankInput {
+        name: "store_fault_bank",
+        bank: BankId::new(0x51),
+        vram: FAULT_BASE,
+        words: &words,
+    });
+    let stdout = compile_and_run(
+        &emitted,
+        &format!(
+            r#"    let mut storage = vec![0u8; 16];
+    let mut mem = Rdram::new(&mut storage);
+    let mut ctx = RecompContext::new();
+    let run = store_fault_bank(
+        ExecutionKey::new(BankId::new(0x51), GuestPc::new({FAULT_BASE:#010X})),
+        InstructionBudget::new(64).unwrap(),
+        &mut ctx,
+        &mut mem,
+    );
+    // The LUI retired; the faulting SW did not. Excludes the faulting instruction.
+    assert_eq!(run.instructions, 1, "expected only the LUI to retire: {{run:?}}");
+    match run.exit {{
+        BlockExit::Fault(CpuFault {{ at, kind: CpuFaultKind::MemoryFault {{ addr }} }}) => {{
+            assert_eq!(at, ExecutionKey::new(BankId::new(0x51), GuestPc::new({store_pc:#010X})));
+            assert_eq!(addr, {FAULT_ADDR:#018X}u64);
+            println!("store fault at pc={{}} addr={{addr:#018X}}", at.pc);
+        }}
+        other => panic!("expected typed MemoryFault, got {{other:?}}"),
+    }}"#,
+            store_pc = FAULT_BASE + 4,
+        ),
+    );
+    assert!(stdout.contains("store fault"), "{stdout}");
+}
+
+#[test]
+fn bank_load_outside_backed_rdram_is_a_typed_memory_fault() {
+    // lui $t0,0x8000 ; lw $v0,0x40($t0) ; jr $ra ; nop
+    let words = [0x3C08_8000u32, 0x8D02_0040, 0x03E0_0008, 0x0000_0000];
+    let emitted = emit_bank_runner(&BankInput {
+        name: "load_fault_bank",
+        bank: BankId::new(0x52),
+        vram: FAULT_BASE,
+        words: &words,
+    });
+    let stdout = compile_and_run(
+        &emitted,
+        &format!(
+            r#"    let mut storage = vec![0u8; 16];
+    let mut mem = Rdram::new(&mut storage);
+    let mut ctx = RecompContext::new();
+    let run = load_fault_bank(
+        ExecutionKey::new(BankId::new(0x52), GuestPc::new({FAULT_BASE:#010X})),
+        InstructionBudget::new(64).unwrap(),
+        &mut ctx,
+        &mut mem,
+    );
+    assert_eq!(run.instructions, 1, "expected only the LUI to retire: {{run:?}}");
+    match run.exit {{
+        BlockExit::Fault(CpuFault {{ at, kind: CpuFaultKind::MemoryFault {{ addr }} }}) => {{
+            assert_eq!(at, ExecutionKey::new(BankId::new(0x52), GuestPc::new({load_pc:#010X})));
+            assert_eq!(addr, {FAULT_ADDR:#018X}u64);
+            // The destination register keeps its old value; the load never landed.
+            assert_eq!(ctx.r_u32(2), 0);
+            println!("load fault at pc={{}} addr={{addr:#018X}}", at.pc);
+        }}
+        other => panic!("expected typed MemoryFault, got {{other:?}}"),
+    }}"#,
+            load_pc = FAULT_BASE + 4,
+        ),
+    );
+    assert!(stdout.contains("load fault"), "{stdout}");
+}
+
+#[test]
+fn bank_fault_in_a_branch_delay_slot_does_not_commit_the_branch() {
+    // lui $t0,0x8000 ; beq $zero,$zero,-2 ; sw $v0,0x40($t0) (delay) ; jr $ra ; nop
+    //
+    // The BEQ target is BASE (a valid in-bank arm), but its delay-slot store
+    // faults. Architecturally a delay-slot exception annuls the branch: the
+    // runner must return the typed fault, NOT a Transfer to the branch target,
+    // and count only the instructions that retired before the branch (the LUI).
+    let words = [
+        0x3C08_8000u32, // lui $t0,0x8000
+        0x1000_FFFE,    // beq $zero,$zero,-2  (target = BASE)
+        0xAD02_0040,    // sw  $v0,0x40($t0)   (delay slot: faults)
+        0x03E0_0008,    // jr  $ra
+        0x0000_0000,    // nop
+    ];
+    let emitted = emit_bank_runner(&BankInput {
+        name: "delay_fault_bank",
+        bank: BankId::new(0x53),
+        vram: FAULT_BASE,
+        words: &words,
+    });
+    let stdout = compile_and_run(
+        &emitted,
+        &format!(
+            r#"    let mut storage = vec![0u8; 16];
+    let mut mem = Rdram::new(&mut storage);
+    let mut ctx = RecompContext::new();
+    let run = delay_fault_bank(
+        ExecutionKey::new(BankId::new(0x53), GuestPc::new({FAULT_BASE:#010X})),
+        InstructionBudget::new(64).unwrap(),
+        &mut ctx,
+        &mut mem,
+    );
+    // Only the LUI retired; the branch is annulled by the delay-slot fault.
+    assert_eq!(run.instructions, 1, "delay-slot fault must not retire the branch/delay pair: {{run:?}}");
+    match run.exit {{
+        BlockExit::Fault(CpuFault {{ at, kind: CpuFaultKind::MemoryFault {{ addr }} }}) => {{
+            assert_eq!(at, ExecutionKey::new(BankId::new(0x53), GuestPc::new({delay_pc:#010X})));
+            assert_eq!(addr, {FAULT_ADDR:#018X}u64);
+            println!("delay-slot fault at pc={{}} addr={{addr:#018X}}, branch not committed", at.pc);
+        }}
+        BlockExit::Transfer(_) => panic!("branch committed despite delay-slot fault: {{run:?}}"),
+        other => panic!("expected typed MemoryFault, got {{other:?}}"),
+    }}"#,
+            delay_pc = FAULT_BASE + 8,
+        ),
+    );
+    assert!(stdout.contains("branch not committed"), "{stdout}");
+}
+
 #[test]
 fn bank_ending_inside_a_delay_slot_is_rejected_loudly() {
     let result = std::panic::catch_unwind(|| {

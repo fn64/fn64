@@ -165,9 +165,11 @@ mechanically derived register-only interior PC entered mid-block, the pack
 hole/unaligned/unknown-bank entries all faulting typed, a minimum-budget
 checkpoint, and a bounded transfer-following dispatch loop. A separate
 probe enters `entry+4` (skipping the entry stub's `lui`) and asserts that
-the resulting wild store still panics the host — the open U4 typed-memory-
-fault frontier in `UNIVERSAL-RUNTIME-PLAN.md`, pinned so it fails loudly
-when U4 lands.
+the resulting wild store now returns a typed VR4300 `MemoryFault` naming the
+faulting PC and its wild guest address `0xffffffffffffb4c0` — the first slice
+of U4 (`UNIVERSAL-RUNTIME-PLAN.md`) landed. The probe still fails loudly if
+that access stops faulting typed; full address-error/TLB vectoring remains
+open U4 scope.
 
 This orders the next work. Proof-carrying resident executable regions are
 recovered (above): reached-code closure now feeds typed executable facts and

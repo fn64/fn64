@@ -84,11 +84,29 @@ impl fmt::Display for ExecutionKey {
 }
 
 /// Why CPU execution could not begin or continue at an [`ExecutionKey`].
+///
+/// `MemoryFault` models a guest load/store whose effective address lands
+/// outside the backed RDRAM storage. It is deliberately narrower than the
+/// real VR4300 exception surface: it does *not* yet carry a coprocessor-0
+/// cause code, a `BadVAddr`/`EPC` snapshot, TLB miss vs. address-error
+/// distinction, or exception vectoring. Those remain open U4 scope
+/// (`docs/UNIVERSAL-RUNTIME-PLAN.md`). What it does carry is enough to name
+/// the exact fault deterministically: the faulting PC lives in
+/// [`CpuFault::at`] and the faulting guest virtual address is `addr`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CpuFaultKind {
     UnalignedPc,
     UnknownBank,
-    UnmappedPc { bank_start: u32, bank_end: u32 },
+    UnmappedPc {
+        bank_start: u32,
+        bank_end: u32,
+    },
+    /// A guest data access whose effective address is outside backed RDRAM.
+    /// `addr` is the full-width guest virtual effective address computed by
+    /// the load/store (base register plus sign-extended offset).
+    MemoryFault {
+        addr: u64,
+    },
 }
 
 /// A guest CPU fault with the exact bank-qualified destination that caused it.
@@ -109,6 +127,11 @@ impl fmt::Display for CpuFault {
             } => write!(
                 f,
                 "unmapped execution PC at {}; bank interval is {bank_start:#010X}..{bank_end:#010X}",
+                self.at
+            ),
+            CpuFaultKind::MemoryFault { addr } => write!(
+                f,
+                "guest memory access outside backed RDRAM at {}; effective address {addr:#018X}",
                 self.at
             ),
         }
