@@ -415,8 +415,12 @@ fn main() {{
     );
 
     let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let stamp = format!("{:?}", std::time::SystemTime::now());
-    let key: String = stamp.chars().filter(char::is_ascii_alphanumeric).collect();
+    // A process-unique key: `SystemTime` alone collides when two fault-gate
+    // tests in this binary run in parallel and format the same instant, which
+    // races their generated source/binary paths. A monotonic counter
+    // disambiguates them deterministically.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let key = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let source_path = out_dir.join(format!("fn64_mem_fault_gate_{key}.rs"));
     let binary_path = out_dir.join(format!("fn64_mem_fault_gate_{key}"));
     std::fs::write(&source_path, source).expect("write generated fault-gate source");

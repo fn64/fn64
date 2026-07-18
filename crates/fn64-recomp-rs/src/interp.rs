@@ -63,6 +63,25 @@ pub struct UnsupportedOp {
     pub at: ExecutionKey,
     /// The decoded instruction (its `Debug` names the opcode in diagnostics).
     pub instruction: Instruction,
+    /// The raw 32-bit encoding of the unsupported instruction. Kept alongside
+    /// the decoded form so a dispatcher lane can surface a typed
+    /// [`CpuFaultKind::UnsupportedInstruction`] naming the exact opcode without
+    /// re-resolving the word from the catalog.
+    pub word: u32,
+}
+
+impl UnsupportedOp {
+    /// Surface this translator/runtime coverage boundary as the typed guest
+    /// [`CpuFault`] the block dispatcher understands. The two are deliberately
+    /// distinct types — an [`UnsupportedOp`] is a *lane* limitation, a
+    /// [`CpuFault`] is the dispatcher's uniform `BlockExit::Fault` currency — so
+    /// the conversion is explicit rather than a `From` that blurs the boundary.
+    pub fn into_cpu_fault(self) -> CpuFault {
+        CpuFault {
+            at: self.at,
+            kind: CpuFaultKind::UnsupportedInstruction { word: self.word },
+        }
+    }
 }
 
 /// Outcome of executing exactly one instruction (and, for a control transfer,
@@ -170,8 +189,8 @@ impl Interp<'_> {
                 // through the same catalog resolution so a delay slot in a hole
                 // faults typed rather than reading out of the bank.
                 let delay_pc = pc.wrapping_add(4);
-                let delay = match self.resolve(delay_pc) {
-                    Ok(dword) => decode(dword),
+                let (delay_word, delay) = match self.resolve(delay_pc) {
+                    Ok(dword) => (dword, decode(dword)),
                     Err(fault) => {
                         // The transfer/delay pair is indivisible: a missing delay
                         // slot annuls the branch; nothing in this pair retires.
@@ -179,7 +198,7 @@ impl Interp<'_> {
                     }
                 };
 
-                match self.control_transfer(pc, instr, delay_pc, delay, ctx, mem) {
+                match self.control_transfer(pc, instr, delay_pc, delay_word, delay, ctx, mem) {
                     Ok(Step::Exit { exit, retired }) => {
                         let executed = executed + retired;
                         return Ok(BlockRun::new(exit, executed));
@@ -198,7 +217,7 @@ impl Interp<'_> {
             }
 
             // Ordinary straight-line instruction.
-            match self.straight(pc, instr, ctx, mem) {
+            match self.straight(pc, word, instr, ctx, mem) {
                 Ok(Step::Fallthrough { next, retired }) => {
                     executed += retired;
                     if self.contains(next) {
@@ -282,11 +301,13 @@ impl Interp<'_> {
     /// typed [`BlockExit`]. `retired` is 2 on a committed branch/delay pair; a
     /// delay-slot [`CpuFault`] surfaces as `Err(StepFault::Cpu)` and the caller
     /// charges 0 (the branch is annulled).
+    #[allow(clippy::too_many_arguments)]
     fn control_transfer(
         &self,
         pc: u32,
         instr: Instruction,
         delay_pc: u32,
+        delay_word: u32,
         delay: Instruction,
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
@@ -299,7 +320,7 @@ impl Interp<'_> {
         // Run the delay slot as an ordinary instruction. It may fault (memory)
         // or be unsupported; either annuls the branch and propagates typed.
         let run_delay = |ctx: &mut RecompContext, mem: &mut Rdram<'_>| -> Result<(), StepFault> {
-            match self.straight(delay_pc, delay, ctx, mem)? {
+            match self.straight(delay_pc, delay_word, delay, ctx, mem)? {
                 Step::Fallthrough { .. } => Ok(()),
                 Step::Exit { .. } => {
                     unreachable!("a delay-slot instruction is never itself a control transfer")
@@ -391,6 +412,7 @@ impl Interp<'_> {
     fn straight(
         &self,
         pc: u32,
+        word: u32,
         instr: Instruction,
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
@@ -407,6 +429,7 @@ impl Interp<'_> {
             StepFault::Unsupported(UnsupportedOp {
                 at: self.key(pc),
                 instruction: instr,
+                word,
             })
         };
         exec_straight(instr, ctx, mem, &mem_fault, &unsupported)?;
