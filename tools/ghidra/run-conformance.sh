@@ -105,6 +105,25 @@ cargo run --quiet --manifest-path "$repo/Cargo.toml" -p fn64-discover --bin gate
     "$work/out/bank-a-seeded.jsonl" \
     "$work/out/bank-b-unseeded.jsonl"
 
+# Stream digests recorded in tools/ghidra/README.md ("Measured conformance").
+# They are stable for the pinned Ghidra 12.1.2 build (the JSONL embeds the
+# build digest); a different Ghidra build fails here by design.
+expected_a_seeded=193ce1641402c9f4c436a7abca70030970859dcb12895535661f863a7fa45e0f
+expected_a_unseeded=953c0a01d81dbdd4fb05c9c02d6664c09610254da22970b4246ee9a55892b807
+expected_b_unseeded=8d3fdcc8e222d598ea815703296d403a693f192e98639d1ee4657dfa5c5e8e31
+for pair in \
+    "bank-a-seeded $expected_a_seeded" \
+    "bank-a-unseeded $expected_a_unseeded" \
+    "bank-b-unseeded $expected_b_unseeded"; do
+    stream=${pair% *}
+    expected=${pair#* }
+    got=$(sha "$work/out/$stream.jsonl")
+    if [ "$got" != "$expected" ]; then
+        echo "$stream.jsonl sha256 $got != recorded $expected (pinned Ghidra 12.1.2)" >&2
+        exit 1
+    fi
+done
+
 if ! grep -q 'ghidra:function-entry:bank-a:80001020' "$work/out/bank-a-unseeded.jsonl"; then
     echo "bank A did not discover its direct-call target" >&2
     exit 1

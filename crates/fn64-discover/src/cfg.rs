@@ -61,7 +61,7 @@ pub enum ControlOp {
 /// (they are `ControlOp::Plain` from the caller's perspective, but `None`
 /// here specifically flags "not decodable as *any* recognized encoding",
 /// which is different from "decodable and ordinary" -- see [`decode_word`]).
-fn classify_control(word: u32) -> ControlOp {
+pub fn classify_control(word: u32) -> ControlOp {
     use Instruction::*;
 
     match decode(word) {
@@ -117,7 +117,7 @@ fn branch_target(pc: u32, imm: u32) -> u32 {
 
 /// Resolve a `j`/`jal`'s 26-bit pseudo-region target: high 4 bits of
 /// `(pc + 4)` combined with `target26 << 2`.
-fn region_target(pc: u32, target26: u32) -> u32 {
+pub fn region_target(pc: u32, target26: u32) -> u32 {
     ((pc.wrapping_add(4)) & 0xf000_0000) | (target26 << 2)
 }
 

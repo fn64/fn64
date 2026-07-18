@@ -70,7 +70,9 @@ lower bound). Repetitive normalized bodies were reported as ambiguous rather
 than selected. CFG-structure matching and external similarity tools should
 therefore concentrate on the unmatched remainder. Ten consecutive bidirectional
 gate runs produced the same output SHA-256
-`d808f8916d66dee749244d7b15912525566daec1dc3b10d48d44697d76431290`.
+`d808f8916d66dee749244d7b15912525566daec1dc3b10d48d44697d76431290` (no test
+re-checks this historical digest: its evidence-manifest inputs were
+session-local and are not preserved on disk).
 
 An unseeded spimdisasm 1.42.2 run over only NWXE's externally supplied
 resident text interval proposed 899 entries against 847 known entries. It
@@ -122,8 +124,9 @@ terminators, and per-block digests without ROM words. Materialization
 re-verifies the normalized ROM and every block digest, then feeds disjoint
 spans directly to the typed sparse arbitrary-PC emitter. The real NWXE gate
 emits 197 blocks / 1,039 words, obtains pack SHA-256
-`5944f1a0c63523591cbef33c4856c594b2cca38466945bc63da35a7459dace44`,
-and compiles the generated runner with `rustc`. Addresses in gaps receive no
+`5944f1a0c63523591cbef33c4856c594b2cca38466945bc63da35a7459dace44` (no test
+re-checks this digest until ROADMAP H3 makes `gate_b2`'s compile-time input
+paths reproducible), and compiles the generated runner with `rustc`. Addresses in gaps receive no
 dispatch arm; static and computed transfers into them remain unresolved.
 
 This orders the next work. First recover proof-carrying resident executable
@@ -279,7 +282,8 @@ the post-clear constructed jump without naming that jump's source-level role.
 On the two current AKI grading ROMs it derives, rather than embeds, the
 different BSS ranges and reaches the same held-out entry target. Ten
 consecutive real-ROM gate runs produced the same output SHA-256
-`5a67f5e471bad44bbb85aba27decd4ac831d93f2a24f0de1b329c3393bfec921`.
+`5a67f5e471bad44bbb85aba27decd4ac831d93f2a24f0de1b329c3393bfec921`,
+re-checkable via `scripts/gate-determinism.sh`.
 This is a narrow loader fact, not general overlay discovery. Correct PI/EPI
 slicing and normalized record-use recovery now exist, but the interprocedural
 producer connecting real wrapper loads to those inputs remains open.
@@ -469,13 +473,46 @@ counts. A phase may increase function recall while reducing precision; that
 is progress only when the newly reached bytes are either proven or explicitly
 left in the unresolved frontier.
 
-Static NW4E selector evidence is now recorded in `aki_reference::NW4E_SELECTOR`:
-the dispatcher is VA `0x80027488`, it reads the flag word at `0x800a10b0`, and
-the observed branch masks are `0x1`, `0x8`, `0x40`, with loop mask `0x2`.
-These masks establish control-flow predicates only; they do not assert which
-runtime states set the flag.
-The dispatcher loads R4 after the flag-controlled loop and loads R5 only when
-`flag & 0x40 != 0`; R1 is loaded on every loop iteration.
+Static NW4E selector evidence is recorded in `aki_reference::NW4E_SELECTOR`
+and mechanically re-derived by `gate_selector`. The dispatcher is VA
+`0x80026888` (ROM `0x27488`); an earlier record said `0x80027488` because it
+assumed a `VA = ROM + 0x8000_0000` resident delta, which contradicts the
+byte-verified boot facts (header entry `0x80000400`, IPL3 copy source ROM
+`0x1000`, so the delta is `0x7fff_f400`). The correction was disambiguated
+mapping-independently: all twelve absolute `jal` targets inside the
+dispatcher land on `addiu $sp,$sp,-N` prologues only under the corrected
+delta. The dispatcher reads the flag word at `0x800a10b0` with branch masks
+`0x1` (skip R2), `0x8` (skip R3), `0x40` (take R5), loop mask `0x2`, loads R4
+after the flag-controlled loop, and re-loads R1 every iteration. The masks
+establish control-flow predicates only; they do not assert which runtime
+states set the flag.
+
+`gate_selector` additionally establishes, over the NW4E ROM:
+
+- The dispatcher zero-initializes the flag itself (`sw $zero` at
+  `0x800268f0`) and writes a companion mode byte at `0x80097fd8` with
+  per-branch constants (0 init/R3, 3 R2, 2 R5, 1 after the loop).
+- No `j`/`jal`/branch in any canonical bank targets the dispatcher. Its
+  entry is data-derived: the wrapper at `0x80026830` materializes the
+  dispatcher address into `$a2` and passes it to the thread create/start
+  pair (`0x80037520`/`0x800376e0`).
+- A linear HI/LO cross-reference sweep (`xref::scan_global_refs`, candidate
+  evidence only) finds exactly eight flag stores: the resident init plus
+  seven overlay stores — R2 `0x80106940` (linear value `0x22`), R2
+  `0x80106dac` (join-dependent, reported unresolved, byte-inspected values
+  `0x2`/`0xe`), R2 `0x80106dec` (zero), R3 `0x80109124`/`0x80109140` (value
+  `0x1`), R3 `0x80109178` (switch-tail join; linear fall-through `0x12`,
+  byte-inspected case values `0x2,0x3,0x6,0x12,0x18,0x22,0x40`), and R5
+  `0x80106824` (value `0x3`). R1 and R4 contain no flag references.
+- All five descriptor-record pointers (record base + `0x10`) are
+  materialized once each inside the dispatcher, matching
+  `NW4E_DESCRIPTOR_TABLE` geometry and the R1,R2,R3,R4,R5 record order.
+
+Ten consecutive `gate_selector` runs produced identical output, SHA-256
+`b53b25c7dd0a92dda59182f78f5c3ac0e0147124ea19941516da92a391679290`,
+re-checkable via `scripts/gate-determinism.sh`. Overlay
+store sites are candidate cross-references on proven load-image bytes;
+executable permission and natural reachability of those sites remain open.
 
 An aligned-pointer-run experiment (four or more words targeting one load image)
 was measured and rejected from the canonical harvest: it produced only 3.10%
