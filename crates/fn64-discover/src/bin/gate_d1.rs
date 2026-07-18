@@ -181,7 +181,12 @@ fn main() {
     });
     let [(nw4e_rom, nw4e_dump), (nwxe_rom, nwxe_dump)] = aki;
     for (label, rom, dump, descriptor) in [
-        ("NW4E", nw4e_rom.as_str(), nw4e_dump.as_str(), Some(nw4e_descriptor())),
+        (
+            "NW4E",
+            nw4e_rom.as_str(),
+            nw4e_dump.as_str(),
+            Some(nw4e_descriptor()),
+        ),
         ("NWXE", nwxe_rom.as_str(), nwxe_dump.as_str(), None),
     ] {
         if !Path::new(rom).exists() || !Path::new(dump).exists() {
@@ -224,8 +229,8 @@ fn grade_one_with_manifest(
 
 fn grade_oot() -> Result<(), String> {
     let oot_rom_path = oot_rom()?;
-    let rom_bytes = std::fs::read(&oot_rom_path)
-        .map_err(|error| format!("reading {oot_rom_path}: {error}"))?;
+    let rom_bytes =
+        std::fs::read(&oot_rom_path).map_err(|error| format!("reading {oot_rom_path}: {error}"))?;
     let (rom, db) =
         run_discovery_with_load_image_tables(&rom_bytes, None, &oot_load_image_tables())
             .map_err(|error| format!("normalizing OoT ROM: {error}"))?;
