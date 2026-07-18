@@ -31,6 +31,9 @@ expected_delta_vote=4910c27983a0344115a11c8537f4a507d585ad9e3e35d8ebe108ea2fb539
 # gate_gp_base: NW4E + NWXE resident $gp-base inference (both OPEN — no
 # recoverable gp-small-data base in either AKI title).
 expected_gp_base=d1e267035c94488b2d47df60038031ab9fc345a4daf00b68eb5b8f948abcaf6a
+# gate_overlay_regions: mechanical overlay-descriptor-table discovery. Needs
+# both AKI ROMs + dumps (grades held-out against the dump layout).
+expected_overlay_regions=471181f20c5add3b7478e7ea65626bc8417126b33e6b9c0a5e200dd5f1cfd920
 # gate_coverage renders the metric ladder for every supplied ROM; its digest is
 # only fixed when all three ROM vars are set, since an unset var is a loud skip
 # line that legitimately changes the output.
@@ -76,8 +79,10 @@ check_gate gate_keys "$expected_keys"
 # symbols); guard on the NWXE dump being present.
 if [ "${FN64_DISCOVER_NWXE_DUMP:-}" != "" ]; then
     check_gate gate_gp_base "$expected_gp_base"
+    check_gate gate_overlay_regions "$expected_overlay_regions"
 else
     echo "gate_gp_base: skipped (FN64_DISCOVER_NWXE_DUMP unset)"
+    echo "gate_overlay_regions: skipped (FN64_DISCOVER_NWXE_DUMP unset)"
 fi
 
 if [ "${FN64_DISCOVER_OOT_ROM:-}" != "" ]; then

@@ -74,6 +74,12 @@
 //!   `jal`-target-to-prologue coincidences, admitted only on a unique
 //!   dominating winner (the mechanized NW4E selector VA correction).
 //!   Admitted deltas are candidate mappings, never proven `RomMapping`s.
+//! - [`overlay_regions`]: ROM-only recovery of candidate overlay ROM
+//!   intervals by searching for a descriptor table of the NW4E FAMILY
+//!   (enumerate shapes, validate each record, canonicalize phase aliases),
+//!   then tightening with [`delta_vote`] admissibility as the uniqueness
+//!   filter. Feeds the intervals `delta_vote` consumes; admits a table only
+//!   on that uniqueness, never by score.
 //! - [`gp_base`]: IDO small-data `$gp` base recovery by constrained voting
 //!   (boot `lui`/`addiu` constructions, or a bounded access-offset histogram
 //!   fallback), admitted only on a unique dominating winner, then surfaces the
@@ -142,6 +148,7 @@ pub mod homology;
 pub mod load_table_use;
 pub mod loaders;
 pub mod oot_reference;
+pub mod overlay_regions;
 pub mod owner_proof;
 pub mod partition;
 pub mod pi_dma;

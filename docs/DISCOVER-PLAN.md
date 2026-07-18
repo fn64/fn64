@@ -47,7 +47,7 @@ byte ownership.
 | OoT, generalized load tables | 99.5672% | 72.3312% | 469 load images; resident `code`/`n64dd` mapping remains incomplete |
 | NW4E, descriptor mapping | 48.4387% | 89.7384% | mapped data is still scanned as code |
 | NW4E, descriptor plus text intervals | 82.4089% | 88.1105% | text intervals are external evidence, not inferred yet |
-| NWXE, boot mapping only | 36.3969% | 28.5422% | overlays are absent |
+| NWXE, boot mapping only | 36.3969% | 28.5422% | overlays WERE absent — now mechanically recovered (see below), integration into the D1 grade pending |
 | NWXE, descriptor mapping only | 49.9529% | 86.8550% | overlay data is scanned as code |
 | NWXE, descriptor plus text intervals | 81.3143% | 84.1114% | text intervals are external evidence, not inferred yet |
 
@@ -96,6 +96,29 @@ proven exact function owners                 0
 The executable intervals equal the six known code sections only because the
 experiment manifest supplies their boundaries. That is a target for inference,
 not a discovery success claim.
+
+**NWXE overlay regions are now recovered mechanically (2026-07-18)** — the
+long-standing "overlays are absent" limitation that pinned NWXE at
+36.40%/28.54%. `overlay_regions.rs` / `gate_overlay_regions` searches ROM
+bytes for aligned records of the NW4E descriptor *family* (candidate
+`table_offset`/`record_count`/`stride`/field-offsets whose rom_start/rom_end
+fields are in-bounds, ordered, code-region-sized), then uses `delta_vote`
+admissibility as the uniqueness filter that rejects spurious tables. It
+re-derives NW4E's five overlays from ROM alone — WITHOUT being handed the
+table at 0x539a0 (it finds 0x53988, the record base) — at 100% region
+precision/recall, delta_vote mapping 5/5. On **NWXE it discovers a real
+descriptor table at ROM 0x48a68 and recovers four overlay regions at 100%
+precision/recall, delta_vote admitting all four deltas with zero wrong**; a
+second candidate table at 0xcb058 is correctly rejected (delta_vote cannot
+uniquely admit it — the discipline that killed the aligned-pointer-run
+heuristic, working). The PI-DMA cross-check route is honestly reported as
+non-contributing for these titles: the AKI overlay loader reads
+rom_start/rom_end/vram out of a descriptor record through registers (not
+`osPiStartDma` immediates), so the descriptor route is the one that recovers
+the triples. Ten `gate_overlay_regions` runs are byte-identical (SHA-256
+`471181f2…`). Remaining step: wire region-discovery → `delta_vote` mapping →
+harvest/owner-proof into the NWXE D1/B2 grade and measure the recall lift off
+the pre-registered 36.40%/28.54% baseline (precision must not collapse).
 
 The byte-verified `ProgramSnapshotV1` now closes the native resident-bank
 passes into one artifact. With only the NWXE header entry as a traversal seed,
@@ -690,6 +713,8 @@ table consolidates, it does not re-measure.
 | Trace→FactDb adapter | n/m | ingestion delta 0 → 499,997 facts / 1,868 Supported code-existence conclusions / 478 corroborations / 0 static-data conflicts | n/m | adopted (Supported, distinct evidence class) |
 | Delta-voting VA-mapping inference | n/m | 5/5 overlays admitted-correct, 0 open, 0 wrong (margins 3.1x-9.7x) | not graded (no NWXE overlay regions yet) | adopted |
 | GP-base voting | n/m | OPEN (0 real $gp constructions; 25 off($gp) = data-as-code noise) | OPEN (7 accesses; unaligned histogram winner rejected) | mechanism adopted; no base to recover on these ROMs |
+| Overlay region discovery (descriptor-family search) | n/m | 5/5 regions recovered from ROM alone (table @0x53988 found without being handed it), delta_vote 5/5 correct | **4 overlay regions recovered @table 0x48a68, 100%/100%, delta_vote 4/4 correct, 0 wrong; a 2nd candidate table correctly rejected** | adopted — mechanically opens NWXE overlays |
+| dynamic_mips interpreter (first slice) | n/m | n/m | n/m | adopted (groundwork): integer/control/memory ops, byte-equivalent to the AOT lane by differential test; FPU/COP0/exceptions typed-unsupported (open) |
 | Answer-key corpus intake | n/m | n/m | n/m | infrastructure only: Banjo 60-row override key parsed (55 fn), PD key absent upstream — no grading yet (ROMs not present) |
 
 Maintenance rule: every future experiment lands a row here in the same
