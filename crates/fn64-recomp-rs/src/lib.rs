@@ -55,7 +55,7 @@ pub use execution::{
     ResolvedInstruction, TransferResolver,
 };
 pub use fallback::{EvidenceClass, FallbackProgram, FallbackRunner};
-pub use interp::{run_bank, UnsupportedOp};
+pub use interp::{run_bank, run_bank_with_mmio, MmioOutcome, MmioPort, NoMmio, UnsupportedOp};
 pub use module::{emit_lookup_dispatcher, emit_module, ModuleFunc, SymbolTable};
 pub use runtime::{
     call_host_or_recompiled, pause_self, resolve_host_function, round_ties_even_f32,

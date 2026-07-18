@@ -46,7 +46,7 @@ use crate::execution::{
     BlockExit, BlockRun, BlockRunner, CodeBank, ExecutionKey, GeneratedBankFn, GeneratedBankRunner,
     InstructionBudget, ProgramError,
 };
-use crate::interp::run_bank;
+use crate::interp::{run_bank_with_mmio, MmioPort, NoMmio};
 use crate::runtime::{Rdram, RecompContext};
 
 pub use crate::execution::BankId;
@@ -175,6 +175,34 @@ impl FallbackProgram {
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
     ) -> BlockRun {
+        self.run_with_mmio(entry, budget, ctx, mem, &mut NoMmio)
+    }
+
+    /// [`FallbackProgram::run`] with a hardware-register ([`MmioPort`]) door
+    /// installed for the `dynamic_mips` interpreter lane.
+    ///
+    /// The interpreter routes a word load/store to a modeled register through
+    /// `port`, giving an interpreted `lw` of a device register a modeled value
+    /// and an interpreted `sw` a modeled effect (see [`crate::interp`]'s
+    /// `MmioPort` doc). Admission is still resolved *before* either lane runs, so
+    /// hole-stays-a-fault is untouched: an unmapped/data-hole/unaligned PC is a
+    /// typed [`BlockExit::Fault`] with zero instructions and no lane — and hence
+    /// no `port` — runs.
+    ///
+    /// The **AOT lane is unchanged**: a generated runner reaches memory through
+    /// its own open-coded accessors and is not offered the port here. This is an
+    /// interpreter→device seam, not a rerouting of the AOT path; wiring the AOT
+    /// lane to the device model is separate, still-open scope
+    /// (`docs/UNIVERSAL-RUNTIME-PLAN.md` U2). Passing [`NoMmio`] recovers
+    /// [`FallbackProgram::run`] exactly.
+    pub fn run_with_mmio(
+        &self,
+        entry: ExecutionKey,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+        port: &mut dyn MmioPort,
+    ) -> BlockRun {
         if let Err(fault) = self.code.resolve(entry) {
             return BlockRun::new(BlockExit::Fault(fault), 0);
         }
@@ -186,13 +214,15 @@ impl FallbackProgram {
         });
         match lane {
             Lane::Aot(run) => run(entry, budget, ctx, mem),
-            Lane::DynamicMips => match run_bank(&self.code, entry.bank, entry, budget, ctx, mem) {
-                Ok(run) => run,
-                // The interpreter's coverage boundary is surfaced as the typed
-                // guest fault the dispatcher already understands, so an AOT and
-                // an interpreted turn are indistinguishable to the dispatcher.
-                Err(op) => BlockRun::new(BlockExit::Fault(op.into_cpu_fault()), 0),
-            },
+            Lane::DynamicMips => {
+                match run_bank_with_mmio(&self.code, entry.bank, entry, budget, ctx, mem, port) {
+                    Ok(run) => run,
+                    // The interpreter's coverage boundary is surfaced as the typed
+                    // guest fault the dispatcher already understands, so an AOT and
+                    // an interpreted turn are indistinguishable to the dispatcher.
+                    Err(op) => BlockRun::new(BlockExit::Fault(op.into_cpu_fault()), 0),
+                }
+            }
         }
     }
 
@@ -209,21 +239,54 @@ impl FallbackProgram {
             program: self,
             ctx,
             mem,
+            port: None,
+        }
+    }
+
+    /// A [`BlockRunner`] view like [`FallbackProgram::runner`] but with a
+    /// hardware-register [`MmioPort`] door threaded to the `dynamic_mips`
+    /// interpreter lane, so a driven dispatch's interpreted word MMIO accesses
+    /// reach the modeled device. The `port` outlives the returned runner (it is
+    /// the executor-owned device state the turn mutates), keeping the single
+    /// device authority on the runtime side.
+    pub fn runner_with_mmio<'a, 'r>(
+        &'a self,
+        ctx: &'a mut RecompContext,
+        mem: &'a mut Rdram<'r>,
+        port: &'a mut dyn MmioPort,
+    ) -> FallbackRunner<'a, 'r> {
+        FallbackRunner {
+            program: self,
+            ctx,
+            mem,
+            port: Some(port),
         }
     }
 }
 
 /// A [`BlockRunner`] adapter that runs turns of a [`FallbackProgram`] against
-/// borrowed machine state. Produced by [`FallbackProgram::runner`].
+/// borrowed machine state, routing the interpreter lane's word MMIO accesses to
+/// a [`MmioPort`] when one is installed. Produced by
+/// [`FallbackProgram::runner`]/[`FallbackProgram::runner_with_mmio`].
 pub struct FallbackRunner<'a, 'r> {
     program: &'a FallbackProgram,
     ctx: &'a mut RecompContext,
     mem: &'a mut Rdram<'r>,
+    /// `None` recovers the plain (no-device) runner exactly: turns run with a
+    /// transient [`NoMmio`] port, byte-identical to before the seam existed.
+    port: Option<&'a mut dyn MmioPort>,
 }
 
 impl BlockRunner for FallbackRunner<'_, '_> {
     fn run(&mut self, entry: ExecutionKey, budget: InstructionBudget) -> BlockRun {
-        self.program.run(entry, budget, self.ctx, self.mem)
+        match self.port.as_deref_mut() {
+            Some(port) => self
+                .program
+                .run_with_mmio(entry, budget, self.ctx, self.mem, port),
+            None => self
+                .program
+                .run_with_mmio(entry, budget, self.ctx, self.mem, &mut NoMmio),
+        }
     }
 }
 

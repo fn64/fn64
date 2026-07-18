@@ -31,6 +31,11 @@
 //! *distinct* interval set survives -- [`crate::delta_vote`] admissibility is
 //! the uniqueness filter that breaks the ambiguity. A table whose regions
 //! delta_vote cannot map is not admitted merely because its records parse.
+//! After that unchanged table-level admission, an open record may use its
+//! descriptor destination as a mapping hypothesis only when a CFG rooted at
+//! that destination decodes without a blocker, every reachable PC-relative
+//! branch stays in the proposed interval, and no distinct admitted or
+//! corroborated record overlaps its VA interval.
 //!
 //! Every function here is a pure function of the ROM bytes and the search
 //! configuration: no I/O, no randomness, byte-identical output across runs.
@@ -69,6 +74,7 @@
 //! proven bank-qualified load image. Multiple admissions, open deltas, and
 //! destination disagreements remain conflict/open facts.
 
+use crate::cfg::{build_cfg, BlockTerminator, WordClass};
 use crate::delta_vote::{infer_region_delta, DeltaVoteConfig, DeltaVoteOutcome};
 use crate::file_table::{
     recover_file_table, CandidateFileTable, FileTableRecovery, FileTableSearchConfig,
@@ -324,13 +330,143 @@ fn canonicalize(mut raw: Vec<CandidateTable>) -> Vec<CandidateTable> {
 pub struct TableAdmission {
     pub table: CandidateTable,
     /// One entry per region: `Some((delta, va_start))` when delta_vote
-    /// admitted a unique mapping, `None` when it stayed open.
+    /// admitted a unique mapping or the descriptor hypothesis was
+    /// independently corroborated and unique, `None` when it stayed open.
     pub region_deltas: Vec<Option<(u32, u32)>>,
-    /// Regions delta_vote uniquely mapped.
+    /// Regions mapped by delta_vote or the descriptor-corroborated fallback.
     pub mapped_regions: u32,
     /// Admitted iff `mapped_regions >= min_mapped_regions` (see
     /// [`recover_overlay_regions`]).
     pub admitted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct MappingHypothesis {
+    source_start: u32,
+    source_end: u32,
+    va_start: u32,
+    va_end: u32,
+}
+
+impl MappingHypothesis {
+    fn from_descriptor(record: CandidateRecord, config: &SearchConfig) -> Option<Self> {
+        let va_end = record.vram_dest.checked_add(record.byte_len())?;
+        (record.vram_dest >= config.vram_lo && va_end <= config.vram_hi).then_some(Self {
+            source_start: record.rom_start,
+            source_end: record.rom_end,
+            va_start: record.vram_dest,
+            va_end,
+        })
+    }
+
+    fn from_delta(record: CandidateRecord, va_start: u32) -> Option<Self> {
+        Some(Self {
+            source_start: record.rom_start,
+            source_end: record.rom_end,
+            va_start,
+            va_end: va_start.checked_add(record.byte_len())?,
+        })
+    }
+
+    fn overlaps_va(self, other: Self) -> bool {
+        self.va_start < other.va_end && other.va_start < self.va_end
+    }
+}
+
+/// Validate the descriptor-derived mapping without using delta_vote or a
+/// grading key. The descriptor supplies only the root VA; the region's own
+/// reachable instructions must establish a complete, blocker-free CFG.
+fn descriptor_mapping_corroborated(region_bytes: &[u8], hypothesis: MappingHypothesis) -> bool {
+    if region_bytes.is_empty()
+        || !region_bytes.len().is_multiple_of(4)
+        || region_bytes.len() != (hypothesis.source_end - hypothesis.source_start) as usize
+    {
+        return false;
+    }
+
+    let cfg = build_cfg(
+        "descriptor_mapping_hypothesis",
+        region_bytes,
+        hypothesis.va_start,
+        &[hypothesis.va_start],
+    );
+    let in_range = |va: u32| {
+        va >= hypothesis.va_start
+            && va < hypothesis.va_end
+            && (va - hypothesis.va_start).is_multiple_of(4)
+    };
+    let has_code = cfg
+        .word_class
+        .values()
+        .any(|class| *class == WordClass::ProvenCode);
+    let all_blocks_corroborate = cfg.blocks.iter().all(|block| match &block.terminator {
+        BlockTerminator::InvalidInstruction { .. }
+        | BlockTerminator::MissingDelaySlot { .. }
+        | BlockTerminator::RanOffEnd => false,
+        BlockTerminator::Branch {
+            target,
+            fallthrough,
+        }
+        | BlockTerminator::BranchLikely {
+            target,
+            fallthrough,
+        } => in_range(*target) && in_range(*fallthrough),
+        BlockTerminator::Call { next, .. } => in_range(*next),
+        BlockTerminator::Fallthrough { next } => in_range(*next),
+        BlockTerminator::Tail { .. }
+        | BlockTerminator::Return
+        | BlockTerminator::Indirect { .. }
+        | BlockTerminator::ResolvedIndirect { .. }
+        | BlockTerminator::Trap => true,
+    });
+    has_code && !cfg.blocks.is_empty() && all_blocks_corroborate
+}
+
+#[derive(Debug)]
+struct DescriptorFallback {
+    admission_index: usize,
+    record_index: usize,
+    mapping: MappingHypothesis,
+}
+
+/// Admit only hypotheses whose VA interval is unique across distinct region
+/// identities. Exact duplicate records from phase/stride aliases are one
+/// hypothesis, not conflicts; different source regions sharing any VA byte
+/// reject each other symmetrically, independent of iteration order.
+fn apply_unique_descriptor_fallbacks<A>(
+    admissions: &mut [A],
+    raw_mappings: &BTreeSet<MappingHypothesis>,
+    fallbacks: Vec<DescriptorFallback>,
+    mut region_deltas: impl FnMut(&mut A) -> &mut Vec<Option<(u32, u32)>>,
+    mut mapped_regions: impl FnMut(&mut A) -> &mut u32,
+) {
+    let admitted: Vec<_> = fallbacks
+        .iter()
+        .filter(|candidate| {
+            let conflicts_with_raw = raw_mappings.iter().any(|mapping| {
+                *mapping != candidate.mapping && mapping.overlaps_va(candidate.mapping)
+            });
+            let conflicts_with_fallback = fallbacks.iter().any(|other| {
+                other.mapping != candidate.mapping && other.mapping.overlaps_va(candidate.mapping)
+            });
+            !conflicts_with_raw && !conflicts_with_fallback
+        })
+        .collect();
+
+    for candidate in admitted {
+        let admission = &mut admissions[candidate.admission_index];
+        let slot = &mut region_deltas(admission)[candidate.record_index];
+        if slot.is_none() {
+            *slot = Some((
+                candidate
+                    .mapping
+                    .va_start
+                    .wrapping_sub(candidate.mapping.source_start),
+                candidate.mapping.va_start,
+            ));
+            *mapped_regions(admission) += 1;
+        }
+    }
 }
 
 /// The full result: the raw family candidates, then the delta_vote-filtered
@@ -385,7 +521,7 @@ pub fn recover_overlay_regions(
 ) -> OverlayRecovery {
     let candidate_tables = enumerate_family_tables(rom_bytes, config);
 
-    let admissions = candidate_tables
+    let mut admissions: Vec<TableAdmission> = candidate_tables
         .iter()
         .map(|table| {
             let mut region_deltas = Vec::with_capacity(table.records.len());
@@ -410,6 +546,53 @@ pub fn recover_overlay_regions(
             }
         })
         .collect();
+
+    let mut raw_mappings = BTreeSet::new();
+    let mut fallbacks = Vec::new();
+    for (admission_index, admission) in admissions.iter().enumerate() {
+        if !admission.admitted {
+            continue;
+        }
+        for (record_index, (record, outcome)) in admission
+            .table
+            .records
+            .iter()
+            .zip(&admission.region_deltas)
+            .enumerate()
+        {
+            match *outcome {
+                Some((_, va_start)) => {
+                    if let Some(mapping) = MappingHypothesis::from_delta(*record, va_start) {
+                        raw_mappings.insert(mapping);
+                    }
+                }
+                None => {
+                    let Some(mapping) = MappingHypothesis::from_descriptor(*record, config) else {
+                        continue;
+                    };
+                    let Some(region_bytes) =
+                        rom_bytes.get(record.rom_start as usize..record.rom_end as usize)
+                    else {
+                        continue;
+                    };
+                    if descriptor_mapping_corroborated(region_bytes, mapping) {
+                        fallbacks.push(DescriptorFallback {
+                            admission_index,
+                            record_index,
+                            mapping,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    apply_unique_descriptor_fallbacks(
+        &mut admissions,
+        &raw_mappings,
+        fallbacks,
+        |admission| &mut admission.region_deltas,
+        |admission| &mut admission.mapped_regions,
+    );
 
     OverlayRecovery {
         config: config.clone(),
@@ -613,7 +796,7 @@ pub fn recover_vrom_overlay_regions(
         .map_or_else(Vec::new, |table| {
             enumerate_vrom_family_tables(rom_bytes, table, config, vrom_min_records)
         });
-    let admissions = candidate_tables
+    let mut admissions: Vec<VromTableAdmission> = candidate_tables
         .iter()
         .map(|table| {
             let admitted_file_table = file_table
@@ -650,6 +833,58 @@ pub fn recover_vrom_overlay_regions(
             }
         })
         .collect();
+
+    if let Some(admitted_file_table) = &file_table.admitted_table {
+        let mut raw_mappings = BTreeSet::new();
+        let mut fallbacks = Vec::new();
+        for (admission_index, admission) in admissions.iter().enumerate() {
+            if !admission.admitted {
+                continue;
+            }
+            for (record_index, (record, outcome)) in admission
+                .table
+                .records
+                .iter()
+                .zip(&admission.region_deltas)
+                .enumerate()
+            {
+                match *outcome {
+                    Some((_, va_start)) => {
+                        if let Some(mapping) = MappingHypothesis::from_delta(*record, va_start) {
+                            raw_mappings.insert(mapping);
+                        }
+                    }
+                    None => {
+                        let Some(mapping) = MappingHypothesis::from_descriptor(*record, config)
+                        else {
+                            continue;
+                        };
+                        let Ok(region_bytes) = admitted_file_table.materialize_vrom_range(
+                            rom_bytes,
+                            record.rom_start,
+                            record.rom_end,
+                        ) else {
+                            continue;
+                        };
+                        if descriptor_mapping_corroborated(&region_bytes, mapping) {
+                            fallbacks.push(DescriptorFallback {
+                                admission_index,
+                                record_index,
+                                mapping,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        apply_unique_descriptor_fallbacks(
+            &mut admissions,
+            &raw_mappings,
+            fallbacks,
+            |admission| &mut admission.region_deltas,
+            |admission| &mut admission.mapped_regions,
+        );
+    }
 
     VromOverlayRecovery {
         file_table,
@@ -705,6 +940,15 @@ mod tests {
                     self.put_u32(physical_start + p, PROLOGUE);
                 }
             }
+        }
+
+        /// A small, complete leaf function with no absolute-address evidence:
+        /// delta_vote stays open, while descriptor-rooted CFG validation has
+        /// an independently decodable return path.
+        fn plant_descriptor_corroborating_region(&mut self, physical_start: u32) {
+            self.put_u32(physical_start, 0x27bd_ffe0); // addiu $sp,$sp,-0x20
+            self.put_u32(physical_start + 4, 0x03e0_0008); // jr $ra
+            self.put_u32(physical_start + 8, 0x0000_0000); // delay-slot nop
         }
 
         fn plant_file_record(
@@ -899,6 +1143,71 @@ mod tests {
             serde_json::to_string(&first).unwrap(),
             serde_json::to_string(&second).unwrap()
         );
+    }
+
+    fn descriptor_fallback_fixture(third_va: u32, corroborating_code: bool) -> TableAdmission {
+        let mut rom = RomBuilder::new(0x20_000);
+        let records = [
+            (0x8000u32, 0x400u32, 0x8010_0000u32),
+            (0x9000, 0x400, 0x8020_0000),
+            (0xa000, 0x400, third_va),
+        ];
+        for (index, &(rom_start, len, va_start)) in records.iter().enumerate() {
+            let descriptor = 0x2000 + index as u32 * 0x10;
+            rom.put_u32(descriptor, rom_start);
+            rom.put_u32(descriptor + 4, rom_start + len);
+            rom.put_u32(descriptor + 8, va_start);
+            if index < 2 {
+                rom.plant_admissible_region(rom_start, len, va_start);
+            } else if corroborating_code {
+                rom.plant_descriptor_corroborating_region(rom_start);
+            }
+        }
+
+        let recovery = recover_overlay_regions(
+            &rom.bytes,
+            &SearchConfig::vrom_family(),
+            &DeltaVoteConfig::default(),
+            2,
+        );
+        recovery
+            .admissions
+            .into_iter()
+            .find(|admission| {
+                admission.table.interval_set()
+                    == vec![(0x8000, 0x8400), (0x9000, 0x9400), (0xa000, 0xa400)]
+            })
+            .expect("planted descriptor table recovered")
+    }
+
+    #[test]
+    fn descriptor_corroborates_delta_open_record() {
+        let admission = descriptor_fallback_fixture(0x8030_0000, true);
+        assert!(
+            admission.admitted,
+            "two delta-voted records admit the table"
+        );
+        assert_eq!(admission.mapped_regions, 3);
+        assert_eq!(
+            admission.region_deltas[2],
+            Some((0x8030_0000u32.wrapping_sub(0xa000), 0x8030_0000))
+        );
+    }
+
+    #[test]
+    fn descriptor_without_region_corroboration_stays_open() {
+        let admission = descriptor_fallback_fixture(0x8030_0000, false);
+        assert!(admission.admitted);
+        assert_eq!(admission.mapped_regions, 2);
+        assert_eq!(admission.region_deltas[2], None);
+    }
+
+    #[test]
+    fn descriptor_overlapping_delta_admitted_va_is_rejected_as_non_unique() {
+        let admission = descriptor_fallback_fixture(0x8010_0000, true);
+        assert!(admission.admitted);
+        assert_eq!(admission.mapped_regions, 2);
+        assert_eq!(admission.region_deltas[2], None);
     }
 
     #[test]
