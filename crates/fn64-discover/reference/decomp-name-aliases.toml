@@ -1,0 +1,40 @@
+# Cross-project answer-key name aliases for held-out homology grading.
+#
+# The corpus-homology oracle assumes "same function => same real name across
+# dumps". That held while all graded dumps came from one project's naming;
+# it breaks across decomp communities, which rename the same libultra/libc
+# function differently. Each group below asserts, with citation, that its
+# names denote ONE machine function — every claim was checked against the
+# dumps' own function sizes and the matcher's full-body (relocation-masked)
+# validation before being added. This file harmonizes ANSWER KEYS for
+# grading only; it is never an input to discovery or matching.
+#
+# Deliberately ABSENT: OoT `CIC6105_AddFaultClient` vs MM
+# `CIC6105_AddRomInfoFaultPage` (both 0x34 = 13 instructions). Bodies mask
+# identically, but at that size two genuinely distinct wrappers differing
+# only in relocated operands would too — left un-aliased, and graded WRONG,
+# until adjudicated at byte level. An alias must never launder a possible
+# masked-wrapper collision into a pass.
+
+[[alias]]
+# libultra csleep: zeldaret/oot renamed it Sleep_Cycles; zeldaret/mm keeps
+# the libultra name. Identical 0x6c bodies in both dumps.
+names = ["csleep", "Sleep_Cycles"]
+
+[[alias]]
+# libultra msleep: zeldaret/oot rename (0x54 bodies agree).
+names = ["msleep", "Sleep_Msec"]
+
+[[alias]]
+# libultra sleep: zeldaret/oot rename (0x40 bodies agree).
+names = ["sleep", "Sleep_Sec"]
+
+[[alias]]
+# libm tanf: Kirby64Ret keeps the libm name; zeldaret/mm carries the same
+# compiled body under its project math-library naming.
+names = ["tanf", "Math_FTanF"]
+
+[[alias]]
+# The stdio _Printf output callback: zeldaret projects call it proutPrintf,
+# Kirby64Ret calls it write_to_buf. Same compiled body.
+names = ["proutPrintf", "write_to_buf"]
