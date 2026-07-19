@@ -39,12 +39,48 @@ pub const BOOT_COPY_SIZE: u32 = 0x0010_0000;
 /// Name reserved for the always-resident boot/init bank.
 pub const BOOT_BANK: &str = "boot";
 
-/// Discover the boot-copy bank from the ROM header alone. This never fails
-/// for a normalized ROM (the header was already validated in Phase 1) and
-/// is `Proven` immediately: the mapping is a direct read of hardware-fixed
-/// header fields, not an inference.
+/// The 4032-byte IPL3 blob occupies ROM `[0x40, 0x1000)`; which build a
+/// cartridge carries decides where its CIC-paired IPL3 relocates the 1 MiB
+/// boot copy. CIC-6102 and 6105 builds load at the header entry point;
+/// the CIC-6103 build loads at `entry point - 0x100000` (public N64 boot
+/// documentation, n64brew "CIC-NUS-610x" / "IPL3"). The digest below was
+/// measured directly from a Kirby 64 (US) cartridge dump — the one 6103
+/// title in the local corpus — and cross-checked by clustering IPL3
+/// digests across 14 local ROMs: the 6102 cluster (SM64, GoldenEye, four
+/// AKI titles) and 6105 cluster (OoT, MM, Perfect Dark) share their own
+/// distinct blobs and a zero delta, and Kirby's decomp places `main` at
+/// exactly `entry - 0x100000` (0x80000400), confirming the delta on real
+/// data. An unrecognized IPL3 keeps the zero-delta reading — the behavior
+/// for every non-6103 blob observed so far — rather than guessing.
+const IPL3_SHA256_CIC_6103: &str =
+    "bf3620d30817007091ebe9bddd1b88c23b8a0052170b3309cde5b6b4238e45e7";
+
+const IPL3_ROM_START: usize = 0x40;
+const IPL3_ROM_END: usize = 0x1000;
+
+fn boot_load_delta(rom_bytes: &[u8]) -> (u32, &'static str) {
+    use sha2::Digest as _;
+    if rom_bytes.len() < IPL3_ROM_END {
+        return (0, "header-only (ROM too short for IPL3)");
+    }
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&rom_bytes[IPL3_ROM_START..IPL3_ROM_END]);
+    let digest = format!("{:x}", hasher.finalize());
+    if digest == IPL3_SHA256_CIC_6103 {
+        (0x10_0000, "CIC-6103 IPL3 (loads at entry - 0x100000)")
+    } else {
+        (0, "entry-loading IPL3 (6102/6105-class or unrecognized)")
+    }
+}
+
+/// Discover the boot-copy bank from the ROM header plus the IPL3 blob.
+/// This never fails for a normalized ROM (the header was already validated
+/// in Phase 1) and is `Proven` immediately: the mapping is a direct read
+/// of hardware-fixed header fields and the hardware-fixed relocation
+/// behavior of the identified IPL3 build, not an inference.
 pub fn discover_boot_bank(rom: &NormalizedRom, db: &mut FactDb) {
-    let va_start = rom.header.entry_point;
+    let (load_delta, ipl3_note) = boot_load_delta(&rom.bytes);
+    let va_start = rom.header.entry_point.wrapping_sub(load_delta);
     let rom_start = BOOT_COPY_ROM_START;
     let rom_end = rom_start
         .saturating_add(BOOT_COPY_SIZE)
@@ -63,7 +99,8 @@ pub fn discover_boot_bank(rom: &NormalizedRom, db: &mut FactDb) {
         subject: crate::facts::BankAddr::new(BOOT_BANK, va_start),
         note: format!(
             "IPL3 boot copy: ROM [0x{rom_start:x}, 0x{rom_end:x}) -> VA [0x{va_start:x}, 0x{va_end:x}); \
-             entry point read directly from normalized header, size fixed by N64 hardware boot behavior"
+             entry point read directly from normalized header, size fixed by N64 hardware boot behavior; \
+             {ipl3_note}"
         ),
     });
 
@@ -1635,5 +1672,17 @@ mod tests {
             ProofState::Conflict
         );
         assert!(db.proven_rom_mappings().is_empty());
+    }
+
+    #[test]
+    fn unrecognized_ipl3_keeps_entry_loading_delta() {
+        // Any blob that is not the measured 6103 IPL3 must keep the
+        // zero-delta reading, including a ROM too short to hold IPL3 at
+        // all — never a guessed relocation.
+        let (delta, _) = super::boot_load_delta(&[0u8; IPL3_ROM_END]);
+        assert_eq!(delta, 0);
+        let (delta, note) = super::boot_load_delta(&[0u8; 0x100]);
+        assert_eq!(delta, 0);
+        assert!(note.contains("too short"));
     }
 }
