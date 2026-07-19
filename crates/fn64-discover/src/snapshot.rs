@@ -22,7 +22,7 @@ use crate::facts::{
 use crate::owner_proof::{
     prove_exact_owners_with_external_authority, OwnerAssessment, OwnerBlocker, OwnerProofReport,
 };
-use crate::partition::{partition, Partition};
+use crate::partition::{partition, partition_with_authorized_splits, Partition};
 use crate::resolve::{
     build_cfg_value_set_closed, ClosureResult, IndirectProofState, IndirectResolutionKind,
 };
@@ -486,41 +486,7 @@ fn prepare_materialized_bank(
     let mut facts = base_facts.clone();
     let root_vec: Vec<u32> = roots.into_iter().collect();
     let closure = build_cfg_value_set_closed(input.bank, input.bytes, input.va_start, &root_vec);
-    for &(source_pc, target_pc) in &closure.cfg.direct_calls {
-        // A target outside this materialized bank has no mechanically known
-        // bank identity yet. The CFG retains that edge; the canonical fact
-        // log waits for load-image resolution instead of guessing a bank.
-        if target_pc >= input.va_start && target_pc < va_end {
-            insert_unique(
-                &mut facts,
-                Fact::DirectCall {
-                    source: BankAddr::new(input.bank, source_pc),
-                    target: BankAddr::new(input.bank, target_pc),
-                },
-            );
-        }
-    }
-    for resolution in &closure.indirect {
-        insert_unique(
-            &mut facts,
-            Fact::IndirectTransferAnalysis {
-                site: BankAddr::new(input.bank, resolution.site_pc),
-                via_call: resolution.via_call,
-                state: match resolution.state {
-                    IndirectProofState::Exhaustive => IndirectTransferState::Exhaustive,
-                    IndirectProofState::Bounded => IndirectTransferState::Bounded,
-                    IndirectProofState::Open => IndirectTransferState::Open,
-                },
-                kind: resolution.kind.map(|kind| match kind {
-                    IndirectResolutionKind::Constant => IndirectTransferKind::Constant,
-                    IndirectResolutionKind::MemoryValueSet => IndirectTransferKind::MemoryValueSet,
-                    IndirectResolutionKind::JumpTable => IndirectTransferKind::JumpTable,
-                }),
-                targets: resolution.targets.clone(),
-                memory_sources: resolution.memory_sources.clone(),
-            },
-        );
-    }
+    integrate_closure_facts(&mut facts, input.bank, input.va_start, va_end, &closure);
 
     Ok(PreparedBank {
         bank: input.bank.into(),
@@ -569,12 +535,26 @@ fn finish_materialized_bank(
         va_start,
         digest,
         mut facts,
-        closure,
+        mut closure,
         bytes,
         ..
     } = prepared;
 
-    let partition = partition(&closure.cfg);
+    ensure_authoritative_block_leaders(&mut closure, external_authorized_roots);
+    let callable_boundaries =
+        authoritative_partition_entries(&closure, &facts, external_authorized_roots);
+    let partition = if external_authorized_roots.is_empty() {
+        // Preserve the resident/single-bank construction byte-for-byte. The
+        // authority-aware rule is needed only when composition adds callable
+        // boundaries the bank-local CFG could not know.
+        partition(&closure.cfg)
+    } else {
+        partition_with_authorized_splits(
+            &closure.cfg,
+            external_authorized_roots,
+            &callable_boundaries,
+        )
+    };
     // First owner pass supplies entry authority to block proof; executable
     // evidence may not exist yet, so its `NotProvenExecutable` blockers are
     // provisional and it is never serialized.
@@ -619,6 +599,135 @@ fn finish_materialized_bank(
         banks: vec![bank],
         coverage,
     })
+}
+
+fn integrate_closure_facts(
+    facts: &mut FactDb,
+    bank: &str,
+    va_start: u32,
+    va_end: u32,
+    closure: &ClosureResult,
+) {
+    for &(source_pc, target_pc) in &closure.cfg.direct_calls {
+        // A target outside this materialized bank has no mechanically known
+        // bank identity yet. The CFG retains that edge; the canonical fact
+        // log waits for load-image resolution instead of guessing a bank.
+        if target_pc >= va_start && target_pc < va_end {
+            insert_unique(
+                facts,
+                Fact::DirectCall {
+                    source: BankAddr::new(bank, source_pc),
+                    target: BankAddr::new(bank, target_pc),
+                },
+            );
+        }
+    }
+    for resolution in &closure.indirect {
+        insert_unique(
+            facts,
+            Fact::IndirectTransferAnalysis {
+                site: BankAddr::new(bank, resolution.site_pc),
+                via_call: resolution.via_call,
+                state: match resolution.state {
+                    IndirectProofState::Exhaustive => IndirectTransferState::Exhaustive,
+                    IndirectProofState::Bounded => IndirectTransferState::Bounded,
+                    IndirectProofState::Open => IndirectTransferState::Open,
+                },
+                kind: resolution.kind.map(|kind| match kind {
+                    IndirectResolutionKind::Constant => IndirectTransferKind::Constant,
+                    IndirectResolutionKind::MemoryValueSet => IndirectTransferKind::MemoryValueSet,
+                    IndirectResolutionKind::JumpTable => IndirectTransferKind::JumpTable,
+                }),
+                targets: resolution.targets.clone(),
+                memory_sources: resolution.memory_sources.clone(),
+            },
+        );
+    }
+}
+
+fn ensure_authoritative_block_leaders(
+    closure: &mut ClosureResult,
+    external_authorized_roots: &BTreeSet<u32>,
+) {
+    for &entry in external_authorized_roots {
+        if !entry.is_multiple_of(4)
+            || closure
+                .cfg
+                .blocks
+                .iter()
+                .any(|block| block.start_va == entry)
+        {
+            continue;
+        }
+        let Some(index) = closure
+            .cfg
+            .blocks
+            .iter()
+            .position(|block| block.start_va < entry && entry < block.end_va)
+        else {
+            continue;
+        };
+        let mut suffix = closure.cfg.blocks[index].clone();
+        suffix.start_va = entry;
+        closure.cfg.blocks[index].end_va = entry;
+        closure.cfg.blocks[index].terminator = crate::cfg::BlockTerminator::Tail { target: entry };
+        closure.cfg.blocks.push(suffix);
+    }
+    closure.cfg.blocks.sort_by_key(|block| block.start_va);
+    for &entry in external_authorized_roots {
+        if closure
+            .cfg
+            .blocks
+            .iter()
+            .any(|block| block.start_va == entry)
+            && !closure.cfg.proven_roots.contains(&entry)
+        {
+            closure.cfg.proven_roots.push(entry);
+        }
+    }
+    for block in &mut closure.cfg.blocks {
+        if matches!(
+            block.terminator,
+            crate::cfg::BlockTerminator::Fallthrough { next }
+                if external_authorized_roots.contains(&next)
+        ) {
+            block.terminator = crate::cfg::BlockTerminator::Tail {
+                target: block.end_va,
+            };
+        }
+    }
+}
+
+fn authoritative_partition_entries(
+    closure: &ClosureResult,
+    facts: &FactDb,
+    external_authorized_roots: &BTreeSet<u32>,
+) -> BTreeSet<u32> {
+    let cfg = &closure.cfg;
+    let mut entries: BTreeSet<u32> = facts
+        .proven_function_entries(&cfg.bank)
+        .into_iter()
+        .collect();
+    entries.extend(external_authorized_roots.iter().copied());
+    entries.extend(cfg.direct_calls.iter().filter_map(|&(source, target)| {
+        (cfg.word_class.get(&source) == Some(&crate::cfg::WordClass::ProvenCode)).then_some(target)
+    }));
+    for block in &cfg.blocks {
+        let crate::cfg::BlockTerminator::ResolvedIndirect {
+            targets,
+            via_call: true,
+        } = &block.terminator
+        else {
+            continue;
+        };
+        if block.end_va >= block.start_va.saturating_add(8)
+            && cfg.word_class.get(&(block.end_va - 8)) == Some(&crate::cfg::WordClass::ProvenCode)
+            && cfg.word_class.get(&(block.end_va - 4)) == Some(&crate::cfg::WordClass::ProvenCode)
+        {
+            entries.extend(targets.iter().copied());
+        }
+    }
+    entries
 }
 
 /// A proven direct `jal` in one bank whose target lands inside another bank's
@@ -1294,6 +1403,49 @@ mod tests {
             Fact::DirectCall { source, target }
                 if source.bank == "caller" && target.bank == "callee" && target.pc == Y_BASE
         )));
+    }
+
+    #[test]
+    fn proven_cross_bank_jal_splits_an_interior_callee_entry() {
+        let interior = Y_BASE + 4;
+        let x = asm(&[jal_to(interior), NOP, JR_RA, NOP]);
+        let y = asm(&[NOP, JR_RA, NOP]);
+        let rom = rom_with_two_banks(&x, &y);
+        let mut facts = FactDb::new();
+        prove_bank(
+            &mut facts,
+            "caller",
+            X_ROM,
+            X_BASE,
+            x.len() as u32,
+            &[X_BASE],
+        );
+        prove_bank(&mut facts, "callee", Y_ROM, Y_BASE, y.len() as u32, &[]);
+
+        let inputs = two_bank_inputs(&x, &y, &[X_BASE], &[Y_BASE]);
+        let snapshots = compose_materialized_banks_v1(&rom, &facts, &inputs).unwrap();
+        let bank = &snapshots[1].banks[0];
+        let prefix = bank
+            .partition
+            .owners
+            .iter()
+            .find(|owner| owner.root_va == Y_BASE)
+            .expect("the enclosing owner keeps its prefix");
+        assert_eq!(prefix.extent_end, interior);
+        let split = bank
+            .partition
+            .owners
+            .iter()
+            .find(|owner| owner.root_va == interior)
+            .expect("the authorized interior entry gets its own owner");
+        assert_eq!(split.extent_end, Y_BASE + 12);
+        assert!(bank.owner_proof.assessments.iter().any(|assessment| {
+            matches!(
+                assessment,
+                OwnerAssessment::Proven { owner }
+                    if owner.entry.pc == interior && owner.va_end == Y_BASE + 12
+            )
+        }));
     }
 
     #[test]

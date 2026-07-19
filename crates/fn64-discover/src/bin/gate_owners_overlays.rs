@@ -459,13 +459,19 @@ fn extent_in_mapping(extent: &KeyExtent, mapping: &OverlayMapping) -> bool {
 
 fn grade_extents(overlay: &CompletedOverlay, key: &[KeyExtent]) -> ExtentGrade {
     let bank_snapshot = &overlay.snapshot.banks[0];
-    let direct_targets: BTreeSet<u32> = bank_snapshot
+    let mut direct_targets: BTreeSet<u32> = bank_snapshot
         .closure
         .cfg
         .direct_calls
         .iter()
         .map(|&(_, target)| target)
         .collect();
+    direct_targets.extend(overlay.snapshot.facts.facts().iter().filter_map(|fact| {
+        let Fact::DirectCall { source, target } = fact else {
+            return None;
+        };
+        (source.bank != target.bank && target.bank == overlay.mapping.bank).then_some(target.pc)
+    }));
     let mut grade = ExtentGrade::default();
     for assessment in &bank_snapshot.owner_proof.assessments {
         let OwnerAssessment::Proven { owner } = assessment else {
@@ -482,11 +488,14 @@ fn grade_extents(overlay: &CompletedOverlay, key: &[KeyExtent]) -> ExtentGrade {
             continue;
         }
         if key.iter().any(|extent| {
-            owner.rom_start > extent.rom_start
-                && owner.rom_end <= extent.rom_end
-                && owner.entry.pc > extent.va_start
-                && owner.va_end <= extent.va_end
-                && direct_targets.contains(&owner.entry.pc)
+            is_direct_call_subspan(
+                owner.entry.pc,
+                owner.va_end,
+                owner.rom_start,
+                owner.rom_end,
+                extent,
+                &direct_targets,
+            )
         }) {
             grade.interior_direct_calls += 1;
             continue;
@@ -499,6 +508,22 @@ fn grade_extents(overlay: &CompletedOverlay, key: &[KeyExtent]) -> ExtentGrade {
     grade
 }
 
+fn is_direct_call_subspan(
+    owner_va_start: u32,
+    owner_va_end: u32,
+    owner_rom_start: u32,
+    owner_rom_end: u32,
+    extent: &KeyExtent,
+    direct_targets: &BTreeSet<u32>,
+) -> bool {
+    owner_rom_start >= extent.rom_start
+        && owner_rom_end <= extent.rom_end
+        && owner_va_start >= extent.va_start
+        && owner_va_end <= extent.va_end
+        && (owner_rom_start > extent.rom_start || owner_rom_end < extent.rom_end)
+        && (direct_targets.contains(&owner_va_start) || direct_targets.contains(&owner_va_end))
+}
+
 fn merge_histogram(
     total: &mut BTreeMap<OwnerBlockerKind, (u64, u64, u64)>,
     histogram: &[OwnerBlockerSummary],
@@ -508,5 +533,29 @@ fn merge_histogram(
         count.0 += summary.affected_assessments;
         count.1 += summary.occurrences;
         count.2 += summary.sole_blocker_assessments;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_wrong_split_without_a_callable_boundary_is_rejected() {
+        let key = KeyExtent {
+            name: "synthetic".into(),
+            rom_start: 0x1000,
+            rom_end: 0x1100,
+            va_start: 0x8000_0000,
+            va_end: 0x8000_0100,
+        };
+        assert!(!is_direct_call_subspan(
+            0x8000_0020,
+            0x8000_0040,
+            0x1020,
+            0x1040,
+            &key,
+            &BTreeSet::new(),
+        ));
     }
 }

@@ -99,6 +99,12 @@
 //!   results. Homology emits candidates only.
 //! - [`cfg_homology`]: address-free typed CFG fingerprints with conservative
 //!   unique-to-unique matching. Structural collisions remain ambiguous.
+//! - [`corpus_homology`]: N-ROM identity graph built on the pairwise engines --
+//!   every ROM pair is matched by [`callgraph_match`], and the cross-ROM edges
+//!   are closed transitively under a per-ROM-uniqueness + body-corroboration
+//!   guard. A conflicting transitive edge collapses its component to ambiguous
+//!   rather than guessing; a connected component is one function identity
+//!   spanning N ROMs (libultra/SDK spans many). Candidates only.
 //! - [`trace`]: digest-bound, strictly sequenced dynamic trace ingestion with
 //!   explicit unknown banks and bounded instrumentation guarantees separated
 //!   from observations.
@@ -143,6 +149,7 @@ pub mod cfg;
 pub mod cfg_homology;
 pub mod closure;
 pub mod content_consumer;
+pub mod corpus_homology;
 pub mod coverage;
 pub mod delta_vote;
 pub mod evidence;

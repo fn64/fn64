@@ -183,7 +183,7 @@ owner) / `block_aot` (proven reachable code, no source-level owner claimed) /
 `dynamic_mips` (open/bounded indirect the interpreter fallback covers) /
 `unsupported` (lands outside every known mapping — the release-blocker). Per
 ROM (destinations): NW4E block_aot 22,051 / dynamic_mips 892 / **unsupported
-11**; NWXE exact_aot 95 / block_aot 17,622 / dynamic_mips 2,169 /
+11**; NWXE exact_aot 349 / block_aot 17,622 / dynamic_mips 2,169 /
 **unsupported 20**; OoT (resident boot bank only — its VROM overlays are
 outside snapshot V1's physical-backing composition) block_aot 287 /
 dynamic_mips 73 / **unsupported 6**. Held-out grading found
@@ -833,6 +833,8 @@ table consolidates, it does not re-measure.
 | Backward-slice indirect resolution (angr pattern, BSD-2) | 1 NW4E site Open→Bounded; precision unchanged | (see NW4E) | wrong 0, all 399 open sites stay open — PROVEN irreducibly static (vtable/return-value jalr = AKI dynamic dispatch) | adopted (sound, robustness) — instrumented negative: 16,366 unresolved_indirect are dynamic_mips territory, not static |
 | Corpus call-graph propagation (BinDiff MD-index, Apache-2) | n/m | ←591 body-hash seeds + 44 propagated, 100% precision, 0 wrong | (matched vs NW4E) | adopted — self-corrected from 13.45% (positional-only) to 100% by requiring body-hash corroboration; the propagation engine for corpus homology |
 | Relocation-accuracy grade (Ramblr concept) | 280 recovered refs, 50.4% misclassified vs function-symbol key proxy | n/m | n/m | adopted (baseline metric) — Decomp-Pack readiness; proxy grade (key has symbols not full relocs), a number to improve |
+| Partition owner-span construction (authoritative splits) | n/m | n/m | NWXE overlay exact_owners 7→46, wrong 0; owner_missing 1145→229 (−916, −468 sole); gate_b2 resident frozen | adopted — splits an owner at a proven interior callable entry (j-vs-jal preserved); next blocker is unresolved_indirect (dynamic, per #21/#28) |
+| Corpus-scale N-ROM homology | ←OoT names propagate onto unlabeled AKI functions | ←(shared libultra) | ←(shared libultra) | adopted — 6-ROM corpus, 635 identities, 100% held-out precision, 0 cascade; 5 libultra kernel routines span AKI+Zelda engines; the superlinear payoff (a labeled ROM labels others) |
 | Content-consumer data/code discriminator | 2/10 open words correct (20%) | n/m | (see OoT) | DROPPED as shippable — root-caused: 8 wrong Pointers = __osExceptionPreamble idiom, Code signal redundant with cfg.rs; documented dead-end, candidate-only module retained unwired |
 | NWXE overlay owner recovery via entry-authority | n/m | n/m | 6→6 (measured negative): entry_not_authoritative/owner_missing have sole_blocker=0, 818/987 roots authorized only by cross-bank jals a single-bank composition can't prove | valid negative — real lever is multi-bank composition (deferred snapshot feature), not entry-authority; 2 guard tests lock the sound exhaustive-jalr boundary |
 | dynamic_mips → real device (interp MMIO seam) | n/m | n/m | n/m | adopted (groundwork): interpreted lw/sw of PI_STATUS reads busy→idle across a real DeviceFabric DMA deadline and acks a PI interrupt, through the SAME modeled device authority (port trait, no second authority); hole-stays-fault with MMIO window present; rung suite unchanged; AOT lane untouched |
