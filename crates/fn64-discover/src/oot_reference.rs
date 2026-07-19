@@ -235,13 +235,13 @@ pub fn bind_ranges_to_fact_db_partial(
             }),
             [] => {
                 unresolved.push(format!(
-                    "OOT section {} range {}..{} has no proven mapping",
+                    "dump section {} range {}..{} has no proven mapping",
                     range.bank, range.va_start, range.va_end
                 ));
             }
             many => {
                 unresolved.push(format!(
-                    "OOT section {} range {}..{} has {} proven mappings",
+                    "dump section {} range {}..{} has {} proven mappings",
                     range.bank,
                     range.va_start,
                     range.va_end,
