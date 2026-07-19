@@ -154,10 +154,12 @@ def place_functions(segments, symbols):
         "outside_kseg0": 0,
         "rom_unplaced": 0,
         "rom_vram_inconsistent": 0,
+        "suffix_vram_inconsistent": 0,
         "vram_unplaced": 0,
         "vram_ambiguous": 0,
     }
     placed = {seg["index"]: [] for seg in segments}
+    by_name = {seg["name"]: seg for seg in segments}
 
     for name, vram, attrs in symbols:
         if attrs.get("type") != "func":
@@ -168,6 +170,15 @@ def place_functions(segments, symbols):
             continue
         size = attr_int(attrs, "size")
         rom = attr_int(attrs, "rom")
+        # splat's per-segment symbol_name_format suffixes overlay symbols
+        # with their segment name (func_80198880_ovl7) -- the only static
+        # disambiguator for bank-slot overlays that share a VRAM window.
+        # endswith (not rsplit) because segment names may contain
+        # underscores; longest match wins when one name suffixes another.
+        suffix_matches = [n for n in by_name if name.endswith(f"_{n}")]
+        suffix_seg = (
+            by_name[max(suffix_matches, key=len)] if suffix_matches else None
+        )
 
         if rom is not None:
             owners = [s for s in segments if s["rom"] <= rom < s["rom_end"]]
@@ -177,6 +188,11 @@ def place_functions(segments, symbols):
             seg = owners[0]
             if vram - seg["vram"] != rom - seg["rom"]:
                 skipped["rom_vram_inconsistent"] += 1
+                continue
+        elif suffix_seg is not None:
+            seg = suffix_seg
+            if not seg["vram"] <= vram < seg["vram"] + (seg["rom_end"] - seg["rom"]):
+                skipped["suffix_vram_inconsistent"] += 1
                 continue
         else:
             owners = [
@@ -306,6 +322,9 @@ some_data = 0x80100800; // type:data
 ovl_a_entry = 0x80200010; // type:func rom:0x3010
 ovl_ambiguous = 0x80200100; // type:func
 ovl_bad_rom = 0x80200200; // type:func rom:0x4300
+func_80200300_ovl_b = 0x80200300; // type:func
+func_80200400_ovl_a = 0x80200400; // type:func
+func_90000000_ovl_b = 0x90000000; // type:func
 """
 
 
@@ -325,14 +344,21 @@ def self_test():
     sizes = {f["name"]: f["size"] for f in main["functions"]}
     # explicit size attr wins; gap-derived size for helper; open tail = 0.
     assert sizes == {"boot_main": 0x20, "helper": 0x3E0, "tail": 0}
-    # rom: attr disambiguates the ovl_a/ovl_b vram collision...
-    assert [f["name"] for f in by_name["ovl_a"]["functions"]] == ["ovl_a_entry"]
+    # rom: attr disambiguates the ovl_a/ovl_b vram collision, and a
+    # segment-name suffix does the same for symbols without a rom attr.
+    assert [f["name"] for f in by_name["ovl_a"]["functions"]] == [
+        "ovl_a_entry",
+        "func_80200400_ovl_a",
+    ]
+    assert [f["name"] for f in by_name["ovl_b"]["functions"]] == ["func_80200300_ovl_b"]
     # ...vram-only placement in the collision is ambiguous and skipped...
     assert counters["vram_ambiguous"] == 1
-    # ...and a rom attr contradicting the affine mapping is skipped.
+    # ...a rom attr contradicting the affine mapping is skipped...
     assert counters["rom_vram_inconsistent"] == 1
+    # ...and a suffix pointing at a segment that can't contain the vram is
+    # skipped, not trusted.
+    assert counters["suffix_vram_inconsistent"] == 1
     assert counters["not_func"] == 1
-    assert "ovl_b" not in by_name  # no placeable functions survived
     print("self-test OK")
 
 
