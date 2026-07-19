@@ -910,6 +910,37 @@ an accuracy oracle reachable only via its GDB stub, not a bulk tracer.
 BizHawk's mupen core has `ITraceable` file tracing but is the same slow
 interpreter class and pulls GPL, so it is not preferred.
 
+## WM2000 (NWXE) whole-ROM recompile — milestone status (2026-07-18)
+
+The origin ROM, pointed at by the full discovery stack. `gate_wm2000_recompile`
+consumes the discovery facts (no re-derivation): `run_discovery_with_recovered_overlay_regions`
+gives the 5-bank FactDb (resident boot + 4 mechanically-recovered overlays,
+46 exact owners), `compose_materialized_banks_v1` composes them with cross-bank
+authority, and `emit_block_pack_v1` emits the portable whole-ROM BlockPack.
+
+Whole-ROM pack: **38,194 blocks / 205,086 words / 820,344 emitted bytes**
+(portable pack JSON 8.45 MB, no ROM instruction words in it). Whole-ROM
+execution-closure classification (union across all 5 banks, 19,909 reachable
+destinations): exact_aot 349 / block_aot 17,642 / dynamic_mips 1,898 /
+**unsupported 20** — composing the overlays did NOT raise the unsupported
+count; it stays a 20-destination punch-list, and dynamic_mips (1,898,
+fallback-covered) absorbs the AKI dynamic-dispatch sites.
+
+The whole-ROM **runner does not yet compile** — one precise, named blocker,
+reported loudly rather than papered over: at `boot:0x800f8e90` a control
+transfer's architecturally-inseparable delay slot at `0x800f8e94` is split
+into a SEPARATE CFG block, and the sparse runner emitter (correctly) requires
+the control instruction and its delay slot in the same emitted unit. So
+generation fails before producing a runner `rustc` would reject; no
+BlockProgram was constructed and no arbitrary-PC runs were claimed. This is a
+CFG block-boundary bug (a branch/delay-slot pair split across two blocks), a
+focused fix in the CFG/block-proof/pack boundary — the last step between the
+measured whole-ROM pack and a compiling whole-ROM CPU-recompiled WM2000.
+
+Honest scope: this is the CPU-recompilation milestone (all discovered code
+packed + classified, runner one bug from compiling). It is NOT a booting game
+— RSP audio and RDP graphics are separate U6 runtime subsystems.
+
 # Phase unlock ledger
 
 Every ROM run must report physical, logical, executable, owner, and function
