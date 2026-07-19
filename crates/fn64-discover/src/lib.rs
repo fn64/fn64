@@ -55,6 +55,13 @@
 //!   classification (`proven_code`/`candidate_code`/`proven_data`/
 //!   `candidate_data`/`conflict`/`unknown`), basic blocks, direct calls,
 //!   tail transfers, and the open indirect-site frontier.
+//! - [`content_consumer`]: a candidate-only data-flow discriminator (the
+//!   Ramblr concept, angr/Ramblr BSD-2, concept-only per the clean-room
+//!   protocol) for words `cfg`'s reachability test leaves open -- classifies
+//!   by consumer: loaded-then-dereferenced is a pointer, a proven
+//!   branch/call edge target is code, and anything else stays ambiguous.
+//!   Never reads or mutates [`facts::FactDb`] or a [`cfg::Cfg`]; strictly
+//!   corroborating evidence that cannot override a proven conclusion.
 //! - [`partition`]: Phase 5, recursive-descent owner partitioning of a
 //!   [`cfg::Cfg`]'s blocks from its proven roots -- one owner per block per
 //!   bank, ambiguous claims and unowned blocks reported explicitly rather
@@ -131,9 +138,11 @@ pub mod answer_keys;
 pub mod banks;
 pub mod block_pack;
 pub mod block_proof;
+pub mod callgraph_match;
 pub mod cfg;
 pub mod cfg_homology;
 pub mod closure;
+pub mod content_consumer;
 pub mod coverage;
 pub mod delta_vote;
 pub mod evidence;
@@ -158,6 +167,7 @@ pub mod partition;
 pub mod pi_dma;
 pub mod probe;
 pub mod regions;
+pub mod reloc_grade;
 pub mod resolve;
 pub mod rom;
 pub mod snapshot;
