@@ -2,18 +2,26 @@
 //!
 //! Game-agnostic sibling of gate_b2's per-game boot grades: run Phase 4/5/6
 //! (delay-slot-aware CFG + owner partitioning + bounded HI/LO resolution)
-//! over the ROM's proven boot bank, seeded with ONLY the header entrypoint,
+//! over the ROM's proven boot bank, seeded with ONLY the effective entry
+//! (the proven boot bank's va_start — equal to the header entrypoint except
+//! under a relocating IPL3 like Kirby 64's CIC-6103, where IPL3 jumps to
+//! the relocated base),
 //! then grade owner boundaries against the answer-key dump's boot-bank
 //! functions. Same posture as gate_b2: `wrong == 0` is required; `open`
 //! (found fewer than exist) is an honest, allowed gap.
 //!
-//! Answer-key selection is by ROM window, not VA window: a dump section
-//! belongs to the boot grade only when its `rom` range lies inside the boot
-//! copy's proven ROM extent. (VA selection would wrongly sweep in segments
-//! that share the boot copy's VA window but are loaded separately — MM's
-//! `code` segment does exactly that.) The scan's code end comes from the
-//! answer key's own maximum function end — a cited external bound, used to
-//! grade output only, exactly like gate_b2's OoT code-end constant.
+//! Answer-key selection requires AFFINE AGREEMENT with the boot copy: a
+//! dump section belongs to the boot grade only when its `rom` lies inside
+//! the boot copy's proven ROM extent AND its vram equals
+//! `boot_va_start + (rom - boot_rom_start)` — the section genuinely runs
+//! where the copy places it. Either half alone over-selects on real
+//! corpora: VA containment sweeps in MM's separately-loaded `code`
+//! segment, and ROM containment sweeps in Kirby 64's ovl1/ovl2, which are
+//! *stored* inside the first MiB but relocated to their overlay slots at
+//! runtime. The scan's code end comes from the answer key's own maximum
+//! function end (a cited external bound, used to grade output only,
+//! exactly like gate_b2's OoT code-end constant), clamped to the proven
+//! boot extent so a malformed dump cannot push the scan past the image.
 //!
 //! Env:
 //!   FN64_DISCOVER_ROM    the game's .z64
@@ -35,6 +43,7 @@ struct Dump {
 #[derive(Deserialize)]
 struct Section {
     rom: u32,
+    vram: u32,
     #[serde(default)]
     functions: Vec<Function>,
 }
@@ -80,11 +89,17 @@ fn main() {
     let (boot_rom_start, boot_rom_end, boot_va_start) = boot;
 
     // Cited answer-key facts about the boot image: which functions live in
-    // it (by ROM containment) and where its code region ends.
+    // it (ROM containment + affine agreement) and where its code ends.
+    let boot_va_end = boot_va_start + (boot_rom_end - boot_rom_start);
     let mut answer: Vec<AnswerFunction> = Vec::new();
     let mut code_end = boot_va_start;
+    let mut skipped_nonaffine = 0usize;
     for section in &dump.sections {
         if section.rom < boot_rom_start || section.rom >= boot_rom_end {
+            continue;
+        }
+        if section.vram != boot_va_start + (section.rom - boot_rom_start) {
+            skipped_nonaffine += 1;
             continue;
         }
         for function in &section.functions {
@@ -95,16 +110,26 @@ fn main() {
             });
         }
     }
+    code_end = code_end.min(boot_va_end);
     answer.sort_by_key(|function| function.va_start);
     assert!(
         !answer.is_empty(),
-        "no answer-key sections inside the boot copy ROM window"
+        "no answer-key sections affine with the boot copy"
     );
+    if skipped_nonaffine != 0 {
+        println!(
+            "answer-key sections in boot ROM window but not affine with the \
+             boot copy (stored-not-resident, e.g. packed overlays): {skipped_nonaffine}"
+        );
+    }
 
     let code_len = (code_end - boot_va_start) as usize;
     let bank_bytes =
         &rom.bytes[boot_rom_start as usize..boot_rom_start as usize + code_len];
-    let entrypoint = rom.header.entry_point;
+    // The proven bank base IS the effective entry: IPL3 jumps to where it
+    // copied the image (header entry adjusted by the identified variant's
+    // relocation delta) — for 6102/6105-class IPL3s the two coincide.
+    let entrypoint = boot_va_start;
     println!(
         "boot bank: rom=0x{boot_rom_start:x}..0x{boot_rom_end:x} va_start=0x{boot_va_start:x} \
          answer_code_end=0x{code_end:x} entrypoint=0x{entrypoint:x} answer_functions={}",
