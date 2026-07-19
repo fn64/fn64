@@ -17,21 +17,27 @@
 //! gate loudly, so a regression gets reverted rather than a false "done"
 //! recorded.
 //!
-//! The corpus is 6 ROMs across 3+ engine families. Three carry dumps and are
-//! graded (NW4E, NWXE, OoT); three are ungraded contributors (GoldenEye,
-//! Perfect Dark, SM64) — they still consume and contribute identities, but no
-//! answer key grades them.
+//! The corpus is 8 ROMs across 4+ engine families and three CIC/IPL3
+//! variants. Five carry dumps and are graded (NW4E, NWXE, OoT, MM, K64);
+//! three are ungraded contributors (GoldenEye, Perfect Dark, SM64) — they
+//! still consume and contribute identities, but no answer key grades them.
 //!
 //! Inputs are named and declared, never defaulted (DESIGN.md section 1.0). A
 //! ROM that is unset is a loud, deterministic skip line — the corpus shrinks to
 //! whatever is present, so the recorded digest is fixed only with the full
-//! six-ROM set:
+//! eight-ROM set:
 //!   FN64_DISCOVER_NW4E_ROM / _DUMP   WWF No Mercy (U) v1.1 + NW4E dump.toml
 //!   FN64_DISCOVER_NWXE_ROM / _DUMP   WWF WrestleMania 2000 (U) + NWXE dump.toml
 //!   FN64_DISCOVER_OOT_ROM  / _DUMP   OoT NTSC 1.0 + OOTU dump.toml
+//!   FN64_DISCOVER_MM_ROM   / _DUMP   Majora's Mask (U) + MMU dump.toml
+//!   FN64_DISCOVER_K64_ROM  / _DUMP   Kirby 64 (U) + K64U dump.toml
 //!   FN64_DISCOVER_GE_ROM             GoldenEye 007 (U)     [ungraded]
 //!   FN64_DISCOVER_PD_ROM             Perfect Dark (U)      [ungraded]
 //!   FN64_DISCOVER_SM64_ROM           Super Mario 64 (U)    [ungraded]
+//!   FN64_DISCOVER_NAME_ALIASES       optional cross-project alias TOML
+//!                                    (reference/decomp-name-aliases.toml);
+//!                                    canonicalizes the held-out ORACLE's
+//!                                    names only, never matcher input
 
 use fn64_discover::callgraph_match::FunctionBody;
 use fn64_discover::corpus_homology::{build_corpus, CorpusConfig, CorpusIdentity, CorpusRom};
@@ -47,6 +53,21 @@ const MAX_ROUNDS: u32 = 64;
 struct SymbolsDoc {
     #[serde(default)]
     section: Vec<SectionDoc>,
+}
+
+/// Optional cross-project name-alias table (FN64_DISCOVER_NAME_ALIASES):
+/// each group's names denote one machine function under different decomp
+/// communities' naming. Harmonizes the held-out ORACLE only — aliases are
+/// never an input to matching.
+#[derive(Debug, Deserialize)]
+struct AliasDoc {
+    #[serde(default)]
+    alias: Vec<AliasGroup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AliasGroup {
+    names: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +120,16 @@ const SPECS: &[RomSpec] = &[
         label: "OoT",
         rom_var: "FN64_DISCOVER_OOT_ROM",
         dump_var: "FN64_DISCOVER_OOT_DUMP",
+    },
+    RomSpec {
+        label: "MM",
+        rom_var: "FN64_DISCOVER_MM_ROM",
+        dump_var: "FN64_DISCOVER_MM_DUMP",
+    },
+    RomSpec {
+        label: "K64",
+        rom_var: "FN64_DISCOVER_K64_ROM",
+        dump_var: "FN64_DISCOVER_K64_DUMP",
     },
     RomSpec {
         label: "GE",
@@ -195,13 +226,17 @@ fn run() -> Result<(), String> {
     let name_by_rom: Vec<&BTreeMap<u32, String>> =
         loaded.iter().map(|r| &r.real_name_by_va).collect();
     let graded_flags: Vec<bool> = loaded.iter().map(|r| r.graded).collect();
+    let aliases = load_name_aliases()?;
+    if !aliases.is_empty() {
+        println!("  name_aliases loaded={} (oracle canonicalization only)", aliases.len());
+    }
 
     let mut graded_identities = 0usize;
     let mut correct = 0usize;
     let mut wrong = 0usize;
     let mut wrong_examples: Vec<String> = Vec::new();
     for identity in &report.identities {
-        match grade_identity(identity, &name_by_rom, &graded_flags) {
+        match grade_identity(identity, &name_by_rom, &graded_flags, &aliases) {
             IdentityGrade::Ungraded => {}
             IdentityGrade::Correct => {
                 graded_identities += 1;
@@ -305,6 +340,7 @@ fn grade_identity(
     identity: &CorpusIdentity,
     name_by_rom: &[&BTreeMap<u32, String>],
     graded: &[bool],
+    aliases: &BTreeMap<String, String>,
 ) -> IdentityGrade {
     let mut names: Vec<(&str, &str)> = Vec::new();
     for member in &identity.members {
@@ -318,8 +354,11 @@ fn grade_identity(
     if names.len() < 2 {
         return IdentityGrade::Ungraded;
     }
-    let first = names[0].1;
-    if names.iter().all(|(_, name)| *name == first) {
+    let canonical = |name: &str| -> String {
+        aliases.get(name).cloned().unwrap_or_else(|| name.to_string())
+    };
+    let first = canonical(names[0].1);
+    if names.iter().all(|(_, name)| canonical(name) == first) {
         IdentityGrade::Correct
     } else {
         let rendered: Vec<String> = names
@@ -355,6 +394,31 @@ fn load_rom(label: &str, rom_path: &str, dump_path: &str) -> Result<LoadedRom, S
         real_name_by_va,
         graded: true,
     })
+}
+
+/// Load the optional alias table into name -> canonical (the group's first
+/// name). Unset env means an empty map: grading is exactly the strict
+/// name-equality oracle.
+fn load_name_aliases() -> Result<BTreeMap<String, String>, String> {
+    let Ok(path) = std::env::var("FN64_DISCOVER_NAME_ALIASES") else {
+        return Ok(BTreeMap::new());
+    };
+    let text = std::fs::read_to_string(&path).map_err(|error| format!("reading {path}: {error}"))?;
+    let doc: AliasDoc = toml::from_str(&text).map_err(|error| format!("parsing {path}: {error}"))?;
+    let mut map = BTreeMap::new();
+    for group in &doc.alias {
+        let [canonical, rest @ ..] = group.names.as_slice() else {
+            return Err(format!("{path}: alias group with no names"));
+        };
+        for name in [canonical].into_iter().chain(rest) {
+            if let Some(previous) = map.insert(name.clone(), canonical.clone()) {
+                return Err(format!(
+                    "{path}: name {name:?} appears in two alias groups ({previous:?} and {canonical:?})"
+                ));
+            }
+        }
+    }
+    Ok(map)
 }
 
 fn parse_dump(path: &str) -> Result<SymbolsDoc, String> {
