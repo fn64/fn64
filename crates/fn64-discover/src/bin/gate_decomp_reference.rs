@@ -7,14 +7,29 @@
 //! proven bank can't own is reported as unresolved rather than guessed.
 //!
 //! Env:
-//!   FN64_DISCOVER_ROM    the game's .z64
-//!   FN64_DISCOVER_DUMP   the matching answer-key dump.toml
+//!   FN64_DISCOVER_ROM      the game's .z64
+//!   FN64_DISCOVER_DUMP     the matching answer-key dump.toml
+//!   FN64_DISCOVER_TABLES   optional load-image table geometry TOML
+//!                          (explicit cited claims, e.g.
+//!                          crates/fn64-discover/reference/
+//!                          mm-n64-us-load-tables.toml); without it only
+//!                          ROM-only banks (the boot bank) can own ranges
 
+use fn64_discover::banks::LoadImageTableInput;
 use fn64_discover::evidence::{EvidenceManifest, EVIDENCE_SCHEMA_VERSION};
 use fn64_discover::oot_reference::{
     bind_ranges_to_fact_db_partial, executable_ranges_from_oot_dump,
 };
-use fn64_discover::{normalize, required_env_path, run_discovery, run_discovery_with_manifest};
+use fn64_discover::{
+    normalize, required_env_path, run_discovery_with_load_image_tables,
+    run_discovery_with_manifest,
+};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct TablesFile {
+    load_image_tables: Vec<LoadImageTableInput>,
+}
 
 fn main() {
     let rom_path =
@@ -27,6 +42,16 @@ fn main() {
             eprintln!("gate_decomp_reference: {error}");
             std::process::exit(1);
         });
+    let tables: Vec<LoadImageTableInput> = match std::env::var("FN64_DISCOVER_TABLES") {
+        Ok(path) => {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("reading {path}: {error}"));
+            let parsed: TablesFile = toml::from_str(&text)
+                .unwrap_or_else(|error| panic!("parsing {path}: {error}"));
+            parsed.load_image_tables
+        }
+        Err(_) => Vec::new(),
+    };
     let rom_bytes =
         std::fs::read(&rom_path).unwrap_or_else(|error| panic!("reading {rom_path}: {error}"));
     let rom = normalize(&rom_bytes).expect("normalizing ROM");
@@ -38,7 +63,8 @@ fn main() {
         .map(|range| u64::from(range.va_end - range.va_start))
         .sum();
     let (_baseline_rom, baseline_db) =
-        run_discovery(&rom_bytes, None).expect("baseline ROM-only discovery");
+        run_discovery_with_load_image_tables(&rom_bytes, None, &tables)
+            .expect("baseline discovery");
     let (bound_ranges, unresolved) = bind_ranges_to_fact_db_partial(&dump, &dump_path, &baseline_db)
         .expect("binding dump ranges to native mappings");
     let bound_count = bound_ranges.len();
@@ -47,7 +73,7 @@ fn main() {
         schema_version: EVIDENCE_SCHEMA_VERSION,
         rom_sha256: rom.sha256.clone(),
         descriptor_tables: Vec::new(),
-        load_image_tables: Vec::new(),
+        load_image_tables: tables.clone(),
         executable_ranges: bound_ranges,
     };
     let (_validated_rom, db) = run_discovery_with_manifest(&rom_bytes, &manifest)
@@ -59,8 +85,8 @@ fn main() {
     println!("  executable candidate bytes={bytes}");
     println!("  ranges bound to exactly one native bank={bound_count}");
     println!("  ranges unresolved by native mapping={unresolved_count}");
-    if let Some(first) = unresolved.first() {
-        println!("  first unresolved range={first}");
+    for line in &unresolved {
+        println!("  unresolved: {line}");
     }
     println!("  native mapped banks after evidence={proven_ranges}");
 }

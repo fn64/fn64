@@ -1,0 +1,67 @@
+# Ocarina of Time (NTSC 1.0) load-image table geometry — the exact values of
+# oot_reference::oot_load_image_tables(), expressed as data. Kept as the
+# differential fixture proving the TOML tables path is equivalent to the
+# compiled-in geometry: gate_decomp_reference with this file must reproduce
+# gate_oot_reference's bound/proven counts on the same ROM.
+
+[[load_image_tables]]
+name = "dmadata"
+
+[load_image_tables.shape]
+location = { space = "Physical", offset = 0x7430 }
+record_count = 0x5f6
+record_stride = 0x10
+source = { space = "Virtual", field_start = 0, field_end = 4 }
+destination = { space = "physical_rom", field_start = 8, end = { field_or_source_length = 0xc } }
+
+[[load_image_tables]]
+name = "effect_overlays"
+
+[load_image_tables.bank_name]
+prefix = "effect_overlay_"
+
+[load_image_tables.shape]
+location = { space = "Virtual", offset = 0xb5dba0 }
+record_count = 0x25
+record_stride = 0x1c
+source = { space = "Virtual", field_start = 0, field_end = 4 }
+destination = { space = "vram", field_start = 8, end = { field = 0xc } }
+
+[[load_image_tables]]
+name = "actor_overlays"
+
+[load_image_tables.bank_name]
+prefix = "actor_overlay_"
+
+[load_image_tables.shape]
+location = { space = "Virtual", offset = 0xb5e490 }
+record_count = 0x1d7
+record_stride = 0x20
+source = { space = "Virtual", field_start = 0, field_end = 4 }
+destination = { space = "vram", field_start = 8, end = { field = 0xc } }
+
+[[load_image_tables]]
+name = "gamestate_overlays"
+
+[load_image_tables.bank_name]
+prefix = "gamestate_overlay_"
+
+[load_image_tables.shape]
+location = { space = "Virtual", offset = 0xb672a0 }
+record_count = 6
+record_stride = 0x30
+source = { space = "Virtual", field_start = 4, field_end = 8 }
+destination = { space = "vram", field_start = 0xc, end = { field = 0x10 } }
+
+[[load_image_tables]]
+name = "kaleido_overlays"
+
+[load_image_tables.bank_name]
+prefix = "kaleido_overlay_"
+
+[load_image_tables.shape]
+location = { space = "Virtual", offset = 0xb743e0 }
+record_count = 2
+record_stride = 0x1c
+source = { space = "Virtual", field_start = 4, field_end = 8 }
+destination = { space = "vram", field_start = 0xc, end = { field = 0x10 } }
