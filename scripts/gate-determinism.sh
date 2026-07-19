@@ -45,13 +45,17 @@ expected_d1_oot_overlays=c8fcb6a1fb013492cce964e71c4985ba10aa197cc0e66b9cbab57ed
 # gate_closure: per-ROM execution-closure scoreboard (reachable destinations
 # by exact_aot/block_aot/dynamic_mips/unsupported). The "unsupported" count is
 # the distance to a full-game build. Needs all 3 AKI+OoT ROMs.
-expected_closure=4ff3a44cf8cbfb31813420ed4ba19b9fc77339808c02cbb58a665fa5d17a3607
+expected_closure=c8455706cbc12a7c7fc5d771017a70217236d0cc66663b112356554d4ef5e207
 # gate_owners_overlays: exact-owner proof on the recovered NWXE overlay banks
 # (6 owners, 0 wrong extents). Dump is grading-only, opened after proof. The
 # digest moved when Phase-6 indirect closure strengthened: unresolved_indirect
 # occurrences fell 19196→16366 and more blocks reached; exact_owners/wrong
 # unchanged (6/0).
-expected_owners_overlays=507cacddc91f0c204d5c53dcc86f44137907137640ad3f9a994609b685b6ffa3
+expected_owners_overlays=0b2f315070dbac6263f7a9d705eb162326878f79ea91f41295148761988f3a1b
+# gate_corpus_homology: N-ROM mutual-labeling identity graph (6-ROM corpus, 3
+# dump-graded). 635 identities, 100% held-out precision; libultra kernel
+# routines span AKI+Zelda engines (OoT names propagate onto unlabeled AKI).
+expected_corpus_homology=b1dd747d9cc3c214fae517db94ca8f530b6d524cd67120c865ee58fcb1e02637
 # gate_callgraph_match: BinDiff MD-index call-graph propagation (NW4E<->NWXE);
 # 591 body-hash seeds + 44 propagated matches, 100% precision held-out.
 expected_callgraph_match=587a8cb5cc56befab6f2ba86e27d0acf829d3da17a106a16d56dc97fdb88ab89
@@ -133,6 +137,7 @@ if [ "${FN64_DISCOVER_NWXE_DUMP:-}" != "" ]; then
     check_gate gate_overlay_regions "$expected_overlay_regions"
     check_gate gate_d1_overlays "$expected_d1_overlays"
     check_gate gate_owners_overlays "$expected_owners_overlays"
+    check_gate gate_corpus_homology "$expected_corpus_homology"
     check_gate gate_callgraph_match "$expected_callgraph_match"
 else
     echo "gate_gp_base: skipped (FN64_DISCOVER_NWXE_DUMP unset)"
