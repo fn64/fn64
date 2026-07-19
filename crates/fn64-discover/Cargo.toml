@@ -93,3 +93,7 @@ path = "src/bin/gate_reloc_accuracy.rs"
 [[bin]]
 name = "gate_content_consumer"
 path = "src/bin/gate_content_consumer.rs"
+
+[[bin]]
+name = "gate_asm_roundtrip"
+path = "src/bin/gate_asm_roundtrip.rs"
