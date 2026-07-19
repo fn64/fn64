@@ -97,3 +97,7 @@ path = "src/bin/gate_content_consumer.rs"
 [[bin]]
 name = "gate_asm_roundtrip"
 path = "src/bin/gate_asm_roundtrip.rs"
+
+[[bin]]
+name = "gate_wm2000_recompile"
+path = "src/bin/gate_wm2000_recompile.rs"
