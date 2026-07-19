@@ -141,6 +141,7 @@
 
 pub mod aki_reference;
 pub mod answer_keys;
+pub mod asm_emit;
 pub mod banks;
 pub mod block_pack;
 pub mod block_proof;

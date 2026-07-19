@@ -62,6 +62,11 @@ expected_callgraph_match=587a8cb5cc56befab6f2ba86e27d0acf829d3da17a106a16d56dc97
 # gate_reloc_accuracy: Decomp-Pack readiness metric (recovered references vs
 # the OoT function-symbol key proxy). Held-out.
 expected_reloc_accuracy=0ec62172a861da733bc5890d61e0e81075629a2986c3bf0301681e9c82c6275f
+# gate_asm_roundtrip: Phase-8 assembly round trip — fn64 emits GNU-as .s from
+# its OWN proven exact-owner facts, reassembles, and byte-compares to the ROM.
+# 32/32 OoT boot-bank owners byte-identical. The Decomp-Pack assembly proof +
+# the #25 matching-decomp prerequisite. Needs FN64_DISCOVER_OOT_ROM.
+expected_asm_roundtrip=6406bfee511704589f40a624275c5ac64429e8f66e3e1d78cdc64657d32f42ca
 # gate_overlay_generalize: the family search (now with VROM resolution) run
 # against four NON-AKI ROMs (OoT/GE/PD/SM64). OoT now recovers 414 overlay
 # regions (100% precision / 88.5% recall) via file-table VROM translation;
@@ -162,10 +167,12 @@ if [ "${FN64_DISCOVER_OOT_ROM:-}" != "" ]; then
         check_gate gate_d1_oot_overlays "$expected_d1_oot_overlays"
         check_gate gate_closure "$expected_closure"
         check_gate gate_reloc_accuracy "$expected_reloc_accuracy"
+        check_gate gate_asm_roundtrip "$expected_asm_roundtrip"
     else
         echo "gate_d1_oot_overlays: skipped (FN64_DISCOVER_OOT_DUMP unset)"
         echo "gate_closure: skipped (FN64_DISCOVER_OOT_DUMP unset)"
         echo "gate_reloc_accuracy: skipped (FN64_DISCOVER_OOT_DUMP unset)"
+        echo "gate_asm_roundtrip: skipped (FN64_DISCOVER_OOT_DUMP unset)"
     fi
     b2_out=$(cargo run --quiet --manifest-path "$repo/Cargo.toml" -p fn64-discover --bin gate_b2)
     case "$b2_out" in
