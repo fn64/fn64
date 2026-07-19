@@ -41,20 +41,24 @@ expected_d1_overlays=9b0dc15f92aac10586edf98a02873c0acfc57f4ff6f00f857546fcb1ec1
 # recovered VROM overlays vs hand-supplied table geometry). B reaches
 # 99.46%/48.45% — 67% of C's hand-geometry recall at matching precision.
 # Held-out (OoT dump opens after all three discovery runs).
-expected_d1_oot_overlays=f14c646ea096dcc1ec38a58fbf3aeb2b2cde396762ac1baa00e1968eb7491e6f
+expected_d1_oot_overlays=c8fcb6a1fb013492cce964e71c4985ba10aa197cc0e66b9cbab57ed23493ecf7
+# gate_closure: per-ROM execution-closure scoreboard (reachable destinations
+# by exact_aot/block_aot/dynamic_mips/unsupported). The "unsupported" count is
+# the distance to a full-game build. Needs all 3 AKI+OoT ROMs.
+expected_closure=4ff3a44cf8cbfb31813420ed4ba19b9fc77339808c02cbb58a665fa5d17a3607
 # gate_owners_overlays: exact-owner proof on the recovered NWXE overlay banks
 # (6 owners, 0 wrong extents). Dump is grading-only, opened after proof. The
 # digest moved when Phase-6 indirect closure strengthened: unresolved_indirect
 # occurrences fell 19196→16366 and more blocks reached; exact_owners/wrong
 # unchanged (6/0).
-expected_owners_overlays=ad9100231545eb7bbaab4f492531c2e5be7500b08be9778f58253424346a3717
+expected_owners_overlays=507cacddc91f0c204d5c53dcc86f44137907137640ad3f9a994609b685b6ffa3
 # gate_overlay_generalize: the family search (now with VROM resolution) run
 # against four NON-AKI ROMs (OoT/GE/PD/SM64). OoT now recovers 414 overlay
 # regions (100% precision / 88.5% recall) via file-table VROM translation;
 # SM64 stays the correct no-overlay negative control (0 admissions); GE/PD
 # ungraded. Digest is fixed only with the full OoT+GE+PD+SM64 ROM set (unset
 # ROMs are loud skips that change output), so it is guarded on those vars.
-expected_overlay_generalize=b05d47d78e79ce3c49ff037356ad42cd9c72b525fa6ebe2894cc6e8f1b5ff3c2
+expected_overlay_generalize=dec5742e52cb3bcdba9ba5c7bfee25cff35e8dd2edd6aa757d17ee4d97bb9841
 # gate_coverage renders the metric ladder for every supplied ROM; its digest is
 # only fixed when all three ROM vars are set, since an unset var is a loud skip
 # line that legitimately changes the output.
@@ -144,8 +148,10 @@ if [ "${FN64_DISCOVER_OOT_ROM:-}" != "" ]; then
     check_gate gate_b2 "$expected_b2"
     if [ "${FN64_DISCOVER_OOT_DUMP:-}" != "" ]; then
         check_gate gate_d1_oot_overlays "$expected_d1_oot_overlays"
+        check_gate gate_closure "$expected_closure"
     else
         echo "gate_d1_oot_overlays: skipped (FN64_DISCOVER_OOT_DUMP unset)"
+        echo "gate_closure: skipped (FN64_DISCOVER_OOT_DUMP unset)"
     fi
     b2_out=$(cargo run --quiet --manifest-path "$repo/Cargo.toml" -p fn64-discover --bin gate_b2)
     case "$b2_out" in

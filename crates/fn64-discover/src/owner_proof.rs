@@ -242,6 +242,37 @@ pub fn prove_exact_owners(
     image_bytes: &[u8],
     image_va_start: u32,
 ) -> OwnerProofReport {
+    prove_exact_owners_with_external_authority(
+        cfg,
+        partition,
+        facts,
+        image_bytes,
+        image_va_start,
+        &BTreeSet::new(),
+    )
+}
+
+/// Same as [`prove_exact_owners`], but additionally treats every VA in
+/// `external_authorized_roots` as an authoritative callable entry of this
+/// bank.
+///
+/// Each VA in the set is a target this bank's [`Cfg`] cannot see the authority
+/// for: a direct `jal` living in *another* proven bank whose source word is
+/// proven code and whose target lands inside this bank's proven VA range. The
+/// multi-bank composer vets those two conditions before populating the set —
+/// exactly the same authority rule a same-bank direct call already confers via
+/// [`Cfg::direct_calls`], extended across the bank boundary. This function
+/// applies no weaker rule; it trusts the caller to have proven the source, the
+/// alignment, and the in-range landing, because those facts are not present in
+/// this bank's own CFG.
+pub fn prove_exact_owners_with_external_authority(
+    cfg: &Cfg,
+    partition: &Partition,
+    facts: &FactDb,
+    image_bytes: &[u8],
+    image_va_start: u32,
+    external_authorized_roots: &BTreeSet<u32>,
+) -> OwnerProofReport {
     let mut roots: BTreeSet<u32> = cfg.proven_roots.iter().copied().collect();
     roots.extend(partition.owners.iter().map(|owner| owner.root_va));
     roots.extend(
@@ -250,6 +281,7 @@ pub fn prove_exact_owners(
             .iter()
             .flat_map(|block| block.claimants.iter().copied()),
     );
+    roots.extend(external_authorized_roots.iter().copied());
 
     let mut blocks_by_start: BTreeMap<u32, &BasicBlock> = BTreeMap::new();
     let mut duplicate_blocks = BTreeSet::new();
@@ -302,6 +334,7 @@ pub fn prove_exact_owners(
                 &overlaps,
                 image_bytes,
                 image_va_start,
+                external_authorized_roots,
             )
         })
         .collect();
@@ -327,6 +360,7 @@ fn assess_root(
     overlaps: &[(u32, u32)],
     image_bytes: &[u8],
     image_va_start: u32,
+    external_authorized_roots: &BTreeSet<u32>,
 ) -> OwnerAssessment {
     let entry = BankAddr::new(&cfg.bank, root);
     let mut blockers = BTreeSet::new();
@@ -339,7 +373,9 @@ fn assess_root(
             partition_bank: partition.bank.clone(),
         });
     }
-    if !entry_is_authoritative(root, cfg, facts, blocks_by_start, proven_entries) {
+    if !external_authorized_roots.contains(&root)
+        && !entry_is_authoritative(root, cfg, facts, blocks_by_start, proven_entries)
+    {
         blockers.insert(OwnerBlocker::EntryNotAuthoritative);
     }
 

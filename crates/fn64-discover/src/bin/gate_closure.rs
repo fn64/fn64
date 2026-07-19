@@ -1,0 +1,494 @@
+//! Execution-closure scoreboard gate: the concrete "distance to recompilable"
+//! metric.
+//!
+//! The full-game gate (DISCOVER-PLAN, UNIVERSAL-RUNTIME-PLAN) is "zero
+//! `unsupported` execution destinations." This gate is the SCOREBOARD that
+//! measures that number. For each supplied ROM it runs the real discovery
+//! pipeline, composes every proven physically-resident bank through Phase 4-6
+//! closure + owner/block proof (reusing [`snapshot::compose_materialized_banks_v1`],
+//! not reimplementing anything), then classifies every reachable CPU transfer
+//! destination as `exact_aot` / `block_aot` / `dynamic_mips` / `unsupported`
+//! and reports the counts. The headline `unsupported` count is the number that
+//! must reach zero for a full-game build.
+//!
+//! Honest scope: this is a STATIC reachability scoreboard from proven roots. It
+//! measures what discovery has CLOSED, not a live run. Destinations reachable
+//! only at runtime surface as `dynamic_mips` (open indirects) or are simply
+//! never reached; nothing here claims runtime closure. See CLOSURE_EVIDENCE.md.
+//!
+//! Grading (held-out): where a ROM dump is supplied it is opened ONLY AFTER
+//! classification, and used solely to reject a bug — an `exact_aot`/`block_aot`
+//! destination the dump says is data. It never becomes a root, fact, or class.
+//!
+//! ROM/dump paths come from named, declared environment variables. An unset var
+//! is a loud skip line, never a silent omission:
+//!   FN64_DISCOVER_NW4E_ROM  [FN64_DISCOVER_NW4E_DUMP]
+//!   FN64_DISCOVER_NWXE_ROM  [FN64_DISCOVER_NWXE_DUMP]
+//!   FN64_DISCOVER_OOT_ROM   [FN64_DISCOVER_OOT_DUMP]
+
+use fn64_discover::banks::{self, BankNamePattern};
+use fn64_discover::closure::{
+    classified_destinations, scoreboard, ClosureScoreboard, DestinationClass,
+};
+use fn64_discover::delta_vote::DeltaVoteConfig;
+use fn64_discover::facts::{FunctionEntryEvidence, ProofState};
+use fn64_discover::overlay_regions::SearchConfig;
+use fn64_discover::snapshot::{compose_materialized_banks_v1, MaterializedBankInput};
+use fn64_discover::{
+    aki_reference, oot_reference, run_discovery, run_discovery_with_load_image_tables,
+    run_discovery_with_recovered_overlay_regions, DescriptorTableInput, Fact, FactDb,
+    NormalizedRom, RecoveredOverlayInput, RomAddressSpace,
+};
+use serde::Deserialize;
+use std::collections::BTreeSet;
+
+const NW4E_ROM_VAR: &str = "FN64_DISCOVER_NW4E_ROM";
+const NW4E_DUMP_VAR: &str = "FN64_DISCOVER_NW4E_DUMP";
+const NWXE_ROM_VAR: &str = "FN64_DISCOVER_NWXE_ROM";
+const NWXE_DUMP_VAR: &str = "FN64_DISCOVER_NWXE_DUMP";
+const OOT_ROM_VAR: &str = "FN64_DISCOVER_OOT_ROM";
+const OOT_DUMP_VAR: &str = "FN64_DISCOVER_OOT_DUMP";
+
+/// Which discovery composition a ROM uses. All three reuse the crate's own
+/// `run_discovery*` entry points; none reimplements discovery.
+enum Discovery {
+    /// Boot bank + an AKI-family descriptor table (NW4E).
+    Descriptor(Option<DescriptorTableInput>),
+    /// Boot bank + explicitly located load-image tables (OoT).
+    LoadImageTables(Vec<banks::LoadImageTableInput>),
+    /// Boot bank + mechanically recovered overlay descriptor table (NWXE).
+    RecoveredOverlays(RecoveredOverlayInput),
+}
+
+struct RomSpec {
+    label: &'static str,
+    rom_var: &'static str,
+    dump_var: &'static str,
+    discovery: fn() -> Discovery,
+}
+
+/// One proven physically-resident bank the composer can materialize.
+struct PhysicalBank {
+    bank: String,
+    rom_start: u32,
+    rom_end: u32,
+    va_start: u32,
+    va_end: u32,
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("gate_closure FAILED: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
+    println!("=== fn64-discover execution-closure scoreboard ===");
+    println!("(static reachability from proven roots; unsupported is the release blocker)");
+    println!();
+
+    let roms = [
+        RomSpec {
+            label: "NW4E",
+            rom_var: NW4E_ROM_VAR,
+            dump_var: NW4E_DUMP_VAR,
+            discovery: nw4e_discovery,
+        },
+        RomSpec {
+            label: "NWXE",
+            rom_var: NWXE_ROM_VAR,
+            dump_var: NWXE_DUMP_VAR,
+            discovery: nwxe_discovery,
+        },
+        RomSpec {
+            label: "OoT",
+            rom_var: OOT_ROM_VAR,
+            dump_var: OOT_DUMP_VAR,
+            discovery: oot_discovery,
+        },
+    ];
+
+    let mut failed = false;
+    for spec in roms {
+        match std::env::var_os(spec.rom_var) {
+            None => {
+                println!("skip {}: {} unset", spec.label, spec.rom_var);
+                println!();
+            }
+            Some(path) => {
+                let path = path.to_string_lossy().into_owned();
+                match score_rom(&spec, &path) {
+                    Ok(()) => println!(),
+                    Err(error) => {
+                        failed = true;
+                        eprintln!("FAIL {}: {error}", spec.label);
+                    }
+                }
+            }
+        }
+    }
+
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn score_rom(spec: &RomSpec, path: &str) -> Result<(), String> {
+    let rom_bytes = std::fs::read(path).map_err(|error| format!("reading {path}: {error}"))?;
+    let (rom, facts) = discover(&rom_bytes, (spec.discovery)())?;
+
+    let physical = physical_banks(&facts)?;
+    if physical.is_empty() {
+        return Err("no proven physically-resident bank to compose".to_string());
+    }
+
+    // Materialize every physical bank's bytes and roots; `MaterializedBankInput`
+    // borrows both, so they must outlive the composition call. Banks are
+    // composed together so cross-bank direct-call authority is available.
+    let mut bank_bytes: Vec<&[u8]> = Vec::with_capacity(physical.len());
+    let mut bank_roots: Vec<Vec<u32>> = Vec::with_capacity(physical.len());
+    for bank in &physical {
+        let bytes = rom
+            .bytes
+            .get(bank.rom_start as usize..bank.rom_end as usize)
+            .ok_or_else(|| {
+                format!(
+                    "{} ROM interval [0x{:x},0x{:x}) is outside the normalized image",
+                    bank.bank, bank.rom_start, bank.rom_end
+                )
+            })?;
+        bank_bytes.push(bytes);
+        bank_roots.push(callable_roots(&facts, bank));
+    }
+
+    let inputs: Vec<MaterializedBankInput> = physical
+        .iter()
+        .enumerate()
+        .map(|(index, bank)| MaterializedBankInput {
+            bank: &bank.bank,
+            va_start: bank.va_start,
+            bytes: bank_bytes[index],
+            seed_roots: &bank_roots[index],
+        })
+        .collect();
+
+    let snapshots = compose_materialized_banks_v1(&rom, &facts, &inputs)
+        .map_err(|error| format!("composing banks: {error}"))?;
+
+    let board = scoreboard(&snapshots);
+
+    // Held-out grading boundary: every discovery, composition, proof, and
+    // classification pass above is COMPLETE. Nothing parsed from the dump below
+    // can become a root, fact, range, owner, or class — it can only reject a
+    // destination this gate classified exact_aot/block_aot that the dump calls
+    // data.
+    let dump_check = match std::env::var_os(spec.dump_var) {
+        None => None,
+        Some(dump_path) => {
+            let dump_path = dump_path.to_string_lossy().into_owned();
+            let dump_text = std::fs::read_to_string(&dump_path)
+                .map_err(|error| format!("reading {dump_path}: {error}"))?;
+            Some(grade_against_dump(&snapshots, &dump_text)?)
+        }
+    };
+
+    print_scoreboard(spec.label, &rom, &physical, &snapshots, &board, &dump_check);
+
+    if let Some(check) = &dump_check {
+        if check.misclassified != 0 {
+            return Err(format!(
+                "held-out grade: {} exact_aot/block_aot destinations land where the dump says data",
+                check.misclassified
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn discover(rom_bytes: &[u8], discovery: Discovery) -> Result<(NormalizedRom, FactDb), String> {
+    match discovery {
+        Discovery::Descriptor(descriptor) => {
+            run_discovery(rom_bytes, descriptor).map_err(|error| error.to_string())
+        }
+        Discovery::LoadImageTables(tables) => {
+            run_discovery_with_load_image_tables(rom_bytes, None, &tables)
+                .map_err(|error| error.to_string())
+        }
+        Discovery::RecoveredOverlays(input) => {
+            run_discovery_with_recovered_overlay_regions(rom_bytes, &input)
+                .map(|(rom, facts, _recovery)| (rom, facts))
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+/// Every proven physically-backed ROM mapping, in deterministic bank order.
+/// Snapshot V1 can only byte-verify and compose physical backing; virtual /
+/// compressed overlays (OoT's) are honestly excluded from this measurement.
+fn physical_banks(facts: &FactDb) -> Result<Vec<PhysicalBank>, String> {
+    let mut banks = Vec::new();
+    for fact in facts.proven_rom_mappings() {
+        let Fact::RomMapping {
+            bank,
+            rom_space,
+            rom_start,
+            rom_end,
+            va_start,
+            va_end,
+        } = fact
+        else {
+            unreachable!("proven_rom_mappings returned a non-mapping fact")
+        };
+        if *rom_space != RomAddressSpace::Physical {
+            continue;
+        }
+        if rom_end.checked_sub(*rom_start) != va_end.checked_sub(*va_start) {
+            return Err(format!(
+                "physical bank {bank} has unequal ROM and VA extents"
+            ));
+        }
+        banks.push(PhysicalBank {
+            bank: bank.clone(),
+            rom_start: *rom_start,
+            rom_end: *rom_end,
+            va_start: *va_start,
+            va_end: *va_end,
+        });
+    }
+    banks.sort_by(|left, right| left.bank.cmp(&right.bank));
+    Ok(banks)
+}
+
+/// Traversal roots come only from ROM-derived discovery claims: proven
+/// entries plus direct/exhaustive-indirect/table callable-entry claims. This
+/// mirrors [`gate_owners_overlays`]'s rule; the composer itself decides
+/// authority. Candidate prologues are deliberately not bulk-seeded.
+fn callable_roots(facts: &FactDb, bank: &PhysicalBank) -> Vec<u32> {
+    let mut roots: BTreeSet<u32> = facts
+        .proven_function_entries(&bank.bank)
+        .into_iter()
+        .collect();
+    for fact in facts.facts() {
+        let Fact::FunctionEntryClaim {
+            target,
+            evidence,
+            proposed_state,
+            ..
+        } = fact
+        else {
+            continue;
+        };
+        if target.bank != bank.bank
+            || target.pc < bank.va_start
+            || target.pc >= bank.va_end
+            || !matches!(
+                proposed_state,
+                ProofState::Candidate | ProofState::Supported | ProofState::Proven
+            )
+            || !matches!(
+                evidence,
+                FunctionEntryEvidence::DirectJal { .. }
+                    | FunctionEntryEvidence::ResolvedJalr { .. }
+                    | FunctionEntryEvidence::ExhaustiveIndirectCall { .. }
+                    | FunctionEntryEvidence::TableEntry { .. }
+            )
+        {
+            continue;
+        }
+        roots.insert(target.pc);
+    }
+    roots.into_iter().collect()
+}
+
+// ---- Held-out dump grading ---------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct SymbolsDoc {
+    #[serde(default)]
+    section: Vec<SectionDoc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SectionDoc {
+    vram: u32,
+    size: u32,
+    #[serde(default)]
+    functions: Vec<FunctionDoc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FunctionDoc {
+    vram: u32,
+    size: u32,
+}
+
+struct DumpCheck {
+    /// Distinct code VAs in the dump's function extents used for the cross-check.
+    code_va_count: usize,
+    /// exact_aot/block_aot destinations classified inside a dump function
+    /// extent (positive corroboration).
+    corroborated: usize,
+    /// exact_aot/block_aot destinations that the dump's section/function layout
+    /// says are DATA (outside every function extent but inside a graded
+    /// section). A nonzero count is a real bug this gate surfaces.
+    misclassified: usize,
+}
+
+/// Build the set of VAs the dump attributes to CODE (any function body) and the
+/// set of VAs inside a graded SECTION at all. A destination classified AOT that
+/// is inside a section but not any function is a data hit — a real bug.
+fn grade_against_dump(
+    snapshots: &[fn64_discover::snapshot::ProgramSnapshotV1],
+    dump_text: &str,
+) -> Result<DumpCheck, String> {
+    let doc: SymbolsDoc = toml::from_str(dump_text).map_err(|error| error.to_string())?;
+    let mut code: BTreeSet<u32> = BTreeSet::new();
+    let mut section_ranges: Vec<(u32, u32)> = Vec::new();
+    for section in &doc.section {
+        if section.size == 0 {
+            continue;
+        }
+        let Some(section_end) = section.vram.checked_add(section.size) else {
+            continue;
+        };
+        section_ranges.push((section.vram, section_end));
+        for function in &section.functions {
+            if function.size == 0 {
+                continue;
+            }
+            let Some(end) = function.vram.checked_add(function.size) else {
+                continue;
+            };
+            for va in (function.vram..end).step_by(4) {
+                code.insert(va);
+            }
+        }
+    }
+    let in_section = |va: u32| section_ranges.iter().any(|&(s, e)| va >= s && va < e);
+
+    let mut corroborated = 0usize;
+    let mut misclassified = 0usize;
+    for dest in classified_destinations(snapshots) {
+        if !matches!(
+            dest.class(),
+            DestinationClass::ExactAot | DestinationClass::BlockAot
+        ) {
+            continue;
+        }
+        if code.contains(&dest.va) {
+            corroborated += 1;
+        } else if in_section(dest.va) {
+            // The dump has an opinion about this VA (it is inside a graded
+            // section) and that opinion is "not the start of a function body
+            // word here" -> surface it. Only count VAs the dump actually
+            // covers, so overlay banks the dump lacks never produce false bugs.
+            misclassified += 1;
+        }
+    }
+    Ok(DumpCheck {
+        code_va_count: code.len(),
+        corroborated,
+        misclassified,
+    })
+}
+
+// ---- Reporting ---------------------------------------------------------------
+
+fn print_scoreboard(
+    label: &str,
+    rom: &NormalizedRom,
+    physical: &[PhysicalBank],
+    snapshots: &[fn64_discover::snapshot::ProgramSnapshotV1],
+    board: &ClosureScoreboard,
+    dump_check: &Option<DumpCheck>,
+) {
+    let reached_blocks: u64 = snapshots
+        .iter()
+        .flat_map(|snapshot| snapshot.banks.iter())
+        .map(|bank| bank.block_proof.proven_blocks)
+        .sum();
+    println!("{label}: ROM SHA-256 {}", rom.sha256);
+    println!(
+        "  composed_physical_banks={} reached_proven_blocks={} total_reachable_destinations={}",
+        physical.len(),
+        reached_blocks,
+        board.total_destinations
+    );
+    for class in DestinationClass::ALL {
+        let tally = board.tally(class);
+        println!(
+            "  {:<12} destinations={:>8} bytes={:>10}",
+            class.label(),
+            tally.destinations,
+            tally.bytes
+        );
+    }
+    println!(
+        "  HEADLINE unsupported={}  (release blocker; must reach 0)",
+        board.unsupported
+    );
+    println!(
+        "  dynamic_mips={}  (interpreter-fallback covered; reported honestly, not a blocker)",
+        board.dynamic_mips
+    );
+    println!(
+        "  reasons={}",
+        serde_json::to_string(&board.per_reason).unwrap_or_else(|_| "<error>".to_string())
+    );
+    // The concrete VAs that block release, so the number has an address list
+    // the reachability work can chase. Bounded so the gate stays readable.
+    let unsupported_vas: Vec<u32> = classified_destinations(snapshots)
+        .into_iter()
+        .filter(|dest| dest.class() == DestinationClass::Unsupported)
+        .map(|dest| dest.va)
+        .collect();
+    const SHOWN: usize = 24;
+    let shown: Vec<String> = unsupported_vas
+        .iter()
+        .take(SHOWN)
+        .map(|va| format!("{va:#010x}"))
+        .collect();
+    let suffix = if unsupported_vas.len() > SHOWN {
+        format!(" (+{} more)", unsupported_vas.len() - SHOWN)
+    } else {
+        String::new()
+    };
+    println!(
+        "  unsupported_destinations=[{}]{}",
+        shown.join(", "),
+        suffix
+    );
+    match dump_check {
+        None => println!("  held-out grade: no dump supplied (classification ungraded)"),
+        Some(check) => println!(
+            "  held-out grade: dump_code_vas={} corroborated_aot={} misclassified_as_code={}",
+            check.code_va_count, check.corroborated, check.misclassified
+        ),
+    }
+}
+
+// ---- Per-ROM discovery inputs (cited geometry, no answer keys) ---------------
+
+fn nw4e_discovery() -> Discovery {
+    Discovery::Descriptor(Some((
+        aki_reference::NW4E_DESCRIPTOR_TABLE,
+        aki_reference::nw4e_bank_name,
+    )))
+}
+
+fn nwxe_discovery() -> Discovery {
+    let search = SearchConfig::aki_family();
+    Discovery::RecoveredOverlays(RecoveredOverlayInput {
+        min_mapped_regions: search.min_records,
+        search,
+        delta_vote: DeltaVoteConfig::default(),
+        table_name: "recovered_overlay_descriptors".to_string(),
+        bank_name: BankNamePattern::new("recovered_overlay_", 0, ""),
+    })
+}
+
+fn oot_discovery() -> Discovery {
+    Discovery::LoadImageTables(oot_reference::oot_load_image_tables().to_vec())
+}

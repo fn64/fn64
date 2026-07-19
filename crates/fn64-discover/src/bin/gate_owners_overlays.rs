@@ -11,7 +11,7 @@ use fn64_discover::facts::{FunctionEntryEvidence, ProofState, RomAddressSpace};
 use fn64_discover::overlay_regions::SearchConfig;
 use fn64_discover::owner_proof::OwnerAssessment;
 use fn64_discover::snapshot::{
-    compose_materialized_bank_v1, MaterializedBankInput, OwnerBlockerKind, OwnerBlockerSummary,
+    compose_materialized_banks_v1, MaterializedBankInput, OwnerBlockerKind, OwnerBlockerSummary,
     ProgramSnapshotV1,
 };
 use fn64_discover::{
@@ -123,8 +123,22 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    let mut completed = Vec::with_capacity(mappings.len());
-    for mapping in mappings {
+    // The resident boot bank is composed alongside the overlays purely as a
+    // cross-bank authority SOURCE: a direct `jal` in proven boot code whose
+    // target lands inside an overlay's proven VA range authorizes that overlay
+    // entry (the same authority rule a same-bank direct call already confers).
+    // Sibling overlays are sources for one another symmetrically. Boot's own
+    // owner proof is discarded; it never enters overlay grading.
+    let boot = boot_mapping(&facts)?;
+
+    // Materialize every bank's bytes and roots first; `MaterializedBankInput`
+    // borrows both, so they must outlive the composition call.
+    let mut bank_bytes: Vec<&[u8]> = Vec::with_capacity(mappings.len() + 1);
+    let mut bank_roots: Vec<Vec<u32>> = Vec::with_capacity(mappings.len() + 1);
+    let mut proven_root_counts: Vec<usize> = Vec::with_capacity(mappings.len() + 1);
+
+    // Index 0 is boot; indices 1.. are the overlays, in `mappings` order.
+    for mapping in std::iter::once(&boot).chain(mappings.iter()) {
         let bytes = rom
             .bytes
             .get(mapping.rom_start as usize..mapping.rom_end as usize)
@@ -134,24 +148,33 @@ fn run() -> Result<(), String> {
                     mapping.bank, mapping.rom_start, mapping.rom_end
                 )
             })?;
-        let proven_roots = facts.proven_function_entries(&mapping.bank).len();
-        let roots = callable_roots(&facts, &mapping);
-        let snapshot = compose_materialized_bank_v1(
-            &rom,
-            &facts,
-            MaterializedBankInput {
-                bank: &mapping.bank,
-                va_start: mapping.va_start,
-                bytes,
-                seed_roots: &roots,
-            },
-        )
-        .map_err(|error| format!("composing {}: {error}", mapping.bank))?;
+        bank_bytes.push(bytes);
+        bank_roots.push(callable_roots(&facts, mapping));
+        proven_root_counts.push(facts.proven_function_entries(&mapping.bank).len());
+    }
+
+    let inputs: Vec<MaterializedBankInput> = std::iter::once(&boot)
+        .chain(mappings.iter())
+        .enumerate()
+        .map(|(index, mapping)| MaterializedBankInput {
+            bank: &mapping.bank,
+            va_start: mapping.va_start,
+            bytes: bank_bytes[index],
+            seed_roots: &bank_roots[index],
+        })
+        .collect();
+
+    let snapshots = compose_materialized_banks_v1(&rom, &facts, &inputs)
+        .map_err(|error| format!("composing banks: {error}"))?;
+
+    // Drop the boot snapshot (index 0); grade only the overlays.
+    let mut completed = Vec::with_capacity(mappings.len());
+    for (index, mapping) in mappings.iter().enumerate() {
         completed.push(CompletedOverlay {
-            mapping,
-            seed_roots: roots.len(),
-            proven_roots,
-            snapshot,
+            mapping: mapping.clone(),
+            seed_roots: bank_roots[index + 1].len(),
+            proven_roots: proven_root_counts[index + 1],
+            snapshot: snapshots[index + 1].clone(),
         });
     }
 
@@ -270,6 +293,41 @@ fn run() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The proven resident boot bank mapping. It is composed only as a cross-bank
+/// authority source, never graded.
+fn boot_mapping(facts: &FactDb) -> Result<OverlayMapping, String> {
+    for fact in facts.proven_rom_mappings() {
+        let Fact::RomMapping {
+            bank,
+            rom_space,
+            rom_start,
+            rom_end,
+            va_start,
+            va_end,
+        } = fact
+        else {
+            unreachable!("proven_rom_mappings returned a non-mapping fact")
+        };
+        if bank != banks::BOOT_BANK {
+            continue;
+        }
+        if *rom_space != RomAddressSpace::Physical {
+            return Err("resident boot bank is not physically ROM-backed".to_string());
+        }
+        if rom_end.checked_sub(*rom_start) != va_end.checked_sub(*va_start) {
+            return Err("resident boot bank has unequal ROM and VA extents".to_string());
+        }
+        return Ok(OverlayMapping {
+            bank: bank.clone(),
+            rom_start: *rom_start,
+            rom_end: *rom_end,
+            va_start: *va_start,
+            va_end: *va_end,
+        });
+    }
+    Err("no proven resident boot bank mapping".to_string())
 }
 
 fn overlay_mappings(facts: &FactDb) -> Result<Vec<OverlayMapping>, String> {
