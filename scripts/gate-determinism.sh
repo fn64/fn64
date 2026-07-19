@@ -52,6 +52,12 @@ expected_closure=4ff3a44cf8cbfb31813420ed4ba19b9fc77339808c02cbb58a665fa5d17a360
 # occurrences fell 19196→16366 and more blocks reached; exact_owners/wrong
 # unchanged (6/0).
 expected_owners_overlays=507cacddc91f0c204d5c53dcc86f44137907137640ad3f9a994609b685b6ffa3
+# gate_callgraph_match: BinDiff MD-index call-graph propagation (NW4E<->NWXE);
+# 591 body-hash seeds + 44 propagated matches, 100% precision held-out.
+expected_callgraph_match=587a8cb5cc56befab6f2ba86e27d0acf829d3da17a106a16d56dc97fdb88ab89
+# gate_reloc_accuracy: Decomp-Pack readiness metric (recovered references vs
+# the OoT function-symbol key proxy). Held-out.
+expected_reloc_accuracy=0ec62172a861da733bc5890d61e0e81075629a2986c3bf0301681e9c82c6275f
 # gate_overlay_generalize: the family search (now with VROM resolution) run
 # against four NON-AKI ROMs (OoT/GE/PD/SM64). OoT now recovers 414 overlay
 # regions (100% precision / 88.5% recall) via file-table VROM translation;
@@ -127,6 +133,7 @@ if [ "${FN64_DISCOVER_NWXE_DUMP:-}" != "" ]; then
     check_gate gate_overlay_regions "$expected_overlay_regions"
     check_gate gate_d1_overlays "$expected_d1_overlays"
     check_gate gate_owners_overlays "$expected_owners_overlays"
+    check_gate gate_callgraph_match "$expected_callgraph_match"
 else
     echo "gate_gp_base: skipped (FN64_DISCOVER_NWXE_DUMP unset)"
     echo "gate_overlay_regions: skipped (FN64_DISCOVER_NWXE_DUMP unset)"
@@ -149,9 +156,11 @@ if [ "${FN64_DISCOVER_OOT_ROM:-}" != "" ]; then
     if [ "${FN64_DISCOVER_OOT_DUMP:-}" != "" ]; then
         check_gate gate_d1_oot_overlays "$expected_d1_oot_overlays"
         check_gate gate_closure "$expected_closure"
+        check_gate gate_reloc_accuracy "$expected_reloc_accuracy"
     else
         echo "gate_d1_oot_overlays: skipped (FN64_DISCOVER_OOT_DUMP unset)"
         echo "gate_closure: skipped (FN64_DISCOVER_OOT_DUMP unset)"
+        echo "gate_reloc_accuracy: skipped (FN64_DISCOVER_OOT_DUMP unset)"
     fi
     b2_out=$(cargo run --quiet --manifest-path "$repo/Cargo.toml" -p fn64-discover --bin gate_b2)
     case "$b2_out" in

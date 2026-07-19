@@ -831,6 +831,9 @@ table consolidates, it does not re-measure.
 | Execution-closure scoreboard (gate_closure) | OoT (boot): block_aot 287, dyn_mips 73, **unsupported 6** | NW4E: block_aot 22051, dyn_mips 892, **unsupported 11** | NWXE: exact 95, block_aot 17622, dyn_mips 2169, **unsupported 20** | adopted — the recompilability metric; 0 misclassified-as-code; distance to full-game build is 6-20 destinations/ROM not thousands |
 | Multi-bank cross-overlay owner authority | n/m | n/m | exact_owners 6→7, wrong 0; entry_not_authoritative 987→273 (−714) | adopted — real but exposes partition owner-span construction (owner_missing +578) as next lever |
 | Backward-slice indirect resolution (angr pattern, BSD-2) | 1 NW4E site Open→Bounded; precision unchanged | (see NW4E) | wrong 0, all 399 open sites stay open — PROVEN irreducibly static (vtable/return-value jalr = AKI dynamic dispatch) | adopted (sound, robustness) — instrumented negative: 16,366 unresolved_indirect are dynamic_mips territory, not static |
+| Corpus call-graph propagation (BinDiff MD-index, Apache-2) | n/m | ←591 body-hash seeds + 44 propagated, 100% precision, 0 wrong | (matched vs NW4E) | adopted — self-corrected from 13.45% (positional-only) to 100% by requiring body-hash corroboration; the propagation engine for corpus homology |
+| Relocation-accuracy grade (Ramblr concept) | 280 recovered refs, 50.4% misclassified vs function-symbol key proxy | n/m | n/m | adopted (baseline metric) — Decomp-Pack readiness; proxy grade (key has symbols not full relocs), a number to improve |
+| Content-consumer data/code discriminator | 2/10 open words correct (20%) | n/m | (see OoT) | DROPPED as shippable — root-caused: 8 wrong Pointers = __osExceptionPreamble idiom, Code signal redundant with cfg.rs; documented dead-end, candidate-only module retained unwired |
 | NWXE overlay owner recovery via entry-authority | n/m | n/m | 6→6 (measured negative): entry_not_authoritative/owner_missing have sole_blocker=0, 818/987 roots authorized only by cross-bank jals a single-bank composition can't prove | valid negative — real lever is multi-bank composition (deferred snapshot feature), not entry-authority; 2 guard tests lock the sound exhaustive-jalr boundary |
 | dynamic_mips → real device (interp MMIO seam) | n/m | n/m | n/m | adopted (groundwork): interpreted lw/sw of PI_STATUS reads busy→idle across a real DeviceFabric DMA deadline and acks a PI interrupt, through the SAME modeled device authority (port trait, no second authority); hole-stays-fault with MMIO window present; rung suite unchanged; AOT lane untouched |
 | Phase-6 indirect closure (switch-table precision) | jump tables 230→240 exhaustive, precision/recall unchanged | 223→227 exhaustive, unchanged | unresolved_indirect 19196→16366 occurrences (−2830), exact_owners 6→6, wrong 0 | adopted — sound (3 near-miss soundness tests); remaining sites blocked by entry_not_authoritative/owner_missing/partition_ambiguity, not indirect |
@@ -882,6 +885,27 @@ input-replay subsystem (verified by reading its ISC source), and its
 first-launch Gatekeeper prompt blocked sandboxed execution entirely, so
 n64-systemtest results under ares remain uncollected; the DEBUGGER=1
 mupen64plus core stays the working automation vehicle.
+
+Dynamic-tracing tooling decision (2026-07-18, research-backed). Two findings
+settle the emulator question: (1) **no headless or file-tracing ares exists** —
+verified from the installed v148 binary (only display/settings CLI flags, no
+`--headless`/`--trace`, monolithic GUI) and from a fork survey (the best fork,
+`HailToDodongo/ares-64`, ISC, adds only a GUI debugger — no trace-to-file, CLI,
+Lua, or GDB; ares's sole programmatic surface is a GDB DebugServer). (2) **The
+N64 decomp community does not trace execution at all** — Zelda/MM/SM64 decomp
+is static byte-for-byte matching (splat + m2c + asm-differ + decomp-permuter +
+objdiff); indirect targets and boundaries are resolved statically with manual
+jump-table annotation, not by dynamic PC capture. fn64's dynamic-trace ambition
+is therefore closer to a recompilation workflow than a decompilation one — novel
+capability, not a missing standard tool. Consequences: static discovery remains
+the main line (where all measured leverage is); the one dynamic-speed
+investment worth making is an **x86_64/dynarec rebuild of the custom
+DEBUGGER=1 mupen core** (the arm64 build is `NO_ASM=1` pure-interpreter; mupen's
+Makefile only disables the dynarec for arm64, so an x86_64 build under Rosetta
+regains it — expected 100-300x, the tool we already own), and ares is parked as
+an accuracy oracle reachable only via its GDB stub, not a bulk tracer.
+BizHawk's mupen core has `ITraceable` file tracing but is the same slow
+interpreter class and pulls GPL, so it is not preferred.
 
 # Phase unlock ledger
 

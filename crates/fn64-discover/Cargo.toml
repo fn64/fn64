@@ -55,6 +55,10 @@ name = "gate_homology"
 path = "src/bin/gate_homology.rs"
 
 [[bin]]
+name = "gate_callgraph_match"
+path = "src/bin/gate_callgraph_match.rs"
+
+[[bin]]
 name = "gate_loaders"
 path = "src/bin/gate_loaders.rs"
 
@@ -77,3 +81,11 @@ path = "src/bin/gate_overlay_generalize.rs"
 [[bin]]
 name = "gate_closure"
 path = "src/bin/gate_closure.rs"
+
+[[bin]]
+name = "gate_reloc_accuracy"
+path = "src/bin/gate_reloc_accuracy.rs"
+
+[[bin]]
+name = "gate_content_consumer"
+path = "src/bin/gate_content_consumer.rs"
