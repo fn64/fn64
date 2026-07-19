@@ -19,7 +19,9 @@ use crate::coverage::{report_with_owner_proofs, CoverageReport, OwnerProofCovera
 use crate::facts::{
     BankAddr, Fact, FactDb, IndirectTransferKind, IndirectTransferState, RomAddressSpace,
 };
-use crate::owner_proof::{prove_exact_owners, OwnerAssessment, OwnerBlocker, OwnerProofReport};
+use crate::owner_proof::{
+    prove_exact_owners_with_external_authority, OwnerAssessment, OwnerBlocker, OwnerProofReport,
+};
 use crate::partition::{partition, Partition};
 use crate::resolve::{
     build_cfg_value_set_closed, ClosureResult, IndirectProofState, IndirectResolutionKind,
@@ -323,12 +325,27 @@ struct CoveringMapping {
 }
 
 /// Compose one byte-verified, proven physical ROM-backed bank through
-/// exact-owner proof.
+/// exact-owner proof, using only in-bank authority. Behavior and signature are
+/// preserved for existing callers; the multi-bank path is a separate entry
+/// point that adds cross-bank authority without touching this one.
 pub fn compose_materialized_bank_v1(
     rom: &NormalizedRom,
     base_facts: &FactDb,
     input: MaterializedBankInput<'_>,
 ) -> Result<ProgramSnapshotV1, SnapshotError> {
+    let prepared = prepare_materialized_bank(rom, base_facts, input)?;
+    finish_materialized_bank(rom, prepared, &BTreeSet::new())
+}
+
+/// Validate, byte-verify, and build the CFG closure of one materialized bank,
+/// integrating its in-bank direct-call and indirect-transfer facts. Owner
+/// proof is deferred to [`finish_materialized_bank`] so a caller may first
+/// gather cross-bank authority from every prepared bank.
+fn prepare_materialized_bank(
+    rom: &NormalizedRom,
+    base_facts: &FactDb,
+    input: MaterializedBankInput<'_>,
+) -> Result<PreparedBank, SnapshotError> {
     if input.bank.is_empty() || input.bank.trim() != input.bank {
         return Err(SnapshotError::InvalidBankName);
     }
@@ -505,35 +522,12 @@ pub fn compose_materialized_bank_v1(
         );
     }
 
-    let partition = partition(&closure.cfg);
-    // First owner pass supplies entry authority to block proof; executable
-    // evidence may not exist yet, so its `NotProvenExecutable` blockers are
-    // provisional and it is never serialized.
-    let authority_proof = prove_exact_owners(
-        &closure.cfg,
-        &partition,
-        &facts,
-        input.bytes,
-        input.va_start,
-    );
-    let block_proof = prove_reachable_blocks(&closure.cfg, &partition, &authority_proof, &facts);
-    // Bytes reached as proven code from an authoritative entry are proven
-    // executable — exactly those bytes, never the gaps between them. Record
-    // them as typed facts, then re-prove owners against the enriched
-    // evidence. Block proof itself does not consume executable ranges, and
-    // entry authority is unaffected, so no further fixpoint iteration exists.
-    conclude_reached_executable_ranges(&block_proof, &mut facts);
-    let owner_proof = prove_exact_owners(
-        &closure.cfg,
-        &partition,
-        &facts,
-        input.bytes,
-        input.va_start,
-    );
-    let blocker_histogram = owner_blocker_histogram(&owner_proof);
-    let coverage = report_with_owner_proofs(rom.len(), &facts, std::slice::from_ref(&owner_proof))?;
-    let bank = BankSnapshotV1 {
-        input: BankInputDigestV1 {
+    Ok(PreparedBank {
+        bank: input.bank.into(),
+        va_start: input.va_start,
+        va_end,
+        bytes: input.bytes.to_vec(),
+        digest: BankInputDigestV1 {
             bank: input.bank.into(),
             va_start: input.va_start,
             va_end,
@@ -542,12 +536,82 @@ pub fn compose_materialized_bank_v1(
             rom_end,
             bytes_sha256: sha256_hex(input.bytes),
         },
+        facts,
+        closure,
+    })
+}
+
+/// A byte-verified, closure-built bank awaiting owner proof. Separating this
+/// from owner proof lets the multi-bank composer build every bank's closure
+/// first, collect cross-bank direct-call authority, then prove each bank's
+/// owners against the enriched authority — without changing single-bank
+/// behavior, which just proves immediately with no external authority.
+struct PreparedBank {
+    bank: String,
+    va_start: u32,
+    va_end: u32,
+    bytes: Vec<u8>,
+    digest: BankInputDigestV1,
+    /// Base facts already enriched with this bank's in-bank direct-call and
+    /// indirect-transfer analysis facts.
+    facts: FactDb,
+    closure: ClosureResult,
+}
+
+/// Partition, prove owners (with any externally-conferred callable roots),
+/// derive executable evidence, and package one bank's snapshot.
+fn finish_materialized_bank(
+    rom: &NormalizedRom,
+    prepared: PreparedBank,
+    external_authorized_roots: &BTreeSet<u32>,
+) -> Result<ProgramSnapshotV1, SnapshotError> {
+    let PreparedBank {
+        va_start,
+        digest,
+        mut facts,
+        closure,
+        bytes,
+        ..
+    } = prepared;
+
+    let partition = partition(&closure.cfg);
+    // First owner pass supplies entry authority to block proof; executable
+    // evidence may not exist yet, so its `NotProvenExecutable` blockers are
+    // provisional and it is never serialized.
+    let authority_proof = prove_exact_owners_with_external_authority(
+        &closure.cfg,
+        &partition,
+        &facts,
+        &bytes,
+        va_start,
+        external_authorized_roots,
+    );
+    let block_proof = prove_reachable_blocks(&closure.cfg, &partition, &authority_proof, &facts);
+    // Bytes reached as proven code from an authoritative entry are proven
+    // executable — exactly those bytes, never the gaps between them. Record
+    // them as typed facts, then re-prove owners against the enriched
+    // evidence. Block proof itself does not consume executable ranges, and
+    // entry authority is unaffected, so no further fixpoint iteration exists.
+    conclude_reached_executable_ranges(&block_proof, &mut facts);
+    let owner_proof = prove_exact_owners_with_external_authority(
+        &closure.cfg,
+        &partition,
+        &facts,
+        &bytes,
+        va_start,
+        external_authorized_roots,
+    );
+    let blocker_histogram = owner_blocker_histogram(&owner_proof);
+    let coverage = report_with_owner_proofs(rom.len(), &facts, std::slice::from_ref(&owner_proof))?;
+    let bank = BankSnapshotV1 {
+        input: digest,
         closure,
         partition,
         owner_proof,
         block_proof,
         blocker_histogram,
     };
+    debug_assert_eq!(bank.input.bank, bank.owner_proof.bank);
     Ok(ProgramSnapshotV1 {
         schema_version: PROGRAM_SNAPSHOT_SCHEMA_V1,
         normalized_rom_sha256: rom.sha256.clone(),
@@ -555,6 +619,118 @@ pub fn compose_materialized_bank_v1(
         banks: vec![bank],
         coverage,
     })
+}
+
+/// A proven direct `jal` in one bank whose target lands inside another bank's
+/// proven VA range. Its source word is proven code and its target is aligned
+/// and in-range — the same conditions a same-bank direct call already carries.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CrossBankDirectCall {
+    source_bank: String,
+    source_pc: u32,
+    target_pc: u32,
+}
+
+/// Compose several byte-verified banks together, letting a proven direct `jal`
+/// in any one bank confer callable-entry authority on the target bank it lands
+/// in. Returns one [`ProgramSnapshotV1`] per input bank, in input order.
+///
+/// This is the multi-bank counterpart to [`compose_materialized_bank_v1`]. Each
+/// bank is prepared (validated, byte-verified, closure-built) exactly as in the
+/// single-bank path; the only added authority is cross-bank: a
+/// `DirectCall{source, target}` from proven code in bank X whose `target` lands
+/// aligned inside bank Y's proven VA range becomes an authoritative callable
+/// root of bank Y — the identical rule a same-bank direct call already applies,
+/// extended across the bank boundary. Computed/tail transfers never confer this
+/// authority; only a direct `jal` from proven bytes does. A bank composed alone
+/// here (no siblings) is byte-identical to `compose_materialized_bank_v1`.
+pub fn compose_materialized_banks_v1(
+    rom: &NormalizedRom,
+    base_facts: &FactDb,
+    inputs: &[MaterializedBankInput<'_>],
+) -> Result<Vec<ProgramSnapshotV1>, SnapshotError> {
+    let prepared: Vec<PreparedBank> = inputs
+        .iter()
+        .map(|input| {
+            prepare_materialized_bank(
+                rom,
+                base_facts,
+                MaterializedBankInput {
+                    bank: input.bank,
+                    va_start: input.va_start,
+                    bytes: input.bytes,
+                    seed_roots: input.seed_roots,
+                },
+            )
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Collect every proven-source direct call whose target lands inside some
+    // OTHER prepared bank's proven VA range, keyed by that target bank. The
+    // source bank's own closure has already recorded its in-bank calls; here we
+    // look only across bank boundaries, which no single-bank composition sees.
+    let mut cross_calls: BTreeMap<String, BTreeSet<CrossBankDirectCall>> = BTreeMap::new();
+    for source in &prepared {
+        for &(source_pc, target_pc) in &source.closure.cfg.direct_calls {
+            // SOUNDNESS: the source `jal` word must be proven code, not a
+            // jal-shaped word in unproven bytes.
+            if source.closure.cfg.word_class.get(&source_pc)
+                != Some(&crate::cfg::WordClass::ProvenCode)
+            {
+                continue;
+            }
+            for target in &prepared {
+                if target.bank == source.bank {
+                    continue;
+                }
+                // SOUNDNESS: the target must land aligned inside the target
+                // bank's proven VA range. Same-bank calls are handled by that
+                // bank's own closure; only genuinely cross-bank edges get here.
+                if target_pc >= target.va_start
+                    && target_pc < target.va_end
+                    && target_pc.is_multiple_of(4)
+                {
+                    cross_calls.entry(target.bank.clone()).or_default().insert(
+                        CrossBankDirectCall {
+                            source_bank: source.bank.clone(),
+                            source_pc,
+                            target_pc,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let mut snapshots = Vec::with_capacity(prepared.len());
+    for mut bank in prepared {
+        let calls = cross_calls.remove(&bank.bank).unwrap_or_default();
+        // Record the real cross-bank edge as a fact and promote its target to an
+        // external authorized root. The fact makes the incoming edge visible to
+        // owner proof (a cross-bank call into an interior is still an ambiguity
+        // blocker; only a call to the exact entry confers authority); the root
+        // set is what discharges `EntryNotAuthoritative` for that entry.
+        //
+        // Deliberately NOT re-seeded into the CFG closure: the target bank's
+        // own traversal already reaches this code, and injecting hundreds of
+        // extra partition roots fractures the partition into ambiguity (measured
+        // to erase even the in-bank owners). Authority alone is the sound,
+        // additive change — a same-bank direct call's authority extended across
+        // the boundary, nothing weaker and nothing that re-shapes the partition.
+        let mut external_roots = BTreeSet::new();
+        for call in &calls {
+            insert_unique(
+                &mut bank.facts,
+                Fact::DirectCall {
+                    source: BankAddr::new(call.source_bank.as_str(), call.source_pc),
+                    target: BankAddr::new(bank.bank.as_str(), call.target_pc),
+                },
+            );
+            external_roots.insert(call.target_pc);
+        }
+        snapshots.push(finish_materialized_bank(rom, bank, &external_roots)?);
+    }
+    Ok(snapshots)
 }
 
 fn insert_unique(db: &mut FactDb, fact: Fact) {
@@ -965,5 +1141,325 @@ mod tests {
                 serde_json::to_vec(&compose(&rom, &facts, &bytes, &[BASE]).unwrap()).unwrap();
             assert_eq!(actual, expected);
         }
+    }
+
+    // ---- Multi-bank cross-bank authority ----
+    //
+    // Bank X ("caller") at VA X_BASE holds an authoritative returning function
+    // that `jal`s into bank Y ("callee") at Y_BASE. Both banks live in the same
+    // 256 MB region so a real MIPS `jal` can address across them. Y_BASE names a
+    // valid returning function with NO in-bank authority; only X's proven direct
+    // call can authorize it.
+
+    const X_BASE: u32 = 0x8000_0000;
+    const X_ROM: u32 = 0x1000;
+    const Y_BASE: u32 = 0x8000_1000;
+    const Y_ROM: u32 = 0x2000;
+
+    fn jal_to(target: u32) -> u32 {
+        0x0c00_0000 | ((target >> 2) & 0x03ff_ffff)
+    }
+
+    /// A ROM holding bank X bytes at `X_ROM` and bank Y bytes at `Y_ROM`.
+    fn rom_with_two_banks(x_bytes: &[u8], y_bytes: &[u8]) -> NormalizedRom {
+        let mut bytes = vec![0u8; Y_ROM as usize + y_bytes.len()];
+        bytes[0..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        bytes[8..12].copy_from_slice(&X_BASE.to_be_bytes());
+        bytes[X_ROM as usize..X_ROM as usize + x_bytes.len()].copy_from_slice(x_bytes);
+        bytes[Y_ROM as usize..Y_ROM as usize + y_bytes.len()].copy_from_slice(y_bytes);
+        normalize(&bytes).unwrap()
+    }
+
+    /// Prove one physical bank mapping and, optionally, an authoritative entry.
+    fn prove_bank(
+        facts: &mut FactDb,
+        bank: &str,
+        rom_start: u32,
+        va_start: u32,
+        byte_len: u32,
+        authoritative_entries: &[u32],
+    ) {
+        let mapping = facts.insert(Fact::RomMapping {
+            bank: bank.into(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start,
+            rom_end: rom_start + byte_len,
+            va_start,
+            va_end: va_start + byte_len,
+        });
+        facts
+            .conclude(
+                format!("bank:{bank}"),
+                ProofState::Proven,
+                vec![mapping],
+                "test_mapping",
+            )
+            .unwrap();
+        for &entry in authoritative_entries {
+            let target = BankAddr::new(bank, entry);
+            let claim = facts.insert(Fact::FunctionEntryClaim {
+                target: target.clone(),
+                detector: CandidateDetector::ProloguePattern,
+                evidence: FunctionEntryEvidence::Prologue {
+                    stack_adjust: target.clone(),
+                    frame_size: 16,
+                    pattern: ProloguePattern::LeafWithMatchedRestore,
+                    corroborating_site: BankAddr::new(bank, entry + 4),
+                },
+                proposed_state: ProofState::Proven,
+            });
+            facts
+                .conclude(
+                    function_entry_subject(&target),
+                    ProofState::Proven,
+                    vec![claim],
+                    "test_entry",
+                )
+                .unwrap();
+        }
+    }
+
+    fn two_bank_inputs<'a>(
+        x_bytes: &'a [u8],
+        y_bytes: &'a [u8],
+        x_seeds: &'a [u32],
+        y_seeds: &'a [u32],
+    ) -> [MaterializedBankInput<'a>; 2] {
+        [
+            MaterializedBankInput {
+                bank: "caller",
+                va_start: X_BASE,
+                bytes: x_bytes,
+                seed_roots: x_seeds,
+            },
+            MaterializedBankInput {
+                bank: "callee",
+                va_start: Y_BASE,
+                bytes: y_bytes,
+                seed_roots: y_seeds,
+            },
+        ]
+    }
+
+    fn callee_owner_is_proven(snapshots: &[ProgramSnapshotV1]) -> bool {
+        snapshots[1]
+            .banks[0]
+            .owner_proof
+            .assessments
+            .iter()
+            .any(|assessment| {
+                matches!(assessment, OwnerAssessment::Proven { owner } if owner.entry.pc == Y_BASE)
+            })
+    }
+
+    fn callee_entry_not_authoritative(snapshots: &[ProgramSnapshotV1]) -> bool {
+        snapshots[1].banks[0].owner_proof.assessments.iter().any(|assessment| {
+            assessment.entry().pc == Y_BASE
+                && matches!(
+                    assessment,
+                    OwnerAssessment::Candidate { frontier } | OwnerAssessment::Ambiguous { frontier }
+                        if frontier.blockers.contains(&OwnerBlocker::EntryNotAuthoritative)
+                )
+        })
+    }
+
+    #[test]
+    fn proven_cross_bank_jal_authorizes_a_callee_owner() {
+        // X calls Y with a real `jal`; Y is a bare returning function with no
+        // in-bank authority. Cross-bank composition must admit Y's owner.
+        let x = asm(&[jal_to(Y_BASE), NOP, JR_RA, NOP]);
+        let y = asm(&[JR_RA, NOP]);
+        let rom = rom_with_two_banks(&x, &y);
+        let mut facts = FactDb::new();
+        prove_bank(
+            &mut facts,
+            "caller",
+            X_ROM,
+            X_BASE,
+            x.len() as u32,
+            &[X_BASE],
+        );
+        prove_bank(&mut facts, "callee", Y_ROM, Y_BASE, y.len() as u32, &[]);
+
+        let inputs = two_bank_inputs(&x, &y, &[X_BASE], &[Y_BASE]);
+        let snapshots = compose_materialized_banks_v1(&rom, &facts, &inputs).unwrap();
+        assert!(
+            callee_owner_is_proven(&snapshots),
+            "a proven cross-bank jal should authorize the callee entry: {:?}",
+            snapshots[1].banks[0].owner_proof.assessments
+        );
+        // The honest cross-bank edge is recorded as a fact on the callee.
+        assert!(snapshots[1].facts.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::DirectCall { source, target }
+                if source.bank == "caller" && target.bank == "callee" && target.pc == Y_BASE
+        )));
+    }
+
+    #[test]
+    fn single_bank_composition_leaves_callee_unauthorized() {
+        // The same callee composed ALONE (no caller sibling) has no in-bank
+        // authority, so its entry stays non-authoritative. This is the control
+        // that the win above comes from the cross-bank edge, not the geometry.
+        let y = asm(&[JR_RA, NOP]);
+        let rom = rom_with_two_banks(&asm(&[JR_RA, NOP]), &y);
+        let mut facts = FactDb::new();
+        prove_bank(&mut facts, "callee", Y_ROM, Y_BASE, y.len() as u32, &[]);
+
+        let callee_only = [MaterializedBankInput {
+            bank: "callee",
+            va_start: Y_BASE,
+            bytes: &y,
+            seed_roots: &[Y_BASE],
+        }];
+        let snapshots = compose_materialized_banks_v1(&rom, &facts, &callee_only).unwrap();
+        // snapshots[0] is the callee here; the helper indexes [1], so assert
+        // directly on assessment [0].
+        assert!(snapshots[0].banks[0]
+            .owner_proof
+            .assessments
+            .iter()
+            .any(|assessment| assessment.entry().pc == Y_BASE
+                && matches!(
+                    assessment,
+                    OwnerAssessment::Candidate { frontier }
+                        | OwnerAssessment::Ambiguous { frontier }
+                        if frontier.blockers.contains(&OwnerBlocker::EntryNotAuthoritative)
+                )));
+    }
+
+    #[test]
+    fn cross_bank_jal_from_unproven_code_confers_no_authority() {
+        // The `jal` word in X is NOT reached as proven code: X is seeded with a
+        // root that never reaches the call site, so the source word stays
+        // unproven. A jal-shaped word in unproven bytes proves nothing.
+        //
+        // X layout: [0x00] JR_RA / NOP  (the only reached, authoritative fn)
+        //           [0x08] jal Y / NOP  (unreached — never proven code)
+        let x = asm(&[JR_RA, NOP, jal_to(Y_BASE), NOP]);
+        let y = asm(&[JR_RA, NOP]);
+        let rom = rom_with_two_banks(&x, &y);
+        let mut facts = FactDb::new();
+        prove_bank(
+            &mut facts,
+            "caller",
+            X_ROM,
+            X_BASE,
+            x.len() as u32,
+            &[X_BASE],
+        );
+        prove_bank(&mut facts, "callee", Y_ROM, Y_BASE, y.len() as u32, &[]);
+
+        // Seed X only at X_BASE (the returning fn); the jal at X_BASE+8 is never
+        // traversed, so its word_class is not ProvenCode.
+        let inputs = two_bank_inputs(&x, &y, &[X_BASE], &[Y_BASE]);
+        let snapshots = compose_materialized_banks_v1(&rom, &facts, &inputs).unwrap();
+        assert!(
+            !callee_owner_is_proven(&snapshots),
+            "an unproven-source jal must not authorize the callee"
+        );
+        assert!(callee_entry_not_authoritative(&snapshots));
+        // No cross-bank DirectCall fact was minted from unproven source bytes.
+        assert!(!snapshots[1].facts.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::DirectCall { source, target }
+                if source.bank == "caller" && target.bank == "callee"
+        )));
+    }
+
+    #[test]
+    fn cross_bank_jal_missing_the_callee_range_confers_no_authority() {
+        // X `jal`s an address that lands in NEITHER bank's proven VA range
+        // (a gap between X and Y). No bank claims it, so no authority is
+        // conferred and Y's own entry is untouched.
+        let stray = Y_BASE - 0x100; // between X and Y, mapped by no bank
+        let x = asm(&[jal_to(stray), NOP, JR_RA, NOP]);
+        let y = asm(&[JR_RA, NOP]);
+        let rom = rom_with_two_banks(&x, &y);
+        let mut facts = FactDb::new();
+        prove_bank(
+            &mut facts,
+            "caller",
+            X_ROM,
+            X_BASE,
+            x.len() as u32,
+            &[X_BASE],
+        );
+        prove_bank(&mut facts, "callee", Y_ROM, Y_BASE, y.len() as u32, &[]);
+
+        let inputs = two_bank_inputs(&x, &y, &[X_BASE], &[Y_BASE]);
+        let snapshots = compose_materialized_banks_v1(&rom, &facts, &inputs).unwrap();
+        assert!(
+            !callee_owner_is_proven(&snapshots),
+            "a jal missing the callee's VA range must not authorize its entry"
+        );
+        assert!(callee_entry_not_authoritative(&snapshots));
+    }
+
+    #[test]
+    fn cross_bank_computed_call_confers_no_authority() {
+        // X reaches Y through a computed `jalr $ra, $t9` (t9 built with
+        // lui/addiu), NOT a direct `jal`. A cross-bank computed/tail transfer is
+        // NOT the direct-call authority rule, so Y's entry stays unauthorized.
+        let lui_t9 = 0x3c19_0000 | (Y_BASE >> 16); // lui $t9, hi(Y)
+        let ori_t9 = 0x3739_0000 | (Y_BASE & 0xffff); // ori $t9, $t9, lo(Y)
+        let jalr_ra_t9 = (25u32 << 21) | (31u32 << 11) | 0x09; // jalr $ra, $t9
+        let x = asm(&[lui_t9, ori_t9, jalr_ra_t9, NOP, JR_RA, NOP]);
+        let y = asm(&[JR_RA, NOP]);
+        let rom = rom_with_two_banks(&x, &y);
+        let mut facts = FactDb::new();
+        prove_bank(
+            &mut facts,
+            "caller",
+            X_ROM,
+            X_BASE,
+            x.len() as u32,
+            &[X_BASE],
+        );
+        prove_bank(&mut facts, "callee", Y_ROM, Y_BASE, y.len() as u32, &[]);
+
+        let inputs = two_bank_inputs(&x, &y, &[X_BASE], &[Y_BASE]);
+        let snapshots = compose_materialized_banks_v1(&rom, &facts, &inputs).unwrap();
+        assert!(
+            !callee_owner_is_proven(&snapshots),
+            "a cross-bank computed call must not authorize the callee entry"
+        );
+        assert!(callee_entry_not_authoritative(&snapshots));
+    }
+
+    #[test]
+    fn multi_bank_solo_matches_single_bank_composition() {
+        // A bank composed alone through the multi-bank entry point must be
+        // byte-identical to `compose_materialized_bank_v1`: the no-sibling path
+        // adds no authority and re-shapes nothing.
+        let bytes = asm(&[JR_RA, NOP]);
+        let rom = rom_with_bank(&bytes);
+        let facts = facts_for(bytes.len() as u32, &[BASE]);
+        let single = compose_materialized_bank_v1(
+            &rom,
+            &facts,
+            MaterializedBankInput {
+                bank: "bank",
+                va_start: BASE,
+                bytes: &bytes,
+                seed_roots: &[BASE],
+            },
+        )
+        .unwrap();
+        let multi = compose_materialized_banks_v1(
+            &rom,
+            &facts,
+            &[MaterializedBankInput {
+                bank: "bank",
+                va_start: BASE,
+                bytes: &bytes,
+                seed_roots: &[BASE],
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&single).unwrap(),
+            serde_json::to_vec(&multi[0]).unwrap()
+        );
     }
 }

@@ -156,16 +156,46 @@ geometry (a per-game input the engine did not infer). Running the identical
 function-entry grade through the *mechanically recovered* overlays instead
 answers whether automation can replace that hand geometry. The three-way
 result: (A) boot-only 62.500%/0.823%; (B) mechanically recovered
-99.462%/48.450%; (C) hand geometry 99.567%/72.331%. **B reaches 66.98% of C's
-recall at matching precision (99.46% vs 99.57%) — two-thirds of the
-hand-geometry benefit, recovered from ROM bytes alone, with no precision
-loss.** The per-family answer-key accounting locates the remaining gap
-precisely: kaleido fully recovered (594/594 functions); actor 167 of 426
-sub-banks recovered (5,935 of 9,213 functions — 3,278 missed); effect and
-gamestate stayed below the two-region admission floor (0 of 236 functions).
-So the recall gap is dominated by *actor sub-bank coverage* (3,278 functions),
-not the two dropped tables (236) — the next lever is recovering more actor
-overlay records, not lowering the admission floor.
+**99.567%/72.331%**; (C) hand geometry 99.567%/72.331%. **B now equals C
+byte-for-byte — mechanically-recovered overlays reach the hand-supplied
+geometry ceiling exactly, at identical precision, recovered from ROM bytes
+alone.** This closed in three steps: descriptor-corroborated actor mapping
+(each open record's own `vram_dest` field admitted only if a CFG rooted there
+reaches valid in-window code and the VA is unique) took B from 48.450% to
+69.449% recall (actor 167→412 of 426 sub-banks, 0 wrong); then sound
+below-floor admission (a table below the two-region floor is admitted iff its
+single record is descriptor-corroborated AND VA-unique) closed the last 14
+actor sub-banks plus the effect (36/36) and gamestate (4/4) tables. Final:
+actor 426/426, effect 36/36, gamestate 4/4, kaleido 2/2 — all 468 overlay
+regions recovered, 0 wrong, 0 missed. The AKI physical path never fires the
+corroboration or below-floor rules (their tables map fully via delta_vote), so
+`gate_overlay_regions` (`471181f2…`) and `gate_d1_overlays` (`9b0dc15f…`) are
+byte-identical throughout. `gate_d1_oot_overlays` is 10/10 byte-identical
+(`c8fcb6a1…`); `gate_overlay_generalize` (`dec5742e…`). **This proves the
+"port any N64 ROM without per-game hand geometry" thesis on the answer-key
+ROM: automation matches the hand-encoded overlay tables, not approximately but
+exactly.**
+
+**Execution-closure scoreboard (`gate_closure`, held-out, 10/10 byte-identical
+`4ff3a44c…`).** The concrete "distance to a recompilable ROM": every reachable
+CPU transfer destination is classified `exact_aot` (inside a proven exact
+owner) / `block_aot` (proven reachable code, no source-level owner claimed) /
+`dynamic_mips` (open/bounded indirect the interpreter fallback covers) /
+`unsupported` (lands outside every known mapping — the release-blocker). Per
+ROM (destinations): NW4E block_aot 22,051 / dynamic_mips 892 / **unsupported
+11**; NWXE exact_aot 95 / block_aot 17,622 / dynamic_mips 2,169 /
+**unsupported 20**; OoT (resident boot bank only — its VROM overlays are
+outside snapshot V1's physical-backing composition) block_aot 287 /
+dynamic_mips 73 / **unsupported 6**. Held-out grading found
+`misclassified_as_code = 0` on all three: no exact_aot/block_aot destination
+lands where the dump says data. The headline: the distance to a full-game
+build is not thousands of destinations but **6–20 per ROM** — each an
+enumerable frontier (boot-DMA/hardware targets and CFG computed-jump
+over-approximations). This reframes "recompile it all" from an open-ended
+recall question into a small, inspectable punch-list, and confirms the
+architecture's design: the large `dynamic_mips` counts (the AKI dynamic-
+dispatch `jalr` sites that indirect backward-slicing proved irreducibly static-
+open) are fallback-covered, not blockers.
 
 Phase-6 indirect closure was then strengthened on the recovered NWXE overlay
 banks (three sound `sltiu`-bounded switch-table recognizers, each with a
@@ -797,7 +827,10 @@ table consolidates, it does not re-measure.
 | Overlay region discovery (descriptor-family search) | n/m | 5/5 regions recovered from ROM alone (table @0x53988 found without being handed it), delta_vote 5/5 correct | **4 overlay regions recovered @table 0x48a68, 100%/100%, delta_vote 4/4 correct, 0 wrong; integrated D1 36.396867%/28.542179% → 49.976448%/86.895987%; a 2nd candidate table correctly rejected** | adopted — mechanically opens NWXE overlays |
 | Exact-owner proof on recovered NWXE overlays | n/m | n/m | 6 exact owners (from 0), 0 wrong extents; 22,562 reached blocks, 475,740 proven-executable bytes; dominant blocker unresolved-indirect (614 sole) | adopted — first proof-qualified overlay ownership |
 | VROM overlay recovery (file-table resolution) | **OoT: file table @0x7430 recovered (=dmadata); 414 overlay regions, 100% precision / 88.5% recall (actor+kaleido tables admitted)**; SM64 correctly 0 (negative control); GE/PD 0 ungraded | n/m (AKI physical path unchanged) | n/m (unchanged) | adopted — overlay recovery now crosses engine families (AKI + OoT); effect/gamestate tables below 2-region floor stay open |
-| OoT end-to-end with recovered overlays (gate_d1_oot_overlays) | **B mechanical: 99.549%/69.449% (was 48.450%); C hand-geometry: 99.567%/72.331% → B now reaches 96.0% of C recall at matching precision**; descriptor-corroborated actor recovery: actor 167→412/426 sub-banks, +3,050 fns, 0 wrong | n/m | n/m | held-out: mechanical recovery now ~96% of hand geometry, no precision loss; remaining gap = 14 actor sub-banks + effect/gamestate below 2-region floor (464 fns) |
+| OoT end-to-end with recovered overlays (gate_d1_oot_overlays) | **B mechanical NOW EQUALS C hand-geometry EXACTLY: 99.567%/72.331%** (was 48.450%→69.449%→72.331% over 3 steps); all 468 overlay regions recovered (actor 426/426, effect 36/36, gamestate 4/4, kaleido 2/2), 0 wrong | n/m | n/m | thesis proven: mechanical recovery matches hand-encoded overlay geometry exactly, no precision loss, held-out |
+| Execution-closure scoreboard (gate_closure) | OoT (boot): block_aot 287, dyn_mips 73, **unsupported 6** | NW4E: block_aot 22051, dyn_mips 892, **unsupported 11** | NWXE: exact 95, block_aot 17622, dyn_mips 2169, **unsupported 20** | adopted — the recompilability metric; 0 misclassified-as-code; distance to full-game build is 6-20 destinations/ROM not thousands |
+| Multi-bank cross-overlay owner authority | n/m | n/m | exact_owners 6→7, wrong 0; entry_not_authoritative 987→273 (−714) | adopted — real but exposes partition owner-span construction (owner_missing +578) as next lever |
+| Backward-slice indirect resolution (angr pattern, BSD-2) | 1 NW4E site Open→Bounded; precision unchanged | (see NW4E) | wrong 0, all 399 open sites stay open — PROVEN irreducibly static (vtable/return-value jalr = AKI dynamic dispatch) | adopted (sound, robustness) — instrumented negative: 16,366 unresolved_indirect are dynamic_mips territory, not static |
 | NWXE overlay owner recovery via entry-authority | n/m | n/m | 6→6 (measured negative): entry_not_authoritative/owner_missing have sole_blocker=0, 818/987 roots authorized only by cross-bank jals a single-bank composition can't prove | valid negative — real lever is multi-bank composition (deferred snapshot feature), not entry-authority; 2 guard tests lock the sound exhaustive-jalr boundary |
 | dynamic_mips → real device (interp MMIO seam) | n/m | n/m | n/m | adopted (groundwork): interpreted lw/sw of PI_STATUS reads busy→idle across a real DeviceFabric DMA deadline and acks a PI interrupt, through the SAME modeled device authority (port trait, no second authority); hole-stays-fault with MMIO window present; rung suite unchanged; AOT lane untouched |
 | Phase-6 indirect closure (switch-table precision) | jump tables 230→240 exhaustive, precision/recall unchanged | 223→227 exhaustive, unchanged | unresolved_indirect 19196→16366 occurrences (−2830), exact_owners 6→6, wrong 0 | adopted — sound (3 near-miss soundness tests); remaining sites blocked by entry_not_authoritative/owner_missing/partition_ambiguity, not indirect |

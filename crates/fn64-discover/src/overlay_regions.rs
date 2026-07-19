@@ -31,11 +31,16 @@
 //! *distinct* interval set survives -- [`crate::delta_vote`] admissibility is
 //! the uniqueness filter that breaks the ambiguity. A table whose regions
 //! delta_vote cannot map is not admitted merely because its records parse.
-//! After that unchanged table-level admission, an open record may use its
-//! descriptor destination as a mapping hypothesis only when a CFG rooted at
-//! that destination decodes without a blocker, every reachable PC-relative
-//! branch stays in the proposed interval, and no distinct admitted or
-//! corroborated record overlaps its VA interval.
+//! An open record may use its descriptor destination as a mapping hypothesis
+//! only when a CFG rooted at that destination decodes without a blocker, every
+//! reachable PC-relative branch stays in the proposed interval, and no
+//! distinct admitted or corroborated record overlaps its VA interval. The
+//! ordinary mapped-region floor remains the default table rule. A table below
+//! that floor is admitted only when every record is independently
+//! descriptor-corroborated and its resulting VA interval is globally unique;
+//! partial corroboration never mints a table. One-record gaps are enumerated
+//! only inside an already-established descriptor-family envelope, because an
+//! arbitrary isolated pointer triple can otherwise alias real resident code.
 //!
 //! Every function here is a pure function of the ROM bytes and the search
 //! configuration: no I/O, no randomness, byte-identical output across runs.
@@ -135,9 +140,10 @@ impl SearchConfig {
     /// still has to derive the unique address for every admitted region.
     pub fn vrom_family() -> Self {
         let mut config = Self::aki_family();
-        // Small effect/utility overlays remain real code images; delta_vote,
-        // not a 4 KiB AKI size floor, is the discriminating evidence.
-        config.min_region_len = 0x100;
+        // Small effect/utility overlays remain real code images. The 0x80
+        // floor includes bounded leaf images while descriptor-rooted CFG
+        // validation, not the 4 KiB AKI size floor, discriminates code.
+        config.min_region_len = 0x80;
         config.vram_hi = 0x8100_0000;
         config
     }
@@ -373,15 +379,64 @@ impl MappingHypothesis {
     }
 }
 
+/// The precise rule-(3) blocker for a descriptor-rooted CFG. Kept typed so a
+/// caller can report why a record stayed open without re-running discovery or
+/// consulting a grading key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DescriptorCfgFailure {
+    EmptyOrMisalignedRegion,
+    SourceLengthMismatch,
+    NoDecodedCode,
+    EmptyCfg,
+    InvalidInstruction { pc: u32, word: u32 },
+    MissingDelaySlot { control_pc: u32 },
+    RanOffEnd { block_start: u32 },
+    OutOfRangeTarget { block_start: u32, target: u32 },
+    OutOfRangeFallthrough { block_start: u32, next: u32 },
+}
+
+/// Which descriptor-corroboration rule left a VROM record open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DescriptorMappingFailure {
+    /// The source interval did not materialize through exactly one recovered
+    /// file-table record.
+    Rule1SourceMaterialization,
+    /// The aligned descriptor destination and checked end did not fit wholly
+    /// inside the configured link-VA window.
+    Rule2DestinationRange,
+    /// Recursive descent from the descriptor VA did not establish a bounded,
+    /// blocker-free real-code CFG.
+    Rule3Cfg(DescriptorCfgFailure),
+    /// A distinct mapping hypothesis overlapped the proposed VA interval.
+    Rule4VaConflict,
+}
+
+/// Per-record mapping outcome for the VROM path. `region_diagnostics` stays
+/// parallel to `region_deltas`, making every open record attributable to one
+/// failed corroboration rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VromRecordMappingDiagnostic {
+    DeltaVote,
+    DeltaVoteAndDescriptorCorroborated,
+    DescriptorCorroborated,
+    /// This record passed on its own, but a sibling in the same below-floor
+    /// table did not. Partial descriptor evidence never mints a table.
+    DescriptorCorroboratedTableIncomplete,
+    Open(DescriptorMappingFailure),
+}
+
 /// Validate the descriptor-derived mapping without using delta_vote or a
 /// grading key. The descriptor supplies only the root VA; the region's own
 /// reachable instructions must establish a complete, blocker-free CFG.
-fn descriptor_mapping_corroborated(region_bytes: &[u8], hypothesis: MappingHypothesis) -> bool {
-    if region_bytes.is_empty()
-        || !region_bytes.len().is_multiple_of(4)
-        || region_bytes.len() != (hypothesis.source_end - hypothesis.source_start) as usize
-    {
-        return false;
+fn descriptor_mapping_corroborated(
+    region_bytes: &[u8],
+    hypothesis: MappingHypothesis,
+) -> Result<(), DescriptorCfgFailure> {
+    if region_bytes.is_empty() || !region_bytes.len().is_multiple_of(4) {
+        return Err(DescriptorCfgFailure::EmptyOrMisalignedRegion);
+    }
+    if region_bytes.len() != (hypothesis.source_end - hypothesis.source_start) as usize {
+        return Err(DescriptorCfgFailure::SourceLengthMismatch);
     }
 
     let cfg = build_cfg(
@@ -399,30 +454,70 @@ fn descriptor_mapping_corroborated(region_bytes: &[u8], hypothesis: MappingHypot
         .word_class
         .values()
         .any(|class| *class == WordClass::ProvenCode);
-    let all_blocks_corroborate = cfg.blocks.iter().all(|block| match &block.terminator {
-        BlockTerminator::InvalidInstruction { .. }
-        | BlockTerminator::MissingDelaySlot { .. }
-        | BlockTerminator::RanOffEnd => false,
-        BlockTerminator::Branch {
-            target,
-            fallthrough,
+    if !has_code {
+        return Err(DescriptorCfgFailure::NoDecodedCode);
+    }
+    if cfg.blocks.is_empty() {
+        return Err(DescriptorCfgFailure::EmptyCfg);
+    }
+    for block in &cfg.blocks {
+        let failure = match &block.terminator {
+            BlockTerminator::InvalidInstruction { pc, word } => {
+                Some(DescriptorCfgFailure::InvalidInstruction {
+                    pc: *pc,
+                    word: *word,
+                })
+            }
+            BlockTerminator::MissingDelaySlot { control_pc } => {
+                Some(DescriptorCfgFailure::MissingDelaySlot {
+                    control_pc: *control_pc,
+                })
+            }
+            BlockTerminator::RanOffEnd => Some(DescriptorCfgFailure::RanOffEnd {
+                block_start: block.start_va,
+            }),
+            BlockTerminator::Branch {
+                target,
+                fallthrough,
+            }
+            | BlockTerminator::BranchLikely {
+                target,
+                fallthrough,
+            } => {
+                if !in_range(*target) {
+                    Some(DescriptorCfgFailure::OutOfRangeTarget {
+                        block_start: block.start_va,
+                        target: *target,
+                    })
+                } else if !in_range(*fallthrough) {
+                    Some(DescriptorCfgFailure::OutOfRangeFallthrough {
+                        block_start: block.start_va,
+                        next: *fallthrough,
+                    })
+                } else {
+                    None
+                }
+            }
+            BlockTerminator::Call { next, .. } | BlockTerminator::Fallthrough { next } => {
+                (!in_range(*next)).then_some(DescriptorCfgFailure::OutOfRangeFallthrough {
+                    block_start: block.start_va,
+                    next: *next,
+                })
+            }
+            BlockTerminator::Tail { .. }
+            | BlockTerminator::Return
+            | BlockTerminator::Indirect { .. }
+            | BlockTerminator::ResolvedIndirect { .. }
+            | BlockTerminator::Trap => None,
+        };
+        if let Some(failure) = failure {
+            return Err(failure);
         }
-        | BlockTerminator::BranchLikely {
-            target,
-            fallthrough,
-        } => in_range(*target) && in_range(*fallthrough),
-        BlockTerminator::Call { next, .. } => in_range(*next),
-        BlockTerminator::Fallthrough { next } => in_range(*next),
-        BlockTerminator::Tail { .. }
-        | BlockTerminator::Return
-        | BlockTerminator::Indirect { .. }
-        | BlockTerminator::ResolvedIndirect { .. }
-        | BlockTerminator::Trap => true,
-    });
-    has_code && !cfg.blocks.is_empty() && all_blocks_corroborate
+    }
+    Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct DescriptorFallback {
     admission_index: usize,
     record_index: usize,
@@ -439,7 +534,7 @@ fn apply_unique_descriptor_fallbacks<A>(
     fallbacks: Vec<DescriptorFallback>,
     mut region_deltas: impl FnMut(&mut A) -> &mut Vec<Option<(u32, u32)>>,
     mut mapped_regions: impl FnMut(&mut A) -> &mut u32,
-) {
+) -> BTreeSet<(usize, usize)> {
     let admitted: Vec<_> = fallbacks
         .iter()
         .filter(|candidate| {
@@ -453,6 +548,10 @@ fn apply_unique_descriptor_fallbacks<A>(
         })
         .collect();
 
+    let admitted_keys: BTreeSet<_> = admitted
+        .iter()
+        .map(|candidate| (candidate.admission_index, candidate.record_index))
+        .collect();
     for candidate in admitted {
         let admission = &mut admissions[candidate.admission_index];
         let slot = &mut region_deltas(admission)[candidate.record_index];
@@ -467,6 +566,7 @@ fn apply_unique_descriptor_fallbacks<A>(
             *mapped_regions(admission) += 1;
         }
     }
+    admitted_keys
 }
 
 /// The full result: the raw family candidates, then the delta_vote-filtered
@@ -575,7 +675,7 @@ pub fn recover_overlay_regions(
                     else {
                         continue;
                     };
-                    if descriptor_mapping_corroborated(region_bytes, mapping) {
+                    if descriptor_mapping_corroborated(region_bytes, mapping).is_ok() {
                         fallbacks.push(DescriptorFallback {
                             admission_index,
                             record_index,
@@ -586,7 +686,7 @@ pub fn recover_overlay_regions(
             }
         }
     }
-    apply_unique_descriptor_fallbacks(
+    let _ = apply_unique_descriptor_fallbacks(
         &mut admissions,
         &raw_mappings,
         fallbacks,
@@ -633,9 +733,13 @@ impl VromCandidateTable {
 pub struct VromTableAdmission {
     pub table: VromCandidateTable,
     pub region_deltas: Vec<Option<(u32, u32)>>,
+    /// Parallel per-record reason path. An open mapping always names the
+    /// failed descriptor rule; callers never have to infer it from a score.
+    pub region_diagnostics: Vec<VromRecordMappingDiagnostic>,
     pub mapped_regions: u32,
-    /// Engine-independent evidence minimum supplied by the caller, matching
-    /// the unchanged physical descriptor-family path.
+    /// Engine-independent ordinary evidence minimum supplied by the caller.
+    /// A below-floor table needs complete descriptor corroboration and global
+    /// uniqueness instead.
     pub required_mapped_regions: u32,
     pub admitted: bool,
 }
@@ -722,6 +826,8 @@ fn enumerate_vrom_family_tables(
             fields_offset += 4;
         }
 
+        let mut covered_triples = BTreeSet::new();
+
         for &stride in &config.strides {
             if stride < 12 || !stride.is_multiple_of(4) {
                 continue;
@@ -734,15 +840,18 @@ fn enumerate_vrom_family_tables(
                     continue;
                 }
                 let mut records = Vec::new();
+                let mut record_offsets = Vec::new();
                 let mut offset = start;
                 while let Some(record) = valid_triples.get(&offset) {
                     records.push(*record);
+                    record_offsets.push(offset);
                     let Some(next) = offset.checked_add(stride) else {
                         break;
                     };
                     offset = next;
                 }
                 if records.len() as u32 >= vrom_min_records && intervals_non_overlapping(&records) {
+                    covered_triples.extend(record_offsets);
                     raw.push(VromCandidateTable {
                         table_vrom_offset: file_record.vrom_start + start,
                         record_stride: stride,
@@ -752,6 +861,31 @@ fn enumerate_vrom_family_tables(
                         records,
                     });
                 }
+            }
+        }
+
+        // A valid triple between the first and last records of established
+        // constant-stride tables is a one-record gap candidate. Keeping the
+        // surrounding table-family envelope is load-bearing: an arbitrary
+        // code-bearing file can contain a coincidental source/end/VA triple
+        // whose destination also decodes, so rules 1-4 alone do not prove
+        // that an isolated triple outside any descriptor family is a table.
+        if let (Some(&first), Some(&last)) = (
+            covered_triples.iter().next(),
+            covered_triples.iter().next_back(),
+        ) {
+            for (&offset, &record) in valid_triples.range(first..=last) {
+                if covered_triples.contains(&offset) {
+                    continue;
+                }
+                raw.push(VromCandidateTable {
+                    table_vrom_offset: file_record.vrom_start + offset,
+                    record_stride: 0,
+                    field_rom_start: 0,
+                    field_rom_end: 4,
+                    field_vram_dest: 8,
+                    records: vec![record],
+                });
             }
         }
     }
@@ -776,10 +910,13 @@ fn enumerate_vrom_family_tables(
 /// Recover the physical file table, resolve every materializable VROM file,
 /// and run the descriptor-family search over those virtual table locations.
 ///
-/// `vrom_min_records` is explicit because two records are enough only when
-/// both independently satisfy `delta_vote`; physical AKI callers retain their
-/// established three-record family minimum. `min_mapped_regions` has exactly
-/// the same meaning as [`recover_overlay_regions`].
+/// `vrom_min_records` is the ordinary constant-stride run floor; physical AKI
+/// callers retain their established three-record family minimum. A one-record
+/// gap inside an established descriptor-family envelope is enumerated
+/// separately and can pass only through complete descriptor corroboration and
+/// global VA uniqueness. `min_mapped_regions` is the ordinary delta-vote
+/// admission floor; a table below it is admitted only when every record passes
+/// the stricter descriptor route.
 pub fn recover_vrom_overlay_regions(
     rom_bytes: &[u8],
     config: &SearchConfig,
@@ -804,6 +941,7 @@ pub fn recover_vrom_overlay_regions(
                 .as_ref()
                 .expect("VROM candidates require one admitted file table");
             let mut mapped_regions = 0u32;
+            let mut region_diagnostics = Vec::with_capacity(table.records.len());
             let region_deltas = table
                 .records
                 .iter()
@@ -817,9 +955,18 @@ pub fn recover_vrom_overlay_regions(
                     match outcome {
                         Some(DeltaVoteOutcome::Admitted { delta, va_start }) => {
                             mapped_regions += 1;
+                            region_diagnostics.push(VromRecordMappingDiagnostic::DeltaVote);
                             Some((delta, va_start))
                         }
-                        _ => None,
+                        _ => {
+                            // Replaced with the precise rule below. Rule 1 is
+                            // the fail-closed default if no admitted file table
+                            // is available to evaluate the record further.
+                            region_diagnostics.push(VromRecordMappingDiagnostic::Open(
+                                DescriptorMappingFailure::Rule1SourceMaterialization,
+                            ));
+                            None
+                        }
                     }
                 })
                 .collect();
@@ -829,61 +976,160 @@ pub fn recover_vrom_overlay_regions(
                 mapped_regions,
                 required_mapped_regions,
                 region_deltas,
+                region_diagnostics,
                 table: table.clone(),
             }
         })
         .collect();
 
     if let Some(admitted_file_table) = &file_table.admitted_table {
-        let mut raw_mappings = BTreeSet::new();
-        let mut fallbacks = Vec::new();
-        for (admission_index, admission) in admissions.iter().enumerate() {
-            if !admission.admitted {
-                continue;
-            }
-            for (record_index, (record, outcome)) in admission
-                .table
-                .records
-                .iter()
-                .zip(&admission.region_deltas)
-                .enumerate()
-            {
-                match *outcome {
-                    Some((_, va_start)) => {
-                        if let Some(mapping) = MappingHypothesis::from_delta(*record, va_start) {
-                            raw_mappings.insert(mapping);
-                        }
+        let initially_admitted: Vec<_> = admissions
+            .iter()
+            .map(|admission| admission.admitted)
+            .collect();
+        let mut table_evidence = vec![Vec::new(); admissions.len()];
+
+        // Evaluate every delta-open record in an ordinary admission. For a
+        // below-floor table, evaluate every record: its delta-voted records
+        // must independently agree with descriptor corroboration too.
+        for admission_index in 0..admissions.len() {
+            for record_index in 0..admissions[admission_index].table.records.len() {
+                let below_floor = !initially_admitted[admission_index];
+                if !below_floor && admissions[admission_index].region_deltas[record_index].is_some()
+                {
+                    continue;
+                }
+                let record = admissions[admission_index].table.records[record_index];
+                let region_bytes = match admitted_file_table.materialize_vrom_range(
+                    rom_bytes,
+                    record.rom_start,
+                    record.rom_end,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        admissions[admission_index].region_diagnostics[record_index] =
+                            VromRecordMappingDiagnostic::Open(
+                                DescriptorMappingFailure::Rule1SourceMaterialization,
+                            );
+                        continue;
                     }
-                    None => {
-                        let Some(mapping) = MappingHypothesis::from_descriptor(*record, config)
-                        else {
-                            continue;
-                        };
-                        let Ok(region_bytes) = admitted_file_table.materialize_vrom_range(
-                            rom_bytes,
-                            record.rom_start,
-                            record.rom_end,
-                        ) else {
-                            continue;
-                        };
-                        if descriptor_mapping_corroborated(&region_bytes, mapping) {
-                            fallbacks.push(DescriptorFallback {
-                                admission_index,
-                                record_index,
-                                mapping,
-                            });
+                };
+                let Some(mapping) = MappingHypothesis::from_descriptor(record, config) else {
+                    admissions[admission_index].region_diagnostics[record_index] =
+                        VromRecordMappingDiagnostic::Open(
+                            DescriptorMappingFailure::Rule2DestinationRange,
+                        );
+                    continue;
+                };
+                match descriptor_mapping_corroborated(&region_bytes, mapping) {
+                    Ok(()) => {
+                        if let Some((_, va_start)) =
+                            admissions[admission_index].region_deltas[record_index]
+                        {
+                            if MappingHypothesis::from_delta(record, va_start) != Some(mapping) {
+                                admissions[admission_index].region_diagnostics[record_index] =
+                                    VromRecordMappingDiagnostic::Open(
+                                        DescriptorMappingFailure::Rule4VaConflict,
+                                    );
+                                continue;
+                            }
+                            admissions[admission_index].region_diagnostics[record_index] =
+                                VromRecordMappingDiagnostic::DeltaVoteAndDescriptorCorroborated;
+                        } else {
+                            admissions[admission_index].region_diagnostics[record_index] =
+                                VromRecordMappingDiagnostic::DescriptorCorroborated;
                         }
+                        table_evidence[admission_index].push(DescriptorFallback {
+                            admission_index,
+                            record_index,
+                            mapping,
+                        });
+                    }
+                    Err(failure) => {
+                        admissions[admission_index].region_diagnostics[record_index] =
+                            VromRecordMappingDiagnostic::Open(DescriptorMappingFailure::Rule3Cfg(
+                                failure,
+                            ));
                     }
                 }
             }
         }
-        apply_unique_descriptor_fallbacks(
+
+        let table_eligible: Vec<_> = admissions
+            .iter()
+            .enumerate()
+            .map(|(admission_index, admission)| {
+                if initially_admitted[admission_index] {
+                    return true;
+                }
+                table_evidence[admission_index].len() == admission.table.records.len()
+            })
+            .collect();
+
+        // Only ordinary admissions and fully corroborated below-floor tables
+        // participate in global uniqueness. An incomplete, rejected table
+        // cannot manufacture a conflict that suppresses a sound mapping.
+        let mut raw_mappings = BTreeSet::new();
+        let mut fallbacks = Vec::new();
+        for (admission_index, admission) in admissions.iter().enumerate() {
+            if !table_eligible[admission_index] {
+                continue;
+            }
+            if initially_admitted[admission_index] {
+                for (record, outcome) in
+                    admission.table.records.iter().zip(&admission.region_deltas)
+                {
+                    if let Some((_, va_start)) = *outcome {
+                        if let Some(mapping) = MappingHypothesis::from_delta(*record, va_start) {
+                            raw_mappings.insert(mapping);
+                        }
+                    }
+                }
+            }
+            fallbacks.extend(table_evidence[admission_index].iter().copied());
+        }
+
+        let accepted = apply_unique_descriptor_fallbacks(
             &mut admissions,
             &raw_mappings,
-            fallbacks,
+            fallbacks.clone(),
             |admission| &mut admission.region_deltas,
             |admission| &mut admission.mapped_regions,
         );
+
+        for candidate in &fallbacks {
+            if !accepted.contains(&(candidate.admission_index, candidate.record_index)) {
+                admissions[candidate.admission_index].region_diagnostics[candidate.record_index] =
+                    VromRecordMappingDiagnostic::Open(DescriptorMappingFailure::Rule4VaConflict);
+            }
+        }
+
+        for admission_index in 0..admissions.len() {
+            if initially_admitted[admission_index] {
+                continue;
+            }
+            let fully_mapped = admissions[admission_index]
+                .region_deltas
+                .iter()
+                .all(Option::is_some);
+            let all_unique = table_evidence[admission_index].iter().all(|candidate| {
+                accepted.contains(&(candidate.admission_index, candidate.record_index))
+            });
+            admissions[admission_index].admitted =
+                table_eligible[admission_index] && fully_mapped && all_unique;
+            if !admissions[admission_index].admitted {
+                for diagnostic in &mut admissions[admission_index].region_diagnostics {
+                    if matches!(
+                        diagnostic,
+                        VromRecordMappingDiagnostic::DescriptorCorroborated
+                            | VromRecordMappingDiagnostic::DeltaVoteAndDescriptorCorroborated
+                    ) {
+                        *diagnostic =
+                            VromRecordMappingDiagnostic::DescriptorCorroboratedTableIncomplete;
+                    }
+                }
+            }
+        }
     }
 
     VromOverlayRecovery {
@@ -939,6 +1185,35 @@ mod tests {
                 if p + 4 <= len {
                     self.put_u32(physical_start + p, PROLOGUE);
                 }
+            }
+        }
+
+        fn plant_admissible_and_corroborating_region(
+            &mut self,
+            physical_start: u32,
+            va_start: u32,
+        ) {
+            let jal = |target: u32| 0x0c00_0000 | ((target >> 2) & 0x03ff_ffff);
+            for (offset, word) in [
+                (0x00, jal(va_start + 0x40)),
+                (0x04, 0),
+                (0x08, jal(va_start + 0x90)),
+                (0x0c, 0),
+                (0x10, jal(va_start + 0x100)),
+                (0x14, 0),
+                (0x18, 0x3c04_0000 | (va_start >> 16)),
+                (0x1c, 0x3c05_0000 | (va_start >> 16)),
+                (0x20, 0x3c06_0000 | (va_start >> 16)),
+                (0x24, 0x3c07_0000 | (va_start >> 16)),
+                (0x28, 0x03e0_0008),
+                (0x2c, 0),
+            ] {
+                self.put_u32(physical_start + offset, word);
+            }
+            for offset in [0x40, 0x90, 0x100] {
+                self.put_u32(physical_start + offset, 0x27bd_ffe0);
+                self.put_u32(physical_start + offset + 4, 0x03e0_0008);
+                self.put_u32(physical_start + offset + 8, 0);
             }
         }
 
@@ -1208,6 +1483,176 @@ mod tests {
         assert!(admission.admitted);
         assert_eq!(admission.mapped_regions, 2);
         assert_eq!(admission.region_deltas[2], None);
+    }
+
+    fn one_delta_mapped_vrom_table(second_va: u32, corroborate_second: bool) -> VromTableAdmission {
+        let mut rom = RomBuilder::new(0x20_000);
+        for (index, &(vrom_start, vrom_end, physical_start)) in [
+            (0x0000, 0x1000, 0x0000),
+            (0x1000, 0x2000, 0x4000),
+            (0x2000, 0x2400, 0x8000),
+            (0x2400, 0x2800, 0x8400),
+        ]
+        .iter()
+        .enumerate()
+        {
+            rom.plant_file_record(
+                0x2000 + index as u32 * 0x10,
+                vrom_start,
+                vrom_end,
+                physical_start,
+            );
+        }
+
+        let first_va = 0x8010_0000;
+        for (index, &(start, end, va)) in [(0x2000, 0x2400, first_va), (0x2400, 0x2800, second_va)]
+            .iter()
+            .enumerate()
+        {
+            let descriptor = 0x4000 + index as u32 * 0x10;
+            rom.put_u32(descriptor, start);
+            rom.put_u32(descriptor + 4, end);
+            rom.put_u32(descriptor + 8, va);
+        }
+        rom.plant_admissible_and_corroborating_region(0x8000, first_va);
+        if corroborate_second {
+            rom.plant_descriptor_corroborating_region(0x8400);
+        }
+
+        recover_vrom_overlay_regions(
+            &rom.bytes,
+            &SearchConfig::vrom_family(),
+            &DeltaVoteConfig::default(),
+            &FileTableSearchConfig::n64_family(),
+            2,
+            2,
+        )
+        .admissions
+        .into_iter()
+        .find(|admission| {
+            admission.table.interval_set() == vec![(0x2000, 0x2400), (0x2400, 0x2800)]
+        })
+        .expect("planted VROM descriptor table recovered")
+    }
+
+    #[test]
+    fn one_delta_mapped_table_with_corroborated_unique_record_is_admitted() {
+        let admission = one_delta_mapped_vrom_table(0x8020_0000, true);
+        assert!(admission.admitted);
+        assert_eq!(admission.mapped_regions, 2);
+        assert_eq!(
+            admission.region_diagnostics,
+            [
+                VromRecordMappingDiagnostic::DeltaVoteAndDescriptorCorroborated,
+                VromRecordMappingDiagnostic::DescriptorCorroborated,
+            ]
+        );
+    }
+
+    #[test]
+    fn one_delta_mapped_table_with_uncorroborated_record_stays_open() {
+        let admission = one_delta_mapped_vrom_table(0x8020_0000, false);
+        assert!(!admission.admitted);
+        assert_eq!(admission.mapped_regions, 1);
+        assert!(matches!(
+            admission.region_diagnostics[1],
+            VromRecordMappingDiagnostic::Open(DescriptorMappingFailure::Rule3Cfg(_))
+        ));
+    }
+
+    #[test]
+    fn one_delta_mapped_table_with_va_conflict_is_rejected() {
+        let admission = one_delta_mapped_vrom_table(0x8010_0000, true);
+        assert!(!admission.admitted);
+        assert_eq!(admission.mapped_regions, 1);
+        assert!(admission.region_diagnostics.iter().any(|diagnostic| {
+            *diagnostic
+                == VromRecordMappingDiagnostic::Open(DescriptorMappingFailure::Rule4VaConflict)
+        }));
+    }
+
+    #[test]
+    fn bounded_short_leaf_is_code_but_same_size_non_code_is_rejected() {
+        let mapping = MappingHypothesis {
+            source_start: 0x1000,
+            source_end: 0x1080,
+            va_start: 0x8080_0000,
+            va_end: 0x8080_0080,
+        };
+        let mut leaf = vec![0u8; 0x80];
+        leaf[..12].copy_from_slice(&[
+            0x27, 0xbd, 0xff, 0xe0, 0x03, 0xe0, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        assert_eq!(descriptor_mapping_corroborated(&leaf, mapping), Ok(()));
+        assert!(matches!(
+            descriptor_mapping_corroborated(&[0u8; 0x80], mapping),
+            Err(DescriptorCfgFailure::RanOffEnd { .. })
+        ));
+    }
+
+    #[test]
+    fn corroborated_one_record_gap_is_admitted_but_isolated_triple_is_not_enumerated() {
+        let mut rom = RomBuilder::new(0x20_000);
+        let files = [
+            (0x0000, 0x1000, 0x0000),
+            (0x1000, 0x2000, 0x4000),
+            (0x2000, 0x2100, 0x8000),
+            (0x2100, 0x2200, 0x8100),
+            (0x2200, 0x2300, 0x8200),
+            (0x2300, 0x2400, 0x8300),
+            (0x2400, 0x2500, 0x8400),
+            (0x2500, 0x2600, 0x8500),
+        ];
+        for (index, &(vrom_start, vrom_end, physical_start)) in files.iter().enumerate() {
+            rom.plant_file_record(
+                0x2800 + index as u32 * 0x10,
+                vrom_start,
+                vrom_end,
+                physical_start,
+            );
+        }
+
+        let records = [
+            (0x100, 0x2000, 0x2100, 0x8080_0000, 0x8000),
+            (0x140, 0x2100, 0x2200, 0x8080_0100, 0x8100),
+            (0x200, 0x2200, 0x2300, 0x8080_0200, 0x8200),
+            (0x300, 0x2300, 0x2400, 0x8080_0300, 0x8300),
+            (0x340, 0x2400, 0x2500, 0x8080_0400, 0x8400),
+            // This also corroborates as code, but lies outside the envelope
+            // formed by the two ordinary constant-stride table fragments.
+            (0x500, 0x2500, 0x2600, 0x8080_0500, 0x8500),
+        ];
+        for &(table_offset, start, end, va, physical_start) in &records {
+            rom.put_u32(0x4000 + table_offset, start);
+            rom.put_u32(0x4000 + table_offset + 4, end);
+            rom.put_u32(0x4000 + table_offset + 8, va);
+            rom.plant_descriptor_corroborating_region(physical_start);
+        }
+
+        let recovery = recover_vrom_overlay_regions(
+            &rom.bytes,
+            &SearchConfig::vrom_family(),
+            &DeltaVoteConfig::default(),
+            &FileTableSearchConfig::n64_family(),
+            2,
+            2,
+        );
+        let gap = recovery
+            .admissions
+            .iter()
+            .find(|admission| admission.table.interval_set() == vec![(0x2200, 0x2300)])
+            .expect("one-record gap inside the descriptor envelope");
+        assert_eq!(gap.table.record_stride, 0);
+        assert!(gap.admitted);
+        assert_eq!(gap.mapped_regions, 1);
+        assert_eq!(
+            gap.region_diagnostics,
+            [VromRecordMappingDiagnostic::DescriptorCorroborated]
+        );
+        assert!(recovery
+            .candidate_tables
+            .iter()
+            .all(|table| table.interval_set() != vec![(0x2500, 0x2600)]));
     }
 
     #[test]

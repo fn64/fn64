@@ -73,3 +73,7 @@ path = "src/bin/gate_coverage.rs"
 [[bin]]
 name = "gate_overlay_generalize"
 path = "src/bin/gate_overlay_generalize.rs"
+
+[[bin]]
+name = "gate_closure"
+path = "src/bin/gate_closure.rs"

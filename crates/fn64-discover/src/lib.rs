@@ -133,6 +133,7 @@ pub mod block_pack;
 pub mod block_proof;
 pub mod cfg;
 pub mod cfg_homology;
+pub mod closure;
 pub mod coverage;
 pub mod delta_vote;
 pub mod evidence;
