@@ -1,0 +1,89 @@
+# Majora's Mask (N64 US 1.0) load-image table geometry — explicit, cited
+# external claims in the sense of fn64-discover's discipline: table shapes
+# only, no answers. The ROM contents still have to satisfy each table.
+#
+# Provenance (all values derived 2026-07-19 from the zeldaret/mm decomp,
+# github.com/zeldaret/mm, built from source at version n64-us with a
+# checksum-matching output ROM; retail ROM sha1
+# d6133ace5afaa0882cf214cf88daba39e266c078):
+# - dmadata: linker map `..dmadata` load address 0x1A500, segment size
+#   0x6200 -> 0x620 records of 0x10 (DmaEntry). Physical location equals
+#   VROM because dmadata precedes all compressed files.
+# - Overlay tables: VROM = code segment load address 0xB3C000 + (symbol
+#   vram - code vram 0x800A5AC0), symbols from the same map:
+#     gEffectSsOverlayTable  0x801AE4A0 -> 0xC449E0
+#     gActorOverlayTable     0x801AEFD0 -> 0xC45510
+#     gGameStateOverlayTable 0x801BD910 -> 0xC53E50
+#     gKaleidoMgrOverlayTable 0x801D0B70 -> 0xC670B0
+# - Strides/field offsets from the decomp's struct definitions:
+#   ActorOverlay 0x20 (z64actor_dlftbls.h), EffectSsOverlay 0x1C
+#   (z64effect_ss.h), GameStateOverlay 0x30 (z64game.h), KaleidoMgrOverlay
+#   0x1C (kaleido_manager.h). Counts from the array declarations:
+#   ACTOR_ID_MAX 0x2B2, EFFECT_SS_TYPE_MAX 0x27, GAMESTATE_ID_MAX 7,
+#   KALEIDO_OVL_MAX 2.
+# - gTransitionOverlayTable is deliberately ABSENT: TransitionOverlay packs
+#   its load info in a 24-bit bitfield (z64transition.h), which
+#   LoadImageTableShape cannot express; omitting it is the honest gap.
+
+[[load_image_tables]]
+# bank_name omitted: VROM-to-physical file table, not a VRAM bank source.
+name = "dmadata"
+
+[load_image_tables.shape]
+location = { space = "Physical", offset = 0x1A500 }
+record_count = 0x620
+record_stride = 0x10
+source = { space = "Virtual", field_start = 0, field_end = 4 }
+destination = { space = "physical_rom", field_start = 8, end = { field_or_source_length = 0xc } }
+
+[[load_image_tables]]
+name = "effect_overlays"
+
+[load_image_tables.bank_name]
+prefix = "effect_overlay_"
+
+[load_image_tables.shape]
+location = { space = "Virtual", offset = 0xC449E0 }
+record_count = 0x27
+record_stride = 0x1C
+source = { space = "Virtual", field_start = 0, field_end = 4 }
+destination = { space = "vram", field_start = 8, end = { field = 0xc } }
+
+[[load_image_tables]]
+name = "actor_overlays"
+
+[load_image_tables.bank_name]
+prefix = "actor_overlay_"
+
+[load_image_tables.shape]
+location = { space = "Virtual", offset = 0xC45510 }
+record_count = 0x2B2
+record_stride = 0x20
+source = { space = "Virtual", field_start = 0, field_end = 4 }
+destination = { space = "vram", field_start = 8, end = { field = 0xc } }
+
+[[load_image_tables]]
+name = "gamestate_overlays"
+
+[load_image_tables.bank_name]
+prefix = "gamestate_overlay_"
+
+[load_image_tables.shape]
+location = { space = "Virtual", offset = 0xC53E50 }
+record_count = 7
+record_stride = 0x30
+source = { space = "Virtual", field_start = 4, field_end = 8 }
+destination = { space = "vram", field_start = 0xc, end = { field = 0x10 } }
+
+[[load_image_tables]]
+name = "kaleido_overlays"
+
+[load_image_tables.bank_name]
+prefix = "kaleido_overlay_"
+
+[load_image_tables.shape]
+location = { space = "Virtual", offset = 0xC670B0 }
+record_count = 2
+record_stride = 0x1C
+source = { space = "Virtual", field_start = 4, field_end = 8 }
+destination = { space = "vram", field_start = 0xc, end = { field = 0x10 } }
