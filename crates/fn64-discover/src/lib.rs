@@ -287,6 +287,30 @@ pub fn run_discovery_with_load_image_tables(
     Ok((rom, db))
 }
 
+/// [`run_discovery_with_load_image_tables`] plus a static request-DMA scan
+/// over the proven boot image (cited claims; see
+/// [`banks::StaticRequestDmaInput`]). The scan runs after table proving so
+/// Virtual-space device operands can corroborate against proven VROM file
+/// mappings, and before harvest so recovered banks feed Phase 3.
+pub fn run_discovery_with_tables_and_request_dma(
+    rom_bytes: &[u8],
+    descriptor_table: Option<DescriptorTableInput>,
+    load_image_tables: &[banks::LoadImageTableInput],
+    request_dma: &[banks::StaticRequestDmaInput],
+) -> Result<(NormalizedRom, FactDb, banks::StaticRequestDmaReport), RomRejectReason> {
+    let rom = rom::normalize(rom_bytes)?;
+    let mut db = FactDb::new();
+    banks::discover_boot_bank(&rom, &mut db);
+    if let Some((shape, bank_name)) = descriptor_table {
+        banks::scan_descriptor_table(&rom, shape, bank_name, &mut db);
+    }
+    banks::scan_load_image_tables(&rom, load_image_tables, &mut db);
+    let report = banks::scan_static_request_dma(&rom, request_dma, &mut db);
+    harvest::harvest_discovered_candidates(&rom, &mut db)
+        .expect("Phase 2 produced a malformed load-image mapping");
+    Ok((rom, db, report))
+}
+
 /// Run discovery with overlay load images recovered mechanically from the
 /// normalized ROM itself. The returned recovery keeps every raw/admitted
 /// table visible; only the unique-table, matching-delta/destination proof rule
@@ -450,6 +474,19 @@ pub fn run_discovery_with_manifest(
     rom_bytes: &[u8],
     manifest: &evidence::EvidenceManifest,
 ) -> Result<(NormalizedRom, FactDb), DiscoveryError> {
+    let (rom, db, _report) = run_discovery_with_manifest_and_request_dma(rom_bytes, manifest, &[])?;
+    Ok((rom, db))
+}
+
+/// [`run_discovery_with_manifest`] plus a static request-DMA scan between
+/// mapping and executable evidence, so executable ranges may bind to banks
+/// this scan proves (which have no serializable in-ROM table to carry them
+/// through the manifest).
+pub fn run_discovery_with_manifest_and_request_dma(
+    rom_bytes: &[u8],
+    manifest: &evidence::EvidenceManifest,
+    request_dma: &[banks::StaticRequestDmaInput],
+) -> Result<(NormalizedRom, FactDb, banks::StaticRequestDmaReport), DiscoveryError> {
     let rom = rom::normalize(rom_bytes).map_err(DiscoveryError::Rom)?;
     manifest
         .validate_identity(&rom)
@@ -457,9 +494,10 @@ pub fn run_discovery_with_manifest(
     let mut db = FactDb::new();
     banks::discover_boot_bank(&rom, &mut db);
     evidence::apply_mapping_evidence(&rom, manifest, &mut db).map_err(DiscoveryError::Evidence)?;
+    let report = banks::scan_static_request_dma(&rom, request_dma, &mut db);
     evidence::apply_executable_evidence(manifest, &mut db).map_err(DiscoveryError::Evidence)?;
     harvest::harvest_discovered_candidates(&rom, &mut db).map_err(DiscoveryError::Harvest)?;
-    Ok((rom, db))
+    Ok((rom, db, report))
 }
 
 #[cfg(test)]

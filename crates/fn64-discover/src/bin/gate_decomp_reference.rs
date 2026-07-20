@@ -9,26 +9,43 @@
 //! Env:
 //!   FN64_DISCOVER_ROM      the game's .z64
 //!   FN64_DISCOVER_DUMP     the matching answer-key dump.toml
+//!   FN64_DISCOVER_REQUEST_DMA  optional static request-DMA claims TOML
+//!                          (cited load-request callee + arg registers,
+//!                          e.g. reference/mm-n64-us-request-dma.toml);
+//!                          recovered banks come from constant operands
+//!                          at call sites in the proven boot image
 //!   FN64_DISCOVER_TABLES   optional load-image table geometry TOML
 //!                          (explicit cited claims, e.g.
 //!                          crates/fn64-discover/reference/
 //!                          mm-n64-us-load-tables.toml); without it only
 //!                          ROM-only banks (the boot bank) can own ranges
 
-use fn64_discover::banks::LoadImageTableInput;
+use fn64_discover::banks::{LoadImageTableInput, StaticRequestDmaInput};
 use fn64_discover::evidence::{EvidenceManifest, EVIDENCE_SCHEMA_VERSION};
 use fn64_discover::oot_reference::{
     bind_ranges_to_fact_db_partial, executable_ranges_from_oot_dump,
 };
 use fn64_discover::{
-    normalize, required_env_path, run_discovery_with_load_image_tables,
-    run_discovery_with_manifest,
+    normalize, required_env_path, run_discovery_with_manifest_and_request_dma,
+    run_discovery_with_tables_and_request_dma,
 };
 use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct TablesFile {
     load_image_tables: Vec<LoadImageTableInput>,
+}
+
+#[derive(Deserialize)]
+struct RequestDmaFile {
+    request_dma: Vec<StaticRequestDmaInput>,
+}
+
+fn load_toml_env<T: serde::de::DeserializeOwned>(variable: &str) -> Option<T> {
+    let path = std::env::var(variable).ok()?;
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("reading {path}: {error}"));
+    Some(toml::from_str(&text).unwrap_or_else(|error| panic!("parsing {path}: {error}")))
 }
 
 fn main() {
@@ -42,16 +59,13 @@ fn main() {
             eprintln!("gate_decomp_reference: {error}");
             std::process::exit(1);
         });
-    let tables: Vec<LoadImageTableInput> = match std::env::var("FN64_DISCOVER_TABLES") {
-        Ok(path) => {
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("reading {path}: {error}"));
-            let parsed: TablesFile = toml::from_str(&text)
-                .unwrap_or_else(|error| panic!("parsing {path}: {error}"));
-            parsed.load_image_tables
-        }
-        Err(_) => Vec::new(),
-    };
+    let tables: Vec<LoadImageTableInput> = load_toml_env::<TablesFile>("FN64_DISCOVER_TABLES")
+        .map(|file| file.load_image_tables)
+        .unwrap_or_default();
+    let request_dma: Vec<StaticRequestDmaInput> =
+        load_toml_env::<RequestDmaFile>("FN64_DISCOVER_REQUEST_DMA")
+            .map(|file| file.request_dma)
+            .unwrap_or_default();
     let rom_bytes =
         std::fs::read(&rom_path).unwrap_or_else(|error| panic!("reading {rom_path}: {error}"));
     let rom = normalize(&rom_bytes).expect("normalizing ROM");
@@ -62,9 +76,19 @@ fn main() {
         .iter()
         .map(|range| u64::from(range.va_end - range.va_start))
         .sum();
-    let (_baseline_rom, baseline_db) =
-        run_discovery_with_load_image_tables(&rom_bytes, None, &tables)
+    let (_baseline_rom, baseline_db, request_report) =
+        run_discovery_with_tables_and_request_dma(&rom_bytes, None, &tables, &request_dma)
             .expect("baseline discovery");
+    if !request_dma.is_empty() {
+        println!(
+            "  request-dma banks proven={} open sites={}",
+            request_report.proven_banks.len(),
+            request_report.open.len()
+        );
+        for line in &request_report.open {
+            println!("  request-dma open: {line}");
+        }
+    }
     let (mut bound_ranges, unresolved) =
         bind_ranges_to_fact_db_partial(&dump, &dump_path, &baseline_db)
             .expect("binding dump ranges to native mappings");
@@ -82,8 +106,9 @@ fn main() {
         load_image_tables: tables.clone(),
         executable_ranges: bound_ranges,
     };
-    let (_validated_rom, db) = run_discovery_with_manifest(&rom_bytes, &manifest)
-        .expect("ingesting bound executable-range evidence");
+    let (_validated_rom, db, _manifest_report) =
+        run_discovery_with_manifest_and_request_dma(&rom_bytes, &manifest, &request_dma)
+            .expect("ingesting bound executable-range evidence");
     let proven_ranges = db.proven_rom_mappings().len();
     println!("decomp reference adapter PASSED");
     println!("  normalized sha256={}", rom.sha256);

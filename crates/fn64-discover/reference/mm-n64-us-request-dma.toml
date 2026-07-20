@@ -1,0 +1,27 @@
+# Majora's Mask (N64 US 1.0) static request-DMA claims — explicit, cited
+# external anchors in the sense of fn64-discover's discipline: the claim
+# says where to look; the boot image's instruction bytes still have to
+# yield fully constant operands, and Virtual-space device ranges must sit
+# inside exactly one proven VROM file mapping (the dmadata table from
+# mm-n64-us-load-tables.toml) before anything is proven.
+#
+# Provenance: zeldaret/mm src/boot/z_std_dma.c declares
+# `DmaMgr_RequestAsync(DmaRequest* req, void* ram, uintptr_t vrom,
+# size_t size, ...)` — o32: ram in $a1 (5), vrom in $a2 (6), size in $a3
+# (7). src/boot/idle.c `Main_Init` calls it with the `code` segment's
+# link-time constants. Callee VA 0x80080C04 from the decomp's own build
+# map (games/MMU answer key; used as an anchor claim only — the recovered
+# geometry is read from ROM instruction bytes, not from the answer key).
+# The vrom operand names VROM (DmaMgr translates via dmadata), hence
+# device_space Virtual.
+
+[[request_dma]]
+name = "DmaMgr_RequestAsync"
+callee_va = 0x80080C04
+dram_arg_register = 5
+device_arg_register = 6
+size_arg_register = 7
+device_space = "Virtual"
+
+[request_dma.bank_name]
+prefix = "request_dma_"
