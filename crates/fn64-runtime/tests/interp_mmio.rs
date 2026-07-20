@@ -50,6 +50,12 @@ impl PiTimingModel for FixedTiming {
     ) -> Cycles {
         self.0
     }
+
+    fn evidence_bytes(&self) -> Vec<u8> {
+        let mut bytes = b"fn64.pi-timing.interp-mmio-test.v1\0".to_vec();
+        bytes.extend_from_slice(&self.0.get().to_be_bytes());
+        bytes
+    }
 }
 
 /// The runtime-side `MmioPort`: the interpreter's word MMIO accesses translated
