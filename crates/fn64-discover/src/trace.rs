@@ -727,6 +727,141 @@ pub fn fold_executed_pcs_into_fact_db(
     report
 }
 
+/// The measured effect of folding one trace's `IndirectTransfer`
+/// observations into a [`crate::facts::FactDb`] as
+/// [`crate::facts::Fact::ObservedIndirectTarget`] existence evidence.
+/// Every count is a direct measurement of what
+/// [`fold_indirect_targets_into_fact_db`] did to `db`, never an estimate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndirectFoldReport {
+    /// `Fact::ObservedIndirectTarget` records appended (one per known-bank
+    /// site+target observation folded).
+    pub facts_added: u64,
+    /// `(site -> target)` edges observed for the first time in this fold.
+    pub new_edges: BTreeSet<(crate::facts::BankAddr, crate::facts::BankAddr)>,
+    /// Edges already concluded (this or an earlier fold) that this
+    /// observation corroborates -- a repeat sighting, not a new edge.
+    pub corroborated: BTreeSet<(crate::facts::BankAddr, crate::facts::BankAddr)>,
+    /// Observations whose target word static analysis had already proven
+    /// `ProvenData`. Reported, never resolved by fiat -- an indirect edge
+    /// into proven data means the static class or the trace bank identity
+    /// is wrong, and that must surface loudly.
+    pub target_conflicts: Vec<StaticDataConflict>,
+    /// Observations skipped because the site OR target bank was
+    /// `BankContext::Unknown`. An edge is only sound when BOTH endpoints
+    /// have a known bank; a target in an unknown bank cannot become a
+    /// bank-qualified `ObservedIndirectTarget` without inventing identity.
+    pub unknown_bank_skipped: u64,
+}
+
+/// Fold every known-bank `IndirectTransfer` observation in `facts` into
+/// `db` as [`crate::facts::Fact::ObservedIndirectTarget`] existence
+/// evidence, and return the exact measured delta.
+///
+/// This is the trace lane's admission rule for indirect edges, the
+/// counterpart of [`fold_executed_pcs_into_fact_db`] for executed PCs. An
+/// observed `jr`/`jalr` transfer proves the edge `site -> target`
+/// EXISTED at runtime -- exactly the evidence static value-set analysis
+/// cannot supply for a load-derived or input-dependent dispatch (the MM
+/// audio/camera handler tables the static lanes leave open). It is
+/// deliberately weaker than a static `IndirectTransferAnalysis` with
+/// `Exhaustive` state: an observation is existence, never exhaustiveness,
+/// so it concludes at `ProofState::Supported` and NEVER contributes an
+/// exhaustive successor set. Downstream owner admission may treat the
+/// target as a proven callable entry (it demonstrably ran), but the
+/// site's frontier stays open unless a separate exhaustive proof closes
+/// it.
+///
+/// BOTH endpoints must have a known bank: an edge whose target bank is
+/// `Unknown` is skipped (`unknown_bank_skipped`), never promoted, per
+/// this module's mandate that unknown-bank identity is preserved rather
+/// than guessed. `static_word_class` is the same caller-supplied lookup
+/// as the executed-PC fold; a target landing on `ProvenData` is recorded
+/// as a conflict, never silently resolved.
+///
+/// Idempotent per `(site -> target)` edge: the same edge observed twice
+/// inserts two facts (distinct provenance) but concludes the edge once,
+/// growing its `justified_by` list.
+pub fn fold_indirect_targets_into_fact_db(
+    db: &mut crate::facts::FactDb,
+    trace_id: &str,
+    facts: &[ObservedTraceFact],
+    static_word_class: impl Fn(&str, u32) -> Option<crate::cfg::WordClass>,
+) -> IndirectFoldReport {
+    use crate::cfg::WordClass;
+    use crate::facts::{observed_indirect_target_subject, BankAddr, Fact, ProofState};
+
+    let mut report = IndirectFoldReport::default();
+    for observed in facts {
+        let ObservedTraceFact::IndirectTransfer {
+            sequence,
+            site,
+            target,
+            ..
+        } = observed
+        else {
+            continue;
+        };
+        let (BankContext::Known { bank: site_bank, .. }, BankContext::Known { bank: target_bank, .. }) =
+            (&site.bank, &target.bank)
+        else {
+            report.unknown_bank_skipped += 1;
+            continue;
+        };
+        let site_addr = BankAddr::new(site_bank.clone(), site.address);
+        let target_addr = BankAddr::new(target_bank.clone(), target.address);
+        let subject = observed_indirect_target_subject(
+            &site_addr.bank,
+            site_addr.pc,
+            &target_addr.bank,
+            target_addr.pc,
+        );
+        let already_concluded = db.conclusion(&subject).is_some();
+
+        let fact_index = db.insert(Fact::ObservedIndirectTarget {
+            site: site_addr.clone(),
+            target: target_addr.clone(),
+            trace: trace_id.to_string(),
+        });
+        report.facts_added += 1;
+
+        let mut justified_by = db
+            .conclusion(&subject)
+            .map(|conclusion| conclusion.justified_by.clone())
+            .unwrap_or_default();
+        justified_by.push(fact_index);
+        db.conclude(
+            subject,
+            ProofState::Supported,
+            justified_by,
+            "trace_observed_indirect_target",
+        )
+        .expect(
+            "ObservedIndirectTarget never proposes Proven, so it can never fail to supersede \
+             an existing conclusion for the same subject",
+        );
+
+        let edge = (site_addr.clone(), target_addr.clone());
+        if already_concluded {
+            report.corroborated.insert(edge);
+        } else {
+            report.new_edges.insert(edge);
+        }
+
+        if matches!(
+            static_word_class(&target_addr.bank, target_addr.pc),
+            Some(WordClass::ProvenData)
+        ) {
+            report.target_conflicts.push(StaticDataConflict {
+                site: target_addr,
+                trace_id: trace_id.to_string(),
+                sequence: *sequence,
+            });
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1050,6 +1185,132 @@ mod tests {
             assert_eq!(report.facts_added, 0);
             assert_eq!(report.unknown_bank_skipped, 0);
             assert!(db.facts().is_empty());
+        }
+    }
+
+    mod indirect_fold {
+        use super::*;
+        use crate::cfg::WordClass;
+        use crate::facts::{
+            observed_indirect_target_subject, BankAddr, Fact, FactDb, ProofState,
+        };
+
+        fn known(bank: &str, address: u32) -> ObservedAddress {
+            ObservedAddress {
+                address,
+                bank: BankContext::Known {
+                    bank: bank.to_string(),
+                    activation: 0,
+                },
+            }
+        }
+
+        fn unknown(address: u32) -> ObservedAddress {
+            ObservedAddress {
+                address,
+                bank: BankContext::Unknown,
+            }
+        }
+
+        fn edge(site: ObservedAddress, target: ObservedAddress) -> ObservedTraceFact {
+            ObservedTraceFact::IndirectTransfer {
+                sequence: 1,
+                kind: IndirectTransferKind::Call,
+                site,
+                target,
+            }
+        }
+
+        fn no_class(_bank: &str, _va: u32) -> Option<WordClass> {
+            None
+        }
+
+        #[test]
+        fn known_edge_becomes_a_supported_observed_indirect_target() {
+            let mut db = FactDb::new();
+            let facts = vec![edge(
+                known("code", 0x8019_3efc),
+                known("code", 0x8019_4000),
+            )];
+            let report = fold_indirect_targets_into_fact_db(&mut db, "trace-a", &facts, no_class);
+
+            assert_eq!(report.facts_added, 1);
+            let site = BankAddr::new("code", 0x8019_3efc);
+            let target = BankAddr::new("code", 0x8019_4000);
+            assert_eq!(report.new_edges, [(site.clone(), target.clone())].into());
+            assert!(report.corroborated.is_empty());
+            assert!(report.target_conflicts.is_empty());
+            assert_eq!(report.unknown_bank_skipped, 0);
+            assert!(matches!(
+                &db.facts()[0],
+                Fact::ObservedIndirectTarget { site: s, target: t, trace }
+                    if *s == site && *t == target && trace == "trace-a"
+            ));
+            let subject = observed_indirect_target_subject("code", 0x8019_3efc, "code", 0x8019_4000);
+            assert_eq!(db.conclusion(&subject).unwrap().state, ProofState::Supported);
+        }
+
+        #[test]
+        fn same_edge_twice_corroborates_one_conclusion_with_two_facts() {
+            let mut db = FactDb::new();
+            let facts = vec![
+                edge(known("code", 0x100), known("code", 0x200)),
+                edge(known("code", 0x100), known("code", 0x200)),
+            ];
+            let report = fold_indirect_targets_into_fact_db(&mut db, "trace-a", &facts, no_class);
+
+            assert_eq!(report.facts_added, 2);
+            assert_eq!(report.new_edges.len(), 1);
+            assert_eq!(report.corroborated.len(), 1);
+            let subject = observed_indirect_target_subject("code", 0x100, "code", 0x200);
+            assert_eq!(db.conclusion(&subject).unwrap().justified_by, vec![0, 1]);
+        }
+
+        #[test]
+        fn one_site_two_targets_are_two_distinct_edges() {
+            let mut db = FactDb::new();
+            let facts = vec![
+                edge(known("code", 0x100), known("code", 0x200)),
+                edge(known("code", 0x100), known("code", 0x300)),
+            ];
+            let report = fold_indirect_targets_into_fact_db(&mut db, "trace-a", &facts, no_class);
+            // Existence, not exhaustiveness: both edges kept, never merged.
+            assert_eq!(report.new_edges.len(), 2);
+            assert_eq!(report.facts_added, 2);
+        }
+
+        #[test]
+        fn unknown_target_bank_is_skipped_not_invented() {
+            let mut db = FactDb::new();
+            let facts = vec![edge(known("code", 0x100), unknown(0x8020_0000))];
+            let report = fold_indirect_targets_into_fact_db(&mut db, "trace-a", &facts, no_class);
+            assert_eq!(report.facts_added, 0);
+            assert_eq!(report.unknown_bank_skipped, 1);
+            assert!(db.facts().is_empty());
+        }
+
+        #[test]
+        fn unknown_site_bank_is_also_skipped() {
+            let mut db = FactDb::new();
+            let facts = vec![edge(unknown(0x100), known("code", 0x200))];
+            let report = fold_indirect_targets_into_fact_db(&mut db, "trace-a", &facts, no_class);
+            assert_eq!(report.facts_added, 0);
+            assert_eq!(report.unknown_bank_skipped, 1);
+        }
+
+        #[test]
+        fn target_on_proven_data_is_reported_as_conflict() {
+            let mut db = FactDb::new();
+            let facts = vec![edge(known("code", 0x100), known("code", 0x200))];
+            let class = |bank: &str, va: u32| {
+                (bank == "code" && va == 0x200).then_some(WordClass::ProvenData)
+            };
+            let report = fold_indirect_targets_into_fact_db(&mut db, "trace-a", &facts, class);
+            // The edge is still recorded (the observation happened); the
+            // conflict is surfaced, never silently resolved.
+            assert_eq!(report.facts_added, 1);
+            assert_eq!(report.target_conflicts.len(), 1);
+            assert_eq!(report.target_conflicts[0].site, BankAddr::new("code", 0x200));
         }
     }
 }

@@ -316,6 +316,21 @@ pub fn observed_executed_code_subject(bank: &str, pc: u32) -> String {
     format!("observed-executed:{bank}:0x{pc:08x}")
 }
 
+/// Stable conclusion key for one observed indirect edge
+/// `(site -> target)`, both bank-qualified
+/// (`trace::fold_indirect_targets_into_fact_db`'s subject). The target is
+/// part of the key: one `jr`/`jalr` site legitimately reaches many
+/// targets across a trace, and each observed edge is its own existence
+/// fact -- never collapsed, never treated as exhaustive.
+pub fn observed_indirect_target_subject(
+    site_bank: &str,
+    site_pc: u32,
+    target_bank: &str,
+    target_pc: u32,
+) -> String {
+    format!("observed-indirect:{site_bank}:0x{site_pc:08x}->{target_bank}:0x{target_pc:08x}")
+}
+
 /// A derived conclusion tracked with its proof state and the fact
 /// indices that justify it. Conclusions are recomputed by proof rules
 /// (see `banks.rs`), but the running record of "what did we conclude and
