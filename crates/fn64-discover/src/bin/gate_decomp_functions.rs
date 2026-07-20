@@ -29,13 +29,31 @@
 //!   FN64_DISCOVER_ENTRY_ARGS  optional cited code-pointer-argument claims
 //!                             TOML (e.g. osCreateThread's entry in $a2);
 //!                             constant operands seed additional CFG roots
+//!   FN64_DISCOVER_TABLES / FN64_DISCOVER_REQUEST_DMA
+//!                             optional geometry/claims (as in
+//!                             gate_decomp_reference); every additional
+//!                             proven bank is scanned for direct jals into
+//!                             the boot window — the boot bank is a library,
+//!                             and cross-bank call sites are the
+//!                             machine-checked evidence of which boot
+//!                             functions other segments enter
 
-use fn64_discover::banks;
+use fn64_discover::banks::{self, materialize_rom_range, LoadImageTableInput, StaticRequestDmaInput};
 use fn64_discover::grade_oot_functions::{grade_functions, AnswerFunction, JalTargets};
 use fn64_discover::partition::{partition, same_bank_overlaps};
 use fn64_discover::resolve::build_cfg_closed_with_facts;
-use fn64_discover::{required_env_path, run_discovery, Fact};
+use fn64_discover::{required_env_path, run_discovery_with_tables_and_request_dma, Fact};
 use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct TablesFile {
+    load_image_tables: Vec<LoadImageTableInput>,
+}
+
+#[derive(Deserialize)]
+struct RequestDmaFile {
+    request_dma: Vec<StaticRequestDmaInput>,
+}
 
 #[derive(Deserialize)]
 struct Dump {
@@ -93,7 +111,23 @@ fn main() {
     let dump_text = std::fs::read_to_string(&dump_path).expect("reading answer-key dump");
     let dump: Dump = toml::from_str(&dump_text).expect("parsing answer-key dump");
 
-    let (rom, db) = run_discovery(&rom_bytes, None).expect("ROM-only discovery");
+    let tables: Vec<LoadImageTableInput> = load_toml_env::<TablesFile>("FN64_DISCOVER_TABLES")
+        .map(|file| file.load_image_tables)
+        .unwrap_or_default();
+    let request_dma: Vec<StaticRequestDmaInput> =
+        load_toml_env::<RequestDmaFile>("FN64_DISCOVER_REQUEST_DMA")
+            .map(|file| file.request_dma)
+            .unwrap_or_default();
+    let (rom, db, request_report) =
+        run_discovery_with_tables_and_request_dma(&rom_bytes, None, &tables, &request_dma)
+            .expect("baseline discovery");
+    if !request_dma.is_empty() {
+        println!(
+            "request-dma banks proven={} open sites={}",
+            request_report.proven_banks.len(),
+            request_report.open.len()
+        );
+    }
     let boot = db
         .facts()
         .iter()
@@ -207,6 +241,56 @@ fn main() {
         println!(
             "entry-arg seeding: roots added={seeded} open sites={open_sites} \
              pointers outside scanned window={outside}"
+        );
+    }
+
+    // Multi-bank recall: the boot bank is a library, so many of its
+    // functions are entered only from other segments. Every additional
+    // proven bank's image (materialized through its own proof chain —
+    // physical bytes directly, VROM through exactly one proven file
+    // record, Yaz0 included) is scanned for direct jals landing in the
+    // boot window; each such target is a machine-checked callable entry,
+    // the same evidentiary class as an in-bank jal target.
+    let mut cross_bank = 0usize;
+    let mut cross_bank_unreadable = 0usize;
+    for fact in db.proven_rom_mappings() {
+        let Fact::RomMapping {
+            bank,
+            rom_space,
+            rom_start,
+            rom_end,
+            va_start,
+            ..
+        } = fact
+        else {
+            continue;
+        };
+        if bank == banks::BOOT_BANK {
+            continue;
+        }
+        let image = match materialize_rom_range(&rom, &db, *rom_space, *rom_start, *rom_end) {
+            Ok(image) => image,
+            Err(_) => {
+                cross_bank_unreadable += 1;
+                continue;
+            }
+        };
+        for (index, chunk) in image.bytes.chunks_exact(4).enumerate() {
+            let word = u32::from_be_bytes(chunk.try_into().unwrap());
+            if word >> 26 != 0x03 {
+                continue;
+            }
+            let pc = va_start.wrapping_add((index as u32) * 4);
+            let target = (pc & 0xf000_0000) | ((word & 0x03ff_ffff) << 2);
+            if target >= boot_va_start && target < code_end && !roots.contains(&target) {
+                roots.push(target);
+                cross_bank += 1;
+            }
+        }
+    }
+    if cross_bank != 0 || cross_bank_unreadable != 0 {
+        println!(
+            "cross-bank jal roots added={cross_bank} unreadable banks={cross_bank_unreadable}"
         );
     }
 
