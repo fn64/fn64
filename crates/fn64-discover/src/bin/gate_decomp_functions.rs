@@ -461,6 +461,34 @@ fn main() {
         }
     }
 
+    // In-bank flat jal sweep: the boot bank is a library whose engine
+    // functions are frequently entered only through indirect dispatch
+    // (GObj process/handler tables, callback fields). The recursive CFG
+    // walk from the entrypoint never enters those callers, so a plain
+    // `jal <leaf>` sitting in an unreached caller block is never followed
+    // and the leaf stays open. Scanning the boot bank's own text flatly
+    // for direct jals landing in the code window recovers exactly those
+    // machine-checked callable entries — the same evidentiary class as a
+    // cross-bank jal target. A bogus target that splits a real answer
+    // function surfaces as `wrong`, which the wrong==0 posture judges.
+    let mut in_bank_jal = 0usize;
+    for (index, chunk) in bank_bytes.chunks_exact(4).enumerate() {
+        let word = u32::from_be_bytes(chunk.try_into().unwrap());
+        if word >> 26 != 0x03 {
+            continue;
+        }
+        let pc = boot_va_start.wrapping_add((index as u32) * 4);
+        let target = (pc & 0xf000_0000) | ((word & 0x03ff_ffff) << 2);
+        if target >= boot_va_start && target < code_end && !roots.contains(&target) {
+            roots.push(target);
+            excused.push(target);
+            in_bank_jal += 1;
+        }
+    }
+    if in_bank_jal != 0 {
+        println!("in-bank flat jal roots added={in_bank_jal}");
+    }
+
     // Multi-bank recall: the boot bank is a library, so many of its
     // functions are entered only from other segments. Every additional
     // proven bank's image (materialized through its own proof chain —
