@@ -144,6 +144,9 @@ pub fn scan_signatures(
     matches
 }
 
+/// True where a function can plausibly start. Shared by the signature
+/// scan and the stored-pointer harvest.
+///
 /// A signature match is only credible where a function can actually
 /// start: the window base, after nop padding, or directly after a
 /// function terminator — `jr $ra` or `eret` in the second-to-last slot
@@ -153,7 +156,7 @@ pub fn scan_signatures(
 /// the same code into different function boundaries full-body-matches
 /// INSIDE a larger target function and splits it (observed: MM's
 /// __osException vs an older donor SDK).
-fn plausible_function_boundary(raw_words: &[u32], offset: usize) -> bool {
+pub fn plausible_function_boundary(raw_words: &[u32], offset: usize) -> bool {
     if offset == 0 {
         return true;
     }
