@@ -1386,6 +1386,21 @@ impl RenderBackend for ReferenceBackend {
         }
     }
 
+    fn identify_microcode(
+        &self,
+        imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    ) -> Option<UcodeId> {
+        let geometry = self.f3dex2_ucodes.identify_text(imem);
+        let sprite = self.s2dex_ucodes.identify_text(imem);
+        match (geometry, sprite) {
+            (Some(geometry), Some(sprite)) => {
+                panic!("one microcode digest cannot identify both {geometry:?} and {sprite:?}")
+            }
+            (Some(ucode), None) | (None, Some(ucode)) => Some(ucode),
+            (None, None) => None,
+        }
+    }
+
     fn supported_ucodes(&self) -> &[UcodeId] {
         match self.decode_mode {
             DecodeMode::S2dex => self.s2dex_ucodes.supported_ucodes(),
@@ -4564,6 +4579,13 @@ impl RenderBackend for Rt64Backend {
         let _ = (w, h);
     }
 
+    fn identify_microcode(
+        &self,
+        imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    ) -> Option<UcodeId> {
+        self.f3dex2_ucodes.identify_text(imem)
+    }
+
     fn supported_ucodes(&self) -> &[UcodeId] {
         #[cfg(feature = "rt64")]
         {
@@ -4709,6 +4731,16 @@ mod tests {
         }
         assert!(!backend.created);
         assert!(backend.supported_ucodes().is_empty());
+    }
+
+    #[test]
+    fn rt64_backend_identifies_only_exact_admitted_imem_images() {
+        let admitted = [0x81; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let unadmitted = [0x82; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let backend = Rt64Backend::new().with_f3dex2_ucode_text(&admitted);
+
+        assert_eq!(backend.identify_microcode(&admitted), Some(UcodeId::F3dex2));
+        assert_eq!(backend.identify_microcode(&unadmitted), None);
     }
 
     #[test]
@@ -5266,6 +5298,21 @@ mod tests {
                 UcodeId::F3dlx2Rej
             ]
         );
+    }
+
+    #[test]
+    fn reference_backend_identifies_only_exact_admitted_imem_images() {
+        let geometry = [0x71; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let sprite = [0x72; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let unadmitted = [0x73; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let backend = ReferenceBackend::new()
+            .with_geometry_ucode_text(GeometryWireFamily::L3dex2, &geometry)
+            .with_s2dex_ucode_text_for(S2dexWireFamily::S2dex, &sprite);
+
+        assert_eq!(backend.identify_microcode(&geometry), Some(UcodeId::L3dex2));
+        assert_eq!(backend.identify_microcode(&sprite), Some(UcodeId::S2dex));
+        assert_eq!(backend.identify_microcode(&unadmitted), None);
+        assert_eq!(backend.supported_ucodes(), &[UcodeId::L3dex2]);
     }
 
     #[test]

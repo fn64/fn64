@@ -27,7 +27,7 @@ use crate::{
     ReleaseHostPlatform, ReleaseObservationGeometry, ReleaseRendererEvidence,
 };
 
-pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v15";
+pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v16";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -93,6 +93,136 @@ pub struct ExecutionDestinationEvidence {
     pub unique_sha256: String,
     pub ordered: Vec<ExecutionDestinationEventEvidence>,
     pub unique: Vec<ExecutionDestinationCountEvidence>,
+}
+
+/// Exact public graphics-microcode identity returned by the registered
+/// backend's digest catalog. This is recognition evidence only: release
+/// reports still require the ROM's instructions to execute through LLE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "family", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReleaseMicrocodeFamily {
+    Fast3d,
+    F3dex,
+    F3dlx,
+    F3dlxRej,
+    F3dex2,
+    F3dex2NoN,
+    F3dex2Rej,
+    F3dlx2Rej,
+    /// Named by the shared renderer seam but excluded from the public
+    /// certification denominator because its complete wire is unpublished.
+    F3dzex2,
+    S2dex,
+    S2dex2,
+    L3dex,
+    L3dex2,
+    /// A backend-specific identity is retained but never satisfies a public
+    /// family requirement.
+    Other {
+        id: u32,
+    },
+}
+
+impl ReleaseMicrocodeFamily {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Fast3d => 0,
+            Self::F3dex => 1,
+            Self::F3dlx => 2,
+            Self::F3dlxRej => 3,
+            Self::F3dex2 => 4,
+            Self::F3dex2NoN => 5,
+            Self::F3dex2Rej => 6,
+            Self::F3dlx2Rej => 7,
+            Self::F3dzex2 => 8,
+            Self::S2dex => 9,
+            Self::S2dex2 => 10,
+            Self::L3dex => 11,
+            Self::L3dex2 => 12,
+            Self::Other { .. } => 13,
+        }
+    }
+
+    fn encode(self, out: &mut Vec<u8>) {
+        out.push(self.tag());
+        if let Self::Other { id } = self {
+            push_u32(out, id);
+        }
+    }
+}
+
+/// One committed observation at the ABI-owned RSP/RDP execution boundary.
+/// The vector order is fn64 commit order; it is not presented as a claim
+/// about undocumented silicon interleaving.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RspRdpObservationKindEvidence {
+    MicrocodeRecognition {
+        task_address: u32,
+        imem_generation: u64,
+        text_sha256: String,
+        family: Option<ReleaseMicrocodeFamily>,
+    },
+    DramDpcCommitted {
+        start: u32,
+        end: u32,
+        command_sha256: String,
+    },
+    XbusDpcCommitted {
+        start: u32,
+        end: u32,
+        command_sha256: String,
+    },
+    ImemReplacementCommitted {
+        task_address: u32,
+        imem_generation: u64,
+        text_sha256: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RspRdpObservationEventEvidence {
+    pub guest_cycle: u64,
+    pub observation: RspRdpObservationKindEvidence,
+}
+
+/// Canonical ordered RSP/RDP history frozen at the committed VI boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RspRdpEvidence {
+    pub total_observations: u64,
+    pub ordered_sha256: String,
+    pub ordered: Vec<RspRdpObservationEventEvidence>,
+}
+
+impl RspRdpEvidence {
+    pub(crate) fn from_ordered(
+        ordered: Vec<RspRdpObservationEventEvidence>,
+    ) -> Result<Self, GateError> {
+        let total_observations =
+            u64::try_from(ordered.len()).map_err(|_| GateError::RspRdpObservationCountOverflow)?;
+        let ordered_sha256 = sha256_hex(&encode_rsp_rdp_observations(&ordered)?);
+        Ok(Self {
+            total_observations,
+            ordered_sha256,
+            ordered,
+        })
+    }
+
+    pub fn verify_integrity(&self, gate_cycle: u64) -> Result<(), GateError> {
+        if self.total_observations != self.ordered.len() as u64 {
+            return Err(GateError::RspRdpObservationIntegrityMismatch);
+        }
+        decode_sha256(&self.ordered_sha256)
+            .ok_or(GateError::InvalidReportSha256("rsp_rdp.ordered_sha256"))?;
+        validate_rsp_rdp_observations(gate_cycle, &self.ordered)?;
+        let recomputed = sha256_hex(&encode_rsp_rdp_observations(&self.ordered)?);
+        if self.ordered_sha256 != recomputed {
+            return Err(GateError::RspRdpObservationIntegrityMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// One mandatory observable in the fixed-cycle digest.
@@ -259,6 +389,7 @@ impl LiveReleaseGate {
         let device_trace_events = fn64_abi::copy_device_trace().len();
         let save_operation_events = fn64_abi::copy_save_operations().len();
         let controller_operation_events = fn64_abi::copy_controller_operations().len();
+        let rsp_rdp_observations = fn64_abi::copy_rsp_rdp_observations().len();
         let native_execution_destination_events =
             fn64_abi::copy_native_execution_destinations().len();
         #[cfg(feature = "recomp-rs")]
@@ -276,6 +407,7 @@ impl LiveReleaseGate {
             || device_trace_events != 0
             || save_operation_events != 0
             || controller_operation_events != 0
+            || rsp_rdp_observations != 0
             || native_execution_destination_events != 0
             || function_execution_destination_events != 0
             || block_execution_destination_events != 0
@@ -286,6 +418,7 @@ impl LiveReleaseGate {
                 device_trace_events,
                 save_operation_events,
                 controller_operation_events,
+                rsp_rdp_observations,
                 native_execution_destination_events,
                 function_execution_destination_events,
                 block_execution_destination_events,
@@ -326,11 +459,21 @@ impl LiveReleaseGate {
                 observed: boundary.cycle(),
             });
         }
-        let (snapshot, executor, host, program, frozen_destinations, platform, render) = boundary
+        let (
+            snapshot,
+            executor,
+            host,
+            program,
+            frozen_destinations,
+            frozen_rsp_rdp,
+            platform,
+            render,
+        ) = boundary
             .into_evidence()
             .map_err(GateError::InvalidViBoundary)?;
         let execution_destinations =
             capture_execution_destinations(&program, frozen_destinations, self.guest_cycle)?;
+        let rsp_rdp = capture_rsp_rdp_evidence(frozen_rsp_rdp)?;
         let observed_cycle = fn64_abi::sim_time();
         if observed_cycle != self.guest_cycle {
             return Err(GateError::WrongLiveCycle {
@@ -401,9 +544,12 @@ impl LiveReleaseGate {
             scenario,
             input_bytes,
             digest.finish()?,
-            observed.observations,
-            environment,
-            execution_destinations,
+            ReleaseBoundaryReportEvidence {
+                observations: observed.observations,
+                environment,
+                execution_destinations,
+                rsp_rdp,
+            },
             closure,
         )?;
         report.write_json(report_path)?;
@@ -428,6 +574,77 @@ fn validate_controller_operation_cycles(
         })
     } else {
         Ok(())
+    }
+}
+
+fn capture_rsp_rdp_evidence(
+    frozen: Vec<fn64_abi::RspRdpObservationEvent>,
+) -> Result<RspRdpEvidence, GateError> {
+    let ordered = frozen
+        .into_iter()
+        .map(|event| RspRdpObservationEventEvidence {
+            guest_cycle: event.at.get(),
+            observation: match event.kind {
+                fn64_abi::RspRdpObservationKind::MicrocodeRecognition {
+                    task_addr,
+                    imem_generation,
+                    text_sha256,
+                    family,
+                } => RspRdpObservationKindEvidence::MicrocodeRecognition {
+                    task_address: task_addr.offset(),
+                    imem_generation,
+                    text_sha256: hex(&text_sha256),
+                    family: family.map(release_microcode_family),
+                },
+                fn64_abi::RspRdpObservationKind::DramDpcCommitted {
+                    start,
+                    end,
+                    command_sha256,
+                } => RspRdpObservationKindEvidence::DramDpcCommitted {
+                    start,
+                    end,
+                    command_sha256: hex(&command_sha256),
+                },
+                fn64_abi::RspRdpObservationKind::XbusDpcCommitted {
+                    start,
+                    end,
+                    command_sha256,
+                } => RspRdpObservationKindEvidence::XbusDpcCommitted {
+                    start,
+                    end,
+                    command_sha256: hex(&command_sha256),
+                },
+                fn64_abi::RspRdpObservationKind::ImemReplacementCommitted {
+                    task_addr,
+                    imem_generation,
+                    text_sha256,
+                } => RspRdpObservationKindEvidence::ImemReplacementCommitted {
+                    task_address: task_addr.offset(),
+                    imem_generation,
+                    text_sha256: hex(&text_sha256),
+                },
+            },
+        })
+        .collect();
+    RspRdpEvidence::from_ordered(ordered)
+}
+
+const fn release_microcode_family(family: fn64_abi::UcodeId) -> ReleaseMicrocodeFamily {
+    match family {
+        fn64_abi::UcodeId::Fast3d => ReleaseMicrocodeFamily::Fast3d,
+        fn64_abi::UcodeId::F3dex => ReleaseMicrocodeFamily::F3dex,
+        fn64_abi::UcodeId::F3dlx => ReleaseMicrocodeFamily::F3dlx,
+        fn64_abi::UcodeId::F3dlxRej => ReleaseMicrocodeFamily::F3dlxRej,
+        fn64_abi::UcodeId::F3dex2 => ReleaseMicrocodeFamily::F3dex2,
+        fn64_abi::UcodeId::F3dex2NoN => ReleaseMicrocodeFamily::F3dex2NoN,
+        fn64_abi::UcodeId::F3dex2Rej => ReleaseMicrocodeFamily::F3dex2Rej,
+        fn64_abi::UcodeId::F3dlx2Rej => ReleaseMicrocodeFamily::F3dlx2Rej,
+        fn64_abi::UcodeId::F3dzex2 => ReleaseMicrocodeFamily::F3dzex2,
+        fn64_abi::UcodeId::S2dex => ReleaseMicrocodeFamily::S2dex,
+        fn64_abi::UcodeId::S2dex2 => ReleaseMicrocodeFamily::S2dex2,
+        fn64_abi::UcodeId::L3dex => ReleaseMicrocodeFamily::L3dex,
+        fn64_abi::UcodeId::L3dex2 => ReleaseMicrocodeFamily::L3dex2,
+        fn64_abi::UcodeId::Other(id) => ReleaseMicrocodeFamily::Other { id },
     }
 }
 
@@ -1298,6 +1515,35 @@ fn test_release_environment(
     }
 }
 
+#[cfg(test)]
+fn test_rsp_rdp_evidence(
+    guest_cycle: u64,
+    closure: &[ClosurePath],
+) -> Result<RspRdpEvidence, GateError> {
+    let graphics_exercised = closure.iter().any(|path| {
+        path.name == "rsp.graphics-task"
+            && matches!(
+                path.status,
+                ClosurePathStatus::ExercisedZeroUnsupported
+                    | ClosurePathStatus::ExercisedUnsupported
+            )
+    });
+    let ordered = if graphics_exercised {
+        vec![RspRdpObservationEventEvidence {
+            guest_cycle,
+            observation: RspRdpObservationKindEvidence::MicrocodeRecognition {
+                task_address: 0,
+                imem_generation: 0,
+                text_sha256: sha256_hex(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]),
+                family: None,
+            },
+        }]
+    } else {
+        Vec::new()
+    };
+    RspRdpEvidence::from_ordered(ordered)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseGateReport {
     pub schema: String,
@@ -1313,6 +1559,9 @@ pub struct ReleaseGateReport {
     /// Exact entered executable destinations selected from the program-owner
     /// lane frozen at the same committed boundary.
     pub execution_destinations: ExecutionDestinationEvidence,
+    /// Exact ABI-owned graphics-microcode recognition, IMEM replacement, and
+    /// committed DPC history frozen at the same boundary.
+    pub rsp_rdp: RspRdpEvidence,
     pub closure: Vec<ClosurePath>,
     /// SHA-256 over every other semantic report field in an explicit wire
     /// order. Cite this value, rather than the artifact-only digest root, when
@@ -1320,16 +1569,27 @@ pub struct ReleaseGateReport {
     pub report_sha256: String,
 }
 
+struct ReleaseBoundaryReportEvidence {
+    observations: ReleaseObservationGeometry,
+    environment: ReleaseEnvironmentEvidence,
+    execution_destinations: ExecutionDestinationEvidence,
+    rsp_rdp: RspRdpEvidence,
+}
+
 impl ReleaseGateReport {
     fn new_with_environment(
         scenario: impl Into<String>,
         input_bytes: &[u8],
         digest: DeterministicDigest,
-        observations: ReleaseObservationGeometry,
-        environment: ReleaseEnvironmentEvidence,
-        execution_destinations: ExecutionDestinationEvidence,
+        boundary: ReleaseBoundaryReportEvidence,
         mut closure: Vec<ClosurePath>,
     ) -> Result<Self, GateError> {
+        let ReleaseBoundaryReportEvidence {
+            observations,
+            environment,
+            execution_destinations,
+            rsp_rdp,
+        } = boundary;
         let scenario = scenario.into();
         if scenario.is_empty() {
             return Err(GateError::EmptyScenario);
@@ -1341,6 +1601,7 @@ impl ReleaseGateReport {
         validate_environment_observation(&environment, &observations)?;
         execution_destinations.verify_integrity()?;
         validate_execution_destination_cycles(digest.guest_cycle, &execution_destinations)?;
+        rsp_rdp.verify_integrity(digest.guest_cycle)?;
         digest.verify_integrity()?;
         validate_artifact_observation_bytes(&digest, &observations)?;
         validate_closure_paths(&closure)?;
@@ -1352,6 +1613,7 @@ impl ReleaseGateReport {
         {
             return Err(GateError::DuplicateClosurePath(duplicate));
         }
+        validate_rsp_rdp_closure(&closure, &rsp_rdp)?;
         let mut report = Self {
             schema: REPORT_SCHEMA.to_owned(),
             scenario,
@@ -1360,6 +1622,7 @@ impl ReleaseGateReport {
             observations,
             environment,
             execution_destinations,
+            rsp_rdp,
             closure,
             report_sha256: String::new(),
         };
@@ -1376,13 +1639,17 @@ impl ReleaseGateReport {
         closure: Vec<ClosurePath>,
     ) -> Result<Self, GateError> {
         let environment = test_release_environment(&observations);
+        let rsp_rdp = test_rsp_rdp_evidence(digest.guest_cycle, &closure)?;
         Self::new_with_environment(
             scenario,
             input_bytes,
             digest,
-            observations,
-            environment,
-            ExecutionDestinationEvidence::no_program(),
+            ReleaseBoundaryReportEvidence {
+                observations,
+                environment,
+                execution_destinations: ExecutionDestinationEvidence::no_program(),
+                rsp_rdp,
+            },
             closure,
         )
     }
@@ -1396,13 +1663,17 @@ impl ReleaseGateReport {
         environment: ReleaseEnvironmentEvidence,
         closure: Vec<ClosurePath>,
     ) -> Result<Self, GateError> {
+        let rsp_rdp = test_rsp_rdp_evidence(digest.guest_cycle, &closure)?;
         Self::new_with_environment(
             scenario,
             input_bytes,
             digest,
-            observations,
-            environment,
-            ExecutionDestinationEvidence::no_program(),
+            ReleaseBoundaryReportEvidence {
+                observations,
+                environment,
+                execution_destinations: ExecutionDestinationEvidence::no_program(),
+                rsp_rdp,
+            },
             closure,
         )
     }
@@ -1417,18 +1688,22 @@ impl ReleaseGateReport {
         execution_destinations: ExecutionDestinationEvidence,
         closure: Vec<ClosurePath>,
     ) -> Result<Self, GateError> {
+        let rsp_rdp = test_rsp_rdp_evidence(digest.guest_cycle, &closure)?;
         Self::new_with_environment(
             scenario,
             input_bytes,
             digest,
-            observations,
-            environment,
-            execution_destinations,
+            ReleaseBoundaryReportEvidence {
+                observations,
+                environment,
+                execution_destinations,
+                rsp_rdp,
+            },
             closure,
         )
     }
 
-    /// Recompute the schema-v15 evidence digest after loading a retained JSON
+    /// Recompute the schema-v16 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {
@@ -1445,10 +1720,12 @@ impl ReleaseGateReport {
             self.digest.guest_cycle,
             &self.execution_destinations,
         )?;
+        self.rsp_rdp.verify_integrity(self.digest.guest_cycle)?;
         self.digest.verify_integrity()?;
         validate_artifact_observation_bytes(&self.digest, &self.observations)?;
         validate_closure_paths(&self.closure)?;
         validate_canonical_closure_order(&self.closure)?;
+        validate_rsp_rdp_closure(&self.closure, &self.rsp_rdp)?;
         decode_sha256(&self.input_sha256).ok_or(GateError::InvalidReportSha256("input_sha256"))?;
         decode_sha256(&self.report_sha256)
             .ok_or(GateError::InvalidReportSha256("report_sha256"))?;
@@ -1537,12 +1814,17 @@ pub enum GateError {
         event_cycle: u64,
         operation: String,
     },
+    FutureRspRdpObservation {
+        gate_cycle: u64,
+        event_cycle: u64,
+    },
     LiveGateArmedLate {
         sim_time: u64,
         trace_events: usize,
         device_trace_events: usize,
         save_operation_events: usize,
         controller_operation_events: usize,
+        rsp_rdp_observations: usize,
         native_execution_destination_events: usize,
         function_execution_destination_events: usize,
         block_execution_destination_events: usize,
@@ -1562,6 +1844,32 @@ pub enum GateError {
     EmptyExecutionDestinationEvidence(&'static str),
     ExecutionDestinationSourceMismatch(&'static str),
     ExecutionDestinationIntegrityMismatch,
+    RspRdpObservationCountOverflow,
+    RspRdpObservationIntegrityMismatch,
+    InvalidDpcObservationRange {
+        source: &'static str,
+        start: u32,
+        end: u32,
+        limit: u32,
+    },
+    NonMonotonicRspRdpObservationCycle {
+        previous: u64,
+        observed: u64,
+    },
+    NonMonotonicImemGeneration {
+        previous: u64,
+        observed: u64,
+    },
+    NonMonotonicImemReplacementGeneration {
+        previous: u64,
+        observed: u64,
+    },
+    ConflictingImemGenerationDigest {
+        generation: u64,
+        previous: String,
+        observed: String,
+    },
+    MissingGraphicsMicrocodeRecognition,
     UnidentifiedCartridgeSave,
     UnidentifiedRenderBackend,
     NonAccuracyRenderPolicy,
@@ -1674,12 +1982,20 @@ impl fmt::Display for GateError {
                 f,
                 "unsupported event {operation:?} contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
             ),
+            Self::FutureRspRdpObservation {
+                gate_cycle,
+                event_cycle,
+            } => write!(
+                f,
+                "RSP/RDP observation contains guest cycle {event_cycle} after gate cycle {gate_cycle}"
+            ),
             Self::LiveGateArmedLate {
                 sim_time,
                 trace_events,
                 device_trace_events,
                 save_operation_events,
                 controller_operation_events,
+                rsp_rdp_observations,
                 native_execution_destination_events,
                 function_execution_destination_events,
                 block_execution_destination_events,
@@ -1689,6 +2005,7 @@ impl fmt::Display for GateError {
                  trace_events={trace_events}, device_trace_events={device_trace_events}, \
                  save_operation_events={save_operation_events}, \
                  controller_operation_events={controller_operation_events}, \
+                 rsp_rdp_observations={rsp_rdp_observations}, \
                  native_execution_destination_events={native_execution_destination_events}, \
                  function_execution_destination_events={function_execution_destination_events}, \
                  block_execution_destination_events={block_execution_destination_events}"
@@ -1721,6 +2038,46 @@ impl fmt::Display for GateError {
             Self::ExecutionDestinationIntegrityMismatch => write!(
                 f,
                 "execution-destination counts, canonical set, order, or digest are inconsistent"
+            ),
+            Self::RspRdpObservationCountOverflow => {
+                write!(f, "RSP/RDP observation count exceeds u64")
+            }
+            Self::RspRdpObservationIntegrityMismatch => write!(
+                f,
+                "RSP/RDP observation count, order, or digest is inconsistent"
+            ),
+            Self::InvalidDpcObservationRange {
+                source,
+                start,
+                end,
+                limit,
+            } => write!(
+                f,
+                "{source} DPC observation range [{start:#010x}, {end:#010x}) must be nonempty, 8-byte aligned, and end at or below {limit:#010x}"
+            ),
+            Self::NonMonotonicRspRdpObservationCycle { previous, observed } => write!(
+                f,
+                "RSP/RDP observation cycle {observed} precedes retained cycle {previous}"
+            ),
+            Self::NonMonotonicImemGeneration { previous, observed } => write!(
+                f,
+                "RSP IMEM generation {observed} precedes retained generation {previous}"
+            ),
+            Self::NonMonotonicImemReplacementGeneration { previous, observed } => write!(
+                f,
+                "RSP IMEM replacement generation {observed} does not follow retained generation {previous}"
+            ),
+            Self::ConflictingImemGenerationDigest {
+                generation,
+                previous,
+                observed,
+            } => write!(
+                f,
+                "RSP IMEM generation {generation} names conflicting text digests {previous} and {observed}"
+            ),
+            Self::MissingGraphicsMicrocodeRecognition => write!(
+                f,
+                "exercised graphics-task closure lacks an ABI-owned microcode-recognition observation"
             ),
             Self::UnidentifiedCartridgeSave => write!(
                 f,
@@ -1823,7 +2180,7 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-fn decode_sha256(value: &str) -> Option<[u8; 32]> {
+pub(crate) fn decode_sha256(value: &str) -> Option<[u8; 32]> {
     if value.len() != 64
         || !value
             .bytes()
@@ -1931,6 +2288,30 @@ pub(crate) fn validate_canonical_closure_order(paths: &[ClosurePath]) -> Result<
             previous: pair[0].name.clone(),
             next: pair[1].name.clone(),
         });
+    }
+    Ok(())
+}
+
+fn validate_rsp_rdp_closure(
+    paths: &[ClosurePath],
+    evidence: &RspRdpEvidence,
+) -> Result<(), GateError> {
+    let graphics_exercised = paths.iter().any(|path| {
+        path.name == "rsp.graphics-task"
+            && matches!(
+                path.status,
+                ClosurePathStatus::ExercisedZeroUnsupported
+                    | ClosurePathStatus::ExercisedUnsupported
+            )
+    });
+    let recognition_observed = evidence.ordered.iter().any(|event| {
+        matches!(
+            event.observation,
+            RspRdpObservationKindEvidence::MicrocodeRecognition { .. }
+        )
+    });
+    if graphics_exercised && !recognition_observed {
+        return Err(GateError::MissingGraphicsMicrocodeRecognition);
     }
     Ok(())
 }
@@ -3060,10 +3441,203 @@ pub(crate) fn encode_execution_destination_evidence(
     Ok(out)
 }
 
+fn validate_rsp_rdp_observations(
+    gate_cycle: u64,
+    observations: &[RspRdpObservationEventEvidence],
+) -> Result<(), GateError> {
+    let mut previous_cycle = None;
+    let mut previous_imem_generation = None;
+    let mut imem_generation_digests = BTreeMap::<u64, &str>::new();
+    for event in observations {
+        if event.guest_cycle > gate_cycle {
+            return Err(GateError::FutureRspRdpObservation {
+                gate_cycle,
+                event_cycle: event.guest_cycle,
+            });
+        }
+        if previous_cycle.is_some_and(|previous| event.guest_cycle < previous) {
+            return Err(GateError::NonMonotonicRspRdpObservationCycle {
+                previous: previous_cycle.expect("checked RSP/RDP observation cycle"),
+                observed: event.guest_cycle,
+            });
+        }
+        previous_cycle = Some(event.guest_cycle);
+        match &event.observation {
+            RspRdpObservationKindEvidence::MicrocodeRecognition {
+                imem_generation,
+                text_sha256,
+                ..
+            } => {
+                decode_sha256(text_sha256).ok_or(GateError::InvalidReportSha256(
+                    "rsp_rdp.ordered[].observation.text_sha256",
+                ))?;
+                validate_imem_generation_digest(
+                    &mut imem_generation_digests,
+                    *imem_generation,
+                    text_sha256,
+                )?;
+                if previous_imem_generation.is_some_and(|previous| *imem_generation < previous) {
+                    return Err(GateError::NonMonotonicImemGeneration {
+                        previous: previous_imem_generation.expect("checked RSP IMEM generation"),
+                        observed: *imem_generation,
+                    });
+                }
+                previous_imem_generation = Some(*imem_generation);
+            }
+            RspRdpObservationKindEvidence::DramDpcCommitted {
+                start,
+                end,
+                command_sha256,
+            } => {
+                validate_dpc_observation_range(*start, *end, 0x0100_0000, "DRAM")?;
+                decode_sha256(command_sha256).ok_or(GateError::InvalidReportSha256(
+                    "rsp_rdp.ordered[].observation.command_sha256",
+                ))?;
+            }
+            RspRdpObservationKindEvidence::XbusDpcCommitted {
+                start,
+                end,
+                command_sha256,
+            } => {
+                validate_dpc_observation_range(*start, *end, 0x1000, "XBUS")?;
+                decode_sha256(command_sha256).ok_or(GateError::InvalidReportSha256(
+                    "rsp_rdp.ordered[].observation.command_sha256",
+                ))?;
+            }
+            RspRdpObservationKindEvidence::ImemReplacementCommitted {
+                imem_generation,
+                text_sha256,
+                ..
+            } => {
+                decode_sha256(text_sha256).ok_or(GateError::InvalidReportSha256(
+                    "rsp_rdp.ordered[].observation.text_sha256",
+                ))?;
+                validate_imem_generation_digest(
+                    &mut imem_generation_digests,
+                    *imem_generation,
+                    text_sha256,
+                )?;
+                if previous_imem_generation.is_some_and(|previous| *imem_generation <= previous) {
+                    return Err(GateError::NonMonotonicImemReplacementGeneration {
+                        previous: previous_imem_generation.expect("checked RSP IMEM generation"),
+                        observed: *imem_generation,
+                    });
+                }
+                previous_imem_generation = Some(*imem_generation);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_imem_generation_digest<'a>(
+    generations: &mut BTreeMap<u64, &'a str>,
+    generation: u64,
+    text_sha256: &'a str,
+) -> Result<(), GateError> {
+    if let Some(previous) = generations.insert(generation, text_sha256) {
+        if previous != text_sha256 {
+            return Err(GateError::ConflictingImemGenerationDigest {
+                generation,
+                previous: previous.to_owned(),
+                observed: text_sha256.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_dpc_observation_range(
+    start: u32,
+    end: u32,
+    limit: u32,
+    source: &'static str,
+) -> Result<(), GateError> {
+    if start >= end || !start.is_multiple_of(8) || !end.is_multiple_of(8) || end > limit {
+        return Err(GateError::InvalidDpcObservationRange {
+            source,
+            start,
+            end,
+            limit,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn encode_rsp_rdp_observations(
+    observations: &[RspRdpObservationEventEvidence],
+) -> Result<Vec<u8>, GateError> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"fn64.rsp-rdp-observations.v1\0");
+    push_u64(&mut out, observations.len() as u64);
+    for event in observations {
+        push_u64(&mut out, event.guest_cycle);
+        match &event.observation {
+            RspRdpObservationKindEvidence::MicrocodeRecognition {
+                task_address,
+                imem_generation,
+                text_sha256,
+                family,
+            } => {
+                out.push(0);
+                push_u32(&mut out, *task_address);
+                push_u64(&mut out, *imem_generation);
+                out.extend_from_slice(&decode_sha256(text_sha256).ok_or(
+                    GateError::InvalidReportSha256("rsp_rdp.ordered[].observation.text_sha256"),
+                )?);
+                match family {
+                    Some(family) => {
+                        out.push(1);
+                        family.encode(&mut out);
+                    }
+                    None => out.push(0),
+                }
+            }
+            RspRdpObservationKindEvidence::DramDpcCommitted {
+                start,
+                end,
+                command_sha256,
+            } => {
+                out.push(1);
+                push_u32(&mut out, *start);
+                push_u32(&mut out, *end);
+                out.extend_from_slice(&decode_sha256(command_sha256).ok_or(
+                    GateError::InvalidReportSha256("rsp_rdp.ordered[].observation.command_sha256"),
+                )?);
+            }
+            RspRdpObservationKindEvidence::XbusDpcCommitted {
+                start,
+                end,
+                command_sha256,
+            } => {
+                out.push(2);
+                push_u32(&mut out, *start);
+                push_u32(&mut out, *end);
+                out.extend_from_slice(&decode_sha256(command_sha256).ok_or(
+                    GateError::InvalidReportSha256("rsp_rdp.ordered[].observation.command_sha256"),
+                )?);
+            }
+            RspRdpObservationKindEvidence::ImemReplacementCommitted {
+                task_address,
+                imem_generation,
+                text_sha256,
+            } => {
+                out.push(3);
+                push_u32(&mut out, *task_address);
+                push_u64(&mut out, *imem_generation);
+                out.extend_from_slice(&decode_sha256(text_sha256).ok_or(
+                    GateError::InvalidReportSha256("rsp_rdp.ordered[].observation.text_sha256"),
+                )?);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Encode a complete report without `report_sha256` itself. This is an
 /// evidence wire format, so it does not depend on JSON key order or serializer
 /// formatting.
-fn encode_report_evidence(report: &ReleaseGateReport) -> Result<Vec<u8>, GateError> {
+pub(crate) fn encode_report_evidence(report: &ReleaseGateReport) -> Result<Vec<u8>, GateError> {
     let mut out = Vec::new();
     push_bytes(&mut out, report.schema.as_bytes());
     push_bytes(&mut out, report.scenario.as_bytes());
@@ -3160,6 +3734,15 @@ fn encode_report_evidence(report: &ReleaseGateReport) -> Result<Vec<u8>, GateErr
     push_bytes(
         &mut out,
         &encode_execution_destination_evidence(&report.execution_destinations)?,
+    );
+    push_bytes(
+        &mut out,
+        &encode_rsp_rdp_observations(&report.rsp_rdp.ordered)?,
+    );
+    push_u64(&mut out, report.rsp_rdp.total_observations);
+    out.extend_from_slice(
+        &decode_sha256(&report.rsp_rdp.ordered_sha256)
+            .ok_or(GateError::InvalidReportSha256("rsp_rdp.ordered_sha256"))?,
     );
     push_u64(&mut out, report.closure.len() as u64);
     for path in &report.closure {
@@ -3431,9 +4014,12 @@ mod tests {
             "destination-order",
             b"input",
             complete_digest(),
-            geometry.clone(),
-            test_release_environment(&geometry),
-            evidence.clone(),
+            ReleaseBoundaryReportEvidence {
+                observations: geometry.clone(),
+                environment: test_release_environment(&geometry),
+                execution_destinations: evidence.clone(),
+                rsp_rdp: RspRdpEvidence::from_ordered(Vec::new()).unwrap(),
+            },
             Vec::new(),
         )
         .unwrap();
@@ -3441,9 +4027,12 @@ mod tests {
             "destination-order",
             b"input",
             complete_digest(),
-            geometry.clone(),
-            test_release_environment(&geometry),
-            reordered_canonical,
+            ReleaseBoundaryReportEvidence {
+                observations: geometry.clone(),
+                environment: test_release_environment(&geometry),
+                execution_destinations: reordered_canonical,
+                rsp_rdp: RspRdpEvidence::from_ordered(Vec::new()).unwrap(),
+            },
             Vec::new(),
         )
         .unwrap();
@@ -3759,12 +4348,12 @@ mod tests {
     }
 
     #[test]
-    fn schema_v15_fixed_cycle_digest_is_stable_and_complete() {
+    fn schema_v16_fixed_cycle_digest_is_stable_and_complete() {
         assert_eq!(complete_digest(), complete_digest());
         assert_eq!(complete_digest().artifacts.len(), 5);
         assert_eq!(
             complete_digest().root_sha256,
-            "8616e77fb1409eaf1372bd5a259869fbb92337fdfded9a1c60c68218cc39536d"
+            "e8cab8952b06820896ef1888d75eb022d938ed8e571a0804ba1bae7a7d6b30a1"
         );
     }
 
@@ -4788,7 +5377,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v15_report_wire_binds_every_release_environment_field() {
+    fn schema_v16_report_wire_binds_every_release_environment_field() {
         let report = ReleaseGateReport::new(
             "environment-wire",
             b"input",
@@ -5453,6 +6042,155 @@ mod tests {
             assert_eq!(evidence.observations, 1);
             assert_eq!(evidence.status, ClosurePathStatus::ExercisedZeroUnsupported);
         }
+    }
+
+    #[test]
+    fn schema_v16_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
+        let geometry = observations();
+        let graphics_closure = vec![ClosurePath {
+            name: "rsp.graphics-task".to_owned(),
+            observations: 1,
+            status: ClosurePathStatus::ExercisedZeroUnsupported,
+            unsupported: Vec::new(),
+        }];
+        let ordered = vec![
+            RspRdpObservationEventEvidence {
+                guest_cycle: 40,
+                observation: RspRdpObservationKindEvidence::MicrocodeRecognition {
+                    task_address: 0x1000,
+                    imem_generation: 3,
+                    text_sha256: "11".repeat(32),
+                    family: Some(ReleaseMicrocodeFamily::F3dex2),
+                },
+            },
+            RspRdpObservationEventEvidence {
+                guest_cycle: 41,
+                observation: RspRdpObservationKindEvidence::DramDpcCommitted {
+                    start: 0x100,
+                    end: 0x108,
+                    command_sha256: "22".repeat(32),
+                },
+            },
+            RspRdpObservationEventEvidence {
+                guest_cycle: 42,
+                observation: RspRdpObservationKindEvidence::ImemReplacementCommitted {
+                    task_address: 0x1000,
+                    imem_generation: 4,
+                    text_sha256: "33".repeat(32),
+                },
+            },
+        ];
+        let report = ReleaseGateReport::new_with_environment(
+            "rsp-rdp-wire",
+            b"input",
+            complete_digest(),
+            ReleaseBoundaryReportEvidence {
+                observations: geometry.clone(),
+                environment: test_release_environment(&geometry),
+                execution_destinations: ExecutionDestinationEvidence::no_program(),
+                rsp_rdp: RspRdpEvidence::from_ordered(ordered).unwrap(),
+            },
+            graphics_closure.clone(),
+        )
+        .unwrap();
+        report.verify_integrity().unwrap();
+
+        let mut reordered = report.clone();
+        reordered.rsp_rdp.ordered.swap(0, 1);
+        assert!(matches!(
+            reordered.verify_integrity(),
+            Err(GateError::NonMonotonicRspRdpObservationCycle {
+                previous: 41,
+                observed: 40
+            })
+        ));
+
+        let mut future = report.clone();
+        future.rsp_rdp.ordered[0].guest_cycle = 43;
+        assert!(matches!(
+            future.verify_integrity(),
+            Err(GateError::FutureRspRdpObservation {
+                gate_cycle: 42,
+                event_cycle: 43
+            })
+        ));
+
+        let mut nonmonotonic_cycle_events = report.rsp_rdp.ordered.clone();
+        nonmonotonic_cycle_events[1].guest_cycle = 39;
+        let mut nonmonotonic_cycle = report.clone();
+        nonmonotonic_cycle.rsp_rdp =
+            RspRdpEvidence::from_ordered(nonmonotonic_cycle_events).unwrap();
+        assert!(matches!(
+            nonmonotonic_cycle.verify_integrity(),
+            Err(GateError::NonMonotonicRspRdpObservationCycle {
+                previous: 40,
+                observed: 39
+            })
+        ));
+
+        let mut regressing_generation_events = report.rsp_rdp.ordered.clone();
+        if let RspRdpObservationKindEvidence::ImemReplacementCommitted {
+            imem_generation, ..
+        } = &mut regressing_generation_events[2].observation
+        {
+            *imem_generation = 2;
+        }
+        let mut regressing_generation = report.clone();
+        regressing_generation.rsp_rdp =
+            RspRdpEvidence::from_ordered(regressing_generation_events).unwrap();
+        assert!(matches!(
+            regressing_generation.verify_integrity(),
+            Err(GateError::NonMonotonicImemReplacementGeneration {
+                previous: 3,
+                observed: 2
+            })
+        ));
+
+        let mut conflicting_digest_events = report.rsp_rdp.ordered.clone();
+        conflicting_digest_events.push(RspRdpObservationEventEvidence {
+            guest_cycle: 42,
+            observation: RspRdpObservationKindEvidence::MicrocodeRecognition {
+                task_address: 0x1000,
+                imem_generation: 4,
+                text_sha256: "44".repeat(32),
+                family: None,
+            },
+        });
+        let mut conflicting_digest = report.clone();
+        conflicting_digest.rsp_rdp =
+            RspRdpEvidence::from_ordered(conflicting_digest_events).unwrap();
+        assert!(matches!(
+            conflicting_digest.verify_integrity(),
+            Err(GateError::ConflictingImemGenerationDigest { generation: 4, .. })
+        ));
+
+        let mut invalid_range = report.clone();
+        invalid_range.rsp_rdp.ordered[1].observation =
+            RspRdpObservationKindEvidence::DramDpcCommitted {
+                start: 0x101,
+                end: 0x108,
+                command_sha256: "22".repeat(32),
+            };
+        assert!(matches!(
+            invalid_range.verify_integrity(),
+            Err(GateError::InvalidDpcObservationRange { source: "DRAM", .. })
+        ));
+
+        assert!(matches!(
+            ReleaseGateReport::new_with_environment(
+                "false-graphics-closure",
+                b"input",
+                complete_digest(),
+                ReleaseBoundaryReportEvidence {
+                    observations: geometry.clone(),
+                    environment: test_release_environment(&geometry),
+                    execution_destinations: ExecutionDestinationEvidence::no_program(),
+                    rsp_rdp: RspRdpEvidence::from_ordered(Vec::new()).unwrap(),
+                },
+                graphics_closure,
+            ),
+            Err(GateError::MissingGraphicsMicrocodeRecognition)
+        ));
     }
 
     #[test]

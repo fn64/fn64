@@ -91,7 +91,7 @@ digits, dots, underscores, or hyphens, beginning with a letter or digit. A raw
 
 `program_evidence_lane` is the pre-run executable-authority contract. A
 `full_rom` or `combined` run must select `typed_observed_function`,
-`typed_block_program`, or `identified_native_archive`; the resulting v15
+`typed_block_program`, or `identified_native_archive`; the resulting v16
 report must carry that exact execution-destination source.
 `typed_observed_function` asserts that the host installed the generated
 artifact's `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA` marker and that the
@@ -114,12 +114,16 @@ The release policy mirrors the typed release-matrix vocabulary:
 
 These values are pre-run admission policy only. Matrix v5 does not copy them
 into a certification denominator or trust them as scenario coverage: it derives
-platform, controller, save, renderer, and program-lane coverage from each
-validated committed-boundary report. The current FullParityV1 comparison can
-assign only the derived program/renderer-lane, save, and controller members;
-schema v15's coarse host platform cannot satisfy an exact platform/API target.
-A readiness receipt cannot satisfy ROM-class, TV-region, microcode,
-platform-case, or blocker requirements by itself.
+platform, controller, save, renderer, program-lane, and committed RSP/RDP-
+mechanism coverage from each validated committed-boundary report. A backend-
+recognized microcode family is diagnostic/optimization evidence only.
+Public-microcode credit requires independent exact digest-to-family
+adjudication by the immutable project-owned catalog v1, which is currently
+empty pending allowed-source digest provenance; v13 therefore cannot yet
+satisfy any public-microcode requirement. Schema v16's coarse host platform
+still cannot satisfy an exact platform/API target. A readiness receipt cannot
+satisfy ROM-class, TV-region, public-microcode, platform-case, or blocker
+requirements by itself.
 
 ## Filesystem and identity rules
 

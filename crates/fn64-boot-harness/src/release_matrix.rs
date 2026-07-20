@@ -2,7 +2,7 @@
 //!
 //! The manifest contains only the immutable project profile and evidence
 //! identities, never ROM bytes, captured output, or caller-authored coverage.
-//! Dynamic evidence remains the schema-v15 report series; coverage is derived
+//! Dynamic evidence remains the schema-v16 report series; coverage is derived
 //! from each validated report before it is compared with the fixed profile.
 
 use crate::{
@@ -11,7 +11,8 @@ use crate::{
     DeterministicDigest, ExecutionDestinationEvidence, FramebufferObservationSource, FullParityV1,
     ParsedUnsupportedJournal, ReleaseCartridgeSave, ReleaseControllerPort,
     ReleaseEnvironmentEvidence, ReleaseGateReport, ReleaseGraphicsExecutionPolicy,
-    ReleaseHostPlatform, ReleaseObservationGeometry, ReleaseRendererEvidence, ReportSeriesError,
+    ReleaseHostPlatform, ReleaseMicrocodeFamily, ReleaseObservationGeometry,
+    ReleaseRendererEvidence, ReportSeriesError, RspRdpEvidence, RspRdpObservationKindEvidence,
     LIVE_MINIMUM_CLOSURE_PATHS,
 };
 use serde::{Deserialize, Serialize};
@@ -22,8 +23,8 @@ use std::{
 };
 
 pub const RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix.v5";
-pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v12";
-pub const INCOMPLETE_RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix-incomplete.v1";
+pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v13";
+pub const INCOMPLETE_RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix-incomplete.v2";
 pub const RELEASE_MATRIX_REPORT_COUNT: usize = 10;
 pub const RELEASE_MATRIX_MAX_SCENARIOS: usize = 64;
 
@@ -90,6 +91,45 @@ pub enum ProgramFeature {
     TypedBlock,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicrocodeFeature {
+    Fast3d,
+    F3dex,
+    F3dlx,
+    F3dlxRej,
+    F3dex2,
+    F3dex2NoN,
+    F3dex2Rej,
+    F3dlx2Rej,
+    S2dex,
+    S2dex2,
+    L3dex,
+    L3dex2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CertifiedMicrocodeIdentity {
+    text_sha256: [u8; 32],
+    family: ReleaseMicrocodeFamily,
+}
+
+/// Immutable digest-to-family adjudication for matrix-v5/v13 certification.
+///
+/// Runtime/backend admission remains host-configurable because it selects an
+/// optimization, not certification. Public-microcode denominator credit is
+/// intentionally empty until allowed-source digest provenance is reviewed and
+/// lands in a new, schema-versioned project catalog.
+const CERTIFIED_PUBLIC_MICROCODE_CATALOG_V1: &[CertifiedMicrocodeIdentity] = &[];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RspRdpMechanismFeature {
+    DramDpc,
+    XbusDpc,
+    ImemReplacement,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseMatrixCoverage {
@@ -98,6 +138,11 @@ pub struct ReleaseMatrixCoverage {
     pub saves: Vec<SaveFeature>,
     pub renderers: Vec<RendererFeature>,
     pub programs: Vec<ProgramFeature>,
+    /// Empty is valid evidence that no publicly admitted family was reached;
+    /// it satisfies no profile requirement.
+    pub microcodes: Vec<MicrocodeFeature>,
+    /// Empty is valid evidence that none of the required mechanisms committed.
+    pub rsp_rdp_mechanisms: Vec<RspRdpMechanismFeature>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,12 +151,12 @@ pub struct ReleaseMatrixScenario {
     /// Stable diagnostic key. Evidence is associated by `report_scenario`, not
     /// by a caller-provided command-line assignment.
     pub id: String,
-    /// Exact scenario string bound by every schema-v15 report in this series.
+    /// Exact scenario string bound by every schema-v16 report in this series.
     pub report_scenario: String,
     /// Exact private-input identity bound by every report; no input bytes are stored.
     pub input_sha256: String,
     pub report_sha256: String,
-    /// Canonical digest over this declaration and its exact v15 evidence IDs.
+    /// Canonical digest over this declaration and its exact v16 evidence IDs.
     pub declaration_sha256: String,
 }
 
@@ -185,9 +230,12 @@ pub struct VerifiedMatrixScenario {
     pub environment: ReleaseEnvironmentEvidence,
     pub closure_paths: u64,
     /// Exact destination sequence and canonical unique/count summary retained
-    /// from the verified v15 series.
+    /// from the verified v16 series.
     pub execution_destinations: ExecutionDestinationEvidence,
-    /// Exact canonical closure ledger retained from the verified v15 series.
+    /// Complete schema-v16 RSP/RDP observation stream retained for independent
+    /// report reconstruction and coverage derivation.
+    pub rsp_rdp: RspRdpEvidence,
+    /// Exact canonical closure ledger retained from the verified v16 series.
     /// A count alone cannot prove which feature-specific operation paths ran.
     pub closure: Vec<ClosurePath>,
     pub unsupported_events: u64,
@@ -504,6 +552,7 @@ impl VerifiedReleaseMatrix {
                 observations: scenario.observations.clone(),
                 environment: scenario.environment.clone(),
                 execution_destinations: scenario.execution_destinations.clone(),
+                rsp_rdp: scenario.rsp_rdp.clone(),
                 closure: scenario.closure.clone(),
                 report_sha256: scenario.report_sha256.clone(),
             };
@@ -675,6 +724,7 @@ pub fn verify_release_matrix(
             observations: reports[0].observations.clone(),
             environment: reports[0].environment.clone(),
             execution_destinations: reports[0].execution_destinations.clone(),
+            rsp_rdp: reports[0].rsp_rdp.clone(),
             closure_paths: reports[0].closure.len() as u64,
             closure: reports[0].closure.clone(),
             unsupported_events: reports[0]
@@ -772,6 +822,22 @@ fn derive_profile_assignments(
                 &scenario.declaration_sha256,
             );
         }
+        for microcode in &scenario.coverage.microcodes {
+            insert_requirement_evidence(
+                &mut evidence,
+                CertificationRequirementClass::PublicMicrocode,
+                microcode_feature_id(*microcode).to_owned(),
+                &scenario.declaration_sha256,
+            );
+        }
+        for mechanism in &scenario.coverage.rsp_rdp_mechanisms {
+            insert_requirement_evidence(
+                &mut evidence,
+                CertificationRequirementClass::RspRdpMechanism,
+                rsp_rdp_mechanism_feature_id(*mechanism).to_owned(),
+                &scenario.declaration_sha256,
+            );
+        }
     }
 
     let mut assignments = Vec::new();
@@ -830,6 +896,31 @@ const fn controller_feature_id(value: ControllerFeature) -> &'static str {
     }
 }
 
+const fn microcode_feature_id(value: MicrocodeFeature) -> &'static str {
+    match value {
+        MicrocodeFeature::Fast3d => "fast3d",
+        MicrocodeFeature::F3dex => "f3dex",
+        MicrocodeFeature::F3dlx => "f3dlx",
+        MicrocodeFeature::F3dlxRej => "f3dlx-rej",
+        MicrocodeFeature::F3dex2 => "f3dex2",
+        MicrocodeFeature::F3dex2NoN => "f3dex2-non",
+        MicrocodeFeature::F3dex2Rej => "f3dex2-rej",
+        MicrocodeFeature::F3dlx2Rej => "f3dlx2-rej",
+        MicrocodeFeature::S2dex => "s2dex",
+        MicrocodeFeature::S2dex2 => "s2dex2",
+        MicrocodeFeature::L3dex => "l3dex",
+        MicrocodeFeature::L3dex2 => "l3dex2",
+    }
+}
+
+const fn rsp_rdp_mechanism_feature_id(value: RspRdpMechanismFeature) -> &'static str {
+    match value {
+        RspRdpMechanismFeature::DramDpc => "dram-dpc",
+        RspRdpMechanismFeature::XbusDpc => "xbus-dpc",
+        RspRdpMechanismFeature::ImemReplacement => "imem-replacement",
+    }
+}
+
 fn presentation_boundary(
     observations: &ReleaseObservationGeometry,
 ) -> PresentationBoundaryEvidence {
@@ -846,6 +937,14 @@ fn presentation_boundary(
 fn derive_scenario_coverage(
     id: &str,
     report: &ReleaseGateReport,
+) -> Result<ReleaseMatrixCoverage, ReleaseMatrixError> {
+    derive_scenario_coverage_with_catalog(id, report, CERTIFIED_PUBLIC_MICROCODE_CATALOG_V1)
+}
+
+fn derive_scenario_coverage_with_catalog(
+    id: &str,
+    report: &ReleaseGateReport,
+    certified_microcodes: &[CertifiedMicrocodeIdentity],
 ) -> Result<ReleaseMatrixCoverage, ReleaseMatrixError> {
     let program = match &report.execution_destinations.source {
         crate::ExecutionDestinationSource::NoProgram => {
@@ -941,16 +1040,94 @@ fn derive_scenario_coverage(
         ReleaseCartridgeSave::Sram32Kib => SaveFeature::Sram32Kib,
         ReleaseCartridgeSave::FlashRam128Kib => SaveFeature::FlashRam128Kib,
     }];
+    let mut microcodes = BTreeSet::new();
+    let mut rsp_rdp_mechanisms = BTreeSet::new();
+    for event in &report.rsp_rdp.ordered {
+        match &event.observation {
+            RspRdpObservationKindEvidence::MicrocodeRecognition {
+                text_sha256,
+                family,
+                ..
+            } => {
+                if let Some(feature) =
+                    certified_microcode_feature(id, text_sha256, *family, certified_microcodes)?
+                {
+                    microcodes.insert(feature);
+                }
+            }
+            RspRdpObservationKindEvidence::DramDpcCommitted { .. } => {
+                rsp_rdp_mechanisms.insert(RspRdpMechanismFeature::DramDpc);
+            }
+            RspRdpObservationKindEvidence::XbusDpcCommitted { .. } => {
+                rsp_rdp_mechanisms.insert(RspRdpMechanismFeature::XbusDpc);
+            }
+            RspRdpObservationKindEvidence::ImemReplacementCommitted { .. } => {
+                rsp_rdp_mechanisms.insert(RspRdpMechanismFeature::ImemReplacement);
+            }
+        }
+    }
     let coverage = ReleaseMatrixCoverage {
         platforms,
         controllers: observed_controllers.into_iter().collect(),
         saves,
         renderers,
         programs: vec![program],
+        microcodes: microcodes.into_iter().collect(),
+        rsp_rdp_mechanisms: rsp_rdp_mechanisms.into_iter().collect(),
     };
     validate_coverage(id, &coverage, None)?;
     validate_coverage_cardinality(id, &coverage)?;
     Ok(coverage)
+}
+
+fn certified_microcode_feature(
+    id: &str,
+    text_sha256: &str,
+    observed_family: Option<ReleaseMicrocodeFamily>,
+    catalog: &[CertifiedMicrocodeIdentity],
+) -> Result<Option<MicrocodeFeature>, ReleaseMatrixError> {
+    let digest =
+        crate::release_gate::decode_sha256(text_sha256).expect("validated release report SHA-256");
+    let mut matches = catalog
+        .iter()
+        .filter(|identity| identity.text_sha256 == digest);
+    let Some(certified) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(ReleaseMatrixError::DuplicateCertifiedMicrocodeIdentity {
+            text_sha256: text_sha256.to_owned(),
+        });
+    }
+    if let Some(observed) = observed_family {
+        if observed != certified.family {
+            return Err(ReleaseMatrixError::CertifiedMicrocodeFamilyMismatch {
+                id: id.to_owned(),
+                text_sha256: text_sha256.to_owned(),
+                certified: certified.family,
+                observed,
+            });
+        }
+    }
+    Ok(microcode_feature(certified.family))
+}
+
+const fn microcode_feature(family: ReleaseMicrocodeFamily) -> Option<MicrocodeFeature> {
+    match family {
+        ReleaseMicrocodeFamily::Fast3d => Some(MicrocodeFeature::Fast3d),
+        ReleaseMicrocodeFamily::F3dex => Some(MicrocodeFeature::F3dex),
+        ReleaseMicrocodeFamily::F3dlx => Some(MicrocodeFeature::F3dlx),
+        ReleaseMicrocodeFamily::F3dlxRej => Some(MicrocodeFeature::F3dlxRej),
+        ReleaseMicrocodeFamily::F3dex2 => Some(MicrocodeFeature::F3dex2),
+        ReleaseMicrocodeFamily::F3dex2NoN => Some(MicrocodeFeature::F3dex2NoN),
+        ReleaseMicrocodeFamily::F3dex2Rej => Some(MicrocodeFeature::F3dex2Rej),
+        ReleaseMicrocodeFamily::F3dlx2Rej => Some(MicrocodeFeature::F3dlx2Rej),
+        ReleaseMicrocodeFamily::S2dex => Some(MicrocodeFeature::S2dex),
+        ReleaseMicrocodeFamily::S2dex2 => Some(MicrocodeFeature::S2dex2),
+        ReleaseMicrocodeFamily::L3dex => Some(MicrocodeFeature::L3dex),
+        ReleaseMicrocodeFamily::L3dex2 => Some(MicrocodeFeature::L3dex2),
+        ReleaseMicrocodeFamily::F3dzex2 | ReleaseMicrocodeFamily::Other { .. } => None,
+    }
 }
 
 fn validate_retained_closure(id: &str, closure: &[ClosurePath]) -> Result<(), ReleaseMatrixError> {
@@ -1242,6 +1419,26 @@ fn validate_coverage(
         &coverage.programs,
         required.map(|r| r.programs.as_slice()),
     )?;
+    validate_optional_dimension(scope, "microcodes", &coverage.microcodes)?;
+    validate_optional_dimension(scope, "rsp_rdp_mechanisms", &coverage.rsp_rdp_mechanisms)?;
+    Ok(())
+}
+
+fn validate_optional_dimension<T: Copy + fmt::Debug + Ord>(
+    scope: &str,
+    dimension: &'static str,
+    values: &[T],
+) -> Result<(), ReleaseMatrixError> {
+    let mut unique = BTreeSet::new();
+    for value in values {
+        if !unique.insert(*value) {
+            return Err(ReleaseMatrixError::DuplicateCoverage {
+                scope: scope.to_owned(),
+                dimension,
+                value: format!("{value:?}"),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1330,6 +1527,35 @@ impl ProgramFeature {
             Self::NativeArchive => 0,
             Self::TypedObservedFunction => 1,
             Self::TypedBlock => 2,
+        }
+    }
+}
+
+impl MicrocodeFeature {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Fast3d => 0,
+            Self::F3dex => 1,
+            Self::F3dlx => 2,
+            Self::F3dlxRej => 3,
+            Self::F3dex2 => 4,
+            Self::F3dex2NoN => 5,
+            Self::F3dex2Rej => 6,
+            Self::F3dlx2Rej => 7,
+            Self::S2dex => 8,
+            Self::S2dex2 => 9,
+            Self::L3dex => 10,
+            Self::L3dex2 => 11,
+        }
+    }
+}
+
+impl RspRdpMechanismFeature {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::DramDpc => 0,
+            Self::XbusDpc => 1,
+            Self::ImemReplacement => 2,
         }
     }
 }
@@ -1456,7 +1682,7 @@ fn push_assignment(wire: &mut Vec<u8>, assignment: &CertificationRequirementAssi
 
 fn incomplete_matrix_sha256(report: &IncompleteReleaseMatrix) -> String {
     let mut wire = Vec::new();
-    wire.extend_from_slice(b"fn64.release-matrix-incomplete.v1\0");
+    wire.extend_from_slice(b"fn64.release-matrix-incomplete.v2\0");
     push_bytes(&mut wire, report.schema.as_bytes());
     push_bytes(&mut wire, report.manifest_sha256.as_bytes());
     push_bytes(&mut wire, report.profile.schema.as_bytes());
@@ -1477,7 +1703,7 @@ fn incomplete_matrix_sha256(report: &IncompleteReleaseMatrix) -> String {
 
 fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
     let mut wire = Vec::new();
-    wire.extend_from_slice(b"fn64.verified-release-matrix.v12\0");
+    wire.extend_from_slice(b"fn64.verified-release-matrix.v13\0");
     push_bytes(&mut wire, report.schema.as_bytes());
     push_bytes(&mut wire, report.manifest_sha256.as_bytes());
     push_bytes(&mut wire, report.profile.schema.as_bytes());
@@ -1510,6 +1736,16 @@ fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
             RendererFeature::tag,
         );
         push_tags(&mut wire, &scenario.coverage.programs, ProgramFeature::tag);
+        push_tags(
+            &mut wire,
+            &scenario.coverage.microcodes,
+            MicrocodeFeature::tag,
+        );
+        push_tags(
+            &mut wire,
+            &scenario.coverage.rsp_rdp_mechanisms,
+            RspRdpMechanismFeature::tag,
+        );
         push_bytes(&mut wire, scenario.declaration_sha256.as_bytes());
         wire.extend_from_slice(&scenario.guest_cycle.to_be_bytes());
         wire.extend_from_slice(&scenario.fixed_cycle_digest.guest_cycle.to_be_bytes());
@@ -1541,6 +1777,13 @@ fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
             )
             .expect("verified destination evidence was validated before hashing"),
         );
+        push_bytes(
+            &mut wire,
+            &crate::release_gate::encode_rsp_rdp_observations(&scenario.rsp_rdp.ordered)
+                .expect("verified RSP/RDP evidence was validated before hashing"),
+        );
+        wire.extend_from_slice(&scenario.rsp_rdp.total_observations.to_be_bytes());
+        push_bytes(&mut wire, scenario.rsp_rdp.ordered_sha256.as_bytes());
         wire.extend_from_slice(&scenario.closure_paths.to_be_bytes());
         wire.extend_from_slice(&(scenario.closure.len() as u64).to_be_bytes());
         for path in &scenario.closure {
@@ -1875,6 +2118,15 @@ pub enum ReleaseMatrixError {
         id: String,
         backend_identity: String,
     },
+    DuplicateCertifiedMicrocodeIdentity {
+        text_sha256: String,
+    },
+    CertifiedMicrocodeFamilyMismatch {
+        id: String,
+        text_sha256: String,
+        certified: ReleaseMicrocodeFamily,
+        observed: ReleaseMicrocodeFamily,
+    },
     MissingEvidence {
         id: String,
     },
@@ -1983,6 +2235,8 @@ impl fmt::Display for ReleaseMatrixError {
             Self::ProgramCoverageMismatch { id, expected, observed } => write!(f, "release-matrix scenario {id:?} declares program lane {expected:?}, but its execution destinations prove {observed:?}"),
             Self::EnvironmentCoverageMismatch { id, dimension, declared, observed } => write!(f, "release-matrix scenario {id:?} declares {dimension} {declared:?}, but its committed-boundary environment observed {observed:?}"),
             Self::NonAuthoritativeRt64Identity { id, backend_identity } => write!(f, "release-matrix scenario {id:?} has non-authoritative RT64 backend identity {backend_identity:?}"),
+            Self::DuplicateCertifiedMicrocodeIdentity { text_sha256 } => write!(f, "project-owned certified-microcode catalog repeats digest {text_sha256}"),
+            Self::CertifiedMicrocodeFamilyMismatch { id, text_sha256, certified, observed } => write!(f, "release-matrix scenario {id:?} reports microcode digest {text_sha256} as {observed:?}, but the project-owned catalog adjudicates it as {certified:?}"),
             Self::MissingEvidence { id } => write!(f, "release-matrix scenario {id:?} has no report evidence"),
             Self::UnexpectedEvidence { id } => write!(f, "report evidence names undeclared release-matrix scenario {id:?}"),
             Self::WrongReportCount { id, expected, actual } => write!(f, "release-matrix scenario {id:?} has {actual} reports; exactly {expected} are required"),
@@ -2018,7 +2272,7 @@ mod tests {
     use super::*;
     use crate::{
         ArtifactKind, ClosurePath, ClosurePathStatus, FixedCycleDigestGate, LiveRenderEvidence,
-        RenderPixelFormat, LIVE_MINIMUM_CLOSURE_PATHS,
+        RenderPixelFormat, RspRdpObservationEventEvidence, LIVE_MINIMUM_CLOSURE_PATHS,
     };
 
     const CLEAN_RT64_IDENTITY: &str = concat!(
@@ -2215,6 +2469,18 @@ mod tests {
             closure,
         )
         .unwrap()
+    }
+
+    fn with_rsp_rdp_observations(
+        mut report: ReleaseGateReport,
+        ordered: Vec<RspRdpObservationEventEvidence>,
+    ) -> ReleaseGateReport {
+        report.rsp_rdp = RspRdpEvidence::from_ordered(ordered).unwrap();
+        report.report_sha256 = hex(&Sha256::digest(
+            crate::release_gate::encode_report_evidence(&report).unwrap(),
+        ));
+        report.verify_integrity().unwrap();
+        report
     }
 
     fn scenario(id: &str, report: &ReleaseGateReport) -> ReleaseMatrixScenario {
@@ -2803,6 +3069,8 @@ mod tests {
                 saves: vec![SaveFeature::Eeprom4Kbit],
                 renderers: vec![RendererFeature::ReferenceLleAccuracy],
                 programs: vec![ProgramFeature::TypedObservedFunction],
+                microcodes: Vec::new(),
+                rsp_rdp_mechanisms: Vec::new(),
             }
         );
         assert_eq!(
@@ -2819,6 +3087,8 @@ mod tests {
                     RendererFeature::Rt64PostViCapture,
                 ],
                 programs: vec![ProgramFeature::TypedObservedFunction],
+                microcodes: Vec::new(),
+                rsp_rdp_mechanisms: Vec::new(),
             }
         );
 
@@ -2851,6 +3121,179 @@ mod tests {
         ] {
             assert!(assigned.contains(&(key.0, key.1.to_owned())), "{key:?}");
         }
+    }
+
+    #[test]
+    fn microcode_credit_requires_project_catalog_and_rsp_rdp_uses_report_events() {
+        let public_families = [
+            ReleaseMicrocodeFamily::Fast3d,
+            ReleaseMicrocodeFamily::F3dex,
+            ReleaseMicrocodeFamily::F3dlx,
+            ReleaseMicrocodeFamily::F3dlxRej,
+            ReleaseMicrocodeFamily::F3dex2,
+            ReleaseMicrocodeFamily::F3dex2NoN,
+            ReleaseMicrocodeFamily::F3dex2Rej,
+            ReleaseMicrocodeFamily::F3dlx2Rej,
+            ReleaseMicrocodeFamily::S2dex,
+            ReleaseMicrocodeFamily::S2dex2,
+            ReleaseMicrocodeFamily::L3dex,
+            ReleaseMicrocodeFamily::L3dex2,
+        ];
+        let certified_digest_families = public_families
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, family)| ([u8::try_from(index + 1).unwrap(); 32], family))
+            .collect::<Vec<_>>();
+        let certified_catalog = certified_digest_families
+            .iter()
+            .map(|(text_sha256, family)| CertifiedMicrocodeIdentity {
+                text_sha256: *text_sha256,
+                family: *family,
+            })
+            .collect::<Vec<_>>();
+        let mut ordered = certified_digest_families
+            .iter()
+            .enumerate()
+            .map(
+                |(index, (text_sha256, family))| RspRdpObservationEventEvidence {
+                    guest_cycle: 50,
+                    observation: RspRdpObservationKindEvidence::MicrocodeRecognition {
+                        task_address: 0x1000 + index as u32 * 0x40,
+                        imem_generation: index as u64 + 1,
+                        text_sha256: hex(text_sha256),
+                        family: Some(*family),
+                    },
+                },
+            )
+            .collect::<Vec<_>>();
+        for family in [
+            ReleaseMicrocodeFamily::F3dzex2,
+            ReleaseMicrocodeFamily::Other { id: 7 },
+        ] {
+            ordered.push(RspRdpObservationEventEvidence {
+                guest_cycle: 51,
+                observation: RspRdpObservationKindEvidence::MicrocodeRecognition {
+                    task_address: 0x2000,
+                    imem_generation: 20,
+                    text_sha256: "ee".repeat(32),
+                    family: Some(family),
+                },
+            });
+        }
+        ordered.push(RspRdpObservationEventEvidence {
+            guest_cycle: 52,
+            observation: RspRdpObservationKindEvidence::MicrocodeRecognition {
+                task_address: 0x2040,
+                imem_generation: 21,
+                text_sha256: "ef".repeat(32),
+                family: None,
+            },
+        });
+        ordered.extend([
+            RspRdpObservationEventEvidence {
+                guest_cycle: 53,
+                observation: RspRdpObservationKindEvidence::DramDpcCommitted {
+                    start: 0x100,
+                    end: 0x108,
+                    command_sha256: "f1".repeat(32),
+                },
+            },
+            RspRdpObservationEventEvidence {
+                guest_cycle: 54,
+                observation: RspRdpObservationKindEvidence::XbusDpcCommitted {
+                    start: 0,
+                    end: 8,
+                    command_sha256: "f2".repeat(32),
+                },
+            },
+            RspRdpObservationEventEvidence {
+                guest_cycle: 55,
+                observation: RspRdpObservationKindEvidence::ImemReplacementCommitted {
+                    task_address: 0x3000,
+                    imem_generation: 22,
+                    text_sha256: "f3".repeat(32),
+                },
+            },
+        ]);
+        let report = with_rsp_rdp_observations(
+            closed_report(
+                "microcode-reference",
+                b"private-microcode",
+                0xc3,
+                "save.eeprom-4k-operation",
+                CLEAN_RT64_IDENTITY,
+                Some(ProgramFeature::TypedObservedFunction),
+            ),
+            ordered,
+        );
+        let certified_coverage = derive_scenario_coverage_with_catalog(
+            "microcode-evidence",
+            &report,
+            &certified_catalog,
+        )
+        .unwrap();
+        assert_eq!(certified_coverage.microcodes.len(), 12);
+        assert_eq!(
+            certified_coverage.rsp_rdp_mechanisms,
+            vec![
+                RspRdpMechanismFeature::DramDpc,
+                RspRdpMechanismFeature::XbusDpc,
+                RspRdpMechanismFeature::ImemReplacement,
+            ]
+        );
+
+        let production_coverage = derive_scenario_coverage("microcode-evidence", &report).unwrap();
+        assert!(production_coverage.microcodes.is_empty());
+        assert_eq!(
+            production_coverage.rsp_rdp_mechanisms,
+            certified_coverage.rsp_rdp_mechanisms
+        );
+
+        let mut mislabeled = report.clone();
+        let RspRdpObservationKindEvidence::MicrocodeRecognition { family, .. } =
+            &mut mislabeled.rsp_rdp.ordered[0].observation
+        else {
+            panic!("first fixture event must be microcode recognition");
+        };
+        *family = Some(ReleaseMicrocodeFamily::F3dex);
+        assert!(matches!(
+            derive_scenario_coverage_with_catalog(
+                "microcode-evidence",
+                &mislabeled,
+                &certified_catalog
+            ),
+            Err(ReleaseMatrixError::CertifiedMicrocodeFamilyMismatch {
+                certified: ReleaseMicrocodeFamily::Fast3d,
+                observed: ReleaseMicrocodeFamily::F3dex,
+                ..
+            })
+        ));
+
+        let manifest = ReleaseMatrixManifest {
+            schema: RELEASE_MATRIX_SCHEMA.to_owned(),
+            profile: CertificationProfileIdentity::full_parity_v1(),
+            scenarios: vec![scenario("microcode-evidence", &report)],
+        };
+        let ReleaseMatrixVerification::Incomplete(incomplete) =
+            verify_release_matrix(&manifest, &evidence_series(report)).unwrap()
+        else {
+            panic!("platform and full-ROM requirements remain intentionally absent");
+        };
+        for (class, id) in [
+            (CertificationRequirementClass::RspRdpMechanism, "dram-dpc"),
+            (
+                CertificationRequirementClass::RspRdpMechanism,
+                "imem-replacement",
+            ),
+        ] {
+            assert!(incomplete.satisfied.iter().any(|assignment| {
+                assignment.requirement.class() == class && assignment.requirement.id() == id
+            }));
+        }
+        assert!(!incomplete.satisfied.iter().any(|assignment| {
+            assignment.requirement.class() == CertificationRequirementClass::PublicMicrocode
+        }));
     }
 
     #[test]

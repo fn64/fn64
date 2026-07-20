@@ -253,6 +253,14 @@ impl GeometryUcodeCatalog {
         self.digests.get(&digest).copied()
     }
 
+    pub(crate) fn identify_text(
+        &self,
+        text: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    ) -> Option<UcodeId> {
+        self.family(UcodeDigest::from_text(text))
+            .map(GeometryWireFamily::ucode_id)
+    }
+
     pub fn supported_ucodes(&self) -> &[UcodeId] {
         &self.supported
     }

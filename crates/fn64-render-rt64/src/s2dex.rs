@@ -152,6 +152,16 @@ impl UcodeCatalog {
             })
     }
 
+    pub(crate) fn identify_text(
+        &self,
+        text: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    ) -> Option<UcodeId> {
+        self.digests
+            .get(&UcodeDigest::from_text(text))
+            .copied()
+            .map(S2dexWireFamily::ucode_id)
+    }
+
     pub fn supported_ucodes(&self) -> &'static [UcodeId] {
         let s2dex = self
             .digests

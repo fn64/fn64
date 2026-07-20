@@ -102,6 +102,7 @@ pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
         host.pending_pi_completions.clear();
         host.save_operations.clear();
         host.controller_operations.clear();
+        host.rsp_rdp_observations.clear();
         host.native_execution_destinations.clear();
     });
 }
@@ -1686,6 +1687,21 @@ pub unsafe extern "C" fn osLeoDiskInit_recomp(rdram: *mut u8, ctx: *mut RecompCo
 mod tests {
     use super::*;
     use crate::test_support::*;
+
+    #[test]
+    fn loading_a_rom_clears_prior_rsp_rdp_observations() {
+        load_rom(vec![0]);
+        crate::record_rsp_rdp_observations(vec![crate::RspRdpObservationKind::DramDpcCommitted {
+            start: 0,
+            end: 8,
+            command_sha256: [0x5a; 32],
+        }]);
+        assert_eq!(crate::copy_rsp_rdp_observations().len(), 1);
+
+        load_rom(vec![1]);
+
+        assert!(crate::copy_rsp_rdp_observations().is_empty());
+    }
 
     #[test]
     fn synchronous_pi_boundaries_preserve_same_cycle_cross_owner_save_order() {

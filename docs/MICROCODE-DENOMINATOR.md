@@ -12,6 +12,24 @@ F3DEX2.NoN, F3DEX2.Rej, F3DLX2.Rej, L3DEX, and L3DEX2. Opcode bytes do not
 select among those families. F3DZEX2 remains named but unadmitted because the
 allowed public sources do not specify its continuation and branch wire.
 
+Release recognition is exact but diagnostic/optimization evidence only. For
+every graphics LLE generation, the ABI independently hashes the complete live
+4 KiB IMEM image; the registered backend may attach a family from its runtime
+catalog, but cannot choose the digest or replace LLE execution. Report schema
+v16 binds those recognition events in order with committed IMEM replacements
+and DRAM/XBUS DPC command digests. It rejects decreasing event cycles,
+decreasing global IMEM generations, a replacement that does not strictly
+advance the generation, or different digests assigned to one generation.
+
+Matrix v5 does not trust the backend's family label for public-microcode
+credit. It independently adjudicates each reported text digest through the
+immutable, project-owned certified-public-microcode catalog v1, and rejects a
+backend label that contradicts that adjudication. Catalog v1 is currently
+empty pending allowed-source digest provenance, so no v13 matrix can yet
+satisfy any of the twelve public-microcode requirements. Unknown digests,
+F3DZEX2, and declared readiness families likewise receive no denominator
+credit.
+
 The public command-class denominator for the admitted polygon and line
 families is represented. Remaining gaps are behavioral precision rather than
 unknown ordinary opcode classes: exact transform/clipping/line-edge

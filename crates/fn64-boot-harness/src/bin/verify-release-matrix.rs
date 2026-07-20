@@ -235,6 +235,7 @@ mod tests {
             "fn64.verified-release-matrix.v9",
             "fn64.verified-release-matrix.v10",
             "fn64.verified-release-matrix.v11",
+            "fn64.verified-release-matrix.v12",
         ] {
             let error =
                 verify_retained_json(&empty_retained(schema, &"00".repeat(32))).unwrap_err();

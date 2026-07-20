@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 
 /// The `OOT_*` spellings these knobs shipped under before they were renamed to
 /// the game-agnostic `FN64_*` prefix. Nothing about dumping PCM or skipping
@@ -456,6 +457,49 @@ struct HleBootResult {
     machine_state: fn64_audio::rsp::runtime::RspMachineState,
 }
 
+#[derive(Clone, Debug)]
+struct PendingImemReplacement {
+    generation: u64,
+    image: [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+}
+
+fn imem_sha256(imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE]) -> [u8; 32] {
+    Sha256::digest(imem).into()
+}
+
+fn identify_microcode(
+    imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+) -> Option<fn64_render::UcodeId> {
+    with_render_backend("identify_microcode", |backend| {
+        Ok(backend.identify_microcode(imem))
+    })
+}
+
+fn canonical_rdp_words_sha256(words: &[u32]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for word in words {
+        digest.update(word.to_be_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn dpc_observation(xbus: bool, start: u32, end: u32, words: &[u32]) -> RspRdpObservationKind {
+    let command_sha256 = canonical_rdp_words_sha256(words);
+    if xbus {
+        RspRdpObservationKind::XbusDpcCommitted {
+            start,
+            end,
+            command_sha256,
+        }
+    } else {
+        RspRdpObservationKind::DramDpcCommitted {
+            start,
+            end,
+            command_sha256,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdmittedTaskImageShape {
     BootOverlay,
@@ -697,26 +741,31 @@ fn commit_rsp_memory_state(
 /// This is the universal clean-room path for custom/unknown task types.
 unsafe fn dispatch_lle_task(
     rdram: *mut u8,
+    task_addr: RdramAddr,
+    recognize_graphics_microcode: bool,
     machine_state: Option<fn64_audio::rsp::runtime::RspMachineState>,
 ) -> LleTaskResult {
     const CHUNK_STEPS: u64 = 1 << 20;
     const MAX_TASK_STEPS: u64 = 1 << 26;
 
-    let (mut dmem, mut imem, status, mut pc, rdram_len, static_aliases) = with_host(|host| {
-        let fabric = &host.device_fabric;
-        (
-            *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Dmem),
-            *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Imem),
-            fabric.sp_status(),
-            fabric.sp_pc(),
-            host.runtime_rdram_len,
-            host.sections.loaded_static_storage_ranges(),
-        )
-    });
+    let (mut dmem, mut imem, status, mut pc, imem_generation, rdram_len, static_aliases) =
+        with_host(|host| {
+            let fabric = &host.device_fabric;
+            (
+                *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Dmem),
+                *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Imem),
+                fabric.sp_status(),
+                fabric.sp_pc(),
+                fabric.rsp_memory().imem_generation(),
+                host.runtime_rdram_len,
+                host.sections.loaded_static_storage_ranges(),
+            )
+        });
     assert!(
         !rdram.is_null() && rdram_len != 0,
         "RSP LLE task has no registered process RDRAM allocation"
     );
+    let initial_imem = imem;
     unsafe { trace_rsp_rdram_words(rdram, rdram_len) };
     let (dma_ranges, snapshot_len) = rsp_dma_storage_layout(rdram_len, static_aliases);
     let mut rdram_image = vec![0u8; snapshot_len];
@@ -735,6 +784,7 @@ unsafe fn dispatch_lle_task(
     }
     let mut total_steps = 0u64;
     let mut overlays = 0u64;
+    let mut replacements = Vec::new();
     trace_rsp_dmem_words(&machine.dmem_logical(), overlays, pc);
     loop {
         let words: Vec<u32> = imem
@@ -758,6 +808,12 @@ unsafe fn dispatch_lle_task(
                 overlays = overlays
                     .checked_add(1)
                     .expect("RSP IMEM overlay generation counter overflow");
+                replacements.push(PendingImemReplacement {
+                    generation: imem_generation
+                        .checked_add(overlays)
+                        .expect("RSP IMEM generation evidence overflow"),
+                    image: imem,
+                });
                 trace_rsp_dmem_words(&machine.dmem_logical(), overlays, pc);
             }
             fn64_audio::rsp::RspExitReason::StepLimit => {}
@@ -775,8 +831,17 @@ unsafe fn dispatch_lle_task(
 
     unsafe { commit_rsp_rdram_image(rdram, &rdram_image) };
     commit_rsp_memory_state(&dmem, &imem, overlays, pc, final_status);
+    let committed_generation = with_host(|host| host.device_fabric.rsp_memory().imem_generation());
+    assert_eq!(
+        committed_generation,
+        imem_generation
+            .checked_add(overlays)
+            .expect("RSP IMEM generation evidence overflow"),
+        "RSP transactional IMEM replacement count diverged from the committed fabric generation"
+    );
 
     let mut dp_full_sync = fn64_render::DpFullSyncStatus::NotReached;
+    let mut dpc_observations = Vec::with_capacity(dp_submissions.len());
     for submission in &dp_submissions {
         if let Some(limit) = std::env::var("RSP_TRACE_DPC_WORDS").ok().map(|raw| {
             raw.parse::<usize>().unwrap_or_else(|_| {
@@ -801,12 +866,47 @@ unsafe fn dispatch_lle_task(
             submission.start,
             submission.end
         );
-        if unsafe { dispatch_captured_raw_rdp(rdram, &submission.words) }
-            == fn64_render::DpFullSyncStatus::Reached
-        {
+        let (full_sync, observation) = unsafe {
+            dispatch_captured_raw_rdp(
+                rdram,
+                &submission.words,
+                submission.start,
+                submission.end,
+                submission.xbus,
+            )
+        };
+        dpc_observations.push(observation);
+        if full_sync == fn64_render::DpFullSyncStatus::Reached {
             dp_full_sync = fn64_render::DpFullSyncStatus::Reached;
         }
     }
+
+    let mut observations = Vec::new();
+    if recognize_graphics_microcode {
+        observations.push(RspRdpObservationKind::MicrocodeRecognition {
+            task_addr,
+            imem_generation,
+            text_sha256: imem_sha256(&initial_imem),
+            family: identify_microcode(&initial_imem),
+        });
+    }
+    for replacement in replacements {
+        observations.push(RspRdpObservationKind::ImemReplacementCommitted {
+            task_addr,
+            imem_generation: replacement.generation,
+            text_sha256: imem_sha256(&replacement.image),
+        });
+        if recognize_graphics_microcode {
+            observations.push(RspRdpObservationKind::MicrocodeRecognition {
+                task_addr,
+                imem_generation: replacement.generation,
+                text_sha256: imem_sha256(&replacement.image),
+                family: identify_microcode(&replacement.image),
+            });
+        }
+    }
+    observations.extend(dpc_observations);
+    record_rsp_rdp_observations(observations);
 
     LleTaskResult {
         steps: total_steps.max(1),
@@ -823,21 +923,23 @@ unsafe fn dispatch_lle_task(
 /// starts that ucode. HLE backends consume the public `OSTask` contract, while
 /// a transactional LLE fallback receives the complete non-memory machine
 /// snapshot alongside the committed memory image.
-unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
+unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) -> HleBootResult {
     const BOOT_CHUNK_STEPS: u64 = 1 << 12;
     const MAX_BOOT_STEPS: u64 = 1 << 20;
 
-    let (mut dmem, mut imem, status, mut pc, rdram_len, static_aliases) = with_host(|host| {
-        let fabric = &host.device_fabric;
-        (
-            *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Dmem),
-            *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Imem),
-            fabric.sp_status(),
-            fabric.sp_pc(),
-            host.runtime_rdram_len,
-            host.sections.loaded_static_storage_ranges(),
-        )
-    });
+    let (mut dmem, mut imem, status, mut pc, imem_generation, rdram_len, static_aliases) =
+        with_host(|host| {
+            let fabric = &host.device_fabric;
+            (
+                *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Dmem),
+                *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Imem),
+                fabric.sp_status(),
+                fabric.sp_pc(),
+                fabric.rsp_memory().imem_generation(),
+                host.runtime_rdram_len,
+                host.sections.loaded_static_storage_ranges(),
+            )
+        });
     assert!(
         !rdram.is_null() && rdram_len != 0,
         "RSP HLE rspboot has no registered process RDRAM allocation"
@@ -857,6 +959,7 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
     let mut total_steps = 0u64;
     let mut overlays = 0u64;
     let mut loaded_spans = Vec::new();
+    let mut replacements = Vec::new();
 
     loop {
         let execution_pc = if machine.ctx.resume_address != 0 {
@@ -906,6 +1009,12 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
                 overlays = overlays
                     .checked_add(1)
                     .expect("RSP rspboot IMEM generation counter overflow");
+                replacements.push(PendingImemReplacement {
+                    generation: imem_generation
+                        .checked_add(overlays)
+                        .expect("RSP rspboot IMEM generation evidence overflow"),
+                    image: imem,
+                });
             }
             fn64_audio::rsp::RspExitReason::StepLimit => {}
             fn64_audio::rsp::RspExitReason::Broke => panic!(
@@ -940,6 +1049,26 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
 
     unsafe { commit_rsp_rdram_image(rdram, &rdram_image) };
     commit_rsp_memory_state(&dmem, &imem, overlays, pc, final_status);
+    let committed_generation = with_host(|host| host.device_fabric.rsp_memory().imem_generation());
+    assert_eq!(
+        committed_generation,
+        imem_generation
+            .checked_add(overlays)
+            .expect("RSP rspboot IMEM generation evidence overflow"),
+        "RSP rspboot IMEM replacement count diverged from the committed fabric generation"
+    );
+    record_rsp_rdp_observations(
+        replacements
+            .into_iter()
+            .map(
+                |replacement| RspRdpObservationKind::ImemReplacementCommitted {
+                    task_addr,
+                    imem_generation: replacement.generation,
+                    text_sha256: imem_sha256(&replacement.image),
+                },
+            )
+            .collect(),
+    );
     HleBootResult {
         steps: total_steps.max(1),
         task,
@@ -951,6 +1080,24 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
 /// renderer. DPC state is committed by the caller before this runs; missing
 /// backends and backend failures trap rather than completing nonexistent work.
 pub(crate) unsafe fn dispatch_raw_rdp(rdram: *mut u8, start: u32, end: u32) {
+    let words = {
+        let rdram_slice = unsafe { renderer_rdram_slice(rdram) };
+        let start_usize = start as usize;
+        let end_usize = end as usize;
+        assert!(
+            start_usize < end_usize && start_usize.is_multiple_of(8) && end_usize.is_multiple_of(8),
+            "DRAM DPC range [{start:#010x}, {end:#010x}) must be nonempty and 8-byte aligned"
+        );
+        assert!(
+            end_usize <= rdram_slice.len(),
+            "DRAM DPC range end {end:#010x} exceeds registered RDRAM length {:#x}",
+            rdram_slice.len()
+        );
+        rdram_slice[start_usize..end_usize]
+            .chunks_exact(4)
+            .map(|word| u32::from_ne_bytes(word.try_into().expect("four RDRAM bytes")))
+            .collect::<Vec<_>>()
+    };
     let result = with_render_backend("dispatch_raw_rdp", |backend| {
         let rdram_slice = unsafe { renderer_rdram_slice(rdram) };
         let status = backend.process_rdp_commands(rdram_slice, start, end, render_output_addr())?;
@@ -959,7 +1106,12 @@ pub(crate) unsafe fn dispatch_raw_rdp(rdram: *mut u8, start: u32, end: u32) {
             dp_full_sync: backend.last_dp_full_sync(),
         })
     });
-    schedule_raw_dp_full_sync(result, "dispatch_raw_rdp");
+    let full_sync = require_committed_full_sync_evidence(result, "dispatch_raw_rdp");
+    record_rsp_rdp_observations(vec![dpc_observation(false, start, end, &words)]);
+    if full_sync == fn64_render::DpFullSyncStatus::Reached {
+        crate::pi::start_live_dp_full_sync()
+            .unwrap_or_else(|error| panic!("dispatch_raw_rdp: DP FullSync completion: {error}"));
+    }
 }
 
 /// Submit an XBUS DPC range whose command bytes live in persistent RSP DMEM.
@@ -973,22 +1125,26 @@ unsafe fn dispatch_raw_rdp_xbus(
     start: u32,
     end: u32,
 ) {
-    let start = (start & 0x0fff) as usize;
-    let end = (end & 0x0fff) as usize;
+    let start = start & 0x0fff;
+    let end = end & 0x0fff;
+    let start_usize = start as usize;
+    let end_usize = end as usize;
     assert!(
         start < end && start.is_multiple_of(8) && end.is_multiple_of(8),
         "RSP XBUS DPC range [{start:#05x}, {end:#05x}) must be nonempty and 8-byte aligned"
     );
     assert!(
-        end <= dmem.len(),
+        end_usize <= dmem.len(),
         "RSP XBUS DPC range end {end:#05x} exceeds 4 KiB DMEM"
     );
-    let words = dmem[start..end]
+    let words = dmem[start_usize..end_usize]
         .chunks_exact(4)
         .map(|word| u32::from_be_bytes(word.try_into().expect("four DMEM bytes")))
         .collect::<Vec<_>>();
-    if unsafe { dispatch_captured_raw_rdp(rdram, &words) } == fn64_render::DpFullSyncStatus::Reached
-    {
+    let (full_sync, observation) =
+        unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true) };
+    record_rsp_rdp_observations(vec![observation]);
+    if full_sync == fn64_render::DpFullSyncStatus::Reached {
         crate::pi::start_live_dp_full_sync().unwrap_or_else(|error| {
             panic!("dispatch_raw_rdp_xbus: DP FullSync completion: {error}")
         });
@@ -1003,10 +1159,18 @@ unsafe fn dispatch_raw_rdp_xbus(
 unsafe fn dispatch_captured_raw_rdp(
     rdram: *mut u8,
     words: &[u32],
-) -> fn64_render::DpFullSyncStatus {
+    source_start: u32,
+    source_end: u32,
+    xbus: bool,
+) -> (fn64_render::DpFullSyncStatus, RspRdpObservationKind) {
     assert!(
         !words.is_empty() && words.len().is_multiple_of(2),
         "captured RSP DPC submission must contain a nonempty whole number of 64-bit commands"
+    );
+    assert_eq!(
+        source_end.checked_sub(source_start),
+        Some(u32::try_from(words.len() * 4).expect("captured RSP DPC byte length exceeds u32")),
+        "captured RSP DPC source range does not match the captured command image"
     );
     let real = unsafe { renderer_rdram_slice(rdram) };
     let physical_len = real.len();
@@ -1035,7 +1199,11 @@ unsafe fn dispatch_captured_raw_rdp(
         })
     });
     real.copy_from_slice(&image[..physical_len]);
-    require_committed_full_sync_evidence(result, "dispatch_captured_raw_rdp")
+    let full_sync = require_committed_full_sync_evidence(result, "dispatch_captured_raw_rdp");
+    (
+        full_sync,
+        dpc_observation(xbus, source_start, source_end, words),
+    )
 }
 
 fn require_committed_full_sync_evidence(
@@ -1055,15 +1223,6 @@ fn require_committed_full_sync_evidence(
         fn64_render::FrameStatus::NeedsLle { .. } => {
             panic!("{operation}: raw RDP submission cannot request RSP LLE fallback")
         }
-    }
-}
-
-fn schedule_raw_dp_full_sync(result: RenderDispatchResult, operation: &'static str) {
-    if require_committed_full_sync_evidence(result, operation)
-        == fn64_render::DpFullSyncStatus::Reached
-    {
-        crate::pi::start_live_dp_full_sync()
-            .unwrap_or_else(|error| panic!("{operation}: DP FullSync completion: {error}"));
     }
 }
 
@@ -1894,7 +2053,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     let mut hle_entry = if is_gfx || header.task_type == M_AUDTASK {
         Some(match admitted_task_image_shape(&header) {
             AdmittedTaskImageShape::BootOverlay => {
-                let boot = unsafe { dispatch_hle_rspboot(rdram) };
+                let boot = unsafe { dispatch_hle_rspboot(rdram, task_addr) };
                 assert_eq!(
                     boot.task.task_type, header.task_type,
                     "RSP rspboot changed OSTask type from {} to {}; HLE selection is no longer valid",
@@ -1920,7 +2079,8 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
             .take()
             .expect("gfx accuracy LLE requires an admitted HLE entry");
         let pre_ucode_steps = entry.pre_ucode_steps();
-        let lle = unsafe { dispatch_lle_task(rdram, entry.into_lle_machine_state()) };
+        let lle =
+            unsafe { dispatch_lle_task(rdram, task_addr, true, entry.into_lle_machine_state()) };
         crate::pi::start_live_rcp_task_with_latency(
             rcp_completion_plan(lle.dp_full_sync, "gfx accuracy LLE"),
             pre_ucode_steps.saturating_add(lle.steps),
@@ -2035,7 +2195,9 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                     .take()
                     .expect("gfx LLE fallback requires an admitted HLE entry");
                 let pre_ucode_steps = entry.pre_ucode_steps();
-                let lle = unsafe { dispatch_lle_task(rdram, entry.into_lle_machine_state()) };
+                let lle = unsafe {
+                    dispatch_lle_task(rdram, task_addr, true, entry.into_lle_machine_state())
+                };
                 crate::pi::start_live_rcp_task_with_latency(
                     rcp_completion_plan(lle.dp_full_sync, "gfx LLE fallback"),
                     pre_ucode_steps.saturating_add(lle.steps),
@@ -2050,7 +2212,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         unsafe { dispatch_audio_task(rdram, o, &hle_header) };
         fn64_render::DpFullSyncStatus::NotReached
     } else {
-        let lle = unsafe { dispatch_lle_task(rdram, None) };
+        let lle = unsafe { dispatch_lle_task(rdram, task_addr, false, None) };
         crate::pi::start_live_rcp_task_with_latency(
             rcp_completion_plan(lle.dp_full_sync, "custom-task LLE"),
             lle.steps,
@@ -2160,6 +2322,46 @@ mod tests {
         }
 
         fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[UcodeId] {
+            &[]
+        }
+    }
+
+    struct ExactIdentityBackend {
+        admitted: [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        family: UcodeId,
+    }
+
+    impl RenderBackend for ExactIdentityBackend {
+        fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        no_rust_hidden_sidecar!();
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            _task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            Ok(FrameStatus::Complete)
+        }
+
+        fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn identify_microcode(
+            &self,
+            imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        ) -> Option<UcodeId> {
+            (imem == &self.admitted).then_some(self.family)
+        }
 
         fn supported_ucodes(&self) -> &[UcodeId] {
             &[]
@@ -2504,6 +2706,8 @@ mod tests {
     fn renderer_entries_expose_exact_physical_rdram_and_its_last_byte() {
         use std::rc::Rc;
 
+        crate::load_rom(Vec::new());
+
         struct SpanBackend(Rc<RefCell<Vec<(usize, u8)>>>);
 
         impl RenderBackend for SpanBackend {
@@ -2575,6 +2779,17 @@ mod tests {
 
         assert_eq!(observations.borrow().as_slice(), [(physical_len, 0xa5); 2]);
         assert_eq!(allocation[physical_len], 0x5a);
+        assert_eq!(
+            copy_rsp_rdp_observations()
+                .into_iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![RspRdpObservationKind::DramDpcCommitted {
+                start: 0,
+                end: 8,
+                command_sha256: canonical_rdp_words_sha256(&[0, 0]),
+            }]
+        );
     }
 
     #[test]
@@ -2623,6 +2838,23 @@ mod tests {
             last_render_error().as_deref(),
             Some("synthetic backend error: deliberate failure")
         );
+    }
+
+    #[test]
+    fn rejected_raw_dpc_does_not_enter_the_committed_observation_history() {
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        set_render_backend(
+            Box::new(StatusRenderBackend(FrameStatus::Complete)),
+            rdram.len(),
+        );
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            dispatch_raw_rdp(rdram.as_mut_ptr(), 0, 8)
+        }));
+
+        assert!(rejected.is_err());
+        assert!(copy_rsp_rdp_observations().is_empty());
     }
 
     /// The rename is only honest if the retired spelling is LOUD: an unset var
@@ -2777,7 +3009,9 @@ mod tests {
         }
         let generation_before = with_host(|host| host.device_fabric.rsp_memory().imem_generation());
 
-        let boot = unsafe { dispatch_hle_rspboot(rdram.as_mut_ptr()) };
+        let boot = unsafe {
+            dispatch_hle_rspboot(rdram.as_mut_ptr(), RdramAddr::from_offset(HEADER as u32))
+        };
 
         assert_eq!(boot.steps, 7);
         assert_eq!(boot.task.task_type, fn64_runtime::M_GFXTASK);
@@ -2828,7 +3062,7 @@ mod tests {
         });
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            dispatch_hle_rspboot(rdram.as_mut_ptr())
+            dispatch_hle_rspboot(rdram.as_mut_ptr(), RdramAddr::from_offset(HEADER as u32))
         }))
         .expect_err("rspboot BREAK before ucode must trap");
         assert!(panic_message(panic.as_ref())
@@ -2893,10 +3127,16 @@ mod tests {
         );
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + HEADER as u64;
-        unsafe {
-            osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx);
-            osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx);
-        }
+        unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        let expected_at = Cycles::new(sim_time());
+        let (imem_generation, expected_digest) = with_host(|host| {
+            let memory = host.device_fabric.rsp_memory();
+            (
+                memory.imem_generation(),
+                imem_sha256(memory.bank(fn64_runtime::RspMemoryBank::Imem)),
+            )
+        });
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
 
         with_host(|host| {
             let fabric = &host.device_fabric;
@@ -2913,7 +3153,83 @@ mod tests {
             );
             assert!(fabric.snapshot().sp_busy);
         });
+        assert_eq!(
+            copy_rsp_rdp_observations(),
+            vec![RspRdpObservationEvent {
+                at: expected_at,
+                kind: RspRdpObservationKind::MicrocodeRecognition {
+                    task_addr: RdramAddr::from_offset(HEADER as u32),
+                    imem_generation,
+                    text_sha256: expected_digest,
+                    family: None,
+                },
+            }]
+        );
         crate::advance_virtual_time(3);
+    }
+
+    #[test]
+    fn lle_microcode_recognition_requires_the_backends_exact_imem_image() {
+        const HEADER: usize = 0x40;
+        const IMAGE: usize = 0x100;
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x200];
+        for (field, value) in [
+            (0x00, fn64_runtime::M_GFXTASK),
+            (0x08, 0x8000_0000 | IMAGE as u32),
+            (0x0c, 12),
+            (0x10, 0xA000_0000 | IMAGE as u32),
+            (0x14, 12),
+        ] {
+            rdram[HEADER + field..HEADER + field + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        for (index, word) in [0x2408_4321u32, 0xac08_0100, 0x0000_000d]
+            .into_iter()
+            .enumerate()
+        {
+            let offset = IMAGE + index * 4;
+            rdram[offset..offset + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        prepare_renderer_rdram(&mut rdram);
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + HEADER as u64;
+        unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        let (admitted, imem_generation) = with_host(|host| {
+            let memory = host.device_fabric.rsp_memory();
+            (
+                *memory.bank(fn64_runtime::RspMemoryBank::Imem),
+                memory.imem_generation(),
+            )
+        });
+        let expected_digest = imem_sha256(&admitted);
+        let expected_at = Cycles::new(sim_time());
+        set_render_backend_with_policy(
+            Box::new(ExactIdentityBackend {
+                admitted,
+                family: UcodeId::F3dex2,
+            }),
+            rdram.len(),
+            GraphicsTaskExecutionPolicy::LleAccuracy,
+        );
+
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+
+        assert_eq!(
+            copy_rsp_rdp_observations(),
+            vec![RspRdpObservationEvent {
+                at: expected_at,
+                kind: RspRdpObservationKind::MicrocodeRecognition {
+                    task_addr: RdramAddr::from_offset(HEADER as u32),
+                    imem_generation,
+                    text_sha256: expected_digest,
+                    family: Some(UcodeId::F3dex2),
+                },
+            }]
+        );
     }
 
     #[test]
@@ -2984,6 +3300,8 @@ mod tests {
     fn graphics_lle_accuracy_policy_forwards_raw_dpc_without_hle_dispatch() {
         use std::cell::RefCell;
         use std::rc::Rc;
+
+        crate::load_rom(Vec::new());
 
         type DpcCall = (u32, u32, u32, u32);
         struct LleDpcBackend {
@@ -3112,6 +3430,37 @@ mod tests {
             assert!(snapshot.sp_busy);
             assert!(snapshot.dp_busy);
         });
+        let observations = copy_rsp_rdp_observations();
+        assert_eq!(observations.len(), 3);
+        let replacement_generation = match &observations[0].kind {
+            RspRdpObservationKind::ImemReplacementCommitted {
+                task_addr,
+                imem_generation,
+                ..
+            } => {
+                assert_eq!(*task_addr, RdramAddr::from_offset(HEADER as u32));
+                *imem_generation
+            }
+            ref other => panic!("expected rspboot replacement first, got {other:?}"),
+        };
+        assert!(matches!(
+            &observations[1].kind,
+            RspRdpObservationKind::MicrocodeRecognition {
+                task_addr,
+                imem_generation,
+                family: None,
+                ..
+            } if *task_addr == RdramAddr::from_offset(HEADER as u32)
+                && *imem_generation == replacement_generation
+        ));
+        assert_eq!(
+            observations[2].kind,
+            RspRdpObservationKind::DramDpcCommitted {
+                start: DPC_START,
+                end: DPC_END,
+                command_sha256: canonical_rdp_words_sha256(&[0xe900_0000, 0]),
+            }
+        );
     }
 
     #[test]
@@ -3214,7 +3563,9 @@ mod tests {
                 .unwrap();
         });
 
-        let result = unsafe { dispatch_lle_task(rdram.as_mut_ptr(), None) };
+        let result = unsafe {
+            dispatch_lle_task(rdram.as_mut_ptr(), RdramAddr::from_offset(0), false, None)
+        };
 
         assert_eq!(
             result,
@@ -3287,6 +3638,7 @@ mod tests {
 
     #[test]
     fn unknown_task_lle_resolves_rspboot_style_imem_overlay_and_resumes() {
+        crate::load_rom(Vec::new());
         let mtc0 = |rt: u32, rd: u32| (0x10 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11);
         let boot = [
             0x2402_0200u32,
@@ -3300,6 +3652,7 @@ mod tests {
         ];
         let overlay = [0u32, 0, 0, 0, 0, 0, 0x2405_5678, 0xAC05_0104];
         let mut rdram = vec![0u8; 0x1000];
+        prepare_renderer_rdram(&mut rdram);
         for (index, word) in overlay.into_iter().enumerate() {
             let offset = 0x200 + index * 4;
             rdram[offset..offset + 4].copy_from_slice(&word.to_ne_bytes());
@@ -3324,9 +3677,23 @@ mod tests {
                 )
                 .unwrap();
         });
-        let generation_before = with_host(|host| host.device_fabric.rsp_memory().imem_generation());
+        let (generation_before, initial_digest) = with_host(|host| {
+            let memory = host.device_fabric.rsp_memory();
+            (
+                memory.imem_generation(),
+                imem_sha256(memory.bank(fn64_runtime::RspMemoryBank::Imem)),
+            )
+        });
+        set_render_backend_with_policy(
+            Box::new(StatusRenderBackend(FrameStatus::Complete)),
+            rdram.len(),
+            GraphicsTaskExecutionPolicy::LleAccuracy,
+        );
+        let expected_at = Cycles::new(sim_time());
 
-        let result = unsafe { dispatch_lle_task(rdram.as_mut_ptr(), None) };
+        let result = unsafe {
+            dispatch_lle_task(rdram.as_mut_ptr(), RdramAddr::from_offset(0x40), true, None)
+        };
 
         assert_eq!(
             result,
@@ -3348,12 +3715,51 @@ mod tests {
                 0x0000_5678
             );
         });
+        let final_digest = with_host(|host| {
+            imem_sha256(
+                host.device_fabric
+                    .rsp_memory()
+                    .bank(fn64_runtime::RspMemoryBank::Imem),
+            )
+        });
+        assert_eq!(
+            copy_rsp_rdp_observations(),
+            vec![
+                RspRdpObservationEvent {
+                    at: expected_at,
+                    kind: RspRdpObservationKind::MicrocodeRecognition {
+                        task_addr: RdramAddr::from_offset(0x40),
+                        imem_generation: generation_before,
+                        text_sha256: initial_digest,
+                        family: None,
+                    },
+                },
+                RspRdpObservationEvent {
+                    at: expected_at,
+                    kind: RspRdpObservationKind::ImemReplacementCommitted {
+                        task_addr: RdramAddr::from_offset(0x40),
+                        imem_generation: generation_before + 1,
+                        text_sha256: final_digest,
+                    },
+                },
+                RspRdpObservationEvent {
+                    at: expected_at,
+                    kind: RspRdpObservationKind::MicrocodeRecognition {
+                        task_addr: RdramAddr::from_offset(0x40),
+                        imem_generation: generation_before + 1,
+                        text_sha256: final_digest,
+                        family: None,
+                    },
+                },
+            ]
+        );
     }
 
     #[test]
     fn xbus_dpc_submission_stages_logical_dmem_commands_for_renderer() {
         use fn64_render::RenderConfig;
 
+        crate::load_rom(Vec::new());
         const TARGET: u32 = 0x400;
         let mut rdram = vec![0u8; 0x1000];
         let commands: [(u32, u32); 4] = [
@@ -3386,6 +3792,22 @@ mod tests {
                 "XBUS raw RDP pixel {index}"
             );
         }
+        assert_eq!(
+            copy_rsp_rdp_observations()
+                .into_iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![RspRdpObservationKind::XbusDpcCommitted {
+                start: 0,
+                end: (commands.len() * 8) as u32,
+                command_sha256: canonical_rdp_words_sha256(
+                    &commands
+                        .into_iter()
+                        .flat_map(|(w0, w1)| [w0, w1])
+                        .collect::<Vec<_>>()
+                ),
+            }]
+        );
     }
 
     #[test]
