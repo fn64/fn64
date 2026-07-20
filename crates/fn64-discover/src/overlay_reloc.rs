@@ -15,10 +15,16 @@
 //! strict and total: any inconsistency returns `None` (most files are
 //! not overlays), never a partial result.
 //!
-//! HI16/LO16 pairs are deliberately not consumed yet: their pairing is
-//! order-dependent across entries, and the lui/addiu harvest already
-//! covers materialized code. R_MIPS_26 `j` (not `jal`) targets are also
-//! skipped: a plain jump proves code, not a callable entry.
+//! HI16/LO16 pairs are consumed with the engine's own pairing rule —
+//! BY REGISTER, not by adjacency: each HI16 saves its immediate under
+//! the lui's rt register, and each LO16 looks up its own rs register
+//! (compilers interleave pairs as `lui A; lui B; addiu A; addiu B`, so
+//! most-recent-HI16 pairing constructs garbage — measured as a split
+//! root landing in BgHidanHamstep_Draw's delay slot on OoT). This
+//! mirrors Overlay_Relocate's per-register tracking, yielding the
+//! addresses actor code materializes as constants: `this->actionFunc =
+//! Func` compiles to a typed lui/addiu pair. R_MIPS_26 `j` (not `jal`)
+//! targets are skipped: a plain jump proves code, not a callable entry.
 //!
 //! Measured result (MM, 2026-07-20): all 612 proven overlays parse, and
 //! every reloc-typed boot-window reference was already found by the
@@ -39,13 +45,21 @@ pub struct OverlayRelocRefs {
     /// pointers; when they name text, they are callback fields (actor
     /// init/destroy/update/draw), i.e. callable entries.
     pub data_pointers: Vec<u32>,
-    /// Absolute values of words typed `R_MIPS_32` in `.rodata`. Kept
-    /// separate deliberately: rodata pointer arrays are dominated by
+    /// Words typed `R_MIPS_32` in `.rodata`, as `(file_offset, value)`
+    /// sorted by offset. Zelda overlays load file-layout-identical, so a
+    /// word's VA is `bank_va_start + file_offset`. Kept separate from
+    /// `.data` deliberately: rodata pointer arrays are dominated by
     /// switch jump tables, whose entries are MID-FUNCTION case labels —
     /// seeding them as roots split 25 real functions across 10 MM actor
-    /// overlays (measured 2026-07-20). Useful as jump-table evidence,
-    /// never as entry seeds.
-    pub rodata_pointers: Vec<u32>,
+    /// overlays (measured 2026-07-20). As located, typed runs they are
+    /// exactly the jump-table evidence the open-`jr` frontier needs:
+    /// the typing bounds the table where value-set analysis cannot.
+    pub rodata_words: Vec<(u32, u32)>,
+    /// Addresses constructed by typed HI16/LO16 pairs (most-recent-HI16
+    /// pairing, signed LO for addiu/loads, unsigned for ori) — the
+    /// constants overlay code materializes, dominated by action-function
+    /// assignments.
+    pub hi_lo_pointers: Vec<u32>,
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -87,6 +101,7 @@ pub fn parse_zelda_overlay(bytes: &[u8]) -> Option<OverlayRelocRefs> {
         return None;
     }
     let mut refs = OverlayRelocRefs::default();
+    let mut hi16_by_reg: [Option<u32>; 32] = [None; 32];
     for index in 0..reloc_count {
         let word = read_u32(bytes, header + 0x14 + index * 4)?;
         let section = word >> 30;
@@ -103,6 +118,24 @@ pub fn parse_zelda_overlay(bytes: &[u8]) -> Option<OverlayRelocRefs> {
         }
         let value = read_u32(bytes, base + offset)?;
         match kind {
+            5 => {
+                // HI16 must sit on a lui; save under its rt register.
+                if value >> 26 != 0x0f {
+                    return None;
+                }
+                hi16_by_reg[((value >> 16) & 0x1f) as usize] = Some(value & 0xffff);
+            }
+            6 => {
+                // LO16 pairs with the HI16 that loaded its rs register.
+                let hi = hi16_by_reg[((value >> 21) & 0x1f) as usize]?;
+                let lo = value & 0xffff;
+                let target = if value >> 26 == 0x0d {
+                    (hi << 16) | lo // ori: unsigned
+                } else {
+                    ((hi << 16) as i64 + (lo as i16 as i64)) as u32
+                };
+                refs.hi_lo_pointers.push(target);
+            }
             4 => {
                 // R_MIPS_26 must sit on a j/jal instruction.
                 match value >> 26 {
@@ -114,8 +147,8 @@ pub fn parse_zelda_overlay(bytes: &[u8]) -> Option<OverlayRelocRefs> {
                 }
             }
             2 if section == 2 => refs.data_pointers.push(value),
-            2 if section == 3 => refs.rodata_pointers.push(value),
-            2 | 5 | 6 => {}
+            2 if section == 3 => refs.rodata_words.push(((base + offset) as u32, value)),
+            2 => {}
             _ => return None,
         }
     }
@@ -123,8 +156,10 @@ pub fn parse_zelda_overlay(bytes: &[u8]) -> Option<OverlayRelocRefs> {
     refs.jal_targets.dedup();
     refs.data_pointers.sort_unstable();
     refs.data_pointers.dedup();
-    refs.rodata_pointers.sort_unstable();
-    refs.rodata_pointers.dedup();
+    refs.rodata_words.sort_unstable();
+    refs.rodata_words.dedup();
+    refs.hi_lo_pointers.sort_unstable();
+    refs.hi_lo_pointers.dedup();
     Some(refs)
 }
 
