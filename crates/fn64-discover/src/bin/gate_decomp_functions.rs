@@ -24,8 +24,11 @@
 //! boot extent so a malformed dump cannot push the scan past the image.
 //!
 //! Env:
-//!   FN64_DISCOVER_ROM    the game's .z64
-//!   FN64_DISCOVER_DUMP   the matching answer-key dump.toml
+//!   FN64_DISCOVER_ROM         the game's .z64
+//!   FN64_DISCOVER_DUMP        the matching answer-key dump.toml
+//!   FN64_DISCOVER_ENTRY_ARGS  optional cited code-pointer-argument claims
+//!                             TOML (e.g. osCreateThread's entry in $a2);
+//!                             constant operands seed additional CFG roots
 
 use fn64_discover::banks;
 use fn64_discover::grade_oot_functions::{grade_functions, AnswerFunction, JalTargets};
@@ -53,6 +56,25 @@ struct Function {
     name: String,
     vram: u32,
     size: u32,
+}
+
+#[derive(Deserialize)]
+struct EntryArgsFile {
+    entry_arg_calls: Vec<EntryArgCall>,
+}
+
+#[derive(Deserialize)]
+struct EntryArgCall {
+    name: String,
+    callee_va: u32,
+    pointer_arg_register: u8,
+}
+
+fn load_toml_env<T: serde::de::DeserializeOwned>(variable: &str) -> Option<T> {
+    let path = std::env::var(variable).ok()?;
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("reading {path}: {error}"));
+    Some(toml::from_str(&text).unwrap_or_else(|error| panic!("parsing {path}: {error}")))
 }
 
 fn main() {
@@ -136,8 +158,60 @@ fn main() {
         answer.len()
     );
 
+    // Optional cited entry-argument claims (FN64_DISCOVER_ENTRY_ARGS): a
+    // callee that receives a code pointer in a declared register (e.g.
+    // osCreateThread's entry in $a2). Constant operands recovered from the
+    // scanned image become additional CFG roots — the OS transfers control
+    // there, so a static constant is a callable-entry observation. The
+    // grade's wrong==0 posture judges the result; open operands and
+    // out-of-window pointers are reported, never guessed.
+    let mut roots = vec![entrypoint];
+    if let Some(file) = load_toml_env::<EntryArgsFile>("FN64_DISCOVER_ENTRY_ARGS") {
+        let words: Vec<u32> = bank_bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+            .collect();
+        let mut seeded = 0usize;
+        let mut open_sites = 0usize;
+        let mut outside = 0usize;
+        for claim in &file.entry_arg_calls {
+            let slices = fn64_discover::pi_dma::slice_pointer_arg_calls(
+                &words,
+                fn64_discover::loaders::VirtualAddress::new(boot_va_start),
+                fn64_discover::loaders::VirtualAddress::new(claim.callee_va),
+                0x0080_0000,
+                claim.pointer_arg_register,
+            )
+            .expect("boot image already validated");
+            for slice in slices {
+                match slice.pointer.proven() {
+                    Some(pointer)
+                        if pointer.get() >= boot_va_start && pointer.get() < code_end =>
+                    {
+                        let va = pointer.get();
+                        if !roots.contains(&va) {
+                            println!(
+                                "entry-arg root: 0x{va:x} ({} call at 0x{:x})",
+                                claim.name,
+                                slice.call_pc.get()
+                            );
+                            roots.push(va);
+                            seeded += 1;
+                        }
+                    }
+                    Some(_) => outside += 1,
+                    None => open_sites += 1,
+                }
+            }
+        }
+        println!(
+            "entry-arg seeding: roots added={seeded} open sites={open_sites} \
+             pointers outside scanned window={outside}"
+        );
+    }
+
     let (cfg, resolved) =
-        build_cfg_closed_with_facts(&db, banks::BOOT_BANK, bank_bytes, boot_va_start, &[entrypoint]);
+        build_cfg_closed_with_facts(&db, banks::BOOT_BANK, bank_bytes, boot_va_start, &roots);
     let part = partition(&cfg);
     let overlaps = same_bank_overlaps(&part, &cfg);
     println!(
@@ -159,7 +233,15 @@ fn main() {
         "same-bank owner overlaps must be zero, got {overlaps:?}"
     );
 
-    let jal_targets: JalTargets = cfg.direct_calls.iter().map(|(_, target)| *target).collect();
+    // The interior-entry excuse set holds machine-checkable callable
+    // entries: direct jal targets, plus statically proven entry-argument
+    // pointers (the OS transfers control there — same evidentiary class).
+    // An owner rooted at one inside a coarser answer function is correct
+    // finer-grained discovery, not a mis-split (see grade_oot_functions;
+    // Kirby's WIP answer key gap-derives sizes across unlabeled real
+    // functions, which is exactly where this matters).
+    let mut jal_targets: JalTargets = cfg.direct_calls.iter().map(|(_, target)| *target).collect();
+    jal_targets.extend(roots.iter().copied());
     let report = grade_functions(&part.owners, &answer, code_end, &jal_targets);
     println!(
         "function-boundary grade: total={} matched_exact={} matched_coarse={} \
@@ -177,6 +259,13 @@ fn main() {
         (report.open as f64 / report.total as f64) * 100.0
     );
     if report.wrong != 0 {
+        for (function, grade) in &report.per_function {
+            if let fn64_discover::grade_oot_functions::FunctionGrade::WrongSplit { owner_root } =
+                grade
+            {
+                println!("wrong: answer function {function} split by owner root 0x{owner_root:x}");
+            }
+        }
         eprintln!("gate_decomp_functions FAILED: wrong={}", report.wrong);
         std::process::exit(1);
     }

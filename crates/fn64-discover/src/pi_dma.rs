@@ -217,6 +217,48 @@ impl LoadRequestCallSlice {
     }
 }
 
+/// A statically recovered code-pointer argument at a direct call to a
+/// cited callee (e.g. `osCreateThread`'s entry argument): the OS will
+/// transfer control to the recovered address, making a constant operand a
+/// callable-entry observation of the same strength as the other static
+/// call-boundary slices — reachability of the call site itself stays
+/// unproven, as ever.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PointerArgCallSlice {
+    pub call_pc: VirtualAddress,
+    pub callee: VirtualAddress,
+    pub pointer: StaticOperand<VirtualAddress>,
+}
+
+/// Find direct calls to `callee` and recover the pointer argument in the
+/// declared register. Which register — and what the pointer means — is the
+/// caller's cited claim; this slicer only recovers straight-line constants.
+pub fn slice_pointer_arg_calls(
+    image_words: &[u32],
+    image_start: VirtualAddress,
+    callee: VirtualAddress,
+    rdram_len: u32,
+    pointer_register: u8,
+) -> Result<Vec<PointerArgCallSlice>, PiDmaSliceError> {
+    validate_input(image_words, image_start, rdram_len)?;
+    let mut out = Vec::new();
+    for call_index in 0..image_words.len().saturating_sub(1) {
+        let call_pc = pc_at(image_start, call_index);
+        if direct_jal_target(image_words[call_index], call_pc) != Some(callee.get()) {
+            continue;
+        }
+        let state = slice_state_at_call(image_words, image_start, call_index, &[pointer_register]);
+        out.push(PointerArgCallSlice {
+            call_pc,
+            callee,
+            pointer: map_operand(register_operand(&state, pointer_register), |raw| {
+                Ok(VirtualAddress::new(raw))
+            }),
+        });
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PiDmaSliceError {
     EmptyImage,

@@ -1,0 +1,10 @@
+# mm-n64-us cited code-pointer-argument claims for CFG-root seeding.
+# osCreateThread(OSThread*, id, void (*entry)(void*), ...) carries its
+# entry pointer in $a2 (o32; public libultra manual). Callee VA from the
+# zeldaret/mm decomp's answer key (MMU dump) — an anchor claim only: recovered
+# pointers are read from ROM instruction bytes and graded wrong==0.
+
+[[entry_arg_calls]]
+name = "osCreateThread"
+callee_va = 0x80089e40
+pointer_arg_register = 6

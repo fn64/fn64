@@ -1,0 +1,10 @@
+# k64-us cited code-pointer-argument claims for CFG-root seeding.
+# osCreateThread(OSThread*, id, void (*entry)(void*), ...) carries its
+# entry pointer in $a2 (o32; public libultra manual). Callee VA from the
+# Kirby64Ret/kirby64 decomp's answer key (K64U dump) — an anchor claim only: recovered
+# pointers are read from ROM instruction bytes and graded wrong==0.
+
+[[entry_arg_calls]]
+name = "osCreateThread"
+callee_va = 0x8002fbe0
+pointer_arg_register = 6
