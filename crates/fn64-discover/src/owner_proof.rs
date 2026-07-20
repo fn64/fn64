@@ -748,7 +748,7 @@ fn validate_block(
             });
             true
         }
-        BlockTerminator::RanOffEnd => {
+        BlockTerminator::RanOffEnd | BlockTerminator::DataFence { .. } => {
             blockers.insert(OwnerBlocker::RanOffEnd {
                 block_start: block.start_va,
             });
@@ -864,7 +864,8 @@ fn validate_incoming(
             | BlockTerminator::Trap
             | BlockTerminator::InvalidInstruction { .. }
             | BlockTerminator::MissingDelaySlot { .. }
-            | BlockTerminator::RanOffEnd => {}
+            | BlockTerminator::RanOffEnd
+            | BlockTerminator::DataFence { .. } => {}
         }
         for (target, edge) in edges {
             if !contains(target) {
