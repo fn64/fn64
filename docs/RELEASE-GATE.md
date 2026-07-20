@@ -162,7 +162,7 @@ The source inventory is checked by
 `tools/check_unsupported_event_sites.py` against
 `fn64.unsupported-event-sites.v2`. It scans the production Rust paths in the
 runtime, ABI, audio/RSP, Rust CPU recompiler, shared renderer, and RT64 adapter.
-Seventeen exact record sites and the RT64 reference renderer's 42 helper-routed
+Sixteen exact record sites and the RT64 reference renderer's 43 helper-routed
 operation identities must remain registered. Inline `cfg(test)` items are
 removed before the sweep, so test-oracle panics neither create false coverage
 nor hide a production outcome. Audio/RSP unknown instructions, missing VU
@@ -539,61 +539,58 @@ execution.
 
 ## Representative release matrix
 
-`fn64-boot-harness` also accepts a bounded `fn64.release-matrix.v4` manifest.
-V3 replaced v2's configuration-only controller declarations with mandatory
-positive operation paths and changes every manifest/declaration digest domain;
-v2 manifests cannot be relabeled as behavioral controller evidence. V4 adds
-one mandatory executable program lane per scenario and changes those digest
-domains again: native-archive, typed observed-function, and typed-block reports
-cannot satisfy each other's declarations, and no-program evidence is rejected. It
-assigns at most 64 stable scenario IDs to closed enums for host platform,
-controller/accessory, cartridge save medium, renderer capability, and program
-lane. The
-top-level `required` set is exhaustive: every scenario tag must belong to it,
-and the union of scenarios must cover every required value. Each scenario
-binds one exact schema-v15 `report_scenario`, private-input SHA-256, and report
-SHA-256. It also carries a canonical `declaration_sha256` over those identities
-and its sorted coverage tags, so a scenario cannot be relabeled while retaining
-the cited declaration digest. Each scenario selects exactly one platform, one
-cartridge-save mode, and one program lane. Reference LLE must stand alone; RT64 LLE can be
-combined with the typed post-VI-capture and replacement-pack capabilities, but
-its assigned report must carry the authoritative clean fn64 RT64 identity,
-including the canonical fn64 adapter-source SHA-256,
-described above.
+`fn64-boot-harness` accepts a bounded `fn64.release-matrix.v5` evidence
+manifest. V5 removes the caller-authored `required` denominator and every
+scenario `coverage` label. Instead, the manifest must name the exact
+project-owned `fn64.certification-profile.full-parity.v1` schema and its golden
+definition SHA-256. That profile currently contains 162 non-shrinking
+requirements: two real full-ROM classes, NTSC/PAL/MPAL, all six
+program/renderer lane pairs, five save classes, five controller classes,
+twelve public microcode families, three RSP/RDP execution mechanisms, six
+platform/API targets, all 13 RT64 cases on each target, and closure of all seven
+blockers on each target. Synthetic fixtures are mechanism evidence and cannot
+satisfy a real full-ROM class.
 
-The manifest is coverage policy, but its labels must equal the environment
-frozen in the assigned report rather than merely describe host intent. Schema
-v15 records the actual host OS/architecture, all four exact PIF port identities,
-typed cartridge-save configuration, registered graphics execution policy, and
-renderer self-report at the committed VI boundary. EEPROM, SRAM, and FlashRAM
-declarations
-must match exactly one positive device-qualified save path; a path from any
-other cartridge-save type is rejected, including all cartridge-save paths in
-a `no_cartridge_save` scenario. Controller declarations likewise require the
-matching positive operation path: standard input read, Rumble operation,
-Transfer Pak operation, Voice operation, or PFS operation for Controller Pak.
-An operation path for an undeclared controller/accessory is rejected. A
-controller with an accessory projects both `standard_controller` and that
-accessory. RT64 rows require an authoritative,
-nonempty backend identity, matching post-VI settings identity, accuracy policy,
-and `rt64_post_vi_capture`; `rt64_replacement_packs` is present exactly when an
-enabled nonempty pack set was active. The assigned reports also prove their
-fixed-cycle artifacts, all 12 live minimum paths, zero reached unsupported
-events, and deterministic equality. Every report must have its exact terminal
-v3 journal partner with a globally unique run-event identity. The matrix verifier requires exactly ten report/journal
-pairs per scenario, not merely ten across the matrix.
+Each of at most 64 scenario declarations binds only a stable diagnostic ID,
+one exact schema-v15 `report_scenario`, private-input SHA-256, report SHA-256,
+and a canonical v5 `declaration_sha256` over those identities. The verifier
+first validates every report, then routes it by the report's own `scenario`
+value, which must match exactly one manifest declaration; command-line IDs
+cannot assign evidence to a different declaration. Platform, all four PIF port
+identities, cartridge-save hardware, renderer/presentation mode, and executable
+program lane are derived as scenario coverage from the committed-boundary
+report. The manifest cannot cross-label them. Of those derived values, the
+current FullParityV1 assignment pass can satisfy only program/renderer-lane,
+save, and controller requirements; the coarse host platform cannot satisfy an
+exact platform/API target.
+
+Derived EEPROM, SRAM, and FlashRAM coverage still requires the corresponding
+positive device-qualified save path. Derived controller coverage likewise
+requires standard input, Rumble, Transfer Pak, Voice, or PFS operation as
+applicable; a controller with an accessory projects both
+`standard_controller` and that accessory. RT64 evidence requires the
+authoritative clean fn64 adapter identity, matching post-VI settings identity,
+LLE-accuracy policy, and exact post-VI capture. Every scenario still requires
+exactly ten schema-v15 reports, each paired with its terminal v3 journal and a
+globally unique run-event identity, while proving all five fixed-cycle
+artifacts, every live-minimum path, and zero reached unsupported events.
+
+Schema v15 cannot yet expose ROM class, decoded TV region, encountered
+microcode families, DRAM/XBUS/IMEM execution mechanisms, Windows version/API,
+platform case results, or blocker closure. Valid v15 evidence therefore returns
+a typed `Incomplete` assessment listing the exact unsatisfied project-owned
+requirements; it never emits a smaller passing denominator. Report schema v16
+and typed external platform/blocker results are the next evidence inputs needed
+before a `Complete` v12 retained matrix is reachable.
 
 A minimal two-scenario shape is:
 
 ```json
 {
-  "schema": "fn64.release-matrix.v4",
-  "required": {
-    "platforms": ["macos_arm64"],
-    "controllers": ["standard_controller", "rumble_pak"],
-    "saves": ["eeprom_4_kbit", "sram_32_kib"],
-    "renderers": ["reference_lle_accuracy", "rt64_lle_accuracy", "rt64_post_vi_capture"],
-    "programs": ["typed_observed_function"]
+  "schema": "fn64.release-matrix.v5",
+  "profile": {
+    "schema": "fn64.certification-profile.full-parity.v1",
+    "definition_sha256": "<FULL_PARITY_V1_DEFINITION_SHA256>"
   },
   "scenarios": [
     {
@@ -601,13 +598,6 @@ A minimal two-scenario shape is:
       "report_scenario": "game-a-macos-reference-lle-accuracy",
       "input_sha256": "<64 lowercase hexadecimal characters>",
       "report_sha256": "<64 lowercase hexadecimal characters>",
-      "coverage": {
-        "platforms": ["macos_arm64"],
-        "controllers": ["standard_controller"],
-        "saves": ["eeprom_4_kbit"],
-        "renderers": ["reference_lle_accuracy"],
-        "programs": ["typed_observed_function"]
-      },
       "declaration_sha256": "<canonical 64-character scenario declaration SHA>"
     },
     {
@@ -615,18 +605,15 @@ A minimal two-scenario shape is:
       "report_scenario": "game-b-macos-rt64-lle-accuracy",
       "input_sha256": "<64 lowercase hexadecimal characters>",
       "report_sha256": "<64 lowercase hexadecimal characters>",
-      "coverage": {
-        "platforms": ["macos_arm64"],
-        "controllers": ["standard_controller", "rumble_pak"],
-        "saves": ["sram_32_kib"],
-        "renderers": ["rt64_lle_accuracy", "rt64_post_vi_capture"],
-        "programs": ["typed_observed_function"]
-      },
       "declaration_sha256": "<canonical 64-character scenario declaration SHA>"
     }
   ]
 }
 ```
+
+Replace the profile placeholder with the exact
+`FULL_PARITY_V1_DEFINITION_SHA256` exported by `fn64-boot-harness`; manifest
+verification rejects every other value.
 
 While preparing a manifest, compute each canonical declaration digest (the
 stored value is excluded from its own digest) with:
@@ -644,17 +631,18 @@ Keep the populated manifest and every report/journal pair outside the repository
 their hashes or names disclose private game identity. The manifest contains
 only declarations and digests, never ROM bytes, framebuffer/audio/RDRAM
 bytes, or recompiled output. Assign each private report and journal together at
-verification time; repeat each ID exactly ten times, in execution order:
+verification time; supply each report and journal together, in execution order.
+The report's validated `scenario` field performs the assignment:
 
 ```text
 cargo run -p fn64-boot-harness --bin verify-release-matrix -- \
   /private/path/matrix.json \
-  game-a-reference=/private/path/game-a-01.json,/private/path/game-a-01.unsupported.jsonl \
+  /private/path/game-a-01.json,/private/path/game-a-01.unsupported.jsonl \
   ... \
-  game-a-reference=/private/path/game-a-10.json,/private/path/game-a-10.unsupported.jsonl \
-  game-b-rt64=/private/path/game-b-01.json,/private/path/game-b-01.unsupported.jsonl \
+  /private/path/game-a-10.json,/private/path/game-a-10.unsupported.jsonl \
+  /private/path/game-b-01.json,/private/path/game-b-01.unsupported.jsonl \
   ... \
-  game-b-rt64=/private/path/game-b-10.json,/private/path/game-b-10.unsupported.jsonl
+  /private/path/game-b-10.json,/private/path/game-b-10.unsupported.jsonl
 ```
 
 Every report path and journal path must resolve to a distinct file, and the two
@@ -664,10 +652,18 @@ immutable pair per invocation remains the runner's responsibility. The verifier
 rejects a run-event identity repeated within or across matrix scenarios, while
 making no stronger claim than provenance about physical process independence.
 
-The default output is a human summary. `--json` instead emits a retained,
-machine-readable `fn64.verified-release-matrix.v11` result. It contains the
-canonical manifest digest, required coverage, every scenario's exact coverage
-assignments and input/report/declaration identity, the five fixed-cycle artifact
+For a complete result, the default output is a human summary. Until all 162
+profile requirements are proved, `--json` emits a tagged `incomplete` result
+whose nested `fn64.release-matrix-incomplete.v1` assessment binds the manifest
+and profile identities, verified counts, evidence-derived satisfied
+assignments, the canonical missing requirement list, and its own SHA-256; the
+command then exits nonzero. It is diagnostic evidence, not a verified release
+artifact.
+
+Only a complete profile emits a retained, machine-readable
+`fn64.verified-release-matrix.v12` result. It contains the canonical manifest
+and profile identities, every scenario's derived coverage and exact
+input/report/declaration identity, the five fixed-cycle artifact
 digests and byte lengths, the exact guest cycle, the canonical closure ledger
 and its redundant path count, exact
 boundary-frozen environment, the exact ordered and canonical unique/count
@@ -679,26 +675,28 @@ RT64's exact post-VI capture. A top-level verification SHA binds
 that complete result; no ROM, framebuffer, audio, RDRAM, or recompiled bytes are
 serialized.
 
-`--verify-json` does not treat that self-digest as sufficient by itself. It
-revalidates the retained semantic envelope: one to 64 scenarios, nonempty and
-duplicate-free required coverage, valid and unique scenario/report identities,
+`--verify-json` accepts only that complete v12 artifact and does not treat its
+self-digest as sufficient by itself. It
+revalidates the retained semantic envelope: one to 64 scenarios and valid,
+unique scenario/report identities,
 lowercase SHA-256 fields, exactly ten reports, ten bound v3 journals, and ten
 globally unique run-event identities per scenario, every fixed-cycle artifact and observation invariant, every positive
 live-minimum closure path, and zero unsupported events. It also revalidates each
-declared save/controller feature against its exact successful-operation path,
-rejects operation paths outside the frozen feature declaration (including PFS
-without a Controller Pak), validates each retained scenario assignment against
-the required denominator, enforces scenario cardinality, renderer combinations,
-and exact agreement between each declared program lane and its retained
-execution-destination source, proves that the scenario union covers every required value,
+derived save/controller feature against its exact successful-operation path,
+rejects operation paths outside the frozen environment (including PFS without
+a Controller Pak), re-derives scenario coverage from the retained report,
+enforces renderer combinations and exact program-lane agreement, proves that
+every member of the immutable profile has a validated evidence assignment,
 recomputes every declaration SHA, reconstructs each retained v15 report and
 its report SHA, and reconstructs the canonical manifest SHA.
 A freshly re-digested empty, zero-path, relabeled, under-covered, cross-labeled,
 or manifest-mismatched document is therefore rejected without the original
 manifest. Historical retained JSON through v10 omits some part of the current
-execution-destination, run-provenance, RT64 workload, or typed program-lane envelope and is
-intentionally rejected; regenerate it from the original manifest and ten bound
-v15 report/journal pairs rather than relabeling it as v11.
+execution-destination, run-provenance, RT64 workload, or typed program-lane
+envelope. V11 retains that envelope but lacks the fixed FullParityV1 profile
+identity and requirement assignments. Every historical version through v11 is
+intentionally rejected; regenerate it from a v5 manifest and bound
+report/journal pairs rather than relabeling it as v12.
 
 Keep populated results private when their scenario names or hashes disclose
 game identity:
@@ -706,7 +704,7 @@ game identity:
 ```text
 cargo run -p fn64-boot-harness --bin verify-release-matrix -- \
   --json /private/path/matrix.json \
-  game-a-reference=/private/path/game-a-01.json,/private/path/game-a-01.unsupported.jsonl \
+  /private/path/game-a-01.json,/private/path/game-a-01.unsupported.jsonl \
   ... \
   > /private/tmp/verified-matrix.json
 
@@ -721,18 +719,20 @@ certified release matrix**. The exact state is:
 
 | ROM/report class | Mechanism available | Certified evidence retained |
 | --- | --- | --- |
-| Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, paired ten-report series verification, real executor/device/VI/reference-render boundaries, matrix coverage/admission, and retained JSON verification are available. | Mechanism evidence only; synthetic bytes are not a ROM certification. |
+| Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, paired ten-report series verification, real executor/device/VI/reference-render boundaries, derived matrix coverage, and the canonical incomplete assessment are available. | Mechanism evidence only; synthetic bytes are not a ROM certification, and an incomplete assessment is not a retained verified matrix. |
 | OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, and an artifact/schema-bound whole-function entry stream exist. The v15 report and private policy admit the observed function stream; the host uses the schema-enabled boot API and a path-independent generated-source identity. | Regenerate the stale cached private generated crate so it exports the marker, then produce a ten-run `typed_observed_function` series (or generate and select the real block pack). |
-| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, explicit `BlockProgram` host selection, and an artifact/schema-bound whole-function entry stream exist. The host consumes the schema marker; earlier local private groups are pre-v15 historical evidence only. | Regenerate the private crate or generate the block pack, then run v15 with the ROM's successful EEPROM operation path. |
+| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, explicit `BlockProgram` host selection, and an artifact/schema-bound whole-function entry stream exist. The host consumes the schema marker; earlier local private groups are pre-v15 historical evidence only. | Regenerate the private crate or generate the block pack, then run v15 with the ROM's successful banked 32-KiB SRAM operation path. |
 | OoT NTSC 1.0, legacy C lane | Observation tooling and exact linked-archive identity wiring exist. | Non-authoritative: measured framebuffer parity is only claimed through swap 60, and the C oracle's missing bodies prevent deeper arbitration beyond the known swap-231 frontier. |
-| Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | The manifest can declare bounded representative coverage; save, PFS, controller input, Rumble, Transfer Pak, and Voice declarations have typed behavioral admission. | No private full-ROM report series or populated representative manifest has been supplied. |
+| Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v15-visible save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, and program-lane assignments while retaining the remaining project-owned profile entries as missing. | No private full-ROM report series, schema-v16 microcode/region evidence, or complete platform result set has been supplied. |
 
-Therefore the generic report mechanism can now retain a multi-ROM
-zero-reached-unsupported result, but populating it remains blocked on private
-ROM/recompiled inputs and ten independent fixed-cycle executions per scenario.
-The matrix still proves only reached paths: it cannot enumerate avoided
-unsupported destinations or convert representative scenarios into exhaustive
-reachable-ROM closure.
+Therefore the generic report mechanism can validate multi-ROM
+zero-reached-unsupported evidence and retain its satisfied/missing profile
+partition in an incomplete assessment, but a complete retained matrix remains
+blocked on private ROM/recompiled inputs, ten independent fixed-cycle
+executions per scenario, and the missing typed evidence classes above. The
+matrix still proves only reached paths: it cannot enumerate avoided unsupported
+destinations or convert representative scenarios into exhaustive reachable-ROM
+closure.
 
 ## Remaining release frontier
 

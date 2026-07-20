@@ -1,12 +1,14 @@
 //! Typed representative-scenario matrix over deterministic release reports.
 //!
-//! The manifest contains identities and coverage declarations, never ROM bytes
-//! or captured output. Dynamic evidence remains the schema-v15 report series;
-//! this layer assigns one exact ten-run series to each declared scenario.
+//! The manifest contains only the immutable project profile and evidence
+//! identities, never ROM bytes, captured output, or caller-authored coverage.
+//! Dynamic evidence remains the schema-v15 report series; coverage is derived
+//! from each validated report before it is compared with the fixed profile.
 
 use crate::{
-    verify_release_evidence_series, ArtifactDigest, ArtifactKind, ClosurePath, ClosurePathStatus,
-    DeterministicDigest, ExecutionDestinationEvidence, FramebufferObservationSource,
+    verify_release_evidence_series, ArtifactDigest, ArtifactKind, CertificationProfileIdentity,
+    CertificationRequirementClass, CertificationRequirementRef, ClosurePath, ClosurePathStatus,
+    DeterministicDigest, ExecutionDestinationEvidence, FramebufferObservationSource, FullParityV1,
     ParsedUnsupportedJournal, ReleaseCartridgeSave, ReleaseControllerPort,
     ReleaseEnvironmentEvidence, ReleaseGateReport, ReleaseGraphicsExecutionPolicy,
     ReleaseHostPlatform, ReleaseObservationGeometry, ReleaseRendererEvidence, ReportSeriesError,
@@ -19,8 +21,9 @@ use std::{
     fmt,
 };
 
-pub const RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix.v4";
-pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v11";
+pub const RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix.v5";
+pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v12";
+pub const INCOMPLETE_RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix-incomplete.v1";
 pub const RELEASE_MATRIX_REPORT_COUNT: usize = 10;
 pub const RELEASE_MATRIX_MAX_SCENARIOS: usize = 64;
 
@@ -100,36 +103,27 @@ pub struct ReleaseMatrixCoverage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseMatrixScenario {
-    /// Stable manifest key used to associate private report paths at verify time.
+    /// Stable diagnostic key. Evidence is associated by `report_scenario`, not
+    /// by a caller-provided command-line assignment.
     pub id: String,
     /// Exact scenario string bound by every schema-v15 report in this series.
     pub report_scenario: String,
     /// Exact private-input identity bound by every report; no input bytes are stored.
     pub input_sha256: String,
     pub report_sha256: String,
-    pub coverage: ReleaseMatrixCoverage,
     /// Canonical digest over this declaration and its exact v15 evidence IDs.
     pub declaration_sha256: String,
 }
 
 impl ReleaseMatrixScenario {
-    /// Recompute the declaration digest without trusting vector ordering.
+    /// Recompute the declaration digest under the v5 evidence-only wire.
     pub fn recompute_declaration_sha256(&self) -> String {
         let mut wire = Vec::new();
-        wire.extend_from_slice(b"fn64.release-matrix.scenario.v4\0");
+        wire.extend_from_slice(b"fn64.release-matrix.scenario.v5\0");
         push_bytes(&mut wire, self.id.as_bytes());
         push_bytes(&mut wire, self.report_scenario.as_bytes());
         push_bytes(&mut wire, self.input_sha256.as_bytes());
         push_bytes(&mut wire, self.report_sha256.as_bytes());
-        push_tags(&mut wire, &self.coverage.platforms, ReleasePlatform::tag);
-        push_tags(
-            &mut wire,
-            &self.coverage.controllers,
-            ControllerFeature::tag,
-        );
-        push_tags(&mut wire, &self.coverage.saves, SaveFeature::tag);
-        push_tags(&mut wire, &self.coverage.renderers, RendererFeature::tag);
-        push_tags(&mut wire, &self.coverage.programs, ProgramFeature::tag);
         hex(&Sha256::digest(wire))
     }
 }
@@ -138,7 +132,7 @@ impl ReleaseMatrixScenario {
 #[serde(deny_unknown_fields)]
 pub struct ReleaseMatrixManifest {
     pub schema: String,
-    pub required: ReleaseMatrixCoverage,
+    pub profile: CertificationProfileIdentity,
     pub scenarios: Vec<ReleaseMatrixScenario>,
 }
 
@@ -147,17 +141,10 @@ impl ReleaseMatrixManifest {
     /// per-scenario evidence identities. No ROM or captured bytes enter it.
     pub fn recompute_manifest_sha256(&self) -> String {
         let mut wire = Vec::new();
-        wire.extend_from_slice(b"fn64.release-matrix.manifest.v4\0");
+        wire.extend_from_slice(b"fn64.release-matrix.manifest.v5\0");
         push_bytes(&mut wire, self.schema.as_bytes());
-        push_tags(&mut wire, &self.required.platforms, ReleasePlatform::tag);
-        push_tags(
-            &mut wire,
-            &self.required.controllers,
-            ControllerFeature::tag,
-        );
-        push_tags(&mut wire, &self.required.saves, SaveFeature::tag);
-        push_tags(&mut wire, &self.required.renderers, RendererFeature::tag);
-        push_tags(&mut wire, &self.required.programs, ProgramFeature::tag);
+        push_bytes(&mut wire, self.profile.schema.as_bytes());
+        push_bytes(&mut wire, self.profile.definition_sha256.as_bytes());
         let mut scenarios: Vec<_> = self.scenarios.iter().collect();
         scenarios.sort_by(|left, right| left.id.cmp(&right.id));
         wire.extend_from_slice(&(scenarios.len() as u32).to_be_bytes());
@@ -216,11 +203,87 @@ pub struct VerifiedMatrixScenario {
 pub struct VerifiedReleaseMatrix {
     pub schema: String,
     pub manifest_sha256: String,
-    pub required: ReleaseMatrixCoverage,
+    pub profile: CertificationProfileIdentity,
     pub total_reports: usize,
     pub scenarios: Vec<VerifiedMatrixScenario>,
+    /// Every project-owned profile requirement and the exact validated
+    /// evidence declarations that satisfy it. A complete retained matrix has
+    /// no unassigned profile member.
+    pub assignments: Vec<CertificationRequirementAssignment>,
     /// Canonical digest over this retained verification result.
     pub verification_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertificationRequirementAssignment {
+    pub requirement: CertificationRequirementRef,
+    pub evidence_sha256s: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncompleteReleaseMatrix {
+    pub schema: String,
+    pub manifest_sha256: String,
+    pub profile: CertificationProfileIdentity,
+    pub verified_scenarios: usize,
+    pub verified_reports: usize,
+    pub satisfied: Vec<CertificationRequirementAssignment>,
+    pub missing: Vec<CertificationRequirementRef>,
+    pub assessment_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "result", rename_all = "snake_case")]
+pub enum ReleaseMatrixVerification {
+    Complete(VerifiedReleaseMatrix),
+    Incomplete(IncompleteReleaseMatrix),
+}
+
+impl IncompleteReleaseMatrix {
+    pub fn verify_integrity(&self) -> Result<(), ReleaseMatrixError> {
+        if self.schema != INCOMPLETE_RELEASE_MATRIX_SCHEMA {
+            return Err(ReleaseMatrixError::UnsupportedIncompleteSchema(
+                self.schema.clone(),
+            ));
+        }
+        let profile = self
+            .profile
+            .verify()
+            .map_err(ReleaseMatrixError::InvalidCertificationProfile)?;
+        validate_sha256(
+            "incomplete-matrix",
+            "manifest_sha256",
+            &self.manifest_sha256,
+        )?;
+        if self.verified_scenarios == 0
+            || self.verified_scenarios > RELEASE_MATRIX_MAX_SCENARIOS
+            || self.verified_reports != self.verified_scenarios * RELEASE_MATRIX_REPORT_COUNT
+        {
+            return Err(ReleaseMatrixError::InvalidIncompleteCounts {
+                scenarios: self.verified_scenarios,
+                reports: self.verified_reports,
+            });
+        }
+        validate_assignment_partition(profile, &self.satisfied, &self.missing, false)?;
+        if self.missing.is_empty() {
+            return Err(ReleaseMatrixError::IncompleteWithoutMissing);
+        }
+        validate_sha256(
+            "incomplete-matrix",
+            "assessment_sha256",
+            &self.assessment_sha256,
+        )?;
+        let recomputed = incomplete_matrix_sha256(self);
+        if self.assessment_sha256 != recomputed {
+            return Err(ReleaseMatrixError::IncompleteIntegrityMismatch {
+                stored: self.assessment_sha256.clone(),
+                recomputed,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl VerifiedReleaseMatrix {
@@ -230,6 +293,10 @@ impl VerifiedReleaseMatrix {
                 self.schema.clone(),
             ));
         }
+        let profile = self
+            .profile
+            .verify()
+            .map_err(ReleaseMatrixError::InvalidCertificationProfile)?;
         if self.scenarios.is_empty() || self.scenarios.len() > RELEASE_MATRIX_MAX_SCENARIOS {
             return Err(ReleaseMatrixError::ScenarioCount {
                 minimum: 1,
@@ -237,16 +304,10 @@ impl VerifiedReleaseMatrix {
                 actual: self.scenarios.len(),
             });
         }
-        validate_coverage("verified required", &self.required, None)?;
         validate_sha256("verified-matrix", "manifest_sha256", &self.manifest_sha256)?;
 
         let mut ids = BTreeSet::new();
         let mut report_scenarios = BTreeSet::new();
-        let mut covered_platforms = BTreeSet::new();
-        let mut covered_controllers = BTreeSet::new();
-        let mut covered_saves = BTreeSet::new();
-        let mut covered_renderers = BTreeSet::new();
-        let mut covered_programs = BTreeSet::new();
         let mut matrix_run_events = BTreeSet::new();
         let expected_artifacts = BTreeSet::from([
             ArtifactKind::Framebuffer,
@@ -275,9 +336,9 @@ impl VerifiedReleaseMatrix {
             }
             validate_sha256(&scenario.id, "input_sha256", &scenario.input_sha256)?;
             validate_sha256(&scenario.id, "report_sha256", &scenario.report_sha256)?;
-            validate_coverage(&scenario.id, &scenario.coverage, Some(&self.required))?;
+            validate_coverage(&scenario.id, &scenario.coverage, None)?;
             let declaration = retained_scenario_declaration(scenario);
-            validate_scenario_cardinality(&declaration)?;
+            validate_coverage_cardinality(&scenario.id, &scenario.coverage)?;
             validate_sha256(
                 &scenario.id,
                 "declaration_sha256",
@@ -291,24 +352,12 @@ impl VerifiedReleaseMatrix {
                     recomputed: recomputed_declaration,
                 });
             }
-            covered_platforms.extend(scenario.coverage.platforms.iter().copied());
-            covered_controllers.extend(scenario.coverage.controllers.iter().copied());
-            covered_saves.extend(scenario.coverage.saves.iter().copied());
-            covered_renderers.extend(scenario.coverage.renderers.iter().copied());
-            covered_programs.extend(scenario.coverage.programs.iter().copied());
             scenario.observations.validate().map_err(|source| {
                 ReleaseMatrixError::InvalidVerifiedObservations {
                     id: scenario.id.clone(),
                     source,
                 }
             })?;
-            validate_environment_coverage(&scenario.id, &scenario.coverage, &scenario.environment)?;
-            validate_renderer_observation(
-                &scenario.id,
-                &scenario.coverage,
-                &scenario.observations,
-                &scenario.environment,
-            )?;
             scenario
                 .execution_destinations
                 .verify_integrity()
@@ -316,11 +365,6 @@ impl VerifiedReleaseMatrix {
                     id: scenario.id.clone(),
                     source,
                 })?;
-            validate_program_coverage(
-                &scenario.id,
-                &scenario.coverage,
-                &scenario.execution_destinations.source,
-            )?;
             let expected_boundary = presentation_boundary(&scenario.observations);
             if scenario.presentation_boundary != expected_boundary {
                 return Err(ReleaseMatrixError::VerifiedPresentationMismatch {
@@ -452,7 +496,7 @@ impl VerifiedReleaseMatrix {
                     actual: scenario.closure_paths,
                 });
             }
-            ReleaseGateReport {
+            let retained_report = ReleaseGateReport {
                 schema: crate::release_gate::REPORT_SCHEMA.to_owned(),
                 scenario: scenario.report_scenario.clone(),
                 input_sha256: scenario.input_sha256.clone(),
@@ -462,25 +506,38 @@ impl VerifiedReleaseMatrix {
                 execution_destinations: scenario.execution_destinations.clone(),
                 closure: scenario.closure.clone(),
                 report_sha256: scenario.report_sha256.clone(),
-            }
-            .verify_integrity()
-            .map_err(|source| ReleaseMatrixError::InvalidVerifiedReport {
-                id: scenario.id.clone(),
-                source,
+            };
+            retained_report.verify_integrity().map_err(|source| {
+                ReleaseMatrixError::InvalidVerifiedReport {
+                    id: scenario.id.clone(),
+                    source,
+                }
             })?;
+            let derived = derive_scenario_coverage(&scenario.id, &retained_report)?;
+            if scenario.coverage != derived {
+                return Err(ReleaseMatrixError::VerifiedDerivedCoverageMismatch {
+                    id: scenario.id.clone(),
+                });
+            }
         }
-        require_all("platforms", &self.required.platforms, &covered_platforms)?;
-        require_all(
-            "controllers",
-            &self.required.controllers,
-            &covered_controllers,
-        )?;
-        require_all("saves", &self.required.saves, &covered_saves)?;
-        require_all("renderers", &self.required.renderers, &covered_renderers)?;
-        require_all("programs", &self.required.programs, &covered_programs)?;
+        let (assignments, missing) = derive_profile_assignments(profile, &self.scenarios);
+        if !missing.is_empty() {
+            return Err(ReleaseMatrixError::VerifiedProfileIncomplete {
+                missing: missing
+                    .iter()
+                    .map(|requirement| {
+                        format!("{}:{}", requirement.class().as_str(), requirement.id())
+                    })
+                    .collect(),
+            });
+        }
+        validate_assignment_partition(profile, &self.assignments, &[], true)?;
+        if self.assignments != assignments {
+            return Err(ReleaseMatrixError::VerifiedAssignmentsMismatch);
+        }
         let retained_manifest = ReleaseMatrixManifest {
             schema: RELEASE_MATRIX_SCHEMA.to_owned(),
-            required: self.required.clone(),
+            profile: self.profile.clone(),
             scenarios: self
                 .scenarios
                 .iter()
@@ -512,32 +569,50 @@ impl VerifiedReleaseMatrix {
     }
 }
 
-/// Verify a bounded representative matrix against private, run-ordered reports.
+/// Verify private, run-ordered reports against the fixed full-parity profile.
 ///
-/// Coverage tags identify scenario selection. Save-device and every
-/// controller/accessory tag require matching positive operation paths derived
-/// by the live gate; platform and renderer tags bind the frozen environment,
-/// while the program tag must equal the retained execution-destination source.
+/// Every report is routed by its integrity-checked `scenario` field. Coverage
+/// is then derived from committed-boundary evidence; the manifest cannot label
+/// a report as a different platform, feature, renderer, or executable lane.
+/// Honest absence returns [`ReleaseMatrixVerification::Incomplete`].
 pub fn verify_release_matrix(
     manifest: &ReleaseMatrixManifest,
-    evidence_by_scenario: &BTreeMap<String, Vec<(ReleaseGateReport, ParsedUnsupportedJournal)>>,
-) -> Result<VerifiedReleaseMatrix, ReleaseMatrixError> {
-    validate_manifest(manifest)?;
+    evidence: &[(ReleaseGateReport, ParsedUnsupportedJournal)],
+) -> Result<ReleaseMatrixVerification, ReleaseMatrixError> {
+    let profile = validate_manifest(manifest)?;
 
-    for id in evidence_by_scenario.keys() {
-        if !manifest.scenarios.iter().any(|scenario| &scenario.id == id) {
-            return Err(ReleaseMatrixError::UnexpectedEvidence { id: id.clone() });
+    let mut evidence_by_report_scenario =
+        BTreeMap::<String, Vec<(ReleaseGateReport, ParsedUnsupportedJournal)>>::new();
+    for (report, journal) in evidence {
+        report.verify_integrity().map_err(|source| {
+            ReleaseMatrixError::InvalidUnassignedReport {
+                scenario: report.scenario.clone(),
+                source,
+            }
+        })?;
+        if !manifest
+            .scenarios
+            .iter()
+            .any(|scenario| scenario.report_scenario == report.scenario)
+        {
+            return Err(ReleaseMatrixError::UnexpectedReportScenario {
+                scenario: report.scenario.clone(),
+            });
         }
+        evidence_by_report_scenario
+            .entry(report.scenario.clone())
+            .or_default()
+            .push((report.clone(), journal.clone()));
     }
 
     let mut verified = Vec::with_capacity(manifest.scenarios.len());
     let mut matrix_run_events = BTreeSet::new();
     for scenario in &manifest.scenarios {
-        let evidence = evidence_by_scenario.get(&scenario.id).ok_or_else(|| {
-            ReleaseMatrixError::MissingEvidence {
+        let evidence = evidence_by_report_scenario
+            .get(&scenario.report_scenario)
+            .ok_or_else(|| ReleaseMatrixError::MissingEvidence {
                 id: scenario.id.clone(),
-            }
-        })?;
+            })?;
         if evidence.len() != RELEASE_MATRIX_REPORT_COUNT {
             return Err(ReleaseMatrixError::WrongReportCount {
                 id: scenario.id.clone(),
@@ -563,7 +638,8 @@ pub fn verify_release_matrix(
         for path_name in LIVE_MINIMUM_CLOSURE_PATHS {
             require_positive_path(&reports[0].closure, &scenario.id, path_name, false)?;
         }
-        validate_feature_operation_paths(&scenario.id, &scenario.coverage, &reports[0].closure)?;
+        let coverage = derive_scenario_coverage(&scenario.id, reports[0])?;
+        validate_feature_operation_paths(&scenario.id, &coverage, &reports[0].closure)?;
         if series.scenario != scenario.report_scenario {
             return Err(ReleaseMatrixError::ReportScenarioMismatch {
                 id: scenario.id.clone(),
@@ -586,25 +662,13 @@ pub fn verify_release_matrix(
                 observed: series.report_sha256,
             });
         }
-        validate_environment_coverage(&scenario.id, &scenario.coverage, &reports[0].environment)?;
-        validate_renderer_observation(
-            &scenario.id,
-            &scenario.coverage,
-            &reports[0].observations,
-            &reports[0].environment,
-        )?;
-        validate_program_coverage(
-            &scenario.id,
-            &scenario.coverage,
-            &reports[0].execution_destinations.source,
-        )?;
         verified.push(VerifiedMatrixScenario {
             id: scenario.id.clone(),
             count: series.count,
             report_sha256: scenario.report_sha256.clone(),
             report_scenario: scenario.report_scenario.clone(),
             input_sha256: scenario.input_sha256.clone(),
-            coverage: scenario.coverage.clone(),
+            coverage,
             declaration_sha256: scenario.declaration_sha256.clone(),
             guest_cycle: series.guest_cycle,
             fixed_cycle_digest: reports[0].digest.clone(),
@@ -626,16 +690,37 @@ pub fn verify_release_matrix(
     }
 
     verified.sort_by(|left, right| left.id.cmp(&right.id));
+    let manifest_sha256 = manifest.recompute_manifest_sha256();
+    let total_reports = verified.iter().map(|scenario| scenario.count).sum();
+    let (assignments, missing) = derive_profile_assignments(profile, &verified);
+    if !missing.is_empty() {
+        let mut incomplete = IncompleteReleaseMatrix {
+            schema: INCOMPLETE_RELEASE_MATRIX_SCHEMA.to_owned(),
+            manifest_sha256,
+            profile: manifest.profile.clone(),
+            verified_scenarios: verified.len(),
+            verified_reports: total_reports,
+            satisfied: assignments,
+            missing,
+            assessment_sha256: String::new(),
+        };
+        incomplete.assessment_sha256 = incomplete_matrix_sha256(&incomplete);
+        incomplete.verify_integrity()?;
+        return Ok(ReleaseMatrixVerification::Incomplete(incomplete));
+    }
+
     let mut result = VerifiedReleaseMatrix {
         schema: VERIFIED_RELEASE_MATRIX_SCHEMA.to_owned(),
-        manifest_sha256: manifest.recompute_manifest_sha256(),
-        required: manifest.required.clone(),
-        total_reports: verified.iter().map(|scenario| scenario.count).sum(),
+        manifest_sha256,
+        profile: manifest.profile.clone(),
+        total_reports,
         scenarios: verified,
+        assignments,
         verification_sha256: String::new(),
     };
     result.verification_sha256 = verified_matrix_sha256(&result);
-    Ok(result)
+    result.verify_integrity()?;
+    Ok(ReleaseMatrixVerification::Complete(result))
 }
 
 fn retained_scenario_declaration(scenario: &VerifiedMatrixScenario) -> ReleaseMatrixScenario {
@@ -644,8 +729,104 @@ fn retained_scenario_declaration(scenario: &VerifiedMatrixScenario) -> ReleaseMa
         report_scenario: scenario.report_scenario.clone(),
         input_sha256: scenario.input_sha256.clone(),
         report_sha256: scenario.report_sha256.clone(),
-        coverage: scenario.coverage.clone(),
         declaration_sha256: scenario.declaration_sha256.clone(),
+    }
+}
+
+fn derive_profile_assignments(
+    profile: FullParityV1,
+    scenarios: &[VerifiedMatrixScenario],
+) -> (
+    Vec<CertificationRequirementAssignment>,
+    Vec<CertificationRequirementRef>,
+) {
+    let mut evidence = BTreeMap::<(CertificationRequirementClass, String), BTreeSet<String>>::new();
+    for scenario in scenarios {
+        let program = program_feature_id(scenario.coverage.programs[0]);
+        let renderer = if scenario
+            .coverage
+            .renderers
+            .contains(&RendererFeature::ReferenceLleAccuracy)
+        {
+            "reference_lle_accuracy"
+        } else {
+            "rt64_lle_accuracy"
+        };
+        insert_requirement_evidence(
+            &mut evidence,
+            CertificationRequirementClass::ProgramRendererLane,
+            format!("{program}/{renderer}"),
+            &scenario.declaration_sha256,
+        );
+        insert_requirement_evidence(
+            &mut evidence,
+            CertificationRequirementClass::Save,
+            save_feature_id(scenario.coverage.saves[0]).to_owned(),
+            &scenario.declaration_sha256,
+        );
+        for controller in &scenario.coverage.controllers {
+            insert_requirement_evidence(
+                &mut evidence,
+                CertificationRequirementClass::Controller,
+                controller_feature_id(*controller).to_owned(),
+                &scenario.declaration_sha256,
+            );
+        }
+    }
+
+    let mut assignments = Vec::new();
+    let mut missing = Vec::new();
+    for requirement in profile.requirements() {
+        let key = (requirement.class(), requirement.id().to_owned());
+        if let Some(evidence_sha256s) = evidence.remove(&key) {
+            assignments.push(CertificationRequirementAssignment {
+                requirement: CertificationRequirementRef::from_requirement(&requirement),
+                evidence_sha256s: evidence_sha256s.into_iter().collect(),
+            });
+        } else {
+            missing.push(CertificationRequirementRef::from_requirement(&requirement));
+        }
+    }
+    (assignments, missing)
+}
+
+fn insert_requirement_evidence(
+    evidence: &mut BTreeMap<(CertificationRequirementClass, String), BTreeSet<String>>,
+    class: CertificationRequirementClass,
+    id: String,
+    declaration_sha256: &str,
+) {
+    evidence
+        .entry((class, id))
+        .or_default()
+        .insert(declaration_sha256.to_owned());
+}
+
+const fn program_feature_id(value: ProgramFeature) -> &'static str {
+    match value {
+        ProgramFeature::NativeArchive => "native_archive",
+        ProgramFeature::TypedObservedFunction => "typed_observed_function",
+        ProgramFeature::TypedBlock => "typed_block",
+    }
+}
+
+const fn save_feature_id(value: SaveFeature) -> &'static str {
+    match value {
+        SaveFeature::NoCartridgeSave => "no_cartridge_save",
+        SaveFeature::Eeprom4Kbit => "eeprom_4_kbit",
+        SaveFeature::Eeprom16Kbit => "eeprom_16_kbit",
+        SaveFeature::Sram32Kib => "sram_32_kib",
+        SaveFeature::FlashRam128Kib => "flash_ram_128_kib",
+    }
+}
+
+const fn controller_feature_id(value: ControllerFeature) -> &'static str {
+    match value {
+        ControllerFeature::StandardController => "standard_controller",
+        ControllerFeature::ControllerPak => "controller_pak",
+        ControllerFeature::RumblePak => "rumble_pak",
+        ControllerFeature::TransferPak => "transfer_pak",
+        ControllerFeature::VoiceRecognitionUnit => "voice_recognition_unit",
     }
 }
 
@@ -662,12 +843,11 @@ fn presentation_boundary(
     }
 }
 
-fn validate_program_coverage(
+fn derive_scenario_coverage(
     id: &str,
-    coverage: &ReleaseMatrixCoverage,
-    source: &crate::ExecutionDestinationSource,
-) -> Result<(), ReleaseMatrixError> {
-    let observed = match source {
+    report: &ReleaseGateReport,
+) -> Result<ReleaseMatrixCoverage, ReleaseMatrixError> {
+    let program = match &report.execution_destinations.source {
         crate::ExecutionDestinationSource::NoProgram => {
             return Err(ReleaseMatrixError::NoProgramEvidence { id: id.to_owned() });
         }
@@ -677,91 +857,55 @@ fn validate_program_coverage(
         }
         crate::ExecutionDestinationSource::TypedBlockProgram { .. } => ProgramFeature::TypedBlock,
     };
-    let expected = coverage.programs[0];
-    if expected == observed {
-        Ok(())
-    } else {
-        Err(ReleaseMatrixError::ProgramCoverageMismatch {
-            id: id.to_owned(),
-            expected,
-            observed,
-        })
-    }
-}
 
-fn validate_renderer_observation(
-    id: &str,
-    coverage: &ReleaseMatrixCoverage,
-    observations: &ReleaseObservationGeometry,
-    environment: &ReleaseEnvironmentEvidence,
-) -> Result<(), ReleaseMatrixError> {
-    let expected = if coverage
-        .renderers
-        .contains(&RendererFeature::ReferenceLleAccuracy)
-    {
-        "physical_rdram"
-    } else {
-        "post_vi_swapchain"
-    };
-    let observed = match &observations.framebuffer.source {
-        FramebufferObservationSource::PhysicalRdram { .. } => "physical_rdram",
-        FramebufferObservationSource::PostViSwapchain {
-            backend_identity, ..
-        } => {
-            if expected == "post_vi_swapchain"
-                && crate::render_evidence::validate_authoritative_rt64_backend_identity(
-                    backend_identity,
-                    environment.platform,
-                )
-                .is_err()
-            {
-                return Err(ReleaseMatrixError::NonAuthoritativeRt64Identity {
-                    id: id.to_owned(),
-                    backend_identity: backend_identity.clone(),
-                });
-            }
-            "post_vi_swapchain"
-        }
-    };
-    match (&environment.renderer, &observations.framebuffer.source) {
+    let environment = &report.environment;
+    let observations = &report.observations;
+    let renderers = match (&environment.renderer, &observations.framebuffer.source) {
         (
-            ReleaseRendererEvidence::Reference { .. },
+            ReleaseRendererEvidence::Reference {
+                execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+            },
             FramebufferObservationSource::PhysicalRdram { .. },
-        ) => {}
+        ) => vec![RendererFeature::ReferenceLleAccuracy],
         (
             ReleaseRendererEvidence::Rt64 {
+                execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
                 backend_identity,
                 source_authoritative: true,
                 settings_sha256,
-                ..
+                replacement_packs_active,
             },
             FramebufferObservationSource::PostViSwapchain {
                 backend_identity: observed_identity,
                 settings_sha256: observed_settings,
                 ..
             },
-        ) if backend_identity == observed_identity && settings_sha256 == observed_settings => {}
+        ) if backend_identity == observed_identity && settings_sha256 == observed_settings => {
+            if crate::render_evidence::validate_authoritative_rt64_backend_identity(
+                backend_identity,
+                environment.platform,
+            )
+            .is_err()
+            {
+                return Err(ReleaseMatrixError::NonAuthoritativeRt64Identity {
+                    id: id.to_owned(),
+                    backend_identity: backend_identity.clone(),
+                });
+            }
+            let mut values = vec![
+                RendererFeature::Rt64LleAccuracy,
+                RendererFeature::Rt64PostViCapture,
+            ];
+            if *replacement_packs_active {
+                values.push(RendererFeature::Rt64ReplacementPacks);
+            }
+            values
+        }
         _ => {
             return Err(ReleaseMatrixError::RendererEnvironmentMismatch { id: id.to_owned() });
         }
-    }
-    if expected == observed {
-        Ok(())
-    } else {
-        Err(ReleaseMatrixError::RendererObservationMismatch {
-            id: id.to_owned(),
-            expected,
-            observed,
-        })
-    }
-}
-
-fn validate_environment_coverage(
-    id: &str,
-    declared: &ReleaseMatrixCoverage,
-    environment: &ReleaseEnvironmentEvidence,
-) -> Result<(), ReleaseMatrixError> {
-    let observed_platforms = vec![match environment.platform {
+    };
+    let platforms = vec![match environment.platform {
         ReleaseHostPlatform::MacosArm64 => ReleasePlatform::MacosArm64,
         ReleaseHostPlatform::LinuxX86_64 => ReleasePlatform::LinuxX86_64,
         ReleaseHostPlatform::WindowsX86_64 => ReleasePlatform::WindowsX86_64,
@@ -790,71 +934,23 @@ fn validate_environment_coverage(
             ReleaseControllerPort::Absent => {}
         }
     }
-    let observed_saves = vec![match environment.cartridge_save {
+    let saves = vec![match environment.cartridge_save {
         ReleaseCartridgeSave::NoCartridgeSave => SaveFeature::NoCartridgeSave,
         ReleaseCartridgeSave::Eeprom4k => SaveFeature::Eeprom4Kbit,
         ReleaseCartridgeSave::Eeprom16k => SaveFeature::Eeprom16Kbit,
         ReleaseCartridgeSave::Sram32Kib => SaveFeature::Sram32Kib,
         ReleaseCartridgeSave::FlashRam128Kib => SaveFeature::FlashRam128Kib,
     }];
-    let observed_renderers: Vec<_> = match &environment.renderer {
-        ReleaseRendererEvidence::Reference {
-            execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
-        } => vec![RendererFeature::ReferenceLleAccuracy],
-        ReleaseRendererEvidence::Rt64 {
-            execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
-            replacement_packs_active,
-            ..
-        } => {
-            let mut values = vec![
-                RendererFeature::Rt64LleAccuracy,
-                RendererFeature::Rt64PostViCapture,
-            ];
-            if *replacement_packs_active {
-                values.push(RendererFeature::Rt64ReplacementPacks);
-            }
-            values
-        }
-        _ => {
-            return Err(ReleaseMatrixError::RendererEnvironmentMismatch { id: id.to_owned() });
-        }
+    let coverage = ReleaseMatrixCoverage {
+        platforms,
+        controllers: observed_controllers.into_iter().collect(),
+        saves,
+        renderers,
+        programs: vec![program],
     };
-
-    require_exact_environment_dimension(id, "platforms", &declared.platforms, observed_platforms)?;
-    require_exact_environment_dimension(
-        id,
-        "controllers",
-        &declared.controllers,
-        observed_controllers.into_iter().collect(),
-    )?;
-    require_exact_environment_dimension(id, "saves", &declared.saves, observed_saves)?;
-    require_exact_environment_dimension(id, "renderers", &declared.renderers, observed_renderers)
-}
-
-fn require_exact_environment_dimension<T: Copy + fmt::Debug + Ord>(
-    id: &str,
-    dimension: &'static str,
-    declared: &[T],
-    observed: Vec<T>,
-) -> Result<(), ReleaseMatrixError> {
-    let declared: BTreeSet<_> = declared.iter().copied().collect();
-    let observed: BTreeSet<_> = observed.into_iter().collect();
-    if declared == observed {
-        Ok(())
-    } else {
-        Err(ReleaseMatrixError::EnvironmentCoverageMismatch {
-            id: id.to_owned(),
-            dimension,
-            declared: declared
-                .into_iter()
-                .map(|value| format!("{value:?}"))
-                .collect(),
-            observed: observed
-                .into_iter()
-                .map(|value| format!("{value:?}"))
-                .collect(),
-        })
-    }
+    validate_coverage(id, &coverage, None)?;
+    validate_coverage_cardinality(id, &coverage)?;
+    Ok(coverage)
 }
 
 fn validate_retained_closure(id: &str, closure: &[ClosurePath]) -> Result<(), ReleaseMatrixError> {
@@ -981,12 +1077,16 @@ fn require_positive_path(
     Ok(())
 }
 
-fn validate_manifest(manifest: &ReleaseMatrixManifest) -> Result<(), ReleaseMatrixError> {
+fn validate_manifest(manifest: &ReleaseMatrixManifest) -> Result<FullParityV1, ReleaseMatrixError> {
     if manifest.schema != RELEASE_MATRIX_SCHEMA {
         return Err(ReleaseMatrixError::UnsupportedSchema(
             manifest.schema.clone(),
         ));
     }
+    let profile = manifest
+        .profile
+        .verify()
+        .map_err(ReleaseMatrixError::InvalidCertificationProfile)?;
     if manifest.scenarios.is_empty() || manifest.scenarios.len() > RELEASE_MATRIX_MAX_SCENARIOS {
         return Err(ReleaseMatrixError::ScenarioCount {
             minimum: 1,
@@ -994,15 +1094,8 @@ fn validate_manifest(manifest: &ReleaseMatrixManifest) -> Result<(), ReleaseMatr
             actual: manifest.scenarios.len(),
         });
     }
-    validate_coverage("required", &manifest.required, None)?;
-
     let mut ids = BTreeSet::new();
     let mut report_scenarios = BTreeSet::new();
-    let mut covered_platforms = BTreeSet::new();
-    let mut covered_controllers = BTreeSet::new();
-    let mut covered_saves = BTreeSet::new();
-    let mut covered_renderers = BTreeSet::new();
-    let mut covered_programs = BTreeSet::new();
 
     for scenario in &manifest.scenarios {
         validate_id(&scenario.id)?;
@@ -1029,8 +1122,6 @@ fn validate_manifest(manifest: &ReleaseMatrixManifest) -> Result<(), ReleaseMatr
             "declaration_sha256",
             &scenario.declaration_sha256,
         )?;
-        validate_coverage(&scenario.id, &scenario.coverage, Some(&manifest.required))?;
-        validate_scenario_cardinality(scenario)?;
         let recomputed = scenario.recompute_declaration_sha256();
         if scenario.declaration_sha256 != recomputed {
             return Err(ReleaseMatrixError::DeclarationDigestMismatch {
@@ -1039,76 +1130,49 @@ fn validate_manifest(manifest: &ReleaseMatrixManifest) -> Result<(), ReleaseMatr
                 recomputed,
             });
         }
-
-        covered_platforms.extend(scenario.coverage.platforms.iter().copied());
-        covered_controllers.extend(scenario.coverage.controllers.iter().copied());
-        covered_saves.extend(scenario.coverage.saves.iter().copied());
-        covered_renderers.extend(scenario.coverage.renderers.iter().copied());
-        covered_programs.extend(scenario.coverage.programs.iter().copied());
     }
-
-    require_all(
-        "platforms",
-        &manifest.required.platforms,
-        &covered_platforms,
-    )?;
-    require_all(
-        "controllers",
-        &manifest.required.controllers,
-        &covered_controllers,
-    )?;
-    require_all("saves", &manifest.required.saves, &covered_saves)?;
-    require_all(
-        "renderers",
-        &manifest.required.renderers,
-        &covered_renderers,
-    )?;
-    require_all("programs", &manifest.required.programs, &covered_programs)?;
-    Ok(())
+    Ok(profile)
 }
 
-fn validate_scenario_cardinality(
-    scenario: &ReleaseMatrixScenario,
+fn validate_coverage_cardinality(
+    id: &str,
+    coverage: &ReleaseMatrixCoverage,
 ) -> Result<(), ReleaseMatrixError> {
-    if scenario.coverage.platforms.len() != 1 {
+    if coverage.platforms.len() != 1 {
         return Err(ReleaseMatrixError::ExactOneCoverage {
-            id: scenario.id.clone(),
+            id: id.to_owned(),
             dimension: "platforms",
-            actual: scenario.coverage.platforms.len(),
+            actual: coverage.platforms.len(),
         });
     }
-    if scenario.coverage.saves.len() != 1 {
+    if coverage.saves.len() != 1 {
         return Err(ReleaseMatrixError::ExactOneCoverage {
-            id: scenario.id.clone(),
+            id: id.to_owned(),
             dimension: "saves",
-            actual: scenario.coverage.saves.len(),
+            actual: coverage.saves.len(),
         });
     }
-    if scenario.coverage.programs.len() != 1 {
+    if coverage.programs.len() != 1 {
         return Err(ReleaseMatrixError::ExactOneCoverage {
-            id: scenario.id.clone(),
+            id: id.to_owned(),
             dimension: "programs",
-            actual: scenario.coverage.programs.len(),
+            actual: coverage.programs.len(),
         });
     }
 
-    let has_reference = scenario
-        .coverage
+    let has_reference = coverage
         .renderers
         .contains(&RendererFeature::ReferenceLleAccuracy);
-    let has_rt64 = scenario
-        .coverage
+    let has_rt64 = coverage
         .renderers
         .contains(&RendererFeature::Rt64LleAccuracy);
     let valid_renderer = match (has_reference, has_rt64) {
-        (true, false) => scenario.coverage.renderers.len() == 1,
+        (true, false) => coverage.renderers.len() == 1,
         (false, true) => true,
         _ => false,
     };
     if !valid_renderer {
-        return Err(ReleaseMatrixError::InvalidRendererCombination {
-            id: scenario.id.clone(),
-        });
+        return Err(ReleaseMatrixError::InvalidRendererCombination { id: id.to_owned() });
     }
     Ok(())
 }
@@ -1215,23 +1279,6 @@ fn validate_dimension<T: Copy + fmt::Debug + Ord>(
     Ok(())
 }
 
-fn require_all<T: Copy + fmt::Debug + Ord>(
-    dimension: &'static str,
-    required: &[T],
-    covered: &BTreeSet<T>,
-) -> Result<(), ReleaseMatrixError> {
-    let missing: Vec<String> = required
-        .iter()
-        .filter(|value| !covered.contains(value))
-        .map(|value| format!("{value:?}"))
-        .collect();
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(ReleaseMatrixError::MissingRequiredCoverage { dimension, missing })
-    }
-}
-
 impl ReleasePlatform {
     const fn tag(self) -> u8 {
         match self {
@@ -1299,20 +1346,142 @@ fn push_tags<T: Copy>(wire: &mut Vec<u8>, values: &[T], tag: impl Fn(T) -> u8) {
     wire.extend_from_slice(&tags);
 }
 
-fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
+fn validate_assignment_partition(
+    profile: FullParityV1,
+    assignments: &[CertificationRequirementAssignment],
+    missing: &[CertificationRequirementRef],
+    require_complete: bool,
+) -> Result<(), ReleaseMatrixError> {
+    let mut observed = BTreeMap::new();
+    for assignment in assignments {
+        assignment
+            .requirement
+            .verify_member(profile)
+            .map_err(ReleaseMatrixError::InvalidCertificationProfile)?;
+        if assignment.evidence_sha256s.is_empty() {
+            return Err(ReleaseMatrixError::EmptyRequirementEvidence {
+                class: assignment.requirement.class(),
+                id: assignment.requirement.id().to_owned(),
+            });
+        }
+        let mut evidence = BTreeSet::new();
+        for digest in &assignment.evidence_sha256s {
+            validate_sha256("certification-assignment", "evidence_sha256s", digest)?;
+            if !evidence.insert(digest) {
+                return Err(ReleaseMatrixError::DuplicateRequirementEvidence {
+                    class: assignment.requirement.class(),
+                    id: assignment.requirement.id().to_owned(),
+                    sha256: digest.clone(),
+                });
+            }
+        }
+        if assignment.evidence_sha256s
+            != evidence
+                .iter()
+                .map(|digest| (*digest).clone())
+                .collect::<Vec<_>>()
+        {
+            return Err(ReleaseMatrixError::InvalidRequirementPartition);
+        }
+        let key = (
+            assignment.requirement.class(),
+            assignment.requirement.id().to_owned(),
+        );
+        if observed.insert(key.clone(), true).is_some() {
+            return Err(ReleaseMatrixError::DuplicateRequirementAssignment {
+                class: key.0,
+                id: key.1,
+            });
+        }
+    }
+    for requirement in missing {
+        requirement
+            .verify_member(profile)
+            .map_err(ReleaseMatrixError::InvalidCertificationProfile)?;
+        let key = (requirement.class(), requirement.id().to_owned());
+        if observed.insert(key.clone(), false).is_some() {
+            return Err(ReleaseMatrixError::DuplicateRequirementAssignment {
+                class: key.0,
+                id: key.1,
+            });
+        }
+    }
+
+    let requirements = profile.requirements();
+    let expected_keys: Vec<_> = requirements
+        .iter()
+        .map(|requirement| (requirement.class(), requirement.id().to_owned()))
+        .collect();
+    let actual_satisfied: Vec<_> = assignments
+        .iter()
+        .map(|assignment| {
+            (
+                assignment.requirement.class(),
+                assignment.requirement.id().to_owned(),
+            )
+        })
+        .collect();
+    let expected_satisfied: Vec<_> = expected_keys
+        .iter()
+        .filter(|key| observed.get(*key) == Some(&true))
+        .cloned()
+        .collect();
+    let actual_missing: Vec<_> = missing
+        .iter()
+        .map(|requirement| (requirement.class(), requirement.id().to_owned()))
+        .collect();
+    let expected_missing: Vec<_> = expected_keys
+        .iter()
+        .filter(|key| observed.get(*key) == Some(&false))
+        .cloned()
+        .collect();
+    if observed.len() != expected_keys.len()
+        || actual_satisfied != expected_satisfied
+        || actual_missing != expected_missing
+        || (require_complete && !missing.is_empty())
+    {
+        return Err(ReleaseMatrixError::InvalidRequirementPartition);
+    }
+    Ok(())
+}
+
+fn push_assignment(wire: &mut Vec<u8>, assignment: &CertificationRequirementAssignment) {
+    push_bytes(wire, assignment.requirement.class().as_str().as_bytes());
+    push_bytes(wire, assignment.requirement.id().as_bytes());
+    wire.extend_from_slice(&(assignment.evidence_sha256s.len() as u32).to_be_bytes());
+    for digest in &assignment.evidence_sha256s {
+        push_bytes(wire, digest.as_bytes());
+    }
+}
+
+fn incomplete_matrix_sha256(report: &IncompleteReleaseMatrix) -> String {
     let mut wire = Vec::new();
-    wire.extend_from_slice(b"fn64.verified-release-matrix.v11\0");
+    wire.extend_from_slice(b"fn64.release-matrix-incomplete.v1\0");
     push_bytes(&mut wire, report.schema.as_bytes());
     push_bytes(&mut wire, report.manifest_sha256.as_bytes());
-    push_tags(&mut wire, &report.required.platforms, ReleasePlatform::tag);
-    push_tags(
-        &mut wire,
-        &report.required.controllers,
-        ControllerFeature::tag,
-    );
-    push_tags(&mut wire, &report.required.saves, SaveFeature::tag);
-    push_tags(&mut wire, &report.required.renderers, RendererFeature::tag);
-    push_tags(&mut wire, &report.required.programs, ProgramFeature::tag);
+    push_bytes(&mut wire, report.profile.schema.as_bytes());
+    push_bytes(&mut wire, report.profile.definition_sha256.as_bytes());
+    wire.extend_from_slice(&(report.verified_scenarios as u64).to_be_bytes());
+    wire.extend_from_slice(&(report.verified_reports as u64).to_be_bytes());
+    wire.extend_from_slice(&(report.satisfied.len() as u32).to_be_bytes());
+    for assignment in &report.satisfied {
+        push_assignment(&mut wire, assignment);
+    }
+    wire.extend_from_slice(&(report.missing.len() as u32).to_be_bytes());
+    for requirement in &report.missing {
+        push_bytes(&mut wire, requirement.class().as_str().as_bytes());
+        push_bytes(&mut wire, requirement.id().as_bytes());
+    }
+    hex(&Sha256::digest(wire))
+}
+
+fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
+    let mut wire = Vec::new();
+    wire.extend_from_slice(b"fn64.verified-release-matrix.v12\0");
+    push_bytes(&mut wire, report.schema.as_bytes());
+    push_bytes(&mut wire, report.manifest_sha256.as_bytes());
+    push_bytes(&mut wire, report.profile.schema.as_bytes());
+    push_bytes(&mut wire, report.profile.definition_sha256.as_bytes());
     wire.extend_from_slice(&(report.total_reports as u64).to_be_bytes());
 
     let mut scenarios: Vec<_> = report.scenarios.iter().collect();
@@ -1408,6 +1577,10 @@ fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
             PresentationBoundaryEvidence::CommittedViBoundary => 0,
             PresentationBoundaryEvidence::ExactPostViCapture => 1,
         });
+    }
+    wire.extend_from_slice(&(report.assignments.len() as u32).to_be_bytes());
+    for assignment in &report.assignments {
+        push_assignment(&mut wire, assignment);
     }
     hex(&Sha256::digest(wire))
 }
@@ -1506,6 +1679,45 @@ fn hex(bytes: &[u8]) -> String {
 pub enum ReleaseMatrixError {
     UnsupportedSchema(String),
     UnsupportedVerifiedSchema(String),
+    UnsupportedIncompleteSchema(String),
+    InvalidCertificationProfile(crate::CertificationProfileError),
+    InvalidUnassignedReport {
+        scenario: String,
+        source: crate::GateError,
+    },
+    UnexpectedReportScenario {
+        scenario: String,
+    },
+    VerifiedDerivedCoverageMismatch {
+        id: String,
+    },
+    VerifiedProfileIncomplete {
+        missing: Vec<String>,
+    },
+    VerifiedAssignmentsMismatch,
+    InvalidIncompleteCounts {
+        scenarios: usize,
+        reports: usize,
+    },
+    IncompleteWithoutMissing,
+    IncompleteIntegrityMismatch {
+        stored: String,
+        recomputed: String,
+    },
+    EmptyRequirementEvidence {
+        class: CertificationRequirementClass,
+        id: String,
+    },
+    DuplicateRequirementEvidence {
+        class: CertificationRequirementClass,
+        id: String,
+        sha256: String,
+    },
+    DuplicateRequirementAssignment {
+        class: CertificationRequirementClass,
+        id: String,
+    },
+    InvalidRequirementPartition,
     VerifiedReportCountMismatch {
         stored: usize,
         recomputed: usize,
@@ -1719,6 +1931,20 @@ impl fmt::Display for ReleaseMatrixError {
         match self {
             Self::UnsupportedSchema(schema) => write!(f, "unsupported release-matrix schema {schema:?}"),
             Self::UnsupportedVerifiedSchema(schema) => write!(f, "unsupported verified release-matrix schema {schema:?}"),
+            Self::UnsupportedIncompleteSchema(schema) => write!(f, "unsupported incomplete release-matrix schema {schema:?}"),
+            Self::InvalidCertificationProfile(source) => write!(f, "invalid certification profile: {source}"),
+            Self::InvalidUnassignedReport { scenario, source } => write!(f, "release report scenario {scenario:?} is invalid before matrix assignment: {source}"),
+            Self::UnexpectedReportScenario { scenario } => write!(f, "release report scenario {scenario:?} is not declared by the matrix manifest"),
+            Self::VerifiedDerivedCoverageMismatch { id } => write!(f, "verified release-matrix scenario {id:?} stores coverage that does not match its retained report evidence"),
+            Self::VerifiedProfileIncomplete { missing } => write!(f, "verified release matrix is missing project-owned profile requirements {missing:?}"),
+            Self::VerifiedAssignmentsMismatch => write!(f, "verified release-matrix requirement assignments do not match retained scenario evidence"),
+            Self::InvalidIncompleteCounts { scenarios, reports } => write!(f, "incomplete release matrix has invalid verified counts: scenarios={scenarios}, reports={reports}"),
+            Self::IncompleteWithoutMissing => write!(f, "incomplete release matrix has no missing requirements"),
+            Self::IncompleteIntegrityMismatch { stored, recomputed } => write!(f, "incomplete release-matrix assessment SHA mismatch: stored={stored}, recomputed={recomputed}"),
+            Self::EmptyRequirementEvidence { class, id } => write!(f, "certification requirement ({}:{id}) has no validating evidence identity", class.as_str()),
+            Self::DuplicateRequirementEvidence { class, id, sha256 } => write!(f, "certification requirement ({}:{id}) repeats evidence identity {sha256}", class.as_str()),
+            Self::DuplicateRequirementAssignment { class, id } => write!(f, "certification requirement ({}:{id}) appears more than once in the outcome partition", class.as_str()),
+            Self::InvalidRequirementPartition => write!(f, "certification outcome is not the canonical complete partition of the project-owned profile"),
             Self::VerifiedReportCountMismatch { stored, recomputed } => write!(f, "verified release matrix stores total_reports={stored}, recomputed={recomputed}"),
             Self::VerifiedScenarioReportCount { id, expected, actual } => write!(f, "verified release-matrix scenario {id:?} has {actual} reports; exactly {expected} are required"),
             Self::VerifiedCycleMismatch { id, scenario_cycle, digest_cycle } => write!(f, "verified release-matrix scenario {id:?} names cycle {scenario_cycle}, but its fixed-cycle digest names {digest_cycle}"),
@@ -1775,6 +2001,8 @@ impl fmt::Display for ReleaseMatrixError {
 impl std::error::Error for ReleaseMatrixError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::InvalidCertificationProfile(source) => Some(source),
+            Self::InvalidUnassignedReport { source, .. } => Some(source),
             Self::InvalidSeries { source, .. } => Some(source),
             Self::InvalidVerifiedObservations { source, .. } => Some(source),
             Self::InvalidVerifiedDigest { source, .. } => Some(source),
@@ -1989,101 +2217,16 @@ mod tests {
         .unwrap()
     }
 
-    fn coverage(
-        platform: ReleasePlatform,
-        controller: ControllerFeature,
-        save: SaveFeature,
-        renderer: RendererFeature,
-    ) -> ReleaseMatrixCoverage {
-        ReleaseMatrixCoverage {
-            platforms: vec![platform],
-            controllers: vec![controller],
-            saves: vec![save],
-            renderers: vec![renderer],
-            programs: vec![ProgramFeature::TypedObservedFunction],
-        }
-    }
-
-    fn fixture() -> (
-        ReleaseMatrixManifest,
-        BTreeMap<String, Vec<(ReleaseGateReport, ParsedUnsupportedJournal)>>,
-    ) {
-        let reference = closed_report(
-            "game-a-reference",
-            b"private-a",
-            0xa1,
-            "save.eeprom-4k-operation",
-            CLEAN_RT64_IDENTITY,
-            Some(ProgramFeature::TypedObservedFunction),
-        );
-        let rt64 = closed_report(
-            "game-b-rt64",
-            b"private-b",
-            0xb2,
-            "save.sram-operation",
-            CLEAN_RT64_IDENTITY,
-            Some(ProgramFeature::TypedObservedFunction),
-        );
-        let mut manifest = ReleaseMatrixManifest {
-            schema: RELEASE_MATRIX_SCHEMA.to_owned(),
-            required: ReleaseMatrixCoverage {
-                platforms: vec![ReleasePlatform::MacosArm64, ReleasePlatform::LinuxX86_64],
-                controllers: vec![
-                    ControllerFeature::StandardController,
-                    ControllerFeature::RumblePak,
-                ],
-                saves: vec![SaveFeature::Eeprom4Kbit, SaveFeature::Sram32Kib],
-                renderers: vec![
-                    RendererFeature::ReferenceLleAccuracy,
-                    RendererFeature::Rt64LleAccuracy,
-                    RendererFeature::Rt64PostViCapture,
-                ],
-                programs: vec![ProgramFeature::TypedObservedFunction],
-            },
-            scenarios: vec![
-                ReleaseMatrixScenario {
-                    id: "game-a-reference".to_owned(),
-                    report_scenario: reference.scenario.clone(),
-                    input_sha256: reference.input_sha256.clone(),
-                    report_sha256: reference.report_sha256.clone(),
-                    coverage: coverage(
-                        ReleasePlatform::MacosArm64,
-                        ControllerFeature::StandardController,
-                        SaveFeature::Eeprom4Kbit,
-                        RendererFeature::ReferenceLleAccuracy,
-                    ),
-                    declaration_sha256: String::new(),
-                },
-                ReleaseMatrixScenario {
-                    id: "game-b-rt64".to_owned(),
-                    report_scenario: rt64.scenario.clone(),
-                    input_sha256: rt64.input_sha256.clone(),
-                    report_sha256: rt64.report_sha256.clone(),
-                    coverage: {
-                        let mut coverage = coverage(
-                            ReleasePlatform::LinuxX86_64,
-                            ControllerFeature::RumblePak,
-                            SaveFeature::Sram32Kib,
-                            RendererFeature::Rt64LleAccuracy,
-                        );
-                        coverage
-                            .controllers
-                            .push(ControllerFeature::StandardController);
-                        coverage.renderers.push(RendererFeature::Rt64PostViCapture);
-                        coverage
-                    },
-                    declaration_sha256: String::new(),
-                },
-            ],
+    fn scenario(id: &str, report: &ReleaseGateReport) -> ReleaseMatrixScenario {
+        let mut scenario = ReleaseMatrixScenario {
+            id: id.to_owned(),
+            report_scenario: report.scenario.clone(),
+            input_sha256: report.input_sha256.clone(),
+            report_sha256: report.report_sha256.clone(),
+            declaration_sha256: String::new(),
         };
-        for scenario in &mut manifest.scenarios {
-            scenario.declaration_sha256 = scenario.recompute_declaration_sha256();
-        }
-        let reports = BTreeMap::from([
-            ("game-a-reference".to_owned(), evidence_series(reference)),
-            ("game-b-rt64".to_owned(), evidence_series(rt64)),
-        ]);
-        (manifest, reports)
+        scenario.declaration_sha256 = scenario.recompute_declaration_sha256();
+        scenario
     }
 
     fn evidence_series(
@@ -2107,1107 +2250,685 @@ mod tests {
             .collect()
     }
 
+    fn fixture() -> (
+        ReleaseMatrixManifest,
+        Vec<(ReleaseGateReport, ParsedUnsupportedJournal)>,
+    ) {
+        let reference = closed_report(
+            "game-a-reference",
+            b"private-a",
+            0xa1,
+            "save.eeprom-4k-operation",
+            CLEAN_RT64_IDENTITY,
+            Some(ProgramFeature::TypedObservedFunction),
+        );
+        let rt64 = closed_report(
+            "game-b-rt64",
+            b"private-b",
+            0xb2,
+            "save.sram-operation",
+            CLEAN_RT64_IDENTITY,
+            Some(ProgramFeature::TypedObservedFunction),
+        );
+        let manifest = ReleaseMatrixManifest {
+            schema: RELEASE_MATRIX_SCHEMA.to_owned(),
+            profile: CertificationProfileIdentity::full_parity_v1(),
+            scenarios: vec![
+                scenario("reference-evidence", &reference),
+                scenario("rt64-evidence", &rt64),
+            ],
+        };
+        let reference = evidence_series(reference);
+        let rt64 = evidence_series(rt64);
+        let mut evidence = Vec::with_capacity(RELEASE_MATRIX_REPORT_COUNT * 2);
+        for index in 0..RELEASE_MATRIX_REPORT_COUNT {
+            // Deliberately interleave the flat input in the opposite order
+            // from the manifest. Routing authority is report.scenario.
+            evidence.push(rt64[index].clone());
+            evidence.push(reference[index].clone());
+        }
+        (manifest, evidence)
+    }
+
+    fn incomplete_fixture() -> (
+        ReleaseMatrixManifest,
+        Vec<(ReleaseGateReport, ParsedUnsupportedJournal)>,
+        IncompleteReleaseMatrix,
+    ) {
+        let (manifest, evidence) = fixture();
+        let incomplete = match verify_release_matrix(&manifest, &evidence).unwrap() {
+            ReleaseMatrixVerification::Incomplete(incomplete) => incomplete,
+            ReleaseMatrixVerification::Complete(_) => {
+                panic!("two scenarios cannot cover the fixed full-parity denominator")
+            }
+        };
+        incomplete.verify_integrity().unwrap();
+        (manifest, evidence, incomplete)
+    }
+
+    fn replace_report(
+        manifest: &mut ReleaseMatrixManifest,
+        evidence: &mut Vec<(ReleaseGateReport, ParsedUnsupportedJournal)>,
+        report: ReleaseGateReport,
+    ) {
+        let declaration = manifest
+            .scenarios
+            .iter_mut()
+            .find(|scenario| scenario.report_scenario == report.scenario)
+            .expect("replacement report scenario is declared");
+        declaration.input_sha256 = report.input_sha256.clone();
+        declaration.report_sha256 = report.report_sha256.clone();
+        declaration.declaration_sha256 = declaration.recompute_declaration_sha256();
+        evidence.retain(|(existing, _)| existing.scenario != report.scenario);
+        evidence.extend(evidence_series(report));
+    }
+
+    fn forged_ref(class: CertificationRequirementClass, id: &str) -> CertificationRequirementRef {
+        serde_json::from_value(serde_json::json!({
+            "class": class,
+            "id": id,
+        }))
+        .unwrap()
+    }
+
+    fn requirement_keys(
+        requirements: impl IntoIterator<Item = CertificationRequirementRef>,
+    ) -> Vec<(CertificationRequirementClass, String)> {
+        requirements
+            .into_iter()
+            .map(|requirement| (requirement.class(), requirement.id().to_owned()))
+            .collect()
+    }
+
+    fn profile_keys() -> Vec<(CertificationRequirementClass, String)> {
+        FullParityV1::new()
+            .requirements()
+            .into_iter()
+            .map(|requirement| (requirement.class(), requirement.id().to_owned()))
+            .collect()
+    }
+
     #[test]
-    fn accepts_complete_exact_ten_report_matrix() {
-        let (manifest, reports) = fixture();
-        let verified = verify_release_matrix(&manifest, &reports).unwrap();
-        verified.verify_integrity().unwrap();
-        assert_eq!(verified.schema, VERIFIED_RELEASE_MATRIX_SCHEMA);
-        assert_eq!(verified.total_reports, 20);
+    fn valid_v5_evidence_returns_canonical_incomplete_profile() {
+        let (manifest, evidence, incomplete) = incomplete_fixture();
+        assert_eq!(FullParityV1::REQUIREMENT_COUNT, 162);
+        assert_eq!(incomplete.verified_scenarios, 2);
+        assert_eq!(incomplete.verified_reports, 20);
+        assert_eq!(incomplete.satisfied.len(), 6);
+        assert_eq!(incomplete.missing.len(), 156);
         assert_eq!(
-            verified.manifest_sha256,
+            incomplete.manifest_sha256,
             manifest.recompute_manifest_sha256()
         );
-        assert_eq!(verified.scenarios.len(), 2);
-        assert!(verified
-            .scenarios
+
+        let satisfied_keys: BTreeSet<_> = incomplete
+            .satisfied
             .iter()
-            .all(|scenario| scenario.count == 10));
-        assert!(verified.scenarios.iter().all(|scenario| scenario
-            .fixed_cycle_digest
-            .artifacts
-            .len()
-            == 5
-            && scenario.unsupported_events == 0
-            && scenario.unsupported_journal_schema == "fn64.unsupported-journal.v3"
-            && scenario.bound_journals == 10
-            && scenario.run_event_sha256s.len() == 10));
-        assert_eq!(
-            verified.scenarios[0].coverage,
-            manifest.scenarios[0].coverage
-        );
-        assert_eq!(
-            verified.scenarios[1].coverage,
-            manifest.scenarios[1].coverage
-        );
-    }
-
-    #[test]
-    fn program_lane_is_derived_from_destinations_and_cannot_be_cross_labeled() {
-        let (mut manifest, reports) = fixture();
-        manifest.required.programs = vec![
-            ProgramFeature::TypedObservedFunction,
-            ProgramFeature::NativeArchive,
-        ];
-        manifest.scenarios[0].coverage.programs = vec![ProgramFeature::NativeArchive];
-        manifest.scenarios[0].declaration_sha256 =
-            manifest.scenarios[0].recompute_declaration_sha256();
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::ProgramCoverageMismatch {
-                expected: ProgramFeature::NativeArchive,
-                observed: ProgramFeature::TypedObservedFunction,
-                ..
-            })
-        ));
-
-        let (manifest, reports) = fixture();
-        let mut verified = verify_release_matrix(&manifest, &reports).unwrap();
-        let baseline_sha = verified.verification_sha256.clone();
-        verified
-            .required
-            .programs
-            .push(ProgramFeature::NativeArchive);
-        verified.scenarios[0].coverage.programs = vec![ProgramFeature::NativeArchive];
-        verified.scenarios[0].declaration_sha256 =
-            retained_scenario_declaration(&verified.scenarios[0]).recompute_declaration_sha256();
-        verified.verification_sha256 = verified_matrix_sha256(&verified);
-        assert_ne!(verified.verification_sha256, baseline_sha);
-        assert!(matches!(
-            verified.verify_integrity(),
-            Err(ReleaseMatrixError::ProgramCoverageMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn every_program_lane_accepts_only_its_matching_destination_source() {
-        for (id, program) in [
-            ("program-native-archive", ProgramFeature::NativeArchive),
-            (
-                "program-typed-function",
-                ProgramFeature::TypedObservedFunction,
-            ),
-            ("program-typed-block", ProgramFeature::TypedBlock),
-        ] {
-            let report = closed_report(
-                id,
-                b"private-program",
-                0x77,
-                "save.eeprom-4k-operation",
-                CLEAN_RT64_IDENTITY,
-                Some(program),
-            );
-            let coverage = ReleaseMatrixCoverage {
-                platforms: vec![ReleasePlatform::MacosArm64],
-                controllers: vec![ControllerFeature::StandardController],
-                saves: vec![SaveFeature::Eeprom4Kbit],
-                renderers: vec![RendererFeature::ReferenceLleAccuracy],
-                programs: vec![program],
-            };
-            let mut scenario = ReleaseMatrixScenario {
-                id: id.to_owned(),
-                report_scenario: report.scenario.clone(),
-                input_sha256: report.input_sha256.clone(),
-                report_sha256: report.report_sha256.clone(),
-                coverage: coverage.clone(),
-                declaration_sha256: String::new(),
-            };
-            scenario.declaration_sha256 = scenario.recompute_declaration_sha256();
-            let manifest = ReleaseMatrixManifest {
-                schema: RELEASE_MATRIX_SCHEMA.to_owned(),
-                required: coverage,
-                scenarios: vec![scenario],
-            };
-            let reports = BTreeMap::from([(id.to_owned(), evidence_series(report))]);
-
-            let verified = verify_release_matrix(&manifest, &reports).unwrap();
-            assert_eq!(verified.scenarios[0].coverage.programs, vec![program]);
-            verified.verify_integrity().unwrap();
-        }
-    }
-
-    #[test]
-    fn representative_matrix_rejects_a_report_without_program_entry_evidence() {
-        let (mut manifest, mut reports) = fixture();
-        let original = &reports["game-a-reference"][0].0;
-        let replacement = ReleaseGateReport::new_with_test_environment(
-            original.scenario.clone(),
-            b"private-a",
-            original.digest.clone(),
-            original.observations.clone(),
-            original.environment.clone(),
-            original.closure.clone(),
-        )
-        .unwrap();
-        reports.insert(
-            "game-a-reference".to_owned(),
-            evidence_series(replacement.clone()),
-        );
-        manifest.scenarios[0].report_sha256 = replacement.report_sha256;
-        manifest.scenarios[0].declaration_sha256 =
-            manifest.scenarios[0].recompute_declaration_sha256();
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::NoProgramEvidence { .. })
-        ));
-    }
-
-    #[test]
-    fn renderer_declaration_cannot_cross_label_observation_source() {
-        let (mut manifest, mut reports) = fixture();
-        let original = &reports["game-b-rt64"][0].0;
-        let physical_digest = reports["game-a-reference"][0].0.digest.clone();
-        let mut replacement_environment = original.environment.clone();
-        replacement_environment.renderer = ReleaseRendererEvidence::Reference {
-            execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
-        };
-        let replacement = ReleaseGateReport::new_with_test_environment(
-            original.scenario.clone(),
-            b"private-b",
-            physical_digest,
-            ReleaseObservationGeometry::reference_rdram(0, 1, 1).unwrap(),
-            replacement_environment,
-            original.closure.clone(),
-        )
-        .unwrap();
-        reports.insert(
-            "game-b-rt64".to_owned(),
-            evidence_series(replacement.clone()),
-        );
-        manifest.scenarios[1].report_sha256 = replacement.report_sha256;
-        manifest.scenarios[1].declaration_sha256 =
-            manifest.scenarios[1].recompute_declaration_sha256();
-
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::EnvironmentCoverageMismatch {
-                dimension: "renderers",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn rt64_certification_rejects_unbound_or_nonauthoritative_identities() {
-        for identity in [
-            concat!(
-                "adapter=fn64-render-rt64/rt64;adapter_sha256=",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                ";source=git:",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                ";provenance=git-dirty;overlay=fn64-test;post_vi_api=vulkan-bgra8-rgba8-unorm"
-            ),
-            concat!(
-                "adapter=fn64-render-rt64/rt64;adapter_sha256=",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                ";source=declared:test;provenance=declared;overlay=fn64-test;post_vi_api=vulkan-bgra8-rgba8-unorm"
-            ),
-            concat!(
-                "adapter=fn64-render-rt64/rt64;source=git:",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                ";provenance=git-clean;overlay=fn64-test;post_vi_api=vulkan-bgra8-rgba8-unorm"
-            ),
-            concat!(
-                "adapter=fn64-render-rt64/rt64;adapter_sha256=NOT-A-SHA;source=git:",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                ";provenance=git-clean;overlay=fn64-test;post_vi_api=vulkan-bgra8-rgba8-unorm"
-            ),
-            concat!(
-                "adapter=fn64-render-rt64/rt64;adapter_sha256=",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                ";source=abc123;provenance=git-clean;overlay=fn64-test;post_vi_api=vulkan-bgra8-rgba8-unorm"
-            ),
-            concat!(
-                "adapter=fn64-render-rt64/rt64;adapter_sha256=",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                ";source=git:",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                ";provenance=git-clean;overlay=fn64-test;post_vi_api=metal-bgra8-unorm"
-            ),
-            "synthetic-release-backend",
-        ] {
-            assert!(
-                crate::render_evidence::validate_authoritative_rt64_backend_identity(
-                identity,
-                    ReleaseHostPlatform::LinuxX86_64,
+            .map(|assignment| {
+                (
+                    assignment.requirement.class(),
+                    assignment.requirement.id().to_owned(),
                 )
-                .is_err(),
-                "invalid identity passed: {identity}"
-            );
-        }
-    }
-
-    #[test]
-    fn verified_matrix_json_binds_artifacts_zero_unsupported_and_presentation_boundary() {
-        let (mut manifest, reports) = fixture();
-        manifest.scenarios[1].declaration_sha256 =
-            manifest.scenarios[1].recompute_declaration_sha256();
-
-        let verified = verify_release_matrix(&manifest, &reports).unwrap();
-        let json = serde_json::to_string(&verified).unwrap();
-        let retained: VerifiedReleaseMatrix = serde_json::from_str(&json).unwrap();
-        retained.verify_integrity().unwrap();
-        assert!(json.contains("\"coverage\""));
-        assert!(json.contains("\"framebuffer\""));
-        assert!(json.contains("\"audio\""));
-        assert!(json.contains("\"memory\""));
-        assert!(json.contains("\"device_state\""));
-        assert!(json.contains("\"timing_trace\""));
-        assert_eq!(
-            retained.scenarios[1].presentation_boundary,
-            PresentationBoundaryEvidence::ExactPostViCapture
-        );
-
-        let mut mutated = retained.clone();
-        mutated.scenarios[0].fixed_cycle_digest.artifacts[0].sha256 = "0".repeat(64);
-        assert!(matches!(
-            mutated.verify_integrity(),
-            Err(ReleaseMatrixError::InvalidVerifiedDigest { .. })
-        ));
-
-        mutated.scenarios[0].fixed_cycle_digest.artifacts.pop();
-        assert!(matches!(
-            mutated.verify_integrity(),
-            Err(ReleaseMatrixError::VerifiedArtifactSet { .. })
-        ));
-
-        let mut invalid_destinations = retained.clone();
-        invalid_destinations.scenarios[0]
-            .execution_destinations
-            .total_observations = 2;
-        invalid_destinations.verification_sha256 = verified_matrix_sha256(&invalid_destinations);
-        assert!(matches!(
-            invalid_destinations.verify_integrity(),
-            Err(ReleaseMatrixError::InvalidVerifiedDestinations { .. })
-        ));
-
-        let mut wrong_memory_count = retained.clone();
-        let digest = &mut wrong_memory_count.scenarios[0].fixed_cycle_digest;
-        digest.artifacts[2].bytes -= 1;
-        digest.root_sha256 =
-            crate::release_gate::recompute_digest_root(digest.guest_cycle, &digest.artifacts)
-                .unwrap();
-        wrong_memory_count.verification_sha256 = verified_matrix_sha256(&wrong_memory_count);
-        assert!(matches!(
-            wrong_memory_count.verify_integrity(),
-            Err(ReleaseMatrixError::InvalidVerifiedDigest {
-                source: crate::GateError::ArtifactObservationByteMismatch {
-                    kind: ArtifactKind::Memory,
-                    ..
-                },
-                ..
             })
-        ));
+            .collect();
+        let expected_satisfied: Vec<_> = profile_keys()
+            .into_iter()
+            .filter(|key| satisfied_keys.contains(key))
+            .collect();
+        let actual_satisfied: Vec<_> = incomplete
+            .satisfied
+            .iter()
+            .map(|assignment| {
+                (
+                    assignment.requirement.class(),
+                    assignment.requirement.id().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(actual_satisfied, expected_satisfied);
 
-        let mut dirty_identity = retained.clone();
-        let FramebufferObservationSource::PostViSwapchain {
-            backend_identity, ..
-        } = &mut dirty_identity.scenarios[1].observations.framebuffer.source
-        else {
-            unreachable!("fixture RT64 scenario uses post-VI evidence")
+        let missing_keys = requirement_keys(incomplete.missing.clone());
+        let expected_missing: Vec<_> = profile_keys()
+            .into_iter()
+            .filter(|key| !satisfied_keys.contains(key))
+            .collect();
+        assert_eq!(missing_keys, expected_missing);
+
+        let standard = incomplete
+            .satisfied
+            .iter()
+            .find(|assignment| {
+                assignment.requirement.class() == CertificationRequirementClass::Controller
+                    && assignment.requirement.id() == "standard_controller"
+            })
+            .unwrap();
+        assert_eq!(standard.evidence_sha256s.len(), 2);
+
+        // Re-running the interleaved flat stream is deterministic.
+        let rerun = match verify_release_matrix(&manifest, &evidence).unwrap() {
+            ReleaseMatrixVerification::Incomplete(value) => value,
+            ReleaseMatrixVerification::Complete(_) => unreachable!(),
         };
-        *backend_identity =
-            backend_identity.replace("provenance=git-clean", "provenance=git-dirty");
-        dirty_identity.verification_sha256 = verified_matrix_sha256(&dirty_identity);
-        assert!(matches!(
-            dirty_identity.verify_integrity(),
-            Err(ReleaseMatrixError::NonAuthoritativeRt64Identity { .. })
-        ));
-
-        let mut unbound = verified;
-        unbound.scenarios[0].bound_journals = 9;
-        assert!(matches!(
-            unbound.verify_integrity(),
-            Err(ReleaseMatrixError::VerifiedJournalBinding { .. })
-        ));
-
-        let mut replayed = retained.clone();
-        replayed.scenarios[1].run_event_sha256s[0] =
-            replayed.scenarios[0].run_event_sha256s[0].clone();
-        replayed.verification_sha256 = verified_matrix_sha256(&replayed);
-        assert!(matches!(
-            replayed.verify_integrity(),
-            Err(ReleaseMatrixError::DuplicateRunEventIdentity { .. })
-        ));
-
-        let mut historical_schema = retained;
-        historical_schema.schema = "fn64.verified-release-matrix.v9".to_owned();
-        assert!(matches!(
-            historical_schema.verify_integrity(),
-            Err(ReleaseMatrixError::UnsupportedVerifiedSchema(schema))
-                if schema == "fn64.verified-release-matrix.v9"
-        ));
+        assert_eq!(rerun.assessment_sha256, incomplete.assessment_sha256);
     }
 
     #[test]
-    fn verified_matrix_v11_wire_binds_every_frozen_environment_field() {
-        let (manifest, reports) = fixture();
-        let verified = verify_release_matrix(&manifest, &reports).unwrap();
-        let baseline = verified_matrix_sha256(&verified);
-
-        macro_rules! changed {
-            ($name:literal, $body:expr) => {{
-                let mut value = verified.clone();
-                $body(&mut value.scenarios[1].environment);
-                assert_ne!(verified_matrix_sha256(&value), baseline, $name);
-            }};
-        }
-
-        for platform in [
-            ReleaseHostPlatform::MacosArm64,
-            ReleaseHostPlatform::LinuxX86_64,
-            ReleaseHostPlatform::WindowsX86_64,
-        ] {
-            if platform != verified.scenarios[1].environment.platform {
-                changed!(
-                    "platform collided",
-                    |environment: &mut ReleaseEnvironmentEvidence| {
-                        environment.platform = platform;
-                    }
-                );
-            }
-        }
-        for index in 0..4 {
-            for state in [
-                ReleaseControllerPort::StandardControllerNoPak,
-                ReleaseControllerPort::StandardControllerControllerPak,
-                ReleaseControllerPort::StandardControllerRumblePak,
-                ReleaseControllerPort::StandardControllerTransferPak,
-                ReleaseControllerPort::VoiceRecognitionUnit,
-                ReleaseControllerPort::Absent,
-            ] {
-                if state != verified.scenarios[1].environment.controller_ports[index] {
-                    changed!(
-                        "controller placement collided",
-                        |environment: &mut ReleaseEnvironmentEvidence| {
-                            environment.controller_ports[index] = state;
-                        }
-                    );
-                }
-            }
-        }
-        for save in [
-            ReleaseCartridgeSave::NoCartridgeSave,
-            ReleaseCartridgeSave::Eeprom4k,
-            ReleaseCartridgeSave::Eeprom16k,
-            ReleaseCartridgeSave::Sram32Kib,
-            ReleaseCartridgeSave::FlashRam128Kib,
-        ] {
-            if save != verified.scenarios[1].environment.cartridge_save {
-                changed!(
-                    "cartridge save collided",
-                    |environment: &mut ReleaseEnvironmentEvidence| {
-                        environment.cartridge_save = save;
-                    }
-                );
-            }
-        }
-        changed!(
-            "renderer class collided",
-            |environment: &mut ReleaseEnvironmentEvidence| {
-                environment.renderer = ReleaseRendererEvidence::Reference {
-                    execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
-                };
-            }
+    fn flat_evidence_auto_routes_by_report_scenario_not_manifest_id_or_input_order() {
+        let (manifest, mut evidence) = fixture();
+        assert_ne!(
+            manifest.scenarios[0].id,
+            manifest.scenarios[0].report_scenario
         );
-        changed!(
-            "execution policy collided",
-            |environment: &mut ReleaseEnvironmentEvidence| {
-                let ReleaseRendererEvidence::Rt64 {
-                    execution_policy, ..
-                } = &mut environment.renderer
-                else {
-                    unreachable!()
-                };
-                *execution_policy = ReleaseGraphicsExecutionPolicy::HleOptimized;
-            }
-        );
-        changed!(
-            "backend identity collided",
-            |environment: &mut ReleaseEnvironmentEvidence| {
-                let ReleaseRendererEvidence::Rt64 {
-                    backend_identity, ..
-                } = &mut environment.renderer
-                else {
-                    unreachable!()
-                };
-                backend_identity.push_str("-changed");
-            }
-        );
-        changed!(
-            "source authority collided",
-            |environment: &mut ReleaseEnvironmentEvidence| {
-                let ReleaseRendererEvidence::Rt64 {
-                    source_authoritative,
-                    ..
-                } = &mut environment.renderer
-                else {
-                    unreachable!()
-                };
-                *source_authoritative = false;
-            }
-        );
-        changed!(
-            "settings identity collided",
-            |environment: &mut ReleaseEnvironmentEvidence| {
-                let ReleaseRendererEvidence::Rt64 {
-                    settings_sha256, ..
-                } = &mut environment.renderer
-                else {
-                    unreachable!()
-                };
-                *settings_sha256 = "22".repeat(32);
-            }
-        );
-        changed!(
-            "replacement activity collided",
-            |environment: &mut ReleaseEnvironmentEvidence| {
-                let ReleaseRendererEvidence::Rt64 {
-                    replacement_packs_active,
-                    ..
-                } = &mut environment.renderer
-                else {
-                    unreachable!()
-                };
-                *replacement_packs_active = true;
-            }
-        );
-    }
-
-    #[test]
-    fn retained_rt64_workload_is_nonzero_and_bound_to_report_and_matrix() {
-        let (manifest, reports) = fixture();
-        let verified = verify_release_matrix(&manifest, &reports).unwrap();
-        let baseline_sha = verified_matrix_sha256(&verified);
-
-        let mut changed = verified.clone();
-        let FramebufferObservationSource::PostViSwapchain { workload_id, .. } =
-            &mut changed.scenarios[1].observations.framebuffer.source
+        evidence.rotate_left(7);
+        let ReleaseMatrixVerification::Incomplete(incomplete) =
+            verify_release_matrix(&manifest, &evidence).unwrap()
         else {
-            unreachable!("fixture RT64 scenario uses post-VI evidence")
+            panic!("fixture remains intentionally incomplete")
         };
-        *workload_id = std::num::NonZeroU64::new(workload_id.get() + 1).unwrap();
-        assert_ne!(verified_matrix_sha256(&changed), baseline_sha);
-        changed.verification_sha256 = verified_matrix_sha256(&changed);
-        assert!(matches!(
-            changed.verify_integrity(),
-            Err(ReleaseMatrixError::InvalidVerifiedReport {
-                source: crate::GateError::ReportIntegrityMismatch { .. },
-                ..
-            })
-        ));
-
-        let mut zero = serde_json::to_value(&verified).unwrap();
-        zero["scenarios"][1]["observations"]["framebuffer"]["source"]["workload_id"] = 0.into();
-        assert!(serde_json::from_value::<VerifiedReleaseMatrix>(zero).is_err());
+        assert_eq!(incomplete.verified_scenarios, 2);
+        assert_eq!(incomplete.verified_reports, 20);
     }
 
     #[test]
-    fn retained_matrix_revalidates_semantic_envelope_after_digest_recomputation() {
-        let (manifest, reports) = fixture();
-        let verified = verify_release_matrix(&manifest, &reports).unwrap();
+    fn profile_identity_and_v4_relabels_are_rejected() {
+        for (schema, digest, expected_schema_error) in [
+            (
+                "fn64.certification-profile.full-parity.v0",
+                crate::FULL_PARITY_V1_DEFINITION_SHA256,
+                true,
+            ),
+            (crate::FULL_PARITY_V1_SCHEMA, "00", false),
+        ] {
+            let (mut manifest, evidence) = fixture();
+            manifest.profile.schema = schema.to_owned();
+            manifest.profile.definition_sha256 = digest.to_owned();
+            let error = verify_release_matrix(&manifest, &evidence).unwrap_err();
+            match (error, expected_schema_error) {
+                (
+                    ReleaseMatrixError::InvalidCertificationProfile(
+                        crate::CertificationProfileError::UnsupportedSchema(_),
+                    ),
+                    true,
+                )
+                | (
+                    ReleaseMatrixError::InvalidCertificationProfile(
+                        crate::CertificationProfileError::DefinitionDigestMismatch { .. },
+                    ),
+                    false,
+                ) => {}
+                (other, _) => panic!("unexpected profile error: {other:?}"),
+            }
+        }
 
-        let mut bad_self_digest = verified.clone();
-        bad_self_digest.verification_sha256 = "00".repeat(32);
+        let (mut manifest, evidence) = fixture();
+        manifest.schema = "fn64.release-matrix.v4".to_owned();
         assert!(matches!(
-            bad_self_digest.verify_integrity(),
-            Err(ReleaseMatrixError::VerifiedIntegrityMismatch { .. })
+            verify_release_matrix(&manifest, &evidence),
+            Err(ReleaseMatrixError::UnsupportedSchema(schema))
+                if schema == "fn64.release-matrix.v4"
         ));
 
-        let mut empty = verified.clone();
-        empty.scenarios.clear();
-        empty.total_reports = 0;
-        empty.verification_sha256 = verified_matrix_sha256(&empty);
-        assert!(matches!(
-            empty.verify_integrity(),
-            Err(ReleaseMatrixError::ScenarioCount { actual: 0, .. })
-        ));
-
-        let mut empty_required = verified.clone();
-        empty_required.required.platforms.clear();
-        empty_required.verification_sha256 = verified_matrix_sha256(&empty_required);
-        assert!(matches!(
-            empty_required.verify_integrity(),
-            Err(ReleaseMatrixError::EmptyCoverage {
-                ref scope,
-                dimension: "platforms"
-            }) if scope == "verified required"
-        ));
-
-        let mut duplicate_id = verified.clone();
-        duplicate_id.scenarios[1].id = duplicate_id.scenarios[0].id.clone();
-        duplicate_id.verification_sha256 = verified_matrix_sha256(&duplicate_id);
-        assert!(matches!(
-            duplicate_id.verify_integrity(),
-            Err(ReleaseMatrixError::DuplicateScenarioId(_))
-        ));
-
-        let mut malformed_manifest_identity = verified.clone();
-        malformed_manifest_identity.manifest_sha256 = "not-a-sha256".to_owned();
-        malformed_manifest_identity.verification_sha256 =
-            verified_matrix_sha256(&malformed_manifest_identity);
-        assert!(matches!(
-            malformed_manifest_identity.verify_integrity(),
-            Err(ReleaseMatrixError::InvalidSha256 {
-                field: "manifest_sha256",
-                ..
-            })
-        ));
-
-        let mut no_positive_closure = verified;
-        no_positive_closure.scenarios[0].closure_paths = 0;
-        no_positive_closure.verification_sha256 = verified_matrix_sha256(&no_positive_closure);
-        assert!(matches!(
-            no_positive_closure.verify_integrity(),
-            Err(ReleaseMatrixError::VerifiedClosurePathCountMismatch { stored: 0, .. })
-        ));
-    }
-
-    #[test]
-    fn retained_matrix_revalidates_exact_feature_operation_paths() {
-        let (manifest, reports) = fixture();
-        let verified = verify_release_matrix(&manifest, &reports).unwrap();
-
-        let mut missing = verified.clone();
-        missing.scenarios[1]
-            .closure
-            .retain(|path| path.name != "controller.rumble-operation");
-        missing.scenarios[1].closure_paths = missing.scenarios[1].closure.len() as u64;
-        missing.verification_sha256 = verified_matrix_sha256(&missing);
-        assert!(matches!(
-            missing.verify_integrity(),
-            Err(ReleaseMatrixError::MissingFeatureObservation { path, .. })
-                if path == "controller.rumble-operation"
-        ));
-
-        let mut unexpected = verified;
-        unexpected.scenarios[0].closure.push(ClosurePath {
-            name: "controller.transfer-pak-operation".to_owned(),
-            observations: 1,
-            status: ClosurePathStatus::ExercisedZeroUnsupported,
-            unsupported: Vec::new(),
+        let legacy = serde_json::json!({
+            "schema": RELEASE_MATRIX_SCHEMA,
+            "required": {
+                "platforms": ["macos_arm64"],
+                "controllers": ["standard_controller"],
+                "saves": ["eeprom_4_kbit"],
+                "renderers": ["reference_lle_accuracy"],
+                "programs": ["typed_observed_function"]
+            },
+            "scenarios": []
         });
-        unexpected.scenarios[0]
-            .closure
-            .sort_by(|left, right| left.name.cmp(&right.name));
-        unexpected.scenarios[0].closure_paths = unexpected.scenarios[0].closure.len() as u64;
-        unexpected.verification_sha256 = verified_matrix_sha256(&unexpected);
-        assert!(matches!(
-            unexpected.verify_integrity(),
-            Err(ReleaseMatrixError::UnexpectedFeatureObservation { path, .. })
-                if path == "controller.transfer-pak-operation"
-        ));
+        assert!(serde_json::from_value::<ReleaseMatrixManifest>(legacy).is_err());
     }
 
     #[test]
-    fn verified_matrix_v11_wire_binds_exact_closure_evidence() {
-        let (manifest, reports) = fixture();
-        let verified = verify_release_matrix(&manifest, &reports).unwrap();
-        let baseline = verified_matrix_sha256(&verified);
+    fn scenario_and_manifest_digests_use_the_v5_evidence_only_wire() {
+        let (manifest, evidence) = fixture();
+        let declaration = &manifest.scenarios[0];
+        let baseline = declaration.recompute_declaration_sha256();
 
-        let mut changed = verified.clone();
-        changed.scenarios[0].closure[0].observations += 1;
-        assert_ne!(verified_matrix_sha256(&changed), baseline);
+        let mut legacy_wire = Vec::new();
+        legacy_wire.extend_from_slice(b"fn64.release-matrix.scenario.v4\0");
+        push_bytes(&mut legacy_wire, declaration.id.as_bytes());
+        push_bytes(&mut legacy_wire, declaration.report_scenario.as_bytes());
+        push_bytes(&mut legacy_wire, declaration.input_sha256.as_bytes());
+        push_bytes(&mut legacy_wire, declaration.report_sha256.as_bytes());
+        assert_ne!(baseline, hex(&Sha256::digest(legacy_wire)));
 
-        let mut changed = verified;
-        changed.scenarios[0].closure[0].name.push_str("-changed");
-        assert_ne!(verified_matrix_sha256(&changed), baseline);
-    }
+        for field in ["id", "scenario", "input", "report"] {
+            let mut changed = declaration.clone();
+            match field {
+                "id" => changed.id.push('x'),
+                "scenario" => changed.report_scenario.push('x'),
+                "input" => changed.input_sha256 = "11".repeat(32),
+                "report" => changed.report_sha256 = "22".repeat(32),
+                _ => unreachable!(),
+            }
+            assert_ne!(changed.recompute_declaration_sha256(), baseline, "{field}");
+        }
 
-    #[test]
-    fn verified_matrix_v11_wire_binds_run_event_order() {
-        let (manifest, reports) = fixture();
-        let verified = verify_release_matrix(&manifest, &reports).unwrap();
-        let baseline = verified_matrix_sha256(&verified);
-
-        let mut reordered = verified;
-        reordered.scenarios[0].run_event_sha256s.swap(0, 1);
-        assert_ne!(verified_matrix_sha256(&reordered), baseline);
-    }
-
-    #[test]
-    fn retained_matrix_independently_revalidates_coverage_and_manifest_identity() {
-        let (manifest, reports) = fixture();
-        let verified = verify_release_matrix(&manifest, &reports).unwrap();
-
-        let mut missing_required = verified.clone();
-        missing_required.scenarios[1].coverage.platforms = vec![ReleasePlatform::MacosArm64];
-        missing_required.scenarios[1].declaration_sha256 =
-            retained_scenario_declaration(&missing_required.scenarios[1])
-                .recompute_declaration_sha256();
-        missing_required.verification_sha256 = verified_matrix_sha256(&missing_required);
+        let mut relabeled = manifest.clone();
+        relabeled.scenarios[0].report_scenario.push_str("-changed");
         assert!(matches!(
-            missing_required.verify_integrity(),
-            Err(ReleaseMatrixError::EnvironmentCoverageMismatch {
-                dimension: "platforms",
-                ..
-            })
-        ));
-
-        let mut undeclared = verified.clone();
-        undeclared.scenarios[0]
-            .coverage
-            .controllers
-            .push(ControllerFeature::TransferPak);
-        undeclared.verification_sha256 = verified_matrix_sha256(&undeclared);
-        assert!(matches!(
-            undeclared.verify_integrity(),
-            Err(ReleaseMatrixError::UndeclaredCoverage {
-                dimension: "controllers",
-                ..
-            })
-        ));
-
-        let mut cross_labeled_renderer = verified.clone();
-        cross_labeled_renderer.scenarios[0].coverage.renderers =
-            vec![RendererFeature::Rt64LleAccuracy];
-        cross_labeled_renderer.scenarios[0].declaration_sha256 =
-            retained_scenario_declaration(&cross_labeled_renderer.scenarios[0])
-                .recompute_declaration_sha256();
-        cross_labeled_renderer.verification_sha256 =
-            verified_matrix_sha256(&cross_labeled_renderer);
-        assert!(matches!(
-            cross_labeled_renderer.verify_integrity(),
-            Err(ReleaseMatrixError::EnvironmentCoverageMismatch {
-                dimension: "renderers",
-                ..
-            })
-        ));
-
-        let mut relabeled = verified.clone();
-        relabeled.scenarios[0].coverage.controllers = vec![ControllerFeature::RumblePak];
-        relabeled.verification_sha256 = verified_matrix_sha256(&relabeled);
-        assert!(matches!(
-            relabeled.verify_integrity(),
+            verify_release_matrix(&relabeled, &evidence),
             Err(ReleaseMatrixError::DeclarationDigestMismatch { .. })
         ));
 
-        let mut wrong_manifest = verified;
-        wrong_manifest.manifest_sha256 = "00".repeat(32);
-        wrong_manifest.verification_sha256 = verified_matrix_sha256(&wrong_manifest);
-        assert!(matches!(
-            wrong_manifest.verify_integrity(),
-            Err(ReleaseMatrixError::VerifiedManifestIdentityMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_matrix_series_with_unbound_v1_journal() {
-        let (manifest, mut evidence) = fixture();
-        evidence.get_mut("game-a-reference").unwrap()[4]
-            .1
-            .completion = crate::UnsupportedJournalCompletion::V1Unbound { guest_cycle: 100 };
-        assert!(matches!(
-            verify_release_matrix(&manifest, &evidence),
-            Err(ReleaseMatrixError::InvalidSeries { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_run_event_identity_replayed_across_scenarios() {
-        let (manifest, mut evidence) = fixture();
-        let replayed = evidence["game-a-reference"][0]
-            .1
-            .release_run_event_sha256()
-            .unwrap()
-            .to_owned();
-        let second = &mut evidence.get_mut("game-b-rt64").unwrap()[0].1.completion;
-        let crate::UnsupportedJournalCompletion::V3RunBound {
-            run_event_sha256, ..
-        } = second
-        else {
-            unreachable!("fixture uses v3 run-bound journals")
-        };
-        *run_event_sha256 = replayed;
-        assert!(matches!(
-            verify_release_matrix(&manifest, &evidence),
-            Err(ReleaseMatrixError::DuplicateRunEventIdentity { .. })
-        ));
-    }
-
-    #[test]
-    fn manifest_identity_is_independent_of_declaration_order() {
-        let (manifest, _) = fixture();
-        let expected = manifest.recompute_manifest_sha256();
-        let mut reversed = manifest;
-        reversed.scenarios.reverse();
-        reversed.required.platforms.reverse();
-        reversed.required.controllers.reverse();
-        reversed.required.saves.reverse();
-        reversed.required.renderers.reverse();
-        reversed.required.programs.reverse();
-        assert_eq!(reversed.recompute_manifest_sha256(), expected);
-    }
-
-    #[test]
-    fn wire_feature_names_are_explicit_and_stable() {
-        assert_eq!(
-            serde_json::to_string(&ReleasePlatform::LinuxX86_64).unwrap(),
-            "\"linux_x86_64\""
-        );
-        assert_eq!(
-            serde_json::to_string(&SaveFeature::Eeprom4Kbit).unwrap(),
-            "\"eeprom_4_kbit\""
-        );
-        assert_eq!(
-            serde_json::to_string(&SaveFeature::FlashRam128Kib).unwrap(),
-            "\"flash_ram_128_kib\""
-        );
-        assert_eq!(
-            serde_json::to_string(&RendererFeature::Rt64PostViCapture).unwrap(),
-            "\"rt64_post_vi_capture\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ProgramFeature::TypedObservedFunction).unwrap(),
-            "\"typed_observed_function\""
+        let baseline_manifest = manifest.recompute_manifest_sha256();
+        let mut changed_profile = manifest;
+        changed_profile.profile.definition_sha256 = "33".repeat(32);
+        assert_ne!(
+            changed_profile.recompute_manifest_sha256(),
+            baseline_manifest
         );
     }
 
     #[test]
-    fn rejects_nine_or_eleven_reports() {
-        let (manifest, mut reports) = fixture();
-        reports.get_mut("game-a-reference").unwrap().pop();
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::WrongReportCount { actual: 9, .. })
-        ));
-
-        let (manifest, mut reports) = fixture();
-        let extra = reports["game-a-reference"][0].clone();
-        reports.get_mut("game-a-reference").unwrap().push(extra);
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::WrongReportCount { actual: 11, .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_unassigned_required_coverage() {
-        let (mut manifest, reports) = fixture();
-        manifest
-            .required
-            .platforms
-            .push(ReleasePlatform::WindowsX86_64);
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::MissingRequiredCoverage {
-                dimension: "platforms",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn rejects_scenario_coverage_outside_requirements() {
-        let (mut manifest, reports) = fixture();
-        manifest.scenarios[0].coverage.controllers = vec![ControllerFeature::TransferPak];
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::UndeclaredCoverage {
-                dimension: "controllers",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn rejects_wrong_declared_input_or_report_digest() {
-        let (mut manifest, reports) = fixture();
-        manifest.scenarios[0].input_sha256 = "0".repeat(64);
-        manifest.scenarios[0].declaration_sha256 =
-            manifest.scenarios[0].recompute_declaration_sha256();
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::InputDigestMismatch { .. })
-        ));
-
-        let (mut manifest, reports) = fixture();
-        manifest.scenarios[0].report_sha256 = "0".repeat(64);
-        manifest.scenarios[0].declaration_sha256 =
-            manifest.scenarios[0].recompute_declaration_sha256();
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::ReportDigestMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_missing_or_unexpected_evidence() {
-        let (manifest, mut reports) = fixture();
-        reports.remove("game-a-reference");
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::MissingEvidence { .. })
-        ));
-
-        let (manifest, mut reports) = fixture();
-        reports.insert("undeclared".to_owned(), Vec::new());
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::UnexpectedEvidence { .. })
-        ));
-    }
-
-    #[test]
-    fn propagates_v15_series_integrity_and_closure_failure() {
-        let (manifest, mut reports) = fixture();
-        reports.get_mut("game-a-reference").unwrap()[3]
-            .0
-            .scenario
-            .push_str("-mutated");
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::InvalidSeries { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_zero_count_or_inconsistent_live_path_evidence() {
-        let (_manifest, reports) = fixture();
-        let original = &reports["game-a-reference"][0].0;
-        let mut closure = original.closure.clone();
-        closure[0].observations = 0;
-        assert!(matches!(
-            ReleaseGateReport::new(
-                original.scenario.clone(),
-                b"private-a",
-                original.digest.clone(),
-                original.observations.clone(),
-                closure,
-            ),
-            Err(crate::GateError::InvalidClosurePath { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_declared_save_without_matching_operation_path() {
-        let (mut manifest, mut reports) = fixture();
-        let original = &reports["game-a-reference"][0].0;
-        let closure: Vec<_> = original
-            .closure
-            .iter()
-            .filter(|path| path.name != "save.eeprom-4k-operation")
-            .cloned()
-            .collect();
-        let replacement = ReleaseGateReport::new(
-            original.scenario.clone(),
-            b"private-a",
-            original.digest.clone(),
-            original.observations.clone(),
-            closure,
-        )
-        .unwrap();
-        reports.insert(
-            "game-a-reference".to_owned(),
-            evidence_series(replacement.clone()),
-        );
-        manifest.scenarios[0].report_sha256 = replacement.report_sha256;
-        manifest.scenarios[0].declaration_sha256 =
-            manifest.scenarios[0].recompute_declaration_sha256();
-
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::MissingFeatureObservation { path, .. })
-                if path == "save.eeprom-4k-operation"
-        ));
-    }
-
-    #[test]
-    fn rejects_save_observation_outside_exact_device_declaration() {
-        for declared in [SaveFeature::NoCartridgeSave, SaveFeature::Eeprom16Kbit] {
-            let (mut manifest, reports) = fixture();
-            manifest.required.saves[0] = declared;
-            manifest.scenarios[0].coverage.saves[0] = declared;
-            manifest.scenarios[0].declaration_sha256 =
-                manifest.scenarios[0].recompute_declaration_sha256();
-
+    fn exact_ten_run_series_is_enforced_table_driven() {
+        for requested in [9usize, 11] {
+            let (manifest, evidence) = fixture();
+            let mut first: Vec<_> = evidence
+                .iter()
+                .filter(|(report, _)| report.scenario == "game-a-reference")
+                .cloned()
+                .collect();
+            if requested == 9 {
+                first.pop();
+            } else {
+                let extra = first[0].clone();
+                let mut extra = extra;
+                let crate::UnsupportedJournalCompletion::V3RunBound {
+                    run_event_sha256, ..
+                } = &mut extra.1.completion
+                else {
+                    unreachable!()
+                };
+                *run_event_sha256 = "44".repeat(32);
+                first.push(extra);
+            }
+            let mut changed: Vec<_> = evidence
+                .into_iter()
+                .filter(|(report, _)| report.scenario != "game-a-reference")
+                .collect();
+            changed.extend(first);
             assert!(matches!(
-                verify_release_matrix(&manifest, &reports),
-                Err(ReleaseMatrixError::UnexpectedFeatureObservation { path, .. })
-                    if path == "save.eeprom-4k-operation"
+                verify_release_matrix(&manifest, &changed),
+                Err(ReleaseMatrixError::WrongReportCount {
+                    expected: 10,
+                    actual,
+                    ..
+                }) if actual == requested
             ));
         }
     }
 
     #[test]
-    fn controller_pak_requires_positive_pfs_operation() {
-        let (mut manifest, reports) = fixture();
-        manifest
-            .required
-            .controllers
-            .push(ControllerFeature::ControllerPak);
-        manifest.scenarios[0]
-            .coverage
-            .controllers
-            .push(ControllerFeature::ControllerPak);
-        manifest.scenarios[0].declaration_sha256 =
-            manifest.scenarios[0].recompute_declaration_sha256();
-
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::MissingFeatureObservation { path, .. })
-                if path == "save.pfs-operation"
-        ));
-    }
-
-    #[test]
-    fn pfs_operation_is_rejected_without_controller_pak_declaration() {
-        let (mut manifest, mut reports) = fixture();
-        let original = &reports["game-a-reference"][0].0;
-        let mut closure = original.closure.clone();
-        closure.push(ClosurePath {
-            name: "save.pfs-operation".to_owned(),
-            observations: 1,
-            status: ClosurePathStatus::ExercisedZeroUnsupported,
-            unsupported: Vec::new(),
-        });
-        let replacement = ReleaseGateReport::new_with_test_environment(
-            original.scenario.clone(),
-            b"private-a",
-            original.digest.clone(),
-            original.observations.clone(),
-            original.environment.clone(),
-            closure,
-        )
-        .unwrap();
-        reports.insert(
-            "game-a-reference".to_owned(),
-            evidence_series(replacement.clone()),
-        );
-        manifest.scenarios[0].report_sha256 = replacement.report_sha256;
-        manifest.scenarios[0].declaration_sha256 =
-            manifest.scenarios[0].recompute_declaration_sha256();
-
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::UnexpectedFeatureObservation { path, .. })
-                if path == "save.pfs-operation"
-        ));
-    }
-
-    #[test]
-    fn declared_controller_accessory_requires_matching_operation_path() {
-        let (mut manifest, mut reports) = fixture();
-        let original = &reports["game-b-rt64"][0].0;
-        let closure = original
-            .closure
+    fn missing_and_unexpected_scenario_evidence_are_distinct() {
+        let (manifest, evidence) = fixture();
+        let missing: Vec<_> = evidence
             .iter()
-            .filter(|path| path.name != "controller.rumble-operation")
+            .filter(|(report, _)| report.scenario != "game-a-reference")
             .cloned()
             .collect();
-        let replacement = ReleaseGateReport::new_with_test_environment(
-            original.scenario.clone(),
-            b"private-b",
-            original.digest.clone(),
-            original.observations.clone(),
-            original.environment.clone(),
-            closure,
-        )
-        .unwrap();
-        reports.insert(
-            "game-b-rt64".to_owned(),
-            evidence_series(replacement.clone()),
-        );
-        manifest.scenarios[1].report_sha256 = replacement.report_sha256;
-        manifest.scenarios[1].declaration_sha256 =
-            manifest.scenarios[1].recompute_declaration_sha256();
-
         assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::MissingFeatureObservation { path, .. })
-                if path == "controller.rumble-operation"
+            verify_release_matrix(&manifest, &missing),
+            Err(ReleaseMatrixError::MissingEvidence { id })
+                if id == "reference-evidence"
+        ));
+
+        let unexpected = closed_report(
+            "undeclared-report",
+            b"private-c",
+            0xc3,
+            "save.eeprom-4k-operation",
+            CLEAN_RT64_IDENTITY,
+            Some(ProgramFeature::TypedObservedFunction),
+        );
+        let mut extra = evidence;
+        extra.extend(evidence_series(unexpected));
+        assert!(matches!(
+            verify_release_matrix(&manifest, &extra),
+            Err(ReleaseMatrixError::UnexpectedReportScenario { scenario })
+                if scenario == "undeclared-report"
         ));
     }
 
     #[test]
-    fn controller_operation_cannot_be_cross_labeled_as_another_configuration() {
-        let (mut manifest, mut reports) = fixture();
-        let original = &reports["game-a-reference"][0].0;
-        let mut closure = original.closure.clone();
-        closure.push(ClosurePath {
-            name: "controller.transfer-pak-operation".to_owned(),
-            observations: 1,
-            status: ClosurePathStatus::ExercisedZeroUnsupported,
-            unsupported: Vec::new(),
-        });
+    fn replayed_run_event_identity_across_scenarios_is_rejected() {
+        let (manifest, mut evidence) = fixture();
+        let replay = evidence
+            .iter()
+            .find_map(|(report, journal)| {
+                (report.scenario == "game-a-reference").then(|| match &journal.completion {
+                    crate::UnsupportedJournalCompletion::V3RunBound {
+                        run_event_sha256, ..
+                    } => run_event_sha256.clone(),
+                    _ => unreachable!(),
+                })
+            })
+            .unwrap();
+        let (_, journal) = evidence
+            .iter_mut()
+            .find(|(report, _)| report.scenario == "game-b-rt64")
+            .unwrap();
+        let crate::UnsupportedJournalCompletion::V3RunBound {
+            run_event_sha256, ..
+        } = &mut journal.completion
+        else {
+            unreachable!()
+        };
+        *run_event_sha256 = replay;
+        assert!(matches!(
+            verify_release_matrix(&manifest, &evidence),
+            Err(ReleaseMatrixError::DuplicateRunEventIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn report_and_input_digests_are_bound_by_each_v5_declaration() {
+        for field in ["input", "report"] {
+            let (mut manifest, evidence) = fixture();
+            if field == "input" {
+                manifest.scenarios[0].input_sha256 = "55".repeat(32);
+            } else {
+                manifest.scenarios[0].report_sha256 = "66".repeat(32);
+            }
+            manifest.scenarios[0].declaration_sha256 =
+                manifest.scenarios[0].recompute_declaration_sha256();
+            let error = verify_release_matrix(&manifest, &evidence).unwrap_err();
+            assert!(
+                matches!(
+                    (&error, field),
+                    (ReleaseMatrixError::InputDigestMismatch { .. }, "input")
+                        | (ReleaseMatrixError::ReportDigestMismatch { .. }, "report")
+                ),
+                "unexpected {field} result: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_without_entered_program_evidence_is_rejected() {
+        let (mut manifest, mut evidence) = fixture();
+        let original = evidence
+            .iter()
+            .find(|(report, _)| report.scenario == "game-a-reference")
+            .unwrap()
+            .0
+            .clone();
         let replacement = ReleaseGateReport::new_with_test_environment(
             original.scenario.clone(),
             b"private-a",
-            original.digest.clone(),
-            original.observations.clone(),
-            original.environment.clone(),
-            closure,
+            original.digest,
+            original.observations,
+            original.environment,
+            original.closure,
         )
         .unwrap();
-        reports.insert(
-            "game-a-reference".to_owned(),
-            evidence_series(replacement.clone()),
+        replace_report(&mut manifest, &mut evidence, replacement);
+        assert!(matches!(
+            verify_release_matrix(&manifest, &evidence),
+            Err(ReleaseMatrixError::NoProgramEvidence { .. })
+        ));
+    }
+
+    #[test]
+    fn rt64_identity_and_observation_source_are_authoritative() {
+        const DIRTY_RT64_IDENTITY: &str = concat!(
+            "adapter=fn64-render-rt64/rt64;adapter_sha256=",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ";source=git:",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ";provenance=git-dirty;overlay=fn64-test;post_vi_api=vulkan-bgra8-rgba8-unorm"
         );
-        manifest.scenarios[0].report_sha256 = replacement.report_sha256;
-        manifest.scenarios[0].declaration_sha256 =
-            manifest.scenarios[0].recompute_declaration_sha256();
-
+        let (_, evidence) = fixture();
+        let original = evidence
+            .iter()
+            .find(|(report, _)| report.scenario == "game-b-rt64")
+            .unwrap()
+            .0
+            .clone();
+        let mut environment = original.environment.clone();
+        let ReleaseRendererEvidence::Rt64 {
+            backend_identity, ..
+        } = &mut environment.renderer
+        else {
+            unreachable!()
+        };
+        *backend_identity = DIRTY_RT64_IDENTITY.to_owned();
+        let mut observations = original.observations.clone();
+        let FramebufferObservationSource::PostViSwapchain {
+            backend_identity, ..
+        } = &mut observations.framebuffer.source
+        else {
+            unreachable!()
+        };
+        *backend_identity = DIRTY_RT64_IDENTITY.to_owned();
         assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::UnexpectedFeatureObservation { path, .. })
-                if path == "controller.transfer-pak-operation"
+            ReleaseGateReport::new_with_test_environment_and_destinations(
+                original.scenario,
+                b"private-b",
+                original.digest,
+                observations,
+                environment,
+                original.execution_destinations,
+                original.closure,
+            ),
+            Err(crate::GateError::RendererObservationMismatch(_))
+        ));
+
+        let (manifest, mut evidence) = fixture();
+        let report = evidence
+            .iter_mut()
+            .find(|(report, _)| report.scenario == "game-b-rt64")
+            .unwrap();
+        report.0.environment.renderer = ReleaseRendererEvidence::Reference {
+            execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+        };
+        assert!(matches!(
+            verify_release_matrix(&manifest, &evidence),
+            Err(ReleaseMatrixError::InvalidUnassignedReport {
+                source: crate::GateError::RendererObservationMismatch(_),
+                ..
+            })
         ));
     }
 
     #[test]
-    fn rejects_unbounded_or_ambiguous_manifest_shapes() {
-        let (mut manifest, reports) = fixture();
-        manifest.scenarios[0].id = "INVALID_ID".to_owned();
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::InvalidScenarioId(_))
-        ));
-
-        let (mut manifest, reports) = fixture();
-        manifest.scenarios[1].report_scenario = manifest.scenarios[0].report_scenario.clone();
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::DuplicateReportScenario(_))
-        ));
+    fn save_and_controller_assignments_require_positive_operation_paths() {
+        for (scenario_name, input, path) in [
+            (
+                "game-a-reference",
+                b"private-a".as_slice(),
+                "save.eeprom-4k-operation",
+            ),
+            (
+                "game-b-rt64",
+                b"private-b".as_slice(),
+                "controller.rumble-operation",
+            ),
+        ] {
+            let (mut manifest, mut evidence) = fixture();
+            let original = evidence
+                .iter()
+                .find(|(report, _)| report.scenario == scenario_name)
+                .unwrap()
+                .0
+                .clone();
+            let closure: Vec<_> = original
+                .closure
+                .iter()
+                .filter(|entry| entry.name != path)
+                .cloned()
+                .collect();
+            let replacement = ReleaseGateReport::new_with_test_environment_and_destinations(
+                original.scenario,
+                input,
+                original.digest,
+                original.observations,
+                original.environment,
+                original.execution_destinations,
+                closure,
+            )
+            .unwrap();
+            replace_report(&mut manifest, &mut evidence, replacement);
+            assert!(matches!(
+                verify_release_matrix(&manifest, &evidence),
+                Err(ReleaseMatrixError::MissingFeatureObservation {
+                    path: missing,
+                    ..
+                }) if missing == path
+            ));
+        }
     }
 
     #[test]
-    fn rejects_relabeling_without_a_new_declaration_digest() {
-        let (mut manifest, reports) = fixture();
-        manifest.scenarios[0].coverage.controllers = vec![ControllerFeature::RumblePak];
-        assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::DeclarationDigestMismatch { .. })
-        ));
+    fn program_renderer_save_and_controller_coverage_is_derived_from_reports() {
+        let (_, evidence, incomplete) = incomplete_fixture();
+        let reference = evidence
+            .iter()
+            .find(|(report, _)| report.scenario == "game-a-reference")
+            .unwrap();
+        let rt64 = evidence
+            .iter()
+            .find(|(report, _)| report.scenario == "game-b-rt64")
+            .unwrap();
+
+        assert_eq!(
+            derive_scenario_coverage("reference-evidence", &reference.0).unwrap(),
+            ReleaseMatrixCoverage {
+                platforms: vec![ReleasePlatform::MacosArm64],
+                controllers: vec![ControllerFeature::StandardController],
+                saves: vec![SaveFeature::Eeprom4Kbit],
+                renderers: vec![RendererFeature::ReferenceLleAccuracy],
+                programs: vec![ProgramFeature::TypedObservedFunction],
+            }
+        );
+        assert_eq!(
+            derive_scenario_coverage("rt64-evidence", &rt64.0).unwrap(),
+            ReleaseMatrixCoverage {
+                platforms: vec![ReleasePlatform::LinuxX86_64],
+                controllers: vec![
+                    ControllerFeature::StandardController,
+                    ControllerFeature::RumblePak,
+                ],
+                saves: vec![SaveFeature::Sram32Kib],
+                renderers: vec![
+                    RendererFeature::Rt64LleAccuracy,
+                    RendererFeature::Rt64PostViCapture,
+                ],
+                programs: vec![ProgramFeature::TypedObservedFunction],
+            }
+        );
+
+        let assigned: BTreeSet<_> = incomplete
+            .satisfied
+            .iter()
+            .map(|assignment| {
+                (
+                    assignment.requirement.class(),
+                    assignment.requirement.id().to_owned(),
+                )
+            })
+            .collect();
+        for key in [
+            (
+                CertificationRequirementClass::ProgramRendererLane,
+                "typed_observed_function/reference_lle_accuracy",
+            ),
+            (
+                CertificationRequirementClass::ProgramRendererLane,
+                "typed_observed_function/rt64_lle_accuracy",
+            ),
+            (CertificationRequirementClass::Save, "eeprom_4_kbit"),
+            (CertificationRequirementClass::Save, "sram_32_kib"),
+            (
+                CertificationRequirementClass::Controller,
+                "standard_controller",
+            ),
+            (CertificationRequirementClass::Controller, "rumble_pak"),
+        ] {
+            assert!(assigned.contains(&(key.0, key.1.to_owned())), "{key:?}");
+        }
     }
 
     #[test]
-    fn rejects_ambiguous_platform_save_and_renderer_selection() {
-        let (mut manifest, reports) = fixture();
-        manifest.scenarios[0]
-            .coverage
-            .platforms
-            .push(ReleasePlatform::LinuxX86_64);
-        manifest.scenarios[0].declaration_sha256 =
-            manifest.scenarios[0].recompute_declaration_sha256();
+    fn incomplete_integrity_rejects_cross_class_duplicates_partition_and_hash_tampering() {
+        let (_, _, baseline) = incomplete_fixture();
+
+        let mut cross_class = baseline.clone();
+        cross_class.missing[0] =
+            forged_ref(CertificationRequirementClass::Save, "standard_controller");
         assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::ExactOneCoverage {
-                dimension: "platforms",
+            cross_class.verify_integrity(),
+            Err(ReleaseMatrixError::InvalidCertificationProfile(
+                crate::CertificationProfileError::UnknownRequirement { .. }
+            ))
+        ));
+
+        let mut duplicate = baseline.clone();
+        duplicate.satisfied.push(duplicate.satisfied[0].clone());
+        assert!(matches!(
+            duplicate.verify_integrity(),
+            Err(ReleaseMatrixError::DuplicateRequirementAssignment { .. })
+        ));
+
+        let mut overlap = baseline.clone();
+        overlap
+            .missing
+            .push(overlap.satisfied[0].requirement.clone());
+        assert!(matches!(
+            overlap.verify_integrity(),
+            Err(ReleaseMatrixError::DuplicateRequirementAssignment { .. })
+        ));
+
+        let mut missing_partition = baseline.clone();
+        missing_partition.missing.pop();
+        assert!(matches!(
+            missing_partition.verify_integrity(),
+            Err(ReleaseMatrixError::InvalidRequirementPartition)
+        ));
+
+        let mut duplicate_evidence = baseline.clone();
+        let digest = duplicate_evidence.satisfied[0].evidence_sha256s[0].clone();
+        duplicate_evidence.satisfied[0]
+            .evidence_sha256s
+            .push(digest);
+        assert!(matches!(
+            duplicate_evidence.verify_integrity(),
+            Err(ReleaseMatrixError::DuplicateRequirementEvidence { .. })
+        ));
+
+        let mut malformed_evidence = baseline.clone();
+        malformed_evidence.satisfied[0].evidence_sha256s[0] = "not-a-sha".to_owned();
+        assert!(matches!(
+            malformed_evidence.verify_integrity(),
+            Err(ReleaseMatrixError::InvalidSha256 {
+                field: "evidence_sha256s",
                 ..
             })
         ));
 
-        let (mut manifest, reports) = fixture();
-        manifest.scenarios[0]
-            .coverage
-            .renderers
-            .push(RendererFeature::Rt64LleAccuracy);
-        manifest.scenarios[0].declaration_sha256 =
-            manifest.scenarios[0].recompute_declaration_sha256();
+        let mut empty_evidence = baseline.clone();
+        empty_evidence.satisfied[0].evidence_sha256s.clear();
         assert!(matches!(
-            verify_release_matrix(&manifest, &reports),
-            Err(ReleaseMatrixError::InvalidRendererCombination { .. })
+            empty_evidence.verify_integrity(),
+            Err(ReleaseMatrixError::EmptyRequirementEvidence { .. })
+        ));
+
+        let mut semantic_hash_change = baseline.clone();
+        semantic_hash_change.satisfied[0].evidence_sha256s[0] = "77".repeat(32);
+        assert!(matches!(
+            semantic_hash_change.verify_integrity(),
+            Err(ReleaseMatrixError::IncompleteIntegrityMismatch { .. })
+        ));
+
+        let mut assessment_hash = baseline;
+        assessment_hash.assessment_sha256 = "88".repeat(32);
+        assert!(matches!(
+            assessment_hash.verify_integrity(),
+            Err(ReleaseMatrixError::IncompleteIntegrityMismatch { .. })
         ));
     }
 }

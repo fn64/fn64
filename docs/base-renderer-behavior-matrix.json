@@ -456,18 +456,18 @@
       "category": "integration",
       "title": "Fixed-cycle full-ROM zero-unsupported evidence",
       "exactness": "missing",
-      "behavior": "Schema-v15 public mechanism code binds framebuffer, audio, complete physical RDRAM, modeled DeviceFabric, executor control, ABI HostState, typed-Rust program identity when enabled, timing traces, execution destinations, and typed unsupported events at one exact guest cycle; the v3 RT64 envelope additionally binds completed workload and present identity, while v3 run-bound journals and verified matrix v11 retain distinct ordered run identities and machine-check each declared native/typed-function/typed-block program lane against the observed destination source. No representative full-ROM class currently has an authoritative ten-run series.",
+      "behavior": "Schema-v15 public mechanism code binds framebuffer, audio, complete physical RDRAM, modeled DeviceFabric, executor control, ABI HostState, typed-Rust program identity when enabled, timing traces, execution destinations, and typed unsupported events at one exact guest cycle; the v3 RT64 envelope additionally binds completed workload and present identity. Matrix v5 routes v3-journal-bound evidence by each validated report scenario, derives schema-v15-visible scenario coverage, and assigns the evidence-backed program/renderer-lane, save, and controller members of the immutable 162-item FullParityV1 denominator. No representative full-ROM class currently has an authoritative ten-run series.",
       "evidence": [
         { "kind": "doc", "path": "docs/RELEASE-GATE.md", "needle": "no representative full-ROM class has a" },
         { "kind": "test", "path": "crates/fn64-boot-harness/src/release_gate.rs", "needle": "fn device_evidence_wire_binds_executor_peripheral_and_manager_state" },
         { "kind": "test", "path": "crates/fn64-runtime/src/device.rs", "needle": "fn release_evidence_distinguishes_pif_state_that_the_compact_snapshot_cannot" },
-        { "kind": "test", "path": "crates/fn64-boot-harness/src/release_matrix.rs", "needle": "fn retained_matrix_independently_revalidates_coverage_and_manifest_identity" },
+        { "kind": "test", "path": "crates/fn64-boot-harness/src/release_matrix.rs", "needle": "fn valid_v5_evidence_returns_canonical_incomplete_profile" },
         { "kind": "doc", "path": "docs/PARITY-METHOD.md", "needle": "current measured observation matches through swap 60" }
       ],
       "blockers": [
-        { "kind": "full_rom", "detail": "Self-contained verified matrix v11 retains and revalidates per-scenario coverage, exact program-lane agreement, reconstructed schema-v15 report integrity, RT64 workload/present identity, and ordered distinct run-event identities. No private representative matrix has supplied ten schema-v15 reports paired with ten distinct v3 run-bound journals per scenario; native-archive identity does not repair the legacy C oracle's missing bodies, a declared run identity is provenance rather than proof of process independence, and measured parity only reaches swap 60." }
+        { "kind": "full_rom", "detail": "Valid evidence produces an explicit `fn64.release-matrix-incomplete.v1` assessment with canonical satisfied/missing profile assignments; only all 162 requirements can produce a self-contained verified matrix v12. Schema v15 cannot yet prove ROM class, decoded TV region, encountered microcodes/mechanisms, exact Windows/API targets, RT64 target-case results, or blocker closure. No private representative matrix has supplied ten schema-v15 reports paired with ten distinct v3 run-bound journals per scenario; native-archive identity does not repair the legacy C oracle's missing bodies, a declared run identity is provenance rather than proof of process independence, and measured parity only reaches swap 60." }
       ],
-      "next_action": "Populate representative private ROM manifests with an explicit observed program lane, emit schema-v15 fixed-cycle render/device digests plus typed unsupported events, pair every report with a distinct v3 run-bound journal, and retain a verified matrix-v11 ten-run series for every declared class."
+      "next_action": "Add schema-v16 ROM/TV/microcode execution evidence and typed platform/blocker results, then populate private v5 manifests with ten distinct report/journal pairs per scenario until the fixed profile reaches Complete."
     }
   ]
 }

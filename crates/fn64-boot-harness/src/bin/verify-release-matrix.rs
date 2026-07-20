@@ -1,9 +1,9 @@
 use fn64_boot_harness::{
     parse_unsupported_journal, verify_release_matrix, ParsedUnsupportedJournal, ReleaseGateReport,
-    ReleaseMatrixManifest, VerifiedReleaseMatrix,
+    ReleaseMatrixManifest, ReleaseMatrixVerification, VerifiedReleaseMatrix,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     env,
     ffi::OsStr,
     fs,
@@ -67,17 +67,13 @@ fn run() -> Result<(), String> {
 
     let mut distinct_reports = BTreeSet::new();
     let mut distinct_journals = BTreeSet::new();
-    let mut evidence_by_scenario: BTreeMap<
-        String,
-        Vec<(ReleaseGateReport, ParsedUnsupportedJournal)>,
-    > = BTreeMap::new();
+    let mut evidence = Vec::<(ReleaseGateReport, ParsedUnsupportedJournal)>::new();
     for assignment in assignments {
         let assignment = assignment
             .into_string()
-            .map_err(|_| "scenario report assignment is not UTF-8".to_owned())?;
-        let (id, raw_paths) = assignment.split_once('=').ok_or_else(usage)?;
-        let (raw_report, raw_journal) = raw_paths.split_once(',').ok_or_else(usage)?;
-        if id.is_empty() || raw_report.is_empty() || raw_journal.is_empty() {
+            .map_err(|_| "report/journal assignment is not UTF-8".to_owned())?;
+        let (raw_report, raw_journal) = assignment.split_once(',').ok_or_else(usage)?;
+        if raw_report.is_empty() || raw_journal.is_empty() {
             return Err(usage());
         }
         let report_path = PathBuf::from(raw_report);
@@ -112,14 +108,38 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("read {}: {error}", journal_path.display()))?;
         let journal = parse_unsupported_journal(&journal_bytes)
             .map_err(|error| format!("parse {}: {error}", journal_path.display()))?;
-        evidence_by_scenario
-            .entry(id.to_owned())
-            .or_default()
-            .push((report, journal));
+        evidence.push((report, journal));
     }
 
-    let verified = verify_release_matrix(&manifest, &evidence_by_scenario)
-        .map_err(|error| error.to_string())?;
+    let outcome = verify_release_matrix(&manifest, &evidence).map_err(|error| error.to_string())?;
+    let verified = match outcome {
+        ReleaseMatrixVerification::Complete(verified) => verified,
+        ReleaseMatrixVerification::Incomplete(incomplete) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&ReleaseMatrixVerification::Incomplete(
+                        incomplete.clone()
+                    ))
+                    .map_err(|error| format!("serialize incomplete matrix: {error}"))?
+                );
+            }
+            let preview = incomplete
+                .missing
+                .iter()
+                .take(8)
+                .map(|requirement| format!("{}:{}", requirement.class().as_str(), requirement.id()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "certification incomplete: {} of {} profile requirements missing{}{}",
+                incomplete.missing.len(),
+                incomplete.missing.len() + incomplete.satisfied.len(),
+                if preview.is_empty() { "" } else { "; first: " },
+                preview
+            ));
+        }
+    };
     if json {
         println!(
             "{}",
@@ -179,7 +199,7 @@ fn read_manifest(path: &Path) -> Result<ReleaseMatrixManifest, String> {
 }
 
 fn usage() -> String {
-    "usage: verify-release-matrix [--json] MANIFEST.json SCENARIO_ID=REPORT.json,JOURNAL.jsonl ...\n       verify-release-matrix --print-declaration-digests MANIFEST.json\n       verify-release-matrix --verify-json VERIFIED.json".to_owned()
+    "usage: verify-release-matrix [--json] MANIFEST.json REPORT.json,JOURNAL.jsonl ...\n       verify-release-matrix --print-declaration-digests MANIFEST.json\n       verify-release-matrix --verify-json VERIFIED.json".to_owned()
 }
 
 #[cfg(test)]
@@ -190,15 +210,13 @@ mod tests {
         serde_json::to_vec(&serde_json::json!({
             "schema": schema,
             "manifest_sha256": "11".repeat(32),
-            "required": {
-                "platforms": [],
-                "controllers": [],
-                "saves": [],
-                "renderers": [],
-                "programs": []
+            "profile": {
+                "schema": fn64_boot_harness::FULL_PARITY_V1_SCHEMA,
+                "definition_sha256": fn64_boot_harness::FULL_PARITY_V1_DEFINITION_SHA256
             },
             "total_reports": 0,
             "scenarios": [],
+            "assignments": [],
             "verification_sha256": verification_sha256
         }))
         .unwrap()
@@ -216,6 +234,7 @@ mod tests {
             "fn64.verified-release-matrix.v8",
             "fn64.verified-release-matrix.v9",
             "fn64.verified-release-matrix.v10",
+            "fn64.verified-release-matrix.v11",
         ] {
             let error =
                 verify_retained_json(&empty_retained(schema, &"00".repeat(32))).unwrap_err();

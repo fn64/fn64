@@ -202,7 +202,7 @@
         "extended-gbi-cooperation": "pass"
       },
       "open_blockers": ["recognized-hle-and-extended-gbi", "aspect-and-generated-frames", "remaining-user-controls", "remaining-enhancement-controls", "inspector-gui", "full-adapter-rom-coverage", "declared-host-range"],
-      "frontier": "Eleven legacy Metal cases retain their exact 10/20-run evidence, including HFR and Extended-GBI cooperation; user-controls/rebuild has a separate 20-clean-run race-fix result and enhancement/emulator controls retain bounded causal results on the same macOS 26.5 arm64 Apple-M5-Pro host. Both S2DEX controls additionally pass twenty fresh processes with complete load-program and exact pixel/RDRAM evidence. All seven non-shrinking platform blockers remain open pending production full-ROM and wider platform certification."
+      "frontier": "Every currently required Metal case retains its applicable 10/20-run evidence, including HFR and Extended-GBI cooperation; user-controls/rebuild has a separate 20-clean-run race-fix result and enhancement/emulator controls retain bounded causal results on the same macOS 26.5 arm64 Apple-M5-Pro host. Both S2DEX controls additionally pass twenty fresh processes with complete load-program and exact pixel/RDRAM evidence. All seven non-shrinking platform blockers remain open pending production full-ROM and wider platform certification."
     },
     {
       "id": "linux-vulkan",

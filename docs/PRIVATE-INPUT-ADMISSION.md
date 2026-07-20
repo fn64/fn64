@@ -112,6 +112,15 @@ The release policy mirrors the typed release-matrix vocabulary:
   `rt64_post_vi_capture`;
 - the deterministic repeat bar is exactly ten.
 
+These values are pre-run admission policy only. Matrix v5 does not copy them
+into a certification denominator or trust them as scenario coverage: it derives
+platform, controller, save, renderer, and program-lane coverage from each
+validated committed-boundary report. The current FullParityV1 comparison can
+assign only the derived program/renderer-lane, save, and controller members;
+schema v15's coarse host platform cannot satisfy an exact platform/API target.
+A readiness receipt cannot satisfy ROM-class, TV-region, microcode,
+platform-case, or blocker requirements by itself.
+
 ## Filesystem and identity rules
 
 Admission rejects:
