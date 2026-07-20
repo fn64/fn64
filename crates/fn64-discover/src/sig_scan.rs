@@ -177,6 +177,65 @@ pub fn plausible_function_boundary(raw_words: &[u32], offset: usize) -> bool {
     prev1 == 0 && prev2 == 0
 }
 
+/// Find embedded handler-table entries: function pointers stored in a
+/// dense `const Func[]` array in a bank's data.
+///
+/// SM64-class code dispatches object actions, camera modes, and cutscene
+/// shots through static `const Func table[]` arrays (`sBowserActions`,
+/// `sCameraModes`, `sCutsceneShots`), NOT through instruction-materialized
+/// pointers or a bytecode interpreter. Each array is a run of consecutive
+/// 4-aligned words that are all valid in-window code addresses, and each
+/// entry is a callable function the CFG never reaches statically (the
+/// interpreter indexes the array at runtime). This is the dispatch
+/// equivalent of a jump table, one level up.
+///
+/// Detection is a run of `>= min_run` consecutive words where every word
+/// is a 4-aligned address inside `[va_start, code_end)` AND lands on a
+/// [`plausible_function_boundary`]. The boundary requirement is the guard
+/// against a run of float/fixed-point constants that alias as `0x80xxxxxx`
+/// addresses: an aliasing run essentially never has all of its words point
+/// at real function starts, whereas a genuine handler table does by
+/// construction. Returns each such entry VA (deduplicated, sorted); the
+/// caller seeds them as callable-entry roots and `wrong == 0` is the final
+/// adversarial judge.
+pub fn detect_handler_tables(
+    bank_words: &[u32],
+    text_words: &[u32],
+    va_start: u32,
+    code_end: u32,
+    min_run: usize,
+) -> Vec<u32> {
+    let is_entry = |word: u32| -> bool {
+        if !word.is_multiple_of(4) || word < va_start || word >= code_end {
+            return false;
+        }
+        let offset = ((word - va_start) / 4) as usize;
+        text_words
+            .get(offset)
+            .is_some_and(|&first| first != 0)
+            && plausible_function_boundary(text_words, offset)
+    };
+
+    let mut entries: Vec<u32> = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for index in 0..=bank_words.len() {
+        let in_run = index < bank_words.len() && is_entry(bank_words[index]);
+        match (run_start, in_run) {
+            (None, true) => run_start = Some(index),
+            (Some(start), false) => {
+                if index - start >= min_run {
+                    entries.extend(bank_words[start..index].iter().copied());
+                }
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    entries.sort_unstable();
+    entries.dedup();
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +325,43 @@ mod tests {
         // Target contains only the first 6 words of the body.
         let target: Vec<u32> = donor_words[..6].to_vec();
         assert!(scan_signatures(&signatures, &target, 0x80000000).is_empty());
+    }
+
+    #[test]
+    fn detect_handler_tables_finds_dense_pointer_run_not_floats() {
+        // text: 4 leaf functions, each `jr $ra; nop` so an address into
+        // one is a plausible boundary. Layout: fn at +0x00, +0x08, +0x10,
+        // +0x18 (each 2 words, jr ra / nop).
+        let va = 0x8024_6000;
+        let text: Vec<u32> = vec![
+            0x03e00008, 0x00000000, // fn @ 0x...00
+            0x03e00008, 0x00000000, // fn @ 0x...08
+            0x03e00008, 0x00000000, // fn @ 0x...10
+            0x03e00008, 0x00000000, // fn @ 0x...18
+        ];
+        let code_end = va + (text.len() as u32) * 4;
+        // A handler table of 4 entries pointing at the 4 fn starts.
+        let table = [va, va + 0x08, va + 0x10, va + 0x18];
+        // Bank words = text, then some non-pointer data, then the table.
+        let mut bank = text.clone();
+        bank.extend_from_slice(&[0x3f800000, 0x42280000]); // floats, not ptrs
+        bank.extend_from_slice(&table);
+        let entries = detect_handler_tables(&bank, &text, va, code_end, 4);
+        assert_eq!(entries, vec![va, va + 0x08, va + 0x10, va + 0x18]);
+
+        // A run below the threshold is not a table.
+        let mut short = text.clone();
+        short.extend_from_slice(&[va, va + 0x08, va + 0x10]); // only 3
+        assert!(detect_handler_tables(&short, &text, va, code_end, 4).is_empty());
+
+        // A run of float aliases that do NOT land on boundaries is rejected
+        // even at length >= min_run (they point mid-function / at nops).
+        let aliases = [va + 0x04, va + 0x0c, va + 0x14, va + 0x1c]; // +4 = delay-slot nops
+        let mut floaty = text.clone();
+        floaty.extend_from_slice(&aliases);
+        assert!(
+            detect_handler_tables(&floaty, &text, va, code_end, 4).is_empty(),
+            "addresses pointing at delay-slot nops are not function boundaries"
+        );
     }
 }
