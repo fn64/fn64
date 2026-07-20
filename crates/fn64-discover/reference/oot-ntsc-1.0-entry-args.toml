@@ -8,3 +8,12 @@
 name = "osCreateThread"
 callee_va = 0x80002f20
 pointer_arg_register = 6
+
+[[entry_arg_calls]]
+# Fault_AddClient(client, callback, arg0, arg1): the fault thread calls
+# the registered callback — callback pointer in $a1. Callee VA from the
+# OOTU answer key (the function lives in the `code` segment; its boot
+# call sites are what get sliced).
+name = "Fault_AddClient"
+callee_va = 0x800aef8c
+pointer_arg_register = 5
