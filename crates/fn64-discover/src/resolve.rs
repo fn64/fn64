@@ -2535,7 +2535,7 @@ mod tests {
         bytes.resize(0x120, 0);
         bytes[0x100..0x104].copy_from_slice(&jr_ra.to_be_bytes());
 
-        let cfg = build_cfg_with_indirect(
+        let cfg = crate::cfg::build_cfg_with_indirect(
             "boot",
             &bytes,
             0x8000_0000,

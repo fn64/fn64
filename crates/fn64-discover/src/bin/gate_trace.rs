@@ -3,14 +3,19 @@
 //! observed PC against the resident bank's existing static evidence, and the
 //! real measured `FactDb` delta from folding those observations in.
 //!
-//! What this gate does NOT do: promote anything beyond the one sound rule
-//! `trace::fold_executed_pcs_into_fact_db` implements -- a known-bank
-//! executed-PC observation becomes bank-scoped dynamic code-existence
-//! evidence (`Fact::ObservedExecutedCode`, `ProofState::Supported`), never a
-//! proven owner and never CFG-reachability proof. `IndirectTransfer`,
-//! `PiDma`, and `WatchedTableWrite` facts still have no FactDb adapter and
-//! stay at delta zero; bounded-exhaustiveness-aware indirect-target
-//! corroboration remains a frontier. Before folding, this gate also reports
+//! What this gate does NOT do: promote anything beyond the two sound
+//! rules the trace lane implements. A known-bank executed-PC observation
+//! becomes bank-scoped dynamic code-existence evidence
+//! (`Fact::ObservedExecutedCode`, `ProofState::Supported`) via
+//! `trace::fold_executed_pcs_into_fact_db`; a known-bank indirect
+//! transfer becomes an observed-edge existence fact
+//! (`Fact::ObservedIndirectTarget`, `ProofState::Supported`) via
+//! `trace::fold_indirect_targets_into_fact_db`. Neither is a proven
+//! owner or a CFG-reachability/exhaustiveness proof: an observed edge is
+//! existence (the target demonstrably ran from that site), never the
+//! claim that the site's target set is closed. `PiDma` and
+//! `WatchedTableWrite` facts still have no FactDb adapter and stay at
+//! delta zero. Before folding, this gate also reports
 //! the same corroboration breakdown as before the adapter existed: how many
 //! observed PCs land inside already-proven code, inside candidate code
 //! (execution evidence agreeing with a heuristic claim), on
@@ -333,6 +338,45 @@ fn report(rom_bytes: &[u8], trace_path: &str) -> Result<String, String> {
         writeln!(
             out,
             "  CONFLICT: trace={:?} seq={} observed-executed PC 0x{:08x} is statically ProvenData",
+            conflict.trace_id, conflict.sequence, conflict.site.pc
+        )
+        .unwrap();
+    }
+
+    // Indirect-edge fold: the adapter this gate's header formerly listed as
+    // "no FactDb adapter, delta zero." Observed jr/jalr transfers become
+    // Fact::ObservedIndirectTarget existence evidence (Supported, never
+    // exhaustive) -- the dynamic evidence for load-derived/input-dependent
+    // dispatch the static value-set lanes leave open.
+    let indirect_report = fn64_discover::trace::fold_indirect_targets_into_fact_db(
+        &mut db,
+        &ingest.header.trace_id,
+        &ingest.facts,
+        static_word_class,
+    );
+    writeln!(
+        out,
+        "FactDb indirect delta: {} facts added ({} new observed edges, {} corroborations, \
+         {} observed-target-vs-ProvenData conflicts, {} unknown-bank observations skipped)",
+        indirect_report.facts_added,
+        indirect_report.new_edges.len(),
+        indirect_report.corroborated.len(),
+        indirect_report.target_conflicts.len(),
+        indirect_report.unknown_bank_skipped,
+    )
+    .unwrap();
+    for (site, target) in &indirect_report.new_edges {
+        writeln!(
+            out,
+            "  observed edge: {}:0x{:08x} -> {}:0x{:08x}",
+            site.bank, site.pc, target.bank, target.pc
+        )
+        .unwrap();
+    }
+    for conflict in &indirect_report.target_conflicts {
+        writeln!(
+            out,
+            "  CONFLICT: trace={:?} seq={} observed-indirect target 0x{:08x} is statically ProvenData",
             conflict.trace_id, conflict.sequence, conflict.site.pc
         )
         .unwrap();
