@@ -986,6 +986,11 @@ pub struct StaticRequestDmaInput {
     pub dram_arg_register: u8,
     pub device_arg_register: u8,
     pub size_arg_register: u8,
+    /// When set, the size register carries the EXCLUSIVE END device address
+    /// instead of a byte count (SM64's `dma_read(dest, srcStart, srcEnd)`
+    /// shape); the length is `end - device`, rejected unless positive.
+    #[serde(default)]
+    pub size_is_end_address: bool,
     pub device_space: RomAddressSpace,
     pub bank_name: BankNamePattern,
 }
@@ -1079,7 +1084,25 @@ pub fn scan_static_request_dma(
                 continue;
             };
             let device = candidate.device_address.get();
-            let length = candidate.byte_count.get();
+            // In end-address mode the slicer's byte_count carries the raw
+            // end operand (its rdram bound check then over-reserves by the
+            // device offset — a conservative ceiling, never an undercheck).
+            let length = if input.size_is_end_address {
+                match candidate.byte_count.get().checked_sub(device) {
+                    Some(length) if length > 0 => length,
+                    _ => {
+                        report.open.push(format!(
+                            "{}: call at 0x{call_pc:x} end address 0x{:x} is not \
+                             beyond device start 0x{device:x}",
+                            input.name,
+                            candidate.byte_count.get()
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                candidate.byte_count.get()
+            };
             let va_start = dram_pointer.get();
             if !seen.insert((device, va_start, length)) {
                 continue;
