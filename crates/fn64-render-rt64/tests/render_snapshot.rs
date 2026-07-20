@@ -83,8 +83,12 @@ fn fixture_triangle_render_digest_snapshot() {
         data_ptr: dl_addr,
         ..Default::default()
     };
-    backend.process_task(&mut rdram, &task, 0).unwrap();
-    backend.present().unwrap();
+    backend
+        .process_task(&mut rdram, &mut fn64_runtime::RspMemory::new(), &task, 0)
+        .unwrap();
+    backend
+        .present(fn64_render::ViPresentation::default())
+        .unwrap();
     let fb = backend.framebuffer().expect("framebuffer after create()");
 
     // Guard against a degenerate fixture: a blank frame must FAIL loudly, never

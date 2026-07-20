@@ -6,7 +6,7 @@ shouldn't require a lawyer.**
 `fn64` runs the C emitted by an N64 static recompiler ([our fork of
 N64Recomp](https://github.com/fn64/n64recomp), MIT) as a native desktop app.
 It's the layer under the game: scheduler, message queues, timers, DMA and
-overlay lifecycle, save/input/audio, RSP task dispatch. That layer exists
+overlay lifecycle, save/input/audio, persistent RSP memory/DMA and task dispatch. That layer exists
 elsewhere — GPL-3.0, C++, and carrying race conditions we've personally
 excavated. So we're building the one we actually want.
 

@@ -266,6 +266,7 @@ mod tests {
         ctx.r5 = mb_vram;
         ctx.r6 = 0; // OS_READ / ToRdram
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+        advance_virtual_time(1);
 
         // The game's baked read: MEM_W at the STATIC link VRAM of the table.
         // Static VRAM 0x808301C0+TABLE_FILE_OFF -> rdram offset (mask KSEG0).

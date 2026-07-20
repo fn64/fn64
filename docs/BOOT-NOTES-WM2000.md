@@ -700,3 +700,85 @@ its own gate is the N64Recomp regen (exit 0, confirmed) + the harness run
 (now crashes at a materially later point, confirmed via LLDB backtrace,
 not just trace-file inspection which is too coarse-grained to show the
 difference on its own).
+
+## Session 2026-07-19: C++ harness revived, audio manager PUMPS, discovery lane boots
+
+Lane 1 (N64Recomp-C harness) had rotted against the working tree's C++
+MMIO-proxy migration; four fixes revived it and moved the frontier a long
+way past the old AI-register crash:
+
+1. **build.rs jr_addend rewrite** -- aki-recomp's regenerated
+   `RecompiledFuncs` now carry jump-table temporaries
+   (`gpr jr_addend_X = <expr>;`) that other case arms `goto` past. Legal
+   C11, hard error in C++. `examples/wm2000-boot/build.rs` now splits each
+   into declaration + assignment (byte-identical semantics) into OUT_DIR
+   copies before compiling.
+2. **RECOMP_FUNC `inline` bug** -- `fn64_mmio_proxy.h`'s clang branch
+   defined `RECOMP_FUNC` as `extern "C" inline ... weak`; a C++ `inline`
+   function never called in its own TU emits NO symbol, so all 51 generated
+   objects were EMPTY (link failed on `recomp_entrypoint`). `weak` alone
+   provides the duplicate tolerance; `inline` removed.
+3. **Cart handle** -- the new PI fabric requires
+   `set_cart_rom_handle_vram`; NWXE's osCartRomInit (`func_80022540`)
+   returns its OSPiHandle BSS at `D_800839A0` (disasm/asm/1050.s,
+   `addiu $v0,$s0,%lo(D_800839A0)` at 0x80022578). Registered in main.rs.
+4. **NDEBUG** -- generated code carries aki's `NAN_CHECK` debug asserts;
+   0.0/0.0 in genuinely-uninitialized-BSS math aborted the boot. Real
+   hardware propagates NaN silently; build.rs now defines NDEBUG.
+
+**Hook C landed in aki-recomp `wm2000.toml`**: boot progressed past hooks
+A/B into a THIRD dereference of the never-written `D_800481FC` dispatch
+table -- `0x8002703C: lw $v0,0x8($v1)` (table+0x8) -- observed as SIGSEGV
+at host `rdram+0x80000008` (guest null+8). Same "nothing registered"
+guard, landing on `after_9`, synthesizing the bypassed delay slot
+(`$a0=$sp+0x10`). Regenerated, rebuilt clean, cleared.
+
+**C-lane raw MMIO now charges guest time**
+(`fn64-abi/src/lib.rs::fn64_c_mmio_read_w/write_w`, 32 cycles/access, only
+when a coroutine is active): the audio manager's raw
+`while (AI_STATUS & FULL)` poll (via `func_8002B890/80`, AI_STATUS/AI_LEN
+reads) used to spin forever inside ONE scheduling slice because AI drain
+deadlines only fire as virtual time advances. With the charge, **the audio
+manager works end-to-end**: it feeds 0x8A0-byte buffers at 28805 Hz every
+~1.8M cycles (19 ms -- correct real-time cadence), the AI FIFO
+fills/drains, and thread 6 wakes once per buffer.
+
+**New Lane 1 frontier (20M-step run, sim_time 802M ~= 8.5 s virtual):**
+threads: 0 dead (expected), 3 = audio pump (19,999,788 of 20M slices),
+6 = per-buffer consumer (104 wakes, re-blocks on queue 0x838B8),
+1 = ran exactly twice then blocked forever. vi_swaps=0, gfx_tasks=0.
+The rest of boot waits on something never delivered -- plausibly a
+notification one of the SKIPPED empty-dispatch-table handlers
+(D_800481FC entries 0/1/2, hooks A/B/C) would have sent. The rung-3
+mystery is now load-bearing: the table's writer is still unfound, and its
+handlers appear to be what advances boot past audio bring-up. Exit-time
+teardown also aborts (`panic_cannot_unwind` force-unwinding a coroutine
+parked inside extern "C" `fn64_c_mmio_read_w`) -- cosmetic, post-summary,
+worth an `extern "C-unwind"` follow-up.
+
+## Lane 2 same session: wm2000-block-boot -- the DISCOVERY lane executes real ROM code
+
+New standalone example `examples/wm2000-block-boot`: build.rs runs the
+REAL fn64-discover pipeline on the ROM (`run_discovery` ->
+`compose_materialized_bank_v1` -> `emit_block_pack_v1` ->
+`materialize_block_pack` -> `emit_materialized_bank_runner`), emits the
+197-block/1,039-word sparse runner + pack consts into OUT_DIR; main.rs
+installs them via `ExecutableRegion`/`BlockProgram` and boots through
+`fn64_abi::recompiled::boot_thread0_block_program`. Zero aki-recomp
+metadata, zero N64Recomp C, zero game bytes in-repo.
+
+Climb log (each a real frontier cleared):
+- `CpuException` missing from gate_b2/gate_static_closure's emitted-runner
+  import wrapper (345 rustc E0433s) -- fixed, gates green again.
+- `mtc0` COP0 reg 18 (WatchLo): SDK boot disarms the watchpoint; emitter
+  + `RecompContext` now round-trip WatchLo/WatchHi (18/19) as stored
+  state, no watch-exception modeling.
+- **Current frontier**: typed `Rdram::load_w` at guest `0xBFC007FC` -- the
+  PIF terminate-boot status word osInitialize polls (rung-2's handshake).
+  The typed lane's MMIO window models RCP `0xA4xxxxxx` only; the PIF RAM
+  window (`0x1FC007C0-0x1FC007FF`) is not mapped. The discovered pack
+  genuinely executes the bss-clear + osInitialize prologue to get there.
+
+Gates: `cargo build/test/clippy/fmt --workspace` all green (51 suites, 0
+failures). `gate_b1`/`gate_b2`/`gate_d1`/`gate_static_closure` all pass;
+NWXE grade unchanged at 26 exact + 3 coarse + 0 wrong.

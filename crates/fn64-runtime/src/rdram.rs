@@ -232,6 +232,28 @@ impl RdramPtr {
     }
 
     /// # Safety
+    /// The allocation must cover the native word at `addr.offset()`.
+    pub unsafe fn read_u32(self, addr: RdramAddr) -> u32 {
+        assert!(
+            addr.offset().is_multiple_of(4),
+            "RDRAM raw u32 read at unaligned logical address {:#x}",
+            addr.offset()
+        );
+        unsafe { (self.0.as_ptr().add(addr.offset() as usize) as *const u32).read_unaligned() }
+    }
+
+    /// # Safety
+    /// The allocation must cover the native word at `addr.offset()`.
+    pub unsafe fn write_u32(self, addr: RdramAddr, value: u32) {
+        assert!(
+            addr.offset().is_multiple_of(4),
+            "RDRAM raw u32 write at unaligned logical address {:#x}",
+            addr.offset()
+        );
+        unsafe { (self.0.as_ptr().add(addr.offset() as usize) as *mut u32).write_unaligned(value) };
+    }
+
+    /// # Safety
     /// The allocation must cover `addr.offset() ^ 3`.
     pub unsafe fn read_u8(self, addr: RdramAddr) -> u8 {
         unsafe { *self.0.as_ptr().add((addr.offset() ^ 3) as usize) }
@@ -323,6 +345,25 @@ impl<'a> RdramViewMut<'a> {
             );
         }
     }
+
+    /// Copy flat device bytes into this borrowed storage in logical guest
+    /// order. This is the borrowed-buffer counterpart to
+    /// [`Rdram::dma_write_bytes`].
+    pub fn dma_write_bytes(&mut self, offset: usize, data: &[u8]) {
+        let addr =
+            RdramAddr::from_offset(u32::try_from(offset).expect("DMA RDRAM offset exceeds u32"));
+        self.write_logical_bytes(addr, data);
+    }
+
+    /// Read native-word storage back into flat device byte order. This is
+    /// the borrowed-buffer counterpart to [`Rdram::dma_read_bytes_flat`].
+    pub fn dma_read_bytes_flat(&self, offset: usize, len: usize) -> Vec<u8> {
+        let addr =
+            RdramAddr::from_offset(u32::try_from(offset).expect("DMA RDRAM offset exceeds u32"));
+        let mut flat = vec![0; len];
+        self.as_view().copy_logical_bytes(addr, &mut flat);
+        flat
+    }
 }
 
 /// Owns the single rdram allocation. Every consumer (`fn64-abi` shims, the
@@ -362,7 +403,8 @@ impl Rdram {
     /// `AI_STATUS`'s "not busy, not full" idle default -- see
     /// `mmio.rs::AiRegs::status` -- but callers should not rely on that
     /// coincidence for registers whose idle-zero value isn't itself the
-    /// correct default, e.g. `SpRegs::status`'s halted+broke bits).
+    /// correct default. Timed SP state is owned by `DeviceFabric` and is not
+    /// mirrored into this legacy allocation.
     pub fn new_with_mmio(size: usize) -> Self {
         let size = size.max(crate::mmio::RDRAM_MMIO_WINDOW_END as usize);
         Rdram::new(size)

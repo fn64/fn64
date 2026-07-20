@@ -76,14 +76,10 @@
 //!   host-state fields on `HostState` (new this wave).
 //! - T1 thread lifecycle completion: `osCreateThread_recomp`/
 //!   `osStartThread_recomp` now really dispatch via `SectionRegistry`.
-//! - T2 loud traps: the VI family (`osViSetMode`/`osViSetSpecialFeatures`/
-//!   `osViSetYScale`/`osViSwapBuffer`/`osViBlack`) and `osSetEventMesg`
-//!   (already real, unchanged) -- VI shims are loud `unimplemented!()`s
-//!   (no real display backend exists yet in this crate; per `AGENTS.md`,
-//!   a silently-succeeding VI stub would be worse than refusing).
-//!   `osSetTimer_recomp` IS wired for real (the executor's `TimerWheel`
-//!   already exists and needs no new host backend, unlike VI's display
-//!   surface).
+//! - The formerly trapped VI family now updates typed `ViState`, drives the
+//!   configured render backend at swap time, and shares executor retrace
+//!   delivery with `osSetEventMesg`. `osSetTimer_recomp` is likewise wired
+//!   to the executor's `TimerWheel`.
 
 use std::cell::{Cell, RefCell};
 
@@ -91,8 +87,10 @@ use corosensei::Yielder;
 use fn64_audio::AudioBackend;
 use fn64_render::RenderBackend;
 use fn64_runtime::{
-    DmaDirection, Executor, ExternalEvent, InMemoryRom, Mesg, OsTaskHeader, PiDma, Priority,
-    RdramAddr, Resume, Section, SectionRegistry, ThreadId, Yield, M_AUDTASK, M_GFXTASK,
+    AiDmaRequest, Cycles, DeviceFabric, DeviceFault, DeviceNotification, DmaDirection, Executor,
+    ExternalEvent, FixedPiTiming, InMemoryRom, Mesg, MmioAddr, OsTaskHeader, PiDma, PiDmaError,
+    PiDmaRequest, Priority, RdramAddr, Resume, Section, SectionRegistry, ThreadId, Yield,
+    M_AUDTASK, M_GFXTASK,
 };
 
 #[cfg(feature = "recomp-rs")]
@@ -193,6 +191,88 @@ pub struct RecompContext {
 /// ctx);`).
 pub type RecompFunc = unsafe extern "C" fn(*mut u8, *mut RecompContext);
 
+/// Guest cycles charged per generated-C raw RCP register access. Uncached
+/// MMIO stalls the real VR4300 for tens of cycles, and charging that time is
+/// also what keeps a raw `while (AI_STATUS & FULL)`-style poll loop live:
+/// device deadlines (AI drain, PI completion, VI retrace) only fire as
+/// virtual time advances, and the C lane has no instruction checkpoints of
+/// its own, so an uncharged poll would spin forever inside one scheduling
+/// slice (observed: WM2000's audio manager polling `0xA450000C`).
+/// ponytail: one flat cost, calibrate per-register timing if a title's
+/// faithful-rate work (docs/ROADMAP.md R5) ever needs it.
+const C_LANE_RAW_MMIO_ACCESS_CYCLES: u32 = 32;
+
+/// Charge the raw-access stall iff a guest coroutine is executing. Host-side
+/// callers (the c_smoke proxy binary, diagnostics) have no coroutine to
+/// suspend and no virtual clock to keep honest.
+fn charge_c_lane_mmio_access() {
+    if ACTIVE_YIELDER.with(|cell| cell.get()).is_some() {
+        suspend_active_coroutine(Yield::InstructionCheckpoint {
+            instructions: C_LANE_RAW_MMIO_ACCESS_CYCLES,
+        });
+    }
+}
+
+/// Generated-C word-MMIO proxy entry points. The proxy header calls these
+/// only for KSEG1 RCP addresses; ordinary RDRAM accesses stay inline.
+#[no_mangle]
+pub extern "C" fn fn64_c_mmio_read_w(vaddr: u64) -> i32 {
+    charge_c_lane_mmio_access();
+    pi::read_raw_mmio_word(vaddr).unwrap_or_else(|| {
+        panic!("generated-C raw MMIO read is outside the modeled RCP window: {vaddr:#018X}")
+    }) as i32
+}
+
+#[no_mangle]
+pub extern "C" fn fn64_c_mmio_write_w(vaddr: u64, value: u32) {
+    charge_c_lane_mmio_access();
+    assert!(
+        pi::write_raw_mmio_word(vaddr, value),
+        "generated-C raw MMIO write is outside the modeled RCP window: {vaddr:#018X}"
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn fn64_c_mmio_bad_width(vaddr: u64, width: u32, is_write: u32) {
+    let operation = if is_write == 0 { "read" } else { "write" };
+    panic!(
+        "generated-C raw MMIO {operation} at {vaddr:#018X} used unsupported {width}-byte access; RCP registers require modeled word semantics"
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn fn64_c_rdram_write(vaddr: u64, width: u32) {
+    let offset = RdramAddr::from_gpr(vaddr).offset();
+    #[cfg(feature = "recomp-rs")]
+    fn64_recomp_rs::notify_guest_write(offset, width);
+    #[cfg(not(feature = "recomp-rs"))]
+    let _ = (offset, width);
+}
+
+type LiveDeviceFabric = DeviceFabric<InMemoryRom, FixedPiTiming>;
+
+#[derive(Clone, Copy)]
+struct PendingPiCompletion {
+    request: PiDmaRequest,
+    rdram: *mut u8,
+    rdram_len: usize,
+    ret_queue: Option<RdramAddr>,
+    ret_mesg: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PendingSiCompletion {
+    request: fn64_runtime::SiDmaRequest,
+    rdram: *mut u8,
+    rdram_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PendingViMode {
+    registers: [u32; 14],
+    fields: [[u32; 5]; 2],
+}
+
 /// Host-side, non-guest state this crate owns beyond the executor: the
 /// overlay/section registry `get_function` resolves against, and the PI/ROM
 /// DMA engine. Kept alongside (not inside) `fn64_runtime::Executor` --
@@ -204,15 +284,56 @@ pub type RecompFunc = unsafe extern "C" fn(*mut u8, *mut RecompContext);
 /// says the PI/ROM completion posts through `inject_event`.
 struct HostState {
     sections: SectionRegistry,
-    /// `None` until `fn64-shell`/a test supplies a real ROM via
-    /// `set_rom`/`load_test_rom` -- PI-DMA shims called before that panic
-    /// loudly (see `with_pi_dma`) rather than silently no-op'ing, matching
-    /// `AGENTS.md`'s "loud traps."
-    pi_dma: Option<PiDma<InMemoryRom>>,
+    /// Always-present RCP/MI authority. Cartridge storage begins empty so
+    /// interrupts and non-PI devices cannot depend on ROM load order;
+    /// `rom_installed` preserves PI DMA's loud missing-ROM failure.
+    device_fabric: LiveDeviceFabric,
+    rom_installed: bool,
+    /// OS-side information intentionally kept out of the hardware fabric.
+    /// There is at most one entry because PI exposes one DMA channel.
+    pending_pi_completion: Option<PendingPiCompletion>,
+    pending_si_completion: Option<PendingSiCompletion>,
+    /// Public `OSViMode` register image queued by `osViSetMode`; the VI
+    /// manager applies it at the next V-blank rather than at the shim call.
+    pending_vi_mode: Option<PendingViMode>,
+    /// Last latched mode's two field-dependent register images. Common
+    /// registers latch once; these five words alternate with VI field parity.
+    active_vi_mode: Option<PendingViMode>,
+    /// Standalone VI control update queued by `osViSetSpecialFeatures` when
+    /// no mode image is pending. Multiple calls accumulate in order.
+    pending_vi_control: Option<u32>,
+    /// Public X/Y scale coefficients queued for the next VI interrupt.
+    pending_vi_x_scale: Option<f32>,
+    pending_vi_y_scale: Option<f32>,
+    /// Active coefficients multiply the selected mode's 2.10 register base.
+    active_vi_x_scale: f32,
+    active_vi_y_scale: f32,
+    /// Process-wide allocation used by typed raw-MMIO starts. Managed shim
+    /// starts record their call-local pointer/required extent directly.
+    runtime_rdram: *mut u8,
+    runtime_rdram_len: usize,
     /// Guest-visible `OSPiHandle*` returned by `osCartRomInit`. The handle
     /// storage is game-owned BSS, so the boot host supplies its link address;
     /// leaving it unset is a loud trap rather than returning a stale `$v0`.
     cart_rom_handle_vram: Option<u32>,
+    /// Guest BSS storage for the `OSPiHandle*` returned by `osFlashInit`.
+    /// Flash and cartridge handles describe different PI domains and must
+    /// never be silently aliased.
+    flash_handle_vram: Option<u32>,
+    /// Host-supplied 64DD-register EPI handle. Disk images and their timing
+    /// are optional runtime inputs, so retail cartridge boots leave this
+    /// absent and a real 64DD caller must configure it explicitly.
+    leo_disk: Option<pi::LeoDiskConfig>,
+    /// Stateful FlashRAM command sequencing (write buffer and through-erase
+    /// completion) lives beside the one save backing store it controls.
+    flash: save::FlashState,
+    /// Host-selected development-hardware profile used by the clean-room
+    /// `__checkHardware_*` shims. A retail/default host reports none rather
+    /// than pretending an unavailable debug transport exists.
+    debug_hardware: debug::DebugHardware,
+    /// Lossless host side of the RDB/printf transport. Debug output must not
+    /// disappear into a silent no-op; shells consume this queue explicitly.
+    debug_packets: Vec<debug::DebugPacket>,
     /// `OSThread*` (rdram-relative offset) -> `OSId`, populated by
     /// `osCreateThread_recomp`. Needed because real call sites pass the SAME
     /// `OSThread*` handle to `osStartThread`/`osSetThreadPri`/etc, NOT the
@@ -220,6 +341,21 @@ struct HostState {
     /// the real disassembly evidence that disproved a prior wave's opposite
     /// assumption.
     thread_handles: std::collections::HashMap<u32, ThreadId>,
+    /// Executor `ThreadId` -> the OSId the guest's `osCreateThread` actually
+    /// supplied. Libultra's OSId is an informational tag with NO uniqueness
+    /// contract -- thread identity on real hardware is the OSThread struct
+    /// pointer, and NWXE's retail boot creates two live threads with id 3
+    /// (`func_80001410`'s create is gated on a `.data` byte whose ROM
+    /// initializer is 0x01, then `func_80026DE0` reuses id 3 for the audio
+    /// manager -- see docs/BOOT-NOTES-WM2000.md, 2026-07-19). On a
+    /// collision `osCreateThread_recomp` keys the executor by a synthetic
+    /// id instead, and this map preserves the guest-visible OSId for
+    /// `osGetThreadId_recomp`.
+    thread_guest_ids: std::collections::HashMap<ThreadId, u32>,
+    /// Next synthetic executor id handed out on an OSId collision. Starts
+    /// far above any plausible guest OSId so remapped threads are obvious
+    /// in trace output.
+    next_synthetic_thread_id: ThreadId,
     /// `OSTimer*` (rdram-relative offset) -> `TimerId`, populated by
     /// `osSetTimer_recomp`. Same shape as `thread_handles`: a real
     /// `osStopTimer(t)` call site (OoT's boot-critical set, per
@@ -233,6 +369,12 @@ struct HostState {
     /// coroutine used by the C path.
     #[cfg(feature = "recomp-rs")]
     recompiled_lookup: Option<fn(u32) -> fn64_recomp_rs::RecompFunc>,
+    /// Bank-qualified arbitrary-PC program installed by the universal rs
+    /// lane. This is mutually exclusive with `recompiled_lookup`: spawned
+    /// OSThreads enter through its explicit PC-to-bank resolver and retain
+    /// the same owned program/generation identities as thread 0.
+    #[cfg(feature = "recomp-rs")]
+    recompiled_program: Option<recompiled::LiveBlockProgram>,
     /// Length of the process-wide RDRAM/MMIO allocation behind `ACTIVE_RDRAM`.
     /// Required to rebuild the checked rs-lane `Rdram` view at a spawned
     /// thread's entry without creating a second memory model or allocation.
@@ -244,16 +386,71 @@ impl Default for HostState {
     fn default() -> Self {
         HostState {
             sections: SectionRegistry::new(),
-            pi_dma: None,
+            device_fabric: DeviceFabric::new(
+                PiDma::new(InMemoryRom::new(Vec::new())),
+                FixedPiTiming(Cycles::new(1)),
+            ),
+            rom_installed: false,
+            pending_pi_completion: None,
+            pending_si_completion: None,
+            pending_vi_mode: None,
+            active_vi_mode: None,
+            pending_vi_control: None,
+            pending_vi_x_scale: None,
+            pending_vi_y_scale: None,
+            active_vi_x_scale: 1.0,
+            active_vi_y_scale: 1.0,
+            runtime_rdram: std::ptr::null_mut(),
+            runtime_rdram_len: 0,
             cart_rom_handle_vram: None,
+            flash_handle_vram: None,
+            leo_disk: None,
+            flash: save::FlashState::default(),
+            debug_hardware: debug::DebugHardware::default(),
+            debug_packets: Vec::new(),
             thread_handles: std::collections::HashMap::new(),
+            thread_guest_ids: std::collections::HashMap::new(),
+            next_synthetic_thread_id: 0xF000_0000,
             timer_handles: std::collections::HashMap::new(),
             #[cfg(feature = "recomp-rs")]
             recompiled_lookup: None,
             #[cfg(feature = "recomp-rs")]
+            recompiled_program: None,
+            #[cfg(feature = "recomp-rs")]
             recompiled_rdram_len: 0,
         }
     }
+}
+
+/// Select the IPL television standard for the shared VI/AI clock authority.
+/// Returns the currently armed VI field interval in guest CPU cycles.
+pub fn configure_tv_type(tv_type: fn64_runtime::TvType) -> u64 {
+    with_host(|host| {
+        host.device_fabric
+            .configure_tv_type(tv_type)
+            .unwrap_or_else(|error| panic!("configure_tv_type failed: {error}"))
+            .get()
+    })
+}
+
+/// Active public video clock. Hosts that have not installed IPL state retain
+/// the historical NTSC default; real boot allocations call
+/// [`configure_tv_type`] before guest code starts.
+pub fn vi_clock_hz() -> u32 {
+    with_host(|host| {
+        host.device_fabric
+            .tv_type()
+            .unwrap_or_default()
+            .vi_clock_hz()
+    })
+}
+
+pub fn configured_tv_type() -> fn64_runtime::TvType {
+    with_host(|host| host.device_fabric.tv_type().unwrap_or_default())
+}
+
+pub fn vi_field_interval() -> Option<u64> {
+    with_host(|host| host.device_fabric.vi_field_interval().map(Cycles::get))
 }
 
 /// Reentrant-safe interior mutability for `Executor`, replacing a plain
@@ -665,10 +862,14 @@ unsafe fn read_offset_word(rdram: *mut u8, base_offset: u32, extra_offset: u32) 
 
 mod ai;
 mod cache;
+mod debug;
 mod dispatch;
+mod gbpak;
 mod host;
 mod mesgqueue;
+mod pfs;
 mod pi;
+mod save;
 mod si;
 mod softmath;
 mod sp_dp;
@@ -677,13 +878,18 @@ mod task_dispatch;
 mod thread;
 mod timer;
 mod vi;
+mod voice;
 
 pub use ai::*;
 pub use cache::*;
+pub use debug::*;
 pub use dispatch::*;
+pub use gbpak::*;
 pub use host::*;
 pub use mesgqueue::*;
+pub use pfs::*;
 pub use pi::*;
+pub use save::*;
 pub use si::*;
 pub use softmath::*;
 pub use sp_dp::*;
@@ -692,9 +898,7 @@ pub use task_dispatch::*;
 pub use thread::*;
 pub use timer::*;
 pub use vi::*;
-
-#[cfg(feature = "recomp-rs")]
-pub(crate) use system::INT_MASK;
+pub use voice::*;
 
 #[cfg(test)]
 mod test_support;

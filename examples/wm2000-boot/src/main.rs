@@ -106,10 +106,15 @@ fn main() {
     // Real plumbing, stand-in body (see stand_in_audio_ucode's doc comment).
     unsafe { fn64_abi::set_audio_ucode_fn(stand_in_audio_ucode) };
 
-    // VI retrace: arm a host-chosen approximation (fn64_runtime::vi's doc:
-    // not a hardware-accurate NTSC/PAL constant). 1000 virtual-time units
-    // per field is an arbitrary but documented choice for this harness.
-    fn64_abi::arm_vi_retrace(1000);
+    // NWXE's osCartRomInit (func_80022540) returns its OSPiHandle BSS at
+    // D_800839A0 (`addiu $v0, $s0, %lo(D_800839A0)`, disasm/asm/1050.s
+    // vram 0x80022578); the host shim hands guest code that same address.
+    fn64_abi::set_cart_rom_handle_vram(0x8008_39A0);
+
+    // Typed IPL video standard is the shared VI/AI clock authority. The first
+    // field uses nominal NTSC timing; the latched OSViMode H/V registers then
+    // refine it from the public VI clock.
+    fn64_abi::configure_tv_type(fn64_boot_harness::TvType::Ntsc);
 
     // Arm crash-safe incremental trace flushing BEFORE booting thread 0 --
     // a SIGSEGV mid-boot (as rung 3 hit) must not lose the whole session's
@@ -159,9 +164,11 @@ fn main() {
     // against ONE shared budget and logged periodically so a genuine
     // infinite idle-spin is visible (many steps, sim_time barely advancing)
     // rather than silently indistinguishable from real progress.
-    const MAX_STEPS: u64 = 2_000_000;
-    const TICK_STEP: u64 = 100;
-    const LOG_EVERY: u64 = 50_000;
+    // 20M: with the C-lane raw-MMIO time charge, the audio manager's
+    // AI_STATUS poll consumes ~56k steps per 19ms audio buffer, so 2M steps
+    // only covered ~0.8s of virtual boot.
+    const MAX_STEPS: u64 = 20_000_000;
+    const LOG_EVERY: u64 = 500_000;
     // How many consecutive "nothing was runnable, and advancing the
     // virtual clock didn't wake anything either" ticks before concluding
     // boot has reached a genuinely idle steady state (not just a thread
@@ -232,7 +239,8 @@ fn main() {
         if !stepped {
             // Nothing was runnable -- host-driven progress (VI retrace,
             // due timers) is the only way forward.
-            tick += TICK_STEP;
+            tick += fn64_abi::vi_field_interval()
+                .expect("typed television standard must keep VI armed");
             fn64_abi::advance_virtual_time(tick);
             consecutive_idle_ticks += 1;
             if consecutive_idle_ticks >= IDLE_TICKS_BEFORE_STOP {
