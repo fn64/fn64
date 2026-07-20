@@ -46,9 +46,26 @@ fn64-audio = { path = "../fn64-audio" }
 # Window + live framebuffer present. Both MIT/Apache-2.0 (permissive).
 # `pixels` is a thin wgpu-backed pixel-buffer presenter -- the simplest way
 # to blit the game's RGBA framebuffer to a resizable window with correct
-# aspect. winit drives the window + keyboard events.
-winit = "0.30"
+# aspect. winit drives the window + keyboard events. The `serde` feature is
+# for persisting `KeyCode` bindings in the input config TOML.
+winit = { version = "0.30", features = ["serde"] }
 pixels = "0.15"
+
+# Gamepad input (issue #4). `serde-serialize` persists `gilrs::Button`
+# bindings in the input config TOML.
+gilrs = { version = "0.11", features = ["serde-serialize"] }
+
+# The in-game settings overlay (issue #5). Pinned to 0.27: pixels 0.15 pins
+# wgpu 0.19, and 0.27 is the egui line built against wgpu 0.19. egui-winit is
+# deliberately absent (its 0.27 wants winit 0.29); the shell hand-translates
+# the few mouse events the overlay needs (see overlay.rs).
+egui = "0.27"
+egui-wgpu = "0.27"
+
+# Input config persistence: ~/.config/fn64/input.toml.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
 
 # For `_exit(2)` (immediate process termination): the one global fn64_abi
 # executor holds a booted game's GameThreads, whose Drop panics if run at

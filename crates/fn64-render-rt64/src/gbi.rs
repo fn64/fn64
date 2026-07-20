@@ -116,6 +116,9 @@ const G_LOAD_UCODE: u8 = 0xDD;
 /// the coord word as a bogus opcode and desyncs the stream.
 const G_TEXRECT: u8 = 0xE4;
 const G_TEXRECTFLIP: u8 = 0xE5;
+/// First texrect coordinate half in F3DEX2's three-word texrect form
+/// (gbi.h gDPTextureRectangle: E4, then E1 with s/t, then F1 with steps).
+const G_RDPHALF_1: u8 = 0xE1;
 const G_SETOTHERMODE_L: u8 = 0xE2;
 const G_SETOTHERMODE_H: u8 = 0xE3;
 /// Full RDP other-mode write (`gsDPSetOtherMode`; gbi.h:3724-3737).
@@ -2632,13 +2635,107 @@ fn decode_stream(rdram: &[u8], dl_addr: u32, state: &mut DecodeState) {
                 });
             }
             G_TEXRECT | G_TEXRECTFLIP => {
-                // 16-byte (two-word) RDP rectangle command (gbi.h:4973). We
-                // don't rasterize 2D texrects yet, but we MUST advance past
-                // the second word (S/T + dsdx/dtdy) so the following command
-                // is read at the right offset -- otherwise the coord word
-                // decodes as a garbage opcode and desyncs the stream.
-                skip_opcode(opcode);
-                pc += 8;
+                // 16-byte (two-word) RDP rectangle command (gbi.h:4973):
+                // this word packs the lower-right corner (10.2 px) in w0 and
+                // tile + upper-left corner in w1; the SECOND 8-byte word is
+                // S/T start (S10.5 texels) + dsdx/dtdy steps (S5.10
+                // texels/px). Advancing past that second word is mandatory
+                // even when not drawing, or the stream desyncs.
+                // The loop already advanced `pc` past this command's first
+                // 8 bytes, so `pc` now addresses the coordinate payload.
+                // F3DEX2's gDPTextureRectangle emits it as TWO more command
+                // words -- G_RDPHALF_1 (0xE1, w1 = s<<16|t) then G_RDPHALF_2
+                // (0xF1, w1 = dsdx<<16|dtdy), 24 bytes total (the form OoT
+                // uses; verified from a live boot-logo task trace). The raw
+                // RDP 16-byte form packs s/t + steps directly in the next
+                // 8 bytes. Distinguish by the payload's opcode byte.
+                let (s_word, d_word) = if read_u32(rdram, pc) >> 24 == G_RDPHALF_1 as u32 {
+                    let s = read_u32(rdram, pc + 4);
+                    let d = read_u32(rdram, pc + 12);
+                    pc += 16;
+                    (s, d)
+                } else {
+                    let s = read_u32(rdram, pc);
+                    let d = read_u32(rdram, pc + 4);
+                    pc += 8;
+                    (s, d)
+                };
+                let mut lrx = ((w0 >> 12) & 0xFFF) as f32 / 4.0;
+                let mut lry = (w0 & 0xFFF) as f32 / 4.0;
+                let ulx = ((w1 >> 12) & 0xFFF) as f32 / 4.0;
+                let uly = (w1 & 0xFFF) as f32 / 4.0;
+                let s0 = ((s_word >> 16) as u16 as i16) as f32 / 32.0;
+                let t0 = (s_word as u16 as i16) as f32 / 32.0;
+                let mut dsdx = ((d_word >> 16) as u16 as i16) as f32 / 1024.0;
+                let dtdy = (d_word as u16 as i16) as f32 / 1024.0;
+                // COPY/FILL cycle types treat the lower-right edge as
+                // INCLUSIVE, and COPY encodes dsdx pre-multiplied by 4
+                // (the RDP copies 4 texels per clock) -- gbi.h's
+                // gsSPTextureRectangle COPY-mode notes.
+                match state.other_mode.cycle_type() {
+                    CycleType::Copy => {
+                        lrx += 1.0;
+                        lry += 1.0;
+                        dsdx /= 4.0;
+                    }
+                    CycleType::Fill => {
+                        lrx += 1.0;
+                        lry += 1.0;
+                    }
+                    CycleType::OneCycle | CycleType::TwoCycle => {}
+                }
+                if lrx > ulx && lry > uly {
+                    // Emit as two screen-space triangles through the normal
+                    // rasterizer path: z=0 (2D overlay, wins the z-test
+                    // against any 3D geometry), w=1 (no perspective), white
+                    // shade so SHADE-referencing combiners stay neutral.
+                    // RDP rectangles ignore the RSP G_TEXTURE enable, so bind
+                    // `current` directly instead of `active_texture`. The
+                    // single-`current` tile approximation stands in for the
+                    // command's tile index, as everywhere else.
+                    let flip = opcode == G_TEXRECTFLIP;
+                    let corner = |x: f32, y: f32| {
+                        let (dx, dy) = (x - ulx, y - uly);
+                        // FLIP exchanges which screen axis each texture axis
+                        // walks (gbi.h G_TEXRECTFLIP).
+                        let (s, t) = if flip {
+                            (s0 + dy * dsdx, t0 + dx * dtdy)
+                        } else {
+                            (s0 + dx * dsdx, t0 + dy * dtdy)
+                        };
+                        Vertex {
+                            x,
+                            y,
+                            z: 0.0,
+                            r: 255,
+                            g: 255,
+                            b: 255,
+                            a: 255,
+                            s,
+                            t,
+                            w: 1.0,
+                        }
+                    };
+                    let quad = [
+                        corner(ulx, uly),
+                        corner(lrx, uly),
+                        corner(lrx, lry),
+                        corner(ulx, lry),
+                    ];
+                    let texture = state.tex.current.clone();
+                    let blender = active_blender(state);
+                    for idx in [[0usize, 1, 2], [0, 2, 3]] {
+                        state.tris.push(Triangle {
+                            v: [quad[idx[0]], quad[idx[1]], quad[idx[2]]],
+                            scissor: state.scissor,
+                            cull: CullMode::None,
+                            texture: texture.clone(),
+                            other_mode: state.other_mode,
+                            combiner: state.combiner,
+                            blender,
+                        });
+                    }
+                }
             }
             G_ENDDL => break,
             _ => skip_opcode(opcode),
@@ -3677,9 +3774,211 @@ mod tests {
         let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
         assert_eq!(
             tris.len(),
-            1,
-            "texrect must consume both words so the following G_TRI1 is \
-             decoded at the right offset"
+            3,
+            "texrect (2 tris) must consume both words so the following \
+             G_TRI1 is decoded at the right offset (3rd tri)"
+        );
+        assert_eq!(
+            [tris[2].v[0].r, tris[2].v[1].g, tris[2].v[2].b],
+            [255, 255, 255],
+            "the trailing G_TRI1's red/green/blue vertices decoded intact"
+        );
+    }
+
+    /// Plant a minimal loaded I8 4x2 texture (SETTIMG + SETTILE +
+    /// SETTILESIZE + LOADBLOCK) at `off`, texels at `timg`, returning the
+    /// offset after the last command.
+    fn plant_i8_4x2_texture(rdram: &mut [u8], mut off: usize, timg: u32) -> usize {
+        for (i, texel) in [0x00u8, 0x40, 0x80, 0xC0, 0x11, 0x51, 0x91, 0xD1]
+            .into_iter()
+            .enumerate()
+        {
+            wr_u8(rdram, timg as usize + i, texel);
+        }
+        // G_SETTIMG: fmt=I(4), siz=8b(1), width=4.
+        wr_cmd(
+            rdram,
+            off,
+            ((G_SETTIMG as u32) << 24) | (4 << 21) | (1 << 19) | (4 - 1),
+            timg,
+        );
+        off += 8;
+        // G_SETTILE tile 0: fmt=I, siz=8b, clamp S+T.
+        wr_cmd(
+            rdram,
+            off,
+            ((G_SETTILE as u32) << 24) | (4 << 21) | (1 << 19),
+            (2 << 18) | (2 << 8),
+        );
+        off += 8;
+        // G_SETTILESIZE tile 0: 4x2 texels (S10.5 inclusive bounds).
+        wr_cmd(
+            rdram,
+            off,
+            (G_SETTILESIZE as u32) << 24,
+            ((4u32 - 1) * 4) << 12 | ((2 - 1) * 4),
+        );
+        off += 8;
+        wr_cmd(rdram, off, (G_LOADBLOCK as u32) << 24, 0);
+        off + 8
+    }
+
+    #[test]
+    fn texrect_emits_two_screen_space_triangles_with_texel_uvs() {
+        // gSPTextureRectangle (gbi.h:4973): word A = opcode + lrx/lry
+        // (10.2 px), word B = tile + ulx/uly; the second 8-byte word is
+        // s/t (S10.5 texels) + dsdx/dtdy (S5.10 texels-per-pixel). The rect
+        // (10,20)-(42,28) with s=2.0,t=1.0 and unit steps must become two
+        // screen-space triangles (z=0, w=1, white shade) whose corner UVs
+        // run (2,1) at the upper-left to (2+32, 1+8) at the lower-right,
+        // sampling the bound texture even though no G_TEXTURE enable ran
+        // (RDP rectangles bypass the RSP texture-on bit).
+        let mut rdram = vec![0u8; 0x4000];
+        let mut off = plant_i8_4x2_texture(&mut rdram, 0x1000, 0x2000);
+
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_TEXRECT as u32) << 24) | ((42 * 4) << 12) | (28 * 4),
+            ((10 * 4) << 12) | (20 * 4),
+        );
+        off += 8;
+        wr_cmd(&mut rdram, off, (64 << 16) | 32, (1024 << 16) | 1024);
+        off += 8;
+        wr_cmd(&mut rdram, off, (G_ENDDL as u32) << 24, 0);
+
+        let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
+        assert_eq!(tris.len(), 2, "one texrect = two triangles");
+
+        let mut corners: Vec<(i32, i32, i32, i32)> = tris
+            .iter()
+            .flat_map(|t| t.v.iter())
+            .map(|v| {
+                assert_eq!(v.z, 0.0, "texrect is 2D: no depth");
+                assert_eq!(v.w, 1.0, "texrect is 2D: no perspective");
+                assert_eq!([v.r, v.g, v.b, v.a], [255; 4], "neutral white shade");
+                (
+                    v.x as i32,
+                    v.y as i32,
+                    (v.s * 32.0) as i32,
+                    (v.t * 32.0) as i32,
+                )
+            })
+            .collect();
+        corners.sort_unstable();
+        corners.dedup();
+        assert_eq!(
+            corners,
+            vec![
+                (10, 20, 64, 32),
+                (10, 28, 64, 32 + 8 * 32),
+                (42, 20, 64 + 32 * 32, 32),
+                (42, 28, 64 + 32 * 32, 32 + 8 * 32),
+            ],
+            "4 unique corners spanning the rect, UVs stepped by dsdx/dtdy"
+        );
+        for t in &tris {
+            let tex = t.texture.as_ref().expect(
+                "texrect must sample the loaded tile without a G_TEXTURE enable",
+            );
+            assert_eq!((tex.width, tex.height), (4, 2));
+            assert_eq!(t.cull, CullMode::None, "RDP rects are never culled");
+        }
+    }
+
+    #[test]
+    fn texrect_reads_st_and_steps_from_rdphalf_words() {
+        // F3DEX2's gDPTextureRectangle does NOT inline s/t in the second
+        // 8 bytes: it emits THREE words -- E4 (corners), G_RDPHALF_1 (0xE1,
+        // w1 = s<<16|t), G_RDPHALF_2 (0xF1, w1 = dsdx<<16|dtdy) -- 24 bytes
+        // total. This is the form OoT's boot logo uses (verified from a live
+        // task-150 trace: E4 at 0x16a820, next command at 0x16a838). Reading
+        // the E1 command word itself as s/t samples texel (0,0) forever.
+        let mut rdram = vec![0u8; 0x4000];
+        let mut off = plant_i8_4x2_texture(&mut rdram, 0x1000, 0x2000);
+
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_TEXRECT as u32) << 24) | ((42 * 4) << 12) | (28 * 4),
+            ((10 * 4) << 12) | (20 * 4),
+        );
+        off += 8;
+        wr_cmd(&mut rdram, off, 0xE100_0000, (64 << 16) | 32);
+        off += 8;
+        wr_cmd(&mut rdram, off, 0xF100_0000, (1024 << 16) | 1024);
+        off += 8;
+        wr_cmd(&mut rdram, off, (G_ENDDL as u32) << 24, 0);
+
+        let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
+        assert_eq!(tris.len(), 2, "24-byte texrect still emits two triangles");
+        let min_s = tris
+            .iter()
+            .flat_map(|t| t.v.iter())
+            .map(|v| (v.s * 32.0) as i32)
+            .min()
+            .unwrap();
+        let max_s = tris
+            .iter()
+            .flat_map(|t| t.v.iter())
+            .map(|v| (v.s * 32.0) as i32)
+            .max()
+            .unwrap();
+        assert_eq!(
+            (min_s, max_s),
+            (64, 64 + 32 * 32),
+            "s/t come from RDPHALF_1's w1, steps from RDPHALF_2's w1"
+        );
+    }
+
+    #[test]
+    fn texrect_copy_mode_uses_inclusive_bounds_and_quarter_dsdx() {
+        // In G_CYC_COPY the RDP copies 4 texels per clock: dsdx is encoded
+        // pre-multiplied by 4 (gbi.h gsSPTextureRectangle COPY notes) and the
+        // lower-right edge is INCLUSIVE. A (0,0)-(31,15) COPY texrect with
+        // dsdx=4<<10 must span 32x16 pixels with unit texel steps.
+        let mut rdram = vec![0u8; 0x4000];
+        let mut off = plant_i8_4x2_texture(&mut rdram, 0x1000, 0x2000);
+
+        // G_RDPSETOTHERMODE: high 24 bits in w0 payload; G_CYC_COPY = 2<<20.
+        wr_cmd(&mut rdram, off, ((G_RDPSETOTHERMODE as u32) << 24) | (2 << 20), 0);
+        off += 8;
+        wr_cmd(
+            &mut rdram,
+            off,
+            ((G_TEXRECT as u32) << 24) | ((31 * 4) << 12) | (15 * 4),
+            0,
+        );
+        off += 8;
+        wr_cmd(&mut rdram, off, 0, ((4 << 10) << 16) | (1 << 10));
+        off += 8;
+        wr_cmd(&mut rdram, off, (G_ENDDL as u32) << 24, 0);
+
+        let tris = decode_display_list_f3dex2(&rdram, 0x1000).unwrap();
+        assert_eq!(tris.len(), 2);
+        let max_x = tris
+            .iter()
+            .flat_map(|t| t.v.iter())
+            .map(|v| v.x as i32)
+            .max()
+            .unwrap();
+        let max_y = tris
+            .iter()
+            .flat_map(|t| t.v.iter())
+            .map(|v| v.y as i32)
+            .max()
+            .unwrap();
+        assert_eq!((max_x, max_y), (32, 16), "COPY lower-right is inclusive");
+        let max_s = tris
+            .iter()
+            .flat_map(|t| t.v.iter())
+            .map(|v| (v.s * 32.0) as i32)
+            .max()
+            .unwrap();
+        assert_eq!(
+            max_s,
+            32 * 32,
+            "COPY dsdx is stored x4: 32px at 1 texel/px, not 4 texels/px"
         );
     }
 

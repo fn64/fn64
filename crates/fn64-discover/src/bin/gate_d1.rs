@@ -4,8 +4,8 @@
 //! their local ROM/key files are present.
 
 use fn64_discover::banks::{
-    BankNamePattern, DestinationEnd, DestinationRangeFields, DestinationSpace, LoadImageTableInput,
-    LoadImageTableShape, SourceRangeFields, TableLocation,
+    BankNamePattern, DescriptorTableShape, DestinationEnd, DestinationRangeFields, DestinationSpace,
+    LoadImageTableInput, LoadImageTableShape, SourceRangeFields, TableLocation,
 };
 use fn64_discover::evidence::EvidenceManifest;
 use fn64_discover::facts::load_image_table_record_subject;
@@ -44,6 +44,28 @@ fn nw4e_descriptor() -> DescriptorTableInput {
     (
         fn64_discover::aki_reference::NW4E_DESCRIPTOR_TABLE,
         fn64_discover::aki_reference::nw4e_bank_name,
+    )
+}
+
+/// NWXE (WM2000) overlay bank table, statically recovered in
+/// aki-recomp/games/NWXE/overlays.json (2026-07-13): reader func_800222D8
+/// loads 4 records of 9 words [rom_start, rom_end, text_start, text_dup,
+/// data_start, data_dup, bss_start, bss_dup, bss_end]. Byte-verified
+/// 2026-07-17 against the ROM: records begin at ROM 0x48a80 (record 1 =
+/// [0x4c160, 0x73390, 0x800e1b90, ...]); the word after record 4 is
+/// 0x00000001, not a fifth record. Banks 1/4 and 2/3 share destination VA
+/// slots but have disjoint ROM ranges, so records stay independently proven.
+fn nwxe_descriptor() -> DescriptorTableInput {
+    (
+        DescriptorTableShape {
+            table_rom_offset: 0x48a80,
+            record_count: 4,
+            record_stride: 0x24,
+            field_rom_start: 0x00,
+            field_rom_end: 0x04,
+            field_vram_dest: 0x08,
+        },
+        |index| format!("bank{}", index + 1),
     )
 }
 
@@ -187,7 +209,12 @@ fn main() {
             nw4e_dump.as_str(),
             Some(nw4e_descriptor()),
         ),
-        ("NWXE", nwxe_rom.as_str(), nwxe_dump.as_str(), None),
+        (
+            "NWXE",
+            nwxe_rom.as_str(),
+            nwxe_dump.as_str(),
+            Some(nwxe_descriptor()),
+        ),
     ] {
         if !Path::new(rom).exists() || !Path::new(dump).exists() {
             println!("{label}: optional grade skipped (ROM or answer key absent)\n");
