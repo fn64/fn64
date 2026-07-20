@@ -302,3 +302,68 @@ without a working ares launch, there was nothing to boot NW4E against or
 screenshot. No comparison to the existing Mupen64Plus captures
 (`/Users/jer/.claude/jobs/9e110870/tmp/mupen-debug`,
 `/Users/jer/.claude/jobs/9e110870/tmp/shots`) was possible this pass.
+
+## Update 2026-07-20: GDB stub is the automation surface; socket driver is ready
+
+Two earlier assumptions were wrong. Resolved by reading the ares source
+(`/Users/jer/.claude/jobs/9e110870/tmp/ares-src`) and testing:
+
+- **settings.bml pre-seeding does NOT enable the instruction tracer.** Its
+  `file`/`terminal` flags live on the runtime `emulator->root` node
+  (`node/debugger/tracer/tracer.hpp`), opened lazily per-instruction in
+  `Program::log` (`desktop-ui/program/platform.cpp:60`). That state is not
+  serialized to settings.bml — only `Boot/Debugger` (boots paused + shows
+  the Tracer panel, still needs a GUI checkbox). The tracer is genuinely
+  GUI-only. Lead (b) above is dead.
+- **The GDB stub IS the surface, and it IS settings-controllable.**
+  `Boot/AwaitGDBClient: true` + `GDBServer/Port: 9123` both persist in
+  settings.bml. ares implements the standard GDB Remote Serial Protocol
+  (`nall/gdb/server.cpp`: `Z0` breakpoint, `c` continue, `p<idx>` register
+  read, `?` halt, `m`/`M` memory), wired into the N64 CPU with breakpoints
+  and watchpoints that gate the *recompiler* (`cpu/recompiler.cpp`), so it
+  free-runs at dynarec speed and breaks only on installed PCs.
+- **The real blocker is that ares has no headless mode.** A launched copy
+  (dequarantine via `cp -R` to a writable dir + `xattr -dr` on the copy;
+  notarization travels, `spctl` still accepts) runs its AppKit event loop
+  (`sample` shows `hiro::pApplication::run -> NSApplication run ->
+  _DPSNextEvent`) waiting for a window-server session. From a headless
+  agent job it parks there forever and never boots the ROM. `ares --help`
+  has no `--headless`/`--no-video`. **ares must run in a real desktop (or
+  VNC) GUI session** — that one step needs a human.
+
+### Turnkey capture procedure (`tools/mupen-trace/ares_gdb_trace.py`)
+
+Register map (from `ares/n64/system/system.cpp` regRead hook): GPR `$rN` =
+index N (0-31), `$pc` = index 37; each value is 16 hex chars, 64-bit. A
+`jr $rs`/`jalr $rs` target is simply the value of `$rs` at the branch, so
+the driver reads one register per hit — no single-stepping.
+
+1. **(human, once)** Clear Gatekeeper: launch ares from Finder once, or
+   `xattr -dr com.apple.quarantine /Applications/ares.app` in Terminal.app.
+2. **(human)** In ares settings (or settings.bml): `Boot/AwaitGDBClient:
+   true`. Launch `ares --system "Nintendo 64" mm.z64` in a desktop
+   session; it boots paused, waiting for a GDB client on :9123.
+3. **(agent/script)** Build the site list from open-frontier PCs
+   (`gate_decomp_functions ... FN64_DISCOVER_PRINT_OPEN=1` prints
+   `code-seg open [bank]: name@0xVA` lines):
+   ```sh
+   python3 ares_gdb_trace.py emit-sites --rom mm.z64 \
+       --pcs "0x800a5b00,0x8019..." --va-base 0x800a5ac0 \
+       --rom-base <request_dma_0 resident file offset> --out sites.json
+   ```
+   (Only PCs that decode as jr/jalr become sites.)
+4. **(agent/script)** Capture while the game runs (human plays, or
+   attract-mode; ares has no scripted input):
+   ```sh
+   python3 ares_gdb_trace.py capture --rom mm.z64 --sites sites.json \
+       --out mm.trace.jsonl --trace-id mm-ares-1 --duration 300
+   ```
+5. **(agent)** Fold: `FN64_DISCOVER_TRACE=mm.trace.jsonl
+   gate_decomp_functions ...` — observed targets become excused
+   code-segment roots (PR #33).
+
+The driver is fully self-tested offline against a mock GDB server
+(`test_ares_gdb_trace.py`, `python3 test_ares_gdb_trace.py`) and its output
+was verified end-to-end through the real gate: a driver-produced
+MM-digest-bound trace recovered `func_800A6650` (code-seg 3040 -> 3041,
+wrong=0). Only step 2 (a GUI ares session) remains human-only.
