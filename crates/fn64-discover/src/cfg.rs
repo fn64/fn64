@@ -222,6 +222,10 @@ pub enum BlockTerminator {
     MissingDelaySlot { control_pc: u32 },
     /// Ran off the end of the decodable/bank region without a terminator.
     RanOffEnd,
+    /// Straight-line descent reached a caller-supplied data-fence VA
+    /// (machine-checked embedded read-only data). The block ends here
+    /// with no successor; the fenced words are never decoded.
+    DataFence { at: u32 },
 }
 
 /// One indirect control-transfer site the CFG could not resolve -- carried
@@ -311,6 +315,51 @@ pub fn build_cfg(bank: &str, bank_bytes: &[u8], va_start: u32, roots: &[u32]) ->
     build_cfg_with_indirect(bank, bank_bytes, va_start, roots, &BTreeMap::new())
 }
 
+/// Detect embedded in-`.text` pointer tables and return the VA of each
+/// table's first word, suitable as a [`build_cfg_fenced`] fence set.
+///
+/// The machine-checked signal is a run of `min_run` or more consecutive
+/// 4-aligned words that are each a valid VA into this bank's own code
+/// window `[va_start, code_end)`. A jump/handler/vtable stored inline in
+/// `.text` is exactly this: a dense run of self-references. Ordinary code
+/// does not contain long runs of words that are all bank-internal
+/// aligned addresses (an instruction stream mixes opcodes, immediates,
+/// and offsets), so this fences data tables, not code. Descent that would
+/// otherwise fall through a leaf function into the following pointer table
+/// -- decoding those addresses as instructions and manufacturing a
+/// computed branch into a neighbor (the MM audio/camera contamination) --
+/// stops at the table instead. A shorter run stays unfenced; the caller
+/// still grades wrong==0 as the final judge.
+pub fn detect_embedded_data(
+    bank_bytes: &[u8],
+    va_start: u32,
+    code_end: u32,
+    min_run: usize,
+) -> BTreeSet<u32> {
+    let words: Vec<u32> = bank_bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+        .collect();
+    let is_internal_ptr =
+        |word: u32| word.is_multiple_of(4) && word > va_start && word < code_end;
+    let mut fences = BTreeSet::new();
+    let mut run_start: Option<usize> = None;
+    for index in 0..=words.len() {
+        let in_run = index < words.len() && is_internal_ptr(words[index]);
+        match (run_start, in_run) {
+            (None, true) => run_start = Some(index),
+            (Some(start), false) => {
+                if index - start >= min_run {
+                    fences.insert(va_start + (start as u32) * 4);
+                }
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    fences
+}
+
 /// Build a CFG while consuming Phase 6's exhaustive indirect successors.
 /// The map is keyed by transfer-site PC. A missing or empty target set leaves
 /// the site open; callers must never put partially-resolved sets here.
@@ -320,6 +369,25 @@ pub fn build_cfg_with_indirect(
     va_start: u32,
     roots: &[u32],
     exhaustive_indirect: &BTreeMap<u32, Vec<u32>>,
+) -> Cfg {
+    build_cfg_fenced(bank, bank_bytes, va_start, roots, exhaustive_indirect, &BTreeSet::new())
+}
+
+/// [`build_cfg_with_indirect`] plus a caller-supplied set of DATA FENCE
+/// addresses: VAs the caller has machine-checked to begin embedded
+/// read-only data (e.g. a function's inline float-constant block, located
+/// by a typed relocation). Straight-line descent that reaches a fenced VA
+/// ends the current block as [`BlockTerminator::DataFence`] instead of
+/// decoding the data as instructions -- the fence never adds a successor.
+/// The set is evidence, not a guess: this module never derives fences
+/// from raw bytes. An empty set reproduces the unfenced CFG exactly.
+pub fn build_cfg_fenced(
+    bank: &str,
+    bank_bytes: &[u8],
+    va_start: u32,
+    roots: &[u32],
+    exhaustive_indirect: &BTreeMap<u32, Vec<u32>>,
+    data_fence: &BTreeSet<u32>,
 ) -> Cfg {
     let va_end = va_start.wrapping_add(bank_bytes.len() as u32);
     let in_range = |va: u32| va >= va_start && va < va_end && (va - va_start).is_multiple_of(4);
@@ -366,6 +434,21 @@ pub fn build_cfg_with_indirect(
 
         let mut pc = block_start;
         loop {
+            // A data fence stops straight-line descent before the fenced
+            // word is decoded. When the block's own start is fenced it
+            // becomes a zero-instruction fence block (a root that lands in
+            // data); mid-run it ends the block with the code decoded so
+            // far. Either way the fenced words are never read as code, so
+            // an embedded float block cannot manufacture a computed branch
+            // into a neighboring function.
+            if data_fence.contains(&pc) {
+                blocks.push(BasicBlock {
+                    start_va: block_start,
+                    end_va: pc,
+                    terminator: BlockTerminator::DataFence { at: pc },
+                });
+                break;
+            }
             let off = (pc - va_start) as usize;
             let Some(word) = read_word(bank_bytes, off) else {
                 blocks.push(BasicBlock {
@@ -670,6 +753,63 @@ mod tests {
     }
 
     const NOP: u32 = 0x0000_0000; // sll $zero, $zero, 0
+
+    #[test]
+    fn detect_embedded_data_finds_pointer_table_not_code() {
+        // Two ordinary instructions, then a 4-entry inline pointer table
+        // of bank-internal aligned addresses.
+        let code = [0x27bd_ffe8u32, 0x03e0_0008]; // addiu sp; jr ra
+        let table = [0x8000_0100u32, 0x8000_0140, 0x8000_0180, 0x8000_01c0];
+        let mut words = Vec::new();
+        words.extend_from_slice(&code);
+        words.extend_from_slice(&table);
+        let bytes = asm(&words);
+        let fences = detect_embedded_data(&bytes, 0x8000_0000, 0x8000_1000, 4);
+        // Only the table (starting at index 2 = VA 0x...08) is fenced.
+        assert_eq!(fences.into_iter().collect::<Vec<_>>(), vec![0x8000_0008]);
+        // A run of 3 is below threshold: nothing fenced.
+        let short = asm(&[0x27bd_ffe8, 0x8000_0100, 0x8000_0140, 0x8000_0180]);
+        assert!(detect_embedded_data(&short, 0x8000_0000, 0x8000_1000, 4).is_empty());
+    }
+
+    #[test]
+    fn data_fence_stops_descent_before_the_fenced_word() {
+        // A leaf function (addiu $sp; jr $ra; nop) immediately followed by
+        // an embedded float-constant block that decodes as a valid COP1
+        // store with an in-window computed target. Without a fence,
+        // descent past the leaf would decode the float and could branch
+        // anywhere. With the block's start fenced, descent stops clean.
+        let float_word = 0xe032_ada2; // sdc1-shaped; must never be decoded
+        let bytes = asm(&[0x27bd_ffe8, 0x03e0_0008, NOP, float_word, float_word]);
+        let fence: BTreeSet<u32> = [0x8000_000c].into_iter().collect();
+        let cfg = build_cfg_fenced(
+            "boot",
+            &bytes,
+            0x8000_0000,
+            &[0x8000_0000, 0x8000_000c],
+            &BTreeMap::new(),
+            &fence,
+        );
+        // The fenced root at 0x...0c is a zero-instruction DataFence block;
+        // the float word is never classified as code.
+        let fenced = cfg
+            .blocks
+            .iter()
+            .find(|b| b.start_va == 0x8000_000c)
+            .expect("fenced block present");
+        assert!(matches!(
+            fenced.terminator,
+            BlockTerminator::DataFence { at: 0x8000_000c }
+        ));
+        assert_eq!(fenced.start_va, fenced.end_va);
+        assert!(!cfg.word_class.contains_key(&0x8000_000c));
+        // The same input WITHOUT the fence does decode the float word.
+        let unfenced = build_cfg("boot", &bytes, 0x8000_0000, &[0x8000_0000, 0x8000_000c]);
+        assert_eq!(
+            unfenced.word_class.get(&0x8000_000c),
+            Some(&WordClass::ProvenCode)
+        );
+    }
 
     #[test]
     fn straight_line_falls_off_end_as_ran_off_end() {

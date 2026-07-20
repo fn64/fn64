@@ -430,7 +430,8 @@ fn declared_edge_count(terminator: &BlockTerminator) -> Option<usize> {
         | BlockTerminator::Trap
         | BlockTerminator::InvalidInstruction { .. }
         | BlockTerminator::MissingDelaySlot { .. }
-        | BlockTerminator::RanOffEnd => Some(0),
+        | BlockTerminator::RanOffEnd
+        | BlockTerminator::DataFence { .. } => Some(0),
     }
 }
 
@@ -534,6 +535,7 @@ fn describe_block(
             }
             BlockTerminator::Trap => (11, false, false, 0, Vec::new()),
             BlockTerminator::RanOffEnd => (12, false, false, 0, Vec::new()),
+            BlockTerminator::DataFence { .. } => (13, false, false, 0, Vec::new()),
             BlockTerminator::InvalidInstruction { .. } => (13, false, false, 0, Vec::new()),
             BlockTerminator::MissingDelaySlot { .. } => (14, false, false, 0, Vec::new()),
         };

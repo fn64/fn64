@@ -281,7 +281,7 @@ fn validate_block(block: &BasicBlock, cfg: &Cfg, blockers: &mut BTreeSet<BlockPr
         BlockTerminator::MissingDelaySlot { control_pc } => {
             blockers.insert(BlockProofBlocker::MissingDelaySlot { control_pc });
         }
-        BlockTerminator::RanOffEnd => {
+        BlockTerminator::RanOffEnd | BlockTerminator::DataFence { .. } => {
             blockers.insert(BlockProofBlocker::RanOffEnd);
         }
         _ => {}

@@ -346,7 +346,8 @@ fn reachable_blocks(
             | BlockTerminator::Trap
             | BlockTerminator::InvalidInstruction { .. }
             | BlockTerminator::MissingDelaySlot { .. }
-            | BlockTerminator::RanOffEnd => {}
+            | BlockTerminator::RanOffEnd
+            | BlockTerminator::DataFence { .. } => {}
         }
     }
     visited
