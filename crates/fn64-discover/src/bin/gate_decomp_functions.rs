@@ -95,7 +95,7 @@ struct ScriptPtrTable {
     name: String,
     rom_start: u32,
     rom_end: u32,
-    command_word: u32,
+    command_words: Vec<u32>,
     command_mask: u32,
 }
 
@@ -284,7 +284,11 @@ fn main() {
                 .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
                 .collect();
             for pair in words.windows(2) {
-                if pair[0] & table.command_mask != table.command_word {
+                if !table
+                    .command_words
+                    .iter()
+                    .any(|&command| pair[0] & table.command_mask == command)
+                {
                     continue;
                 }
                 let pointer = pair[1];
