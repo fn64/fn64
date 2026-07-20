@@ -1563,9 +1563,28 @@ pub fn build_cfg_value_set_closed(
     va_start: u32,
     seed_roots: &[u32],
 ) -> ClosureResult {
+    build_cfg_value_set_closed_with_claims(bank, bank_bytes, va_start, seed_roots, &BTreeMap::new())
+}
+
+/// [`build_cfg_value_set_closed`] with cited indirect-edge claims pinned
+/// into the fixed point: `claimed` maps a `jr` site pc to its
+/// externally-cited jump-table targets (read from ROM bytes by the
+/// caller). Claims are unioned into every iteration's exhaustive map —
+/// they are citations, not derivations, so the resolver can neither
+/// confirm nor demote them; the wrong==0 grade judges them instead. The
+/// claimed sites' own resolution records stay exactly what the resolver
+/// can prove (usually `Open`) — injecting an edge never fabricates an
+/// exhaustiveness proof.
+pub fn build_cfg_value_set_closed_with_claims(
+    bank: &str,
+    bank_bytes: &[u8],
+    va_start: u32,
+    seed_roots: &[u32],
+    claimed: &BTreeMap<u32, Vec<u32>>,
+) -> ClosureResult {
     let roots: BTreeSet<u32> = seed_roots.iter().copied().collect();
     let va_end = va_start.wrapping_add(bank_bytes.len() as u32);
-    let mut exhaustive: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut exhaustive: BTreeMap<u32, Vec<u32>> = claimed.clone();
     let mut history = vec![exhaustive.clone()];
 
     loop {
@@ -1575,11 +1594,14 @@ pub fn build_cfg_value_set_closed(
         backslice_open_sites(&cfg, bank_bytes, va_start, &mut resolutions);
         reject_unusable_targets(&mut resolutions, va_start, va_end);
 
-        let next: BTreeMap<u32, Vec<u32>> = resolutions
+        let mut next: BTreeMap<u32, Vec<u32>> = resolutions
             .iter()
             .filter(|resolution| resolution.state == IndirectProofState::Exhaustive)
             .map(|resolution| (resolution.site_pc, resolution.targets.clone()))
             .collect();
+        for (site, targets) in claimed {
+            next.insert(*site, targets.clone());
+        }
         if next == exhaustive {
             return ClosureResult {
                 cfg,
@@ -1608,11 +1630,14 @@ pub fn build_cfg_value_set_closed(
                     .filter(|resolution| resolution.state == IndirectProofState::Exhaustive)
                     .map(|resolution| (resolution.site_pc, resolution.targets.clone()))
                     .collect();
-                let confirmed: BTreeMap<u32, Vec<u32>> = conservative
+                let mut confirmed: BTreeMap<u32, Vec<u32>> = conservative
                     .iter()
                     .filter(|(site, targets)| resolved.get(site) == Some(*targets))
                     .map(|(site, targets)| (*site, targets.clone()))
                     .collect();
+                for (site, targets) in claimed {
+                    confirmed.insert(*site, targets.clone());
+                }
                 if confirmed != conservative {
                     conservative = confirmed;
                     continue;
@@ -1647,14 +1672,61 @@ pub fn build_cfg_closed_with_facts(
     va_start: u32,
     seed_roots: &[u32],
 ) -> (Cfg, Vec<ResolvedTarget>) {
+    build_cfg_closed_with_facts_and_claims(db, bank, bank_bytes, va_start, seed_roots, &BTreeMap::new())
+}
+
+/// [`build_cfg_closed_with_facts`] plus cited jump-table claims (see
+/// [`build_cfg_value_set_closed_with_claims`]).
+pub fn build_cfg_closed_with_facts_and_claims(
+    db: &crate::facts::FactDb,
+    bank: &str,
+    bank_bytes: &[u8],
+    va_start: u32,
+    seed_roots: &[u32],
+    claimed: &BTreeMap<u32, Vec<u32>>,
+) -> (Cfg, Vec<ResolvedTarget>) {
     let mut roots: BTreeSet<u32> = seed_roots.iter().copied().collect();
     roots.extend(db.proven_function_entries(bank));
-    build_cfg_closed(
+    let closure = build_cfg_value_set_closed_with_claims(
         bank,
         bank_bytes,
         va_start,
         &roots.into_iter().collect::<Vec<_>>(),
-    )
+        claimed,
+    );
+    let block_starts: BTreeMap<u32, u32> = closure
+        .cfg
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            closure
+                .indirect
+                .iter()
+                .filter(move |resolution| {
+                    resolution.site_pc >= block.start_va && resolution.site_pc < block.end_va
+                })
+                .map(move |resolution| (resolution.site_pc, block.start_va))
+        })
+        .collect();
+    let mut legacy = Vec::new();
+    for resolution in &closure.indirect {
+        if resolution.state != IndirectProofState::Exhaustive {
+            continue;
+        }
+        for &target in &resolution.targets {
+            legacy.push(ResolvedTarget {
+                site_pc: resolution.site_pc,
+                target,
+                via_call: resolution.via_call,
+                construction_start: block_starts
+                    .get(&resolution.site_pc)
+                    .copied()
+                    .unwrap_or(resolution.site_pc),
+            });
+        }
+    }
+    legacy.sort_by_key(|resolution| (resolution.site_pc, resolution.target));
+    (closure.cfg, legacy)
 }
 
 /// Exploratory counterpart to [`build_cfg_closed_with_facts`]. It seeds the
