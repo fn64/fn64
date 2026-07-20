@@ -1,0 +1,47 @@
+# Kirby 64: The Crystal Shards (US) load-image table geometry — explicit,
+# cited external claims: table shapes only, no answers. The ROM contents
+# still have to satisfy the table.
+#
+# Provenance (derived 2026-07-19 from the Kirby64Ret/kirby64 decomp plus
+# direct byte verification against the retail ROM, sha1
+# 6cea2d46b929a3bb347b060a77fccc83526fb855; the ROM is fully uncompressed,
+# so every VRAM-resident structure has a direct physical offset):
+# - The loader is src/main/dma.c `dma_overlay_load(struct Overlay*)`;
+#   include/types.h gives the record layout: 0x00 startAddr (physical ROM
+#   start, passed straight to osEPiStartDma), 0x04 endAddr (physical ROM
+#   end), 0x08 RAMStart (VRAM destination), then text/data/bss bounds;
+#   stride 0x24.
+# - `gOverlayTable` (tools/symbol_addrs.txt, 0x800BE8A0 = ROM 0x66AF0
+#   through ovl1's affine mapping) is a NULL-terminated array of 20
+#   pointers to consecutive stride-0x24 records at 0x800BE5D0 = ROM
+#   0x66820, ending exactly where the pointer array begins. All 20 records
+#   were byte-verified against the retail ROM: their (rom, vram) pairs are
+#   exactly the decomp splat.yaml's 20 overlay segments (6 differ only in
+#   table-index order vs the yaml's ROM-order ovlN naming). Record 0
+#   duplicates the resident `ovl1Def` (mainSegOverlay, 0x8003DC70), so no
+#   separate single-record claim is needed.
+# - Destination end is source length: `dma_overlay_load` copies exactly
+#   endAddr-startAddr bytes to RAMStart (byte-checked: RAMStart + length
+#   == the record's dataEnd field for ovl1).
+# - This table lives INSIDE ovl1 (which record 0 maps); its location is
+#   cited here as the physical offset, valid because the ROM stores ovl1
+#   uncompressed at its record's startAddr.
+# - Kirby's overlays are mutually-exclusive bank slots (e.g. eight records
+#   share RAMStart 0x801DB1E0). Records sharing a VRAM slot prove distinct
+#   same-VA banks; a dump section inside a shared slot will bind only if
+#   its extent fits exactly one bank — anything else stays an honest
+#   multi-mapping ambiguity.
+
+[[load_image_tables]]
+name = "overlay_records"
+
+[load_image_tables.bank_name]
+prefix = "overlay_"
+index_base = 1
+
+[load_image_tables.shape]
+location = { space = "Physical", offset = 0x66820 }
+record_count = 20
+record_stride = 0x24
+source = { space = "Physical", field_start = 0, field_end = 4 }
+destination = { space = "vram", field_start = 8, end = "source_length" }
