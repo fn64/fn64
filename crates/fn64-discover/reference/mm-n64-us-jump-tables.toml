@@ -1,0 +1,26 @@
+# mm-n64-us cited jump-table claims for open `jr` sites.
+#
+# Each claim was adjudicated at byte level in the boot image (boot copy:
+# ROM 0x1000 -> VA 0x80080000). Targets are read from ROM bytes at the
+# cited table VA and injected as CFG successors of the site — case
+# labels, never roots, never an exhaustiveness proof. The wrong==0 grade
+# judges every claim.
+
+[[jump_table_claims]]
+# IrqMgr_ThreadEntry's message switch. Construction at VA
+# 0x800826c0..0x800816e0 (ROM 0x26c0..0x26e0):
+#   lw    $t6, 0x34($sp)        # message value reloaded from stack —
+#   addiu $t7, $t6, -666        # why the bounded resolver stays Open
+#   sltiu $at, $t7, 8           # bound: 8 cases
+#   beqz  $at, default
+#   sll   $t7, $t7, 2
+#   lui   $at, 0x800a
+#   addu  $at, $at, $t7
+#   lw    $t7, -0x7da0($at)     # table VA 0x80098260
+#   jr    $t7
+# Table bytes at ROM 0x19260: 8 case labels 0x800816e8..0x80081730,
+# all inside IrqMgr_ThreadEntry.
+name = "IrqMgr_ThreadEntry_message_switch"
+site_va = 0x800816e0
+table_va = 0x80098260
+entry_count = 8

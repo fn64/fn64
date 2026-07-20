@@ -53,11 +53,19 @@
 //!                             optional cited byte-adjudicated interior
 //!                             entries (WIP answer keys); grading excuses
 //!                             only, never discovery input
+//!   FN64_DISCOVER_JUMP_TABLES optional cited jump-table claims for open
+//!                             `jr` sites the bounded resolver cannot prove
+//!                             (load-derived index): site pc + table VA +
+//!                             entry count, cited at byte level; entries
+//!                             are read from ROM bytes, validated in-window,
+//!                             and pinned as CFG successors — never roots,
+//!                             never an exhaustiveness proof
 
 use fn64_discover::banks::{self, materialize_rom_range, LoadImageTableInput, StaticRequestDmaInput};
 use fn64_discover::grade_oot_functions::{grade_functions, AnswerFunction, JalTargets};
 use fn64_discover::partition::{partition, same_bank_overlaps};
-use fn64_discover::resolve::build_cfg_closed_with_facts;
+use fn64_discover::resolve::build_cfg_closed_with_facts_and_claims;
+use std::collections::BTreeMap;
 use fn64_discover::{required_env_path, run_discovery_with_tables_and_request_dma, Fact};
 use serde::Deserialize;
 
@@ -120,6 +128,24 @@ struct EntryArgCall {
     name: String,
     callee_va: u32,
     pointer_arg_register: u8,
+}
+
+/// Cited jump-table claims (FN64_DISCOVER_JUMP_TABLES): an open `jr`
+/// site whose switch table location and bound were adjudicated at byte
+/// level (the claim file cites the construction instructions). Targets
+/// are read from ROM bytes at the cited table and become CFG successors
+/// of the site — case labels, not function roots.
+#[derive(Deserialize)]
+struct JumpTablesFile {
+    jump_table_claims: Vec<JumpTableClaim>,
+}
+
+#[derive(Deserialize)]
+struct JumpTableClaim {
+    name: String,
+    site_va: u32,
+    table_va: u32,
+    entry_count: u32,
 }
 
 /// Byte-adjudicated interior entries (FN64_DISCOVER_ADJUDICATED_ENTRIES):
@@ -400,6 +426,94 @@ fn main() {
         );
     }
 
+    // Stored code-pointer harvest: a `lui rt, HI` followed shortly by
+    // `addiu/ori rd, rt, LO` constructing a 4-aligned address inside the
+    // boot code window is, in compiled code, almost always a function
+    // pointer being materialized (callback fields, handler registration —
+    // switch labels come from tables, not HI/LO pairs). Scan the boot
+    // window plus every materializable proven bank; accept only targets at
+    // a plausible function boundary. Seeds are unexcused: a constant that
+    // points mid-function shows up as `wrong`, never as an excuse.
+    {
+        let mut images: Vec<Vec<u32>> = Vec::new();
+        images.push(
+            bank_bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+                .collect(),
+        );
+        for fact in db.proven_rom_mappings() {
+            let Fact::RomMapping { bank, rom_space, rom_start, rom_end, .. } = fact else {
+                continue;
+            };
+            if bank == banks::BOOT_BANK {
+                continue;
+            }
+            if let Ok(image) = materialize_rom_range(&rom, &db, *rom_space, *rom_start, *rom_end) {
+                images.push(
+                    image
+                        .bytes
+                        .chunks_exact(4)
+                        .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+                        .collect(),
+                );
+            }
+        }
+        let boot_words = &images[0];
+        let mut stored_ptr = 0usize;
+        let mut candidates: Vec<u32> = Vec::new();
+        for words in &images {
+            for (index, word) in words.iter().enumerate() {
+                if word >> 26 != 0x0f {
+                    continue; // not lui
+                }
+                let rt = (word >> 16) & 0x1f;
+                let hi = (word & 0xffff) << 16;
+                // Pair with the nearest following addiu/ori on the same
+                // register before that register is redefined.
+                for follow in words.iter().skip(index + 1).take(8) {
+                    let opcode = follow >> 26;
+                    let rs = (follow >> 21) & 0x1f;
+                    let rd = (follow >> 16) & 0x1f;
+                    if (opcode == 0x09 || opcode == 0x0d) && rs == rt {
+                        let low = follow & 0xffff;
+                        let target = if opcode == 0x09 {
+                            hi.wrapping_add((low as i16) as i32 as u32)
+                        } else {
+                            hi | low
+                        };
+                        if target % 4 == 0
+                            && target > boot_va_start
+                            && target < code_end
+                        {
+                            candidates.push(target);
+                        }
+                        break;
+                    }
+                    if rd == rt && opcode != 0x00 {
+                        break; // rt redefined by another I-type
+                    }
+                }
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        for target in candidates {
+            let offset = ((target - boot_va_start) / 4) as usize;
+            if offset >= boot_words.len() {
+                continue;
+            }
+            if !fn64_discover::sig_scan::plausible_function_boundary(boot_words, offset) {
+                continue;
+            }
+            if !roots.contains(&target) {
+                roots.push(target);
+                stored_ptr += 1;
+            }
+        }
+        println!("stored code-pointer roots added={stored_ptr}");
+    }
+
     // Donor-signature lane (FN64_DISCOVER_SIG_DONOR_ROM/_DUMP, ';'-lists
     // zipped pairwise): masked full-body signatures from other ROMs' answer
     // keys, matched into this ROM's boot window. Recovers statically-dead
@@ -570,8 +684,52 @@ fn main() {
         }
     }
 
-    let (cfg, resolved) =
-        build_cfg_closed_with_facts(&db, banks::BOOT_BANK, bank_bytes, boot_va_start, &roots);
+    // Cited jump-table claims: read each table's entries from the boot
+    // image at its cited VA, validate hard (a malformed claim dies loudly,
+    // never degrades), and pin the edges into the CFG fixed point.
+    let mut claimed_edges: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    if let Some(file) = load_toml_env::<JumpTablesFile>("FN64_DISCOVER_JUMP_TABLES") {
+        for claim in &file.jump_table_claims {
+            let table_offset = claim
+                .table_va
+                .checked_sub(boot_va_start)
+                .map(|delta| (boot_rom_start + delta) as usize)
+                .unwrap_or_else(|| panic!("jump-table {}: table below boot VA", claim.name));
+            let mut targets = Vec::new();
+            for index in 0..claim.entry_count {
+                let at = table_offset + (index as usize) * 4;
+                let word = rom
+                    .bytes
+                    .get(at..at + 4)
+                    .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+                    .unwrap_or_else(|| panic!("jump-table {}: entry {index} outside ROM", claim.name));
+                assert!(
+                    word % 4 == 0 && word >= boot_va_start && word < code_end,
+                    "jump-table {}: entry {index} = {word:#x} outside the scanned code window",
+                    claim.name
+                );
+                targets.push(word);
+            }
+            targets.sort_unstable();
+            targets.dedup();
+            println!(
+                "jump-table claim {}: site 0x{:x}, {} unique target(s)",
+                claim.name,
+                claim.site_va,
+                targets.len()
+            );
+            claimed_edges.insert(claim.site_va, targets);
+        }
+    }
+
+    let (cfg, resolved) = build_cfg_closed_with_facts_and_claims(
+        &db,
+        banks::BOOT_BANK,
+        bank_bytes,
+        boot_va_start,
+        &roots,
+        &claimed_edges,
+    );
     let part = partition(&cfg);
     let overlaps = same_bank_overlaps(&part, &cfg);
     println!(
