@@ -53,6 +53,13 @@
 //!                             optional cited byte-adjudicated interior
 //!                             entries (WIP answer keys); grading excuses
 //!                             only, never discovery input
+//!   FN64_DISCOVER_OVL_RELOCS  set to 1 for Zelda-format overlay reloc
+//!                             harvesting: every materializable proven bank
+//!                             that parses as an overlay contributes its
+//!                             typed R_MIPS_26 jal targets (machine-checked
+//!                             callable entries, excused) and R_MIPS_32
+//!                             data pointers (unexcused seeds) into the
+//!                             boot window
 //!   FN64_DISCOVER_JUMP_TABLES optional cited jump-table claims for open
 //!                             `jr` sites the bounded resolver cannot prove
 //!                             (load-derived index): site pc + table VA +
@@ -459,6 +466,61 @@ fn main() {
                 );
             }
         }
+        // Zelda overlay reloc harvest (FN64_DISCOVER_OVL_RELOCS=1): the
+        // engine's own relocation tables type every reference. Typed jal
+        // targets are the same evidentiary class as cross-bank jals
+        // (excused); typed data pointers are unexcused seeds.
+        if std::env::var("FN64_DISCOVER_OVL_RELOCS").is_ok() {
+            let mut ovl_files = 0usize;
+            let mut ovl_jal = 0usize;
+            let mut ovl_ptr_candidates: Vec<u32> = Vec::new();
+            for words in images.iter().skip(1) {
+                let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+                let Some(refs) = fn64_discover::overlay_reloc::parse_zelda_overlay(&bytes)
+                else {
+                    continue;
+                };
+                ovl_files += 1;
+                for target in refs.jal_targets {
+                    if target >= boot_va_start
+                        && target < code_end
+                        && !roots.contains(&target)
+                    {
+                        roots.push(target);
+                        excused.push(target);
+                        ovl_jal += 1;
+                    }
+                }
+                ovl_ptr_candidates.extend(refs.data_pointers);
+            }
+            let boot_words_ref = &images[0];
+            let mut ovl_ptr = 0usize;
+            ovl_ptr_candidates.sort_unstable();
+            ovl_ptr_candidates.dedup();
+            for target in ovl_ptr_candidates {
+                if target % 4 != 0 || target <= boot_va_start || target >= code_end {
+                    continue;
+                }
+                let offset = ((target - boot_va_start) / 4) as usize;
+                if offset >= boot_words_ref.len()
+                    || !fn64_discover::sig_scan::plausible_function_boundary(
+                        boot_words_ref,
+                        offset,
+                    )
+                {
+                    continue;
+                }
+                if !roots.contains(&target) {
+                    roots.push(target);
+                    ovl_ptr += 1;
+                }
+            }
+            println!(
+                "overlay relocs: files parsed={ovl_files} jal roots added={ovl_jal} \
+                 data-pointer roots added={ovl_ptr}"
+            );
+        }
+
         let boot_words = &images[0];
         let mut stored_ptr = 0usize;
         let mut candidates: Vec<u32> = Vec::new();
