@@ -83,13 +83,15 @@ fn main() {{
     );
 
     let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    // A process-unique key: `SystemTime` alone collides when two harness tests
-    // in the same binary run in parallel and land in the same instant, so a
-    // monotonic counter disambiguates them deterministically.
+    // Nextest launches each test in a separate process, so every process-local
+    // counter previously started at zero and raced on the same source/binary
+    // paths. The PID separates those processes; the counter separates parallel
+    // calls that share one process.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let key = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let source_path = out_dir.join(format!("fn64_fallback_dispatch_{key}.rs"));
-    let binary_path = out_dir.join(format!("fn64_fallback_dispatch_{key}"));
+    let process_id = std::process::id();
+    let source_path = out_dir.join(format!("fn64_fallback_dispatch_{process_id}_{key}.rs"));
+    let binary_path = out_dir.join(format!("fn64_fallback_dispatch_{process_id}_{key}"));
     std::fs::write(&source_path, source).expect("write fallback dispatch source");
 
     let deps = std::env::current_exe()
