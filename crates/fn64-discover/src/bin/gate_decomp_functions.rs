@@ -669,10 +669,42 @@ fn main() {
         candidates.dedup();
         for target in candidates {
             let offset = ((target - boot_va_start) / 4) as usize;
-            if offset >= boot_words.len() {
+            let Some(&first) = boot_words.get(offset) else {
+                continue;
+            };
+            if !fn64_discover::sig_scan::plausible_function_boundary(boot_words, offset) {
                 continue;
             }
-            if !fn64_discover::sig_scan::plausible_function_boundary(boot_words, offset) {
+            // A `lui/addiu`-constructed in-window address is a FUNCTION
+            // pointer only if it points at a real function opener. The AKI
+            // engines construct DATA-array bases the same way (`lui;addiu`
+            // then `subu`/`sw`/`addu` index arithmetic), and those land in
+            // an embedded read-only region — a hex-digit ASCII table
+            // ("0123456789ABCDEF"), a zero-filled scratch run, then a small
+            // pointer table. Every word in that region aliases as a
+            // boundary-plausible address (a zero run trips the double-nop
+            // padding rule), so per-opcode guards just chase the split root
+            // a few words forward. Reject on the data tells a real IDO/KMC
+            // prologue never has: first word is `nop`/zero (no function
+            // opens with a bare nop — this subsumes the whole zero run),
+            // all-printable-ASCII (string/number table), a coprocessor op
+            // (0x10-0x13, e.g. mfc0), `addi` (0x08, trapping; compilers
+            // emit `addiu`), or a reserved encoding the decoder rejects.
+            // wrong==0 judges.
+            let opcode = first >> 26;
+            let is_ascii = first
+                .to_be_bytes()
+                .iter()
+                .all(|&b| (0x20..=0x7e).contains(&b));
+            if first == 0
+                || is_ascii
+                || (0x10..=0x13).contains(&opcode)
+                || opcode == 0x08
+                || matches!(
+                    fn64_recomp_rs::decode(first),
+                    fn64_recomp_rs::Instruction::Unknown { .. }
+                )
+            {
                 continue;
             }
             if !roots.contains(&target) {
