@@ -170,6 +170,7 @@ pub mod load_table_use;
 pub mod loaders;
 pub mod oot_reference;
 pub mod overlay_regions;
+pub mod overlay_reloc;
 pub mod owner_proof;
 pub mod partition;
 pub mod pi_dma;
