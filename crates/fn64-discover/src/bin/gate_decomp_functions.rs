@@ -183,6 +183,29 @@ struct AdjudicatedEntry {
     va: u32,
 }
 
+/// Back-scan the canonical IDO switch construction from an open `jr`
+/// site: `lui $b, HI; ...; lw $t, LO($b); jr $t`. Returns the table VA
+/// on the dominant pattern; `None` (site stays open) otherwise.
+fn switch_table_base(text_words: &[u32], va_start: u32, site_pc: u32) -> Option<u32> {
+    let site = ((site_pc.checked_sub(va_start)?) / 4) as usize;
+    let jr = *text_words.get(site)?;
+    if jr & 0xfc1f_ffff != 0x0000_0008 {
+        return None; // not jr
+    }
+    let jr_reg = (jr >> 21) & 0x1f;
+    let scan_from = site.saturating_sub(8);
+    let (lw_index, lo, base_reg) = (scan_from..site).rev().find_map(|index| {
+        let word = text_words[index];
+        (word >> 26 == 0x23 && (word >> 16) & 0x1f == jr_reg)
+            .then_some((index, (word & 0xffff) as i16 as i32, (word >> 21) & 0x1f))
+    })?;
+    let hi = (scan_from..lw_index).rev().find_map(|index| {
+        let word = text_words[index];
+        (word >> 26 == 0x0f && (word >> 16) & 0x1f == base_reg).then_some(word & 0xffff)
+    })?;
+    Some(((hi << 16) as i64 + lo as i64) as u32)
+}
+
 fn load_toml_env<T: serde::de::DeserializeOwned>(variable: &str) -> Option<T> {
     let path = std::env::var(variable).ok()?;
     let text =
@@ -894,6 +917,7 @@ fn main() {
     if std::env::var("FN64_DISCOVER_GRADE_OVERLAYS").is_ok() {
         let mut graded_banks = 0usize;
         let mut skipped_unparsed = 0usize;
+        let mut overlay_tables_paired = 0usize;
         let mut totals = (0usize, 0usize, 0usize, 0usize, 0usize); // total, exact, coarse+interior, open, wrong
         let mut wrong_examples: Vec<String> = Vec::new();
         for fact in db.proven_rom_mappings() {
@@ -962,12 +986,17 @@ fn main() {
                     bank_excused.push(target);
                 }
             }
-            for &pointer in &refs.data_pointers {
+            for &pointer in refs.data_pointers.iter().chain(&refs.hi_lo_pointers) {
                 if pointer % 4 != 0 || pointer < bank_va_start || pointer >= text_end {
                     continue;
                 }
                 let offset = ((pointer - bank_va_start) / 4) as usize;
+                // A nop word is never a function start (same rule as
+                // donor signatures): constructed constants can point at
+                // trailing padding — measured as a split root in
+                // BgHidanHamstep_Draw's final padding on OoT.
                 if offset < text_words.len()
+                    && text_words[offset] != 0
                     && fn64_discover::sig_scan::plausible_function_boundary(
                         &text_words,
                         offset,
@@ -980,7 +1009,7 @@ fn main() {
             if bank_roots.is_empty() {
                 continue;
             }
-            let (bank_cfg, _) = build_cfg_closed_with_facts_and_claims(
+            let (first_pass, _) = build_cfg_closed_with_facts_and_claims(
                 &db,
                 bank,
                 text_bytes,
@@ -988,6 +1017,93 @@ fn main() {
                 &bank_roots,
                 &BTreeMap::new(),
             );
+            // Pair each open `jr` site with the typed rodata run at its
+            // back-scanned table base. The reloc typing bounds the table
+            // where value-set analysis could not: the run of consecutive
+            // typed words at the base IS the entry list, and it ends
+            // where the typing ends. Every entry must be a 4-aligned
+            // text VA or the site stays open.
+            let mut bank_claims: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+            // Sorted first-pass roots bound each site's own function: a
+            // switch's case labels are LOCAL (between the site's owning
+            // root and the next discovered root). A typed rodata run
+            // whose entries land outside that window is a function-
+            // POINTER array (jr tail dispatch), not a jump table —
+            // injecting one as intra-owner successors swallowed
+            // neighboring owners and tripped the overlap assert on MM's
+            // actor_overlay_164.
+            let mut sorted_roots: Vec<u32> = first_pass.proven_roots.clone();
+            sorted_roots.extend(bank_roots.iter().copied());
+            sorted_roots.sort_unstable();
+            sorted_roots.dedup();
+            for site in &first_pass.indirect_sites {
+                if site.via_call {
+                    continue;
+                }
+                let owner_root = match sorted_roots.partition_point(|root| *root <= site.pc) {
+                    0 => continue,
+                    index => sorted_roots[index - 1],
+                };
+                let next_root = sorted_roots
+                    .get(sorted_roots.partition_point(|root| *root <= site.pc))
+                    .copied()
+                    .unwrap_or(text_end);
+                let Some(base) =
+                    switch_table_base(&text_words, bank_va_start, site.pc)
+                else {
+                    continue;
+                };
+                let Some(base_offset) = base.checked_sub(bank_va_start) else {
+                    continue;
+                };
+                let start = refs
+                    .rodata_words
+                    .partition_point(|(offset, _)| *offset < base_offset);
+                if refs.rodata_words.get(start).map(|(offset, _)| *offset)
+                    != Some(base_offset)
+                {
+                    continue;
+                }
+                let mut targets: Vec<u32> = Vec::new();
+                let mut expected = base_offset;
+                for (offset, value) in &refs.rodata_words[start..] {
+                    if *offset != expected
+                        || *value % 4 != 0
+                        || *value < bank_va_start
+                        || *value >= text_end
+                    {
+                        break;
+                    }
+                    targets.push(*value);
+                    expected += 4;
+                }
+                if targets.len() < 2 {
+                    continue;
+                }
+                if targets
+                    .iter()
+                    .any(|target| *target < owner_root || *target >= next_root)
+                {
+                    continue; // function-pointer array, not case labels
+                }
+                targets.sort_unstable();
+                targets.dedup();
+                bank_claims.insert(site.pc, targets);
+            }
+            let bank_cfg = if bank_claims.is_empty() {
+                first_pass
+            } else {
+                overlay_tables_paired += bank_claims.len();
+                build_cfg_closed_with_facts_and_claims(
+                    &db,
+                    bank,
+                    text_bytes,
+                    bank_va_start,
+                    &bank_roots,
+                    &bank_claims,
+                )
+                .0
+            };
             let bank_part = partition(&bank_cfg);
             let bank_overlaps = same_bank_overlaps(&bank_part, &bank_cfg);
             assert!(
@@ -1020,6 +1136,7 @@ fn main() {
         }
         println!(
             "overlay grade: banks={graded_banks} (skipped non-overlay={skipped_unparsed}) \
+             jump-tables paired={overlay_tables_paired} \
              total={} matched_exact={} coarse+interior={} open={} wrong={}",
             totals.0, totals.1, totals.2, totals.3, totals.4
         );
