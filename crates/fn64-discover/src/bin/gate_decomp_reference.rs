@@ -65,8 +65,14 @@ fn main() {
     let (_baseline_rom, baseline_db) =
         run_discovery_with_load_image_tables(&rom_bytes, None, &tables)
             .expect("baseline discovery");
-    let (bound_ranges, unresolved) = bind_ranges_to_fact_db_partial(&dump, &dump_path, &baseline_db)
-        .expect("binding dump ranges to native mappings");
+    let (mut bound_ranges, unresolved) =
+        bind_ranges_to_fact_db_partial(&dump, &dump_path, &baseline_db)
+            .expect("binding dump ranges to native mappings");
+    // A section whose only function is unsized yields an empty extent —
+    // no evidence to ingest; report it rather than assert an empty range.
+    let before = bound_ranges.len();
+    bound_ranges.retain(|range| range.va_end > range.va_start);
+    let empty_extent = before - bound_ranges.len();
     let bound_count = bound_ranges.len();
     let unresolved_count = unresolved.len();
     let manifest = EvidenceManifest {
@@ -84,6 +90,9 @@ fn main() {
     println!("  function-bearing sections={}", ranges.len());
     println!("  executable candidate bytes={bytes}");
     println!("  ranges bound to exactly one native bank={bound_count}");
+    if empty_extent != 0 {
+        println!("  bound ranges dropped for empty extent (unsized-only sections)={empty_extent}");
+    }
     println!("  ranges unresolved by native mapping={unresolved_count}");
     for line in &unresolved {
         println!("  unresolved: {line}");
