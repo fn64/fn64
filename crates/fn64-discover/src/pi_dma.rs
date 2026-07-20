@@ -189,6 +189,34 @@ impl EpiDmaCallSlice {
     }
 }
 
+/// Recovered operands for a game-specific load-request wrapper (e.g. a DMA
+/// manager's request function) whose destination pointer, device address,
+/// and byte count travel in caller-declared argument registers. Which
+/// registers — and which address space the device operand names — is part
+/// of the caller's cited claim, not something this slicer infers. Requests
+/// are loads by contract, so direction is `ToRdram` by construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadRequestCallSlice {
+    pub call_pc: VirtualAddress,
+    pub callee: VirtualAddress,
+    pub dram_pointer: StaticOperand<VirtualAddress>,
+    pub rdram_address: StaticOperand<RdramAddress>,
+    pub device_address: StaticOperand<PiDeviceAddress>,
+    pub byte_count: StaticOperand<NonZeroU32>,
+}
+
+impl LoadRequestCallSlice {
+    pub fn candidate(&self) -> Option<StaticPiDmaCandidate> {
+        Some(StaticPiDmaCandidate {
+            call_pc: self.call_pc,
+            direction: PiDmaDirection::ToRdram,
+            device_address: *self.device_address.proven()?,
+            rdram_address: *self.rdram_address.proven()?,
+            byte_count: *self.byte_count.proven()?,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PiDmaSliceError {
     EmptyImage,
@@ -326,6 +354,49 @@ pub fn slice_os_epi_start_dma_calls(
             rdram_address: resolve_rdram_operand(dram_raw, size_raw, rdram_len),
             device_address,
             byte_count,
+        });
+    }
+    Ok(out)
+}
+
+/// Find direct calls to a cited load-request wrapper and recover the
+/// destination/device/size argument registers. The device operand is NOT
+/// range-checked against the physical cartridge domain here: request
+/// wrappers may name a VROM address a DMA manager later translates, so the
+/// caller owns that judgement along with the declared device space.
+pub fn slice_load_request_calls(
+    image_words: &[u32],
+    image_start: VirtualAddress,
+    callee: VirtualAddress,
+    rdram_len: u32,
+    dram_register: u8,
+    device_register: u8,
+    size_register: u8,
+) -> Result<Vec<LoadRequestCallSlice>, PiDmaSliceError> {
+    validate_input(image_words, image_start, rdram_len)?;
+    let mut out = Vec::new();
+    for call_index in 0..image_words.len().saturating_sub(1) {
+        let call_pc = pc_at(image_start, call_index);
+        if direct_jal_target(image_words[call_index], call_pc) != Some(callee.get()) {
+            continue;
+        }
+        let state = slice_state_at_call(
+            image_words,
+            image_start,
+            call_index,
+            &[dram_register, device_register, size_register],
+        );
+        let dram_raw = register_operand(&state, dram_register);
+        let size_raw = register_operand(&state, size_register);
+        out.push(LoadRequestCallSlice {
+            call_pc,
+            callee,
+            dram_pointer: map_operand(dram_raw.clone(), |raw| Ok(VirtualAddress::new(raw))),
+            rdram_address: resolve_rdram_operand(dram_raw, size_raw.clone(), rdram_len),
+            device_address: map_operand(register_operand(&state, device_register), |raw| {
+                Ok(PiDeviceAddress::new(raw))
+            }),
+            byte_count: map_byte_count(size_raw),
         });
     }
     Ok(out)
@@ -615,6 +686,30 @@ fn execute(state: &mut SliceState, pc: VirtualAddress, word: u32) {
             }
             0x21 | 0x25 | 0x2d if rs == 0 => {
                 state.set_register(rd, state.registers[rt as usize].clone());
+            }
+            // addu/subu/or over two proven constants folds exactly: these
+            // never trap and wrap mod 2^32 like the hardware (IDO computes
+            // e.g. a segment's byte count as `subu end, start` of two
+            // link-time constants). Anything else stays unsupported.
+            0x21 | 0x23 | 0x25 if rd != 0 => {
+                let value = match (
+                    &state.registers[rs as usize],
+                    &state.registers[rt as usize],
+                ) {
+                    (
+                        Value::Constant { value: lhs, .. },
+                        Value::Constant { value: rhs, .. },
+                    ) => Value::Constant {
+                        value: match word & 0x3f {
+                            0x21 => lhs.wrapping_add(*rhs),
+                            0x23 => lhs.wrapping_sub(*rhs),
+                            _ => lhs | rhs,
+                        },
+                        source: OperandSource::RegisterDefinition { register: rd, pc },
+                    },
+                    _ => Value::open(SliceBlocker::UnsupportedRegisterWrite { pc, register: rd }),
+                };
+                state.set_register(rd, value);
             }
             _ if rd != 0 => state.set_register(
                 rd,
@@ -1147,5 +1242,58 @@ mod tests {
             ),
             Err(PiDmaSliceError::RdramLengthOutsidePhysicalDomain { .. })
         ));
+    }
+
+    #[test]
+    fn load_request_slice_folds_subu_of_link_constants() {
+        // IDO computes a request's byte count as `subu end, start` of two
+        // link-time constants (MM boot's Main_Init code load). The slicer
+        // must fold it; a size taken from memory must stay open.
+        const START: u32 = 0x8008_0000;
+        const CALLEE: u32 = 0x8008_0c04;
+        let jal = 0x0c00_0000 | ((CALLEE >> 2) & 0x03ff_ffff);
+        let words = vec![
+            0x3c03_00b4, // lui   r3, 0x00b4
+            0x3c0f_00c8, // lui   r15, 0x00c8
+            0x2466_c000, // addiu r6, r3, -0x4000   -> device 0x00b3c000
+            0x25ef_a4e0, // addiu r15, r15, -0x5b20 -> 0x00c8a4e0
+            0x3c05_800a, // lui   r5, 0x800a
+            0x24a5_5ac0, // addiu r5, r5, 0x5ac0    -> dram 0x800a5ac0
+            0x01e6_3823, // subu  r7, r15, r6       -> size 0x0014e4e0
+            jal,         // jal   callee
+            0x0000_0000, // nop
+            0x0000_0000,
+        ];
+        let slices = slice_load_request_calls(
+            &words,
+            VirtualAddress::new(START),
+            VirtualAddress::new(CALLEE),
+            0x0080_0000,
+            5,
+            6,
+            7,
+        )
+        .unwrap();
+        assert_eq!(slices.len(), 1);
+        let candidate = slices[0].candidate().expect("all operands constant");
+        assert_eq!(candidate.device_address.get(), 0x00b3_c000);
+        assert_eq!(candidate.byte_count.get(), 0x0014_e4e0);
+        assert_eq!(slices[0].dram_pointer.proven().unwrap().get(), 0x800a_5ac0);
+        assert_eq!(candidate.direction, PiDmaDirection::ToRdram);
+
+        // Same call, size loaded from memory: candidate must not form.
+        let mut open_words = words.clone();
+        open_words[6] = 0x8ce7_0000; // lw r7, 0x0(r7)
+        let slices = slice_load_request_calls(
+            &open_words,
+            VirtualAddress::new(START),
+            VirtualAddress::new(CALLEE),
+            0x0080_0000,
+            5,
+            6,
+            7,
+        )
+        .unwrap();
+        assert!(slices[0].candidate().is_none());
     }
 }
