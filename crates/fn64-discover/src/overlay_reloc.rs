@@ -35,10 +35,17 @@ pub struct OverlayRelocRefs {
     /// Absolute targets of `jal` words typed `R_MIPS_26` in `.text` —
     /// machine-checked callable entries.
     pub jal_targets: Vec<u32>,
-    /// Absolute values of words typed `R_MIPS_32` in `.data`/`.rodata` —
-    /// stored pointers (function or data; the caller decides by window
-    /// and boundary shape).
+    /// Absolute values of words typed `R_MIPS_32` in `.data` — stored
+    /// pointers; when they name text, they are callback fields (actor
+    /// init/destroy/update/draw), i.e. callable entries.
     pub data_pointers: Vec<u32>,
+    /// Absolute values of words typed `R_MIPS_32` in `.rodata`. Kept
+    /// separate deliberately: rodata pointer arrays are dominated by
+    /// switch jump tables, whose entries are MID-FUNCTION case labels —
+    /// seeding them as roots split 25 real functions across 10 MM actor
+    /// overlays (measured 2026-07-20). Useful as jump-table evidence,
+    /// never as entry seeds.
+    pub rodata_pointers: Vec<u32>,
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -106,7 +113,8 @@ pub fn parse_zelda_overlay(bytes: &[u8]) -> Option<OverlayRelocRefs> {
                     _ => return None,
                 }
             }
-            2 if section != 1 => refs.data_pointers.push(value),
+            2 if section == 2 => refs.data_pointers.push(value),
+            2 if section == 3 => refs.rodata_pointers.push(value),
             2 | 5 | 6 => {}
             _ => return None,
         }
@@ -115,6 +123,8 @@ pub fn parse_zelda_overlay(bytes: &[u8]) -> Option<OverlayRelocRefs> {
     refs.jal_targets.dedup();
     refs.data_pointers.sort_unstable();
     refs.data_pointers.dedup();
+    refs.rodata_pointers.sort_unstable();
+    refs.rodata_pointers.dedup();
     Some(refs)
 }
 
