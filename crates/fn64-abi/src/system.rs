@@ -1,15 +1,9 @@
 use super::*;
 
-/// `osSetIntMask(u32 mask) -> u32` (previous mask). Real hardware semantics
-/// (CPU interrupt-enable mask) have no host-visible effect on this
-/// single-threaded coroutine executor (`docs/DESIGN.md` section 2: there is
-/// exactly one host thread, so there is no real concurrent interrupt this
-/// mask could race against) -- modeled as a simple stored value with the
-/// documented "returns the previous mask" contract, since every real call
-/// site's actual behavioral dependency (per rung 9/rung 11's citations) is
-/// on the paired critical section it wraps being atomic, which is already
-/// guaranteed structurally by the single-executor-thread model, not by this
-/// mask's bit pattern.
+/// `osSetIntMask(u32 mask) -> u32` (previous mask). The public libultra manual
+/// defines one combined `OSIntMask`: Status.IE/IM in bits 0/8..15 and the six
+/// RCP MI masks in bits 16..21. The CPU fields are per-context while MI is the
+/// shared device gate, so both authorities must change together.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
@@ -18,31 +12,51 @@ pub unsafe extern "C" fn osSetIntMask_recomp(_rdram: *mut u8, ctx: *mut RecompCo
     let ctx = unsafe { &mut *ctx };
     let new_mask = ctx.r4 as u32;
     let previous = INT_MASK.with(|cell| cell.replace(new_mask));
+    const CPU_INTERRUPT_FIELDS: u32 = 1 | (0xFF << 8);
+    ctx.status_reg = (ctx.status_reg & !CPU_INTERRUPT_FIELDS) | (new_mask & CPU_INTERRUPT_FIELDS);
+    crate::pi::set_mi_interrupt_mask((new_mask >> 16) & 0x3F);
     ctx.r2 = previous as u64;
 }
 
 thread_local! {
     pub(crate) static INT_MASK: Cell<u32> = const { Cell::new(0) };
+    static FPC_CSR: Cell<u32> = const { Cell::new(0) };
 }
 
-/// `osInitialize(void)` -- top-level libultra bring-up. Real semantics
-/// (thread-0 creation, PI/SP scaffolding) are already covered by this
-/// crate's own `osCreateThread_recomp`/`osCreatePiManager_recomp` shims,
-/// which the ROM itself calls separately (rung 2: `osInitialize` is the
-/// caller of the SI-raw-IO functions during the PIF terminate-boot
-/// handshake, not itself the thing that creates the main thread in this
-/// corpus's boot sequence -- `recomp_entrypoint` calls `osInitialize_recomp`
-/// BEFORE its own `osCreateThread`/`osStartThread` pair, per `funcs_0.c`).
-/// This shim's real, tested effect: nothing beyond being a safe, callable
-/// no-op -- there is no additional host-state this milestone's evidence
-/// shows `osInitialize` itself needs to establish beyond what the
-/// executor's `Default` already does at construction (empty run queue, no
-/// threads, per `Executor::new`).
+// Public libultra manuals name these as FPCSR_FS (flush denormals to zero)
+// and FPCSR_EV (enable invalid-operation exceptions). The values are the
+// public R4300 FCSR bit layout, not behavior recovered from a GPL runtime.
+const FPCSR_FS: u32 = 0x0100_0000;
+const FPCSR_EV: u32 = 0x0000_0800;
+
+pub(crate) fn initialize_common() {
+    FPC_CSR.with(|csr| csr.set(FPCSR_FS | FPCSR_EV));
+}
+
+/// `__osInitialize_common(void)` -- initialization shared by retail and the
+/// MSP/KMC/ISV development-hardware entry points. The public `osInitialize`
+/// and internal-routine manuals require FPCSR_FS and FPCSR_EV at startup.
+/// Exception-vector installation and debug-port TLB mapping remain executor
+/// responsibilities: recompiled functions are the smallest resumable unit,
+/// so fn64 never executes or fetches from the original exception vectors.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn osInitialize_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
+pub unsafe extern "C" fn __osInitialize_common_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
+    initialize_common();
+}
+
+/// `osInitialize(void)` -- top-level libultra bring-up. The shared observable
+/// CPU state is initialized here; PI/SP managers and application threads are
+/// still created by their dedicated public calls.
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn osInitialize_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
+    initialize_common();
+}
 
 // ---------------------------------------------------------------------
 // Batch-generated trivial shims: thin wrappers over machinery this crate
@@ -70,37 +84,31 @@ pub unsafe extern "C" fn osGetMemSize_recomp(_rdram: *mut u8, ctx: *mut RecompCo
     ctx.r2 = fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u64;
 }
 
-/// `__osDisableInt(void) -> u32` -- real hardware effect: disables CPU
-/// interrupts, returning the previous interrupt-enable state (an `SR`
-/// register snapshot) so a matching `__osRestoreInt` can restore it. This
-/// crate has no interrupt model (`docs/DESIGN.md`'s single-executor,
-/// single-host-thread design means there is no concurrent interrupt
-/// delivery to race against -- see `executor.rs`'s own doc comment on why
-/// that hazard class doesn't exist here) -- returns a fixed "was enabled"
-/// sentinel (`1`, matching `osSetIntMask_recomp`'s existing convention of
-/// returning the previous mask value) since no evidence shows any call
-/// site branching on the exact previous value beyond feeding it back to
-/// `__osRestoreInt`. Real call sites: `games/OOTU/RecompiledFuncs/funcs_0.c`
-/// (x2).
+/// `__osDisableInt(void) -> u32` -- clear this context's Status.IE and return
+/// its previous value for `__osRestoreInt`. Real call sites:
+/// `games/OOTU/RecompiledFuncs/funcs_0.c` (x2).
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn __osDisableInt_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
-    ctx.r2 = 1;
+    let previous = ctx.status_reg & 1;
+    ctx.status_reg &= !1;
+    ctx.r2 = previous as u64;
 }
 
-/// `__osRestoreInt(u32 mask)` -- restores the interrupt-enable state a
-/// prior `__osDisableInt` returned. No-op counterpart to
-/// `__osDisableInt_recomp` (see that shim's doc comment for why this crate
-/// has nothing real to restore). Real call sites:
+/// `__osRestoreInt(u32 mask)` -- restore Status.IE from the value returned by
+/// `__osDisableInt_recomp`. Real call sites:
 /// `games/OOTU/RecompiledFuncs/funcs_0.c` (x2).
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn __osRestoreInt_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
+pub unsafe extern "C" fn __osRestoreInt_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    ctx.status_reg = (ctx.status_reg & !1) | (ctx.r4 as u32 & 1);
+}
 
 /// `osGetTime(void) -> OSTime` -- no arguments; returns the current system
 /// time counter (`u64`). This crate has no wall-clock (only the executor's
@@ -129,64 +137,59 @@ pub unsafe extern "C" fn osGetTime_recomp(_rdram: *mut u8, ctx: *mut RecompConte
 }
 
 /// `osGetCount(void) -> u32` -- no arguments; real hardware `Count` COP0
-/// register read (a free-running cycle counter). This crate has no COP0
-/// register model and no evidence (function-table slot only,
-/// `recomp_overlays.inl:82`, zero real call sites in this corpus) any boot-
-/// path code branches on its exact value beyond timing/profiling use --
-/// backed by the SAME virtual clock `osGetTime_recomp` already exposes
-/// (`Executor::sim_time`), matching that shim's "differential-trace-
-/// reproducible" reasoning rather than a wall-clock or a fabricated cycle
-/// count.
+/// register read (a free-running cycle counter). `Executor` keeps it distinct
+/// from the OS time base: deterministic virtual-time advances increment both,
+/// while `osSetTime` changes only OSTime and `osSetCount` changes only Count.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osGetCount_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
-    ctx.r2 = with_executor(|exec| exec.sim_time()) as u32 as u64;
+    ctx.r2 = with_executor(|exec| exec.cp0_count()) as u64;
 }
 
-/// `__osSetFpcCsr(u32 value) -> u32` -- sets/reads the MIPS FPU control/
-/// status register. Zero real call sites in this corpus (function-table
-/// slot only, `recomp_overlays.inl:88`) -- this crate's generated-code
-/// execution model has no FPU-exception-mode host state at all (every FP
-/// op RecompiledFuncs emits is plain host-native float arithmetic, per
-/// `RecompContext`'s `Fpr` union doc comment; there is no CSR whose bits
-/// this crate's arithmetic actually consults). Loud-trapped rather than
-/// returning a fabricated "no exceptions enabled" CSR value with no call
-/// site to verify it against.
+/// `osSetCount(u32 count)` -- writes the MIPS CP0 Count register without
+/// changing the OS time base.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn __osSetFpcCsr_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
-    unimplemented!(
-        "__osSetFpcCsr_recomp: no FPU-CSR host state exists in this crate's execution model \
-         (RecompContext's Fpr union is plain host-native float arithmetic, no exception-mode \
-         bits consulted) and no real call site in games/OOTU/RecompiledFuncs exercises this."
-    );
+pub unsafe extern "C" fn osSetCount_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let count = unsafe { &*ctx }.r4 as u32;
+    with_executor(|exec| exec.set_cp0_count(count));
+}
+
+/// `__osSetFpcCsr(u32 value) -> u32` -- the public internal-routine manual
+/// specifies that it returns the previous MIPS FPU control/status register
+/// before installing the new value. The register is CPU-global state, so one
+/// executor-thread-local cell backs every guest thread. Generated host FP
+/// operations do not yet apply its rounding/exception bits; that behavioral
+/// gap remains explicit even though register reads/writes are now correct.
+///
+/// # Safety
+/// Same contract as every other shim in this file.
+#[no_mangle]
+pub unsafe extern "C" fn __osSetFpcCsr_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let previous = FPC_CSR.with(|csr| csr.replace(ctx.r4 as u32));
+    ctx.r2 = previous as u64;
 }
 
 /// `osSetTime(OSTime time)` -- sets the virtual system-time base. `time` is
 /// a 64-bit value split r4:r5 hi:lo (standard o32 convention, same shape as
-/// `__ll_div_recomp`'s arguments -- NOT independently confirmed for this
-/// symbol though, since this corpus has zero real call sites,
-/// function-table slot only per `recomp_overlays.inl:2955`). Loud-trapped:
-/// `Executor::sim_time` has a getter (`osGetTime_recomp`) but no public
-/// setter today, and BOOT-PLAN.md flags this specific symbol as
-/// "re-verify against source if link errors persist" -- exactly the
-/// "prefer not verified over a false done" case.
+/// `__ll_div_recomp`'s arguments). The public libultra timer contract says
+/// this sets the system time counter, so it updates the same deterministic
+/// executor clock `osGetTime_recomp` reads. This keeps timer behavior inside
+/// the runtime's no-wall-clock model.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn osSetTime_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
-    unimplemented!(
-        "osSetTime_recomp: no real call site in games/OOTU/RecompiledFuncs exercises this \
-         (function-table slot only) and Executor::sim_time has no public setter yet -- \
-         BOOT-PLAN.md itself flags this symbol as unconfirmed, re-verify against source before \
-         implementing rather than guessing the register shape."
-    );
+pub unsafe extern "C" fn osSetTime_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &*ctx };
+    let time = (ctx.r4 as u32 as u64) << 32 | (ctx.r5 as u32 as u64);
+    with_executor(|exec| exec.set_sim_time(time));
 }
 
 #[cfg(test)]
@@ -202,11 +205,14 @@ mod tests {
     }
 
     #[test]
-    fn disable_restore_int_are_safe_and_disable_returns_nonzero() {
+    fn disable_restore_int_round_trips_an_enabled_state() {
         let mut ctx = ctx_zeroed();
+        ctx.status_reg = 1;
         unsafe { __osDisableInt_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
-        assert_ne!(ctx.r2, 0, "a previous-enabled-state sentinel, not zero");
-        unsafe { __osRestoreInt_recomp(std::ptr::null_mut(), &mut ctx_zeroed() as *mut _) };
+        assert_eq!(ctx.r2, 1);
+        ctx.r4 = ctx.r2;
+        unsafe { __osRestoreInt_recomp(std::ptr::null_mut(), &mut ctx) };
+        assert_eq!(ctx.status_reg & 1, 1);
     }
 
     #[test]
@@ -228,6 +234,7 @@ mod tests {
 
     #[test]
     fn os_set_int_mask_returns_previous_mask() {
+        INT_MASK.with(|mask| mask.set(0));
         let mut ctx1 = ctx_zeroed();
         ctx1.r4 = 1;
         unsafe { osSetIntMask_recomp(std::ptr::null_mut(), &mut ctx1 as *mut _) };
@@ -240,8 +247,41 @@ mod tests {
     }
 
     #[test]
-    fn os_initialize_is_a_safe_callable_noop() {
+    fn os_set_int_mask_updates_context_status_and_the_mi_gate() {
+        INT_MASK.with(|mask| mask.set(0));
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        let mut ctx = ctx_zeroed();
+        ctx.status_reg = 0x3400_0002;
+        ctx.r4 = 0x0010_0401; // OS_IM_PI
+        unsafe { osSetIntMask_recomp(std::ptr::null_mut(), &mut ctx) };
+
+        assert_eq!(ctx.status_reg & 0x0000_FF01, 0x0000_0401);
+        assert_eq!(
+            crate::pi::read_live_device_mmio(0xFFFF_FFFF_A430_000C),
+            Some(fn64_runtime::InterruptSource::Pi.bit())
+        );
+    }
+
+    #[test]
+    fn disable_and_restore_interrupts_mutate_status_ie() {
+        let mut ctx = ctx_zeroed();
+        ctx.status_reg = 0x3400_0401;
+        unsafe { __osDisableInt_recomp(std::ptr::null_mut(), &mut ctx) };
+        assert_eq!(ctx.r2, 1);
+        assert_eq!(ctx.status_reg, 0x3400_0400);
+        ctx.r4 = ctx.r2;
+        unsafe { __osRestoreInt_recomp(std::ptr::null_mut(), &mut ctx) };
+        assert_eq!(ctx.status_reg, 0x3400_0401);
+    }
+
+    #[test]
+    fn os_initialize_installs_the_public_fpcsr_startup_bits() {
+        FPC_CSR.with(|csr| csr.set(0));
         unsafe { osInitialize_recomp(std::ptr::null_mut(), &mut ctx_zeroed() as *mut _) };
+        let mut replace = ctx_zeroed();
+        replace.r4 = 0;
+        unsafe { __osSetFpcCsr_recomp(std::ptr::null_mut(), &mut replace) };
+        assert_eq!(replace.r2, FPCSR_FS as u64 | FPCSR_EV as u64);
     }
 
     /// osGetTime returns a u64 OSTime split $v0:$v1 = HIGH:LOW word (this
@@ -262,5 +302,56 @@ mod tests {
 
         assert_eq!(ctx.r2, 0x1122_3344, "$v0 = HIGH word");
         assert_eq!(ctx.r3, 0x5566_7788, "$v1 = LOW word");
+    }
+
+    #[test]
+    fn os_set_time_and_get_time_round_trip_both_words() {
+        let mut set_ctx = ctx_zeroed();
+        set_ctx.r4 = 0x89AB_CDEF;
+        set_ctx.r5 = 0x0123_4567;
+        unsafe { osSetTime_recomp(std::ptr::null_mut(), &mut set_ctx) };
+
+        let mut get_ctx = ctx_zeroed();
+        unsafe { osGetTime_recomp(std::ptr::null_mut(), &mut get_ctx) };
+        assert_eq!(get_ctx.r2, 0x89AB_CDEF);
+        assert_eq!(get_ctx.r3, 0x0123_4567);
+    }
+
+    #[test]
+    fn count_register_is_settable_and_advances_without_aliasing_os_time() {
+        let mut count_ctx = ctx_zeroed();
+        count_ctx.r4 = 0xFFFF_FFF0;
+        unsafe { osSetCount_recomp(std::ptr::null_mut(), &mut count_ctx) };
+
+        let old_time = with_executor(|exec| exec.sim_time());
+        with_executor(|exec| exec.advance_time(old_time + 0x20));
+        let mut get_count = ctx_zeroed();
+        unsafe { osGetCount_recomp(std::ptr::null_mut(), &mut get_count) };
+        assert_eq!(
+            get_count.r2, 0,
+            "CP0 Count increments once per two CPU cycles and wraps at 32 bits"
+        );
+
+        let mut set_time = ctx_zeroed();
+        set_time.r4 = 0x1234_5678;
+        set_time.r5 = 0x9ABC_DEF0;
+        unsafe { osSetTime_recomp(std::ptr::null_mut(), &mut set_time) };
+        let mut unchanged_count = ctx_zeroed();
+        unsafe { osGetCount_recomp(std::ptr::null_mut(), &mut unchanged_count) };
+        assert_eq!(unchanged_count.r2, 0);
+    }
+
+    #[test]
+    fn set_fpc_csr_returns_the_previous_register_value() {
+        FPC_CSR.with(|csr| csr.set(0));
+        let mut first = ctx_zeroed();
+        first.r4 = 0x0100_0C01;
+        unsafe { __osSetFpcCsr_recomp(std::ptr::null_mut(), &mut first) };
+        assert_eq!(first.r2, 0);
+
+        let mut second = ctx_zeroed();
+        second.r4 = 0x0000_0003;
+        unsafe { __osSetFpcCsr_recomp(std::ptr::null_mut(), &mut second) };
+        assert_eq!(second.r2, 0x0100_0C01);
     }
 }

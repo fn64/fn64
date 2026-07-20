@@ -14,7 +14,7 @@
 //! implementation was read -- this is a fresh design against the documented
 //! libultra contract plus our own byte-cited call-site evidence.
 //!
-//! ## Design: async-looking API, synchronous-in-this-model completion
+//! ## Design: synchronous transfer primitive under a timed device fabric
 //!
 //! Real N64 `osEPiStartDma` is asynchronous: it kicks off a PI DMA and
 //! returns immediately, with completion signaled later via a message posted
@@ -27,27 +27,50 @@
 //! the registered OSMesgQueue, let the next coroutine-resume decision (not a
 //! new host thread) pick up the woken thread.'"
 //!
-//! This module's `PiDma::start_dma` performs the byte copy immediately (a
-//! host file read is not meaningfully slower than emulating multi-tick DMA
-//! latency for this milestone, and `docs/DESIGN.md`'s explicit "no wall-clock
-//! in core" rule means there is no virtual-time cost to model without
-//! inventing one with no evidence behind it) but does NOT itself decide
-//! when the completion message is posted -- it returns a `DmaCompletion`
-//! value the caller (an `fn64-abi` shim) feeds to
-//! `Executor::inject_event(ExternalEvent::DirectPost { .. })`, the exact
-//! "ONE explicit host-side injection point" `docs/DESIGN.md` section 2
-//! already establishes for every other completion source (VI, timers). This
-//! keeps `fn64-runtime`'s rom module free of any `Executor` dependency
-//! (matching this crate's existing "pure, standalone core" shape -- see
-//! `timer.rs`'s identical split between "what changed" and "who acts on
-//! it") while still routing every DMA completion through the same queue
-//! machinery a blocking guest `osSendMesg` uses, closing the same
-//! "asymmetry between guest and host senders" rung-18b-derived design point
-//! that `docs/DESIGN.md` calls out for VI/timer events.
+//! `PiDma::start_dma` is the byte-transfer primitive invoked only when a
+//! scheduled device event matures. `DeviceFabric` owns PI busy state and the
+//! guest-cycle deadline, then calls this primitive while committing bytes,
+//! clearing busy, raising MI, and producing a `DmaCompletion` in one ordered
+//! transition. The ABI layer posts that completion through the executor's
+//! single external-event path before a coroutine can resume. Keeping the
+//! primitive here avoids an Executor dependency while no longer pretending
+//! that an asynchronous public API completed at its call site.
 
+use crate::device::Cycles;
 use crate::rdram::RdramAddr;
-use crate::save::SaveStorage;
+use crate::save::{
+    EepromError, EepromKind, EepromStatus, SaveStorage, EEPROM_BLOCK_SIZE, EEPROM_WRITE_CYCLES,
+};
 use crate::trace::DmaDirection;
+
+/// The logical-byte operations a PI transfer needs from the process's one
+/// RDRAM allocation. Both the owning [`crate::rdram::Rdram`] and a checked
+/// borrowed [`crate::rdram::RdramViewMut`] implement this interface, so an
+/// ABI adapter never needs to fabricate a second RDRAM object.
+pub trait DmaMemory {
+    fn dma_write_bytes(&mut self, offset: usize, data: &[u8]);
+    fn dma_read_bytes_flat(&self, offset: usize, len: usize) -> Vec<u8>;
+}
+
+impl DmaMemory for crate::rdram::Rdram {
+    fn dma_write_bytes(&mut self, offset: usize, data: &[u8]) {
+        Self::dma_write_bytes(self, offset, data);
+    }
+
+    fn dma_read_bytes_flat(&self, offset: usize, len: usize) -> Vec<u8> {
+        Self::dma_read_bytes_flat(self, offset, len)
+    }
+}
+
+impl DmaMemory for crate::rdram::RdramViewMut<'_> {
+    fn dma_write_bytes(&mut self, offset: usize, data: &[u8]) {
+        Self::dma_write_bytes(self, offset, data);
+    }
+
+    fn dma_read_bytes_flat(&self, offset: usize, len: usize) -> Vec<u8> {
+        Self::dma_read_bytes_flat(self, offset, len)
+    }
+}
 
 /// Base of the PI **domain-2 address space** (the SRAM/save cartridge
 /// domain). A PI DMA whose `devAddr` is `>= this` is a SAVE access, not a
@@ -138,12 +161,10 @@ impl RomStorage for InMemoryRom {
 // patch," a `DmaCompletion` value handed to `Executor::inject_event`/traced
 // via `TraceKind::Dma` needs exactly one direction type, not two
 // `DmaDirection`s that happen to share variant names and require a
-// conversion at the call site. Cartridge ROM is read-only, so `ToRdram` (a
-// ROM read) is the only direction this milestone's shims exercise;
-// `FromRdram` is modeled for completeness against the documented API shape
-// (a future EEPROM/flash `_recomp` shim would need it) but has no real
-// backing store to write to yet -- see `PiDma::start_dma`'s
-// `unimplemented!` for that direction.
+// conversion at the call site. Cartridge ROM is read-only, while domain-2
+// SRAM is writable. `try_start_dma` therefore returns a typed rejection for
+// a ROM-domain `FromRdram` request and performs save-domain writes through
+// the installed `SaveStorage`; callers never need to infer this distinction.
 
 /// The result of a completed PI DMA, carrying exactly what the caller needs
 /// to post a completion message through `Executor::inject_event` -- see
@@ -156,6 +177,24 @@ pub struct DmaCompletion {
     pub dev_addr: u32,
     pub len: u32,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PiDmaError {
+    ReadOnlyDevice { dev_addr: u32 },
+}
+
+impl std::fmt::Display for PiDmaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::ReadOnlyDevice { dev_addr } => write!(
+                f,
+                "PI write targets read-only cartridge ROM at device address {dev_addr:#010x}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PiDmaError {}
 
 /// The PI-manager-owned DMA engine. Exactly one exists per running game
 /// (owned by whatever holds the `RomStorage`, e.g. `fn64-shell`'s top-level
@@ -172,11 +211,23 @@ pub struct PiDma<R: RomStorage> {
     /// registered is a loud trap (see `sram_read_into`/`sram_write_from`),
     /// not a silent ROM read past its end -- the old bug this fix removes.
     save: Option<Box<dyn SaveStorage>>,
+    pending_eeprom_write: Option<PendingEepromWrite>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingEepromWrite {
+    offset: usize,
+    data: [u8; EEPROM_BLOCK_SIZE],
+    ready_at: Cycles,
 }
 
 impl<R: RomStorage> PiDma<R> {
     pub fn new(rom: R) -> Self {
-        PiDma { rom, save: None }
+        PiDma {
+            rom,
+            save: None,
+            pending_eeprom_write: None,
+        }
     }
 
     /// Register the domain-2 (SRAM/EEPROM/Flash) save-backing store this PI
@@ -184,11 +235,105 @@ impl<R: RomStorage> PiDma<R> {
     /// ROM is installed at construction -- the harness/`fn64-shell` supplies
     /// an `InMemorySaveStorage`/`FileSaveStorage` of the game's save size.
     pub fn set_save(&mut self, save: Box<dyn SaveStorage>) {
+        assert!(
+            self.pending_eeprom_write.is_none(),
+            "PiDma::set_save cannot replace a save store while an EEPROM write is pending"
+        );
         self.save = Some(save);
     }
 
     pub fn has_save(&self) -> bool {
         self.save.is_some()
+    }
+
+    /// Installed save-device capacity, used by protocol probes to distinguish
+    /// EEPROM types without duplicating ownership of the backing store.
+    pub fn save_len(&self) -> Option<usize> {
+        self.save.as_deref().map(SaveStorage::len)
+    }
+
+    fn eeprom_kind(&self) -> Result<EepromKind, EepromError> {
+        self.save_len()
+            .and_then(EepromKind::from_byte_len)
+            .ok_or(EepromError::NoDevice)
+    }
+
+    /// Commit a matured EEPROM programming operation. The pending payload is
+    /// retained separately from the backing store so reads before the exact
+    /// deadline cannot observe bytes hardware has only latched, not written.
+    pub fn advance_eeprom_to(&mut self, now: Cycles) {
+        let Some(pending) = self.pending_eeprom_write else {
+            return;
+        };
+        if pending.ready_at > now {
+            return;
+        }
+        self.pending_eeprom_write = None;
+        self.save_mut("EEPROM write completion")
+            .write_from(pending.offset, &pending.data);
+    }
+
+    pub fn eeprom_status(&mut self, now: Cycles) -> Option<EepromStatus> {
+        self.advance_eeprom_to(now);
+        let kind = self.eeprom_kind().ok()?;
+        Some(EepromStatus {
+            kind,
+            busy: self.pending_eeprom_write.is_some(),
+        })
+    }
+
+    pub fn eeprom_busy_until(&mut self, now: Cycles) -> Option<Cycles> {
+        self.advance_eeprom_to(now);
+        self.pending_eeprom_write.map(|pending| pending.ready_at)
+    }
+
+    /// Read one physical Joybus block. A 4-Kbit part ignores the upper two
+    /// block-address bits; callers implementing libultra's stricter API range
+    /// contract validate before entering this hardware-level operation.
+    pub fn eeprom_read_block(
+        &mut self,
+        now: Cycles,
+        block: u8,
+    ) -> Result<[u8; EEPROM_BLOCK_SIZE], EepromError> {
+        self.advance_eeprom_to(now);
+        let kind = self.eeprom_kind()?;
+        if let Some(pending) = self.pending_eeprom_write {
+            return Err(EepromError::Busy {
+                ready_at: pending.ready_at,
+            });
+        }
+        let offset = usize::from(kind.normalize_hardware_block(block)) * EEPROM_BLOCK_SIZE;
+        let mut data = [0; EEPROM_BLOCK_SIZE];
+        self.save_mut("EEPROM read").read_into(offset, &mut data);
+        Ok(data)
+    }
+
+    /// Latch one Joybus block and begin background programming. The backing
+    /// store changes only when [`Self::advance_eeprom_to`] reaches the returned
+    /// deadline. A write attempted while busy is rejected with the same
+    /// deadline so the Joybus layer can return its public `0x80` status.
+    pub fn start_eeprom_write(
+        &mut self,
+        now: Cycles,
+        block: u8,
+        data: [u8; EEPROM_BLOCK_SIZE],
+    ) -> Result<Cycles, EepromError> {
+        self.advance_eeprom_to(now);
+        let kind = self.eeprom_kind()?;
+        if let Some(pending) = self.pending_eeprom_write {
+            return Err(EepromError::Busy {
+                ready_at: pending.ready_at,
+            });
+        }
+        let ready_at = now
+            .checked_add(EEPROM_WRITE_CYCLES)
+            .expect("EEPROM write deadline overflows guest cycle clock");
+        self.pending_eeprom_write = Some(PendingEepromWrite {
+            offset: usize::from(kind.normalize_hardware_block(block)) * EEPROM_BLOCK_SIZE,
+            data,
+            ready_at,
+        });
+        Ok(ready_at)
     }
 
     fn save_mut(&mut self, dir: &str) -> &mut dyn SaveStorage {
@@ -209,8 +354,7 @@ impl<R: RomStorage> PiDma<R> {
     /// reads the destination back via `MEM_BU` (`^3` byte-lane XOR, recomp.h)
     /// -- a flat rdram write would read back byte-swapped within each word.
     pub fn sram_read_into(&mut self, sram_offset: u32, buf: &mut [u8]) {
-        self.save_mut("read (device->RDRAM)")
-            .read_into(sram_offset as usize, buf);
+        self.save_read_into(sram_offset as usize, buf);
     }
 
     /// Write FLAT `data` bytes to the save chip at `sram_offset` (already
@@ -218,8 +362,32 @@ impl<R: RomStorage> PiDma<R> {
     /// native-word bytes back to flat save order first (see
     /// `osEPiStartDma_recomp`'s FromRdram arm).
     pub fn sram_write_from(&mut self, sram_offset: u32, data: &[u8]) {
-        self.save_mut("write (RDRAM->device)")
-            .write_from(sram_offset as usize, data);
+        self.save_write_from(sram_offset as usize, data);
+    }
+
+    /// Protocol-neutral save read. EEPROM, FlashRAM, Controller Pak, and PI
+    /// domain-2 SRAM all converge on the one installed backing store.
+    pub fn save_read_into(&mut self, offset: usize, buf: &mut [u8]) {
+        self.save_mut("read").read_into(offset, buf);
+    }
+
+    /// Protocol-neutral save write; see [`Self::save_read_into`].
+    pub fn save_write_from(&mut self, offset: usize, data: &[u8]) {
+        assert!(
+            self.pending_eeprom_write.is_none(),
+            "protocol-neutral save write cannot bypass a pending EEPROM programming operation"
+        );
+        self.save_mut("write").write_from(offset, data);
+    }
+
+    /// Protocol-neutral save erase, preserving the backing store's erased
+    /// byte value and durability policy.
+    pub fn save_erase(&mut self, offset: usize, len: usize) {
+        assert!(
+            self.pending_eeprom_write.is_none(),
+            "protocol-neutral save erase cannot bypass a pending EEPROM programming operation"
+        );
+        self.save_mut("erase").erase(offset, len);
     }
 
     pub fn rom_len(&self) -> usize {
@@ -247,18 +415,31 @@ impl<R: RomStorage> PiDma<R> {
     ///
     /// Copies `len` ROM bytes starting at `dev_addr` into `rdram` at
     /// `dram_addr`, matching real cartridge-domain PI DMA's actual effect --
-    /// see module doc for why this happens synchronously here even though
-    /// the real hardware/ABI models it as async (the completion-message
-    /// timing is the caller's job via the returned `DmaCompletion`, not
-    /// this function's).
-    pub fn start_dma(
+    /// This primitive runs synchronously only after `DeviceFabric` reaches
+    /// the scheduled deadline; callers must not use it as the public start
+    /// operation.
+    pub fn start_dma<M: DmaMemory + ?Sized>(
         &mut self,
-        rdram: &mut crate::rdram::Rdram,
+        rdram: &mut M,
         direction: DmaDirection,
         dram_addr: RdramAddr,
         dev_addr: u32,
         len: u32,
     ) -> DmaCompletion {
+        self.try_start_dma(rdram, direction, dram_addr, dev_addr, len)
+            .unwrap_or_else(|error| panic!("PiDma::start_dma: {error}"))
+    }
+
+    /// Typed counterpart to [`Self::start_dma`]. Device fabrics use this so
+    /// a guest-visible PI rejection cannot escape as a host-language panic.
+    pub fn try_start_dma<M: DmaMemory + ?Sized>(
+        &mut self,
+        rdram: &mut M,
+        direction: DmaDirection,
+        dram_addr: RdramAddr,
+        dev_addr: u32,
+        len: u32,
+    ) -> Result<DmaCompletion, PiDmaError> {
         let base = dram_addr.offset() as usize;
         match (direction, is_sram_dev_addr(dev_addr)) {
             // Cartridge-ROM read: big-endian ROM bytes swizzled into rdram's
@@ -288,23 +469,16 @@ impl<R: RomStorage> PiDma<R> {
                 let sram_offset = dev_addr - SRAM_DOMAIN2_BASE;
                 self.sram_write_from(sram_offset, &flat);
             }
-            // A FromRdram write to the *cartridge-ROM* domain (not domain-2)
-            // is genuinely nonsensical -- ROM is read-only. Keep the loud trap.
             (DmaDirection::FromRdram, false) => {
-                unimplemented!(
-                    "PiDma::start_dma: FromRdram to the cartridge-ROM domain (devAddr {dev_addr:#x} \
-                     < SRAM_DOMAIN2_BASE) -- ROM is read-only. A domain-2 (SRAM/save) write uses \
-                     devAddr >= SRAM_DOMAIN2_BASE and routes to the save store; a ROM-domain write \
-                     is a caller bug, not a backing-store gap."
-                );
+                return Err(PiDmaError::ReadOnlyDevice { dev_addr });
             }
         }
-        DmaCompletion {
+        Ok(DmaCompletion {
             direction,
             dram_addr,
             dev_addr,
             len,
-        }
+        })
     }
 }
 
@@ -389,6 +563,76 @@ mod tests {
     use crate::save::{InMemorySaveStorage, SaveType};
 
     #[test]
+    fn eeprom_write_commits_at_exact_typed_deadline_and_rejects_overlap() {
+        let mut dma = PiDma::new(InMemoryRom::new(vec![]));
+        dma.set_save(Box::new(InMemorySaveStorage::for_device(
+            SaveType::Eeprom4k,
+        )));
+        let start = Cycles::new(10);
+        let first = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let deadline = dma.start_eeprom_write(start, 3, first).unwrap();
+        assert_eq!(deadline, start.checked_add(EEPROM_WRITE_CYCLES).unwrap());
+        assert_eq!(
+            dma.eeprom_status(start),
+            Some(EepromStatus {
+                kind: EepromKind::Eeprom4k,
+                busy: true,
+            })
+        );
+
+        let second = [0xA5; EEPROM_BLOCK_SIZE];
+        assert_eq!(
+            dma.start_eeprom_write(Cycles::new(deadline.get() - 1), 4, second),
+            Err(EepromError::Busy { ready_at: deadline })
+        );
+        let bypass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dma.save_write_from(0, &[0]);
+        }))
+        .expect_err("protocol-neutral write must not bypass EEPROM busy state");
+        let bypass_message = bypass
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| bypass.downcast_ref::<&str>().copied())
+            .unwrap();
+        assert!(bypass_message.contains("cannot bypass a pending EEPROM"));
+        let replacement = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dma.set_save(Box::new(InMemorySaveStorage::for_device(
+                SaveType::Eeprom4k,
+            )));
+        }))
+        .expect_err("save replacement must not discard EEPROM busy state");
+        let replacement_message = replacement
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| replacement.downcast_ref::<&str>().copied())
+            .unwrap();
+        assert!(replacement_message.contains("while an EEPROM write is pending"));
+        let mut physical = [0; EEPROM_BLOCK_SIZE];
+        dma.save_read_into(3 * EEPROM_BLOCK_SIZE, &mut physical);
+        assert_eq!(physical, [0xFF; EEPROM_BLOCK_SIZE]);
+
+        dma.advance_eeprom_to(Cycles::new(deadline.get() - 1));
+        dma.save_read_into(3 * EEPROM_BLOCK_SIZE, &mut physical);
+        assert_eq!(physical, [0xFF; EEPROM_BLOCK_SIZE]);
+        dma.advance_eeprom_to(deadline);
+        dma.save_read_into(3 * EEPROM_BLOCK_SIZE, &mut physical);
+        assert_eq!(physical, first);
+        assert_eq!(dma.eeprom_busy_until(deadline), None);
+    }
+
+    #[test]
+    fn physical_4k_eeprom_ignores_top_two_block_address_bits() {
+        let mut dma = PiDma::new(InMemoryRom::new(vec![]));
+        dma.set_save(Box::new(InMemorySaveStorage::for_device(
+            SaveType::Eeprom4k,
+        )));
+        let data = [0x5A; EEPROM_BLOCK_SIZE];
+        let deadline = dma.start_eeprom_write(Cycles::ZERO, 0xC2, data).unwrap();
+        dma.advance_eeprom_to(deadline);
+        assert_eq!(dma.eeprom_read_block(deadline, 0x02).unwrap(), data);
+    }
+
+    #[test]
     fn sram_dma_round_trips_through_rdram_with_correct_byte_order() {
         // Write a known pattern to SRAM via a FromRdram (save-write) DMA, then
         // read it back via a ToRdram (save-read) DMA and assert the bytes come
@@ -462,6 +706,22 @@ mod tests {
         // MEM_BU(0x40) is the FIRST SRAM byte (0xC1), not the ROM byte (0xAA).
         assert_eq!(rdram.read_bu(RdramAddr::from_offset(0x40)), 0xC1);
         assert_ne!(rdram.read_bu(RdramAddr::from_offset(0x40)), 0xAA);
+    }
+
+    #[test]
+    fn cartridge_write_is_a_typed_device_error() {
+        let mut dma = PiDma::new(InMemoryRom::new(vec![0u8; 0x100]));
+        let mut rdram = Rdram::new(0x100);
+        assert_eq!(
+            dma.try_start_dma(
+                &mut rdram,
+                DmaDirection::FromRdram,
+                RdramAddr::from_offset(0x20),
+                0x10,
+                4,
+            ),
+            Err(PiDmaError::ReadOnlyDevice { dev_addr: 0x10 })
+        );
     }
 
     #[test]

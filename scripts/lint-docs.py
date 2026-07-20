@@ -200,20 +200,24 @@ def check_doc_hashes_are_tested() -> None:
                 )
 
 
-# --- 4. COMPLETENESS's own regen recipe must not be blind --------------------
+# --- 4. COMPLETENESS's generated ABI inventory must match live code ----------
 # It once grepped lib.rs alone; the crate had been split into modules, so it
-# matched ZERO of 73 shims and "regenerating" re-asserted a falsehood. A doc
-# whose maintenance tool is broken rots faster than one with no tool.
+# matched ZERO of 73 shims and "regenerating" re-asserted a falsehood. The
+# dedicated checker now owns both the clean-room 116-name manifest and the
+# generated doc block; run it here so every ordinary doc-lint invocation is a
+# mechanical surface-drift gate.
 def check_completeness_recipe() -> None:
-    shims = subprocess.run(
-        ["git", "grep", "-hc", "_recomp(", "--", "crates/fn64-abi/src/"],
-        cwd=ROOT, capture_output=True, text=True,
-    ).stdout
-    total = sum(int(n) for n in shims.split() if n.isdigit())
-    if total == 0:
-        fail("COMPLETENESS.md", "regen recipe finds 0 shims in crates/fn64-abi/src/ -- recipe is blind")
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/check-nmr-surface.py"), "--check-doc"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
+        fail("COMPLETENESS.md", detail)
     elif VERBOSE:
-        print(f"  completeness recipe sees {total} shims")
+        print("  NMR surface manifest, live ABI, and completeness doc agree")
 
 
 # --- 5. no doc may cite a scripts/ entry point that isn't executable ---------

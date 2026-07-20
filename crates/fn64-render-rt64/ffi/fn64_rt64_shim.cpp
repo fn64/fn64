@@ -200,8 +200,12 @@ struct Fn64Rt64Context {
     }
 #endif
 
-    void update_vi() {
-        registers[9] = VI_STATUS_16_BIT;
+    void update_vi(
+        bool blanked = false,
+        bool fade_enabled = false,
+        uint16_t fade_factor = 0,
+        bool repeat_line = false) {
+        registers[9] = blanked ? 0U : VI_STATUS_16_BIT;
         // RT64 compensates for the VI origin convention by subtracting one
         // scanline. Supplying the following line makes decodeVI().fbAddress()
         // equal fn64's exact physical output_addr.
@@ -212,7 +216,17 @@ struct Fn64Rt64Context {
         registers[18] = (108U << 16U) | 748U;
         registers[19] = (34U << 16U) | (34U + height * 2U);
         registers[21] = 0x400;
-        registers[22] = 0x400;
+        // VI_Y_SCALE is `offset << 16 | scale`. A zero scale repeats one
+        // sampled row; its 10-bit offset chooses the interpolation between
+        // source rows zero and one. These are the hardware mechanisms behind
+        // the public osViRepeatLine and osViFade scanout operations.
+        if (fade_enabled) {
+            registers[22] = static_cast<uint32_t>(fade_factor & 0x03FFU) << 16U;
+        } else if (repeat_line) {
+            registers[22] = 0U;
+        } else {
+            registers[22] = 0x400U;
+        }
     }
 };
 
@@ -285,6 +299,10 @@ extern "C" int fn64_rt64_process_task(
     Fn64Rt64Context *context,
     uint8_t *rdram,
     size_t rdram_len,
+    uint8_t *dmem,
+    size_t dmem_len,
+    uint8_t *imem,
+    size_t imem_len,
     const Fn64Rt64Task *task,
     uint32_t output_addr,
     char *error,
@@ -294,14 +312,21 @@ extern "C" int fn64_rt64_process_task(
             set_error(error, error_capacity, "RT64 context is not initialized");
             return 0;
         }
-        if ((rdram == nullptr) || (task == nullptr)) {
-            set_error(error, error_capacity, "null RDRAM or OSTask pointer");
+        if ((rdram == nullptr) || (dmem == nullptr) || (imem == nullptr) || (task == nullptr)) {
+            set_error(error, error_capacity, "null RDRAM, RSP memory, or OSTask pointer");
             return 0;
         }
         if (rdram_len < N64_RDRAM_SIZE) {
             set_error(error, error_capacity, "RDRAM slice is smaller than the 8 MiB RT64 address space");
             return 0;
         }
+        if ((dmem_len != context->dmem.size()) || (imem_len != context->imem.size())) {
+            set_error(error, error_capacity, "RSP memory banks are not exactly 4 KiB");
+            return 0;
+        }
+
+        std::memcpy(context->dmem.data(), dmem, context->dmem.size());
+        std::memcpy(context->imem.data(), imem, context->imem.size());
 
         const uint32_t dl_address = task->data_ptr & 0x00FFFFFFU;
         const uint32_t ucode_address = task->ucode & 0x00FFFFFFU;
@@ -341,6 +366,9 @@ extern "C" int fn64_rt64_process_task(
             context->application->workloadQueue->waitForWorkloadId(submitted_workload);
         }
 
+        std::memcpy(dmem, context->dmem.data(), context->dmem.size());
+        std::memcpy(imem, context->imem.data(), context->imem.size());
+
         return 1;
     } catch (const std::exception &exception) {
         set_error(error, error_capacity, std::string("RT64 task processing threw: ") + exception.what());
@@ -351,8 +379,71 @@ extern "C" int fn64_rt64_process_task(
     }
 }
 
+extern "C" int fn64_rt64_process_rdp_commands(
+    Fn64Rt64Context *context,
+    uint8_t *rdram,
+    size_t rdram_len,
+    uint32_t start,
+    uint32_t end,
+    uint32_t output_addr,
+    char *error,
+    size_t error_capacity) {
+    try {
+        if ((context == nullptr) || !context->setup_complete) {
+            set_error(error, error_capacity, "RT64 context is not initialized");
+            return 0;
+        }
+        if (rdram == nullptr) {
+            set_error(error, error_capacity, "null RDRAM pointer");
+            return 0;
+        }
+        if (rdram_len < N64_RDRAM_SIZE) {
+            set_error(error, error_capacity, "RDRAM slice is smaller than the 8 MiB RT64 address space");
+            return 0;
+        }
+        if ((start >= end) || ((start & 7U) != 0U) || ((end & 7U) != 0U) ||
+            (end > rdram_len)) {
+            set_error(error, error_capacity, "raw RDP range must be nonempty, 8-byte aligned, and inside RDRAM");
+            return 0;
+        }
+
+        context->active_rdram = rdram;
+        context->active_rdram_len = rdram_len;
+        context->output_addr = output_addr & 0x00FFFFFFU;
+        context->update_vi();
+        context->registers[1] = start;
+        context->registers[2] = end;
+        context->registers[3] = start;
+
+        // RT64's public embedding entry accepts an explicit bounded LLE RDP
+        // range when isHLE is false. Keep both public RDRAM aliases coherent
+        // exactly as the task path does before the interpreter observes it.
+        context->application->core.RDRAM = rdram;
+        context->application->state->RDRAM = rdram;
+        const uint64_t previous_workload = context->application->state->workloadId;
+        context->application->processDisplayLists(rdram, start, end, false);
+        context->registers[3] = end;
+        const uint64_t submitted_workload = context->application->state->workloadId;
+        if (submitted_workload > previous_workload) {
+            context->application->workloadQueue->waitForWorkloadId(submitted_workload);
+        }
+
+        return 1;
+    } catch (const std::exception &exception) {
+        set_error(error, error_capacity, std::string("RT64 raw RDP processing threw: ") + exception.what());
+        return 0;
+    } catch (...) {
+        set_error(error, error_capacity, "RT64 raw RDP processing failed with an unknown C++ exception");
+        return 0;
+    }
+}
+
 extern "C" int fn64_rt64_present(
     Fn64Rt64Context *context,
+    uint8_t blanked,
+    uint8_t fade_enabled,
+    uint16_t fade_factor,
+    uint8_t repeat_line,
     char *error,
     size_t error_capacity) {
     try {
@@ -361,7 +452,20 @@ extern "C" int fn64_rt64_present(
             return 0;
         }
 
-        context->update_vi();
+        if ((fade_enabled != 0U) && (repeat_line != 0U)) {
+            set_error(error, error_capacity, "VI fade and repeat-line cannot be enabled together");
+            return 0;
+        }
+        if (fade_factor > 0x03FFU) {
+            set_error(error, error_capacity, "VI fade factor exceeds 10 bits");
+            return 0;
+        }
+
+        context->update_vi(
+            blanked != 0U,
+            fade_enabled != 0U,
+            fade_factor,
+            repeat_line != 0U);
         const uint64_t previous_present = context->application->state->presentId;
         context->application->updateScreen();
         const uint64_t submitted_present = context->application->state->presentId;

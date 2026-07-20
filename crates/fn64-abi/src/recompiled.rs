@@ -5,13 +5,155 @@
 //! confined here, beside the C ABI seam that already owns the identical
 //! process-lifetime RDRAM and coroutine contracts.
 
-use fn64_recomp_rs::{Rdram, RecompContext as RsContext, RecompFunc};
+use std::{cell::RefCell, rc::Rc};
+
+use fn64_recomp_rs::{
+    enter_pending_interrupt, BankId, BlockExit, BlockProgram, CallResolution, CodeBank, CpuFault,
+    CpuInterruptLine, ExecutableRegion, ExecutionKey, GeneratedBankRunner, GenerationError,
+    GuestPc, InstructionBudget, Rdram, RecompContext as RsContext, RecompFunc, TransferResolver,
+};
 use fn64_runtime::{Priority, ThreadId};
 
 use super::{with_active_yielder, with_executor, with_host, RecompContext as CContext};
 
 type Lookup = fn(u32) -> RecompFunc;
 type CShim = unsafe extern "C" fn(*mut u8, *mut CContext);
+const THREAD_RETURN_SENTINEL: u32 = 0xFFFF_FFFC;
+pub type ProgramEntryLookup = fn(GuestPc) -> Result<ExecutionKey, CpuFault>;
+pub type ProgramTransferLookup = fn(BankId, GuestPc) -> Result<ExecutionKey, CpuFault>;
+pub type LiveGenerationBuilder = fn(&[u8], u64) -> Result<(CodeBank, GeneratedBankRunner), String>;
+
+struct ObservedExecutableRegion {
+    physical_start: u32,
+    physical_end: u32,
+    region: ExecutableRegion,
+    next_generation: u64,
+    builder: LiveGenerationBuilder,
+}
+
+thread_local! {
+    static PENDING_EXECUTABLE_WRITES: RefCell<Vec<(u32, u32)>> = const {
+        RefCell::new(Vec::new())
+    };
+}
+
+/// One immutable arbitrary-PC program plus the active executable-mapping
+/// resolvers shared by every guest coroutine in this runtime instance.
+#[derive(Clone)]
+pub(super) struct LiveBlockProgram {
+    program: Rc<RefCell<BlockProgram>>,
+    entry_lookup: ProgramEntryLookup,
+    transfer_lookup: ProgramTransferLookup,
+    budget: InstructionBudget,
+    executable_regions: Rc<RefCell<Vec<ObservedExecutableRegion>>>,
+}
+
+struct LiveTransferResolver {
+    live: LiveBlockProgram,
+}
+
+impl TransferResolver for LiveTransferResolver {
+    fn resolve(
+        &mut self,
+        source_bank: BankId,
+        target_pc: GuestPc,
+    ) -> Result<ExecutionKey, CpuFault> {
+        self.live.resolve_transfer(source_bank, target_pc)
+    }
+
+    fn resolve_call(
+        &mut self,
+        source_bank: BankId,
+        target_pc: GuestPc,
+        _resume: ExecutionKey,
+    ) -> Result<CallResolution, CpuFault> {
+        if fn64_recomp_rs::resolve_host_function(target_pc.get()).is_some() {
+            Ok(CallResolution::Host)
+        } else {
+            self.resolve(source_bank, target_pc)
+                .map(CallResolution::Guest)
+        }
+    }
+}
+
+impl LiveBlockProgram {
+    fn resolve_transfer(
+        &self,
+        source_bank: BankId,
+        target_pc: GuestPc,
+    ) -> Result<ExecutionKey, CpuFault> {
+        if let Some(key) = self
+            .executable_regions
+            .borrow()
+            .iter()
+            .find_map(|observed| observed.region.resolve(target_pc))
+        {
+            return Ok(key);
+        }
+        (self.transfer_lookup)(source_bank, target_pc)
+    }
+
+    fn resolve_entry(&self, target_pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        if let Some(key) = self
+            .executable_regions
+            .borrow()
+            .iter()
+            .find_map(|observed| observed.region.resolve(target_pc))
+        {
+            return Ok(key);
+        }
+        (self.entry_lookup)(target_pc)
+    }
+}
+
+fn record_executable_write(offset: u32, len: u32) {
+    PENDING_EXECUTABLE_WRITES.with(|writes| writes.borrow_mut().push((offset, len)));
+}
+
+fn process_executable_writes(
+    live: &LiveBlockProgram,
+    mut read_logical_byte: impl FnMut(u32) -> u8,
+) -> Vec<BankId> {
+    let writes =
+        PENDING_EXECUTABLE_WRITES.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+    if writes.is_empty() {
+        return Vec::new();
+    }
+    let mut regions = live.executable_regions.borrow_mut();
+    let mut program = live.program.borrow_mut();
+    let mut retired = Vec::new();
+    for observed in regions.iter_mut() {
+        let touched = writes.iter().any(|&(start, len)| {
+            let end = start.saturating_add(len);
+            start < observed.physical_end && end > observed.physical_start
+        });
+        if !touched {
+            continue;
+        }
+        let bytes = (observed.physical_start..observed.physical_end)
+            .map(&mut read_logical_byte)
+            .collect::<Vec<_>>();
+        let generation = observed.next_generation;
+        let (code, runner) = (observed.builder)(&bytes, generation).unwrap_or_else(|error| {
+            panic!(
+                "executable rewrite [{:#010x}, {:#010x}) generation {generation} could not be translated: {error}",
+                observed.physical_start, observed.physical_end
+            )
+        });
+        if let Some(previous) = observed
+            .region
+            .install(&mut program, code, runner)
+            .unwrap_or_else(|error| panic!("executable generation install failed: {error}"))
+        {
+            retired.push(previous);
+        }
+        observed.next_generation = observed
+            .next_generation
+            .checked_add(1)
+            .expect("executable generation counter overflow");
+    }
+    retired
+}
 
 /// Return the static link-time vram for a callback pointer relocated into a
 /// currently loaded overlay, if any.
@@ -23,14 +165,152 @@ pub fn canonical_vram(vram: u32) -> Option<u32> {
 /// OSThread subsequently created by `osCreateThread`.
 pub fn set_entry_lookup(lookup: Lookup, rdram_len: usize) {
     assert!(rdram_len > 0, "recompiled RDRAM length must be nonzero");
+    PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+    fn64_recomp_rs::set_write_observer(None);
     with_host(|host| {
         host.recompiled_lookup = Some(lookup);
+        host.recompiled_program = None;
         host.recompiled_rdram_len = rdram_len;
+    });
+}
+
+fn set_block_program(program: LiveBlockProgram, rdram_len: usize) {
+    assert!(rdram_len > 0, "recompiled RDRAM length must be nonzero");
+    PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+    with_host(|host| {
+        host.recompiled_lookup = None;
+        host.recompiled_program = Some(program);
+        host.recompiled_rdram_len = rdram_len;
+    });
+}
+
+/// Replace one live executable region with a new immutable bank generation.
+/// This is safe at host/device boundaries, where `run_block_program` has
+/// already dropped its immutable dispatch borrow. The old bank and runner are
+/// retired atomically by [`ExecutableRegion::install`].
+pub fn install_live_block_generation(
+    region: &mut ExecutableRegion,
+    code: CodeBank,
+    runner: GeneratedBankRunner,
+) -> Result<Option<BankId>, GenerationError> {
+    let live = with_host(|host| host.recompiled_program.clone()).unwrap_or_else(|| {
+        panic!("install_live_block_generation: no live BlockProgram is installed")
+    });
+    let result = region.install(&mut live.program.borrow_mut(), code, runner);
+    result
+}
+
+/// Observe one physical RDRAM span as the backing bytes for an already-live
+/// virtual executable region. CPU stores and device DMA writes that intersect
+/// the physical span rebuild and atomically replace its active immutable bank
+/// at the next host boundary.
+///
+/// The builder is deliberately a pure function of the final committed byte
+/// image and a monotonically increasing generation number. It may select a
+/// pre-generated runner today or invoke a future translator, but may not
+/// publish half of a code/runner pair.
+pub fn register_live_executable_region(
+    physical_start: u32,
+    physical_end: u32,
+    region: ExecutableRegion,
+    builder: LiveGenerationBuilder,
+) {
+    assert!(
+        physical_start < physical_end,
+        "observed executable RDRAM region must be nonempty"
+    );
+    assert!(
+        physical_start.is_multiple_of(4) && physical_end.is_multiple_of(4),
+        "observed executable RDRAM bounds must be instruction-aligned"
+    );
+    let physical_len = physical_end - physical_start;
+    let virtual_len = region.end().get() - region.start().get();
+    assert_eq!(
+        physical_len, virtual_len,
+        "observed physical and virtual executable regions must have equal byte lengths"
+    );
+    let active = region.active_bank().unwrap_or_else(|| {
+        panic!("observed executable region must have an installed active generation")
+    });
+    let (live, rdram_len) = with_host(|host| {
+        (
+            host.recompiled_program.clone().unwrap_or_else(|| {
+                panic!("register_live_executable_region: no live BlockProgram is installed")
+            }),
+            host.recompiled_rdram_len,
+        )
+    });
+    assert!(
+        usize::try_from(physical_end).expect("physical executable end exceeds usize") <= rdram_len,
+        "observed executable RDRAM end {physical_end:#010x} exceeds allocation {rdram_len:#x}"
+    );
+    {
+        let program = live.program.borrow();
+        let code = program.code().bank(active).unwrap_or_else(|| {
+            panic!("observed executable region references missing active generation {active}")
+        });
+        assert_eq!(
+            (code.vram_start(), code.vram_end()),
+            (region.start(), region.end()),
+            "observed executable region does not match its active bank"
+        );
+    }
+    let mut regions = live.executable_regions.borrow_mut();
+    assert!(
+        regions.iter().all(|existing| {
+            physical_end <= existing.physical_start || physical_start >= existing.physical_end
+        }),
+        "observed executable physical region overlaps an existing registration"
+    );
+    assert!(
+        regions.iter().all(|existing| {
+            region.end() <= existing.region.start() || region.start() >= existing.region.end()
+        }),
+        "observed executable virtual region overlaps an existing registration"
+    );
+    regions.push(ObservedExecutableRegion {
+        physical_start,
+        physical_end,
+        region,
+        next_generation: 1,
+        builder,
+    });
+}
+
+/// Apply DMA-originated executable writes after the device fabric has
+/// committed all bytes, but before it publishes completion messages or any
+/// guest coroutine can resume.
+pub(crate) fn process_live_executable_writes_from_host() {
+    let live = with_host(|host| host.recompiled_program.clone());
+    let Some(live) = live else {
+        PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+        return;
+    };
+    let (rdram, rdram_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+    assert!(
+        !rdram.is_null() && rdram_len > 0,
+        "live BlockProgram has no process RDRAM allocation"
+    );
+    // SAFETY: block execution is suspended at this device boundary and the
+    // boot contract keeps the one process RDRAM allocation live throughout.
+    // Use the raw storage adapter instead of manufacturing a second `&mut`
+    // slice while the dormant coroutine retains its checked `Rdram` view.
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    process_executable_writes(&live, |offset| unsafe {
+        storage.read_u8(fn64_runtime::RdramAddr::from_offset(offset))
     });
 }
 
 fn pause_active_recompiled_thread() {
     super::suspend_active_coroutine(fn64_runtime::Yield::PauseSelf);
+}
+
+fn read_raw_mmio(vaddr: u64) -> Option<u32> {
+    crate::pi::read_raw_mmio_word(vaddr)
+}
+
+fn write_raw_mmio(vaddr: u64, value: u32) -> bool {
+    crate::pi::write_raw_mmio_word(vaddr, value)
 }
 
 /// Create and start thread 0 with a typed recompiled entrypoint on fn64's existing
@@ -49,7 +329,12 @@ pub unsafe fn boot_thread0(
     priority: Priority,
 ) {
     set_entry_lookup(lookup, rdram_len);
+    with_host(|host| {
+        host.runtime_rdram = rdram;
+        host.runtime_rdram_len = rdram_len;
+    });
     fn64_recomp_rs::set_host_pause(Some(pause_active_recompiled_thread));
+    fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
 
     let rdram_addr = rdram as usize;
     with_executor(|exec| {
@@ -72,6 +357,168 @@ pub unsafe fn boot_thread0(
     });
 }
 
+/// Create and start thread 0 with the bank-qualified arbitrary-PC execution
+/// program as the live owner. Each instruction checkpoint suspends back to
+/// the existing executor, which charges guest instructions to virtual time
+/// and services due devices before any coroutine resumes.
+///
+/// # Safety
+/// `rdram` must address `rdram_len` live bytes for every coroutine's lifetime,
+/// exactly like [`boot_thread0`]'s existing shared-allocation contract.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn boot_thread0_block_program(
+    rdram: *mut u8,
+    rdram_len: usize,
+    program: BlockProgram,
+    entry: ExecutionKey,
+    entry_lookup: ProgramEntryLookup,
+    transfer_lookup: ProgramTransferLookup,
+    budget: InstructionBudget,
+    thread_id: ThreadId,
+    priority: Priority,
+) {
+    let live = LiveBlockProgram {
+        program: Rc::new(RefCell::new(program)),
+        entry_lookup,
+        transfer_lookup,
+        budget,
+        executable_regions: Rc::new(RefCell::new(Vec::new())),
+    };
+    set_block_program(live.clone(), rdram_len);
+    with_host(|host| {
+        host.runtime_rdram = rdram;
+        host.runtime_rdram_len = rdram_len;
+    });
+    fn64_recomp_rs::set_host_pause(Some(pause_active_recompiled_thread));
+    fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+    fn64_recomp_rs::set_write_observer(Some(record_executable_write));
+
+    let rdram_addr = rdram as usize;
+    with_executor(|exec| {
+        // SAFETY: inherited from this function's process-lifetime buffer
+        // contract; this is the same executor registration as both legacy
+        // function-granularity boot lanes.
+        unsafe { exec.set_rdram_base(rdram) };
+        exec.create_thread(thread_id, priority, move |yielder, first_input| {
+            let rdram_ptr = rdram_addr as *mut u8;
+            with_active_yielder(thread_id, rdram_ptr, yielder, || {
+                let _ = first_input;
+                // SAFETY: the boot host guarantees this one allocation
+                // outlives every executor coroutine.
+                let bytes = unsafe { std::slice::from_raw_parts_mut(rdram_ptr, rdram_len) };
+                let mut mem = Rdram::new(bytes);
+                let mut ctx = RsContext::new();
+                ctx.set_r32(31, THREAD_RETURN_SENTINEL as i32);
+                ctx.set_thread_return_pc(Some(THREAD_RETURN_SENTINEL));
+                run_block_program(&live, entry, &mut ctx, &mut mem);
+            });
+        });
+        exec.start_thread(thread_id);
+    });
+}
+
+fn run_block_program(
+    live: &LiveBlockProgram,
+    mut entry: ExecutionKey,
+    ctx: &mut RsContext,
+    mem: &mut Rdram<'_>,
+) {
+    loop {
+        // Exact timer interleaving: checkpoint suspension -> executor advances
+        // Count and latches Compare/IP7 -> coroutine resume -> this sample ->
+        // exception entry before the resumed guest block. Sampling after
+        // dispatch would allow that block to run once with an overdue timer.
+        let (count, compare, timer_pending) = with_executor(|executor| {
+            (
+                executor.cp0_count(),
+                executor.cp0_compare(),
+                executor.cp0_timer_pending(),
+            )
+        });
+        ctx.synchronize_cop0_timing(count, compare);
+        CpuInterruptLine::TIMER.set_level(ctx, timer_pending);
+        CpuInterruptLine::RCP.set_level(ctx, crate::pi::cpu_interrupt_pending());
+        if let Some(vector) = enter_pending_interrupt(ctx, entry.pc) {
+            entry = live.resolve_transfer(entry.bank, vector).unwrap_or_else(|fault| {
+                panic!(
+                    "live BlockProgram interrupt vector {vector} from {entry} does not resolve: {fault:?}"
+                )
+            });
+        }
+        let mut resolver = LiveTransferResolver { live: live.clone() };
+        let dispatched = {
+            let program = live.program.borrow();
+            program
+                .dispatch(entry, live.budget, ctx, mem, &mut resolver)
+                .unwrap_or_else(|error| {
+                    panic!("live BlockProgram dispatch failed at {entry}: {error}")
+                })
+        };
+        process_executable_writes(live, |offset| {
+            mem.load_b(0xFFFF_FFFF_8000_0000u64 + u64::from(offset)) as u8
+        });
+        let (count_write, compare_write) = ctx.take_cop0_timing_writes();
+        if count_write.is_some() || compare_write.is_some() {
+            // Commit a handler's same-value Compare write before suspending:
+            // otherwise checkpoint time could advance while the executor's
+            // IP7 latch remained set, causing an acknowledged interrupt to
+            // re-enter immediately after ERET.
+            with_executor(|executor| {
+                if let Some(count) = count_write {
+                    executor.set_cp0_count(count);
+                }
+                if let Some(compare) = compare_write {
+                    executor.write_cp0_compare(compare);
+                }
+            });
+        }
+        if dispatched.instructions > 0 {
+            super::suspend_active_coroutine(fn64_runtime::Yield::InstructionCheckpoint {
+                instructions: dispatched.instructions,
+            });
+        }
+        match dispatched.exit {
+            BlockExit::Checkpoint(next) | BlockExit::Yield(next) => {
+                assert!(
+                    dispatched.instructions > 0,
+                    "live BlockProgram returned {:?} without guest progress",
+                    dispatched.exit
+                );
+                entry = live
+                    .resolve_transfer(next.bank, next.pc)
+                    .unwrap_or_else(|fault| {
+                        panic!("live BlockProgram checkpoint {next} no longer resolves: {fault:?}")
+                    });
+            }
+            BlockExit::HostCall { vram, resume } => {
+                let host = fn64_recomp_rs::resolve_host_function(vram.get()).unwrap_or_else(|| {
+                    panic!(
+                        "live BlockProgram requested unknown host call {:#010x}",
+                        vram.get()
+                    )
+                });
+                host(ctx, mem);
+                entry = live
+                    .resolve_transfer(resume.bank, resume.pc)
+                    .unwrap_or_else(|fault| {
+                        panic!(
+                            "live BlockProgram host resume {resume} no longer resolves: {fault:?}"
+                        )
+                    });
+            }
+            BlockExit::ThreadReturn => return,
+            BlockExit::Fault(fault) => {
+                panic!("live BlockProgram stopped on unresolved guest fault: {fault:?}")
+            }
+            BlockExit::Transfer(_)
+            | BlockExit::ResolveTransfer { .. }
+            | BlockExit::ResolveCall { .. } => {
+                unreachable!("BlockProgram::dispatch returned an internal transfer boundary")
+            }
+        }
+    }
+}
+
 /// Dispatch a newly-created OSThread through the installed typed module.
 /// Returns `false` only for the legacy C configuration.
 ///
@@ -84,10 +531,35 @@ pub(super) unsafe fn run_registered_entry(
     arg: u64,
     sp: u64,
 ) -> bool {
-    let registered = with_host(|host| {
-        host.recompiled_lookup
-            .map(|lookup| (lookup, host.recompiled_rdram_len))
+    let (program, registered) = with_host(|host| {
+        (
+            host.recompiled_program.clone(),
+            host.recompiled_lookup
+                .map(|lookup| (lookup, host.recompiled_rdram_len)),
+        )
     });
+    if let Some(program) = program {
+        let entry = program
+            .resolve_entry(GuestPc::new(entry_vram))
+            .unwrap_or_else(|fault| {
+                panic!("spawned OSThread entry {entry_vram:#010x} is not executable: {fault:?}")
+            });
+        let rdram_len = with_host(|host| host.recompiled_rdram_len);
+        assert!(
+            rdram_len > 0,
+            "recompiled block program has no RDRAM length"
+        );
+        // SAFETY: inherited from the caller's shared-allocation contract.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
+        let mut mem = Rdram::new(bytes);
+        let mut ctx = RsContext::new();
+        ctx.set_r(4, arg);
+        ctx.set_r(29, sp);
+        ctx.set_r32(31, THREAD_RETURN_SENTINEL as i32);
+        ctx.set_thread_return_pc(Some(THREAD_RETURN_SENTINEL));
+        run_block_program(&program, entry, &mut ctx, &mut mem);
+        return true;
+    }
     let Some((lookup, rdram_len)) = registered else {
         return false;
     };
@@ -177,6 +649,15 @@ macro_rules! c_adapters {
 }
 
 c_adapters!(
+    (os_initialize_common, __osInitialize_common_recomp),
+    (is_prout_sync_printf, is_proutSyncPrintf_recomp),
+    (check_hardware_msp, __checkHardware_msp_recomp),
+    (check_hardware_kmc, __checkHardware_kmc_recomp),
+    (check_hardware_isv, __checkHardware_isv_recomp),
+    (os_initialize_msp, __osInitialize_msp_recomp),
+    (os_initialize_kmc, __osInitialize_kmc_recomp),
+    (os_initialize_isv, __osInitialize_isv_recomp),
+    (os_rdb_send, __osRdbSend_recomp),
     (os_create_thread, osCreateThread_recomp),
     (os_start_thread, osStartThread_recomp),
     (os_set_thread_pri, osSetThreadPri_recomp),
@@ -187,11 +668,42 @@ c_adapters!(
     (os_set_event_mesg, osSetEventMesg_recomp),
     (os_set_timer, osSetTimer_recomp),
     (os_cart_rom_init, osCartRomInit_recomp),
+    (os_pi_read_io, osPiReadIo_recomp),
+    (os_pi_start_dma, osPiStartDma_recomp),
+    (os_pi_get_status, osPiGetStatus_recomp),
     (os_epi_start_dma, osEPiStartDma_recomp),
+    (os_epi_raw_start_dma, osEPiRawStartDma_recomp),
+    (os_eeprom_probe, osEepromProbe_recomp),
+    (os_eeprom_read, osEepromRead_recomp),
+    (os_eeprom_write, osEepromWrite_recomp),
+    (os_eeprom_long_read, osEepromLongRead_recomp),
+    (os_eeprom_long_write, osEepromLongWrite_recomp),
+    (os_pfs_init_pak, osPfsInitPak_recomp),
+    (os_pfs_free_blocks, osPfsFreeBlocks_recomp),
+    (os_pfs_allocate_file, osPfsAllocateFile_recomp),
+    (os_pfs_delete_file, osPfsDeleteFile_recomp),
+    (os_pfs_file_state, osPfsFileState_recomp),
+    (os_pfs_find_file, osPfsFindFile_recomp),
+    (os_pfs_read_write_file, osPfsReadWriteFile_recomp),
+    (os_flash_init, osFlashInit_recomp),
+    (os_flash_read_status, osFlashReadStatus_recomp),
+    (os_flash_read_id, osFlashReadId_recomp),
+    (os_flash_clear_status, osFlashClearStatus_recomp),
+    (os_flash_all_erase, osFlashAllErase_recomp),
+    (os_flash_all_erase_through, osFlashAllEraseThrough_recomp),
+    (os_flash_sector_erase, osFlashSectorErase_recomp),
+    (
+        os_flash_sector_erase_through,
+        osFlashSectorEraseThrough_recomp
+    ),
+    (os_flash_check_erase_end, osFlashCheckEraseEnd_recomp),
+    (os_flash_write_buffer, osFlashWriteBuffer_recomp),
+    (os_flash_write_array, osFlashWriteArray_recomp),
+    (os_flash_read_array, osFlashReadArray_recomp),
+    (os_flash_change, osFlashChange_recomp),
     (os_virtual_to_physical, osVirtualToPhysical_recomp),
     (os_create_pi_manager, osCreatePiManager_recomp),
     (os_si_raw_start_dma, __osSiRawStartDma_recomp),
-    (os_set_int_mask, osSetIntMask_recomp),
     (os_initialize, osInitialize_recomp),
     (os_ai_set_frequency, osAiSetFrequency_recomp),
     (os_ai_get_length, osAiGetLength_recomp),
@@ -204,17 +716,25 @@ c_adapters!(
     (os_restore_int, __osRestoreInt_recomp),
     (os_get_thread_id, osGetThreadId_recomp),
     (os_get_time, osGetTime_recomp),
+    (os_set_count, osSetCount_recomp),
+    (os_set_fpc_csr, __osSetFpcCsr_recomp),
     (os_sp_task_yielded, osSpTaskYielded_recomp),
     (os_create_vi_manager, osCreateViManager_recomp),
     (os_vi_set_event, osViSetEvent_recomp),
     (os_vi_set_mode, osViSetMode_recomp),
     (os_vi_set_special_features, osViSetSpecialFeatures_recomp),
+    (os_vi_set_x_scale, osViSetXScale_recomp),
     (os_vi_set_y_scale, osViSetYScale_recomp),
     (os_vi_swap_buffer, osViSwapBuffer_recomp),
     (os_vi_black, osViBlack_recomp),
+    (os_vi_fade, osViFade_recomp),
+    (os_vi_repeat_line, osViRepeatLine_recomp),
     (ll_div, __ll_div_recomp),
     (ll_mul, __ll_mul_recomp),
     (ull_div, __ull_div_recomp),
+    (ull_rem, __ull_rem_recomp),
+    (ull_to_d, __ull_to_d_recomp),
+    (ull_to_f, __ull_to_f_recomp),
     (os_pi_get_access, __osPiGetAccess_recomp),
     (os_pi_rel_access, __osPiRelAccess_recomp),
     (os_sp_set_pc, __osSpSetPc_recomp),
@@ -225,9 +745,23 @@ c_adapters!(
     (os_cont_set_ch, osContSetCh_recomp),
     (os_cont_start_query, osContStartQuery_recomp),
     (os_cont_start_read_data, osContStartReadData_recomp),
+    (os_motor_init, osMotorInit_recomp),
+    (os_motor_access, __osMotorAccess_recomp),
+    (os_motor_start, osMotorStart_recomp),
+    (os_motor_stop, osMotorStop_recomp),
+    (os_voice_set_word, osVoiceSetWord_recomp),
+    (os_voice_check_word, osVoiceCheckWord_recomp),
+    (os_voice_stop_read_data, osVoiceStopReadData_recomp),
+    (os_voice_init, osVoiceInit_recomp),
+    (os_voice_mask_dictionary, osVoiceMaskDictionary_recomp),
+    (os_voice_start_read_data, osVoiceStartReadData_recomp),
+    (os_voice_control_gain, osVoiceControlGain_recomp),
+    (os_voice_get_read_data, osVoiceGetReadData_recomp),
+    (os_voice_clear_dictionary, osVoiceClearDictionary_recomp),
     (os_destroy_thread, osDestroyThread_recomp),
     (os_stop_thread, osStopThread_recomp),
     (os_dp_set_status, osDpSetStatus_recomp),
+    (os_dp_set_next_buffer, osDpSetNextBuffer_recomp),
     (os_epi_read_io, osEPiReadIo_recomp),
     (os_epi_write_io, osEPiWriteIo_recomp),
     (os_get_count, osGetCount_recomp),
@@ -262,15 +796,369 @@ pub fn os_get_cause(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
     ctx.set_r(2, ctx.cop0_cause as u64);
 }
 
-/// `osGetIntMask`: return the same process-local interrupt mask maintained by
-/// `osSetIntMask_recomp`.
+/// `osSetIntMask`: update this typed OSThread's packed mask and the shared MI
+/// gate. Unlike the legacy C adapter, the prior value is owned by `ctx`, so
+/// coroutine switches cannot make one thread return another thread's mask.
+pub fn os_set_int_mask(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
+    const CPU_INTERRUPT_FIELDS: u32 = 1 | (0xFF << 8);
+    let new_mask = ctx.r_u32(4);
+    let previous = ctx.replace_os_interrupt_mask(new_mask);
+    ctx.cop0_status = (ctx.cop0_status & !CPU_INTERRUPT_FIELDS) | (new_mask & CPU_INTERRUPT_FIELDS);
+    crate::pi::set_mi_interrupt_mask((new_mask >> 16) & 0x3F);
+    ctx.set_r(2, previous as u64);
+}
+
+/// `osGetIntMask`: return this typed OSThread's combined CPU/RCP mask.
 pub fn os_get_int_mask(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
-    ctx.set_r(2, super::INT_MASK.with(|cell| cell.get()) as u64);
+    ctx.set_r(2, ctx.os_interrupt_mask() as u64);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fn64_recomp_rs::{BlockRun, CodeBank, CpuFaultKind, GeneratedBankRunner};
+
+    const LIVE_BANK: BankId = BankId::new(0xA11CE);
+    const LIVE_SECOND_BANK: BankId = BankId::new(0xA11CF);
+    const LIVE_ENTRY: GuestPc = GuestPc::new(0x8000_1000);
+    const LIVE_NEXT: GuestPc = GuestPc::new(0x8000_1004);
+    const LIVE_HOST: GuestPc = GuestPc::new(0x8000_2000);
+    const IRQ_BANK: BankId = BankId::new(0x1A2);
+    const IRQ_ENTRY: GuestPc = GuestPc::new(0x8000_0100);
+    const IRQ_RESUME: GuestPc = GuestPc::new(0x8000_0104);
+    const IRQ_VECTOR: GuestPc = GuestPc::new(0x8000_0180);
+    const TIMER_BANK: BankId = BankId::new(0x1A7);
+    const REWRITE_OLD_BANK: BankId = BankId::new(0xC0DE_0000);
+    const REWRITE_NEW_BANK: BankId = BankId::new(0xC0DE_0001);
+    const REWRITE_ENTRY: GuestPc = GuestPc::new(0x8000_3000);
+    const REWRITE_PHYSICAL: u32 = 0x80;
+    const DMA_OLD_BANK: BankId = BankId::new(0xD00D_0000);
+    const DMA_NEW_BANK: BankId = BankId::new(0xD00D_0001);
+    const DMA_ENTRY: GuestPc = GuestPc::new(0x8000_4000);
+    const DMA_PHYSICAL: u32 = 0x100;
+
+    thread_local! {
+        static LIVE_ACTIVE_BANK: std::cell::Cell<BankId> = const { std::cell::Cell::new(LIVE_BANK) };
+        static REWRITE_BUILDS: std::cell::RefCell<Vec<(u64, Vec<u8>)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+
+    fn unmapped(bank: BankId, pc: GuestPc, start: GuestPc, end: GuestPc) -> CpuFault {
+        CpuFault {
+            at: ExecutionKey::new(bank, pc),
+            kind: CpuFaultKind::UnmappedPc {
+                bank_start: start.get(),
+                bank_end: end.get(),
+            },
+        }
+    }
+
+    fn rewrite_lookup(pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        Err(unmapped(
+            REWRITE_OLD_BANK,
+            pc,
+            REWRITE_ENTRY,
+            GuestPc::new(REWRITE_ENTRY.get() + 8),
+        ))
+    }
+
+    fn rewrite_transfer_lookup(_source: BankId, pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        rewrite_lookup(pc)
+    }
+
+    fn rewrite_runner(
+        entry: ExecutionKey,
+        _budget: InstructionBudget,
+        _ctx: &mut RsContext,
+        mem: &mut Rdram<'_>,
+    ) -> BlockRun {
+        match (entry.bank, entry.pc) {
+            (REWRITE_OLD_BANK, REWRITE_ENTRY) => {
+                mem.store_w(
+                    0xFFFF_FFFF_8000_0000 | u64::from(REWRITE_PHYSICAL),
+                    0x1122_3344,
+                );
+                BlockRun::new(BlockExit::Checkpoint(entry), 2)
+            }
+            (REWRITE_NEW_BANK, REWRITE_ENTRY) => {
+                mem.store_w(0xFFFF_FFFF_8000_0010, 0xA11C_E001);
+                BlockRun::new(BlockExit::ThreadReturn, 2)
+            }
+            (bank, pc) => BlockRun::new(
+                BlockExit::Fault(unmapped(
+                    bank,
+                    pc,
+                    REWRITE_ENTRY,
+                    GuestPc::new(REWRITE_ENTRY.get() + 8),
+                )),
+                0,
+            ),
+        }
+    }
+
+    fn rewrite_builder(
+        bytes: &[u8],
+        generation: u64,
+    ) -> Result<(CodeBank, GeneratedBankRunner), String> {
+        REWRITE_BUILDS.with(|builds| builds.borrow_mut().push((generation, bytes.to_vec())));
+        if generation != 1 || bytes != [0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0] {
+            return Err(format!(
+                "unexpected CPU rewrite generation/image: {generation} {bytes:02x?}"
+            ));
+        }
+        Ok((
+            CodeBank::new(REWRITE_NEW_BANK, REWRITE_ENTRY, vec![1, 1])
+                .map_err(|error| error.to_string())?,
+            GeneratedBankRunner::new(REWRITE_NEW_BANK, rewrite_runner),
+        ))
+    }
+
+    fn dma_lookup(pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        Err(unmapped(
+            DMA_OLD_BANK,
+            pc,
+            DMA_ENTRY,
+            GuestPc::new(DMA_ENTRY.get() + 8),
+        ))
+    }
+
+    fn dma_transfer_lookup(_source: BankId, pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        dma_lookup(pc)
+    }
+
+    fn dma_rewrite_runner(
+        entry: ExecutionKey,
+        _budget: InstructionBudget,
+        _ctx: &mut RsContext,
+        mem: &mut Rdram<'_>,
+    ) -> BlockRun {
+        match (entry.bank, entry.pc) {
+            (DMA_OLD_BANK, DMA_ENTRY) => {
+                mem.store_w(0xFFFF_FFFF_A460_0000, DMA_PHYSICAL);
+                mem.store_w(0xFFFF_FFFF_A460_0004, 0x20);
+                mem.store_w(0xFFFF_FFFF_A460_0008, 7);
+                BlockRun::new(BlockExit::Checkpoint(entry), 5)
+            }
+            (DMA_NEW_BANK, DMA_ENTRY) => {
+                mem.store_w(0xFFFF_FFFF_8000_0014, 0xD00D_0001);
+                BlockRun::new(BlockExit::ThreadReturn, 2)
+            }
+            (bank, pc) => BlockRun::new(
+                BlockExit::Fault(unmapped(
+                    bank,
+                    pc,
+                    DMA_ENTRY,
+                    GuestPc::new(DMA_ENTRY.get() + 8),
+                )),
+                0,
+            ),
+        }
+    }
+
+    fn dma_rewrite_builder(
+        bytes: &[u8],
+        generation: u64,
+    ) -> Result<(CodeBank, GeneratedBankRunner), String> {
+        REWRITE_BUILDS.with(|builds| builds.borrow_mut().push((generation, bytes.to_vec())));
+        if generation != 1 || bytes != [0x3c, 0x08, 0x12, 0x34, 0x35, 0x08, 0x56, 0x78] {
+            return Err(format!(
+                "unexpected DMA rewrite generation/image: {generation} {bytes:02x?}"
+            ));
+        }
+        Ok((
+            CodeBank::new(DMA_NEW_BANK, DMA_ENTRY, vec![1, 1])
+                .map_err(|error| error.to_string())?,
+            GeneratedBankRunner::new(DMA_NEW_BANK, dma_rewrite_runner),
+        ))
+    }
+
+    fn live_host(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+        ctx.set_r32(2, 0x1234);
+        mem.store_w(0xFFFF_FFFF_8000_0000, ctx.r_u32(2));
+    }
+
+    fn live_host_lookup(vram: u32) -> Option<RecompFunc> {
+        (vram == LIVE_HOST.get()).then_some(live_host)
+    }
+
+    fn live_test_runner(
+        entry: ExecutionKey,
+        _budget: InstructionBudget,
+        _ctx: &mut RsContext,
+        _mem: &mut Rdram<'_>,
+    ) -> BlockRun {
+        match entry.pc {
+            LIVE_ENTRY => BlockRun::new(
+                BlockExit::ResolveCall {
+                    source_bank: LIVE_BANK,
+                    target_pc: LIVE_HOST,
+                    resume: ExecutionKey::new(LIVE_BANK, LIVE_NEXT),
+                },
+                3,
+            ),
+            LIVE_NEXT => BlockRun::new(BlockExit::ThreadReturn, 2),
+            pc => BlockRun::new(
+                BlockExit::Fault(CpuFault {
+                    at: ExecutionKey::new(LIVE_BANK, pc),
+                    kind: CpuFaultKind::UnmappedPc {
+                        bank_start: LIVE_ENTRY.get(),
+                        bank_end: LIVE_NEXT.get() + 4,
+                    },
+                }),
+                0,
+            ),
+        }
+    }
+
+    fn live_entry_lookup(pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        let key = ExecutionKey::new(LIVE_ACTIVE_BANK.with(std::cell::Cell::get), pc);
+        if matches!(pc, LIVE_ENTRY | LIVE_NEXT) {
+            Ok(key)
+        } else {
+            Err(CpuFault {
+                at: key,
+                kind: CpuFaultKind::UnmappedPc {
+                    bank_start: LIVE_ENTRY.get(),
+                    bank_end: LIVE_NEXT.get() + 4,
+                },
+            })
+        }
+    }
+
+    fn live_transfer_lookup(_source: BankId, pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        live_entry_lookup(pc)
+    }
+
+    fn irq_runner(
+        entry: ExecutionKey,
+        _budget: InstructionBudget,
+        ctx: &mut RsContext,
+        mem: &mut Rdram<'_>,
+    ) -> BlockRun {
+        match entry.pc {
+            IRQ_ENTRY => {
+                ctx.set_r(4, 0x0010_0401); // OS_IM_PI
+                os_set_int_mask(ctx, mem);
+                mem.store_w(0xFFFF_FFFF_A460_0000, 0x400);
+                mem.store_w(0xFFFF_FFFF_A460_0004, 0x20);
+                mem.store_w(0xFFFF_FFFF_A460_0008, 3);
+                BlockRun::new(
+                    BlockExit::Checkpoint(ExecutionKey::new(IRQ_BANK, IRQ_RESUME)),
+                    5,
+                )
+            }
+            IRQ_VECTOR => {
+                mem.store_w(0xFFFF_FFFF_8000_0000, ctx.cop0_epc);
+                mem.store_w(0xFFFF_FFFF_8000_0004, ctx.cop0_cause);
+                mem.store_w(0xFFFF_FFFF_8000_0008, ctx.cop0_status);
+                mem.store_w(0xFFFF_FFFF_A460_0010, 1 << 1); // clear PI interrupt
+                let resume = GuestPc::new(ctx.exception_return_pc());
+                BlockRun::new(
+                    BlockExit::Checkpoint(ExecutionKey::new(IRQ_BANK, resume)),
+                    2,
+                )
+            }
+            IRQ_RESUME => {
+                mem.store_w(0xFFFF_FFFF_8000_000C, ctx.cop0_cause);
+                mem.store_w(0xFFFF_FFFF_8000_0010, ctx.cop0_status);
+                BlockRun::new(BlockExit::ThreadReturn, 2)
+            }
+            pc => BlockRun::new(
+                BlockExit::Fault(CpuFault {
+                    at: ExecutionKey::new(IRQ_BANK, pc),
+                    kind: CpuFaultKind::UnmappedPc {
+                        bank_start: IRQ_ENTRY.get(),
+                        bank_end: IRQ_VECTOR.get() + 4,
+                    },
+                }),
+                0,
+            ),
+        }
+    }
+
+    fn irq_lookup(pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        let key = ExecutionKey::new(IRQ_BANK, pc);
+        if matches!(pc, IRQ_ENTRY | IRQ_RESUME | IRQ_VECTOR) {
+            Ok(key)
+        } else {
+            Err(CpuFault {
+                at: key,
+                kind: CpuFaultKind::UnmappedPc {
+                    bank_start: IRQ_ENTRY.get(),
+                    bank_end: IRQ_VECTOR.get() + 4,
+                },
+            })
+        }
+    }
+
+    fn irq_transfer_lookup(_source: BankId, pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        irq_lookup(pc)
+    }
+
+    fn timer_runner(
+        entry: ExecutionKey,
+        _budget: InstructionBudget,
+        ctx: &mut RsContext,
+        mem: &mut Rdram<'_>,
+    ) -> BlockRun {
+        match entry.pc {
+            IRQ_ENTRY => {
+                ctx.cop0_status = 1 | CpuInterruptLine::TIMER.cause_bit();
+                ctx.write_cop0(9, 0);
+                ctx.write_cop0(11, 2);
+                BlockRun::new(
+                    BlockExit::Checkpoint(ExecutionKey::new(TIMER_BANK, IRQ_RESUME)),
+                    4,
+                )
+            }
+            IRQ_VECTOR => {
+                mem.store_w(0xFFFF_FFFF_8000_0020, ctx.cop0_epc);
+                mem.store_w(0xFFFF_FFFF_8000_0024, ctx.cop0_cause);
+                mem.store_w(0xFFFF_FFFF_8000_0028, ctx.cop0_count);
+                ctx.write_cop0(11, ctx.cop0_compare);
+                let resume = GuestPc::new(ctx.exception_return_pc());
+                BlockRun::new(
+                    BlockExit::Checkpoint(ExecutionKey::new(TIMER_BANK, resume)),
+                    2,
+                )
+            }
+            IRQ_RESUME => {
+                mem.store_w(0xFFFF_FFFF_8000_002C, ctx.cop0_cause);
+                mem.store_w(0xFFFF_FFFF_8000_0030, ctx.cop0_count);
+                BlockRun::new(BlockExit::ThreadReturn, 2)
+            }
+            pc => BlockRun::new(
+                BlockExit::Fault(CpuFault {
+                    at: ExecutionKey::new(TIMER_BANK, pc),
+                    kind: CpuFaultKind::UnmappedPc {
+                        bank_start: IRQ_ENTRY.get(),
+                        bank_end: IRQ_VECTOR.get() + 4,
+                    },
+                }),
+                0,
+            ),
+        }
+    }
+
+    fn timer_lookup(pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        let key = ExecutionKey::new(TIMER_BANK, pc);
+        if matches!(pc, IRQ_ENTRY | IRQ_RESUME | IRQ_VECTOR) {
+            Ok(key)
+        } else {
+            Err(CpuFault {
+                at: key,
+                kind: CpuFaultKind::UnmappedPc {
+                    bank_start: IRQ_ENTRY.get(),
+                    bank_end: IRQ_VECTOR.get() + 4,
+                },
+            })
+        }
+    }
+
+    fn timer_transfer_lookup(_source: BankId, pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        timer_lookup(pc)
+    }
 
     #[test]
     fn c_adapter_round_trips_all_gprs_and_forces_zero() {
@@ -288,6 +1176,312 @@ mod tests {
     }
 
     #[test]
+    fn live_block_program_owns_thread_dispatch_and_charges_instruction_time() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_host(|host| *host = super::super::HostState::default());
+        let mut bytes = vec![0u8; 0x100];
+        let mut program = BlockProgram::new();
+        let mut region = ExecutableRegion::new(LIVE_ENTRY, GuestPc::new(LIVE_NEXT.get() + 4));
+        LIVE_ACTIVE_BANK.with(|active| active.set(LIVE_BANK));
+        region
+            .install(
+                &mut program,
+                CodeBank::new(LIVE_BANK, LIVE_ENTRY, vec![0, 0]).unwrap(),
+                GeneratedBankRunner::new(LIVE_BANK, live_test_runner),
+            )
+            .unwrap();
+        let thread_id = 0xB10C;
+        let previous_host_lookup = fn64_recomp_rs::set_host_lookup(Some(live_host_lookup));
+
+        // SAFETY: `bytes` remains live until the installed thread has
+        // returned and the executor marks it dead below.
+        unsafe {
+            boot_thread0_block_program(
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                program,
+                ExecutionKey::new(LIVE_BANK, LIVE_ENTRY),
+                live_entry_lookup,
+                live_transfer_lookup,
+                InstructionBudget::new(8).unwrap(),
+                thread_id,
+                10,
+            );
+        }
+
+        assert!(crate::run_one_step());
+        assert_eq!(crate::host::sim_time(), 3);
+        assert!(!crate::is_thread_dead(thread_id));
+        LIVE_ACTIVE_BANK.with(|active| active.set(LIVE_SECOND_BANK));
+        assert_eq!(
+            install_live_block_generation(
+                &mut region,
+                CodeBank::new(LIVE_SECOND_BANK, LIVE_ENTRY, vec![1, 1]).unwrap(),
+                GeneratedBankRunner::new(LIVE_SECOND_BANK, live_test_runner),
+            )
+            .unwrap(),
+            Some(LIVE_BANK)
+        );
+        assert!(crate::run_one_step());
+        assert_eq!(crate::host::sim_time(), 5);
+        assert!(!crate::is_thread_dead(thread_id));
+        assert!(crate::run_one_step());
+        assert!(crate::is_thread_dead(thread_id));
+        let mem = Rdram::new(&mut bytes);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0000), 0x1234);
+        fn64_recomp_rs::set_host_lookup(previous_host_lookup);
+    }
+
+    #[test]
+    fn cpu_store_rebuilds_executable_region_before_old_checkpoint_can_resume() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_host(|host| *host = super::super::HostState::default());
+        REWRITE_BUILDS.with(|builds| builds.borrow_mut().clear());
+        let mut bytes = vec![0u8; 0x200];
+        let mut program = BlockProgram::new();
+        let mut region =
+            ExecutableRegion::new(REWRITE_ENTRY, GuestPc::new(REWRITE_ENTRY.get() + 8));
+        region
+            .install(
+                &mut program,
+                CodeBank::new(REWRITE_OLD_BANK, REWRITE_ENTRY, vec![0, 0]).unwrap(),
+                GeneratedBankRunner::new(REWRITE_OLD_BANK, rewrite_runner),
+            )
+            .unwrap();
+        let thread_id = 0xC0DE;
+
+        // SAFETY: `bytes` remains live until this thread returns below.
+        unsafe {
+            boot_thread0_block_program(
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                program,
+                ExecutionKey::new(REWRITE_OLD_BANK, REWRITE_ENTRY),
+                rewrite_lookup,
+                rewrite_transfer_lookup,
+                InstructionBudget::new(8).unwrap(),
+                thread_id,
+                10,
+            );
+        }
+        register_live_executable_region(
+            REWRITE_PHYSICAL,
+            REWRITE_PHYSICAL + 8,
+            region,
+            rewrite_builder,
+        );
+
+        assert!(crate::run_one_step());
+        let live = with_host(|host| host.recompiled_program.clone().unwrap());
+        assert!(live
+            .program
+            .borrow()
+            .code()
+            .bank(REWRITE_OLD_BANK)
+            .is_none());
+        assert!(live
+            .program
+            .borrow()
+            .code()
+            .bank(REWRITE_NEW_BANK)
+            .is_some());
+        assert_eq!(
+            live.resolve_entry(REWRITE_ENTRY).unwrap().bank,
+            REWRITE_NEW_BANK
+        );
+        assert_eq!(
+            REWRITE_BUILDS.with(|builds| builds.borrow().clone()),
+            vec![(1, vec![0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0])]
+        );
+
+        assert!(crate::run_one_step());
+        let mem = Rdram::new(&mut bytes);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0010) as u32, 0xA11C_E001);
+        assert!(crate::run_one_step());
+        assert!(crate::is_thread_dead(thread_id));
+    }
+
+    #[test]
+    fn pi_dma_rebuilds_executable_region_before_completion_is_observable() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_host(|host| *host = super::super::HostState::default());
+        REWRITE_BUILDS.with(|builds| builds.borrow_mut().clear());
+        let mut rom = vec![0u8; 0x100];
+        rom[0x20..0x28].copy_from_slice(&[0x3c, 0x08, 0x12, 0x34, 0x35, 0x08, 0x56, 0x78]);
+        crate::load_rom_with_fixed_pi_latency(rom, 5);
+        let mut bytes = vec![0u8; 0x200];
+        let mut program = BlockProgram::new();
+        let mut region = ExecutableRegion::new(DMA_ENTRY, GuestPc::new(DMA_ENTRY.get() + 8));
+        region
+            .install(
+                &mut program,
+                CodeBank::new(DMA_OLD_BANK, DMA_ENTRY, vec![0, 0]).unwrap(),
+                GeneratedBankRunner::new(DMA_OLD_BANK, dma_rewrite_runner),
+            )
+            .unwrap();
+        let thread_id = 0xD00D;
+
+        // SAFETY: `bytes` remains live until this thread returns below.
+        unsafe {
+            boot_thread0_block_program(
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                program,
+                ExecutionKey::new(DMA_OLD_BANK, DMA_ENTRY),
+                dma_lookup,
+                dma_transfer_lookup,
+                InstructionBudget::new(8).unwrap(),
+                thread_id,
+                10,
+            );
+        }
+        register_live_executable_region(
+            DMA_PHYSICAL,
+            DMA_PHYSICAL + 8,
+            region,
+            dma_rewrite_builder,
+        );
+
+        assert!(crate::run_one_step());
+        assert_eq!(crate::host::sim_time(), 5);
+        let live = with_host(|host| host.recompiled_program.clone().unwrap());
+        assert!(live.program.borrow().code().bank(DMA_OLD_BANK).is_none());
+        assert_eq!(live.resolve_entry(DMA_ENTRY).unwrap().bank, DMA_NEW_BANK);
+        assert_eq!(
+            REWRITE_BUILDS.with(|builds| builds.borrow().clone()),
+            vec![(1, vec![0x3c, 0x08, 0x12, 0x34, 0x35, 0x08, 0x56, 0x78])]
+        );
+
+        assert!(crate::run_one_step());
+        let mem = Rdram::new(&mut bytes);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0014) as u32, 0xD00D_0001);
+        assert!(crate::run_one_step());
+        assert!(crate::is_thread_dead(thread_id));
+    }
+
+    #[test]
+    fn checkpoint_due_pi_enters_ip2_handler_before_the_next_guest_block() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_host(|host| *host = super::super::HostState::default());
+        let mut rom = vec![0u8; 0x100];
+        rom[0x20..0x24].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        crate::load_rom_with_fixed_pi_latency(rom, 5);
+        let mut bytes = vec![0u8; 0x1000];
+        let mut program = BlockProgram::new();
+        program
+            .register(
+                CodeBank::new(IRQ_BANK, IRQ_ENTRY, vec![0; 33]).unwrap(),
+                GeneratedBankRunner::new(IRQ_BANK, irq_runner),
+            )
+            .unwrap();
+        let thread_id = 0x1A2;
+
+        // SAFETY: `bytes` remains live through the thread's final return.
+        unsafe {
+            boot_thread0_block_program(
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                program,
+                ExecutionKey::new(IRQ_BANK, IRQ_ENTRY),
+                irq_lookup,
+                irq_transfer_lookup,
+                InstructionBudget::new(8).unwrap(),
+                thread_id,
+                10,
+            );
+        }
+
+        assert!(crate::run_one_step());
+        assert_eq!(crate::host::sim_time(), 5);
+        {
+            let mem = Rdram::new(&mut bytes);
+            assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0400) as u32, 0x1234_5678);
+            assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0000), 0);
+        }
+
+        assert!(crate::run_one_step());
+        assert_eq!(crate::host::sim_time(), 7);
+        {
+            let mem = Rdram::new(&mut bytes);
+            assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0000) as u32, IRQ_RESUME.get());
+            assert_eq!((mem.load_w(0xFFFF_FFFF_8000_0004) as u32 >> 2) & 0x1F, 0);
+            assert_ne!(
+                mem.load_w(0xFFFF_FFFF_8000_0004) as u32 & CpuInterruptLine::RCP.cause_bit(),
+                0
+            );
+            assert_ne!(mem.load_w(0xFFFF_FFFF_8000_0008) as u32 & (1 << 1), 0);
+        }
+
+        assert!(crate::run_one_step());
+        {
+            let mem = Rdram::new(&mut bytes);
+            assert_eq!(
+                mem.load_w(0xFFFF_FFFF_8000_000C) as u32 & CpuInterruptLine::RCP.cause_bit(),
+                0
+            );
+            assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0010) as u32 & (1 << 1), 0);
+        }
+        assert!(crate::run_one_step());
+        assert!(crate::is_thread_dead(thread_id));
+    }
+
+    #[test]
+    fn checkpoint_count_compare_match_enters_ip7_and_compare_write_acks_it() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_host(|host| *host = super::super::HostState::default());
+        let mut bytes = vec![0u8; 0x100];
+        let mut program = BlockProgram::new();
+        program
+            .register(
+                CodeBank::new(TIMER_BANK, IRQ_ENTRY, vec![0; 33]).unwrap(),
+                GeneratedBankRunner::new(TIMER_BANK, timer_runner),
+            )
+            .unwrap();
+        let thread_id = 0x1A7;
+
+        // SAFETY: `bytes` remains live through the thread's final return.
+        unsafe {
+            boot_thread0_block_program(
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                program,
+                ExecutionKey::new(TIMER_BANK, IRQ_ENTRY),
+                timer_lookup,
+                timer_transfer_lookup,
+                InstructionBudget::new(8).unwrap(),
+                thread_id,
+                10,
+            );
+        }
+
+        assert!(crate::run_one_step());
+        assert_eq!(crate::host::sim_time(), 4);
+        assert!(crate::run_one_step());
+        assert_eq!(crate::host::sim_time(), 6);
+        {
+            let mem = Rdram::new(&mut bytes);
+            assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0020) as u32, IRQ_RESUME.get());
+            assert_ne!(
+                mem.load_w(0xFFFF_FFFF_8000_0024) as u32 & CpuInterruptLine::TIMER.cause_bit(),
+                0
+            );
+            assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0028) as u32, 2);
+        }
+
+        assert!(crate::run_one_step());
+        {
+            let mem = Rdram::new(&mut bytes);
+            assert_eq!(
+                mem.load_w(0xFFFF_FFFF_8000_002C) as u32 & CpuInterruptLine::TIMER.cause_bit(),
+                0
+            );
+            assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0030) as u32, 3);
+        }
+        assert!(crate::run_one_step());
+        assert!(crate::is_thread_dead(thread_id));
+    }
+
+    #[test]
     fn status_adapters_are_per_context_state() {
         let mut bytes = [0; 4];
         let mut mem = Rdram::new(&mut bytes);
@@ -297,5 +1491,256 @@ mod tests {
         ctx.set_r(2, 0);
         os_get_sr(&mut ctx, &mut mem);
         assert_eq!(ctx.r_u32(2), 0x3400_0001);
+    }
+
+    #[test]
+    fn typed_interrupt_masks_return_each_contexts_own_previous_value() {
+        let mut bytes = [0; 4];
+        let mut mem = Rdram::new(&mut bytes);
+        let mut first = RsContext::new();
+        let mut second = RsContext::new();
+
+        first.set_r(4, 0x0010_0401);
+        os_set_int_mask(&mut first, &mut mem);
+        assert_eq!(first.r_u32(2), 0);
+        second.set_r(4, 0x0008_0401);
+        os_set_int_mask(&mut second, &mut mem);
+        assert_eq!(second.r_u32(2), 0);
+        first.set_r(4, 0x0004_0401);
+        os_set_int_mask(&mut first, &mut mem);
+        assert_eq!(first.r_u32(2), 0x0010_0401);
+    }
+
+    #[test]
+    fn typed_raw_word_accesses_and_sp_shims_share_one_device_fabric_state() {
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        let mut bytes = [0; 4];
+        let mut mem = Rdram::new(&mut bytes);
+
+        mem.store_w(0xFFFF_FFFF_A408_0000, 0x0A8);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_A408_0000) as u32, 0x0A8);
+
+        let mut set = CContext::zeroed();
+        set.r4 = 1 << 10;
+        unsafe { crate::__osSpSetStatus_recomp(std::ptr::null_mut(), &mut set) };
+        assert_eq!(mem.load_w(0xFFFF_FFFF_A404_0010) as u32 & (1 << 7), 1 << 7);
+
+        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
+    }
+
+    #[test]
+    fn typed_raw_sp_dma_replaces_persistent_imem_on_guest_time() {
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        let mut bytes = vec![0u8; 0x1000];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut bytes);
+            for (index, byte) in [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80]
+                .into_iter()
+                .enumerate()
+            {
+                view.write_u8(
+                    fn64_runtime::RdramAddr::from_offset(0x100 + index as u32),
+                    byte,
+                );
+            }
+        }
+        with_host(|host| {
+            host.runtime_rdram = bytes.as_mut_ptr();
+            host.runtime_rdram_len = bytes.len();
+        });
+        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        {
+            let mut mem = Rdram::new(&mut bytes);
+            mem.store_w(0xFFFF_FFFF_A404_0000, 0x1000);
+            mem.store_w(0xFFFF_FFFF_A404_0004, 0x100);
+            mem.store_w(0xFFFF_FFFF_A404_0008, 7);
+            assert_ne!(
+                mem.load_w(0xFFFF_FFFF_A404_0010) as u32 & fn64_runtime::SP_STATUS_DMA_BUSY,
+                0
+            );
+        }
+
+        crate::advance_virtual_time(8);
+        {
+            let mem = Rdram::new(&mut bytes);
+            assert_ne!(
+                mem.load_w(0xFFFF_FFFF_A404_0010) as u32 & fn64_runtime::SP_STATUS_DMA_BUSY,
+                0
+            );
+        }
+        crate::advance_virtual_time(9);
+        {
+            let mem = Rdram::new(&mut bytes);
+            assert_eq!(mem.load_w(0xFFFF_FFFF_A404_0010) as u32 & 4, 0);
+            assert_eq!(mem.load_w(0xFFFF_FFFF_A400_1000) as u32, 0x1020_3040);
+            assert_eq!(mem.load_w(0xFFFF_FFFF_A400_1004) as u32, 0x5060_7080);
+        }
+        assert_eq!(
+            with_host(|host| host.device_fabric.snapshot().sp_imem_generation),
+            1
+        );
+        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
+    }
+
+    #[test]
+    fn typed_raw_pi_registers_drive_the_live_timed_device_fabric() {
+        let mut rom = vec![0u8; 0x100];
+        rom[0x20..0x24].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        crate::load_rom_with_fixed_pi_latency(rom, 5);
+        let mut bytes = vec![0u8; 0x1000];
+        with_host(|host| {
+            host.runtime_rdram = bytes.as_mut_ptr();
+            host.runtime_rdram_len = bytes.len();
+        });
+        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        {
+            let mut mem = Rdram::new(&mut bytes);
+            mem.store_w(0xFFFF_FFFF_A460_0000, 0x400);
+            mem.store_w(0xFFFF_FFFF_A460_0004, 0x20);
+            mem.store_w(0xFFFF_FFFF_A460_0008, 3);
+            assert_eq!(
+                mem.load_w(0xFFFF_FFFF_A460_0010) as u32,
+                fn64_runtime::PI_STATUS_DMA_BUSY
+            );
+            assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0400), 0);
+        }
+
+        crate::advance_virtual_time(4);
+        {
+            let mem = Rdram::new(&mut bytes);
+            assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0400), 0);
+        }
+        crate::advance_virtual_time(5);
+
+        let mem = Rdram::new(&mut bytes);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0400) as u32, 0x1234_5678);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_A460_0010), 0);
+        assert_ne!(
+            mem.load_w(0xFFFF_FFFF_A430_0008) as u32 & fn64_runtime::InterruptSource::Pi.bit(),
+            0
+        );
+        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
+    }
+
+    #[test]
+    fn typed_raw_rcp_acknowledgements_clear_the_shared_mi_sources() {
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        let sources = [
+            fn64_runtime::InterruptSource::Sp,
+            fn64_runtime::InterruptSource::Si,
+            fn64_runtime::InterruptSource::Ai,
+            fn64_runtime::InterruptSource::Vi,
+            fn64_runtime::InterruptSource::Dp,
+        ];
+        with_host(|host| {
+            let fabric = &mut host.device_fabric;
+            for source in sources {
+                fabric.raise_interrupt(source);
+            }
+        });
+
+        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        let mut bytes = [0; 4];
+        let mut mem = Rdram::new(&mut bytes);
+        mem.store_w(0xFFFF_FFFF_A404_0010, 1 << 3);
+        mem.store_w(0xFFFF_FFFF_A480_0018, 0);
+        mem.store_w(0xFFFF_FFFF_A450_000C, 0);
+        mem.store_w(0xFFFF_FFFF_A440_0010, 0);
+        mem.store_w(0xFFFF_FFFF_A430_0000, 1 << 11);
+
+        let pending = with_host(|host| host.device_fabric.snapshot().mi_pending);
+        assert_eq!(pending & 0x3F, 0);
+        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
+    }
+
+    #[test]
+    fn typed_raw_vi_registers_drive_half_line_timing_and_shared_mi() {
+        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        let mut bytes = [0; 4];
+        let mut mem = Rdram::new(&mut bytes);
+        mem.store_w(0xFFFF_FFFF_A440_0018, 525);
+        mem.store_w(0xFFFF_FFFF_A440_000C, 100);
+        crate::vi::arm_vi_retrace(1_000);
+
+        crate::advance_virtual_time(190);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_A440_0010), 98);
+        crate::advance_virtual_time(191);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_A440_0010), 100);
+        assert_ne!(
+            mem.load_w(0xFFFF_FFFF_A430_0008) as u32 & fn64_runtime::InterruptSource::Vi.bit(),
+            0
+        );
+
+        mem.store_w(0xFFFF_FFFF_A440_0010, 0xFFFF_FFFF);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_A440_0010), 100);
+        assert_eq!(
+            mem.load_w(0xFFFF_FFFF_A430_0008) as u32 & fn64_runtime::InterruptSource::Vi.bit(),
+            0
+        );
+        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
+    }
+
+    #[test]
+    fn typed_raw_ai_registers_schedule_the_live_guest_cycle_fifo() {
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        let mut bytes = [0; 4];
+        let mut mem = Rdram::new(&mut bytes);
+        mem.store_w(0xFFFF_FFFF_A450_0010, 151);
+        mem.store_w(0xFFFF_FFFF_A450_0000, 0x1000);
+        mem.store_w(0xFFFF_FFFF_A450_0004, 0x80);
+        assert_ne!(
+            mem.load_w(0xFFFF_FFFF_A450_000C) as u32 & fn64_runtime::AI_STATUS_BUSY,
+            0
+        );
+        let deadline = with_host(|host| host.device_fabric.next_deadline().unwrap().get());
+        crate::advance_virtual_time(deadline);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_A450_000C), 0);
+        assert_ne!(
+            with_host(|host| host.device_fabric.snapshot().mi_pending)
+                & fn64_runtime::InterruptSource::Ai.bit(),
+            0
+        );
+        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
+    }
+
+    #[test]
+    fn typed_raw_si_registers_run_separate_timed_pif_write_and_read_dmas() {
+        let mut bytes = vec![0u8; 0x200];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut bytes);
+            for (offset, byte) in [(0, 1), (1, 3), (2, 0xFF), (3, 0), (6, 0xFE)] {
+                view.write_u8(fn64_runtime::RdramAddr::from_offset(offset), byte);
+            }
+        }
+        with_host(|host| {
+            host.runtime_rdram = bytes.as_mut_ptr();
+            host.runtime_rdram_len = bytes.len();
+        });
+        let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
+        {
+            let mut mem = Rdram::new(&mut bytes);
+            mem.store_w(0xFFFF_FFFF_A480_0000, 0);
+            mem.store_w(0xFFFF_FFFF_A480_0010, 0);
+            assert_eq!(mem.load_w(0xFFFF_FFFF_A480_0018) & 1, 1);
+        }
+        crate::advance_virtual_time(1);
+        {
+            let mut mem = Rdram::new(&mut bytes);
+            assert_eq!(mem.load_w(0xFFFF_FFFF_A480_0018) as u32, 1 << 12);
+            mem.store_w(0xFFFF_FFFF_A480_0018, 0);
+            mem.store_w(0xFFFF_FFFF_A480_0000, 0);
+            mem.store_w(0xFFFF_FFFF_A480_0004, 0);
+        }
+        crate::advance_virtual_time(2);
+        let view = fn64_runtime::RdramView::from_storage(&bytes);
+        assert_eq!(
+            (3..6)
+                .map(|offset| view.read_u8(fn64_runtime::RdramAddr::from_offset(offset)))
+                .collect::<Vec<_>>(),
+            vec![0x05, 0, 0]
+        );
+        fn64_recomp_rs::set_mmio_hooks(previous.0, previous.1);
     }
 }

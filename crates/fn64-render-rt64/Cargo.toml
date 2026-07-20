@@ -15,6 +15,7 @@ rt64 = []
 [dependencies]
 fn64-runtime = { path = "../fn64-runtime" }
 fn64-render = { path = "../fn64-render" }
+sha2 = "0.10"
 
 [dev-dependencies]
 # Snapshot testing for render output. A render test captures a STRUCTURAL
