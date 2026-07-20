@@ -72,6 +72,13 @@
 //!                             affine answer-selection rule picks each
 //!                             bank's answer functions. wrong==0 across
 //!                             ALL graded banks is required
+//!   FN64_DISCOVER_TRACE       optional dynamic-trace JSONL (schema-bound
+//!                             to this ROM's normalized sha256). Observed
+//!                             indirect-transfer targets fold into the
+//!                             fact database and, in the code-segment
+//!                             grade, become excused owner roots — the
+//!                             dynamic evidence for handler dispatch the
+//!                             static lanes leave open
 //!   FN64_DISCOVER_JUMP_TABLES optional cited jump-table claims for open
 //!                             `jr` sites the bounded resolver cannot prove
 //!                             (load-derived index): site pc + table VA +
@@ -236,7 +243,7 @@ fn main() {
         load_toml_env::<RequestDmaFile>("FN64_DISCOVER_REQUEST_DMA")
             .map(|file| file.request_dma)
             .unwrap_or_default();
-    let (rom, db, request_report) =
+    let (rom, mut db, request_report) =
         run_discovery_with_tables_and_request_dma(&rom_bytes, None, &tables, &request_dma)
             .expect("baseline discovery");
     if !request_dma.is_empty() {
@@ -246,6 +253,37 @@ fn main() {
             request_report.open.len()
         );
     }
+
+    // Optional dynamic trace (FN64_DISCOVER_TRACE): fold observed
+    // indirect transfers into the fact database as ObservedIndirectTarget
+    // existence evidence. An observed jr/jalr target is a machine-checked
+    // callable entry — the target demonstrably executed from that site —
+    // so the code-segment grade later excuses these targets as owner
+    // roots (same evidentiary class as a jal target). This is the dynamic
+    // evidence for load-derived/input-dependent dispatch (the MM
+    // audio/camera handler tables) the static lanes leave open.
+    if let Ok(trace_path) = std::env::var("FN64_DISCOVER_TRACE") {
+        let file = std::fs::File::open(&trace_path)
+            .unwrap_or_else(|error| panic!("opening trace {trace_path}: {error}"));
+        let expected = fn64_discover::trace::NormalizedRomDigest::try_from(rom.sha256.clone())
+            .expect("normalized ROM sha256 is a valid digest");
+        let ingest = fn64_discover::trace::ingest_jsonl(std::io::BufReader::new(file), &expected)
+            .unwrap_or_else(|error| panic!("ingesting trace {trace_path}: {error}"));
+        let report = fn64_discover::trace::fold_indirect_targets_into_fact_db(
+            &mut db,
+            &ingest.header.trace_id,
+            &ingest.facts,
+            |_bank: &str, _va: u32| None,
+        );
+        println!(
+            "trace {:?}: {} observed indirect edges folded ({} new, {} unknown-bank skipped)",
+            ingest.header.trace_id,
+            report.facts_added,
+            report.new_edges.len(),
+            report.unknown_bank_skipped,
+        );
+    }
+
     let boot = db
         .facts()
         .iter()
@@ -1172,13 +1210,26 @@ fn main() {
         // No reloc section here, so the roots come from elsewhere: typed
         // overlay references INTO the bank (the overlays' reloc tables
         // name the code-segment API they call), a blind jal sweep across
-        // every materialized bank, and a pointer sweep of the bank's own
-        // data region (actor tables, scene-command handlers, gamestate
-        // tables — absolute VAs in a statically-linked segment).
+        // every materialized bank, a pointer sweep of the bank's own data
+        // region (actor tables, scene-command handlers, gamestate tables),
+        // and — when a trace was folded — observed indirect-transfer
+        // targets (the handler-dispatch entries no static signal reaches).
         typed_jal_all.sort_unstable();
         typed_jal_all.dedup();
         typed_ptr_all.sort_unstable();
         typed_ptr_all.dedup();
+        // Observed indirect targets from any folded trace: each is a
+        // machine-checked callable entry (it ran from an observed site),
+        // so it joins the excused root set — same evidentiary class as a
+        // jal target, never a guess.
+        let observed_targets: Vec<fn64_discover::facts::BankAddr> = db
+            .facts()
+            .iter()
+            .filter_map(|fact| match fact {
+                Fact::ObservedIndirectTarget { target, .. } => Some(target.clone()),
+                _ => None,
+            })
+            .collect();
         let mut code_totals = (0usize, 0usize, 0usize, 0usize, 0usize);
         let mut code_wrong: Vec<String> = Vec::new();
         for (bank, bank_va, image) in &non_overlay_banks {
@@ -1242,6 +1293,19 @@ fn main() {
                         bank_roots.push(target);
                         bank_excused.push(target);
                     }
+                }
+            }
+            // Observed indirect-transfer targets into this bank: a jr/jalr
+            // demonstrably reached them at runtime, so they are excused
+            // callable entries — this is the trace lane recovering the
+            // handler-dispatch functions no static signal can reach.
+            for observed in &observed_targets {
+                if observed.bank == *bank
+                    && window(observed.pc)
+                    && !bank_roots.contains(&observed.pc)
+                {
+                    bank_roots.push(observed.pc);
+                    bank_excused.push(observed.pc);
                 }
             }
             // Typed overlay pointers into this bank, plus this bank's own
@@ -1309,6 +1373,27 @@ fn main() {
             code_totals.2 += bank_report.matched_coarse + bank_report.interior_entries;
             code_totals.3 += bank_report.open;
             code_totals.4 += bank_report.wrong;
+            // FN64_DISCOVER_PRINT_OPEN=1: list open code-segment functions
+            // with their VAs — the exact targets a dynamic trace would need
+            // to observe to recover them (see FN64_DISCOVER_TRACE).
+            if std::env::var("FN64_DISCOVER_PRINT_OPEN").is_ok() {
+                let open: Vec<String> = bank_report
+                    .per_function
+                    .iter()
+                    .filter(|(_, grade)| {
+                        matches!(grade, fn64_discover::grade_oot_functions::FunctionGrade::Open)
+                    })
+                    .map(|(name, _)| {
+                        let va = bank_answer
+                            .iter()
+                            .find(|answer| answer.name == *name)
+                            .map(|answer| answer.va_start)
+                            .unwrap_or(0);
+                        format!("{name}@0x{va:08x}")
+                    })
+                    .collect();
+                println!("code-seg open [{bank}] ({}): {}", open.len(), open.join(", "));
+            }
             if bank_report.wrong != 0 {
                 for (function, grade) in &bank_report.per_function {
                     if let fn64_discover::grade_oot_functions::FunctionGrade::WrongSplit {
