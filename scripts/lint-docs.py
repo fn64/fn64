@@ -47,6 +47,18 @@ def docs() -> list[Path]:
     return [ROOT / p for p in out.stdout.split()]
 
 
+def superseded(text: str) -> bool:
+    """True if a doc marks ITSELF superseded with a top-of-file banner.
+
+    A superseded design record documents the paths and env vars it PROPOSED
+    or REJECTED, which by definition need not exist in code -- the drift
+    rules ("a named file/var that isn't real is a silent no-op instruction")
+    are about live, actionable docs, not history. The opt-out is a
+    `> **SUPERSEDED` banner in the first few lines -- the doc's OWN status,
+    not a doc that merely mentions the word elsewhere."""
+    return any("**SUPERSEDED" in line for line in text.splitlines()[:5])
+
+
 # --- 1. every repo-relative path a doc names must exist -----------------------
 # Both shapes occur: `docs/X.md` in backticks (the common one) and bare
 # docs/X.md. The leading class must therefore ALLOW a backtick and only reject
@@ -60,7 +72,10 @@ TRAIL = ".,;:)]}'\""
 def check_refs() -> None:
     global checked
     for doc in docs():
-        for lineno, line in enumerate(doc.read_text().splitlines(), 1):
+        text = doc.read_text()
+        if superseded(text):
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
             for raw in REF.findall(line):
                 ref = raw.rstrip(TRAIL)
                 # Illustrative globs/wildcards aren't claims about one file.
@@ -99,7 +114,10 @@ def check_env_vars() -> None:
     ).stdout
     live = set(src.split())
     for doc in docs():
-        for lineno, line in enumerate(doc.read_text().splitlines(), 1):
+        text = doc.read_text()
+        if superseded(text):
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
             for var in ENV.findall(line):
                 # RECOMP_FUNC is a generated-C symbol prefix, not an env var.
                 if var == "RECOMP_FUNC":
