@@ -126,8 +126,12 @@ class GdbClient:
     # --- high-level ops ---
 
     def handshake(self):
-        # ares sends nothing until we speak; '?' asks why we halted and
-        # returns a faked T05 so the client does not spin.
+        # ares sends nothing until we speak, and RESETS the connection if
+        # the first bytes it sees are a packet with no leading ack. Send a
+        # bare '+' first (observed against ares v148: '+' then '$?#3f'
+        # yields '+$T05#b9'; a bare '$?' without the leading '+' is reset).
+        # ares ignores qSupported, so go straight to '?'.
+        self._send_raw(b"+")
         self.send_packet("?")
         return self.read_packet()
 
@@ -221,15 +225,33 @@ def bank_addr(bank: str, addr: int) -> dict:
 def run(args):
     rom = open(args.rom, "rb").read()
     digest = normalized_sha256(rom)
-    sites = json.load(open(args.sites))
+    # --sites is either a JSON list of {site, src_reg, via_call} (jr/jalr
+    # mode) or, with --entries, a comma/space list of VAs (or @file) to
+    # breakpoint as function entries directly.
+    if getattr(args, "entries", False):
+        raw = args.sites
+        if raw.startswith("@"):
+            raw = " ".join(open(raw[1:]).read().split())
+        sites = [{"site": tok} for tok in raw.replace(",", " ").split() if tok]
+    else:
+        sites = json.load(open(args.sites))
     if not sites:
         raise SystemExit("no sites to watch")
 
-    # site VA -> (src_reg, via_call)
+    # Two capture models:
+    #  - jr/jalr sites (default): breakpoint the transfer instruction; the
+    #    target is the value of its source register at the branch.
+    #  - entry mode (--entries): breakpoint each candidate FUNCTION ENTRY
+    #    directly. When execution reaches it, that PROVES it is real code
+    #    that ran, so the recovered target IS the breakpoint PC (site = the
+    #    return address $ra, provenance only). The gate only consumes the
+    #    target, so entry mode is the direct way to recover open handlers
+    #    without knowing their (open, unknown) dispatch sites.
+    entry_mode = getattr(args, "entries", False)
     by_pc = {}
     for s in sites:
         pc = int(s["site"], 16) if isinstance(s["site"], str) else s["site"]
-        by_pc[pc & 0xFFFFFFFF] = (int(s["src_reg"]), bool(s.get("via_call", False)))
+        by_pc[pc & 0xFFFFFFFF] = (int(s.get("src_reg", 31)), bool(s.get("via_call", False)))
 
     gdb = GdbClient(args.host, args.port)
     out = open(args.out, "w")
@@ -272,17 +294,25 @@ def run(args):
             hit = by_pc.get(pc)
             if hit is not None:
                 src_reg, via_call = hit
-                target = gdb.read_reg(src_reg) & 0xFFFFFFFF
-                key = (pc, target)
+                if entry_mode:
+                    # The breakpoint IS a function entry that just executed:
+                    # the recovered target is this PC; site is its caller
+                    # ($ra), provenance only.
+                    target = pc
+                    site = gdb.read_reg(31) & 0xFFFFFFFF  # $ra
+                else:
+                    site = pc
+                    target = gdb.read_reg(src_reg) & 0xFFFFFFFF
+                key = (site, target)
                 if key not in edges:
                     edges.add(key)
                     emit({
                         "event": "indirect_transfer", "sequence": seq,
-                        "kind": "call" if via_call else "jump",
-                        "site": bank_addr(args.bank, pc),
+                        "kind": "call" if (entry_mode or via_call) else "jump",
+                        "site": bank_addr(args.bank, site),
                         "target": bank_addr(args.bank, target),
                     })
-                    print(f"edge 0x{pc:08x} -> 0x{target:08x} ({len(edges)} unique)", file=sys.stderr)
+                    print(f"edge 0x{site:08x} -> 0x{target:08x} ({len(edges)} unique)", file=sys.stderr)
             gdb.cont()  # resume until the next break
         # crude wall-clock budget: each poll is <= args.poll seconds
         args.duration -= args.poll
@@ -318,7 +348,12 @@ def main():
 
     cap = sub.add_parser("capture", help="drive ares over GDB and emit a trace")
     cap.add_argument("--rom", required=True)
-    cap.add_argument("--sites", required=True, help="JSON list of {site, src_reg, via_call}")
+    cap.add_argument("--sites", required=True,
+                     help="JSON {site,src_reg,via_call} list; or with --entries, "
+                          "a comma/space VA list (or @file) to breakpoint as entries")
+    cap.add_argument("--entries", action="store_true",
+                     help="breakpoint each VA as a function ENTRY; recovered "
+                          "target = the entry PC that executed (site = caller $ra)")
     cap.add_argument("--out", required=True)
     cap.add_argument("--trace-id", default="ares-1")
     cap.add_argument("--bank", default="request_dma_0", help="fn64 bank name for site/target")
