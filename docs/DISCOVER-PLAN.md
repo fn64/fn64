@@ -291,6 +291,25 @@ of U4 (`UNIVERSAL-RUNTIME-PLAN.md`) landed. The probe still fails loudly if
 that access stops faulting typed; full address-error/TLB vectoring remains
 open U4 scope.
 
+The public `emit_block_program_source` seam converts a reverified pack into
+deterministic Rust implementing the boot-harness block contract. Its typed
+configuration requires an admitted bank-qualified entry and instruction
+budget, every runner is bound to the host-supplied source artifact identity,
+and bankless overlapping-VA lookup returns typed ambiguity instead of
+guessing; same-bank transfer resolution retains priority. A synthetic
+two-bank test compiles and executes the source while proving sparse-hole
+faults and runner identity evidence.
+
+The `fn64-discover emit-block-program` command exposes that seam without
+making generated game output repository content. It requires the ROM, strict
+pack JSON, exact-width uppercase bank/PC values, canonical decimal budget, and
+an explicit output path. The ROM-derived source is staged and synced beside
+the destination, published without clobbering an existing file, and identified
+by a stdout SHA-256/byte receipt. Synthetic CLI integration tests cover
+deterministic output, retained overlay ambiguity, wrong ROM/schema/entry,
+unknown fields, numeric rejection, output failures, and the unchanged legacy
+discovery invocation.
+
 This orders the next work. Proof-carrying resident executable regions are
 recovered (above): reached-code closure now feeds typed executable facts and
 exact owners are admitted and extent-graded, so the frontier has moved from

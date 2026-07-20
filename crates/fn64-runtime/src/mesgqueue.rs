@@ -56,6 +56,55 @@ impl BlockedList {
     fn is_empty(&self) -> bool {
         self.waiters.is_empty()
     }
+
+    fn remove(&mut self, id: CoroutineId) -> usize {
+        let before = self.waiters.len();
+        self.waiters.retain(|waiter| *waiter != id);
+        before - self.waiters.len()
+    }
+}
+
+/// Which end of the queue a blocked sender must use once a receiver frees a
+/// slot. This is part of the suspended operation, not a property the wake site
+/// may reconstruct: `osSendMesg` appends at the tail while `osJamMesg` inserts
+/// at the head.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SendPlacement {
+    Tail,
+    Head,
+}
+
+/// One blocked sender in the exact FIFO order in which a freed queue slot
+/// will service it. The placement is part of the suspended operation:
+/// omitting it would make `osJamMesg` and `osSendMesg` evidence-identical
+/// even though their next successful delivery changes the queue differently.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BlockedSenderEvidenceSnapshot {
+    pub id: CoroutineId,
+    pub msg: Mesg,
+    pub placement: SendPlacement,
+}
+
+/// Pointer-free, future-affecting view of one `OSMesgQueue`.
+///
+/// `messages` is logical receive order rather than the unused contents of the
+/// backing ring. `first` remains explicit because guest code observes it in
+/// the mirrored `OSMesgQueue` structure even when two rings would deliver the
+/// same logical messages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MesgQueueEvidenceSnapshot {
+    pub capacity: u64,
+    pub first: u64,
+    pub messages: Vec<Mesg>,
+    pub blocked_receivers: Vec<CoroutineId>,
+    pub blocked_senders: Vec<BlockedSenderEvidenceSnapshot>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct BlockedSend {
+    id: CoroutineId,
+    msg: Mesg,
+    placement: SendPlacement,
 }
 
 /// Same FIFO shape as `BlockedList`, but for blocked SENDERS: a blocked
@@ -74,16 +123,16 @@ impl BlockedList {
 /// index.
 #[derive(Default)]
 struct BlockedSenderList {
-    waiters: Vec<(CoroutineId, Mesg)>,
+    waiters: Vec<BlockedSend>,
 }
 
 impl BlockedSenderList {
-    fn push(&mut self, id: CoroutineId, msg: Mesg) {
-        self.waiters.push((id, msg));
+    fn push(&mut self, id: CoroutineId, msg: Mesg, placement: SendPlacement) {
+        self.waiters.push(BlockedSend { id, msg, placement });
     }
 
     /// FIFO pop, matching libultra's documented per-queue delivery order.
-    fn pop(&mut self) -> Option<(CoroutineId, Mesg)> {
+    fn pop(&mut self) -> Option<BlockedSend> {
         if self.waiters.is_empty() {
             None
         } else {
@@ -94,6 +143,18 @@ impl BlockedSenderList {
     fn is_empty(&self) -> bool {
         self.waiters.is_empty()
     }
+
+    fn remove(&mut self, id: CoroutineId) -> usize {
+        let before = self.waiters.len();
+        self.waiters.retain(|waiter| waiter.id != id);
+        before - self.waiters.len()
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemovedWaiterRoles {
+    pub receivers: usize,
+    pub senders: usize,
 }
 
 /// Outcome of `MesgQueue::try_send`. `WouldBlock` carries no coroutine
@@ -179,6 +240,37 @@ impl MesgQueue {
         self.first
     }
 
+    /// Produce a read-only evidence projection without exposing the backing
+    /// allocation or stale ring slots. Empty zero-capacity queues are handled
+    /// explicitly so the logical-order projection never takes modulo zero.
+    pub fn evidence_snapshot(&self) -> MesgQueueEvidenceSnapshot {
+        let messages = if self.buffer.is_empty() {
+            Vec::new()
+        } else {
+            (0..self.valid_count)
+                .map(|logical_index| self.buffer[(self.first + logical_index) % self.buffer.len()])
+                .collect()
+        };
+        MesgQueueEvidenceSnapshot {
+            capacity: u64::try_from(self.buffer.len())
+                .expect("OSMesgQueue capacity does not fit evidence width"),
+            first: u64::try_from(self.first)
+                .expect("OSMesgQueue first index does not fit evidence width"),
+            messages,
+            blocked_receivers: self.blocked_on_recv.waiters.clone(),
+            blocked_senders: self
+                .blocked_on_send
+                .waiters
+                .iter()
+                .map(|blocked| BlockedSenderEvidenceSnapshot {
+                    id: blocked.id,
+                    msg: blocked.msg,
+                    placement: blocked.placement,
+                })
+                .collect(),
+        }
+    }
+
     fn is_full(&self) -> bool {
         self.valid_count == self.buffer.len()
     }
@@ -239,12 +331,23 @@ impl MesgQueue {
     /// executor -- see module doc: registration and yield are sequential
     /// steps on the one executor thread, never two threads racing this
     /// list.
-    pub fn block_sender(&mut self, id: CoroutineId, msg: Mesg) {
-        self.blocked_on_send.push(id, msg);
+    pub fn block_sender(&mut self, id: CoroutineId, msg: Mesg, placement: SendPlacement) {
+        self.blocked_on_send.push(id, msg, placement);
     }
 
     pub fn block_receiver(&mut self, id: CoroutineId) {
         self.blocked_on_recv.push(id);
+    }
+
+    /// Remove `id` from every waiter role owned by this queue. Thread
+    /// lifecycle code calls this for every registered queue before marking a
+    /// thread stopped or dead, so a later queue mutation cannot rediscover and
+    /// revive an otherwise-unscheduled coroutine.
+    pub fn remove_waiter(&mut self, id: CoroutineId) -> RemovedWaiterRoles {
+        RemovedWaiterRoles {
+            receivers: self.blocked_on_recv.remove(id),
+            senders: self.blocked_on_send.remove(id),
+        }
     }
 
     /// Called by the executor after a `try_recv` succeeds (freeing a slot),
@@ -259,14 +362,23 @@ impl MesgQueue {
     /// the caller only invokes this after confirming
     /// `has_blocked_senders()` following a successful `try_recv`).
     pub fn wake_one_sender(&mut self) -> Option<CoroutineId> {
-        let (id, msg) = self.blocked_on_send.pop()?;
+        let blocked = self.blocked_on_send.pop()?;
+        // Interleaving closed here: a blocking osJamMesg suspends while the
+        // queue is full, another thread receives one item, then this wake path
+        // commits the suspended message. Retaining `placement` in the waiter
+        // prevents that handoff from silently changing a head insert into the
+        // ordinary tail-send operation.
+        let delivered = match blocked.placement {
+            SendPlacement::Tail => self.try_send(blocked.msg),
+            SendPlacement::Head => self.try_jam(blocked.msg),
+        };
         assert_eq!(
-            self.try_send(msg),
+            delivered,
             SendResult::Delivered,
             "wake_one_sender: freed slot rejected the blocked sender's message -- queue \
              bookkeeping is inconsistent"
         );
-        Some(id)
+        Some(blocked.id)
     }
 
     pub fn wake_one_receiver(&mut self) -> Option<CoroutineId> {
@@ -312,7 +424,7 @@ mod tests {
         let mut q = MesgQueue::new(1);
         assert_eq!(q.try_send(1), SendResult::Delivered);
         assert_eq!(q.try_send(2), SendResult::WouldBlock);
-        q.block_sender(42, 2);
+        q.block_sender(42, 2, SendPlacement::Tail);
         assert!(q.has_blocked_senders());
 
         // Executor's job: a recv frees a slot, then wake a blocked sender.
@@ -351,7 +463,7 @@ mod tests {
         let mut q = MesgQueue::new(1);
         assert_eq!(q.try_send(0xAAAA), SendResult::Delivered);
         assert_eq!(q.try_send(0xBBBB), SendResult::WouldBlock);
-        q.block_sender(7, 0xBBBB);
+        q.block_sender(7, 0xBBBB, SendPlacement::Tail);
 
         // First recv drains the original message and wakes the blocked
         // sender, which must land ITS message (0xBBBB) into the queue.
@@ -362,5 +474,79 @@ mod tests {
         // message, not 0 (the old, silently-dropped-message bug) or any
         // other stale value.
         assert_eq!(q.try_recv(), RecvResult::Delivered(0xBBBB));
+    }
+
+    /// Exact interleaving regression: a blocking jam observes a full queue,
+    /// suspends, and another thread receives one item before the sender wakes.
+    /// The delayed commit must still insert at the head; forgetting the typed
+    /// placement makes the pre-existing tail message arrive first.
+    #[test]
+    fn blocked_jam_preserves_head_placement_after_receiver_frees_space() {
+        let mut q = MesgQueue::new(2);
+        assert_eq!(q.try_send(0xAAAA), SendResult::Delivered);
+        assert_eq!(q.try_send(0xBBBB), SendResult::Delivered);
+        assert_eq!(q.try_jam(0xCCCC), SendResult::WouldBlock);
+        q.block_sender(7, 0xCCCC, SendPlacement::Head);
+
+        assert_eq!(q.try_recv(), RecvResult::Delivered(0xAAAA));
+        assert_eq!(q.wake_one_sender(), Some(7));
+        assert_eq!(q.try_recv(), RecvResult::Delivered(0xCCCC));
+        assert_eq!(q.try_recv(), RecvResult::Delivered(0xBBBB));
+    }
+
+    #[test]
+    fn remove_waiter_clears_every_role_and_every_duplicate() {
+        let mut q = MesgQueue::new(1);
+        q.block_receiver(9);
+        q.block_receiver(9);
+        q.block_sender(9, 1, SendPlacement::Tail);
+        q.block_sender(9, 2, SendPlacement::Head);
+
+        assert_eq!(
+            q.remove_waiter(9),
+            RemovedWaiterRoles {
+                receivers: 2,
+                senders: 2,
+            }
+        );
+        assert!(!q.has_blocked_receivers());
+        assert!(!q.has_blocked_senders());
+        assert_eq!(q.wake_one_receiver(), None);
+        assert_eq!(q.wake_one_sender(), None);
+    }
+
+    #[test]
+    fn evidence_snapshot_uses_logical_ring_and_exact_waiter_fifo() {
+        let mut q = MesgQueue::new(3);
+        assert_eq!(q.try_send(0x11), SendResult::Delivered);
+        assert_eq!(q.try_send(0x22), SendResult::Delivered);
+        assert_eq!(q.try_recv(), RecvResult::Delivered(0x11));
+        assert_eq!(q.try_send(0x33), SendResult::Delivered);
+        q.block_receiver(7);
+        q.block_receiver(8);
+        q.block_sender(9, 0x44, SendPlacement::Head);
+        q.block_sender(10, 0x55, SendPlacement::Tail);
+
+        assert_eq!(
+            q.evidence_snapshot(),
+            MesgQueueEvidenceSnapshot {
+                capacity: 3,
+                first: 1,
+                messages: vec![0x22, 0x33],
+                blocked_receivers: vec![7, 8],
+                blocked_senders: vec![
+                    BlockedSenderEvidenceSnapshot {
+                        id: 9,
+                        msg: 0x44,
+                        placement: SendPlacement::Head,
+                    },
+                    BlockedSenderEvidenceSnapshot {
+                        id: 10,
+                        msg: 0x55,
+                        placement: SendPlacement::Tail,
+                    },
+                ],
+            }
+        );
     }
 }

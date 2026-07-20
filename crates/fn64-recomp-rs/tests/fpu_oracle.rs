@@ -78,6 +78,10 @@ fn truncf_oracle(f12: f32) -> u32 {
 // --- The emitter's output, pasted VERBATIM (guarded by the golden test). ---
 #[allow(unused, clippy::all)]
 pub fn truncf_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(
+        0x800CD930,
+        "truncf_recomp",
+    ));
     let mut pc: u32 = 0x800CD930;
     'run: loop {
         match pc {
@@ -240,6 +244,10 @@ fn run_synth(a0: i32, in_val: f32) -> SynthOut {
 // --- Synthetic emitter output, pasted VERBATIM (guarded by the golden test). ---
 #[allow(unused, clippy::all)]
 pub fn synth_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(
+        0x80100000,
+        "synth_recomp",
+    ));
     let mut pc: u32 = 0x80100000;
     'run: loop {
         match pc {
@@ -501,6 +509,39 @@ fn decode_cop1_moves() {
     assert_eq!(decode(0x4442F800), Instruction::Cfc1 { rt: 2, fs: 31 });
     // ctc1 $a0, $f31 = 0x44C4F800
     assert_eq!(decode(0x44C4F800), Instruction::Ctc1 { rt: 4, fs: 31 });
+}
+
+#[test]
+fn decoded_cop1_families_share_the_cu1_requirement() {
+    let cop1_words = [
+        0x4402_2000, // MFC1
+        0x4484_2000, // MTC1
+        0x4422_2000, // DMFC1
+        0x44A4_2000, // DMTC1
+        0x4442_F800, // CFC1
+        0x44C4_F800, // CTC1
+        0xC4A6_0000, // LWC1
+        0xE4C0_0000, // SWC1
+        0xD7A4_0008, // LDC1
+        0xF7A4_0008, // SDC1
+        0x4604_1000, // ADD.S
+        0x4624_1000, // ADD.D
+        0x4680_6020, // CVT.S.W
+        0x46A0_1021, // CVT.D.L
+        0x4602_0032, // C.EQ.S
+        0x4622_003C, // C.LT.D
+        0x4500_0001, // BC1F
+        0x4503_0001, // BC1TL
+    ];
+    for word in cop1_words {
+        let instruction = decode(word);
+        assert!(
+            instruction.requires_cop1(),
+            "decoded COP1 instruction omitted CU1 guard: {instruction:?}"
+        );
+    }
+    assert!(!decode(0x8C82_0000).requires_cop1()); // LW
+    assert!(!decode(0x4002_6000).requires_cop1()); // MFC0
 }
 
 #[test]

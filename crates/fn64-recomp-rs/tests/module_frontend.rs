@@ -30,9 +30,20 @@
 //!    `resolve_jal` Match-vs-Ambiguous decision.
 
 use fn64_recomp_rs::{
-    call_host_or_recompiled, emit_module, resolve_host_function, set_host_lookup, ModuleFunc,
-    Rdram, RecompContext, RecompFunc, SymbolTable,
+    call_host_or_recompiled, emit_module, resolve_host_function, set_function_entry_observer,
+    set_host_lookup, ModuleFunc, Rdram, RecompContext, RecompFunc, SymbolTable,
+    TranslatedFunctionIdentity,
 };
+
+thread_local! {
+    static FUNCTION_ENTRIES: std::cell::RefCell<Vec<TranslatedFunctionIdentity>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+fn observe_function_entry(identity: TranslatedFunctionIdentity) {
+    FUNCTION_ENTRIES.with(|entries| entries.borrow_mut().push(identity));
+}
 
 // --- The synthetic three-function "program" (real MIPS III encodings). ---
 //
@@ -89,6 +100,7 @@ fn synthetic_module() -> String {
 
 #[allow(unused_variables, unused_mut, unused_labels, clippy::all)]
 pub fn callee(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(TranslatedFunctionIdentity::new(0x80001000, "callee"));
     let mut pc: u32 = 0x80001000;
     'run: loop {
         match pc {
@@ -107,6 +119,7 @@ pub fn callee(ctx: &mut RecompContext, mem: &mut Rdram) {
 
 #[allow(unused_variables, unused_mut, unused_labels, clippy::all)]
 pub fn caller(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(TranslatedFunctionIdentity::new(0x80002000, "caller"));
     let mut pc: u32 = 0x80002000;
     'run: loop {
         match pc {
@@ -132,6 +145,10 @@ pub fn caller(ctx: &mut RecompContext, mem: &mut Rdram) {
 
 #[allow(unused_variables, unused_mut, unused_labels, clippy::all)]
 pub fn tail_caller(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(TranslatedFunctionIdentity::new(
+        0x80003000,
+        "tail_caller",
+    ));
     let mut pc: u32 = 0x80003000;
     'run: loop {
         match pc {
@@ -208,6 +225,41 @@ fn crosscall_executes_to_expected_state() {
         0x8000_2008,
         "JAL must link $ra to post-delay-slot pc"
     );
+}
+
+#[test]
+fn entry_observer_covers_guest_bodies_and_excludes_resolution_attempts() {
+    FUNCTION_ENTRIES.with(|entries| entries.borrow_mut().clear());
+    let previous_observer = set_function_entry_observer(Some(observe_function_entry));
+
+    let mut mem_buf = vec![0u8; 64];
+    let mut mem = Rdram::new(&mut mem_buf);
+    let mut ctx = RecompContext::new();
+    caller(&mut ctx, &mut mem);
+    tail_caller(&mut ctx, &mut mem);
+    lookup(CALLEE_VRAM)(&mut ctx, &mut mem);
+
+    let previous_lookup = set_host_lookup(Some(host_resolver));
+    caller(&mut ctx, &mut mem);
+    lookup(CALLEE_VRAM)(&mut ctx, &mut mem);
+    set_host_lookup(previous_lookup);
+    let missing = std::panic::catch_unwind(|| lookup(0x8000_9000));
+
+    set_function_entry_observer(previous_observer);
+    assert!(missing.is_err());
+    FUNCTION_ENTRIES.with(|entries| {
+        assert_eq!(
+            entries.borrow().as_slice(),
+            [
+                TranslatedFunctionIdentity::new(CALLER_VRAM, "caller"),
+                TranslatedFunctionIdentity::new(CALLEE_VRAM, "callee"),
+                TranslatedFunctionIdentity::new(TAIL_VRAM, "tail_caller"),
+                TranslatedFunctionIdentity::new(CALLEE_VRAM, "callee"),
+                TranslatedFunctionIdentity::new(CALLEE_VRAM, "callee"),
+                TranslatedFunctionIdentity::new(CALLER_VRAM, "caller"),
+            ]
+        );
+    });
 }
 
 /// The inter-function `J` (tail call) path: `tail_caller` tail-calls `callee`,

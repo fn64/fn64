@@ -70,7 +70,9 @@ fn main() {
         )
     });
     println!("[wm2000-boot] ROM size: {} bytes", rom_bytes.len());
-    fn64_abi::load_rom(rom_bytes);
+    let mut rdram = fn64_boot_harness::new_rdram(fn64_boot_harness::TvType::Ntsc);
+    fn64_boot_harness::seed_ipl3_image(&mut rdram, &rom_bytes);
+    fn64_abi::load_rom(rom_bytes.clone());
 
     let registration = fn64_boot_harness::register_linked_sections();
     println!(
@@ -102,14 +104,50 @@ fn main() {
             println!("[wm2000-boot] marked section {section_key} (index {idx}) loaded");
         }
     }
+    let resident_sections: Vec<_> = registration
+        .sections()
+        .iter()
+        .take(2)
+        .map(|section| (section.rom_addr, section.ram_addr, section.size))
+        .collect();
+    fn64_boot_harness::seed_resident_sections(&mut rdram, &rom_bytes, &resident_sections);
 
     // Real plumbing, stand-in body (see stand_in_audio_ucode's doc comment).
     unsafe { fn64_abi::set_audio_ucode_fn(stand_in_audio_ucode) };
 
-    // VI retrace: arm a host-chosen approximation (fn64_runtime::vi's doc:
-    // not a hardware-accurate NTSC/PAL constant). 1000 virtual-time units
-    // per field is an arbitrary but documented choice for this harness.
-    fn64_abi::arm_vi_retrace(1000);
+    // NWXE's osCartRomInit (func_80022540) returns its OSPiHandle BSS at
+    // D_800839A0 (`addiu $v0, $s0, %lo(D_800839A0)`, disasm/asm/1050.s
+    // vram 0x80022578); the host shim hands guest code that same address.
+    fn64_abi::set_cart_rom_handle_vram(0x8008_39A0);
+
+    // Save-backing store: NWXE's boot streams its overlay data, then
+    // initializes its SRAM save region with FromRdram PI writes (observed:
+    // repeating `FromRdram cart=0x0 len=0x20` retry loop when no storage is
+    // registered -- the game verifies the write and retries forever).
+    fn64_abi::set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+        fn64_runtime::SaveType::SramBanked,
+    )));
+
+    // Main's VI pump now delivers real presentations; without a registered
+    // backend the first retrace trips present_render_backend's loud trap.
+    // The software ReferenceBackend keeps this harness headless.
+    // ponytail: no RT64/env switch like oot-boot until a wm2000 frame exists.
+    {
+        use fn64_render::RenderBackend as _;
+        let mut backend = fn64_render_rt64::ReferenceBackend::new()
+            .with_f3dex2()
+            .with_clear_color([0, 0, 0, 255])
+            .with_auto_dump("/tmp", "fn64-wm2000-render", 240);
+        backend
+            .create(&fn64_render::RenderConfig::new(320, 240))
+            .expect("ReferenceBackend create must be infallible for 320x240");
+        fn64_abi::set_render_backend(Box::new(backend), rdram.len());
+    }
+
+    // Typed IPL video standard is the shared VI/AI clock authority. The first
+    // field uses nominal NTSC timing; the latched OSViMode H/V registers then
+    // refine it from the public VI clock.
+    fn64_abi::configure_tv_type(fn64_boot_harness::TvType::Ntsc);
 
     // Arm crash-safe incremental trace flushing BEFORE booting thread 0 --
     // a SIGSEGV mid-boot (as rung 3 hit) must not lose the whole session's
@@ -136,7 +174,6 @@ fn main() {
     // buffer's end (`docs/BOOT-NOTES-WM2000.md`'s LLDB-confirmed
     // `EXC_BAD_ACCESS`). See `fn64_runtime::mmio`'s module doc for the full
     // story.
-    let mut rdram = fn64_boot_harness::new_rdram(fn64_boot_harness::TvType::Ntsc);
     let rdram_ptr = rdram.as_mut_ptr();
 
     // Prime the MMIO backing bytes before the guest ever runs, so even a
@@ -147,20 +184,20 @@ fn main() {
 
     println!("[wm2000-boot] booting thread 0 (recomp_entrypoint)...");
     unsafe {
-        fn64_abi::boot_thread0(rdram_ptr, fn64_boot_harness::c_recomp_entrypoint(), 0, 10);
+        fn64_abi::boot_thread0(
+            rdram_ptr,
+            rdram.len(),
+            fn64_boot_harness::c_recomp_entrypoint(),
+            0,
+            10,
+        );
     }
 
-    // Drive boot for a bounded number of scheduling STEPS, not an unbounded
-    // inner drain loop -- a thread that keeps calling pause_self (or any
-    // other always-immediately-runnable yield) in a tight loop is a REAL,
-    // legitimate boot state (rung 14's own precedent: an idle-thread self-
-    // loop), and an inner `while run_one_step() {}` never returns in that
-    // case, hanging the harness with no diagnostic. Every step is counted
-    // against ONE shared budget and logged periodically so a genuine
-    // infinite idle-spin is visible (many steps, sim_time barely advancing)
-    // rather than silently indistinguishable from real progress.
+    // Drain guest work to the public idle-thread quiescence boundary before
+    // advancing each virtual VI field. This keeps host time independent of a
+    // recompiler lane's internal checkpoint density while still bounding a
+    // genuinely non-idle spin with MAX_STEPS.
     const MAX_STEPS: u64 = 2_000_000;
-    const TICK_STEP: u64 = 100;
     const LOG_EVERY: u64 = 50_000;
     // How many consecutive "nothing was runnable, and advancing the
     // virtual clock didn't wake anything either" ticks before concluding
@@ -174,6 +211,7 @@ fn main() {
 
     let mut tick = 0u64;
     let mut steps = 0u64;
+    let mut drain = fn64_boot_harness::GuestDrain::default();
     loop {
         if steps >= MAX_STEPS {
             println!(
@@ -191,8 +229,44 @@ fn main() {
         // one-shot busy bit can change between steps via an `osAiXxx_recomp`
         // shim call the PREVIOUS step made.
         unsafe { fn64_abi::sync_mmio_into_rdram(rdram_ptr) };
-        let stepped = fn64_abi::run_one_step();
-        steps += 1;
+        let next_priority = fn64_abi::next_runnable_priority();
+        let advanced_field =
+            drain.before_step(next_priority) == fn64_boot_harness::DrainDecision::AdvanceField;
+        if advanced_field {
+            let next_field = tick
+                + fn64_abi::vi_field_interval()
+                    .expect("typed television standard must keep VI armed");
+            // Device completions land between fields: a guest slice charges
+            // (almost) no virtual time in the C lane, so a DMA issued
+            // mid-slice arms its deadline just past sim_time. Jumping a
+            // whole field would deliver EVERY completion a field late and
+            // break real issue-then-poll-next-frame guest pipelines
+            // (BOOT-NOTES-WM2000.md part 7: NWXE's joybus). Service any
+            // deadline due before the next field boundary first.
+            let device_deadline = fn64_abi::next_device_deadline()
+                .filter(|deadline| *deadline < next_field);
+            match device_deadline {
+                Some(deadline) => {
+                    // Service the earlier hardware event, but do NOT reset
+                    // the field target: a chattering device (e.g. degenerate
+                    // audio refeed) must never starve the VI tick.
+                    fn64_abi::advance_virtual_time(deadline.max(fn64_abi::sim_time()));
+                }
+                None => {
+                    tick = next_field;
+                    fn64_abi::advance_virtual_time(tick);
+                    drain.begin_field();
+                }
+            }
+        } else {
+            let stepped = fn64_abi::run_one_step();
+            assert!(
+                stepped,
+                "guest drain authorized a scheduling step without runnable work"
+            );
+            drain.record_step(next_priority.expect("guest drain lost runnable priority"));
+            steps += 1;
+        }
         if steps.is_multiple_of(LOG_EVERY) {
             println!(
                 "[wm2000-boot] progress: steps={steps} sim_time={} vi_swaps={} gfx_tasks={} \
@@ -210,7 +284,7 @@ fn main() {
         // spawned along the way (thread 1, thread 6, etc, per the ladder's
         // own multi-thread evidence). Only log this once, never treat it as
         // "boot ended" -- the executor's run queue (other threads) is the
-        // real signal, handled by `stepped`/the idle-tick counter below.
+        // real signal, handled by the drain/idle-tick counter below.
         if !thread0_death_logged && fn64_abi::is_thread_dead(0) {
             println!(
                 "[wm2000-boot] thread 0 (recomp_entrypoint) returned at step {steps} -- expected \
@@ -229,12 +303,12 @@ fn main() {
             last_swap_count = swap_count;
         }
 
-        if !stepped {
-            // Nothing was runnable -- host-driven progress (VI retrace,
-            // due timers) is the only way forward.
-            tick += TICK_STEP;
-            fn64_abi::advance_virtual_time(tick);
-            consecutive_idle_ticks += 1;
+        if advanced_field {
+            if fn64_abi::next_runnable_priority().is_none() {
+                consecutive_idle_ticks += 1;
+            } else {
+                consecutive_idle_ticks = 0;
+            }
             if consecutive_idle_ticks >= IDLE_TICKS_BEFORE_STOP {
                 println!(
                     "[wm2000-boot] reached a steady idle state ({IDLE_TICKS_BEFORE_STOP} \

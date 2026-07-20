@@ -32,6 +32,9 @@
 use std::env;
 use std::path::PathBuf;
 
+#[path = "../fn64-boot-harness/build_support.rs"]
+mod build_support;
+
 fn main() {
     println!("cargo:rerun-if-env-changed=RECOMPILED_DIR");
     println!("cargo:rerun-if-env-changed=RECOMP_H_DIR");
@@ -101,39 +104,31 @@ fn main() {
         );
     }
 
-    // RecompiledFuncs/*.c: plain C, generated, no warning hygiene.
+    // Generated sources use C++ only for fn64's MEM_W lvalue proxy; the
+    // emitted program remains N64Recomp's C ABI and has no warning hygiene.
     let mut build = cc::Build::new();
     build
+        .cpp(true)
         // The shared bridge include comes FIRST: its clean-room sections.h
         // must shadow any real (GPL-3.0) librecomp header on the path.
         .include(bridge_dir.join("include"))
         .include(&recompiled_dir)
         .include(&recomp_h_dir)
+        .flag("-include")
+        .flag("fn64_mmio_proxy.h")
+        .flag_if_supported("-std=c++17")
         .flag_if_supported("-Wno-everything")
         .warnings(false);
 
-    let mut c_file_count = 0usize;
-    for entry in std::fs::read_dir(&recompiled_dir).unwrap_or_else(|e| {
-        panic!(
-            "fn64-shell build.rs: failed to read RECOMPILED_DIR={}: {e}",
-            recompiled_dir.display()
-        )
-    }) {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("c") {
-            build.file(&path);
-            c_file_count += 1;
-        }
-    }
-    assert!(
-        c_file_count > 0,
-        "fn64-shell build.rs: found zero .c files in RECOMPILED_DIR={} -- expected N64Recomp's \
-         generated RecompiledFuncs/*.c output.",
-        recompiled_dir.display()
-    );
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("Cargo must provide OUT_DIR"));
+    let (cxx_sources, jump_snapshot_count, prototype_count) =
+        build_support::prepare_recompiled_cxx_sources(&recompiled_dir, &out_dir);
+    let c_file_count = cxx_sources.len();
+    build.files(cxx_sources);
     println!(
-        "cargo:warning=fn64-shell: compiling {c_file_count} RecompiledFuncs/*.c files from {}",
+        "cargo:warning=fn64-shell: compiling {c_file_count} RecompiledFuncs/*.c files from {} \
+         ({jump_snapshot_count} C jump snapshots normalized and {prototype_count} missing C \
+         prototypes supplied for C++)",
         recompiled_dir.display()
     );
     build.compile("fn64_shell_recompiled");
@@ -156,6 +151,10 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         bridge_dir.join("section_bridge.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        bridge_dir.join("include/fn64_mmio_proxy.h").display()
     );
     println!("cargo:rerun-if-changed={}", recompiled_dir.display());
 }

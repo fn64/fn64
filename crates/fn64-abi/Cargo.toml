@@ -37,6 +37,7 @@ fn64-audio = { path = "../fn64-audio" }
 # coroutine model; not a second, competing coroutine implementation.
 corosensei = "0.3"
 fn64-recomp-rs = { path = "../fn64-recomp-rs", optional = true }
+sha2 = "0.10"
 
 [dev-dependencies]
 # Only for a test proving the gfx-task seam actually reaches a real backend

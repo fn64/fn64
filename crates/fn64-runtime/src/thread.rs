@@ -58,7 +58,8 @@ pub const OS_PRIORITY_IDLE: Priority = 0;
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ThreadState {
     /// Created via `osCreateThread` but not yet `osStartThread`'d. Real
-    /// libultra threads sit here with no coroutine stack allocated yet.
+    /// libultra threads are not runnable in this state; fn64 may already have
+    /// allocated the host coroutine storage that will carry the guest stack.
     Stopped,
     /// On the run queue, eligible to be resumed (may not be the one
     /// actually running right now -- that's the executor's run queue's
@@ -71,7 +72,7 @@ pub enum ThreadState {
     /// Parked in `osSendMesg` on a full queue.
     BlockedOnSend,
     /// The coroutine's body returned (thread function fell off the end) or
-    /// `osStopThread`/`osDestroyThread` was called.
+    /// `osDestroyThread` was called.
     Dead,
 }
 
@@ -89,6 +90,12 @@ pub enum Yield {
     /// round (rung 14's idle-loop fix: this is what an unconditional spin
     /// MUST call instead of looping forever without ever yielding).
     PauseSelf,
+    /// A translated block exhausted its deterministic instruction slice.
+    /// The executor charges these guest instructions to virtual time only
+    /// after the coroutine has suspended, when its exclusive `&mut Executor`
+    /// is available again. Device deadlines are therefore serviced before
+    /// this thread (or any other) can execute the next block.
+    InstructionCheckpoint { instructions: u32 },
     /// `osRecvMesg` on the named queue. `may_block` is `flag ==
     /// OS_MESG_BLOCK`: when false (`OS_MESG_NOBLOCK`), the executor's
     /// yield handler never parks this coroutine on the blocked list --
@@ -126,8 +133,8 @@ pub enum Yield {
 pub enum Resume {
     /// First resume after `osStartThread` -- no prior yield to resume from.
     Start,
-    /// Resumed after a plain `pause_self`/scheduling round; nothing to
-    /// hand back.
+    /// Resumed after a plain `pause_self` or translated-instruction
+    /// checkpoint scheduling round; nothing to hand back.
     Continue,
     /// Resumed because a blocked recv was delivered a message (or a
     /// non-blocking recv attempt succeeded immediately).
@@ -176,6 +183,7 @@ pub struct GameThread {
     pub id: ThreadId,
     pub priority: Priority,
     state: ThreadState,
+    started: bool,
     coroutine: Option<ThreadCoroutine>,
 }
 
@@ -197,6 +205,7 @@ impl GameThread {
             id,
             priority,
             state: ThreadState::Stopped,
+            started: false,
             coroutine: Some(Coroutine::with_stack(
                 DefaultStack::new(COROUTINE_STACK_SIZE)
                     .expect("failed to allocate GameThread coroutine stack"),
@@ -223,6 +232,10 @@ impl GameThread {
         matches!(self.state, ThreadState::Dead)
     }
 
+    pub fn has_started(&self) -> bool {
+        self.started
+    }
+
     /// Resume this thread's coroutine. Requires a `RunToken` -- see that
     /// type's doc comment for the compile-time guarantee this establishes.
     /// The token is consumed for the duration of this call by Rust's
@@ -234,6 +247,20 @@ impl GameThread {
     /// calling this function and does not call `issue()` again until this
     /// call has returned.
     pub fn resume(&mut self, _token: RunToken, input: Resume) -> CoroutineResult<Yield, ()> {
+        if self.started {
+            assert_ne!(
+                input,
+                Resume::Start,
+                "Resume::Start may only be delivered on a GameThread's first resume"
+            );
+        } else {
+            assert_eq!(
+                input,
+                Resume::Start,
+                "a GameThread's first resume must use Resume::Start"
+            );
+            self.started = true;
+        }
         let coroutine = self
             .coroutine
             .as_mut()

@@ -3,12 +3,13 @@
 //! `#[path]`; it is game-profile data, so it lives beside the OoT harness,
 //! not in the game-agnostic crates).
 
+#[cfg(not(fn64_recomp_rs_block_program))]
 use oot_recompiled as recompiled;
 
 /// OoT NTSC 1.0's libultra vrams, from its decomp-derived symbol dump
 /// (`games/OOTU/syms/dump.toml`). Each target is an ordinary safe typed
 /// adapter; the raw C ABI exists only inside `fn64-abi::recompiled`.
-pub fn recompiled_or_host_lookup(vram: u32) -> Option<fn64_recomp_rs::RecompFunc> {
+fn exact_host_lookup(vram: u32) -> Option<fn64_recomp_rs::RecompFunc> {
     use fn64_abi::recompiled as r;
     let host = match vram {
         0x8000_1DB0 => r::os_pi_get_access,
@@ -79,10 +80,28 @@ pub fn recompiled_or_host_lookup(vram: u32) -> Option<fn64_recomp_rs::RecompFunc
         0x800D_5D90 => r::os_sp_set_pc,
         0x800B_BE80 => r::os_ai_set_next_buffer,
         0x800D_2900 => r::os_ai_set_frequency,
-        _ => {
-            let canonical = r::canonical_vram(vram)?;
-            return Some(recompiled::lookup(canonical));
-        }
+        _ => return None,
     };
     Some(host)
+}
+
+/// Resolve only OoT's named host ABI adapters. The arbitrary-PC block lane
+/// uses this narrower table so an omitted guest bank cannot silently escape
+/// into the whole-function generated crate.
+pub fn host_only_lookup(vram: u32) -> Option<fn64_recomp_rs::RecompFunc> {
+    exact_host_lookup(vram).or_else(|| {
+        let canonical = fn64_abi::recompiled::canonical_vram(vram)?;
+        exact_host_lookup(canonical)
+    })
+}
+
+/// Whole-function lane lookup: host adapters take priority, then the emitted
+/// function dispatcher owns every remaining canonical guest destination.
+#[cfg(not(fn64_recomp_rs_block_program))]
+pub fn recompiled_or_host_lookup(vram: u32) -> Option<fn64_recomp_rs::RecompFunc> {
+    if let Some(host) = host_only_lookup(vram) {
+        return Some(host);
+    }
+    let canonical = fn64_abi::recompiled::canonical_vram(vram)?;
+    Some(recompiled::lookup(canonical))
 }

@@ -14,6 +14,64 @@ pub(crate) fn ctx_with(r4: u64, r5: u64, r6: u64) -> RecompContext {
     ctx
 }
 
+struct CompleteRenderBackend;
+
+impl fn64_render::RenderBackend for CompleteRenderBackend {
+    fn create(&mut self, _cfg: &fn64_render::RenderConfig) -> Result<(), fn64_render::RenderError> {
+        Ok(())
+    }
+
+    fn observe_non_rdp_write16(
+        &mut self,
+        _write: fn64_render::NonRdpWrite16,
+    ) -> fn64_render::NonRdpWrite16Disposition {
+        fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+    }
+
+    fn process_task(
+        &mut self,
+        _rdram: &mut [u8],
+        _rsp_memory: &mut fn64_runtime::RspMemory,
+        _task: &fn64_render::OsTask,
+        _output_addr: u32,
+    ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
+        Ok(fn64_render::FrameStatus::Complete)
+    }
+
+    fn process_rdp_commands(
+        &mut self,
+        _rdram: &mut [u8],
+        _start: u32,
+        _end: u32,
+        _output_addr: u32,
+    ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
+        Ok(fn64_render::FrameStatus::Complete)
+    }
+
+    fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
+        fn64_render::DpFullSyncStatus::Reached
+    }
+
+    fn present(
+        &mut self,
+        _vi: fn64_render::ViPresentation,
+    ) -> Result<(), fn64_render::RenderError> {
+        Ok(())
+    }
+
+    fn resize(&mut self, _w: u32, _h: u32) {}
+
+    fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
+        &[]
+    }
+}
+
+/// Make a test's renderer dependency explicit without assigning it drawing
+/// semantics irrelevant to that test.
+pub(crate) fn install_complete_render_backend(rdram_len: usize) {
+    set_render_backend(Box::new(CompleteRenderBackend), rdram_len);
+}
+
 /// An rdram buffer for a test that hands guest KSEG0 vram addresses to a
 /// shim. `len_from_vram` is the HIGHEST KSEG0 address the test hands to any
 /// shim; the buffer is sized to cover that address's rdram offset, so a

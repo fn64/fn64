@@ -1,7 +1,8 @@
 //! The rdram buffer, its `MEM_*`-equivalent accessors, and the `RdramAddr`
 //! translation newtype. See `docs/DESIGN.md` section 3.
 //!
-//! Semantics (byte-lane XOR, sign extension, KSEG0 base subtraction) are
+//! Semantics (byte-lane XOR, sign extension, direct-segment RDRAM aliasing,
+//! and sparse non-RDRAM base subtraction) are
 //! transcribed from `aki-recomp/runtime/ABI-SURFACE.md` section (c), which
 //! mechanically extracted them from N64Recomp-generated C (MIT-licensed
 //! recompiler output; no vendor runtime implementation was read).
@@ -76,8 +77,22 @@ impl RdramAddr {
     /// may carry a sign-extended 64-bit KSEG0 address in it). Replicates
     /// the generated `MEM_*` macros' own base-subtraction math exactly
     /// (section (c)) so this is correct for both a plain 32-bit vram value
-    /// and its 64-bit sign-extended form.
+    /// and its 64-bit sign-extended form. KSEG0 and KSEG1 addresses inside
+    /// physical RDRAM share their low-29-bit offset; sparse MMIO/non-RDRAM
+    /// windows retain the generated macro's historical subtraction.
     pub fn from_gpr(reg: u64) -> Self {
+        let upper = reg >> 32;
+        let low = reg as u32;
+        let physical = low & 0x1fff_ffff;
+        let direct_rdram =
+            (0x8000_0000..0xc000_0000).contains(&low) && physical < DEFAULT_RDRAM_SIZE as u32;
+        if direct_rdram {
+            assert!(
+                upper == 0 || upper == u32::MAX as u64,
+                "RdramAddr::from_gpr: noncanonical 64-bit direct RDRAM address {reg:#018x}"
+            );
+            return RdramAddr(physical);
+        }
         RdramAddr(reg.wrapping_sub(KSEG0_BASE_SIGN_EXTENDED) as u32)
     }
 
@@ -232,6 +247,28 @@ impl RdramPtr {
     }
 
     /// # Safety
+    /// The allocation must cover the native word at `addr.offset()`.
+    pub unsafe fn read_u32(self, addr: RdramAddr) -> u32 {
+        assert!(
+            addr.offset().is_multiple_of(4),
+            "RDRAM raw u32 read at unaligned logical address {:#x}",
+            addr.offset()
+        );
+        unsafe { (self.0.as_ptr().add(addr.offset() as usize) as *const u32).read_unaligned() }
+    }
+
+    /// # Safety
+    /// The allocation must cover the native word at `addr.offset()`.
+    pub unsafe fn write_u32(self, addr: RdramAddr, value: u32) {
+        assert!(
+            addr.offset().is_multiple_of(4),
+            "RDRAM raw u32 write at unaligned logical address {:#x}",
+            addr.offset()
+        );
+        unsafe { (self.0.as_ptr().add(addr.offset() as usize) as *mut u32).write_unaligned(value) };
+    }
+
+    /// # Safety
     /// The allocation must cover `addr.offset() ^ 3`.
     pub unsafe fn read_u8(self, addr: RdramAddr) -> u8 {
         unsafe { *self.0.as_ptr().add((addr.offset() ^ 3) as usize) }
@@ -323,6 +360,25 @@ impl<'a> RdramViewMut<'a> {
             );
         }
     }
+
+    /// Copy flat device bytes into this borrowed storage in logical guest
+    /// order. This is the borrowed-buffer counterpart to
+    /// [`Rdram::dma_write_bytes`].
+    pub fn dma_write_bytes(&mut self, offset: usize, data: &[u8]) {
+        let addr =
+            RdramAddr::from_offset(u32::try_from(offset).expect("DMA RDRAM offset exceeds u32"));
+        self.write_logical_bytes(addr, data);
+    }
+
+    /// Read native-word storage back into flat device byte order. This is
+    /// the borrowed-buffer counterpart to [`Rdram::dma_read_bytes_flat`].
+    pub fn dma_read_bytes_flat(&self, offset: usize, len: usize) -> Vec<u8> {
+        let addr =
+            RdramAddr::from_offset(u32::try_from(offset).expect("DMA RDRAM offset exceeds u32"));
+        let mut flat = vec![0; len];
+        self.as_view().copy_logical_bytes(addr, &mut flat);
+        flat
+    }
 }
 
 /// Owns the single rdram allocation. Every consumer (`fn64-abi` shims, the
@@ -362,7 +418,8 @@ impl Rdram {
     /// `AI_STATUS`'s "not busy, not full" idle default -- see
     /// `mmio.rs::AiRegs::status` -- but callers should not rely on that
     /// coincidence for registers whose idle-zero value isn't itself the
-    /// correct default, e.g. `SpRegs::status`'s halted+broke bits).
+    /// correct default. Timed SP state is owned by `DeviceFabric` and is not
+    /// mirrored into this legacy allocation.
     pub fn new_with_mmio(size: usize) -> Self {
         let size = size.max(crate::mmio::RDRAM_MMIO_WINDOW_END as usize);
         Rdram::new(size)
@@ -533,6 +590,26 @@ mod tests {
         // gpr may carry it (per ABI-SURFACE.md section (b)).
         let extended = RdramAddr::from_gpr(0xFFFF_FFFF_8000_1234);
         assert_eq!(extended.offset(), 0x1234);
+    }
+
+    #[test]
+    fn rdram_addr_from_gpr_aliases_kseg0_and_kseg1_only_inside_rdram() {
+        for address in [
+            0x0000_0000_8000_1234,
+            0xffff_ffff_8000_1234,
+            0x0000_0000_a000_1234,
+            0xffff_ffff_a000_1234,
+        ] {
+            assert_eq!(RdramAddr::from_gpr(address).offset(), 0x1234);
+        }
+        assert_eq!(
+            RdramAddr::from_gpr(0xffff_ffff_a450_000c).offset(),
+            0x2450_000c,
+            "MMIO must retain its sparse backing offset"
+        );
+        assert_ne!(RdramAddr::from_gpr(0x1234).offset(), 0x1234);
+        assert_ne!(RdramAddr::from_gpr(0xffff_ffff_c000_1234).offset(), 0x1234);
+        assert!(std::panic::catch_unwind(|| RdramAddr::from_gpr(0x0000_0001_8000_1234)).is_err());
     }
 
     /// Regression: `to_kseg0` must round-trip the KSEG0 form that a

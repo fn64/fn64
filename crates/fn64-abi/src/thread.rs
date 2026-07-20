@@ -48,15 +48,39 @@ use super::*;
 pub unsafe extern "C" fn osCreateThread_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &*ctx };
     let thread_handle = RdramAddr::from_gpr(ctx.r4);
-    let id: ThreadId = ctx.r5 as u32;
+    let requested_osid: u32 = ctx.r5 as u32;
     let entry_vram = ctx.r6 as u32;
     let arg = ctx.r7;
     let sp = read_stack_word(rdram, ctx.r29, 0x10) as u64;
     let priority = read_stack_word(rdram, ctx.r29, 0x14) as Priority;
 
+    // Libultra's OSId is an informational tag, not a key: thread identity on
+    // real hardware is the OSThread struct pointer, and NWXE's retail boot
+    // legitimately creates two live threads with id 3 once resident `.data`
+    // is faithfully seeded (docs/BOOT-NOTES-WM2000.md, 2026-07-19). The
+    // executor keys threads by number, so a colliding OSId gets a synthetic
+    // internal id; every later thread op resolves through the OSThread*
+    // handle anyway, and `osGetThreadId` reads `thread_guest_ids` so the
+    // guest-visible OSId stays exactly what this call supplied.
+    let id: ThreadId = if with_executor(|exec| exec.thread_exists(requested_osid)) {
+        with_host(|host| {
+            let id = host.next_synthetic_thread_id;
+            host.next_synthetic_thread_id += 1;
+            id
+        })
+    } else {
+        requested_osid
+    };
+
     with_host(|host| {
         host.thread_handles.insert(thread_handle.offset(), id);
+        host.thread_guest_ids.insert(id, requested_osid);
     });
+    if crate::boot_probe_enabled() {
+        eprintln!(
+            "[boot-probe] osCreateThread(id={requested_osid} -> {id:#x}, entry={entry_vram:#010x}, sp={sp:#010x}, pri={priority})"
+        );
+    }
 
     // rdram is one shared allocation for the whole process lifetime
     // (docs/DESIGN.md section 3) -- capturing its raw pointer in this
@@ -192,11 +216,14 @@ fn resolve_thread_arg(raw: u64, shim: &str) -> ThreadId {
 /// `resolve_thread_arg` (same `NULL`-means-current-thread convention as
 /// `osGetThreadPri_recomp`/`osSetThreadPri_recomp` -- the public libultra
 /// manual documents the same `t == NULL` convention for this call too).
-/// Since this crate's `ThreadId` IS the real `OSId` (see
-/// `HostState::thread_handles`' doc comment: it maps `OSThread*` -> the
-/// `OSId` a real `osCreateThread(t, id, ...)` call supplied), this is a
-/// direct return of the resolved id, not a separate lookup table. Real
-/// call sites: `games/OOTU/RecompiledFuncs/funcs_0.c:4152`, `funcs_56.c:643`.
+/// The executor `ThreadId` is USUALLY the real `OSId`, but not always:
+/// on an OSId collision `osCreateThread_recomp` keys the executor by a
+/// synthetic id (OSIds carry no uniqueness contract on real hardware --
+/// see that shim's collision comment), so this consults
+/// `HostState::thread_guest_ids` to return the OSId the guest actually
+/// supplied. Threads registered outside `osCreateThread_recomp` (tests,
+/// boot hosts) have no entry and fall back to the id itself. Real call
+/// sites: `games/OOTU/RecompiledFuncs/funcs_0.c:4152`, `funcs_56.c:643`.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
@@ -204,7 +231,8 @@ fn resolve_thread_arg(raw: u64, shim: &str) -> ThreadId {
 pub unsafe extern "C" fn osGetThreadId_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     let target = resolve_thread_arg(ctx.r4, "osGetThreadId_recomp");
-    ctx.r2 = target as u64;
+    let osid = with_host(|host| host.thread_guest_ids.get(&target).copied()).unwrap_or(target);
+    ctx.r2 = osid as u64;
 }
 
 /// `osDestroyThread(OSThread *t)` -- `a0`=`ctx->r4`, resolved via
@@ -248,16 +276,37 @@ mod tests {
 
     #[test]
     fn pause_self_yields_via_real_executor_and_thread_keeps_running() {
-        let ran_twice = std::rc::Rc::new(std::cell::RefCell::new(0));
-        let ran_twice2 = ran_twice.clone();
+        const MAX_RESUMES_AFTER_PAUSE: usize = 8;
+
+        let entered_pause = std::rc::Rc::new(std::cell::Cell::new(false));
+        let continued_after_pause = std::rc::Rc::new(std::cell::Cell::new(false));
+        let entered_pause2 = entered_pause.clone();
+        let continued_after_pause2 = continued_after_pause.clone();
         spawn_test_thread(100, 5, move || {
+            entered_pause2.set(true);
             pause_self(std::ptr::null_mut());
-            *ran_twice2.borrow_mut() += 1;
+            continued_after_pause2.set(true);
         });
         assert!(run_one_step());
-        assert_eq!(*ran_twice.borrow(), 0);
-        assert!(run_one_step());
-        assert_eq!(*ran_twice.borrow(), 1);
+        assert!(entered_pause.get(), "thread never reached pause_self");
+        assert!(
+            !continued_after_pause.get(),
+            "pause_self returned without yielding to the executor"
+        );
+
+        for _ in 0..MAX_RESUMES_AFTER_PAUSE {
+            if continued_after_pause.get() {
+                break;
+            }
+            assert!(
+                run_one_step(),
+                "pause_self blocked the thread instead of keeping it runnable"
+            );
+        }
+        assert!(
+            continued_after_pause.get(),
+            "pause_self did not resume within {MAX_RESUMES_AFTER_PAUSE} scheduler steps"
+        );
     }
 
     /// Test-only helper: register an `OSThread*` handle -> `OSId` mapping,
@@ -329,6 +378,42 @@ mod tests {
         });
         run_to_idle_with_yielder_plumbing();
         assert_eq!(*observed.borrow(), Some(204));
+    }
+
+    #[test]
+    fn colliding_osids_create_two_distinct_threads_and_keep_the_guest_osid() {
+        // NWXE's retail boot creates two live threads with OSId 3 once
+        // resident .data is faithfully seeded (docs/BOOT-NOTES-WM2000.md,
+        // 2026-07-19): OSId carries no uniqueness contract on hardware.
+        let mut rdram = vec![0u8; 16384];
+        fn create(rdram: &mut [u8], handle: u64) {
+            let mut ctx = ctx_zeroed();
+            ctx.r4 = handle;
+            ctx.r5 = 3; // the same OSId both times
+            ctx.r6 = 0x8030_0000;
+            ctx.r29 = 0xFFFF_FFFF_8000_2000;
+            let sp_slot = RdramAddr::from_gpr(ctx.r29.wrapping_add(0x10)).offset() as usize;
+            rdram[sp_slot..sp_slot + 4].copy_from_slice(&0x8000_1000u32.to_ne_bytes());
+            unsafe { osCreateThread_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+        }
+        create(&mut rdram, 0x8006_0000);
+        create(&mut rdram, 0x8006_0200);
+
+        let first = resolve_thread_arg(0x8006_0000, "collision test");
+        let second = resolve_thread_arg(0x8006_0200, "collision test");
+        assert_eq!(first, 3, "first create keeps its requested OSId");
+        assert_ne!(second, 3, "colliding OSId must get a synthetic executor id");
+        with_executor(|exec| {
+            assert!(exec.thread_exists(first));
+            assert!(exec.thread_exists(second));
+        });
+
+        // Both handles report the guest-visible OSId the game supplied.
+        for handle in [0x8006_0000u64, 0x8006_0200] {
+            let mut ctx = ctx_with(handle, 0, 0);
+            unsafe { osGetThreadId_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+            assert_eq!(ctx.r2, 3, "guest-visible OSId must be preserved");
+        }
     }
 
     // osStartThread_recomp is a plain `extern "C" fn` -- same subprocess-abort

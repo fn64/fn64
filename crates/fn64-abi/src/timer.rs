@@ -37,6 +37,12 @@ pub unsafe extern "C" fn osSetTimer_recomp(rdram: *mut u8, ctx: *mut RecompConte
     let mq_addr = RdramAddr::from_gpr(read_stack_word(rdram, ctx.r29, 0x18) as u64);
     let msg = read_stack_word(rdram, ctx.r29, 0x1C) as Mesg;
     let armed_by = current_thread_id("osSetTimer_recomp");
+    if crate::boot_probe_enabled() {
+        eprintln!(
+            "[boot-probe] osSetTimer(countdown={countdown:#x}, interval={interval:#x}, mq={:#010x}, msg={msg:#x}) by thread {armed_by:#x}",
+            mq_addr.offset() + 0x8000_0000
+        );
+    }
     let id = with_executor(|exec| exec.set_timer(countdown, interval, mq_addr, msg, armed_by));
     // Recorded so a later real osStopTimer(t) call (same OSTimer* handle,
     // per libultra's documented API -- OoT's boot-critical set per

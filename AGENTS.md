@@ -64,12 +64,14 @@ it, don't read it. Every design claim states which allowed source it came from.
   feature. If you're tempted to guard, you haven't found the bug yet.
 - **Differential evidence.** Behavior changes get diffed, and you attach the
   diff (or its absence) to your claim. Use a differential that actually runs:
-  - `scripts/lane-parity.sh N` — the c and rs lanes over identical ROM, per-swap
-    framebuffer SHAs. The real A/B. **Caveat (ROADMAP V1a/V1b): the C lane is
-    missing bodies for ~127 stubbed functions that fn64 recompiles correctly,
-    so past swap ~231 the lanes legitimately disagree.** Below 232 they are
-    byte-identical, so a diff there is a real regression. Above it, the C lane
-    is not an arbiter.
+  - `scripts/lane-parity.sh N` — first mechanically audits the c/rs generated
+    callable-body sets, then compares per-swap framebuffer SHAs only if that
+    authority precondition holds. The current legacy C lane has callable empty
+    bodies that fn64 recompiles correctly, so default mode rejects it as an
+    arbiter from swap zero. `scripts/lane-parity.sh --observe N` retains a
+    labeled, non-authoritative framebuffer comparison; no observed matching
+    horizon proves the missing bodies were irrelevant. See
+    `docs/PARITY-METHOD.md`.
   - `cargo nextest run -p fn64-abi` — `c_smoke` links a real C caller against
     the staticlib, so the ABI shape is proven by a test, not by prose.
   - `crates/fn64-recomp-rs/tests/oracle.rs` + friends — per-instruction

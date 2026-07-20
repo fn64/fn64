@@ -77,6 +77,10 @@ fn dynapoly_oracle(a0: u64) -> u64 {
 // `0 | 0`) is intentionally un-idiomatic Rust.
 #[allow(unused_variables, clippy::all)]
 pub fn dynapoly_is_bg_id_bg_actor(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(
+        0x80031264,
+        "dynapoly_is_bg_id_bg_actor",
+    ));
     let mut pc: u32 = 0x80031264;
     'run: loop {
         match pc {

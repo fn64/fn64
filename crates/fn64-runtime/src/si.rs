@@ -1,4 +1,4 @@
-//! Minimal SI/PIF model: `__osSiRawStartDma`'s controller-probe/read path.
+//! SI/PIF controller and accessory model.
 //!
 //! ## Provenance
 //!
@@ -12,8 +12,7 @@
 //!
 //! ## Scope
 //!
-//! This is deliberately the SMALLEST model that answers "one standard
-//! controller, no pak" the task asks for: a single port (port 0) reports
+//! A single port (port 0) defaults to
 //! present with a standard N64 controller (`CONT_TYPE_STANDARD = 0x0500`)
 //! and no accessory (status byte clears `CONT_CARD_ON`/pak-present bits);
 //! ports 1-3 report not-present (status byte's `CONT_ABSENT` bit set), which
@@ -25,8 +24,10 @@
 //! This module has no host input-device polling of its own (that's
 //! `fn64-shell`'s wave-5 concern per `docs/DESIGN.md` section 1) -- it is
 //! the PIF-format RESPONSE SHAPE only, parameterized by which ports are
-//! "connected" so a future real-input wave can flip that without touching
-//! this module's protocol-formatting logic.
+//! "connected". Hosts can explicitly attach a Controller Pak, Rumble Pak, or
+//! Transfer Pak; query responses and accessory state then share this one
+//! typed port identity rather than independently claiming incompatible
+//! hardware.
 
 /// PIF-format controller-type response for a standard N64 controller (no
 /// Controller Pak, no Rumble Pak accessory) -- the public libultra manual's
@@ -42,14 +43,24 @@ pub const CONT_CARD_ON: u8 = 0x01;
 pub const CONT_ADDR_CRC_ER: u8 = 0x02;
 pub const CONT_ABSENT: u8 = 0x80;
 
-/// One port's static identity for this milestone's model: present-as-a-
-/// standard-controller-with-no-pak, or absent. Real hardware can report
-/// richer states (mouse, VRU, absent-but-was-present-last-poll); not
-/// modeled here since no boot-rung evidence exercises them yet.
+/// One port's controller/accessory identity. Keeping accessory type in the
+/// enum makes it impossible for a port to simultaneously answer "Rumble Pak"
+/// to motor access and "no pak" to a controller status query.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PortState {
     StandardControllerNoPak,
+    StandardControllerControllerPak,
+    StandardControllerRumblePak,
+    StandardControllerTransferPak,
+    VoiceRecognitionUnit,
     Absent,
+}
+
+/// Guest-visible failure classes for Rumble Pak initialization/access.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RumbleError {
+    NoPak,
+    WrongDevice,
 }
 
 /// A single controller's live button/stick state -- the four values a real
@@ -72,6 +83,17 @@ pub struct ContInput {
     pub stick_y: i8,
 }
 
+/// Future-affecting controller identities, input, and motor state retained by
+/// the executor-owned PIF model. This is a release-evidence projection, not a
+/// Joybus response packet: all four physical slots remain represented even
+/// when a port is absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PifEvidenceSnapshot {
+    pub ports: [PortState; 4],
+    pub inputs: [ContInput; 4],
+    pub rumble_on: [bool; 4],
+}
+
 /// The minimal PIF/SI model: which of the 4 controller ports are populated.
 /// Per the task ("minimal PIF model reporting one standard controller, no
 /// pak"), port 0 defaults to `StandardControllerNoPak`, ports 1-3 to
@@ -85,6 +107,7 @@ pub struct PifModel {
     /// `osContGetReadData` sees them. Ports with no controller keep the idle
     /// default, which is inert anyway (the game checks `errno`/absence first).
     inputs: [ContInput; 4],
+    rumble_on: [bool; 4],
 }
 
 impl Default for PifModel {
@@ -97,6 +120,7 @@ impl Default for PifModel {
                 PortState::Absent,
             ],
             inputs: [ContInput::default(); 4],
+            rumble_on: [false; 4],
         }
     }
 }
@@ -106,8 +130,45 @@ impl PifModel {
         Self::default()
     }
 
+    pub const fn evidence_snapshot(&self) -> PifEvidenceSnapshot {
+        PifEvidenceSnapshot {
+            ports: self.ports,
+            inputs: self.inputs,
+            rumble_on: self.rumble_on,
+        }
+    }
+
     pub fn port_state(&self, port: usize) -> PortState {
         self.ports.get(port).copied().unwrap_or(PortState::Absent)
+    }
+
+    /// Set the physical identity of one of the four controller ports.
+    /// Changing an accessory always de-energizes the old motor.
+    pub fn set_port_state(&mut self, port: usize, state: PortState) {
+        let slot = self
+            .ports
+            .get_mut(port)
+            .unwrap_or_else(|| panic!("controller port {port} is outside physical ports 0..=3"));
+        *slot = state;
+        self.rumble_on[port] = false;
+    }
+
+    /// Start or stop the Rumble Pak attached to `port`.
+    pub fn set_rumble(&mut self, port: usize, active: bool) -> Result<(), RumbleError> {
+        match self.port_state(port) {
+            PortState::StandardControllerRumblePak => {
+                self.rumble_on[port] = active;
+                Ok(())
+            }
+            PortState::StandardControllerControllerPak
+            | PortState::StandardControllerTransferPak => Err(RumbleError::WrongDevice),
+            PortState::VoiceRecognitionUnit => Err(RumbleError::WrongDevice),
+            PortState::StandardControllerNoPak | PortState::Absent => Err(RumbleError::NoPak),
+        }
+    }
+
+    pub fn rumble_active(&self, port: usize) -> bool {
+        self.rumble_on.get(port).copied().unwrap_or(false)
     }
 
     /// Feed a controller's live button/stick state for `port` -- the host-
@@ -139,6 +200,16 @@ impl PifModel {
                 let ty = CONT_TYPE_STANDARD;
                 [(ty >> 8) as u8, (ty & 0xFF) as u8, 0]
             }
+            PortState::StandardControllerControllerPak
+            | PortState::StandardControllerRumblePak
+            | PortState::StandardControllerTransferPak => {
+                let ty = CONT_TYPE_STANDARD;
+                [(ty >> 8) as u8, (ty & 0xFF) as u8, CONT_CARD_ON]
+            }
+            // Public VRU Joybus captures identify the device as wire bytes
+            // 00 01. `osContGetQuery` deliberately assembles those bytes in
+            // the libultra order documented at its call site.
+            PortState::VoiceRecognitionUnit => [0x00, 0x01, 0],
             PortState::Absent => [0, 0, CONT_ABSENT],
         }
     }
@@ -235,5 +306,31 @@ mod tests {
         // not a silent success/no-op over guest-visible state.
         let pif = PifModel::new();
         assert_eq!(pif.port_state(7), PortState::Absent);
+    }
+
+    #[test]
+    fn rumble_attachment_drives_query_and_motor_state() {
+        let mut pif = PifModel::new();
+        pif.set_port_state(0, PortState::StandardControllerRumblePak);
+        assert_eq!(pif.query_response(0), [0x05, 0x00, CONT_CARD_ON]);
+        assert_eq!(pif.set_rumble(0, true), Ok(()));
+        assert!(pif.rumble_active(0));
+        assert_eq!(pif.set_rumble(0, false), Ok(()));
+        assert!(!pif.rumble_active(0));
+    }
+
+    #[test]
+    fn rumble_access_distinguishes_no_pak_from_wrong_device() {
+        let mut pif = PifModel::new();
+        assert_eq!(pif.set_rumble(0, true), Err(RumbleError::NoPak));
+        pif.set_port_state(0, PortState::StandardControllerControllerPak);
+        assert_eq!(pif.set_rumble(0, true), Err(RumbleError::WrongDevice));
+    }
+
+    #[test]
+    fn voice_unit_reports_public_wire_identifier() {
+        let mut pif = PifModel::new();
+        pif.set_port_state(0, PortState::VoiceRecognitionUnit);
+        assert_eq!(pif.query_response(0), [0x00, 0x01, 0x00]);
     }
 }

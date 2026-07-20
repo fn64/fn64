@@ -530,9 +530,9 @@ fn interpreter_matches_aot_bank_runner_on_ordinary_programs() {
     let source = format!(
         r#"#![allow(unused_imports)]
 use fn64_recomp_rs::{{
-    run_bank, BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeCatalog, CodeSpan, CpuFault,
-    CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError,
-    Rdram, RecompContext,
+    run_bank, BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeCatalog, CodeSpan,
+    CpuException, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc,
+    InstructionBudget, ProgramError, Rdram, RecompContext,
 }};
 
 {emitted}

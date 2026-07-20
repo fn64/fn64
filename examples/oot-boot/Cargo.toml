@@ -27,12 +27,14 @@ path = "src/main.rs"
 
 [build-dependencies]
 cc = "1"
+sha2 = "0.10"
+toml = "0.8"
 
 [dependencies]
 libc = "0.2"
 fn64-runtime = { path = "../../crates/fn64-runtime" }
 fn64-abi = { path = "../../crates/fn64-abi", features = ["recomp-rs"] }
-fn64-boot-harness = { path = "../../crates/fn64-boot-harness" }
+fn64-boot-harness = { path = "../../crates/fn64-boot-harness", features = ["recomp-rs"] }
 fn64-recomp-rs = { path = "../../crates/fn64-recomp-rs" }
 # The graphics seam + its headless reference software rasterizer. Registered
 # via fn64_abi::set_render_backend so submitted M_GFXTASKs actually

@@ -335,6 +335,7 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
     // crate root and when a boot harness `include!`s it inside its own module.
     // An inner `#![allow]` is rejected in the latter context.
     module.push_str("#[allow(clippy::all, unused, non_snake_case)]\nmod generated {\n");
+    module.push_str("pub const FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA: fn64_recomp_rs::FunctionEntryObservationSchema = fn64_recomp_rs::FUNCTION_ENTRY_OBSERVATION_SCHEMA;\n");
     module.push_str("#[allow(unused_imports)]\n");
     module.push_str(
         "use fn64_recomp_rs::{call_host_or_recompiled, pause_self, resolve_host_function, RecompContext, RecompFunc, Rdram, round_ties_even_f32, round_ties_even_f64};\n\n",
@@ -505,6 +506,7 @@ fn render_generated_lib(symbols: &SymbolTable, sections: &[Section]) -> String {
     );
     root.push_str("#![forbid(unsafe_code)]\n");
     root.push_str("#![allow(clippy::all, unused, non_snake_case)]\n\n");
+    root.push_str("pub const FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA: fn64_recomp_rs::FunctionEntryObservationSchema = fn64_recomp_rs::FUNCTION_ENTRY_OBSERVATION_SCHEMA;\n\n");
     for index in 0..RECOMPILED_PART_COUNT {
         root.push_str(&format!(
             "mod part_{index:03};\npub use part_{index:03}::*;\n"
@@ -1044,6 +1046,7 @@ mod tests {
             .map(|(_, contents)| contents)
             .expect("generated crate root");
         assert!(lib.contains("#![forbid(unsafe_code)]"));
+        assert!(lib.contains("pub const FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA"));
         assert!(lib.contains("pub fn lookup(vram: u32) -> RecompFunc"));
         assert!(lib.contains("pub static RECOMPILED_SECTION_GEOMETRY"));
         assert_eq!(

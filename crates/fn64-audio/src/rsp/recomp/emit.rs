@@ -22,8 +22,8 @@
 //! - **Indirect jumps** (`jr`/`jalr`) — normalize the register's low 12 bits
 //!   into the IMEM address window and
 //!   `continue`; the `match` on `pc` IS the `do_indirect_jump` switch, and an
-//!   unmatched target falls through to the `_ =>` arm returning
-//!   `UnhandledJumpTarget`.
+//!   unmatched target falls through to the `_ =>` arm, records the typed
+//!   unsupported outcome, and returns `RspExitReason::Unsupported`.
 //! - **Overlay swap** — a `DO_DMA_READ` whose MEM address targets IMEM returns
 //!   `RspExitReason::SwapOverlay`, matching RSPRecomp's `do_overlay_swap`.
 //!   The next overlay invocation consumes the saved 12-bit resume PC.
@@ -57,7 +57,7 @@ pub fn emit_module(words: &[u32], base_vram: u32, fn_name: &str) -> String {
          // Source: RSP microcode, {} instructions, base IMEM 0x{:04X}.\n\
          #![allow(unused_variables, unused_assignments, unused_parens, unused_braces, unused_imports, clippy::all)]\n\n\
          use fn64_audio::rsp::recomp::runtime::RspMachine;\n\
-         use fn64_audio::rsp::recomp::{{trap_unknown, trap_unknown_vu}};\n\
+         use fn64_audio::rsp::recomp::{{trap_delay_slot_control, trap_step_budget, trap_unhandled_jump, trap_unknown, trap_unknown_vu}};\n\
          use fn64_audio::rsp::context::RspExitReason;\n\
          use fn64_audio::rsp::ops::{{dispatch, OpInvocation, OpStatus, VuOp}};\n\n",
         words.len(),
@@ -89,7 +89,7 @@ pub fn emit_module(words: &[u32], base_vram: u32, fn_name: &str) -> String {
          \x20   let mut steps: u64 = 0;\n\
          \x20   let reason = 'run: loop {{\n\
          \x20       steps += 1;\n\
-         \x20       if steps > 5_000_000 {{ break 'run trap_unknown(pc, 0); }}\n\
+         \x20       if steps > 5_000_000 {{ break 'run trap_step_budget(pc); }}\n\
          \x20       match pc {{\n",
         0x1000 | (base_vram & 0x0FFF)
     ));
@@ -113,7 +113,7 @@ pub fn emit_module(words: &[u32], base_vram: u32, fn_name: &str) -> String {
     // The fallthrough / unhandled-jump-target arm (RSPRecomp's
     // do_indirect_jump default + ImemOverrun).
     out.push_str(
-        "            _ => break 'run RspExitReason::UnhandledJumpTarget,\n\
+        "            _ => break 'run trap_unhandled_jump(pc),\n\
          \x20       }\n    };\n\
          \x20   m.ctx.steps = steps;\n\
          \x20   reason\n}\n",
@@ -432,8 +432,9 @@ fn delay_stmt(d: &Instr, delay_pc: u32, resume: &str) -> Option<String> {
         | Instr::Jump { .. }
         | Instr::Jal { .. }
         | Instr::Jr { .. }
-        | Instr::Jalr { .. }) => panic!(
-            "unsupported RSP control transfer {illegal:?} in delay slot at IMEM 0x{delay_pc:04X}"
+        | Instr::Jalr { .. }) => format!(
+            "trap_delay_slot_control(0x{delay_pc:04X}, {:?});",
+            format!("{illegal:?}")
         ),
     })
 }

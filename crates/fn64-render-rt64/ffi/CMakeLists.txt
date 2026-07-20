@@ -21,6 +21,139 @@ set(PLUME_BUILD_EXAMPLES OFF CACHE BOOL "Do not build plume examples" FORCE)
 # mupen64plus subtree is therefore neither compiled nor linked.
 add_subdirectory("${FN64_RT64_SOURCE_DIR}" rt64-build EXCLUDE_FROM_ALL)
 
+# RT64's CompilationThread constructor launches an idle-priority worker before
+# initializing its running predicate, and the worker writes that predicate true
+# again on entry. A teardown that stores false and notifies before a delayed
+# worker enters its loop can therefore have its stop request overwritten; the
+# worker then sleeps after the only notification while the destructor joins it.
+# Stage an exact-source overlay that publishes the running predicate before
+# launch and leaves the destructor as its only post-launch writer. The source
+# checks keep the overlay tied visibly to the reviewed pinned MIT source.
+set(FN64_RT64_RASTER_SHADER_CACHE_SOURCE
+    "${FN64_RT64_SOURCE_DIR}/src/render/rt64_raster_shader_cache.cpp")
+file(READ
+    "${FN64_RT64_RASTER_SHADER_CACHE_SOURCE}"
+    FN64_RT64_RASTER_SHADER_CACHE_CONTENTS)
+set(FN64_RT64_COMPILATION_THREAD_START_ORIGINAL
+    "        this->shaderCache = shaderCache;\n\n        thread = std::make_unique<std::thread>(&CompilationThread::loop, this);\n        threadRunning = false;")
+set(FN64_RT64_COMPILATION_THREAD_START_PATCHED
+    "        this->shaderCache = shaderCache;\n\n        // The destructor's false store and notification must happen after this\n        // publication: a delayed idle-priority worker must never overwrite the\n        // stop predicate and sleep after the notification while join waits.\n        threadRunning = true;\n        thread = std::make_unique<std::thread>(&CompilationThread::loop, this);")
+string(FIND
+    "${FN64_RT64_RASTER_SHADER_CACHE_CONTENTS}"
+    "${FN64_RT64_COMPILATION_THREAD_START_ORIGINAL}"
+    FN64_RT64_COMPILATION_THREAD_START_OFFSET)
+if(FN64_RT64_COMPILATION_THREAD_START_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 raster-shader worker startup source changed; review the fn64 predicate overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_COMPILATION_THREAD_START_ORIGINAL}"
+    "${FN64_RT64_COMPILATION_THREAD_START_PATCHED}"
+    FN64_RT64_RASTER_SHADER_CACHE_PATCHED
+    "${FN64_RT64_RASTER_SHADER_CACHE_CONTENTS}")
+set(FN64_RT64_COMPILATION_THREAD_LOOP_ORIGINAL
+    "        threadRunning = true;\n\n        while (threadRunning) {")
+set(FN64_RT64_COMPILATION_THREAD_LOOP_PATCHED
+    "        while (threadRunning) {")
+string(FIND
+    "${FN64_RT64_RASTER_SHADER_CACHE_PATCHED}"
+    "${FN64_RT64_COMPILATION_THREAD_LOOP_ORIGINAL}"
+    FN64_RT64_COMPILATION_THREAD_LOOP_OFFSET)
+if(FN64_RT64_COMPILATION_THREAD_LOOP_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 raster-shader worker loop source changed; review the fn64 predicate overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_COMPILATION_THREAD_LOOP_ORIGINAL}"
+    "${FN64_RT64_COMPILATION_THREAD_LOOP_PATCHED}"
+    FN64_RT64_RASTER_SHADER_CACHE_PATCHED
+    "${FN64_RT64_RASTER_SHADER_CACHE_PATCHED}")
+set(FN64_RT64_RASTER_SHADER_CACHE_PATCHED_SOURCE
+    "${CMAKE_CURRENT_BINARY_DIR}/fn64_rt64_raster_shader_cache.cpp")
+file(WRITE
+    "${FN64_RT64_RASTER_SHADER_CACHE_PATCHED_SOURCE}"
+    "${FN64_RT64_RASTER_SHADER_CACHE_PATCHED}")
+set_source_files_properties(
+    "${FN64_RT64_RASTER_SHADER_CACHE_SOURCE}"
+    TARGET_DIRECTORY rt64
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+target_sources(rt64 PRIVATE "${FN64_RT64_RASTER_SHADER_CACHE_PATCHED_SOURCE}")
+target_include_directories(rt64 PRIVATE
+    "${FN64_RT64_SOURCE_DIR}/src/render")
+
+if(FN64_RT64_HFR_EVIDENCE)
+    # Observe the exact actual-present boundary without changing its control
+    # flow. The full-file digest and exact replacement contexts bind this
+    # evidence overlay to the reviewed pinned MIT source and fail on drift.
+    set(FN64_RT64_PRESENT_QUEUE_SOURCE
+        "${FN64_RT64_SOURCE_DIR}/src/hle/rt64_present_queue.cpp")
+    file(SHA256
+        "${FN64_RT64_PRESENT_QUEUE_SOURCE}"
+        FN64_RT64_PRESENT_QUEUE_SHA256)
+    if(NOT FN64_RT64_PRESENT_QUEUE_SHA256 STREQUAL
+       "023dc3f4bc74bf6863e37ad1781fb32eaa543a7713bd8b9a3757b2262a1a1e52")
+        message(FATAL_ERROR
+            "RT64 present-queue source changed; review the HFR pacing overlay")
+    endif()
+    file(READ
+        "${FN64_RT64_PRESENT_QUEUE_SOURCE}"
+        FN64_RT64_PRESENT_QUEUE_CONTENTS)
+    set(FN64_RT64_PRESENT_QUEUE_DECLARATION_ORIGINAL [=[#include "rt64_workload_queue.h"
+
+namespace RT64 {]=])
+    set(FN64_RT64_PRESENT_QUEUE_DECLARATION_PATCHED [=[#include "rt64_workload_queue.h"
+
+extern "C" void fn64_rt64_hfr_present_call_observe(void *, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+
+namespace RT64 {]=])
+    string(FIND
+        "${FN64_RT64_PRESENT_QUEUE_CONTENTS}"
+        "${FN64_RT64_PRESENT_QUEUE_DECLARATION_ORIGINAL}"
+        FN64_RT64_PRESENT_QUEUE_DECLARATION_OFFSET)
+    if(FN64_RT64_PRESENT_QUEUE_DECLARATION_OFFSET EQUAL -1)
+        message(FATAL_ERROR
+            "RT64 present-queue declaration context changed; review the HFR pacing overlay")
+    endif()
+    string(REPLACE
+        "${FN64_RT64_PRESENT_QUEUE_DECLARATION_ORIGINAL}"
+        "${FN64_RT64_PRESENT_QUEUE_DECLARATION_PATCHED}"
+        FN64_RT64_PRESENT_QUEUE_PATCHED
+        "${FN64_RT64_PRESENT_QUEUE_CONTENTS}")
+    set(FN64_RT64_PRESENT_QUEUE_CALL_ORIGINAL [=[                presentTimestamp = Timer::current();
+                swapChainValid = ext.swapChain->present(swapChainIndex, &waitSemaphore, 1);
+                presentProfiler.logAndRestart();]=])
+    set(FN64_RT64_PRESENT_QUEUE_CALL_PATCHED [=[                presentTimestamp = Timer::current();
+                fn64_rt64_hfr_present_call_observe(ext.device, present.presentId, uint32_t(i), uint32_t(framesToPresent), viOriginalRate, targetRate, 0, 1);
+                swapChainValid = ext.swapChain->present(swapChainIndex, &waitSemaphore, 1);
+                fn64_rt64_hfr_present_call_observe(ext.device, present.presentId, uint32_t(i), uint32_t(framesToPresent), viOriginalRate, targetRate, 1, swapChainValid ? 1U : 0U);
+                presentProfiler.logAndRestart();]=])
+    string(FIND
+        "${FN64_RT64_PRESENT_QUEUE_PATCHED}"
+        "${FN64_RT64_PRESENT_QUEUE_CALL_ORIGINAL}"
+        FN64_RT64_PRESENT_QUEUE_CALL_OFFSET)
+    if(FN64_RT64_PRESENT_QUEUE_CALL_OFFSET EQUAL -1)
+        message(FATAL_ERROR
+            "RT64 present-call context changed; review the HFR pacing overlay")
+    endif()
+    string(REPLACE
+        "${FN64_RT64_PRESENT_QUEUE_CALL_ORIGINAL}"
+        "${FN64_RT64_PRESENT_QUEUE_CALL_PATCHED}"
+        FN64_RT64_PRESENT_QUEUE_PATCHED
+        "${FN64_RT64_PRESENT_QUEUE_PATCHED}")
+    set(FN64_RT64_PRESENT_QUEUE_PATCHED_SOURCE
+        "${CMAKE_CURRENT_BINARY_DIR}/fn64_rt64_present_queue.cpp")
+    file(WRITE
+        "${FN64_RT64_PRESENT_QUEUE_PATCHED_SOURCE}"
+        "${FN64_RT64_PRESENT_QUEUE_PATCHED}")
+    set_source_files_properties(
+        "${FN64_RT64_PRESENT_QUEUE_SOURCE}"
+        TARGET_DIRECTORY rt64
+        PROPERTIES HEADER_FILE_ONLY TRUE)
+    target_sources(rt64 PRIVATE "${FN64_RT64_PRESENT_QUEUE_PATCHED_SOURCE}")
+    target_include_directories(rt64 PRIVATE
+        "${FN64_RT64_SOURCE_DIR}/src/hle")
+endif()
+
 # plume acquires several autoreleased convenience-factory results, then manually
 # releases them from commit/end/destructor paths. When RT64's workload thread
 # exits, its implicit autorelease pool releases the already-deallocated AGX blit
@@ -173,6 +306,17 @@ target_compile_definitions(fn64_rt64_shim PRIVATE
     FFX_GCC
     IMGUI_IMPL_VULKAN_NO_PROTOTYPES
 )
+if(FN64_RT64_HFR_EVIDENCE)
+    target_compile_definitions(fn64_rt64_shim PRIVATE FN64_RT64_HFR_EVIDENCE)
+endif()
+if(FN64_RT64_SYNTHETIC_F3DEX2_EVIDENCE)
+    target_compile_definitions(fn64_rt64_shim PRIVATE
+        FN64_RT64_SYNTHETIC_F3DEX2_EVIDENCE)
+endif()
+if(FN64_RT64_SYNTHETIC_S2DEX_EVIDENCE)
+    target_compile_definitions(fn64_rt64_shim PRIVATE
+        FN64_RT64_SYNTHETIC_S2DEX_EVIDENCE)
+endif()
 target_include_directories(fn64_rt64_shim PRIVATE
     "${FN64_RT64_SOURCE_DIR}/src"
     "${FN64_RT64_SOURCE_DIR}/src/contrib"
