@@ -376,7 +376,7 @@ mod tests {
             va_end: va_start + (rom_end - rom_start),
         });
         db.conclude(
-            &format!("bank:{bank}"),
+            format!("bank:{bank}"),
             crate::facts::ProofState::Proven,
             vec![id],
             "test",
