@@ -34,6 +34,13 @@ pub const MIN_SIGNATURE_WORDS: usize = 8;
 /// A signature matching more sites than this is not identifying anything.
 pub const MAX_MATCHES_PER_SIGNATURE: usize = 4;
 
+/// Largest word stride a handler table may use. Stride 1 is a dense
+/// `const Func[]`; 2/3/4 covers struct-of-`{data..., Func}` dispatch
+/// arrays (SM64 `sInteractionHandlers` is `{flag, Func}` = stride 2).
+/// Larger strides risk matching incidental periodic pointers in unrelated
+/// structs, so the scan stops here.
+pub const MAX_TABLE_STRIDE: usize = 4;
+
 /// One donor function's relocation-masked body. `name` is diagnostic
 /// only — grading never consumes it.
 #[derive(Debug, Clone)]
@@ -189,15 +196,19 @@ pub fn plausible_function_boundary(raw_words: &[u32], offset: usize) -> bool {
 /// interpreter indexes the array at runtime). This is the dispatch
 /// equivalent of a jump table, one level up.
 ///
-/// Detection is a run of `>= min_run` consecutive words where every word
-/// is a 4-aligned address inside `[va_start, code_end)` AND lands on a
-/// [`plausible_function_boundary`]. The boundary requirement is the guard
-/// against a run of float/fixed-point constants that alias as `0x80xxxxxx`
-/// addresses: an aliasing run essentially never has all of its words point
-/// at real function starts, whereas a genuine handler table does by
-/// construction. Returns each such entry VA (deduplicated, sorted); the
-/// caller seeds them as callable-entry roots and `wrong == 0` is the final
-/// adversarial judge.
+/// Detection is a STRIDED run of `>= min_run` pointer slots at a fixed
+/// word stride `S` (1..=`MAX_TABLE_STRIDE`), where every slot is a
+/// 4-aligned address inside `[va_start, code_end)` landing on a
+/// [`plausible_function_boundary`], and the non-slot words between them
+/// are NOT such addresses. Stride 1 is the dense `const Func[]` case;
+/// stride 2/3/4 covers struct-of-`{data, Func}` arrays common in
+/// dispatch tables (SM64's `sInteractionHandlers` is `{u32 flag; Func
+/// handler}` at stride 2). The boundary requirement on every slot is the
+/// guard against float/fixed-point alias runs; requiring the interleaved
+/// words to be non-pointers keeps a stride-`S` scan from re-reading a
+/// denser table as a sparser one. Returns each pointer-slot VA
+/// (deduplicated, sorted); the caller seeds them as callable-entry roots
+/// and `wrong == 0` is the final adversarial judge.
 pub fn detect_handler_tables(
     bank_words: &[u32],
     text_words: &[u32],
@@ -217,18 +228,57 @@ pub fn detect_handler_tables(
     };
 
     let mut entries: Vec<u32> = Vec::new();
-    let mut run_start: Option<usize> = None;
-    for index in 0..=bank_words.len() {
-        let in_run = index < bank_words.len() && is_entry(bank_words[index]);
-        match (run_start, in_run) {
-            (None, true) => run_start = Some(index),
-            (Some(start), false) => {
-                if index - start >= min_run {
-                    entries.extend(bank_words[start..index].iter().copied());
+    // Slots already claimed by a table, so a denser stride wins and a
+    // sparser stride does not re-harvest the same pointers.
+    let mut claimed = vec![false; bank_words.len()];
+
+    for stride in 1..=MAX_TABLE_STRIDE {
+        let mut start: Option<usize> = None;
+        let mut index = 0usize;
+        while index < bank_words.len() {
+            let slot_ok = !claimed[index] && is_entry(bank_words[index]);
+            // For stride > 1, the word(s) between this slot and the next
+            // must NOT be pointer-like (that would be a denser table).
+            let interstitial_ok = stride == 1
+                || (1..stride).all(|k| {
+                    bank_words
+                        .get(index + k)
+                        .is_none_or(|&w| !is_entry(w))
+                });
+            if slot_ok && interstitial_ok {
+                if start.is_none() {
+                    start = Some(index);
                 }
-                run_start = None;
+                index += stride;
+            } else {
+                if let Some(s) = start.take() {
+                    let count = (index - s).div_ceil(stride);
+                    if count >= min_run {
+                        let mut i = s;
+                        while i < index {
+                            if !claimed[i] {
+                                entries.push(bank_words[i]);
+                                claimed[i] = true;
+                            }
+                            i += stride;
+                        }
+                    }
+                }
+                index += 1;
             }
-            _ => {}
+        }
+        if let Some(s) = start.take() {
+            let count = (bank_words.len() - s).div_ceil(stride);
+            if count >= min_run {
+                let mut i = s;
+                while i < bank_words.len() {
+                    if !claimed[i] {
+                        entries.push(bank_words[i]);
+                        claimed[i] = true;
+                    }
+                    i += stride;
+                }
+            }
         }
     }
     entries.sort_unstable();
@@ -363,5 +413,34 @@ mod tests {
             detect_handler_tables(&floaty, &text, va, code_end, 4).is_empty(),
             "addresses pointing at delay-slot nops are not function boundaries"
         );
+    }
+
+    #[test]
+    fn detect_handler_tables_finds_strided_struct_table() {
+        // 4 leaf functions (same layout as above).
+        let va = 0x8024_6000;
+        let text: Vec<u32> = vec![
+            0x03e00008, 0x00000000, // fn @ +0x00
+            0x03e00008, 0x00000000, // fn @ +0x08
+            0x03e00008, 0x00000000, // fn @ +0x10
+            0x03e00008, 0x00000000, // fn @ +0x18
+        ];
+        let code_end = va + (text.len() as u32) * 4;
+        // A `{u32 flag; Func handler}` struct array: ptr at +0, non-ptr
+        // flag at +1, stride 2 words. (SM64 sInteractionHandlers shape.)
+        let table = [
+            va, 0x0000_0010, // {handler0, flag}
+            va + 0x08, 0x0001_0000, // {handler1, flag}
+            va + 0x10, 0x0000_1000, // {handler2, flag}
+            va + 0x18, 0x0800_0000, // {handler3, flag}
+        ];
+        let mut bank = text.clone();
+        bank.extend_from_slice(&table);
+        let entries = detect_handler_tables(&bank, &text, va, code_end, 4);
+        assert_eq!(entries, vec![va, va + 0x08, va + 0x10, va + 0x18]);
+
+        // The interleaved flag words must NOT be seeded as roots (they are
+        // not in-window code addresses; verified they are absent above).
+        assert!(!entries.contains(&0x0000_0010));
     }
 }
