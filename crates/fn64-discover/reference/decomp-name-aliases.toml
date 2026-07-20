@@ -48,3 +48,13 @@ names = ["proutPrintf", "write_to_buf"]
 # exactly the two HI/LO relocation pairs and the jal target — both jal
 # Fault_AddClient.
 names = ["CIC6105_AddFaultClient", "CIC6105_AddRomInfoFaultPage"]
+
+[[alias]]
+# The SI controller/pak init-data reader, renamed across libultra SDK
+# versions (__osContGetInitData in SM64-era libultra; __osPfsGetInitData
+# in later SDKs — each corpus dump carries exactly one of the two).
+# Adjudicated 2026-07-19 at byte level: retail-ROM word compare (K64
+# 0x37960 / SM64 0xDEEBC, 52 words, both 0xD0): 46/52 bit-identical and
+# all 6 diffs are HI/LO relocation pairs addressing per-game globals
+# (lui+lbu, lui+addiu) — same machine code modulo relocations.
+names = ["__osContGetInitData", "__osPfsGetInitData"]
