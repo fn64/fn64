@@ -336,8 +336,16 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v15 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v16 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
+
+The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
+For each graphics LLE generation, the ABI hashes the complete live 4 KiB IMEM
+image and asks the registered backend only for exact catalog recognition; the
+backend cannot supply the digest or choose execution policy. Successful IMEM
+replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
+release observation, not future-affecting DeviceState, so ROM installation
+clears it and report schema v16 binds it independently.
 
 The emitted crate is out-of-tree, game-derived material, and per `AGENTS.md`
 it must never enter git or the main workspace graph. That constraint — not

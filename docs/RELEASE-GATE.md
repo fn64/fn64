@@ -20,17 +20,26 @@ zero-unsupported full-ROM claim has been made.
 
 The digest rejects a wrong-cycle, duplicate, reordered, or omitted channel.
 Each channel has a canonical lowercase SHA-256, and both live construction and
-retained-report verification recompute the artifact root from the v15 schema,
-cycle, exact ordered channel set, byte lengths, and channel hashes. Schema v15
+retained-report verification recompute the artifact root from the v16 schema,
+cycle, exact ordered channel set, byte lengths, and channel hashes. Schema v16
 emits each closure path's
 typed observation count and `report_sha256`, an explicit wire digest over the
 schema, scenario, private input hash, complete fixed-cycle digest, and
 canonical counted closure ledger. It additionally binds the exact entered
 execution-destination sequence, its canonical unique destination set and
-counts, and independent ordered/set SHA-256 values. It also binds framebuffer source, format,
+counts, and independent ordered/set SHA-256 values. V16 additionally binds the
+ABI-owned ordered RSP/RDP stream: exact 4 KiB IMEM digests, diagnostic family
+recognition from the registered backend's runtime catalog, committed IMEM
+replacements, and DRAM/XBUS DPC command digests. Recognition is
+diagnostic/optimization evidence only; release reports still require
+`LleAccuracy`, so a backend label never substitutes HLE execution for the
+ROM's RSP instructions or independently certifies its family. V16 validation
+requires nondecreasing event cycles and global IMEM generations, strictly
+advancing replacement generations, and one consistent text digest per
+generation. It also binds framebuffer source, format,
 dimensions, tight row size, payload size, and either the physical RDRAM address
 or RT64 post-VI backend/settings/workload/present identity, plus the complete
-physical RDRAM observation range and boundary-frozen release environment. V14
+physical RDRAM observation range and boundary-frozen release environment. V15
 and earlier reports are rejected rather than reinterpreted under this new wire.
 The Memory
 artifact byte count must be exactly eight
@@ -43,7 +52,7 @@ truly program-free fixture from an unidentified linked native/C program. V10
 lacks the boundary-frozen platform, four-port, cartridge-save, and renderer
 environment, while v11 omits Controller Pak bank geometry and the active bank
 latch. Cite the report SHA for cross-run evidence; the artifact root
-alone does not bind the scenario's private-input or environment (although v15's
+alone does not bind the scenario's private-input or environment (although v16's
 DeviceState component binds installed-ROM and executable-program identities). The
 report never serializes ROM, framebuffer,
 audio, trace source, or RDRAM bytes. Device and trace encodings have explicit
@@ -51,22 +60,23 @@ big-endian wire formats; Rust `Debug`, host wall time, and the diagnostic
 sequence counter do not enter the root.
 
 The artifact-root wire is itself domain-separated by the release-report
-schema. Moving from v14 to v15 therefore intentionally changes both the
-artifact root and `report_sha256`, even for reference-RDRAM reports whose
-capture bytes and geometry are otherwise unchanged. V15 adds RT64's completed
-workload identity to the v3 render envelope, typed post-VI observation, and
-report wire; historical roots cannot be relabeled as v15 evidence.
+schema. Moving from v15 to v16 therefore intentionally changes both the
+artifact root and `report_sha256`, even for reports whose five captured
+channels are otherwise unchanged. V16 adds the ordered RSP/RDP observation
+stream to the report wire. V15 had already added RT64's completed workload
+identity to the v3 render envelope and typed post-VI observation; neither v15
+nor older roots can be relabeled as v16 evidence.
 
 Consumers call `ReleaseGateReport::verify_integrity()` after deserializing a
 retained JSON artifact. `require_closed()` performs that verification first,
 so a mutated scenario, input hash, digest, observation descriptor, or ledger
 cannot be accepted with a stale report SHA. Verification also rejects a stale
-pre-v15 artifact root and contradictory closure states: unexercised means zero
+pre-v16 artifact root and contradictory closure states: unexercised means zero
 observations and events, zero-unsupported requires a positive count and no
 events, and unsupported requires a positive count covering a nonempty event
 list.
 
-Schema v15 retains `execution.unsupported-event-source` as a twelfth mandatory
+Schema v16 retains `execution.unsupported-event-source` as a twelfth mandatory
 path and the host-owned machine-readable observation geometry introduced by
 v6. Its DeviceState channel retains schema v7's compact guest register projection,
 PI timing-policy identity, pending PI/SI/AI/SP/RCP work and exact scheduled
@@ -96,8 +106,8 @@ native program, identified native archive, and typed Rust. Live release capture
 rejects the unidentified-native class. Native coroutine continuations and
 callable pointers remain excluded. Append-only save and controller-operation
 histories are also excluded from DeviceState v6 because they cannot affect a
-future device result; their typed observations instead enter the canonical v15
-closure ledger and therefore the report SHA. V15 likewise keeps historical
+future device result; their typed observations instead enter the canonical v16
+closure ledger and therefore the report SHA. V16 likewise keeps historical
 execution outside DeviceState. Identified native archives retain guest cycle,
 section index, function offset, and link VRAM from the injected first-body-entry
 hook. Typed whole-function execution retains guest cycle, link VRAM, and symbol
@@ -109,8 +119,10 @@ holes, failed destinations, and host calls do not count. A no-program fixture
 must have an empty stream. Unidentified native programs, typed function lanes
 without a regenerated entry-observation schema marker, cross-lane entries, missing block-runner identity,
 future cycle-stamped entries, and any entry appended after the committed
-boundary fail closed. Previously retained v7 through v14 reports remain
-historical evidence but are not valid inputs to the v15 series verifier.
+boundary fail closed. The v16 RSP/RDP stream is likewise append-only release
+observation rather than future-affecting DeviceState. Previously retained v7
+through v15 reports remain historical evidence but are not valid inputs to the
+v16 series verifier.
 Regenerate each scenario's ten-report series; do not reinterpret or edit old
 reports.
 
@@ -122,7 +134,7 @@ the producer-supplied artifact identity, stable `(link VRAM, symbol)` identity,
 and current guest cycle. Artifact identity alone is insufficient: authoritative
 installation must consume the regenerated artifact's exported
 `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA` marker. The committed-boundary freeze,
-v15 report, private admission, and paired verifier consume that stream as the
+v16 report, private admission, and paired verifier consume that stream as the
 distinct `typed_observed_function` lane. The stale `typed_function` label and
 identity-only installations remain rejected.
 
@@ -213,7 +225,7 @@ retain execution order; an undrained storage-owner history is a loud invariant
 failure rather than a best-effort merge with unknowable order.
 
 The live gate derives those entries from captured bytes and typed trace events;
-its host cannot mark them covered by declaration, and the schema-v15 report
+its host cannot mark them covered by declaration, and the schema-v16 report
 factory is crate-private so external callers cannot bypass the typed live
 capture methods accidentally. `unexercised` means no corresponding
 observation reached the gate. `exercised_zero_unsupported` means the path ran
@@ -244,7 +256,7 @@ typed event is appended and flushed immediately. Journal v3 binds a canonical,
 caller-supplied run-event SHA-256 in that armed header, then writes its
 completion record only after the fixed-cycle report itself is durable and
 binds the exact guest cycle, the report's `report_sha256`, and the same run
-identity. A closed v15 report is release evidence only when paired with that
+identity. A closed v16 report is release evidence only when paired with that
 terminal v3 journal. A
 journal with events but no completion identifies a reached loud trap; an
 armed-only journal identifies an early abort or otherwise unobserved path; and
@@ -307,7 +319,8 @@ captured only on the explicit `advance_virtual_time(C)` edge, after due
 device/VI events are committed and before any newly woken guest thread runs.
 That edge returns an opaque, single-use `CommittedViBoundary`; both live
 capture methods require the witness and reject it if executor, device, save,
-controller-operation, or guest time advances before capture. An always-on
+controller-operation, RSP/RDP observation history, or guest time advances
+before capture. An always-on
 monotonic coroutine-resume
 epoch makes that proof independent of optional diagnostic tracing, including a
 same-cycle resume with tracing disabled. Cycle equality alone cannot call the
@@ -322,7 +335,7 @@ their exact-edge freshness is a separate host responsibility.
 An instruction checkpoint reaching `C` never captures a report; a later step
 past `C` fails loudly. A step limit, swap limit, or idle exit before `C` also
 cannot return success without a report. This opaque-boundary rule is
-independent of the schema-v15 wire shape and its geometry-bound encoding.
+independent of the schema-v16 wire shape and its geometry-bound encoding.
 
 The cycle and report variables are an inseparable pair. Report-only,
 cycle-only, non-Unicode release/discovery values, and unknown renderers while a
@@ -347,7 +360,7 @@ buffers:
 - memory bytes are the complete physical eight-MiB RDRAM image, also copied in
   logical byte order.
 
-Schema v15 binds both paths through one typed descriptor. Reference capture can
+Schema v16 binds both paths through one typed descriptor. Reference capture can
 only construct physical-RDRAM RGBA16 evidence, RT64 capture can only construct
 post-VI BGRA8 evidence, and both require a complete logical-byte observation of
 physical eight-MiB RDRAM. The release-matrix verifier derives presentation
@@ -401,7 +414,7 @@ cargo run -p fn64-boot-harness --bin verify-release-evidence-series -- \
 ```
 
 The required `--program-lane` value must match the content-free readiness
-report emitted before the run. The checker compares it with every v15
+report emitted before the run. The checker compares it with every v16
 report's `execution_destinations.source`; stale `typed_function` and
 `unidentified_native` are rejected with the exact remediation before any
 report pair is accepted, and a source mismatch says to rerun rather than
@@ -424,7 +437,8 @@ pairs; there is no report-only release verifier.
 It runs a real executor coroutine and message queue, commits timed PI, SI, and
 AI work, admits graphics and audio SP tasks, renders and presents a raw RDP
 fixture through the reference backend, commits the exact scheduled VI edge,
-and captures all five schema-v15 channels. One invocation writes one report and
+and captures all five schema-v16 channels plus the ABI-owned RSP/RDP stream.
+One invocation writes one report and
 one bound v3 journal. The runner must generate a fresh canonical event identity
 before launch and pass it as the third argument:
 
@@ -532,10 +546,10 @@ accepted all ten at guest cycle `1562500` under scenario
 `synthetic-runtime-device-render-fixed-cycle-v1`. Their exact digests are
 historical manual evidence, not tested by the current schema, and therefore are
 not release gates. This closed the now-historical schema-v12 public mechanism
-bar only; v13 required regenerated native/block execution destinations, and
-v15 additionally requires regenerated evidence for the observed typed-function
-lane. Neither series certifies a private ROM or representative banked-accessory
-execution.
+bar only; v13 required regenerated native/block execution destinations, v15
+required regenerated observed typed-function evidence, and v16 requires the
+ordered RSP/RDP stream. Neither series certifies a private ROM or
+representative banked-accessory execution.
 
 ## Representative release matrix
 
@@ -552,17 +566,24 @@ blockers on each target. Synthetic fixtures are mechanism evidence and cannot
 satisfy a real full-ROM class.
 
 Each of at most 64 scenario declarations binds only a stable diagnostic ID,
-one exact schema-v15 `report_scenario`, private-input SHA-256, report SHA-256,
+one exact schema-v16 `report_scenario`, private-input SHA-256, report SHA-256,
 and a canonical v5 `declaration_sha256` over those identities. The verifier
 first validates every report, then routes it by the report's own `scenario`
 value, which must match exactly one manifest declaration; command-line IDs
 cannot assign evidence to a different declaration. Platform, all four PIF port
 identities, cartridge-save hardware, renderer/presentation mode, and executable
 program lane are derived as scenario coverage from the committed-boundary
-report. The manifest cannot cross-label them. Of those derived values, the
-current FullParityV1 assignment pass can satisfy only program/renderer-lane,
-save, and controller requirements; the coarse host platform cannot satisfy an
-exact platform/API target.
+report. The manifest cannot cross-label them. Committed DRAM-DPC, XBUS-DPC,
+and IMEM-replacement mechanisms are likewise derived solely from the validated
+v16 stream. A backend-recognized family remains diagnostic/optimization
+evidence. Public-microcode credit instead requires the reported text digest to
+match the immutable project-owned certified-public-microcode catalog v1; a
+contradictory backend family is rejected. That catalog is currently empty
+pending allowed-source digest provenance, so v13 cannot yet satisfy any of the
+twelve public-microcode requirements. The current FullParityV1 assignment pass
+can satisfy program/renderer-lane, save, controller, and RSP/RDP mechanism
+requirements; the coarse host platform cannot satisfy an exact platform/API
+target.
 
 Derived EEPROM, SRAM, and FlashRAM coverage still requires the corresponding
 positive device-qualified save path. Derived controller coverage likewise
@@ -571,17 +592,17 @@ applicable; a controller with an accessory projects both
 `standard_controller` and that accessory. RT64 evidence requires the
 authoritative clean fn64 adapter identity, matching post-VI settings identity,
 LLE-accuracy policy, and exact post-VI capture. Every scenario still requires
-exactly ten schema-v15 reports, each paired with its terminal v3 journal and a
+exactly ten schema-v16 reports, each paired with its terminal v3 journal and a
 globally unique run-event identity, while proving all five fixed-cycle
 artifacts, every live-minimum path, and zero reached unsupported events.
 
-Schema v15 cannot yet expose ROM class, decoded TV region, encountered
-microcode families, DRAM/XBUS/IMEM execution mechanisms, Windows version/API,
-platform case results, or blocker closure. Valid v15 evidence therefore returns
-a typed `Incomplete` assessment listing the exact unsatisfied project-owned
-requirements; it never emits a smaller passing denominator. Report schema v16
-and typed external platform/blocker results are the next evidence inputs needed
-before a `Complete` v12 retained matrix is reachable.
+Schema v16 still cannot expose ROM class, decoded TV region, exact Windows
+version/API, platform case results, or blocker closure. Valid v16 evidence
+therefore returns a typed `Incomplete` assessment listing the exact
+unsatisfied project-owned requirements; it never emits a smaller passing
+denominator. Allowed-source identities in a successor certified-public-
+microcode catalog, typed ROM/region evidence, and external platform/blocker
+results are required before a `Complete` v13 retained matrix is reachable.
 
 A minimal two-scenario shape is:
 
@@ -654,20 +675,21 @@ making no stronger claim than provenance about physical process independence.
 
 For a complete result, the default output is a human summary. Until all 162
 profile requirements are proved, `--json` emits a tagged `incomplete` result
-whose nested `fn64.release-matrix-incomplete.v1` assessment binds the manifest
+whose nested `fn64.release-matrix-incomplete.v2` assessment binds the manifest
 and profile identities, verified counts, evidence-derived satisfied
 assignments, the canonical missing requirement list, and its own SHA-256; the
 command then exits nonzero. It is diagnostic evidence, not a verified release
 artifact.
 
 Only a complete profile emits a retained, machine-readable
-`fn64.verified-release-matrix.v12` result. It contains the canonical manifest
+`fn64.verified-release-matrix.v13` result. It contains the canonical manifest
 and profile identities, every scenario's derived coverage and exact
 input/report/declaration identity, the five fixed-cycle artifact
 digests and byte lengths, the exact guest cycle, the canonical closure ledger
 and its redundant path count, exact
 boundary-frozen environment, the exact ordered and canonical unique/count
-execution-destination evidence with both digests, explicit zero unsupported-event count, v3
+execution-destination evidence with both digests, the complete ordered RSP/RDP
+stream and its digest, explicit zero unsupported-event count, v3
 journal schema and binding count, the exact ordered run-event SHA-256 list, the typed
 observation geometry (including RT64's nonzero completed workload and present
 IDs), and whether its source proves a committed-VI physical framebuffer or
@@ -675,7 +697,7 @@ RT64's exact post-VI capture. A top-level verification SHA binds
 that complete result; no ROM, framebuffer, audio, RDRAM, or recompiled bytes are
 serialized.
 
-`--verify-json` accepts only that complete v12 artifact and does not treat its
+`--verify-json` accepts only that complete v13 artifact and does not treat its
 self-digest as sufficient by itself. It
 revalidates the retained semantic envelope: one to 64 scenarios and valid,
 unique scenario/report identities,
@@ -687,16 +709,17 @@ rejects operation paths outside the frozen environment (including PFS without
 a Controller Pak), re-derives scenario coverage from the retained report,
 enforces renderer combinations and exact program-lane agreement, proves that
 every member of the immutable profile has a validated evidence assignment,
-recomputes every declaration SHA, reconstructs each retained v15 report and
+recomputes every declaration SHA, reconstructs each retained v16 report and
 its report SHA, and reconstructs the canonical manifest SHA.
 A freshly re-digested empty, zero-path, relabeled, under-covered, cross-labeled,
 or manifest-mismatched document is therefore rejected without the original
 manifest. Historical retained JSON through v10 omits some part of the current
 execution-destination, run-provenance, RT64 workload, or typed program-lane
 envelope. V11 retains that envelope but lacks the fixed FullParityV1 profile
-identity and requirement assignments. Every historical version through v11 is
+identity and requirement assignments; v12 lacks the retained v16 RSP/RDP
+stream and its derived assignments. Every historical version through v12 is
 intentionally rejected; regenerate it from a v5 manifest and bound
-report/journal pairs rather than relabeling it as v12.
+report/journal pairs rather than relabeling it as v13.
 
 Keep populated results private when their scenario names or hashes disclose
 game identity:
@@ -720,10 +743,10 @@ certified release matrix**. The exact state is:
 | ROM/report class | Mechanism available | Certified evidence retained |
 | --- | --- | --- |
 | Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, paired ten-report series verification, real executor/device/VI/reference-render boundaries, derived matrix coverage, and the canonical incomplete assessment are available. | Mechanism evidence only; synthetic bytes are not a ROM certification, and an incomplete assessment is not a retained verified matrix. |
-| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, and an artifact/schema-bound whole-function entry stream exist. The v15 report and private policy admit the observed function stream; the host uses the schema-enabled boot API and a path-independent generated-source identity. | Regenerate the stale cached private generated crate so it exports the marker, then produce a ten-run `typed_observed_function` series (or generate and select the real block pack). |
-| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, explicit `BlockProgram` host selection, and an artifact/schema-bound whole-function entry stream exist. The host consumes the schema marker; earlier local private groups are pre-v15 historical evidence only. | Regenerate the private crate or generate the block pack, then run v15 with the ROM's successful banked 32-KiB SRAM operation path. |
+| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, and an artifact/schema-bound whole-function entry stream exist. The v16 report and private policy admit the observed function stream; the host uses the schema-enabled boot API and a path-independent generated-source identity. | Regenerate the stale cached private generated crate so it exports the marker, then produce a ten-run `typed_observed_function` v16 series (or generate and select the real block pack). |
+| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, explicit `BlockProgram` host selection, and an artifact/schema-bound whole-function entry stream exist. The host consumes the schema marker; earlier local private groups are pre-v16 historical evidence only. | Regenerate the private crate or generate the block pack, then run v16 with the ROM's successful banked 32-KiB SRAM operation path. |
 | OoT NTSC 1.0, legacy C lane | Observation tooling and exact linked-archive identity wiring exist. | Non-authoritative: measured framebuffer parity is only claimed through swap 60, and the C oracle's missing bodies prevent deeper arbitration beyond the known swap-231 frontier. |
-| Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v15-visible save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, and program-lane assignments while retaining the remaining project-owned profile entries as missing. | No private full-ROM report series, schema-v16 microcode/region evidence, or complete platform result set has been supplied. |
+| Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v16-visible save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, program-lane, and committed RSP/RDP-mechanism assignments while retaining the remaining project-owned profile entries as missing. Backend microcode labels are diagnostic only; independent public-microcode adjudication uses the empty project-owned catalog v1. | No public-microcode requirement can be credited until allowed-source identities populate a successor catalog; no private full-ROM v16 report series, typed ROM/region evidence, or complete platform result set has been supplied. |
 
 Therefore the generic report mechanism can validate multi-ROM
 zero-reached-unsupported evidence and retain its satisfied/missing profile
@@ -736,7 +759,7 @@ closure.
 
 ## Remaining release frontier
 
-- Schema v15 aggregates the modeled device fabric, executor control,
+- Schema v16 aggregates the modeled device fabric, executor control,
   ABI HostState, typed-Rust program identity, and exact native/C linked-archive
   identity plus actual platform, four-port controller/accessory placement,
   typed cartridge-save configuration, and renderer identity/policy at the
@@ -744,7 +767,8 @@ closure.
   whole-runtime savestate: native coroutine continuation stacks are not
   canonical or portable, and archive identity does not prove callable-body
   completeness. Exact ordered native/typed-function/block execution
-  destinations are bound, but equal v15 digests do not claim excluded
+  destinations and the ordered RSP/RDP observation stream are bound, but equal
+  v16 digests do not claim excluded
   continuation state is equal.
 - Extend the typed unsupported-site registry whenever a new runtime, ABI, or
   renderer boundary is added; preserve failed-run journals with reports.
@@ -753,6 +777,9 @@ closure.
   PFS, controller input, Rumble, Transfer Pak, and Voice rows require matching
   operations; every configuration row is bound to actual boundary-frozen
   owner state.
+- Populate a successor immutable certified-public-microcode catalog only from
+  reviewed allowed-source digest provenance; backend runtime catalogs and
+  readiness declarations cannot supply certification identities.
 - Extend scenario coverage to the full reachable-ROM frontier; even a complete
   representative matrix cannot establish paths its selected scenarios do not
   reach.

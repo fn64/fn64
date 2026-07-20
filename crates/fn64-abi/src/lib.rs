@@ -86,7 +86,7 @@ use std::cell::{Cell, RefCell};
 use corosensei::Yielder;
 use fn64_audio::AudioBackend;
 use fn64_render::RenderBackend;
-pub use fn64_render::RenderBackendEvidence;
+pub use fn64_render::{RenderBackendEvidence, UcodeId};
 use fn64_runtime::{
     AiDmaRequest, Cycles, DeviceFabric, DeviceFault, DeviceNotification, DmaDirection, Executor,
     ExternalEvent, FixedPiTiming, InMemoryRom, Mesg, MmioAddr, OsTaskHeader, PiDma, PiDmaError,
@@ -211,6 +211,44 @@ pub struct NativeExecutionDestination {
 pub struct NativeExecutionDestinationEvent {
     pub at: Cycles,
     pub destination: NativeExecutionDestination,
+}
+
+/// One committed RSP/RDP observation retained in exact ABI execution order.
+///
+/// This history is distinct from future-affecting device state. Microcode
+/// identity comes from the registered renderer's exact-digest catalog over a
+/// complete live IMEM image, while the ABI independently retains that image's
+/// digest. DPC observations appear only after the renderer accepts the exact
+/// command image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RspRdpObservationEvent {
+    pub at: Cycles,
+    pub kind: RspRdpObservationKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RspRdpObservationKind {
+    MicrocodeRecognition {
+        task_addr: RdramAddr,
+        imem_generation: u64,
+        text_sha256: [u8; 32],
+        family: Option<UcodeId>,
+    },
+    DramDpcCommitted {
+        start: u32,
+        end: u32,
+        command_sha256: [u8; 32],
+    },
+    XbusDpcCommitted {
+        start: u32,
+        end: u32,
+        command_sha256: [u8; 32],
+    },
+    ImemReplacementCommitted {
+        task_addr: RdramAddr,
+        imem_generation: u64,
+        text_sha256: [u8; 32],
+    },
 }
 
 /// Guest cycles charged per generated-C raw RCP register access. Uncached
@@ -617,6 +655,9 @@ struct HostState {
     /// admission. Configuration and probes are excluded; only guest-visible
     /// reads, writes, or controls append here.
     controller_operations: Vec<fn64_runtime::ControllerOperationEvent>,
+    /// Exact microcode-recognition and committed RSP/RDP mechanism history.
+    /// This is release observation, not future-affecting device state.
+    rsp_rdp_observations: Vec<RspRdpObservationEvent>,
     /// Stable destinations entered by prepared generated-C bodies. Native
     /// pointers are retained only in the registration map used to translate
     /// the in-body hook back to generated section identity.
@@ -701,6 +742,7 @@ impl Default for HostState {
             debug_packets: Vec::new(),
             save_operations: Vec::new(),
             controller_operations: Vec::new(),
+            rsp_rdp_observations: Vec::new(),
             native_execution_destinations: Vec::new(),
             native_destination_by_pointer: std::collections::HashMap::new(),
             thread_handles: std::collections::HashMap::new(),
@@ -886,6 +928,7 @@ fn classify_host_evidence_fields(host: &HostState) {
         debug_packets: _,
         save_operations: _,
         controller_operations: _,
+        rsp_rdp_observations: _,
         native_execution_destinations: _,
         native_destination_by_pointer: _,
         thread_handles: _,
@@ -1043,6 +1086,30 @@ pub fn copy_save_operations() -> Vec<fn64_runtime::SaveOperationEvent> {
 /// device was actually exercised by the guest.
 pub fn copy_controller_operations() -> Vec<fn64_runtime::ControllerOperationEvent> {
     with_host(|host| host.controller_operations.clone())
+}
+
+/// Copy exact committed RSP/RDP observations in ABI execution order.
+///
+/// Capability lists, task headers, and pending device requests never enter
+/// this history. Microcode entries require an exact lookup over the complete
+/// live IMEM image; mechanism entries require their corresponding memory or
+/// renderer commit to have succeeded.
+pub fn copy_rsp_rdp_observations() -> Vec<RspRdpObservationEvent> {
+    with_host(|host| host.rsp_rdp_observations.clone())
+}
+
+pub(crate) fn record_rsp_rdp_observations(kinds: Vec<RspRdpObservationKind>) {
+    if kinds.is_empty() {
+        return;
+    }
+    let at = Cycles::new(sim_time());
+    with_host(|host| {
+        host.rsp_rdp_observations.extend(
+            kinds
+                .into_iter()
+                .map(|kind| RspRdpObservationEvent { at, kind }),
+        );
+    });
 }
 
 pub(crate) fn record_controller_operation(

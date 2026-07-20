@@ -29,17 +29,19 @@ pub use release_gate::{
     ArtifactDigest, ArtifactKind, ClosureGate, ClosurePath, ClosurePathStatus, DeterministicDigest,
     ExecutionDestinationCountEvidence, ExecutionDestinationEventEvidence,
     ExecutionDestinationEvidence, ExecutionDestinationSource, FixedCycleDigestGate, GateError,
-    LiveReleaseGate, ReleaseExecutionDestination, ReleaseGateReport, UnsupportedEvent,
-    LIVE_CONTROLLER_OPERATION_CLOSURE_PATHS, LIVE_MINIMUM_CLOSURE_PATHS,
+    LiveReleaseGate, ReleaseExecutionDestination, ReleaseGateReport, ReleaseMicrocodeFamily,
+    RspRdpEvidence, RspRdpObservationEventEvidence, RspRdpObservationKindEvidence,
+    UnsupportedEvent, LIVE_CONTROLLER_OPERATION_CLOSURE_PATHS, LIVE_MINIMUM_CLOSURE_PATHS,
     LIVE_SAVE_OPERATION_CLOSURE_PATHS,
 };
 pub use release_matrix::{
     verify_release_matrix, CertificationRequirementAssignment, ControllerFeature,
-    IncompleteReleaseMatrix, PresentationBoundaryEvidence, ProgramFeature, ReleaseMatrixCoverage,
-    ReleaseMatrixError, ReleaseMatrixManifest, ReleaseMatrixScenario, ReleaseMatrixVerification,
-    ReleasePlatform, RendererFeature, SaveFeature, VerifiedMatrixScenario, VerifiedReleaseMatrix,
-    INCOMPLETE_RELEASE_MATRIX_SCHEMA, RELEASE_MATRIX_MAX_SCENARIOS, RELEASE_MATRIX_REPORT_COUNT,
-    RELEASE_MATRIX_SCHEMA, VERIFIED_RELEASE_MATRIX_SCHEMA,
+    IncompleteReleaseMatrix, MicrocodeFeature, PresentationBoundaryEvidence, ProgramFeature,
+    ReleaseMatrixCoverage, ReleaseMatrixError, ReleaseMatrixManifest, ReleaseMatrixScenario,
+    ReleaseMatrixVerification, ReleasePlatform, RendererFeature, RspRdpMechanismFeature,
+    SaveFeature, VerifiedMatrixScenario, VerifiedReleaseMatrix, INCOMPLETE_RELEASE_MATRIX_SCHEMA,
+    RELEASE_MATRIX_MAX_SCENARIOS, RELEASE_MATRIX_REPORT_COUNT, RELEASE_MATRIX_SCHEMA,
+    VERIFIED_RELEASE_MATRIX_SCHEMA,
 };
 pub use render_evidence::{
     LiveReleaseGateRenderExt, LiveRenderEvidence, RenderCaptureStage, RenderEvidenceError,
@@ -210,6 +212,7 @@ pub struct CommittedViBoundary {
     device_trace_events: usize,
     save_operation_events: usize,
     controller_operation_events: usize,
+    rsp_rdp_observations: Vec<fn64_abi::RspRdpObservationEvent>,
     native_execution_destinations: Vec<fn64_abi::NativeExecutionDestinationEvent>,
     #[cfg(feature = "recomp-rs")]
     function_execution_destinations:
@@ -430,6 +433,7 @@ type CommittedEvidence = (
     fn64_abi::AbiHostEvidenceSnapshot,
     ProgramEvidenceSnapshot,
     FrozenExecutionDestinations,
+    Vec<fn64_abi::RspRdpObservationEvent>,
     ReleaseHostPlatform,
     fn64_abi::RenderEnvironmentEvidenceSnapshot,
 );
@@ -584,6 +588,7 @@ fn commit_scheduled_vi_boundary_inner(
         device_trace_events: device_trace.len(),
         save_operation_events: fn64_abi::copy_save_operations().len(),
         controller_operation_events: fn64_abi::copy_controller_operations().len(),
+        rsp_rdp_observations: fn64_abi::copy_rsp_rdp_observations(),
         native_execution_destinations: fn64_abi::copy_native_execution_destinations(),
         #[cfg(feature = "recomp-rs")]
         function_execution_destinations,
@@ -610,6 +615,7 @@ impl CommittedViBoundary {
             && fn64_abi::copy_device_trace().len() == self.device_trace_events
             && fn64_abi::copy_save_operations().len() == self.save_operation_events
             && fn64_abi::copy_controller_operations().len() == self.controller_operation_events
+            && fn64_abi::copy_rsp_rdp_observations() == self.rsp_rdp_observations
             && fn64_abi::copy_native_execution_destinations() == self.native_execution_destinations
             && {
                 #[cfg(feature = "recomp-rs")]
@@ -645,6 +651,7 @@ impl CommittedViBoundary {
                 #[cfg(feature = "recomp-rs")]
                 block: self.block_execution_destinations,
             },
+            self.rsp_rdp_observations,
             self.platform,
             self.render_snapshot,
         ))
@@ -659,6 +666,7 @@ impl CommittedViBoundary {
             device_trace_events: fn64_abi::copy_device_trace().len(),
             save_operation_events: fn64_abi::copy_save_operations().len(),
             controller_operation_events: fn64_abi::copy_controller_operations().len(),
+            rsp_rdp_observations: fn64_abi::copy_rsp_rdp_observations(),
             native_execution_destinations: fn64_abi::copy_native_execution_destinations(),
             #[cfg(feature = "recomp-rs")]
             function_execution_destinations: Vec::new(),
@@ -1261,6 +1269,7 @@ mod tests {
             captured_host,
             _captured_program,
             _captured_destinations,
+            _captured_rsp_rdp,
             _captured_platform,
             _captured_renderer,
         ) = boundary.into_evidence().unwrap();

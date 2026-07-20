@@ -193,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_program_lane_must_match_the_v15_report_source() {
+    fn selected_program_lane_must_match_the_v16_report_source() {
         let native = ExecutionDestinationSource::NativeArchive {
             artifact_sha256: "11".repeat(32),
         };

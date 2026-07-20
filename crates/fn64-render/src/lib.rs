@@ -758,6 +758,18 @@ pub trait RenderBackend {
     /// gate on a `Result`) simple to wire.
     fn resize(&mut self, w: u32, h: u32);
 
+    /// Identify one complete logical IMEM image only when this backend has
+    /// explicitly admitted its exact digest as a public HLE microcode family.
+    /// This is evidence about content identity, not an execution selector:
+    /// callers still dispatch through the runtime's HLE/LLE mechanism, and
+    /// compatibility backends make no identity claim by default.
+    fn identify_microcode(
+        &self,
+        _imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    ) -> Option<UcodeId> {
+        None
+    }
+
     /// Which microcode families this backend actually implements. A task
     /// using an unlisted ucode must be rejected by `process_task` with
     /// `RenderError::UnsupportedUcode` (named, not a silent black frame) --
@@ -898,6 +910,10 @@ mod tests {
                 .process_task(&mut rdram, &mut rsp_memory, &task, 0)
                 .unwrap(),
             FrameStatus::Complete
+        );
+        assert_eq!(
+            backend.identify_microcode(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]),
+            None
         );
         backend.present(ViPresentation::default()).unwrap();
     }
