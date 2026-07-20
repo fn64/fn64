@@ -1,0 +1,60 @@
+# Cross-project answer-key name aliases for held-out homology grading.
+#
+# The corpus-homology oracle assumes "same function => same real name across
+# dumps". That held while all graded dumps came from one project's naming;
+# it breaks across decomp communities, which rename the same libultra/libc
+# function differently. Each group below asserts, with citation, that its
+# names denote ONE machine function — every claim was checked against the
+# dumps' own function sizes and the matcher's full-body (relocation-masked)
+# validation before being added. This file harmonizes ANSWER KEYS for
+# grading only; it is never an input to discovery or matching.
+#
+# Every group here must clear the masked-wrapper bar: for a small function,
+# bodies that mask identically could still be two distinct wrappers, so an
+# alias needs source- or byte-level adjudication, never just the match.
+
+[[alias]]
+# libultra csleep: zeldaret/oot renamed it Sleep_Cycles; zeldaret/mm keeps
+# the libultra name. Identical 0x6c bodies in both dumps.
+names = ["csleep", "Sleep_Cycles"]
+
+[[alias]]
+# libultra msleep: zeldaret/oot rename (0x54 bodies agree).
+names = ["msleep", "Sleep_Msec"]
+
+[[alias]]
+# libultra sleep: zeldaret/oot rename (0x40 bodies agree).
+names = ["sleep", "Sleep_Sec"]
+
+[[alias]]
+# libm tanf: Kirby64Ret keeps the libm name; zeldaret/mm carries the same
+# compiled body under its project math-library naming.
+names = ["tanf", "Math_FTanF"]
+
+[[alias]]
+# The stdio _Printf output callback: zeldaret projects call it proutPrintf,
+# Kirby64Ret calls it write_to_buf. Same compiled body.
+names = ["proutPrintf", "write_to_buf"]
+
+[[alias]]
+# The CIC6105 fault-page registration wrapper. Adjudicated 2026-07-19 at
+# source AND byte level (the 13-instruction case the masked-wrapper bar
+# exists for): zeldaret/oot src/boot/cic6105.c defines
+# `CIC6105_AddFaultClient { Fault_AddClient(&sCIC6105FaultClient,
+# CIC6105_FaultClient, NULL, NULL); }`; zeldaret/mm src/boot/CIC6105.c
+# defines the same wrapper renamed `CIC6105_AddRomInfoFaultPage` (client
+# struct and callback renamed alongside). Retail-ROM word compare (OoT
+# 0x2038 / MM 0x289C): 8 of 13 words bit-identical; the 5 diffs are
+# exactly the two HI/LO relocation pairs and the jal target — both jal
+# Fault_AddClient.
+names = ["CIC6105_AddFaultClient", "CIC6105_AddRomInfoFaultPage"]
+
+[[alias]]
+# The SI controller/pak init-data reader, renamed across libultra SDK
+# versions (__osContGetInitData in SM64-era libultra; __osPfsGetInitData
+# in later SDKs — each corpus dump carries exactly one of the two).
+# Adjudicated 2026-07-19 at byte level: retail-ROM word compare (K64
+# 0x37960 / SM64 0xDEEBC, 52 words, both 0xD0): 46/52 bit-identical and
+# all 6 diffs are HI/LO relocation pairs addressing per-game globals
+# (lui+lbu, lui+addiu) — same machine code modulo relocations.
+names = ["__osContGetInitData", "__osPfsGetInitData"]

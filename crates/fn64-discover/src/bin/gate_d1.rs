@@ -4,39 +4,46 @@
 //! their local ROM/key files are present.
 
 use fn64_discover::banks::{
-    DescriptorTableShape, DestinationEnd, DestinationRangeFields, DestinationSpace,
+    BankNamePattern, DescriptorTableShape, DestinationEnd, DestinationRangeFields, DestinationSpace,
     LoadImageTableInput, LoadImageTableShape, SourceRangeFields, TableLocation,
 };
+use fn64_discover::evidence::EvidenceManifest;
 use fn64_discover::facts::load_image_table_record_subject;
 use fn64_discover::grade_candidates::{grade_candidates, parse_symbol_dump, DetectorGrade};
 use fn64_discover::{
-    run_discovery, run_discovery_with_load_image_tables, DescriptorTableInput, RomAddressSpace,
+    run_discovery, run_discovery_with_load_image_tables, run_discovery_with_manifest,
+    DescriptorTableInput, RomAddressSpace,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
 
-const OOT_ROM: &str = "/Users/jer/Downloads/Legend of Zelda, The - Ocarina of Time (USA).z64";
-const OOT_DUMP: &str = "/Users/jer/Code/aki-recomp/games/OOTU/syms/dump.toml";
+fn oot_rom() -> Result<String, String> {
+    fn64_discover::required_env_path("FN64_DISCOVER_OOT_ROM", "an OoT NTSC 1.0 .z64")
+}
+fn oot_dump() -> Result<String, String> {
+    fn64_discover::required_env_path("FN64_DISCOVER_OOT_DUMP", "the OoT reference dump.toml")
+}
 const OOT_SHA1: &str = "ad69c91157f6705e8ab06c79fe08aad47bb57ba7";
 const OOT_FUNCTIONS: usize = 13_358;
 const OOT_SECTIONS: usize = 472;
 
-const NW4E_ROM: &str = "/Users/jer/Code/aki-recomp/games/NW4E/nomercy.z64";
-const NW4E_DUMP: &str = "/Users/jer/Code/aki-recomp/games/NW4E/syms/dump.toml";
-const NWXE_ROM: &str = "/Users/jer/Code/aki-recomp/games/NWXE/wm2000.z64";
-const NWXE_DUMP: &str = "/Users/jer/Code/aki-recomp/games/NWXE/syms/dump.toml";
+fn aki_inputs() -> Result<[(String, String); 2], String> {
+    Ok([
+        (
+            fn64_discover::required_env_path("FN64_DISCOVER_NW4E_ROM", "the NW4E .z64")?,
+            fn64_discover::required_env_path("FN64_DISCOVER_NW4E_DUMP", "the NW4E dump.toml")?,
+        ),
+        (
+            fn64_discover::required_env_path("FN64_DISCOVER_NWXE_ROM", "the NWXE .z64")?,
+            fn64_discover::required_env_path("FN64_DISCOVER_NWXE_DUMP", "the NWXE dump.toml")?,
+        ),
+    ])
+}
 
 fn nw4e_descriptor() -> DescriptorTableInput {
     (
-        DescriptorTableShape {
-            table_rom_offset: 0x0539a0,
-            record_count: 5,
-            record_stride: 0x24,
-            field_rom_start: 0x00,
-            field_rom_end: 0x04,
-            field_vram_dest: 0x08,
-        },
-        |index| format!("R{}", index + 1),
+        fn64_discover::aki_reference::NW4E_DESCRIPTOR_TABLE,
+        fn64_discover::aki_reference::nw4e_bank_name,
     )
 }
 
@@ -71,7 +78,7 @@ fn nwxe_descriptor() -> DescriptorTableInput {
 fn oot_load_image_tables() -> [LoadImageTableInput; 5] {
     [
         LoadImageTableInput {
-            name: "dmadata",
+            name: "dmadata".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Physical,
@@ -93,7 +100,7 @@ fn oot_load_image_tables() -> [LoadImageTableInput; 5] {
             bank_name: None,
         },
         LoadImageTableInput {
-            name: "effect_overlays",
+            name: "effect_overlays".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Virtual,
@@ -112,10 +119,10 @@ fn oot_load_image_tables() -> [LoadImageTableInput; 5] {
                     end: DestinationEnd::Field(0x0c),
                 },
             },
-            bank_name: Some(|index| format!("effect_overlay_{index}")),
+            bank_name: Some(BankNamePattern::new("effect_overlay_", 0, "")),
         },
         LoadImageTableInput {
-            name: "actor_overlays",
+            name: "actor_overlays".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Virtual,
@@ -134,10 +141,10 @@ fn oot_load_image_tables() -> [LoadImageTableInput; 5] {
                     end: DestinationEnd::Field(0x0c),
                 },
             },
-            bank_name: Some(|index| format!("actor_overlay_{index}")),
+            bank_name: Some(BankNamePattern::new("actor_overlay_", 0, "")),
         },
         LoadImageTableInput {
-            name: "gamestate_overlays",
+            name: "gamestate_overlays".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Virtual,
@@ -156,10 +163,10 @@ fn oot_load_image_tables() -> [LoadImageTableInput; 5] {
                     end: DestinationEnd::Field(0x10),
                 },
             },
-            bank_name: Some(|index| format!("gamestate_overlay_{index}")),
+            bank_name: Some(BankNamePattern::new("gamestate_overlay_", 0, "")),
         },
         LoadImageTableInput {
-            name: "kaleido_overlays",
+            name: "kaleido_overlays".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Virtual,
@@ -178,7 +185,7 @@ fn oot_load_image_tables() -> [LoadImageTableInput; 5] {
                     end: DestinationEnd::Field(0x10),
                 },
             },
-            bank_name: Some(|index| format!("kaleido_overlay_{index}")),
+            bank_name: Some(BankNamePattern::new("kaleido_overlay_", 0, "")),
         },
     ]
 }
@@ -190,24 +197,67 @@ fn main() {
         std::process::exit(1);
     }
 
+    let aki = aki_inputs().unwrap_or_else(|error| {
+        eprintln!("gate_d1: {error}");
+        std::process::exit(1);
+    });
+    let [(nw4e_rom, nw4e_dump), (nwxe_rom, nwxe_dump)] = aki;
     for (label, rom, dump, descriptor) in [
-        ("NW4E", NW4E_ROM, NW4E_DUMP, Some(nw4e_descriptor())),
-        ("NWXE", NWXE_ROM, NWXE_DUMP, Some(nwxe_descriptor())),
+        (
+            "NW4E",
+            nw4e_rom.as_str(),
+            nw4e_dump.as_str(),
+            Some(nw4e_descriptor()),
+        ),
+        (
+            "NWXE",
+            nwxe_rom.as_str(),
+            nwxe_dump.as_str(),
+            Some(nwxe_descriptor()),
+        ),
     ] {
         if !Path::new(rom).exists() || !Path::new(dump).exists() {
             println!("{label}: optional grade skipped (ROM or answer key absent)\n");
             continue;
         }
-        match grade_one(label, rom, dump, descriptor) {
+        let evidence_var = format!("FN64_DISCOVER_{label}_EVIDENCE");
+        let result = match std::env::var_os(&evidence_var) {
+            Some(path) => grade_one_with_manifest(label, rom, dump, Path::new(&path)),
+            None => grade_one(label, rom, dump, descriptor),
+        };
+        match result {
             Ok(()) => {}
             Err(error) => println!("{label}: optional grade unavailable: {error}\n"),
         }
     }
 }
 
-fn grade_oot() -> Result<(), String> {
+fn grade_one_with_manifest(
+    label: &str,
+    rom_path: &str,
+    dump_path: &str,
+    evidence_path: &Path,
+) -> Result<(), String> {
     let rom_bytes =
-        std::fs::read(OOT_ROM).map_err(|error| format!("reading {OOT_ROM}: {error}"))?;
+        std::fs::read(rom_path).map_err(|error| format!("reading {rom_path}: {error}"))?;
+    let evidence_text = std::fs::read_to_string(evidence_path)
+        .map_err(|error| format!("reading {}: {error}", evidence_path.display()))?;
+    let manifest =
+        EvidenceManifest::from_toml(&evidence_text).map_err(|error| error.to_string())?;
+    let (_rom, db) =
+        run_discovery_with_manifest(&rom_bytes, &manifest).map_err(|error| error.to_string())?;
+    let key_text = std::fs::read_to_string(dump_path)
+        .map_err(|error| format!("reading {dump_path}: {error}"))?;
+    let key = parse_symbol_dump(&key_text)?;
+    println!("{label}: evidence manifest {}", evidence_path.display());
+    print_report(label, &db, &key);
+    Ok(())
+}
+
+fn grade_oot() -> Result<(), String> {
+    let oot_rom_path = oot_rom()?;
+    let rom_bytes =
+        std::fs::read(&oot_rom_path).map_err(|error| format!("reading {oot_rom_path}: {error}"))?;
     let (rom, db) =
         run_discovery_with_load_image_tables(&rom_bytes, None, &oot_load_image_tables())
             .map_err(|error| format!("normalizing OoT ROM: {error}"))?;
@@ -218,8 +268,9 @@ fn grade_oot() -> Result<(), String> {
         ));
     }
     print_oot_phase2(&db);
-    let key_text = std::fs::read_to_string(OOT_DUMP)
-        .map_err(|error| format!("reading {OOT_DUMP}: {error}"))?;
+    let oot_dump_path = oot_dump()?;
+    let key_text = std::fs::read_to_string(&oot_dump_path)
+        .map_err(|error| format!("reading {oot_dump_path}: {error}"))?;
     let key = parse_symbol_dump(&key_text)?;
     if key.function_count != OOT_FUNCTIONS || key.section_count != OOT_SECTIONS {
         return Err(format!(

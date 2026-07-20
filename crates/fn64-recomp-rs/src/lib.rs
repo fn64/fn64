@@ -33,14 +33,29 @@
 #![forbid(unsafe_code)]
 
 pub mod decoder;
+pub mod drive;
 pub mod emit;
+pub mod execution;
+pub mod fallback;
+pub mod interp;
 pub mod module;
 pub mod runtime;
 
 pub use decoder::{decode, Instruction};
+pub use drive::ExecutorAction;
 pub use emit::{
-    emit_function, emit_function_resolved, CallResolver, CallTarget, FuncInput, NullResolver,
+    classify_bank_words, emit_bank_runner, emit_function, emit_function_resolved,
+    emit_sparse_bank_runner, BankBlockInput, BankInput, BankWordCatalog, BankWordKind, BankWordRun,
+    CallResolver, CallTarget, FuncInput, NullResolver, SparseBankInput,
 };
+pub use execution::{
+    dispatch_until_boundary, BankError, BankId, BlockExit, BlockProgram, BlockRun, BlockRunner,
+    CodeBank, CodeCatalog, CodeSpan, CpuFault, CpuFaultKind, DispatchError, DispatchRun,
+    ExecutionKey, GeneratedBankFn, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError,
+    ResolvedInstruction, TransferResolver,
+};
+pub use fallback::{EvidenceClass, FallbackProgram, FallbackRunner};
+pub use interp::{run_bank, run_bank_with_mmio, MmioOutcome, MmioPort, NoMmio, UnsupportedOp};
 pub use module::{emit_lookup_dispatcher, emit_module, ModuleFunc, SymbolTable};
 pub use runtime::{
     call_host_or_recompiled, pause_self, resolve_host_function, round_ties_even_f32,

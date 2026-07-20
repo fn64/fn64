@@ -7,6 +7,8 @@ repository.workspace = true
 description = "Mechanical, zero-LLM N64 ROM function-metadata discovery frontend, per docs/DISCOVER-DESIGN.md. Proven facts + rejected candidates + an explicit unresolved frontier -- never a guessed symbol file."
 
 [dependencies]
+fn64-recomp-rs = { path = "../fn64-recomp-rs" }
+csv = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -27,3 +29,75 @@ path = "src/bin/gate_b2.rs"
 [[bin]]
 name = "gate_d1"
 path = "src/bin/gate_d1.rs"
+
+[[bin]]
+name = "gate_d1_overlays"
+path = "src/bin/gate_d1_overlays.rs"
+
+[[bin]]
+name = "gate_d1_oot_overlays"
+path = "src/bin/gate_d1_oot_overlays.rs"
+
+[[bin]]
+name = "gate_owners_overlays"
+path = "src/bin/gate_owners_overlays.rs"
+
+[[bin]]
+name = "fn64-discover"
+path = "src/bin/fn64_discover.rs"
+
+[[bin]]
+name = "gate_regions"
+path = "src/bin/gate_regions.rs"
+
+[[bin]]
+name = "gate_homology"
+path = "src/bin/gate_homology.rs"
+
+[[bin]]
+name = "gate_callgraph_match"
+path = "src/bin/gate_callgraph_match.rs"
+
+[[bin]]
+name = "gate_corpus_homology"
+path = "src/bin/gate_corpus_homology.rs"
+
+[[bin]]
+name = "gate_loaders"
+path = "src/bin/gate_loaders.rs"
+
+[[bin]]
+name = "gate_static_closure"
+path = "src/bin/gate_static_closure.rs"
+
+[[bin]]
+name = "gate_oot_reference"
+path = "src/bin/gate_oot_reference.rs"
+
+[[bin]]
+name = "gate_coverage"
+path = "src/bin/gate_coverage.rs"
+
+[[bin]]
+name = "gate_overlay_generalize"
+path = "src/bin/gate_overlay_generalize.rs"
+
+[[bin]]
+name = "gate_closure"
+path = "src/bin/gate_closure.rs"
+
+[[bin]]
+name = "gate_reloc_accuracy"
+path = "src/bin/gate_reloc_accuracy.rs"
+
+[[bin]]
+name = "gate_content_consumer"
+path = "src/bin/gate_content_consumer.rs"
+
+[[bin]]
+name = "gate_asm_roundtrip"
+path = "src/bin/gate_asm_roundtrip.rs"
+
+[[bin]]
+name = "gate_wm2000_recompile"
+path = "src/bin/gate_wm2000_recompile.rs"

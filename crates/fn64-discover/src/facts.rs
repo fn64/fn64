@@ -45,6 +45,7 @@ pub enum MappingAddressSpace {
 /// add a new variant rather than reusing a free-form string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CandidateDetector {
+    HardwareEntrypoint,
     JalTarget,
     IndirectCallTarget,
     ProloguePattern,
@@ -85,6 +86,10 @@ pub enum ProloguePattern {
 /// Machine-readable evidence carried by every Phase 3 function-entry claim.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum FunctionEntryEvidence {
+    /// The normalized ROM header entry executed after IPL3's hardware-fixed
+    /// boot copy. This is authoritative reachability, not a heuristic
+    /// prologue or tool claim.
+    RomHeaderEntrypoint,
     DirectJal {
         call_site: BankAddr,
     },
@@ -139,6 +144,18 @@ pub enum Fact {
         target: BankAddr,
         trace: String,
     },
+    /// A dynamic trace observed the instruction at `site` execute. This is
+    /// bank-scoped dynamic code-existence evidence -- strictly weaker than a
+    /// proven owner or a CFG-reachability proof: it proves one word decoded
+    /// and ran once in the named bank's activation, never that the trace's
+    /// observed set is exhaustive (see `trace.rs`). `trace`/`sequence` pin
+    /// this fact to one exact record of one exact capture so the evidence
+    /// stays auditable.
+    ObservedExecutedCode {
+        site: BankAddr,
+        trace: String,
+        sequence: u64,
+    },
     /// Static Phase 6 result for one reachable `jr`/`jalr`. Only an
     /// exhaustive record may contribute CFG successors; bounded/open records
     /// preserve the unresolved frontier without guessing.
@@ -159,6 +176,14 @@ pub enum Fact {
         rom_space: RomAddressSpace,
         rom_start: u32,
         rom_end: u32,
+        va_start: u32,
+        va_end: u32,
+    },
+    /// A bank-qualified interval whose bytes are permitted to enter code
+    /// discovery. Load-image mappings describe where bytes can be loaded;
+    /// they do not imply that text, rodata, and data are all executable.
+    ExecutableRange {
+        bank: String,
         va_start: u32,
         va_end: u32,
     },
@@ -211,8 +236,10 @@ impl Fact {
             Fact::BlockStart { bank, .. } => Some(bank),
             Fact::LoadsFrom { site, .. } => Some(&site.bank),
             Fact::ObservedIndirectTarget { site, .. } => Some(&site.bank),
+            Fact::ObservedExecutedCode { site, .. } => Some(&site.bank),
             Fact::IndirectTransferAnalysis { site, .. } => Some(&site.bank),
             Fact::RomMapping { bank, .. } => Some(bank),
+            Fact::ExecutableRange { bank, .. } => Some(bank),
             Fact::LoadImageTableRecord { bank, .. } => bank.as_deref(),
             Fact::TableEntry { table, .. } => Some(&table.bank),
             Fact::FunctionEntryClaim { target, .. } => Some(&target.bank),
@@ -276,6 +303,32 @@ pub fn table_entry_subject(table: &BankAddr, index: u32) -> String {
 /// Stable conclusion key for one Phase-2 load-image/file-table record.
 pub fn load_image_table_record_subject(table: &str, index: u32) -> String {
     format!("load-image-table:{table}:{index}")
+}
+
+/// Stable conclusion key for one bank-qualified executable interval.
+pub fn executable_range_subject(bank: &str, va_start: u32, va_end: u32) -> String {
+    format!("executable-range:{bank}:0x{va_start:08x}:0x{va_end:08x}")
+}
+
+/// Stable conclusion key for one bank-qualified word's dynamic
+/// execution-observed evidence (`trace::fold_into_fact_db`'s subject).
+pub fn observed_executed_code_subject(bank: &str, pc: u32) -> String {
+    format!("observed-executed:{bank}:0x{pc:08x}")
+}
+
+/// Stable conclusion key for one observed indirect edge
+/// `(site -> target)`, both bank-qualified
+/// (`trace::fold_indirect_targets_into_fact_db`'s subject). The target is
+/// part of the key: one `jr`/`jalr` site legitimately reaches many
+/// targets across a trace, and each observed edge is its own existence
+/// fact -- never collapsed, never treated as exhaustive.
+pub fn observed_indirect_target_subject(
+    site_bank: &str,
+    site_pc: u32,
+    target_bank: &str,
+    target_pc: u32,
+) -> String {
+    format!("observed-indirect:{site_bank}:0x{site_pc:08x}->{target_bank}:0x{target_pc:08x}")
 }
 
 /// A derived conclusion tracked with its proof state and the fact
@@ -399,6 +452,34 @@ impl FactDb {
             .collect()
     }
 
+    /// Proven executable intervals for `bank`, sorted by address. An empty
+    /// result means no provider has separated text from the load image yet;
+    /// callers may retain their legacy whole-image behavior but must not
+    /// represent that fallback as proven executable coverage.
+    pub fn proven_executable_ranges(&self, bank: &str) -> Vec<(u32, u32)> {
+        let mut ranges: Vec<_> = self
+            .facts
+            .iter()
+            .filter_map(|fact| {
+                let Fact::ExecutableRange {
+                    bank: fact_bank,
+                    va_start,
+                    va_end,
+                } = fact
+                else {
+                    return None;
+                };
+                (fact_bank == bank
+                    && self
+                        .conclusion(&executable_range_subject(fact_bank, *va_start, *va_end))
+                        .is_some_and(|conclusion| conclusion.state == ProofState::Proven))
+                .then_some((*va_start, *va_end))
+            })
+            .collect();
+        ranges.sort_unstable();
+        ranges
+    }
+
     /// Proven VROM-to-physical-ROM file mappings supplied by Phase 2. These
     /// are the byte-backing evidence used to materialize VROM load images;
     /// rejected/conflicting records cannot leak into detector input.
@@ -458,6 +539,32 @@ impl FactDb {
                     .conclusion(&function_entry_subject(target))
                     .is_some_and(|conclusion| conclusion.state == ProofState::Proven)
             {
+                entries.insert(target.pc);
+            }
+        }
+        entries.into_iter().collect()
+    }
+
+    /// Function-entry candidates suitable only for exploratory CFG coverage.
+    /// This deliberately includes non-authoritative claims but never changes
+    /// their proof state; callers must keep resulting owners/candidates out of
+    /// exact-proof admission.
+    pub fn candidate_function_entries(&self, bank: &str) -> Vec<u32> {
+        let mut entries = BTreeSet::new();
+        for fact in &self.facts {
+            let Fact::FunctionEntryClaim { target, .. } = fact else {
+                continue;
+            };
+            if target.bank != bank {
+                continue;
+            }
+            let state = self
+                .conclusion(&function_entry_subject(target))
+                .map(|conclusion| conclusion.state);
+            if matches!(
+                state,
+                Some(ProofState::Candidate | ProofState::Supported | ProofState::Proven)
+            ) {
                 entries.insert(target.pc);
             }
         }

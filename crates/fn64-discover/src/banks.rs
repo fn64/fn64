@@ -22,9 +22,11 @@
 //! state per bank rather than re-deriving mapping validity themselves.
 
 use crate::facts::{
-    load_image_table_record_subject, Fact, FactDb, MappingAddressSpace, ProofState, RomAddressSpace,
+    function_entry_subject, load_image_table_record_subject, BankAddr, CandidateDetector, Fact,
+    FactDb, FunctionEntryEvidence, MappingAddressSpace, ProofState, RomAddressSpace,
 };
 use crate::rom::NormalizedRom;
+use serde::{Deserialize, Serialize};
 
 /// IPL3's fixed boot-copy size on real N64 hardware: the first 0x100000
 /// ROM bytes (after the 0x1000-byte header+IPL3 region) are DMA'd to RDRAM
@@ -37,12 +39,48 @@ pub const BOOT_COPY_SIZE: u32 = 0x0010_0000;
 /// Name reserved for the always-resident boot/init bank.
 pub const BOOT_BANK: &str = "boot";
 
-/// Discover the boot-copy bank from the ROM header alone. This never fails
-/// for a normalized ROM (the header was already validated in Phase 1) and
-/// is `Proven` immediately: the mapping is a direct read of hardware-fixed
-/// header fields, not an inference.
+/// The 4032-byte IPL3 blob occupies ROM `[0x40, 0x1000)`; which build a
+/// cartridge carries decides where its CIC-paired IPL3 relocates the 1 MiB
+/// boot copy. CIC-6102 and 6105 builds load at the header entry point;
+/// the CIC-6103 build loads at `entry point - 0x100000` (public N64 boot
+/// documentation, n64brew "CIC-NUS-610x" / "IPL3"). The digest below was
+/// measured directly from a Kirby 64 (US) cartridge dump — the one 6103
+/// title in the local corpus — and cross-checked by clustering IPL3
+/// digests across 14 local ROMs: the 6102 cluster (SM64, GoldenEye, four
+/// AKI titles) and 6105 cluster (OoT, MM, Perfect Dark) share their own
+/// distinct blobs and a zero delta, and Kirby's decomp places `main` at
+/// exactly `entry - 0x100000` (0x80000400), confirming the delta on real
+/// data. An unrecognized IPL3 keeps the zero-delta reading — the behavior
+/// for every non-6103 blob observed so far — rather than guessing.
+const IPL3_SHA256_CIC_6103: &str =
+    "bf3620d30817007091ebe9bddd1b88c23b8a0052170b3309cde5b6b4238e45e7";
+
+const IPL3_ROM_START: usize = 0x40;
+const IPL3_ROM_END: usize = 0x1000;
+
+fn boot_load_delta(rom_bytes: &[u8]) -> (u32, &'static str) {
+    use sha2::Digest as _;
+    if rom_bytes.len() < IPL3_ROM_END {
+        return (0, "header-only (ROM too short for IPL3)");
+    }
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&rom_bytes[IPL3_ROM_START..IPL3_ROM_END]);
+    let digest = format!("{:x}", hasher.finalize());
+    if digest == IPL3_SHA256_CIC_6103 {
+        (0x10_0000, "CIC-6103 IPL3 (loads at entry - 0x100000)")
+    } else {
+        (0, "entry-loading IPL3 (6102/6105-class or unrecognized)")
+    }
+}
+
+/// Discover the boot-copy bank from the ROM header plus the IPL3 blob.
+/// This never fails for a normalized ROM (the header was already validated
+/// in Phase 1) and is `Proven` immediately: the mapping is a direct read
+/// of hardware-fixed header fields and the hardware-fixed relocation
+/// behavior of the identified IPL3 build, not an inference.
 pub fn discover_boot_bank(rom: &NormalizedRom, db: &mut FactDb) {
-    let va_start = rom.header.entry_point;
+    let (load_delta, ipl3_note) = boot_load_delta(&rom.bytes);
+    let va_start = rom.header.entry_point.wrapping_sub(load_delta);
     let rom_start = BOOT_COPY_ROM_START;
     let rom_end = rom_start
         .saturating_add(BOOT_COPY_SIZE)
@@ -61,7 +99,8 @@ pub fn discover_boot_bank(rom: &NormalizedRom, db: &mut FactDb) {
         subject: crate::facts::BankAddr::new(BOOT_BANK, va_start),
         note: format!(
             "IPL3 boot copy: ROM [0x{rom_start:x}, 0x{rom_end:x}) -> VA [0x{va_start:x}, 0x{va_end:x}); \
-             entry point read directly from normalized header, size fixed by N64 hardware boot behavior"
+             entry point read directly from normalized header, size fixed by N64 hardware boot behavior; \
+             {ipl3_note}"
         ),
     });
 
@@ -72,6 +111,21 @@ pub fn discover_boot_bank(rom: &NormalizedRom, db: &mut FactDb) {
         "boot_copy_from_header",
     )
     .expect("boot bank is the first conclusion for this subject; cannot violate monotonicity");
+
+    let entry = BankAddr::new(BOOT_BANK, va_start);
+    let entry_fact = db.insert(Fact::FunctionEntryClaim {
+        target: entry.clone(),
+        detector: CandidateDetector::HardwareEntrypoint,
+        evidence: FunctionEntryEvidence::RomHeaderEntrypoint,
+        proposed_state: ProofState::Proven,
+    });
+    db.conclude(
+        function_entry_subject(&entry),
+        ProofState::Proven,
+        vec![mapping, evidence, entry_fact],
+        "rom_header_entry_after_ipl3_boot_copy",
+    )
+    .expect("boot entry is the first conclusion for this subject; cannot violate monotonicity");
 }
 
 /// One fixed-shape descriptor-table record location, in ROM-record-field
@@ -84,7 +138,7 @@ pub fn discover_boot_bank(rom: &NormalizedRom, db: &mut FactDb) {
 /// file" discipline -- so this function accepts the location as an input,
 /// records exactly where it came from, and only promotes what parses
 /// consistently within it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DescriptorTableShape {
     /// ROM byte offset of the first record.
     pub table_rom_offset: u32,
@@ -229,14 +283,14 @@ pub fn scan_descriptor_table(
 
 /// Location of a table in either physical cartridge ROM or the VROM
 /// namespace resolved by an earlier file-table record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableLocation {
     pub space: RomAddressSpace,
     pub offset: u32,
 }
 
 /// Field offsets for the source interval in one table record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRangeFields {
     pub space: RomAddressSpace,
     pub field_start: u32,
@@ -244,7 +298,8 @@ pub struct SourceRangeFields {
 }
 
 /// Address space named by a table record's destination interval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DestinationSpace {
     PhysicalRom,
     Vram,
@@ -252,7 +307,8 @@ pub enum DestinationSpace {
 
 /// How to obtain a destination interval's exclusive end. `FieldOrSourceLength`
 /// models DMA file tables whose zero physical end denotes an uncompressed file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DestinationEnd {
     Field(u32),
     SourceLength,
@@ -260,7 +316,7 @@ pub enum DestinationEnd {
 }
 
 /// Field offsets for the destination interval in one table record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DestinationRangeFields {
     pub space: DestinationSpace,
     pub field_start: u32,
@@ -271,7 +327,7 @@ pub struct DestinationRangeFields {
 /// physical ROM file or a VRAM load range. The same shape describes OoT-style
 /// file tables and overlay tables; a physical-ROM-to-VRAM shape also subsumes
 /// the older AKI descriptor-table form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadImageTableShape {
     pub location: TableLocation,
     pub record_count: u32,
@@ -280,13 +336,254 @@ pub struct LoadImageTableShape {
     pub destination: DestinationRangeFields,
 }
 
+/// Deterministic, serializable bank naming for records in one table. Keeping
+/// this as data rather than a function pointer lets the same validated input
+/// come from an inferred fact pack or an external ROM-bound manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BankNamePattern {
+    pub prefix: String,
+    #[serde(default)]
+    pub suffix: String,
+    #[serde(default)]
+    pub index_base: u32,
+}
+
+impl BankNamePattern {
+    pub fn new(prefix: impl Into<String>, index_base: u32, suffix: impl Into<String>) -> Self {
+        Self {
+            prefix: prefix.into(),
+            suffix: suffix.into(),
+            index_base,
+        }
+    }
+
+    pub fn name(&self, index: u32) -> String {
+        format!("{}{}{}", self.prefix, index + self.index_base, self.suffix)
+    }
+}
+
 /// Explicit per-title data for one mapping table. `bank_name` is required for
 /// VRAM destinations and absent for VROM-to-physical file tables.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadImageTableInput {
-    pub name: &'static str,
+    pub name: String,
     pub shape: LoadImageTableShape,
-    pub bank_name: Option<fn(u32) -> String>,
+    pub bank_name: Option<BankNamePattern>,
+}
+
+/// Turn one uniquely admitted ROM-only overlay-table recovery into the same
+/// proven bank-qualified load-image representation as an explicitly located
+/// descriptor table.
+///
+/// Recovery is authoritative only when exactly one distinct table survives.
+/// Within that table, a record becomes a proven mapping only when its own
+/// delta vote is admitted and the inferred VA exactly equals the destination
+/// independently parsed from the descriptor record. A delta vote by itself
+/// remains candidate evidence; the agreement of two separately derived
+/// fields under a unique table admission is the proof rule.
+pub fn scan_recovered_overlay_regions(
+    rom: &NormalizedRom,
+    recovery: &crate::overlay_regions::OverlayRecovery,
+    table_name: &str,
+    bank_name: &BankNamePattern,
+    db: &mut FactDb,
+) -> Vec<String> {
+    assert!(
+        !table_name.trim().is_empty(),
+        "recovered overlay table name must not be empty"
+    );
+
+    let admitted: Vec<_> = recovery
+        .admissions
+        .iter()
+        .filter(|admission| admission.admitted)
+        .collect();
+    let table_subject = format!("load-image-table:{table_name}");
+    let selection = db.insert(Fact::Evidence {
+        subject: BankAddr::new(
+            table_name,
+            admitted
+                .first()
+                .map_or(0, |admission| admission.table.table_rom_offset),
+        ),
+        note: format!(
+            "ROM-only descriptor-family recovery: {} distinct candidate table(s), {} admitted by delta_vote",
+            recovery.candidate_tables.len(),
+            admitted.len()
+        ),
+    });
+
+    let [admission] = admitted.as_slice() else {
+        let (state, rule) = if admitted.is_empty() {
+            (
+                ProofState::Open,
+                "recovered_overlay_table_has_no_unique_admission",
+            )
+        } else {
+            (
+                ProofState::Conflict,
+                "recovered_overlay_table_has_multiple_admissions",
+            )
+        };
+        db.conclude(table_subject, state, vec![selection], rule)
+            .expect("first conclusion for recovered overlay table");
+        return Vec::new();
+    };
+
+    assert_eq!(
+        admission.table.records.len(),
+        admission.region_deltas.len(),
+        "overlay recovery must report one delta outcome per record"
+    );
+    assert_eq!(
+        admission.mapped_regions as usize,
+        admission
+            .region_deltas
+            .iter()
+            .filter(|delta| delta.is_some())
+            .count(),
+        "overlay recovery mapped_regions must match its delta outcomes"
+    );
+
+    let table = &admission.table;
+    let mut accepted_banks = Vec::new();
+    let mut table_evidence = vec![selection];
+    for (index, (record, delta_outcome)) in table
+        .records
+        .iter()
+        .zip(&admission.region_deltas)
+        .enumerate()
+    {
+        let index = index as u32;
+        let bank = bank_name.name(index);
+        let record_subject = load_image_table_record_subject(table_name, index);
+        let Some(byte_len) = record.rom_end.checked_sub(record.rom_start) else {
+            conclude_record_and_bank(
+                db,
+                &record_subject,
+                Some(&bank),
+                ProofState::Rejected,
+                vec![selection],
+                "recovered_overlay_record_inverted",
+            );
+            continue;
+        };
+        let destination_end = record.vram_dest.checked_add(byte_len);
+        let interval_valid = byte_len != 0
+            && record.rom_end <= rom.len() as u32
+            && record.rom_start.is_multiple_of(4)
+            && record.rom_end.is_multiple_of(4)
+            && record.vram_dest.is_multiple_of(4)
+            && destination_end.is_some();
+        let destination_end = destination_end.unwrap_or(record.vram_dest);
+
+        let record_fact = db.insert(Fact::LoadImageTableRecord {
+            table: table_name.to_string(),
+            bank: Some(bank.clone()),
+            table_space: RomAddressSpace::Physical,
+            table_offset: table.table_rom_offset,
+            index,
+            source_space: MappingAddressSpace::PhysicalRom,
+            source_start: record.rom_start,
+            source_end: record.rom_end,
+            destination_space: MappingAddressSpace::Vram,
+            destination_start: record.vram_dest,
+            destination_end,
+        });
+        let delta_note = match delta_outcome {
+            Some((delta, va_start)) => {
+                format!("delta=0x{delta:08x}, inferred VA=0x{va_start:08x}")
+            }
+            None => "delta_vote remained open".to_string(),
+        };
+        let provenance = db.insert(Fact::Evidence {
+            subject: BankAddr::new(&bank, record.vram_dest),
+            note: format!(
+                "uniquely admitted ROM-only descriptor table at 0x{:x}, record {index}: ROM [0x{:x},0x{:x}) -> descriptor VA 0x{:08x}; {delta_note}",
+                table.table_rom_offset,
+                record.rom_start,
+                record.rom_end,
+                record.vram_dest,
+            ),
+        });
+        let mut evidence = vec![selection, record_fact, provenance];
+        table_evidence.extend([record_fact, provenance]);
+
+        if !interval_valid {
+            conclude_record_and_bank(
+                db,
+                &record_subject,
+                Some(&bank),
+                ProofState::Rejected,
+                evidence,
+                "recovered_overlay_record_malformed",
+            );
+            continue;
+        }
+
+        let Some((delta, va_start)) = *delta_outcome else {
+            conclude_record_and_bank(
+                db,
+                &record_subject,
+                Some(&bank),
+                ProofState::Open,
+                evidence,
+                "recovered_overlay_record_delta_open",
+            );
+            continue;
+        };
+        if record.rom_start.wrapping_add(delta) != va_start || va_start != record.vram_dest {
+            conclude_record_and_bank(
+                db,
+                &record_subject,
+                Some(&bank),
+                ProofState::Conflict,
+                evidence,
+                "recovered_overlay_delta_conflicts_with_descriptor_destination",
+            );
+            continue;
+        }
+
+        let mapping = db.insert(Fact::RomMapping {
+            bank: bank.clone(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: record.rom_start,
+            rom_end: record.rom_end,
+            va_start,
+            va_end: destination_end,
+        });
+        evidence.push(mapping);
+        db.conclude(
+            &record_subject,
+            ProofState::Proven,
+            evidence.clone(),
+            "unique_recovered_overlay_record_with_matching_delta_and_destination",
+        )
+        .expect("first conclusion for recovered overlay record");
+        db.conclude(
+            format!("bank:{bank}"),
+            ProofState::Proven,
+            evidence,
+            "unique_recovered_overlay_record_with_matching_delta_and_destination",
+        )
+        .expect("first conclusion for recovered overlay bank");
+        surface_mapping_conflicts(db, record_fact);
+        if db
+            .conclusion(&format!("bank:{bank}"))
+            .is_some_and(|conclusion| conclusion.state == ProofState::Proven)
+        {
+            accepted_banks.push(bank);
+        }
+    }
+
+    db.conclude(
+        table_subject,
+        ProofState::Proven,
+        table_evidence,
+        "unique_recovered_overlay_table_admission",
+    )
+    .expect("first conclusion for recovered overlay table");
+    accepted_banks
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,7 +694,7 @@ pub fn scan_load_image_tables(
     ordered.sort_by_key(|input| {
         (
             input.shape.location.space == RomAddressSpace::Virtual,
-            input.name,
+            input.name.as_str(),
         )
     });
     let mut accepted_banks = Vec::new();
@@ -433,7 +730,7 @@ pub fn scan_load_image_tables(
             Ok(materialized) => materialized,
             Err(error) => {
                 let evidence = db.insert(Fact::Evidence {
-                    subject: crate::facts::BankAddr::new(input.name, shape.location.offset),
+                    subject: crate::facts::BankAddr::new(&input.name, shape.location.offset),
                     note: format!("table bytes unavailable: {error}"),
                 });
                 db.conclude(
@@ -448,7 +745,7 @@ pub fn scan_load_image_tables(
         };
 
         for index in 0..shape.record_count {
-            let record_subject = load_image_table_record_subject(input.name, index);
+            let record_subject = load_image_table_record_subject(&input.name, index);
             let base = (index * shape.record_stride) as usize;
             let read = |field: u32| -> Option<u32> {
                 let start = base.checked_add(field as usize)?;
@@ -507,7 +804,7 @@ pub fn scan_load_image_tables(
                 .expect("first conclusion for this record");
                 continue;
             };
-            let bank = input.bank_name.map(|name| name(index));
+            let bank = input.bank_name.as_ref().map(|pattern| pattern.name(index));
             let source_space = match shape.source.space {
                 RomAddressSpace::Physical => MappingAddressSpace::PhysicalRom,
                 RomAddressSpace::Virtual => MappingAddressSpace::VirtualRom,
@@ -578,7 +875,7 @@ pub fn scan_load_image_tables(
                 Err(error) => {
                     let unavailable = db.insert(Fact::Evidence {
                         subject: crate::facts::BankAddr::new(
-                            bank.as_deref().unwrap_or(input.name),
+                            bank.as_deref().unwrap_or(&input.name),
                             source_start,
                         ),
                         note: format!(
@@ -670,6 +967,219 @@ fn conclude_record_and_bank(
         db.conclude(format!("bank:{bank}"), state, evidence, rule)
             .expect("first conclusion for this bank");
     }
+}
+
+/// A cited claim locating a game's load-request wrapper inside the proven
+/// boot image: the callee's entry VA and which argument registers carry the
+/// destination pointer, device address, and byte count (from the game's own
+/// calling convention, e.g. MM boot's `DmaMgr_RequestAsync(req, ram, vrom,
+/// size, ...)`). `device_space` declares what namespace the device operand
+/// uses: `Physical` for raw cartridge offsets, `Virtual` for VROM that a DMA
+/// manager translates — the latter is only accepted when the recovered range
+/// sits inside exactly one already-proven VROM file mapping. The claim says
+/// where to look; the boot image's instruction bytes still have to yield
+/// fully constant operands, or the site stays an open frontier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticRequestDmaInput {
+    pub name: String,
+    pub callee_va: u32,
+    pub dram_arg_register: u8,
+    pub device_arg_register: u8,
+    pub size_arg_register: u8,
+    /// When set, the size register carries the EXCLUSIVE END device address
+    /// instead of a byte count (SM64's `dma_read(dest, srcStart, srcEnd)`
+    /// shape); the length is `end - device`, rejected unless positive.
+    #[serde(default)]
+    pub size_is_end_address: bool,
+    pub device_space: RomAddressSpace,
+    pub bank_name: BankNamePattern,
+}
+
+/// What a request-DMA scan proved and what it left open, for gate reports.
+#[derive(Debug, Default)]
+pub struct StaticRequestDmaReport {
+    pub proven_banks: Vec<String>,
+    pub open: Vec<String>,
+}
+
+/// The largest RDRAM a retail console reaches (Expansion Pak). Used only to
+/// bound destination sanity in the slicer; VA truth is judged downstream.
+const SCAN_RDRAM_LEN: u32 = 0x0080_0000;
+
+/// Recover load-image mappings from static operands at direct calls to a
+/// cited request wrapper within the proven boot image. Each fully constant
+/// (destination, device, size) triple that passes its declared-space
+/// validation becomes a `Proven` bank mapping; every other call site is
+/// reported open, never guessed. Reachability and completion are recorded as
+/// unproven in the evidence note, matching `pi_dma`'s honesty contract.
+pub fn scan_static_request_dma(
+    rom: &NormalizedRom,
+    inputs: &[StaticRequestDmaInput],
+    db: &mut FactDb,
+) -> StaticRequestDmaReport {
+    use crate::loaders::VirtualAddress;
+    use std::collections::BTreeSet;
+
+    let mut report = StaticRequestDmaReport::default();
+    if inputs.is_empty() {
+        return report;
+    }
+    let boot = db.proven_rom_mappings().iter().find_map(|fact| match fact {
+        Fact::RomMapping {
+            bank,
+            rom_start,
+            rom_end,
+            va_start,
+            ..
+        } if bank == BOOT_BANK => Some((*rom_start, *rom_end, *va_start)),
+        _ => None,
+    });
+    let Some((boot_rom_start, boot_rom_end, boot_va_start)) = boot else {
+        report
+            .open
+            .push("boot bank not proven; request-dma scan skipped".to_string());
+        return report;
+    };
+    let words: Vec<u32> = rom.bytes[boot_rom_start as usize..boot_rom_end as usize]
+        .chunks_exact(4)
+        .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+        .collect();
+
+    for input in inputs {
+        let slices = match crate::pi_dma::slice_load_request_calls(
+            &words,
+            VirtualAddress::new(boot_va_start),
+            VirtualAddress::new(input.callee_va),
+            SCAN_RDRAM_LEN,
+            input.dram_arg_register,
+            input.device_arg_register,
+            input.size_arg_register,
+        ) {
+            Ok(slices) => slices,
+            Err(error) => {
+                report
+                    .open
+                    .push(format!("{}: slicer rejected boot image: {error:?}", input.name));
+                continue;
+            }
+        };
+        if slices.is_empty() {
+            report.open.push(format!(
+                "{}: no direct calls to cited callee 0x{:x} in the boot image",
+                input.name, input.callee_va
+            ));
+            continue;
+        }
+        let mut seen: BTreeSet<(u32, u32, u32)> = BTreeSet::new();
+        let mut index = 0u32;
+        for slice in slices {
+            let call_pc = slice.call_pc.get();
+            let (Some(candidate), Some(dram_pointer)) =
+                (slice.candidate(), slice.dram_pointer.proven().copied())
+            else {
+                report.open.push(format!(
+                    "{}: call at 0x{call_pc:x} has open operands",
+                    input.name
+                ));
+                continue;
+            };
+            let device = candidate.device_address.get();
+            // In end-address mode the slicer's byte_count carries the raw
+            // end operand (its rdram bound check then over-reserves by the
+            // device offset — a conservative ceiling, never an undercheck).
+            let length = if input.size_is_end_address {
+                match candidate.byte_count.get().checked_sub(device) {
+                    Some(length) if length > 0 => length,
+                    _ => {
+                        report.open.push(format!(
+                            "{}: call at 0x{call_pc:x} end address 0x{:x} is not \
+                             beyond device start 0x{device:x}",
+                            input.name,
+                            candidate.byte_count.get()
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                candidate.byte_count.get()
+            };
+            let va_start = dram_pointer.get();
+            if !seen.insert((device, va_start, length)) {
+                continue;
+            }
+            let (Some(device_end), Some(va_end)) =
+                (device.checked_add(length), va_start.checked_add(length))
+            else {
+                report.open.push(format!(
+                    "{}: call at 0x{call_pc:x} has an overflowing range",
+                    input.name
+                ));
+                continue;
+            };
+            match input.device_space {
+                RomAddressSpace::Physical => {
+                    if device_end as usize > rom.len() {
+                        report.open.push(format!(
+                            "{}: call at 0x{call_pc:x} physical range \
+                             0x{device:x}..0x{device_end:x} exceeds the ROM",
+                            input.name
+                        ));
+                        continue;
+                    }
+                }
+                RomAddressSpace::Virtual => {
+                    let containing = db
+                        .proven_vrom_file_mappings()
+                        .iter()
+                        .filter(|(_, fact)| {
+                            matches!(fact, Fact::LoadImageTableRecord {
+                                source_start,
+                                source_end,
+                                ..
+                            } if device >= *source_start && device_end <= *source_end)
+                        })
+                        .count();
+                    if containing != 1 {
+                        report.open.push(format!(
+                            "{}: call at 0x{call_pc:x} VROM range \
+                             0x{device:x}..0x{device_end:x} has {containing} proven file \
+                             mappings; expected exactly one",
+                            input.name
+                        ));
+                        continue;
+                    }
+                }
+            }
+            let bank = input.bank_name.name(index);
+            index += 1;
+            let mapping = db.insert(Fact::RomMapping {
+                bank: bank.clone(),
+                rom_space: input.device_space,
+                rom_start: device,
+                rom_end: device_end,
+                va_start,
+                va_end,
+            });
+            let evidence = db.insert(Fact::Evidence {
+                subject: BankAddr::new(&bank, va_start),
+                note: format!(
+                    "static request-DMA operands at call 0x{call_pc:x} to cited {} \
+                     (0x{:x}): device 0x{device:x}+0x{length:x} -> VA 0x{va_start:x}; \
+                     instruction bytes do not prove reachability or completion",
+                    input.name, input.callee_va
+                ),
+            });
+            db.conclude(
+                format!("bank:{bank}"),
+                ProofState::Proven,
+                vec![mapping, evidence],
+                "static_request_dma_operands",
+            )
+            .expect("request-dma bank names are freshly generated");
+            report.proven_banks.push(bank);
+        }
+    }
+    report
 }
 
 fn validate_file_record(
@@ -1058,7 +1568,7 @@ mod tests {
 
     fn file_table_input(count: u32) -> LoadImageTableInput {
         LoadImageTableInput {
-            name: "files",
+            name: "files".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Physical,
@@ -1114,7 +1624,7 @@ mod tests {
         write_u32(&mut rom_bytes, 0x201c, 0);
 
         let overlay = LoadImageTableInput {
-            name: "effects",
+            name: "effects".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Virtual,
@@ -1133,11 +1643,12 @@ mod tests {
                     end: DestinationEnd::Field(0xc),
                 },
             },
-            bank_name: Some(|index| format!("effect_{index}")),
+            bank_name: Some(BankNamePattern::new("effect_", 0, "")),
         };
         let rom = normalize(&rom_bytes).unwrap();
         let mut db = FactDb::new();
-        let accepted = scan_load_image_tables(&rom, &[overlay, file_table_input(2)], &mut db);
+        let accepted =
+            scan_load_image_tables(&rom, &[overlay.clone(), file_table_input(2)], &mut db);
 
         assert_eq!(accepted, ["effect_0"]);
         assert_eq!(
@@ -1199,7 +1710,7 @@ mod tests {
             write_u32(&mut rom_bytes, base + 0xc, vram_end);
         }
         let input = LoadImageTableInput {
-            name: "overlays",
+            name: "overlays".to_string(),
             shape: LoadImageTableShape {
                 location: TableLocation {
                     space: RomAddressSpace::Physical,
@@ -1218,7 +1729,7 @@ mod tests {
                     end: DestinationEnd::Field(0xc),
                 },
             },
-            bank_name: Some(|index| format!("overlay_{index}")),
+            bank_name: Some(BankNamePattern::new("overlay_", 0, "")),
         };
         let rom = normalize(&rom_bytes).unwrap();
         let mut db = FactDb::new();
@@ -1239,5 +1750,152 @@ mod tests {
             );
         }
         assert!(db.proven_rom_mappings().is_empty());
+    }
+
+    fn recovered_table(
+        table_rom_offset: u32,
+        rom_start: u32,
+        vram_dest: u32,
+        inferred_va: u32,
+    ) -> crate::overlay_regions::TableAdmission {
+        let table = crate::overlay_regions::CandidateTable {
+            table_rom_offset,
+            record_stride: 0x24,
+            field_rom_start: 0x18,
+            field_rom_end: 0x1c,
+            field_vram_dest: 0x20,
+            records: vec![crate::overlay_regions::CandidateRecord {
+                rom_start,
+                rom_end: rom_start + 0x1000,
+                vram_dest,
+            }],
+        };
+        crate::overlay_regions::TableAdmission {
+            table,
+            region_deltas: vec![Some((inferred_va.wrapping_sub(rom_start), inferred_va))],
+            mapped_regions: 1,
+            admitted: true,
+        }
+    }
+
+    fn recovery_with(
+        admissions: Vec<crate::overlay_regions::TableAdmission>,
+    ) -> crate::overlay_regions::OverlayRecovery {
+        crate::overlay_regions::OverlayRecovery {
+            config: crate::overlay_regions::SearchConfig::aki_family(),
+            delta_config: crate::delta_vote::DeltaVoteConfig::default(),
+            min_mapped_regions: 1,
+            candidate_tables: admissions
+                .iter()
+                .map(|admission| admission.table.clone())
+                .collect(),
+            admissions,
+        }
+    }
+
+    #[test]
+    fn unique_recovered_table_with_matching_delta_proves_load_image() {
+        let rom = make_test_rom(0x8000_0400, 0x5000);
+        let recovery = recovery_with(vec![recovered_table(
+            0x1800,
+            0x2000,
+            0x8010_0000,
+            0x8010_0000,
+        )]);
+        let mut db = FactDb::new();
+        let banks = scan_recovered_overlay_regions(
+            &rom,
+            &recovery,
+            "recovered_overlays",
+            &BankNamePattern::new("overlay_", 0, ""),
+            &mut db,
+        );
+
+        assert_eq!(banks, ["overlay_0"]);
+        assert_eq!(
+            db.conclusion("bank:overlay_0").unwrap().state,
+            ProofState::Proven
+        );
+        assert_eq!(
+            db.conclusion(&load_image_table_record_subject("recovered_overlays", 0))
+                .unwrap()
+                .state,
+            ProofState::Proven
+        );
+        assert!(db.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::RomMapping {
+                bank,
+                rom_start: 0x2000,
+                rom_end: 0x3000,
+                va_start: 0x8010_0000,
+                va_end: 0x8010_1000,
+                ..
+            } if bank == "overlay_0"
+        )));
+    }
+
+    #[test]
+    fn recovered_delta_disagreeing_with_descriptor_stays_conflict() {
+        let rom = make_test_rom(0x8000_0400, 0x5000);
+        let recovery = recovery_with(vec![recovered_table(
+            0x1800,
+            0x2000,
+            0x8010_0000,
+            0x8010_1000,
+        )]);
+        let mut db = FactDb::new();
+        let banks = scan_recovered_overlay_regions(
+            &rom,
+            &recovery,
+            "recovered_overlays",
+            &BankNamePattern::new("overlay_", 0, ""),
+            &mut db,
+        );
+
+        assert!(banks.is_empty());
+        assert_eq!(
+            db.conclusion("bank:overlay_0").unwrap().state,
+            ProofState::Conflict
+        );
+        assert!(db.proven_rom_mappings().is_empty());
+    }
+
+    #[test]
+    fn multiple_recovered_table_admissions_map_nothing() {
+        let rom = make_test_rom(0x8000_0400, 0x5000);
+        let recovery = recovery_with(vec![
+            recovered_table(0x1800, 0x2000, 0x8010_0000, 0x8010_0000),
+            recovered_table(0x1900, 0x3000, 0x8020_0000, 0x8020_0000),
+        ]);
+        let mut db = FactDb::new();
+        let banks = scan_recovered_overlay_regions(
+            &rom,
+            &recovery,
+            "recovered_overlays",
+            &BankNamePattern::new("overlay_", 0, ""),
+            &mut db,
+        );
+
+        assert!(banks.is_empty());
+        assert_eq!(
+            db.conclusion("load-image-table:recovered_overlays")
+                .unwrap()
+                .state,
+            ProofState::Conflict
+        );
+        assert!(db.proven_rom_mappings().is_empty());
+    }
+
+    #[test]
+    fn unrecognized_ipl3_keeps_entry_loading_delta() {
+        // Any blob that is not the measured 6103 IPL3 must keep the
+        // zero-delta reading, including a ROM too short to hold IPL3 at
+        // all — never a guessed relocation.
+        let (delta, _) = super::boot_load_delta(&[0u8; IPL3_ROM_END]);
+        assert_eq!(delta, 0);
+        let (delta, note) = super::boot_load_delta(&[0u8; 0x100]);
+        assert_eq!(delta, 0);
+        assert!(note.contains("too short"));
     }
 }

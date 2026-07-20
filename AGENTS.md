@@ -33,6 +33,13 @@ fn64 is a clean-room reimplementation. Allowed sources:
 - The MIT recompiler source ([fn64/n64recomp](https://github.com/fn64/n64recomp))
   and the C it generates — that's the ABI we serve.
 - Public hardware documentation.
+- Permissively-licensed N64 references, licenses verified from their LICENSE
+  files 2026-07-18 (`docs/DISCOVER-PLAN.md` "Research intake" records the
+  verification): ares (ISC), paraLLEl-RDP (MIT — its Angrylion reference
+  lineage is unlicensed and stays excluded), n64-systemtest (MIT), libdragon
+  (Unlicense). Same precedent as reading MIT RT64. MAME remains excluded
+  (GPL-2.0+ as a whole; its documented Lua/debugger interfaces are fine for
+  black-box use). ddisasm is AGPL: cite its paper's concepts, never its code.
 
 Disallowed: reading GPL runtime implementation code (ultramodern/librecomp
 internals, or any GPL runtime). Not for "inspiration," not to "check one

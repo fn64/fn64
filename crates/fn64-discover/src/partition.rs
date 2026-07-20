@@ -132,6 +132,36 @@ impl Partition {
 /// This preserves "tail transfers may cross owners" while failing closed to
 /// a coarser owner when no callable-entry evidence exists.
 pub fn partition(cfg: &Cfg) -> Partition {
+    partition_with_authoritative_entries(cfg, &BTreeSet::new())
+}
+
+/// Partition `cfg` while treating `authoritative_entries` as hard callable
+/// boundaries in addition to the CFG's traversal roots.
+///
+/// Traversal roots are not necessarily callable entries: an uncorroborated
+/// `j` target or a heuristic seed may exist only to expose reachable code.
+/// Consequently this function re-carves geometry only at addresses supplied
+/// through `authoritative_entries`. When such an entry lies in an existing
+/// claim span, the enclosing claimants keep only the prefix before the entry;
+/// the entry owns its reachable closure up to the next authoritative entry or
+/// the enclosing span's original end. An entry that is not already a CFG block
+/// leader is left unresolved rather than fabricating a partial basic block.
+pub fn partition_with_authoritative_entries(
+    cfg: &Cfg,
+    authoritative_entries: &BTreeSet<u32>,
+) -> Partition {
+    partition_with_authorized_splits(cfg, authoritative_entries, authoritative_entries)
+}
+
+/// Authority-aware partitioning with a distinct set of newly learned split
+/// entries and the complete set of callable boundaries. The distinction lets
+/// a multi-bank caller re-carve only cross-bank entries while still protecting
+/// already-known in-bank call targets from being absorbed by a new closure.
+pub fn partition_with_authorized_splits(
+    cfg: &Cfg,
+    split_entries: &BTreeSet<u32>,
+    callable_boundaries: &BTreeSet<u32>,
+) -> Partition {
     let blocks_by_start: BTreeMap<u32, &BasicBlock> =
         cfg.blocks.iter().map(|b| (b.start_va, b)).collect();
 
@@ -139,57 +169,75 @@ pub fn partition(cfg: &Cfg) -> Partition {
     // reaches this block.
     let mut claims: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
 
+    let legacy_tail_boundaries: BTreeSet<u32> = cfg.proven_roots.iter().copied().collect();
     for &root in &cfg.proven_roots {
-        let mut visited: BTreeSet<u32> = BTreeSet::new();
-        let mut stack = vec![root];
-        while let Some(start) = stack.pop() {
-            if !visited.insert(start) {
-                continue;
-            }
-            let Some(block) = blocks_by_start.get(&start) else {
-                continue; // ran-off-end or out-of-range: no block recorded
-            };
+        for start in reachable_blocks(&blocks_by_start, root, None, &legacy_tail_boundaries) {
             claims.entry(start).or_default().insert(root);
-            match &block.terminator {
-                BlockTerminator::Fallthrough { next } => stack.push(*next),
-                BlockTerminator::Tail { target } => {
-                    if !cfg.proven_roots.contains(target) {
-                        stack.push(*target);
-                    }
-                }
-                BlockTerminator::Call { next, .. } => stack.push(*next),
-                BlockTerminator::Branch {
-                    target,
-                    fallthrough,
-                } => {
-                    stack.push(*target);
-                    stack.push(*fallthrough);
-                }
-                BlockTerminator::BranchLikely {
-                    target,
-                    fallthrough,
-                } => {
-                    stack.push(*target);
-                    stack.push(*fallthrough);
-                }
-                BlockTerminator::ResolvedIndirect {
-                    targets,
-                    via_call: false,
-                } => stack.extend(targets.iter().copied()),
-                BlockTerminator::ResolvedIndirect { via_call: true, .. }
-                | BlockTerminator::Indirect { via_call: true } => {
-                    // Computed calls return to the block after their delay
-                    // slot. Their targets are separate callable roots,
-                    // never caller-owned blocks.
-                    stack.push(block.end_va);
-                }
-                BlockTerminator::Return
-                | BlockTerminator::Indirect { via_call: false }
-                | BlockTerminator::Trap
-                | BlockTerminator::RanOffEnd => {
-                    // Terminal: no successor to own.
-                }
-            }
+        }
+    }
+
+    let original_claims = claims.clone();
+    let usable_authoritative: Vec<u32> = split_entries
+        .iter()
+        .copied()
+        .filter(|entry| blocks_by_start.contains_key(entry))
+        .collect();
+    for &entry in &usable_authoritative {
+        let Some(enclosing_claimants) = original_claims.get(&entry) else {
+            continue;
+        };
+        let original_end = cfg
+            .blocks
+            .iter()
+            .filter(|block| {
+                original_claims
+                    .get(&block.start_va)
+                    .is_some_and(|claimants| !claimants.is_disjoint(enclosing_claimants))
+            })
+            .map(|block| block.end_va)
+            .max()
+            .unwrap_or(entry);
+        let next_entry = callable_boundaries
+            .range(entry.saturating_add(1)..)
+            .next()
+            .copied()
+            .unwrap_or(u32::MAX);
+        let region_end = original_end.min(next_entry);
+        if region_end <= entry {
+            continue;
+        }
+
+        // A proven callable entry is a boundary, so no enclosing root can own
+        // blocks at or beyond it. Candidate traversal roots in the same local
+        // region cannot compete with that proven identity; unresolved entry
+        // claims remain proof blockers rather than partition claimants.
+        for (_, block_claims) in claims.range_mut(entry..region_end) {
+            block_claims.clear();
+        }
+        let reachable = reachable_blocks(
+            &blocks_by_start,
+            entry,
+            Some(region_end),
+            callable_boundaries,
+        );
+        for &start in &reachable {
+            claims.entry(start).or_default().insert(entry);
+        }
+        let closure_end = reachable
+            .iter()
+            .filter_map(|start| blocks_by_start.get(start).map(|block| block.end_va))
+            .max()
+            .unwrap_or(entry);
+        if closure_end < region_end
+            && !callable_boundaries.contains(&closure_end)
+            && original_claims.contains_key(&closure_end)
+        {
+            claims.entry(entry).or_default().extend(
+                enclosing_claimants
+                    .iter()
+                    .copied()
+                    .filter(|root| *root != entry),
+            );
         }
     }
 
@@ -216,7 +264,13 @@ pub fn partition(cfg: &Cfg) -> Partition {
         }
     }
 
-    for &root in &cfg.proven_roots {
+    let mut roots = cfg.proven_roots.clone();
+    for entry in usable_authoritative {
+        if !roots.contains(&entry) {
+            roots.push(entry);
+        }
+    }
+    for root in roots {
         let mut block_starts = per_root_blocks.remove(&root).unwrap_or_default();
         if block_starts.is_empty() {
             // A root that produced no CFG block at all (e.g. entirely
@@ -245,6 +299,58 @@ pub fn partition(cfg: &Cfg) -> Partition {
         ambiguous,
         unowned,
     }
+}
+
+fn reachable_blocks(
+    blocks_by_start: &BTreeMap<u32, &BasicBlock>,
+    root: u32,
+    exclusive_end: Option<u32>,
+    callable_boundaries: &BTreeSet<u32>,
+) -> BTreeSet<u32> {
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(start) = stack.pop() {
+        if exclusive_end.is_some_and(|end| start < root || start >= end) || !visited.insert(start) {
+            continue;
+        }
+        let Some(block) = blocks_by_start.get(&start) else {
+            continue;
+        };
+        match &block.terminator {
+            BlockTerminator::Fallthrough { next } => stack.push(*next),
+            BlockTerminator::Tail { target } => {
+                if !callable_boundaries.contains(target) {
+                    stack.push(*target);
+                }
+            }
+            BlockTerminator::Call { next, .. } => stack.push(*next),
+            BlockTerminator::Branch {
+                target,
+                fallthrough,
+            }
+            | BlockTerminator::BranchLikely {
+                target,
+                fallthrough,
+            } => {
+                stack.push(*target);
+                stack.push(*fallthrough);
+            }
+            BlockTerminator::ResolvedIndirect {
+                targets,
+                via_call: false,
+            } => stack.extend(targets.iter().copied()),
+            BlockTerminator::ResolvedIndirect { via_call: true, .. }
+            | BlockTerminator::Indirect { via_call: true } => stack.push(block.end_va),
+            BlockTerminator::Return
+            | BlockTerminator::Indirect { via_call: false }
+            | BlockTerminator::Trap
+            | BlockTerminator::InvalidInstruction { .. }
+            | BlockTerminator::MissingDelaySlot { .. }
+            | BlockTerminator::RanOffEnd
+            | BlockTerminator::DataFence { .. } => {}
+        }
+    }
+    visited
 }
 
 /// Acceptance-gate check: verify no two owners in this bank claim
@@ -476,6 +582,71 @@ mod tests {
             .find(|o| o.root_va == 0x8000_0000)
             .expect("root A should still own its own leading block");
         assert_eq!(owner_a.extent_end, 0x8000_0004);
+    }
+
+    #[test]
+    fn authoritative_entry_inside_an_owner_span_splits_the_span() {
+        let entry = 0x8000_0004;
+        let bytes = asm(&[NOP, NOP, JR_RA, NOP]);
+        let cfg = build_cfg("boot", &bytes, 0x8000_0000, &[0x8000_0000, entry]);
+
+        let unresolved = partition(&cfg);
+        assert!(unresolved
+            .ambiguous
+            .iter()
+            .any(|block| block.block_start == entry));
+
+        let resolved = partition_with_authoritative_entries(&cfg, &BTreeSet::from([entry]));
+        assert!(resolved.ambiguous.is_empty());
+        let prefix = resolved
+            .owners
+            .iter()
+            .find(|owner| owner.root_va == 0x8000_0000)
+            .unwrap();
+        assert_eq!(prefix.block_starts, vec![0x8000_0000]);
+        assert_eq!(prefix.extent_end, entry);
+        let split = resolved
+            .owners
+            .iter()
+            .find(|owner| owner.root_va == entry)
+            .unwrap();
+        assert_eq!(split.block_starts, vec![entry]);
+        assert_eq!(split.extent_end, 0x8000_0010);
+        assert!(same_bank_overlaps(&resolved, &cfg).is_empty());
+    }
+
+    #[test]
+    fn reached_only_entry_inside_an_owner_span_does_not_split() {
+        let target = 0x8000_0004;
+        let bytes = asm(&[NOP, NOP, JR_RA, NOP]);
+        let cfg = build_cfg("boot", &bytes, 0x8000_0000, &[0x8000_0000, target]);
+
+        let part = partition_with_authoritative_entries(&cfg, &BTreeSet::new());
+        assert!(part
+            .ambiguous
+            .iter()
+            .any(|block| block.block_start == target));
+        assert!(!part.owners.iter().any(|owner| owner.root_va == target));
+    }
+
+    #[test]
+    fn synthetic_extent_key_rejects_a_split_at_the_wrong_boundary() {
+        let entry = 0x8000_0004;
+        let bytes = asm(&[NOP, NOP, JR_RA, NOP]);
+        let cfg = build_cfg("boot", &bytes, 0x8000_0000, &[0x8000_0000, entry]);
+        let part = partition_with_authoritative_entries(&cfg, &BTreeSet::from([entry]));
+        let split = part
+            .owners
+            .iter()
+            .find(|owner| owner.root_va == entry)
+            .unwrap();
+
+        let held_out_key = (entry, 0x8000_000c);
+        assert_ne!(
+            (split.root_va, split.extent_end),
+            held_out_key,
+            "a split with the wrong end must not pass exact held-out grading"
+        );
     }
 
     #[test]

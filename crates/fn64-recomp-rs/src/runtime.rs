@@ -805,4 +805,225 @@ impl<'a> Rdram<'a> {
         let shifted = val << (56 - misalign * 8);
         self.store_d(dword_addr, masked | shifted);
     }
+
+    // --- Checked accessors for the bank/sparse block-runner lane (U4) ---
+    //
+    // The historical whole-function lane calls the unchecked accessors above:
+    // an access outside backed RDRAM is a host panic there, and that panicking
+    // semantics is deliberately preserved. The block-runner lane instead needs
+    // a typed VR4300 memory fault it can turn into `BlockExit::Fault`, so it
+    // calls these `try_` variants. On success they perform the identical access
+    // as their unchecked twin; on an out-of-bounds effective address they
+    // return `Err(vaddr)` carrying the faulting guest virtual address, and
+    // touch no memory. This models "access outside backed RDRAM storage"; it is
+    // not full VR4300 address-error/TLB semantics (see U4 in
+    // `docs/UNIVERSAL-RUNTIME-PLAN.md`).
+
+    /// True iff the `width`-byte physical range beginning at physical offset
+    /// `p` lies wholly inside backed storage. Every checked accessor reduces to
+    /// this after applying its own swizzle so the admitted set matches exactly
+    /// which unchecked accesses would not panic.
+    #[inline]
+    fn phys_range_backed(&self, p: usize, width: usize) -> bool {
+        p.checked_add(width)
+            .is_some_and(|end| end <= self.mem.len())
+    }
+
+    /// Whether the aligned-word effective address is backed (LW/LWU/LL/…).
+    #[inline]
+    fn word_backed(&self, vaddr: u64) -> bool {
+        self.phys_range_backed(Self::phys(vaddr), 4)
+    }
+
+    /// Whether the aligned-doubleword effective address is backed (LD/SD/…).
+    #[inline]
+    fn dword_backed(&self, vaddr: u64) -> bool {
+        // A doubleword is two words at `vaddr` and `vaddr+4`; the second is the
+        // one that can run off the end, so checking it covers both.
+        self.phys_range_backed(Self::phys(vaddr.wrapping_add(4)), 4)
+    }
+
+    /// Checked LW/LWU (aligned word). See the module note on the block lane.
+    #[inline]
+    pub fn try_load_w(&self, vaddr: u64) -> Result<i32, u64> {
+        if self.word_backed(vaddr) {
+            Ok(self.load_w(vaddr))
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked LH (aligned, sign-extended halfword).
+    #[inline]
+    pub fn try_load_h(&self, vaddr: u64) -> Result<i16, u64> {
+        if self.phys_range_backed(Self::phys(vaddr) ^ 2, 2) {
+            Ok(self.load_h(vaddr))
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked LHU (aligned, zero-extended halfword).
+    #[inline]
+    pub fn try_load_hu(&self, vaddr: u64) -> Result<u16, u64> {
+        self.try_load_h(vaddr).map(|v| v as u16)
+    }
+
+    /// Checked LB (sign-extended byte).
+    #[inline]
+    pub fn try_load_b(&self, vaddr: u64) -> Result<i8, u64> {
+        if self.phys_range_backed(Self::phys(vaddr) ^ 3, 1) {
+            Ok(self.load_b(vaddr))
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked LBU (zero-extended byte).
+    #[inline]
+    pub fn try_load_bu(&self, vaddr: u64) -> Result<u8, u64> {
+        if self.phys_range_backed(Self::phys(vaddr) ^ 3, 1) {
+            Ok(self.load_bu(vaddr))
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked LWL (the aligned word it merges from must be backed).
+    #[inline]
+    pub fn try_load_wl(&self, initial: u64, vaddr: u64) -> Result<i32, u64> {
+        if self.word_backed(vaddr & !0x3) {
+            Ok(self.load_wl(initial, vaddr))
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked LWR.
+    #[inline]
+    pub fn try_load_wr(&self, initial: u64, vaddr: u64) -> Result<i32, u64> {
+        if self.word_backed(vaddr & !0x3) {
+            Ok(self.load_wr(initial, vaddr))
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked LD/LLD (aligned doubleword).
+    #[inline]
+    pub fn try_load_d(&self, vaddr: u64) -> Result<u64, u64> {
+        if self.dword_backed(vaddr) {
+            Ok(self.load_d(vaddr))
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked LDL.
+    #[inline]
+    pub fn try_load_dl(&self, initial: u64, vaddr: u64) -> Result<u64, u64> {
+        if self.dword_backed(vaddr & !0x7) {
+            Ok(self.load_dl(initial, vaddr))
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked LDR.
+    #[inline]
+    pub fn try_load_dr(&self, initial: u64, vaddr: u64) -> Result<u64, u64> {
+        if self.dword_backed(vaddr & !0x7) {
+            Ok(self.load_dr(initial, vaddr))
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked SW.
+    #[inline]
+    pub fn try_store_w(&mut self, vaddr: u64, val: u32) -> Result<(), u64> {
+        if self.word_backed(vaddr) {
+            self.store_w(vaddr, val);
+            Ok(())
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked SH.
+    #[inline]
+    pub fn try_store_h(&mut self, vaddr: u64, val: u16) -> Result<(), u64> {
+        if self.phys_range_backed(Self::phys(vaddr) ^ 2, 2) {
+            self.store_h(vaddr, val);
+            Ok(())
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked SB.
+    #[inline]
+    pub fn try_store_b(&mut self, vaddr: u64, val: u8) -> Result<(), u64> {
+        if self.phys_range_backed(Self::phys(vaddr) ^ 3, 1) {
+            self.store_b(vaddr, val);
+            Ok(())
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked SWL (reads and writes the aligned word it straddles).
+    #[inline]
+    pub fn try_store_wl(&mut self, vaddr: u64, val: u32) -> Result<(), u64> {
+        if self.word_backed(vaddr & !0x3) {
+            self.store_wl(vaddr, val);
+            Ok(())
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked SWR.
+    #[inline]
+    pub fn try_store_wr(&mut self, vaddr: u64, val: u32) -> Result<(), u64> {
+        if self.word_backed(vaddr & !0x3) {
+            self.store_wr(vaddr, val);
+            Ok(())
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked SD/SCD (aligned doubleword).
+    #[inline]
+    pub fn try_store_d(&mut self, vaddr: u64, val: u64) -> Result<(), u64> {
+        if self.dword_backed(vaddr) {
+            self.store_d(vaddr, val);
+            Ok(())
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked SDL.
+    #[inline]
+    pub fn try_store_dl(&mut self, vaddr: u64, val: u64) -> Result<(), u64> {
+        if self.dword_backed(vaddr & !0x7) {
+            self.store_dl(vaddr, val);
+            Ok(())
+        } else {
+            Err(vaddr)
+        }
+    }
+
+    /// Checked SDR.
+    #[inline]
+    pub fn try_store_dr(&mut self, vaddr: u64, val: u64) -> Result<(), u64> {
+        if self.dword_backed(vaddr & !0x7) {
+            self.store_dr(vaddr, val);
+            Ok(())
+        } else {
+            Err(vaddr)
+        }
+    }
 }

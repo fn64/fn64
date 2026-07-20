@@ -1,0 +1,32 @@
+# Super Mario 64 (US) static request-DMA claims. n64decomp/sm64
+# src/game/memory.c `load_engine_code_segment` (answer key 0x80278974)
+# loads the engine segment via the file-local `dma_read(dest, srcStart,
+# srcEnd)` — o32: dest $a0(4), srcStart $a1(5), srcEnd $a2(6); the third
+# argument is an EXCLUSIVE END address, hence size_is_end_address.
+# dma_read is `static` and absent from the linker map; its VA 0x80278504
+# was recovered by decoding the jal inside load_engine_code_segment from
+# the retail ROM (offset 0x339DC), with the engine constants
+# (srcStart 0xF5580, srcEnd 0x108A10 — matching the map's
+# _engineSegmentRomStart/_engineSegmentRomEnd exactly, sign-extended
+# addiu included) staged into $a1/$a2 at that call site. SM64 stores
+# these segments uncompressed at their physical offsets, hence
+# device_space Physical. Call sites with runtime arguments (the level
+# script loader) are reported open, never guessed.
+
+[[request_dma]]
+name = "dma_read"
+callee_va = 0x80278504
+dram_arg_register = 4
+device_arg_register = 5
+size_arg_register = 6
+size_is_end_address = true
+device_space = "Physical"
+
+[request_dma.bank_name]
+prefix = "request_dma_"
+
+# STATUS (2026-07-20): the engine site (0x802789DC) proves under the
+# slicer's ABI-carried allowance (caller-frame slots and callee-saved
+# registers persist across direct calls absent a frame-address escape —
+# see pi_dma's module doc). The five other dma_read sites carry runtime
+# arguments (the level-script loader) and stay honestly open.
