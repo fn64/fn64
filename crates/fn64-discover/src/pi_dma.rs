@@ -6,7 +6,16 @@
 //! `vAddr`/`nbytes` are in the caller's stack argument area at
 //! `$sp + 0x10`/`$sp + 0x14`.
 //! This module recovers only constants established in the straight-line run
-//! immediately before a direct `jal`, including the call's delay slot.
+//! immediately before a direct `jal`, including the call's delay slot —
+//! extended by exactly one ABI-carried allowance: across an intervening
+//! DIRECT call, o32 callee-saved registers (`$s0..$s7`, `$gp`, `$sp`,
+//! `$fp`) and the caller's tracked frame slots persist, because the o32
+//! contract obliges callees to preserve them, UNLESS a frame address was
+//! materialized in the bounded window (an escaped `&local` lets a callee
+//! legally write the caller's frame). Caller-saved registers still never
+//! cross any transfer; branches and indirect transfers remain full
+//! barriers; escapes older than the bounded window are invisible, which is
+//! one reason recovered geometry stays candidate-strength.
 //!
 //! Recovered operands are exact call-boundary semantics.  The resulting DMA
 //! geometry remains a candidate: instruction bytes do not prove reachability,
@@ -499,6 +508,33 @@ fn slice_call(
     slice
 }
 
+/// Registers the o32 ABI obliges a callee to preserve: `$s0..$s7`, `$gp`,
+/// `$sp`, `$fp`. Everything else is caller-saved and resets at any call.
+fn abi_preserved(register: u8) -> bool {
+    matches!(register, 16..=23 | 28 | 29 | 30)
+}
+
+/// Does this word materialize a frame address into a general register (or
+/// store `$sp` itself)? That is how `&stack_local` escapes to a callee,
+/// which may then legally write the caller's frame — the condition that
+/// disables caller-frame slot persistence across a call.
+fn materializes_frame_address(word: u32) -> bool {
+    let op = word >> 26;
+    let rs = ((word >> 21) & 0x1f) as u8;
+    let rt = ((word >> 16) & 0x1f) as u8;
+    match op {
+        0x09 | 0x19 => rs == 29 && rt != 29,
+        0 => {
+            matches!(word & 0x3f, 0x21 | 0x23 | 0x25 | 0x2d) && (rs == 29 || rt == 29) && {
+                let rd = ((word >> 11) & 0x1f) as u8;
+                rd != 29
+            }
+        }
+        0x28..=0x2f | 0x38..=0x3f => rt == 29,
+        _ => false,
+    }
+}
+
 fn slice_state_at_call(
     words: &[u32],
     image_start: VirtualAddress,
@@ -515,6 +551,65 @@ fn slice_state_at_call(
     let budget_exhausted = slice_start == budget_start && budget_start != 0;
     let slice_start_pc = pc_at(image_start, slice_start);
     let mut state = SliceState::new(slice_start_pc, budget_exhausted);
+
+    // ABI-carried history (a documented extension of the straight-line
+    // contract): walk the window before `slice_start`. Across a DIRECT jal
+    // the o32 contract preserves callee-saved registers and the caller's
+    // frame, so tracked stack slots and preserved registers survive —
+    // UNLESS a frame address escaped (a callee holding `&local` may write
+    // the frame), the transfer is not a direct call, or a store went
+    // through an unknown base. Escapes created before the bounded window
+    // are invisible; the recovered operands remain candidate-strength and
+    // are corroborated downstream, matching this module's contract.
+    if slice_start > budget_start {
+        let mut history = SliceState::new(pc_at(image_start, budget_start), budget_start != 0);
+        let mut escaped = false;
+        let mut index = budget_start;
+        while index < call_index && index < slice_start {
+            let word = words[index];
+            escaped |= materializes_frame_address(word);
+            if is_control_transfer(word) && index + 1 < call_index {
+                let delay = words[index + 1];
+                escaped |= materializes_frame_address(delay);
+                execute(&mut history, pc_at(image_start, index + 1), delay);
+                let soft = word >> 26 == 0x03 && !escaped;
+                let after = pc_at(image_start, index + 2);
+                history.memory_words.clear();
+                if !soft {
+                    history.stack_words.clear();
+                }
+                let carried_sp = history.registers[29].clone();
+                for register in 1..32u8 {
+                    if !(soft && abi_preserved(register)) {
+                        history.set_register(
+                            register,
+                            Value::open(SliceBlocker::DefinitionNotRecovered {
+                                register,
+                                slice_start: after,
+                                budget_exhausted: false,
+                            }),
+                        );
+                    }
+                }
+                // `$sp` itself is preserved by every call and unchanged by
+                // in-function branches; carrying it keeps stack-slot keys
+                // consistent across the whole window.
+                history.registers[29] = carried_sp;
+                index += 2;
+                continue;
+            }
+            execute(&mut history, pc_at(image_start, index), word);
+            index += 1;
+        }
+        state.stack_words = history.stack_words;
+        state.registers[29] = history.registers[29].clone();
+        for register in [16u8, 17, 18, 19, 20, 21, 22, 23, 28, 30] {
+            if !matches!(history.registers[register as usize], Value::Open(_)) {
+                state.registers[register as usize] =
+                    history.registers[register as usize].clone();
+            }
+        }
+    }
 
     for (index, &word) in words.iter().enumerate().take(call_index).skip(slice_start) {
         execute(&mut state, pc_at(image_start, index), word);
@@ -1302,6 +1397,60 @@ mod tests {
             ),
             Err(PiDmaSliceError::RdramLengthOutsidePhysicalDomain { .. })
         ));
+    }
+
+    #[test]
+    fn caller_frame_slots_and_saved_registers_cross_direct_calls_only() {
+        const START: u32 = 0x8000_0000;
+        const CALLEE: u32 = 0x8000_2000;
+        let jal_word = |target: u32| 0x0c00_0000 | ((target >> 2) & 0x03ff_ffff);
+        // sw of a constant arg to the frame, an intervening helper call,
+        // then the sliced call reloading the spill in its delay slot —
+        // the SM64 dma_read shape.
+        let body = |middle: u32, escape: Option<u32>| {
+            let mut words = vec![
+                0x3c08_00aa, // lui   r8, 0x00aa      (spilled value)
+                0xafa8_0024, // sw    r8, 0x24(sp)
+            ];
+            if let Some(word) = escape {
+                words.push(word);
+            }
+            words.extend([
+                middle,      // intervening transfer
+                0x0000_0000, // its delay slot
+                0x3c06_0123, // lui   r6, 0x0123      (device register a2)
+                jal_word(CALLEE),
+                0x8fa6_0024, // delay: lw r6, 0x24(sp) — reload the spill
+                0x0000_0000,
+            ]);
+            words
+        };
+        let device = |words: &[u32]| {
+            slice_pointer_arg_calls(
+                words,
+                VirtualAddress::new(START),
+                VirtualAddress::new(CALLEE),
+                0x80_0000,
+                6,
+            )
+            .unwrap()[0]
+                .pointer
+                .proven()
+                .copied()
+        };
+
+        // Direct helper call, no escape: the spill survives and the reload
+        // yields the stored constant.
+        let direct = body(jal_word(0x8000_3000), None);
+        assert_eq!(device(&direct).map(|va| va.get()), Some(0x00aa_0000));
+
+        // Same shape with a materialized frame address: persistence off.
+        let escaped = body(jal_word(0x8000_3000), Some(0x27a4_0024)); // addiu a0, sp, 0x24
+        assert_eq!(device(&escaped), None);
+
+        // A branch instead of a call: full barrier, as ever.
+        let branch = body(0x1000_0004, None); // beq r0, r0, +4
+        assert_eq!(device(&branch), None);
     }
 
     #[test]
