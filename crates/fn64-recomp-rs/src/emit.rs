@@ -550,6 +550,17 @@ pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
     blocks.sort_by_key(|block| block.vram);
     let mut ranges = Vec::with_capacity(blocks.len());
     let mut instrs = BTreeMap::new();
+    // Addresses that are the delay slot of a control transfer within the same
+    // admitted block. A delay-slot word belongs to its control transfer's
+    // architectural unit: it executes as an ordinary instruction (the transfer
+    // arm runs it inline, and its own arbitrary-PC arm runs it straight), never
+    // as an independent transfer that would demand a further delay slot. Pairing
+    // walks each block exactly as `emit_function` does — advance two words past
+    // a control transfer — so a `jr`/branch-shaped word sitting in a delay slot
+    // (common in `jr $sN` register-save data runs proven as code) is classified
+    // as the delay slot it is, not re-decoded as a transfer whose unproven
+    // successor byte cannot supply a delay slot.
+    let mut delay_slots: BTreeSet<u32> = BTreeSet::new();
     let mut previous_end = None;
     for block in blocks {
         assert!(
@@ -587,6 +598,18 @@ pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
                 "sparse bank {} contains duplicate instruction at {pc:#010X}",
                 bank.bank
             );
+        }
+        // Classify delay slots by walking the block from its leader with the
+        // same two-word stride `emit_function` uses: the word after each control
+        // transfer is that transfer's delay slot.
+        let mut index = 0usize;
+        while index < block.words.len() {
+            if decode(block.words[index]).has_delay_slot() && index + 1 < block.words.len() {
+                delay_slots.insert(block.vram + (index as u32 + 1) * 4);
+                index += 2;
+            } else {
+                index += 1;
+            }
         }
         if let Some((_, previous_end)) = ranges.last_mut() {
             if *previous_end == block.vram {
@@ -662,16 +685,26 @@ pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
     for (&vram, &instr) in &instrs {
         let _ = writeln!(out, "        {vram:#010X} => {{");
         let _ = writeln!(out, "            // {vram:#010X}: {instr:?}");
-        if instr.has_delay_slot() {
-            let delay_vram = vram
-                .checked_add(4)
-                .expect("sparse bank delay-slot address exceeds u32");
-            let delay = Some(*instrs.get(&delay_vram).unwrap_or_else(|| {
-                panic!(
-                    "sparse bank {} control transfer at {vram:#010X} omits its delay slot at {delay_vram:#010X}",
-                    bank.bank
-                )
-            }));
+        // A word is executed as a control transfer only when it is NOT itself
+        // the delay slot of a preceding transfer in its block. A delay-slot word
+        // is one architectural unit with its control transfer: it is emitted as
+        // an ordinary instruction here (its transfer arm ran it inline), never
+        // re-decoded as a transfer that would demand a further delay slot.
+        let delay_vram = vram.checked_add(4);
+        let delay_admitted = delay_vram.and_then(|d| instrs.get(&d).copied());
+        if instr.has_delay_slot() && !delay_slots.contains(&vram) && delay_admitted.is_none() {
+            // A control transfer at a block's last word whose delay slot is
+            // admitted by no proven block. The genuine severed-delay case was
+            // re-attached in the pack (its delay slot is proven code); reaching
+            // here means the delay slot is unproven — the "control transfer" is
+            // misclassified data or an inconsistent decode. It cannot be soundly
+            // executed as a transfer (its delay slot is unknown), so its arm is
+            // a loud runtime trap rather than a generation-time panic that would
+            // reject the whole runner. Legitimate control flow never enters here.
+            emit_data_control_word(&mut out, vram);
+        } else if instr.has_delay_slot() && !delay_slots.contains(&vram) {
+            let delay_vram = delay_vram.expect("sparse bank delay-slot address exceeds u32");
+            let delay = Some(delay_admitted.expect("delay slot admitted in this branch"));
             let _ = writeln!(
                 out,
                 "            if executed != 0 && executed + 2 > budget.get() {{"
@@ -685,8 +718,13 @@ pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
             emit_bank_control_transfer(
                 &mut out, instr, vram, delay, delay_vram, bank.bank, &domain,
             );
+        } else if instr.has_delay_slot() {
+            // A delay slot (or a block-terminal control word with no admitted
+            // delay) whose bytes decode as a control transfer. It cannot execute
+            // as a transfer; a loud trap is the whole arm. See `emit_delay_slot`.
+            emit_data_control_word(&mut out, vram);
         } else {
-            emit_straight(
+            emit_delay_slot(
                 &mut out,
                 instr,
                 vram,
@@ -821,7 +859,7 @@ fn emit_bank_control_transfer(
             // has already charged the branch/delay pair (`executed += 2`) before
             // this point, so report `executed - 2` — only instructions that
             // retired before the branch. See `MemFault::Fault`.
-            emit_straight(
+            emit_delay_slot(
                 out,
                 delay,
                 delay_vram,
@@ -1254,6 +1292,49 @@ fn emit_sc(out: &mut String, mem_fault: &MemFault, rt: Reg, base: Reg, off: i16,
             );
         }
     }
+}
+
+/// Emit the delay-slot word of a control transfer.
+///
+/// The delay slot runs as an ordinary instruction, so it is normally
+/// [`emit_straight`]. A delay slot whose *bytes* happen to decode as a
+/// branch/jump/`jr` is architecturally impossible to execute as a transfer —
+/// MIPS III leaves a control transfer inside a delay slot UNPREDICTABLE, and
+/// such a word is admitted only because a `jr`-shaped data run was proven code.
+/// It is never reached by legitimate control flow (nothing branches through
+/// it as a real transfer), but the arm must still compile, so emit a loud
+/// runtime trap rather than [`emit_straight`]'s `compile_error!`. This keeps
+/// the "no silent shrug" contract: if one ever executes, it panics with its PC.
+fn emit_delay_slot(out: &mut String, instr: Instruction, vram: u32, mem_fault: &MemFault) {
+    if instr.has_delay_slot() {
+        // The instruction's Debug form contains braces; keep it out of the
+        // generated `panic!` format string (which would misparse them) — the PC
+        // alone identifies the site.
+        let _ = writeln!(
+            out,
+            "            panic!(\"control transfer in delay slot at {vram:#010X} is architecturally UNPREDICTABLE (misclassified data)\");"
+        );
+    } else {
+        emit_straight(out, instr, vram, mem_fault);
+    }
+}
+
+/// Emit the arm for a control-transfer-shaped word that is proven code but
+/// whose delay slot no proven block admits.
+///
+/// A genuine control transfer always has a proven delay slot, re-attached to its
+/// block before emission. Reaching this path means the word's successor is
+/// unproven: the "transfer" is misclassified data (or an inconsistent decode)
+/// that cannot execute soundly — a delay slot it cannot supply. It is never
+/// reached by legitimate control flow, but the arm must compile, so it is a loud
+/// runtime trap carrying its PC rather than a silent no-op.
+fn emit_data_control_word(out: &mut String, vram: u32) {
+    // The PC alone identifies the site; the decoded instruction's Debug form is
+    // deliberately left out (its braces would misparse in the format string).
+    let _ = writeln!(
+        out,
+        "            panic!(\"control transfer at {vram:#010X} has no admitted delay slot (misclassified data)\");"
+    );
 }
 
 /// Emit a straight-line (non-control-transfer) instruction as typed Rust.
