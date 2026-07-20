@@ -1,0 +1,18 @@
+# Super Mario 64 (US) script-embedded pointer claims. The behavior
+# segment (n64decomp/sm64 data/behavior_data.c) is an interpreter data
+# stream stored UNCOMPRESSED at physical ROM 0x219E00..0x21F4C0
+# (_behaviorSegmentRomStart/_behaviorSegmentRomEnd in the decomp's own
+# build map). Its CALL_NATIVE command is `BC_B(0x0C), BC_PTR(func)` —
+# word 0x0C000000 followed by the raw C function address (absolute VA,
+# independent of where the script itself loads). Object update/init
+# behaviors dispatch through these records via the behavior interpreter
+# (src/engine/behavior_script.c). Pointers are read from ROM bytes and
+# graded adversarially: a bogus record that splits a real answer
+# function fails the gate.
+
+[[script_ptr_tables]]
+name = "behavior_call_native"
+rom_start = 0x219E00
+rom_end = 0x21F4C0
+command_word = 0x0C000000
+command_mask = 0xFFFFFFFF
