@@ -1,0 +1,28 @@
+# Kirby 64 (US) byte-adjudicated interior entries. The K64 answer key is
+# WIP and gap-derives sizes, lumping unlabeled real functions into the
+# preceding labeled symbol. Each entry below was adjudicated at byte
+# level (2026-07-20): the word pair before it is a `jr $ra; nop`
+# function terminator and the entry itself begins a fresh
+# `addiu sp,sp,-N` prologue, so a discovery root there is correct
+# finer-grained output, not a mis-split. Consumed as grading excuses
+# only — never as discovery input.
+
+[[adjudicated_entries]]
+# ROM 0x8248 (boot). Inside the key's gtlSetUpdateDrawRate (0x800075dc
+# +0xf4): preceded by `jr $ra; nop`, starts `addiu sp,sp,-0x18`.
+name = "gtlSetUpdateDrawRate_tail_sibling"
+va = 0x80007648
+
+[[adjudicated_entries]]
+# ROM 0x1dab4. Inside the key's create_z_rotation_matrix (0x8001cda0
+# +0x160): preceded by `jr $ra; nop`, starts `addiu sp,sp,-0x60` with
+# an FPU-arg prologue (mtc1 pair) — the F-variant sibling the key
+# doesn't label.
+name = "create_z_rotation_matrix_sibling"
+va = 0x8001ceb4
+
+[[adjudicated_entries]]
+# ROM 0x1dc14. Inside the key's create_y_rotation_matrix (0x8001cf00
+# +0x1b4): same shape as above.
+name = "create_y_rotation_matrix_sibling"
+va = 0x8001d014

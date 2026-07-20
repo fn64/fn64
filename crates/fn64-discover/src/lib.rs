@@ -178,6 +178,7 @@ pub mod regions;
 pub mod reloc_grade;
 pub mod resolve;
 pub mod rom;
+pub mod sig_scan;
 pub mod snapshot;
 pub mod spimdisasm_adapter;
 pub mod tool_adapter;
