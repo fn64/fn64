@@ -7,6 +7,7 @@
 //! Game policy remains with each harness: which sections are resident,
 //! controller input, save type, rendering, audio, and executor driving.
 
+mod certification_profile;
 mod observation_evidence;
 mod release_gate;
 mod release_matrix;
@@ -14,6 +15,11 @@ mod render_evidence;
 mod report_series;
 mod unsupported_journal;
 
+pub use certification_profile::{
+    CertificationProfileError, CertificationProfileIdentity, CertificationRequirement,
+    CertificationRequirementClass, CertificationRequirementRef, FullParityV1,
+    FULL_PARITY_V1_DEFINITION_SHA256, FULL_PARITY_V1_SCHEMA,
+};
 pub use observation_evidence::{
     FramebufferObservationFormat, FramebufferObservationGeometry, FramebufferObservationSource,
     LiveMemoryEvidence, LiveReferenceFramebufferEvidence, LiveReleaseGateObservationExt,
@@ -28,11 +34,12 @@ pub use release_gate::{
     LIVE_SAVE_OPERATION_CLOSURE_PATHS,
 };
 pub use release_matrix::{
-    verify_release_matrix, ControllerFeature, PresentationBoundaryEvidence, ProgramFeature,
-    ReleaseMatrixCoverage, ReleaseMatrixError, ReleaseMatrixManifest, ReleaseMatrixScenario,
+    verify_release_matrix, CertificationRequirementAssignment, ControllerFeature,
+    IncompleteReleaseMatrix, PresentationBoundaryEvidence, ProgramFeature, ReleaseMatrixCoverage,
+    ReleaseMatrixError, ReleaseMatrixManifest, ReleaseMatrixScenario, ReleaseMatrixVerification,
     ReleasePlatform, RendererFeature, SaveFeature, VerifiedMatrixScenario, VerifiedReleaseMatrix,
-    RELEASE_MATRIX_MAX_SCENARIOS, RELEASE_MATRIX_REPORT_COUNT, RELEASE_MATRIX_SCHEMA,
-    VERIFIED_RELEASE_MATRIX_SCHEMA,
+    INCOMPLETE_RELEASE_MATRIX_SCHEMA, RELEASE_MATRIX_MAX_SCENARIOS, RELEASE_MATRIX_REPORT_COUNT,
+    RELEASE_MATRIX_SCHEMA, VERIFIED_RELEASE_MATRIX_SCHEMA,
 };
 pub use render_evidence::{
     LiveReleaseGateRenderExt, LiveRenderEvidence, RenderCaptureStage, RenderEvidenceError,
