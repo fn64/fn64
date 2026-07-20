@@ -1,0 +1,10 @@
+# oot-ntsc-1.0 cited code-pointer-argument claims for CFG-root seeding.
+# osCreateThread(OSThread*, id, void (*entry)(void*), ...) carries its
+# entry pointer in $a2 (o32; public libultra manual). Callee VA from the
+# zeldaret/oot decomp's answer key (OOTU dump) — an anchor claim only: recovered
+# pointers are read from ROM instruction bytes and graded wrong==0.
+
+[[entry_arg_calls]]
+name = "osCreateThread"
+callee_va = 0x80002f20
+pointer_arg_register = 6
