@@ -25,14 +25,8 @@ device_space = "Physical"
 [request_dma.bank_name]
 prefix = "request_dma_"
 
-# STATUS (2026-07-20): all six dma_read call sites currently report open
-# operands. The engine site (0x802789DC) stages $a1/$a2 as constants in
-# its own straight-line window, but $a0 (dest) is SPILLED to a
-# caller-frame stack slot BEFORE an intervening bzero call and reloaded
-# in the jal's delay slot — recovering it requires persisting
-# caller-frame stack slots across direct calls. That is o32-ABI-sound
-# (callees do not write the caller's frame) but deliberately outside the
-# slicer's documented straight-line contract (see pi_dma's
-# never_propagates_values_across_an_earlier_control_transfer test);
-# extending that contract is an open design decision, recorded here
-# rather than decided by a claims file.
+# STATUS (2026-07-20): the engine site (0x802789DC) proves under the
+# slicer's ABI-carried allowance (caller-frame slots and callee-saved
+# registers persist across direct calls absent a frame-address escape —
+# see pi_dma's module doc). The five other dma_read sites carry runtime
+# arguments (the level-script loader) and stay honestly open.
