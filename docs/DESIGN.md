@@ -222,6 +222,18 @@ reference runtime can only be a **checkpoint PC reached by whole-function
 execution**, never a single MIPS instruction. `fn64-diff` is scoped to exactly
 that comparison and nothing more.
 
+This is a statement about the current function-granularity lane, not a permanent
+limit on fn64. `UNIVERSAL-RUNTIME-PLAN.md` defines the bank-qualified
+arbitrary-PC block lane that removes the representability wall. Until its U1
+gate passes, savestate resume remains unrepresentable and no tool may claim
+otherwise. The working-tree sparse emitter now compiles a real digest-verified
+N64 bank without decoding holes. `BlockProgram` atomically registers the owned
+`CodeBank` with the generated callable and rechecks a sparse entry before
+invocation; emitted code supplies the bank-bound registration helper. The live
+executor/dispatcher connection is still absent, so source generation and an
+owned program in isolation do not make transplant/resume available to the
+runtime.
+
 Provenance of the removal: `crates/fn64-diff` once carried a subprocess client
 for the *faki-tools* `oracle` CLI plus a mupen64plus `.m64p` savestate parser,
 to drive this transplant path. Both were removed 2026-07-17 — the oracle client

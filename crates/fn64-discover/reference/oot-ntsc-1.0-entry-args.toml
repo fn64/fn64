@@ -1,0 +1,30 @@
+# oot-ntsc-1.0 cited code-pointer-argument claims for CFG-root seeding.
+# osCreateThread(OSThread*, id, void (*entry)(void*), ...) carries its
+# entry pointer in $a2 (o32; public libultra manual). Callee VA from the
+# zeldaret/oot decomp's answer key (OOTU dump) — an anchor claim only: recovered
+# pointers are read from ROM instruction bytes and graded wrong==0.
+
+[[entry_arg_calls]]
+name = "osCreateThread"
+callee_va = 0x80002f20
+pointer_arg_register = 6
+
+[[entry_arg_calls]]
+# Fault_AddClient(client, callback, arg0, arg1): the fault thread calls
+# the registered callback — callback pointer in $a1. Callee VA from the
+# OOTU answer key (the function lives in the `code` segment; its boot
+# call sites are what get sliced).
+name = "Fault_AddClient"
+callee_va = 0x800aef8c
+pointer_arg_register = 5
+
+[[entry_arg_calls]]
+# _Printf(outfun prout, char* arg, const char* fmt, va_list): IDO libc's
+# printf engine dispatches every character through the prout callback
+# passed in $a0 (public IDO libc shape; measured 2026-07-20 as the
+# dominant open-jalr cluster). Callee VA from the OOTU answer key — an
+# anchor claim; recovered pointers are read from ROM bytes and graded
+# wrong==0.
+name = "_Printf"
+callee_va = 0x800d1d00
+pointer_arg_register = 4

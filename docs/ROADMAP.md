@@ -362,14 +362,30 @@ and scope limits that make an open item meaningful.
 Today OoT symbol/section metadata comes entirely from the zeldaret decomp
 via aki-recomp's Python (`import_oot_syms.py`, `gen_stubs.py`). The zeldaret
 answer key (10,833 named fns) makes OoT the perfect graded target.
-fn64-discover has Phases 1/2/4/5 + bounded-6; the rest is design-only
-(DISCOVER-DESIGN.md).
+fn64-discover has Phases 1/2/4/5 + bounded-6, plus candidate-only region,
+homology, loader, trace, probe, and tool-adapter foundations; pack emission
+and end-to-end closure remain open (DISCOVER-DESIGN.md). The active
+measurements and implementation sequence are
+in `DISCOVER-PLAN.md`; `DISCOVER-STORAGE.md`, `DISCOVER-OWNER-PROOF.md`, and
+`DISCOVER-TOOLCHAIN.md` define the graph/index, exact-owner, and external-tool
+boundaries.
 
-Current grading (D1+D1.5+D2, 2026-07-17, `gate_d1` — but see H3: these
-numbers are reproducible on one machine only): OoT 98.7% precision / 72.3%
-recall; NW4E 48.4%/89.7%; NWXE 50.0%/86.9% (NWXE was 36.4%/28.5% until its
-overlay bank table geometry was wired into the gate — the Phase-2 recall
-lesson below, confirmed a second time).
+Current grading (D1+D1.5+D2, 2026-07-17, `gate_d1`; inputs are
+`FN64_DISCOVER_*` env-declared since H3 closed — but see H3: these numbers
+are reproducible on one machine only): OoT 98.7% precision / 72.3% recall;
+NW4E 48.4%/89.7%; NWXE 50.0%/86.9% (NWXE was 36.4%/28.5% until its overlay
+bank table geometry was wired into the gate — the Phase-2 recall lesson
+below, confirmed a second time). The AKI figures use SHA-bound external
+text intervals, so they measure the payoff from correct executable regions,
+not mechanical recovery of those regions. Mapping-only baselines and byte
+coverage remain separate in `DISCOVER-PLAN.md`.
+
+NWXE's mapping-only overlay gap is closed mechanically: ROM-only
+descriptor-family recovery plus unique delta/destination agreement produces
+four proven load images, and wiring the overlay bank table geometry into
+the gate took the held-out D1 grade from 36.4%/28.5% boot-only to
+50.0%/86.9%. Whole-image data scanning is still why this sits below the
+external-text-filter result above.
 
 Two findings worth not rediscovering:
 - **Recall is a Phase-2 problem, not a detector problem.** OoT recall was
@@ -379,19 +395,122 @@ Two findings worth not rediscovering:
   before tuning detectors — they can only hunt inside discovered images.
 - **Table-derived candidates are an honest 0 everywhere.** Descriptor tables
   prove load-images, not entry points. Not a bug; don't "fix" it.
+- **Cross-ROM homology is already a high-precision seed, not full recall.**
+  Relocation-masked whole-body matches recovered 16.0% of NW4E and 22.6% of
+  NWXE target entries at 99.6% and 98.8% boundary precision respectively;
+  ambiguous bodies stayed unresolved. Ten gate runs were byte-identical.
+- **External function finders still need native ownership proof.** An unseeded
+  spimdisasm 1.42.2 run on NWXE resident text reached 92.0% entry precision /
+  97.6% recall, but only 666 of 827 common starts had exact extents. A strict
+  candidate-only CSV adapter now binds those claims to exact tool, bank,
+  mapping, configuration, and provider-output identities. The native exact-
+  owner proof type exists, but no real-ROM owner is claimed until its gate is
+  integrated and every blocker is discharged.
+- **External-tool claims now have a non-contaminating merge boundary.**
+  Accepted adapter runs freeze into a canonical `ToolClaimSetV1` sidecar bound
+  to the exact discovery snapshot, bank bytes, mapping, tool, configuration,
+  and provider output. Deserialized sets recompute source/claim digests and
+  bank-local constraints. The type remains candidate-only and never enters
+  `FactDb`, so disabling a provider removes only its sidecar claims. Rich
+  Ghidra/spimdisasm xrefs, blocks, data objects, and types are still open.
+- **Strict boot-loader semantics transfer without title descriptors.** The
+  generic entry-stub recognizer proves complete countdown zero-fill loops and
+  constructed post-clear transfers in both current AKI grading ROMs, deriving
+  their different ranges. Ten real-ROM gate runs were byte-identical. This
+  does not yet recover general PI DMA overlay tables. The static slicer now
+  models the public seven-argument `osPiStartDma` ABI and the distinct
+  three-argument `osEPiStartDma` message ABI separately, including delay-slot
+  stores and exact `OSIoMesg` geometry. The descriptor-free affine table-use
+  stage now normalizes biased pointers, validates stable role offsets and the
+  public ROM/text/data/BSS relations, and refuses to call a consecutive subset
+  complete without independently proven loop base/count/stride. Producing
+  those semantic loads and exact enumeration through real wrapper chains is
+  the next frontier.
+- **RE tools are now typed Decomp Pack inputs, not parallel truth stores.** A
+  strict spimdisasm adapter preserves bank and lineage, and stock headless
+  Ghidra passed ten deterministic synthetic runs with same-VA banks isolated
+  and seeded/unseeded provenance distinct. Their next useful output is graph,
+  xref, data, and type metadata; exact ownership and recompiler admission stay
+  native proof stages.
 
 Still open from D1.5: resident `code`/`n64dd` destination discovery.
 - [x] **D2 Phase-6 completion** (merged 2026-07-17) — jump tables +
   value-set analysis; OoT precision 90.6% -> 98.7%.
+- [~] **D2b shared decode + composed owner gate** (working tree,
+  2026-07-18) — discovery now uses recompilation's decoder, invalid/missing
+  delay words are typed owner blockers, REGIMM link and `jalr $zero`
+  semantics are covered, and one physical bank composes into a byte-bound
+  `ProgramSnapshotV1`. The real NWXE resident run is 10/10 byte-identical,
+  keeps 0 wrong answer-key splits, and reports its honest blocker histogram.
+  Link-free resolved jumps no longer fabricate callable roots; this reduced
+  NWXE partition ambiguity from 5 blocks to 0 and improved its grading from
+  26 exact + 1 coarse to 26 exact + 3 coarse. The ROM-header entry is now a
+  typed hardware-authoritative fact. No real-ROM exact owner is admitted yet
+  because executable-range authority is not mechanical (27/27 NWXE owner
+  assessments carry that blocker, and it is the sole blocker for 25). A
+  separate function-independent proof admits all 197 currently reached NWXE
+  blocks / 4,156 bytes with exact ROM backing. Canonical leader splitting
+  prevents overlapping pseudo-blocks. `BlockPackV1` binds those disjoint
+  spans to ROM and per-block digests without serializing ROM words; the real
+  gate re-materializes 1,039 words, emits a sparse arbitrary-PC runner, and
+  compiles it with `rustc`. Holes receive no arms or same-bank authority. This
+  does not claim the remaining resident text or overlays. The typed runtime
+  catalog now owns/searches disjoint bank-bound spans and the real gate re-
+  resolves every packed word while rejecting a real hole. `BlockProgram`
+  atomically pairs code and generated callables, rejects bank mismatch or
+  duplicate registration, and resolves sparse admission before invocation;
+  the emitter's registration helper passes the compile/run gate. This owned
+  program is not yet connected to live guest dispatch.
 - [ ] **D3 Phases 7-8**: targeted dynamic probes; assembly/relink
-  verification.
+  verification. Digest-bound strict trace ingestion and emulator-neutral
+  bounded probe plans exist; a black-box emulator adapter and proof-rule
+  integration remain open.
 - [ ] **D4 pack emission**: emit fn64-owned `dump.toml`-equivalent
   (Decomp Pack) from discover output, replacing the aki-recomp Python for
   metadata production.
+- [ ] **D4b full-game execution closure**: emit a bank-qualified dispatch
+  table whose destinations are exact-owner AOT, basic-block AOT, or explicit
+  instrumented MIPS fallback. A release has zero unsupported destinations;
+  function-boundary ambiguity is not allowed to become a missing-code path.
 - [ ] **D-gate**: `recompile_rom` consumes the fn64-discovered pack for OoT
   and the boot is **byte-identical** (framebuffer SHA at fixed swaps) to the
   decomp-metadata build. Then produce the WM2000 pack with zero
   game-specific code.
+
+## Phase U — general N64 execution closure
+
+`UNIVERSAL-RUNTIME-PLAN.md` is the load-bearing capability matrix and staged
+gate. Discovery and exact decomp remain valuable, but execution may not depend
+on recovering historical function boundaries. The universal destination is a
+bank-qualified PC; every path ends as exact AOT, block AOT, dynamic MIPS, or an
+explicit unsupported result, and a release admits zero unsupported results.
+
+- [~] **U0 execution identity** — typed bank/PC keys, immutable code-bank
+  admission, overlapping same-VA isolation, and typed block exits exist in the
+  working tree; arbitrary-PC execution is U1, so this is not yet complete.
+- [~] **U1 one-bank arbitrary-PC runner** — the working tree emits, compiles,
+  and executes every aligned entry with typed transfers/faults, ordinary-entry
+  parity, deterministic instruction budgets, delay-pair-safe checkpoints, and
+  an outer dispatcher that follows bank-qualified direct/resolved transfers.
+  It also consumes digest-verified disjoint Block Pack spans without decoding
+  data gaps; a real NWXE 197-block/1,039-word runner passes `rustc`, and the
+  sparse catalog re-resolves every packed word while rejecting a real hole.
+  Code/runner registration is now atomic and bank-checked in `BlockProgram`.
+  Live dispatcher ownership and guest-cycle charging remain open, so this is
+  not a full execution lane yet.
+- [~] **U2 deterministic PI/device slice** — a typed working-tree fabric makes
+  raw PI registers and the shim API schedule the same deadline and atomically
+  orders bytes, PI busy, MI pending, and notification in a cycle-stamped trace.
+  Existing ABI/MMIO routing, hardware PI timing, executable generations, and
+  executor notification delivery are not connected yet.
+- [ ] **U3 runtime code generations** — load, translate, rewrite, invalidate,
+  and redispatch overlay/decompressed/generated code without stale blocks.
+- [ ] **U4/U5 CPU + device closure** — precise exceptions, CP0/TLB/FPU and
+  complete PI/SI/AI/VI/MI/controller/save/timing behavior.
+- [ ] **U6 general RSP/RDP** — persistent IMEM generations and LLE fallback for
+  every non-proven HLE task; no skip or synthetic completion.
+- [ ] **U7 exploration/release gate** — digest-bound forced-state exploration,
+  deterministic output traces, and zero unsupported execution closure.
 
 ## Phase H — cut the aki-recomp tether (blocks going public)
 
@@ -425,13 +544,9 @@ Everything else is now owned here. After D-gate, only a user's own ROM remains.
   knobs are now `FN64_*`; `fn64-render-rt64`'s `debug_flag()` and `fn64-abi`'s
   `assert_no_legacy_env_vars()` panic on a retired `OOT_*` spelling so an old
   invocation cannot silently no-op. `examples/` keeps `OOT_*` by design.
-- [ ] **H3 `fn64-discover` gates cannot run off the author's machine.** Not
-  env vars with defaults — compile-time `const`s: `gate_b1.rs:18/20-22`,
-  `gate_d1.rs:18-19/24-27`, `gate_b2.rs:39/51` hold
-  `/Users/jer/Downloads/...z64` and `/Users/jer/Code/aki-recomp/...`. The
-  D1/B1 grading numbers cited in Phase D are reproducible by exactly one
-  person. Fix: env var + a loud, named skip when unset (never a silent pass —
-  that is the "silent shrug" AGENTS.md bans).
+- [x] **H3 `fn64-discover` gates cannot run off the author's machine.** Fixed
+  2026-07-18: personal paths became required `FN64_DISCOVER_*` env vars with
+  loud unset errors; grades byte-identical; `gate_b2` digest gated.
 
 - [ ] **H4 `cargo test -p fn64-abi` flakes ~60%; nextest does NOT.** Measured
   2026-07-17 across the day: `cargo test -p fn64-abi --lib` ->

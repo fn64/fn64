@@ -1,0 +1,397 @@
+# Super Mario 64 (US) script-embedded pointer claims. All ranges and
+# encodings cited from the n64decomp/sm64 decomp (build map symbols +
+# data/behavior_data.c / include/geo_commands.h); every segment below is
+# stored UNCOMPRESSED at its physical ROM range, and the embedded
+# pointers are absolute VAs read from ROM bytes. Claims are graded
+# adversarially by the wrong==0 posture: a bogus record that splits a
+# real answer function fails the gate.
+#
+# behavior: CALL_NATIVE = [0x0C000000][ptr].
+# geo layouts (actor groups + common): GEO_SWITCH_CASE [0x0E00cccc],
+# GEO_ASM [0x1800pppp], GEO_BACKGROUND [0x1900bbbb], each followed by a
+# raw GraphNodeFunc/callback pointer; mask 0xFFFF0000 pins cmd byte and
+# the zero second byte.
+
+[[script_ptr_tables]]
+name = "behavior_call_native"
+rom_start = 0x219e00
+rom_end = 0x21f4c0
+command_words = [0xc000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "common0_geo_geo"
+rom_start = 0x2008d0
+rom_end = 0x201410
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "common1_geo_geo"
+rom_start = 0x218da0
+rom_end = 0x219e00
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group0_geo_geo"
+rom_start = 0x1279b0
+rom_end = 0x12a7e0
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group10_geo_geo"
+rom_start = 0x180540
+rom_end = 0x180bb0
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group11_geo_geo"
+rom_start = 0x187fa0
+rom_end = 0x188440
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group12_geo_geo"
+rom_start = 0x1b9070
+rom_end = 0x1b9cc0
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group13_geo_geo"
+rom_start = 0x1c3db0
+rom_end = 0x1c4230
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group14_geo_geo"
+rom_start = 0x1d7c90
+rom_end = 0x1d8310
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group15_geo_geo"
+rom_start = 0x1e4bf0
+rom_end = 0x1e51f0
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group16_geo_geo"
+rom_start = 0x1e7d90
+rom_end = 0x1e7ee0
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group17_geo_geo"
+rom_start = 0x1f1b30
+rom_end = 0x1f2200
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group1_geo_geo"
+rom_start = 0x132850
+rom_end = 0x132c60
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group2_geo_geo"
+rom_start = 0x134a70
+rom_end = 0x134d20
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group3_geo_geo"
+rom_start = 0x13b5d0
+rom_end = 0x13b910
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group4_geo_geo"
+rom_start = 0x145c10
+rom_end = 0x145e90
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group5_geo_geo"
+rom_start = 0x151b70
+rom_end = 0x1521d0
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group6_geo_geo"
+rom_start = 0x1602e0
+rom_end = 0x160670
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group7_geo_geo"
+rom_start = 0x1656e0
+rom_end = 0x165a50
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group8_geo_geo"
+rom_start = 0x166bd0
+rom_end = 0x166c60
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "group9_geo_geo"
+rom_start = 0x16d5c0
+rom_end = 0x16d870
+command_words = [0xe000000, 0x18000000, 0x19000000]
+command_mask = 0xFFFF0000
+
+# Level script+geo segments (raw; identified as every segment with a
+# mio0 `_segment_7` sibling in the map). Level scripts add CALL
+# [0x11080000] / CALL_LOOP [0x12080000] (include/level_commands.h);
+# their geo layouts use the same geo commands as above.
+
+[[script_ptr_tables]]
+name = "bbh_script"
+rom_start = 0x3828c0
+rom_end = 0x383950
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "bitdw_script"
+rom_start = 0x45bf60
+rom_end = 0x45c600
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "bitfs_script"
+rom_start = 0x46a840
+rom_end = 0x46b090
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "bits_script"
+rom_start = 0x477d00
+rom_end = 0x4784a0
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "bob_script"
+rom_start = 0x405a60
+rom_end = 0x405fb0
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "bowser_1_script"
+rom_start = 0x4c41c0
+rom_end = 0x4c4320
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "bowser_2_script"
+rom_start = 0x4ce9f0
+rom_end = 0x4cec00
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "bowser_3_script"
+rom_start = 0x4d14f0
+rom_end = 0x4d1910
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "castle_courtyard_script"
+rom_start = 0x4af670
+rom_end = 0x4af930
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "castle_grounds_script"
+rom_start = 0x4545e0
+rom_end = 0x454e00
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "castle_inside_script"
+rom_start = 0x3cf0d0
+rom_end = 0x3d0dc0
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "ccm_script"
+rom_start = 0x395c90
+rom_end = 0x396340
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "cotmc_script"
+rom_start = 0x4be9e0
+rom_end = 0x4bec30
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "ddd_script"
+rom_start = 0x495a60
+rom_end = 0x496090
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "ending_script"
+rom_start = 0x4ac4b0
+rom_end = 0x4ac570
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "hmc_script"
+rom_start = 0x3e6a00
+rom_end = 0x3e76b0
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "intro_script"
+rom_start = 0x269ea0
+rom_end = 0x26a3a0
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "jrb_script"
+rom_start = 0x423b20
+rom_end = 0x4246d0
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "lll_script"
+rom_start = 0x48c9b0
+rom_end = 0x48d930
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "menu_script"
+rom_start = 0x2a6120
+rom_end = 0x2a65b0
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "pss_script"
+rom_start = 0x4b7f10
+rom_end = 0x4b80d0
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "rr_script"
+rom_start = 0x44a140
+rom_end = 0x44abc0
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "sa_script"
+rom_start = 0x46c1a0
+rom_end = 0x46c3a0
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "sl_script"
+rom_start = 0x40e840
+rom_end = 0x40ed70
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "ssl_script"
+rom_start = 0x3fb990
+rom_end = 0x3fc2b0
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "thi_script"
+rom_start = 0x42c6e0
+rom_end = 0x42cf20
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "totwc_script"
+rom_start = 0x4c2700
+rom_end = 0x4c2920
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "ttc_script"
+rom_start = 0x437400
+rom_end = 0x437870
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "ttm_script"
+rom_start = 0x4eb1f0
+rom_end = 0x4ec000
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "vcutm_script"
+rom_start = 0x461220
+rom_end = 0x4614d0
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "wdw_script"
+rom_start = 0x419f90
+rom_end = 0x41a760
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "wf_script"
+rom_start = 0x49da50
+rom_end = 0x49e710
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+
+[[script_ptr_tables]]
+name = "wmotr_script"
+rom_start = 0x4cd930
+rom_end = 0x4cdbd0
+command_words = [0x0E000000, 0x18000000, 0x19000000, 0x11080000, 0x12080000]
+command_mask = 0xFFFF0000
+

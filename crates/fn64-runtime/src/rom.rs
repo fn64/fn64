@@ -149,6 +149,7 @@ impl RomStorage for InMemoryRom {
 /// to post a completion message through `Executor::inject_event` -- see
 /// module doc's "async-looking API" design note. Deliberately does NOT post
 /// the message itself (no `Executor` dependency in this crate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DmaCompletion {
     pub direction: DmaDirection,
     pub dram_addr: RdramAddr,
