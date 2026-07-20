@@ -918,6 +918,13 @@ fn main() {
         let mut graded_banks = 0usize;
         let mut skipped_unparsed = 0usize;
         let mut overlay_tables_paired = 0usize;
+        // Cross-bank evidence accumulated during the overlay pass, and
+        // the non-overlay banks (the statically-linked code segment) to
+        // grade afterwards from that evidence.
+        let mut typed_jal_all: Vec<u32> = Vec::new();
+        let mut typed_ptr_all: Vec<u32> = Vec::new();
+        let mut all_images: Vec<Vec<u8>> = vec![bank_bytes.to_vec()];
+        let mut non_overlay_banks: Vec<(String, u32, Vec<u8>)> = Vec::new();
         let mut totals = (0usize, 0usize, 0usize, 0usize, 0usize); // total, exact, coarse+interior, open, wrong
         let mut wrong_examples: Vec<String> = Vec::new();
         for fact in db.proven_rom_mappings() {
@@ -935,8 +942,13 @@ fn main() {
             let Some(refs) = fn64_discover::overlay_reloc::parse_zelda_overlay(&image.bytes)
             else {
                 skipped_unparsed += 1;
+                non_overlay_banks.push((bank.clone(), *va_start, image.bytes.clone()));
+                all_images.push(image.bytes);
                 continue;
             };
+            typed_jal_all.extend(&refs.jal_targets);
+            typed_ptr_all.extend(refs.data_pointers.iter().chain(&refs.hi_lo_pointers));
+            all_images.push(image.bytes.clone());
             // Mechanical text window from the overlay's own footer.
             let text_size = {
                 let len = image.bytes.len();
@@ -1155,5 +1167,182 @@ fn main() {
             std::process::exit(1);
         }
         println!("overlay function grade PASSED (wrong=0)");
+
+        // Non-overlay bank grading (the statically-linked code segment).
+        // No reloc section here, so the roots come from elsewhere: typed
+        // overlay references INTO the bank (the overlays' reloc tables
+        // name the code-segment API they call), a blind jal sweep across
+        // every materialized bank, and a pointer sweep of the bank's own
+        // data region (actor tables, scene-command handlers, gamestate
+        // tables — absolute VAs in a statically-linked segment).
+        typed_jal_all.sort_unstable();
+        typed_jal_all.dedup();
+        typed_ptr_all.sort_unstable();
+        typed_ptr_all.dedup();
+        let mut code_totals = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut code_wrong: Vec<String> = Vec::new();
+        for (bank, bank_va, image) in &non_overlay_banks {
+            let bank_va = *bank_va;
+            // Affine answer selection against this bank's image extent.
+            let (bank_rom_start, bank_rom_end) = match db.proven_rom_mappings().into_iter().find_map(|fact| {
+                match fact {
+                    Fact::RomMapping { bank: b, rom_start, rom_end, .. } if b == bank => {
+                        Some((*rom_start, *rom_end))
+                    }
+                    _ => None,
+                }
+            }) {
+                Some(range) => range,
+                None => continue,
+            };
+            let mut bank_answer: Vec<AnswerFunction> = Vec::new();
+            let mut bank_code_end = bank_va;
+            for section in &dump.sections {
+                if section.rom < bank_rom_start || section.rom >= bank_rom_end {
+                    continue;
+                }
+                if section.vram != bank_va + (section.rom - bank_rom_start) {
+                    continue;
+                }
+                for function in &section.functions {
+                    bank_code_end =
+                        bank_code_end.max(function.vram.saturating_add(function.size));
+                    bank_answer.push(AnswerFunction {
+                        name: function.name.clone(),
+                        va_start: function.vram,
+                    });
+                }
+            }
+            let bank_va_end = bank_va + image.len() as u32;
+            bank_code_end = bank_code_end.min(bank_va_end);
+            if bank_answer.is_empty() {
+                continue;
+            }
+            bank_answer.sort_by_key(|function| function.va_start);
+            let window = |target: u32| target >= bank_va && target < bank_code_end;
+
+            let text_len = (bank_code_end - bank_va) as usize;
+            let text_bytes = &image[..text_len.min(image.len())];
+            let text_words: Vec<u32> = text_bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+                .collect();
+            let mut bank_roots: Vec<u32> = Vec::new();
+            let mut bank_excused: Vec<u32> = Vec::new();
+            // Blind jal sweep across every materialized bank (machine-
+            // checked callable entries — same class as cross-bank jals).
+            for scan in &all_images {
+                for chunk in scan.chunks_exact(4) {
+                    let word = u32::from_be_bytes(chunk.try_into().unwrap());
+                    if word >> 26 != 0x03 {
+                        continue;
+                    }
+                    let target = 0x8000_0000 | ((word & 0x03ff_ffff) << 2);
+                    if window(target) && !bank_roots.contains(&target) {
+                        bank_roots.push(target);
+                        bank_excused.push(target);
+                    }
+                }
+            }
+            // Typed overlay pointers into this bank, plus this bank's own
+            // data region swept for absolute in-window pointers. Both
+            // unexcused, boundary-guarded, never at a nop.
+            // Typed overlay pointers keep the boundary guard alone; the
+            // BLIND own-data sweep additionally requires the target to
+            // open with a stack prologue (`addiu $sp,$sp,-N`) — raw data
+            // words (floats, fixed-point) alias as plausible 0x80xxxxxx
+            // addresses, and boundary shape alone let 4 such aliases
+            // split real MM code functions. Leaf functions this misses
+            // are jal-reachable through the blind jal sweep instead.
+            let mut pointer_seeds: Vec<(u32, bool)> =
+                typed_ptr_all.iter().map(|p| (*p, false)).collect();
+            for chunk in image[text_len.min(image.len())..].chunks_exact(4) {
+                pointer_seeds.push((u32::from_be_bytes(chunk.try_into().unwrap()), true));
+            }
+            pointer_seeds.sort_unstable();
+            pointer_seeds.dedup_by_key(|(pointer, _)| *pointer);
+            for (pointer, blind) in pointer_seeds {
+                if pointer % 4 != 0 || !window(pointer) || pointer == bank_va {
+                    continue;
+                }
+                let offset = ((pointer - bank_va) / 4) as usize;
+                let Some(&first_word) = text_words.get(offset) else {
+                    continue;
+                };
+                if blind && (first_word >> 16 != 0x27bd || first_word & 0x8000 == 0) {
+                    continue;
+                }
+                if first_word != 0
+                    && fn64_discover::sig_scan::plausible_function_boundary(
+                        &text_words,
+                        offset,
+                    )
+                    && !bank_roots.contains(&pointer)
+                {
+                    bank_roots.push(pointer);
+                }
+            }
+            if bank_roots.is_empty() {
+                continue;
+            }
+            let (bank_cfg, _) = build_cfg_closed_with_facts_and_claims(
+                &db,
+                bank,
+                text_bytes,
+                bank_va,
+                &bank_roots,
+                &BTreeMap::new(),
+            );
+            let bank_part = partition(&bank_cfg);
+            let bank_overlaps = same_bank_overlaps(&bank_part, &bank_cfg);
+            assert!(
+                bank_overlaps.is_empty(),
+                "bank {bank}: same-bank owner overlaps must be zero"
+            );
+            let mut bank_jal: JalTargets =
+                bank_cfg.direct_calls.iter().map(|(_, target)| *target).collect();
+            bank_jal.extend(bank_excused.iter().copied());
+            let bank_report =
+                grade_functions(&bank_part.owners, &bank_answer, bank_code_end, &bank_jal);
+            code_totals.0 += bank_report.total;
+            code_totals.1 += bank_report.matched_exact;
+            code_totals.2 += bank_report.matched_coarse + bank_report.interior_entries;
+            code_totals.3 += bank_report.open;
+            code_totals.4 += bank_report.wrong;
+            if bank_report.wrong != 0 {
+                for (function, grade) in &bank_report.per_function {
+                    if let fn64_discover::grade_oot_functions::FunctionGrade::WrongSplit {
+                        owner_root,
+                    } = grade
+                    {
+                        code_wrong.push(format!(
+                            "bank {bank}: {function} split by 0x{owner_root:x}"
+                        ));
+                    }
+                }
+            }
+        }
+        if code_totals.0 != 0 {
+            println!(
+                "code-segment grade: total={} matched_exact={} coarse+interior={} open={} wrong={}",
+                code_totals.0, code_totals.1, code_totals.2, code_totals.3, code_totals.4
+            );
+            println!(
+                "  matched%={:.1} open%={:.1}",
+                (code_totals.1 as f64 / code_totals.0 as f64) * 100.0,
+                (code_totals.3 as f64 / code_totals.0 as f64) * 100.0
+            );
+            if code_totals.4 != 0 {
+                for example in code_wrong.iter().take(10) {
+                    println!("wrong: {example}");
+                }
+                eprintln!(
+                    "gate_decomp_functions FAILED: code-segment wrong={}",
+                    code_totals.4
+                );
+                std::process::exit(1);
+            }
+            println!("code-segment function grade PASSED (wrong=0)");
+        }
     }
 }
