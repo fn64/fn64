@@ -1,7 +1,8 @@
 use std::ffi::{c_char, c_int, CStr};
 use std::ptr::NonNull;
 
-use fn64_render::OsTask;
+use fn64_render::{OsTask, ViPresentation};
+use fn64_runtime::{RspMemAddr, RspMemory, RspMemoryBank};
 
 const ERROR_CAPACITY: usize = 1024;
 
@@ -62,13 +63,31 @@ unsafe extern "C" {
         context: *mut RawContext,
         rdram: *mut u8,
         rdram_len: usize,
+        dmem: *mut u8,
+        dmem_len: usize,
+        imem: *mut u8,
+        imem_len: usize,
         task: *const RawTask,
+        output_addr: u32,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
+    fn fn64_rt64_process_rdp_commands(
+        context: *mut RawContext,
+        rdram: *mut u8,
+        rdram_len: usize,
+        start: u32,
+        end: u32,
         output_addr: u32,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
     fn fn64_rt64_present(
         context: *mut RawContext,
+        blanked: u8,
+        fade_enabled: u8,
+        fade_factor: u16,
+        repeat_line: u8,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
@@ -106,10 +125,13 @@ impl Context {
     pub(crate) fn process_task(
         &mut self,
         rdram: &mut [u8],
+        rsp_memory: &mut RspMemory,
         task: &OsTask,
         output_addr: u32,
     ) -> Result<(), String> {
         let raw_task = RawTask::from(task);
+        let mut dmem = *rsp_memory.bank(RspMemoryBank::Dmem);
+        let mut imem = *rsp_memory.bank(RspMemoryBank::Imem);
         let mut error = [0; ERROR_CAPACITY];
         // SAFETY: the opaque context is alive and uniquely borrowed; both
         // slice pointer/length and the repr(C) task remain valid for the
@@ -120,7 +142,53 @@ impl Context {
                 self.0.as_ptr(),
                 rdram.as_mut_ptr(),
                 rdram.len(),
+                dmem.as_mut_ptr(),
+                dmem.len(),
+                imem.as_mut_ptr(),
+                imem.len(),
                 &raw_task,
+                output_addr,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok != 0 {
+            if rsp_memory.bank(RspMemoryBank::Dmem) != &dmem {
+                rsp_memory
+                    .write_bytes(RspMemAddr::from_register(0), &dmem)
+                    .expect("RT64 returned a complete 4 KiB DMEM bank");
+            }
+            if rsp_memory.bank(RspMemoryBank::Imem) != &imem {
+                rsp_memory
+                    .write_bytes(RspMemAddr::from_register(0x1000), &imem)
+                    .expect("RT64 returned a complete 4 KiB IMEM bank");
+            }
+            Ok(())
+        } else {
+            Err(error_string(
+                &error,
+                "RT64 task processing failed without a diagnostic",
+            ))
+        }
+    }
+
+    pub(crate) fn process_rdp_commands(
+        &mut self,
+        rdram: &mut [u8],
+        start: u32,
+        end: u32,
+        output_addr: u32,
+    ) -> Result<(), String> {
+        let mut error = [0; ERROR_CAPACITY];
+        // SAFETY: the context is alive and uniquely borrowed, and RT64 waits
+        // for the submitted render-to-RAM workload before this call returns.
+        let ok = unsafe {
+            fn64_rt64_process_rdp_commands(
+                self.0.as_ptr(),
+                rdram.as_mut_ptr(),
+                rdram.len(),
+                start,
+                end,
                 output_addr,
                 error.as_mut_ptr(),
                 error.len(),
@@ -131,16 +199,27 @@ impl Context {
         } else {
             Err(error_string(
                 &error,
-                "RT64 task processing failed without a diagnostic",
+                "RT64 raw RDP processing failed without a diagnostic",
             ))
         }
     }
 
-    pub(crate) fn present(&mut self) -> Result<(), String> {
+    pub(crate) fn present(&mut self, vi: ViPresentation) -> Result<(), String> {
         let mut error = [0; ERROR_CAPACITY];
         // SAFETY: the opaque context is alive and uniquely borrowed for the
-        // synchronous presentation call.
-        let ok = unsafe { fn64_rt64_present(self.0.as_ptr(), error.as_mut_ptr(), error.len()) };
+        // synchronous presentation call. Every scalar is passed by value;
+        // `ViPresentation` has already bounded fade to the public 10 bits.
+        let ok = unsafe {
+            fn64_rt64_present(
+                self.0.as_ptr(),
+                u8::from(vi.blanked),
+                u8::from(vi.fade.is_some()),
+                vi.fade.unwrap_or(0),
+                u8::from(vi.repeat_line),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
         if ok != 0 {
             Ok(())
         } else {

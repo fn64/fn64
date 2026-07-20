@@ -99,6 +99,21 @@ pub struct RenderConfig {
     pub height: u32,
 }
 
+/// VI-manager state that affects scanout at a presentation boundary rather
+/// than RDP rendering. Keeping this separate from [`RenderConfig`] matters:
+/// `osViBlack` changes at V-blank and does not recreate the output surface or
+/// destroy the RDP's most recently rendered image.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ViPresentation {
+    /// Present a black image while VI retrace timing continues normally.
+    pub blanked: bool,
+    /// Interpolate the first two source rows by this public 10-bit factor and
+    /// repeat the resulting row over scanout. `None` disables VI fade.
+    pub fade: Option<u16>,
+    /// Repeat the first source row over the complete scanout image.
+    pub repeat_line: bool,
+}
+
 impl RenderConfig {
     pub fn new(width: u32, height: u32) -> Self {
         RenderConfig { width, height }
@@ -121,6 +136,16 @@ pub enum FrameStatus {
     /// yielding, matching `osSpTaskYield`'s real semantics -- the caller is
     /// expected to resume this same task later, not resubmit from scratch.
     Yielded,
+    /// HLE preflight encountered a content-addressed microcode generation it
+    /// cannot execute. The backend has committed no task effects; the runtime
+    /// must run the whole ucode phase from its untouched post-rspboot state
+    /// through the general RSP interpreter.
+    NeedsLle {
+        /// Exact complete live IMEM identity rejected by HLE. Keeping it in
+        /// the typed outcome makes catalog discovery observable without
+        /// weakening admission or scraping diagnostic text.
+        ucode_sha256: [u8; 32],
+    },
 }
 
 /// Everything that can go wrong at this seam. Every variant is loud/named
@@ -137,6 +162,11 @@ pub enum RenderError {
     /// ucode *contents* (that's the backend's own job, if it wants finer
     /// detection than "not in my declared list").
     UnsupportedUcode { ucode_addr: u32 },
+    /// An ordered HLE preflight reached a self-loaded IMEM generation whose
+    /// exact text digest is not admitted for that family. This is an internal
+    /// typed handoff signal: a transactional backend maps it to
+    /// [`FrameStatus::NeedsLle`] without committing speculative mutations.
+    RequiresLle { ucode_sha256: [u8; 32] },
     /// `task.output_buff`/`output_buff_size` describe a region outside the
     /// `rdram` slice `process_task` was given -- a malformed or
     /// adversarial task header, reported rather than causing a panic or an
@@ -167,6 +197,13 @@ impl fmt::Display for RenderError {
         match self {
             RenderError::UnsupportedUcode { ucode_addr } => {
                 write!(f, "unsupported ucode at rdram offset {ucode_addr:#010x}")
+            }
+            RenderError::RequiresLle { ucode_sha256 } => {
+                write!(f, "microcode SHA-256 ")?;
+                for byte in ucode_sha256 {
+                    write!(f, "{byte:02x}")?;
+                }
+                write!(f, " requires the general RSP LLE path")
             }
             RenderError::InvalidTaskBounds {
                 offset,
@@ -208,7 +245,11 @@ pub trait RenderBackend {
     /// convention, per `docs/DESIGN.md` section 2) -- the backend reads
     /// vertex/texture/matrix data out of it directly, never through any
     /// runtime API, which is the "never reaches back into runtime state"
-    /// invariant made concrete.
+    /// invariant made concrete. `rsp_memory` is the device fabric's ONE
+    /// persistent DMEM/IMEM image. Requiring it at the trait boundary makes
+    /// debug GBI DMA, CPU SP-memory access, LLE overlays, and later commands
+    /// in the same task share state by construction; a backend-private shadow
+    /// is not a conforming implementation.
     ///
     /// `rdram` is `&mut` because on real hardware the RDP writes the
     /// rasterized color image back into DRAM (the framebuffer the VI then
@@ -226,9 +267,31 @@ pub trait RenderBackend {
     fn process_task(
         &mut self,
         rdram: &mut [u8],
+        rsp_memory: &mut fn64_runtime::RspMemory,
         task: &OsTask,
         output_addr: u32,
     ) -> Result<FrameStatus, RenderError>;
+
+    /// Execute a CPU/RSP-produced raw RDP command range selected through the
+    /// DPC start/end registers. `output_addr` is the physical VI framebuffer
+    /// selected at this submission boundary, under the same contract as
+    /// `process_task`; it must not be inferred from backend call history.
+    /// Backends that do not implement raw command execution return a named
+    /// error; the default must never pretend the range rendered successfully.
+    fn process_rdp_commands(
+        &mut self,
+        _rdram: &mut [u8],
+        start: u32,
+        end: u32,
+        _output_addr: u32,
+    ) -> Result<FrameStatus, RenderError> {
+        Err(RenderError::Backend {
+            backend: "render",
+            reason: format!(
+                "raw RDP command execution [{start:#010x}, {end:#010x}) is unsupported"
+            ),
+        })
+    }
 
     /// Present the most recently rendered frame (swap to screen, or for a
     /// headless backend, finalize it as retrievable). Distinct from
@@ -236,7 +299,7 @@ pub trait RenderBackend {
     /// manager posting a rendered buffer to the display) is a separate
     /// event from RSP task completion -- multiple gfx tasks can render
     /// before one present, matching double/triple-buffering.
-    fn present(&mut self) -> Result<(), RenderError>;
+    fn present(&mut self, vi: ViPresentation) -> Result<(), RenderError>;
 
     /// The output target changed size (a real window resize, or a harness
     /// reconfiguring a headless target). Infallible by design: a backend
@@ -278,6 +341,7 @@ mod tests {
         fn process_task(
             &mut self,
             rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
             task: &OsTask,
             _output_addr: u32,
         ) -> Result<FrameStatus, RenderError> {
@@ -300,7 +364,7 @@ mod tests {
             Ok(FrameStatus::Complete)
         }
 
-        fn present(&mut self) -> Result<(), RenderError> {
+        fn present(&mut self, _vi: ViPresentation) -> Result<(), RenderError> {
             if !self.ready {
                 return Err(RenderError::NotReady("create() not called"));
             }
@@ -328,6 +392,7 @@ mod tests {
         let mut backend: Box<dyn RenderBackend> = Box::new(fake(vec![UcodeId::F3dex2]));
         backend.create(&RenderConfig::new(320, 240)).unwrap();
         let mut rdram = vec![0u8; 4096];
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
         let task = OsTask {
             task_type: M_GFXTASK,
             output_buff: 0,
@@ -335,18 +400,21 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            backend.process_task(&mut rdram, &task, 0).unwrap(),
+            backend
+                .process_task(&mut rdram, &mut rsp_memory, &task, 0)
+                .unwrap(),
             FrameStatus::Complete
         );
-        backend.present().unwrap();
+        backend.present(ViPresentation::default()).unwrap();
     }
 
     #[test]
     fn process_task_before_create_is_not_ready() {
         let mut backend = fake(vec![UcodeId::F3dex2]);
         let mut rdram = vec![0u8; 16];
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
         let err = backend
-            .process_task(&mut rdram, &OsTask::default(), 0)
+            .process_task(&mut rdram, &mut rsp_memory, &OsTask::default(), 0)
             .unwrap_err();
         assert!(matches!(err, RenderError::NotReady(_)));
     }
@@ -356,11 +424,14 @@ mod tests {
         let mut backend = fake(vec![]); // declares NO supported ucodes
         backend.create(&RenderConfig::new(64, 64)).unwrap();
         let mut rdram = vec![0u8; 16];
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
         let task = OsTask {
             ucode: 0x8000_1234,
             ..Default::default()
         };
-        let err = backend.process_task(&mut rdram, &task, 0).unwrap_err();
+        let err = backend
+            .process_task(&mut rdram, &mut rsp_memory, &task, 0)
+            .unwrap_err();
         match err {
             RenderError::UnsupportedUcode { ucode_addr } => assert_eq!(ucode_addr, 0x8000_1234),
             other => panic!("expected UnsupportedUcode, got {other:?}"),
@@ -372,12 +443,15 @@ mod tests {
         let mut backend = fake(vec![UcodeId::F3dex2]);
         backend.create(&RenderConfig::new(64, 64)).unwrap();
         let mut rdram = vec![0u8; 16];
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
         let task = OsTask {
             output_buff: 10,
             output_buff_size: 100,
             ..Default::default()
         };
-        let err = backend.process_task(&mut rdram, &task, 0).unwrap_err();
+        let err = backend
+            .process_task(&mut rdram, &mut rsp_memory, &task, 0)
+            .unwrap_err();
         assert!(matches!(err, RenderError::InvalidTaskBounds { .. }));
     }
 

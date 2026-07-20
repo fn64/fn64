@@ -85,14 +85,35 @@ behind that. `fn64-rt64` (→ `fn64-render-rt64`) already exists as the intended
 /// executor event seam; the backend never reaches back into runtime state.
 pub trait RenderBackend {
     fn create(&mut self, cfg: &RenderConfig) -> Result<(), RenderError>;
-    fn process_task(&mut self, rdram: &[u8], task: &OsTask) -> Result<FrameStatus, RenderError>;
-    fn present(&mut self) -> Result<(), RenderError>;
+    fn process_task(
+        &mut self,
+        rdram: &mut [u8],
+        rsp_memory: &mut fn64_runtime::RspMemory,
+        task: &OsTask,
+        output_addr: u32,
+    ) -> Result<FrameStatus, RenderError>;
+    fn present(&mut self, vi: ViPresentation) -> Result<(), RenderError>;
     fn resize(&mut self, w: u32, h: u32);
     /// Which microcode GBIs this backend actually implements — a task using an
     /// unlisted ucode traps by name (no silent black frame).
     fn supported_ucodes(&self) -> &[UcodeId];
 }
 ```
+
+The RSP-memory argument is the device fabric's one persistent DMEM/IMEM
+image, not backend-private scratch. It is explicit in the type boundary so
+`G_DMA_IO`, ucode overlays, CPU SP-memory access, and later commands in the
+same task cannot accidentally observe different banks. The backend still has
+no callback into runtime state: it receives exactly the two mutable memory
+resources the task can affect.
+
+`ViPresentation` carries V-blank-latched scanout state separately from RDP
+task execution. Its typed controls cover black, the public 10-bit fade factor,
+and first-line repetition. The reference backend keeps an RDP source image and
+a distinct presented image, so these effects never destroy the frame restored
+when they are disabled. The RT64 adapter passes those typed controls over its
+foreign boundary and realizes them with VI pixel type, zero vertical scale,
+and the 10-bit vertical subpixel offset; it does not rewrite the RDP image.
 
 ### Adapter today: `fn64-render-rt64` (= the current `fn64-rt64` (→ `fn64-render-rt64`), renamed by role)
 

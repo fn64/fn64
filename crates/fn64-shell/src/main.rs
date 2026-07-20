@@ -152,16 +152,6 @@ mod game {
     /// VI frame is well under this; the cap only bounds a pathological spin.
     const STEPS_PER_PUMP: u64 = 200_000;
 
-    /// Virtual-time units per VI field. Passed to `arm_vi_retrace`, and added
-    /// to the guest clock exactly once per pump -- the two MUST match, because
-    /// that identity is what makes the guest's retrace rate equal the pump's
-    /// wall-clock rate (`FRAME` in `about_to_wait`, 16.67 ms => ~60 Hz NTSC).
-    ///
-    /// The value itself is arbitrary (it is a host-chosen approximation, not a
-    /// hardware constant -- see `fn64_runtime::vi`'s module doc); what is NOT
-    /// arbitrary is that one pump advances the clock by exactly one interval.
-    const RETRACE_INTERVAL: u64 = 1000;
-
     impl Shell {
         fn boot() -> Self {
             let rom_path = env_path("ROM");
@@ -217,10 +207,10 @@ mod game {
                 );
             }
 
-            // VI retrace ticker. MUST be the same constant `pump_one_frame`
-            // advances the clock by each pump: one pump (one 16.67 ms wall
-            // deadline) == one interval == one retrace == ~60 Hz NTSC.
-            fn64_abi::arm_vi_retrace(RETRACE_INTERVAL);
+            // The typed IPL standard owns both VI and AI clocks. The nominal
+            // NTSC interval bootstraps the first field; OSViMode H/V timing
+            // replaces it when the mode latches.
+            fn64_abi::configure_tv_type(fn64_boot_harness::TvType::Ntsc);
 
             let mut rdram = fn64_boot_harness::new_rdram(fn64_boot_harness::TvType::Ntsc);
             let rdram_ptr = rdram.as_mut_ptr();
@@ -349,14 +339,17 @@ mod game {
             let start_swaps = fn64_abi::vi_swap_count();
             let mut drain = RetraceDrain::new(start_swaps);
 
-            // Advance the guest clock by exactly one retrace interval FIRST,
+            // Advance the guest clock by exactly one live retrace interval FIRST,
             // unconditionally, because the caller only enters here when the
             // 16.67 ms wall deadline is due (`about_to_wait`'s FRAME). One
-            // pump == one NTSC field == one retrace, whatever happens below.
+            // pump == one field == one retrace, whatever happens below. The
+            // interval may change when a pending OSViMode latches.
             //
             // Doing it at the TOP is load-bearing: retrace must not depend on
             // whether the game happens to finish a frame during this pump.
-            let tick = fn64_abi::sim_time() + RETRACE_INTERVAL;
+            let interval = fn64_abi::vi_field_interval()
+                .expect("typed television standard must keep VI armed");
+            let tick = fn64_abi::sim_time() + interval;
             fn64_abi::advance_virtual_time(tick);
 
             loop {

@@ -1,0 +1,194 @@
+{
+  "schema": 1,
+  "target": "N64ModernRuntime public libultra _recomp shim surface",
+  "denominator": 116,
+  "provenance": "Transcribed from fn64's clean-room docs/COMPLETENESS.md inventory, which records the mechanically extracted N64Recomp MIT symbol_lists.cpp set and public ABI signatures. Symbol names and subsystem grouping only; no GPL implementation bodies.",
+  "subsystems": [
+    {
+      "name": "core/OS",
+      "symbols": [
+        "__osInitialize_common",
+        "osInitialize",
+        "osGetMemSize",
+        "osSetIntMask",
+        "__osDisableInt",
+        "__osRestoreInt",
+        "osVirtualToPhysical",
+        "osGetCount",
+        "osSetCount",
+        "__osSetFpcCsr",
+        "osInvalDCache",
+        "osInvalICache",
+        "osWritebackDCache",
+        "osWritebackDCacheAll",
+        "is_proutSyncPrintf",
+        "__checkHardware_msp",
+        "__checkHardware_kmc",
+        "__checkHardware_isv",
+        "__osInitialize_msp",
+        "__osInitialize_kmc",
+        "__osInitialize_isv",
+        "__osRdbSend",
+        "__ull_div",
+        "__ll_div",
+        "__ll_mul",
+        "__ull_rem",
+        "__ull_to_d",
+        "__ull_to_f"
+      ]
+    },
+    {
+      "name": "thread scheduler",
+      "symbols": [
+        "osCreateThread",
+        "osStartThread",
+        "osStopThread",
+        "osDestroyThread",
+        "osSetThreadPri",
+        "osGetThreadPri",
+        "osGetThreadId"
+      ]
+    },
+    {
+      "name": "message queue",
+      "symbols": [
+        "osCreateMesgQueue",
+        "osRecvMesg",
+        "osSendMesg",
+        "osJamMesg",
+        "osSetEventMesg"
+      ]
+    },
+    {
+      "name": "timer",
+      "symbols": [
+        "osGetTime",
+        "osSetTime",
+        "osSetTimer",
+        "osStopTimer"
+      ]
+    },
+    {
+      "name": "PI/ROM DMA",
+      "symbols": [
+        "osCartRomInit",
+        "osCreatePiManager",
+        "osPiReadIo",
+        "osPiStartDma",
+        "osEPiStartDma",
+        "osPiGetStatus",
+        "osEPiRawStartDma",
+        "osEPiReadIo"
+      ]
+    },
+    {
+      "name": "SI/controller",
+      "symbols": [
+        "osContInit",
+        "osContStartReadData",
+        "osContGetReadData",
+        "osContStartQuery",
+        "osContGetQuery",
+        "osContSetCh"
+      ]
+    },
+    {
+      "name": "EEPROM",
+      "symbols": [
+        "osEepromProbe",
+        "osEepromWrite",
+        "osEepromLongWrite",
+        "osEepromRead",
+        "osEepromLongRead"
+      ]
+    },
+    {
+      "name": "Flash",
+      "symbols": [
+        "osFlashInit",
+        "osFlashReadStatus",
+        "osFlashReadId",
+        "osFlashClearStatus",
+        "osFlashAllErase",
+        "osFlashAllEraseThrough",
+        "osFlashSectorErase",
+        "osFlashSectorEraseThrough",
+        "osFlashCheckEraseEnd",
+        "osFlashWriteBuffer",
+        "osFlashWriteArray",
+        "osFlashReadArray",
+        "osFlashChange"
+      ]
+    },
+    {
+      "name": "Controller Pak/PFS",
+      "symbols": [
+        "osPfsInitPak",
+        "osPfsFreeBlocks",
+        "osPfsAllocateFile",
+        "osPfsDeleteFile",
+        "osPfsFileState",
+        "osPfsFindFile",
+        "osPfsReadWriteFile"
+      ]
+    },
+    {
+      "name": "Rumble Pak",
+      "symbols": [
+        "__osMotorAccess",
+        "osMotorInit",
+        "osMotorStart",
+        "osMotorStop"
+      ]
+    },
+    {
+      "name": "AI/audio",
+      "symbols": [
+        "osAiGetLength",
+        "osAiGetStatus",
+        "osAiSetFrequency",
+        "osAiSetNextBuffer"
+      ]
+    },
+    {
+      "name": "VI/DP",
+      "symbols": [
+        "osViSetXScale",
+        "osViSetYScale",
+        "osCreateViManager",
+        "osViBlack",
+        "osViSetSpecialFeatures",
+        "osViGetCurrentFramebuffer",
+        "osViGetNextFramebuffer",
+        "osViSwapBuffer",
+        "osViSetMode",
+        "osViSetEvent",
+        "osDpSetNextBuffer"
+      ]
+    },
+    {
+      "name": "RSP/SP",
+      "symbols": [
+        "osSpTaskLoad",
+        "osSpTaskStartGo",
+        "osSpTaskYield",
+        "osSpTaskYielded",
+        "__osSpSetPc"
+      ]
+    },
+    {
+      "name": "Voice/ISV",
+      "symbols": [
+        "osVoiceSetWord",
+        "osVoiceCheckWord",
+        "osVoiceStopReadData",
+        "osVoiceInit",
+        "osVoiceMaskDictionary",
+        "osVoiceStartReadData",
+        "osVoiceControlGain",
+        "osVoiceGetReadData",
+        "osVoiceClearDictionary"
+      ]
+    }
+  ]
+}
