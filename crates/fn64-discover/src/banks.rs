@@ -969,6 +969,196 @@ fn conclude_record_and_bank(
     }
 }
 
+/// A cited claim locating a game's load-request wrapper inside the proven
+/// boot image: the callee's entry VA and which argument registers carry the
+/// destination pointer, device address, and byte count (from the game's own
+/// calling convention, e.g. MM boot's `DmaMgr_RequestAsync(req, ram, vrom,
+/// size, ...)`). `device_space` declares what namespace the device operand
+/// uses: `Physical` for raw cartridge offsets, `Virtual` for VROM that a DMA
+/// manager translates — the latter is only accepted when the recovered range
+/// sits inside exactly one already-proven VROM file mapping. The claim says
+/// where to look; the boot image's instruction bytes still have to yield
+/// fully constant operands, or the site stays an open frontier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticRequestDmaInput {
+    pub name: String,
+    pub callee_va: u32,
+    pub dram_arg_register: u8,
+    pub device_arg_register: u8,
+    pub size_arg_register: u8,
+    pub device_space: RomAddressSpace,
+    pub bank_name: BankNamePattern,
+}
+
+/// What a request-DMA scan proved and what it left open, for gate reports.
+#[derive(Debug, Default)]
+pub struct StaticRequestDmaReport {
+    pub proven_banks: Vec<String>,
+    pub open: Vec<String>,
+}
+
+/// The largest RDRAM a retail console reaches (Expansion Pak). Used only to
+/// bound destination sanity in the slicer; VA truth is judged downstream.
+const SCAN_RDRAM_LEN: u32 = 0x0080_0000;
+
+/// Recover load-image mappings from static operands at direct calls to a
+/// cited request wrapper within the proven boot image. Each fully constant
+/// (destination, device, size) triple that passes its declared-space
+/// validation becomes a `Proven` bank mapping; every other call site is
+/// reported open, never guessed. Reachability and completion are recorded as
+/// unproven in the evidence note, matching `pi_dma`'s honesty contract.
+pub fn scan_static_request_dma(
+    rom: &NormalizedRom,
+    inputs: &[StaticRequestDmaInput],
+    db: &mut FactDb,
+) -> StaticRequestDmaReport {
+    use crate::loaders::VirtualAddress;
+    use std::collections::BTreeSet;
+
+    let mut report = StaticRequestDmaReport::default();
+    if inputs.is_empty() {
+        return report;
+    }
+    let boot = db.proven_rom_mappings().iter().find_map(|fact| match fact {
+        Fact::RomMapping {
+            bank,
+            rom_start,
+            rom_end,
+            va_start,
+            ..
+        } if bank == BOOT_BANK => Some((*rom_start, *rom_end, *va_start)),
+        _ => None,
+    });
+    let Some((boot_rom_start, boot_rom_end, boot_va_start)) = boot else {
+        report
+            .open
+            .push("boot bank not proven; request-dma scan skipped".to_string());
+        return report;
+    };
+    let words: Vec<u32> = rom.bytes[boot_rom_start as usize..boot_rom_end as usize]
+        .chunks_exact(4)
+        .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+        .collect();
+
+    for input in inputs {
+        let slices = match crate::pi_dma::slice_load_request_calls(
+            &words,
+            VirtualAddress::new(boot_va_start),
+            VirtualAddress::new(input.callee_va),
+            SCAN_RDRAM_LEN,
+            input.dram_arg_register,
+            input.device_arg_register,
+            input.size_arg_register,
+        ) {
+            Ok(slices) => slices,
+            Err(error) => {
+                report
+                    .open
+                    .push(format!("{}: slicer rejected boot image: {error:?}", input.name));
+                continue;
+            }
+        };
+        if slices.is_empty() {
+            report.open.push(format!(
+                "{}: no direct calls to cited callee 0x{:x} in the boot image",
+                input.name, input.callee_va
+            ));
+            continue;
+        }
+        let mut seen: BTreeSet<(u32, u32, u32)> = BTreeSet::new();
+        let mut index = 0u32;
+        for slice in slices {
+            let call_pc = slice.call_pc.get();
+            let (Some(candidate), Some(dram_pointer)) =
+                (slice.candidate(), slice.dram_pointer.proven().copied())
+            else {
+                report.open.push(format!(
+                    "{}: call at 0x{call_pc:x} has open operands",
+                    input.name
+                ));
+                continue;
+            };
+            let device = candidate.device_address.get();
+            let length = candidate.byte_count.get();
+            let va_start = dram_pointer.get();
+            if !seen.insert((device, va_start, length)) {
+                continue;
+            }
+            let (Some(device_end), Some(va_end)) =
+                (device.checked_add(length), va_start.checked_add(length))
+            else {
+                report.open.push(format!(
+                    "{}: call at 0x{call_pc:x} has an overflowing range",
+                    input.name
+                ));
+                continue;
+            };
+            match input.device_space {
+                RomAddressSpace::Physical => {
+                    if device_end as usize > rom.len() {
+                        report.open.push(format!(
+                            "{}: call at 0x{call_pc:x} physical range \
+                             0x{device:x}..0x{device_end:x} exceeds the ROM",
+                            input.name
+                        ));
+                        continue;
+                    }
+                }
+                RomAddressSpace::Virtual => {
+                    let containing = db
+                        .proven_vrom_file_mappings()
+                        .iter()
+                        .filter(|(_, fact)| {
+                            matches!(fact, Fact::LoadImageTableRecord {
+                                source_start,
+                                source_end,
+                                ..
+                            } if device >= *source_start && device_end <= *source_end)
+                        })
+                        .count();
+                    if containing != 1 {
+                        report.open.push(format!(
+                            "{}: call at 0x{call_pc:x} VROM range \
+                             0x{device:x}..0x{device_end:x} has {containing} proven file \
+                             mappings; expected exactly one",
+                            input.name
+                        ));
+                        continue;
+                    }
+                }
+            }
+            let bank = input.bank_name.name(index);
+            index += 1;
+            let mapping = db.insert(Fact::RomMapping {
+                bank: bank.clone(),
+                rom_space: input.device_space,
+                rom_start: device,
+                rom_end: device_end,
+                va_start,
+                va_end,
+            });
+            let evidence = db.insert(Fact::Evidence {
+                subject: BankAddr::new(&bank, va_start),
+                note: format!(
+                    "static request-DMA operands at call 0x{call_pc:x} to cited {} \
+                     (0x{:x}): device 0x{device:x}+0x{length:x} -> VA 0x{va_start:x}; \
+                     instruction bytes do not prove reachability or completion",
+                    input.name, input.callee_va
+                ),
+            });
+            db.conclude(
+                format!("bank:{bank}"),
+                ProofState::Proven,
+                vec![mapping, evidence],
+                "static_request_dma_operands",
+            )
+            .expect("request-dma bank names are freshly generated");
+            report.proven_banks.push(bank);
+        }
+    }
+    report
+}
+
 fn validate_file_record(
     rom: &NormalizedRom,
     vrom_len: u32,
