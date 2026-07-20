@@ -784,7 +784,25 @@ fn execute(state: &mut SliceState, pc: VirtualAddress, word: u32) {
             };
             state.set_register(rt, value);
         }
-        0x23 | 0x27 => state.set_register(
+        // A word load from a TRACKED stack slot restores the stored value —
+        // IDO spills call arguments and reloads them in the delay slot
+        // (SM64's `dma_read` sites). `clobber_memory` clears the map, so a
+        // hit can never be stale; every other load stays open.
+        0x23 => {
+            let restored = match state.registers[rs as usize].clone() {
+                Value::StackPointer { offset } => offset
+                    .checked_add(immediate)
+                    .and_then(|address| state.stack_words.get(&address).cloned()),
+                _ => None,
+            };
+            state.set_register(
+                rt,
+                restored.unwrap_or_else(|| {
+                    Value::open(SliceBlocker::LoadedFromMemory { pc, register: rt })
+                }),
+            );
+        }
+        0x27 => state.set_register(
             rt,
             Value::open(SliceBlocker::LoadedFromMemory { pc, register: rt }),
         ),
