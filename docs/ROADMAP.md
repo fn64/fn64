@@ -370,18 +370,22 @@ in `DISCOVER-PLAN.md`; `DISCOVER-STORAGE.md`, `DISCOVER-OWNER-PROOF.md`, and
 `DISCOVER-TOOLCHAIN.md` define the graph/index, exact-owner, and external-tool
 boundaries.
 
-Current grading (2026-07-17, `gate_d1`; inputs are `FN64_DISCOVER_*`
-env-declared since H3 closed): OoT 98.7% precision / 72.3% recall;
-NW4E 82.4%/88.1%; NWXE 81.3%/84.1%. The AKI figures use SHA-bound external
+Current grading (D1+D1.5+D2, 2026-07-17, `gate_d1`; inputs are
+`FN64_DISCOVER_*` env-declared since H3 closed — but see H3: these numbers
+are reproducible on one machine only): OoT 98.7% precision / 72.3% recall;
+NW4E 48.4%/89.7%; NWXE 50.0%/86.9% (NWXE was 36.4%/28.5% until its overlay
+bank table geometry was wired into the gate — the Phase-2 recall lesson
+below, confirmed a second time). The AKI figures use SHA-bound external
 text intervals, so they measure the payoff from correct executable regions,
 not mechanical recovery of those regions. Mapping-only baselines and byte
 coverage remain separate in `DISCOVER-PLAN.md`.
 
-NWXE's mapping-only overlay gap is now closed mechanically: ROM-only
+NWXE's mapping-only overlay gap is closed mechanically: ROM-only
 descriptor-family recovery plus unique delta/destination agreement produces
-four proven load images, taking the held-out D1 grade from 36.396867% /
-28.542179% boot-only to 49.976448% / 86.895987%. Whole-image data scanning is
-still why this sits below the external-text-filter result above.
+four proven load images, and wiring the overlay bank table geometry into
+the gate took the held-out D1 grade from 36.4%/28.5% boot-only to
+50.0%/86.9%. Whole-image data scanning is still why this sits below the
+external-text-filter result above.
 
 Two findings worth not rediscovering:
 - **Recall is a Phase-2 problem, not a detector problem.** OoT recall was

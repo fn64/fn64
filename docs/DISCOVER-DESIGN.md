@@ -539,6 +539,16 @@ calls; neither can be guessed inside Phase 6. NW4E improves from 89.040698% to
 89.709302% combined recall and from 44.689233% to 48.438236% precision; NWXE
 remains exactly 28.501229% recall / 36.363636% precision.
 
+The NWXE stall was the predicted Phase-2 gap, not a detector gap: `gate_d1`
+supplied no table geometry for NWXE, so detectors could only hunt the IPL3
+boot copy while the answer key's four bank_text sections (~860 KB of the
+key's code) sat in unexposed images. Wiring in the statically recovered
+NWXE overlay bank table (aki-recomp `games/NWXE/overlays.json`, byte-verified
+2026-07-17: 4 records × 0x24 at ROM 0x48a80, fields rom_start/rom_end/
+vram_text at +0x00/+0x04/+0x08; banks 1/4 and 2/3 share VA slots with
+disjoint ROM ranges) took NWXE to 86.855037% recall / 49.952897% precision —
+parity with NW4E, from geometry input alone, zero pipeline changes.
+
 For every computed `jr` or `jalr`:
 
 1. Perform constant propagation and bounded value-set analysis.
