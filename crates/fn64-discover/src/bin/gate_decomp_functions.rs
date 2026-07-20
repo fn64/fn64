@@ -81,6 +81,24 @@ struct EntryArgsFile {
     entry_arg_calls: Vec<EntryArgCall>,
 }
 
+/// Cited script-embedded pointer claims: an interpreter's data stream at a
+/// known physical ROM range whose `[command][pointer]` records carry raw
+/// code addresses (SM64 behavior scripts' CALL_NATIVE). The claim cites the
+/// range and the command encoding; the pointers are read from ROM bytes.
+#[derive(Deserialize)]
+struct ScriptPtrFile {
+    script_ptr_tables: Vec<ScriptPtrTable>,
+}
+
+#[derive(Deserialize)]
+struct ScriptPtrTable {
+    name: String,
+    rom_start: u32,
+    rom_end: u32,
+    command_word: u32,
+    command_mask: u32,
+}
+
 #[derive(Deserialize)]
 struct EntryArgCall {
     name: String,
@@ -242,6 +260,48 @@ fn main() {
             "entry-arg seeding: roots added={seeded} open sites={open_sites} \
              pointers outside scanned window={outside}"
         );
+    }
+
+    // Script-embedded pointers (FN64_DISCOVER_SCRIPT_PTRS): raw code
+    // addresses inside a cited interpreter data stream. These seeds are
+    // deliberately NOT added to the interior-entry excuse set — nothing
+    // machine-checks that the interpreter reaches each record, so a bogus
+    // pointer that splits a real answer function FAILS the gate loudly.
+    // The wrong==0 posture is the adversarial judge of every claim here.
+    if let Some(file) = load_toml_env::<ScriptPtrFile>("FN64_DISCOVER_SCRIPT_PTRS") {
+        for table in &file.script_ptr_tables {
+            let mut seeded = 0usize;
+            let mut outside = 0usize;
+            let Some(bytes) = rom
+                .bytes
+                .get(table.rom_start as usize..table.rom_end as usize)
+            else {
+                println!("script-ptrs {}: cited range exceeds ROM", table.name);
+                continue;
+            };
+            let words: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+                .collect();
+            for pair in words.windows(2) {
+                if pair[0] & table.command_mask != table.command_word {
+                    continue;
+                }
+                let pointer = pair[1];
+                if pointer % 4 == 0 && pointer >= boot_va_start && pointer < code_end {
+                    if !roots.contains(&pointer) {
+                        roots.push(pointer);
+                        seeded += 1;
+                    }
+                } else if pointer != 0 {
+                    outside += 1;
+                }
+            }
+            println!(
+                "script-ptrs {}: roots added={seeded} pointers outside window={outside}",
+                table.name
+            );
+        }
     }
 
     // Multi-bank recall: the boot bank is a library, so many of its
