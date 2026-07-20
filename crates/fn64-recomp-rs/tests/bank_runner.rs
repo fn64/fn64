@@ -616,3 +616,109 @@ fn bank_ending_inside_a_delay_slot_is_rejected_loudly() {
         .unwrap_or("non-string panic");
     assert!(message.contains("omits its delay slot"), "{message}");
 }
+
+/// A `jal` whose target lands ON the delay slot of a control transfer earlier
+/// in the SAME block is the rare MIPS "into a delay slot" hazard. The delay slot
+/// stays one unit with its control transfer; the hazard-entry arm at the delay
+/// slot address executes it as an ordinary instruction (never re-decoded as a
+/// nested transfer that would demand a further delay slot). The runner must
+/// compile and run without a generation-time panic.
+#[test]
+fn branch_into_delay_slot_keeps_control_and_delay_as_one_unit() {
+    // 0x8000_2000  beq $zero,$zero,+2   (control transfer to 0x8000_200C)
+    // 0x8000_2004  addiu $a0,$zero,7    (delay slot — also a jal target below)
+    // 0x8000_2008  jr $ra
+    // 0x8000_200C  nop                  (branch target / after delay)
+    // A jal elsewhere targets 0x8000_2004 (the delay slot). The block still
+    // carries [control, delay] together; the delay-slot address gets its own
+    // straight arm for the hazard entry.
+    const B: u32 = 0x8000_2000;
+    let block_words = [
+        0x1000_0002, // beq $zero,$zero,+2  -> 0x8000_200C
+        0x2404_0007, // addiu $a0,$zero,7   (delay slot)
+        0x03E0_0008, // jr $ra
+        0x0000_0000, // nop
+    ];
+    let blocks = [BankBlockInput {
+        vram: B,
+        words: &block_words,
+    }];
+    let emitted = emit_sparse_bank_runner(&SparseBankInput {
+        name: "run_hazard_bank",
+        bank: BankId::new(0xB1),
+        blocks: &blocks,
+    });
+    // The delay slot has its own arbitrary-PC arm (hazard entry) AND is not
+    // emitted as a control transfer demanding a further delay slot.
+    assert!(emitted.contains("0x80002004 => {"), "{emitted}");
+
+    let stdout = compile_and_run(
+        &emitted,
+        r#"    let mut storage = vec![0u8; 64];
+    let mut mem = Rdram::new(&mut storage);
+    let mut ctx = RecompContext::new();
+    // Enter at the delay-slot address directly: it runs as an ordinary addiu,
+    // then continues to the jr.
+    let run = run_hazard_bank(
+        ExecutionKey::new(BankId::new(0xB1), GuestPc::new(0x8000_2004)),
+        InstructionBudget::new(64).unwrap(),
+        &mut ctx,
+        &mut mem,
+    );
+    assert_eq!(ctx.r(4), 7, "delay slot ran as an ordinary instruction");
+    println!("hazard entry ran addiu: a0={}", ctx.r(4));
+    let _ = run;
+"#,
+    );
+    assert!(stdout.contains("hazard entry ran addiu: a0=7"), "{stdout}");
+}
+
+/// A delay slot whose bytes decode as a control transfer (`jr`-shaped data
+/// admitted as proven code) is emitted as a loud runtime trap, never as a
+/// nested transfer. The runner compiles without a generation-time panic.
+#[test]
+fn control_shaped_delay_slot_emits_a_trap_and_compiles() {
+    const B: u32 = 0x8000_3000;
+    // 0x8000_3000  jr $ra           (real control transfer)
+    // 0x8000_3004  jr $s1           (its delay slot — bytes decode as jr)
+    let block_words = [
+        0x03E0_0008, // jr $ra
+        0x0226_8008, // jr $s1 (0x02268008) as the delay slot
+    ];
+    let blocks = [BankBlockInput {
+        vram: B,
+        words: &block_words,
+    }];
+    let emitted = emit_sparse_bank_runner(&SparseBankInput {
+        name: "run_trap_bank",
+        bank: BankId::new(0xB2),
+        blocks: &blocks,
+    });
+    // The delay-slot arm is a loud trap, not a control-transfer arm demanding a
+    // further delay slot.
+    assert!(
+        emitted.contains("has no admitted delay slot")
+            || emitted.contains("architecturally UNPREDICTABLE"),
+        "control-shaped delay slot must emit a trap:\n{emitted}"
+    );
+    // Compiles cleanly (the whole point: no generation-time panic, valid Rust).
+    // A wrong-bank entry faults before any arm executes, so the run proves the
+    // generated source is valid Rust without provoking the (never-legitimately-
+    // reached) UNPREDICTABLE delay-slot trap.
+    let stdout = compile_and_run(
+        &emitted,
+        r#"    let mut storage = vec![0u8; 64];
+    let mut mem = Rdram::new(&mut storage);
+    let mut ctx = RecompContext::new();
+    let run = run_trap_bank(
+        ExecutionKey::new(BankId::new(0xDEAD), GuestPc::new(0x8000_3000)),
+        InstructionBudget::new(64).unwrap(),
+        &mut ctx,
+        &mut mem,
+    );
+    assert!(matches!(run.exit, BlockExit::Fault(CpuFault { kind: CpuFaultKind::UnknownBank, .. })));
+    println!("trap bank compiled and ran: exit={:?}", run.exit);
+"#,
+    );
+    assert!(stdout.contains("trap bank compiled and ran"), "{stdout}");
+}
