@@ -1,0 +1,17 @@
+# Ocarina of Time (NTSC 1.0) static request-DMA claims. zeldaret/oot
+# src/boot/idle.c loads the code segment via DMA_REQUEST_SYNC ->
+# DmaMgr_RequestSync(ram, vrom, size) — o32: ram $a0(4), vrom $a1(5),
+# size $a2(6). Callee VA from the OOTU answer key (anchor claim only;
+# geometry is read from ROM instruction bytes). The vrom operand names
+# VROM (DmaMgr translates via dmadata), hence device_space Virtual.
+
+[[request_dma]]
+name = "DmaMgr_RequestSync"
+callee_va = 0x80000df0
+dram_arg_register = 4
+device_arg_register = 5
+size_arg_register = 6
+device_space = "Virtual"
+
+[request_dma.bank_name]
+prefix = "request_dma_"
