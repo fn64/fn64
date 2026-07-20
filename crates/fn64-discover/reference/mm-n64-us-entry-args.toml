@@ -16,3 +16,14 @@ pointer_arg_register = 6
 name = "Fault_AddClient"
 callee_va = 0x800819f0
 pointer_arg_register = 5
+
+[[entry_arg_calls]]
+# _Printf(outfun prout, char* arg, const char* fmt, va_list): IDO libc's
+# printf engine dispatches every character through the prout callback
+# passed in $a0 (public IDO libc shape; measured 2026-07-20 as 9 of MM's
+# 16 open boot jalr sites). Callee VA from the MMU answer key — an
+# anchor claim; recovered pointers are read from ROM bytes and graded
+# wrong==0.
+name = "_Printf"
+callee_va = 0x8008e050
+pointer_arg_register = 4

@@ -37,6 +37,22 @@
 //!                             and cross-bank call sites are the
 //!                             machine-checked evidence of which boot
 //!                             functions other segments enter
+//!   FN64_DISCOVER_SIG_DONOR_ROM / FN64_DISCOVER_SIG_DONOR_DUMP
+//!                             optional donor pair for the signature lane
+//!                             (see sig_scan): relocation-masked full-body
+//!                             signatures from a DIFFERENT ROM's answer key
+//!                             matched into this ROM's boot window; matches
+//!                             seed unexcused roots, judged by wrong==0.
+//!                             ';'-lists zipped pairwise for multiple donors
+//!   FN64_DISCOVER_SIG_DONOR_TABLES / FN64_DISCOVER_SIG_DONOR_REQUEST_DMA
+//!                             optional ';'-lists parallel to the donor
+//!                             lists (empty segment = none): the donor's own
+//!                             geometry/claims, so its compressed banks
+//!                             materialize and contribute signatures
+//!   FN64_DISCOVER_ADJUDICATED_ENTRIES
+//!                             optional cited byte-adjudicated interior
+//!                             entries (WIP answer keys); grading excuses
+//!                             only, never discovery input
 
 use fn64_discover::banks::{self, materialize_rom_range, LoadImageTableInput, StaticRequestDmaInput};
 use fn64_discover::grade_oot_functions::{grade_functions, AnswerFunction, JalTargets};
@@ -104,6 +120,22 @@ struct EntryArgCall {
     name: String,
     callee_va: u32,
     pointer_arg_register: u8,
+}
+
+/// Byte-adjudicated interior entries (FN64_DISCOVER_ADJUDICATED_ENTRIES):
+/// real function starts a WIP answer key lumps into a neighboring symbol,
+/// each adjudicated at byte level and cited in the claims file. Grading
+/// excuses only — never discovery input.
+#[derive(Deserialize)]
+struct AdjudicatedEntriesFile {
+    adjudicated_entries: Vec<AdjudicatedEntry>,
+}
+
+#[derive(Deserialize)]
+struct AdjudicatedEntry {
+    #[allow(dead_code)]
+    name: String,
+    va: u32,
 }
 
 fn load_toml_env<T: serde::de::DeserializeOwned>(variable: &str) -> Option<T> {
@@ -217,7 +249,15 @@ fn main() {
     // there, so a static constant is a callable-entry observation. The
     // grade's wrong==0 posture judges the result; open operands and
     // out-of-window pointers are reported, never guessed.
+    // Two evidentiary classes of root. `excused` roots are machine-checked
+    // callable entries (the entrypoint, statically proven entry-argument
+    // pointers, cross-bank jal targets) and join the interior-entry excuse
+    // set. `roots` additionally carries unexcused SEEDS (script-embedded
+    // pointers, donor-signature matches): nothing machine-checks those, so
+    // one that splits a real answer function must surface as `wrong`, not
+    // be excused as a legitimate interior entry.
     let mut roots = vec![entrypoint];
+    let mut excused = vec![entrypoint];
     if let Some(file) = load_toml_env::<EntryArgsFile>("FN64_DISCOVER_ENTRY_ARGS") {
         let words: Vec<u32> = bank_bytes
             .chunks_exact(4)
@@ -248,6 +288,7 @@ fn main() {
                                 slice.call_pc.get()
                             );
                             roots.push(va);
+                            excused.push(va);
                             seeded += 1;
                         }
                     }
@@ -348,6 +389,7 @@ fn main() {
             let target = (pc & 0xf000_0000) | ((word & 0x03ff_ffff) << 2);
             if target >= boot_va_start && target < code_end && !roots.contains(&target) {
                 roots.push(target);
+                excused.push(target);
                 cross_bank += 1;
             }
         }
@@ -356,6 +398,176 @@ fn main() {
         println!(
             "cross-bank jal roots added={cross_bank} unreadable banks={cross_bank_unreadable}"
         );
+    }
+
+    // Donor-signature lane (FN64_DISCOVER_SIG_DONOR_ROM/_DUMP, ';'-lists
+    // zipped pairwise): masked full-body signatures from other ROMs' answer
+    // keys, matched into this ROM's boot window. Recovers statically-dead
+    // SDK code no CFG descent (and no dynamic trace) can reach. Donor
+    // bodies are read straight at each dump section's cited ROM offset —
+    // no donor discovery run. A donor section stored compressed in its ROM
+    // yields garbage words that match nothing (a full 8+ masked-word
+    // accidental match against real code does not happen in practice, and
+    // wrong==0 stands judge regardless). Seeds are unexcused.
+    if let (Ok(donor_roms), Ok(donor_dumps)) = (
+        std::env::var("FN64_DISCOVER_SIG_DONOR_ROM"),
+        std::env::var("FN64_DISCOVER_SIG_DONOR_DUMP"),
+    ) {
+        // ';'-separated: real ROM filenames contain commas.
+        let rom_paths: Vec<&str> = donor_roms.split(';').collect();
+        let dump_paths: Vec<&str> = donor_dumps.split(';').collect();
+        assert_eq!(
+            rom_paths.len(),
+            dump_paths.len(),
+            "SIG_DONOR_ROM and SIG_DONOR_DUMP must list the same number of donors"
+        );
+        let target_words: Vec<u32> = bank_bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+            .collect();
+        // Optional per-donor geometry/claims (';'-lists parallel to the
+        // donor lists; an empty segment means none): with them the donor's
+        // proven banks are materialized through its own proof chain (Yaz0
+        // included), so bodies in compressed segments — where OoT/MM keep
+        // most of libultra/libc — become readable signatures too.
+        let donor_tables_env =
+            std::env::var("FN64_DISCOVER_SIG_DONOR_TABLES").unwrap_or_default();
+        let donor_request_env =
+            std::env::var("FN64_DISCOVER_SIG_DONOR_REQUEST_DMA").unwrap_or_default();
+        let donor_tables_paths: Vec<&str> = donor_tables_env.split(';').collect();
+        let donor_request_paths: Vec<&str> = donor_request_env.split(';').collect();
+        for (donor_index, (donor_rom_path, donor_dump_path)) in
+            rom_paths.iter().zip(&dump_paths).enumerate()
+        {
+            let donor_rom_bytes = std::fs::read(donor_rom_path)
+                .unwrap_or_else(|error| panic!("reading {donor_rom_path}: {error}"));
+            let donor_dump_text = std::fs::read_to_string(donor_dump_path)
+                .unwrap_or_else(|error| panic!("reading {donor_dump_path}: {error}"));
+            let donor_dump: Dump =
+                toml::from_str(&donor_dump_text).expect("parsing donor answer-key dump");
+            let load_donor_claims = |paths: &[&str]| -> Option<String> {
+                paths
+                    .get(donor_index)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_string())
+            };
+            let donor_tables: Vec<LoadImageTableInput> = load_donor_claims(&donor_tables_paths)
+                .map(|path| {
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|error| panic!("reading {path}: {error}"));
+                    toml::from_str::<TablesFile>(&text)
+                        .unwrap_or_else(|error| panic!("parsing {path}: {error}"))
+                        .load_image_tables
+                })
+                .unwrap_or_default();
+            let donor_request: Vec<StaticRequestDmaInput> =
+                load_donor_claims(&donor_request_paths)
+                    .map(|path| {
+                        let text = std::fs::read_to_string(&path)
+                            .unwrap_or_else(|error| panic!("reading {path}: {error}"));
+                        toml::from_str::<RequestDmaFile>(&text)
+                            .unwrap_or_else(|error| panic!("parsing {path}: {error}"))
+                            .request_dma
+                    })
+                    .unwrap_or_default();
+            let (donor_rom, donor_db, _) = run_discovery_with_tables_and_request_dma(
+                &donor_rom_bytes,
+                None,
+                &donor_tables,
+                &donor_request,
+            )
+            .expect("donor discovery");
+            // Materialize every proven donor bank once; bodies are then
+            // looked up by VA containment.
+            let mut donor_banks: Vec<(u32, Vec<u8>)> = Vec::new();
+            for fact in donor_db.proven_rom_mappings() {
+                let Fact::RomMapping { rom_space, rom_start, rom_end, va_start, .. } = fact
+                else {
+                    continue;
+                };
+                if let Ok(image) =
+                    materialize_rom_range(&donor_rom, &donor_db, *rom_space, *rom_start, *rom_end)
+                {
+                    donor_banks.push((*va_start, image.bytes));
+                }
+            }
+            let mut donor_functions: Vec<(String, u32, u32)> = Vec::new();
+            let mut donor_words: Vec<u32> = Vec::new();
+            let push_body = |name: &str, size: u32, bytes: &[u8], words: &mut Vec<u32>,
+                                 functions: &mut Vec<(String, u32, u32)>| {
+                // Re-home each body at a synthetic VA: its own offset in
+                // the accumulated donor word buffer.
+                let synthetic_va = (words.len() * 4) as u32;
+                words.extend(
+                    bytes
+                        .chunks_exact(4)
+                        .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap())),
+                );
+                functions.push((name.to_string(), synthetic_va, size));
+            };
+            for section in &donor_dump.sections {
+                for function in &section.functions {
+                    // Preferred: VA containment in a materialized proven
+                    // bank (correct for compressed storage).
+                    let from_bank = donor_banks.iter().find_map(|(va_start, bytes)| {
+                        let offset = function.vram.checked_sub(*va_start)? as usize;
+                        bytes.get(offset..offset + function.size as usize)
+                    });
+                    if let Some(bytes) = from_bank {
+                        push_body(
+                            &function.name,
+                            function.size,
+                            bytes,
+                            &mut donor_words,
+                            &mut donor_functions,
+                        );
+                        continue;
+                    }
+                    // Fallback: the section's cited ROM offset, valid for
+                    // sections stored uncompressed outside proven banks.
+                    let Some(delta) = function.vram.checked_sub(section.vram) else {
+                        continue;
+                    };
+                    let start = (section.rom + delta) as usize;
+                    if let Some(bytes) =
+                        donor_rom.bytes.get(start..start + function.size as usize)
+                    {
+                        push_body(
+                            &function.name,
+                            function.size,
+                            bytes,
+                            &mut donor_words,
+                            &mut donor_functions,
+                        );
+                    }
+                }
+            }
+            let signatures = fn64_discover::sig_scan::donor_signatures(
+                &donor_functions,
+                &donor_words,
+                0,
+                fn64_discover::sig_scan::MIN_SIGNATURE_WORDS,
+            );
+            let matches = fn64_discover::sig_scan::scan_signatures(
+                &signatures,
+                &target_words,
+                boot_va_start,
+            );
+            let mut seeded = 0usize;
+            for m in &matches {
+                if !roots.contains(&m.va) {
+                    roots.push(m.va);
+                    seeded += 1;
+                }
+            }
+            println!(
+                "signature lane {donor_rom_path}: donor functions={} signatures={} \
+                 matches={} roots added={seeded}",
+                donor_functions.len(),
+                signatures.len(),
+                matches.len()
+            );
+        }
     }
 
     let (cfg, resolved) =
@@ -382,14 +594,24 @@ fn main() {
     );
 
     // The interior-entry excuse set holds machine-checkable callable
-    // entries: direct jal targets, plus statically proven entry-argument
-    // pointers (the OS transfers control there — same evidentiary class).
-    // An owner rooted at one inside a coarser answer function is correct
-    // finer-grained discovery, not a mis-split (see grade_oot_functions;
-    // Kirby's WIP answer key gap-derives sizes across unlabeled real
-    // functions, which is exactly where this matters).
+    // entries ONLY: direct jal targets, the entrypoint, statically proven
+    // entry-argument pointers, and cross-bank jal targets. Unexcused seeds
+    // (script-embedded pointers, donor-signature matches) are deliberately
+    // left out — a bogus seed splitting a real answer function must count
+    // as `wrong`, which is the adversarial posture the seed lanes claim.
+    // (Previously ALL roots were excused here, silently weakening that
+    // claim for script-ptr seeds.)
     let mut jal_targets: JalTargets = cfg.direct_calls.iter().map(|(_, target)| *target).collect();
-    jal_targets.extend(roots.iter().copied());
+    jal_targets.extend(excused.iter().copied());
+    if let Some(file) =
+        load_toml_env::<AdjudicatedEntriesFile>("FN64_DISCOVER_ADJUDICATED_ENTRIES")
+    {
+        println!(
+            "adjudicated interior entries excused: {}",
+            file.adjudicated_entries.len()
+        );
+        jal_targets.extend(file.adjudicated_entries.iter().map(|entry| entry.va));
+    }
     let report = grade_functions(&part.owners, &answer, code_end, &jal_targets);
     println!(
         "function-boundary grade: total={} matched_exact={} matched_coarse={} \
@@ -406,6 +628,19 @@ fn main() {
         report.matched_fraction() * 100.0,
         (report.open as f64 / report.total as f64) * 100.0
     );
+    // FN64_DISCOVER_PRINT_OPEN=1: list the still-open answer functions —
+    // the measured frontier that decides where the next recall lane goes.
+    if std::env::var("FN64_DISCOVER_PRINT_OPEN").is_ok() {
+        let open: Vec<&str> = report
+            .per_function
+            .iter()
+            .filter(|(_, grade)| {
+                matches!(grade, fn64_discover::grade_oot_functions::FunctionGrade::Open)
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        println!("open functions ({}): {}", open.len(), open.join(", "));
+    }
     if report.wrong != 0 {
         for (function, grade) in &report.per_function {
             if let fn64_discover::grade_oot_functions::FunctionGrade::WrongSplit { owner_root } =
