@@ -60,6 +60,18 @@
 //!                             callable entries, excused) and R_MIPS_32
 //!                             data pointers (unexcused seeds) into the
 //!                             boot window
+//!   FN64_DISCOVER_GRADE_OVERLAYS
+//!                             set to 1 to grade function boundaries in
+//!                             every proven bank that parses as a Zelda
+//!                             overlay, not just the boot bank: the reloc
+//!                             section supplies typed in-bank jal targets
+//!                             (excused roots) and typed data pointers
+//!                             (unexcused seeds, e.g. actor init/update/
+//!                             draw callbacks), the footer's text_size is
+//!                             the mechanical code window, and the same
+//!                             affine answer-selection rule picks each
+//!                             bank's answer functions. wrong==0 across
+//!                             ALL graded banks is required
 //!   FN64_DISCOVER_JUMP_TABLES optional cited jump-table claims for open
 //!                             `jr` sites the bounded resolver cannot prove
 //!                             (load-derived index): site pc + table VA +
@@ -873,4 +885,158 @@ fn main() {
         std::process::exit(1);
     }
     println!("decomp function grade PASSED (wrong=0)");
+
+    // Overlay grading (FN64_DISCOVER_GRADE_OVERLAYS=1): the boot rule,
+    // generalized per proven bank. Only banks that parse as Zelda
+    // overlays are graded — their reloc section supplies typed roots and
+    // the mechanical text window; banks the answer key has no affine
+    // functions for are skipped (nothing to grade against).
+    if std::env::var("FN64_DISCOVER_GRADE_OVERLAYS").is_ok() {
+        let mut graded_banks = 0usize;
+        let mut skipped_unparsed = 0usize;
+        let mut totals = (0usize, 0usize, 0usize, 0usize, 0usize); // total, exact, coarse+interior, open, wrong
+        let mut wrong_examples: Vec<String> = Vec::new();
+        for fact in db.proven_rom_mappings() {
+            let Fact::RomMapping { bank, rom_space, rom_start, rom_end, va_start, .. } = fact
+            else {
+                continue;
+            };
+            if bank == banks::BOOT_BANK {
+                continue;
+            }
+            let Ok(image) = materialize_rom_range(&rom, &db, *rom_space, *rom_start, *rom_end)
+            else {
+                continue;
+            };
+            let Some(refs) = fn64_discover::overlay_reloc::parse_zelda_overlay(&image.bytes)
+            else {
+                skipped_unparsed += 1;
+                continue;
+            };
+            // Mechanical text window from the overlay's own footer.
+            let text_size = {
+                let len = image.bytes.len();
+                let section_size =
+                    u32::from_be_bytes(image.bytes[len - 4..].try_into().unwrap()) as usize;
+                u32::from_be_bytes(image.bytes[len - section_size..len - section_size + 4]
+                    .try_into()
+                    .unwrap()) as usize
+            };
+            let bank_va_start = *va_start;
+            let text_end = bank_va_start + text_size as u32;
+
+            // Affine answer selection, per bank.
+            let mut bank_answer: Vec<AnswerFunction> = Vec::new();
+            for section in &dump.sections {
+                if section.rom < *rom_start || section.rom >= *rom_end {
+                    continue;
+                }
+                if section.vram != bank_va_start + (section.rom - rom_start) {
+                    continue;
+                }
+                for function in &section.functions {
+                    if function.vram < text_end {
+                        bank_answer.push(AnswerFunction {
+                            name: function.name.clone(),
+                            va_start: function.vram,
+                        });
+                    }
+                }
+            }
+            if bank_answer.is_empty() {
+                continue;
+            }
+            bank_answer.sort_by_key(|function| function.va_start);
+
+            let text_bytes = &image.bytes[..text_size.min(image.bytes.len())];
+            let text_words: Vec<u32> = text_bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+                .collect();
+            let mut bank_roots: Vec<u32> = Vec::new();
+            let mut bank_excused: Vec<u32> = Vec::new();
+            for &target in &refs.jal_targets {
+                if target >= bank_va_start && target < text_end && !bank_roots.contains(&target)
+                {
+                    bank_roots.push(target);
+                    bank_excused.push(target);
+                }
+            }
+            for &pointer in &refs.data_pointers {
+                if pointer % 4 != 0 || pointer < bank_va_start || pointer >= text_end {
+                    continue;
+                }
+                let offset = ((pointer - bank_va_start) / 4) as usize;
+                if offset < text_words.len()
+                    && fn64_discover::sig_scan::plausible_function_boundary(
+                        &text_words,
+                        offset,
+                    )
+                    && !bank_roots.contains(&pointer)
+                {
+                    bank_roots.push(pointer);
+                }
+            }
+            if bank_roots.is_empty() {
+                continue;
+            }
+            let (bank_cfg, _) = build_cfg_closed_with_facts_and_claims(
+                &db,
+                bank,
+                text_bytes,
+                bank_va_start,
+                &bank_roots,
+                &BTreeMap::new(),
+            );
+            let bank_part = partition(&bank_cfg);
+            let bank_overlaps = same_bank_overlaps(&bank_part, &bank_cfg);
+            assert!(
+                bank_overlaps.is_empty(),
+                "bank {bank}: same-bank owner overlaps must be zero"
+            );
+            let mut bank_jal: JalTargets =
+                bank_cfg.direct_calls.iter().map(|(_, target)| *target).collect();
+            bank_jal.extend(bank_excused.iter().copied());
+            let bank_report =
+                grade_functions(&bank_part.owners, &bank_answer, text_end, &bank_jal);
+            graded_banks += 1;
+            totals.0 += bank_report.total;
+            totals.1 += bank_report.matched_exact;
+            totals.2 += bank_report.matched_coarse + bank_report.interior_entries;
+            totals.3 += bank_report.open;
+            totals.4 += bank_report.wrong;
+            if bank_report.wrong != 0 {
+                for (function, grade) in &bank_report.per_function {
+                    if let fn64_discover::grade_oot_functions::FunctionGrade::WrongSplit {
+                        owner_root,
+                    } = grade
+                    {
+                        wrong_examples.push(format!(
+                            "bank {bank}: {function} split by 0x{owner_root:x}"
+                        ));
+                    }
+                }
+            }
+        }
+        println!(
+            "overlay grade: banks={graded_banks} (skipped non-overlay={skipped_unparsed}) \
+             total={} matched_exact={} coarse+interior={} open={} wrong={}",
+            totals.0, totals.1, totals.2, totals.3, totals.4
+        );
+        if totals.0 != 0 {
+            println!(
+                "  matched%={:.1} open%={:.1}",
+                (totals.1 as f64 / totals.0 as f64) * 100.0,
+                (totals.3 as f64 / totals.0 as f64) * 100.0
+            );
+        }
+        if totals.4 != 0 {
+            for example in wrong_examples.iter().take(10) {
+                println!("wrong: {example}");
+            }
+            eprintln!("gate_decomp_functions FAILED: overlay wrong={}", totals.4);
+            std::process::exit(1);
+        }
+        println!("overlay function grade PASSED (wrong=0)");
+    }
 }
