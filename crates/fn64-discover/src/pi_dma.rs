@@ -1256,10 +1256,10 @@ mod tests {
             0x3c03_00b4, // lui   r3, 0x00b4
             0x3c0f_00c8, // lui   r15, 0x00c8
             0x2466_c000, // addiu r6, r3, -0x4000   -> device 0x00b3c000
-            0x25ef_a4e0, // addiu r15, r15, -0x5b20 -> 0x00c8a4e0
+            0x25ef_a4e0, // addiu r15, r15, -0x5b20 -> 0x00c7a4e0
             0x3c05_800a, // lui   r5, 0x800a
             0x24a5_5ac0, // addiu r5, r5, 0x5ac0    -> dram 0x800a5ac0
-            0x01e6_3823, // subu  r7, r15, r6       -> size 0x0014e4e0
+            0x01e6_3823, // subu  r7, r15, r6       -> size 0x0013e4e0
             jal,         // jal   callee
             0x0000_0000, // nop
             0x0000_0000,
@@ -1277,7 +1277,10 @@ mod tests {
         assert_eq!(slices.len(), 1);
         let candidate = slices[0].candidate().expect("all operands constant");
         assert_eq!(candidate.device_address.get(), 0x00b3_c000);
-        assert_eq!(candidate.byte_count.get(), 0x0014_e4e0);
+        // MM's real map places code at exactly this size (0x13E4E0): the
+        // addiu immediate 0xA4E0 sign-extends negative, which is the very
+        // subtlety a naive unsigned reading of the fixture gets wrong.
+        assert_eq!(candidate.byte_count.get(), 0x0013_e4e0);
         assert_eq!(slices[0].dram_pointer.proven().unwrap().get(), 0x800a_5ac0);
         assert_eq!(candidate.direction, PiDmaDirection::ToRdram);
 
