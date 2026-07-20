@@ -48,6 +48,10 @@ pub enum RspExitReason {
     /// After an overlay swap, the saved `resume_address` matched no generated
     /// resume label — a recompilation gap on the resume path.
     UnhandledResumeTarget,
+    /// The host-supplied deterministic instruction budget expired before an
+    /// architectural BREAK/YIELD. This is a scheduling boundary, not an
+    /// unsupported opcode.
+    StepLimit,
 }
 
 /// The scalar-side RSP context the generated ucode threads through. Field

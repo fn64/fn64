@@ -12,15 +12,7 @@ use std::collections::HashMap;
 
 pub use fn64_runtime::rdram::DEFAULT_RDRAM_SIZE;
 
-/// Console television standard written by the IPL into libultra's
-/// `osTvType` boot global at `0x8000_0300` before game code starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum TvType {
-    Pal = 0,
-    Ntsc = 1,
-    Mpal = 2,
-}
+pub use fn64_runtime::TvType;
 
 const OS_TV_TYPE: fn64_runtime::RdramAddr = fn64_runtime::RdramAddr::from_offset(0x300);
 
@@ -38,6 +30,7 @@ pub const fn rdram_len() -> usize {
 /// window generated code can address directly, and seed the IPL-owned boot
 /// globals that libultra/game initialization reads before any shim runs.
 pub fn new_rdram(tv_type: TvType) -> Vec<u8> {
+    fn64_abi::configure_tv_type(tv_type);
     let mut rdram = vec![0; rdram_len()];
     fn64_runtime::RdramViewMut::from_storage(&mut rdram).write_u32(OS_TV_TYPE, tv_type as u32);
     rdram
@@ -201,6 +194,11 @@ mod tests {
             assert_eq!(
                 fn64_runtime::RdramView::from_storage(&rdram).read_u32(OS_TV_TYPE),
                 expected
+            );
+            assert_eq!(fn64_abi::configured_tv_type(), tv_type);
+            assert_eq!(
+                fn64_abi::vi_field_interval(),
+                Some(tv_type.nominal_field_cycles())
             );
         }
     }

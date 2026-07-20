@@ -224,18 +224,31 @@ historical observation, not a standing claim.
   cpal, so claiming audible device output would be false.
 
 ### Render — geometry & texture layers
-- Geometry: G_VTX, G_TRI1/TRI2/QUAD, G_MTX (LOAD/MUL/PUSH), G_POPMTX, G_DL
-  (call/branch, recursion-limited), G_ENDDL — **implemented**.
+- Geometry: G_VTX, G_MODIFYVTX, G_TRI1/TRI2/QUAD, G_MTX (LOAD/MUL/PUSH),
+  counted G_POPMTX, G_CULLDL (retained six-plane clip codes), compound
+  G_RDPHALF_1/G_BRANCH_Z (exact screen-depth tail branch), G_DL (call/branch,
+  recursion-limited), G_ENDDL, and typed G_LINE3D with public width,
+  homogeneous clipping, shade/texture/scissor/blender state, and read-only Z
+  — **implemented**. Exact line edge coefficients remain hardware-trace work.
 - **Depth / Z-test: implemented AND verified correct.** Viewport-mapped NDC-z
   (`sz=tz=127.75` → screen-z [0,255.5]), nearer wins (`z < depth[pix]`),
   rejects ~124k farther fragments/frame, 42% pixel delta vs painter's-order.
   Fail-against-bug regression tests in `raster.rs`. (Uses an internal z-array,
   not G_SETZIMG — functionally correct.)
-- Textures: G_SETTIMG/SETTILE/SETTILESIZE/LOADTLUT implemented;
-  LOADBLOCK/LOADTILE partial (direct decode, not byte-exact TMEM DMA). Texels
-  **are** sampled in the rasterizer with nearest filtering and
+- Textures: G_SETTIMG/SETTILE/SETTILESIZE/LOADTLUT/LOADBLOCK/LOADTILE execute
+  through a physical 4 KiB TMEM snapshot. Load and render tiles are distinct;
+  base/line addressing, odd-row exchange, RGBA32 and YUV split halves,
+  quadricated RGBA16/IA16 TLUTs, and per-sample CI lookup are modeled. Texels
+  use point, four-sample average, or documented three-nearest filtering with
   perspective-correct S/T (`S/w`, `T/w`, `1/w`, then divide). Formats:
-  RGBA16/32, IA16, I4/IA4, CI8/CI4.
+  RGBA16/32, YUV16, IA16/8/4, I8/4, CI8/4. Equal low/high fractional load
+  bounds preserve subtexel origins, and source-sized transfers support a
+  distinct load-descriptor size (including RGBA32 through 16-bit). Unequal
+  low/high fractional edge selection remains open; uninitialized TMEM bits
+  trap by address. Texture-image/tile/TLUT/TMEM and the other RDP registers now
+  survive task boundaries and are shared with raw DPC execution; `G_TEXTURE`
+  remains RSP-owned and resets. Enabling it without a live TMEM image traps
+  rather than silently substituting white.
 - `G_SETSCISSOR` snapshots quarter-pixel `[upper-left, lower-right)` state per
   triangle and intersects it with framebuffer raster bounds at pixel centers.
 
@@ -324,14 +337,19 @@ road, but the top half misprojects).
    `mtxutil.c:3-19`. Finally, `z_play.c:1173-1188` reads the already-written
    viewing matrix to derive separate billboard data; it does not overwrite
    the projection-stack view slot.
-2. **G_SETOTHERMODE_L/H + alpha compare: implemented.** F3DEX2 masked H/L
+2. **G_SETOTHERMODE_L/H + threshold alpha compare: implemented.** F3DEX2 masked H/L
    updates now produce typed cycle/filter/dither/render/Z/coverage/blender
    state, snapshotted per triangle. `G_AC_THRESHOLD` compares post-combiner
-   alpha with `G_SETBLENDCOLOR.a`; `G_AC_DITHER` uses a deterministic varying
-   threshold. Rejected fragments leave both color and depth untouched. The
+   alpha with `G_SETBLENDCOLOR.a`; rejected fragments leave both color and
+   depth untouched. The public Programming Manual defines `G_AC_DITHER` as a
+   hardware-generated pseudo-random threshold, so the Rust reference path now
+   traps that mode rather than substituting the former screen-locked Bayer
+   matrix. Active one/two-cycle RGB/alpha dither selectors likewise trap
+   instead of silently rendering undithered pixels; the disabled path uses
+   documented three-bit truncation for RGBA16 RGB and RGBA32 memory alpha. The
    fail-against-bug tests cover state carry, the OoT render-mode macro's
    embedded alpha-dither bits, a transparent cutout texel, depth preservation,
-   and mixed dither coverage. The bounded C-file boot reached 250 swaps and
+   and named dither rejection. The bounded C-file boot reached 250 swaps and
    produced a changed actual frame sequence. The eyes-on dump proves corrected
    alpha coverage rather than a finished scene.
 3. **Alpha blending: implemented and unit-verified; live visual exercise is
@@ -352,18 +370,74 @@ road, but the top half misprojects).
   FIXED (2026-07-16, fn64#2): gsSPBranchList is a tail jump that consumes no
   return-stack entry, but the decoder recursed and counted it against the
   call cap, silently dropping every branch chain deeper than 10. Branch now
-  reassigns the DL pointer; the call (G_DL_PUSH) cap is F3DEX2's 18; a
-  2^20-command whole-decode budget bounds cyclic DLs. Evidence: deterministic
+  reassigns the DL pointer; the call (G_DL_PUSH) cap is F3DEX2's 18. Exceeding
+  that stack or the 2^20-command whole-decode budget is now a named corrupt-DL
+  trap rather than a plausible partial render. Evidence: deterministic
   1300-swap reference-backend A/B 4,207 warnings -> 0 with identical boot
   progression; 10/10 consecutive clean release runs post-merge. Note: this
   decoder runs only under the ReferenceBackend (the oracle/fallback) — RT64
   walks display lists in its own code.
-- G_GEOMETRYMODE partial (only cull+lighting bits act); G_MOVEMEM/MOVEWORD
-  partial; G_SETZIMG/SETCIMG/TEXRECT stubs.
+- G_GEOMETRYMODE consumers remain partial; G_MOVEMEM/MOVEWORD implement
+  viewport, both LookAt directions, light, active-light-count, segment, and
+  both public light-color copy destinations. Signed fog factors generate
+  vertex shade alpha from projected depth. Regular and inverse-cosine texture
+  generation replace explicit vertex coordinates from projected normals and
+  the public `gSPTexture` scale. The public two-command `gSPForceMatrix` loads
+  an already-concatenated transform without corrupting the underlying stacks;
+  a later ordinary matrix command supersedes it. Perspective normalization is
+  retained across ucode loads and an explicit zero rejects geometry. Exact microcode
+  clipping ratios are retained per side and applied to line geometry without
+  changing `G_CULLDL` codes. `G_DMA_IO` now transfers aligned logical bytes
+  between RDRAM and the device fabric's persistent DMEM/IMEM in decode order;
+  a write can rewrite the next command in the same display list. Compound
+  `G_LOAD_UCODE` now copies its physical data/text sources into live DMEM/IMEM
+  before later commands and applies the public F3DEX2 maintained-state list;
+  the DL and matrix stacks, modelview/projection, segments, viewport, scissor,
+  other mode, and perspective normalization survive the reload. Task-entry and
+  self-loaded text must each match an explicitly registered 4 KiB SHA-256;
+  selecting the F3DEX2 decoder no longer admits the live image. An unknown
+  generation discards speculative clone state and replays
+  the whole ucode phase through LLE from untouched post-rspboot state instead
+  of being guessed F3DEX2. RT64 accepts the resulting bounded raw DPC ranges
+  through its LLE RDP entry. Public RDP
+  tagged no-op and RSP no-op commands are explicit, while all three reserved
+  `G_SPECIAL_*`, non-public move subindices, and unknown opcodes trap with
+  wire context. Truncated command pairs, malformed vertex/triangle ranges,
+  malformed other-mode bit ranges, and incomplete vertex/matrix/viewport/light
+  DMA also fail before partial or stale state can escape. Exact microcode subdivision/rounding/trigonometric lookup
+  remains a hardware-trace frontier. The Rust
+  reference lane now preserves
+  SETCIMG/FILLRECT/TEXRECT/FULLSYNC in command order, executes persistent
+  RGBA16/RGBA32 color targets and format-correct fill-cycle rectangles, and
+  requires that persistent RDP target before F3DEX2/raw color writes instead
+  of borrowing the VI/output address. Each task re-imports that target from
+  RDRAM, preserving intervening CPU-visible changes to untouched pixels. It implements the public
+  non-flipped RGBA16 copy-cycle TEXRECT path, including the alpha-bit write
+  enable used by threshold compare. One/two-cycle TEXRECT and
+  TEXRECTFLIP now share the triangle texture filter, combiner, alpha compare,
+  and blender; point, four-sample average, Nintendo's documented
+  three-nearest triangular filter, and distinct TEXEL1 execute. Programming
+  Manual Chapter 13.7 mip/detail/sharpen LOD selection now uses immutable
+  eight-tile snapshots, adjacent perspective-corrected derivatives,
+  minimum/maximum levels, modulo-eight tile selection, and the LOD_FRACTION
+  combiner input across rectangles, F3DEX2 triangles, and raw RDP triangles.
+  Copy-cycle TEXRECTFLIP now uses the public S/T screen-axis swap. Bounded raw
+  DPC state/fill/texture ranges also reach the reference executor through the
+  shim and MMIO paths. YUV16 shared-chroma loads, all six `G_SETCONVERT`
+  fields, the three public conversion/filter modes, and K4/K5 combiner inputs
+  now share those raw and high-level texture paths. `G_SETKEYR`/`G_SETKEYGB`
+  and `G_CK_KEY` also execute the public soft-edge chroma alpha-fixup equation
+  and feed alpha compare. Shade-dependent rectangle
+  programs, exact LOD derivative norm/fixed-point boundaries, arbitrary nonzero-DeltaZ depth-fill packing,
+  and silicon-exact conversion/filter/
+  coverage arithmetic remain loud gaps.
 - G_SETCOMBINE + primitive/environment RGBA are implemented for the common
   OoT modulate, decal/replace, primitive-tint, environment-blend, and
-  shade-only source set. TEXEL1 and key/noise/K/LOD sources remain logged
-  approximations until multi-tile/TMEM and the matching registers exist.
+  shade-only source set. TEXEL1 is distinct for rectangles and both triangle
+  paths; a missing tile+1 or LOD-selected tile traps instead of aliasing.
+  LOD_FRACTION is modeled. The hardware NOISE combiner source now traps by
+  name instead of substituting black; its long-period, frame-varying generator
+  remains a hardware-trace frontier.
 - Bounded probes in BOTH lanes use `_exit(0)` after explicitly flushing the
   summary/trace (2026-07-16; was rs-lane-only, so C-lane probes aborted with
   exit 134 in TLS teardown after a clean summary and probe exit codes were

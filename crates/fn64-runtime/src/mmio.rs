@@ -1,5 +1,5 @@
-//! Hardware-register (MMIO) backing for the `0xA4xxxxxx`/`0xA8xxxxxx` KSEG1
-//! range: AI, VI, PI, SI, SP, DP, MI.
+//! Legacy hardware-register mirror for the `0xA4xxxxxx`/`0xA8xxxxxx` KSEG1
+//! range: AI, VI, PI, SI, DP, MI.
 //!
 //! ## Why this exists (real crash this closes)
 //!
@@ -53,6 +53,14 @@
 //! real firmware observes when the corresponding unit is idle/uninitialized
 //! at boot.
 //!
+//! SP memory, DMA, status, semaphore, and PC are deliberately absent here:
+//! [`crate::device::DeviceFabric`] is their one authoritative model and raw
+//! typed/generated-C accesses are intercepted there before this legacy mirror.
+//! Keeping a second SP register file here previously mislabeled `SP_WR_LEN` at
+//! `0xA404_000c` as the PC (the real CPU-visible PC is `0xA408_0000`) and could
+//! not express timed DMA. An access that bypasses the device fabric must trap
+//! rather than observe that stale shadow.
+//!
 //! Address decoding (which rdram-relative offset -> which unit -> which
 //! register) lives in `MmioSpace::read_w`/`write_w`, the ONE place that
 //! maps an already-`RdramAddr`-translated offset to a specific register --
@@ -86,7 +94,6 @@ pub const RDRAM_MMIO_WINDOW_END: u32 = 0x2900_0000;
 /// `SI=0xA480_0000` -- each below is that base minus
 /// `RDRAM_MMIO_WINDOW_START`'s corresponding `0xA400_0000`.
 mod base {
-    pub const SP: u32 = 0x0004_0000;
     pub const DP_CMD: u32 = 0x0010_0000;
     pub const MI: u32 = 0x0030_0000;
     pub const VI: u32 = 0x0040_0000;
@@ -186,29 +193,18 @@ pub struct SiRegs {
     pub status: u32,
 }
 
-/// SP (Signal Processor / RSP) register block. `STATUS` bits (subset):
-/// `SP_STATUS_HALT = 1`, `SP_STATUS_BROKE = 2`, `SP_STATUS_DMA_BUSY = 4`,
-/// `SP_STATUS_DMA_FULL = 8`, `SP_STATUS_TASKDONE = 0x200`. Defaults to
-/// halted+broke (the documented reset state of a real RSP that hasn't been
-/// given a task yet), matching `rsp.rs::TaskLog`'s "acknowledge task,
-/// don't simulate microcode" stance -- a polling read before any task is
-/// submitted should see the real idle-halted state, not a fabricated
-/// "running" one.
-#[derive(Debug)]
-pub struct SpRegs {
-    pub status: u32,
-    pub pc: u32,
-}
-
-pub const SP_STATUS_HALT: u32 = 1;
-pub const SP_STATUS_BROKE: u32 = 1 << 1;
-
-impl Default for SpRegs {
-    fn default() -> Self {
-        SpRegs {
-            status: SP_STATUS_HALT | SP_STATUS_BROKE,
-            pc: 0,
-        }
+fn apply_clear_set_pair(
+    state: &mut u32,
+    command: u32,
+    clear_command: u32,
+    set_command: u32,
+    state_bit: u32,
+) {
+    if command & (1 << clear_command) != 0 {
+        *state &= !(1 << state_bit);
+    }
+    if command & (1 << set_command) != 0 {
+        *state |= 1 << state_bit;
     }
 }
 
@@ -229,6 +225,49 @@ pub struct DpRegs {
     pub status: u32,
 }
 
+pub const DP_STATUS_XBUS_DMA: u32 = 1;
+pub const DP_STATUS_FREEZE: u32 = 1 << 1;
+pub const DP_STATUS_FLUSH: u32 = 1 << 2;
+pub const DP_STATUS_START_VALID: u32 = 1 << 10;
+
+impl DpRegs {
+    /// Apply the DP status register's paired clear/set command bits. Counter
+    /// reset commands have no observable counter state in this model.
+    pub fn apply_status_command(&mut self, command: u32) {
+        if command & 0x01 != 0 {
+            self.status &= !DP_STATUS_XBUS_DMA;
+        }
+        if command & 0x02 != 0 {
+            self.status |= DP_STATUS_XBUS_DMA;
+        }
+        if command & 0x04 != 0 {
+            self.status &= !DP_STATUS_FREEZE;
+        }
+        if command & 0x08 != 0 {
+            self.status |= DP_STATUS_FREEZE;
+        }
+        if command & 0x10 != 0 {
+            self.status &= !DP_STATUS_FLUSH;
+        }
+        if command & 0x20 != 0 {
+            self.status |= DP_STATUS_FLUSH;
+        }
+    }
+
+    /// Submit one DRAM-backed RDP command range. The current HLE renderer
+    /// consumes graphics work synchronously, so the observable current
+    /// pointer reaches `end` and no busy/valid bit remains set on return.
+    pub fn set_next_buffer(&mut self, start: u32, end: u32) -> bool {
+        if self.status & DP_STATUS_START_VALID != 0 {
+            return false;
+        }
+        self.start = start;
+        self.end = end;
+        self.current = end;
+        true
+    }
+}
+
 /// MI (MIPS Interface) register block: the top-level interrupt-mask/
 /// interrupt-pending registers every other unit's interrupt line funnels
 /// through. `MI_INTR_MASK`/`MI_INTR` bit layout (public hardware docs):
@@ -238,6 +277,31 @@ pub struct MiRegs {
     pub intr_mask: u32,
     pub intr: u32,
     pub mode: u32,
+}
+
+impl MiRegs {
+    /// Apply the public MI mode command register. The write bits are commands,
+    /// while the readback mode bits occupy different positions. DP interrupt
+    /// acknowledgement belongs to the integrated interrupt fabric, so bit 11
+    /// is intentionally not represented in this register-only view.
+    pub fn apply_mode_command(&mut self, command: u32) {
+        apply_clear_set_pair(&mut self.mode, command, 7, 8, 7); // INIT
+        apply_clear_set_pair(&mut self.mode, command, 9, 10, 8); // EBUS
+        apply_clear_set_pair(&mut self.mode, command, 12, 13, 9); // RDRAM
+    }
+
+    /// Apply the six paired clear/set commands in `MI_INTR_MASK_REG`.
+    pub fn apply_mask_command(&mut self, command: u32) {
+        for source in 0..6 {
+            apply_clear_set_pair(
+                &mut self.intr_mask,
+                command,
+                source * 2,
+                source * 2 + 1,
+                source,
+            );
+        }
+    }
 }
 
 /// The full hardware-register MMIO space: one instance per running game,
@@ -251,7 +315,6 @@ pub struct MmioSpace {
     pub vi: ViRegs,
     pub pi: PiRegs,
     pub si: SiRegs,
-    pub sp: SpRegs,
     pub dp: DpRegs,
     pub mi: MiRegs,
 }
@@ -303,9 +366,6 @@ impl MmioSpace {
 
             o if o == base::SI | 0x18 => self.si.status,
 
-            o if o == base::SP | 0x10 => self.sp.status,
-            o if o == base::SP | 0x0C => self.sp.pc,
-
             o if o == base::DP_CMD | 0x00 => self.dp.start,
             o if o == base::DP_CMD | 0x04 => self.dp.end,
             o if o == base::DP_CMD | 0x08 => self.dp.current,
@@ -336,18 +396,22 @@ impl MmioSpace {
             o if o == base::AI | 0x10 => self.ai.dacrate = value,
             o if o == base::AI | 0x14 => self.ai.bitrate = value,
 
+            o if o == base::VI | 0x10 => { /* Any write acknowledges VI in the integrated interrupt fabric. */
+            }
+
             o if o == base::PI | 0x00 => self.pi.dram_addr = value,
             o if o == base::PI | 0x04 => self.pi.cart_addr = value,
             o if o == base::PI | 0x10 => self.pi.status = 0, // any write to PI_STATUS clears busy/error bits, per hardware docs
 
-            o if o == base::SP | 0x10 => self.sp.status = value,
-            o if o == base::SP | 0x0C => self.sp.pc = value,
+            o if o == base::SI | 0x18 => { /* Any write acknowledges SI in the integrated interrupt fabric. */
+            }
 
             o if o == base::DP_CMD | 0x00 => self.dp.start = value,
             o if o == base::DP_CMD | 0x04 => self.dp.end = value,
+            o if o == base::DP_CMD | 0x0C => self.dp.apply_status_command(value),
 
-            o if o == base::MI | 0x00 => self.mi.mode = value,
-            o if o == base::MI | 0x0C => self.mi.intr_mask = value, // real HW: write is a set/clear bitmask, not a plain store; refine when a real caller needs it
+            o if o == base::MI | 0x00 => self.mi.apply_mode_command(value),
+            o if o == base::MI | 0x0C => self.mi.apply_mask_command(value),
             o if o == base::MI | 0x08 => { /* MI_INTR is read-only on real hardware; write is documented as ignored */
             }
 
@@ -366,7 +430,7 @@ impl MmioSpace {
     /// `sync_into_rdram` to know which bytes of the backing buffer to keep
     /// live, without hand-maintaining a second list that could drift out of
     /// sync with `read_w`'s own match arms.
-    fn modeled_offsets(&self) -> [u32; 20] {
+    fn modeled_offsets(&self) -> [u32; 18] {
         [
             base::AI | 0x00,
             base::AI | 0x04,
@@ -380,8 +444,6 @@ impl MmioSpace {
             base::PI | 0x04,
             base::PI | 0x10,
             base::SI | 0x18,
-            base::SP | 0x10,
-            base::SP | 0x0C,
             base::DP_CMD | 0x00,
             base::DP_CMD | 0x04,
             base::DP_CMD | 0x08,
@@ -412,18 +474,12 @@ impl MmioSpace {
     /// responsible for sizing the buffer that large; see module doc).
     ///
     /// Deliberately one-directional (model -> rdram bytes only, no
-    /// `sync_from_rdram` counterpart): every register this module marks
-    /// writable already has a real host-state mutation path through
-    /// `write_w` (fed by an `osXxx_recomp` shim, per `docs/COMPLETENESS.md`
-    /// -- no evidence yet of any target game issuing a raw guest STORE to
-    /// one of these registers, only the raw LOAD this module exists to
-    /// fix). Re-deriving `write_w`'s side effects (e.g. `AI_STATUS`'s
-    /// "write clears the pending interrupt" semantics, or `AiRegs::status`'s
-    /// one-shot-busy-then-clear state) from raw bytes on every sync would
-    /// risk double-applying those effects; add a real `sync_from_rdram` only
-    /// once a genuine raw-guest-store call site is found (same "don't build
-    /// ahead of evidence" discipline `docs/COMPLETENESS.md`'s prioritized
-    /// gap list already applies elsewhere).
+    /// `sync_from_rdram` counterpart). Typed-Rust recompiled `lw/sw` now call
+    /// `read_w`/`write_w` directly through `fn64-recomp-rs`'s MMIO hooks, so
+    /// their side effects cannot be re-derived or double-applied from bytes.
+    /// The byte mirror remains the compatibility path for generated C, whose
+    /// raw pointer macros cannot be intercepted; retiring that one-directional
+    /// C-lane bridge requires the universal block/dynamic execution lane.
     pub unsafe fn sync_into_rdram(&mut self, rdram: *mut u8) {
         for window_offset in self.modeled_offsets() {
             let value = self.read_w(window_offset);
@@ -473,18 +529,22 @@ mod tests {
     }
 
     #[test]
+    fn dp_status_commands_update_latched_state_not_command_bits() {
+        let mut dp = DpRegs::default();
+        dp.apply_status_command(0x02 | 0x08 | 0x20);
+        assert_eq!(
+            dp.status,
+            DP_STATUS_XBUS_DMA | DP_STATUS_FREEZE | DP_STATUS_FLUSH
+        );
+        dp.apply_status_command(0x01 | 0x04 | 0x10);
+        assert_eq!(dp.status, 0);
+    }
+
+    #[test]
     fn ai_get_length_reports_latched_length() {
         let mut mmio = MmioSpace::new();
         mmio.write_w(base::AI | 0x04, 0x100);
         assert_eq!(mmio.read_w(base::AI | 0x04), 0x100);
-    }
-
-    #[test]
-    fn sp_status_defaults_to_halted_broke() {
-        let mut mmio = MmioSpace::new();
-        let status = mmio.read_w(base::SP | 0x10);
-        assert_eq!(status & SP_STATUS_HALT, SP_STATUS_HALT);
-        assert_eq!(status & SP_STATUS_BROKE, SP_STATUS_BROKE);
     }
 
     #[test]

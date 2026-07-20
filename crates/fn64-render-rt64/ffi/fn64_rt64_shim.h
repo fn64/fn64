@@ -41,13 +41,31 @@ int fn64_rt64_process_task(
     Fn64Rt64Context *context,
     uint8_t *rdram,
     size_t rdram_len,
+    uint8_t *dmem,
+    size_t dmem_len,
+    uint8_t *imem,
+    size_t imem_len,
     const Fn64Rt64Task *task,
+    uint32_t output_addr,
+    char *error,
+    size_t error_capacity);
+
+int fn64_rt64_process_rdp_commands(
+    Fn64Rt64Context *context,
+    uint8_t *rdram,
+    size_t rdram_len,
+    uint32_t start,
+    uint32_t end,
     uint32_t output_addr,
     char *error,
     size_t error_capacity);
 
 int fn64_rt64_present(
     Fn64Rt64Context *context,
+    uint8_t blanked,
+    uint8_t fade_enabled,
+    uint16_t fade_factor,
+    uint8_t repeat_line,
     char *error,
     size_t error_capacity);
 
