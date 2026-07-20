@@ -9,12 +9,9 @@
 # validation before being added. This file harmonizes ANSWER KEYS for
 # grading only; it is never an input to discovery or matching.
 #
-# Deliberately ABSENT: OoT `CIC6105_AddFaultClient` vs MM
-# `CIC6105_AddRomInfoFaultPage` (both 0x34 = 13 instructions). Bodies mask
-# identically, but at that size two genuinely distinct wrappers differing
-# only in relocated operands would too — left un-aliased, and graded WRONG,
-# until adjudicated at byte level. An alias must never launder a possible
-# masked-wrapper collision into a pass.
+# Every group here must clear the masked-wrapper bar: for a small function,
+# bodies that mask identically could still be two distinct wrappers, so an
+# alias needs source- or byte-level adjudication, never just the match.
 
 [[alias]]
 # libultra csleep: zeldaret/oot renamed it Sleep_Cycles; zeldaret/mm keeps
@@ -38,3 +35,16 @@ names = ["tanf", "Math_FTanF"]
 # The stdio _Printf output callback: zeldaret projects call it proutPrintf,
 # Kirby64Ret calls it write_to_buf. Same compiled body.
 names = ["proutPrintf", "write_to_buf"]
+
+[[alias]]
+# The CIC6105 fault-page registration wrapper. Adjudicated 2026-07-19 at
+# source AND byte level (the 13-instruction case the masked-wrapper bar
+# exists for): zeldaret/oot src/boot/cic6105.c defines
+# `CIC6105_AddFaultClient { Fault_AddClient(&sCIC6105FaultClient,
+# CIC6105_FaultClient, NULL, NULL); }`; zeldaret/mm src/boot/CIC6105.c
+# defines the same wrapper renamed `CIC6105_AddRomInfoFaultPage` (client
+# struct and callback renamed alongside). Retail-ROM word compare (OoT
+# 0x2038 / MM 0x289C): 8 of 13 words bit-identical; the 5 diffs are
+# exactly the two HI/LO relocation pairs and the jal target — both jal
+# Fault_AddClient.
+names = ["CIC6105_AddFaultClient", "CIC6105_AddRomInfoFaultPage"]
