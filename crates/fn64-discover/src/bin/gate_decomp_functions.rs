@@ -92,6 +92,12 @@ use fn64_discover::grade_oot_functions::{grade_functions, AnswerFunction, JalTar
 use fn64_discover::partition::{partition, same_bank_overlaps};
 use fn64_discover::resolve::build_cfg_closed_with_facts_and_claims;
 use std::collections::BTreeMap;
+
+/// Shortest run of consecutive boundary-plausible in-window code pointers
+/// that counts as a handler-dispatch table (see
+/// `sig_scan::detect_handler_tables`). Short runs collide with incidental
+/// pointer pairs in data; a real action/camera/cutscene table is longer.
+const HANDLER_TABLE_MIN_RUN: usize = 4;
 use fn64_discover::{required_env_path, run_discovery_with_tables_and_request_dma, Fact};
 use serde::Deserialize;
 
@@ -647,6 +653,50 @@ fn main() {
             }
         }
         println!("stored code-pointer roots added={stored_ptr}");
+    }
+
+    // Handler-table lane: object-action / camera-mode / cutscene-shot
+    // dispatch tables (`const Func table[]` arrays) stored in the bank's
+    // own data. A dense run of consecutive in-window code pointers whose
+    // every entry lands on a plausible function boundary IS such a table;
+    // its entries are callable dispatch handlers the CFG never reaches
+    // statically (the interpreter indexes the array at runtime). This is
+    // the dominant SM64 open cluster (behavior/camera/cutscene handlers).
+    // Entries are excused: a proven dense table pointing at real function
+    // starts is machine-checked callable-entry evidence, the same class as
+    // a jal target. The boundary-plausibility of *every* run entry is the
+    // guard against float/fixed-point alias runs.
+    {
+        // The handler TABLES live in the bank's .data/.rodata, which sits
+        // PAST the answer key's code_end — so scan the FULL bank image
+        // [rom_start, rom_end), not just the [va_start, code_end) code
+        // window (`bank_bytes`). Entries are still validated against the
+        // code window via `text_words`.
+        let full_bank = &rom.bytes[boot_rom_start as usize..boot_rom_end as usize];
+        let bank_words: Vec<u32> = full_bank
+            .chunks_exact(4)
+            .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+            .collect();
+        let text_words: Vec<u32> = bank_bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+            .collect();
+        let handlers = fn64_discover::sig_scan::detect_handler_tables(
+            &bank_words,
+            &text_words,
+            boot_va_start,
+            code_end,
+            HANDLER_TABLE_MIN_RUN,
+        );
+        let mut added = 0usize;
+        for entry in handlers {
+            if !roots.contains(&entry) {
+                roots.push(entry);
+                excused.push(entry);
+                added += 1;
+            }
+        }
+        println!("handler-table roots added={added}");
     }
 
     // Donor-signature lane (FN64_DISCOVER_SIG_DONOR_ROM/_DUMP, ';'-lists
