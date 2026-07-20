@@ -14,12 +14,13 @@
 //! `MEM_*`. We replicate the SAME lane math here for the 0x1000-byte DMEM so
 //! the generated audio-ucode entry points observe identical bytes.
 //!
-//! Words (`RSP_MEM_W_*`) are native-endian with NO lane XOR (word-aligned,
-//! `from_ne_bytes`); halfwords carry `^2`; bytes carry `^3` — the same three
-//! rules as `rdram.rs`, just scoped to the 4 KiB DMEM address space instead
-//! of 8 MiB RDRAM. The RSP address space wraps at 0x1000 (`rsp_mem_mask =
-//! 0x1FFF` in the codegen masks IMEM+DMEM; DMEM proper is the low 0x1000),
-//! so every offset is masked into range before the lane XOR.
+//! Aligned words use native-endian backing with no whole-address XOR;
+//! halfwords and bytes occupy their `^2`/`^3` lanes. RSP scalar accesses have
+//! no alignment exception, however, so multi-byte operations walk consecutive
+//! architectural bytes rather than treating an unaligned host pointer as a
+//! native integer. The RSP address space wraps at 0x1000 (`rsp_mem_mask =
+//! 0x1FFF` in the codegen masks IMEM+DMEM; DMEM proper is the low 0x1000), so
+//! every addressed byte is masked into range before the lane XOR.
 
 /// RSP DMEM size: 4 KiB. The RSP has 4 KiB DMEM + 4 KiB IMEM; only DMEM holds
 /// the data the compute ops touch (IMEM is instructions, handled by the
@@ -28,6 +29,45 @@ pub const DMEM_SIZE: usize = 0x1000;
 
 /// The DMEM address mask. RSP data addresses wrap within the 4 KiB DMEM.
 pub const DMEM_MASK: u32 = 0x0FFF;
+
+fn trace_write(kind: &str, address: u32, width: usize, value: u32) {
+    use std::sync::OnceLock;
+
+    static WATCH: OnceLock<Option<std::ops::Range<usize>>> = OnceLock::new();
+    let Some(watch) = WATCH
+        .get_or_init(|| {
+            std::env::var("RSP_TRACE_DMEM_WRITES").ok().map(|spec| {
+                let (offset, count) = spec.split_once(':').unwrap_or_else(|| {
+                    panic!("RSP_TRACE_DMEM_WRITES must be OFFSET:COUNT, got {spec:?}")
+                });
+                let offset = usize::from_str_radix(offset.trim_start_matches("0x"), 16)
+                    .unwrap_or_else(|_| panic!("RSP_TRACE_DMEM_WRITES offset must be hexadecimal"));
+                let count = count.parse::<usize>().unwrap_or_else(|_| {
+                    panic!("RSP_TRACE_DMEM_WRITES count must be decimal bytes")
+                });
+                let end = offset
+                    .checked_add(count)
+                    .expect("RSP_TRACE_DMEM_WRITES range overflow");
+                assert!(
+                    offset < end && end <= DMEM_SIZE,
+                    "RSP_TRACE_DMEM_WRITES range must be nonempty and within DMEM"
+                );
+                offset..end
+            })
+        })
+        .as_ref()
+    else {
+        return;
+    };
+    let overlaps =
+        (0..width).any(|byte| watch.contains(&((address as usize + byte) & DMEM_MASK as usize)));
+    if overlaps {
+        eprintln!(
+            "[fn64-rsp-dmem-write] kind={kind} addr={:#05x} width={width} value={value:#010x}",
+            address & DMEM_MASK
+        );
+    }
+}
 
 /// The 4 KiB RSP data memory scratchpad, with native-endian-word storage and
 /// the `^2`/`^3` byte-lane-swizzled sub-word accessors the generated ucode C
@@ -64,46 +104,42 @@ impl Dmem {
         &mut self.bytes
     }
 
-    /// `RSP_MEM_W_LOAD`: int32_t, word-aligned, NO byte-lane XOR, native byte
-    /// order, sign is inherent in `i32`. Mirrors `rdram.rs::read_w`.
+    /// `RSP_MEM_W_LOAD`: four consecutive architectural big-endian bytes.
+    /// The public SGI RSP guide specifies no LW alignment exception and uses
+    /// all twelve effective-address bits, so an unaligned word must not be
+    /// reinterpreted as four consecutive bytes of native-word backing.
     pub fn read_w(&self, offset: u32) -> i32 {
-        let o = (offset & DMEM_MASK) as usize;
-        i32::from_ne_bytes([
-            self.bytes[o],
-            self.bytes[(o + 1) & (DMEM_SIZE - 1)],
-            self.bytes[(o + 2) & (DMEM_SIZE - 1)],
-            self.bytes[(o + 3) & (DMEM_SIZE - 1)],
-        ])
+        i32::from_be_bytes(core::array::from_fn(|byte| {
+            self.read_bu(offset.wrapping_add(byte as u32))
+        }))
     }
 
-    /// `RSP_MEM_W_STORE`: native-endian word store, no lane XOR.
+    /// `RSP_MEM_W_STORE`: four consecutive architectural big-endian bytes.
     pub fn write_w(&mut self, offset: u32, value: i32) {
-        let o = (offset & DMEM_MASK) as usize;
-        let b = value.to_ne_bytes();
-        for (k, &byte) in b.iter().enumerate() {
-            self.bytes[(o + k) & (DMEM_SIZE - 1)] = byte;
+        for (byte, value) in value.to_be_bytes().into_iter().enumerate() {
+            let address = offset.wrapping_add(byte as u32);
+            self.bytes[((address ^ 3) & DMEM_MASK) as usize] = value;
         }
+        trace_write("word", offset, 4, value as u32);
     }
 
-    /// `RSP_MEM_H_LOAD`: int16_t, byte-lane XOR `offset ^ 2`, native byte
-    /// order, sign-extended. Mirrors `rdram.rs::read_h`.
+    /// `RSP_MEM_H_LOAD`: two consecutive architectural big-endian bytes.
     pub fn read_h(&self, offset: u32) -> i16 {
-        let o = ((offset ^ 2) & DMEM_MASK) as usize;
-        i16::from_ne_bytes([self.bytes[o], self.bytes[(o + 1) & (DMEM_SIZE - 1)]])
+        i16::from_be_bytes([self.read_bu(offset), self.read_bu(offset.wrapping_add(1))])
     }
 
-    /// `RSP_MEM_H_STORE`: byte-lane XOR `offset ^ 2`, native order.
+    /// `RSP_MEM_H_STORE`: two consecutive architectural big-endian bytes.
     pub fn write_h(&mut self, offset: u32, value: i16) {
-        let o = ((offset ^ 2) & DMEM_MASK) as usize;
-        let b = value.to_ne_bytes();
-        self.bytes[o] = b[0];
-        self.bytes[(o + 1) & (DMEM_SIZE - 1)] = b[1];
+        for (byte, value) in value.to_be_bytes().into_iter().enumerate() {
+            let address = offset.wrapping_add(byte as u32);
+            self.bytes[((address ^ 3) & DMEM_MASK) as usize] = value;
+        }
+        trace_write("half", offset, 2, value as u16 as u32);
     }
 
-    /// `RSP_MEM_HU_LOAD`: uint16_t, byte-lane XOR `offset ^ 2`, zero-extended.
+    /// `RSP_MEM_HU_LOAD`: unsigned two-byte architectural load.
     pub fn read_hu(&self, offset: u32) -> u16 {
-        let o = ((offset ^ 2) & DMEM_MASK) as usize;
-        u16::from_ne_bytes([self.bytes[o], self.bytes[(o + 1) & (DMEM_SIZE - 1)]])
+        u16::from_be_bytes([self.read_bu(offset), self.read_bu(offset.wrapping_add(1))])
     }
 
     /// `RSP_MEM_B`: int8_t, byte-lane XOR `offset ^ 3`, sign-extended.
@@ -116,6 +152,7 @@ impl Dmem {
     pub fn write_b(&mut self, offset: u32, value: i8) {
         let o = ((offset ^ 3) & DMEM_MASK) as usize;
         self.bytes[o] = value as u8;
+        trace_write("byte", offset, 1, value as u8 as u32);
     }
 
     /// `RSP_MEM_BU`: uint8_t, byte-lane XOR `offset ^ 3`, zero-extended.
@@ -128,6 +165,7 @@ impl Dmem {
     pub fn write_bu(&mut self, offset: u32, value: u8) {
         let o = ((offset ^ 3) & DMEM_MASK) as usize;
         self.bytes[o] = value;
+        trace_write("byte", offset, 1, value as u32);
     }
 }
 
@@ -171,6 +209,35 @@ mod tests {
         // MEM_HU(word+0) ^2 -> high halfword 0x1122; +2 -> low 0x3344.
         assert_eq!(d.read_hu(0x10), 0x1122);
         assert_eq!(d.read_hu(0x12), 0x3344);
+    }
+
+    #[test]
+    fn unaligned_scalar_words_and_halves_follow_logical_byte_addresses() {
+        let mut d = Dmem::new();
+        d.write_w(0x101, 0x1122_3344);
+        assert_eq!(d.read_w(0x101), 0x1122_3344);
+        assert_eq!(
+            (0..4)
+                .map(|byte| d.read_bu(0x101 + byte))
+                .collect::<Vec<_>>(),
+            [0x11, 0x22, 0x33, 0x44]
+        );
+
+        d.write_h(0x107, 0x5566);
+        assert_eq!(d.read_hu(0x107), 0x5566);
+        assert_eq!(d.read_bu(0x107), 0x55);
+        assert_eq!(d.read_bu(0x108), 0x66);
+    }
+
+    #[test]
+    fn unaligned_scalar_access_wraps_each_byte_within_dmem() {
+        let mut d = Dmem::new();
+        d.write_w(0x0ffe, 0x89ab_cdefu32 as i32);
+        assert_eq!(d.read_w(0x0ffe) as u32, 0x89ab_cdef);
+        assert_eq!(d.read_bu(0x0ffe), 0x89);
+        assert_eq!(d.read_bu(0x0fff), 0xab);
+        assert_eq!(d.read_bu(0x0000), 0xcd);
+        assert_eq!(d.read_bu(0x0001), 0xef);
     }
 
     #[test]

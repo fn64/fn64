@@ -110,7 +110,31 @@ cmp /tmp/interp.rdram /tmp/generated.rdram
 
 `RSP_TRACE_DMA=1` logs every RSP DMA read/write with decoded length and a source
 checksum in both paths. Use it to find the first divergent hardware seam before
-looking at instruction traces.
+looking at instruction traces. `RSP_TRACE_DMA_LIMIT=N` bounds the process-wide
+DMA stream to its first `N` operations. `RSP_TRACE_DMA_WORDS=N` adds the first
+`N` native-storage words from each read source; keep it bounded because command
+buffers are game data and the diagnostic can be large.
+
+`RSP_TRACE_EXEC=1` logs every interpreter PC and raw instruction word.
+`RSP_TRACE_EXEC_LIMIT=N` bounds that process-wide stream to the first `N`
+instructions. The trace is intentionally verbose and disabled by default.
+`RSP_TRACE_EXEC_GPRS=9,11,13` adds the named scalar-register values to each
+emitted instruction record; indices are decimal and comma-separated.
+`RSP_TRACE_CP0=1` logs RSP-side CP0 writes, including the scalar values which
+program SP DMA and DPC registers.
+`RSP_TRACE_DPC_WORDS=N` prints the first `N` logical command words from each
+completed LLE DPC range before it is submitted to the renderer.
+`RSP_TRACE_RDRAM_WORDS=OFFSET:COUNT` prints native-storage words from one
+hexadecimal RDRAM offset when an LLE task begins; `COUNT` is decimal.
+`RSP_TRACE_DMEM_WORDS=OFFSET:COUNT` prints big-endian logical DMEM words at
+task admission and after every completed IMEM overlay DMA, tagged with the
+overlay generation and resumed PC.
+`RSP_TRACE_DMEM_WRITES=OFFSET:COUNT` watches a hexadecimal DMEM offset and a
+decimal byte count, logging scalar/vector writes which overlap that logical
+range. Pair it with `RSP_TRACE_DMA=1`, since bulk SP DMA uses the backing image
+directly and is reported by the DMA trace instead.
+`FN64_TRACE_PI_DMA=1` logs every managed/raw PI request at the shared timing
+boundary with direction, cartridge address, RDRAM destination, and length.
 
 For crackle that survives stable ring depth and zero underruns, capture the
 post-resample stream too:

@@ -28,6 +28,15 @@ errors: list[str] = []
 checked = 0
 
 
+def check_generated_validators() -> None:
+    validator = ROOT / "tools/check_unsupported_event_sites.py"
+    result = subprocess.run(
+        [sys.executable, str(validator)], cwd=ROOT, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        fail("docs/unsupported-event-sites.json", result.stderr.strip() or result.stdout.strip())
+
+
 def fail(where: str, msg: str) -> None:
     errors.append(f"{where}: {msg}")
 
@@ -109,7 +118,22 @@ ENV = re.compile(r"\b((?:FN64|OOT|RECOMP)_[A-Z0-9_]+)\b")
 
 def check_env_vars() -> None:
     src = subprocess.run(
-        ["git", "grep", "-hoE", r"(FN64|OOT|RECOMP)_[A-Z0-9_]+", "--", "*.rs", "*.sh", "*.toml", "*.c"],
+        [
+            "git",
+            "grep",
+            "-hoE",
+            r"(FN64|OOT|RECOMP)_[A-Z0-9_]+",
+            "--",
+            "*.rs",
+            "*.sh",
+            "*.toml",
+            "*.c",
+            "*.cc",
+            "*.cpp",
+            "*.cxx",
+            "*.h",
+            "*.hpp",
+        ],
         cwd=ROOT, capture_output=True, text=True,
     ).stdout
     live = set(src.split())
@@ -200,20 +224,88 @@ def check_doc_hashes_are_tested() -> None:
                 )
 
 
-# --- 4. COMPLETENESS's own regen recipe must not be blind --------------------
+# --- 4. COMPLETENESS's generated ABI inventory must match live code ----------
 # It once grepped lib.rs alone; the crate had been split into modules, so it
-# matched ZERO of 73 shims and "regenerating" re-asserted a falsehood. A doc
-# whose maintenance tool is broken rots faster than one with no tool.
+# matched ZERO of 73 shims and "regenerating" re-asserted a falsehood. The
+# dedicated checker now owns both the clean-room 116-name manifest and the
+# generated doc block; run it here so every ordinary doc-lint invocation is a
+# mechanical surface-drift gate.
 def check_completeness_recipe() -> None:
-    shims = subprocess.run(
-        ["git", "grep", "-hc", "_recomp(", "--", "crates/fn64-abi/src/"],
-        cwd=ROOT, capture_output=True, text=True,
-    ).stdout
-    total = sum(int(n) for n in shims.split() if n.isdigit())
-    if total == 0:
-        fail("COMPLETENESS.md", "regen recipe finds 0 shims in crates/fn64-abi/src/ -- recipe is blind")
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/check-nmr-surface.py"), "--check-doc"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
+        fail("COMPLETENESS.md", detail)
     elif VERBOSE:
-        print(f"  completeness recipe sees {total} shims")
+        print("  NMR surface manifest, live ABI, and completeness doc agree")
+
+
+# --- 4b. RT64's advertised feature denominator must remain complete ---------
+# The ordinary doc gate checks schema, rejection guards, evidence shape, and
+# generated-doc drift without requiring an external checkout. Release owners
+# additionally pass --rt64-dir directly to the inventory tool to prove the
+# pinned source identity and line anchors.
+def check_rt64_feature_inventory() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools/check_rt64_feature_inventory.py")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
+        fail("RT64-PUBLIC-FEATURE-INVENTORY.md", detail)
+    elif VERBOSE:
+        print("  RT64 public feature manifest and generated inventory agree")
+
+
+# --- 4bb. cross-platform RT64 case/blocker matrix must not shrink ----------
+def check_rt64_platform_certification() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools/rt64_platform_certification.py"), "--check"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
+        fail("RT64-PLATFORM-CERTIFICATION.md", detail)
+    elif VERBOSE:
+        print("  RT64 platform/API case and blocker denominators agree")
+
+
+# --- 4bc. private inputs stay external while the admission contract works --
+def check_private_input_admission() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools/private_input_admission.py"), "--check"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
+        fail("PRIVATE-INPUT-ADMISSION.md", detail)
+    elif VERBOSE:
+        print("  private-input admission rejects identity/content leakage")
+
+
+# --- 4c. base-renderer accuracy is a generated, non-shrinking denominator --
+def check_base_renderer_matrix() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools/check_base_renderer_matrix.py")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
+        fail("BASE-RENDERER-BEHAVIOR-MATRIX.md", detail)
+    elif VERBOSE:
+        print("  base-renderer behavior matrix and generated report agree")
 
 
 # --- 5. no doc may cite a scripts/ entry point that isn't executable ---------
@@ -282,7 +374,12 @@ def main() -> int:
         return selftest()
     for fn in (check_refs, check_readme_crates, check_env_vars,
                check_closed_roadmap_items, check_doc_hashes_are_tested,
-               check_completeness_recipe, check_scripts):
+               check_completeness_recipe, check_rt64_feature_inventory,
+               check_rt64_platform_certification,
+               check_private_input_admission,
+               check_base_renderer_matrix,
+               check_generated_validators,
+               check_scripts):
         fn()
     if errors:
         print(f"lint-docs: {len(errors)} error(s)\n")

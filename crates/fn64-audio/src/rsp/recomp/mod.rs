@@ -37,9 +37,17 @@ use crate::rsp::ops::VuOp;
 #[cold]
 #[inline(never)]
 pub fn trap_unknown(imem_addr: u32, word: u32) -> RspExitReason {
+    let context =
+        format!("unimplemented RSP instruction word 0x{word:08X} at IMEM 0x{imem_addr:04X}");
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Audio,
+        "audio.rsp.unknown-instruction",
+        context.clone(),
+        None,
+        fn64_runtime::UnsupportedDisposition::ReturnedError,
+    );
     eprintln!(
-        "[fn64-rsp-recomp] TRAP: unimplemented RSP instruction word 0x{word:08X} \
-         at IMEM 0x{imem_addr:04X} — recompiler gap, not a silent skip. \
+        "[fn64-rsp-recomp] TRAP: {context} — recompiler gap, not a silent skip. \
          Decode this opcode from the public ISA and add it to decode.rs."
     );
     RspExitReason::Unsupported
@@ -50,12 +58,140 @@ pub fn trap_unknown(imem_addr: u32, word: u32) -> RspExitReason {
 #[cold]
 #[inline(never)]
 pub fn trap_unknown_vu(imem_addr: u32, op: VuOp) -> RspExitReason {
-    eprintln!(
-        "[fn64-rsp-recomp] TRAP: VU op {op:?} at IMEM 0x{imem_addr:04X} reached \
-         but its body is not wired into dispatch() — recompiler/op-table gap, \
-         not a silent skip."
+    let context = format!("VU op {op:?} at IMEM 0x{imem_addr:04X} has no dispatch body");
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Audio,
+        "audio.rsp.unimplemented-vu-op",
+        context.clone(),
+        None,
+        fn64_runtime::UnsupportedDisposition::ReturnedError,
     );
+    eprintln!("[fn64-rsp-recomp] TRAP: {context} — recompiler/op-table gap, not a silent skip.");
     RspExitReason::Unsupported
+}
+
+#[cold]
+#[inline(never)]
+pub fn trap_unhandled_jump(imem_addr: u32) -> RspExitReason {
+    let context = format!("RSP jump target at IMEM 0x{imem_addr:04X} has no admitted instruction");
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Audio,
+        "audio.rsp.unhandled-jump-target",
+        context.clone(),
+        None,
+        fn64_runtime::UnsupportedDisposition::ReturnedError,
+    );
+    eprintln!("[fn64-rsp-recomp] TRAP: {context}");
+    RspExitReason::Unsupported
+}
+
+#[cold]
+#[inline(never)]
+pub fn trap_imem_overrun(imem_addr: u32) -> RspExitReason {
+    let context = format!("RSP execution ran outside admitted IMEM at 0x{imem_addr:04X}");
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Audio,
+        "audio.rsp.imem-overrun",
+        context.clone(),
+        None,
+        fn64_runtime::UnsupportedDisposition::ReturnedError,
+    );
+    eprintln!("[fn64-rsp-recomp] TRAP: {context}");
+    RspExitReason::Unsupported
+}
+
+#[cold]
+#[inline(never)]
+pub fn trap_step_budget(imem_addr: u32) -> RspExitReason {
+    let context =
+        format!("recompiled RSP exceeded its fixed step budget at IMEM 0x{imem_addr:04X}");
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Audio,
+        "audio.rsp.recompiler-step-budget",
+        context.clone(),
+        None,
+        fn64_runtime::UnsupportedDisposition::ReturnedError,
+    );
+    eprintln!("[fn64-rsp-recomp] TRAP: {context}");
+    RspExitReason::Unsupported
+}
+
+/// Loud endpoint for a control-transfer instruction in a branch delay slot.
+/// Both the interpreter and emitted RSP bodies route through this one typed
+/// recorder before preserving the existing panic.
+#[cold]
+#[inline(never)]
+pub fn trap_delay_slot_control(imem_addr: u32, instruction: impl std::fmt::Debug) -> ! {
+    let context = format!(
+        "unsupported RSP control transfer {instruction:?} in delay slot at IMEM 0x{imem_addr:04X}"
+    );
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Audio,
+        "audio.rsp.delay-slot-control-transfer",
+        context.clone(),
+        None,
+        fn64_runtime::UnsupportedDisposition::LoudTrap,
+    );
+    panic!("{context}")
+}
+
+#[cfg(test)]
+mod unsupported_event_tests {
+    use super::*;
+
+    #[test]
+    fn rsp_gap_endpoints_record_typed_events_before_return_or_panic() {
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        assert_eq!(
+            trap_unknown(0x1040, 0xffff_ffff),
+            RspExitReason::Unsupported
+        );
+        assert_eq!(
+            trap_unknown_vu(0x1080, VuOp::Vmulf),
+            RspExitReason::Unsupported
+        );
+        let panic = std::panic::catch_unwind(|| trap_delay_slot_control(0x10c0, "Jr"));
+        assert!(panic.is_err());
+        assert_eq!(trap_unhandled_jump(0x1100), RspExitReason::Unsupported);
+        assert_eq!(trap_imem_overrun(0x2100), RspExitReason::Unsupported);
+        assert_eq!(trap_step_budget(0x1140), RspExitReason::Unsupported);
+
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 6);
+        assert_eq!(
+            events[0].subsystem,
+            fn64_runtime::UnsupportedSubsystem::Audio
+        );
+        assert_eq!(
+            events[0].operation,
+            concat!("audio.rsp.", "unknown-instruction")
+        );
+        assert_eq!(
+            events[0].disposition,
+            fn64_runtime::UnsupportedDisposition::ReturnedError
+        );
+        assert_eq!(
+            events[1].operation,
+            concat!("audio.rsp.", "unimplemented-vu-op")
+        );
+        assert_eq!(
+            events[2].operation,
+            concat!("audio.rsp.", "delay-slot-control-transfer")
+        );
+        assert_eq!(
+            events[2].disposition,
+            fn64_runtime::UnsupportedDisposition::LoudTrap
+        );
+        assert_eq!(
+            events[3].operation,
+            concat!("audio.rsp.", "unhandled-jump-target")
+        );
+        assert_eq!(events[4].operation, concat!("audio.rsp.", "imem-overrun"));
+        assert_eq!(
+            events[5].operation,
+            concat!("audio.rsp.", "recompiler-step-budget")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -99,7 +235,7 @@ mod round_trip_tests {
             }
             let idx = ((pc - base) / 4) as usize;
             if idx >= n {
-                return RspExitReason::UnhandledJumpTarget;
+                return trap_unhandled_jump(pc);
             }
             let instr = decode(words[idx], pc);
             let delay = if idx + 1 < n {
@@ -426,9 +562,7 @@ mod round_trip_tests {
                 | Instr::Jal { .. }
                 | Instr::Jr { .. }
                 | Instr::Jalr { .. }),
-            ) => panic!(
-                "unsupported RSP control transfer {illegal:?} in delay slot at IMEM 0x{delay_pc:04X}"
-            ),
+            ) => trap_delay_slot_control(delay_pc, illegal),
         }
     }
 

@@ -215,13 +215,21 @@ pub struct LoudStubUcodeExecutor;
 
 impl UcodeExecutor for LoudStubUcodeExecutor {
     fn execute_task(&mut self, _rdram: &[u8], ucode_addr: u32) -> Result<Vec<i16>, AudioError> {
+        let reason = format!(
+            "audio ucode execution not yet clean-room implemented (GPL-derivation \
+             question pending, see fn64-audio crate doc); refused to fabricate output \
+             for ucode at rdram offset {ucode_addr:#010x}"
+        );
+        fn64_runtime::record_unsupported_event(
+            fn64_runtime::UnsupportedSubsystem::Audio,
+            "audio.ucode-executor.unimplemented",
+            reason.clone(),
+            None,
+            fn64_runtime::UnsupportedDisposition::ReturnedError,
+        );
         Err(AudioError::Backend {
             backend: "ucode-executor",
-            reason: format!(
-                "audio ucode execution not yet clean-room implemented (GPL-derivation \
-                 question pending, see fn64-audio crate doc); refused to fabricate output \
-                 for ucode at rdram offset {ucode_addr:#010x}"
-            ),
+            reason,
         })
     }
 }
@@ -966,7 +974,8 @@ mod tests {
     }
 
     #[test]
-    fn loud_stub_ucode_executor_traps_by_name_not_silently() {
+    fn unsupported_loud_stub_ucode_executor_traps_by_name_not_silently() {
+        fn64_runtime::arm_unsupported_events(None).unwrap();
         let mut executor = LoudStubUcodeExecutor;
         let rdram = vec![0u8; 16];
         let err = executor.execute_task(&rdram, 0x8001_2340).unwrap_err();
@@ -978,6 +987,16 @@ mod tests {
             }
             other => panic!("expected AudioError::Backend, got {other:?}"),
         }
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].operation,
+            concat!("audio.ucode-executor.", "unimplemented")
+        );
+        assert_eq!(
+            events[0].disposition,
+            fn64_runtime::UnsupportedDisposition::ReturnedError
+        );
     }
 
     #[test]

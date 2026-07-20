@@ -8,5 +8,6 @@ description = "AudioBackend trait: the audio seam per docs/DECOUPLING.md, symmet
 
 [dependencies]
 cpal = "0.18"
+fn64-runtime = { path = "../fn64-runtime" }
 
 [dev-dependencies]

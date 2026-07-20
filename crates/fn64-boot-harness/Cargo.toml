@@ -9,7 +9,12 @@ description = "Shared generated-C registration and RDRAM boot seam for fn64 harn
 [features]
 default = ["c-bridge"]
 c-bridge = []
+recomp-rs = ["fn64-abi/recomp-rs", "dep:fn64-recomp-rs"]
 
 [dependencies]
 fn64-abi = { path = "../fn64-abi" }
 fn64-runtime = { path = "../fn64-runtime" }
+fn64-recomp-rs = { path = "../fn64-recomp-rs", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

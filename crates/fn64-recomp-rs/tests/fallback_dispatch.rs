@@ -68,7 +68,7 @@ fn compile_and_run(emitted: &str, main_body: &str) -> String {
         r#"#![allow(unused_imports)]
 use fn64_recomp_rs::{{
     dispatch_until_boundary, run_bank, BankId, BlockExit, BlockProgram, BlockRun, BlockRunner,
-    CodeBank, CodeCatalog, CodeSpan, CpuFault, CpuFaultKind, DispatchRun, EvidenceClass,
+    CodeBank, CodeCatalog, CodeSpan, CpuException, CpuFault, CpuFaultKind, DispatchRun, EvidenceClass,
     ExecutionKey, FallbackProgram, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError,
     Rdram, RecompContext,
 }};

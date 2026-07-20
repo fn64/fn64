@@ -1,11 +1,606 @@
 use super::*;
 
+const EEPROM_CHANNEL: usize = 4;
+const EEPROM_BLOCK_BYTES: usize = 8;
+const PIF_CHANNEL_NO_RESPONSE: u8 = 0x80;
+const ACCESSORY_BLOCK_BYTES: usize = 32;
+const ACCESSORY_ADDR_MASK: u16 = 0xFFE0;
+const ACCESSORY_ADDR_RUMBLE_PROBE: u16 = 0x8000;
+const ACCESSORY_ADDR_RUMBLE_MOTOR: u16 = 0xC000;
+
+/// Public Joybus accessory addressing sends eleven aligned address bits plus
+/// the five-bit polynomial checksum. The public hardware vectors include
+/// 0x0020 -> 0x15 and the Rumble motor address 0xC000 -> 0x1B.
+fn accessory_address_crc(address: u16) -> u8 {
+    let mut block_address = address >> 5;
+    let mut crc = 0u8;
+    for _ in 0..16 {
+        crc <<= 1;
+        if block_address & 0x400 != 0 {
+            crc = if crc & 0x20 != 0 { crc ^ 0x14 } else { crc | 1 };
+        } else if crc & 0x20 != 0 {
+            crc ^= 0x15;
+        }
+        block_address <<= 1;
+    }
+    crc & 0x1F
+}
+
+/// Public Joybus data checksum: CRC-8 seed 0, polynomial 0x85, followed by
+/// eight zero augmentation bits. Accessories apply it to 32-byte blocks;
+/// public VRU captures apply the same checksum to their shorter payloads.
+fn joybus_data_crc(data: &[u8]) -> u8 {
+    let mut crc = 0u8;
+    for byte in data.iter().copied().chain(std::iter::once(0)) {
+        for bit in (0..8).rev() {
+            let feedback = crc & 0x80 != 0;
+            crc <<= 1;
+            if byte & (1 << bit) != 0 {
+                crc |= 1;
+            }
+            if feedback {
+                crc ^= 0x85;
+            }
+        }
+    }
+    crc
+}
+
+#[cfg(test)]
+fn accessory_data_crc(data: &[u8; ACCESSORY_BLOCK_BYTES]) -> u8 {
+    joybus_data_crc(data)
+}
+
+fn trap_raw_voice(command: u8, port: usize, now: Cycles, detail: impl AsRef<str>) -> ! {
+    let context = format!(
+        "SI PIF Voice command {command:#04x} on channel {port} is unsupported: {}",
+        detail.as_ref()
+    );
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Abi,
+        format!("abi.si.voice-command-{command:02x}"),
+        &context,
+        Some(now),
+        fn64_runtime::UnsupportedDisposition::LoudTrap,
+    );
+    panic!("{context}")
+}
+
+fn accessory_address(pif_ram: &[u8; 64], cursor: usize, command: u8, port: usize) -> u16 {
+    let encoded = u16::from_be_bytes([pif_ram[cursor + 3], pif_ram[cursor + 4]]);
+    let address = encoded & ACCESSORY_ADDR_MASK;
+    let supplied_crc = (encoded & !ACCESSORY_ADDR_MASK) as u8;
+    let expected_crc = accessory_address_crc(address);
+    assert_eq!(
+        supplied_crc, expected_crc,
+        "SI PIF accessory command {command:#04x} on channel {port} has address CRC {supplied_crc:#04x} for {address:#06x}; expected {expected_crc:#04x}"
+    );
+    address
+}
+
+fn voice_zero_address(
+    pif_ram: &[u8; 64],
+    cursor: usize,
+    command: u8,
+    port: usize,
+    now: Cycles,
+) -> u16 {
+    let address = accessory_address(pif_ram, cursor, command, port);
+    if address != 0 {
+        trap_raw_voice(
+            command,
+            port,
+            now,
+            format!("address {address:#06x}; public Voice captures establish only address 0x0000"),
+        );
+    }
+    address
+}
+
+fn voice_result_payload(result: fn64_runtime::VoiceData) -> [u8; 36] {
+    let mut payload = [0u8; 36];
+    payload[..4].copy_from_slice(&[0x80, 0x00, 0x0F, 0x00]);
+    let scalar_fields = [
+        result.warning,
+        result.answer_num,
+        result.voice_level,
+        result.voice_sn,
+        result.voice_time,
+    ];
+    for (index, value) in scalar_fields.into_iter().enumerate() {
+        let offset = 4 + index * 2;
+        payload[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    for index in 0..5 {
+        let offset = 14 + index * 4;
+        payload[offset..offset + 2].copy_from_slice(&result.answer[index].to_le_bytes());
+        payload[offset + 2..offset + 4].copy_from_slice(&result.distance[index].to_le_bytes());
+    }
+    payload[34..].copy_from_slice(&[0x40, 0x00]);
+    payload
+}
+
+fn eeprom_query_response<R: fn64_runtime::RomStorage>(
+    pi_dma: &mut fn64_runtime::PiDma<R>,
+    now: Cycles,
+) -> Option<[u8; 3]> {
+    let status = pi_dma.eeprom_status(now)?;
+    let identifier = status.kind.joybus_identifier().to_be_bytes();
+    Some([identifier[0], identifier[1], u8::from(status.busy) * 0x80])
+}
+
+fn require_pif_shape(
+    command: u8,
+    port: usize,
+    tx_size: u8,
+    rx_size: u8,
+    expected_tx: u8,
+    expected_rx: u8,
+) {
+    assert!(
+        tx_size == expected_tx && rx_size == expected_rx,
+        "SI PIF command {command:#04x} on channel {port} has tx={tx_size} rx={rx_size}; expected tx={expected_tx} rx={expected_rx}"
+    );
+}
+
+fn mark_no_response(pif_ram: &mut [u8; 64], cursor: usize) {
+    pif_ram[cursor + 1] |= PIF_CHANNEL_NO_RESPONSE;
+}
+
+#[derive(Default)]
+pub(crate) struct PifExecutionObservations {
+    pub(crate) save_operations: Vec<fn64_runtime::SaveOperationEvent>,
+    pub(crate) controller_operations: Vec<fn64_runtime::ControllerOperationEvent>,
+}
+
+impl PifExecutionObservations {
+    fn record_controller(
+        &mut self,
+        now: Cycles,
+        port: usize,
+        device: fn64_runtime::ControllerOperationDevice,
+        operation: fn64_runtime::ControllerOperationKind,
+    ) {
+        self.controller_operations
+            .push(fn64_runtime::ControllerOperationEvent {
+                at: now,
+                port: u8::try_from(port).expect("PIF controller port exceeds u8"),
+                device,
+                operation,
+            });
+    }
+}
+
+fn execute_pif_commands<R: fn64_runtime::RomStorage>(
+    now: Cycles,
+    pif_ram: &mut [u8; 64],
+    executor: &mut fn64_runtime::Executor,
+    pi_dma: &mut fn64_runtime::PiDma<R>,
+    observations: &mut PifExecutionObservations,
+) {
+    executor.advance_transfer_paks_to(now);
+    let mut port = 0usize;
+    let mut cursor = 0usize;
+    while cursor < pif_ram.len() {
+        let tx_size = pif_ram[cursor];
+        match tx_size {
+            0x00 => {
+                port += 1;
+                cursor += 1;
+                continue;
+            }
+            0xFD => {
+                port += 1;
+                cursor += 1;
+                continue;
+            }
+            0xFE => break,
+            0xFF => {
+                cursor += 1;
+                continue;
+            }
+            _ => {}
+        }
+        assert!(
+            cursor + 2 < pif_ram.len(),
+            "SI PIF command header at {cursor:#x} exceeds 64-byte PIF RAM"
+        );
+        let tx_size = tx_size & 0x3F;
+        let rx_size = pif_ram[cursor + 1] & 0x3F;
+        pif_ram[cursor + 1] = rx_size;
+        let command = pif_ram[cursor + 2];
+        let rx_off = cursor + 2 + tx_size as usize;
+        let next = rx_off + rx_size as usize;
+        assert!(
+            next <= pif_ram.len(),
+            "SI PIF command at {cursor:#x} overruns PIF RAM: tx={tx_size} rx={rx_size}"
+        );
+        match command {
+            0x00 | 0xFF if port < EEPROM_CHANNEL => {
+                require_pif_shape(command, port, tx_size, rx_size, 1, 3);
+                let mut response = executor.pif().query_response(port);
+                if matches!(
+                    executor.pif().port_state(port),
+                    fn64_runtime::PortState::VoiceRecognitionUnit
+                ) {
+                    response[2] = u8::from(
+                        executor
+                            .voice_unit(port)
+                            .expect("VRU identity exists without VoiceUnit state")
+                            .initialized(),
+                    );
+                }
+                pif_ram[rx_off..next].copy_from_slice(&response);
+            }
+            0x00 | 0xFF if port == EEPROM_CHANNEL => {
+                require_pif_shape(command, port, tx_size, rx_size, 1, 3);
+                if let Some(response) = eeprom_query_response(pi_dma, now) {
+                    pif_ram[rx_off..next].copy_from_slice(&response);
+                } else {
+                    mark_no_response(pif_ram, cursor);
+                }
+            }
+            0x01 if port < EEPROM_CHANNEL => {
+                require_pif_shape(command, port, tx_size, rx_size, 1, 4);
+                pif_ram[rx_off..next]
+                    .copy_from_slice(&executor.pif().read_data_response(port));
+                if matches!(
+                    executor.pif().port_state(port),
+                    fn64_runtime::PortState::StandardControllerNoPak
+                        | fn64_runtime::PortState::StandardControllerControllerPak
+                        | fn64_runtime::PortState::StandardControllerRumblePak
+                        | fn64_runtime::PortState::StandardControllerTransferPak
+                ) {
+                    observations.record_controller(
+                        now,
+                        port,
+                        fn64_runtime::ControllerOperationDevice::StandardController,
+                        fn64_runtime::ControllerOperationKind::Read,
+                    );
+                }
+            }
+            0x02 if port < EEPROM_CHANNEL => {
+                require_pif_shape(command, port, tx_size, rx_size, 3, 33);
+                let address = accessory_address(pif_ram, cursor, command, port);
+                let mut data = [0u8; ACCESSORY_BLOCK_BYTES];
+                match executor.pif().port_state(port) {
+                    fn64_runtime::PortState::StandardControllerRumblePak => {
+                        if address == ACCESSORY_ADDR_RUMBLE_PROBE {
+                            data.fill(0x80);
+                        }
+                    }
+                    fn64_runtime::PortState::StandardControllerNoPak => {
+                        pif_ram[rx_off..rx_off + ACCESSORY_BLOCK_BYTES].copy_from_slice(&data);
+                        pif_ram[next - 1] = joybus_data_crc(&data) ^ 0xFF;
+                        cursor = next;
+                        port += 1;
+                        continue;
+                    }
+                    fn64_runtime::PortState::Absent => {
+                        mark_no_response(pif_ram, cursor);
+                        cursor = next;
+                        port += 1;
+                        continue;
+                    }
+                    fn64_runtime::PortState::StandardControllerControllerPak => {
+                        let pak = executor
+                            .controller_pak(port)
+                            .expect("typed Controller Pak identity has no storage");
+                        let physical_offset = usize::from(pak.active_bank())
+                            * fn64_runtime::pfs::PFS_BANK_CAPACITY
+                            + usize::from(address);
+                        pak.raw_read_block(address as usize, &mut data)
+                            .expect("validated Controller Pak block address was rejected");
+                        if usize::from(address) < fn64_runtime::pfs::PFS_BANK_CAPACITY {
+                            observations
+                                .save_operations
+                                .push(fn64_runtime::SaveOperationEvent {
+                                at: now,
+                                device: fn64_runtime::SaveType::ControllerPak,
+                                operation: fn64_runtime::SaveOperationKind::Read,
+                                offset: u32::try_from(physical_offset)
+                                    .expect("Controller Pak physical offset exceeds u32"),
+                                len: fn64_runtime::pfs::PFS_BLOCK_SIZE as u32,
+                                });
+                        }
+                    }
+                    fn64_runtime::PortState::StandardControllerTransferPak => {
+                        executor
+                            .transfer_pak_mut(port)
+                            .expect("typed Transfer Pak identity has no storage")
+                            .read_block(address, &mut data);
+                        observations.record_controller(
+                            now,
+                            port,
+                            fn64_runtime::ControllerOperationDevice::TransferPak,
+                            fn64_runtime::ControllerOperationKind::Read,
+                        );
+                    }
+                    fn64_runtime::PortState::VoiceRecognitionUnit => panic!(
+                        "SI PIF accessory read command 0x02 on Voice channel {port} is not implemented"
+                    ),
+                }
+                pif_ram[rx_off..rx_off + ACCESSORY_BLOCK_BYTES].copy_from_slice(&data);
+                pif_ram[next - 1] = joybus_data_crc(&data);
+            }
+            0x03 if port < EEPROM_CHANNEL => {
+                require_pif_shape(command, port, tx_size, rx_size, 35, 1);
+                let address = accessory_address(pif_ram, cursor, command, port);
+                let data: [u8; ACCESSORY_BLOCK_BYTES] = pif_ram
+                    [cursor + 5..cursor + 5 + ACCESSORY_BLOCK_BYTES]
+                    .try_into()
+                    .expect("fixed accessory write payload must be 32 bytes");
+                let data_crc = joybus_data_crc(&data);
+                match executor.pif().port_state(port) {
+                    fn64_runtime::PortState::StandardControllerRumblePak => {
+                        if address == ACCESSORY_ADDR_RUMBLE_MOTOR {
+                            executor
+                                .set_rumble(port, data[ACCESSORY_BLOCK_BYTES - 1] & 1 != 0)
+                                .expect("typed Rumble Pak identity changed during one PIF command");
+                            observations.record_controller(
+                                now,
+                                port,
+                                fn64_runtime::ControllerOperationDevice::RumblePak,
+                                fn64_runtime::ControllerOperationKind::Control,
+                            );
+                        }
+                        pif_ram[rx_off] = data_crc;
+                    }
+                    fn64_runtime::PortState::StandardControllerNoPak => {
+                        pif_ram[rx_off] = data_crc ^ 0xFF;
+                    }
+                    fn64_runtime::PortState::Absent => mark_no_response(pif_ram, cursor),
+                    fn64_runtime::PortState::StandardControllerControllerPak => {
+                        let pak = executor
+                            .controller_pak_mut(port)
+                            .expect("typed Controller Pak identity has no storage");
+                        let physical_offset = usize::from(pak.active_bank())
+                            * fn64_runtime::pfs::PFS_BANK_CAPACITY
+                            + usize::from(address);
+                        pak.raw_write_block(address as usize, &data)
+                            .expect("validated Controller Pak block address was rejected");
+                        if usize::from(address) < fn64_runtime::pfs::PFS_BANK_CAPACITY {
+                            observations
+                                .save_operations
+                                .push(fn64_runtime::SaveOperationEvent {
+                                at: now,
+                                device: fn64_runtime::SaveType::ControllerPak,
+                                operation: fn64_runtime::SaveOperationKind::Write,
+                                offset: u32::try_from(physical_offset)
+                                    .expect("Controller Pak physical offset exceeds u32"),
+                                len: fn64_runtime::pfs::PFS_BLOCK_SIZE as u32,
+                                });
+                        }
+                        pif_ram[rx_off] = data_crc;
+                    }
+                    fn64_runtime::PortState::StandardControllerTransferPak => {
+                        executor
+                            .transfer_pak_mut(port)
+                            .expect("typed Transfer Pak identity has no storage")
+                            .write_block(address, &data);
+                        observations.record_controller(
+                            now,
+                            port,
+                            fn64_runtime::ControllerOperationDevice::TransferPak,
+                            fn64_runtime::ControllerOperationKind::Write,
+                        );
+                        pif_ram[rx_off] = data_crc;
+                    }
+                    fn64_runtime::PortState::VoiceRecognitionUnit => panic!(
+                        "SI PIF accessory write command 0x03 on Voice channel {port} is not implemented"
+                    ),
+                }
+            }
+            0x04 if port == EEPROM_CHANNEL => {
+                require_pif_shape(command, port, tx_size, rx_size, 2, 8);
+                let block = pif_ram[cursor + 3];
+                match pi_dma.eeprom_read_block(now, block) {
+                    Ok(data) => pif_ram[rx_off..next].copy_from_slice(&data),
+                    Err(fn64_runtime::EepromError::NoDevice) => mark_no_response(pif_ram, cursor),
+                    Err(fn64_runtime::EepromError::Busy { ready_at }) => panic!(
+                        "SI PIF EEPROM read command 0x04 on channel {port} arrived while a write is busy until guest cycle {} -- poll EEPROM Info status bit 0x80 before reading",
+                        ready_at.get()
+                    ),
+                }
+            }
+            0x05 if port == EEPROM_CHANNEL => {
+                require_pif_shape(command, port, tx_size, rx_size, 10, 1);
+                let block = pif_ram[cursor + 3];
+                let data: [u8; EEPROM_BLOCK_BYTES] = pif_ram
+                    [cursor + 4..cursor + 4 + EEPROM_BLOCK_BYTES]
+                    .try_into()
+                    .expect("fixed EEPROM write payload must be eight bytes");
+                match pi_dma.start_eeprom_write(now, block, data) {
+                    Ok(_) => pif_ram[rx_off] = 0,
+                    Err(fn64_runtime::EepromError::Busy { .. }) => pif_ram[rx_off] = 0x80,
+                    Err(fn64_runtime::EepromError::NoDevice) => mark_no_response(pif_ram, cursor),
+                }
+            }
+            0x0B
+                if port < EEPROM_CHANNEL
+                    && matches!(
+                        executor.pif().port_state(port),
+                        fn64_runtime::PortState::VoiceRecognitionUnit
+                    ) =>
+            {
+                require_pif_shape(command, port, tx_size, rx_size, 3, 3);
+                let arguments = [pif_ram[cursor + 3], pif_ram[cursor + 4]];
+                if arguments != [0, 0] {
+                    trap_raw_voice(
+                        command,
+                        port,
+                        now,
+                        format!(
+                            "status-query arguments {:02x} {:02x}; public captures establish only 00 00",
+                            arguments[0], arguments[1]
+                        ),
+                    );
+                }
+                let status = executor
+                    .voice_unit(port)
+                    .expect("VRU identity exists without VoiceUnit state")
+                    .wire_status();
+                let response = [status, 0];
+                pif_ram[rx_off..rx_off + response.len()].copy_from_slice(&response);
+                pif_ram[rx_off + response.len()] = joybus_data_crc(&response);
+            }
+            0x09
+                if port < EEPROM_CHANNEL
+                    && matches!(
+                        executor.pif().port_state(port),
+                        fn64_runtime::PortState::VoiceRecognitionUnit
+                    ) =>
+            {
+                require_pif_shape(command, port, tx_size, rx_size, 3, 37);
+                voice_zero_address(pif_ram, cursor, command, port, now);
+                let result = executor
+                    .voice_unit_mut(port)
+                    .expect("VRU identity exists without VoiceUnit state")
+                    .take_result()
+                    .unwrap_or_else(|error| {
+                        trap_raw_voice(
+                            command,
+                            port,
+                            now,
+                            format!(
+                                "result read without a captured host-injected result: {error:?}"
+                            ),
+                        )
+                    });
+                let payload = voice_result_payload(result);
+                pif_ram[rx_off..rx_off + payload.len()].copy_from_slice(&payload);
+                pif_ram[rx_off + payload.len()] = joybus_data_crc(&payload);
+                observations.record_controller(
+                    now,
+                    port,
+                    fn64_runtime::ControllerOperationDevice::VoiceRecognitionUnit,
+                    fn64_runtime::ControllerOperationKind::Read,
+                );
+            }
+            0x0C
+                if port < EEPROM_CHANNEL
+                    && matches!(
+                        executor.pif().port_state(port),
+                        fn64_runtime::PortState::VoiceRecognitionUnit
+                    ) =>
+            {
+                require_pif_shape(command, port, tx_size, rx_size, 7, 1);
+                voice_zero_address(pif_ram, cursor, command, port, now);
+                let data: [u8; 4] = pif_ram[cursor + 5..cursor + 9]
+                    .try_into()
+                    .expect("fixed Voice control payload must be four bytes");
+                let voice = executor
+                    .voice_unit_mut(port)
+                    .expect("VRU identity exists without VoiceUnit state");
+                match data {
+                    [0x02, 0, words, 0] => voice.clear_dictionary(words).unwrap_or_else(|error| {
+                        panic!(
+                            "SI PIF Voice clear-dictionary command 0x0c on channel {port} failed for {words} words: {error:?}"
+                        )
+                    }),
+                    [0x00, 0, 0x01, 0] => voice.finish_raw_initialize().unwrap_or_else(|error| {
+                        panic!(
+                            "SI PIF Voice raw initialization-finalize command 0x0c on channel {port} failed: {error:?}"
+                        )
+                    }),
+                    [0x00, 0, 0x06, 0] => voice.start().unwrap_or_else(|error| {
+                        panic!(
+                            "SI PIF Voice start command 0x0c on channel {port} failed: {error:?}"
+                        )
+                    }),
+                    [0x05, 0, 0, 0] => voice.stop(),
+                    _ => trap_raw_voice(
+                        command,
+                        port,
+                        now,
+                        format!(
+                            "control payload {:02x} {:02x} {:02x} {:02x}; only captured initialization-finalize 00 00 01 00, clear-dictionary 02 00 nn 00, start 00 00 06 00, and stop 05 00 00 00 forms are modeled",
+                            data[0], data[1], data[2], data[3]
+                        ),
+                    ),
+                }
+                pif_ram[rx_off] = joybus_data_crc(&data);
+                observations.record_controller(
+                    now,
+                    port,
+                    fn64_runtime::ControllerOperationDevice::VoiceRecognitionUnit,
+                    fn64_runtime::ControllerOperationKind::Control,
+                );
+            }
+            0x0D
+                if port < EEPROM_CHANNEL
+                    && matches!(
+                        executor.pif().port_state(port),
+                        fn64_runtime::PortState::VoiceRecognitionUnit
+                    ) =>
+            {
+                require_pif_shape(command, port, tx_size, rx_size, 3, 1);
+                let address = accessory_address(pif_ram, cursor, command, port);
+                executor
+                    .voice_unit_mut(port)
+                    .expect("VRU identity exists without VoiceUnit state")
+                    .raw_initialize_step(address)
+                    .unwrap_or_else(|error| {
+                        trap_raw_voice(
+                            command,
+                            port,
+                            now,
+                            format!(
+                                "address {address:#06x} is not the next captured raw initialization write: {error:?}; power and gain writes remain unestablished"
+                            ),
+                        )
+                    });
+                pif_ram[rx_off] = 0;
+                observations.record_controller(
+                    now,
+                    port,
+                    fn64_runtime::ControllerOperationDevice::VoiceRecognitionUnit,
+                    fn64_runtime::ControllerOperationKind::Control,
+                );
+            }
+            0x0A
+                if port < EEPROM_CHANNEL
+                    && matches!(
+                        executor.pif().port_state(port),
+                        fn64_runtime::PortState::VoiceRecognitionUnit
+                    ) =>
+            {
+                trap_raw_voice(
+                    command,
+                    port,
+                    now,
+                    "public captures do not establish the complete packet, sequencing, and error semantics",
+                )
+            }
+            _ => panic!(
+                "SI PIF command {command:#04x} on channel {port} with tx={tx_size} rx={rx_size} is not implemented"
+            ),
+        }
+        cursor = next;
+        port += 1;
+    }
+    // Real PIF hardware clears its control/format byte (0x1FC007FF) once the
+    // command block has been processed; hand-rolled joybus code (AKI titles)
+    // can poll that byte to confirm completion, and leaving the guest's 0x01
+    // in place reads as "PIF still busy" forever.
+    pif_ram[63] = 0;
+}
+
+pub(crate) fn execute_controller_pif<R: fn64_runtime::RomStorage>(
+    now: Cycles,
+    pif_ram: &mut [u8; 64],
+    pi_dma: &mut fn64_runtime::PiDma<R>,
+) -> PifExecutionObservations {
+    let mut observations = PifExecutionObservations::default();
+    with_executor(|executor| {
+        execute_pif_commands(now, pif_ram, executor, pi_dma, &mut observations)
+    });
+    observations
+}
+
 /// `__osSiRawStartDma(s32 direction, u8* dramAddr)` -- `a0`=direction
-/// (`ctx->r4`; per the public libultra manual and this milestone's real
-/// call-site evidence below, `1` = "write this PIF command block from rdram
-/// TO the PIF, execute it, and read the response back into the same
-/// buffer" -- the SI-manager's synchronous raw-transfer primitive
-/// underlying `osContStartQuery`/`osContStartReadData`), `a1`=dramAddr
+/// (`ctx->r4`; `OS_READ=0` transfers PIF RAM to RDRAM and `OS_WRITE=1`
+/// transfers RDRAM to PIF RAM), `a1`=dramAddr
 /// (`ctx->r5`, the PIF command-block buffer's rdram address).
 ///
 /// ## What this really does (this wave, replacing the prior loud trap)
@@ -16,17 +611,18 @@ use super::*;
 /// calling this: byte 0 = tx-size (`0xFF` = end-of-block marker observed at
 /// offsets 0x26/final), each channel's header is
 /// `[tx_size, rx_size, cmd, ...tx_bytes]` followed by `rx_size` response
-/// bytes to fill in -- the public libultra manual's documented PIF-RAM
+/// bytes to fill in -- the public PIF-RAM format
 /// protocol (`osContStartQuery`'s `0x01,0x03` 3-byte-tx-then-3-byte-rx
 /// status-query shape, `osContStartReadData`'s 1-byte-tx/4-byte-rx
 /// read-data shape). This function walks channels 0-3 in that documented
-/// format, filling each channel's response bytes from `PifModel`
-/// (`fn64_runtime::si` -- "one standard controller on port 0, no pak, ports
-/// 1-3 absent," per the task's explicit scope) rather than a fabricated
-/// byte pattern, and stops at the first `0xFF` tx-size byte (the documented
-/// end-of-block marker) or buffer exhaustion.
+/// format when the DRAM-to-PIF DMA reaches its deadline. `0x00`, `0xFD`,
+/// `0xFE`, and `0xFF` retain their documented skip, reset, format-end, and
+/// dummy meanings. Controller query/read responses come from `PifModel`;
+/// unsupported command bytes trap with channel context.
 ///
-/// Completion is posted through `OS_EVENT_SI` (5, per the public libultra
+/// Each direction is a separate scheduled 64-byte transfer. SI BUSY stays set
+/// until the fabric deadline; only then are bytes committed, MI SI raised,
+/// and completion posted through `OS_EVENT_SI` (5, per the public libultra
 /// manual's event-code table) via the SAME `Executor::inject_event` path
 /// every other completion source uses -- matching `docs/DESIGN.md`
 /// section 2's "closing the asymmetry" design point. If no
@@ -38,76 +634,72 @@ use super::*;
 /// hardware where the SI interrupt fires regardless of whether software
 /// has hooked it yet.
 ///
-/// Real-hardware commands this milestone's `PifModel` does NOT model
-/// (EEPROM/mempak read-write commands, reset) are represented as
-/// `CONT_ABSENT`-shaped responses per channel walked, which is honest for
-/// "no such device," not a guessed success.
+/// Raw EEPROM probe/read/write commands on external channel 4 use the same
+/// save backing store as the high-level EEPROM shims. Raw Rumble Pak
+/// probe/read/write uses the same typed port identity and motor latch as the
+/// high-level motor shims, including the public address and data CRCs. A
+/// non-EEPROM save device reports the PIF no-response bit; malformed packet
+/// shapes and address checksums trap with command/channel context, while a
+/// physical 4-Kbit EEPROM ignores its upper two block-address bits. Controller
+/// Pak block I/O uses the same physical
+/// data pages as the high-level PFS model; management-page inode/directory
+/// decoding remains open. Transfer Pak power, status/mode, bank, and Game Boy
+/// bus windows use typed cartridge ROM/RAM plus common mapper state. MBC3 RTC
+/// oscillator, immutable latch, halt, 9-bit day, and sticky carry state advance
+/// on the same guest clock through raw and high-level paths. A separate host
+/// API imports/exports the exact-ROM-bound RTC sidecar with explicit wall-time
+/// samples. Raw Voice result reads, status, captured five-write initialization,
+/// and initialization/clear/start/stop controls share the high-level
+/// VoiceUnit lifecycle. Region-dependent `0x0A` dictionary staging, `0x0D`
+/// power/gain writes, result reads without a host result, and unestablished
+/// `0x0C` forms record a command-specific unsupported event before trapping.
+/// High-level shims do not silently authorize fabricated raw-protocol success.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn __osSiRawStartDma_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
-    let ctx = unsafe { &*ctx };
+    let ctx = unsafe { &mut *ctx };
     let dram_addr = RdramAddr::from_gpr(ctx.r5);
-    let base = dram_addr.offset() as usize;
-
-    with_executor(|exec| {
-        let pif = *exec.pif();
-        let mut port = 0usize;
-        let mut cursor = base;
-        // Documented PIF-RAM command-block format: walk channel headers
-        // until the 0xFF end-of-block marker or a bogus/oversized read that
-        // would run off any sane buffer (64 bytes is PIF RAM's own real
-        // hardware size, per public documentation -- used here only as a
-        // runaway guard, not asserted as this buffer's actual allocation).
-        for _ in 0..16 {
-            let tx_size = unsafe { *rdram.add(cursor) };
-            if tx_size == 0xFF {
-                break;
-            }
-            let rx_size = unsafe { *rdram.add(cursor + 1) };
-            if tx_size == 0 && rx_size == 0 {
-                cursor += 1;
-                continue;
-            }
-            let cmd = unsafe { *rdram.add(cursor + 2) };
-            let rx_off = cursor + 2 + tx_size as usize;
-            match (cmd, rx_size) {
-                // osContStartQuery-shape: 1-byte tx (the 0xFF query command
-                // itself is tx_size/cmd, not a separate byte in some
-                // encodings; this crate matches on the documented 3-byte
-                // status response regardless of the exact tx encoding
-                // variant, since PifModel's response doesn't depend on it).
-                (_, 3) => {
-                    let resp = pif.query_response(port);
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(resp.as_ptr(), rdram.add(rx_off), 3);
-                    }
-                }
-                (_, 4) => {
-                    let resp = pif.read_data_response(port);
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(resp.as_ptr(), rdram.add(rx_off), 4);
-                    }
-                }
-                _ => {
-                    // Unmodeled command shape for this milestone (see doc
-                    // comment) -- leave whatever bytes were already there
-                    // rather than fabricating a response with no documented
-                    // basis.
-                }
-            }
-            cursor = rx_off + rx_size as usize;
-            port += 1;
+    if crate::boot_probe_enabled() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed);
+        if n < 24 || n.is_multiple_of(512) {
+            eprintln!(
+                "[boot-probe] __osSiRawStartDma #{n} dir={} dram={:#010x}",
+                ctx.r4 as u32,
+                dram_addr.offset() + 0x8000_0000
+            );
+            let base = dram_addr.offset() as usize;
+            let bytes: Vec<u8> = (0..64)
+                .map(|i| unsafe { rdram.add((base + i) ^ 3).read() })
+                .collect();
+            eprintln!("[boot-probe]   block: {:02x?}", bytes);
         }
-    });
-
-    const OS_EVENT_SI: u32 = 5;
-    with_executor(|exec| {
-        if exec.event_table_contains(OS_EVENT_SI) {
-            exec.inject_event(ExternalEvent::OsEvent(OS_EVENT_SI));
-        }
-    });
+    }
+    let kind = match ctx.r4 as u32 {
+        0 => fn64_runtime::SiDmaKind::PifToDram,
+        1 => fn64_runtime::SiDmaKind::DramToPif,
+        direction => panic!("__osSiRawStartDma_recomp: invalid direction {direction}"),
+    };
+    let logical_end = dram_addr
+        .offset()
+        .checked_add(64)
+        .expect("SI DMA RDRAM range overflow") as usize;
+    let rdram_len = logical_end
+        .checked_add(3)
+        .expect("SI DMA RDRAM storage extent overflow")
+        & !3;
+    ctx.r2 = match crate::pi::start_live_si_dma(
+        fn64_runtime::SiDmaRequest { kind, dram_addr },
+        rdram,
+        rdram_len,
+    ) {
+        Ok(()) => 0,
+        Err(DeviceFault::SiBusy) => u64::MAX,
+        Err(error) => panic!("__osSiRawStartDma_recomp: {error}"),
+    };
 }
 
 /// Host-facing input seam: feed controller `port`'s live button/stick state
@@ -126,6 +718,64 @@ pub fn set_controller_state(port: usize, buttons: u16, stick_x: i8, stick_y: i8)
         stick_y,
     };
     with_executor(|exec| exec.set_controller_input(port, input));
+}
+
+/// Host-facing accessory seam. The configured identity is the single source
+/// used by controller queries, Controller Pak calls, and Rumble Pak calls.
+pub fn set_controller_port_state(port: usize, state: fn64_runtime::PortState) {
+    with_executor(|exec| exec.set_controller_port_state(port, state));
+}
+
+/// Host-facing runtime configuration for a linear bank-switched Controller
+/// Pak. This replaces the retained Pak on `port` and selects it as the active
+/// accessory; games do not need to be recompiled for a different capacity.
+pub fn set_controller_pak_bank_count(
+    port: usize,
+    bank_count: fn64_runtime::ControllerPakBankCount,
+) {
+    with_executor(|exec| {
+        exec.attach_controller_pak(
+            port,
+            fn64_runtime::ControllerPak::with_bank_count(bank_count),
+        );
+    });
+}
+
+/// Attach a Game Boy cartridge image and optional persistent RAM image to a
+/// configured Transfer Pak. The cartridge header selects the typed mapper;
+/// unsupported cartridge types and wrong RAM sizes are returned explicitly.
+pub fn insert_transfer_pak_cartridge(
+    port: usize,
+    rom: Vec<u8>,
+    ram: Option<Vec<u8>>,
+) -> Result<(), fn64_runtime::TransferPakError> {
+    with_executor(|exec| exec.insert_transfer_pak_cartridge(port, rom, ram))
+}
+
+/// Attach a Game Boy cartridge while restoring caller-loaded MBC3 battery
+/// metadata. The host supplies the wall-clock sample explicitly; neither the
+/// ABI nor runtime reads `SystemTime`.
+pub fn insert_transfer_pak_cartridge_with_battery(
+    port: usize,
+    rom: Vec<u8>,
+    ram: Option<Vec<u8>>,
+    restore: Option<fn64_runtime::Mbc3BatteryRestore>,
+) -> Result<(), fn64_runtime::TransferPakError> {
+    with_executor(|exec| exec.insert_transfer_pak_cartridge_with_battery(port, rom, ram, restore))
+}
+
+/// Export the current cartridge's battery-backed RTC at the executor's exact
+/// guest cycle and a caller-supplied host checkpoint.
+pub fn checkpoint_transfer_pak_battery(
+    port: usize,
+    checkpoint: fn64_runtime::HostUnixNanos,
+) -> Result<Option<fn64_runtime::Mbc3BatteryMetadata>, fn64_runtime::TransferPakError> {
+    with_executor(|exec| exec.checkpoint_transfer_pak_battery(port, checkpoint))
+}
+
+/// Read back the physical Rumble Pak output for a host haptics backend.
+pub fn rumble_active(port: usize) -> bool {
+    with_executor(|exec| exec.pif().rumble_active(port))
 }
 
 /// `osContGetQuery(OSContStatus *data)` -- ONE argument, `a0`=data
@@ -296,6 +946,19 @@ pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut Reco
                 );
             }
         }
+        if matches!(
+            pif.port_state(port),
+            fn64_runtime::PortState::StandardControllerNoPak
+                | fn64_runtime::PortState::StandardControllerControllerPak
+                | fn64_runtime::PortState::StandardControllerRumblePak
+                | fn64_runtime::PortState::StandardControllerTransferPak
+        ) {
+            crate::record_controller_operation(
+                port,
+                fn64_runtime::ControllerOperationDevice::StandardController,
+                fn64_runtime::ControllerOperationKind::Read,
+            );
+        }
     }
     // osContGetReadData returns void; leave $v0 as the decomp does (unset).
 }
@@ -397,13 +1060,9 @@ thread_local! {
 
 /// `osContStartQuery(OSMesgQueue *mq) -> s32` -- `a0`=`ctx->r4`. Public
 /// libultra manual: kicks off an async PIF status-query DMA, posting
-/// completion to `mq`. This crate's PI/SI DMA is synchronous-modeled
-/// throughout (`__osSiRawStartDma_recomp`'s doc comment: "every path... is
-/// success"/completes immediately) -- consistent with that, this shim
-/// posts the `OS_EVENT_SI` completion (mirroring
-/// `__osSiRawStartDma_recomp`'s own event-post at the bottom of this file)
-/// immediately rather than modeling a real async gap, since no evidence
-/// shows any call site depending on a delay here. Function-table slot only
+/// completion to `mq`. It enters the same timed SI fabric as raw register and
+/// `__osSiRawStartDma` starts; no queue message or MI bit appears before the
+/// deadline. Function-table slot only
 /// (`recomp_overlays.inl:2933`), reached from `PadMgr_Init`/its polling
 /// thread body (BOOT-PLAN.md rung 15).
 ///
@@ -414,11 +1073,19 @@ pub unsafe extern "C" fn osContStartQuery_recomp(_rdram: *mut u8, ctx: *mut Reco
     let ctx = unsafe { &mut *ctx };
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
     const OS_EVENT_SI: u32 = 5;
-    with_executor(|exec| {
-        exec.set_event_mesg(OS_EVENT_SI, mq_addr, 0);
-        exec.inject_event(ExternalEvent::OsEvent(OS_EVENT_SI));
-    });
-    ctx.r2 = 0;
+    with_executor(|exec| exec.set_event_mesg(OS_EVENT_SI, mq_addr, 0));
+    ctx.r2 = match crate::pi::start_live_si_dma(
+        fn64_runtime::SiDmaRequest {
+            kind: fn64_runtime::SiDmaKind::ControllerQuery,
+            dram_addr: RdramAddr::from_offset(0),
+        },
+        std::ptr::null_mut(),
+        0,
+    ) {
+        Ok(()) => 0,
+        Err(DeviceFault::SiBusy) => u64::MAX,
+        Err(error) => panic!("osContStartQuery_recomp: {error}"),
+    };
 }
 
 /// `osContStartReadData(OSMesgQueue *mq) -> s32` -- same shape/reasoning as
@@ -433,55 +1100,183 @@ pub unsafe extern "C" fn osContStartReadData_recomp(_rdram: *mut u8, ctx: *mut R
     let ctx = unsafe { &mut *ctx };
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
     const OS_EVENT_SI: u32 = 5;
-    with_executor(|exec| {
-        exec.set_event_mesg(OS_EVENT_SI, mq_addr, 0);
-        exec.inject_event(ExternalEvent::OsEvent(OS_EVENT_SI));
-    });
-    ctx.r2 = 0;
+    with_executor(|exec| exec.set_event_mesg(OS_EVENT_SI, mq_addr, 0));
+    ctx.r2 = match crate::pi::start_live_si_dma(
+        fn64_runtime::SiDmaRequest {
+            kind: fn64_runtime::SiDmaKind::ControllerRead,
+            dram_addr: RdramAddr::from_offset(0),
+        },
+        std::ptr::null_mut(),
+        0,
+    ) {
+        Ok(()) => 0,
+        Err(DeviceFault::SiBusy) => u64::MAX,
+        Err(error) => panic!("osContStartReadData_recomp: {error}"),
+    };
 }
 
-/// `osMotorInit(OSMesgQueue *mq, OSPfs *pfs, int channel) -> s32` --
-/// Rumble Pak initialization. Zero real call sites in this corpus and
-/// BOOT-PLAN.md's own "rumble-pak specific... not required for a picture
-/// on screen" note. `PifModel` (`si.rs`) explicitly models "no pak" on
-/// every port (this task's stated scope) -- loud-trapped rather than
-/// fabricating a fake accessory-present/success response, since a real
-/// game branching on this return value deserves a named failure, not a
-/// silently-wrong "rumble pak found."
+const PFS_ERR_NOPACK: u32 = 1;
+const PFS_ERR_DEVICE: u32 = 11;
+const MOTOR_INITIALIZED: u32 = 8;
+
+fn rumble_error_code(error: fn64_runtime::RumbleError) -> u32 {
+    match error {
+        fn64_runtime::RumbleError::NoPak => PFS_ERR_NOPACK,
+        fn64_runtime::RumbleError::WrongDevice => PFS_ERR_DEVICE,
+    }
+}
+
+/// `osMotorInit(OSMesgQueue *mq, OSPfs *pfs, int channel) -> s32`.
+/// Public `os_motor.h` defines the signature and `MOTOR_INITIALIZED`; the
+/// function manual defines `PFS_ERR_NOPACK` and `PFS_ERR_DEVICE`. Successful
+/// initialization records the documented OSPfs status/queue/channel prefix.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn osMotorInit_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
-    unimplemented!(
-        "osMotorInit_recomp: no Rumble Pak modeled (PifModel's explicit 'no pak' scope, \
-         si.rs's module doc) and no real call site in games/OOTU/RecompiledFuncs exercises \
-         this on the boot path (BOOT-PLAN.md: 'not required for a picture on screen') -- a \
-         fabricated success/failure response would be an unearned guess."
-    );
+pub unsafe extern "C" fn osMotorInit_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let queue = ctx.r4 as u32;
+    let pfs = RdramAddr::from_gpr(ctx.r5);
+    let channel = ctx.r6 as usize;
+    let result = with_executor(|exec| exec.set_rumble(channel, false));
+    match result {
+        Ok(()) => {
+            let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+            unsafe {
+                storage.write_u32(pfs, MOTOR_INITIALIZED);
+                storage.write_u32(
+                    pfs.checked_add(4)
+                        .expect("OSPfs queue field address overflow"),
+                    queue,
+                );
+                storage.write_u32(
+                    pfs.checked_add(8)
+                        .expect("OSPfs channel field address overflow"),
+                    channel as u32,
+                );
+            }
+            ctx.r2 = 0;
+        }
+        Err(error) => ctx.r2 = rumble_error_code(error) as u64,
+    }
 }
 
-/// `__osMotorAccess(OSPfs *pfs, int accesslib)` -- Rumble Pak channel-access
-/// mutex primitive, reached only from PadMgr's deeper controller-pak
-/// polling (BOOT-PLAN.md: after `osContStartQuery` succeeds; not required
-/// for a picture on screen). Zero real call sites in this corpus
-/// (function-table slot only, `recomp_overlays.inl:2916`). Same
-/// no-accessory-modeled reasoning as `osMotorInit_recomp` -- loud trap.
+fn motor_access(rdram: *mut u8, ctx: &mut RecompContext) {
+    let pfs = RdramAddr::from_gpr(ctx.r4);
+    let active = match ctx.r5 as u32 {
+        0 => false,
+        1 => true,
+        access => panic!("__osMotorAccess_recomp: invalid MOTOR access value {access}"),
+    };
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    let status = unsafe { storage.read_u32(pfs) };
+    assert!(
+        status & MOTOR_INITIALIZED != 0,
+        "__osMotorAccess_recomp: OSPfs was not initialized by osMotorInit"
+    );
+    let channel = unsafe {
+        storage.read_u32(
+            pfs.checked_add(8)
+                .expect("OSPfs channel field address overflow"),
+        )
+    } as usize;
+    ctx.r2 = match with_executor(|exec| exec.set_rumble(channel, active)) {
+        Ok(()) => {
+            crate::record_controller_operation(
+                channel,
+                fn64_runtime::ControllerOperationDevice::RumblePak,
+                fn64_runtime::ControllerOperationKind::Control,
+            );
+            0
+        }
+        Err(error) => rumble_error_code(error) as u64,
+    };
+}
+
+/// `__osMotorAccess(OSPfs *pfs, s32 accesslib) -> s32`. Public `os_motor.h`
+/// defines `MOTOR_START = 1`, `MOTOR_STOP = 0`, and exposes `osMotorStart`/
+/// `osMotorStop` as macros over this entry point.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn __osMotorAccess_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
-    unimplemented!(
-        "__osMotorAccess_recomp: no Rumble Pak modeled (see osMotorInit_recomp's doc comment) \
-         and no real call site in games/OOTU/RecompiledFuncs exercises this on the boot path."
-    );
+pub unsafe extern "C" fn __osMotorAccess_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    motor_access(rdram, ctx);
+}
+
+/// Callable form of the public `osMotorStart(pfs)` macro.
+///
+/// # Safety
+/// `rdram` and `ctx` must satisfy the recompiler ABI contract and name a valid `OSPfs`.
+#[no_mangle]
+pub unsafe extern "C" fn osMotorStart_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    ctx.r5 = 1;
+    motor_access(rdram, ctx);
+}
+
+/// Callable form of the public `osMotorStop(pfs)` macro.
+///
+/// # Safety
+/// `rdram` and `ctx` must satisfy the recompiler ABI contract and name a valid `OSPfs`.
+#[no_mangle]
+pub unsafe extern "C" fn osMotorStop_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    ctx.r5 = 0;
+    motor_access(rdram, ctx);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pi::{load_rom, set_save};
     use crate::test_support::*;
+
+    fn install_eeprom(kind: fn64_runtime::SaveType) {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+            kind,
+        )));
+    }
+
+    fn write_logical_bytes(rdram: &mut [u8], offset: u32, bytes: &[u8]) {
+        let mut view = fn64_runtime::RdramViewMut::from_storage(rdram);
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            view.write_u8(
+                RdramAddr::from_offset(offset + u32::try_from(index).unwrap()),
+                byte,
+            );
+        }
+    }
+
+    fn read_logical_bytes(rdram: &[u8], offset: u32, len: usize) -> Vec<u8> {
+        let view = fn64_runtime::RdramView::from_storage(rdram);
+        (0..len)
+            .map(|index| {
+                view.read_u8(RdramAddr::from_offset(
+                    offset + u32::try_from(index).unwrap(),
+                ))
+            })
+            .collect()
+    }
+
+    fn raw_si_round_trip(rdram: &mut [u8]) {
+        let write_deadline = crate::sim_time().saturating_add(1);
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 1;
+        ctx.r5 = 0x8000_0000;
+        unsafe { __osSiRawStartDma_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(ctx.r2, 0);
+        crate::advance_virtual_time(write_deadline);
+
+        ctx.r4 = 0;
+        unsafe { __osSiRawStartDma_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(ctx.r2, 0);
+        crate::advance_virtual_time(write_deadline + 1);
+    }
 
     /// Regression for the OoT-boot `PadSetup_Init` EXC_BAD_ACCESS: the real
     /// `osContGetQuery(OSContStatus* data)` takes its ONLY argument (the
@@ -631,6 +1426,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn high_level_input_evidence_excludes_voice_ports() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::VoiceRecognitionUnit);
+        set_controller_port_state(1, fn64_runtime::PortState::StandardControllerNoPak);
+
+        let mut rdram = vec![0u8; 0x40];
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000;
+        unsafe { osContGetReadData_recomp(rdram.as_mut_ptr(), &mut ctx) };
+
+        assert_eq!(
+            crate::copy_controller_operations(),
+            vec![fn64_runtime::ControllerOperationEvent {
+                at: Cycles::ZERO,
+                port: 1,
+                device: fn64_runtime::ControllerOperationDevice::StandardController,
+                operation: fn64_runtime::ControllerOperationKind::Read,
+            }]
+        );
+    }
+
     /// `__osSiRawStartDma_recomp` is real this wave (replacing the prior
     /// loud trap) -- verifies a port-0 status-query channel (tx_size=1,
     /// rx_size=3) gets `PifModel::query_response(0)`'s real bytes written
@@ -638,34 +1456,1161 @@ mod tests {
     #[test]
     fn os_si_raw_start_dma_fills_real_pif_query_responses() {
         let mut rdram = vec![0u8; 64];
-        // Channel 0: tx_size=1, rx_size=3, cmd=0xFF (query), 1 tx byte, then
-        // 3 response bytes to be filled at offset 3..6.
-        rdram[0] = 1;
-        rdram[1] = 3;
-        rdram[2] = 0xFF;
-        rdram[3] = 0; // the 1 tx byte
-                      // rdram[4..7] is the response area for this channel (rx_off = 0+2+1=3,
-                      // so response bytes land at 3..6 -- recompute: cursor=0, tx_size=1,
-                      // rx_off = cursor+2+tx_size = 0+2+1 = 3, filled 3..6).
-                      // Channel 1 starts at cursor = rx_off + rx_size = 3+3 = 6.
-        rdram[6] = 1; // tx_size
-        rdram[7] = 3; // rx_size
-        rdram[8] = 0xFF; // cmd
-        rdram[9] = 0; // tx byte
-                      // response area for channel 1: rx_off = 6+2+1=9, filled 9..12.
-        rdram[12] = 0xFF; // end-of-block marker, channel 2 onward absent
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            // Channel 0: tx_size=1, rx_size=3, cmd=0xFF (query), 1 tx byte,
+            // then 3 response bytes to be filled at offset 3..6.
+            view.write_u8(RdramAddr::from_offset(0), 1);
+            view.write_u8(RdramAddr::from_offset(1), 3);
+            view.write_u8(RdramAddr::from_offset(2), 0xFF);
+            view.write_u8(RdramAddr::from_offset(3), 0);
+            // Channel 1 starts after channel 0's three response bytes.
+            view.write_u8(RdramAddr::from_offset(6), 1);
+            view.write_u8(RdramAddr::from_offset(7), 3);
+            view.write_u8(RdramAddr::from_offset(8), 0xFF);
+            view.write_u8(RdramAddr::from_offset(9), 0);
+            view.write_u8(RdramAddr::from_offset(12), 0xFE);
+        }
 
         let mut ctx = ctx_zeroed();
+        ctx.r4 = 1; // OS_WRITE: DRAM -> PIF, then execute the command block.
         ctx.r5 = 0x8000_0000; // dramAddr vram -> rdram offset 0
         unsafe { __osSiRawStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+        assert_eq!(ctx.r2, 0);
+        crate::advance_virtual_time(1);
+
+        ctx.r4 = 0; // OS_READ: PIF -> DRAM response copy.
+        unsafe { __osSiRawStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+        crate::advance_virtual_time(2);
 
         // Port 0: standard controller, no pak, not absent.
-        assert_eq!(&rdram[3..6], &[0x05, 0x00, 0x00]);
+        let view = fn64_runtime::RdramView::from_storage(&rdram);
+        assert_eq!(
+            (3..6)
+                .map(|offset| view.read_u8(RdramAddr::from_offset(offset)))
+                .collect::<Vec<_>>(),
+            vec![0x05, 0x00, 0x00]
+        );
         // Port 1: absent bit set.
         assert_eq!(
-            rdram[9 + 2] & fn64_runtime::CONT_ABSENT,
+            view.read_u8(RdramAddr::from_offset(11)) & fn64_runtime::CONT_ABSENT,
             fn64_runtime::CONT_ABSENT
         );
+    }
+
+    #[test]
+    fn raw_pif_records_operations_but_not_accessory_probes() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::StandardControllerNoPak);
+
+        let mut input = [0u8; 64];
+        input[0] = 1;
+        input[1] = 4;
+        input[2] = 0x01;
+        input[7] = 0xfe;
+        let input_observations = crate::pi::with_pi_dma("raw controller input", |pi_dma| {
+            execute_controller_pif(Cycles::new(11), &mut input, pi_dma)
+        });
+        assert_eq!(
+            input_observations.controller_operations,
+            vec![fn64_runtime::ControllerOperationEvent {
+                at: Cycles::new(11),
+                port: 0,
+                device: fn64_runtime::ControllerOperationDevice::StandardController,
+                operation: fn64_runtime::ControllerOperationKind::Read,
+            }]
+        );
+
+        set_controller_port_state(0, fn64_runtime::PortState::StandardControllerRumblePak);
+        let encoded_probe = ACCESSORY_ADDR_RUMBLE_PROBE
+            | u16::from(accessory_address_crc(ACCESSORY_ADDR_RUMBLE_PROBE));
+        let mut probe = [0u8; 64];
+        probe[0] = 3;
+        probe[1] = 33;
+        probe[2] = 0x02;
+        probe[3..5].copy_from_slice(&encoded_probe.to_be_bytes());
+        probe[38] = 0xfe;
+        let probe_observations = crate::pi::with_pi_dma("raw Rumble Pak probe", |pi_dma| {
+            execute_controller_pif(Cycles::new(12), &mut probe, pi_dma)
+        });
+        assert!(probe_observations.controller_operations.is_empty());
+
+        let encoded_motor = ACCESSORY_ADDR_RUMBLE_MOTOR
+            | u16::from(accessory_address_crc(ACCESSORY_ADDR_RUMBLE_MOTOR));
+        let mut motor = [0u8; 64];
+        motor[0] = 35;
+        motor[1] = 1;
+        motor[2] = 0x03;
+        motor[3..5].copy_from_slice(&encoded_motor.to_be_bytes());
+        motor[5..37].fill(1);
+        motor[38] = 0xfe;
+        let motor_observations = crate::pi::with_pi_dma("raw Rumble Pak motor", |pi_dma| {
+            execute_controller_pif(Cycles::new(13), &mut motor, pi_dma)
+        });
+        assert_eq!(
+            motor_observations.controller_operations,
+            vec![fn64_runtime::ControllerOperationEvent {
+                at: Cycles::new(13),
+                port: 0,
+                device: fn64_runtime::ControllerOperationDevice::RumblePak,
+                operation: fn64_runtime::ControllerOperationKind::Control,
+            }]
+        );
+
+        set_controller_port_state(0, fn64_runtime::PortState::StandardControllerTransferPak);
+        let mut gb_rom = vec![0xff; 0x8000];
+        gb_rom[0x147] = 0;
+        insert_transfer_pak_cartridge(0, gb_rom, None).unwrap();
+        let mut transfer = [0u8; 64];
+        transfer[0] = 3;
+        transfer[1] = 33;
+        transfer[2] = 0x02;
+        transfer[3..5].copy_from_slice(&encoded_probe.to_be_bytes());
+        transfer[38] = 0xfe;
+        let transfer_observations = crate::pi::with_pi_dma("raw Transfer Pak read", |pi_dma| {
+            execute_controller_pif(Cycles::new(14), &mut transfer, pi_dma)
+        });
+        assert_eq!(
+            transfer_observations.controller_operations,
+            vec![fn64_runtime::ControllerOperationEvent {
+                at: Cycles::new(14),
+                port: 0,
+                device: fn64_runtime::ControllerOperationDevice::TransferPak,
+                operation: fn64_runtime::ControllerOperationKind::Read,
+            }]
+        );
+    }
+
+    #[test]
+    fn raw_voice_info_and_high_level_init_share_readiness_state() {
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::VoiceRecognitionUnit);
+
+        let query = || {
+            let mut packet = [0u8; 64];
+            packet[0] = 1;
+            packet[1] = 3;
+            packet[2] = 0x00;
+            packet[6] = 0xFE;
+            packet
+        };
+
+        let mut before = query();
+        crate::pi::with_pi_dma("raw Voice pre-init Info", |pi_dma| {
+            execute_controller_pif(Cycles::ZERO, &mut before, pi_dma)
+        });
+        assert_eq!(&before[3..6], &[0x00, 0x01, 0x00]);
+
+        let mut rdram = vec![0u8; 0x100];
+        let mut init = ctx_zeroed();
+        init.r4 = 0x8000_0020;
+        init.r5 = 0x8000_0040;
+        init.r6 = 0;
+        unsafe { crate::voice::osVoiceInit_recomp(rdram.as_mut_ptr(), &mut init) };
+        assert_eq!(init.r2, 0);
+
+        let mut after = query();
+        crate::pi::with_pi_dma("raw Voice post-init Info", |pi_dma| {
+            execute_controller_pif(Cycles::ZERO, &mut after, pi_dma)
+        });
+        assert_eq!(&after[3..6], &[0x00, 0x01, 0x01]);
+    }
+
+    #[test]
+    fn raw_voice_captured_initialization_sequence_reaches_shared_readiness() {
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::VoiceRecognitionUnit);
+
+        let run = |packet: &mut [u8; 64]| {
+            crate::pi::with_pi_dma("raw Voice initialization", |pi_dma| {
+                execute_controller_pif(Cycles::new(17), packet, pi_dma)
+            });
+        };
+        for encoded_address in [0x1E0Cu16, 0x6E07, 0x080E, 0x5618, 0x030F] {
+            let mut packet = [0u8; 64];
+            packet[0] = 3;
+            packet[1] = 1;
+            packet[2] = 0x0D;
+            packet[3..5].copy_from_slice(&encoded_address.to_be_bytes());
+            packet[6] = 0xFE;
+            run(&mut packet);
+            assert_eq!(packet[5], 0);
+        }
+        assert_eq!(
+            with_executor(|exec| exec
+                .voice_unit(0)
+                .unwrap()
+                .evidence_snapshot()
+                .raw_init_step),
+            5
+        );
+
+        let mut finish = [0u8; 64];
+        finish[0] = 7;
+        finish[1] = 1;
+        finish[2] = 0x0C;
+        finish[5..9].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+        finish[10] = 0xFE;
+        run(&mut finish);
+        assert_eq!(finish[9], 0x97);
+        assert!(with_executor(|exec| exec
+            .voice_unit(0)
+            .unwrap()
+            .initialized()));
+    }
+
+    #[test]
+    fn joybus_crc_matches_public_voice_capture_vectors() {
+        assert_eq!(joybus_data_crc(&[0x00, 0x00, 0x01, 0x00]), 0x97);
+        assert_eq!(joybus_data_crc(&[0x02, 0x00, 0x3B, 0x00]), 0xF9);
+        assert_eq!(joybus_data_crc(&[0x05, 0x00, 0x00, 0x00]), 0x4E);
+        assert_eq!(joybus_data_crc(&[0x00, 0x00, 0x06, 0x00]), 0x78);
+        assert_eq!(joybus_data_crc(&[0x01, 0x00]), 0x97);
+        assert_eq!(joybus_data_crc(&[0x05, 0x00]), 0x44);
+    }
+
+    #[test]
+    fn raw_voice_status_clear_and_start_share_high_level_state() {
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::VoiceRecognitionUnit);
+
+        let run = |packet: &mut [u8; 64]| {
+            crate::pi::with_pi_dma("raw Voice state convergence", |pi_dma| {
+                execute_controller_pif(Cycles::new(23), packet, pi_dma)
+            });
+        };
+        let status_packet = || {
+            let mut packet = [0u8; 64];
+            packet[0] = 3;
+            packet[1] = 3;
+            packet[2] = 0x0B;
+            packet[8] = 0xFE;
+            packet
+        };
+
+        let mut pre_init = status_packet();
+        run(&mut pre_init);
+        assert_eq!(&pre_init[5..8], &[0x01, 0x00, 0x97]);
+
+        let mut rdram = vec![0u8; 0x100];
+        let mut init = ctx_zeroed();
+        init.r4 = 0x8000_0020;
+        init.r5 = 0x8000_0040;
+        init.r6 = 0;
+        unsafe { crate::voice::osVoiceInit_recomp(rdram.as_mut_ptr(), &mut init) };
+        assert_eq!(init.r2, 0);
+
+        let mut ready = status_packet();
+        run(&mut ready);
+        assert_eq!(&ready[5..8], &[0x00, 0x00, 0x00]);
+
+        let mut clear = [0u8; 64];
+        clear[0] = 7;
+        clear[1] = 1;
+        clear[2] = 0x0C;
+        clear[5..9].copy_from_slice(&[0x02, 0x00, 0x01, 0x00]);
+        clear[10] = 0xFE;
+        run(&mut clear);
+        assert_eq!(clear[9], joybus_data_crc(&[0x02, 0x00, 0x01, 0x00]));
+        assert_eq!(
+            with_executor(|exec| exec
+                .voice_unit(0)
+                .unwrap()
+                .evidence_snapshot()
+                .expected_words),
+            Some(1)
+        );
+
+        let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram.as_mut_ptr()) };
+        for (index, byte) in b"voice\0".iter().copied().enumerate() {
+            unsafe {
+                storage.write_u8(RdramAddr::from_offset(0x80 + index as u32), byte);
+            }
+        }
+        let mut word = ctx_zeroed();
+        word.r4 = 0x8000_0040;
+        word.r5 = 0x8000_0080;
+        unsafe { crate::voice::osVoiceSetWord_recomp(rdram.as_mut_ptr(), &mut word) };
+        assert_eq!(word.r2, 0);
+
+        let mut start = [0u8; 64];
+        start[0] = 7;
+        start[1] = 1;
+        start[2] = 0x0C;
+        start[5..9].copy_from_slice(&[0x00, 0x00, 0x06, 0x00]);
+        start[10] = 0xFE;
+        run(&mut start);
+        assert_eq!(start[9], 0x78);
+
+        let mut get = ctx_zeroed();
+        get.r4 = 0x8000_0040;
+        get.r5 = 0x8000_00C0;
+        unsafe { crate::voice::osVoiceGetReadData_recomp(rdram.as_mut_ptr(), &mut get) };
+        assert_ne!(get.r2, 0);
+        assert_eq!(
+            unsafe { storage.read_u8(RdramAddr::from_offset(0x4C)) },
+            fn64_runtime::voice::VOICE_STATUS_START
+        );
+
+        let mut started = status_packet();
+        run(&mut started);
+        assert_eq!(&started[5..8], &[0x01, 0x00, 0x97]);
+
+        crate::voice::mark_voice_detected(0);
+        let mut busy = status_packet();
+        run(&mut busy);
+        assert_eq!(&busy[5..8], &[0x05, 0x00, 0x44]);
+
+        crate::voice::inject_voice_result(0, fn64_runtime::VoiceData::default());
+        let mut ended = status_packet();
+        run(&mut ended);
+        assert_eq!(&ended[5..8], &[0x07, 0x00, joybus_data_crc(&[0x07, 0x00])]);
+
+        let mut stop = [0u8; 64];
+        stop[0] = 7;
+        stop[1] = 1;
+        stop[2] = 0x0C;
+        stop[5..9].copy_from_slice(&[0x05, 0x00, 0x00, 0x00]);
+        stop[10] = 0xFE;
+        run(&mut stop);
+        assert_eq!(stop[9], 0x4E);
+        let mut canceled = status_packet();
+        run(&mut canceled);
+        assert_eq!(
+            &canceled[5..8],
+            &[0x03, 0x00, joybus_data_crc(&[0x03, 0x00])]
+        );
+    }
+
+    #[test]
+    fn raw_voice_result_matches_public_capture_layout_and_consumes_shared_result() {
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::VoiceRecognitionUnit);
+        with_executor(|exec| {
+            let voice = exec.voice_unit_mut(0).unwrap();
+            voice.initialize();
+            voice.clear_dictionary(1).unwrap();
+            voice.set_word(b"capture").unwrap();
+            voice.start().unwrap();
+            voice
+                .inject_result(fn64_runtime::VoiceData {
+                    warning: 0,
+                    answer_num: 2,
+                    voice_level: 0x059D,
+                    voice_sn: 0x077C,
+                    voice_time: 0x04B0,
+                    answer: [0, 4, 0x10, 0x14, 5],
+                    distance: [0x0477, 0x04CC, 0x04F9, 0x0503, 0x0512],
+                })
+                .unwrap();
+        });
+
+        let mut packet = [0u8; 64];
+        packet[0] = 3;
+        packet[1] = 37;
+        packet[2] = 0x09;
+        packet[42] = 0xFE;
+        let observations = crate::pi::with_pi_dma("raw Voice result", |pi_dma| {
+            execute_controller_pif(Cycles::new(29), &mut packet, pi_dma)
+        });
+        assert_eq!(
+            observations.controller_operations,
+            vec![fn64_runtime::ControllerOperationEvent {
+                at: Cycles::new(29),
+                port: 0,
+                device: fn64_runtime::ControllerOperationDevice::VoiceRecognitionUnit,
+                operation: fn64_runtime::ControllerOperationKind::Read,
+            }]
+        );
+        assert_eq!(
+            &packet[5..42],
+            &[
+                0x80, 0x00, 0x0F, 0x00, 0x00, 0x00, 0x02, 0x00, 0x9D, 0x05, 0x7C, 0x07, 0xB0, 0x04,
+                0x00, 0x00, 0x77, 0x04, 0x04, 0x00, 0xCC, 0x04, 0x10, 0x00, 0xF9, 0x04, 0x14, 0x00,
+                0x03, 0x05, 0x05, 0x00, 0x12, 0x05, 0x40, 0x00, 0x97,
+            ]
+        );
+        assert_eq!(
+            with_executor(|exec| exec.voice_unit(0).unwrap().status()),
+            fn64_runtime::voice::VOICE_STATUS_READY
+        );
+    }
+
+    #[test]
+    fn unestablished_raw_voice_payload_records_a_typed_loud_trap() {
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::VoiceRecognitionUnit);
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+
+        let mut packet = [0u8; 64];
+        packet[0] = 7;
+        packet[1] = 1;
+        packet[2] = 0x0C;
+        packet[5..9].copy_from_slice(&[0x00, 0x00, 0x07, 0x00]);
+        packet[10] = 0xFE;
+        let trapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::pi::with_pi_dma("unsupported raw Voice payload", |pi_dma| {
+                execute_controller_pif(Cycles::new(41), &mut packet, pi_dma)
+            });
+        }));
+        assert!(trapped.is_err());
+
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].subsystem, fn64_runtime::UnsupportedSubsystem::Abi);
+        assert_eq!(events[0].operation, "abi.si.voice-command-0c");
+        assert_eq!(events[0].guest_cycle, Some(Cycles::new(41)));
+        assert_eq!(
+            events[0].disposition,
+            fn64_runtime::UnsupportedDisposition::LoudTrap
+        );
+        assert!(events[0].context.contains("00 00 07 00"));
+        fn64_runtime::complete_unsupported_observation(Cycles::new(41), &"0".repeat(64));
+    }
+
+    #[test]
+    fn raw_eeprom_and_high_level_shims_share_one_backing_store() {
+        install_eeprom(fn64_runtime::SaveType::Eeprom4k);
+        let mut rdram = vec![0u8; 0x200];
+        let raw_payload = [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87];
+
+        let mut raw_write = vec![0; 18];
+        raw_write[4] = 10;
+        raw_write[5] = 1;
+        raw_write[6] = 0x05;
+        raw_write[7] = 7;
+        raw_write[8..16].copy_from_slice(&raw_payload);
+        raw_write[17] = 0xFE;
+        write_logical_bytes(&mut rdram, 0, &raw_write);
+        raw_si_round_trip(&mut rdram);
+        assert_eq!(read_logical_bytes(&rdram, 16, 1), vec![0]);
+
+        let mut high_read = ctx_zeroed();
+        high_read.r5 = 7;
+        high_read.r6 = 0x8000_0080;
+        unsafe { crate::save::osEepromRead_recomp(rdram.as_mut_ptr(), &mut high_read) };
+        assert_eq!(high_read.r2, 0);
+        assert_eq!(read_logical_bytes(&rdram, 0x80, 8), raw_payload);
+
+        let shim_payload = [0xF8, 0xE7, 0xD6, 0xC5, 0xB4, 0xA3, 0x92, 0x81];
+        write_logical_bytes(&mut rdram, 0xA0, &shim_payload);
+        let mut high_write = ctx_zeroed();
+        high_write.r5 = 7;
+        high_write.r6 = 0x8000_00A0;
+        unsafe { crate::save::osEepromWrite_recomp(rdram.as_mut_ptr(), &mut high_write) };
+        assert_eq!(high_write.r2, 0);
+        crate::advance_virtual_time(
+            crate::sim_time().saturating_add(fn64_runtime::EEPROM_WRITE_CYCLES.get()),
+        );
+
+        let mut raw_read = vec![0; 17];
+        raw_read[4] = 2;
+        raw_read[5] = 8;
+        raw_read[6] = 0x04;
+        raw_read[7] = 7;
+        raw_read[16] = 0xFE;
+        write_logical_bytes(&mut rdram, 0, &raw_read);
+        raw_si_round_trip(&mut rdram);
+        assert_eq!(read_logical_bytes(&rdram, 8, 8), shim_payload);
+        let operations = crate::copy_save_operations();
+        assert_eq!(operations.len(), 4);
+        assert_eq!(
+            operations
+                .iter()
+                .map(|event| event.operation)
+                .collect::<Vec<_>>(),
+            vec![
+                fn64_runtime::SaveOperationKind::Write,
+                fn64_runtime::SaveOperationKind::Read,
+                fn64_runtime::SaveOperationKind::Write,
+                fn64_runtime::SaveOperationKind::Read,
+            ]
+        );
+        assert!(operations.iter().all(|event| {
+            event.device == fn64_runtime::SaveType::Eeprom4k
+                && event.offset == 7 * EEPROM_BLOCK_BYTES as u32
+                && event.len == EEPROM_BLOCK_BYTES as u32
+        }));
+    }
+
+    #[test]
+    fn same_cycle_eeprom_maturity_pfs_and_eeprom_read_keep_wire_order() {
+        install_eeprom(fn64_runtime::SaveType::Eeprom4k);
+        set_controller_port_state(0, fn64_runtime::PortState::StandardControllerControllerPak);
+        let deadline = crate::pi::with_pi_dma("same-cycle raw save ordering", |pi_dma| {
+            pi_dma
+                .start_eeprom_write(Cycles::ZERO, 1, [0x5a; EEPROM_BLOCK_BYTES])
+                .unwrap()
+        });
+        crate::advance_virtual_time(deadline.get() - 1);
+
+        let mut packet = [0u8; 64];
+        let pak_address = 0u16;
+        let encoded = pak_address | u16::from(accessory_address_crc(pak_address));
+        packet[0] = 3;
+        packet[1] = 33;
+        packet[2] = 0x02;
+        packet[3..5].copy_from_slice(&encoded.to_be_bytes());
+        packet[38..41].fill(0);
+        packet[41] = 2;
+        packet[42] = 8;
+        packet[43] = 0x04;
+        packet[44] = 1;
+        packet[53] = 0xfe;
+
+        let mut rdram = vec![0u8; 64];
+        write_logical_bytes(&mut rdram, 0, &packet);
+        raw_si_round_trip(&mut rdram);
+
+        assert_eq!(
+            crate::copy_save_operations(),
+            vec![
+                fn64_runtime::SaveOperationEvent {
+                    at: deadline,
+                    device: fn64_runtime::SaveType::Eeprom4k,
+                    operation: fn64_runtime::SaveOperationKind::Write,
+                    offset: EEPROM_BLOCK_BYTES as u32,
+                    len: EEPROM_BLOCK_BYTES as u32,
+                },
+                fn64_runtime::SaveOperationEvent {
+                    at: deadline,
+                    device: fn64_runtime::SaveType::ControllerPak,
+                    operation: fn64_runtime::SaveOperationKind::Read,
+                    offset: 0,
+                    len: ACCESSORY_BLOCK_BYTES as u32,
+                },
+                fn64_runtime::SaveOperationEvent {
+                    at: deadline,
+                    device: fn64_runtime::SaveType::Eeprom4k,
+                    operation: fn64_runtime::SaveOperationKind::Read,
+                    offset: EEPROM_BLOCK_BYTES as u32,
+                    len: EEPROM_BLOCK_BYTES as u32,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_eeprom_query_distinguishes_devices_and_reports_no_response() {
+        fn query(kind: fn64_runtime::SaveType) -> ([u8; 3], u8) {
+            install_eeprom(kind);
+            let mut packet = [0u8; 64];
+            packet[4] = 1;
+            packet[5] = 3;
+            packet[6] = 0;
+            packet[10] = 0xFE;
+            crate::pi::with_pi_dma("raw EEPROM query test", |pi_dma| {
+                execute_controller_pif(Cycles::ZERO, &mut packet, pi_dma)
+            });
+            (packet[7..10].try_into().unwrap(), packet[5])
+        }
+
+        assert_eq!(
+            query(fn64_runtime::SaveType::Eeprom4k),
+            ([0x00, 0x80, 0x00], 3)
+        );
+        assert_eq!(
+            query(fn64_runtime::SaveType::Eeprom16k),
+            ([0x00, 0xC0, 0x00], 3)
+        );
+        assert_eq!(
+            query(fn64_runtime::SaveType::SramBanked),
+            ([0x00, 0x00, 0x00], 3 | PIF_CHANNEL_NO_RESPONSE)
+        );
+    }
+
+    #[test]
+    fn raw_eeprom_busy_status_rejects_overlap_and_clears_at_deadline() {
+        install_eeprom(fn64_runtime::SaveType::Eeprom4k);
+        let first = [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87];
+        let second = [0xA5; EEPROM_BLOCK_BYTES];
+
+        let write_packet = |payload: [u8; EEPROM_BLOCK_BYTES]| {
+            let mut packet = [0u8; 64];
+            packet[4] = 10;
+            packet[5] = 1;
+            packet[6] = 0x05;
+            packet[7] = 0xC9;
+            packet[8..16].copy_from_slice(&payload);
+            packet[17] = 0xFE;
+            packet
+        };
+        let query_packet = || {
+            let mut packet = [0u8; 64];
+            packet[4] = 1;
+            packet[5] = 3;
+            packet[6] = 0;
+            packet[10] = 0xFE;
+            packet
+        };
+
+        let start = Cycles::new(50);
+        let deadline = start
+            .checked_add(fn64_runtime::EEPROM_WRITE_CYCLES)
+            .unwrap();
+        let mut write = write_packet(first);
+        crate::pi::with_pi_dma("raw EEPROM timed write", |pi_dma| {
+            execute_controller_pif(start, &mut write, pi_dma)
+        });
+        assert_eq!(write[16], 0);
+
+        let mut busy_query = query_packet();
+        crate::pi::with_pi_dma("raw EEPROM busy query", |pi_dma| {
+            execute_controller_pif(start, &mut busy_query, pi_dma)
+        });
+        assert_eq!(&busy_query[7..10], &[0x00, 0x80, 0x80]);
+
+        let mut overlap = write_packet(second);
+        crate::pi::with_pi_dma("raw EEPROM overlapping write", |pi_dma| {
+            execute_controller_pif(Cycles::new(deadline.get() - 1), &mut overlap, pi_dma)
+        });
+        assert_eq!(overlap[16], 0x80);
+
+        let mut ready_query = query_packet();
+        crate::pi::with_pi_dma("raw EEPROM deadline query", |pi_dma| {
+            execute_controller_pif(deadline, &mut ready_query, pi_dma);
+            let mut stored = [0; EEPROM_BLOCK_BYTES];
+            pi_dma.save_read_into(9 * EEPROM_BLOCK_BYTES, &mut stored);
+            assert_eq!(stored, first);
+        });
+        assert_eq!(&ready_query[7..10], &[0x00, 0x80, 0x00]);
+    }
+
+    #[test]
+    fn malformed_raw_eeprom_packet_traps_with_protocol_context() {
+        install_eeprom(fn64_runtime::SaveType::Eeprom4k);
+        let mut packet = [0u8; 64];
+        packet[4] = 1;
+        packet[5] = 8;
+        packet[6] = 0x04;
+        packet[15] = 0xFE;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::pi::with_pi_dma("malformed raw EEPROM test", |pi_dma| {
+                execute_controller_pif(Cycles::ZERO, &mut packet, pi_dma)
+            });
+        }))
+        .expect_err("wrong EEPROM packet shape must trap");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("panic must carry protocol context");
+        assert!(message.contains("command 0x04 on channel 4"), "{message}");
+        assert!(message.contains("expected tx=2 rx=8"), "{message}");
+    }
+
+    #[test]
+    fn public_accessory_crc_vectors_match_rumble_and_block_addresses() {
+        assert_eq!(accessory_address_crc(0x0020), 0x15);
+        assert_eq!(accessory_address_crc(ACCESSORY_ADDR_RUMBLE_PROBE), 0x01);
+        assert_eq!(accessory_address_crc(ACCESSORY_ADDR_RUMBLE_MOTOR), 0x1B);
+        assert_eq!(accessory_data_crc(&[0; ACCESSORY_BLOCK_BYTES]), 0x00);
+        assert_eq!(accessory_data_crc(&[1; ACCESSORY_BLOCK_BYTES]), 0xEB);
+        assert_eq!(accessory_data_crc(&[0x80; ACCESSORY_BLOCK_BYTES]), 0xB8);
+    }
+
+    #[test]
+    fn raw_rumble_probe_and_write_share_the_high_level_motor_latch() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::StandardControllerRumblePak);
+        let mut rdram = vec![0u8; 0x200];
+
+        let mut init = ctx_zeroed();
+        init.r5 = 0x8000_0100;
+        init.r6 = 0;
+        unsafe { osMotorInit_recomp(rdram.as_mut_ptr(), &mut init) };
+        assert_eq!(init.r2, 0);
+        assert!(!rumble_active(0));
+
+        let mut raw_write = vec![0; 39];
+        raw_write[0] = 35;
+        raw_write[1] = 1;
+        raw_write[2] = 0x03;
+        raw_write[3..5].copy_from_slice(&0xC01Bu16.to_be_bytes());
+        raw_write[5..37].fill(1);
+        raw_write[38] = 0xFE;
+        write_logical_bytes(&mut rdram, 0, &raw_write);
+        raw_si_round_trip(&mut rdram);
+        assert_eq!(read_logical_bytes(&rdram, 37, 1), vec![0xEB]);
+        assert!(rumble_active(0));
+
+        let mut stop = ctx_zeroed();
+        stop.r4 = 0x8000_0100;
+        unsafe { osMotorStop_recomp(rdram.as_mut_ptr(), &mut stop) };
+        assert_eq!(stop.r2, 0);
+        assert!(!rumble_active(0));
+
+        let mut raw_probe = vec![0; 39];
+        raw_probe[0] = 3;
+        raw_probe[1] = 33;
+        raw_probe[2] = 0x02;
+        raw_probe[3..5].copy_from_slice(&0x8001u16.to_be_bytes());
+        raw_probe[38] = 0xFE;
+        write_logical_bytes(&mut rdram, 0, &raw_probe);
+        raw_si_round_trip(&mut rdram);
+        assert_eq!(read_logical_bytes(&rdram, 5, 32), vec![0x80; 32]);
+        assert_eq!(read_logical_bytes(&rdram, 37, 1), vec![0xB8]);
+        assert!(!rumble_active(0), "probe reads must not energize the motor");
+        assert_eq!(
+            crate::copy_controller_operations(),
+            vec![
+                fn64_runtime::ControllerOperationEvent {
+                    at: Cycles::new(1),
+                    port: 0,
+                    device: fn64_runtime::ControllerOperationDevice::RumblePak,
+                    operation: fn64_runtime::ControllerOperationKind::Control,
+                },
+                fn64_runtime::ControllerOperationEvent {
+                    at: Cycles::new(2),
+                    port: 0,
+                    device: fn64_runtime::ControllerOperationDevice::RumblePak,
+                    operation: fn64_runtime::ControllerOperationKind::Control,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_controller_pak_blocks_and_high_level_files_share_data_pages() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::StandardControllerControllerPak);
+        let key = fn64_runtime::PfsKey {
+            company_code: 0x1234,
+            game_code: 0x4142_4344,
+            game_name: [0x21; 16],
+            ext_name: [0x11; 4],
+        };
+        with_executor(|executor| {
+            assert_eq!(
+                executor
+                    .controller_pak_mut(0)
+                    .expect("configured Controller Pak")
+                    .allocate(key, fn64_runtime::pfs::PFS_PAGE_SIZE),
+                Ok(0)
+            );
+        });
+        let mut rdram = vec![0u8; 0x200];
+        let raw_payload = [0x5A; ACCESSORY_BLOCK_BYTES];
+        let first_data_address =
+            (fn64_runtime::pfs::PFS_MANAGEMENT_PAGES * fn64_runtime::pfs::PFS_PAGE_SIZE) as u16;
+        let encoded_address =
+            first_data_address | u16::from(accessory_address_crc(first_data_address));
+        let mut raw_write = vec![0; 39];
+        raw_write[0] = 35;
+        raw_write[1] = 1;
+        raw_write[2] = 0x03;
+        raw_write[3..5].copy_from_slice(&encoded_address.to_be_bytes());
+        raw_write[5..37].copy_from_slice(&raw_payload);
+        raw_write[38] = 0xFE;
+        write_logical_bytes(&mut rdram, 0, &raw_write);
+        raw_si_round_trip(&mut rdram);
+        assert_eq!(
+            read_logical_bytes(&rdram, 37, 1),
+            vec![accessory_data_crc(&raw_payload)]
+        );
+        with_executor(|executor| {
+            let mut semantic = [0; ACCESSORY_BLOCK_BYTES];
+            executor
+                .controller_pak(0)
+                .expect("configured Controller Pak")
+                .read(0, 0, &mut semantic)
+                .unwrap();
+            assert_eq!(semantic, raw_payload);
+        });
+
+        let semantic_payload = [0xA5; ACCESSORY_BLOCK_BYTES];
+        with_executor(|executor| {
+            executor
+                .controller_pak_mut(0)
+                .expect("configured Controller Pak")
+                .write(0, ACCESSORY_BLOCK_BYTES, &semantic_payload)
+                .unwrap();
+        });
+        let second_block = first_data_address + ACCESSORY_BLOCK_BYTES as u16;
+        let encoded_second = second_block | u16::from(accessory_address_crc(second_block));
+        let mut raw_read = vec![0; 39];
+        raw_read[0] = 3;
+        raw_read[1] = 33;
+        raw_read[2] = 0x02;
+        raw_read[3..5].copy_from_slice(&encoded_second.to_be_bytes());
+        raw_read[38] = 0xFE;
+        write_logical_bytes(&mut rdram, 0, &raw_read);
+        raw_si_round_trip(&mut rdram);
+        assert_eq!(read_logical_bytes(&rdram, 5, 32), semantic_payload);
+        assert_eq!(
+            read_logical_bytes(&rdram, 37, 1),
+            vec![accessory_data_crc(&semantic_payload)]
+        );
+        assert_eq!(
+            crate::copy_save_operations(),
+            vec![
+                fn64_runtime::SaveOperationEvent {
+                    at: Cycles::new(1),
+                    device: fn64_runtime::SaveType::ControllerPak,
+                    operation: fn64_runtime::SaveOperationKind::Write,
+                    offset: u32::from(first_data_address),
+                    len: ACCESSORY_BLOCK_BYTES as u32,
+                },
+                fn64_runtime::SaveOperationEvent {
+                    at: Cycles::new(3),
+                    device: fn64_runtime::SaveType::ControllerPak,
+                    operation: fn64_runtime::SaveOperationKind::Read,
+                    offset: u32::from(second_block),
+                    len: ACCESSORY_BLOCK_BYTES as u32,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_controller_pak_bank_select_reaches_high_level_cross_bank_data() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_pak_bank_count(0, fn64_runtime::ControllerPakBankCount::new(2).unwrap());
+        let key = fn64_runtime::PfsKey {
+            company_code: 0x1234,
+            game_code: 0x4241_4e4b,
+            game_name: [0x22; 16],
+            ext_name: [0x12; 4],
+        };
+        let payload = [0x6c; ACCESSORY_BLOCK_BYTES];
+        with_executor(|executor| {
+            let pak = executor.controller_pak_mut(0).unwrap();
+            let file = pak
+                .allocate(key, 122 * fn64_runtime::pfs::PFS_PAGE_SIZE)
+                .unwrap();
+            pak.write(file, 121 * fn64_runtime::pfs::PFS_PAGE_SIZE, &payload)
+                .unwrap();
+        });
+
+        let encoded_select = ACCESSORY_ADDR_RUMBLE_PROBE | u16::from(accessory_address_crc(0x8000));
+        let mut select = [0u8; 64];
+        select[0] = 35;
+        select[1] = 1;
+        select[2] = 0x03;
+        select[3..5].copy_from_slice(&encoded_select.to_be_bytes());
+        select[5..37].fill(1);
+        select[38] = 0xfe;
+        let select_operations =
+            crate::pi::with_pi_dma("raw Controller Pak bank select", |pi_dma| {
+                execute_controller_pif(Cycles::ZERO, &mut select, pi_dma)
+            });
+        assert!(select_operations.save_operations.is_empty());
+        assert!(select_operations.controller_operations.is_empty());
+        assert_eq!(select[37], accessory_data_crc(&[1; ACCESSORY_BLOCK_BYTES]));
+
+        let address = fn64_runtime::pfs::PFS_PAGE_SIZE as u16;
+        let encoded = address | u16::from(accessory_address_crc(address));
+        let mut read = [0u8; 64];
+        read[0] = 3;
+        read[1] = 33;
+        read[2] = 0x02;
+        read[3..5].copy_from_slice(&encoded.to_be_bytes());
+        read[38] = 0xfe;
+        let read_operations = crate::pi::with_pi_dma("raw Controller Pak banked read", |pi_dma| {
+            execute_controller_pif(Cycles::ZERO, &mut read, pi_dma)
+        });
+        assert_eq!(&read[5..37], &payload);
+        assert_eq!(read[37], accessory_data_crc(&payload));
+        with_executor(|executor| {
+            assert_eq!(executor.controller_pak(0).unwrap().active_bank(), 1);
+        });
+        assert_eq!(
+            read_operations.save_operations,
+            vec![fn64_runtime::SaveOperationEvent {
+                at: Cycles::ZERO,
+                device: fn64_runtime::SaveType::ControllerPak,
+                operation: fn64_runtime::SaveOperationKind::Read,
+                offset: (fn64_runtime::pfs::PFS_BANK_CAPACITY + fn64_runtime::pfs::PFS_PAGE_SIZE)
+                    as u32,
+                len: ACCESSORY_BLOCK_BYTES as u32,
+            }]
+        );
+        assert!(read_operations.controller_operations.is_empty());
+    }
+
+    #[test]
+    fn raw_transfer_pak_reaches_banked_game_boy_rom_and_persistent_ram() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::StandardControllerTransferPak);
+        let mut gb_rom = vec![0xff; 64 * 0x4000];
+        gb_rom[0x147] = 0x03; // MBC1 + RAM + battery
+        gb_rom[0x149] = 0x03; // 32 KiB RAM
+        for bank in 0..64 {
+            gb_rom[bank * 0x4000] = bank as u8;
+        }
+        insert_transfer_pak_cartridge(0, gb_rom, None).unwrap();
+
+        let write = |address: u16, value: u8| {
+            let encoded = address | u16::from(accessory_address_crc(address));
+            let mut packet = [0u8; 64];
+            packet[0] = 35;
+            packet[1] = 1;
+            packet[2] = 0x03;
+            packet[3..5].copy_from_slice(&encoded.to_be_bytes());
+            packet[5..37].fill(value);
+            packet[38] = 0xfe;
+            crate::pi::with_pi_dma("raw Transfer Pak write", |pi_dma| {
+                execute_controller_pif(Cycles::ZERO, &mut packet, pi_dma)
+            });
+            assert_eq!(packet[37], accessory_data_crc(&[value; 32]));
+        };
+        let read = |address: u16| {
+            let encoded = address | u16::from(accessory_address_crc(address));
+            let mut packet = [0u8; 64];
+            packet[0] = 3;
+            packet[1] = 33;
+            packet[2] = 0x02;
+            packet[3..5].copy_from_slice(&encoded.to_be_bytes());
+            packet[38] = 0xfe;
+            crate::pi::with_pi_dma("raw Transfer Pak read", |pi_dma| {
+                execute_controller_pif(Cycles::ZERO, &mut packet, pi_dma)
+            });
+            let data: [u8; 32] = packet[5..37].try_into().unwrap();
+            assert_eq!(packet[37], accessory_data_crc(&data));
+            data
+        };
+
+        assert_eq!(read(0x8000), [0; 32]);
+        write(0x8000, 0x84);
+        assert_eq!(read(0x8000), [0x84; 32]);
+        assert_eq!(read(0xb000), [0x84; 32]);
+
+        // Transfer bank zero exposes GB 0x2000 at accessory 0xe000; select
+        // MBC1 ROM bank two, then Transfer bank one exposes GB 0x4000.
+        write(0xe000, 2);
+        write(0xa000, 1);
+        assert_eq!(read(0xc000)[0], 2);
+
+        // Select MBC1 RAM banking mode and RAM bank two, then write GB
+        // 0xa000 through Transfer bank two. The host-visible cartridge RAM
+        // must observe the same byte, proving raw Joybus and persistence use
+        // one backing store.
+        write(0xa000, 0);
+        write(0xc000, 0x0a);
+        write(0xa000, 1);
+        write(0xc000, 2);
+        write(0xe000, 1);
+        write(0xa000, 2);
+        write(0xe000, 0x5a);
+        assert_eq!(read(0xe000), [0x5a; 32]);
+        with_executor(|executor| {
+            assert_eq!(
+                executor
+                    .transfer_pak(0)
+                    .expect("configured Transfer Pak")
+                    .cartridge_ram()
+                    .expect("MBC1 cartridge RAM")[2 * 0x2000],
+                0x5a
+            );
+        });
+    }
+
+    #[test]
+    fn raw_and_high_level_transfer_pak_paths_share_one_mbc3_guest_clock() {
+        fn high_transfer(rdram: &mut [u8], write: bool, address: u16, buffer_offset: u32) {
+            let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram.as_mut_ptr()) };
+            let mut ctx = ctx_zeroed();
+            ctx.r4 = 0x8000_0200;
+            ctx.r5 = u64::from(write);
+            ctx.r6 = u64::from(address);
+            ctx.r7 = u64::from(0x8000_0000 | buffer_offset);
+            ctx.r29 = 0x8000_0080;
+            unsafe { storage.write_u32(RdramAddr::from_offset(0x90), 32) };
+            unsafe { crate::gbpak::osGbpakReadWrite_recomp(rdram.as_mut_ptr(), &mut ctx) };
+            assert_eq!(ctx.r2, 0);
+        }
+
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::StandardControllerTransferPak);
+        let mut gb_rom = vec![0xff; 4 * 0x4000];
+        gb_rom[0x147] = 0x10; // MBC3 + timer + RAM + battery
+        gb_rom[0x149] = 0x03; // 32 KiB RAM
+        insert_transfer_pak_cartridge(0, gb_rom, None).unwrap();
+
+        let raw_write = |address: u16, value: u8, now: Cycles| {
+            let encoded = address | u16::from(accessory_address_crc(address));
+            let mut packet = [0u8; 64];
+            packet[0] = 35;
+            packet[1] = 1;
+            packet[2] = 0x03;
+            packet[3..5].copy_from_slice(&encoded.to_be_bytes());
+            packet[5..37].fill(value);
+            packet[38] = 0xfe;
+            crate::pi::with_pi_dma("raw timed Transfer Pak write", |pi_dma| {
+                execute_controller_pif(now, &mut packet, pi_dma)
+            });
+            assert_eq!(packet[37], accessory_data_crc(&[value; 32]));
+        };
+        let raw_read = |address: u16, now: Cycles| {
+            let encoded = address | u16::from(accessory_address_crc(address));
+            let mut packet = [0u8; 64];
+            packet[0] = 3;
+            packet[1] = 33;
+            packet[2] = 0x02;
+            packet[3..5].copy_from_slice(&encoded.to_be_bytes());
+            packet[38] = 0xfe;
+            crate::pi::with_pi_dma("raw timed Transfer Pak read", |pi_dma| {
+                execute_controller_pif(now, &mut packet, pi_dma)
+            });
+            let data: [u8; 32] = packet[5..37].try_into().unwrap();
+            assert_eq!(packet[37], accessory_data_crc(&data));
+            data
+        };
+
+        // Raw Joybus powers the Pak, enables MBC3 RAM/RTC, halts the timer,
+        // initializes seconds to zero, then resumes it at guest cycle zero.
+        raw_write(0x8000, 0x84, Cycles::ZERO);
+        raw_write(0xa000, 0, Cycles::ZERO);
+        raw_write(0xc000, 0x0a, Cycles::ZERO);
+        raw_write(0xa000, 1, Cycles::ZERO);
+        raw_write(0xc000, 0x0c, Cycles::ZERO);
+        raw_write(0xa000, 2, Cycles::ZERO);
+        raw_write(0xe000, 0x40, Cycles::ZERO);
+        raw_write(0xa000, 1, Cycles::ZERO);
+        raw_write(0xc000, 0x08, Cycles::ZERO);
+        raw_write(0xa000, 2, Cycles::ZERO);
+        raw_write(0xe000, 0, Cycles::ZERO);
+        raw_write(0xa000, 1, Cycles::ZERO);
+        raw_write(0xc000, 0x0c, Cycles::ZERO);
+        raw_write(0xa000, 2, Cycles::ZERO);
+        raw_write(0xe000, 0, Cycles::ZERO);
+
+        let mut rdram = vec![0; 0x800];
+        let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram.as_mut_ptr()) };
+        unsafe {
+            storage.write_u32(RdramAddr::from_offset(0x200), 0x10);
+            storage.write_u32(RdramAddr::from_offset(0x208), 0);
+            for offset in 0..32 {
+                storage.write_u8(RdramAddr::from_offset(0x300 + offset), 0);
+                storage.write_u8(RdramAddr::from_offset(0x340 + offset), 1);
+                storage.write_u8(RdramAddr::from_offset(0x380 + offset), 0x08);
+            }
+        }
+
+        crate::advance_virtual_time(fn64_runtime::CPU_CLOCK_HZ - 1);
+        high_transfer(&mut rdram, true, 0x6000, 0x300);
+        high_transfer(&mut rdram, true, 0x6000, 0x340);
+        high_transfer(&mut rdram, true, 0x4000, 0x380);
+        high_transfer(&mut rdram, false, 0xa000, 0x400);
+        assert_eq!(unsafe { storage.read_u8(RdramAddr::from_offset(0x400)) }, 0);
+
+        crate::advance_virtual_time(fn64_runtime::CPU_CLOCK_HZ);
+        high_transfer(&mut rdram, false, 0xa000, 0x440);
+        assert_eq!(
+            unsafe { storage.read_u8(RdramAddr::from_offset(0x440)) },
+            0,
+            "high-level read must retain the prior RTC latch"
+        );
+        high_transfer(&mut rdram, true, 0x6000, 0x300);
+        high_transfer(&mut rdram, true, 0x6000, 0x340);
+        high_transfer(&mut rdram, false, 0xa000, 0x480);
+        assert_eq!(unsafe { storage.read_u8(RdramAddr::from_offset(0x480)) }, 1);
+        assert_eq!(
+            raw_read(0xe000, Cycles::new(fn64_runtime::CPU_CLOCK_HZ)),
+            [1; 32]
+        );
+    }
+
+    #[test]
+    fn host_battery_forwarding_materializes_before_guest_access() {
+        let mut gb_rom = vec![0xff; 4 * 0x4000];
+        gb_rom[0x147] = 0x10;
+        gb_rom[0x149] = 0x03;
+        let mut source = fn64_runtime::TransferPak::new();
+        source.insert_cartridge(gb_rom.clone(), None).unwrap();
+        let metadata = source
+            .checkpoint_mbc3_battery(
+                Cycles::new(fn64_runtime::CPU_CLOCK_HZ / 2),
+                fn64_runtime::HostUnixNanos::new(1_000_000_000),
+            )
+            .unwrap()
+            .unwrap();
+
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::StandardControllerTransferPak);
+        insert_transfer_pak_cartridge_with_battery(
+            0,
+            gb_rom,
+            None,
+            Some(fn64_runtime::Mbc3BatteryRestore::new(
+                metadata,
+                fn64_runtime::HostUnixNanos::new(2_500_000_000),
+            )),
+        )
+        .unwrap();
+        let checkpoint =
+            checkpoint_transfer_pak_battery(0, fn64_runtime::HostUnixNanos::new(3_000_000_000))
+                .unwrap()
+                .unwrap();
+        assert_eq!(checkpoint.rtc()[0], 2);
+        assert_eq!(checkpoint.subsecond_cycles(), 0);
+    }
+
+    #[test]
+    fn transfer_pak_removal_changes_status_and_data_access_traps_by_name() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::StandardControllerTransferPak);
+        let mut gb_rom = vec![0xff; 2 * 0x4000];
+        gb_rom[0x147] = 0x00;
+        gb_rom[0x149] = 0;
+        insert_transfer_pak_cartridge(0, gb_rom, None).unwrap();
+        with_executor(|executor| {
+            let pak = executor.transfer_pak_mut(0).unwrap();
+            pak.write_block(0x8000, &[0x84; 32]);
+            assert!(pak.remove_cartridge().is_some());
+            let mut status = [0xff; 32];
+            pak.read_block(0xb000, &mut status);
+            assert_eq!(status, [0xc0; 32]);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pak.read_block(0xc000, &mut status)
+            }))
+            .expect_err("powered Transfer Pak without a cartridge must not fabricate data");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .expect("panic must carry Transfer Pak context");
+            assert!(message.contains("no Game Boy cartridge"), "{message}");
+        });
+    }
+
+    #[test]
+    fn malformed_raw_accessory_address_crc_traps_with_address_context() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(0, fn64_runtime::PortState::StandardControllerRumblePak);
+        let mut packet = [0u8; 64];
+        packet[0] = 3;
+        packet[1] = 33;
+        packet[2] = 0x02;
+        packet[3..5].copy_from_slice(&0xC000u16.to_be_bytes());
+        packet[38] = 0xFE;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::pi::with_pi_dma("malformed raw accessory test", |pi_dma| {
+                execute_controller_pif(Cycles::ZERO, &mut packet, pi_dma)
+            });
+        }))
+        .expect_err("wrong accessory address CRC must trap");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("panic must carry protocol context");
+        assert!(message.contains("command 0x02 on channel 0"), "{message}");
+        assert!(message.contains("for 0xc000; expected 0x1b"), "{message}");
     }
 
     /// osContInit: (1) OSContStatus entries must be written SWIZZLED (^3) like
@@ -707,5 +2652,79 @@ mod tests {
             "flat bitfield addr untouched (no flat store)"
         );
         assert_eq!(rdram[0x81], 0xEE, "adjacent byte untouched (no +1 store)");
+    }
+
+    #[test]
+    fn motor_init_start_and_stop_share_the_configured_accessory_state() {
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        set_controller_port_state(0, fn64_runtime::PortState::StandardControllerRumblePak);
+
+        let mut rdram = vec![0u8; 0x100];
+        let pfs_vram = 0x8000_0040u64;
+        let queue_vram = 0x8000_0080u64;
+        let mut init = ctx_with(queue_vram, pfs_vram, 0);
+        unsafe { osMotorInit_recomp(rdram.as_mut_ptr(), &mut init) };
+        assert_eq!(init.r2, 0);
+        assert_eq!(u32::from_ne_bytes(rdram[0x40..0x44].try_into().unwrap()), 8);
+        assert_eq!(
+            u32::from_ne_bytes(rdram[0x44..0x48].try_into().unwrap()),
+            queue_vram as u32
+        );
+        assert_eq!(u32::from_ne_bytes(rdram[0x48..0x4c].try_into().unwrap()), 0);
+        assert_eq!(
+            with_executor(|exec| exec.pif().query_response(0)),
+            [0x05, 0x00, fn64_runtime::CONT_CARD_ON]
+        );
+
+        let mut access = ctx_zeroed();
+        access.r4 = pfs_vram;
+        unsafe { osMotorStart_recomp(rdram.as_mut_ptr(), &mut access) };
+        assert_eq!(access.r2, 0);
+        assert!(rumble_active(0));
+
+        unsafe { osMotorStop_recomp(rdram.as_mut_ptr(), &mut access) };
+        assert_eq!(access.r2, 0);
+        assert!(!rumble_active(0));
+    }
+
+    #[test]
+    fn motor_init_returns_documented_no_pak_and_wrong_device_errors() {
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        let mut rdram = vec![0u8; 0x100];
+        let mut ctx = ctx_with(0x8000_0080, 0x8000_0040, 0);
+
+        unsafe { osMotorInit_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(ctx.r2, PFS_ERR_NOPACK as u64);
+
+        set_controller_port_state(0, fn64_runtime::PortState::StandardControllerControllerPak);
+        unsafe { osMotorInit_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(ctx.r2, PFS_ERR_DEVICE as u64);
+    }
+
+    #[test]
+    fn controller_dma_completion_raises_the_shared_mi_si_source() {
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        crate::pi::set_mi_interrupt_mask(fn64_runtime::InterruptSource::Si.bit());
+        let queue = RdramAddr::from_offset(0x40);
+        with_executor(|exec| exec.create_mesg_queue(queue, 1));
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = queue.to_kseg0() as u64;
+        unsafe { osContStartQuery_recomp(std::ptr::null_mut(), &mut ctx) };
+
+        let before = crate::pi::read_live_device_mmio(0xFFFF_FFFF_A430_0008).unwrap();
+        assert_eq!(before & fn64_runtime::InterruptSource::Si.bit(), 0);
+        assert_eq!(
+            with_executor(|exec| exec.recv_mesg(99, queue, false)),
+            fn64_runtime::RecvMesgOutcome::WouldBlock
+        );
+        crate::advance_virtual_time(1);
+
+        let pending = crate::pi::read_live_device_mmio(0xFFFF_FFFF_A430_0008).unwrap();
+        assert_ne!(pending & fn64_runtime::InterruptSource::Si.bit(), 0);
+        assert!(crate::pi::cpu_interrupt_pending());
+        assert_eq!(
+            with_executor(|exec| exec.recv_mesg(99, queue, false)),
+            fn64_runtime::RecvMesgOutcome::Delivered(0)
+        );
     }
 }

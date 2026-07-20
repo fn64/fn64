@@ -101,6 +101,16 @@ pub enum ExecutorAction {
         source_bank: crate::execution::BankId,
         target_pc: GuestPc,
     },
+    /// A computed call whose target still needs the active mapping/host ABI
+    /// resolver. The already-executed link destination remains bank-qualified.
+    ResolveCall {
+        source_bank: crate::execution::BankId,
+        target_pc: GuestPc,
+        resume: ExecutionKey,
+    },
+    /// The guest entry returned through its explicit thread-return sentinel.
+    /// This is a clean retirement, distinct from a CPU fault or unmapped PC.
+    ThreadReturn,
     /// A typed guest CPU fault surfaced through the fallback lane
     /// ([`BlockExit::Fault`]): an unmapped/data-hole/unaligned PC, an unknown
     /// bank, a memory fault, or an interpreter coverage-boundary opcode. This is
@@ -133,6 +143,16 @@ impl ExecutorAction {
                 source_bank,
                 target_pc,
             },
+            BlockExit::ResolveCall {
+                source_bank,
+                target_pc,
+                resume,
+            } => ExecutorAction::ResolveCall {
+                source_bank,
+                target_pc,
+                resume,
+            },
+            BlockExit::ThreadReturn => ExecutorAction::ThreadReturn,
             BlockExit::Fault(fault) => ExecutorAction::Fault(fault),
         }
     }
@@ -199,6 +219,22 @@ mod tests {
                 target_pc: GuestPc::new(0x8000_3000),
             }
         );
+        assert_eq!(
+            ExecutorAction::for_boundary(BlockExit::ResolveCall {
+                source_bank: BANK,
+                target_pc: GuestPc::new(0x8000_4000),
+                resume: KEY,
+            }),
+            ExecutorAction::ResolveCall {
+                source_bank: BANK,
+                target_pc: GuestPc::new(0x8000_4000),
+                resume: KEY,
+            }
+        );
+        assert_eq!(
+            ExecutorAction::for_boundary(BlockExit::ThreadReturn),
+            ExecutorAction::ThreadReturn
+        );
         let fault = CpuFault {
             at: KEY,
             kind: CpuFaultKind::UnmappedPc {
@@ -221,5 +257,6 @@ mod tests {
         .is_terminal_fault());
         assert!(!ExecutorAction::Continue { resume: KEY }.is_terminal_fault());
         assert!(!ExecutorAction::Yield { resume: KEY }.is_terminal_fault());
+        assert!(!ExecutorAction::ThreadReturn.is_terminal_fault());
     }
 }

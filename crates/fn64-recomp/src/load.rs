@@ -321,6 +321,9 @@ fn resolve_relative(base: &Path, path: &str) -> PathBuf {
 mod tests {
     use super::*;
     use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TMPDIR: AtomicU64 = AtomicU64::new(0);
 
     /// The `OOT_*` spellings of these knobs are gone; an unset var means "off",
     /// so a silent rename would let a stale `OOT_CONFIG=…` skip this test
@@ -341,15 +344,19 @@ mod tests {
     }
 
     fn tmpdir() -> PathBuf {
+        // Parallel tests can observe the same coarse SystemTime tick: one test
+        // then removes the shared directory while another is still writing its
+        // config. The process-local sequence makes ownership unambiguous.
+        let sequence = NEXT_TMPDIR.fetch_add(1, Ordering::Relaxed);
         let d = std::env::temp_dir().join(format!(
-            "fn64-load-test-{}-{:?}",
+            "fn64-load-test-{}-{:?}-{sequence}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&d).unwrap();
+        std::fs::create_dir(&d).unwrap();
         d
     }
 

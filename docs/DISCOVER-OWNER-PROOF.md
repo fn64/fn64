@@ -111,3 +111,11 @@ emitter. No bounding-range conversion is permitted: holes have no instruction
 arm, and transfers into them remain unresolved. The synthetic gate compiles
 and executes hole cases; the real NWXE gate additionally requires its
 197-block / 1,039-word emitted runner to compile.
+
+`block_pack::emit_block_program_source` is the typed executable boundary over
+that serialization format. It re-materializes and validates the pack before
+emission, requires a bank-qualified entry and instruction budget, binds every
+generated runner to the compiling host's artifact identity, and preserves
+bank ambiguity as a typed fault. The companion `fn64-discover
+emit-block-program` command requires an explicit no-clobber output path because
+its generated Rust contains user-owned ROM-derived instruction words.

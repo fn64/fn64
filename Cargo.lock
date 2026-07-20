@@ -705,6 +705,7 @@ dependencies = [
  "fn64-render",
  "fn64-render-rt64",
  "fn64-runtime",
+ "sha2",
 ]
 
 [[package]]
@@ -712,6 +713,7 @@ name = "fn64-audio"
 version = "0.0.0"
 dependencies = [
  "cpal",
+ "fn64-runtime",
 ]
 
 [[package]]
@@ -719,7 +721,11 @@ name = "fn64-boot-harness"
 version = "0.0.0"
 dependencies = [
  "fn64-abi",
+ "fn64-recomp-rs",
  "fn64-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -754,20 +760,30 @@ version = "0.0.0"
 dependencies = [
  "fn64-recomp",
  "serde",
+ "sha2",
  "toml",
 ]
 
 [[package]]
 name = "fn64-render"
 version = "0.0.0"
+dependencies = [
+ "fn64-runtime",
+ "sha2",
+]
 
 [[package]]
 name = "fn64-render-rt64"
 version = "0.0.0"
 dependencies = [
+ "cc",
+ "fn64-abi",
+ "fn64-boot-harness",
  "fn64-render",
  "fn64-runtime",
  "insta",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -776,6 +792,7 @@ version = "0.0.0"
 dependencies = [
  "corosensei",
  "fn64-recomp-rs",
+ "sha2",
 ]
 
 [[package]]

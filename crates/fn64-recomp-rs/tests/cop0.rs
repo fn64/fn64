@@ -25,11 +25,9 @@
 //! spanning zero, small, sign-bit-set, and max. This is the strong check, not
 //! a bbox/fuzzy one.
 //!
-//! Cop0 is almost entirely libultra-managed on a recompiled title, so the rest
-//! of the family (Status/Cause/EPC moves, TLB ops, ERET, COP2, SYSCALL/BREAK)
-//! is emitted as a **loud trap** — never a silent nop. Those are validated by
-//! (a) decoder unit tests (known word -> right op) and (b) structural emit
-//! tests asserting the emitted text traps / no-ops as designed.
+//! The arbitrary-PC lane models Status/Cause/EPC moves, ERET, and typed
+//! synchronous exceptions. TLB and unavailable coprocessor state remain loud.
+//! Decoder and structural emitter tests keep that boundary explicit.
 
 use fn64_recomp_rs::{decode, emit_function, FuncInput, Instruction, Rdram, RecompContext};
 
@@ -60,6 +58,10 @@ fn os_get_count_oracle(count: u32) -> u64 {
 // emitter's text, not this fn's attributes.
 #[allow(unused_variables, unused_labels, clippy::all)]
 pub fn os_get_count(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(
+        0x80004D50,
+        "os_get_count",
+    ));
     let mut pc: u32 = 0x80004D50;
     'run: loop {
         match pc {
@@ -152,7 +154,7 @@ fn mtc0_compare_round_trips() {
     };
     let emitted = emit_function(&input);
     assert!(
-        emitted.contains("ctx.cop0_compare = ctx.r_u32(4);"),
+        emitted.contains("ctx.write_cop0(11, ctx.r_u32(4));"),
         "mtc0 $a0,$11 should write cop0_compare from $a0; emitted:\n{emitted}"
     );
 
@@ -160,6 +162,23 @@ fn mtc0_compare_round_trips() {
     // value. We assert the decode + emit intent here; execution parity is
     // covered by the osGetCount differential above (same set_r32/context path).
     assert_eq!(decode(0x40845800), Instruction::Mtc0 { rt: 4, cop0d: 11 });
+}
+
+#[test]
+fn mtc0_status_and_cause_use_the_typed_interrupt_state() {
+    let status = emit_function(&FuncInput {
+        name: "set_status",
+        vram: 0x8000_1000,
+        words: &[0x4084_6000, 0x03E0_0008, 0],
+    });
+    assert!(status.contains("ctx.write_cop0(12, ctx.r_u32(4));"));
+
+    let cause = emit_function(&FuncInput {
+        name: "set_cause",
+        vram: 0x8000_1000,
+        words: &[0x4084_6800, 0x03E0_0008, 0],
+    });
+    assert!(cause.contains("ctx.write_cop0(13, ctx.r_u32(4));"));
 }
 
 // --- Decoder unit tests (known word -> right op), fail-against-bug. ---
@@ -262,7 +281,9 @@ fn cop0_family_has_no_delay_slot() {
 // --- Structural emit tests: privileged ops trap, cache/sync are no-ops. ---
 
 /// Emit each privileged/unused op inside a tiny function and assert the
-/// generated Rust is a loud `panic!` trap — NEVER a silent nop.
+/// generated Rust is a loud trap — NEVER a silent nop. Unsupported runtime
+/// gaps use the host-observed trap endpoint; architectural guest traps retain
+/// their direct panic.
 #[test]
 fn privileged_ops_emit_loud_traps() {
     struct Case {
@@ -270,14 +291,6 @@ fn privileged_ops_emit_loud_traps() {
         needle: &'static str,
     }
     let cases = [
-        Case {
-            word: 0x40086000,
-            needle: "unsupported mfc0 from COP0 register 12",
-        }, // mfc0 Status
-        Case {
-            word: 0x40886000,
-            needle: "unsupported mtc0 to COP0 register 12",
-        }, // mtc0 Status
         Case {
             word: 0x40224800,
             needle: "unsupported dmfc0",
@@ -290,10 +303,7 @@ fn privileged_ops_emit_loud_traps() {
             word: 0x42000018,
             needle: "eret executed in recompiled code",
         }, // eret
-        Case {
-            word: 0x42000002,
-            needle: "tlbwi",
-        }, // tlbwi
+        // tlbwi
         Case {
             word: 0x42000006,
             needle: "tlbwr",
@@ -341,7 +351,7 @@ fn privileged_ops_emit_loud_traps() {
         };
         let emitted = emit_function(&input);
         assert!(
-            emitted.contains("panic!"),
+            emitted.contains("panic!") || emitted.contains("trap_unsupported"),
             "op {:#010X} must emit a loud trap, got:\n{emitted}",
             c.word
         );
@@ -394,14 +404,14 @@ fn cache_and_sync_emit_noops() {
     );
 }
 
-/// A `mfc0` from an unsupported (libultra-managed) register decodes fine but
+/// A `mfc0` from an unsupported register decodes fine but
 /// its emitted body traps at runtime. Prove the emitted panic message names the
 /// register, so a game hitting it fails audibly with a diagnosable cause.
 #[test]
 fn unsupported_cop0_read_names_the_register() {
-    // mfc0 $t0, $13 (Cause) : rt=8, rd=13 -> 0x40086800
-    assert_eq!(decode(0x40086800), Instruction::Mfc0 { rt: 8, cop0d: 13 });
-    let words = [0x40086800u32, 0x03E00008, 0x00000000];
+    // mfc0 $t0, $7 : rt=8, rd=7 -> 0x40083800
+    assert_eq!(decode(0x40083800), Instruction::Mfc0 { rt: 8, cop0d: 7 });
+    let words = [0x40083800u32, 0x03E00008, 0x00000000];
     let input = FuncInput {
         name: "t",
         vram: 0x80001000,
@@ -409,7 +419,46 @@ fn unsupported_cop0_read_names_the_register() {
     };
     let emitted = emit_function(&input);
     assert!(
-        emitted.contains("unsupported mfc0 from COP0 register 13"),
-        "Cause read should name register 13:\n{emitted}"
+        emitted.contains("unsupported mfc0 from COP0 register 7"),
+        "unsupported read should name register 7:\n{emitted}"
+    );
+}
+
+#[test]
+fn modeled_exception_register_reads_emit_typed_accesses() {
+    for (word, reg) in [
+        (0x4008_4000, 8u8),
+        (0x4008_6000, 12),
+        (0x4008_6800, 13),
+        (0x4008_7000, 14),
+        (0x4008_F000, 30),
+    ] {
+        let emitted = emit_function(&FuncInput {
+            name: "t",
+            vram: 0x8000_1000,
+            words: &[word, 0x03E0_0008, 0],
+        });
+        assert!(
+            emitted.contains(&format!("ctx.read_cop0({reg})")),
+            "COP0 register {reg} should use typed state:\n{emitted}"
+        );
+        assert!(!emitted.contains("panic!"));
+    }
+}
+
+#[test]
+fn tlbwi_records_the_staged_entry_instead_of_trapping() {
+    // tlbwi ; jr $ra ; nop -- boot-time TLB setup must run, not trap;
+    // translation through recorded entries stays unmodeled (use faults).
+    let words = [0x42000002, 0x03E00008, 0x00000000];
+    let input = FuncInput {
+        name: "t",
+        vram: 0x80001000,
+        words: &words,
+    };
+    let emitted = emit_function(&input);
+    assert!(
+        emitted.contains("ctx.tlbwi_record();"),
+        "tlbwi must record the staged entry; emitted:\n{emitted}"
     );
 }

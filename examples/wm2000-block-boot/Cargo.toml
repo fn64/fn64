@@ -1,0 +1,22 @@
+# Standalone workspace (like ../wm2000-boot): requires an out-of-tree,
+# game-derived build input (ROM env var) the main fn64 workspace must never
+# depend on. Zero game content ships in this crate; the discovered pack and
+# emitted runner live only under target/.
+[package]
+name = "wm2000-block-boot"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+fn64-abi = { path = "../../crates/fn64-abi", features = ["recomp-rs"] }
+fn64-recomp-rs = { path = "../../crates/fn64-recomp-rs" }
+fn64-boot-harness = { path = "../../crates/fn64-boot-harness" }
+
+[build-dependencies]
+fn64-discover = { path = "../../crates/fn64-discover" }
+
+[profile.release]
+debug = true

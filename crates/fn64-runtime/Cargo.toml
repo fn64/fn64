@@ -13,13 +13,10 @@ description = "fn64 core: scheduler, OSMesgQueue, timers, PI/SI/VI/AI plumbing, 
 # real machine stack switched to/from cooperatively on one host thread, which
 # is exactly the property that makes rung-18-class races unrepresentable.
 corosensei = "0.3"
+sha2 = "0.10"
 
 [dev-dependencies]
 # Test-only: the executor-drives-the-fallback-lane integration proof lives in
-# tests/executor_fallback.rs. This is a DEV dependency, so the strictly-one-way
-# production dependency direction (docs/DESIGN.md §1: fn64-runtime depends on
-# nothing else in the workspace) is unchanged -- fn64-recomp-rs's execution/
-# fallback types are only linked into fn64-runtime's test binaries, never its
-# library. No cycle exists: fn64-recomp-rs depends on fn64-recomp, never on
-# fn64-runtime.
+# tests/executor_fallback.rs. Production dependency direction remains one-way;
+# the recompiler lane is linked only into fn64-runtime test binaries.
 fn64-recomp-rs = { path = "../fn64-recomp-rs" }

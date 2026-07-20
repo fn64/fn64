@@ -6,7 +6,7 @@ shouldn't require a lawyer.**
 `fn64` runs the C emitted by an N64 static recompiler ([our fork of
 N64Recomp](https://github.com/fn64/n64recomp), MIT) as a native desktop app.
 It's the layer under the game: scheduler, message queues, timers, DMA and
-overlay lifecycle, save/input/audio, RSP task dispatch. That layer exists
+overlay lifecycle, save/input/audio, persistent RSP memory/DMA and task dispatch. That layer exists
 elsewhere — GPL-3.0, C++, and carrying race conditions we've personally
 excavated. So we're building the one we actually want.
 
@@ -64,6 +64,14 @@ the test suite; it does not grade on a curve. What is NOT done is tracked
 honestly in `docs/ROADMAP.md` — audio is still broken (R5) and the outdoor
 gameplay eye-gate is unmet (R3b).
 
+The renderer target includes RT64's modern host features, not only stock N64
+pixels. `docs/RT64-PUBLIC-FEATURE-INVENTORY.md` is the machine-generated
+denominator: runtime settings, build capabilities, and the small subset that
+requires game/Extended-GBI cooperation are tracked separately so base-renderer
+evidence cannot silently close an enhancement claim. The exact host-control
+families and their live/recreate/game-cooperation boundaries are recorded in
+`docs/RT64-RUNTIME-CONTROLS.md`.
+
 ### Discovery corpus
 
 Function-boundary discovery is graded against decomp answer keys under a strict
@@ -105,10 +113,12 @@ tribal:
   runs. Concurrency fix: 20+. One green run proves nothing and we treat it
   that way.
 - **Differential testing.** Behavior changes get diffed against something that
-  actually runs: `scripts/lane-parity.sh` A/Bs our two recompiler lanes over
-  identical ROM by per-swap framebuffer SHA, `c_smoke` link-tests the ABI with
-  a real C caller, and the recompiler has a per-instruction oracle suite. Each
-  has a documented blind spot, named where it's used — a differential you can't
+  actually runs. `scripts/lane-parity.sh` first audits whether the two generated
+  callable-body sets are aligned; it currently rejects the legacy C lane as a
+  semantic arbiter, while `--observe` retains a labeled, non-authoritative
+  per-swap framebuffer comparison. `c_smoke` link-tests the ABI with a real C
+  caller, and the recompiler has per-instruction oracle suites. Each has a
+  documented blind spot in `docs/PARITY-METHOD.md` — a differential you can't
   run isn't evidence.
 - **Types carry the invariants.** One-runnable-game-thread, queue ownership,
   rdram addressing — modeled so misuse fails to compile where possible, and

@@ -2,6 +2,7 @@
 // Emitted by fn64-recomp-rs (typed Rust, no unsafe).
 #[allow(unused_variables)]
 pub fn bg_breakwall_lava_cover_move(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(0x80901694, "bg_breakwall_lava_cover_move"));
     let mut pc: u32 = 0x80901694;
     'run: loop { match pc {
         0x80901694 => {

@@ -5,10 +5,9 @@
 //! dumb" framing: this test is the mechanical check that the ABI-SURFACE.md
 //! shape is honored, independent of any behavior.
 //!
-//! Deliberately shells out to the system `cc` rather than adding a build-time
-//! dependency (the `cc` crate) -- there is exactly one C file, compiled
-//! once, at test time; a build.rs would run this on every `cargo build` of
-//! this crate for no benefit, since only this test needs it.
+//! Deliberately shells out to the system C/C++ compilers rather than adding a
+//! build-time dependency: one plain-C ABI caller and one generated-C-shaped
+//! C++ MMIO-proxy caller compile only when this integration test runs.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,6 +17,16 @@ use std::process::Command;
 /// `.a` is guaranteed present in the same profile's `deps` output dir by
 /// the time this test executes).
 fn find_staticlib() -> PathBuf {
+    // A prior staticlib can exist while `cargo test` has rebuilt only the
+    // test/rlib targets. Refresh it unconditionally so new exported ABI hooks
+    // cannot be hidden by a stale archive that merely has the expected name.
+    let status =
+        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args(["build", "-p", "fn64-abi"])
+            .status()
+            .expect("spawn cargo build -p fn64-abi for the staticlib");
+    assert!(status.success(), "cargo build -p fn64-abi failed");
+
     // CARGO_TARGET_TMPDIR isn't quite what we want here; derive the
     // profile dir from the test binary's own path, which cargo places at
     // <target>/<profile>/deps/<test-binary>.
@@ -25,22 +34,6 @@ fn find_staticlib() -> PathBuf {
     let deps_dir = exe.parent().expect("deps dir");
     let profile_dir = deps_dir.parent().expect("profile dir");
 
-    for dir in [deps_dir, profile_dir] {
-        let candidate = dir.join("libfn64_abi.a");
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    // `cargo test` builds the staticlib crate-type as a side effect, but
-    // `cargo nextest` builds only the test binaries -- so under nextest the
-    // staticlib may not exist yet. Build it explicitly (idempotent, cached)
-    // so the test is runner-agnostic instead of assuming cargo test's layout.
-    let status =
-        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-            .args(["build", "-p", "fn64-abi"])
-            .status()
-            .expect("spawn cargo build -p fn64-abi for the staticlib");
-    assert!(status.success(), "cargo build -p fn64-abi failed");
     for dir in [deps_dir, profile_dir] {
         let candidate = dir.join("libfn64_abi.a");
         if candidate.exists() {
@@ -111,4 +104,110 @@ fn c_caller_links_and_runs_against_fn64_abi_staticlib() {
         stdout.contains("fn64-abi C smoke test: linked and returned OK"),
         "unexpected smoke test output: {stdout}"
     );
+
+    let proxy_cpp = manifest_dir.join("tests/c_smoke/mmio_proxy.cpp");
+    let bridge_include = manifest_dir.join("../fn64-boot-harness/bridge/include");
+    let vendor_include = bridge_include.join("vendor");
+    let proxy_bin = out_dir.join("fn64_abi_mmio_proxy_smoke");
+    let mut cxx = Command::new(std::env::var("CXX").unwrap_or_else(|_| "c++".into()));
+    cxx.arg("-std=c++17")
+        .arg(&proxy_cpp)
+        .arg(&staticlib)
+        .arg("-I")
+        .arg(&bridge_include)
+        .arg("-I")
+        .arg(&vendor_include)
+        .arg("-o")
+        .arg(&proxy_bin);
+    if cfg!(target_os = "macos") {
+        cxx.args([
+            "-framework",
+            "CoreAudio",
+            "-framework",
+            "AudioToolbox",
+            "-framework",
+            "CoreFoundation",
+            "-framework",
+            "Foundation",
+            "-lobjc",
+        ]);
+    }
+    let proxy_compile = cxx
+        .output()
+        .expect("failed to invoke C++ compiler for generated-C MMIO proxy smoke");
+    assert!(
+        proxy_compile.status.success(),
+        "C++ compiler failed for MMIO proxy smoke:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&proxy_compile.stdout),
+        String::from_utf8_lossy(&proxy_compile.stderr)
+    );
+    let proxy_run = Command::new(&proxy_bin)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to execute {:?}: {error}", proxy_bin));
+    assert!(
+        proxy_run.status.success(),
+        "MMIO proxy smoke exited non-zero:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&proxy_run.stdout),
+        String::from_utf8_lossy(&proxy_run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&proxy_run.stdout)
+            .contains("fn64 generated-C MMIO proxy: live DeviceFabric round-trip OK"),
+        "unexpected MMIO proxy output: {}",
+        String::from_utf8_lossy(&proxy_run.stdout)
+    );
+    let bad_width = Command::new(&proxy_bin)
+        .arg("--bad-width")
+        .output()
+        .unwrap_or_else(|error| panic!("failed to execute {:?}: {error}", proxy_bin));
+    assert!(
+        !bad_width.status.success(),
+        "generated-C subword MMIO must trap loudly rather than bypass DeviceFabric"
+    );
+    for argument in [
+        "--bad-kuseg",
+        "--bad-kseg2",
+        "--bad-pif-kuseg",
+        "--bad-pif-kseg2",
+    ] {
+        let bad_address = Command::new(&proxy_bin)
+            .arg(argument)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("failed to execute {:?} {argument}: {error}", proxy_bin)
+            });
+        assert!(
+            !bad_address.status.success(),
+            "generated-C {argument} access must trap before dereferencing host storage"
+        );
+        assert!(
+            String::from_utf8_lossy(&bad_address.stderr)
+                .contains("only zero- or sign-extended KSEG0/KSEG1 are modeled"),
+            "generated-C {argument} trap lost its named address diagnostic: {}",
+            String::from_utf8_lossy(&bad_address.stderr)
+        );
+    }
+    for argument in [
+        "--bad-dword-read",
+        "--bad-dword-write",
+        "--bad-swl",
+        "--bad-swr",
+    ] {
+        let bad_width = Command::new(&proxy_bin)
+            .arg(argument)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("failed to execute {:?} {argument}: {error}", proxy_bin)
+            });
+        assert!(
+            !bad_width.status.success(),
+            "generated-C {argument} must trap before decomposing into word MMIO"
+        );
+        assert!(
+            String::from_utf8_lossy(&bad_width.stderr)
+                .contains("RCP registers require modeled word semantics"),
+            "generated-C {argument} trap lost its named width diagnostic: {}",
+            String::from_utf8_lossy(&bad_width.stderr)
+        );
+    }
 }

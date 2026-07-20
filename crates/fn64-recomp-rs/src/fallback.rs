@@ -43,7 +43,7 @@
 use std::collections::BTreeMap;
 
 use crate::execution::{
-    BlockExit, BlockRun, BlockRunner, CodeBank, ExecutionKey, GeneratedBankFn, GeneratedBankRunner,
+    BlockExit, BlockProgram, BlockRun, BlockRunner, CodeBank, ExecutionKey, GeneratedBankRunner,
     InstructionBudget, ProgramError,
 };
 use crate::interp::{run_bank_with_mmio, MmioPort, NoMmio};
@@ -71,7 +71,9 @@ pub enum EvidenceClass {
 
 /// One installed execution lane for a bank.
 enum Lane {
-    Aot(GeneratedBankFn),
+    /// Keep the evolved runner wrapper inside the primary AOT ownership
+    /// mechanism so its artifact identity is not discarded as a bare callable.
+    Aot(BlockProgram),
     DynamicMips,
 }
 
@@ -122,10 +124,14 @@ impl FallbackProgram {
         if self.contains(bank) {
             return Err(ProgramError::DuplicateBank { bank });
         }
+        let mut program = BlockProgram::new();
+        program
+            .register(code.clone(), runner)
+            .expect("runner identity and duplicate admission were checked before registration");
         self.code
             .register(code)
             .expect("duplicate program bank was checked before catalog registration");
-        self.lanes.insert(bank, Lane::Aot(runner.into_fn()));
+        self.lanes.insert(bank, Lane::Aot(program));
         Ok(())
     }
 
@@ -213,7 +219,7 @@ impl FallbackProgram {
             )
         });
         match lane {
-            Lane::Aot(run) => run(entry, budget, ctx, mem),
+            Lane::Aot(program) => program.run(entry, budget, ctx, mem),
             Lane::DynamicMips => {
                 match run_bank_with_mmio(&self.code, entry.bank, entry, budget, ctx, mem, port) {
                     Ok(run) => run,

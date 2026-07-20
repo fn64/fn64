@@ -35,6 +35,9 @@
 use std::env;
 use std::path::PathBuf;
 
+#[path = "../../crates/fn64-boot-harness/build_support.rs"]
+mod build_support;
+
 fn required_env(name: &str, hint: &str) -> PathBuf {
     match env::var(name) {
         Ok(v) => PathBuf::from(v),
@@ -94,6 +97,7 @@ fn main() {
 
     let mut build = cc::Build::new();
     build
+        .cpp(true)
         // The shared bridge include comes FIRST: it holds fn64's clean-room
         // stand-in librecomp/sections.h, which must shadow any real
         // (GPL-3.0-licensed) librecomp/include on the search path -- see
@@ -101,34 +105,29 @@ fn main() {
         .include(bridge_dir.join("include"))
         .include(&recompiled_dir)
         .include(&recomp_h_dir)
+        .flag("-include")
+        .flag("fn64_mmio_proxy.h")
+        .flag_if_supported("-std=c++17")
         .flag_if_supported("-Wno-everything")
+        // Generated code carries aki-recomp's NAN_CHECK debug asserts;
+        // real hardware propagates NaN silently (0.0/0.0 in genuinely
+        // uninitialized-BSS math is normal mid-boot). NDEBUG disables the
+        // asserts, matching a release build of the same sources.
+        .define("NDEBUG", None)
         // RecompiledFuncs/*.c is generated code with no warning hygiene of
         // its own (matches aki-recomp's own CMakeLists.txt build recipe for
         // this same source, per M1-WORKLIST.md's method section).
         .warnings(false);
 
-    let mut c_file_count = 0usize;
-    for entry in std::fs::read_dir(&recompiled_dir).unwrap_or_else(|e| {
-        panic!(
-            "wm2000-boot build.rs: failed to read RECOMPILED_DIR={}: {e}",
-            recompiled_dir.display()
-        )
-    }) {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("c") {
-            build.file(&path);
-            c_file_count += 1;
-        }
-    }
-    assert!(
-        c_file_count > 0,
-        "wm2000-boot build.rs: found zero .c files in RECOMPILED_DIR={} -- expected N64Recomp's \
-         generated RecompiledFuncs/*.c output.",
-        recompiled_dir.display()
-    );
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("Cargo must provide OUT_DIR"));
+    let (cxx_sources, jump_snapshot_count, prototype_count) =
+        build_support::prepare_recompiled_cxx_sources(&recompiled_dir, &out_dir);
+    let c_file_count = cxx_sources.len();
+    build.files(cxx_sources);
     println!(
-        "cargo:warning=wm2000-boot: compiling {c_file_count} RecompiledFuncs/*.c files from {}",
+        "cargo:warning=wm2000-boot: compiling {c_file_count} RecompiledFuncs/*.c files from {} \
+         ({jump_snapshot_count} C jump snapshots normalized and {prototype_count} missing C \
+         prototypes supplied for C++)",
         recompiled_dir.display()
     );
 
@@ -138,8 +137,8 @@ fn main() {
     // recomp_overlays.inl's SectionTableEntry initializers use `nullptr`
     // (the file was generated for a C++ port build, per N64Recomp's own
     // codegen target), which is not valid in C. RecompiledFuncs/*.c itself
-    // compiles fine as plain C (per M1-WORKLIST.md's own method), so only
-    // this one glue file needs the C++ compiler.
+    // also uses C++ now so fn64_mmio_proxy.h can preserve MEM_W lvalue syntax
+    // while intercepting raw RCP register words.
     let mut bridge_build = cc::Build::new();
     bridge_build
         .cpp(true)
@@ -154,6 +153,10 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         bridge_dir.join("section_bridge.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        bridge_dir.join("include/fn64_mmio_proxy.h").display()
     );
     println!("cargo:rerun-if-changed={}", recompiled_dir.display());
 }

@@ -17,9 +17,10 @@
 //! - A GPR is a 64-bit value (`gpr = uint64_t` in the C). 32-bit results are
 //!   sign-extended into it (that is what `S32`/`ADD32` do). We store GPRs as
 //!   `u64` and expose typed read/write helpers.
-//! - A KSEG0/KSEG1 virtual address `v` maps to rdram byte offset
-//!   `v - 0xFFFF_FFFF_8000_0000` (i.e. strip the sign-extended `0x8000_0000`
-//!   base). This is the `- 0xFFFFFFFF80000000` in the C macros.
+//! - Zero- or sign-extended KSEG0/KSEG1 addresses in the physical RDRAM
+//!   window map through their shared low-29-bit physical offset. Unsupported
+//!   mapped addresses retain the generated C lane's sparse/failing behavior;
+//!   this runtime does not silently invent TLB translation.
 //! - Word accesses use the host-native representation used by the ABI buffer;
 //!   sub-word accesses XOR the byte offset: halfword `^2`, byte `^3`. This is
 //!   the N64's big-endian view over a little-endian host buffer. It is applied
@@ -32,6 +33,16 @@
 /// keeps; the typed accessors ([`RecompContext::r`], [`RecompContext::set_r32`],
 /// …) enforce the sign/zero-extension contract so emitted code never open-codes
 /// a cast.
+/// One raw TLB entry as staged by the COP0 registers at `tlbwi` time.
+/// Bookkeeping only -- no translation is performed through these.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TlbEntryRaw {
+    pub page_mask: u32,
+    pub entry_hi: u32,
+    pub entry_lo0: u32,
+    pub entry_lo1: u32,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RecompContext {
     /// r[0] is `$zero`; kept in the array for uniform indexing but never
@@ -73,6 +84,11 @@ pub struct RecompContext {
     /// `MTC0 rt, $11` on the `osSetTimer` path. Stored so the write round-trips;
     /// the interrupt it would schedule is the host's concern.
     pub cop0_compare: u32,
+    /// Writes are handed to the live CPU clock authority at the next block
+    /// boundary. Options retain same-value writes, which are observable for
+    /// Compare because every write acknowledges IP7.
+    cop0_count_write: Option<u32>,
+    cop0_compare_write: Option<u32>,
     /// COP0 condition bit used by BC0*. On VR4300 this reflects Status.CH.
     /// CACHE tag operations are host-modeled, so callers that exercise BC0
     /// explicitly supply the observed condition through this field.
@@ -86,12 +102,78 @@ pub struct RecompContext {
     /// normal value is zero; keeping the field makes `__osGetCause` an honest
     /// state read instead of a fabricated constant.
     pub cop0_cause: u32,
+    /// COP0 EPC (register 14), written on precise exception entry when EXL was
+    /// clear. Branch-delay exceptions hold the branch PC, not the delay PC.
+    pub cop0_epc: u32,
+    /// COP0 ErrorEPC (register 30), selected by ERET while Status.ERL is set.
+    pub cop0_error_epc: u32,
+    /// COP0 BadVAddr (register 8). The arbitrary-PC lane populates it for
+    /// instruction-fetch AdEL and aligned-memory AdEL/AdES; TLB exception
+    /// paths remain open.
+    pub cop0_badvaddr: u32,
+    /// COP0 TLB registers (Index 0, EntryLo0/1 2/3, PageMask 5, Wired 6,
+    /// EntryHi 10). Stored round-trip state only: boot-time unmap-all loops
+    /// save/clear these and `tlbwi` records entries; address translation
+    /// through recorded entries is not modeled (use faults at the memory
+    /// path).
+    pub cop0_index: u32,
+    /// Raw recorded TLB entries (see `tlbwi_record`).
+    pub tlb_entries: [TlbEntryRaw; 32],
+    pub cop0_entry_lo0: u32,
+    pub cop0_entry_lo1: u32,
+    pub cop0_page_mask: u32,
+    pub cop0_wired: u32,
+    pub cop0_entry_hi: u32,
+    /// COP0 WatchLo/WatchHi (registers 18/19). Stored round-trip state only:
+    /// SDK boot code writes 0 to disarm the watchpoint on the way up, and
+    /// nothing in this runtime models the watch exception itself (a set
+    /// watchpoint simply never fires).
+    pub cop0_watch_lo: u32,
+    pub cop0_watch_hi: u32,
+    /// Libultra's combined CPU/RCP interrupt mask associated with this
+    /// OSThread. CPU gating is mirrored into `cop0_status`; the packed value
+    /// is retained so `osSetIntMask` returns this context's prior mask rather
+    /// than another coroutine's last hardware setting.
+    os_interrupt_mask: u32,
+    /// Explicit host-installed return sentinel for an OSThread entry. A
+    /// generated `jr`/`jalr` may finish the coroutine only when its captured
+    /// target equals this value; address zero or an unmapped PC remains a
+    /// loud guest fault.
+    thread_return_pc: Option<u32>,
 }
 
 impl RecompContext {
     /// A fresh context with all registers zeroed.
     pub fn new() -> Self {
         RecompContext::default()
+    }
+
+    pub fn set_thread_return_pc(&mut self, pc: Option<u32>) {
+        self.thread_return_pc = pc;
+    }
+
+    pub fn is_thread_return(&self, pc: u32) -> bool {
+        self.thread_return_pc == Some(pc)
+    }
+
+    pub fn os_interrupt_mask(&self) -> u32 {
+        self.os_interrupt_mask
+    }
+
+    pub fn replace_os_interrupt_mask(&mut self, mask: u32) -> u32 {
+        std::mem::replace(&mut self.os_interrupt_mask, mask)
+    }
+
+    /// Refresh the block-local view from the live CPU clock without
+    /// fabricating an architectural MTC0 write.
+    pub fn synchronize_cop0_timing(&mut self, count: u32, compare: u32) {
+        self.cop0_count = count;
+        self.cop0_compare = compare;
+    }
+
+    /// Drain MTC0 Count/Compare writes for the live CPU clock authority.
+    pub fn take_cop0_timing_writes(&mut self) -> (Option<u32>, Option<u32>) {
+        (self.cop0_count_write.take(), self.cop0_compare_write.take())
     }
 
     /// Read GPR `idx` as a full 64-bit value. `$zero` reads 0.
@@ -166,7 +248,7 @@ impl RecompContext {
             // VR4300 implementation number 0x0B, revision zero.
             0 => 0x0000_0B00,
             31 => (self.fcsr & !(1 << 23)) | ((self.fpu_cond as u32) << 23),
-            _ => panic!("reserved COP1 control register FCR{idx}"),
+            _ => trap_unsupported(format!("reserved COP1 control register FCR{idx}")),
         }
     }
 
@@ -174,10 +256,11 @@ impl RecompContext {
     /// effect. Reserved bits are discarded rather than becoming hidden state.
     #[inline]
     pub fn write_fcr(&mut self, idx: u8, value: u32) {
-        assert_eq!(
-            idx, 31,
-            "write to read-only/reserved COP1 control register FCR{idx}"
-        );
+        if idx != 31 {
+            trap_unsupported(format!(
+                "write to read-only/reserved COP1 control register FCR{idx}"
+            ));
+        }
         const WRITABLE: u32 = (1 << 24) | (1 << 23) | 0x0003_FFFF;
         self.fpu_cond = value & (1 << 23) != 0;
         self.fcsr = value & WRITABLE & !(1 << 23);
@@ -195,6 +278,102 @@ impl RecompContext {
     #[inline]
     pub fn take_ll_reservation(&mut self, vaddr: u64, width: u8) -> bool {
         self.ll_reservation.take() == Some((vaddr, width))
+    }
+
+    /// Apply the VR4300 ERET state transition and return its virtual target.
+    /// User's Manual section 6.3 specifies ErrorEPC/ERL precedence over
+    /// EPC/EXL and clearing the architectural LLbit on exception return.
+    #[inline]
+    pub fn exception_return_pc(&mut self) -> u32 {
+        const STATUS_EXL: u32 = 1 << 1;
+        const STATUS_ERL: u32 = 1 << 2;
+
+        self.ll_reservation = None;
+        if self.cop0_status & STATUS_ERL != 0 {
+            self.cop0_status &= !STATUS_ERL;
+            self.cop0_error_epc
+        } else {
+            self.cop0_status &= !STATUS_EXL;
+            self.cop0_epc
+        }
+    }
+
+    /// Read a modeled 32-bit COP0 register for MFC0. Registers whose
+    /// architectural behavior is not represented here remain loud instead of
+    /// fabricating a value.
+    /// `tlbwi`: record the indexed entry from the staged COP0 TLB registers.
+    /// Address TRANSLATION through recorded entries is not modeled -- KSEG0/
+    /// KSEG1 code never needs it, and an actual load/store through a mapped
+    /// segment (e.g. libultra's osInitialize page at 0xC0000000) faults
+    /// loudly at the memory path if a title ever dereferences one. Recording
+    /// instead of trapping lets boot-time TLB setup/unmap loops run exactly
+    /// as on hardware.
+    pub fn tlbwi_record(&mut self) {
+        let index = (self.cop0_index & 31) as usize;
+        self.tlb_entries[index] = TlbEntryRaw {
+            page_mask: self.cop0_page_mask,
+            entry_hi: self.cop0_entry_hi,
+            entry_lo0: self.cop0_entry_lo0,
+            entry_lo1: self.cop0_entry_lo1,
+        };
+    }
+
+    #[inline]
+    pub fn read_cop0(&self, reg: u8) -> u32 {
+        match reg {
+            8 => self.cop0_badvaddr,
+            9 => self.cop0_count,
+            11 => self.cop0_compare,
+            12 => self.cop0_status,
+            13 => self.cop0_cause,
+            14 => self.cop0_epc,
+            0 => self.cop0_index,
+            2 => self.cop0_entry_lo0,
+            3 => self.cop0_entry_lo1,
+            5 => self.cop0_page_mask,
+            6 => self.cop0_wired,
+            10 => self.cop0_entry_hi,
+            18 => self.cop0_watch_lo,
+            19 => self.cop0_watch_hi,
+            30 => self.cop0_error_epc,
+            _ => trap_unsupported(format!("unsupported MFC0 from COP0 register {reg}")),
+        }
+    }
+
+    /// Write a modeled 32-bit COP0 register for MTC0. Cause permits only the
+    /// two software-pending bits; hardware pending lines remain owned by the
+    /// device/clock layer. Status is context state and is replaced as one
+    /// architectural register so interrupt gating changes at the next block
+    /// boundary.
+    #[inline]
+    pub fn write_cop0(&mut self, reg: u8, value: u32) {
+        match reg {
+            9 => {
+                self.cop0_count = value;
+                self.cop0_count_write = Some(value);
+            }
+            11 => {
+                self.cop0_compare = value;
+                self.cop0_compare_write = Some(value);
+                self.cop0_cause &= !crate::execution::CpuInterruptLine::TIMER.cause_bit();
+            }
+            12 => self.cop0_status = value,
+            13 => {
+                const SOFTWARE_IP: u32 = 0b11 << 8;
+                self.cop0_cause = (self.cop0_cause & !SOFTWARE_IP) | (value & SOFTWARE_IP);
+            }
+            14 => self.cop0_epc = value,
+            0 => self.cop0_index = value,
+            2 => self.cop0_entry_lo0 = value,
+            3 => self.cop0_entry_lo1 = value,
+            5 => self.cop0_page_mask = value,
+            6 => self.cop0_wired = value,
+            10 => self.cop0_entry_hi = value,
+            18 => self.cop0_watch_lo = value,
+            19 => self.cop0_watch_hi = value,
+            30 => self.cop0_error_epc = value,
+            _ => trap_unsupported(format!("unsupported MTC0 to COP0 register {reg}")),
+        }
     }
 
     /// VR4300 signed word division, including the implementation-defined
@@ -308,7 +487,7 @@ impl RecompContext {
         self.fcsr |= 1 << (12 + exception);
         self.fcsr |= 1 << (2 + exception);
         if self.fcsr & (1 << (7 + exception)) != 0 {
-            panic!("enabled COP1 exception {}", exception);
+            trap_unsupported(format!("enabled COP1 exception {exception}"));
         }
     }
 
@@ -511,6 +690,68 @@ pub type RecompFunc =
 pub type HostLookup = fn(u32) -> Option<RecompFunc>;
 /// Cooperative-yield hook for the N64Recomp `pause_self` self-loop rule.
 pub type HostPause = fn();
+/// Optional raw word-MMIO read. `None` means the address is ordinary memory.
+pub type MmioRead = fn(u64) -> Option<u32>;
+/// Optional raw word-MMIO write. `true` means the device consumed the write.
+pub type MmioWrite = fn(u64, u32) -> bool;
+/// One post-commit guest write. Only aligned CPU halfword stores carry a
+/// value because public RDRAM hidden-bit behavior assigns semantics to that
+/// exact operation; byte/word/DMA effects remain unclaimed ranges.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GuestWriteEvent {
+    Range { physical_offset: u32, len: u32 },
+    NonRdpWrite16 { logical_offset: u32, value: u16 },
+}
+
+impl GuestWriteEvent {
+    pub const fn range(self) -> (u32, u32) {
+        match self {
+            Self::Range {
+                physical_offset,
+                len,
+            } => (physical_offset, len),
+            Self::NonRdpWrite16 { logical_offset, .. } => (logical_offset, 2),
+        }
+    }
+}
+
+/// Post-commit physical RDRAM write observer. Executable invalidation and
+/// renderer notification are multiplexed by the host callback.
+pub type WriteObserver = fn(GuestWriteEvent);
+
+/// Host callback reached immediately before translated code preserves a loud
+/// panic for an instruction shape this runtime does not model.
+pub type UnsupportedObserver = fn(&str);
+
+/// Stable identity emitted at the first statement of every translated
+/// whole-function body. The enclosing artifact identity remains host-owned;
+/// `(vram, symbol)` distinguishes functions within that artifact without
+/// depending on native addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TranslatedFunctionIdentity {
+    pub vram: u32,
+    pub symbol: &'static str,
+}
+
+impl TranslatedFunctionIdentity {
+    pub const fn new(vram: u32, symbol: &'static str) -> Self {
+        Self { vram, symbol }
+    }
+}
+
+/// Opaque version marker exported by newly generated whole-function modules.
+/// Passing a generated module's marker to the ABI is the explicit assertion
+/// that every callable in that artifact contains the entry hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FunctionEntryObservationSchema(u32);
+
+/// Entry-observation schema implemented by this emitter/runtime pair.
+pub const FUNCTION_ENTRY_OBSERVATION_SCHEMA: FunctionEntryObservationSchema =
+    FunctionEntryObservationSchema(1);
+
+/// Host callback reached by an emitted body before its first translated
+/// instruction executes.
+pub type FunctionEntryObserver = fn(TranslatedFunctionIdentity);
 
 thread_local! {
     /// Recompiled execution is single-threaded by design (`docs/DESIGN.md` section
@@ -521,6 +762,21 @@ thread_local! {
         std::cell::Cell::new(None)
     };
     static HOST_PAUSE: std::cell::Cell<Option<HostPause>> = const {
+        std::cell::Cell::new(None)
+    };
+    static MMIO_READ: std::cell::Cell<Option<MmioRead>> = const {
+        std::cell::Cell::new(None)
+    };
+    static MMIO_WRITE: std::cell::Cell<Option<MmioWrite>> = const {
+        std::cell::Cell::new(None)
+    };
+    static WRITE_OBSERVER: std::cell::Cell<Option<WriteObserver>> = const {
+        std::cell::Cell::new(None)
+    };
+    static UNSUPPORTED_OBSERVER: std::cell::Cell<Option<UnsupportedObserver>> = const {
+        std::cell::Cell::new(None)
+    };
+    static FUNCTION_ENTRY_OBSERVER: std::cell::Cell<Option<FunctionEntryObserver>> = const {
         std::cell::Cell::new(None)
     };
 }
@@ -540,6 +796,92 @@ pub fn set_host_lookup(resolver: Option<HostLookup>) -> Option<HostLookup> {
 /// Install the host's cooperative-yield adapter for translated self-loops.
 pub fn set_host_pause(pause: Option<HostPause>) -> Option<HostPause> {
     HOST_PAUSE.with(|slot| slot.replace(pause))
+}
+
+/// Install the raw word-MMIO boundary used by emitted `lw`/`sw` operations.
+/// The hooks are thread-local like host lookup because guest execution is
+/// single-threaded; ordinary RDRAM accesses remain direct checked slice I/O.
+pub fn set_mmio_hooks(
+    read: Option<MmioRead>,
+    write: Option<MmioWrite>,
+) -> (Option<MmioRead>, Option<MmioWrite>) {
+    let previous_read = MMIO_READ.with(|slot| slot.replace(read));
+    let previous_write = MMIO_WRITE.with(|slot| slot.replace(write));
+    (previous_read, previous_write)
+}
+
+pub fn set_write_observer(observer: Option<WriteObserver>) -> Option<WriteObserver> {
+    WRITE_OBSERVER.with(|slot| slot.replace(observer))
+}
+
+/// Install the host's unsupported-instruction evidence sink. The translated
+/// lane remains independently usable: without a sink, the same named panic
+/// still fires.
+pub fn set_unsupported_observer(
+    observer: Option<UnsupportedObserver>,
+) -> Option<UnsupportedObserver> {
+    UNSUPPORTED_OBSERVER.with(|slot| slot.replace(observer))
+}
+
+/// Install the current thread's translated-function entry observer.
+pub fn set_function_entry_observer(
+    observer: Option<FunctionEntryObserver>,
+) -> Option<FunctionEntryObserver> {
+    FUNCTION_ENTRY_OBSERVER.with(|slot| slot.replace(observer))
+}
+
+/// Record entry into one emitted whole-function body. Generated code places
+/// this call before initializing its local dispatch PC, so direct calls,
+/// lookup-resolved calls, tail calls, and root entry share one boundary.
+#[inline]
+pub fn notify_function_entry(identity: TranslatedFunctionIdentity) {
+    FUNCTION_ENTRY_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.get() {
+            observer(identity);
+        }
+    });
+}
+
+/// Record and preserve the loud endpoint for unsupported translated CPU
+/// behavior. Generated bodies use this instead of open-coded panics so the
+/// fixed-cycle journal cannot miss an early abort.
+#[cold]
+#[inline(never)]
+pub fn trap_unsupported(context: impl Into<String>) -> ! {
+    let context = context.into();
+    UNSUPPORTED_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.get() {
+            observer(&context);
+        }
+    });
+    panic!("{context}")
+}
+
+/// Notify the installed observer after bytes at a physical RDRAM range have
+/// committed. DMA and generated-C adapters use this same seam as typed stores.
+pub fn notify_guest_write(offset: u32, len: u32) {
+    if len != 0 {
+        WRITE_OBSERVER.with(|slot| {
+            if let Some(observer) = slot.get() {
+                observer(GuestWriteEvent::Range {
+                    physical_offset: offset,
+                    len,
+                });
+            }
+        });
+    }
+}
+
+/// Notify one aligned CPU halfword store after the visible bytes commit.
+pub fn notify_non_rdp_write16(logical_offset: u32, value: u16) {
+    WRITE_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.get() {
+            observer(GuestWriteEvent::NonRdpWrite16 {
+                logical_offset,
+                value,
+            });
+        }
+    });
 }
 
 /// Yield the active emulated thread at an unconditional branch-to-self.
@@ -592,9 +934,54 @@ impl<'a> Rdram<'a> {
     /// sum the MIPS code computes) to a physical rdram byte offset.
     #[inline]
     fn phys(vaddr: u64) -> usize {
-        // Wrapping sub mirrors the C `(addr) - 0xFFFFFFFF80000000`; the result
-        // is then range-checked by the slice index in each accessor.
-        vaddr.wrapping_sub(RDRAM_VBASE) as usize
+        if let Some(offset) = Self::physical_rdram_offset(vaddr) {
+            return offset as usize;
+        }
+        let physical = (vaddr as u32) & 0x1fff_ffff;
+        trap_unsupported(format!(
+            "Rdram: unsupported mapped address {vaddr:#018x} resolves to physical {physical:#x}; only zero- or sign-extended KSEG0/KSEG1 are modeled"
+        ))
+    }
+
+    /// Canonical physical RDRAM offset for cached or uncached CPU aliases.
+    /// Only the direct segments are accepted: masking KUSEG would silently
+    /// add unsupported TLB behavior. Device/renderer observations are named
+    /// in the same physical RDRAM space as the visible backing bytes.
+    #[inline]
+    fn physical_rdram_offset(vaddr: u64) -> Option<u32> {
+        let upper = vaddr >> 32;
+        let low = vaddr as u32;
+        let canonical_32 = upper == 0 || upper == u32::MAX as u64;
+        let direct_segment = (0x8000_0000..0xc000_0000).contains(&low);
+        let physical = low & 0x1fff_ffff;
+        (canonical_32 && direct_segment && physical < RDRAM_LEN as u32).then_some(physical)
+    }
+
+    /// Generated-C's proxy exposes RCP registers and PIF RAM only as modeled
+    /// word accesses. Keep the typed lane on that identical boundary instead
+    /// of letting a subword operation fall through to sparse host storage.
+    #[inline]
+    fn is_word_only_mmio(vaddr: u64) -> bool {
+        let upper = vaddr >> 32;
+        let low = vaddr as u32;
+        let canonical_32 = upper == 0 || upper == u32::MAX as u64;
+        if canonical_32 && (0xa400_0000..0xa490_0000).contains(&low) {
+            return true;
+        }
+        let physical = low & 0x1fff_ffff;
+        canonical_32
+            && (0x8000_0000..0xc000_0000).contains(&low)
+            && (0x1fc0_07c0..0x1fc0_0800).contains(&physical)
+    }
+
+    #[inline]
+    fn reject_nonword_mmio(vaddr: u64, width: u32, is_write: bool) {
+        if Self::is_word_only_mmio(vaddr) {
+            let operation = if is_write { "write" } else { "read" };
+            trap_unsupported(format!(
+                "Rdram: raw MMIO {operation} at {vaddr:#018x} used unsupported {width}-byte access; RCP/PIF registers require modeled word semantics"
+            ));
+        }
     }
 
     /// Effective virtual address of a `off(base)` operand: full-width MIPS III
@@ -617,15 +1004,19 @@ impl<'a> Rdram<'a> {
     /// still `#![forbid(unsafe_code)]`.
     #[inline]
     pub fn load_w(&self, vaddr: u64) -> i32 {
+        assert_eq!(vaddr & 3, 0, "unaligned LW at {vaddr:#018x}");
+        if let Some(value) = MMIO_READ.with(|slot| slot.get().and_then(|read| read(vaddr))) {
+            return value as i32;
+        }
         let p = Self::phys(vaddr);
-        debug_assert_eq!(p & 3, 0, "unaligned LW at {vaddr:#018x}");
         i32::from_ne_bytes(self.mem[p..p + 4].try_into().unwrap())
     }
 
     /// Load a sign-extended halfword (byte offset XOR 2).
     #[inline]
     pub fn load_h(&self, vaddr: u64) -> i16 {
-        debug_assert_eq!(vaddr & 1, 0, "unaligned LH at {vaddr:#018x}");
+        Self::reject_nonword_mmio(vaddr, 2, false);
+        assert_eq!(vaddr & 1, 0, "unaligned LH at {vaddr:#018x}");
         let p = Self::phys(vaddr) ^ 2;
         i16::from_ne_bytes(self.mem[p..p + 2].try_into().unwrap())
     }
@@ -639,6 +1030,7 @@ impl<'a> Rdram<'a> {
     /// Load a sign-extended byte (byte offset XOR 3).
     #[inline]
     pub fn load_b(&self, vaddr: u64) -> i8 {
+        Self::reject_nonword_mmio(vaddr, 1, false);
         let p = Self::phys(vaddr) ^ 3;
         self.mem[p] as i8
     }
@@ -646,6 +1038,7 @@ impl<'a> Rdram<'a> {
     /// Load a zero-extended byte (byte offset XOR 3).
     #[inline]
     pub fn load_bu(&self, vaddr: u64) -> u8 {
+        Self::reject_nonword_mmio(vaddr, 1, false);
         let p = Self::phys(vaddr) ^ 3;
         self.mem[p]
     }
@@ -655,24 +1048,38 @@ impl<'a> Rdram<'a> {
     /// Store the low word of `val`.
     #[inline]
     pub fn store_w(&mut self, vaddr: u64, val: u32) {
+        assert_eq!(vaddr & 3, 0, "unaligned SW at {vaddr:#018x}");
+        if MMIO_WRITE.with(|slot| slot.get().is_some_and(|write| write(vaddr, val))) {
+            return;
+        }
         let p = Self::phys(vaddr);
-        debug_assert_eq!(p & 3, 0, "unaligned SW at {vaddr:#018x}");
         self.mem[p..p + 4].copy_from_slice(&val.to_ne_bytes());
+        if let Some(offset) = Self::physical_rdram_offset(vaddr) {
+            notify_guest_write(offset, 4);
+        }
     }
 
     /// Store the low halfword of `val` (byte offset XOR 2).
     #[inline]
     pub fn store_h(&mut self, vaddr: u64, val: u16) {
-        debug_assert_eq!(vaddr & 1, 0, "unaligned SH at {vaddr:#018x}");
+        Self::reject_nonword_mmio(vaddr, 2, true);
+        assert_eq!(vaddr & 1, 0, "unaligned SH at {vaddr:#018x}");
         let p = Self::phys(vaddr) ^ 2;
         self.mem[p..p + 2].copy_from_slice(&val.to_ne_bytes());
+        if let Some(offset) = Self::physical_rdram_offset(vaddr) {
+            notify_non_rdp_write16(offset, val);
+        }
     }
 
     /// Store the low byte of `val` (byte offset XOR 3).
     #[inline]
     pub fn store_b(&mut self, vaddr: u64, val: u8) {
+        Self::reject_nonword_mmio(vaddr, 1, true);
         let p = Self::phys(vaddr) ^ 3;
         self.mem[p] = val;
+        if let Some(offset) = Self::physical_rdram_offset(vaddr) {
+            notify_guest_write(offset, 1);
+        }
     }
 
     // --- Unaligned word loads/stores (LWL/LWR/SWL/SWR) ---
@@ -709,8 +1116,15 @@ impl<'a> Rdram<'a> {
     #[inline]
     pub fn store_wl(&mut self, vaddr: u64, val: u32) {
         let word_addr = vaddr & !0x3;
-        let initial = self.load_w(word_addr) as u32;
         let misalign = (vaddr & 0x3) as u32;
+        if Self::is_word_only_mmio(word_addr) {
+            if misalign != 0 {
+                Self::reject_nonword_mmio(vaddr, 4 - misalign, true);
+            }
+            self.store_w(word_addr, val);
+            return;
+        }
+        let initial = self.load_w(word_addr) as u32;
         let masked = initial & !(0xFFFF_FFFFu32 >> (misalign * 8));
         let shifted = val >> (misalign * 8);
         self.store_w(word_addr, masked | shifted);
@@ -720,8 +1134,15 @@ impl<'a> Rdram<'a> {
     #[inline]
     pub fn store_wr(&mut self, vaddr: u64, val: u32) {
         let word_addr = vaddr & !0x3;
-        let initial = self.load_w(word_addr) as u32;
         let misalign = (vaddr & 0x3) as u32;
+        if Self::is_word_only_mmio(word_addr) {
+            if misalign != 3 {
+                Self::reject_nonword_mmio(vaddr, misalign + 1, true);
+            }
+            self.store_w(word_addr, val);
+            return;
+        }
+        let initial = self.load_w(word_addr) as u32;
         let masked = initial & !(0xFFFF_FFFFu32 << (24 - misalign * 8));
         let shifted = val << (24 - misalign * 8);
         self.store_w(word_addr, masked | shifted);
@@ -740,19 +1161,31 @@ impl<'a> Rdram<'a> {
     /// at `vaddr+0` and `lo_word` at `vaddr+4`.
     #[inline]
     pub fn load_d(&self, vaddr: u64) -> u64 {
-        debug_assert_eq!(vaddr & 7, 0, "unaligned LD at {vaddr:#018x}");
+        Self::reject_nonword_mmio(vaddr, 8, false);
+        assert_eq!(vaddr & 7, 0, "unaligned LD at {vaddr:#018x}");
         let hi = self.load_w(vaddr) as u32 as u64;
         let lo = self.load_w(vaddr.wrapping_add(4)) as u32 as u64;
         (hi << 32) | lo
     }
 
     /// Store a 64-bit doubleword: the high word to `vaddr+0`, the low word to
-    /// `vaddr+4`.
+    /// `vaddr+4`, followed by one post-commit eight-byte write range.
     #[inline]
     pub fn store_d(&mut self, vaddr: u64, val: u64) {
-        debug_assert_eq!(vaddr & 7, 0, "unaligned SD at {vaddr:#018x}");
-        self.store_w(vaddr, (val >> 32) as u32);
-        self.store_w(vaddr.wrapping_add(4), val as u32);
+        Self::reject_nonword_mmio(vaddr, 8, true);
+        assert_eq!(vaddr & 7, 0, "unaligned SD at {vaddr:#018x}");
+        if let Some(offset) = Self::physical_rdram_offset(vaddr) {
+            let high = Self::phys(vaddr);
+            let low = Self::phys(vaddr.wrapping_add(4));
+            // Match N64Recomp's low-word then high-word commit order. The
+            // observer runs only after both halves are coherent.
+            self.mem[low..low + 4].copy_from_slice(&(val as u32).to_ne_bytes());
+            self.mem[high..high + 4].copy_from_slice(&((val >> 32) as u32).to_ne_bytes());
+            notify_guest_write(offset, 8);
+        } else {
+            self.store_w(vaddr.wrapping_add(4), val as u32);
+            self.store_w(vaddr, (val >> 32) as u32);
+        }
     }
 
     // --- Unaligned doubleword loads/stores (LDL/LDR/SDL/SDR) ---
@@ -829,18 +1262,26 @@ impl<'a> Rdram<'a> {
             .is_some_and(|end| end <= self.mem.len())
     }
 
+    /// Translate and bound a checked-lane access without entering the
+    /// unchecked lane's loud unsupported-address trap. `try_*` callers must
+    /// return the original virtual address as a typed fault for every
+    /// non-RDRAM segment, including opt-in MMIO windows with no installed port.
+    #[inline]
+    fn virtual_range_backed(&self, vaddr: u64, lane_xor: usize, width: usize) -> bool {
+        Self::physical_rdram_offset(vaddr)
+            .is_some_and(|p| self.phys_range_backed((p as usize) ^ lane_xor, width))
+    }
+
     /// Whether the aligned-word effective address is backed (LW/LWU/LL/…).
     #[inline]
     fn word_backed(&self, vaddr: u64) -> bool {
-        self.phys_range_backed(Self::phys(vaddr), 4)
+        self.virtual_range_backed(vaddr, 0, 4)
     }
 
     /// Whether the aligned-doubleword effective address is backed (LD/SD/…).
     #[inline]
     fn dword_backed(&self, vaddr: u64) -> bool {
-        // A doubleword is two words at `vaddr` and `vaddr+4`; the second is the
-        // one that can run off the end, so checking it covers both.
-        self.phys_range_backed(Self::phys(vaddr.wrapping_add(4)), 4)
+        self.virtual_range_backed(vaddr, 0, 8)
     }
 
     /// Checked LW/LWU (aligned word). See the module note on the block lane.
@@ -856,7 +1297,7 @@ impl<'a> Rdram<'a> {
     /// Checked LH (aligned, sign-extended halfword).
     #[inline]
     pub fn try_load_h(&self, vaddr: u64) -> Result<i16, u64> {
-        if self.phys_range_backed(Self::phys(vaddr) ^ 2, 2) {
+        if self.virtual_range_backed(vaddr, 2, 2) {
             Ok(self.load_h(vaddr))
         } else {
             Err(vaddr)
@@ -872,7 +1313,7 @@ impl<'a> Rdram<'a> {
     /// Checked LB (sign-extended byte).
     #[inline]
     pub fn try_load_b(&self, vaddr: u64) -> Result<i8, u64> {
-        if self.phys_range_backed(Self::phys(vaddr) ^ 3, 1) {
+        if self.virtual_range_backed(vaddr, 3, 1) {
             Ok(self.load_b(vaddr))
         } else {
             Err(vaddr)
@@ -882,7 +1323,7 @@ impl<'a> Rdram<'a> {
     /// Checked LBU (zero-extended byte).
     #[inline]
     pub fn try_load_bu(&self, vaddr: u64) -> Result<u8, u64> {
-        if self.phys_range_backed(Self::phys(vaddr) ^ 3, 1) {
+        if self.virtual_range_backed(vaddr, 3, 1) {
             Ok(self.load_bu(vaddr))
         } else {
             Err(vaddr)
@@ -953,7 +1394,7 @@ impl<'a> Rdram<'a> {
     /// Checked SH.
     #[inline]
     pub fn try_store_h(&mut self, vaddr: u64, val: u16) -> Result<(), u64> {
-        if self.phys_range_backed(Self::phys(vaddr) ^ 2, 2) {
+        if self.virtual_range_backed(vaddr, 2, 2) {
             self.store_h(vaddr, val);
             Ok(())
         } else {
@@ -964,7 +1405,7 @@ impl<'a> Rdram<'a> {
     /// Checked SB.
     #[inline]
     pub fn try_store_b(&mut self, vaddr: u64, val: u8) -> Result<(), u64> {
-        if self.phys_range_backed(Self::phys(vaddr) ^ 3, 1) {
+        if self.virtual_range_backed(vaddr, 3, 1) {
             self.store_b(vaddr, val);
             Ok(())
         } else {
@@ -1025,5 +1466,328 @@ impl<'a> Rdram<'a> {
         } else {
             Err(vaddr)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        set_unsupported_observer, trap_unsupported, GuestWriteEvent, Rdram, RecompContext,
+    };
+
+    type RdramOperation = for<'a> fn(&mut Rdram<'a>);
+
+    thread_local! {
+        static OBSERVED_WRITES: std::cell::RefCell<Vec<GuestWriteEvent>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+        static MMIO_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static UNSUPPORTED_CONTEXTS: std::cell::RefCell<Vec<String>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+
+    fn observe_write(event: GuestWriteEvent) {
+        OBSERVED_WRITES.with(|writes| writes.borrow_mut().push(event));
+    }
+
+    fn consume_mmio(_vaddr: u64, _value: u32) -> bool {
+        MMIO_CALLS.with(|calls| calls.set(calls.get() + 1));
+        true
+    }
+
+    fn read_mmio(_vaddr: u64) -> Option<u32> {
+        MMIO_CALLS.with(|calls| calls.set(calls.get() + 1));
+        Some(0)
+    }
+
+    fn observe_unsupported(context: &str) {
+        UNSUPPORTED_CONTEXTS.with(|contexts| contexts.borrow_mut().push(context.to_owned()));
+    }
+
+    #[test]
+    fn unsupported_observer_runs_before_the_named_panic() {
+        UNSUPPORTED_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
+        let previous = set_unsupported_observer(Some(observe_unsupported));
+        let panic = std::panic::catch_unwind(|| trap_unsupported("unsupported COP0 register 7"));
+        set_unsupported_observer(previous);
+
+        assert!(panic.is_err());
+        UNSUPPORTED_CONTEXTS.with(|contexts| {
+            assert_eq!(
+                contexts.borrow().as_slice(),
+                ["unsupported COP0 register 7"]
+            );
+        });
+    }
+
+    #[test]
+    fn exception_return_prefers_error_epc_and_preserves_exl_under_erl() {
+        let mut ctx = RecompContext::new();
+        ctx.cop0_status = (1 << 1) | (1 << 2);
+        ctx.cop0_epc = 0x8000_1000;
+        ctx.cop0_error_epc = 0xBFC0_0200;
+        ctx.set_ll_reservation(0x8000_0040, 4);
+
+        assert_eq!(ctx.exception_return_pc(), 0xBFC0_0200);
+        assert_eq!(ctx.cop0_status & (1 << 2), 0);
+        assert_ne!(ctx.cop0_status & (1 << 1), 0);
+        assert!(!ctx.take_ll_reservation(0x8000_0040, 4));
+    }
+
+    #[test]
+    fn cop0_status_and_software_interrupt_writes_preserve_hardware_pending() {
+        let mut ctx = RecompContext::new();
+        ctx.write_cop0(12, 0x3400_FF01);
+        assert_eq!(ctx.read_cop0(12), 0x3400_FF01);
+
+        ctx.cop0_cause = (1 << 10) | (9 << 2) | (1 << 31);
+        ctx.write_cop0(13, 0b10 << 8);
+        assert_eq!(ctx.cop0_cause & (0b11 << 8), 0b10 << 8);
+        assert_ne!(ctx.cop0_cause & (1 << 10), 0);
+        assert_eq!((ctx.cop0_cause >> 2) & 0x1F, 9);
+        assert_ne!(ctx.cop0_cause & (1 << 31), 0);
+    }
+
+    #[test]
+    fn cop0_timing_writes_retain_same_value_compare_acknowledgements() {
+        let mut ctx = RecompContext::new();
+        ctx.synchronize_cop0_timing(7, 9);
+        ctx.cop0_cause = 1 << 15;
+        ctx.write_cop0(9, 7);
+        ctx.write_cop0(11, 9);
+
+        assert_eq!(ctx.cop0_cause & (1 << 15), 0);
+        assert_eq!(ctx.take_cop0_timing_writes(), (Some(7), Some(9)));
+        assert_eq!(ctx.take_cop0_timing_writes(), (None, None));
+    }
+
+    #[test]
+    fn rdram_write_observer_runs_after_committed_logical_ranges() {
+        OBSERVED_WRITES.with(|writes| writes.borrow_mut().clear());
+        let previous = super::set_write_observer(Some(observe_write));
+        let mut bytes = [0u8; 16];
+        let mut mem = Rdram::new(&mut bytes);
+
+        mem.store_w(0xFFFF_FFFF_8000_0000, 0x1122_3344);
+        mem.store_h(0xFFFF_FFFF_8000_0004, 0x5566);
+        mem.store_h(0xFFFF_FFFF_8000_0004, 0x5566);
+        mem.store_b(0xFFFF_FFFF_8000_0006, 0x77);
+        mem.store_d(0xFFFF_FFFF_A000_0008, 0x8899_aabb_ccdd_eeff);
+
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0000) as u32, 0x1122_3344);
+        assert_eq!(mem.load_hu(0xFFFF_FFFF_8000_0004), 0x5566);
+        assert_eq!(mem.load_bu(0xFFFF_FFFF_8000_0006), 0x77);
+        assert_eq!(mem.load_d(0xFFFF_FFFF_8000_0008), 0x8899_aabb_ccdd_eeff);
+        assert_eq!(
+            OBSERVED_WRITES.with(|writes| writes.borrow().clone()),
+            vec![
+                GuestWriteEvent::Range {
+                    physical_offset: 0,
+                    len: 4,
+                },
+                GuestWriteEvent::NonRdpWrite16 {
+                    logical_offset: 4,
+                    value: 0x5566,
+                },
+                GuestWriteEvent::NonRdpWrite16 {
+                    logical_offset: 4,
+                    value: 0x5566,
+                },
+                GuestWriteEvent::Range {
+                    physical_offset: 6,
+                    len: 1,
+                },
+                GuestWriteEvent::Range {
+                    physical_offset: 8,
+                    len: 8,
+                },
+            ]
+        );
+        super::set_write_observer(previous);
+    }
+
+    #[test]
+    fn write_events_canonicalize_cached_and_uncached_rdram_aliases() {
+        assert_eq!(
+            Rdram::physical_rdram_offset(0xffff_ffff_8000_1234),
+            Some(0x1234)
+        );
+        assert_eq!(
+            Rdram::physical_rdram_offset(0xffff_ffff_a000_1234),
+            Some(0x1234)
+        );
+        assert_eq!(Rdram::physical_rdram_offset(0xffff_ffff_a440_0000), None);
+        assert_eq!(
+            Rdram::physical_rdram_offset(0x0000_0000_8000_1234),
+            Some(0x1234)
+        );
+        assert_eq!(
+            Rdram::physical_rdram_offset(0x0000_0000_a000_1234),
+            Some(0x1234)
+        );
+        assert_eq!(Rdram::physical_rdram_offset(0x0000_0000_0000_1234), None);
+        assert_eq!(Rdram::physical_rdram_offset(0xffff_ffff_c000_1234), None);
+        assert_eq!(Rdram::physical_rdram_offset(0x0000_0001_8000_1234), None);
+    }
+
+    #[test]
+    fn kseg0_and_kseg1_loads_and_stores_share_visible_bytes() {
+        let mut bytes = [0u8; 16];
+        let mut mem = Rdram::new(&mut bytes);
+        let kseg0 = 0xffff_ffff_8000_0000;
+        let kseg1 = 0xffff_ffff_a000_0000;
+
+        mem.store_w(kseg1, 0x1122_3344);
+        assert_eq!(mem.load_w(kseg0) as u32, 0x1122_3344);
+        mem.store_h(kseg0 + 4, 0x8567);
+        assert_eq!(mem.load_hu(kseg1 + 4), 0x8567);
+        mem.store_b(kseg1 + 6, 0xa9);
+        assert_eq!(mem.load_bu(kseg0 + 6), 0xa9);
+
+        mem.store_w(0x0000_0000_8000_0008, 0xdead_beef);
+        assert_eq!(mem.load_w(0x0000_0000_a000_0008) as u32, 0xdead_beef);
+    }
+
+    #[test]
+    fn mapped_low_physical_addresses_trap_instead_of_aliasing_rdram() {
+        let mut bytes = [0u8; 4];
+        let mem = Rdram::new(&mut bytes);
+        for address in [
+            0x0000_0000_0000_0000,
+            0xffff_ffff_c000_0000,
+            0x0000_0001_8000_0000,
+        ] {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = mem.load_w(address);
+            }));
+            assert!(
+                panic.is_err(),
+                "mapped address {address:#018x} did not trap"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_accessors_return_typed_faults_for_non_rdram_segments() {
+        let mut bytes = [0u8; 16];
+        let mut mem = Rdram::new(&mut bytes);
+        let mmio = 0xffff_ffff_a460_0010;
+
+        assert_eq!(mem.try_load_w(mmio), Err(mmio));
+        assert_eq!(mem.try_load_h(mmio), Err(mmio));
+        assert_eq!(mem.try_load_hu(mmio), Err(mmio));
+        assert_eq!(mem.try_load_b(mmio), Err(mmio));
+        assert_eq!(mem.try_load_bu(mmio), Err(mmio));
+        assert_eq!(mem.try_load_wl(0, mmio + 1), Err(mmio + 1));
+        assert_eq!(mem.try_load_wr(0, mmio + 2), Err(mmio + 2));
+        assert_eq!(mem.try_load_d(mmio), Err(mmio));
+        assert_eq!(mem.try_load_dl(0, mmio + 1), Err(mmio + 1));
+        assert_eq!(mem.try_load_dr(0, mmio + 2), Err(mmio + 2));
+        assert_eq!(mem.try_store_w(mmio, 0), Err(mmio));
+        assert_eq!(mem.try_store_h(mmio, 0), Err(mmio));
+        assert_eq!(mem.try_store_b(mmio, 0), Err(mmio));
+        assert_eq!(mem.try_store_wl(mmio + 1, 0), Err(mmio + 1));
+        assert_eq!(mem.try_store_wr(mmio + 2, 0), Err(mmio + 2));
+        assert_eq!(mem.try_store_d(mmio, 0), Err(mmio));
+        assert_eq!(mem.try_store_dl(mmio + 1, 0), Err(mmio + 1));
+        assert_eq!(mem.try_store_dr(mmio + 2, 0), Err(mmio + 2));
+        assert_eq!(mem.as_mut_slice(), [0; 16]);
+    }
+
+    #[test]
+    fn nonword_rcp_and_pif_accesses_trap_before_any_side_effect() {
+        OBSERVED_WRITES.with(|writes| writes.borrow_mut().clear());
+        MMIO_CALLS.with(|calls| calls.set(0));
+        let previous_observer = super::set_write_observer(Some(observe_write));
+        let previous_mmio = super::set_mmio_hooks(Some(read_mmio), Some(consume_mmio));
+        let mut bytes = [0u8; 4];
+        let mut mem = Rdram::new(&mut bytes);
+
+        let operations: [RdramOperation; 8] = [
+            |mem| {
+                let _ = mem.load_h(0xffff_ffff_a400_0000);
+            },
+            |mem| {
+                let _ = mem.load_b(0xffff_ffff_9fc0_07c0);
+            },
+            |mem| mem.store_h(0xffff_ffff_a440_0000, 1),
+            |mem| mem.store_b(0xffff_ffff_bfc0_07c0, 1),
+            |mem| {
+                let _ = mem.load_d(0xffff_ffff_a400_0000);
+            },
+            |mem| mem.store_d(0xffff_ffff_bfc0_07c0, 1),
+            |mem| mem.store_wl(0xffff_ffff_a440_0001, 1),
+            |mem| mem.store_wr(0xffff_ffff_a440_0002, 1),
+        ];
+        for operation in operations {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                operation(&mut mem);
+            }));
+            assert!(panic.is_err(), "non-word MMIO access did not trap");
+        }
+
+        assert_eq!(MMIO_CALLS.with(std::cell::Cell::get), 0);
+        assert!(OBSERVED_WRITES.with(|writes| writes.borrow().is_empty()));
+        assert_eq!(mem.as_mut_slice(), [0; 4]);
+
+        mem.store_wl(0xffff_ffff_a440_0000, 0x1122_3344);
+        mem.store_wr(0xffff_ffff_a440_0003, 0x5566_7788);
+        assert_eq!(
+            MMIO_CALLS.with(std::cell::Cell::get),
+            2,
+            "full-selector SWL/SWR must issue one write each with no MMIO pre-read"
+        );
+        assert!(OBSERVED_WRITES.with(|writes| writes.borrow().is_empty()));
+        super::set_mmio_hooks(previous_mmio.0, previous_mmio.1);
+        super::set_write_observer(previous_observer);
+    }
+
+    #[test]
+    fn misaligned_aligned_accessors_trap_before_bytes_or_events_change() {
+        OBSERVED_WRITES.with(|writes| writes.borrow_mut().clear());
+        let previous_observer = super::set_write_observer(Some(observe_write));
+        let mut bytes = [0x5au8; 16];
+        let before = bytes;
+        let mut mem = Rdram::new(&mut bytes);
+        let operations: [RdramOperation; 6] = [
+            |mem| {
+                let _ = mem.load_h(0xffff_ffff_8000_0001);
+            },
+            |mem| mem.store_h(0xffff_ffff_a000_0001, 1),
+            |mem| {
+                let _ = mem.load_w(0xffff_ffff_8000_0002);
+            },
+            |mem| mem.store_w(0xffff_ffff_a000_0002, 1),
+            |mem| {
+                let _ = mem.load_d(0xffff_ffff_8000_0004);
+            },
+            |mem| mem.store_d(0xffff_ffff_a000_0004, 1),
+        ];
+        for operation in operations {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                operation(&mut mem);
+            }));
+            assert!(panic.is_err(), "misaligned access did not trap");
+        }
+        assert_eq!(bytes, before);
+        assert!(OBSERVED_WRITES.with(|writes| writes.borrow().is_empty()));
+        super::set_write_observer(previous_observer);
+    }
+
+    #[test]
+    fn consumed_mmio_store_does_not_report_an_rdram_write() {
+        OBSERVED_WRITES.with(|writes| writes.borrow_mut().clear());
+        let previous_observer = super::set_write_observer(Some(observe_write));
+        let previous_mmio = super::set_mmio_hooks(None, Some(consume_mmio));
+        let mut bytes = [0u8; 4];
+        let mut mem = Rdram::new(&mut bytes);
+
+        mem.store_w(0xFFFF_FFFF_A460_0000, 0x1234_5678);
+
+        assert!(OBSERVED_WRITES.with(|writes| writes.borrow().is_empty()));
+        assert_eq!(bytes, [0; 4]);
+        super::set_mmio_hooks(previous_mmio.0, previous_mmio.1);
+        super::set_write_observer(previous_observer);
     }
 }

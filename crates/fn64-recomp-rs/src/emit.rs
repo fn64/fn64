@@ -311,6 +311,11 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
         "pub fn {}(ctx: &mut RecompContext, mem: &mut Rdram) {{",
         func.name
     );
+    let _ = writeln!(
+        out,
+        "    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new({base:#010X}, {:?}));",
+        func.name
+    );
     let _ = writeln!(out, "    let mut pc: u32 = {:#010X};", base);
     let _ = writeln!(out, "    'run: loop {{ match pc {{");
 
@@ -400,6 +405,15 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
 /// targets remain [`crate::BlockExit::ResolveTransfer`] until the active
 /// mapping layer resolves them.
 pub fn emit_bank_runner(bank: &BankInput<'_>) -> String {
+    emit_bank_runner_with_host_calls(bank, &[])
+}
+
+/// Emit a contiguous bank while treating the supplied statically-known call
+/// destinations as host ABI boundaries. A matching JAL executes its delay
+/// slot, records `$ra`, and returns [`crate::BlockExit::HostCall`] with the
+/// exact bank-qualified resume PC instead of asking the executable mapping to
+/// pretend host code is a guest bank.
+pub fn emit_bank_runner_with_host_calls(bank: &BankInput<'_>, host_calls: &[u32]) -> String {
     let base = bank.vram;
     let byte_len = u32::try_from(bank.words.len())
         .expect("bank instruction count exceeds u32")
@@ -413,6 +427,7 @@ pub fn emit_bank_runner(bank: &BankInput<'_>) -> String {
     let domain = ExecutionDomain {
         ranges: &ranges,
         runtime_predicate: None,
+        host_calls,
     };
 
     let mut out = String::new();
@@ -448,9 +463,10 @@ pub fn emit_bank_runner(bank: &BankInput<'_>) -> String {
     );
     let _ = writeln!(out, "    }}");
     let _ = writeln!(out, "    if !entry.pc.is_instruction_aligned() {{");
+    let _ = writeln!(out, "        executed += 1;");
     let _ = writeln!(
         out,
-        "        finish!(BlockExit::Fault(CpuFault {{ at: entry, kind: CpuFaultKind::UnalignedPc }}));"
+        "        finish!(BlockExit::Fault(CpuFault::instruction_address_error(entry)));"
     );
     let _ = writeln!(out, "    }}");
     let _ = writeln!(out, "    let mut pc = entry.pc.get();");
@@ -460,6 +476,7 @@ pub fn emit_bank_runner(bank: &BankInput<'_>) -> String {
         let vram = base + index as u32 * 4;
         let _ = writeln!(out, "        {vram:#010X} => {{");
         let _ = writeln!(out, "            // {vram:#010X}: {instr:?}");
+        emit_bank_cop1_guard(&mut out, instr, vram, vram, false, bank.bank, false);
         if instr.has_delay_slot() {
             let delay = Some(*instrs.get(index + 1).unwrap_or_else(|| {
                 panic!(
@@ -479,15 +496,23 @@ pub fn emit_bank_runner(bank: &BankInput<'_>) -> String {
             let _ = writeln!(out, "            executed += 2;");
             emit_bank_control_transfer(&mut out, instr, vram, delay, vram + 4, bank.bank, &domain);
         } else {
-            emit_straight(
-                &mut out,
-                instr,
-                vram,
-                &MemFault::Fault {
-                    pc: vram,
-                    retired: "executed",
-                },
-            );
+            if !emit_bank_eret(&mut out, instr, bank.bank)
+                && !emit_bank_overflow(&mut out, instr, vram, vram, false, bank.bank, false)
+                && !emit_bank_exception(&mut out, instr, vram, vram, false, bank.bank, false)
+                && !emit_bank_address_exception(
+                    &mut out, instr, vram, vram, false, bank.bank, false,
+                )
+            {
+                emit_straight(
+                    &mut out,
+                    instr,
+                    vram,
+                    &MemFault::Fault {
+                        pc: vram,
+                        retired: "executed",
+                    },
+                );
+            }
             let _ = writeln!(out, "            executed += 1;");
             let next = vram + 4;
             if domain.contains(next) {
@@ -540,6 +565,38 @@ pub fn emit_bank_runner(bank: &BankInput<'_>) -> String {
 /// lowest and highest admitted addresses. This is the code/data boundary the
 /// contiguous [`emit_bank_runner`] input cannot express.
 pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
+    emit_sparse_bank_runner_with_host_calls(bank, &[])
+}
+
+/// Emit only the sparse runner function, omitting the compatibility
+/// registration helper. Whole-program generators use this form so they can
+/// require an artifact identity when constructing every runner.
+pub fn emit_sparse_bank_runner_function(bank: &SparseBankInput<'_>) -> String {
+    emit_sparse_bank_runner_function_with_host_calls(bank, &[])
+}
+
+/// Sparse-bank counterpart of [`emit_bank_runner_with_host_calls`].
+pub fn emit_sparse_bank_runner_with_host_calls(
+    bank: &SparseBankInput<'_>,
+    host_calls: &[u32],
+) -> String {
+    emit_sparse_bank_runner_inner(bank, host_calls, true)
+}
+
+/// [`emit_sparse_bank_runner_function`] with an explicit static host-call
+/// inventory.
+pub fn emit_sparse_bank_runner_function_with_host_calls(
+    bank: &SparseBankInput<'_>,
+    host_calls: &[u32],
+) -> String {
+    emit_sparse_bank_runner_inner(bank, host_calls, false)
+}
+
+fn emit_sparse_bank_runner_inner(
+    bank: &SparseBankInput<'_>,
+    host_calls: &[u32],
+    emit_registration: bool,
+) -> String {
     assert!(
         !bank.blocks.is_empty(),
         "sparse bank {} contains no proven code spans",
@@ -550,17 +607,7 @@ pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
     blocks.sort_by_key(|block| block.vram);
     let mut ranges = Vec::with_capacity(blocks.len());
     let mut instrs = BTreeMap::new();
-    // Addresses that are the delay slot of a control transfer within the same
-    // admitted block. A delay-slot word belongs to its control transfer's
-    // architectural unit: it executes as an ordinary instruction (the transfer
-    // arm runs it inline, and its own arbitrary-PC arm runs it straight), never
-    // as an independent transfer that would demand a further delay slot. Pairing
-    // walks each block exactly as `emit_function` does — advance two words past
-    // a control transfer — so a `jr`/branch-shaped word sitting in a delay slot
-    // (common in `jr $sN` register-save data runs proven as code) is classified
-    // as the delay slot it is, not re-decoded as a transfer whose unproven
-    // successor byte cannot supply a delay slot.
-    let mut delay_slots: BTreeSet<u32> = BTreeSet::new();
+    let mut delay_slots = BTreeSet::new();
     let mut previous_end = None;
     for block in blocks {
         assert!(
@@ -583,6 +630,15 @@ pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
             .vram
             .checked_add(byte_len)
             .expect("sparse bank virtual span exceeds u32");
+        let mut index = 0usize;
+        while index < block.words.len() {
+            if decode(block.words[index]).has_delay_slot() && index + 1 < block.words.len() {
+                delay_slots.insert(block.vram + (index as u32 + 1) * 4);
+                index += 2;
+            } else {
+                index += 1;
+            }
+        }
         if let Some(previous_end) = previous_end {
             assert!(
                 block.vram >= previous_end,
@@ -599,18 +655,6 @@ pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
                 bank.bank
             );
         }
-        // Classify delay slots by walking the block from its leader with the
-        // same two-word stride `emit_function` uses: the word after each control
-        // transfer is that transfer's delay slot.
-        let mut index = 0usize;
-        while index < block.words.len() {
-            if decode(block.words[index]).has_delay_slot() && index + 1 < block.words.len() {
-                delay_slots.insert(block.vram + (index as u32 + 1) * 4);
-                index += 2;
-            } else {
-                index += 1;
-            }
-        }
         if let Some((_, previous_end)) = ranges.last_mut() {
             if *previous_end == block.vram {
                 *previous_end = end;
@@ -626,6 +670,7 @@ pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
     let domain = ExecutionDomain {
         ranges: &ranges,
         runtime_predicate: Some("admitted"),
+        host_calls,
     };
     let (bank_start, bank_end) = domain.bounds();
     let mut out = String::new();
@@ -662,9 +707,10 @@ pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
     );
     let _ = writeln!(out, "    }}");
     let _ = writeln!(out, "    if !entry.pc.is_instruction_aligned() {{");
+    let _ = writeln!(out, "        executed += 1;");
     let _ = writeln!(
         out,
-        "        finish!(BlockExit::Fault(CpuFault {{ at: entry, kind: CpuFaultKind::UnalignedPc }}));"
+        "        finish!(BlockExit::Fault(CpuFault::instruction_address_error(entry)));"
     );
     let _ = writeln!(out, "    }}");
     let _ = writeln!(out, "    let mut pc = entry.pc.get();");
@@ -685,26 +731,13 @@ pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
     for (&vram, &instr) in &instrs {
         let _ = writeln!(out, "        {vram:#010X} => {{");
         let _ = writeln!(out, "            // {vram:#010X}: {instr:?}");
-        // A word is executed as a control transfer only when it is NOT itself
-        // the delay slot of a preceding transfer in its block. A delay-slot word
-        // is one architectural unit with its control transfer: it is emitted as
-        // an ordinary instruction here (its transfer arm ran it inline), never
-        // re-decoded as a transfer that would demand a further delay slot.
+        emit_bank_cop1_guard(&mut out, instr, vram, vram, false, bank.bank, false);
         let delay_vram = vram.checked_add(4);
-        let delay_admitted = delay_vram.and_then(|d| instrs.get(&d).copied());
-        if instr.has_delay_slot() && !delay_slots.contains(&vram) && delay_admitted.is_none() {
-            // A control transfer at a block's last word whose delay slot is
-            // admitted by no proven block. The genuine severed-delay case was
-            // re-attached in the pack (its delay slot is proven code); reaching
-            // here means the delay slot is unproven — the "control transfer" is
-            // misclassified data or an inconsistent decode. It cannot be soundly
-            // executed as a transfer (its delay slot is unknown), so its arm is
-            // a loud runtime trap rather than a generation-time panic that would
-            // reject the whole runner. Legitimate control flow never enters here.
+        let delay = delay_vram.and_then(|address| instrs.get(&address).copied());
+        if instr.has_delay_slot() && !delay_slots.contains(&vram) && delay.is_none() {
             emit_data_control_word(&mut out, vram);
         } else if instr.has_delay_slot() && !delay_slots.contains(&vram) {
             let delay_vram = delay_vram.expect("sparse bank delay-slot address exceeds u32");
-            let delay = Some(delay_admitted.expect("delay slot admitted in this branch"));
             let _ = writeln!(
                 out,
                 "            if executed != 0 && executed + 2 > budget.get() {{"
@@ -719,20 +752,25 @@ pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
                 &mut out, instr, vram, delay, delay_vram, bank.bank, &domain,
             );
         } else if instr.has_delay_slot() {
-            // A delay slot (or a block-terminal control word with no admitted
-            // delay) whose bytes decode as a control transfer. It cannot execute
-            // as a transfer; a loud trap is the whole arm. See `emit_delay_slot`.
             emit_data_control_word(&mut out, vram);
         } else {
-            emit_delay_slot(
-                &mut out,
-                instr,
-                vram,
-                &MemFault::Fault {
-                    pc: vram,
-                    retired: "executed",
-                },
-            );
+            if !emit_bank_eret(&mut out, instr, bank.bank)
+                && !emit_bank_overflow(&mut out, instr, vram, vram, false, bank.bank, false)
+                && !emit_bank_exception(&mut out, instr, vram, vram, false, bank.bank, false)
+                && !emit_bank_address_exception(
+                    &mut out, instr, vram, vram, false, bank.bank, false,
+                )
+            {
+                emit_straight(
+                    &mut out,
+                    instr,
+                    vram,
+                    &MemFault::Fault {
+                        pc: vram,
+                        retired: "executed",
+                    },
+                );
+            }
             let _ = writeln!(out, "            executed += 1;");
             let next = vram
                 .checked_add(4)
@@ -765,24 +803,27 @@ pub fn emit_sparse_bank_runner(bank: &SparseBankInput<'_>) -> String {
     let _ = writeln!(out, "    }} }}");
     let _ = writeln!(out, "}}");
     let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "pub fn register_{}(program: &mut BlockProgram, code: CodeBank) -> Result<(), ProgramError> {{",
-        bank.name
-    );
-    let _ = writeln!(
-        out,
-        "    program.register(code, GeneratedBankRunner::new(BankId::new({:#018X}), {}))",
-        bank.bank.get(),
-        bank.name
-    );
-    let _ = writeln!(out, "}}");
+    if emit_registration {
+        let _ = writeln!(
+            out,
+            "pub fn register_{}(program: &mut BlockProgram, code: CodeBank) -> Result<(), ProgramError> {{",
+            bank.name
+        );
+        let _ = writeln!(
+            out,
+            "    program.register(code, GeneratedBankRunner::new(BankId::new({:#018X}), {}))",
+            bank.bank.get(),
+            bank.name
+        );
+        let _ = writeln!(out, "}}");
+    }
     out
 }
 
 struct ExecutionDomain<'a> {
     ranges: &'a [(u32, u32)],
     runtime_predicate: Option<&'a str>,
+    host_calls: &'a [u32],
 }
 
 impl ExecutionDomain<'_> {
@@ -830,6 +871,38 @@ fn emit_proven_or_resolved_transfer(
     }
 }
 
+fn emit_call_transfer(
+    out: &mut String,
+    bank: BankId,
+    target: u32,
+    resume: u32,
+    domain: &ExecutionDomain<'_>,
+    indent: usize,
+) {
+    if domain.host_calls.contains(&target) {
+        let pad = " ".repeat(indent);
+        let _ = writeln!(
+            out,
+            "{pad}finish!(BlockExit::HostCall {{ vram: GuestPc::new({target:#010X}), resume: ExecutionKey::new(BankId::new({:#018X}), GuestPc::new({resume:#010X})) }});",
+            bank.get()
+        );
+    } else if domain.contains(target) {
+        emit_proven_or_resolved_transfer(out, bank, target, domain, indent);
+    } else {
+        emit_resolve_call(out, bank, target, resume, indent);
+    }
+}
+
+fn emit_resolve_call(out: &mut String, bank: BankId, target: u32, resume: u32, indent: usize) {
+    let pad = " ".repeat(indent);
+    let _ = writeln!(
+        out,
+        "{pad}finish!(BlockExit::ResolveCall {{ source_bank: BankId::new({:#018X}), target_pc: GuestPc::new({target:#010X}), resume: ExecutionKey::new(BankId::new({:#018X}), GuestPc::new({resume:#010X})) }});",
+        bank.get(),
+        bank.get()
+    );
+}
+
 fn emit_resolve_transfer(out: &mut String, bank: BankId, target: u32, indent: usize) {
     let pad = " ".repeat(indent);
     let _ = writeln!(
@@ -855,19 +928,25 @@ fn emit_bank_control_transfer(
     let emit_delay = |out: &mut String| {
         if let Some(delay) = delay {
             let _ = writeln!(out, "            // delay: {delay_vram:#010X}: {delay:?}");
-            // A fault in the delay slot annuls the branch it delays: the runner
-            // has already charged the branch/delay pair (`executed += 2`) before
-            // this point, so report `executed - 2` — only instructions that
-            // retired before the branch. See `MemFault::Fault`.
-            emit_delay_slot(
-                out,
-                delay,
-                delay_vram,
-                &MemFault::Fault {
-                    pc: delay_vram,
-                    retired: "(executed - 2)",
-                },
-            );
+            if delay.has_delay_slot() {
+                emit_data_control_word(out, delay_vram);
+            } else {
+                emit_bank_cop1_guard(out, delay, delay_vram, vram, true, bank, true);
+                if !emit_bank_overflow(out, delay, delay_vram, vram, true, bank, true)
+                    && !emit_bank_exception(out, delay, delay_vram, vram, true, bank, true)
+                    && !emit_bank_address_exception(out, delay, delay_vram, vram, true, bank, true)
+                {
+                    emit_straight(
+                        out,
+                        delay,
+                        delay_vram,
+                        &MemFault::Fault {
+                            pc: delay_vram,
+                            retired: "(executed - 2)",
+                        },
+                    );
+                }
+            }
         }
     };
 
@@ -889,7 +968,7 @@ fn emit_bank_control_transfer(
             // that writes `rs` must not redirect the already-issued jump.
             let _ = writeln!(out, "            let target = ctx.r_u32({rs});");
             emit_delay(out);
-            emit_runtime_transfer(out, bank, domain, 12);
+            emit_runtime_transfer(out, bank, domain, None, 12);
         }
         Jalr { rd, rs } => {
             let _ = writeln!(out, "            let target = ctx.r_u32({rs});");
@@ -898,7 +977,7 @@ fn emit_bank_control_transfer(
                 "            ctx.set_r32({rd}, {fallthrough:#010X}u32 as i32);"
             );
             emit_delay(out);
-            emit_runtime_transfer(out, bank, domain, 12);
+            emit_runtime_transfer(out, bank, domain, Some(fallthrough), 12);
         }
         J { .. } => {
             emit_delay(out);
@@ -910,10 +989,11 @@ fn emit_bank_control_transfer(
                 "            ctx.set_r32(31, {fallthrough:#010X}u32 as i32);"
             );
             emit_delay(out);
-            emit_proven_or_resolved_transfer(
+            emit_call_transfer(
                 out,
                 bank,
                 target.expect("JAL has target"),
+                fallthrough,
                 domain,
                 12,
             );
@@ -929,12 +1009,21 @@ fn emit_bank_control_transfer(
             if instr.is_branch_likely() {
                 let _ = writeln!(out, "            if take {{");
                 emit_delay(out);
-                emit_proven_or_resolved_transfer(out, bank, target, domain, 16);
+                emit_call_transfer(out, bank, target, fallthrough, domain, 16);
                 let _ = writeln!(out, "            }}");
                 emit_proven_or_resolved_transfer(out, bank, fallthrough, domain, 12);
             } else {
-                emit_delay(out);
-                emit_conditional_transfer(out, bank, target, fallthrough, domain);
+                if domain.host_calls.contains(&target) {
+                    let _ = writeln!(out, "            if take {{");
+                    emit_delay(out);
+                    emit_call_transfer(out, bank, target, fallthrough, domain, 16);
+                    let _ = writeln!(out, "            }}");
+                    emit_delay(out);
+                    emit_proven_or_resolved_transfer(out, bank, fallthrough, domain, 12);
+                } else {
+                    emit_delay(out);
+                    emit_conditional_transfer(out, bank, target, fallthrough, domain);
+                }
             }
         }
         _ if instr.is_branch_likely() => {
@@ -960,25 +1049,37 @@ fn emit_runtime_transfer(
     out: &mut String,
     bank: BankId,
     domain: &ExecutionDomain<'_>,
+    resume: Option<u32>,
     indent: usize,
 ) {
     let pad = " ".repeat(indent);
+    let _ = writeln!(out, "{pad}if ctx.is_thread_return(target) {{");
+    let _ = writeln!(out, "{pad}    finish!(BlockExit::ThreadReturn);");
+    let _ = writeln!(out, "{pad}}}");
     let _ = writeln!(out, "{pad}if target & 3 != 0 {{");
     let _ = writeln!(
         out,
         "{pad}    let at = ExecutionKey::new(BankId::new({:#018X}), GuestPc::new(target));",
         bank.get()
     );
+    let _ = writeln!(out, "{pad}    if executed >= budget.get() {{");
+    let _ = writeln!(out, "{pad}        finish!(BlockExit::Checkpoint(at));");
+    let _ = writeln!(out, "{pad}    }}");
+    let _ = writeln!(out, "{pad}    executed += 1;");
     let _ = writeln!(
         out,
-        "{pad}    finish!(BlockExit::Fault(CpuFault {{ at, kind: CpuFaultKind::UnalignedPc }}));"
+        "{pad}    finish!(BlockExit::Fault(CpuFault::instruction_address_error(at)));"
     );
     let _ = writeln!(out, "{pad}}}");
     let condition = domain.runtime_condition("target");
     let _ = writeln!(out, "{pad}if {condition} {{");
     let _ = writeln!(out, "{pad}    finish!(BlockExit::Transfer(ExecutionKey::new(BankId::new({:#018X}), GuestPc::new(target))));", bank.get());
     let _ = writeln!(out, "{pad}}}");
-    let _ = writeln!(out, "{pad}finish!(BlockExit::ResolveTransfer {{ source_bank: BankId::new({:#018X}), target_pc: GuestPc::new(target) }});", bank.get());
+    if let Some(resume) = resume {
+        let _ = writeln!(out, "{pad}finish!(BlockExit::ResolveCall {{ source_bank: BankId::new({:#018X}), target_pc: GuestPc::new(target), resume: ExecutionKey::new(BankId::new({:#018X}), GuestPc::new({resume:#010X})) }});", bank.get(), bank.get());
+    } else {
+        let _ = writeln!(out, "{pad}finish!(BlockExit::ResolveTransfer {{ source_bank: BankId::new({:#018X}), target_pc: GuestPc::new(target) }});", bank.get());
+    }
 }
 
 fn emit_conditional_transfer(
@@ -1132,6 +1233,315 @@ fn emit_fpu_i64(out: &mut String, fd: Reg, fs: Reg, single: bool, mode: Option<u
     );
 }
 
+/// Emit the Status.CU1 check before any COP1-visible effect. A branch checks
+/// before its delay slot; a COP1 delay instruction checks after the branch has
+/// retired and therefore reports the branch EPC with Cause.BD set.
+fn emit_bank_cop1_guard(
+    out: &mut String,
+    instr: Instruction,
+    fault_vram: u32,
+    epc: u32,
+    branch_delay: bool,
+    bank: BankId,
+    already_counted: bool,
+) {
+    if !instr.requires_cop1() {
+        return;
+    }
+    let _ = writeln!(out, "            if ctx.cop0_status & (1 << 29) == 0 {{");
+    if !already_counted {
+        let _ = writeln!(out, "                executed += 1;");
+    }
+    let _ = writeln!(out, "                finish!(BlockExit::Fault(CpuFault {{");
+    let _ = writeln!(out, "                    at: ExecutionKey::new(BankId::new({:#018X}), GuestPc::new({fault_vram:#010X})),", bank.get());
+    let _ = writeln!(out, "                    kind: CpuFaultKind::Exception {{");
+    let _ = writeln!(
+        out,
+        "                        exception: CpuException::CoprocessorUnusable,"
+    );
+    let _ = writeln!(
+        out,
+        "                        epc: GuestPc::new({epc:#010X}),"
+    );
+    let _ = writeln!(out, "                        branch_delay: {branch_delay},");
+    let _ = writeln!(out, "                        instruction_code: 0,");
+    let _ = writeln!(out, "                        bad_vaddr: None,");
+    let _ = writeln!(out, "                        coprocessor: Some(1),");
+    let _ = writeln!(out, "                    }},");
+    let _ = writeln!(out, "                }}));");
+    let _ = writeln!(out, "            }}");
+}
+
+fn emit_bank_overflow(
+    out: &mut String,
+    instr: Instruction,
+    fault_vram: u32,
+    epc: u32,
+    branch_delay: bool,
+    bank: BankId,
+    already_counted: bool,
+) -> bool {
+    use Instruction::*;
+    let (result, write) = match instr {
+        Addi { rt, rs, imm } => (
+            format!("({}).checked_add({})", rs32(rs), imm as i32),
+            format!("ctx.set_r32({rt}, value);"),
+        ),
+        Add { rd, rs, rt } => (
+            format!("({}).checked_add({})", rs32(rs), rs32(rt)),
+            format!("ctx.set_r32({rd}, value);"),
+        ),
+        Sub { rd, rs, rt } => (
+            format!("({}).checked_sub({})", rs32(rs), rs32(rt)),
+            format!("ctx.set_r32({rd}, value);"),
+        ),
+        Daddi { rt, rs, imm } => (
+            format!("({}).checked_add({}i64)", rs64(rs), imm as i64),
+            format!("ctx.set_r({rt}, value as u64);"),
+        ),
+        Dadd { rd, rs, rt } => (
+            format!("({}).checked_add({})", rs64(rs), rs64(rt)),
+            format!("ctx.set_r({rd}, value as u64);"),
+        ),
+        Dsub { rd, rs, rt } => (
+            format!("({}).checked_sub({})", rs64(rs), rs64(rt)),
+            format!("ctx.set_r({rd}, value as u64);"),
+        ),
+        _ => return false,
+    };
+    let _ = writeln!(out, "            if let Some(value) = {result} {{");
+    let _ = writeln!(out, "                {write}");
+    let _ = writeln!(out, "            }} else {{");
+    if !already_counted {
+        let _ = writeln!(out, "                executed += 1;");
+    }
+    let _ = writeln!(out, "                finish!(BlockExit::Fault(CpuFault {{");
+    let _ = writeln!(out, "                    at: ExecutionKey::new(BankId::new({:#018X}), GuestPc::new({fault_vram:#010X})),", bank.get());
+    let _ = writeln!(out, "                    kind: CpuFaultKind::Exception {{");
+    let _ = writeln!(
+        out,
+        "                        exception: CpuException::IntegerOverflow,"
+    );
+    let _ = writeln!(
+        out,
+        "                        epc: GuestPc::new({epc:#010X}),"
+    );
+    let _ = writeln!(out, "                        branch_delay: {branch_delay},");
+    let _ = writeln!(out, "                        instruction_code: 0,");
+    let _ = writeln!(out, "                        bad_vaddr: None,");
+    let _ = writeln!(out, "                        coprocessor: None,");
+    let _ = writeln!(out, "                    }},");
+    let _ = writeln!(out, "                }}));");
+    let _ = writeln!(out, "            }}");
+    true
+}
+
+/// Emit the alignment checks that architecturally precede aligned memory
+/// operations in the arbitrary-PC lane. The effective address is sampled
+/// before any destination, memory, or LLbit state can change.
+fn emit_bank_address_exception(
+    out: &mut String,
+    instr: Instruction,
+    fault_vram: u32,
+    epc: u32,
+    branch_delay: bool,
+    bank: BankId,
+    already_counted: bool,
+) -> bool {
+    use Instruction::*;
+    let (base, off, alignment, exception) = match instr {
+        Lh { base, off, .. } | Lhu { base, off, .. } => (base, off, 2u32, "AddressErrorLoad"),
+        Lw { base, off, .. }
+        | Lwu { base, off, .. }
+        | Ll { base, off, .. }
+        | Lwc1 { base, off, .. } => (base, off, 4, "AddressErrorLoad"),
+        Ld { base, off, .. } | Lld { base, off, .. } | Ldc1 { base, off, .. } => {
+            (base, off, 8, "AddressErrorLoad")
+        }
+        Sh { base, off, .. } => (base, off, 2, "AddressErrorStore"),
+        Sw { base, off, .. } | Sc { base, off, .. } | Swc1 { base, off, .. } => {
+            (base, off, 4, "AddressErrorStore")
+        }
+        Sd { base, off, .. } | Scd { base, off, .. } | Sdc1 { base, off, .. } => {
+            (base, off, 8, "AddressErrorStore")
+        }
+        _ => return false,
+    };
+    let _ = writeln!(
+        out,
+        "            let effective_address = Rdram::eff_addr({}, {});",
+        r(base),
+        off
+    );
+    let _ = writeln!(
+        out,
+        "            if effective_address & {:#010X} != 0 {{",
+        alignment - 1
+    );
+    if !already_counted {
+        let _ = writeln!(out, "                executed += 1;");
+    }
+    let _ = writeln!(out, "                finish!(BlockExit::Fault(CpuFault {{");
+    let _ = writeln!(out, "                    at: ExecutionKey::new(BankId::new({:#018X}), GuestPc::new({fault_vram:#010X})),", bank.get());
+    let _ = writeln!(out, "                    kind: CpuFaultKind::Exception {{");
+    let _ = writeln!(
+        out,
+        "                        exception: CpuException::{exception},"
+    );
+    let _ = writeln!(
+        out,
+        "                        epc: GuestPc::new({epc:#010X}),"
+    );
+    let _ = writeln!(out, "                        branch_delay: {branch_delay},");
+    let _ = writeln!(out, "                        instruction_code: 0,");
+    let _ = writeln!(
+        out,
+        "                        bad_vaddr: Some(effective_address as u32),"
+    );
+    let _ = writeln!(out, "                        coprocessor: None,");
+    let _ = writeln!(out, "                    }},");
+    let _ = writeln!(out, "                }}));");
+    let _ = writeln!(out, "            }}");
+    emit_straight(
+        out,
+        instr,
+        fault_vram,
+        &MemFault::Fault {
+            pc: fault_vram,
+            retired: if branch_delay {
+                "(executed - 2)"
+            } else {
+                "executed"
+            },
+        },
+    );
+    true
+}
+
+/// ERET is a privileged transfer without a delay slot. The arbitrary-PC lane
+/// can express it directly as a resolved transfer after applying CP0/LLbit
+/// state; whole-function output retains its host-boundary trap because it has
+/// no typed transfer return.
+fn emit_bank_eret(out: &mut String, instr: Instruction, bank: BankId) -> bool {
+    if !matches!(instr, Instruction::Eret) {
+        return false;
+    }
+    let _ = writeln!(out, "            executed += 1;");
+    let _ = writeln!(out, "            let target = ctx.exception_return_pc();");
+    let _ = writeln!(out, "            finish!(BlockExit::ResolveTransfer {{");
+    let _ = writeln!(
+        out,
+        "                source_bank: BankId::new({:#018X}),",
+        bank.get()
+    );
+    let _ = writeln!(out, "                target_pc: GuestPc::new(target),");
+    let _ = writeln!(out, "            }});");
+    true
+}
+
+/// Emit a synchronous architectural exception for an arbitrary-PC runner.
+/// Whole-function output retains its historical loud panic until it also has
+/// an exception-return ABI; the block lane can preserve exact bank/PC/EPC/BD
+/// context in its existing typed `BlockExit::Fault` boundary today.
+fn emit_bank_exception(
+    out: &mut String,
+    instr: Instruction,
+    fault_vram: u32,
+    epc: u32,
+    branch_delay: bool,
+    bank: BankId,
+    already_counted: bool,
+) -> bool {
+    use Instruction::*;
+    let (condition, exception, code) = match instr {
+        Syscall { code } => (None, "Syscall", code),
+        Break { code } => (None, "Breakpoint", code),
+        Tge { rs, rt, code } => (
+            Some(format!("{} >= {}", rs64(rs), rs64(rt))),
+            "Trap",
+            code as u32,
+        ),
+        Tgeu { rs, rt, code } => (
+            Some(format!("{} >= {}", ru64(rs), ru64(rt))),
+            "Trap",
+            code as u32,
+        ),
+        Tlt { rs, rt, code } => (
+            Some(format!("{} < {}", rs64(rs), rs64(rt))),
+            "Trap",
+            code as u32,
+        ),
+        Tltu { rs, rt, code } => (
+            Some(format!("{} < {}", ru64(rs), ru64(rt))),
+            "Trap",
+            code as u32,
+        ),
+        Teq { rs, rt, code } => (Some(format!("{} == {}", r(rs), r(rt))), "Trap", code as u32),
+        Tne { rs, rt, code } => (Some(format!("{} != {}", r(rs), r(rt))), "Trap", code as u32),
+        Tgei { rs, imm } => (
+            Some(format!("{} >= {}i64", rs64(rs), imm as i64)),
+            "Trap",
+            0,
+        ),
+        Tgeiu { rs, imm } => (
+            Some(format!("{} >= {}u64", ru64(rs), imm as i64 as u64)),
+            "Trap",
+            0,
+        ),
+        Tlti { rs, imm } => (Some(format!("{} < {}i64", rs64(rs), imm as i64)), "Trap", 0),
+        Tltiu { rs, imm } => (
+            Some(format!("{} < {}u64", ru64(rs), imm as i64 as u64)),
+            "Trap",
+            0,
+        ),
+        Teqi { rs, imm } => (
+            Some(format!("{} == {}i64", rs64(rs), imm as i64)),
+            "Trap",
+            0,
+        ),
+        Tnei { rs, imm } => (
+            Some(format!("{} != {}i64", rs64(rs), imm as i64)),
+            "Trap",
+            0,
+        ),
+        _ => return false,
+    };
+    if let Some(condition) = &condition {
+        let _ = writeln!(out, "            if {condition} {{");
+    }
+    let pad = if condition.is_some() { "    " } else { "" };
+    if !already_counted {
+        let _ = writeln!(out, "            {pad}executed += 1;");
+    }
+    let _ = writeln!(out, "            {pad}finish!(BlockExit::Fault(CpuFault {{");
+    let _ = writeln!(out, "            {pad}    at: ExecutionKey::new(BankId::new({:#018X}), GuestPc::new({fault_vram:#010X})),", bank.get());
+    let _ = writeln!(out, "            {pad}    kind: CpuFaultKind::Exception {{");
+    let _ = writeln!(
+        out,
+        "            {pad}        exception: CpuException::{exception},"
+    );
+    let _ = writeln!(
+        out,
+        "            {pad}        epc: GuestPc::new({epc:#010X}),"
+    );
+    let _ = writeln!(
+        out,
+        "            {pad}        branch_delay: {branch_delay},"
+    );
+    let _ = writeln!(
+        out,
+        "            {pad}        instruction_code: {code:#010X},"
+    );
+    let _ = writeln!(out, "            {pad}        bad_vaddr: None,");
+    let _ = writeln!(out, "            {pad}        coprocessor: None,");
+    let _ = writeln!(out, "            {pad}    }},");
+    let _ = writeln!(out, "            {pad}}}));");
+    if condition.is_some() {
+        let _ = writeln!(out, "            }}");
+    }
+    true
+}
+
 fn emit_trap(out: &mut String, condition: &str, mnemonic: &str, code: u16) {
     let _ = writeln!(
         out,
@@ -1140,55 +1550,37 @@ fn emit_trap(out: &mut String, condition: &str, mnemonic: &str, code: u16) {
     );
 }
 
-/// How a guest load/store outside backed RDRAM is emitted.
-///
-/// The historical whole-function lane keeps the unchecked accessors and the
-/// host panic they raise ([`MemFault::Panic`]) — its codegen is byte-identical
-/// to before U4. The block/sparse runner lane raises a typed VR4300 memory
-/// fault instead ([`MemFault::Fault`]): each access uses `Rdram::try_*` and, on
-/// an out-of-bounds effective address, returns `BlockRun` with
-/// `BlockExit::Fault(CpuFault { kind: MemoryFault { addr }, .. })` through the
-/// `finish!` macro the runner body defines.
+fn emit_data_control_word(out: &mut String, vram: u32) {
+    let _ = writeln!(
+        out,
+        "            panic!(\"control transfer at {vram:#010X} has no admitted delay slot or is architecturally UNPREDICTABLE in a delay slot\");"
+    );
+}
+
+/// Selects the historical panicking memory boundary for whole-function output
+/// or the typed out-of-range boundary required by arbitrary-PC runners.
 #[derive(Clone, Copy)]
 enum MemFault {
-    /// Function lane: `mem.load_*/store_*`; out-of-bounds is a host panic.
     Panic,
-    /// Block lane: `mem.try_*`; out-of-bounds is a typed `MemoryFault`.
-    ///
-    /// `pc` is the faulting instruction's vram (reported as the fault's PC).
-    /// `retired` is the Rust expression for the instruction count to report:
-    /// the count of instructions that fully retired *before* the faulting one.
-    /// For a straight-line access that is `"executed"` (not yet incremented for
-    /// this instruction). For an access in a branch delay slot it is
-    /// `"(executed - 2)"`, because the runner charges the branch/delay pair
-    /// (`executed += 2`) before emitting the delay slot, yet a delay-slot fault
-    /// annuls the branch: neither the branch nor the delay slot retire.
     Fault { pc: u32, retired: &'static str },
 }
 
 impl MemFault {
-    /// The `finish!(...)` statement a checked access runs on an out-of-bounds
-    /// effective address bound to `__fa`. Only valid for [`MemFault::Fault`].
-    fn finish(&self) -> String {
-        match *self {
-            MemFault::Panic => {
-                unreachable!("MemFault::Panic has no typed-fault finish statement")
-            }
-            MemFault::Fault { pc, retired } => format!(
+    fn finish(self) -> String {
+        match self {
+            Self::Panic => unreachable!("panicking memory accesses do not emit a typed fault"),
+            Self::Fault { pc, retired } => format!(
                 "return BlockRun::new(BlockExit::Fault(CpuFault {{ at: ExecutionKey::new(expected_bank, GuestPc::new({pc:#010X})), kind: CpuFaultKind::MemoryFault {{ addr: __fa }} }}), {retired});"
             ),
         }
     }
 
-    /// Emit a store. `unchecked` is the full function-lane statement, verbatim
-    /// (e.g. `mem.store_w(A, V);`); `checked` is the corresponding `try_` call
-    /// expression (e.g. `mem.try_store_w(A, V)`) that returns `Result<(), u64>`.
-    fn store(&self, out: &mut String, unchecked: &str, checked: &str) {
+    fn store(self, out: &mut String, unchecked: &str, checked: &str) {
         match self {
-            MemFault::Panic => {
+            Self::Panic => {
                 let _ = writeln!(out, "            {unchecked}");
             }
-            MemFault::Fault { .. } => {
+            Self::Fault { .. } => {
                 let _ = writeln!(
                     out,
                     "            if let Err(__fa) = {checked} {{ {} }}",
@@ -1198,26 +1590,21 @@ impl MemFault {
         }
     }
 
-    /// Emit a load whose value feeds `consume(value_expr)`. `unchecked` is the
-    /// full function-lane value expression, verbatim (e.g. `mem.load_w(A)`);
-    /// `checked` is the `try_` call (e.g. `mem.try_load_w(A)`) returning
-    /// `Result<T, u64>`. For the block lane the load is lifted to a `match`
-    /// that faults on out-of-bounds and binds the value for `consume`.
     fn load(
-        &self,
+        self,
         out: &mut String,
         unchecked: &str,
         checked: &str,
         consume: impl FnOnce(&str) -> String,
     ) {
         match self {
-            MemFault::Panic => {
+            Self::Panic => {
                 let _ = writeln!(out, "            {}", consume(unchecked));
             }
-            MemFault::Fault { .. } => {
+            Self::Fault { .. } => {
                 let _ = writeln!(
                     out,
-                    "            let __mv = match {checked} {{ Ok(v) => v, Err(__fa) => {{ {} }} }}; {}",
+                    "            let __mv = match {checked} {{ Ok(value) => value, Err(__fa) => {{ {} }} }}; {}",
                     self.finish(),
                     consume("__mv")
                 );
@@ -1226,115 +1613,45 @@ impl MemFault {
     }
 }
 
-/// Emit LL (load-linked word). Compound because it also arms the LL/SC
-/// reservation, so it does not fit the single-expression [`MemFault::load`].
-fn emit_ll(out: &mut String, mem_fault: &MemFault, rt: Reg, base: Reg, off: i16) {
-    let a = format!("Rdram::eff_addr({}, {})", r(base), off);
+fn emit_ll(out: &mut String, mem_fault: MemFault, rt: Reg, base: Reg, off: i16) {
+    let addr = format!("Rdram::eff_addr({}, {})", r(base), off);
     match mem_fault {
         MemFault::Panic => {
-            let _ = writeln!(
-                out,
-                "            {{ let a = {a}; let v = mem.load_w(a); ctx.set_r32({rt}, v); ctx.set_ll_reservation(a, 4); }}"
-            );
+            let _ = writeln!(out, "            {{ let addr = {addr}; let value = mem.load_w(addr); ctx.set_r32({rt}, value); ctx.set_ll_reservation(addr, 4); }}");
         }
         MemFault::Fault { .. } => {
-            let _ = writeln!(
-                out,
-                "            {{ let a = {a}; let v = match mem.try_load_w(a) {{ Ok(v) => v, Err(__fa) => {{ {} }} }}; ctx.set_r32({rt}, v); ctx.set_ll_reservation(a, 4); }}",
-                mem_fault.finish()
-            );
+            let _ = writeln!(out, "            {{ let addr = {addr}; let value = match mem.try_load_w(addr) {{ Ok(value) => value, Err(__fa) => {{ {} }} }}; ctx.set_r32({rt}, value); ctx.set_ll_reservation(addr, 4); }}", mem_fault.finish());
         }
     }
 }
 
-/// Emit LLD (load-linked doubleword).
-fn emit_ll_d(out: &mut String, mem_fault: &MemFault, rt: Reg, base: Reg, off: i16) {
-    let a = format!("Rdram::eff_addr({}, {})", r(base), off);
+fn emit_lld(out: &mut String, mem_fault: MemFault, rt: Reg, base: Reg, off: i16) {
+    let addr = format!("Rdram::eff_addr({}, {})", r(base), off);
     match mem_fault {
         MemFault::Panic => {
-            let _ = writeln!(
-                out,
-                "            {{ let a = {a}; let v = mem.load_d(a); ctx.set_r({rt}, v); ctx.set_ll_reservation(a, 8); }}"
-            );
+            let _ = writeln!(out, "            {{ let addr = {addr}; let value = mem.load_d(addr); ctx.set_r({rt}, value); ctx.set_ll_reservation(addr, 8); }}");
         }
         MemFault::Fault { .. } => {
-            let _ = writeln!(
-                out,
-                "            {{ let a = {a}; let v = match mem.try_load_d(a) {{ Ok(v) => v, Err(__fa) => {{ {} }} }}; ctx.set_r({rt}, v); ctx.set_ll_reservation(a, 8); }}",
-                mem_fault.finish()
-            );
+            let _ = writeln!(out, "            {{ let addr = {addr}; let value = match mem.try_load_d(addr) {{ Ok(value) => value, Err(__fa) => {{ {} }} }}; ctx.set_r({rt}, value); ctx.set_ll_reservation(addr, 8); }}", mem_fault.finish());
         }
     }
 }
 
-/// Emit SC (store-conditional word) or SCD (doubleword when `double`). The
-/// store executes only when the reservation still holds; a held reservation to
-/// an unbacked address is a typed memory fault in the block lane.
-fn emit_sc(out: &mut String, mem_fault: &MemFault, rt: Reg, base: Reg, off: i16, double: bool) {
-    let a = format!("Rdram::eff_addr({}, {})", r(base), off);
-    let (val, width, store, try_store) = if double {
+fn emit_sc(out: &mut String, mem_fault: MemFault, rt: Reg, base: Reg, off: i16, double: bool) {
+    let addr = format!("Rdram::eff_addr({}, {})", r(base), off);
+    let (value, width, store, checked_store) = if double {
         (ru64(rt), 8, "store_d", "try_store_d")
     } else {
         (ru32(rt), 4, "store_w", "try_store_w")
     };
     match mem_fault {
         MemFault::Panic => {
-            let _ = writeln!(
-                out,
-                "            {{ let a = {a}; let v = {val}; if ctx.take_ll_reservation(a, {width}) {{ mem.{store}(a, v); ctx.set_r({rt}, 1); }} else {{ ctx.set_r({rt}, 0); }} }}"
-            );
+            let _ = writeln!(out, "            {{ let addr = {addr}; let value = {value}; if ctx.take_ll_reservation(addr, {width}) {{ mem.{store}(addr, value); ctx.set_r({rt}, 1); }} else {{ ctx.set_r({rt}, 0); }} }}");
         }
         MemFault::Fault { .. } => {
-            let _ = writeln!(
-                out,
-                "            {{ let a = {a}; let v = {val}; if ctx.take_ll_reservation(a, {width}) {{ if let Err(__fa) = mem.{try_store}(a, v) {{ {} }} ctx.set_r({rt}, 1); }} else {{ ctx.set_r({rt}, 0); }} }}",
-                mem_fault.finish()
-            );
+            let _ = writeln!(out, "            {{ let addr = {addr}; let value = {value}; if ctx.take_ll_reservation(addr, {width}) {{ if let Err(__fa) = mem.{checked_store}(addr, value) {{ {} }} ctx.set_r({rt}, 1); }} else {{ ctx.set_r({rt}, 0); }} }}", mem_fault.finish());
         }
     }
-}
-
-/// Emit the delay-slot word of a control transfer.
-///
-/// The delay slot runs as an ordinary instruction, so it is normally
-/// [`emit_straight`]. A delay slot whose *bytes* happen to decode as a
-/// branch/jump/`jr` is architecturally impossible to execute as a transfer —
-/// MIPS III leaves a control transfer inside a delay slot UNPREDICTABLE, and
-/// such a word is admitted only because a `jr`-shaped data run was proven code.
-/// It is never reached by legitimate control flow (nothing branches through
-/// it as a real transfer), but the arm must still compile, so emit a loud
-/// runtime trap rather than [`emit_straight`]'s `compile_error!`. This keeps
-/// the "no silent shrug" contract: if one ever executes, it panics with its PC.
-fn emit_delay_slot(out: &mut String, instr: Instruction, vram: u32, mem_fault: &MemFault) {
-    if instr.has_delay_slot() {
-        // The instruction's Debug form contains braces; keep it out of the
-        // generated `panic!` format string (which would misparse them) — the PC
-        // alone identifies the site.
-        let _ = writeln!(
-            out,
-            "            panic!(\"control transfer in delay slot at {vram:#010X} is architecturally UNPREDICTABLE (misclassified data)\");"
-        );
-    } else {
-        emit_straight(out, instr, vram, mem_fault);
-    }
-}
-
-/// Emit the arm for a control-transfer-shaped word that is proven code but
-/// whose delay slot no proven block admits.
-///
-/// A genuine control transfer always has a proven delay slot, re-attached to its
-/// block before emission. Reaching this path means the word's successor is
-/// unproven: the "transfer" is misclassified data (or an inconsistent decode)
-/// that cannot execute soundly — a delay slot it cannot supply. It is never
-/// reached by legitimate control flow, but the arm must compile, so it is a loud
-/// runtime trap carrying its PC rather than a silent no-op.
-fn emit_data_control_word(out: &mut String, vram: u32) {
-    // The PC alone identifies the site; the decoded instruction's Debug form is
-    // deliberately left out (its braces would misparse in the format string).
-    let _ = writeln!(
-        out,
-        "            panic!(\"control transfer at {vram:#010X} has no admitted delay slot (misclassified data)\");"
-    );
 }
 
 /// Emit a straight-line (non-control-transfer) instruction as typed Rust.
@@ -1342,6 +1659,12 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
     use Instruction::*;
     let line = |out: &mut String, s: String| {
         let _ = writeln!(out, "            {}", s);
+    };
+    let unsupported = |out: &mut String, context: String| {
+        line(
+            out,
+            format!("fn64_recomp_rs::trap_unsupported({context:?});"),
+        );
     };
     match instr {
         Nop => line(out, "// nop".to_string()),
@@ -1490,50 +1813,50 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
             out,
             &format!("mem.load_w(Rdram::eff_addr({}, {}))", r(base), off),
             &format!("mem.try_load_w(Rdram::eff_addr({}, {}))", r(base), off),
-            |v| format!("ctx.set_r32({rt}, {v});"),
+            |value| format!("ctx.set_r32({rt}, {value});"),
         ),
         Lwu { rt, base, off } => mem_fault.load(
             out,
             &format!("mem.load_w(Rdram::eff_addr({}, {}))", r(base), off),
             &format!("mem.try_load_w(Rdram::eff_addr({}, {}))", r(base), off),
-            |v| format!("ctx.set_r({rt}, {v} as u32 as u64);"),
+            |value| format!("ctx.set_r({rt}, {value} as u32 as u64);"),
         ),
-        Ll { rt, base, off } => emit_ll(out, mem_fault, rt, base, off),
+        Ll { rt, base, off } => emit_ll(out, *mem_fault, rt, base, off),
         Lh { rt, base, off } => mem_fault.load(
             out,
             &format!("mem.load_h(Rdram::eff_addr({}, {}))", r(base), off),
             &format!("mem.try_load_h(Rdram::eff_addr({}, {}))", r(base), off),
-            |v| format!("ctx.set_r32({rt}, {v} as i32);"),
+            |value| format!("ctx.set_r32({rt}, {value} as i32);"),
         ),
         Lhu { rt, base, off } => mem_fault.load(
             out,
             &format!("mem.load_hu(Rdram::eff_addr({}, {}))", r(base), off),
             &format!("mem.try_load_hu(Rdram::eff_addr({}, {}))", r(base), off),
-            |v| format!("ctx.set_r({rt}, {v} as u64);"),
+            |value| format!("ctx.set_r({rt}, {value} as u64);"),
         ),
         Lb { rt, base, off } => mem_fault.load(
             out,
             &format!("mem.load_b(Rdram::eff_addr({}, {}))", r(base), off),
             &format!("mem.try_load_b(Rdram::eff_addr({}, {}))", r(base), off),
-            |v| format!("ctx.set_r32({rt}, {v} as i32);"),
+            |value| format!("ctx.set_r32({rt}, {value} as i32);"),
         ),
         Lbu { rt, base, off } => mem_fault.load(
             out,
             &format!("mem.load_bu(Rdram::eff_addr({}, {}))", r(base), off),
             &format!("mem.try_load_bu(Rdram::eff_addr({}, {}))", r(base), off),
-            |v| format!("ctx.set_r({rt}, {v} as u64);"),
+            |value| format!("ctx.set_r({rt}, {value} as u64);"),
         ),
         Lwl { rt, base, off } => mem_fault.load(
             out,
-            &format!("mem.load_wl(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
-            &format!("mem.try_load_wl(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
-            |v| format!("ctx.set_r32({rt}, {v});"),
+            &format!("mem.load_wl(ctx.r({rt}), Rdram::eff_addr({}, {}))", r(base), off),
+            &format!("mem.try_load_wl(ctx.r({rt}), Rdram::eff_addr({}, {}))", r(base), off),
+            |value| format!("ctx.set_r32({rt}, {value});"),
         ),
         Lwr { rt, base, off } => mem_fault.load(
             out,
-            &format!("mem.load_wr(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
-            &format!("mem.try_load_wr(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
-            |v| format!("ctx.set_r32({rt}, {v});"),
+            &format!("mem.load_wr(ctx.r({rt}), Rdram::eff_addr({}, {}))", r(base), off),
+            &format!("mem.try_load_wr(ctx.r({rt}), Rdram::eff_addr({}, {}))", r(base), off),
+            |value| format!("ctx.set_r32({rt}, {value});"),
         ),
 
         // --- Stores ---
@@ -1562,7 +1885,7 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
             &format!("mem.store_wr(Rdram::eff_addr({}, {}), {});", r(base), off, ru32(rt)),
             &format!("mem.try_store_wr(Rdram::eff_addr({}, {}), {})", r(base), off, ru32(rt)),
         ),
-        Sc { rt, base, off } => emit_sc(out, mem_fault, rt, base, off, false),
+        Sc { rt, base, off } => emit_sc(out, *mem_fault, rt, base, off, false),
 
         // --- 64-bit doubleword ALU immediate ---
         // DADDI/DADDIU: full 64-bit add of rs and the sign-extended immediate;
@@ -1681,20 +2004,20 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
             out,
             &format!("mem.load_d(Rdram::eff_addr({}, {}))", r(base), off),
             &format!("mem.try_load_d(Rdram::eff_addr({}, {}))", r(base), off),
-            |v| format!("ctx.set_r({rt}, {v});"),
+            |value| format!("ctx.set_r({rt}, {value});"),
         ),
-        Lld { rt, base, off } => emit_ll_d(out, mem_fault, rt, base, off),
+        Lld { rt, base, off } => emit_lld(out, *mem_fault, rt, base, off),
         Ldl { rt, base, off } => mem_fault.load(
             out,
-            &format!("mem.load_dl(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
-            &format!("mem.try_load_dl(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
-            |v| format!("ctx.set_r({rt}, {v});"),
+            &format!("mem.load_dl(ctx.r({rt}), Rdram::eff_addr({}, {}))", r(base), off),
+            &format!("mem.try_load_dl(ctx.r({rt}), Rdram::eff_addr({}, {}))", r(base), off),
+            |value| format!("ctx.set_r({rt}, {value});"),
         ),
         Ldr { rt, base, off } => mem_fault.load(
             out,
-            &format!("mem.load_dr(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
-            &format!("mem.try_load_dr(ctx.r({}), Rdram::eff_addr({}, {}))", rt, r(base), off),
-            |v| format!("ctx.set_r({rt}, {v});"),
+            &format!("mem.load_dr(ctx.r({rt}), Rdram::eff_addr({}, {}))", r(base), off),
+            &format!("mem.try_load_dr(ctx.r({rt}), Rdram::eff_addr({}, {}))", r(base), off),
+            |value| format!("ctx.set_r({rt}, {value});"),
         ),
 
         // --- Doubleword stores ---
@@ -1713,7 +2036,7 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
             &format!("mem.store_dr(Rdram::eff_addr({}, {}), {});", r(base), off, ru64(rt)),
             &format!("mem.try_store_dr(Rdram::eff_addr({}, {}), {})", r(base), off, ru64(rt)),
         ),
-        Scd { rt, base, off } => emit_sc(out, mem_fault, rt, base, off, true),
+        Scd { rt, base, off } => emit_sc(out, *mem_fault, rt, base, off, true),
 
         // ================================================================
         // COP1 / FPU.
@@ -1753,23 +2076,23 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
             out,
             &format!("mem.load_w(Rdram::eff_addr({}, {}))", r(base), off),
             &format!("mem.try_load_w(Rdram::eff_addr({}, {}))", r(base), off),
-            |v| format!("ctx.set_f_bits({ft}, {v} as u32);"),
+            |value| format!("ctx.set_f_bits({ft}, {value} as u32);"),
         ),
         Swc1 { ft, base, off } => mem_fault.store(
             out,
-            &format!("mem.store_w(Rdram::eff_addr({}, {}), ctx.f_bits({}));", r(base), off, ft),
-            &format!("mem.try_store_w(Rdram::eff_addr({}, {}), ctx.f_bits({}))", r(base), off, ft),
+            &format!("mem.store_w(Rdram::eff_addr({}, {}), ctx.f_bits({ft}));", r(base), off),
+            &format!("mem.try_store_w(Rdram::eff_addr({}, {}), ctx.f_bits({ft}))", r(base), off),
         ),
         Ldc1 { ft, base, off } => mem_fault.load(
             out,
             &format!("mem.load_d(Rdram::eff_addr({}, {}))", r(base), off),
             &format!("mem.try_load_d(Rdram::eff_addr({}, {}))", r(base), off),
-            |v| format!("ctx.set_d_bits({ft}, {v});"),
+            |value| format!("ctx.set_d_bits({ft}, {value});"),
         ),
         Sdc1 { ft, base, off } => mem_fault.store(
             out,
-            &format!("mem.store_d(Rdram::eff_addr({}, {}), ctx.d_bits({}));", r(base), off, ft),
-            &format!("mem.try_store_d(Rdram::eff_addr({}, {}), ctx.d_bits({}))", r(base), off, ft),
+            &format!("mem.store_d(Rdram::eff_addr({}, {}), ctx.d_bits({ft}));", r(base), off),
+            &format!("mem.try_store_d(Rdram::eff_addr({}, {}), ctx.d_bits({ft}))", r(base), off),
         ),
 
         // --- Single-precision arithmetic ---
@@ -1894,59 +2217,52 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
 
         // --- COP0 system control ---
         //
-        // Count (reg 9) and Compare (reg 11) are the only COP0 registers a
-        // recompiled body legitimately touches (via osGetCount / the timer
-        // path); they live in the typed context as real state. Every other
-        // COP0 register (Status/Cause/EPC/…) is libultra-managed, and the raw
-        // TLB / ERET ops are privileged — those become loud traps, never a
-        // silent nop, so a game that unexpectedly executes one fails audibly.
+        // The typed context owns the modeled COP0 state. Unsupported
+        // registers remain loud; the block lane separately expresses ERET as
+        // a typed arbitrary-PC transfer.
         Mfc0 { rt, cop0d } => match cop0d {
             9 => line(out, format!("ctx.set_r32({}, ctx.cop0_count as i32);", rt)),
             11 => line(out, format!("ctx.set_r32({}, ctx.cop0_compare as i32);", rt)),
-            other => line(
+            0 | 2 | 3 | 5 | 6 | 8 | 10 | 12 | 13 | 14 | 18 | 19 | 30 => line(
                 out,
-                format!(
-                    "panic!(\"unsupported mfc0 from COP0 register {} (libultra-managed); \
-                     fn64-recomp-rs only models Count(9)/Compare(11)\");",
-                    other
-                ),
+                format!("ctx.set_r32({}, ctx.read_cop0({}) as i32);", rt, cop0d),
+            ),
+            other => unsupported(
+                out,
+                format!("unsupported mfc0 from COP0 register {other}"),
             ),
         },
         Mtc0 { rt, cop0d } => match cop0d {
-            9 => line(out, format!("ctx.cop0_count = {};", ru32(rt))),
-            11 => line(out, format!("ctx.cop0_compare = {};", ru32(rt))),
-            other => line(
+            0 | 2 | 3 | 5 | 6 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30 => line(
                 out,
-                format!(
-                    "panic!(\"unsupported mtc0 to COP0 register {} (libultra-managed); \
-                     fn64-recomp-rs only models Count(9)/Compare(11)\");",
-                    other
-                ),
+                format!("ctx.write_cop0({}, {});", cop0d, ru32(rt)),
+            ),
+            other => unsupported(
+                out,
+                format!("unsupported mtc0 to COP0 register {other}"),
             ),
         },
-        Dmfc0 { cop0d, .. } => line(
+        Dmfc0 { cop0d, .. } => unsupported(
             out,
             format!(
-                "panic!(\"unsupported dmfc0 from COP0 register {} (64-bit privileged access)\");",
-                cop0d
+                "unsupported dmfc0 from COP0 register {cop0d} (64-bit privileged access)"
             ),
         ),
-        Dmtc0 { cop0d, .. } => line(
+        Dmtc0 { cop0d, .. } => unsupported(
             out,
             format!(
-                "panic!(\"unsupported dmtc0 to COP0 register {} (64-bit privileged access)\");",
-                cop0d
+                "unsupported dmtc0 to COP0 register {cop0d} (64-bit privileged access)"
             ),
         ),
-        Eret => line(
+        Eret => unsupported(
             out,
-            "panic!(\"eret executed in recompiled code: exception return is host/libultra territory\");"
-                .to_string(),
+            "eret executed in recompiled code: exception return is host/libultra territory"
+                .to_owned(),
         ),
-        Tlbwi => line(out, "panic!(\"tlbwi: TLB is host-managed, not modeled\");".to_string()),
-        Tlbwr => line(out, "panic!(\"tlbwr: TLB is host-managed, not modeled\");".to_string()),
-        Tlbp => line(out, "panic!(\"tlbp: TLB is host-managed, not modeled\");".to_string()),
-        Tlbr => line(out, "panic!(\"tlbr: TLB is host-managed, not modeled\");".to_string()),
+        Tlbwi => line(out, "ctx.tlbwi_record();".to_string()),
+        Tlbwr => unsupported(out, "tlbwr: TLB is host-managed, not modeled".to_owned()),
+        Tlbp => unsupported(out, "tlbp: TLB is host-managed, not modeled".to_owned()),
+        Tlbr => unsupported(out, "tlbr: TLB is host-managed, not modeled".to_owned()),
 
         // --- Cache / sync: no-ops on a coherent host rdram ---
         Cache { op, .. } => {
@@ -1957,10 +2273,9 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
         // --- COP2: unused coprocessor, loud trap ---
         Mfc2 { .. } | Mtc2 { .. } | Cfc2 { .. } | Ctc2 { .. } | Dmfc2 { .. }
         | Dmtc2 { .. } | Cop2Op { .. } | Lwc2 { .. } | Ldc2 { .. } | Swc2 { .. }
-        | Sdc2 { .. } => line(
+        | Sdc2 { .. } => unsupported(
             out,
-            "panic!(\"COP2 access in recompiled code: COP2 is unused on the N64 and not modeled\");"
-                .to_string(),
+            "COP2 access in recompiled code: COP2 is unused on the N64 and not modeled".to_owned(),
         ),
 
         // --- Traps ---

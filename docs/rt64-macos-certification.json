@@ -1,0 +1,164 @@
+{
+  "schema": "fn64.rt64-macos-certification.v1",
+  "platform_claim": "platform-macos",
+  "source": {
+    "rt64_commit": "f0728a2520d5aa735886240de3fee75cc805f6d6",
+    "source_id": "git:f0728a2520d5aa735886240de3fee75cc805f6d6",
+    "provenance": "GitClean",
+    "post_vi_api": "metal-bgra8-unorm"
+  },
+  "recorded_host": {
+    "product": "macOS",
+    "version": "26.5",
+    "build": "25F71",
+    "kernel": "Darwin 25.5.0",
+    "architecture": "arm64",
+    "gpu": "Apple M5 Pro"
+  },
+  "denominator": "Complete fn64 RT64 adapter and public enhancement behavior on a declared macOS version, architecture, and GPU support range.",
+  "cases": [
+    {
+      "id": "backend-lifecycle",
+      "category": "backend",
+      "example": "rt64_metal_backend_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 20,
+      "claims": ["backend-metal"],
+      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-19" }
+    },
+    {
+      "id": "resolution-downsample",
+      "category": "resolution",
+      "example": "rt64_resolution_downsample_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 10,
+      "claims": ["high-resolution-renderer", "downsample-to-original-like"],
+      "recorded": { "status": "pass", "clean_runs": 10, "verified_on": "2026-07-19" }
+    },
+    {
+      "id": "framebuffer-rdram-region",
+      "category": "framebuffer",
+      "example": "rt64_framebuffer_rdram_region_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 10,
+      "claims": ["native-renderer-rdram-sync", "framebuffer-detection-region-copy"],
+      "recorded": { "status": "pass", "clean_runs": 10, "verified_on": "2026-07-19" }
+    },
+    {
+      "id": "framebuffer-enhancement",
+      "category": "framebuffer",
+      "example": "rt64_framebuffer_enhancement_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 10,
+      "claims": ["framebuffer-upscaling", "framebuffer-reinterpretation"],
+      "recorded": { "status": "pass", "clean_runs": 10, "verified_on": "2026-07-19" }
+    },
+    {
+      "id": "texture-replacements",
+      "category": "textures",
+      "example": "rt64_texture_replacement_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 10,
+      "claims": ["texture-pack-dds", "texture-pack-rice-filenames", "texture-pack-async-streaming"],
+      "recorded": { "status": "pass", "clean_runs": 10, "verified_on": "2026-07-19" }
+    },
+    {
+      "id": "latency-skip-buffering",
+      "category": "latency",
+      "example": "rt64_latency_skip_buffering_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 10,
+      "claims": ["latency-skip-buffering"],
+      "recorded": { "status": "pass", "clean_runs": 10, "verified_on": "2026-07-19" }
+    },
+    {
+      "id": "latency-present-early",
+      "category": "latency",
+      "example": "rt64_latency_present_early_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 20,
+      "claims": ["latency-present-early"],
+      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-19" }
+    },
+    {
+      "id": "deferred-debugger",
+      "category": "inspection",
+      "example": "rt64_deferred_debugger_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 20,
+      "claims": ["deferred-frame-history", "debugger-frame-inspection"],
+      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-19" }
+    },
+    {
+      "id": "ubershader-critical-path",
+      "category": "pipelines",
+      "example": "rt64_ubershader_pipeline_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 20,
+      "claims": ["ubershader-no-pipeline-stutter"],
+      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-19" }
+    },
+    {
+      "id": "hfr-hle-cooperation",
+      "category": "generated-frames",
+      "example": "rt64_hfr_interpolation_behavior",
+      "features": ["hfr-evidence"],
+      "repeat_bar": 20,
+      "claims": ["hfr-60-plus-interpolation"],
+      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-20" }
+    },
+    {
+      "id": "extended-gbi-cooperation",
+      "category": "extended-gbi",
+      "example": "rt64_extended_gbi_enhancement_behavior",
+      "features": ["extended-gbi-evidence"],
+      "repeat_bar": 10,
+      "claims": ["extended-gbi"],
+      "recorded": { "status": "pass", "clean_runs": 10, "verified_on": "2026-07-20" }
+    }
+  ],
+  "blockers": [
+    {
+      "id": "recognized-hle-and-extended-gbi",
+      "status": "open",
+      "claims": [],
+      "reason": "The public Extended command-set behavior is closed by guarded non-ROM HLE-dialect gates with strict production-recognition negative controls. A user-owned production-recognized microcode/full-ROM run remains required for release certification and is not inferred from synthetic admission."
+    },
+    {
+      "id": "aspect-and-generated-frames",
+      "status": "open",
+      "claims": [],
+      "reason": "The public HFR renderer-API row is closed by twenty fresh Metal processes that bind a required Extended-v1 handshake, typed 60 Hz refresh and transform-group cooperation, a live Manual-120-Hz transition, workload/present identities, exact midpoint/endpoint pixels, and post-sleep present-call cadence while production recognition stays strict. macOS platform certification remains open because API-call return is not a physical compositor/scanout timestamp."
+    },
+    {
+      "id": "remaining-user-controls",
+      "status": "open",
+      "claims": [],
+      "reason": "The expanded user-control gate isolates Manual refresh targeting, hardware resolve under MSAA4x, idle work, and developer mode with exact active-policy, post-VI, present, and source-resource continuity through live apply and restoration. The blocker remains open for broader mixed-control combinations, recognized-HLE workloads, and physical refresh/resolve-path evidence."
+    },
+    {
+      "id": "remaining-enhancement-controls",
+      "status": "open",
+      "claims": [],
+      "reason": "Every individual pinned enhancement control now has bounded causal Metal evidence, including a twenty-fresh-process S2DEX bilerp predicate matrix and framebuffer-fast-path differential. The non-shrinking platform blocker remains until those controls and combinations are certified through supported recognized HLE tasks rather than only isolated synthetic fixtures."
+    },
+    {
+      "id": "metal-inspector-gui",
+      "status": "open",
+      "claims": [],
+      "reason": "The backend-independent debugger host API is certified, but pinned RT64's ImGui Inspector constructor supports D3D12/Vulkan only and asserts for Metal."
+    },
+    {
+      "id": "full-adapter-rom-coverage",
+      "status": "open",
+      "claims": ["base-rendering-accuracy"],
+      "reason": "The live suite is synthetic and predominantly raw-DPC; complete HLE microcode, full-ROM, fixed-cycle device, and zero-unsupported coverage is not established on macOS."
+    },
+    {
+      "id": "declared-host-range",
+      "status": "open",
+      "claims": [],
+      "reason": "Evidence currently names one macOS 26.5 arm64 Apple-M5-Pro host; the minimum macOS version, architecture set, GPU families, and CI support range are not declared and certified."
+    }
+  ]
+}

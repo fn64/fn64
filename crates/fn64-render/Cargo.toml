@@ -7,3 +7,5 @@ repository.workspace = true
 description = "RenderBackend trait: the graphics seam per docs/DECOUPLING.md. Zero backend here -- see fn64-render-rt64."
 
 [dependencies]
+fn64-runtime = { path = "../fn64-runtime" }
+sha2 = "0.10"

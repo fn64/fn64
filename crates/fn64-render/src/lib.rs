@@ -30,7 +30,20 @@
 //! graph at all.
 #![forbid(unsafe_code)]
 
-use std::fmt;
+mod settings;
+
+use std::{fmt, num::NonZeroU64};
+
+pub use settings::{
+    AspectTarget, DownsampleMultiplier, RefreshRateTarget, RenderAntialiasing, RenderAspectRatio,
+    RenderDisplayBuffering, RenderEmulatorSettings, RenderEnhancementSettings, RenderFiltering,
+    RenderGraphicsApi, RenderHardwareResolve, RenderInternalColorFormat, RenderPolicyApply,
+    RenderPresentationMode, RenderRefreshRate, RenderReplacementAutoPath,
+    RenderReplacementOperation, RenderReplacementPackIdentity, RenderReplacementSettings,
+    RenderReplacementShift, RenderResolution, RenderRestartField, RenderRuntimePolicy,
+    RenderRuntimeSettings, RenderSettingsApply, RenderSettingsError, RenderUpscale2d,
+    ResolutionMultiplier,
+};
 
 /// Public libultra manual's documented `OSTask_t` field shape -- the same
 /// fields as `fn64_runtime::rsp::OsTaskHeader`, redeclared here (see module
@@ -73,11 +86,43 @@ pub const M_AUDTASK: u32 = 2;
 /// frame, per this task's explicit requirement.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum UcodeId {
+    /// Original 16-entry Fast3D polygon microcode using the base GBI wire
+    /// layout.
+    Fast3d,
+    /// Extended 32-entry Fast3DEX polygon microcode using the F3DEX_GBI wire
+    /// layout.
+    F3dex,
+    /// F3DLX polygon microcode. Its wire layout is F3DEX-compatible, while
+    /// its pixel-precision and clipping policy require a distinct identity.
+    F3dlx,
+    /// Legacy F3DLX.Rej polygon microcode with a 64-entry cache and reject-box
+    /// processing in place of clipping.
+    F3dlxRej,
     /// Fast3DEX2 family (the common late-era SDK gfx ucode; both No Mercy
     /// and Ocarina of Time's era used an F3DEX2-family microcode per public
-    /// SDK documentation) -- the only family any backend in this workspace
-    /// targets so far.
+    /// SDK documentation).
     F3dex2,
+    /// Public F3DEX2.NoN variant: the F3DEX_GBI_2 wire with near-plane
+    /// clipping disabled.
+    F3dex2NoN,
+    /// Public F3DEX2.Rej variant: subpixel transforms, 64 vertices, and
+    /// reject-box processing instead of clipping.
+    F3dex2Rej,
+    /// Public F3DLX2.Rej variant: 64 vertices and reject-box processing,
+    /// without subpixel vertex calculations.
+    F3dlx2Rej,
+    /// Known game-era F3DZEX2 identity. Public/allowed materials do not
+    /// specify its family-specific command envelope, so HLE admission is
+    /// intentionally unavailable.
+    F3dzex2,
+    /// Original S2DEX family using the F3DEX_GBI command layout.
+    S2dex,
+    /// S2DEX2 family using the F3DEX_GBI_2 command layout.
+    S2dex2,
+    /// Original L3DEX line family using the F3DEX_GBI command layout.
+    L3dex,
+    /// L3DEX2 line family using the F3DEX_GBI_2 command layout.
+    L3dex2,
     /// Catch-all for a named-but-not-yet-modeled ucode family, so a backend
     /// can advertise partial/experimental support without this enum
     /// growing a variant per guess. `0` is never a real value produced by
@@ -97,6 +142,250 @@ pub enum UcodeId {
 pub struct RenderConfig {
     pub width: u32,
     pub height: u32,
+}
+
+/// VI-manager state that affects scanout at a presentation boundary rather
+/// than RDP rendering. Keeping this separate from [`RenderConfig`] matters:
+/// `osViBlack` changes at V-blank and does not recreate the output surface or
+/// destroy the RDP's most recently rendered image.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ViPixelType {
+    /// No hardware STATUS value was supplied (for backend-only callers).
+    #[default]
+    Unspecified,
+    Blank,
+    Reserved,
+    Rgba16,
+    Rgba32,
+}
+
+/// Public VI STATUS anti-alias/resample selector (bits 8..=9).
+///
+/// `Unspecified` preserves the backend-only presentation seam for callers
+/// that do not supply live VI registers. Every register-derived value is one
+/// of the four hardware modes below.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ViAaMode {
+    #[default]
+    Unspecified,
+    AaResampleAlways,
+    AaResampleWhenNeeded,
+    ResampleOnly,
+    Replicate,
+}
+
+impl ViAaMode {
+    pub const fn from_status(status: u32) -> Self {
+        match (status >> 8) & 3 {
+            0 => Self::AaResampleAlways,
+            1 => Self::AaResampleWhenNeeded,
+            2 => Self::ResampleOnly,
+            3 => Self::Replicate,
+            _ => unreachable!(),
+        }
+    }
+
+    pub const fn status_bits(self) -> Option<u32> {
+        match self {
+            Self::Unspecified => None,
+            Self::AaResampleAlways => Some(0),
+            Self::AaResampleWhenNeeded => Some(1 << 8),
+            Self::ResampleOnly => Some(2 << 8),
+            Self::Replicate => Some(3 << 8),
+        }
+    }
+
+    pub const fn silhouette_aa_enabled(self) -> bool {
+        matches!(self, Self::AaResampleAlways | Self::AaResampleWhenNeeded)
+    }
+
+    pub const fn resampling_enabled(self) -> bool {
+        !matches!(self, Self::Replicate)
+    }
+}
+
+/// Scanout filters selected by the latched VI STATUS register.
+///
+/// These are presentation properties, not RDP render state. Keeping the
+/// decoded register value in this shared type means every backend observes
+/// the exact feature set that became live at the same V-blank as a buffer
+/// swap or VI-manager transition.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ViFilterControl {
+    pub pixel_type: ViPixelType,
+    pub antialias_mode: ViAaMode,
+    pub gamma: bool,
+    pub gamma_dither: bool,
+    pub divot: bool,
+    pub dither_filter: bool,
+}
+
+impl ViFilterControl {
+    pub fn from_status(status: u32) -> Self {
+        let pixel_type = match status & 3 {
+            0 => ViPixelType::Blank,
+            1 => ViPixelType::Reserved,
+            2 => ViPixelType::Rgba16,
+            3 => ViPixelType::Rgba32,
+            _ => unreachable!("VI pixel type is two bits"),
+        };
+        Self {
+            pixel_type,
+            antialias_mode: ViAaMode::from_status(status),
+            gamma: status & (1 << 3) != 0,
+            gamma_dither: status & (1 << 2) != 0,
+            divot: status & (1 << 4) != 0,
+            dither_filter: status & (1 << 16) != 0,
+        }
+    }
+}
+
+/// One public VI X/Y scale-register axis.
+///
+/// US 6,166,748 Figures 35M/35N split each register into a twelve-bit scale
+/// field and a twelve-bit subpixel-offset field. Public VI programming uses
+/// ten fractional bits. Keeping the encoded fields typed prevents scanout
+/// code from confusing host pixels with register subpixels.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ViScaleAxis {
+    step_u2_10: u16,
+    offset_u2_10: u16,
+}
+
+impl ViScaleAxis {
+    pub const FRACTION_BITS: u32 = 10;
+    pub const ONE: u16 = 1 << Self::FRACTION_BITS;
+    const FIELD_MASK: u32 = 0x0fff;
+
+    pub fn from_register(register: u32) -> Self {
+        Self {
+            step_u2_10: (register & Self::FIELD_MASK) as u16,
+            offset_u2_10: ((register >> 16) & Self::FIELD_MASK) as u16,
+        }
+    }
+
+    pub const fn step_u2_10(self) -> u16 {
+        self.step_u2_10
+    }
+
+    pub const fn offset_u2_10(self) -> u16 {
+        self.offset_u2_10
+    }
+}
+
+/// Field provenance attached to one latched VI scanout image.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ViScanoutField {
+    Progressive,
+    InterlacedEven,
+    InterlacedOdd,
+}
+
+impl ViScanoutField {
+    pub const fn interlaced(self) -> bool {
+        !matches!(self, Self::Progressive)
+    }
+}
+
+/// Register-derived digital resampling state latched for one presentation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ViResampleControl {
+    pub x: ViScaleAxis,
+    pub y: ViScaleAxis,
+    pub field: ViScanoutField,
+}
+
+impl ViResampleControl {
+    pub fn from_registers(x_scale: u32, y_scale: u32, status: u32, field: u32) -> Self {
+        let field = if status & (1 << 6) == 0 {
+            assert_eq!(field, 0, "progressive VI scanout cannot carry an odd field");
+            ViScanoutField::Progressive
+        } else {
+            match field {
+                0 => ViScanoutField::InterlacedEven,
+                1 => ViScanoutField::InterlacedOdd,
+                _ => panic!("interlaced VI field {field} exceeds one bit"),
+            }
+        };
+        Self {
+            x: ViScaleAxis::from_register(x_scale),
+            y: ViScaleAxis::from_register(y_scale),
+            field,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ViPresentation {
+    /// Present a black image while VI retrace timing continues normally.
+    pub blanked: bool,
+    /// Interpolate the first two source rows by this public 10-bit factor and
+    /// repeat the resulting row over scanout. `None` disables VI fade.
+    pub fade: Option<u16>,
+    /// Repeat the first source row over the complete scanout image.
+    pub repeat_line: bool,
+    /// Pixel type and analog scanout filters from the latched VI STATUS
+    /// register.
+    pub filters: ViFilterControl,
+    /// Latched VI X/Y scale and field registers. `None` preserves the
+    /// historical backend-only identity scanout for callers without a live
+    /// VI register image.
+    pub resample: Option<ViResampleControl>,
+    /// Deterministic entropy key for scanout noise. Integrated execution uses
+    /// the exact guest cycle of the VI retrace, so repeated runs agree while
+    /// successive fields do not freeze gamma dither to the screen.
+    pub noise_seed: u64,
+}
+
+/// Position and byte layout of an image captured for release evidence.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReleaseCaptureFormat {
+    /// RT64's post-VI swapchain color attachment: blue, green, red, alpha.
+    PostViBgra8Unorm,
+}
+
+/// Backend-owned identity used by fixed-cycle release evidence.
+///
+/// This is a self-report from the registered trait object, not a label supplied
+/// by its host. The default is deliberately unidentified so compatibility and
+/// test backends remain runnable while release capture fails closed unless the
+/// concrete backend implements this evidence seam.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RenderBackendEvidence {
+    Unidentified,
+    Reference,
+    Rt64 {
+        backend_identity: String,
+        source_authoritative: bool,
+        /// Canonical identity of the complete active RT64 runtime policy.
+        settings_sha256: [u8; 32],
+        /// True only when the active policy enables at least one identified
+        /// replacement pack. Configured or staged packs do not qualify.
+        replacement_packs_active: bool,
+    },
+}
+
+/// One renderer-owned image whose presentation is tied to an exact guest
+/// cycle. The backend supplies this only after the corresponding present has
+/// completed; callers must still compare `guest_cycle` with their gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderReleaseCapture {
+    pub guest_cycle: u64,
+    pub backend_identity: String,
+    pub source_authoritative: bool,
+    /// Canonical identity of the complete user/enhancement/emulator/replacement
+    /// policy active for this image. Pending settings or packs that require
+    /// recreation, fail inspection, or fail activation must never be
+    /// substituted here.
+    pub settings_sha256: [u8; 32],
+    pub width: u32,
+    pub height: u32,
+    pub row_bytes: u32,
+    pub format: ReleaseCaptureFormat,
+    /// Completed RT64 workload selected by this presentation.
+    pub workload_id: NonZeroU64,
+    pub present_id: u64,
+    pub bytes: Vec<u8>,
 }
 
 impl RenderConfig {
@@ -121,6 +410,76 @@ pub enum FrameStatus {
     /// yielding, matching `osSpTaskYield`'s real semantics -- the caller is
     /// expected to resume this same task later, not resubmit from scratch.
     Yielded,
+    /// HLE preflight encountered a content-addressed microcode generation it
+    /// cannot execute. The backend has committed no task effects; the runtime
+    /// must run the whole ucode phase from its untouched post-rspboot state
+    /// through the general RSP interpreter.
+    NeedsLle {
+        /// Exact complete live IMEM identity rejected by HLE. Keeping it in
+        /// the typed outcome makes catalog discovery observable without
+        /// weakening admission or scraping diagnostic text.
+        ucode_sha256: [u8; 32],
+    },
+}
+
+/// Whether one successful renderer submission reached an RDP FullSync.
+///
+/// The public RDP contract makes FullSync the source of the DP interrupt; task
+/// type or the mere existence of a DPC range is not equivalent evidence.
+/// Compatibility backends default to `Unidentified`, which remains runnable
+/// for direct rendering but must not drive a fabricated device completion.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum DpFullSyncStatus {
+    #[default]
+    Unidentified,
+    NotReached,
+    Reached,
+}
+
+/// Opaque ownership token for a backend-retained HLE task continuation.
+///
+/// The backend, not the ABI scheduler, owns the renderer-local continuation
+/// state. The scheduler may move this token between `Running` and `Suspended`
+/// states, but may resume it at most once.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RenderTaskContinuation(u64);
+
+impl RenderTaskContinuation {
+    pub const fn new(value: u64) -> Self {
+        assert!(value != 0, "render continuation token must be nonzero");
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Whether a task call begins new work or consumes one retained continuation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RenderTaskStep {
+    Start,
+    Resume(RenderTaskContinuation),
+}
+
+/// Result of one committed renderer chunk.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RenderTaskChunkStatus {
+    Complete,
+    Continue(RenderTaskContinuation),
+    Yielded,
+    NeedsLle { ucode_sha256: [u8; 32] },
+}
+
+/// The task-progress guarantee a backend makes at registration time.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum RenderTaskChunking {
+    /// `process_task_chunk(Start)` is one indivisible compatibility call.
+    #[default]
+    Atomic,
+    /// `Continue(token)` marks a committed boundary at which SIG0 may be
+    /// observed before the token is consumed exactly once.
+    Resumable,
 }
 
 /// Everything that can go wrong at this seam. Every variant is loud/named
@@ -137,6 +496,11 @@ pub enum RenderError {
     /// ucode *contents* (that's the backend's own job, if it wants finer
     /// detection than "not in my declared list").
     UnsupportedUcode { ucode_addr: u32 },
+    /// An ordered HLE preflight reached a self-loaded IMEM generation whose
+    /// exact text digest is not admitted for that family. This is an internal
+    /// typed handoff signal: a transactional backend maps it to
+    /// [`FrameStatus::NeedsLle`] without committing speculative mutations.
+    RequiresLle { ucode_sha256: [u8; 32] },
     /// `task.output_buff`/`output_buff_size` describe a region outside the
     /// `rdram` slice `process_task` was given -- a malformed or
     /// adversarial task header, reported rather than causing a panic or an
@@ -167,6 +531,13 @@ impl fmt::Display for RenderError {
         match self {
             RenderError::UnsupportedUcode { ucode_addr } => {
                 write!(f, "unsupported ucode at rdram offset {ucode_addr:#010x}")
+            }
+            RenderError::RequiresLle { ucode_sha256 } => {
+                write!(f, "microcode SHA-256 ")?;
+                for byte in ucode_sha256 {
+                    write!(f, "{byte:02x}")?;
+                }
+                write!(f, " requires the general RSP LLE path")
             }
             RenderError::InvalidTaskBounds {
                 offset,
@@ -200,6 +571,49 @@ pub trait RenderBackend {
     /// may treat it as a full reset).
     fn create(&mut self, cfg: &RenderConfig) -> Result<(), RenderError>;
 
+    /// Observe one completed CPU/non-RDP halfword store to physical RDRAM.
+    /// The public RDP memory-interface rule assigns a hidden-bit mutation to
+    /// every such store, including a same-value store that byte comparison
+    /// cannot discover later. Backends must state whether they applied that
+    /// mutation to a Rust-owned sidecar; there is deliberately no silent
+    /// default implementation.
+    fn observe_non_rdp_write16(&mut self, write: NonRdpWrite16) -> NonRdpWrite16Disposition;
+
+    /// Stage settings before `create`, or apply live-safe fields after it.
+    /// Backends must return a named error for unsupported settings rather than
+    /// retain the request while rendering with a different configuration.
+    fn apply_runtime_settings(
+        &mut self,
+        _settings: &RenderRuntimeSettings,
+    ) -> Result<RenderSettingsApply, RenderError> {
+        Err(RenderError::Backend {
+            backend: "render-runtime-settings",
+            reason: "registered backend does not implement typed runtime settings".to_string(),
+        })
+    }
+
+    /// Stage or live-apply the complete pinned RT64 enhancement policy.
+    fn apply_enhancement_settings(
+        &mut self,
+        _settings: &RenderEnhancementSettings,
+    ) -> Result<RenderPolicyApply, RenderError> {
+        Err(RenderError::Backend {
+            backend: "render-enhancement-settings",
+            reason: "registered backend does not implement typed enhancement settings".to_string(),
+        })
+    }
+
+    /// Stage or live-apply the complete pinned RT64 emulator/device policy.
+    fn apply_emulator_settings(
+        &mut self,
+        _settings: &RenderEmulatorSettings,
+    ) -> Result<RenderPolicyApply, RenderError> {
+        Err(RenderError::Backend {
+            backend: "render-emulator-settings",
+            reason: "registered backend does not implement typed emulator settings".to_string(),
+        })
+    }
+
     /// Process one RSP gfx task: walk `task`'s display list (rooted at
     /// `task.data_ptr`, per the public libultra manual's `OSTask_t.data_ptr`
     /// field being the display-list start for `M_GFXTASK`) out of `rdram`
@@ -208,7 +622,11 @@ pub trait RenderBackend {
     /// convention, per `docs/DESIGN.md` section 2) -- the backend reads
     /// vertex/texture/matrix data out of it directly, never through any
     /// runtime API, which is the "never reaches back into runtime state"
-    /// invariant made concrete.
+    /// invariant made concrete. `rsp_memory` is the device fabric's ONE
+    /// persistent DMEM/IMEM image. Requiring it at the trait boundary makes
+    /// debug GBI DMA, CPU SP-memory access, LLE overlays, and later commands
+    /// in the same task share state by construction; a backend-private shadow
+    /// is not a conforming implementation.
     ///
     /// `rdram` is `&mut` because on real hardware the RDP writes the
     /// rasterized color image back into DRAM (the framebuffer the VI then
@@ -226,9 +644,85 @@ pub trait RenderBackend {
     fn process_task(
         &mut self,
         rdram: &mut [u8],
+        rsp_memory: &mut fn64_runtime::RspMemory,
         task: &OsTask,
         output_addr: u32,
     ) -> Result<FrameStatus, RenderError>;
+
+    /// Execute one HLE task chunk or resume one backend-owned continuation.
+    ///
+    /// The default is the explicit compatibility adapter: a start delegates
+    /// to the historical atomic `process_task`, while a resume traps by token.
+    /// Backends returning `Continue` must also report `Resumable` from
+    /// `task_chunking` and retain exactly one continuation for that token.
+    fn process_task_chunk(
+        &mut self,
+        rdram: &mut [u8],
+        rsp_memory: &mut fn64_runtime::RspMemory,
+        task: &OsTask,
+        output_addr: u32,
+        step: RenderTaskStep,
+    ) -> Result<RenderTaskChunkStatus, RenderError> {
+        match step {
+            RenderTaskStep::Start => Ok(
+                match self.process_task(rdram, rsp_memory, task, output_addr)? {
+                    FrameStatus::Complete => RenderTaskChunkStatus::Complete,
+                    FrameStatus::Yielded => RenderTaskChunkStatus::Yielded,
+                    FrameStatus::NeedsLle { ucode_sha256 } => {
+                        RenderTaskChunkStatus::NeedsLle { ucode_sha256 }
+                    }
+                },
+            ),
+            RenderTaskStep::Resume(token) => Err(RenderError::Backend {
+                backend: "render-task-continuation",
+                reason: format!(
+                    "atomic backend cannot resume continuation token {}",
+                    token.get()
+                ),
+            }),
+        }
+    }
+
+    fn task_chunking(&self) -> RenderTaskChunking {
+        RenderTaskChunking::Atomic
+    }
+
+    /// Execute a CPU/RSP-produced raw RDP command range selected through the
+    /// DPC start/end registers. `output_addr` is the physical VI framebuffer
+    /// selected at this submission boundary, under the same contract as
+    /// `process_task`; it must not be inferred from backend call history.
+    /// Backends that do not implement raw command execution return a named
+    /// error; the default must never pretend the range rendered successfully.
+    fn process_rdp_commands(
+        &mut self,
+        _rdram: &mut [u8],
+        start: u32,
+        end: u32,
+        _output_addr: u32,
+    ) -> Result<FrameStatus, RenderError> {
+        let reason =
+            format!("raw RDP command execution [{start:#010x}, {end:#010x}) is unsupported");
+        fn64_runtime::record_unsupported_event(
+            fn64_runtime::UnsupportedSubsystem::Render,
+            "render.raw-rdp.default-backend",
+            &reason,
+            None,
+            fn64_runtime::UnsupportedDisposition::ReturnedError,
+        );
+        Err(RenderError::Backend {
+            backend: "render",
+            reason,
+        })
+    }
+
+    /// FullSync result of the immediately preceding successful task, raw DPC
+    /// submission, or committed task chunk. For a resumable task this result
+    /// is cumulative through the returned continuation. Implementations reset
+    /// it to `Unidentified` before new work and publish identified state only
+    /// after commit.
+    fn last_dp_full_sync(&self) -> DpFullSyncStatus {
+        DpFullSyncStatus::Unidentified
+    }
 
     /// Present the most recently rendered frame (swap to screen, or for a
     /// headless backend, finalize it as retrievable). Distinct from
@@ -236,7 +730,25 @@ pub trait RenderBackend {
     /// manager posting a rendered buffer to the display) is a separate
     /// event from RSP task completion -- multiple gfx tasks can render
     /// before one present, matching double/triple-buffering.
-    fn present(&mut self) -> Result<(), RenderError>;
+    fn present(&mut self, vi: ViPresentation) -> Result<(), RenderError>;
+
+    /// Return the most recent completed renderer image for fixed-cycle
+    /// release evidence. Ordinary rendering does not require this opt-in
+    /// capability; asking a backend that cannot prove a typed capture is a
+    /// named error rather than an empty image or stale fallback.
+    fn release_capture(&mut self) -> Result<RenderReleaseCapture, RenderError> {
+        Err(RenderError::Backend {
+            backend: "render-release-capture",
+            reason: "registered backend does not expose typed release capture".to_string(),
+        })
+    }
+
+    /// Report the concrete backend and active capabilities for fixed-cycle
+    /// evidence. Hosts cannot provide this value separately, so a reference
+    /// backend cannot be relabeled as RT64 (or vice versa) after registration.
+    fn release_environment(&self) -> RenderBackendEvidence {
+        RenderBackendEvidence::Unidentified
+    }
 
     /// The output target changed size (a real window resize, or a harness
     /// reconfiguring a headless target). Infallible by design: a backend
@@ -252,6 +764,47 @@ pub trait RenderBackend {
     /// callers are expected to consult this before dispatch too, but
     /// `process_task` is the enforced boundary, not this advisory list.
     fn supported_ucodes(&self) -> &[UcodeId];
+}
+
+/// One post-commit, non-RDP 16-bit write at a canonical physical RDRAM
+/// halfword. Construction rejects sparse KSEG/MMIO offsets and unaligned
+/// addresses so a backend never has to reinterpret guest virtual addresses.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct NonRdpWrite16 {
+    logical_offset: fn64_runtime::RdramAddr,
+    value: u16,
+}
+
+impl NonRdpWrite16 {
+    pub fn new(logical_offset: u32, value: u16) -> Self {
+        assert!(
+            logical_offset < fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u32,
+            "non-RDP halfword write offset {logical_offset:#x} is outside physical RDRAM"
+        );
+        assert!(
+            logical_offset.is_multiple_of(2),
+            "non-RDP halfword write offset {logical_offset:#x} is unaligned"
+        );
+        Self {
+            logical_offset: fn64_runtime::RdramAddr::from_offset(logical_offset),
+            value,
+        }
+    }
+
+    pub const fn logical_offset(self) -> fn64_runtime::RdramAddr {
+        self.logical_offset
+    }
+
+    pub const fn value(self) -> u16 {
+        self.value
+    }
+}
+
+/// Explicit ownership result for [`RenderBackend::observe_non_rdp_write16`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NonRdpWrite16Disposition {
+    AppliedHiddenSidecar,
+    NoRustHiddenSidecar,
 }
 
 #[cfg(test)]
@@ -275,9 +828,14 @@ mod tests {
             Ok(())
         }
 
+        fn observe_non_rdp_write16(&mut self, _write: NonRdpWrite16) -> NonRdpWrite16Disposition {
+            NonRdpWrite16Disposition::NoRustHiddenSidecar
+        }
+
         fn process_task(
             &mut self,
             rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
             task: &OsTask,
             _output_addr: u32,
         ) -> Result<FrameStatus, RenderError> {
@@ -300,7 +858,7 @@ mod tests {
             Ok(FrameStatus::Complete)
         }
 
-        fn present(&mut self) -> Result<(), RenderError> {
+        fn present(&mut self, _vi: ViPresentation) -> Result<(), RenderError> {
             if !self.ready {
                 return Err(RenderError::NotReady("create() not called"));
             }
@@ -328,6 +886,7 @@ mod tests {
         let mut backend: Box<dyn RenderBackend> = Box::new(fake(vec![UcodeId::F3dex2]));
         backend.create(&RenderConfig::new(320, 240)).unwrap();
         let mut rdram = vec![0u8; 4096];
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
         let task = OsTask {
             task_type: M_GFXTASK,
             output_buff: 0,
@@ -335,18 +894,54 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            backend.process_task(&mut rdram, &task, 0).unwrap(),
+            backend
+                .process_task(&mut rdram, &mut rsp_memory, &task, 0)
+                .unwrap(),
             FrameStatus::Complete
         );
-        backend.present().unwrap();
+        backend.present(ViPresentation::default()).unwrap();
+    }
+
+    #[test]
+    fn atomic_chunk_adapter_completes_start_and_rejects_resume() {
+        let mut backend = fake(vec![UcodeId::F3dex2]);
+        backend.create(&RenderConfig::new(1, 1)).unwrap();
+        let mut rdram = vec![0u8; 16];
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
+        assert_eq!(backend.task_chunking(), RenderTaskChunking::Atomic);
+        assert_eq!(
+            backend
+                .process_task_chunk(
+                    &mut rdram,
+                    &mut rsp_memory,
+                    &OsTask::default(),
+                    0,
+                    RenderTaskStep::Start,
+                )
+                .unwrap(),
+            RenderTaskChunkStatus::Complete
+        );
+        let error = backend
+            .process_task_chunk(
+                &mut rdram,
+                &mut rsp_memory,
+                &OsTask::default(),
+                0,
+                RenderTaskStep::Resume(RenderTaskContinuation::new(1)),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot resume continuation token 1"));
     }
 
     #[test]
     fn process_task_before_create_is_not_ready() {
         let mut backend = fake(vec![UcodeId::F3dex2]);
         let mut rdram = vec![0u8; 16];
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
         let err = backend
-            .process_task(&mut rdram, &OsTask::default(), 0)
+            .process_task(&mut rdram, &mut rsp_memory, &OsTask::default(), 0)
             .unwrap_err();
         assert!(matches!(err, RenderError::NotReady(_)));
     }
@@ -356,11 +951,14 @@ mod tests {
         let mut backend = fake(vec![]); // declares NO supported ucodes
         backend.create(&RenderConfig::new(64, 64)).unwrap();
         let mut rdram = vec![0u8; 16];
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
         let task = OsTask {
             ucode: 0x8000_1234,
             ..Default::default()
         };
-        let err = backend.process_task(&mut rdram, &task, 0).unwrap_err();
+        let err = backend
+            .process_task(&mut rdram, &mut rsp_memory, &task, 0)
+            .unwrap_err();
         match err {
             RenderError::UnsupportedUcode { ucode_addr } => assert_eq!(ucode_addr, 0x8000_1234),
             other => panic!("expected UnsupportedUcode, got {other:?}"),
@@ -372,12 +970,15 @@ mod tests {
         let mut backend = fake(vec![UcodeId::F3dex2]);
         backend.create(&RenderConfig::new(64, 64)).unwrap();
         let mut rdram = vec![0u8; 16];
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
         let task = OsTask {
             output_buff: 10,
             output_buff_size: 100,
             ..Default::default()
         };
-        let err = backend.process_task(&mut rdram, &task, 0).unwrap_err();
+        let err = backend
+            .process_task(&mut rdram, &mut rsp_memory, &task, 0)
+            .unwrap_err();
         assert!(matches!(err, RenderError::InvalidTaskBounds { .. }));
     }
 
@@ -393,8 +994,111 @@ mod tests {
     }
 
     #[test]
+    fn default_raw_rdp_unsupported_error_records_typed_evidence() {
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        let mut backend = FakeBackend {
+            ready: true,
+            ucodes: vec![],
+            frames_presented: 0,
+        };
+        let error = backend
+            .process_rdp_commands(&mut [], 0x100, 0x108, 0)
+            .unwrap_err();
+        assert!(error.to_string().contains("is unsupported"));
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].operation.starts_with("render.raw-rdp."));
+        assert_eq!(
+            events[0].disposition,
+            fn64_runtime::UnsupportedDisposition::ReturnedError
+        );
+    }
+
+    #[test]
     fn ucode_id_other_is_distinct_from_named_variants() {
         assert_ne!(UcodeId::Other(0), UcodeId::F3dex2);
+        assert_ne!(UcodeId::Fast3d, UcodeId::F3dex);
+        assert_ne!(UcodeId::F3dex, UcodeId::F3dlx);
+        assert_ne!(UcodeId::F3dlx, UcodeId::F3dlxRej);
+        assert_ne!(UcodeId::F3dex, UcodeId::F3dex2);
+        assert_ne!(UcodeId::F3dex2, UcodeId::F3dex2NoN);
+        assert_ne!(UcodeId::F3dex2NoN, UcodeId::F3dex2Rej);
+        assert_ne!(UcodeId::F3dex2Rej, UcodeId::F3dlx2Rej);
+        assert_ne!(UcodeId::F3dlx2Rej, UcodeId::F3dzex2);
+        assert_ne!(UcodeId::S2dex, UcodeId::S2dex2);
+        assert_ne!(UcodeId::L3dex, UcodeId::L3dex2);
         assert_eq!(UcodeId::Other(7), UcodeId::Other(7));
+    }
+
+    #[test]
+    fn vi_filter_control_decodes_latched_status_bits() {
+        assert_eq!(
+            ViFilterControl::from_status(3 | (2 << 8) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 16),),
+            ViFilterControl {
+                pixel_type: ViPixelType::Rgba32,
+                antialias_mode: ViAaMode::ResampleOnly,
+                gamma: true,
+                gamma_dither: true,
+                divot: true,
+                dither_filter: true,
+            }
+        );
+        assert_eq!(
+            ViFilterControl::from_status(2).pixel_type,
+            ViPixelType::Rgba16
+        );
+
+        for (bits, expected) in [
+            (0, ViAaMode::AaResampleAlways),
+            (1, ViAaMode::AaResampleWhenNeeded),
+            (2, ViAaMode::ResampleOnly),
+            (3, ViAaMode::Replicate),
+        ] {
+            let status = bits << 8;
+            let decoded = ViFilterControl::from_status(status).antialias_mode;
+            assert_eq!(decoded, expected);
+            assert_eq!(decoded.status_bits(), Some(status));
+            assert_eq!(decoded.silhouette_aa_enabled(), bits < 2);
+            assert_eq!(decoded.resampling_enabled(), bits < 3);
+        }
+        assert_eq!(ViAaMode::Unspecified.status_bits(), None);
+        assert!(!ViAaMode::Unspecified.silhouette_aa_enabled());
+        assert!(ViAaMode::Unspecified.resampling_enabled());
+    }
+
+    #[test]
+    fn vi_resample_control_decodes_every_public_scale_and_offset_code() {
+        for code in 0..=0x0fff {
+            let step = ViScaleAxis::from_register(code);
+            assert_eq!(step.step_u2_10(), code as u16);
+            assert_eq!(step.offset_u2_10(), 0);
+
+            let offset = ViScaleAxis::from_register(code << 16);
+            assert_eq!(offset.step_u2_10(), 0);
+            assert_eq!(offset.offset_u2_10(), code as u16);
+        }
+
+        let progressive = ViResampleControl::from_registers(0x0123_0456, 0x0789_0abc, 0, 0);
+        assert_eq!(progressive.x.step_u2_10(), 0x456);
+        assert_eq!(progressive.x.offset_u2_10(), 0x123);
+        assert_eq!(progressive.y.step_u2_10(), 0xabc);
+        assert_eq!(progressive.y.offset_u2_10(), 0x789);
+        assert_eq!(progressive.field, ViScanoutField::Progressive);
+
+        assert_eq!(
+            ViResampleControl::from_registers(0, 0, 1 << 6, 0).field,
+            ViScanoutField::InterlacedEven
+        );
+        assert_eq!(
+            ViResampleControl::from_registers(0, 0, 1 << 6, 1).field,
+            ViScanoutField::InterlacedOdd
+        );
+    }
+
+    #[test]
+    fn vi_scale_axis_ignores_preserved_not_used_register_bits() {
+        let axis = ViScaleAxis::from_register(0xf123_e456);
+        assert_eq!(axis.step_u2_10(), 0x456);
+        assert_eq!(axis.offset_u2_10(), 0x123);
     }
 }

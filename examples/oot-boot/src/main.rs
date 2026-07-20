@@ -20,8 +20,9 @@
 //!    per OoT's OWN linker `.map`: everything before the 469 `ovl_*` actor/
 //!    scene overlays, which are heap-loaded on demand via DmaMgr at runtime,
 //!    NOT pre-mapped at boot -- see games/OOTU/profile.toml's `[segments]`).
-//! 3. Boots thread 0 through the selected C `recomp_entrypoint` or typed-Rust
-//!    `entrypoint`, then drives the same executor: `run_one_step` while
+//! 3. Boots thread 0 through the selected C `recomp_entrypoint`, typed-Rust
+//!    whole-function `entrypoint`, or explicitly supplied bank-qualified
+//!    `BlockProgram`, then drives the same executor: `run_one_step` while
 //!    runnable and `advance_virtual_time` for host VI/timer progress.
 //! 4. On every `osViSwapBuffer_recomp` call (observed via
 //!    `fn64_abi::vi_swap_count()` polling), hashes the pointed-to
@@ -61,6 +62,14 @@ fn env_path(name: &str) -> std::path::PathBuf {
     std::env::var(name)
         .unwrap_or_else(|_| panic!("oot-boot: required environment variable {name} not set"))
         .into()
+}
+
+#[cfg(not(fn64_recomp_rs))]
+fn linked_native_program_identity() -> fn64_boot_harness::NativeProgramArtifactIdentity {
+    fn64_boot_harness::NativeProgramArtifactIdentity::from_hex(env!(
+        "FN64_NATIVE_PROGRAM_ARTIFACT_SHA256"
+    ))
+    .expect("oot-boot build script emitted an invalid native program artifact identity")
 }
 
 /// Open a real host output stream and register it at fn64's AI DMA boundary.
@@ -260,8 +269,16 @@ fn parse_input_script(spec: &str) -> Vec<ScriptStep> {
 
 #[cfg(fn64_recomp_rs)]
 mod host_lookup;
-#[cfg(fn64_recomp_rs)]
+#[cfg(all(fn64_recomp_rs, fn64_recomp_rs_block_program))]
+use host_lookup::host_only_lookup;
+#[cfg(all(fn64_recomp_rs, not(fn64_recomp_rs_block_program)))]
 use host_lookup::recompiled_or_host_lookup;
+
+#[cfg(fn64_recomp_rs)]
+#[path = "../block_program_config.rs"]
+mod block_program_config;
+#[cfg(all(fn64_recomp_rs, fn64_recomp_rs_block_program))]
+mod block_program_pack;
 
 fn main() {
     let rom_path = env_path("ROM");
@@ -269,7 +286,9 @@ fn main() {
     let rom_bytes = std::fs::read(&rom_path)
         .unwrap_or_else(|e| panic!("oot-boot: failed to read ROM {}: {e}", rom_path.display()));
     println!("[oot-boot] ROM size: {} bytes", rom_bytes.len());
-    fn64_abi::load_rom(rom_bytes);
+    let mut rdram = fn64_boot_harness::new_rdram(fn64_boot_harness::TvType::Ntsc);
+    fn64_boot_harness::seed_ipl3_image(&mut rdram, &rom_bytes);
+    fn64_abi::load_rom(rom_bytes.clone());
     // OoT NTSC 1.0's osCartRomInit materializes and returns __CartRomHandle
     // at this guest BSS address (ROM disassembly 0x80005698-0x8000569C and
     // return path 0x800057BC). AudioLoad_Dma later dereferences the public
@@ -283,9 +302,12 @@ fn main() {
     // SRAM (32 KiB); Sram_InitSram DMAs the whole 0x8000-byte save in at boot
     // (funcs_34.c:10636). Ephemeral in-memory store for this boot harness --
     // a persisted FileSaveStorage is a shell concern, not this bring-up's.
-    fn64_abi::set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
-        fn64_runtime::SaveType::SramBanked,
-    )));
+    fn64_abi::set_cartridge_save(
+        fn64_abi::CartridgeSaveType::SramBanked,
+        Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+            fn64_runtime::SaveType::SramBanked,
+        )),
+    );
 
     #[cfg(not(fn64_recomp_rs))]
     let registration = fn64_boot_harness::register_linked_sections();
@@ -319,11 +341,20 @@ fn main() {
     // always-resident sections are marked loaded, matching real boot-time
     // hardware state (no actor overlay has been DMA'd in yet this early).
     #[cfg(not(fn64_recomp_rs))]
-    for section_key in [0usize, 1usize, 2usize] {
-        if let Some(idx) = registration.registry_index(section_key) {
-            fn64_abi::set_section_loaded(idx);
-            println!("[oot-boot] marked section {section_key} (index {idx}) loaded");
+    {
+        for section_key in [0usize, 1usize, 2usize] {
+            if let Some(idx) = registration.registry_index(section_key) {
+                fn64_abi::set_section_loaded(idx);
+                println!("[oot-boot] marked section {section_key} (index {idx}) loaded");
+            }
         }
+        let resident_sections: Vec<_> = registration
+            .sections()
+            .iter()
+            .take(3)
+            .map(|section| (section.rom_addr, section.ram_addr, section.size))
+            .collect();
+        fn64_boot_harness::seed_resident_sections(&mut rdram, &rom_bytes, &resident_sections);
     }
 
     #[cfg(fn64_recomp_rs)]
@@ -337,6 +368,11 @@ fn main() {
         for &section_key in &[0usize, 1, 2] {
             fn64_abi::set_section_loaded(section_indices[section_key]);
         }
+        fn64_boot_harness::seed_resident_sections(
+            &mut rdram,
+            &rom_bytes,
+            &recompiled::RECOMPILED_SECTION_GEOMETRY[..3],
+        );
         println!(
             "[oot-boot] registered {} recompiled section geometries; marked 0/1/2 resident",
             section_indices.len()
@@ -345,10 +381,10 @@ fn main() {
 
     let _ = stand_in_audio_ucode; // kept for reference; real ucode wired below
 
-    // VI retrace: arm a host-chosen approximation (fn64_runtime::vi's doc:
-    // not a hardware-accurate NTSC/PAL constant). 1000 virtual-time units
-    // per field is an arbitrary but documented choice for this harness.
-    fn64_abi::arm_vi_retrace(1000);
+    // Typed IPL video standard is the shared VI/AI clock authority. The first
+    // field uses nominal NTSC timing; the latched OSViMode H/V registers then
+    // refine it from the public VI clock.
+    fn64_abi::configure_tv_type(fn64_boot_harness::TvType::Ntsc);
 
     // Opt-in crash-safe incremental trace flushing BEFORE booting thread 0 --
     // a SIGSEGV mid-boot (as rung 3 hit) must not lose the whole session's
@@ -358,8 +394,89 @@ fn main() {
     // same path from the in-memory copy -- harmless, since by then the
     // incremental sink already has every event that copy will contain).
     const TRACE_PATH: &str = "/tmp/oot-boot-trace.jsonl";
-    let trace_enabled = std::env::var_os("OOT_TRACE").is_some();
-    if trace_enabled {
+    let trace_file_enabled = std::env::var_os("OOT_TRACE").is_some();
+    let release_gate_raw = fn64_boot_harness::parse_release_env_value(
+        "OOT_RELEASE_GATE_CYCLE",
+        std::env::var_os("OOT_RELEASE_GATE_CYCLE"),
+    )
+    .unwrap_or_else(|error| panic!("oot-boot: {error}"));
+    let release_report_raw = fn64_boot_harness::parse_release_env_value(
+        "OOT_RELEASE_REPORT",
+        std::env::var_os("OOT_RELEASE_REPORT"),
+    )
+    .unwrap_or_else(|error| panic!("oot-boot: {error}"));
+    let release_run_event_sha256 = fn64_boot_harness::parse_release_env_value(
+        "OOT_RELEASE_RUN_EVENT_SHA256",
+        std::env::var_os("OOT_RELEASE_RUN_EVENT_SHA256"),
+    )
+    .unwrap_or_else(|error| panic!("oot-boot: {error}"));
+    assert_eq!(
+        release_gate_raw.is_some(),
+        release_report_raw.is_some(),
+        "oot-boot: OOT_RELEASE_GATE_CYCLE and OOT_RELEASE_REPORT must be provided together"
+    );
+    assert_eq!(
+        release_gate_raw.is_some(),
+        release_run_event_sha256.is_some(),
+        "oot-boot: OOT_RELEASE_GATE_CYCLE and OOT_RELEASE_RUN_EVENT_SHA256 must be provided together"
+    );
+    let release_report_present = release_report_raw.is_some();
+    let quiescent_discovery_raw = fn64_boot_harness::parse_release_env_value(
+        "OOT_RELEASE_DISCOVER_QUIESCENT_AFTER",
+        std::env::var_os("OOT_RELEASE_DISCOVER_QUIESCENT_AFTER"),
+    )
+    .unwrap_or_else(|error| panic!("oot-boot: {error}"));
+    let presentation_discovery_raw = fn64_boot_harness::parse_release_env_value(
+        "OOT_RELEASE_DISCOVER_PRESENTATION_AFTER",
+        std::env::var_os("OOT_RELEASE_DISCOVER_PRESENTATION_AFTER"),
+    )
+    .unwrap_or_else(|error| panic!("oot-boot: {error}"));
+    let quiescent_discovery = fn64_boot_harness::parse_quiescent_discovery(
+        quiescent_discovery_raw.as_deref(),
+        release_gate_raw.as_deref(),
+        release_report_present,
+    )
+    .unwrap_or_else(|error| panic!("oot-boot: {error}"));
+    let presentation_discovery = fn64_boot_harness::parse_presentation_discovery(
+        presentation_discovery_raw.as_deref(),
+        quiescent_discovery_raw.is_some(),
+        release_gate_raw.as_deref(),
+        release_report_present,
+    )
+    .unwrap_or_else(|error| panic!("oot-boot: {error}"));
+    if let Some(discovery) = quiescent_discovery {
+        println!(
+            "[oot-boot] diagnostics-only quiescence discovery armed at floor {}; no release report can be written",
+            discovery.floor()
+        );
+    }
+    if let Some(discovery) = presentation_discovery {
+        println!(
+            "[oot-boot] diagnostics-only RT64 presentation discovery armed at floor {}; no release report can be written",
+            discovery.floor()
+        );
+    }
+    let mut release_gate =
+        release_gate_raw
+            .zip(release_report_raw)
+            .zip(release_run_event_sha256)
+            .map(|((raw, report), run_event_sha256)| {
+                let cycle = raw.parse::<u64>().unwrap_or_else(|_| {
+            panic!("oot-boot: OOT_RELEASE_GATE_CYCLE must be an unsigned guest cycle, got {raw:?}")
+                });
+                let report_path = std::path::PathBuf::from(report);
+                let journal_path = report_path.with_extension("unsupported.jsonl");
+                let mut gate = fn64_boot_harness::LiveReleaseGate::new(cycle);
+                gate.arm_with_unsupported_journal(&journal_path, &run_event_sha256)
+                    .unwrap_or_else(|error| panic!("oot-boot: arm live release gate: {error}"));
+                println!(
+                    "[oot-boot] live release gate armed at guest cycle {cycle}; report={}; unsupported_journal={}",
+                    report_path.display(),
+                    journal_path.display()
+                );
+                (gate, report_path)
+            });
+    if trace_file_enabled {
         if let Err(e) = fn64_abi::set_trace_sink_file(TRACE_PATH) {
             eprintln!(
                 "[oot-boot] WARNING: failed to arm incremental trace sink at {TRACE_PATH}: {e} -- \
@@ -368,35 +485,34 @@ fn main() {
         } else {
             println!("[oot-boot] incremental trace sink armed at {TRACE_PATH}");
         }
-    } else {
+    } else if release_gate.is_none()
+        && quiescent_discovery.is_none()
+        && presentation_discovery.is_none()
+    {
         fn64_abi::set_trace_enabled(false);
         println!("[oot-boot] differential trace disabled (set OOT_TRACE=1 to enable)");
+    } else if quiescent_discovery.is_some() {
+        println!("[oot-boot] in-memory trace enabled for quiescence discovery");
+    } else if presentation_discovery.is_some() {
+        println!("[oot-boot] in-memory trace enabled for RT64 presentation discovery");
+    } else {
+        println!("[oot-boot] in-memory timing trace enabled for live release evidence");
     }
 
     // rdram: this process's one shared buffer (docs/DESIGN.md section 3).
-    // `.max(RDRAM_MMIO_WINDOW_END)` (same pattern as examples/wm2000-boot's
-    // harness) is REQUIRED, not just extra headroom: OoT's own boot path
-    // (`CIC6105_SaveBootMagicValues`, `RecompiledFuncs/funcs_0.c`) issues a
-    // raw `MEM_W` load at a KSEG1 (uncached) RDRAM address
+    // OoT's own boot path (`CIC6105_SaveBootMagicValues`,
+    // `RecompiledFuncs/funcs_0.c`) issues a raw `MEM_W` load at a KSEG1
+    // (uncached) RDRAM address
     // (`0xA0300000 - 0x4E0C` / `-0x1E40`, verified byte-exact against
     // `refs/oot-decomp/src/boot/cic6105.c`'s own `IO_READ(0x002FB1F4)` /
     // `IO_READ(0x002FE1C0)` -- KSEG1's `0xA0300000` base is a plain
     // uncached alias of physical RDRAM offset `0x00300000`, so this is
     // real hardware semantics, not a translation bug in `RdramAddr`).
-    // `recomp.h`'s real `MEM_W` macro subtracts the KSEG0 base
-    // unconditionally for every address (verified against
-    // `refs/N64RecompSource/include/recomp.h`), so a KSEG1 address lands
-    // 0x20000000 bytes further into the buffer than the same physical
-    // offset would via KSEG0 -- a flat 8 MB buffer is a real out-of-bounds
-    // read/SIGSEGV here (first hit: this harness's very first
-    // `recomp_entrypoint` call, before any thread/section work even
-    // starts). A plain 8 MB buffer was never big enough for a game that
-    // touches KSEG1-mirrored RDRAM at boot; WM2000/NW4E's own
-    // `RecompiledFuncs` corpora happen not to exercise this address range,
-    // which is why examples/wm2000-boot's identical `.max(...)` guard
-    // never had to fire in that harness's own testing, not because the
-    // sizing itself is game-specific.
-    let mut rdram = fn64_boot_harness::new_rdram(fn64_boot_harness::TvType::Ntsc);
+    // The build-wide proxy now canonicalizes that KSEG0/KSEG1 pair onto the
+    // same physical 8 MiB prefix before dereferencing. The harness still uses
+    // the larger shared allocation because modeled raw MMIO and non-RDRAM
+    // windows retain their sparse generated-code offsets; that capacity is no
+    // longer evidence that uncached RDRAM itself has separate host storage.
     let rdram_ptr = rdram.as_mut_ptr();
 
     // Select the renderer before boot. `FN64_RENDER=rt64` requests the
@@ -416,6 +532,12 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // Performance/release probes retain rendering but omit both capture
+    // producers: the backend's per-task PNG diagnostics and the harness's
+    // per-swap framebuffer dumps below. Leaving the first one armed produced
+    // thousands of log lines and colliding filenames across deterministic
+    // report workers even though the later harness capture was disabled.
+    let perf_no_capture = std::env::var_os("OOT_PERF_NO_CAPTURE").is_some();
     // NOTE: 240 (one full second of NTSC frames) so the capture reaches the
     // frames where real 3D geometry appears -- the first ~8 gfx tasks are
     // OoT's boot/logo screens (large flat gradient background quads), and
@@ -428,23 +550,63 @@ fn main() {
     let create_reference = || -> Box<dyn fn64_render::RenderBackend> {
         let mut backend = fn64_render_rt64::ReferenceBackend::new()
             .with_f3dex2()
-            .with_clear_color([0, 0, 0, 255])
-            .with_auto_dump("/tmp", "fn64-oot-render", 240)
-            .with_auto_dump_skip(render_dump_start);
+            .with_clear_color([0, 0, 0, 255]);
+        if !perf_no_capture {
+            backend = backend
+                .with_auto_dump("/tmp", "fn64-oot-render", 240)
+                .with_auto_dump_skip(render_dump_start);
+        }
         backend
             .create(&fn64_render::RenderConfig::new(320, 240))
             .expect("ReferenceBackend create must be infallible for 320x240");
         Box::new(backend)
     };
-    let requested_renderer = std::env::var("FN64_RENDER")
-        .unwrap_or_else(|_| "reference".to_string())
-        .to_ascii_lowercase();
+    let requested_renderer =
+        fn64_boot_harness::parse_release_env_value("FN64_RENDER", std::env::var_os("FN64_RENDER"))
+            .unwrap_or_else(|error| panic!("oot-boot: {error}"))
+            .unwrap_or_else(|| "reference".to_string())
+            .to_ascii_lowercase();
+    let release_mode_active =
+        release_gate.is_some() || quiescent_discovery.is_some() || presentation_discovery.is_some();
+    assert!(
+        !release_mode_active || matches!(requested_renderer.as_str(), "reference" | "rt64"),
+        "oot-boot: release modes require FN64_RENDER=reference or FN64_RENDER=rt64, got {requested_renderer:?}"
+    );
+    assert!(
+        presentation_discovery.is_none() || requested_renderer == "rt64",
+        "oot-boot: OOT_RELEASE_DISCOVER_PRESENTATION_AFTER requires FN64_RENDER=rt64"
+    );
     let (render_backend, active_renderer): (Box<dyn fn64_render::RenderBackend>, &'static str) =
         if requested_renderer == "rt64" {
             let mut backend = fn64_render_rt64::Rt64Backend::new();
             match backend.create(&fn64_render::RenderConfig::new(320, 240)) {
-                Ok(()) => (Box::new(backend), "rt64"),
+                Ok(()) => {
+                    if release_gate.is_some() || presentation_discovery.is_some() {
+                        backend.enable_present_capture().unwrap_or_else(|error| {
+                            panic!(
+                                "oot-boot: RT64 release evidence requires post-VI capture: {error}"
+                            )
+                        });
+                        #[cfg(feature = "rt64")]
+                        let identity = fn64_render_rt64::Rt64Backend::release_identity();
+                        #[cfg(feature = "rt64")]
+                        assert!(
+                            identity.is_source_authoritative(),
+                            "oot-boot: RT64 release evidence requires a clean Git source identity, got {}",
+                            identity.canonical_id()
+                        );
+                        #[cfg(not(feature = "rt64"))]
+                        unreachable!(
+                            "RT64 create cannot succeed without the example's `rt64` feature"
+                        );
+                    }
+                    (Box::new(backend), "rt64")
+                }
                 Err(error) => {
+                    assert!(
+                        release_gate.is_none() && presentation_discovery.is_none(),
+                        "oot-boot: RT64 release evidence cannot fall back after create failed: {error}"
+                    );
                     eprintln!(
                         "[oot-boot] WARNING: RT64 create failed ({error}); falling back to the \
                          ReferenceBackend oracle"
@@ -461,10 +623,19 @@ fn main() {
             }
             (create_reference(), "reference")
         };
-    fn64_abi::set_render_backend(render_backend, rdram.len());
+    // This harness is the release/parity evidence path. Execute the ROM's
+    // loaded graphics microcode through the clean-room RSP interpreter and
+    // give the selected backend only the resulting raw DPC stream; the
+    // interactive shell retains the explicitly documented HLE optimization.
+    fn64_abi::set_render_backend_with_policy(
+        render_backend,
+        rdram.len(),
+        fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy,
+    );
     println!(
-        "[oot-boot] registered {active_renderer} renderer (320x240); reference/fallback \
-         auto-dumps honor OOT_RENDER_DUMP_START={render_dump_start}"
+        "[oot-boot] registered {active_renderer} renderer (320x240), graphics ucode=LLE \
+         accuracy; reference/fallback auto-dumps honor \
+         OOT_RENDER_DUMP_START={render_dump_start}"
     );
 
     wire_audio_output(rdram.len());
@@ -490,20 +661,66 @@ fn main() {
     );
 
     println!("[oot-boot] booting thread 0 (recomp_entrypoint)...");
-    #[cfg(fn64_recomp_rs)]
+    #[cfg(all(fn64_recomp_rs, not(fn64_recomp_rs_block_program)))]
     {
         fn64_recomp_rs::set_host_lookup(Some(recompiled_or_host_lookup));
+        let artifact_sha256 = block_program_config::parse_lowercase_sha256(env!(
+            "FN64_RECOMP_RS_FUNCTION_ARTIFACT_SHA256"
+        ))
+        .expect("oot-boot build script emitted an invalid generated-Rust source SHA-256");
+        let artifact_identity = fn64_recomp_rs::ProgramArtifactIdentity::new(artifact_sha256);
         println!(
-            "[oot-boot] FN64_RECOMP=rs: linked oot-recompiled crate + host-first recompiled adapters active"
+            "[oot-boot] FN64_RECOMP=rs: linked observed oot-recompiled crate + host-first adapters active; generated_source_sha256={}",
+            env!("FN64_RECOMP_RS_FUNCTION_ARTIFACT_SHA256")
         );
         // SAFETY: `rdram` is the process-wide allocation and remains live
         // until every executor coroutine is dropped at process shutdown.
         unsafe {
-            fn64_abi::recompiled::boot_thread0(
+            fn64_abi::recompiled::boot_thread0_with_execution_observation(
                 rdram_ptr,
                 rdram.len(),
                 recompiled::lookup,
                 recompiled::entrypoint,
+                artifact_identity,
+                recompiled::FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA,
+                0,
+                10,
+            );
+        }
+    }
+    #[cfg(all(fn64_recomp_rs, fn64_recomp_rs_block_program))]
+    {
+        // The block lane must never fall through to the whole-function guest
+        // lookup. Only named host ABI adapters are installed; every guest
+        // destination must resolve through the selected bank-qualified pack.
+        fn64_recomp_rs::set_host_lookup(Some(host_only_lookup));
+        let loaded = block_program_pack::load();
+        let program_sha256: String = loaded
+            .program
+            .evidence_snapshot()
+            .identity
+            .identity
+            .bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        println!(
+            "[oot-boot] FN64_RECOMP=rs, FN64_RS_EXECUTION=block: authoritative BlockProgram active; entry={} budget={} canonical_program_sha256={program_sha256}",
+            loaded.entry,
+            loaded.budget.get()
+        );
+        // SAFETY: `rdram` is the process-wide allocation and remains live
+        // until every executor coroutine is dropped at process shutdown.
+        unsafe {
+            fn64_abi::recompiled::boot_thread0_block_program_with_artifact_identity(
+                rdram_ptr,
+                rdram.len(),
+                loaded.program,
+                loaded.entry,
+                block_program_pack::entry_lookup,
+                block_program_pack::transfer_lookup,
+                loaded.budget,
+                loaded.artifact_identity,
                 0,
                 10,
             );
@@ -511,20 +728,23 @@ fn main() {
     }
     #[cfg(not(fn64_recomp_rs))]
     unsafe {
-        fn64_abi::boot_thread0(rdram_ptr, fn64_boot_harness::c_recomp_entrypoint(), 0, 10);
+        fn64_abi::boot_thread0(
+            rdram_ptr,
+            rdram.len(),
+            fn64_boot_harness::c_recomp_entrypoint(),
+            0,
+            10,
+        );
     }
 
-    // Drive boot for a bounded number of scheduling STEPS, not an unbounded
-    // inner drain loop -- a thread that keeps calling pause_self (or any
-    // other always-immediately-runnable yield) in a tight loop is a REAL,
-    // legitimate boot state (rung 14's own precedent: an idle-thread self-
-    // loop), and an inner `while run_one_step() {}` never returns in that
-    // case, hanging the harness with no diagnostic. Every step is counted
-    // against ONE shared budget and logged periodically so a genuine
-    // infinite idle-spin is visible (many steps, sim_time barely advancing)
-    // rather than silently indistinguishable from real progress.
+    // Drive boot for a bounded number of scheduling steps while advancing a
+    // virtual field only at guest quiescence. Counting 100 resumptions per
+    // field made time depend on compiler checkpoint density: the Rust lane
+    // could receive a VI retrace before finishing work the atomic C lane had
+    // already completed. One observable idle-thread turn followed by another
+    // idle turn (or an empty run queue) closes that exact interleaving without
+    // letting a voluntary idle loop hang the harness.
     const MAX_STEPS: u64 = 2_000_000;
-    const TICK_STEP: u64 = 100;
     const LOG_EVERY: u64 = 50_000;
     // Feedback-loop speedup: `OOT_MAX_SWAPS=N` stops the boot as soon as N VI
     // swaps have happened, instead of grinding the full 2M-step budget.
@@ -543,11 +763,6 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(MAX_STEPS);
     let stop_on_frame: bool = std::env::var("OOT_STOP_ON_FRAME").is_ok();
-    // Performance probes must not include the harness's per-swap PNG encoder
-    // and filesystem writes. Default capture behavior remains unchanged;
-    // this flag affects diagnostics only, never guest execution or rendering.
-    let perf_no_capture = std::env::var_os("OOT_PERF_NO_CAPTURE").is_some();
-
     // Scripted controller input (the INPUT-SEAM deliverable). `OOT_INPUT_SCRIPT`
     // is a comma-separated list of `frame:BUTTON[+BUTTON...][@stickX/stickY]`
     // steps, keyed by VI-swap count (one swap ~= one displayed frame). At each
@@ -583,8 +798,8 @@ fn main() {
     let mut thread0_death_logged = false;
     let mut consecutive_idle_ticks = 0u32;
 
-    let mut tick = 0u64;
     let mut steps = 0u64;
+    let mut drain = fn64_boot_harness::GuestDrain::default();
     let swap_timing = std::env::var_os("OOT_SWAP_TIMING").is_some();
     let state_trace = std::env::var_os("OOT_STATE_TRACE").is_some();
     let mut last_oot_state = None;
@@ -605,8 +820,129 @@ fn main() {
             );
             break;
         }
-        let stepped = fn64_abi::run_one_step();
-        steps += 1;
+        let next_priority = fn64_abi::next_runnable_priority();
+        let drain_decision = drain.before_step(next_priority);
+        let advanced_field = drain_decision == fn64_boot_harness::DrainDecision::AdvanceField;
+        if quiescent_discovery
+            .is_some_and(|discovery| discovery.matches(drain_decision, fn64_abi::sim_time()))
+        {
+            let cycle = fn64_abi::sim_time();
+            let trace = fn64_abi::copy_trace();
+            let device_trace = fn64_abi::copy_device_trace();
+            println!(
+                "[oot-boot] QUIESCENT CYCLE DISCOVERED: cycle={cycle} executor_trace_events={} device_trace_events={}",
+                trace.len(),
+                device_trace.len()
+            );
+            for event in &trace[trace.len().saturating_sub(8)..] {
+                println!("[oot-boot] quiescent executor tail: {event:?}");
+            }
+            for event in &device_trace[device_trace.len().saturating_sub(8)..] {
+                println!("[oot-boot] quiescent device tail: {event:?}");
+            }
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            // SAFETY: diagnostic state is flushed above; skipping coroutine
+            // TLS teardown avoids unwinding suspended extern-C guest frames.
+            unsafe { libc::_exit(0) }
+        }
+        if advanced_field {
+            let before_host_advance = fn64_abi::sim_time();
+            let next_vi = fn64_abi::next_vi_deadline()
+                .expect("typed television standard must keep a VI edge scheduled");
+            let tick = fn64_boot_harness::select_release_vi_edge(
+                before_host_advance,
+                next_vi,
+                release_gate.as_ref().map(|(gate, _)| gate.guest_cycle()),
+            )
+            .unwrap_or_else(|error| panic!("oot-boot: {error}"));
+            #[cfg(fn64_recomp_rs)]
+            let boundary = fn64_boot_harness::commit_scheduled_vi_boundary(tick)
+                .unwrap_or_else(|error| panic!("oot-boot: commit scheduled VI edge: {error}"));
+            #[cfg(not(fn64_recomp_rs))]
+            let boundary = fn64_boot_harness::commit_scheduled_vi_boundary_with_program(
+                tick,
+                fn64_boot_harness::ReleaseProgramDescriptor::NativeArchive(
+                    linked_native_program_identity(),
+                ),
+            )
+            .unwrap_or_else(|error| panic!("oot-boot: commit scheduled VI edge: {error}"));
+            let arrival = fn64_boot_harness::ReleaseCycleArrival::HostAdvanceCommitted;
+
+            if let Some(discovery) = presentation_discovery.filter(|value| tick >= value.floor()) {
+                match fn64_abi::capture_render_release_frame() {
+                    Ok(capture) if discovery.matches(arrival, tick, capture.guest_cycle) => {
+                        assert!(
+                            capture.source_authoritative,
+                            "oot-boot: presentation discovery found non-authoritative backend identity {}",
+                            capture.backend_identity
+                        );
+                        let settings_sha: String = capture
+                            .settings_sha256
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect();
+                        println!(
+                            "[oot-boot] PRESENTATION CYCLE DISCOVERED: cycle={tick} workload_id={} present_id={} post_vi={}x{} row_bytes={} format={:?} settings_sha256={settings_sha} backend_identity={}",
+                            capture.workload_id,
+                            capture.present_id,
+                            capture.width,
+                            capture.height,
+                            capture.row_bytes,
+                            capture.format,
+                            capture.backend_identity
+                        );
+                        let _ = std::io::stdout().flush();
+                        let _ = std::io::stderr().flush();
+                        // SAFETY: diagnostic state is flushed above; skipping
+                        // TLS teardown avoids suspended extern-C guest frames.
+                        unsafe { libc::_exit(0) }
+                    }
+                    Ok(_) => {}
+                    Err(fn64_render::RenderError::NotReady(
+                        "RT64 release capture requested before a completed VI present",
+                    )) => {}
+                    Err(error) => {
+                        panic!("oot-boot: discover RT64 presentation boundary: {error}")
+                    }
+                }
+            }
+
+            let release_due = release_gate.as_ref().is_some_and(|(gate, _)| {
+                fn64_boot_harness::PresentationReleaseBoundary::new(gate.guest_cycle())
+                    .matches(arrival, tick)
+            });
+            if release_due {
+                let (gate, report_path) = release_gate
+                    .take()
+                    .expect("live release gate disappeared before post-advance capture");
+                let report = capture_release_report(
+                    gate,
+                    boundary,
+                    &report_path,
+                    active_renderer,
+                    &rom_bytes,
+                    &rdram,
+                );
+                println!(
+                    "[oot-boot] RELEASE GATE CLOSED at post-advance cycle {tick}: report_sha={} \
+                     artifact_root={} report={}",
+                    report.report_sha256,
+                    report.digest.root_sha256,
+                    report_path.display()
+                );
+                break;
+            }
+            drain.begin_field();
+        } else {
+            let stepped = fn64_abi::run_one_step();
+            assert!(
+                stepped,
+                "guest drain authorized a scheduling step without runnable work"
+            );
+            drain.record_step(next_priority.expect("guest drain lost runnable priority"));
+            steps += 1;
+        }
         if steps.is_multiple_of(LOG_EVERY) {
             println!(
                 "[oot-boot] progress: steps={steps} sim_time={} vi_swaps={} gfx_tasks={} \
@@ -617,6 +953,14 @@ fn main() {
                 fn64_abi::task_counts().1
             );
         }
+        if let Some((gate, _)) = release_gate.as_ref() {
+            let observed_cycle = fn64_abi::sim_time();
+            assert!(
+                observed_cycle <= gate.guest_cycle(),
+                "oot-boot: release gate cycle {} was skipped; current guest cycle is {observed_cycle}",
+                gate.guest_cycle()
+            );
+        }
         // Thread 0 (recomp_entrypoint) returning is EXPECTED, not the end
         // of boot: recomp_entrypoint's own body does `LOOKUP_FUNC(..)(rdram,
         // ctx); return;` once its initial call chain unwinds -- real game
@@ -624,7 +968,7 @@ fn main() {
         // spawned along the way (thread 1, thread 6, etc, per the ladder's
         // own multi-thread evidence). Only log this once, never treat it as
         // "boot ended" -- the executor's run queue (other threads) is the
-        // real signal, handled by `stepped`/the idle-tick counter below.
+        // real signal, handled by the drain/idle-tick counter below.
         if !thread0_death_logged && fn64_abi::is_thread_dead(0) {
             println!(
                 "[oot-boot] thread 0 (recomp_entrypoint) returned at step {steps} -- expected \
@@ -926,12 +1270,12 @@ fn main() {
             }
         }
 
-        if !stepped {
-            // Nothing was runnable -- host-driven progress (VI retrace,
-            // due timers) is the only way forward.
-            tick += TICK_STEP;
-            fn64_abi::advance_virtual_time(tick);
-            consecutive_idle_ticks += 1;
+        if advanced_field {
+            if fn64_abi::next_runnable_priority().is_none() {
+                consecutive_idle_ticks += 1;
+            } else {
+                consecutive_idle_ticks = 0;
+            }
             if consecutive_idle_ticks >= IDLE_TICKS_BEFORE_STOP {
                 println!(
                     "[oot-boot] reached a steady idle state ({IDLE_TICKS_BEFORE_STOP} \
@@ -943,16 +1287,30 @@ fn main() {
             }
         } else {
             consecutive_idle_ticks = 0;
-            // A voluntary `pause_self` idle loop is runnable by definition,
-            // so waiting for `run_one_step == false` would starve host time
-            // forever. Pace the same single-threaded executor every 100
-            // scheduling steps; this is host clock injection, not a second
-            // game/executor thread (docs/DESIGN.md's one-runnable-token rule).
-            if steps.is_multiple_of(100) {
-                tick += TICK_STEP;
-                fn64_abi::advance_virtual_time(tick);
-            }
         }
+    }
+
+    if let Some((gate, report_path)) = release_gate.as_ref() {
+        panic!(
+            "oot-boot: stopped before live release gate cycle {}; current cycle={}, report was not written to {}",
+            gate.guest_cycle(),
+            fn64_abi::sim_time(),
+            report_path.display()
+        );
+    }
+    if let Some(discovery) = quiescent_discovery {
+        panic!(
+            "oot-boot: no scheduler quiescence boundary found at or after {} before the bounded run stopped; current cycle={}",
+            discovery.floor(),
+            fn64_abi::sim_time()
+        );
+    }
+    if let Some(discovery) = presentation_discovery {
+        panic!(
+            "oot-boot: no same-cycle RT64 presentation found at or after {} before the bounded run stopped; current cycle={}",
+            discovery.floor(),
+            fn64_abi::sim_time()
+        );
     }
 
     let (gfx_count, audio_count) = fn64_abi::task_counts();
@@ -1032,7 +1390,7 @@ fn main() {
         fb_dumps
     );
 
-    if trace_enabled {
+    if trace_file_enabled {
         let trace = fn64_abi::copy_trace();
         println!("[oot-boot] trace events recorded: {}", trace.len());
         write_trace_file(&trace, TRACE_PATH);
@@ -1083,6 +1441,136 @@ fn find_guest_word(rdram: &[u8], needle: u32) -> Option<usize> {
             let value = u32::from_ne_bytes(bytes.try_into().expect("four-byte chunk"));
             (value == needle && read_guest_u32(rdram, base + 0x98) == 1).then_some(main_field)
         })
+}
+
+fn capture_release_report(
+    gate: fn64_boot_harness::LiveReleaseGate,
+    boundary: fn64_boot_harness::CommittedViBoundary,
+    report_path: &std::path::Path,
+    active_renderer: &str,
+    rom_bytes: &[u8],
+    rdram: &[u8],
+) -> fn64_boot_harness::ReleaseGateReport {
+    let observed_cycle = fn64_abi::sim_time();
+    let memory = fn64_boot_harness::LiveMemoryEvidence::full_physical_rdram(logical_rdram_bytes(
+        rdram,
+        0,
+        fn64_boot_harness::DEFAULT_RDRAM_SIZE,
+    ))
+    .unwrap_or_else(|error| panic!("oot-boot: validate complete physical RDRAM: {error}"));
+    #[cfg(fn64_recomp_rs)]
+    let release_scenario =
+        format!("oot-ntsc-1.0-headless-rs-{active_renderer}-lle-accuracy-minimum");
+    #[cfg(not(fn64_recomp_rs))]
+    let release_scenario =
+        format!("oot-ntsc-1.0-headless-c-legacy-{active_renderer}-lle-accuracy-observation");
+    if active_renderer == "rt64" {
+        use fn64_boot_harness::LiveReleaseGateRenderExt as _;
+
+        let capture = fn64_abi::capture_render_release_frame().unwrap_or_else(|error| {
+            panic!("oot-boot: capture RT64 fixed-cycle presentation: {error}")
+        });
+        assert_eq!(
+            capture.guest_cycle, observed_cycle,
+            "oot-boot: RT64 presentation belongs to guest cycle {}, release gate requires {observed_cycle}",
+            capture.guest_cycle
+        );
+        assert!(
+            capture.source_authoritative,
+            "oot-boot: RT64 fixed-cycle capture has non-authoritative backend identity {}",
+            capture.backend_identity
+        );
+        let format = match capture.format {
+            fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm => {
+                fn64_boot_harness::RenderPixelFormat::Bgra8Unorm
+            }
+        };
+        let render = fn64_boot_harness::LiveRenderEvidence::post_vi_swapchain(
+            capture.guest_cycle,
+            capture.backend_identity,
+            capture.settings_sha256,
+            capture.width,
+            capture.height,
+            capture.row_bytes,
+            format,
+            capture.workload_id.get(),
+            capture.present_id,
+            capture.bytes,
+        )
+        .unwrap_or_else(|error| {
+            panic!("oot-boot: validate RT64 fixed-cycle presentation: {error}")
+        });
+        gate.capture_and_write_render_evidence(
+            boundary,
+            release_scenario,
+            rom_bytes,
+            &render,
+            &memory,
+            report_path,
+        )
+    } else {
+        use fn64_boot_harness::LiveReleaseGateObservationExt as _;
+
+        let framebuffer_address = fn64_abi::current_vi_framebuffer()
+            .expect("oot-boot: VI has no current framebuffer at release capture");
+        let framebuffer = release_framebuffer_bytes(rdram)
+            .unwrap_or_else(|error| panic!("oot-boot: capture release framebuffer: {error}"));
+        let framebuffer = fn64_boot_harness::LiveReferenceFramebufferEvidence::rgba16(
+            framebuffer_address,
+            320,
+            240,
+            framebuffer,
+        )
+        .unwrap_or_else(|error| panic!("oot-boot: validate release framebuffer: {error}"));
+        gate.capture_and_write_reference_evidence(
+            boundary,
+            release_scenario,
+            rom_bytes,
+            &framebuffer,
+            &memory,
+            report_path,
+        )
+    }
+    .unwrap_or_else(|error| {
+        panic!(
+            "oot-boot: live release gate failed at post-advance cycle {observed_cycle}; report path {}: {error}",
+            report_path.display()
+        )
+    })
+}
+
+fn logical_rdram_bytes(rdram: &[u8], start: u32, len: usize) -> Vec<u8> {
+    let start_usize = start as usize;
+    let end = start_usize
+        .checked_add(len)
+        .expect("release RDRAM observation range overflow");
+    assert!(
+        end <= rdram.len(),
+        "release RDRAM observation [{start_usize:#x}, {end:#x}) exceeds allocation {:#x}",
+        rdram.len()
+    );
+    let view = fn64_runtime::RdramView::from_storage(rdram);
+    (0..len)
+        .map(|offset| {
+            view.read_u8(fn64_runtime::RdramAddr::from_offset(
+                start + u32::try_from(offset).expect("release RDRAM range exceeds u32"),
+            ))
+        })
+        .collect()
+}
+
+fn release_framebuffer_bytes(rdram: &[u8]) -> Result<Vec<u8>, String> {
+    const FB_BYTES: usize = 320 * 240 * 2;
+    let start = fn64_abi::current_vi_framebuffer()
+        .ok_or_else(|| "VI has no current framebuffer".to_owned())?;
+    let end = start as usize + FB_BYTES;
+    if end > fn64_boot_harness::DEFAULT_RDRAM_SIZE {
+        return Err(format!(
+            "current framebuffer [{start:#010x}, {end:#010x}) exceeds physical RDRAM {:#x}",
+            fn64_boot_harness::DEFAULT_RDRAM_SIZE
+        ));
+    }
+    Ok(logical_rdram_bytes(rdram, start, FB_BYTES))
 }
 
 /// Hash the fb region (a fixed-size guess: 320x240 RGBA5551 = 153600 bytes,

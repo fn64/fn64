@@ -19,8 +19,8 @@ use super::*;
 //   implemented for real where the boot ladder's rung analysis says they
 //   are reached (SP task control, contmgr, timer stop), loud-trapped
 //   where no evidence (this corpus OR the boot doc) shows a reachable
-//   call (`__osMotorAccess`, `osMotorInit`, `__osSetFpcCsr`, `__ull_rem`,
-//   `__ull_to_d`, `__ull_to_f`, `osJamMesg`, `osSetTime`) -- per
+//   call (`__osMotorAccess`, `osMotorInit`, `__osSetFpcCsr`,
+//   `__ull_to_d`, `__ull_to_f`, `osJamMesg`) -- per
 //   AGENTS.md's "loud traps, no silent shrugs," a fabricated return value
 //   for genuinely untested code is worse than refusing.
 // ---------------------------------------------------------------------
@@ -95,54 +95,97 @@ pub unsafe extern "C" fn __ull_div_recomp(_rdram: *mut u8, ctx: *mut RecompConte
     ctx.r3 = result & 0xFFFF_FFFF;
 }
 
-/// `__ull_rem(u64 a, u64 b) -> u64` -- unsigned 64-bit remainder,
-/// `__umoddi3`-shaped compiler-rt helper. Zero real call sites in this
-/// corpus (function-table slot only, `recomp_overlays.inl:56`) -- loud-
-/// trapped since (unlike `__ll_div`/`__ll_mul`/`__ull_div`, which DO have
-/// real call sites establishing their exact register shape) no call site
-/// here confirms the r4:r5/r6:r7 argument-pair convention actually holds
-/// for this specific symbol in this corpus; implementing an unverified
-/// signature would be exactly the "plausible-sounding story, not actual
-/// bytes" AGENTS.md warns against.
+/// `__ull_rem(u64 a, u64 b) -> u64` -- unsigned remainder counterpart to
+/// `__ull_div_recomp`. Compiler arithmetic helpers use the same o32 ABI for
+/// identical argument and result types: r4:r5/r6:r7 -> r2:r3, whose exact
+/// word ordering is established by `__ull_div_recomp`'s generated-C call
+/// site. The operation is the `__umoddi3` remainder paired with that
+/// quotient helper. A zero divisor remains a loud failure: C leaves integer
+/// division by zero undefined, so manufacturing a remainder would conceal
+/// guest corruption.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn __ull_rem_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
-    unimplemented!(
-        "__ull_rem_recomp: no real call site in games/OOTU/RecompiledFuncs exercises this \
-         (function-table slot only) -- register-shape convention not independently confirmed \
-         for this symbol in this corpus, see __ll_div_recomp's doc comment for the sibling \
-         helpers that DO have verified call sites."
-    );
+pub unsafe extern "C" fn __ull_rem_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let a = (ctx.r4 as u32 as u64) << 32 | (ctx.r5 as u32 as u64);
+    let b = (ctx.r6 as u32 as u64) << 32 | (ctx.r7 as u32 as u64);
+    assert_ne!(b, 0, "__ull_rem_recomp: division by zero");
+    let result = a % b;
+    ctx.r2 = result >> 32;
+    ctx.r3 = result & 0xFFFF_FFFF;
 }
 
 /// `__ull_to_d(u64 a) -> f64` -- unsigned 64-bit-to-double conversion,
 /// `__floatundidf`-shaped compiler-rt helper. Zero real call sites in this
-/// corpus (function-table slot only, `recomp_overlays.inl:2971`) -- same
-/// "unverified for this symbol" loud-trap reasoning as `__ull_rem_recomp`.
+/// corpus (function-table slot only, `recomp_overlays.inl:2971`). The System
+/// V MIPS ABI supplement specifies a double result in the `$f0/$f1` pair;
+/// N64Recomp's `Fpr` union represents that pair as `f0.d`.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn __ull_to_d_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
-    unimplemented!(
-        "__ull_to_d_recomp: no real call site in games/OOTU/RecompiledFuncs exercises this \
-         (function-table slot only) -- see __ull_rem_recomp's doc comment for the reasoning."
-    );
+pub unsafe extern "C" fn __ull_to_d_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let value = (ctx.r4 as u32 as u64) << 32 | (ctx.r5 as u32 as u64);
+    ctx.f0.d = value as f64;
 }
 
 /// `__ull_to_f(u64 a) -> f32` -- unsigned 64-bit-to-float conversion,
-/// `__floatundisf`-shaped compiler-rt helper. Same reasoning as
-/// `__ull_to_d_recomp` (function-table slot only,
-/// `recomp_overlays.inl:2972`, zero real call sites).
+/// `__floatundisf`-shaped compiler-rt helper. The same MIPS ABI table places
+/// a single-precision result in `$f0`, represented by `f0.halves.0` in the
+/// generated context.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn __ull_to_f_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
-    unimplemented!(
-        "__ull_to_f_recomp: no real call site in games/OOTU/RecompiledFuncs exercises this \
-         (function-table slot only) -- see __ull_rem_recomp's doc comment for the reasoning."
-    );
+pub unsafe extern "C" fn __ull_to_f_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let value = (ctx.r4 as u32 as u64) << 32 | (ctx.r5 as u32 as u64);
+    ctx.f0.halves.0 = value as f32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::ctx_zeroed;
+
+    #[test]
+    fn ull_rem_uses_o32_u64_argument_and_result_pairs() {
+        let a = 0xFEDC_BA98_7654_3210_u64;
+        let b = 0x0000_0001_2345_6789_u64;
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = a >> 32;
+        ctx.r5 = a as u32 as u64;
+        ctx.r6 = b >> 32;
+        ctx.r7 = b as u32 as u64;
+
+        unsafe { __ull_rem_recomp(std::ptr::null_mut(), &mut ctx) };
+
+        let result = (ctx.r2 << 32) | (ctx.r3 & 0xFFFF_FFFF);
+        assert_eq!(result, a % b);
+    }
+
+    #[test]
+    fn ull_float_conversions_return_through_f0_with_ieee_rounding() {
+        let value = 0xFEDC_BA98_7654_3210_u64;
+        let mut double_ctx = ctx_zeroed();
+        double_ctx.r4 = value >> 32;
+        double_ctx.r5 = value as u32 as u64;
+        unsafe { __ull_to_d_recomp(std::ptr::null_mut(), &mut double_ctx) };
+        assert_eq!(
+            unsafe { double_ctx.f0.d }.to_bits(),
+            (value as f64).to_bits()
+        );
+
+        let mut float_ctx = ctx_zeroed();
+        float_ctx.r4 = value >> 32;
+        float_ctx.r5 = value as u32 as u64;
+        unsafe { __ull_to_f_recomp(std::ptr::null_mut(), &mut float_ctx) };
+        assert_eq!(
+            unsafe { float_ctx.f0.halves.0 }.to_bits(),
+            (value as f32).to_bits()
+        );
+    }
 }
