@@ -332,7 +332,8 @@ pub fn scoreboard(snapshots: &[ProgramSnapshotV1]) -> ClosureScoreboard {
                     | BlockTerminator::Trap
                     | BlockTerminator::InvalidInstruction { .. }
                     | BlockTerminator::MissingDelaySlot { .. }
-                    | BlockTerminator::RanOffEnd => {}
+                    | BlockTerminator::RanOffEnd
+                    | BlockTerminator::DataFence { .. } => {}
                 }
             }
             // Indirect SITES: one entry per site. Exhaustive resolutions are

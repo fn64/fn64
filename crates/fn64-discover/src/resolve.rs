@@ -48,7 +48,7 @@
 //! the bounded case needs; anything else clears the touched register rather
 //! than pretend to know it.
 
-use crate::cfg::{build_cfg_with_indirect, BasicBlock, BlockTerminator, Cfg};
+use crate::cfg::{build_cfg_fenced, BasicBlock, BlockTerminator, Cfg};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -982,7 +982,8 @@ fn block_successors(block: &BasicBlock) -> Vec<u32> {
         | BlockTerminator::Trap
         | BlockTerminator::InvalidInstruction { .. }
         | BlockTerminator::MissingDelaySlot { .. }
-        | BlockTerminator::RanOffEnd => Vec::new(),
+        | BlockTerminator::RanOffEnd
+        | BlockTerminator::DataFence { .. } => Vec::new(),
     }
 }
 
@@ -1582,6 +1583,23 @@ pub fn build_cfg_value_set_closed_with_claims(
     seed_roots: &[u32],
     claimed: &BTreeMap<u32, Vec<u32>>,
 ) -> ClosureResult {
+    build_cfg_value_set_closed_with_claims_fenced(
+        bank, bank_bytes, va_start, seed_roots, claimed, &BTreeSet::new(),
+    )
+}
+
+/// [`build_cfg_value_set_closed_with_claims`] plus caller-supplied data
+/// fences (see [`crate::cfg::build_cfg_fenced`]). Fenced VAs stop
+/// straight-line descent so embedded read-only data is never decoded as
+/// instructions; the fence is machine-checked evidence, not a guess.
+pub fn build_cfg_value_set_closed_with_claims_fenced(
+    bank: &str,
+    bank_bytes: &[u8],
+    va_start: u32,
+    seed_roots: &[u32],
+    claimed: &BTreeMap<u32, Vec<u32>>,
+    data_fence: &BTreeSet<u32>,
+) -> ClosureResult {
     let roots: BTreeSet<u32> = seed_roots.iter().copied().collect();
     let va_end = va_start.wrapping_add(bank_bytes.len() as u32);
     let mut exhaustive: BTreeMap<u32, Vec<u32>> = claimed.clone();
@@ -1589,7 +1607,7 @@ pub fn build_cfg_value_set_closed_with_claims(
 
     loop {
         let root_vec: Vec<u32> = roots.iter().copied().collect();
-        let cfg = build_cfg_with_indirect(bank, bank_bytes, va_start, &root_vec, &exhaustive);
+        let cfg = build_cfg_fenced(bank, bank_bytes, va_start, &root_vec, &exhaustive, data_fence);
         let mut resolutions = resolve_value_sets_from_roots(&cfg, bank_bytes, va_start, &root_vec);
         backslice_open_sites(&cfg, bank_bytes, va_start, &mut resolutions);
         reject_unusable_targets(&mut resolutions, va_start, va_end);
@@ -1620,7 +1638,7 @@ pub fn build_cfg_value_set_closed_with_claims(
             let mut conservative = retain_cycle_stable_entries(&history[cycle_start..]);
             loop {
                 let cfg =
-                    build_cfg_with_indirect(bank, bank_bytes, va_start, &root_vec, &conservative);
+                    build_cfg_fenced(bank, bank_bytes, va_start, &root_vec, &conservative, data_fence);
                 let mut resolutions =
                     resolve_value_sets_from_roots(&cfg, bank_bytes, va_start, &root_vec);
                 backslice_open_sites(&cfg, bank_bytes, va_start, &mut resolutions);
@@ -1685,14 +1703,31 @@ pub fn build_cfg_closed_with_facts_and_claims(
     seed_roots: &[u32],
     claimed: &BTreeMap<u32, Vec<u32>>,
 ) -> (Cfg, Vec<ResolvedTarget>) {
+    build_cfg_closed_with_facts_claims_fenced(
+        db, bank, bank_bytes, va_start, seed_roots, claimed, &BTreeSet::new(),
+    )
+}
+
+/// [`build_cfg_closed_with_facts_and_claims`] plus caller-supplied data
+/// fences (see [`crate::cfg::build_cfg_fenced`]).
+pub fn build_cfg_closed_with_facts_claims_fenced(
+    db: &crate::facts::FactDb,
+    bank: &str,
+    bank_bytes: &[u8],
+    va_start: u32,
+    seed_roots: &[u32],
+    claimed: &BTreeMap<u32, Vec<u32>>,
+    data_fence: &BTreeSet<u32>,
+) -> (Cfg, Vec<ResolvedTarget>) {
     let mut roots: BTreeSet<u32> = seed_roots.iter().copied().collect();
     roots.extend(db.proven_function_entries(bank));
-    let closure = build_cfg_value_set_closed_with_claims(
+    let closure = build_cfg_value_set_closed_with_claims_fenced(
         bank,
         bank_bytes,
         va_start,
         &roots.into_iter().collect::<Vec<_>>(),
         claimed,
+        data_fence,
     );
     let block_starts: BTreeMap<u32, u32> = closure
         .cfg
