@@ -101,14 +101,19 @@ fn main() {
         );
     }
 
-    // RecompiledFuncs/*.c: plain C, generated, no warning hygiene.
+    // Generated sources use C++ only for fn64's MEM_W lvalue proxy; the
+    // emitted program remains N64Recomp's C ABI and has no warning hygiene.
     let mut build = cc::Build::new();
     build
+        .cpp(true)
         // The shared bridge include comes FIRST: its clean-room sections.h
         // must shadow any real (GPL-3.0) librecomp header on the path.
         .include(bridge_dir.join("include"))
         .include(&recompiled_dir)
         .include(&recomp_h_dir)
+        .flag("-include")
+        .flag("fn64_mmio_proxy.h")
+        .flag_if_supported("-std=c++17")
         .flag_if_supported("-Wno-everything")
         .warnings(false);
 
@@ -156,6 +161,10 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         bridge_dir.join("section_bridge.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        bridge_dir.join("include/fn64_mmio_proxy.h").display()
     );
     println!("cargo:rerun-if-changed={}", recompiled_dir.display());
 }

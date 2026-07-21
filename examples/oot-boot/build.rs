@@ -201,6 +201,7 @@ fn main() {
 
     let mut build = cc::Build::new();
     build
+        .cpp(true)
         // The shared bridge include comes FIRST: it holds fn64's clean-room
         // stand-in librecomp/sections.h, which must shadow any real
         // (GPL-3.0-licensed) librecomp/include on the search path -- see
@@ -208,6 +209,9 @@ fn main() {
         .include(bridge_dir.join("include"))
         .include(&recompiled_dir)
         .include(&recomp_h_dir)
+        .flag("-include")
+        .flag("fn64_mmio_proxy.h")
+        .flag_if_supported("-std=c++17")
         .flag_if_supported("-Wno-everything")
         // RecompiledFuncs/*.c is generated code with no warning hygiene of
         // its own (matches aki-recomp's own CMakeLists.txt build recipe for
@@ -244,9 +248,9 @@ fn main() {
     // The bridge glue (section_bridge.c) is built SEPARATELY, as C++ --
     // recomp_overlays.inl's SectionTableEntry initializers use `nullptr`
     // (the file was generated for a C++ port build, per N64Recomp's own
-    // codegen target), which is not valid in C. RecompiledFuncs/*.c itself
-    // compiles fine as plain C, so only this one glue file needs the C++
-    // compiler.
+    // codegen target), which is not valid in C. RecompiledFuncs/*.c also uses
+    // C++ now so fn64_mmio_proxy.h can preserve MEM_W lvalue syntax while
+    // intercepting raw RCP register words.
     let mut bridge_build = cc::Build::new();
     bridge_build
         .cpp(true)
@@ -261,6 +265,10 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         bridge_dir.join("section_bridge.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        bridge_dir.join("include/fn64_mmio_proxy.h").display()
     );
     println!("cargo:rerun-if-changed={}", recompiled_dir.display());
 }

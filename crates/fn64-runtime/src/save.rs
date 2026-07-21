@@ -37,6 +37,9 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use crate::device::Cycles;
+use crate::tv::CPU_CLOCK_HZ;
+
 /// Which save device a game's cartridge is wired to, per its
 /// `profile.toml` -- purely descriptive; this module does not act on it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -48,12 +51,74 @@ pub enum SaveType {
     ControllerPak,
 }
 
+/// Public EEPROM device identities carried by the Joybus Info response.
+/// Capacity, identifiers, and the write-in-progress status bit come from
+/// the public N64 Joybus hardware documentation; the conservative 15 ms
+/// programming interval is the libultra EEPROM Manager's documented timer
+/// policy for consecutive writes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EepromKind {
+    Eeprom4k,
+    Eeprom16k,
+}
+
+impl EepromKind {
+    pub const fn from_byte_len(len: usize) -> Option<Self> {
+        match len {
+            512 => Some(Self::Eeprom4k),
+            2048 => Some(Self::Eeprom16k),
+            _ => None,
+        }
+    }
+
+    pub const fn byte_len(self) -> usize {
+        match self {
+            Self::Eeprom4k => 512,
+            Self::Eeprom16k => 2048,
+        }
+    }
+
+    pub const fn joybus_identifier(self) -> u16 {
+        match self {
+            Self::Eeprom4k => 0x0080,
+            Self::Eeprom16k => 0x00C0,
+        }
+    }
+
+    pub const fn normalize_hardware_block(self, block: u8) -> u8 {
+        match self {
+            // Public hardware documentation specifies that a 4-Kbit part
+            // ignores the top two address bits. Libultra's high-level API
+            // still rejects those addresses before reaching this layer.
+            Self::Eeprom4k => block & 0x3F,
+            Self::Eeprom16k => block,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EepromStatus {
+    pub kind: EepromKind,
+    pub busy: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EepromError {
+    NoDevice,
+    Busy { ready_at: Cycles },
+}
+
+/// Libultra's public EEPROM Manager waits 15 ms between consecutive block
+/// writes. This is a deterministic compatibility deadline, not a claim that
+/// every physical EEPROM revision takes exactly the full interval.
+pub const EEPROM_WRITE_CYCLES: Cycles = Cycles::new(CPU_CLOCK_HZ * 15 / 1_000);
+
 impl SaveType {
     /// Backing-store byte size for this device, per the publicly documented
     /// N64 save-device sizes (4 Kbit EEPROM = 512 bytes, 16 Kbit EEPROM =
     /// 2048 bytes, SRAM = 32 KiB, FlashRAM = 128 KiB, Controller Pak =
     /// 32 KiB usable + system pages).
-    pub fn byte_len(self) -> usize {
+    pub const fn byte_len(self) -> usize {
         match self {
             SaveType::Eeprom4k => 512,
             SaveType::Eeprom16k => 2048,
@@ -151,10 +216,10 @@ impl SaveStorage for InMemorySaveStorage {
 /// opens (creating if absent, zero-padded to the device's real size with
 /// the real erased-state `0xFF` fill) a single flat file and does plain
 /// seek+read/write against it. Every write is followed by an explicit
-/// `flush` (not just buffered) so a host crash/kill right after a guest
-/// `osEepromWrite`/`osPfsReadWriteFile` call does not silently lose the
-/// write that libultra's synchronous-looking API contract implies already
-/// completed.
+/// `flush` (not just buffered) so a host crash/kill after a device-model
+/// commit does not silently lose it. EEPROM writes reach this method only at
+/// their typed programming deadline; command acceptance alone does not flush
+/// latched bytes prematurely.
 pub struct FileSaveStorage {
     file: std::fs::File,
     len: usize,
@@ -222,9 +287,9 @@ impl SaveStorage for FileSaveStorage {
         self.file
             .write_all(data)
             .expect("FileSaveStorage::write_from: write failed -- save file I/O error");
-        // Explicit flush -- see struct doc comment: a guest write must be
-        // durable by the time osEepromWrite/etc. returns, not merely
-        // buffered in the host's page cache.
+        // Explicit flush -- see struct doc comment: once the device model
+        // commits a write, it must be durable rather than merely buffered in
+        // the host's page cache.
         self.file
             .flush()
             .expect("FileSaveStorage::write_from: flush failed -- save file I/O error");
@@ -264,9 +329,10 @@ pub fn eeprom_long_write(storage: &mut dyn SaveStorage, start_block: u8, data: &
     storage.write_from(start_block as usize * EEPROM_BLOCK_SIZE, data);
 }
 
-/// FlashRAM sector size (public hardware docs: 128 sectors x 1 page each,
-/// 128 bytes/page in the "write buffer" path, 4 KiB per erase sector).
-pub const FLASH_SECTOR_SIZE: usize = 4096;
+/// FlashRAM geometry from the public `osFlashSectorErase` manual: one page
+/// is 128 bytes and one erase sector is 128 pages (16 KiB). The device has
+/// 1024 pages total (128 KiB), hence eight independently erasable sectors.
+pub const FLASH_SECTOR_SIZE: usize = 128 * FLASH_PAGE_SIZE;
 pub const FLASH_PAGE_SIZE: usize = 128;
 
 pub fn flash_erase_sector(storage: &mut dyn SaveStorage, sector: u32) {
@@ -357,6 +423,35 @@ mod tests {
         flash_write_page(&mut s, 0, &page);
         flash_read_page(&mut s, 0, &mut readback);
         assert_eq!(readback, page);
+    }
+
+    #[test]
+    fn flash_sector_erase_uses_the_documented_128_page_boundary() {
+        let mut s = InMemorySaveStorage::for_device(SaveType::FlashRam);
+        let before = [0x11; FLASH_PAGE_SIZE];
+        let inside = [0x22; FLASH_PAGE_SIZE];
+        let after = [0x33; FLASH_PAGE_SIZE];
+        flash_write_page(
+            &mut s,
+            (FLASH_SECTOR_SIZE - FLASH_PAGE_SIZE) as u32,
+            &before,
+        );
+        flash_write_page(&mut s, FLASH_SECTOR_SIZE as u32, &inside);
+        flash_write_page(&mut s, (2 * FLASH_SECTOR_SIZE) as u32, &after);
+
+        flash_erase_sector(&mut s, 1);
+
+        let mut page = [0; FLASH_PAGE_SIZE];
+        flash_read_page(
+            &mut s,
+            (FLASH_SECTOR_SIZE - FLASH_PAGE_SIZE) as u32,
+            &mut page,
+        );
+        assert_eq!(page, before);
+        flash_read_page(&mut s, FLASH_SECTOR_SIZE as u32, &mut page);
+        assert_eq!(page, [0xFF; FLASH_PAGE_SIZE]);
+        flash_read_page(&mut s, (2 * FLASH_SECTOR_SIZE) as u32, &mut page);
+        assert_eq!(page, after);
     }
 
     #[test]

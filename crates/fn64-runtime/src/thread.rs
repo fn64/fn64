@@ -89,6 +89,12 @@ pub enum Yield {
     /// round (rung 14's idle-loop fix: this is what an unconditional spin
     /// MUST call instead of looping forever without ever yielding).
     PauseSelf,
+    /// A translated block exhausted its deterministic instruction slice.
+    /// The executor charges these guest instructions to virtual time only
+    /// after the coroutine has suspended, when its exclusive `&mut Executor`
+    /// is available again. Device deadlines are therefore serviced before
+    /// this thread (or any other) can execute the next block.
+    InstructionCheckpoint { instructions: u32 },
     /// `osRecvMesg` on the named queue. `may_block` is `flag ==
     /// OS_MESG_BLOCK`: when false (`OS_MESG_NOBLOCK`), the executor's
     /// yield handler never parks this coroutine on the blocked list --
@@ -126,8 +132,8 @@ pub enum Yield {
 pub enum Resume {
     /// First resume after `osStartThread` -- no prior yield to resume from.
     Start,
-    /// Resumed after a plain `pause_self`/scheduling round; nothing to
-    /// hand back.
+    /// Resumed after a plain `pause_self` or translated-instruction
+    /// checkpoint scheduling round; nothing to hand back.
     Continue,
     /// Resumed because a blocked recv was delivered a message (or a
     /// non-blocking recv attempt succeeded immediately).
@@ -221,6 +227,34 @@ impl GameThread {
 
     pub fn is_dead(&self) -> bool {
         matches!(self.state, ThreadState::Dead)
+    }
+
+    /// Abandon this thread's parked coroutine WITHOUT unwinding its stack,
+    /// marking it `Dead`. Process-exit teardown only.
+    ///
+    /// Why this exists: dropping a *suspended* `corosensei::Coroutine`
+    /// force-unwinds its stack with a special panic payload. A parked
+    /// recompiled guest thread is suspended inside an `extern "C"` `_recomp`
+    /// shim frame (e.g. `osRecvMesg_recomp`), which Rust marks nounwind --
+    /// so the forced unwind is instant UB-by-abort ("panic in a function
+    /// that cannot unwind"). At process exit the stacks are about to be
+    /// reclaimed by the OS anyway; `force_reset` (corosensei's own escape
+    /// hatch for exactly this) marks the coroutine completed so its `Drop`
+    /// is a no-op, at the cost of leaking whatever was live on the guest
+    /// stack -- which is the honest, correct trade at teardown.
+    pub fn abandon(&mut self) {
+        if let Some(coroutine) = self.coroutine.as_mut() {
+            if coroutine.started() && !coroutine.done() {
+                // SAFETY: equivalent to longjmp past the parked frames; the
+                // objects on the coroutine stack are leaked, never touched
+                // again. Only sound because nothing will resume or inspect
+                // this thread afterwards -- guaranteed by marking it Dead
+                // (a dead thread is never scheduled again) and by this
+                // method's process-exit-teardown-only contract.
+                unsafe { coroutine.force_reset() };
+            }
+        }
+        self.state = ThreadState::Dead;
     }
 
     /// Resume this thread's coroutine. Requires a `RunToken` -- see that

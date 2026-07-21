@@ -52,7 +52,9 @@ const SEG: u8 = 0x06; // arbitrary segment number we route vertex/matrix data th
 const SEG_BASE: u32 = 0x0000_1000; // physical rdram base for segment SEG
 const VTX_SEG_OFF: u32 = 0x0000; // vertex array at segment offset 0
 const MTX_SEG_OFF: u32 = 0x0200; // projection matrix at segment offset 0x200
+const VP_SEG_OFF: u32 = 0x0280; // explicit 320x240 viewport at offset 0x280
 const DL_ADDR: u32 = 0x0000_3000; // display list lives outside the segment (raw)
+const COLOR_ADDR: u32 = 0x0000_8000; // explicit 320x240 RGBA16 RDP color image
 
 /// Write an N64 fixed-point `Mtx` (64 bytes) for a diagonal scale matrix
 /// diag(sx, sy, sz, 1) at `off` in `rdram`. N64 `Mtx` layout: first 32
@@ -74,14 +76,20 @@ fn write_scale_mtx(rdram: &mut [u8], off: usize, sx: f32, sy: f32, sz: f32) {
     }
 }
 
+fn write_centered_viewport(rdram: &mut [u8], off: usize) {
+    for (index, value) in [640, 480, 511, 0, 640, 480, 511, 0].into_iter().enumerate() {
+        wr_i16(rdram, off + index * 2, value);
+    }
+}
+
 /// Build an rdram image with a real F3DEX2 display list. Returns
 /// (rdram, dl_addr).
 fn build_f3dex2_rdram() -> (Vec<u8>, u32) {
-    let mut rdram = vec![0u8; 0x8000];
+    let mut rdram = vec![0u8; 0x30000];
 
     // Vertices (model space, s16 ob[3]); projection diag(1/32,1/32,1) maps
     // model coord 32 -> NDC 1.0. Chosen so the triangle lands well inside a
-    // 320x240 default viewport (px = ndc_x*160+160, py = -ndc_y*120+120):
+    // explicit 320x240 viewport (px = ndc_x*160+160, py = -ndc_y*120+120):
     //   (-16,-16) -> ndc(-0.5,-0.5) -> screen ( 80, 180)
     //   ( 16,-16) -> ndc( 0.5,-0.5) -> screen (240, 180)
     //   (  0, 24) -> ndc( 0.0, 0.75)-> screen (160,  30)
@@ -105,6 +113,8 @@ fn build_f3dex2_rdram() -> (Vec<u8>, u32) {
     // Projection matrix diag(1/32, 1/32, 1, 1).
     let mtx_phys = SEG_BASE as usize + MTX_SEG_OFF as usize;
     write_scale_mtx(&mut rdram, mtx_phys, 1.0 / 32.0, 1.0 / 32.0, 1.0);
+    let viewport_phys = SEG_BASE as usize + VP_SEG_OFF as usize;
+    write_centered_viewport(&mut rdram, viewport_phys);
 
     // --- Build the F3DEX2 command stream ---
     // Collect logical (w0,w1) word pairs; they are written into rdram
@@ -120,10 +130,21 @@ fn build_f3dex2_rdram() -> (Vec<u8>, u32) {
     let mw_w0 = ((gbi::G_MOVEWORD as u32) << 24) | (0x06u32 << 16) | ((SEG as u32) * 4);
     push_cmd(mw_w0, SEG_BASE, &mut dl);
 
-    // 2) A no-op-to-us state op we MUST see loudly skipped (G_RDPPIPESYNC).
+    // 2) G_MOVEMEM G_MV_VIEWPORT: a transformed display list must provide
+    //    its screen mapping rather than relying on host framebuffer size.
+    let viewport_w0 = ((gbi::G_MOVEMEM as u32) << 24) | (1 << 19) | 8;
+    let viewport_seg_addr = ((SEG as u32) << 24) | VP_SEG_OFF;
+    push_cmd(viewport_w0, viewport_seg_addr, &mut dl);
+
+    // 3) G_SETCIMG: production F3DEX2 rendering consumes this persistent RDP
+    //    register; output_addr/VI state is not a substitute for it.
+    let color_w0 = (0xffu32 << 24) | (2 << 19) | (320 - 1);
+    push_cmd(color_w0, COLOR_ADDR, &mut dl);
+
+    // 4) A no-op-to-us state op we MUST see loudly skipped (G_RDPPIPESYNC).
     push_cmd((0xE7u32) << 24, 0, &mut dl);
 
-    // 3) G_MTX projection load: w0 = op<<24 | ((64-1)/8)<<19 | 0<<8 | idx ;
+    // 5) G_MTX projection load: w0 = op<<24 | ((64-1)/8)<<19 | 0<<8 | idx ;
     //    idx = params ^ G_MTX_PUSH ; params = PROJECTION(0x04)|LOAD(0x02) =
     //    0x06 ; ^PUSH(0x01) => 0x07 (F3DEX_GBI_2 flags, gbi.h:233-239).
     //    w1 = segmented matrix address.
@@ -132,7 +153,7 @@ fn build_f3dex2_rdram() -> (Vec<u8>, u32) {
     let mtx_seg_addr = ((SEG as u32) << 24) | MTX_SEG_OFF;
     push_cmd(mtx_w0, mtx_seg_addr, &mut dl);
 
-    // 4) G_VTX: load n=3 vertices into slots 0..3 (F3DEX2-CONCEPTS.md §2.1:
+    // 6) G_VTX: load n=3 vertices into slots 0..3 (F3DEX2-CONCEPTS.md §2.1:
     //    w0 = op<<24 | n<<12 | end<<1, end = v0+n; v0 = end - n). w1 =
     //    segmented addr.
     let n: u32 = 3;
@@ -142,11 +163,11 @@ fn build_f3dex2_rdram() -> (Vec<u8>, u32) {
     let vtx_seg_addr = ((SEG as u32) << 24) | VTX_SEG_OFF;
     push_cmd(vtx_w0, vtx_seg_addr, &mut dl);
 
-    // 5) G_TRI1: slots 0,1,2 as three 7-bit fields at bits 17/9/1 (§2.2).
+    // 7) G_TRI1: slots 0,1,2 as three 7-bit fields at bits 17/9/1 (§2.2).
     let tri_w0 = ((gbi::G_TRI1 as u32) << 24) | (1 << 9) | (2 << 1);
     push_cmd(tri_w0, 0, &mut dl);
 
-    // 6) G_ENDDL.
+    // 8) G_ENDDL.
     push_cmd((gbi::G_ENDDL as u32) << 24, 0, &mut dl);
 
     for (i, &word) in dl.iter().enumerate() {
@@ -159,9 +180,10 @@ fn build_f3dex2_rdram() -> (Vec<u8>, u32) {
 fn f3dex2_display_list_renders_transformed_triangle_at_expected_pixel() {
     let (mut rdram, dl_addr) = build_f3dex2_rdram();
 
-    let clear = [7, 7, 7, 255]; // distinct from every vertex color
+    let clear = [0, 0, 0, 255]; // matches the zeroed explicit RGBA16 target
     let mut backend = ReferenceBackend::new()
         .with_f3dex2()
+        .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE])
         .with_clear_color(clear);
     backend.create(&RenderConfig::new(320, 240)).unwrap();
 
@@ -171,7 +193,7 @@ fn f3dex2_display_list_renders_transformed_triangle_at_expected_pixel() {
         ..Default::default()
     };
     let status = backend
-        .process_task(&mut rdram, &task, 0)
+        .process_task(&mut rdram, &mut fn64_runtime::RspMemory::new(), &task, 0)
         .expect("process_task ok");
     assert_eq!(status, fn64_render::FrameStatus::Complete);
 
@@ -233,6 +255,7 @@ fn f3dex2_without_fill_leaves_centroid_clear_proving_fill_is_load_bearing() {
     let clear = [7u8, 7, 7, 255];
     let mut backend = ReferenceBackend::new()
         .with_f3dex2()
+        .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE])
         .with_clear_color(clear);
     backend.create(&RenderConfig::new(320, 240)).unwrap();
     let fb = backend.framebuffer().unwrap();

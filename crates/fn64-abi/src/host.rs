@@ -19,17 +19,8 @@ pub fn inject_external_event(event: ExternalEvent) {
 /// read back from the executor rather than predicted, so the probe counts what
 /// actually fired, not what the caller expected to fire.
 pub fn advance_virtual_time(now: u64) {
-    let fired = with_executor(|exec| {
-        let before = exec.retrace_ticks_fired();
-        exec.advance_time(now);
-        exec.retrace_ticks_fired().saturating_sub(before)
-    });
-    if fired > 0 {
-        // u32 is the tick-count width everywhere upstream (RetraceTick);
-        // saturating rather than `as` so an absurd delta can never wrap to a
-        // small number and understate the rate we are trying to measure.
-        crate::vi::note_retrace_ticks(u32::try_from(fired).unwrap_or(u32::MAX));
-    }
+    crate::pi::advance_device_time(now);
+    with_executor(|exec| exec.advance_time(now));
 }
 
 /// Create and start thread 0 running `recomp_entrypoint` -- the harness's
@@ -42,16 +33,32 @@ pub fn advance_virtual_time(now: u64) {
 ///
 /// # Safety
 /// `rdram` must be a valid pointer to the process's one shared rdram
-/// buffer, live for at least as long as any coroutine spawned here might
-/// run (the whole process, per `docs/DESIGN.md` section 3). `entry` must be
-/// `recomp_entrypoint` (or a real `recomp_func_t`-shaped function with the
-/// same contract) -- the boot harness passes the real generated symbol.
+/// buffer of at least `rdram_len` bytes, live for at least as long as any
+/// coroutine spawned here might run (the whole process, per
+/// `docs/DESIGN.md` section 3). `entry` must be `recomp_entrypoint` (or a
+/// real `recomp_func_t`-shaped function with the same contract) -- the
+/// boot harness passes the real generated symbol.
+///
+/// `rdram_len` (new 2026-07-21): the C lane previously never registered
+/// the process RDRAM with the host (`host.runtime_rdram` stayed null), so
+/// the FIRST raw MMIO device-DMA start a real game performed --
+/// WM2000's own `__osSpRawStartDma` (`func_80037760`) inside its
+/// `osSpTaskLoad` (`func_80031CC0`), reached as soon as the game's real
+/// event bootstrap (`func_80000B30`) started its task threads -- hit
+/// `write_live_device_mmio`'s "no registered process RDRAM" trap. The
+/// recompiled-lane boots (`recompiled::boot_thread0*`) already register
+/// it; this brings the C lane to parity.
 pub unsafe fn boot_thread0(
     rdram: *mut u8,
+    rdram_len: usize,
     entry: RecompFunc,
     thread_id: ThreadId,
     priority: Priority,
 ) {
+    with_host(|host| {
+        host.runtime_rdram = rdram;
+        host.runtime_rdram_len = rdram_len;
+    });
     let rdram_addr = rdram as usize;
     with_executor(|exec| {
         // Register the process-wide rdram base so the executor can mirror
@@ -74,6 +81,26 @@ pub unsafe fn boot_thread0(
     });
 }
 
+/// Explicit end-of-run shutdown: abandon every parked guest coroutine
+/// without unwinding its stack. A harness that booted real guest threads
+/// MUST call this before `main` returns.
+///
+/// Why: guest threads park suspended inside nounwind `extern "C"` `_recomp`
+/// shims (`osRecvMesg_recomp` et al). When the thread-local `EXECUTOR` cell
+/// is dropped by the TLS destructor at process exit, dropping each parked
+/// `corosensei::Coroutine` force-unwinds its stack -- straight through
+/// those nounwind frames -- and the process aborts ("panic in a function
+/// that cannot unwind") AFTER all real work already finished. This seam
+/// marks every parked coroutine completed instead (`Executor::
+/// abandon_parked_threads`), leaking the parked stacks' contents, which at
+/// process exit is exactly what would happen anyway.
+///
+/// Idempotent; scheduling anything after calling it is a caller bug (every
+/// thread is `Dead`).
+pub fn shutdown_abandon_threads() {
+    with_executor(|exec| exec.abandon_parked_threads());
+}
+
 /// Run one scheduling step (see `Executor::run_one_step`'s doc comment).
 /// Returns `false` when nothing was runnable -- the harness should then
 /// call `advance_virtual_time` to make host-driven progress (VI retrace,
@@ -88,7 +115,7 @@ pub unsafe fn boot_thread0(
 /// fixed reappears.
 pub fn run_one_step() -> bool {
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
-    let stepped = with_executor(|exec| {
+    let (stepped, now) = with_executor(|exec| {
         // `peek_next_thread` is a read-only preview of exactly which thread
         // `exec.run_one_step()` is about to resume -- read it BEFORE the
         // resume so the correct thread's context is active for the entire
@@ -96,11 +123,21 @@ pub fn run_one_step() -> bool {
         // thread's body makes after waking, up to and including its next
         // suspend). `None` means nothing is runnable -- no resume will
         // happen, so no context needs arming.
-        match exec.peek_next_thread() {
+        let stepped = match exec.peek_next_thread() {
             Some(id) => with_rearmed_context(id, || exec.run_one_step()),
             None => exec.run_one_step(),
-        }
+        };
+        (stepped, exec.sim_time())
     });
+    if stepped {
+        // `run_one_step` returns only after a yielding coroutine is fully
+        // suspended. Commit the ABI-owned device fabric at that exact guest
+        // time before any later scheduling step can resume a guest. This
+        // closes the interleaving checkpoint-yield -> same-thread resume ->
+        // overdue PI completion, which would otherwise execute one extra
+        // translated block before bytes/MI/queue state became observable.
+        crate::pi::advance_device_time(now);
+    }
     if let Some(started) = started {
         EXECUTOR_NS.with(|total| {
             total.set(
@@ -174,6 +211,7 @@ pub fn sim_time() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::test_support::*;
 
     /// Regression: `arm_fpr_alias` must make an odd-register `mtc1` (which
@@ -223,5 +261,68 @@ mod tests {
         assert_eq!(unsafe { ctx.f8.u32_halves.0 }, 0, "f8 low word untouched");
         assert_eq!(unsafe { ctx.f6.u32_halves.0 }, 0, "f6 low word untouched");
         assert_eq!(unsafe { ctx.f16.u32_halves.0 }, 0, "f16 low word untouched");
+    }
+
+    #[test]
+    fn retrace_progress_raises_the_shared_mi_vi_source() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::pi::set_mi_interrupt_mask(fn64_runtime::InterruptSource::Vi.bit());
+        crate::vi::arm_vi_retrace(10);
+
+        advance_virtual_time(10);
+        let pending = crate::pi::read_live_device_mmio(0xFFFF_FFFF_A430_0008).unwrap();
+        assert_ne!(pending & fn64_runtime::InterruptSource::Vi.bit(), 0);
+        assert!(crate::pi::cpu_interrupt_pending());
+    }
+
+    #[test]
+    fn vi_retrace_latches_state_and_mi_before_both_message_paths() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::test_support::install_complete_render_backend(0);
+        let os_queue = RdramAddr::from_offset(0x100);
+        let manager_queue = RdramAddr::from_offset(0x200);
+        let framebuffer = RdramAddr::from_offset(0x30_0000);
+        with_executor(|executor| {
+            executor.create_mesg_queue(os_queue, 1);
+            executor.create_mesg_queue(manager_queue, 1);
+            executor.set_event_mesg(fn64_runtime::executor::OS_EVENT_VI, os_queue, 0x31);
+            executor.vi_set_event(manager_queue, 0x32, 1);
+            executor.vi_swap_buffer(framebuffer);
+        });
+        crate::vi::arm_vi_retrace(10);
+
+        advance_virtual_time(9);
+        assert!(!with_host(|host| host
+            .device_fabric
+            .interrupt_pending(fn64_runtime::InterruptSource::Vi)));
+        with_executor(|executor| {
+            assert_eq!(executor.vi().current_framebuffer, None);
+            assert_eq!(
+                executor.recv_mesg(99, os_queue, false),
+                fn64_runtime::RecvMesgOutcome::WouldBlock
+            );
+            assert_eq!(
+                executor.recv_mesg(99, manager_queue, false),
+                fn64_runtime::RecvMesgOutcome::WouldBlock
+            );
+        });
+
+        advance_virtual_time(10);
+        assert!(with_host(|host| host
+            .device_fabric
+            .interrupt_pending(fn64_runtime::InterruptSource::Vi)));
+        with_executor(|executor| {
+            assert_eq!(executor.vi().current_framebuffer, Some(framebuffer));
+            assert_eq!(
+                executor.recv_mesg(99, os_queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x31)
+            );
+            assert_eq!(
+                executor.recv_mesg(99, manager_queue, false),
+                fn64_runtime::RecvMesgOutcome::Delivered(0x32)
+            );
+        });
     }
 }

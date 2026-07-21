@@ -345,10 +345,10 @@ fn main() {
 
     let _ = stand_in_audio_ucode; // kept for reference; real ucode wired below
 
-    // VI retrace: arm a host-chosen approximation (fn64_runtime::vi's doc:
-    // not a hardware-accurate NTSC/PAL constant). 1000 virtual-time units
-    // per field is an arbitrary but documented choice for this harness.
-    fn64_abi::arm_vi_retrace(1000);
+    // Typed IPL video standard is the shared VI/AI clock authority. The first
+    // field uses nominal NTSC timing; the latched OSViMode H/V registers then
+    // refine it from the public VI clock.
+    fn64_abi::configure_tv_type(fn64_boot_harness::TvType::Ntsc);
 
     // Opt-in crash-safe incremental trace flushing BEFORE booting thread 0 --
     // a SIGSEGV mid-boot (as rung 3 hit) must not lose the whole session's
@@ -524,7 +524,6 @@ fn main() {
     // infinite idle-spin is visible (many steps, sim_time barely advancing)
     // rather than silently indistinguishable from real progress.
     const MAX_STEPS: u64 = 2_000_000;
-    const TICK_STEP: u64 = 100;
     const LOG_EVERY: u64 = 50_000;
     // Feedback-loop speedup: `OOT_MAX_SWAPS=N` stops the boot as soon as N VI
     // swaps have happened, instead of grinding the full 2M-step budget.
@@ -929,7 +928,8 @@ fn main() {
         if !stepped {
             // Nothing was runnable -- host-driven progress (VI retrace,
             // due timers) is the only way forward.
-            tick += TICK_STEP;
+            tick += fn64_abi::vi_field_interval()
+                .expect("typed television standard must keep VI armed");
             fn64_abi::advance_virtual_time(tick);
             consecutive_idle_ticks += 1;
             if consecutive_idle_ticks >= IDLE_TICKS_BEFORE_STOP {
@@ -949,7 +949,8 @@ fn main() {
             // scheduling steps; this is host clock injection, not a second
             // game/executor thread (docs/DESIGN.md's one-runnable-token rule).
             if steps.is_multiple_of(100) {
-                tick += TICK_STEP;
+                tick += fn64_abi::vi_field_interval()
+                    .expect("typed television standard must keep VI armed");
                 fn64_abi::advance_virtual_time(tick);
             }
         }

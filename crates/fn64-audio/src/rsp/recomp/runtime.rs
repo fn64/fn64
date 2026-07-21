@@ -31,6 +31,45 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static DMA_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// One RDP command-DMA range submitted through the RSP's DPC CP0 registers.
+/// `xbus` records whether the command source is RSP DMEM rather than RDRAM.
+///
+/// For an XBUS submission, `payload` holds the logical (big-endian) DMEM
+/// bytes of the range, captured AT SUBMISSION TIME: the XBUS ring is a small
+/// reused DMEM window (F3DEX xbus 2.08's is ~1 KiB), so by the time the task
+/// finishes and a consumer looks at the final DMEM snapshot, earlier ranges
+/// have been overwritten by later ring generations. Empty for DRAM-sourced
+/// submissions, whose bytes persist in RDRAM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RspDpSubmission {
+    pub start: u32,
+    pub end: u32,
+    pub xbus: bool,
+    pub payload: Vec<u8>,
+}
+
+/// The logical IMEM byte range replaced by one pending SP read-DMA.
+///
+/// RSP DMA wraps within the 4 KiB memory bank, so membership is expressed as
+/// circular distance rather than a non-wrapping host range. The descriptor's
+/// rectangular lines are contiguous on the RSP-memory side; DRAM `skip`
+/// changes only the source stride. This follows the public SGI *Nintendo 64
+/// RSP Programmer's Guide*, DMA engine length/count/skip register semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImemDmaSpan {
+    start: usize,
+    byte_len: usize,
+}
+
+impl ImemDmaSpan {
+    /// Whether `pc` selects an instruction byte replaced by this DMA.
+    pub fn contains_pc(self, pc: u32) -> bool {
+        let offset = pc as usize & (DMEM_SIZE - 1);
+        let distance = offset.wrapping_sub(self.start) & (DMEM_SIZE - 1);
+        distance < self.byte_len.min(DMEM_SIZE)
+    }
+}
+
 /// The full RSP machine state the recompiled ucode runs against: scalar regs
 /// + DMA context (in [`RspContext`]), the 4 KiB DMEM, and the VU state.
 ///
@@ -59,6 +98,13 @@ pub struct RspMachine<'a> {
     dp_busy: u32,
     dp_pipe_busy: u32,
     dp_tmem_busy: u32,
+    dp_submissions: Vec<RspDpSubmission>,
+    /// Half-open `[start, end)` rdram byte ranges written by `dma_write`
+    /// since construction (or the last [`Self::take_rdram_writes`]),
+    /// clamped to `rdram.len()` and coalesced when contiguous/overlapping.
+    /// The union of these spans covers every rdram byte this machine may
+    /// have mutated: `dma_write` is the ONLY rdram store path in this type.
+    rdram_writes: Vec<(usize, usize)>,
 }
 
 impl<'a> RspMachine<'a> {
@@ -84,7 +130,36 @@ impl<'a> RspMachine<'a> {
             dp_busy: 0,
             dp_pipe_busy: 0,
             dp_tmem_busy: 0,
+            dp_submissions: Vec::new(),
+            rdram_writes: Vec::new(),
         }
+    }
+
+    /// Replace DMEM from an architectural, big-endian byte image.
+    pub fn load_dmem_logical(&mut self, bytes: &[u8; DMEM_SIZE]) {
+        for (address, byte) in bytes.iter().copied().enumerate() {
+            self.dmem.write_bu(address as u32, byte);
+        }
+    }
+
+    /// Export DMEM in architectural byte-address order.
+    pub fn dmem_logical(&self) -> [u8; DMEM_SIZE] {
+        core::array::from_fn(|address| self.dmem.read_bu(address as u32))
+    }
+
+    /// Install the persistent SP status image used when this interpreter run
+    /// begins. BUSY/FULL remain owned by the outer device fabric.
+    pub fn set_sp_status_raw(&mut self, status: u32) {
+        self.sp_status = status;
+    }
+
+    pub const fn sp_status(&self) -> u32 {
+        self.sp_status
+    }
+
+    /// Drain the DPC ranges produced since the last call.
+    pub fn take_dp_submissions(&mut self) -> Vec<RspDpSubmission> {
+        core::mem::take(&mut self.dp_submissions)
     }
 
     // -- Scalar register access (r0 hardwired zero) --
@@ -237,12 +312,40 @@ impl<'a> RspMachine<'a> {
                 // Architecturally read-only registers ignore writes.
             }
             7 => self.sp_semaphore = false,
-            8 => self.dp_start = value & 0x00FF_FFF8,
+            8 => {
+                // Writing DPC_START also latches DPC_CURRENT (hardware: the
+                // command DMA engine begins the next run at START).
+                self.dp_start = value & 0x00FF_FFF8;
+                self.dp_current = self.dp_start;
+            }
             9 => {
+                // Writing DPC_END runs the RDP from CURRENT to END -- NOT
+                // from START: a ucode that grows one command run with
+                // repeated END writes (F3DEX xbus 2.08 does exactly this
+                // against its DMEM ring) must submit each new tail once,
+                // never re-submit from START. `END == CURRENT` (how the xbus
+                // ucode opens its stream before any command exists) runs
+                // zero commands and is not a submission at all.
                 self.dp_end = value & 0x00FF_FFF8;
-                // No RDP execution engine lives in fn64-audio. Model the
-                // command DMA as instant so polling loops observe idle.
-                self.dp_current = self.dp_end;
+                if self.dp_end != self.dp_current {
+                    let xbus = self.dp_status & 1 != 0;
+                    let payload = if xbus && self.dp_current < self.dp_end {
+                        (self.dp_current..self.dp_end)
+                            .map(|address| self.dmem.read_bu(address & 0xfff))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    self.dp_submissions.push(RspDpSubmission {
+                        start: self.dp_current,
+                        end: self.dp_end,
+                        xbus,
+                        payload,
+                    });
+                    // No RDP execution engine lives in fn64-audio. Model the
+                    // command DMA as instant so polling loops observe idle.
+                    self.dp_current = self.dp_end;
+                }
             }
             11 => self.write_dp_status(value),
             _ => panic!("invalid RSP MTC0 register c{reg}"),
@@ -542,6 +645,7 @@ impl<'a> RspMachine<'a> {
     /// `len` is the raw length/count/skip encoding. The hardware forces the
     /// low three address bits to zero and the low three length bits to one.
     pub fn dma_read(&mut self, len: u32) -> Option<RspExitReason> {
+        self.dma_read_length = len;
         if self.ctx.dma_mem_address & 0x1000 != 0 {
             return Some(RspExitReason::SwapOverlay);
         }
@@ -572,6 +676,58 @@ impl<'a> RspMachine<'a> {
         None
     }
 
+    /// Describe the IMEM destination of the read-DMA which returned
+    /// [`RspExitReason::SwapOverlay`]. The caller uses this before completing
+    /// the DMA to identify the first instruction belonging to the new ucode.
+    pub fn pending_imem_dma_span(&self) -> ImemDmaSpan {
+        assert!(
+            self.ctx.dma_mem_address & 0x1000 != 0,
+            "pending_imem_dma_span called without an IMEM destination"
+        );
+        let (line_len, lines, _) = decode_dma_length(self.dma_read_length);
+        ImemDmaSpan {
+            start: self.ctx.dma_mem_address as usize & (DMEM_SIZE - 8),
+            byte_len: line_len
+                .checked_mul(lines)
+                .expect("IMEM DMA destination length overflow"),
+        }
+    }
+
+    /// Complete the IMEM DMA which caused [`RspExitReason::SwapOverlay`].
+    ///
+    /// The interpreter pauses before replacing executable memory. The outer
+    /// runtime supplies its persistent architectural IMEM image here; this
+    /// method applies the pending rectangular DMA in the native-word backing
+    /// layout shared by RDRAM and RSP memory, then converts it back to logical
+    /// byte order and advances the CP0 DMA address registers.
+    pub fn complete_imem_dma(&mut self, imem: &mut [u8; DMEM_SIZE]) {
+        assert!(
+            self.ctx.dma_mem_address & 0x1000 != 0,
+            "complete_imem_dma called without an IMEM destination"
+        );
+        let (line_len, lines, skip) = decode_dma_length(self.dma_read_length);
+        let mut dram = self.ctx.dma_dram_address as usize & 0x00FF_FFF8;
+        let mut mem = self.ctx.dma_mem_address as usize & (DMEM_SIZE - 8);
+        let mut backing = [0u8; DMEM_SIZE];
+        for logical in 0..DMEM_SIZE {
+            backing[logical ^ 3] = imem[logical];
+        }
+        for _ in 0..lines {
+            for i in 0..line_len {
+                if let Some(&byte) = self.rdram.get(dram + i) {
+                    backing[(mem + i) & (DMEM_SIZE - 1)] = byte;
+                }
+            }
+            dram = dram.wrapping_add(line_len + skip);
+            mem = (mem + line_len) & (DMEM_SIZE - 1);
+        }
+        for logical in 0..DMEM_SIZE {
+            imem[logical] = backing[logical ^ 3];
+        }
+        self.ctx.dma_dram_address = dram as u32;
+        self.ctx.dma_mem_address = 0x1000 | mem as u32;
+    }
+
     /// `DO_DMA_WRITE` (`SP_WR_LEN` write): copy `len+1` bytes from DMEM at
     /// `dma_mem_address & 0xFFF` back to rdram at `dma_dram_address`.
     pub fn dma_write(&mut self, len: u32) {
@@ -594,11 +750,38 @@ impl<'a> RspMachine<'a> {
                     *dst = self.dmem.as_bytes()[(mem + i) & (DMEM_SIZE - 1)];
                 }
             }
+            self.record_rdram_write(dram, line_len);
             dram = dram.wrapping_add(line_len + skip);
             mem = (mem + line_len) & (DMEM_SIZE - 1);
         }
         self.ctx.dma_dram_address = dram as u32;
         self.ctx.dma_mem_address = mem as u32;
+    }
+
+    /// Record one DMA-write line's rdram byte range, clamped exactly the way
+    /// the copy loop above clamps (per-byte `get_mut` beyond `rdram.len()` is
+    /// a dropped store). Contiguous/overlapping ranges coalesce with the most
+    /// recent entry so consecutive lines (skip = 0) stay one span.
+    fn record_rdram_write(&mut self, start: usize, len: usize) {
+        let end = start.saturating_add(len).min(self.rdram.len());
+        let start = start.min(self.rdram.len());
+        if start >= end {
+            return;
+        }
+        if let Some(last) = self.rdram_writes.last_mut() {
+            if start <= last.1 && end >= last.0 {
+                last.0 = last.0.min(start);
+                last.1 = last.1.max(end);
+                return;
+            }
+        }
+        self.rdram_writes.push((start, end));
+    }
+
+    /// Take the accumulated half-open rdram write spans (see `rdram_writes`'s
+    /// field doc). After this call the machine's write log is empty again.
+    pub fn take_rdram_writes(&mut self) -> Vec<(usize, usize)> {
+        std::mem::take(&mut self.rdram_writes)
     }
 
     /// Convenience accessor for the VU state the compute-op dispatcher wants.
@@ -846,6 +1029,57 @@ mod tests {
     }
 
     #[test]
+    fn imem_overlay_completion_replaces_logical_words_and_advances_dma() {
+        let mut rdram = vec![0u8; 0x1000];
+        write_rdram_word(&mut rdram, 0x200, 0x3C01_1234);
+        write_rdram_word(&mut rdram, 0x204, 0x3421_5678);
+        let mut m = RspMachine::new(&mut rdram);
+        let mut imem = [0xAA; DMEM_SIZE];
+        m.set_dma_dram(0x200);
+        m.set_dma_mem(0x1020);
+        assert_eq!(m.dma_read(7), Some(RspExitReason::SwapOverlay));
+
+        m.complete_imem_dma(&mut imem);
+
+        assert_eq!(
+            &imem[0x20..0x28],
+            &[0x3C, 0x01, 0x12, 0x34, 0x34, 0x21, 0x56, 0x78]
+        );
+        assert_eq!(m.ctx.dma_mem_address, 0x1028);
+        assert_eq!(m.ctx.dma_dram_address, 0x208);
+    }
+
+    #[test]
+    fn pending_imem_dma_span_tracks_aligned_rectangular_and_wrapped_destinations() {
+        let mut rdram = vec![0u8; 0x1000];
+        let mut m = RspMachine::new(&mut rdram);
+        m.set_dma_mem(0x1ffb);
+        let descriptor = 7 | (1 << 12) | (8 << 20);
+        assert_eq!(m.dma_read(descriptor), Some(RspExitReason::SwapOverlay));
+
+        let span = m.pending_imem_dma_span();
+        assert!(span.contains_pc(0x1ff8));
+        assert!(span.contains_pc(0x1ffc));
+        assert!(span.contains_pc(0x1000));
+        assert!(span.contains_pc(0x1004));
+        assert!(!span.contains_pc(0x1008));
+        assert!(!span.contains_pc(0x1ff4));
+    }
+
+    #[test]
+    fn pending_imem_dma_span_covering_a_bank_contains_every_pc() {
+        let mut rdram = vec![0u8; 0x1000];
+        let mut m = RspMachine::new(&mut rdram);
+        m.set_dma_mem(0x1180);
+        let descriptor = 0x0fff;
+        assert_eq!(m.dma_read(descriptor), Some(RspExitReason::SwapOverlay));
+        let span = m.pending_imem_dma_span();
+        assert!([0x1000, 0x117c, 0x1180, 0x1ffc]
+            .into_iter()
+            .all(|pc| span.contains_pc(pc)));
+    }
+
+    #[test]
     fn dma_applies_eight_byte_alignment_count_and_skip() {
         let mut rdram = vec![0u8; 0x1000];
         for i in 0..8usize {
@@ -899,6 +1133,19 @@ mod tests {
         );
         assert_eq!(m.read_cp0(5), 0);
         assert_eq!(m.read_cp0(6), 0);
+        assert_eq!(
+            m.take_dp_submissions(),
+            vec![RspDpSubmission {
+                start: 0x123458,
+                end: 0x234568,
+                xbus: false,
+                payload: Vec::new(),
+            }]
+        );
+        m.write_cp0(11, 1 << 1);
+        m.write_cp0(8, 0x80);
+        m.write_cp0(9, 0x100);
+        assert!(m.take_dp_submissions()[0].xbus);
     }
 
     fn write_rdram_word(rdram: &mut [u8], offset: usize, value: u32) {
