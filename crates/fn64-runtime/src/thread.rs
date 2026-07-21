@@ -229,6 +229,34 @@ impl GameThread {
         matches!(self.state, ThreadState::Dead)
     }
 
+    /// Abandon this thread's parked coroutine WITHOUT unwinding its stack,
+    /// marking it `Dead`. Process-exit teardown only.
+    ///
+    /// Why this exists: dropping a *suspended* `corosensei::Coroutine`
+    /// force-unwinds its stack with a special panic payload. A parked
+    /// recompiled guest thread is suspended inside an `extern "C"` `_recomp`
+    /// shim frame (e.g. `osRecvMesg_recomp`), which Rust marks nounwind --
+    /// so the forced unwind is instant UB-by-abort ("panic in a function
+    /// that cannot unwind"). At process exit the stacks are about to be
+    /// reclaimed by the OS anyway; `force_reset` (corosensei's own escape
+    /// hatch for exactly this) marks the coroutine completed so its `Drop`
+    /// is a no-op, at the cost of leaking whatever was live on the guest
+    /// stack -- which is the honest, correct trade at teardown.
+    pub fn abandon(&mut self) {
+        if let Some(coroutine) = self.coroutine.as_mut() {
+            if coroutine.started() && !coroutine.done() {
+                // SAFETY: equivalent to longjmp past the parked frames; the
+                // objects on the coroutine stack are leaked, never touched
+                // again. Only sound because nothing will resume or inspect
+                // this thread afterwards -- guaranteed by marking it Dead
+                // (a dead thread is never scheduled again) and by this
+                // method's process-exit-teardown-only contract.
+                unsafe { coroutine.force_reset() };
+            }
+        }
+        self.state = ThreadState::Dead;
+    }
+
     /// Resume this thread's coroutine. Requires a `RunToken` -- see that
     /// type's doc comment for the compile-time guarantee this establishes.
     /// The token is consumed for the duration of this call by Rust's
