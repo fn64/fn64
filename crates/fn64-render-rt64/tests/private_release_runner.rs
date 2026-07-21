@@ -110,6 +110,7 @@ fn ten_fresh_processes_certify_live_runtime_device_and_render_path() {
         schema: PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA.to_owned(),
         admission_manifest: file_identity(&manifest),
         readiness_report: file_identity(&readiness),
+        program_build_receipt: None,
         purpose: "synthetic_mechanism".to_owned(),
         report_scenario: REPOSITORY_SYNTHETIC_RELEASE_SCENARIO.to_owned(),
         guest_cycle: REPOSITORY_SYNTHETIC_RELEASE_CYCLE,

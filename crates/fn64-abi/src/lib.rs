@@ -232,6 +232,13 @@ pub enum RspRdpObservationKind {
         task_addr: RdramAddr,
         imem_generation: u64,
         text_sha256: [u8; 32],
+        /// Physical start of the original task microcode-data image. A
+        /// yielded resume retains the identity captured for its initial task;
+        /// the rewritten yield-buffer pointer is never represented as source
+        /// microcode data.
+        data_addr: RdramAddr,
+        data_size: u32,
+        data_sha256: [u8; 32],
         family: Option<UcodeId>,
     },
     DramDpcCommitted {
@@ -472,6 +479,43 @@ pub struct RspBootImageEvidenceSnapshot {
     pub bytes: Vec<u8>,
 }
 
+/// Exact logical identity of one task-named microcode-data image hashed at an
+/// RSP kickoff boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RspTaskDataIdentityEvidenceSnapshot {
+    pub rdram_offset: u32,
+    pub byte_len: u32,
+    pub sha256: [u8; 32],
+}
+
+/// The one task header most recently copied into RSP DMEM by
+/// `osSpTaskLoad`. `resumed_data_identity` is present only when the loaded
+/// header is a validated yielded rewrite whose original data image was
+/// retained through task lineage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadedRspTaskEvidenceSnapshot {
+    pub task_offset: u32,
+    pub header: OsTaskHeader,
+    pub resumed_data_identity: Option<RspTaskDataIdentityEvidenceSnapshot>,
+}
+
+/// Original task/data identity retained for a task that may be rewritten and
+/// reloaded after a public RSP yield handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RspTaskLineagePhaseEvidenceSnapshot {
+    Running,
+    ResumeAuthorized,
+    ResumeLoaded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RspTaskLineageEvidenceSnapshot {
+    pub task_offset: u32,
+    pub original_header: OsTaskHeader,
+    pub data_identity: Option<RspTaskDataIdentityEvidenceSnapshot>,
+    pub phase: RspTaskLineagePhaseEvidenceSnapshot,
+}
+
 /// Stable identity of the cartridge image installed behind the PI bus.
 ///
 /// The digest is captured while the host still owns the installation bytes;
@@ -554,6 +598,8 @@ pub struct AbiHostEvidenceSnapshot {
     pub flash: save::FlashEvidenceSnapshot,
     pub sections: fn64_runtime::SectionRegistryEvidenceSnapshot,
     pub rsp_boot_images: Vec<RspBootImageEvidenceSnapshot>,
+    pub loaded_rsp_task: Option<LoadedRspTaskEvidenceSnapshot>,
+    pub rsp_task_lineages: Vec<RspTaskLineageEvidenceSnapshot>,
     pub rom_installed: bool,
     pub installed_rom: Option<InstalledRomEvidenceSnapshot>,
     pub cartridge_save: CartridgeSaveEvidenceSnapshot,
@@ -625,6 +671,14 @@ struct HostState {
     /// cache preserves the source image which `osSpTaskLoad` re-DMAs at the
     /// beginning of every task.
     rsp_boot_images: std::collections::HashMap<u32, Vec<u8>>,
+    /// Exact CPU task header/source most recently admitted to RSP DMEM. The
+    /// only StartGo path consumes this token; it never rereads mutable guest
+    /// task fields after Load returns.
+    loaded_rsp_task: Option<task_dispatch::LoadedRspTask>,
+    /// Original task/data identities retained independently of append-only
+    /// observation history so a yielded reload cannot inherit evidence from
+    /// an unrelated task that reused the same guest address.
+    rsp_task_lineages: std::collections::HashMap<u32, task_dispatch::RspTaskLineage>,
     /// Guest-visible `OSPiHandle*` returned by `osCartRomInit`. The handle
     /// storage is game-owned BSS, so the boot host supplies its link address;
     /// leaving it unset is a loud trap rather than returning a stale `$v0`.
@@ -734,6 +788,8 @@ impl Default for HostState {
             runtime_rdram: std::ptr::null_mut(),
             runtime_rdram_len: 0,
             rsp_boot_images: std::collections::HashMap::new(),
+            loaded_rsp_task: None,
+            rsp_task_lineages: std::collections::HashMap::new(),
             cart_rom_handle_vram: None,
             flash_handle_vram: None,
             leo_disk: None,
@@ -918,6 +974,8 @@ fn classify_host_evidence_fields(host: &HostState) {
         runtime_rdram: _,
         runtime_rdram_len: _,
         rsp_boot_images: _,
+        loaded_rsp_task: _,
+        rsp_task_lineages: _,
         cart_rom_handle_vram: _,
         flash_handle_vram: _,
         leo_disk: _,
@@ -999,6 +1057,17 @@ pub fn host_evidence_snapshot() -> AbiHostEvidenceSnapshot {
             .collect();
         rsp_boot_images.sort_unstable_by_key(|image| image.rdram_offset);
 
+        let loaded_rsp_task = host
+            .loaded_rsp_task
+            .as_ref()
+            .map(task_dispatch::LoadedRspTask::evidence_snapshot);
+        let mut rsp_task_lineages: Vec<_> = host
+            .rsp_task_lineages
+            .iter()
+            .map(|(&task_offset, lineage)| lineage.evidence_snapshot(task_offset))
+            .collect();
+        rsp_task_lineages.sort_unstable_by_key(|lineage| lineage.task_offset);
+
         let mut thread_handles: Vec<_> = host
             .thread_handles
             .iter()
@@ -1038,6 +1107,8 @@ pub fn host_evidence_snapshot() -> AbiHostEvidenceSnapshot {
             flash: host.flash.evidence_snapshot(),
             sections: host.sections.evidence_snapshot(),
             rsp_boot_images,
+            loaded_rsp_task,
+            rsp_task_lineages,
             rom_installed: host.rom_installed,
             installed_rom: host.installed_rom,
             cartridge_save: host.cartridge_save,

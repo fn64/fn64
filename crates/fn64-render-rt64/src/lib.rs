@@ -120,10 +120,10 @@ pub(crate) fn render_unsupported_panic(operation: &'static str, context: impl In
 #[cfg(test)]
 use fn64_render::ViPixelType;
 use fn64_render::{
-    FrameStatus, NonRdpWrite16, NonRdpWrite16Disposition, OsTask, RenderBackend, RenderConfig,
-    RenderEmulatorSettings, RenderEnhancementSettings, RenderError, RenderPolicyApply,
-    RenderReplacementPackIdentity, RenderReplacementSettings, RenderRuntimePolicy,
-    RenderRuntimeSettings, RenderSettingsApply, UcodeId, ViPresentation,
+    FrameStatus, MicrocodeDataImageIdentity, NonRdpWrite16, NonRdpWrite16Disposition, OsTask,
+    RenderBackend, RenderConfig, RenderEmulatorSettings, RenderEnhancementSettings, RenderError,
+    RenderPolicyApply, RenderReplacementPackIdentity, RenderReplacementSettings,
+    RenderRuntimePolicy, RenderRuntimeSettings, RenderSettingsApply, UcodeId, ViPresentation,
 };
 use raster::Framebuffer;
 
@@ -214,8 +214,43 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "rt64")]
 use sha2::Digest;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct MicrocodePairKey {
+    text_sha256: [u8; 32],
+    data: MicrocodeDataImageIdentity,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MicrocodePairCatalog {
+    families: HashMap<MicrocodePairKey, UcodeId>,
+}
+
+impl MicrocodePairCatalog {
+    fn admit(&mut self, family: UcodeId, text_sha256: [u8; 32], data: MicrocodeDataImageIdentity) {
+        let key = MicrocodePairKey { text_sha256, data };
+        if let Some(previous) = self.families.insert(key, family) {
+            assert_eq!(
+                previous, family,
+                "one exact microcode text/data pair cannot identify two families"
+            );
+        }
+    }
+
+    fn identify(
+        &self,
+        text: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        data: MicrocodeDataImageIdentity,
+    ) -> Option<UcodeId> {
+        self.families
+            .get(&MicrocodePairKey {
+                text_sha256: sha2::Sha256::digest(text).into(),
+                data,
+            })
+            .copied()
+    }
+}
 
 /// A headless software `RenderBackend`: decodes bounded F3DEX2/S2DEX
 /// display-list subsets to ordered geometry/image/fill/sync operations and
@@ -278,6 +313,9 @@ pub struct ReferenceBackend {
     /// Exact S2DEX/S2DEX2-compatible task-entry images and their public wire
     /// families. No F3DEX2 digest or opcode-family guess is inherited.
     s2dex_ucodes: s2dex::UcodeCatalog,
+    /// Exact complete text/data pairs admitted independently for runtime
+    /// consumption evidence. Text-only HLE catalogs cannot populate this.
+    microcode_pairs: MicrocodePairCatalog,
     /// FullSync result of the last successfully committed submission.
     last_dp_full_sync: fn64_render::DpFullSyncStatus,
     /// If set, `process_task` writes the rasterized framebuffer to
@@ -355,6 +393,7 @@ impl ReferenceBackend {
             decode_mode: DecodeMode::Simple,
             f3dex2_ucodes: gbi::F3dex2UcodeCatalog::default(),
             s2dex_ucodes: s2dex::UcodeCatalog::default(),
+            microcode_pairs: MicrocodePairCatalog::default(),
             last_dp_full_sync: fn64_render::DpFullSyncStatus::Unidentified,
             auto_dump: None,
             #[cfg(not(test))]
@@ -467,6 +506,46 @@ impl ReferenceBackend {
             "S2DEX text admission requires one complete 4 KiB IMEM image"
         );
         self.s2dex_ucodes.admit_text_for(family, text);
+        self
+    }
+
+    /// Admit one exact complete microcode text/data identity for runtime
+    /// recognition evidence. This is separate from HLE text admission.
+    pub fn with_microcode_pair_sha256(
+        mut self,
+        family: UcodeId,
+        text_sha256: [u8; 32],
+        data_bytes: u32,
+        data_sha256: [u8; 32],
+    ) -> Self {
+        self.microcode_pairs.admit(
+            family,
+            text_sha256,
+            MicrocodeDataImageIdentity {
+                bytes: data_bytes,
+                sha256: data_sha256,
+            },
+        );
+        self
+    }
+
+    /// Byte-backed fixture convenience for [`Self::with_microcode_pair_sha256`].
+    pub fn with_microcode_pair(mut self, family: UcodeId, text: &[u8], data: &[u8]) -> Self {
+        assert_eq!(
+            text.len(),
+            fn64_runtime::RSP_MEMORY_BANK_SIZE,
+            "microcode pair admission requires one complete 4 KiB IMEM image"
+        );
+        let data_bytes = u32::try_from(data.len())
+            .expect("microcode pair data length exceeds the OSTask u32 size field");
+        self.microcode_pairs.admit(
+            family,
+            sha2::Sha256::digest(text).into(),
+            MicrocodeDataImageIdentity {
+                bytes: data_bytes,
+                sha256: sha2::Sha256::digest(data).into(),
+            },
+        );
         self
     }
 
@@ -1399,6 +1478,14 @@ impl RenderBackend for ReferenceBackend {
             (Some(ucode), None) | (None, Some(ucode)) => Some(ucode),
             (None, None) => None,
         }
+    }
+
+    fn identify_microcode_pair(
+        &self,
+        imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        data: MicrocodeDataImageIdentity,
+    ) -> Option<UcodeId> {
+        self.microcode_pairs.identify(imem, data)
     }
 
     fn supported_ucodes(&self) -> &[UcodeId] {
@@ -3001,6 +3088,8 @@ pub struct Rt64Backend {
     /// RT64's GBI selection is still HLE. Apply the same exact task-entry
     /// admission as the Rust reference backend before crossing the C ABI.
     f3dex2_ucodes: gbi::F3dex2UcodeCatalog,
+    /// Exact complete pairs admitted for RT64 runtime-recognition evidence.
+    microcode_pairs: MicrocodePairCatalog,
     /// FullSync result of the last successfully committed submission.
     last_dp_full_sync: fn64_render::DpFullSyncStatus,
     #[cfg(feature = "rt64")]
@@ -3032,6 +3121,7 @@ impl Rt64Backend {
     pub fn new() -> Self {
         Rt64Backend {
             f3dex2_ucodes: gbi::F3dex2UcodeCatalog::default(),
+            microcode_pairs: MicrocodePairCatalog::default(),
             last_dp_full_sync: fn64_render::DpFullSyncStatus::Unidentified,
             #[cfg(feature = "rt64")]
             task_index: 0,
@@ -3752,6 +3842,46 @@ impl Rt64Backend {
             "F3DEX2 text admission requires one complete 4 KiB IMEM image"
         );
         self.f3dex2_ucodes.admit_text(text);
+        self
+    }
+
+    /// Admit one exact F3DEX2 text/data identity for RT64 runtime-recognition
+    /// evidence. This does not replace the separate HLE text admission.
+    pub fn with_f3dex2_ucode_pair_sha256(
+        mut self,
+        text_sha256: [u8; 32],
+        data_bytes: u32,
+        data_sha256: [u8; 32],
+    ) -> Self {
+        self.microcode_pairs.admit(
+            UcodeId::F3dex2,
+            text_sha256,
+            MicrocodeDataImageIdentity {
+                bytes: data_bytes,
+                sha256: data_sha256,
+            },
+        );
+        self
+    }
+
+    /// Byte-backed fixture convenience for
+    /// [`Self::with_f3dex2_ucode_pair_sha256`].
+    pub fn with_f3dex2_ucode_pair(mut self, text: &[u8], data: &[u8]) -> Self {
+        assert_eq!(
+            text.len(),
+            fn64_runtime::RSP_MEMORY_BANK_SIZE,
+            "F3DEX2 pair admission requires one complete 4 KiB IMEM image"
+        );
+        let data_bytes = u32::try_from(data.len())
+            .expect("F3DEX2 pair data length exceeds the OSTask u32 size field");
+        self.microcode_pairs.admit(
+            UcodeId::F3dex2,
+            sha2::Sha256::digest(text).into(),
+            MicrocodeDataImageIdentity {
+                bytes: data_bytes,
+                sha256: sha2::Sha256::digest(data).into(),
+            },
+        );
         self
     }
 
@@ -4586,6 +4716,14 @@ impl RenderBackend for Rt64Backend {
         self.f3dex2_ucodes.identify_text(imem)
     }
 
+    fn identify_microcode_pair(
+        &self,
+        imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        data: MicrocodeDataImageIdentity,
+    ) -> Option<UcodeId> {
+        self.microcode_pairs.identify(imem, data)
+    }
+
     fn supported_ucodes(&self) -> &[UcodeId] {
         #[cfg(feature = "rt64")]
         {
@@ -4741,6 +4879,46 @@ mod tests {
 
         assert_eq!(backend.identify_microcode(&admitted), Some(UcodeId::F3dex2));
         assert_eq!(backend.identify_microcode(&unadmitted), None);
+    }
+
+    #[test]
+    fn rt64_pair_recognition_requires_exact_text_data_length_and_digest() {
+        let text = [0x81; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let other_text = [0x82; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let data = [0x31, 0x41, 0x59, 0x26, 0x53];
+        let identity = MicrocodeDataImageIdentity {
+            bytes: data.len() as u32,
+            sha256: sha2::Sha256::digest(data).into(),
+        };
+        let text_only = Rt64Backend::new().with_f3dex2_ucode_text(&text);
+        assert_eq!(text_only.identify_microcode_pair(&text, identity), None);
+
+        let backend = text_only.with_f3dex2_ucode_pair(&text, &data);
+        assert_eq!(
+            backend.identify_microcode_pair(&text, identity),
+            Some(UcodeId::F3dex2)
+        );
+        assert_eq!(backend.identify_microcode_pair(&other_text, identity), None);
+        assert_eq!(
+            backend.identify_microcode_pair(
+                &text,
+                MicrocodeDataImageIdentity {
+                    bytes: identity.bytes + 1,
+                    ..identity
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            backend.identify_microcode_pair(
+                &text,
+                MicrocodeDataImageIdentity {
+                    sha256: [0xff; 32],
+                    ..identity
+                }
+            ),
+            None
+        );
     }
 
     #[test]
@@ -5313,6 +5491,24 @@ mod tests {
         assert_eq!(backend.identify_microcode(&sprite), Some(UcodeId::S2dex));
         assert_eq!(backend.identify_microcode(&unadmitted), None);
         assert_eq!(backend.supported_ucodes(), &[UcodeId::L3dex2]);
+    }
+
+    #[test]
+    fn reference_pair_recognition_is_separate_from_text_hle_admission() {
+        let text = [0x71; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let data = [0x10, 0x20, 0x30];
+        let identity = MicrocodeDataImageIdentity {
+            bytes: data.len() as u32,
+            sha256: sha2::Sha256::digest(data).into(),
+        };
+        let text_only =
+            ReferenceBackend::new().with_geometry_ucode_text(GeometryWireFamily::L3dex2, &text);
+        assert_eq!(text_only.identify_microcode_pair(&text, identity), None);
+        let paired = text_only.with_microcode_pair(UcodeId::L3dex2, &text, &data);
+        assert_eq!(
+            paired.identify_microcode_pair(&text, identity),
+            Some(UcodeId::L3dex2)
+        );
     }
 
     #[test]

@@ -467,11 +467,168 @@ fn imem_sha256(imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE]) -> [u8; 32] {
     Sha256::digest(imem).into()
 }
 
-fn identify_microcode(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TaskMicrocodeDataIdentity {
+    addr: RdramAddr,
+    size: u32,
+    sha256: [u8; 32],
+}
+
+impl TaskMicrocodeDataIdentity {
+    fn evidence_snapshot(self) -> RspTaskDataIdentityEvidenceSnapshot {
+        RspTaskDataIdentityEvidenceSnapshot {
+            rdram_offset: self.addr.offset(),
+            byte_len: self.size,
+            sha256: self.sha256,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RspTaskLineagePhase {
+    Running,
+    ResumeAuthorized,
+    ResumeLoaded,
+}
+
+impl RspTaskLineagePhase {
+    fn evidence_snapshot(self) -> RspTaskLineagePhaseEvidenceSnapshot {
+        match self {
+            Self::Running => RspTaskLineagePhaseEvidenceSnapshot::Running,
+            Self::ResumeAuthorized => RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized,
+            Self::ResumeLoaded => RspTaskLineagePhaseEvidenceSnapshot::ResumeLoaded,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RspTaskLineage {
+    original_header: OsTaskHeader,
+    data_identity: Option<TaskMicrocodeDataIdentity>,
+    phase: RspTaskLineagePhase,
+}
+
+impl RspTaskLineage {
+    pub(crate) fn evidence_snapshot(&self, task_offset: u32) -> RspTaskLineageEvidenceSnapshot {
+        RspTaskLineageEvidenceSnapshot {
+            task_offset,
+            original_header: self.original_header,
+            data_identity: self
+                .data_identity
+                .map(TaskMicrocodeDataIdentity::evidence_snapshot),
+            phase: self.phase.evidence_snapshot(),
+        }
+    }
+
+    fn yielded_header(self) -> OsTaskHeader {
+        OsTaskHeader {
+            flags: self.original_header.flags | fn64_runtime::OS_TASK_YIELDED,
+            ucode_data: self.original_header.yield_data_ptr,
+            ucode_data_size: self.original_header.yield_data_size,
+            ..self.original_header
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoadedRspTask {
+    task_addr: RdramAddr,
+    header: OsTaskHeader,
+    resumed_data_identity: Option<TaskMicrocodeDataIdentity>,
+}
+
+impl LoadedRspTask {
+    pub(crate) fn evidence_snapshot(&self) -> LoadedRspTaskEvidenceSnapshot {
+        LoadedRspTaskEvidenceSnapshot {
+            task_offset: self.task_addr.offset(),
+            header: self.header,
+            resumed_data_identity: self
+                .resumed_data_identity
+                .map(TaskMicrocodeDataIdentity::evidence_snapshot),
+        }
+    }
+}
+
+/// Capture the original task microcode-data image at the RSP kickoff boundary.
+///
+/// The source address and size come from the typed header retained by
+/// `osSpTaskLoad`, never from the mutable CPU `OSTask` storage. SP_DRAM_ADDR
+/// canonicalizes addresses to 24 bits; the result must remain inside physical
+/// RDRAM even when the host allocation appends sparse MMIO backing.
+///
+/// # Safety
+/// `rdram` must address the process allocation registered in `HostState`.
+unsafe fn task_microcode_data_identity(
+    rdram: *mut u8,
+    task_addr: RdramAddr,
+    source_addr: u32,
+    size: u32,
+) -> TaskMicrocodeDataIdentity {
+    let (registered_rdram, allocation_len) =
+        with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+    assert!(
+        !rdram.is_null() && allocation_len != 0,
+        "RSP task {:#010x} microcode-data capture has no registered process RDRAM allocation",
+        task_addr.offset()
+    );
+    assert_eq!(
+        registered_rdram, rdram,
+        "RSP task {:#010x} microcode-data capture does not use the registered process RDRAM allocation",
+        task_addr.offset()
+    );
+    let addr = RdramAddr::from_offset(source_addr & 0x00ff_ffff);
+    let start = addr.offset() as usize;
+    let end = start.checked_add(size as usize).unwrap_or_else(|| {
+        panic!(
+            "RSP task {:#010x} microcode-data range overflows host usize: start={:#010x} size={size:#x}",
+            task_addr.offset(),
+            addr.offset()
+        )
+    });
+    assert!(
+        end <= fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        "RSP task {:#010x} microcode-data range [{:#010x}, {end:#010x}) exceeds physical RDRAM length {:#x}",
+        task_addr.offset(),
+        addr.offset(),
+        fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+    );
+    assert!(
+        end <= allocation_len,
+        "RSP task {:#010x} microcode-data range [{:#010x}, {end:#010x}) exceeds registered allocation length {allocation_len:#x}",
+        task_addr.offset(),
+        addr.offset(),
+    );
+
+    let memory = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    let mut digest = Sha256::new();
+    for offset in 0..size {
+        let byte_addr = addr.checked_add(offset).unwrap_or_else(|| {
+            panic!(
+                "RSP task {:#010x} microcode-data logical address overflow at byte {offset:#x}",
+                task_addr.offset()
+            )
+        });
+        digest.update([unsafe { memory.read_u8(byte_addr) }]);
+    }
+    TaskMicrocodeDataIdentity {
+        addr,
+        size,
+        sha256: digest.finalize().into(),
+    }
+}
+
+fn identify_microcode_pair(
     imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    data: TaskMicrocodeDataIdentity,
 ) -> Option<fn64_render::UcodeId> {
-    with_render_backend("identify_microcode", |backend| {
-        Ok(backend.identify_microcode(imem))
+    with_render_backend("identify_microcode_pair", |backend| {
+        Ok(backend.identify_microcode_pair(
+            imem,
+            fn64_render::MicrocodeDataImageIdentity {
+                bytes: data.size,
+                sha256: data.sha256,
+            },
+        ))
     })
 }
 
@@ -744,6 +901,7 @@ unsafe fn dispatch_lle_task(
     task_addr: RdramAddr,
     recognize_graphics_microcode: bool,
     machine_state: Option<fn64_audio::rsp::runtime::RspMachineState>,
+    microcode_data: Option<TaskMicrocodeDataIdentity>,
 ) -> LleTaskResult {
     const CHUNK_STEPS: u64 = 1 << 20;
     const MAX_TASK_STEPS: u64 = 1 << 26;
@@ -882,12 +1040,25 @@ unsafe fn dispatch_lle_task(
     }
 
     let mut observations = Vec::new();
-    if recognize_graphics_microcode {
+    let recognition_data = if recognize_graphics_microcode {
+        Some(microcode_data.unwrap_or_else(|| {
+            panic!(
+                "RSP graphics task {:#010x} has no task-start microcode-data identity",
+                task_addr.offset()
+            )
+        }))
+    } else {
+        None
+    };
+    if let Some(data) = recognition_data {
         observations.push(RspRdpObservationKind::MicrocodeRecognition {
             task_addr,
             imem_generation,
             text_sha256: imem_sha256(&initial_imem),
-            family: identify_microcode(&initial_imem),
+            data_addr: data.addr,
+            data_size: data.size,
+            data_sha256: data.sha256,
+            family: identify_microcode_pair(&initial_imem, data),
         });
     }
     for replacement in replacements {
@@ -896,12 +1067,15 @@ unsafe fn dispatch_lle_task(
             imem_generation: replacement.generation,
             text_sha256: imem_sha256(&replacement.image),
         });
-        if recognize_graphics_microcode {
+        if let Some(data) = recognition_data {
             observations.push(RspRdpObservationKind::MicrocodeRecognition {
                 task_addr,
                 imem_generation: replacement.generation,
                 text_sha256: imem_sha256(&replacement.image),
-                family: identify_microcode(&replacement.image),
+                data_addr: data.addr,
+                data_size: data.size,
+                data_sha256: data.sha256,
+                family: identify_microcode_pair(&replacement.image, data),
             });
         }
     }
@@ -1365,16 +1539,63 @@ pub unsafe extern "C" fn osSpTaskYielded_recomp(rdram: *mut u8, ctx: *mut Recomp
     let task_addr = RdramAddr::from_gpr(ctx.r4);
     let o = task_addr.offset() as usize;
     if crate::pi::live_sp_status() & fn64_runtime::SP_STATUS_YIELDED == 0 {
+        with_host(|host| {
+            let retire = host
+                .rsp_task_lineages
+                .get(&task_addr.offset())
+                .is_some_and(|lineage| lineage.phase == RspTaskLineagePhase::Running);
+            if retire {
+                host.rsp_task_lineages.remove(&task_addr.offset());
+            }
+        });
         ctx.r2 = 0;
         return;
     }
 
     let header = unsafe { read_os_task_header(rdram, o) };
+    let lineage = with_host(|host| host.rsp_task_lineages.get(&task_addr.offset()).copied())
+        .unwrap_or_else(|| {
+            panic!(
+                "osSpTaskYielded_recomp: yielded RSP task {:#010x} has no started task lineage",
+                task_addr.offset()
+            )
+        });
+    assert_eq!(
+        lineage.phase,
+        RspTaskLineagePhase::Running,
+        "osSpTaskYielded_recomp: yielded RSP task {:#010x} cannot authorize a resume from phase {:?}",
+        task_addr.offset(),
+        lineage.phase,
+    );
+    let expected = if header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
+        lineage.yielded_header()
+    } else {
+        lineage.original_header
+    };
+    assert_eq!(
+        header,
+        expected,
+        "osSpTaskYielded_recomp: task {:#010x} changed after its loaded task admission",
+        task_addr.offset()
+    );
     unsafe {
         write_os_task_word(rdram, o, 0x04, header.flags | fn64_runtime::OS_TASK_YIELDED);
         write_os_task_word(rdram, o, 0x18, header.yield_data_ptr);
         write_os_task_word(rdram, o, 0x1c, header.yield_data_size);
     }
+    with_host(|host| {
+        let lineage = host
+            .rsp_task_lineages
+            .get_mut(&task_addr.offset())
+            .expect("yielded task lineage was validated above");
+        assert_eq!(
+            lineage.phase,
+            RspTaskLineagePhase::Running,
+            "osSpTaskYielded_recomp: yielded RSP task {:#010x} changed lineage phase during its public rewrite",
+            task_addr.offset()
+        );
+        lineage.phase = RspTaskLineagePhase::ResumeAuthorized;
+    });
     ctx.r2 = u64::from(fn64_runtime::OS_TASK_YIELDED);
 }
 
@@ -1556,6 +1777,7 @@ pub(crate) fn advance_hle_render_task() {
                 1,
             )
             .unwrap_or_else(|error| panic!("complete HLE chunk completion: {error}"));
+            retire_running_rsp_task_lineage(pending.task_addr, "complete HLE chunk");
         }
         fn64_render::RenderTaskChunkStatus::Yielded => {
             assert_ne!(
@@ -1918,6 +2140,176 @@ unsafe fn write_os_task_word(rdram: *mut u8, base: usize, field: usize, value: u
     };
 }
 
+fn loaded_rsp_task_from_header(task_addr: RdramAddr, header: OsTaskHeader) -> LoadedRspTask {
+    let resumed_data_identity = if header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
+        let lineage = with_host(|host| host.rsp_task_lineages.get(&task_addr.offset()).copied())
+            .unwrap_or_else(|| {
+                panic!(
+                    "osSpTaskLoad_recomp: yielded RSP task {:#010x} has no retained task lineage",
+                    task_addr.offset()
+                )
+            });
+        assert_eq!(
+            lineage.phase,
+            RspTaskLineagePhase::ResumeAuthorized,
+            "osSpTaskLoad_recomp: yielded RSP task {:#010x} has no unused resume authorization (phase {:?})",
+            task_addr.offset(),
+            lineage.phase,
+        );
+        assert_eq!(
+            header,
+            lineage.yielded_header(),
+            "osSpTaskLoad_recomp: yielded RSP task {:#010x} does not match its retained task lineage",
+            task_addr.offset()
+        );
+        lineage.data_identity
+    } else {
+        None
+    };
+    LoadedRspTask {
+        task_addr,
+        header,
+        resumed_data_identity,
+    }
+}
+
+fn retain_loaded_rsp_task(loaded: LoadedRspTask) {
+    with_host(|host| {
+        if let Some(replaced) = host.loaded_rsp_task.take() {
+            let remove_replaced_lineage = host
+                .rsp_task_lineages
+                .get(&replaced.task_addr.offset())
+                .is_some_and(|lineage| lineage.phase == RspTaskLineagePhase::ResumeLoaded);
+            if remove_replaced_lineage {
+                host.rsp_task_lineages.remove(&replaced.task_addr.offset());
+            }
+        }
+        if loaded.header.flags & fn64_runtime::OS_TASK_YIELDED == 0 {
+            host.rsp_task_lineages.remove(&loaded.task_addr.offset());
+        } else {
+            let lineage = host
+                .rsp_task_lineages
+                .get_mut(&loaded.task_addr.offset())
+                .expect("yielded loaded task lineage was validated before SP admission");
+            assert_eq!(
+                lineage.phase,
+                RspTaskLineagePhase::ResumeAuthorized,
+                "osSpTaskLoad_recomp: yielded RSP task {:#010x} consumed a stale resume authorization",
+                loaded.task_addr.offset()
+            );
+            lineage.phase = RspTaskLineagePhase::ResumeLoaded;
+        }
+        // RSP has one admitted task image. A later successful Load replaces
+        // that image and therefore replaces the sole unconsumed token too.
+        host.loaded_rsp_task = Some(loaded);
+    });
+}
+
+fn take_loaded_rsp_task(task_addr: RdramAddr) -> LoadedRspTask {
+    with_host(|host| {
+        let loaded = host.loaded_rsp_task.as_ref().unwrap_or_else(|| {
+            panic!(
+                "osSpTaskStartGo_recomp: task {:#010x} has no unconsumed osSpTaskLoad admission",
+                task_addr.offset()
+            )
+        });
+        assert_eq!(
+            loaded.task_addr, task_addr,
+            "osSpTaskStartGo_recomp: task {:#010x} does not own the loaded RSP task token for {:#010x}",
+            task_addr.offset(),
+            loaded.task_addr.offset()
+        );
+        host.loaded_rsp_task
+            .take()
+            .expect("loaded RSP task was present above")
+    })
+}
+
+fn retain_started_rsp_task_lineage(
+    loaded: LoadedRspTask,
+    data_identity: Option<TaskMicrocodeDataIdentity>,
+) {
+    with_host(|host| {
+        let running = host
+            .rsp_task_lineages
+            .iter()
+            .find_map(|(&task_offset, lineage)| {
+                (lineage.phase == RspTaskLineagePhase::Running).then_some(task_offset)
+            });
+        assert!(
+            running.is_none(),
+            "osSpTaskStartGo_recomp: task {:#010x} cannot start while task {:#010x} owns the Running RSP lineage",
+            loaded.task_addr.offset(),
+            running.unwrap_or_default(),
+        );
+        if loaded.header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
+            let lineage = host
+                .rsp_task_lineages
+                .get_mut(&loaded.task_addr.offset())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "osSpTaskStartGo_recomp: yielded RSP task {:#010x} lost its retained task lineage",
+                        loaded.task_addr.offset()
+                    )
+                });
+            assert_eq!(
+                lineage.data_identity, data_identity,
+                "osSpTaskStartGo_recomp: yielded RSP task {:#010x} changed its original microcode-data identity",
+                loaded.task_addr.offset()
+            );
+            assert_eq!(
+                lineage.phase,
+                RspTaskLineagePhase::ResumeLoaded,
+                "osSpTaskStartGo_recomp: yielded RSP task {:#010x} does not own a loaded resume token",
+                loaded.task_addr.offset()
+            );
+            lineage.phase = RspTaskLineagePhase::Running;
+        } else {
+            let previous = host.rsp_task_lineages.insert(
+                loaded.task_addr.offset(),
+                RspTaskLineage {
+                    original_header: loaded.header,
+                    data_identity,
+                    phase: RspTaskLineagePhase::Running,
+                },
+            );
+            assert!(
+                previous.is_none(),
+                "osSpTaskStartGo_recomp: fresh RSP task {:#010x} unexpectedly retained an older lineage",
+                loaded.task_addr.offset()
+            );
+        }
+    });
+}
+
+fn retire_running_rsp_task_lineage(task_addr: RdramAddr, operation: &'static str) {
+    with_host(|host| {
+        let lineage = host
+            .rsp_task_lineages
+            .get(&task_addr.offset())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{operation}: task {:#010x} has no Running RSP lineage to retire",
+                    task_addr.offset()
+                )
+            });
+        assert_eq!(
+            lineage.phase,
+            RspTaskLineagePhase::Running,
+            "{operation}: task {:#010x} cannot retire RSP lineage phase {:?}",
+            task_addr.offset(),
+            lineage.phase,
+        );
+        host.rsp_task_lineages.remove(&task_addr.offset());
+    });
+}
+
+fn retire_rsp_task_lineage_after_synchronous_result(task_addr: RdramAddr, operation: &'static str) {
+    if crate::pi::live_sp_status() & fn64_runtime::SP_STATUS_YIELDED == 0 {
+        retire_running_rsp_task_lineage(task_addr, operation);
+    }
+}
+
 /// `osSpTaskLoad(OSSpTask *sptask)` -- performs the public RSP guide's
 /// CPU-side admission algorithm: with SP halted, copy the complete 64-byte
 /// `OSTask` to DMEM `0xfc0`, copy aligned rspboot bytes to IMEM `0`, and set
@@ -1934,6 +2326,7 @@ pub unsafe extern "C" fn osSpTaskLoad_recomp(rdram: *mut u8, ctx: *mut RecompCon
     let task_addr = RdramAddr::from_gpr(ctx.r4);
     let o = task_addr.offset() as usize;
     let header = unsafe { read_os_task_header(rdram, o) };
+    let loaded = loaded_rsp_task_from_header(task_addr, header);
     // A newly admitted task must not inherit either half of the preceding
     // task's yield handshake. In particular, stale SIG1 would make the next
     // `osSpTaskYielded` rewrite a task that actually completed normally.
@@ -1961,6 +2354,7 @@ pub unsafe extern "C" fn osSpTaskLoad_recomp(rdram: *mut u8, ctx: *mut RecompCon
     });
     unsafe { crate::pi::admit_live_sp_task(rdram, task_addr, header, &boot) }
         .unwrap_or_else(|error| panic!("osSpTaskLoad_recomp: {error}"));
+    retain_loaded_rsp_task(loaded);
     if std::env::var_os("RSP_TRACE_TASK").is_some() {
         let memory = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
         let boot_word = unsafe {
@@ -2039,9 +2433,26 @@ pub unsafe extern "C" fn osSpTaskLoad_recomp(rdram: *mut u8, ctx: *mut RecompCon
 pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &*ctx };
     let task_addr = RdramAddr::from_gpr(ctx.r4);
+    let loaded = take_loaded_rsp_task(task_addr);
     let o = task_addr.offset() as usize;
-    let header = unsafe { read_os_task_header(rdram, o) };
+    let header = loaded.header;
     let is_gfx = header.task_type == M_GFXTASK;
+    // Hash fresh task data at the actual kickoff boundary using only the
+    // address/size admitted by Load. A yielded token owns the original
+    // identity directly and never hashes its rewritten yield buffer.
+    let initial_microcode_data = if is_gfx {
+        Some(loaded.resumed_data_identity.unwrap_or_else(|| unsafe {
+            task_microcode_data_identity(
+                rdram,
+                task_addr,
+                header.ucode_data,
+                header.ucode_data_size,
+            )
+        }))
+    } else {
+        None
+    };
+    retain_started_rsp_task_lineage(loaded, initial_microcode_data);
 
     // Kicking the RSP is where the selected task effect runs, so the work
     // happens here -- this is the path OoT uses (Load then
@@ -2079,8 +2490,17 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
             .take()
             .expect("gfx accuracy LLE requires an admitted HLE entry");
         let pre_ucode_steps = entry.pre_ucode_steps();
-        let lle =
-            unsafe { dispatch_lle_task(rdram, task_addr, true, entry.into_lle_machine_state()) };
+        let microcode_data = initial_microcode_data
+            .expect("gfx accuracy LLE requires admitted microcode-data identity");
+        let lle = unsafe {
+            dispatch_lle_task(
+                rdram,
+                task_addr,
+                true,
+                entry.into_lle_machine_state(),
+                Some(microcode_data),
+            )
+        };
         crate::pi::start_live_rcp_task_with_latency(
             rcp_completion_plan(lle.dp_full_sync, "gfx accuracy LLE"),
             pre_ucode_steps.saturating_add(lle.steps),
@@ -2088,6 +2508,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         .unwrap_or_else(|error| {
             panic!("osSpTaskStartGo_recomp gfx accuracy LLE completion: {error}")
         });
+        retire_rsp_task_lineage_after_synchronous_result(task_addr, "gfx accuracy LLE");
         return;
     } else if is_gfx {
         let retained = HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take());
@@ -2195,8 +2616,16 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                     .take()
                     .expect("gfx LLE fallback requires an admitted HLE entry");
                 let pre_ucode_steps = entry.pre_ucode_steps();
+                let microcode_data = initial_microcode_data
+                    .expect("gfx LLE fallback requires admitted microcode-data identity");
                 let lle = unsafe {
-                    dispatch_lle_task(rdram, task_addr, true, entry.into_lle_machine_state())
+                    dispatch_lle_task(
+                        rdram,
+                        task_addr,
+                        true,
+                        entry.into_lle_machine_state(),
+                        Some(microcode_data),
+                    )
                 };
                 crate::pi::start_live_rcp_task_with_latency(
                     rcp_completion_plan(lle.dp_full_sync, "gfx LLE fallback"),
@@ -2205,6 +2634,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                 .unwrap_or_else(|error| {
                     panic!("osSpTaskStartGo_recomp gfx LLE completion: {error}")
                 });
+                retire_rsp_task_lineage_after_synchronous_result(task_addr, "gfx LLE fallback");
                 return;
             }
         }
@@ -2212,12 +2642,13 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         unsafe { dispatch_audio_task(rdram, o, &hle_header) };
         fn64_render::DpFullSyncStatus::NotReached
     } else {
-        let lle = unsafe { dispatch_lle_task(rdram, task_addr, false, None) };
+        let lle = unsafe { dispatch_lle_task(rdram, task_addr, false, None, None) };
         crate::pi::start_live_rcp_task_with_latency(
             rcp_completion_plan(lle.dp_full_sync, "custom-task LLE"),
             lle.steps,
         )
         .unwrap_or_else(|error| panic!("osSpTaskStartGo_recomp LLE completion: {error}"));
+        retire_rsp_task_lineage_after_synchronous_result(task_addr, "custom-task LLE");
         return;
     };
 
@@ -2229,6 +2660,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         pre_ucode_steps.saturating_add(1),
     )
     .unwrap_or_else(|error| panic!("osSpTaskStartGo_recomp: {error}"));
+    retire_rsp_task_lineage_after_synchronous_result(task_addr, "known HLE task");
 }
 
 fn rcp_completion_plan(
@@ -2330,6 +2762,7 @@ mod tests {
 
     struct ExactIdentityBackend {
         admitted: [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        admitted_data: fn64_render::MicrocodeDataImageIdentity,
         family: UcodeId,
     }
 
@@ -2361,6 +2794,14 @@ mod tests {
             imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
         ) -> Option<UcodeId> {
             (imem == &self.admitted).then_some(self.family)
+        }
+
+        fn identify_microcode_pair(
+            &self,
+            imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+            data: fn64_render::MicrocodeDataImageIdentity,
+        ) -> Option<UcodeId> {
+            (imem == &self.admitted && data == self.admitted_data).then_some(self.family)
         }
 
         fn supported_ucodes(&self) -> &[UcodeId] {
@@ -3097,14 +3538,21 @@ mod tests {
     fn direct_imem_graphics_task_starts_lle_at_pc_zero_without_rspboot_overlay() {
         const HEADER: usize = 0x40;
         const IMAGE: usize = 0x100;
+        const DATA: u32 = 0x181;
+        const MUTATED_DATA: u32 = 0x1d1;
+        const INITIAL_DATA: [u8; 5] = [0x01, 0x23, 0x45, 0x67, 0x89];
+        const START_DATA: [u8; 5] = [0xfe, 0xdc, 0xba, 0x98, 0x76];
+        const MUTATED_DATA_BYTES: [u8; 3] = [0xaa, 0xbb, 0xcc];
         crate::load_rom(Vec::new());
-        let mut rdram = vec![0u8; 0x200];
+        let mut rdram = vec![0u8; 0x220];
         for (field, value) in [
             (0x00, fn64_runtime::M_GFXTASK),
             (0x08, 0x8000_0000 | IMAGE as u32),
             (0x0c, 12),
             (0x10, 0xA000_0000 | IMAGE as u32),
             (0x14, 12),
+            (0x18, 0xA000_0000 | DATA),
+            (0x1c, INITIAL_DATA.len() as u32),
         ] {
             rdram[HEADER + field..HEADER + field + 4].copy_from_slice(&value.to_ne_bytes());
         }
@@ -3114,6 +3562,12 @@ mod tests {
         {
             let offset = IMAGE + index * 4;
             rdram[offset..offset + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (offset, byte) in INITIAL_DATA.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(DATA + offset as u32), byte);
+            }
         }
         with_host(|host| {
             host.runtime_rdram = rdram.as_mut_ptr();
@@ -3127,7 +3581,32 @@ mod tests {
         );
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + HEADER as u64;
+        let admitted_header = unsafe { read_os_task_header(rdram.as_mut_ptr(), HEADER) };
         unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(
+            crate::host_evidence_snapshot().loaded_rsp_task,
+            Some(LoadedRspTaskEvidenceSnapshot {
+                task_offset: HEADER as u32,
+                header: admitted_header,
+                resumed_data_identity: None,
+            })
+        );
+        // StartGo hashes current bytes at the address/size admitted by Load.
+        // Mutating the CPU header to a second source must not change that
+        // admitted source, while mutation of source A's bytes remains visible.
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (offset, byte) in START_DATA.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(DATA + offset as u32), byte);
+            }
+            for (offset, byte) in MUTATED_DATA_BYTES.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(MUTATED_DATA + offset as u32), byte);
+            }
+        }
+        rdram[HEADER + 0x18..HEADER + 0x1c]
+            .copy_from_slice(&(0xA000_0000 | MUTATED_DATA).to_ne_bytes());
+        rdram[HEADER + 0x1c..HEADER + 0x20]
+            .copy_from_slice(&(MUTATED_DATA_BYTES.len() as u32).to_ne_bytes());
         let expected_at = Cycles::new(sim_time());
         let (imem_generation, expected_digest) = with_host(|host| {
             let memory = host.device_fabric.rsp_memory();
@@ -3137,6 +3616,13 @@ mod tests {
             )
         });
         unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+
+        let host_evidence = crate::host_evidence_snapshot();
+        assert_eq!(host_evidence.loaded_rsp_task, None);
+        assert!(
+            host_evidence.rsp_task_lineages.is_empty(),
+            "a synchronous normal completion must retire its Running lineage"
+        );
 
         with_host(|host| {
             let fabric = &host.device_fabric;
@@ -3161,6 +3647,9 @@ mod tests {
                     task_addr: RdramAddr::from_offset(HEADER as u32),
                     imem_generation,
                     text_sha256: expected_digest,
+                    data_addr: RdramAddr::from_offset(DATA),
+                    data_size: START_DATA.len() as u32,
+                    data_sha256: Sha256::digest(START_DATA).into(),
                     family: None,
                 },
             }]
@@ -3169,7 +3658,346 @@ mod tests {
     }
 
     #[test]
-    fn lle_microcode_recognition_requires_the_backends_exact_imem_image() {
+    fn yielded_resume_reuses_typed_original_data_lineage_until_rom_reset() {
+        const TASK: u32 = 0x40;
+        const ORIGINAL: u32 = 0x101;
+        const YIELD: u32 = 0x181;
+        const ORIGINAL_BYTES: [u8; 5] = [0x11, 0x22, 0x33, 0x44, 0x55];
+        const YIELD_BYTES: [u8; 5] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x200];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (offset, byte) in ORIGINAL_BYTES.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(ORIGINAL + offset as u32), byte);
+            }
+            for (offset, byte) in YIELD_BYTES.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(YIELD + offset as u32), byte);
+            }
+        }
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+        let task_addr = RdramAddr::from_offset(TASK);
+        let initial_header = OsTaskHeader {
+            task_type: M_GFXTASK,
+            ucode_data: 0x8000_0000 | ORIGINAL,
+            ucode_data_size: ORIGINAL_BYTES.len() as u32,
+            yield_data_ptr: 0xA000_0000 | YIELD,
+            yield_data_size: YIELD_BYTES.len() as u32,
+            ..Default::default()
+        };
+        let original = unsafe {
+            task_microcode_data_identity(
+                rdram.as_mut_ptr(),
+                task_addr,
+                initial_header.ucode_data,
+                initial_header.ucode_data_size,
+            )
+        };
+        with_host(|host| {
+            host.rsp_task_lineages.insert(
+                task_addr.offset(),
+                RspTaskLineage {
+                    original_header: initial_header,
+                    data_identity: Some(original),
+                    phase: RspTaskLineagePhase::ResumeAuthorized,
+                },
+            );
+        });
+
+        let resumed_header = OsTaskHeader {
+            flags: fn64_runtime::OS_TASK_YIELDED,
+            ucode_data: initial_header.yield_data_ptr,
+            ucode_data_size: initial_header.yield_data_size,
+            ..initial_header
+        };
+        let resumed = loaded_rsp_task_from_header(task_addr, resumed_header);
+        assert_eq!(resumed.resumed_data_identity, Some(original));
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_task_lineages[0].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized
+        );
+        let yield_sha256: [u8; 32] = Sha256::digest(YIELD_BYTES).into();
+        assert_ne!(
+            resumed
+                .resumed_data_identity
+                .expect("yielded load retains data identity")
+                .sha256,
+            yield_sha256
+        );
+
+        retain_loaded_rsp_task(resumed);
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_task_lineages[0].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::ResumeLoaded
+        );
+        let replay =
+            std::panic::catch_unwind(|| loaded_rsp_task_from_header(task_addr, resumed_header))
+                .unwrap_err();
+        let replay_message = panic_message(replay.as_ref());
+        assert!(replay_message.contains("has no unused resume authorization"));
+
+        let loaded = take_loaded_rsp_task(task_addr);
+        retain_started_rsp_task_lineage(loaded, Some(original));
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_task_lineages[0].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::Running
+        );
+
+        crate::load_rom(Vec::new());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loaded_rsp_task_from_header(task_addr, resumed_header)
+        }))
+        .unwrap_err();
+        let message = panic_message(panic.as_ref());
+        assert!(message.contains("yielded RSP task 0x00000040 has no retained task lineage"));
+    }
+
+    #[test]
+    fn rom_reset_invalidates_unconsumed_loaded_task_authority() {
+        let task_addr = RdramAddr::from_offset(0x40);
+        retain_loaded_rsp_task(LoadedRspTask {
+            task_addr,
+            header: OsTaskHeader {
+                task_type: M_GFXTASK,
+                ..Default::default()
+            },
+            resumed_data_identity: None,
+        });
+        crate::load_rom(Vec::new());
+
+        let panic = std::panic::catch_unwind(|| take_loaded_rsp_task(task_addr)).unwrap_err();
+        let message = panic_message(panic.as_ref());
+        assert!(message.contains("has no unconsumed osSpTaskLoad admission"));
+        assert!(crate::host_evidence_snapshot().rsp_task_lineages.is_empty());
+    }
+
+    #[test]
+    fn loading_one_suspended_task_preserves_other_resume_authorizations() {
+        crate::load_rom(Vec::new());
+        let original = |yield_data_ptr| OsTaskHeader {
+            yield_data_ptr,
+            yield_data_size: 0x40,
+            ..Default::default()
+        };
+        let first_addr = RdramAddr::from_offset(0x40);
+        let second_addr = RdramAddr::from_offset(0x80);
+        let first = RspTaskLineage {
+            original_header: original(0x180),
+            data_identity: None,
+            phase: RspTaskLineagePhase::ResumeAuthorized,
+        };
+        let second = RspTaskLineage {
+            original_header: original(0x1c0),
+            data_identity: None,
+            phase: RspTaskLineagePhase::ResumeAuthorized,
+        };
+        with_host(|host| {
+            host.rsp_task_lineages.insert(first_addr.offset(), first);
+            host.rsp_task_lineages.insert(second_addr.offset(), second);
+        });
+
+        let loaded = loaded_rsp_task_from_header(first_addr, first.yielded_header());
+        retain_loaded_rsp_task(loaded);
+        let snapshot = crate::host_evidence_snapshot();
+        assert_eq!(snapshot.rsp_task_lineages.len(), 2);
+        assert_eq!(
+            snapshot.rsp_task_lineages[0].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::ResumeLoaded
+        );
+        assert_eq!(
+            snapshot.rsp_task_lineages[1].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized
+        );
+
+        let loaded = take_loaded_rsp_task(first_addr);
+        retain_started_rsp_task_lineage(loaded, None);
+        retire_running_rsp_task_lineage(first_addr, "multiple-suspended test completion");
+        let snapshot = crate::host_evidence_snapshot();
+        assert_eq!(snapshot.rsp_task_lineages.len(), 1);
+        assert_eq!(
+            snapshot.rsp_task_lineages[0].task_offset,
+            second_addr.offset()
+        );
+        assert_eq!(
+            snapshot.rsp_task_lineages[0].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized
+        );
+    }
+
+    #[test]
+    fn fresh_load_reuse_cancels_same_address_resume_authorization() {
+        crate::load_rom(Vec::new());
+        let task_addr = RdramAddr::from_offset(0x40);
+        with_host(|host| {
+            host.rsp_task_lineages.insert(
+                task_addr.offset(),
+                RspTaskLineage {
+                    original_header: OsTaskHeader {
+                        yield_data_ptr: 0x180,
+                        yield_data_size: 0x40,
+                        ..Default::default()
+                    },
+                    data_identity: None,
+                    phase: RspTaskLineagePhase::ResumeAuthorized,
+                },
+            );
+        });
+
+        retain_loaded_rsp_task(LoadedRspTask {
+            task_addr,
+            header: OsTaskHeader::default(),
+            resumed_data_identity: None,
+        });
+
+        assert!(crate::host_evidence_snapshot().rsp_task_lineages.is_empty());
+    }
+
+    #[test]
+    fn microcode_data_capture_rejects_out_of_bounds_task_range() {
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x100];
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+        let header = OsTaskHeader {
+            task_type: M_GFXTASK,
+            ucode_data: 0x8000_00ff,
+            ucode_data_size: 2,
+            ..Default::default()
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            task_microcode_data_identity(
+                rdram.as_mut_ptr(),
+                RdramAddr::from_offset(0x40),
+                header.ucode_data,
+                header.ucode_data_size,
+            )
+        }))
+        .unwrap_err();
+        let message = panic_message(panic.as_ref());
+        assert!(message.contains("microcode-data range [0x000000ff, 0x00000101)"));
+        assert!(message.contains("registered allocation length 0x100"));
+    }
+
+    #[test]
+    fn microcode_data_capture_uses_sp_dram_addr_high_alias() {
+        const DATA: u32 = 0x81;
+        const BYTES: [u8; 5] = [0x10, 0x32, 0x54, 0x76, 0x98];
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x100];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (offset, byte) in BYTES.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(DATA + offset as u32), byte);
+            }
+        }
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+
+        let identity = unsafe {
+            task_microcode_data_identity(
+                rdram.as_mut_ptr(),
+                RdramAddr::from_offset(0x40),
+                0xab00_0000 | DATA,
+                BYTES.len() as u32,
+            )
+        };
+
+        assert_eq!(identity.addr, RdramAddr::from_offset(DATA));
+        let expected_sha256: [u8; 32] = Sha256::digest(BYTES).into();
+        assert_eq!(identity.sha256, expected_sha256);
+    }
+
+    #[test]
+    fn microcode_data_capture_rejects_sparse_host_bytes_beyond_physical_rdram() {
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE + 0x100];
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            task_microcode_data_identity(
+                rdram.as_mut_ptr(),
+                RdramAddr::from_offset(0x40),
+                fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u32 - 1,
+                2,
+            )
+        }))
+        .unwrap_err();
+        let message = panic_message(panic.as_ref());
+        assert!(message.contains("microcode-data range [0x007fffff, 0x00800001)"));
+        assert!(message.contains("exceeds physical RDRAM length 0x800000"));
+    }
+
+    #[test]
+    fn text_only_backend_identity_cannot_set_a_microcode_pair_family() {
+        struct TextOnlyBackend {
+            admitted: [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        }
+
+        impl RenderBackend for TextOnlyBackend {
+            fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            no_rust_hidden_sidecar!();
+
+            fn process_task(
+                &mut self,
+                _rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+            ) -> Result<FrameStatus, RenderError> {
+                Ok(FrameStatus::Complete)
+            }
+
+            fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn identify_microcode(
+                &self,
+                imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+            ) -> Option<UcodeId> {
+                (imem == &self.admitted).then_some(UcodeId::F3dex2)
+            }
+
+            fn supported_ucodes(&self) -> &[UcodeId] {
+                &[]
+            }
+        }
+
+        let admitted = [0x5a; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let backend = TextOnlyBackend { admitted };
+        assert_eq!(backend.identify_microcode(&admitted), Some(UcodeId::F3dex2));
+        set_render_backend(Box::new(backend), fn64_runtime::rdram::DEFAULT_RDRAM_SIZE);
+        assert_eq!(
+            identify_microcode_pair(
+                &admitted,
+                TaskMicrocodeDataIdentity {
+                    addr: RdramAddr::from_offset(0x100),
+                    size: 3,
+                    sha256: Sha256::digest([1, 2, 3]).into(),
+                },
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn lle_microcode_recognition_requires_the_backends_exact_text_data_pair() {
         const HEADER: usize = 0x40;
         const IMAGE: usize = 0x100;
         crate::load_rom(Vec::new());
@@ -3210,6 +4038,10 @@ mod tests {
         set_render_backend_with_policy(
             Box::new(ExactIdentityBackend {
                 admitted,
+                admitted_data: fn64_render::MicrocodeDataImageIdentity {
+                    bytes: 0,
+                    sha256: Sha256::digest([]).into(),
+                },
                 family: UcodeId::F3dex2,
             }),
             rdram.len(),
@@ -3226,6 +4058,9 @@ mod tests {
                     task_addr: RdramAddr::from_offset(HEADER as u32),
                     imem_generation,
                     text_sha256: expected_digest,
+                    data_addr: RdramAddr::from_offset(0),
+                    data_size: 0,
+                    data_sha256: Sha256::digest([]).into(),
                     family: Some(UcodeId::F3dex2),
                 },
             }]
@@ -3361,12 +4196,24 @@ mod tests {
         const DPC_START: u32 = 0x180;
         const DPC_END: u32 = 0x188;
         const VI_OUTPUT: u32 = 0x100;
+        const MICROCODE_DATA: u32 = 0x1a1;
+        const MICROCODE_DATA_BYTES: [u8; 5] = [0x13, 0x57, 0x9b, 0xdf, 0x24];
         let mtc0 = |rt: u32, rd: u32| (0x10 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11);
         let mut rdram = vec![0u8; 0x200];
         rdram[DPC_START as usize..DPC_START as usize + 4]
             .copy_from_slice(&0xe900_0000u32.to_ne_bytes());
         rdram[DPC_START as usize + 4..DPC_END as usize].copy_from_slice(&0u32.to_ne_bytes());
         rdram[HEADER..HEADER + 4].copy_from_slice(&fn64_runtime::M_GFXTASK.to_ne_bytes());
+        rdram[HEADER + 0x18..HEADER + 0x1c]
+            .copy_from_slice(&(0xA000_0000 | MICROCODE_DATA).to_ne_bytes());
+        rdram[HEADER + 0x1c..HEADER + 0x20]
+            .copy_from_slice(&(MICROCODE_DATA_BYTES.len() as u32).to_ne_bytes());
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (offset, byte) in MICROCODE_DATA_BYTES.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(MICROCODE_DATA + offset as u32), byte);
+            }
+        }
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + HEADER as u64;
         admit_synthetic_hle_task(&mut rdram, HEADER, &mut ctx);
@@ -3432,6 +4279,7 @@ mod tests {
         });
         let observations = copy_rsp_rdp_observations();
         assert_eq!(observations.len(), 3);
+        let microcode_data_sha256: [u8; 32] = Sha256::digest(MICROCODE_DATA_BYTES).into();
         let replacement_generation = match &observations[0].kind {
             RspRdpObservationKind::ImemReplacementCommitted {
                 task_addr,
@@ -3448,10 +4296,16 @@ mod tests {
             RspRdpObservationKind::MicrocodeRecognition {
                 task_addr,
                 imem_generation,
+                data_addr,
+                data_size,
+                data_sha256,
                 family: None,
                 ..
             } if *task_addr == RdramAddr::from_offset(HEADER as u32)
                 && *imem_generation == replacement_generation
+                && *data_addr == RdramAddr::from_offset(MICROCODE_DATA)
+                && *data_size == MICROCODE_DATA_BYTES.len() as u32
+                && *data_sha256 == microcode_data_sha256
         ));
         assert_eq!(
             observations[2].kind,
@@ -3564,7 +4418,13 @@ mod tests {
         });
 
         let result = unsafe {
-            dispatch_lle_task(rdram.as_mut_ptr(), RdramAddr::from_offset(0), false, None)
+            dispatch_lle_task(
+                rdram.as_mut_ptr(),
+                RdramAddr::from_offset(0),
+                false,
+                None,
+                None,
+            )
         };
 
         assert_eq!(
@@ -3614,6 +4474,11 @@ mod tests {
         });
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + HEADER as u64;
+        retain_loaded_rsp_task(LoadedRspTask {
+            task_addr: RdramAddr::from_offset(HEADER as u32),
+            header: OsTaskHeader::default(),
+            resumed_data_identity: None,
+        });
 
         unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
 
@@ -3637,7 +4502,49 @@ mod tests {
     }
 
     #[test]
+    fn two_consecutive_normal_tasks_retire_running_lineage_without_yield_query() {
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x1000];
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+            let program = [0x0000_000du32];
+            let bytes: Vec<u8> = program.into_iter().flat_map(u32::to_be_bytes).collect();
+            host.device_fabric
+                .rsp_memory_mut()
+                .write_bytes(
+                    fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0),
+                    &bytes,
+                )
+                .unwrap();
+        });
+        let mut ctx = ctx_zeroed();
+
+        for task_offset in [0x40, 0x80] {
+            crate::pi::set_live_sp_pc(0);
+            let task_addr = RdramAddr::from_offset(task_offset);
+            retain_loaded_rsp_task(LoadedRspTask {
+                task_addr,
+                header: OsTaskHeader::default(),
+                resumed_data_identity: None,
+            });
+            ctx.r4 = 0x8000_0000 + u64::from(task_offset);
+
+            unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+
+            assert!(
+                crate::host_evidence_snapshot().rsp_task_lineages.is_empty(),
+                "normal task {task_offset:#x} must retire before another task starts"
+            );
+            let deadline = crate::next_device_deadline().expect("normal task completion deadline");
+            crate::advance_virtual_time(deadline);
+        }
+    }
+
+    #[test]
     fn unknown_task_lle_resolves_rspboot_style_imem_overlay_and_resumes() {
+        const DATA: u32 = 0x281;
+        const DATA_BYTES: [u8; 7] = [0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc];
         crate::load_rom(Vec::new());
         let mtc0 = |rt: u32, rd: u32| (0x10 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11);
         let boot = [
@@ -3656,6 +4563,12 @@ mod tests {
         for (index, word) in overlay.into_iter().enumerate() {
             let offset = 0x200 + index * 4;
             rdram[offset..offset + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (offset, byte) in DATA_BYTES.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(DATA + offset as u32), byte);
+            }
         }
         // The 32-byte DMA resumes at 0x1018; put BREAK in the still-existing
         // word immediately after the overlay transfer.
@@ -3691,8 +4604,28 @@ mod tests {
         );
         let expected_at = Cycles::new(sim_time());
 
+        let task_addr = RdramAddr::from_offset(0x40);
+        let task = OsTaskHeader {
+            ucode_data: 0x8000_0000 | DATA,
+            ucode_data_size: DATA_BYTES.len() as u32,
+            ..Default::default()
+        };
+        let microcode_data = unsafe {
+            task_microcode_data_identity(
+                rdram.as_mut_ptr(),
+                task_addr,
+                task.ucode_data,
+                task.ucode_data_size,
+            )
+        };
         let result = unsafe {
-            dispatch_lle_task(rdram.as_mut_ptr(), RdramAddr::from_offset(0x40), true, None)
+            dispatch_lle_task(
+                rdram.as_mut_ptr(),
+                task_addr,
+                true,
+                None,
+                Some(microcode_data),
+            )
         };
 
         assert_eq!(
@@ -3731,6 +4664,9 @@ mod tests {
                         task_addr: RdramAddr::from_offset(0x40),
                         imem_generation: generation_before,
                         text_sha256: initial_digest,
+                        data_addr: microcode_data.addr,
+                        data_size: microcode_data.size,
+                        data_sha256: microcode_data.sha256,
                         family: None,
                     },
                 },
@@ -3748,6 +4684,9 @@ mod tests {
                         task_addr: RdramAddr::from_offset(0x40),
                         imem_generation: generation_before + 1,
                         text_sha256: final_digest,
+                        data_addr: microcode_data.addr,
+                        data_size: microcode_data.size,
+                        data_sha256: microcode_data.sha256,
                         family: None,
                     },
                 },
@@ -4637,6 +5576,23 @@ mod tests {
         }
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
+        with_host(|host| {
+            host.rsp_task_lineages.insert(
+                HEADER_OFF as u32,
+                RspTaskLineage {
+                    original_header: OsTaskHeader {
+                        flags: FLAGS,
+                        ucode_data: OLD_UCODE_DATA,
+                        ucode_data_size: OLD_UCODE_DATA_SIZE,
+                        yield_data_ptr: YIELD_DATA,
+                        yield_data_size: YIELD_DATA_SIZE,
+                        ..Default::default()
+                    },
+                    data_identity: None,
+                    phase: RspTaskLineagePhase::Running,
+                },
+            );
+        });
 
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
@@ -4651,6 +5607,10 @@ mod tests {
         assert_eq!(word(0x04), FLAGS | fn64_runtime::OS_TASK_YIELDED);
         assert_eq!(word(0x18), YIELD_DATA);
         assert_eq!(word(0x1c), YIELD_DATA_SIZE);
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_task_lineages[0].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized
+        );
         assert_ne!(
             crate::pi::live_sp_status() & fn64_runtime::SP_STATUS_YIELDED,
             0,

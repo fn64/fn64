@@ -2,7 +2,7 @@
 //!
 //! The manifest contains only the immutable project profile and evidence
 //! identities, never ROM bytes, captured output, or caller-authored coverage.
-//! Dynamic evidence remains the schema-v16 report series; coverage is derived
+//! Dynamic evidence remains the schema-v17 report series; coverage is derived
 //! from each validated report before it is compared with the fixed profile.
 
 use crate::{
@@ -151,12 +151,12 @@ pub struct ReleaseMatrixScenario {
     /// Stable diagnostic key. Evidence is associated by `report_scenario`, not
     /// by a caller-provided command-line assignment.
     pub id: String,
-    /// Exact scenario string bound by every schema-v16 report in this series.
+    /// Exact scenario string bound by every schema-v17 report in this series.
     pub report_scenario: String,
     /// Exact private-input identity bound by every report; no input bytes are stored.
     pub input_sha256: String,
     pub report_sha256: String,
-    /// Canonical digest over this declaration and its exact v16 evidence IDs.
+    /// Canonical digest over this declaration and its exact v17 evidence IDs.
     pub declaration_sha256: String,
 }
 
@@ -230,12 +230,12 @@ pub struct VerifiedMatrixScenario {
     pub environment: ReleaseEnvironmentEvidence,
     pub closure_paths: u64,
     /// Exact destination sequence and canonical unique/count summary retained
-    /// from the verified v16 series.
+    /// from the verified v17 series.
     pub execution_destinations: ExecutionDestinationEvidence,
-    /// Complete schema-v16 RSP/RDP observation stream retained for independent
+    /// Complete schema-v17 RSP/RDP observation stream retained for independent
     /// report reconstruction and coverage derivation.
     pub rsp_rdp: RspRdpEvidence,
-    /// Exact canonical closure ledger retained from the verified v16 series.
+    /// Exact canonical closure ledger retained from the verified v17 series.
     /// A count alone cannot prove which feature-specific operation paths ran.
     pub closure: Vec<ClosurePath>,
     pub unsupported_events: u64,
@@ -3162,6 +3162,9 @@ mod tests {
                         task_address: 0x1000 + index as u32 * 0x40,
                         imem_generation: index as u64 + 1,
                         text_sha256: hex(text_sha256),
+                        data_address: 0x4000 + index as u32 * 0x80,
+                        data_bytes: 0x80,
+                        data_sha256: hex(text_sha256),
                         family: Some(*family),
                     },
                 },
@@ -3177,6 +3180,9 @@ mod tests {
                     task_address: 0x2000,
                     imem_generation: 20,
                     text_sha256: "ee".repeat(32),
+                    data_address: 0x6000,
+                    data_bytes: 0x80,
+                    data_sha256: "ed".repeat(32),
                     family: Some(family),
                 },
             });
@@ -3187,6 +3193,9 @@ mod tests {
                 task_address: 0x2040,
                 imem_generation: 21,
                 text_sha256: "ef".repeat(32),
+                data_address: 0x6080,
+                data_bytes: 0x80,
+                data_sha256: "ec".repeat(32),
                 family: None,
             },
         });

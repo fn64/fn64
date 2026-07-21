@@ -204,11 +204,13 @@ Corollaries, each earned the hard way:
 
 #### Private release execution is a typed authority boundary
 
-Private admission and private execution are deliberately separate. Schema-v4
-admission validates local ownership/provenance policy and content-addresses the
-ROM, recompiled output, microcode pair, native host entry image, arguments,
-environment, fixed cycle, and expected execution source. The emitted
-`fn64.private-release-run-contract.v1` is an integrity wire, not a signature:
+Private admission and private execution are deliberately separate. Admission
+schema `fn64.private-input-admission.v5` validates local ownership/provenance
+policy and content-addresses the
+ROM, recompiled output, microcode pair, native host entry image, typed
+program-build receipt, arguments, environment, fixed cycle, and expected
+execution source. The emitted `fn64.private-release-run-contract.v2` is an
+integrity wire, not a signature:
 any caller can recompute a self-hash. Production runner APIs therefore accept
 only an opaque `VerifiedPrivateReleaseRunContract`. Its loader requires the
 runtime admission script to equal the bytes embedded when the runner was built
@@ -234,17 +236,44 @@ create-new, read-only, and rehashed, but a malicious same-UID process capable
 of chmod plus pathname replacement between verification and OS open/spawn is
 outside scope. The resolved system-Python executable is trusted as OS-owned.
 
-That still does not prove consumption. Rehashing an admitted microcode or
-recompiled file proves that it did not change, not that the child installed
-it. Consequently `full_rom` and `combined` currently fail before their first
-child with the missing `fn64.release-program-build-receipt.v1` boundary.
-Production becomes admissible only when typed build/runtime evidence connects
-the admitted recompiled bytes to the child/report execution source and the
-admitted microcode text/data to the ABI-owned task observations. The live
-synthetic runner test demonstrates direct-process orchestration and mechanism
-determinism during the observed test invocation only. Its self-hashed receipt
-is retained integrity evidence, not a transferable process attestation, and
-the synthetic result cannot be promoted into private-ROM evidence.
+Rehashing an admitted microcode or recompiled file proves only that it did not
+change, not that the child consumed it. Schema v5 therefore requires
+`fn64.release-program-build-receipt.v1` for `full_rom` and `combined`. The
+receipt binds the exact child entry image and recomputes the declared execution
+source from one typed lane: canonically labeled exact linked archives for a
+native program, the generated typed-observed-function identity wire, or the
+typed-block pack plus its expected live program identity. The private v2
+contract binds the receipt itself, requires exactly one receipt lane input to
+equal the admitted `recompiled` artifact, and requires both the declared and
+recomputed source to equal the report source. The runner revalidates these
+files before the series, before each child, after the final child, and during
+retained-series verification. This is exact identity co-binding, not proof that
+the child was compiled or linked from the lane inputs; that stronger claim
+requires a trusted build/link record or external attestation.
+
+Runtime task-start identity is separate from program-input identity. At the authoritative
+graphics-task start, the ABI hashes the exact logical RDRAM bytes named by the
+original task's microcode-data address and length and records that identity in
+the same recognition event as the live 4 KiB IMEM digest and recognized
+family. That family comes only from the selected backend's exact text/data-pair
+catalog; text-only HLE recognition cannot populate release evidence. Overlay
+recognition pairs each replacement IMEM generation with that
+same original data identity; a yielded resume never promotes the rewritten
+yield-buffer pointer to admitted microcode data. One typed lifecycle permits
+`Running -> ResumeAuthorized -> ResumeLoaded -> Running`; ordinary completion
+retires `Running`, and each authorization is load-consumed exactly once. Every production report in
+the exact-ten series must contain one single recognized event whose text SHA,
+data length, and data SHA equal the admitted pair. Report schema
+`fn64.release-gate.v17` and the
+`fn64.rsp-rdp-observations.v2` wire bind those fields.
+
+This mechanism makes a correctly formed production contract launchable; it is
+not representative-ROM evidence by itself. No representative private full-ROM
+exact-ten series has yet been retained. The live synthetic runner test still
+demonstrates direct-process orchestration and mechanism determinism during the
+observed test invocation only. Its self-hashed receipt is retained integrity
+evidence, not a transferable process attestation, and the synthetic result
+cannot be promoted into private-ROM evidence.
 
 #### Instruction-exact savestate transplant is NOT REPRESENTABLE here (negative result, 2026-07-14)
 
@@ -380,7 +409,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v16 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v17 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -389,7 +418,10 @@ image and asks the registered backend only for exact catalog recognition; the
 backend cannot supply the digest or choose execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema v16 binds it independently.
+clears it and report schema `fn64.release-gate.v17` binds it independently.
+Each microcode recognition entry also binds the original task data address,
+exact logical byte length, and SHA-256 in the
+`fn64.rsp-rdp-observations.v2` wire.
 
 The emitted crate is out-of-tree, game-derived material, and per `AGENTS.md`
 it must never enter git or the main workspace graph. That constraint — not
@@ -904,7 +936,9 @@ task calls out:
   block-lane checkpoints. Both boot lanes pass the allocation length with its
   pointer through one process-RDRAM registration seam; the executor, timed DMA
   paths, and RSP HLE/LLE task runners therefore share one explicit bounds
-  authority. Raw-MMIO interception ends at the public RCP/SI boundary
+  authority. Re-registering the identical pointer/length is idempotent;
+  replacing a live allocation traps because retained device/task authority may
+  still name the original bytes. Raw-MMIO interception ends at the public RCP/SI boundary
   `0xA4900000`; cartridge-domain KSEG1 addresses at `0xA5000000` and above
   remain ordinary mapped memory rather than being misdecoded as registers.
 - **Why rung-18-class races become unrepresentable, precisely.** Rung 18's

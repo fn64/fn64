@@ -35,6 +35,7 @@ const AI_BUFFER: usize = 0x500;
 const GFX_TASK: usize = 0x600;
 const AUDIO_TASK: usize = 0x680;
 const RSP_BOOT: usize = 0x700;
+const RSP_UCODE_DATA: usize = 0x780;
 const RDP_COMMANDS: usize = 0x800;
 const FRAMEBUFFER: usize = 0x900;
 const WIDTH: usize = 4;
@@ -292,6 +293,8 @@ fn prepare_synthetic_memory(rdram: &mut [u8]) {
     }
     write_word(rdram, RSP_BOOT, 0x0000_000d);
     write_word(rdram, RSP_BOOT + 4, 0);
+    write_word(rdram, RSP_UCODE_DATA, 0x666e_3634);
+    write_word(rdram, RSP_UCODE_DATA + 4, 0x6461_7461);
 
     let commands: [(u32, u32); 5] = [
         (0xef00_0000 | (3 << 20), 0),
@@ -312,6 +315,8 @@ fn write_task(rdram: &mut [u8], base: usize, task_type: u32) {
     write_word(rdram, base + 0x0c, 8);
     write_word(rdram, base + 0x10, kseg(RSP_BOOT));
     write_word(rdram, base + 0x14, 8);
+    write_word(rdram, base + 0x18, kseg(RSP_UCODE_DATA));
+    write_word(rdram, base + 0x1c, 8);
 }
 
 unsafe extern "C" fn synthetic_entry(rdram: *mut u8, ctx: *mut fn64_abi::RecompContext) {
