@@ -3858,6 +3858,7 @@ pub fn validate_raw_rdp_command_range(
             opcode,
             G_NOOP | 0x08
                 ..=0x0f
+                    | 0xc8..=0xcf
                     | G_TEXRECT
                     | G_TEXRECTFLIP
                     | G_RDPLOADSYNC
@@ -3911,8 +3912,20 @@ pub fn validate_raw_rdp_command_range(
     Ok(())
 }
 
+/// Map a raw-lane command byte to its 6-bit RDP triangle command when it is
+/// one of the eight edge/coefficient layouts. The RDP command processor
+/// decodes only the low 6 bits of the command byte (bits 61:56 of the
+/// 64-bit command word), and RSP microcode output sets the top two bits --
+/// F3DEX2's XBUS stream carries a shade+texture triangle as 0xCE, while this
+/// crate's canonical fixtures spell the same command 0x0E. Both encodings
+/// name the identical hardware command; any OTHER alias (0x48/0x88 bases)
+/// is not produced by known microcode and stays a loud unsupported opcode.
+fn raw_rdp_triangle_layout(opcode: u8) -> Option<u8> {
+    matches!(opcode, 0x08..=0x0f | 0xc8..=0xcf).then_some(opcode & 0x3f)
+}
+
 fn raw_rdp_opcode_name(opcode: u8) -> &'static str {
-    match opcode {
+    match raw_rdp_triangle_layout(opcode).unwrap_or(opcode) {
         0x08 => "RDP_TRI_FILL",
         0x09 => "RDP_TRI_FILL_ZBUFF",
         0x0a => "RDP_TRI_TXTR",
@@ -3928,16 +3941,16 @@ fn raw_rdp_opcode_name(opcode: u8) -> &'static str {
 /// Byte width of one raw RDP command. Triangle sizes concatenate the edge,
 /// shade, texture, and Z groups from SGI *RDP Command Summary* Table 11.
 fn raw_rdp_command_width(opcode: u8) -> Option<u32> {
+    if let Some(layout) = raw_rdp_triangle_layout(opcode) {
+        // Edge group (32) + optional shade (64) + texture (64) + Z (16),
+        // selected by the layout's low three bits.
+        let shade = if layout & 4 != 0 { 64 } else { 0 };
+        let texture = if layout & 2 != 0 { 64 } else { 0 };
+        let z = if layout & 1 != 0 { 16 } else { 0 };
+        return Some(32 + shade + texture + z);
+    }
     Some(match opcode {
         G_NOOP => 8,
-        0x08 => 32,
-        0x09 => 48,
-        0x0a => 96,
-        0x0b => 112,
-        0x0c => 96,
-        0x0d => 112,
-        0x0e => 160,
-        0x0f => 176,
         G_TEXRECT | G_TEXRECTFLIP => 16,
         G_RDPLOADSYNC..=0xFF => 8,
         _ => return None,
@@ -4415,7 +4428,13 @@ fn decode_stream_impl(
                 );
                 assert_eq!(w1, 0, "G_SPNOOP reserved second word must be zero");
             }
-            opcode @ (0x08..=0x0f) if raw_rdp => {
+            // Both spellings of the eight RDP triangle layouts: 0x08-base
+            // (this crate's canonical fixtures) and 0xC8-base (the on-wire
+            // encoding RSP microcode emits; the RDP decodes only the low 6
+            // bits of the command byte). The low three bits -- shade (4),
+            // texture (2), Z (1) -- are identical in both encodings.
+            opcode @ (0x08..=0x0f | 0xc8..=0xcf) if raw_rdp => {
+                let opcode = opcode & 0x3f;
                 let command_pc = pc - 8;
                 let coefficients = decode_rdp_edge_coefficients(rdram, command_pc)
                     .expect("validated raw RDP edge triangle became truncated during decode");
@@ -10451,6 +10470,81 @@ mod tests {
                 .collect::<Vec<_>>(),
             [32, 48, 96, 112, 96, 112, 160, 176]
         );
+    }
+
+    #[test]
+    fn raw_rdp_wire_encoding_matches_canonical_triangle_layouts() {
+        // The RDP decodes only the low 6 bits of the command byte; RSP
+        // microcode emits triangles with the top two bits set (0xC8-base).
+        // Width and name must agree between the two spellings, and no other
+        // alias base is admitted.
+        for layout in 0x08u8..=0x0f {
+            let wire = layout | 0xc0;
+            assert_eq!(raw_rdp_command_width(layout), raw_rdp_command_width(wire));
+            assert_eq!(raw_rdp_opcode_name(layout), raw_rdp_opcode_name(wire));
+            assert_eq!(raw_rdp_triangle_layout(wire), Some(layout));
+            assert_eq!(raw_rdp_triangle_layout(layout | 0x40), None);
+            assert_eq!(raw_rdp_triangle_layout(layout | 0x80), None);
+        }
+    }
+
+    #[test]
+    fn raw_rdp_wire_encoded_shade_triangle_decodes_identically_to_canonical() {
+        let stream = |opcode: u32| {
+            let mut rdram = vec![0u8; 104];
+            let yh = 4;
+            let ym = 4 * 4;
+            let yl = 7 * 4;
+            wr_cmd(&mut rdram, 0, (opcode << 24) | yl, (ym << 16) | yh);
+            wr_cmd(
+                &mut rdram,
+                8,
+                1 << 16,
+                (5.0f32 / 3.0 * 65536.0).round() as u32,
+            );
+            wr_cmd(
+                &mut rdram,
+                16,
+                1 << 16,
+                (5.0f32 / 6.0 * 65536.0).round() as u32,
+            );
+            wr_cmd(&mut rdram, 24, 1 << 16, 0);
+            wr_cmd(&mut rdram, 32, (10 << 16) | 20, (30 << 16) | 255);
+            wr_cmd(&mut rdram, 40, u32::from(u16::MAX) << 16, 0);
+            for off in (48..96).step_by(8) {
+                wr_cmd(&mut rdram, off, 0, 0);
+            }
+            wr_cmd(&mut rdram, 96, (G_ENDDL as u32) << 24, 0);
+            rdram
+        };
+        let canonical = stream(0x0c);
+        let wire = stream(0xcc);
+        validate_raw_rdp_command_range(&canonical, 0, 96).unwrap();
+        validate_raw_rdp_command_range(&wire, 0, 96).unwrap();
+        let canonical_ops = decode_raw_rdp_ops(&canonical, 0).unwrap();
+        let wire_ops = decode_raw_rdp_ops(&wire, 0).unwrap();
+        assert_eq!(canonical_ops.len(), 1);
+        assert_eq!(wire_ops.len(), 1);
+        let (RenderOp::RawTriangle(canonical), RenderOp::RawTriangle(wire)) =
+            (&canonical_ops[0], &wire_ops[0])
+        else {
+            panic!("both encodings must decode to a raw triangle")
+        };
+        assert!(canonical.shade.is_some());
+        assert_eq!(canonical.edge, wire.edge);
+        assert_eq!(canonical.shade, wire.shade);
+        assert_eq!(canonical.texture_coefficients, wire.texture_coefficients);
+        assert_eq!(canonical.z, wire.z);
+    }
+
+    #[test]
+    fn raw_rdp_range_accepts_wire_encoded_shade_texture_triangle() {
+        // Opcode 0xCE (shade+texture) is the first triangle the WM2000 boot
+        // submits over XBUS; the validator must admit the wire spelling with
+        // its full 160-byte width.
+        let mut rdram = vec![0u8; 160];
+        wr_cmd(&mut rdram, 0, 0xce00_0000 | 28, (16 << 16) | 4);
+        validate_raw_rdp_command_range(&rdram, 0, 160).unwrap();
     }
 
     #[test]
