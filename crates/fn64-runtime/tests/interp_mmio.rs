@@ -13,9 +13,10 @@
 //!     `DeviceFabric` a shim/AOT PI path would drive;
 //!  2. an interpreted `sw` to PI_STATUS updates modeled device state (the PI
 //!     interrupt-acknowledge/abort semantics `DeviceFabric::write_mmio` owns);
-//!  3. hole-stays-a-fault survives WITH an MMIO window present: an out-of-RDRAM,
-//!     out-of-MMIO address is still a typed `MemoryFault`, and an in-window but
-//!     unmodeled/misaligned register is a typed fault too — never a silent 0.
+//!  3. the generated-code sparse direct backing remains distinct from MMIO:
+//!     a canonical non-RDRAM KSEG load reaches supplied storage, while a true
+//!     out-of-backing address and an unmodeled/misaligned register remain typed
+//!     faults — never a silent 0.
 //!
 //! The device interaction happens inside one synchronous interpreter turn, on
 //! the calling stack: no wall-clock, no second thread. `DeviceFabric` advances
@@ -26,7 +27,7 @@ use fn64_recomp_rs::execution::{
     BankId, BlockExit, CodeBank, CpuFault, CpuFaultKind, ExecutionKey, GuestPc, InstructionBudget,
 };
 use fn64_recomp_rs::interp::{run_bank_with_mmio, MmioOutcome, MmioPort};
-use fn64_recomp_rs::runtime::{Rdram, RecompContext};
+use fn64_recomp_rs::runtime::{Rdram, RecompContext, RDRAM_LEN};
 use fn64_recomp_rs::CodeCatalog;
 
 use fn64_runtime::device::{Cycles, DeviceFabric, PiDmaRequest, PiTimingModel};
@@ -238,7 +239,41 @@ fn interpreted_sw_to_pi_status_updates_modeled_device_state() {
     );
 }
 
-/// (3a) hole-stays-a-fault WITH an MMIO window present: an out-of-RDRAM,
+/// (3a) Canonical non-RDRAM KSEG windows use the same sparse backing layout as
+/// generated C after the device port declines them. The first byte after the
+/// physical 8 MiB prefix is sufficient to prove the general classifier without
+/// allocating the much later DDROM offset used by `osDriveRomInit`.
+#[test]
+fn interpreted_non_mmio_direct_window_reads_supplied_sparse_backing() {
+    // lui $t0,0x8080 ; lw $v0,0($t0) ; jr $ra ; nop. LUI sign-extends the
+    // effective address to FFFFFFFF80800000, whose sparse backing offset is
+    // exactly 0x00800000.
+    let catalog = catalog_of(&[0x3C08_8080, 0x8D02_0000, 0x03E0_0008, 0x0000_0000]);
+    let mut fabric = fabric();
+    let mut storage = vec![0u8; RDRAM_LEN + 4];
+    storage[RDRAM_LEN..RDRAM_LEN + 4].copy_from_slice(&0x1234_5678u32.to_ne_bytes());
+    let mut mem = Rdram::new(&mut storage);
+    let mut ctx = RecompContext::new();
+    let mut port = FabricPort {
+        fabric: &mut fabric,
+    };
+
+    let run = run_bank_with_mmio(
+        &catalog,
+        BANK,
+        ExecutionKey::new(BANK, GuestPc::new(VA)),
+        InstructionBudget::new(8).unwrap(),
+        &mut ctx,
+        &mut mem,
+        &mut port,
+    )
+    .unwrap();
+
+    assert!(!matches!(run.exit, BlockExit::Fault(_)));
+    assert_eq!(ctx.r(2), 0x1234_5678);
+}
+
+/// (3b) hole-stays-a-fault WITH an MMIO window present: an out-of-RDRAM,
 /// out-of-MMIO address is still a typed `MemoryFault`. The MMIO seam must not
 /// make an arbitrary out-of-RDRAM address succeed.
 #[test]
