@@ -260,6 +260,12 @@ impl RetraceSchedule {
         }
         fired
     }
+
+    /// When the next retrace tick is due -- the host's virtual-clock driver
+    /// hops exactly to due events rather than overshooting them.
+    pub fn next_due(&self) -> u64 {
+        self.next_due
+    }
 }
 
 #[cfg(test)]

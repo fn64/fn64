@@ -94,6 +94,15 @@ impl TimerWheel {
         self.timers.retain(|(tid, _)| *tid != id);
     }
 
+    /// The earliest pending deadline, if any timer is armed -- the host's
+    /// virtual-clock driver uses this to advance time TO the next due event
+    /// instead of overshooting it by a coarse fixed quantum (which charged
+    /// every sub-quantum wait, e.g. a one-cycle PI completion, a full
+    /// quantum of virtual time).
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.timers.iter().map(|(_, t)| t.deadline).min()
+    }
+
     /// Advance the virtual clock to `now`, firing (and, for repeating
     /// timers, re-arming) everything whose deadline has passed. Returns
     /// fired timers in deadline order, matching libultra's own
