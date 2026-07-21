@@ -913,6 +913,27 @@ unsafe fn dispatch_raw_rdp_xbus(rdram: *mut u8, stream: &[u8]) {
             )
             .map(|_| ())
     });
+    if std::env::var_os("FN64_XBUS_DIFF_TRACE").is_some() {
+        // Diagnostic: log every rdram span the renderer changed in the staged
+        // image (i.e. everything the copy-back below will inject into live
+        // guest memory).
+        let mut offset = 0usize;
+        while offset < rdram_len {
+            if image[offset] != real[offset] {
+                let start = offset;
+                while offset < rdram_len && image[offset] != real[offset] {
+                    offset += 1;
+                }
+                eprintln!(
+                    "[fn64-abi] XBUS diff: renderer changed rdram [{start:#010x}, {offset:#010x}) \
+                     ({} bytes)",
+                    offset - start
+                );
+            } else {
+                offset += 1;
+            }
+        }
+    }
     real.copy_from_slice(&image[..rdram_len]);
 }
 
