@@ -89,9 +89,11 @@
 
 use fn64_discover::banks::{self, materialize_rom_range, LoadImageTableInput, StaticRequestDmaInput};
 use fn64_discover::grade_oot_functions::{grade_functions, AnswerFunction, JalTargets};
-use fn64_discover::partition::{partition, same_bank_overlaps};
+use fn64_discover::partition::{
+    partition, partition_with_authoritative_entries, same_bank_overlaps,
+};
 use fn64_discover::resolve::build_cfg_closed_with_facts_and_claims;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Shortest run of consecutive boundary-plausible in-window code pointers
 /// that counts as a handler-dispatch table (see
@@ -669,10 +671,42 @@ fn main() {
         candidates.dedup();
         for target in candidates {
             let offset = ((target - boot_va_start) / 4) as usize;
-            if offset >= boot_words.len() {
+            let Some(&first) = boot_words.get(offset) else {
+                continue;
+            };
+            if !fn64_discover::sig_scan::plausible_function_boundary(boot_words, offset) {
                 continue;
             }
-            if !fn64_discover::sig_scan::plausible_function_boundary(boot_words, offset) {
+            // A `lui/addiu`-constructed in-window address is a FUNCTION
+            // pointer only if it points at a real function opener. The AKI
+            // engines construct DATA-array bases the same way (`lui;addiu`
+            // then `subu`/`sw`/`addu` index arithmetic), and those land in
+            // an embedded read-only region — a hex-digit ASCII table
+            // ("0123456789ABCDEF"), a zero-filled scratch run, then a small
+            // pointer table. Every word in that region aliases as a
+            // boundary-plausible address (a zero run trips the double-nop
+            // padding rule), so per-opcode guards just chase the split root
+            // a few words forward. Reject on the data tells a real IDO/KMC
+            // prologue never has: first word is `nop`/zero (no function
+            // opens with a bare nop — this subsumes the whole zero run),
+            // all-printable-ASCII (string/number table), a coprocessor op
+            // (0x10-0x13, e.g. mfc0), `addi` (0x08, trapping; compilers
+            // emit `addiu`), or a reserved encoding the decoder rejects.
+            // wrong==0 judges.
+            let opcode = first >> 26;
+            let is_ascii = first
+                .to_be_bytes()
+                .iter()
+                .all(|&b| (0x20..=0x7e).contains(&b));
+            if first == 0
+                || is_ascii
+                || (0x10..=0x13).contains(&opcode)
+                || opcode == 0x08
+                || matches!(
+                    fn64_recomp_rs::decode(first),
+                    fn64_recomp_rs::Instruction::Unknown { .. }
+                )
+            {
                 continue;
             }
             if !roots.contains(&target) {
@@ -943,7 +977,22 @@ fn main() {
         &roots,
         &claimed_edges,
     );
-    let part = partition(&cfg);
+    // Machine-checked callable entries (direct jal targets + the excused set:
+    // entrypoint, cross-bank jals, proven handler-table entries) are HARD
+    // function boundaries — a proven-callable VA cannot be the interior of
+    // another function. Passing them as authoritative entries fences each
+    // enclosing closure at the boundary, so an adjacent proven leaf whose
+    // block the previous function's fallthrough also reaches becomes its own
+    // owner instead of a 2-claimant `ambiguous` block that grades `open`.
+    // Only these excused entries re-carve geometry; unexcused seeds
+    // (script/donor matches) stay soft and still surface as `wrong` if they
+    // split a real function — the wrong==0 firewall is unchanged.
+    let authoritative_entries: BTreeSet<u32> = cfg
+        .direct_calls
+        .iter()
+        .map(|(_, target)| *target)
+        .collect();
+    let part = partition_with_authoritative_entries(&cfg, &authoritative_entries);
     let overlaps = same_bank_overlaps(&part, &cfg);
     println!(
         "CFG: {} blocks, {} direct calls, {} indirect sites, {} bounded targets resolved",
