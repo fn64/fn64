@@ -429,8 +429,9 @@ pub struct Framebuffer {
     /// software-only sample cannot be committed to an RDP depth image.
     pub(crate) encoded_depth: Vec<Option<EncodedDepth>>,
     primitive_depth: Option<PrimitiveDepth>,
-    /// xorshift32 state for `AlphaDither::Noise` (see
-    /// [`Self::apply_alpha_dither`]). Deterministically seeded so a replayed
+    /// xorshift32 state shared by `AlphaDither::Noise` and
+    /// `RgbDither::Noise` (see [`Self::apply_alpha_dither`] and
+    /// [`Self::apply_rgb_dither`]). Deterministically seeded so a replayed
     /// task stream produces identical framebuffer bytes run over run.
     alpha_dither_noise_state: u32,
 }
@@ -626,18 +627,53 @@ impl Framebuffer {
         match other_mode.alpha_dither() {
             AlphaDither::Disabled => rgba,
             AlphaDither::Noise => {
-                let mut state = self.alpha_dither_noise_state;
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                self.alpha_dither_noise_state = state;
-                rgba[3] = rgba[3].saturating_add((state & 7) as u8);
+                let noise = self.dither_noise_3bit();
+                rgba[3] = rgba[3].saturating_add(noise);
                 rgba
             }
             AlphaDither::Pattern | AlphaDither::InversePattern => {
                 unreachable!("unsupported alpha dither is rejected before rasterization")
             }
         }
+    }
+
+    /// Apply the selected RGB-dither stage to a blended fragment, between
+    /// the blender and the pixel write (Programming Manual pipeline order:
+    /// dithering perturbs the three RGB LSBs before memory-interface
+    /// truncation). Only `G_CD_NOISE` is implemented, under exactly the
+    /// `apply_alpha_dither` precedent: the manual specifies pseudo-random
+    /// noise of 3-bit magnitude but does not publish the hardware
+    /// generator, so this draws one documented deterministic xorshift32
+    /// value per pixel (hardware likewise applies a single per-pixel dither
+    /// value to all three channels) -- REAL noise with the specified
+    /// magnitude, NOT claimed to be sequence-exact against silicon. The
+    /// ordered `MagicSquare`/`Bayer` matrices remain unimplemented and trap
+    /// in `require_supported_dither`.
+    fn apply_rgb_dither(&mut self, other_mode: OtherMode, mut rgba: [u8; 4]) -> [u8; 4] {
+        match other_mode.rgb_dither() {
+            RgbDither::Disabled => rgba,
+            RgbDither::Noise => {
+                let noise = self.dither_noise_3bit();
+                for channel in &mut rgba[..3] {
+                    *channel = channel.saturating_add(noise);
+                }
+                rgba
+            }
+            RgbDither::MagicSquare | RgbDither::Bayer => {
+                unreachable!("unsupported RGB dither is rejected before rasterization")
+            }
+        }
+    }
+
+    /// One 3-bit draw from the deterministic xorshift32 noise source shared
+    /// by the alpha and RGB noise dither stages.
+    fn dither_noise_3bit(&mut self) -> u8 {
+        let mut state = self.alpha_dither_noise_state;
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        self.alpha_dither_noise_state = state;
+        (state & 7) as u8
     }
 
     pub fn clear(&mut self, r: u8, g: u8, b: u8, a: u8) {
@@ -1041,6 +1077,7 @@ impl Framebuffer {
             result.blend_enabled,
             result.memory,
         );
+        let out = self.apply_rgb_dither(other_mode, out);
         self.pixels[idx..idx + 4].copy_from_slice(&out);
         true
     }
@@ -1122,6 +1159,7 @@ impl Framebuffer {
                 coverage.blend_enabled,
                 coverage.memory,
             );
+            let out = self.apply_rgb_dither(other_mode, out);
             // The fragment pipeline is combiner -> alpha compare -> depth
             // test -> blend -> write. Keep both writes after compositing so
             // a rejected fragment cannot mutate either target.
@@ -1787,7 +1825,13 @@ fn require_supported_alpha_compare(other_mode: OtherMode, primitive: &str) {
 /// would silently change both RGBA16 memory bytes and RGBA32 RGB values.
 fn require_supported_dither(other_mode: OtherMode, primitive: &str) {
     match other_mode.rgb_dither() {
-        RgbDither::Disabled => {}
+        // `Noise` is implemented (Framebuffer::apply_rgb_dither) under the
+        // same precedent as alpha noise below: the manual documents the
+        // effect (pseudo-random 3-bit perturbation of the blended RGB
+        // before truncation) without publishing the generator. The ordered
+        // matrices still trap: substituting a guessed table would silently
+        // change deterministic memory bytes.
+        RgbDither::Disabled | RgbDither::Noise => {}
         selector => panic!(
             "{primitive} selected RGB dither {selector:?}, whose hardware matrix/noise sequence is not implemented"
         ),
@@ -3426,6 +3470,56 @@ mod tests {
     }
 
     #[test]
+    fn rgb_noise_dither_is_deterministic_and_bounded_to_three_bits() {
+        let solid = |high: u32| {
+            let tri = Triangle {
+                v: [
+                    v(0.0, 0.0, 100, 120, 140, 255),
+                    v(8.0, 0.0, 100, 120, 140, 255),
+                    v(0.0, 8.0, 100, 120, 140, 255),
+                ],
+                other_mode: OtherMode::from_raw(high, 0, 0),
+                ..Default::default()
+            };
+            let mut fb = Framebuffer::new(8, 8);
+            fb.draw_triangle(&tri);
+            fb
+        };
+        // RGB noise selected (selector 2 at bits 6-7), alpha dither disabled.
+        let noisy = solid((2 << 6) | (3 << 4));
+        let replay = solid((2 << 6) | (3 << 4));
+        let clean = solid((3 << 6) | (3 << 4));
+        assert_eq!(
+            noisy.pixels, replay.pixels,
+            "seeded xorshift noise must replay to identical framebuffer bytes"
+        );
+        let mut perturbed = 0u32;
+        for (noisy_px, clean_px) in noisy
+            .pixels
+            .chunks_exact(4)
+            .zip(clean.pixels.chunks_exact(4))
+        {
+            if clean_px == [0, 0, 0, 0] {
+                // Pixel outside the triangle: noise must not invent coverage.
+                assert_eq!(noisy_px, [0, 0, 0, 0]);
+                continue;
+            }
+            // One per-pixel 3-bit value applied to all three channels;
+            // alpha untouched by RGB dither.
+            let delta = noisy_px[0].wrapping_sub(clean_px[0]);
+            assert!(delta < 8, "noise magnitude must stay within 3 bits");
+            assert_eq!(noisy_px[1].wrapping_sub(clean_px[1]), delta);
+            assert_eq!(noisy_px[2].wrapping_sub(clean_px[2]), delta);
+            assert_eq!(noisy_px[3], clean_px[3]);
+            perturbed += u32::from(delta != 0);
+        }
+        assert!(
+            perturbed > 0,
+            "an all-zero draw would mean the noise stage silently disabled itself"
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "alpha dither Pattern")]
     fn active_alpha_dither_traps_instead_of_using_full_precision_alpha() {
         let tri = Triangle {
@@ -3990,7 +4084,11 @@ mod tests {
         let mut framebuffer = Framebuffer::new(1, 1);
         framebuffer.clear(0, 0, 255, 255);
         framebuffer.coverage[0] = Coverage::new(3);
-        let mode = OtherMode::from_raw(0, 0x4180, 0);
+        // 0xf0 high bits: RGB and alpha dither both disabled -- this test
+        // exercises coverage semantics, not the dither stage, and it calls
+        // the internal write path directly (below the primitive-level
+        // require_supported_dither gate).
+        let mode = OtherMode::from_raw(0xf0, 0x4180, 0);
 
         assert!(!framebuffer.set_blended(
             0,
@@ -4046,7 +4144,9 @@ mod tests {
                     update: false,
                     mode: crate::gbi::DepthMode::Opaque,
                 },
-                OtherMode::from_raw(0, 0x0110, 0),
+                // Dither disabled (0xf0): direct internal-path call below
+                // the primitive-level dither gate.
+                OtherMode::from_raw(0xf0, 0x0110, 0),
             )
         };
 
