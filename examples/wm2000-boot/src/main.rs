@@ -44,6 +44,14 @@ use std::io::Write;
 /// dispatch) without linking the disallowed dependency. It is clearly
 /// NOT the real ucode -- it does nothing to rdram, just proves the call
 /// happened.
+/// SUPERSEDED (2026-07-21) by the clean-room RSP LLE replay: `fn64_abi::
+/// set_audio_task_lle(true)` (below) routes every `M_AUDTASK` through the
+/// same `fn64_audio::rsp` interpreter path non-catalog gfx tasks already
+/// take, executing the REAL in-ROM audio ucode instruction by instruction
+/// against guest RDRAM -- no GPL header involved, no stand-in needed. Kept
+/// (unregistered) so the licensing finding above stays attached to working
+/// code demonstrating the registered-function seam's shape.
+#[allow(dead_code)]
 unsafe extern "C" fn stand_in_audio_ucode(_rdram: *mut u8, ucode_addr: u32) -> u32 {
     eprintln!(
         "[wm2000-boot] STAND-IN audio ucode invoked for ucode_addr={ucode_addr:#010x} -- NOT the \
@@ -112,8 +120,12 @@ fn main() {
         }
     }
 
-    // Real plumbing, stand-in body (see stand_in_audio_ucode's doc comment).
-    unsafe { fn64_abi::set_audio_ucode_fn(stand_in_audio_ucode) };
+    // Real audio: replay every M_AUDTASK's genuine in-ROM ucode through the
+    // clean-room RSP LLE interpreter (the same fallback path gfx tasks take)
+    // so the CPU-side AKI sound driver observes the real mixer/sequence
+    // state the RSP writes -- see stand_in_audio_ucode's doc comment for
+    // the licensing history this supersedes.
+    fn64_abi::set_audio_task_lle(true);
 
     // REAL renderer seam: the in-repo software ReferenceBackend (the same
     // pure-Rust CI oracle fn64-shell uses), in F3DEX2 decode mode. NWXE's
