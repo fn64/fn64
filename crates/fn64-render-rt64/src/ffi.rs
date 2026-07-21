@@ -1759,9 +1759,10 @@ struct RawVi {
     repeat_line: u8,
     fade_factor: u16,
     reserved: u16,
+    noise_seed: u64,
 }
 
-const _: [(); 64] = [(); std::mem::size_of::<RawVi>()];
+const _: [(); 72] = [(); std::mem::size_of::<RawVi>()];
 
 fn raw_vi(vi: ViPresentation) -> Result<RawVi, String> {
     let filters = vi.scanout.filters();
@@ -1791,6 +1792,7 @@ fn raw_vi(vi: ViPresentation) -> Result<RawVi, String> {
         repeat_line: u8::from(vi.repeat_line),
         fade_factor: vi.fade.unwrap_or(0),
         reserved: 0,
+        noise_seed: vi.noise_seed,
     })
 }
 
@@ -3771,6 +3773,17 @@ mod tests {
     }
 
     #[test]
+    fn vi_wire_preserves_the_complete_noise_seed() {
+        for noise_seed in [0, 0x0123_4567_89ab_cdef, u64::MAX] {
+            let vi = ViPresentation {
+                noise_seed,
+                ..Default::default()
+            };
+            assert_eq!(raw_vi(vi).unwrap().noise_seed, noise_seed);
+        }
+    }
+
+    #[test]
     fn cpp_vi_ingress_rejects_an_odd_half_line_extent() {
         let task = RawTask::default();
         let mut vi = RawVi {
@@ -3781,6 +3794,7 @@ mod tests {
             repeat_line: 0,
             fade_factor: 0,
             reserved: 0,
+            noise_seed: 0,
         };
         vi.registers[0] = 3;
         vi.registers[2] = 320;
@@ -3904,9 +3918,9 @@ mod tests {
         assert!(cmake.contains("9b3cf39bb15fc0c7d52085566197042f4960cc410b241e38457bb817f2501e5b"));
         assert!(cmake.contains("fn64_rt64_nominal_full_rate(this)"));
         let expected_overlay = if cfg!(feature = "hfr-evidence") {
-            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+hfr-post-present-call:v1"
+            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-retrace-cadence:v1+hfr-post-present-call:v1"
         } else {
-            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1"
+            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-retrace-cadence:v1"
         };
         assert_eq!(env!("FN64_RT64_SOURCE_OVERLAY_ID"), expected_overlay);
     }

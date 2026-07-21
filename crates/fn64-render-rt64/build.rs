@@ -9,8 +9,8 @@ mod adapter_source_identity;
 mod native_program_identity;
 
 const RT64_SOURCE_OVERLAY_ID: &str =
-    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1";
-const RT64_HFR_SOURCE_OVERLAY_ID: &str = "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+hfr-post-present-call:v1";
+    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-retrace-cadence:v1";
+const RT64_HFR_SOURCE_OVERLAY_ID: &str = "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-retrace-cadence:v1+hfr-post-present-call:v1";
 
 fn run(command: &mut Command, description: &str) {
     let status = command
@@ -223,7 +223,13 @@ fn main() {
     // so enabling the feature never writes build products into the checkout.
     let cmake_source = out_dir.join("rt64-cmake-source");
     std::fs::create_dir_all(&cmake_source).expect("create RT64 CMake source wrapper");
-    for file in ["CMakeLists.txt", "fn64_rt64_shim.cpp", "fn64_rt64_shim.h"] {
+    for file in [
+        "CMakeLists.txt",
+        "fn64_rt64_shim.cpp",
+        "fn64_rt64_shim.h",
+        "fn64_rt64_video_interface.h",
+        "fn64_rt64_video_interface_ps.hlsl",
+    ] {
         let source = manifest_dir.join("ffi").join(file);
         let destination = cmake_source.join(file);
         std::fs::copy(&source, &destination).unwrap_or_else(|e| {

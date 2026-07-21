@@ -350,17 +350,19 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
   representative private exact-ten PAL/MPAL series has yet been retained;
   physical compositor cadence, field timing, and analog PAL output remain
   outside this closure.
-- **Native VI pixel observation — closed; native filter residuals remain.** A
-  fourteen-phase live Metal gate keeps one completed workload, strictly
-  advances presents, captures exact nondefault 8x6 BGRA8 output, and restores
-  six disabled phases byte-for-byte. Gamma and nonidentity X/Y scale change
-  exact pixels. Gamma dither, divot, RGBA16 dither restoration, and all four AA
-  selectors remain pixel-inert at pinned MIT RT64 `f0728a2`; its
-  `VideoInterfacePS` implements sampling, border, and gamma only. fn64's
-  deterministic reference lane separately models the cited public mechanisms.
-  The native equalities therefore name port work and prevent an accidental
-  parity claim; they do not adjudicate reference arithmetic, silicon behavior,
-  DAC output, or analog video.
+- **Native VI pixel observation and bounded gamma dither — closed; other
+  native filter residuals remain.** A twenty-phase live Metal gate keeps one
+  completed workload, strictly advances presents, captures exact nondefault
+  8x6 BGRA8 output, and restores baseline/gamma phases byte-for-byte. Gamma,
+  seeded gamma dither, and nonidentity X/Y scale change exact pixels. Repeating
+  an identical dither seed reproduces exact pixels across a distinct present;
+  changing only the seed changes them. The exact-source overlay mirrors fn64's
+  named bounded-v1 stream in pinned RT64's final VI shader. Divot, RGBA16
+  dither restoration, and all four AA selectors remain pixel-inert because
+  their public mechanisms require source-neighborhood or coverage state not
+  yet carried to that shader. Native equalities name port work and prevent an
+  accidental parity claim; native gamma-dither evidence still does not prove
+  the silicon random stream, DAC output, or analog video.
 
 ---
 

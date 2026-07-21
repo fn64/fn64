@@ -42,7 +42,7 @@ const IDLE_WORK_POLICY_SHA256: &str =
 const DEVELOPER_MODE_POLICY_SHA256: &str =
     "ac4a48da879d3acd5087e09a4e2066c275e78c04f13bf11f370f64c0ef7ff9d2";
 const SOURCE_OVERLAY_ID: &str =
-    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1";
+    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-retrace-cadence:v1";
 
 #[derive(Clone, Debug)]
 struct Observation {
