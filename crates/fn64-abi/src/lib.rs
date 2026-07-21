@@ -272,6 +272,23 @@ pub extern "C" fn fn64_c_mmio_bad_width(vaddr: u64, width: u32, is_write: u32) {
     );
 }
 
+/// Generated-C unaligned-access trap (see `fn64_mmio_proxy.h`): MIPS lw/sw
+/// and lh/sh require natural alignment -- real hardware raises AdEL/AdES.
+/// recomp.h's raw host-pointer cast would instead read/write a byte-lane
+/// chimera of two adjacent native words, silently corrupting guest state
+/// (the WM2000 demo-scene wild-pointer crash rode exactly such a value).
+/// Loud trap per AGENTS.md, naming the access.
+#[no_mangle]
+pub extern "C" fn fn64_c_mem_unaligned(vaddr: u64, width: u32, is_write: u32) {
+    let operation = if is_write == 0 { "load" } else { "store" };
+    panic!(
+        "generated-C {width}-byte {operation} at unaligned guest address {vaddr:#018X}; real \
+         hardware raises an address-error exception here (MIPS lw/sw/lh/sh alignment rule) -- \
+         the recompiled access would otherwise read/write a byte-lane chimera of two adjacent \
+         words and silently corrupt guest state"
+    );
+}
+
 #[no_mangle]
 pub extern "C" fn fn64_c_rdram_write(vaddr: u64, width: u32) {
     let offset = RdramAddr::from_gpr(vaddr).offset();
