@@ -396,6 +396,116 @@ fn commit_rsp_rdram_writes(written: &[(usize, usize)]) {
     }
 }
 
+/// Write the forensic capture for a runaway LLE task (see
+/// `FN64_RSP_LLE_DEBUG_DIR` in `dispatch_lle_task`): the admitted DMEM/IMEM
+/// images, the current DMEM/IMEM images, the scalar machine state, a ring of
+/// the most recent PCs, the parsed OSTask header, and a logical-byte-order
+/// window of the task's rdram data area.
+#[allow(clippy::too_many_arguments)]
+fn dump_lle_debug_state(
+    dir: &std::path::Path,
+    initial_dmem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    initial_imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    initial_pc: u32,
+    imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    machine: &fn64_audio::rsp::runtime::RspMachine<'_>,
+    abort_pc: u32,
+    total_steps: u64,
+    overlays: u64,
+    pc_ring: &std::collections::VecDeque<u32>,
+) {
+    use std::fmt::Write as _;
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        eprintln!("[fn64-abi] LLE debug dump: cannot create {dir:?}: {error}");
+        return;
+    }
+    let write = |name: &str, bytes: &[u8]| {
+        if let Err(error) = std::fs::write(dir.join(name), bytes) {
+            eprintln!("[fn64-abi] LLE debug dump: cannot write {name}: {error}");
+        }
+    };
+    write("initial_dmem.bin", initial_dmem);
+    write("initial_imem.bin", initial_imem);
+    write("final_dmem.bin", &machine.dmem_logical());
+    write("final_imem.bin", imem);
+
+    let mut state = String::new();
+    let _ = writeln!(state, "abort_pc {abort_pc:#06x}");
+    let _ = writeln!(state, "initial_pc {initial_pc:#06x}");
+    let _ = writeln!(state, "total_steps {total_steps}");
+    let _ = writeln!(state, "overlays {overlays}");
+    let _ = writeln!(state, "sp_status {:#010x}", machine.sp_status());
+    let _ = writeln!(state, "sp_semaphore {}", machine.sp_semaphore_latch());
+    let _ = writeln!(state, "dma_mem_address {:#010x}", machine.ctx.dma_mem_address);
+    let _ = writeln!(
+        state,
+        "dma_dram_address {:#010x}",
+        machine.ctx.dma_dram_address
+    );
+    for reg in 0..32u8 {
+        let _ = writeln!(state, "r{reg} {:#010x}", machine.reg(reg));
+    }
+    write("state.txt", state.as_bytes());
+
+    let mut ring = String::new();
+    for pc in pc_ring {
+        let _ = writeln!(ring, "{pc:#06x}");
+    }
+    write("pc_ring.txt", ring.as_bytes());
+
+    // OSTask header (rspboot leaves it at DMEM 0xFC0; public libultra layout).
+    let field = |image: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE], offset: usize| {
+        u32::from_be_bytes(
+            image[0xfc0 + offset..0xfc0 + offset + 4]
+                .try_into()
+                .expect("four OSTask bytes"),
+        )
+    };
+    let mut header = String::new();
+    for (name, offset) in [
+        ("type", 0x00),
+        ("flags", 0x04),
+        ("ucode_boot", 0x08),
+        ("ucode_boot_size", 0x0c),
+        ("ucode", 0x10),
+        ("ucode_size", 0x14),
+        ("ucode_data", 0x18),
+        ("ucode_data_size", 0x1c),
+        ("dram_stack", 0x20),
+        ("dram_stack_size", 0x24),
+        ("output_buff", 0x28),
+        ("output_buff_size", 0x2c),
+        ("data_ptr", 0x30),
+        ("data_size", 0x34),
+        ("yield_data_ptr", 0x38),
+        ("yield_data_size", 0x3c),
+    ] {
+        let _ = writeln!(header, "{name} {:#010x}", field(initial_dmem, offset));
+    }
+    write("task_header.txt", header.as_bytes());
+
+    // The task's rdram data area, exported in logical (big-endian guest) byte
+    // order: fn64's rdram backing stores each 32-bit word natively, so the
+    // logical byte at `offset` lives at `offset ^ 3`.
+    let data_ptr = (field(initial_dmem, 0x30) as usize) & 0x00ff_ffff;
+    let data_size = (field(initial_dmem, 0x34) as usize).clamp(0x40, 0x20000);
+    let end = (data_ptr + data_size).min(machine.rdram.len());
+    if data_ptr < end {
+        let logical: Vec<u8> = (data_ptr..end)
+            .map(|offset| machine.rdram.get(offset ^ 3).copied().unwrap_or(0))
+            .collect();
+        write("task_data_logical.bin", &logical);
+    }
+
+    // Raw (native backing layout) rdram image, clamped to the 8 MiB guest
+    // window, so the failing task can be replayed offline against the same
+    // memory the machine saw. Post-abort rdram has absorbed the task's own
+    // DMA writes; replays reading those regions may diverge slightly, but
+    // command-list-driven control flow replays exactly.
+    let raw_len = machine.rdram.len().min(0x0080_0000);
+    write("rdram_raw.bin", &machine.rdram[..raw_len]);
+}
+
 fn commit_rsp_memory_state(
     dmem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
     imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
@@ -457,20 +567,69 @@ unsafe fn dispatch_lle_task(rdram: *mut u8) -> LleTaskResult {
     );
     let mut total_steps = 0u64;
     let mut overlays = 0u64;
+    // Env-gated forensic capture (`FN64_RSP_LLE_DEBUG_DIR=<dir>`): snapshot
+    // the admitted task state up front, single-step the final stretch before
+    // the admission bound to build a PC ring, and dump everything to files
+    // when the bound is exceeded so a runaway loop can be analyzed offline.
+    let debug_dir = std::env::var_os("FN64_RSP_LLE_DEBUG_DIR").map(std::path::PathBuf::from);
+    const DEBUG_TAIL_STEPS: u64 = 1 << 16;
+    const DEBUG_PC_RING: usize = 4096;
+    let debug_initial: Option<(
+        [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        u32,
+    )> = debug_dir.as_ref().map(|_| (dmem, imem, pc));
+    let mut debug_pc_ring: std::collections::VecDeque<u32> =
+        std::collections::VecDeque::with_capacity(DEBUG_PC_RING);
     loop {
         let words: Vec<u32> = imem
             .chunks_exact(4)
             .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("four IMEM bytes")))
             .collect();
-        let result = fn64_audio::rsp::run_imem(&words, pc, &mut machine, CHUNK_STEPS);
+        let chunk = if debug_dir.is_some() {
+            // Land exactly on the tail boundary, then single-step so the PC
+            // ring records every instruction leading up to the bound.
+            let tail_start = MAX_TASK_STEPS - DEBUG_TAIL_STEPS;
+            if total_steps >= tail_start {
+                1
+            } else {
+                CHUNK_STEPS.min(tail_start - total_steps)
+            }
+        } else {
+            CHUNK_STEPS
+        };
+        let result = fn64_audio::rsp::run_imem(&words, pc, &mut machine, chunk);
         total_steps = total_steps
             .checked_add(result.steps)
             .expect("RSP task step counter overflow");
-        assert!(
-            total_steps <= MAX_TASK_STEPS,
-            "RSP task exceeded deterministic {MAX_TASK_STEPS}-instruction admission bound at PC {:#06x}",
-            result.pc
-        );
+        if debug_dir.is_some() && chunk == 1 {
+            if debug_pc_ring.len() == DEBUG_PC_RING {
+                debug_pc_ring.pop_front();
+            }
+            debug_pc_ring.push_back(result.pc);
+        }
+        if total_steps > MAX_TASK_STEPS {
+            if let (Some(dir), Some((initial_dmem, initial_imem, initial_pc))) =
+                (debug_dir.as_ref(), debug_initial.as_ref())
+            {
+                dump_lle_debug_state(
+                    dir,
+                    initial_dmem,
+                    initial_imem,
+                    *initial_pc,
+                    &imem,
+                    &machine,
+                    result.pc,
+                    total_steps,
+                    overlays,
+                    &debug_pc_ring,
+                );
+            }
+            panic!(
+                "RSP task exceeded deterministic {MAX_TASK_STEPS}-instruction admission bound at PC {:#06x}",
+                result.pc
+            );
+        }
         pc = result.pc;
         match result.reason {
             fn64_audio::rsp::RspExitReason::Broke => break,

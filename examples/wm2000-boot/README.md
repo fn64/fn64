@@ -141,20 +141,105 @@ accepted while busy are queued (capacity = the game's own
 `osCreatePiManager(cmdMsgCnt)`; NWXE passes 0x40, funcs_0.c asm
 0x800004F8) and started FIFO as each transfer completes.
 
-## Known frontier (2026-07-21): music-sequencer stub livelock
+## RESOLVED (2026-07-21): music-sequencer stub livelock
 
-With both fixes, boot progresses past the fade + asset loading into the
-AKI sound driver's sequencer tick and spins forever inside ONE
-scheduler step: `funcs_9.c` `func_80023930` (asm 0x80023A4C) loops
+Boot progressed past the fade + asset loading into the AKI sound
+driver's sequencer tick and spun forever inside ONE scheduler step:
+`funcs_9.c` `func_80023930` (asm 0x80023A4C) loops
 `while (nextEventTime - clock < 0) func_80023C20(track);` — and
 `func_80023C20` (the 0x54C-byte music-sequence command interpreter,
-`disasm/asm/1050.s` line 40933, marked `nonmatching`, dispatching
-through the `D_80047F24` jump table) was emitted as an EMPTY stub in
-RecompiledFuncs, so the track's next-event time never advances. This is
-a CORPUS repair (aki-recomp side — same class as the repaired
-`func_80000B30` boot-bootstrap stub), not an fn64 runtime divergence:
-the interpreter and its ~0x80 jump-table handlers need real
-translations before boot can reach the logo scene.
+`disasm/asm/1050.s` line 40933, marked `nonmatching`) was emitted as an
+EMPTY stub in RecompiledFuncs.
+
+Root cause was a CORPUS defect, repaired in aki-recomp (commits
+`add8b28` + `9f06f81` on the corpus side): gen_stubs.py's opcode scan
+had auto-stubbed the interpreter on two guarded IDO div-by-zero
+`break` asserts (the same false-positive class as `func_8011DFE4` /
+`func_800E1FB8`). Its dispatch is a `jalr` through `D_80047F24` — a
+function-POINTER table in .data (rom 0x48B24; 45 entries, command
+bytes 0x80–0xAC, each a handler function in 0x80022xxx/0x80025xxx),
+which N64Recomp translates fine as `LOOKUP_FUNC` — no jump-table
+declaration was needed, just un-stubbing via profile.toml
+`[syms].force_recompile`. Second rung the same day: with the
+interpreter live, the sequence's first tick issued command 0x90 into
+the still-stubbed handler `func_800226A0`; the stub's stale `$v0` made
+the dispatch loop re-read code bytes as sequence data and spin (sim
+frozen at ~16.153B). Its three div-guard siblings (`func_800226A0`,
+`func_800256AC`/`func_800257D4` = cmds 0x84/0x85, and `func_800241E8`,
+jal'd directly by the tick epilogue) were force-recompiled the same
+way.
+
+With all five repaired, boot clears the sequencer rung: gfx task
+submissions resume past the former 16.07B-cycle wall (10 tasks by
+16.12B), audio stays exactly 1/field, and the sequencer emits its
+first real voiced audio command list at sim ~16.175B.
+
+## RESOLVED (2026-07-21, later): first voiced audio task blew the LLE admission bound
+
+That first real audio command list was the next wall — fn64-side, in the
+RSP LLE core's DMEM model. Diagnosed with the new env-gated forensic
+capture (`FN64_RSP_LLE_DEBUG_DIR=<dir>` dumps the admitted DMEM/IMEM,
+machine state, OSTask header, a single-stepped PC ring, and the raw
+rdram window on an admission-bound hit) plus the offline replayer
+(`cargo run -p fn64-audio --release --example rsp_replay`), which
+re-executes the captured task deterministically and reported the first
+bad control transfer:
+
+The wm2000 audio ucode (in-ROM at 0x39510, IMEM 0x080) dispatches its
+8-byte commands through a 16-entry halfword jump table at DMEM 0x0,
+with two unused slots at 0xE/0x10. Command 0x0F stores a DRAM segment
+pointer across those slots with `sw r1, 0xe(r0)` — an UNALIGNED word
+store, legal on the byte-addressed RSP scalar unit. fn64's
+`Dmem::write_w` modeled only aligned stores (native word, no byte-lane
+XOR), so the store scattered the pointer bytes onto the wrong `^3`
+lanes and rewrote table entry 6 (DMEM 0xC) from 0x1208 to 0x5FC0. The
+next command-6 dispatch jumped to IMEM 0x1FC0, ran off the top of IMEM
+into the rspboot remnant at 0x000, re-entered the ucode at 0x1080,
+re-read the OSTask header — which the ucode itself legitimately
+overwrites as mixer scratch (negative-offset SQV to 0xfb0/0xfc0, `sh`
+to 0xff0) — and looped forever on a garbage fetch pointer, tripping the
+2^26-instruction bound with the PC sampled mid-fetch at 0x1128.
+
+Fixed in `crates/fn64-audio/src/rsp/dmem.rs`: `read_w`/`write_w`/
+`read_h`/`write_h`/`read_hu` now assemble/scatter logical big-endian
+bytes on their `^3` lanes at ANY byte address (aligned fast paths
+bit-identical), with regression tests for the exact jump-table
+scenario. The captured failing task replays to BREAK in 106,411
+instructions, and in-harness the voiced task completes.
+
+## Second wall the same rung: PI command-queue-full retry livelock
+
+Immediately past the voiced task, boot livelocked at 100% host CPU in
+the AKI chunked loader (`func_80000660`, jal'd from the audio driver's
+sample-load chain): `while (osEPiStartDma(..) != 0);` with the
+0x40-deep PI command queue genuinely full. Device completions only
+commit as virtual time advances, and a shim-level retry — unlike a raw
+MMIO poll — carried no instruction checkpoint, so the retrying thread
+spun forever inside one scheduling slice. `start_timed_pi_dma` now
+charges the same 32-cycle stall raw MMIO polls pay when it reports
+PiBusy, so the executor commits the in-flight completion and the next
+retry observes a freed slot.
+
+With both fixes, boot runs ~3.05B cycles past the former wall (sim
+16.18B → 19.23B): gfx task submissions grow 10 → 14, VI swaps 5 → 7
+with NEW frame content (white fade-in frames after the fade-to-black),
+and audio fields tick 9,385 → 11,533 through the voiced era.
+
+## Known frontier (2026-07-21, latest): garbage OSIoMesg size in the audio loader chain
+
+At sim ~19.23B the audio driver's loader chain (`func_800222D8` →
+`func_80000870` → `func_800E1B90`/`func_800E1BAC` → `osEPiStartDma`)
+submits an OSIoMesg whose size field is garbage: `osEPiStartDma_recomp:
+PI DMA RDRAM range overflow -- OSIoMesg at 0x0005b268 carries dramAddr
+offset 0x002c92a0 + size 0xfffffffc (devAddr 0x00144aa4)`
+(`fn64-abi/src/pi.rs`; the panic now reports the OSIoMesg address and
+field values). Size 0xfffffffc is exactly -4: a computed
+remaining-length in the streaming loader underflowed by one word, while
+the dramAddr/devAddr look like live, real pointers — so the suspect is
+the loader's length arithmetic (another guarded-IDO-div stub in the
+corpus, or driver state diverging upstream), not the OSIoMesg struct
+itself. Needs a write-watch on rdram 0x0005b278 (the size word) to find
+the owner.
 
 ## Known frontier (2026-07-14)
 
