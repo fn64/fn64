@@ -603,22 +603,71 @@ full ramps (white `/tmp/fn64-fb-272.png` -> black `fn64-fb-318.png`
 -> mid-gray `fn64-fb-360.png`/`fn64-fb-500.png` -> black
 `fn64-fb-414.png`, deepest `fn64-fb-732.png`).
 
-## Next frontier: the fade cover never lifts (no scene bleed-through)
+## RESOLVED (2026-07-21, this cycle): the raw-RDP lane now draws the real
+## WWF WrestleMania 2000 TITLE SCREEN
 
-No presented frame ever contains textured/scene content: every
-`/tmp/fn64-fb-*.png` through #732 is a UNIFORM fill at the fade's
-current level (a full-frame variance scan found structure only from
-the 1-px dotted VI artifact column). That is evidence of a compositing
-bug, not game logic: at mid-ramp, an alpha-blended fade rect over the
-live scene (549..723-tri bursts pre-save at tasks #778/#25/#28;
-constant 100/104 tris post-save) MUST show the scene tinted, never a
-flat field -- so the full-screen cover is being rendered opaque (color
-ramping, alpha ignored), or the scene geometry never survives into
-the color image. Next rung: capture a post-save-read display list
-(`FN64_XBUS_STREAM_DUMP_DIR` + `WM2000_GFX_DUMP_SKIP=783`) and decode
-the cover texrect's combine/blend state vs the scene draws -- decide
-whether the raw-RDP lane's blender, the HLE texrect path, or the
-scene's TMEM loads are at fault.
+The uniform-frame frontier was three separate raw-RDP-lane bugs, each
+found by decoding the live post-save DL (task #783, captured with the
+new `FN64_XBUS_STREAM_DUMP_SKIP` knob and replayed offline against a
+real RDRAM image via the new `FN64_XBUS_STREAM_DUMP_RDRAM` +
+`xbus_replay <stream> <out> <rdram>` flow):
+
+1. **Edge-walker `lft` convention inverted.** Command bit 55 means the
+   H (major) edge walks the LEFT side; the walker read it as
+   right-major, so every real triangle's span computed right < left and
+   rasterized ZERO pixels -- all "raw tris" reported since the first
+   demo-scene frames had never written a single fragment. (The in-tree
+   fixtures were self-consistent with the inverted reading; all
+   corrected, flag renamed `left_major`.)
+2. **Perspective texel coordinates were a bare S/W ratio.** Hardware
+   tcdiv produces S10.5 = (S/W)*2^15, i.e. (S/W)*2^10 texels; without
+   the scale the whole title quad collapsed onto texel (0,0). G_TP_NONE
+   now uses the plane integer part as S10.5 (tcdiv_nopersp).
+3. **EN_TLUT keyed on tile format.** The title scene draws its CI8 logo
+   image through a tile DECLARED IA8 with G_TT_RGBA16 on; hardware
+   palettizes any 4/8-bit texel through high TMEM regardless of the
+   declared format. Larger TLUT texel sizes keep a loud trap.
+
+**The scene itself (decoded task #783):** clear to near-black, then the
+320x240 CI8 title image (rdram 0x1CDE10, RGBA16 TLUT at 0x1CDC10)
+drawn as 50 LOADTILE tile-pairs / 100 shade+texture tris with combiner
+`(ENV-TEXEL0)*PRIM+TEXEL0`, alpha `TEXEL0*PRIM`, standard
+`CC*a + MEM*(1-a)` blend (IM_RD|FORCE_BL). Replaying the DL truncated
+before its cover pass renders the full **WWF WrestleMania 2000 title
+screen** -- scratched white WF logo, WRESTLEMANIA(R) lettering, glowing
+green "2000" -- committed to the guest framebuffer at 0x3C7C00
+(`/tmp/wm2000-title-screen.png`, from
+`/tmp/xbus-replay-nocover/cimg-003c7c00.png`). Workspace tests: 1363
+passed / 0 failed (two new stream-pinned regressions).
+
+## Next frontier: the fade's opaque black under-cover (game timeline, not blending)
+
+Presented frames are still the fade fill because the game's own DL
+composites TWO full-screen texrect passes OVER the title scene every
+task: an under-cover at constant PRIM (0,0,0,255) -- fully opaque
+black -- then a white cover whose alpha saws 216 -> 8 by 16/task and
+wraps (248, 232, ...): the post-save white-strobe transition. Both
+covers use combiner PRIM-passthrough into the standard alpha blend, so
+with the blender now correct the composite is legitimately a uniform
+field at every captured task (verified 781..798); the logo shows only
+when the game timeline drops the black under-cover's alpha. That gate
+is game-side scripting, likely stalled by the known game-frame pacing
+rung (the frame loop completes one game frame per ~1,400 VI fields):
+next step is a deep capture window (`FN64_XBUS_STREAM_DUMP_SKIP=1100`+)
+to find the task where the under-cover alpha starts ramping, or the
+pacing fix itself.
+
+**Live presentation proof (same cycle, 5M-step run):** the cover
+mechanism does open for other scenes -- the presented framebuffer at
+swap #1219 (`/tmp/fn64-fb-1219.png`, recurring at #2340 as the attract
+loop repeats) shows the game's LEGAL SCREEN as readable text through a
+partially lifted cover: "WRESTLEMANIA 2000 ... World Wrestling
+Federation Entertainment ... All Rights Reserved ... [Angel] created
+by White Wolf". First recognizable, presented content in any fn64
+boot. The legal screen recurs at swaps #2340 and #3465 as the attract
+loop repeats (~1,120-swap period), and the run reached swap #4249+
+crash-free (deepest ever, ~6x the previous frontier) with the
+white-strobe covers cycling throughout.
 
 ## Superseded framing (2026-07-21, earlier): wild-pointer crash in the demo scene, one task after first geometry
 
