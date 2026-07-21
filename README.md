@@ -80,8 +80,8 @@ overlays). Recall on merged `main`:
 | Majora's Mask | 399 / 486 | 82.1% | 0 |
 | Super Mario 64 | 2816 / 3030 | 92.9% | 0 |
 | Kirby 64 | 402 / 531 | 75.7% | 0 |
-| WM2000 (AKI, NWXE) | 603 / 847 | 71.2% | 0 |
-| No Mercy (AKI, NW4E) | 754 / 985 | 76.5% | 0 |
+| WM2000 (AKI, NWXE) | 688 / 847 | 81.2% | 0 |
+| No Mercy (AKI, NW4E) | 826 / 985 | 83.9% | 0 |
 
 `wrong == 0` holds across every game. The open remainder is an honest,
 characterized gap — genuinely unreferenced library/dead code (Kirby 64),
