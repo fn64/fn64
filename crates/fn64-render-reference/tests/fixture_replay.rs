@@ -15,7 +15,7 @@
 //! same kind of synthetic task; `osSpTaskYielded` is only a yield-status query
 //! and deliberately cannot dispatch rendering.
 use fn64_render::{OsTask, RenderBackend, RenderConfig, M_GFXTASK};
-use fn64_render_rt64::{png_dump, ReferenceBackend};
+use fn64_render_reference::{gbi, png_dump, ReferenceBackend};
 
 /// Build a tiny rdram image containing: a 3-vertex array (a red/green/blue
 /// triangle spanning most of a 64x64 frame) followed by a display list
@@ -45,16 +45,16 @@ fn build_fixture_rdram() -> (Vec<u8>, u32) {
     // G_VTX word0: opcode<<24 | n<<12 | v0 ; word1: address.
     let n: u32 = 3;
     let v0: u32 = 0;
-    let w0 = ((fn64_render_rt64::gbi::G_VTX as u32) << 24) | (n << 12) | v0;
+    let w0 = ((gbi::G_VTX as u32) << 24) | (n << 12) | v0;
     dl.extend_from_slice(&w0.to_be_bytes());
     dl.extend_from_slice(&(VTX_ADDR as u32).to_be_bytes());
     // G_TRI1 word0: opcode<<24 (rest unused by this decoder); word1: (v0<<16)|(v1<<8)|v2.
-    let w0 = (fn64_render_rt64::gbi::G_TRI1 as u32) << 24;
+    let w0 = (gbi::G_TRI1 as u32) << 24;
     let w1 = (1u32 << 8) | 2u32; // v0 index is 0, so its <<16 term is omitted (identity op)
     dl.extend_from_slice(&w0.to_be_bytes());
     dl.extend_from_slice(&w1.to_be_bytes());
     // G_ENDDL.
-    let w0 = (fn64_render_rt64::gbi::G_ENDDL as u32) << 24;
+    let w0 = (gbi::G_ENDDL as u32) << 24;
     dl.extend_from_slice(&w0.to_be_bytes());
     dl.extend_from_slice(&0u32.to_be_bytes());
 
@@ -108,7 +108,7 @@ fn fixture_display_list_renders_a_non_clear_frame() {
 
     // Dump the rendered frame as a real PNG file -- the task's explicit
     // "dump a PNG" deliverable for a non-clear rendered frame.
-    let out_dir = std::env::temp_dir().join("fn64-render-rt64-fixtures");
+    let out_dir = std::env::temp_dir().join("fn64-render-reference-fixtures");
     std::fs::create_dir_all(&out_dir).unwrap();
     let out_path = out_dir.join("fixture_triangle.png");
     png_dump::write_png(&out_path, fb.width, fb.height, &fb.pixels).unwrap();
@@ -134,7 +134,7 @@ fn unlisted_ucode_still_traps_through_the_real_backend_not_just_the_trait_fake()
     // real "nothing to draw" case. Unknown opcodes and unterminated streams
     // are deliberately errors even in this fixture-only decoder.
     let mut rdram = vec![0u8; 16];
-    rdram[..4].copy_from_slice(&((fn64_render_rt64::gbi::G_ENDDL as u32) << 24).to_be_bytes());
+    rdram[..4].copy_from_slice(&((gbi::G_ENDDL as u32) << 24).to_be_bytes());
     let task = OsTask {
         task_type: M_GFXTASK,
         data_ptr: 0,
@@ -181,14 +181,14 @@ fn process_task_writes_rgba5551_framebuffer_to_output_addr() {
         rdram[off + 12..off + 16].copy_from_slice(rgba);
     }
     let mut dl = Vec::new();
-    let w0 = ((fn64_render_rt64::gbi::G_VTX as u32) << 24) | (3u32 << 12);
+    let w0 = ((gbi::G_VTX as u32) << 24) | (3u32 << 12);
     dl.extend_from_slice(&w0.to_be_bytes());
     dl.extend_from_slice(&(VTX_ADDR as u32).to_be_bytes());
-    let w0 = (fn64_render_rt64::gbi::G_TRI1 as u32) << 24;
+    let w0 = (gbi::G_TRI1 as u32) << 24;
     let w1 = (1u32 << 8) | 2u32;
     dl.extend_from_slice(&w0.to_be_bytes());
     dl.extend_from_slice(&w1.to_be_bytes());
-    let w0 = (fn64_render_rt64::gbi::G_ENDDL as u32) << 24;
+    let w0 = (gbi::G_ENDDL as u32) << 24;
     dl.extend_from_slice(&w0.to_be_bytes());
     dl.extend_from_slice(&0u32.to_be_bytes());
     rdram[DL_ADDR..DL_ADDR + dl.len()].copy_from_slice(&dl);

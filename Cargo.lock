@@ -703,7 +703,7 @@ dependencies = [
  "fn64-audio",
  "fn64-recomp-rs",
  "fn64-render",
- "fn64-render-rt64",
+ "fn64-render-reference",
  "fn64-runtime",
  "sha2",
 ]
@@ -735,6 +735,7 @@ name = "fn64-certification"
 version = "0.0.0"
 dependencies = [
  "fn64-render",
+ "fn64-render-reference",
  "fn64-render-rt64",
  "fn64-runtime",
  "sha2",
@@ -785,6 +786,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fn64-render-reference"
+version = "0.0.0"
+dependencies = [
+ "fn64-render",
+ "fn64-runtime",
+ "insta",
+ "sha2",
+]
+
+[[package]]
 name = "fn64-render-rt64"
 version = "0.0.0"
 dependencies = [
@@ -792,8 +803,8 @@ dependencies = [
  "fn64-abi",
  "fn64-boot-harness",
  "fn64-render",
+ "fn64-render-reference",
  "fn64-runtime",
- "insta",
  "serde_json",
  "sha2",
 ]
@@ -820,6 +831,7 @@ dependencies = [
  "fn64-audio",
  "fn64-boot-harness",
  "fn64-render",
+ "fn64-render-reference",
  "fn64-render-rt64",
  "fn64-runtime",
  "gilrs",

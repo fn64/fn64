@@ -21,8 +21,8 @@
       "exactness": "bounded_reference",
       "behavior": "Digest-admitted F3DEX2 commands cover matrices, viewport, vertices, triangles, lines, lighting, fog, texgen, cull/branch, state DMA, and self-load with loud malformed-command traps.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/tests/f3dex2_replay.rs", "needle": "fn f3dex2_display_list_renders_transformed_triangle_at_expected_pixel" },
-        { "kind": "doc", "path": "crates/fn64-render-rt64/F3DEX2-CONCEPTS.md", "needle": "## 7. Cross-reference" }
+        { "kind": "test", "path": "crates/fn64-render-reference/tests/f3dex2_replay.rs", "needle": "fn f3dex2_display_list_renders_transformed_triangle_at_expected_pixel" },
+        { "kind": "doc", "path": "crates/fn64-render-reference/F3DEX2-CONCEPTS.md", "needle": "## 7. Cross-reference" }
       ],
       "blockers": [
         { "kind": "hardware_trace", "detail": "Exact reciprocal, transform, clipping-subdivision, line-edge, and negative/boundary fixed-point rounding are not published." },
@@ -37,8 +37,8 @@
       "exactness": "bounded_reference",
       "behavior": "Digest identity selects the public legacy command envelope, cache limits, matrix/state normalization, triangle forms, texture-rectangle continuations, and legacy self-load reset contract.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn admitted_polygon_families_public_triangle_forms_rasterize_identically" },
-        { "kind": "doc", "path": "crates/fn64-render-rt64/FAST3D-F3DEX-CONCEPTS.md", "needle": "## 4. Self-load and remaining frontier" }
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn admitted_polygon_families_public_triangle_forms_rasterize_identically" },
+        { "kind": "doc", "path": "crates/fn64-render-reference/FAST3D-F3DEX-CONCEPTS.md", "needle": "## 4. Self-load and remaining frontier" }
       ],
       "blockers": [
         { "kind": "hardware_trace", "detail": "Legacy microcode transform/clipping precision and the historical dedicated quadrangle wire form remain unresolved." },
@@ -53,8 +53,8 @@
       "exactness": "bounded_reference",
       "behavior": "Digest-selected cache sizes and public near-clip/reject-box admission policies are typed without aliasing variant identities.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn f3dex2_rej_variants_load_all_sixty_four_vertices_in_one_command" },
-        { "kind": "doc", "path": "crates/fn64-render-rt64/F3DEX2-VARIANTS.md", "needle": "## 3. NoN and Rej admission policies" }
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn f3dex2_rej_variants_load_all_sixty_four_vertices_in_one_command" },
+        { "kind": "doc", "path": "crates/fn64-render-reference/F3DEX2-VARIANTS.md", "needle": "## 3. NoN and Rej admission policies" }
       ],
       "blockers": [
         { "kind": "hardware_trace", "detail": "F3DLX/F3DLX2 transformed-pixel rounding and exact reject/clipping boundary precision are unknown." },
@@ -69,8 +69,8 @@
       "exactness": "bounded_reference",
       "behavior": "Legacy and modern public line envelopes normalize to typed width, ordered endpoints, clipping, texture/shade attributes, scissor, coverage, blender, and read-only depth behavior.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn l3dex_and_l3dex2_public_line_forms_normalize_to_identical_raster_input" },
-        { "kind": "doc", "path": "crates/fn64-render-rt64/L3DEX-CONCEPTS.md", "needle": "## 4. Remaining fidelity frontier" }
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn l3dex_and_l3dex2_public_line_forms_normalize_to_identical_raster_input" },
+        { "kind": "doc", "path": "crates/fn64-render-reference/L3DEX-CONCEPTS.md", "needle": "## 4. Remaining fidelity frontier" }
       ],
       "blockers": [
         { "kind": "hardware_trace", "detail": "Exact microcode transform rounding and silicon line-edge coefficient generation are unmeasured." },
@@ -85,11 +85,11 @@
       "exactness": "bounded_reference",
       "behavior": "Digest-admitted S2DEX/S2DEX2 implements typed object loads, rectangles, matrix-relative rectangles, rotating sprites, matrices, composable exact SHRINK/WIDEN perimeter correction, exact inward Average+SHRINK correction on non-rotating rectangle paths, safe-interior Point/Average NOTXCLAMP proofs, status/segment commands, and bounded wrapped point-background strips for declared combinations.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/s2dex.rs", "needle": "fn full_matrix_rotates_standalone_sprite_into_two_textured_triangles" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/s2dex.rs", "needle": "fn average_shrink_rectangles_exhaust_families_paths_scales_and_flips" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/s2dex.rs", "needle": "fn unclamped_average_endpoint_proof_matches_every_emitted_four_texel_cell" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/s2dex.rs", "needle": "fn copy_background_reuses_bounded_scratch_for_every_wire_and_loader_remainder" },
-        { "kind": "doc", "path": "crates/fn64-render-rt64/S2DEX-CONCEPTS.md", "needle": "## 4. Loud frontier" }
+        { "kind": "test", "path": "crates/fn64-render-reference/src/s2dex.rs", "needle": "fn full_matrix_rotates_standalone_sprite_into_two_textured_triangles" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/s2dex.rs", "needle": "fn average_shrink_rectangles_exhaust_families_paths_scales_and_flips" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/s2dex.rs", "needle": "fn unclamped_average_endpoint_proof_matches_every_emitted_four_texel_cell" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/s2dex.rs", "needle": "fn copy_background_reuses_bounded_scratch_for_every_wire_and_loader_remainder" },
+        { "kind": "doc", "path": "crates/fn64-render-reference/S2DEX-CONCEPTS.md", "needle": "## 4. Loud frontier" }
       ],
       "blockers": [
         { "kind": "hardware_trace", "detail": "Public sources do not settle out-of-domain NOTXCLAMP addressing; WIDEN with filtering/flips or inexact quarter-pixel extents; Average with WIDEN or rotating polygons; filtered background neighbour partitions, fractional imageYorig strip rounding, or other perimeter edge ownership. Copy subpixel processing and vertical background subpixel motion are explicitly outside the public supported contract rather than local implementation omissions." },
@@ -108,7 +108,7 @@
         { "kind": "test", "path": "crates/fn64-abi/src/task_dispatch.rs", "needle": "fn graphics_lle_accuracy_policy_forwards_raw_dpc_without_hle_dispatch" },
         { "kind": "test", "path": "crates/fn64-abi/src/task_dispatch.rs", "needle": "fn direct_imem_graphics_task_starts_lle_at_pc_zero_without_rspboot_overlay" },
         { "kind": "doc", "path": "crates/fn64-audio/RSP-ISA-COVERAGE.md", "needle": "The instruction-level model is therefore manual-complete." },
-        { "kind": "doc", "path": "crates/fn64-render-rt64/F3DEX2-VARIANTS.md", "needle": "## 4. F3DZEX2 remains an explicit unsupported identity" },
+        { "kind": "doc", "path": "crates/fn64-render-reference/F3DEX2-VARIANTS.md", "needle": "## 4. F3DZEX2 remains an explicit unsupported identity" },
         { "kind": "doc", "path": "docs/RT64-GAP-REGISTER.md", "needle": "Rej / line (L3DEX2) / Wave microcodes" }
       ],
       "blockers": [
@@ -125,8 +125,8 @@
       "exactness": "exact_public",
       "behavior": "The bounded raw-DPC decoder validates command widths and retains signed edge, shade, texture, and Z coefficients for every public triangle variant without opcode truncation.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn raw_rdp_triangle_widths_cover_every_coefficient_variant" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn raw_rdp_texture_coefficients_preserve_signed_fixed_components" }
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn raw_rdp_triangle_widths_cover_every_coefficient_variant" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn raw_rdp_texture_coefficients_preserve_signed_fixed_components" }
       ],
       "blockers": [],
       "next_action": "Keep every newly admitted raw opcode in the width/coefficient sweep; pixel behavior remains tracked in later rows."
@@ -138,8 +138,8 @@
       "exactness": "exact_public",
       "behavior": "Color/depth/texture targets, other modes, tiles/TMEM, fills, and sync commands are retained in display-list order and snapshotted onto emitted work.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn ordered_ops_preserve_color_target_fill_and_full_sync" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn rdp_registers_tiles_and_tmem_survive_f3dex2_task_boundaries" }
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn ordered_ops_preserve_color_target_fill_and_full_sync" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn rdp_registers_tiles_and_tmem_survive_f3dex2_task_boundaries" }
       ],
       "blockers": [],
       "next_action": "Require any new state command to prove ordering, snapshot timing, reset behavior, and loud malformed bounds."
@@ -151,9 +151,9 @@
       "exactness": "bounded_reference",
       "behavior": "Typed matrices, viewport, lighting/look-at, fog alpha, regular/linear texgen, culling, and perspective normalization produce deterministic reference geometry.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn large_world_perspective_view_model_projects_in_frustum" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn texture_generation_replaces_explicit_vertex_coordinates" },
-        { "kind": "doc", "path": "crates/fn64-render-rt64/F3DEX2-CONCEPTS.md", "needle": "exact F3DEX2 reciprocal/trigonometric lookup" }
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn large_world_perspective_view_model_projects_in_frustum" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn texture_generation_replaces_explicit_vertex_coordinates" },
+        { "kind": "doc", "path": "crates/fn64-render-reference/F3DEX2-CONCEPTS.md", "needle": "exact F3DEX2 reciprocal/trigonometric lookup" }
       ],
       "blockers": [
         { "kind": "hardware_trace", "detail": "Host-float transforms and analytic texgen do not establish microcode reciprocal/trigonometric table precision or boundary rounding." }
@@ -167,8 +167,8 @@
       "exactness": "bounded_reference",
       "behavior": "All modeled color/alpha mux sources, cycle-zero COMBINED handoff, TEXEL0/TEXEL1, shade, primitive, environment, noise, K4/K5, and LOD fraction feed deterministic combiner equations.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn combiner_second_cycle_consumes_first_cycle_combined_result" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn combiner_presets_select_decal_primitive_environment_and_shade_sources" }
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn combiner_second_cycle_consumes_first_cycle_combined_result" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn combiner_presets_select_decal_primitive_environment_and_shade_sources" }
       ],
       "blockers": [
         { "kind": "hardware_trace", "detail": "Silicon accumulator widths, signed negative-product rounding, clamp points, and two-cycle register timing remain unmeasured." }
@@ -182,8 +182,8 @@
       "exactness": "bounded_reference",
       "behavior": "Signed K0-K5 conversion coefficients, paired YUV samples, point/filter-convert modes, and key center/scale/width alpha fixup are typed and deterministic.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn texture_conversion_modes_execute_point_filter_and_filter_convert" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn chroma_key_center_scale_and_width_drive_alpha_fixup" }
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn texture_conversion_modes_execute_point_filter_and_filter_convert" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn chroma_key_center_scale_and_width_drive_alpha_fixup" }
       ],
       "blockers": [
         { "kind": "hardware_trace", "detail": "Conversion/key accumulator widths, negative rounding, and exact clamp boundaries are not established." }
@@ -197,8 +197,8 @@
       "exactness": "bounded_reference",
       "behavior": "Programmed cycle muxes, fog/pass, force-blend, memory color/coverage, and cycle-one-to-cycle-two handoff produce deterministic framebuffer composites. A strict raw-DPC analyzer preserves a finite 72-point reset-isolated matrix across ordinary/force-blend/fog-pass, one/two-cycle, five-bit alpha extrema/adjacent codes, and exact producer-declared denominator neighbors, plus one command-digest-bound two-adjacent-pixel feedback sequence per mode with raw RGBA/depth/coverage and divergence retained.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn two_cycle_blender_feeds_cycle_one_result_into_cycle_two" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn fog_cycle_then_pass_uses_shade_alpha_and_prior_cycle_color" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn two_cycle_blender_feeds_cycle_one_result_into_cycle_two" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn fog_cycle_then_pass_uses_shade_alpha_and_prior_cycle_color" },
         { "kind": "test", "path": "tools/rdp-silicon-vectors/tests/schema.rs", "needle": "fn blender_precision_analysis_is_complete_deterministic_and_preserves_divergence" },
         { "kind": "tool", "path": "tools/rdp-silicon-vectors/src/lib.rs", "needle": "analyze_blender_precision_sweep" },
         { "kind": "doc", "path": "docs/RDP-SILICON-VECTORS.md", "needle": "## Blender precision and adjacent-pixel memory feedback" }
@@ -215,9 +215,9 @@
       "exactness": "bounded_reference",
       "behavior": "Threshold and dither alpha compare, ordered RGB/alpha patterns before every public color-image format write, disabled RGBA16 truncation, and a seeded per-fragment noise stream are deterministic and share the documented selector topology. Strict capture analyzers preserve complete two-cycle alpha thresholds and isolated 4x4 RGB channel transfer tiles without treating synthetic fixtures as hardware evidence.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn noise_selectors_share_one_fragment_sample_at_their_documented_widths" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn rgb_dither_selector_sweep_matches_every_public_threshold" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn one_cycle_ordered_rgb_dither_reaches_index8_color_image_bytes" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn noise_selectors_share_one_fragment_sample_at_their_documented_widths" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn rgb_dither_selector_sweep_matches_every_public_threshold" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn one_cycle_ordered_rgb_dither_reaches_index8_color_image_bytes" },
         { "kind": "test", "path": "tools/rdp-silicon-vectors/tests/schema.rs", "needle": "fn alpha_dither_sweep_reports_exact_cycle_transitions_without_hiding_difference" },
         { "kind": "test", "path": "tools/rdp-silicon-vectors/tests/schema.rs", "needle": "fn alpha_dither_sweep_preserves_nonmonotonic_hardware_observations" },
         { "kind": "test", "path": "tools/rdp-silicon-vectors/tests/schema.rs", "needle": "fn rgb_dither_sweep_preserves_complete_tiles_and_cycle_difference" },
@@ -237,9 +237,9 @@
       "exactness": "exact_public",
       "behavior": "Public exponent/mantissa Z encoding, DeltaZ exponent selection, visible/hidden packing, fill-register LSB expansion, decode/encode canonicalization, and inclusive comparison relations are exhaustively tested.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/depth.rs", "needle": "fn every_stored_z_code_is_canonical_after_decode_encode" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/depth.rs", "needle": "fn visible_and_hidden_delta_bits_round_trip" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/depth.rs", "needle": "fn every_fill_halfword_replicates_its_lsb_into_both_hidden_bits" }
+        { "kind": "test", "path": "crates/fn64-render-reference/src/depth.rs", "needle": "fn every_stored_z_code_is_canonical_after_decode_encode" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/depth.rs", "needle": "fn visible_and_hidden_delta_bits_round_trip" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/depth.rs", "needle": "fn every_fill_halfword_replicates_its_lsb_into_both_hidden_bits" }
       ],
       "blockers": [],
       "next_action": "Keep all depth-image imports, fills, and fragment writes on this canonical encoding; unresolved comparison/update precision stays in the raster row."
@@ -251,11 +251,11 @@
       "exactness": "bounded_reference",
       "behavior": "Pixel/primitive depth, fill-register DeltaZ expansion, independent compare/update bits, opaque/interpenetrating/translucent/decal relations, texture rectangles, triangles, and read-only lines share typed depth control. Depth-compared coverage wrap routes through one typed Z-mode decision: opaque selects strict in-front comparison, while interpenetrating wrap traps by name instead of silently aliasing the unsupported adjustment to opaque correlation.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn programmed_z_modes_distinguish_front_correlated_and_behind_fragments" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn depth_mode_and_wrap_routing_exhaustively_preserves_supported_relations" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn interpenetrating_coverage_wrap_traps_before_silently_using_opaque_routing" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn primitive_depth_drives_texture_rectangle_compare_and_update" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn raw_depth_fill_halfwords_replicate_lsbs_into_hidden_delta_bits" }
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn programmed_z_modes_distinguish_front_correlated_and_behind_fragments" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn depth_mode_and_wrap_routing_exhaustively_preserves_supported_relations" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn interpenetrating_coverage_wrap_traps_before_silently_using_opaque_routing" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn primitive_depth_drives_texture_rectangle_compare_and_update" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn raw_depth_fill_halfwords_replicate_lsbs_into_hidden_delta_bits" }
       ],
       "blockers": [
         { "kind": "hardware_trace", "detail": "Exact interpolated Z/DeltaZ quantization, decal/interpenetration boundaries, and the numeric ZMODE_INTER coverage adjustment remain open. The strict 384-point raw-DPC intent/analyzer fixes the admission and stored-coverage denominator, but no reviewed repeated hardware bundle exists; public sources establish when the adjustment is selected but not its arithmetic." }
@@ -269,14 +269,14 @@
       "exactness": "bounded_reference",
       "behavior": "Raw and high-level triangles retain the public eight-sample checkerboard mask through axis, shared-edge, scissor, preceding-scanline, and one-Q16-LSB boundary sweeps. Full masks evaluate attributes at pixel center; partial masks use one typed bounded-policy covered checkerboard point for shade, texture, and Z. The policy has one explicit total preference order and exhausts every nonzero mask plus every equal-distance tie subset. Strict raw-DPC analyzers preserve all 1,530 mask/cycle/independent-observable selector results and a producer-selected narrow-edge matrix of raw one-LSB-below/on/above accumulator values, exact declared mask/count, and independent shade/texture/depth observations without promoting synthetic fixtures to hardware evidence or encoding a correction formula.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn raw_coverage_axis_aligned_boundaries_exhaustively_preserve_sample_identity" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn raw_coverage_q16_lsb_sweep_preserves_every_checkerboard_boundary" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn covered_attribute_sample_exhausts_every_nonzero_mask" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn partial_attribute_sample_policy_exhausts_every_equal_distance_tie" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn full_coverage_attributes_preserve_pixel_center" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn raw_and_high_level_partial_attributes_use_the_shared_covered_sample" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn raw_and_high_level_partial_texture_coordinates_use_the_shared_covered_sample" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn shared_edge_attribute_samples_stay_on_their_own_triangle" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn raw_coverage_axis_aligned_boundaries_exhaustively_preserve_sample_identity" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn raw_coverage_q16_lsb_sweep_preserves_every_checkerboard_boundary" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn covered_attribute_sample_exhausts_every_nonzero_mask" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn partial_attribute_sample_policy_exhausts_every_equal_distance_tie" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn full_coverage_attributes_preserve_pixel_center" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn raw_and_high_level_partial_attributes_use_the_shared_covered_sample" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn raw_and_high_level_partial_texture_coordinates_use_the_shared_covered_sample" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn shared_edge_attribute_samples_stay_on_their_own_triangle" },
         { "kind": "test", "path": "tools/rdp-silicon-vectors/tests/schema.rs", "needle": "fn representative_sample_analysis_is_deterministic_and_complete" },
         { "kind": "test", "path": "tools/rdp-silicon-vectors/tests/schema.rs", "needle": "fn narrow_edge_coverage_analysis_is_deterministic_complete_and_exact" },
         { "kind": "doc", "path": "docs/RDP-SILICON-VECTORS.md", "needle": "## Representative covered-sample selector sweep" },
@@ -294,8 +294,8 @@
       "exactness": "bounded_reference",
       "behavior": "All CVG_DST modes, coverage-times-alpha, alpha-coverage select, clear-on-coverage, RGBA16 hidden coverage, RGBA32 memory alpha, and opaque-wrap strict-front behavior are typed. Strict capture analyzers require and preserve the complete 8-coverage by 256-alpha domain in both one-cycle and two-cycle modes for both alpha-product and coverage-to-alpha directions.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn coverage_destinations_follow_public_clamp_wrap_full_and_save_rules" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn alpha_coverage_current_policy_is_bounded_monotonic_and_endpoint_exact" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn coverage_destinations_follow_public_clamp_wrap_full_and_save_rules" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn alpha_coverage_current_policy_is_bounded_monotonic_and_endpoint_exact" },
         { "kind": "tool", "path": "tools/rdp-silicon-vectors/src/lib.rs", "needle": "analyze_alpha_coverage_product_sweep" },
         { "kind": "tool", "path": "tools/rdp-silicon-vectors/src/lib.rs", "needle": "analyze_coverage_to_alpha_sweep" },
         { "kind": "test", "path": "tools/rdp-silicon-vectors/tests/schema.rs", "needle": "fn alpha_coverage_sweep_preserves_all_curves_and_cycle_comparison" },
@@ -313,9 +313,9 @@
       "exactness": "exact_public",
       "behavior": "Physical TMEM layout covers odd-row swaps, RGBA32 split banks, YUV planes, block DXT progression, tile origins/fractions, TLUT addressing, and supported RGBA/CI/IA/I decode formats.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn tmem_storage_matches_public_odd_row_and_rgba32_bank_layouts" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn load_block_counts_source_sized_texels_with_mismatched_load_tile" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn decode_ci4_combines_palette_bank_with_each_nibble" }
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn tmem_storage_matches_public_odd_row_and_rgba32_bank_layouts" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn load_block_counts_source_sized_texels_with_mismatched_load_tile" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn decode_ci4_combines_palette_bank_with_each_nibble" }
       ],
       "blockers": [],
       "next_action": "Require every new format/load form to add physical-address layout and sampling vectors rather than only decoded colors."
@@ -327,15 +327,15 @@
       "exactness": "bounded_reference",
       "behavior": "Clamp/wrap/mirror/mask/shift, typed copy-mode clamp bypass, a range-checked signed S10.5 input plus a distinct post-shift host accumulator, point/average/integer-weight three-nearest filters, perspective attributes, YUV convert modes, two-tile cycles, mip/detail/sharpen selection, and LOD fraction share one deterministic sampler. Strict capture analyzers now require reset-isolated one/two-cycle below/on/above matrices for the three-nearest diagonal, reciprocal-to-S10.5 boundary, average-filter output tie, and exact derivative/LOD boundaries across mip/detail/sharpen, with producer-declared numeric controls and framebuffer/depth/coverage observations, without promoting synthetic fixtures to hardware evidence.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn copy_clamp_axis_sweep_matches_public_bypass_then_wrap_mirror_equation" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn copy_clamp_bits_are_ignored_before_mask_wrap" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn texture_filter_matches_public_point_average_and_triangular_rules" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn texture_s10_5_coordinate_sweep_covers_every_grid_value_and_tile_shift" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn texture_fixed_s10_5_filter_sweeps_both_triangle_halves_without_float_drift" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn texture_fixed_s10_5_negative_half_texel_observes_wrap_mirror_and_clamp_boundaries" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn texture_shift_precedes_fractional_tile_origin_subtraction" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn lod_selection_matches_public_mip_detail_and_sharpen_tables" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/raster.rs", "needle": "fn perspective_correct_st_uses_reciprocal_clip_w" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn copy_clamp_axis_sweep_matches_public_bypass_then_wrap_mirror_equation" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn copy_clamp_bits_are_ignored_before_mask_wrap" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn texture_filter_matches_public_point_average_and_triangular_rules" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn texture_s10_5_coordinate_sweep_covers_every_grid_value_and_tile_shift" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn texture_fixed_s10_5_filter_sweeps_both_triangle_halves_without_float_drift" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn texture_fixed_s10_5_negative_half_texel_observes_wrap_mirror_and_clamp_boundaries" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn texture_shift_precedes_fractional_tile_origin_subtraction" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn lod_selection_matches_public_mip_detail_and_sharpen_tables" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn perspective_correct_st_uses_reciprocal_clip_w" },
         { "kind": "test", "path": "tools/rdp-silicon-vectors/tests/schema.rs", "needle": "fn texture_filter_tie_analysis_is_complete_deterministic_and_preserves_divergence" },
         { "kind": "tool", "path": "tools/rdp-silicon-vectors/src/lib.rs", "needle": "analyze_texture_filter_tie_sweep" },
         { "kind": "doc", "path": "docs/RDP-SILICON-VECTORS.md", "needle": "## Three-nearest texture-filter tie boundary" },
@@ -361,20 +361,20 @@
       "exactness": "bounded_reference",
       "behavior": "Public I8, RGBA16, and RGBA32 layouts share typed import/fill/combined commit paths, pre-write RGB dither, big-endian logical bytes, and physical-address hidden coverage/DeltaZ sidecars. Exhaustive sweeps cover all nine target transitions, all three fill layouts, and public direct I8, IA8, undereferenced CI8, and RGBA16 copy sources while trapping unsupported source/target pairs. Eight-bit copy preserves the original TMEM byte while source-format alpha comparison uses I8 intensity, IA8's expanded low nibble, or the undereferenced CI8 index. Generated-C and typed-Rust CPU halfword stores share one post-commit physical-address event, so an owned RGBA16 sidecar applies the public visible-LSB replication rule even for a same-value write.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/tests/fixture_replay.rs", "needle": "fn process_task_writes_rgba5551_framebuffer_to_output_addr" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/gbi.rs", "needle": "fn color_image_layout_classifies_exactly_the_public_memory_interfaces" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn one_cycle_ordered_rgb_dither_reaches_index8_color_image_bytes" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn raw_depth_fill_halfwords_replicate_lsbs_into_hidden_delta_bits" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn every_public_color_image_transition_commits_then_imports_exact_layouts" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn every_public_fill_layout_commits_exact_bytes_and_hidden_ownership" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn copy_layout_matrix_admits_only_public_direct_pairs" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn copy_source_gate_rejects_ci8_tlut_and_undefined_eight_bit_formats" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn copy_texture_rectangle_samples_rgba16_into_color_image" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn copy_ci8_indices_directly_to_eight_bit_color_image" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn copy_i8_preserves_source_bytes_and_uses_intensity_as_alpha" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn copy_ia8_preserves_packed_bytes_and_compares_expanded_alpha_nibble" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn copy_ia8_preserves_odd_tmem_row_layout_without_alpha_compare" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn known_same_value_non_rdp_write_replicates_the_visible_lsb" },
+        { "kind": "test", "path": "crates/fn64-render-reference/tests/fixture_replay.rs", "needle": "fn process_task_writes_rgba5551_framebuffer_to_output_addr" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn color_image_layout_classifies_exactly_the_public_memory_interfaces" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn one_cycle_ordered_rgb_dither_reaches_index8_color_image_bytes" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn raw_depth_fill_halfwords_replicate_lsbs_into_hidden_delta_bits" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn every_public_color_image_transition_commits_then_imports_exact_layouts" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn every_public_fill_layout_commits_exact_bytes_and_hidden_ownership" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn copy_layout_matrix_admits_only_public_direct_pairs" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn copy_source_gate_rejects_ci8_tlut_and_undefined_eight_bit_formats" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn copy_texture_rectangle_samples_rgba16_into_color_image" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn copy_ci8_indices_directly_to_eight_bit_color_image" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn copy_i8_preserves_source_bytes_and_uses_intensity_as_alpha" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn copy_ia8_preserves_packed_bytes_and_compares_expanded_alpha_nibble" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn copy_ia8_preserves_odd_tmem_row_layout_without_alpha_compare" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn known_same_value_non_rdp_write_replicates_the_visible_lsb" },
         { "kind": "test", "path": "crates/fn64-recomp-rs/src/runtime.rs", "needle": "fn rdram_write_observer_runs_after_committed_logical_ranges" },
         { "kind": "test", "path": "crates/fn64-abi/src/task_dispatch.rs", "needle": "fn generated_c_kseg1_same_value_halfword_keeps_visible_bytes_and_renderer_sidecar_coherent" },
         { "kind": "test", "path": "crates/fn64-abi/tests/c_smoke.rs", "needle": "fn c_caller_links_and_runs_against_fn64_abi_staticlib" },
@@ -394,31 +394,31 @@
       "behavior": "The exact public four-value VI STATUS selector admits partial-coverage silhouette AA and resampling for modes 0/1, resampling only for mode 2, and lower-sample coordinate replication for mode 3, while independent DITHER_FILTER admits only full-coverage RGBA16 restoration. One typed fourteen-word snapshot at each exact retrace deadline co-binds STATUS, origin/source width, timing, H/V active window, X/Y scale, and field; every field crosses the renderer exactly once, so batched checkpoint jumps cannot collapse fields onto their final cycle and repeated progressive images retain distinct retrace-seeded noise/cadence. A move-only live request also co-binds a call-scoped read capability over the current physical 8 MiB allocation, while explicitly typed compatibility requests cannot impersonate live-register release evidence. A jointly zero H/V window remains inactive and blank scanout remains black without reading source bytes. The reference path rereads the exact live 24-bit origin and effective 12-bit stride on every field, decodes RGBA16 with correlated hidden coverage or byte-gathered RGBA32, validates a checked vertical resampling/filter envelope, and commits inferred hidden bits plus the presented image only after the full scanout succeeds; its resident RDP framebuffer is never substituted or mutated. The post-VI image uses the programmed pixel/half-line active extent, then composes interlaced AA row spacing, divot, vertical-then-horizontal linear resampling or replication, held-last border, and gamma. Fade/repeat retain the active extent. Native RT64 validates only the public programmed source span, receives the same current allocation and live origin/effective stride, waits its workload and present queues idle, and restores placeholder aliases before the Rust capability ends. A fourteen-phase pinned-Metal pixel gate retains one workload, increasing presents, exact nondefault 8x6 output, six byte-identical baseline restorations, and causal gamma/1.5x-scale changes. It also preserves gamma-dither, divot, DITHER_FILTER, and all four AA selectors as exact pixel-inert native implementation residuals; this is observation of the pinned boundary, not silicon parity. A separate strict non-parity digital capture analyzer preserves the complete 44-point producer-declared active-window, border, insufficient-neighborhood, centroid-candidate, and one-/two-line interlaced-phase matrix with exact source RDRAM/coverage and post-VI bytes; it does not encode a silicon rule.",
       "evidence": [
         { "kind": "test", "path": "crates/fn64-render/src/lib.rs", "needle": "fn vi_filter_control_decodes_latched_status_bits" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn vi_status_antialias_modes_select_partial_coverage_filter_exactly" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn dither_restoration_is_independent_and_full_coverage_only" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn vi_status_antialias_modes_select_resampling_exactly" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn rgba16_restoration_exact_neighbor_and_border_vectors" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn rgba16_coverage_aa_exact_checkerboard_neighborhood_vector" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn rgba16_coverage_aa_equations_are_exhaustive_over_stored_colors" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn interlaced_coverage_aa_uses_two_line_checkerboard_rows" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn resampling_integer_policy_exhausts_public_fractions_and_color_endpoints" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn resampling_typed_axis_position_exhausts_register_and_border_boundaries" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn resampling_preserves_host_alpha_for_identity_and_fractional_positions" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn scanout_resamples_before_gamma_in_patent_order" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn vi_status_antialias_modes_select_partial_coverage_filter_exactly" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn dither_restoration_is_independent_and_full_coverage_only" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn vi_status_antialias_modes_select_resampling_exactly" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn rgba16_restoration_exact_neighbor_and_border_vectors" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn rgba16_coverage_aa_exact_checkerboard_neighborhood_vector" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn rgba16_coverage_aa_equations_are_exhaustive_over_stored_colors" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn interlaced_coverage_aa_uses_two_line_checkerboard_rows" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn resampling_integer_policy_exhausts_public_fractions_and_color_endpoints" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn resampling_typed_axis_position_exhausts_register_and_border_boundaries" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn resampling_preserves_host_alpha_for_identity_and_fractional_positions" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn scanout_resamples_before_gamma_in_patent_order" },
         { "kind": "test", "path": "crates/fn64-render/src/lib.rs", "needle": "fn vi_resample_control_decodes_every_public_scale_and_offset_code" },
         { "kind": "test", "path": "crates/fn64-render/src/lib.rs", "needle": "fn vi_scanout_registers_retain_one_complete_atomic_image" },
         { "kind": "test", "path": "crates/fn64-abi/src/vi.rs", "needle": "fn vi_swap_and_black_transitions_present_typed_vi_state_at_vblank" },
         { "kind": "test", "path": "crates/fn64-abi/src/vi.rs", "needle": "fn batched_retraces_present_each_interlaced_field_at_its_deadline" },
         { "kind": "test", "path": "crates/fn64-abi/src/vi.rs", "needle": "fn raw_mmio_vi_image_and_seed_cross_each_progressive_retrace_without_an_os_vi_mode" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn divot_exact_horizontal_median_vectors" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn active_window_drives_post_vi_extent_and_source_crop" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn normal_640_dot_window_consumes_half_rate_source_coordinates" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn reference_vi_reads_rgba16_from_live_origin_and_effective_padded_stride" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn reference_vi_reads_unaligned_rgba32_rows_from_odd_live_stride" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn reference_vi_uses_each_field_exact_live_origin_without_extra_bias" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn reference_vi_bounds_fail_transactionally_and_exact_edge_succeeds" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn reference_vi_blank_and_inactive_paths_do_not_fetch_live_source" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn native_programmed_span_excludes_reference_filter_halo" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn divot_exact_horizontal_median_vectors" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn active_window_drives_post_vi_extent_and_source_crop" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn normal_640_dot_window_consumes_half_rate_source_coordinates" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn reference_vi_reads_rgba16_from_live_origin_and_effective_padded_stride" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn reference_vi_reads_unaligned_rgba32_rows_from_odd_live_stride" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn reference_vi_uses_each_field_exact_live_origin_without_extra_bias" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn reference_vi_bounds_fail_transactionally_and_exact_edge_succeeds" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn reference_vi_blank_and_inactive_paths_do_not_fetch_live_source" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn native_programmed_span_excludes_reference_filter_halo" },
         { "kind": "test", "path": "crates/fn64-render-rt64/src/lib.rs", "needle": "fn rt64_release_authority_rejects_backend_only_compatibility" },
         { "kind": "test", "path": "crates/fn64-abi/src/vi.rs", "needle": "fn raw_mmio_retrace_rereads_live_origin_bytes_without_a_graphics_task" },
         { "kind": "test", "path": "crates/fn64-render-rt64/tests/rt64_adapter_capture.rs", "needle": "fn typed_task_and_vi_cross_cpp_boundary_without_a_graphics_device" },
@@ -441,8 +441,8 @@
       "exactness": "bounded_reference",
       "behavior": "Integer square-root gamma and seeded stochastic seven-bit quantization provide reproducible digital pre-DAC output with exact endpoint/reference vectors.",
       "evidence": [
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn gamma_square_root_exact_integer_vectors" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/src/vi.rs", "needle": "fn gamma_dither_host_policy_has_an_exact_seeded_vector" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn gamma_square_root_exact_integer_vectors" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/vi.rs", "needle": "fn gamma_dither_host_policy_has_an_exact_seeded_vector" },
         { "kind": "doc", "path": "docs/VI-FILTERS.md", "needle": "The silicon gamma transfer table" }
       ],
       "blockers": [

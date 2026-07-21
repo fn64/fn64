@@ -5,13 +5,13 @@
       "operation_prefix": "render.",
       "subsystem": "render",
       "dispositions": ["loud_trap", "returned_error"],
-      "recorder_path": "crates/fn64-render-rt64/src/lib.rs",
+      "recorder_path": "crates/fn64-render-reference/src/lib.rs",
       "recorder_trigger": "fn64_runtime::record_unsupported_event(",
       "source_paths": [
-        "crates/fn64-render-rt64/src/lib.rs",
-        "crates/fn64-render-rt64/src/gbi.rs",
-        "crates/fn64-render-rt64/src/raster.rs",
-        "crates/fn64-render-rt64/src/s2dex.rs"
+        "crates/fn64-render-reference/src/backend.rs",
+        "crates/fn64-render-reference/src/gbi.rs",
+        "crates/fn64-render-reference/src/raster.rs",
+        "crates/fn64-render-reference/src/s2dex.rs"
       ]
     }
   ],

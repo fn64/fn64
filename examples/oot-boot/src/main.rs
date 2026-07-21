@@ -566,7 +566,7 @@ fn main() {
     // 320x240 (this harness does not yet decode the ROM's real OSViMode).
     use fn64_render::RenderBackend as _;
     let create_reference = || -> Box<dyn fn64_render::RenderBackend> {
-        let mut backend = fn64_render_rt64::ReferenceBackend::new()
+        let mut backend = fn64_render_reference::ReferenceBackend::new()
             .with_f3dex2()
             .with_clear_color([0, 0, 0, 255]);
         if let Some(pair) = &release_microcode_pair {

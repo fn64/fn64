@@ -1,6 +1,6 @@
 //! Typed encoding for pinned RT64's public F3DEX2 Extended-GBI v1 protocol.
 //!
-//! This module is deliberately independent of [`crate::ReferenceBackend`]
+//! This module is deliberately independent of `fn64-render-reference`
 //! and the RT64 C++ adapter. A cooperating game first submits [`Probe::command`]
 //! in one completed graphics task, reads the zero-initialized return word on
 //! the CPU, and only then uses the returned [`Version1`] to build later

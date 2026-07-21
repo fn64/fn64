@@ -135,7 +135,7 @@ fn main() {
     // ponytail: no RT64/env switch like oot-boot until a wm2000 frame exists.
     {
         use fn64_render::RenderBackend as _;
-        let mut backend = fn64_render_rt64::ReferenceBackend::new()
+        let mut backend = fn64_render_reference::ReferenceBackend::new()
             .with_f3dex2()
             .with_clear_color([0, 0, 0, 255])
             .with_auto_dump("/tmp", "fn64-wm2000-render", 240);

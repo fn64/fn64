@@ -13,9 +13,10 @@ use fn64_render::{
     RenderSettingsApply, ResolutionMultiplier, ViFilterControl, ViPixelType, ViPresentation,
     M_GFXTASK,
 };
+use fn64_render_reference::gbi;
 use fn64_render_rt64::{
     extended_gbi::{AspectMode, Availability, Origin, Policy, RectAlignment, Version1},
-    gbi, Rt64Backend, Rt64ExtendedAspectMode, Rt64ExtendedGbiEvidence, Rt64PresentPixelFormat,
+    Rt64Backend, Rt64ExtendedAspectMode, Rt64ExtendedGbiEvidence, Rt64PresentPixelFormat,
     Rt64PresentedPixels, Rt64SourceProvenance,
 };
 use sha2::{Digest, Sha256};

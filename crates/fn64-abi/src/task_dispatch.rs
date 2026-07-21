@@ -4780,7 +4780,7 @@ mod tests {
             dmem[offset..offset + 4].copy_from_slice(&w0.to_be_bytes());
             dmem[offset + 4..offset + 8].copy_from_slice(&w1.to_be_bytes());
         }
-        let mut backend = fn64_render_rt64::ReferenceBackend::new().with_f3dex2();
+        let mut backend = fn64_render_reference::ReferenceBackend::new().with_f3dex2();
         backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         prepare_renderer_rdram(&mut rdram);
         set_render_backend(Box::new(backend), rdram.len());
@@ -4842,7 +4842,7 @@ mod tests {
             dmem[offset..offset + 4].copy_from_slice(&w0.to_be_bytes());
             dmem[offset + 4..offset + 8].copy_from_slice(&w1.to_be_bytes());
         }
-        let mut backend = fn64_render_rt64::ReferenceBackend::new().with_f3dex2();
+        let mut backend = fn64_render_reference::ReferenceBackend::new().with_f3dex2();
         backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
         prepare_renderer_rdram(&mut rdram);
         set_render_backend(Box::new(backend), rdram.len());
@@ -5367,7 +5367,7 @@ mod tests {
 
     /// Proves the executor gfx-task seam actually reaches a real `dyn
     /// RenderBackend` end-to-end: `set_render_backend` registers a real
-    /// `fn64_render_rt64::ReferenceBackend`, a real F3DEX2-family display
+    /// `fn64_render_reference::ReferenceBackend`, a real F3DEX2-family display
     /// list (same tiny triangle fixture shape as
     /// `fn64-render-rt64/tests/fixture_replay.rs` -- see that file's doc
     /// comment for why this is a hand-built, not ROM-captured, fixture) is
@@ -5380,7 +5380,7 @@ mod tests {
     #[test]
     fn os_sp_task_start_go_routes_gfx_tasks_through_the_registered_render_backend() {
         use fn64_render::RenderConfig;
-        use fn64_render_rt64::{gbi, ReferenceBackend};
+        use fn64_render_reference::{gbi, ReferenceBackend};
 
         const RDRAM_LEN: usize = 0x4000;
         const VTX_ADDR: usize = 0x1000;

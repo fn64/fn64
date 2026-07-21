@@ -14,6 +14,7 @@ SOURCE_ROOTS = [
     ROOT / "crates/fn64-audio/src",
     ROOT / "crates/fn64-recomp-rs/src",
     ROOT / "crates/fn64-render/src",
+    ROOT / "crates/fn64-render-reference/src",
     ROOT / "crates/fn64-render-rt64/src",
 ]
 CALL = re.compile(

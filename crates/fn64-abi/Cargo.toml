@@ -21,9 +21,9 @@ fn64-runtime = { path = "../fn64-runtime" }
 # The RenderBackend trait ONLY (docs/DECOUPLING.md) -- fn64-abi routes the
 # gfx half of osSpTaskYielded_recomp through `dyn RenderBackend`, exactly
 # like the audio half already routes through the registered
-# `AudioUcodeFn`. This crate never depends on a concrete backend crate
-# (fn64-render-rt64); the shell registers whichever `Box<dyn RenderBackend>`
-# it constructed, keeping fn64-abi backend-agnostic.
+# `AudioUcodeFn`. This crate never has a production dependency on a concrete
+# backend crate; the shell registers whichever `Box<dyn RenderBackend>` it
+# constructed, keeping fn64-abi backend-agnostic.
 fn64-render = { path = "../fn64-render" }
 # The AudioBackend trait ONLY (docs/DECOUPLING.md's fn64-audio crate plan)
 # -- fn64-abi routes M_AUDTASK's sample-delivery half through `dyn
@@ -44,4 +44,4 @@ sha2 = "0.10"
 # end-to-end (not just the trait in isolation) -- never a non-test
 # dependency, keeping fn64-abi's real dependency graph backend-agnostic per
 # docs/DECOUPLING.md.
-fn64-render-rt64 = { path = "../fn64-render-rt64" }
+fn64-render-reference = { path = "../fn64-render-reference" }

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "RenderBackend adapter over the MIT RT64 fork (C++, quarantined here) plus a headless reference software backend. See README.md, docs/DESIGN.md section 1, docs/DECOUPLING.md."
+description = "Thin RenderBackend adapter over the pinned MIT RT64 renderer, with all C++ interop quarantined here."
 
 [features]
 default = []
@@ -37,12 +37,8 @@ sha2 = "0.10"
 [dev-dependencies]
 fn64-abi = { path = "../fn64-abi" }
 fn64-boot-harness = { path = "../fn64-boot-harness" }
+fn64-render-reference = { path = "../fn64-render-reference" }
 serde_json = "1"
-# Snapshot testing for render output. A render test captures a STRUCTURAL
-# digest (dims, tri count, non-clear pixel count, framebuffer hash) as a
-# reviewable snapshot; `cargo insta review` blesses an intentional render
-# change instead of hand-editing a golden. No giant PNG committed.
-insta = "1"
 
 [build-dependencies]
 cc = "1"

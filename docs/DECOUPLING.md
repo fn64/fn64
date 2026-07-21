@@ -142,11 +142,13 @@ preflight consumes `fn64-render`'s typed footprint for the source rows selected
 by public coordinate arithmetic; the deterministic reference filter halo
 remains a separate policy.
 
-### Adapter today: `fn64-render-rt64` (= the current `fn64-rt64` (→ `fn64-render-rt64`), renamed by role)
+### Adapters today: `fn64-render-reference` and `fn64-render-rt64`
 
-Implements `RenderBackend` over the MIT RT64 fork via FFI. Owns all C++ interop.
-It temporarily also contains the pure-Rust `ReferenceBackend`; that backend is
-being extracted without changing the frozen `fn64-render` seam.
+`fn64-render-reference` implements the deterministic pure-Rust
+`ReferenceBackend`, including the geometry/object decoders, software rasterizer,
+and reference VI path. `fn64-render-rt64` implements `RenderBackend` over the
+MIT RT64 fork via FFI and owns all C++ interop. The extraction preserves the
+frozen `fn64-render` seam.
 The runtime and shell see only `dyn RenderBackend`. Tests: task-fixture replays
 (a captured display list → a frame hash), and the trap path (unlisted ucode →
 named error, not a crash).
@@ -176,7 +178,8 @@ before following it.
    instead of being adapter-wrapped. `aki_profile` is legacy (ROADMAP Phase H).
 3. ~~**Rename `fn64-rt64` → `fn64-render-rt64`**~~ **DONE**, behind the
    `RenderBackend` trait; fixture-replay tests live in
-   `crates/fn64-render-rt64/tests/`.
+   `crates/fn64-render-reference/tests/` for reference behavior and
+   `crates/fn64-render-rt64/tests/` for native-adapter behavior.
 4. **Rebrand the forks by role**: `fn64/n64recomp` stays (it's literally a fork,
    honest name), but our crates and docs speak in fn64-recomp / fn64-render terms
    so the *project's* vocabulary is already decoupled before the code is.
@@ -199,8 +202,8 @@ A crate marks a **swap boundary** (backend you can replace) or a **cross-tool sh
 Not a topic. MMIO / save / libultra are modules *inside* `fn64-runtime`, not crates.
 
 **Exists:** fn64-runtime, fn64-abi, fn64-render (trait + neutral render
-mechanisms), fn64-render-rt64 (RT64 adapter + reference raster pending
-extraction), fn64-shell.
+mechanisms), fn64-render-reference (deterministic Rust reference renderer),
+fn64-render-rt64 (RT64 adapter), fn64-shell.
 
 **To add, prioritized:**
 1. **fn64-audio** — the `AudioBackend` trait (consume AI samples → host stream) + a cpal backend +

@@ -575,7 +575,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fn64_render_rt64::ReferenceBackend;
+    use fn64_render_reference::ReferenceBackend;
 
     #[test]
     fn raw_fixture_has_the_expected_native_geometry() {

@@ -19,7 +19,7 @@
 //! F3DEX2 wire value (see `gbi.rs`'s module doc for the per-opcode
 //! citations); nothing is captured from a real ROM.
 use fn64_render::{OsTask, RenderBackend, RenderConfig, M_GFXTASK};
-use fn64_render_rt64::{gbi, png_dump, ReferenceBackend};
+use fn64_render_reference::{gbi, png_dump, ReferenceBackend};
 
 // --- Swizzled rdram writers (mirror the decoder's recomp memory model) --
 //
@@ -222,7 +222,7 @@ fn f3dex2_display_list_renders_transformed_triangle_at_expected_pixel() {
     assert_eq!(corner, &clear[..], "corner must remain clear");
 
     // Dump the frame for the human eye-gate.
-    let out_dir = std::env::temp_dir().join("fn64-render-rt64-fixtures");
+    let out_dir = std::env::temp_dir().join("fn64-render-reference-fixtures");
     std::fs::create_dir_all(&out_dir).unwrap();
     let out_path = out_dir.join("f3dex2_triangle.png");
     png_dump::write_png(&out_path, fb.width, fb.height, &fb.pixels).unwrap();

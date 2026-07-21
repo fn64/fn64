@@ -697,8 +697,8 @@ and deterministic output traces.
   same typed operation; their equivalent raster output is regression-tested.
   Line-microcode `G_TRI1` is a validated no-op, while polygon-only and
   undocumented commands remain loud. See
-  `crates/fn64-render-rt64/L3DEX-CONCEPTS.md`. Exact digest admission now also
-  distinguishes the public Fast3D, F3DEX, and F3DEX2 polygon envelopes. Their
+  `crates/fn64-render-reference/L3DEX-CONCEPTS.md`. Exact digest admission now
+  also distinguishes the public Fast3D, F3DEX, and F3DEX2 polygon envelopes. Their
   distinct vertex, matrix, move, cull, modify, branch, and triangle layouts
   normalize into the same typed mechanisms, and equivalent display lists have
   byte-identical raster regressions. Legacy self-load resets all published RSP
@@ -708,8 +708,8 @@ and deterministic output traces.
   coefficient words and digest-selected legacy/modern `G_RDPHALF_1/2`
   envelopes are exhaustive across all admitted geometry/line families;
   malformed or mixed-family wrappers trap. See
-  `crates/fn64-render-rt64/FAST3D-F3DEX-CONCEPTS.md`. Exact digest identity now
-  also distinguishes F3DLX and F3DLX.Rej despite their F3DEX-compatible wire.
+  `crates/fn64-render-reference/FAST3D-F3DEX-CONCEPTS.md`. Exact digest identity
+  now also distinguishes F3DLX and F3DLX.Rej despite their F3DEX-compatible wire.
   The bounded decoder enforces the ordinary 32-entry versus Rej 64-entry
   caches, legacy 32-vertex load maximum, F3DLX-only clipping toggle, Rej
   front-cull restriction, default `FRUSTRATIO_2`, and whole-triangle X/Y/far
@@ -719,7 +719,7 @@ and deterministic output traces.
   emulation and F3DEX2 `G_QUAD` have byte-identical raster regressions; the
   removed historical dedicated Fast3D form remains loud because no allowed
   public source specifies its opcode/layout. See
-  `crates/fn64-render-rt64/F3DLX-CONCEPTS.md`. Exact digest identity also
+  `crates/fn64-render-reference/F3DLX-CONCEPTS.md`. Exact digest identity also
   distinguishes public F3DEX2.NoN, F3DEX2.Rej, and F3DLX2.Rej. Their bounded
   policies cover the public 32/64-entry cache split, modern Rej 1--64 vertex
   loads, initial `FRUSTRATIO_2`, NoN near-admission distinction, and
@@ -728,8 +728,8 @@ and deterministic output traces.
   boundary as legacy F3DLX. F3DZEX2 has a named identity but cannot enter HLE:
   allowed sources do not specify its family-specific continuation/branch wire,
   and public `G_SPECIAL_*` opcodes remain reserved. See
-  `crates/fn64-render-rt64/F3DEX2-VARIANTS.md`. The content-admitted S2DEX
-  slice now retains object clamp, filter correction, perimeter, and ignored
+  `crates/fn64-render-reference/F3DEX2-VARIANTS.md`. The content-admitted
+  S2DEX slice now retains object clamp, filter correction, perimeter, and ignored
   legacy edge requests as typed task-local state. It admits the current public
   header's ignored XLU/AA bits, Point-or-Average filtering with the shared RDP
   four-sample box path, exact-quarter-pixel 3/8-texel WIDEN edges, and
@@ -744,8 +744,8 @@ and deterministic output traces.
   perimeter mechanism across rectangle/matrix/rotating/compound paths and
   both S2DEX wires. WIDEN/filter/flip/Copy composition, historical XLU/AA
   revisions, and any required sub-quarter-pixel rounding remain loud. See
-  `crates/fn64-render-rt64/S2DEX-CONCEPTS.md`. The admitted family/opcode audit
-  and its evidence boundary are recorded in `docs/MICROCODE-DENOMINATOR.md`.
+  `crates/fn64-render-reference/S2DEX-CONCEPTS.md`. The admitted family/opcode
+  audit and its evidence boundary are recorded in `docs/MICROCODE-DENOMINATOR.md`.
   Public `gSPLookAt` X/Y
   DMAs now feed typed screen-direction state, and regular/linear texture
   generation maps signed

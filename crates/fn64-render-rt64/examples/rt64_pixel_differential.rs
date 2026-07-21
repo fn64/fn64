@@ -9,10 +9,11 @@ use fn64_render::{
     RenderResolution, RenderRestartField, RenderRuntimePolicy, RenderRuntimeSettings,
     RenderSettingsApply, ResolutionMultiplier, ViPresentation, M_GFXTASK,
 };
+use fn64_render_reference::ReferenceBackend;
 use fn64_render_rt64::{
     capture_rt64_adapter_inputs, roundtrip_rt64_emulator_settings,
-    roundtrip_rt64_enhancement_settings, roundtrip_rt64_runtime_settings, ReferenceBackend,
-    Rt64Backend, Rt64ReplacementPackInput,
+    roundtrip_rt64_enhancement_settings, roundtrip_rt64_runtime_settings, Rt64Backend,
+    Rt64ReplacementPackInput,
 };
 use sha2::{Digest, Sha256};
 

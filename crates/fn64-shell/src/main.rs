@@ -260,7 +260,7 @@ mod game {
             // default remains the software ReferenceBackend (the CI oracle).
             use fn64_render::RenderBackend as _;
             let create_reference = || -> Box<dyn fn64_render::RenderBackend> {
-                let mut backend = fn64_render_rt64::ReferenceBackend::new()
+                let mut backend = fn64_render_reference::ReferenceBackend::new()
                     .with_f3dex2()
                     .with_clear_color([0, 0, 0, 255]);
                 if let Err(e) = backend.create(&fn64_render::RenderConfig::for_tv(
