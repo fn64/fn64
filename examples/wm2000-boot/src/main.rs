@@ -143,10 +143,29 @@ fn main() {
     // surface as PNGs, independent of the swap-hash capture below.
     {
         use fn64_render::RenderBackend as _;
+        // Dump window knobs (2026-07-21 fall-through-mend rung): boot now
+        // reaches dozens of real gfx tasks, so a fixed first-8 window can no
+        // longer show the deepest frames -- let forensics runs aim the
+        // window without a rebuild.
+        let dump_limit = std::env::var("WM2000_GFX_DUMP_LIMIT")
+            .ok()
+            .map_or(8, |raw| {
+                raw.parse::<u64>().unwrap_or_else(|_| {
+                    panic!("WM2000_GFX_DUMP_LIMIT must be a u64, got {raw:?}")
+                })
+            });
+        let dump_skip = std::env::var("WM2000_GFX_DUMP_SKIP")
+            .ok()
+            .map_or(0, |raw| {
+                raw.parse::<u64>().unwrap_or_else(|_| {
+                    panic!("WM2000_GFX_DUMP_SKIP must be a u64, got {raw:?}")
+                })
+            });
         let mut backend = fn64_render_rt64::ReferenceBackend::new()
             .with_f3dex2()
             .with_clear_color([0, 0, 0, 255])
-            .with_auto_dump("/tmp/wm2000-gfx-dumps", "wm2000", 8);
+            .with_auto_dump("/tmp/wm2000-gfx-dumps", "wm2000", dump_limit)
+            .with_auto_dump_skip(dump_skip);
         backend
             .create(&fn64_render::RenderConfig::new(320, 240))
             .expect("reference backend create");
@@ -368,6 +387,33 @@ fn main() {
         });
     let snapshot_path = std::env::var_os("WM2000_SNAPSHOT_PATH").map(std::path::PathBuf::from);
 
+    // Word-probe forensics (2026-07-21 DL-cursor rung): WM2000_PROBE_WORDS=
+    // <hexaddr>,<hexaddr>,... (guest KSEG0 addresses). After every scheduler
+    // step, each probed 32-bit word is re-read; any VALUE CHANGE is logged
+    // with the step number. This is the harness-level analogue of the lldb
+    // value-change watchpoint scripts (/tmp/wm2000_watch2.py), but step-
+    // granular, deterministic, and free of debugger setup -- ideal for
+    // bracketing WHEN a guest cell first goes bad across a 250k-step run.
+    let mut probe_words: Vec<(u32, Option<u32>)> = std::env::var("WM2000_PROBE_WORDS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    let addr = u32::from_str_radix(s.trim().trim_start_matches("0x"), 16)
+                        .unwrap_or_else(|_| {
+                            panic!("WM2000_PROBE_WORDS entries must be hex guest addrs, got {s:?}")
+                        });
+                    assert!(
+                        addr >= 0x8000_0000 && addr.is_multiple_of(4),
+                        "WM2000_PROBE_WORDS addr {addr:#010x} must be a 4-aligned KSEG0 address"
+                    );
+                    (addr, None)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut tick = 0u64;
     let mut steps = 0u64;
     loop {
@@ -389,6 +435,25 @@ fn main() {
         unsafe { fn64_abi::sync_mmio_into_rdram(rdram_ptr) };
         let stepped = fn64_abi::run_one_step();
         steps += 1;
+        if !probe_words.is_empty() {
+            let view = fn64_runtime::RdramView::from_storage(&rdram);
+            for (addr, last) in probe_words.iter_mut() {
+                let cur =
+                    view.read_u32(fn64_runtime::RdramAddr::from_offset(*addr - 0x8000_0000));
+                if *last != Some(cur) {
+                    println!(
+                        "[wm2000-probe] step {steps} sim={} word {addr:#010x}: {} -> {cur:#010x}",
+                        fn64_abi::sim_time(),
+                        match *last {
+                            Some(old) => format!("{old:#010x}"),
+                            None => "(first read)".to_string(),
+                        }
+                    );
+                    let _ = std::io::stdout().flush();
+                    *last = Some(cur);
+                }
+            }
+        }
         if let (Some(target), Some(path)) = (snapshot_step, snapshot_path.as_deref()) {
             if steps == target {
                 std::fs::write(path, &rdram).expect("writing rdram snapshot");
