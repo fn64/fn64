@@ -141,20 +141,51 @@ accepted while busy are queued (capacity = the game's own
 `osCreatePiManager(cmdMsgCnt)`; NWXE passes 0x40, funcs_0.c asm
 0x800004F8) and started FIFO as each transfer completes.
 
-## Known frontier (2026-07-21): music-sequencer stub livelock
+## RESOLVED (2026-07-21): music-sequencer stub livelock
 
-With both fixes, boot progresses past the fade + asset loading into the
-AKI sound driver's sequencer tick and spins forever inside ONE
-scheduler step: `funcs_9.c` `func_80023930` (asm 0x80023A4C) loops
+Boot progressed past the fade + asset loading into the AKI sound
+driver's sequencer tick and spun forever inside ONE scheduler step:
+`funcs_9.c` `func_80023930` (asm 0x80023A4C) loops
 `while (nextEventTime - clock < 0) func_80023C20(track);` — and
 `func_80023C20` (the 0x54C-byte music-sequence command interpreter,
-`disasm/asm/1050.s` line 40933, marked `nonmatching`, dispatching
-through the `D_80047F24` jump table) was emitted as an EMPTY stub in
-RecompiledFuncs, so the track's next-event time never advances. This is
-a CORPUS repair (aki-recomp side — same class as the repaired
-`func_80000B30` boot-bootstrap stub), not an fn64 runtime divergence:
-the interpreter and its ~0x80 jump-table handlers need real
-translations before boot can reach the logo scene.
+`disasm/asm/1050.s` line 40933, marked `nonmatching`) was emitted as an
+EMPTY stub in RecompiledFuncs.
+
+Root cause was a CORPUS defect, repaired in aki-recomp (commits
+`add8b28` + `9f06f81` on the corpus side): gen_stubs.py's opcode scan
+had auto-stubbed the interpreter on two guarded IDO div-by-zero
+`break` asserts (the same false-positive class as `func_8011DFE4` /
+`func_800E1FB8`). Its dispatch is a `jalr` through `D_80047F24` — a
+function-POINTER table in .data (rom 0x48B24; 45 entries, command
+bytes 0x80–0xAC, each a handler function in 0x80022xxx/0x80025xxx),
+which N64Recomp translates fine as `LOOKUP_FUNC` — no jump-table
+declaration was needed, just un-stubbing via profile.toml
+`[syms].force_recompile`. Second rung the same day: with the
+interpreter live, the sequence's first tick issued command 0x90 into
+the still-stubbed handler `func_800226A0`; the stub's stale `$v0` made
+the dispatch loop re-read code bytes as sequence data and spin (sim
+frozen at ~16.153B). Its three div-guard siblings (`func_800226A0`,
+`func_800256AC`/`func_800257D4` = cmds 0x84/0x85, and `func_800241E8`,
+jal'd directly by the tick epilogue) were force-recompiled the same
+way.
+
+With all five repaired, boot clears the sequencer rung: gfx task
+submissions resume past the former 16.07B-cycle wall (10 tasks by
+16.12B), audio stays exactly 1/field, and the sequencer emits its
+first real voiced audio command list at sim ~16.175B.
+
+## Known frontier (2026-07-21, later): first voiced audio task blows the LLE admission bound
+
+That first real audio command list is the new wall — and this one is
+fn64-side, not corpus-side: `osSpTaskStartGo` (audio runner thread,
+`func_80001024`) submits the task, and the RSP LLE replay aborts with
+`RSP task exceeded deterministic 67108864-instruction admission bound
+at PC 0x1128` (`fn64-abi/src/task_dispatch.rs:469`). Every prior audio
+task (~10,300 silence-era fields, one per field) completed fine, so
+either the ucode loops at PC 0x1128 on some feature the LLE core
+mis-executes (first time real voices are mixed), or the sequencer is
+handing it a command list our driver-state modeling corrupted upstream.
+Needs an IMEM-level look at PC 0x1128 with the task's DMEM captured.
 
 ## Known frontier (2026-07-14)
 
