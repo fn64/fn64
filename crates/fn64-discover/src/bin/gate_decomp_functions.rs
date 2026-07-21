@@ -89,9 +89,11 @@
 
 use fn64_discover::banks::{self, materialize_rom_range, LoadImageTableInput, StaticRequestDmaInput};
 use fn64_discover::grade_oot_functions::{grade_functions, AnswerFunction, JalTargets};
-use fn64_discover::partition::{partition, same_bank_overlaps};
+use fn64_discover::partition::{
+    partition, partition_with_authoritative_entries, same_bank_overlaps,
+};
 use fn64_discover::resolve::build_cfg_closed_with_facts_and_claims;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Shortest run of consecutive boundary-plausible in-window code pointers
 /// that counts as a handler-dispatch table (see
@@ -975,7 +977,22 @@ fn main() {
         &roots,
         &claimed_edges,
     );
-    let part = partition(&cfg);
+    // Machine-checked callable entries (direct jal targets + the excused set:
+    // entrypoint, cross-bank jals, proven handler-table entries) are HARD
+    // function boundaries — a proven-callable VA cannot be the interior of
+    // another function. Passing them as authoritative entries fences each
+    // enclosing closure at the boundary, so an adjacent proven leaf whose
+    // block the previous function's fallthrough also reaches becomes its own
+    // owner instead of a 2-claimant `ambiguous` block that grades `open`.
+    // Only these excused entries re-carve geometry; unexcused seeds
+    // (script/donor matches) stay soft and still surface as `wrong` if they
+    // split a real function — the wrong==0 firewall is unchanged.
+    let authoritative_entries: BTreeSet<u32> = cfg
+        .direct_calls
+        .iter()
+        .map(|(_, target)| *target)
+        .collect();
+    let part = partition_with_authoritative_entries(&cfg, &authoritative_entries);
     let overlaps = same_bank_overlaps(&part, &cfg);
     println!(
         "CFG: {} blocks, {} direct calls, {} indirect sites, {} bounded targets resolved",
