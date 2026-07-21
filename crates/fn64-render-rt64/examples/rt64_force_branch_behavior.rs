@@ -186,10 +186,10 @@ fn settings() -> RenderRuntimeSettings {
 fn presentation() -> ViPresentation {
     ViPresentation {
         noise_seed: 0x4252_414e,
-        filters: ViFilterControl {
+        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
             pixel_type: ViPixelType::Rgba16,
             ..ViFilterControl::default()
-        },
+        }),
         ..ViPresentation::default()
     }
 }

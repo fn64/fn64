@@ -11,6 +11,7 @@
 #include <exception>
 #include <initializer_list>
 #include <limits>
+#include <stdexcept>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -554,31 +555,76 @@ void write_vi_registers(
     uint32_t output_addr,
     uint32_t width,
     uint32_t height,
-    uint32_t status,
-    bool fade_enabled,
-    uint16_t fade_factor,
-    bool repeat_line) {
-    registers[9] = status;
-    // RT64 compensates for the VI origin convention by subtracting one
-    // scanline. Supplying the following line makes decodeVI().fbAddress()
-    // equal fn64's exact physical output_addr.
-    registers[10] = output_addr + width * 2U;
-    registers[11] = width;
-    registers[15] = 525;
-    registers[16] = 3093;
-    registers[18] = (108U << 16U) | 748U;
-    registers[19] = (34U << 16U) | (34U + height * 2U);
-    registers[21] = 0x400;
+    const Fn64Rt64ViState &vi) {
+    if ((vi.registers_present > 1U) || (vi.blanked > 1U) ||
+        (vi.fade_enabled > 1U) || (vi.repeat_line > 1U) ||
+        (vi.reserved != 0U)) {
+        throw std::runtime_error("VI state contains invalid boolean or reserved fields");
+    }
+    if ((vi.fade_enabled != 0U) && (vi.repeat_line != 0U)) {
+        throw std::runtime_error("VI fade and repeat-line cannot be enabled together");
+    }
+    if (vi.fade_factor > 0x03FFU) {
+        throw std::runtime_error("VI fade factor exceeds 10 bits");
+    }
+
+    std::array<uint32_t, 14> guest{};
+    if (vi.registers_present != 0U) {
+        std::copy(std::begin(vi.registers), std::end(vi.registers), guest.begin());
+        const uint32_t h_start = (guest[9] >> 16U) & 0x03FFU;
+        const uint32_t h_end = guest[9] & 0x03FFU;
+        const uint32_t v_start = (guest[10] >> 16U) & 0x03FFU;
+        const uint32_t v_end = guest[10] & 0x03FFU;
+        const bool active_window =
+            ((h_start | h_end | v_start | v_end) != 0U);
+        if (active_window &&
+            (((guest[2] & 0x0FFFU) == 0U) || (h_end <= h_start) ||
+             (v_end <= v_start) || (((v_end - v_start) & 1U) != 0U))) {
+            throw std::runtime_error("VI register image has invalid width or active window");
+        }
+    } else {
+        const uint64_t vertical_end = 34ULL + static_cast<uint64_t>(height) * 2ULL;
+        if ((width == 0U) || (height == 0U) || (vertical_end > 0x03FFU)) {
+            throw std::runtime_error("compatibility VI geometry exceeds public register fields");
+        }
+        guest[0] = vi.registers[0];
+        guest[1] = output_addr & 0x00FFFFFFU;
+        guest[2] = width;
+        guest[6] = 525U;
+        guest[7] = 3093U;
+        guest[9] = (108U << 16U) | 748U;
+        guest[10] = (34U << 16U) | static_cast<uint32_t>(vertical_end);
+        guest[12] = 0x400U;
+        guest[13] = 0x400U;
+    }
+
+    for (size_t index = 0; index < guest.size(); ++index) {
+        registers[9 + index] = guest[index];
+    }
+    registers[9] = (vi.blanked != 0U) ? 0U : guest[0];
+    // RT64 compensates for the VI origin convention by subtracting one row,
+    // or two for an odd serrated field. Supplying the same row count makes
+    // decodeVI().fbAddress() equal the guest's exact physical VI_ORIGIN. The
+    // source stride and pixel width come from the same retained register image.
+    const uint32_t bytes_per_pixel = ((guest[0] & 3U) == 3U) ? 4U : 2U;
+    const uint32_t effective_width = guest[2] & 0x0FFFU;
+    const uint32_t origin_rows =
+        (((guest[0] & (1U << 6U)) != 0U) && ((guest[4] & 1U) != 0U)) ? 2U : 1U;
+    const uint64_t adjusted_origin =
+        static_cast<uint64_t>(guest[1] & 0x00FFFFFFU) +
+        static_cast<uint64_t>(effective_width) * bytes_per_pixel * origin_rows;
+    if (adjusted_origin > UINT32_MAX) {
+        throw std::runtime_error("VI origin compensation overflows u32");
+    }
+    registers[10] = static_cast<uint32_t>(adjusted_origin);
     // VI_Y_SCALE is `offset << 16 | scale`. A zero scale repeats one
     // sampled row; its 10-bit offset chooses the interpolation between
     // source rows zero and one. These are the hardware mechanisms behind
     // the public osViRepeatLine and osViFade scanout operations.
-    if (fade_enabled) {
-        registers[22] = static_cast<uint32_t>(fade_factor & 0x03FFU) << 16U;
-    } else if (repeat_line) {
+    if (vi.fade_enabled != 0U) {
+        registers[22] = static_cast<uint32_t>(vi.fade_factor & 0x03FFU) << 16U;
+    } else if (vi.repeat_line != 0U) {
         registers[22] = 0U;
-    } else {
-        registers[22] = 0x400U;
     }
 }
 
@@ -1090,6 +1136,7 @@ struct Fn64Rt64Context {
     uint32_t width = 320;
     uint32_t height = 240;
     uint32_t output_addr = 0;
+    Fn64Rt64ViState vi_state{};
     bool setup_complete = false;
     bool presentation_refresh_pending = false;
     bool replacement_observed_resolved_not_installed = false;
@@ -1154,6 +1201,7 @@ struct Fn64Rt64Context {
           width(width),
           height(height) {
         std::memset(placeholder_rdram.get(), 0, N64_RDRAM_SIZE);
+        vi_state.registers[0] = VI_STATUS_16_BIT;
     }
 
     ~Fn64Rt64Context() {
@@ -1338,20 +1386,27 @@ struct Fn64Rt64Context {
     }
 #endif
 
-    void update_vi(
-        uint32_t status = VI_STATUS_16_BIT,
-        bool fade_enabled = false,
-        uint16_t fade_factor = 0,
-        bool repeat_line = false) {
+    void update_vi() {
+        std::array<uint32_t, 24> next_registers = registers;
         write_vi_registers(
-            registers,
+            next_registers,
             output_addr,
             width,
             height,
-            status,
-            fade_enabled,
-            fade_factor,
-            repeat_line);
+            vi_state);
+        registers = next_registers;
+    }
+
+    void update_vi(const Fn64Rt64ViState &next_vi_state) {
+        std::array<uint32_t, 24> next_registers = registers;
+        write_vi_registers(
+            next_registers,
+            output_addr,
+            width,
+            height,
+            next_vi_state);
+        vi_state = next_vi_state;
+        registers = next_registers;
     }
 };
 
@@ -1862,47 +1917,45 @@ extern "C" int fn64_rt64_capture_adapter_inputs(
     uint32_t output_addr,
     uint32_t width,
     uint32_t height,
-    uint32_t vi_status,
-    uint8_t fade_enabled,
-    uint16_t fade_factor,
-    uint8_t repeat_line,
+    const Fn64Rt64ViState *vi,
     Fn64Rt64AdapterCapture *capture,
     char *error,
     size_t error_capacity) {
-    if ((task == nullptr) || (capture == nullptr)) {
-        set_error(error, error_capacity, "null OSTask or adapter-capture pointer");
-        return 0;
-    }
-    if ((width == 0U) || (height == 0U)) {
-        set_error(error, error_capacity, "capture dimensions must be non-zero");
-        return 0;
-    }
-    if ((fade_enabled != 0U) && (repeat_line != 0U)) {
-        set_error(error, error_capacity, "VI fade and repeat-line cannot be enabled together");
-        return 0;
-    }
-    if (fade_factor > 0x03FFU) {
-        set_error(error, error_capacity, "VI fade factor exceeds 10 bits");
-        return 0;
-    }
+    try {
+        if ((task == nullptr) || (vi == nullptr) || (capture == nullptr)) {
+            set_error(error, error_capacity, "null OSTask, VI-state, or adapter-capture pointer");
+            return 0;
+        }
+        if ((width == 0U) || (height == 0U)) {
+            set_error(error, error_capacity, "capture dimensions must be non-zero");
+            return 0;
+        }
 
-    *capture = Fn64Rt64AdapterCapture{};
-    capture->task = *task;
-    capture->output_addr = output_addr & 0x00FFFFFFU;
-    capture->width = width;
-    capture->height = height;
-    std::array<uint32_t, 24> registers{};
-    write_vi_registers(
-        registers,
-        capture->output_addr,
-        width,
-        height,
-        vi_status,
-        fade_enabled != 0U,
-        fade_factor,
-        repeat_line != 0U);
-    std::copy(registers.begin(), registers.end(), capture->registers);
-    return 1;
+        *capture = Fn64Rt64AdapterCapture{};
+        capture->task = *task;
+        capture->output_addr = output_addr & 0x00FFFFFFU;
+        capture->width = width;
+        capture->height = height;
+        Fn64Rt64Context context(width, height);
+        context.output_addr = capture->output_addr;
+        context.update_vi(*vi);
+        std::copy(context.registers.begin(), context.registers.end(), capture->registers);
+        // Every HLE/raw submission and resize takes this no-argument path.
+        // It must refresh address aliases without replacing the last complete
+        // presentation-owned VI register image.
+        context.update_vi();
+        std::copy(
+            context.registers.begin(),
+            context.registers.end(),
+            capture->registers_after_submission);
+        return 1;
+    } catch (const std::exception &exception) {
+        set_error(error, error_capacity, std::string("RT64 adapter capture threw: ") + exception.what());
+        return 0;
+    } catch (...) {
+        set_error(error, error_capacity, "RT64 adapter capture failed with an unknown C++ exception");
+        return 0;
+    }
 }
 
 extern "C" int fn64_rt64_roundtrip_user_config(
@@ -2945,24 +2998,12 @@ extern "C" int fn64_rt64_process_rdp_commands(
 
 extern "C" int fn64_rt64_present(
     Fn64Rt64Context *context,
-    uint32_t vi_status,
-    uint8_t fade_enabled,
-    uint16_t fade_factor,
-    uint8_t repeat_line,
+    const Fn64Rt64ViState *vi,
     char *error,
     size_t error_capacity) {
     try {
-        if ((context == nullptr) || !context->setup_complete) {
+        if ((context == nullptr) || (vi == nullptr) || !context->setup_complete) {
             set_error(error, error_capacity, "RT64 context is not initialized");
-            return 0;
-        }
-
-        if ((fade_enabled != 0U) && (repeat_line != 0U)) {
-            set_error(error, error_capacity, "VI fade and repeat-line cannot be enabled together");
-            return 0;
-        }
-        if (fade_factor > 0x03FFU) {
-            set_error(error, error_capacity, "VI fade factor exceeds 10 bits");
             return 0;
         }
 
@@ -2977,11 +3018,7 @@ extern "C" int fn64_rt64_present(
             context->present_capture_error.clear();
         }
 
-        context->update_vi(
-            vi_status,
-            fade_enabled != 0U,
-            fade_factor,
-            repeat_line != 0U);
+        context->update_vi(*vi);
         const uint64_t previous_present = context->application->state->presentId;
         diagnostic.present_before = previous_present;
 #if defined(__APPLE__)
@@ -5325,10 +5362,24 @@ extern "C" int fn64_rt64_read_ubershader_evidence(
     }
 }
 
-extern "C" void fn64_rt64_resize(Fn64Rt64Context *context, uint32_t width, uint32_t height) {
-    if ((context == nullptr) || (width == 0) || (height == 0)) {
-        return;
-    }
+extern "C" int fn64_rt64_resize(
+    Fn64Rt64Context *context,
+    uint32_t width,
+    uint32_t height,
+    char *error,
+    size_t error_capacity) {
+    try {
+        if ((context == nullptr) || (width == 0) || (height == 0)) {
+            set_error(error, error_capacity, "RT64 resize requires a live context and non-zero dimensions");
+            return 0;
+        }
+        std::array<uint32_t, 24> next_registers = context->registers;
+        write_vi_registers(
+            next_registers,
+            context->output_addr,
+            width,
+            height,
+            context->vi_state);
 #if defined(__APPLE__)
     // Plume derives the next Metal drawable size from the native window; VI
     // dimensions alone leave the swapchain at its creation geometry.
@@ -5374,7 +5425,15 @@ extern "C" void fn64_rt64_resize(Fn64Rt64Context *context, uint32_t width, uint3
 #endif
     context->width = width;
     context->height = height;
-    context->update_vi();
+    context->registers = next_registers;
+        return 1;
+    } catch (const std::exception &exception) {
+        set_error(error, error_capacity, std::string("RT64 resize threw: ") + exception.what());
+        return 0;
+    } catch (...) {
+        set_error(error, error_capacity, "RT64 resize failed with an unknown C++ exception");
+        return 0;
+    }
 }
 
 extern "C" void fn64_rt64_destroy(Fn64Rt64Context *context) {

@@ -855,6 +855,30 @@ pub(crate) fn write_raw_mmio_word(vaddr: u64, value: u32) -> bool {
 
 /// Commit due device work before any executor resume is possible.
 pub(crate) fn advance_device_time(now: u64) {
+    loop {
+        let step = with_host(|host| {
+            let current = host.device_fabric.now().get();
+            assert!(
+                now >= current,
+                "device time moved backwards from {current} to {now}"
+            );
+            host.device_fabric
+                .next_deadline()
+                .filter(|deadline| deadline.get() <= now)
+                .map_or(now, fn64_runtime::Cycles::get)
+        });
+        advance_device_time_step(step);
+        if step == now {
+            break;
+        }
+    }
+}
+
+/// Advance through exactly one due device deadline. Keeping notification
+/// handling at this boundary lets a VI mode latch reschedule the following
+/// field before the fabric advances again, while executor wakeups remain
+/// deferred until the committed event has been converted to owned messages.
+fn advance_device_time_step(now: u64) {
     if crate::boot_probe_enabled() {
         let next = with_host(|host| host.device_fabric.next_deadline().map(|d| d.get()));
         if next.is_some_and(|d| d <= now) {
@@ -864,8 +888,7 @@ pub(crate) fn advance_device_time(now: u64) {
     enum ReadyNotification {
         External(ExternalEvent),
         ViRetrace {
-            status: u32,
-            resample: Option<fn64_render::ViResampleControl>,
+            scanout: fn64_render::ViScanoutState,
             noise_seed: u64,
         },
     }
@@ -1042,7 +1065,12 @@ pub(crate) fn advance_device_time(now: u64) {
                         OS_EVENT_SI,
                     )));
                 }
-                DeviceNotification::ViRetrace => {
+                DeviceNotification::ViRetrace { at } => {
+                    assert_eq!(
+                        host.device_fabric.now(),
+                        at,
+                        "VI retrace notification escaped its device deadline"
+                    );
                     if let Some(mode) = host.pending_vi_mode.take() {
                         const FIELD_REGISTER_INDICES: [usize; 5] = [1, 13, 10, 11, 3];
                         for (index, value) in mode.registers.into_iter().enumerate() {
@@ -1124,30 +1152,21 @@ pub(crate) fn advance_device_time(now: u64) {
                                 panic!("VI framebuffer-origin latch failed: {error}")
                             });
                     }
-                    let status = host
-                        .device_fabric
-                        .read_mmio(MmioAddr::new(0xA440_0000))
-                        .expect("VI_STATUS register is not mapped");
-                    let resample = host.active_vi_mode.map(|_| {
-                        let x_scale = host
+                    let mut words = [0u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
+                    for (index, word) in words.iter_mut().enumerate() {
+                        let address = 0xA440_0000
+                            + u32::try_from(index).expect("VI register index exceeds u32") * 4;
+                        *word = host
                             .device_fabric
-                            .read_mmio(MmioAddr::new(0xA440_0030))
-                            .expect("VI_X_SCALE register is not mapped");
-                        let y_scale = host
-                            .device_fabric
-                            .read_mmio(MmioAddr::new(0xA440_0034))
-                            .expect("VI_Y_SCALE register is not mapped");
-                        fn64_render::ViResampleControl::from_registers(
-                            x_scale,
-                            y_scale,
-                            status,
-                            host.device_fabric.vi_field(),
-                        )
-                    });
+                            .read_mmio(MmioAddr::new(address))
+                            .expect("complete VI register image is not mapped");
+                    }
+                    let scanout = fn64_render::ViScanoutState::Registers(
+                        fn64_render::ViScanoutRegisters::from_words(words),
+                    );
                     events.push(ReadyNotification::ViRetrace {
-                        status,
-                        resample,
-                        noise_seed: host.device_fabric.now().get(),
+                        scanout,
+                        noise_seed: at.get(),
                     });
                 }
                 DeviceNotification::RcpTaskComplete(completion) => {
@@ -1190,21 +1209,18 @@ pub(crate) fn advance_device_time(now: u64) {
                         exec.inject_event(event);
                     }
                     ReadyNotification::ViRetrace {
-                        status,
-                        resample,
+                        scanout,
                         noise_seed,
                     } => {
                         vi_ticks = vi_ticks.saturating_add(1);
-                        if exec.deliver_vi_retrace() {
-                            presentations.push(fn64_render::ViPresentation {
-                                blanked: exec.vi().blanked,
-                                fade: exec.vi().fade,
-                                repeat_line: exec.vi().repeat_line,
-                                filters: fn64_render::ViFilterControl::from_status(status),
-                                resample,
-                                noise_seed,
-                            });
-                        }
+                        exec.deliver_vi_retrace();
+                        presentations.push(fn64_render::ViPresentation {
+                            blanked: exec.vi().blanked,
+                            fade: exec.vi().fade,
+                            repeat_line: exec.vi().repeat_line,
+                            scanout,
+                            noise_seed,
+                        });
                     }
                 }
             }

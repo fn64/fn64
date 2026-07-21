@@ -8,7 +8,7 @@ use fn64_render::{
     RenderInternalColorFormat, RenderPresentationMode, RenderRefreshRate,
     RenderReplacementAutoPath, RenderReplacementOperation, RenderReplacementPackIdentity,
     RenderReplacementShift, RenderResolution, RenderRuntimeSettings, RenderUpscale2d,
-    ResolutionMultiplier, ViPixelType, ViPresentation,
+    ResolutionMultiplier, ViPixelType, ViPresentation, ViScanoutState,
 };
 use fn64_runtime::{RspMemAddr, RspMemory, RspMemoryBank};
 
@@ -90,9 +90,10 @@ struct RawAdapterCapture {
     width: u32,
     height: u32,
     registers: [u32; 24],
+    registers_after_submission: [u32; 24],
 }
 
-const _: [(); 41 * std::mem::size_of::<u32>()] = [(); std::mem::size_of::<RawAdapterCapture>()];
+const _: [(); 65 * std::mem::size_of::<u32>()] = [(); std::mem::size_of::<RawAdapterCapture>()];
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -1426,34 +1427,47 @@ impl TryFrom<RawUserConfig> for RenderRuntimeSettings {
 }
 
 #[derive(Copy, Clone)]
+#[repr(C)]
 struct RawVi {
-    status: u32,
+    registers: [u32; 14],
+    registers_present: u8,
+    blanked: u8,
     fade_enabled: u8,
-    fade_factor: u16,
     repeat_line: u8,
+    fade_factor: u16,
+    reserved: u16,
 }
 
+const _: [(); 64] = [(); std::mem::size_of::<RawVi>()];
+
 fn raw_vi(vi: ViPresentation) -> Result<RawVi, String> {
-    let pixel_type = match vi.filters.pixel_type {
-        ViPixelType::Unspecified | ViPixelType::Rgba16 => 2,
-        ViPixelType::Rgba32 => 3,
-        ViPixelType::Blank => 0,
+    let filters = vi.scanout.filters();
+    let pixel_type = match filters.pixel_type {
+        ViPixelType::Unspecified | ViPixelType::Rgba16 => 2u32,
+        ViPixelType::Rgba32 => 3u32,
+        ViPixelType::Blank => 0u32,
         ViPixelType::Reserved => return Err("VI STATUS selects reserved pixel type 1".into()),
     };
-    let mut status = pixel_type;
-    status |= vi.filters.antialias_mode.status_bits().unwrap_or(0);
-    status |= u32::from(vi.filters.gamma_dither) << 2;
-    status |= u32::from(vi.filters.gamma) << 3;
-    status |= u32::from(vi.filters.divot) << 4;
-    status |= u32::from(vi.filters.dither_filter) << 16;
-    if vi.blanked {
-        status = 0;
+    let (registers_present, mut registers) = match vi.scanout {
+        ViScanoutState::BackendOnly(_) => (0, [0; 14]),
+        ViScanoutState::Registers(registers) => (1, registers.words()),
+    };
+    if registers_present == 0 {
+        registers[0] = pixel_type
+            | filters.antialias_mode.status_bits().unwrap_or(0)
+            | (u32::from(filters.gamma_dither) << 2)
+            | (u32::from(filters.gamma) << 3)
+            | (u32::from(filters.divot) << 4)
+            | (u32::from(filters.dither_filter) << 16);
     }
     Ok(RawVi {
-        status,
+        registers,
+        registers_present,
+        blanked: u8::from(vi.blanked),
         fade_enabled: u8::from(vi.fade.is_some()),
-        fade_factor: vi.fade.unwrap_or(0),
         repeat_line: u8::from(vi.repeat_line),
+        fade_factor: vi.fade.unwrap_or(0),
+        reserved: 0,
     })
 }
 
@@ -1490,10 +1504,7 @@ unsafe extern "C" {
         output_addr: u32,
         width: u32,
         height: u32,
-        vi_status: u32,
-        fade_enabled: u8,
-        fade_factor: u16,
-        repeat_line: u8,
+        vi: *const RawVi,
         capture: *mut RawAdapterCapture,
         error: *mut c_char,
         error_capacity: usize,
@@ -1594,10 +1605,7 @@ unsafe extern "C" {
     ) -> c_int;
     fn fn64_rt64_present(
         context: *mut RawContext,
-        vi_status: u32,
-        fade_enabled: u8,
-        fade_factor: u16,
-        repeat_line: u8,
+        vi: *const RawVi,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
@@ -1740,7 +1748,13 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_resize(context: *mut RawContext, width: u32, height: u32);
+    fn fn64_rt64_resize(
+        context: *mut RawContext,
+        width: u32,
+        height: u32,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
     fn fn64_rt64_destroy(context: *mut RawContext);
 }
 
@@ -1764,10 +1778,7 @@ pub(crate) fn capture_adapter_inputs(
             output_addr,
             width,
             height,
-            vi.status,
-            vi.fade_enabled,
-            vi.fade_factor,
-            vi.repeat_line,
+            &vi,
             &mut capture,
             error.as_mut_ptr(),
             error.len(),
@@ -1785,6 +1796,7 @@ pub(crate) fn capture_adapter_inputs(
         width: capture.width,
         height: capture.height,
         registers: capture.registers,
+        registers_after_submission: capture.registers_after_submission,
     })
 }
 
@@ -2309,17 +2321,8 @@ impl Context {
         // SAFETY: the opaque context is alive and uniquely borrowed for the
         // synchronous presentation call. Every scalar is passed by value;
         // `ViPresentation` has already bounded fade to the public 10 bits.
-        let ok = unsafe {
-            fn64_rt64_present(
-                self.0.as_ptr(),
-                vi.status,
-                vi.fade_enabled,
-                vi.fade_factor,
-                vi.repeat_line,
-                error.as_mut_ptr(),
-                error.len(),
-            )
-        };
+        let ok =
+            unsafe { fn64_rt64_present(self.0.as_ptr(), &vi, error.as_mut_ptr(), error.len()) };
         if ok != 0 {
             Ok(())
         } else {
@@ -3067,8 +3070,23 @@ impl Context {
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
+        let mut error = [0; ERROR_CAPACITY];
         // SAFETY: the opaque context is alive and uniquely borrowed.
-        unsafe { fn64_rt64_resize(self.0.as_ptr(), width, height) };
+        let ok = unsafe {
+            fn64_rt64_resize(
+                self.0.as_ptr(),
+                width,
+                height,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert_ne!(
+            ok,
+            0,
+            "{}",
+            error_string(&error, "RT64 resize failed without a diagnostic")
+        );
     }
 }
 
@@ -3093,24 +3111,61 @@ mod tests {
             (fn64_render::ViAaMode::Replicate, 3 << 8),
         ] {
             let vi = ViPresentation {
-                filters: fn64_render::ViFilterControl {
+                scanout: ViScanoutState::BackendOnly(fn64_render::ViFilterControl {
                     pixel_type: ViPixelType::Rgba16,
                     antialias_mode: mode,
                     ..Default::default()
-                },
+                }),
                 ..Default::default()
             };
-            assert_eq!(raw_vi(vi).unwrap().status & (3 << 8), bits);
+            assert_eq!(raw_vi(vi).unwrap().registers[0] & (3 << 8), bits);
         }
 
         let unspecified = ViPresentation {
-            filters: fn64_render::ViFilterControl {
+            scanout: ViScanoutState::BackendOnly(fn64_render::ViFilterControl {
                 pixel_type: ViPixelType::Rgba16,
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         };
-        assert_eq!(raw_vi(unspecified).unwrap().status & (3 << 8), 0);
+        assert_eq!(raw_vi(unspecified).unwrap().registers[0] & (3 << 8), 0);
+    }
+
+    #[test]
+    fn cpp_vi_ingress_rejects_an_odd_half_line_extent() {
+        let task = RawTask::default();
+        let mut vi = RawVi {
+            registers: [0; 14],
+            registers_present: 1,
+            blanked: 0,
+            fade_enabled: 0,
+            repeat_line: 0,
+            fade_factor: 0,
+            reserved: 0,
+        };
+        vi.registers[0] = 3;
+        vi.registers[2] = 320;
+        vi.registers[9] = 0x006c_02ec;
+        vi.registers[10] = 0x0025_0200;
+        let mut capture = RawAdapterCapture::default();
+        let mut error = [0; ERROR_CAPACITY];
+        // SAFETY: every pointer references a live fixed-size C-layout value;
+        // the adapter capture retains none of them.
+        let ok = unsafe {
+            fn64_rt64_capture_adapter_inputs(
+                &task,
+                0,
+                320,
+                240,
+                &vi,
+                &mut capture,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert_eq!(ok, 0);
+        assert!(error_string(&error, "missing malformed-VI diagnostic")
+            .contains("invalid width or active window"));
     }
 
     fn present_capture_wire(format: u32) -> RawPresentCapture {

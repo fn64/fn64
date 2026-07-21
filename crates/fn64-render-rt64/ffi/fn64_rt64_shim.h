@@ -27,12 +27,23 @@ typedef struct Fn64Rt64Task {
     uint32_t data_size;
 } Fn64Rt64Task;
 
+typedef struct Fn64Rt64ViState {
+    uint32_t registers[14];
+    uint8_t registers_present;
+    uint8_t blanked;
+    uint8_t fade_enabled;
+    uint8_t repeat_line;
+    uint16_t fade_factor;
+    uint16_t reserved;
+} Fn64Rt64ViState;
+
 typedef struct Fn64Rt64AdapterCapture {
     Fn64Rt64Task task;
     uint32_t output_addr;
     uint32_t width;
     uint32_t height;
     uint32_t registers[24];
+    uint32_t registers_after_submission[24];
 } Fn64Rt64AdapterCapture;
 
 enum {
@@ -418,7 +429,8 @@ typedef struct Fn64Rt64TextureReplacementState {
 
 #ifdef __cplusplus
 static_assert(sizeof(Fn64Rt64Task) == 14 * sizeof(uint32_t));
-static_assert(sizeof(Fn64Rt64AdapterCapture) == 41 * sizeof(uint32_t));
+static_assert(sizeof(Fn64Rt64ViState) == 64);
+static_assert(sizeof(Fn64Rt64AdapterCapture) == 65 * sizeof(uint32_t));
 static_assert(sizeof(Fn64Rt64PresentCapture) == 48);
 static_assert(sizeof(Fn64Rt64PresentSelection) == 32);
 static_assert(sizeof(Fn64Rt64DeferredWorkloadSnapshot) == 328);
@@ -444,10 +456,7 @@ int fn64_rt64_capture_adapter_inputs(
     uint32_t output_addr,
     uint32_t width,
     uint32_t height,
-    uint32_t vi_status,
-    uint8_t fade_enabled,
-    uint16_t fade_factor,
-    uint8_t repeat_line,
+    const Fn64Rt64ViState *vi,
     Fn64Rt64AdapterCapture *capture,
     char *error,
     size_t error_capacity);
@@ -585,10 +594,7 @@ int fn64_rt64_process_rdp_commands(
 
 int fn64_rt64_present(
     Fn64Rt64Context *context,
-    uint32_t vi_status,
-    uint8_t fade_enabled,
-    uint16_t fade_factor,
-    uint8_t repeat_line,
+    const Fn64Rt64ViState *vi,
     char *error,
     size_t error_capacity);
 
@@ -754,7 +760,12 @@ int fn64_rt64_read_ubershader_evidence(
     char *error,
     size_t error_capacity);
 
-void fn64_rt64_resize(Fn64Rt64Context *context, uint32_t width, uint32_t height);
+int fn64_rt64_resize(
+    Fn64Rt64Context *context,
+    uint32_t width,
+    uint32_t height,
+    char *error,
+    size_t error_capacity);
 void fn64_rt64_destroy(Fn64Rt64Context *context);
 
 #ifdef __cplusplus

@@ -858,14 +858,23 @@ task calls out:
   `osViGetCurrentLine`, `osViGetCurrentField`, `osViGetStatus`, and
   `osViGetCurrentMode` query that live state; a queued mode does not become
   current until the interrupt latch.
-  At the interrupt, pending mode/scales/blanking/framebuffer state becomes
+  Device advancement stops at each due deadline rather than collecting
+  multiple field notifications at the final requested cycle. At each VI
+  interrupt, pending mode/scales/blanking/framebuffer state becomes
   current before the general OS_EVENT_VI target or `osViSetEvent` target can
   wake. The general event fires every field; the VI-manager target honors its
   public nonzero `retraceCount` divisor independently. Framebuffer,
-  black/unblack, and special-feature transitions each trigger the renderer
-  only after that latch. The live `VI_STATUS` value is decoded once into typed
-  pixel/gamma/gamma-dither/divot/dither-filter state and crosses the renderer
-  boundary with `ViPresentation`; the Rust
+  black/unblack, and special-feature transitions become visible only after
+  that latch. Every field triggers the renderer, including unchanged
+  progressive register images: field cadence and the retrace-cycle noise seed
+  are scanout inputs in their own right. One `ViScanoutRegisters` value
+  snapshots all fourteen live words after field selection; it crosses the
+  renderer boundary atomically with `ViPresentation`, so origin, source width,
+  timing, active H/V window, X/Y scale, STATUS filters, event cycle, and sampled
+  field cannot drift independently even when one checkpoint jump spans multiple
+  fields. A jointly
+  zero H/V window stays an inactive live register image rather than selecting
+  backend compatibility geometry. The Rust
   reference backend keeps its RDP image separate from VI scanout, presents
   black without erasing that image, implements the public `osViFade` 10-bit
   interpolation of its first two rows, implements `osViRepeatLine`, and
@@ -876,6 +885,13 @@ task calls out:
   exact implemented arithmetic and the boundary between public mechanism,
   deterministic host policy, bounded hardware-unverified coverage
   AA/resampling, and post-DAC analog behavior are recorded in `VI-FILTERS.md`.
+  Its post-VI allocation uses the public H start/end pixel extent and V
+  start/end half-line extent independently of the RDP source dimensions; the
+  same coordinate generators implement filtered modes and mode-3 replication.
+  RT64 also consumes the live VI origin and effective 12-bit source stride. The
+  deterministic reference path retains those words but still samples its
+  resident RDP framebuffer; arbitrary origin/stride RDRAM source selection is
+  therefore an explicit remaining implementation boundary, not a parity claim.
   Those mechanisms follow the
   public VI manual and the clean-room hardware descriptions in
   [US 6,166,748](https://patents.google.com/patent/US6166748A/en) and
@@ -889,12 +905,15 @@ task calls out:
   for general N64 software in both C and Rust-recompiler host-call lanes.
   Enabling black with an effective Y scale other than the manual-required 1.0
   traps loudly, as do blacking while fade/repeat is active and enabling fade
-  and repeat together. The RT64 adapter sends the same typed state through its
-  quarantined C boundary and programs the VI mechanisms directly: disabled
-  pixel type for black, zero Y scale for repeat-line, and zero Y scale plus
-  the 10-bit Y subpixel offset for fade. This was feature-compiled and its
-  Rust/C/C++ ABI exercised by the RT64 unit build; pixel-level GPU capture is
-  still an integration gate. A typed IPL television standard is
+  and repeat together. The RT64 adapter sends the complete register image
+  through its quarantined C boundary, compensates RT64's origin convention
+  with the image's own source width and RGBA16/RGBA32 pixel size, and retains
+  that image when later HLE/raw submissions or resizes refresh address aliases.
+  Black still disables pixel type, repeat-line uses zero Y scale, and fade uses
+  zero Y scale plus the 10-bit Y subpixel offset without discarding the retained
+  image. The no-device adapter capture proves the first and post-submission
+  24-word RT64 images are identical; pixel-level GPU capture of nondefault
+  active geometry remains an integration gate. A typed IPL television standard is
   the common VI/AI clock authority. Before a mode exists, VI uses the public
   nominal 60 Hz NTSC/MPAL or 50 Hz PAL rate; once H_SYNC and V_SYNC are
   nonzero, their public line/half-line units derive the next guest-cycle field

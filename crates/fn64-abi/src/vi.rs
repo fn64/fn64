@@ -445,9 +445,64 @@ pub unsafe extern "C" fn osViGetCurrentMode_recomp(_rdram: *mut u8, ctx: *mut Re
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use fn64_render::{FrameStatus, RenderConfig, RenderError, UcodeId};
+    use std::sync::{Arc, Mutex};
+
+    struct ViCaptureBackend {
+        presentations: Arc<Mutex<Vec<fn64_render::ViPresentation>>>,
+    }
+
+    impl RenderBackend for ViCaptureBackend {
+        fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn observe_non_rdp_write16(
+            &mut self,
+            _write: fn64_render::NonRdpWrite16,
+        ) -> fn64_render::NonRdpWrite16Disposition {
+            fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+        }
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            _task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            Ok(FrameStatus::Complete)
+        }
+
+        fn present(
+            &mut self,
+            presentation: fn64_render::ViPresentation,
+        ) -> Result<(), RenderError> {
+            self.presentations.lock().unwrap().push(presentation);
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[UcodeId] {
+            &[]
+        }
+    }
+
+    fn install_vi_capture_backend() -> Arc<Mutex<Vec<fn64_render::ViPresentation>>> {
+        let presentations = Arc::new(Mutex::new(Vec::new()));
+        set_render_backend(
+            Box::new(ViCaptureBackend {
+                presentations: Arc::clone(&presentations),
+            }),
+            0,
+        );
+        presentations
+    }
 
     #[test]
     fn os_vi_scale_shims_latch_mode_relative_fixed_point_registers() {
+        crate::test_support::install_complete_render_backend(0);
         let mut rdram = vec![0u8; 0x100];
         let mode = RdramAddr::from_offset(0x20);
         {
@@ -525,6 +580,8 @@ mod tests {
             view.write_u32(mode.checked_add(4).unwrap(), 0x0000_0002);
             view.write_u32(mode.checked_add(8).unwrap(), 320);
             view.write_u32(mode.checked_add(16).unwrap(), 525);
+            view.write_u32(mode.checked_add(28).unwrap(), 0x006c_02ec);
+            view.write_u32(mode.checked_add(48).unwrap(), 0x0025_01ff);
             view.write_u32(mode.checked_add(40).unwrap(), 0);
             view.write_u32(mode.checked_add(56).unwrap(), 100);
         }
@@ -599,15 +656,16 @@ mod tests {
             view.write_u32(mode.checked_add(4).unwrap(), 0x42);
             view.write_u32(mode.checked_add(8).unwrap(), 320);
             view.write_u32(mode.checked_add(16).unwrap(), 525);
+            view.write_u32(mode.checked_add(28).unwrap(), 0x006c_02ec);
             for (offset, value) in [
                 (40, 0x20),
                 (44, 0x111),
-                (48, 0x122),
+                (48, 0x0025_01ff),
                 (52, 0x133),
                 (56, 0),
                 (60, 0x80),
                 (64, 0x211),
-                (68, 0x222),
+                (68, 0x0026_0200),
                 (72, 0x233),
                 (76, 0),
             ] {
@@ -632,7 +690,7 @@ mod tests {
         for (address, expected) in [
             (0xFFFF_FFFF_A440_0004, 0x1080),
             (0xFFFF_FFFF_A440_0034, 0x211),
-            (0xFFFF_FFFF_A440_0028, 0x222),
+            (0xFFFF_FFFF_A440_0028, 0x0026_0200),
             (0xFFFF_FFFF_A440_002C, 0x233),
         ] {
             assert_eq!(crate::pi::read_live_device_mmio(address), Some(expected));
@@ -643,7 +701,7 @@ mod tests {
         for (address, expected) in [
             (0xFFFF_FFFF_A440_0004, 0x1020),
             (0xFFFF_FFFF_A440_0034, 0x111),
-            (0xFFFF_FFFF_A440_0028, 0x122),
+            (0xFFFF_FFFF_A440_0028, 0x0025_01ff),
             (0xFFFF_FFFF_A440_002C, 0x133),
         ] {
             assert_eq!(crate::pi::read_live_device_mmio(address), Some(expected));
@@ -652,6 +710,7 @@ mod tests {
 
     #[test]
     fn os_vi_query_shims_report_live_status_line_and_interlaced_field() {
+        crate::test_support::install_complete_render_backend(0);
         let base = with_host(|host| host.device_fabric.now().get());
         assert!(crate::pi::write_live_device_mmio(
             0xFFFF_FFFF_A440_0000,
@@ -728,7 +787,7 @@ mod tests {
             last_blanked: Arc<AtomicU32>,
             last_fade: Arc<AtomicU32>,
             last_repeat_line: Arc<AtomicU32>,
-            last_resample: Arc<Mutex<Option<fn64_render::ViResampleControl>>>,
+            last_scanout: Arc<Mutex<Option<fn64_render::ViScanoutState>>>,
         }
 
         impl RenderBackend for CountingBackend {
@@ -760,7 +819,7 @@ mod tests {
                     .store(vi.fade.map_or(u32::MAX, u32::from), Ordering::SeqCst);
                 self.last_repeat_line
                     .store(u32::from(vi.repeat_line), Ordering::SeqCst);
-                *self.last_resample.lock().unwrap() = vi.resample;
+                *self.last_scanout.lock().unwrap() = Some(vi.scanout);
                 self.presents.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
@@ -776,14 +835,14 @@ mod tests {
         let last_blanked = Arc::new(AtomicU32::new(0));
         let last_fade = Arc::new(AtomicU32::new(u32::MAX));
         let last_repeat_line = Arc::new(AtomicU32::new(0));
-        let last_resample = Arc::new(Mutex::new(None));
+        let last_scanout = Arc::new(Mutex::new(None));
         set_render_backend(
             Box::new(CountingBackend {
                 presents: Arc::clone(&presents),
                 last_blanked: Arc::clone(&last_blanked),
                 last_fade: Arc::clone(&last_fade),
                 last_repeat_line: Arc::clone(&last_repeat_line),
-                last_resample: Arc::clone(&last_resample),
+                last_scanout: Arc::clone(&last_scanout),
             }),
             0,
         );
@@ -793,8 +852,18 @@ mod tests {
         {
             let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
             view.write_u32(mode.checked_add(4).unwrap(), 2);
+            view.write_u32(mode.checked_add(8).unwrap(), 320);
+            view.write_u32(mode.checked_add(12).unwrap(), 0x03e5_2239);
+            view.write_u32(mode.checked_add(16).unwrap(), 525);
+            view.write_u32(mode.checked_add(20).unwrap(), 3093);
+            view.write_u32(mode.checked_add(24).unwrap(), 0x0c15_0c15);
+            view.write_u32(mode.checked_add(28).unwrap(), 0x006c_02ec);
             view.write_u32(mode.checked_add(32).unwrap(), 0x0100_0400);
+            view.write_u32(mode.checked_add(40).unwrap(), 0x80);
             view.write_u32(mode.checked_add(44).unwrap(), 0x0200_0400);
+            view.write_u32(mode.checked_add(48).unwrap(), 0x0025_01ff);
+            view.write_u32(mode.checked_add(52).unwrap(), 0x000e_0204);
+            view.write_u32(mode.checked_add(56).unwrap(), 100);
             view.write_u32(mode.checked_add(64).unwrap(), 0x0300_0400);
         }
         let mut mode_ctx = ctx_zeroed();
@@ -811,12 +880,40 @@ mod tests {
         crate::advance_virtual_time(base + 10);
         assert_eq!(presents.load(Ordering::SeqCst), 1);
         assert_eq!(last_blanked.load(Ordering::SeqCst), 0);
-        let resample = last_resample.lock().unwrap().unwrap();
+        let scanout = last_scanout.lock().unwrap().unwrap();
+        let registers = scanout.registers().unwrap();
+        assert_eq!(
+            registers.words(),
+            [
+                2,
+                0x0010_0080,
+                320,
+                100,
+                0,
+                0x03e5_2239,
+                525,
+                3093,
+                0x0c15_0c15,
+                0x006c_02ec,
+                0x0025_01ff,
+                0x000e_0204,
+                0x0100_0400,
+                0x0200_0400,
+            ]
+        );
+        let resample = registers.resample();
         assert_eq!(resample.x.step_u2_10(), 0x400);
         assert_eq!(resample.x.offset_u2_10(), 0x100);
         assert_eq!(resample.y.step_u2_10(), 0x400);
         assert_eq!(resample.y.offset_u2_10(), 0x200);
         assert_eq!(resample.field, fn64_render::ViScanoutField::Progressive);
+        let active_window = registers.active_window().unwrap();
+        assert_eq!(active_window.horizontal_register(), 0x006c_02ec);
+        assert_eq!(active_window.vertical_register(), 0x0025_01ff);
+        assert_eq!(
+            (active_window.output_width(), active_window.output_height()),
+            (640, 237)
+        );
 
         ctx.r4 = 1;
         unsafe { osViBlack_recomp(std::ptr::null_mut(), &mut ctx) };
@@ -850,5 +947,137 @@ mod tests {
         assert_eq!(presents.load(Ordering::SeqCst), 6);
         assert_eq!(last_repeat_line.load(Ordering::SeqCst), 1);
         assert_eq!(last_render_error(), None);
+    }
+
+    #[test]
+    fn batched_retraces_present_each_interlaced_field_at_its_deadline() {
+        let presentations = install_vi_capture_backend();
+
+        let mut rdram = vec![0u8; 0x100];
+        let mode = RdramAddr::from_offset(0x20);
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            view.write_u32(mode.checked_add(4).unwrap(), 2 | (1 << 6));
+            view.write_u32(mode.checked_add(8).unwrap(), 320);
+            view.write_u32(mode.checked_add(16).unwrap(), 525);
+            view.write_u32(mode.checked_add(28).unwrap(), 0x006c_02ec);
+            view.write_u32(mode.checked_add(32).unwrap(), 0x0100_0400);
+            view.write_u32(mode.checked_add(40).unwrap(), 0x20);
+            view.write_u32(mode.checked_add(44).unwrap(), 0x0200_0400);
+            view.write_u32(mode.checked_add(48).unwrap(), 0x0026_0200);
+            view.write_u32(mode.checked_add(60).unwrap(), 0x40);
+            view.write_u32(mode.checked_add(64).unwrap(), 0x0300_0400);
+            view.write_u32(mode.checked_add(68).unwrap(), 0x0025_01ff);
+        }
+        let mut mode_ctx = ctx_zeroed();
+        mode_ctx.r4 = u64::from(mode.to_kseg0());
+        unsafe { osViSetMode_recomp(rdram.as_mut_ptr(), &mut mode_ctx) };
+
+        let mut swap_ctx = ctx_zeroed();
+        swap_ctx.r4 = 0x8010_0000;
+        unsafe { osViSwapBuffer_recomp(std::ptr::null_mut(), &mut swap_ctx) };
+
+        let base = with_host(|host| host.device_fabric.now().get());
+        arm_vi_retrace(10);
+        crate::advance_virtual_time(base + 40);
+
+        let captured = presentations.lock().unwrap();
+        assert_eq!(captured.len(), 4);
+        assert_eq!(captured[0].noise_seed, base + 10);
+        let first = captured[0].scanout.registers().unwrap();
+        assert_eq!(first.origin(), 0x0010_0040);
+        assert_eq!(first.words()[4], 1);
+        assert_eq!(
+            first.active_window().unwrap().vertical_register(),
+            0x0025_01ff
+        );
+        assert_eq!(first.y_scale_register(), 0x0300_0400);
+        assert_eq!(
+            first.resample().field,
+            fn64_render::ViScanoutField::InterlacedOdd
+        );
+        assert_eq!(captured[1].noise_seed, base + 20);
+        let second = captured[1].scanout.registers().unwrap();
+        assert_eq!(second.origin(), 0x0010_0020);
+        assert_eq!(second.words()[4], 0);
+        assert_eq!(
+            second.active_window().unwrap().vertical_register(),
+            0x0026_0200
+        );
+        assert_eq!(second.y_scale_register(), 0x0200_0400);
+        assert_eq!(
+            second.resample().field,
+            fn64_render::ViScanoutField::InterlacedEven
+        );
+        assert_eq!(captured[2].noise_seed, base + 30);
+        assert_eq!(captured[2].scanout, captured[0].scanout);
+        assert_eq!(captured[3].noise_seed, base + 40);
+        assert_eq!(captured[3].scanout, captured[1].scanout);
+        drop(captured);
+
+        assert_eq!(
+            crate::pi::read_live_device_mmio(0xFFFF_FFFF_A440_0004),
+            Some(0x0010_0020)
+        );
+        assert_eq!(
+            crate::pi::read_live_device_mmio(0xFFFF_FFFF_A440_0010),
+            Some(0)
+        );
+        assert_eq!(
+            crate::pi::read_live_device_mmio(0xFFFF_FFFF_A440_0028),
+            Some(0x0026_0200)
+        );
+        assert_eq!(
+            crate::pi::read_live_device_mmio(0xFFFF_FFFF_A440_0034),
+            Some(0x0200_0400)
+        );
+    }
+
+    #[test]
+    fn raw_mmio_vi_image_and_seed_cross_each_progressive_retrace_without_an_os_vi_mode() {
+        let presentations = install_vi_capture_backend();
+        let expected = [
+            3,
+            0x0012_3456,
+            320,
+            0,
+            0,
+            0x03e5_2239,
+            525,
+            3093,
+            0x0c15_0c15,
+            0xfc6c_f2ec,
+            0xfc25_f1ff,
+            0x000e_0204,
+            0xf100_f400,
+            0xf200_f400,
+        ];
+        for (index, value) in expected.into_iter().enumerate() {
+            if index == 4 {
+                continue;
+            }
+            let address = 0xFFFF_FFFF_A440_0000
+                + u64::try_from(index).expect("VI register index exceeds u64") * 4;
+            assert!(crate::pi::write_live_device_mmio(address, value));
+        }
+
+        let base = with_host(|host| host.device_fabric.now().get());
+        arm_vi_retrace(10);
+        crate::advance_virtual_time(base + 20);
+
+        let captured = presentations.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].noise_seed, base + 10);
+        assert_eq!(captured[1].noise_seed, base + 20);
+        assert!(!captured[0].blanked);
+        let registers = captured[0].scanout.registers().unwrap();
+        assert_eq!(registers.words(), expected);
+        assert_eq!(captured[1].scanout.registers().unwrap(), registers);
+        assert_eq!(registers.active_window().unwrap().output_width(), 640);
+        assert_eq!(registers.active_window().unwrap().output_height(), 237);
+        assert_eq!(registers.resample().x.offset_u2_10(), 0x100);
+        assert_eq!(registers.resample().x.step_u2_10(), 0x400);
+        assert_eq!(registers.resample().y.offset_u2_10(), 0x200);
+        assert_eq!(registers.resample().y.step_u2_10(), 0x400);
     }
 }

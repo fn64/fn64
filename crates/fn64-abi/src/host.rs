@@ -630,6 +630,7 @@ mod tests {
     fn retrace_progress_raises_the_shared_mi_vi_source() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
         crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::test_support::install_complete_render_backend(0);
         crate::pi::set_mi_interrupt_mask(fn64_runtime::InterruptSource::Vi.bit());
         crate::vi::arm_vi_retrace(10);
 

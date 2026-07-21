@@ -213,9 +213,10 @@ impl ViState {
     }
 
     /// Atomically apply every VI-manager change pending for V-blank. Returns
-    /// whether scanout-visible state changed, allowing the host renderer to
-    /// present framebuffer swaps and VI scanout-effect transitions at this
-    /// boundary rather than at submission time.
+    /// whether the manager-owned framebuffer, special-feature bits, black,
+    /// fade, or repeat-line state changed. Mode and scale changes are omitted.
+    /// Integrated execution presents every hardware field independently; this
+    /// partial manager delta is never presentation admission authority.
     pub fn latch_retrace(&mut self) -> bool {
         let old_special_features = self.special_features;
         let old_blanked = self.blanked;
@@ -243,19 +244,6 @@ impl ViState {
             self.y_scale = Some(scale);
         }
         if let Some(blanked) = self.next_blanked {
-            let effective_y_scale = self.next_y_scale.or(self.y_scale).unwrap_or(1.0);
-            assert!(
-                !blanked || effective_y_scale == 1.0,
-                "osViBlack(TRUE) requires an effective Y scale of 1.0"
-            );
-            assert!(
-                !blanked || self.next_fade.unwrap_or(self.fade).is_none(),
-                "osViBlack(TRUE) requires osViFade to be disabled"
-            );
-            assert!(
-                !blanked || !self.next_repeat_line.unwrap_or(self.repeat_line),
-                "osViBlack(TRUE) requires osViRepeatLine to be disabled"
-            );
             self.blanked = blanked;
         }
         if let Some(fade) = self.next_fade {
@@ -264,6 +252,18 @@ impl ViState {
         if let Some(repeat_line) = self.next_repeat_line {
             self.repeat_line = repeat_line;
         }
+        assert!(
+            !self.blanked || self.y_scale.unwrap_or(1.0) == 1.0,
+            "osViBlack(TRUE) requires an effective Y scale of 1.0"
+        );
+        assert!(
+            !self.blanked || self.fade.is_none(),
+            "osViBlack(TRUE) requires osViFade to be disabled"
+        );
+        assert!(
+            !self.blanked || !self.repeat_line,
+            "osViBlack(TRUE) requires osViRepeatLine to be disabled"
+        );
         assert!(
             self.fade.is_none() || !self.repeat_line,
             "osViFade and osViRepeatLine cannot be enabled together"
@@ -422,6 +422,48 @@ mod tests {
         vi.set_y_scale(0.5);
         vi.set_black(true);
         vi.latch_retrace();
+    }
+
+    #[test]
+    #[should_panic(expected = "osViBlack(TRUE) requires an effective Y scale of 1.0")]
+    fn already_black_scanout_rejects_a_later_non_unit_y_scale() {
+        let mut vi = ViState::new();
+        vi.set_black(true);
+        vi.latch_retrace();
+        vi.set_y_scale(0.5);
+        vi.latch_retrace();
+    }
+
+    #[test]
+    #[should_panic(expected = "osViBlack(TRUE) requires osViFade to be disabled")]
+    fn already_black_scanout_rejects_a_later_fade() {
+        let mut vi = ViState::new();
+        vi.set_black(true);
+        vi.latch_retrace();
+        vi.set_fade(true, 0x0200);
+        vi.latch_retrace();
+    }
+
+    #[test]
+    #[should_panic(expected = "osViBlack(TRUE) requires osViRepeatLine to be disabled")]
+    fn already_black_scanout_rejects_a_later_repeated_line() {
+        let mut vi = ViState::new();
+        vi.set_black(true);
+        vi.latch_retrace();
+        vi.set_repeat_line(true);
+        vi.latch_retrace();
+    }
+
+    #[test]
+    fn unblank_and_scanout_effect_may_latch_together() {
+        let mut vi = ViState::new();
+        vi.set_black(true);
+        vi.latch_retrace();
+        vi.set_black(false);
+        vi.set_fade(true, 0x0200);
+        assert!(vi.latch_retrace());
+        assert!(!vi.blanked);
+        assert_eq!(vi.fade, Some(0x0200));
     }
 
     #[test]

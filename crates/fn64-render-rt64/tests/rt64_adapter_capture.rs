@@ -5,8 +5,8 @@ use fn64_render::{
     RenderAspectRatio, RenderConfig, RenderDisplayBuffering, RenderEmulatorSettings,
     RenderEnhancementSettings, RenderFiltering, RenderGraphicsApi, RenderHardwareResolve,
     RenderInternalColorFormat, RenderPresentationMode, RenderRefreshRate, RenderResolution,
-    RenderRuntimeSettings, RenderUpscale2d, ResolutionMultiplier, ViFilterControl, ViPixelType,
-    ViPresentation,
+    RenderRuntimeSettings, RenderUpscale2d, ResolutionMultiplier, ViPresentation,
+    ViScanoutRegisters, ViScanoutState,
 };
 use fn64_render_rt64::{
     capture_rt64_adapter_inputs, roundtrip_rt64_emulator_settings,
@@ -14,6 +14,21 @@ use fn64_render_rt64::{
 };
 
 fn fixture() -> (OsTask, RenderConfig, ViPresentation) {
+    let mut vi_registers = [0u32; ViScanoutRegisters::WORD_COUNT];
+    vi_registers[0] = 0x0001_001f;
+    vi_registers[1] = 0x0010_0000;
+    vi_registers[2] = 320;
+    vi_registers[3] = 2;
+    vi_registers[4] = 0;
+    vi_registers[5] = 0x03e5_2239;
+    vi_registers[6] = 525;
+    vi_registers[7] = 3093;
+    vi_registers[8] = 0x0c15_0c15;
+    vi_registers[9] = 0x006c_02ec;
+    vi_registers[10] = 0x0025_01ff;
+    vi_registers[11] = 0x000e_0204;
+    vi_registers[12] = 0x0000_0200;
+    vi_registers[13] = 0x0000_0400;
     (
         OsTask {
             task_type: 1,
@@ -33,15 +48,7 @@ fn fixture() -> (OsTask, RenderConfig, ViPresentation) {
         },
         RenderConfig::new(640, 480),
         ViPresentation {
-            fade: Some(0x155),
-            filters: ViFilterControl {
-                pixel_type: ViPixelType::Rgba32,
-                antialias_mode: fn64_render::ViAaMode::AaResampleAlways,
-                gamma: true,
-                gamma_dither: true,
-                divot: true,
-                dither_filter: true,
-            },
+            scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(vi_registers)),
             ..ViPresentation::default()
         },
     )
@@ -64,26 +71,47 @@ fn typed_task_and_vi_cross_cpp_boundary_without_a_graphics_device() {
 
     let mut expected_registers = [0; 24];
     expected_registers[9] = 0x0001_001f;
-    expected_registers[10] = 0x0012_3956;
-    expected_registers[11] = 640;
+    expected_registers[10] = 0x0010_0500;
+    expected_registers[11] = 320;
+    expected_registers[12] = 2;
+    expected_registers[14] = 0x03e5_2239;
     expected_registers[15] = 525;
     expected_registers[16] = 3093;
+    expected_registers[17] = 0x0c15_0c15;
     expected_registers[18] = 0x006c_02ec;
-    expected_registers[19] = 0x0022_03e2;
-    expected_registers[21] = 0x400;
-    expected_registers[22] = 0x0155_0000;
+    expected_registers[19] = 0x0025_01ff;
+    expected_registers[20] = 0x000e_0204;
+    expected_registers[21] = 0x200;
+    expected_registers[22] = 0x400;
     assert_eq!(first.registers, expected_registers);
+    assert_eq!(first.registers_after_submission, expected_registers);
 }
 
 #[test]
 fn capture_rejects_vi_state_the_live_boundary_rejects() {
     let (task, cfg, mut vi) = fixture();
+    vi.fade = Some(0x155);
     vi.repeat_line = true;
     let error = capture_rt64_adapter_inputs(&task, 0, cfg, vi).unwrap_err();
     assert!(
         error.to_string().contains("fade and repeat-line"),
         "unexpected adapter diagnostic: {error}"
     );
+}
+
+#[test]
+fn odd_interlaced_origin_compensation_uses_two_effective_source_rows() {
+    let (task, cfg, mut vi) = fixture();
+    let mut words = vi.scanout.registers().unwrap().words();
+    words[0] |= 1 << 6;
+    words[2] = 0x1140;
+    words[4] = 1;
+    vi.scanout = ViScanoutState::Registers(ViScanoutRegisters::from_words(words));
+
+    let capture = capture_rt64_adapter_inputs(&task, 0, cfg, vi).unwrap();
+    assert_eq!(capture.registers[11], 0x1140);
+    assert_eq!(capture.registers[10], 0x0010_0a00);
+    assert_eq!(capture.registers_after_submission, capture.registers);
 }
 
 #[test]

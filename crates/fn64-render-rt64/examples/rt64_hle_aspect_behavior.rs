@@ -482,10 +482,10 @@ fn render(
     }
     backend.present(ViPresentation {
         noise_seed,
-        filters: ViFilterControl {
+        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
             pixel_type: ViPixelType::Rgba16,
             ..ViFilterControl::default()
-        },
+        }),
         ..ViPresentation::default()
     })?;
     if u32::from_ne_bytes(rdram[target - 4..target].try_into()?) != GUARD

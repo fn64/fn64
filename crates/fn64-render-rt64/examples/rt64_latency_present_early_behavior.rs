@@ -85,10 +85,10 @@ fn explicit_present(
 ) -> Result<Rt64PresentedPixels, Box<dyn Error>> {
     backend.present(ViPresentation {
         noise_seed: guest_cycle,
-        filters: ViFilterControl {
+        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
             pixel_type: ViPixelType::Rgba16,
             ..ViFilterControl::default()
-        },
+        }),
         ..ViPresentation::default()
     })?;
     Ok(backend.presented_pixels()?)

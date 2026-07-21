@@ -331,7 +331,7 @@ pub enum DeviceNotification {
     PiDmaComplete(DmaCompletion),
     AiDmaComplete(AiDmaRequest),
     SiDmaComplete(SiDmaRequest),
-    ViRetrace,
+    ViRetrace { at: Cycles },
     RcpTaskComplete(RcpTaskCompletion),
 }
 
@@ -1935,7 +1935,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     self.pending_vi = None;
                     self.record(DeviceTraceKind::ViInterrupt);
                     self.raise_interrupt(InterruptSource::Vi);
-                    let notification = DeviceNotification::ViRetrace;
+                    let notification = DeviceNotification::ViRetrace { at: self.now };
                     notifications.push(notification);
                     self.record(DeviceTraceKind::NotificationReady(notification));
                     self.reschedule_vi_interrupt()?;
@@ -2781,7 +2781,12 @@ mod tests {
         assert_eq!(fabric.read_mmio(VI_CURRENT_REG).unwrap(), 98);
 
         let notifications = fabric.advance_to(Cycles::new(191), &mut rdram).unwrap();
-        assert_eq!(notifications, vec![DeviceNotification::ViRetrace]);
+        assert_eq!(
+            notifications,
+            vec![DeviceNotification::ViRetrace {
+                at: Cycles::new(191)
+            }]
+        );
         assert_eq!(fabric.read_mmio(VI_CURRENT_REG).unwrap(), 100);
         assert!(fabric.interrupt_pending(InterruptSource::Vi));
 
@@ -2793,7 +2798,9 @@ mod tests {
         );
         assert_eq!(
             tail[2].kind,
-            DeviceTraceKind::NotificationReady(DeviceNotification::ViRetrace)
+            DeviceTraceKind::NotificationReady(DeviceNotification::ViRetrace {
+                at: Cycles::new(191)
+            })
         );
 
         fabric.write_mmio(VI_CURRENT_REG, u32::MAX).unwrap();
