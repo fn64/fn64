@@ -54,6 +54,7 @@
 namespace {
 constexpr size_t N64_RDRAM_SIZE = 8U * 1024U * 1024U;
 constexpr uint32_t VI_STATUS_16_BIT = 2U;
+static_assert(sizeof(Fn64Rt64TaskResult) == 40U);
 static_assert(sizeof(Fn64Rt64ExtendedPresentCapture) == 72U);
 static_assert(sizeof(Fn64Rt64PresentCapture) == 48U);
 #if defined(FN64_RT64_HFR_EVIDENCE)
@@ -2862,6 +2863,7 @@ extern "C" int fn64_rt64_process_task(
     size_t imem_len,
     const Fn64Rt64Task *task,
     uint32_t output_addr,
+    Fn64Rt64TaskResult *result,
     char *error,
     size_t error_capacity) {
     try {
@@ -2869,8 +2871,10 @@ extern "C" int fn64_rt64_process_task(
             set_error(error, error_capacity, "RT64 context is not initialized");
             return 0;
         }
-        if ((rdram == nullptr) || (dmem == nullptr) || (imem == nullptr) || (task == nullptr)) {
-            set_error(error, error_capacity, "null RDRAM, RSP memory, or OSTask pointer");
+        if ((rdram == nullptr) || (dmem == nullptr) || (imem == nullptr) ||
+            (task == nullptr) || (result == nullptr)) {
+            set_error(error, error_capacity,
+                      "null RDRAM, RSP memory, OSTask, or task-result pointer");
             return 0;
         }
         if (rdram_len < N64_RDRAM_SIZE) {
@@ -2881,6 +2885,9 @@ extern "C" int fn64_rt64_process_task(
             set_error(error, error_capacity, "RSP memory banks are not exactly 4 KiB");
             return 0;
         }
+
+        *result = {};
+        result->schema = FN64_RT64_TASK_RESULT_SCHEMA;
 
         std::memcpy(context->dmem.data(), dmem, context->dmem.size());
         std::memcpy(context->imem.data(), imem, context->imem.size());
@@ -2912,8 +2919,14 @@ extern "C" int fn64_rt64_process_task(
             set_error(error, error_capacity, "RT64 did not recognize the task's graphics microcode");
             return 0;
         }
+        result->entry_gbi_available = 1;
+        result->initial_ucode_text_address =
+            context->application->interpreter->UCode.textAddress;
+        result->initial_ucode_data_address =
+            context->application->interpreter->UCode.dataAddress;
 
         const uint64_t previous_workload = context->application->state->workloadId;
+        result->workload_id_before = previous_workload;
         ExtendedDispatchProbe extended_probe{};
         RT64::GBI *initial_gbi = context->application->interpreter->hleGBI;
         std::unique_ptr<ExtendedDispatchScope> extended_scope;
@@ -2932,6 +2945,16 @@ extern "C" int fn64_rt64_process_task(
         context->application->processDisplayLists(rdram, dl_address, 0, true);
         extended_scope.reset();
         const uint64_t submitted_workload = context->application->state->workloadId;
+        if (submitted_workload < previous_workload) {
+            set_error(error, error_capacity,
+                      "RT64 task workload ID moved backwards during processing");
+            return 0;
+        }
+        result->workload_id_after = submitted_workload;
+        result->final_ucode_text_address =
+            context->application->interpreter->UCode.textAddress;
+        result->final_ucode_data_address =
+            context->application->interpreter->UCode.dataAddress;
         if (submitted_workload > previous_workload) {
             // renderToRAM is enabled above. Waiting for this exact workload
             // closes the GPU/CPU interleaving before Rust or the VI capture

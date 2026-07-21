@@ -852,6 +852,17 @@ task calls out:
   independent digest maps. The admission rule follows the public GBI family
   boundaries; it does not infer compatibility from a task header or colliding
   opcode byte.
+  Native RT64 task submission returns a schema-checked result containing entry
+  GBI availability, pre/post workload IDs, and initial/final microcode
+  addresses.
+  Pinned RT64 advances the workload ID only from `State::fullSync`, so the
+  delta is typed native completion evidence and must agree with transactional
+  public-command inspection. The address pair is not admission authority: a
+  final address cannot reveal an intermediate self-load that later returned
+  to the original image, and RT64's address cache cannot prove same-address
+  content. Removing reference preflight therefore still requires an ordered
+  per-generation observation or another transactionally equivalent native
+  admission mechanism.
   The reference rasterizer owns one deterministic, explicitly seedable
   per-fragment noise stream. Every covered one/two-cycle fragment consumes one
   typed eight-bit sample before combiner/alpha/depth rejection; combiner
