@@ -90,6 +90,7 @@ pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
         host.device_fabric = device_fabric;
         host.rom_installed = true;
         host.pending_pi_completion = None;
+        host.queued_pi_requests.clear();
     });
 }
 
@@ -177,9 +178,6 @@ fn start_timed_pi_dma(
     shim: &str,
 ) -> Result<(), DeviceFault> {
     with_host(|host| {
-        if host.pending_pi_completion.is_some() {
-            return Err(DeviceFault::PiBusy);
-        }
         if matches!(request.direction, DmaDirection::FromRdram)
             && !fn64_runtime::rom::is_sram_dev_addr(request.cart_addr)
         {
@@ -192,15 +190,31 @@ fn start_timed_pi_dma(
                 "{shim}: no ROM installed -- call fn64_abi::load_rom(bytes) before any PI/EPI DMA"
             )
         }
-        let fabric = &mut host.device_fabric;
-        fabric.start_pi_dma(request)?;
-        host.pending_pi_completion = Some(PendingPiCompletion {
+        let pending = PendingPiCompletion {
             request,
             rdram,
             rdram_len,
             ret_queue,
             ret_mesg,
-        });
+        };
+        if host.pending_pi_completion.is_some() {
+            // A transfer is in flight. Real `osEPiStartDma` does NOT report
+            // that as -1 -- it enqueues the OSIoMesg on the PI manager's
+            // command queue and returns 0; -1 means the COMMAND QUEUE is
+            // full (`!__osPiDevMgr.active` aside). Model exactly that:
+            // accept up to the game's own `osCreatePiManager(cmdMsgCnt)`
+            // requests, started in FIFO order as prior transfers complete
+            // (see `HostState::queued_pi_requests`' doc for the WM2000
+            // tight-retry livelock a busy=-1 model causes).
+            if host.queued_pi_requests.len() >= host.pi_cmd_queue_capacity {
+                return Err(DeviceFault::PiBusy);
+            }
+            host.queued_pi_requests.push_back(pending);
+            return Ok(());
+        }
+        let fabric = &mut host.device_fabric;
+        fabric.start_pi_dma(request)?;
+        host.pending_pi_completion = Some(pending);
         Ok(())
     })
 }
@@ -809,6 +823,23 @@ pub(crate) fn advance_device_time(now: u64) {
                             msg: pending.ret_mesg,
                         }));
                     }
+                    // PI-manager serialization: the single PI channel is
+                    // free again -- start the next command-queue request
+                    // (FIFO), exactly as libultra's PI manager thread pops
+                    // its cmdQ after each completion. Its own completion is
+                    // scheduled by the fabric and commits on a subsequent
+                    // advance. See `HostState::queued_pi_requests`.
+                    if let Some(next) = host.queued_pi_requests.pop_front() {
+                        host.device_fabric
+                            .start_pi_dma(next.request)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "queued PI request failed to start after the prior \
+                                     completion freed the channel: {error}"
+                                )
+                            });
+                        host.pending_pi_completion = Some(next);
+                    }
                 }
                 DeviceNotification::AiDmaComplete(_) => {
                     const OS_EVENT_AI: u32 = 6;
@@ -1271,6 +1302,11 @@ pub unsafe extern "C" fn osCreatePiManager_recomp(_rdram: *mut u8, ctx: *mut Rec
     let cmd_q = RdramAddr::from_gpr(ctx.r5);
     let cmd_msg_cnt = ctx.r7 as usize;
     with_executor(|exec| exec.create_mesg_queue(cmd_q, cmd_msg_cnt.max(1)));
+    // The cmdQ depth is also the managed-DMA queueing capacity: how many
+    // `osEPiStartDma` requests may wait behind the in-flight transfer
+    // before the shim reports a full command queue (-1). NWXE passes 0x40
+    // (funcs_0.c asm 0x800004F8). See `HostState::queued_pi_requests`.
+    with_host(|host| host.pi_cmd_queue_capacity = cmd_msg_cnt);
 }
 
 /// `__osPiGetAccess(void)` -- no arguments (verified: real call site
@@ -1556,6 +1592,106 @@ mod tests {
             kinds[4],
             fn64_runtime::DeviceTraceKind::NotificationReady(_)
         ));
+    }
+
+    /// WM2000 chunked-loader regression (`funcs_5.c` `func_80012064`, asm
+    /// 0x8001214C `while (osEPiStartDma(..) != 0);`): a second managed DMA
+    /// issued while one is in flight must be QUEUED and return 0 -- real
+    /// `osEPiStartDma` enqueues on the PI manager's cmdQ; -1 means the
+    /// cmdQ is full, not "channel busy". Reporting busy as -1 livelocks
+    /// the cooperative executor inside the guest's tight retry loop (the
+    /// pending completion can only commit once the guest yields, which
+    /// the retry loop never does). Also pins FIFO start order and the
+    /// full-queue -1, and that capacity comes from `osCreatePiManager`.
+    #[test]
+    fn epi_start_dma_queues_while_busy_and_completes_fifo() {
+        let mut rom = vec![0u8; 0x100];
+        rom[0x20..0x24].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        rom[0x30..0x34].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        load_rom_with_fixed_pi_latency(rom, 5);
+
+        // osCreatePiManager(pri, cmdQ, cmdBuf, 1): capacity 1 queued entry.
+        let mut pim_ctx = ctx_zeroed();
+        pim_ctx.r5 = 0x8000_0900;
+        pim_ctx.r7 = 1;
+        unsafe { osCreatePiManager_recomp(std::ptr::null_mut(), &mut pim_ctx) };
+
+        let mut rdram = vec![0u8; 0x1000];
+        let queue_a = RdramAddr::from_offset(0x300);
+        let queue_b = RdramAddr::from_offset(0x340);
+        with_executor(|exec| {
+            exec.create_mesg_queue(queue_a, 1);
+            exec.create_mesg_queue(queue_b, 1);
+        });
+
+        // Two OSIoMesg structs: A reads ROM 0x20 -> rdram 0x400, B reads
+        // ROM 0x30 -> rdram 0x500.
+        for (mb, retq, dev, dram) in [
+            (0x100usize, 0x8000_0300u32, 0x20u32, 0x8000_0400u32),
+            (0x140usize, 0x8000_0340u32, 0x30u32, 0x8000_0500u32),
+        ] {
+            rdram[mb + 0x4..mb + 0x8].copy_from_slice(&retq.to_ne_bytes());
+            rdram[mb + 0x8..mb + 0xC].copy_from_slice(&dram.to_ne_bytes());
+            rdram[mb + 0xC..mb + 0x10].copy_from_slice(&dev.to_ne_bytes());
+            rdram[mb + 0x10..mb + 0x14].copy_from_slice(&4u32.to_ne_bytes());
+        }
+
+        let mut ctx = ctx_zeroed();
+        ctx.r5 = 0x8000_0100;
+        ctx.r6 = 0;
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(ctx.r2, 0, "first DMA starts immediately");
+
+        let mut ctx_b = ctx_zeroed();
+        ctx_b.r5 = 0x8000_0140;
+        ctx_b.r6 = 0;
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx_b) };
+        assert_eq!(
+            ctx_b.r2, 0,
+            "second DMA while busy must be QUEUED (return 0), not busy=-1 -- \
+             the WM2000 tight-retry livelock"
+        );
+
+        // Third submit: command queue (capacity 1) is full -> real -1.
+        let mut ctx_c = ctx_zeroed();
+        ctx_c.r5 = 0x8000_0140;
+        ctx_c.r6 = 0;
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx_c) };
+        assert_eq!(
+            ctx_c.r2,
+            u64::MAX,
+            "beyond cmdQ capacity osEPiStartDma reports a full queue (-1)"
+        );
+
+        // First completion: A's bytes land, A's queue gets its post, B has
+        // NOT completed yet (serialized single channel).
+        complete_pi_dma();
+        // Native-endian word storage, same as
+        // `managed_pi_dma_commits_state_then_posts_completion_before_resume`.
+        assert_eq!(
+            u32::from_ne_bytes(rdram[0x400..0x404].try_into().unwrap()),
+            0xAABB_CCDD
+        );
+        assert_eq!(
+            with_executor(|exec| exec.recv_mesg(99, queue_a, false)),
+            fn64_runtime::RecvMesgOutcome::Delivered(0)
+        );
+        assert_eq!(
+            with_executor(|exec| exec.recv_mesg(99, queue_b, false)),
+            fn64_runtime::RecvMesgOutcome::WouldBlock,
+            "queued request must not complete before the in-flight one"
+        );
+
+        // Second completion: B follows in FIFO order.
+        complete_pi_dma();
+        assert_eq!(
+            u32::from_ne_bytes(rdram[0x500..0x504].try_into().unwrap()),
+            0x1122_3344
+        );
+        assert_eq!(
+            with_executor(|exec| exec.recv_mesg(99, queue_b, false)),
+            fn64_runtime::RecvMesgOutcome::Delivered(0)
+        );
     }
 
     #[test]

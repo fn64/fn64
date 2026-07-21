@@ -92,13 +92,39 @@ byte-identical trace), and the stand-in audio ucode (routing audio
 through the real RSP LLE replay — `set_audio_task_lle` — changes
 nothing).
 
-Open question (the actual next blocker): why thread 18 is already parked
-on the shared SP queue when 17 kicks — on hardware the same FIFO
-delivery rules apply, so the game's protocol must prevent that overlap
-via ordering fn64 does not yet reproduce. Answering it needs guest-level
-decompilation of the two manager loops (the task-grant state machine
-around the AKI scheduler threads), correlating with the trace's queue
-addresses.
+RESOLVED (2026-07-21): decompiling the two manager loops answered the
+open question and located the divergence in fn64, not the game.
+
+The guest protocol (funcs_0.c): `func_80000B30` builds the AKI event
+manager — per-runner command queues 0x522B0 (audio) / 0x522E8 (gfx), the
+SHARED `OS_EVENT_SP` done queue 0x52320 (= 0x522E8+0x38), the DP queue
+0x52358, and the handoff queue 0x52390 — then starts thread 18 (audio
+runner, entry `func_80001024`, **priority 0x6E**) and thread 17 (gfx
+runner, entry `func_80001180`, **priority 0x64**). The gfx runner kicks
+a task and parks on 0x52320 for its done. The audio runner, on
+receiving a command while a gfx task is in flight (`*0x52760 != 0`),
+calls `osSpTaskYield`, parks on 0x52320 to consume the gfx task's
+yield-or-done message, kicks its own task, parks on 0x52320 AGAIN for
+the audio done, then either restarts the yielded gfx task or re-posts
+the done to 0x52320 for a gfx task that completed instead of yielding.
+So BOTH runners being parked on 0x52320 simultaneously is a designed,
+legitimate state — the protocol is correct on hardware because libultra
+wakes blocked receivers in THREAD-PRIORITY order (`__osEnqueueThread`
+keeps `mq->mtqueue` priority-sorted; `osSendMesg` pops the head): every
+SP-done that arrives while both are parked wakes the higher-priority
+audio runner (0x6E > 0x64) first, and only the final resumed-gfx done
+falls through to the gfx runner.
+
+fn64's divergence: `fn64-runtime`'s `BlockedList` popped waiters in
+ARRIVAL order. After the audio runner consumed the gfx yield-done and
+re-parked, the gfx runner was the longer-parked waiter — so the AUDIO
+task's done woke the GFX runner (the trace's crossover, seq
+312716-312800). Fixed in `crates/fn64-runtime/src/mesgqueue.rs` by
+making both blocked lists priority-sorted at insertion (descending,
+FIFO among equals), with the parking thread's priority captured at
+block time. With the fix the boot runs straight through the former
+3-frame wall (fade ramp white → black completes and gfx frames keep
+pacing 2 per second-ish of virtual time alongside the audio cadence).
 
 ## Known frontier (2026-07-14)
 
