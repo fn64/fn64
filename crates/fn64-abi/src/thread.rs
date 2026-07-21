@@ -280,18 +280,33 @@ mod tests {
     use super::*;
     use crate::test_support::*;
 
+    /// The C-ABI `pause_self` parks the thread until an explicit
+    /// `osStartThread` (reference-runtime semantics; `Yield::StopSelf`).
+    /// N64Recomp's C codegen emits `pause_self()` for guest self-branch
+    /// hangs with NO loop back, so an auto-resume here returns through
+    /// code the console can never reach -- the WM2000 streaming-loader
+    /// size-underflow bug (2026-07-21, see `dispatch.rs::pause_self`).
     #[test]
-    fn pause_self_yields_via_real_executor_and_thread_keeps_running() {
-        let ran_twice = std::rc::Rc::new(std::cell::RefCell::new(0));
-        let ran_twice2 = ran_twice.clone();
+    fn pause_self_parks_via_real_executor_until_explicit_restart() {
+        let fell_through = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let fell_through2 = fell_through.clone();
         spawn_test_thread(100, 5, move || {
             pause_self(std::ptr::null_mut());
-            *ran_twice2.borrow_mut() += 1;
+            *fell_through2.borrow_mut() += 1;
         });
         assert!(run_one_step());
-        assert_eq!(*ran_twice.borrow(), 0);
+        assert_eq!(*fell_through.borrow(), 0);
+        // Parked: the scheduler on its own must NEVER resume it (this was
+        // the assert-hang fall-through bug).
+        for _ in 0..10 {
+            run_one_step();
+        }
+        assert_eq!(*fell_through.borrow(), 0);
+        // The one legal resume path: an explicit osStartThread, after which
+        // pause_self returns (the reference runtime's restart fall-through).
+        with_executor(|exec| exec.start_thread(100));
         assert!(run_one_step());
-        assert_eq!(*ran_twice.borrow(), 1);
+        assert_eq!(*fell_through.borrow(), 1);
     }
 
     /// Test-only helper: register an `OSThread*` handle -> `OSId` mapping,
