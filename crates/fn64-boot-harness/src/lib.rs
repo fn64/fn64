@@ -35,6 +35,7 @@ pub use private_release_series::{
     PrivateReleaseSeriesError, PrivateReleaseSeriesReceipt, PrivateReleaseSeriesRun,
     VerifiedPrivateReleaseRunContract, PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA,
     PRIVATE_RELEASE_SERIES_COUNT, PRIVATE_RELEASE_SERIES_RECEIPT_SCHEMA,
+    RELEASE_MICROCODE_DATA_PATH_ENV, RELEASE_MICROCODE_TEXT_PATH_ENV,
     REPOSITORY_SYNTHETIC_RELEASE_CYCLE, REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES,
     REPOSITORY_SYNTHETIC_RELEASE_MANIFEST_BYTES, REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES,
     REPOSITORY_SYNTHETIC_RELEASE_SCENARIO,
@@ -56,6 +57,10 @@ pub use release_matrix::{
     SaveFeature, VerifiedMatrixScenario, VerifiedReleaseMatrix, INCOMPLETE_RELEASE_MATRIX_SCHEMA,
     RELEASE_MATRIX_MAX_SCENARIOS, RELEASE_MATRIX_REPORT_COUNT, RELEASE_MATRIX_SCHEMA,
     VERIFIED_RELEASE_MATRIX_SCHEMA,
+};
+pub use release_program_build_receipt::{
+    materialize_release_program_build_receipt, MaterializedReleaseProgramBuildReceipt,
+    NativeArchiveReceiptInput, ReleaseProgramBuildReceiptError, ReleaseProgramBuildReceiptInput,
 };
 pub use release_run_env::{
     release_run_environment_from_process, release_run_environment_from_process_with_oot_aliases,

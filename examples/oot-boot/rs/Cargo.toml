@@ -18,6 +18,10 @@ rt64 = ["fn64-render-rt64/rt64"]
 name = "oot-boot"
 path = "../src/main.rs"
 
+[[bin]]
+name = "write-function-identity-wire"
+path = "../src/bin/write-function-identity-wire.rs"
+
 [build-dependencies]
 cc = "1"
 sha2 = "0.10"
@@ -25,6 +29,7 @@ toml = "0.8"
 
 [dependencies]
 libc = "0.2"
+sha2 = "0.10"
 fn64-runtime = { path = "../../../crates/fn64-runtime" }
 fn64-abi = { path = "../../../crates/fn64-abi", features = ["recomp-rs"] }
 # The rs lane still uses the shared C section-bridge (register_linked_sections

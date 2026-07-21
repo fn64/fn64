@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fmt,
-    fs::{self, File},
-    io::Read,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -68,7 +68,38 @@ pub(crate) struct VerifiedReleaseProgramBuildReceipt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ReleaseProgramBuildReceiptError(String);
+pub struct ReleaseProgramBuildReceiptError(String);
+
+/// One exact archive input for a native linked-program identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeArchiveReceiptInput {
+    pub label: String,
+    pub path: PathBuf,
+}
+
+/// Actual local inputs from which a production program-build receipt is
+/// materialized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReleaseProgramBuildReceiptInput {
+    NativeArchives {
+        archives: Vec<NativeArchiveReceiptInput>,
+    },
+    TypedObservedFunction {
+        identity_wire: PathBuf,
+    },
+    TypedBlock {
+        pack: PathBuf,
+        expected_program_sha256: String,
+    },
+}
+
+/// Result returned after a create-new receipt was reread and independently
+/// verified against every bound file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializedReleaseProgramBuildReceipt {
+    pub receipt_sha256: String,
+    pub execution_source: ExecutionDestinationSource,
+}
 
 impl fmt::Display for ReleaseProgramBuildReceiptError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -77,6 +108,125 @@ impl fmt::Display for ReleaseProgramBuildReceiptError {
 }
 
 impl std::error::Error for ReleaseProgramBuildReceiptError {}
+
+/// Measure exact local program inputs and publish one create-new canonical
+/// receipt.
+///
+/// This co-binds file identities. It does not attest that the child was
+/// compiled or linked from the lane inputs.
+pub fn materialize_release_program_build_receipt(
+    output: impl AsRef<Path>,
+    child_executable: impl AsRef<Path>,
+    input: ReleaseProgramBuildReceiptInput,
+) -> Result<MaterializedReleaseProgramBuildReceipt, ReleaseProgramBuildReceiptError> {
+    let output = output.as_ref();
+    validate_new_receipt_output(output)?;
+    let child_executable =
+        measure_program_file(child_executable.as_ref(), "child_executable", None)?;
+
+    let (lane, expected_execution_source) = match input {
+        ReleaseProgramBuildReceiptInput::NativeArchives { mut archives } => {
+            if archives.is_empty() {
+                return Err(error(
+                    "native archive receipt must bind at least one archive",
+                ));
+            }
+            archives.sort_unstable_by(|left, right| left.label.cmp(&right.label));
+            for (index, archive) in archives.iter().enumerate() {
+                validate_label(&archive.label, &format!("lane.archives[{index}].label"))?;
+                if index > 0 && archives[index - 1].label == archive.label {
+                    return Err(error(format!(
+                        "lane.archives repeats logical label {:?}",
+                        archive.label
+                    )));
+                }
+            }
+
+            let mut aggregate = Sha256::new();
+            aggregate.update(b"fn64.native-program-archives.v1\0");
+            aggregate.update(
+                u64::try_from(archives.len())
+                    .expect("archive count fits canonical u64")
+                    .to_be_bytes(),
+            );
+            let mut measured = Vec::with_capacity(archives.len());
+            for (index, archive) in archives.into_iter().enumerate() {
+                aggregate.update(
+                    u64::try_from(archive.label.len())
+                        .expect("archive label length fits canonical u64")
+                        .to_be_bytes(),
+                );
+                aggregate.update(archive.label.as_bytes());
+                let file = measure_program_file(
+                    &archive.path,
+                    &format!("lane.archives[{index}].file"),
+                    Some(&mut aggregate),
+                )?;
+                measured.push(NativeArchiveBuildInput {
+                    label: archive.label,
+                    file,
+                });
+            }
+            (
+                ReleaseProgramBuildLane::NativeArchives { archives: measured },
+                ExecutionDestinationSource::NativeArchive {
+                    artifact_sha256: hex(&aggregate.finalize()),
+                },
+            )
+        }
+        ReleaseProgramBuildReceiptInput::TypedObservedFunction { identity_wire } => {
+            let identity_wire = measure_program_file(&identity_wire, "lane.identity_wire", None)?;
+            let source = ExecutionDestinationSource::TypedObservedFunctionProgram {
+                artifact_sha256: identity_wire.sha256.clone(),
+            };
+            (
+                ReleaseProgramBuildLane::TypedObservedFunction { identity_wire },
+                source,
+            )
+        }
+        ReleaseProgramBuildReceiptInput::TypedBlock {
+            pack,
+            expected_program_sha256,
+        } => {
+            require_sha256(&expected_program_sha256, "lane.expected_program_sha256")?;
+            let pack = measure_program_file(&pack, "lane.pack", None)?;
+            let source = ExecutionDestinationSource::TypedBlockProgram {
+                program_sha256: expected_program_sha256.clone(),
+                dispatch_artifact_sha256: pack.sha256.clone(),
+            };
+            (
+                ReleaseProgramBuildLane::TypedBlock {
+                    pack,
+                    expected_program_sha256,
+                },
+                source,
+            )
+        }
+    };
+
+    let mut receipt = ReleaseProgramBuildReceipt {
+        schema: RELEASE_PROGRAM_BUILD_RECEIPT_SCHEMA.to_owned(),
+        child_executable,
+        lane,
+        expected_execution_source,
+        receipt_sha256: String::new(),
+    };
+    receipt.receipt_sha256 = receipt.recompute_receipt_sha256()?;
+    let verified = verify_release_program_build_receipt(receipt.clone())?;
+    publish_release_program_build_receipt(output, &receipt)?;
+    let retained = load_release_program_build_receipt(output)?;
+    if retained.receipt != verified.receipt
+        || retained.recomputed_execution_source != verified.recomputed_execution_source
+    {
+        return Err(error(
+            "materialized release program build receipt changed before retained verification",
+        ));
+    }
+    Ok(MaterializedReleaseProgramBuildReceipt {
+        receipt_sha256: retained.receipt.receipt_sha256,
+        execution_source: retained.recomputed_execution_source,
+    })
+}
 
 impl ReleaseProgramBuildReceipt {
     pub(crate) fn recompute_receipt_sha256(
@@ -222,7 +372,6 @@ pub(crate) fn verify_release_program_build_receipt(
                         .to_be_bytes(),
                 );
                 digest.update(archive.label.as_bytes());
-                digest.update(archive.file.bytes.to_be_bytes());
                 verify_bound_file_and_update(
                     &archive.file,
                     &format!("lane.archives[{index}].file"),
@@ -331,16 +480,54 @@ fn verify_bound_file(
 fn verify_bound_file_and_update(
     identity: &ReleaseProgramFileIdentity,
     field: &str,
-    mut aggregate: Option<&mut Sha256>,
+    aggregate: Option<&mut Sha256>,
 ) -> Result<(u64, String), ReleaseProgramBuildReceiptError> {
     validate_file_identity(identity, field)?;
-    let path = Path::new(&identity.path);
+    let observed = measure_program_file(Path::new(&identity.path), field, aggregate)?;
+    if observed.bytes != identity.bytes || observed.sha256 != identity.sha256 {
+        return Err(error(format!(
+            "{field} identity drift at {}: expected bytes={} sha256={}, observed bytes={} sha256={}",
+            identity.path, identity.bytes, identity.sha256, observed.bytes, observed.sha256
+        )));
+    }
+    Ok((observed.bytes, observed.sha256))
+}
+
+fn measure_program_file(
+    path: &Path,
+    field: &str,
+    mut aggregate: Option<&mut Sha256>,
+) -> Result<ReleaseProgramFileIdentity, ReleaseProgramBuildReceiptError> {
     validate_regular_no_symlink_file(path, field)?;
+    let path_string = path
+        .to_str()
+        .ok_or_else(|| error(format!("{field} path must be valid UTF-8")))?
+        .to_owned();
+    let path_before = fs::symlink_metadata(path)
+        .map_err(|source| error(format!("inspect {field} {}: {source}", path.display())))?;
     let mut file = File::open(path)
         .map_err(|source| error(format!("open {field} {}: {source}", path.display())))?;
-    let before = file
+    let handle_before = file
         .metadata()
-        .map_err(|source| error(format!("inspect {field} {}: {source}", path.display())))?;
+        .map_err(|source| error(format!("inspect open {field} {}: {source}", path.display())))?;
+    if !same_file_identity(&path_before, &handle_before) {
+        return Err(error(format!(
+            "{field} {} changed between path validation and open",
+            path.display()
+        )));
+    }
+    if handle_before.len() == 0 {
+        return Err(error(format!("{field}.bytes must be positive")));
+    }
+    if handle_before.len() > MAX_RELEASE_PROGRAM_FILE_BYTES {
+        return Err(error(format!(
+            "{field}.bytes exceeds the {}-byte release-program limit",
+            MAX_RELEASE_PROGRAM_FILE_BYTES
+        )));
+    }
+    if let Some(aggregate) = aggregate.as_deref_mut() {
+        aggregate.update(handle_before.len().to_be_bytes());
+    }
     let mut digest = Sha256::new();
     let mut observed_bytes = 0u64;
     let mut buffer = [0u8; 1024 * 1024];
@@ -359,23 +546,51 @@ fn verify_bound_file_and_update(
             aggregate.update(&buffer[..read]);
         }
     }
-    let after = file
-        .metadata()
+    let handle_after = file.metadata().map_err(|source| {
+        error(format!(
+            "reinspect open {field} {}: {source}",
+            path.display()
+        ))
+    })?;
+    validate_regular_no_symlink_file(path, field)?;
+    let path_after = fs::symlink_metadata(path)
         .map_err(|source| error(format!("reinspect {field} {}: {source}", path.display())))?;
-    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+    if !same_file_identity(&handle_before, &handle_after)
+        || !same_file_identity(&handle_after, &path_after)
+        || observed_bytes != handle_after.len()
+    {
         return Err(error(format!(
             "{field} {} changed while it was being measured",
             path.display()
         )));
     }
     let observed_sha256 = hex(&digest.finalize());
-    if observed_bytes != identity.bytes || observed_sha256 != identity.sha256 {
-        return Err(error(format!(
-            "{field} identity drift at {}: expected bytes={} sha256={}, observed bytes={observed_bytes} sha256={observed_sha256}",
-            path.display(), identity.bytes, identity.sha256
-        )));
+    Ok(ReleaseProgramFileIdentity {
+        path: path_string,
+        bytes: observed_bytes,
+        sha256: observed_sha256,
+    })
+}
+
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        left.dev() == right.dev()
+            && left.ino() == right.ino()
+            && left.len() == right.len()
+            && left.mtime() == right.mtime()
+            && left.mtime_nsec() == right.mtime_nsec()
+            && left.ctime() == right.ctime()
+            && left.ctime_nsec() == right.ctime_nsec()
     }
-    Ok((observed_bytes, observed_sha256))
+    #[cfg(not(unix))]
+    {
+        left.len() == right.len()
+            && left.modified().ok() == right.modified().ok()
+            && left.created().ok() == right.created().ok()
+            && left.permissions().readonly() == right.permissions().readonly()
+    }
 }
 
 fn validate_regular_no_symlink_file(
@@ -393,6 +608,78 @@ fn validate_regular_no_symlink_file(
         )));
     }
     Ok(())
+}
+
+fn validate_new_receipt_output(path: &Path) -> Result<(), ReleaseProgramBuildReceiptError> {
+    validate_absolute_no_parent(path, "output")?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| error("output must have an existing parent directory"))?;
+    reject_symlink_components(parent, "output parent")?;
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|source| {
+        error(format!(
+            "inspect output parent {}: {source}",
+            parent.display()
+        ))
+    })?;
+    if !parent_metadata.is_dir() {
+        return Err(error(format!(
+            "output parent {} is not a directory",
+            parent.display()
+        )));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(error(format!(
+            "output {} already exists; receipt publication never replaces a path",
+            path.display()
+        ))),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(error(format!(
+            "inspect output {}: {source}",
+            path.display()
+        ))),
+    }
+}
+
+fn publish_release_program_build_receipt(
+    path: &Path,
+    receipt: &ReleaseProgramBuildReceipt,
+) -> Result<(), ReleaseProgramBuildReceiptError> {
+    validate_new_receipt_output(path)?;
+    let mut payload = serde_json::to_vec_pretty(receipt)
+        .map_err(|source| error(format!("serialize release program build receipt: {source}")))?;
+    payload.push(b'\n');
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|source| {
+        error(format!(
+            "create-new release program build receipt {}: {source}",
+            path.display()
+        ))
+    })?;
+    file.write_all(&payload).map_err(|source| {
+        error(format!(
+            "write release program build receipt {}: {source}",
+            path.display()
+        ))
+    })?;
+    file.flush().map_err(|source| {
+        error(format!(
+            "flush release program build receipt {}: {source}",
+            path.display()
+        ))
+    })?;
+    file.sync_all().map_err(|source| {
+        error(format!(
+            "sync release program build receipt {}: {source}",
+            path.display()
+        ))
+    })
 }
 
 fn validate_absolute_no_parent(
@@ -994,6 +1281,193 @@ mod tests {
         for mutation in mutations {
             assert_ne!(mutation.recompute_receipt_sha256().unwrap(), original);
         }
+    }
+
+    #[test]
+    fn materializer_derives_and_reverifies_all_three_lane_sources() {
+        let directory = TestDirectory::new();
+        let child = write_file(&directory.0, "child", b"exact child image");
+        let generated = write_file(&directory.0, "generated.a", b"generated archive");
+        let bridge = write_file(&directory.0, "bridge.a", b"section bridge archive");
+        let native_output = directory.0.join("native-receipt.json");
+        let native = materialize_release_program_build_receipt(
+            &native_output,
+            &child.path,
+            ReleaseProgramBuildReceiptInput::NativeArchives {
+                archives: vec![
+                    NativeArchiveReceiptInput {
+                        label: "section-bridge".to_owned(),
+                        path: PathBuf::from(&bridge.path),
+                    },
+                    NativeArchiveReceiptInput {
+                        label: "generated-code".to_owned(),
+                        path: PathBuf::from(&generated.path),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let expected_native = ExecutionDestinationSource::NativeArchive {
+            artifact_sha256: hex(&native_program_archives_sha256([
+                ("generated-code".to_owned(), b"generated archive".to_vec()),
+                (
+                    "section-bridge".to_owned(),
+                    b"section bridge archive".to_vec(),
+                ),
+            ])),
+        };
+        assert_eq!(native.execution_source, expected_native);
+        let retained_native = load_release_program_build_receipt(&native_output).unwrap();
+        assert_eq!(
+            retained_native.recomputed_execution_source,
+            native.execution_source
+        );
+        assert_eq!(
+            retained_native.receipt.receipt_sha256,
+            native.receipt_sha256
+        );
+        let ReleaseProgramBuildLane::NativeArchives { archives } = retained_native.receipt.lane
+        else {
+            panic!("materialized native receipt changed lanes");
+        };
+        assert_eq!(
+            archives
+                .iter()
+                .map(|archive| archive.label.as_str())
+                .collect::<Vec<_>>(),
+            ["generated-code", "section-bridge"]
+        );
+
+        let wire = write_file(
+            &directory.0,
+            "source.wire",
+            b"canonical source identity wire",
+        );
+        let observed = materialize_release_program_build_receipt(
+            directory.0.join("observed-receipt.json"),
+            &child.path,
+            ReleaseProgramBuildReceiptInput::TypedObservedFunction {
+                identity_wire: PathBuf::from(&wire.path),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            observed.execution_source,
+            ExecutionDestinationSource::TypedObservedFunctionProgram {
+                artifact_sha256: wire.sha256,
+            }
+        );
+
+        let pack = write_file(&directory.0, "program.pack", b"typed block pack");
+        let expected_program_sha256 = sha256_hex(b"installed block program");
+        let block = materialize_release_program_build_receipt(
+            directory.0.join("block-receipt.json"),
+            &child.path,
+            ReleaseProgramBuildReceiptInput::TypedBlock {
+                pack: PathBuf::from(&pack.path),
+                expected_program_sha256: expected_program_sha256.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            block.execution_source,
+            ExecutionDestinationSource::TypedBlockProgram {
+                program_sha256: expected_program_sha256,
+                dispatch_artifact_sha256: pack.sha256,
+            }
+        );
+    }
+
+    #[test]
+    fn materializer_never_replaces_an_existing_output() {
+        let directory = TestDirectory::new();
+        let child = write_file(&directory.0, "child", b"child");
+        let wire = write_file(&directory.0, "wire", b"wire");
+        let output = directory.0.join("receipt.json");
+        let input = || ReleaseProgramBuildReceiptInput::TypedObservedFunction {
+            identity_wire: PathBuf::from(&wire.path),
+        };
+        materialize_release_program_build_receipt(&output, &child.path, input()).unwrap();
+        let before = fs::read(&output).unwrap();
+        let error = materialize_release_program_build_receipt(&output, &child.path, input())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already exists"));
+        assert_eq!(fs::read(&output).unwrap(), before);
+    }
+
+    #[test]
+    fn materializer_rejects_nonregular_inputs_and_duplicate_archive_labels() {
+        let directory = TestDirectory::new();
+        let child = write_file(&directory.0, "child", b"child");
+        let archive = write_file(&directory.0, "archive.a", b"archive");
+        let duplicate = materialize_release_program_build_receipt(
+            directory.0.join("duplicate.json"),
+            &child.path,
+            ReleaseProgramBuildReceiptInput::NativeArchives {
+                archives: vec![
+                    NativeArchiveReceiptInput {
+                        label: "same".to_owned(),
+                        path: PathBuf::from(&archive.path),
+                    },
+                    NativeArchiveReceiptInput {
+                        label: "same".to_owned(),
+                        path: PathBuf::from(&archive.path),
+                    },
+                ],
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(duplicate.contains("repeats logical label"));
+
+        let nonregular = materialize_release_program_build_receipt(
+            directory.0.join("nonregular.json"),
+            &child.path,
+            ReleaseProgramBuildReceiptInput::TypedObservedFunction {
+                identity_wire: directory.0.clone(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(nonregular.contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materializer_rejects_symlinked_inputs_and_output_parents() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let child = write_file(&directory.0, "child", b"child");
+        let wire = write_file(&directory.0, "wire", b"wire");
+        let wire_link = directory.0.join("wire-link");
+        symlink(&wire.path, &wire_link).unwrap();
+        let linked_input = materialize_release_program_build_receipt(
+            directory.0.join("linked-input.json"),
+            &child.path,
+            ReleaseProgramBuildReceiptInput::TypedObservedFunction {
+                identity_wire: wire_link,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(linked_input.contains("forbidden symlink"));
+
+        let real_parent = directory.0.join("real-parent");
+        fs::create_dir(&real_parent).unwrap();
+        let linked_parent = directory.0.join("linked-parent");
+        symlink(&real_parent, &linked_parent).unwrap();
+        let linked_output = materialize_release_program_build_receipt(
+            linked_parent.join("receipt.json"),
+            &child.path,
+            ReleaseProgramBuildReceiptInput::TypedObservedFunction {
+                identity_wire: PathBuf::from(&wire.path),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(linked_output.contains("forbidden symlink"));
     }
 
     #[test]

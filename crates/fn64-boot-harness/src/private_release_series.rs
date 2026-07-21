@@ -34,6 +34,8 @@ use std::{
 pub const PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA: &str = "fn64.private-release-run-contract.v2";
 pub const PRIVATE_RELEASE_SERIES_RECEIPT_SCHEMA: &str = "fn64.private-release-series-receipt.v1";
 pub const PRIVATE_RELEASE_SERIES_COUNT: usize = 10;
+pub const RELEASE_MICROCODE_TEXT_PATH_ENV: &str = "FN64_RELEASE_MICROCODE_TEXT_PATH";
+pub const RELEASE_MICROCODE_DATA_PATH_ENV: &str = "FN64_RELEASE_MICROCODE_DATA_PATH";
 pub const REPOSITORY_SYNTHETIC_RELEASE_SCENARIO: &str =
     "synthetic-runtime-device-render-fixed-cycle-v1";
 pub const REPOSITORY_SYNTHETIC_RELEASE_CYCLE: u64 = 1_562_500;
@@ -532,6 +534,29 @@ impl Drop for StagedChildExecutable {
     }
 }
 
+struct StagedPrivateArtifact(PathBuf);
+
+impl Drop for StagedPrivateArtifact {
+    fn drop(&mut self) {
+        make_removable(&self.0);
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+struct StagedMicrocodePair {
+    text: StagedPrivateArtifact,
+    data: StagedPrivateArtifact,
+    text_identity: PrivateFileIdentity,
+    data_identity: PrivateFileIdentity,
+}
+
+impl StagedMicrocodePair {
+    fn verify(&self) -> Result<(), PrivateReleaseSeriesError> {
+        verify_file_identity(&self.text_identity, "staged microcode text", false)?;
+        verify_file_identity(&self.data_identity, "staged microcode data", false)
+    }
+}
+
 #[cfg(windows)]
 fn make_removable(path: &Path) {
     if let Ok(metadata) = fs::metadata(path) {
@@ -545,6 +570,33 @@ fn make_removable(path: &Path) {
 
 #[cfg(not(windows))]
 fn make_removable(_path: &Path) {}
+
+fn open_private_stage(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn seal_private_stage(path: &Path, executable: bool) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = if executable { 0o500 } else { 0o400 };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = executable;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(path, permissions)
+    }
+}
 
 fn stage_child_executable(
     identity: &PrivateFileIdentity,
@@ -563,7 +615,7 @@ fn stage_child_executable(
             .map(|value| format!(".{value}"))
             .unwrap_or_default();
         let path = parent.join(format!(".fn64-release-child-{}{}", hex(&random), extension));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        match open_private_stage(&path) {
             Ok(mut destination) => {
                 let staged = StagedChildExecutable(path.clone());
                 let mut source_file = File::open(source).map_err(|source| {
@@ -572,15 +624,6 @@ fn stage_child_executable(
                         identity.path
                     ))
                 })?;
-                let mut permissions = source_file
-                    .metadata()
-                    .map_err(|source| {
-                        error(format!(
-                            "inspect child executable {} for exact staging: {source}",
-                            identity.path
-                        ))
-                    })?
-                    .permissions();
                 std::io::copy(&mut source_file, &mut destination)
                     .and_then(|_| destination.flush())
                     .and_then(|()| destination.sync_all())
@@ -590,10 +633,9 @@ fn stage_child_executable(
                             path.display()
                         ))
                     })?;
-                permissions.set_readonly(true);
-                fs::set_permissions(&path, permissions).map_err(|source| {
+                seal_private_stage(&path, true).map_err(|source| {
                     error(format!(
-                        "preserve staged child executable permissions {}: {source}",
+                        "seal staged child executable owner-only {}: {source}",
                         path.display()
                     ))
                 })?;
@@ -624,6 +666,91 @@ fn stage_child_executable(
     )))
 }
 
+fn stage_private_artifact(
+    identity: &PrivateArtifactIdentity,
+) -> Result<(StagedPrivateArtifact, PrivateFileIdentity), PrivateReleaseSeriesError> {
+    let source = Path::new(&identity.path);
+    let parent = source.parent().ok_or_else(|| {
+        error(format!(
+            "private artifact {:?} has no parent directory",
+            identity.role
+        ))
+    })?;
+    for _ in 0..32 {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|source| error(format!("obtain artifact-stage nonce: {source}")))?;
+        let path = parent.join(format!(".fn64-release-{}-{}", identity.role, hex(&random)));
+        match open_private_stage(&path) {
+            Ok(mut destination) => {
+                let staged = StagedPrivateArtifact(path.clone());
+                let mut source_file = File::open(source).map_err(|source| {
+                    error(format!(
+                        "open private artifact {:?} for exact staging: {source}",
+                        identity.role
+                    ))
+                })?;
+                std::io::copy(&mut source_file, &mut destination)
+                    .and_then(|_| destination.flush())
+                    .and_then(|()| destination.sync_all())
+                    .map_err(|source| {
+                        error(format!(
+                            "persist exact staged private artifact {:?}: {source}",
+                            identity.role
+                        ))
+                    })?;
+                seal_private_stage(&path, false).map_err(|source| {
+                    error(format!(
+                        "seal staged private artifact {:?} owner-only: {source}",
+                        identity.role
+                    ))
+                })?;
+                let staged_identity = PrivateFileIdentity {
+                    path: path
+                        .to_str()
+                        .ok_or_else(|| error("staged private artifact path is not UTF-8"))?
+                        .to_owned(),
+                    bytes: identity.bytes,
+                    sha256: identity.sha256.clone(),
+                };
+                verify_file_identity(&staged_identity, "staged private artifact", false)?;
+                return Ok((staged, staged_identity));
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(error(format!(
+                    "create exact private-artifact stage beside {:?}: {source}",
+                    identity.role
+                )))
+            }
+        }
+    }
+    Err(error(format!(
+        "could not allocate an exact staged private artifact for {:?}",
+        identity.role
+    )))
+}
+
+fn stage_microcode_pair(
+    contract: &PrivateReleaseRunContract,
+) -> Result<Option<StagedMicrocodePair>, PrivateReleaseSeriesError> {
+    if contract.purpose == "synthetic_mechanism" {
+        return Ok(None);
+    }
+    let (text, text_identity) =
+        stage_private_artifact(required_artifact(contract, "microcode_text")?)?;
+    let (data, data_identity) =
+        stage_private_artifact(required_artifact(contract, "microcode_data")?)?;
+    let pair = StagedMicrocodePair {
+        text,
+        data,
+        text_identity,
+        data_identity,
+    };
+    pair.verify()?;
+    Ok(Some(pair))
+}
+
 fn stage_contract_for_admission(
     source_path: &Path,
     bytes: &[u8],
@@ -639,7 +766,7 @@ fn stage_contract_for_admission(
             ".fn64-private-contract-admission-{}.json",
             hex(&random)
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        match open_private_stage(&path) {
             Ok(mut file) => {
                 let staged = StagedAdmissionContract(path.clone());
                 file.write_all(bytes)
@@ -651,19 +778,9 @@ fn stage_contract_for_admission(
                             path.display()
                         ))
                     })?;
-                let mut permissions = file
-                    .metadata()
-                    .map_err(|source| {
-                        error(format!(
-                            "inspect admission-stage contract {}: {source}",
-                            path.display()
-                        ))
-                    })?
-                    .permissions();
-                permissions.set_readonly(true);
-                fs::set_permissions(&path, permissions).map_err(|source| {
+                seal_private_stage(&path, false).map_err(|source| {
                     error(format!(
-                        "seal admission-stage contract {} read-only: {source}",
+                        "seal admission-stage contract {} owner-only: {source}",
                         path.display()
                     ))
                 })?;
@@ -959,6 +1076,7 @@ pub fn run_private_release_series(
         ))
     })?;
     let staged_child = stage_child_executable(&contract.child.executable)?;
+    let staged_microcode_pair = stage_microcode_pair(contract)?;
 
     let runner_executable = std::env::current_exe()
         .map_err(|source| error(format!("resolve runner executable: {source}")))?;
@@ -984,6 +1102,14 @@ pub fn run_private_release_series(
                 index + 1
             ))
         })?;
+        if let Some(pair) = &staged_microcode_pair {
+            pair.verify().map_err(|source| {
+                error(format!(
+                    "private release staged microcode preflight before child {} failed: {source}",
+                    index + 1
+                ))
+            })?;
+        }
         let staged_identity = PrivateFileIdentity {
             path: staged_child
                 .0
@@ -1033,6 +1159,11 @@ pub fn run_private_release_series(
             .env(RELEASE_GATE_CYCLE_ENV, contract.guest_cycle.to_string())
             .env(RELEASE_REPORT_ENV, &report_path)
             .env(RELEASE_RUN_EVENT_SHA256_ENV, &run_event_sha256);
+        if let Some(pair) = &staged_microcode_pair {
+            command
+                .env(RELEASE_MICROCODE_TEXT_PATH_ENV, &pair.text.0)
+                .env(RELEASE_MICROCODE_DATA_PATH_ENV, &pair.data.0);
+        }
 
         let status = command.status().map_err(|source| {
             error(format!(
@@ -1066,6 +1197,9 @@ pub fn run_private_release_series(
     }
     contract.verify_bound_files()?;
     verify_release_program_build_receipt_binding(contract)?;
+    if let Some(pair) = &staged_microcode_pair {
+        pair.verify()?;
+    }
     let staged_identity = PrivateFileIdentity {
         path: staged_child
             .0
@@ -2201,6 +2335,14 @@ mod tests {
             staged_path = staged.0.clone();
             assert_ne!(staged_path, source);
             assert_eq!(fs::read(&staged_path).unwrap(), captured);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&staged_path).unwrap().permissions().mode() & 0o777,
+                    0o400
+                );
+            }
         }
         assert!(!staged_path.exists());
     }
@@ -2221,6 +2363,14 @@ mod tests {
         let staged = stage_child_executable(&identity).unwrap();
         let staged_path = staged.0.clone();
         assert_eq!(fs::read(&staged_path).unwrap(), fs::read(&source).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&staged_path).unwrap().permissions().mode() & 0o777,
+                0o500
+            );
+        }
 
         fs::write(&source, b"\x7fELFmutated source bytes").unwrap();
         let staged_identity = PrivateFileIdentity {
@@ -2231,6 +2381,77 @@ mod tests {
         verify_file_identity(&staged_identity, "test staged child", false).unwrap();
         drop(staged);
         assert!(!staged_path.exists());
+    }
+
+    #[test]
+    fn microcode_pair_stage_is_exact_independent_and_revalidated() {
+        let directory = TestDirectory::new();
+        let text_path = directory.0.join("microcode-text.bin");
+        let data_path = directory.0.join("microcode-data.bin");
+        fs::write(&text_path, vec![0x5a; fn64_runtime::RSP_MEMORY_BANK_SIZE]).unwrap();
+        fs::write(&data_path, b"exact task data").unwrap();
+
+        let (mut contract, _) = fixture_contract(&directory.0.join("contract"));
+        contract.purpose = "full_rom".to_owned();
+        contract.admitted_artifacts = vec![
+            artifact_identity(&data_path, "microcode_data"),
+            artifact_identity(&text_path, "microcode_text"),
+        ];
+        let pair = stage_microcode_pair(&contract).unwrap().unwrap();
+        let staged_text_path = pair.text.0.clone();
+        let staged_data_path = pair.data.0.clone();
+        assert_ne!(staged_text_path, text_path);
+        assert_ne!(staged_data_path, data_path);
+        assert_eq!(
+            fs::read(&staged_text_path).unwrap(),
+            vec![0x5a; fn64_runtime::RSP_MEMORY_BANK_SIZE]
+        );
+        assert_eq!(fs::read(&staged_data_path).unwrap(), b"exact task data");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&staged_text_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o400
+            );
+            assert_eq!(
+                fs::metadata(&staged_data_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o400
+            );
+        }
+
+        fs::write(&text_path, vec![0xa5; fn64_runtime::RSP_MEMORY_BANK_SIZE]).unwrap();
+        fs::write(&data_path, b"mutated source").unwrap();
+        pair.verify().unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&staged_data_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let mut permissions = fs::metadata(&staged_data_path).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&staged_data_path, permissions).unwrap();
+        }
+        fs::write(&staged_data_path, b"tampered staged data").unwrap();
+        assert!(pair
+            .verify()
+            .unwrap_err()
+            .to_string()
+            .contains("identity drift"));
+        drop(pair);
+        assert!(!staged_text_path.exists());
+        assert!(!staged_data_path.exists());
     }
 
     #[test]
@@ -2258,21 +2479,27 @@ mod tests {
             .to_string()
             .contains("authoritative executable"));
 
-        let mut reserved = contract;
-        reserved.child.environment.push(PrivateEnvironmentEntry {
-            name: "FN64_PRIVATE_RUN_ID".to_owned(),
-            value: "forged".to_owned(),
-        });
-        reserved
-            .child
-            .environment
-            .sort_by(|left, right| left.name.cmp(&right.name));
-        reserved.contract_sha256 = reserved.recompute_contract_sha256().unwrap();
-        assert!(reserved
-            .verify_integrity()
-            .unwrap_err()
-            .to_string()
-            .contains("runner-owned"));
+        for name in [
+            "FN64_PRIVATE_RUN_ID",
+            RELEASE_MICROCODE_TEXT_PATH_ENV,
+            RELEASE_MICROCODE_DATA_PATH_ENV,
+        ] {
+            let mut reserved = contract.clone();
+            reserved.child.environment.push(PrivateEnvironmentEntry {
+                name: name.to_owned(),
+                value: "forged".to_owned(),
+            });
+            reserved
+                .child
+                .environment
+                .sort_by(|left, right| left.name.cmp(&right.name));
+            reserved.contract_sha256 = reserved.recompute_contract_sha256().unwrap();
+            assert!(reserved
+                .verify_integrity()
+                .unwrap_err()
+                .to_string()
+                .contains("runner-owned"));
+        }
     }
 
     #[test]

@@ -64,6 +64,35 @@ fn env_path(name: &str) -> std::path::PathBuf {
         .into()
 }
 
+struct ReleaseMicrocodePair {
+    text: [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    data: Vec<u8>,
+}
+
+fn load_release_microcode_pair() -> ReleaseMicrocodePair {
+    let text_path = env_path(fn64_boot_harness::RELEASE_MICROCODE_TEXT_PATH_ENV);
+    let data_path = env_path(fn64_boot_harness::RELEASE_MICROCODE_DATA_PATH_ENV);
+    let text = std::fs::read(&text_path).unwrap_or_else(|error| {
+        panic!("oot-boot: read runner-staged release microcode text: {error}")
+    });
+    let text: [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE] =
+        text.try_into().unwrap_or_else(|text: Vec<u8>| {
+            panic!(
+                "oot-boot: runner-staged release microcode text has {} bytes, expected {}",
+                text.len(),
+                fn64_runtime::RSP_MEMORY_BANK_SIZE
+            )
+        });
+    let data = std::fs::read(&data_path).unwrap_or_else(|error| {
+        panic!("oot-boot: read runner-staged release microcode data: {error}")
+    });
+    assert!(
+        !data.is_empty() && u32::try_from(data.len()).is_ok(),
+        "oot-boot: runner-staged release microcode data must contain 1..=u32::MAX bytes"
+    );
+    ReleaseMicrocodePair { text, data }
+}
+
 #[cfg(not(fn64_recomp_rs))]
 fn linked_native_program_identity() -> fn64_boot_harness::NativeProgramArtifactIdentity {
     fn64_boot_harness::NativeProgramArtifactIdentity::from_hex(env!(
@@ -512,6 +541,7 @@ fn main() {
     // thousands of log lines and colliding filenames across deterministic
     // report workers even though the later harness capture was disabled.
     let perf_no_capture = std::env::var_os("OOT_PERF_NO_CAPTURE").is_some();
+    let release_microcode_pair = release_gate.as_ref().map(|_| load_release_microcode_pair());
     // NOTE: 240 (one full second of NTSC frames) so the capture reaches the
     // frames where real 3D geometry appears -- the first ~8 gfx tasks are
     // OoT's boot/logo screens (large flat gradient background quads), and
@@ -525,6 +555,10 @@ fn main() {
         let mut backend = fn64_render_rt64::ReferenceBackend::new()
             .with_f3dex2()
             .with_clear_color([0, 0, 0, 255]);
+        if let Some(pair) = &release_microcode_pair {
+            backend =
+                backend.with_microcode_pair(fn64_render::UcodeId::F3dex2, &pair.text, &pair.data);
+        }
         if !perf_no_capture {
             backend = backend
                 .with_auto_dump("/tmp", "fn64-oot-render", 240)
@@ -553,6 +587,9 @@ fn main() {
     let (render_backend, active_renderer): (Box<dyn fn64_render::RenderBackend>, &'static str) =
         if requested_renderer == "rt64" {
             let mut backend = fn64_render_rt64::Rt64Backend::new();
+            if let Some(pair) = &release_microcode_pair {
+                backend = backend.with_f3dex2_ucode_pair(&pair.text, &pair.data);
+            }
             match backend.create(&fn64_render::RenderConfig::new(320, 240)) {
                 Ok(()) => {
                     if release_gate.is_some() || presentation_discovery.is_some() {
