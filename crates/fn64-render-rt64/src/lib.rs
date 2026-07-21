@@ -17,6 +17,8 @@ mod adapter_source_identity;
 pub mod extended_gbi;
 #[cfg(feature = "rt64")]
 mod ffi;
+#[cfg(any(feature = "rt64", test))]
+mod transaction;
 
 #[cfg(feature = "rt64")]
 use std::ffi::CString;
@@ -34,6 +36,8 @@ use fn64_render::{
 #[cfg(feature = "rt64")]
 use fn64_render::{PresentMemory, TaskAdmissionPlan, TaskAdmissionRawWindow};
 use sha2::Digest;
+#[cfg(feature = "rt64")]
+use transaction::{NativeContextLease, NativeRdramRollback, NativeTaskMemoryRollback};
 
 #[cfg(feature = "rt64")]
 const RT64_GBI_TEXT_RECOGNITION_BYTES: usize = 0x18d0;
@@ -921,6 +925,10 @@ pub struct Rt64Backend {
     last_dp_full_sync: fn64_render::DpFullSyncStatus,
     #[cfg(feature = "rt64")]
     context: Option<ffi::Context>,
+    /// Reused full-device preimage for failure-atomic native task/raw-RDP
+    /// calls. It is scratch only and never becomes a second RDRAM authority.
+    #[cfg(feature = "rt64")]
+    native_rdram_preimage: Vec<u8>,
     #[cfg(not(feature = "rt64"))]
     created: bool,
     /// Authority and guest cycle of the last successfully completed VI
@@ -951,6 +959,8 @@ impl Rt64Backend {
             last_dp_full_sync: fn64_render::DpFullSyncStatus::Unidentified,
             #[cfg(feature = "rt64")]
             context: None,
+            #[cfg(feature = "rt64")]
+            native_rdram_preimage: Vec::new(),
             #[cfg(not(feature = "rt64"))]
             created: false,
             last_present: None,
@@ -964,6 +974,23 @@ impl Rt64Backend {
             configured_replacement_enabled: RenderReplacementSettings::default().enabled,
             active_replacement_settings: None,
         }
+    }
+
+    #[cfg(any(feature = "rt64", test))]
+    fn clear_active_native_identity(&mut self) {
+        self.active_tv_type = None;
+        self.last_present = None;
+        self.active_settings = None;
+        self.active_enhancement_settings = None;
+        self.active_emulator_settings = None;
+        self.active_replacement_settings = None;
+        self.last_dp_full_sync = fn64_render::DpFullSyncStatus::Unidentified;
+    }
+
+    #[cfg(feature = "rt64")]
+    fn invalidate_native_state(&mut self) {
+        self.context = None;
+        self.clear_active_native_identity();
     }
 
     /// Present one complete live register image against a standalone
@@ -2262,15 +2289,36 @@ impl RenderBackend for Rt64Backend {
                 plan: inspection.admission_plan,
                 raw_windows: inspection.raw_windows,
             };
-            let native_outcome = self
-                .context
-                .as_mut()
-                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
-                .process_task(rdram, rsp_memory, task, output_addr, &admission_plan)
-                .map_err(|reason| RenderError::Backend {
-                    backend: "rt64",
-                    reason,
-                })?;
+            let mut context = NativeContextLease::take(&mut self.context)
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?;
+            let mut transaction =
+                NativeTaskMemoryRollback::new(rdram, rsp_memory, &mut self.native_rdram_preimage);
+            let native_call = {
+                let (native_rdram, native_rsp) = transaction.memories_mut();
+                context.context_mut().process_task(
+                    native_rdram,
+                    native_rsp,
+                    task,
+                    output_addr,
+                    &admission_plan,
+                )
+            };
+            let native_outcome = match native_call {
+                Ok(outcome) => outcome,
+                Err(reason) => {
+                    // Destroy the potentially mutated native context before
+                    // the rollback guard republishes the guest-memory
+                    // preimage. No later call can observe either half of the
+                    // rejected task.
+                    drop(context);
+                    drop(transaction);
+                    self.invalidate_native_state();
+                    return Err(RenderError::Backend {
+                        backend: "rt64",
+                        reason,
+                    });
+                }
+            };
             let native_result = match native_outcome {
                 ffi::NativeTaskOutcome::Complete(result) => result,
                 ffi::NativeTaskOutcome::NeedsLle {
@@ -2282,9 +2330,21 @@ impl RenderBackend for Rt64Backend {
                         .generations()
                         .get(rejected_generation as usize)
                         .expect("schema-checked native rejection index is in the admission plan");
-                    return Ok(FrameStatus::NeedsLle {
-                        ucode_sha256: generation.text_sha256.as_bytes(),
-                    });
+                    let ucode_sha256 = generation.text_sha256.as_bytes();
+                    if !transaction.unchanged() {
+                        drop(context);
+                        drop(transaction);
+                        self.invalidate_native_state();
+                        return Err(RenderError::Backend {
+                            backend: "rt64-task-result",
+                            reason: format!(
+                                "native RT64 mutated guest memory during precommit NeedsLle for generation {rejected_generation}"
+                            ),
+                        });
+                    }
+                    transaction.commit();
+                    context.restore();
+                    return Ok(FrameStatus::NeedsLle { ucode_sha256 });
                 }
             };
             let full_sync = match validate_native_full_sync_count(
@@ -2293,11 +2353,9 @@ impl RenderBackend for Rt64Backend {
             ) {
                 Ok(full_sync) => full_sync,
                 Err(reason) => {
-                    // Native execution has already mutated renderer state.
-                    // A count disagreement therefore invalidates the whole
-                    // context; continuing would let unverified post-task
-                    // state influence later submissions.
-                    self.context = None;
+                    drop(context);
+                    drop(transaction);
+                    self.invalidate_native_state();
                     return Err(RenderError::Backend {
                         backend: "rt64-task-result",
                         reason: format!(
@@ -2311,6 +2369,8 @@ impl RenderBackend for Rt64Backend {
                     });
                 }
             };
+            transaction.commit();
+            context.restore();
             self.last_dp_full_sync = full_sync;
             Ok(FrameStatus::Complete)
         }
@@ -2349,14 +2409,25 @@ impl RenderBackend for Rt64Backend {
             }
             debug_assert!(start_usize < end_usize);
             let full_sync = fn64_render::inspect_raw_rdp_full_sync(rdram, start, end)?;
-            self.context
-                .as_mut()
-                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
-                .process_rdp_commands(rdram, start, end, output_addr)
-                .map_err(|reason| RenderError::Backend {
+            let mut context = NativeContextLease::take(&mut self.context)
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?;
+            let mut transaction = NativeRdramRollback::new(rdram, &mut self.native_rdram_preimage);
+            if let Err(reason) = context.context_mut().process_rdp_commands(
+                transaction.memory_mut(),
+                start,
+                end,
+                output_addr,
+            ) {
+                drop(context);
+                drop(transaction);
+                self.invalidate_native_state();
+                return Err(RenderError::Backend {
                     backend: "rt64",
                     reason,
-                })?;
+                });
+            }
+            transaction.commit();
+            context.restore();
             self.last_dp_full_sync = full_sync;
             Ok(FrameStatus::Complete)
         }
@@ -2722,6 +2793,14 @@ mod tests {
         );
         assert!(process_task.contains("f3dex_force_branch"));
         assert!(process_task.contains("GeometryTaskInspectionPolicy { force_branch }"));
+        assert!(process_task.contains("NativeContextLease::take(&mut self.context)"));
+        assert!(process_task.contains("NativeTaskMemoryRollback::new("));
+        assert!(process_task.contains("&mut self.native_rdram_preimage"));
+        assert!(process_task.contains("transaction.commit()"));
+        assert!(
+            !process_task.contains("self.context.as_mut()"),
+            "native task execution must take context ownership before FFI"
+        );
         for forbidden in [
             "gbi::inspect_",
             "gbi::execute_",
@@ -2734,6 +2813,32 @@ mod tests {
                 "RT64 production task submission still references {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn rt64_raw_rdp_submission_owns_context_and_rdram_rollback() {
+        let source = include_str!("lib.rs");
+        let rt64_impl = source
+            .find("impl RenderBackend for Rt64Backend")
+            .expect("Rt64Backend RenderBackend implementation exists");
+        let process_start = rt64_impl
+            + source[rt64_impl..]
+                .find("    fn process_rdp_commands(")
+                .expect("Rt64Backend process_rdp_commands exists");
+        let process_end = process_start
+            + source[process_start..]
+                .find("    fn last_dp_full_sync(")
+                .expect("last_dp_full_sync follows process_rdp_commands");
+        let process_rdp = &source[process_start..process_end];
+
+        assert!(process_rdp.contains("NativeContextLease::take(&mut self.context)"));
+        assert!(process_rdp.contains("NativeRdramRollback::new("));
+        assert!(process_rdp.contains("&mut self.native_rdram_preimage"));
+        assert!(process_rdp.contains("transaction.commit()"));
+        assert!(
+            !process_rdp.contains("self.context.as_mut()"),
+            "raw RDP execution must take context ownership before FFI"
+        );
     }
 
     #[test]
@@ -2750,6 +2855,39 @@ mod tests {
             assert!(error.contains(&format!("executed {native} FullSync")));
             assert!(error.contains(&format!("executed {inspected}")));
         }
+    }
+
+    #[test]
+    fn native_invalidation_clears_active_identity_but_keeps_recreate_configuration() {
+        let mut backend = Rt64Backend::new();
+        let configured_policy_sha256 = backend.configured_runtime_policy().sha256();
+        backend.active_tv_type = Some(fn64_runtime::TvType::Pal);
+        backend.last_present = Some(CompletedRt64Present {
+            guest_cycle: 91,
+            authority: Rt64PresentAuthority::LiveRegisters,
+        });
+        backend.active_settings = Some(RenderRuntimeSettings::default());
+        backend.active_enhancement_settings = Some(RenderEnhancementSettings::default());
+        backend.active_emulator_settings = Some(RenderEmulatorSettings::default());
+        backend.active_replacement_settings = Some(RenderReplacementSettings::default());
+        backend.last_dp_full_sync = fn64_render::DpFullSyncStatus::Reached;
+
+        backend.clear_active_native_identity();
+
+        assert_eq!(backend.active_tv_type, None);
+        assert_eq!(backend.last_present, None);
+        assert_eq!(backend.active_settings, None);
+        assert_eq!(backend.active_enhancement_settings, None);
+        assert_eq!(backend.active_emulator_settings, None);
+        assert_eq!(backend.active_replacement_settings, None);
+        assert_eq!(
+            backend.last_dp_full_sync,
+            fn64_render::DpFullSyncStatus::Unidentified
+        );
+        assert_eq!(
+            backend.configured_runtime_policy().sha256(),
+            configured_policy_sha256
+        );
     }
 
     #[test]

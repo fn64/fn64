@@ -3627,6 +3627,63 @@ mod tests {
                 plan_sha256,
                 ..RawTaskResult::default()
             },
+            RawTaskResult {
+                schema: TASK_RESULT_SCHEMA,
+                entry_gbi_available: 1,
+                disposition: UCODE_DISPOSITION_COMPLETE,
+                planned_generation_count: 2,
+                observed_generation_count: 2,
+                rejected_generation: u32::MAX,
+                plan_sha256,
+                ..RawTaskResult::default()
+            },
+            RawTaskResult {
+                schema: TASK_RESULT_SCHEMA,
+                entry_gbi_available: 1,
+                disposition: UCODE_DISPOSITION_COMPLETE,
+                planned_generation_count: 1,
+                observed_generation_count: 1,
+                rejected_generation: u32::MAX,
+                plan_sha256: [0x24; 32],
+                ..RawTaskResult::default()
+            },
+            RawTaskResult {
+                schema: TASK_RESULT_SCHEMA,
+                entry_gbi_available: 1,
+                disposition: UCODE_DISPOSITION_COMPLETE,
+                planned_generation_count: 1,
+                observed_generation_count: 2,
+                rejected_generation: u32::MAX,
+                plan_sha256,
+                ..RawTaskResult::default()
+            },
+            RawTaskResult {
+                schema: TASK_RESULT_SCHEMA,
+                entry_gbi_available: 1,
+                disposition: UCODE_DISPOSITION_NEEDS_LLE,
+                planned_generation_count: 1,
+                rejected_generation: 0,
+                plan_sha256,
+                ..RawTaskResult::default()
+            },
+            RawTaskResult {
+                schema: TASK_RESULT_SCHEMA,
+                disposition: UCODE_DISPOSITION_NEEDS_LLE,
+                planned_generation_count: 1,
+                rejected_generation: 1,
+                plan_sha256,
+                ..RawTaskResult::default()
+            },
+            RawTaskResult {
+                schema: TASK_RESULT_SCHEMA,
+                entry_gbi_available: 1,
+                disposition: 99,
+                planned_generation_count: 1,
+                observed_generation_count: 1,
+                rejected_generation: u32::MAX,
+                plan_sha256,
+                ..RawTaskResult::default()
+            },
         ] {
             assert!(task_result_from_raw(raw, 1, plan_sha256).is_err());
         }
