@@ -1896,15 +1896,18 @@ fn validate_copy_texture_rectangle(
     })?;
     let rgba16 =
         texture.format == gbi::ColorImage::RGBA_FORMAT && texture.size == gbi::ColorImage::BITS_16;
-    let direct_ci8 = texture.format == gbi::ColorImage::CI_FORMAT
-        && texture.size == gbi::ColorImage::BITS_8
-        && rectangle.other_mode.texture_lut() == 0;
-    if !rgba16 && !direct_ci8 {
+    let direct_8bit = texture.size == gbi::ColorImage::BITS_8
+        && match texture.format {
+            gbi::ColorImage::I_FORMAT | gbi::ColorImage::IA_FORMAT => true,
+            gbi::ColorImage::CI_FORMAT => rectangle.other_mode.texture_lut() == 0,
+            _ => false,
+        };
+    if !rgba16 && !direct_8bit {
         return Err(render_unsupported_error(
             "reference",
             "render.rdp.copy-source-layout",
             format!(
-                "{} copy source format={} size={} LUT={} is unsupported; expected RGBA16 or non-dereferenced CI8",
+                "{} copy source format={} size={} LUT={} is unsupported; expected RGBA16, I8, IA8, or non-dereferenced CI8",
                 texture_rectangle_name(rectangle),
                 texture.format,
                 texture.size,
@@ -1914,7 +1917,7 @@ fn validate_copy_texture_rectangle(
     }
     if let Some(target) = target {
         let matching_target = matches!(
-            (rgba16, direct_ci8, target.layout()),
+            (rgba16, direct_8bit, target.layout()),
             (true, false, Some(gbi::ColorImageLayout::Rgba16))
                 | (false, true, Some(gbi::ColorImageLayout::Index8))
         );
@@ -5130,6 +5133,92 @@ impl RenderBackend for Rt64Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_direct_8bit_copy(
+        source_format: u8,
+        width: u16,
+        height: u16,
+        source: &[u8],
+        threshold: Option<u8>,
+    ) -> Vec<u8> {
+        const DL: usize = 0x100;
+        const TEXTURE: u32 = 0x600;
+        const TARGET: u32 = 0x800;
+        let pixel_count = usize::from(width) * usize::from(height);
+        assert_eq!(source.len(), pixel_count);
+        let mut rdram = vec![0u8; 0x1000];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (index, value) in source.iter().copied().enumerate() {
+                view.write_u8(
+                    fn64_runtime::RdramAddr::from_offset(TEXTURE + index as u32),
+                    value,
+                );
+                view.write_u8(
+                    fn64_runtime::RdramAddr::from_offset(TARGET + index as u32),
+                    0xaa,
+                );
+            }
+        }
+        let mut commands = Vec::new();
+        let alpha_compare = u32::from(threshold.is_some());
+        commands.push((0xef00_0000 | (2 << 20), alpha_compare));
+        if let Some(threshold) = threshold {
+            commands.push((0xf900_0000, u32::from(threshold)));
+        }
+        let width_field = u32::from(width - 1);
+        let format_field = u32::from(source_format) << 21;
+        let size_field = u32::from(gbi::ColorImage::BITS_8) << 19;
+        commands.push((
+            0xff00_0000 | (u32::from(gbi::ColorImage::I_FORMAT) << 21) | size_field | width_field,
+            TARGET,
+        ));
+        commands.push((
+            0xfd00_0000 | format_field | size_field | width_field,
+            TEXTURE,
+        ));
+        let line_words = u32::from(width).div_ceil(8);
+        let tile_word0 = 0xf500_0000 | format_field | size_field | (line_words << 9);
+        commands.push((tile_word0, 7 << 24));
+        let lrs = u32::from(width - 1) * 4;
+        let lrt = u32::from(height - 1) * 4;
+        commands.push((0xf400_0000, (7 << 24) | (lrs << 12) | lrt));
+        commands.push((tile_word0, 0x0008_0200));
+        commands.push((0xf200_0000, (lrs << 12) | lrt));
+        commands.push((0xe400_0000 | (lrs << 12) | lrt, 0));
+        commands.push((0, 0x1000_0400));
+        commands.push((0xe900_0000, 0));
+        commands.push((0xdf00_0000, 0));
+        for (index, (word0, word1)) in commands.into_iter().enumerate() {
+            let offset = DL + index * 8;
+            rdram[offset..offset + 4].copy_from_slice(&word0.to_ne_bytes());
+            rdram[offset + 4..offset + 8].copy_from_slice(&word1.to_ne_bytes());
+        }
+
+        let mut backend = ReferenceBackend::new()
+            .with_f3dex2()
+            .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
+        backend
+            .create(&RenderConfig::new(u32::from(width), u32::from(height)))
+            .unwrap();
+        backend
+            .process_task(
+                &mut rdram,
+                &mut fn64_runtime::RspMemory::new(),
+                &OsTask {
+                    task_type: fn64_render::M_GFXTASK,
+                    data_ptr: DL as u32,
+                    ..OsTask::default()
+                },
+                0,
+            )
+            .unwrap();
+
+        let view = fn64_runtime::RdramView::from_storage(&rdram);
+        (0..pixel_count)
+            .map(|index| view.read_u8(fn64_runtime::RdramAddr::from_offset(TARGET + index as u32)))
+            .collect()
+    }
 
     fn present_resident(
         backend: &mut ReferenceBackend,
@@ -8604,80 +8693,159 @@ mod tests {
                 assert_eq!(admitted, expected, "{source:?} -> {destination:?}");
             }
         }
+
+        for source_format in [gbi::ColorImage::I_FORMAT, gbi::ColorImage::IA_FORMAT] {
+            for destination in gbi::ColorImageLayout::ALL {
+                let rectangle = gbi::TextureRectangle {
+                    ulx: 0.0,
+                    uly: 0.0,
+                    lrx: 0.0,
+                    lry: 0.0,
+                    tile: 0,
+                    s: 0.0,
+                    t: 0.0,
+                    dsdx: 4 << 10,
+                    dtdy: 1 << 10,
+                    flip: false,
+                    other_mode: gbi::OtherMode::from_raw(2 << 20, 0, 0),
+                    combiner: gbi::CombinerState::default(),
+                    blender: gbi::BlenderState::default(),
+                    scissor: None,
+                    texture: Some(gbi::Texture {
+                        format: source_format,
+                        size: gbi::ColorImage::BITS_8,
+                        width: 1,
+                        height: 1,
+                        texels: std::rc::Rc::new(vec![255; 4]),
+                        clamp_s: true,
+                        clamp_t: true,
+                        mirror_s: false,
+                        mirror_t: false,
+                        mask_s: 0,
+                        mask_t: 0,
+                        shift_s: 0,
+                        shift_t: 0,
+                        origin_s: 0.0,
+                        origin_t: 0.0,
+                        tmem: None,
+                        lod: None,
+                    }),
+                    texture1: None,
+                };
+                assert_eq!(
+                    validate_copy_texture_rectangle(&rectangle, Some(target(destination))).is_ok(),
+                    destination == gbi::ColorImageLayout::Index8,
+                    "format {source_format} -> {destination:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copy_source_gate_rejects_ci8_tlut_and_undefined_eight_bit_formats() {
+        let target = gbi::ColorImage {
+            format: gbi::ColorImage::I_FORMAT,
+            size: gbi::ColorImage::BITS_8,
+            width: 1,
+            address: 0,
+        };
+        let mut rectangle = gbi::TextureRectangle {
+            ulx: 0.0,
+            uly: 0.0,
+            lrx: 0.0,
+            lry: 0.0,
+            tile: 0,
+            s: 0.0,
+            t: 0.0,
+            dsdx: 4 << 10,
+            dtdy: 1 << 10,
+            flip: false,
+            other_mode: gbi::OtherMode::from_raw((2 << 20) | (2 << 14), 0, 0),
+            combiner: gbi::CombinerState::default(),
+            blender: gbi::BlenderState::default(),
+            scissor: None,
+            texture: Some(gbi::Texture {
+                format: gbi::ColorImage::CI_FORMAT,
+                size: gbi::ColorImage::BITS_8,
+                width: 1,
+                height: 1,
+                texels: std::rc::Rc::new(vec![255; 4]),
+                clamp_s: true,
+                clamp_t: true,
+                mirror_s: false,
+                mirror_t: false,
+                mask_s: 0,
+                mask_t: 0,
+                shift_s: 0,
+                shift_t: 0,
+                origin_s: 0.0,
+                origin_t: 0.0,
+                tmem: None,
+                lod: None,
+            }),
+            texture1: None,
+        };
+        assert!(validate_copy_texture_rectangle(&rectangle, Some(target)).is_err());
+
+        rectangle.other_mode = gbi::OtherMode::from_raw(2 << 20, 0, 0);
+        rectangle.texture.as_mut().unwrap().format = gbi::ColorImage::RGBA_FORMAT;
+        assert!(validate_copy_texture_rectangle(&rectangle, Some(target)).is_err());
+        rectangle.texture.as_mut().unwrap().format = 1;
+        assert!(validate_copy_texture_rectangle(&rectangle, Some(target)).is_err());
     }
 
     #[test]
     fn copy_ci8_indices_directly_to_eight_bit_color_image() {
-        const DL: usize = 0x100;
-        const TEXTURE: u32 = 0x600;
-        const TARGET: u32 = 0x800;
-        let mut rdram = vec![0u8; 0x1000];
-        {
-            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
-            for (index, value) in [0u8, 1, 0x7f, 0xff].into_iter().enumerate() {
-                view.write_u8(
-                    fn64_runtime::RdramAddr::from_offset(TEXTURE + index as u32),
-                    value,
-                );
-                view.write_u8(
-                    fn64_runtime::RdramAddr::from_offset(TARGET + index as u32),
-                    0xaa,
-                );
-            }
-        }
-        let mut offset = DL;
-        let write_command = |rdram: &mut [u8], offset: usize, w0: u32, w1: u32| {
-            rdram[offset..offset + 4].copy_from_slice(&w0.to_ne_bytes());
-            rdram[offset + 4..offset + 8].copy_from_slice(&w1.to_ne_bytes());
-        };
-        // Copy cycle, no TLUT dereference, threshold alpha compare at index 1.
-        write_command(&mut rdram, offset, 0xef00_0000 | (2 << 20), 1);
-        offset += 8;
-        write_command(&mut rdram, offset, 0xf900_0000, 1);
-        offset += 8;
-        // Public 8-bit color image and CI8 texture image, both width four.
-        write_command(&mut rdram, offset, 0xff88_0003, TARGET);
-        offset += 8;
-        write_command(&mut rdram, offset, 0xfd48_0003, TEXTURE);
-        offset += 8;
-        write_command(&mut rdram, offset, 0xf548_0000, 7 << 24);
-        offset += 8;
-        write_command(&mut rdram, offset, 0xf300_0000, (7 << 24) | (3 << 12));
-        offset += 8;
-        write_command(&mut rdram, offset, 0xf548_0200, 0x0008_0200);
-        offset += 8;
-        write_command(&mut rdram, offset, 0xf200_0000, 0x0000_c000);
-        offset += 8;
-        write_command(&mut rdram, offset, 0xe400_0000 | ((3 * 4) << 12), 0);
-        offset += 8;
-        write_command(&mut rdram, offset, 0, 0x1000_0400);
-        offset += 8;
-        write_command(&mut rdram, offset, 0xe900_0000, 0);
-        offset += 8;
-        write_command(&mut rdram, offset, 0xdf00_0000, 0);
+        assert_eq!(
+            run_direct_8bit_copy(
+                gbi::ColorImage::CI_FORMAT,
+                4,
+                1,
+                &[0, 1, 0x7f, 0xff],
+                Some(1),
+            ),
+            [0xaa, 1, 0x7f, 0xff]
+        );
+    }
 
-        let mut backend = ReferenceBackend::new()
-            .with_f3dex2()
-            .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(4, 1)).unwrap();
-        backend
-            .process_task(
-                &mut rdram,
-                &mut fn64_runtime::RspMemory::new(),
-                &OsTask {
-                    task_type: fn64_render::M_GFXTASK,
-                    data_ptr: DL as u32,
-                    ..OsTask::default()
-                },
-                0,
-            )
-            .unwrap();
+    #[test]
+    fn copy_i8_preserves_source_bytes_and_uses_intensity_as_alpha() {
+        assert_eq!(
+            run_direct_8bit_copy(
+                gbi::ColorImage::I_FORMAT,
+                8,
+                1,
+                &[0, 0x7f, 0x80, 0xff, 0x20, 0x81, 0x01, 0xfe],
+                Some(0x80),
+            ),
+            [0xaa, 0xaa, 0x80, 0xff, 0xaa, 0x81, 0xaa, 0xfe]
+        );
+    }
 
-        let view = fn64_runtime::RdramView::from_storage(&rdram);
-        let actual = std::array::from_fn(|index| {
-            view.read_u8(fn64_runtime::RdramAddr::from_offset(TARGET + index as u32))
-        });
-        assert_eq!(actual, [0xaa, 1, 0x7f, 0xff]);
+    #[test]
+    fn copy_ia8_preserves_packed_bytes_and_compares_expanded_alpha_nibble() {
+        assert_eq!(
+            run_direct_8bit_copy(
+                gbi::ColorImage::IA_FORMAT,
+                8,
+                1,
+                &[0x10, 0x17, 0x28, 0x4f, 0xf8, 0xe9, 0xa0, 0xbf],
+                Some(0x88),
+            ),
+            [0xaa, 0xaa, 0x28, 0x4f, 0xf8, 0xe9, 0xaa, 0xbf]
+        );
+    }
+
+    #[test]
+    fn copy_ia8_preserves_odd_tmem_row_layout_without_alpha_compare() {
+        let source = [
+            0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed,
+            0xfe, 0x0f,
+        ];
+        assert_eq!(
+            run_direct_8bit_copy(gbi::ColorImage::IA_FORMAT, 8, 2, &source, None),
+            source
+        );
     }
 
     #[test]

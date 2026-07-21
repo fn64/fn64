@@ -182,9 +182,12 @@ gate scanlines across fill, depth-fill, copy/combined rectangle, raw-triangle,
 and high-level-triangle paths. The three public 8-bit/RGBA16/RGBA32 color
 layouts share typed validation/import/fill/commit and exact-byte same-address
 reinterpretation. An exhaustive typed matrix covers all nine target switches,
-all three fill layouts, and the two publicly admitted direct copy pairs
-(undereferenced CI8 to I8 and RGBA16 to RGBA16); every other copy-layout pair
-fails loudly. With RGB/alpha dither disabled, RGBA16 RGB and RGBA32 memory
+all three fill layouts, direct I8, packed IA8, undereferenced CI8, and RGBA16
+copy sources, and every admitted source/target size pairing; unsupported
+copy-source formats and cross-size targets fail loudly. Eight-bit copy retains
+the original TMEM byte, including odd-row bank layout, while alpha comparison
+uses I8 intensity, IA8's expanded low nibble, or the undereferenced CI8 index.
+With RGB/alpha dither disabled, RGBA16 RGB and RGBA32 memory
 alpha use the manual's three-bit truncation instead of round-to-nearest.
 One/two-cycle RGB MagicSquare/Bayer and alpha Pattern/InversePattern selectors
 execute before all three public I8, RGBA16, and RGBA32 color-image writes. The

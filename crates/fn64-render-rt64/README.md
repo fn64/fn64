@@ -69,7 +69,10 @@ section 15.5. Disabled dither retains the known exact truncation path: RGBA16
 RGB and RGBA32 memory alpha reduce with `>> 3`. Copy and fill cycles retain
 their documented blender-bypass behavior; `G_FILLRECT` in one/two-cycle mode
 instead follows the supported combiner, alpha-compare, depth, blender, dither,
-and color-write path with an exclusive lower-right edge.
+and color-write path with an exclusive lower-right edge. Copy-cycle I8, packed
+IA8, and undereferenced CI8 preserve the original TMEM byte in an 8-bit color
+target while alpha compare consumes the source format's intensity, expanded
+IA8 low nibble, or CI8 index; RGBA16 retains its one-bit write-enable rule.
 
 VI scanout is isolated from that RDP dither stage in `src/vi.rs`. Every live
 presentation receives a retrace-scoped physical-RDRAM capability and rereads
