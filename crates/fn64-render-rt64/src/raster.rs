@@ -504,10 +504,17 @@ fn raw_span_edges_at_y_eighth(
         i64::from(edge.xl)
             + fixed_mul_ratio(edge.dxldy, i64::from(sample_y_eighth - middle_eighth), 8)
     };
-    if edge.right_major {
-        (minor_x, major_x)
-    } else {
+    // `lft` (command bit 55): 1 = LEFT-major -- the H (major) edge walks the
+    // triangle's LEFT side and spans run major -> minor; 0 mirrors it.
+    // Verified against WM2000's live title-scene stream (task #783): its
+    // rect-split tris carry lft=1 with a constant XH on the left and XM/XL
+    // marching right. The previous reading was inverted, which made every
+    // real triangle's span come back right < left = empty -- raw RDP
+    // geometry decoded but never rasterized a single pixel.
+    if edge.left_major {
         (major_x, minor_x)
+    } else {
+        (minor_x, major_x)
     }
 }
 
@@ -1364,9 +1371,36 @@ impl Framebuffer {
                     // crossing) hit it; the assert was right to exist until
                     // then, and the hardware-faithful behavior is "keep
                     // rasterizing", not "abort the machine".
-                    let corrected = |values: [i64; 3]| {
-                        let denom = values[2].unsigned_abs().max(1) as f32;
-                        (values[0] as f32 / denom, values[1] as f32 / denom)
+                    //
+                    // Scale (2026-07-21 WM2000 title-scene rung): hardware
+                    // tcdiv is not a bare S/W ratio -- it produces an S10.5
+                    // texel coordinate. The pipeline feeds tcdiv the high
+                    // bits of the s15.16 attribute planes and multiplies by
+                    // a 2^15-normalized reciprocal of W, so the output is
+                    // (S/W) * 2^15 in S10.5 units = (S/W) * 2^10 texels
+                    // (angrylion `tcdiv` persp path; RT64 divides s.w by
+                    // w and scales identically). Without the 2^10 the whole
+                    // title-screen quad collapsed onto texel (0,0) -- every
+                    // pixel sampled the image's corner and the presented
+                    // frame was a uniform field. With G_TP_NONE the divide
+                    // is skipped entirely and the plane's integer part IS
+                    // the S10.5 coordinate (angrylion `tcdiv_nopersp`).
+                    let persp = triangle.other_mode.texture_perspective();
+                    let corrected = move |values: [i64; 3]| {
+                        if persp {
+                            let denom = values[2].unsigned_abs().max(1) as f32;
+                            (
+                                values[0] as f32 / denom * 1024.0,
+                                values[1] as f32 / denom * 1024.0,
+                            )
+                        } else {
+                            // s15.16 plane -> S10.5 texels: 2^16 * 2^5.
+                            const PLANE_TO_TEXEL: f32 = (1u32 << 21) as f32;
+                            (
+                                values[0] as f32 / PLANE_TO_TEXEL,
+                                values[1] as f32 / PLANE_TO_TEXEL,
+                            )
+                        }
                     };
                     let (s, t) = corrected(stw);
                     let next_x = std::array::from_fn(|component| {
@@ -2425,7 +2459,7 @@ mod tests {
 
         let raw = RawRdpTriangle {
             edge: crate::gbi::RdpEdgeCoefficients {
-                right_major: false,
+                left_major: true,
                 level: 0,
                 tile: 0,
                 yl: 16,
@@ -2854,7 +2888,7 @@ mod tests {
         let other_mode = crate::gbi::OtherMode::from_raw(high, 0, 0);
         let triangle = RawRdpTriangle {
             edge: crate::gbi::RdpEdgeCoefficients {
-                right_major: true,
+                left_major: false,
                 level: 2,
                 tile: 0,
                 yl: 4,
@@ -2869,7 +2903,10 @@ mod tests {
             },
             shade: None,
             texture_coefficients: Some(crate::gbi::RdpTextureCoefficients {
-                stw: [0, 0, 1 << 16],
+                // W = 1024: tcdiv unity under the hardware persp scale
+                // (S/W * 2^10 texels), so dstdx/dstdy below read directly
+                // in texels per pixel.
+                stw: [0, 0, 1024 << 16],
                 dstdx: [(2.5 * 65536.0) as i32, 0, 0],
                 dstde: [0; 3],
                 dstdy: [0, (2.5 * 65536.0) as i32, 0],
@@ -2892,6 +2929,23 @@ mod tests {
 
         let mut framebuffer = Framebuffer::new(1, 1);
         framebuffer.draw_raw_rdp_triangle(&triangle);
+        assert_eq!(framebuffer.pixels, vec![50, 50, 50, 255]);
+
+        // G_TP_NONE variant of the same primitive: hardware `tcdiv_nopersp`
+        // skips the divide entirely and the plane's INTEGER part is the
+        // S10.5 texel coordinate, so the same 2.5-texel-per-pixel gradient
+        // is spelled `2.5 * 2^21` in plane units and W is irrelevant.
+        let mut nopersp = triangle;
+        nopersp.other_mode =
+            crate::gbi::OtherMode::from_raw(other_mode.raw_high() & !(1 << 19), 0, 0);
+        nopersp.texture_coefficients = Some(crate::gbi::RdpTextureCoefficients {
+            stw: [0, 0, 0],
+            dstdx: [(2.5 * (1u32 << 21) as f64) as i32, 0, 0],
+            dstde: [0; 3],
+            dstdy: [0, (2.5 * (1u32 << 21) as f64) as i32, 0],
+        });
+        let mut framebuffer = Framebuffer::new(1, 1);
+        framebuffer.draw_raw_rdp_triangle(&nopersp);
         assert_eq!(framebuffer.pixels, vec![50, 50, 50, 255]);
     }
 
@@ -3976,7 +4030,7 @@ mod tests {
     #[test]
     fn raw_coverage_uses_the_public_eight_sample_checkerboard_mask() {
         let vertical_strip = |left: f32, right: f32| crate::gbi::RdpEdgeCoefficients {
-            right_major: true,
+            left_major: false,
             level: 0,
             tile: 0,
             yl: 4,
@@ -4058,7 +4112,7 @@ mod tests {
     #[test]
     fn raw_edges_use_the_public_preceding_scanline_reference_point() {
         let edge = crate::gbi::RdpEdgeCoefficients {
-            right_major: true,
+            left_major: false,
             level: 0,
             tile: 0,
             yl: 8,
@@ -4229,7 +4283,7 @@ mod tests {
         let lower_slope = -(5.0f32 / 3.0 * 65536.0).round() as i32;
         let triangle = RawRdpTriangle {
             edge: crate::gbi::RdpEdgeCoefficients {
-                right_major: false,
+                left_major: true,
                 level: 0,
                 tile: 0,
                 yl: 7 * 4,
@@ -4283,5 +4337,55 @@ mod tests {
         );
         assert_eq!(pixel(2, 4), &[255, 255, 255, 255]);
         assert_eq!(pixel(1, 4), &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn real_stream_left_major_rect_split_triangle_rasterizes_interior() {
+        // Byte-exact edge coefficients from WM2000's live title-scene XBUS
+        // stream (task #783, first tri): `lft`=1 with the constant XH edge
+        // on the LEFT (11.75) and XM marching right at +4.157/line, lower
+        // half degenerate (ym == yl) -- the canonical rect-split shape every
+        // real F3DEX2 quad decomposes into. Under the inverted lft reading
+        // every span computed right < left and the triangle rasterized ZERO
+        // pixels (the whole title logo vanished); this pins the corrected
+        // convention to live-stream evidence.
+        let triangle = RawRdpTriangle {
+            edge: crate::gbi::RdpEdgeCoefficients {
+                left_major: true,
+                level: 0,
+                tile: 0,
+                yl: 106,
+                ym: 106,
+                yh: 17,
+                xl: 6832128,
+                dxldy: -16842729,
+                xh: 770048,
+                dxhdy: 0,
+                xm: 701940,
+                dxmdy: 272435,
+            },
+            shade: None,
+            texture_coefficients: None,
+            z: None,
+            texture: None,
+            other_mode: OtherMode::default(),
+            combiner: CombinerState {
+                primitive: [255; 4],
+                ..CombinerState::default()
+            },
+            blender: BlenderState::default(),
+            scissor: None,
+        };
+        let mut framebuffer = Framebuffer::new(64, 32);
+        framebuffer.draw_raw_rdp_triangle(&triangle);
+        let pixel = |x: usize, y: usize| {
+            let offset = (y * 64 + x) * 4;
+            &framebuffer.pixels[offset..offset + 4]
+        };
+        // Interior at y=15: span is [11.75, 10.71 + 4.157 * 11.5 ~= 58.5).
+        assert_eq!(pixel(30, 15), &[255, 255, 255, 255]);
+        // Left of the major edge and right of the minor edge stay untouched.
+        assert_eq!(pixel(5, 15), &[0, 0, 0, 0]);
+        assert_eq!(pixel(60, 10), &[0, 0, 0, 0]);
     }
 }
