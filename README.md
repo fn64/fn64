@@ -64,6 +64,31 @@ the test suite; it does not grade on a curve. What is NOT done is tracked
 honestly in `docs/ROADMAP.md` — audio is still broken (R5) and the outdoor
 gameplay eye-gate is unmet (R3b).
 
+### Discovery corpus
+
+Function-boundary discovery is graded against decomp answer keys under a strict
+`wrong == 0` posture: a discovered boundary that splits a real answer function
+fails the grade — only machine-checked evidence promotes a boundary, nothing is
+guessed. The numbers below grade the ROM's **resident boot bank** (the code
+present at the entrypoint before any overlay DMA — a few hundred functions per
+game, not the whole ROM; OoT's 10,833 total live mostly in later banks and
+overlays). Recall on merged `main`:
+
+| Game | Boot-bank matched / total | Recall | Wrong |
+|------|---------------------------|-------:|------:|
+| Ocarina of Time (primary answer key) | 116 / 137 | 84.7% | 0 |
+| Majora's Mask | 399 / 486 | 82.1% | 0 |
+| Super Mario 64 | 2816 / 3030 | 92.9% | 0 |
+| Kirby 64 | 402 / 531 | 75.7% | 0 |
+| WM2000 (AKI, NWXE) | 688 / 847 | 81.2% | 0 |
+| No Mercy (AKI, NW4E) | 826 / 985 | 83.9% | 0 |
+
+`wrong == 0` holds across every game. The open remainder is an honest,
+characterized gap — genuinely unreferenced library/dead code (Kirby 64),
+struct-callback dispatch that needs runtime information static analysis cannot
+soundly recover (AKI), and variable-length script callbacks — not
+mis-attributed boundaries.
+
 ## How we work
 
 This is an **agent-forward** codebase: most code is written by AI agents in
