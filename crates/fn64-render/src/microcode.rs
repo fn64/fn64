@@ -42,6 +42,110 @@ impl std::fmt::Display for UcodeDigest {
     }
 }
 
+/// How one microcode generation became active during a graphics task.
+///
+/// The distinction is part of the ordered admission contract: a task has
+/// exactly one entry generation followed by zero or more self-loads. Native
+/// adapters must not collapse repeated addresses because `A -> B -> A` and a
+/// same-address content replacement are behaviorally distinct generations.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TaskAdmissionSource {
+    TaskEntry,
+    SelfLoad,
+}
+
+/// Exact identity expected at one ordered microcode activation boundary.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TaskAdmissionGeneration {
+    pub source: TaskAdmissionSource,
+    pub text_address: u32,
+    pub data_address: u32,
+    pub text_sha256: UcodeDigest,
+    pub data: MicrocodeDataImageIdentity,
+    pub family: UcodeId,
+}
+
+impl TaskAdmissionGeneration {
+    fn validate(self, ordinal: usize) {
+        assert!(
+            self.text_address < 0x0100_0000 && self.text_address.is_multiple_of(8),
+            "microcode admission generation {ordinal} text address {:#010x} must be an aligned physical RDRAM offset",
+            self.text_address
+        );
+        assert!(
+            self.data_address < 0x0100_0000 && self.data_address.is_multiple_of(8),
+            "microcode admission generation {ordinal} data address {:#010x} must be an aligned physical RDRAM offset",
+            self.data_address
+        );
+        assert!(
+            self.data.bytes > 0
+                && self.data.bytes <= fn64_runtime::RSP_MEMORY_BANK_SIZE as u32
+                && self.data.bytes.is_multiple_of(8),
+            "microcode admission generation {ordinal} data length {} must be a nonzero 64-bit multiple no larger than one 4 KiB DMEM bank",
+            self.data.bytes
+        );
+    }
+}
+
+/// Immutable pre-commit admission plan for one native HLE task.
+///
+/// Construction validates ordering and physical DMA shape. The vector keeps
+/// every generation, including exact duplicates, so a native observer can
+/// consume it positionally and fail loudly on a missing, extra, reordered, or
+/// content-divergent activation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskAdmissionPlan {
+    generations: Box<[TaskAdmissionGeneration]>,
+}
+
+impl TaskAdmissionPlan {
+    pub fn new(
+        entry: TaskAdmissionGeneration,
+        self_loads: impl IntoIterator<Item = TaskAdmissionGeneration>,
+    ) -> Self {
+        assert_eq!(
+            entry.source,
+            TaskAdmissionSource::TaskEntry,
+            "microcode admission plan generation zero must be the task entry"
+        );
+        let mut generations = vec![entry];
+        for generation in self_loads {
+            assert_eq!(
+                generation.source,
+                TaskAdmissionSource::SelfLoad,
+                "microcode admission plan generations after zero must be self-loads"
+            );
+            generations.push(generation);
+        }
+        for (ordinal, generation) in generations.iter().copied().enumerate() {
+            generation.validate(ordinal);
+        }
+        Self {
+            generations: generations.into_boxed_slice(),
+        }
+    }
+
+    pub fn generations(&self) -> &[TaskAdmissionGeneration] {
+        &self.generations
+    }
+
+    pub fn entry(&self) -> TaskAdmissionGeneration {
+        self.generations[0]
+    }
+
+    pub fn self_loads(&self) -> &[TaskAdmissionGeneration] {
+        &self.generations[1..]
+    }
+
+    pub fn len(&self) -> usize {
+        self.generations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.generations.is_empty()
+    }
+}
+
 /// Public command-envelope identity for polygon and line geometry HLE.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum GeometryWireFamily {
@@ -387,6 +491,57 @@ fn ucode_sort_key(ucode: &UcodeId) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn admission_generation(
+        source: TaskAdmissionSource,
+        text_address: u32,
+        digest_byte: u8,
+    ) -> TaskAdmissionGeneration {
+        TaskAdmissionGeneration {
+            source,
+            text_address,
+            data_address: text_address + 0x1000,
+            text_sha256: UcodeDigest::from_sha256([digest_byte; 32]),
+            data: MicrocodeDataImageIdentity {
+                bytes: 8,
+                sha256: [digest_byte.wrapping_add(1); 32],
+            },
+            family: UcodeId::F3dex2,
+        }
+    }
+
+    #[test]
+    fn task_admission_plan_preserves_same_address_content_and_a_b_a_order() {
+        let entry = admission_generation(TaskAdmissionSource::TaskEntry, 0x1000, 0x10);
+        let a_changed = admission_generation(TaskAdmissionSource::SelfLoad, 0x1000, 0x11);
+        let b = admission_generation(TaskAdmissionSource::SelfLoad, 0x2000, 0x20);
+        let a_again = admission_generation(TaskAdmissionSource::SelfLoad, 0x1000, 0x10);
+        let plan = TaskAdmissionPlan::new(entry, [a_changed, b, a_again]);
+
+        assert_eq!(plan.len(), 4);
+        assert!(!plan.is_empty());
+        assert_eq!(plan.entry(), entry);
+        assert_eq!(plan.self_loads(), &[a_changed, b, a_again]);
+        assert_ne!(
+            plan.generations()[0].text_sha256,
+            plan.generations()[1].text_sha256
+        );
+        assert_eq!(
+            plan.generations()[0].text_address,
+            plan.generations()[1].text_address
+        );
+        assert_eq!(
+            plan.generations()[0].text_sha256,
+            plan.generations()[3].text_sha256
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "generations after zero must be self-loads")]
+    fn task_admission_plan_rejects_a_second_entry() {
+        let entry = admission_generation(TaskAdmissionSource::TaskEntry, 0x1000, 0x10);
+        TaskAdmissionPlan::new(entry, [entry]);
+    }
 
     #[test]
     fn geometry_admission_is_exact_and_family_typed() {

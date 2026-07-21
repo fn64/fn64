@@ -15,8 +15,9 @@
 //! completion mechanisms below.
 //!
 //! **No backend implementation lives here.** This crate owns the mechanisms
-//! every backend must share: exact content-addressed microcode admission and
-//! public raw-RDP command-width inspection for typed FullSync completion.
+//! every backend must share: exact content-addressed microcode admission, an
+//! immutable ordered task/self-load admission plan, and public raw-RDP
+//! command-width inspection for typed FullSync completion.
 //! `fn64-render-rt64` is the first adapter (RT64 FFI, quarantined per
 //! `docs/DESIGN.md` section 1's C++ boundary rule) and temporarily also houses
 //! the headless reference software rasterizer used as its deterministic CI
@@ -39,7 +40,8 @@ use std::{fmt, num::NonZeroU64};
 
 pub use microcode::{
     F3dex2UcodeCatalog, GeometryUcodeCatalog, GeometryWireFamily, MicrocodePairCatalog,
-    S2dexUcodeCatalog, S2dexWireFamily, UcodeDigest,
+    S2dexUcodeCatalog, S2dexWireFamily, TaskAdmissionGeneration, TaskAdmissionPlan,
+    TaskAdmissionSource, UcodeDigest,
 };
 pub use rdp_completion::{inspect_raw_rdp_full_sync, raw_rdp_command_width};
 pub use settings::{
@@ -836,10 +838,11 @@ pub enum RenderError {
     /// ucode *contents* (that's the backend's own job, if it wants finer
     /// detection than "not in my declared list").
     UnsupportedUcode { ucode_addr: u32 },
-    /// An ordered HLE preflight reached a self-loaded IMEM generation whose
-    /// exact text digest is not admitted for that family. This is an internal
-    /// typed handoff signal: a transactional backend maps it to
-    /// [`FrameStatus::NeedsLle`] without committing speculative mutations.
+    /// An ordered HLE preflight cannot bind one task-entry or self-loaded IMEM
+    /// generation to the exact native input image admitted for that family.
+    /// This is an internal typed handoff signal: a transactional backend maps
+    /// it to [`FrameStatus::NeedsLle`] without committing speculative
+    /// mutations.
     RequiresLle { ucode_sha256: [u8; 32] },
     /// `task.output_buff`/`output_buff_size` describe a region outside the
     /// `rdram` slice `process_task` was given -- a malformed or

@@ -851,7 +851,12 @@ task calls out:
   image identity. Backends consume that shared mechanism rather than carrying
   independent digest maps. The admission rule follows the public GBI family
   boundaries; it does not infer compatibility from a task header or colliding
-  opcode byte.
+  opcode byte. The RT64 transactional preflight additionally freezes an
+  immutable shared `TaskAdmissionPlan`: task entry is generation zero and
+  every admitted `G_LOAD_UCODE` follows in executed order with physical
+  addresses, complete text/data identities, and public family. Duplicate
+  addresses and `A -> B -> A` generations are deliberately retained. This is
+  currently a preflight artifact, not native-consumption evidence.
   Native RT64 task submission returns a schema-checked result containing entry
   GBI availability, pre/post workload IDs, and initial/final microcode
   addresses.
@@ -860,9 +865,9 @@ task calls out:
   public-command inspection. The address pair is not admission authority: a
   final address cannot reveal an intermediate self-load that later returned
   to the original image, and RT64's address cache cannot prove same-address
-  content. Removing reference preflight therefore still requires an ordered
-  per-generation observation or another transactionally equivalent native
-  admission mechanism.
+  content. Removing reference preflight therefore still requires RT64 to
+  consume that exact plan before its address cache, force content recognition
+  for every generation, and fail closed on missing, extra, or reordered loads.
   The reference rasterizer owns one deterministic, explicitly seedable
   per-fragment noise stream. Every covered one/two-cycle fragment consumes one
   typed eight-bit sample before combiner/alpha/depth rejection; combiner

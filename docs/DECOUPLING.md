@@ -75,9 +75,10 @@ delete the adapter when no one needs the fork.
 We reach RT64 through exactly one boundary: **process a gfx display-list task
 → a rendered frame**, plus lifecycle (create device/window, present, resize).
 Everything RT64-specific (D3D12/Vulkan/Metal and native HLE execution) lives
-behind that. Backend-neutral content-addressed microcode admission and raw-DPC
-FullSync inspection live in `fn64-render`, so native and reference backends
-cannot drift on those handoff invariants. `fn64-rt64` (→
+behind that. Backend-neutral content-addressed microcode catalogs, immutable
+ordered task/self-load plans, and raw-DPC FullSync inspection live in
+`fn64-render`, so native and reference backends cannot drift on those handoff
+invariants. `fn64-rt64` (→
 `fn64-render-rt64`) already exists as the intended quarantine crate.
 
 ### The shared seam (crate: `fn64-render`)
@@ -111,10 +112,11 @@ no callback into runtime state: it receives exactly the two mutable memory
 resources the task can affect.
 
 The same crate owns exact SHA-256-to-wire-family catalogs for complete IMEM
-images and the public RDP Command Summary Table 11 width classifier used to
-inspect raw DPC ranges for FullSync. These are backend admission/completion
-mechanisms, not renderer implementations: the reference rasterizer and RT64
-adapter consume them through the same typed API.
+images, immutable plans retaining task entry plus every ordered self-load
+generation, and the public RDP Command Summary Table 11 width classifier used
+to inspect raw DPC ranges for FullSync. These are backend
+admission/completion mechanisms, not renderer implementations: the reference
+rasterizer and RT64 adapter consume them through the same typed API.
 
 `PresentRequest` co-binds `ViPresentation`'s V-blank-latched scanout state with
 a move-only `PhysicalRdramRead` capability for that exact retrace. Integrated
@@ -158,7 +160,7 @@ This list is kept for the rationale, not as a work queue — read the annotation
 before following it.
 
 1. ~~**Define the shared seam**~~ **DONE.** `fn64-render`'s `RenderBackend`,
-   content-addressed admission, and raw-DPC completion inspection live at
+   content-addressed ordered admission, and raw-DPC completion inspection live at
    `crates/fn64-render/src/lib.rs`; the recomp side landed as the `c`/`rs` lane
    split (DESIGN.md §1.1).
 2. ~~**Wrap the recompiler fork** as `fn64-recomp-n64recomp`~~ **NOT DONE, and
