@@ -52,6 +52,14 @@ pub(crate) unsafe fn register_process_rdram(rdram: *mut u8, rdram_len: usize) {
     assert!(!rdram.is_null(), "process RDRAM pointer must be non-null");
     assert!(rdram_len > 0, "process RDRAM length must be nonzero");
     with_host(|host| {
+        if !host.runtime_rdram.is_null() {
+            assert!(
+                host.runtime_rdram == rdram && host.runtime_rdram_len == rdram_len,
+                "process RDRAM registration cannot replace the live allocation: registered pointer={:?} length={}, requested pointer={rdram:?} length={rdram_len}",
+                host.runtime_rdram,
+                host.runtime_rdram_len,
+            );
+        }
         host.runtime_rdram = rdram;
         host.runtime_rdram_len = rdram_len;
         host.native_execution_destinations.clear();
@@ -527,6 +535,7 @@ mod tests {
 
     #[test]
     fn process_rdram_registration_updates_the_shared_runtime_owner() {
+        reset_evidence_owners();
         let mut bytes = vec![0u8; 0x100];
         with_host(|host| {
             host.native_execution_destinations
@@ -546,6 +555,25 @@ mod tests {
             assert_eq!(host.runtime_rdram, bytes.as_mut_ptr());
             assert_eq!(host.runtime_rdram_len, bytes.len());
             assert!(host.native_execution_destinations.is_empty());
+        });
+
+        unsafe { register_process_rdram(bytes.as_mut_ptr(), bytes.len()) };
+    }
+
+    #[test]
+    fn process_rdram_registration_rejects_a_replacement_allocation() {
+        reset_evidence_owners();
+        let mut first = vec![0u8; 0x100];
+        let mut replacement = vec![0u8; 0x100];
+        unsafe { register_process_rdram(first.as_mut_ptr(), first.len()) };
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            register_process_rdram(replacement.as_mut_ptr(), replacement.len());
+        }));
+        assert!(rejected.is_err());
+        with_host(|host| {
+            assert_eq!(host.runtime_rdram, first.as_mut_ptr());
+            assert_eq!(host.runtime_rdram_len, first.len());
         });
     }
 

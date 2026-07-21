@@ -8,11 +8,17 @@
 //! launching the next child. Its retained receipt is an integrity record, not
 //! a signature or later proof that this process performed those launches.
 
+#[cfg(test)]
+use crate::release_program_build_receipt::ReleaseProgramBuildReceipt;
+use crate::release_program_build_receipt::{
+    load_release_program_build_receipt, ReleaseProgramBuildLane, ReleaseProgramFileIdentity,
+    VerifiedReleaseProgramBuildReceipt, RELEASE_PROGRAM_BUILD_RECEIPT_SCHEMA,
+};
 use crate::{
     parse_unsupported_journal, verify_release_evidence_series, verify_release_report_journal,
     ArtifactKind, ExecutionDestinationSource, ParsedUnsupportedJournal, ReleaseGateReport,
-    LIVE_MINIMUM_CLOSURE_PATHS, RELEASE_GATE_CYCLE_ENV, RELEASE_REPORT_ENV,
-    RELEASE_RUN_EVENT_SHA256_ENV,
+    RspRdpObservationKindEvidence, LIVE_MINIMUM_CLOSURE_PATHS, RELEASE_GATE_CYCLE_ENV,
+    RELEASE_REPORT_ENV, RELEASE_RUN_EVENT_SHA256_ENV,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,7 +31,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-pub const PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA: &str = "fn64.private-release-run-contract.v1";
+pub const PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA: &str = "fn64.private-release-run-contract.v2";
 pub const PRIVATE_RELEASE_SERIES_RECEIPT_SCHEMA: &str = "fn64.private-release-series-receipt.v1";
 pub const PRIVATE_RELEASE_SERIES_COUNT: usize = 10;
 pub const REPOSITORY_SYNTHETIC_RELEASE_SCENARIO: &str =
@@ -38,8 +44,8 @@ pub const REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES: &[u8] =
 pub const REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES: &[u8] =
     b"fn64 synthetic non-game release input v1";
 
-const RELEASE_REPORT_SCHEMA: &str = "fn64.release-gate.v16";
-const CONTRACT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-run-contract-digest.v1\0";
+const RELEASE_REPORT_SCHEMA: &str = "fn64.release-gate.v17";
+const CONTRACT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-run-contract-digest.v2\0";
 const RUN_EVENT_DOMAIN: &[u8] = b"fn64.private-release-run-event.v1\0";
 const RECEIPT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-series-receipt-digest.v1\0";
 const RECEIPT_FILE: &str = "receipt.json";
@@ -47,7 +53,6 @@ const SYSTEM_PYTHON3: &str = "/usr/bin/python3";
 const PYTHON_EMBEDDED_SCRIPT_BOOTSTRAP: &str = "import sys\nscript_path = sys.argv.pop(1)\nsource = sys.stdin.buffer.read()\nexec(compile(source, script_path, 'exec'), {'__name__': '__main__', '__file__': script_path})";
 const PRIVATE_INPUT_ADMISSION_SCRIPT: &[u8] =
     include_bytes!("../../../tools/private_input_admission.py");
-const RELEASE_PROGRAM_BUILD_RECEIPT_SCHEMA: &str = "fn64.release-program-build-receipt.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +94,9 @@ pub struct PrivateReleaseRunContract {
     pub schema: String,
     pub admission_manifest: PrivateFileIdentity,
     pub readiness_report: PrivateFileIdentity,
+    /// Exact private receipt which recomputes the linked program identity from
+    /// its lane inputs and binds it to the child executable image.
+    pub program_build_receipt: Option<PrivateFileIdentity>,
     pub purpose: String,
     pub report_scenario: String,
     pub guest_cycle: u64,
@@ -122,6 +130,13 @@ impl PrivateReleaseRunContract {
         push_bytes(&mut wire, self.schema.as_bytes());
         encode_file_identity(&mut wire, &self.admission_manifest)?;
         encode_file_identity(&mut wire, &self.readiness_report)?;
+        match &self.program_build_receipt {
+            Some(receipt) => {
+                wire.push(1);
+                encode_file_identity(&mut wire, receipt)?;
+            }
+            None => wire.push(0),
+        }
         push_bytes(&mut wire, self.purpose.as_bytes());
         push_bytes(&mut wire, self.report_scenario.as_bytes());
         push_u64(&mut wire, self.guest_cycle);
@@ -206,6 +221,12 @@ impl PrivateReleaseRunContract {
                         self.purpose
                     )));
                 }
+                if self.program_build_receipt.is_none() {
+                    return Err(error(format!(
+                        "private {} contract requires a {RELEASE_PROGRAM_BUILD_RECEIPT_SCHEMA}",
+                        self.purpose
+                    )));
+                }
             }
             "synthetic_mechanism" => {
                 if self.input.role != "synthetic_input" {
@@ -213,6 +234,11 @@ impl PrivateReleaseRunContract {
                         "synthetic mechanism contract input role must be synthetic_input, got {:?}",
                         self.input.role
                     )));
+                }
+                if self.program_build_receipt.is_some() {
+                    return Err(error(
+                        "synthetic mechanism contract cannot bind a production program-build receipt",
+                    ));
                 }
             }
             purpose => {
@@ -223,6 +249,9 @@ impl PrivateReleaseRunContract {
         }
         validate_file_identity_shape(&self.admission_manifest, "admission_manifest")?;
         validate_file_identity_shape(&self.readiness_report, "readiness_report")?;
+        if let Some(receipt) = &self.program_build_receipt {
+            validate_file_identity_shape(receipt, "program_build_receipt")?;
+        }
         validate_artifact_identity_shape(&self.input, "input")?;
         validate_execution_source(&self.expected_execution_source)?;
         validate_file_identity_shape(&self.child.executable, "child.executable")?;
@@ -242,6 +271,33 @@ impl PrivateReleaseRunContract {
                 )));
             }
             previous_role = Some(&artifact.role);
+        }
+        if matches!(self.purpose.as_str(), "full_rom" | "combined") {
+            let roles = self
+                .admitted_artifacts
+                .iter()
+                .map(|artifact| artifact.role.as_str())
+                .collect::<BTreeSet<_>>();
+            if roles != BTreeSet::from(["microcode_data", "microcode_text", "recompiled"]) {
+                return Err(error(format!(
+                    "private {} contract requires exact admitted roles microcode_data, microcode_text, and recompiled",
+                    self.purpose
+                )));
+            }
+            let text = required_artifact(self, "microcode_text")?;
+            if text.bytes != fn64_runtime::RSP_MEMORY_BANK_SIZE as u64 {
+                return Err(error(format!(
+                    "microcode_text bytes are {}; exact RSP IMEM image size {} is required",
+                    text.bytes,
+                    fn64_runtime::RSP_MEMORY_BANK_SIZE
+                )));
+            }
+            let data = required_artifact(self, "microcode_data")?;
+            if data.bytes > u64::from(u32::MAX) {
+                return Err(error(
+                    "microcode_data bytes exceed the task-header u32 size field",
+                ));
+            }
         }
 
         validate_absolute_no_symlink_directory(
@@ -269,6 +325,9 @@ impl PrivateReleaseRunContract {
     fn verify_bound_files(&self) -> Result<(), PrivateReleaseSeriesError> {
         verify_private_file_identity(&self.admission_manifest, "admission_manifest")?;
         verify_private_file_identity(&self.readiness_report, "readiness_report")?;
+        if let Some(receipt) = &self.program_build_receipt {
+            verify_private_file_identity(receipt, "program_build_receipt")?;
+        }
         verify_private_artifact_identity(&self.input, "input")?;
         for artifact in &self.admitted_artifacts {
             verify_private_artifact_identity(artifact, "admitted_artifacts[]")?;
@@ -703,17 +762,111 @@ fn verify_with_repository_admission(
     Ok(())
 }
 
-fn require_release_program_build_receipt(
+fn same_program_file_identity(
+    build: &ReleaseProgramFileIdentity,
+    contract_path: &str,
+    contract_bytes: u64,
+    contract_sha256: &str,
+) -> bool {
+    build.path == contract_path && build.bytes == contract_bytes && build.sha256 == contract_sha256
+}
+
+fn required_artifact<'a>(
+    contract: &'a PrivateReleaseRunContract,
+    role: &str,
+) -> Result<&'a PrivateArtifactIdentity, PrivateReleaseSeriesError> {
+    contract
+        .admitted_artifacts
+        .iter()
+        .find(|artifact| artifact.role == role)
+        .ok_or_else(|| {
+            error(format!(
+                "private release contract omits required artifact {role:?}"
+            ))
+        })
+}
+
+fn verify_release_program_build_receipt_binding(
     contract: &PrivateReleaseRunContract,
-) -> Result<(), PrivateReleaseSeriesError> {
+) -> Result<Option<VerifiedReleaseProgramBuildReceipt>, PrivateReleaseSeriesError> {
     match contract.purpose.as_str() {
-        "full_rom" | "combined" => Err(error(format!(
-            "private {} execution is not yet admissible: missing {RELEASE_PROGRAM_BUILD_RECEIPT_SCHEMA} binding admitted recompiled and microcode artifacts to expected_execution_source and child.executable.sha256",
-            contract.purpose
-        ))),
-        "synthetic_mechanism" => Err(error(
-            "production contract loader cannot authorize synthetic_mechanism; use the repository-test synthetic constructor",
-        )),
+        "full_rom" | "combined" => {
+            let identity = contract.program_build_receipt.as_ref().ok_or_else(|| {
+                error(format!(
+                    "private {} execution requires a {RELEASE_PROGRAM_BUILD_RECEIPT_SCHEMA}",
+                    contract.purpose
+                ))
+            })?;
+            verify_private_file_identity(identity, "program_build_receipt")?;
+            let verified =
+                load_release_program_build_receipt(&identity.path).map_err(|source| {
+                    error(format!(
+                        "verify bound {RELEASE_PROGRAM_BUILD_RECEIPT_SCHEMA}: {source}"
+                    ))
+                })?;
+            verify_private_file_identity(identity, "program_build_receipt")?;
+            if !same_program_file_identity(
+                &verified.receipt.child_executable,
+                &contract.child.executable.path,
+                contract.child.executable.bytes,
+                &contract.child.executable.sha256,
+            ) {
+                return Err(error(
+                    "program-build receipt child executable does not match the private run contract",
+                ));
+            }
+            if verified.receipt.expected_execution_source != contract.expected_execution_source
+                || verified.recomputed_execution_source != contract.expected_execution_source
+            {
+                return Err(error(
+                    "program-build receipt execution source does not match the private run contract",
+                ));
+            }
+            let recompiled = required_artifact(contract, "recompiled")?;
+            let matching_inputs = match &verified.receipt.lane {
+                ReleaseProgramBuildLane::NativeArchives { archives } => archives
+                    .iter()
+                    .filter(|archive| {
+                        same_program_file_identity(
+                            &archive.file,
+                            &recompiled.path,
+                            recompiled.bytes,
+                            &recompiled.sha256,
+                        )
+                    })
+                    .count(),
+                ReleaseProgramBuildLane::TypedObservedFunction { identity_wire } => {
+                    usize::from(same_program_file_identity(
+                        identity_wire,
+                        &recompiled.path,
+                        recompiled.bytes,
+                        &recompiled.sha256,
+                    ))
+                }
+                ReleaseProgramBuildLane::TypedBlock { pack, .. } => {
+                    usize::from(same_program_file_identity(
+                        pack,
+                        &recompiled.path,
+                        recompiled.bytes,
+                        &recompiled.sha256,
+                    ))
+                }
+            };
+            if matching_inputs != 1 {
+                return Err(error(format!(
+                    "program-build receipt binds {matching_inputs} exact lane inputs matching the admitted recompiled artifact; exactly one is required"
+                )));
+            }
+            Ok(Some(verified))
+        }
+        "synthetic_mechanism" => {
+            if contract.program_build_receipt.is_some() {
+                return Err(error(
+                    "synthetic mechanism contract cannot bind a production program-build receipt",
+                ));
+            }
+            Ok(None)
+        }
         _ => Err(error("private release contract purpose was not validated")),
     }
 }
@@ -737,7 +890,7 @@ pub fn load_private_release_run_contract(
         ))
     })?;
     contract.verify_integrity()?;
-    require_release_program_build_receipt(&contract)?;
+    verify_release_program_build_receipt_binding(&contract)?;
     Ok(VerifiedPrivateReleaseRunContract { contract })
 }
 
@@ -796,6 +949,7 @@ pub fn run_private_release_series(
     let contract = verified_contract.contract();
     contract.verify_integrity()?;
     contract.verify_bound_files()?;
+    verify_release_program_build_receipt_binding(contract)?;
     let output_directory = output_directory.as_ref();
     validate_new_private_directory(output_directory)?;
     fs::create_dir(output_directory).map_err(|source| {
@@ -821,6 +975,12 @@ pub fn run_private_release_series(
         contract.verify_bound_files().map_err(|source| {
             error(format!(
                 "private release preflight before child {} failed: {source}",
+                index + 1
+            ))
+        })?;
+        verify_release_program_build_receipt_binding(contract).map_err(|source| {
+            error(format!(
+                "private release program-build preflight before child {} failed: {source}",
                 index + 1
             ))
         })?;
@@ -905,6 +1065,7 @@ pub fn run_private_release_series(
         evidence.push((verified.report, verified.journal));
     }
     contract.verify_bound_files()?;
+    verify_release_program_build_receipt_binding(contract)?;
     let staged_identity = PrivateFileIdentity {
         path: staged_child
             .0
@@ -954,6 +1115,7 @@ pub fn verify_private_release_series(
     let contract = verified_contract.contract();
     contract.verify_integrity()?;
     contract.verify_bound_files()?;
+    verify_release_program_build_receipt_binding(contract)?;
     receipt.verify_integrity()?;
     let output_directory = output_directory.as_ref();
     validate_private_existing_directory(output_directory, "private release output directory")?;
@@ -1024,6 +1186,8 @@ pub fn verify_private_release_series(
             "retained private release evidence does not match its exact ten-run receipt",
         ));
     }
+    contract.verify_bound_files()?;
+    verify_release_program_build_receipt_binding(contract)?;
     Ok(())
 }
 
@@ -1078,6 +1242,7 @@ fn read_and_verify_pair(
             "verify private release child {ordinal} report/journal: {source}"
         ))
     })?;
+    verify_consumed_microcode_pair(contract, ordinal, &report)?;
     if journal.release_run_event_sha256() != Some(expected_run_event_sha256) {
         return Err(error(format!(
             "private release child {ordinal} journal does not bind its runner-derived event identity"
@@ -1094,6 +1259,38 @@ fn read_and_verify_pair(
         report_file_sha256,
         journal_file_sha256,
     })
+}
+
+fn verify_consumed_microcode_pair(
+    contract: &PrivateReleaseRunContract,
+    ordinal: u64,
+    report: &ReleaseGateReport,
+) -> Result<(), PrivateReleaseSeriesError> {
+    if contract.purpose == "synthetic_mechanism" {
+        return Ok(());
+    }
+    let text = required_artifact(contract, "microcode_text")?;
+    let data = required_artifact(contract, "microcode_data")?;
+    let matched = report.rsp_rdp.ordered.iter().any(|event| {
+        matches!(
+            &event.observation,
+            RspRdpObservationKindEvidence::MicrocodeRecognition {
+                text_sha256,
+                data_bytes,
+                data_sha256,
+                family: Some(_),
+                ..
+            } if text_sha256 == &text.sha256
+                && u64::from(*data_bytes) == data.bytes
+                && data_sha256 == &data.sha256
+        )
+    });
+    if !matched {
+        return Err(error(format!(
+            "private release child {ordinal} has no single recognized microcode event binding the admitted text SHA-256 and exact data length/SHA-256"
+        )));
+    }
+    Ok(())
 }
 
 fn require_exact_artifacts(report: &ReleaseGateReport) -> Result<(), PrivateReleaseSeriesError> {
@@ -1912,6 +2109,7 @@ mod tests {
             schema: PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA.to_owned(),
             admission_manifest: file_identity(&manifest),
             readiness_report: file_identity(&readiness),
+            program_build_receipt: None,
             purpose: "synthetic_mechanism".to_owned(),
             report_scenario: REPOSITORY_SYNTHETIC_RELEASE_SCENARIO.to_owned(),
             guest_cycle: REPOSITORY_SYNTHETIC_RELEASE_CYCLE,
@@ -2086,7 +2284,7 @@ mod tests {
         production.purpose = "full_rom".to_owned();
         production.input.role = "rom".to_owned();
         production.contract_sha256 = production.recompute_contract_sha256().unwrap();
-        assert!(require_release_program_build_receipt(&production)
+        assert!(verify_release_program_build_receipt_binding(&production)
             .unwrap_err()
             .to_string()
             .contains(RELEASE_PROGRAM_BUILD_RECEIPT_SCHEMA));
@@ -2168,7 +2366,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn python_emitted_production_contract_reaches_rust_build_receipt_boundary() {
+    fn python_emitted_production_contract_authorizes_the_same_build_receipt_in_rust() {
         let directory = TestDirectory::new();
         let manifest_path = directory.0.join("manifest.json");
         let readiness_path = directory.0.join("readiness.json");
@@ -2177,6 +2375,7 @@ mod tests {
         let data = directory.0.join("microcode-data.bin");
         let rom = directory.0.join("synthetic-rom.bin");
         let recompiled = directory.0.join("synthetic-recompiled.bin");
+        let program_receipt_path = directory.0.join("program-build-receipt.json");
         fs::write(&text, vec![0x5a; 4096]).unwrap();
         fs::write(&data, vec![0xa5; 257]).unwrap();
         fs::write(&rom, b"repository non-game synthetic ROM stand-in").unwrap();
@@ -2186,6 +2385,36 @@ mod tests {
         )
         .unwrap();
         let executable = Path::new("/usr/bin/true").canonicalize().unwrap();
+        let recompiled_identity = file_identity(&recompiled);
+        let executable_identity = file_identity(&executable);
+        let expected_execution_source = ExecutionDestinationSource::TypedBlockProgram {
+            program_sha256: "11".repeat(32),
+            dispatch_artifact_sha256: recompiled_identity.sha256.clone(),
+        };
+        let mut program_receipt = ReleaseProgramBuildReceipt {
+            schema: RELEASE_PROGRAM_BUILD_RECEIPT_SCHEMA.to_owned(),
+            child_executable: ReleaseProgramFileIdentity {
+                path: executable_identity.path.clone(),
+                bytes: executable_identity.bytes,
+                sha256: executable_identity.sha256.clone(),
+            },
+            lane: ReleaseProgramBuildLane::TypedBlock {
+                pack: ReleaseProgramFileIdentity {
+                    path: recompiled_identity.path.clone(),
+                    bytes: recompiled_identity.bytes,
+                    sha256: recompiled_identity.sha256.clone(),
+                },
+                expected_program_sha256: "11".repeat(32),
+            },
+            expected_execution_source: expected_execution_source.clone(),
+            receipt_sha256: String::new(),
+        };
+        program_receipt.receipt_sha256 = program_receipt.recompute_receipt_sha256().unwrap();
+        fs::write(
+            &program_receipt_path,
+            serde_json::to_vec_pretty(&program_receipt).unwrap(),
+        )
+        .unwrap();
 
         let descriptor = |path: &Path, provenance: &str| {
             let identity = file_identity(path);
@@ -2197,14 +2426,14 @@ mod tests {
                 "git_identity": "excluded",
             })
         };
-        let executable_identity = file_identity(&executable);
+        let program_receipt_identity = file_identity(&program_receipt_path);
         let manifest = serde_json::json!({
-            "schema": "fn64.private-input-admission.v4",
+            "schema": "fn64.private-input-admission.v5",
             "purpose": "full_rom",
             "intent": {
                 "wire_family": "full_rom_mixed",
                 "report_scenario": "synthetic-python-rust-policy-parity",
-                "recognition": "runtime_must_confirm_rt64_known_pair",
+                "recognition": "runtime_must_confirm_backend_known_pair",
                 "extended_gbi_cases": [],
                 "program_evidence_lane": "typed_block_program",
             },
@@ -2235,7 +2464,13 @@ mod tests {
                 "execution_source": {
                     "kind": "typed_block_program",
                     "program_sha256": "11".repeat(32),
-                    "dispatch_artifact_sha256": "22".repeat(32),
+                    "dispatch_artifact_sha256": recompiled_identity.sha256,
+                },
+                "program_build_receipt": {
+                    "path": program_receipt_identity.path,
+                    "length": program_receipt_identity.bytes,
+                    "sha256": program_receipt_identity.sha256,
+                    "git_identity": "excluded",
                 },
             },
         });
@@ -2258,13 +2493,84 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        let error = load_private_release_run_contract(&contract_path)
+        load_private_release_run_contract(&contract_path).unwrap();
+    }
+
+    #[test]
+    fn production_report_requires_one_recognized_event_with_the_exact_admitted_pair() {
+        let directory = TestDirectory::new();
+        let (mut contract, _) = fixture_contract(&directory.0);
+        contract.purpose = "full_rom".to_owned();
+        contract.input.role = "rom".to_owned();
+        contract.admitted_artifacts = vec![
+            PrivateArtifactIdentity {
+                role: "microcode_data".to_owned(),
+                path: "/private/ucode.data".to_owned(),
+                bytes: 257,
+                sha256: "22".repeat(32),
+                provenance: "user_owned_rom_derived".to_owned(),
+            },
+            PrivateArtifactIdentity {
+                role: "microcode_text".to_owned(),
+                path: "/private/ucode.text".to_owned(),
+                bytes: fn64_runtime::RSP_MEMORY_BANK_SIZE as u64,
+                sha256: "11".repeat(32),
+                provenance: "user_owned_rom_derived".to_owned(),
+            },
+            PrivateArtifactIdentity {
+                role: "recompiled".to_owned(),
+                path: "/private/program.pack".to_owned(),
+                bytes: 1,
+                sha256: "33".repeat(32),
+                provenance: "user_generated_from_owned_rom".to_owned(),
+            },
+        ];
+        let mut report = fixture_report(b"ignored", ExecutionDestinationSource::NoProgram);
+        report.rsp_rdp =
+            crate::RspRdpEvidence::from_ordered(vec![crate::RspRdpObservationEventEvidence {
+                guest_cycle: 42,
+                observation: RspRdpObservationKindEvidence::MicrocodeRecognition {
+                    task_address: 0x1000,
+                    imem_generation: 1,
+                    text_sha256: "11".repeat(32),
+                    data_address: 0x2000,
+                    data_bytes: 257,
+                    data_sha256: "22".repeat(32),
+                    family: Some(crate::ReleaseMicrocodeFamily::F3dex2),
+                },
+            }])
+            .unwrap();
+        verify_consumed_microcode_pair(&contract, 1, &report).unwrap();
+
+        let matching = report.rsp_rdp.ordered[0].clone();
+        let mut split = report.clone();
+        let mut text_only = matching.clone();
+        let RspRdpObservationKindEvidence::MicrocodeRecognition { data_sha256, .. } =
+            &mut text_only.observation
+        else {
+            unreachable!()
+        };
+        *data_sha256 = "44".repeat(32);
+        let mut data_only = matching;
+        let RspRdpObservationKindEvidence::MicrocodeRecognition { text_sha256, .. } =
+            &mut data_only.observation
+        else {
+            unreachable!()
+        };
+        *text_sha256 = "55".repeat(32);
+        split.rsp_rdp = crate::RspRdpEvidence::from_ordered(vec![text_only, data_only]).unwrap();
+        assert!(verify_consumed_microcode_pair(&contract, 2, &split)
             .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains(RELEASE_PROGRAM_BUILD_RECEIPT_SCHEMA),
-            "{error}"
-        );
+            .to_string()
+            .contains("no single recognized microcode event"));
+
+        let RspRdpObservationKindEvidence::MicrocodeRecognition { family, .. } =
+            &mut report.rsp_rdp.ordered[0].observation
+        else {
+            unreachable!()
+        };
+        *family = None;
+        assert!(verify_consumed_microcode_pair(&contract, 3, &report).is_err());
     }
 
     #[test]
@@ -2340,6 +2646,11 @@ mod tests {
                 bytes: 456,
                 sha256: "11".repeat(32),
             },
+            program_build_receipt: Some(PrivateFileIdentity {
+                path: "/private/program-build-receipt.json".to_owned(),
+                bytes: 654,
+                sha256: "12".repeat(32),
+            }),
             purpose: "full_rom".to_owned(),
             report_scenario: "canonical-wire-fixture".to_owned(),
             guest_cycle: 42,
@@ -2357,6 +2668,13 @@ mod tests {
                     path: "/private/ucode.data".to_owned(),
                     bytes: 128,
                     sha256: "33".repeat(32),
+                    provenance: "user_owned_rom_derived".to_owned(),
+                },
+                PrivateArtifactIdentity {
+                    role: "microcode_text".to_owned(),
+                    path: "/private/ucode.text".to_owned(),
+                    bytes: fn64_runtime::RSP_MEMORY_BANK_SIZE as u64,
+                    sha256: "34".repeat(32),
                     provenance: "user_owned_rom_derived".to_owned(),
                 },
                 PrivateArtifactIdentity {
@@ -2394,7 +2712,7 @@ mod tests {
         };
         assert_eq!(
             contract.recompute_contract_sha256().unwrap(),
-            "aba3f69b9e8f5a16c276fba59122451eda9141a4afcc7da4cf0427d18d464543"
+            "d4b373cc9292da0025d71ced85f3a5fb647082de5ea4ed08aa9eb2e2278005cf"
         );
     }
 

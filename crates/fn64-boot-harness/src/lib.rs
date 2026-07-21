@@ -12,6 +12,7 @@ mod observation_evidence;
 mod private_release_series;
 mod release_gate;
 mod release_matrix;
+mod release_program_build_receipt;
 mod release_run_env;
 mod render_evidence;
 mod report_series;

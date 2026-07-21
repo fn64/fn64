@@ -18,11 +18,15 @@ import tempfile
 from pathlib import Path
 
 
-MANIFEST_SCHEMA = "fn64.private-input-admission.v4"
-READINESS_SCHEMA = "fn64.private-input-readiness.v3"
-PRIVATE_RUN_CONTRACT_SCHEMA = "fn64.private-release-run-contract.v1"
+MANIFEST_SCHEMA = "fn64.private-input-admission.v5"
+READINESS_SCHEMA = "fn64.private-input-readiness.v4"
+PRIVATE_RUN_CONTRACT_SCHEMA = "fn64.private-release-run-contract.v2"
 PRIVATE_RUN_CONTRACT_DIGEST_DOMAIN = (
-    b"fn64.private-release-run-contract-digest.v1\0"
+    b"fn64.private-release-run-contract-digest.v2\0"
+)
+PROGRAM_BUILD_RECEIPT_SCHEMA = "fn64.release-program-build-receipt.v1"
+PROGRAM_BUILD_RECEIPT_DIGEST_DOMAIN = (
+    b"fn64.release-program-build-receipt-digest.v1\0"
 )
 PURPOSES = {"extended_gbi", "full_rom", "combined"}
 WIRE_FAMILIES = {
@@ -75,7 +79,7 @@ ARTIFACT_FIELDS = {"microcode_text", "microcode_data", "rom", "recompiled"}
 FILE_FIELDS = {"path", "length", "sha256", "provenance", "git_identity"}
 RUNNER_FIELDS = {
     "executable", "working_directory", "argv", "env", "release_gate_cycle",
-    "execution_source",
+    "execution_source", "program_build_receipt",
 }
 EXECUTABLE_FIELDS = {"path", "length", "sha256", "git_identity"}
 CONTRACT_DESCRIPTOR_FIELDS = {"path", "bytes", "sha256"}
@@ -84,7 +88,7 @@ CONTRACT_INPUT_DESCRIPTOR_FIELDS = {
 }
 CONTRACT_FIELDS = {
     "schema", "admission_manifest", "readiness_report", "purpose",
-    "report_scenario", "guest_cycle", "repeat_count", "input",
+    "program_build_receipt", "report_scenario", "guest_cycle", "repeat_count", "input",
     "admitted_artifacts", "expected_execution_source", "child",
     "contract_sha256",
 }
@@ -168,6 +172,18 @@ READINESS_FIELDS = {
     "artifact_roles_admitted", "extended_gbi_fixture", "full_rom_inputs",
     "release_matrix_policy", "repeat_bar", "required_extended_cases",
     "platform", "controllers", "save", "renderers", "program_evidence_lane",
+    "program_build_receipt",
+}
+PROGRAM_BUILD_RECEIPT_FIELDS = {
+    "schema", "child_executable", "lane", "expected_execution_source",
+    "receipt_sha256",
+}
+PROGRAM_FILE_IDENTITY_FIELDS = {"path", "bytes", "sha256"}
+NATIVE_ARCHIVE_INPUT_FIELDS = {"label", "file"}
+PROGRAM_BUILD_LANE_FIELDS = {
+    "native_archives": {"kind", "archives"},
+    "typed_observed_function": {"kind", "identity_wire"},
+    "typed_block": {"kind", "pack", "expected_program_sha256"},
 }
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024 * 1024
 SCENARIO_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
@@ -591,7 +607,12 @@ def require_native_executable(path: Path, where: str) -> None:
         )
 
 
-def validate_runner(runner: object, lane: str, root: Path) -> tuple[dict, Path]:
+def validate_runner(
+    runner: object,
+    lane: str,
+    root: Path,
+    recompiled_descriptor: dict | None = None,
+) -> tuple[dict, Path]:
     require(
         isinstance(runner, dict) and set(runner) == RUNNER_FIELDS,
         "runner fields are invalid",
@@ -663,6 +684,67 @@ def validate_runner(runner: object, lane: str, root: Path) -> tuple[dict, Path]:
             f"runner.env[{name!r}] must be a string without NUL",
         )
     validate_execution_source(runner["execution_source"], lane, "runner.execution_source")
+    receipt_descriptor = runner["program_build_receipt"]
+    if lane == "no_program_fixture":
+        require(
+            receipt_descriptor is None,
+            "no_program_fixture runner cannot bind a program-build receipt",
+        )
+    else:
+        require(
+            isinstance(receipt_descriptor, dict)
+            and set(receipt_descriptor) == EXECUTABLE_FIELDS,
+            "runner.program_build_receipt fields are invalid",
+        )
+        require(
+            receipt_descriptor["git_identity"] == "excluded",
+            "runner.program_build_receipt.git_identity must be 'excluded'",
+        )
+        receipt_length = receipt_descriptor["length"]
+        require(
+            isinstance(receipt_length, int) and not isinstance(receipt_length, bool)
+            and 0 < receipt_length <= MAX_ARTIFACT_BYTES,
+            "runner.program_build_receipt.length is invalid",
+        )
+        receipt_sha256 = validate_sha256(
+            receipt_descriptor["sha256"],
+            "runner.program_build_receipt.sha256",
+        )
+        receipt_path = validate_local_regular_file(
+            receipt_descriptor["path"], "runner.program_build_receipt", root,
+        )
+        observed_length, observed_sha256, _ = regular_file_measurement(receipt_path)
+        require(
+            observed_length == receipt_length,
+            "runner.program_build_receipt length drift",
+        )
+        require(
+            observed_sha256 == receipt_sha256,
+            "runner.program_build_receipt SHA-256 drift",
+        )
+        require(
+            recompiled_descriptor is not None,
+            "authoritative program lane requires artifacts.recompiled",
+        )
+        normalized_recompiled = {
+            "path": recompiled_descriptor["path"],
+            "bytes": recompiled_descriptor["length"],
+            "sha256": recompiled_descriptor["sha256"],
+        }
+        validate_program_build_receipt(
+            load_json(receipt_path),
+            receipt_path,
+            lane,
+            root,
+            executable,
+            runner["execution_source"],
+            (normalized_recompiled, Path(recompiled_descriptor["path"])),
+        )
+        final_length, final_sha256, _ = regular_file_measurement(receipt_path)
+        require(
+            final_length == receipt_length and final_sha256 == receipt_sha256,
+            "runner.program_build_receipt changed during validation",
+        )
     return runner, executable_path
 
 
@@ -683,7 +765,10 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
         and re.fullmatch(r"[0-9a-f]{64}", scenario) is None,
         "intent.report_scenario is invalid",
     )
-    require(intent["recognition"] == "runtime_must_confirm_rt64_known_pair", "intent.recognition must preserve the runtime recognition gate")
+    require(
+        intent["recognition"] == "runtime_must_confirm_backend_known_pair",
+        "intent.recognition must preserve the exact backend text/data-pair gate",
+    )
     program_lane = nonempty(intent["program_evidence_lane"], "intent.program_evidence_lane")
     if program_lane == "typed_function":
         raise AdmissionError(
@@ -732,6 +817,14 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
         descriptor = artifacts[role]
         if descriptor is not None:
             admitted[role] = validate_artifact(role, descriptor, root)
+    require(
+        artifacts["microcode_text"]["length"] == 4096,
+        "artifacts.microcode_text must contain the exact 4096-byte RSP IMEM image",
+    )
+    require(
+        artifacts["microcode_data"]["length"] <= (1 << 32) - 1,
+        "artifacts.microcode_data length exceeds the task-header u32 size field",
+    )
     if purpose in {"full_rom", "combined"}:
         require({"rom", "recompiled"} <= set(admitted), f"{purpose} admission requires ROM and recompiled artifacts")
         require(
@@ -749,7 +842,12 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
             "extended_gbi-only admission must select 'no_program_fixture'; executable full-ROM "
             "lane claims require purpose 'full_rom' or 'combined'",
         )
-    validate_runner(manifest["runner"], program_lane, root)
+    validate_runner(
+        manifest["runner"],
+        program_lane,
+        root,
+        artifacts.get("recompiled"),
+    )
 
     readiness = {
         "schema": READINESS_SCHEMA,
@@ -761,6 +859,9 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
         "artifact_roles_admitted": sorted(admitted),
         "extended_gbi_fixture": "ready_for_runtime_recognition" if purpose in {"extended_gbi", "combined"} else "not_requested",
         "full_rom_inputs": "ready" if {"rom", "recompiled"} <= set(admitted) else "not_supplied",
+        "program_build_receipt": (
+            "verified" if program_lane != "no_program_fixture" else "not_applicable"
+        ),
         "release_matrix_policy": "ready_for_ten_run_evidence",
         "repeat_bar": 10,
         "required_extended_cases": sorted(cases),
@@ -786,6 +887,10 @@ def validate_readiness(report: dict) -> None:
     require({"microcode_text", "microcode_data"} <= roles <= ARTIFACT_FIELDS, "readiness artifact roles are invalid")
     require(report["extended_gbi_fixture"] in {"ready_for_runtime_recognition", "not_requested"}, "readiness Extended GBI state is invalid")
     require(report["full_rom_inputs"] in {"ready", "not_supplied"}, "readiness full-ROM state is invalid")
+    require(
+        report["program_build_receipt"] in {"verified", "not_applicable"},
+        "readiness program-build receipt state is invalid",
+    )
     require(report["release_matrix_policy"] == "ready_for_ten_run_evidence", "readiness release-matrix state is invalid")
     require(report["repeat_bar"] == 10, "readiness repeat bar is invalid")
     require(report["platform"] in PLATFORMS, "readiness platform is invalid")
@@ -808,6 +913,10 @@ def validate_readiness(report: dict) -> None:
     if report["purpose"] in {"full_rom", "combined"}:
         require(report["full_rom_inputs"] == "ready" and {"rom", "recompiled"} <= roles, "readiness full-ROM inputs are incomplete")
         require(
+            report["program_build_receipt"] == "verified",
+            "readiness full-ROM program-build receipt is not verified",
+        )
+        require(
             program_lane in {
                 "identified_native_archive", "typed_observed_function",
                 "typed_block_program",
@@ -815,6 +924,10 @@ def validate_readiness(report: dict) -> None:
             "readiness full-ROM program-evidence lane is not authoritative",
         )
     else:
+        require(
+            report["program_build_receipt"] == "not_applicable",
+            "readiness fixture cannot claim a program-build receipt",
+        )
         require(program_lane == "no_program_fixture", "readiness fixture program lane is inconsistent")
     forbidden = {"path", "sha256", "hash", "length", "bytes", "filename", "manifest"}
     for key in report:
@@ -1028,6 +1141,258 @@ def append_execution_source(wire: bytearray, value: object, where: str) -> None:
         )
 
 
+def append_program_build_lane(wire: bytearray, value: object, where: str) -> None:
+    require(isinstance(value, dict), f"{where} must be an object")
+    kind = nonempty(value.get("kind"), f"{where}.kind")
+    require(kind in PROGRAM_BUILD_LANE_FIELDS, f"{where}.kind is invalid")
+    require(
+        set(value) == PROGRAM_BUILD_LANE_FIELDS[kind],
+        f"{where} fields are invalid for {kind!r}",
+    )
+    if kind == "native_archives":
+        wire.append(1)
+        archives = value["archives"]
+        require(isinstance(archives, list), f"{where}.archives must be an array")
+        append_u64(wire, len(archives), f"{where}.archives count")
+        for index, archive in enumerate(archives):
+            require(
+                isinstance(archive, dict)
+                and set(archive) == NATIVE_ARCHIVE_INPUT_FIELDS,
+                f"{where}.archives[{index}] fields are invalid",
+            )
+            append_string(
+                wire, archive["label"], f"{where}.archives[{index}].label",
+            )
+            append_file_identity(
+                wire, archive["file"], f"{where}.archives[{index}].file",
+            )
+    elif kind == "typed_observed_function":
+        wire.append(2)
+        append_file_identity(wire, value["identity_wire"], f"{where}.identity_wire")
+    else:
+        wire.append(3)
+        append_file_identity(wire, value["pack"], f"{where}.pack")
+        append_sha256(
+            wire,
+            value["expected_program_sha256"],
+            f"{where}.expected_program_sha256",
+        )
+
+
+def program_build_receipt_sha256(receipt_without_sha256: dict) -> str:
+    wire = bytearray(PROGRAM_BUILD_RECEIPT_DIGEST_DOMAIN)
+    append_string(wire, receipt_without_sha256["schema"], "program receipt.schema")
+    append_file_identity(
+        wire,
+        receipt_without_sha256["child_executable"],
+        "program receipt.child_executable",
+    )
+    append_program_build_lane(
+        wire, receipt_without_sha256["lane"], "program receipt.lane",
+    )
+    append_execution_source(
+        wire,
+        receipt_without_sha256["expected_execution_source"],
+        "program receipt.expected_execution_source",
+    )
+    return hashlib.sha256(wire).hexdigest()
+
+
+def validate_program_file_identity(
+    value: object, where: str, root: Path,
+) -> tuple[dict, Path]:
+    require(
+        isinstance(value, dict) and set(value) == PROGRAM_FILE_IDENTITY_FIELDS,
+        f"{where} fields are invalid",
+    )
+    path = validate_local_regular_file(value["path"], where, root)
+    length = value["bytes"]
+    require(
+        isinstance(length, int) and not isinstance(length, bool)
+        and 0 < length <= MAX_ARTIFACT_BYTES,
+        f"{where}.bytes is invalid",
+    )
+    expected_sha256 = validate_sha256(value["sha256"], f"{where}.sha256")
+    observed_length, observed_sha256, _ = regular_file_measurement(path)
+    require(observed_length == length, f"{where} length drift")
+    require(observed_sha256 == expected_sha256, f"{where} SHA-256 drift")
+    return value, path
+
+
+def native_archive_source_sha256(
+    archives: list[tuple[str, dict, Path]],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"fn64.native-program-archives.v1\0")
+    digest.update(len(archives).to_bytes(8, "big"))
+    for label, identity, path in archives:
+        encoded_label = label.encode("utf-8")
+        digest.update(len(encoded_label).to_bytes(8, "big"))
+        digest.update(encoded_label)
+        digest.update(identity["bytes"].to_bytes(8, "big"))
+        descriptor = open_regular_nofollow(path)
+        try:
+            before = os.fstat(descriptor)
+            require(stat.S_ISREG(before.st_mode), f"{path} must remain a regular file")
+            archive_digest = hashlib.sha256()
+            observed_bytes = 0
+            with os.fdopen(descriptor, "rb", closefd=False) as file:
+                while block := file.read(1024 * 1024):
+                    digest.update(block)
+                    archive_digest.update(block)
+                    observed_bytes += len(block)
+            after = os.fstat(descriptor)
+            require(
+                stable_file_identity(before) == stable_file_identity(after),
+                f"{path} changed while computing native program identity",
+            )
+            require(
+                observed_bytes == identity["bytes"]
+                and before.st_size == identity["bytes"],
+                f"{path} length drift",
+            )
+            require(
+                archive_digest.hexdigest() == identity["sha256"],
+                f"{path} SHA-256 drift while computing native program identity",
+            )
+        finally:
+            os.close(descriptor)
+    return digest.hexdigest()
+
+
+def validate_program_build_receipt(
+    receipt: dict,
+    receipt_path: Path,
+    lane: str,
+    root: Path,
+    expected_child: dict,
+    expected_execution_source: dict,
+    recompiled: tuple[dict, Path],
+) -> None:
+    require(
+        set(receipt) == PROGRAM_BUILD_RECEIPT_FIELDS,
+        "program-build receipt has unknown or missing fields",
+    )
+    require(
+        receipt["schema"] == PROGRAM_BUILD_RECEIPT_SCHEMA,
+        f"program-build receipt schema must be {PROGRAM_BUILD_RECEIPT_SCHEMA!r}",
+    )
+    child, child_path = validate_program_file_identity(
+        receipt["child_executable"], "program receipt.child_executable", root,
+    )
+    require(
+        child["path"] == expected_child["path"]
+        and child["bytes"] == expected_child["length"]
+        and child["sha256"] == expected_child["sha256"],
+        "program-build receipt child does not match runner.executable",
+    )
+    require_native_executable(child_path, "program receipt.child_executable")
+
+    lane_value = receipt["lane"]
+    require(isinstance(lane_value, dict), "program receipt.lane must be an object")
+    kind = nonempty(lane_value.get("kind"), "program receipt.lane.kind")
+    expected_kind = {
+        "identified_native_archive": "native_archives",
+        "typed_observed_function": "typed_observed_function",
+        "typed_block_program": "typed_block",
+    }.get(lane)
+    require(kind == expected_kind, "program-build receipt lane does not match manifest lane")
+    append_program_build_lane(bytearray(), lane_value, "program receipt.lane")
+
+    recompiled_value, _ = recompiled
+    matching_recompiled = 0
+    if kind == "native_archives":
+        raw_archives = lane_value["archives"]
+        require(bool(raw_archives), "program receipt native archive list is empty")
+        archives: list[tuple[str, dict, Path]] = []
+        labels: list[str] = []
+        for index, archive in enumerate(raw_archives):
+            require(
+                isinstance(archive, dict)
+                and set(archive) == NATIVE_ARCHIVE_INPUT_FIELDS,
+                f"program receipt.lane.archives[{index}] fields are invalid",
+            )
+            label = nonempty(
+                archive["label"], f"program receipt.lane.archives[{index}].label",
+            )
+            require(
+                re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", label) is not None,
+                f"program receipt archive label {label!r} is not canonical",
+            )
+            identity, path = validate_program_file_identity(
+                archive["file"], f"program receipt.lane.archives[{index}].file", root,
+            )
+            labels.append(label)
+            archives.append((label, identity, path))
+            matching_recompiled += int(
+                identity["path"] == recompiled_value["path"]
+                and identity["bytes"] == recompiled_value["bytes"]
+                and identity["sha256"] == recompiled_value["sha256"]
+            )
+        require(labels == sorted(labels), "program receipt archive labels are not sorted")
+        require(len(labels) == len(set(labels)), "program receipt archive labels repeat")
+        recomputed_source = {
+            "kind": "native_archive",
+            "artifact_sha256": native_archive_source_sha256(archives),
+        }
+    elif kind == "typed_observed_function":
+        identity, _ = validate_program_file_identity(
+            lane_value["identity_wire"], "program receipt.lane.identity_wire", root,
+        )
+        matching_recompiled = int(
+            identity["path"] == recompiled_value["path"]
+            and identity["bytes"] == recompiled_value["bytes"]
+            and identity["sha256"] == recompiled_value["sha256"]
+        )
+        recomputed_source = {
+            "kind": "typed_observed_function_program",
+            "artifact_sha256": identity["sha256"],
+        }
+    else:
+        identity, _ = validate_program_file_identity(
+            lane_value["pack"], "program receipt.lane.pack", root,
+        )
+        expected_program = validate_sha256(
+            lane_value["expected_program_sha256"],
+            "program receipt.lane.expected_program_sha256",
+        )
+        matching_recompiled = int(
+            identity["path"] == recompiled_value["path"]
+            and identity["bytes"] == recompiled_value["bytes"]
+            and identity["sha256"] == recompiled_value["sha256"]
+        )
+        recomputed_source = {
+            "kind": "typed_block_program",
+            "program_sha256": expected_program,
+            "dispatch_artifact_sha256": identity["sha256"],
+        }
+    require(
+        matching_recompiled == 1,
+        "program-build receipt must bind exactly one lane input equal to artifacts.recompiled",
+    )
+    declared_source = receipt["expected_execution_source"]
+    validate_execution_source(
+        declared_source, lane, "program receipt.expected_execution_source",
+    )
+    require(
+        declared_source == recomputed_source
+        and declared_source == expected_execution_source,
+        "program-build receipt execution source does not match recomputed and runner identities",
+    )
+    claimed = validate_sha256(
+        receipt["receipt_sha256"], "program receipt.receipt_sha256",
+    )
+    unsigned = {
+        key: value for key, value in receipt.items() if key != "receipt_sha256"
+    }
+    require(
+        claimed == program_build_receipt_sha256(unsigned),
+        "program-build receipt canonical SHA-256 drift",
+    )
+    # Recheck its own bound bytes after all referenced files have been read.
+    regular_file_measurement(receipt_path)
+
+
 def private_run_contract_sha256(contract_without_sha256: dict) -> str:
     wire = bytearray(PRIVATE_RUN_CONTRACT_DIGEST_DOMAIN)
     append_string(wire, contract_without_sha256["schema"], "contract.schema")
@@ -1041,6 +1406,14 @@ def private_run_contract_sha256(contract_without_sha256: dict) -> str:
         contract_without_sha256["readiness_report"],
         "contract.readiness_report",
     )
+    program_receipt = contract_without_sha256["program_build_receipt"]
+    if program_receipt is None:
+        wire.append(0)
+    else:
+        wire.append(1)
+        append_file_identity(
+            wire, program_receipt, "contract.program_build_receipt",
+        )
     append_string(wire, contract_without_sha256["purpose"], "contract.purpose")
     append_string(
         wire,
@@ -1130,6 +1503,7 @@ def build_private_run_contract(
     )
     runner = manifest["runner"]
     executable_path = Path(runner["executable"]["path"])
+    program_receipt_path = Path(runner["program_build_receipt"]["path"])
     require("rom" in admitted, "private run contract requires an admitted ROM input")
     unsigned = {
         "schema": PRIVATE_RUN_CONTRACT_SCHEMA,
@@ -1139,6 +1513,7 @@ def build_private_run_contract(
             if readiness_payload is None
             else contract_descriptor_for_bytes(readiness_path, readiness_payload)
         ),
+        "program_build_receipt": contract_descriptor(program_receipt_path),
         "purpose": manifest["purpose"],
         "report_scenario": manifest["intent"]["report_scenario"],
         "guest_cycle": runner["release_gate_cycle"],
@@ -1232,6 +1607,19 @@ def validate_private_run_contract(
         retained_readiness == readiness,
         "contract readiness report does not match its validated manifest",
     )
+    program_receipt, program_receipt_path = validate_contract_descriptor(
+        contract["program_build_receipt"],
+        "contract.program_build_receipt",
+        root,
+    )
+    manifest_program_receipt = manifest["runner"]["program_build_receipt"]
+    require(
+        isinstance(manifest_program_receipt, dict)
+        and program_receipt_path == Path(manifest_program_receipt["path"])
+        and program_receipt["bytes"] == manifest_program_receipt["length"]
+        and program_receipt["sha256"] == manifest_program_receipt["sha256"],
+        "contract program-build receipt does not match the validated manifest",
+    )
     require(
         manifest["purpose"] == contract["purpose"]
         and manifest["intent"]["report_scenario"] == scenario
@@ -1293,7 +1681,7 @@ def validate_private_run_contract(
         child["executable"], "contract.child.executable", root,
     )
     manifest_runner, manifest_executable_path = validate_runner(
-        manifest["runner"], lane, root,
+        manifest["runner"], lane, root, manifest["artifacts"]["recompiled"],
     )
     require(
         executable_path == manifest_executable_path
@@ -1377,7 +1765,7 @@ def synthetic_manifest(directory: Path) -> tuple[Path, dict]:
         "intent": {
             "wire_family": "f3dex2_extended_gbi_v1",
             "report_scenario": "synthetic-private-admission-selftest",
-            "recognition": "runtime_must_confirm_rt64_known_pair",
+            "recognition": "runtime_must_confirm_backend_known_pair",
             "extended_gbi_cases": sorted(EXTENDED_CASES),
             "program_evidence_lane": "no_program_fixture",
         },
@@ -1406,6 +1794,7 @@ def synthetic_manifest(directory: Path) -> tuple[Path, dict]:
             "env": {"FN64_SYNTHETIC_FIXED": "1"},
             "release_gate_cycle": 42,
             "execution_source": {"kind": "no_program"},
+            "program_build_receipt": None,
         },
     }
     manifest_path = directory / "manifest.json"
@@ -1422,6 +1811,33 @@ def expect_rejected(action, label: str) -> None:
 
 
 def selftest(root: Path) -> None:
+    canonical_program_receipt = {
+        "schema": PROGRAM_BUILD_RECEIPT_SCHEMA,
+        "child_executable": {
+            "path": "/private/fn64/child",
+            "bytes": 999,
+            "sha256": "11" * 32,
+        },
+        "lane": {
+            "kind": "typed_block",
+            "pack": {
+                "path": "/private/fn64/program.pack",
+                "bytes": 789,
+                "sha256": "22" * 32,
+            },
+            "expected_program_sha256": "33" * 32,
+        },
+        "expected_execution_source": {
+            "kind": "typed_block_program",
+            "program_sha256": "33" * 32,
+            "dispatch_artifact_sha256": "22" * 32,
+        },
+    }
+    require(
+        program_build_receipt_sha256(canonical_program_receipt)
+        == "3ce6e14e0a67c1837ca506e85815d20b6b9fe45f70b8a425ef2eeaf0ab6cd650",
+        "selftest: program-build receipt canonical wire drifted",
+    )
     canonical_fixture = {
         "schema": PRIVATE_RUN_CONTRACT_SCHEMA,
         "admission_manifest": {
@@ -1431,6 +1847,10 @@ def selftest(root: Path) -> None:
         "readiness_report": {
             "path": "/private/readiness.json", "bytes": 456,
             "sha256": "11" * 32,
+        },
+        "program_build_receipt": {
+            "path": "/private/program-build-receipt.json", "bytes": 654,
+            "sha256": "12" * 32,
         },
         "purpose": "full_rom",
         "report_scenario": "canonical-wire-fixture",
@@ -1444,6 +1864,11 @@ def selftest(root: Path) -> None:
             {
                 "role": "microcode_data", "path": "/private/ucode.data",
                 "bytes": 128, "sha256": "33" * 32,
+                "provenance": "user_owned_rom_derived",
+            },
+            {
+                "role": "microcode_text", "path": "/private/ucode.text",
+                "bytes": 4096, "sha256": "34" * 32,
                 "provenance": "user_owned_rom_derived",
             },
             {
@@ -1471,7 +1896,7 @@ def selftest(root: Path) -> None:
     }
     require(
         private_run_contract_sha256(canonical_fixture)
-        == "aba3f69b9e8f5a16c276fba59122451eda9141a4afcc7da4cf0427d18d464543",
+        == "d4b373cc9292da0025d71ced85f3a5fb647082de5ea4ed08aa9eb2e2278005cf",
         "selftest: private run-contract canonical wire drifted",
     )
 
@@ -1539,15 +1964,56 @@ def selftest(root: Path) -> None:
         full_rom["intent"]["wire_family"] = "full_rom_mixed"
         full_rom["intent"]["extended_gbi_cases"] = []
         full_rom["intent"]["program_evidence_lane"] = "typed_block_program"
+        recompiled_sha256 = sha256_file(recompiled)
         full_rom["runner"]["execution_source"] = {
             "kind": "typed_block_program",
             "program_sha256": "11" * 32,
-            "dispatch_artifact_sha256": "22" * 32,
+            "dispatch_artifact_sha256": recompiled_sha256,
         }
         full_rom["release_matrix"]["renderers"] = ["reference_lle_accuracy"]
         full_rom["artifacts"]["rom"] = descriptor(rom, "user_owned_rom")
         full_rom["artifacts"]["recompiled"] = descriptor(
             recompiled, "user_generated_from_owned_rom"
+        )
+        def write_program_receipt(
+            path: Path, lane_value: dict, source: dict,
+        ) -> dict:
+            executable_value = full_rom["runner"]["executable"]
+            unsigned_receipt = {
+                "schema": PROGRAM_BUILD_RECEIPT_SCHEMA,
+                "child_executable": {
+                    "path": executable_value["path"],
+                    "bytes": executable_value["length"],
+                    "sha256": executable_value["sha256"],
+                },
+                "lane": lane_value,
+                "expected_execution_source": source,
+            }
+            receipt = {
+                **unsigned_receipt,
+                "receipt_sha256": program_build_receipt_sha256(unsigned_receipt),
+            }
+            path.write_bytes(serialize_json_document(receipt))
+            return {
+                "path": str(path),
+                "length": path.stat().st_size,
+                "sha256": sha256_file(path),
+                "git_identity": "excluded",
+            }
+
+        recompiled_identity = {
+            "path": str(recompiled),
+            "bytes": recompiled.stat().st_size,
+            "sha256": recompiled_sha256,
+        }
+        full_rom["runner"]["program_build_receipt"] = write_program_receipt(
+            directory / "typed-block-program-receipt.json",
+            {
+                "kind": "typed_block",
+                "pack": recompiled_identity,
+                "expected_program_sha256": "11" * 32,
+            },
+            full_rom["runner"]["execution_source"],
         )
         full_readiness, _ = validate_manifest(full_rom, manifest_path, root)
         validate_readiness(full_readiness)
@@ -1556,12 +2022,53 @@ def selftest(root: Path) -> None:
         observed_function["intent"]["program_evidence_lane"] = "typed_observed_function"
         observed_function["runner"]["execution_source"] = {
             "kind": "typed_observed_function_program",
-            "artifact_sha256": "33" * 32,
+            "artifact_sha256": recompiled_sha256,
         }
+        observed_function["runner"]["program_build_receipt"] = write_program_receipt(
+            directory / "typed-observed-program-receipt.json",
+            {
+                "kind": "typed_observed_function",
+                "identity_wire": recompiled_identity,
+            },
+            observed_function["runner"]["execution_source"],
+        )
         observed_function_readiness, _ = validate_manifest(
             observed_function, manifest_path, root
         )
         validate_readiness(observed_function_readiness)
+
+        native_identity = {
+            "path": str(recompiled),
+            "bytes": recompiled.stat().st_size,
+            "sha256": recompiled_sha256,
+        }
+        native_source = {
+            "kind": "native_archive",
+            "artifact_sha256": native_archive_source_sha256([
+                ("0-generated", native_identity, recompiled),
+            ]),
+        }
+        stale_native_identity = dict(native_identity)
+        stale_native_identity["sha256"] = "00" * 32
+        expect_rejected(
+            lambda: native_archive_source_sha256([
+                ("0-generated", stale_native_identity, recompiled),
+            ]),
+            "native archive aggregate with stale per-file digest",
+        )
+        native = json.loads(json.dumps(full_rom))
+        native["intent"]["program_evidence_lane"] = "identified_native_archive"
+        native["runner"]["execution_source"] = native_source
+        native["runner"]["program_build_receipt"] = write_program_receipt(
+            directory / "native-program-receipt.json",
+            {
+                "kind": "native_archives",
+                "archives": [{"label": "0-generated", "file": native_identity}],
+            },
+            native_source,
+        )
+        native_readiness, _ = validate_manifest(native, manifest_path, root)
+        validate_readiness(native_readiness)
 
         typed_function = json.loads(json.dumps(full_rom))
         typed_function["intent"]["program_evidence_lane"] = "typed_function"

@@ -130,6 +130,16 @@ pub enum UcodeId {
     Other(u32),
 }
 
+/// Exact identity of the original microcode-data image paired with one live
+/// IMEM image. The ABI owns the logical RDRAM read and supplies this typed
+/// value; a renderer must explicitly admit the complete text/data pair before
+/// returning a family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MicrocodeDataImageIdentity {
+    pub bytes: u32,
+    pub sha256: [u8; 32],
+}
+
 /// Backend configuration for `RenderBackend::create`. Deliberately minimal
 /// (window/output size only) -- a real windowing surface handle is backend-
 /// specific (RT64 wants a native window handle; a headless backend wants
@@ -766,6 +776,18 @@ pub trait RenderBackend {
     fn identify_microcode(
         &self,
         _imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    ) -> Option<UcodeId> {
+        None
+    }
+
+    /// Identify one exact text/data pair for runtime consumption evidence.
+    /// Text-only HLE admission is deliberately insufficient: compatibility
+    /// backends and catalogs that have not admitted this complete pair return
+    /// `None` even if [`Self::identify_microcode`] recognizes the IMEM image.
+    fn identify_microcode_pair(
+        &self,
+        _imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        _data: MicrocodeDataImageIdentity,
     ) -> Option<UcodeId> {
         None
     }

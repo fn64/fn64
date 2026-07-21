@@ -27,7 +27,7 @@ use crate::{
     ReleaseHostPlatform, ReleaseObservationGeometry, ReleaseRendererEvidence,
 };
 
-pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v16";
+pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v17";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -161,6 +161,12 @@ pub enum RspRdpObservationKindEvidence {
         task_address: u32,
         imem_generation: u64,
         text_sha256: String,
+        /// Physical RDRAM address and exact logical byte identity of the
+        /// original task microcode-data image. Yielded resumes retain the
+        /// initial task identity rather than certifying rewritten yield state.
+        data_address: u32,
+        data_bytes: u32,
+        data_sha256: String,
         family: Option<ReleaseMicrocodeFamily>,
     },
     DramDpcCommitted {
@@ -589,11 +595,17 @@ fn capture_rsp_rdp_evidence(
                     task_addr,
                     imem_generation,
                     text_sha256,
+                    data_addr,
+                    data_size,
+                    data_sha256,
                     family,
                 } => RspRdpObservationKindEvidence::MicrocodeRecognition {
                     task_address: task_addr.offset(),
                     imem_generation,
                     text_sha256: hex(&text_sha256),
+                    data_address: data_addr.offset(),
+                    data_bytes: data_size,
+                    data_sha256: hex(&data_sha256),
                     family: family.map(release_microcode_family),
                 },
                 fn64_abi::RspRdpObservationKind::DramDpcCommitted {
@@ -1535,6 +1547,9 @@ fn test_rsp_rdp_evidence(
                 task_address: 0,
                 imem_generation: 0,
                 text_sha256: sha256_hex(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]),
+                data_address: 0,
+                data_bytes: 1,
+                data_sha256: sha256_hex(&[0]),
                 family: None,
             },
         }]
@@ -1703,7 +1718,7 @@ impl ReleaseGateReport {
         )
     }
 
-    /// Recompute the schema-v16 evidence digest after loading a retained JSON
+    /// Recompute the schema-v17 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {
@@ -1850,6 +1865,15 @@ pub enum GateError {
         source: &'static str,
         start: u32,
         end: u32,
+        limit: u32,
+    },
+    InvalidMicrocodeDataObservationRange {
+        start: u32,
+        bytes: u32,
+        limit: u32,
+    },
+    InvalidRspTaskObservationAddress {
+        address: u32,
         limit: u32,
     },
     NonMonotonicRspRdpObservationCycle {
@@ -2054,6 +2078,18 @@ impl fmt::Display for GateError {
             } => write!(
                 f,
                 "{source} DPC observation range [{start:#010x}, {end:#010x}) must be nonempty, 8-byte aligned, and end at or below {limit:#010x}"
+            ),
+            Self::InvalidMicrocodeDataObservationRange {
+                start,
+                bytes,
+                limit,
+            } => write!(
+                f,
+                "microcode-data observation at {start:#010x} with {bytes:#010x} bytes must be nonempty and fit physical RDRAM ending at {limit:#010x}"
+            ),
+            Self::InvalidRspTaskObservationAddress { address, limit } => write!(
+                f,
+                "RSP task observation at {address:#010x} must name a complete 64-byte OSTask header inside physical RDRAM ending at {limit:#010x}"
             ),
             Self::NonMonotonicRspRdpObservationCycle { previous, observed } => write!(
                 f,
@@ -2873,6 +2909,44 @@ fn encode_section_registry(
     }
 }
 
+fn encode_os_task_header(out: &mut Vec<u8>, header: &fn64_runtime::OsTaskHeader) {
+    for word in [
+        header.task_type,
+        header.flags,
+        header.ucode_boot,
+        header.ucode_boot_size,
+        header.ucode,
+        header.ucode_size,
+        header.ucode_data,
+        header.ucode_data_size,
+        header.dram_stack,
+        header.dram_stack_size,
+        header.output_buff,
+        header.output_buff_size,
+        header.data_ptr,
+        header.data_size,
+        header.yield_data_ptr,
+        header.yield_data_size,
+    ] {
+        push_u32(out, word);
+    }
+}
+
+fn encode_rsp_task_data_identity(
+    out: &mut Vec<u8>,
+    identity: Option<fn64_abi::RspTaskDataIdentityEvidenceSnapshot>,
+) {
+    match identity {
+        Some(identity) => {
+            out.push(1);
+            push_u32(out, identity.rdram_offset);
+            push_u32(out, identity.byte_len);
+            out.extend_from_slice(&identity.sha256);
+        }
+        None => out.push(0),
+    }
+}
+
 fn encode_abi_host(out: &mut Vec<u8>, snapshot: fn64_abi::AbiHostEvidenceSnapshot) {
     encode_runtime_peripherals(out, snapshot.runtime_peripherals);
     match snapshot.flash.write_buffer {
@@ -2891,6 +2965,26 @@ fn encode_abi_host(out: &mut Vec<u8>, snapshot: fn64_abi::AbiHostEvidenceSnapsho
     for image in snapshot.rsp_boot_images {
         push_u32(out, image.rdram_offset);
         push_bytes(out, &image.bytes);
+    }
+    match snapshot.loaded_rsp_task {
+        Some(task) => {
+            out.push(1);
+            push_u32(out, task.task_offset);
+            encode_os_task_header(out, &task.header);
+            encode_rsp_task_data_identity(out, task.resumed_data_identity);
+        }
+        None => out.push(0),
+    }
+    push_u64(out, snapshot.rsp_task_lineages.len() as u64);
+    for lineage in snapshot.rsp_task_lineages {
+        push_u32(out, lineage.task_offset);
+        encode_os_task_header(out, &lineage.original_header);
+        encode_rsp_task_data_identity(out, lineage.data_identity);
+        out.push(match lineage.phase {
+            fn64_abi::RspTaskLineagePhaseEvidenceSnapshot::Running => 0,
+            fn64_abi::RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized => 1,
+            fn64_abi::RspTaskLineagePhaseEvidenceSnapshot::ResumeLoaded => 2,
+        });
     }
     out.push(snapshot.rom_installed as u8);
     match snapshot.installed_rom {
@@ -3031,7 +3125,7 @@ fn encode_device_snapshot(
     program: crate::ProgramEvidenceSnapshot,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 * 1024 + snapshot.save_bytes.as_ref().map_or(0, Vec::len));
-    out.extend_from_slice(b"fn64.device-evidence.v6\0");
+    out.extend_from_slice(b"fn64.device-evidence.v7\0");
     encode_guest_device_snapshot(&mut out, snapshot.guest);
     push_bytes(&mut out, &snapshot.pi_timing_policy);
 
@@ -3464,13 +3558,22 @@ fn validate_rsp_rdp_observations(
         previous_cycle = Some(event.guest_cycle);
         match &event.observation {
             RspRdpObservationKindEvidence::MicrocodeRecognition {
+                task_address,
                 imem_generation,
                 text_sha256,
+                data_address,
+                data_bytes,
+                data_sha256,
                 ..
             } => {
+                validate_rsp_task_observation_address(*task_address)?;
                 decode_sha256(text_sha256).ok_or(GateError::InvalidReportSha256(
                     "rsp_rdp.ordered[].observation.text_sha256",
                 ))?;
+                decode_sha256(data_sha256).ok_or(GateError::InvalidReportSha256(
+                    "rsp_rdp.ordered[].observation.data_sha256",
+                ))?;
+                validate_microcode_data_observation_range(*data_address, *data_bytes)?;
                 validate_imem_generation_digest(
                     &mut imem_generation_digests,
                     *imem_generation,
@@ -3489,7 +3592,12 @@ fn validate_rsp_rdp_observations(
                 end,
                 command_sha256,
             } => {
-                validate_dpc_observation_range(*start, *end, 0x0100_0000, "DRAM")?;
+                validate_dpc_observation_range(
+                    *start,
+                    *end,
+                    crate::DEFAULT_RDRAM_SIZE as u32,
+                    "DRAM",
+                )?;
                 decode_sha256(command_sha256).ok_or(GateError::InvalidReportSha256(
                     "rsp_rdp.ordered[].observation.command_sha256",
                 ))?;
@@ -3505,10 +3613,11 @@ fn validate_rsp_rdp_observations(
                 ))?;
             }
             RspRdpObservationKindEvidence::ImemReplacementCommitted {
+                task_address,
                 imem_generation,
                 text_sha256,
-                ..
             } => {
+                validate_rsp_task_observation_address(*task_address)?;
                 decode_sha256(text_sha256).ok_or(GateError::InvalidReportSha256(
                     "rsp_rdp.ordered[].observation.text_sha256",
                 ))?;
@@ -3564,11 +3673,37 @@ fn validate_dpc_observation_range(
     Ok(())
 }
 
+fn validate_microcode_data_observation_range(start: u32, bytes: u32) -> Result<(), GateError> {
+    let limit = u32::try_from(crate::DEFAULT_RDRAM_SIZE).expect("release RDRAM size fits u32");
+    let valid =
+        bytes != 0 && start < limit && start.checked_add(bytes).is_some_and(|end| end <= limit);
+    if !valid {
+        return Err(GateError::InvalidMicrocodeDataObservationRange {
+            start,
+            bytes,
+            limit,
+        });
+    }
+    Ok(())
+}
+
+fn validate_rsp_task_observation_address(address: u32) -> Result<(), GateError> {
+    const OS_TASK_HEADER_BYTES: u32 = 64;
+    let limit = u32::try_from(crate::DEFAULT_RDRAM_SIZE).expect("release RDRAM size fits u32");
+    if address
+        .checked_add(OS_TASK_HEADER_BYTES)
+        .is_none_or(|end| end > limit)
+    {
+        return Err(GateError::InvalidRspTaskObservationAddress { address, limit });
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_rsp_rdp_observations(
     observations: &[RspRdpObservationEventEvidence],
 ) -> Result<Vec<u8>, GateError> {
     let mut out = Vec::new();
-    out.extend_from_slice(b"fn64.rsp-rdp-observations.v1\0");
+    out.extend_from_slice(b"fn64.rsp-rdp-observations.v2\0");
     push_u64(&mut out, observations.len() as u64);
     for event in observations {
         push_u64(&mut out, event.guest_cycle);
@@ -3577,6 +3712,9 @@ pub(crate) fn encode_rsp_rdp_observations(
                 task_address,
                 imem_generation,
                 text_sha256,
+                data_address,
+                data_bytes,
+                data_sha256,
                 family,
             } => {
                 out.push(0);
@@ -3584,6 +3722,11 @@ pub(crate) fn encode_rsp_rdp_observations(
                 push_u64(&mut out, *imem_generation);
                 out.extend_from_slice(&decode_sha256(text_sha256).ok_or(
                     GateError::InvalidReportSha256("rsp_rdp.ordered[].observation.text_sha256"),
+                )?);
+                push_u32(&mut out, *data_address);
+                push_u32(&mut out, *data_bytes);
+                out.extend_from_slice(&decode_sha256(data_sha256).ok_or(
+                    GateError::InvalidReportSha256("rsp_rdp.ordered[].observation.data_sha256"),
                 )?);
                 match family {
                     Some(family) => {
@@ -4348,12 +4491,12 @@ mod tests {
     }
 
     #[test]
-    fn schema_v16_fixed_cycle_digest_is_stable_and_complete() {
+    fn schema_v17_fixed_cycle_digest_is_stable_and_complete() {
         assert_eq!(complete_digest(), complete_digest());
         assert_eq!(complete_digest().artifacts.len(), 5);
         assert_eq!(
             complete_digest().root_sha256,
-            "e8cab8952b06820896ef1888d75eb022d938ed8e571a0804ba1bae7a7d6b30a1"
+            "a45253b2b1f2cf72a46f9a7f8226c1235a779f4d421e22d36f37118588c62eae"
         );
     }
 
@@ -4741,7 +4884,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v6_wire_binds_executor_and_abi_host_families() {
+    fn device_state_v7_wire_binds_executor_and_abi_host_families() {
         use fn64_runtime::{
             EventRegistrationEvidenceSnapshot, ExecutorQueueEvidenceSnapshot,
             ExecutorRunningEvidenceSnapshot, MesgQueueEvidenceSnapshot,
@@ -4772,7 +4915,7 @@ mod tests {
                         crate::ProgramEvidenceSnapshot::NoProgram,
                     )),
                     baseline,
-                    "device-state-v6 evidence omitted executor family {}",
+                    "device-state-v7 evidence omitted executor family {}",
                     $name
                 );
             }};
@@ -4869,7 +5012,7 @@ mod tests {
                         crate::ProgramEvidenceSnapshot::NoProgram,
                     )),
                     baseline,
-                    "device-state-v6 evidence omitted ABI HostState family {}",
+                    "device-state-v7 evidence omitted ABI HostState family {}",
                     $name
                 );
             }};
@@ -4916,6 +5059,61 @@ mod tests {
                     .push(fn64_abi::RspBootImageEvidenceSnapshot {
                         rdram_offset: 0x100,
                         bytes: vec![1, 2, 3],
+                    });
+            }
+        );
+        changed_host!(
+            "loaded RSP task token",
+            |value: &mut fn64_abi::AbiHostEvidenceSnapshot| {
+                value.loaded_rsp_task = Some(fn64_abi::LoadedRspTaskEvidenceSnapshot {
+                    task_offset: 0x200,
+                    header: fn64_runtime::OsTaskHeader {
+                        task_type: fn64_runtime::M_GFXTASK,
+                        flags: fn64_runtime::OS_TASK_YIELDED,
+                        ucode_boot: 0x1000,
+                        ucode_boot_size: 0x80,
+                        ucode: 0x2000,
+                        ucode_size: 0x1000,
+                        ucode_data: 0x3000,
+                        ucode_data_size: 0x40,
+                        dram_stack: 0x4000,
+                        dram_stack_size: 0x20,
+                        output_buff: 0x5000,
+                        output_buff_size: 0x5004,
+                        data_ptr: 0x6000,
+                        data_size: 0x18,
+                        yield_data_ptr: 0x7000,
+                        yield_data_size: 0x80,
+                    },
+                    resumed_data_identity: Some(fn64_abi::RspTaskDataIdentityEvidenceSnapshot {
+                        rdram_offset: 0x3000,
+                        byte_len: 0x40,
+                        sha256: [0x31; 32],
+                    }),
+                });
+            }
+        );
+        changed_host!(
+            "yielded RSP task lineage",
+            |value: &mut fn64_abi::AbiHostEvidenceSnapshot| {
+                value
+                    .rsp_task_lineages
+                    .push(fn64_abi::RspTaskLineageEvidenceSnapshot {
+                        task_offset: 0x200,
+                        original_header: fn64_runtime::OsTaskHeader {
+                            task_type: fn64_runtime::M_GFXTASK,
+                            ucode_data: 0x3000,
+                            ucode_data_size: 0x40,
+                            yield_data_ptr: 0x7000,
+                            yield_data_size: 0x80,
+                            ..fn64_runtime::OsTaskHeader::default()
+                        },
+                        data_identity: Some(fn64_abi::RspTaskDataIdentityEvidenceSnapshot {
+                            rdram_offset: 0x3000,
+                            byte_len: 0x40,
+                            sha256: [0x32; 32],
+                        }),
+                        phase: fn64_abi::RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized,
                     });
             }
         );
@@ -4989,7 +5187,46 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v6_wire_distinguishes_native_program_classes_and_identity() {
+    fn device_state_v7_wire_distinguishes_rsp_task_lineage_phases() {
+        let device = snapshot(42);
+        let executor = executor_snapshot();
+        let digest = |phase| {
+            let mut host = host_snapshot();
+            host.rsp_task_lineages
+                .push(fn64_abi::RspTaskLineageEvidenceSnapshot {
+                    task_offset: 0x200,
+                    original_header: fn64_runtime::OsTaskHeader {
+                        task_type: fn64_runtime::M_GFXTASK,
+                        ucode_data: 0x3000,
+                        ucode_data_size: 0x40,
+                        ..fn64_runtime::OsTaskHeader::default()
+                    },
+                    data_identity: Some(fn64_abi::RspTaskDataIdentityEvidenceSnapshot {
+                        rdram_offset: 0x3000,
+                        byte_len: 0x40,
+                        sha256: [0x32; 32],
+                    }),
+                    phase,
+                });
+            sha256_hex(&encode_device_snapshot(
+                device.clone(),
+                executor.clone(),
+                host,
+                crate::ProgramEvidenceSnapshot::NoProgram,
+            ))
+        };
+        let distinct: std::collections::BTreeSet<_> = [
+            digest(fn64_abi::RspTaskLineagePhaseEvidenceSnapshot::Running),
+            digest(fn64_abi::RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized),
+            digest(fn64_abi::RspTaskLineagePhaseEvidenceSnapshot::ResumeLoaded),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(distinct.len(), 3);
+    }
+
+    #[test]
+    fn device_state_v7_wire_distinguishes_native_program_classes_and_identity() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let host = host_snapshot();
@@ -5019,7 +5256,7 @@ mod tests {
 
     #[cfg(feature = "recomp-rs")]
     #[test]
-    fn device_state_v6_wire_binds_typed_program_identity_and_dynamic_state() {
+    fn device_state_v7_wire_binds_typed_program_identity_and_dynamic_state() {
         use fn64_abi::recompiled::{
             LiveExecutableRegionEvidenceSnapshot, PendingExecutableWriteEvidenceSnapshot,
             RecompiledProgramEvidenceSnapshot,
@@ -5377,7 +5614,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v16_report_wire_binds_every_release_environment_field() {
+    fn schema_v17_report_wire_binds_every_release_environment_field() {
         let report = ReleaseGateReport::new(
             "environment-wire",
             b"input",
@@ -6045,7 +6282,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v16_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
+    fn schema_v17_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
         let geometry = observations();
         let graphics_closure = vec![ClosurePath {
             name: "rsp.graphics-task".to_owned(),
@@ -6060,6 +6297,9 @@ mod tests {
                     task_address: 0x1000,
                     imem_generation: 3,
                     text_sha256: "11".repeat(32),
+                    data_address: 0x2000,
+                    data_bytes: 0x80,
+                    data_sha256: "12".repeat(32),
                     family: Some(ReleaseMicrocodeFamily::F3dex2),
                 },
             },
@@ -6094,6 +6334,20 @@ mod tests {
         )
         .unwrap();
         report.verify_integrity().unwrap();
+
+        let mut changed_data_events = report.rsp_rdp.ordered.clone();
+        let RspRdpObservationKindEvidence::MicrocodeRecognition { data_sha256, .. } =
+            &mut changed_data_events[0].observation
+        else {
+            panic!("first fixture event must be microcode recognition");
+        };
+        *data_sha256 = "13".repeat(32);
+        let mut changed_data = report.clone();
+        changed_data.rsp_rdp = RspRdpEvidence::from_ordered(changed_data_events).unwrap();
+        assert!(matches!(
+            changed_data.verify_integrity(),
+            Err(GateError::ReportIntegrityMismatch { .. })
+        ));
 
         let mut reordered = report.clone();
         reordered.rsp_rdp.ordered.swap(0, 1);
@@ -6153,6 +6407,9 @@ mod tests {
                 task_address: 0x1000,
                 imem_generation: 4,
                 text_sha256: "44".repeat(32),
+                data_address: 0x2000,
+                data_bytes: 0x80,
+                data_sha256: "12".repeat(32),
                 family: None,
             },
         });
@@ -6174,6 +6431,65 @@ mod tests {
         assert!(matches!(
             invalid_range.verify_integrity(),
             Err(GateError::InvalidDpcObservationRange { source: "DRAM", .. })
+        ));
+
+        let mut host_only_dram_range = report.clone();
+        host_only_dram_range.rsp_rdp.ordered[1].observation =
+            RspRdpObservationKindEvidence::DramDpcCommitted {
+                start: crate::DEFAULT_RDRAM_SIZE as u32,
+                end: crate::DEFAULT_RDRAM_SIZE as u32 + 8,
+                command_sha256: "22".repeat(32),
+            };
+        assert!(matches!(
+            host_only_dram_range.verify_integrity(),
+            Err(GateError::InvalidDpcObservationRange { source: "DRAM", .. })
+        ));
+
+        for (data_address, data_bytes) in [
+            (0x2000, 0),
+            (crate::DEFAULT_RDRAM_SIZE as u32, 1),
+            (crate::DEFAULT_RDRAM_SIZE as u32 - 0x40, 0x80),
+            (u32::MAX - 3, 8),
+        ] {
+            let mut invalid_data_range = report.clone();
+            let RspRdpObservationKindEvidence::MicrocodeRecognition {
+                data_address: address,
+                data_bytes: bytes,
+                ..
+            } = &mut invalid_data_range.rsp_rdp.ordered[0].observation
+            else {
+                panic!("first fixture event must be microcode recognition");
+            };
+            *address = data_address;
+            *bytes = data_bytes;
+            assert!(matches!(
+                invalid_data_range.verify_integrity(),
+                Err(GateError::InvalidMicrocodeDataObservationRange { .. })
+            ));
+        }
+
+        let mut invalid_recognition_task = report.clone();
+        let RspRdpObservationKindEvidence::MicrocodeRecognition { task_address, .. } =
+            &mut invalid_recognition_task.rsp_rdp.ordered[0].observation
+        else {
+            panic!("first fixture event must be microcode recognition");
+        };
+        *task_address = crate::DEFAULT_RDRAM_SIZE as u32 - 63;
+        assert!(matches!(
+            invalid_recognition_task.verify_integrity(),
+            Err(GateError::InvalidRspTaskObservationAddress { .. })
+        ));
+
+        let mut invalid_replacement_task = report.clone();
+        let RspRdpObservationKindEvidence::ImemReplacementCommitted { task_address, .. } =
+            &mut invalid_replacement_task.rsp_rdp.ordered[2].observation
+        else {
+            panic!("third fixture event must be IMEM replacement");
+        };
+        *task_address = u32::MAX;
+        assert!(matches!(
+            invalid_replacement_task.verify_integrity(),
+            Err(GateError::InvalidRspTaskObservationAddress { .. })
         ));
 
         assert!(matches!(
