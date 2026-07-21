@@ -5,7 +5,8 @@ trusted series mechanism are wired. Representative private NTSC full-ROM
 exact-ten series for reference and RT64 LLE/post-VI were retained and
 reverified locally on 2026-07-21. Their content-bearing evidence remains
 outside the repository; no private game content, path, length, or content hash
-is tracked here.
+is tracked here. Joint private-series matrix verification retains all 162
+FullParityV1 requirements and currently satisfies 9, leaving 153 explicit.
 
 `tools/private_input_admission.py` validates private inputs before an
 Extended-GBI fixture or full-ROM release run consumes them. It never copies
