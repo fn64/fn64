@@ -723,6 +723,7 @@ dependencies = [
  "fn64-abi",
  "fn64-recomp-rs",
  "fn64-runtime",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
  "sha2",

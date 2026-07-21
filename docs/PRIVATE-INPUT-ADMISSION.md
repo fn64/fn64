@@ -1,7 +1,9 @@
 # Private-input admission
 
-Status: local admission mechanism complete; no private game content, path,
-length, or content hash is tracked by this repository.
+Status: local admission and trusted synthetic-series mechanism complete;
+production full-ROM launch remains fail-closed pending the typed program-build
+receipt described below. No private game content, path, length, or content
+hash is tracked by this repository.
 
 `tools/private_input_admission.py` validates private inputs before an
 Extended-GBI fixture or full-ROM release run consumes them. It never copies
@@ -17,14 +19,15 @@ that a full-ROM release matrix closed.
 
 ## Local-only manifest
 
-The schema is `fn64.private-input-admission.v3`. A populated manifest contains
+The schema is `fn64.private-input-admission.v4`. A populated manifest contains
 private paths, exact lengths, and SHA-256 values and must never enter git. Use
-this shape, replacing every angle-bracket placeholder locally. Quoted length
-placeholders must become JSON integers, not strings:
+this shape, replacing every angle-bracket placeholder locally. Quoted integer
+placeholders (`length` and `release_gate_cycle`) must become JSON integers,
+not strings:
 
 ```json
 {
-  "schema": "fn64.private-input-admission.v3",
+  "schema": "fn64.private-input-admission.v4",
   "purpose": "combined",
   "intent": {
     "wire_family": "f3dex2_extended_gbi_v1",
@@ -76,6 +79,25 @@ placeholders must become JSON integers, not strings:
       "provenance": "user_generated_from_owned_rom",
       "git_identity": "excluded"
     }
+  },
+  "runner": {
+    "executable": {
+      "path": "/private/tmp/<prebuilt-native-host>",
+      "length": "<exact-positive-integer>",
+      "sha256": "<lowercase-sha256>",
+      "git_identity": "excluded"
+    },
+    "working_directory": "/private/tmp/<run-directory>",
+    "argv": [],
+    "env": {
+      "OOT_MAX_STEPS": "<fixed-value>"
+    },
+    "release_gate_cycle": "<nonnegative-u64-integer>",
+    "execution_source": {
+      "kind": "typed_block_program",
+      "program_sha256": "<lowercase-sha256>",
+      "dispatch_artifact_sha256": "<lowercase-sha256>"
+    }
   }
 }
 ```
@@ -101,6 +123,18 @@ is rejected because it makes no such assertion, and
 bound. Use `no_program_fixture` only for an `extended_gbi`-only fixture that
 executes no full-ROM program. These failures occur during admission, before a
 ten-run series spends time booting the game.
+
+The v4 `runner` section binds the exact native entry image, working directory,
+argument vector, fixed child environment, gate cycle, and expected v16
+execution source. The executable must be built before admission. The trusted
+runner clears the ambient environment, launches the executable directly, and
+owns `ROM` plus the three `FN64_RELEASE_*` values; manifests cannot override
+them. ELF, Mach-O, and PE entry images are accepted by the Rust runner;
+scripts and interpreter-mediated launchers are rejected. Loader, interpreter,
+plugin, shader/ICD, and search-path override variables are also rejected,
+including the `LD_*`, `DYLD_*`, `PYTHON*`, `VK_*`, and analogous families.
+This constrains entry-image provenance; it does not pretend that one executable
+SHA-256 attests every system framework or GPU driver loaded by the process.
 
 The release policy mirrors the typed release-matrix vocabulary:
 
@@ -139,10 +173,17 @@ Admission rejects:
 - full-ROM/combined admission without both ROM and recompiled artifacts;
 - full-ROM admission with stale `typed_function`, `unidentified_native`, or
   `no_program_fixture` program evidence;
-- reference-renderer and RT64 capabilities mixed in one release scenario.
+- reference-renderer and RT64 capabilities mixed in one release scenario;
+- case-variant paths that resolve to tracked repository files on a
+  case-insensitive filesystem;
+- reserved or code-injecting runner environment variables.
 
 The manifest itself is subject to the same local-only, regular-file, no-symlink
-policy. Output refuses to overwrite an existing report.
+policy. Input measurement uses no-follow descriptors and detects identity,
+length, or timestamp changes during hashing. Output is staged, flushed, and
+published without replacement; rejected output leaves no final file. A writer
+that can concurrently rename external directory ancestors or restore file
+metadata remains outside this local single-owner admission guarantee.
 
 ## Content-free readiness report
 
@@ -166,6 +207,82 @@ length, SHA-256, manifest identity, or private byte-derived digest. It is safe
 as a content-free handoff, but it is not a substitute for retaining the local
 manifest during the run.
 
+## Private run contract and trusted series
+
+For `full_rom` or `combined`, admission can also emit the content-bearing
+`fn64.private-release-run-contract.v1` file:
+
+```sh
+python3 tools/private_input_admission.py \
+  --manifest /private/tmp/fn64-private-input.json \
+  --report /private/tmp/fn64-private-readiness.json \
+  --emit-private-run-contract /private/tmp/fn64-private-run.json
+
+python3 tools/private_input_admission.py \
+  --verify-private-run-contract /private/tmp/fn64-private-run.json
+```
+
+The contract binds the manifest and readiness bytes, purpose, scenario,
+cycle, exact ROM and admitted artifacts, execution source, native child image,
+working directory, arguments, and sorted environment. Its canonical SHA-256
+wire uses domain `fn64.private-release-run-contract-digest.v1\0`, u64
+big-endian lengths/counts, raw 32-byte hashes, and typed execution-source
+tags. This is integrity plus policy equivalence, not an authority signature.
+
+The Rust loader therefore does not accept a deserialized contract directly.
+It returns an opaque verified-contract type only after the repository policy
+script at `tools/private_input_admission.py` byte-matches the copy embedded in
+the runner. The runner resolves `/usr/bin/python3`, then feeds the embedded
+policy bytes directly to isolated Python over a pipe while it revalidates the
+full v4 manifest/readiness mapping; Python never reopens a mutable script path
+for execution. Repository-owned synthetic mechanism tests use a separate
+constructor that accepts only the exact fixed non-game manifest/readiness/input
+bytes, scenario, cycle, empty admitted-artifact set, `NoProgram` source, and
+current test executable. Caller-labelled synthetic input cannot mint authority.
+
+That pinned verifier path is presently a `/usr/bin/python3` system-layout
+boundary, not a cross-platform claim: hosts without that path, including
+Windows, fail closed until an equivalently pinned verifier is implemented.
+Retained verification also
+requires the exact runner image named by the receipt, so the certifying binary
+must be preserved alongside the receipt and evidence. The CLI's
+`--print-contract-sha256` mode recomputes integrity only; its output is never
+admission authority.
+
+`run-private-release-series` owns a random series nonce and launches exactly
+ten children sequentially with an empty ambient environment. It copies the
+verified child bytes to a create-new executable beside the original and runs
+only that read-only isolated stage; before every launch and after the series it
+rehashes both the contract-bound files and stage. This is a local single-owner
+execution guarantee: a malicious same-UID process able to discover, chmod, and
+replace staged paths between verification and operating-system open/spawn is
+outside scope, as is replacement of the OS-owned resolved Python image. Each
+child gets a distinct derived
+event identity and new report/journal/log paths. The
+runner verifies each terminal v3 journal, exact v16 scenario/cycle/input/source,
+the five fixed-cycle artifacts, live-minimum closure, and zero reached
+unsupported events before starting the next child. A create-new, flushed and
+file-synced
+`fn64.private-release-series-receipt.v1` binds the contract, runner and child
+entry-image hashes, nonce, ten event/file/report identities, and common
+semantic report SHA-256.
+
+That receipt is deliberately an integrity record, not a signature. An
+observed runner invocation enforces the direct sequential launches, while
+later receipt verification proves only that the retained evidence still
+matches the recorded series. Transferable process-provenance claims require
+an external trusted CI/code-signing attestation over the receipt and exact
+runner image; fn64 does not currently manufacture such an attestation.
+
+Production launch currently stops before the first child with a precise
+`fn64.release-program-build-receipt.v1` error. Admission proves that the
+recompiled and microcode descriptors are unchanged; it does not yet prove
+that the selected executable consumed those exact bytes. The next production
+gate must bind admitted recompiled input to the report's typed execution
+source and admitted microcode text/data to the ABI-owned task observations.
+Until that typed consumption evidence exists, a full-ROM series is not
+certifiable and the runner intentionally refuses to manufacture one.
+
 ## Synthetic CI gate
 
 The CI-friendly gate creates deterministic non-game bytes in a temporary
@@ -176,10 +293,15 @@ tracked repository files, symlinks, and report overwrite:
 ```sh
 python3 tools/private_input_admission.py --check
 python3 tools/private_input_admission.py --selftest
+cargo test -p fn64-render-rt64 --test private_release_runner
 ```
 
-No private fixture is required for these checks, and none of the synthetic
-paths, lengths, or hashes is written into a tracked file.
+The Rust integration test makes the trusted runner launch ten fresh test
+processes. Every child executes the real executor, PI/SI/AI device fabric,
+graphics-task RSP path, raw RDP submission, reference renderer, and committed
+VI boundary before producing its five-channel report and journal. No private
+fixture is required for these checks, and none of the synthetic paths,
+lengths, or hashes is written into a tracked file.
 
 This admission self-test is separate from the live non-default
 `extended-gbi-evidence` renderer fixture. That fixture substitutes RT64's

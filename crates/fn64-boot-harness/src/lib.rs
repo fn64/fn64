@@ -9,8 +9,10 @@
 
 mod certification_profile;
 mod observation_evidence;
+mod private_release_series;
 mod release_gate;
 mod release_matrix;
+mod release_run_env;
 mod render_evidence;
 mod report_series;
 mod unsupported_journal;
@@ -24,6 +26,17 @@ pub use observation_evidence::{
     FramebufferObservationFormat, FramebufferObservationGeometry, FramebufferObservationSource,
     LiveMemoryEvidence, LiveReferenceFramebufferEvidence, LiveReleaseGateObservationExt,
     MemoryObservationGeometry, ObservationEvidenceError, ReleaseObservationGeometry,
+};
+pub use private_release_series::{
+    load_private_release_run_contract, run_private_release_series, verify_private_release_series,
+    verify_repository_synthetic_private_release_run_contract, PrivateArtifactIdentity,
+    PrivateChildCommand, PrivateEnvironmentEntry, PrivateFileIdentity, PrivateReleaseRunContract,
+    PrivateReleaseSeriesError, PrivateReleaseSeriesReceipt, PrivateReleaseSeriesRun,
+    VerifiedPrivateReleaseRunContract, PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA,
+    PRIVATE_RELEASE_SERIES_COUNT, PRIVATE_RELEASE_SERIES_RECEIPT_SCHEMA,
+    REPOSITORY_SYNTHETIC_RELEASE_CYCLE, REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES,
+    REPOSITORY_SYNTHETIC_RELEASE_MANIFEST_BYTES, REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES,
+    REPOSITORY_SYNTHETIC_RELEASE_SCENARIO,
 };
 pub use release_gate::{
     ArtifactDigest, ArtifactKind, ClosureGate, ClosurePath, ClosurePathStatus, DeterministicDigest,
@@ -42,6 +55,11 @@ pub use release_matrix::{
     SaveFeature, VerifiedMatrixScenario, VerifiedReleaseMatrix, INCOMPLETE_RELEASE_MATRIX_SCHEMA,
     RELEASE_MATRIX_MAX_SCENARIOS, RELEASE_MATRIX_REPORT_COUNT, RELEASE_MATRIX_SCHEMA,
     VERIFIED_RELEASE_MATRIX_SCHEMA,
+};
+pub use release_run_env::{
+    release_run_environment_from_process, release_run_environment_from_process_with_oot_aliases,
+    ReleaseRunEnvironment, ReleaseRunEnvironmentError, RELEASE_GATE_CYCLE_ENV, RELEASE_REPORT_ENV,
+    RELEASE_RUN_EVENT_SHA256_ENV,
 };
 pub use render_evidence::{
     LiveReleaseGateRenderExt, LiveRenderEvidence, RenderCaptureStage, RenderEvidenceError,

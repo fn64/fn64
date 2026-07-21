@@ -395,32 +395,13 @@ fn main() {
     // incremental sink already has every event that copy will contain).
     const TRACE_PATH: &str = "/tmp/oot-boot-trace.jsonl";
     let trace_file_enabled = std::env::var_os("OOT_TRACE").is_some();
-    let release_gate_raw = fn64_boot_harness::parse_release_env_value(
-        "OOT_RELEASE_GATE_CYCLE",
-        std::env::var_os("OOT_RELEASE_GATE_CYCLE"),
-    )
-    .unwrap_or_else(|error| panic!("oot-boot: {error}"));
-    let release_report_raw = fn64_boot_harness::parse_release_env_value(
-        "OOT_RELEASE_REPORT",
-        std::env::var_os("OOT_RELEASE_REPORT"),
-    )
-    .unwrap_or_else(|error| panic!("oot-boot: {error}"));
-    let release_run_event_sha256 = fn64_boot_harness::parse_release_env_value(
-        "OOT_RELEASE_RUN_EVENT_SHA256",
-        std::env::var_os("OOT_RELEASE_RUN_EVENT_SHA256"),
-    )
-    .unwrap_or_else(|error| panic!("oot-boot: {error}"));
-    assert_eq!(
-        release_gate_raw.is_some(),
-        release_report_raw.is_some(),
-        "oot-boot: OOT_RELEASE_GATE_CYCLE and OOT_RELEASE_REPORT must be provided together"
-    );
-    assert_eq!(
-        release_gate_raw.is_some(),
-        release_run_event_sha256.is_some(),
-        "oot-boot: OOT_RELEASE_GATE_CYCLE and OOT_RELEASE_RUN_EVENT_SHA256 must be provided together"
-    );
-    let release_report_present = release_report_raw.is_some();
+    let release_environment =
+        fn64_boot_harness::release_run_environment_from_process_with_oot_aliases()
+            .unwrap_or_else(|error| panic!("oot-boot: {error}"));
+    let release_gate_raw = release_environment
+        .as_ref()
+        .map(|environment| environment.guest_cycle.to_string());
+    let release_report_present = release_environment.is_some();
     let quiescent_discovery_raw = fn64_boot_harness::parse_release_env_value(
         "OOT_RELEASE_DISCOVER_QUIESCENT_AFTER",
         std::env::var_os("OOT_RELEASE_DISCOVER_QUIESCENT_AFTER"),
@@ -456,26 +437,19 @@ fn main() {
             discovery.floor()
         );
     }
-    let mut release_gate =
-        release_gate_raw
-            .zip(release_report_raw)
-            .zip(release_run_event_sha256)
-            .map(|((raw, report), run_event_sha256)| {
-                let cycle = raw.parse::<u64>().unwrap_or_else(|_| {
-            panic!("oot-boot: OOT_RELEASE_GATE_CYCLE must be an unsigned guest cycle, got {raw:?}")
-                });
-                let report_path = std::path::PathBuf::from(report);
-                let journal_path = report_path.with_extension("unsupported.jsonl");
-                let mut gate = fn64_boot_harness::LiveReleaseGate::new(cycle);
-                gate.arm_with_unsupported_journal(&journal_path, &run_event_sha256)
-                    .unwrap_or_else(|error| panic!("oot-boot: arm live release gate: {error}"));
-                println!(
-                    "[oot-boot] live release gate armed at guest cycle {cycle}; report={}; unsupported_journal={}",
-                    report_path.display(),
-                    journal_path.display()
-                );
-                (gate, report_path)
-            });
+    let mut release_gate = release_environment.map(|environment| {
+        let journal_path = environment.journal_path();
+        let mut gate = fn64_boot_harness::LiveReleaseGate::new(environment.guest_cycle);
+        gate.arm_with_unsupported_journal(&journal_path, &environment.run_event_sha256)
+            .unwrap_or_else(|error| panic!("oot-boot: arm live release gate: {error}"));
+        println!(
+            "[oot-boot] live release gate armed at guest cycle {}; report={}; unsupported_journal={}",
+            environment.guest_cycle,
+            environment.report_path.display(),
+            journal_path.display()
+        );
+        (gate, environment.report_path)
+    });
     if trace_file_enabled {
         if let Err(e) = fn64_abi::set_trace_sink_file(TRACE_PATH) {
             eprintln!(
