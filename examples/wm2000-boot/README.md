@@ -551,22 +551,74 @@ near-black (`/tmp/fn64-fb-15.png`) -> mid-gray (`/tmp/fn64-fb-186.png`)
 By task ~#780 the task shape changes to small 11-25-triangle DLs --
 logo/menu-scale content beginning, still under the fade cover.
 
-## Next frontier: SRAM read one page past the 32 KiB device
+## RESOLVED (2026-07-21): SRAM read one page past the 32 KiB device
 
-The 2M-step run ends at a NAMED save-storage trap, not corruption:
+The 2M-step run ended at a NAMED save-storage trap, not corruption:
 `InMemorySaveStorage::read_into: range 0x20..0x8020 exceeds device
 length 0x8000` (save.rs:192), immediately after swap #272 / gfx task
-#781. The game DMAs 0x8000 bytes of SRAM starting at device offset
-0x20 -- 0x20 past the 256 Kbit chip this harness registers
-(`SaveType::SramBanked`). Open questions for the next cycle: does NWXE
-actually use banked/larger SRAM (768 Kbit, 3x32 KiB banks -- the
-`SramBanked` type exists for exactly that shape), does hardware wrap
-the address lines (so the last 0x20 bytes alias offset 0..0x20), or is
-fn64's PI SRAM offset decode off by the 0x20-byte save-signature
-header the game writes at boot (`func_800F4B60`'s 0x19990901 block)?
-Evidence gathering: log the OSPiHandle fields + cart address of the
-offending `osEPiStartDma`, and compare against the game's own SRAM
-handle constructor (`func_80000A88`, baseAddress 0xA8000000, domain 2).
+#781. Root cause: the boot save-load path (`func_800F497C`) validates
+the 0x20-byte 0x19990901 signature header at device offset 0, then
+reads the payload as a round **0x8000 bytes from device offset 0x20**
+(OSIoMesg `devAddr=0x20, size=0x8000`, OS_READ) -- 0x20 past the end
+of a 256 Kbit chip.
+
+**The evidenced geometry is 256 Kbit (0x8000 bytes), not 768 Kbit.**
+Three independent signals agree:
+
+1. **The game's own save-region table** (13 entries of
+   `{u16 offset, u16 stride, u16 size, u16 pad}` at `0x8010625C`,
+   bank-1 data, ROM `0x7082C`): regions span device offsets
+   `0x20..0x66E4` including each region's trailing 4-byte checksum
+   (`func_800F03C0`'s per-region sum written at `buf+offset+size`).
+   Entry 13 (`0x801062C4`) is the whole-payload pseudo-region the
+   format path (`func_800F4B60`) writes: offset 0, length 0x66E0 --
+   device end 0x6700. No code path addresses past 0x8020, and no
+   write EVER crosses 0x8000; only the boot read's round 0x8000 does.
+2. **mupen64plus.ini**: all WM2000 regions (U/E/J) are
+   `SaveType=SRAM` -- the flat 32 KiB device.
+3. **The beta-playable reference port** (jessetbh
+   WWFWrestleMania2000Recomp, `src/main/main.cpp`) configures
+   `recomp::SaveType::Sram`, a 32 KB buffer.
+
+**Fix (hardware address decode, not a bigger device):** a discrete
+256 Kbit SRAM part only decodes A0..A14, so the PI byte address
+aliases modulo the power-of-two device size -- the read's last 0x20
+bytes wrap to `0x0..0x20` and return the signature header again, into
+a buffer tail the game never consumes (payload use caps at 0x66E0).
+`PiDma::sram_decode` (fn64-runtime `rom.rs`) now models exactly that
+for both directions: offset masks down, a transfer crossing the end
+splits at the boundary and wraps to 0. A transfer longer than the
+whole device (aliases every byte more than once -- no shipped
+pattern) and non-power-of-two devices (no defined undriven-line
+model) keep the loud trap; EEPROM/Flash/PFS bounds traps untouched.
+4 new wrap tests in `rom.rs`; workspace 1361 passed / 0 failed.
+
+**Result:** the save read completes and boot runs past the old
+frontier to **VI swap #732 / gfx task #1241** (manually bounded, no
+crash -- 2.7x deeper). Immediately after the save read the task shape
+changes for good: tasks #783+ carry a CONSTANT 100/104-triangle DL
+(vs the demo's cycling 50..1013) -- a new static scene (title/menu
+scale) never reached before -- while the fade layer keeps executing
+full ramps (white `/tmp/fn64-fb-272.png` -> black `fn64-fb-318.png`
+-> mid-gray `fn64-fb-360.png`/`fn64-fb-500.png` -> black
+`fn64-fb-414.png`, deepest `fn64-fb-732.png`).
+
+## Next frontier: the fade cover never lifts (no scene bleed-through)
+
+No presented frame ever contains textured/scene content: every
+`/tmp/fn64-fb-*.png` through #732 is a UNIFORM fill at the fade's
+current level (a full-frame variance scan found structure only from
+the 1-px dotted VI artifact column). That is evidence of a compositing
+bug, not game logic: at mid-ramp, an alpha-blended fade rect over the
+live scene (549..723-tri bursts pre-save at tasks #778/#25/#28;
+constant 100/104 tris post-save) MUST show the scene tinted, never a
+flat field -- so the full-screen cover is being rendered opaque (color
+ramping, alpha ignored), or the scene geometry never survives into
+the color image. Next rung: capture a post-save-read display list
+(`FN64_XBUS_STREAM_DUMP_DIR` + `WM2000_GFX_DUMP_SKIP=783`) and decode
+the cover texrect's combine/blend state vs the scene draws -- decide
+whether the raw-RDP lane's blender, the HLE texrect path, or the
+scene's TMEM loads are at fault.
 
 ## Superseded framing (2026-07-21, earlier): wild-pointer crash in the demo scene, one task after first geometry
 
