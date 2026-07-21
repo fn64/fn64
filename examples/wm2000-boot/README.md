@@ -35,6 +35,38 @@ cargo run
    PNG if non-uniform (`/tmp/fn64-fb-<n>.png`).
 4. Writes the full `TraceEvent` stream to `/tmp/wm2000-boot-trace.jsonl`.
 
+## Step budget (`WM2000_MAX_STEPS`)
+
+Default 20,000,000 scheduler steps. Override with `WM2000_MAX_STEPS=<n>`
+(positive integer). Measured economics (2026-07-21 trace,
+`/tmp/wm2000-boot-trace.jsonl`): one full VI field of boot activity —
+retrace fan-out, the AKI sound pump's ~6 raw `AI_STATUS`/`AI_LEN` polls
+(each charged 32 guest cycles and one scheduler step), and one audio-task
+submit — costs ~10–16 steps, so the default budget covers on the order of
+a million VI fields (hours of virtual boot time). Audio tasks are paced
+at exactly one per field by the retrace, the natural hardware cadence,
+**not** a starved-feedback loop from the stand-in ucode completing
+instantly — verified by the constant 1,563,558-cycle submit gaps in the
+trace. Raise the budget for long captures; the budget is not what limits
+graphics frames (see below).
+
+## Boot stall after the first 3 gfx frames (2026-07-21)
+
+With the IPL3 boot copy + RDRAM swizzle + RSP replay fixes in place, boot
+reaches real rendered frames, then stalls:
+
+1. sim 0 → ~16.03B cycles (~10,300 fields): audio-pump-only phase — one
+   `M_AUDTASK` per field, no gfx.
+2. sim ~16.03B–16.07B: the game submits 3 gfx frame pairs (F3DEX2 XBUS
+   tasks); `osViSwapBuffer` fires and non-uniform framebuffers are dumped
+   (near-white dithered fade frames).
+3. sim >16.07B: **no further task submissions of any kind.** The retrace
+   fan-out thread stops posting to the sound pump's queue (rdram 0xE0908),
+   so the pump (blocked in `osRecvMesg`) starves and audio stops; the
+   audio thread blocks on 0x559A0 and the gfx-task thread on 0x522E8,
+   each waiting for a message the per-field main-loop thread never sends.
+   Persists for 20k+ fields — a real handshake stall, not a pause.
+
 ## Known frontier (2026-07-14)
 
 See `docs/DESIGN.md`'s "M1 boot-host attempt" section for the full,
