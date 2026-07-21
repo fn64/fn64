@@ -1245,7 +1245,8 @@ impl Framebuffer {
                 } else {
                     (rect.s + dx * ds_per_pixel, rect.t + dy * dt_per_pixel)
                 };
-                let texel = texture.sample_copy(s, t);
+                let sample = texture.sample_copy(s, t);
+                let texel = sample.rgba;
                 let noise = self.noise.next_sample();
                 if !copy_alpha_compare_value(
                     rect.other_mode.alpha_compare(),
@@ -1257,7 +1258,21 @@ impl Framebuffer {
                     continue;
                 }
                 let index = (y as u32 * self.width + x as u32) as usize * 4;
-                self.pixels[index..index + 4].copy_from_slice(&texel);
+                if self.color_layout == ColorImageLayout::Index8 {
+                    // Programming Manual 13.11 and 15.5 define copy as a
+                    // direct 8-bit memory transfer after source-format alpha
+                    // comparison. In particular, IA8 must retain both packed
+                    // nibbles rather than store its expanded intensity lane.
+                    let byte = sample.direct_8bit.unwrap_or_else(|| {
+                        panic!(
+                            "copy-cycle 8-bit target reached rasterizer without a direct source byte (format={} size={})",
+                            texture.format, texture.size
+                        )
+                    });
+                    self.pixels[index..index + 4].copy_from_slice(&[byte, byte, byte, texel[3]]);
+                } else {
+                    self.pixels[index..index + 4].copy_from_slice(&texel);
+                }
                 self.coverage[index / 4] = Coverage::FULL;
             }
         }

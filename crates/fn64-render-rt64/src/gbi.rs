@@ -1803,6 +1803,18 @@ pub struct Texture {
     pub(crate) lod: Option<std::rc::Rc<TextureLodSnapshot>>,
 }
 
+/// One copy-cycle texture sample.
+///
+/// Copy mode writes supported 8-bit texels as their original memory byte, but
+/// alpha compare still consumes the source format's decoded alpha. Keeping
+/// both values prevents IA8's packed intensity/alpha byte from being rebuilt
+/// from an RGBA intermediate at the framebuffer boundary.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CopyTextureSample {
+    pub rgba: [u8; 4],
+    pub direct_8bit: Option<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TextureLodSnapshot {
     tiles: [Option<Texture>; 8],
@@ -2034,8 +2046,33 @@ impl Texture {
     /// Point-sample through the copy-cycle coordinate path. Chapter 13.11,
     /// "Restrictions," specifies that copy implicitly disables clamping while
     /// retaining wrap/mirror for supported texel sizes.
-    pub(crate) fn sample_copy(&self, s: f32, t: f32) -> [u8; 4] {
-        self.sample_filtered_with_address_mode(s, t, TextureFilter::Point, TextureAddressMode::Copy)
+    pub(crate) fn sample_copy(&self, s: f32, t: f32) -> CopyTextureSample {
+        let (s, t) = self.relative_coordinates(s, t);
+        let (x, y) = self.address_texel(s.texel(), t.texel(), TextureAddressMode::Copy);
+        let rgba = self.sample_addressed(x, y);
+        let direct_8bit = if self.size != ColorImage::BITS_8 {
+            None
+        } else {
+            match self.format {
+                ColorImage::I_FORMAT | ColorImage::CI_FORMAT => Some(
+                    self.tmem
+                        .as_ref()
+                        .map_or(rgba[0], |tmem| tmem.raw_texel(x as usize, y as usize) as u8),
+                ),
+                ColorImage::IA_FORMAT => Some(self.tmem.as_ref().map_or_else(
+                    || {
+                        debug_assert_eq!(rgba[0], rgba[1]);
+                        debug_assert_eq!(rgba[0], rgba[2]);
+                        debug_assert_eq!(rgba[0] >> 4, rgba[0] & 0xf);
+                        debug_assert_eq!(rgba[3] >> 4, rgba[3] & 0xf);
+                        (rgba[0] & 0xf0) | (rgba[3] >> 4)
+                    },
+                    |tmem| tmem.raw_texel(x as usize, y as usize) as u8,
+                )),
+                _ => None,
+            }
+        };
+        CopyTextureSample { rgba, direct_8bit }
     }
 
     /// Sample through the RDP texture-filter mode.
@@ -2058,55 +2095,11 @@ impl Texture {
         address_mode: TextureAddressMode,
     ) -> [u8; 4] {
         let texel = |x: i64, y: i64| -> [u8; 4] {
-            let x = texture_axis_address(
-                x,
-                self.width,
-                self.clamp_s,
-                self.mirror_s,
-                self.mask_s,
-                address_mode,
-            );
-            let y = texture_axis_address(
-                y,
-                self.height,
-                self.clamp_t,
-                self.mirror_t,
-                self.mask_t,
-                address_mode,
-            );
-            if let Some(tmem) = &self.tmem {
-                return tmem.sample(x as usize, y as usize);
-            }
-            assert!(
-                x < self.width && y < self.height,
-                "G_SETTILE masks ({}, {}) address texel ({x}, {y}) outside decoded {}x{} fixture",
-                self.mask_s,
-                self.mask_t,
-                self.width,
-                self.height,
-            );
-            let offset = ((y * self.width + x) * 4) as usize;
-            assert!(
-                offset + 4 <= self.texels.len(),
-                "texture sample ({x}, {y}) exceeds {}x{} RGBA buffer of {} bytes",
-                self.width,
-                self.height,
-                self.texels.len()
-            );
-            [
-                self.texels[offset],
-                self.texels[offset + 1],
-                self.texels[offset + 2],
-                self.texels[offset + 3],
-            ]
+            let (x, y) = self.address_texel(x, y, address_mode);
+            self.sample_addressed(x, y)
         };
 
-        let s = TextureCoordinateS10_5::from_texels_bounded(s)
-            .shifted(self.shift_s)
-            .relative_to(TextureCoordinateS10_5::from_texels_bounded(self.origin_s));
-        let t = TextureCoordinateS10_5::from_texels_bounded(t)
-            .shifted(self.shift_t)
-            .relative_to(TextureCoordinateS10_5::from_texels_bounded(self.origin_t));
+        let (s, t) = self.relative_coordinates(s, t);
         let s0 = s.texel();
         let t0 = t.texel();
         if filter == TextureFilter::Point {
@@ -2137,6 +2130,69 @@ impl Texture {
         let sf = s.fraction();
         let tf = t.fraction();
         filter_three_nearest_s10_5(samples, sf, tf)
+    }
+
+    fn relative_coordinates(
+        &self,
+        s: f32,
+        t: f32,
+    ) -> (TextureCoordinateAccumulator5, TextureCoordinateAccumulator5) {
+        let s = TextureCoordinateS10_5::from_texels_bounded(s)
+            .shifted(self.shift_s)
+            .relative_to(TextureCoordinateS10_5::from_texels_bounded(self.origin_s));
+        let t = TextureCoordinateS10_5::from_texels_bounded(t)
+            .shifted(self.shift_t)
+            .relative_to(TextureCoordinateS10_5::from_texels_bounded(self.origin_t));
+        (s, t)
+    }
+
+    fn address_texel(&self, x: i64, y: i64, address_mode: TextureAddressMode) -> (u32, u32) {
+        (
+            texture_axis_address(
+                x,
+                self.width,
+                self.clamp_s,
+                self.mirror_s,
+                self.mask_s,
+                address_mode,
+            ),
+            texture_axis_address(
+                y,
+                self.height,
+                self.clamp_t,
+                self.mirror_t,
+                self.mask_t,
+                address_mode,
+            ),
+        )
+    }
+
+    fn sample_addressed(&self, x: u32, y: u32) -> [u8; 4] {
+        if let Some(tmem) = &self.tmem {
+            return tmem.sample(x as usize, y as usize);
+        }
+        assert!(
+            x < self.width && y < self.height,
+            "G_SETTILE masks ({}, {}) address texel ({x}, {y}) outside decoded {}x{} fixture",
+            self.mask_s,
+            self.mask_t,
+            self.width,
+            self.height,
+        );
+        let offset = ((y * self.width + x) * 4) as usize;
+        assert!(
+            offset + 4 <= self.texels.len(),
+            "texture sample ({x}, {y}) exceeds {}x{} RGBA buffer of {} bytes",
+            self.width,
+            self.height,
+            self.texels.len()
+        );
+        [
+            self.texels[offset],
+            self.texels[offset + 1],
+            self.texels[offset + 2],
+            self.texels[offset + 3],
+        ]
     }
 
     /// Run the public texture-filter conversion selection. `G_TC_CONV`
@@ -2496,6 +2552,8 @@ pub struct PrimitiveDepth {
 impl ColorImage {
     pub const RGBA_FORMAT: u8 = 0;
     pub const CI_FORMAT: u8 = 2;
+    pub const IA_FORMAT: u8 = 3;
+    pub const I_FORMAT: u8 = 4;
     pub const BITS_8: u8 = 1;
     pub const BITS_16: u8 = 2;
     pub const BITS_32: u8 = 3;
@@ -4368,6 +4426,10 @@ impl Tmem {
 }
 
 impl TmemTexture {
+    fn raw_texel(&self, x: usize, y: usize) -> u32 {
+        self.storage.read_texel(self.tile, x, y, self.tile.siz)
+    }
+
     fn sample(&self, x: usize, y: usize) -> [u8; 4] {
         if self.tile.fmt == G_IM_FMT_YUV && self.tile.siz == G_IM_SIZ_16B {
             let base = Tmem::row_base(self.tile, y);
@@ -4384,7 +4446,7 @@ impl TmemTexture {
             return [luma, u, v, 255];
         }
 
-        let raw = self.storage.read_texel(self.tile, x, y, self.tile.siz);
+        let raw = self.raw_texel(x, y);
         match (self.tile.fmt, self.tile.siz) {
             (G_IM_FMT_RGBA, G_IM_SIZ_16B) => rgba5551_to_rgba8888(raw as u16),
             (G_IM_FMT_RGBA, G_IM_SIZ_32B) => raw.to_be_bytes(),

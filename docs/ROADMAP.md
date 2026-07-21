@@ -669,7 +669,9 @@ and deterministic output traces.
   public color-image layouts: size-defined 8-bit index/intensity, RGBA16, and
   RGBA32. One typed classifier drives validation, import, fill, copy, and
   commit; target switches can reinterpret the same RDRAM bytes. The 8-bit path
-  supports undereferenced CI8 copy-cycle indices, and RGBA32 preserves the
+  supports direct I8, packed IA8, and undereferenced CI8 copy-cycle sources,
+  preserving each original TMEM byte while comparing format-correct alpha;
+  RGBA32 preserves the
   public five-bit memory alpha and three-bit coverage packing. It also decodes the
   F3DEX2 control path now retains six homogeneous clip-plane codes,
   executes inclusive-range `G_CULLDL` as an end of the current list,
