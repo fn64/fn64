@@ -183,6 +183,15 @@ fn main() {
     // storage: this harness is boot telemetry, not a real player session,
     // so nothing is persisted (a fresh all-0xFF chip each run, exactly the
     // first-boot path the game must handle anyway).
+    //
+    // 256 Kbit is the evidenced cart geometry, NOT a guess: mupen64plus.ini
+    // lists every WM2000 region as `SaveType=SRAM` (32 KiB), and the game's
+    // own save-region table (13 entries at 0x8010625C, bank-1 data, ROM
+    // 0x7082C) caps real payload use at device offset 0x66E4. The one access
+    // past 0x8000 -- the boot payload read of a round 0x8000 bytes from
+    // devAddr 0x20 (`func_800F497C`) -- relies on the chip's undriven-
+    // address-line wrap, modeled in `PiDma::sram_decode` (rom.rs), not on a
+    // larger device.
     fn64_abi::set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
         fn64_runtime::SaveType::SramBanked,
     )));
