@@ -33,11 +33,19 @@ static DMA_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// One RDP command-DMA range submitted through the RSP's DPC CP0 registers.
 /// `xbus` records whether the command source is RSP DMEM rather than RDRAM.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// For an XBUS submission, `payload` holds the logical (big-endian) DMEM
+/// bytes of the range, captured AT SUBMISSION TIME: the XBUS ring is a small
+/// reused DMEM window (F3DEX xbus 2.08's is ~1 KiB), so by the time the task
+/// finishes and a consumer looks at the final DMEM snapshot, earlier ranges
+/// have been overwritten by later ring generations. Empty for DRAM-sourced
+/// submissions, whose bytes persist in RDRAM.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RspDpSubmission {
     pub start: u32,
     pub end: u32,
     pub xbus: bool,
+    pub payload: Vec<u8>,
 }
 
 /// The logical IMEM byte range replaced by one pending SP read-DMA.
@@ -320,10 +328,19 @@ impl<'a> RspMachine<'a> {
                 // zero commands and is not a submission at all.
                 self.dp_end = value & 0x00FF_FFF8;
                 if self.dp_end != self.dp_current {
+                    let xbus = self.dp_status & 1 != 0;
+                    let payload = if xbus && self.dp_current < self.dp_end {
+                        (self.dp_current..self.dp_end)
+                            .map(|address| self.dmem.read_bu(address & 0xfff))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     self.dp_submissions.push(RspDpSubmission {
                         start: self.dp_current,
                         end: self.dp_end,
-                        xbus: self.dp_status & 1 != 0,
+                        xbus,
+                        payload,
                     });
                     // No RDP execution engine lives in fn64-audio. Model the
                     // command DMA as instant so polling loops observe idle.
@@ -1122,6 +1139,7 @@ mod tests {
                 start: 0x123458,
                 end: 0x234568,
                 xbus: false,
+                payload: Vec::new(),
             }]
         );
         m.write_cp0(11, 1 << 1);
