@@ -1014,9 +1014,17 @@ task calls out:
   fixture. Managed-target per-pixel dither history and complete coverage,
   linear and anti-aliased-pixel-scaling filtering, enhancement resolution,
   MSAA/downsample behavior, D3D12, Vulkan, and representative full-ROM
-  presentation remain uncertified. The four AA selectors are the fixture's
-  only exact pixel-inert native filter residual. Silicon and analog parity
-  remain explicitly bounded. A typed IPL television
+  presentation remain uncertified. A separate eleven-phase pinned-Metal
+  fixture distinguishes supplied hardware mode 0 from compatibility-only
+  `Unspecified` at the native callback; a separate adapter-capture integration
+  test proves the Rust/C/C++ wire distinction. The fixture applies the public
+  Figure-11 AA arithmetic to deliberately generated RT64-managed code 4 with
+  opaque code-7 controls, and proves modes 0/1 equal an independent
+  coverage-four oracle while modes 2/3 restore the baseline. AA precedes
+  divot causally. Pinned RT64 aliases managed 7/8 and clamped 8/8 at code 7;
+  untested partial codes, natural/imported hidden coverage, code-0/save
+  semantics, wider sampling lattices, silicon, and analog parity remain
+  explicitly bounded. A typed IPL television
   standard is the common VI/AI clock authority. Before a mode exists, VI uses the public
   nominal 60 Hz NTSC/MPAL or 50 Hz PAL rate; once H_SYNC and V_SYNC are
   nonzero, their public line/half-line units derive the next guest-cycle field
@@ -1024,8 +1032,8 @@ task calls out:
   every injection point, so a latched mode changes the next deadline. This
   formula is clean-room derived from public register definitions and has not
   yet been checked against a hardware timing trace. Exact VI random-stream
-  identity, native AA-selector behavior, broader native restoration coverage,
-  and physical-console filter capture remain open.
+  identity, broader native coverage/filter-lattice certification, and
+  physical-console filter capture remain open.
   In the block
   lane, raw MI mask commands and RCP completion drive CPU IP2; the next
   instruction boundary applies the

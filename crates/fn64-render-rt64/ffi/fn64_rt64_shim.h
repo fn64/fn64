@@ -122,7 +122,8 @@ typedef struct Fn64Rt64ViState {
     uint8_t fade_enabled;
     uint8_t repeat_line;
     uint16_t fade_factor;
-    uint16_t reserved;
+    uint8_t aa_mode_specified;
+    uint8_t reserved;
     uint64_t noise_seed;
 } Fn64Rt64ViState;
 
@@ -131,6 +132,10 @@ typedef struct Fn64Rt64AdapterCapture {
     uint32_t output_addr;
     uint32_t width;
     uint32_t height;
+    uint32_t aa_mode_specified;
+    uint32_t vi_filter_flags;
+    uint32_t noise_seed_low;
+    uint32_t noise_seed_high;
     uint32_t registers[24];
     uint32_t registers_after_submission[24];
 } Fn64Rt64AdapterCapture;
@@ -530,7 +535,7 @@ typedef struct Fn64Rt64TextureReplacementState {
 #ifdef __cplusplus
 static_assert(sizeof(Fn64Rt64Task) == 14 * sizeof(uint32_t));
 static_assert(sizeof(Fn64Rt64ViState) == 72);
-static_assert(sizeof(Fn64Rt64AdapterCapture) == 65 * sizeof(uint32_t));
+static_assert(sizeof(Fn64Rt64AdapterCapture) == 69 * sizeof(uint32_t));
 static_assert(sizeof(Fn64Rt64PresentCapture) == 48);
 static_assert(sizeof(Fn64Rt64PresentSelection) == 32);
 static_assert(sizeof(Fn64Rt64DeferredWorkloadSnapshot) == 328);

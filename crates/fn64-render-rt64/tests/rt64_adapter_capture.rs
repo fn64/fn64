@@ -15,7 +15,7 @@ use fn64_render_rt64::{
 
 fn fixture() -> (OsTask, RenderConfig, ViPresentation) {
     let mut vi_registers = [0u32; ViScanoutRegisters::WORD_COUNT];
-    vi_registers[0] = 0x0001_001f;
+    vi_registers[0] = 0x0001_001e;
     vi_registers[1] = 0x0010_0000;
     vi_registers[2] = 320;
     vi_registers[3] = 2;
@@ -68,10 +68,13 @@ fn typed_task_and_vi_cross_cpp_boundary_without_a_graphics_device() {
     );
     assert_eq!(first.output_addr, 0x0012_3456);
     assert_eq!((first.width, first.height), (640, 480));
+    assert!(first.aa_mode_specified);
+    assert_eq!(first.vi_filter_flags, (1 << 0) | (1 << 1) | (1 << 2));
+    assert_eq!(first.noise_seed, 0);
 
     let mut expected_registers = [0; 24];
-    expected_registers[9] = 0x0001_001f;
-    expected_registers[10] = 0x0010_0500;
+    expected_registers[9] = 0x0001_001e;
+    expected_registers[10] = 0x0010_0280;
     expected_registers[11] = 320;
     expected_registers[12] = 2;
     expected_registers[14] = 0x03e5_2239;
@@ -88,6 +91,41 @@ fn typed_task_and_vi_cross_cpp_boundary_without_a_graphics_device() {
 }
 
 #[test]
+fn cpp_capture_distinguishes_compatibility_unspecified_from_explicit_mode_zero() {
+    let task = OsTask::default();
+    let cfg = RenderConfig::ntsc(640, 480);
+    let compatibility =
+        capture_rt64_adapter_inputs(&task, 0, cfg, ViPresentation::default()).unwrap();
+
+    let mut words = [0; ViScanoutRegisters::WORD_COUNT];
+    words[0] = 2;
+    words[2] = cfg.width;
+    words[6] = 525;
+    words[7] = 3093;
+    words[9] = (108 << 16) | 748;
+    words[10] = (34 << 16) | (34 + cfg.height * 2);
+    words[12] = 0x400;
+    words[13] = 0x400;
+    let explicit = capture_rt64_adapter_inputs(
+        &task,
+        0,
+        cfg,
+        ViPresentation {
+            scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(words)),
+            ..ViPresentation::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(compatibility.registers, explicit.registers);
+    assert!(!compatibility.aa_mode_specified);
+    assert!(explicit.aa_mode_specified);
+    assert_eq!(compatibility.vi_filter_flags, 1 << 2);
+    assert_eq!(explicit.vi_filter_flags, (1 << 1) | (1 << 2));
+    assert_ne!(compatibility.sha256(), explicit.sha256());
+}
+
+#[test]
 fn capture_rejects_vi_state_the_live_boundary_rejects() {
     let (task, cfg, mut vi) = fixture();
     vi.fade = Some(0x155);
@@ -95,6 +133,21 @@ fn capture_rejects_vi_state_the_live_boundary_rejects() {
     let error = capture_rt64_adapter_inputs(&task, 0, cfg, vi).unwrap_err();
     assert!(
         error.to_string().contains("fade and repeat-line"),
+        "unexpected adapter diagnostic: {error}"
+    );
+}
+
+#[test]
+fn capture_rejects_rgba32_dither_restoration_like_live_presentation() {
+    let (task, cfg, mut vi) = fixture();
+    let mut words = vi.scanout.registers().unwrap().words();
+    words[0] = (words[0] & !3) | 3;
+    vi.scanout = ViScanoutState::Registers(ViScanoutRegisters::from_words(words));
+    let error = capture_rt64_adapter_inputs(&task, 0, cfg, vi).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("VI dither restoration requires an RGBA16 scanout image"),
         "unexpected adapter diagnostic: {error}"
     );
 }
@@ -110,7 +163,7 @@ fn odd_interlaced_origin_compensation_uses_two_effective_source_rows() {
 
     let capture = capture_rt64_adapter_inputs(&task, 0, cfg, vi).unwrap();
     assert_eq!(capture.registers[11], 0x1140);
-    assert_eq!(capture.registers[10], 0x0010_0a00);
+    assert_eq!(capture.registers[10], 0x0010_0500);
     assert_eq!(capture.registers_after_submission, capture.registers);
 }
 

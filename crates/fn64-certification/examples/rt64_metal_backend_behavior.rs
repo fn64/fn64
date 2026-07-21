@@ -10,6 +10,8 @@ use fn64_render_rt64::{Rt64Backend, Rt64BackendIdentity, Rt64SourceProvenance};
 use fn64_runtime::TvType;
 use sha2::{Digest, Sha256};
 
+#[path = "rt64_vi_aa_selector_behavior.rs"]
+mod vi_aa_selector_behavior;
 #[path = "rt64_vi_filter_behavior.rs"]
 mod vi_filter_behavior;
 
@@ -290,6 +292,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             ..ViPresentation::default()
         },
     )?;
+    let compatibility_pixels = backend.presented_pixels()?;
+    if recreated_capture.workload_id.get() != 1
+        || recreated_capture.present_id != 1
+        || compatibility_pixels.workload_id != 1
+        || compatibility_pixels.present_id != 2
+    {
+        return Err(io::Error::other(format!(
+            "recreated and compatibility presents lost exact identity: recreated={}/{} compatibility={}/{}",
+            recreated_capture.workload_id,
+            recreated_capture.present_id,
+            compatibility_pixels.workload_id,
+            compatibility_pixels.present_id
+        ))
+        .into());
+    }
     let compatibility_error = backend.release_capture().unwrap_err();
     if !compatibility_error
         .to_string()
@@ -297,6 +314,32 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err(io::Error::other(format!(
             "compatibility presentation entered release evidence: {compatibility_error}"
+        ))
+        .into());
+    }
+
+    // Keep the platform's existing backend-lifecycle denominator while making
+    // its native VI pixel coverage non-shrinking. Reuse the recreated context
+    // so this end-to-end gate exercises live policy and drawable transitions
+    // without turning one runtime lifecycle into three artificial Cocoa/Metal
+    // ownership cycles.
+    let vi_filter_summary = vi_filter_behavior::run_on_backend(&mut backend)?;
+    let vi_aa_summary = vi_aa_selector_behavior::run_on_backend(&mut backend)?;
+    if vi_filter_summary
+        != (vi_filter_behavior::ViFilterRunSummary {
+            workload_id: 2,
+            first_present_id: 3,
+            last_present_id: 22,
+        })
+        || vi_aa_summary
+            != (vi_aa_selector_behavior::ViAaSelectorRunSummary {
+                workload_id: 3,
+                first_present_id: 23,
+                last_present_id: 33,
+            })
+    {
+        return Err(io::Error::other(format!(
+            "native VI suites did not preserve exact cross-gate identity: filter={vi_filter_summary:?} aa={vi_aa_summary:?}"
         ))
         .into());
     }
@@ -313,11 +356,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     if backend.release_environment().tv_type().is_some() {
         return Err(io::Error::other("failed Metal recreation retained stale TV authority").into());
     }
-
-    // Keep the platform's existing backend-lifecycle denominator while making
-    // its native VI pixel coverage non-shrinking. The isolated gate owns a
-    // fresh context and exact public-register phases.
-    vi_filter_behavior::run()?;
 
     println!(
         "metal_backend_evidence source={} provenance={:?} initial_native={} initial_post_vi={} initial_workload_id={} initial_present_id={} transition_native={} transition_post_vi={} transition={}x{} transition_workload_id={} transition_present_id={} resized_native={} resized_post_vi={} resized={}x{} resized_workload_id={} resized_present_id={} recreated_native={} recreated_post_vi={} recreated={}x{} recreated_workload_id={} recreated_present_id={} policy_sha256={}",
@@ -390,7 +428,7 @@ mod tests {
             source_id: PINNED_SOURCE,
             source_provenance: Rt64SourceProvenance::GitClean,
             source_overlay_id:
-                "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-retrace-cadence:v1",
+                "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1",
             post_vi_api: "metal-bgra8-unorm",
         };
         let capture = RenderReleaseCapture {

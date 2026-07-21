@@ -68,7 +68,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 13, "needle": "D3D12, Vulkan and Metal" },
         { "kind": "pinned_source", "path": "src/hle/rt64_application.cpp", "line": 168, "needle": "GraphicsAPI::Metal" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_metal_backend_behavior.rs", "line": 232, "needle": "validate_capture(resized, &resized_capture, &identity, policy_sha256)", "claim_id": "backend-metal" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_metal_backend_behavior.rs", "line": 234, "needle": "validate_capture(resized, &resized_capture, &identity, policy_sha256)", "claim_id": "backend-metal" }
       ]
     },
     {
@@ -178,7 +178,7 @@
         { "kind": "official_readme", "path": "README.md", "line": 20, "needle": "60 FPS or above" },
         { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 989, "needle": "generateInterpolatedFrames" },
         { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_hfr_interpolation_behavior.rs", "line": 845, "needle": "fn main()", "claim_id": "hfr-60-plus-interpolation" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/src/ffi.rs", "line": 3979, "needle": "fn cpp_vi_history_uses_context_region_rate_for_stable_factors", "claim_id": "hfr-60-plus-interpolation" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/src/ffi.rs", "line": 4100, "needle": "fn cpp_vi_history_uses_context_region_rate_for_stable_factors", "claim_id": "hfr-60-plus-interpolation" },
         { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_region_rate_behavior.rs", "line": 161, "needle": "fn main()", "claim_id": "hfr-60-plus-interpolation" }
       ]
     },

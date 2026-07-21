@@ -88,9 +88,25 @@ uint2 SourceExtent() {
         uint2(1u, 1u));
 }
 
+uint CoverageCode(float alpha) {
+    return uint(round(saturate(alpha) * float(gConstants.coverageRange))) & 7u;
+}
+
 bool HasFullCoverage(float alpha) {
-    uint encoded = uint(round(saturate(alpha) * float(gConstants.coverageRange)));
-    return (encoded & 7u) == 7u;
+    return CoverageCode(alpha) == 7u;
+}
+
+bool HasQualifiedPartialCoverage(float alpha) {
+    // Pinned RT64 writes its estimated sample count directly for codes 1..6
+    // and clamps eight samples to seven. Code zero is ambiguous across
+    // modulo-wrap and zero-destination save/unqualified paths, so it cannot
+    // identify one sample here.
+    uint code = CoverageCode(alpha);
+    return (code >= 1u) && (code <= 6u);
+}
+
+bool ViFilterEnabled(uint flag) {
+    return (gConstants.viFilterFlags & flag) != 0u;
 }
 
 float Median(float left, float center, float right) {
@@ -99,6 +115,106 @@ float Median(float left, float center, float right) {
 
 uint3 Rgba16Components(float3 rgb) {
     return uint3(round(saturate(rgb) * 255.0f)) >> 3u;
+}
+
+uint3 SourceComponents(float3 rgb) {
+    uint3 value = uint3(round(saturate(rgb) * 255.0f));
+    if (!ViFilterEnabled(ViFilterRgba16)) {
+        return value;
+    }
+    uint3 fiveBit = value >> 3u;
+    return (fiveBit << 3u) | (fiveBit >> 2u);
+}
+
+void AdmitFullCoverageNeighbor(
+    float4 neighbor,
+    inout uint admitted,
+    inout uint3 firstMinimum,
+    inout uint3 secondMinimum,
+    inout uint3 firstMaximum,
+    inout uint3 secondMaximum) {
+    if (!HasFullCoverage(neighbor.a)) {
+        return;
+    }
+    uint3 value = SourceComponents(neighbor.rgb);
+    uint3 priorMinimum = firstMinimum;
+    uint3 priorMaximum = firstMaximum;
+    firstMinimum = min(firstMinimum, value);
+    secondMinimum = min(secondMinimum, max(priorMinimum, value));
+    firstMaximum = max(firstMaximum, value);
+    secondMaximum = max(secondMaximum, min(priorMaximum, value));
+    admitted++;
+}
+
+// US 5,742,277 Figure 11 and Equation 4 define the preferred six-neighbor
+// silhouette filter. RT64's managed target supplies only its own modulo-eight
+// coverage estimate. The topology is public; 5-to-8 expansion, saturation,
+// and round-to-nearest are named bounded integer policies.
+float4 FinishCoverageAa(
+    float4 raw,
+    uint admitted,
+    uint3 secondMinimum,
+    uint3 secondMaximum) {
+    uint3 foreground = SourceComponents(raw.rgb);
+    if (admitted < 3u) {
+        // The preferred penultimate interval is undefined. Preserve the
+        // source-format foreground through the named bounded fallback.
+        raw.rgb = float3(foreground) / 255.0f;
+        return raw;
+    }
+    uint3 low = min(foreground, secondMinimum);
+    uint3 high = max(foreground, secondMaximum);
+    int3 backgroundSigned = clamp(
+        int3(low) + int3(high) - int3(foreground),
+        int3(0, 0, 0),
+        int3(255, 255, 255));
+    uint coverage = CoverageCode(raw.a);
+    uint3 filtered =
+        (coverage * foreground + (8u - coverage) * uint3(backgroundSigned) + 4u) >> 3u;
+    raw.rgb = float3(filtered) / 255.0f;
+    return raw;
+}
+
+void AdmitTexelNeighbor(
+    int2 coordinate,
+    int2 extent,
+    inout uint admitted,
+    inout uint3 firstMinimum,
+    inout uint3 secondMinimum,
+    inout uint3 firstMaximum,
+    inout uint3 secondMaximum) {
+    if (any(coordinate < int2(0, 0)) || any(coordinate >= extent)) {
+        return;
+    }
+    AdmitFullCoverageNeighbor(
+        gInput.Load(int3(coordinate, 0)),
+        admitted,
+        firstMinimum,
+        secondMinimum,
+        firstMaximum,
+        secondMaximum);
+}
+
+float4 CoverageAaTexel(float4 raw, int2 coordinate, int2 extent) {
+    uint admitted = 0u;
+    uint3 firstMinimum = uint3(256u, 256u, 256u);
+    uint3 secondMinimum = firstMinimum;
+    uint3 firstMaximum = uint3(0u, 0u, 0u);
+    uint3 secondMaximum = firstMaximum;
+    int rowStride = ViFilterEnabled(ViFilterSerratedRows) ? 2 : 1;
+    AdmitTexelNeighbor(coordinate + int2(-1, -rowStride), extent, admitted,
+        firstMinimum, secondMinimum, firstMaximum, secondMaximum);
+    AdmitTexelNeighbor(coordinate + int2(1, -rowStride), extent, admitted,
+        firstMinimum, secondMinimum, firstMaximum, secondMaximum);
+    AdmitTexelNeighbor(coordinate + int2(-2, 0), extent, admitted,
+        firstMinimum, secondMinimum, firstMaximum, secondMaximum);
+    AdmitTexelNeighbor(coordinate + int2(2, 0), extent, admitted,
+        firstMinimum, secondMinimum, firstMaximum, secondMaximum);
+    AdmitTexelNeighbor(coordinate + int2(-1, rowStride), extent, admitted,
+        firstMinimum, secondMinimum, firstMaximum, secondMaximum);
+    AdmitTexelNeighbor(coordinate + int2(1, rowStride), extent, admitted,
+        firstMinimum, secondMinimum, firstMaximum, secondMaximum);
+    return FinishCoverageAa(raw, admitted, secondMinimum, secondMaximum);
 }
 
 int CompareFiveBit(uint neighbor, uint center) {
@@ -115,11 +231,14 @@ void AccumulateRestoration(inout int3 restored, uint3 center, uint3 neighbor) {
 // reconstruct full-coverage RGBA16 components. RT64's managed target is not
 // an authoritative N64 storage image, so source reconstruction and lattice
 // identity remain explicitly bounded even though this integer kernel is exact.
-float4 RestoredTexel(int2 coordinate) {
+float4 FilteredTexel(int2 coordinate) {
     int2 extent = int2(SourceExtent());
     coordinate = clamp(coordinate, int2(0, 0), extent - int2(1, 1));
     float4 raw = gInput.Load(int3(coordinate, 0));
-    if ((gConstants.ditherFilter == 0u) || !HasFullCoverage(raw.a)) {
+    if (ViFilterEnabled(ViFilterSilhouetteAa) && HasQualifiedPartialCoverage(raw.a)) {
+        return CoverageAaTexel(raw, coordinate, extent);
+    }
+    if (!ViFilterEnabled(ViFilterDitherRestoration) || !HasFullCoverage(raw.a)) {
         return raw;
     }
 
@@ -150,9 +269,64 @@ uint2 NearestSourceCoordinate(float2 uv) {
         SourceExtent() - uint2(1u, 1u));
 }
 
-float4 RestoredNearest(float2 uv, uint2 coordinate) {
+void AdmitNearestNeighbor(
+    float2 uv,
+    int2 coordinate,
+    int2 extent,
+    inout uint admitted,
+    inout uint3 firstMinimum,
+    inout uint3 secondMinimum,
+    inout uint3 firstMaximum,
+    inout uint3 secondMaximum) {
+    if (any(coordinate < int2(0, 0)) || any(coordinate >= extent)) {
+        return;
+    }
+    AdmitFullCoverageNeighbor(
+        gInput.SampleLevel(gSampler, uv, 0),
+        admitted,
+        firstMinimum,
+        secondMinimum,
+        firstMaximum,
+        secondMaximum);
+}
+
+float4 CoverageAaNearest(float4 raw, float2 uv, uint2 coordinate) {
+    uint admitted = 0u;
+    uint3 firstMinimum = uint3(256u, 256u, 256u);
+    uint3 secondMinimum = firstMinimum;
+    uint3 firstMaximum = uint3(0u, 0u, 0u);
+    uint3 secondMaximum = firstMaximum;
+    int rowStride = ViFilterEnabled(ViFilterSerratedRows) ? 2 : 1;
+    int2 center = int2(coordinate);
+    int2 extent = int2(SourceExtent());
+    float2 texel = 1.0f / gConstants.textureResolution;
+    AdmitNearestNeighbor(uv + float2(-1, -rowStride) * texel,
+        center + int2(-1, -rowStride), extent, admitted,
+        firstMinimum, secondMinimum, firstMaximum, secondMaximum);
+    AdmitNearestNeighbor(uv + float2(1, -rowStride) * texel,
+        center + int2(1, -rowStride), extent, admitted,
+        firstMinimum, secondMinimum, firstMaximum, secondMaximum);
+    AdmitNearestNeighbor(uv + float2(-2, 0) * texel,
+        center + int2(-2, 0), extent, admitted,
+        firstMinimum, secondMinimum, firstMaximum, secondMaximum);
+    AdmitNearestNeighbor(uv + float2(2, 0) * texel,
+        center + int2(2, 0), extent, admitted,
+        firstMinimum, secondMinimum, firstMaximum, secondMaximum);
+    AdmitNearestNeighbor(uv + float2(-1, rowStride) * texel,
+        center + int2(-1, rowStride), extent, admitted,
+        firstMinimum, secondMinimum, firstMaximum, secondMaximum);
+    AdmitNearestNeighbor(uv + float2(1, rowStride) * texel,
+        center + int2(1, rowStride), extent, admitted,
+        firstMinimum, secondMinimum, firstMaximum, secondMaximum);
+    return FinishCoverageAa(raw, admitted, secondMinimum, secondMaximum);
+}
+
+float4 FilteredNearest(float2 uv, uint2 coordinate) {
     float4 raw = gInput.SampleLevel(gSampler, uv, 0);
-    if ((gConstants.ditherFilter == 0u) || !HasFullCoverage(raw.a)) {
+    if (ViFilterEnabled(ViFilterSilhouetteAa) && HasQualifiedPartialCoverage(raw.a)) {
+        return CoverageAaNearest(raw, uv, coordinate);
+    }
+    if (!ViFilterEnabled(ViFilterDitherRestoration) || !HasFullCoverage(raw.a)) {
         return raw;
     }
 
@@ -188,13 +362,13 @@ float4 RestoredNearest(float2 uv, uint2 coordinate) {
 float4 DivotTexel(int2 coordinate) {
     int2 maximum = int2(SourceExtent()) - int2(1, 1);
     coordinate = clamp(coordinate, int2(0, 0), maximum);
-    float4 center = RestoredTexel(coordinate);
+    float4 center = FilteredTexel(coordinate);
     if ((coordinate.x == 0) || (coordinate.x == maximum.x)) {
         return center;
     }
 
-    float4 left = RestoredTexel(coordinate + int2(-1, 0));
-    float4 right = RestoredTexel(coordinate + int2(1, 0));
+    float4 left = FilteredTexel(coordinate + int2(-1, 0));
+    float4 right = FilteredTexel(coordinate + int2(1, 0));
     if (HasFullCoverage(left.a) && HasFullCoverage(center.a) &&
         HasFullCoverage(right.a)) {
         return center;
@@ -208,16 +382,16 @@ float4 DivotTexel(int2 coordinate) {
 
 float4 DivotNearest(float2 uv) {
     uint2 sourceCoordinate = NearestSourceCoordinate(uv);
-    float4 center = RestoredNearest(uv, sourceCoordinate);
+    float4 center = FilteredNearest(uv, sourceCoordinate);
     uint sourceX = sourceCoordinate.x;
     if ((sourceX == 0u) || (sourceX + 1u == SourceExtent().x)) {
         return center;
     }
 
     float2 horizontal = float2(1.0f, 0.0f) / gConstants.textureResolution;
-    float4 left = RestoredNearest(
+    float4 left = FilteredNearest(
         uv - horizontal, sourceCoordinate - uint2(1u, 0u));
-    float4 right = RestoredNearest(
+    float4 right = FilteredNearest(
         uv + horizontal, sourceCoordinate + uint2(1u, 0u));
     if (HasFullCoverage(left.a) && HasFullCoverage(center.a) &&
         HasFullCoverage(right.a)) {
@@ -230,22 +404,22 @@ float4 DivotNearest(float2 uv) {
     return center;
 }
 
-float4 SampleRestored(float2 uv) {
+float4 SampleFiltered(float2 uv) {
     const float2 LowerRight = gConstants.videoResolution / gConstants.textureResolution;
     const float2 HalfPixel = float2(0.5f, 0.5f) / gConstants.textureResolution;
     float2 boundedUv = clamp(uv, HalfPixel, LowerRight - HalfPixel);
 
     if (gConstants.filtering == 0u) {
-        return RestoredNearest(boundedUv, NearestSourceCoordinate(boundedUv));
+        return FilteredNearest(boundedUv, NearestSourceCoordinate(boundedUv));
     }
 
     float2 texelPosition = boundedUv * gConstants.textureResolution - 0.5f;
     int2 lower = int2(floor(texelPosition));
     float2 fraction = frac(texelPosition);
-    float4 upperLeft = RestoredTexel(lower);
-    float4 upperRight = RestoredTexel(lower + int2(1, 0));
-    float4 lowerLeft = RestoredTexel(lower + int2(0, 1));
-    float4 lowerRight = RestoredTexel(lower + int2(1, 1));
+    float4 upperLeft = FilteredTexel(lower);
+    float4 upperRight = FilteredTexel(lower + int2(1, 0));
+    float4 lowerLeft = FilteredTexel(lower + int2(0, 1));
+    float4 lowerRight = FilteredTexel(lower + int2(1, 1));
     return lerp(
         lerp(upperLeft, upperRight, fraction.x),
         lerp(lowerLeft, lowerRight, fraction.x),
@@ -285,8 +459,9 @@ float4 SampleInput(float2 uv) {
     if (gConstants.divot != 0u) {
         sampledColor = SampleDivot(uv);
     }
-    else if (gConstants.ditherFilter != 0u) {
-        sampledColor = SampleRestored(uv);
+    else if ((gConstants.viFilterFlags &
+              (ViFilterDitherRestoration | ViFilterSilhouetteAa)) != 0u) {
+        sampledColor = SampleFiltered(uv);
     }
     else {
         sampledColor = gInput.SampleLevel(

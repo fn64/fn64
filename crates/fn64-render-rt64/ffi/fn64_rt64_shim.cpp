@@ -566,8 +566,12 @@ void write_vi_registers(
     const Fn64Rt64ViState &vi) {
     if ((vi.registers_present > 1U) || (vi.blanked > 1U) ||
         (vi.fade_enabled > 1U) || (vi.repeat_line > 1U) ||
+        (vi.aa_mode_specified > 1U) ||
         (vi.reserved != 0U)) {
         throw std::runtime_error("VI state contains invalid boolean or reserved fields");
+    }
+    if ((vi.registers_present != 0U) && (vi.aa_mode_specified == 0U)) {
+        throw std::runtime_error("VI register image requires an explicit AA selector marker");
     }
     if ((vi.fade_enabled != 0U) && (vi.repeat_line != 0U)) {
         throw std::runtime_error("VI fade and repeat-line cannot be enabled together");
@@ -1488,6 +1492,23 @@ void unregister_vi_filter_context(Fn64Rt64Context *context) {
     }
 }
 
+uint32_t vi_filter_flags_for_context(const Fn64Rt64Context &context) {
+    const uint32_t status = context.registers[9];
+    const bool rgba16 = (status & 3U) == 2U;
+    const bool silhouette_aa =
+        (context.vi_state.aa_mode_specified != 0U) &&
+        (((status >> 8U) & 3U) <= 1U);
+    return
+        (((status & (1U << 16U)) != 0U) && rgba16
+             ? interop::ViFilterDitherRestoration
+             : 0U) |
+        (silhouette_aa ? interop::ViFilterSilhouetteAa : 0U) |
+        (rgba16 ? interop::ViFilterRgba16 : 0U) |
+        (((status & (1U << 6U)) != 0U)
+             ? interop::ViFilterSerratedRows
+             : 0U);
+}
+
 Fn64Rt64Context *vi_filter_context_for_device(void *device) {
     const auto entry = std::find_if(
         vi_filter_contexts.begin(),
@@ -1509,17 +1530,16 @@ extern "C" void fn64_rt64_vi_filter_constants(
     std::scoped_lock lock(vi_filter_registry_mutex);
     Fn64Rt64Context *context = vi_filter_context_for_device(device);
     if (context == nullptr) {
-        // RT64 setup can compile/draw before fn64 publishes the completed
-        // context. The unregistered setup path has no guest retrace identity.
-        constants->gammaDither = 0U;
-        constants->divot = 0U;
-        constants->policyVersion = 1U;
-        return;
+        // Pinned setup constructs VIRenderer but invokes this hook only from
+        // render, after the completed context publishes its stable device.
+        // A miss is therefore stale/wrong live ownership; silently clearing
+        // filters would publish an image under false policy.
+        std::terminate();
     }
-    constants->gammaDither =
-        (context->registers[9] & (1U << 2U)) != 0U ? 1U : 0U;
-    constants->divot =
-        (context->registers[9] & (1U << 4U)) != 0U ? 1U : 0U;
+    const uint32_t status = context->registers[9];
+    constants->gammaDither = (status & (1U << 2U)) != 0U ? 1U : 0U;
+    constants->divot = (status & (1U << 4U)) != 0U ? 1U : 0U;
+    constants->viFilterFlags = vi_filter_flags_for_context(*context);
     constants->noiseSeedLow = uint32_t(context->vi_state.noise_seed);
     constants->noiseSeedHigh = uint32_t(context->vi_state.noise_seed >> 32U);
     constants->policyVersion = 1U;
@@ -2741,6 +2761,10 @@ extern "C" int fn64_rt64_capture_adapter_inputs(
         Fn64Rt64Context context(width, height, 60U);
         context.output_addr = capture->output_addr;
         context.update_vi(*vi);
+        capture->aa_mode_specified = context.vi_state.aa_mode_specified;
+        capture->vi_filter_flags = vi_filter_flags_for_context(context);
+        capture->noise_seed_low = uint32_t(context.vi_state.noise_seed);
+        capture->noise_seed_high = uint32_t(context.vi_state.noise_seed >> 32U);
         std::copy(context.registers.begin(), context.registers.end(), capture->registers);
         // Every HLE/raw submission and resize takes this no-argument path.
         // It must refresh address aliases without replacing the last complete
@@ -2999,6 +3023,9 @@ extern "C" Fn64Rt64Context *fn64_rt64_create(
             &context->application->state->viHistory,
             context->nominal_refresh_rate);
         context->vi_history_rate_registered = true;
+        // Setup has finished assigning Application::device. Publish only this
+        // stable pointer so concurrent context creation cannot race a registry
+        // scan against unique_ptr mutation or collide on two null devices.
         register_vi_filter_context(context.get());
         context->vi_filter_registered = true;
         if (context->application->userConfig.antialiasing != requested_user_config.antialiasing) {

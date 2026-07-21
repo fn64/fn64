@@ -91,7 +91,8 @@ identity, a strictly increasing present identity, and exact 8x6 BGRA8
 geometry. Six baseline observations return byte-for-byte to the first
 baseline, and disabling gamma dither restores the exact gamma-only image.
 
-The `vi-gamma-dither:v1`, `vi-dither-filter:v1`, and `vi-divot:v1` source
+The `vi-gamma-dither:v1`, `vi-dither-filter:v1`, `vi-divot:v1`, and
+`vi-silhouette-aa:v1` source
 overlays replace only pinned RT64's final VI fullscreen shaders. Gamma dither
 applies the shared `fn64.vi-public-filters.bounded-v1` seven-bit quantizer
 after RT64's gamma stage. The shader mirrors the SplitMix64-derived
@@ -113,13 +114,40 @@ limited to nearest host filtering at native scale in one progressive synthetic
 RGBA16 image; the shader's linear and anti-aliased-pixel-scaling paths are not
 promoted by that result.
 
-Twenty fresh official watchdog-bounded backend-lifecycle Metal processes
-retained every exact SHA-256 identity enforced by the embedded gate. The run closes the
-present-queue interleaving named at the native wait site: a preceding
-process-time early present cannot retain the prior VI policy while the next
-retrace replaces its seed. Every `rt64_metal_backend_behavior` process invokes
-this gate in a fresh context, and the 20/20 result includes the required macOS
-surface-teardown interval:
+The device-free adapter-capture test preserves whether the typed AA selector
+was actually supplied across Rust/C/C++, and `rt64_vi_aa_selector_behavior`
+proves the same distinction at the native callback. Compatibility-only
+`Unspecified` therefore cannot collapse onto hardware mode 0. Modes 0
+and 1 apply the public Figure-11 six-neighbor filter to qualified RT64
+managed-coverage codes 1 through 6; modes 2 and 3 leave those pixels unchanged.
+Code 0 remains ambiguous across modulo-wrap and zero-destination
+save/unqualified paths. Code 7 is treated as full, but pinned RT64 aliases
+managed 7/8 and clamped 8/8 at that code; the fixture's opaque code-7 controls
+are known full by construction, not by the encoding alone. An independent CPU
+oracle expands the declared RGB5 source, asserts all six admitted neighbors
+are the fixture's full controls, discards one componentwise minimum and
+maximum, applies the penultimate interval and coverage-four Equation-4 blend,
+and expects exact RGB `[132, 78, 99]`. The eleven-phase Metal fixture proves
+modes 0/1 are identical, modes 2/3 restore the pinned baseline, compatibility
+`Unspecified` matches compatibility replicate while explicit compatibility
+mode 0 matches the AA oracle, AA changes exactly one projected pixel, divot
+alone changes one, and AA-before-divot changes two.
+The four exact BGRA8 digests are stable while one workload is retained and
+presentation identity advances. This proves the bounded public arithmetic and
+stage order over a deliberately generated RT64 code-4/code-7 managed source;
+it does not promote that managed alpha to authoritative N64 hidden coverage.
+
+The eleven-phase selector fixture is embedded in every
+`rt64_metal_backend_behavior` process. The recreated context remains live
+across the compatibility present, live nearest-policy application, the
+twenty-phase filter gate, a resize, and this selector gate. Exact identity is
+`workload/present 1/1` for the recreated release present, `1/2` for
+compatibility, workload 2 with presents 3 through 22 for filters, and workload
+3 with presents 23 through 33 for the selector. On 2026-07-21 that unchanged
+source passed the official watchdog-bounded backend-lifecycle runner in 20/20
+fresh processes on Darwin 25.5.0 arm64. The runner also enforces the macOS
+surface-teardown interval, while each successful child drains the present
+queue before destroying the final context.
 
 | Native phase | Nonblack pixels | Unique colors |
 | --- | ---: | ---: |
@@ -142,9 +170,10 @@ off phases restore the exact baseline.
 Gamma dither is independently causal with gamma disabled or
 enabled; two distinct retrace seeds produce distinct exact images, while an
 identical repeated seed reproduces the exact image across a distinct present.
-AA selector values 0-3 remain identical at the nonidentity scale, leaving the
-selector as the only native filter residual in this fixture. That equality is
-a named implementation residual rather than positive selector evidence. The
+AA selector values 0-3 remain identical at the nonidentity scale because that
+older fixture deliberately supplies only full code-7 and ambiguous
+code-0/save rows. It is a negative control, not an AA implementation residual
+or positive selector evidence. The
 restoration closure is deliberately no broader than clean pinned Metal,
 nearest filtering, native scale, progressive scanout, and this synthetic
 RGBA16 source. A managed RT64 target does not retain authoritative per-pixel
@@ -187,14 +216,18 @@ tool's consensus result cannot close the base-renderer row by itself.
 - Exact interaction timing between filter blocks and field/retrace state.
 - Mode-0 unconditional versus mode-1 conditional extra-line fetch timing and
   memory-bus behavior; their public pixel-stage selection is implemented.
-- Native RT64 AA-selector pixel behavior remains an exact pixel-inert
-  implementation residual at the pinned source revision. RGBA16 dither
-  restoration is causal only for the gate's pinned-Metal, nearest,
-  native-scale, progressive synthetic source. Managed-target per-pixel dither
-  history and complete coverage, linear/anti-aliased-pixel-scaling and
-  enhancement-resolution behavior, MSAA/downsample resolve semantics, D3D12,
-  Vulkan, and representative full-ROM presentation remain open rather
-  than inheriting that narrow result.
+- Native RT64 AA-selector arithmetic is certified only for deliberately
+  generated code 4 with opaque code-7 controls in the pinned-Metal, nearest,
+  progressive synthetic projection. The shader admits managed codes 1-6, but
+  codes 1, 2, 3, 5, and 6 do not yet have native pixel vectors. Code 7 aliases
+  RT64's managed 7/8 and clamped 8/8 estimates. Code 0/save semantics, natural
+  triangle coverage, imported framebuffer
+  hidden coverage, insufficient-neighborhood output, interlaced/scaled and
+  linear/anti-aliased-pixel-scaling paths, enhancement resolution,
+  MSAA/downsample resolve semantics, D3D12, Vulkan, and representative
+  full-ROM presentation remain open rather than inheriting that narrow
+  result. RGBA16 dither restoration has the same bounded managed-source
+  provenance.
 - Video DAC conversion, composite/S-Video encoding, bandwidth limits, and
   analog NTSC/PAL/MPAL output characteristics.
 - Pixel-level hardware traces spanning the framebuffer through physical video

@@ -1,6 +1,8 @@
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::ptr::NonNull;
 
+#[cfg(test)]
+use fn64_render::ViScanoutRegisters;
 use fn64_render::{
     ActiveRenderGraphicsApi, AspectTarget, DownsampleMultiplier, DpFullSyncStatus, OsTask,
     RefreshRateTarget, RenderAntialiasing, RenderAspectRatio, RenderDisplayBuffering,
@@ -398,11 +400,15 @@ struct RawAdapterCapture {
     output_addr: u32,
     width: u32,
     height: u32,
+    aa_mode_specified: u32,
+    vi_filter_flags: u32,
+    noise_seed_low: u32,
+    noise_seed_high: u32,
     registers: [u32; 24],
     registers_after_submission: [u32; 24],
 }
 
-const _: [(); 65 * std::mem::size_of::<u32>()] = [(); std::mem::size_of::<RawAdapterCapture>()];
+const _: [(); 69 * std::mem::size_of::<u32>()] = [(); std::mem::size_of::<RawAdapterCapture>()];
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -1758,7 +1764,8 @@ struct RawVi {
     fade_enabled: u8,
     repeat_line: u8,
     fade_factor: u16,
-    reserved: u16,
+    aa_mode_specified: u8,
+    reserved: u8,
     noise_seed: u64,
 }
 
@@ -1791,6 +1798,7 @@ fn raw_vi(vi: ViPresentation) -> Result<RawVi, String> {
         fade_enabled: u8::from(vi.fade.is_some()),
         repeat_line: u8::from(vi.repeat_line),
         fade_factor: vi.fade.unwrap_or(0),
+        aa_mode_specified: u8::from(filters.antialias_mode.status_bits().is_some()),
         reserved: 0,
         noise_seed: vi.noise_seed,
     })
@@ -2112,6 +2120,7 @@ pub(crate) fn capture_adapter_inputs(
     height: u32,
     vi: ViPresentation,
 ) -> Result<crate::Rt64AdapterCapture, String> {
+    validate_native_vi_filters(&vi)?;
     let raw_task = RawTask::from(task);
     let vi = raw_vi(vi)?;
     let mut capture = RawAdapterCapture::default();
@@ -2137,11 +2146,26 @@ pub(crate) fn capture_adapter_inputs(
             "RT64 adapter capture failed without a diagnostic",
         ));
     }
+    if capture.aa_mode_specified > 1 {
+        return Err("RT64 adapter capture returned an invalid AA-selector marker".into());
+    }
+    let status = capture.registers[9];
+    let rgba16 = (status & 3) == 2;
+    let expected_filter_flags = u32::from((status & (1 << 16)) != 0 && rgba16)
+        | (u32::from(capture.aa_mode_specified != 0 && ((status >> 8) & 3) <= 1) << 1)
+        | (u32::from(rgba16) << 2)
+        | (u32::from((status & (1 << 6)) != 0) << 3);
+    if capture.vi_filter_flags != expected_filter_flags {
+        return Err("RT64 adapter capture returned inconsistent VI filter flags".into());
+    }
     Ok(crate::Rt64AdapterCapture {
         task_words: capture.task.words(),
         output_addr: capture.output_addr,
         width: capture.width,
         height: capture.height,
+        aa_mode_specified: capture.aa_mode_specified != 0,
+        vi_filter_flags: capture.vi_filter_flags,
+        noise_seed: u64::from(capture.noise_seed_low) | (u64::from(capture.noise_seed_high) << 32),
         registers: capture.registers,
         registers_after_submission: capture.registers_after_submission,
     })
@@ -3813,6 +3837,66 @@ mod tests {
     }
 
     #[test]
+    fn vi_wire_distinguishes_unspecified_from_hardware_aa_mode_zero() {
+        assert_eq!(
+            raw_vi(ViPresentation::default()).unwrap().aa_mode_specified,
+            0
+        );
+
+        let mut words = [0; ViScanoutRegisters::WORD_COUNT];
+        words[0] = 2;
+        words[2] = 320;
+        words[9] = 0x006c_02ec;
+        words[10] = 0x0025_01ff;
+        let vi = ViPresentation {
+            scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(words)),
+            ..ViPresentation::default()
+        };
+        let raw = raw_vi(vi).unwrap();
+        assert_eq!((raw.registers[0] >> 8) & 3, 0);
+        assert_eq!(raw.aa_mode_specified, 1);
+    }
+
+    #[test]
+    fn cpp_vi_ingress_rejects_registers_without_an_explicit_aa_selector() {
+        let task = RawTask::default();
+        let mut vi = RawVi {
+            registers: [0; 14],
+            registers_present: 1,
+            blanked: 0,
+            fade_enabled: 0,
+            repeat_line: 0,
+            fade_factor: 0,
+            aa_mode_specified: 0,
+            reserved: 0,
+            noise_seed: 0,
+        };
+        vi.registers[0] = 2;
+        vi.registers[2] = 320;
+        vi.registers[9] = 0x006c_02ec;
+        vi.registers[10] = 0x0025_01ff;
+        let mut capture = RawAdapterCapture::default();
+        let mut error = [0; ERROR_CAPACITY];
+        // SAFETY: every pointer references a live fixed-size C-layout value;
+        // the adapter capture retains none of them.
+        let ok = unsafe {
+            fn64_rt64_capture_adapter_inputs(
+                &task,
+                0,
+                320,
+                240,
+                &vi,
+                &mut capture,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert_eq!(ok, 0);
+        assert!(error_string(&error, "missing AA-selector diagnostic")
+            .contains("requires an explicit AA selector marker"));
+    }
+
+    #[test]
     fn cpp_vi_ingress_rejects_an_odd_half_line_extent() {
         let task = RawTask::default();
         let mut vi = RawVi {
@@ -3822,6 +3906,7 @@ mod tests {
             fade_enabled: 0,
             repeat_line: 0,
             fade_factor: 0,
+            aa_mode_specified: 1,
             reserved: 0,
             noise_seed: 0,
         };
@@ -3947,11 +4032,47 @@ mod tests {
         assert!(cmake.contains("9b3cf39bb15fc0c7d52085566197042f4960cc410b241e38457bb817f2501e5b"));
         assert!(cmake.contains("fn64_rt64_nominal_full_rate(this)"));
         let expected_overlay = if cfg!(feature = "hfr-evidence") {
-            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-retrace-cadence:v1+hfr-post-present-call:v1"
+            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+hfr-post-present-call:v1"
         } else {
-            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-retrace-cadence:v1"
+            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1"
         };
         assert_eq!(env!("FN64_RT64_SOURCE_OVERLAY_ID"), expected_overlay);
+    }
+
+    #[test]
+    fn vi_silhouette_aa_overlay_keeps_wire_selector_and_stage_order_visible() {
+        let header = include_str!("../ffi/fn64_rt64_video_interface.h");
+        let shader = include_str!("../ffi/fn64_rt64_video_interface_ps.hlsl");
+        let shim_header = include_str!("../ffi/fn64_rt64_shim.h");
+        let shim = include_str!("../ffi/fn64_rt64_shim.cpp");
+        let cmake = include_str!("../ffi/CMakeLists.txt");
+
+        assert!(header.contains("uint viFilterFlags;"));
+        for flag in [
+            "ViFilterDitherRestoration",
+            "ViFilterSilhouetteAa",
+            "ViFilterRgba16",
+            "ViFilterSerratedRows",
+        ] {
+            assert!(header.contains(flag), "VI filter wire lost {flag}");
+        }
+        for mechanism in [
+            "HasQualifiedPartialCoverage",
+            "CoverageAaTexel",
+            "CoverageAaNearest",
+            "admitted < 3u",
+            "(-2, 0)",
+            "(2, 0)",
+            "float4 center = FilteredTexel(coordinate);",
+            "float4 center = FilteredNearest(uv, sourceCoordinate);",
+        ] {
+            assert!(shader.contains(mechanism), "VI AA shader lost {mechanism}");
+        }
+        assert!(shim_header.contains("uint8_t aa_mode_specified;"));
+        assert!(shim.contains("context.vi_state.aa_mode_specified != 0U"));
+        assert!(shim.contains("vi_filter_flags_for_context(*context)"));
+        assert!(shim.contains("interop::ViFilterSilhouetteAa"));
+        assert!(!cmake.contains("pushConstants.ditherFilter"));
     }
 
     fn cpp_logical_rate(nominal_refresh_rate: u32, factor: u32) -> Result<u32, String> {

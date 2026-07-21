@@ -20,8 +20,12 @@ namespace interop {
         uint divot;
         uint coverageRange;
         uint filtering;
-        uint ditherFilter;
+        uint viFilterFlags;
     };
+    static const uint ViFilterDitherRestoration = 1u << 0u;
+    static const uint ViFilterSilhouetteAa = 1u << 1u;
+    static const uint ViFilterRgba16 = 1u << 2u;
+    static const uint ViFilterSerratedRows = 1u << 3u;
 #ifdef HLSL_CPU
 };
 #endif

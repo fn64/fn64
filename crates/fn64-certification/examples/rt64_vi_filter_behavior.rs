@@ -8,8 +8,8 @@ use fn64_render::{
         restore_rgba16_component_bounded_v1,
     },
     ActiveRenderGraphicsApi, FrameStatus, ReleaseCaptureFormat, RenderBackend, RenderConfig,
-    RenderFiltering, RenderGraphicsApi, RenderRuntimeSettings, ViPresentation, ViScaleAxis,
-    ViScanoutRegisters, ViScanoutState,
+    RenderFiltering, RenderGraphicsApi, RenderRuntimeSettings, RenderSettingsApply, ViPresentation,
+    ViScaleAxis, ViScanoutRegisters, ViScanoutState,
 };
 use fn64_render_rt64::{Rt64Backend, Rt64PresentedPixels, Rt64SourceProvenance};
 use fn64_runtime::TvType;
@@ -83,6 +83,13 @@ struct Observation {
     nonblack_pixels: usize,
     unique_colors: usize,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViFilterRunSummary {
+    pub workload_id: u64,
+    pub first_present_id: u64,
+    pub last_present_id: u64,
 }
 
 fn push_command(rdram: &mut [u8], cursor: &mut usize, w0: u32, w1: u32) {
@@ -373,7 +380,15 @@ fn observe(
     })
 }
 
-pub fn run() -> Result<(), Box<dyn Error>> {
+fn settings() -> RenderRuntimeSettings {
+    RenderRuntimeSettings {
+        graphics_api: RenderGraphicsApi::Metal,
+        filtering: RenderFiltering::Nearest,
+        ..RenderRuntimeSettings::default()
+    }
+}
+
+fn run_created(backend: &mut Rt64Backend) -> Result<ViFilterRunSummary, Box<dyn Error>> {
     let identity = Rt64Backend::release_identity();
     if identity.source_id != PINNED_SOURCE
         || identity.source_provenance != Rt64SourceProvenance::GitClean
@@ -384,18 +399,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         ))
         .into());
     }
-    let settings = RenderRuntimeSettings {
-        graphics_api: RenderGraphicsApi::Metal,
-        filtering: RenderFiltering::Nearest,
-        ..RenderRuntimeSettings::default()
-    };
-    let mut backend = Rt64Backend::new();
-    backend.apply_runtime_settings(&settings)?;
-    backend.create(&RenderConfig::for_tv(
-        OUTPUT_WIDTH,
-        OUTPUT_HEIGHT,
-        TvType::Ntsc,
-    ))?;
+    backend.resize(OUTPUT_WIDTH, OUTPUT_HEIGHT);
     backend.enable_present_capture()?;
 
     let (mut rdram, command_end) = fixture();
@@ -554,7 +558,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let mut observations = Vec::with_capacity(phases.len());
     for phase in phases {
-        observations.push(observe(&mut backend, &rdram, phase)?);
+        observations.push(observe(backend, &rdram, phase)?);
     }
     for pair in observations.windows(2) {
         if pair[1].workload_id != pair[0].workload_id || pair[1].present_id <= pair[0].present_id {
@@ -721,10 +725,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         || by_label("resample-mode-3").bytes != by_label("resample-mode-1").bytes
         || by_label("resample-mode-3").bytes != by_label("resample-mode-0").bytes
     {
-        return Err(io::Error::other(
-            "pinned RT64's explicit native VI residual changed; review AA-selector support",
-        )
-        .into());
+        return Err(
+            io::Error::other("pinned RT64's code-0/save scaled negative control changed").into(),
+        );
     }
 
     let release = backend.release_capture()?;
@@ -739,7 +742,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         );
     }
     println!(
-        "vi_filter_pixel_evidence source={} baseline_sha256={} gamma_sha256={} dither_only_a_sha256={} dither_only_b_sha256={} gamma_dither_a_sha256={} gamma_dither_b_sha256={} divot_sha256={} divot_changed_pixels={} dither_filter_sha256={} restoration_changed_pixels={} scaled_sha256={} phases={} native_residual=aa-selector",
+        "vi_filter_pixel_evidence source={} baseline_sha256={} gamma_sha256={} dither_only_a_sha256={} dither_only_b_sha256={} gamma_dither_a_sha256={} gamma_dither_b_sha256={} divot_sha256={} divot_changed_pixels={} dither_filter_sha256={} restoration_changed_pixels={} scaled_sha256={} phases={} aa_selector_evidence=separate-qualified-coverage-gate",
         identity.source_id,
         BASELINE_SHA256,
         GAMMA_SHA256,
@@ -754,7 +757,38 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         SCALED_SHA256,
         observations.len()
     );
-    Ok(())
+    Ok(ViFilterRunSummary {
+        workload_id: observations[0].workload_id,
+        first_present_id: observations[0].present_id,
+        last_present_id: observations.last().unwrap().present_id,
+    })
+}
+
+pub fn run_on_backend(backend: &mut Rt64Backend) -> Result<ViFilterRunSummary, Box<dyn Error>> {
+    let expected_settings_sha256 = settings().sha256();
+    match backend.apply_runtime_settings(&settings())? {
+        RenderSettingsApply::LiveApplied {
+            settings_sha256, ..
+        } if settings_sha256 == expected_settings_sha256 => {}
+        result => {
+            return Err(io::Error::other(format!(
+                "native VI fixture requires an existing Metal backend that applies exact nearest settings live: {result:?}"
+            ))
+            .into());
+        }
+    }
+    run_created(backend)
+}
+
+pub fn run() -> Result<(), Box<dyn Error>> {
+    let mut backend = Rt64Backend::new();
+    backend.apply_runtime_settings(&settings())?;
+    backend.create(&RenderConfig::for_tv(
+        OUTPUT_WIDTH,
+        OUTPUT_HEIGHT,
+        TvType::Ntsc,
+    ))?;
+    run_created(&mut backend).map(|_| ())
 }
 
 #[allow(dead_code)]
