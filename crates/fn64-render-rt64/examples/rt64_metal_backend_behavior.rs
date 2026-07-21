@@ -10,6 +10,9 @@ use fn64_render_rt64::{Rt64Backend, Rt64BackendIdentity, Rt64SourceProvenance};
 use fn64_runtime::TvType;
 use sha2::{Digest, Sha256};
 
+#[path = "rt64_vi_filter_behavior.rs"]
+mod vi_filter_behavior;
+
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
 const COMMANDS: usize = 0x100;
 const COMMAND_COUNT: usize = 5;
@@ -310,6 +313,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     if backend.release_environment().tv_type().is_some() {
         return Err(io::Error::other("failed Metal recreation retained stale TV authority").into());
     }
+
+    // Keep the platform's existing backend-lifecycle denominator while making
+    // its native VI pixel coverage non-shrinking. The isolated gate owns a
+    // fresh context and exact public-register phases.
+    vi_filter_behavior::run()?;
 
     println!(
         "metal_backend_evidence source={} provenance={:?} initial_native={} initial_post_vi={} initial_workload_id={} initial_present_id={} transition_native={} transition_post_vi={} transition={}x{} transition_workload_id={} transition_present_id={} resized_native={} resized_post_vi={} resized={}x{} resized_workload_id={} resized_present_id={} recreated_native={} recreated_post_vi={} recreated={}x{} recreated_workload_id={} recreated_present_id={} policy_sha256={}",

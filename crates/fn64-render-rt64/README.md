@@ -94,6 +94,20 @@ square-root gamma policy, and seven-bit stochastic gamma quantization.
 and border details, the silicon gamma ROM and random stream, and post-DAC analog
 video remain unproven.
 
+The live Metal `rt64_vi_filter_behavior` gate supplies the missing native
+post-VI pixel observation without promoting RT64 to a silicon oracle. Fourteen
+live-register phases retain one workload, strictly advancing presents, exact
+8x6 BGRA8 geometry, and six byte-identical baseline restorations. Pinned RT64's
+gamma and nonidentity X/Y scale produce stable distinct images; gamma dither,
+divot, RGBA16 dither restoration, and the four AA selector values are retained
+as exact pixel-inert residuals because the pinned native VI shader implements
+only sampling, border, and gamma. The backend-lifecycle case runs this gate in
+a separate context so later source changes cannot silently convert that known
+residual into an unreviewed behavior claim. Ten fresh Metal processes retained
+the standalone gate's three exact baseline, gamma, and scaled SHA-256
+identities; the expanded full backend-lifecycle process then re-earned its
+20-clean-run platform bar with the gate included.
+
 Raw RDP decode accepts the unassigned second word of Load/Pipe/Tile/Full Sync,
 while the atomic F3DEX2 macro path keeps its stricter reserved-payload check.
 Wrapped, unclamped tile axes derive their active domain from the nonzero mask
@@ -372,6 +386,17 @@ These bytes are not post-analog N64 VI output and do not establish silicon
 gamma/divot/dither equivalence. Metal retains its measured 20-run control;
 macOS compiles the Vulkan branch and static tests retain the D3D12 seam, but no
 Linux/Vulkan or Windows/Vulkan/D3D12 actual-hardware result is claimed.
+
+The focused native VI gate is also directly runnable:
+
+```sh
+cargo run -p fn64-render-rt64 --features rt64 --example rt64_vi_filter_behavior
+```
+
+It requires a clean pinned source identity and names the unsupported native
+filter stages in its terminal evidence line. A passing process therefore means
+the recorded implementation boundary is stable, not that the pixel-inert
+controls have been implemented.
 
 For fixed-cycle reports, `RenderBackend::release_environment()` records the
 concrete graphics API observed from the completed capture framebuffer and

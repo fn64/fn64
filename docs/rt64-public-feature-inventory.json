@@ -68,7 +68,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 13, "needle": "D3D12, Vulkan and Metal" },
         { "kind": "pinned_source", "path": "src/hle/rt64_application.cpp", "line": 168, "needle": "GraphicsAPI::Metal" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_metal_backend_behavior.rs", "line": 229, "needle": "validate_capture(resized, &resized_capture, &identity, policy_sha256)", "claim_id": "backend-metal" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_metal_backend_behavior.rs", "line": 232, "needle": "validate_capture(resized, &resized_capture, &identity, policy_sha256)", "claim_id": "backend-metal" }
       ]
     },
     {

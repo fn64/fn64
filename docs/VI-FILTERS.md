@@ -81,6 +81,45 @@ cargo test -p fn64-render vi_ --lib
 cargo test -p fn64-abi vi --lib
 ```
 
+## Native RT64 pixel boundary
+
+`rt64_vi_filter_behavior` observes pinned RT64's native Metal post-VI output
+without treating RT64 as a silicon oracle. One asymmetric public raw-RDP
+RGBA16 fixture is submitted once, then fourteen complete live VI register
+images cross the same context. Every phase retains the same nonzero workload
+identity, a strictly increasing present identity, and exact 8x6 BGRA8
+geometry. Six off-state restorations return byte-for-byte to the first
+baseline.
+
+Ten fresh Metal processes retained the three exact SHA-256 identities enforced
+by the standalone gate. The expanded full `rt64_metal_backend_behavior`
+process, which invokes this gate in a fresh context, separately passed its
+existing twenty-process platform-certification bar:
+
+| Native phase | Nonblack pixels | Unique colors |
+| --- | ---: | ---: |
+| Baseline and all six restorations | 48 | 48 |
+| Gamma and gamma plus gamma-dither | 48 | 48 |
+| Nonidentity 1.5x X/Y scale under all four AA selectors | 40 | 41 |
+
+Gamma and nonidentity scale each causally change the exact captured pixels and
+their later off phases restore the baseline. Gamma dither remains identical to
+gamma; divot and `DITHER_FILTER` remain identical to baseline; and AA selector
+values 0-3 remain identical at the nonidentity scale. The clean pinned MIT
+RT64 `VideoInterfacePS` implements sampling, border, and gamma, so those four
+equalities are named native implementation residuals rather than positive
+filter results. The fixture fails if a source update changes either side of
+that boundary without an explicit review. This closes the missing native GPU
+pixel observation only; it neither validates the deterministic reference
+arithmetic against RT64 nor establishes physical-console or analog-video
+parity.
+
+Run the native gate directly with:
+
+```sh
+cargo run -p fn64-render-rt64 --features rt64 --example rt64_vi_filter_behavior
+```
+
 ## Physical-video capture admission
 
 `VI-ANALOG-CAPTURE-PROGRAM.md` defines the strict external-evidence boundary
@@ -105,6 +144,9 @@ tool's consensus result cannot close the base-renderer row by itself.
 - Exact interaction timing between filter blocks and field/retrace state.
 - Mode-0 unconditional versus mode-1 conditional extra-line fetch timing and
   memory-bus behavior; their public pixel-stage selection is implemented.
+- Native RT64 gamma-dither, divot, RGBA16 dither-restoration, and AA-selector
+  pixel behavior. The live Metal gate currently preserves each as an exact
+  pixel-inert implementation residual at the pinned source revision.
 - Video DAC conversion, composite/S-Video encoding, bandwidth limits, and
   analog NTSC/PAL/MPAL output characteristics.
 - Pixel-level hardware traces spanning the framebuffer through physical video
