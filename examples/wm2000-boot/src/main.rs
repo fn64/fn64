@@ -273,6 +273,19 @@ fn main() {
     // 20M: with the C-lane raw-MMIO time charge, the audio manager's
     // AI_STATUS poll consumes ~56k steps per 19ms audio buffer, so 2M steps
     // only covered ~0.8s of virtual boot.
+    //
+    // Step-economics re-measurement (2026-07-21, post RDRAM-swizzle/RSP-replay
+    // fix): the AI pump is NOT a step sink anymore. Trace evidence
+    // (/tmp/wm2000-boot-trace.jsonl, 300k-step run): audio tasks are submitted
+    // at exactly one per VI field (1,563,558-cycle gaps; occasionally one per
+    // two fields) -- the retrace-driven cadence real hardware has, NOT a
+    // starved-feedback loop from the stand-in ucode completing instantly. The
+    // whole per-field round (retrace fan-out -> AI pump's ~6 raw AI_STATUS/
+    // AI_LEN polls at 32 cycles each -> audio manager task submit) costs
+    // ~10-16 scheduler steps, so the default 20M-step budget covers ~1M+
+    // fields (hours of virtual boot). The budget is no longer what limits gfx
+    // frames; the game itself stops submitting tasks after its first 3 gfx
+    // frames (sim ~16.07B) -- see the boot-stall notes in the README.
     const MAX_STEPS: u64 = 20_000_000;
     const LOG_EVERY: u64 = 500_000;
     // Once the RSP-task throughput fix landed, 20M steps pass in a couple of
