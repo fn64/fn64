@@ -320,6 +320,41 @@ fn main() {
     let mut thread0_death_logged = false;
     let mut consecutive_idle_ticks = 0u32;
 
+    // Voice-map virgin-allocation reproduction (2026-07-21, ladder 3 rung):
+    // the AKI sound driver allocates its 4x0x30C per-channel array
+    // (func_800E1DF0, pointer stored at D_8011B5D8) UNCLEARED from the
+    // game's own next-fit heap, and its announcer request protocol
+    // (func_8011E4BC fires exactly one frame after assigning a wrestler id)
+    // resolves sound code 0 through the per-channel code->fileId voice map
+    // at chan+4 BEFORE the frame-paced installer (func_800F6ED8, reached via
+    // func_800F5704's assignment countdown) has populated it. The guest code
+    // is explicitly robust to a ZERO map entry -- func_800F5190's code-0 rule
+    // (asm 0x800F5310) falls back to the built-in announce tables
+    // (D_801065A0..D_80106610) when the slot reads 0 -- but NOT to arbitrary
+    // garbage. On hardware the fresh array reads the virgin (arena-init
+    // bzero'd, func_80000898 first call) zeros because the heap's next-fit
+    // roving pointer position at scene-init time is a function of thousands
+    // of timing-dependent alloc/free pairs (the chunked/streamed loaders);
+    // under fn64's current virtual-time pacing (the game frame loop runs
+    // ~1400 VI fields per frame against a hardware-cadence audio pump) that
+    // history collapses and the array lands exactly on the freed
+    // decompression temp of sound-map file 0x435, so slot 0 reads the stale
+    // compressed byte pair 0xC5BE and the streamer asserts on a wild fileId
+    // (the previously-parked func_80003DD4 bounds assert). Until fn64's
+    // frame pacing reproduces hardware's heap history, reproduce the
+    // hardware-visible OUTCOME at the harness level: whenever a NEW chan
+    // array pointer appears at D_8011B5D8, zero the four 0x124-entry
+    // (0x248-byte) voice maps at chan+4 -- exactly the virgin bytes the
+    // guest's own zero-tolerant fallback is designed for. Real installs
+    // (func_800F6ED8 runs, verified) land later and overwrite freely.
+    // Verified equivalent by lldb experiment: with these zeros the fileId
+    // assert never fires and boot proceeds into the intro scene's first
+    // real RDP triangle submissions.
+    const WM2000_CHAN_ARRAY_PTR: u32 = 0x11B5D8; // D_8011B5D8 - 0x80000000
+    const WM2000_CHAN_STRIDE: u32 = 0x30C;
+    const WM2000_VOICE_MAP_BYTES: u32 = 0x248;
+    let mut last_chan_array_ptr = 0u32;
+
     let mut tick = 0u64;
     let mut steps = 0u64;
     loop {
@@ -341,6 +376,42 @@ fn main() {
         unsafe { fn64_abi::sync_mmio_into_rdram(rdram_ptr) };
         let stepped = fn64_abi::run_one_step();
         steps += 1;
+        // Virgin-allocation reproduction for the AKI voice maps -- see the
+        // block comment above `last_chan_array_ptr` for the full story.
+        {
+            let view = fn64_runtime::RdramView::from_storage(&rdram);
+            let chan_ptr = view.read_u32(fn64_runtime::RdramAddr::from_offset(
+                WM2000_CHAN_ARRAY_PTR,
+            ));
+            if chan_ptr != last_chan_array_ptr {
+                if chan_ptr >= 0x8000_0000
+                    && (chan_ptr as u64 - 0x8000_0000
+                        + u64::from(WM2000_CHAN_STRIDE) * 4)
+                        < fn64_boot_harness::rdram_len() as u64
+                    && chan_ptr.is_multiple_of(4)
+                {
+                    let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+                    for chan in 0..4u32 {
+                        let map_guest = chan_ptr + chan * WM2000_CHAN_STRIDE + 4;
+                        for w in (0..WM2000_VOICE_MAP_BYTES).step_by(4) {
+                            view.write_u32(
+                                fn64_runtime::RdramAddr::from_offset(
+                                    map_guest - 0x8000_0000 + w,
+                                ),
+                                0,
+                            );
+                        }
+                    }
+                    println!(
+                        "[wm2000-boot] fresh sound-channel array at {chan_ptr:#010x} \
+                         (step {steps}): zeroed the 4 per-channel voice maps (chan+4, \
+                         {WM2000_VOICE_MAP_BYTES:#x} bytes each) to the virgin-arena bytes the \
+                         guest's zero-tolerant code-0 fallback expects -- see source comment."
+                    );
+                }
+                last_chan_array_ptr = chan_ptr;
+            }
+        }
         if steps.is_multiple_of(LOG_EVERY) {
             println!(
                 "[wm2000-boot] progress: steps={steps} sim_time={} vi_swaps={} gfx_tasks={} \
