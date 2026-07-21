@@ -9,6 +9,8 @@ const FFI_FILES: &[&str] = &[
     "ffi/CMakeLists.txt",
     "ffi/fn64_rt64_shim.cpp",
     "ffi/fn64_rt64_shim.h",
+    "ffi/fn64_rt64_video_interface.h",
+    "ffi/fn64_rt64_video_interface_ps.hlsl",
 ];
 const SHARED_RENDER_ROOT: &str = "../fn64-render";
 
@@ -183,6 +185,8 @@ mod tests {
             "ffi/CMakeLists.txt",
             "ffi/fn64_rt64_shim.cpp",
             "ffi/fn64_rt64_shim.h",
+            "ffi/fn64_rt64_video_interface.h",
+            "ffi/fn64_rt64_video_interface_ps.hlsl",
             "../fn64-render/Cargo.toml",
             "../fn64-render/src/lib.rs",
             "../fn64-render/src/microcode.rs",

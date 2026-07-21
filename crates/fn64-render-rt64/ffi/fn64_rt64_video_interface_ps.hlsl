@@ -1,0 +1,112 @@
+// Pinned RT64 VI pass plus fn64's bounded post-gamma dither policy.
+
+#include "fn64_rt64_video_interface.h"
+
+[[vk::push_constant]] ConstantBuffer<VideoInterfaceCB> gConstants : register(b0);
+Texture2D<float4> gInput : register(t1);
+SamplerState gSampler : register(s2);
+
+// uint2 is little-endian (low, high). RT64's Metal shader target predates
+// MSL 2.2, so the exact modulo-2^64 policy is expressed without native u64.
+uint2 Add64(uint2 left, uint2 right) {
+    uint low = left.x + right.x;
+    return uint2(low, left.y + right.y + uint(low < left.x));
+}
+
+uint2 ShiftRight64(uint2 value, uint amount) {
+    return uint2(
+        (value.x >> amount) | (value.y << (32u - amount)),
+        value.y >> amount);
+}
+
+uint2 Mul32Wide(uint left, uint right) {
+    uint leftLow = left & 0xffffu;
+    uint leftHigh = left >> 16u;
+    uint rightLow = right & 0xffffu;
+    uint rightHigh = right >> 16u;
+    uint lowProduct = leftLow * rightLow;
+    uint leftCross = leftLow * rightHigh;
+    uint rightCross = leftHigh * rightLow;
+    uint middle = (lowProduct >> 16u) +
+        (leftCross & 0xffffu) + (rightCross & 0xffffu);
+    return uint2(
+        (lowProduct & 0xffffu) | (middle << 16u),
+        leftHigh * rightHigh + (leftCross >> 16u) +
+            (rightCross >> 16u) + (middle >> 16u));
+}
+
+uint2 Mul64(uint2 left, uint2 right) {
+    uint2 lowProduct = Mul32Wide(left.x, right.x);
+    return uint2(
+        lowProduct.x,
+        lowProduct.y + left.x * right.y + left.y * right.x);
+}
+
+uint ReferenceNoiseBitV1(uint2 retraceCycle, uint2 outputPixel, uint channel) {
+    const uint2 Golden = uint2(0x7f4a7c15u, 0x9e3779b9u);
+    const uint2 Mix1 = uint2(0x1ce4e5b9u, 0xbf58476du);
+    const uint2 Mix2 = uint2(0x133111ebu, 0x94d049bbu);
+    uint2 key = retraceCycle ^ Mul64(outputPixel, Golden) ^
+        Mul64(uint2(channel, 0u), Mix1);
+    uint2 mixed = Add64(key, Golden);
+    mixed = Mul64(mixed ^ ShiftRight64(mixed, 30u), Mix1);
+    mixed = Mul64(mixed ^ ShiftRight64(mixed, 27u), Mix2);
+    return (mixed ^ ShiftRight64(mixed, 31u)).x & 1u;
+}
+
+float GammaDitherChannelBoundedV1(float channel, uint randomBit) {
+    uint value = uint(round(saturate(channel) * 255.0f));
+    uint quantized = (min(value + randomBit, 255u) >> 1);
+    uint expanded = (quantized << 1) | (quantized >> 6);
+    return float(expanded) / 255.0f;
+}
+
+float4 ApplyGammaDither(float4 color, float4 position) {
+    if (gConstants.gammaDither == 0u) {
+        return color;
+    }
+    // A mismatched policy is a loud visible failure, never an approximation.
+    if (gConstants.policyVersion != 1u) {
+        return float4(1.0f, 0.0f, 1.0f, 1.0f);
+    }
+    uint x = uint(position.x) - gConstants.outputOriginX;
+    uint y = uint(position.y) - gConstants.outputOriginY;
+    uint2 pixel = Add64(
+        Mul64(uint2(y, 0u), uint2(gConstants.outputWidth, 0u)),
+        uint2(x, 0u));
+    uint2 seed = uint2(gConstants.noiseSeedLow, gConstants.noiseSeedHigh);
+    color.r = GammaDitherChannelBoundedV1(color.r, ReferenceNoiseBitV1(seed, pixel, 0u));
+    color.g = GammaDitherChannelBoundedV1(color.g, ReferenceNoiseBitV1(seed, pixel, 1u));
+    color.b = GammaDitherChannelBoundedV1(color.b, ReferenceNoiseBitV1(seed, pixel, 2u));
+    return color;
+}
+
+// Limit texture sampling to the area the VI can sample of the texture.
+float4 SampleInput(float2 uv) {
+    const float2 LowerRight = gConstants.videoResolution / gConstants.textureResolution;
+    const float2 HalfPixel = float2(0.5f, 0.5f) / gConstants.textureResolution;
+    float2 outsideBorder = step(LowerRight, uv);
+    float4 sampledColor = gInput.SampleLevel(gSampler, clamp(uv, HalfPixel, LowerRight - HalfPixel), 0);
+    float4 gammaCorrectedColor = pow(sampledColor, gConstants.gamma);
+    gammaCorrectedColor.rgb *= max(1.0f - outsideBorder.x - outsideBorder.y, 0.0f);
+    gammaCorrectedColor.a = 1.0f;
+    return gammaCorrectedColor;
+}
+
+// Sourced by pinned MIT RT64 from https://www.shadertoy.com/view/csX3RH.
+float4 PixelAntialiasing(float2 uv) {
+    float2 uvTexspace = uv * gConstants.videoResolution;
+    float2 seam = floor(uvTexspace + 0.5f);
+    uvTexspace = (uvTexspace - seam) / fwidth(uvTexspace) + seam;
+    uvTexspace = clamp(uvTexspace, seam - 0.5f, seam + 0.5f);
+    return SampleInput(uvTexspace / gConstants.textureResolution);
+}
+
+float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET {
+#ifdef PIXEL_ANTIALIASING
+    float4 color = PixelAntialiasing(uv);
+#else
+    float4 color = SampleInput((uv / gConstants.textureResolution) * gConstants.videoResolution);
+#endif
+    return ApplyGammaDither(color, pos);
+}

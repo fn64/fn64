@@ -19,6 +19,8 @@
 #include <thread>
 #include <vector>
 
+#include "fn64_rt64_video_interface.h"
+
 #include <SDL.h>
 #include "contrib/plume/plume_vulkan.h"
 #include "rhi/rt64_render_hooks.h"
@@ -57,6 +59,8 @@ constexpr size_t N64_RDRAM_SIZE = 8U * 1024U * 1024U;
 constexpr uint32_t VI_STATUS_16_BIT = 2U;
 static_assert(sizeof(Fn64Rt64UcodeGeneration) == 120U);
 static_assert(sizeof(Fn64Rt64TaskResult) == 88U);
+static_assert(sizeof(Fn64Rt64ViState) == 72U);
+static_assert(sizeof(interop::VideoInterfaceCB) == 48U);
 static_assert(sizeof(Fn64Rt64ExtendedPresentCapture) == 72U);
 static_assert(sizeof(Fn64Rt64PresentCapture) == 48U);
 #if defined(FN64_RT64_HFR_EVIDENCE)
@@ -1093,6 +1097,8 @@ bool extended_workload_snapshot(
 namespace {
 std::mutex present_capture_registry_mutex;
 std::vector<Fn64Rt64Context *> present_capture_contexts;
+std::mutex vi_filter_registry_mutex;
+std::vector<Fn64Rt64Context *> vi_filter_contexts;
 struct ViHistoryRateEntry {
     const void *history = nullptr;
     uint32_t nominal_refresh_rate = 0;
@@ -1123,6 +1129,8 @@ void capture_present_draw(
     plume::RenderCommandList *command_list,
     plume::RenderFramebuffer *framebuffer) noexcept;
 void unregister_present_capture(Fn64Rt64Context *context);
+void register_vi_filter_context(Fn64Rt64Context *context);
+void unregister_vi_filter_context(Fn64Rt64Context *context);
 void register_vi_history_rate(const void *history, uint32_t nominal_refresh_rate);
 void unregister_vi_history_rate(const void *history);
 #if defined(FN64_RT64_HFR_EVIDENCE)
@@ -1166,6 +1174,7 @@ struct Fn64Rt64Context {
     bool setup_complete = false;
     bool ucode_admission_poisoned = false;
     bool vi_history_rate_registered = false;
+    bool vi_filter_registered = false;
     bool presentation_refresh_pending = false;
     bool replacement_observed_resolved_not_installed = false;
     uint32_t replacement_stream_worker_count = 0;
@@ -1282,6 +1291,10 @@ struct Fn64Rt64Context {
             if (vi_history_rate_registered) {
                 unregister_vi_history_rate(&application->state->viHistory);
                 vi_history_rate_registered = false;
+            }
+            if (vi_filter_registered) {
+                unregister_vi_filter_context(this);
+                vi_filter_registered = false;
             }
             if (present_diagnostics_enabled()) {
                 std::fprintf(stderr, "fn64 RT64 shutdown diagnostic: application-end begin\n");
@@ -1446,6 +1459,80 @@ struct Fn64Rt64Context {
         registers = next_registers;
     }
 };
+
+namespace {
+void register_vi_filter_context(Fn64Rt64Context *context) {
+    std::scoped_lock lock(vi_filter_registry_mutex);
+    const auto duplicate = std::find_if(
+        vi_filter_contexts.begin(),
+        vi_filter_contexts.end(),
+        [context](const Fn64Rt64Context *candidate) {
+            return (candidate == context) ||
+                   (candidate->application->device.get() ==
+                    context->application->device.get());
+        });
+    if (duplicate != vi_filter_contexts.end()) {
+        throw std::runtime_error("RT64 VI filter device was registered twice");
+    }
+    vi_filter_contexts.push_back(context);
+}
+
+void unregister_vi_filter_context(Fn64Rt64Context *context) {
+    std::scoped_lock lock(vi_filter_registry_mutex);
+    const size_t prior_size = vi_filter_contexts.size();
+    vi_filter_contexts.erase(
+        std::remove(vi_filter_contexts.begin(), vi_filter_contexts.end(), context),
+        vi_filter_contexts.end());
+    if (vi_filter_contexts.size() + 1U != prior_size) {
+        std::terminate();
+    }
+}
+
+Fn64Rt64Context *vi_filter_context_for_device(void *device) {
+    const auto entry = std::find_if(
+        vi_filter_contexts.begin(),
+        vi_filter_contexts.end(),
+        [device](const Fn64Rt64Context *context) {
+            return context->application &&
+                   (context->application->device.get() == device);
+        });
+    return (entry == vi_filter_contexts.end()) ? nullptr : *entry;
+}
+} // namespace
+
+extern "C" void fn64_rt64_vi_filter_constants(
+    void *device,
+    interop::VideoInterfaceCB *constants) {
+    if (constants == nullptr) {
+        std::terminate();
+    }
+    std::scoped_lock lock(vi_filter_registry_mutex);
+    Fn64Rt64Context *context = vi_filter_context_for_device(device);
+    if (context == nullptr) {
+        // RT64 setup can compile/draw before fn64 publishes the completed
+        // context. The unregistered setup path has no guest retrace identity.
+        constants->gammaDither = 0U;
+        constants->policyVersion = 1U;
+        return;
+    }
+    constants->gammaDither =
+        (context->registers[9] & (1U << 2U)) != 0U ? 1U : 0U;
+    constants->noiseSeedLow = uint32_t(context->vi_state.noise_seed);
+    constants->noiseSeedHigh = uint32_t(context->vi_state.noise_seed >> 32U);
+    constants->policyVersion = 1U;
+}
+
+extern "C" uint32_t fn64_rt64_vi_retrace_event(
+    void *device,
+    uint32_t from_early_present) {
+    if (from_early_present != 0U) {
+        return 0U;
+    }
+    std::scoped_lock lock(vi_filter_registry_mutex);
+    // A registered call is one authoritative fn64 VI event. Setup-owned
+    // updateScreen calls precede registration and keep pinned RT64 behavior.
+    return vi_filter_context_for_device(device) != nullptr ? 1U : 0U;
+}
 
 /// Bind fn64's one physical allocation only for a synchronous renderer call.
 /// Every caller waits its exact workload or present worker before this scope
@@ -2909,6 +2996,8 @@ extern "C" Fn64Rt64Context *fn64_rt64_create(
             &context->application->state->viHistory,
             context->nominal_refresh_rate);
         context->vi_history_rate_registered = true;
+        register_vi_filter_context(context.get());
+        context->vi_filter_registered = true;
         if (context->application->userConfig.antialiasing != requested_user_config.antialiasing) {
             set_error(error, error_capacity, "RT64 device silently rejected the requested antialiasing sample count");
             return nullptr;
@@ -3869,6 +3958,12 @@ extern "C" int fn64_rt64_present(
             return 0;
         }
 
+        // A process-time PresentEarly may still be reading the preceding VI
+        // policy after its producer returns. Drain that worker before replacing
+        // `vi_state`; the current call then remains joined through the existing
+        // end-of-function idle wait, so no present can observe the next
+        // retrace's seed with the prior retrace's register image.
+        context->application->presentQueue->waitForIdle();
         ScopedRdramBinding rdram_binding(context, rdram);
 
         PresentDiagnosticSnapshot diagnostic{};

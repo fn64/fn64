@@ -3,6 +3,7 @@ use std::error::Error;
 use std::io;
 
 use fn64_render::{
+    vi_public_filters::{gamma_dither_quantize_bounded_v1, reference_noise_bit_v1},
     ActiveRenderGraphicsApi, FrameStatus, ReleaseCaptureFormat, RenderBackend, RenderConfig,
     RenderGraphicsApi, RenderRuntimeSettings, ViPresentation, ViScaleAxis, ViScanoutRegisters,
     ViScanoutState,
@@ -21,6 +22,14 @@ const OUTPUT_HEIGHT: u32 = 6;
 const PINNED_SOURCE: &str = "git:f0728a2520d5aa735886240de3fee75cc805f6d6";
 const BASELINE_SHA256: &str = "e1d959640644ed83214b89a238802ac82fc7e4b853131ff250f1f16f842ca355";
 const GAMMA_SHA256: &str = "2281b631918039786430a3831ec3a6237b51171c61852bc44cf2fa88c6089a15";
+const DITHER_ONLY_A_SHA256: &str =
+    "41ed92021430493334b9969e5d0b019ec25993046e2c6329c82203d0d35e4ba5";
+const DITHER_ONLY_B_SHA256: &str =
+    "35a50a6b954b66990fce8457870180444a91a0417255c6abb31d2bcfbdcae968";
+const GAMMA_DITHER_A_SHA256: &str =
+    "667576d5590d25255becda4e30ea9aaca2ad13f2a2497b69d8f668b0154975e6";
+const GAMMA_DITHER_B_SHA256: &str =
+    "d71bb4498d9d9bef5cc64acfed849d4a001308882ca976325abed5599fc29165";
 const SCALED_SHA256: &str = "9549acd7464bb0da111623f1d5162803e05a1c4892755446764cf3eb73a8070a";
 
 const STATUS_RGBA16_AA_ALWAYS: u32 = 0x002;
@@ -135,6 +144,19 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn expected_gamma_dither(source: &[u8], noise_seed: u64) -> Vec<u8> {
+    let mut expected = source.to_vec();
+    for (pixel_index, bgra) in expected.chunks_exact_mut(4).enumerate() {
+        for (byte_index, rgb_channel) in [(2, 0), (1, 1), (0, 2)] {
+            bgra[byte_index] = gamma_dither_quantize_bounded_v1(
+                bgra[byte_index],
+                reference_noise_bit_v1(noise_seed, pixel_index as u64, rgb_channel),
+            );
+        }
+    }
+    expected
+}
+
 fn observe(
     backend: &mut Rt64Backend,
     rdram: &[u8],
@@ -244,95 +266,137 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             cycle: 100,
         },
         Phase {
-            label: "gamma",
-            status: STATUS_RGBA16_REPLICATE | STATUS_GAMMA,
+            label: "dither-only-a",
+            status: STATUS_RGBA16_REPLICATE | STATUS_GAMMA_DITHER,
             x_scale: one,
             y_scale: one,
             cycle: 101,
+        },
+        Phase {
+            label: "dither-only-a-repeat",
+            status: STATUS_RGBA16_REPLICATE | STATUS_GAMMA_DITHER,
+            x_scale: one,
+            y_scale: one,
+            cycle: 101,
+        },
+        Phase {
+            label: "dither-only-b",
+            status: STATUS_RGBA16_REPLICATE | STATUS_GAMMA_DITHER,
+            x_scale: one,
+            y_scale: one,
+            cycle: 102,
         },
         Phase {
             label: "baseline-b",
             status: STATUS_RGBA16_REPLICATE,
             x_scale: one,
             y_scale: one,
-            cycle: 102,
+            cycle: 103,
         },
         Phase {
-            label: "gamma-dither",
+            label: "gamma",
+            status: STATUS_RGBA16_REPLICATE | STATUS_GAMMA,
+            x_scale: one,
+            y_scale: one,
+            cycle: 104,
+        },
+        Phase {
+            label: "gamma-dither-a",
             status: STATUS_RGBA16_REPLICATE | STATUS_GAMMA | STATUS_GAMMA_DITHER,
             x_scale: one,
             y_scale: one,
-            cycle: 103,
+            cycle: 105,
+        },
+        Phase {
+            label: "gamma-dither-a-repeat",
+            status: STATUS_RGBA16_REPLICATE | STATUS_GAMMA | STATUS_GAMMA_DITHER,
+            x_scale: one,
+            y_scale: one,
+            cycle: 105,
+        },
+        Phase {
+            label: "gamma-dither-b",
+            status: STATUS_RGBA16_REPLICATE | STATUS_GAMMA | STATUS_GAMMA_DITHER,
+            x_scale: one,
+            y_scale: one,
+            cycle: 106,
+        },
+        Phase {
+            label: "gamma-restore",
+            status: STATUS_RGBA16_REPLICATE | STATUS_GAMMA,
+            x_scale: one,
+            y_scale: one,
+            cycle: 107,
         },
         Phase {
             label: "baseline-c",
             status: STATUS_RGBA16_REPLICATE,
             x_scale: one,
             y_scale: one,
-            cycle: 104,
+            cycle: 108,
         },
         Phase {
             label: "divot",
             status: STATUS_RGBA16_REPLICATE | STATUS_DIVOT,
             x_scale: one,
             y_scale: one,
-            cycle: 105,
+            cycle: 109,
         },
         Phase {
             label: "baseline-d",
             status: STATUS_RGBA16_REPLICATE,
             x_scale: one,
             y_scale: one,
-            cycle: 106,
+            cycle: 110,
         },
         Phase {
             label: "dither-filter",
             status: STATUS_RGBA16_REPLICATE | STATUS_DITHER_FILTER,
             x_scale: one,
             y_scale: one,
-            cycle: 107,
+            cycle: 111,
         },
         Phase {
             label: "baseline-e",
             status: STATUS_RGBA16_REPLICATE,
             x_scale: one,
             y_scale: one,
-            cycle: 108,
+            cycle: 112,
         },
         Phase {
             label: "resample-mode-3",
             status: STATUS_RGBA16_REPLICATE,
             x_scale: three_halves,
             y_scale: three_halves,
-            cycle: 109,
+            cycle: 113,
         },
         Phase {
             label: "resample-mode-2",
             status: STATUS_RGBA16_RESAMPLE,
             x_scale: three_halves,
             y_scale: three_halves,
-            cycle: 110,
+            cycle: 114,
         },
         Phase {
             label: "resample-mode-1",
             status: STATUS_RGBA16_AA_NEEDED,
             x_scale: three_halves,
             y_scale: three_halves,
-            cycle: 111,
+            cycle: 115,
         },
         Phase {
             label: "resample-mode-0",
             status: STATUS_RGBA16_AA_ALWAYS,
             x_scale: three_halves,
             y_scale: three_halves,
-            cycle: 112,
+            cycle: 116,
         },
         Phase {
             label: "baseline-f",
             status: STATUS_RGBA16_REPLICATE,
             x_scale: one,
             y_scale: one,
-            cycle: 113,
+            cycle: 117,
         },
     ];
 
@@ -356,6 +420,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .find(|observation| observation.label == label)
             .unwrap_or_else(|| panic!("missing native VI observation {label}"))
     };
+    for observation in &observations {
+        println!(
+            "vi_filter_phase label={} sha256={} nonblack={} unique={} workload_id={} present_id={}",
+            observation.label,
+            observation.sha256,
+            observation.nonblack_pixels,
+            observation.unique_colors,
+            observation.workload_id,
+            observation.present_id
+        );
+    }
     for label in [
         "baseline-a",
         "baseline-b",
@@ -377,7 +452,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    for label in ["gamma", "gamma-dither"] {
+    for label in ["gamma", "gamma-restore"] {
         let observation = by_label(label);
         if observation.sha256 != GAMMA_SHA256
             || observation.nonblack_pixels != 48
@@ -385,6 +460,25 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         {
             return Err(io::Error::other(format!(
                 "{label} drifted from the exact pinned gamma result: {observation:?}"
+            ))
+            .into());
+        }
+    }
+    for (label, expected) in [
+        ("dither-only-a", DITHER_ONLY_A_SHA256),
+        ("dither-only-a-repeat", DITHER_ONLY_A_SHA256),
+        ("dither-only-b", DITHER_ONLY_B_SHA256),
+        ("gamma-dither-a", GAMMA_DITHER_A_SHA256),
+        ("gamma-dither-a-repeat", GAMMA_DITHER_A_SHA256),
+        ("gamma-dither-b", GAMMA_DITHER_B_SHA256),
+    ] {
+        let observation = by_label(label);
+        if observation.sha256 != expected
+            || observation.nonblack_pixels != 48
+            || observation.unique_colors != 48
+        {
+            return Err(io::Error::other(format!(
+                "{label} drifted from its exact pinned gamma-dither result: {observation:?}"
             ))
             .into());
         }
@@ -407,14 +501,40 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     if by_label("baseline-a").bytes == by_label("gamma").bytes
+        || by_label("baseline-a").bytes == by_label("dither-only-a").bytes
+        || by_label("dither-only-a").bytes == by_label("dither-only-b").bytes
+        || by_label("gamma").bytes == by_label("gamma-dither-a").bytes
+        || by_label("gamma-dither-a").bytes == by_label("gamma-dither-b").bytes
         || by_label("baseline-a").bytes == by_label("resample-mode-3").bytes
     {
         return Err(io::Error::other(
-            "native gamma and nonidentity scale must each change exact post-VI pixels",
+            "native gamma, seeded gamma-dither, and nonidentity scale must each change exact post-VI pixels",
         )
         .into());
     }
-    if by_label("gamma").bytes != by_label("gamma-dither").bytes
+    if by_label("dither-only-a").bytes != by_label("dither-only-a-repeat").bytes
+        || by_label("gamma-dither-a").bytes != by_label("gamma-dither-a-repeat").bytes
+    {
+        return Err(io::Error::other(
+            "an identical gamma-dither seed did not reproduce exact native post-VI pixels",
+        )
+        .into());
+    }
+    for (source_label, dithered_label, noise_seed) in [
+        ("baseline-a", "dither-only-a", 101),
+        ("baseline-a", "dither-only-b", 102),
+        ("gamma", "gamma-dither-a", 105),
+        ("gamma", "gamma-dither-b", 106),
+    ] {
+        let expected = expected_gamma_dither(&by_label(source_label).bytes, noise_seed);
+        if by_label(dithered_label).bytes != expected {
+            return Err(io::Error::other(format!(
+                "{dithered_label} does not match the shared bounded-v1 quantizer over {source_label}"
+            ))
+            .into());
+        }
+    }
+    if by_label("gamma").bytes != by_label("gamma-restore").bytes
         || by_label("baseline-a").bytes != by_label("divot").bytes
         || by_label("baseline-a").bytes != by_label("dither-filter").bytes
         || by_label("resample-mode-3").bytes != by_label("resample-mode-2").bytes
@@ -422,28 +542,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         || by_label("resample-mode-3").bytes != by_label("resample-mode-0").bytes
     {
         return Err(io::Error::other(
-            "pinned RT64's explicit native VI residual changed; review gamma-dither/divot/restoration/AA-selector support",
+            "pinned RT64's explicit native VI residual changed; review divot/restoration/AA-selector support",
         )
         .into());
-    }
-
-    for observation in &observations {
-        println!(
-            "vi_filter_phase label={} sha256={} nonblack={} unique={} workload_id={} present_id={}",
-            observation.label,
-            observation.sha256,
-            observation.nonblack_pixels,
-            observation.unique_colors,
-            observation.workload_id,
-            observation.present_id
-        );
     }
 
     let release = backend.release_capture()?;
     if release.format != ReleaseCaptureFormat::PostViBgra8Unorm
         || release.width != OUTPUT_WIDTH
         || release.height != OUTPUT_HEIGHT
-        || release.guest_cycle != 113
+        || release.guest_cycle != 117
         || release.bytes != observations.last().unwrap().bytes
     {
         return Err(
@@ -451,10 +559,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         );
     }
     println!(
-        "vi_filter_pixel_evidence source={} baseline_sha256={} gamma_sha256={} scaled_sha256={} phases={} native_residual=gamma-dither,divot,dither-filter,aa-selector",
+        "vi_filter_pixel_evidence source={} baseline_sha256={} gamma_sha256={} dither_only_a_sha256={} dither_only_b_sha256={} gamma_dither_a_sha256={} gamma_dither_b_sha256={} scaled_sha256={} phases={} native_residual=divot,dither-filter,aa-selector",
         identity.source_id,
         BASELINE_SHA256,
         GAMMA_SHA256,
+        DITHER_ONLY_A_SHA256,
+        DITHER_ONLY_B_SHA256,
+        GAMMA_DITHER_A_SHA256,
+        GAMMA_DITHER_B_SHA256,
         SCALED_SHA256,
         observations.len()
     );

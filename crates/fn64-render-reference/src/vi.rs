@@ -7,7 +7,10 @@
 //! therefore explicit reproducibility policies, not silicon-identical claims.
 
 use crate::{gbi, raster::Framebuffer};
-use fn64_render::{RenderError, ViPixelType, ViPresentation, ViResampleControl, ViScaleAxis};
+use fn64_render::{
+    vi_public_filters::{gamma_dither_quantize_bounded_v1, reference_noise_bit_v1},
+    RenderError, ViPixelType, ViPresentation, ViResampleControl, ViScaleAxis,
+};
 
 pub(crate) fn scanout(
     source: &Framebuffer,
@@ -547,12 +550,6 @@ fn apply_gamma(output: &mut Framebuffer) {
 /// value back into the reference framebuffer's eight-bit storage. The random
 /// bit is a separate input so the documented quantization step can be tested
 /// independently of fn64's noise and output-representation policies.
-fn gamma_dither_quantize(channel: u8, random_bit: u8) -> u8 {
-    debug_assert!(random_bit <= 1);
-    let quantized = channel.saturating_add(random_bit) >> 1;
-    (quantized << 1) | (quantized >> 6)
-}
-
 /// Public documentation specifies fresh random low-bit noise before final
 /// seven-bit quantization, but not its generator or seed. This coordinate and
 /// channel hash is an explicit deterministic emulation policy keyed by the
@@ -560,14 +557,10 @@ fn gamma_dither_quantize(channel: u8, random_bit: u8) -> u8 {
 fn apply_gamma_dither(output: &mut Framebuffer, seed: u64) {
     for (pixel_index, pixel) in output.pixels.chunks_exact_mut(4).enumerate() {
         for (channel_index, channel) in pixel[..3].iter_mut().enumerate() {
-            let key = seed
-                ^ (pixel_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                ^ (channel_index as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            let mut mixed = key.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            let random_bit = (mixed ^ (mixed >> 31)) as u8 & 1;
-            *channel = gamma_dither_quantize(*channel, random_bit);
+            *channel = gamma_dither_quantize_bounded_v1(
+                *channel,
+                reference_noise_bit_v1(seed, pixel_index as u64, channel_index as u8),
+            );
         }
     }
 }
@@ -1303,14 +1296,16 @@ mod tests {
 
     #[test]
     fn gamma_dither_quantizer_and_host_expansion_vectors() {
-        assert_eq!(gamma_dither_quantize(0, 0), 0);
-        assert_eq!(gamma_dither_quantize(0, 1), 0);
-        assert_eq!(gamma_dither_quantize(100, 0), 100);
-        assert_eq!(gamma_dither_quantize(100, 1), 100);
-        assert_eq!(gamma_dither_quantize(101, 0), 100);
-        assert_eq!(gamma_dither_quantize(101, 1), 102);
-        assert_eq!(gamma_dither_quantize(128, 0), 129);
-        assert_eq!(gamma_dither_quantize(255, 1), 255);
+        let zero = fn64_render::vi_public_filters::ViRandomBit::new(0).unwrap();
+        let one = fn64_render::vi_public_filters::ViRandomBit::new(1).unwrap();
+        assert_eq!(gamma_dither_quantize_bounded_v1(0, zero), 0);
+        assert_eq!(gamma_dither_quantize_bounded_v1(0, one), 0);
+        assert_eq!(gamma_dither_quantize_bounded_v1(100, zero), 100);
+        assert_eq!(gamma_dither_quantize_bounded_v1(100, one), 100);
+        assert_eq!(gamma_dither_quantize_bounded_v1(101, zero), 100);
+        assert_eq!(gamma_dither_quantize_bounded_v1(101, one), 102);
+        assert_eq!(gamma_dither_quantize_bounded_v1(128, zero), 129);
+        assert_eq!(gamma_dither_quantize_bounded_v1(255, one), 255);
     }
 
     #[test]

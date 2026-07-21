@@ -21,6 +21,198 @@ set(PLUME_BUILD_EXAMPLES OFF CACHE BOOL "Do not build plume examples" FORCE)
 # mupen64plus subtree is therefore neither compiled nor linked.
 add_subdirectory("${FN64_RT64_SOURCE_DIR}" rt64-build EXCLUDE_FROM_ALL)
 
+# Compile fn64's bounded post-gamma VI shader as a source-identity overlay.
+# RT64's shader helper functions are defined in the child directory; import
+# their directory-local compiler variables into this caller before invoking
+# them against the fn64-owned source staged beside this file.
+foreach(FN64_SHADER_VARIABLE
+        DXC DXC_DXIL_OPTS DXC_SPV_OPTS DXC_PS_OPTS SPIRVCROSS)
+    get_directory_property(
+        FN64_IMPORTED_${FN64_SHADER_VARIABLE}
+        DIRECTORY "${FN64_RT64_SOURCE_DIR}"
+        DEFINITION ${FN64_SHADER_VARIABLE})
+    set(${FN64_SHADER_VARIABLE} "${FN64_IMPORTED_${FN64_SHADER_VARIABLE}}")
+endforeach()
+target_include_directories(rt64 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+build_shader(
+    rt64
+    "fn64_rt64_video_interface_ps.hlsl"
+    "${DXC_PS_OPTS}"
+    "src/shaders/Fn64VideoInterfacePSRegular.hlsl"
+    "-I${CMAKE_CURRENT_SOURCE_DIR}")
+build_shader(
+    rt64
+    "fn64_rt64_video_interface_ps.hlsl"
+    "${DXC_PS_OPTS}"
+    "src/shaders/Fn64VideoInterfacePSPixel.hlsl"
+    "-D" "PIXEL_ANTIALIASING"
+    "-I${CMAKE_CURRENT_SOURCE_DIR}")
+set(FN64_RT64_VI_SHADER_OUTPUTS
+    "${CMAKE_BINARY_DIR}/src/shaders/Fn64VideoInterfacePSRegular.hlsl.spirv.c"
+    "${CMAKE_BINARY_DIR}/src/shaders/Fn64VideoInterfacePSPixel.hlsl.spirv.c")
+if(APPLE)
+    list(APPEND FN64_RT64_VI_SHADER_OUTPUTS
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64VideoInterfacePSRegular.hlsl.metal.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64VideoInterfacePSPixel.hlsl.metal.c")
+elseif(WIN32)
+    list(APPEND FN64_RT64_VI_SHADER_OUTPUTS
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64VideoInterfacePSRegular.hlsl.dxil.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64VideoInterfacePSPixel.hlsl.dxil.c")
+endif()
+# CMake custom-command visibility is directory-scoped while `rt64` belongs to
+# the child directory. This explicit parent target publishes the generated
+# shader objects before the child target compiles their C arrays.
+add_custom_target(fn64_rt64_vi_shaders DEPENDS ${FN64_RT64_VI_SHADER_OUTPUTS})
+add_dependencies(rt64 fn64_rt64_vi_shaders)
+
+set(FN64_RT64_ORIGINAL_VI_SHADER_OBJECTS
+    "${CMAKE_BINARY_DIR}/src/shaders/VideoInterfacePSRegular.hlsl.spirv.c"
+    "${CMAKE_BINARY_DIR}/src/shaders/VideoInterfacePSPixel.hlsl.spirv.c")
+if(APPLE)
+    list(APPEND FN64_RT64_ORIGINAL_VI_SHADER_OBJECTS
+        "${CMAKE_BINARY_DIR}/src/shaders/VideoInterfacePSRegular.hlsl.metal.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/VideoInterfacePSPixel.hlsl.metal.c")
+elseif(WIN32)
+    list(APPEND FN64_RT64_ORIGINAL_VI_SHADER_OBJECTS
+        "${CMAKE_BINARY_DIR}/src/shaders/VideoInterfacePSRegular.hlsl.dxil.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/VideoInterfacePSPixel.hlsl.dxil.c")
+endif()
+set_source_files_properties(
+    ${FN64_RT64_ORIGINAL_VI_SHADER_OBJECTS}
+    TARGET_DIRECTORY rt64
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+
+# Bind the replacement shader blobs and expanded push constants to the exact
+# reviewed pinned MIT sources. A pin update must review this overlay rather
+# than silently retaining old shader/library assumptions.
+set(FN64_RT64_SHADER_LIBRARY_SOURCE
+    "${FN64_RT64_SOURCE_DIR}/src/render/rt64_shader_library.cpp")
+file(SHA256 "${FN64_RT64_SHADER_LIBRARY_SOURCE}" FN64_RT64_SHADER_LIBRARY_SHA256)
+if(NOT FN64_RT64_SHADER_LIBRARY_SHA256 STREQUAL
+   "72421375b232d5449f2f90f153c8452420084f43809c3234bc9727eddfde6ffd")
+    message(FATAL_ERROR
+        "RT64 shader library changed; review the fn64 VI filter overlay")
+endif()
+file(READ "${FN64_RT64_SHADER_LIBRARY_SOURCE}" FN64_RT64_SHADER_LIBRARY_PATCHED)
+string(REPLACE
+    "VideoInterfacePSRegular"
+    "Fn64VideoInterfacePSRegular"
+    FN64_RT64_SHADER_LIBRARY_PATCHED
+    "${FN64_RT64_SHADER_LIBRARY_PATCHED}")
+string(REPLACE
+    "VideoInterfacePSPixel"
+    "Fn64VideoInterfacePSPixel"
+    FN64_RT64_SHADER_LIBRARY_PATCHED
+    "${FN64_RT64_SHADER_LIBRARY_PATCHED}")
+string(REPLACE
+    "#include \"shared/rt64_video_interface.h\""
+    "#include \"fn64_rt64_video_interface.h\""
+    FN64_RT64_SHADER_LIBRARY_PATCHED
+    "${FN64_RT64_SHADER_LIBRARY_PATCHED}")
+set(FN64_RT64_SHADER_LIBRARY_PATCHED_SOURCE
+    "${CMAKE_CURRENT_BINARY_DIR}/fn64_rt64_shader_library.cpp")
+file(WRITE
+    "${FN64_RT64_SHADER_LIBRARY_PATCHED_SOURCE}"
+    "${FN64_RT64_SHADER_LIBRARY_PATCHED}")
+set_source_files_properties(
+    "${FN64_RT64_SHADER_LIBRARY_SOURCE}"
+    TARGET_DIRECTORY rt64
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+target_sources(rt64 PRIVATE "${FN64_RT64_SHADER_LIBRARY_PATCHED_SOURCE}")
+
+set(FN64_RT64_VI_RENDERER_SOURCE
+    "${FN64_RT64_SOURCE_DIR}/src/render/rt64_vi_renderer.cpp")
+file(SHA256 "${FN64_RT64_VI_RENDERER_SOURCE}" FN64_RT64_VI_RENDERER_SHA256)
+if(NOT FN64_RT64_VI_RENDERER_SHA256 STREQUAL
+   "0159b441fd4872ef30a49d7603f4570d8858084004c20dd6646f51039241fa7b")
+    message(FATAL_ERROR
+        "RT64 VI renderer changed; review the fn64 VI filter overlay")
+endif()
+file(READ "${FN64_RT64_VI_RENDERER_SOURCE}" FN64_RT64_VI_RENDERER_PATCHED)
+string(REPLACE
+    "#include \"shared/rt64_video_interface.h\""
+    "#include \"fn64_rt64_video_interface.h\"\n\nextern \"C\" void fn64_rt64_vi_filter_constants(void *, interop::VideoInterfaceCB *);"
+    FN64_RT64_VI_RENDERER_PATCHED
+    "${FN64_RT64_VI_RENDERER_PATCHED}")
+set(FN64_RT64_VI_CONSTANTS_ORIGINAL [=[        interop::VideoInterfaceCB pushConstants;
+        pushConstants.videoResolution = computeHDSize(hlslpp::float2(p.vi->fbSize()), p.resolutionScale, p.downsamplingScale);
+        pushConstants.textureResolution = { float(p.textureWidth), float(p.textureHeight) };
+        pushConstants.gamma = p.vi->gamma();]=])
+set(FN64_RT64_VI_CONSTANTS_PATCHED [=[        interop::VideoInterfaceCB pushConstants{};
+        pushConstants.videoResolution = computeHDSize(hlslpp::float2(p.vi->fbSize()), p.resolutionScale, p.downsamplingScale);
+        pushConstants.textureResolution = { float(p.textureWidth), float(p.textureHeight) };
+        pushConstants.gamma = p.vi->gamma();
+        pushConstants.outputOriginX = uint32_t(std::max(0L, lround(viewport.x)));
+        pushConstants.outputOriginY = uint32_t(std::max(0L, lround(viewport.y)));
+        pushConstants.outputWidth = uint32_t(std::max(1L, lround(viewport.width)));
+        fn64_rt64_vi_filter_constants(p.device, &pushConstants);]=])
+string(FIND
+    "${FN64_RT64_VI_RENDERER_PATCHED}"
+    "${FN64_RT64_VI_CONSTANTS_ORIGINAL}"
+    FN64_RT64_VI_CONSTANTS_OFFSET)
+if(FN64_RT64_VI_CONSTANTS_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 VI push-constant context changed; review the fn64 VI filter overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_VI_CONSTANTS_ORIGINAL}"
+    "${FN64_RT64_VI_CONSTANTS_PATCHED}"
+    FN64_RT64_VI_RENDERER_PATCHED
+    "${FN64_RT64_VI_RENDERER_PATCHED}")
+set(FN64_RT64_VI_RENDERER_PATCHED_SOURCE
+    "${CMAKE_CURRENT_BINARY_DIR}/fn64_rt64_vi_renderer.cpp")
+file(WRITE
+    "${FN64_RT64_VI_RENDERER_PATCHED_SOURCE}"
+    "${FN64_RT64_VI_RENDERER_PATCHED}")
+set_source_files_properties(
+    "${FN64_RT64_VI_RENDERER_SOURCE}"
+    TARGET_DIRECTORY rt64
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+target_sources(rt64 PRIVATE "${FN64_RT64_VI_RENDERER_PATCHED_SOURCE}")
+
+# Every fn64 VI event must enqueue one normal RT64 present even when the raw
+# register image and source bytes repeat. This preserves retrace-seeded filter
+# cadence without mislabeling the event as PresentEarly or changing VIHistory.
+set(FN64_RT64_STATE_SOURCE
+    "${FN64_RT64_SOURCE_DIR}/src/hle/rt64_state.cpp")
+file(SHA256 "${FN64_RT64_STATE_SOURCE}" FN64_RT64_STATE_SHA256)
+if(NOT FN64_RT64_STATE_SHA256 STREQUAL
+   "07d3a7c1e2fa455aedff045d0ec19d52cea9616e1e4d41e99dad833b61a4cda2")
+    message(FATAL_ERROR
+        "RT64 State changed; review the fn64 VI retrace overlay")
+endif()
+file(READ "${FN64_RT64_STATE_SOURCE}" FN64_RT64_STATE_PATCHED)
+string(REPLACE
+    "#include \"rt64_interpreter.h\""
+    "#include \"rt64_interpreter.h\"\n\nextern \"C\" uint32_t fn64_rt64_vi_retrace_event(void *, uint32_t);"
+    FN64_RT64_STATE_PATCHED
+    "${FN64_RT64_STATE_PATCHED}")
+set(FN64_RT64_STATE_CONDITION_ORIGINAL
+    "        if (fromEarlyPresent || viDifferent || fbChangesMade || screenChangesMade) {")
+set(FN64_RT64_STATE_CONDITION_PATCHED
+    "        const bool fn64RetraceEvent = fn64_rt64_vi_retrace_event(ext.device, fromEarlyPresent ? 1U : 0U) != 0U;\n        if (fromEarlyPresent || viDifferent || fbChangesMade || screenChangesMade || fn64RetraceEvent) {")
+string(FIND
+    "${FN64_RT64_STATE_PATCHED}"
+    "${FN64_RT64_STATE_CONDITION_ORIGINAL}"
+    FN64_RT64_STATE_CONDITION_OFFSET)
+if(FN64_RT64_STATE_CONDITION_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 screen-update condition changed; review the fn64 VI retrace overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_STATE_CONDITION_ORIGINAL}"
+    "${FN64_RT64_STATE_CONDITION_PATCHED}"
+    FN64_RT64_STATE_PATCHED
+    "${FN64_RT64_STATE_PATCHED}")
+set(FN64_RT64_STATE_PATCHED_SOURCE
+    "${CMAKE_CURRENT_BINARY_DIR}/fn64_rt64_state.cpp")
+file(WRITE "${FN64_RT64_STATE_PATCHED_SOURCE}" "${FN64_RT64_STATE_PATCHED}")
+set_source_files_properties(
+    "${FN64_RT64_STATE_SOURCE}"
+    TARGET_DIRECTORY rt64
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+target_sources(rt64 PRIVATE "${FN64_RT64_STATE_PATCHED_SOURCE}")
+
 # Pinned RT64 normally reuses the previously selected GBI whenever a
 # G_LOAD_UCODE keeps the same text/data addresses. That address cache cannot
 # distinguish same-address content generations. Route every load through the

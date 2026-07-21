@@ -659,11 +659,13 @@ and deterministic output traces.
   dither-filter status through its C boundary. The Rust lane implements the
   public square-root gamma transfer, partial-coverage horizontal-median divot,
   RGBA16 3x3-neighbor dither restoration, and retrace-seeded stochastic
-  seven-bit gamma dither. `VI-FILTERS.md` separates those deterministic digital
-  mechanisms from the bounded partial-coverage fallback: exact coverage
-  AA/resampling, the silicon gamma ROM and random stream, and post-DAC analog
-  video remain open. The feature build proves the RT64 boundary, while GPU
-  screenshot validation remains open. The typed
+  seven-bit gamma dither. The same named bounded-v1 noise/quantization policy
+  now crosses the native RT64 VI shader: a twenty-phase Metal gate proves
+  dither-only and gamma-plus-dither are seed-causal, exact-repeatable, and
+  restorable across distinct ordinary presents. `VI-FILTERS.md` separates those
+  deterministic digital mechanisms from the bounded partial-coverage fallback:
+  native divot/restoration/AA, exact coverage AA/resampling, the silicon gamma
+  ROM and random stream, and post-DAC analog video remain open. The typed
   IPL standard now selects the shared VI/AI clock; nominal
   60/50 Hz boot timing gives way to H_SYNC/V_SYNC-derived field deadlines once
   a mode latches, and host loops consume the live interval. Hardware-trace

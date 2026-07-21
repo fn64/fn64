@@ -36,6 +36,7 @@ mod geometry_task_inspection;
 mod microcode;
 mod rdp_completion;
 mod settings;
+pub mod vi_public_filters;
 mod vi_source;
 
 use std::{fmt, num::NonZeroU64};

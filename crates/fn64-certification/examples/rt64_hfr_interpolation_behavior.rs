@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 
 const PINNED_SOURCE: &str = "git:f0728a2520d5aa735886240de3fee75cc805f6d6";
 const PINNED_OVERLAY: &str =
-    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+hfr-post-present-call:v1";
+    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-retrace-cadence:v1+hfr-post-present-call:v1";
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
 const SEGMENT: u8 = 6;
 const SEGMENT_BASE: usize = 0x0000_1000;
