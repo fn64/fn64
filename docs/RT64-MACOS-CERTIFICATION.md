@@ -28,7 +28,7 @@ Recorded host: macOS 26.5 build 25F71; Darwin 25.5.0 arm64; Apple M5 Pro.
 | `latency-present-early` | latency | [​`rt64_latency_present_early_behavior`](../crates/fn64-render-rt64/examples/rt64_latency_present_early_behavior.rs) | 20 | 20 clean (2026-07-19) | `latency-present-early` |
 | `deferred-debugger` | inspection | [​`rt64_deferred_debugger_behavior`](../crates/fn64-render-rt64/examples/rt64_deferred_debugger_behavior.rs) | 20 | 20 clean (2026-07-19) | `deferred-frame-history`, `debugger-frame-inspection` |
 | `ubershader-critical-path` | pipelines | [​`rt64_ubershader_pipeline_behavior`](../crates/fn64-render-rt64/examples/rt64_ubershader_pipeline_behavior.rs) | 20 | 20 clean (2026-07-19) | `ubershader-no-pipeline-stutter` |
-| `hfr-hle-cooperation` | generated-frames | [​`rt64_hfr_interpolation_behavior`](../crates/fn64-render-rt64/examples/rt64_hfr_interpolation_behavior.rs) | 20 | 20 clean (2026-07-20) | `hfr-60-plus-interpolation` |
+| `hfr-hle-cooperation` | generated-frames | [​`rt64_hfr_interpolation_behavior`](../crates/fn64-render-rt64/examples/rt64_hfr_interpolation_behavior.rs) | 20 | 20 clean (2026-07-21) | `hfr-60-plus-interpolation` |
 | `extended-gbi-cooperation` | extended-gbi | [​`rt64_extended_gbi_enhancement_behavior`](../crates/fn64-render-rt64/examples/rt64_extended_gbi_enhancement_behavior.rs) | 10 | 10 clean (2026-07-20) | `extended-gbi` |
 
 A manifest result is record evidence only when its run count meets the case's
@@ -61,4 +61,6 @@ diagnostic-only. `--run all` executes every case at its own repeat bar unless
 `--runs` supplies a common diagnostic or repeat count. Execution requires
 Darwin and an exact, clean pinned RT64 source tree selected by `FN64_RT64_DIR`
 or the default sibling checkout. Every live case invocation fails if it exceeds
-the shared 60-second per-process watchdog.
+the shared 60-second per-process watchdog. Fresh
+processes are spaced by 5 seconds so WindowServer
+can reclaim each hidden Metal surface before the next case invocation.

@@ -492,7 +492,8 @@ def validate_rt64_tree(path: Path, commit: str) -> None:
     except (OSError, subprocess.CalledProcessError) as error:
         raise CertificationError(f"cannot inspect RT64 source tree: {error}") from error
     require(head == commit, f"RT64 HEAD {head!r} does not match pinned {commit!r}")
-    require(not dirty, f"RT64 source tree is dirty: {dirty.splitlines()[0]!r}")
+    dirty_summary = dirty.splitlines()[0] if dirty else "<clean>"
+    require(not dirty, f"RT64 source tree is dirty: {dirty_summary!r}")
 
 
 def write_result(path: Path, result: dict) -> None:

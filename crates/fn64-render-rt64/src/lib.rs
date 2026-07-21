@@ -2886,6 +2886,22 @@ pub struct Rt64ExtendedPresentedPixels {
     pub bytes: Vec<u8>,
 }
 
+/// One completed workload whose source refresh rate was inferred from the
+/// context's registered TV standard.
+///
+/// The evidence-only synthetic transport substitutes only F3DEX2 identity.
+/// It emits no Extended GBI refresh-rate command, so pinned RT64's normal
+/// FullSync fallback must derive `workload_original_refresh_rate` from the
+/// exact `VIHistory` owned by this production context.
+#[cfg(feature = "region-rate-evidence")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Rt64RegionRateEvidence {
+    pub workload_id: u64,
+    pub configured_nominal_refresh_rate: u32,
+    pub registered_nominal_refresh_rate: u32,
+    pub workload_original_refresh_rate: u32,
+}
+
 /// One ordered post-VI image from a synthetic HFR evidence burst.
 #[cfg(feature = "hfr-evidence")]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3908,6 +3924,42 @@ impl Rt64Backend {
         }
     }
 
+    /// Process a hand-authored F3DEX2 display list without an Extended GBI
+    /// refresh override and return the completed workload's inferred rate.
+    ///
+    /// This non-default evidence seam does not alter production microcode
+    /// admission. Callers must drive ordinary VI events between submissions
+    /// so RT64 can accumulate the stable-factor history used by FullSync.
+    #[cfg(feature = "region-rate-evidence")]
+    pub fn process_synthetic_region_rate_f3dex2(
+        &mut self,
+        rdram: &mut [u8],
+        display_list: u32,
+        output_addr: u32,
+    ) -> Result<Rt64RegionRateEvidence, RenderError> {
+        #[cfg(feature = "rt64")]
+        {
+            self.context
+                .as_mut()
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
+                .process_synthetic_region_rate_f3dex2(rdram, display_list, output_addr)
+                .map_err(|reason| RenderError::Backend {
+                    backend: "rt64-synthetic-region-rate-f3dex2",
+                    reason,
+                })
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        {
+            let _ = (rdram, display_list, output_addr);
+            Err(RenderError::Backend {
+                backend: "rt64-synthetic-region-rate-f3dex2",
+                reason: "fn64-render-rt64 was built without the opt-in `rt64` Cargo feature"
+                    .to_string(),
+            })
+        }
+    }
+
     /// Process a non-ROM, hand-authored public S2DEX2 display list.
     ///
     /// This non-default evidence seam substitutes only the fixture's GBI
@@ -4574,6 +4626,7 @@ impl RenderBackend for Rt64Backend {
             let mut context = ffi::Context::create(
                 cfg.width,
                 cfg.height,
+                cfg.tv_type.nominal_field_hz(),
                 &self.configured_settings,
                 &self.configured_enhancement_settings,
                 &self.configured_emulator_settings,
@@ -5199,7 +5252,7 @@ mod tests {
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
         backend
-            .create(&RenderConfig::new(u32::from(width), u32::from(height)))
+            .create(&RenderConfig::ntsc(u32::from(width), u32::from(height)))
             .unwrap();
         backend
             .process_task(
@@ -5494,7 +5547,7 @@ mod tests {
             backend.task_chunking(),
             fn64_render::RenderTaskChunking::Atomic
         );
-        let err = backend.create(&RenderConfig::new(320, 240)).unwrap_err();
+        let err = backend.create(&RenderConfig::ntsc(320, 240)).unwrap_err();
         match err {
             RenderError::Backend { backend, .. } => assert_eq!(backend, "rt64"),
             other => panic!("expected Backend stub error, got {other:?}"),
@@ -5605,7 +5658,7 @@ mod tests {
             backend.task_chunking(),
             fn64_render::RenderTaskChunking::Resumable
         );
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
         present_resident(&mut backend, ViPresentation::default()).unwrap();
         assert!(!backend
             .framebuffer()
@@ -5645,7 +5698,7 @@ mod tests {
             let mut backend = ReferenceBackend::new()
                 .with_f3dex2()
                 .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-            backend.create(&RenderConfig::new(4, 2)).unwrap();
+            backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
             backend
         };
 
@@ -5777,7 +5830,7 @@ mod tests {
     #[test]
     fn reference_backend_noise_seed_is_selectable_and_survives_resize() {
         let mut backend = ReferenceBackend::new().with_noise_seed(7);
-        backend.create(&RenderConfig::new(4, 4)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 4)).unwrap();
         assert_eq!(backend.fb.as_ref().unwrap().noise_position(), (7, 0));
 
         let vertex = |x, y| gbi::Vertex {
@@ -5804,7 +5857,7 @@ mod tests {
     #[test]
     fn reference_backend_blanks_scanout_without_destroying_the_rdp_image() {
         let mut backend = ReferenceBackend::new();
-        backend.create(&RenderConfig::new(2, 1)).unwrap();
+        backend.create(&RenderConfig::ntsc(2, 1)).unwrap();
         backend.fb.as_mut().unwrap().pixels[0..4].copy_from_slice(&[9, 8, 7, 255]);
 
         present_resident(&mut backend, ViPresentation::default()).unwrap();
@@ -5842,7 +5895,7 @@ mod tests {
     #[test]
     fn reference_backend_executes_public_fade_and_repeat_line_scanout() {
         let mut backend = ReferenceBackend::new();
-        backend.create(&RenderConfig::new(2, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(2, 2)).unwrap();
         backend.fb.as_mut().unwrap().pixels.copy_from_slice(&[
             10, 20, 30, 255, 40, 50, 60, 255, 110, 120, 130, 255, 140, 150, 160, 255,
         ]);
@@ -5882,7 +5935,7 @@ mod tests {
             ..Default::default()
         };
         let mut backend = ReferenceBackend::new();
-        backend.create(&RenderConfig::new(3, 3)).unwrap();
+        backend.create(&RenderConfig::ntsc(3, 3)).unwrap();
         let fb = backend.fb.as_mut().unwrap();
         for pixel in fb.pixels.chunks_exact_mut(4) {
             pixel.copy_from_slice(&[88, 88, 88, 255]);
@@ -5943,7 +5996,7 @@ mod tests {
     #[test]
     fn reference_backend_gamma_dither_is_seeded_and_frame_varying() {
         let mut backend = ReferenceBackend::new();
-        backend.create(&RenderConfig::new(1, 1)).unwrap();
+        backend.create(&RenderConfig::ntsc(1, 1)).unwrap();
         backend.fb.as_mut().unwrap().pixels[0..4].copy_from_slice(&[101, 101, 101, 255]);
         let presentation = |noise_seed| ViPresentation {
             scanout: fn64_render::ViScanoutState::BackendOnly(fn64_render::ViFilterControl {
@@ -5998,7 +6051,7 @@ mod tests {
         );
 
         let mut backend = ReferenceBackend::new();
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         backend.fb.as_mut().unwrap().clear(9, 8, 7, 255);
         let vi = live_presentation(0x302, ORIGIN, 0xf000_0004, 2, 2);
         present_physical(&mut backend, &rdram, vi).unwrap();
@@ -6035,7 +6088,7 @@ mod tests {
             .write_logical_bytes(fn64_runtime::RdramAddr::from_offset(ORIGIN), &logical);
 
         let mut backend = ReferenceBackend::new();
-        backend.create(&RenderConfig::new(3, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(3, 2)).unwrap();
         present_physical(
             &mut backend,
             &rdram,
@@ -6063,7 +6116,7 @@ mod tests {
         }
 
         let mut backend = ReferenceBackend::new();
-        backend.create(&RenderConfig::new(2, 1)).unwrap();
+        backend.create(&RenderConfig::ntsc(2, 1)).unwrap();
         let odd = live_presentation(0x342, 0x280, 2, 2, 1);
         let mut odd_words = odd.scanout.registers().unwrap().words();
         odd_words[4] = 1;
@@ -6094,7 +6147,7 @@ mod tests {
     fn reference_vi_bounds_fail_transactionally_and_exact_edge_succeeds() {
         let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
         let mut backend = ReferenceBackend::new();
-        backend.create(&RenderConfig::new(2, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(2, 2)).unwrap();
         present_resident(&mut backend, ViPresentation::default()).unwrap();
         let before = backend.presented_framebuffer().unwrap().clone();
 
@@ -6135,7 +6188,7 @@ mod tests {
     fn reference_vi_blank_and_inactive_paths_do_not_fetch_live_source() {
         let rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
         let mut backend = ReferenceBackend::new();
-        backend.create(&RenderConfig::new(2, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(2, 2)).unwrap();
 
         let mut inactive_words = [0u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
         inactive_words[0] = 0x302;
@@ -6201,7 +6254,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0x11; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
         let mut rdram = vec![0u8; 0x4000];
         fn64_runtime::RdramViewMut::from_storage(&mut rdram).write_logical_bytes(
             fn64_runtime::RdramAddr::from_offset(TEXT as u32),
@@ -6264,7 +6317,7 @@ mod tests {
         let text = [0x4c; fn64_runtime::RSP_MEMORY_BANK_SIZE];
         let mut backend =
             ReferenceBackend::new().with_geometry_ucode_text(GeometryWireFamily::L3dex, &text);
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
         assert_eq!(backend.supported_ucodes(), &[UcodeId::L3dex]);
 
         let mut rdram = vec![0u8; 0x2000];
@@ -6366,7 +6419,7 @@ mod tests {
     fn reference_backend_requires_exact_task_entry_admission() {
         const DL: usize = 0x100;
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
         let mut rdram = vec![0u8; 0x200];
         rdram[DL..DL + 4].copy_from_slice(&0xdf00_0000u32.to_ne_bytes());
         let mut rsp_memory = fn64_runtime::RspMemory::new();
@@ -6426,7 +6479,7 @@ mod tests {
             rdram[offset + 4..offset + 8].copy_from_slice(&w1.to_ne_bytes());
         }
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         backend.fb.as_mut().unwrap().depth.fill(1.0);
 
         backend
@@ -6482,7 +6535,7 @@ mod tests {
             rdram[offset + 4..offset + 8].copy_from_slice(&word1.to_ne_bytes());
         }
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
 
         backend
             .process_rdp_commands(
@@ -6547,7 +6600,7 @@ mod tests {
         }
         let end = offset;
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
 
         backend
             .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
@@ -6633,7 +6686,7 @@ mod tests {
         }
         let end = offset;
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
 
         backend
             .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
@@ -6704,7 +6757,7 @@ mod tests {
         let end = offset;
 
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
         backend
             .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
             .unwrap();
@@ -6775,7 +6828,7 @@ mod tests {
         let end = offset;
 
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
         backend
             .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
             .unwrap();
@@ -6862,7 +6915,7 @@ mod tests {
         let end = offset;
 
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
         backend
             .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
             .unwrap();
@@ -6919,7 +6972,7 @@ mod tests {
         }
         let end = offset;
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
 
         backend
             .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
@@ -7022,7 +7075,7 @@ mod tests {
         }
         let end = offset;
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
 
         backend
             .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
@@ -7108,7 +7161,7 @@ mod tests {
         }
         let end = offset;
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
         backend
             .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
             .unwrap();
@@ -7194,7 +7247,7 @@ mod tests {
         }
         let end = offset;
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(2, 1)).unwrap();
+        backend.create(&RenderConfig::ntsc(2, 1)).unwrap();
 
         backend
             .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
@@ -7277,7 +7330,7 @@ mod tests {
         }
         let end = offset;
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(2, 1)).unwrap();
+        backend.create(&RenderConfig::ntsc(2, 1)).unwrap();
 
         backend
             .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
@@ -7896,7 +7949,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         backend
             .process_task(
                 &mut rdram,
@@ -7970,7 +8023,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(1, 1)).unwrap();
+        backend.create(&RenderConfig::ntsc(1, 1)).unwrap();
 
         // Task one only programs device registers; it emits no pixels.
         write_command(&mut rdram, DL, 0xef00_0000 | (3 << 20), 0);
@@ -8028,7 +8081,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(1, 1)).unwrap();
+        backend.create(&RenderConfig::ntsc(1, 1)).unwrap();
 
         // A bounded raw DPC submission programs the device without drawing.
         write_command(&mut rdram, RAW, 0xef00_0000 | (3 << 20), 0);
@@ -8081,7 +8134,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         backend
             .process_task(
                 &mut rdram,
@@ -8130,7 +8183,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(2, 1)).unwrap();
+        backend.create(&RenderConfig::ntsc(2, 1)).unwrap();
         backend
             .process_task(
                 &mut rdram,
@@ -8180,7 +8233,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         backend
             .process_task(
                 &mut rdram,
@@ -8326,7 +8379,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         let error = backend
             .process_task(
                 &mut rdram,
@@ -8350,7 +8403,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
         let mut rdram = vec![0u8; 0x2000];
         let write_command = |rdram: &mut [u8], offset: usize, w0: u32, w1: u32| {
             rdram[offset..offset + 4].copy_from_slice(&w0.to_ne_bytes());
@@ -8405,7 +8458,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         backend
             .process_task(
                 &mut rdram,
@@ -8462,7 +8515,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(4, 1)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 1)).unwrap();
         backend
             .process_task(
                 &mut rdram,
@@ -8514,7 +8567,7 @@ mod tests {
                 .with_noise_seed(0x1234)
                 .with_f3dex2()
                 .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-            backend.create(&RenderConfig::new(8, 1)).unwrap();
+            backend.create(&RenderConfig::ntsc(8, 1)).unwrap();
             backend
                 .process_task(
                     &mut rdram,
@@ -8601,7 +8654,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         backend
             .process_task(
                 &mut rdram,
@@ -8896,7 +8949,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(2, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(2, 2)).unwrap();
         backend
             .process_task(
                 &mut rdram,
@@ -9005,7 +9058,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_f3dex2()
             .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         backend
             .process_task(
                 &mut rdram,
@@ -9228,7 +9281,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_s2dex()
             .with_s2dex_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         backend
             .process_rdp_commands(
                 &mut rdram,
@@ -9279,7 +9332,7 @@ mod tests {
             write_command(&mut direct_rdram, DIRECT + index * 8, w0, w1);
         }
         let mut direct = ReferenceBackend::new();
-        direct.create(&RenderConfig::new(4, 2)).unwrap();
+        direct.create(&RenderConfig::ntsc(4, 2)).unwrap();
         direct
             .process_rdp_commands(
                 &mut direct_rdram,
@@ -9330,7 +9383,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_s2dex()
             .with_s2dex_ucode_text_for(S2dexWireFamily::S2dex, &text);
-        backend.create(&RenderConfig::new(1, 1)).unwrap();
+        backend.create(&RenderConfig::ntsc(1, 1)).unwrap();
         assert_eq!(
             backend
                 .process_task(
@@ -9359,7 +9412,7 @@ mod tests {
         let mut backend = ReferenceBackend::new()
             .with_s2dex()
             .with_s2dex_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
-        backend.create(&RenderConfig::new(2, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(2, 2)).unwrap();
         let error = backend
             .process_task(
                 &mut rdram,
@@ -9405,7 +9458,7 @@ mod tests {
         let expected =
             gbi::UcodeDigest::from_text(rsp.bank(fn64_runtime::RspMemoryBank::Imem)).as_bytes();
         let mut backend = ReferenceBackend::new().with_s2dex();
-        backend.create(&RenderConfig::new(2, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(2, 2)).unwrap();
         assert_eq!(
             backend
                 .process_task(

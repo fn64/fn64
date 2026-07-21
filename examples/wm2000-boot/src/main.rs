@@ -70,7 +70,8 @@ fn main() {
         )
     });
     println!("[wm2000-boot] ROM size: {} bytes", rom_bytes.len());
-    let mut rdram = fn64_boot_harness::new_rdram(fn64_boot_harness::TvType::Ntsc);
+    let tv_type = fn64_boot_harness::TvType::Ntsc;
+    let mut rdram = fn64_boot_harness::new_rdram(tv_type);
     fn64_boot_harness::seed_ipl3_image(&mut rdram, &rom_bytes);
     fn64_abi::load_rom(rom_bytes.clone());
 
@@ -139,7 +140,7 @@ fn main() {
             .with_clear_color([0, 0, 0, 255])
             .with_auto_dump("/tmp", "fn64-wm2000-render", 240);
         backend
-            .create(&fn64_render::RenderConfig::new(320, 240))
+            .create(&fn64_render::RenderConfig::for_tv(320, 240, tv_type))
             .expect("ReferenceBackend create must be infallible for 320x240");
         fn64_abi::set_render_backend(Box::new(backend), rdram.len());
     }
@@ -147,7 +148,7 @@ fn main() {
     // Typed IPL video standard is the shared VI/AI clock authority. The first
     // field uses nominal NTSC timing; the latched OSViMode H/V registers then
     // refine it from the public VI clock.
-    fn64_abi::configure_tv_type(fn64_boot_harness::TvType::Ntsc);
+    fn64_abi::configure_tv_type(tv_type);
 
     // Arm crash-safe incremental trace flushing BEFORE booting thread 0 --
     // a SIGSEGV mid-boot (as rung 3 hit) must not lose the whole session's

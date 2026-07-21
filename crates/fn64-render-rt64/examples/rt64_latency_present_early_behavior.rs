@@ -235,7 +235,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut backend = Rt64Backend::new()
         .with_runtime_settings(runtime.clone())
         .with_enhancement_settings(console.clone());
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     backend.enable_present_capture()?;
     if backend.active_settings() != Some(&runtime)
         || backend.active_enhancement_settings() != Some(&console)

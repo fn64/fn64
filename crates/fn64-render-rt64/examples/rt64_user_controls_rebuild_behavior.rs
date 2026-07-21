@@ -41,7 +41,7 @@ const IDLE_WORK_POLICY_SHA256: &str =
     "4236678e89ed815e0fe58c63bb68ed96d123fcce0b5c5f2ef1dc5e84fb761577";
 const DEVELOPER_MODE_POLICY_SHA256: &str =
     "ac4a48da879d3acd5087e09a4e2066c275e78c04f13bf11f370f64c0ef7ff9d2";
-const SOURCE_OVERLAY_ID: &str = "fn64:raster-shader-start-stop:v1";
+const SOURCE_OVERLAY_ID: &str = "fn64:raster-shader-start-stop:v1+vi-region-rate:v1";
 
 #[derive(Clone, Debug)]
 struct Observation {
@@ -343,7 +343,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         hex(&baseline.sha256())
     );
 
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     backend.enable_present_capture()?;
     let baseline_policy = active_policy_sha256(&backend, &baseline)?;
     let baseline_observation = render(&mut backend, 1)?;
@@ -453,7 +453,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into());
     }
 
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     backend.enable_present_capture()?;
     if backend.configured_settings() != &recreated || backend.active_settings() != Some(&recreated)
     {

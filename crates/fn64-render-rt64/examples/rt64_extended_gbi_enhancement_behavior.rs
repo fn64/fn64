@@ -23,7 +23,7 @@ use fn64_render_rt64::{
 use sha2::{Digest, Sha256};
 
 const PINNED_SOURCE: &str = "git:f0728a2520d5aa735886240de3fee75cc805f6d6";
-const PINNED_OVERLAY: &str = "fn64:raster-shader-start-stop:v1";
+const PINNED_OVERLAY: &str = "fn64:raster-shader-start-stop:v1+vi-region-rate:v1";
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
 const SEGMENT: u8 = 6;
 const SEGMENT_BASE: usize = 0x0000_1000;
@@ -328,7 +328,7 @@ fn presentation(seed: u64) -> ViPresentation {
 
 fn backend(refresh_rate: RenderRefreshRate) -> Result<Rt64Backend, Box<dyn Error>> {
     let mut backend = Rt64Backend::new().with_runtime_settings(settings(refresh_rate));
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     backend.enable_present_capture()?;
     Ok(backend)
 }

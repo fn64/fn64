@@ -9,11 +9,13 @@ import os
 import platform
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
 SCHEMA = "fn64.rt64-macos-certification.v1"
 LIVE_CASE_TIMEOUT_SECONDS = 60
+LIVE_CASE_TEARDOWN_SECONDS = 5.0
 EXPECTED_CASES = {
     "backend-lifecycle": "backend",
     "resolution-downsample": "resolution",
@@ -241,7 +243,9 @@ def render_doc(manifest: dict, cases: list[dict], blockers: list[dict]) -> str:
             "`--runs` supplies a common diagnostic or repeat count. Execution requires",
             "Darwin and an exact, clean pinned RT64 source tree selected by `FN64_RT64_DIR`",
             "or the default sibling checkout. Every live case invocation fails if it exceeds",
-            f"the shared {LIVE_CASE_TIMEOUT_SECONDS}-second per-process watchdog.",
+            f"the shared {LIVE_CASE_TIMEOUT_SECONDS}-second per-process watchdog. Fresh",
+            f"processes are spaced by {LIVE_CASE_TEARDOWN_SECONDS:g} seconds so WindowServer",
+            "can reclaim each hidden Metal surface before the next case invocation.",
             "",
         ]
     )
@@ -266,7 +270,8 @@ def validate_rt64_tree(rt64_dir: Path, commit: str) -> None:
     except (OSError, subprocess.CalledProcessError) as error:
         raise CertificationError(f"cannot inspect RT64 source tree {rt64_dir}: {error}") from error
     require(head == commit, f"RT64 HEAD {head!r} does not match pinned commit {commit!r}")
-    require(not dirty, f"RT64 source tree must be clean; status begins {dirty.splitlines()[0]!r}")
+    dirty_summary = dirty.splitlines()[0] if dirty else "<clean>"
+    require(not dirty, f"RT64 source tree must be clean; status begins {dirty_summary!r}")
 
 
 def run_cases(manifest: dict, cases: list[dict], selection: str, requested_runs: int | None, root: Path) -> int:
@@ -317,6 +322,11 @@ def run_cases(manifest: dict, cases: list[dict], selection: str, requested_runs:
                 failure = f"cargo exited {completed.returncode}"
                 break
             clean_runs += 1
+            if run_number != count:
+                # A fresh process has exited, but WindowServer may still be
+                # reclaiming its hidden Metal surface before the next one asks
+                # CoreGraphics for another display-service connection.
+                time.sleep(LIVE_CASE_TEARDOWN_SECONDS)
         if failure is not None:
             status = "failed"
             exit_code = 1

@@ -453,6 +453,30 @@ only notification while its destructor waited in `join`. Overlay revision
 destructor the only post-launch writer. CMake rejects an upstream source shape
 that no longer matches the reviewed patch context.
 
+The composite source overlay also carries `vi-region-rate:v1`. Pinned RT64's
+stable-factor workload inference divides a hardcoded 60 Hz base and labels PAL
+workloads as 60/factor. `RenderConfig` now requires callers either to name an
+NTSC fixture explicitly with `RenderConfig::ntsc` or to carry the IPL-selected
+`TvType` through `RenderConfig::for_tv`. The C ABI registers each RT64
+`VIHistory` with that context's 50/60 Hz nominal field rate; the exact-source
+overlay replaces only the hardcoded base lookup, retaining RT64's factor
+history and the later Extended-GBI `SetRefreshRate` override. A device-free C++
+probe calls the patched `VIHistory::logicalRateFromFactors()` and requires
+NTSC/MPAL factor 1/2 to produce 60/30 and PAL factor 1/2 to produce 50/25.
+Ten fresh live Metal processes separately carry PAL and MPAL through
+`RenderConfig::for_tv`, production context creation, ordinary VI events, and
+FullSync without an Extended refresh override. Each run stabilizes the exact
+completed-workload sequence at PAL `[0, 0, 0, 50]` and MPAL
+`[0, 0, 0, 60]`, while a zero-identity production task remains `NeedsLle`.
+Rust's unique mutable `Context` ownership prevents destruction from overlapping
+the display-list caller that performs logical-rate lookup. Teardown drains the
+RT64 workers and removes the per-context entry before RT64 destroys its state;
+the registry mutex isolates simultaneous contexts without a process-global
+region. This is workload-rate behavior; it does not claim physical compositor
+cadence or analog PAL output. Full-ROM release evidence must still bind its
+decoded TV authority to the renderer configuration rather than infer that
+agreement from this synthetic gate.
+
 The wrapper CMake build also applies an exact-source-checked Metal ownership fix
 to plume: several convenience-factory results (the command buffer, persistent
 encoders, a formatted-buffer texture descriptor, and stored shader names) had

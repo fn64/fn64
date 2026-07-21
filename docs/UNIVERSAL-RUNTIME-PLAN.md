@@ -406,7 +406,12 @@ public `rcp.h` command semantics also converge SP/SI/VI/AI/DP acknowledgement
 on the common MI source. That RCP/MI authority exists from host-state creation,
 independent of cartridge ROM installation; PI separately retains a loud
 missing-ROM gate. The typed IPL standard selects NTSC/PAL/MPAL VI and AI
-clocks; raw generated-C writes remain open. VI now stores the complete raw register block, samples `VI_CURRENT` from
+clocks and now crosses `RenderConfig` into native RT64 workload-rate inference,
+so stable VI factors derive from 60/50/60 Hz without changing an Extended-GBI
+refresh override. Ten fresh Metal processes observe exact PAL/MPAL completed-
+workload sequences `[0,0,0,50]` and `[0,0,0,60]`; release evidence still must
+co-bind decoded TV authority to the renderer configuration. Raw generated-C
+writes remain open. VI now stores the complete raw register block, samples `VI_CURRENT` from
 the programmed `VI_V_SYNC`, schedules MI at `VI_INTR`, decodes the public
 `OSViMode` layout, and latches pending mode/framebuffer state before either
 VI-manager message path and renderer presentation. Progressive and serrated

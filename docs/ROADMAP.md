@@ -139,7 +139,12 @@ and scope limits that make an open item meaningful.
 
   The mechanism now makes each boundary explicit: `RetraceDrain` treats swap
   as an observation and ends only at guest quiescence; `TvType` is a required
-  boot-harness input and seeds the IPL-owned global before thread 0; cpal
+  boot-harness input, seeds the IPL-owned global before thread 0, and is carried
+  into RT64 so PAL stable-factor workloads derive from 50 Hz rather than the
+  pinned upstream 60 Hz constant. Ten fresh live Metal processes prove the
+  production-context PAL/MPAL workload sequences `[0,0,0,50]` and
+  `[0,0,0,60]` without an Extended refresh override; full-ROM evidence still
+  must co-bind decoded TV authority to that renderer configuration. cpal
   resamples guest rate to device rate; and the audio backend distinguishes the
   current AI DMA (what `AI_LEN` exposes) from its host jitter prebuffer. Playback
   starts only after the N64-equivalent two-DMA queue is primed.

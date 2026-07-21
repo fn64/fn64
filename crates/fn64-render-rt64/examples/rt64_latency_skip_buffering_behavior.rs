@@ -276,7 +276,7 @@ fn run_mode(mode: RenderPresentationMode) -> Result<ModeEvidence, Box<dyn Error>
     let mut backend = Rt64Backend::new()
         .with_runtime_settings(runtime.clone())
         .with_enhancement_settings(enhancement.clone());
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     if backend.active_settings() != Some(&runtime)
         || backend.active_enhancement_settings() != Some(&enhancement)
     {

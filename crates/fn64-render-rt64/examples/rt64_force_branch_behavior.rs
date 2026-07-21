@@ -306,7 +306,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..disabled.clone()
     };
     let mut backend = Rt64Backend::new().with_runtime_settings(settings());
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     backend.enable_present_capture()?;
     let mut rdram = vec![0_u8; RDRAM_LEN];
     require_production_rejection(&mut backend, &mut rdram)?;

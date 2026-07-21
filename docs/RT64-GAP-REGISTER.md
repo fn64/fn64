@@ -334,7 +334,20 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
   remain loud trace frontiers; this is no longer a blanket Rej/line omission.
 - **Prim-depth, near-clip-at-0, frustum-ratio clip, flat shading** — each individually wrong (§A2).
 - **Framebuffer format reinterpretation & native read/writeback** — several format combos assert-out.
-- **PAL/50Hz** — `rt64_vi.cpp:166` hardcodes 60Hz FullRate (`// TODO: PAL support`).
+- **PAL/50Hz workload rate — closed at the adapter seam.** Pinned
+  `rt64_vi.cpp` hardcodes 60 Hz `FullRate` while deriving a stable workload
+  rate. The exact-source `vi-region-rate:v1` overlay obtains that base from the
+  active fn64 context instead: typed `RenderConfig` carries the IPL-selected
+  NTSC/PAL/MPAL standard, each `VIHistory` has an independently registered
+  60/50/60 Hz base, and the device-free C++ probe calls the patched RT64 method
+  for factor-one and factor-two vectors (60/30, 50/25, 60/30). Ten fresh live
+  Metal processes additionally carry PAL and MPAL through production context
+  creation and ordinary VI events, then observe exact completed-workload rate
+  sequences `[0,0,0,50]` and `[0,0,0,60]` without an Extended override. The
+  overlay does not alter the later Extended-GBI refresh-rate override. A
+  production full-ROM report must still co-bind its decoded TV authority to the
+  renderer configuration; physical compositor cadence, field timing, and
+  analog PAL output remain outside this closure.
 
 ---
 

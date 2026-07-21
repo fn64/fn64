@@ -326,7 +326,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let high_settings = settings(2.0, 1)?;
     let downsample_settings = settings(2.0, 2)?;
     let mut backend = Rt64Backend::new().with_runtime_settings(native_settings.clone());
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     backend.enable_present_capture()?;
 
     let control = render(&mut backend, TexturePattern::CertifiedControl)?;
@@ -581,7 +581,7 @@ mod tests {
     fn raw_fixture_has_the_expected_native_geometry() {
         let (mut rdram, end) = fixture(TexturePattern::Diagonal);
         let mut backend = ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(WIDTH, HEIGHT)).unwrap();
+        backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT)).unwrap();
         assert_eq!(
             backend
                 .process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET)

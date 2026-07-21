@@ -254,7 +254,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..RenderRuntimeSettings::default()
     };
     let mut backend = Rt64Backend::new().with_runtime_settings(settings);
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     backend.enable_present_capture()?;
 
     let base = render(&mut backend, Footprint::Full, 1)?;

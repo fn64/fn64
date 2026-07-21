@@ -160,7 +160,8 @@ mod game {
                 panic!("fn64-shell: failed to read ROM {}: {e}", rom_path.display())
             });
             println!("[fn64-shell] ROM size: {} bytes", rom_bytes.len());
-            let mut rdram = fn64_boot_harness::new_rdram(fn64_boot_harness::TvType::Ntsc);
+            let tv_type = fn64_boot_harness::TvType::Ntsc;
+            let mut rdram = fn64_boot_harness::new_rdram(tv_type);
             fn64_boot_harness::seed_ipl3_image(&mut rdram, &rom_bytes);
             fn64_abi::load_rom(rom_bytes.clone());
 
@@ -248,7 +249,7 @@ mod game {
             // The typed IPL standard owns both VI and AI clocks. The nominal
             // NTSC interval bootstraps the first field; OSViMode H/V timing
             // replaces it when the mode latches.
-            fn64_abi::configure_tv_type(fn64_boot_harness::TvType::Ntsc);
+            fn64_abi::configure_tv_type(tv_type);
 
             let rdram_ptr = rdram.as_mut_ptr();
 
@@ -262,9 +263,10 @@ mod game {
                 let mut backend = fn64_render_rt64::ReferenceBackend::new()
                     .with_f3dex2()
                     .with_clear_color([0, 0, 0, 255]);
-                if let Err(e) = backend.create(&fn64_render::RenderConfig::new(
+                if let Err(e) = backend.create(&fn64_render::RenderConfig::for_tv(
                     FB_WIDTH as u32,
                     FB_HEIGHT as u32,
+                    tv_type,
                 )) {
                     eprintln!("[fn64-shell] WARNING: render backend create() failed: {e}");
                 }
@@ -278,9 +280,10 @@ mod game {
                 &'static str,
             ) = if requested_renderer == "rt64" {
                 let mut backend = fn64_render_rt64::Rt64Backend::new();
-                match backend.create(&fn64_render::RenderConfig::new(
+                match backend.create(&fn64_render::RenderConfig::for_tv(
                     FB_WIDTH as u32,
                     FB_HEIGHT as u32,
+                    tv_type,
                 )) {
                     Ok(()) => (Box::new(backend), "rt64"),
                     Err(error) => {

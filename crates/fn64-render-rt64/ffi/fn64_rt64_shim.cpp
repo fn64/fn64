@@ -34,6 +34,7 @@
 
 #include "hle/rt64_application.h"
 #include "hle/rt64_present_queue.h"
+#include "hle/rt64_vi.h"
 #include "hle/rt64_workload_queue.h"
 #if defined(FN64_RT64_SYNTHETIC_F3DEX2_EVIDENCE)
 #include "gbi/rt64_gbi_f3dex2.h"
@@ -1089,6 +1090,12 @@ bool extended_workload_snapshot(
 namespace {
 std::mutex present_capture_registry_mutex;
 std::vector<Fn64Rt64Context *> present_capture_contexts;
+struct ViHistoryRateEntry {
+    const void *history = nullptr;
+    uint32_t nominal_refresh_rate = 0;
+};
+std::mutex vi_history_rate_registry_mutex;
+std::vector<ViHistoryRateEntry> vi_history_rate_entries;
 #if defined(FN64_RT64_HFR_EVIDENCE)
 std::mutex hfr_pacing_registry_mutex;
 std::vector<Fn64Rt64Context *> hfr_pacing_contexts;
@@ -1113,10 +1120,27 @@ void capture_present_draw(
     plume::RenderCommandList *command_list,
     plume::RenderFramebuffer *framebuffer) noexcept;
 void unregister_present_capture(Fn64Rt64Context *context);
+void register_vi_history_rate(const void *history, uint32_t nominal_refresh_rate);
+void unregister_vi_history_rate(const void *history);
 #if defined(FN64_RT64_HFR_EVIDENCE)
 void unregister_hfr_pacing(Fn64Rt64Context *context);
 #endif
 } // namespace
+
+extern "C" uint32_t fn64_rt64_nominal_full_rate(const void *history) {
+    std::scoped_lock lock(vi_history_rate_registry_mutex);
+    const auto entry = std::find_if(
+        vi_history_rate_entries.begin(),
+        vi_history_rate_entries.end(),
+        [history](const ViHistoryRateEntry &candidate) {
+            return candidate.history == history;
+        });
+    if (entry == vi_history_rate_entries.end()) {
+        throw std::runtime_error(
+            "RT64 VI history reached logical-rate inference without a registered TV standard");
+    }
+    return entry->nominal_refresh_rate;
+}
 
 struct Fn64Rt64Context {
     std::array<uint8_t, 64> header{};
@@ -1133,9 +1157,11 @@ struct Fn64Rt64Context {
     std::unique_ptr<RT64::Application> application;
     uint32_t width = 320;
     uint32_t height = 240;
+    uint32_t nominal_refresh_rate = 60;
     uint32_t output_addr = 0;
     Fn64Rt64ViState vi_state{};
     bool setup_complete = false;
+    bool vi_history_rate_registered = false;
     bool presentation_refresh_pending = false;
     bool replacement_observed_resolved_not_installed = false;
     uint32_t replacement_stream_worker_count = 0;
@@ -1194,10 +1220,11 @@ struct Fn64Rt64Context {
     std::string hfr_pacing_error;
 #endif
 
-    Fn64Rt64Context(uint32_t width, uint32_t height)
+    Fn64Rt64Context(uint32_t width, uint32_t height, uint32_t nominal_refresh_rate)
         : placeholder_rdram(std::make_unique<uint8_t[]>(N64_RDRAM_SIZE)),
           width(width),
-          height(height) {
+          height(height),
+          nominal_refresh_rate(nominal_refresh_rate) {
         std::memset(placeholder_rdram.get(), 0, N64_RDRAM_SIZE);
         vi_state.registers[0] = VI_STATUS_16_BIT;
     }
@@ -1244,6 +1271,14 @@ struct Fn64Rt64Context {
                 ubershader_evidence_active = false;
             }
 #endif
+            // Rust owns Context uniquely, so destruction cannot overlap the
+            // display-list caller that performs logical-rate lookup. Drain the
+            // RT64 workers, then remove the entry while State still owns the
+            // exact VIHistory address.
+            if (vi_history_rate_registered) {
+                unregister_vi_history_rate(&application->state->viHistory);
+                vi_history_rate_registered = false;
+            }
             if (present_diagnostics_enabled()) {
                 std::fprintf(stderr, "fn64 RT64 shutdown diagnostic: application-end begin\n");
             }
@@ -1908,6 +1943,39 @@ void capture_present_draw(
     }
 }
 
+void register_vi_history_rate(const void *history, uint32_t nominal_refresh_rate) {
+    std::scoped_lock lock(vi_history_rate_registry_mutex);
+    if ((nominal_refresh_rate != 50U) && (nominal_refresh_rate != 60U)) {
+        throw std::runtime_error("RT64 VI history requires a 50 or 60 Hz TV standard");
+    }
+    const auto existing = std::find_if(
+        vi_history_rate_entries.begin(),
+        vi_history_rate_entries.end(),
+        [history](const ViHistoryRateEntry &entry) {
+            return entry.history == history;
+        });
+    if (existing != vi_history_rate_entries.end()) {
+        throw std::runtime_error("RT64 VI history TV standard was registered twice");
+    }
+    vi_history_rate_entries.push_back({history, nominal_refresh_rate});
+}
+
+void unregister_vi_history_rate(const void *history) {
+    std::scoped_lock lock(vi_history_rate_registry_mutex);
+    const size_t prior_size = vi_history_rate_entries.size();
+    vi_history_rate_entries.erase(
+        std::remove_if(
+            vi_history_rate_entries.begin(),
+            vi_history_rate_entries.end(),
+            [history](const ViHistoryRateEntry &entry) {
+                return entry.history == history;
+            }),
+        vi_history_rate_entries.end());
+    if (vi_history_rate_entries.size() + 1U != prior_size) {
+        std::terminate();
+    }
+}
+
 void unregister_present_capture(Fn64Rt64Context *context) {
     std::scoped_lock registry_lock(present_capture_registry_mutex);
     if (!context->present_capture_enabled) {
@@ -1967,7 +2035,10 @@ extern "C" int fn64_rt64_capture_adapter_inputs(
         capture->output_addr = output_addr & 0x00FFFFFFU;
         capture->width = width;
         capture->height = height;
-        Fn64Rt64Context context(width, height);
+        // This scalar-only capture context never creates an RT64 State or
+        // performs logical-rate inference; the nominal value is intentionally
+        // inert but remains explicit so production contexts cannot default it.
+        Fn64Rt64Context context(width, height, 60U);
         context.output_addr = capture->output_addr;
         context.update_vi(*vi);
         std::copy(context.registers.begin(), context.registers.end(), capture->registers);
@@ -1985,6 +2056,49 @@ extern "C" int fn64_rt64_capture_adapter_inputs(
         return 0;
     } catch (...) {
         set_error(error, error_capacity, "RT64 adapter capture failed with an unknown C++ exception");
+        return 0;
+    }
+}
+
+extern "C" int fn64_rt64_probe_logical_rate(
+    uint32_t nominal_refresh_rate,
+    uint32_t factor,
+    uint32_t *logical_rate,
+    char *error,
+    size_t error_capacity) {
+    try {
+        if (logical_rate == nullptr) {
+            set_error(error, error_capacity, "null logical-rate output pointer");
+            return 0;
+        }
+        if ((nominal_refresh_rate != 50U) && (nominal_refresh_rate != 60U)) {
+            set_error(error, error_capacity, "nominal TV refresh rate must be 50 or 60 Hz");
+            return 0;
+        }
+        if (factor == 0U) {
+            set_error(error, error_capacity, "VI presentation factor must be non-zero");
+            return 0;
+        }
+
+        RT64::VIHistory history;
+        register_vi_history_rate(&history, nominal_refresh_rate);
+        struct ViHistoryRateRegistration {
+            const void *history;
+            ~ViHistoryRateRegistration() {
+                unregister_vi_history_rate(history);
+            }
+        } registration{&history};
+
+        history.pushFactor(factor);
+        history.pushFactor(factor);
+        history.pushFactor(factor);
+        *logical_rate = history.logicalRateFromFactors();
+        return 1;
+    } catch (const std::exception &exception) {
+        set_error(error, error_capacity, std::string("RT64 logical-rate probe threw: ") + exception.what());
+        return 0;
+    } catch (...) {
+        set_error(error, error_capacity, "RT64 logical-rate probe failed with an unknown C++ exception");
         return 0;
     }
 }
@@ -2106,6 +2220,7 @@ extern "C" int fn64_rt64_inspect_replacement_pack(
 extern "C" Fn64Rt64Context *fn64_rt64_create(
     uint32_t width,
     uint32_t height,
+    uint32_t nominal_refresh_rate,
     const Fn64Rt64UserConfig *user_config,
     const Fn64Rt64EnhancementConfig *enhancement_config,
     const Fn64Rt64EmulatorConfig *emulator_config,
@@ -2114,6 +2229,10 @@ extern "C" Fn64Rt64Context *fn64_rt64_create(
     try {
         if ((width == 0) || (height == 0)) {
             set_error(error, error_capacity, "render dimensions must be non-zero");
+            return nullptr;
+        }
+        if ((nominal_refresh_rate != 50U) && (nominal_refresh_rate != 60U)) {
+            set_error(error, error_capacity, "nominal TV refresh rate must be 50 or 60 Hz");
             return nullptr;
         }
 
@@ -2130,7 +2249,10 @@ extern "C" Fn64Rt64Context *fn64_rt64_create(
             return nullptr;
         }
 
-        auto context = std::make_unique<Fn64Rt64Context>(width, height);
+        auto context = std::make_unique<Fn64Rt64Context>(
+            width,
+            height,
+            nominal_refresh_rate);
 #if defined(__APPLE__)
         if (!context->create_hidden_metal_surface(error, error_capacity)) {
             return nullptr;
@@ -2173,6 +2295,10 @@ extern "C" Fn64Rt64Context *fn64_rt64_create(
         }
 
         context->setup_complete = true;
+        register_vi_history_rate(
+            &context->application->state->viHistory,
+            context->nominal_refresh_rate);
+        context->vi_history_rate_registered = true;
         if (context->application->userConfig.antialiasing != requested_user_config.antialiasing) {
             set_error(error, error_capacity, "RT64 device silently rejected the requested antialiasing sample count");
             return nullptr;
@@ -4300,6 +4426,7 @@ extern "C" int fn64_rt64_process_synthetic_hfr_f3dex2(
     uint32_t display_list,
     uint32_t output_addr,
     uint16_t original_refresh_rate,
+    Fn64Rt64RegionRateEvidence *region_rate_evidence,
     char *error,
     size_t error_capacity) {
     try {
@@ -4318,12 +4445,13 @@ extern "C" int fn64_rt64_process_synthetic_hfr_f3dex2(
             (target_byte_len == 0U) || (target_byte_len > rdram_len) ||
             (static_cast<uint64_t>(output_addr) >
              static_cast<uint64_t>(rdram_len) - target_byte_len);
+        const bool capture_region_rate = region_rate_evidence != nullptr;
         if (((display_list & 7U) != 0U) || (display_list >= rdram_len) ||
             ((output_addr & 7U) != 0U) ||
             ((output_addr & 0xFF000000U) != 0U) || target_out_of_bounds ||
-            (original_refresh_rate == 0U)) {
+            ((original_refresh_rate == 0U) != capture_region_rate)) {
             set_error(error, error_capacity,
-                      "synthetic RT64 F3DEX2 addresses, RGBA16 target footprint, or original refresh rate are invalid");
+                      "synthetic RT64 F3DEX2 addresses, RGBA16 target footprint, or refresh-rate evidence mode are invalid");
             return 0;
         }
 
@@ -4388,7 +4516,19 @@ extern "C" int fn64_rt64_process_synthetic_hfr_f3dex2(
         if (synthetic_gbi.resetFromTask != nullptr) {
             synthetic_gbi.resetFromTask(state);
         }
-        state->setRefreshRate(original_refresh_rate);
+        if (capture_region_rate) {
+            // This fixture isolates the production FullSync fallback. An
+            // Extended GBI SetRefreshRate command would intentionally win
+            // over VIHistory and make the region registry unobservable.
+            if (state->extended.refreshRate != UINT16_MAX) {
+                set_error(error, error_capacity,
+                          "synthetic RT64 region-rate fixture inherited an Extended refresh override");
+                return 0;
+            }
+        }
+        else {
+            state->setRefreshRate(original_refresh_rate);
+        }
 
         const uint64_t previous_workload = state->workloadId;
         ExtendedDispatchProbe extended_probe{};
@@ -4422,6 +4562,35 @@ extern "C" int fn64_rt64_process_synthetic_hfr_f3dex2(
             return 0;
         }
         context->application->workloadQueue->waitForWorkloadId(submitted_workload);
+
+        if (capture_region_rate) {
+            const uint32_t slot =
+                context->application->workloadQueue->previousWriteCursor();
+            const RT64::Workload &workload =
+                context->application->workloadQueue->workloads[slot];
+            if (workload.workloadId != submitted_workload) {
+                set_error(error, error_capacity,
+                          "synthetic RT64 region-rate workload slot identity is inconsistent");
+                return 0;
+            }
+            const uint32_t registered_nominal_refresh_rate =
+                fn64_rt64_nominal_full_rate(&state->viHistory);
+            if (registered_nominal_refresh_rate !=
+                context->nominal_refresh_rate) {
+                set_error(error, error_capacity,
+                          "synthetic RT64 region-rate registry disagrees with context creation");
+                return 0;
+            }
+            Fn64Rt64RegionRateEvidence snapshot{};
+            snapshot.workload_id = workload.workloadId;
+            snapshot.configured_nominal_refresh_rate =
+                context->nominal_refresh_rate;
+            snapshot.registered_nominal_refresh_rate =
+                registered_nominal_refresh_rate;
+            snapshot.workload_original_refresh_rate = workload.viOriginalRate;
+            snapshot.extended_refresh_override_absent = 1U;
+            *region_rate_evidence = snapshot;
+        }
 
         if (capture_extended) {
             if (interpreter->hleGBI != &synthetic_gbi) {

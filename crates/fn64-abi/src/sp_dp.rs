@@ -148,7 +148,7 @@ mod tests {
             rdram[offset + 4..offset + 8].copy_from_slice(&w1.to_ne_bytes());
         }
         let mut backend = fn64_render_rt64::ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         crate::set_render_backend(Box::new(backend), rdram.len());
         with_host(|host| {
             host.runtime_rdram = rdram.as_mut_ptr();
@@ -211,7 +211,7 @@ mod tests {
         let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
         rdram[START..START + 4].copy_from_slice(&0xe900_0000u32.to_ne_bytes());
         let mut backend = fn64_render_rt64::ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         crate::load_rom_with_fixed_pi_latency(Vec::new(), 1);
         crate::set_render_backend(Box::new(backend), rdram.len());
         with_host(|host| {

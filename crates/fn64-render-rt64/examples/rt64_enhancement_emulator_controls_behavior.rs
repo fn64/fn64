@@ -222,7 +222,7 @@ fn render_profile(
         ))
         .into());
     }
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     backend.enable_present_capture()?;
     let policy = backend
         .active_runtime_policy()
@@ -401,7 +401,7 @@ fn render_copy_region_profile(
         ))
         .into());
     }
-    backend.create(&RenderConfig::new(COPY_WIDTH, COPY_SOURCE_HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(COPY_WIDTH, COPY_SOURCE_HEIGHT))?;
     backend.enable_present_capture()?;
     let policy = backend
         .active_runtime_policy()

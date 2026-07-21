@@ -353,7 +353,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
     ];
     let mut backend = Rt64Backend::new().with_runtime_settings(cases[0].1.clone());
-    backend.create(&RenderConfig::new(PRESENT_WIDTH, PRESENT_HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(PRESENT_WIDTH, PRESENT_HEIGHT))?;
     backend.enable_present_capture()?;
 
     let mut results = Vec::new();

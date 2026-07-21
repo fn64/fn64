@@ -4756,7 +4756,7 @@ mod tests {
             dmem[offset + 4..offset + 8].copy_from_slice(&w1.to_be_bytes());
         }
         let mut backend = fn64_render_rt64::ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         prepare_renderer_rdram(&mut rdram);
         set_render_backend(Box::new(backend), rdram.len());
 
@@ -4818,7 +4818,7 @@ mod tests {
             dmem[offset + 4..offset + 8].copy_from_slice(&w1.to_be_bytes());
         }
         let mut backend = fn64_render_rt64::ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
         prepare_renderer_rdram(&mut rdram);
         set_render_backend(Box::new(backend), rdram.len());
 
@@ -5406,7 +5406,7 @@ mod tests {
         ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
         admit_synthetic_hle_task(&mut rdram, HEADER_OFF, &mut ctx);
         let mut backend = ReferenceBackend::new().with_clear_color([1, 2, 3, 255]);
-        backend.create(&RenderConfig::new(64, 64)).unwrap();
+        backend.create(&RenderConfig::ntsc(64, 64)).unwrap();
         prepare_renderer_rdram(&mut rdram);
         set_render_backend(Box::new(backend), rdram.len());
         unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
@@ -5440,7 +5440,7 @@ mod tests {
         // the seam call really executed the real decode+rasterize path on
         // this fixture, not a silent no-op.
         let mut direct = ReferenceBackend::new().with_clear_color([1, 2, 3, 255]);
-        direct.create(&RenderConfig::new(64, 64)).unwrap();
+        direct.create(&RenderConfig::ntsc(64, 64)).unwrap();
         let task = fn64_render::OsTask {
             task_type: fn64_render::M_GFXTASK,
             data_ptr: DL_ADDR as u32,

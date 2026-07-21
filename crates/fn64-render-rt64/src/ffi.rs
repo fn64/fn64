@@ -395,6 +395,20 @@ impl Default for RawExtendedGbiEvidence {
 
 const _: [(); 1984] = [(); std::mem::size_of::<RawExtendedGbiEvidence>()];
 
+#[cfg(feature = "synthetic-f3dex2-evidence")]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+struct RawRegionRateEvidence {
+    workload_id: u64,
+    configured_nominal_refresh_rate: u32,
+    registered_nominal_refresh_rate: u32,
+    workload_original_refresh_rate: u32,
+    extended_refresh_override_absent: u32,
+}
+
+#[cfg(feature = "synthetic-f3dex2-evidence")]
+const _: [(); 24] = [(); std::mem::size_of::<RawRegionRateEvidence>()];
+
 #[cfg(feature = "hfr-evidence")]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -1509,9 +1523,18 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
+    #[cfg(test)]
+    fn fn64_rt64_probe_logical_rate(
+        nominal_refresh_rate: u32,
+        factor: u32,
+        logical_rate: *mut u32,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
     fn fn64_rt64_create(
         width: u32,
         height: u32,
+        nominal_refresh_rate: u32,
         user_config: *const RawUserConfig,
         enhancement_config: *const RawEnhancementConfig,
         emulator_config: *const RawEmulatorConfig,
@@ -1687,6 +1710,7 @@ unsafe extern "C" {
         display_list: u32,
         output_addr: u32,
         original_refresh_rate: u16,
+        region_rate_evidence: *mut RawRegionRateEvidence,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
@@ -1937,6 +1961,7 @@ impl Context {
     pub(crate) fn create(
         width: u32,
         height: u32,
+        nominal_refresh_rate: u32,
         user_settings: &RenderRuntimeSettings,
         enhancement_settings: &RenderEnhancementSettings,
         emulator_settings: &RenderEmulatorSettings,
@@ -1951,6 +1976,7 @@ impl Context {
             fn64_rt64_create(
                 width,
                 height,
+                nominal_refresh_rate,
                 &raw_user,
                 &raw_enhancement,
                 &raw_emulator,
@@ -2795,6 +2821,7 @@ impl Context {
                 display_list,
                 output_addr,
                 original_refresh_rate,
+                std::ptr::null_mut(),
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -2807,6 +2834,50 @@ impl Context {
                 "synthetic RT64 HFR F3DEX2 processing failed without a diagnostic",
             ))
         }
+    }
+
+    #[cfg(feature = "region-rate-evidence")]
+    pub(crate) fn process_synthetic_region_rate_f3dex2(
+        &mut self,
+        rdram: &mut [u8],
+        display_list: u32,
+        output_addr: u32,
+    ) -> Result<crate::Rt64RegionRateEvidence, String> {
+        let mut raw = RawRegionRateEvidence::default();
+        let mut error = [0; ERROR_CAPACITY];
+        // SAFETY: the mutable allocation and evidence output are valid for
+        // the synchronous evidence-only HLE call and uniquely borrowed.
+        let ok = unsafe {
+            fn64_rt64_process_synthetic_hfr_f3dex2(
+                self.0.as_ptr(),
+                rdram.as_mut_ptr(),
+                rdram.len(),
+                display_list,
+                output_addr,
+                0,
+                &mut raw,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok == 0 {
+            return Err(error_string(
+                &error,
+                "synthetic RT64 region-rate F3DEX2 processing failed without a diagnostic",
+            ));
+        }
+        if raw.workload_id == 0
+            || raw.extended_refresh_override_absent != 1
+            || raw.configured_nominal_refresh_rate != raw.registered_nominal_refresh_rate
+        {
+            return Err("RT64 region-rate evidence returned inconsistent authority".into());
+        }
+        Ok(crate::Rt64RegionRateEvidence {
+            workload_id: raw.workload_id,
+            configured_nominal_refresh_rate: raw.configured_nominal_refresh_rate,
+            registered_nominal_refresh_rate: raw.registered_nominal_refresh_rate,
+            workload_original_refresh_rate: raw.workload_original_refresh_rate,
+        })
     }
 
     #[cfg(feature = "synthetic-s2dex-evidence")]
@@ -3278,12 +3349,65 @@ mod tests {
         assert!(cmake.contains("FN64_RT64_COMPILATION_THREAD_LOOP_ORIGINAL"));
         assert!(cmake.contains("threadRunning = true;\\n        thread ="));
         assert!(cmake.contains("leaves the destructor as its only post-launch writer"));
+        assert!(cmake.contains("9b3cf39bb15fc0c7d52085566197042f4960cc410b241e38457bb817f2501e5b"));
+        assert!(cmake.contains("fn64_rt64_nominal_full_rate(this)"));
         let expected_overlay = if cfg!(feature = "hfr-evidence") {
-            "fn64:raster-shader-start-stop:v1+hfr-post-present-call:v1"
+            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+hfr-post-present-call:v1"
         } else {
-            "fn64:raster-shader-start-stop:v1"
+            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1"
         };
         assert_eq!(env!("FN64_RT64_SOURCE_OVERLAY_ID"), expected_overlay);
+    }
+
+    fn cpp_logical_rate(nominal_refresh_rate: u32, factor: u32) -> Result<u32, String> {
+        let mut logical_rate = u32::MAX;
+        let mut error = [0; ERROR_CAPACITY];
+        // SAFETY: the scalar output and error buffer remain live for this
+        // synchronous, device-free exact-source probe.
+        let ok = unsafe {
+            fn64_rt64_probe_logical_rate(
+                nominal_refresh_rate,
+                factor,
+                &mut logical_rate,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok == 0 {
+            Err(error_string(&error, "missing logical-rate diagnostic"))
+        } else {
+            Ok(logical_rate)
+        }
+    }
+
+    #[test]
+    fn cpp_vi_history_uses_context_region_rate_for_stable_factors() {
+        assert_eq!(cpp_logical_rate(60, 1).unwrap(), 60);
+        assert_eq!(cpp_logical_rate(60, 2).unwrap(), 30);
+        assert_eq!(cpp_logical_rate(50, 1).unwrap(), 50);
+        assert_eq!(cpp_logical_rate(50, 2).unwrap(), 25);
+    }
+
+    #[test]
+    fn cpp_vi_history_rejects_missing_or_invalid_region_authority() {
+        assert!(cpp_logical_rate(59, 1).unwrap_err().contains("50 or 60 Hz"));
+        assert!(cpp_logical_rate(60, 0).unwrap_err().contains("non-zero"));
+    }
+
+    #[test]
+    fn cpp_vi_history_keeps_concurrent_region_registrations_isolated() {
+        let ntsc = std::thread::spawn(|| {
+            for _ in 0..128 {
+                assert_eq!(cpp_logical_rate(60, 2).unwrap(), 30);
+            }
+        });
+        let pal = std::thread::spawn(|| {
+            for _ in 0..128 {
+                assert_eq!(cpp_logical_rate(50, 2).unwrap(), 25);
+            }
+        });
+        ntsc.join().unwrap();
+        pal.join().unwrap();
     }
 
     fn raw_roundtrip(input: RawUserConfig) -> Result<RawUserConfig, String> {

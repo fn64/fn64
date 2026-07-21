@@ -190,7 +190,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             framebuffer_render_to_ram: true,
             framebuffer_copy_with_gpu: true,
         });
-    backend.create(&RenderConfig::new(SOURCE_WIDTH, SOURCE_HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(SOURCE_WIDTH, SOURCE_HEIGHT))?;
     if backend.active_settings() != Some(&settings)
         || backend
             .active_settings()

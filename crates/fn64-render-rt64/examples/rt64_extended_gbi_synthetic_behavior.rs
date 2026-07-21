@@ -75,7 +75,7 @@ fn runtime_settings() -> RenderRuntimeSettings {
 
 fn backend() -> Result<Rt64Backend, Box<dyn Error>> {
     let mut backend = Rt64Backend::new().with_runtime_settings(runtime_settings());
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     Ok(backend)
 }
 

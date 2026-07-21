@@ -169,7 +169,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         rgba16: 0xf801,
         guest_cycle: 101,
     };
-    backend.create(&RenderConfig::new(initial.width, initial.height))?;
+    backend.create(&RenderConfig::ntsc(initial.width, initial.height))?;
     if backend.active_settings() != Some(&settings) {
         return Err(
             io::Error::other("Metal initialization did not activate staged settings").into(),
@@ -231,7 +231,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         rgba16: 0x003f,
         guest_cycle: 303,
     };
-    backend.create(&RenderConfig::new(recreated.width, recreated.height))?;
+    backend.create(&RenderConfig::ntsc(recreated.width, recreated.height))?;
     if backend.active_settings() != Some(&settings) {
         return Err(
             io::Error::other("Metal recreation did not preserve configured settings").into(),
@@ -347,7 +347,7 @@ mod tests {
                 "1111111111111111111111111111111111111111111111111111111111111111",
             source_id: PINNED_SOURCE,
             source_provenance: Rt64SourceProvenance::GitClean,
-            source_overlay_id: "fn64:raster-shader-start-stop:v1",
+            source_overlay_id: "fn64:raster-shader-start-stop:v1+vi-region-rate:v1",
             post_vi_api: "metal-bgra8-unorm",
         };
         let capture = RenderReleaseCapture {
