@@ -436,7 +436,7 @@ unsafe fn dispatch_gfx_task_chunk(
     status
 }
 
-/// Present the registered graphics backend at the guest's real VI swap
+/// Present the registered graphics backend at the guest's real VI retrace
 /// boundary. Task submission and VI presentation are distinct on N64; this
 /// closes the second half of `RenderBackend` without exposing RT64 or any
 /// foreign type outside `fn64-render-rt64`.

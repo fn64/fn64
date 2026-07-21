@@ -202,10 +202,10 @@ fn capture(
     let route = backend.s2dex_fast_path_evidence()?;
     backend.present(ViPresentation {
         noise_seed: 0x5332_4445,
-        filters: ViFilterControl {
+        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
             pixel_type: ViPixelType::Rgba16,
             ..ViFilterControl::default()
-        },
+        }),
         ..ViPresentation::default()
     })?;
     let pixels = backend.presented_pixels()?;

@@ -214,10 +214,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     backend.present(ViPresentation {
         noise_seed: 0x55aa_1234,
-        filters: ViFilterControl {
+        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
             pixel_type: ViPixelType::Rgba16,
             ..ViFilterControl::default()
-        },
+        }),
         ..ViPresentation::default()
     })?;
 

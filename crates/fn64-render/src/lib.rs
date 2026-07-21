@@ -297,12 +297,189 @@ impl ViScanoutField {
     }
 }
 
+/// Register-derived active digital output rectangle for one VI field.
+///
+/// The public VI register interface encodes horizontal start/end in pixels
+/// and vertical start/end in half-lines. Keeping the programmed coordinates
+/// as well as their derived extent prevents a backend from substituting its
+/// host window size for the guest's latched scanout geometry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ViActiveWindow {
+    horizontal_start: u16,
+    horizontal_end: u16,
+    vertical_start_half_line: u16,
+    vertical_end_half_line: u16,
+}
+
+impl ViActiveWindow {
+    const FIELD_MASK: u32 = 0x03ff;
+
+    /// Decode a programmed active window, or report that no H/V window has
+    /// been programmed yet. A partially programmed or malformed image still
+    /// traps through [`Self::from_registers`].
+    pub fn try_from_registers(horizontal: u32, vertical: u32) -> Option<Self> {
+        let used = Self::FIELD_MASK | (Self::FIELD_MASK << 16);
+        if horizontal & used == 0 && vertical & used == 0 {
+            None
+        } else {
+            Some(Self::from_registers(horizontal, vertical))
+        }
+    }
+
+    pub fn from_registers(horizontal: u32, vertical: u32) -> Self {
+        let horizontal_start = ((horizontal >> 16) & Self::FIELD_MASK) as u16;
+        let horizontal_end = (horizontal & Self::FIELD_MASK) as u16;
+        let vertical_start_half_line = ((vertical >> 16) & Self::FIELD_MASK) as u16;
+        let vertical_end_half_line = (vertical & Self::FIELD_MASK) as u16;
+        assert!(
+            horizontal_end > horizontal_start,
+            "VI H_START has an empty or reversed active window {horizontal_start}..{horizontal_end}"
+        );
+        assert!(
+            vertical_end_half_line > vertical_start_half_line,
+            "VI V_START has an empty or reversed active window {vertical_start_half_line}..{vertical_end_half_line}"
+        );
+        let vertical_half_lines = vertical_end_half_line - vertical_start_half_line;
+        assert_eq!(
+            vertical_half_lines & 1,
+            0,
+            "VI V_START active extent {vertical_half_lines} is not a whole output line"
+        );
+        Self {
+            horizontal_start,
+            horizontal_end,
+            vertical_start_half_line,
+            vertical_end_half_line,
+        }
+    }
+
+    pub const fn horizontal_register(self) -> u32 {
+        ((self.horizontal_start as u32) << 16) | self.horizontal_end as u32
+    }
+
+    pub const fn vertical_register(self) -> u32 {
+        ((self.vertical_start_half_line as u32) << 16) | self.vertical_end_half_line as u32
+    }
+
+    pub const fn output_width(self) -> u32 {
+        (self.horizontal_end - self.horizontal_start) as u32
+    }
+
+    pub const fn output_height(self) -> u32 {
+        ((self.vertical_end_half_line - self.vertical_start_half_line) / 2) as u32
+    }
+}
+
 /// Register-derived digital resampling state latched for one presentation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ViResampleControl {
     pub x: ViScaleAxis,
     pub y: ViScaleAxis,
     pub field: ViScanoutField,
+}
+
+/// One complete latched fourteen-word public VI register image.
+///
+/// The words stay together so origin/stride/timing/window/scale/field cannot
+/// drift across the renderer seam. Construction validates the geometry that
+/// every digital backend must consume; reserved pixel formats remain a typed
+/// presentation error rather than being rewritten here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ViScanoutRegisters {
+    words: [u32; Self::WORD_COUNT],
+}
+
+impl ViScanoutRegisters {
+    pub const WORD_COUNT: usize = 14;
+
+    pub fn from_words(words: [u32; Self::WORD_COUNT]) -> Self {
+        let active_window = ViActiveWindow::try_from_registers(words[9], words[10]);
+        if active_window.is_some() {
+            assert_ne!(
+                words[2] & 0x0fff,
+                0,
+                "VI WIDTH has zero effective source stride for an active scanout image"
+            );
+        }
+        let _ = ViResampleControl::from_registers(words[12], words[13], words[0], words[4] & 1);
+        Self { words }
+    }
+
+    pub const fn words(self) -> [u32; Self::WORD_COUNT] {
+        self.words
+    }
+
+    pub const fn status(self) -> u32 {
+        self.words[0]
+    }
+
+    pub const fn origin(self) -> u32 {
+        self.words[1]
+    }
+
+    pub const fn width(self) -> u32 {
+        self.words[2] & 0x0fff
+    }
+
+    pub fn active_window(self) -> Option<ViActiveWindow> {
+        // Construction proved these fields; repeat the cheap typed decode so
+        // no second representation can drift from the retained words.
+        ViActiveWindow::try_from_registers(self.words[9], self.words[10])
+    }
+
+    pub const fn x_scale_register(self) -> u32 {
+        self.words[12]
+    }
+
+    pub const fn y_scale_register(self) -> u32 {
+        self.words[13]
+    }
+
+    pub fn resample(self) -> ViResampleControl {
+        ViResampleControl::from_registers(
+            self.words[12],
+            self.words[13],
+            self.words[0],
+            self.words[4] & 1,
+        )
+    }
+
+    pub fn filters(self) -> ViFilterControl {
+        ViFilterControl::from_status(self.words[0])
+    }
+}
+
+/// Authority for one presentation's VI state.
+///
+/// Integrated execution always uses `Registers`. `BackendOnly` is the
+/// explicit compatibility path for unit embedders that do not own a live VI
+/// register file; it cannot accidentally carry a partial geometry image.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ViScanoutState {
+    BackendOnly(ViFilterControl),
+    Registers(ViScanoutRegisters),
+}
+
+impl Default for ViScanoutState {
+    fn default() -> Self {
+        Self::BackendOnly(ViFilterControl::default())
+    }
+}
+
+impl ViScanoutState {
+    pub fn filters(self) -> ViFilterControl {
+        match self {
+            Self::BackendOnly(filters) => filters,
+            Self::Registers(registers) => registers.filters(),
+        }
+    }
+
+    pub const fn registers(self) -> Option<ViScanoutRegisters> {
+        match self {
+            Self::BackendOnly(_) => None,
+            Self::Registers(registers) => Some(registers),
+        }
+    }
 }
 
 impl ViResampleControl {
@@ -334,13 +511,9 @@ pub struct ViPresentation {
     pub fade: Option<u16>,
     /// Repeat the first source row over the complete scanout image.
     pub repeat_line: bool,
-    /// Pixel type and analog scanout filters from the latched VI STATUS
-    /// register.
-    pub filters: ViFilterControl,
-    /// Latched VI X/Y scale and field registers. `None` preserves the
-    /// historical backend-only identity scanout for callers without a live
-    /// VI register image.
-    pub resample: Option<ViResampleControl>,
+    /// Complete live register authority or an explicit backend-only filter
+    /// compatibility state.
+    pub scanout: ViScanoutState,
     /// Deterministic entropy key for scanout noise. Integrated execution uses
     /// the exact guest cycle of the VI retrace, so repeated runs agree while
     /// successive fields do not freeze gamma dither to the screen.
@@ -750,12 +923,14 @@ pub trait RenderBackend {
         DpFullSyncStatus::Unidentified
     }
 
-    /// Present the most recently rendered frame (swap to screen, or for a
-    /// headless backend, finalize it as retrievable). Distinct from
-    /// `process_task` because real hardware's `osViSwapBuffer` (the VI
-    /// manager posting a rendered buffer to the display) is a separate
-    /// event from RSP task completion -- multiple gfx tasks can render
-    /// before one present, matching double/triple-buffering.
+    /// Present one VI field from the most recently rendered framebuffer
+    /// (scan it to screen, or for a headless backend, finalize it as
+    /// retrievable). Distinct from `process_task` because each hardware VI
+    /// retrace is separate from RSP task completion; `osViSwapBuffer` only
+    /// selects which rendered buffer a later field consumes. Multiple gfx
+    /// tasks can render before one present, matching double/triple-buffering,
+    /// and unchanged progressive fields still present with distinct cadence
+    /// and retrace-seeded scanout noise.
     fn present(&mut self, vi: ViPresentation) -> Result<(), RenderError>;
 
     /// Return the most recent completed renderer image for fixed-cycle
@@ -1147,6 +1322,103 @@ mod tests {
             ViResampleControl::from_registers(0, 0, 1 << 6, 1).field,
             ViScanoutField::InterlacedOdd
         );
+    }
+
+    #[test]
+    fn vi_active_window_decodes_public_pixel_and_half_line_extents() {
+        let window = ViActiveWindow::from_registers(0x006c_02ec, 0x0025_01ff);
+        assert_eq!(window.horizontal_register(), 0x006c_02ec);
+        assert_eq!(window.vertical_register(), 0x0025_01ff);
+        assert_eq!(window.output_width(), 640);
+        assert_eq!(window.output_height(), 237);
+
+        let masked = ViActiveWindow::from_registers(0xfc6c_f2ec, 0xfc25_f1ff);
+        assert_eq!(masked, window);
+        assert_eq!(ViActiveWindow::try_from_registers(0, 0), None);
+        assert_eq!(
+            ViActiveWindow::try_from_registers(0x006c_02ec, 0x0025_01ff),
+            Some(window)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "VI H_START has an empty or reversed active window")]
+    fn vi_active_window_rejects_reversed_horizontal_extent() {
+        let _ = ViActiveWindow::from_registers(0x0200_0100, 0x0025_01ff);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a whole output line")]
+    fn vi_active_window_rejects_half_line_output_extent() {
+        let _ = ViActiveWindow::from_registers(0x006c_02ec, 0x0025_0200);
+    }
+
+    #[test]
+    fn vi_scanout_registers_retain_one_complete_atomic_image() {
+        let mut words = [0u32; ViScanoutRegisters::WORD_COUNT];
+        words[0] = 3 | (1 << 6) | (2 << 8) | (1 << 16);
+        words[1] = 0x0012_3456;
+        words[2] = 320;
+        words[3] = 2;
+        words[4] = 1;
+        words[5] = 0x03e5_2239;
+        words[6] = 525;
+        words[7] = 3093;
+        words[8] = 0x0c15_0c15;
+        words[9] = 0x006c_02ec;
+        words[10] = 0x0025_01ff;
+        words[11] = 0x000e_0204;
+        words[12] = 0x0123_0200;
+        words[13] = 0x0234_0400;
+
+        let registers = ViScanoutRegisters::from_words(words);
+        assert_eq!(registers.words(), words);
+        assert_eq!(registers.status(), words[0]);
+        assert_eq!(registers.origin(), words[1]);
+        assert_eq!(registers.width(), 320);
+        assert_eq!(registers.active_window().unwrap().output_width(), 640);
+        assert_eq!(registers.active_window().unwrap().output_height(), 237);
+        assert_eq!(registers.x_scale_register(), words[12]);
+        assert_eq!(registers.y_scale_register(), words[13]);
+        assert_eq!(registers.resample().field, ViScanoutField::InterlacedOdd);
+        assert_eq!(registers.resample().x.step_u2_10(), 0x200);
+        assert_eq!(registers.filters().pixel_type, ViPixelType::Rgba32);
+        assert_eq!(registers.filters().antialias_mode, ViAaMode::ResampleOnly);
+        assert!(registers.filters().dither_filter);
+        assert_eq!(
+            ViScanoutState::Registers(registers).registers(),
+            Some(registers)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "VI WIDTH has zero effective source stride")]
+    fn vi_scanout_registers_reject_zero_source_stride() {
+        let mut words = [0u32; ViScanoutRegisters::WORD_COUNT];
+        words[9] = 0x006c_02ec;
+        words[10] = 0x0025_01ff;
+        let _ = ViScanoutRegisters::from_words(words);
+    }
+
+    #[test]
+    #[should_panic(expected = "VI WIDTH has zero effective source stride")]
+    fn vi_scanout_registers_reject_width_with_only_unused_bits() {
+        let mut words = [0u32; ViScanoutRegisters::WORD_COUNT];
+        words[2] = 0x1000;
+        words[9] = 0x006c_02ec;
+        words[10] = 0x0025_01ff;
+        let _ = ViScanoutRegisters::from_words(words);
+    }
+
+    #[test]
+    fn vi_scanout_registers_retain_an_inactive_live_image() {
+        let mut words = [0u32; ViScanoutRegisters::WORD_COUNT];
+        words[0] = 3;
+        words[1] = 0x0010_0000;
+        words[2] = 320;
+        let registers = ViScanoutRegisters::from_words(words);
+        assert_eq!(registers.words(), words);
+        assert_eq!(registers.active_window(), None);
     }
 
     #[test]

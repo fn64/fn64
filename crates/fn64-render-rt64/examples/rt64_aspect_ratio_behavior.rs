@@ -295,10 +295,10 @@ fn render(
     }
     backend.present(ViPresentation {
         noise_seed: guest_cycle,
-        filters: ViFilterControl {
+        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
             pixel_type: ViPixelType::Rgba16,
             ..ViFilterControl::default()
-        },
+        }),
         ..ViPresentation::default()
     })?;
     let capture = backend.presented_pixels()?;

@@ -208,10 +208,10 @@ fn settings() -> Result<RenderRuntimeSettings, Box<dyn Error>> {
 fn presentation() -> ViPresentation {
     ViPresentation {
         noise_seed: 0x4c4f_4421,
-        filters: ViFilterControl {
+        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
             pixel_type: ViPixelType::Rgba16,
             ..ViFilterControl::default()
-        },
+        }),
         ..ViPresentation::default()
     }
 }

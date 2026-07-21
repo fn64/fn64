@@ -406,10 +406,10 @@ fn run_case(
     }
     backend.present(ViPresentation {
         noise_seed: 0x6412_0000 | case as u64,
-        filters: ViFilterControl {
+        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
             pixel_type: ViPixelType::Rgba16,
             ..ViFilterControl::default()
-        },
+        }),
         ..ViPresentation::default()
     })?;
     require_guards(&rdram, &regions)?;

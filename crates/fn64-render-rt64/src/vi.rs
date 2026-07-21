@@ -13,16 +13,27 @@ pub(crate) fn scanout(
     source: &Framebuffer,
     presentation: ViPresentation,
 ) -> Result<Framebuffer, RenderError> {
+    let filters = presentation.scanout.filters();
+    let registers = presentation.scanout.registers();
+    let active_window = registers.and_then(|registers| registers.active_window());
     let mut output = source.clone();
-    if presentation.blanked || presentation.filters.pixel_type == ViPixelType::Blank {
-        output.clear(0, 0, 0, 255);
-        return Ok(output);
-    }
-    if presentation.filters.pixel_type == ViPixelType::Reserved {
+    if filters.pixel_type == ViPixelType::Reserved {
         return Err(RenderError::Backend {
             backend: "reference",
             reason: "VI STATUS selects reserved pixel type 1".to_string(),
         });
+    }
+    if registers.is_some() && active_window.is_none() {
+        let mut inactive = output_with_geometry(source, 0, 0);
+        inactive.clear(0, 0, 0, 255);
+        return Ok(inactive);
+    }
+    if presentation.blanked || filters.pixel_type == ViPixelType::Blank {
+        if let Some(window) = active_window {
+            output = output_with_geometry(source, window.output_width(), window.output_height());
+        }
+        output.clear(0, 0, 0, 255);
+        return Ok(output);
     }
 
     let row_bytes = usize::try_from(source.width)
@@ -63,11 +74,11 @@ pub(crate) fn scanout(
         }
     }
 
-    let silhouette_aa_enabled = presentation.filters.antialias_mode.silhouette_aa_enabled();
-    if silhouette_aa_enabled || presentation.filters.dither_filter {
-        let restoration_enabled = presentation.filters.dither_filter;
+    let silhouette_aa_enabled = filters.antialias_mode.silhouette_aa_enabled();
+    if silhouette_aa_enabled || filters.dither_filter {
+        let restoration_enabled = filters.dither_filter;
         if restoration_enabled
-            && (presentation.filters.pixel_type != ViPixelType::Rgba16
+            && (filters.pixel_type != ViPixelType::Rgba16
                 || source.color_layout() != gbi::ColorImageLayout::Rgba16)
         {
             return Err(RenderError::Backend {
@@ -75,9 +86,7 @@ pub(crate) fn scanout(
                 reason: "VI dither restoration requires an RGBA16 scanout image".to_string(),
             });
         }
-        let interlaced = presentation
-            .resample
-            .is_some_and(|control| control.field.interlaced());
+        let interlaced = registers.is_some_and(|registers| registers.resample().field.interlaced());
         filter_scanout(
             source,
             &mut output,
@@ -86,19 +95,34 @@ pub(crate) fn scanout(
             restoration_enabled,
         );
     }
-    if presentation.filters.divot {
+    if filters.divot {
         apply_divot(source, &mut output);
     }
-    if let Some(control) = presentation
-        .resample
-        .filter(|_| presentation.filters.antialias_mode.resampling_enabled())
-    {
-        apply_resampling(&mut output, control);
+    match registers {
+        Some(registers) if filters.antialias_mode.resampling_enabled() => {
+            let window = active_window.expect("active VI register image lost its window");
+            output = apply_resampling(
+                &output,
+                registers.resample(),
+                window.output_width(),
+                window.output_height(),
+            );
+        }
+        Some(registers) => {
+            let window = active_window.expect("active VI register image lost its window");
+            output = apply_replication(
+                &output,
+                registers.resample(),
+                window.output_width(),
+                window.output_height(),
+            );
+        }
+        None => {}
     }
-    if presentation.filters.gamma {
+    if filters.gamma {
         apply_gamma(&mut output);
     }
-    if presentation.filters.gamma_dither {
+    if filters.gamma_dither {
         apply_gamma_dither(&mut output, presentation.noise_seed);
     }
     Ok(output)
@@ -385,31 +409,39 @@ fn interpolate_u2_10(lower: u8, upper: u8, fraction_u0_10: u16) -> u8 {
 
 /// US 6,166,748 Figures 34A/35M/35N: vertical linear interpolation between
 /// successive filtered lines precedes horizontal linear interpolation between
-/// neighboring pixels. The configured host framebuffer extent is the output
-/// extent. Out-of-range fetches clamp to the last source sample; neither that
-/// border rule nor integer rounding is claimed as silicon behavior. All four
-/// stored host channels share this interpolation so identity scanout preserves
-/// alpha; that is a host-representation contract, not a VI silicon-alpha claim.
-fn apply_resampling(output: &mut Framebuffer, control: ViResampleControl) {
-    let width = output.width as usize;
-    let height = output.height as usize;
+/// neighboring pixels. H_START/V_START supply the output extent while X/Y
+/// scale supply source positions. Out-of-range fetches clamp to the last source
+/// sample; neither that border rule nor integer rounding is claimed as silicon
+/// behavior. All four stored host channels share this interpolation so identity
+/// scanout preserves alpha; that is a host-representation contract, not a VI
+/// silicon-alpha claim.
+fn apply_resampling(
+    source: &Framebuffer,
+    control: ViResampleControl,
+    output_width: u32,
+    output_height: u32,
+) -> Framebuffer {
+    let source_width = source.width as usize;
+    let source_height = source.height as usize;
+    let width = output_width as usize;
+    let height = output_height as usize;
     assert!(
-        width > 0 && height > 0,
+        source_width > 0 && source_height > 0 && width > 0 && height > 0,
         "VI resampling requires a nonempty framebuffer"
     );
-    let original = output.pixels.clone();
-    let mut vertical = vec![0u8; original.len()];
+    let mut output = output_with_geometry(source, output_width, output_height);
+    let mut vertical = vec![0u8; height * source_width * 4];
 
     for y in 0..height {
-        let sample = AxisSample::from_output(y, control.y, height);
-        for x in 0..width {
-            let destination = (y * width + x) * 4;
-            let lower = (sample.lower * width + x) * 4;
-            let upper = (sample.upper * width + x) * 4;
+        let sample = AxisSample::from_output(y, control.y, source_height);
+        for x in 0..source_width {
+            let destination = (y * source_width + x) * 4;
+            let lower = (sample.lower * source_width + x) * 4;
+            let upper = (sample.upper * source_width + x) * 4;
             for channel in 0..4 {
                 vertical[destination + channel] = interpolate_u2_10(
-                    original[lower + channel],
-                    original[upper + channel],
+                    source.pixels[lower + channel],
+                    source.pixels[upper + channel],
                     sample.fraction_u0_10(),
                 );
             }
@@ -418,10 +450,10 @@ fn apply_resampling(output: &mut Framebuffer, control: ViResampleControl) {
 
     for y in 0..height {
         for x in 0..width {
-            let sample = AxisSample::from_output(x, control.x, width);
+            let sample = AxisSample::from_output(x, control.x, source_width);
             let destination = (y * width + x) * 4;
-            let lower = (y * width + sample.lower) * 4;
-            let upper = (y * width + sample.upper) * 4;
+            let lower = (y * source_width + sample.lower) * 4;
+            let upper = (y * source_width + sample.upper) * 4;
             for channel in 0..4 {
                 output.pixels[destination + channel] = interpolate_u2_10(
                     vertical[lower + channel],
@@ -431,6 +463,44 @@ fn apply_resampling(output: &mut Framebuffer, control: ViResampleControl) {
             }
         }
     }
+    output
+}
+
+/// Public AA mode 3 selects replication instead of filtered resampling. It
+/// still consumes the programmed X/Y coordinate generators and active output
+/// extent, but chooses the lower resident sample without interpolation.
+fn apply_replication(
+    source: &Framebuffer,
+    control: ViResampleControl,
+    output_width: u32,
+    output_height: u32,
+) -> Framebuffer {
+    let source_width = source.width as usize;
+    let source_height = source.height as usize;
+    let width = output_width as usize;
+    let height = output_height as usize;
+    assert!(
+        source_width > 0 && source_height > 0 && width > 0 && height > 0,
+        "VI replication requires nonempty source and output geometry"
+    );
+    let mut output = output_with_geometry(source, output_width, output_height);
+    for y in 0..height {
+        let source_y = AxisSample::from_output(y, control.y, source_height).lower;
+        for x in 0..width {
+            let source_x = AxisSample::from_output(x, control.x, source_width).lower;
+            let source_offset = (source_y * source_width + source_x) * 4;
+            let destination = (y * width + x) * 4;
+            output.pixels[destination..destination + 4]
+                .copy_from_slice(&source.pixels[source_offset..source_offset + 4]);
+        }
+    }
+    output
+}
+
+fn output_with_geometry(source: &Framebuffer, width: u32, height: u32) -> Framebuffer {
+    let mut output = Framebuffer::new(width, height);
+    output.set_color_layout(source.color_layout());
+    output
 }
 
 /// US 6,166,748, Video Interface: pixels on or next to a silhouette edge use
@@ -506,7 +576,9 @@ fn apply_gamma_dither(output: &mut Framebuffer, seed: u64) {
 mod tests {
     use super::*;
     use crate::raster::Coverage;
-    use fn64_render::{ViAaMode, ViFilterControl};
+    use fn64_render::{
+        ViAaMode, ViFilterControl, ViScanoutField, ViScanoutRegisters, ViScanoutState,
+    };
 
     fn grayscale(values: &[u8], width: u32) -> Framebuffer {
         assert_eq!(values.len() % width as usize, 0);
@@ -688,13 +760,17 @@ mod tests {
         scanout(
             source,
             ViPresentation {
-                filters: ViFilterControl {
-                    pixel_type: ViPixelType::Rgba16,
-                    antialias_mode,
-                    dither_filter,
-                    ..Default::default()
-                },
-                resample,
+                scanout: test_scanout_state(
+                    ViFilterControl {
+                        pixel_type: ViPixelType::Rgba16,
+                        antialias_mode,
+                        dither_filter,
+                        ..Default::default()
+                    },
+                    resample,
+                    source.width,
+                    source.height,
+                ),
                 ..Default::default()
             },
         )
@@ -746,18 +822,257 @@ mod tests {
         )
     }
 
+    fn test_scanout_state(
+        filters: ViFilterControl,
+        resample: Option<ViResampleControl>,
+        width: u32,
+        height: u32,
+    ) -> ViScanoutState {
+        test_scanout_state_with_window(filters, resample, width, width, height * 2)
+    }
+
+    fn test_scanout_state_with_window(
+        filters: ViFilterControl,
+        resample: Option<ViResampleControl>,
+        source_width: u32,
+        h_start: u32,
+        v_start: u32,
+    ) -> ViScanoutState {
+        let Some(resample) = resample else {
+            return ViScanoutState::BackendOnly(filters);
+        };
+        let pixel_type = match filters.pixel_type {
+            ViPixelType::Blank => 0,
+            ViPixelType::Reserved => 1,
+            ViPixelType::Unspecified | ViPixelType::Rgba16 => 2,
+            ViPixelType::Rgba32 => 3,
+        };
+        let mut status = pixel_type
+            | filters.antialias_mode.status_bits().unwrap_or(0)
+            | (u32::from(filters.gamma_dither) << 2)
+            | (u32::from(filters.gamma) << 3)
+            | (u32::from(filters.divot) << 4)
+            | (u32::from(filters.dither_filter) << 16);
+        let field = match resample.field {
+            ViScanoutField::Progressive => 0,
+            ViScanoutField::InterlacedEven => {
+                status |= 1 << 6;
+                0
+            }
+            ViScanoutField::InterlacedOdd => {
+                status |= 1 << 6;
+                1
+            }
+        };
+        let mut words = [0u32; ViScanoutRegisters::WORD_COUNT];
+        words[0] = status;
+        words[2] = source_width;
+        words[4] = field;
+        words[9] = h_start;
+        words[10] = v_start;
+        words[12] =
+            u32::from(resample.x.step_u2_10()) | (u32::from(resample.x.offset_u2_10()) << 16);
+        words[13] =
+            u32::from(resample.y.step_u2_10()) | (u32::from(resample.y.offset_u2_10()) << 16);
+        ViScanoutState::Registers(ViScanoutRegisters::from_words(words))
+    }
+
+    #[test]
+    fn active_window_drives_post_vi_extent_and_source_crop() {
+        let source = grayscale(&[0, 40, 80, 120, 10, 50, 90, 130], 4);
+        let filters = ViFilterControl {
+            pixel_type: ViPixelType::Rgba32,
+            antialias_mode: ViAaMode::ResampleOnly,
+            ..Default::default()
+        };
+        let output = scanout(
+            &source,
+            ViPresentation {
+                scanout: test_scanout_state_with_window(
+                    filters,
+                    Some(resample_control(
+                        ViScaleAxis::ONE,
+                        ViScaleAxis::ONE,
+                        ViScaleAxis::ONE,
+                        0,
+                    )),
+                    source.width,
+                    (100 << 16) | 102,
+                    (20 << 16) | 24,
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((output.width, output.height), (2, 2));
+        let red = output
+            .pixels
+            .chunks_exact(4)
+            .map(|pixel| pixel[0])
+            .collect::<Vec<_>>();
+        assert_eq!(red, [40, 80, 50, 90]);
+    }
+
+    #[test]
+    fn normal_640_dot_window_consumes_half_rate_source_coordinates() {
+        let values = (0..320).map(|x| (x % 251) as u8).collect::<Vec<_>>();
+        let source = grayscale(&values, 320);
+        let output = scanout(
+            &source,
+            ViPresentation {
+                scanout: test_scanout_state_with_window(
+                    ViFilterControl {
+                        pixel_type: ViPixelType::Rgba32,
+                        antialias_mode: ViAaMode::ResampleOnly,
+                        ..Default::default()
+                    },
+                    Some(resample_control(0x0200, 0, ViScaleAxis::ONE, 0)),
+                    source.width,
+                    0x006c_02ec,
+                    (37 << 16) | 39,
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((output.width, output.height), (640, 1));
+        let red = output
+            .pixels
+            .chunks_exact(4)
+            .map(|pixel| pixel[0])
+            .collect::<Vec<_>>();
+        assert_eq!((red[0], red[1], red[2], red[200]), (0, 1, 1, 100));
+        assert_eq!(red[639], values[319]);
+    }
+
+    #[test]
+    fn active_window_extent_survives_blank_fade_and_repeat_line() {
+        let source = grayscale(&[0, 40, 80, 120, 10, 50, 90, 130], 4);
+        let scanout_state = test_scanout_state_with_window(
+            ViFilterControl {
+                pixel_type: ViPixelType::Rgba32,
+                antialias_mode: ViAaMode::ResampleOnly,
+                ..Default::default()
+            },
+            Some(resample_control(
+                ViScaleAxis::ONE,
+                ViScaleAxis::ONE,
+                ViScaleAxis::ONE,
+                0,
+            )),
+            source.width,
+            (100 << 16) | 102,
+            (20 << 16) | 22,
+        );
+        let blank = scanout(
+            &source,
+            ViPresentation {
+                blanked: true,
+                scanout: scanout_state,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((blank.width, blank.height), (2, 1));
+        assert!(blank
+            .pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel == [0, 0, 0, 255]));
+
+        let fade = scanout(
+            &source,
+            ViPresentation {
+                fade: Some(0x03ff),
+                scanout: scanout_state,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((fade.width, fade.height), (2, 1));
+        assert_eq!(
+            fade.pixels
+                .chunks_exact(4)
+                .map(|pixel| pixel[0])
+                .collect::<Vec<_>>(),
+            [50, 90]
+        );
+
+        let repeated = scanout(
+            &source,
+            ViPresentation {
+                repeat_line: true,
+                scanout: scanout_state,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((repeated.width, repeated.height), (2, 1));
+        assert_eq!(
+            repeated
+                .pixels
+                .chunks_exact(4)
+                .map(|pixel| pixel[0])
+                .collect::<Vec<_>>(),
+            [40, 80]
+        );
+    }
+
+    #[test]
+    fn explicit_blanking_does_not_mask_reserved_vi_pixel_type() {
+        let source = grayscale(&[0], 1);
+        let error = match scanout(
+            &source,
+            ViPresentation {
+                blanked: true,
+                scanout: ViScanoutState::BackendOnly(ViFilterControl {
+                    pixel_type: ViPixelType::Reserved,
+                    ..ViFilterControl::default()
+                }),
+                ..ViPresentation::default()
+            },
+        ) {
+            Ok(_) => panic!("reserved VI pixel type was hidden by explicit blanking"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "reference backend error: VI STATUS selects reserved pixel type 1"
+        );
+    }
+
+    #[test]
+    fn inactive_live_window_does_not_fall_back_to_host_geometry() {
+        let source = grayscale(&[0, 40, 80, 120], 2);
+        let mut words = [0u32; ViScanoutRegisters::WORD_COUNT];
+        words[0] = 3;
+        words[1] = 0x0010_0000;
+        words[2] = 2;
+        let output = scanout(
+            &source,
+            ViPresentation {
+                scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(words)),
+                ..ViPresentation::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((output.width, output.height), (0, 0));
+        assert!(output.pixels.is_empty());
+    }
+
     #[test]
     fn resampling_identity_and_xy_half_step_offset_vectors() {
-        let mut identity = grayscale(&[0, 40, 80, 80, 120, 160, 160, 200, 240], 3);
+        let identity = grayscale(&[0, 40, 80, 80, 120, 160, 160, 200, 240], 3);
         let expected = identity.pixels.clone();
-        apply_resampling(
-            &mut identity,
+        let identity = apply_resampling(
+            &identity,
             resample_control(ViScaleAxis::ONE, 0, ViScaleAxis::ONE, 0),
+            3,
+            3,
         );
         assert_eq!(identity.pixels, expected);
 
-        let mut half = grayscale(&[0, 40, 80, 80, 120, 160, 160, 200, 240], 3);
-        apply_resampling(&mut half, resample_control(512, 512, 512, 512));
+        let half_source = grayscale(&[0, 40, 80, 80, 120, 160, 160, 200, 240], 3);
+        let half = apply_resampling(&half_source, resample_control(512, 512, 512, 512), 3, 3);
         let red = half
             .pixels
             .chunks_exact(4)
@@ -795,22 +1110,26 @@ mod tests {
 
     #[test]
     fn resampling_preserves_host_alpha_for_identity_and_fractional_positions() {
-        let mut identity = grayscale(&[0, 40], 2);
-        identity.pixels[3] = 17;
-        identity.pixels[7] = 201;
-        let expected = identity.pixels.clone();
-        apply_resampling(
-            &mut identity,
+        let mut identity_source = grayscale(&[0, 40], 2);
+        identity_source.pixels[3] = 17;
+        identity_source.pixels[7] = 201;
+        let expected = identity_source.pixels.clone();
+        let identity = apply_resampling(
+            &identity_source,
             resample_control(ViScaleAxis::ONE, 0, ViScaleAxis::ONE, 0),
+            2,
+            1,
         );
         assert_eq!(identity.pixels, expected);
 
-        let mut horizontal = grayscale(&[0, 255], 2);
-        horizontal.pixels[3] = 0;
-        horizontal.pixels[7] = 200;
-        apply_resampling(
-            &mut horizontal,
+        let mut horizontal_source = grayscale(&[0, 255], 2);
+        horizontal_source.pixels[3] = 0;
+        horizontal_source.pixels[7] = 200;
+        let horizontal = apply_resampling(
+            &horizontal_source,
             resample_control(ViScaleAxis::ONE, 512, ViScaleAxis::ONE, 0),
+            2,
+            1,
         );
         let alpha = horizontal
             .pixels
@@ -819,12 +1138,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(alpha, [100, 200]);
 
-        let mut vertical = grayscale(&[0, 255], 1);
-        vertical.pixels[3] = 20;
-        vertical.pixels[7] = 220;
-        apply_resampling(
-            &mut vertical,
+        let mut vertical_source = grayscale(&[0, 255], 1);
+        vertical_source.pixels[3] = 20;
+        vertical_source.pixels[7] = 220;
+        let vertical = apply_resampling(
+            &vertical_source,
             resample_control(ViScaleAxis::ONE, 0, ViScaleAxis::ONE, 512),
+            1,
+            2,
         );
         let alpha = vertical
             .pixels
@@ -889,10 +1210,12 @@ mod tests {
 
     #[test]
     fn resampling_clamps_register_derived_fetches_to_source_extent() {
-        let mut output = grayscale(&[0, 40, 80], 3);
-        apply_resampling(
-            &mut output,
+        let source = grayscale(&[0, 40, 80], 3);
+        let output = apply_resampling(
+            &source,
             resample_control(ViScaleAxis::ONE, 512, ViScaleAxis::ONE, 0),
+            3,
+            1,
         );
         let red = output
             .pixels
@@ -933,17 +1256,21 @@ mod tests {
         let output = scanout(
             &source,
             ViPresentation {
-                filters: ViFilterControl {
-                    pixel_type: ViPixelType::Rgba32,
-                    gamma: true,
-                    ..ViFilterControl::default()
-                },
-                resample: Some(resample_control(
-                    ViScaleAxis::ONE,
-                    ViScaleAxis::ONE / 2,
-                    ViScaleAxis::ONE,
-                    0,
-                )),
+                scanout: test_scanout_state(
+                    ViFilterControl {
+                        pixel_type: ViPixelType::Rgba32,
+                        gamma: true,
+                        ..ViFilterControl::default()
+                    },
+                    Some(resample_control(
+                        ViScaleAxis::ONE,
+                        ViScaleAxis::ONE / 2,
+                        ViScaleAxis::ONE,
+                        0,
+                    )),
+                    source.width,
+                    source.height,
+                ),
                 ..ViPresentation::default()
             },
         )
@@ -1011,14 +1338,14 @@ mod tests {
         let output = scanout(
             &source,
             ViPresentation {
-                filters: ViFilterControl {
+                scanout: ViScanoutState::BackendOnly(ViFilterControl {
                     pixel_type: ViPixelType::Rgba16,
                     antialias_mode: ViAaMode::AaResampleAlways,
                     gamma: true,
                     gamma_dither: true,
                     divot: true,
                     dither_filter: true,
-                },
+                }),
                 noise_seed: 0x0123_4567_89ab_cdef,
                 ..ViPresentation::default()
             },

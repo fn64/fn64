@@ -391,11 +391,30 @@ The registered backend remains owned behind `dyn RenderBackend`, so the live
 OoT host retrieves it through the backend-neutral `release_capture` seam rather
 than downcasting or retaining an RT64 alias. RT64 records
 `ViPresentation::noise_seed`, which integrated execution sets to the exact VI
-retrace guest cycle, only after `present` succeeds. The host requires that
-cycle to equal the fixed-cycle gate before it accepts the pixels. An arbitrary
-cycle between presents therefore fails loudly instead of relabeling the prior
-swapchain image. When an RT64 release gate is armed, capture setup or device
-creation failure is fatal and cannot select the reference fallback.
+retrace guest cycle. Every field is presented exactly once, including repeated
+progressive register images, and RT64 retains that cycle only after `present`
+succeeds. The host requires the retained cycle to equal the fixed-cycle gate
+before it accepts the pixels. An arbitrary cycle between presents therefore
+fails loudly instead of relabeling the prior swapchain image. When an RT64
+release gate is armed, capture setup or device creation failure is fatal and
+cannot select the reference fallback.
+
+Integrated presentation now crosses the native adapter with one complete
+fourteen-word VI snapshot rather than reconstructing geometry from the host
+window. RT64 receives the selected field's origin, source width, timing,
+H/V active window, and X/Y scale together; its origin compensation uses the
+retained register pixel type and effective 12-bit source stride, with one row
+for ordinary fields and RT64's two-row convention for odd serrated fields. The
+context preserves
+that image across the no-argument VI refresh performed by later HLE/raw tasks
+and resize, so PresentEarly or buffered work cannot silently revert to the
+compatibility 108..748/identity-scale image. A live zero H/V window remains
+inactive instead of selecting compatibility geometry. Backend-only examples
+still use that compatibility image explicitly. The no-device adapter test
+binds both the initial and no-argument-reapplied 24-word images; source review
+separately verifies that HLE/raw/resize paths invoke that reapplication.
+Hardware-exact border, field phase, and analog output remain outside this
+claim.
 
 A clean Git source is the only automatically authoritative identity. A dirty
 checkout remains visible as `git-dirty`; `FN64_RT64_SOURCE_ID` is visible as

@@ -2308,6 +2308,10 @@ pub struct Rt64AdapterCapture {
     pub width: u32,
     pub height: u32,
     pub registers: [u32; 24],
+    /// Same context after the no-argument refresh used by the next HLE/raw
+    /// task or resize. Equality proves that submission did not restore
+    /// compatibility geometry over the retained live VI image.
+    pub registers_after_submission: [u32; 24],
 }
 
 /// Byte layout returned by RT64's post-VI swapchain render-target capture.
@@ -2774,7 +2778,7 @@ impl Rt64AdapterCapture {
         use sha2::Digest;
 
         let mut hasher = sha2::Sha256::new();
-        hasher.update(b"fn64-rt64-adapter-capture-v1\0");
+        hasher.update(b"fn64-rt64-adapter-capture-v2\0");
         for word in self.task_words {
             hasher.update(word.to_be_bytes());
         }
@@ -2782,6 +2786,9 @@ impl Rt64AdapterCapture {
             hasher.update(word.to_be_bytes());
         }
         for word in self.registers {
+            hasher.update(word.to_be_bytes());
+        }
+        for word in self.registers_after_submission {
             hasher.update(word.to_be_bytes());
         }
         hasher.finalize().into()
@@ -5398,7 +5405,7 @@ mod tests {
         fb.pixels[4 * 4..4 * 4 + 4].copy_from_slice(&[80, 80, 80, 255]);
         backend
             .present(ViPresentation {
-                filters: rgba16,
+                scanout: fn64_render::ViScanoutState::BackendOnly(rgba16),
                 ..Default::default()
             })
             .unwrap();
@@ -5412,11 +5419,11 @@ mod tests {
         fb.coverage[1] = raster::Coverage::new(4);
         backend
             .present(ViPresentation {
-                filters: fn64_render::ViFilterControl {
+                scanout: fn64_render::ViScanoutState::BackendOnly(fn64_render::ViFilterControl {
                     pixel_type: ViPixelType::Rgba16,
                     divot: true,
                     ..Default::default()
-                },
+                }),
                 ..Default::default()
             })
             .unwrap();
@@ -5428,11 +5435,11 @@ mod tests {
         backend.fb.as_mut().unwrap().pixels[0..4].copy_from_slice(&[64, 0, 255, 255]);
         backend
             .present(ViPresentation {
-                filters: fn64_render::ViFilterControl {
+                scanout: fn64_render::ViScanoutState::BackendOnly(fn64_render::ViFilterControl {
                     pixel_type: ViPixelType::Rgba32,
                     gamma: true,
                     ..Default::default()
-                },
+                }),
                 ..Default::default()
             })
             .unwrap();
@@ -5448,11 +5455,11 @@ mod tests {
         backend.create(&RenderConfig::new(1, 1)).unwrap();
         backend.fb.as_mut().unwrap().pixels[0..4].copy_from_slice(&[101, 101, 101, 255]);
         let presentation = |noise_seed| ViPresentation {
-            filters: fn64_render::ViFilterControl {
+            scanout: fn64_render::ViScanoutState::BackendOnly(fn64_render::ViFilterControl {
                 pixel_type: ViPixelType::Rgba16,
                 gamma_dither: true,
                 ..Default::default()
-            },
+            }),
             noise_seed,
             ..Default::default()
         };

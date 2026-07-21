@@ -157,10 +157,10 @@ fn render(backend: &mut Rt64Backend, guest_cycle: u64) -> Result<Observation, Bo
     }
     backend.present(ViPresentation {
         noise_seed: guest_cycle,
-        filters: ViFilterControl {
+        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
             pixel_type: ViPixelType::Rgba16,
             ..ViFilterControl::default()
-        },
+        }),
         ..ViPresentation::default()
     })?;
     let pixels = backend.presented_pixels()?;
@@ -432,10 +432,10 @@ fn render_copy_region_profile(
     let copy_path = backend.framebuffer_copy_path_evidence()?;
     backend.present(ViPresentation {
         noise_seed: guest_cycle,
-        filters: ViFilterControl {
+        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
             pixel_type: ViPixelType::Rgba16,
             ..ViFilterControl::default()
-        },
+        }),
         ..ViPresentation::default()
     })?;
     let capture = backend.presented_pixels()?;

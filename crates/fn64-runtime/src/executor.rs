@@ -915,8 +915,12 @@ impl Executor {
     /// this only after MI has latched; the standalone executor ticker has no
     /// MI owner. Pending VI state becomes
     /// current before either notification path can wake a guest thread.
-    /// Returns whether scanout-visible framebuffer or blanking state changed
-    /// at this V-blank.
+    /// Returns whether manager-owned framebuffer, special-feature bits,
+    /// black, fade, or repeat-line state changed at this V-blank; mode and
+    /// scale changes are omitted. The integrated device path presents every
+    /// field because field registers and retrace-seeded noise can change even
+    /// when this high-level state does not. Callers must not use this partial
+    /// manager delta as presentation admission authority.
     pub fn deliver_vi_retrace(&mut self) -> bool {
         let framebuffer_changed = self.peripherals.vi_latch_retrace();
         self.retrace_ticks_fired = self.retrace_ticks_fired.saturating_add(1);

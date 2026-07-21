@@ -1070,7 +1070,53 @@ pub fn c_recomp_entrypoint() -> fn64_abi::RecompFunc {
 mod tests {
     use super::*;
 
+    struct BoundaryRenderBackend;
+
+    impl fn64_render::RenderBackend for BoundaryRenderBackend {
+        fn create(
+            &mut self,
+            _cfg: &fn64_render::RenderConfig,
+        ) -> Result<(), fn64_render::RenderError> {
+            Ok(())
+        }
+
+        fn observe_non_rdp_write16(
+            &mut self,
+            _write: fn64_render::NonRdpWrite16,
+        ) -> fn64_render::NonRdpWrite16Disposition {
+            fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+        }
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            _task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
+            Ok(fn64_render::FrameStatus::Complete)
+        }
+
+        fn present(
+            &mut self,
+            _vi: fn64_render::ViPresentation,
+        ) -> Result<(), fn64_render::RenderError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
+            &[]
+        }
+    }
+
+    fn install_boundary_render_backend() {
+        fn64_abi::set_render_backend(Box::new(BoundaryRenderBackend), 0);
+    }
+
     fn commit_synthetic_boundary(cycle: u64) -> Result<CommittedViBoundary, ViBoundaryError> {
+        install_boundary_render_backend();
         commit_scheduled_vi_boundary_with_program(cycle, ReleaseProgramDescriptor::NoProgram)
     }
 
@@ -1395,6 +1441,7 @@ mod tests {
             ));
             fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
             let scheduled = fn64_abi::next_vi_deadline().unwrap();
+            install_boundary_render_backend();
             let boundary = commit_scheduled_vi_boundary(scheduled).unwrap();
             assert_eq!(boundary.function_execution_destinations.len(), 1);
             assert_eq!(boundary.validate_unconsumed(), Ok(()));
@@ -1424,6 +1471,7 @@ mod tests {
             );
             fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
             let scheduled = fn64_abi::next_vi_deadline().unwrap();
+            install_boundary_render_backend();
             let failure = std::panic::catch_unwind(|| commit_scheduled_vi_boundary(scheduled))
                 .expect_err("identity-only function lane must fail the observation-schema gate");
             let message = failure
@@ -1493,6 +1541,7 @@ mod tests {
         let scheduled = fn64_abi::next_vi_deadline().unwrap();
         let mut gate = LiveReleaseGate::new(scheduled);
         gate.arm().unwrap();
+        install_boundary_render_backend();
         let boundary = commit_scheduled_vi_boundary(scheduled).unwrap();
         let path = std::env::temp_dir().join(format!(
             "fn64-unidentified-native-{}-{scheduled}.json",
