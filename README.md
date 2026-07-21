@@ -38,8 +38,8 @@ One workspace, separate crates, each publishable alone:
 | `fn64-abi` | The `extern "C"` surface recompiled code links against |
 | `fn64-boot-harness` | Shared generated-section bridge, registration callback, and RDRAM allocation for boot hosts |
 | `fn64-shell` | The executable: window, input, audio out, ROM intake |
-| `fn64-render` | Backend-agnostic render seam + the pure-Rust `ReferenceBackend` (headless CI oracle) |
-| `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/fn64/rt64) (MIT, C++) — all C++ interop quarantined here |
+| `fn64-render` | Backend-neutral render seam, content-addressed microcode admission, and raw-DPC completion inspection |
+| `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/fn64/rt64) (MIT, C++) plus the pure-Rust `ReferenceBackend` pending extraction — all C++ interop quarantined here |
 | `fn64-certification` | Executable cross-backend and native RT64 behavioral evidence gates |
 | `fn64-recomp` / `fn64-recomp-rs` | The Rust-emitting recompiler and its whole-ROM driver — the `rs` lane |
 | `fn64-audio` | RSP audio ucode execution |

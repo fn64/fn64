@@ -74,10 +74,13 @@ delete the adapter when no one needs the fork.
 
 We reach RT64 through exactly one boundary: **process a gfx display-list task
 → a rendered frame**, plus lifecycle (create device/window, present, resize).
-Everything RT64-specific (D3D12/Vulkan/Metal, HLE microcode handling) lives
-behind that. `fn64-rt64` (→ `fn64-render-rt64`) already exists as the intended quarantine crate.
+Everything RT64-specific (D3D12/Vulkan/Metal and native HLE execution) lives
+behind that. Backend-neutral content-addressed microcode admission and raw-DPC
+FullSync inspection live in `fn64-render`, so native and reference backends
+cannot drift on those handoff invariants. `fn64-rt64` (→
+`fn64-render-rt64`) already exists as the intended quarantine crate.
 
-### The trait (crate: `fn64-render`)
+### The shared seam (crate: `fn64-render`)
 
 ```rust
 /// A graphics backend: consumes N64 gfx tasks (F3DEX-family display lists from
@@ -107,6 +110,12 @@ same task cannot accidentally observe different banks. The backend still has
 no callback into runtime state: it receives exactly the two mutable memory
 resources the task can affect.
 
+The same crate owns exact SHA-256-to-wire-family catalogs for complete IMEM
+images and the public RDP Command Summary Table 11 width classifier used to
+inspect raw DPC ranges for FullSync. These are backend admission/completion
+mechanisms, not renderer implementations: the reference rasterizer and RT64
+adapter consume them through the same typed API.
+
 `PresentRequest` co-binds `ViPresentation`'s V-blank-latched scanout state with
 a move-only `PhysicalRdramRead` capability for that exact retrace. Integrated
 execution creates the capability while the guest is suspended and without a
@@ -128,6 +137,8 @@ the deterministic reference filter halo remains a separate policy.
 ### Adapter today: `fn64-render-rt64` (= the current `fn64-rt64` (→ `fn64-render-rt64`), renamed by role)
 
 Implements `RenderBackend` over the MIT RT64 fork via FFI. Owns all C++ interop.
+It temporarily also contains the pure-Rust `ReferenceBackend`; that backend is
+being extracted without changing the frozen `fn64-render` seam.
 The runtime and shell see only `dyn RenderBackend`. Tests: task-fixture replays
 (a captured display list → a frame hash), and the trap path (unlisted ucode →
 named error, not a crash).
@@ -146,7 +157,8 @@ adapter first (we need the reference to diff against).
 This list is kept for the rationale, not as a work queue — read the annotations
 before following it.
 
-1. ~~**Define the traits**~~ **DONE.** `fn64-render`'s `RenderBackend` lives at
+1. ~~**Define the shared seam**~~ **DONE.** `fn64-render`'s `RenderBackend`,
+   content-addressed admission, and raw-DPC completion inspection live at
    `crates/fn64-render/src/lib.rs`; the recomp side landed as the `c`/`rs` lane
    split (DESIGN.md §1.1).
 2. ~~**Wrap the recompiler fork** as `fn64-recomp-n64recomp`~~ **NOT DONE, and
@@ -178,8 +190,9 @@ rebuilt correctly on our schedule.
 A crate marks a **swap boundary** (backend you can replace) or a **cross-tool shared type**.
 Not a topic. MMIO / save / libultra are modules *inside* `fn64-runtime`, not crates.
 
-**Exists:** fn64-runtime, fn64-abi, fn64-render (trait), fn64-render-rt64 (RT64 stub + reference
-raster), fn64-shell.
+**Exists:** fn64-runtime, fn64-abi, fn64-render (trait + neutral render
+mechanisms), fn64-render-rt64 (RT64 adapter + reference raster pending
+extraction), fn64-shell.
 
 **To add, prioritized:**
 1. **fn64-audio** — the `AudioBackend` trait (consume AI samples → host stream) + a cpal backend +

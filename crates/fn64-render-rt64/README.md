@@ -46,6 +46,11 @@ perimeter arithmetic and wrapped/subpixel/filter-corrected backgrounds remain
 loud named frontiers.
 See [`S2DEX-CONCEPTS.md`](S2DEX-CONCEPTS.md) for the exact frontier.
 
+The admission catalogs and public raw-RDP FullSync inspector live in
+`fn64-render`, not in either backend. This crate consumes those shared
+mechanisms while the decoder, rasterizer, and native adapter remain separated
+in later extraction steps.
+
 The reference lane also keeps the RDP device alive across task boundaries.
 Other mode, combiner/key/convert and constant-color registers, fill color,
 scissor, the texture-image latch, all eight tile descriptors, TLUT, and the
@@ -411,9 +416,10 @@ unknown capture backend and any explicit-request mismatch fail closed. The
 identity records the selected source tree as a clean/dirty Git revision or an
 explicitly declared source ID, the concrete post-VI API, and `adapter_sha256`:
 a canonical digest over the fn64-owned `Cargo.toml`, `build.rs`, every Rust
-adapter source, the CMake wrapper/shim sources, the compilation target, and the
-sorted enabled feature set. Cargo reruns the identity step when any covered
-source changes. The no-argument `Rt64Backend::release_identity()` is retained
+adapter source, the shared `fn64-render` manifest and Rust sources, the CMake
+wrapper/shim sources, the compilation target, and the sorted enabled feature
+set. Cargo reruns the identity step when any covered source changes. The
+no-argument `Rt64Backend::release_identity()` is retained
 for non-release behavior examples and remains intentionally ambiguous on
 Windows; report generation never accepts that ambiguous identity.
 `LiveRenderEvidence` from `fn64-boot-harness`

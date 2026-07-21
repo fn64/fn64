@@ -15,8 +15,8 @@ fn64-runtime   core: scheduler, OSMesgQueue, timers, PI/SI/VI/AI plumbing, rdram
 fn64-abi       the extern "C" surface recompiled code links against
 fn64-boot-harness shared generated-section bridge/registration and ABI-sized rdram allocation
 fn64-shell     the executable: window, input, audio out, ROM/RecompiledFuncs intake
-fn64-render    backend-agnostic render seam + the pure-Rust ReferenceBackend (A/B oracle)
-fn64-render-rt64 FFI bridge to RT64 (C++) -- all C++ interop quarantined here
+fn64-render    backend-neutral render seam, exact microcode admission, and raw-DPC completion inspection
+fn64-render-rt64 FFI bridge to RT64 (C++) + ReferenceBackend pending extraction
 fn64-certification executable behavioral evidence gates over the public renderer seams
 fn64-recomp / fn64-recomp-rs  the Rust-emitting recompiler and its whole-ROM driver (§1.1's `rs` lane)
 fn64-audio     RSP audio ucode execution
@@ -34,7 +34,7 @@ fn64-shell ──depends on──> fn64-abi ──depends on──> fn64-runtime
     │                                                    ^
     └──────────────────depends on───────────────────────┘
     └──depends on──> fn64-boot-harness ──depends on──> fn64-abi + fn64-runtime
-    └──depends on──> fn64-rt64 ──depends on──> fn64-runtime (types only)
+    └──depends on──> fn64-rt64 ──depends on──> fn64-render ──depends on──> fn64-runtime
 fn64-certification ──depends on──> fn64-render + fn64-render-rt64 + fn64-runtime
 ```
 
@@ -100,10 +100,11 @@ starts after two AI DMAs are queued, and exists only to absorb callback jitter;
 letting its depth leak into `AI_LEN` would make guest buffer sizing depend on
 host latency rather than N64 hardware state.
 
-`fn64-rt64` depends on `fn64-runtime` (for the shared types the gfx task
-handoff needs to name -- e.g. an rdram-relative address newtype, task
-buffers) but is the ONLY crate in the workspace permitted to contain C++ or
-call into RT64's C++ API. Rationale, three reasons:
+`fn64-rt64` depends on `fn64-render`, which owns the backend-neutral task,
+microcode-admission, runtime-policy, and raw-DPC completion seams, and on
+`fn64-runtime` for persistent RSP memory and device value types. It is the ONLY
+crate in the workspace permitted to contain C++ or call into RT64's C++ API.
+Rationale, three reasons:
 
 1. **License and language boundary are the same boundary.** RT64 is MIT but
    C++; keeping all `cxx`/`bindgen`/raw-FFI surface in one crate means a
@@ -814,8 +815,9 @@ task calls out:
   infers it from a preceding HLE call. Each successful backend operation also
   returns typed `Reached`/`NotReached` FullSync evidence. HLE derives it from
   the admitted display-list operation stream; raw DRAM and staged XBUS ranges
-  walk exact public command widths, so a triangle coefficient that resembles
-  opcode `0xe9` cannot fabricate completion. `Unidentified` is accepted only
+  use the backend-neutral `fn64-render` inspector to walk exact public command
+  widths, so a triangle coefficient that resembles opcode `0xe9` cannot
+  fabricate completion. `Unidentified` is accepted only
   as a backend's pre-operation state and traps if a successful operation leaves
   it unresolved. This implements the public RDP Programming Manual's
   Sync Full command-to-DP-interrupt relationship without treating every
@@ -843,6 +845,13 @@ task calls out:
   chunking still requires an upstream-owned checkpoint representation; a
   yield-buffer image cannot reconstruct an arbitrary host call stack or
   renderer-local state.
+  Exact task-entry and self-loaded microcode admission is likewise owned by
+  `fn64-render`: catalogs bind the complete IMEM SHA-256 to an explicit public
+  wire family, while release recognition can additionally bind the exact data
+  image identity. Backends consume that shared mechanism rather than carrying
+  independent digest maps. The admission rule follows the public GBI family
+  boundaries; it does not infer compatibility from a task header or colliding
+  opcode byte.
   The reference rasterizer owns one deterministic, explicitly seedable
   per-fragment noise stream. Every covered one/two-cycle fragment consumes one
   typed eight-bit sample before combiner/alpha/depth rejection; combiner

@@ -6,32 +6,16 @@
 //! use the existing raw-RDP TMEM path; draws lower through existing rectangle/
 //! triangle paths.
 
-use crate::gbi::{
-    CullMode, CycleType, RdpDecodeState, RenderOp, TextureFilter, Triangle, UcodeDigest, Vertex,
-};
-use fn64_render::{RenderError, UcodeId};
-use std::collections::HashMap;
+use crate::gbi::{CullMode, CycleType, RdpDecodeState, RenderOp, TextureFilter, Triangle, Vertex};
+use fn64_render::RenderError;
+#[cfg(test)]
+use fn64_render::UcodeId;
 
+#[cfg(test)]
 pub const SUPPORTED: &[UcodeId] = &[UcodeId::S2dex, UcodeId::S2dex2];
-const SUPPORTED_S2DEX: &[UcodeId] = &[UcodeId::S2dex];
-const SUPPORTED_S2DEX2: &[UcodeId] = &[UcodeId::S2dex2];
-
-/// Public `gs2dex.h` wire families. Their payload structures are shared, but
-/// their opcode assignments and `gMoveWd` packing are not interchangeable.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum S2dexWireFamily {
-    S2dex,
-    S2dex2,
-}
-
-impl S2dexWireFamily {
-    pub const fn ucode_id(self) -> UcodeId {
-        match self {
-            Self::S2dex => UcodeId::S2dex,
-            Self::S2dex2 => UcodeId::S2dex2,
-        }
-    }
-}
+pub use fn64_render::S2dexWireFamily;
+#[cfg(test)]
+pub type UcodeCatalog = fn64_render::S2dexUcodeCatalog;
 
 const G_OBJ_RECTANGLE: u8 = 0x01;
 const G_OBJ_SPRITE: u8 = 0x02;
@@ -108,77 +92,6 @@ const RDP_LOADSYNC: u8 = 0xe6;
 const RDP_LOADBLOCK: u8 = 0xf3;
 const RDP_LOADTILE: u8 = 0xf4;
 const RDP_LOADTLUT: u8 = 0xf0;
-
-#[derive(Clone, Debug, Default)]
-pub struct UcodeCatalog {
-    digests: HashMap<UcodeDigest, S2dexWireFamily>,
-}
-
-impl UcodeCatalog {
-    pub fn admit_sha256(&mut self, digest: [u8; 32]) {
-        self.admit_sha256_for(S2dexWireFamily::S2dex2, digest);
-    }
-
-    pub fn admit_sha256_for(&mut self, family: S2dexWireFamily, digest: [u8; 32]) {
-        self.admit(UcodeDigest::from_sha256(digest), family);
-    }
-
-    pub fn admit_text(&mut self, text: &[u8]) -> UcodeDigest {
-        self.admit_text_for(S2dexWireFamily::S2dex2, text)
-    }
-
-    pub fn admit_text_for(&mut self, family: S2dexWireFamily, text: &[u8]) -> UcodeDigest {
-        let digest = UcodeDigest::from_text(text);
-        self.admit(digest, family);
-        digest
-    }
-
-    fn admit(&mut self, digest: UcodeDigest, family: S2dexWireFamily) {
-        if let Some(previous) = self.digests.insert(digest, family) {
-            assert_eq!(
-                previous, family,
-                "one S2DEX microcode digest cannot identify two wire families"
-            );
-        }
-    }
-
-    pub fn require_text(&self, text: &[u8]) -> Result<S2dexWireFamily, RenderError> {
-        let digest = UcodeDigest::from_text(text);
-        self.digests
-            .get(&digest)
-            .copied()
-            .ok_or(RenderError::RequiresLle {
-                ucode_sha256: digest.as_bytes(),
-            })
-    }
-
-    pub(crate) fn identify_text(
-        &self,
-        text: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
-    ) -> Option<UcodeId> {
-        self.digests
-            .get(&UcodeDigest::from_text(text))
-            .copied()
-            .map(S2dexWireFamily::ucode_id)
-    }
-
-    pub fn supported_ucodes(&self) -> &'static [UcodeId] {
-        let s2dex = self
-            .digests
-            .values()
-            .any(|family| *family == S2dexWireFamily::S2dex);
-        let s2dex2 = self
-            .digests
-            .values()
-            .any(|family| *family == S2dexWireFamily::S2dex2);
-        match (s2dex, s2dex2) {
-            (false, false) => &[],
-            (true, false) => SUPPORTED_S2DEX,
-            (false, true) => SUPPORTED_S2DEX2,
-            (true, true) => SUPPORTED,
-        }
-    }
-}
 
 /// Public `uObjSprite_t` wire fields from `gs2dex.h` / Programming Manual
 /// Chapter 25, "S2DEX Microcode", section 4.2.1.

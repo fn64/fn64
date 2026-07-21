@@ -23,7 +23,7 @@ There are two independent admission checks before an Extended command can
 run:
 
 1. fn64 requires the 4 KiB IMEM image to belong to the configured microcode
-   catalog ([`lib.rs`](../crates/fn64-render-rt64/src/lib.rs#L3043)).
+   catalog ([`lib.rs`](../crates/fn64-render-rt64/src/lib.rs#L4691)).
 2. Pinned RT64 hashes the microcode text and data separately and requires a
    known intersecting GBI instance
    ([`rt64_gbi.cpp`](https://github.com/rt64/rt64/blob/f0728a2520d5aa735886240de3fee75cc805f6d6/src/gbi/rt64_gbi.cpp#L396)).

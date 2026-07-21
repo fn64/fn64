@@ -6,34 +6,42 @@
 //! `RenderBackend` is the ONE boundary the runtime uses to hand off N64 gfx
 //! work: a captured RSP task header (`OsTask`, the public libultra manual's
 //! `OSTask_t` field shape -- same fields `fn64_runtime::rsp::OsTaskHeader`
-//! already models, mirrored here so this crate has zero dependency on
-//! `fn64-runtime` internals, per `docs/DECOUPLING.md`'s "the backend never
-//! reaches back into runtime state") plus the raw rdram byte buffer the
-//! display list and its vertex/texture data live in. That's it. Lifecycle
+//! already models, mirrored here so the seam does not expose executor
+//! internals, per `docs/DECOUPLING.md`'s "the backend never reaches back into
+//! runtime state") plus the raw rdram byte buffer the
+//! display list and its vertex/texture data live in. Lifecycle
 //! (`create`/`resize`/`present`) and a `supported_ucodes` self-report round
-//! out the trait.
+//! out the backend trait; the crate also owns the shared admission and
+//! completion mechanisms below.
 //!
-//! **Zero backend lives here.** `fn64-render-rt64` is the first adapter
-//! (RT64 FFI, quarantined per `docs/DESIGN.md` section 1's C++ boundary
-//! rule) and also home to a headless reference software rasterizer used as
-//! the deterministic CI oracle for the feature-gated RT64 path -- see that
-//! crate's README for each backend's build and fallback contract.
+//! **No backend implementation lives here.** This crate owns the mechanisms
+//! every backend must share: exact content-addressed microcode admission and
+//! public raw-RDP command-width inspection for typed FullSync completion.
+//! `fn64-render-rt64` is the first adapter (RT64 FFI, quarantined per
+//! `docs/DESIGN.md` section 1's C++ boundary rule) and temporarily also houses
+//! the headless reference software rasterizer used as its deterministic CI
+//! oracle.
 //!
 //! ## Why `OsTask` is redefined here instead of reusing `fn64_runtime::rsp::OsTaskHeader`
 //!
-//! `fn64-render` must not depend on `fn64-runtime` (`docs/DECOUPLING.md`:
-//! "Everything RT64-specific... lives behind that [boundary]"; the runtime
-//! submits INTO this trait, this trait does not submit into the runtime).
-//! A `From<OsTaskHeader> for OsTask` conversion is the adapter's job (or the
-//! executor-seam glue crate's), not this crate's -- keeping this crate
-//! buildable and testable with no other workspace crate in its dependency
-//! graph at all.
+//! The runtime submits into this trait; the trait never receives or calls an
+//! executor. It uses stable runtime-owned device value types and logical RDRAM
+//! views, but deliberately redeclares the task handoff so backend APIs cannot
+//! acquire scheduler state. A `From<OsTaskHeader> for OsTask` conversion is
+//! executor-seam glue rather than backend policy.
 #![forbid(unsafe_code)]
 
+mod microcode;
+mod rdp_completion;
 mod settings;
 
 use std::{fmt, num::NonZeroU64};
 
+pub use microcode::{
+    F3dex2UcodeCatalog, GeometryUcodeCatalog, GeometryWireFamily, MicrocodePairCatalog,
+    S2dexUcodeCatalog, S2dexWireFamily, UcodeDigest,
+};
+pub use rdp_completion::{inspect_raw_rdp_full_sync, raw_rdp_command_width};
 pub use settings::{
     AspectTarget, DownsampleMultiplier, RefreshRateTarget, RenderAntialiasing, RenderAspectRatio,
     RenderDisplayBuffering, RenderEmulatorSettings, RenderEnhancementSettings, RenderFiltering,
