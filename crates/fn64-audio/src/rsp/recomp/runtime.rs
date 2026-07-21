@@ -157,6 +157,13 @@ impl<'a> RspMachine<'a> {
         self.sp_status
     }
 
+    /// Debug observability: the current SP semaphore latch (CP0 $c7). Reading
+    /// through this accessor does NOT perform the architectural
+    /// read-and-set -- it is for diagnostics only.
+    pub const fn sp_semaphore_latch(&self) -> bool {
+        self.sp_semaphore
+    }
+
     /// Drain the DPC ranges produced since the last call.
     pub fn take_dp_submissions(&mut self) -> Vec<RspDpSubmission> {
         core::mem::take(&mut self.dp_submissions)
