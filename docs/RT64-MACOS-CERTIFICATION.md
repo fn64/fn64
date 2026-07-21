@@ -19,7 +19,7 @@ Recorded host: macOS 26.5 build 25F71; Darwin 25.5.0 arm64; Apple M5 Pro.
 
 | Case | Category | Example | Repeat bar | Recorded result | Closed claims |
 |---|---|---|---:|---|---|
-| `backend-lifecycle` | backend | [​`rt64_metal_backend_behavior`](../crates/fn64-render-rt64/examples/rt64_metal_backend_behavior.rs) | 20 | 20 clean (2026-07-19) | `backend-metal` |
+| `backend-lifecycle` | backend | [​`rt64_metal_backend_behavior`](../crates/fn64-render-rt64/examples/rt64_metal_backend_behavior.rs) | 20 | 20 clean (2026-07-21) | `backend-metal` |
 | `resolution-downsample` | resolution | [​`rt64_resolution_downsample_behavior`](../crates/fn64-render-rt64/examples/rt64_resolution_downsample_behavior.rs) | 10 | 10 clean (2026-07-19) | `high-resolution-renderer`, `downsample-to-original-like` |
 | `framebuffer-rdram-region` | framebuffer | [​`rt64_framebuffer_rdram_region_behavior`](../crates/fn64-render-rt64/examples/rt64_framebuffer_rdram_region_behavior.rs) | 10 | 10 clean (2026-07-19) | `native-renderer-rdram-sync`, `framebuffer-detection-region-copy` |
 | `framebuffer-enhancement` | framebuffer | [​`rt64_framebuffer_enhancement_behavior`](../crates/fn64-render-rt64/examples/rt64_framebuffer_enhancement_behavior.rs) | 10 | 10 clean (2026-07-19) | `framebuffer-upscaling`, `framebuffer-reinterpretation` |
@@ -44,7 +44,7 @@ every invocation exits successfully. Unavailable and skipped cases are errors.
 | `remaining-user-controls` | — | The expanded user-control gate isolates Manual refresh targeting, hardware resolve under MSAA4x, idle work, and developer mode with exact active-policy, post-VI, present, and source-resource continuity through live apply and restoration. The blocker remains open for broader mixed-control combinations, recognized-HLE workloads, and physical refresh/resolve-path evidence. |
 | `remaining-enhancement-controls` | — | Every individual pinned enhancement control now has bounded causal Metal evidence, including a twenty-fresh-process S2DEX bilerp predicate matrix and framebuffer-fast-path differential. The non-shrinking platform blocker remains until those controls and combinations are certified through supported recognized HLE tasks rather than only isolated synthetic fixtures. |
 | `metal-inspector-gui` | — | The backend-independent debugger host API is certified, but pinned RT64's ImGui Inspector constructor supports D3D12/Vulkan only and asserts for Metal. |
-| `full-adapter-rom-coverage` | `base-rendering-accuracy` | The live suite is synthetic and predominantly raw-DPC; complete HLE microcode, full-ROM, fixed-cycle device, and zero-unsupported coverage is not established on macOS. |
+| `full-adapter-rom-coverage` | `base-rendering-accuracy` | The live suite is synthetic and predominantly raw-DPC. A fourteen-phase native Metal gate now binds exact nondefault post-VI pixels, causal gamma/scale changes, and six restorations while retaining gamma-dither/divot/dither-restoration/AA-selector behavior as named pixel-inert residuals. Complete HLE microcode, full-ROM, fixed-cycle device, zero-unsupported coverage, and physical-console VI parity are not established on macOS. |
 | `declared-host-range` | — | Evidence currently names one macOS 26.5 arm64 Apple-M5-Pro host; the minimum macOS version, architecture set, GPU families, and CI support range are not declared and certified. |
 
 ## Validation and execution

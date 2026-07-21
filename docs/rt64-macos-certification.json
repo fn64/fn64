@@ -24,7 +24,7 @@
       "features": ["rt64"],
       "repeat_bar": 20,
       "claims": ["backend-metal"],
-      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-19" }
+      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-21" }
     },
     {
       "id": "resolution-downsample",
@@ -152,7 +152,7 @@
       "id": "full-adapter-rom-coverage",
       "status": "open",
       "claims": ["base-rendering-accuracy"],
-      "reason": "The live suite is synthetic and predominantly raw-DPC; complete HLE microcode, full-ROM, fixed-cycle device, and zero-unsupported coverage is not established on macOS."
+      "reason": "The live suite is synthetic and predominantly raw-DPC. A fourteen-phase native Metal gate now binds exact nondefault post-VI pixels, causal gamma/scale changes, and six restorations while retaining gamma-dither/divot/dither-restoration/AA-selector behavior as named pixel-inert residuals. Complete HLE microcode, full-ROM, fixed-cycle device, zero-unsupported coverage, and physical-console VI parity are not established on macOS."
     },
     {
       "id": "declared-host-range",

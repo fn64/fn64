@@ -88,6 +88,10 @@ name = "rt64_metal_backend_behavior"
 required-features = ["rt64"]
 
 [[example]]
+name = "rt64_vi_filter_behavior"
+required-features = ["rt64"]
+
+[[example]]
 name = "rt64_resolution_downsample_behavior"
 required-features = ["rt64"]
 

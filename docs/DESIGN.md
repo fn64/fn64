@@ -946,8 +946,15 @@ task calls out:
   Black still disables pixel type, repeat-line uses zero Y scale, and fade uses
   zero Y scale plus the 10-bit Y subpixel offset without discarding the retained
   image. The no-device adapter capture proves the first and post-submission
-  24-word RT64 images are identical; pixel-level GPU capture of nondefault
-  active geometry remains an integration gate. A typed IPL television standard is
+  24-word RT64 images are identical. A live pinned-Metal gate now observes
+  fourteen complete register phases over one workload at nondefault 8x6 active
+  geometry: six off-state restorations are byte-identical, gamma and 1.5x X/Y
+  scale causally change exact pixels, and every present identity advances.
+  Gamma dither, divot, RGBA16 dither restoration, and the four AA selectors are
+  retained as exact pixel-inert native residuals because the pinned RT64 VI
+  shader implements sampling, border, and gamma only. This closes the missing
+  native GPU observation boundary, not the named RT64 implementations or
+  silicon/analog parity. A typed IPL television standard is
   the common VI/AI clock authority. Before a mode exists, VI uses the public
   nominal 60 Hz NTSC/MPAL or 50 Hz PAL rate; once H_SYNC and V_SYNC are
   nonzero, their public line/half-line units derive the next guest-cycle field
@@ -955,7 +962,8 @@ task calls out:
   every injection point, so a latched mode changes the next deadline. This
   formula is clean-room derived from public register definitions and has not
   yet been checked against a hardware timing trace. Exact VI random-stream
-  identity and pixel-level RT64 filter capture remain open.
+  identity, native implementation of the pixel-inert filter residuals, and
+  physical-console filter capture remain open.
   In the block
   lane, raw MI mask commands and RCP completion drive CPU IP2; the next
   instruction boundary applies the
