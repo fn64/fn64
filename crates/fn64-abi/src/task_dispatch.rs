@@ -496,6 +496,14 @@ fn dump_lle_debug_state(
             .collect();
         write("task_data_logical.bin", &logical);
     }
+
+    // Raw (native backing layout) rdram image, clamped to the 8 MiB guest
+    // window, so the failing task can be replayed offline against the same
+    // memory the machine saw. Post-abort rdram has absorbed the task's own
+    // DMA writes; replays reading those regions may diverge slightly, but
+    // command-list-driven control flow replays exactly.
+    let raw_len = machine.rdram.len().min(0x0080_0000);
+    write("rdram_raw.bin", &machine.rdram[..raw_len]);
 }
 
 fn commit_rsp_memory_state(
