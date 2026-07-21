@@ -423,8 +423,12 @@ processes sequentially under `env_clear`, derives a distinct run-event identity
 and report path for each child, executes a create-new exact copy of the verified
 child image beside its original, seals the stage read-only, rehashes every bound
 input and the stage before each spawn and after the series, and verifies each
-report/journal pair before launching the next child. It then writes one
-create-new, flushed and file-synced
+report/journal pair before launching the next child. Production contracts also
+produce separate create-new, read-only stages for the admitted microcode text
+and data. The runner injects only those paths through reserved release
+variables, revalidates both stages at every child boundary, and the OoT host
+registers the exact pair with whichever release backend it selected. It then
+writes one create-new, flushed and file-synced
 `fn64.private-release-series-receipt.v1` binding the exact contract, runner and
 child entry images, ten event/file/report identities, and the common semantic
 report SHA-256. Retained evidence can be reverified from that receipt.
@@ -436,10 +440,10 @@ itself prove that the trusted runner originally performed the launches. A
 release that needs transferable process-provenance evidence must retain an
 external trusted CI/code-signing attestation over the receipt and runner image.
 The local execution guarantee assumes no malicious same-UID writer can chmod
-and replace the random staged contract/child path between validation and the
-operating-system open/spawn; the resolved system-Python image is likewise
-trusted as OS-owned. This is the same explicit single-owner boundary as private
-input admission, not a sandbox against the invoking user.
+and replace the random staged contract, child, or microcode-pair paths between
+validation and the operating-system open/spawn; the resolved system-Python
+image is likewise trusted as OS-owned. This is the same explicit single-owner
+boundary as private input admission, not a sandbox against the invoking user.
 
 Raw JSON is not runner authority. Production loading first requires the
 repository admission script to byte-match the copy embedded at runner build
@@ -461,6 +465,15 @@ recomputed, contract, and report sources to agree. The receipt and every bound
 file are reverified before the series, before each child, after the final
 child, and during retained-series verification. This co-binds identities but
 does not prove the child was compiled or linked from the lane input.
+
+`materialize-release-program-build-receipt` is the supported create-new
+producer for all three lanes. It measures the actual child and lane inputs,
+derives rather than accepts the execution source, syncs the private JSON, and
+reloads it through the production verifier. For the OoT function lane,
+`write-function-identity-wire` publishes the exact source wire embedded by the
+same private child build and first verifies that its SHA-256 equals the build's
+typed-function artifact identity. The concrete commands live in
+`PRIVATE-INPUT-ADMISSION.md`.
 
 Build evidence does not stand in for runtime microcode kickoff identity. Each v17
 production report must contain one single recognized microcode event whose
@@ -850,8 +863,8 @@ certified release matrix**. The exact state is:
 | ROM/report class | Mechanism available | Certified evidence retained |
 | --- | --- | --- |
 | Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, a trusted exact-ten fresh-process runner and receipt, real executor/device/RSP/RDP/VI/reference-render boundaries, derived matrix coverage, and the canonical incomplete assessment are available. | Mechanism evidence only; synthetic bytes are not a ROM certification, and an incomplete assessment is not a retained verified matrix. |
-| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, typed build receipt, and same-event microcode-pair kickoff check exist. The v17 report and private policy admit the observed function stream; the host uses the schema-enabled boot API and a path-independent generated-source identity. | Regenerate the stale cached private generated crate so it exports the marker, then produce a ten-run `typed_observed_function` v17 series (or generate and select the real block pack). |
-| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, explicit `BlockProgram` host selection, an artifact/schema-bound whole-function entry stream, typed build receipt, and same-event microcode-pair kickoff check exist. The host consumes the schema marker; earlier local private groups are pre-v17 historical evidence only. | Regenerate the private crate or generate the block pack, then run v17 with the ROM's successful banked 32-KiB SRAM operation path. |
+| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, a create-new receipt/source-wire producer, runner-staged exact microcode-pair admission, and same-event kickoff check exist. The v17 report and private policy admit the observed function stream; the host uses the schema-enabled boot API and a path-independent generated-source identity. | Regenerate the stale cached private generated crate so it exports the marker, then produce a ten-run `typed_observed_function` v17 series (or generate and select the real block pack). |
+| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, explicit `BlockProgram` host selection, an artifact/schema-bound whole-function entry stream, create-new receipt tooling, and runner-staged exact microcode-pair admission exist. The host consumes the schema marker and registers the same pair with RT64; earlier local private groups are pre-v17 historical evidence only. | Regenerate the private crate or generate the block pack, then run v17 with the ROM's successful banked 32-KiB SRAM operation path. |
 | OoT NTSC 1.0, legacy C lane | Observation tooling and exact linked-archive identity wiring exist. | Non-authoritative: measured framebuffer parity is only claimed through swap 60, and the C oracle's missing bodies prevent deeper arbitration beyond the known swap-231 frontier. |
 | Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v17-visible save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, program-lane, and committed RSP/RDP-mechanism assignments while retaining the remaining project-owned profile entries as missing. Backend microcode labels are diagnostic only; independent public-microcode adjudication uses the empty project-owned catalog v1. | No public-microcode requirement can be credited until allowed-source identities populate a successor catalog; no private full-ROM v17 report series, typed ROM/region evidence, or complete platform result set has been supplied. |
 

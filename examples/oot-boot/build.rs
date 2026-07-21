@@ -266,8 +266,21 @@ fn main() {
                             panic!("oot-boot build.rs: identify generated Rust crate: {error}")
                         });
                 let artifact_sha256 = lowercase_hex(Sha256::digest(&source_wire).into());
+                let identity_wire_path =
+                    PathBuf::from(env::var("OUT_DIR").expect("Cargo supplies OUT_DIR"))
+                        .join("fn64-typed-observed-function-identity.wire");
+                fs::write(&identity_wire_path, &source_wire).unwrap_or_else(|error| {
+                    panic!(
+                        "oot-boot build.rs: write generated-source identity wire {}: {error}",
+                        identity_wire_path.display()
+                    )
+                });
                 println!(
                     "cargo:rustc-env=FN64_RECOMP_RS_FUNCTION_ARTIFACT_SHA256={artifact_sha256}"
+                );
+                println!(
+                    "cargo:rustc-env=FN64_RECOMP_RS_FUNCTION_IDENTITY_WIRE_PATH={}",
+                    identity_wire_path.display()
                 );
                 for path in watched_files {
                     println!("cargo:rerun-if-changed={}", path.display());

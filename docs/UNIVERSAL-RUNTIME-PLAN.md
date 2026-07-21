@@ -58,6 +58,11 @@ are not an implementation source.
 In the validation row, “binds” means exact identity co-binding. The typed
 receipt does not prove that the child was compiled or linked from its lane
 input; trusted build/link provenance remains a separate open evidence class.
+The supported receipt materializer derives that co-binding from measured
+files, and the OoT function-lane writer publishes the exact source wire
+embedded by the child build. Production series additionally stage and
+revalidate the admitted microcode text/data at every child boundary; the OoT
+host registers those runner-owned bytes with the selected backend before boot.
 Likewise, a release microcode family comes only from the selected backend's
 exact text/data-pair catalog; text-only HLE recognition is diagnostic only.
 Yield lineage is phase-typed: ordinary completion retires it, while a public

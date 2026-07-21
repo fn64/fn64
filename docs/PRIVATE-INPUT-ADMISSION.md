@@ -265,12 +265,18 @@ admission authority.
 `run-private-release-series` owns a random series nonce and launches exactly
 ten children sequentially with an empty ambient environment. It copies the
 verified child bytes to a create-new executable beside the original and runs
-only that read-only isolated stage; before every launch and after the series it
-rehashes both the contract-bound files and stage. This is a local single-owner
-execution guarantee: a malicious same-UID process able to discover, chmod, and
-replace staged paths between verification and operating-system open/spawn is
-outside scope, as is replacement of the OS-owned resolved Python image. Each
-child gets a distinct derived event identity and new report/journal/log paths.
+only that read-only isolated stage. Production runs likewise copy the admitted
+microcode text and data into separate create-new, read-only stages and inject
+their paths through runner-owned `FN64_RELEASE_MICROCODE_TEXT_PATH` and
+`FN64_RELEASE_MICROCODE_DATA_PATH` variables.
+The OoT host reads those exact staged bytes and admits the pair to the selected
+reference or RT64 backend before boot. Before every launch and after the series
+the runner rehashes the contract-bound files, child stage, and both pair
+stages. This is a local single-owner execution guarantee: a malicious same-UID
+process able to discover, chmod, and replace staged paths between verification
+and operating-system open/spawn is outside scope, as is replacement of the
+OS-owned resolved Python image. Each child gets a distinct derived event
+identity and new report/journal/log paths.
 The runner verifies each terminal v3 journal, exact v17
 scenario/cycle/input/source, the five fixed-cycle artifacts, live-minimum
 closure, zero reached unsupported events, and the admitted microcode pair
@@ -311,6 +317,51 @@ independently reread the files and require the declared source, recomputed
 source, contract source, and eventual report source to agree. Exactly one lane
 input must equal the admitted `recompiled` descriptor. The manifest binds the
 receipt file's own exact identity, and contract v2 binds that descriptor.
+
+Create the receipt from measured files; do not hand-author its JSON. The
+materializer sorts native labels, derives the execution source, publishes only
+with create-new semantics, file-syncs the result, and reloads it through the
+same verifier used by admission:
+
+```sh
+cargo run -p fn64-boot-harness \
+  --bin materialize-release-program-build-receipt -- \
+  native-archives \
+  --output /private/tmp/program-build-receipt.json \
+  --child /private/tmp/oot-boot \
+  --archive generated-code /private/tmp/librecompiled.a \
+  --archive section-bridge /private/tmp/libsection_bridge.a
+
+cargo run -p fn64-boot-harness \
+  --bin materialize-release-program-build-receipt -- \
+  typed-block \
+  --output /private/tmp/program-build-receipt.json \
+  --child /private/tmp/oot-boot \
+  --pack /private/tmp/program.pack \
+  --expected-program-sha256 LOWERCASE_LIVE_PROGRAM_SHA256
+```
+
+For the OoT typed-observed-function lane, the host build embeds the same
+path-independent source wire used by its execution-destination identity. Its
+private writer publishes those exact bytes, after checking their SHA-256
+against the child build identity, for the generic materializer. Invoke it with
+the same private `FN64_GAME_DIR` (or explicit `ROM`/`RECOMPILED_DIR`) and
+regenerated `RECOMP_RS_DIR` used to build the exact child:
+
+```sh
+FN64_GAME_DIR=/absolute/private/game-workspace \
+RECOMP_RS_DIR=/absolute/private/generated-rust-crate \
+FN64_RECOMP=rs FN64_RS_EXECUTION=function \
+  examples/oot-boot/oot identity-wire \
+  /private/tmp/oot-function-identity.wire
+
+cargo run -p fn64-boot-harness \
+  --bin materialize-release-program-build-receipt -- \
+  typed-observed-function \
+  --output /private/tmp/program-build-receipt.json \
+  --child /private/tmp/oot-boot \
+  --identity-wire /private/tmp/oot-function-identity.wire
+```
 
 This is identity co-binding, not proof that the child was compiled or linked
 from the lane input. That stronger build-provenance claim requires a trusted

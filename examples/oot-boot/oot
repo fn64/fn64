@@ -12,6 +12,7 @@
 #   ./oot trace [SWAPS]      run + dump the last executor events (what was running at the stop)
 #   ./oot fn FILE:LINE ...   resolve recompiled-C locations to RECOMP_FUNC names
 #   ./oot where              run + report the deepest frame / loud trap (the frontier)
+#   ./oot identity-wire PATH build the exact Rust lane and publish its private source-identity wire
 #
 # Env overrides: RECOMPILED_DIR / ROM default under $FN64_GAME_DIR (your ROM-derived
 # workspace). recomp.h is vendored in-tree, so RECOMP_H_DIR is not defaulted.
@@ -49,6 +50,7 @@ export RECOMP_RS_DIR="${RECOMP_RS_DIR:-/tmp/fn64-recomp-rs-oot}"
 export FN64_RS_EXECUTION="${FN64_RS_EXECUTION:-function}"
 
 BIN="$FN64/examples/oot-boot/target/release/oot-boot"
+IDENTITY_WIRE_BIN="$FN64/examples/oot-boot/target/release/write-function-identity-wire"
 
 build() {
   # bash 3.2 (macOS default) counts an EMPTY array as unbound under `set -u`,
@@ -91,6 +93,18 @@ resolve_fn() {
 
 cmd="${1:-run}"; shift || true
 case "$cmd" in
+  identity-wire)
+    if [[ "$FN64_RECOMP" != "rs" || "$FN64_RS_EXECUTION" != "function" ]]; then
+      echo "oot: identity-wire requires FN64_RECOMP=rs and FN64_RS_EXECUTION=function" >&2
+      exit 2
+    fi
+    if [[ "$#" -ne 1 ]]; then
+      echo "usage: ./oot identity-wire ABSOLUTE_OUTPUT" >&2
+      exit 2
+    fi
+    build
+    "$IDENTITY_WIRE_BIN" "$1"
+    ;;
   fn)
     for loc in "$@"; do resolve_fn "$loc"; done
     ;;
@@ -115,5 +129,5 @@ case "$cmd" in
     tail -6 /tmp/oot-boot-trace.jsonl 2>/dev/null
     ;;
   *)
-    echo "usage: ./oot {run [SWAPS]|trace [SWAPS]|fn FILE:LINE...|where}" >&2; exit 2 ;;
+    echo "usage: ./oot {run [SWAPS]|trace [SWAPS]|fn FILE:LINE...|where|identity-wire ABSOLUTE_OUTPUT}" >&2; exit 2 ;;
 esac
