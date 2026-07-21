@@ -8,9 +8,9 @@ mod adapter_source_identity;
 #[path = "../fn64-boot-harness/native_program_identity.rs"]
 mod native_program_identity;
 
-const RT64_SOURCE_OVERLAY_ID: &str = "fn64:raster-shader-start-stop:v1+vi-region-rate:v1";
-const RT64_HFR_SOURCE_OVERLAY_ID: &str =
-    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+hfr-post-present-call:v1";
+const RT64_SOURCE_OVERLAY_ID: &str =
+    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1";
+const RT64_HFR_SOURCE_OVERLAY_ID: &str = "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+hfr-post-present-call:v1";
 
 fn run(command: &mut Command, description: &str) {
     let status = command

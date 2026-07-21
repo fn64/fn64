@@ -21,6 +21,108 @@ set(PLUME_BUILD_EXAMPLES OFF CACHE BOOL "Do not build plume examples" FORCE)
 # mupen64plus subtree is therefore neither compiled nor linked.
 add_subdirectory("${FN64_RT64_SOURCE_DIR}" rt64-build EXCLUDE_FROM_ALL)
 
+# Pinned RT64 normally reuses the previously selected GBI whenever a
+# G_LOAD_UCODE keeps the same text/data addresses. That address cache cannot
+# distinguish same-address content generations. Route every load through the
+# fn64 ordered-plan observer before RT64 flushes or consults that cache, and
+# leave only the address bookkeeping/reset behavior in the pinned function.
+# The full-file digest and exact replacement contexts make any upstream change
+# a mandatory review rather than silently moving this admission boundary.
+set(FN64_RT64_INTERPRETER_SOURCE
+    "${FN64_RT64_SOURCE_DIR}/src/hle/rt64_interpreter.cpp")
+file(SHA256
+    "${FN64_RT64_INTERPRETER_SOURCE}"
+    FN64_RT64_INTERPRETER_SHA256)
+if(NOT FN64_RT64_INTERPRETER_SHA256 STREQUAL
+   "cd91e76019205296b0ff9a52d4b477d45959243302c218c3c047d9328e66a7d2")
+    message(FATAL_ERROR
+        "RT64 interpreter source changed; review the fn64 ordered-microcode admission overlay")
+endif()
+file(READ
+    "${FN64_RT64_INTERPRETER_SOURCE}"
+    FN64_RT64_INTERPRETER_CONTENTS)
+set(FN64_RT64_INTERPRETER_DECLARATION_ORIGINAL [=[#include <cassert>
+
+//#define DUMP_DISPLAY_LISTS]=])
+set(FN64_RT64_INTERPRETER_DECLARATION_PATCHED [=[#include <cassert>
+
+extern "C" void *fn64_rt64_ucode_generation_observe(
+    void *, uint32_t, uint32_t, uint32_t);
+extern "C" void fn64_rt64_ucode_generation_apply(void *, void *);
+
+//#define DUMP_DISPLAY_LISTS]=])
+string(FIND
+    "${FN64_RT64_INTERPRETER_CONTENTS}"
+    "${FN64_RT64_INTERPRETER_DECLARATION_ORIGINAL}"
+    FN64_RT64_INTERPRETER_DECLARATION_OFFSET)
+if(FN64_RT64_INTERPRETER_DECLARATION_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 interpreter declaration context changed; review the fn64 ordered-microcode admission overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_INTERPRETER_DECLARATION_ORIGINAL}"
+    "${FN64_RT64_INTERPRETER_DECLARATION_PATCHED}"
+    FN64_RT64_INTERPRETER_PATCHED
+    "${FN64_RT64_INTERPRETER_CONTENTS}")
+set(FN64_RT64_INTERPRETER_LOAD_START_ORIGINAL [=[    void Interpreter::loadUCodeGBI(uint32_t textAddress, uint32_t dataAddress, bool resetFromTask) {
+        if (!resetFromTask) {]=])
+set(FN64_RT64_INTERPRETER_LOAD_START_PATCHED [=[    void Interpreter::loadUCodeGBI(uint32_t textAddress, uint32_t dataAddress, bool resetFromTask) {
+        void *fn64AdmittedGBI = fn64_rt64_ucode_generation_observe(
+            this, textAddress, dataAddress, resetFromTask ? 1U : 0U);
+        if (!resetFromTask) {]=])
+string(FIND
+    "${FN64_RT64_INTERPRETER_PATCHED}"
+    "${FN64_RT64_INTERPRETER_LOAD_START_ORIGINAL}"
+    FN64_RT64_INTERPRETER_LOAD_START_OFFSET)
+if(FN64_RT64_INTERPRETER_LOAD_START_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 loadUCodeGBI entry changed; review the fn64 ordered-microcode admission overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_INTERPRETER_LOAD_START_ORIGINAL}"
+    "${FN64_RT64_INTERPRETER_LOAD_START_PATCHED}"
+    FN64_RT64_INTERPRETER_PATCHED
+    "${FN64_RT64_INTERPRETER_PATCHED}")
+set(FN64_RT64_INTERPRETER_CACHE_ORIGINAL [=[        if ((UCode.textAddress != maskedTextAddress) || (UCode.dataAddress != maskedDataAddress)) {
+            hleGBI = gbiManager.getGBIForUCode(state->RDRAM, maskedTextAddress, maskedDataAddress);
+            if (hleGBI != nullptr) {
+                state->rsp->setGBI(hleGBI);
+            }
+
+            UCode.textAddress = maskedTextAddress;
+            UCode.dataAddress = maskedDataAddress;
+        }]=])
+set(FN64_RT64_INTERPRETER_CACHE_PATCHED [=[        fn64_rt64_ucode_generation_apply(this, fn64AdmittedGBI);
+        if ((UCode.textAddress != maskedTextAddress) || (UCode.dataAddress != maskedDataAddress)) {
+            UCode.textAddress = maskedTextAddress;
+            UCode.dataAddress = maskedDataAddress;
+        }]=])
+string(FIND
+    "${FN64_RT64_INTERPRETER_PATCHED}"
+    "${FN64_RT64_INTERPRETER_CACHE_ORIGINAL}"
+    FN64_RT64_INTERPRETER_CACHE_OFFSET)
+if(FN64_RT64_INTERPRETER_CACHE_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 loadUCodeGBI address cache changed; review the fn64 ordered-microcode admission overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_INTERPRETER_CACHE_ORIGINAL}"
+    "${FN64_RT64_INTERPRETER_CACHE_PATCHED}"
+    FN64_RT64_INTERPRETER_PATCHED
+    "${FN64_RT64_INTERPRETER_PATCHED}")
+set(FN64_RT64_INTERPRETER_PATCHED_SOURCE
+    "${CMAKE_CURRENT_BINARY_DIR}/fn64_rt64_interpreter.cpp")
+file(WRITE
+    "${FN64_RT64_INTERPRETER_PATCHED_SOURCE}"
+    "${FN64_RT64_INTERPRETER_PATCHED}")
+set_source_files_properties(
+    "${FN64_RT64_INTERPRETER_SOURCE}"
+    TARGET_DIRECTORY rt64
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+target_sources(rt64 PRIVATE "${FN64_RT64_INTERPRETER_PATCHED_SOURCE}")
+target_include_directories(rt64 PRIVATE
+    "${FN64_RT64_SOURCE_DIR}/src/hle")
+
 # RT64's CompilationThread constructor launches an idle-priority worker before
 # initializing its running predicate, and the worker writes that predicate true
 # again on entry. A teardown that stores false and notifies before a delayed

@@ -28,13 +28,57 @@ typedef struct Fn64Rt64Task {
 } Fn64Rt64Task;
 
 enum {
-    FN64_RT64_TASK_RESULT_SCHEMA = 1
+    FN64_RT64_UCODE_PLAN_SCHEMA = 1,
+    FN64_RT64_TASK_RESULT_SCHEMA = 2,
+    FN64_RT64_UCODE_SOURCE_TASK_ENTRY = 1,
+    FN64_RT64_UCODE_SOURCE_SELF_LOAD = 2,
+    FN64_RT64_TASK_DISPOSITION_COMPLETE = 1,
+    FN64_RT64_TASK_DISPOSITION_NEEDS_LLE = 2,
+    FN64_RT64_UCODE_NO_REJECTED_GENERATION = UINT32_MAX,
+    FN64_RT64_UCODE_TEXT_RECOGNITION_BYTES = 0x18D0,
+    FN64_RT64_UCODE_DATA_RECOGNITION_BYTES = 0x0FC0
 };
 
+/* One immutable, ordered microcode generation. The raw windows are offsets
+ * into Fn64Rt64UcodePlan::raw_pool and must have the exact recognition lengths
+ * above. The logical digests retain fn64's full admitted text/data identities
+ * independently of RT64's shorter recognition windows. expected_family zero
+ * denotes UcodeId::Other and carries its opaque value in reserved0; named
+ * families require reserved0 zero. The reserved array must always be zero. */
+typedef struct Fn64Rt64UcodeGeneration {
+    uint32_t source;
+    uint32_t text_address;
+    uint32_t data_address;
+    uint32_t expected_family;
+    uint32_t data_bytes;
+    uint32_t raw_text_offset;
+    uint32_t raw_text_len;
+    uint32_t raw_data_offset;
+    uint32_t raw_data_len;
+    uint32_t reserved0;
+    uint8_t logical_text_sha256[32];
+    uint8_t logical_data_sha256[32];
+    uint32_t reserved[4];
+} Fn64Rt64UcodeGeneration;
+
+/* plan_sha256 is SHA-256 over the schema-1 canonical encoding documented by
+ * the shim implementation: domain, little-endian scalar generation fields,
+ * logical digests, zero reserved fields, little-endian raw length, then the
+ * complete raw pool. Pointer values are deliberately excluded. */
+typedef struct Fn64Rt64UcodePlan {
+    uint32_t schema;
+    uint32_t count;
+    const Fn64Rt64UcodeGeneration *entries;
+    const uint8_t *raw_pool;
+    uint64_t raw_len;
+    uint8_t plan_sha256[32];
+    uint32_t reserved[4];
+} Fn64Rt64UcodePlan;
+
 /* Typed observations from one synchronous native HLE task. A workload-ID
- * advance is emitted only by pinned RT64's FullSync path. Address changes are
- * diagnostic until every intermediate G_LOAD_UCODE generation is observed;
- * they are not sufficient by themselves to authorize HLE admission. */
+ * advance is emitted only by pinned RT64's FullSync path. Every successful HLE
+ * completion exhausts the ordered plan; a preflight recognition mismatch is a
+ * successful call with NEEDS_LLE and no live interpreter mutation. */
 typedef struct Fn64Rt64TaskResult {
     uint32_t schema;
     uint32_t entry_gbi_available;
@@ -44,7 +88,32 @@ typedef struct Fn64Rt64TaskResult {
     uint32_t initial_ucode_data_address;
     uint32_t final_ucode_text_address;
     uint32_t final_ucode_data_address;
+    uint32_t disposition;
+    uint32_t planned_count;
+    uint32_t observed_count;
+    uint32_t rejected_generation;
+    uint8_t plan_sha256[32];
 } Fn64Rt64TaskResult;
+
+#if defined(__cplusplus)
+static_assert(sizeof(Fn64Rt64UcodeGeneration) == 120U,
+              "Fn64Rt64UcodeGeneration ABI size changed");
+#if UINTPTR_MAX == UINT64_MAX
+static_assert(sizeof(Fn64Rt64UcodePlan) == 80U,
+              "Fn64Rt64UcodePlan ABI size changed");
+#endif
+static_assert(sizeof(Fn64Rt64TaskResult) == 88U,
+              "Fn64Rt64TaskResult ABI size changed");
+#elif defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+_Static_assert(sizeof(Fn64Rt64UcodeGeneration) == 120U,
+               "Fn64Rt64UcodeGeneration ABI size changed");
+#if UINTPTR_MAX == UINT64_MAX
+_Static_assert(sizeof(Fn64Rt64UcodePlan) == 80U,
+               "Fn64Rt64UcodePlan ABI size changed");
+#endif
+_Static_assert(sizeof(Fn64Rt64TaskResult) == 88U,
+               "Fn64Rt64TaskResult ABI size changed");
+#endif
 
 typedef struct Fn64Rt64ViState {
     uint32_t registers[14];
@@ -619,6 +688,7 @@ int fn64_rt64_process_task(
     size_t imem_len,
     const Fn64Rt64Task *task,
     uint32_t output_addr,
+    const Fn64Rt64UcodePlan *ucode_plan,
     Fn64Rt64TaskResult *result,
     char *error,
     size_t error_capacity);

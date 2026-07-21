@@ -116,7 +116,12 @@ images, immutable plans retaining task entry plus every ordered self-load
 generation, and the public RDP Command Summary Table 11 width classifier used
 to inspect raw DPC ranges for FullSync. These are backend
 admission/completion mechanisms, not renderer implementations: the reference
-rasterizer and RT64 adapter consume them through the same typed API.
+rasterizer and RT64 adapter consume them through the same typed API. The RT64
+adapter also binds each task to a schema-checked immutable ABI encoding of that
+plan. Its pinned pre-cache observer forces native recognition and requires
+exact ordered exhaustion, including same-address and `A -> B -> A` generations;
+precommit incompatibility returns typed `NeedsLle`, while divergence after
+execution begins poisons the context.
 
 `PresentRequest` co-binds `ViPresentation`'s V-blank-latched scanout state with
 a move-only `PhysicalRdramRead` capability for that exact retrace. Integrated

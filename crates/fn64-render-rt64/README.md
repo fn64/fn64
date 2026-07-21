@@ -56,9 +56,25 @@ The transactional geometry preflight now freezes one shared
 text/data identities and family; every admitted `G_LOAD_UCODE` appends another
 generation in executed command order. Repeated addresses and exact duplicate
 identities are retained, so same-address content replacement and `A -> B -> A`
-cannot collapse into a set or final-address check. The current milestone only
-produces that plan. Native RT64 does not consume it yet, so the full preflight
-remains required and no narrower admission or extraction claim follows.
+cannot collapse into a set or final-address check. The native adapter consumes
+the immutable plan at RT64's pre-cache `loadUCodeGBI` boundary. It checks the
+live raw recognition bytes, forces content recognition for every generation,
+and requires exact source/address order and plan exhaustion. Unknown or
+incompatible generations return typed `NeedsLle` before interpreter mutation;
+a missing, extra, reordered, or changed generation after native execution
+starts poisons the context and fails loudly. The full reference preflight still
+produces the ordered self-load list and public-command FullSync observation;
+replacing it with a focused backend-neutral walker is the prerequisite for
+extracting `ReferenceBackend` from this crate.
+
+Device-free tests cover ABI identity, typed precommit rejection, exact plan
+exhaustion parsing, and retained same-address `A -> B -> A` raw windows. The
+public synthetic Extended-GBI transport does not call production
+`process_task`, so its live Metal pixels are not positive observer evidence.
+A positive native task-entry/self-load series still requires an admitted
+allowed/private microcode input through the existing fail-closed manifest
+path; until that runs, native compilation and negative fallback are verified
+but positive production observer execution is not.
 
 The reference lane also keeps the RDP device alive across task boundaries.
 Other mode, combiner/key/convert and constant-color registers, fill color,
@@ -147,17 +163,16 @@ streams do not depend on backend call history. Unknown microcode therefore
 does not require RT64 to recognize its GBI.
 
 Native HLE task submission returns a schema-checked typed result. The result
-binds whether RT64 had an entry GBI, workload IDs before and after the call,
-and RT64's initial/final microcode address pair. In pinned RT64, only the
-public FullSync path advances the state workload ID, so the delta provides
-native `Reached`/`NotReached` evidence and preserves the exact count when a
-task synchronizes more than once. While the reference preflight remains, its
-public-command result must agree exactly with the native delta or the adapter
-fails closed. Initial/final address changes are diagnostic only: they cannot
-prove that native RT64 consumed every planned `G_LOAD_UCODE` generation. The
-next adapter step must match the plan at RT64's pre-cache `loadUCodeGBI`
-boundary and force content recognition for same-address replacements before
-the transactional self-load preflight can be reduced.
+binds the immutable plan SHA-256, planned/observed generation counts, typed
+completion or precommit `NeedsLle` disposition, rejected generation, whether
+RT64 admitted the entry GBI, workload IDs before and after the call, and RT64's
+initial/final microcode address pair. A complete result must exhaust the exact
+plan; initial/final addresses remain diagnostic rather than admission
+authority. In pinned RT64, only the public FullSync path advances the state
+workload ID, so the delta provides native `Reached`/`NotReached` evidence and
+preserves the exact count when a task synchronizes more than once. While the
+reference preflight remains, its public-command result must agree exactly with
+the native delta or the adapter fails closed.
 
 The C++ and every Rust `unsafe` block used to call it are quarantined here, as
 required by `docs/DESIGN.md` section 1. `fn64-render`, `fn64-runtime`, and the
