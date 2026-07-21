@@ -269,12 +269,12 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | PI/ROM DMA | `osPiGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/pi.rs:1646` |
 | PI/ROM DMA | `osEPiRawStartDma_recomp` | **implemented** | `crates/fn64-abi/src/pi.rs:1444` |
 | PI/ROM DMA | `osEPiReadIo_recomp` | **implemented** | `crates/fn64-abi/src/pi.rs:1553` |
-| SI/controller | `osContInit_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:979` |
-| SI/controller | `osContStartReadData_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1099` |
-| SI/controller | `osContGetReadData_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:902` |
-| SI/controller | `osContStartQuery_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1072` |
-| SI/controller | `osContGetQuery_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:818` |
-| SI/controller | `osContSetCh_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1051` |
+| SI/controller | `osContInit_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1005` |
+| SI/controller | `osContStartReadData_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1125` |
+| SI/controller | `osContGetReadData_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:928` |
+| SI/controller | `osContStartQuery_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1098` |
+| SI/controller | `osContGetQuery_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:844` |
+| SI/controller | `osContSetCh_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1077` |
 | EEPROM | `osEepromProbe_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:141` |
 | EEPROM | `osEepromWrite_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:287` |
 | EEPROM | `osEepromLongWrite_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:318` |
@@ -300,10 +300,10 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | Controller Pak/PFS | `osPfsFileState_recomp` | **implemented** | `crates/fn64-abi/src/pfs.rs:221` |
 | Controller Pak/PFS | `osPfsFindFile_recomp` | **implemented** | `crates/fn64-abi/src/pfs.rs:202` |
 | Controller Pak/PFS | `osPfsReadWriteFile_recomp` | **implemented** | `crates/fn64-abi/src/pfs.rs:251` |
-| Rumble Pak | `__osMotorAccess_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1204` |
-| Rumble Pak | `osMotorInit_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1137` |
-| Rumble Pak | `osMotorStart_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1214` |
-| Rumble Pak | `osMotorStop_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1225` |
+| Rumble Pak | `__osMotorAccess_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1230` |
+| Rumble Pak | `osMotorInit_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1163` |
+| Rumble Pak | `osMotorStart_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1240` |
+| Rumble Pak | `osMotorStop_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1251` |
 | AI/audio | `osAiGetLength_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:144` |
 | AI/audio | `osAiGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:114` |
 | AI/audio | `osAiSetFrequency_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:28` |
@@ -342,7 +342,7 @@ These low-level or title-specific helpers are real ABI exports but are not part 
 |---|---|---|
 | `__osPiGetAccess_recomp` | **implemented** | `crates/fn64-abi/src/pi.rs:1527` |
 | `__osPiRelAccess_recomp` | **implemented** | `crates/fn64-abi/src/pi.rs:1537` |
-| `__osSiRawStartDma_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:661` |
+| `__osSiRawStartDma_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:682` |
 | `__osSpGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:93` |
 | `__osSpSetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:31` |
 | `osDpGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:103` |

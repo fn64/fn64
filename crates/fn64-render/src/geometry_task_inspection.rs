@@ -189,7 +189,7 @@ impl WalkState {
         self.rdp_half_1 = None;
         if loading_family.is_legacy_loadable() {
             if !self.return_stack.is_empty() {
-                return Err(reject(
+                return Err(reject_unsupported(
                     "F3DEX/L3DEX G_LOAD_UCODE inside a called display list resets link state and cannot return",
                 ));
             }
@@ -236,7 +236,7 @@ pub fn inspect_geometry_task(
     let live_text = rsp_memory.bank(RspMemoryBank::Imem);
     let family = catalog.require_text(live_text)?;
     if !is_supported_polygon_family(family) {
-        return Err(reject(format!(
+        return Err(reject_unsupported(format!(
             "{} task inspection is outside the supported public polygon-family frontier",
             family.name()
         )));
@@ -419,7 +419,7 @@ fn walk(
                     });
                 };
                 if !is_supported_polygon_family(next_family) {
-                    return Err(reject(format!(
+                    return Err(reject_unsupported(format!(
                         "G_LOAD_UCODE selected {}, outside the supported public polygon-family frontier",
                         next_family.name()
                     )));
@@ -495,14 +495,14 @@ fn walk(
                 }
             }
             G_SPECIAL_1 | G_SPECIAL_2 | G_SPECIAL_3 => {
-                return Err(reject(format!(
+                return Err(reject_unsupported(format!(
                     "reserved {} command {opcode:#04x} at RDRAM {command_pc:#010x}",
                     state.family.name()
                 )));
             }
             opcode if is_non_control_command(opcode) => {}
             _ => {
-                return Err(reject(format!(
+                return Err(reject_unsupported(format!(
                     "unsupported {} command {opcode:#04x} at RDRAM {command_pc:#010x}: w0={wire_w0:#010x} w1={wire_w1:#010x}",
                     state.family.name()
                 )));
@@ -518,7 +518,7 @@ fn normalize_command(
     pc: usize,
 ) -> Result<(u32, u32), RenderError> {
     if family.has_unpublished_wire() {
-        return Err(reject("F3DZEX2 command wire is not admitted"));
+        return Err(reject_unsupported("F3DZEX2 command wire is not admitted"));
     }
     if is_modern(family) {
         return Ok((w0, w1));
@@ -557,7 +557,7 @@ fn normalize_command(
                     (G_MV_LIGHT, (light + 1) as u8 * 3)
                 }
                 _ => {
-                    return Err(reject(format!(
+                    return Err(reject_unsupported(format!(
                         "unsupported {} G_MOVEMEM index {index:#04x} at {pc:#010x}",
                         family.name()
                     )))
@@ -608,7 +608,7 @@ fn normalize_command(
         LEGACY_G_NOOP => (u32::from(G_NOOP) << 24, w1),
         0xe4..=0xff => (w0, w1),
         _ => {
-            return Err(reject(format!(
+            return Err(reject_unsupported(format!(
                 "unsupported {} command byte {opcode:#04x} at RDRAM {pc:#010x}",
                 family.name()
             )))
@@ -824,7 +824,7 @@ fn apply_moveword(
         }
         G_MW_NUMLIGHT | G_MW_CLIP | G_MW_FOG | G_MW_LIGHTCOL => {}
         _ => {
-            return Err(reject(format!(
+            return Err(reject_unsupported(format!(
                 "unsupported {} G_MOVEWORD index {index:#04x} offset {offset:#06x}",
                 state.family.name()
             )))
@@ -853,8 +853,13 @@ fn apply_movemem(rdram: &[u8], w0: u32, w1: u32, state: &mut WalkState) -> Resul
             state.pending_forced_mvp = Some(read_matrix(rdram, address)?);
         }
         G_MV_LIGHT if length == 1 => {}
-        _ => {
+        G_MV_LIGHT => {
             return Err(reject(format!(
+                "G_MOVEMEM light length {length} is malformed"
+            )))
+        }
+        _ => {
+            return Err(reject_unsupported(format!(
                 "unsupported {} G_MOVEMEM index {index:#04x} offset/8 {offset:#04x}",
                 state.family.name()
             )))
@@ -899,7 +904,7 @@ fn modify_vertex(w0: u32, w1: u32, state: &mut WalkState) -> Result<(), RenderEr
         G_MWO_POINT_ZSCREEN => state.vertices[encoded / 2].z_screen = w1,
         G_MWO_POINT_RGBA | G_MWO_POINT_ST | G_MWO_POINT_XYSCREEN => {}
         _ => {
-            return Err(reject(format!(
+            return Err(reject_unsupported(format!(
                 "G_MODIFYVTX field {field:#04x} is unsupported"
             )))
         }
@@ -1283,6 +1288,21 @@ fn reject(reason: impl Into<String>) -> RenderError {
     }
 }
 
+fn reject_unsupported(reason: impl Into<String>) -> RenderError {
+    let reason = reason.into();
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Render,
+        "render.geometry-task-inspection.rejected",
+        format!("inspector={INSPECTOR}; reason={reason}"),
+        None,
+        fn64_runtime::UnsupportedDisposition::ReturnedError,
+    );
+    RenderError::Backend {
+        backend: INSPECTOR,
+        reason,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1614,6 +1634,140 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.full_sync_count, 0);
+    }
+
+    #[test]
+    fn rejection_records_one_stable_detailed_journal_event() {
+        let path = std::env::temp_dir().join(format!(
+            "fn64-geometry-inspection-unsupported-{}.journal",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        fn64_runtime::arm_unsupported_events(Some(&path)).unwrap();
+
+        let (mut rdram, rsp, task, catalog) = fixture();
+        write_command(&mut rdram, DL, u32::from(G_SPECIAL_1) << 24, 0x1234_5678);
+        let error = inspect_geometry_task(
+            &rdram,
+            &rsp,
+            &task,
+            &catalog,
+            GeometryTaskInspectionPolicy::default(),
+            None,
+        )
+        .unwrap_err();
+        let reason = error.to_string();
+        assert!(reason.contains("reserved F3DEX2 command 0xd5"));
+        assert!(reason.contains("RDRAM 0x00001000"));
+
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.subsystem, fn64_runtime::UnsupportedSubsystem::Render);
+        assert_eq!(event.operation, "render.geometry-task-inspection.rejected");
+        assert_eq!(
+            event.disposition,
+            fn64_runtime::UnsupportedDisposition::ReturnedError
+        );
+        assert_eq!(event.guest_cycle, None);
+        assert_eq!(
+            event.context,
+            "inspector=geometry-task-inspection; reason=reserved F3DEX2 command 0xd5 at RDRAM 0x00001000"
+        );
+
+        let journal = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = journal.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "fn64.unsupported-journal.v2\tarmed");
+        let fields: Vec<_> = lines[1].split('\t').collect();
+        assert_eq!(fields.len(), 8);
+        assert_eq!(fields[0], "fn64.unsupported-journal.v2");
+        assert_eq!(fields[1], "event");
+        assert_eq!(fields[3], "unknown");
+        assert_eq!(fields[4], "render");
+        assert_eq!(fields[5], "returned_error");
+        assert_eq!(
+            fields[6],
+            "72656e6465722e67656f6d657472792d7461736b2d696e7370656374696f6e2e72656a6563746564"
+        );
+        assert_eq!(
+            fields[7],
+            "696e73706563746f723d67656f6d657472792d7461736b2d696e7370656374696f6e3b20726561736f6e3d72657365727665642046334445583220636f6d6d616e64203078643520617420524452414d2030783030303031303030"
+        );
+
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_rejection_does_not_poison_unsupported_evidence() {
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        let (mut rdram, rsp, task, catalog) = fixture();
+        write_command(&mut rdram, DL, (u32::from(G_BRANCH_Z) << 24) | 1, 0);
+        let error = inspect_geometry_task(
+            &rdram,
+            &rsp,
+            &task,
+            &catalog,
+            GeometryTaskInspectionPolicy::default(),
+            None,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("G_BRANCH_Z malformed cache offsets"));
+        assert!(fn64_runtime::copy_unsupported_events().is_empty());
+    }
+
+    #[test]
+    fn needs_lle_is_not_misreported_as_an_inspection_rejection() {
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        let (rdram, mut rsp, task, catalog) = fixture();
+        rsp.write_bytes(
+            RspMemAddr::from_parts(RspMemoryBank::Imem, 0),
+            &[0xa5; SP_UCODE_SIZE],
+        )
+        .unwrap();
+
+        let error = inspect_geometry_task(
+            &rdram,
+            &rsp,
+            &task,
+            &catalog,
+            GeometryTaskInspectionPolicy::default(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, RenderError::RequiresLle { .. }));
+        assert!(fn64_runtime::copy_unsupported_events().is_empty());
+
+        const OTHER_TEXT: u32 = 0x5000;
+        const OTHER_DATA: u32 = 0x6800;
+        let (mut rdram, rsp, task, catalog) = fixture();
+        let other = vec![0x5d; SP_UCODE_SIZE];
+        write_logical(&mut rdram, OTHER_TEXT, &other);
+        write_logical(
+            &mut rdram,
+            OTHER_DATA,
+            &[0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe],
+        );
+        write_command(&mut rdram, DL, u32::from(G_RDPHALF_1) << 24, OTHER_DATA);
+        write_command(&mut rdram, DL + 8, load_word(8), OTHER_TEXT);
+        write_command(&mut rdram, DL + 16, u32::from(G_ENDDL) << 24, 0);
+        let error = inspect_geometry_task(
+            &rdram,
+            &rsp,
+            &task,
+            &catalog,
+            GeometryTaskInspectionPolicy::default(),
+            None,
+        )
+        .unwrap_err();
+        let RenderError::RequiresLle { ucode_sha256 } = error else {
+            panic!("unadmitted self-loaded ucode did not request LLE")
+        };
+        assert_eq!(ucode_sha256, UcodeDigest::from_text(&other).as_bytes());
+        assert!(fn64_runtime::copy_unsupported_events().is_empty());
     }
 
     #[test]
