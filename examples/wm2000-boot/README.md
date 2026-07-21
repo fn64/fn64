@@ -716,19 +716,38 @@ logo (~#250), the wrestler intro montage with RAW/SmackDown show cards
 2.5M steps. Before these fixes, 4,484 consecutive swaps contained
 NOTHING but uniform fade fills plus 3 legal-screen frames.
 
-## Open: full-screen image scenes present striped/repeated
+## RESOLVED (2026-07-21, same cycle): the "striping" was the harness
+## capturing a 480-wide framebuffer at a fixed 320 width
 
-Every attract scene drawn as a full-screen IMAGE (logos, montage stills)
-presents with alternate-scanline striping and 2-3x horizontal repetition
-(`/tmp/fn64-fb-100.png` THQ, `/tmp/fn64-fb-250.png` WF logo). Scene
-CONTENT is clearly recognizable, so this is a decode geometry bug
-(likely hi-res/interlaced color-image handling or copy-mode texrect
-stepping in the raw-RDP lane, possibly plus the harness's fixed 320x240
-capture of a 640-wide framebuffer), not a timeline gate. A gfx task #123
-trap on the way: these scenes draw an RGBA16-coded tile with
-G_TT_RGBA16 enabled; per angrylion a 16-bit texel under EN_TLUT feeds
-its top byte as the palette index -- implemented (regression test
+The attract's full-screen image scenes first presented "striped and
+horizontally repeated". Captured stream #752 shows those scenes scissor
+and render **480x240** (`SETSCISSOR (0,0)-(480,240)`), and the reference
+backend already follows the declared `G_SETCIMG` width -- the guest
+framebuffer bytes were correct 480-wide rows; only the harness's fixed
+320x240 PNG capture sheared them. New seam: `DeviceFabric::vi_width` ->
+`fn64_abi::vi_scanout_width` (the programmed VI_WIDTH register);
+`capture_framebuffer` now uses the live width. A gfx task #123 trap on
+the way: these scenes draw an RGBA16-coded tile with G_TT_RGBA16
+enabled; per angrylion a 16-bit texel under EN_TLUT feeds its top byte
+as the palette index -- implemented (regression test
 `tlut_mode_palettizes_sixteen_bit_texels_through_their_top_byte`).
+
+## SUCCESS (2026-07-21): the TITLE SCREEN presents LIVE
+
+With all three fixes (osGetTime identification, next-due virtual-time
+hopping, VI-width-aware capture), one uninterrupted boot presents the
+game's ENTIRE attract program, clean and in order, in the live swapped
+framebuffers: legal screen (swap #3), THQ logo (~#100), AKI logo
+(~#160), WF scratch logo with "World Wrestling Federation(R)" (~#250,
+pixel-crisp), the full 3D wrestler intro/showcase and demo match
+sequence (RAW IS WAR set, ring, crowd, entrances, cage spots, Kane's
+fire entrance, the WrestleMania stage -- swaps ~340-2600), and finally
+**the title screen: scratched white WF logo + WRESTLEMANIA(R) + glowing
+green 2000 at swap #2620, with the blinking PRESS START at #2700**
+(`/tmp/fn64-fb-2620.png`, `/tmp/fn64-fb-2700.png`; preserved as
+`/tmp/wm2000-title-screen-LIVE.png` and
+`/tmp/wm2000-title-press-start-LIVE.png`). Crash-free throughout.
+Workspace tests: 1364 passed / 0 failed.
 
 ## Superseded framing (2026-07-21, earlier): the fade's opaque black under-cover (game timeline, not blending)
 
