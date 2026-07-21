@@ -150,7 +150,7 @@
         { "kind": "official_readme", "path": "README.md", "line": 19, "needle": "arbitrary aspect ratios" },
         { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 210, "needle": "aspectRatioScale" },
         { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_aspect_ratio_behavior.rs", "line": 329, "needle": "fn main()", "claim_id": "widescreen-arbitrary-aspect" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_hle_aspect_behavior.rs", "line": 648, "needle": "if !captures.windows(2).all", "claim_id": "widescreen-arbitrary-aspect" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_hle_aspect_behavior.rs", "line": 649, "needle": "if !captures.windows(2).all", "claim_id": "widescreen-arbitrary-aspect" }
       ]
     },
     {
@@ -164,7 +164,7 @@
         { "kind": "official_readme", "path": "README.md", "line": 19, "needle": "Ultrawide support (limited game support)" },
         { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 210, "needle": "aspectRatioTarget" },
         { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_aspect_ratio_behavior.rs", "line": 329, "needle": "fn main()", "claim_id": "ultrawide" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_hle_aspect_behavior.rs", "line": 648, "needle": "if !captures.windows(2).all", "claim_id": "ultrawide" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_hle_aspect_behavior.rs", "line": 649, "needle": "if !captures.windows(2).all", "claim_id": "ultrawide" }
       ]
     },
     {
@@ -178,8 +178,8 @@
         { "kind": "official_readme", "path": "README.md", "line": 20, "needle": "60 FPS or above" },
         { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 989, "needle": "generateInterpolatedFrames" },
         { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_hfr_interpolation_behavior.rs", "line": 845, "needle": "fn main()", "claim_id": "hfr-60-plus-interpolation" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/src/ffi.rs", "line": 3504, "needle": "fn cpp_vi_history_uses_context_region_rate_for_stable_factors", "claim_id": "hfr-60-plus-interpolation" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_region_rate_behavior.rs", "line": 160, "needle": "fn main()", "claim_id": "hfr-60-plus-interpolation" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/src/ffi.rs", "line": 3879, "needle": "fn cpp_vi_history_uses_context_region_rate_for_stable_factors", "claim_id": "hfr-60-plus-interpolation" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_region_rate_behavior.rs", "line": 161, "needle": "fn main()", "claim_id": "hfr-60-plus-interpolation" }
       ]
     },
     {
@@ -192,7 +192,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 21, "needle": "Extended command set" },
         { "kind": "pinned_source", "path": "include/rt64_extended_gbi.h", "line": 16, "needle": "RT64_HOOK_OP_ENABLE" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_extended_gbi_enhancement_behavior.rs", "line": 742, "needle": "fn run_once()", "claim_id": "extended-gbi" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_extended_gbi_enhancement_behavior.rs", "line": 743, "needle": "fn run_once()", "claim_id": "extended-gbi" }
       ]
     },
     {

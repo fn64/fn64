@@ -144,6 +144,51 @@ impl TaskAdmissionPlan {
     pub fn is_empty(&self) -> bool {
         self.generations.is_empty()
     }
+
+    /// Stable identity of the complete ordered logical admission contract.
+    ///
+    /// Native adapters may bind additional storage-layout windows to this
+    /// identity, but cannot replace it with an address set or final state: the
+    /// generation source and order are part of the hash domain.
+    pub fn sha256(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"fn64-task-admission-plan-v1\0");
+        hash.update(
+            u64::try_from(self.generations.len())
+                .expect("task admission generation count fits u64")
+                .to_be_bytes(),
+        );
+        for generation in &self.generations {
+            hash.update([match generation.source {
+                TaskAdmissionSource::TaskEntry => 1,
+                TaskAdmissionSource::SelfLoad => 2,
+            }]);
+            hash.update(generation.text_address.to_be_bytes());
+            hash.update(generation.data_address.to_be_bytes());
+            hash.update(generation.text_sha256.as_bytes());
+            hash.update(generation.data.bytes.to_be_bytes());
+            hash.update(generation.data.sha256);
+            let (family, other) = match generation.family {
+                UcodeId::Fast3d => (1, 0),
+                UcodeId::F3dex => (2, 0),
+                UcodeId::F3dlx => (3, 0),
+                UcodeId::F3dlxRej => (4, 0),
+                UcodeId::F3dex2 => (5, 0),
+                UcodeId::F3dex2NoN => (6, 0),
+                UcodeId::F3dex2Rej => (7, 0),
+                UcodeId::F3dlx2Rej => (8, 0),
+                UcodeId::F3dzex2 => (9, 0),
+                UcodeId::S2dex => (10, 0),
+                UcodeId::S2dex2 => (11, 0),
+                UcodeId::L3dex => (12, 0),
+                UcodeId::L3dex2 => (13, 0),
+                UcodeId::Other(value) => (u8::MAX, value),
+            };
+            hash.update([family]);
+            hash.update(other.to_be_bytes());
+        }
+        hash.finalize().into()
+    }
 }
 
 /// Public command-envelope identity for polygon and line geometry HLE.
@@ -541,6 +586,56 @@ mod tests {
     fn task_admission_plan_rejects_a_second_entry() {
         let entry = admission_generation(TaskAdmissionSource::TaskEntry, 0x1000, 0x10);
         TaskAdmissionPlan::new(entry, [entry]);
+    }
+
+    #[test]
+    fn task_admission_plan_identity_binds_generation_order_and_every_field_family() {
+        let entry = admission_generation(TaskAdmissionSource::TaskEntry, 0x1000, 0x10);
+        let a = admission_generation(TaskAdmissionSource::SelfLoad, 0x1000, 0x11);
+        let b = admission_generation(TaskAdmissionSource::SelfLoad, 0x2000, 0x20);
+        let baseline = TaskAdmissionPlan::new(entry, [a, b]);
+        assert_eq!(baseline.sha256(), baseline.clone().sha256());
+        assert_ne!(
+            baseline.sha256(),
+            TaskAdmissionPlan::new(entry, [b, a]).sha256()
+        );
+
+        let mut changed = a;
+        changed.text_address += 8;
+        assert_ne!(
+            baseline.sha256(),
+            TaskAdmissionPlan::new(entry, [changed, b]).sha256()
+        );
+        changed = a;
+        changed.data_address += 8;
+        assert_ne!(
+            baseline.sha256(),
+            TaskAdmissionPlan::new(entry, [changed, b]).sha256()
+        );
+        changed = a;
+        changed.text_sha256 = UcodeDigest::from_sha256([0x55; 32]);
+        assert_ne!(
+            baseline.sha256(),
+            TaskAdmissionPlan::new(entry, [changed, b]).sha256()
+        );
+        changed = a;
+        changed.data.bytes += 8;
+        assert_ne!(
+            baseline.sha256(),
+            TaskAdmissionPlan::new(entry, [changed, b]).sha256()
+        );
+        changed = a;
+        changed.data.sha256 = [0x66; 32];
+        assert_ne!(
+            baseline.sha256(),
+            TaskAdmissionPlan::new(entry, [changed, b]).sha256()
+        );
+        changed = a;
+        changed.family = UcodeId::Other(7);
+        assert_ne!(
+            baseline.sha256(),
+            TaskAdmissionPlan::new(entry, [changed, b]).sha256()
+        );
     }
 
     #[test]

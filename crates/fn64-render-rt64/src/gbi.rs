@@ -3749,6 +3749,13 @@ struct DecodeState {
     /// addresses and identities stay distinct so native execution can be
     /// matched positionally instead of inheriting RT64's address cache.
     admission_generations: Vec<TaskAdmissionGeneration>,
+    /// Optional adapter-requested raw backing-store windows captured at the
+    /// exact command boundary where each admitted self-load becomes active.
+    /// The reference renderer leaves this disabled; native RT64 admission
+    /// uses it because the pinned GBI database hashes more than one IMEM bank.
+    admission_raw_window_bytes: Option<(usize, usize)>,
+    admission_raw_windows: Vec<TaskAdmissionRawWindow>,
+    admission_raw_window_error: Option<String>,
 }
 
 /// Public F3DEX2 vertex-fog state. With `G_FOG` enabled, the RSP generates
@@ -3867,6 +3874,9 @@ fn fresh_decode_state() -> DecodeState {
         clip_ratio: ClipRatio::default(),
         unsupported_ucode_reload: None,
         admission_generations: Vec::new(),
+        admission_raw_window_bytes: None,
+        admission_raw_windows: Vec::new(),
+        admission_raw_window_error: None,
     }
 }
 
@@ -4810,6 +4820,7 @@ fn execute_display_list_f3dex2_state_with_catalog(
         catalog,
         None,
         GeometryWireFamily::F3dex2,
+        None,
     )
 }
 
@@ -4820,11 +4831,13 @@ fn execute_display_list_f3dex2_state_with_catalog_and_rdp(
     catalog: Option<&F3dex2UcodeCatalog>,
     rdp_state: Option<&mut RdpDecodeState>,
     initial_family: GeometryWireFamily,
+    admission_raw_window_bytes: Option<(usize, usize)>,
 ) -> Result<DecodeState, RenderError> {
     let mut state = rdp_state
         .as_deref()
         .map(RdpDecodeState::begin_task)
         .unwrap_or_else(fresh_decode_state);
+    state.admission_raw_window_bytes = admission_raw_window_bytes;
     #[cfg(not(test))]
     projdump::reset_frame();
     let mut family = initial_family;
@@ -4842,6 +4855,12 @@ fn execute_display_list_f3dex2_state_with_catalog_and_rdp(
     if let Some(digest) = state.unsupported_ucode_reload {
         return Err(RenderError::RequiresLle {
             ucode_sha256: digest.as_bytes(),
+        });
+    }
+    if let Some(reason) = state.admission_raw_window_error {
+        return Err(RenderError::Backend {
+            backend: "microcode-admission-window",
+            reason,
         });
     }
     if let Some(rdp_state) = rdp_state {
@@ -4943,6 +4962,7 @@ pub(crate) fn execute_display_list_f3dex2_ops_admitted_with_rdp_state(
         Some(catalog),
         Some(rdp_state),
         GeometryWireFamily::F3dex2,
+        None,
     )?
     .ops)
 }
@@ -4965,6 +4985,20 @@ pub(crate) fn execute_display_list_geometry_ops_admitted_with_rdp_state(
 pub(crate) struct GeometryTaskInspection {
     pub(crate) operations: Vec<RenderOp>,
     pub(crate) self_loads: Vec<TaskAdmissionGeneration>,
+    #[cfg_attr(not(any(feature = "rt64", test)), allow(dead_code))]
+    pub(crate) self_load_raw_windows: Vec<TaskAdmissionRawWindow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TaskAdmissionRawWindow {
+    pub(crate) text: Vec<u8>,
+    pub(crate) data: Vec<u8>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TaskAdmissionRawWindowSize {
+    pub(crate) text: usize,
+    pub(crate) data: usize,
 }
 
 pub(crate) fn inspect_display_list_geometry_admission_with_rdp_state(
@@ -4982,10 +5016,44 @@ pub(crate) fn inspect_display_list_geometry_admission_with_rdp_state(
         Some(catalog),
         Some(rdp_state),
         family,
+        None,
     )?;
     Ok(GeometryTaskInspection {
         operations: state.ops,
         self_loads: state.admission_generations,
+        self_load_raw_windows: state.admission_raw_windows,
+    })
+}
+
+#[cfg_attr(not(any(feature = "rt64", test)), allow(dead_code))]
+pub(crate) fn inspect_display_list_geometry_admission_with_raw_windows(
+    rdram: &mut [u8],
+    rsp_memory: &mut fn64_runtime::RspMemory,
+    dl_addr: u32,
+    catalog: &GeometryUcodeCatalog,
+    rdp_state: &mut RdpDecodeState,
+    family: GeometryWireFamily,
+    raw_window_size: TaskAdmissionRawWindowSize,
+) -> Result<GeometryTaskInspection, RenderError> {
+    assert!(raw_window_size.text > 0 && raw_window_size.data > 0);
+    let state = execute_display_list_f3dex2_state_with_catalog_and_rdp(
+        rdram,
+        rsp_memory,
+        dl_addr,
+        Some(catalog),
+        Some(rdp_state),
+        family,
+        Some((raw_window_size.text, raw_window_size.data)),
+    )?;
+    assert_eq!(
+        state.admission_generations.len(),
+        state.admission_raw_windows.len(),
+        "each admitted self-load must retain exactly one requested raw recognition window"
+    );
+    Ok(GeometryTaskInspection {
+        operations: state.ops,
+        self_loads: state.admission_generations,
+        self_load_raw_windows: state.admission_raw_windows,
     })
 }
 
@@ -5454,6 +5522,25 @@ struct LoadedUcodeIdentity {
     data_address: u32,
     text_sha256: UcodeDigest,
     data: MicrocodeDataImageIdentity,
+}
+
+fn capture_raw_recognition_window(
+    rdram: &[u8],
+    address: u32,
+    bytes: usize,
+    section: &str,
+) -> Result<Vec<u8>, String> {
+    let start = usize::try_from(address).expect("24-bit microcode address fits usize");
+    let end = start.checked_add(bytes).ok_or_else(|| {
+        format!("microcode {section} recognition window overflows at {address:#010x} + {bytes:#x}")
+    })?;
+    let window = rdram.get(start..end).ok_or_else(|| {
+        format!(
+            "microcode {section} recognition window {start:#010x}..{end:#010x} exceeds RDRAM length {:#x}",
+            rdram.len()
+        )
+    })?;
+    Ok(window.to_vec())
 }
 
 fn execute_load_ucode(
@@ -6047,14 +6134,39 @@ fn decode_stream_impl(
                 }
                 if let Some(catalog) = ucode_catalog {
                     if let Some(next_family) = catalog.family(loaded.text_sha256) {
-                        state.admission_generations.push(TaskAdmissionGeneration {
+                        let generation = TaskAdmissionGeneration {
                             source: TaskAdmissionSource::SelfLoad,
                             text_address: loaded.text_address,
                             data_address: loaded.data_address,
                             text_sha256: loaded.text_sha256,
                             data: loaded.data,
                             family: next_family.ucode_id(),
-                        });
+                        };
+                        if let Some((text_bytes, data_bytes)) = state.admission_raw_window_bytes {
+                            let raw_window = capture_raw_recognition_window(
+                                rdram,
+                                generation.text_address,
+                                text_bytes,
+                                "text",
+                            )
+                            .and_then(|text| {
+                                capture_raw_recognition_window(
+                                    rdram,
+                                    generation.data_address,
+                                    data_bytes,
+                                    "data",
+                                )
+                                .map(|data| TaskAdmissionRawWindow { text, data })
+                            });
+                            match raw_window {
+                                Ok(raw_window) => state.admission_raw_windows.push(raw_window),
+                                Err(reason) => {
+                                    state.admission_raw_window_error = Some(reason);
+                                    break;
+                                }
+                            }
+                        }
+                        state.admission_generations.push(generation);
                         *family = next_family;
                         initialize_geometry_family_state(state, next_family);
                     } else {
@@ -7655,13 +7767,14 @@ mod tests {
         catalog.admit_text(&b);
         let mut rsp_memory = fn64_runtime::RspMemory::new();
         let mut rdp_state = RdpDecodeState::default();
-        let inspection = inspect_display_list_geometry_admission_with_rdp_state(
+        let inspection = inspect_display_list_geometry_admission_with_raw_windows(
             &mut rdram,
             &mut rsp_memory,
             DL as u32,
             &catalog,
             &mut rdp_state,
             GeometryWireFamily::F3dex2,
+            TaskAdmissionRawWindowSize { text: 16, data: 8 },
         )
         .unwrap();
 
@@ -7689,6 +7802,15 @@ mod tests {
                 && generation.data.sha256 == data_sha256
                 && generation.family == UcodeId::F3dex2
         }));
+        assert_eq!(inspection.self_load_raw_windows.len(), 3);
+        assert_eq!(
+            inspection.self_load_raw_windows[0], inspection.self_load_raw_windows[2],
+            "A -> B -> A must retain the original raw recognition bytes twice"
+        );
+        assert_ne!(
+            inspection.self_load_raw_windows[0], inspection.self_load_raw_windows[1],
+            "same-address B bytes must not collapse into RT64's address cache"
+        );
     }
 
     #[test]
@@ -10427,6 +10549,9 @@ mod tests {
             clip_ratio: ClipRatio::default(),
             unsupported_ucode_reload: None,
             admission_generations: Vec::new(),
+            admission_raw_window_bytes: None,
+            admission_raw_windows: Vec::new(),
+            admission_raw_window_error: None,
         }
     }
 

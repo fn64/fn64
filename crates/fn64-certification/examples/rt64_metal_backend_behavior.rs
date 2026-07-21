@@ -389,7 +389,8 @@ mod tests {
                 "1111111111111111111111111111111111111111111111111111111111111111",
             source_id: PINNED_SOURCE,
             source_provenance: Rt64SourceProvenance::GitClean,
-            source_overlay_id: "fn64:raster-shader-start-stop:v1+vi-region-rate:v1",
+            source_overlay_id:
+                "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1",
             post_vi_api: "metal-bgra8-unorm",
         };
         let capture = RenderReleaseCapture {

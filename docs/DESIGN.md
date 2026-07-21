@@ -855,19 +855,26 @@ task calls out:
   immutable shared `TaskAdmissionPlan`: task entry is generation zero and
   every admitted `G_LOAD_UCODE` follows in executed order with physical
   addresses, complete text/data identities, and public family. Duplicate
-  addresses and `A -> B -> A` generations are deliberately retained. This is
-  currently a preflight artifact, not native-consumption evidence.
-  Native RT64 task submission returns a schema-checked result containing entry
-  GBI availability, pre/post workload IDs, and initial/final microcode
-  addresses.
+  addresses and `A -> B -> A` generations are deliberately retained. The
+  native adapter consumes that plan at pinned RT64's pre-cache
+  `loadUCodeGBI` boundary, compares the live raw recognition windows, forces
+  recognition for every generation, and preserves the old active GBI through
+  the self-load flush before applying the admitted replacement. Unknown or
+  incompatible generations return typed `NeedsLle` before live interpreter
+  mutation. Missing, extra, reordered, or changed generations after execution
+  begins poison the native context and fail loudly.
+  Native RT64 task submission returns a schema-checked result containing the
+  plan identity, planned/observed generation counts, typed disposition and
+  rejected generation, entry GBI availability, pre/post workload IDs, and
+  initial/final microcode addresses. A complete result must exhaust the exact
+  ordered plan.
   Pinned RT64 advances the workload ID only from `State::fullSync`, so the
   delta is typed native completion evidence and must agree with transactional
-  public-command inspection. The address pair is not admission authority: a
-  final address cannot reveal an intermediate self-load that later returned
-  to the original image, and RT64's address cache cannot prove same-address
-  content. Removing reference preflight therefore still requires RT64 to
-  consume that exact plan before its address cache, force content recognition
-  for every generation, and fail closed on missing, extra, or reordered loads.
+  public-command inspection. The address pair is diagnostic, not admission
+  authority. The remaining reference-preflight dependency is implementation
+  structure: a focused backend-neutral walker must produce the ordered
+  self-load plan and FullSync observation before the full reference decoder can
+  be removed from the RT64 production path and extracted into its own crate.
   The reference rasterizer owns one deterministic, explicitly seedable
   per-fragment noise stream. Every covered one/two-cycle fragment consumes one
   typed eight-bit sample before combiner/alpha/depth rejection; combiner

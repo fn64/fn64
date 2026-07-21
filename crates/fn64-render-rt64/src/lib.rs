@@ -130,6 +130,11 @@ use fn64_render::{
 use fn64_render::{TaskAdmissionGeneration, TaskAdmissionPlan, TaskAdmissionSource, UcodeDigest};
 use raster::Framebuffer;
 
+#[cfg(feature = "rt64")]
+const RT64_GBI_TEXT_RECOGNITION_BYTES: usize = 0x18d0;
+#[cfg(feature = "rt64")]
+const RT64_GBI_DATA_RECOGNITION_BYTES: usize = 0x0fc0;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct RdramHiddenSample {
     visible: u16,
@@ -3360,13 +3365,21 @@ impl CompletedRt64Present {
 }
 
 #[cfg(feature = "rt64")]
+#[derive(Debug)]
+struct Rt64TaskAdmission {
+    plan: TaskAdmissionPlan,
+    raw_windows: Vec<gbi::TaskAdmissionRawWindow>,
+}
+
+#[cfg(feature = "rt64")]
 fn task_entry_admission_plan(
     rdram: &[u8],
     rsp_memory: &fn64_runtime::RspMemory,
     task: &OsTask,
     family: GeometryWireFamily,
     self_loads: Vec<TaskAdmissionGeneration>,
-) -> Result<TaskAdmissionPlan, RenderError> {
+    self_load_raw_windows: Vec<gbi::TaskAdmissionRawWindow>,
+) -> Result<Rt64TaskAdmission, RenderError> {
     let reject = |reason: String| RenderError::Backend {
         backend: "rt64-task-admission",
         reason,
@@ -3404,6 +3417,16 @@ fn task_entry_admission_plan(
     };
     let text_start = checked_end("text", text_address, text_bytes)?;
     let data_start = checked_end("data", data_address, data_bytes)?;
+    let raw_text_start = checked_end(
+        "native recognition text",
+        text_address,
+        RT64_GBI_TEXT_RECOGNITION_BYTES,
+    )?;
+    let raw_data_start = checked_end(
+        "native recognition data",
+        data_address,
+        RT64_GBI_DATA_RECOGNITION_BYTES,
+    )?;
     let view = fn64_runtime::RdramView::from_storage(rdram);
     let mut text = vec![0; text_bytes];
     view.copy_logical_bytes(
@@ -3434,7 +3457,22 @@ fn task_entry_admission_plan(
         },
         family: family.ucode_id(),
     };
-    Ok(TaskAdmissionPlan::new(entry, self_loads))
+    if self_loads.len() != self_load_raw_windows.len() {
+        return Err(reject(format!(
+            "ordered self-load identities ({}) and native recognition windows ({}) differ",
+            self_loads.len(),
+            self_load_raw_windows.len()
+        )));
+    }
+    let mut raw_windows = Vec::with_capacity(self_load_raw_windows.len() + 1);
+    raw_windows.push(gbi::TaskAdmissionRawWindow {
+        text: rdram[raw_text_start..raw_text_start + RT64_GBI_TEXT_RECOGNITION_BYTES].to_vec(),
+        data: rdram[raw_data_start..raw_data_start + RT64_GBI_DATA_RECOGNITION_BYTES].to_vec(),
+    });
+    raw_windows.extend(self_load_raw_windows);
+    let plan = TaskAdmissionPlan::new(entry, self_loads);
+    assert_eq!(plan.len(), raw_windows.len());
+    Ok(Rt64TaskAdmission { plan, raw_windows })
 }
 
 pub struct Rt64Backend {
@@ -4783,13 +4821,17 @@ impl RenderBackend for Rt64Backend {
             let mut inspection_rdram = rdram.to_vec();
             let mut inspection_rsp = rsp_memory.clone();
             let mut inspection_rdp = gbi::RdpDecodeState::default();
-            let inspection = match gbi::inspect_display_list_geometry_admission_with_rdp_state(
+            let inspection = match gbi::inspect_display_list_geometry_admission_with_raw_windows(
                 &mut inspection_rdram,
                 &mut inspection_rsp,
                 task.data_ptr,
                 &self.f3dex2_ucodes,
                 &mut inspection_rdp,
                 family,
+                gbi::TaskAdmissionRawWindowSize {
+                    text: RT64_GBI_TEXT_RECOGNITION_BYTES,
+                    data: RT64_GBI_DATA_RECOGNITION_BYTES,
+                },
             ) {
                 Ok(inspection) => inspection,
                 Err(RenderError::RequiresLle { ucode_sha256 }) => {
@@ -4803,6 +4845,7 @@ impl RenderBackend for Rt64Backend {
                 task,
                 family,
                 inspection.self_loads,
+                inspection.self_load_raw_windows,
             ) {
                 Ok(plan) => plan,
                 Err(RenderError::RequiresLle { ucode_sha256 }) => {
@@ -4871,15 +4914,31 @@ impl RenderBackend for Rt64Backend {
                     );
                 }
             }
-            let native_result = self
+            let native_outcome = self
                 .context
                 .as_mut()
                 .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
-                .process_task(rdram, rsp_memory, task, output_addr)
+                .process_task(rdram, rsp_memory, task, output_addr, &admission_plan)
                 .map_err(|reason| RenderError::Backend {
                     backend: "rt64",
                     reason,
                 })?;
+            let native_result = match native_outcome {
+                ffi::NativeTaskOutcome::Complete(result) => result,
+                ffi::NativeTaskOutcome::NeedsLle {
+                    rejected_generation,
+                    plan_sha256: _,
+                } => {
+                    let generation = admission_plan
+                        .plan
+                        .generations()
+                        .get(rejected_generation as usize)
+                        .expect("schema-checked native rejection index is in the admission plan");
+                    return Ok(FrameStatus::NeedsLle {
+                        ucode_sha256: generation.text_sha256.as_bytes(),
+                    });
+                }
+            };
             if native_result.dp_full_sync != full_sync {
                 return Err(RenderError::Backend {
                     backend: "rt64-task-result",
@@ -4887,7 +4946,7 @@ impl RenderBackend for Rt64Backend {
                         "native FullSync evidence {:?} (count {}, planned microcode generations {}, ucode addresses {:#010x}/{:#010x} -> {:#010x}/{:#010x}) disagrees with transactional inspection {full_sync:?}",
                         native_result.dp_full_sync,
                         native_result.full_sync_count,
-                        admission_plan.len(),
+                        admission_plan.plan.len(),
                         native_result.initial_ucode_addresses.0,
                         native_result.initial_ucode_addresses.1,
                         native_result.final_ucode_addresses.0,
@@ -5734,13 +5793,19 @@ mod tests {
             &task,
             GeometryWireFamily::F3dex2,
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan.entry().source, TaskAdmissionSource::TaskEntry);
-        assert_eq!(plan.entry().text_sha256, UcodeDigest::from_text(&text));
+        assert_eq!(plan.plan.len(), 1);
+        assert_eq!(plan.plan.entry().source, TaskAdmissionSource::TaskEntry);
+        assert_eq!(plan.plan.entry().text_sha256, UcodeDigest::from_text(&text));
         let data_sha256: [u8; 32] = sha2::Sha256::digest(data).into();
-        assert_eq!(plan.entry().data.sha256, data_sha256);
+        assert_eq!(plan.plan.entry().data.sha256, data_sha256);
+        assert_eq!(plan.raw_windows.len(), 1);
+        assert_eq!(
+            plan.raw_windows[0].text,
+            rdram[TEXT as usize..TEXT as usize + RT64_GBI_TEXT_RECOGNITION_BYTES]
+        );
 
         rdram[TEXT as usize ^ 3] ^= 0xff;
         let mismatch = task_entry_admission_plan(
@@ -5748,6 +5813,7 @@ mod tests {
             &rsp_memory,
             &task,
             GeometryWireFamily::F3dex2,
+            Vec::new(),
             Vec::new(),
         )
         .unwrap_err();

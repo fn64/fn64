@@ -33,6 +33,7 @@
 #endif
 
 #include "hle/rt64_application.h"
+#include "hle/rt64_interpreter.h"
 #include "hle/rt64_present_queue.h"
 #include "hle/rt64_vi.h"
 #include "hle/rt64_workload_queue.h"
@@ -54,7 +55,8 @@
 namespace {
 constexpr size_t N64_RDRAM_SIZE = 8U * 1024U * 1024U;
 constexpr uint32_t VI_STATUS_16_BIT = 2U;
-static_assert(sizeof(Fn64Rt64TaskResult) == 40U);
+static_assert(sizeof(Fn64Rt64UcodeGeneration) == 120U);
+static_assert(sizeof(Fn64Rt64TaskResult) == 88U);
 static_assert(sizeof(Fn64Rt64ExtendedPresentCapture) == 72U);
 static_assert(sizeof(Fn64Rt64PresentCapture) == 48U);
 #if defined(FN64_RT64_HFR_EVIDENCE)
@@ -1162,6 +1164,7 @@ struct Fn64Rt64Context {
     uint32_t output_addr = 0;
     Fn64Rt64ViState vi_state{};
     bool setup_complete = false;
+    bool ucode_admission_poisoned = false;
     bool vi_history_rate_registered = false;
     bool presentation_refresh_pending = false;
     bool replacement_observed_resolved_not_installed = false;
@@ -1476,6 +1479,612 @@ public:
 private:
     Fn64Rt64Context *context;
 };
+
+namespace {
+// FIPS 180-4 SHA-256 keeps the plan identity self-contained at the C++ ABI;
+// pointer values never participate in the canonical encoding.
+class Sha256 {
+public:
+    Sha256()
+        : state{0x6A09E667U, 0xBB67AE85U, 0x3C6EF372U, 0xA54FF53AU,
+                0x510E527FU, 0x9B05688CU, 0x1F83D9ABU, 0x5BE0CD19U} {}
+
+    void update(const uint8_t *bytes, size_t length) {
+        if ((bytes == nullptr) && (length != 0U)) {
+            throw std::runtime_error("SHA-256 input is null");
+        }
+        for (size_t index = 0; index < length; index++) {
+            block[block_length++] = bytes[index];
+            if (block_length == block.size()) {
+                transform();
+                bit_length += 512U;
+                block_length = 0;
+            }
+        }
+    }
+
+    std::array<uint8_t, 32> finish() {
+        const uint64_t final_bit_length = bit_length + uint64_t(block_length) * 8U;
+        block[block_length++] = 0x80U;
+        if (block_length > 56U) {
+            std::fill(block.begin() + block_length, block.end(), 0U);
+            transform();
+            block_length = 0;
+        }
+        std::fill(block.begin() + block_length, block.begin() + 56U, 0U);
+        for (uint32_t index = 0; index < 8U; index++) {
+            block[63U - index] =
+                static_cast<uint8_t>(final_bit_length >> (index * 8U));
+        }
+        transform();
+
+        std::array<uint8_t, 32> digest{};
+        for (uint32_t word = 0; word < state.size(); word++) {
+            for (uint32_t byte = 0; byte < 4U; byte++) {
+                digest[word * 4U + byte] = static_cast<uint8_t>(
+                    state[word] >> (24U - byte * 8U));
+            }
+        }
+        return digest;
+    }
+
+private:
+    static uint32_t rotate_right(uint32_t value, uint32_t amount) {
+        return (value >> amount) | (value << (32U - amount));
+    }
+
+    void transform() {
+        static constexpr std::array<uint32_t, 64> RoundConstants = {
+            0x428A2F98U, 0x71374491U, 0xB5C0FBCFU, 0xE9B5DBA5U,
+            0x3956C25BU, 0x59F111F1U, 0x923F82A4U, 0xAB1C5ED5U,
+            0xD807AA98U, 0x12835B01U, 0x243185BEU, 0x550C7DC3U,
+            0x72BE5D74U, 0x80DEB1FEU, 0x9BDC06A7U, 0xC19BF174U,
+            0xE49B69C1U, 0xEFBE4786U, 0x0FC19DC6U, 0x240CA1CCU,
+            0x2DE92C6FU, 0x4A7484AAU, 0x5CB0A9DCU, 0x76F988DAU,
+            0x983E5152U, 0xA831C66DU, 0xB00327C8U, 0xBF597FC7U,
+            0xC6E00BF3U, 0xD5A79147U, 0x06CA6351U, 0x14292967U,
+            0x27B70A85U, 0x2E1B2138U, 0x4D2C6DFCU, 0x53380D13U,
+            0x650A7354U, 0x766A0ABBU, 0x81C2C92EU, 0x92722C85U,
+            0xA2BFE8A1U, 0xA81A664BU, 0xC24B8B70U, 0xC76C51A3U,
+            0xD192E819U, 0xD6990624U, 0xF40E3585U, 0x106AA070U,
+            0x19A4C116U, 0x1E376C08U, 0x2748774CU, 0x34B0BCB5U,
+            0x391C0CB3U, 0x4ED8AA4AU, 0x5B9CCA4FU, 0x682E6FF3U,
+            0x748F82EEU, 0x78A5636FU, 0x84C87814U, 0x8CC70208U,
+            0x90BEFFFAU, 0xA4506CEBU, 0xBEF9A3F7U, 0xC67178F2U};
+
+        std::array<uint32_t, 64> schedule{};
+        for (uint32_t index = 0; index < 16U; index++) {
+            const uint32_t offset = index * 4U;
+            schedule[index] = (uint32_t(block[offset]) << 24U) |
+                              (uint32_t(block[offset + 1U]) << 16U) |
+                              (uint32_t(block[offset + 2U]) << 8U) |
+                              uint32_t(block[offset + 3U]);
+        }
+        for (uint32_t index = 16U; index < schedule.size(); index++) {
+            const uint32_t s0 = rotate_right(schedule[index - 15U], 7U) ^
+                                rotate_right(schedule[index - 15U], 18U) ^
+                                (schedule[index - 15U] >> 3U);
+            const uint32_t s1 = rotate_right(schedule[index - 2U], 17U) ^
+                                rotate_right(schedule[index - 2U], 19U) ^
+                                (schedule[index - 2U] >> 10U);
+            schedule[index] = schedule[index - 16U] + s0 +
+                              schedule[index - 7U] + s1;
+        }
+
+        uint32_t a = state[0];
+        uint32_t b = state[1];
+        uint32_t c = state[2];
+        uint32_t d = state[3];
+        uint32_t e = state[4];
+        uint32_t f = state[5];
+        uint32_t g = state[6];
+        uint32_t h = state[7];
+        for (uint32_t index = 0; index < schedule.size(); index++) {
+            const uint32_t s1 = rotate_right(e, 6U) ^ rotate_right(e, 11U) ^
+                                rotate_right(e, 25U);
+            const uint32_t choose = (e & f) ^ ((~e) & g);
+            const uint32_t temporary1 = h + s1 + choose +
+                                        RoundConstants[index] + schedule[index];
+            const uint32_t s0 = rotate_right(a, 2U) ^ rotate_right(a, 13U) ^
+                                rotate_right(a, 22U);
+            const uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t temporary2 = s0 + majority;
+            h = g;
+            g = f;
+            f = e;
+            e = d + temporary1;
+            d = c;
+            c = b;
+            b = a;
+            a = temporary1 + temporary2;
+        }
+        state[0] += a;
+        state[1] += b;
+        state[2] += c;
+        state[3] += d;
+        state[4] += e;
+        state[5] += f;
+        state[6] += g;
+        state[7] += h;
+    }
+
+    std::array<uint32_t, 8> state;
+    std::array<uint8_t, 64> block{};
+    uint64_t bit_length = 0;
+    size_t block_length = 0;
+};
+
+void sha256_u32_le(Sha256 &sha, uint32_t value) {
+    const std::array<uint8_t, 4> encoded = {
+        static_cast<uint8_t>(value),
+        static_cast<uint8_t>(value >> 8U),
+        static_cast<uint8_t>(value >> 16U),
+        static_cast<uint8_t>(value >> 24U)};
+    sha.update(encoded.data(), encoded.size());
+}
+
+void sha256_u64_le(Sha256 &sha, uint64_t value) {
+    std::array<uint8_t, 8> encoded{};
+    for (uint32_t index = 0; index < encoded.size(); index++) {
+        encoded[index] = static_cast<uint8_t>(value >> (index * 8U));
+    }
+    sha.update(encoded.data(), encoded.size());
+}
+
+struct NativeUcodeIdentity {
+    RT64::GBIUCode ucode = RT64::GBIUCode::Unknown;
+    bool low_p = false;
+    bool no_n = false;
+    bool rej = false;
+    bool compute_mvp = false;
+    bool point_lighting = false;
+};
+
+NativeUcodeIdentity native_ucode_identity(const RT64::GBI &gbi) {
+    return NativeUcodeIdentity{
+        gbi.ucode,
+        gbi.flags.LowP,
+        gbi.flags.NoN,
+        gbi.flags.ReJ,
+        gbi.flags.computeMVP,
+        gbi.flags.pointLighting};
+}
+
+void apply_native_ucode_flags(RT64::GBI &gbi,
+                              const NativeUcodeIdentity &identity) {
+    gbi.flags.LowP = identity.low_p;
+    gbi.flags.NoN = identity.no_n;
+    gbi.flags.ReJ = identity.rej;
+    gbi.flags.computeMVP = identity.compute_mvp;
+    gbi.flags.pointLighting = identity.point_lighting;
+}
+
+bool same_native_ucode_identity(const NativeUcodeIdentity &left,
+                                const NativeUcodeIdentity &right) {
+    return (left.ucode == right.ucode) &&
+           (left.low_p == right.low_p) &&
+           (left.no_n == right.no_n) &&
+           (left.rej == right.rej) &&
+           (left.compute_mvp == right.compute_mvp) &&
+           (left.point_lighting == right.point_lighting);
+}
+
+bool expected_family_matches(uint32_t family,
+                             const NativeUcodeIdentity &identity) {
+    using UCode = RT64::GBIUCode;
+    switch (family) {
+    case 1U:
+        return (identity.ucode == UCode::F3D) && !identity.low_p &&
+               !identity.no_n && !identity.rej;
+    case 2U:
+        return (identity.ucode == UCode::F3DEX) && !identity.low_p &&
+               !identity.no_n && !identity.rej;
+    case 3U:
+        return (identity.ucode == UCode::F3DEX) && identity.low_p &&
+               !identity.no_n && !identity.rej;
+    case 4U:
+        return (identity.ucode == UCode::F3DEX) && identity.low_p &&
+               !identity.no_n && identity.rej;
+    case 5U:
+        return (identity.ucode == UCode::F3DEX2) && !identity.low_p &&
+               !identity.no_n && !identity.rej;
+    case 6U:
+        return (identity.ucode == UCode::F3DEX2) && !identity.low_p &&
+               identity.no_n && !identity.rej;
+    case 7U:
+        return (identity.ucode == UCode::F3DEX2) && !identity.low_p &&
+               !identity.no_n && identity.rej;
+    case 8U:
+        return (identity.ucode == UCode::F3DEX2) && identity.low_p &&
+               !identity.no_n && identity.rej;
+    case 9U:
+        return (identity.ucode == UCode::F3DZEX2) && !identity.low_p &&
+               identity.no_n && !identity.rej;
+    case 10U:
+        return (identity.ucode == UCode::S2DEX) && !identity.low_p &&
+               !identity.no_n && !identity.rej;
+    case 11U:
+        return (identity.ucode == UCode::S2DEX2) && !identity.low_p &&
+               !identity.no_n && !identity.rej;
+    case 13U:
+        return (identity.ucode == UCode::L3DEX2) && !identity.low_p &&
+               !identity.no_n && !identity.rej;
+    default:
+        return false;
+    }
+}
+
+struct ImmutableUcodePlan {
+    std::vector<Fn64Rt64UcodeGeneration> entries;
+    std::vector<uint8_t> raw;
+    std::array<uint8_t, 32> sha256{};
+    std::vector<NativeUcodeIdentity> native_identities;
+};
+
+std::array<uint8_t, 32> canonical_plan_sha256(
+    const Fn64Rt64UcodePlan &plan,
+    const std::vector<Fn64Rt64UcodeGeneration> &entries,
+    const std::vector<uint8_t> &raw) {
+    static constexpr uint8_t Domain[] = "fn64-rt64-ucode-plan-v1";
+    Sha256 sha;
+    sha.update(Domain, sizeof(Domain) - 1U);
+    sha256_u32_le(sha, plan.schema);
+    sha256_u32_le(sha, plan.count);
+    for (const Fn64Rt64UcodeGeneration &generation : entries) {
+        const uint32_t scalars[] = {
+            generation.source,
+            generation.text_address,
+            generation.data_address,
+            generation.expected_family,
+            generation.data_bytes,
+            generation.raw_text_offset,
+            generation.raw_text_len,
+            generation.raw_data_offset,
+            generation.raw_data_len,
+            generation.reserved0};
+        for (const uint32_t scalar : scalars) {
+            sha256_u32_le(sha, scalar);
+        }
+        sha.update(generation.logical_text_sha256,
+                   sizeof(generation.logical_text_sha256));
+        sha.update(generation.logical_data_sha256,
+                   sizeof(generation.logical_data_sha256));
+        for (const uint32_t reserved : generation.reserved) {
+            sha256_u32_le(sha, reserved);
+        }
+    }
+    sha256_u64_le(sha, plan.raw_len);
+    for (const uint32_t reserved : plan.reserved) {
+        sha256_u32_le(sha, reserved);
+    }
+    sha.update(raw.data(), raw.size());
+    return sha.finish();
+}
+
+enum class UcodePlanPreflight {
+    Ready,
+    NeedsLle,
+    Invalid
+};
+
+UcodePlanPreflight preflight_ucode_plan(
+    const Fn64Rt64UcodePlan *source,
+    const Fn64Rt64Task &task,
+    ImmutableUcodePlan &plan,
+    uint32_t &rejected_generation,
+    std::string &diagnostic) {
+    rejected_generation = FN64_RT64_UCODE_NO_REJECTED_GENERATION;
+    if (source == nullptr) {
+        diagnostic = "null RT64 ordered microcode-plan pointer";
+        return UcodePlanPreflight::Invalid;
+    }
+    if (source->schema != FN64_RT64_UCODE_PLAN_SCHEMA) {
+        diagnostic = "unsupported RT64 ordered microcode-plan schema";
+        return UcodePlanPreflight::Invalid;
+    }
+    if ((source->count == 0U) || (source->entries == nullptr)) {
+        diagnostic = "RT64 ordered microcode plan has no task-entry generation";
+        return UcodePlanPreflight::Invalid;
+    }
+    if ((source->raw_len > uint64_t(std::numeric_limits<size_t>::max())) ||
+        ((source->raw_len != 0U) && (source->raw_pool == nullptr))) {
+        diagnostic = "RT64 ordered microcode-plan raw pool is invalid";
+        return UcodePlanPreflight::Invalid;
+    }
+    if (std::any_of(std::begin(source->reserved), std::end(source->reserved),
+                    [](uint32_t value) { return value != 0U; })) {
+        diagnostic = "RT64 ordered microcode-plan reserved fields are nonzero";
+        return UcodePlanPreflight::Invalid;
+    }
+
+    plan.entries.assign(source->entries, source->entries + source->count);
+    if (source->raw_len != 0U) {
+        plan.raw.assign(source->raw_pool,
+                        source->raw_pool + static_cast<size_t>(source->raw_len));
+    }
+    std::copy(std::begin(source->plan_sha256), std::end(source->plan_sha256),
+              plan.sha256.begin());
+    const std::array<uint8_t, 32> computed =
+        canonical_plan_sha256(*source, plan.entries, plan.raw);
+    if (computed != plan.sha256) {
+        diagnostic = "RT64 ordered microcode-plan SHA-256 mismatch";
+        return UcodePlanPreflight::Invalid;
+    }
+
+    const uint32_t task_text = task.ucode & 0x00FFFFF8U;
+    const uint32_t task_data = task.ucode_data & 0x00FFFFF8U;
+    RT64::GBIManager scratch_manager;
+    std::vector<uint8_t> scratch(N64_RDRAM_SIZE, 0U);
+    plan.native_identities.reserve(plan.entries.size());
+    for (uint32_t index = 0; index < plan.entries.size(); index++) {
+        const Fn64Rt64UcodeGeneration &generation = plan.entries[index];
+        const bool entry = index == 0U;
+        const uint32_t expected_source = entry
+            ? FN64_RT64_UCODE_SOURCE_TASK_ENTRY
+            : FN64_RT64_UCODE_SOURCE_SELF_LOAD;
+        if (generation.source != expected_source) {
+            diagnostic = "RT64 ordered microcode-plan source order is invalid at generation " +
+                         std::to_string(index);
+            return UcodePlanPreflight::Invalid;
+        }
+        if ((generation.text_address & 0xFF000007U) != 0U ||
+            (generation.data_address & 0xFF000007U) != 0U) {
+            diagnostic = "RT64 ordered microcode-plan address is not a masked aligned physical address at generation " +
+                         std::to_string(index);
+            return UcodePlanPreflight::Invalid;
+        }
+        if (entry && ((generation.text_address != task_text) ||
+                      (generation.data_address != task_data))) {
+            diagnostic = "RT64 ordered microcode-plan entry addresses disagree with OSTask";
+            return UcodePlanPreflight::Invalid;
+        }
+        if ((generation.data_bytes == 0U) ||
+            (generation.data_bytes > 4096U) ||
+            ((generation.data_bytes & 7U) != 0U) ||
+            (generation.raw_text_len !=
+             FN64_RT64_UCODE_TEXT_RECOGNITION_BYTES) ||
+            (generation.raw_data_len !=
+             FN64_RT64_UCODE_DATA_RECOGNITION_BYTES) ||
+            ((generation.expected_family != 0U) &&
+             (generation.reserved0 != 0U)) ||
+            std::any_of(std::begin(generation.reserved),
+                        std::end(generation.reserved),
+                        [](uint32_t value) { return value != 0U; })) {
+            diagnostic = "RT64 ordered microcode-plan generation shape is invalid at generation " +
+                         std::to_string(index);
+            return UcodePlanPreflight::Invalid;
+        }
+        const uint64_t text_end = uint64_t(generation.raw_text_offset) +
+                                  generation.raw_text_len;
+        const uint64_t data_end = uint64_t(generation.raw_data_offset) +
+                                  generation.raw_data_len;
+        const uint64_t rdram_text_end = uint64_t(generation.text_address) +
+                                        generation.raw_text_len;
+        const uint64_t rdram_data_end = uint64_t(generation.data_address) +
+                                        generation.raw_data_len;
+        if ((text_end > plan.raw.size()) || (data_end > plan.raw.size()) ||
+            (rdram_text_end > N64_RDRAM_SIZE) ||
+            (rdram_data_end > N64_RDRAM_SIZE)) {
+            diagnostic = "RT64 ordered microcode-plan recognition window is out of bounds at generation " +
+                         std::to_string(index);
+            return UcodePlanPreflight::Invalid;
+        }
+
+        const uint8_t *text = plan.raw.data() + generation.raw_text_offset;
+        const uint8_t *data = plan.raw.data() + generation.raw_data_offset;
+        std::memcpy(scratch.data() + generation.text_address,
+                    text, generation.raw_text_len);
+        std::memcpy(scratch.data() + generation.data_address,
+                    data, generation.raw_data_len);
+        if ((std::memcmp(scratch.data() + generation.text_address,
+                         text, generation.raw_text_len) != 0) ||
+            (std::memcmp(scratch.data() + generation.data_address,
+                         data, generation.raw_data_len) != 0)) {
+            diagnostic = "RT64 ordered microcode-plan overlapping recognition windows conflict at generation " +
+                         std::to_string(index);
+            return UcodePlanPreflight::Invalid;
+        }
+
+        // Family 12 is the logical L3DEX family, which pinned RT64 does not
+        // expose as an HLE GBI. Reject it before calling the manager because
+        // its database's historical Unknown tag is not an executable GBI.
+        if ((generation.expected_family == 0U) ||
+            (generation.expected_family == 12U) ||
+            (generation.expected_family > 13U)) {
+            rejected_generation = index;
+            diagnostic = "RT64 ordered microcode-plan family requires LLE at generation " +
+                         std::to_string(index);
+            return UcodePlanPreflight::NeedsLle;
+        }
+        RT64::GBI *recognized = scratch_manager.getGBIForUCode(
+            scratch.data(), generation.text_address, generation.data_address);
+        if (recognized == nullptr) {
+            rejected_generation = index;
+            diagnostic = "RT64 did not recognize ordered microcode generation " +
+                         std::to_string(index);
+            return UcodePlanPreflight::NeedsLle;
+        }
+        const NativeUcodeIdentity identity = native_ucode_identity(*recognized);
+        if (!expected_family_matches(generation.expected_family, identity)) {
+            rejected_generation = index;
+            diagnostic = "RT64 native microcode family disagrees with ordered preflight at generation " +
+                         std::to_string(index);
+            return UcodePlanPreflight::NeedsLle;
+        }
+        plan.native_identities.push_back(identity);
+    }
+    return UcodePlanPreflight::Ready;
+}
+
+struct ActiveUcodePlan {
+    Fn64Rt64Context *context = nullptr;
+    RT64::Interpreter *interpreter = nullptr;
+    const ImmutableUcodePlan *plan = nullptr;
+    Fn64Rt64TaskResult *result = nullptr;
+    uint32_t cursor = 0;
+    bool execution_started = false;
+    RT64::GBI *pending_gbi = nullptr;
+    NativeUcodeIdentity pending_identity{};
+    bool pending = false;
+};
+
+thread_local ActiveUcodePlan *active_ucode_plan = nullptr;
+
+class ScopedUcodePlan {
+public:
+    ScopedUcodePlan(Fn64Rt64Context *context,
+                    RT64::Interpreter *interpreter,
+                    const ImmutableUcodePlan &plan,
+                    Fn64Rt64TaskResult *result)
+        : active{context, interpreter, &plan, result, 0U, false,
+                 nullptr, {}, false} {
+        if (active_ucode_plan != nullptr) {
+            throw std::runtime_error("nested RT64 ordered microcode-plan scope");
+        }
+        active_ucode_plan = &active;
+    }
+
+    ScopedUcodePlan(const ScopedUcodePlan &) = delete;
+    ScopedUcodePlan &operator=(const ScopedUcodePlan &) = delete;
+
+    ~ScopedUcodePlan() {
+        if (active_ucode_plan == &active) {
+            active_ucode_plan = nullptr;
+        }
+        if (active.execution_started &&
+            (active.cursor != active.plan->entries.size())) {
+            active.context->ucode_admission_poisoned = true;
+            active.result->rejected_generation = active.cursor;
+        }
+    }
+
+    bool exhausted() const {
+        return active.cursor == active.plan->entries.size();
+    }
+
+    uint32_t cursor() const {
+        return active.cursor;
+    }
+
+private:
+    ActiveUcodePlan active;
+};
+
+[[noreturn]] void poison_ucode_plan(ActiveUcodePlan &active,
+                                    uint32_t generation,
+                                    const std::string &diagnostic) {
+    active.context->ucode_admission_poisoned = true;
+    active.result->rejected_generation = generation;
+    throw std::runtime_error(diagnostic);
+}
+} // namespace
+
+extern "C" void *fn64_rt64_ucode_generation_observe(
+    void *raw_interpreter,
+    uint32_t text_address,
+    uint32_t data_address,
+    uint32_t reset_from_task) {
+    ActiveUcodePlan *active = active_ucode_plan;
+    if (active == nullptr) {
+        throw std::runtime_error(
+            "RT64 microcode load occurred without an ordered admission plan");
+    }
+    active->execution_started = true;
+    const uint32_t index = active->cursor;
+    if (active->pending) {
+        poison_ucode_plan(*active, index,
+                          "RT64 began a microcode generation before applying the previous admission");
+    }
+    if (raw_interpreter != active->interpreter) {
+        poison_ucode_plan(*active, index,
+                          "RT64 ordered microcode-plan interpreter changed");
+    }
+    if (index >= active->plan->entries.size()) {
+        poison_ucode_plan(*active, index,
+                          "RT64 observed an extra microcode generation");
+    }
+    const Fn64Rt64UcodeGeneration &generation = active->plan->entries[index];
+    const uint32_t source = reset_from_task != 0U
+        ? FN64_RT64_UCODE_SOURCE_TASK_ENTRY
+        : FN64_RT64_UCODE_SOURCE_SELF_LOAD;
+    const uint32_t masked_text = text_address & 0x00FFFFF8U;
+    const uint32_t masked_data = data_address & 0x00FFFFF8U;
+    if ((source != generation.source) ||
+        (masked_text != generation.text_address) ||
+        (masked_data != generation.data_address)) {
+        poison_ucode_plan(*active, index,
+                          "RT64 microcode generation source or address order disagrees with admission plan");
+    }
+
+    RT64::Interpreter *interpreter = active->interpreter;
+    uint8_t *rdram = interpreter->state->RDRAM;
+    const uint8_t *expected_text =
+        active->plan->raw.data() + generation.raw_text_offset;
+    const uint8_t *expected_data =
+        active->plan->raw.data() + generation.raw_data_offset;
+    if ((std::memcmp(rdram + masked_text, expected_text,
+                     generation.raw_text_len) != 0) ||
+        (std::memcmp(rdram + masked_data, expected_data,
+                     generation.raw_data_len) != 0)) {
+        poison_ucode_plan(*active, index,
+                          "RT64 live microcode recognition bytes disagree with immutable admission plan");
+    }
+
+    const bool recognized_was_active = interpreter->hleGBI != nullptr;
+    const NativeUcodeIdentity previous_active = recognized_was_active
+        ? native_ucode_identity(*interpreter->hleGBI)
+        : NativeUcodeIdentity{};
+    RT64::GBI *recognized = interpreter->gbiManager.getGBIForUCode(
+        rdram, masked_text, masked_data);
+    if (recognized == nullptr) {
+        poison_ucode_plan(*active, index,
+                          "RT64 failed to recognize a preflighted live microcode generation");
+    }
+    const NativeUcodeIdentity observed = native_ucode_identity(*recognized);
+    if (!same_native_ucode_identity(
+            observed, active->plan->native_identities[index])) {
+        poison_ucode_plan(*active, index,
+                          "RT64 live microcode identity or flags disagree with preflight");
+    }
+
+    // getGBIForUCode stores per-instance flags in its broad-family cache.
+    // Preserve the old active instance until pinned RT64 has flushed it; the
+    // paired apply hook publishes the preflighted identity immediately after.
+    if (recognized_was_active && (recognized == interpreter->hleGBI)) {
+        apply_native_ucode_flags(*recognized, previous_active);
+    }
+    active->pending_gbi = recognized;
+    active->pending_identity = observed;
+    active->pending = true;
+    return recognized;
+}
+
+extern "C" void fn64_rt64_ucode_generation_apply(
+    void *raw_interpreter,
+    void *raw_gbi) {
+    ActiveUcodePlan *active = active_ucode_plan;
+    if (active == nullptr) {
+        throw std::runtime_error(
+            "RT64 microcode apply occurred without an ordered admission plan");
+    }
+    const uint32_t index = active->cursor;
+    if ((raw_interpreter != active->interpreter) || !active->pending ||
+        (raw_gbi != active->pending_gbi)) {
+        poison_ucode_plan(*active, index,
+                          "RT64 microcode apply disagrees with the observed admission generation");
+    }
+    RT64::GBI *recognized = active->pending_gbi;
+    apply_native_ucode_flags(*recognized, active->pending_identity);
+    active->interpreter->hleGBI = recognized;
+    active->interpreter->state->rsp->setGBI(recognized);
+    active->pending_gbi = nullptr;
+    active->pending = false;
+    active->cursor++;
+    active->result->observed_count = active->cursor;
+    if (index == 0U) {
+        active->result->entry_gbi_available = 1U;
+    }
+}
 
 #if defined(FN64_RT64_HFR_EVIDENCE)
 extern "C" void fn64_rt64_hfr_present_call_observe(
@@ -2863,12 +3472,18 @@ extern "C" int fn64_rt64_process_task(
     size_t imem_len,
     const Fn64Rt64Task *task,
     uint32_t output_addr,
+    const Fn64Rt64UcodePlan *ucode_plan,
     Fn64Rt64TaskResult *result,
     char *error,
     size_t error_capacity) {
     try {
         if ((context == nullptr) || !context->setup_complete) {
             set_error(error, error_capacity, "RT64 context is not initialized");
+            return 0;
+        }
+        if (context->ucode_admission_poisoned) {
+            set_error(error, error_capacity,
+                      "RT64 context is poisoned by an ordered microcode-plan divergence");
             return 0;
         }
         if ((rdram == nullptr) || (dmem == nullptr) || (imem == nullptr) ||
@@ -2888,6 +3503,30 @@ extern "C" int fn64_rt64_process_task(
 
         *result = {};
         result->schema = FN64_RT64_TASK_RESULT_SCHEMA;
+        result->rejected_generation = FN64_RT64_UCODE_NO_REJECTED_GENERATION;
+
+        ImmutableUcodePlan immutable_plan;
+        uint32_t rejected_generation = FN64_RT64_UCODE_NO_REJECTED_GENERATION;
+        std::string preflight_diagnostic;
+        const UcodePlanPreflight preflight = preflight_ucode_plan(
+            ucode_plan, *task, immutable_plan, rejected_generation,
+            preflight_diagnostic);
+        if (ucode_plan != nullptr) {
+            result->planned_count = ucode_plan->count;
+            std::copy(std::begin(ucode_plan->plan_sha256),
+                      std::end(ucode_plan->plan_sha256),
+                      std::begin(result->plan_sha256));
+        }
+        if (preflight == UcodePlanPreflight::Invalid) {
+            set_error(error, error_capacity, preflight_diagnostic);
+            return 0;
+        }
+        if (preflight == UcodePlanPreflight::NeedsLle) {
+            result->disposition = FN64_RT64_TASK_DISPOSITION_NEEDS_LLE;
+            result->rejected_generation = rejected_generation;
+            set_error(error, error_capacity, preflight_diagnostic);
+            return 1;
+        }
 
         std::memcpy(context->dmem.data(), dmem, context->dmem.size());
         std::memcpy(context->imem.data(), imem, context->imem.size());
@@ -2908,6 +3547,11 @@ extern "C" int fn64_rt64_process_task(
         // Update both aliases together before any interpreter or worker can
         // observe the fn64-owned allocation.
         ScopedRdramBinding rdram_binding(context, rdram);
+        ScopedUcodePlan admission_scope(
+            context,
+            context->application->interpreter.get(),
+            immutable_plan,
+            result);
         context->application->interpreter->loadUCodeGBI(
             ucode_address,
             ucode_data_address,
@@ -2943,6 +3587,13 @@ extern "C" int fn64_rt64_process_task(
         MetalPipelineCriticalScope pipeline_scope(context->ubershader_evidence_active);
 #endif
         context->application->processDisplayLists(rdram, dl_address, 0, true);
+        if (!admission_scope.exhausted()) {
+            context->ucode_admission_poisoned = true;
+            result->rejected_generation = admission_scope.cursor();
+            set_error(error, error_capacity,
+                      "RT64 task completed without exhausting its ordered microcode plan");
+            return 0;
+        }
         extended_scope.reset();
         const uint64_t submitted_workload = context->application->state->workloadId;
         if (submitted_workload < previous_workload) {
@@ -3008,6 +3659,8 @@ extern "C" int fn64_rt64_process_task(
 
         std::memcpy(dmem, context->dmem.data(), context->dmem.size());
         std::memcpy(imem, context->imem.data(), context->imem.size());
+
+        result->disposition = FN64_RT64_TASK_DISPOSITION_COMPLETE;
 
         return 1;
     } catch (const std::exception &exception) {

@@ -8,9 +8,10 @@ use fn64_render::{
     RenderHardwareResolve, RenderInternalColorFormat, RenderPresentationMode, RenderRefreshRate,
     RenderReplacementAutoPath, RenderReplacementOperation, RenderReplacementPackIdentity,
     RenderReplacementShift, RenderResolution, RenderRuntimeSettings, RenderUpscale2d,
-    ResolutionMultiplier, ViPixelType, ViPresentation, ViScanoutState,
+    ResolutionMultiplier, UcodeId, ViPixelType, ViPresentation, ViScanoutState,
 };
 use fn64_runtime::{RspMemAddr, RspMemory, RspMemoryBank};
+use sha2::{Digest, Sha256};
 
 const ERROR_CAPACITY: usize = 1024;
 
@@ -82,7 +83,186 @@ impl From<&OsTask> for RawTask {
     }
 }
 
-const TASK_RESULT_SCHEMA: u32 = 1;
+const TASK_RESULT_SCHEMA: u32 = 2;
+
+const UCODE_PLAN_SCHEMA: u32 = 1;
+const UCODE_SOURCE_TASK_ENTRY: u32 = 1;
+const UCODE_SOURCE_SELF_LOAD: u32 = 2;
+const UCODE_DISPOSITION_COMPLETE: u32 = 1;
+const UCODE_DISPOSITION_NEEDS_LLE: u32 = 2;
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+struct RawUcodeGeneration {
+    source: u32,
+    text_address: u32,
+    data_address: u32,
+    expected_family: u32,
+    data_bytes: u32,
+    raw_text_offset: u32,
+    raw_text_len: u32,
+    raw_data_offset: u32,
+    raw_data_len: u32,
+    reserved0: u32,
+    text_sha256: [u8; 32],
+    data_sha256: [u8; 32],
+    reserved: [u32; 4],
+}
+
+const _: [(); 120] = [(); std::mem::size_of::<RawUcodeGeneration>()];
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct RawUcodePlan {
+    schema: u32,
+    generation_count: u32,
+    generations: *const RawUcodeGeneration,
+    raw_pool: *const u8,
+    raw_pool_len: u64,
+    plan_sha256: [u8; 32],
+    reserved: [u32; 4],
+}
+
+const _: [(); 80] = [(); std::mem::size_of::<RawUcodePlan>()];
+
+struct PreparedUcodePlan {
+    generations: Vec<RawUcodeGeneration>,
+    raw_pool: Vec<u8>,
+    plan_sha256: [u8; 32],
+}
+
+fn raw_ucode_family(family: UcodeId) -> (u32, u32) {
+    match family {
+        UcodeId::Fast3d => (1, 0),
+        UcodeId::F3dex => (2, 0),
+        UcodeId::F3dlx => (3, 0),
+        UcodeId::F3dlxRej => (4, 0),
+        UcodeId::F3dex2 => (5, 0),
+        UcodeId::F3dex2NoN => (6, 0),
+        UcodeId::F3dex2Rej => (7, 0),
+        UcodeId::F3dlx2Rej => (8, 0),
+        UcodeId::F3dzex2 => (9, 0),
+        UcodeId::S2dex => (10, 0),
+        UcodeId::S2dex2 => (11, 0),
+        UcodeId::L3dex => (12, 0),
+        UcodeId::L3dex2 => (13, 0),
+        UcodeId::Other(value) => (0, value),
+    }
+}
+
+impl PreparedUcodePlan {
+    fn new(admission: &crate::Rt64TaskAdmission) -> Result<Self, String> {
+        if admission.plan.len() != admission.raw_windows.len() {
+            return Err(format!(
+                "logical microcode generations ({}) and raw recognition windows ({}) differ",
+                admission.plan.len(),
+                admission.raw_windows.len()
+            ));
+        }
+        let mut raw_pool = Vec::new();
+        let mut generations = Vec::with_capacity(admission.plan.len());
+        for (generation, window) in admission
+            .plan
+            .generations()
+            .iter()
+            .zip(&admission.raw_windows)
+        {
+            let (expected_family, reserved0) = raw_ucode_family(generation.family);
+            if window.text.len() != crate::RT64_GBI_TEXT_RECOGNITION_BYTES
+                || window.data.len() != crate::RT64_GBI_DATA_RECOGNITION_BYTES
+            {
+                return Err(format!(
+                    "microcode recognition window has text/data lengths {:#x}/{:#x}, required {:#x}/{:#x}",
+                    window.text.len(),
+                    window.data.len(),
+                    crate::RT64_GBI_TEXT_RECOGNITION_BYTES,
+                    crate::RT64_GBI_DATA_RECOGNITION_BYTES
+                ));
+            }
+            let raw_text_offset = u32::try_from(raw_pool.len())
+                .map_err(|_| "microcode raw byte pool exceeds u32 offsets".to_owned())?;
+            raw_pool.extend_from_slice(&window.text);
+            let raw_data_offset = u32::try_from(raw_pool.len())
+                .map_err(|_| "microcode raw byte pool exceeds u32 offsets".to_owned())?;
+            raw_pool.extend_from_slice(&window.data);
+            generations.push(RawUcodeGeneration {
+                source: match generation.source {
+                    fn64_render::TaskAdmissionSource::TaskEntry => UCODE_SOURCE_TASK_ENTRY,
+                    fn64_render::TaskAdmissionSource::SelfLoad => UCODE_SOURCE_SELF_LOAD,
+                },
+                text_address: generation.text_address,
+                data_address: generation.data_address,
+                expected_family,
+                data_bytes: generation.data.bytes,
+                raw_text_offset,
+                raw_text_len: u32::try_from(window.text.len())
+                    .expect("pinned RT64 text recognition window fits u32"),
+                raw_data_offset,
+                raw_data_len: u32::try_from(window.data.len())
+                    .expect("pinned RT64 data recognition window fits u32"),
+                reserved0,
+                text_sha256: generation.text_sha256.as_bytes(),
+                data_sha256: generation.data.sha256,
+                reserved: [0; 4],
+            });
+        }
+        let raw_pool_len = u64::try_from(raw_pool.len())
+            .map_err(|_| "microcode raw byte pool length exceeds u64".to_owned())?;
+        let mut hash = Sha256::new();
+        hash.update(b"fn64-rt64-ucode-plan-v1");
+        hash.update(UCODE_PLAN_SCHEMA.to_le_bytes());
+        hash.update(
+            u32::try_from(generations.len())
+                .map_err(|_| "microcode generation count exceeds u32".to_owned())?
+                .to_le_bytes(),
+        );
+        for generation in &generations {
+            for value in [
+                generation.source,
+                generation.text_address,
+                generation.data_address,
+                generation.expected_family,
+                generation.data_bytes,
+                generation.raw_text_offset,
+                generation.raw_text_len,
+                generation.raw_data_offset,
+                generation.raw_data_len,
+                generation.reserved0,
+            ] {
+                hash.update(value.to_le_bytes());
+            }
+            hash.update(generation.text_sha256);
+            hash.update(generation.data_sha256);
+            for value in generation.reserved {
+                hash.update(value.to_le_bytes());
+            }
+        }
+        hash.update(raw_pool_len.to_le_bytes());
+        for value in [0u32; 4] {
+            hash.update(value.to_le_bytes());
+        }
+        hash.update(&raw_pool);
+        Ok(Self {
+            generations,
+            raw_pool,
+            plan_sha256: hash.finalize().into(),
+        })
+    }
+
+    fn raw(&self) -> RawUcodePlan {
+        RawUcodePlan {
+            schema: UCODE_PLAN_SCHEMA,
+            generation_count: u32::try_from(self.generations.len())
+                .expect("validated microcode generation count fits u32"),
+            generations: self.generations.as_ptr(),
+            raw_pool: self.raw_pool.as_ptr(),
+            raw_pool_len: u64::try_from(self.raw_pool.len())
+                .expect("validated microcode raw pool length fits u64"),
+            plan_sha256: self.plan_sha256,
+            reserved: [0; 4],
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -95,9 +275,14 @@ struct RawTaskResult {
     initial_ucode_data_address: u32,
     final_ucode_text_address: u32,
     final_ucode_data_address: u32,
+    disposition: u32,
+    planned_generation_count: u32,
+    observed_generation_count: u32,
+    rejected_generation: u32,
+    plan_sha256: [u8; 32],
 }
 
-const _: [(); 40] = [(); std::mem::size_of::<RawTaskResult>()];
+const _: [(); 88] = [(); std::mem::size_of::<RawTaskResult>()];
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NativeTaskResult {
@@ -105,19 +290,78 @@ pub(crate) struct NativeTaskResult {
     pub(crate) full_sync_count: u64,
     pub(crate) initial_ucode_addresses: (u32, u32),
     pub(crate) final_ucode_addresses: (u32, u32),
+    pub(crate) planned_generation_count: u32,
+    pub(crate) observed_generation_count: u32,
+    pub(crate) plan_sha256: [u8; 32],
 }
 
-fn task_result_from_raw(raw: RawTaskResult) -> Result<NativeTaskResult, String> {
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NativeTaskOutcome {
+    Complete(NativeTaskResult),
+    NeedsLle {
+        rejected_generation: u32,
+        plan_sha256: [u8; 32],
+    },
+}
+
+fn task_result_from_raw(
+    raw: RawTaskResult,
+    expected_generation_count: u32,
+    expected_plan_sha256: [u8; 32],
+) -> Result<NativeTaskOutcome, String> {
     if raw.schema != TASK_RESULT_SCHEMA {
         return Err(format!(
             "RT64 task result schema {} does not match required schema {TASK_RESULT_SCHEMA}",
             raw.schema
         ));
     }
-    if raw.entry_gbi_available != 1 {
+    if raw.planned_generation_count != expected_generation_count {
         return Err(format!(
-            "RT64 successful task returned entry_gbi_available={}",
-            raw.entry_gbi_available
+            "RT64 task result planned {} microcode generations, expected {expected_generation_count}",
+            raw.planned_generation_count
+        ));
+    }
+    if raw.plan_sha256 != expected_plan_sha256 {
+        return Err("RT64 task result returned a different microcode plan identity".into());
+    }
+    if raw.observed_generation_count > raw.planned_generation_count {
+        return Err(format!(
+            "RT64 observed {} microcode generations from a {}-generation plan",
+            raw.observed_generation_count, raw.planned_generation_count
+        ));
+    }
+    if raw.disposition == UCODE_DISPOSITION_NEEDS_LLE {
+        if raw.entry_gbi_available != 0
+            || raw.observed_generation_count != 0
+            || raw.rejected_generation >= raw.planned_generation_count
+            || raw.workload_id_before != 0
+            || raw.workload_id_after != 0
+            || raw.initial_ucode_text_address != 0
+            || raw.initial_ucode_data_address != 0
+            || raw.final_ucode_text_address != 0
+            || raw.final_ucode_data_address != 0
+        {
+            return Err(
+                "RT64 needs-LLE task result contains committed native-task evidence".into(),
+            );
+        }
+        return Ok(NativeTaskOutcome::NeedsLle {
+            rejected_generation: raw.rejected_generation,
+            plan_sha256: raw.plan_sha256,
+        });
+    }
+    if raw.disposition != UCODE_DISPOSITION_COMPLETE
+        || raw.entry_gbi_available != 1
+        || raw.observed_generation_count != raw.planned_generation_count
+        || raw.rejected_generation != u32::MAX
+    {
+        return Err(format!(
+            "RT64 complete task returned disposition/entry/planned/observed/rejected={}/{}/{}/{}/{}",
+            raw.disposition,
+            raw.entry_gbi_available,
+            raw.planned_generation_count,
+            raw.observed_generation_count,
+            raw.rejected_generation
         ));
     }
     let full_sync_count = raw
@@ -129,7 +373,7 @@ fn task_result_from_raw(raw: RawTaskResult) -> Result<NativeTaskResult, String> 
                 raw.workload_id_before, raw.workload_id_after
             )
         })?;
-    Ok(NativeTaskResult {
+    Ok(NativeTaskOutcome::Complete(NativeTaskResult {
         dp_full_sync: if full_sync_count == 0 {
             DpFullSyncStatus::NotReached
         } else {
@@ -141,7 +385,10 @@ fn task_result_from_raw(raw: RawTaskResult) -> Result<NativeTaskResult, String> 
             raw.initial_ucode_data_address,
         ),
         final_ucode_addresses: (raw.final_ucode_text_address, raw.final_ucode_data_address),
-    })
+        planned_generation_count: raw.planned_generation_count,
+        observed_generation_count: raw.observed_generation_count,
+        plan_sha256: raw.plan_sha256,
+    }))
 }
 
 #[derive(Copy, Clone, Default)]
@@ -1675,6 +1922,7 @@ unsafe extern "C" {
         imem_len: usize,
         task: *const RawTask,
         output_addr: u32,
+        ucode_plan: *const RawUcodePlan,
         result: *mut RawTaskResult,
         error: *mut c_char,
         error_capacity: usize,
@@ -2330,8 +2578,11 @@ impl Context {
         rsp_memory: &mut RspMemory,
         task: &OsTask,
         output_addr: u32,
-    ) -> Result<NativeTaskResult, String> {
+        admission: &crate::Rt64TaskAdmission,
+    ) -> Result<NativeTaskOutcome, String> {
         let raw_task = RawTask::from(task);
+        let prepared_plan = PreparedUcodePlan::new(admission)?;
+        let raw_plan = prepared_plan.raw();
         let mut dmem = *rsp_memory.bank(RspMemoryBank::Dmem);
         let mut imem = *rsp_memory.bank(RspMemoryBank::Imem);
         let mut result = RawTaskResult::default();
@@ -2351,23 +2602,30 @@ impl Context {
                 imem.len(),
                 &raw_task,
                 output_addr,
+                &raw_plan,
                 &mut result,
                 error.as_mut_ptr(),
                 error.len(),
             )
         };
         if ok != 0 {
-            if rsp_memory.bank(RspMemoryBank::Dmem) != &dmem {
-                rsp_memory
-                    .write_bytes(RspMemAddr::from_register(0), &dmem)
-                    .expect("RT64 returned a complete 4 KiB DMEM bank");
+            let expected_generation_count = u32::try_from(prepared_plan.generations.len())
+                .expect("validated microcode generation count fits u32");
+            let outcome =
+                task_result_from_raw(result, expected_generation_count, prepared_plan.plan_sha256)?;
+            if matches!(outcome, NativeTaskOutcome::Complete(_)) {
+                if rsp_memory.bank(RspMemoryBank::Dmem) != &dmem {
+                    rsp_memory
+                        .write_bytes(RspMemAddr::from_register(0), &dmem)
+                        .expect("RT64 returned a complete 4 KiB DMEM bank");
+                }
+                if rsp_memory.bank(RspMemoryBank::Imem) != &imem {
+                    rsp_memory
+                        .write_bytes(RspMemAddr::from_register(0x1000), &imem)
+                        .expect("RT64 returned a complete 4 KiB IMEM bank");
+                }
             }
-            if rsp_memory.bank(RspMemoryBank::Imem) != &imem {
-                rsp_memory
-                    .write_bytes(RspMemAddr::from_register(0x1000), &imem)
-                    .expect("RT64 returned a complete 4 KiB IMEM bank");
-            }
-            task_result_from_raw(result)
+            Ok(outcome)
         } else {
             Err(error_string(
                 &error,
@@ -3256,36 +3514,91 @@ mod tests {
 
     #[test]
     fn native_task_result_derives_full_sync_count_and_ucode_transition() {
-        let result = task_result_from_raw(RawTaskResult {
-            schema: TASK_RESULT_SCHEMA,
-            entry_gbi_available: 1,
-            workload_id_before: 7,
-            workload_id_after: 10,
-            initial_ucode_text_address: 0x1000,
-            initial_ucode_data_address: 0x2000,
-            final_ucode_text_address: 0x3000,
-            final_ucode_data_address: 0x4000,
-        })
+        let plan_sha256 = [0x42; 32];
+        let outcome = task_result_from_raw(
+            RawTaskResult {
+                schema: TASK_RESULT_SCHEMA,
+                entry_gbi_available: 1,
+                workload_id_before: 7,
+                workload_id_after: 10,
+                initial_ucode_text_address: 0x1000,
+                initial_ucode_data_address: 0x2000,
+                final_ucode_text_address: 0x3000,
+                final_ucode_data_address: 0x4000,
+                disposition: UCODE_DISPOSITION_COMPLETE,
+                planned_generation_count: 3,
+                observed_generation_count: 3,
+                rejected_generation: u32::MAX,
+                plan_sha256,
+            },
+            3,
+            plan_sha256,
+        )
         .unwrap();
+        let NativeTaskOutcome::Complete(result) = outcome else {
+            panic!("complete native result decoded as NeedsLle");
+        };
         assert_eq!(result.dp_full_sync, DpFullSyncStatus::Reached);
         assert_eq!(result.full_sync_count, 3);
         assert_eq!(result.initial_ucode_addresses, (0x1000, 0x2000));
         assert_eq!(result.final_ucode_addresses, (0x3000, 0x4000));
+        assert_eq!(result.planned_generation_count, 3);
+        assert_eq!(result.observed_generation_count, 3);
+        assert_eq!(result.plan_sha256, plan_sha256);
 
-        let no_sync = task_result_from_raw(RawTaskResult {
-            schema: TASK_RESULT_SCHEMA,
-            entry_gbi_available: 1,
-            workload_id_before: 11,
-            workload_id_after: 11,
-            ..RawTaskResult::default()
-        })
+        let no_sync = task_result_from_raw(
+            RawTaskResult {
+                schema: TASK_RESULT_SCHEMA,
+                entry_gbi_available: 1,
+                workload_id_before: 11,
+                workload_id_after: 11,
+                disposition: UCODE_DISPOSITION_COMPLETE,
+                planned_generation_count: 1,
+                observed_generation_count: 1,
+                rejected_generation: u32::MAX,
+                plan_sha256,
+                ..RawTaskResult::default()
+            },
+            1,
+            plan_sha256,
+        )
         .unwrap();
+        let NativeTaskOutcome::Complete(no_sync) = no_sync else {
+            panic!("complete no-sync result decoded as NeedsLle");
+        };
         assert_eq!(no_sync.dp_full_sync, DpFullSyncStatus::NotReached);
         assert_eq!(no_sync.full_sync_count, 0);
     }
 
     #[test]
+    fn native_task_result_preserves_precommit_needs_lle_generation() {
+        let plan_sha256 = [0x31; 32];
+        let outcome = task_result_from_raw(
+            RawTaskResult {
+                schema: TASK_RESULT_SCHEMA,
+                disposition: UCODE_DISPOSITION_NEEDS_LLE,
+                planned_generation_count: 3,
+                observed_generation_count: 0,
+                rejected_generation: 1,
+                plan_sha256,
+                ..RawTaskResult::default()
+            },
+            3,
+            plan_sha256,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            NativeTaskOutcome::NeedsLle {
+                rejected_generation: 1,
+                plan_sha256
+            }
+        );
+    }
+
+    #[test]
     fn native_task_result_rejects_untyped_or_inconsistent_success() {
+        let plan_sha256 = [0x42; 32];
         for raw in [
             RawTaskResult {
                 schema: TASK_RESULT_SCHEMA + 1,
@@ -3295,6 +3608,11 @@ mod tests {
             RawTaskResult {
                 schema: TASK_RESULT_SCHEMA,
                 entry_gbi_available: 0,
+                disposition: UCODE_DISPOSITION_COMPLETE,
+                planned_generation_count: 1,
+                observed_generation_count: 1,
+                rejected_generation: u32::MAX,
+                plan_sha256,
                 ..RawTaskResult::default()
             },
             RawTaskResult {
@@ -3302,11 +3620,68 @@ mod tests {
                 entry_gbi_available: 1,
                 workload_id_before: 2,
                 workload_id_after: 1,
+                disposition: UCODE_DISPOSITION_COMPLETE,
+                planned_generation_count: 1,
+                observed_generation_count: 1,
+                rejected_generation: u32::MAX,
+                plan_sha256,
                 ..RawTaskResult::default()
             },
         ] {
-            assert!(task_result_from_raw(raw).is_err());
+            assert!(task_result_from_raw(raw, 1, plan_sha256).is_err());
         }
+    }
+
+    #[test]
+    fn native_ucode_plan_binds_ordered_logical_and_raw_recognition_images() {
+        let generation = |source, text_address, digest| fn64_render::TaskAdmissionGeneration {
+            source,
+            text_address,
+            data_address: 0x4000,
+            text_sha256: fn64_render::UcodeDigest::from_sha256([digest; 32]),
+            data: fn64_render::MicrocodeDataImageIdentity {
+                bytes: 8,
+                sha256: [digest.wrapping_add(1); 32],
+            },
+            family: UcodeId::F3dex2,
+        };
+        let entry = generation(fn64_render::TaskAdmissionSource::TaskEntry, 0x1000, 0x11);
+        let self_load = generation(fn64_render::TaskAdmissionSource::SelfLoad, 0x2000, 0x22);
+        let raw_window = |byte| crate::gbi::TaskAdmissionRawWindow {
+            text: vec![byte; crate::RT64_GBI_TEXT_RECOGNITION_BYTES],
+            data: vec![byte.wrapping_add(1); crate::RT64_GBI_DATA_RECOGNITION_BYTES],
+        };
+        let admission = crate::Rt64TaskAdmission {
+            plan: fn64_render::TaskAdmissionPlan::new(entry, [self_load]),
+            raw_windows: vec![raw_window(0x31), raw_window(0x42)],
+        };
+        let prepared = PreparedUcodePlan::new(&admission).unwrap();
+        assert_eq!(prepared.generations.len(), 2);
+        assert_eq!(prepared.generations[0].source, UCODE_SOURCE_TASK_ENTRY);
+        assert_eq!(prepared.generations[1].source, UCODE_SOURCE_SELF_LOAD);
+        assert_eq!(prepared.generations[0].raw_text_offset, 0);
+        assert_eq!(
+            prepared.generations[0].raw_data_offset as usize,
+            crate::RT64_GBI_TEXT_RECOGNITION_BYTES
+        );
+        assert_eq!(prepared.raw().plan_sha256, prepared.plan_sha256);
+
+        let mut opaque_entry = entry;
+        opaque_entry.family = UcodeId::Other(0x5645_4e44);
+        let opaque = PreparedUcodePlan::new(&crate::Rt64TaskAdmission {
+            plan: fn64_render::TaskAdmissionPlan::new(opaque_entry, []),
+            raw_windows: vec![raw_window(0x53)],
+        })
+        .unwrap();
+        assert_eq!(opaque.generations[0].expected_family, 0);
+        assert_eq!(opaque.generations[0].reserved0, 0x5645_4e44);
+
+        let mut changed = admission;
+        changed.raw_windows[1].text[0] ^= 0xff;
+        assert_ne!(
+            prepared.plan_sha256,
+            PreparedUcodePlan::new(&changed).unwrap().plan_sha256
+        );
     }
 
     #[test]
@@ -3472,9 +3847,9 @@ mod tests {
         assert!(cmake.contains("9b3cf39bb15fc0c7d52085566197042f4960cc410b241e38457bb817f2501e5b"));
         assert!(cmake.contains("fn64_rt64_nominal_full_rate(this)"));
         let expected_overlay = if cfg!(feature = "hfr-evidence") {
-            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+hfr-post-present-call:v1"
+            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+hfr-post-present-call:v1"
         } else {
-            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1"
+            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1"
         };
         assert_eq!(env!("FN64_RT64_SOURCE_OVERLAY_ID"), expected_overlay);
     }
