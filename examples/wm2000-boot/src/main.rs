@@ -54,72 +54,6 @@ unsafe extern "C" fn stand_in_audio_ucode(_rdram: *mut u8, ucode_addr: u32) -> u
     0
 }
 
-/// Headless stand-in render backend, same stance as `stand_in_audio_ucode`
-/// above: the DISPATCH plumbing (task submission, VI present boundary) is
-/// real and counted; actual RSP display-list execution is NOT performed, so
-/// framebuffer pixels only ever come from CPU writes the game itself makes.
-/// This exists so the headless boot harness can cross the first
-/// `present`/gfx-task boundary without pulling a real renderer (RT64) into
-/// this zero-content example. It reports `Complete` for tasks it did not
-/// draw -- acceptable ONLY because this binary's whole purpose is boot
-/// progression telemetry, and every skipped task is loudly counted on
-/// stderr (never a silent black frame passed off as rendered).
-struct HeadlessRenderBackend {
-    tasks_skipped: u64,
-    rdp_ranges_skipped: u64,
-}
-
-impl fn64_render::RenderBackend for HeadlessRenderBackend {
-    fn create(&mut self, _cfg: &fn64_render::RenderConfig) -> Result<(), fn64_render::RenderError> {
-        Ok(())
-    }
-
-    fn process_task(
-        &mut self,
-        _rdram: &mut [u8],
-        _rsp_memory: &mut fn64_runtime::RspMemory,
-        _task: &fn64_render::OsTask,
-        _output_addr: u32,
-    ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
-        self.tasks_skipped += 1;
-        if self.tasks_skipped <= 3 || self.tasks_skipped.is_power_of_two() {
-            eprintln!(
-                "[wm2000-boot] HEADLESS render backend: gfx task #{} acknowledged but NOT \
-                 rendered (no real renderer in this harness)",
-                self.tasks_skipped
-            );
-        }
-        Ok(fn64_render::FrameStatus::Complete)
-    }
-
-    fn process_rdp_commands(
-        &mut self,
-        _rdram: &mut [u8],
-        _start: u32,
-        _end: u32,
-        _output_addr: u32,
-    ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
-        self.rdp_ranges_skipped += 1;
-        if self.rdp_ranges_skipped <= 3 || self.rdp_ranges_skipped.is_power_of_two() {
-            eprintln!(
-                "[wm2000-boot] HEADLESS render backend: raw RDP range #{} acknowledged but NOT \
-                 executed",
-                self.rdp_ranges_skipped
-            );
-        }
-        Ok(fn64_render::FrameStatus::Complete)
-    }
-
-    fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), fn64_render::RenderError> {
-        Ok(())
-    }
-
-    fn resize(&mut self, _w: u32, _h: u32) {}
-
-    fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
-        &[fn64_render::UcodeId::F3dex2]
-    }
-}
 
 fn env_path(name: &str) -> std::path::PathBuf {
     std::env::var(name)
@@ -181,20 +115,29 @@ fn main() {
     // Real plumbing, stand-in body (see stand_in_audio_ucode's doc comment).
     unsafe { fn64_abi::set_audio_ucode_fn(stand_in_audio_ucode) };
 
-    // Headless render seam (see HeadlessRenderBackend's doc comment): lets
-    // boot cross the first gfx-task/VI-present boundary without a real
-    // renderer. Registered with the FULL rdram length (set below once the
-    // buffer exists is too late -- set_render_backend wants it now), so use
-    // the same length new_rdram will allocate.
+    // REAL renderer seam: the in-repo software ReferenceBackend (the same
+    // pure-Rust CI oracle fn64-shell uses), in F3DEX2 decode mode. NWXE's
+    // gfx ucodes are "RSP Gfx ucode F3DEX xbus 2.08" and "F3DLX.Rej xbus
+    // 2.08" (ID strings verified in the user's ROM) -- F3DEX2-generation but
+    // not in the (empty-by-default) exact-digest HLE catalog, so every gfx
+    // task takes the honest fallback path: `process_task` returns
+    // `NeedsLle`, `osSpTaskStartGo_recomp` replays the WHOLE ucode phase
+    // through the LLE RSP interpreter (`dispatch_lle_task`), and the real
+    // RDP command stream the ucode emits (XBUS submissions included) is
+    // rasterized by `process_rdp_commands`' raw-RDP lane, whose
+    // `commit_color_image` writes actual pixels back into the guest RDRAM
+    // framebuffer this harness hashes at every osViSwapBuffer. Auto-dump is
+    // belt-and-braces evidence: the backend also writes its own rasterized
+    // surface as PNGs, independent of the swap-hash capture below.
     {
-        let mut backend = HeadlessRenderBackend {
-            tasks_skipped: 0,
-            rdp_ranges_skipped: 0,
-        };
         use fn64_render::RenderBackend as _;
+        let mut backend = fn64_render_rt64::ReferenceBackend::new()
+            .with_f3dex2()
+            .with_clear_color([0, 0, 0, 255])
+            .with_auto_dump("/tmp/wm2000-gfx-dumps", "wm2000", 8);
         backend
             .create(&fn64_render::RenderConfig::new(320, 240))
-            .expect("headless backend create is infallible");
+            .expect("reference backend create");
         fn64_abi::set_render_backend(Box::new(backend), fn64_boot_harness::rdram_len());
     }
 

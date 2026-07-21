@@ -304,17 +304,31 @@ impl<'a> RspMachine<'a> {
                 // Architecturally read-only registers ignore writes.
             }
             7 => self.sp_semaphore = false,
-            8 => self.dp_start = value & 0x00FF_FFF8,
+            8 => {
+                // Writing DPC_START also latches DPC_CURRENT (hardware: the
+                // command DMA engine begins the next run at START).
+                self.dp_start = value & 0x00FF_FFF8;
+                self.dp_current = self.dp_start;
+            }
             9 => {
+                // Writing DPC_END runs the RDP from CURRENT to END -- NOT
+                // from START: a ucode that grows one command run with
+                // repeated END writes (F3DEX xbus 2.08 does exactly this
+                // against its DMEM ring) must submit each new tail once,
+                // never re-submit from START. `END == CURRENT` (how the xbus
+                // ucode opens its stream before any command exists) runs
+                // zero commands and is not a submission at all.
                 self.dp_end = value & 0x00FF_FFF8;
-                self.dp_submissions.push(RspDpSubmission {
-                    start: self.dp_start,
-                    end: self.dp_end,
-                    xbus: self.dp_status & 1 != 0,
-                });
-                // No RDP execution engine lives in fn64-audio. Model the
-                // command DMA as instant so polling loops observe idle.
-                self.dp_current = self.dp_end;
+                if self.dp_end != self.dp_current {
+                    self.dp_submissions.push(RspDpSubmission {
+                        start: self.dp_current,
+                        end: self.dp_end,
+                        xbus: self.dp_status & 1 != 0,
+                    });
+                    // No RDP execution engine lives in fn64-audio. Model the
+                    // command DMA as instant so polling loops observe idle.
+                    self.dp_current = self.dp_end;
+                }
             }
             11 => self.write_dp_status(value),
             _ => panic!("invalid RSP MTC0 register c{reg}"),
