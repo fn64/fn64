@@ -57,6 +57,13 @@ pub struct Rt64AdapterCapture {
     pub output_addr: u32,
     pub width: u32,
     pub height: u32,
+    /// Whether STATUS bits 8..=9 came from an authoritative guest register
+    /// image rather than the compatibility-only default encoding.
+    pub aa_mode_specified: bool,
+    /// Exact bounded native VI overlay flags derived by the C++ adapter.
+    pub vi_filter_flags: u32,
+    /// Guest-cycle-derived seed consumed by native gamma dithering.
+    pub noise_seed: u64,
     pub registers: [u32; 24],
     /// Same context after the no-argument refresh used by the next HLE/raw
     /// task or resize. Equality proves that submission did not restore
@@ -544,13 +551,16 @@ impl Rt64AdapterCapture {
         use sha2::Digest;
 
         let mut hasher = sha2::Sha256::new();
-        hasher.update(b"fn64-rt64-adapter-capture-v2\0");
+        hasher.update(b"fn64-rt64-adapter-capture-v3\0");
         for word in self.task_words {
             hasher.update(word.to_be_bytes());
         }
         for word in [self.output_addr, self.width, self.height] {
             hasher.update(word.to_be_bytes());
         }
+        hasher.update(u32::from(self.aa_mode_specified).to_be_bytes());
+        hasher.update(self.vi_filter_flags.to_be_bytes());
+        hasher.update(self.noise_seed.to_be_bytes());
         for word in self.registers {
             hasher.update(word.to_be_bytes());
         }

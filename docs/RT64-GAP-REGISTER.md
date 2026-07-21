@@ -350,8 +350,8 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
   representative private exact-ten PAL/MPAL series has yet been retained;
   physical compositor cadence, field timing, and analog PAL output remain
   outside this closure.
-- **Native VI pixel observation, bounded gamma dither, divot, and RGBA16
-  restoration — closed at the pinned fixture; AA-selector output remains.**
+- **Native VI pixel observation, bounded gamma dither, divot, RGBA16
+  restoration, and qualified AA-selector output — closed at pinned fixtures.**
   A twenty-phase live Metal gate keeps one
   completed workload, strictly advances presents, captures exact nondefault
   8x6 BGRA8 output, and restores baseline/gamma phases byte-for-byte. Gamma,
@@ -363,14 +363,27 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
   exactly. RGBA16 `DITHER_FILTER` performs the signed comparison against every
   available 3x3 neighbor and preserves alpha: eighteen eligible full-coverage
   pixels change exactly, twenty-four non-full pixels remain unchanged, and six
-  flat full-coverage controls remain unchanged. AA-selector output is the only
-  named pixel-inert native residual. This closure is bounded to pinned Metal,
-  nearest filtering, native scale, and progressive synthetic RGBA16 input.
+  flat full-coverage controls remain unchanged. A separate eleven-phase
+  qualified-coverage fixture, together with the adapter-capture integration
+  test, preserves the hardware-mode-0 versus compatibility-`Unspecified`
+  wire and native-callback distinction. Modes 0/1
+  match an independent Figure-11 coverage-four oracle at exact RGB
+  `[132, 78, 99]`, modes 2/3 restore the exact baseline, compatibility
+  `Unspecified` matches replicate while explicit compatibility mode 0 matches
+  AA, and AA-before-divot changes two exact pixels where either stage alone
+  changes one. This closure is bounded to pinned Metal, nearest filtering,
+  progressive synthetic RGBA16 input, and deliberately generated code 4 with
+  opaque code-7 controls. Pinned RT64 aliases managed 7/8 and clamped 8/8 at
+  code 7. The context-reuse gate binds exact workload/present continuity
+  through both fixtures and passed the official watchdog-bounded lifecycle
+  runner in 20/20 fresh Darwin 25.5.0 arm64 processes on 2026-07-21.
   RT64's managed target does not retain authoritative RGBA16 storage or RDP
   dither history, and its alpha supplies only the native coverage estimate;
-  other filtering/scaling modes, MSAA/downsample behavior, other graphics
-  APIs, full-ROM coverage, silicon behavior and random-stream identity, DAC
-  output, and analog video remain unproven.
+  code-0/save, untested partial codes 1-3/5-6, natural triangle coverage,
+  imported hidden coverage, other
+  filtering/scaling modes, MSAA/downsample behavior, other graphics APIs,
+  full-ROM coverage, silicon behavior and random-stream identity, DAC output,
+  and analog video remain unproven.
 
 ---
 
