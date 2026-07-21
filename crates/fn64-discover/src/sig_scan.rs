@@ -37,9 +37,30 @@ pub const MAX_MATCHES_PER_SIGNATURE: usize = 4;
 /// Largest word stride a handler table may use. Stride 1 is a dense
 /// `const Func[]`; 2/3/4 covers struct-of-`{data..., Func}` dispatch
 /// arrays (SM64 `sInteractionHandlers` is `{flag, Func}` = stride 2).
-/// Larger strides risk matching incidental periodic pointers in unrelated
-/// structs, so the scan stops here.
-pub const MAX_TABLE_STRIDE: usize = 4;
+/// Wider strides occur when the code pointer is one field of a larger
+/// struct laid out as an array (SM64's camera-mode / cutscene-shot tables
+/// are stride 6 = 24-byte structs and stride 12 = 48-byte structs). Larger
+/// strides risk matching incidental periodic pointers, so a wide-stride run
+/// must be proportionally LONGER to count (see [`min_run_for_stride`]) —
+/// every slot must independently be an in-range boundary, and a long run of
+/// those at a fixed stride has vanishing coincidence probability.
+pub const MAX_TABLE_STRIDE: usize = 12;
+
+/// Minimum run length required for a table at word `stride`. Dense/near-dense
+/// tables (stride 1-4) keep the caller's `base_min_run`. Wider strides demand
+/// more slots so a coincidental periodic alignment of unrelated in-range
+/// pointers cannot fabricate a table: each extra slot is another independent
+/// "this word is a 4-aligned in-range function boundary" coincidence, so the
+/// false-positive probability falls geometrically with run length. Requiring
+/// >=6 slots past stride 4 keeps wrong==0 while admitting the real
+/// stride-6/12 struct-array tables (observed runs are length 34-60).
+fn min_run_for_stride(stride: usize, base_min_run: usize) -> usize {
+    if stride <= 4 {
+        base_min_run
+    } else {
+        base_min_run.max(6)
+    }
+}
 
 /// One donor function's relocation-masked body. `name` is diagnostic
 /// only — grading never consumes it.
@@ -253,7 +274,7 @@ pub fn detect_handler_tables(
             } else {
                 if let Some(s) = start.take() {
                     let count = (index - s).div_ceil(stride);
-                    if count >= min_run {
+                    if count >= min_run_for_stride(stride, min_run) {
                         let mut i = s;
                         while i < index {
                             if !claimed[i] {
@@ -269,7 +290,7 @@ pub fn detect_handler_tables(
         }
         if let Some(s) = start.take() {
             let count = (bank_words.len() - s).div_ceil(stride);
-            if count >= min_run {
+            if count >= min_run_for_stride(stride, min_run) {
                 let mut i = s;
                 while i < bank_words.len() {
                     if !claimed[i] {
@@ -442,5 +463,56 @@ mod tests {
         // The interleaved flag words must NOT be seeded as roots (they are
         // not in-window code addresses; verified they are absent above).
         assert!(!entries.contains(&0x0000_0010));
+    }
+
+    #[test]
+    fn detect_handler_tables_finds_wide_stride_struct_array() {
+        // SM64 camera-mode / cutscene-shot tables lay the code pointer as
+        // ONE field of a 24-byte (stride 6) struct. A long run of these is a
+        // real table; the proportional min-run (>=6 slots past stride 4)
+        // admits it while keeping a short coincidental wide-stride run out.
+        let va = 0x8024_6000;
+        // Six leaf functions at 8-byte spacing.
+        let mut text: Vec<u32> = Vec::new();
+        for _ in 0..6 {
+            text.push(0x03e00008);
+            text.push(0x00000000);
+        }
+        let code_end = va + (text.len() as u32) * 4;
+        // A stride-6 (24-byte) struct array: code ptr at +0 of each struct,
+        // five non-pointer fields between. Run length 6.
+        let mut table: Vec<u32> = Vec::new();
+        for k in 0..6u32 {
+            table.push(va + k * 8); // the Func field
+            table.extend_from_slice(&[0x0000_0001, 0x4048_0000, 0x0000_0000, 0x0000_0002, 0x3f80_0000]);
+        }
+        let mut bank = text.clone();
+        bank.extend_from_slice(&table);
+        let entries = detect_handler_tables(&bank, &text, va, code_end, 4);
+        for k in 0..6u32 {
+            assert!(entries.contains(&(va + k * 8)), "missing slot {k}");
+        }
+        // The interstitial non-pointer fields are never seeded.
+        assert!(!entries.contains(&0x4048_0000));
+        assert!(!entries.contains(&0x3f80_0000));
+    }
+
+    #[test]
+    fn detect_handler_tables_rejects_short_wide_stride_run() {
+        // Two in-range pointers 24 bytes apart are NOT a table: a stride-6
+        // run must reach min_run_for_stride (>=6) before it counts, so a
+        // coincidental pair of periodic pointers cannot fabricate roots.
+        let va = 0x8024_6000;
+        let text: Vec<u32> = vec![0x03e00008, 0x00000000, 0x03e00008, 0x00000000];
+        let code_end = va + (text.len() as u32) * 4;
+        // Only two stride-6 slots.
+        let table = [
+            va, 0x0000_0001, 0x0000_0002, 0x0000_0003, 0x0000_0004, 0x0000_0005,
+            va + 0x08, 0x0000_0006, 0x0000_0007, 0x0000_0008, 0x0000_0009, 0x0000_000a,
+        ];
+        let mut bank = text.clone();
+        bank.extend_from_slice(&table);
+        let entries = detect_handler_tables(&bank, &text, va, code_end, 4);
+        assert!(entries.is_empty(), "short wide-stride run must not seed: {entries:x?}");
     }
 }
