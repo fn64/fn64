@@ -43,7 +43,16 @@
 //!                             signatures from a DIFFERENT ROM's answer key
 //!                             matched into this ROM's boot window; matches
 //!                             seed unexcused roots, judged by wrong==0.
-//!                             ';'-lists zipped pairwise for multiple donors
+//!                             ';'-lists zipped pairwise for multiple donors.
+//!                             SAME-ENGINE donors are the strongest form:
+//!                             the AKI titles donate to each other (NWXE
+//!                             graded with NW4E as donor recovers +85, NW4E
+//!                             with NWXE +72, wrong=0 both ways) because the
+//!                             shared engine's functions match reference-
+//!                             free — exactly the struct-callback residual
+//!                             no static reachability evidence can touch.
+//!                             The canonical per-game invocations live in
+//!                             reference/corpus-invocations.md
 //!   FN64_DISCOVER_SIG_DONOR_TABLES / FN64_DISCOVER_SIG_DONOR_REQUEST_DMA
 //!                             optional ';'-lists parallel to the donor
 //!                             lists (empty segment = none): the donor's own
