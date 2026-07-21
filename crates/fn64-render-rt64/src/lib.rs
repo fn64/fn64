@@ -43,8 +43,7 @@ pub mod png_dump;
 pub mod raster;
 mod s2dex;
 mod vi;
-pub use gbi::GeometryWireFamily;
-pub use s2dex::S2dexWireFamily;
+pub use fn64_render::{GeometryWireFamily, S2dexWireFamily};
 
 /// Read a `FN64_*` debug knob, trapping if its retired `OOT_*` name is set.
 ///
@@ -120,12 +119,12 @@ pub(crate) fn render_unsupported_panic(operation: &'static str, context: impl In
 #[cfg(any(feature = "rt64", test))]
 use fn64_render::RenderGraphicsApi;
 use fn64_render::{
-    ActiveRenderGraphicsApi, FrameStatus, MicrocodeDataImageIdentity, NonRdpWrite16,
-    NonRdpWrite16Disposition, OsTask, PresentMemory, PresentRequest, RenderBackend, RenderConfig,
-    RenderEmulatorSettings, RenderEnhancementSettings, RenderError, RenderPolicyApply,
-    RenderReplacementPackIdentity, RenderReplacementSettings, RenderRuntimePolicy,
-    RenderRuntimeSettings, RenderSettingsApply, UcodeId, ViPixelType, ViPresentation,
-    ViScanoutRegisters,
+    ActiveRenderGraphicsApi, F3dex2UcodeCatalog, FrameStatus, MicrocodeDataImageIdentity,
+    MicrocodePairCatalog, NonRdpWrite16, NonRdpWrite16Disposition, OsTask, PresentMemory,
+    PresentRequest, RenderBackend, RenderConfig, RenderEmulatorSettings, RenderEnhancementSettings,
+    RenderError, RenderPolicyApply, RenderReplacementPackIdentity, RenderReplacementSettings,
+    RenderRuntimePolicy, RenderRuntimeSettings, RenderSettingsApply, S2dexUcodeCatalog, UcodeId,
+    ViPixelType, ViPresentation, ViScanoutRegisters,
 };
 use raster::Framebuffer;
 
@@ -436,42 +435,6 @@ use std::path::{Path, PathBuf};
 
 use sha2::Digest;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct MicrocodePairKey {
-    text_sha256: [u8; 32],
-    data: MicrocodeDataImageIdentity,
-}
-
-#[derive(Clone, Debug, Default)]
-struct MicrocodePairCatalog {
-    families: HashMap<MicrocodePairKey, UcodeId>,
-}
-
-impl MicrocodePairCatalog {
-    fn admit(&mut self, family: UcodeId, text_sha256: [u8; 32], data: MicrocodeDataImageIdentity) {
-        let key = MicrocodePairKey { text_sha256, data };
-        if let Some(previous) = self.families.insert(key, family) {
-            assert_eq!(
-                previous, family,
-                "one exact microcode text/data pair cannot identify two families"
-            );
-        }
-    }
-
-    fn identify(
-        &self,
-        text: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
-        data: MicrocodeDataImageIdentity,
-    ) -> Option<UcodeId> {
-        self.families
-            .get(&MicrocodePairKey {
-                text_sha256: sha2::Sha256::digest(text).into(),
-                data,
-            })
-            .copied()
-    }
-}
-
 /// A headless software `RenderBackend`: decodes bounded F3DEX2/S2DEX
 /// display-list subsets to ordered geometry/image/fill/sync operations and
 /// rasterizes them into an off-screen RGBA8888 buffer with explicit RGBA16/32
@@ -533,10 +496,10 @@ pub struct ReferenceBackend {
     /// Exact geometry-microcode text images allowed at task entry and after a
     /// `G_LOAD_UCODE`, together with their public command-wire families.
     /// Selecting the decode mode does not admit content.
-    f3dex2_ucodes: gbi::F3dex2UcodeCatalog,
+    f3dex2_ucodes: F3dex2UcodeCatalog,
     /// Exact S2DEX/S2DEX2-compatible task-entry images and their public wire
     /// families. No F3DEX2 digest or opcode-family guess is inherited.
-    s2dex_ucodes: s2dex::UcodeCatalog,
+    s2dex_ucodes: S2dexUcodeCatalog,
     /// Exact complete text/data pairs admitted independently for runtime
     /// consumption evidence. Text-only HLE catalogs cannot populate this.
     microcode_pairs: MicrocodePairCatalog,
@@ -616,8 +579,8 @@ impl ReferenceBackend {
             clear_color: [0, 0, 0, 255],
             noise_seed: Framebuffer::DEFAULT_NOISE_SEED,
             decode_mode: DecodeMode::Simple,
-            f3dex2_ucodes: gbi::F3dex2UcodeCatalog::default(),
-            s2dex_ucodes: s2dex::UcodeCatalog::default(),
+            f3dex2_ucodes: F3dex2UcodeCatalog::default(),
+            s2dex_ucodes: S2dexUcodeCatalog::default(),
             microcode_pairs: MicrocodePairCatalog::default(),
             last_dp_full_sync: fn64_render::DpFullSyncStatus::Unidentified,
             auto_dump: None,
@@ -2592,8 +2555,8 @@ pub enum Rt64SourceProvenance {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rt64BackendIdentity {
     pub adapter: &'static str,
-    /// Canonical SHA-256 of fn64's Rust/C++ adapter sources, target, and
-    /// enabled feature set for this build.
+    /// Canonical SHA-256 of fn64's Rust/C++ adapter sources, shared neutral
+    /// render seam, target, and enabled feature set for this build.
     pub adapter_source_sha256: &'static str,
     pub source_id: &'static str,
     pub source_provenance: Rt64SourceProvenance,
@@ -3401,7 +3364,7 @@ pub struct Rt64Backend {
     active_tv_type: Option<fn64_runtime::TvType>,
     /// RT64's GBI selection is still HLE. Apply the same exact task-entry
     /// admission as the Rust reference backend before crossing the C ABI.
-    f3dex2_ucodes: gbi::F3dex2UcodeCatalog,
+    f3dex2_ucodes: F3dex2UcodeCatalog,
     /// Exact complete pairs admitted for RT64 runtime-recognition evidence.
     microcode_pairs: MicrocodePairCatalog,
     /// FullSync result of the last successfully committed submission.
@@ -3435,7 +3398,7 @@ impl Rt64Backend {
     pub fn new() -> Self {
         Rt64Backend {
             active_tv_type: None,
-            f3dex2_ucodes: gbi::F3dex2UcodeCatalog::default(),
+            f3dex2_ucodes: F3dex2UcodeCatalog::default(),
             microcode_pairs: MicrocodePairCatalog::default(),
             last_dp_full_sync: fn64_render::DpFullSyncStatus::Unidentified,
             #[cfg(feature = "rt64")]
@@ -4859,7 +4822,7 @@ impl RenderBackend for Rt64Backend {
                 });
             }
             debug_assert!(start_usize < end_usize);
-            let full_sync = gbi::raw_rdp_full_sync_status(rdram, start, end)?;
+            let full_sync = fn64_render::inspect_raw_rdp_full_sync(rdram, start, end)?;
             self.context
                 .as_mut()
                 .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?

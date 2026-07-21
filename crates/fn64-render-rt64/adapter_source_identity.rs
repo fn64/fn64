@@ -1,4 +1,5 @@
-//! Canonical identity of the fn64-owned RT64 adapter source and build shape.
+//! Canonical identity of the fn64-owned RT64 adapter, its shared render seam,
+//! and build shape.
 
 use sha2::{Digest, Sha256};
 use std::{fs, io, path::Path};
@@ -9,6 +10,7 @@ const FFI_FILES: &[&str] = &[
     "ffi/fn64_rt64_shim.cpp",
     "ffi/fn64_rt64_shim.h",
 ];
+const SHARED_RENDER_ROOT: &str = "../fn64-render";
 
 pub fn adapter_source_sha256(
     manifest_dir: &Path,
@@ -53,24 +55,46 @@ pub fn adapter_source_paths(manifest_dir: &Path) -> io::Result<Vec<String>> {
         .chain(FFI_FILES)
         .map(|path| (*path).to_owned())
         .collect::<Vec<_>>();
-    collect_rs_files(manifest_dir, manifest_dir.join("src"), &mut paths)?;
+    collect_rs_files(
+        manifest_dir,
+        manifest_dir.join("src"),
+        Path::new(""),
+        &mut paths,
+    )?;
+
+    let shared_render = manifest_dir.join(SHARED_RENDER_ROOT);
+    paths.push(format!("{SHARED_RENDER_ROOT}/Cargo.toml"));
+    collect_rs_files(
+        &shared_render,
+        shared_render.join("src"),
+        Path::new(SHARED_RENDER_ROOT),
+        &mut paths,
+    )?;
     paths.sort();
+    assert!(
+        paths.windows(2).all(|pair| pair[0] != pair[1]),
+        "adapter source identity contains duplicate paths"
+    );
     Ok(paths)
 }
 
 fn collect_rs_files(
-    root: &Path,
+    source_root: &Path,
     directory: impl AsRef<Path>,
+    identity_root: &Path,
     paths: &mut Vec<String>,
 ) -> io::Result<()> {
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
         if path.is_dir() {
-            collect_rs_files(root, &path, paths)?;
+            collect_rs_files(source_root, &path, identity_root, paths)?;
         } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
             paths.push(
-                path.strip_prefix(root)
-                    .expect("adapter source traversal stays beneath its manifest")
+                identity_root
+                    .join(
+                        path.strip_prefix(source_root)
+                            .expect("source traversal stays beneath its declared root"),
+                    )
                     .to_string_lossy()
                     .replace('\\', "/"),
             );
@@ -91,6 +115,10 @@ mod tests {
     #[test]
     fn identity_binds_source_paths_bytes_target_and_features() {
         let inputs = vec![
+            (
+                "../fn64-render/src/microcode.rs".to_owned(),
+                b"shared-seam-v1".to_vec(),
+            ),
             ("ffi/shim.cpp".to_owned(), b"shim-v1".to_vec()),
             ("src/lib.rs".to_owned(), b"adapter-v1".to_vec()),
         ];
@@ -99,11 +127,27 @@ mod tests {
 
         for changed in [
             vec![
+                (
+                    "../fn64-render/src/microcode.rs".to_owned(),
+                    b"shared-seam-v1".to_vec(),
+                ),
                 ("ffi/shim.cpp".to_owned(), b"shim-v2".to_vec()),
                 ("src/lib.rs".to_owned(), b"adapter-v1".to_vec()),
             ],
             vec![
+                (
+                    "../fn64-render/src/microcode.rs".to_owned(),
+                    b"shared-seam-v1".to_vec(),
+                ),
                 ("ffi/renamed.cpp".to_owned(), b"shim-v1".to_vec()),
+                ("src/lib.rs".to_owned(), b"adapter-v1".to_vec()),
+            ],
+            vec![
+                (
+                    "../fn64-render/src/microcode.rs".to_owned(),
+                    b"shared-seam-v2".to_vec(),
+                ),
+                ("ffi/shim.cpp".to_owned(), b"shim-v1".to_vec()),
                 ("src/lib.rs".to_owned(), b"adapter-v1".to_vec()),
             ],
         ] {
@@ -139,6 +183,11 @@ mod tests {
             "ffi/CMakeLists.txt",
             "ffi/fn64_rt64_shim.cpp",
             "ffi/fn64_rt64_shim.h",
+            "../fn64-render/Cargo.toml",
+            "../fn64-render/src/lib.rs",
+            "../fn64-render/src/microcode.rs",
+            "../fn64-render/src/rdp_completion.rs",
+            "../fn64-render/src/settings.rs",
         ] {
             assert!(
                 paths.iter().any(|path| path == required),
