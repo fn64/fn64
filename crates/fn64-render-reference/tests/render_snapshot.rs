@@ -9,7 +9,7 @@
 //! The fixture is the same hand-built F3DEX2 triangle as `fixture_replay.rs`
 //! (see its doc comment for why it's synthetic, not a ROM capture).
 use fn64_render::{OsTask, RenderBackend, RenderConfig, M_GFXTASK};
-use fn64_render_rt64::{gbi, ReferenceBackend};
+use fn64_render_reference::{gbi, ReferenceBackend};
 
 // Match fixture_replay.rs's WORKING layout exactly (vtx at 0x1000, DL at 0x2000,
 // and G_TRI1 word1 = (v0<<16)|(v1<<8)|v2). Getting these wrong renders a blank
@@ -51,7 +51,7 @@ fn build_fixture_rdram() -> (Vec<u8>, u32) {
 
 /// A stable, human-readable digest of a rendered framebuffer. Deterministic
 /// per render, so a regression is a visible one-line diff in the snapshot.
-fn framebuffer_digest(fb: &fn64_render_rt64::raster::Framebuffer, clear: [u8; 4]) -> String {
+fn framebuffer_digest(fb: &fn64_render_reference::raster::Framebuffer, clear: [u8; 4]) -> String {
     let non_clear = fb.pixels.chunks_exact(4).filter(|px| *px != clear).count();
     // FNV-1a over the pixels — a stable content hash without pulling a crate.
     let mut hash: u64 = 0xcbf29ce484222325;

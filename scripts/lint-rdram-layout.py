@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCAN_ROOTS = (
     "crates/fn64-abi/src",
     "crates/fn64-render/src",
+    "crates/fn64-render-reference/src",
     "crates/fn64-render-rt64/src",
     "crates/fn64-runtime/src",
     "crates/fn64-shell/src",

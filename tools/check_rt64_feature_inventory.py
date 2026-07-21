@@ -378,7 +378,7 @@ def validate_rejection_guards(inventory: dict) -> None:
         item["evidence"].append(
             {
                 "kind": "fn64_base_pixel_test",
-                "path": "crates/fn64-render-rt64/tests/base_pixel.rs",
+                "path": "crates/fn64-render-reference/tests/base_pixel.rs",
                 "line": 1,
                 "needle": "base pixels",
             }

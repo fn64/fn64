@@ -12,7 +12,7 @@ use fn64_render::{
     FrameStatus, NonRdpWrite16, NonRdpWrite16Disposition, OsTask, RenderBackend, RenderConfig,
     RenderError, UcodeId,
 };
-use fn64_render_rt64::ReferenceBackend;
+use fn64_render_reference::ReferenceBackend;
 use fn64_runtime::{M_AUDTASK, M_GFXTASK};
 use std::{
     env,

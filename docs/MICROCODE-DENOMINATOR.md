@@ -71,7 +71,7 @@ NOTXCLAMP, Copy, rotating polygons, or other unpublished neighbour footprints;
 and historical XLU/AA revisions remain loud. Public material describes their
 intent without providing enough intermediate rounding, scaled partition, or
 spill rules for an exact implementation.
-[`S2DEX-CONCEPTS.md`](../crates/fn64-render-rt64/S2DEX-CONCEPTS.md) is the
+[`S2DEX-CONCEPTS.md`](../crates/fn64-render-reference/S2DEX-CONCEPTS.md) is the
 executable-support boundary.
 
 ## Next admissible work

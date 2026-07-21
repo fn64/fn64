@@ -50,7 +50,7 @@ No GPL runtime implementation was consulted.
 The implemented composition order is STATUS-selected per-sample coverage AA or
 full-coverage RGBA16 restoration, divot, STATUS-selected vertical resampling,
 horizontal resampling, gamma, then gamma dither.
-`crates/fn64-render-rt64/src/vi.rs`
+`crates/fn64-render-reference/src/vi.rs`
 contains exact vectors for the signed 3x3 and border cases, the preferred AA
 footprint and interlaced row spacing, partial-neighbor rejection, the
 insufficient-neighborhood state, exhaustive stored-color background equations
@@ -74,7 +74,7 @@ preserve the current call's physical-memory authority.
 Run the focused gate with:
 
 ```sh
-cargo test -p fn64-render-rt64 vi::tests --lib
+cargo test -p fn64-render-reference vi::tests --lib
 cargo test -p fn64-render-rt64 --features rt64 \
   ffi::tests::vi_status_wire_preserves_every_typed_antialias_mode --lib
 cargo test -p fn64-render vi_ --lib

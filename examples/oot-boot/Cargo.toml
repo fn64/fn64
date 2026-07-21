@@ -41,6 +41,7 @@ fn64-recomp-rs = { path = "../../crates/fn64-recomp-rs" }
 # rasterize (into an off-screen framebuffer we dump as PNG), instead of only
 # hashing the blank VI framebuffer. See main.rs's render-backend section.
 fn64-render = { path = "../../crates/fn64-render" }
+fn64-render-reference = { path = "../../crates/fn64-render-reference" }
 fn64-render-rt64 = { path = "../../crates/fn64-render-rt64" }
 fn64-audio = { path = "../../crates/fn64-audio" }
 # The recompiled OoT aspMain audio ucode (typed Rust from fn64-audio's

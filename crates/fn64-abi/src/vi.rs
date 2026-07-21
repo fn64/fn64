@@ -453,7 +453,7 @@ mod tests {
     }
 
     struct ReferencePixelBackend {
-        inner: fn64_render_rt64::ReferenceBackend,
+        inner: fn64_render_reference::ReferenceBackend,
         frames: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
@@ -1148,7 +1148,7 @@ mod tests {
         }
 
         let frames = Arc::new(Mutex::new(Vec::new()));
-        let mut inner = fn64_render_rt64::ReferenceBackend::new();
+        let mut inner = fn64_render_reference::ReferenceBackend::new();
         inner.create(&RenderConfig::ntsc(4, 2)).unwrap();
         set_render_backend(
             Box::new(ReferencePixelBackend {

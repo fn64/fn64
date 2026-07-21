@@ -44,6 +44,7 @@ fn64-recomp-rs = { path = "../../../crates/fn64-recomp-rs" }
 # explicit bridge from the env-selected out-of-tree crate to this manifest.
 oot-recompiled = { path = "recompiled" }
 fn64-render = { path = "../../../crates/fn64-render" }
+fn64-render-reference = { path = "../../../crates/fn64-render-reference" }
 fn64-render-rt64 = { path = "../../../crates/fn64-render-rt64" }
 fn64-audio = { path = "../../../crates/fn64-audio" }
 oot-audio-ucode = { path = "../audio-ucode", optional = true }

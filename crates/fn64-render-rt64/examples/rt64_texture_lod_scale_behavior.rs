@@ -9,8 +9,9 @@ use fn64_render::{
     RenderResolution, RenderRuntimeSettings, ResolutionMultiplier, ViFilterControl, ViPixelType,
     ViPresentation, M_GFXTASK,
 };
+use fn64_render_reference::gbi;
 use fn64_render_rt64::{
-    gbi, Rt64Backend, Rt64PresentPixelFormat, Rt64PresentedPixels, Rt64SourceProvenance,
+    Rt64Backend, Rt64PresentPixelFormat, Rt64PresentedPixels, Rt64SourceProvenance,
 };
 use sha2::{Digest, Sha256};
 

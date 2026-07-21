@@ -1,5 +1,5 @@
 ---
-source: crates/fn64-render-rt64/tests/render_snapshot.rs
+source: crates/fn64-render-reference/tests/render_snapshot.rs
 expression: "framebuffer_digest(fb, clear)"
 ---
 dims: 64x64
