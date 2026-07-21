@@ -4363,7 +4363,17 @@ fn decode_stream_impl(
     mut rsp_memory: Option<&mut fn64_runtime::RspMemory>,
     ucode_catalog: Option<&F3dex2UcodeCatalog>,
 ) {
-    let mut pc = resolve_addr(&state.segments, dl_addr);
+    // Raw RDP command DMA uses physical DRAM addresses -- the RDP has no
+    // segment table (that's RSP microcode state). Resolving a raw start
+    // through F3DEX2 segments silently redirected any stream staged above
+    // the 24-bit segment-offset field (e.g. the XBUS staging window past a
+    // large RDRAM allocation) to `segments[n] + 0`, decoding unrelated
+    // guest memory instead of the submitted commands.
+    let mut pc = if raw_rdp {
+        dl_addr as usize
+    } else {
+        resolve_addr(&state.segments, dl_addr)
+    };
 
     loop {
         let command_end = pc.checked_add(8).unwrap_or_else(|| {
@@ -4389,11 +4399,16 @@ fn decode_stream_impl(
 
         match opcode {
             G_NOOP => {
-                assert_eq!(
-                    w0 & 0x00ff_ffff,
-                    0,
-                    "G_NOOP reserved first-word payload must be zero"
-                );
+                // Raw-lane stance mirrors the sync family below: hardware
+                // ignores every non-opcode bit of a no-op, and a raw stream
+                // may carry residue in them.
+                if !raw_rdp {
+                    assert_eq!(
+                        w0 & 0x00ff_ffff,
+                        0,
+                        "G_NOOP reserved first-word payload must be zero"
+                    );
+                }
                 // Public gDPNoOpTag deliberately carries an arbitrary tag in
                 // w1. The untagged macro is the same command with tag zero.
             }
@@ -5059,26 +5074,39 @@ fn decode_stream_impl(
                 }));
             }
             G_RDPLOADSYNC | G_RDPPIPESYNC | G_RDPTILESYNC => {
-                assert_eq!(
-                    w0 & 0x00ff_ffff,
-                    0,
-                    "{} reserved first-word payload must be zero",
-                    opcode_name(opcode)
-                );
-                assert_eq!(
-                    w1,
-                    0,
-                    "{} reserved second word must be zero",
-                    opcode_name(opcode)
-                );
+                // Reserved bits are only guaranteed zero for CPU-authored
+                // gbi.h macros (the F3DEX2 DL lane). A raw hardware stream
+                // may carry residue there -- F3DEX xbus 2.08 emits syncs
+                // with stale DMEM ring bytes in both words -- and the RDP
+                // ignores every non-opcode bit of a sync, so the raw lane
+                // must too.
+                if !raw_rdp {
+                    assert_eq!(
+                        w0 & 0x00ff_ffff,
+                        0,
+                        "{} reserved first-word payload must be zero",
+                        opcode_name(opcode)
+                    );
+                    assert_eq!(
+                        w1,
+                        0,
+                        "{} reserved second word must be zero",
+                        opcode_name(opcode)
+                    );
+                }
             }
             G_RDPFULLSYNC => {
-                assert_eq!(
-                    w0 & 0x00ff_ffff,
-                    0,
-                    "G_RDPFULLSYNC reserved first-word payload must be zero"
-                );
-                assert_eq!(w1, 0, "G_RDPFULLSYNC reserved second word must be zero");
+                // Same raw-lane stance as the sync family above.
+                if !raw_rdp {
+                    assert_eq!(
+                        w0 & 0x00ff_ffff,
+                        0,
+                        "G_RDPFULLSYNC reserved first-word payload must be zero"
+                    );
+                }
+                if !raw_rdp {
+                    assert_eq!(w1, 0, "G_RDPFULLSYNC reserved second word must be zero");
+                }
                 state.ops.push(RenderOp::FullSync);
             }
             G_SETTIMG => {

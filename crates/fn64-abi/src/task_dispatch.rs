@@ -542,6 +542,12 @@ unsafe fn dispatch_lle_task(rdram: *mut u8) -> LleTaskResult {
                 "RSP DPC range [{start:#010x}, {end:#010x}) is invalid for RDRAM length \
                  {rdram_len:#x}",
             );
+            if std::env::var_os("FN64_XBUS_STREAM_DUMP_DIR").is_some() {
+                eprintln!(
+                    "[fn64-abi] LLE task dispatching DRAM raw-RDP group [{start:#010x}, \
+                     {end:#010x})"
+                );
+            }
             unsafe { dispatch_raw_rdp(rdram, start, end) };
         }
     }
@@ -700,6 +706,34 @@ unsafe fn dispatch_raw_rdp_xbus(rdram: *mut u8, stream: &[u8]) {
         rdram_len != 0,
         "RSP XBUS DPC submission requires a registered renderer RDRAM length"
     );
+    // Observability knob: `FN64_XBUS_STREAM_DUMP_DIR=<dir>` writes each
+    // coalesced XBUS command stream (logical big-endian bytes, exactly what
+    // the raw-RDP decoder sees) as `<dir>/xbus-NNNN.bin`, capped at 16
+    // streams. This is how a stream that traps in the decoder is diagnosed
+    // offline instead of by guesswork.
+    if let Some(dir) = std::env::var_os("FN64_XBUS_STREAM_DUMP_DIR") {
+        thread_local! {
+            static XBUS_DUMP_INDEX: Cell<u64> = const { Cell::new(0) };
+        }
+        let index = XBUS_DUMP_INDEX.with(|cell| {
+            let index = cell.get();
+            cell.set(index + 1);
+            index
+        });
+        if index < 16 {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir)
+                .unwrap_or_else(|error| panic!("FN64_XBUS_STREAM_DUMP_DIR {dir:?}: {error}"));
+            let path = dir.join(format!("xbus-{index:04}.bin"));
+            std::fs::write(&path, stream)
+                .unwrap_or_else(|error| panic!("writing XBUS stream dump {path:?}: {error}"));
+            eprintln!(
+                "[fn64-abi] dumped XBUS stream #{index} ({} bytes) to {}",
+                stream.len(),
+                path.display()
+            );
+        }
+    }
     let real = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
     let staging_start = (rdram_len + 7) & !7;
     let mut image = vec![0u8; staging_start + stream.len()];
