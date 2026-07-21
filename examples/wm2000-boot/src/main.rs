@@ -423,6 +423,107 @@ fn main() {
         })
         .unwrap_or_default();
 
+    // Scripted controller input (2026-07-21, ladder-3 "press START" rung):
+    // deterministic, swap-indexed input injection through the REAL input seam
+    // (`fn64_abi::set_controller_state` -> `PifModel::set_input` -> the PIF
+    // command-1 read-data response the game's own osContGetReadData/raw SI
+    // DMA consumes). Swap-count indexing (not wall-clock) keeps runs
+    // reproducible: the swap counter is itself a pure function of virtual
+    // time. Two env knobs, composable:
+    //
+    // - `WM2000_PRESS_START=<swap>[+<hold>]` -- convenience: hold START
+    //   (0x1000, `OSContPad.button` bit per oot-decomp controller.h, the
+    //   layout `set_controller_state`'s doc pins) on port 0 from swap <swap>
+    //   for <hold> swaps (default 10, ~10 fields -- plenty for the game's
+    //   per-frame poll + debounce), then release.
+    // - `WM2000_INPUT_SCRIPT=<from>..<to>:<buttons_hex>[:<sx>:<sy>];...` --
+    //   general form: during swaps [from, to) hold `buttons` (hex u16, e.g.
+    //   8000=A, 1000=START, 0800..0100=dpad) with optional signed decimal
+    //   stick values. Overlapping entries OR their buttons (sticks: last
+    //   entry wins), so chords are expressible.
+    //
+    // The composed state is re-evaluated at every swap-count change and fed
+    // through the seam only when it CHANGES -- an idle script leaves the pad
+    // untouched (honest neutral default).
+    struct InputScriptEntry {
+        from: u64,
+        to: u64,
+        buttons: u16,
+        stick_x: i8,
+        stick_y: i8,
+    }
+    let mut input_script: Vec<InputScriptEntry> = Vec::new();
+    if let Ok(raw) = std::env::var("WM2000_PRESS_START") {
+        let (swap, hold) = match raw.split_once('+') {
+            Some((s, h)) => (
+                s.parse::<u64>().unwrap_or_else(|_| {
+                    panic!("WM2000_PRESS_START swap must be an integer, got {raw:?}")
+                }),
+                h.parse::<u64>().unwrap_or_else(|_| {
+                    panic!("WM2000_PRESS_START hold must be an integer, got {raw:?}")
+                }),
+            ),
+            None => (
+                raw.parse::<u64>().unwrap_or_else(|_| {
+                    panic!("WM2000_PRESS_START must be <swap>[+<hold>], got {raw:?}")
+                }),
+                10,
+            ),
+        };
+        input_script.push(InputScriptEntry {
+            from: swap,
+            to: swap + hold,
+            buttons: 0x1000, // BTN_START
+            stick_x: 0,
+            stick_y: 0,
+        });
+    }
+    if let Ok(raw) = std::env::var("WM2000_INPUT_SCRIPT") {
+        for entry in raw.split(';').filter(|s| !s.trim().is_empty()) {
+            let mut parts = entry.trim().split(':');
+            let range = parts.next().unwrap_or_default();
+            let (from, to) = range
+                .split_once("..")
+                .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+                .unwrap_or_else(|| {
+                    panic!("WM2000_INPUT_SCRIPT entry {entry:?}: range must be <from>..<to>")
+                });
+            let buttons = parts
+                .next()
+                .and_then(|s| u16::from_str_radix(s, 16).ok())
+                .unwrap_or_else(|| {
+                    panic!("WM2000_INPUT_SCRIPT entry {entry:?}: buttons must be hex u16")
+                });
+            let stick_x = parts.next().map_or(0, |s| {
+                s.parse::<i8>().unwrap_or_else(|_| {
+                    panic!("WM2000_INPUT_SCRIPT entry {entry:?}: stick_x must be i8")
+                })
+            });
+            let stick_y = parts.next().map_or(0, |s| {
+                s.parse::<i8>().unwrap_or_else(|_| {
+                    panic!("WM2000_INPUT_SCRIPT entry {entry:?}: stick_y must be i8")
+                })
+            });
+            assert!(from < to, "WM2000_INPUT_SCRIPT entry {entry:?}: empty swap range");
+            input_script.push(InputScriptEntry {
+                from,
+                to,
+                buttons,
+                stick_x,
+                stick_y,
+            });
+        }
+    }
+    if !input_script.is_empty() {
+        for e in &input_script {
+            println!(
+                "[wm2000-input] scripted: swaps {}..{} buttons={:#06x} stick=({}, {})",
+                e.from, e.to, e.buttons, e.stick_x, e.stick_y
+            );
+        }
+    }
+    let mut last_applied_input: (u16, i8, i8) = (0, 0, 0);
+
     let mut tick = 0u64;
     let mut steps = 0u64;
     loop {
@@ -550,6 +651,32 @@ fn main() {
         // observed "striped / horizontally repeated" logo frames).
         let swap_count = fn64_abi::vi_swap_count();
         if swap_count > last_swap_count {
+            // Scripted input: compose the pad state for THIS swap index and
+            // feed it through the real seam only on change (see the script
+            // block above the main loop).
+            if !input_script.is_empty() {
+                let mut buttons = 0u16;
+                let mut stick = (0i8, 0i8);
+                for e in &input_script {
+                    if swap_count >= e.from && swap_count < e.to {
+                        buttons |= e.buttons;
+                        if e.stick_x != 0 || e.stick_y != 0 {
+                            stick = (e.stick_x, e.stick_y);
+                        }
+                    }
+                }
+                let desired = (buttons, stick.0, stick.1);
+                if desired != last_applied_input {
+                    fn64_abi::set_controller_state(0, desired.0, desired.1, desired.2);
+                    println!(
+                        "[wm2000-input] swap #{swap_count}: pad0 -> buttons={:#06x} \
+                         stick=({}, {})",
+                        desired.0, desired.1, desired.2
+                    );
+                    let _ = std::io::stdout().flush();
+                    last_applied_input = desired;
+                }
+            }
             if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
                 let width = match fn64_abi::vi_scanout_width() {
                     0 => 320,
