@@ -347,22 +347,80 @@ impl<R: RomStorage> PiDma<R> {
         })
     }
 
+    /// SRAM address decode shared by [`Self::sram_read_into`] /
+    /// [`Self::sram_write_from`]: a discrete SRAM part decodes only the
+    /// address lines it physically has (a 256 Kbit part: A0..A14), so the PI
+    /// byte address reaching the chip aliases **modulo the power-of-two
+    /// device size** -- there is no such thing as an out-of-range SRAM
+    /// access on real hardware, only a wrapped one.
+    ///
+    /// Shipped-game evidence this aliasing is load-bearing (not an invented
+    /// leniency): WM2000 (NWXE) boots by reading its whole save payload as a
+    /// round `0x8000` bytes from device offset `0x20` (`func_800F497C`:
+    /// OSIoMesg `devAddr=0x20, size=0x8000`, OS_READ -- immediately after
+    /// validating the 0x19990901 signature header at `devAddr=0`). On the
+    /// cart's 256 Kbit chip (mupen64plus.ini NWXE `SaveType=SRAM`; the
+    /// game's own save-region table at `0x8010625C`, 13 entries, caps real
+    /// payload use at device offset `0x66E4`) the final `0x20` bytes of that
+    /// read alias back to `0x0..0x20` -- returning the signature header into
+    /// a buffer tail the game never consumes. Writes never wrap: every
+    /// region write is `region_offset + 0x20 .. + size + 4-byte checksum`,
+    /// max end `0x66E4`.
+    ///
+    /// A transfer LONGER than the whole device would alias every byte more
+    /// than once -- no shipped access pattern does that, so it stays a loud
+    /// trap (a mis-decoded length, not hardware behavior worth modeling
+    /// silently). Likewise a non-power-of-two device has no well-defined
+    /// "undriven address line" model, so it keeps the strict bounds trap.
+    fn sram_decode(&mut self, dir: &str, sram_offset: u32, len: usize) -> (usize, usize) {
+        let device_len = self.save_mut(dir).len();
+        assert!(
+            len <= device_len,
+            "PiDma: SRAM {dir} of {len:#x} bytes exceeds the whole {device_len:#x}-byte device \
+             -- every byte would alias more than once; a mis-decoded DMA length, not the \
+             single-wrap tail real carts exercise (see sram_decode's doc comment)"
+        );
+        let start = if device_len.is_power_of_two() {
+            sram_offset as usize & (device_len - 1)
+        } else {
+            sram_offset as usize
+        };
+        (start, device_len)
+    }
+
     /// Read `buf.len()` SRAM bytes at `sram_offset` (already `devAddr -
     /// SRAM_DOMAIN2_BASE`) into `buf` as FLAT bytes -- the save chip is a
     /// plain byte buffer. The caller word-swizzles into rdram (see
     /// `osEPiStartDma_recomp`), exactly like a ROM DMA-in, because the guest
     /// reads the destination back via `MEM_BU` (`^3` byte-lane XOR, recomp.h)
     /// -- a flat rdram write would read back byte-swapped within each word.
+    ///
+    /// A transfer running past the last device byte wraps to offset 0, per
+    /// the chip's real address decode -- see [`Self::sram_decode`].
     pub fn sram_read_into(&mut self, sram_offset: u32, buf: &mut [u8]) {
-        self.save_read_into(sram_offset as usize, buf);
+        let (start, device_len) = self.sram_decode("read", sram_offset, buf.len());
+        let first = buf.len().min(device_len - start);
+        let (head, tail) = buf.split_at_mut(first);
+        self.save_read_into(start, head);
+        if !tail.is_empty() {
+            self.save_read_into(0, tail);
+        }
     }
 
     /// Write FLAT `data` bytes to the save chip at `sram_offset` (already
     /// `devAddr - SRAM_DOMAIN2_BASE`). The caller un-swizzles rdram's
     /// native-word bytes back to flat save order first (see
     /// `osEPiStartDma_recomp`'s FromRdram arm).
+    ///
+    /// Wraps at the device boundary exactly like [`Self::sram_read_into`]
+    /// (same chip, same address lines) -- see [`Self::sram_decode`].
     pub fn sram_write_from(&mut self, sram_offset: u32, data: &[u8]) {
-        self.save_write_from(sram_offset as usize, data);
+        let (start, device_len) = self.sram_decode("write", sram_offset, data.len());
+        let first = data.len().min(device_len - start);
+        self.save_write_from(start, &data[..first]);
+        if first < data.len() {
+            self.save_write_from(0, &data[first..]);
+        }
     }
 
     /// Protocol-neutral save read. EEPROM, FlashRAM, Controller Pak, and PI
@@ -706,6 +764,73 @@ mod tests {
         // MEM_BU(0x40) is the FIRST SRAM byte (0xC1), not the ROM byte (0xAA).
         assert_eq!(rdram.read_bu(RdramAddr::from_offset(0x40)), 0xC1);
         assert_ne!(rdram.read_bu(RdramAddr::from_offset(0x40)), 0xAA);
+    }
+
+    #[test]
+    fn sram_read_past_the_last_byte_wraps_to_offset_zero_like_the_real_chip() {
+        // WM2000 (NWXE) boot: after validating the 0x19990901 signature
+        // header at device offset 0, `func_800F497C` reads the payload as a
+        // round 0x8000 bytes from device offset 0x20 -- 0x20 past a 256 Kbit
+        // chip's end. The chip only decodes A0..A14, so the tail aliases back
+        // to 0x0..0x20 and the read returns the header again (harmless: the
+        // game's region table caps real payload use at 0x66E4). Model that
+        // wrap exactly; scaled here to a small power-of-two device.
+        let mut dma = PiDma::new(InMemoryRom::new(vec![0u8; 0x10]));
+        let mut save = InMemorySaveStorage::new(0x100);
+        save.write_from(0x00, &[0xA1, 0xA2, 0xA3, 0xA4]); // "header"
+        save.write_from(0xFC, &[0xB1, 0xB2, 0xB3, 0xB4]); // last device bytes
+        dma.set_save(Box::new(save));
+
+        // Read 8 bytes starting 4 short of the device end: 4 real tail bytes,
+        // then the wrap delivers the 4 "header" bytes.
+        let mut buf = [0u8; 8];
+        dma.sram_read_into(0xFC, &mut buf);
+        assert_eq!(
+            buf,
+            [0xB1, 0xB2, 0xB3, 0xB4, 0xA1, 0xA2, 0xA3, 0xA4],
+            "the over-the-end tail must alias to offset 0, not trap or zero-fill"
+        );
+    }
+
+    #[test]
+    fn sram_write_past_the_last_byte_wraps_to_offset_zero_like_the_real_chip() {
+        // Same address decode as the read direction -- one chip, one set of
+        // address lines. A write spanning the end lands its tail at offset 0.
+        let mut dma = PiDma::new(InMemoryRom::new(vec![0u8; 0x10]));
+        dma.set_save(Box::new(InMemorySaveStorage::new(0x100)));
+
+        dma.sram_write_from(0xFE, &[0x71, 0x72, 0x73, 0x74]);
+        let mut tail = [0u8; 2];
+        dma.save_read_into(0xFE, &mut tail);
+        assert_eq!(tail, [0x71, 0x72]);
+        let mut head = [0u8; 2];
+        dma.save_read_into(0x00, &mut head);
+        assert_eq!(head, [0x73, 0x74], "wrapped write tail must land at offset 0");
+    }
+
+    #[test]
+    fn sram_offset_beyond_the_device_masks_down_via_undriven_address_lines() {
+        // High address bits the chip has no lines for simply don't reach it:
+        // offset 0x104 on a 0x100-byte part addresses byte 0x04.
+        let mut dma = PiDma::new(InMemoryRom::new(vec![0u8; 0x10]));
+        let mut save = InMemorySaveStorage::new(0x100);
+        save.write_from(0x04, &[0xEE]);
+        dma.set_save(Box::new(save));
+
+        let mut buf = [0u8; 1];
+        dma.sram_read_into(0x104, &mut buf);
+        assert_eq!(buf, [0xEE]);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the whole")]
+    fn sram_transfer_longer_than_the_device_still_traps_loudly() {
+        // A transfer longer than the whole device would alias every byte more
+        // than once -- no real access pattern; keep the honest trap.
+        let mut dma = PiDma::new(InMemoryRom::new(vec![0u8; 0x10]));
+        dma.set_save(Box::new(InMemorySaveStorage::new(0x100)));
+        let mut buf = [0u8; 0x101];
+        dma.sram_read_into(0, &mut buf);
     }
 
     #[test]
