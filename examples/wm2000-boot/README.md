@@ -347,21 +347,72 @@ installs land later and overwrite freely. The honest root fix is fn64's
 game-frame pacing (the ~1,400-fields-per-frame stall against the
 audio-clock-synced demo timeline), which is its own rung.
 
-## Known frontier (2026-07-21, latest): first real RDP triangles
+## RESOLVED (2026-07-21, latest): first real RDP triangles rasterize
 
 With the voice maps virgin, the fileId assert never fires, the game
 thread survives the demo's announcer requests, and boot advances past
 the former park: gfx task #7 (first after the 7 fade/fill tasks)
 submits a raw RDP XBUS stream containing opcode 0xCE — an RDP
 triangle-family command (shade+texture triangle) — i.e. the intro scene
-is finally drawing REAL GEOMETRY. The in-repo software ReferenceBackend
-does not implement raw-RDP triangle rasterization and honestly panics
-(`dispatch_raw_rdp_xbus: raw RDP opcode G_<unrecognized> (0xce) at
-0x290004a8 is unsupported`, `fn64-abi/src/task_dispatch.rs:276`) rather
-than skipping geometry. Next rung: RDP triangle-command rasterization in
-the reference backend (edge-walker + shade/texture attribute
-interpolation), after which the AKI/THQ logo/title content becomes
-visible in the frame dumps.
+is finally drawing REAL GEOMETRY. The reference backend panicked
+(`raw RDP opcode G_<unrecognized> (0xce) ... is unsupported`).
+
+Resolved with THREE reference-backend rungs (fn64-render-rt64), each
+hit in sequence by the same task:
+
+1. **Triangle wire encoding.** The raw-RDP lane already implemented all
+   eight edge/coefficient triangle layouts (decode + edge-walker +
+   shade/texture/Z attribute planes in `raster.rs`) — but only under the
+   canonical 0x08..=0x0F spelling its fixtures used. The RDP decodes
+   just the low 6 bits of the command byte and RSP microcode sets the
+   top two, so real streams carry 0xC8..=0xCF. Both spellings now name
+   the identical decode; other alias bases (0x48/0x88) stay loud.
+2. **RGB noise dither.** The triangles select `G_CD_NOISE`, which
+   trapped. Implemented under the existing alpha-noise precedent: one
+   deterministic per-pixel 3-bit xorshift32 draw applied to the blender
+   output on all three channels before the pixel write. The ordered
+   MagicSquare/Bayer matrices still trap (their tables are unpublished).
+3. **Pattern alpha dither.** The same triangles select `G_AD_PATTERN`,
+   which the public gbi.h couples to the RGB dither stage's per-pixel
+   value (`G_AD_NOTPATTERN` = its 3-bit complement) — exactly
+   representable under RGB noise, zero guessed tables. The dither pair
+   is now drawn once per fragment (`Framebuffer::fragment_dither`) and
+   threaded explicitly through the fragment structs. Pattern alpha
+   under an ordered/disabled RGB selector still traps by name.
+
+With all three, gfx task #7 renders **133 raw shade+texture triangles**
+(`[fn64-render-rt64] gfx task #7: NON-CLEAR (133 tris)`), swap #8
+presents, and the frame stream shows the demo scene's first geometry.
+Stream #7's shape (decoded from the `FN64_XBUS_STREAM_DUMP_DIR`
+capture): full-screen fill to near-black, 133 green/blue Gouraud
+triangles (the arena scene) around y=155..270, then 160 full-screen
+32x24 texrect tiles — the white fade overlay still at (or near) full
+cover, which is why the dumped frames remain near-white: the geometry
+is drawn UNDER the fade. Visible AKI/THQ/title content requires
+surviving more frames of the fade ramp — blocked by the next frontier
+below. New offline tool: `cargo run -p fn64-render-rt64 --example
+xbus_replay -- <xbus-NNNN.bin> <out-dir>` replays a captured stream
+through the reference backend without booting the game.
+
+## Known frontier (2026-07-21, latest): wild-pointer crash in the demo scene, one task after first geometry
+
+Immediately after gfx task #7 and swap #8, the boot dies with a real
+host SIGSEGV inside recompiled guest code — not a renderer trap. Crash
+chain (lldb, `--batch -o run -k bt`): scene loop `func_800E2704` →
+demo engine `func_8011C91C` → `func_8011F078` → `func_80122204` →
+`func_80121764` (funcs_22.c, demo scene object setup, nonmatching) →
+`func_800EEA14` → `func_80030EC0` (funcs_1, an FP multiply chain that
+looks like a matrix builder), which stores through a garbage guest
+pointer (observed `str wzr, [x8, x9]` with x9=0x80000000 — KSEG0 NULL —
+and variants). The faulting SITE varies run to run between
+`func_80030EC0` stores and `func_80121764` loads, and the wild
+addresses vary beyond ASLR page slide — so the guest is consuming
+run-variant bytes. Guest time is deterministic (`osGetCount` is
+virtual-time), which points at host-derived garbage reaching guest
+state (uninitialized RecompContext/host-stack reads in a nonmatching
+recompiled function, or a host value stored into rdram) rather than a
+timing divergence. Next rung: watchpoint forensics on the pointer slot
+`func_80030EC0` dereferences, same method as the voice-map rung.
 
 ## Known frontier (2026-07-14)
 
