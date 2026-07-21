@@ -373,26 +373,25 @@ struct HleBootResult {
     task: OsTaskHeader,
 }
 
-unsafe fn commit_rsp_rdram_image(rdram: *mut u8, rdram_image: &[u8]) {
-    let mut changed = false;
-    for offset in (0..rdram_image.len()).step_by(4) {
-        let width = (rdram_image.len() - offset).min(4);
-        let old = unsafe { std::slice::from_raw_parts(rdram.add(offset), width) };
-        if old != &rdram_image[offset..offset + width] {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    rdram_image.as_ptr().add(offset),
-                    rdram.add(offset),
-                    width,
-                );
-            }
-            #[cfg(feature = "recomp-rs")]
-            fn64_recomp_rs::notify_guest_write(offset as u32, width as u32);
-            changed = true;
-        }
+/// Publish the RSP core's guest-visible rdram effects after a task/boot run.
+///
+/// The RSP machine now executes directly against the real guest RDRAM slice
+/// (its ONLY rdram store path is `dma_write`, which logs every written span),
+/// so the bytes are already in place -- what remains is the recompiler-side
+/// bookkeeping a host-side write owes: notify each written range and re-check
+/// live executable pages. A prior version snapshotted the FULL host RDRAM
+/// mapping and memcmp-diffed all of it per task; on the wm2000 harness that
+/// mapping is 656 MiB (`RDRAM_MMIO_WINDOW_END`), which capped the whole boot
+/// at ~5 RSP tasks/second of pure memcpy+memcmp.
+fn commit_rsp_rdram_writes(written: &[(usize, usize)]) {
+    if written.is_empty() {
+        return;
     }
-    if changed {
-        #[cfg(feature = "recomp-rs")]
+    #[cfg(feature = "recomp-rs")]
+    {
+        for &(start, end) in written {
+            fn64_recomp_rs::notify_guest_write(start as u32, (end - start) as u32);
+        }
         crate::recompiled::process_live_executable_writes_from_host();
     }
 }
@@ -445,12 +444,13 @@ unsafe fn dispatch_lle_task(rdram: *mut u8) -> LleTaskResult {
         !rdram.is_null() && rdram_len != 0,
         "RSP LLE task has no registered process RDRAM allocation"
     );
-    let mut rdram_image = vec![0u8; rdram_len];
-    unsafe {
-        std::ptr::copy_nonoverlapping(rdram, rdram_image.as_mut_ptr(), rdram_len);
-    }
-
-    let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut rdram_image);
+    // The machine executes directly against the guest allocation: bounded DMA
+    // through a checked slice, with every written span logged for
+    // `commit_rsp_rdram_writes`. No aliasing access happens while the borrow
+    // lives -- the loop below touches only the machine, and `with_host` is
+    // not re-entered until after `drop(machine)`.
+    let rdram_slice = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
+    let mut machine = fn64_audio::rsp::runtime::RspMachine::new(rdram_slice);
     machine.load_dmem_logical(&dmem);
     machine.set_sp_status_raw(
         status & !(fn64_runtime::SP_STATUS_HALT | fn64_runtime::SP_STATUS_BROKE),
@@ -491,9 +491,10 @@ unsafe fn dispatch_lle_task(rdram: *mut u8) -> LleTaskResult {
     dmem = machine.dmem_logical();
     let final_status = machine.sp_status();
     let dp_submissions = machine.take_dp_submissions();
+    let rdram_writes = machine.take_rdram_writes();
     drop(machine);
 
-    unsafe { commit_rsp_rdram_image(rdram, &rdram_image) };
+    commit_rsp_rdram_writes(&rdram_writes);
     commit_rsp_memory_state(&dmem, &imem, overlays, pc, final_status);
 
     for submission in &dp_submissions {
@@ -548,12 +549,10 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
         !rdram.is_null() && rdram_len != 0,
         "RSP HLE rspboot has no registered process RDRAM allocation"
     );
-    let mut rdram_image = vec![0u8; rdram_len];
-    unsafe {
-        std::ptr::copy_nonoverlapping(rdram, rdram_image.as_mut_ptr(), rdram_len);
-    }
-
-    let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut rdram_image);
+    // Direct guest-RDRAM execution with span-logged writes; see
+    // `dispatch_lle_task`'s matching comment and `commit_rsp_rdram_writes`.
+    let rdram_slice = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
+    let mut machine = fn64_audio::rsp::runtime::RspMachine::new(rdram_slice);
     machine.load_dmem_logical(&dmem);
     machine.set_sp_status_raw(
         status & !(fn64_runtime::SP_STATUS_HALT | fn64_runtime::SP_STATUS_BROKE),
@@ -632,9 +631,10 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
         "RSP HLE rspboot submitted {} DPC range(s) before entering ucode",
         dp_submissions.len()
     );
+    let rdram_writes = machine.take_rdram_writes();
     drop(machine);
 
-    unsafe { commit_rsp_rdram_image(rdram, &rdram_image) };
+    commit_rsp_rdram_writes(&rdram_writes);
     commit_rsp_memory_state(&dmem, &imem, overlays, pc, final_status);
     HleBootResult {
         steps: total_steps.max(1),

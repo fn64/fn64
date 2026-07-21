@@ -332,6 +332,16 @@ fn main() {
     // only covered ~0.8s of virtual boot.
     const MAX_STEPS: u64 = 20_000_000;
     const LOG_EVERY: u64 = 500_000;
+    // Once the RSP-task throughput fix landed, 20M steps pass in a couple of
+    // wall minutes; deeper ladder probes need a bigger (still bounded) budget
+    // without editing the source. Same "must be a positive integer" stance as
+    // the FN64_* knobs in fn64-abi.
+    let max_steps = match std::env::var("WM2000_MAX_STEPS") {
+        Ok(raw) => raw.parse::<u64>().unwrap_or_else(|_| {
+            panic!("WM2000_MAX_STEPS must be a positive integer, got {raw:?}")
+        }),
+        Err(_) => MAX_STEPS,
+    };
     // How many consecutive "nothing was runnable, and advancing the
     // virtual clock didn't wake anything either" ticks before concluding
     // boot has reached a genuinely idle steady state (not just a thread
@@ -345,9 +355,9 @@ fn main() {
     let mut tick = 0u64;
     let mut steps = 0u64;
     loop {
-        if steps >= MAX_STEPS {
+        if steps >= max_steps {
             println!(
-                "[wm2000-boot] step budget ({MAX_STEPS}) exhausted at sim_time={} -- stopping \
+                "[wm2000-boot] step budget ({max_steps}) exhausted at sim_time={} -- stopping \
                  (this may mean a thread is spinning without truly blocking, or boot just needs \
                  a larger budget)",
                 fn64_abi::sim_time()

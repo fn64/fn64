@@ -91,6 +91,12 @@ pub struct RspMachine<'a> {
     dp_pipe_busy: u32,
     dp_tmem_busy: u32,
     dp_submissions: Vec<RspDpSubmission>,
+    /// Half-open `[start, end)` rdram byte ranges written by `dma_write`
+    /// since construction (or the last [`Self::take_rdram_writes`]),
+    /// clamped to `rdram.len()` and coalesced when contiguous/overlapping.
+    /// The union of these spans covers every rdram byte this machine may
+    /// have mutated: `dma_write` is the ONLY rdram store path in this type.
+    rdram_writes: Vec<(usize, usize)>,
 }
 
 impl<'a> RspMachine<'a> {
@@ -117,6 +123,7 @@ impl<'a> RspMachine<'a> {
             dp_pipe_busy: 0,
             dp_tmem_busy: 0,
             dp_submissions: Vec::new(),
+            rdram_writes: Vec::new(),
         }
     }
 
@@ -712,11 +719,38 @@ impl<'a> RspMachine<'a> {
                     *dst = self.dmem.as_bytes()[(mem + i) & (DMEM_SIZE - 1)];
                 }
             }
+            self.record_rdram_write(dram, line_len);
             dram = dram.wrapping_add(line_len + skip);
             mem = (mem + line_len) & (DMEM_SIZE - 1);
         }
         self.ctx.dma_dram_address = dram as u32;
         self.ctx.dma_mem_address = mem as u32;
+    }
+
+    /// Record one DMA-write line's rdram byte range, clamped exactly the way
+    /// the copy loop above clamps (per-byte `get_mut` beyond `rdram.len()` is
+    /// a dropped store). Contiguous/overlapping ranges coalesce with the most
+    /// recent entry so consecutive lines (skip = 0) stay one span.
+    fn record_rdram_write(&mut self, start: usize, len: usize) {
+        let end = start.saturating_add(len).min(self.rdram.len());
+        let start = start.min(self.rdram.len());
+        if start >= end {
+            return;
+        }
+        if let Some(last) = self.rdram_writes.last_mut() {
+            if start <= last.1 && end >= last.0 {
+                last.0 = last.0.min(start);
+                last.1 = last.1.max(end);
+                return;
+            }
+        }
+        self.rdram_writes.push((start, end));
+    }
+
+    /// Take the accumulated half-open rdram write spans (see `rdram_writes`'s
+    /// field doc). After this call the machine's write log is empty again.
+    pub fn take_rdram_writes(&mut self) -> Vec<(usize, usize)> {
+        std::mem::take(&mut self.rdram_writes)
     }
 
     /// Convenience accessor for the VU state the compute-op dispatcher wants.
