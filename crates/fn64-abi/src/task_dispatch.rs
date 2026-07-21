@@ -497,22 +497,52 @@ unsafe fn dispatch_lle_task(rdram: *mut u8) -> LleTaskResult {
     commit_rsp_rdram_writes(&rdram_writes);
     commit_rsp_memory_state(&dmem, &imem, overlays, pc, final_status);
 
-    for submission in &dp_submissions {
-        if submission.xbus {
-            unsafe {
-                dispatch_raw_rdp_xbus(rdram, &dmem, submission.start, submission.end);
+    // Consecutive DPC_END extensions are ONE hardware command stream, not
+    // independent lists: a 16-byte command (G_TEXRECT, G_FILLRECT with
+    // sync, raw triangles) may straddle two END writes -- F3DEX xbus 2.08
+    // extends its run 8 bytes at a time -- so per-submission decode would
+    // trap on a "truncated" command that hardware simply stalls on until
+    // the next END write. Coalesce before dispatch: XBUS runs concatenate
+    // their submission-time payload bytes (the DMEM ring is reused across
+    // generations); DRAM runs merge address-contiguous ranges.
+    let mut index = 0;
+    while index < dp_submissions.len() {
+        if dp_submissions[index].xbus {
+            let mut stream = Vec::new();
+            while index < dp_submissions.len() && dp_submissions[index].xbus {
+                let submission = &dp_submissions[index];
+                assert_eq!(
+                    submission.payload.len(),
+                    (submission.end.wrapping_sub(submission.start)) as usize,
+                    "RSP XBUS DPC range [{:#010x}, {:#010x}) payload was not captured at \
+                     submission time",
+                    submission.start,
+                    submission.end
+                );
+                stream.extend_from_slice(&submission.payload);
+                index += 1;
             }
+            unsafe { dispatch_raw_rdp_xbus(rdram, &stream) };
         } else {
+            let start = dp_submissions[index].start;
+            let mut end = dp_submissions[index].end;
+            index += 1;
+            while index < dp_submissions.len()
+                && !dp_submissions[index].xbus
+                && dp_submissions[index].start == end
+            {
+                end = dp_submissions[index].end;
+                index += 1;
+            }
             assert!(
-                submission.start < submission.end
-                    && submission.start.is_multiple_of(8)
-                    && submission.end.is_multiple_of(8)
-                    && submission.end as usize <= rdram_len,
-                "RSP DPC range [{:#010x}, {:#010x}) is invalid for RDRAM length {rdram_len:#x}",
-                submission.start,
-                submission.end
+                start < end
+                    && start.is_multiple_of(8)
+                    && end.is_multiple_of(8)
+                    && end as usize <= rdram_len,
+                "RSP DPC range [{start:#010x}, {end:#010x}) is invalid for RDRAM length \
+                 {rdram_len:#x}",
             );
-            unsafe { dispatch_raw_rdp(rdram, submission.start, submission.end) };
+            unsafe { dispatch_raw_rdp(rdram, start, end) };
         }
     }
 
@@ -653,25 +683,17 @@ pub(crate) unsafe fn dispatch_raw_rdp(rdram: *mut u8, start: u32, end: u32) {
     });
 }
 
-/// Submit an XBUS DPC range whose command bytes live in persistent RSP DMEM.
-/// The renderer seam accepts an RDRAM image, so the command span is staged
-/// after the real allocation in a private image. Only the original RDRAM
-/// prefix is copied back after rendering; the staging range is unobservable.
-unsafe fn dispatch_raw_rdp_xbus(
-    rdram: *mut u8,
-    dmem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
-    start: u32,
-    end: u32,
-) {
-    let start = (start & 0x0fff) as usize;
-    let end = (end & 0x0fff) as usize;
+/// Submit one coalesced XBUS command stream (logical big-endian bytes,
+/// captured from DMEM at each DPC_END submission -- see `RspDpSubmission::
+/// payload`). The renderer seam accepts an RDRAM image, so the command span
+/// is staged after the real allocation in a private image. Only the original
+/// RDRAM prefix is copied back after rendering; the staging range is
+/// unobservable.
+unsafe fn dispatch_raw_rdp_xbus(rdram: *mut u8, stream: &[u8]) {
     assert!(
-        start < end && start.is_multiple_of(8) && end.is_multiple_of(8),
-        "RSP XBUS DPC range [{start:#05x}, {end:#05x}) must be nonempty and 8-byte aligned"
-    );
-    assert!(
-        end <= dmem.len(),
-        "RSP XBUS DPC range end {end:#05x} exceeds 4 KiB DMEM"
+        !stream.is_empty() && stream.len().is_multiple_of(8),
+        "RSP XBUS DPC stream length {:#x} must be nonempty and 8-byte aligned",
+        stream.len()
     );
     let rdram_len = RDRAM_LEN.with(Cell::get);
     assert!(
@@ -680,14 +702,14 @@ unsafe fn dispatch_raw_rdp_xbus(
     );
     let real = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
     let staging_start = (rdram_len + 7) & !7;
-    let mut image = vec![0u8; staging_start + end - start];
+    let mut image = vec![0u8; staging_start + stream.len()];
     image[..rdram_len].copy_from_slice(real);
-    for (word_index, word) in dmem[start..end].chunks_exact(4).enumerate() {
-        let value = u32::from_be_bytes(word.try_into().expect("four DMEM bytes"));
+    for (word_index, word) in stream.chunks_exact(4).enumerate() {
+        let value = u32::from_be_bytes(word.try_into().expect("four stream bytes"));
         let offset = staging_start + word_index * 4;
         image[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
     }
-    let staged_end = staging_start + end - start;
+    let staged_end = staging_start + stream.len();
     with_render_backend("dispatch_raw_rdp_xbus", |backend| {
         backend
             .process_rdp_commands(
@@ -1965,18 +1987,18 @@ mod tests {
             (0xf700_0000, 0x07c1_07c1),
             (0xf600_0000 | ((3 * 4) << 12) | 4, 0),
         ];
-        let mut dmem = [0u8; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let mut stream = vec![0u8; commands.len() * 8];
         for (index, (w0, w1)) in commands.into_iter().enumerate() {
             let offset = index * 8;
-            dmem[offset..offset + 4].copy_from_slice(&w0.to_be_bytes());
-            dmem[offset + 4..offset + 8].copy_from_slice(&w1.to_be_bytes());
+            stream[offset..offset + 4].copy_from_slice(&w0.to_be_bytes());
+            stream[offset + 4..offset + 8].copy_from_slice(&w1.to_be_bytes());
         }
         let mut backend = fn64_render_rt64::ReferenceBackend::new().with_f3dex2();
         backend.create(&RenderConfig::new(4, 2)).unwrap();
         set_render_backend(Box::new(backend), rdram.len());
 
         unsafe {
-            dispatch_raw_rdp_xbus(rdram.as_mut_ptr(), &dmem, 0, (commands.len() * 8) as u32);
+            dispatch_raw_rdp_xbus(rdram.as_mut_ptr(), &stream);
         }
 
         assert_eq!(last_render_error(), None);
@@ -2010,18 +2032,18 @@ mod tests {
             (0, 0),
             (0xe900_0000, 0),
         ];
-        let mut dmem = [0u8; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let mut stream = vec![0u8; commands.len() * 8];
         for (index, (w0, w1)) in commands.into_iter().enumerate() {
             let offset = index * 8;
-            dmem[offset..offset + 4].copy_from_slice(&w0.to_be_bytes());
-            dmem[offset + 4..offset + 8].copy_from_slice(&w1.to_be_bytes());
+            stream[offset..offset + 4].copy_from_slice(&w0.to_be_bytes());
+            stream[offset + 4..offset + 8].copy_from_slice(&w1.to_be_bytes());
         }
         let mut backend = fn64_render_rt64::ReferenceBackend::new().with_f3dex2();
         backend.create(&RenderConfig::new(8, 8)).unwrap();
         set_render_backend(Box::new(backend), rdram.len());
 
         unsafe {
-            dispatch_raw_rdp_xbus(rdram.as_mut_ptr(), &dmem, 0, (commands.len() * 8) as u32);
+            dispatch_raw_rdp_xbus(rdram.as_mut_ptr(), &stream);
         }
 
         assert_eq!(last_render_error(), None);
