@@ -1,9 +1,10 @@
 # Private-input admission
 
 Status: local admission, typed program/microcode-kickoff identity checks, and the
-trusted synthetic-series mechanism are wired. No representative private
-full-ROM exact-ten series has yet been retained. No private game content,
-path, length, or content hash is tracked by this repository.
+trusted series mechanism are wired. One representative private NTSC/reference
+full-ROM exact-ten series was retained and reverified locally on 2026-07-21.
+Its content-bearing evidence remains outside the repository; no private game
+content, path, length, or content hash is tracked here.
 
 `tools/private_input_admission.py` validates private inputs before an
 Extended-GBI fixture or full-ROM release run consumes them. It never copies
@@ -427,11 +428,12 @@ data SHA-256 with a recognized family.
 This proves which pair the task named at the authoritative kickoff boundary;
 it does not independently trace every later RSP read of the data image.
 
-These checks make a valid production contract launchable; they do not prove a
-representative release result. No representative private full-ROM exact-ten
-series has yet been retained. The series receipt remains a self-hashed
-integrity record, not external process attestation; transferable provenance
-still requires a trusted CI/code-signing root over the receipt and runner.
+These checks make a valid production contract launchable. A representative
+private NTSC/reference full-ROM exact-ten series completed and was reverified
+locally on 2026-07-21, closing this mechanism path for that one scenario only.
+The series receipt remains a self-hashed integrity record, not external process
+attestation; transferable provenance still requires a trusted CI/code-signing
+root over the receipt and runner.
 
 ## Synthetic CI gate
 

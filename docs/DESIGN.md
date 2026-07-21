@@ -275,12 +275,14 @@ data length, and data SHA equal the admitted pair. Report schema
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
 
 This mechanism makes a correctly formed production contract launchable; it is
-not representative-ROM evidence by itself. No representative private full-ROM
-exact-ten series has yet been retained. The live synthetic runner test still
-demonstrates direct-process orchestration and mechanism determinism during the
-observed test invocation only. Its self-hashed receipt is retained integrity
-evidence, not a transferable process attestation, and the synthetic result
-cannot be promoted into private-ROM evidence.
+not representative-ROM evidence by itself. A representative private
+NTSC/reference full-ROM exact-ten series completed and was reverified locally
+on 2026-07-21, closing this mechanism path for that one scenario. The live
+synthetic runner test separately demonstrates direct-process orchestration and
+mechanism determinism during the observed test invocation only. Self-hashed
+receipts are retained integrity evidence, not transferable process
+attestation, and the synthetic result cannot be promoted into private-ROM
+evidence.
 
 Representative matrix verification preserves the same capability boundary.
 Report-only matrix v5 verification never awards a ROM-class requirement from
