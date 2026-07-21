@@ -45,7 +45,10 @@
 //! any unrecognized byte are malformed-command traps. Texture, lighting, RDP
 //! other-mode, alpha compare, and the color-combiner and framebuffer-blender
 //! inputs needed by OoT are decoded.
-use fn64_render::{RenderError, UcodeId};
+use fn64_render::{
+    MicrocodeDataImageIdentity, RenderError, TaskAdmissionGeneration, TaskAdmissionSource, UcodeId,
+};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt::Write as _};
 
 pub use fn64_render::{F3dex2UcodeCatalog, GeometryUcodeCatalog, GeometryWireFamily, UcodeDigest};
@@ -3742,6 +3745,10 @@ struct DecodeState {
     /// First self-loaded text image not admitted as F3DEX2-compatible.
     /// Ordered decode stops at that load boundary.
     unsupported_ucode_reload: Option<UcodeDigest>,
+    /// Every admitted `G_LOAD_UCODE` generation in command order. Repeated
+    /// addresses and identities stay distinct so native execution can be
+    /// matched positionally instead of inheriting RT64's address cache.
+    admission_generations: Vec<TaskAdmissionGeneration>,
 }
 
 /// Public F3DEX2 vertex-fog state. With `G_FOG` enabled, the RSP generates
@@ -3859,6 +3866,7 @@ fn fresh_decode_state() -> DecodeState {
         persp_normalize: PerspectiveNormalize::default(),
         clip_ratio: ClipRatio::default(),
         unsupported_ucode_reload: None,
+        admission_generations: Vec::new(),
     }
 }
 
@@ -4947,15 +4955,38 @@ pub(crate) fn execute_display_list_geometry_ops_admitted_with_rdp_state(
     rdp_state: &mut RdpDecodeState,
     family: GeometryWireFamily,
 ) -> Result<Vec<RenderOp>, RenderError> {
-    Ok(execute_display_list_f3dex2_state_with_catalog_and_rdp(
+    let inspection = inspect_display_list_geometry_admission_with_rdp_state(
+        rdram, rsp_memory, dl_addr, catalog, rdp_state, family,
+    )?;
+    let _ = inspection.self_loads;
+    Ok(inspection.operations)
+}
+
+pub(crate) struct GeometryTaskInspection {
+    pub(crate) operations: Vec<RenderOp>,
+    pub(crate) self_loads: Vec<TaskAdmissionGeneration>,
+}
+
+pub(crate) fn inspect_display_list_geometry_admission_with_rdp_state(
+    rdram: &mut [u8],
+    rsp_memory: &mut fn64_runtime::RspMemory,
+    dl_addr: u32,
+    catalog: &GeometryUcodeCatalog,
+    rdp_state: &mut RdpDecodeState,
+    family: GeometryWireFamily,
+) -> Result<GeometryTaskInspection, RenderError> {
+    let state = execute_display_list_f3dex2_state_with_catalog_and_rdp(
         rdram,
         rsp_memory,
         dl_addr,
         Some(catalog),
         Some(rdp_state),
         family,
-    )?
-    .ops)
+    )?;
+    Ok(GeometryTaskInspection {
+        operations: state.ops,
+        self_loads: state.admission_generations,
+    })
 }
 
 /// Validate a bounded DRAM-backed raw RDP command range before the reference
@@ -5418,13 +5449,20 @@ fn execute_dma_io(
 /// while the RSP Programmer's Guide states that a microcode `.dat` section is
 /// loaded at the beginning of DMEM. Both sources are physical, not segmented,
 /// addresses, and all SP DMA operands obey the hardware's 64-bit granularity.
+struct LoadedUcodeIdentity {
+    text_address: u32,
+    data_address: u32,
+    text_sha256: UcodeDigest,
+    data: MicrocodeDataImageIdentity,
+}
+
 fn execute_load_ucode(
     rdram: &[u8],
     rsp_memory: &mut fn64_runtime::RspMemory,
     w0: u32,
     text_address: u32,
     data_address: u32,
-) -> UcodeDigest {
+) -> LoadedUcodeIdentity {
     assert_eq!(
         w0 & 0x00ff_0000,
         0,
@@ -5487,7 +5525,15 @@ fn execute_load_ucode(
             &text,
         )
         .unwrap_or_else(|error| panic!("G_LOAD_UCODE cannot load IMEM text section: {error}"));
-    UcodeDigest::from_text(&text)
+    LoadedUcodeIdentity {
+        text_address,
+        data_address,
+        text_sha256: UcodeDigest::from_text(&text),
+        data: MicrocodeDataImageIdentity {
+            bytes: u32::try_from(data_size).expect("G_LOAD_UCODE data size fits u32"),
+            sha256: Sha256::digest(data).into(),
+        },
+    }
 }
 
 fn decode_stream_impl(
@@ -5993,18 +6039,26 @@ fn decode_stream_impl(
                         "G_LOAD_UCODE reached without the compound command's preceding G_RDPHALF_1 data address"
                     )
                 });
-                let digest = execute_load_ucode(rdram, rsp_memory, w0, w1, data_address);
+                let loaded = execute_load_ucode(rdram, rsp_memory, w0, w1, data_address);
                 if loading_family.is_legacy_loadable() {
                     reset_legacy_rsp_state_from_ucode_load(state);
                 } else {
                     reset_rsp_state_from_ucode_load(state);
                 }
                 if let Some(catalog) = ucode_catalog {
-                    if let Some(next_family) = catalog.family(digest) {
+                    if let Some(next_family) = catalog.family(loaded.text_sha256) {
+                        state.admission_generations.push(TaskAdmissionGeneration {
+                            source: TaskAdmissionSource::SelfLoad,
+                            text_address: loaded.text_address,
+                            data_address: loaded.data_address,
+                            text_sha256: loaded.text_sha256,
+                            data: loaded.data,
+                            family: next_family.ucode_id(),
+                        });
                         *family = next_family;
                         initialize_geometry_family_state(state, next_family);
                     } else {
-                        state.unsupported_ucode_reload = Some(digest);
+                        state.unsupported_ucode_reload = Some(loaded.text_sha256);
                         break;
                     }
                 }
@@ -7550,6 +7604,91 @@ mod tests {
             &mut round_trip,
         );
         assert_eq!(round_trip, text[..8]);
+    }
+
+    #[test]
+    fn admission_inspection_preserves_same_address_a_b_a_generations() {
+        const DL: usize = 0x1000;
+        const TEXT: usize = 0x2000;
+        const DATA: usize = 0x3800;
+        const A_PREFIX: usize = 0x3900;
+        const B_PREFIX: usize = 0x3a00;
+        let a = vec![0x31; SP_UCODE_SIZE];
+        let mut b = a.clone();
+        b[..8].fill(0x62);
+        let data = [0x7d; 8];
+        let mut rdram = vec![0u8; 0x5000];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            view.write_logical_bytes(fn64_runtime::RdramAddr::from_offset(TEXT as u32), &a);
+            view.write_logical_bytes(fn64_runtime::RdramAddr::from_offset(DATA as u32), &data);
+            view.write_logical_bytes(
+                fn64_runtime::RdramAddr::from_offset(A_PREFIX as u32),
+                &a[..8],
+            );
+            view.write_logical_bytes(
+                fn64_runtime::RdramAddr::from_offset(B_PREFIX as u32),
+                &b[..8],
+            );
+        }
+        {
+            let mut pc = DL;
+            let mut command = |w0, w1| {
+                wr_cmd(&mut rdram, pc, w0, w1);
+                pc += 8;
+            };
+            command((G_RDPHALF_1 as u32) << 24, DATA as u32);
+            command(load_ucode_word(8), TEXT as u32);
+            command(dma_io_word(false, 0, 8), B_PREFIX as u32);
+            command(dma_io_word(true, 0, 8), TEXT as u32);
+            command((G_RDPHALF_1 as u32) << 24, DATA as u32);
+            command(load_ucode_word(8), TEXT as u32);
+            command(dma_io_word(false, 0, 8), A_PREFIX as u32);
+            command(dma_io_word(true, 0, 8), TEXT as u32);
+            command((G_RDPHALF_1 as u32) << 24, DATA as u32);
+            command(load_ucode_word(8), TEXT as u32);
+            command((G_ENDDL as u32) << 24, 0);
+        }
+
+        let mut catalog = GeometryUcodeCatalog::default();
+        catalog.admit_text(&a);
+        catalog.admit_text(&b);
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
+        let mut rdp_state = RdpDecodeState::default();
+        let inspection = inspect_display_list_geometry_admission_with_rdp_state(
+            &mut rdram,
+            &mut rsp_memory,
+            DL as u32,
+            &catalog,
+            &mut rdp_state,
+            GeometryWireFamily::F3dex2,
+        )
+        .unwrap();
+
+        assert_eq!(inspection.self_loads.len(), 3);
+        assert!(inspection
+            .self_loads
+            .iter()
+            .all(|generation| generation.text_address == TEXT as u32));
+        assert_eq!(
+            inspection
+                .self_loads
+                .iter()
+                .map(|generation| generation.text_sha256)
+                .collect::<Vec<_>>(),
+            [
+                UcodeDigest::from_text(&a),
+                UcodeDigest::from_text(&b),
+                UcodeDigest::from_text(&a),
+            ]
+        );
+        let data_sha256: [u8; 32] = Sha256::digest(data).into();
+        assert!(inspection.self_loads.iter().all(|generation| {
+            generation.source == TaskAdmissionSource::SelfLoad
+                && generation.data.bytes == 8
+                && generation.data.sha256 == data_sha256
+                && generation.family == UcodeId::F3dex2
+        }));
     }
 
     #[test]
@@ -10287,6 +10426,7 @@ mod tests {
             persp_normalize: PerspectiveNormalize::default(),
             clip_ratio: ClipRatio::default(),
             unsupported_ucode_reload: None,
+            admission_generations: Vec::new(),
         }
     }
 

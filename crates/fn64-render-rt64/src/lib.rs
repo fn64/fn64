@@ -126,6 +126,8 @@ use fn64_render::{
     RenderRuntimePolicy, RenderRuntimeSettings, RenderSettingsApply, S2dexUcodeCatalog, UcodeId,
     ViPixelType, ViPresentation, ViScanoutRegisters,
 };
+#[cfg(feature = "rt64")]
+use fn64_render::{TaskAdmissionGeneration, TaskAdmissionPlan, TaskAdmissionSource, UcodeDigest};
 use raster::Framebuffer;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -3357,6 +3359,84 @@ impl CompletedRt64Present {
     }
 }
 
+#[cfg(feature = "rt64")]
+fn task_entry_admission_plan(
+    rdram: &[u8],
+    rsp_memory: &fn64_runtime::RspMemory,
+    task: &OsTask,
+    family: GeometryWireFamily,
+    self_loads: Vec<TaskAdmissionGeneration>,
+) -> Result<TaskAdmissionPlan, RenderError> {
+    let reject = |reason: String| RenderError::Backend {
+        backend: "rt64-task-admission",
+        reason,
+    };
+    let text_address = task.ucode & 0x00ff_ffff;
+    let data_address = task.ucode_data & 0x00ff_ffff;
+    let text_bytes = fn64_runtime::RSP_MEMORY_BANK_SIZE;
+    let data_bytes = usize::try_from(task.ucode_data_size)
+        .map_err(|_| reject("task ucode-data size does not fit usize".to_owned()))?;
+    if !text_address.is_multiple_of(8) || !data_address.is_multiple_of(8) {
+        return Err(reject(format!(
+            "task microcode text/data addresses must be 64-bit aligned: text={text_address:#010x}, data={data_address:#010x}"
+        )));
+    }
+    if data_bytes == 0
+        || data_bytes > fn64_runtime::RSP_MEMORY_BANK_SIZE
+        || !data_bytes.is_multiple_of(8)
+    {
+        return Err(reject(format!(
+            "task microcode data size {data_bytes} must be a nonzero 64-bit multiple no larger than one 4 KiB DMEM bank"
+        )));
+    }
+    let checked_end = |name: &str, address: u32, bytes: usize| {
+        let start = usize::try_from(address).expect("24-bit task address fits usize");
+        let end = start
+            .checked_add(bytes)
+            .ok_or_else(|| reject(format!("task microcode {name} range overflows")))?;
+        if end > rdram.len() {
+            return Err(reject(format!(
+                "task microcode {name} range {start:#010x}..{end:#010x} exceeds RDRAM length {:#x}",
+                rdram.len()
+            )));
+        }
+        Ok(start)
+    };
+    let text_start = checked_end("text", text_address, text_bytes)?;
+    let data_start = checked_end("data", data_address, data_bytes)?;
+    let view = fn64_runtime::RdramView::from_storage(rdram);
+    let mut text = vec![0; text_bytes];
+    view.copy_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(text_start as u32),
+        &mut text,
+    );
+    let text_sha256 = UcodeDigest::from_text(&text);
+    let live_text_sha256 =
+        UcodeDigest::from_text(rsp_memory.bank(fn64_runtime::RspMemoryBank::Imem));
+    if text_sha256 != live_text_sha256 {
+        return Err(RenderError::RequiresLle {
+            ucode_sha256: live_text_sha256.as_bytes(),
+        });
+    }
+    let mut data = vec![0; data_bytes];
+    view.copy_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(data_start as u32),
+        &mut data,
+    );
+    let entry = TaskAdmissionGeneration {
+        source: TaskAdmissionSource::TaskEntry,
+        text_address,
+        data_address,
+        text_sha256,
+        data: MicrocodeDataImageIdentity {
+            bytes: task.ucode_data_size,
+            sha256: sha2::Sha256::digest(data).into(),
+        },
+        family: family.ucode_id(),
+    };
+    Ok(TaskAdmissionPlan::new(entry, self_loads))
+}
+
 pub struct Rt64Backend {
     /// TV standard accepted by the last successful `create`. This is
     /// independent of surface resizing and is published only with the live
@@ -4703,7 +4783,7 @@ impl RenderBackend for Rt64Backend {
             let mut inspection_rdram = rdram.to_vec();
             let mut inspection_rsp = rsp_memory.clone();
             let mut inspection_rdp = gbi::RdpDecodeState::default();
-            let inspection = match gbi::execute_display_list_geometry_ops_admitted_with_rdp_state(
+            let inspection = match gbi::inspect_display_list_geometry_admission_with_rdp_state(
                 &mut inspection_rdram,
                 &mut inspection_rsp,
                 task.data_ptr,
@@ -4711,13 +4791,27 @@ impl RenderBackend for Rt64Backend {
                 &mut inspection_rdp,
                 family,
             ) {
-                Ok(operations) => operations,
+                Ok(inspection) => inspection,
+                Err(RenderError::RequiresLle { ucode_sha256 }) => {
+                    return Ok(FrameStatus::NeedsLle { ucode_sha256 });
+                }
+                Err(error) => return Err(error),
+            };
+            let admission_plan = match task_entry_admission_plan(
+                rdram,
+                rsp_memory,
+                task,
+                family,
+                inspection.self_loads,
+            ) {
+                Ok(plan) => plan,
                 Err(RenderError::RequiresLle { ucode_sha256 }) => {
                     return Ok(FrameStatus::NeedsLle { ucode_sha256 });
                 }
                 Err(error) => return Err(error),
             };
             let full_sync = if inspection
+                .operations
                 .iter()
                 .any(|operation| matches!(operation, gbi::RenderOp::FullSync))
             {
@@ -4790,9 +4884,10 @@ impl RenderBackend for Rt64Backend {
                 return Err(RenderError::Backend {
                     backend: "rt64-task-result",
                     reason: format!(
-                        "native FullSync evidence {:?} (count {}, ucode addresses {:#010x}/{:#010x} -> {:#010x}/{:#010x}) disagrees with transactional inspection {full_sync:?}",
+                        "native FullSync evidence {:?} (count {}, planned microcode generations {}, ucode addresses {:#010x}/{:#010x} -> {:#010x}/{:#010x}) disagrees with transactional inspection {full_sync:?}",
                         native_result.dp_full_sync,
                         native_result.full_sync_count,
+                        admission_plan.len(),
                         native_result.initial_ucode_addresses.0,
                         native_result.initial_ucode_addresses.1,
                         native_result.final_ucode_addresses.0,
@@ -5605,6 +5700,62 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    #[cfg(feature = "rt64")]
+    fn rt64_task_entry_plan_binds_native_rdram_to_admitted_live_imem() {
+        const TEXT: u32 = 0x1000;
+        const DATA: u32 = 0x3000;
+        let text = [0x73; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let data = [0x29; 8];
+        let mut rdram = vec![0u8; 0x4000];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            view.write_logical_bytes(fn64_runtime::RdramAddr::from_offset(TEXT), &text);
+            view.write_logical_bytes(fn64_runtime::RdramAddr::from_offset(DATA), &data);
+        }
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
+        rsp_memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0),
+                &text,
+            )
+            .unwrap();
+        let task = OsTask {
+            ucode: TEXT,
+            ucode_data: DATA,
+            ucode_data_size: data.len() as u32,
+            ..OsTask::default()
+        };
+        let plan = task_entry_admission_plan(
+            &rdram,
+            &rsp_memory,
+            &task,
+            GeometryWireFamily::F3dex2,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan.entry().source, TaskAdmissionSource::TaskEntry);
+        assert_eq!(plan.entry().text_sha256, UcodeDigest::from_text(&text));
+        let data_sha256: [u8; 32] = sha2::Sha256::digest(data).into();
+        assert_eq!(plan.entry().data.sha256, data_sha256);
+
+        rdram[TEXT as usize ^ 3] ^= 0xff;
+        let mismatch = task_entry_admission_plan(
+            &rdram,
+            &rsp_memory,
+            &task,
+            GeometryWireFamily::F3dex2,
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            mismatch,
+            RenderError::RequiresLle { ucode_sha256 }
+                if ucode_sha256 == UcodeDigest::from_text(&text).as_bytes()
+        ));
     }
 
     #[test]

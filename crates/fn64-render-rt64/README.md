@@ -51,6 +51,15 @@ The admission catalogs and public raw-RDP FullSync inspector live in
 mechanisms while the decoder, rasterizer, and native adapter remain separated
 in later extraction steps.
 
+The transactional geometry preflight now freezes one shared
+`TaskAdmissionPlan` before native entry. Generation zero binds task-entry
+text/data identities and family; every admitted `G_LOAD_UCODE` appends another
+generation in executed command order. Repeated addresses and exact duplicate
+identities are retained, so same-address content replacement and `A -> B -> A`
+cannot collapse into a set or final-address check. The current milestone only
+produces that plan. Native RT64 does not consume it yet, so the full preflight
+remains required and no narrower admission or extraction claim follows.
+
 The reference lane also keeps the RDP device alive across task boundaries.
 Other mode, combiner/key/convert and constant-color registers, fill color,
 scissor, the texture-image latch, all eight tile descriptors, TLUT, and the
@@ -145,8 +154,10 @@ native `Reached`/`NotReached` evidence and preserves the exact count when a
 task synchronizes more than once. While the reference preflight remains, its
 public-command result must agree exactly with the native delta or the adapter
 fails closed. Initial/final address changes are diagnostic only: they cannot
-prove that every intermediate `G_LOAD_UCODE` generation was admitted, so they
-do not yet authorize removing the transactional self-load preflight.
+prove that native RT64 consumed every planned `G_LOAD_UCODE` generation. The
+next adapter step must match the plan at RT64's pre-cache `loadUCodeGBI`
+boundary and force content recognition for same-address replacements before
+the transactional self-load preflight can be reduced.
 
 The C++ and every Rust `unsafe` block used to call it are quarantined here, as
 required by `docs/DESIGN.md` section 1. `fn64-render`, `fn64-runtime`, and the
