@@ -454,23 +454,92 @@ runs, and macOS crash-report comparison):
    after gfx task #4 instead of #7 -- the cascade's entry is now the
    frontier itself.
 
-## Next frontier: the demo frame whose DL cursor points into the stack
+## RESOLVED (2026-07-21, this cycle): the "DL cursor into the stack" was a
+## fall-through-truncated recompiled function skipping its own epilogue
 
-The first-order corruption is `func_80121764` emitting its per-object DL
-through a cursor (`*a0`, threaded from `func_8011F078` ->
-`func_80122204` sp+0x10) that points at the game thread's stack instead
-of the frame's Gfx pool. Everything downstream (shredded saved
-registers, the phantom 0xEC object walk, the 0x27813FE8 chimera) follows
-from those stack-aimed DL stores. The open question is what fn64
-divergence hands the demo engine that cursor: the leading suspects are
-the task-yield/reload contract (the OS_TASK_YIELDED path whose real
-bytes the KSEG1 fix just surfaced -- fn64's LLE task dispatch may not
-write faithful yield data) and the known frame-pacing divergence (the
-scene loop runs ~1400 VI fields per game frame against hardware-cadence
-audio; the voice-map rung's precedent). Method that works: the
-value-change watchpoint scripts from this cycle (`/tmp/wm2000_watch2.py`
-pattern) on the DL-cursor cell, plus `WM2000_SNAPSHOT_STEP` byte-diffs
-to bracket the fatal frame (it begins between steps 250k and 260k).
+The stack-aimed DL cursor hypothesis above was WRONG in an instructive
+way. Full watchpoint chain (all evidence deterministic and reproducible
+with the scripts noted below):
+
+1. **The cursor was never bad at any hand-off.** The per-frame DL arena
+   is a 64 KiB double buffer: base allocated once (`func_8011EE44` ->
+   `func_80000898(0x10000)`, lands at 0x80315DE0), master cursor global
+   at 0x80129F44 reseeded every frame by `func_8011F078` as
+   `base + ((parity^1)<<15) + 8`. A harness word-probe
+   (`WM2000_PROBE_WORDS`, new env knob in `src/main.rs`) showed
+   base/parity/master stayed sane through the whole run, and an lldb
+   entry-check on the full chain (`func_8011F078` -> `func_80121FA8` ->
+   `func_80122204` -> `func_80121764`) showed every `*cursor-cell` value
+   inside the arena right up to the fatal call.
+2. **The corruption was register/stack shredding INSIDE the emitters.**
+   A hardware watchpoint on the RecompContext's `r17` (guest `s1`)
+   during the fatal `func_80121764` call caught the sequence: s1 valid
+   (0x8012A2B8, the object) through `func_80030EC0`'s save/restore,
+   then `func_801200DC`'s EPILOGUE restored s1 = 0xFF (the trap value:
+   `lw 0xDC($s1)` at guest addr 0x1DB). A second watchpoint on the
+   guest stack slot where `func_801200DC` saved s1 (0x8008381C) proved
+   NOTHING ever overwrote the slot -- the epilogue simply read the
+   wrong address, because guest `sp` was still 0x88 LOW when
+   `func_801200DC`'s epilogue ran.
+3. **Root cause: answer-key function splits with no fall-through.** The
+   corpus's partition split real functions at internal labels, and
+   N64Recomp emitted each fragment as a separate C function with no
+   fall-through tail call. `func_8011F67C` (the announcer/sprite DL
+   emitter `func_801200DC` dispatches to for element kinds 4-7) ends at
+   asm 0x8011FE74 and, on hardware, execution falls THROUGH into
+   0x8011FE78 -- the epilogue fragment holding the DL-cursor write-back,
+   all 10 s-register restores, and `sp += 0x88`. The generated
+   `func_8011F67C` C body just fell off its closing brace, so every
+   call skipped its own epilogue: caller registers stayed clobbered with
+   DL words (s1 = 0xDE000000/0xDF000000/0xFF -- G_DL, G_ENDDL, alpha)
+   and sp stayed 0x88 low, so every subsequent restore in the caller
+   chain read the wrong frame. THAT is what shredded `func_80122204`'s
+   saved registers -- not stores through a stack-aimed cursor. The
+   phantom 0xEC walk and the 0x27813FE8 chimera all follow from
+   restoring DL words as pointers. The corpus has ~80 such truncated
+   fragments (5 more in this very DL path:
+   `func_80120B28/B84/BA0/D20/D98`, consecutive fragments of one
+   emitter).
+4. **The fix (faithful, systematic): build-time fall-through mend.**
+   `build.rs` now parses `recomp_overlays.inl`'s per-section
+   `FuncEntry` tables into an address-contiguity successor map and
+   appends `func_<successor>(rdram, ctx);` to every generated body that
+   can fall off its end -- exactly the tail call N64Recomp itself emits
+   when its function list is correct, and exactly what hardware does
+   (execution continues at the next address). 1996 bodies get the
+   append (most are dead code after an unreachable trailing delay-slot
+   dup -- harmless by construction; the reachable ones are the real
+   fixes). Zero game bytes involved: pure source-to-source mend of
+   out-of-tree generated C, in OUT_DIR only.
+
+**Result:** the demo frame survives. Boot now runs to gfx task #26+
+(previous frontier: crash after #7), with real scene geometry growing
+across tasks -- 133 -> 682 -> 723 -> 777 -> 1013 raw triangles per
+task -- and swaps through #15. The fade layer has progressed from
+full-white texrect cover to near-black frames (`/tmp/fn64-fb-15.png`,
+`/tmp/wm2000-gfx-dumps/wm2000-0007.png` via the new
+`WM2000_GFX_DUMP_SKIP`/`WM2000_GFX_DUMP_LIMIT` window knobs).
+
+Forensics tooling from this cycle, all reusable: `WM2000_PROBE_WORDS`
+(comma-separated hex guest addrs; logs step-bracketed value changes of
+each word -- the harness-level analogue of the lldb value-change
+watchpoint), plus the lldb script patterns in `/tmp/wm2000_dlwatch.py`
+(cursor-chain entry checks + ring buffer), `/tmp/wm2000_r17watch.py`
+(RecompContext register watch armed at the Nth call), and
+`/tmp/wm2000_slotwatch.py` (guest stack-slot watch).
+
+## Next frontier: rasterizer W-reciprocal trap in the deep demo scene
+
+With the fall-through mend in place the run ends at a NAMED renderer
+trap, not guest corruption: `raster.rs:1354` asserts
+`raw RDP textured triangle tile 0 produced non-positive W reciprocal
+-4570513467 at (30, 206)` around gfx task #27. A perspective triangle
+crossing the near plane can legitimately present non-positive W at edge
+pixels; real RDP hardware's `tcdiv` reciprocal path produces garbage
+texels there but never faults. The reference rasterizer needs a
+faithful non-positive-W policy (clamp/garbage-texel like hardware)
+instead of the loud assert -- the assert was correct to exist until real
+content hit it; now it is the boot frontier.
 
 ## Superseded framing (2026-07-21, earlier): wild-pointer crash in the demo scene, one task after first geometry
 
