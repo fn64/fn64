@@ -60,12 +60,45 @@ reaches real rendered frames, then stalls:
 2. sim ~16.03B–16.07B: the game submits 3 gfx frame pairs (F3DEX2 XBUS
    tasks); `osViSwapBuffer` fires and non-uniform framebuffers are dumped
    (near-white dithered fade frames).
-3. sim >16.07B: **no further task submissions of any kind.** The retrace
-   fan-out thread stops posting to the sound pump's queue (rdram 0xE0908),
-   so the pump (blocked in `osRecvMesg`) starves and audio stops; the
-   audio thread blocks on 0x559A0 and the gfx-task thread on 0x522E8,
-   each waiting for a message the per-field main-loop thread never sends.
-   Persists for 20k+ fields — a real handshake stall, not a pause.
+3. sim >16.07B: **no further task submissions of any kind.** Persists at
+   any budget (verified to 50M steps ≈ 38 virtual hours).
+
+Deadlock shape (2026-07-21 trace diagnosis, using the new
+`QueueOpKind::Drop` + `TraceKind::EventMesg` instrumentation): the gfx
+manager (executor thread 17) and audio manager (thread 18) share **one
+FIFO mesg queue** (rdram 0x52320) for `OS_EVENT_SP` task-done messages —
+registered once at boot, never re-registered, zero messages dropped, all
+completions delivered intra-field (~192 cycles after kick). The final
+sequence (trace seq 312716–312800):
+
+1. gfx task loaded+kicked by 17; 17 parks on 0x52320 — but 18 has been
+   parked there since 23M cycles earlier, so the SP-done wakes **18**;
+2. 18 treats it as its grant, kicks the last audio task (#9307), parks;
+3. that audio task's SP-done wakes **17** (`Wake, thread: 17` — the
+   crossover), which proceeds as if its gfx task completed: it loads the
+   next gfx task, asks the service thread (3) for the go-ahead on queue
+   0x522E8, and never kicks it;
+4. terminal state: main thread (6) blocked forever on the sound-service
+   response queue 0x559C0; service thread (3) wakes every field on its
+   retrace queue 0x55948 but never replies; 18 parked forever on
+   0x52320; the AI pump starves (its feeder queues 0xE0908/0xE0930 go
+   quiet); no task of any kind is ever submitted again.
+
+Eliminated by direct evidence: message drops (0 `Drop` events),
+`OS_EVENT_SP` re-registration (a single boot-time `EventMesg`),
+`osSpTaskYield` preemption (never called in the window), completion
+latency past a field boundary (clamping latency to 500k cycles produces a
+byte-identical trace), and the stand-in audio ucode (routing audio
+through the real RSP LLE replay — `set_audio_task_lle` — changes
+nothing).
+
+Open question (the actual next blocker): why thread 18 is already parked
+on the shared SP queue when 17 kicks — on hardware the same FIFO
+delivery rules apply, so the game's protocol must prevent that overlap
+via ordering fn64 does not yet reproduce. Answering it needs guest-level
+decompilation of the two manager loops (the task-grant state machine
+around the AKI scheduler threads), correlating with the trace's queue
+addresses.
 
 ## Known frontier (2026-07-14)
 
