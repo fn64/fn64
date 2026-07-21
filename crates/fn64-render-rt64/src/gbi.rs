@@ -3385,9 +3385,13 @@ impl TmemTexture {
         // fetches through the TLUT whenever `other_modes.en_tlut`; the fmt
         // field only shapes non-TLUT decode). WM2000's title scene draws its
         // full-screen CI8 image through a tile declared IA8 with
-        // G_TT_RGBA16 enabled -- hardware renders it palettized. Larger
-        // texel sizes under TLUT have no shipped precedent here and keep
-        // the loud trap below.
+        // G_TT_RGBA16 enabled -- hardware renders it palettized. A 16-bit
+        // tile under TLUT feeds the texel's TOP byte as the palette index
+        // (angrylion's fetch_texel: every en_tlut path narrows the fetched
+        // texel to 8 index bits, `c >> 8` for 16-bit; WM2000's attract demo
+        // scene hits this at gfx task #123 with an RGBA16-coded tile).
+        // 32-bit texels under TLUT still have no shipped precedent here and
+        // keep the loud trap below.
         if self.texture_lut != 0 {
             match self.tile.siz {
                 G_IM_SIZ_4B => {
@@ -3395,6 +3399,11 @@ impl TmemTexture {
                     return self.storage.read_tlut(index, self.texture_lut);
                 }
                 G_IM_SIZ_8B => return self.storage.read_tlut(raw as usize, self.texture_lut),
+                G_IM_SIZ_16B => {
+                    return self
+                        .storage
+                        .read_tlut((raw >> 8) as usize & 0xff, self.texture_lut)
+                }
                 _ => panic!(
                     "texture-LUT sampling of a {}-coded {}b tile at TMEM word {} is unsupported",
                     self.tile.fmt, self.tile.siz, self.tile.tmem
@@ -4389,6 +4398,14 @@ fn execute_load_ucode(
     UcodeDigest::from_text(&text)
 }
 
+/// `FN64_RDP_COLOR_LOG=1`: log every SETPRIMCOLOR/SETENVCOLOR decoded, so a
+/// long boot run yields a complete timeline of scripted color animation (fade
+/// covers etc.) without per-task stream dumps. Checked once per process.
+fn rdp_color_log() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FN64_RDP_COLOR_LOG").is_some())
+}
+
 fn decode_stream_impl(
     rdram: &mut [u8],
     dl_addr: u32,
@@ -5310,11 +5327,20 @@ fn decode_stream_impl(
                 state.combiner.min_lod_level = ((w0 >> 8) & 0xff) as u8;
                 state.combiner.prim_lod_fraction = (w0 & 0xff) as u8;
                 state.combiner.primitive = w1.to_be_bytes();
+                // Observability knob (`FN64_RDP_COLOR_LOG=1`): one line per
+                // SETPRIMCOLOR so a long boot run yields the full timeline of
+                // e.g. a fade cover's PRIM alpha without dumping every stream.
+                if rdp_color_log() {
+                    eprintln!("[fn64-rdp-color] prim={w1:08x}");
+                }
             }
             G_SETENVCOLOR => {
                 // gDPSetEnvColor -> DPRGBColor (gbi.h:3626-3644): w1 packs
                 // RGBA in bits 31..0, one byte per component.
                 state.combiner.environment = w1.to_be_bytes();
+                if rdp_color_log() {
+                    eprintln!("[fn64-rdp-color] env={w1:08x}");
+                }
             }
             G_SETSCISSOR => {
                 // SGI RDP Command Summary Table 27: all four edges are
@@ -9669,6 +9695,31 @@ mod tests {
             ..Default::default()
         };
         storage.write_texel(tile, 0, 0, false, G_IM_SIZ_8B, 0x42);
+        storage.write_tlut(256, 0x42, 0xf801);
+        let texture = TmemTexture {
+            storage: std::rc::Rc::new(storage),
+            tile,
+            texture_lut: 2,
+        };
+        assert_eq!(texture.sample(0, 0), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn tlut_mode_palettizes_sixteen_bit_texels_through_their_top_byte() {
+        // A 16-bit tile under EN_TLUT feeds the texel's TOP 8 bits as the
+        // palette index (angrylion fetch_texel narrows every en_tlut fetch
+        // to 8 index bits, `c >> 8` for 16-bit texels). WM2000's attract
+        // demo scene draws an RGBA16-coded tile with G_TT_RGBA16 enabled
+        // (gfx task #123 of the post-osGetTime-fix boot); a previous
+        // revision trapped loudly on any 16-bit tile under TLUT.
+        let mut storage = Tmem::default();
+        let tile = Tile {
+            fmt: G_IM_FMT_RGBA,
+            siz: G_IM_SIZ_16B,
+            line: 9,
+            ..Default::default()
+        };
+        storage.write_texel(tile, 0, 0, false, G_IM_SIZ_16B, 0x42AB);
         storage.write_tlut(256, 0x42, 0xf801);
         let texture = TmemTexture {
             storage: std::rc::Rc::new(storage),
