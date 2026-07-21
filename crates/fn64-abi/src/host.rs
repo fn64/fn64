@@ -23,6 +23,30 @@ pub fn advance_virtual_time(now: u64) {
     with_executor(|exec| exec.advance_time(now));
 }
 
+/// The earliest virtual time at which anything time-driven is due: the
+/// soonest device-fabric event (PI/SI/AI DMA completions, RCP task
+/// completions), armed OS timer, or VI retrace tick. `None` when nothing is
+/// scheduled.
+///
+/// This is the seam that lets a host idle loop advance the clock TO the next
+/// due event instead of overshooting it by a fixed field-interval quantum.
+/// The quantum overshoot was a real, measured distortion (2026-07
+/// attract-clock rung): every sub-field device wait -- e.g. a one-cycle PI
+/// chunk completion the AKI streamed loaders block on thousands of times
+/// during boot -- was charged a full 1/60s field of virtual time, inflating
+/// WM2000's boot from seconds to ~171 virtual seconds and pushing the
+/// attract-mode clock (driven by the guest's own osGetTime deltas) tens of
+/// seconds past its script's scene end-times before the first scene even
+/// started.
+pub fn next_virtual_event() -> Option<u64> {
+    let device = with_host(|host| host.device_fabric.next_deadline()).map(|c| c.get());
+    let executor = with_executor(|exec| exec.next_event_due());
+    match (device, executor) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// Create and start thread 0 running `recomp_entrypoint` -- the harness's
 /// boot entry point. `recomp_entrypoint`'s own body (verified directly
 /// against `RecompiledFuncs/funcs_0.c`) computes its own jump target from

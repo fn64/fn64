@@ -553,10 +553,22 @@ fn main() {
         }
 
         if !stepped {
-            // Nothing was runnable -- host-driven progress (VI retrace,
-            // due timers) is the only way forward.
-            tick += fn64_abi::vi_field_interval()
+            // Nothing was runnable -- host-driven progress (VI retrace, due
+            // timers, device completions) is the only way forward. Advance
+            // TO the next due event (capped at one field per hop so a
+            // genuinely idle machine still ticks field-by-field), never past
+            // it: overshooting by a fixed field quantum charged every
+            // sub-field wait -- e.g. the one-cycle PI chunk completions the
+            // AKI streamed loaders block on thousands of times during boot
+            // -- a full 1/60s of virtual time, inflating boot to ~171
+            // virtual seconds and derailing the attract-mode clock (which
+            // the guest derives from its own osGetTime deltas). See
+            // fn64_abi::next_virtual_event's doc comment.
+            let now = fn64_abi::sim_time();
+            let field = fn64_abi::vi_field_interval()
                 .expect("typed television standard must keep VI armed");
+            tick = fn64_abi::next_virtual_event()
+                .map_or(now + field, |due| due.clamp(now + 1, now + field));
             fn64_abi::advance_virtual_time(tick);
             consecutive_idle_ticks += 1;
             if consecutive_idle_ticks >= IDLE_TICKS_BEFORE_STOP {

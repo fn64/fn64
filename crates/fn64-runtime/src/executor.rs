@@ -484,6 +484,20 @@ impl Executor {
     /// call site's `osSetEventMesg(7, mq, &retraceMsg)`, per
     /// `games/NWXE/profile.toml`'s rung-11 evidence cited in `vi.rs`) --
     /// never a second, VI-specific delivery path.
+    /// The earliest virtual time at which this executor has scheduled work
+    /// to fire: the soonest armed timer deadline or the next VI retrace
+    /// tick. `None` when neither exists. The host's idle-time driver hops
+    /// exactly to this instant (bounded by its own field-interval cap)
+    /// instead of overshooting sub-field waits by a whole field.
+    pub fn next_event_due(&self) -> Option<u64> {
+        let timer = self.timers.next_deadline();
+        let retrace = self.peripherals.next_retrace_due();
+        match (timer, retrace) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     pub fn advance_time(&mut self, now: u64) {
         let elapsed = now.checked_sub(self.sim_time).unwrap_or_else(|| {
             panic!(

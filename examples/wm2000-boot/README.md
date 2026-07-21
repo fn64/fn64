@@ -640,7 +640,97 @@ green "2000" -- committed to the guest framebuffer at 0x3C7C00
 `/tmp/xbus-replay-nocover/cimg-003c7c00.png`). Workspace tests: 1363
 passed / 0 failed (two new stream-pinned regressions).
 
-## Next frontier: the fade's opaque black under-cover (game timeline, not blending)
+## RESOLVED (2026-07-21, this cycle): the attract cover gate -- the guest's
+## own libultra osGetTime sawtoothed and poisoned the attract clock
+
+The fade's "opaque black under-cover" below was fully root-caused and
+fixed. The chain, each link verified live:
+
+1. **The cover pair is ONE signed master fade level.** `func_800E561C(dl,
+   level)`: level >= 0 draws a white cover with alpha=level; -0xFF..-1 a
+   black cover with alpha=-level; level < -0xFF an OPAQUE cover. The
+   attract compositor (`func_80121FA8`, jal'd from `func_8011F078`) draws
+   black-opaque + white(alpha = -0x100 - level) when level < -0x100 --
+   exactly the observed black a=255 + sawing white pair, meaning the level
+   sat below -0x100 forever.
+2. **The level is scheduled from the attract script.** `func_8011DFCC`
+   (the per-frame attract tick) computes `request = (end - clock) << 8 /
+   fade_duration` (asm 0x8011E0D4..0x8011E188), where `end` = the current
+   attract-script item's end time (D_8012A2B0) and `clock` = the attract
+   clock (D_8009749C), advanced every frame by `rate` (D_8011C100).
+3. **`rate` comes from osGetTime deltas.** The per-frame sound tick
+   (funcs_16, asm 0x800E2110..0x800E2200) reads the game's own linked
+   libultra `osGetTime` (`func_80032570` -- byte-verified verbatim:
+   IntOff; osGetCount; 64-bit base pair 0x800974E8/EC + (Count -
+   lastCount@0x80088410); IntOn), converts to usec (`*64/0xBB8`), and
+   divides the delta into 60Hz frames (`(delta+0x208D)/0x411A`, 64-bit
+   unsigned).
+4. **fn64 never services the libultra time base.** On hardware the OS
+   counter interrupt refreshes base+lastCount every CP0 Count wrap; fn64
+   runs no guest counter interrupt, so the unpatched `func_80032570`
+   SAWTOOTHS: time jumps back 91.6s (2^32 Count units) every 91.6s of
+   virtual time. At each wrap the tick's delta goes negative and the
+   unsigned divide turns it into rate ~0x5899xxxx (~1.49e9) -- verified
+   numerically: `(2^64 - 91,625,968 usec)/0x411A mod 2^32 = 0x589985B2`,
+   + the tick's real elapsed frames = the two live-probed spikes
+   0x58998D63/0x58998757 exactly (lldb watchpoint on the fade global +
+   `WM2000_PROBE_WORDS` on clock/rate/end/item).
+5. The poisoned clock leapt ~25M units past every script end time
+   (probed: clock 1544 -> 1,486,459,755 in one frame; ends 780..2440),
+   so the fade request was astronomically negative forever: at its
+   +0x10/frame decay the reveal sat ~62 hours away, and the next wrap
+   re-poisoned it. The white "strobe" was the low byte of `-0x100 -
+   level` marching as the level decayed -- pure corruption artifact, not
+   an animation.
+
+**Fix (faithful): identify `func_80032570` AS libultra osGetTime** and
+route it to fn64's `osGetTime_recomp` virtual-clock shim -- the same
+identification the corpus syms already apply to its sibling `osGetCount`
+(0x80037690). Done as a build-time body patch in `build.rs`
+(`patch_osgettime`, with the full evidence chain in its doc comment).
+
+## RESOLVED (2026-07-21, same cycle): idle-quantum overshoot inflated boot
+## ~50x and back-loaded the attract clock
+
+With osGetTime fixed, the attract clock still started ~2,916 units
+(~48.6s) ahead of the script and kept gaining: the virtual boot itself
+consumed ~171 virtual seconds (10,254 audio-only fields) because the
+harness's idle path advanced the clock a FULL VI field whenever nothing
+was runnable -- so every sub-field device wait (the one-cycle PI chunk
+completions the AKI streamed loaders block on thousands of times during
+boot) was charged 1/60s. New seam: `fn64_abi::next_virtual_event()`
+(device-fabric `next_deadline` + executor timer deadlines + retrace
+schedule -- `Executor::next_event_due`), and the harness idle loop now
+hops `due.clamp(now+1, now+field)` -- exactly to the next due event,
+never past it, still field-bounded so a truly idle machine ticks
+per-field. (The stale "~1,400 VI fields per game frame" claim from an
+earlier cycle was re-measured on the way: mode inter-gfx-task gap was
+already 2 fields (907 of 1,199 gaps) with 1-field gaps second (187);
+frame pacing was NOT the gate.)
+
+**Result of the two fixes: the attract sequence PRESENTS, live.** The
+presented framebuffers now show the real attract program in order --
+legal screen (swap #3), THQ logo (~#100), AKI logo (~#160), WF scratch
+logo (~#250), the wrestler intro montage with RAW/SmackDown show cards
+(~#340-#1200+), whiteout transitions between scenes -- crash-free to
+2.5M steps. Before these fixes, 4,484 consecutive swaps contained
+NOTHING but uniform fade fills plus 3 legal-screen frames.
+
+## Open: full-screen image scenes present striped/repeated
+
+Every attract scene drawn as a full-screen IMAGE (logos, montage stills)
+presents with alternate-scanline striping and 2-3x horizontal repetition
+(`/tmp/fn64-fb-100.png` THQ, `/tmp/fn64-fb-250.png` WF logo). Scene
+CONTENT is clearly recognizable, so this is a decode geometry bug
+(likely hi-res/interlaced color-image handling or copy-mode texrect
+stepping in the raw-RDP lane, possibly plus the harness's fixed 320x240
+capture of a 640-wide framebuffer), not a timeline gate. A gfx task #123
+trap on the way: these scenes draw an RGBA16-coded tile with
+G_TT_RGBA16 enabled; per angrylion a 16-bit texel under EN_TLUT feeds
+its top byte as the palette index -- implemented (regression test
+`tlut_mode_palettizes_sixteen_bit_texels_through_their_top_byte`).
+
+## Superseded framing (2026-07-21, earlier): the fade's opaque black under-cover (game timeline, not blending)
 
 Presented frames are still the fade fill because the game's own DL
 composites TWO full-screen texrect passes OVER the title scene every

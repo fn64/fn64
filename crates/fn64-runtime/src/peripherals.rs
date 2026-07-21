@@ -180,6 +180,11 @@ impl Peripherals {
         Some(RetraceTick { event_vi_ticks })
     }
 
+    /// When the next retrace tick is due, if the ticker is armed.
+    pub fn next_retrace_due(&self) -> Option<u64> {
+        self.retrace.as_ref().map(RetraceSchedule::next_due)
+    }
+
     // ---- SI/PIF (controller probe) ---------------------------------------
 
     pub fn pif(&self) -> &PifModel {
