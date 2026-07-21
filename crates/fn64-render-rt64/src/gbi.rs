@@ -3677,6 +3677,12 @@ fn resolve_addr(segments: &[u32; 16], addr: u32) -> usize {
     segments[seg] as usize + off
 }
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct DecodeAdmissionPolicy {
+    raw_window_bytes: Option<(usize, usize)>,
+    force_branch: bool,
+}
+
 /// Decoder state carried across (possibly nested via `G_DL`) command
 /// streams.
 struct DecodeState {
@@ -3756,6 +3762,11 @@ struct DecodeState {
     admission_raw_window_bytes: Option<(usize, usize)>,
     admission_raw_windows: Vec<TaskAdmissionRawWindow>,
     admission_raw_window_error: Option<String>,
+    /// Active RT64 host enhancement. This is inspection policy rather than
+    /// emulated RSP state: pinned RT64 overrides the ordinary BranchZ
+    /// comparison when the field is enabled, so admission must follow the
+    /// same executed command path before native entry.
+    force_branch: bool,
 }
 
 /// Public F3DEX2 vertex-fog state. With `G_FOG` enabled, the RSP generates
@@ -3877,6 +3888,7 @@ fn fresh_decode_state() -> DecodeState {
         admission_raw_window_bytes: None,
         admission_raw_windows: Vec::new(),
         admission_raw_window_error: None,
+        force_branch: false,
     }
 }
 
@@ -4820,7 +4832,7 @@ fn execute_display_list_f3dex2_state_with_catalog(
         catalog,
         None,
         GeometryWireFamily::F3dex2,
-        None,
+        DecodeAdmissionPolicy::default(),
     )
 }
 
@@ -4831,13 +4843,14 @@ fn execute_display_list_f3dex2_state_with_catalog_and_rdp(
     catalog: Option<&F3dex2UcodeCatalog>,
     rdp_state: Option<&mut RdpDecodeState>,
     initial_family: GeometryWireFamily,
-    admission_raw_window_bytes: Option<(usize, usize)>,
+    admission_policy: DecodeAdmissionPolicy,
 ) -> Result<DecodeState, RenderError> {
     let mut state = rdp_state
         .as_deref()
         .map(RdpDecodeState::begin_task)
         .unwrap_or_else(fresh_decode_state);
-    state.admission_raw_window_bytes = admission_raw_window_bytes;
+    state.admission_raw_window_bytes = admission_policy.raw_window_bytes;
+    state.force_branch = admission_policy.force_branch;
     #[cfg(not(test))]
     projdump::reset_frame();
     let mut family = initial_family;
@@ -4962,7 +4975,7 @@ pub(crate) fn execute_display_list_f3dex2_ops_admitted_with_rdp_state(
         Some(catalog),
         Some(rdp_state),
         GeometryWireFamily::F3dex2,
-        None,
+        DecodeAdmissionPolicy::default(),
     )?
     .ops)
 }
@@ -5001,6 +5014,12 @@ pub(crate) struct TaskAdmissionRawWindowSize {
     pub(crate) data: usize,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GeometryTaskAdmissionOptions {
+    pub(crate) raw_window_size: TaskAdmissionRawWindowSize,
+    pub(crate) force_branch: bool,
+}
+
 pub(crate) fn inspect_display_list_geometry_admission_with_rdp_state(
     rdram: &mut [u8],
     rsp_memory: &mut fn64_runtime::RspMemory,
@@ -5016,7 +5035,7 @@ pub(crate) fn inspect_display_list_geometry_admission_with_rdp_state(
         Some(catalog),
         Some(rdp_state),
         family,
-        None,
+        DecodeAdmissionPolicy::default(),
     )?;
     Ok(GeometryTaskInspection {
         operations: state.ops,
@@ -5033,8 +5052,9 @@ pub(crate) fn inspect_display_list_geometry_admission_with_raw_windows(
     catalog: &GeometryUcodeCatalog,
     rdp_state: &mut RdpDecodeState,
     family: GeometryWireFamily,
-    raw_window_size: TaskAdmissionRawWindowSize,
+    options: GeometryTaskAdmissionOptions,
 ) -> Result<GeometryTaskInspection, RenderError> {
+    let raw_window_size = options.raw_window_size;
     assert!(raw_window_size.text > 0 && raw_window_size.data > 0);
     let state = execute_display_list_f3dex2_state_with_catalog_and_rdp(
         rdram,
@@ -5043,7 +5063,10 @@ pub(crate) fn inspect_display_list_geometry_admission_with_raw_windows(
         Some(catalog),
         Some(rdp_state),
         family,
-        Some((raw_window_size.text, raw_window_size.data)),
+        DecodeAdmissionPolicy {
+            raw_window_bytes: Some((raw_window_size.text, raw_window_size.data)),
+            force_branch: options.force_branch,
+        },
     )?;
     assert_eq!(
         state.admission_generations.len(),
@@ -5806,7 +5829,11 @@ fn decode_stream_impl(
                     cache_capacity - 1
                 );
                 let vertex = &state.vtx_cache[vertex_slot];
-                if vertex.z_screen <= w1 {
+                // Keep transactional task admission on the exact path the
+                // active native RT64 enhancement will execute. Otherwise a
+                // forced branch could select different self-load and
+                // FullSync commands after preflight has committed its plan.
+                if state.force_branch || vertex.z_screen <= w1 {
                     let target = state.rdp_half_1.unwrap_or_else(|| {
                         panic!("G_BRANCH_Z reached without a preceding G_RDPHALF_1 target")
                     });
@@ -7725,10 +7752,12 @@ mod tests {
         const DATA: usize = 0x3800;
         const A_PREFIX: usize = 0x3900;
         const B_PREFIX: usize = 0x3a00;
-        let a = vec![0x31; SP_UCODE_SIZE];
+        let a = (0..SP_UCODE_SIZE)
+            .map(|index| ((index * 37 + 11) & 0xff) as u8)
+            .collect::<Vec<_>>();
         let mut b = a.clone();
-        b[..8].fill(0x62);
-        let data = [0x7d; 8];
+        b[..8].copy_from_slice(&[0xe1, 0x02, 0xc3, 0x24, 0xa5, 0x46, 0x87, 0x68]);
+        let data = [0x7d, 0x1e, 0xb3, 0x54, 0x99, 0x2a, 0xc7, 0x60];
         let mut rdram = vec![0u8; 0x5000];
         {
             let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
@@ -7774,7 +7803,10 @@ mod tests {
             &catalog,
             &mut rdp_state,
             GeometryWireFamily::F3dex2,
-            TaskAdmissionRawWindowSize { text: 16, data: 8 },
+            GeometryTaskAdmissionOptions {
+                raw_window_size: TaskAdmissionRawWindowSize { text: 16, data: 8 },
+                force_branch: false,
+            },
         )
         .unwrap();
 
@@ -7810,6 +7842,11 @@ mod tests {
         assert_ne!(
             inspection.self_load_raw_windows[0], inspection.self_load_raw_windows[1],
             "same-address B bytes must not collapse into RT64's address cache"
+        );
+        assert_ne!(
+            inspection.self_load_raw_windows[0].text,
+            a[..16],
+            "raw RT64 recognition bytes must remain distinct from the logical RSP DMA image"
         );
     }
 
@@ -8314,6 +8351,63 @@ mod tests {
         let not_taken = decode_branch_z_fixture(0x0001_ffff);
         assert_eq!(not_taken.len(), 1);
         assert_eq!(not_taken[0].v[0].x, 0.0);
+    }
+
+    fn force_branch_admission_reaches_target(force_branch: bool) -> bool {
+        const ROOT: usize = 0x1000;
+        const TARGET: usize = 0x1100;
+        let mut rdram = vec![0u8; 0x2000];
+        wr_cmd(
+            &mut rdram,
+            ROOT,
+            ((G_MODIFYVTX as u32) << 24) | ((G_MWO_POINT_ZSCREEN as u32) << 16),
+            0x0002_0000,
+        );
+        wr_cmd(
+            &mut rdram,
+            ROOT + 8,
+            (G_RDPHALF_1 as u32) << 24,
+            TARGET as u32,
+        );
+        wr_cmd(
+            &mut rdram,
+            ROOT + 16,
+            (G_BRANCH_Z as u32) << 24,
+            0x0001_ffff,
+        );
+        wr_cmd(&mut rdram, ROOT + 24, (G_ENDDL as u32) << 24, 0);
+        wr_cmd(&mut rdram, TARGET, (G_RDPFULLSYNC as u32) << 24, 0);
+        wr_cmd(&mut rdram, TARGET + 8, (G_ENDDL as u32) << 24, 0);
+
+        let inspection = inspect_display_list_geometry_admission_with_raw_windows(
+            &mut rdram,
+            &mut fn64_runtime::RspMemory::new(),
+            ROOT as u32,
+            &GeometryUcodeCatalog::default(),
+            &mut RdpDecodeState::default(),
+            GeometryWireFamily::F3dex2,
+            GeometryTaskAdmissionOptions {
+                raw_window_size: TaskAdmissionRawWindowSize { text: 1, data: 1 },
+                force_branch,
+            },
+        )
+        .unwrap();
+        inspection
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, RenderOp::FullSync))
+    }
+
+    #[test]
+    fn admission_follows_active_rt64_force_branch_policy() {
+        assert!(
+            !force_branch_admission_reaches_target(false),
+            "ordinary BranchZ must retain its false fallthrough"
+        );
+        assert!(
+            force_branch_admission_reaches_target(true),
+            "active RT64 forceBranch must inspect the forced target"
+        );
     }
 
     #[test]
@@ -10552,6 +10646,7 @@ mod tests {
             admission_raw_window_bytes: None,
             admission_raw_windows: Vec::new(),
             admission_raw_window_error: None,
+            force_branch: false,
         }
     }
 

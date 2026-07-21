@@ -4821,6 +4821,11 @@ impl RenderBackend for Rt64Backend {
             let mut inspection_rdram = rdram.to_vec();
             let mut inspection_rsp = rsp_memory.clone();
             let mut inspection_rdp = gbi::RdpDecodeState::default();
+            let force_branch = self
+                .active_enhancement_settings
+                .as_ref()
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
+                .f3dex_force_branch;
             let inspection = match gbi::inspect_display_list_geometry_admission_with_raw_windows(
                 &mut inspection_rdram,
                 &mut inspection_rsp,
@@ -4828,9 +4833,12 @@ impl RenderBackend for Rt64Backend {
                 &self.f3dex2_ucodes,
                 &mut inspection_rdp,
                 family,
-                gbi::TaskAdmissionRawWindowSize {
-                    text: RT64_GBI_TEXT_RECOGNITION_BYTES,
-                    data: RT64_GBI_DATA_RECOGNITION_BYTES,
+                gbi::GeometryTaskAdmissionOptions {
+                    raw_window_size: gbi::TaskAdmissionRawWindowSize {
+                        text: RT64_GBI_TEXT_RECOGNITION_BYTES,
+                        data: RT64_GBI_DATA_RECOGNITION_BYTES,
+                    },
+                    force_branch,
                 },
             ) {
                 Ok(inspection) => inspection,
