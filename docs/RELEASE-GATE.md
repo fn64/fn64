@@ -989,6 +989,14 @@ certified release matrix**. The exact state is:
 | OoT NTSC 1.0, legacy C lane | Observation tooling and exact linked-archive identity wiring exist. | Non-authoritative: measured framebuffer parity is only claimed through swap 60, and the C oracle's missing bodies prevent deeper arbitration beyond the known swap-231 frontier. |
 | Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v20-visible fixed TV region, save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, program-lane, committed RSP/RDP-mechanism, and authoritative platform/API assignments while retaining the remaining project-owned profile entries as missing. Backend microcode labels are diagnostic only; independent public-microcode adjudication uses the empty project-owned catalog v1. Generic report verification deliberately cannot turn the retained ROM-class label into profile credit; the separate private-series path revalidates its contract, receipt, exact output files, raw ROM, and runner before retaining `fn64.verified-rom-class-authority.v1`. RT64 target-case credit additionally requires the opaque platform-series capability, for which phase one has no production constructor. | No public-microcode requirement can be credited until allowed-source identities populate a successor catalog; regional and additional save/controller/render scenarios, positive native Windows evidence, and production platform-case authority remain unsupplied. |
 
+Joint private-series matrix verification over the two representative NTSC
+scenarios revalidated 20 reports and satisfied exactly 9 of 162 FullParityV1
+requirements: `retail_cartridge`, `ntsc`,
+`typed_observed_function/reference_lle_accuracy`,
+`typed_observed_function/rt64_lle_accuracy`, `sram_32_kib`,
+`standard_controller`, `dram-dpc`, `imem-replacement`, and `macos-metal`.
+The other 153 remain explicit in the incomplete assessment.
+
 Therefore the generic report mechanism can validate multi-ROM
 zero-reached-unsupported evidence and retain its satisfied/missing profile
 partition in an incomplete assessment, but a complete retained matrix remains

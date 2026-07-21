@@ -296,6 +296,11 @@ inside verified-matrix v16. The retained
 self-hash proves canonical integrity, not signer identity or transferable
 process provenance.
 
+The local 2026-07-21 v5 assessment jointly revalidated both representative
+series as 20 reports and retained the full 162-requirement denominator. It
+satisfied 9 assignments and left 153 explicit; incomplete matrix verification
+did not discard or relabel the missing requirements.
+
 #### Instruction-exact savestate transplant is NOT REPRESENTABLE here (negative result, 2026-07-14)
 
 This is an architecture fact about the runtime's shape, kept here because the
