@@ -423,7 +423,7 @@
         { "kind": "test", "path": "crates/fn64-abi/src/vi.rs", "needle": "fn raw_mmio_retrace_rereads_live_origin_bytes_without_a_graphics_task" },
         { "kind": "test", "path": "crates/fn64-render-rt64/tests/rt64_adapter_capture.rs", "needle": "fn typed_task_and_vi_cross_cpp_boundary_without_a_graphics_device" },
         { "kind": "test", "path": "crates/fn64-render-rt64/tests/rt64_adapter_capture.rs", "needle": "fn odd_interlaced_origin_compensation_uses_two_effective_source_rows" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/examples/rt64_vi_filter_behavior.rs", "needle": "native_residual=gamma-dither,divot,dither-filter,aa-selector" },
+        { "kind": "test", "path": "crates/fn64-certification/examples/rt64_vi_filter_behavior.rs", "needle": "native_residual=gamma-dither,divot,dither-filter,aa-selector" },
         { "kind": "test", "path": "tools/vi-analog-captures/tests/digital_boundary.rs", "needle": "fn digital_boundary_analysis_is_complete_deterministic_and_explicitly_non_parity" },
         { "kind": "tool", "path": "tools/vi-analog-captures/src/digital_boundary.rs", "needle": "pub const DIGITAL_BOUNDARY_CAPTURE_SCHEMA: &str = \"fn64.vi-digital-boundary-capture.v1\"" },
         { "kind": "doc", "path": "docs/VI-FILTERS.md", "needle": "Partial-coverage silhouette AA" },

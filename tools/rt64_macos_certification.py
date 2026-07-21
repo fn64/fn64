@@ -116,7 +116,7 @@ def validate_manifest(manifest: dict, root: Path) -> tuple[list[dict], list[dict
         nonempty_string(host[field], f"recorded_host.{field}")
     require(host["product"] == "macOS", "recorded host must be macOS")
 
-    cargo_toml = (root / "crates/fn64-render-rt64/Cargo.toml").read_text(encoding="utf-8")
+    cargo_toml = (root / "crates/fn64-certification/Cargo.toml").read_text(encoding="utf-8")
     inventory = inventory_by_id(root)
     cases = manifest["cases"]
     require(isinstance(cases, list), "cases must be an array")
@@ -132,7 +132,7 @@ def validate_manifest(manifest: dict, root: Path) -> tuple[list[dict], list[dict
             f"{case_id}: missing or incorrect required category",
         )
         example = nonempty_string(case["example"], f"{case_id}.example")
-        example_path = root / f"crates/fn64-render-rt64/examples/{example}.rs"
+        example_path = root / f"crates/fn64-certification/examples/{example}.rs"
         require(example_path.is_file(), f"{case_id}: missing example {example_path.relative_to(root)}")
         require(f'name = "{example}"' in cargo_toml, f"{case_id}: example missing from Cargo.toml")
         source_text = example_path.read_text(encoding="utf-8")
@@ -205,7 +205,7 @@ def render_doc(manifest: dict, cases: list[dict], blockers: list[dict]) -> str:
         claims = ", ".join(f"`{claim}`" for claim in case["claims"])
         recorded = case["recorded"]
         example = case["example"]
-        example_link = f"[\u200b`{example}`](../crates/fn64-render-rt64/examples/{example}.rs)"
+        example_link = f"[\u200b`{example}`](../crates/fn64-certification/examples/{example}.rs)"
         lines.append(
             f"| `{case['id']}` | {case['category']} | {example_link} | {case['repeat_bar']} | "
             f"{recorded['clean_runs']} clean ({recorded['verified_on']}) | {claims} |"
@@ -298,7 +298,7 @@ def run_cases(manifest: dict, cases: list[dict], selection: str, requested_runs:
                         "cargo",
                         "run",
                         "-p",
-                        "fn64-render-rt64",
+                        "fn64-certification",
                         "--features",
                         ",".join(case["features"]),
                         "--example",

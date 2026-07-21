@@ -731,6 +731,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fn64-certification"
+version = "0.0.0"
+dependencies = [
+ "fn64-render",
+ "fn64-render-rt64",
+ "fn64-runtime",
+ "sha2",
+]
+
+[[package]]
 name = "fn64-diff"
 version = "0.0.0"
 

@@ -1,11 +1,16 @@
 # fn64-render-rt64
 
-This crate contains both fn64 graphics backends:
+This crate currently contains both fn64 graphics backends while the reference
+backend is being extracted from the native adapter boundary:
 
 - `ReferenceBackend` is the deterministic, pure-Rust software rasterizer used
   by the default build and headless CI.
 - `Rt64Backend` is an opt-in C ABI wrapper around RT64's MIT C++ render/HLE
   library. It is enabled with the crate's `rt64` Cargo feature.
+
+Executable native behavior gates live in `fn64-certification`. Temporary
+one-line compatibility examples here include those canonical sources so old
+commands remain valid without changing the evidence-bound adapter manifest.
 
 Geometry HLE uses content-addressed admission. The reference backend registers
 each exact 4 KiB text SHA-256 with an explicit Fast3D, F3DEX, F3DLX,
@@ -266,7 +271,7 @@ waits that exact present ID and capture generation before returning the RDRAM
 borrow, closing the workload-complete/present-capture interleaving:
 
 ```sh
-cargo run -p fn64-render-rt64 --features rt64 --example rt64_latency_present_early_behavior
+cargo run -p fn64-certification --features rt64 --example rt64_latency_present_early_behavior
 ```
 
 Twenty consecutive diagnostics-off live Metal runs against clean pinned RT64
@@ -294,7 +299,7 @@ startup, game-cooperation, and build surfaces, lives in
 [`docs/RT64-RUNTIME-CONTROLS.md`](../../docs/RT64-RUNTIME-CONTROLS.md).
 
 The Apple/Metal behavior gate
-`crates/fn64-render-rt64/examples/rt64_texture_replacement_behavior.rs` builds
+`crates/fn64-certification/examples/rt64_texture_replacement_behavior.rs` builds
 only synthetic RGBA16 TMEM and generated RGBA8 DDS inputs. It discovers the
 exact hash from RT64's
 live cache, proves RT64 and Rice auto-path selection in pixels, and distinguishes
@@ -306,7 +311,7 @@ and changed final pixels. Its waits are bounded by deterministic no-progress
 iteration caps and do not use elapsed-time sleeps:
 
 ```sh
-cargo run -p fn64-render-rt64 --features rt64 --example rt64_texture_replacement_behavior
+cargo run -p fn64-certification --features rt64 --example rt64_texture_replacement_behavior
 ```
 
 The DDS, Rice-filename, and asynchronous-streaming inventory claims are closed
@@ -390,7 +395,7 @@ Linux/Vulkan or Windows/Vulkan/D3D12 actual-hardware result is claimed.
 The focused native VI gate is also directly runnable:
 
 ```sh
-cargo run -p fn64-render-rt64 --features rt64 --example rt64_vi_filter_behavior
+cargo run -p fn64-certification --features rt64 --example rt64_vi_filter_behavior
 ```
 
 It requires a clean pinned source identity and names the unsupported native

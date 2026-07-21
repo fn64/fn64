@@ -17,6 +17,7 @@ fn64-boot-harness shared generated-section bridge/registration and ABI-sized rdr
 fn64-shell     the executable: window, input, audio out, ROM/RecompiledFuncs intake
 fn64-render    backend-agnostic render seam + the pure-Rust ReferenceBackend (A/B oracle)
 fn64-render-rt64 FFI bridge to RT64 (C++) -- all C++ interop quarantined here
+fn64-certification executable behavioral evidence gates over the public renderer seams
 fn64-recomp / fn64-recomp-rs  the Rust-emitting recompiler and its whole-ROM driver (§1.1's `rs` lane)
 fn64-audio     RSP audio ucode execution
 fn64-diff      the first-divergence comparator, pure/no-I/O (§4's comparator lane)
@@ -34,6 +35,7 @@ fn64-shell ──depends on──> fn64-abi ──depends on──> fn64-runtime
     └──────────────────depends on───────────────────────┘
     └──depends on──> fn64-boot-harness ──depends on──> fn64-abi + fn64-runtime
     └──depends on──> fn64-rt64 ──depends on──> fn64-runtime (types only)
+fn64-certification ──depends on──> fn64-render + fn64-render-rt64 + fn64-runtime
 ```
 
 `fn64-runtime` depends on nothing else in this workspace. It is pure, safe

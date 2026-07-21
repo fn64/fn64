@@ -152,7 +152,7 @@ def validate_manifest(manifest: dict, root: Path) -> tuple[dict[str, dict], dict
     require(source["provenance"] == "GitClean", "source.provenance must be GitClean")
 
     public = inventory(root)
-    cargo_toml = (root / "crates/fn64-render-rt64/Cargo.toml").read_text(encoding="utf-8")
+    cargo_toml = (root / "crates/fn64-certification/Cargo.toml").read_text(encoding="utf-8")
     cases: dict[str, dict] = {}
     require(isinstance(manifest["cases"], list), "cases must be an array")
     for index, case in enumerate(manifest["cases"]):
@@ -167,7 +167,7 @@ def validate_manifest(manifest: dict, root: Path) -> tuple[dict[str, dict], dict
         require(case_id not in cases, f"duplicate case {case_id!r}")
         require(case["repeat_bar"] in {10, 20}, f"{case_id}: repeat_bar must be 10 or 20")
         example = nonempty(case["example"], f"{case_id}.example")
-        example_path = root / f"crates/fn64-render-rt64/examples/{example}.rs"
+        example_path = root / f"crates/fn64-certification/examples/{example}.rs"
         require(example_path.is_file(), f"{case_id}: missing example")
         require(f'name = "{example}"' in cargo_toml, f"{case_id}: example absent from Cargo.toml")
         require(source["source_id"] in example_path.read_text(encoding="utf-8"), f"{case_id}: example does not enforce pinned source identity")
@@ -557,7 +557,7 @@ def run_case(manifest: dict, cases: dict[str, dict], targets: dict[str, dict], s
         print(f"rt64-platform-certification: {selection} run {number}/{count}", flush=True)
         try:
             completed = subprocess.run([
-                "cargo", "run", "-p", "fn64-render-rt64", "--features", ",".join(case["features"]),
+                "cargo", "run", "-p", "fn64-certification", "--features", ",".join(case["features"]),
                 "--example", case["example"],
             ], cwd=root, env=environment, check=False, timeout=LIVE_CASE_TIMEOUT_SECONDS)
             code = completed.returncode

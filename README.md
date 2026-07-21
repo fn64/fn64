@@ -40,6 +40,7 @@ One workspace, separate crates, each publishable alone:
 | `fn64-shell` | The executable: window, input, audio out, ROM intake |
 | `fn64-render` | Backend-agnostic render seam + the pure-Rust `ReferenceBackend` (headless CI oracle) |
 | `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/fn64/rt64) (MIT, C++) — all C++ interop quarantined here |
+| `fn64-certification` | Executable cross-backend and native RT64 behavioral evidence gates |
 | `fn64-recomp` / `fn64-recomp-rs` | The Rust-emitting recompiler and its whole-ROM driver — the `rs` lane |
 | `fn64-audio` | RSP audio ucode execution |
 | `fn64-diff` | The first-divergence comparator (pure; no I/O) |
