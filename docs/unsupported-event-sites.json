@@ -13,6 +13,26 @@
         "crates/fn64-render-reference/src/raster.rs",
         "crates/fn64-render-reference/src/s2dex.rs"
       ]
+    },
+    {
+      "operation_prefix": "abi.si.voice-command-",
+      "subsystem": "abi",
+      "dispositions": ["loud_trap"],
+      "recorder_path": "crates/fn64-abi/src/si.rs",
+      "recorder_trigger": "format!(\"abi.si.voice-command-{command:02x}\")",
+      "source_paths": [
+        "crates/fn64-abi/src/si.rs"
+      ]
+    },
+    {
+      "operation_prefix": "abi.si.pif-command-",
+      "subsystem": "abi",
+      "dispositions": ["loud_trap"],
+      "recorder_path": "crates/fn64-abi/src/si.rs",
+      "recorder_trigger": "format!(\"abi.si.pif-command-{command:02x}\")",
+      "source_paths": [
+        "crates/fn64-abi/src/si.rs"
+      ]
     }
   ],
   "sites": [
@@ -120,6 +140,13 @@
       "disposition": "returned_error",
       "path": "crates/fn64-render/src/lib.rs",
       "trigger": "raw RDP command execution ["
+    },
+    {
+      "operation": "render.geometry-task-inspection.rejected",
+      "subsystem": "render",
+      "disposition": "returned_error",
+      "path": "crates/fn64-render/src/geometry_task_inspection.rs",
+      "trigger": "inspector={INSPECTOR}; reason={reason}"
     },
     {
       "operation": "render.hle-ucode.needs-lle",

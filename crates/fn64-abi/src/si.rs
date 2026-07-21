@@ -66,6 +66,20 @@ fn trap_raw_voice(command: u8, port: usize, now: Cycles, detail: impl AsRef<str>
     panic!("{context}")
 }
 
+fn trap_raw_pif(command: u8, port: usize, tx_size: u8, rx_size: u8, now: Cycles) -> ! {
+    let context = format!(
+        "SI PIF command {command:#04x} on channel {port} with tx={tx_size} rx={rx_size} is not implemented"
+    );
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Abi,
+        format!("abi.si.pif-command-{command:02x}"),
+        &context,
+        Some(now),
+        fn64_runtime::UnsupportedDisposition::LoudTrap,
+    );
+    panic!("{context}")
+}
+
 fn accessory_address(pif_ram: &[u8; 64], cursor: usize, command: u8, port: usize) -> u16 {
     let encoded = u16::from_be_bytes([pif_ram[cursor + 3], pif_ram[cursor + 4]]);
     let address = encoded & ACCESSORY_ADDR_MASK;
@@ -316,8 +330,11 @@ fn execute_pif_commands<R: fn64_runtime::RomStorage>(
                             fn64_runtime::ControllerOperationKind::Read,
                         );
                     }
-                    fn64_runtime::PortState::VoiceRecognitionUnit => panic!(
-                        "SI PIF accessory read command 0x02 on Voice channel {port} is not implemented"
+                    fn64_runtime::PortState::VoiceRecognitionUnit => trap_raw_voice(
+                        command,
+                        port,
+                        now,
+                        "the standard accessory-read packet has no established Voice semantics",
                     ),
                 }
                 pif_ram[rx_off..rx_off + ACCESSORY_BLOCK_BYTES].copy_from_slice(&data);
@@ -386,8 +403,11 @@ fn execute_pif_commands<R: fn64_runtime::RomStorage>(
                         );
                         pif_ram[rx_off] = data_crc;
                     }
-                    fn64_runtime::PortState::VoiceRecognitionUnit => panic!(
-                        "SI PIF accessory write command 0x03 on Voice channel {port} is not implemented"
+                    fn64_runtime::PortState::VoiceRecognitionUnit => trap_raw_voice(
+                        command,
+                        port,
+                        now,
+                        "the standard accessory-write packet has no established Voice semantics",
                     ),
                 }
             }
@@ -572,9 +592,7 @@ fn execute_pif_commands<R: fn64_runtime::RomStorage>(
                     "public captures do not establish the complete packet, sequencing, and error semantics",
                 )
             }
-            _ => panic!(
-                "SI PIF command {command:#04x} on channel {port} with tx={tx_size} rx={rx_size} is not implemented"
-            ),
+            _ => trap_raw_pif(command, port, tx_size, rx_size, now),
         }
         cursor = next;
         port += 1;
@@ -650,10 +668,13 @@ pub(crate) fn execute_controller_pif<R: fn64_runtime::RomStorage>(
 /// API imports/exports the exact-ROM-bound RTC sidecar with explicit wall-time
 /// samples. Raw Voice result reads, status, captured five-write initialization,
 /// and initialization/clear/start/stop controls share the high-level
-/// VoiceUnit lifecycle. Region-dependent `0x0A` dictionary staging, `0x0D`
-/// power/gain writes, result reads without a host result, and unestablished
-/// `0x0C` forms record a command-specific unsupported event before trapping.
-/// High-level shims do not silently authorize fabricated raw-protocol success.
+/// VoiceUnit lifecycle. Standard accessory read/write packets on a Voice
+/// channel, region-dependent `0x0A` dictionary staging, `0x0D` power/gain
+/// writes, result reads without a host result, and unestablished `0x0C` forms
+/// record a command-specific unsupported event before trapping. Every other
+/// unimplemented raw PIF command records its command byte and packet shape at
+/// the same loud boundary. High-level shims do not silently authorize
+/// fabricated raw-protocol success.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
@@ -671,9 +692,14 @@ pub unsafe extern "C" fn __osSiRawStartDma_recomp(rdram: *mut u8, ctx: *mut Reco
                 ctx.r4 as u32,
                 dram_addr.offset() + 0x8000_0000
             );
-            let base = dram_addr.offset() as usize;
+            let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
             let bytes: Vec<u8> = (0..64)
-                .map(|i| unsafe { rdram.add((base + i) ^ 3).read() })
+                .map(|offset| {
+                    let address = dram_addr
+                        .checked_add(offset)
+                        .expect("SI boot-probe block address overflow");
+                    unsafe { storage.read_u8(address) }
+                })
                 .collect();
             eprintln!("[boot-probe]   block: {:02x?}", bytes);
         }
@@ -1872,6 +1898,100 @@ mod tests {
         );
         assert!(events[0].context.contains("00 00 07 00"));
         fn64_runtime::complete_unsupported_observation(Cycles::new(41), &"0".repeat(64));
+    }
+
+    #[test]
+    fn voice_accessory_read_and_write_record_typed_loud_traps() {
+        let cases = [
+            (
+                0x02,
+                3,
+                33,
+                "abi.si.voice-command-02",
+                "standard accessory-read packet",
+            ),
+            (
+                0x03,
+                35,
+                1,
+                "abi.si.voice-command-03",
+                "standard accessory-write packet",
+            ),
+        ];
+
+        for (command, tx_size, rx_size, operation, detail) in cases {
+            with_executor(|exec| *exec = fn64_runtime::Executor::new());
+            load_rom(vec![0; 0x100]);
+            set_controller_port_state(0, fn64_runtime::PortState::VoiceRecognitionUnit);
+            fn64_runtime::arm_unsupported_events(None).unwrap();
+
+            let mut packet = [0u8; 64];
+            packet[0] = tx_size;
+            packet[1] = rx_size;
+            packet[2] = command;
+            // Address zero has the public accessory-address CRC zero. The
+            // write case's remaining 32 transmit bytes are already zero.
+            let next = 2 + usize::from(tx_size) + usize::from(rx_size);
+            packet[next] = 0xFE;
+            let cycle = Cycles::new(50 + u64::from(command));
+            let trapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::pi::with_pi_dma("unsupported Voice accessory packet", |pi_dma| {
+                    execute_controller_pif(cycle, &mut packet, pi_dma)
+                });
+            }));
+            assert!(trapped.is_err());
+
+            let events = fn64_runtime::copy_unsupported_events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].subsystem, fn64_runtime::UnsupportedSubsystem::Abi);
+            assert_eq!(events[0].operation, operation);
+            assert_eq!(events[0].guest_cycle, Some(cycle));
+            assert_eq!(
+                events[0].disposition,
+                fn64_runtime::UnsupportedDisposition::LoudTrap
+            );
+            assert!(events[0]
+                .context
+                .contains(&format!("command {command:#04x}")));
+            assert!(events[0].context.contains("channel 0"));
+            assert!(events[0].context.contains(detail));
+            fn64_runtime::complete_unsupported_observation(cycle, &"1".repeat(64));
+        }
+    }
+
+    #[test]
+    fn unknown_raw_pif_command_records_packet_shape_before_loud_trap() {
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        load_rom(vec![0; 0x100]);
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+
+        let mut packet = [0u8; 64];
+        packet[0] = 1;
+        packet[1] = 2;
+        packet[2] = 0x7E;
+        packet[5] = 0xFE;
+        let cycle = Cycles::new(73);
+        let trapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::pi::with_pi_dma("unsupported generic PIF packet", |pi_dma| {
+                execute_controller_pif(cycle, &mut packet, pi_dma)
+            });
+        }));
+        assert!(trapped.is_err());
+
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].subsystem, fn64_runtime::UnsupportedSubsystem::Abi);
+        assert_eq!(events[0].operation, "abi.si.pif-command-7e");
+        assert_eq!(events[0].guest_cycle, Some(cycle));
+        assert_eq!(
+            events[0].disposition,
+            fn64_runtime::UnsupportedDisposition::LoudTrap
+        );
+        assert_eq!(
+            events[0].context,
+            "SI PIF command 0x7e on channel 0 with tx=1 rx=2 is not implemented"
+        );
+        fn64_runtime::complete_unsupported_observation(cycle, &"2".repeat(64));
     }
 
     #[test]

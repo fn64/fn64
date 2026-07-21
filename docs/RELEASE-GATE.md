@@ -235,10 +235,11 @@ The source inventory is checked by
 `tools/check_unsupported_event_sites.py` against
 `fn64.unsupported-event-sites.v2`. It scans the production Rust paths in the
 runtime, ABI, audio/RSP, Rust CPU recompiler, shared renderer, and RT64 adapter.
-Sixteen exact record sites and the RT64 reference renderer's 43 helper-routed
-operation identities must remain registered. Inline `cfg(test)` items are
-removed before the sweep, so test-oracle panics neither create false coverage
-nor hide a production outcome. Audio/RSP unknown instructions, missing VU
+Seventeen exact record sites, the reference renderer's 43 literal
+helper-routed operation identities, and the ABI's two command-indexed SI
+operation families must remain registered. Balanced multiline macro scanning
+and inline `cfg(test)` removal ensure test-oracle panics neither create false
+coverage nor hide a production outcome. Audio/RSP unknown instructions, missing VU
 bodies, invalid control flow/IMEM exits, the explicit audio-ucode stub,
 translated CPU gaps and terminal unresolved execution, and reference-renderer
 command/state/precision rejections all flush an event before preserving their
