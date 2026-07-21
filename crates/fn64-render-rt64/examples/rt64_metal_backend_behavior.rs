@@ -4,7 +4,7 @@ use std::io;
 use fn64_render::{
     FrameStatus, ReleaseCaptureFormat, RenderBackend, RenderConfig, RenderGraphicsApi,
     RenderReleaseCapture, RenderRuntimeSettings, RenderSettingsApply, ViFilterControl, ViPixelType,
-    ViPresentation,
+    ViPresentation, ViScaleAxis, ViScanoutRegisters, ViScanoutState,
 };
 use fn64_render_rt64::{Rt64Backend, Rt64BackendIdentity, Rt64SourceProvenance};
 use sha2::{Digest, Sha256};
@@ -45,12 +45,17 @@ fn fixture(spec: FixtureSpec) -> Vec<u8> {
 }
 
 fn presentation(spec: FixtureSpec) -> ViPresentation {
+    let mut words = [0u32; ViScanoutRegisters::WORD_COUNT];
+    words[0] = 0x302;
+    words[1] = spec.target;
+    words[2] = spec.width;
+    words[9] = (100 << 16) | (100 + spec.width);
+    words[10] = (20 << 16) | (20 + spec.height * 2);
+    words[12] = u32::from(ViScaleAxis::ONE);
+    words[13] = u32::from(ViScaleAxis::ONE);
     ViPresentation {
         noise_seed: spec.guest_cycle,
-        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
-            pixel_type: ViPixelType::Rgba16,
-            ..ViFilterControl::default()
-        }),
+        scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(words)),
         ..ViPresentation::default()
     }
 }
@@ -68,7 +73,7 @@ fn submit_raw(
             io::Error::other(format!("Metal raw-RDP submission returned {status:?}")).into(),
         );
     }
-    backend.present(presentation(spec))?;
+    backend.present_live(&rdram, presentation(spec))?;
     let capture = backend.release_capture()?;
     let byte_len = (spec.width * spec.height * 2) as usize;
     let start = spec.target as usize;
@@ -247,6 +252,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     if recreated_policy_sha256 != policy_sha256 {
         return Err(io::Error::other("Metal recreation changed the active policy identity").into());
+    }
+
+    let compatibility_rdram = fixture(recreated);
+    backend.present_physical_compatibility(
+        &compatibility_rdram,
+        ViPresentation {
+            noise_seed: 404,
+            scanout: ViScanoutState::BackendOnly(ViFilterControl {
+                pixel_type: ViPixelType::Rgba16,
+                ..ViFilterControl::default()
+            }),
+            ..ViPresentation::default()
+        },
+    )?;
+    let compatibility_error = backend.release_capture().unwrap_err();
+    if !compatibility_error
+        .to_string()
+        .contains("requires a completed live-register VI present")
+    {
+        return Err(io::Error::other(format!(
+            "compatibility presentation entered release evidence: {compatibility_error}"
+        ))
+        .into());
     }
 
     println!(

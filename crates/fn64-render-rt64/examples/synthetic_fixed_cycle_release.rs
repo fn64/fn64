@@ -420,8 +420,8 @@ impl RenderBackend for ObservedReferenceBackend {
             .process_rdp_commands(rdram, start, end, output_addr)
     }
 
-    fn present(&mut self, vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
-        self.inner.present(vi)?;
+    fn present(&mut self, request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {
+        self.inner.present(request)?;
         self.presents.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }

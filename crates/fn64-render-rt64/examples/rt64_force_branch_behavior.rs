@@ -227,7 +227,7 @@ struct Observation {
 fn capture(backend: &mut Rt64Backend, rdram: &mut [u8]) -> Result<Observation, Box<dyn Error>> {
     write_fixture(rdram);
     backend.process_synthetic_hfr_f3dex2(rdram, ROOT_DISPLAY_LIST as u32, TARGET as u32, 60)?;
-    backend.present(presentation())?;
+    backend.present_physical_compatibility(&*rdram, presentation())?;
     let pixels = backend.presented_pixels()?;
     if pixels.width != WIDTH
         || pixels.height != HEIGHT

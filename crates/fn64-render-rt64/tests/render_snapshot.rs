@@ -87,7 +87,9 @@ fn fixture_triangle_render_digest_snapshot() {
         .process_task(&mut rdram, &mut fn64_runtime::RspMemory::new(), &task, 0)
         .unwrap();
     backend
-        .present(fn64_render::ViPresentation::default())
+        .present(fn64_render::PresentRequest::backend_resident(
+            fn64_render::ViPresentation::default(),
+        ))
         .unwrap();
     let fb = backend.framebuffer().expect("framebuffer after create()");
 

@@ -7,8 +7,7 @@ use fn64_render::{
     RenderConfig, RenderEmulatorSettings, RenderEnhancementSettings, RenderFiltering,
     RenderGraphicsApi, RenderPolicyApply, RenderPresentationMode, RenderReleaseCapture,
     RenderResolution, RenderRestartField, RenderRuntimePolicy, RenderRuntimeSettings,
-    RenderSettingsApply, ResolutionMultiplier, ViFilterControl, ViPixelType, ViPresentation,
-    M_GFXTASK,
+    RenderSettingsApply, ResolutionMultiplier, ViPresentation, M_GFXTASK,
 };
 use fn64_render_rt64::{
     capture_rt64_adapter_inputs, roundtrip_rt64_emulator_settings,
@@ -72,12 +71,19 @@ fn fixture() -> Vec<u8> {
 }
 
 fn presentation() -> ViPresentation {
+    let mut words = [0u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
+    words[0] = 0x302;
+    words[1] = TARGET as u32;
+    words[2] = WIDTH as u32;
+    words[9] = (100 << 16) | (100 + WIDTH as u32);
+    words[10] = (20 << 16) | (20 + HEIGHT as u32 * 2);
+    words[12] = u32::from(fn64_render::ViScaleAxis::ONE);
+    words[13] = u32::from(fn64_render::ViScaleAxis::ONE);
     ViPresentation {
         noise_seed: PRESENT_GUEST_CYCLE,
-        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
-            pixel_type: ViPixelType::Rgba16,
-            ..ViFilterControl::default()
-        }),
+        scanout: fn64_render::ViScanoutState::Registers(
+            fn64_render::ViScanoutRegisters::from_words(words),
+        ),
         ..ViPresentation::default()
     }
 }
@@ -93,7 +99,10 @@ fn submit(backend: &mut impl RenderBackend) -> Result<Vec<u8>, Box<dyn Error>> {
         ))
         .into());
     }
-    backend.present(presentation())?;
+    backend.present(fn64_render::PresentRequest::live(
+        presentation(),
+        fn64_runtime::PhysicalRdramRead::from_storage(&rdram),
+    ))?;
     Ok(rdram[TARGET..TARGET + WIDTH * HEIGHT * 2].to_vec())
 }
 

@@ -1131,8 +1131,6 @@ struct Fn64Rt64Context {
     bool ubershader_evidence_active = false;
 #endif
     std::unique_ptr<RT64::Application> application;
-    uint8_t *active_rdram = nullptr;
-    size_t active_rdram_len = 0;
     uint32_t width = 320;
     uint32_t height = 240;
     uint32_t output_addr = 0;
@@ -1408,6 +1406,39 @@ struct Fn64Rt64Context {
         vi_state = next_vi_state;
         registers = next_registers;
     }
+};
+
+/// Bind fn64's one physical allocation only for a synchronous renderer call.
+/// Every caller waits its exact workload or present worker before this scope
+/// ends, so neither RT64 alias can retain a Rust-owned pointer while guest
+/// execution resumes or another direct embedder supplies its allocation.
+class ScopedRdramBinding {
+public:
+    ScopedRdramBinding(Fn64Rt64Context *context, uint8_t *rdram)
+        : context(context) {
+        context->application->core.RDRAM = rdram;
+        context->application->state->RDRAM = rdram;
+    }
+
+    ScopedRdramBinding(const ScopedRdramBinding &) = delete;
+    ScopedRdramBinding &operator=(const ScopedRdramBinding &) = delete;
+
+    ~ScopedRdramBinding() {
+        // Interleaving closed here, including exception exits: a workload or
+        // present worker can publish its ID before its queue tail releases
+        // Core/State. Restoring the placeholder at that publication point
+        // would let the tail dereference either a replaced allocation or the
+        // placeholder while Rust believes its call-scoped capability ended.
+        // Both queues must be idle before either foreign alias changes.
+        context->application->workloadQueue->waitForIdle();
+        context->application->presentQueue->waitForIdle();
+        uint8_t *placeholder = context->placeholder_rdram.get();
+        context->application->core.RDRAM = placeholder;
+        context->application->state->RDRAM = placeholder;
+    }
+
+private:
+    Fn64Rt64Context *context;
 };
 
 #if defined(FN64_RT64_HFR_EVIDENCE)
@@ -2737,16 +2768,13 @@ extern "C" int fn64_rt64_process_task(
             return 0;
         }
 
-        context->active_rdram = rdram;
-        context->active_rdram_len = rdram_len;
         context->output_addr = output_addr & 0x00FFFFFFU;
         context->update_vi();
 
         // Application::Core and State are RT64's public embedding state.
         // Update both aliases together before any interpreter or worker can
         // observe the fn64-owned allocation.
-        context->application->core.RDRAM = rdram;
-        context->application->state->RDRAM = rdram;
+        ScopedRdramBinding rdram_binding(context, rdram);
         context->application->interpreter->loadUCodeGBI(
             ucode_address,
             ucode_data_address,
@@ -2879,8 +2907,6 @@ extern "C" int fn64_rt64_process_rdp_commands(
             context->present_capture_error.clear();
         }
 
-        context->active_rdram = rdram;
-        context->active_rdram_len = rdram_len;
         context->output_addr = output_addr & 0x00FFFFFFU;
         context->update_vi();
         context->registers[1] = start;
@@ -2890,8 +2916,7 @@ extern "C" int fn64_rt64_process_rdp_commands(
         // RT64's public embedding entry accepts an explicit bounded LLE RDP
         // range when isHLE is false. Keep both public RDRAM aliases coherent
         // exactly as the task path does before the interpreter observes it.
-        context->application->core.RDRAM = rdram;
-        context->application->state->RDRAM = rdram;
+        ScopedRdramBinding rdram_binding(context, rdram);
         const uint64_t previous_workload = context->application->state->workloadId;
 
         const bool capture_deferred = context->deferred_capture_armed;
@@ -2998,6 +3023,8 @@ extern "C" int fn64_rt64_process_rdp_commands(
 
 extern "C" int fn64_rt64_present(
     Fn64Rt64Context *context,
+    uint8_t *rdram,
+    size_t rdram_len,
     const Fn64Rt64ViState *vi,
     char *error,
     size_t error_capacity) {
@@ -3006,6 +3033,16 @@ extern "C" int fn64_rt64_present(
             set_error(error, error_capacity, "RT64 context is not initialized");
             return 0;
         }
+        if (rdram == nullptr) {
+            set_error(error, error_capacity, "null RDRAM pointer at VI presentation");
+            return 0;
+        }
+        if (rdram_len < N64_RDRAM_SIZE) {
+            set_error(error, error_capacity, "RDRAM presentation view is smaller than the 8 MiB RT64 address space");
+            return 0;
+        }
+
+        ScopedRdramBinding rdram_binding(context, rdram);
 
         PresentDiagnosticSnapshot diagnostic{};
         diagnostic.workload_before = context->application->state->workloadId;
@@ -3044,20 +3081,13 @@ extern "C" int fn64_rt64_present(
         if (submitted_present > previous_present) {
             context->application->presentQueue->waitForPresentId(submitted_present);
         }
-#if defined(FN64_RT64_HFR_EVIDENCE)
-        bool pacing_recording = false;
-        {
-            std::scoped_lock capture_lock(context->present_capture_mutex);
-            pacing_recording = context->hfr_pacing_recording;
-        }
-        if (pacing_recording) {
-            // PresentQueue publishes presentId before its post-sleep
-            // swapchain-present tail. Waiting the worker idle only for the
-            // evidence window closes the caller enqueueing the next workload
-            // while that tail still consumes the prior interpolation state.
-            context->application->presentQueue->waitForIdle();
-        }
-#endif
+        // Interleaving closed here: updateScreen publishes presentId before
+        // the worker's post-publication tail has necessarily released State
+        // and Core. Rust's call-scoped RDRAM capability cannot end while that
+        // tail can still dereference the process allocation, so wait for the
+        // queue itself to become idle before the binding restores the
+        // placeholder and guest execution resumes.
+        context->application->presentQueue->waitForIdle();
         if (context->present_capture_enabled) {
             std::string capture_error;
             {
@@ -4301,12 +4331,9 @@ extern "C" int fn64_rt64_process_synthetic_hfr_f3dex2(
         context->extended_capture_armed = false;
         context->extended_capture_valid = false;
 
-        context->active_rdram = rdram;
-        context->active_rdram_len = rdram_len;
         context->output_addr = output_addr & 0x00FFFFFFU;
         context->update_vi();
-        context->application->core.RDRAM = rdram;
-        context->application->state->RDRAM = rdram;
+        ScopedRdramBinding rdram_binding(context, rdram);
 
         RT64::Interpreter *interpreter = context->application->interpreter.get();
         RT64::State *state = context->application->state.get();
@@ -4516,12 +4543,9 @@ extern "C" int fn64_rt64_process_synthetic_s2dex2(
             return 0;
         }
 
-        context->active_rdram = rdram;
-        context->active_rdram_len = rdram_len;
         context->output_addr = output_addr & 0x00FFFFFFU;
         context->update_vi();
-        context->application->core.RDRAM = rdram;
-        context->application->state->RDRAM = rdram;
+        ScopedRdramBinding rdram_binding(context, rdram);
 
         RT64::Interpreter *interpreter = context->application->interpreter.get();
         RT64::State *state = context->application->state.get();

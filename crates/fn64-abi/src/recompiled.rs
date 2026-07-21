@@ -1719,7 +1719,7 @@ mod tests {
 
             fn present(
                 &mut self,
-                _vi: fn64_render::ViPresentation,
+                _request: fn64_render::PresentRequest<'_>,
             ) -> Result<(), fn64_render::RenderError> {
                 Ok(())
             }

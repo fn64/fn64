@@ -64,11 +64,11 @@
       "scope": "behavior",
       "status": "closed",
       "controls": ["build_capability", "runtime_setting"],
-      "closure": "Twenty consecutive clean live runs against clean pinned RT64 explicitly select Metal, initialize the backend, submit exact raw-RDP fills, bind post-VI BGRA8 captures, resize from 4x2 to 8x4 across two distinct worker presents without stale-cache reversion, and recreate at 4x2 with the same active policy identity.",
+      "closure": "Twenty consecutive clean live runs against clean pinned RT64 explicitly select Metal, initialize the backend, submit exact raw-RDP fills, present from nonzero live VI origins through the current physical-RDRAM capability, bind post-VI BGRA8 captures, resize from 4x2 to 8x4 across two distinct worker presents without stale-cache reversion, and recreate at 4x2 with the same active policy identity. Each process also proves a later backend-geometry compatibility present cannot enter release capture.",
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 13, "needle": "D3D12, Vulkan and Metal" },
         { "kind": "pinned_source", "path": "src/hle/rt64_application.cpp", "line": 168, "needle": "GraphicsAPI::Metal" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_metal_backend_behavior.rs", "line": 210, "needle": "validate_capture(resized, &resized_capture, &identity, policy_sha256)", "claim_id": "backend-metal" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_metal_backend_behavior.rs", "line": 215, "needle": "validate_capture(resized, &resized_capture, &identity, policy_sha256)", "claim_id": "backend-metal" }
       ]
     },
     {
@@ -97,7 +97,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 17, "needle": "skip the game's native buffering" },
         { "kind": "pinned_source", "path": "src/common/rt64_enhancement_configuration.h", "line": 18, "needle": "SkipBuffering" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_latency_skip_buffering_behavior.rs", "line": 358, "needle": "require_selection(", "claim_id": "latency-skip-buffering" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_latency_skip_buffering_behavior.rs", "line": 365, "needle": "require_selection(", "claim_id": "latency-skip-buffering" }
       ]
     },
     {
@@ -110,7 +110,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 17, "needle": "draw as early as possible" },
         { "kind": "pinned_source", "path": "src/common/rt64_enhancement_configuration.h", "line": 19, "needle": "PresentEarly" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_latency_present_early_behavior.rs", "line": 293, "needle": "require_recolored_capture(&early_capture, [0x00, 0xff, 0x00, 0xff])?", "claim_id": "latency-present-early" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_latency_present_early_behavior.rs", "line": 297, "needle": "require_recolored_capture(&early_capture, [0x00, 0xff, 0x00, 0xff])?", "claim_id": "latency-present-early" }
       ]
     },
     {
@@ -123,7 +123,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 18, "needle": "higher resolution" },
         { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 211, "needle": "resolutionScale" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_resolution_downsample_behavior.rs", "line": 394, "needle": "high_changed_pixels != 3", "claim_id": "high-resolution-renderer" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_resolution_downsample_behavior.rs", "line": 397, "needle": "high_changed_pixels != 3", "claim_id": "high-resolution-renderer" }
       ]
     },
     {
@@ -136,7 +136,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 18, "needle": "downsample to a resolution closer" },
         { "kind": "pinned_source", "path": "src/render/rt64_render_target.cpp", "line": 354, "needle": "downsampleTarget" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_resolution_downsample_behavior.rs", "line": 548, "needle": "downsample_32_changed_pixels != 7", "claim_id": "downsample-to-original-like" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_resolution_downsample_behavior.rs", "line": 551, "needle": "downsample_32_changed_pixels != 7", "claim_id": "downsample-to-original-like" }
       ]
     },
     {
@@ -149,8 +149,8 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 19, "needle": "arbitrary aspect ratios" },
         { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 210, "needle": "aspectRatioScale" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_aspect_ratio_behavior.rs", "line": 326, "needle": "fn main()", "claim_id": "widescreen-arbitrary-aspect" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_hle_aspect_behavior.rs", "line": 645, "needle": "if !captures.windows(2).all", "claim_id": "widescreen-arbitrary-aspect" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_aspect_ratio_behavior.rs", "line": 329, "needle": "fn main()", "claim_id": "widescreen-arbitrary-aspect" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_hle_aspect_behavior.rs", "line": 648, "needle": "if !captures.windows(2).all", "claim_id": "widescreen-arbitrary-aspect" }
       ]
     },
     {
@@ -163,8 +163,8 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 19, "needle": "Ultrawide support (limited game support)" },
         { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 210, "needle": "aspectRatioTarget" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_aspect_ratio_behavior.rs", "line": 326, "needle": "fn main()", "claim_id": "ultrawide" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_hle_aspect_behavior.rs", "line": 645, "needle": "if !captures.windows(2).all", "claim_id": "ultrawide" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_aspect_ratio_behavior.rs", "line": 329, "needle": "fn main()", "claim_id": "ultrawide" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_hle_aspect_behavior.rs", "line": 648, "needle": "if !captures.windows(2).all", "claim_id": "ultrawide" }
       ]
     },
     {
@@ -203,7 +203,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 22, "needle": "Texture packs with DDS" },
         { "kind": "pinned_source", "path": "src/render/rt64_texture_cache.cpp", "line": 735, "needle": "TextureCache::setDDS" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_texture_replacement_behavior.rs", "line": 291, "needle": "if rt64_minified == single_minified", "claim_id": "texture-pack-dds" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_texture_replacement_behavior.rs", "line": 294, "needle": "if rt64_minified == single_minified", "claim_id": "texture-pack-dds" }
       ]
     },
     {
@@ -216,7 +216,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 22, "needle": "Compatible with Rice filenames" },
         { "kind": "pinned_source", "path": "src/common/rt64_replacement_database.cpp", "line": 158, "needle": "ReplacementAutoPath::Rice" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_texture_replacement_behavior.rs", "line": 303, "needle": "if rice_full != rt64_full", "claim_id": "texture-pack-rice-filenames" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_texture_replacement_behavior.rs", "line": 306, "needle": "if rice_full != rt64_full", "claim_id": "texture-pack-rice-filenames" }
       ]
     },
     {
@@ -229,7 +229,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 22, "needle": "asynchronous streaming support" },
         { "kind": "pinned_source", "path": "src/render/rt64_texture_cache.cpp", "line": 396, "needle": "std::thread" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_texture_replacement_behavior.rs", "line": 365, "needle": "if stream_fallback != stream_base", "claim_id": "texture-pack-async-streaming" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_texture_replacement_behavior.rs", "line": 368, "needle": "if stream_fallback != stream_base", "claim_id": "texture-pack-async-streaming" }
       ]
     },
     {
@@ -256,7 +256,7 @@
         { "kind": "official_readme", "path": "README.md", "line": 69, "needle": "direct copy of one of its regions" },
         { "kind": "pinned_source", "path": "src/hle/rt64_framebuffer_manager.cpp", "line": 105, "needle": "createTileCopySetup" },
         { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_framebuffer_rdram_region_behavior.rs", "line": 205, "needle": "if sampled_after != expected_sampled", "claim_id": "framebuffer-detection-region-copy" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_enhancement_emulator_controls_behavior.rs", "line": 671, "needle": "gpu_copy.copy_path.path != Rt64FramebufferCopyPath::GpuTileCopy", "claim_id": "framebuffer-detection-region-copy" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_enhancement_emulator_controls_behavior.rs", "line": 677, "needle": "gpu_copy.copy_path.path != Rt64FramebufferCopyPath::GpuTileCopy", "claim_id": "framebuffer-detection-region-copy" }
       ]
     },
     {
@@ -297,7 +297,7 @@
         { "kind": "pinned_source", "path": "src/hle/rt64_state.cpp", "line": 1815, "needle": "inspect()" },
         { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 589, "needle": "globalDrawCallIndex + 1" },
         { "kind": "pinned_source", "path": "src/gui/rt64_inspector.cpp", "line": 139, "needle": "Unknown Graphics API" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_deferred_debugger_behavior.rs", "line": 335, "needle": "set_debugger_inspection_for_evidence(true, 0, 0", "claim_id": "debugger-frame-inspection" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_deferred_debugger_behavior.rs", "line": 342, "needle": "set_debugger_inspection_for_evidence(true, 0, 0", "claim_id": "debugger-frame-inspection" }
       ]
     },
     {
@@ -310,7 +310,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 52, "needle": "logs the history of an entire frame" },
         { "kind": "pinned_source", "path": "src/hle/rt64_state.cpp", "line": 1605, "needle": "Inspect the current workload before submission" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_deferred_debugger_behavior.rs", "line": 194, "needle": "fn require_initial_history", "claim_id": "deferred-frame-history" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_deferred_debugger_behavior.rs", "line": 201, "needle": "fn require_initial_history", "claim_id": "deferred-frame-history" }
       ]
     },
     {

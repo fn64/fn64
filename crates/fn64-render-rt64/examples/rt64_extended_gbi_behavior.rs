@@ -404,14 +404,17 @@ fn run_case(
                 .sha256(),
         });
     }
-    backend.present(ViPresentation {
-        noise_seed: 0x6412_0000 | case as u64,
-        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
-            pixel_type: ViPixelType::Rgba16,
-            ..ViFilterControl::default()
-        }),
-        ..ViPresentation::default()
-    })?;
+    backend.present_physical_compatibility(
+        &rdram,
+        ViPresentation {
+            noise_seed: 0x6412_0000 | case as u64,
+            scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
+                pixel_type: ViPixelType::Rgba16,
+                ..ViFilterControl::default()
+            }),
+            ..ViPresentation::default()
+        },
+    )?;
     require_guards(&rdram, &regions)?;
     let capture = backend.presented_pixels()?;
     let selection = backend.present_selection()?;

@@ -1070,6 +1070,11 @@ pub fn c_recomp_entrypoint() -> fn64_abi::RecompFunc {
 mod tests {
     use super::*;
 
+    thread_local! {
+        static BOUNDARY_RDRAM: std::cell::RefCell<Box<[u8]>> =
+            std::cell::RefCell::new(vec![0; rdram_len()].into_boxed_slice());
+    }
+
     struct BoundaryRenderBackend;
 
     impl fn64_render::RenderBackend for BoundaryRenderBackend {
@@ -1099,7 +1104,7 @@ mod tests {
 
         fn present(
             &mut self,
-            _vi: fn64_render::ViPresentation,
+            _request: fn64_render::PresentRequest<'_>,
         ) -> Result<(), fn64_render::RenderError> {
             Ok(())
         }
@@ -1111,8 +1116,20 @@ mod tests {
         }
     }
 
+    fn boundary_rdram() -> (*mut u8, usize) {
+        BOUNDARY_RDRAM.with(|cell| {
+            let mut storage = cell.borrow_mut();
+            (storage.as_mut_ptr(), storage.len())
+        })
+    }
+
     fn install_boundary_render_backend() {
-        fn64_abi::set_render_backend(Box::new(BoundaryRenderBackend), 0);
+        let (rdram, rdram_len) = boundary_rdram();
+        // SAFETY: BOUNDARY_RDRAM owns a fixed-size boxed allocation for the
+        // lifetime of this test thread. The allocation is never resized or
+        // replaced, and boot_thread0 tests below reuse this exact pointer.
+        unsafe { fn64_abi::register_process_rdram(rdram, rdram_len) };
+        fn64_abi::set_render_backend(Box::new(BoundaryRenderBackend), rdram_len);
     }
 
     fn commit_synthetic_boundary(cycle: u64) -> Result<CommittedViBoundary, ViBoundaryError> {
@@ -1302,9 +1319,9 @@ mod tests {
         assert_eq!(boundary.cycle(), scheduled);
         assert_eq!(boundary.validate_unconsumed(), Ok(()));
         fn64_abi::set_trace_enabled(false);
-        let mut rdram = vec![0u8; 0x100];
+        let (rdram, rdram_len) = boundary_rdram();
         unsafe {
-            fn64_abi::boot_thread0(rdram.as_mut_ptr(), rdram.len(), return_immediately, 99, 10);
+            fn64_abi::boot_thread0(rdram, rdram_len, return_immediately, 99, 10);
         }
         assert!(fn64_abi::run_one_step());
         assert_eq!(fn64_abi::sim_time(), scheduled);
@@ -1501,9 +1518,9 @@ mod tests {
         fn64_abi::set_trace_enabled(false);
         let boundary = commit_synthetic_boundary(scheduled).unwrap();
 
-        let mut rdram = vec![0u8; 0x100];
+        let (rdram, rdram_len) = boundary_rdram();
         unsafe {
-            fn64_abi::boot_thread0(rdram.as_mut_ptr(), rdram.len(), return_immediately, 100, 10);
+            fn64_abi::boot_thread0(rdram, rdram_len, return_immediately, 100, 10);
         }
         assert!(fn64_abi::run_one_step());
         assert_eq!(fn64_abi::sim_time(), scheduled);

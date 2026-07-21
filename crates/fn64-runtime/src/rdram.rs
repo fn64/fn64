@@ -47,6 +47,135 @@ compile_error!(
 /// point, not a magic constant scattered through call sites.
 pub const DEFAULT_RDRAM_SIZE: usize = 8 * 1024 * 1024;
 
+/// A call-scoped, read-only capability for the console's complete physical
+/// RDRAM device.
+///
+/// Unlike [`RdramView`], this type does not manufacture a shared Rust slice.
+/// The typed recompiler can retain its checked `&mut [u8]`-backed RDRAM view
+/// while its coroutine is suspended at a device boundary, so host devices
+/// must use the already-registered raw allocation without creating a
+/// competing reference. The higher-ranked constructor below prevents safe
+/// consumers from retaining this capability after the device call returns.
+///
+/// Logical reads still use the one N64Recomp native-word lane mapping owned by
+/// this module. The capability is deliberately neither `Clone`, `Send`, nor
+/// `Sync`: one exact executor boundary owns it.
+pub struct PhysicalRdramRead<'call> {
+    storage: std::ptr::NonNull<u8>,
+    _call: std::marker::PhantomData<&'call [u8]>,
+    _not_send_or_sync: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl<'call> PhysicalRdramRead<'call> {
+    /// Build a physical-device capability from an ordinary exact-size storage
+    /// borrow. Tests and standalone embedders use this path; integrated
+    /// execution uses [`with_physical_rdram_read`] instead.
+    pub fn from_storage(storage: &'call [u8]) -> Self {
+        assert_eq!(
+            storage.len(),
+            DEFAULT_RDRAM_SIZE,
+            "physical RDRAM read storage must be exactly {DEFAULT_RDRAM_SIZE:#x} bytes, got {:#x}",
+            storage.len()
+        );
+        let storage = std::ptr::NonNull::new(storage.as_ptr().cast_mut())
+            .expect("physical RDRAM read storage must not be null");
+        Self {
+            storage,
+            _call: std::marker::PhantomData,
+            _not_send_or_sync: std::marker::PhantomData,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        DEFAULT_RDRAM_SIZE
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+
+    fn range(&self, addr: RdramAddr, width: usize, lane_xor: usize, op: &str) -> usize {
+        let logical = addr.offset() as usize;
+        let start = logical ^ lane_xor;
+        let end = start.checked_add(width).unwrap_or_else(|| {
+            panic!("{op}: physical RDRAM address overflow at logical offset {logical:#x}")
+        });
+        assert!(
+            end <= DEFAULT_RDRAM_SIZE,
+            "{op}: logical physical-RDRAM range {logical:#x}..{:#x} maps outside {DEFAULT_RDRAM_SIZE} bytes",
+            logical.saturating_add(width)
+        );
+        start
+    }
+
+    pub fn read_u32(&self, addr: RdramAddr) -> u32 {
+        assert!(
+            addr.offset().is_multiple_of(4),
+            "physical RDRAM u32 read at unaligned logical address {:#x}",
+            addr.offset()
+        );
+        let start = self.range(addr, 4, 0, "physical read_u32");
+        // SAFETY: construction proves the complete physical device remains
+        // live for this call, and `range` proves the native word is in it.
+        unsafe { (self.storage.as_ptr().add(start) as *const u32).read_unaligned() }
+    }
+
+    pub fn read_u16(&self, addr: RdramAddr) -> u16 {
+        assert!(
+            addr.offset().is_multiple_of(2),
+            "physical RDRAM u16 read at unaligned logical address {:#x}",
+            addr.offset()
+        );
+        let start = self.range(addr, 2, 2, "physical read_u16");
+        // SAFETY: construction proves the complete physical device remains
+        // live for this call, and `range` proves the native halfword is in it.
+        unsafe { (self.storage.as_ptr().add(start) as *const u16).read_unaligned() }
+    }
+
+    pub fn read_u8(&self, addr: RdramAddr) -> u8 {
+        let start = self.range(addr, 1, 3, "physical read_u8");
+        // SAFETY: construction proves the complete physical device remains
+        // live for this call, and `range` proves the byte is in it.
+        unsafe { *self.storage.as_ptr().add(start) }
+    }
+
+    /// Expose the quarantined pointer for a synchronous foreign renderer.
+    ///
+    /// # Safety
+    /// The callee must treat the allocation as read-only, must not retain or
+    /// access the pointer after the enclosing presentation call returns, and
+    /// must complete all worker access before returning to Rust.
+    pub unsafe fn as_mut_ptr(&self) -> *mut u8 {
+        self.storage.as_ptr()
+    }
+}
+
+/// Invoke one device operation with a bounded capability over the registered
+/// process RDRAM allocation, without constructing a competing Rust slice.
+///
+/// # Safety
+/// `storage` must identify an allocation of at least `allocation_len` live
+/// bytes. No other active execution may access that allocation until `use_it`
+/// returns. The process/executor contract supplies that exclusion only while
+/// a guest coroutine is suspended at a host device boundary.
+pub unsafe fn with_physical_rdram_read<R>(
+    storage: *mut u8,
+    allocation_len: usize,
+    use_it: impl for<'call> FnOnce(PhysicalRdramRead<'call>) -> R,
+) -> R {
+    assert!(
+        allocation_len >= DEFAULT_RDRAM_SIZE,
+        "registered RDRAM allocation length {allocation_len:#x} does not cover the required {DEFAULT_RDRAM_SIZE:#x}-byte physical device"
+    );
+    let storage = std::ptr::NonNull::new(storage)
+        .expect("registered physical RDRAM storage pointer must not be null");
+    use_it(PhysicalRdramRead {
+        storage,
+        _call: std::marker::PhantomData,
+        _not_send_or_sync: std::marker::PhantomData,
+    })
+}
+
 /// The KSEG0 base subtracted by every generated `MEM_*` macro. Per
 /// ABI-SURFACE.md section (c): "The subtraction of 0xFFFFFFFF80000000 (not
 /// 0x80000000) is deliberate 64-bit-safe translation math... correctly
@@ -555,6 +684,8 @@ impl Default for Rdram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static_assertions::assert_not_impl_any!(PhysicalRdramRead<'static>: Clone, Send, Sync);
 
     #[test]
     fn new_with_mmio_covers_the_real_crash_address() {

@@ -414,7 +414,7 @@ impl ViScanoutRegisters {
     }
 
     pub const fn origin(self) -> u32 {
-        self.words[1]
+        self.words[1] & 0x00ff_ffff
     }
 
     pub const fn width(self) -> u32 {
@@ -518,6 +518,74 @@ pub struct ViPresentation {
     /// the exact guest cycle of the VI retrace, so repeated runs agree while
     /// successive fields do not freeze gamma dither to the screen.
     pub noise_seed: u64,
+}
+
+/// Memory authority for one exact VI presentation boundary.
+///
+/// Integrated execution always supplies `Physical`. The compatibility form
+/// exists only for standalone backends whose presentation has no live VI
+/// register image; construction enforces that distinction so arbitrary live
+/// `VI_ORIGIN` bytes can never silently fall back to a resident host image.
+pub enum PresentMemory<'call> {
+    Physical(fn64_runtime::PhysicalRdramRead<'call>),
+    BackendResidentCompatibility,
+}
+
+/// Complete input to one renderer presentation.
+///
+/// Keeping memory and the fourteen-word VI image in one move-only request
+/// binds source bytes to the retrace that selected them. The physical-memory
+/// lifetime prevents a safe backend from retaining process RDRAM beyond this
+/// call.
+pub struct PresentRequest<'call> {
+    vi: ViPresentation,
+    memory: PresentMemory<'call>,
+}
+
+impl<'call> PresentRequest<'call> {
+    /// Integrated presentation with one complete live VI register image.
+    pub fn live(vi: ViPresentation, memory: fn64_runtime::PhysicalRdramRead<'call>) -> Self {
+        assert!(
+            matches!(vi.scanout, ViScanoutState::Registers(_)),
+            "live physical presentation requires complete VI registers"
+        );
+        Self {
+            vi,
+            memory: PresentMemory::Physical(memory),
+        }
+    }
+
+    /// Standalone physical-memory presentation using synthesized backend
+    /// geometry. This can drive behavior tests but is not live-register release
+    /// evidence.
+    pub fn physical_compatibility(
+        vi: ViPresentation,
+        memory: fn64_runtime::PhysicalRdramRead<'call>,
+    ) -> Self {
+        assert!(
+            matches!(vi.scanout, ViScanoutState::BackendOnly(_)),
+            "physical compatibility presentation cannot carry live VI registers"
+        );
+        Self {
+            vi,
+            memory: PresentMemory::Physical(memory),
+        }
+    }
+
+    pub fn backend_resident(vi: ViPresentation) -> Self {
+        assert!(
+            matches!(vi.scanout, ViScanoutState::BackendOnly(_)),
+            "backend-resident presentation cannot carry live VI registers"
+        );
+        Self {
+            vi,
+            memory: PresentMemory::BackendResidentCompatibility,
+        }
+    }
+
+    pub fn into_parts(self) -> (ViPresentation, PresentMemory<'call>) {
+        (self.vi, self.memory)
+    }
 }
 
 /// Position and byte layout of an image captured for release evidence.
@@ -709,6 +777,17 @@ pub enum RenderError {
         len: u32,
         rdram_len: usize,
     },
+    /// A live VI source image's checked physical footprint exceeds RDRAM.
+    InvalidViSourceBounds {
+        origin: u32,
+        stride_pixels: u32,
+        rows: u64,
+        bytes_per_pixel: u8,
+        rdram_len: usize,
+    },
+    /// The programmed VI origin cannot address complete pixels in the
+    /// selected memory format.
+    InvalidViSourceAlignment { origin: u32, bytes_per_pixel: u8 },
     /// `create`/`resize`/`present` was called in an order the backend does
     /// not support (e.g. `process_task` before `create`). Carries a short,
     /// backend-supplied reason so this doesn't degenerate into a bare
@@ -745,6 +824,23 @@ impl fmt::Display for RenderError {
             } => write!(
                 f,
                 "task output buffer [{offset:#010x}, +{len}) exceeds rdram length {rdram_len}"
+            ),
+            RenderError::InvalidViSourceBounds {
+                origin,
+                stride_pixels,
+                rows,
+                bytes_per_pixel,
+                rdram_len,
+            } => write!(
+                f,
+                "VI source origin {origin:#010x}, stride {stride_pixels} pixels, {rows} rows, and {bytes_per_pixel} bytes/pixel exceeds {rdram_len}-byte physical RDRAM"
+            ),
+            RenderError::InvalidViSourceAlignment {
+                origin,
+                bytes_per_pixel,
+            } => write!(
+                f,
+                "VI source origin {origin:#010x} is not aligned for {bytes_per_pixel}-byte pixels"
             ),
             RenderError::NotReady(reason) => write!(f, "backend not ready: {reason}"),
             RenderError::Backend { backend, reason } => {
@@ -931,7 +1027,7 @@ pub trait RenderBackend {
     /// tasks can render before one present, matching double/triple-buffering,
     /// and unchanged progressive fields still present with distinct cadence
     /// and retrace-seeded scanout noise.
-    fn present(&mut self, vi: ViPresentation) -> Result<(), RenderError>;
+    fn present(&mut self, request: PresentRequest<'_>) -> Result<(), RenderError>;
 
     /// Return the most recent completed renderer image for fixed-cycle
     /// release evidence. Ordinary rendering does not require this opt-in
@@ -1083,7 +1179,7 @@ mod tests {
             Ok(FrameStatus::Complete)
         }
 
-        fn present(&mut self, _vi: ViPresentation) -> Result<(), RenderError> {
+        fn present(&mut self, _request: PresentRequest<'_>) -> Result<(), RenderError> {
             if !self.ready {
                 return Err(RenderError::NotReady("create() not called"));
             }
@@ -1128,7 +1224,9 @@ mod tests {
             backend.identify_microcode(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]),
             None
         );
-        backend.present(ViPresentation::default()).unwrap();
+        backend
+            .present(PresentRequest::backend_resident(ViPresentation::default()))
+            .unwrap();
     }
 
     #[test]

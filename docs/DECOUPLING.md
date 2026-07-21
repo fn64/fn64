@@ -92,7 +92,7 @@ pub trait RenderBackend {
         task: &OsTask,
         output_addr: u32,
     ) -> Result<FrameStatus, RenderError>;
-    fn present(&mut self, vi: ViPresentation) -> Result<(), RenderError>;
+    fn present(&mut self, request: PresentRequest<'_>) -> Result<(), RenderError>;
     fn resize(&mut self, w: u32, h: u32);
     /// Which microcode GBIs this backend actually implements — a task using an
     /// unlisted ucode traps by name (no silent black frame).
@@ -107,13 +107,23 @@ same task cannot accidentally observe different banks. The backend still has
 no callback into runtime state: it receives exactly the two mutable memory
 resources the task can affect.
 
-`ViPresentation` carries V-blank-latched scanout state separately from RDP
-task execution. Its typed controls cover black, the public 10-bit fade factor,
-and first-line repetition. The reference backend keeps an RDP source image and
-a distinct presented image, so these effects never destroy the frame restored
-when they are disabled. The RT64 adapter passes those typed controls over its
-foreign boundary and realizes them with VI pixel type, zero vertical scale,
-and the 10-bit vertical subpixel offset; it does not rewrite the RDP image.
+`PresentRequest` co-binds `ViPresentation`'s V-blank-latched scanout state with
+a move-only `PhysicalRdramRead` capability for that exact retrace. Integrated
+execution creates the capability while the guest is suspended and without a
+competing Rust slice; its higher-ranked lifetime prevents a safe backend from
+retaining process memory. The `live` constructor requires `Registers`; explicit
+backend-resident and physical-memory compatibility constructors require
+`BackendOnly`, so neither can silently satisfy live `VI_ORIGIN` registers or
+produce authoritative release capture. The reference backend therefore keeps
+its RDP image and its RDRAM-derived presented image distinct, rereads
+RGBA16/RGBA32 source bytes on every field, and never destroys the RDP image
+while applying black, the public 10-bit fade factor, or first-line repetition.
+The RT64 adapter passes
+the same current allocation and typed controls over its foreign boundary,
+waits the native worker queues idle, restores placeholder RDRAM aliases before
+returning, and does not rewrite the RDP image during presentation. Native
+preflight bounds only the source rows selected by public coordinate arithmetic;
+the deterministic reference filter halo remains a separate policy.
 
 ### Adapter today: `fn64-render-rt64` (= the current `fn64-rt64` (→ `fn64-render-rt64`), renamed by role)
 

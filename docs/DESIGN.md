@@ -888,10 +888,24 @@ task calls out:
   Its post-VI allocation uses the public H start/end pixel extent and V
   start/end half-line extent independently of the RDP source dimensions; the
   same coordinate generators implement filtered modes and mode-3 replication.
-  RT64 also consumes the live VI origin and effective 12-bit source stride. The
-  deterministic reference path retains those words but still samples its
-  resident RDP framebuffer; arbitrary origin/stride RDRAM source selection is
-  therefore an explicit remaining implementation boundary, not a parity claim.
+  Presentation receives a move-only, retrace-scoped physical-RDRAM read
+  capability together with that register image. Integrated execution creates
+  the capability from the one registered process allocation only while the
+  guest coroutine is suspended, without manufacturing a Rust slice that would
+  alias the typed recompiler's dormant mutable view. The deterministic
+  reference path rereads the exact live 24-bit origin and effective 12-bit
+  stride on every field, decodes RGBA16 or RGBA32 in the generated-code storage
+  layout, and never substitutes its resident RDP framebuffer. Its checked fetch
+  envelope includes the vertical resampling sample and the largest active
+  restoration/coverage-AA row halo; an out-of-bounds footprint or an odd
+  RGBA16 origin is a named error. Inactive and blank images do not fetch source
+  bytes. Source decoding, hidden-coverage inference, the full VI pipeline, and
+  presentation state commit transactionally, leaving both the previous
+  presented image and the resident RDP framebuffer unchanged on failure.
+  RT64 receives the same current physical allocation and live VI origin/effective
+  stride for each presentation. Its Rust boundary validates only the rows
+  selected by public coordinate arithmetic; the reference-only filter halo is
+  not presented as evidence about RT64's internal or silicon bus fetches.
   Those mechanisms follow the
   public VI manual and the clean-room hardware descriptions in
   [US 6,166,748](https://patents.google.com/patent/US6166748A/en) and
@@ -909,6 +923,13 @@ task calls out:
   through its quarantined C boundary, compensates RT64's origin convention
   with the image's own source width and RGBA16/RGBA32 pixel size, and retains
   that image when later HLE/raw submissions or resizes refresh address aliases.
+  A scoped foreign binding installs the call's RDRAM pointer in RT64 Core and
+  State, waits both workload and presentation queues idle—including exception
+  exits—and restores placeholder aliases before the Rust capability ends.
+  Standalone backend-geometry compatibility remains available for behavior
+  fixtures, but the backend records that authority and refuses to emit a
+  fixed-cycle release capture until a complete live-register presentation has
+  succeeded.
   Black still disables pixel type, repeat-line uses zero Y scale, and fade uses
   zero Y scale plus the 10-bit Y subpixel offset without discarding the retained
   image. The no-device adapter capture proves the first and post-submission
@@ -953,7 +974,8 @@ task calls out:
   split register authority, but not the function lane's inability to suspend
   inside one generated function; tight timed-device polling still requires
   block-lane checkpoints. Both boot lanes pass the allocation length with its
-  pointer through one process-RDRAM registration seam; the executor, timed DMA
+  pointer through the public `register_process_rdram` seam (also invoked by
+  `boot_thread0`); the executor, timed DMA
   paths, and RSP HLE/LLE task runners therefore share one explicit bounds
   authority. Re-registering the identical pointer/length is idempotent;
   replacing a live allocation traps because retained device/task authority may

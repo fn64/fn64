@@ -441,7 +441,19 @@ unsafe fn dispatch_gfx_task_chunk(
 /// closes the second half of `RenderBackend` without exposing RT64 or any
 /// foreign type outside `fn64-render-rt64`.
 pub(crate) fn present_render_backend(vi: fn64_render::ViPresentation) {
-    with_render_backend("present_render_backend", |backend| backend.present(vi));
+    let (rdram, allocation_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+    // SAFETY: every retrace presentation runs after device commit and before
+    // any guest coroutine resumes. The boot contract keeps this one process
+    // allocation live, while the higher-ranked capability prevents a backend
+    // from retaining it beyond the call. No competing Rust slice is created:
+    // typed recompiled execution may retain its dormant checked RDRAM borrow.
+    unsafe {
+        fn64_runtime::with_physical_rdram_read(rdram, allocation_len, |memory| {
+            with_render_backend("present_render_backend", |backend| {
+                backend.present(fn64_render::PresentRequest::live(vi, memory))
+            })
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1958,10 +1970,11 @@ pub fn last_audio_error() -> Option<String> {
 }
 
 /// Register the graphics backend `osSpTaskStartGo_recomp` dispatches
-/// `M_GFXTASK` submissions to, and the rdram buffer length it may safely
-/// read (`rdram_len` must match the actual backing buffer's size -- a
-/// mismatch here is a caller bug, not something this function can check
-/// given it only stores a length, not the buffer itself). Mirrors
+/// `M_GFXTASK` submissions to, and the RDRAM buffer length it may safely
+/// read. The host must separately call [`crate::register_process_rdram`] (or
+/// [`crate::boot_thread0`], which performs that registration) before the
+/// first VI retrace. `rdram_len` must match that allocation's size; a mismatch
+/// is a caller bug. Mirrors
 /// `set_audio_ucode_fn`'s "the shell wires this once at startup" shape,
 /// generalized to a trait object since a graphics backend is stateful
 /// (unlike a single ucode function pointer). This compatibility entry point
@@ -2749,7 +2762,10 @@ mod tests {
             }
         }
 
-        fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), RenderError> {
             Ok(())
         }
 
@@ -2783,7 +2799,10 @@ mod tests {
             Ok(FrameStatus::Complete)
         }
 
-        fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), RenderError> {
             Ok(())
         }
 
@@ -2844,7 +2863,10 @@ mod tests {
                 Ok(FrameStatus::Complete)
             }
 
-            fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
                 Ok(())
             }
 
@@ -2952,7 +2974,10 @@ mod tests {
                 Ok(FrameStatus::Complete)
             }
 
-            fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
                 Ok(())
             }
 
@@ -3069,7 +3094,10 @@ mod tests {
                 Ok(FrameStatus::Complete)
             }
 
-            fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
                 Ok(())
             }
 
@@ -3190,7 +3218,10 @@ mod tests {
                 fn64_render::DpFullSyncStatus::NotReached
             }
 
-            fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
                 Ok(())
             }
 
@@ -3963,7 +3994,10 @@ mod tests {
                 Ok(FrameStatus::Complete)
             }
 
-            fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
                 Ok(())
             }
 
@@ -4179,7 +4213,10 @@ mod tests {
                 Ok(FrameStatus::Complete)
             }
 
-            fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
                 Ok(())
             }
 
@@ -4343,7 +4380,10 @@ mod tests {
                 Ok(FrameStatus::Complete)
             }
 
-            fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
                 Ok(())
             }
 
@@ -5027,7 +5067,10 @@ mod tests {
                 })
             }
 
-            fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
                 Ok(())
             }
 
@@ -5159,7 +5202,10 @@ mod tests {
                 fn64_render::DpFullSyncStatus::NotReached
             }
 
-            fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
                 Ok(())
             }
 

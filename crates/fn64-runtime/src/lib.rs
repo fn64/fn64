@@ -69,7 +69,10 @@ pub use pfs::{
     ControllerPak, ControllerPakBankCount, ControllerPakEvidenceSnapshot, PfsError, PfsKey,
     PfsNoteEvidenceSnapshot, PfsState,
 };
-pub use rdram::{Rdram, RdramAddr, RdramPtr, RdramView, RdramViewMut};
+pub use rdram::{
+    with_physical_rdram_read, PhysicalRdramRead, Rdram, RdramAddr, RdramPtr, RdramView,
+    RdramViewMut,
+};
 pub use rom::{
     DmaCompletion, DmaMemory, InMemoryRom, PendingEepromWriteSnapshot, PiDma, PiDmaError,
     RomStorage,
