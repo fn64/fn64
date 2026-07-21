@@ -2403,19 +2403,14 @@ fn load_tile_into_tmem(
     let raw_source_y = (w0 & 0x0fff) as usize;
     let raw_high_x = ((w1 >> 12) & 0x0fff) as usize;
     let raw_high_y = (w1 & 0x0fff) as usize;
-    // SGI RDP Command Summary Table 7 calls out equal L/H fractions as the
-    // supported subpixel-offset form. Their integer parts select the DRAM
-    // texels while the raw quarters remain in the tile descriptor.
-    assert_eq!(
-        raw_source_x & 3,
-        raw_high_x & 3,
-        "G_LOADTILE S bounds use different fractional quarters; hardware edge selection is not yet verified"
-    );
-    assert_eq!(
-        raw_source_y & 3,
-        raw_high_y & 3,
-        "G_LOADTILE T bounds use different fractional quarters; hardware edge selection is not yet verified"
-    );
+    // SGI RDP Command Summary Table 7 gives the bounds as 10.2 texel
+    // coordinates whose INTEGER parts select the DRAM texels the load
+    // iterates (SL..=SH, TL..=TH inclusive); the raw quarters remain in the
+    // tile descriptor. A previous revision trapped when the L/H fractional
+    // quarters differed, but real streams carry mismatched fractions --
+    // F3DLX xbus 2.08 (WM2000's second per-frame gfx task) emits
+    // G_LOADTILE with SL frac 2 / SH frac 0 -- and the load DMA consumes
+    // only the floored texel indices either way.
     let source_x = raw_source_x / 4;
     let source_y = raw_source_y / 4;
     let high_x = raw_high_x / 4;
@@ -9703,9 +9698,15 @@ mod tests {
         assert_eq!(texture.sample(2.25, 0.5), [30, 30, 30, 30]);
     }
 
+    /// Unequal L/H fractional quarters no longer trap: the load DMA
+    /// consumes only the floored 10.2 integer texel indices (Command
+    /// Summary Table 7), and real streams carry mismatched fractions
+    /// (F3DLX xbus 2.08 emits SL frac 2 / SH frac 0). Both bounds floor
+    /// to texel 0 here, so exactly one texel is loaded.
     #[test]
-    #[should_panic(expected = "different fractional quarters")]
-    fn load_tile_rejects_unverified_unequal_fractional_edges_by_name() {
+    fn load_tile_floors_unequal_fractional_edges() {
+        let mut rdram = vec![0u8; 8];
+        wr_u8(&mut rdram, 0, 0x5a);
         let mut tex = TexState {
             timg_addr: 0,
             timg_fmt: G_IM_FMT_I,
@@ -9720,13 +9721,16 @@ mod tests {
             ..Default::default()
         };
         load_tile_into_tmem(
-            &[0; 8],
+            &rdram,
             &mut tex,
             &[0; 16],
             0,
             (u32::from(G_LOADTILE) << 24) | 1,
             2,
         );
+        let texture = bind_texture_set(&tex, 0, 0, 0).expect("floored tile must bind");
+        // I8 replicates intensity into alpha.
+        assert_eq!(texture.sample(0.25, 0.25), [0x5a; 4]);
     }
 
     #[test]
