@@ -1089,7 +1089,11 @@ impl Executor {
                             thread.set_state(ThreadState::BlockedOnRecv);
                         }
                         self.record_queue_op(mq_addr, QueueOpKind::Block, id);
-                        self.queue_mut(mq_addr).block_receiver(id);
+                        // Park in PRIORITY order (libultra __osEnqueueThread;
+                        // see mesgqueue.rs `BlockedList`'s doc for the WM2000
+                        // grant-crossover this fixes).
+                        let pri = self.thread_pri(id);
+                        self.queue_mut(mq_addr).block_receiver(id, pri);
                     }
                     RecvOutcome::Blocked => {
                         // OS_MESG_NOBLOCK on an empty queue: never parked,
@@ -1137,7 +1141,9 @@ impl Executor {
                             thread.set_state(ThreadState::BlockedOnSend);
                         }
                         self.record_queue_op(mq_addr, QueueOpKind::Block, id);
-                        self.queue_mut(mq_addr).block_sender(id, msg);
+                        // Priority-ordered park, same as the recv side.
+                        let pri = self.thread_pri(id);
+                        self.queue_mut(mq_addr).block_sender(id, pri, msg);
                     }
                     SendOutcome::Blocked => {
                         // OS_MESG_NOBLOCK on a full queue: dropped, never

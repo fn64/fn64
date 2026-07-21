@@ -30,26 +30,63 @@ pub type CoroutineId = crate::trace::ThreadId;
 /// meaning.
 pub type Mesg = u32;
 
+/// A blocked waiter's thread priority, captured at the moment it parks.
+/// Same type as the executor's `thread::Priority` (`i32`), kept as a plain
+/// alias so this module stays executor-independent.
+pub type WaiterPriority = i32;
+
 /// The blocked-list a queue's `blocked_on_recv`/`blocked_on_send` fields
 /// represent. Deliberately NOT a raw pointer or sentinel value — see the
 /// module doc above for why that shape (the real ROM's own struct layout,
 /// mirrored by a raw host pointer) was the rung-12 failure mode.
+///
+/// PRIORITY-ordered, not arrival-ordered (2026-07-21 correction): libultra
+/// parks a blocking `osRecvMesg`/`osSendMesg` caller with
+/// `__osEnqueueThread(&mq->mtqueue, thread)`, which inserts sorted by
+/// thread priority (descending, AFTER existing equal-priority threads),
+/// and `osSendMesg`/`osRecvMesg` wake with `__osPopThread` = "take the
+/// head" = the highest-priority waiter. Arrival order only breaks ties.
+/// WM2000 (NWXE) boot deadlocks without this: its gfx runner (guest thread
+/// 17, pri 0x64) and audio runner (thread 18, pri 0x6E) both block on ONE
+/// shared OS_EVENT_SP queue (rdram 0x52320), and the audio runner's
+/// yield-handshake (funcs_0.c `func_80001024`: osSpTaskYield, then recv the
+/// yield-done, kick audio, then recv the audio-done) is only correct
+/// because every SP-done that arrives while BOTH are parked wakes the
+/// HIGHER-priority audio runner first. Arrival-FIFO handed the audio-done
+/// to the longer-parked gfx runner instead — the grant crossover that froze
+/// boot at 3 gfx frames.
 #[derive(Default)]
 struct BlockedList {
-    waiters: Vec<CoroutineId>,
+    waiters: Vec<(CoroutineId, WaiterPriority)>,
+}
+
+/// `__osEnqueueThread`'s insertion rule: before the first strictly-lower-
+/// priority entry, after all equal-or-higher ones (stable FIFO among
+/// equals). Shared by both blocked lists.
+fn priority_insert_index<T>(
+    waiters: &[T],
+    pri_of: impl Fn(&T) -> WaiterPriority,
+    pri: WaiterPriority,
+) -> usize {
+    waiters
+        .iter()
+        .position(|w| pri_of(w) < pri)
+        .unwrap_or(waiters.len())
 }
 
 impl BlockedList {
-    fn push(&mut self, id: CoroutineId) {
-        self.waiters.push(id);
+    fn push(&mut self, id: CoroutineId, pri: WaiterPriority) {
+        let idx = priority_insert_index(&self.waiters, |w| w.1, pri);
+        self.waiters.insert(idx, (id, pri));
     }
 
-    /// FIFO pop, matching libultra's documented per-queue delivery order.
+    /// Pop the highest-priority waiter (list head; see the type doc for why
+    /// this is priority order, with arrival order only among equals).
     fn pop(&mut self) -> Option<CoroutineId> {
         if self.waiters.is_empty() {
             None
         } else {
-            Some(self.waiters.remove(0))
+            Some(self.waiters.remove(0).0)
         }
     }
 
@@ -58,9 +95,9 @@ impl BlockedList {
     }
 }
 
-/// Same FIFO shape as `BlockedList`, but for blocked SENDERS: a blocked
-/// sender is waiting to hand off a specific `Mesg` payload, not just an
-/// identity, so the queue must remember what to actually enqueue once a
+/// Same priority-ordered shape as `BlockedList`, but for blocked SENDERS: a
+/// blocked sender is waiting to hand off a specific `Mesg` payload, not just
+/// an identity, so the queue must remember what to actually enqueue once a
 /// slot frees. Fixes a real bug this session's OoT boot run hit: the
 /// previous `BlockedList`-based sender queue woke a blocked sender with
 /// `Resume::SendUnblocked` (see `executor.rs`'s `try_deliver_recv`) with NO
@@ -74,20 +111,22 @@ impl BlockedList {
 /// index.
 #[derive(Default)]
 struct BlockedSenderList {
-    waiters: Vec<(CoroutineId, Mesg)>,
+    waiters: Vec<(CoroutineId, WaiterPriority, Mesg)>,
 }
 
 impl BlockedSenderList {
-    fn push(&mut self, id: CoroutineId, msg: Mesg) {
-        self.waiters.push((id, msg));
+    fn push(&mut self, id: CoroutineId, pri: WaiterPriority, msg: Mesg) {
+        let idx = priority_insert_index(&self.waiters, |w| w.1, pri);
+        self.waiters.insert(idx, (id, pri, msg));
     }
 
-    /// FIFO pop, matching libultra's documented per-queue delivery order.
+    /// Pop the highest-priority blocked sender (see `BlockedList::pop`).
     fn pop(&mut self) -> Option<(CoroutineId, Mesg)> {
         if self.waiters.is_empty() {
             None
         } else {
-            Some(self.waiters.remove(0))
+            let (id, _pri, msg) = self.waiters.remove(0);
+            Some((id, msg))
         }
     }
 
@@ -238,13 +277,15 @@ impl MesgQueue {
     /// `try_send` returns `WouldBlock`, immediately before yielding to the
     /// executor -- see module doc: registration and yield are sequential
     /// steps on the one executor thread, never two threads racing this
-    /// list.
-    pub fn block_sender(&mut self, id: CoroutineId, msg: Mesg) {
-        self.blocked_on_send.push(id, msg);
+    /// list. `pri` is the blocking thread's priority AT PARK TIME
+    /// (`__osEnqueueThread` sorts by it; see `BlockedList`'s doc).
+    pub fn block_sender(&mut self, id: CoroutineId, pri: WaiterPriority, msg: Mesg) {
+        self.blocked_on_send.push(id, pri, msg);
     }
 
-    pub fn block_receiver(&mut self, id: CoroutineId) {
-        self.blocked_on_recv.push(id);
+    /// See `block_sender` for the `pri` contract.
+    pub fn block_receiver(&mut self, id: CoroutineId, pri: WaiterPriority) {
+        self.blocked_on_recv.push(id, pri);
     }
 
     /// Called by the executor after a `try_recv` succeeds (freeing a slot),
@@ -312,7 +353,7 @@ mod tests {
         let mut q = MesgQueue::new(1);
         assert_eq!(q.try_send(1), SendResult::Delivered);
         assert_eq!(q.try_send(2), SendResult::WouldBlock);
-        q.block_sender(42, 2);
+        q.block_sender(42, 10, 2);
         assert!(q.has_blocked_senders());
 
         // Executor's job: a recv frees a slot, then wake a blocked sender.
@@ -342,6 +383,57 @@ mod tests {
         assert_eq!(full.try_jam(2), SendResult::WouldBlock);
     }
 
+    /// The WM2000 grant-crossover regression, at the list level: the wake
+    /// order of blocked receivers is THREAD PRIORITY (highest first), with
+    /// arrival order only breaking ties -- `__osEnqueueThread`/`__osPopThread`
+    /// semantics, NOT arrival-FIFO. The deadlock shape: the gfx runner
+    /// (pri 0x64) parks first and the audio runner (pri 0x6E) parks second
+    /// on the same OS_EVENT_SP queue; the SP-done must wake the audio
+    /// runner. Arrival-FIFO woke the gfx runner and froze boot at 3 frames.
+    #[test]
+    fn blocked_receivers_wake_in_priority_order_not_arrival_order() {
+        let mut q = MesgQueue::new(8);
+        q.block_receiver(17, 0x64); // gfx runner parks FIRST, lower pri
+        q.block_receiver(18, 0x6E); // audio runner parks second, higher pri
+        assert_eq!(
+            q.wake_one_receiver(),
+            Some(18),
+            "the higher-priority waiter must be woken first even though it \
+             parked later (libultra __osPopThread on a priority-sorted queue)"
+        );
+        assert_eq!(q.wake_one_receiver(), Some(17));
+        assert_eq!(q.wake_one_receiver(), None);
+    }
+
+    /// Equal priorities keep arrival order (`__osEnqueueThread` inserts
+    /// AFTER existing equal-priority threads), and blocked senders follow
+    /// the same priority rule as receivers.
+    #[test]
+    fn equal_priority_waiters_keep_fifo_and_senders_sort_by_priority_too() {
+        let mut q = MesgQueue::new(8);
+        q.block_receiver(1, 10);
+        q.block_receiver(2, 10);
+        q.block_receiver(3, 10);
+        assert_eq!(q.wake_one_receiver(), Some(1));
+        assert_eq!(q.wake_one_receiver(), Some(2));
+        assert_eq!(q.wake_one_receiver(), Some(3));
+
+        let mut full = MesgQueue::new(1);
+        assert_eq!(full.try_send(0xAA), SendResult::Delivered);
+        full.block_sender(40, 5, 0x1111); // parks first, low pri
+        full.block_sender(41, 20, 0x2222); // parks second, high pri
+        assert_eq!(full.try_recv(), RecvResult::Delivered(0xAA));
+        assert_eq!(
+            full.wake_one_sender(),
+            Some(41),
+            "higher-priority blocked sender must be woken first"
+        );
+        // Its message really landed; the lower-pri sender is still parked.
+        assert_eq!(full.try_recv(), RecvResult::Delivered(0x2222));
+        assert_eq!(full.wake_one_sender(), Some(40));
+        assert_eq!(full.try_recv(), RecvResult::Delivered(0x1111));
+    }
+
     /// The bug this session's OoT boot run actually hit: a blocked
     /// sender's message must be REALLY delivered into the queue, not just
     /// have its coroutine woken -- a later recv must see it, not stale/
@@ -351,7 +443,7 @@ mod tests {
         let mut q = MesgQueue::new(1);
         assert_eq!(q.try_send(0xAAAA), SendResult::Delivered);
         assert_eq!(q.try_send(0xBBBB), SendResult::WouldBlock);
-        q.block_sender(7, 0xBBBB);
+        q.block_sender(7, 10, 0xBBBB);
 
         // First recv drains the original message and wakes the blocked
         // sender, which must land ITS message (0xBBBB) into the queue.
