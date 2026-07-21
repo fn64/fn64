@@ -1000,14 +1000,23 @@ task calls out:
   twenty complete register phases over one workload at nondefault 8x6 active
   geometry: off-state restorations are byte-identical, gamma and 1.5x X/Y
   scale causally change exact pixels, and every present identity advances.
-  Gamma dither and coverage-gated horizontal divot are now causal and
-  restorable in the native VI shader; the divot gate proves that three
-  full-coverage control rows stay unchanged while nine pixels in three
-  otherwise identical non-full rows change to the exact componentwise median
-  over RT64's modulo-eight framebuffer-alpha coverage estimate. RGBA16 dither
-  restoration and the four AA selectors stay
-  exact pixel-inert native residuals. MSAA/downsample coverage semantics are
-  uncertified and bounded; silicon/analog parity remains explicitly bounded. A typed IPL television
+  Gamma dither, coverage-gated horizontal divot, and full-coverage RGBA16
+  dither restoration are causal and restorable in the native VI shader. The
+  divot gate proves that three full-coverage control rows stay unchanged while
+  exactly twelve eligible pixels in the otherwise identical non-full rows
+  change to the exact componentwise median over RT64's modulo-eight
+  framebuffer-alpha coverage estimate. The restoration gate applies the
+  shared signed available-neighbor 3x3 formula: exactly eighteen eligible
+  full-coverage pixels change, all twenty-four non-full pixels and six flat
+  full-coverage controls stay byte-identical, and alpha is preserved. This
+  restoration claim is limited to clean pinned Metal with nearest host
+  filtering, native scale, progressive scanout, and the synthetic RGBA16
+  fixture. Managed-target per-pixel dither history and complete coverage,
+  linear and anti-aliased-pixel-scaling filtering, enhancement resolution,
+  MSAA/downsample behavior, D3D12, Vulkan, and representative full-ROM
+  presentation remain uncertified. The four AA selectors are the fixture's
+  only exact pixel-inert native filter residual. Silicon and analog parity
+  remain explicitly bounded. A typed IPL television
   standard is the common VI/AI clock authority. Before a mode exists, VI uses the public
   nominal 60 Hz NTSC/MPAL or 50 Hz PAL rate; once H_SYNC and V_SYNC are
   nonzero, their public line/half-line units derive the next guest-cycle field
@@ -1015,8 +1024,8 @@ task calls out:
   every injection point, so a latched mode changes the next deadline. This
   formula is clean-room derived from public register definitions and has not
   yet been checked against a hardware timing trace. Exact VI random-stream
-  identity, native implementation of the pixel-inert filter residuals, and
-  physical-console filter capture remain open.
+  identity, native AA-selector behavior, broader native restoration coverage,
+  and physical-console filter capture remain open.
   In the block
   lane, raw MI mask commands and RCP completion drive CPU IP2; the next
   instruction boundary applies the

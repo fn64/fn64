@@ -20,7 +20,7 @@ namespace interop {
         uint divot;
         uint coverageRange;
         uint filtering;
-        uint reserved;
+        uint ditherFilter;
     };
 #ifdef HLSL_CPU
 };

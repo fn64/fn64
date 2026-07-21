@@ -350,19 +350,27 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
   representative private exact-ten PAL/MPAL series has yet been retained;
   physical compositor cadence, field timing, and analog PAL output remain
   outside this closure.
-- **Native VI pixel observation and bounded gamma dither — closed; other
-  native filter residuals remain.** A twenty-phase live Metal gate keeps one
+- **Native VI pixel observation, bounded gamma dither, divot, and RGBA16
+  restoration — closed at the pinned fixture; AA-selector output remains.**
+  A twenty-phase live Metal gate keeps one
   completed workload, strictly advances presents, captures exact nondefault
   8x6 BGRA8 output, and restores baseline/gamma phases byte-for-byte. Gamma,
   seeded gamma dither, and nonidentity X/Y scale change exact pixels. Repeating
   an identical dither seed reproduces exact pixels across a distinct present;
   changing only the seed changes them. The exact-source overlay mirrors fn64's
-  named bounded-v1 stream in pinned RT64's final VI shader. Divot, RGBA16
-  dither restoration, and all four AA selectors remain pixel-inert because
-  their public mechanisms require source-neighborhood or coverage state not
-  yet carried to that shader. Native equalities name port work and prevent an
-  accidental parity claim; native gamma-dither evidence still does not prove
-  the silicon random stream, DAC output, or analog video.
+  named bounded-v1 stream in pinned RT64's final VI shader. Coverage-gated
+  divot now makes twelve exact componentwise-median changes and restores
+  exactly. RGBA16 `DITHER_FILTER` performs the signed comparison against every
+  available 3x3 neighbor and preserves alpha: eighteen eligible full-coverage
+  pixels change exactly, twenty-four non-full pixels remain unchanged, and six
+  flat full-coverage controls remain unchanged. AA-selector output is the only
+  named pixel-inert native residual. This closure is bounded to pinned Metal,
+  nearest filtering, native scale, and progressive synthetic RGBA16 input.
+  RT64's managed target does not retain authoritative RGBA16 storage or RDP
+  dither history, and its alpha supplies only the native coverage estimate;
+  other filtering/scaling modes, MSAA/downsample behavior, other graphics
+  APIs, full-ROM coverage, silicon behavior and random-stream identity, DAC
+  output, and analog video remain unproven.
 
 ---
 

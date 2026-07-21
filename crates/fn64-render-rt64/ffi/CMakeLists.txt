@@ -145,6 +145,8 @@ set(FN64_RT64_VI_CONSTANTS_PATCHED [=[        interop::VideoInterfaceCB pushCons
         pushConstants.coverageRange =
             (p.textureFormat == RenderFormat::R16G16B16A16_UNORM) ? 65535U : 255U;
         pushConstants.filtering = uint32_t(p.filtering);
+        pushConstants.ditherFilter =
+            ((p.vi->status.type == VI_STATUS_TYPE_16_BIT) && p.vi->status.ditherFilter) ? 1U : 0U;
         pushConstants.outputOriginX = uint32_t(std::max(0L, lround(viewport.x)));
         pushConstants.outputOriginY = uint32_t(std::max(0L, lround(viewport.y)));
         pushConstants.outputWidth = uint32_t(std::max(1L, lround(viewport.width)));

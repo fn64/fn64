@@ -1796,6 +1796,14 @@ fn raw_vi(vi: ViPresentation) -> Result<RawVi, String> {
     })
 }
 
+fn validate_native_vi_filters(vi: &ViPresentation) -> Result<(), String> {
+    let filters = vi.scanout.filters();
+    if filters.dither_filter && filters.pixel_type == ViPixelType::Rgba32 {
+        return Err("VI dither restoration requires an RGBA16 scanout image".into());
+    }
+    Ok(())
+}
+
 unsafe extern "C" {
     fn fn64_rt64_roundtrip_user_config(
         input: *const RawUserConfig,
@@ -2674,6 +2682,7 @@ impl Context {
         vi: ViPresentation,
     ) -> Result<(), String> {
         let mut error = [0; ERROR_CAPACITY];
+        validate_native_vi_filters(&vi)?;
         let vi = raw_vi(vi)?;
         // SAFETY: the opaque context is alive and uniquely borrowed. The
         // call-scoped physical capability proves the exact 8 MiB allocation
@@ -3773,6 +3782,26 @@ mod tests {
     }
 
     #[test]
+    fn vi_wire_rejects_rgba32_dither_restoration_by_name() {
+        let vi = ViPresentation {
+            scanout: ViScanoutState::BackendOnly(fn64_render::ViFilterControl {
+                pixel_type: ViPixelType::Rgba32,
+                dither_filter: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = match validate_native_vi_filters(&vi) {
+            Ok(()) => panic!("RGBA32 dither restoration entered native presentation"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "VI dither restoration requires an RGBA16 scanout image"
+        );
+    }
+
+    #[test]
     fn vi_wire_preserves_the_complete_noise_seed() {
         for noise_seed in [0, 0x0123_4567_89ab_cdef, u64::MAX] {
             let vi = ViPresentation {
@@ -3918,9 +3947,9 @@ mod tests {
         assert!(cmake.contains("9b3cf39bb15fc0c7d52085566197042f4960cc410b241e38457bb817f2501e5b"));
         assert!(cmake.contains("fn64_rt64_nominal_full_rate(this)"));
         let expected_overlay = if cfg!(feature = "hfr-evidence") {
-            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-divot:v1+vi-retrace-cadence:v1+hfr-post-present-call:v1"
+            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-retrace-cadence:v1+hfr-post-present-call:v1"
         } else {
-            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-divot:v1+vi-retrace-cadence:v1"
+            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-retrace-cadence:v1"
         };
         assert_eq!(env!("FN64_RT64_SOURCE_OVERLAY_ID"), expected_overlay);
     }
