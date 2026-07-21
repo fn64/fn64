@@ -85,6 +85,20 @@ gate_decomp_functions
 No tables/claims files — the AKI boot banks are KSEG0-affine and run bare
 apart from the donor.
 
+### Optional extension: VPW2 as a second donor (local-only)
+
+jessetbh's AKI recompilation projects on GitHub carry gameplay-validated
+N64Recomp symbol keys in the same `syms/dump.toml` format. Adding the VPW2
+key as a second donor (`<vpw2-recomp checkout>/syms/dump.toml` paired with a
+VPW2 .z64) raises NWXE to 729/847 (86.1%) and NW4E to 834/985 (84.7%), both
+wrong=0. Those repos ship NO license, so their keys must not be vendored
+into this repo — the extension is a local-checkout configuration only, which
+is why the canonical (reproducible-from-corpus) grades above use the mutual
+pair alone. Measured negative results, for the record: the WCW World Tour
+key contributes 0 roots (engine too divergent), and the WCW Revenge key
+introduces wrong=2 on both games (interior signature collisions) — do not
+add Revenge as a donor.
+
 ## Expected grades (main @ cross-donor adoption)
 
 | Game | matched_exact / total | wrong |
