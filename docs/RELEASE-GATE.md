@@ -760,6 +760,16 @@ runner-derived event identities must equal the matrix evidence. It retains
 `fn64.verified-rom-class-authority.v1`; duplicate, unused, relabeled, or
 receipt-detached authorities fail closed. The retained authority digest is
 local integrity evidence, not a signature or transferable process attestation.
+The Unix test `exported_private_series_matrix_path_admits_public_fixture_and_rejects_tamper`
+exercises that exported path end to end with a generated, non-game public
+homebrew-shaped fixture: the repository Python policy emits the production
+contract, a typed-block build receipt binds the child, the trusted runner
+retains ten fresh processes, and the opaque series earns only its exact
+fixture ROM-class row. Reordered supplied run events and a changed retained
+report both fail. The child's schema-v19 report template makes this authority-
+plumbing evidence, not representative-ROM, runtime, renderer, or microcode
+behavioral evidence; its `Other` microcode identity cannot enter the empty
+certified-public-microcode catalog.
 Schema v19 still cannot expose exact Windows OS
 version, platform case results, or blocker closure. Valid v19 evidence
 therefore returns a typed `Incomplete` assessment listing the exact

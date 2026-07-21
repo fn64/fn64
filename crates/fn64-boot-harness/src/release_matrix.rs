@@ -2893,6 +2893,51 @@ mod tests {
         ArtifactKind, ClosurePath, ClosurePathStatus, FixedCycleDigestGate, LiveRenderEvidence,
         RenderPixelFormat, RspRdpObservationEventEvidence, LIVE_MINIMUM_CLOSURE_PATHS,
     };
+    #[cfg(unix)]
+    use crate::{
+        load_private_release_run_contract, materialize_release_program_build_receipt,
+        parse_unsupported_journal, run_private_release_series, verify_private_release_series,
+        ReleaseProgramBuildReceiptInput,
+    };
+    #[cfg(unix)]
+    use std::{
+        fs,
+        io::Write as _,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    #[cfg(unix)]
+    static PRODUCTION_MATRIX_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    struct ProductionMatrixFixtureDirectory(PathBuf);
+
+    #[cfg(unix)]
+    impl ProductionMatrixFixtureDirectory {
+        fn new() -> Self {
+            let counter = PRODUCTION_MATRIX_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let base = if Path::new("/private/tmp").is_dir() {
+                PathBuf::from("/private/tmp")
+            } else {
+                std::env::temp_dir()
+            };
+            let path = base.join(format!(
+                "fn64-production-matrix-fixture-{}-{counter}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProductionMatrixFixtureDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     const CLEAN_RT64_IDENTITY: &str = concat!(
         "adapter=fn64-render-rt64/rt64;adapter_sha256=",
@@ -3338,6 +3383,271 @@ mod tests {
         };
         authority.authority_sha256 = authority.recompute_authority_sha256();
         authority
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exported_private_series_matrix_path_admits_public_fixture_and_rejects_tamper() {
+        const REPORT_SCENARIO: &str = "public-homebrew-production-matrix-mechanism-v1";
+        const CHILD_FIXTURE: &str = "private_release_series::tests::fresh_child_fixture";
+        const CHILD_ENABLE_ENV: &str = "FN64_TEST_RELEASE_CHILD";
+        const CHILD_TEMPLATE_ENV: &str = "FN64_TEST_RELEASE_TEMPLATE";
+
+        let directory = ProductionMatrixFixtureDirectory::new();
+        let manifest_path = directory.0.join("admission-manifest.json");
+        let readiness_path = directory.0.join("readiness.json");
+        let contract_path = directory.0.join("contract.json");
+        let receipt_path = directory.0.join("program-build-receipt.json");
+        let report_template_path = directory.0.join("report-template.json");
+        let rom_path = directory.0.join("public-homebrew-fixture.z64");
+        let text_path = directory.0.join("microcode-text.bin");
+        let data_path = directory.0.join("microcode-data.bin");
+        let recompiled_path = directory.0.join("typed-block-pack.bin");
+        let series_path = directory.0.join("series");
+
+        // This generated file is a public, non-game homebrew-shaped fixture.
+        // It tests the production authority path; it is not representative-ROM
+        // or runtime/microcode behavioral evidence.
+        let mut rom_bytes = vec![0u8; 0x1000];
+        rom_bytes[..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        rom_bytes[0x20..0x34].copy_from_slice(b"FN64 MATRIX FIXTURE ");
+        rom_bytes[0x3b..0x3f].copy_from_slice(b"NF6E");
+        fs::write(&rom_path, &rom_bytes).unwrap();
+        fs::write(&text_path, vec![0x5a; fn64_runtime::RSP_MEMORY_BANK_SIZE]).unwrap();
+        fs::write(&data_path, b"fn64 public matrix fixture task data").unwrap();
+        fs::write(
+            &recompiled_path,
+            b"fn64 public matrix fixture typed-block pack",
+        )
+        .unwrap();
+
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let program_sha256 = hex(&Sha256::digest(
+            b"fn64 public matrix fixture typed-block program v1",
+        ));
+        let materialized = materialize_release_program_build_receipt(
+            &receipt_path,
+            &executable,
+            ReleaseProgramBuildReceiptInput::TypedBlock {
+                pack: recompiled_path.clone(),
+                expected_program_sha256: program_sha256,
+            },
+        )
+        .unwrap();
+        let source = materialized.execution_source;
+        let recompiled_sha256 = hex(&Sha256::digest(fs::read(&recompiled_path).unwrap()));
+        let text_sha256 = hex(&Sha256::digest(fs::read(&text_path).unwrap()));
+        let data_bytes = fs::metadata(&data_path).unwrap().len() as u32;
+        let data_sha256 = hex(&Sha256::digest(fs::read(&data_path).unwrap()));
+
+        let mut report = closed_report(
+            REPORT_SCENARIO,
+            &rom_bytes,
+            0xd6,
+            "save.sram-operation",
+            CLEAN_RT64_IDENTITY,
+            Some(ProgramFeature::TypedBlock),
+        );
+        let (platform, platform_wire) = if cfg!(target_os = "macos") {
+            (ReleaseHostPlatform::MacosArm64, "macos_arm64")
+        } else {
+            (ReleaseHostPlatform::LinuxX86_64, "linux_x86_64")
+        };
+        report.environment.platform = platform;
+        report.execution_destinations = ExecutionDestinationEvidence::from_ordered(
+            source.clone(),
+            vec![crate::ExecutionDestinationEventEvidence {
+                guest_cycle: None,
+                destination: crate::ReleaseExecutionDestination::TypedBlock {
+                    bank: 1,
+                    pc: 0x8000_1000,
+                    runner_artifact_sha256: recompiled_sha256.clone(),
+                },
+            }],
+        )
+        .unwrap();
+        report.rom = Some(
+            ReleaseRomEvidence::from_bytes(
+                &rom_bytes,
+                ReleaseRomClass::PublicHomebrew,
+                fn64_runtime::TvType::Ntsc,
+            )
+            .unwrap(),
+        );
+        report.rsp_rdp = RspRdpEvidence::from_ordered(vec![RspRdpObservationEventEvidence {
+            guest_cycle: 42,
+            observation: RspRdpObservationKindEvidence::MicrocodeRecognition {
+                task_address: 0x1000,
+                imem_generation: 1,
+                text_sha256,
+                data_address: 0x2000,
+                data_bytes,
+                data_sha256,
+                family: Some(ReleaseMicrocodeFamily::Other { id: 0x464e_3634 }),
+            },
+        }])
+        .unwrap();
+        report.report_sha256 = hex(&Sha256::digest(
+            crate::release_gate::encode_report_evidence(&report).unwrap(),
+        ));
+        report.verify_integrity().unwrap();
+        report.write_json(&report_template_path).unwrap();
+
+        let descriptor = |path: &Path, provenance: &str| {
+            let bytes = fs::read(path).unwrap();
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "length": bytes.len(),
+                "sha256": hex(&Sha256::digest(&bytes)),
+                "provenance": provenance,
+                "git_identity": "excluded",
+            })
+        };
+        let file_descriptor = |path: &Path| {
+            let bytes = fs::read(path).unwrap();
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "length": bytes.len(),
+                "sha256": hex(&Sha256::digest(&bytes)),
+                "git_identity": "excluded",
+            })
+        };
+        let execution_source = serde_json::to_value(&source).unwrap();
+        let manifest = serde_json::json!({
+            "schema": "fn64.private-input-admission.v6",
+            "purpose": "full_rom",
+            "intent": {
+                "wire_family": "full_rom_mixed",
+                "report_scenario": REPORT_SCENARIO,
+                "recognition": "runtime_must_confirm_backend_known_pair",
+                "extended_gbi_cases": [],
+                "program_evidence_lane": "typed_block_program",
+                "rom_class": "public_homebrew",
+            },
+            "release_matrix": {
+                "platform": platform_wire,
+                "controllers": ["standard_controller"],
+                "save": "sram_32_kib",
+                "renderers": ["reference_lle_accuracy"],
+                "repeat_bar": 10,
+            },
+            "artifacts": {
+                "microcode_text": descriptor(&text_path, "user_owned_rom_derived"),
+                "microcode_data": descriptor(&data_path, "user_owned_rom_derived"),
+                "rom": descriptor(&rom_path, "publicly_distributed_homebrew_rom"),
+                "recompiled": descriptor(&recompiled_path, "user_generated_from_owned_rom"),
+            },
+            "runner": {
+                "executable": file_descriptor(&executable),
+                "working_directory": directory.0.to_str().unwrap(),
+                "argv": ["--exact", CHILD_FIXTURE, "--nocapture"],
+                "env": {
+                    CHILD_ENABLE_ENV: "1",
+                    CHILD_TEMPLATE_ENV: report_template_path.to_str().unwrap(),
+                },
+                "release_gate_cycle": report.digest.guest_cycle,
+                "execution_source": execution_source,
+                "program_build_receipt": file_descriptor(&receipt_path),
+            },
+        });
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let admission_script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/private_input_admission.py");
+        let admission = Command::new("/usr/bin/python3")
+            .arg(&admission_script)
+            .arg("--manifest")
+            .arg(&manifest_path)
+            .arg("--report")
+            .arg(&readiness_path)
+            .arg("--emit-private-run-contract")
+            .arg(&contract_path)
+            .output()
+            .unwrap();
+        assert!(
+            admission.status.success(),
+            "production fixture admission failed: {}",
+            String::from_utf8_lossy(&admission.stderr)
+        );
+
+        let contract = load_private_release_run_contract(&contract_path).unwrap();
+        let receipt = run_private_release_series(&contract, &series_path).unwrap();
+        let verified_series =
+            verify_private_release_series(&contract, &series_path, &receipt).unwrap();
+        let evidence = (1..=RELEASE_MATRIX_REPORT_COUNT)
+            .map(|ordinal| {
+                let report_path = series_path.join(format!("report-{ordinal:02}.json"));
+                let retained_report =
+                    serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+                let journal_path = report_path.with_extension("unsupported.jsonl");
+                let journal = parse_unsupported_journal(&fs::read(journal_path).unwrap()).unwrap();
+                (retained_report, journal)
+            })
+            .collect::<Vec<_>>();
+        let matrix_manifest = ReleaseMatrixManifest {
+            schema: RELEASE_MATRIX_SCHEMA.to_owned(),
+            profile: CertificationProfileIdentity::full_parity_v1(),
+            scenarios: vec![scenario("public-homebrew-production-fixture", &report)],
+        };
+
+        let ReleaseMatrixVerification::Incomplete(incomplete) =
+            verify_release_matrix_with_private_series(
+                &matrix_manifest,
+                &evidence,
+                &[&verified_series],
+            )
+            .unwrap()
+        else {
+            panic!("one public fixture must remain incomplete against the full profile")
+        };
+        let homebrew_assignment = incomplete
+            .satisfied
+            .iter()
+            .find(|assignment| {
+                assignment.requirement.class() == CertificationRequirementClass::RomClass
+                    && assignment.requirement.id() == "public_homebrew"
+            })
+            .expect("production opaque series earns its exact public-homebrew fixture row");
+        assert_eq!(homebrew_assignment.evidence_sha256s.len(), 1);
+
+        let mut reordered = evidence.clone();
+        let mut journals = reordered
+            .iter()
+            .map(|(_, journal)| journal.clone())
+            .collect::<Vec<_>>();
+        journals.rotate_left(1);
+        for ((_, journal), replacement) in reordered.iter_mut().zip(journals) {
+            *journal = replacement;
+        }
+        assert!(matches!(
+            verify_release_matrix_with_private_series(
+                &matrix_manifest,
+                &reordered,
+                &[&verified_series],
+            ),
+            Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+                field: "run_event_sha256s",
+                ..
+            })
+        ));
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(series_path.join("report-01.json"))
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert!(matches!(
+            verify_release_matrix_with_private_series(
+                &matrix_manifest,
+                &evidence,
+                &[&verified_series],
+            ),
+            Err(ReleaseMatrixError::InvalidPrivateSeriesAuthority { .. })
+        ));
     }
 
     fn replace_report(
