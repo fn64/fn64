@@ -542,8 +542,10 @@ making each public yielded-resume authorization load-consumable exactly once.
 Retained v20 validation requires every task address to name a complete 64-byte
 header inside physical 8 MiB RDRAM, every nonempty microcode-data and DRAM-DPC
 range to fit there, and every XBUS-DPC range to fit the 4 KiB DMEM bank.
-These mechanisms make a valid contract launchable, but no representative
-private full-ROM exact-ten series has yet been retained.
+These mechanisms make a valid contract launchable. A representative private
+NTSC/reference full-ROM exact-ten series completed and was reverified locally
+on 2026-07-21; that result closes this orchestration path for one scenario, not
+the remaining release-matrix denominator.
 
 The current production loader specifically resolves and pins
 `/usr/bin/python3`; Windows production admission therefore remains fail-closed
@@ -982,10 +984,10 @@ certified release matrix**. The exact state is:
 | ROM/report class | Mechanism available | Certified evidence retained |
 | --- | --- | --- |
 | Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, a trusted exact-ten fresh-process runner and receipt, real executor/device/RSP/RDP/VI/reference-render boundaries, derived matrix coverage, and the canonical incomplete assessment are available. | Mechanism evidence only; synthetic bytes are not a ROM certification, and an incomplete assessment is not a retained verified matrix. |
-| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, a create-new receipt/source-wire producer, runner-staged exact ROM/microcode-pair admission, and same-event kickoff check exist. The v20 report and private policy admit the observed function stream and bind normalized ROM identity, class, and decoded TV region; the host uses the schema-enabled boot API and a path-independent generated-source identity. | Regenerate the stale cached private generated crate so it exports the marker, then produce a ten-run `typed_observed_function` v20 series (or generate and select the real block pack). |
+| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, a create-new receipt/source-wire producer, runner-staged exact ROM/microcode-pair admission, and same-event kickoff check exist. The v20 report and private policy admit the observed function stream and bind normalized ROM identity, class, and decoded TV region; the host uses the schema-enabled boot API and a path-independent generated-source identity. | A `typed_observed_function` exact-ten v20 series completed and was reverified locally on 2026-07-21 at the first scheduled VI edge after the audio-task closure path became observed. Its content-bearing artifacts and exact runner remain private and untracked; the broader verified matrix is still incomplete. |
 | OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, resolved graphics-API and TV-standard evidence, explicit `BlockProgram` host selection, an artifact/schema-bound whole-function entry stream, create-new receipt tooling, and runner-staged exact ROM/microcode-pair admission exist. The host consumes the schema marker and registers the same pair with RT64; earlier local private groups are pre-v20 historical evidence only. | Regenerate the private crate or generate the block pack, then run v20 with the ROM's successful banked 32-KiB SRAM operation path. |
 | OoT NTSC 1.0, legacy C lane | Observation tooling and exact linked-archive identity wiring exist. | Non-authoritative: measured framebuffer parity is only claimed through swap 60, and the C oracle's missing bodies prevent deeper arbitration beyond the known swap-231 frontier. |
-| Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v20-visible fixed TV region, save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, program-lane, committed RSP/RDP-mechanism, and authoritative platform/API assignments while retaining the remaining project-owned profile entries as missing. Backend microcode labels are diagnostic only; independent public-microcode adjudication uses the empty project-owned catalog v1. Generic report verification deliberately cannot turn the retained ROM-class label into profile credit; the separate private-series path revalidates its contract, receipt, exact output files, raw ROM, and runner before retaining `fn64.verified-rom-class-authority.v1`. RT64 target-case credit additionally requires the opaque platform-series capability, for which phase one has no production constructor. | No public-microcode requirement can be credited until allowed-source identities populate a successor catalog; no private full-ROM v20 report series carrying verified ROM-class authority, no positive native Windows evidence, and no production platform-case authority has been supplied. |
+| Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v20-visible fixed TV region, save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, program-lane, committed RSP/RDP-mechanism, and authoritative platform/API assignments while retaining the remaining project-owned profile entries as missing. Backend microcode labels are diagnostic only; independent public-microcode adjudication uses the empty project-owned catalog v1. Generic report verification deliberately cannot turn the retained ROM-class label into profile credit; the separate private-series path revalidates its contract, receipt, exact output files, raw ROM, and runner before retaining `fn64.verified-rom-class-authority.v1`. RT64 target-case credit additionally requires the opaque platform-series capability, for which phase one has no production constructor. | No public-microcode requirement can be credited until allowed-source identities populate a successor catalog; regional and additional save/controller/render scenarios, positive native Windows evidence, and production platform-case authority remain unsupplied. |
 
 Therefore the generic report mechanism can validate multi-ROM
 zero-reached-unsupported evidence and retain its satisfied/missing profile
@@ -1000,10 +1002,11 @@ The exact program-input identity-co-binding and runtime microcode-pair kickoff
 identity blockers are closed by the typed receipt plus the same-event
 microcode text/data check. Trusted evidence that the child was compiled or
 linked from those inputs remains open; the receipt alone is not build
-attestation. The remaining evidence frontier is to retain representative
-private exact-ten v20 series through the verified-series matrix path and satisfy
-the still-missing public-microcode-catalog, positive Windows, platform-case, and
-blocker-result classes.
+attestation. The remaining evidence frontier is to feed the retained
+representative series through the verified-series matrix path, add the other
+required private exact-ten scenarios, and satisfy the still-missing
+public-microcode-catalog, positive Windows, platform-case, and blocker-result
+classes.
 
 ## Remaining release frontier
 
