@@ -1149,7 +1149,7 @@ mod tests {
 
         let frames = Arc::new(Mutex::new(Vec::new()));
         let mut inner = fn64_render_rt64::ReferenceBackend::new();
-        inner.create(&RenderConfig::new(4, 2)).unwrap();
+        inner.create(&RenderConfig::ntsc(4, 2)).unwrap();
         set_render_backend(
             Box::new(ReferencePixelBackend {
                 inner,

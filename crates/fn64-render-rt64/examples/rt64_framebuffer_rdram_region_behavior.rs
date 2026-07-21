@@ -163,7 +163,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             framebuffer_render_to_ram: true,
             framebuffer_copy_with_gpu: true,
         });
-    backend.create(&RenderConfig::new(WIDTH, SOURCE_HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, SOURCE_HEIGHT))?;
 
     let (mut rdram, end) = fixture();
     let source_before = pixels(&rdram, SOURCE, WIDTH * SOURCE_HEIGHT);

@@ -279,6 +279,17 @@ typedef struct Fn64Rt64ExtendedGbiEvidence {
     Fn64Rt64GeneratedPresentEvidence generated_presents[FN64_RT64_EXTENDED_MAX_GENERATED_PRESENTS];
 } Fn64Rt64ExtendedGbiEvidence;
 
+/* Region-rate evidence from one synthetic-only F3DEX2 workload. The fixture
+ * omits Extended GBI's explicit refresh-rate command, so FullSync must derive
+ * viOriginalRate from the exact VIHistory registered by context creation. */
+typedef struct Fn64Rt64RegionRateEvidence {
+    uint64_t workload_id;
+    uint32_t configured_nominal_refresh_rate;
+    uint32_t registered_nominal_refresh_rate;
+    uint32_t workload_original_refresh_rate;
+    uint32_t extended_refresh_override_absent;
+} Fn64Rt64RegionRateEvidence;
+
 #if defined(FN64_RT64_HFR_EVIDENCE)
 /* Causal state for one explicitly armed high-frame-rate presentation burst.
  * The synthetic F3DEX2 admission function below is evidence-only; production
@@ -461,6 +472,15 @@ int fn64_rt64_capture_adapter_inputs(
     char *error,
     size_t error_capacity);
 
+/* Device-free exact-source probe for RT64's stable-factor workload-rate
+ * inference. The shim supplies the context's IPL-selected 50/60 Hz base. */
+int fn64_rt64_probe_logical_rate(
+    uint32_t nominal_refresh_rate,
+    uint32_t factor,
+    uint32_t *logical_rate,
+    char *error,
+    size_t error_capacity);
+
 int fn64_rt64_roundtrip_user_config(
     const Fn64Rt64UserConfig *input,
     Fn64Rt64UserConfig *output,
@@ -494,6 +514,7 @@ int fn64_rt64_inspect_replacement_pack(
 Fn64Rt64Context *fn64_rt64_create(
     uint32_t width,
     uint32_t height,
+    uint32_t nominal_refresh_rate,
     const Fn64Rt64UserConfig *user_config,
     const Fn64Rt64EnhancementConfig *enhancement_config,
     const Fn64Rt64EmulatorConfig *emulator_config,
@@ -691,6 +712,7 @@ int fn64_rt64_process_synthetic_hfr_f3dex2(
     uint32_t display_list,
     uint32_t output_addr,
     uint16_t original_refresh_rate,
+    Fn64Rt64RegionRateEvidence *region_rate_evidence,
     char *error,
     size_t error_capacity);
 #endif

@@ -108,7 +108,7 @@ fn submit(backend: &mut impl RenderBackend) -> Result<Vec<u8>, Box<dyn Error>> {
 
 fn render_reference() -> Result<Vec<u8>, Box<dyn Error>> {
     let mut backend = ReferenceBackend::new().with_f3dex2();
-    backend.create(&RenderConfig::new(WIDTH as u32, HEIGHT as u32))?;
+    backend.create(&RenderConfig::ntsc(WIDTH as u32, HEIGHT as u32))?;
     submit(&mut backend)
 }
 
@@ -131,7 +131,7 @@ fn render_rt64(
             .into());
         }
     }
-    backend.create(&RenderConfig::new(WIDTH as u32, HEIGHT as u32))?;
+    backend.create(&RenderConfig::ntsc(WIDTH as u32, HEIGHT as u32))?;
     if stage_replacements_before_create {
         if backend.active_replacement_settings() != Some(&backend.configured_replacement_settings())
         {
@@ -377,7 +377,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if roundtrip_rt64_emulator_settings(&emulator)? != emulator {
         return Err(io::Error::other("RT64 emulator ABI roundtrip changed the typed image").into());
     }
-    let cfg = RenderConfig::new(WIDTH as u32, HEIGHT as u32);
+    let cfg = RenderConfig::ntsc(WIDTH as u32, HEIGHT as u32);
     let task = OsTask {
         task_type: M_GFXTASK,
         data_ptr: COMMANDS as u32,

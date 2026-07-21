@@ -326,7 +326,7 @@ fn run_case(
     let mut backend = Rt64Backend::new()
         .with_f3dex2_ucode_text(&inputs.text)
         .with_runtime_settings(runtime.clone());
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     if case != Case::HookControl {
         backend.enable_present_capture()?;
         backend.enable_extended_gbi_evidence()?;

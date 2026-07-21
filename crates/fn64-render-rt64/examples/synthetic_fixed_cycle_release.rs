@@ -157,7 +157,7 @@ fn run_invocation(invocation: ReleaseInvocation) -> Result<(), Box<dyn Error>> {
     gate.arm_with_unsupported_journal(&journal_path, &run_event_sha256)?;
     let presents = Arc::new(AtomicU64::new(0));
     let mut reference = ReferenceBackend::new().with_f3dex2();
-    reference.create(&RenderConfig::new(WIDTH as u32, HEIGHT as u32))?;
+    reference.create(&RenderConfig::ntsc(WIDTH as u32, HEIGHT as u32))?;
     fn64_abi::set_render_backend_with_policy(
         Box::new(ObservedReferenceBackend {
             inner: reference,

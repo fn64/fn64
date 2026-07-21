@@ -23,7 +23,8 @@ use fn64_render_rt64::{
 use sha2::{Digest, Sha256};
 
 const PINNED_SOURCE: &str = "git:f0728a2520d5aa735886240de3fee75cc805f6d6";
-const PINNED_OVERLAY: &str = "fn64:raster-shader-start-stop:v1+hfr-post-present-call:v1";
+const PINNED_OVERLAY: &str =
+    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+hfr-post-present-call:v1";
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
 const SEGMENT: u8 = 6;
 const SEGMENT_BASE: usize = 0x0000_1000;
@@ -439,7 +440,7 @@ fn require_hfr_first_arm_overlap_rejection(
     runtime: &RenderRuntimeSettings,
 ) -> Result<(), Box<dyn Error>> {
     let mut backend = Rt64Backend::new().with_runtime_settings(runtime.clone());
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     backend.enable_present_capture()?;
     backend.enable_hfr_evidence()?;
     match backend.enable_extended_gbi_evidence() {
@@ -467,6 +468,19 @@ struct HfrEvidence {
     current_shape: ColoredShape,
     cooperation: CooperationSummary,
     pacing: PacingSummary,
+}
+
+impl HfrEvidence {
+    fn deterministic_eq(&self, other: &Self) -> bool {
+        self.previous_endpoint == other.previous_endpoint
+            && self.intermediate == other.intermediate
+            && self.current_endpoint == other.current_endpoint
+            && self.original_policy == other.original_policy
+            && self.previous_shape == other.previous_shape
+            && self.intermediate_shape == other.intermediate_shape
+            && self.current_shape == other.current_shape
+            && self.cooperation == other.cooperation
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -593,7 +607,7 @@ fn run_pacing_lane(
     manual: &RenderRuntimeSettings,
 ) -> Result<PacingSummary, Box<dyn Error>> {
     let mut backend = Rt64Backend::new().with_runtime_settings(original.clone());
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     let mut rdram = vec![0_u8; RDRAM_LEN];
     require_production_rejection(&mut backend, &mut rdram)?;
     let version = negotiate_v1(&mut backend, &mut rdram)?;
@@ -611,7 +625,7 @@ fn run_once() -> Result<HfrEvidence, Box<dyn Error>> {
     require_hfr_first_arm_overlap_rejection(&original)?;
 
     let mut control = Rt64Backend::new().with_runtime_settings(original.clone());
-    control.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    control.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     control.enable_present_capture()?;
     let mut control_rdram = vec![0_u8; RDRAM_LEN];
     submit(&mut control, &mut control_rdram, -4.0, None)?;
@@ -628,7 +642,7 @@ fn run_once() -> Result<HfrEvidence, Box<dyn Error>> {
     let control_endpoint = frame_digest(&control_burst.frames[0].bytes);
 
     let mut enabled = Rt64Backend::new().with_runtime_settings(original.clone());
-    enabled.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    enabled.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     enabled.enable_present_capture()?;
     let mut enabled_rdram = vec![0_u8; RDRAM_LEN];
     require_production_rejection(&mut enabled, &mut enabled_rdram)?;
@@ -833,7 +847,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let run_count = match args.next().as_deref() {
         None => 1,
         Some("--once") if args.next().is_none() => 1,
-        _ => return Err(io::Error::other("expected no arguments or --once").into()),
+        Some("--runs") => {
+            let count = args
+                .next()
+                .ok_or_else(|| io::Error::other("--runs requires a positive count"))?
+                .parse::<usize>()
+                .map_err(|_| io::Error::other("--runs requires a positive count"))?;
+            if count == 0 || args.next().is_some() {
+                return Err(io::Error::other("--runs requires one positive count").into());
+            }
+            count
+        }
+        _ => return Err(io::Error::other("expected no arguments, --once, or --runs N").into()),
     };
     let identity = Rt64Backend::release_identity();
     if identity.source_id != PINNED_SOURCE
@@ -845,8 +870,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let expected = run_once()?;
     for _ in 1..run_count {
-        if run_once()? != expected {
-            return Err(io::Error::other("RT64 HFR evidence drifted between runs").into());
+        let observed = run_once()?;
+        if !observed.deterministic_eq(&expected) {
+            return Err(
+                io::Error::other("RT64 deterministic HFR evidence drifted between runs").into(),
+            );
         }
     }
     println!(

@@ -105,7 +105,7 @@
       "features": ["hfr-evidence"],
       "repeat_bar": 20,
       "claims": ["hfr-60-plus-interpolation"],
-      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-20" }
+      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-21" }
     },
     {
       "id": "extended-gbi-cooperation",

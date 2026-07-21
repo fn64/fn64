@@ -46,7 +46,7 @@ fn fixture() -> (OsTask, RenderConfig, ViPresentation) {
             data_ptr: 13,
             data_size: 14,
         },
-        RenderConfig::new(640, 480),
+        RenderConfig::ntsc(640, 480),
         ViPresentation {
             scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(vi_registers)),
             ..ViPresentation::default()

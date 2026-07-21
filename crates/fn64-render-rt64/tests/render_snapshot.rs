@@ -77,7 +77,7 @@ fn fixture_triangle_render_digest_snapshot() {
     let (mut rdram, dl_addr) = build_fixture_rdram();
     let clear = [10, 10, 10, 255];
     let mut backend = ReferenceBackend::new().with_clear_color(clear);
-    backend.create(&RenderConfig::new(64, 64)).unwrap();
+    backend.create(&RenderConfig::ntsc(64, 64)).unwrap();
     let task = OsTask {
         task_type: M_GFXTASK,
         data_ptr: dl_addr,

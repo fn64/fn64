@@ -44,7 +44,7 @@ Denominator: The same thirteen fn64 RT64 adapter cases on every supported platfo
 | `latency-present-early` | 20 | pass: 20 clean (2026-07-19) | blocked | blocked | blocked | blocked | blocked |
 | `deferred-debugger` | 20 | pass: 20 clean (2026-07-19) | blocked | blocked | blocked | blocked | blocked |
 | `ubershader-critical-path` | 20 | pass: 20 clean (2026-07-19) | blocked | blocked | blocked | blocked | blocked |
-| `hfr-hle-cooperation` | 20 | pass: 20 clean (2026-07-20) | blocked | blocked | blocked | blocked | blocked |
+| `hfr-hle-cooperation` | 20 | pass: 20 clean (2026-07-21) | blocked | blocked | blocked | blocked | blocked |
 | `extended-gbi-cooperation` | 10 | pass: 10 clean (2026-07-20) | blocked | blocked | blocked | blocked | blocked |
 
 The `user-controls-rebuild` race fix passed twenty consecutive watchdog-bounded

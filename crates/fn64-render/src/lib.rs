@@ -141,17 +141,20 @@ pub struct MicrocodeDataImageIdentity {
 }
 
 /// Backend configuration for `RenderBackend::create`. Deliberately minimal
-/// (window/output size only) -- a real windowing surface handle is backend-
-/// specific (RT64 wants a native window handle; a headless backend wants
-/// none), so this trait models only what every backend needs to agree on:
-/// the target framebuffer dimensions. Backend-specific extras (a raw window
-/// handle, a device preference) are the adapter crate's own config type,
-/// passed alongside this one at the adapter's own construction, not through
-/// this shared trait -- keeping `RenderConfig` itself backend-agnostic.
+/// (window/output size and IPL-selected TV standard) -- a real windowing
+/// surface handle is backend-specific (RT64 wants a native window handle; a
+/// headless backend wants none), so this trait models only what every backend
+/// needs to agree on:
+/// the target framebuffer dimensions and television standard. Backend-specific
+/// extras (a raw window handle, a device preference) are the adapter crate's
+/// own config type, passed alongside this one at the adapter's own construction,
+/// not through this shared trait -- keeping `RenderConfig` itself
+/// backend-agnostic.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RenderConfig {
     pub width: u32,
     pub height: u32,
+    pub tv_type: fn64_runtime::TvType,
 }
 
 /// VI-manager state that affects scanout at a presentation boundary rather
@@ -656,8 +659,52 @@ pub struct RenderReleaseCapture {
 }
 
 impl RenderConfig {
-    pub fn new(width: u32, height: u32) -> Self {
-        RenderConfig { width, height }
+    /// Construct a configuration for an explicitly NTSC program or fixture.
+    /// Production boot paths should carry their IPL-selected [`TvType`](fn64_runtime::TvType)
+    /// through [`Self::for_tv`] instead of assuming this standard.
+    pub const fn ntsc(width: u32, height: u32) -> Self {
+        Self::for_tv(width, height, fn64_runtime::TvType::Ntsc)
+    }
+
+    /// Construct a configuration bound to the IPL-selected television
+    /// standard. Native RT64 uses its nominal 50/60 Hz rate when converting
+    /// VI presentation factors into a logical workload rate.
+    pub const fn for_tv(width: u32, height: u32, tv_type: fn64_runtime::TvType) -> Self {
+        RenderConfig {
+            width,
+            height,
+            tv_type,
+        }
+    }
+}
+
+#[cfg(test)]
+mod render_config_tests {
+    use super::RenderConfig;
+    use fn64_runtime::TvType;
+
+    #[test]
+    fn explicit_tv_config_preserves_all_nominal_region_rates() {
+        assert_eq!(
+            RenderConfig::for_tv(320, 240, TvType::Ntsc).tv_type,
+            TvType::Ntsc
+        );
+        assert_eq!(
+            RenderConfig::for_tv(320, 240, TvType::Pal).tv_type,
+            TvType::Pal
+        );
+        assert_eq!(
+            RenderConfig::for_tv(320, 240, TvType::Mpal).tv_type,
+            TvType::Mpal
+        );
+        assert_eq!(TvType::Ntsc.nominal_field_hz(), 60);
+        assert_eq!(TvType::Pal.nominal_field_hz(), 50);
+        assert_eq!(TvType::Mpal.nominal_field_hz(), 60);
+    }
+
+    #[test]
+    fn named_ntsc_constructor_cannot_hide_its_standard() {
+        assert_eq!(RenderConfig::ntsc(320, 240).tv_type, TvType::Ntsc);
     }
 }
 
@@ -1205,7 +1252,7 @@ mod tests {
     #[test]
     fn is_dyn_safe_and_usable_through_a_trait_object() {
         let mut backend: Box<dyn RenderBackend> = Box::new(fake(vec![UcodeId::F3dex2]));
-        backend.create(&RenderConfig::new(320, 240)).unwrap();
+        backend.create(&RenderConfig::ntsc(320, 240)).unwrap();
         let mut rdram = vec![0u8; 4096];
         let mut rsp_memory = fn64_runtime::RspMemory::new();
         let task = OsTask {
@@ -1232,7 +1279,7 @@ mod tests {
     #[test]
     fn atomic_chunk_adapter_completes_start_and_rejects_resume() {
         let mut backend = fake(vec![UcodeId::F3dex2]);
-        backend.create(&RenderConfig::new(1, 1)).unwrap();
+        backend.create(&RenderConfig::ntsc(1, 1)).unwrap();
         let mut rdram = vec![0u8; 16];
         let mut rsp_memory = fn64_runtime::RspMemory::new();
         assert_eq!(backend.task_chunking(), RenderTaskChunking::Atomic);
@@ -1276,7 +1323,7 @@ mod tests {
     #[test]
     fn unlisted_ucode_traps_by_name_not_silently() {
         let mut backend = fake(vec![]); // declares NO supported ucodes
-        backend.create(&RenderConfig::new(64, 64)).unwrap();
+        backend.create(&RenderConfig::ntsc(64, 64)).unwrap();
         let mut rdram = vec![0u8; 16];
         let mut rsp_memory = fn64_runtime::RspMemory::new();
         let task = OsTask {
@@ -1295,7 +1342,7 @@ mod tests {
     #[test]
     fn out_of_bounds_output_buffer_is_a_named_error_not_a_panic() {
         let mut backend = fake(vec![UcodeId::F3dex2]);
-        backend.create(&RenderConfig::new(64, 64)).unwrap();
+        backend.create(&RenderConfig::ntsc(64, 64)).unwrap();
         let mut rdram = vec![0u8; 16];
         let mut rsp_memory = fn64_runtime::RspMemory::new();
         let task = OsTask {

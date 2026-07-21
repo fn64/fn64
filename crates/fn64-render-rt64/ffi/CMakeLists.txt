@@ -81,6 +81,74 @@ target_sources(rt64 PRIVATE "${FN64_RT64_RASTER_SHADER_CACHE_PATCHED_SOURCE}")
 target_include_directories(rt64 PRIVATE
     "${FN64_RT64_SOURCE_DIR}/src/render")
 
+# Pinned RT64 infers a logical workload rate by dividing a hardcoded 60 Hz by
+# the stable VI presentation factor. Bind that calculation to the fn64 context's
+# IPL-selected 50/60 Hz standard without mutating or vendoring the MIT checkout.
+# The full-file digest and exact replacement contexts make upstream drift loud.
+set(FN64_RT64_VI_SOURCE
+    "${FN64_RT64_SOURCE_DIR}/src/hle/rt64_vi.cpp")
+file(SHA256
+    "${FN64_RT64_VI_SOURCE}"
+    FN64_RT64_VI_SHA256)
+if(NOT FN64_RT64_VI_SHA256 STREQUAL
+   "9b3cf39bb15fc0c7d52085566197042f4960cc410b241e38457bb817f2501e5b")
+    message(FATAL_ERROR
+        "RT64 VI source changed; review the fn64 region-rate overlay")
+endif()
+file(READ
+    "${FN64_RT64_VI_SOURCE}"
+    FN64_RT64_VI_CONTENTS)
+set(FN64_RT64_VI_DECLARATION_ORIGINAL [=[#include "rt64_vi.h"
+
+namespace RT64 {]=])
+set(FN64_RT64_VI_DECLARATION_PATCHED [=[#include "rt64_vi.h"
+
+extern "C" uint32_t fn64_rt64_nominal_full_rate(const void *);
+
+namespace RT64 {]=])
+string(FIND
+    "${FN64_RT64_VI_CONTENTS}"
+    "${FN64_RT64_VI_DECLARATION_ORIGINAL}"
+    FN64_RT64_VI_DECLARATION_OFFSET)
+if(FN64_RT64_VI_DECLARATION_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 VI declaration context changed; review the fn64 region-rate overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_VI_DECLARATION_ORIGINAL}"
+    "${FN64_RT64_VI_DECLARATION_PATCHED}"
+    FN64_RT64_VI_PATCHED
+    "${FN64_RT64_VI_CONTENTS}")
+set(FN64_RT64_VI_RATE_ORIGINAL
+    "            const uint32_t FullRate = 60; // TODO: PAL support.")
+set(FN64_RT64_VI_RATE_PATCHED
+    "            const uint32_t FullRate = fn64_rt64_nominal_full_rate(this);")
+string(FIND
+    "${FN64_RT64_VI_PATCHED}"
+    "${FN64_RT64_VI_RATE_ORIGINAL}"
+    FN64_RT64_VI_RATE_OFFSET)
+if(FN64_RT64_VI_RATE_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 VI logical-rate context changed; review the fn64 region-rate overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_VI_RATE_ORIGINAL}"
+    "${FN64_RT64_VI_RATE_PATCHED}"
+    FN64_RT64_VI_PATCHED
+    "${FN64_RT64_VI_PATCHED}")
+set(FN64_RT64_VI_PATCHED_SOURCE
+    "${CMAKE_CURRENT_BINARY_DIR}/fn64_rt64_vi.cpp")
+file(WRITE
+    "${FN64_RT64_VI_PATCHED_SOURCE}"
+    "${FN64_RT64_VI_PATCHED}")
+set_source_files_properties(
+    "${FN64_RT64_VI_SOURCE}"
+    TARGET_DIRECTORY rt64
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+target_sources(rt64 PRIVATE "${FN64_RT64_VI_PATCHED_SOURCE}")
+target_include_directories(rt64 PRIVATE
+    "${FN64_RT64_SOURCE_DIR}/src/hle")
+
 if(FN64_RT64_HFR_EVIDENCE)
     # Observe the exact actual-present boundary without changing its control
     # flow. The full-file digest and exact replacement contexts bind this

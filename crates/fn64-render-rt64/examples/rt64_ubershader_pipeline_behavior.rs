@@ -196,7 +196,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..RenderRuntimeSettings::default()
     };
     let mut backend = Rt64Backend::new().with_runtime_settings(runtime.clone());
-    backend.create(&RenderConfig::new(WIDTH, HEIGHT))?;
+    backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT))?;
     if backend.active_settings() != Some(&runtime) {
         return Err(
             io::Error::other("RT64 did not activate exact ubershader fixture policy").into(),

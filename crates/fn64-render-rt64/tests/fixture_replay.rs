@@ -68,7 +68,7 @@ fn fixture_display_list_renders_a_non_clear_frame() {
 
     let clear = [10, 10, 10, 255]; // distinct from every vertex color above
     let mut backend = ReferenceBackend::new().with_clear_color(clear);
-    backend.create(&RenderConfig::new(64, 64)).unwrap();
+    backend.create(&RenderConfig::ntsc(64, 64)).unwrap();
 
     let task = OsTask {
         task_type: M_GFXTASK,
@@ -128,7 +128,7 @@ fn unlisted_ucode_still_traps_through_the_real_backend_not_just_the_trait_fake()
     // lockstep with what `process_task` actually enforces. This uses the
     // real backend (not the trait crate's in-crate fake) to close that gap.
     let mut backend = ReferenceBackend::new();
-    backend.create(&RenderConfig::new(8, 8)).unwrap();
+    backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
     assert_eq!(backend.supported_ucodes(), &[fn64_render::UcodeId::F3dex2]);
     // A task containing an explicit G_ENDDL decodes to zero triangles -- a
     // real "nothing to draw" case. Unknown opcodes and unterminated streams
@@ -194,7 +194,7 @@ fn process_task_writes_rgba5551_framebuffer_to_output_addr() {
     rdram[DL_ADDR..DL_ADDR + dl.len()].copy_from_slice(&dl);
 
     let mut backend = ReferenceBackend::new().with_clear_color(clear);
-    backend.create(&RenderConfig::new(W, H)).unwrap();
+    backend.create(&RenderConfig::ntsc(W, H)).unwrap();
     let task = OsTask {
         task_type: M_GFXTASK,
         data_ptr: DL_ADDR as u32,

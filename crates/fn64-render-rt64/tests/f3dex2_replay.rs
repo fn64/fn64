@@ -185,7 +185,7 @@ fn f3dex2_display_list_renders_transformed_triangle_at_expected_pixel() {
         .with_f3dex2()
         .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE])
         .with_clear_color(clear);
-    backend.create(&RenderConfig::new(320, 240)).unwrap();
+    backend.create(&RenderConfig::ntsc(320, 240)).unwrap();
 
     let task = OsTask {
         task_type: M_GFXTASK,
@@ -257,7 +257,7 @@ fn f3dex2_without_fill_leaves_centroid_clear_proving_fill_is_load_bearing() {
         .with_f3dex2()
         .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE])
         .with_clear_color(clear);
-    backend.create(&RenderConfig::new(320, 240)).unwrap();
+    backend.create(&RenderConfig::ntsc(320, 240)).unwrap();
     let fb = backend.framebuffer().unwrap();
     let (cx, cy) = (160u32, 130u32);
     let idx = (cy * fb.width + cx) as usize * 4;
