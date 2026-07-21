@@ -135,7 +135,14 @@ pub fn set_section_unloaded(index: fn64_runtime::SectionIndex) {
 /// resolvable at their true relocated base -- see
 /// `SectionRegistry::load_section_at_rom_addr`.
 pub fn note_dma_overlay_load(rom_addr: u32, dest_vram: u32) -> Option<fn64_runtime::SectionIndex> {
-    with_host(|host| host.sections.load_section_at_rom_addr(rom_addr, dest_vram))
+    let loaded = with_host(|host| host.sections.load_section_at_rom_addr(rom_addr, dest_vram));
+    if std::env::var("FN64_DEBUG_BOOT").is_ok() {
+        eprintln!(
+            "[DEBUG note_dma_overlay_load] rom={rom_addr:#010x} dest={dest_vram:#010x} -> \
+             {loaded:?}"
+        );
+    }
+    loaded
 }
 
 #[cfg(test)]

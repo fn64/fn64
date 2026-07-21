@@ -54,6 +54,73 @@ unsafe extern "C" fn stand_in_audio_ucode(_rdram: *mut u8, ucode_addr: u32) -> u
     0
 }
 
+/// Headless stand-in render backend, same stance as `stand_in_audio_ucode`
+/// above: the DISPATCH plumbing (task submission, VI present boundary) is
+/// real and counted; actual RSP display-list execution is NOT performed, so
+/// framebuffer pixels only ever come from CPU writes the game itself makes.
+/// This exists so the headless boot harness can cross the first
+/// `present`/gfx-task boundary without pulling a real renderer (RT64) into
+/// this zero-content example. It reports `Complete` for tasks it did not
+/// draw -- acceptable ONLY because this binary's whole purpose is boot
+/// progression telemetry, and every skipped task is loudly counted on
+/// stderr (never a silent black frame passed off as rendered).
+struct HeadlessRenderBackend {
+    tasks_skipped: u64,
+    rdp_ranges_skipped: u64,
+}
+
+impl fn64_render::RenderBackend for HeadlessRenderBackend {
+    fn create(&mut self, _cfg: &fn64_render::RenderConfig) -> Result<(), fn64_render::RenderError> {
+        Ok(())
+    }
+
+    fn process_task(
+        &mut self,
+        _rdram: &mut [u8],
+        _rsp_memory: &mut fn64_runtime::RspMemory,
+        _task: &fn64_render::OsTask,
+        _output_addr: u32,
+    ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
+        self.tasks_skipped += 1;
+        if self.tasks_skipped <= 3 || self.tasks_skipped.is_power_of_two() {
+            eprintln!(
+                "[wm2000-boot] HEADLESS render backend: gfx task #{} acknowledged but NOT \
+                 rendered (no real renderer in this harness)",
+                self.tasks_skipped
+            );
+        }
+        Ok(fn64_render::FrameStatus::Complete)
+    }
+
+    fn process_rdp_commands(
+        &mut self,
+        _rdram: &mut [u8],
+        _start: u32,
+        _end: u32,
+        _output_addr: u32,
+    ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
+        self.rdp_ranges_skipped += 1;
+        if self.rdp_ranges_skipped <= 3 || self.rdp_ranges_skipped.is_power_of_two() {
+            eprintln!(
+                "[wm2000-boot] HEADLESS render backend: raw RDP range #{} acknowledged but NOT \
+                 executed",
+                self.rdp_ranges_skipped
+            );
+        }
+        Ok(fn64_render::FrameStatus::Complete)
+    }
+
+    fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), fn64_render::RenderError> {
+        Ok(())
+    }
+
+    fn resize(&mut self, _w: u32, _h: u32) {}
+
+    fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
+        &[fn64_render::UcodeId::F3dex2]
+    }
+}
+
 fn env_path(name: &str) -> std::path::PathBuf {
     std::env::var(name)
         .unwrap_or_else(|_| panic!("wm2000-boot: required environment variable {name} not set"))
@@ -70,6 +137,14 @@ fn main() {
         )
     });
     println!("[wm2000-boot] ROM size: {} bytes", rom_bytes.len());
+    // Keep the IPL3 boot-copy source image before `load_rom` takes ownership
+    // of the ROM bytes -- see the IPL3 copy block below for why this exists.
+    let ipl3_image: Vec<u8> = {
+        const IPL3_CART_OFFSET: usize = 0x1000;
+        const IPL3_COPY_LEN: usize = 0x10_0000; // 1 MiB, per IPL3 behavior
+        let end = rom_bytes.len().min(IPL3_CART_OFFSET + IPL3_COPY_LEN);
+        rom_bytes[IPL3_CART_OFFSET.min(rom_bytes.len())..end].to_vec()
+    };
     fn64_abi::load_rom(rom_bytes);
 
     let registration = fn64_boot_harness::register_linked_sections();
@@ -106,10 +181,42 @@ fn main() {
     // Real plumbing, stand-in body (see stand_in_audio_ucode's doc comment).
     unsafe { fn64_abi::set_audio_ucode_fn(stand_in_audio_ucode) };
 
+    // Headless render seam (see HeadlessRenderBackend's doc comment): lets
+    // boot cross the first gfx-task/VI-present boundary without a real
+    // renderer. Registered with the FULL rdram length (set below once the
+    // buffer exists is too late -- set_render_backend wants it now), so use
+    // the same length new_rdram will allocate.
+    {
+        let mut backend = HeadlessRenderBackend {
+            tasks_skipped: 0,
+            rdp_ranges_skipped: 0,
+        };
+        use fn64_render::RenderBackend as _;
+        backend
+            .create(&fn64_render::RenderConfig::new(320, 240))
+            .expect("headless backend create is infallible");
+        fn64_abi::set_render_backend(Box::new(backend), fn64_boot_harness::rdram_len());
+    }
+
     // NWXE's osCartRomInit (func_80022540) returns its OSPiHandle BSS at
     // D_800839A0 (`addiu $v0, $s0, %lo(D_800839A0)`, disasm/asm/1050.s
     // vram 0x80022578); the host shim hands guest code that same address.
     fn64_abi::set_cart_rom_handle_vram(0x8008_39A0);
+
+    // NOTE (2026-07-21 park diagnosis): the long-standing vi_swaps=0 park
+    // (thread 6 woken on its queue at rdram 0x838F0 but never scheduled
+    // again; 16M trailing `ThreadSwitch {to: 3}` trace events) was NOT a
+    // missing event post or a wake-delivery bug -- it was priority
+    // starvation by a degenerate AKI audio-pump thread (guest OSId 3,
+    // entry func_80026F18, guest priority 80) whose sound-driver ops table
+    // (D_800481FC) read null, collapsing its body into a never-blocking
+    // raw AI_STATUS/AI_LEN poll loop. THAT, in turn, was downstream of the
+    // real root cause: this harness never performed the IPL3 boot copy
+    // (below), so every resident `.data` initializer read as zero and boot
+    // took a degraded path that created the pump early and unbound. With
+    // the IPL3 copy in place, boot follows the real path (verified: the
+    // run is byte-identical with or without an experimental pump-priority
+    // clamp) and the park is gone.
 
     // Typed IPL video standard is the shared VI/AI clock authority. The first
     // field uses nominal NTSC timing; the latched OSViMode H/V registers then
@@ -143,6 +250,41 @@ fn main() {
     // story.
     let mut rdram = fn64_boot_harness::new_rdram(fn64_boot_harness::TvType::Ntsc);
     let rdram_ptr = rdram.as_mut_ptr();
+
+    // IPL3 boot copy: on real hardware, the CIC-6102-family boot code copies
+    // 1 MiB of cartridge ROM starting at cart offset 0x1000 into RDRAM at
+    // 0x80000400 BEFORE jumping to the game's entry point (the ROM header's
+    // entry, 0x80000400 here -- section 0's registered ram_addr). NWXE's
+    // `recomp_entrypoint` (funcs_0.c, vram 0x80000400) does NOT copy any
+    // data itself -- it only clears BSS (0x8004B4C0..0x800B1390) and jumps
+    // -- because the IPL already materialized .text+.data. Without this
+    // copy every resident `.data` initializer reads as zero, which is
+    // exactly the previously-documented `D_800481FC == 0` mystery
+    // (docs/BOOT-NOTES-WM2000.md's exhaustive no-writer search) AND the
+    // zeroed segment-descriptor table at 0x80047E80 that made the game's
+    // own overlay loader (`func_80000744`) no-op its bank DMAs before
+    // `func_80000870`'s hardcoded `jal 0x800E1B90` trapped. Words are
+    // written through `RdramViewMut::write_u32` so the big-endian cart
+    // bytes land in fn64's native-word RDRAM storage order.
+    {
+        const IPL3_DEST_OFFSET: u32 = 0x400;
+        let copy_len = ipl3_image.len() & !3;
+        let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+        for word_index in 0..copy_len / 4 {
+            let src = word_index * 4;
+            let word = u32::from_be_bytes(ipl3_image[src..src + 4].try_into().unwrap());
+            view.write_u32(
+                fn64_runtime::RdramAddr::from_offset(
+                    IPL3_DEST_OFFSET + u32::try_from(src).expect("IPL copy fits u32"),
+                ),
+                word,
+            );
+        }
+        println!(
+            "[wm2000-boot] IPL3 boot copy: {copy_len:#x} bytes from cart 0x1000 to rdram \
+             {IPL3_DEST_OFFSET:#x}"
+        );
+    }
 
     // Prime the MMIO backing bytes before the guest ever runs, so even a
     // raw load before any host-side register mutation observes the real
@@ -209,6 +351,10 @@ fn main() {
                 fn64_abi::task_counts().0,
                 fn64_abi::task_counts().1
             );
+            // Progress must survive a later hard kill/abort: stdout is
+            // block-buffered when piped, and a guest entering a non-yielding
+            // spin (a real, observed end state) means no clean exit flushes.
+            let _ = std::io::stdout().flush();
         }
         // Thread 0 (recomp_entrypoint) returning is EXPECTED, not the end
         // of boot: recomp_entrypoint's own body does `LOOKUP_FUNC(..)(rdram,

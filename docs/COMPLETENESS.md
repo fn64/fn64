@@ -172,17 +172,17 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | core/OS | `__ull_to_d_recomp` | **implemented** | `crates/fn64-abi/src/softmath.rs:129` |
 | core/OS | `__ull_to_f_recomp` | **implemented** | `crates/fn64-abi/src/softmath.rs:143` |
 | thread scheduler | `osCreateThread_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:48` |
-| thread scheduler | `osStartThread_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:133` |
-| thread scheduler | `osStopThread_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:261` |
-| thread scheduler | `osDestroyThread_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:247` |
-| thread scheduler | `osSetThreadPri_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:153` |
-| thread scheduler | `osGetThreadPri_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:174` |
-| thread scheduler | `osGetThreadId_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:226` |
+| thread scheduler | `osStartThread_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:140` |
+| thread scheduler | `osStopThread_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:272` |
+| thread scheduler | `osDestroyThread_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:258` |
+| thread scheduler | `osSetThreadPri_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:160` |
+| thread scheduler | `osGetThreadPri_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:185` |
+| thread scheduler | `osGetThreadId_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:237` |
 | message queue | `osCreateMesgQueue_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:14` |
-| message queue | `osRecvMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:71` |
-| message queue | `osSendMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:26` |
-| message queue | `osJamMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:155` |
-| message queue | `osSetEventMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:133` |
+| message queue | `osRecvMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:78` |
+| message queue | `osSendMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:33` |
+| message queue | `osJamMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:169` |
+| message queue | `osSetEventMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:140` |
 | timer | `osGetTime_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:126` |
 | timer | `osSetTime_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:189` |
 | timer | `osSetTimer_recomp` | **implemented** | `crates/fn64-abi/src/timer.rs:30` |

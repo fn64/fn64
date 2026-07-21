@@ -218,9 +218,28 @@ fn charge_c_lane_mmio_access() {
 #[no_mangle]
 pub extern "C" fn fn64_c_mmio_read_w(vaddr: u64) -> i32 {
     charge_c_lane_mmio_access();
-    pi::read_raw_mmio_word(vaddr).unwrap_or_else(|| {
+    let value = pi::read_raw_mmio_word(vaddr).unwrap_or_else(|| {
         panic!("generated-C raw MMIO read is outside the modeled RCP window: {vaddr:#018X}")
-    }) as i32
+    });
+    if std::env::var("FN64_DEBUG_MMIO_POLL").is_ok() {
+        thread_local! {
+            static POLL_SEEN: std::cell::RefCell<std::collections::HashMap<(u32, u64), u64>> =
+                std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        let tid = ACTIVE_THREAD_ID.with(|c| c.get()).unwrap_or(u32::MAX);
+        POLL_SEEN.with(|cell| {
+            let mut map = cell.borrow_mut();
+            let count = map.entry((tid, vaddr)).or_insert(0);
+            *count += 1;
+            if *count <= 5 || count.is_power_of_two() {
+                eprintln!(
+                    "[DEBUG mmio_read] thread={tid} vaddr={vaddr:#010x} -> {value:#010x} \
+                     (occurrence {count})"
+                );
+            }
+        });
+    }
+    value as i32
 }
 
 #[no_mangle]

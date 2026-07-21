@@ -53,6 +53,13 @@ pub unsafe extern "C" fn osCreateThread_recomp(rdram: *mut u8, ctx: *mut RecompC
     let arg = ctx.r7;
     let sp = read_stack_word(rdram, ctx.r29, 0x10) as u64;
     let priority = read_stack_word(rdram, ctx.r29, 0x14) as Priority;
+    if std::env::var("FN64_DEBUG_BOOT").is_ok() {
+        eprintln!(
+            "[DEBUG osCreateThread] osid={requested_osid} entry={entry_vram:#010x} pri={priority} \
+             handle={:#x}",
+            thread_handle.offset()
+        );
+    }
 
     // Libultra's OSId is an informational tag, not a key: thread identity on
     // real hardware is the OSThread struct pointer, and NWXE's retail boot
@@ -154,6 +161,10 @@ pub unsafe extern "C" fn osSetThreadPri_recomp(_rdram: *mut u8, ctx: *mut Recomp
     let ctx = unsafe { &*ctx };
     let target = resolve_thread_arg(ctx.r4, "osSetThreadPri_recomp");
     let pri = ctx.r5 as Priority;
+    if std::env::var("FN64_DEBUG_BOOT").is_ok() {
+        let tid = ACTIVE_THREAD_ID.with(|c| c.get());
+        eprintln!("[DEBUG osSetThreadPri] caller={tid:?} target={target} pri={pri}");
+    }
     with_executor(|exec| exec.set_thread_pri(target, pri));
 }
 
