@@ -53,7 +53,7 @@ namespace {
 constexpr size_t N64_RDRAM_SIZE = 8U * 1024U * 1024U;
 constexpr uint32_t VI_STATUS_16_BIT = 2U;
 static_assert(sizeof(Fn64Rt64ExtendedPresentCapture) == 72U);
-static_assert(sizeof(Fn64Rt64PresentCapture) == 40U);
+static_assert(sizeof(Fn64Rt64PresentCapture) == 48U);
 #if defined(FN64_RT64_HFR_EVIDENCE)
 static_assert(sizeof(Fn64Rt64HfrPacingSample) == 48U);
 static_assert(sizeof(Fn64Rt64HfrPacingEvidence) == 3080U);
@@ -1123,6 +1123,7 @@ struct Fn64Rt64Context {
     uint32_t present_capture_height = 0;
     uint32_t present_capture_row_pitch = 0;
     uint32_t present_capture_format = 0;
+    uint32_t present_capture_graphics_api = 0;
     std::string present_capture_error;
     bool present_capture_enabled = false;
     std::array<ExtendedPresentCaptureSlot, FN64_RT64_EXTENDED_MAX_GENERATED_PRESENTS>
@@ -1526,6 +1527,19 @@ void capture_present_draw(
         return;
     }
 
+    uint32_t capture_graphics_api = 0;
+    switch (backend) {
+    case CaptureBackend::D3D12:
+        capture_graphics_api = FN64_RT64_PRESENT_GRAPHICS_API_D3D12;
+        break;
+    case CaptureBackend::Vulkan:
+        capture_graphics_api = FN64_RT64_PRESENT_GRAPHICS_API_VULKAN;
+        break;
+    case CaptureBackend::Metal:
+        capture_graphics_api = FN64_RT64_PRESENT_GRAPHICS_API_METAL;
+        break;
+    }
+
     std::scoped_lock registry_lock(present_capture_registry_mutex);
     const auto entry = std::find_if(
         present_capture_contexts.begin(),
@@ -1794,6 +1808,7 @@ void capture_present_draw(
         context->present_capture_height = source_height;
         context->present_capture_row_pitch = static_cast<uint32_t>(row_pitch);
         context->present_capture_format = capture_format;
+        context->present_capture_graphics_api = capture_graphics_api;
         capture_stage = "capture-publication";
         context->present_capture_generation++;
     } catch (const std::exception &exception) {
@@ -3157,6 +3172,8 @@ extern "C" int fn64_rt64_read_present_capture(
         capture->height = context->present_capture_height;
         capture->row_bytes = static_cast<uint32_t>(tight_row_bytes);
         capture->format = context->present_capture_format;
+        capture->graphics_api = context->present_capture_graphics_api;
+        capture->reserved = 0U;
         capture->byte_len = byte_len;
         capture->present_id = context->present_capture_id;
         capture->workload_id = context->present_capture_workload_id;

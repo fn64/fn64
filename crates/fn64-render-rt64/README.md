@@ -357,12 +357,19 @@ gamma/divot/dither equivalence. Metal retains its measured 20-run control;
 macOS compiles the Vulkan branch and static tests retain the D3D12 seam, but no
 Linux/Vulkan or Windows/Vulkan/D3D12 actual-hardware result is claimed.
 
-For fixed-cycle reports, `Rt64Backend::release_identity()` records the selected
-source tree as a clean/dirty Git revision or an explicitly declared source ID,
-the concrete post-VI API, and `adapter_sha256`: a canonical digest over the
-fn64-owned `Cargo.toml`, `build.rs`, every Rust adapter source, the CMake
-wrapper/shim sources, the compilation target, and the sorted enabled feature
-set. Cargo reruns the identity step when any covered source changes.
+For fixed-cycle reports, `RenderBackend::release_environment()` records the
+concrete graphics API observed from the completed capture framebuffer and
+command-list types, plus an API-specific RT64 identity. `Automatic` therefore
+resolves from the backend that actually produced the image; a missing or
+unknown capture backend and any explicit-request mismatch fail closed. The
+identity records the selected source tree as a clean/dirty Git revision or an
+explicitly declared source ID, the concrete post-VI API, and `adapter_sha256`:
+a canonical digest over the fn64-owned `Cargo.toml`, `build.rs`, every Rust
+adapter source, the CMake wrapper/shim sources, the compilation target, and the
+sorted enabled feature set. Cargo reruns the identity step when any covered
+source changes. The no-argument `Rt64Backend::release_identity()` is retained
+for non-release behavior examples and remains intentionally ambiguous on
+Windows; report generation never accepts that ambiguous identity.
 `LiveRenderEvidence` from `fn64-boot-harness`
 canonically encodes that identity with guest cycle, capture stage, dimensions,
 tight row size, BGRA8 format, the nonzero completed RT64 workload ID, present

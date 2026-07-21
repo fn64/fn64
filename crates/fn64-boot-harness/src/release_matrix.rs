@@ -2,7 +2,7 @@
 //!
 //! The manifest contains only the immutable project profile and evidence
 //! identities, never ROM bytes, captured output, or caller-authored coverage.
-//! Dynamic evidence remains the schema-v17 report series; coverage is derived
+//! Dynamic evidence remains the schema-v18 report series; coverage is derived
 //! from each validated report before it is compared with the fixed profile.
 
 use crate::{
@@ -10,10 +10,10 @@ use crate::{
     CertificationRequirementClass, CertificationRequirementRef, ClosurePath, ClosurePathStatus,
     DeterministicDigest, ExecutionDestinationEvidence, FramebufferObservationSource, FullParityV1,
     ParsedUnsupportedJournal, ReleaseCartridgeSave, ReleaseControllerPort,
-    ReleaseEnvironmentEvidence, ReleaseGateReport, ReleaseGraphicsExecutionPolicy,
-    ReleaseHostPlatform, ReleaseMicrocodeFamily, ReleaseObservationGeometry,
-    ReleaseRendererEvidence, ReportSeriesError, RspRdpEvidence, RspRdpObservationKindEvidence,
-    LIVE_MINIMUM_CLOSURE_PATHS,
+    ReleaseEnvironmentEvidence, ReleaseGateReport, ReleaseGraphicsApi,
+    ReleaseGraphicsExecutionPolicy, ReleaseHostPlatform, ReleaseMicrocodeFamily,
+    ReleaseObservationGeometry, ReleaseRendererEvidence, ReportSeriesError, RspRdpEvidence,
+    RspRdpObservationKindEvidence, LIVE_MINIMUM_CLOSURE_PATHS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,8 +23,8 @@ use std::{
 };
 
 pub const RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix.v5";
-pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v13";
-pub const INCOMPLETE_RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix-incomplete.v2";
+pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v14";
+pub const INCOMPLETE_RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix-incomplete.v3";
 pub const RELEASE_MATRIX_REPORT_COUNT: usize = 10;
 pub const RELEASE_MATRIX_MAX_SCENARIOS: usize = 64;
 
@@ -114,7 +114,7 @@ struct CertifiedMicrocodeIdentity {
     family: ReleaseMicrocodeFamily,
 }
 
-/// Immutable digest-to-family adjudication for matrix-v5/v13 certification.
+/// Immutable digest-to-family adjudication for matrix-v5/v14 certification.
 ///
 /// Runtime/backend admission remains host-configurable because it selects an
 /// optimization, not certification. Public-microcode denominator credit is
@@ -151,12 +151,12 @@ pub struct ReleaseMatrixScenario {
     /// Stable diagnostic key. Evidence is associated by `report_scenario`, not
     /// by a caller-provided command-line assignment.
     pub id: String,
-    /// Exact scenario string bound by every schema-v17 report in this series.
+    /// Exact scenario string bound by every schema-v18 report in this series.
     pub report_scenario: String,
     /// Exact private-input identity bound by every report; no input bytes are stored.
     pub input_sha256: String,
     pub report_sha256: String,
-    /// Canonical digest over this declaration and its exact v17 evidence IDs.
+    /// Canonical digest over this declaration and its exact v18 evidence IDs.
     pub declaration_sha256: String,
 }
 
@@ -230,12 +230,12 @@ pub struct VerifiedMatrixScenario {
     pub environment: ReleaseEnvironmentEvidence,
     pub closure_paths: u64,
     /// Exact destination sequence and canonical unique/count summary retained
-    /// from the verified v17 series.
+    /// from the verified v18 series.
     pub execution_destinations: ExecutionDestinationEvidence,
-    /// Complete schema-v17 RSP/RDP observation stream retained for independent
+    /// Complete schema-v18 RSP/RDP observation stream retained for independent
     /// report reconstruction and coverage derivation.
     pub rsp_rdp: RspRdpEvidence,
-    /// Exact canonical closure ledger retained from the verified v17 series.
+    /// Exact canonical closure ledger retained from the verified v18 series.
     /// A count alone cannot prove which feature-specific operation paths ran.
     pub closure: Vec<ClosurePath>,
     pub unsupported_events: u64,
@@ -496,9 +496,17 @@ impl VerifiedReleaseMatrix {
                 backend_identity, ..
             } = &scenario.observations.framebuffer.source
             {
+                let ReleaseRendererEvidence::Rt64 { graphics_api, .. } =
+                    &scenario.environment.renderer
+                else {
+                    return Err(ReleaseMatrixError::RendererEnvironmentMismatch {
+                        id: scenario.id.clone(),
+                    });
+                };
                 if crate::render_evidence::validate_authoritative_rt64_backend_identity(
                     backend_identity,
                     scenario.environment.platform,
+                    *graphics_api,
                 )
                 .is_err()
                 {
@@ -808,6 +816,14 @@ fn derive_profile_assignments(
             format!("{program}/{renderer}"),
             &scenario.declaration_sha256,
         );
+        if let Some(target) = platform_api_target(&scenario.environment) {
+            insert_requirement_evidence(
+                &mut evidence,
+                CertificationRequirementClass::PlatformApiTarget,
+                target.to_owned(),
+                &scenario.declaration_sha256,
+            );
+        }
         insert_requirement_evidence(
             &mut evidence,
             CertificationRequirementClass::Save,
@@ -854,6 +870,26 @@ fn derive_profile_assignments(
         }
     }
     (assignments, missing)
+}
+
+fn platform_api_target(environment: &ReleaseEnvironmentEvidence) -> Option<&'static str> {
+    match (environment.platform, &environment.renderer) {
+        (
+            ReleaseHostPlatform::MacosArm64,
+            ReleaseRendererEvidence::Rt64 {
+                graphics_api: ReleaseGraphicsApi::Metal,
+                ..
+            },
+        ) => Some("macos-metal"),
+        (
+            ReleaseHostPlatform::LinuxX86_64,
+            ReleaseRendererEvidence::Rt64 {
+                graphics_api: ReleaseGraphicsApi::Vulkan,
+                ..
+            },
+        ) => Some("linux-vulkan"),
+        _ => None,
+    }
 }
 
 fn insert_requirement_evidence(
@@ -969,6 +1005,7 @@ fn derive_scenario_coverage_with_catalog(
         (
             ReleaseRendererEvidence::Rt64 {
                 execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+                graphics_api,
                 backend_identity,
                 source_authoritative: true,
                 settings_sha256,
@@ -983,6 +1020,7 @@ fn derive_scenario_coverage_with_catalog(
             if crate::render_evidence::validate_authoritative_rt64_backend_identity(
                 backend_identity,
                 environment.platform,
+                *graphics_api,
             )
             .is_err()
             {
@@ -1682,7 +1720,7 @@ fn push_assignment(wire: &mut Vec<u8>, assignment: &CertificationRequirementAssi
 
 fn incomplete_matrix_sha256(report: &IncompleteReleaseMatrix) -> String {
     let mut wire = Vec::new();
-    wire.extend_from_slice(b"fn64.release-matrix-incomplete.v2\0");
+    wire.extend_from_slice(b"fn64.release-matrix-incomplete.v3\0");
     push_bytes(&mut wire, report.schema.as_bytes());
     push_bytes(&mut wire, report.manifest_sha256.as_bytes());
     push_bytes(&mut wire, report.profile.schema.as_bytes());
@@ -1703,7 +1741,7 @@ fn incomplete_matrix_sha256(report: &IncompleteReleaseMatrix) -> String {
 
 fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
     let mut wire = Vec::new();
-    wire.extend_from_slice(b"fn64.verified-release-matrix.v13\0");
+    wire.extend_from_slice(b"fn64.verified-release-matrix.v14\0");
     push_bytes(&mut wire, report.schema.as_bytes());
     push_bytes(&mut wire, report.manifest_sha256.as_bytes());
     push_bytes(&mut wire, report.profile.schema.as_bytes());
@@ -1886,6 +1924,7 @@ fn push_environment(wire: &mut Vec<u8>, environment: &ReleaseEnvironmentEvidence
         }
         ReleaseRendererEvidence::Rt64 {
             execution_policy,
+            graphics_api,
             backend_identity,
             source_authoritative,
             settings_sha256,
@@ -1893,6 +1932,7 @@ fn push_environment(wire: &mut Vec<u8>, environment: &ReleaseEnvironmentEvidence
         } => {
             wire.push(1);
             wire.push(release_execution_policy_tag(*execution_policy));
+            wire.push(release_graphics_api_tag(*graphics_api));
             push_bytes(wire, backend_identity.as_bytes());
             wire.push(*source_authoritative as u8);
             push_bytes(wire, settings_sha256.as_bytes());
@@ -1905,6 +1945,14 @@ const fn release_execution_policy_tag(policy: ReleaseGraphicsExecutionPolicy) ->
     match policy {
         ReleaseGraphicsExecutionPolicy::HleOptimized => 0,
         ReleaseGraphicsExecutionPolicy::LleAccuracy => 1,
+    }
+}
+
+const fn release_graphics_api_tag(api: ReleaseGraphicsApi) -> u8 {
+    match api {
+        ReleaseGraphicsApi::D3d12 => 0,
+        ReleaseGraphicsApi::Vulkan => 1,
+        ReleaseGraphicsApi::Metal => 2,
     }
 }
 
@@ -2283,6 +2331,19 @@ mod tests {
         ";provenance=git-clean;overlay=fn64-test;post_vi_api=vulkan-bgra8-rgba8-unorm"
     );
 
+    fn clean_rt64_identity_for(api: ReleaseGraphicsApi) -> String {
+        let post_vi_api = match api {
+            ReleaseGraphicsApi::D3d12 => "d3d12-bgra8-rgba8-unorm",
+            ReleaseGraphicsApi::Vulkan => "vulkan-bgra8-rgba8-unorm",
+            ReleaseGraphicsApi::Metal => "metal-bgra8-unorm",
+        };
+        format!(
+            "adapter=fn64-render-rt64/rt64;adapter_sha256={};source=git:{};provenance=git-clean;overlay=fn64-test;post_vi_api={post_vi_api}",
+            "aa".repeat(32),
+            "bb".repeat(20),
+        )
+    }
+
     fn closed_report(
         scenario: &str,
         input: &[u8],
@@ -2290,6 +2351,29 @@ mod tests {
         feature_path: &str,
         rt64_identity: &str,
         program: Option<ProgramFeature>,
+    ) -> ReleaseGateReport {
+        closed_report_with_rt64_environment(
+            scenario,
+            input,
+            framebuffer_byte,
+            feature_path,
+            rt64_identity,
+            program,
+            ReleaseHostPlatform::LinuxX86_64,
+            ReleaseGraphicsApi::Vulkan,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn closed_report_with_rt64_environment(
+        scenario: &str,
+        input: &[u8],
+        framebuffer_byte: u8,
+        feature_path: &str,
+        rt64_identity: &str,
+        program: Option<ProgramFeature>,
+        rt64_platform: ReleaseHostPlatform,
+        rt64_graphics_api: ReleaseGraphicsApi,
     ) -> ReleaseGateReport {
         let (observations, framebuffer_artifact) = if scenario.contains("rt64") {
             let render = LiveRenderEvidence::post_vi_swapchain(
@@ -2379,7 +2463,7 @@ mod tests {
         }
         let environment = ReleaseEnvironmentEvidence {
             platform: if is_rt64 {
-                ReleaseHostPlatform::LinuxX86_64
+                rt64_platform
             } else {
                 ReleaseHostPlatform::MacosArm64
             },
@@ -2401,6 +2485,7 @@ mod tests {
             renderer: if is_rt64 {
                 ReleaseRendererEvidence::Rt64 {
                     execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+                    graphics_api: rt64_graphics_api,
                     backend_identity: rt64_identity.to_owned(),
                     source_authoritative: true,
                     settings_sha256: "11".repeat(32),
@@ -2572,6 +2657,51 @@ mod tests {
         (manifest, evidence, incomplete)
     }
 
+    fn rt64_report_for_platform_api(
+        scenario_name: &str,
+        input: &[u8],
+        platform: ReleaseHostPlatform,
+        graphics_api: ReleaseGraphicsApi,
+    ) -> ReleaseGateReport {
+        let identity = clean_rt64_identity_for(graphics_api);
+        closed_report_with_rt64_environment(
+            scenario_name,
+            input,
+            0xc3,
+            "save.sram-operation",
+            &identity,
+            Some(ProgramFeature::TypedObservedFunction),
+            platform,
+            graphics_api,
+        )
+    }
+
+    fn incomplete_for_report(id: &str, report: ReleaseGateReport) -> IncompleteReleaseMatrix {
+        let manifest = ReleaseMatrixManifest {
+            schema: RELEASE_MATRIX_SCHEMA.to_owned(),
+            profile: CertificationProfileIdentity::full_parity_v1(),
+            scenarios: vec![scenario(id, &report)],
+        };
+        match verify_release_matrix(&manifest, &evidence_series(report)).unwrap() {
+            ReleaseMatrixVerification::Incomplete(incomplete) => incomplete,
+            ReleaseMatrixVerification::Complete(_) => {
+                panic!("one report series cannot cover the fixed full-parity denominator")
+            }
+        }
+    }
+
+    fn assigned_requirement_ids(
+        incomplete: &IncompleteReleaseMatrix,
+        class: CertificationRequirementClass,
+    ) -> BTreeSet<String> {
+        incomplete
+            .satisfied
+            .iter()
+            .filter(|assignment| assignment.requirement.class() == class)
+            .map(|assignment| assignment.requirement.id().to_owned())
+            .collect()
+    }
+
     fn replace_report(
         manifest: &mut ReleaseMatrixManifest,
         evidence: &mut Vec<(ReleaseGateReport, ParsedUnsupportedJournal)>,
@@ -2620,8 +2750,8 @@ mod tests {
         assert_eq!(FullParityV1::REQUIREMENT_COUNT, 162);
         assert_eq!(incomplete.verified_scenarios, 2);
         assert_eq!(incomplete.verified_reports, 20);
-        assert_eq!(incomplete.satisfied.len(), 6);
-        assert_eq!(incomplete.missing.len(), 156);
+        assert_eq!(incomplete.satisfied.len(), 7);
+        assert_eq!(incomplete.missing.len(), 155);
         assert_eq!(
             incomplete.manifest_sha256,
             manifest.recompute_manifest_sha256()
@@ -2669,6 +2799,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(standard.evidence_sha256s.len(), 2);
+        assert!(satisfied_keys.contains(&(
+            CertificationRequirementClass::PlatformApiTarget,
+            "linux-vulkan".to_owned(),
+        )));
 
         // Re-running the interleaved flat stream is deterministic.
         let rerun = match verify_release_matrix(&manifest, &evidence).unwrap() {
@@ -3118,9 +3252,181 @@ mod tests {
                 "standard_controller",
             ),
             (CertificationRequirementClass::Controller, "rumble_pak"),
+            (
+                CertificationRequirementClass::PlatformApiTarget,
+                "linux-vulkan",
+            ),
         ] {
             assert!(assigned.contains(&(key.0, key.1.to_owned())), "{key:?}");
         }
+    }
+
+    #[test]
+    fn exact_macos_metal_and_linux_vulkan_evidence_receive_platform_credit() {
+        assert_eq!(
+            clean_rt64_identity_for(ReleaseGraphicsApi::Vulkan),
+            CLEAN_RT64_IDENTITY,
+        );
+        for (scenario_name, platform, graphics_api, expected) in [
+            (
+                "exact-macos-rt64",
+                ReleaseHostPlatform::MacosArm64,
+                ReleaseGraphicsApi::Metal,
+                "macos-metal",
+            ),
+            (
+                "exact-linux-rt64",
+                ReleaseHostPlatform::LinuxX86_64,
+                ReleaseGraphicsApi::Vulkan,
+                "linux-vulkan",
+            ),
+        ] {
+            let report = rt64_report_for_platform_api(
+                scenario_name,
+                scenario_name.as_bytes(),
+                platform,
+                graphics_api,
+            );
+            let incomplete = incomplete_for_report(scenario_name, report);
+            assert_eq!(
+                assigned_requirement_ids(
+                    &incomplete,
+                    CertificationRequirementClass::PlatformApiTarget,
+                ),
+                BTreeSet::from([expected.to_owned()]),
+            );
+        }
+    }
+
+    #[test]
+    fn exact_windows_apis_do_not_claim_an_unobserved_windows_version() {
+        for (scenario_name, graphics_api) in [
+            ("exact-windows-d3d12-rt64", ReleaseGraphicsApi::D3d12),
+            ("exact-windows-vulkan-rt64", ReleaseGraphicsApi::Vulkan),
+        ] {
+            let report = rt64_report_for_platform_api(
+                scenario_name,
+                scenario_name.as_bytes(),
+                ReleaseHostPlatform::WindowsX86_64,
+                graphics_api,
+            );
+            let incomplete = incomplete_for_report(scenario_name, report);
+            assert!(assigned_requirement_ids(
+                &incomplete,
+                CertificationRequirementClass::PlatformApiTarget,
+            )
+            .is_empty());
+            let missing = requirement_keys(incomplete.missing);
+            for target in [
+                "windows10-d3d12",
+                "windows10-vulkan",
+                "windows11-d3d12",
+                "windows11-vulkan",
+            ] {
+                assert!(missing.contains(&(
+                    CertificationRequirementClass::PlatformApiTarget,
+                    target.to_owned(),
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn reference_platform_and_scenario_label_do_not_substitute_for_api_evidence() {
+        let report = closed_report(
+            "macos-metal",
+            b"reference-platform-only",
+            0xd4,
+            "save.eeprom-4k-operation",
+            CLEAN_RT64_IDENTITY,
+            Some(ProgramFeature::TypedObservedFunction),
+        );
+        assert_eq!(report.environment.platform, ReleaseHostPlatform::MacosArm64);
+        assert!(matches!(
+            report.environment.renderer,
+            ReleaseRendererEvidence::Reference { .. }
+        ));
+        let incomplete = incomplete_for_report("macos-metal", report);
+        assert!(assigned_requirement_ids(
+            &incomplete,
+            CertificationRequirementClass::PlatformApiTarget,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn graphics_api_changes_bind_environment_report_and_matrix_digests() {
+        let d3d12 = rt64_report_for_platform_api(
+            "windows-api-rt64",
+            b"same-private-input",
+            ReleaseHostPlatform::WindowsX86_64,
+            ReleaseGraphicsApi::D3d12,
+        );
+        let vulkan = rt64_report_for_platform_api(
+            "windows-api-rt64",
+            b"same-private-input",
+            ReleaseHostPlatform::WindowsX86_64,
+            ReleaseGraphicsApi::Vulkan,
+        );
+
+        let environment_sha256 = |environment: &ReleaseEnvironmentEvidence| {
+            let mut wire = Vec::new();
+            push_environment(&mut wire, environment);
+            hex(&Sha256::digest(wire))
+        };
+        let mut api_tag_only = d3d12.environment.clone();
+        let ReleaseRendererEvidence::Rt64 { graphics_api, .. } = &mut api_tag_only.renderer else {
+            unreachable!()
+        };
+        *graphics_api = ReleaseGraphicsApi::Vulkan;
+        assert_ne!(
+            environment_sha256(&d3d12.environment),
+            environment_sha256(&api_tag_only),
+            "the typed API tag must bind the environment wire independently of the identity string",
+        );
+        assert_ne!(
+            environment_sha256(&d3d12.environment),
+            environment_sha256(&vulkan.environment),
+        );
+        assert_ne!(d3d12.report_sha256, vulkan.report_sha256);
+
+        let d3d12_declaration = scenario("windows-api", &d3d12);
+        let vulkan_declaration = scenario("windows-api", &vulkan);
+        assert_ne!(
+            d3d12_declaration.declaration_sha256,
+            vulkan_declaration.declaration_sha256,
+        );
+        assert_ne!(
+            incomplete_for_report("windows-api", d3d12).assessment_sha256,
+            incomplete_for_report("windows-api", vulkan).assessment_sha256,
+        );
+    }
+
+    #[test]
+    fn stale_verified_v13_and_incomplete_v2_schemas_are_rejected() {
+        let (_, _, incomplete) = incomplete_fixture();
+        let mut stale_incomplete = incomplete;
+        stale_incomplete.schema = "fn64.release-matrix-incomplete.v2".to_owned();
+        assert!(matches!(
+            stale_incomplete.verify_integrity(),
+            Err(ReleaseMatrixError::UnsupportedIncompleteSchema(schema))
+                if schema == "fn64.release-matrix-incomplete.v2"
+        ));
+
+        let stale_verified = VerifiedReleaseMatrix {
+            schema: "fn64.verified-release-matrix.v13".to_owned(),
+            manifest_sha256: "00".repeat(32),
+            profile: CertificationProfileIdentity::full_parity_v1(),
+            total_reports: 0,
+            scenarios: Vec::new(),
+            assignments: Vec::new(),
+            verification_sha256: "11".repeat(32),
+        };
+        assert!(matches!(
+            stale_verified.verify_integrity(),
+            Err(ReleaseMatrixError::UnsupportedVerifiedSchema(schema))
+                if schema == "fn64.verified-release-matrix.v13"
+        ));
     }
 
     #[test]

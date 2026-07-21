@@ -2,13 +2,13 @@ use std::ffi::{c_char, c_int, CStr, CString};
 use std::ptr::NonNull;
 
 use fn64_render::{
-    AspectTarget, DownsampleMultiplier, OsTask, RefreshRateTarget, RenderAntialiasing,
-    RenderAspectRatio, RenderDisplayBuffering, RenderEmulatorSettings, RenderEnhancementSettings,
-    RenderFiltering, RenderGraphicsApi, RenderHardwareResolve, RenderInternalColorFormat,
-    RenderPresentationMode, RenderRefreshRate, RenderReplacementAutoPath,
-    RenderReplacementOperation, RenderReplacementPackIdentity, RenderReplacementShift,
-    RenderResolution, RenderRuntimeSettings, RenderUpscale2d, ResolutionMultiplier, ViPixelType,
-    ViPresentation,
+    ActiveRenderGraphicsApi, AspectTarget, DownsampleMultiplier, OsTask, RefreshRateTarget,
+    RenderAntialiasing, RenderAspectRatio, RenderDisplayBuffering, RenderEmulatorSettings,
+    RenderEnhancementSettings, RenderFiltering, RenderGraphicsApi, RenderHardwareResolve,
+    RenderInternalColorFormat, RenderPresentationMode, RenderRefreshRate,
+    RenderReplacementAutoPath, RenderReplacementOperation, RenderReplacementPackIdentity,
+    RenderReplacementShift, RenderResolution, RenderRuntimeSettings, RenderUpscale2d,
+    ResolutionMultiplier, ViPixelType, ViPresentation,
 };
 use fn64_runtime::{RspMemAddr, RspMemory, RspMemoryBank};
 
@@ -101,16 +101,25 @@ struct RawPresentCapture {
     height: u32,
     row_bytes: u32,
     format: u32,
+    graphics_api: u32,
+    reserved: u32,
     byte_len: u64,
     present_id: u64,
     workload_id: u64,
 }
 
-const _: [(); 40] = [(); std::mem::size_of::<RawPresentCapture>()];
+const _: [(); 48] = [(); std::mem::size_of::<RawPresentCapture>()];
 
 fn validate_present_capture_metadata(
     metadata: RawPresentCapture,
-) -> Result<(usize, crate::Rt64PresentPixelFormat), String> {
+) -> Result<
+    (
+        usize,
+        crate::Rt64PresentPixelFormat,
+        ActiveRenderGraphicsApi,
+    ),
+    String,
+> {
     if metadata.present_id == 0
         || metadata.workload_id == 0
         || metadata.width == 0
@@ -128,6 +137,9 @@ fn validate_present_capture_metadata(
     }
     let host_len = usize::try_from(byte_len)
         .map_err(|_| "RT64 present capture exceeds host address space".to_string())?;
+    if metadata.reserved != 0 {
+        return Err("RT64 present capture returned nonzero reserved metadata".into());
+    }
     let format = match metadata.format {
         1 => crate::Rt64PresentPixelFormat::Bgra8Unorm,
         2 => crate::Rt64PresentPixelFormat::Rgba8Unorm,
@@ -137,7 +149,17 @@ fn validate_present_capture_metadata(
             ))
         }
     };
-    Ok((host_len, format))
+    let graphics_api = match metadata.graphics_api {
+        1 => ActiveRenderGraphicsApi::D3d12,
+        2 => ActiveRenderGraphicsApi::Vulkan,
+        3 => ActiveRenderGraphicsApi::Metal,
+        value => {
+            return Err(format!(
+                "RT64 returned unknown present graphics API {value}"
+            ))
+        }
+    };
+    Ok((host_len, format, graphics_api))
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -2325,6 +2347,34 @@ impl Context {
         }
     }
 
+    /// Concrete graphics API observed from the most recent completed capture.
+    /// The C++ hook publishes this under the same mutex and generation as the
+    /// pixel geometry, so requested settings cannot manufacture the value.
+    pub(crate) fn presented_graphics_api(&self) -> Result<ActiveRenderGraphicsApi, String> {
+        let mut metadata = RawPresentCapture::default();
+        let mut error = [0; ERROR_CAPACITY];
+        // SAFETY: the context is alive. The C++ metadata-only query locks the
+        // capture owner and writes only the caller-owned output/error buffers.
+        let queried = unsafe {
+            fn64_rt64_read_present_capture(
+                self.0.as_ptr(),
+                &mut metadata,
+                std::ptr::null_mut(),
+                0,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if queried == 0 {
+            return Err(error_string(
+                &error,
+                "RT64 present capture query failed without a diagnostic",
+            ));
+        }
+        let (_, _, graphics_api) = validate_present_capture_metadata(metadata)?;
+        Ok(graphics_api)
+    }
+
     pub(crate) fn presented_pixels(&mut self) -> Result<crate::Rt64PresentedPixels, String> {
         let mut metadata = RawPresentCapture::default();
         let mut error = [0; ERROR_CAPACITY];
@@ -2346,7 +2396,7 @@ impl Context {
                 "RT64 present capture query failed without a diagnostic",
             ));
         }
-        let (byte_len, format) = validate_present_capture_metadata(metadata)?;
+        let (byte_len, format, graphics_api) = validate_present_capture_metadata(metadata)?;
         let mut bytes = vec![0; byte_len];
         let queried_metadata = metadata;
         error.fill(0);
@@ -2377,6 +2427,7 @@ impl Context {
             height: metadata.height,
             row_bytes: metadata.row_bytes,
             format,
+            graphics_api,
             present_id: metadata.present_id,
             workload_id: metadata.workload_id,
             bytes,
@@ -3068,6 +3119,8 @@ mod tests {
             height: 2,
             row_bytes: 12,
             format,
+            graphics_api: 2,
+            reserved: 0,
             byte_len: 24,
             present_id: 11,
             workload_id: 7,
@@ -3075,15 +3128,24 @@ mod tests {
     }
 
     #[test]
-    fn portable_present_capture_abi_accepts_exact_bgra_and_rgba_geometry() {
-        assert_eq!(
-            validate_present_capture_metadata(present_capture_wire(1)).unwrap(),
-            (24, crate::Rt64PresentPixelFormat::Bgra8Unorm)
-        );
-        assert_eq!(
-            validate_present_capture_metadata(present_capture_wire(2)).unwrap(),
-            (24, crate::Rt64PresentPixelFormat::Rgba8Unorm)
-        );
+    fn portable_present_capture_abi_accepts_exact_geometry_format_and_observed_api() {
+        for (format_tag, format) in [
+            (1, crate::Rt64PresentPixelFormat::Bgra8Unorm),
+            (2, crate::Rt64PresentPixelFormat::Rgba8Unorm),
+        ] {
+            for (api_tag, graphics_api) in [
+                (1, ActiveRenderGraphicsApi::D3d12),
+                (2, ActiveRenderGraphicsApi::Vulkan),
+                (3, ActiveRenderGraphicsApi::Metal),
+            ] {
+                let mut capture = present_capture_wire(format_tag);
+                capture.graphics_api = api_tag;
+                assert_eq!(
+                    validate_present_capture_metadata(capture).unwrap(),
+                    (24, format, graphics_api)
+                );
+            }
+        }
     }
 
     #[test]
@@ -3101,6 +3163,18 @@ mod tests {
                 workload_id: 0,
                 ..present_capture_wire(1)
             },
+            RawPresentCapture {
+                graphics_api: 0,
+                ..present_capture_wire(1)
+            },
+            RawPresentCapture {
+                graphics_api: 4,
+                ..present_capture_wire(1)
+            },
+            RawPresentCapture {
+                reserved: 1,
+                ..present_capture_wire(1)
+            },
         ] {
             assert!(validate_present_capture_metadata(invalid).is_err());
         }
@@ -3114,6 +3188,8 @@ mod tests {
             "vkCmdCopyImageToBuffer(",
             "D3D12_TEXTURE_DATA_PITCH_ALIGNMENT",
             "d3d_list->d3d->CopyTextureRegion(",
+            "present_capture_graphics_api = capture_graphics_api;",
+            "capture->graphics_api = context->present_capture_graphics_api;",
             "waitForPresentId(submitted_present);",
             "completed.workloadId",
         ] {

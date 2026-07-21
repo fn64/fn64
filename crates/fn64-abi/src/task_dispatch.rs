@@ -3047,6 +3047,7 @@ mod tests {
                 fn64_render::RenderBackendEvidence::Rt64 {
                     backend_identity: "synthetic-release-backend".to_string(),
                     source_authoritative: true,
+                    graphics_api: fn64_render::ActiveRenderGraphicsApi::Vulkan,
                     settings_sha256: [0x5a; 32],
                     replacement_packs_active: false,
                 }
@@ -3113,6 +3114,7 @@ mod tests {
                 backend: fn64_render::RenderBackendEvidence::Rt64 {
                     backend_identity: "synthetic-release-backend".to_string(),
                     source_authoritative: true,
+                    graphics_api: fn64_render::ActiveRenderGraphicsApi::Vulkan,
                     settings_sha256: [0x5a; 32],
                     replacement_packs_active: false,
                 },

@@ -23,11 +23,12 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     FramebufferObservationSource, ObservationEvidenceError, ReleaseCartridgeSave,
-    ReleaseControllerPort, ReleaseEnvironmentEvidence, ReleaseGraphicsExecutionPolicy,
-    ReleaseHostPlatform, ReleaseObservationGeometry, ReleaseRendererEvidence,
+    ReleaseControllerPort, ReleaseEnvironmentEvidence, ReleaseGraphicsApi,
+    ReleaseGraphicsExecutionPolicy, ReleaseHostPlatform, ReleaseObservationGeometry,
+    ReleaseRendererEvidence,
 };
 
-pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v17";
+pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v18";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -1397,10 +1398,16 @@ fn environment_from_frozen(
         fn64_abi::RenderBackendEvidence::Rt64 {
             backend_identity,
             source_authoritative,
+            graphics_api,
             settings_sha256,
             replacement_packs_active,
         } => ReleaseRendererEvidence::Rt64 {
             execution_policy,
+            graphics_api: match graphics_api {
+                fn64_abi::ActiveRenderGraphicsApi::D3d12 => ReleaseGraphicsApi::D3d12,
+                fn64_abi::ActiveRenderGraphicsApi::Vulkan => ReleaseGraphicsApi::Vulkan,
+                fn64_abi::ActiveRenderGraphicsApi::Metal => ReleaseGraphicsApi::Metal,
+            },
             backend_identity,
             source_authoritative,
             settings_sha256: hex(&settings_sha256),
@@ -1467,6 +1474,7 @@ fn validate_environment_evidence(
         }
     }
     if let ReleaseRendererEvidence::Rt64 {
+        graphics_api,
         backend_identity,
         source_authoritative,
         settings_sha256,
@@ -1484,6 +1492,7 @@ fn validate_environment_evidence(
         crate::render_evidence::validate_authoritative_rt64_backend_identity(
             backend_identity,
             environment.platform,
+            *graphics_api,
         )
         .map_err(|_| {
             GateError::RendererObservationMismatch(
@@ -1508,6 +1517,13 @@ fn test_release_environment(
             ..
         } => ReleaseRendererEvidence::Rt64 {
             execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+            graphics_api: match super::release_host_platform()
+                .expect("test platform is release-supported")
+            {
+                ReleaseHostPlatform::MacosArm64 => ReleaseGraphicsApi::Metal,
+                ReleaseHostPlatform::LinuxX86_64 => ReleaseGraphicsApi::Vulkan,
+                ReleaseHostPlatform::WindowsX86_64 => ReleaseGraphicsApi::D3d12,
+            },
             backend_identity: backend_identity.clone(),
             source_authoritative: true,
             settings_sha256: settings_sha256.clone(),
@@ -1718,7 +1734,7 @@ impl ReleaseGateReport {
         )
     }
 
-    /// Recompute the schema-v17 evidence digest after loading a retained JSON
+    /// Recompute the schema-v18 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {
@@ -3859,6 +3875,7 @@ pub(crate) fn encode_report_evidence(report: &ReleaseGateReport) -> Result<Vec<u
         }
         ReleaseRendererEvidence::Rt64 {
             execution_policy,
+            graphics_api,
             backend_identity,
             source_authoritative,
             settings_sha256,
@@ -3866,6 +3883,7 @@ pub(crate) fn encode_report_evidence(report: &ReleaseGateReport) -> Result<Vec<u
         } => {
             out.push(1);
             out.push(encode_graphics_execution_policy(*execution_policy));
+            out.push(encode_graphics_api(*graphics_api));
             push_bytes(&mut out, backend_identity.as_bytes());
             out.push(*source_authoritative as u8);
             out.extend_from_slice(&decode_sha256(settings_sha256).ok_or(
@@ -3921,6 +3939,14 @@ const fn encode_graphics_execution_policy(policy: ReleaseGraphicsExecutionPolicy
     }
 }
 
+const fn encode_graphics_api(api: ReleaseGraphicsApi) -> u8 {
+    match api {
+        ReleaseGraphicsApi::D3d12 => 0,
+        ReleaseGraphicsApi::Vulkan => 1,
+        ReleaseGraphicsApi::Metal => 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3934,17 +3960,29 @@ mod tests {
         ReleaseObservationGeometry::reference_rdram(0, 1, 1).unwrap()
     }
 
-    fn authoritative_rt64_identity() -> String {
-        let post_vi_api = match crate::release_host_platform().unwrap() {
-            ReleaseHostPlatform::MacosArm64 => "metal-bgra8-unorm",
-            ReleaseHostPlatform::LinuxX86_64 => "vulkan-bgra8-rgba8-unorm",
-            ReleaseHostPlatform::WindowsX86_64 => "d3d12-or-vulkan-bgra8-rgba8-unorm",
+    fn authoritative_rt64_identity_for(graphics_api: ReleaseGraphicsApi) -> String {
+        let post_vi_api = match graphics_api {
+            ReleaseGraphicsApi::D3d12 => "d3d12-bgra8-rgba8-unorm",
+            ReleaseGraphicsApi::Vulkan => "vulkan-bgra8-rgba8-unorm",
+            ReleaseGraphicsApi::Metal => "metal-bgra8-unorm",
         };
         format!(
             "adapter=fn64-render-rt64/rt64;adapter_sha256={};source=git:{};provenance=git-clean;overlay=test;post_vi_api={post_vi_api}",
             "a".repeat(64),
             "b".repeat(40),
         )
+    }
+
+    fn authoritative_rt64_identity() -> String {
+        authoritative_rt64_identity_for(current_test_graphics_api())
+    }
+
+    fn current_test_graphics_api() -> ReleaseGraphicsApi {
+        match crate::release_host_platform().unwrap() {
+            ReleaseHostPlatform::MacosArm64 => ReleaseGraphicsApi::Metal,
+            ReleaseHostPlatform::LinuxX86_64 => ReleaseGraphicsApi::Vulkan,
+            ReleaseHostPlatform::WindowsX86_64 => ReleaseGraphicsApi::D3d12,
+        }
     }
 
     fn snapshot(cycle: u64) -> DeviceEvidenceSnapshot {
@@ -4491,12 +4529,12 @@ mod tests {
     }
 
     #[test]
-    fn schema_v17_fixed_cycle_digest_is_stable_and_complete() {
+    fn schema_v18_fixed_cycle_digest_is_stable_and_complete() {
         assert_eq!(complete_digest(), complete_digest());
         assert_eq!(complete_digest().artifacts.len(), 5);
         assert_eq!(
             complete_digest().root_sha256,
-            "a45253b2b1f2cf72a46f9a7f8226c1235a779f4d421e22d36f37118588c62eae"
+            "59d8d53cf3bf84e24eb01406aa3b251385214c6e7bc97007df1bfca80bdcc8e4"
         );
     }
 
@@ -5593,11 +5631,11 @@ mod tests {
         ));
 
         let mut stale_schema = report.clone();
-        stale_schema.schema = "fn64.release-gate.v14".to_owned();
+        stale_schema.schema = "fn64.release-gate.v17".to_owned();
         assert!(matches!(
             stale_schema.verify_integrity(),
             Err(GateError::UnsupportedReportSchema(schema))
-                if schema == "fn64.release-gate.v14"
+                if schema == "fn64.release-gate.v17"
         ));
 
         let duplicate = vec![report.closure[0].clone(), report.closure[0].clone()];
@@ -5614,7 +5652,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v17_report_wire_binds_every_release_environment_field() {
+    fn schema_v18_report_wire_binds_every_release_environment_field() {
         let report = ReleaseGateReport::new(
             "environment-wire",
             b"input",
@@ -5685,6 +5723,7 @@ mod tests {
         let mut rt64 = report.clone();
         rt64.environment.renderer = ReleaseRendererEvidence::Rt64 {
             execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+            graphics_api: current_test_graphics_api(),
             backend_identity: authoritative_rt64_identity(),
             source_authoritative: true,
             settings_sha256: "11".repeat(32),
@@ -5692,6 +5731,27 @@ mod tests {
         };
         let rt64_baseline = digest(&rt64);
         assert_ne!(rt64_baseline, baseline, "renderer class collided");
+
+        let mut changed = rt64.clone();
+        let ReleaseRendererEvidence::Rt64 {
+            execution_policy, ..
+        } = &mut changed.environment.renderer
+        else {
+            unreachable!()
+        };
+        *execution_policy = ReleaseGraphicsExecutionPolicy::HleOptimized;
+        assert_ne!(digest(&changed), rt64_baseline, "RT64 policy collided");
+
+        let mut changed = rt64.clone();
+        let ReleaseRendererEvidence::Rt64 { graphics_api, .. } = &mut changed.environment.renderer
+        else {
+            unreachable!()
+        };
+        *graphics_api = match *graphics_api {
+            ReleaseGraphicsApi::D3d12 => ReleaseGraphicsApi::Vulkan,
+            ReleaseGraphicsApi::Vulkan | ReleaseGraphicsApi::Metal => ReleaseGraphicsApi::D3d12,
+        };
+        assert_ne!(digest(&changed), rt64_baseline, "graphics API collided");
 
         let mut changed = rt64.clone();
         let ReleaseRendererEvidence::Rt64 {
@@ -5785,10 +5845,119 @@ mod tests {
     }
 
     #[test]
+    fn frozen_environment_derivation_preserves_each_concrete_graphics_api() {
+        let platform = crate::release_host_platform().expect("supported test platform");
+        let mut host = host_snapshot();
+        host.cartridge_save = fn64_abi::CartridgeSaveEvidenceSnapshot::NoCartridgeSave;
+
+        for (active, expected) in [
+            (
+                fn64_abi::ActiveRenderGraphicsApi::D3d12,
+                ReleaseGraphicsApi::D3d12,
+            ),
+            (
+                fn64_abi::ActiveRenderGraphicsApi::Vulkan,
+                ReleaseGraphicsApi::Vulkan,
+            ),
+            (
+                fn64_abi::ActiveRenderGraphicsApi::Metal,
+                ReleaseGraphicsApi::Metal,
+            ),
+        ] {
+            let environment = environment_from_frozen(
+                platform,
+                &host,
+                fn64_abi::RenderEnvironmentEvidenceSnapshot {
+                    backend: fn64_abi::RenderBackendEvidence::Rt64 {
+                        backend_identity: authoritative_rt64_identity_for(expected),
+                        source_authoritative: true,
+                        graphics_api: active,
+                        settings_sha256: [0x11; 32],
+                        replacement_packs_active: false,
+                    },
+                    execution_policy: fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy,
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                environment.renderer,
+                ReleaseRendererEvidence::Rt64 { graphics_api, .. } if graphics_api == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn release_renderer_json_requires_a_concrete_rt64_api_only() {
+        let rt64 = serde_json::json!({
+            "kind": "rt64",
+            "execution_policy": "lle_accuracy",
+            "graphics_api": "automatic",
+            "backend_identity": "identity",
+            "source_authoritative": true,
+            "settings_sha256": "11".repeat(32),
+            "replacement_packs_active": false,
+        });
+        assert!(serde_json::from_value::<ReleaseRendererEvidence>(rt64).is_err());
+
+        let reference_with_api = serde_json::json!({
+            "kind": "reference",
+            "execution_policy": "lle_accuracy",
+            "graphics_api": "vulkan",
+        });
+        assert!(
+            serde_json::from_value::<ReleaseRendererEvidence>(reference_with_api).is_err(),
+            "reference evidence must reject an RT64-only graphics API field"
+        );
+    }
+
+    #[test]
+    fn release_environment_rejects_cross_platform_graphics_api_pair() {
+        let platform = crate::release_host_platform().expect("supported test platform");
+        let valid_api = current_test_graphics_api();
+        let environment = ReleaseEnvironmentEvidence {
+            platform,
+            controller_ports: [ReleaseControllerPort::Absent; 4],
+            cartridge_save: ReleaseCartridgeSave::NoCartridgeSave,
+            renderer: ReleaseRendererEvidence::Rt64 {
+                execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+                graphics_api: valid_api,
+                backend_identity: authoritative_rt64_identity_for(valid_api),
+                source_authoritative: true,
+                settings_sha256: "11".repeat(32),
+                replacement_packs_active: false,
+            },
+        };
+        validate_environment_evidence(&environment).unwrap();
+
+        let invalid_api = match platform {
+            ReleaseHostPlatform::MacosArm64 | ReleaseHostPlatform::LinuxX86_64 => {
+                ReleaseGraphicsApi::D3d12
+            }
+            ReleaseHostPlatform::WindowsX86_64 => ReleaseGraphicsApi::Metal,
+        };
+        let mut invalid = environment;
+        let ReleaseRendererEvidence::Rt64 {
+            graphics_api,
+            backend_identity,
+            ..
+        } = &mut invalid.renderer
+        else {
+            unreachable!()
+        };
+        *graphics_api = invalid_api;
+        *backend_identity = authoritative_rt64_identity_for(invalid_api);
+        assert!(matches!(
+            validate_environment_evidence(&invalid),
+            Err(GateError::RendererObservationMismatch(_))
+        ));
+    }
+
+    #[test]
     fn report_rejects_untrusted_or_mismatched_renderer_evidence() {
         let mut environment = test_release_environment(&observations());
         environment.renderer = ReleaseRendererEvidence::Rt64 {
             execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+            graphics_api: current_test_graphics_api(),
             backend_identity: "rt64-test".to_owned(),
             source_authoritative: false,
             settings_sha256: "11".repeat(32),
@@ -5809,6 +5978,7 @@ mod tests {
         let mut environment = test_release_environment(&observations());
         environment.renderer = ReleaseRendererEvidence::Rt64 {
             execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+            graphics_api: current_test_graphics_api(),
             backend_identity: "rt64-test".to_owned(),
             source_authoritative: true,
             settings_sha256: "11".repeat(32),
@@ -6282,7 +6452,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v17_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
+    fn schema_v18_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
         let geometry = observations();
         let graphics_closure = vec![ClosurePath {
             name: "rsp.graphics-task".to_owned(),
