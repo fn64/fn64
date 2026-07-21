@@ -52,7 +52,7 @@ pub const MAX_TABLE_STRIDE: usize = 12;
 /// pointers cannot fabricate a table: each extra slot is another independent
 /// "this word is a 4-aligned in-range function boundary" coincidence, so the
 /// false-positive probability falls geometrically with run length. Requiring
-/// >=6 slots past stride 4 keeps wrong==0 while admitting the real
+/// At least six slots past stride 4 keeps wrong==0 while admitting the real
 /// stride-6/12 struct-array tables (observed runs are length 34-60).
 fn min_run_for_stride(stride: usize, base_min_run: usize) -> usize {
     if stride <= 4 {
