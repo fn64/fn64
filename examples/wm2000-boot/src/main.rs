@@ -355,6 +355,19 @@ fn main() {
     const WM2000_VOICE_MAP_BYTES: u32 = 0x248;
     let mut last_chan_array_ptr = 0u32;
 
+    // Determinism forensics (2026-07-21 wild-pointer rung): dump the full
+    // RDRAM image at an exact scheduler step so two runs of the SAME binary
+    // can be byte-diffed -- any difference at the same virtual point is
+    // host-derived nondeterminism reaching guest memory. Env-gated; both
+    // vars must be set: WM2000_SNAPSHOT_STEP=<step> WM2000_SNAPSHOT_PATH=<file>.
+    let snapshot_step = std::env::var("WM2000_SNAPSHOT_STEP")
+        .ok()
+        .map(|raw| {
+            raw.parse::<u64>()
+                .unwrap_or_else(|_| panic!("WM2000_SNAPSHOT_STEP must be an integer, got {raw:?}"))
+        });
+    let snapshot_path = std::env::var_os("WM2000_SNAPSHOT_PATH").map(std::path::PathBuf::from);
+
     let mut tick = 0u64;
     let mut steps = 0u64;
     loop {
@@ -376,6 +389,19 @@ fn main() {
         unsafe { fn64_abi::sync_mmio_into_rdram(rdram_ptr) };
         let stepped = fn64_abi::run_one_step();
         steps += 1;
+        if let (Some(target), Some(path)) = (snapshot_step, snapshot_path.as_deref()) {
+            if steps == target {
+                std::fs::write(path, &rdram).expect("writing rdram snapshot");
+                println!(
+                    "[wm2000-boot] rdram snapshot at step {steps} (sim_time={}) written to {} -- \
+                     exiting for determinism diff",
+                    fn64_abi::sim_time(),
+                    path.display()
+                );
+                fn64_abi::shutdown_abandon_threads();
+                std::process::exit(0);
+            }
+        }
         // Virgin-allocation reproduction for the AKI voice maps -- see the
         // block comment above `last_chan_array_ptr` for the full story.
         {
