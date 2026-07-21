@@ -5,8 +5,8 @@ use std::io;
 use fn64_render::{
     vi_public_filters::{gamma_dither_quantize_bounded_v1, reference_noise_bit_v1},
     ActiveRenderGraphicsApi, FrameStatus, ReleaseCaptureFormat, RenderBackend, RenderConfig,
-    RenderGraphicsApi, RenderRuntimeSettings, ViPresentation, ViScaleAxis, ViScanoutRegisters,
-    ViScanoutState,
+    RenderFiltering, RenderGraphicsApi, RenderRuntimeSettings, ViPresentation, ViScaleAxis,
+    ViScanoutRegisters, ViScanoutState,
 };
 use fn64_render_rt64::{Rt64Backend, Rt64PresentedPixels, Rt64SourceProvenance};
 use fn64_runtime::TvType;
@@ -15,22 +15,23 @@ use sha2::{Digest, Sha256};
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
 const COMMANDS: usize = 0x100;
 const TARGET: u32 = 0x4000;
-const SOURCE_WIDTH: u32 = 12;
+const SOURCE_WIDTH: u32 = OUTPUT_WIDTH;
 const SOURCE_HEIGHT: u32 = 10;
 const OUTPUT_WIDTH: u32 = 8;
 const OUTPUT_HEIGHT: u32 = 6;
 const PINNED_SOURCE: &str = "git:f0728a2520d5aa735886240de3fee75cc805f6d6";
-const BASELINE_SHA256: &str = "e1d959640644ed83214b89a238802ac82fc7e4b853131ff250f1f16f842ca355";
-const GAMMA_SHA256: &str = "2281b631918039786430a3831ec3a6237b51171c61852bc44cf2fa88c6089a15";
+const BASELINE_SHA256: &str = "55b476df63658cc6a3c15ab2e978bc2030eccdc9194bdaa6afbfe581539aaca4";
+const GAMMA_SHA256: &str = "41b230deb3d61c1f03b231b9428396fa9da169521d14817c6c915124e1200d5d";
 const DITHER_ONLY_A_SHA256: &str =
-    "41ed92021430493334b9969e5d0b019ec25993046e2c6329c82203d0d35e4ba5";
+    "29db07a52f2199264f4dd5022e47dedb0de727019f3e6f213c2b92508c3103ef";
 const DITHER_ONLY_B_SHA256: &str =
-    "35a50a6b954b66990fce8457870180444a91a0417255c6abb31d2bcfbdcae968";
+    "e6dcc40248e4b966ef681a5d73a70d89ed4cd3a6e3125b41470229e609cbf48d";
 const GAMMA_DITHER_A_SHA256: &str =
-    "667576d5590d25255becda4e30ea9aaca2ad13f2a2497b69d8f668b0154975e6";
+    "baeafa1b3e01ef013570885023886d6cd4781668ca42d923bb73324b66f35ef2";
 const GAMMA_DITHER_B_SHA256: &str =
-    "d71bb4498d9d9bef5cc64acfed849d4a001308882ca976325abed5599fc29165";
-const SCALED_SHA256: &str = "9549acd7464bb0da111623f1d5162803e05a1c4892755446764cf3eb73a8070a";
+    "c2f9b761b11daaa90b1ef6888da78bbd85ff57efe2d2146830913df40976bf44";
+const DIVOT_SHA256: &str = "bc3960ac3a5a7866c542fef9cfcdee9e61ec624b23f04e0e3a11fb6a55fd01ff";
+const SCALED_SHA256: &str = "02f32a8ee16f7302c13bc06550f12801e59e4aaf29d66cae273c2dd3eba1da8b";
 
 const STATUS_RGBA16_AA_ALWAYS: u32 = 0x002;
 const STATUS_RGBA16_AA_NEEDED: u32 = 0x102;
@@ -40,6 +41,10 @@ const STATUS_GAMMA: u32 = 1 << 3;
 const STATUS_GAMMA_DITHER: u32 = 1 << 2;
 const STATUS_DIVOT: u32 = 1 << 4;
 const STATUS_DITHER_FILTER: u32 = 1 << 16;
+const CVG_DST_CLAMP: u32 = 0;
+const CVG_DST_SAVE: u32 = 0x300;
+const FULL_COVERAGE_SOURCE_ROWS: u32 = 4;
+const EXPECTED_DIVOT_CHANGED_PIXELS: usize = 9;
 
 #[derive(Clone, Copy, Debug)]
 struct Phase {
@@ -70,17 +75,16 @@ fn push_command(rdram: &mut [u8], cursor: &mut usize, w0: u32, w1: u32) {
     *cursor += 8;
 }
 
-fn rgba16(x: u32, y: u32) -> u16 {
-    let red = (x * 2 + y * 3 + 3) & 31;
-    let green = (x * 5 + y * 2 + 7) & 31;
-    let blue = (x * 3 + y * 7 + 11) & 31;
-    ((red << 11) | (green << 6) | (blue << 1) | 1) as u16
+fn rgba16(x: u32, full_coverage: bool) -> u16 {
+    let red = (x * 2 + 3) & 31;
+    let green = (x * 5 + 7) & 31;
+    let blue = (x * 3 + 11) & 31;
+    ((red << 11) | (green << 6) | (blue << 1) | u32::from(full_coverage)) as u16
 }
 
 fn fixture() -> (Vec<u8>, u32) {
     let mut rdram = vec![0; RDRAM_LEN];
     let mut cursor = COMMANDS;
-    push_command(&mut rdram, &mut cursor, 0xef00_0000 | (3 << 20), 0);
     push_command(
         &mut rdram,
         &mut cursor,
@@ -89,8 +93,20 @@ fn fixture() -> (Vec<u8>, u32) {
     );
 
     for y in 0..SOURCE_HEIGHT {
+        // The visible upper half is an otherwise identical full-coverage
+        // control; the lower half preserves the clear target alpha as
+        // non-full coverage. This proves the VI stage gates on RT64's retained
+        // coverage estimate without pretending host edge samples are N64
+        // coverage.
+        let full_coverage = y < FULL_COVERAGE_SOURCE_ROWS;
+        let cvg_dst = if full_coverage {
+            CVG_DST_CLAMP
+        } else {
+            CVG_DST_SAVE
+        };
+        push_command(&mut rdram, &mut cursor, 0xef00_0000 | (3 << 20), cvg_dst);
         for x in 0..SOURCE_WIDTH {
-            let color = u32::from(rgba16(x, y));
+            let color = u32::from(rgba16(x, full_coverage));
             push_command(&mut rdram, &mut cursor, 0xf700_0000, (color << 16) | color);
             push_command(
                 &mut rdram,
@@ -101,19 +117,6 @@ fn fixture() -> (Vec<u8>, u32) {
         }
     }
 
-    // A public edge-only fill triangle introduces a partial-coverage diagonal
-    // for the native VI divot/AA controls. The command words follow the SGI
-    // RDP Command Summary edge-coefficient layout used by fn64's raw decoder.
-    push_command(&mut rdram, &mut cursor, 0xf700_0000, 0xffff_ffff);
-    let yh = 4;
-    let ym = 4 * 4;
-    let yl = 8 * 4;
-    let major_slope = (5.0f32 / 7.0 * 65536.0).round() as u32;
-    let lower_slope = (5.0f32 / 4.0 * 65536.0).round() as u32;
-    push_command(&mut rdram, &mut cursor, 0x0880_0000 | yl, (ym << 16) | yh);
-    push_command(&mut rdram, &mut cursor, 1 << 16, lower_slope);
-    push_command(&mut rdram, &mut cursor, 1 << 16, major_slope);
-    push_command(&mut rdram, &mut cursor, 1 << 16, 0);
     push_command(&mut rdram, &mut cursor, 0xe900_0000, 0);
 
     (rdram, cursor as u32)
@@ -155,6 +158,59 @@ fn expected_gamma_dither(source: &[u8], noise_seed: u64) -> Vec<u8> {
         }
     }
     expected
+}
+
+fn median(left: u8, center: u8, right: u8) -> u8 {
+    let mut values = [left, center, right];
+    values.sort_unstable();
+    values[1]
+}
+
+fn validate_divot_median(baseline: &[u8], divot: &[u8], width: u32, height: u32) -> usize {
+    assert_eq!(baseline.len(), divot.len());
+    let width = width as usize;
+    let height = height as usize;
+    let mut changed = 0;
+    for y in 0..height {
+        for x in 0..width {
+            let center = (y * width + x) * 4;
+            let changed_pixel = divot[center..center + 4] != baseline[center..center + 4];
+            if x == 0 || x + 1 == width || y < height / 2 {
+                assert_eq!(
+                    &divot[center..center + 4],
+                    &baseline[center..center + 4],
+                    "native divot changed border/full-coverage control pixel ({x}, {y})"
+                );
+            } else {
+                let left = center - 4;
+                let right = center + 4;
+                let mut expected = baseline[center..center + 4].to_vec();
+                for channel in 0..3 {
+                    expected[channel] = median(
+                        baseline[left + channel],
+                        baseline[center + channel],
+                        baseline[right + channel],
+                    );
+                }
+                assert_eq!(
+                    &divot[center..center + 4],
+                    expected,
+                    "native partial-coverage divot mismatch at ({x}, {y})"
+                );
+            }
+            assert_eq!(
+                divot[center + 3],
+                baseline[center + 3],
+                "native divot changed alpha at ({x}, {y})"
+            );
+            changed += usize::from(changed_pixel);
+        }
+    }
+    assert_eq!(
+        changed, EXPECTED_DIVOT_CHANGED_PIXELS,
+        "native divot changed-pixel count drifted"
+    );
+    changed
 }
 
 fn observe(
@@ -235,6 +291,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
     let settings = RenderRuntimeSettings {
         graphics_api: RenderGraphicsApi::Metal,
+        filtering: RenderFiltering::Nearest,
         ..RenderRuntimeSettings::default()
     };
     let mut backend = Rt64Backend::new();
@@ -438,13 +495,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         "baseline-d",
         "baseline-e",
         "baseline-f",
-        "divot",
         "dither-filter",
     ] {
         let observation = by_label(label);
         if observation.sha256 != BASELINE_SHA256
             || observation.nonblack_pixels != 48
-            || observation.unique_colors != 48
+            || observation.unique_colors != 8
         {
             return Err(io::Error::other(format!(
                 "{label} drifted from the exact pinned baseline: {observation:?}"
@@ -452,11 +508,24 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
+    let divot = by_label("divot");
+    if divot.sha256 != DIVOT_SHA256 || divot.nonblack_pixels != 48 || divot.unique_colors != 11 {
+        return Err(io::Error::other(format!(
+            "divot drifted from the exact pinned median result: {divot:?}"
+        ))
+        .into());
+    }
+    let divot_changed_pixels = validate_divot_median(
+        &by_label("baseline-a").bytes,
+        &divot.bytes,
+        OUTPUT_WIDTH,
+        OUTPUT_HEIGHT,
+    );
     for label in ["gamma", "gamma-restore"] {
         let observation = by_label(label);
         if observation.sha256 != GAMMA_SHA256
             || observation.nonblack_pixels != 48
-            || observation.unique_colors != 48
+            || observation.unique_colors != 8
         {
             return Err(io::Error::other(format!(
                 "{label} drifted from the exact pinned gamma result: {observation:?}"
@@ -464,18 +533,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    for (label, expected) in [
-        ("dither-only-a", DITHER_ONLY_A_SHA256),
-        ("dither-only-a-repeat", DITHER_ONLY_A_SHA256),
-        ("dither-only-b", DITHER_ONLY_B_SHA256),
-        ("gamma-dither-a", GAMMA_DITHER_A_SHA256),
-        ("gamma-dither-a-repeat", GAMMA_DITHER_A_SHA256),
-        ("gamma-dither-b", GAMMA_DITHER_B_SHA256),
+    for (label, expected, unique_colors) in [
+        ("dither-only-a", DITHER_ONLY_A_SHA256, 24),
+        ("dither-only-a-repeat", DITHER_ONLY_A_SHA256, 24),
+        ("dither-only-b", DITHER_ONLY_B_SHA256, 20),
+        ("gamma-dither-a", GAMMA_DITHER_A_SHA256, 23),
+        ("gamma-dither-a-repeat", GAMMA_DITHER_A_SHA256, 23),
+        ("gamma-dither-b", GAMMA_DITHER_B_SHA256, 22),
     ] {
         let observation = by_label(label);
         if observation.sha256 != expected
             || observation.nonblack_pixels != 48
-            || observation.unique_colors != 48
+            || observation.unique_colors != unique_colors
         {
             return Err(io::Error::other(format!(
                 "{label} drifted from its exact pinned gamma-dither result: {observation:?}"
@@ -492,7 +561,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         let observation = by_label(label);
         if observation.sha256 != SCALED_SHA256
             || observation.nonblack_pixels != 40
-            || observation.unique_colors != 41
+            || observation.unique_colors != 9
         {
             return Err(io::Error::other(format!(
                 "{label} drifted from the exact pinned scaled result: {observation:?}"
@@ -506,6 +575,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         || by_label("gamma").bytes == by_label("gamma-dither-a").bytes
         || by_label("gamma-dither-a").bytes == by_label("gamma-dither-b").bytes
         || by_label("baseline-a").bytes == by_label("resample-mode-3").bytes
+        || by_label("baseline-a").bytes == by_label("divot").bytes
     {
         return Err(io::Error::other(
             "native gamma, seeded gamma-dither, and nonidentity scale must each change exact post-VI pixels",
@@ -535,7 +605,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     if by_label("gamma").bytes != by_label("gamma-restore").bytes
-        || by_label("baseline-a").bytes != by_label("divot").bytes
         || by_label("baseline-a").bytes != by_label("dither-filter").bytes
         || by_label("resample-mode-3").bytes != by_label("resample-mode-2").bytes
         || by_label("resample-mode-3").bytes != by_label("resample-mode-1").bytes
@@ -559,7 +628,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         );
     }
     println!(
-        "vi_filter_pixel_evidence source={} baseline_sha256={} gamma_sha256={} dither_only_a_sha256={} dither_only_b_sha256={} gamma_dither_a_sha256={} gamma_dither_b_sha256={} scaled_sha256={} phases={} native_residual=divot,dither-filter,aa-selector",
+        "vi_filter_pixel_evidence source={} baseline_sha256={} gamma_sha256={} dither_only_a_sha256={} dither_only_b_sha256={} gamma_dither_a_sha256={} gamma_dither_b_sha256={} divot_sha256={} divot_changed_pixels={} scaled_sha256={} phases={} native_residual=dither-filter,aa-selector",
         identity.source_id,
         BASELINE_SHA256,
         GAMMA_SHA256,
@@ -567,6 +636,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         DITHER_ONLY_B_SHA256,
         GAMMA_DITHER_A_SHA256,
         GAMMA_DITHER_B_SHA256,
+        DIVOT_SHA256,
+        divot_changed_pixels,
         SCALED_SHA256,
         observations.len()
     );

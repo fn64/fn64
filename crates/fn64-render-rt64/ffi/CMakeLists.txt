@@ -142,6 +142,9 @@ set(FN64_RT64_VI_CONSTANTS_PATCHED [=[        interop::VideoInterfaceCB pushCons
         pushConstants.videoResolution = computeHDSize(hlslpp::float2(p.vi->fbSize()), p.resolutionScale, p.downsamplingScale);
         pushConstants.textureResolution = { float(p.textureWidth), float(p.textureHeight) };
         pushConstants.gamma = p.vi->gamma();
+        pushConstants.coverageRange =
+            (p.textureFormat == RenderFormat::R16G16B16A16_UNORM) ? 65535U : 255U;
+        pushConstants.filtering = uint32_t(p.filtering);
         pushConstants.outputOriginX = uint32_t(std::max(0L, lround(viewport.x)));
         pushConstants.outputOriginY = uint32_t(std::max(0L, lround(viewport.y)));
         pushConstants.outputWidth = uint32_t(std::max(1L, lround(viewport.width)));

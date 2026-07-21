@@ -15,7 +15,7 @@ from pathlib import Path
 
 SCHEMA = "fn64.rt64-macos-certification.v1"
 LIVE_CASE_TIMEOUT_SECONDS = 60
-LIVE_CASE_TEARDOWN_SECONDS = 5.0
+LIVE_CASE_TEARDOWN_SECONDS = 10.0
 EXPECTED_CASES = {
     "backend-lifecycle": "backend",
     "resolution-downsample": "resolution",
@@ -323,9 +323,10 @@ def run_cases(manifest: dict, cases: list[dict], selection: str, requested_runs:
                 break
             clean_runs += 1
             if run_number != count:
-                # A fresh process has exited, but WindowServer may still be
-                # reclaiming its hidden Metal surface before the next one asks
-                # CoreGraphics for another display-service connection.
+                # Interleaving closed here: the child exits while WindowServer
+                # is still reclaiming its hidden Metal surface, then the next
+                # child asks CoreGraphics for a display-service connection and
+                # can stall behind that reclamation.
                 time.sleep(LIVE_CASE_TEARDOWN_SECONDS)
         if failure is not None:
             status = "failed"

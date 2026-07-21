@@ -81,12 +81,102 @@ float4 ApplyGammaDither(float4 color, float4 position) {
     return color;
 }
 
+uint2 SourceExtent() {
+    return max(
+        min(uint2(round(gConstants.videoResolution)),
+            uint2(round(gConstants.textureResolution))),
+        uint2(1u, 1u));
+}
+
+bool HasFullCoverage(float alpha) {
+    uint encoded = uint(round(saturate(alpha) * float(gConstants.coverageRange)));
+    return (encoded & 7u) == 7u;
+}
+
+float Median(float left, float center, float right) {
+    return max(min(left, center), min(max(left, center), right));
+}
+
+// US 6,166,748 specifies a componentwise horizontal median on or adjacent to
+// a silhouette edge. RT64's color-target alpha is its modulo-eight coverage
+// estimate; code seven denotes full coverage. This stage intentionally runs
+// on the resolved texture lattice before VI resampling and gamma.
+float4 DivotTexel(int2 coordinate) {
+    int2 maximum = int2(SourceExtent()) - int2(1, 1);
+    coordinate = clamp(coordinate, int2(0, 0), maximum);
+    float4 center = gInput.Load(int3(coordinate, 0));
+    if ((coordinate.x == 0) || (coordinate.x == maximum.x)) {
+        return center;
+    }
+
+    float4 left = gInput.Load(int3(coordinate + int2(-1, 0), 0));
+    float4 right = gInput.Load(int3(coordinate + int2(1, 0), 0));
+    if (HasFullCoverage(left.a) && HasFullCoverage(center.a) &&
+        HasFullCoverage(right.a)) {
+        return center;
+    }
+
+    center.r = Median(left.r, center.r, right.r);
+    center.g = Median(left.g, center.g, right.g);
+    center.b = Median(left.b, center.b, right.b);
+    return center;
+}
+
+float4 DivotNearest(float2 uv) {
+    float4 center = gInput.SampleLevel(gSampler, uv, 0);
+    uint sourceX = min(
+        uint(floor(uv.x * gConstants.textureResolution.x)),
+        SourceExtent().x - 1u);
+    if ((sourceX == 0u) || (sourceX + 1u == SourceExtent().x)) {
+        return center;
+    }
+
+    float2 horizontal = float2(1.0f, 0.0f) / gConstants.textureResolution;
+    float4 left = gInput.SampleLevel(gSampler, uv - horizontal, 0);
+    float4 right = gInput.SampleLevel(gSampler, uv + horizontal, 0);
+    if (HasFullCoverage(left.a) && HasFullCoverage(center.a) &&
+        HasFullCoverage(right.a)) {
+        return center;
+    }
+
+    center.r = Median(left.r, center.r, right.r);
+    center.g = Median(left.g, center.g, right.g);
+    center.b = Median(left.b, center.b, right.b);
+    return center;
+}
+
+float4 SampleDivot(float2 uv) {
+    const float2 LowerRight = gConstants.videoResolution / gConstants.textureResolution;
+    const float2 HalfPixel = float2(0.5f, 0.5f) / gConstants.textureResolution;
+    float2 boundedUv = clamp(uv, HalfPixel, LowerRight - HalfPixel);
+
+    if (gConstants.filtering == 0u) {
+        // Preserve the graphics API's exact half-texel tie decision. Integer
+        // reconstruction can select a different row at a sampler boundary.
+        return DivotNearest(boundedUv);
+    }
+
+    float2 texelPosition = boundedUv * gConstants.textureResolution - 0.5f;
+    int2 lower = int2(floor(texelPosition));
+    float2 fraction = frac(texelPosition);
+    float4 upperLeft = DivotTexel(lower);
+    float4 upperRight = DivotTexel(lower + int2(1, 0));
+    float4 lowerLeft = DivotTexel(lower + int2(0, 1));
+    float4 lowerRight = DivotTexel(lower + int2(1, 1));
+    return lerp(
+        lerp(upperLeft, upperRight, fraction.x),
+        lerp(lowerLeft, lowerRight, fraction.x),
+        fraction.y);
+}
+
 // Limit texture sampling to the area the VI can sample of the texture.
 float4 SampleInput(float2 uv) {
     const float2 LowerRight = gConstants.videoResolution / gConstants.textureResolution;
     const float2 HalfPixel = float2(0.5f, 0.5f) / gConstants.textureResolution;
     float2 outsideBorder = step(LowerRight, uv);
-    float4 sampledColor = gInput.SampleLevel(gSampler, clamp(uv, HalfPixel, LowerRight - HalfPixel), 0);
+    float4 sampledColor = gConstants.divot != 0u
+        ? SampleDivot(uv)
+        : gInput.SampleLevel(gSampler, clamp(uv, HalfPixel, LowerRight - HalfPixel), 0);
     float4 gammaCorrectedColor = pow(sampledColor, gConstants.gamma);
     gammaCorrectedColor.rgb *= max(1.0f - outsideBorder.x - outsideBorder.y, 0.0f);
     gammaCorrectedColor.a = 1.0f;

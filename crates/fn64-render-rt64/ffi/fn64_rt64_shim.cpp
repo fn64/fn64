@@ -60,7 +60,7 @@ constexpr uint32_t VI_STATUS_16_BIT = 2U;
 static_assert(sizeof(Fn64Rt64UcodeGeneration) == 120U);
 static_assert(sizeof(Fn64Rt64TaskResult) == 88U);
 static_assert(sizeof(Fn64Rt64ViState) == 72U);
-static_assert(sizeof(interop::VideoInterfaceCB) == 48U);
+static_assert(sizeof(interop::VideoInterfaceCB) == 64U);
 static_assert(sizeof(Fn64Rt64ExtendedPresentCapture) == 72U);
 static_assert(sizeof(Fn64Rt64PresentCapture) == 48U);
 #if defined(FN64_RT64_HFR_EVIDENCE)
@@ -1512,11 +1512,14 @@ extern "C" void fn64_rt64_vi_filter_constants(
         // RT64 setup can compile/draw before fn64 publishes the completed
         // context. The unregistered setup path has no guest retrace identity.
         constants->gammaDither = 0U;
+        constants->divot = 0U;
         constants->policyVersion = 1U;
         return;
     }
     constants->gammaDither =
         (context->registers[9] & (1U << 2U)) != 0U ? 1U : 0U;
+    constants->divot =
+        (context->registers[9] & (1U << 4U)) != 0U ? 1U : 0U;
     constants->noiseSeedLow = uint32_t(context->vi_state.noise_seed);
     constants->noiseSeedHigh = uint32_t(context->vi_state.noise_seed >> 32U);
     constants->policyVersion = 1U;
