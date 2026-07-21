@@ -1146,6 +1146,28 @@ thread_local! {
     /// that -- `osSpTaskYielded_recomp` treats that as "can't actually run
     /// the ucode" (see its doc comment), never a silent substitute.
     static AUDIO_UCODE_FN: Cell<Option<AudioUcodeFn>> = const { Cell::new(None) };
+
+    /// Opt-in: run `M_AUDTASK`s through `dispatch_lle_task` -- the SAME
+    /// clean-room RSP interpreter replay every non-catalog gfx task already
+    /// takes -- instead of `dispatch_audio_task`'s registered-function path.
+    /// This executes the game's real, in-ROM audio ucode instruction by
+    /// instruction against guest RDRAM, so the CPU-side sound driver
+    /// observes the genuine mixer/sequence state the RSP wrote (a harness
+    /// with no linkable translated ucode otherwise runs a stand-in that
+    /// writes nothing, starving any driver handshake that reads RSP
+    /// output). Off by default: existing tests/hosts that submit synthetic
+    /// audio tasks with no real admitted ucode must keep the
+    /// count-but-don't-run behavior. Set via `set_audio_task_lle` or env
+    /// `FN64_AUDIO_LLE=1`.
+    static AUDIO_TASK_LLE: Cell<bool> =
+        Cell::new(std::env::var_os("FN64_AUDIO_LLE").is_some());
+}
+
+/// Route `M_AUDTASK`s through the clean-room RSP LLE interpreter (see
+/// `AUDIO_TASK_LLE`'s doc comment). Host-facing seam, same shape as
+/// `set_audio_ucode_fn`.
+pub fn set_audio_task_lle(enabled: bool) {
+    AUDIO_TASK_LLE.with(|cell| cell.set(enabled));
 }
 
 /// Register the real translated audio ucode function. Called once by the
@@ -1331,6 +1353,22 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
             }
         }
     } else if header.task_type == M_AUDTASK {
+        if AUDIO_TASK_LLE.with(Cell::get) {
+            // Honest fallback parity with gfx: replay the game's real audio
+            // ucode through the RSP interpreter (see `AUDIO_TASK_LLE`).
+            // rspboot already ran above, so persistent RSP state is at the
+            // ucode entry -- exactly the state `dispatch_lle_task` continues.
+            let lle = unsafe { dispatch_lle_task(rdram) };
+            let boot_steps = boot.expect("audio LLE requires rspboot").steps;
+            crate::pi::start_live_rcp_task_with_latency(
+                lle.needs_dp,
+                boot_steps.saturating_add(lle.steps),
+            )
+            .unwrap_or_else(|error| {
+                panic!("osSpTaskStartGo_recomp audio LLE completion: {error}")
+            });
+            return;
+        }
         unsafe { dispatch_audio_task(rdram, o, &hle_header) };
         false
     } else {
