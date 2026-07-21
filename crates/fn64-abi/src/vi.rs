@@ -219,6 +219,15 @@ pub fn next_vi_framebuffer() -> Option<u32> {
     with_executor(|exec| exec.vi().next_framebuffer.map(|a| a.offset()))
 }
 
+/// The programmed `VI_WIDTH` (pixels per framebuffer row the VI scans out);
+/// 0 until the guest programs a video mode. Harness framebuffer captures
+/// must honor this: games switch widths mid-run (WM2000 renders its attract
+/// image scenes 480-wide and its menus 320-wide), and a fixed-width capture
+/// shears every row of the other mode.
+pub fn vi_scanout_width() -> u32 {
+    with_host(|host| host.device_fabric.vi_width())
+}
+
 /// The total number of `osViSwapBuffer` calls observed so far -- see
 /// `current_vi_framebuffer`'s doc comment for why this crate exposes a
 /// plain function rather than requiring the harness to reach into

@@ -543,11 +543,19 @@ fn main() {
         }
 
         // Framebuffer capture: on every new osViSwapBuffer, hash+dump if
-        // non-uniform (Task requirement 3).
+        // non-uniform (Task requirement 3). Width comes from the LIVE
+        // VI_WIDTH register: WM2000 renders its attract image scenes
+        // 480-wide and its menu/legal scenes 320-wide, and a fixed-width
+        // capture shears every row of the other mode (the previously
+        // observed "striped / horizontally repeated" logo frames).
         let swap_count = fn64_abi::vi_swap_count();
         if swap_count > last_swap_count {
             if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
-                capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);
+                let width = match fn64_abi::vi_scanout_width() {
+                    0 => 320,
+                    programmed => programmed as usize,
+                };
+                capture_framebuffer(&rdram, fb_offset, width, swap_count, &mut fb_dumps);
             }
             last_swap_count = swap_count;
         }
@@ -617,24 +625,29 @@ fn main() {
     println!("[wm2000-boot] clean shutdown: parked guest threads abandoned");
 }
 
-/// Hash the fb region (a fixed-size guess: 320x240 RGBA5551 = 153600 bytes,
-/// the common NTSC low-res mode -- NOT verified against this ROM's actual
-/// `osViSetMode` mode-table contents, since this milestone doesn't decode
-/// `OSViMode`'s fields; see `fn64_runtime::vi`'s doc comment on why that's
-/// not modeled yet). If ANY byte differs from the first (non-uniform),
-/// convert RGBA5551 -> RGBA8888 and dump a PNG. A uniform/blank buffer is
-/// reported as blank, never faked as containing real content.
-fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mut Vec<String>) {
-    const FB_WIDTH: usize = 320;
+/// Hash the fb region (`width` x 240 RGBA5551 -- the row width comes from
+/// the caller's live `VI_WIDTH` read; 240 rows is the NTSC non-interlaced
+/// scanout this harness assumes throughout). If ANY byte differs from the
+/// first (non-uniform), convert RGBA5551 -> RGBA8888 and dump a PNG. A
+/// uniform/blank buffer is reported as blank, never faked as containing
+/// real content.
+fn capture_framebuffer(
+    rdram: &[u8],
+    fb_offset: u32,
+    width: usize,
+    swap_index: u64,
+    dumps: &mut Vec<String>,
+) {
+    let fb_width = width;
     const FB_HEIGHT: usize = 240;
-    const FB_BYTES: usize = FB_WIDTH * FB_HEIGHT * 2; // RGBA5551, 2 bytes/px
+    let fb_bytes = fb_width * FB_HEIGHT * 2; // RGBA5551, 2 bytes/px
 
     let start = fb_offset as usize;
-    let end = start + FB_BYTES;
+    let end = start + fb_bytes;
     if end > rdram.len() {
         eprintln!(
             "[wm2000-boot] swap #{swap_index}: framebuffer offset {fb_offset:#x} + assumed size \
-             {FB_BYTES:#x} exceeds rdram bounds ({} bytes) -- skipping capture, not guessing a \
+             {fb_bytes:#x} exceeds rdram bounds ({} bytes) -- skipping capture, not guessing a \
              smaller region",
             rdram.len()
         );
@@ -658,7 +671,7 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
          dumping PNG."
     );
     let path = format!("/tmp/fn64-fb-{swap_index}.png");
-    match dump_rgba5551_as_png(rdram, start, FB_WIDTH, FB_HEIGHT, &path) {
+    match dump_rgba5551_as_png(rdram, start, fb_width, FB_HEIGHT, &path) {
         Ok(()) => {
             println!("[wm2000-boot] *** NON-UNIFORM FRAMEBUFFER DUMPED: {path} ***");
             dumps.push(path);
