@@ -33,16 +33,32 @@ pub fn advance_virtual_time(now: u64) {
 ///
 /// # Safety
 /// `rdram` must be a valid pointer to the process's one shared rdram
-/// buffer, live for at least as long as any coroutine spawned here might
-/// run (the whole process, per `docs/DESIGN.md` section 3). `entry` must be
-/// `recomp_entrypoint` (or a real `recomp_func_t`-shaped function with the
-/// same contract) -- the boot harness passes the real generated symbol.
+/// buffer of at least `rdram_len` bytes, live for at least as long as any
+/// coroutine spawned here might run (the whole process, per
+/// `docs/DESIGN.md` section 3). `entry` must be `recomp_entrypoint` (or a
+/// real `recomp_func_t`-shaped function with the same contract) -- the
+/// boot harness passes the real generated symbol.
+///
+/// `rdram_len` (new 2026-07-21): the C lane previously never registered
+/// the process RDRAM with the host (`host.runtime_rdram` stayed null), so
+/// the FIRST raw MMIO device-DMA start a real game performed --
+/// WM2000's own `__osSpRawStartDma` (`func_80037760`) inside its
+/// `osSpTaskLoad` (`func_80031CC0`), reached as soon as the game's real
+/// event bootstrap (`func_80000B30`) started its task threads -- hit
+/// `write_live_device_mmio`'s "no registered process RDRAM" trap. The
+/// recompiled-lane boots (`recompiled::boot_thread0*`) already register
+/// it; this brings the C lane to parity.
 pub unsafe fn boot_thread0(
     rdram: *mut u8,
+    rdram_len: usize,
     entry: RecompFunc,
     thread_id: ThreadId,
     priority: Priority,
 ) {
+    with_host(|host| {
+        host.runtime_rdram = rdram;
+        host.runtime_rdram_len = rdram_len;
+    });
     let rdram_addr = rdram as usize;
     with_executor(|exec| {
         // Register the process-wide rdram base so the executor can mirror

@@ -198,6 +198,21 @@ fn main() {
         fn64_abi::set_render_backend(Box::new(backend), fn64_boot_harness::rdram_len());
     }
 
+    // NWXE saves to 256 Kbit (32 KiB) cartridge SRAM on PI domain 2: its own
+    // SRAM-handle constructor (`func_80000A88`, funcs_0.c asm
+    // 0x80000A9C-0x80000ABC) builds an OSPiHandle with baseAddress
+    // 0xA8000000 / type 3 (SRAM) / domain PI_DOMAIN2 and the very first
+    // frame-loop iteration (`func_800F4B60`) writes the 0x20-byte
+    // 0x19990901 save signature to SRAM offset 0, retrying
+    // `osEPiStartDma != 0` forever on failure -- without a registered save
+    // device that retry loop IS the observed boot hang. Ephemeral in-memory
+    // storage: this harness is boot telemetry, not a real player session,
+    // so nothing is persisted (a fresh all-0xFF chip each run, exactly the
+    // first-boot path the game must handle anyway).
+    fn64_abi::set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+        fn64_runtime::SaveType::SramBanked,
+    )));
+
     // NWXE's osCartRomInit (func_80022540) returns its OSPiHandle BSS at
     // D_800839A0 (`addiu $v0, $s0, %lo(D_800839A0)`, disasm/asm/1050.s
     // vram 0x80022578); the host shim hands guest code that same address.
@@ -294,7 +309,13 @@ fn main() {
 
     println!("[wm2000-boot] booting thread 0 (recomp_entrypoint)...");
     unsafe {
-        fn64_abi::boot_thread0(rdram_ptr, fn64_boot_harness::c_recomp_entrypoint(), 0, 10);
+        fn64_abi::boot_thread0(
+            rdram_ptr,
+            fn64_boot_harness::rdram_len(),
+            fn64_boot_harness::c_recomp_entrypoint(),
+            0,
+            10,
+        );
     }
 
     // Drive boot for a bounded number of scheduling STEPS, not an unbounded

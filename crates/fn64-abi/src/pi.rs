@@ -1009,8 +1009,61 @@ pub unsafe extern "C" fn osCartRomInit_recomp(_rdram: *mut u8, ctx: *mut RecompC
     ctx.r2 = (handle_vram as i32 as i64) as u64;
 }
 
+/// Resolve the physical PI bus base a guest `OSPiHandle` carries, or 0 when
+/// no usable handle was supplied. Real `osEPiStartDma`'s device manager
+/// programs `PI_CART_ADDR` with `K1_TO_PHYS(handle->baseAddress | devAddr)`
+/// (public libultra manual; `baseAddress` is at handle offset +0xC per the
+/// public `OSPiHandle` layout -- byte-verified against NWXE's own SRAM-handle
+/// constructor `func_80000A88`, asm 0x80000A9C-0x80000ABC, which stores
+/// `0xA8000000` at handle+0xC and links the handle with `osEPiLinkHandle`).
+/// Ignoring the handle entirely (the prior behavior) silently retargeted
+/// every domain-2 SRAM transfer at cartridge-ROM offset `devAddr`: NWXE's
+/// save-signature write (`func_800F4B60`, devAddr 0, OS_WRITE) then hit the
+/// read-only-ROM rejection and the game's `while (osEPiStartDma(..) != 0)`
+/// retry loop span forever -- the boot hang this helper fixes.
+///
+/// Returns 0 (identity: cart-domain devAddrs pass through unchanged) when
+/// the handle GPR is not a KSEG0/KSEG1 RDRAM pointer or the struct would
+/// read out of RDRAM bounds -- `osPiStartDma_recomp` has no handle argument
+/// at all and delegates with `r4` zeroed, and the cart handle registered by
+/// [`set_cart_rom_handle_vram`] is game BSS whose `baseAddress` field the
+/// host never populates (reads 0), keeping the long-standing "cart devAddr
+/// == plain ROM offset" convention intact for both.
+///
+/// # Safety
+/// `rdram` must be the live RDRAM allocation; guest execution suspended.
+unsafe fn epi_handle_phys_base(rdram: *mut u8, handle_gpr: u64) -> u32 {
+    let vram = handle_gpr as u32;
+    // KSEG0 (0x80000000..) or KSEG1 (0xA0000000..) direct-mapped pointer.
+    if vram & 0xC000_0000 != 0x8000_0000 {
+        return 0;
+    }
+    let offset = vram & 0x1FFF_FFFF;
+    // OSPiHandle is 0x74 bytes; only baseAddress (+0xC) is read. Bounds are
+    // against plain RDRAM (8 MiB) -- a handle pointer outside it is not a
+    // real guest struct.
+    if u64::from(offset) + 0x10 > 0x0080_0000 {
+        return 0;
+    }
+    let base = unsafe { read_offset_word(rdram, offset, 0xC) };
+    base & 0x1FFF_FFFF
+}
+
+/// Map a `handle->baseAddress | devAddr` physical bus address onto fn64's
+/// `PiDma` device-address convention: domain-2 SRAM addresses
+/// (`0x08000000..0x10000000`, see `fn64_runtime::rom::is_sram_dev_addr`)
+/// pass through so the save engine routes them; domain-1 cart-space
+/// addresses (`>= 0x10000000`) drop the cart base because `PiDma`'s ROM
+/// backing indexes by plain ROM offset (every existing caller already
+/// passes bare offsets with a zero `baseAddress`).
+fn pi_bus_to_dev_addr(phys_base: u32, dev_addr: u32) -> u32 {
+    let bus = phys_base | dev_addr;
+    if bus >= 0x1000_0000 { bus - 0x1000_0000 } else { bus }
+}
+
 /// `osEPiStartDma(OSPiHandle *handle, OSIoMesg *mb, s32 direction)` --
-/// `a0`=handle (`ctx->r4`, unused per `osCartRomInit_recomp`'s doc comment),
+/// `a0`=handle (`ctx->r4`, resolved via [`epi_handle_phys_base`] for the
+/// domain routing real hardware derives from `handle->baseAddress`),
 /// `a1`=mb (`ctx->r5`, an `OSIoMesg*`), `a2`=direction (`ctx->r6`,
 /// `OS_READ`=0/`OS_WRITE`=1 per the public manual).
 ///
@@ -1107,7 +1160,11 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
     // wave's own regression test after the sibling double-translation bug
     // (see the correction note above `read_offset_word`'s introduction).
     let dram_addr = RdramAddr::from_gpr(read_offset_word(rdram, mb_addr.offset(), 0x8) as u64);
-    let dev_addr = read_offset_word(rdram, mb_addr.offset(), 0xC);
+    // Real osEPiStartDma routes through handle->baseAddress (domain-1 cart
+    // vs domain-2 SRAM) -- see epi_handle_phys_base's doc comment for the
+    // NWXE save-write boot hang that ignoring the handle caused.
+    let handle_base = unsafe { epi_handle_phys_base(rdram, ctx.r4) };
+    let dev_addr = pi_bus_to_dev_addr(handle_base, read_offset_word(rdram, mb_addr.offset(), 0xC));
     let len = read_offset_word(rdram, mb_addr.offset(), 0x10);
 
     let logical_end = usize::try_from(
@@ -1157,11 +1214,14 @@ pub unsafe extern "C" fn osEPiRawStartDma_recomp(rdram: *mut u8, ctx: *mut Recom
     };
     let dram_addr = RdramAddr::from_gpr(ctx.r7);
     let len = unsafe { read_stack_word(rdram, ctx.r29, 0x10) };
+    // Same handle->baseAddress domain routing as osEPiStartDma_recomp.
+    let handle_base = unsafe { epi_handle_phys_base(rdram, ctx.r4) };
+    let dev_addr = pi_bus_to_dev_addr(handle_base, ctx.r6 as u32);
     ctx.r2 = if start_raw_pi_dma(
         rdram,
         direction,
         dram_addr,
-        ctx.r6 as u32,
+        dev_addr,
         len,
         "osEPiRawStartDma_recomp",
     ) {
@@ -1336,6 +1396,10 @@ pub unsafe extern "C" fn osPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCon
         write_io_mesg_word(rdram, mb, 0x10, nbytes);
     }
 
+    // osPiStartDma has no OSPiHandle argument (implicit domain-1 cart).
+    // Zero r4 so the delegate's epi_handle_phys_base doesn't misread the
+    // OSIoMesg pointer still sitting there as a handle struct.
+    ctx.r4 = 0;
     ctx.r5 = mb.to_kseg0() as i32 as u64;
     ctx.r6 = direction;
     unsafe { osEPiStartDma_recomp(rdram, ctx) };
