@@ -24,6 +24,7 @@
 
 pub mod context;
 pub mod dmem;
+pub mod interpreter;
 pub mod ops;
 pub mod recomp;
 pub mod tables;
@@ -37,6 +38,7 @@ pub use recomp::{decode, emit, runtime};
 
 pub use context::{RspContext, RspExitReason};
 pub use dmem::{Dmem, DMEM_MASK, DMEM_SIZE};
+pub use interpreter::{run_imem, InterpreterResult};
 pub use ops::{dispatch, operand_shape, OpInvocation, OpStatus, OperandRole, OperandShape, VuOp};
 pub use tables::{rcp_rom, rcp_seed, rsq_rom, rsq_seed, RCP_ROM_LEN, RSQ_ROM_LEN};
 pub use vu::{

@@ -139,13 +139,15 @@ Indices relevant here (F3DEX2 values):
 |------------|-------|--------|
 | `G_MW_SEGMENT` | `0x06` | **Set a segment base.** Segment number = `offset / 4` (equivalently `field(w0, 2, 4)`); base = `w1` (mask to a physical RDRAM offset, `w1 & 0x00FF_FFFF`). Writes `segments[seg]`. **This is the command that makes segmented addressing work** — it must be handled before any vertex/DL load that uses that segment. |
 | `G_MW_NUMLIGHT` | `0x02` | number of active lights (lighting; phase-2). |
-| `G_MW_FOG` | `0x08` | fog multiplier/offset (phase-2). |
-| `G_MW_LIGHTCOL` | `0x0A` | a light's color (phase-2). |
-| `G_MW_PERSPNORM` | `0x0E` | perspective-normalization scalar (a small integer scale hint; can be ignored for a first frame). |
-| `G_MW_FORCEMTX` | `0x0C` | force the MVP recompute flag (F3DEX2-specific; ignore for first frame). |
+| `G_MW_FOG` | `0x08` | Pack signed 16-bit multiplier `fm` and offset `fo`. With `G_FOG` enabled, vertex shade alpha becomes `clamp(ndc_z * fm + fo, 0, 255)`; source vertex alpha is ignored. |
+| `G_MW_LIGHTCOL` | `0x0A` | Update a light's RGB without changing its direction. F3DEX2 uses a 24-byte slot stride and word offsets 0/4 for the primary/copied colors; `gSPLightColor` emits both writes with identical RGBA data and ignores alpha. |
+| `G_MW_CLIP` | `0x04` | `gSPClipRatio` writes negative X/Y ratios 1..6 at offsets `0x04`/`0x0C` and their signed-negative positive-side partners at `0x14`/`0x1C`. These expand primitive clipping independently of `G_CULLDL`. |
+| `G_MW_PERSPNORM` | `0x0E` | retain the public unsigned `.16` perspective-divide normalization scale at offset zero. Any nonzero value is mathematically neutral in the float reference divide; explicit zero makes geometry non-renderable. |
+| `G_MW_FORCEMTX` | `0x0C` | second half of `gSPForceMatrix`: offset zero and marker `0x00010000` activate the previously DMA'd concatenated matrix. |
 
-For a flat-shaded first frame, **only `G_MW_SEGMENT` matters**; the rest can
-be acknowledged-and-skipped.
+All public F3DEX2 segment, clip-ratio, light-count/color, fog, force-matrix,
+and perspective-normalization destinations are implemented. Non-public/raw
+subindices remain loud malformed-command frontiers.
 
 ### 1.4 `G_MOVEMEM` — DMA a block into RSP state (opcode `0xDC`)
 
@@ -168,10 +170,102 @@ Index values (F3DEX2): `G_MV_VIEWPORT = 8`, `G_MV_LIGHT = 10`,
   "quarter-pixel" viewport encoding) — divide by 4 to get pixel units. See
   3.5.
 - **`G_MV_LIGHT` slot encoding:** the offset field is in eight-byte units.
+  Public offsets `0 * 24` and `1 * 24` load the X and Y screen-space
+  directions from the two `Light_t`-shaped entries emitted by `gSPLookAt`.
+  Their signed direction bytes are at offsets 8..10; the color bytes are
+  placeholders.
   `gSPLight(light, n)` targets byte offset `n * 24 + 24`; DMEM 24-byte indices
   0 and 1 are the look-at vectors, so `LIGHT_1` (offset 48, wire value 6)
   maps to light slot 0, `LIGHT_2` maps to slot 1, and so on. In other words,
   the light slot is `offset_bytes / 24 - 2`, not `- 1`.
+- **`G_MV_MATRIX`** is the first half of public F3DEX2 `gSPForceMatrix`.
+  It loads one complete 64-byte `Mtx` at destination offset zero as an
+  already-concatenated model/projection transform. The following
+  `G_MW_FORCEMTX` marker activates it; neither underlying matrix stack is
+  changed.
+
+The decoder validates both the encoded lengths and the complete source ranges
+before changing state. A viewport, LookAt, light, or forced-matrix DMA that
+would run past RDRAM traps by public command name instead of retaining the
+previous value. `G_MV_POINT`, the raw model/projection matrix indices, and any
+other non-public destination trap with index and wire words; they are not
+acknowledged skips.
+
+### 1.5 `G_DMA_IO` — debug I/DMEM transfer (opcode `0xD6`)
+
+The public F3DEX2 `gSPDma_io` macro packs a transfer direction, an eight-byte
+unit RSP address, a 12-bit `size - 1`, and a segmented DRAM address. Its
+`gSPDmaRead` and `gSPDmaWrite` wrappers use flags zero and one respectively.
+The SGI *Nintendo 64 RSP Programmer's Guide*, chapter 4 tables 4-1 and 4-6,
+defines those hardware directions as READ = DRAM -> I/DMEM and WRITE =
+I/DMEM -> DRAM. The same chapter requires eight-byte-aligned addresses,
+eight-byte-multiple lengths, at most 4 KiB, without crossing the selected
+4 KiB RSP bank.
+
+`execute_display_list_f3dex2_ops` applies the transfer immediately against
+fn64's one persistent `RspMemory` and logical-byte `RdramView` mapping. This
+ordering is load-bearing: a WRITE may replace the next display-list command,
+and the next decoder iteration observes the replacement. The read-only
+inspection helper traps on `G_DMA_IO` because it has neither authority nor a
+persistent RSP memory image; it cannot truthfully simulate the command.
+
+Sources: public
+[`gbi.h`](https://ultra64.ca/files/documentation/online-manuals/man/header/gbi.htm)
+and SGI
+[*Nintendo 64 RSP Programmer's Guide*, chapter 4](https://ultra64.ca/files/documentation/silicon-graphics/SGI_Nintendo_64_RSP_Programmers_Guide.pdf).
+
+### 1.6 `G_LOAD_UCODE` — ordered F3DEX2 self-load (opcode `0xDD`)
+
+The public `gSPLoadUcodeEx` macro is a compound command. A preceding
+`G_RDPHALF_1` carries the physical microcode-data address; `G_LOAD_UCODE`
+carries `data_size - 1` in its low 16 bits and the physical text address in
+its second word. Public `OSTask` guidance fixes the text size at
+`SP_UCODE_SIZE`, one complete 4 KiB IMEM bank. The RSP Programmer's Guide
+states that the compiled microcode data section is loaded at the beginning of
+DMEM. fn64 therefore copies exactly the declared data prefix to DMEM and the
+4 KiB text image to IMEM through typed `RspMemory`, using logical RDRAM bytes
+and the hardware's 64-bit DMA granularity. Physical ucode addresses are not
+resolved through the display-list segment table.
+
+The transfer is immediate in the ordered execution path. A following
+`G_DMA_IO` observes the new bank contents, and an IMEM write advances the
+persistent generation exactly once. Missing staging, reserved payload bits,
+unaligned addresses, non-eight-byte data sizes, bank overflow, and RDRAM
+bounds all trap by command name. The read-only inspection helper traps because
+it cannot truthfully mutate the console's persistent RSP memories.
+
+`ReferenceBackend::with_f3dex2` selects a decoder but admits no content. The
+rspboot-populated task-entry IMEM and every self-loaded 4 KiB text image are
+identified by exact SHA-256; only a digest registered through
+`with_f3dex2_ucode_sha256` may enter or remain in the F3DEX2 HLE lane. An
+unadmitted entry returns `FrameStatus::NeedsLle` before decode. An unadmitted
+self-load stops at the load boundary before the following command can be
+decoded under the wrong GBI. The reference backend performs admitted decode
+against cloned RDRAM/RSP state. On rejection it discards the clone and the
+runtime replays the whole ucode phase from untouched post-rspboot state through
+the scalar/vector interpreter. This preserves real register evolution,
+DMA/overlay order, BREAK, and DPC submissions without inventing a mid-HLE
+scalar/VU snapshot. RT64 applies the same entry admission; its raw-RDP C ABI
+then consumes the LLE-produced bounded command ranges without GBI recognition.
+
+F3DEX2 self-load does **not** use the older F3DEX reset contract. Its public
+release notes give an explicit maintained-state list: display-list stack,
+matrix stack, modelview and projection matrices, segment table, scissor,
+other mode, perspective normalization, and viewport survive. The combined MP
+matrix, geometry mode, lights, vertex cache, fog factors, texture selection,
+clip ratio, and compound-command staging reset. Independent RDP registers and
+TMEM remain live. A nested-list test proves that execution returns to the
+caller after self-load, as required by the F3DEX2 maintained display-list
+stack.
+
+Sources: public
+[`gbi.h`](https://ultra64.ca/files/documentation/online-manuals/man/header/gbi.htm),
+the public
+[F3DEX2 release notes](https://ultra64.ca/files/documentation/online-manuals/man-v5-2/allman52/ucode/f3dex2/f3dex2.htm),
+the public libultra
+[`OSTask` documentation](https://ultra64.ca/files/documentation/online-manuals/functions_reference_manual_2.0i/os/OSTask.html),
+and SGI
+[*Nintendo 64 RSP Programmer's Guide*, "DMEM Organization and Usage"](https://ultra64.ca/files/documentation/silicon-graphics/SGI_Nintendo_64_RSP_Programmers_Guide.pdf).
 
 ---
 
@@ -195,6 +289,12 @@ cache** (indices 0-31) starting at a destination slot.
 > `v0 = end - n`. (This is a real divergence from the SDK's F3DEX branch, which
 > is why a naive `((w0>>16)&0xFF)/2` reader — an F3DEX-shaped formula — can
 > place vertices in the wrong cache slots. See failure risk #2, section 8.)
+
+The decoder rejects a zero/over-32 count, an end index smaller than the count,
+a destination beyond slot 31, or a source range that cannot hold all `n`
+records before mutating any cache entry. Triangle commands likewise trap when
+any packed index exceeds slot 31; malformed geometry cannot disappear as an
+apparently valid cull.
 
 **Per-vertex wire format — `Vtx_t`, 16 bytes, big-endian:**
 
@@ -273,6 +373,8 @@ Relevant geometry-mode bits (F3DEX2 values):
 | `G_CULL_BOTH` | `0x00000600` | cull both (draws nothing) |
 | `G_FOG` | `0x00010000` | fog (phase-2) |
 | `G_LIGHTING` | `0x00020000` | enable lighting → `cn` = normal, not color (phase-2) |
+| `G_TEXTURE_GEN` | `0x00040000` | generate S/T by projecting the vertex normal onto the loaded LookAt X/Y directions |
+| `G_TEXTURE_GEN_LINEAR` | `0x00080000` | use the inverse-cosine mapping when combined with `G_TEXTURE_GEN` |
 | `G_SHADING_SMOOTH` | `0x00200000` | Gouraud (smooth) vs flat shading |
 
 **For a first frame:** you can ignore lighting/fog/shade-smooth. The one bit
@@ -281,6 +383,80 @@ it, back faces overpaint front faces and models look inside-out/garbled. Cull
 by the sign of the screen-space triangle's signed area (winding); which sign
 is "back" depends on the N64's convention (Y is down in screen space — see
 3.5), so if culling removes the wrong half, flip the test.
+
+#### Automatic texture-coordinate generation
+
+The public Programming Manual, Chapter 11.7.5, requires `G_LIGHTING` together
+with `G_TEXTURE_GEN`: the `cn[0..3]` bytes are therefore a signed normalized
+XYZ normal plus unchanged alpha. The reference lane transforms the two loaded
+LookAt directions into the vertex's model space, normalizes them, and projects
+the normalized vertex normal onto each axis.
+
+- Regular/spherical mode maps projection `p` from `[-1,+1]` to `[0,scale]`:
+  `generated = (p + 1) / 2 * scale`.
+- With `G_TEXTURE_GEN_LINEAR`, it uses
+  `generated = acos(clamp(p,-1,+1)) / pi * scale`.
+
+Here `scale` is the corresponding S/T value supplied by `gSPTexture`. The
+manual's worked form `gSPTexture(tex_max << 6, ...)` therefore maps the regular
+`+1` endpoint (and the linear `-1` endpoint) to `tex_max`. Generated values
+replace the explicit S10.5 `Vtx.tc` fields at vertex-load time and then follow
+the same perspective-correct primitive interpolation and RDP sampler path.
+Using texture generation without lighting, or before both LookAt DMAs, traps
+by the public state/command name rather than treating normal bytes as color or
+inventing axes. The exact F3DEX2 reciprocal/trigonometric lookup and fixed-point
+rounding remain a hardware-trace frontier.
+
+Sources: public libultra
+[`gbi.h`](https://ultra64.ca/files/documentation/online-manuals/man/header/gbi.htm)
+(`G_MVO_LOOKATX/Y`, `gSPLookAtX/Y`, `gdSPDefLookAt`) and Programming Manual
+[11.7, "Vertex Lighting State"](https://ultra64.ca/files/documentation/online-manuals/man-v5-1/pro-man/pro11/11-07.htm).
+
+### 2.5 Clip-volume culling and depth branches — `G_CULLDL` / `G_BRANCH_Z`
+
+F3DEX2 retains six homogeneous clip-plane flags for every transformed vertex:
+`x < -w`, `x > w`, `y < -w`, `y > w`, `z < -w`, and `z > w`. These flags
+drive display-list control flow independently of triangle face culling.
+
+- **`G_CULLDL` (`0x03`)** receives an inclusive cache range encoded as
+  `vstart * 2` and `vend * 2`. AND the clip flags across the selected vertices.
+  If any flag remains set, every vertex lies beyond the same clip plane, so
+  terminate the current display list exactly as `G_ENDDL` would. A culled
+  child therefore returns to its caller; a culled root ends the task. The
+  public `gSPCullDisplayList` contract states that this uses retained clipping
+  codes and is unaffected by the clip ratio.
+- **`G_BRANCH_Z` (`0x04`)** is the second half of the public
+  `gSPBranchLessZraw` compound command. A preceding `G_RDPHALF_1` stages the
+  segmented target, while `G_BRANCH_Z` identifies one vertex through redundant
+  `vtx * 5` and `vtx * 2` fields and carries the raw unsigned 16.16 screen-Z
+  threshold in `w1`. Tail-branch to the staged target, without pushing a return
+  address, when the retained vertex screen Z is less than or equal to that
+  threshold. `G_MODIFYVTX` screen-Z writes must therefore remain exact rather
+  than round-tripping through a host float.
+
+These encodings and comparisons follow the public `gSPCullDisplayList` manual
+page and the public F3DEX2 `gbi.h` macros for `gsSPCullDisplayList` and
+`gsSPBranchLessZraw`.
+
+### 2.6 Lines — `G_LINE3D` (opcode `0x08`)
+
+The public F3DEX2/L3DEX packing stores `v0 * 2`, `v1 * 2`, and an unsigned
+width parameter in the three payload bytes of `w0`; `w1` is zero. The public
+macros express the flat-shade flag by swapping the encoded endpoints, making
+the first endpoint the selected flat color. `gSPLine3D` uses width parameter
+zero for a 1.5-pixel line; `gSPLineW3D` defines the total width as
+`1.5 + width_parameter / 2` pixels.
+
+The reference lane emits a typed line operation rather than manufacturing a
+triangle during decode. It clips transformed endpoints and their color,
+texture, and depth attributes against all six homogeneous clip planes, using
+the active per-side `gSPClipRatio` for X/Y while retaining ordinary Z planes, applies
+the active scissor, evaluates the public eight coverage samples over the
+commanded width, supports flat or smooth shade and perspective texture
+interpolation, and runs the normal combiner/blender. Line depth is read-only:
+Z comparison can reject the fragment, but a line never updates the depth
+image. Exact microcode-generated degenerate-polygon edge coefficients and
+subpixel endpoint convention remain a hardware-trace differential frontier.
 
 ---
 
@@ -350,6 +526,10 @@ Param bits (F3DEX2 values — **different from F3D!**):
 > The F3D microcode uses `PROJECTION=0x01, LOAD=0x02, PUSH=0x04` — reversed
 > bit meanings. This spec and OoT are F3DEX2, so use the `0x04/0x02/0x01` set.
 
+The wire decoder also requires the public zero destination offset, exact
+64-byte DMA length, only these three parameter bits, and a complete 64-byte
+RDRAM source before changing either matrix stack.
+
 Behavior:
 
 - **Projection** (`PROJECTION` set): replace (or, rarely, multiply) the single
@@ -360,7 +540,8 @@ Behavior:
   - If `LOAD`: replace the current modelview with the loaded matrix.
   - Else (`MUL`): `modelview = modelview · loaded` (concatenate — this is how
     a hierarchy of local transforms is built, e.g. a limb relative to a body).
-- After any change, **recompute MVP = projection · modelview** (or apply them
+- After any change, **recompute MVP = modelview · projection** in the N64's
+  row-vector convention (or apply them
   in sequence at vertex time). This cached product is what `G_VTX` uses.
 
 ### 3.3 `G_POPMTX` — pop the modelview stack (opcode `0xD8`)
@@ -373,6 +554,56 @@ push-a-transform / draw-children / pop pattern; the projection matrix has no
 stack.)
 
 The F3DEX2 modelview stack holds **up to 18** matrices.
+
+#### `gSPForceMatrix` — replace the concatenated transform
+
+Public F3DEX2 emits this as exactly two commands. `G_MOVEMEM G_MV_MATRIX`
+stages one 64-byte fixed-point matrix; `G_MOVEWORD G_MW_FORCEMTX` at offset
+zero with `0x00010000` makes it the matrix used by later vertex transforms.
+This bypasses multiplication and leaves the modelview/projection stacks
+untouched. The next ordinary `G_MTX` or `G_POPMTX` rebuilds the concatenated
+matrix from those stacks and supersedes the forced value. A modelview load
+with no explicit projection uses identity projection rather than dropping the
+modelview transform. Missing/malformed halves trap with both public command
+names.
+
+Sources: public libultra
+[`gbi.h`](https://ultra64.ca/files/documentation/online-manuals/man/header/gbi.htm)
+(`gSPForceMatrix`, `G_MV_MATRIX`, `G_MW_FORCEMTX`) and the public
+[`gSPForceMatrix` function index description](https://ultra64.ca/files/documentation/online-manuals/functions_reference_manual_2.0i/gsp/gsp.html).
+
+#### `gSPPerspNormalize` — finite-precision divide scale
+
+`G_MOVEWORD G_MW_PERSPNORM` stores one unsigned `.16` scale at offset zero.
+The RSP scales transformed coordinates and W together before perspective
+division to maximize its limited divider precision. Those factors cancel in
+the float reference lane for every nonzero value; the exact fixed-point
+precision improvement remains a hardware-trace item. An explicitly programmed
+zero leaves the divide degenerate, so vertices retain nonpositive W and no
+triangle or line is emitted. The value survives F3DEX2 `G_LOAD_UCODE`, matching
+the public maintained-state list.
+
+Source: public libultra
+[`gSPPerspNormalize`](https://ultra64.ca/files/documentation/online-manuals/functions_reference_manual_2.0i/gsp/gSPPerspNormalize.html)
+and Programming Manual Chapter 25, "F3DEX2 Microcode."
+
+#### `gSPClipRatio` — expanded primitive clip rectangle
+
+The macro emits four `G_MOVEWORD G_MW_CLIP` writes. Negative-side X/Y fields
+carry `FRUSTRATIO_1..6` directly; positive-side fields carry the corresponding
+signed negative halfword. The state is retained per side in command order but
+resets on F3DEX2 self-load because it is absent from the public exhaustive
+maintained-state list. It expands the primitive clipping planes to
+`x = ±ratio*w` and `y = ±ratio*w`; Z remains `±w`. The reference line path
+uses those planes directly. High-level triangles are rasterized once and then
+scissored, which is mathematically equivalent inside the visible rectangle;
+exact microcode subdivision and fixed-point boundary rounding remain a
+hardware-trace frontier. `G_CULLDL` deliberately continues to use ordinary
+`±w` retained codes, as required by its public contract.
+
+Source: public libultra
+[`gSPClipRatio`](https://ultra64.ca/files/documentation/online-manuals/functions_reference_manual_2.0i/gsp/gSPClipRatio.html)
+and the four `G_MWO_CLIP_*` encodings in public `gbi.h`.
 
 ### 3.4 The transform math, per vertex
 
@@ -412,10 +643,10 @@ depth    = ndc_z * (vscale.z / 4) + (vtrans.z / 4)
   upside-down, this is why.
 - **OoT's viewport** for the main 3D view is centered on a **320×240**
   framebuffer: scale ≈ (160, 120) in pixels (so `vscale ≈ (640, 480)` in the
-  ×4 encoding), translate ≈ (160, 120) center (`vtrans ≈ (640, 480)`). If no
-  viewport has been loaded yet, a **320×240, origin-center default** (scale
-  160/120, translate 160/120) is a reasonable stand-in and matches OoT's
-  actual full-screen view closely enough to get recognizable geometry.
+  ×4 encoding), translate ≈ (160, 120) center (`vtrans ≈ (640, 480)`). The
+  decoder requires that DMA before transformed `G_VTX`: no viewport means a
+  named trap, because a host-sized 320×240 stand-in fabricates RSP state and
+  makes the same display list depend on the runtime's output surface.
 - **Depth** maps to the z-buffer range. OoT uses a 16-bit z-buffer; the exact
   N64 z encoding is non-linear (a piecewise "float"-ish format), but for a
   software rasterizer a **linear NDC-z / plain `1/w`-style depth compare** is
@@ -439,13 +670,17 @@ coverage and depth.
   scanline computes the left/right span from the edge equations, then fills
   the covered pixels.
 - **Coverage / fill rule:** a pixel is inside iff it is on the interior side
-  of all three edges. Hardware uses a specific tie-break (top-left-style rule)
-  and sub-pixel coverage for antialiasing; a first-pass renderer can use the
-  standard **edge-function (barycentric) test**: for edges `e0,e1,e2`
-  evaluated at pixel center, the pixel is inside when all three edge functions
-  share the sign of the triangle's signed area. Sample at pixel-center
-  (`x+0.5, y+0.5`). This is exactly the textbook Pineda edge-function fill and
-  is not N64-specific.
+  of all three edges. The raw RDP path evaluates the public 4×4 checkerboard
+  mask's eight selected subpixel centers against the commanded major/minor
+  edges and retains an actual coverage count from zero through eight. The
+  higher-level F3DEX2 path now evaluates those same eight selected centers
+  against its three barycentric edge functions and carries partial coverage
+  into the shared framebuffer path. Exact-boundary samples use a winding-
+  independent top-left rule, so adjacent high-level triangles assign a shared
+  edge once, matching the raw span walker's public left-inclusive/right-
+  exclusive ownership. It still evaluates vertex attributes at pixel center
+  (`x+0.5, y+0.5`); coverage-centroid attribute correction remains
+  differential work.
 - **Attribute interpolation:** compute barycentric weights from the edge
   functions. Vertex color and the current approximate depth remain
   screen-linear. Texture coordinates are perspective-correct: interpolate
@@ -454,6 +689,13 @@ coverage and depth.
   (`shaders/RasterVS.hlsl:21,36-38`) and emits UV as ordinary TEXCOORD with
   the default perspective interpolation
   (`render/rt64_raster_shader.cpp:254-260,280-286`).
+- **Raw coefficient arithmetic:** raw triangle X, slope, shade, texture, and Z
+  terms remain signed 16.16 integers through span and plane evaluation. The
+  eight coverage sample positions are exact odd eighths, and Table 12's XH/XM
+  reference is the scanline preceding YH while XL is referenced at YM. Host
+  floating point is now used only after S/T/W evaluation for the final texture
+  ratio. The hardware accumulator's narrower internal truncation points are
+  not specified by the public command format and remain differential work.
 - **Scissor:** `G_SETSCISSOR` (`0xED`) packs unsigned 12-bit upper-left X/Y in
   `w0[23:12]/w0[11:0]` and lower-right X/Y in the same fields of `w1`; all
   four are quarter-pixels (`ultra64/gbi.h:4819-4826`). The lower-right edge
@@ -473,17 +715,58 @@ coverage and depth.
 
 - OoT uses a **16-bit z-buffer** (`G_SETZIMG` points at it; `G_ZBUFFER`
   geometry-mode bit + the render mode's z-compare/z-update bits enable it).
-- Per covered pixel: compute the interpolated depth, compare against the
-  stored depth (default **less-than passes**, nearer wins), write color + new
-  depth on pass. For a first frame a simple `f32` depth buffer with
-  less-than-passes is adequate — you just need consistent occlusion so far
-  geometry doesn't overwrite near geometry.
+- Per covered pixel: compute the interpolated depth. `Z_CMP` controls whether
+  the fragment compares against stored depth; `Z_UPD` independently controls
+  whether a passing fragment replaces stored depth. The reference framebuffer
+  models all four compare/update combinations rather than forcing both on for
+  every triangle.
+- Raw RDP Z is converted from its 16.16 command plane to the documented
+  unsigned 15.3 working range, where near is zero and far is `G_MAXZ`. The
+  Chapter 16 exponent/mantissa + split DeltaZ memory codec is implemented and
+  exhaustively checked. Passing `Z_UPD` fragments and depth-directed fills
+  commit CPU-visible compressed halfwords plus the two hidden DeltaZ bits;
+  selecting a depth image reloads both, and the hidden pair is owned by its
+  physical RDRAM halfword so it survives task and image switches. Raw triangle
+  DeltaZ follows Chapter 15 Equation 4 (`|dZ/dx| + |dZ/dy|`). Stored DeltaZ
+  uses Equation 10's most-significant-set-bit index and expands back to its
+  power-of-two floor for comparison. Equations 5-9 supply typed `Farther`,
+  `Nearer`, `In Front`, and maximum-Z relations. Opaque/interpenetrating modes
+  admit front or depth-correlated fragments, translucent mode requires strict
+  in-front depth, and decal mode admits only correlated fragments over a
+  non-clear depth sample. When actual pixel coverage plus memory coverage
+  exceeds eight, opaque mode now uses Equation 9's strict `In Front` result
+  instead of the DeltaZ correlation window, as specified by Programming
+  Manual Chapter 15, "Opaque Surface Antialiased Z-Buffer Algorithm." The
+  interpenetration mode's separate wrap-selected coverage adjustment remains
+  open.
+- `G_ZS_PRIM` selects the persistent `G_SETPRIMDEPTH` registers for triangles
+  and texture rectangles. Per the public libultra `gDPSetPrimDepth` function
+  reference and Programming Manual Chapter 15, "Z Calculation," the 16-bit
+  primitive Z contributes its low 15 integer bits plus three zero fractional
+  bits, while primitive DeltaZ contributes all 16 bits. Both are compressed
+  through the same persistent Z-image path as stepped triangle depth.
 - If you skip the z-buffer entirely, draw order artifacts appear (later
   triangles overwrite earlier regardless of depth). Acceptable for a very
   first "is anything recognizable" frame, but the z-buffer is the first thing
   to add after triangles show up.
 
-### 4.4 The framebuffer format — RGBA5551, 16-bit, 320×240
+### 4.4 Public framebuffer layouts and OoT's RGBA5551 target
+
+- The RDP memory interface has three legal color-image layouts: a size-defined
+  8-bit index/intensity byte, RGBA16, and RGBA32. Programming Manual
+  [Chapter 15.5, "Color Image Format"](https://ultra64.ca/files/documentation/online-manuals/man/pro-man/pro15/15-05.html)
+  defines their byte layouts, while
+  [Chapter 14.6, "Color Index Frame Buffer"](https://ultra64.ca/files/documentation/online-manuals/man/pro-man/pro14/14-06.html)
+  requires an undereferenced CI8 texture for direct index copies. The
+  reference backend classifies these as one `ColorImageLayout`, imports and
+  commits each exact logical byte layout, supports same-address
+  reinterpretation, and copies undereferenced CI8 indices to the 8-bit target.
+  Copy source and destination layouts must match; unsupported raw format/size
+  combinations fail by name. Programming Manual 15.5.4 gives RGBA16 copy
+  alpha special semantics: with `G_AC_THRESHOLD`, its one alpha bit is a
+  direct write enable and never enters the eight-bit blend-alpha comparator.
+  An alpha-zero texel is therefore rejected even when blend alpha is zero;
+  with `G_AC_NONE`, the same texel is copied normally.
 
 - OoT's color framebuffer (`G_SETCIMG`) is **16-bit RGBA5551**: 5 bits red,
   5 green, 5 blue, **1 bit alpha/coverage**, packed big-endian per pixel:
@@ -504,21 +787,36 @@ coverage and depth.
 - `G_SETCIMG` (opcode `0xFF`, an RDP op) carries: format `field(w0,21,3)`,
   size `field(w0,19,2)` (size `2` = 16-bit), width `field(w0,0,12)+1`, and
   `w1` = segmented framebuffer address. `G_SETZIMG` (`0xFE`) carries just the
-  z-buffer address in `w1`.
+  z-buffer address in `w1`. The reference lane retains `G_SETCIMG` across
+  tasks and requires it before production F3DEX2/raw color writes. It does
+  not infer the RDP target from the VI scanout or host `output_addr`.
 
 ---
 
 ## 5. Texture / combiner
 
 The reference backend implements the common OoT texture and color-combiner
-path described here. Exact TMEM layout, the second texture tile, key/noise/K
-inputs, and cycle selection from other-mode remain later fidelity work; those
-approximations are logged when encountered.
+path described here. Physical TMEM layout and command-ordered load/render-tile
+reinterpretation are modeled. Equal low/high 10.2 fractions retain subtexel
+tile origins, and source-sized transfers may use a different load-descriptor
+size, including the public RGBA32-through-16-bit load form. Unequal low/high
+fractions, the noise input, and silicon-internal fixed-point/filter precision
+remain later fidelity work.
+Unsupported cases trap by name. K4/K5, the YUV conversion table, distinct
+TEXEL1, and public mip/detail/sharpen LOD selection are modeled.
+
+These are persistent RDP registers, not per-`OSTask` decoder scratch. The
+reference backend carries the texture-image latch, tile descriptors, TLUT,
+physical TMEM, scissor, other mode, combiner/key/convert state, constant
+colors, and fill color across both F3DEX2 tasks and raw DPC submissions.
+F3DEX2's `G_TEXTURE` enable/tile/scale is RSP state and is reset at the next
+task boundary. If a new task enables it before any task has initialized TMEM,
+the primitive traps by `G_TEXTURE` and tile instead of substituting white.
 
 ### 5.1 Texture image + tile + TMEM load
 
 - **`G_SETTIMG`** (`0xFD`, RDP): sets the source texture image in RDRAM —
-  format `field(w0,21,3)` (RGBA/CI/IA/I), size `field(w0,19,2)` (4/8/16/32
+  format `field(w0,21,3)` (RGBA/YUV/CI/IA/I), size `field(w0,19,2)` (4/8/16/32
   bpp), width `field(w0,0,12)+1`, address `w1` (segmented). Just a pointer +
   format latch; no data moves yet.
 - **`G_SETTILE`** (`0xF5`, RDP): defines a **tile descriptor** — where in the
@@ -534,12 +832,85 @@ approximations are logged when encountered.
 - **`G_LOADTLUT`** (`0xF0`): load a color palette into TMEM for CI (color-
   indexed) textures. The public `gDPLoadTLUTCmd` wire layout stores
   `count - 1` directly in bits 14..23; unlike S/T fields, this count has no
-  quarter-texel scaling.
+  quarter-texel scaling. Each RGBA16 or IA16 entry is quadricated across the
+  four high-TMEM banks before a CI sample selects it.
+- The backend retains the complete 4 KiB physical image and a per-bit
+  initialization mask. `G_SETTILE`'s nine-bit TMEM base and line stride drive
+  addressing; `G_LOADTILE` pads rows to 64-bit words, while `G_LOADBLOCK`
+  applies its 1.11 `dxt` accumulator and line skip. Odd rows exchange the two
+  32-bit longs in each word. RGBA32 stores RG in low TMEM and BA in high TMEM;
+  YUV stores shared UV pairs low and the two Y samples high. These layouts and
+  transfers use `G_SETTIMG`'s source size even when the load tile carries a
+  different size. Equal low/high fractional quarters select the integer
+  source span while remaining in SL/TL/SH/TH as the render origin; unequal
+  fractions still trap until their edge selection is hardware-verified.
+  These rules and
+  the load/render-tile separation follow Programming Manual
+  [13.8, Texture Memory](https://ultra64.ca/files/documentation/online-manuals/man/pro-man/pro13/13-08.html),
+  [13.9, Texture Loading](https://ultra64.ca/files/documentation/online-manuals/man/pro-man/pro13/13-09.html),
+  and SGI *RDP Command Summary* Tables 7-10. A primitive snapshots TMEM with
+  its descriptors, so later loads cannot retroactively alter queued work.
 - To *sample*: take the vertex S/T (S10.5 fixed-point from the `Vtx`), apply
-  the tile's shift/mask/clamp, address TMEM, decode the texel per the tile
-  format. OoT textures are commonly 4-bit/8-bit CI and 16-bit RGBA5551/IA.
+  the tile's public shift encoding (0=no shift, 1..10=right shift, 11..15=
+  left shift by 5..1), then its clamp/mirror/mask address transform, address
+  TMEM, and decode the texel per the tile format. Mask zero implies clamp;
+  nonzero masks pass the low `mask` bits, and mirror inverts those bits when
+  the next bit is set. The shared triangle/rectangle sampler implements this
+  sequence against physical TMEM, including addresses beyond the render
+  tile's clamp extent. Fetching bits that no load initialized traps with the
+  physical byte address. OoT textures are commonly 4-bit/8-bit CI and 16-bit
+  RGBA5551/IA.
 
-### 5.2 Color combiner + `G_TEXTURE`
+### 5.2 YUV conversion
+
+- **`G_SETCONVERT`** (`0xEC`, RDP) stores K0..K5 as six signed nine-bit
+  fields split across its two words. YUV16 source data is byte-interleaved
+  Y0/U/Y1/V, so adjacent luma samples share U and V. K0..K3 feed the texture
+  filter's YUV-to-RGB stage; K4/K5 are independently selectable inputs to the
+  color combiner's second stage. These layouts and equations are from the
+  public SGI [*RDP Command Summary*, Table 28 and texture-filter section](https://ultra64.ca/files/documentation/silicon-graphics/SGI_RDP_Command_Summary.pdf).
+- Other-mode `G_TC_CONV` point-samples then converts, `G_TC_FILTCONV` filters
+  then converts, and `G_TC_FILT` filters without conversion, following public
+  Programming Manual [Chapter 12.5](https://ultra64.ca/files/documentation/online-manuals/man/pro-man/pro12/12-05.html).
+  The shared raw/F3DEX2 triangle and rectangle sampler implements those three
+  modes and rejects reserved encodings. Its integer coefficients and
+  clamping are deterministic, but exact silicon accumulator width and
+  negative-product rounding still need hardware traces.
+
+### 5.3 Texture LOD, detail, and sharpen
+
+Programming Manual [Chapter 13.7, "Texture Level of Detail"](https://ultra64.ca/files/documentation/online-manuals/man/pro-man/pro13/13-07.html)
+defines the tile pair and fraction used for mipmapping, detail texturing, and
+sharpening. The reference path implements those public tables as one shared
+sampler used by texture rectangles, high-level F3DEX2 triangles, and raw RDP
+texture triangles:
+
+- `G_TEXTURE` supplies the primitive tile and maximum mip level for F3DEX2
+  work; raw RDP triangles carry the corresponding three-bit tile and level in
+  their edge command. `G_SETPRIMCOLOR` supplies the eight-bit minimum LOD and
+  primitive LOD fraction independently.
+- Each emitted primitive owns an immutable snapshot of all eight decoded
+  tiles. Later `G_SETTIMG`/`G_LOAD*` commands therefore cannot retroactively
+  change an already-emitted primitive's mip chain. Tile addition wraps modulo
+  eight, including primitive tile 7.
+- LOD derives from the difference between the current perspective-corrected
+  S/T coordinate and its adjacent +X/+Y coordinates. Clamp mode uses the
+  finest tile twice while magnifying; detail mode chooses the documented
+  base/+1 or +1/+2 pair and applies minimum LOD; sharpen mode uses a negative
+  fraction while magnifying. The selected fraction feeds both RGB and alpha
+  `LOD_FRACTION` combiner inputs.
+- Every selected mip must have a decoded `G_LOADBLOCK`/`G_LOADTILE` image.
+  Missing selected tiles and a no-LOD combiner `TEXEL1` without tile+1 trap by
+  tile/source name; neither aliases silently to TEXEL0.
+
+The present deterministic magnitude is the maximum absolute S/T derivative
+component. Chapter 13.7 specifies adjacent-coordinate differences and its
+selection examples, but not enough silicon detail to prove that norm or the
+internal rounding width. Exact fixed-point derivative quantization, boundary
+rounding, and filter accumulator behavior remain hardware-trace work; this is
+not claimed bit-exact.
+
+### 5.4 Color combiner + `G_TEXTURE`
 
 - **`G_SETCOMBINE`** (`0xFC`, RDP): programs the **color combiner** — a
   two-cycle formula `(A - B) * C + D` for RGB and separately for alpha, where
@@ -562,7 +933,7 @@ approximations are logged when encountered.
   coordinate scale applied to vertex texcoords, plus which tile + mip level.
   Fields: on-bit `field(w0,1,7)`, mip level `field(w0,11,3)`, tile
   `field(w0,8,3)`, S scale `field(w1,16,16)`, T scale `field(w1,0,16)` (both
-  U0.16). The current decoder applies these fields to its decoded tile.
+  U0.16). The current decoder applies these fields to its selected TMEM tile.
 - **`G_SETOTHERMODE_H/L`** (`0xE3`/`0xE2`): the RDP "other modes" — render
   mode (blend/z-compare/AA/cvg), texture filter, cycle type (1-cycle/2-cycle/
   copy/fill), etc. F3DEX2 encodes a partial update as `length-1` in the low
@@ -575,26 +946,56 @@ approximations are logged when encountered.
   `hle/rt64_rsp.cpp:1026-1037`.
 - **Alpha compare** is selected by low bits 0..1: `G_AC_NONE=0`,
   `G_AC_THRESHOLD=1`, and `G_AC_DITHER=3` (`gbi.h:500,584-587`). Threshold
-  mode discards post-combiner fragments below `G_SETBLENDCOLOR.a`; dither mode
-  uses a deterministic 4×4 Bayer threshold in the software rasterizer so
-  partial-alpha coverage is reproducible. Rejected fragments update neither
-  color nor depth. OoT's setup display list selects threshold comparison at
+  mode discards post-combiner fragments below `G_SETBLENDCOLOR.a`; rejected
+  fragments update neither color nor depth. Programming Manual 15.5.4 defines
+  dither compare as a hardware-generated pseudo-random threshold, independent
+  of the ordered RGB/alpha dither matrices. Until that generator is proven,
+  `G_AC_DITHER` traps before rasterization instead of using a deterministic
+  Bayer substitute. OoT's setup display list selects threshold comparison at
   `src/code/z_rcp.c:815-818` and programs blend alpha 8 at `z_rcp.c:824-835`.
   RT64 performs the comparison after combiner alpha in
   `shaders/RasterPS.hlsl:184,204-211`.
+- **RGB/alpha dither** is selected by other-mode-high bits 6..7 and 4..5.
+  Programming Manual 15.5.1 establishes screen-registered magic-square/Bayer
+  routing, frame-varying long-period noise, alpha pattern/inverse/noise
+  routing, and three-low-bit addition before RGB truncation. It does not
+  publish either ordered table or the noise generator. One/two-cycle
+  primitives therefore accept only `G_CD_DISABLE` + `G_AD_DISABLE`; every
+  active selector traps by name rather than rendering an observably wrong
+  undithered image. The proven disabled memory path uses exact `>> 3`
+  truncation for RGBA16 RGB and RGBA32's five-bit memory alpha. Copy/fill
+  bypass the blender and are unaffected.
 - **`G_SETPRIMCOLOR`/`G_SETENVCOLOR`/`G_SETFOGCOLOR`/`G_SETFILLCOLOR`/
   `G_SETBLENDCOLOR`** (`0xFA`/`0xFB`/`0xF8`/`0xF7`/`0xF9`): flat color
   registers fed to the combiner/blender. Primitive and environment RGBA are
   decoded now; `G_SETPRIMCOLOR`'s low-byte primitive-LOD fraction is retained
   as a combiner input. Blend and fog RGBA are decoded for the framebuffer
-  blender; fill color remains outside this slice.
+  blender; fill color drives format-correct fill-cycle writes. All remain
+  selected across task boundaries until another RDP command replaces them.
 - **Sync ops** `G_RDPLOADSYNC`/`G_RDPPIPESYNC`/`G_RDPTILESYNC`/
   `G_RDPFULLSYNC` (`0xE6`-`0xE9`) and `G_NOOP`/`G_SPNOOP`
-  (`0x00`/`0xE0`): pipeline hazard barriers / no-ops. **Always safe to skip**
-  in an HLE decoder — they exist to serialize the real RDP pipeline and have
-  no effect on the decoded geometry.
+  (`0x00`/`0xE0`): pipeline hazard barriers / no-ops. The three hazard-only
+  barriers are explicit validated commands in the atomic HLE path;
+  `G_RDPFULLSYNC` remains an ordered operation boundary. `G_NOOP` accepts the
+  public `gDPNoOpTag` second word, while `G_SPNOOP` requires both reserved
+  payloads to be zero. None falls through an unknown-opcode path.
 
-### 5.3 Othermode + framebuffer blender
+### 5.4 Chroma key
+
+`G_SETKEYR` (`0xEB`) and `G_SETKEYGB` (`0xEA`) persist three channel centers,
+eight-bit scales, and twelve-bit 4.8 widths. `G_CK_KEY` enables the public
+two-stage path: the combiner computes `(pixel - CENTER) * SCALE`, then alpha
+fixup computes each channel as `clamp(width - abs(key prime), 0, 1)` and uses
+their minimum as fragment alpha. A width greater than 1.0 disables that
+channel. The wire fields, formula, and two-cycle constraint come from SGI
+[*RDP Command Summary*, Tables 29-30](https://ultra64.ca/files/documentation/silicon-graphics/SGI_RDP_Command_Summary.pdf)
+and Programming Manual
+[Chapter 12.6](https://ultra64.ca/files/documentation/online-manuals/man/pro-man/pro12/12-06.html).
+Raw and F3DEX2 streams share the typed state and alpha-fixup path; an
+end-to-end raw command gate proves the resulting alpha reaches alpha compare.
+Exact internal arithmetic precision still requires hardware traces.
+
+### 5.5 Othermode + framebuffer blender
 
 The RDP framebuffer blender is selected by the two othermode words. OoT uses
 both the full `G_RDPSETOTHERMODE` command (`0xEF`) and F3DEX2's partial
@@ -635,15 +1036,32 @@ framebuffer term as a source color plus a separate blend alpha (lines
 414-424), then its graphics pipeline composites with `SRC1_ALPHA` /
 `INV_SRC1_ALPHA` (`render/rt64_raster_shader.cpp` lines 332-339). This
 software framebuffer performs that last composite directly. `G_BL_A_MEM`
-means coverage alpha, not the stored RGBA byte; because coverage is not yet
-emulated, it is treated as full coverage, matching RT64 lines 351-357.
+means memory coverage alpha, not the stored RGBA byte. The software
+framebuffer now retains the actual 1..8 count and supplies that normalized
+value to this selector. `CVG_DST_CLAMP/WRAP/FULL/SAVE`, `CLR_ON_CVG`,
+`CVG_X_ALPHA`, and `ALPHA_CVG_SEL` feed the same typed coverage path. RGBA16
+stores `coverage - 1`: its high bit occupies the visible word's LSB and its
+low two bits share the physical-address hidden-bit sidecar with depth DeltaZ.
+RGBA32 instead stores those three bits in the alpha byte's MSBs and the
+five-bit memory alpha in its LSBs, so it does not consume the hidden sidecar.
+The disabled-dither store truncates eight-bit components to those five-bit
+fields; it does not round to the nearest bit-replicated display value.
+An observed CPU-visible word change reconstructs both hidden bits from the new
+LSB per Programming Manual 15.5.6. A CPU rewrite of the *same* visible value
+cannot yet be observed without moving this sidecar into the runtime RDRAM
+write path. Exact alpha-times-coverage tie rounding, high-level coverage-
+centroid correction, and fixed-width raw edge accumulators remain hardware-
+differential frontiers.
 
-The blender consumes the alpha produced by the color combiner. Until the
-separate `G_SETCOMBINE`/primitive/environment-color work lands, this renderer's
-"combined alpha" remains the existing shade × texel approximation. The OOTU
+The blender consumes the alpha produced by the color combiner. Both programmed
+combiner cycles, primitive/environment registers, shade, texels, LOD, chroma
+key, and conversion constants feed that result. The hardware NOISE source is
+retained as a distinct selector but traps when evaluated: the public manual
+specifies a long-period value that varies between frames but not its generator
+state, so substituting zero would fabricate stable black input. The OOTU
 C-lane trace through 1,000 VI swaps produced no fractional combined-alpha
-fragments, so the equation and selector wiring are fixture-verified here but
-live OoT translucency remains visually blocked on that combiner input.
+fragments; selector wiring is fixture-verified, while live translucency still
+needs a visual differential.
 
 ---
 
@@ -693,8 +1111,9 @@ vertex-colored), a decoder must correctly handle:
 
 That list is the historical first-frame minimum. The reference backend now
 also implements texture/lighting, RDP other-mode and alpha compare, and the
-common color-combiner and scissor paths above. Remaining framebuffer state
-and sync ops can still be acknowledged-and-skipped at this stage.
+color-combiner, framebuffer, depth, scissor, texture-rectangle, raw-triangle,
+  and line paths described above. Remaining unsupported encodings trap as
+  enumerated in section 7.
 
 ---
 
@@ -706,33 +1125,41 @@ needs attention against the F3DEX2 contract:
 
 | `gbi.rs` const | byte | spec § | handler note |
 |----------------|------|--------|--------------|
-| `G_VTX` | `0x01` | 2.1 | The F3DEX2 `decode_display_list_f3dex2` path reads `n = field(w0,10,6)` and `v0 = field(w0,16,8)/2`. **Per the F3DEX2 contract, `n = field(w0,12,8)` and `v0 = field(w0,1,7) - n`.** Verify against a real OoT DL; the `/2` form is F3DEX-shaped and can misplace vertices. (Failure risk #2.) |
-| `G_TRI1` | `0x05` | 2.2 | Current path extracts three 8-bit bytes and `/2`. The F3DEX2 layout is three **7-bit** fields at bits 17/9/1; each is already the slot. The `/2`-of-a-byte form and the 7-bit-field form agree only if the byte's low bit is 0 — validate. |
+| `G_VTX` | `0x01` | 2.1 | Implemented with `n = field(w0,12,8)` and `v0 = field(w0,1,7) - n`; transformed vertices retain screen values, raw screen Z, six clip codes, and homogeneous position for later control flow/clipping. |
+| `G_MODIFYVTX` | `0x02` | 2.1 | Implemented for all four public final-cache destinations: RGBA bytes, signed S10.5 ST, signed S13.2 screen XY, and unsigned 16.16 screen Z. The packed slot is decoded from `vtx*2`; malformed slots/destinations trap by name. |
+| `G_TRI1` | `0x05` | 2.2 | Implemented with three 7-bit cache-slot fields at bits 17/9/1; no legacy byte `/2` reinterpretation. |
 | `G_TRI2` | `0x06` | 2.3 | Two triangles: tri A in `w0`, tri B in `w1`, same field positions. |
 | `G_QUAD` | `0x07` | 2.3 | Decode identically to `G_TRI2`. |
+| `G_LINE3D` | `0x08` | 2.6 | Implemented as a typed clipped line with public width, shade/texture attributes, scissor, coverage, blender, and read-only depth behavior. |
 | `G_TEXTURE` | `0xD7` | 5.2 | Decodes enable, tile, and S/T scales. |
-| `G_SETOTHERMODE_L/H` | `0xE2`/`0xE3` | 5.2 | Implemented: masked F3DEX2 H/L updates are retained in typed render state, snapshotted per triangle, and consumed by alpha compare. |
+| `G_SETOTHERMODE_L/H` | `0xE2`/`0xE3` | 5.2 | Masked F3DEX2 H/L updates are retained in typed render state and snapshotted per primitive. Threshold alpha compare is implemented; reserved mode 2 and the unproven pseudo-random `G_AC_DITHER` path trap by name. |
 | `G_SETCOMBINE` | `0xFC` | 5.2 | Decodes both cycles' position-specific RGB/alpha selectors and snapshots them per triangle. |
-| `G_POPMTX` | `0xD8` | 3.3 | `count = w1 >> 6`; pop that many modelview entries. |
-| `G_GEOMETRYMODE` | `0xD9` | 2.4 | Currently skipped. To get culling, apply `mode = (mode & field(w0,0,24)) | w1` and honor `G_CULL_BACK`. |
+| `G_CULLDL` | `0x03` | 2.5 | Implemented with retained six-plane clip codes and inclusive `v*2` cache bounds; a common outside plane ends only the current display list. |
+| `G_BRANCH_Z` | `0x04` | 2.5 | Implemented as the conditional tail half of `G_RDPHALF_1` + `G_BRANCH_Z`, using retained unsigned 16.16 screen Z. |
+| `G_POPMTX` | `0xD8` | 3.3 | Implemented: require a nonzero multiple of 64 and pop exactly `w1 / 64` modelview entries. |
+| `G_GEOMETRYMODE` | `0xD9` | 2.4 | Implemented state update; cull, lighting, fog, automatic regular/linear texture generation, Z-buffer, shade, and smooth-shading consumers use the retained bits where their corresponding render mechanisms exist. |
 | `G_MTX` | `0xDA` | 3.2 | Un-XOR the push bit (`params = field(w0,0,8) ^ 0x01`), then PROJECTION=`0x04`/LOAD=`0x02`/PUSH=`0x01`. Confirm the transpose-on-read matches the multiply convention (3.1). |
-| `G_MOVEWORD` | `0xDB` | 1.3 | `G_MW_SEGMENT=0x06`: seg = `field(w0,2,4)` (= `offset/4`), base = `w1 & 0x00FF_FFFF`. |
-| `G_MOVEMEM` | `0xDC` | 1.4 | Currently skipped → viewport falls back to a 320×240 default. To honor OoT's real viewport, handle `G_MV_VIEWPORT` (index `field(w0,0,8)==8`) and parse the `Vp` (÷4). |
+| `G_MOVEWORD` | `0xDB` | 1.3 | All public F3DEX2 destinations are implemented: segment, four clip-ratio sides, active-light-count, both light-color copies, fog, force-matrix activation, and perspective normalization. Non-public/raw indices are malformed-command frontiers. |
+| `G_MOVEMEM` | `0xDC` | 1.4 | Viewport, both LookAt directions, directional/ambient lights, and the 64-byte force-matrix DMA are implemented. Non-public point/raw matrix subindices are named traps. |
+| `G_DMA_IO` | `0xD6` | 1.5 | Implemented against persistent DMEM/IMEM and logical RDRAM bytes in command order; alignment, size, bank, and RDRAM bounds trap by name. |
+| `G_LOAD_UCODE` | `0xDD` | 1.6 | Loads the declared data prefix and fixed 4 KiB text image into persistent DMEM/IMEM in command order, applies the public F3DEX2 maintained-state contract, and validates the compound wire form. |
 | `G_DL` | `0xDE` | 1.1 | Push flag = `field(w0,16,8)` bit `0x01`. **Do not push/pop the matrix stack across `G_DL`** — only the return address is saved; matrix state is intentionally global (see 1.1). |
 | `G_ENDDL` | `0xDF` | 1.2 | Return to caller (pop DL stack) or stop. |
 | `G_SETSCISSOR` | `0xED` | 4.1 | Decode all four 12-bit quarter-pixel edges, snapshot the rect per triangle, and clip raster bounds to its exclusive lower-right edge. |
 
 The `opcode_name` table in `gbi.rs` additionally names `G_NOOP`, `G_SPNOOP`,
 `G_RDPHALF_1/2`, `G_SETOTHERMODE_L/H`, the four sync ops, `G_LOADBLOCK`,
-`G_SETTILE`, `G_SETCOMBINE`, and `G_SETTIMG`. The texture, combiner, and
-other-mode commands among these are handled as described in section 5, while
-the remaining framebuffer and sync ops are still named skips.
+`G_SETTILE`, `G_SETCOMBINE`, and `G_SETTIMG`. Public `G_NOOP`/`G_SPNOOP`
+and the hazard sync commands are explicit validated handlers. The texture, combiner,
+other-mode, framebuffer-image, synchronization, DMA, and self-load commands
+required by the reference executor are handled as described above.
 
-**Not yet named in `gbi.rs`** but part of the F3DEX2 map, worth adding as
-named skips so coverage isn't overstated: `G_MODIFYVTX` (`0x02`),
-`G_CULLDL` (`0x03`), `G_BRANCH_Z` (`0x04`), `G_LINE3D` (`0x08`),
-`G_LOAD_UCODE` (`0xDD`), `G_SPECIAL_1` (`0xD5`), `G_DMA_IO` (`0xD6`), and the
-RDP framebuffer ops `G_SETCIMG` (`0xFF`) and `G_SETZIMG` (`0xFE`).
+There is no remaining rate-limited opcode skip path. `G_SPECIAL_1/2/3`
+(`0xD5`/`0xD4`/`0xD3`) are reserved by the public header and trap with the
+command words. Unsupported `G_MOVEWORD`/`G_MOVEMEM` indices and any
+unrecognized opcode likewise trap with index/address context. A new public
+microcode contract must provide semantics before one of those encodings can
+become an effectful handler.
 
 ---
 
@@ -749,8 +1176,9 @@ RDP framebuffer ops `G_SETCIMG` (`0xFF`) and `G_SETZIMG` (`0xFE`).
 7. `G_GEOMETRYMODE` — only enough to honor `G_CULL_BACK`
 8. `G_SETSCISSOR` — quarter-pixel `[upper-left, lower-right)` raster clip
 
-Remaining opcodes stay acknowledged-and-skipped; decoded texture, lighting,
-other-mode, combiner, blender, and scissor state feed the raster path above.
+Unsupported encodings trap rather than being acknowledged-and-skipped;
+decoded texture, lighting, other-mode, combiner, blender, and scissor state
+feed the raster path above.
 
 ### Top 3 things most likely to be wrong/incomplete in a naive rasterizer
 

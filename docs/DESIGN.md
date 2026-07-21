@@ -230,9 +230,28 @@ otherwise. The working-tree sparse emitter now compiles a real digest-verified
 N64 bank without decoding holes. `BlockProgram` atomically registers the owned
 `CodeBank` with the generated callable and rechecks a sparse entry before
 invocation; emitted code supplies the bank-bound registration helper. The live
-executor/dispatcher connection is still absent, so source generation and an
-owned program in isolation do not make transplant/resume available to the
-runtime.
+executor now has an explicit `boot_thread0_block_program` lane that owns the
+registered program for thread 0 and spawned OSThreads. Generated instruction
+checkpoints suspend to the executor, which charges their instruction count to
+virtual time and services device deadlines before another block can run. The
+real discovered pack is not installed by a boot target yet. Arbitrary-PC
+codegen emits direct boundaries for a supplied static host-JAL inventory and a
+distinct `ResolveCall` for dynamic JAL/JALR targets. The live resolver types
+those as either an installed host function or a bank-qualified guest target;
+generated `jr`/`jalr` recognizes only an explicit OSThread return sentinel.
+`ExecutableRegion` now owns one active immutable generation and atomically
+retires the previous `CodeBank` plus runner on same-range replacement. The ABI
+registers equal-length physical/virtual executable spans and observes typed CPU
+stores, generated-C direct RDRAM stores, and device DMA writes through one
+post-commit range seam. At the next host boundary it snapshots architectural
+byte order, builds and publishes the replacement pair, retires the old pair,
+and re-resolves interrupt, checkpoint, host-resume, and spawned-thread entries
+through the active mapping before executing. A generated runner can still
+execute later instructions from its current immutable body after a store and
+before that runner returns; store-interior checkpoints remain required for the
+strict per-instruction invalidation rule. No real pack supplies a dynamic
+builder or boot registration yet, so this does not make real-ROM
+transplant/resume available by itself.
 
 Provenance of the removal: `crates/fn64-diff` once carried a subprocess client
 for the *faki-tools* `oracle` CLI plus a mupen64plus `.m64p` savestate parser,
@@ -280,6 +299,19 @@ oracle is not obsolete once RT64 works.** ReferenceBackend is what keeps
 `cargo test` GPU-free (RT64 needs Vulkan/D3D12/Metal, so headless CI would
 otherwise need a GPU or software Vulkan), and it is the differential oracle the
 wgpu port is gated against (ROADMAP P2).
+
+An `OSTask` boundary is an RSP scheduling boundary, not an RDP reset. The
+reference backend therefore owns one persistent RDP decode state shared by its
+admitted F3DEX2 and raw-DPC entry paths: other mode, combiner/constants,
+scissor/fill, texture-image/tile/TLUT registers, and physical TMEM survive.
+Only the F3DEX2-owned `G_TEXTURE` enable/tile/scale selection is rebuilt per
+task. Keeping this ownership in the backend prevents a new decoder invocation
+from manufacturing reset registers or a white texture. `G_SETCIMG` is part of
+that persistent RDP state: production F3DEX2/raw color writes require it and
+never infer it from the independent VI scanout/`output_addr` state. Persistence
+retains the register, not a private copy of memory: the selected image is
+re-imported from RDRAM at each task boundary to observe intervening CPU/device
+writes.
 
 Operational detail (emit caching, the shared target dir, the `./oot` loop)
 lives in `FAST-LOOP.md`; this section is only the shape and the why.
@@ -495,6 +527,149 @@ task calls out:
   is no second real thread that could race the queue mutation, because the
   actual mutation of "make thread X runnable" is executor-owned state
   touched only between coroutine resumes.
+
+  The live device implementation now makes that ordering structural. Its
+  RCP/MI authority exists from `HostState` construction and is not optional or
+  coupled to cartridge ROM load order; a separate `rom_installed` invariant
+  keeps PI DMA's missing-content path loud.
+  `DeviceFabric` owns PI's sole in-flight request and guest-cycle deadline;
+  managed EPI, raw PI APIs, and typed-Rust PI register writes all enter it.
+  At the deadline it writes the process's one RDRAM allocation, clears PI
+  busy, raises MI PI pending, and only then returns an executor notification.
+  `advance_virtual_time` injects that notification before it returns. The
+  translated checkpoint path also suspends first, advances executor time, and
+  commits the fabric in `fn64-abi::run_one_step` before any later resume. The
+  default one-cycle `FixedPiTiming` is an explicit,
+  host-configurable compatibility policy because the allowed public manuals
+  define PI domain parameters but not an exact completion formula; it is not a
+  hardware-cycle-accuracy claim. The same fabric now owns AI's two-slot FIFO.
+  It derives deterministic drain deadlines from stereo-frame count, the
+  93.75 MHz CPU clock, and libultra's quantized DAC rate, then raises MI AI and
+  returns OS_EVENT_AI only after the current buffer drains. This is guest-time
+  ordering, not a claim of hardware-verified AI bus timing. Its DAC divisor
+  uses the same IPL-selected NTSC/PAL/MPAL video clock as VI. SP, SI, VI, PI,
+  AI, and DP pending bits and masks are
+  one level-sensitive gate. Typed raw writes apply the acknowledgement commands
+  documented by the public `rcp.h` register definitions: SP status bits 3/4,
+  any VI_CURRENT/AI_STATUS/SI_STATUS write, and MI mode bit 11 for DP. In the
+  same fabric, SI owns persistent 64-byte PIF RAM and schedules distinct
+  DRAM-to-PIF command and PIF-to-DRAM response transfers. Completion order is
+  `PIF/RDRAM bytes -> SI idle -> MI SI -> OS_EVENT_SI`; the current one-cycle
+  deadline is an explicit policy because the public register definitions do
+  not supply a transfer-cycle formula. Raw controller query/read commands are
+  implemented; other raw PIF device commands remain loud gaps. The fabric also
+  owns the RSP's persistent 4 KiB DMEM/IMEM, PC, status, atomic semaphore, and
+  double-buffered SP DMA. DMA forces public 64-bit alignment, decodes
+  length/count/skip rows, commits at an eight-setup-cycle plus one-cycle-per-
+  64-bit-beat deterministic deadline, and increments an IMEM generation only
+  after commit. The public `osSpTaskLoad` sequence copies all 64 OSTask bytes
+  to DMEM `0xfc0`, aligned rspboot bytes to IMEM zero, resets PC, and clears a
+  preceding task's SIG0/SIG1 yield handshake. `osSpTaskYield` writes the public
+  `SP_SET_YIELD`/SIG0 command and returns immediately. After SP completion,
+  `osSpTaskYielded` observes SIG1; a real acknowledgement sets
+  `OS_TASK_YIELDED` and replaces `ucode_data`/`ucode_data_size` with the task's
+  yield-buffer fields, while normal completion returns zero and leaves the
+  task untouched. These semantics come from the public *RSP Programmer's
+  Guide*, "Task Yielding", the `rcp.h` SP signal definitions, and the
+  `osSpTaskYielded` manual page. The query never dispatches a backend or ucode,
+  preventing a completed task from running twice. A renderer returning
+  `FrameStatus::Yielded` drives the same SIG1 state and schedules SP completion
+  without a premature DP completion; missing or failed renderer operations all
+  pass through one loud gate rather than synthetic-completing. Reloading the
+  rewritten task then calls the backend with `OS_TASK_YIELDED` and the saved
+  data range, providing cooperative HLE resume even though host-atomic backend
+  calls cannot yet be preempted mid-call. Known graphics/audio tasks now run
+  the admitted rspboot through its real scalar interpreter until control first
+  reaches an IMEM range installed by read DMA. RDRAM DMA writes, DMEM, the
+  final IMEM generation, SP status, and ucode entry PC commit before the HLE
+  backend represents the loaded-ucode phase; BREAK, DPC submission, or a
+  bounded failure before that handoff traps loudly. Scalar/VU register state
+  does not cross this optimization boundary. Unknown
+  and custom tasks execute from that persistent image through the clean-room
+  scalar/vector interpreter: IMEM DMA replaces a generation and resumes at the
+  saved PC; BREAK commits DMEM, RDRAM DMA writes, status, and DRAM/XBUS DPC
+  submissions before the guest resumes. Graphics HLE preflight is
+  transactional and content-addressed: selecting an HLE decode mode admits no
+  content. Both HLE backends return `NeedsLle` when the task-entry IMEM digest
+  is unregistered; the reference renderer additionally decodes admitted tasks
+  against cloned RDRAM/RSP state and rejects an unadmitted `G_LOAD_UCODE`
+  generation. The clone is discarded and the complete ucode phase runs from
+  untouched post-rspboot state through that interpreter. DRAM and staged XBUS
+  DPC ranges then reach either the Rust raw renderer or RT64's bounded LLE RDP
+  entry with the submission boundary's explicit VI output address; no raw path
+  infers it from a preceding HLE call. This avoids an
+  impossible fabricated mid-HLE scalar/VU transplant while preserving BREAK
+  and DRAM/XBUS DPC effects. Exact graphics/audio HLE task
+  effects after rspboot remain atomic backend calls, so SIG0 cannot yet
+  preempt and resume them in the middle of a task. Completion no longer wakes
+  the scheduler from inside `osSpTaskStartGo`: the fabric schedules SP at the
+  measured rspboot instruction count plus one HLE policy cycle and graphics DP
+  one cycle later, raising each MI source and returning each OS event in order.
+  Those deadlines are a compatibility policy until hardware-derived RSP
+  timing and real RDP FullSync provide the timing.
+  VI is scheduled in this fabric rather than asserted after an executor ticker
+  fires. Its 14-word raw register image is shared with typed MMIO;
+  `VI_CURRENT` is derived from the programmed `VI_V_SYNC`: progressive output
+  exposes the public even half-line sequence,
+  while `VI_STATUS.SERRATE` alternates even/odd fields and the sampled low bit.
+  Equality with `VI_INTR` raises the common MI source, and any `VI_CURRENT`
+  write acknowledges it without replacing the sampled line.
+  `osViSetMode` decodes the public `OSViMode` structure into that same image,
+  retaining both five-word field register sets. Each interrupt selects the
+  set matching live field parity, and its origin is added to the queued
+  framebuffer base rather than misread as an absolute address.
+  `osViSetSpecialFeatures` consumes the public `u32` ON/OFF command pairs—not
+  a pointer—and composes gamma, gamma-dither, divot, and bit-16 dither-filter
+  changes with the queued control image before the same interrupt latch.
+  `osViSetXScale` and `osViSetYScale` validate their public ranges and multiply
+  the mode's low 12-bit 2.10 coefficient while retaining its subpixel offset;
+  a later mode call resets earlier overrides, while later scale calls compose
+  into the queued mode.
+  `osViGetCurrentLine`, `osViGetCurrentField`, `osViGetStatus`, and
+  `osViGetCurrentMode` query that live state; a queued mode does not become
+  current until the interrupt latch.
+  At the interrupt, pending mode/scales/blanking/framebuffer state becomes
+  current before the general OS_EVENT_VI target or `osViSetEvent` target can
+  wake. The general event fires every field; the VI-manager target honors its
+  public nonzero `retraceCount` divisor independently. Framebuffer and
+  black/unblack transitions each trigger the renderer only after that latch.
+  Typed `ViPresentation` state crosses the renderer boundary; the Rust
+  reference backend keeps its RDP image separate from VI scanout, presents
+  black without erasing that image, implements the public `osViFade` 10-bit
+  interpolation of its first two rows, implements `osViRepeatLine`, and
+  restores the unmodified source when each effect is disabled. These two
+  public functions are beyond the canonical NMR inventory but are exported
+  for general N64 software in both C and Rust-recompiler host-call lanes.
+  Enabling black with an effective Y scale other than the manual-required 1.0
+  traps loudly, as do blacking while fade/repeat is active and enabling fade
+  and repeat together. The RT64 adapter sends the same typed state through its
+  quarantined C boundary and programs the VI mechanisms directly: disabled
+  pixel type for black, zero Y scale for repeat-line, and zero Y scale plus
+  the 10-bit Y subpixel offset for fade. This was feature-compiled and its
+  Rust/C/C++ ABI exercised by the RT64 unit build; pixel-level GPU capture is
+  still an integration gate. A typed IPL television standard is
+  the common VI/AI clock authority. Before a mode exists, VI uses the public
+  nominal 60 Hz NTSC/MPAL or 50 Hz PAL rate; once H_SYNC and V_SYNC are
+  nonzero, their public line/half-line units derive the next guest-cycle field
+  interval from that standard's video clock. Hosts query the live interval at
+  every injection point, so a latched mode changes the next deadline. This
+  formula is clean-room derived from public register definitions and has not
+  yet been checked against a hardware timing trace. Analog VI output filtering
+  remains open.
+  In the block
+  lane, raw MI mask commands and RCP completion drive CPU IP2; the next
+  instruction boundary applies the
+  Status IE/IM/EXL/ERL gate, commits Cause/EPC/EXL, and resolves the BEV-selected
+  handler through the active code mapping. The same boundary synchronizes the
+  executor-owned half-rate Count/Compare clock: equality latches CPU IP7 and a
+  handler's MTC0 Compare acknowledges it before ERET can resume. Generated-C
+  translation units compile as C++ solely for `fn64_mmio_proxy.h`: its lvalue
+  proxy preserves direct native-word RDRAM reads/writes but routes KSEG1 RCP
+  `MEM_W` loads and assignments through the same raw handlers as the typed
+  block lane. Subword RCP access traps loudly. This closes split register
+  authority, but not the function lane's inability to suspend inside one
+  generated function; tight timed-device polling still requires block-lane
+  checkpoints.
 - **Why rung-18-class races become unrepresentable, precisely.** Rung 18's
   actual root cause was not "the mutex was in the wrong place" — a mutex
   *was* added at exactly the TOCTOU the original hypothesis named, verified
@@ -652,7 +827,9 @@ scheduling logic, and vice versa.
 **The fix**: a new `fn64_runtime::peripherals::Peripherals` struct now owns
 those four fields and every method that only touches them
 (`vi()`/`vi_set_*`/`vi_swap_buffer`/`arm_retrace`/`advance_retrace`,
-`pif()`, `task_log()`/`submit_task`). `Executor` holds exactly one
+`pif()`, `task_log()`/`submit_task`). Hardware RSP memory/register/DMA state
+now lives separately in `DeviceFabric`; `Peripherals` retains only the OS-facing
+task log. `Executor` holds exactly one
 `peripherals: Peripherals` field and re-exposes the same public method
 names as one-line delegations, so **no caller outside this crate changed**
 — `fn64-abi`'s `with_executor(|exec| exec.vi_set_mode(...))`-shaped call
@@ -1041,8 +1218,9 @@ per group once wave 2's matching runtime API exists).**
   re-derived from `ABI-SURFACE.md`'s prose alone. `get_function` is backed
   by the new `fn64-runtime::overlay::SectionRegistry` (§1's long-deferred
   overlay/`get_function` lookup table, built this wave — see below).
-  `cop0_status_*` NOT started (no call site in either game's corpus per
-  `ABI-SURFACE.md`).
+  The legacy corpus had no `cop0_status_*` call site per `ABI-SURFACE.md`; the
+  arbitrary-PC lane now owns typed Status/Cause/EPC state because precise
+  exceptions and interrupts require it independently of shim reachability.
 - Thread lifecycle shims: `osCreateThread_recomp`/`osStartThread_recomp`
   **DONE** (M1 wave) — real dispatch via `SectionRegistry::resolve`, no
   longer `unimplemented!()`. `osSetThreadPri_recomp` **DONE** (prior wave,
@@ -1174,8 +1352,8 @@ codegen template unconditionally emits `#include "librecomp/rsp.hpp"`, which
 lives under `N64ModernRuntime`'s GPL-3.0-licensed tree (verified: that repo's
 top-level `COPYING` is GPL-3.0; `librecomp/` is not under the MIT-carved-out
 `N64Recomp/` subdirectory) — a real, load-bearing clean-room blocker, not
-routed around. `osSpTaskYielded_recomp`'s `M_AUDTASK` dispatch plumbing
-(`set_audio_ucode_fn`) is real and tested against a stand-in function; the
+routed around. The audio task-dispatch plumbing now owned by
+`osSpTaskStartGo_recomp` (`set_audio_ucode_fn`) is real and tested against a stand-in function; the
 genuine ucode requires either an MIT-clean RSP interpreter or a forked
 RSPRecomp codegen target, both future work.
 

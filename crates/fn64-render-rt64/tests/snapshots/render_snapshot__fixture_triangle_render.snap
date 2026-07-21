@@ -3,7 +3,7 @@ source: crates/fn64-render-rt64/tests/render_snapshot.rs
 expression: "framebuffer_digest(fb, clear)"
 ---
 dims: 64x64
-non_clear_pixels: 1152
-fb_fnv1a: 3fede42d425a9091
+non_clear_pixels: 1200
+fb_fnv1a: 97c4160173ba7e87
 centroid_rgba: [81, 86, 87, 255]
 corner_rgba: [10, 10, 10, 255]

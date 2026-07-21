@@ -94,6 +94,7 @@ fn main() {
 
     let mut build = cc::Build::new();
     build
+        .cpp(true)
         // The shared bridge include comes FIRST: it holds fn64's clean-room
         // stand-in librecomp/sections.h, which must shadow any real
         // (GPL-3.0-licensed) librecomp/include on the search path -- see
@@ -101,12 +102,32 @@ fn main() {
         .include(bridge_dir.join("include"))
         .include(&recompiled_dir)
         .include(&recomp_h_dir)
+        .flag("-include")
+        .flag("fn64_mmio_proxy.h")
+        .flag_if_supported("-std=c++17")
         .flag_if_supported("-Wno-everything")
+        // Generated code carries aki-recomp's NAN_CHECK debug asserts;
+        // real hardware propagates NaN silently (0.0/0.0 in genuinely
+        // uninitialized-BSS math is normal mid-boot). NDEBUG disables the
+        // asserts, matching a release build of the same sources.
+        .define("NDEBUG", None)
         // RecompiledFuncs/*.c is generated code with no warning hygiene of
         // its own (matches aki-recomp's own CMakeLists.txt build recipe for
         // this same source, per M1-WORKLIST.md's method section).
         .warnings(false);
 
+    // N64Recomp's jump-table codegen declares `gpr jr_addend_XXXX = <expr>;`
+    // mid-function, and other case arms `goto` past that declaration. Valid
+    // C11 (the variable is simply uninitialized on bypassing paths, and the
+    // generated code only reads it after the assignment), but a hard error in
+    // C++ ("jump bypasses variable initialization"), which this build needs
+    // for fn64_mmio_proxy.h. Splitting into declaration + assignment is
+    // semantically identical and legal in both languages, so rewrite each .c
+    // into OUT_DIR before compiling. ponytail: line-based string match, not a
+    // C parser -- generated code is mechanically regular, so this holds until
+    // N64Recomp changes its emission shape (then the C++ error returns loudly).
+    let patched_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("cxx-safe-funcs");
+    std::fs::create_dir_all(&patched_dir).unwrap();
     let mut c_file_count = 0usize;
     for entry in std::fs::read_dir(&recompiled_dir).unwrap_or_else(|e| {
         panic!(
@@ -117,7 +138,29 @@ fn main() {
         let entry = entry.unwrap();
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("c") {
-            build.file(&path);
+            let source = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("wm2000-boot build.rs: reading {}: {e}", path.display())
+            });
+            let patched: String = source
+                .lines()
+                .map(|line| {
+                    let trimmed = line.trim_start();
+                    if let Some(rest) = trimmed.strip_prefix("gpr jr_addend_") {
+                        if let Some((name_tail, expr)) = rest.split_once(" = ") {
+                            let indent = &line[..line.len() - trimmed.len()];
+                            return format!(
+                                "{indent}gpr jr_addend_{name_tail}; jr_addend_{name_tail} = {expr}\n"
+                            );
+                        }
+                    }
+                    format!("{line}\n")
+                })
+                .collect();
+            let out_path = patched_dir.join(path.file_name().unwrap());
+            std::fs::write(&out_path, patched).unwrap_or_else(|e| {
+                panic!("wm2000-boot build.rs: writing {}: {e}", out_path.display())
+            });
+            build.file(&out_path);
             c_file_count += 1;
         }
     }
@@ -138,8 +181,8 @@ fn main() {
     // recomp_overlays.inl's SectionTableEntry initializers use `nullptr`
     // (the file was generated for a C++ port build, per N64Recomp's own
     // codegen target), which is not valid in C. RecompiledFuncs/*.c itself
-    // compiles fine as plain C (per M1-WORKLIST.md's own method), so only
-    // this one glue file needs the C++ compiler.
+    // also uses C++ now so fn64_mmio_proxy.h can preserve MEM_W lvalue syntax
+    // while intercepting raw RCP register words.
     let mut bridge_build = cc::Build::new();
     bridge_build
         .cpp(true)
@@ -154,6 +197,10 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         bridge_dir.join("section_bridge.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        bridge_dir.join("include/fn64_mmio_proxy.h").display()
     );
     println!("cargo:rerun-if-changed={}", recompiled_dir.display());
 }

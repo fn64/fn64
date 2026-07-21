@@ -43,10 +43,14 @@
 //! plain data the caller needs to record that same event itself -- see each
 //! method's doc comment for the exact shape carried over.
 
+use crate::device::Cycles;
+use crate::pfs::ControllerPak;
 use crate::rdram::RdramAddr;
 use crate::rsp::{OsTaskHeader, TaskLog};
-use crate::si::PifModel;
+use crate::si::{PifModel, PortState, RumbleError};
+use crate::transfer_pak::{TransferPak, TransferPakError};
 use crate::vi::{RetraceSchedule, ViState};
+use crate::voice::VoiceUnit;
 
 /// VI (video interface) + SI/PIF (controller probe) + RSP (task submission)
 /// host-side hardware-model state. See module doc for why these three are
@@ -68,6 +72,12 @@ pub struct Peripherals {
     retrace: Option<RetraceSchedule>,
     /// Minimal SI/PIF controller-probe model (`si.rs`).
     pif: PifModel,
+    /// Persistent semantic file systems for attached Controller Paks.
+    controller_paks: [Option<ControllerPak>; 4],
+    /// Persistent Transfer Pak register and inserted-cartridge state.
+    transfer_paks: [Option<TransferPak>; 4],
+    /// Persistent state for ports configured with Voice hardware.
+    voice_units: [Option<VoiceUnit>; 4],
     /// RSP task submissions observed (`rsp.rs`).
     tasks: TaskLog,
 }
@@ -81,12 +91,6 @@ pub struct RetraceTick {
     /// How many `OS_EVENT_VI` retrace ticks fired this call (see
     /// `RetraceSchedule::advance`'s doc comment for why this can be >1).
     pub event_vi_ticks: u32,
-    /// The VI manager's own `osViSetEvent` retrace target, if one has been
-    /// registered -- delivered once per call regardless of
-    /// `event_vi_ticks`' count, matching `Executor::advance_time`'s prior
-    /// behavior exactly (one `deliver_or_enqueue` per fired tick, inside the
-    /// same loop `event_vi_ticks` counts).
-    pub retrace_target: Option<(u32, u32)>,
 }
 
 impl Peripherals {
@@ -104,23 +108,40 @@ impl Peripherals {
         self.vi.set_mode(mode_ptr);
     }
 
-    pub fn vi_set_special_features(&mut self, ptr: u32) {
-        self.vi.set_special_features(ptr);
+    pub fn vi_set_special_features(&mut self, features: u32) {
+        self.vi.set_special_features(features);
     }
 
     pub fn vi_set_y_scale(&mut self, scale: f32) {
         self.vi.set_y_scale(scale);
     }
 
+    pub fn vi_set_x_scale(&mut self, scale: f32) {
+        self.vi.set_x_scale(scale);
+    }
+
     /// `osViSetEvent(mq, msg, retraceCount)` -- see `ViState::set_event`'s
     /// doc comment for why this is a separate delivery path from
     /// `osSetEventMesg`.
-    pub fn vi_set_event(&mut self, mq_addr: RdramAddr, msg: crate::mesgqueue::Mesg) {
-        self.vi.set_event(mq_addr, msg);
+    pub fn vi_set_event(
+        &mut self,
+        mq_addr: RdramAddr,
+        msg: crate::mesgqueue::Mesg,
+        retrace_count: u32,
+    ) {
+        self.vi.set_event(mq_addr, msg, retrace_count);
     }
 
     pub fn vi_set_black(&mut self, active: bool) {
         self.vi.set_black(active);
+    }
+
+    pub fn vi_set_fade(&mut self, active: bool, factor: u16) {
+        self.vi.set_fade(active, factor);
+    }
+
+    pub fn vi_set_repeat_line(&mut self, active: bool) {
+        self.vi.set_repeat_line(active);
     }
 
     /// `osViSwapBuffer(frameBufPtr)`. Returns the newly-current framebuffer
@@ -133,9 +154,17 @@ impl Peripherals {
         frame_buf
     }
 
-    /// Arm the periodic VI retrace ticker at `interval` virtual-time units
-    /// per field. See `vi.rs`'s `RetraceSchedule` doc -- not a hardware-
-    /// accurate NTSC/PAL timing value, a host-chosen approximation.
+    pub fn vi_latch_retrace(&mut self) -> bool {
+        self.vi.latch_retrace()
+    }
+
+    pub fn vi_manager_target_for_retrace(&mut self) -> Option<(u32, u32)> {
+        self.vi.manager_target_for_retrace()
+    }
+
+    /// Arm the standalone compatibility VI ticker at `interval` virtual-time
+    /// units per field. Integrated device execution instead derives timing
+    /// from a typed television standard and the live VI timing registers.
     pub fn arm_retrace(&mut self, interval: u64) {
         self.retrace = Some(RetraceSchedule::new(interval));
     }
@@ -148,10 +177,7 @@ impl Peripherals {
     pub fn advance_retrace(&mut self, now: u64) -> Option<RetraceTick> {
         let sched = self.retrace.as_mut()?;
         let event_vi_ticks = sched.advance(now);
-        Some(RetraceTick {
-            event_vi_ticks,
-            retrace_target: self.vi.retrace_target,
-        })
+        Some(RetraceTick { event_vi_ticks })
     }
 
     // ---- SI/PIF (controller probe) ---------------------------------------
@@ -165,6 +191,101 @@ impl Peripherals {
     /// `osContGetReadData` for that port reflects it.
     pub fn set_controller_input(&mut self, port: usize, input: crate::si::ContInput) {
         self.pif.set_input(port, input);
+    }
+
+    pub fn set_controller_port_state(&mut self, port: usize, state: PortState) {
+        self.pif.set_port_state(port, state);
+        if matches!(state, PortState::StandardControllerControllerPak)
+            && self.controller_paks[port].is_none()
+        {
+            self.controller_paks[port] = Some(ControllerPak::new());
+        }
+        if matches!(state, PortState::StandardControllerTransferPak)
+            && self.transfer_paks[port].is_none()
+        {
+            self.transfer_paks[port] = Some(TransferPak::new());
+        }
+        if matches!(state, PortState::VoiceRecognitionUnit) && self.voice_units[port].is_none() {
+            self.voice_units[port] = Some(VoiceUnit::new());
+        }
+    }
+
+    pub fn set_rumble(&mut self, port: usize, active: bool) -> Result<(), RumbleError> {
+        self.pif.set_rumble(port, active)
+    }
+
+    pub fn controller_pak(&self, port: usize) -> Option<&ControllerPak> {
+        if !matches!(
+            self.pif.port_state(port),
+            PortState::StandardControllerControllerPak
+        ) {
+            return None;
+        }
+        self.controller_paks.get(port)?.as_ref()
+    }
+
+    pub fn controller_pak_mut(&mut self, port: usize) -> Option<&mut ControllerPak> {
+        if !matches!(
+            self.pif.port_state(port),
+            PortState::StandardControllerControllerPak
+        ) {
+            return None;
+        }
+        self.controller_paks.get_mut(port)?.as_mut()
+    }
+
+    pub fn transfer_pak(&self, port: usize) -> Option<&TransferPak> {
+        if !matches!(
+            self.pif.port_state(port),
+            PortState::StandardControllerTransferPak
+        ) {
+            return None;
+        }
+        self.transfer_paks.get(port)?.as_ref()
+    }
+
+    pub fn transfer_pak_mut(&mut self, port: usize) -> Option<&mut TransferPak> {
+        if !matches!(
+            self.pif.port_state(port),
+            PortState::StandardControllerTransferPak
+        ) {
+            return None;
+        }
+        self.transfer_paks.get_mut(port)?.as_mut()
+    }
+
+    /// Advance every retained Transfer Pak cartridge, including an accessory
+    /// temporarily detached from its controller port: MBC3's battery-backed
+    /// oscillator is independent of both N64 controller and Pak power.
+    pub fn advance_transfer_paks_to(&mut self, now: Cycles) {
+        for pak in self.transfer_paks.iter_mut().flatten() {
+            pak.advance_to(now);
+        }
+    }
+
+    pub fn insert_transfer_pak_cartridge(
+        &mut self,
+        port: usize,
+        rom: Vec<u8>,
+        ram: Option<Vec<u8>>,
+    ) -> Result<(), TransferPakError> {
+        self.transfer_pak_mut(port)
+            .unwrap_or_else(|| panic!("no Transfer Pak attached to controller port {port}"))
+            .insert_cartridge(rom, ram)
+    }
+
+    pub fn voice_unit_mut(&mut self, port: usize) -> Option<&mut VoiceUnit> {
+        if !matches!(self.pif.port_state(port), PortState::VoiceRecognitionUnit) {
+            return None;
+        }
+        self.voice_units.get_mut(port)?.as_mut()
+    }
+
+    pub fn voice_unit(&self, port: usize) -> Option<&VoiceUnit> {
+        if !matches!(self.pif.port_state(port), PortState::VoiceRecognitionUnit) {
+            return None;
+        }
+        self.voice_units.get(port)?.as_ref()
     }
 
     // ---- RSP task submission -----------------------------------------------

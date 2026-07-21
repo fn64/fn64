@@ -5,22 +5,15 @@
 //!
 //! ## Why this fixture is hand-built, not pulled from a real ROM capture
 //!
-//! `docs/COMPLETENESS.md`'s `osSpTaskStartGo`/`osSpTaskLoad` rows are
-//! ABSENT/no-call-site-observed for both ported games as of this wave --
-//! neither game's currently generated corpus has reached a real gfx task
-//! submission yet (only `osSpTaskYielded`'s task-header path is exercised,
-//! and it currently only ever sees `M_AUDTASK` for real; `M_GFXTASK` is
-//! acknowledged, never carrying real display-list bytes -- see
-//! `fn64_abi::osSpTaskYielded_recomp`'s `GFX_TASK_NOTE`). Claiming this
-//! fixture came from a real OoT/NW4E capture would be exactly the
-//! unevidenced claim `AGENTS.md`/this project's honesty rule forbids.
-//! Instead: this fixture is a deliberately tiny, HAND-CONSTRUCTED display
+//! No game content or ROM-captured command bytes may enter this repository.
+//! Claiming this fixture came from a real OoT/NW4E capture would also be an
+//! unevidenced claim. This fixture is therefore a deliberately tiny, hand-built display
 //! list using the real, public F3DEX2 wire encoding (`gbi.rs`'s module
 //! doc) -- proof the SEAM (decode -> rasterize -> framebuffer) works
-//! end-to-end on real opcode bytes, not proof any specific game's actual
-//! content renders yet. When a real gfx task IS observed from generated
-//! code, replace this fixture with that capture; the test shape (build
-//! task -> `process_task` -> assert non-clear -> dump PNG) stays the same.
+//! end-to-end on public opcode bytes, not proof any specific game's content.
+//! `fn64-abi` separately proves the live Load+StartGo dispatch seam with the
+//! same kind of synthetic task; `osSpTaskYielded` is only a yield-status query
+//! and deliberately cannot dispatch rendering.
 use fn64_render::{OsTask, RenderBackend, RenderConfig, M_GFXTASK};
 use fn64_render_rt64::{png_dump, ReferenceBackend};
 
@@ -83,10 +76,12 @@ fn fixture_display_list_renders_a_non_clear_frame() {
         ..Default::default()
     };
     let status = backend
-        .process_task(&mut rdram, &task, 0)
+        .process_task(&mut rdram, &mut fn64_runtime::RspMemory::new(), &task, 0)
         .expect("process_task should succeed");
     assert_eq!(status, fn64_render::FrameStatus::Complete);
-    backend.present().unwrap();
+    backend
+        .present(fn64_render::ViPresentation::default())
+        .unwrap();
 
     let fb = backend
         .framebuffer()
@@ -133,19 +128,17 @@ fn unlisted_ucode_still_traps_through_the_real_backend_not_just_the_trait_fake()
     let mut backend = ReferenceBackend::new();
     backend.create(&RenderConfig::new(8, 8)).unwrap();
     assert_eq!(backend.supported_ucodes(), &[fn64_render::UcodeId::F3dex2]);
-    // A task with no display list at all (data_ptr = 0, all-zero rdram)
-    // decodes to zero triangles -- a real "nothing to draw" case, not an
-    // error, since G_ENDDL at offset 0 (all-zero bytes: opcode 0x00) is
-    // simply an unmodeled/no-op opcode until it eventually reads past the
-    // buffer and stops. Confirms the happy path doesn't panic on trivial
-    // input.
+    // A task containing an explicit G_ENDDL decodes to zero triangles -- a
+    // real "nothing to draw" case. Unknown opcodes and unterminated streams
+    // are deliberately errors even in this fixture-only decoder.
     let mut rdram = vec![0u8; 16];
+    rdram[..4].copy_from_slice(&((fn64_render_rt64::gbi::G_ENDDL as u32) << 24).to_be_bytes());
     let task = OsTask {
         task_type: M_GFXTASK,
         data_ptr: 0,
         ..Default::default()
     };
-    let result = backend.process_task(&mut rdram, &task, 0);
+    let result = backend.process_task(&mut rdram, &mut fn64_runtime::RspMemory::new(), &task, 0);
     assert!(result.is_ok());
 }
 
@@ -206,17 +199,22 @@ fn process_task_writes_rgba5551_framebuffer_to_output_addr() {
         ..Default::default()
     };
     backend
-        .process_task(&mut rdram, &task, OUTPUT_ADDR as u32)
+        .process_task(
+            &mut rdram,
+            &mut fn64_runtime::RspMemory::new(),
+            &task,
+            OUTPUT_ADDR as u32,
+        )
         .expect("process_task should succeed");
 
     // 1) The byte JUST BEFORE the output region is untouched (0) -- the write
     //    landed at OUTPUT_ADDR, not earlier.
     assert_eq!(rdram[OUTPUT_ADDR - 1], 0, "wrote before output_addr");
 
-    // 2) Every framebuffer pixel is either the clear color (0xF801) or the
-    //    green triangle color (r5=0,g5=31,b5=0,a1=1 -> 0x07C1). No pixel is
-    //    all-zero (which would mean nothing was written) and none has a
-    //    byte-swapped encoding.
+    // 2) Every framebuffer pixel is either the clear color (0xF801) or green.
+    //    RGBA16's visible low bit is stored-coverage bit 2, not retained alpha,
+    //    so an anti-aliased edge can be 0x07C0 while a full-coverage interior
+    //    is 0x07C1. No pixel is all-zero and none is byte-swapped.
     let fb = fn64_runtime::RdramView::from_storage(&rdram);
     let fb_start = fn64_runtime::RdramAddr::from_offset(OUTPUT_ADDR as u32);
     let mut saw_clear = false;
@@ -229,10 +227,10 @@ fn process_task_writes_rgba5551_framebuffer_to_output_addr() {
         );
         match px {
             0xF801 => saw_clear = true,
-            0x07C1 => saw_green = true,
+            0x07C0 | 0x07C1 => saw_green = true,
             other => panic!(
                 "unexpected framebuffer pixel {other:#06x} -- neither clear (0xF801) nor \
-                 green triangle (0x07C1); a wrong format or byte-order bug"
+                 green triangle (0x07C0/0x07C1); a wrong format or byte-order bug"
             ),
         }
     }
@@ -253,7 +251,7 @@ fn process_task_writes_rgba5551_framebuffer_to_output_addr() {
         *b = 0;
     }
     backend
-        .process_task(&mut rdram2, &task, 0)
+        .process_task(&mut rdram2, &mut fn64_runtime::RspMemory::new(), &task, 0)
         .expect("process_task should succeed");
     assert!(
         rdram2[OUTPUT_ADDR..OUTPUT_ADDR + (W * H * 2) as usize]

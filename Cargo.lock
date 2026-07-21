@@ -760,6 +760,9 @@ dependencies = [
 [[package]]
 name = "fn64-render"
 version = "0.0.0"
+dependencies = [
+ "fn64-runtime",
+]
 
 [[package]]
 name = "fn64-render-rt64"
@@ -768,6 +771,7 @@ dependencies = [
  "fn64-render",
  "fn64-runtime",
  "insta",
+ "sha2",
 ]
 
 [[package]]

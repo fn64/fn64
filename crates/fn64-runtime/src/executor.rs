@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use corosensei::CoroutineResult;
 
+use crate::device::Cycles;
 use crate::mesgqueue::{Mesg, MesgQueue, RecvResult, SendResult};
 use crate::peripherals::Peripherals;
 use crate::rdram::RdramAddr;
@@ -108,6 +109,19 @@ pub struct Executor {
     /// entry point for VI-tick-equivalent progress) -- never wall-clock,
     /// per the task's explicit "no wall-clock in core" requirement.
     sim_time: u64,
+    /// MIPS CP0 Count register. It advances by the same deterministic guest
+    /// cycle delta as `sim_time`, but `osSetTime` does not rewrite it: the OS
+    /// time base and the hardware free-running Count register are distinct
+    /// state on real hardware.
+    cp0_count: u32,
+    /// Count increments once per two guest CPU cycles. Retaining the odd-cycle
+    /// phase makes split checkpoint advances identical to one combined
+    /// advance.
+    cp0_count_phase: u8,
+    /// CP0 Compare and its level-sensitive IP7 latch. Equality raises the
+    /// latch; only a Compare write clears it.
+    cp0_compare: u32,
+    cp0_timer_pending: bool,
     /// Cumulative OS_EVENT_VI ticks `advance_time` has fired since boot.
     /// A COUNT, never a rate: rates need wall-clock, which this crate does not
     /// have by design. `fn64-abi` pairs it with `Instant` (ROADMAP R5 probe 3).
@@ -183,12 +197,34 @@ impl Executor {
     /// system's current time counter. This crate has no wall-clock (only
     /// virtual `sim_time`, per `docs/DESIGN.md`'s explicit "no wall-clock in
     /// core" rule), so `osGetTime`'s counterpart reads `sim_time()` and this
-    /// setter reassigns it directly -- the same virtual-clock value both
-    /// `osGetTime`/`osSetTime` and the VI-tick/timer-wheel machinery share,
-    /// matching real hardware's single free-running counter both the OS
-    /// timer API and (indirectly) count-based scheduling read from.
+    /// setter reassigns it directly. CP0 Count is separate hardware state:
+    /// changing OSTime does not rewrite Count, while later positive guest-time
+    /// advances continue to drive both timer scheduling and Count progress.
     pub fn set_sim_time(&mut self, time: u64) {
         self.sim_time = time;
+    }
+
+    pub fn cp0_count(&self) -> u32 {
+        self.cp0_count
+    }
+
+    pub fn set_cp0_count(&mut self, count: u32) {
+        self.cp0_count = count;
+        self.cp0_count_phase = 0;
+    }
+
+    pub fn cp0_compare(&self) -> u32 {
+        self.cp0_compare
+    }
+
+    /// MTC0 Compare both replaces the threshold and acknowledges IP7.
+    pub fn write_cp0_compare(&mut self, compare: u32) {
+        self.cp0_compare = compare;
+        self.cp0_timer_pending = false;
+    }
+
+    pub fn cp0_timer_pending(&self) -> bool {
+        self.cp0_timer_pending
     }
 
     /// Register the process-wide rdram base so queue mutations can mirror
@@ -303,6 +339,20 @@ impl Executor {
         }
     }
 
+    /// Process-exit teardown: abandon every parked coroutine without
+    /// unwinding its stack (see `GameThread::abandon` for why unwinding a
+    /// guest thread parked inside a nounwind `extern "C"` shim aborts the
+    /// process). After this call every thread is `Dead` and the executor's
+    /// eventual drop (e.g. the host's TLS destructor) is unwind-free. The
+    /// run queue is cleared too -- nothing is schedulable afterwards.
+    pub fn abandon_parked_threads(&mut self) {
+        for thread in self.threads.values_mut() {
+            thread.abandon();
+        }
+        self.run_queue.clear();
+        self.running = None;
+    }
+
     /// `osStopThread(t)` -- per the public libultra manual's Thread Manager
     /// section, distinct from `osDestroyThread`: removes the thread from
     /// the run queue (it stops being scheduled) but does NOT tear down its
@@ -377,6 +427,12 @@ impl Executor {
 
     /// `osSetEventMesg(event, mq, msg)`.
     pub fn set_event_mesg(&mut self, event: u32, mq_addr: RdramAddr, msg: Mesg) {
+        let thread = self.running.unwrap_or(0);
+        self.trace.record(self.sim_time, TraceKind::EventMesg {
+            event,
+            queue: mq_addr,
+            thread,
+        });
         self.event_table.insert(event, (mq_addr.offset(), msg));
     }
 
@@ -429,6 +485,26 @@ impl Executor {
     /// `games/NWXE/profile.toml`'s rung-11 evidence cited in `vi.rs`) --
     /// never a second, VI-specific delivery path.
     pub fn advance_time(&mut self, now: u64) {
+        let elapsed = now.checked_sub(self.sim_time).unwrap_or_else(|| {
+            panic!(
+                "Executor::advance_time: virtual time cannot move backward from {} to {now}",
+                self.sim_time
+            )
+        });
+        let total_cycles = u64::from(self.cp0_count_phase)
+            .checked_add(elapsed)
+            .expect("CP0 Count phase overflow");
+        let increments = total_cycles / 2;
+        self.cp0_count_phase = (total_cycles & 1) as u8;
+        if increments != 0 {
+            let distance = u64::from(self.cp0_compare.wrapping_sub(self.cp0_count));
+            let increments_to_match = if distance == 0 { 1u64 << 32 } else { distance };
+            if increments >= increments_to_match {
+                self.cp0_timer_pending = true;
+            }
+            self.cp0_count = self.cp0_count.wrapping_add(increments as u32);
+        }
+        self.peripherals.advance_transfer_paks_to(Cycles::new(now));
         self.sim_time = now;
         let fired = self.timers.advance(now);
         for timer in fired {
@@ -446,34 +522,32 @@ impl Executor {
             // rate: a rate needs wall-clock, and this crate is wall-clock-free
             // by design (DESIGN.md §1) -- fn64-abi correlates it against
             // Instant to answer R5 probe 3.
-            self.retrace_ticks_fired = self
-                .retrace_ticks_fired
-                .saturating_add(u64::from(tick.event_vi_ticks));
             for _ in 0..tick.event_vi_ticks {
-                // Only deliver if the game has actually registered OS_EVENT_VI
-                // (osSetEventMesg_recomp populates event_table) -- before
-                // that registration exists (early boot), a real VI interrupt
-                // still fires but nothing is listening; this mirrors that by
-                // silently skipping delivery rather than panicking (an
-                // unregistered event code is the expected pre-registration
-                // state, not a caller bug -- see `inject_event`'s OsEvent
-                // arm, which DOES panic on an unregistered code, because
-                // that path is only ever invoked by test/harness code that
-                // is expected to know a registration already happened).
-                if self.event_table.contains_key(&OS_EVENT_VI) {
-                    self.inject_event(ExternalEvent::OsEvent(OS_EVENT_VI));
-                }
-                // The VI manager's OWN retrace target (osViSetEvent, see
-                // vi.rs's ViState::retrace_target doc comment) is a
-                // SEPARATE delivery path from OS_EVENT_VI's general event
-                // table -- both may be registered simultaneously and both
-                // fire on the same retrace tick, matching real hardware's
-                // two genuinely independent notification mechanisms.
-                if let Some((mq_offset, msg)) = tick.retrace_target {
-                    self.deliver_or_enqueue(RdramAddr::from_offset(mq_offset), msg, None);
-                }
+                self.deliver_vi_retrace();
             }
         }
+    }
+
+    /// Apply one VI retrace. The integrated `DeviceFabric` caller invokes
+    /// this only after MI has latched; the standalone executor ticker has no
+    /// MI owner. Pending VI state becomes
+    /// current before either notification path can wake a guest thread.
+    /// Returns whether scanout-visible framebuffer or blanking state changed
+    /// at this V-blank.
+    pub fn deliver_vi_retrace(&mut self) -> bool {
+        let framebuffer_changed = self.peripherals.vi_latch_retrace();
+        self.retrace_ticks_fired = self.retrace_ticks_fired.saturating_add(1);
+        // An unregistered OS event is normal during early boot: the hardware
+        // source still fires even though no queue is listening yet.
+        if self.event_table.contains_key(&OS_EVENT_VI) {
+            self.inject_event(ExternalEvent::OsEvent(OS_EVENT_VI));
+        }
+        // `osViSetEvent` owns a second VI-manager target independent of the
+        // general OS_EVENT_VI table, and both fire on the same interrupt.
+        if let Some((mq_offset, msg)) = self.peripherals.vi_manager_target_for_retrace() {
+            self.deliver_or_enqueue(RdramAddr::from_offset(mq_offset), msg, None);
+        }
+        framebuffer_changed
     }
 
     /// Arm the periodic VI retrace ticker at `interval` virtual-time units
@@ -497,23 +571,35 @@ impl Executor {
         self.peripherals.vi_set_mode(mode_ptr);
     }
 
-    pub fn vi_set_special_features(&mut self, ptr: u32) {
-        self.peripherals.vi_set_special_features(ptr);
+    pub fn vi_set_special_features(&mut self, features: u32) {
+        self.peripherals.vi_set_special_features(features);
     }
 
     pub fn vi_set_y_scale(&mut self, scale: f32) {
         self.peripherals.vi_set_y_scale(scale);
     }
 
+    pub fn vi_set_x_scale(&mut self, scale: f32) {
+        self.peripherals.vi_set_x_scale(scale);
+    }
+
     /// `osViSetEvent(mq, msg, retraceCount)` -- see `ViState::set_event`'s
     /// doc comment for why this is a separate delivery path from
     /// `osSetEventMesg`/`OS_EVENT_VI`.
-    pub fn vi_set_event(&mut self, mq_addr: RdramAddr, msg: Mesg) {
-        self.peripherals.vi_set_event(mq_addr, msg);
+    pub fn vi_set_event(&mut self, mq_addr: RdramAddr, msg: Mesg, retrace_count: u32) {
+        self.peripherals.vi_set_event(mq_addr, msg, retrace_count);
     }
 
     pub fn vi_set_black(&mut self, active: bool) {
         self.peripherals.vi_set_black(active);
+    }
+
+    pub fn vi_set_fade(&mut self, active: bool, factor: u16) {
+        self.peripherals.vi_set_fade(active, factor);
+    }
+
+    pub fn vi_set_repeat_line(&mut self, active: bool) {
+        self.peripherals.vi_set_repeat_line(active);
     }
 
     /// `osViSwapBuffer(frameBufPtr)`. Returns the newly-current framebuffer
@@ -545,6 +631,59 @@ impl Executor {
     /// reflects it. See `si::PifModel::set_input` / `peripherals.rs`.
     pub fn set_controller_input(&mut self, port: usize, input: crate::si::ContInput) {
         self.peripherals.set_controller_input(port, input);
+    }
+
+    pub fn set_controller_port_state(&mut self, port: usize, state: crate::si::PortState) {
+        self.peripherals.set_controller_port_state(port, state);
+        self.peripherals
+            .advance_transfer_paks_to(Cycles::new(self.sim_time));
+    }
+
+    pub fn set_rumble(&mut self, port: usize, active: bool) -> Result<(), crate::si::RumbleError> {
+        self.peripherals.set_rumble(port, active)
+    }
+
+    pub fn controller_pak(&self, port: usize) -> Option<&crate::pfs::ControllerPak> {
+        self.peripherals.controller_pak(port)
+    }
+
+    pub fn controller_pak_mut(&mut self, port: usize) -> Option<&mut crate::pfs::ControllerPak> {
+        self.peripherals.controller_pak_mut(port)
+    }
+
+    pub fn transfer_pak(&self, port: usize) -> Option<&crate::transfer_pak::TransferPak> {
+        self.peripherals.transfer_pak(port)
+    }
+
+    pub fn transfer_pak_mut(
+        &mut self,
+        port: usize,
+    ) -> Option<&mut crate::transfer_pak::TransferPak> {
+        self.peripherals.transfer_pak_mut(port)
+    }
+
+    pub fn insert_transfer_pak_cartridge(
+        &mut self,
+        port: usize,
+        rom: Vec<u8>,
+        ram: Option<Vec<u8>>,
+    ) -> Result<(), crate::transfer_pak::TransferPakError> {
+        self.peripherals
+            .advance_transfer_paks_to(Cycles::new(self.sim_time));
+        self.peripherals
+            .insert_transfer_pak_cartridge(port, rom, ram)
+    }
+
+    pub fn advance_transfer_paks_to(&mut self, now: Cycles) {
+        self.peripherals.advance_transfer_paks_to(now);
+    }
+
+    pub fn voice_unit_mut(&mut self, port: usize) -> Option<&mut crate::voice::VoiceUnit> {
+        self.peripherals.voice_unit_mut(port)
+    }
+
+    pub fn voice_unit(&self, port: usize) -> Option<&crate::voice::VoiceUnit> {
+        self.peripherals.voice_unit(port)
     }
 
     // ---- RSP task submission -----------------------------------------------
@@ -643,6 +782,15 @@ impl Executor {
                 // park (this is an external/timer source) -- real hardware
                 // drops the message here exactly as OS_MESG_NOBLOCK would;
                 // there is nothing else a non-coroutine caller could do.
+                // Traced (2026-07-21): a dropped completion message (SP/DP
+                // done, timer) is invisible in the queue-op stream otherwise,
+                // and was the prime suspect in WM2000's post-frame-3 boot
+                // deadlock -- see `QueueOpKind::Drop`'s doc comment.
+                self.record_queue_op(
+                    queue_addr,
+                    QueueOpKind::Drop,
+                    attributed_thread.unwrap_or(0),
+                );
             }
         }
         self.mirror_queue_to_rdram(queue_addr);
@@ -898,6 +1046,29 @@ impl Executor {
                     self.running = None;
                 }
             }
+            Yield::InstructionCheckpoint { instructions } => {
+                assert!(
+                    instructions > 0,
+                    "translated instruction checkpoint must make guest progress"
+                );
+                let now = self
+                    .sim_time
+                    .checked_add(u64::from(instructions))
+                    .expect("translated instruction checkpoint overflows virtual time");
+                // The coroutine is suspended at this point. Advance core
+                // timer/peripheral time before requeueing it; the ABI wrapper
+                // commits its device fabric at this same timestamp after
+                // `run_one_step` returns and before another resume.
+                self.advance_time(now);
+                if let Some(thread) = self.threads.get_mut(&id) {
+                    thread.set_state(ThreadState::Runnable);
+                }
+                self.run_queue.push(id);
+                self.sort_run_queue();
+                if self.running == Some(id) {
+                    self.running = None;
+                }
+            }
             Yield::BlockOnRecv { mq_addr, may_block } => {
                 match self.try_deliver_recv(id, mq_addr) {
                     RecvOutcome::Delivered(msg) => {
@@ -918,7 +1089,11 @@ impl Executor {
                             thread.set_state(ThreadState::BlockedOnRecv);
                         }
                         self.record_queue_op(mq_addr, QueueOpKind::Block, id);
-                        self.queue_mut(mq_addr).block_receiver(id);
+                        // Park in PRIORITY order (libultra __osEnqueueThread;
+                        // see mesgqueue.rs `BlockedList`'s doc for the WM2000
+                        // grant-crossover this fixes).
+                        let pri = self.thread_pri(id);
+                        self.queue_mut(mq_addr).block_receiver(id, pri);
                     }
                     RecvOutcome::Blocked => {
                         // OS_MESG_NOBLOCK on an empty queue: never parked,
@@ -966,7 +1141,9 @@ impl Executor {
                             thread.set_state(ThreadState::BlockedOnSend);
                         }
                         self.record_queue_op(mq_addr, QueueOpKind::Block, id);
-                        self.queue_mut(mq_addr).block_sender(id, msg);
+                        // Priority-ordered park, same as the recv side.
+                        let pri = self.thread_pri(id);
+                        self.queue_mut(mq_addr).block_sender(id, pri, msg);
                     }
                     SendOutcome::Blocked => {
                         // OS_MESG_NOBLOCK on a full queue: dropped, never
@@ -1031,6 +1208,15 @@ impl Executor {
 
     pub fn is_thread_dead(&self, id: ThreadId) -> bool {
         self.threads.get(&id).map(|t| t.is_dead()).unwrap_or(true)
+    }
+
+    /// Whether `id` is occupied by any thread, alive or dead. The ABI layer
+    /// uses this to detect guest OSId collisions before `create_thread`'s
+    /// loud duplicate-id trap fires: libultra's OSId is an informational tag
+    /// with no uniqueness contract (thread identity on hardware is the
+    /// OSThread struct), so a retail boot may legitimately reuse a number.
+    pub fn thread_exists(&self, id: ThreadId) -> bool {
+        self.threads.contains_key(&id)
     }
 
     pub fn queue_capacity(&self, mq_addr: RdramAddr) -> usize {
@@ -1223,5 +1409,39 @@ mod tests {
             msg: 1,
         });
         assert_eq!(exec.queue_capacity(q), 4);
+    }
+
+    #[test]
+    fn cp0_count_runs_at_half_cpu_rate_and_compare_latches_ip7() {
+        let mut exec = Executor::new();
+        exec.set_cp0_count(0xFFFF_FFFE);
+        exec.write_cp0_compare(0);
+
+        exec.advance_time(1);
+        assert_eq!(exec.cp0_count(), 0xFFFF_FFFE);
+        assert!(!exec.cp0_timer_pending());
+        exec.advance_time(2);
+        assert_eq!(exec.cp0_count(), 0xFFFF_FFFF);
+        assert!(!exec.cp0_timer_pending());
+        exec.advance_time(4);
+        assert_eq!(exec.cp0_count(), 0);
+        assert!(exec.cp0_timer_pending());
+
+        exec.write_cp0_compare(0x1234_5678);
+        assert_eq!(exec.cp0_compare(), 0x1234_5678);
+        assert!(!exec.cp0_timer_pending());
+    }
+
+    #[test]
+    fn split_cp0_count_advances_preserve_the_odd_cycle_phase() {
+        let mut split = Executor::new();
+        split.advance_time(1);
+        split.advance_time(3);
+        split.advance_time(7);
+
+        let mut combined = Executor::new();
+        combined.advance_time(7);
+        assert_eq!(split.cp0_count(), combined.cp0_count());
+        assert_eq!(split.cp0_count(), 3);
     }
 }

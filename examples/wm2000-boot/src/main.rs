@@ -44,6 +44,14 @@ use std::io::Write;
 /// dispatch) without linking the disallowed dependency. It is clearly
 /// NOT the real ucode -- it does nothing to rdram, just proves the call
 /// happened.
+/// SUPERSEDED (2026-07-21) by the clean-room RSP LLE replay: `fn64_abi::
+/// set_audio_task_lle(true)` (below) routes every `M_AUDTASK` through the
+/// same `fn64_audio::rsp` interpreter path non-catalog gfx tasks already
+/// take, executing the REAL in-ROM audio ucode instruction by instruction
+/// against guest RDRAM -- no GPL header involved, no stand-in needed. Kept
+/// (unregistered) so the licensing finding above stays attached to working
+/// code demonstrating the registered-function seam's shape.
+#[allow(dead_code)]
 unsafe extern "C" fn stand_in_audio_ucode(_rdram: *mut u8, ucode_addr: u32) -> u32 {
     eprintln!(
         "[wm2000-boot] STAND-IN audio ucode invoked for ucode_addr={ucode_addr:#010x} -- NOT the \
@@ -53,6 +61,7 @@ unsafe extern "C" fn stand_in_audio_ucode(_rdram: *mut u8, ucode_addr: u32) -> u
     );
     0
 }
+
 
 fn env_path(name: &str) -> std::path::PathBuf {
     std::env::var(name)
@@ -70,6 +79,14 @@ fn main() {
         )
     });
     println!("[wm2000-boot] ROM size: {} bytes", rom_bytes.len());
+    // Keep the IPL3 boot-copy source image before `load_rom` takes ownership
+    // of the ROM bytes -- see the IPL3 copy block below for why this exists.
+    let ipl3_image: Vec<u8> = {
+        const IPL3_CART_OFFSET: usize = 0x1000;
+        const IPL3_COPY_LEN: usize = 0x10_0000; // 1 MiB, per IPL3 behavior
+        let end = rom_bytes.len().min(IPL3_CART_OFFSET + IPL3_COPY_LEN);
+        rom_bytes[IPL3_CART_OFFSET.min(rom_bytes.len())..end].to_vec()
+    };
     fn64_abi::load_rom(rom_bytes);
 
     let registration = fn64_boot_harness::register_linked_sections();
@@ -103,13 +120,78 @@ fn main() {
         }
     }
 
-    // Real plumbing, stand-in body (see stand_in_audio_ucode's doc comment).
-    unsafe { fn64_abi::set_audio_ucode_fn(stand_in_audio_ucode) };
+    // Real audio: replay every M_AUDTASK's genuine in-ROM ucode through the
+    // clean-room RSP LLE interpreter (the same fallback path gfx tasks take)
+    // so the CPU-side AKI sound driver observes the real mixer/sequence
+    // state the RSP writes -- see stand_in_audio_ucode's doc comment for
+    // the licensing history this supersedes.
+    fn64_abi::set_audio_task_lle(true);
 
-    // VI retrace: arm a host-chosen approximation (fn64_runtime::vi's doc:
-    // not a hardware-accurate NTSC/PAL constant). 1000 virtual-time units
-    // per field is an arbitrary but documented choice for this harness.
-    fn64_abi::arm_vi_retrace(1000);
+    // REAL renderer seam: the in-repo software ReferenceBackend (the same
+    // pure-Rust CI oracle fn64-shell uses), in F3DEX2 decode mode. NWXE's
+    // gfx ucodes are "RSP Gfx ucode F3DEX xbus 2.08" and "F3DLX.Rej xbus
+    // 2.08" (ID strings verified in the user's ROM) -- F3DEX2-generation but
+    // not in the (empty-by-default) exact-digest HLE catalog, so every gfx
+    // task takes the honest fallback path: `process_task` returns
+    // `NeedsLle`, `osSpTaskStartGo_recomp` replays the WHOLE ucode phase
+    // through the LLE RSP interpreter (`dispatch_lle_task`), and the real
+    // RDP command stream the ucode emits (XBUS submissions included) is
+    // rasterized by `process_rdp_commands`' raw-RDP lane, whose
+    // `commit_color_image` writes actual pixels back into the guest RDRAM
+    // framebuffer this harness hashes at every osViSwapBuffer. Auto-dump is
+    // belt-and-braces evidence: the backend also writes its own rasterized
+    // surface as PNGs, independent of the swap-hash capture below.
+    {
+        use fn64_render::RenderBackend as _;
+        let mut backend = fn64_render_rt64::ReferenceBackend::new()
+            .with_f3dex2()
+            .with_clear_color([0, 0, 0, 255])
+            .with_auto_dump("/tmp/wm2000-gfx-dumps", "wm2000", 8);
+        backend
+            .create(&fn64_render::RenderConfig::new(320, 240))
+            .expect("reference backend create");
+        fn64_abi::set_render_backend(Box::new(backend), fn64_boot_harness::rdram_len());
+    }
+
+    // NWXE saves to 256 Kbit (32 KiB) cartridge SRAM on PI domain 2: its own
+    // SRAM-handle constructor (`func_80000A88`, funcs_0.c asm
+    // 0x80000A9C-0x80000ABC) builds an OSPiHandle with baseAddress
+    // 0xA8000000 / type 3 (SRAM) / domain PI_DOMAIN2 and the very first
+    // frame-loop iteration (`func_800F4B60`) writes the 0x20-byte
+    // 0x19990901 save signature to SRAM offset 0, retrying
+    // `osEPiStartDma != 0` forever on failure -- without a registered save
+    // device that retry loop IS the observed boot hang. Ephemeral in-memory
+    // storage: this harness is boot telemetry, not a real player session,
+    // so nothing is persisted (a fresh all-0xFF chip each run, exactly the
+    // first-boot path the game must handle anyway).
+    fn64_abi::set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+        fn64_runtime::SaveType::SramBanked,
+    )));
+
+    // NWXE's osCartRomInit (func_80022540) returns its OSPiHandle BSS at
+    // D_800839A0 (`addiu $v0, $s0, %lo(D_800839A0)`, disasm/asm/1050.s
+    // vram 0x80022578); the host shim hands guest code that same address.
+    fn64_abi::set_cart_rom_handle_vram(0x8008_39A0);
+
+    // NOTE (2026-07-21 park diagnosis): the long-standing vi_swaps=0 park
+    // (thread 6 woken on its queue at rdram 0x838F0 but never scheduled
+    // again; 16M trailing `ThreadSwitch {to: 3}` trace events) was NOT a
+    // missing event post or a wake-delivery bug -- it was priority
+    // starvation by a degenerate AKI audio-pump thread (guest OSId 3,
+    // entry func_80026F18, guest priority 80) whose sound-driver ops table
+    // (D_800481FC) read null, collapsing its body into a never-blocking
+    // raw AI_STATUS/AI_LEN poll loop. THAT, in turn, was downstream of the
+    // real root cause: this harness never performed the IPL3 boot copy
+    // (below), so every resident `.data` initializer read as zero and boot
+    // took a degraded path that created the pump early and unbound. With
+    // the IPL3 copy in place, boot follows the real path (verified: the
+    // run is byte-identical with or without an experimental pump-priority
+    // clamp) and the park is gone.
+
+    // Typed IPL video standard is the shared VI/AI clock authority. The first
+    // field uses nominal NTSC timing; the latched OSViMode H/V registers then
+    // refine it from the public VI clock.
+    fn64_abi::configure_tv_type(fn64_boot_harness::TvType::Ntsc);
 
     // Arm crash-safe incremental trace flushing BEFORE booting thread 0 --
     // a SIGSEGV mid-boot (as rung 3 hit) must not lose the whole session's
@@ -139,6 +221,41 @@ fn main() {
     let mut rdram = fn64_boot_harness::new_rdram(fn64_boot_harness::TvType::Ntsc);
     let rdram_ptr = rdram.as_mut_ptr();
 
+    // IPL3 boot copy: on real hardware, the CIC-6102-family boot code copies
+    // 1 MiB of cartridge ROM starting at cart offset 0x1000 into RDRAM at
+    // 0x80000400 BEFORE jumping to the game's entry point (the ROM header's
+    // entry, 0x80000400 here -- section 0's registered ram_addr). NWXE's
+    // `recomp_entrypoint` (funcs_0.c, vram 0x80000400) does NOT copy any
+    // data itself -- it only clears BSS (0x8004B4C0..0x800B1390) and jumps
+    // -- because the IPL already materialized .text+.data. Without this
+    // copy every resident `.data` initializer reads as zero, which is
+    // exactly the previously-documented `D_800481FC == 0` mystery
+    // (docs/BOOT-NOTES-WM2000.md's exhaustive no-writer search) AND the
+    // zeroed segment-descriptor table at 0x80047E80 that made the game's
+    // own overlay loader (`func_80000744`) no-op its bank DMAs before
+    // `func_80000870`'s hardcoded `jal 0x800E1B90` trapped. Words are
+    // written through `RdramViewMut::write_u32` so the big-endian cart
+    // bytes land in fn64's native-word RDRAM storage order.
+    {
+        const IPL3_DEST_OFFSET: u32 = 0x400;
+        let copy_len = ipl3_image.len() & !3;
+        let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+        for word_index in 0..copy_len / 4 {
+            let src = word_index * 4;
+            let word = u32::from_be_bytes(ipl3_image[src..src + 4].try_into().unwrap());
+            view.write_u32(
+                fn64_runtime::RdramAddr::from_offset(
+                    IPL3_DEST_OFFSET + u32::try_from(src).expect("IPL copy fits u32"),
+                ),
+                word,
+            );
+        }
+        println!(
+            "[wm2000-boot] IPL3 boot copy: {copy_len:#x} bytes from cart 0x1000 to rdram \
+             {IPL3_DEST_OFFSET:#x}"
+        );
+    }
+
     // Prime the MMIO backing bytes before the guest ever runs, so even a
     // raw load before any host-side register mutation observes the real
     // idle-hardware defaults (e.g. AI_STATUS not-busy/not-full,
@@ -147,7 +264,13 @@ fn main() {
 
     println!("[wm2000-boot] booting thread 0 (recomp_entrypoint)...");
     unsafe {
-        fn64_abi::boot_thread0(rdram_ptr, fn64_boot_harness::c_recomp_entrypoint(), 0, 10);
+        fn64_abi::boot_thread0(
+            rdram_ptr,
+            fn64_boot_harness::rdram_len(),
+            fn64_boot_harness::c_recomp_entrypoint(),
+            0,
+            10,
+        );
     }
 
     // Drive boot for a bounded number of scheduling STEPS, not an unbounded
@@ -159,9 +282,34 @@ fn main() {
     // against ONE shared budget and logged periodically so a genuine
     // infinite idle-spin is visible (many steps, sim_time barely advancing)
     // rather than silently indistinguishable from real progress.
-    const MAX_STEPS: u64 = 2_000_000;
-    const TICK_STEP: u64 = 100;
-    const LOG_EVERY: u64 = 50_000;
+    // 20M: with the C-lane raw-MMIO time charge, the audio manager's
+    // AI_STATUS poll consumes ~56k steps per 19ms audio buffer, so 2M steps
+    // only covered ~0.8s of virtual boot.
+    //
+    // Step-economics re-measurement (2026-07-21, post RDRAM-swizzle/RSP-replay
+    // fix): the AI pump is NOT a step sink anymore. Trace evidence
+    // (/tmp/wm2000-boot-trace.jsonl, 300k-step run): audio tasks are submitted
+    // at exactly one per VI field (1,563,558-cycle gaps; occasionally one per
+    // two fields) -- the retrace-driven cadence real hardware has, NOT a
+    // starved-feedback loop from the stand-in ucode completing instantly. The
+    // whole per-field round (retrace fan-out -> AI pump's ~6 raw AI_STATUS/
+    // AI_LEN polls at 32 cycles each -> audio manager task submit) costs
+    // ~10-16 scheduler steps, so the default 20M-step budget covers ~1M+
+    // fields (hours of virtual boot). The budget is no longer what limits gfx
+    // frames; the game itself stops submitting tasks after its first 3 gfx
+    // frames (sim ~16.07B) -- see the boot-stall notes in the README.
+    const MAX_STEPS: u64 = 20_000_000;
+    const LOG_EVERY: u64 = 500_000;
+    // Once the RSP-task throughput fix landed, 20M steps pass in a couple of
+    // wall minutes; deeper ladder probes need a bigger (still bounded) budget
+    // without editing the source. Same "must be a positive integer" stance as
+    // the FN64_* knobs in fn64-abi.
+    let max_steps = match std::env::var("WM2000_MAX_STEPS") {
+        Ok(raw) => raw.parse::<u64>().unwrap_or_else(|_| {
+            panic!("WM2000_MAX_STEPS must be a positive integer, got {raw:?}")
+        }),
+        Err(_) => MAX_STEPS,
+    };
     // How many consecutive "nothing was runnable, and advancing the
     // virtual clock didn't wake anything either" ticks before concluding
     // boot has reached a genuinely idle steady state (not just a thread
@@ -175,9 +323,9 @@ fn main() {
     let mut tick = 0u64;
     let mut steps = 0u64;
     loop {
-        if steps >= MAX_STEPS {
+        if steps >= max_steps {
             println!(
-                "[wm2000-boot] step budget ({MAX_STEPS}) exhausted at sim_time={} -- stopping \
+                "[wm2000-boot] step budget ({max_steps}) exhausted at sim_time={} -- stopping \
                  (this may mean a thread is spinning without truly blocking, or boot just needs \
                  a larger budget)",
                 fn64_abi::sim_time()
@@ -202,6 +350,10 @@ fn main() {
                 fn64_abi::task_counts().0,
                 fn64_abi::task_counts().1
             );
+            // Progress must survive a later hard kill/abort: stdout is
+            // block-buffered when piped, and a guest entering a non-yielding
+            // spin (a real, observed end state) means no clean exit flushes.
+            let _ = std::io::stdout().flush();
         }
         // Thread 0 (recomp_entrypoint) returning is EXPECTED, not the end
         // of boot: recomp_entrypoint's own body does `LOOKUP_FUNC(..)(rdram,
@@ -232,7 +384,8 @@ fn main() {
         if !stepped {
             // Nothing was runnable -- host-driven progress (VI retrace,
             // due timers) is the only way forward.
-            tick += TICK_STEP;
+            tick += fn64_abi::vi_field_interval()
+                .expect("typed television standard must keep VI armed");
             fn64_abi::advance_virtual_time(tick);
             consecutive_idle_ticks += 1;
             if consecutive_idle_ticks >= IDLE_TICKS_BEFORE_STOP {
@@ -272,6 +425,13 @@ fn main() {
     println!("[wm2000-boot] trace events recorded: {}", trace.len());
     write_trace_file(&trace, TRACE_PATH);
     println!("[wm2000-boot] trace written to {TRACE_PATH}");
+
+    // Clean shutdown: parked guest coroutines must NOT be force-unwound by
+    // the TLS destructor (they're suspended inside nounwind extern "C"
+    // shims -- that unwind is an instant abort). Abandon them explicitly;
+    // see `fn64_abi::shutdown_abandon_threads`'s doc comment.
+    fn64_abi::shutdown_abandon_threads();
+    println!("[wm2000-boot] clean shutdown: parked guest threads abandoned");
 }
 
 /// Hash the fb region (a fixed-size guess: 320x240 RGBA5551 = 153600 bytes,
