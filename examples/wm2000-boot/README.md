@@ -225,21 +225,88 @@ With both fixes, boot runs ~3.05B cycles past the former wall (sim
 with NEW frame content (white fade-in frames after the fade-to-black),
 and audio fields tick 9,385 → 11,533 through the voiced era.
 
-## Known frontier (2026-07-21, latest): garbage OSIoMesg size in the audio loader chain
+## RESOLVED (2026-07-21, later): the -4 OSIoMesg size was a pause_self fall-through
 
-At sim ~19.23B the audio driver's loader chain (`func_800222D8` →
-`func_80000870` → `func_800E1B90`/`func_800E1BAC` → `osEPiStartDma`)
-submits an OSIoMesg whose size field is garbage: `osEPiStartDma_recomp:
-PI DMA RDRAM range overflow -- OSIoMesg at 0x0005b268 carries dramAddr
-offset 0x002c92a0 + size 0xfffffffc (devAddr 0x00144aa4)`
-(`fn64-abi/src/pi.rs`; the panic now reports the OSIoMesg address and
-field values). Size 0xfffffffc is exactly -4: a computed
-remaining-length in the streaming loader underflowed by one word, while
-the dramAddr/devAddr look like live, real pointers — so the suspect is
-the loader's length arithmetic (another guarded-IDO-div stub in the
-corpus, or driver state diverging upstream), not the OSIoMesg struct
-itself. Needs a write-watch on rdram 0x0005b278 (the size word) to find
-the owner.
+The frontier panic (`osEPiStartDma_recomp: OSIoMesg at 0x0005b268 carries
+dramAddr offset 0x002c92a0 + size 0xfffffffc (devAddr 0x00144aa4)`) was
+root-caused end-to-end with lldb (deterministic run, breakpoints on the
+recompiled symbols + hardware watchpoints on rdram):
+
+WHO WROTE THE -4: the streaming-loader itself — `func_80011E20` (funcs_5.c,
+the per-stream start: full chain `func_800E1FB8` → `func_800F53C8` →
+`func_80011488` → `func_80011E20`) computes `remaining = fileSize − 4` and
+`chunk = min(remaining, 0x62)` from the AKI file table
+(`func_80003DD4(out, fileId)`: offset table [0x80057200], size table
+[0x80057204], base 0x144AA0) and stores the chunk into the stream OSIoMesg
+size word at 0x8005B278. The tables were verified CORRECT at the moment of
+the failing lookup (size-table[0] = 0x1C5F, matching the ROM). The killer
+input was the fileId: **0xC5BE** (50622, way past the 0x2848-entry table).
+
+THE MECHANISM (fn64 bug): `func_80003DD4` validates `1 <= fileId < 0x2848`
+and on failure enters the guest's intentional hang-assert — `j self; nop`
+at 0x80003DF0. N64Recomp's C codegen emits that self-loop as a bare
+`pause_self()` call with NO loop back (the reference runtime never returns
+from it without an explicit `osStartThread`). fn64's `pause_self` used
+`Yield::PauseSelf` (rung 14's auto-requeue), so the thread RESUMED and
+FELL THROUGH the unpassable assert into the lookup, indexed 0xC5BD*4 past
+both tables (reading zeros), and fabricated romStart = 0x144AA0+0 (hence
+the "live-looking" devAddr 0x144AA4) and fileSize = 0 (hence size −4).
+
+FIX (fn64): the C-ABI `pause_self` now parks the thread —
+`Yield::StopSelf` in `fn64-runtime` (state `Stopped`, off the run queue,
+resumable only via `osStartThread`, matching N64ModernRuntime). The
+translated-code path (fn64-recomp-rs) keeps auto-requeue `PauseSelf`
+because its codegen preserves the loop (`pause_self(); pc = self;
+continue`). Regression tests: `rung_regressions.rs`
+(`stop_self_parks_the_thread_until_an_explicit_restart`,
+`stop_self_parked_thread_never_starves_other_work`) and
+`fn64-abi::thread::tests::pause_self_parks_via_real_executor_until_explicit_restart`.
+
+With the fix, boot no longer aborts: the game thread parks honestly at the
+guest assert at sim ~19.23B and the rest of the machine keeps running
+(verified to a 2M-step budget = sim 181.9B: audio fields tick past
+106,000 tasks, VI keeps swapping the same last frame; 7 VI swaps / 7 gfx
+tasks, unchanged — all still untextured fade/fill frames, 0 triangles).
+
+## Known frontier (2026-07-21, latest): announcer voice request with an uninstalled voice map
+
+Why fileId was 0xC5BE at all (the next rung, fully forensically mapped):
+
+1. The demo/attract engine queues a REAL pointer-shaped voice request for
+   sound channel 1: `func_8011E4BC` (funcs_22.c, request installer; chain
+   `func_8011C91C` → `func_8011F078` → `func_8011EC20` → `func_8011E6A4`)
+   sets chan1 state ([chan+0x2FC] at rdram 0x2C8998) to 0 = "start voice"
+   with sound code [chan+0x2E6] left at its init value 0.
+2. The per-frame tick `func_800F53C8` sees state != 0x80(idle) and resolves
+   code 0 via `func_800F5190(chan, 0)`, whose code-0 rule reads the
+   per-channel voice-map halfword table at chan+4 — designed to map
+   code -> streamed-voice fileId (e.g. the wrestler's announcer lines).
+3. chan1+4 (rdram 0x2C86A0) was NEVER written by any CPU code (hardware
+   watchpoint over the whole run: only the boot-arena bzero, then a PI DMA,
+   then whole-rdram render round-trips). The chan array (0xC30 bytes at
+   0x802C8390, alloc'd in `func_800E1DF0` and stored to [0x8011B5D8]) is
+   allocated UNCLEARED from the guest heap, directly over the freed
+   decompression TEMP buffer of file 0x435 (the sound-map file: compressed
+   0x87F2 bytes DMA'd to temp 0x802C0C40.., decompressed 0x290DC bytes to
+   dest 0x802C9450, temp freed — `func_800110C0` → `func_80003E98`). The
+   stale compressed bytes at temp+0x7A60 (ROM 0x48CDE4: C5 BE B5 5E) are
+   exactly what chan1+4 later reads as 0xC5BE.
+4. `func_800E1DF0`'s own init loop only writes chan+0x25C..0x2FC (state
+   0x80, codes 0/-1); nothing in the reachable, non-stubbed code installs
+   the chan+4 voice-map table before the request fires (stub-closure scan
+   over the whole dispatch subtree found only the already-annotated
+   `func_80120D60` fragment, which is camera math, not the installer).
+
+So on real hardware this same sequence would only work if the wrestler /
+announcer voice map is installed into chan+4 between the scene-init load
+and the first entrance announcement — that installer (or the state that
+gates the request) is what diverges in fn64's run. Candidate directions
+for the next cycle: find the chan+4 writer in the sibling AKI titles'
+decomp (VPW2/WCW-Revenge sound driver "SndCtl" analogues), or trace which
+sound command SHOULD precede the pointer request (funcs_20's
+`func_800F4304`/`func_800F44F4` bcopy handlers copy wrestler name strings,
+not the 0x124-entry map), or check whether the request itself is spurious
+(fn64 heap-layout divergence from a skipped earlier allocation).
 
 ## Known frontier (2026-07-14)
 
