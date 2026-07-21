@@ -427,6 +427,12 @@ impl Executor {
 
     /// `osSetEventMesg(event, mq, msg)`.
     pub fn set_event_mesg(&mut self, event: u32, mq_addr: RdramAddr, msg: Mesg) {
+        let thread = self.running.unwrap_or(0);
+        self.trace.record(self.sim_time, TraceKind::EventMesg {
+            event,
+            queue: mq_addr,
+            thread,
+        });
         self.event_table.insert(event, (mq_addr.offset(), msg));
     }
 
@@ -776,6 +782,15 @@ impl Executor {
                 // park (this is an external/timer source) -- real hardware
                 // drops the message here exactly as OS_MESG_NOBLOCK would;
                 // there is nothing else a non-coroutine caller could do.
+                // Traced (2026-07-21): a dropped completion message (SP/DP
+                // done, timer) is invisible in the queue-op stream otherwise,
+                // and was the prime suspect in WM2000's post-frame-3 boot
+                // deadlock -- see `QueueOpKind::Drop`'s doc comment.
+                self.record_queue_op(
+                    queue_addr,
+                    QueueOpKind::Drop,
+                    attributed_thread.unwrap_or(0),
+                );
             }
         }
         self.mirror_queue_to_rdram(queue_addr);

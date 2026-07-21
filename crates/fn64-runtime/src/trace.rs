@@ -73,6 +73,12 @@ pub enum QueueOpKind {
     Recv,
     Block,
     Wake,
+    /// A host-injected (event/timer) message hit a full queue with no blocked
+    /// receiver and was dropped -- the documented `OS_MESG_NOBLOCK` fate. On
+    /// real hardware this is survivable because interrupt cadence matches
+    /// consumption; in replay a dropped completion message is the classic
+    /// silent-deadlock seed, so it is traced explicitly.
+    Drop,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -111,6 +117,16 @@ pub enum TraceKind {
     TaskSubmit {
         task_kind: TaskKind,
         ucode: u32,
+    },
+    /// A guest `osSetEventMesg(event, mq, msg)` (re-)registration. Traced
+    /// because event-table routing is resolved at DELIVERY time (see
+    /// `Executor::inject_event`): a completion message scheduled with
+    /// latency can be silently rerouted by a registration that lands in
+    /// between, which is invisible in the queue-op stream alone.
+    EventMesg {
+        event: u32,
+        queue: crate::RdramAddr,
+        thread: ThreadId,
     },
 }
 
