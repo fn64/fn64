@@ -429,6 +429,10 @@ pub struct Framebuffer {
     /// software-only sample cannot be committed to an RDP depth image.
     pub(crate) encoded_depth: Vec<Option<EncodedDepth>>,
     primitive_depth: Option<PrimitiveDepth>,
+    /// xorshift32 state for `AlphaDither::Noise` (see
+    /// [`Self::apply_alpha_dither`]). Deterministically seeded so a replayed
+    /// task stream produces identical framebuffer bytes run over run.
+    alpha_dither_noise_state: u32,
 }
 
 fn raw_span_edges_at_y_eighth(
@@ -604,6 +608,35 @@ impl Framebuffer {
             depth: vec![f32::INFINITY; (width * height) as usize],
             encoded_depth: vec![None; (width * height) as usize],
             primitive_depth: None,
+            alpha_dither_noise_state: 0x2545_F491,
+        }
+    }
+
+    /// Apply the selected alpha-dither stage to a combined fragment's alpha,
+    /// between coverage/alpha selection and alpha compare (Programming
+    /// Manual pipeline order). Only `G_AD_NOISE` is implemented: the manual
+    /// specifies pseudo-random noise perturbing the alpha LSBs before
+    /// memory-interface truncation but does not publish the hardware
+    /// generator, so this uses a documented deterministic xorshift32 source
+    /// -- REAL noise with the specified 3-bit magnitude, NOT claimed to be
+    /// sequence-exact against silicon. The ordered `Pattern`/`NotPattern`
+    /// matrices remain unimplemented and trap in
+    /// `require_supported_dither`.
+    fn apply_alpha_dither(&mut self, other_mode: OtherMode, mut rgba: [u8; 4]) -> [u8; 4] {
+        match other_mode.alpha_dither() {
+            AlphaDither::Disabled => rgba,
+            AlphaDither::Noise => {
+                let mut state = self.alpha_dither_noise_state;
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                self.alpha_dither_noise_state = state;
+                rgba[3] = rgba[3].saturating_add((state & 7) as u8);
+                rgba
+            }
+            AlphaDither::Pattern | AlphaDither::InversePattern => {
+                unreachable!("unsupported alpha dither is rejected before rasterization")
+            }
         }
     }
 
@@ -931,6 +964,7 @@ impl Framebuffer {
                     texel1,
                 );
                 let (rgba, coverage) = apply_coverage_alpha(rect.other_mode, rgba, Coverage::FULL);
+                let rgba = self.apply_alpha_dither(rect.other_mode, rgba);
                 if coverage.count() == 0 {
                     continue;
                 }
@@ -1380,6 +1414,7 @@ impl Framebuffer {
             fragment.texel1,
         );
         let (rgba, coverage) = apply_coverage_alpha(pipeline.other_mode, rgba, fragment.coverage);
+        let rgba = self.apply_alpha_dither(pipeline.other_mode, rgba);
         if coverage.count() == 0 {
             return false;
         }
@@ -1758,7 +1793,13 @@ fn require_supported_dither(other_mode: OtherMode, primitive: &str) {
         ),
     }
     match other_mode.alpha_dither() {
-        AlphaDither::Disabled => {}
+        // `Noise` is implemented (Framebuffer::apply_alpha_dither): the
+        // hardware generator is unpublished, but the manual-specified
+        // effect (pseudo-random 3-bit perturbation of alpha before
+        // truncation) is real and documented there. The ordered matrices
+        // still trap: substituting a guessed table would silently change
+        // deterministic memory bytes.
+        AlphaDither::Disabled | AlphaDither::Noise => {}
         selector => panic!(
             "{primitive} selected alpha dither {selector:?}, whose hardware matrix/noise sequence is not implemented"
         ),
