@@ -990,5 +990,6 @@ dependencies = [
  "cc",
  "fn64-abi",
  "fn64-boot-harness",
+ "fn64-render",
  "fn64-runtime",
 ]

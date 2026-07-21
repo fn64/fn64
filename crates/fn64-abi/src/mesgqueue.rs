@@ -15,6 +15,13 @@ pub unsafe extern "C" fn osCreateMesgQueue_recomp(_rdram: *mut u8, ctx: *mut Rec
     let ctx = unsafe { &*ctx };
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
     let count = ctx.r6 as usize;
+    if std::env::var("FN64_DEBUG_BOOT").is_ok() {
+        let tid = ACTIVE_THREAD_ID.with(|c| c.get());
+        eprintln!(
+            "[DEBUG osCreateMesgQueue] thread={tid:?} mq={:#x} count={count}",
+            mq_addr.offset()
+        );
+    }
     with_executor(|exec| exec.create_mesg_queue(mq_addr, count.max(1)));
 }
 
@@ -135,6 +142,13 @@ pub unsafe extern "C" fn osSetEventMesg_recomp(_rdram: *mut u8, ctx: *mut Recomp
     let event = ctx.r4 as u32;
     let mq_addr = RdramAddr::from_gpr(ctx.r5);
     let msg: Mesg = ctx.r6 as u32;
+    if std::env::var("FN64_DEBUG_BOOT").is_ok() {
+        let tid = ACTIVE_THREAD_ID.with(|c| c.get());
+        eprintln!(
+            "[DEBUG osSetEventMesg] thread={tid:?} event={event} mq={:#x} msg={msg:#x}",
+            mq_addr.offset()
+        );
+    }
     with_executor(|exec| exec.set_event_mesg(event, mq_addr, msg));
 }
 
