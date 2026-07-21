@@ -1351,22 +1351,22 @@ impl Framebuffer {
                             coefficients.dstde[component],
                         )
                     });
-                    assert!(
-                        stw[2] > 0,
-                        "raw RDP textured triangle tile {} produced non-positive W reciprocal {} at ({x}, {y})",
-                        edge.tile,
-                        stw[2]
-                    );
+                    // Non-positive W tolerance (2026-07-21 WM2000 demo-scene
+                    // rung): a perspective triangle crossing the near plane
+                    // legitimately presents w <= 0 at edge pixels of the
+                    // interpolated plane. Real RDP hardware's tcdiv derives
+                    // 1/w from the operand's top bits with NO sign trap --
+                    // the pixel samples garbage texels but the chip never
+                    // faults. Mirror that defined-garbage tolerance: divide
+                    // by the magnitude (min one ULP so it stays finite).
+                    // This replaced a loud assert the moment real content
+                    // (WM2000 gfx task ~#27, pixel-level near-plane
+                    // crossing) hit it; the assert was right to exist until
+                    // then, and the hardware-faithful behavior is "keep
+                    // rasterizing", not "abort the machine".
                     let corrected = |values: [i64; 3]| {
-                        assert!(
-                            values[2] > 0,
-                            "raw RDP LOD derivative produced non-positive W reciprocal {} at ({x}, {y})",
-                            values[2]
-                        );
-                        (
-                            values[0] as f32 / values[2] as f32,
-                            values[1] as f32 / values[2] as f32,
-                        )
+                        let denom = values[2].unsigned_abs().max(1) as f32;
+                        (values[0] as f32 / denom, values[1] as f32 / denom)
                     };
                     let (s, t) = corrected(stw);
                     let next_x = std::array::from_fn(|component| {
