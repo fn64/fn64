@@ -2,8 +2,11 @@
 
 use std::{ffi::OsString, fmt, path::PathBuf};
 
+use crate::ReleaseRomClass;
+
 pub const RELEASE_GATE_CYCLE_ENV: &str = "FN64_RELEASE_GATE_CYCLE";
 pub const RELEASE_REPORT_ENV: &str = "FN64_RELEASE_REPORT";
+pub const RELEASE_ROM_CLASS_ENV: &str = "FN64_RELEASE_ROM_CLASS";
 pub const RELEASE_RUN_EVENT_SHA256_ENV: &str = "FN64_RELEASE_RUN_EVENT_SHA256";
 
 const OOT_RELEASE_GATE_CYCLE_ENV: &str = "OOT_RELEASE_GATE_CYCLE";
@@ -14,6 +17,7 @@ const OOT_RELEASE_RUN_EVENT_SHA256_ENV: &str = "OOT_RELEASE_RUN_EVENT_SHA256";
 pub struct ReleaseRunEnvironment {
     pub guest_cycle: u64,
     pub report_path: PathBuf,
+    pub rom_class: ReleaseRomClass,
     pub run_event_sha256: String,
 }
 
@@ -24,17 +28,19 @@ impl ReleaseRunEnvironment {
 }
 
 /// Read the generic runner-owned release variables. Ordinary executions with
-/// none of the three variables return `None`; partial tuples fail closed.
+/// none of the four variables return `None`; partial tuples fail closed.
 pub fn release_run_environment_from_process(
 ) -> Result<Option<ReleaseRunEnvironment>, ReleaseRunEnvironmentError> {
-    parse_release_run_environment(read_generic(), read_oot(), false)
+    parse_release_run_environment(read_generic(), read_oot(), read_rom_class(), false)
 }
 
 /// Read the generic variables while accepting the historical OoT aliases.
-/// A process may use one complete namespace, never a mixture or duplicate.
+/// A process may use one complete execution namespace, never a mixture or
+/// duplicate. ROM class remains runner-owned under its generic name even when
+/// the historical execution aliases are accepted.
 pub fn release_run_environment_from_process_with_oot_aliases(
 ) -> Result<Option<ReleaseRunEnvironment>, ReleaseRunEnvironmentError> {
-    parse_release_run_environment(read_generic(), read_oot(), true)
+    parse_release_run_environment(read_generic(), read_oot(), read_rom_class(), true)
 }
 
 #[derive(Default)]
@@ -70,9 +76,14 @@ fn read_oot() -> RawReleaseEnvironment {
     }
 }
 
+fn read_rom_class() -> Option<OsString> {
+    std::env::var_os(RELEASE_ROM_CLASS_ENV)
+}
+
 fn parse_release_run_environment(
     generic: RawReleaseEnvironment,
     legacy: RawReleaseEnvironment,
+    raw_rom_class: Option<OsString>,
     allow_legacy: bool,
 ) -> Result<Option<ReleaseRunEnvironment>, ReleaseRunEnvironmentError> {
     if generic.any_present() && legacy.any_present() {
@@ -85,10 +96,14 @@ fn parse_release_run_environment(
             return Err(ReleaseRunEnvironmentError::LegacyNamespaceForbidden);
         }
         ("OOT_RELEASE_*", legacy)
-    } else {
+    } else if raw_rom_class.is_none() {
         return Ok(None);
+    } else {
+        return Err(ReleaseRunEnvironmentError::IncompleteTuple {
+            namespace: "FN64_RELEASE_*",
+        });
     };
-    if !raw.all_present() {
+    if !raw.all_present() || raw_rom_class.is_none() {
         return Err(ReleaseRunEnvironmentError::IncompleteTuple { namespace });
     }
 
@@ -125,10 +140,18 @@ fn parse_release_run_environment(
             run_event_sha256,
         ));
     }
+    let rom_class = unicode(
+        raw_rom_class.expect("complete release tuple"),
+        "FN64_RELEASE_*",
+        "ROM class",
+    )?;
+    let rom_class = ReleaseRomClass::from_wire_name(&rom_class)
+        .ok_or(ReleaseRunEnvironmentError::InvalidRomClass(rom_class))?;
 
     Ok(Some(ReleaseRunEnvironment {
         guest_cycle,
         report_path,
+        rom_class,
         run_event_sha256,
     }))
 }
@@ -163,6 +186,7 @@ pub enum ReleaseRunEnvironmentError {
     },
     InvalidGuestCycle(String),
     InvalidReportPath(String),
+    InvalidRomClass(String),
     InvalidRunEventSha256(String),
 }
 
@@ -178,7 +202,7 @@ impl fmt::Display for ReleaseRunEnvironmentError {
             }
             Self::IncompleteTuple { namespace } => write!(
                 formatter,
-                "{namespace} must provide cycle, report, and run-event SHA-256 together"
+                "{namespace} must provide cycle, report, ROM class, and run-event SHA-256 together"
             ),
             Self::NonUnicode { namespace, field } => {
                 write!(formatter, "{namespace} {field} is not valid Unicode")
@@ -192,6 +216,10 @@ impl fmt::Display for ReleaseRunEnvironmentError {
             Self::InvalidReportPath(path) => write!(
                 formatter,
                 "release report path {path:?} must be absolute and contain no '..' component"
+            ),
+            Self::InvalidRomClass(value) => write!(
+                formatter,
+                "release ROM class {value:?} must be unclassified, retail_cartridge, or public_homebrew"
             ),
             Self::InvalidRunEventSha256(value) => write!(
                 formatter,
@@ -229,11 +257,13 @@ mod tests {
                 Some(&event),
             ),
             RawReleaseEnvironment::default(),
+            Some(OsString::from("retail_cartridge")),
             false,
         )
         .unwrap()
         .unwrap();
         assert_eq!(generic.guest_cycle, 42);
+        assert_eq!(generic.rom_class, ReleaseRomClass::RetailCartridge);
         assert_eq!(
             generic.journal_path(),
             PathBuf::from("/private/tmp/report-01.unsupported.jsonl")
@@ -246,6 +276,7 @@ mod tests {
                 Some("/private/tmp/report-01.json"),
                 Some(&event),
             ),
+            Some(OsString::from("retail_cartridge")),
             true,
         )
         .unwrap()
@@ -260,6 +291,7 @@ mod tests {
             parse_release_run_environment(
                 raw(Some("42"), None, Some(&event)),
                 RawReleaseEnvironment::default(),
+                Some(OsString::from("public_homebrew")),
                 false,
             ),
             Err(ReleaseRunEnvironmentError::IncompleteTuple { .. })
@@ -268,6 +300,7 @@ mod tests {
             parse_release_run_environment(
                 raw(Some("42"), Some("/tmp/report.json"), Some(&event)),
                 raw(Some("42"), Some("/tmp/report.json"), Some(&event)),
+                Some(OsString::from("public_homebrew")),
                 true,
             ),
             Err(ReleaseRunEnvironmentError::MixedNamespaces)
@@ -276,6 +309,7 @@ mod tests {
             parse_release_run_environment(
                 raw(Some("42"), Some("report.json"), Some(&event)),
                 RawReleaseEnvironment::default(),
+                Some(OsString::from("public_homebrew")),
                 false,
             ),
             Err(ReleaseRunEnvironmentError::InvalidReportPath(_))
@@ -284,9 +318,56 @@ mod tests {
             parse_release_run_environment(
                 raw(Some("42"), Some("/tmp/report.json"), Some(&"AB".repeat(32))),
                 RawReleaseEnvironment::default(),
+                Some(OsString::from("public_homebrew")),
                 false,
             ),
             Err(ReleaseRunEnvironmentError::InvalidRunEventSha256(_))
+        ));
+    }
+
+    #[test]
+    fn requires_runner_owned_class_for_generic_and_legacy_tuples() {
+        let event = "ab".repeat(32);
+        for (generic, legacy, allow_legacy) in [
+            (
+                raw(Some("42"), Some("/tmp/report.json"), Some(&event)),
+                RawReleaseEnvironment::default(),
+                false,
+            ),
+            (
+                RawReleaseEnvironment::default(),
+                raw(Some("42"), Some("/tmp/report.json"), Some(&event)),
+                true,
+            ),
+        ] {
+            assert!(matches!(
+                parse_release_run_environment(generic, legacy, None, allow_legacy),
+                Err(ReleaseRunEnvironmentError::IncompleteTuple { .. })
+            ));
+        }
+
+        assert!(matches!(
+            parse_release_run_environment(
+                RawReleaseEnvironment::default(),
+                RawReleaseEnvironment::default(),
+                Some(OsString::from("retail_cartridge")),
+                false,
+            ),
+            Err(ReleaseRunEnvironmentError::IncompleteTuple { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_class_instead_of_relabelling_it() {
+        let event = "ab".repeat(32);
+        assert!(matches!(
+            parse_release_run_environment(
+                raw(Some("42"), Some("/tmp/report.json"), Some(&event)),
+                RawReleaseEnvironment::default(),
+                Some(OsString::from("retail")),
+                false,
+            ),
+            Err(ReleaseRunEnvironmentError::InvalidRomClass(value)) if value == "retail"
         ));
     }
 }

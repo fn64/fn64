@@ -143,8 +143,10 @@ and scope limits that make an open item meaningful.
   into RT64 so PAL stable-factor workloads derive from 50 Hz rather than the
   pinned upstream 60 Hz constant. Ten fresh live Metal processes prove the
   production-context PAL/MPAL workload sequences `[0,0,0,50]` and
-  `[0,0,0,60]` without an Extended refresh override; full-ROM evidence still
-  must co-bind decoded TV authority to that renderer configuration. cpal
+  `[0,0,0,60]` without an Extended refresh override. Report schema v19 now
+  co-binds normalized ROM TV region, committed device TV state, and renderer
+  create-time TV configuration; representative private PAL/MPAL exact-ten
+  evidence remains to be retained. cpal
   resamples guest rate to device rate; and the audio backend distinguishes the
   current AI DMA (what `AI_LEN` exposes) from its host jitter prebuffer. Playback
   starts only after the N64-equivalent two-DMA queue is primed.

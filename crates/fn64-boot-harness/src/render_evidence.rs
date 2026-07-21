@@ -208,6 +208,18 @@ pub trait LiveReleaseGateRenderExt {
         memory: &LiveMemoryEvidence,
         report_path: impl AsRef<Path>,
     ) -> Result<ReleaseGateReport, GateError>;
+
+    /// Capture a full-ROM report whose retail/homebrew class is supplied by
+    /// the admission owner rather than inferred from header bytes.
+    fn capture_and_write_render_rom_evidence(
+        self,
+        boundary: crate::CommittedViBoundary,
+        scenario: impl Into<String>,
+        rom: crate::ReleaseRomInput<'_>,
+        render: &LiveRenderEvidence,
+        memory: &LiveMemoryEvidence,
+        report_path: impl AsRef<Path>,
+    ) -> Result<ReleaseGateReport, GateError>;
 }
 
 impl LiveReleaseGateRenderExt for LiveReleaseGate {
@@ -248,6 +260,55 @@ impl LiveReleaseGateRenderExt for LiveReleaseGate {
             boundary,
             scenario,
             input_bytes,
+            None,
+            LiveObservedArtifacts {
+                framebuffer_artifact_bytes: &render.canonical_bytes(),
+                framebuffer_payload_bytes: render.bytes().len(),
+                memory_bytes: memory.bytes(),
+                observations,
+            },
+            report_path,
+        )
+    }
+
+    fn capture_and_write_render_rom_evidence(
+        self,
+        boundary: crate::CommittedViBoundary,
+        scenario: impl Into<String>,
+        rom: crate::ReleaseRomInput<'_>,
+        render: &LiveRenderEvidence,
+        memory: &LiveMemoryEvidence,
+        report_path: impl AsRef<Path>,
+    ) -> Result<ReleaseGateReport, GateError> {
+        if render.guest_cycle != self.guest_cycle() {
+            return Err(GateError::WrongCycle {
+                expected: self.guest_cycle(),
+                observed: render.guest_cycle,
+                kind: ArtifactKind::Framebuffer,
+            });
+        }
+        let (width, height) = render.dimensions();
+        let observations = ReleaseObservationGeometry {
+            framebuffer: FramebufferObservationGeometry {
+                source: FramebufferObservationSource::PostViSwapchain {
+                    backend_identity: render.backend_identity().to_owned(),
+                    settings_sha256: hex(&render.settings_sha256()),
+                    workload_id: render.workload_id(),
+                    present_id: render.present_id(),
+                },
+                width,
+                height,
+                row_bytes: render.row_bytes(),
+                format: FramebufferObservationFormat::Bgra8Unorm,
+                payload_bytes: render.bytes().len() as u64,
+            },
+            memory: memory.geometry(),
+        };
+        self.capture_and_write_observed(
+            boundary,
+            scenario,
+            rom.bytes(),
+            Some(rom.class()),
             LiveObservedArtifacts {
                 framebuffer_artifact_bytes: &render.canonical_bytes(),
                 framebuffer_payload_bytes: render.bytes().len(),

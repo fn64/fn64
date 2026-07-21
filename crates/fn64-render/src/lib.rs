@@ -620,8 +620,15 @@ pub enum ActiveRenderGraphicsApi {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenderBackendEvidence {
     Unidentified,
-    Reference,
+    Reference {
+        /// IPL-selected television standard retained by the concrete backend
+        /// from its last successful creation.
+        tv_type: fn64_runtime::TvType,
+    },
     Rt64 {
+        /// IPL-selected television standard retained by the concrete backend
+        /// from its last successful creation.
+        tv_type: fn64_runtime::TvType,
         backend_identity: String,
         source_authoritative: bool,
         /// Concrete API backing the live RT64 device. This can never be an
@@ -633,6 +640,17 @@ pub enum RenderBackendEvidence {
         /// replacement pack. Configured or staged packs do not qualify.
         replacement_packs_active: bool,
     },
+}
+
+impl RenderBackendEvidence {
+    /// Television standard owned by an identified, successfully created
+    /// renderer. Compatibility backends cannot fabricate this authority.
+    pub const fn tv_type(&self) -> Option<fn64_runtime::TvType> {
+        match self {
+            Self::Unidentified => None,
+            Self::Reference { tv_type } | Self::Rt64 { tv_type, .. } => Some(*tv_type),
+        }
+    }
 }
 
 /// One renderer-owned image whose presentation is tied to an exact guest

@@ -500,6 +500,10 @@ pub enum DecodeMode {
 }
 
 pub struct ReferenceBackend {
+    /// TV standard accepted by the last successful `create`. Clearing this
+    /// before recreation prevents failed attempts from retaining stale
+    /// release authority.
+    active_tv_type: Option<fn64_runtime::TvType>,
     fb: Option<Framebuffer>,
     /// Last VI scanout image. This is deliberately distinct from `fb`: VI
     /// blanking must not erase the RDP image that becomes visible again when
@@ -600,6 +604,7 @@ struct AutoDump {
 impl ReferenceBackend {
     pub fn new() -> Self {
         ReferenceBackend {
+            active_tv_type: None,
             fb: None,
             presented_fb: None,
             presentation: ViPresentation::default(),
@@ -1525,10 +1530,14 @@ impl Default for ReferenceBackend {
 
 impl RenderBackend for ReferenceBackend {
     fn release_environment(&self) -> fn64_render::RenderBackendEvidence {
-        fn64_render::RenderBackendEvidence::Reference
+        self.active_tv_type.map_or(
+            fn64_render::RenderBackendEvidence::Unidentified,
+            |tv_type| fn64_render::RenderBackendEvidence::Reference { tv_type },
+        )
     }
 
     fn create(&mut self, cfg: &RenderConfig) -> Result<(), RenderError> {
+        self.active_tv_type = None;
         let mut fb = Framebuffer::new(cfg.width, cfg.height);
         fb.set_noise_seed(self.noise_seed);
         let [r, g, b, a] = self.clear_color;
@@ -1543,6 +1552,7 @@ impl RenderBackend for ReferenceBackend {
         self.rdram_hidden_bits.clear();
         self.continuation = None;
         self.next_continuation_token = 1;
+        self.active_tv_type = Some(cfg.tv_type);
         Ok(())
     }
 
@@ -3385,6 +3395,10 @@ impl CompletedRt64Present {
 }
 
 pub struct Rt64Backend {
+    /// TV standard accepted by the last successful `create`. This is
+    /// independent of surface resizing and is published only with the live
+    /// RT64 policy/device evidence created from the same configuration.
+    active_tv_type: Option<fn64_runtime::TvType>,
     /// RT64's GBI selection is still HLE. Apply the same exact task-entry
     /// admission as the Rust reference backend before crossing the C ABI.
     f3dex2_ucodes: gbi::F3dex2UcodeCatalog,
@@ -3420,6 +3434,7 @@ pub struct Rt64Backend {
 impl Rt64Backend {
     pub fn new() -> Self {
         Rt64Backend {
+            active_tv_type: None,
             f3dex2_ucodes: gbi::F3dex2UcodeCatalog::default(),
             microcode_pairs: MicrocodePairCatalog::default(),
             last_dp_full_sync: fn64_render::DpFullSyncStatus::Unidentified,
@@ -4571,6 +4586,9 @@ impl RenderBackend for Rt64Backend {
     fn release_environment(&self) -> fn64_render::RenderBackendEvidence {
         #[cfg(feature = "rt64")]
         {
+            let Some(tv_type) = self.active_tv_type else {
+                return fn64_render::RenderBackendEvidence::Unidentified;
+            };
             let Some(policy) = self.active_runtime_policy() else {
                 return fn64_render::RenderBackendEvidence::Unidentified;
             };
@@ -4585,6 +4603,7 @@ impl RenderBackend for Rt64Backend {
             }
             let identity = Self::release_identity_for_api(graphics_api);
             fn64_render::RenderBackendEvidence::Rt64 {
+                tv_type,
                 backend_identity: identity.canonical_id(),
                 source_authoritative: identity.is_source_authoritative(),
                 graphics_api,
@@ -4601,6 +4620,7 @@ impl RenderBackend for Rt64Backend {
     }
 
     fn create(&mut self, cfg: &RenderConfig) -> Result<(), RenderError> {
+        self.active_tv_type = None;
         self.last_present = None;
         self.active_settings = None;
         self.active_enhancement_settings = None;
@@ -4670,6 +4690,7 @@ impl RenderBackend for Rt64Backend {
                     .map(|pack| pack.identity)
                     .collect(),
             });
+            self.active_tv_type = Some(cfg.tv_type);
             Ok(())
         }
 
@@ -5459,6 +5480,7 @@ mod tests {
             backend.release_environment(),
             fn64_render::RenderBackendEvidence::Unidentified
         );
+        assert_eq!(backend.release_environment().tv_type(), None);
     }
 
     #[test]
@@ -5553,6 +5575,7 @@ mod tests {
             other => panic!("expected Backend stub error, got {other:?}"),
         }
         assert!(!backend.created);
+        assert_eq!(backend.release_environment().tv_type(), None);
         assert!(backend.supported_ucodes().is_empty());
     }
 
@@ -5664,6 +5687,38 @@ mod tests {
             .framebuffer()
             .unwrap()
             .has_non_uniform_content(0, 0, 0, 255));
+    }
+
+    #[test]
+    fn reference_renderer_tv_authority_tracks_create_and_survives_resize() {
+        let mut backend = ReferenceBackend::new();
+        assert_eq!(
+            backend.release_environment(),
+            fn64_render::RenderBackendEvidence::Unidentified
+        );
+
+        backend
+            .create(&RenderConfig::for_tv(8, 8, fn64_runtime::TvType::Pal))
+            .unwrap();
+        assert_eq!(
+            backend.release_environment(),
+            fn64_render::RenderBackendEvidence::Reference {
+                tv_type: fn64_runtime::TvType::Pal,
+            }
+        );
+        backend.resize(16, 12);
+        assert_eq!(
+            backend.release_environment().tv_type(),
+            Some(fn64_runtime::TvType::Pal)
+        );
+
+        backend
+            .create(&RenderConfig::for_tv(4, 4, fn64_runtime::TvType::Mpal))
+            .unwrap();
+        assert_eq!(
+            backend.release_environment().tv_type(),
+            Some(fn64_runtime::TvType::Mpal)
+        );
     }
 
     #[test]

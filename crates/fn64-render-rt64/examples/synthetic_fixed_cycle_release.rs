@@ -6,6 +6,7 @@ use fn64_boot_harness::{
     commit_scheduled_vi_boundary_with_program, parse_unsupported_journal,
     verify_release_report_journal, LiveMemoryEvidence, LiveReferenceFramebufferEvidence,
     LiveReleaseGate, LiveReleaseGateObservationExt as _, ReleaseProgramDescriptor,
+    REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES,
 };
 use fn64_render::{
     FrameStatus, NonRdpWrite16, NonRdpWrite16Disposition, OsTask, RenderBackend, RenderConfig,
@@ -40,8 +41,6 @@ const RDP_COMMANDS: usize = 0x800;
 const FRAMEBUFFER: usize = 0x900;
 const WIDTH: usize = 4;
 const HEIGHT: usize = 2;
-const SYNTHETIC_ROM: &[u8] = b"fn64 synthetic PI payload; not game content";
-
 #[cfg(feature = "synthetic-native-archive-evidence")]
 const SYNTHETIC_GENERATED_ARCHIVE: &[u8] = include_bytes!(env!("FN64_SYNTHETIC_GENERATED_ARCHIVE"));
 #[cfg(feature = "synthetic-native-archive-evidence")]
@@ -138,7 +137,7 @@ fn run_invocation(invocation: ReleaseInvocation) -> Result<(), Box<dyn Error>> {
     let (program, scenario) = release_program()?;
     let mut rdram = vec![0u8; RDRAM_LEN];
     prepare_synthetic_memory(&mut rdram);
-    fn64_abi::load_rom(SYNTHETIC_ROM.to_vec());
+    fn64_abi::load_rom(REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES.to_vec());
     fn64_abi::configure_no_cartridge_save();
     fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
     fn64_abi::set_audio_rdram_len(rdram.len());
@@ -197,7 +196,7 @@ fn run_invocation(invocation: ReleaseInvocation) -> Result<(), Box<dyn Error>> {
     let report = gate.capture_and_write_reference_evidence(
         boundary,
         scenario,
-        b"fn64 synthetic non-game release input v1",
+        REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES,
         &framebuffer,
         &memory,
         &report_path,

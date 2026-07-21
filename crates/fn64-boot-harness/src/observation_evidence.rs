@@ -345,6 +345,18 @@ pub trait LiveReleaseGateObservationExt {
         memory: &LiveMemoryEvidence,
         report_path: impl AsRef<Path>,
     ) -> Result<ReleaseGateReport, GateError>;
+
+    /// Capture a full-ROM report whose provenance class is declared
+    /// explicitly. ROM bytes cannot distinguish retail from public homebrew.
+    fn capture_and_write_reference_rom_evidence(
+        self,
+        boundary: crate::CommittedViBoundary,
+        scenario: impl Into<String>,
+        rom: crate::ReleaseRomInput<'_>,
+        framebuffer: &LiveReferenceFramebufferEvidence,
+        memory: &LiveMemoryEvidence,
+        report_path: impl AsRef<Path>,
+    ) -> Result<ReleaseGateReport, GateError>;
 }
 
 impl LiveReleaseGateObservationExt for LiveReleaseGate {
@@ -361,6 +373,34 @@ impl LiveReleaseGateObservationExt for LiveReleaseGate {
             boundary,
             scenario,
             input_bytes,
+            None,
+            LiveObservedArtifacts {
+                framebuffer_artifact_bytes: framebuffer.bytes(),
+                framebuffer_payload_bytes: framebuffer.bytes().len(),
+                memory_bytes: memory.bytes(),
+                observations: ReleaseObservationGeometry {
+                    framebuffer: framebuffer.geometry(),
+                    memory: memory.geometry(),
+                },
+            },
+            report_path,
+        )
+    }
+
+    fn capture_and_write_reference_rom_evidence(
+        self,
+        boundary: crate::CommittedViBoundary,
+        scenario: impl Into<String>,
+        rom: crate::ReleaseRomInput<'_>,
+        framebuffer: &LiveReferenceFramebufferEvidence,
+        memory: &LiveMemoryEvidence,
+        report_path: impl AsRef<Path>,
+    ) -> Result<ReleaseGateReport, GateError> {
+        self.capture_and_write_observed(
+            boundary,
+            scenario,
+            rom.bytes(),
+            Some(rom.class()),
             LiveObservedArtifacts {
                 framebuffer_artifact_bytes: framebuffer.bytes(),
                 framebuffer_payload_bytes: framebuffer.bytes().len(),

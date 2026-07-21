@@ -7,6 +7,7 @@ use fn64_render::{
     ViPresentation, ViScaleAxis, ViScanoutRegisters, ViScanoutState,
 };
 use fn64_render_rt64::{Rt64Backend, Rt64BackendIdentity, Rt64SourceProvenance};
+use fn64_runtime::TvType;
 use sha2::{Digest, Sha256};
 
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
@@ -150,6 +151,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..RenderRuntimeSettings::default()
     };
     let mut backend = Rt64Backend::new();
+    if backend.release_environment().tv_type().is_some() {
+        return Err(io::Error::other("uncreated RT64 backend claimed TV authority").into());
+    }
     let staged = backend.apply_runtime_settings(&settings)?;
     if staged
         != (RenderSettingsApply::StagedForCreate {
@@ -169,7 +173,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         rgba16: 0xf801,
         guest_cycle: 101,
     };
-    backend.create(&RenderConfig::ntsc(initial.width, initial.height))?;
+    backend.create(&RenderConfig::for_tv(
+        initial.width,
+        initial.height,
+        TvType::Pal,
+    ))?;
     if backend.active_settings() != Some(&settings) {
         return Err(
             io::Error::other("Metal initialization did not activate staged settings").into(),
@@ -183,6 +191,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (initial_native, initial_capture) = submit_raw(&mut backend, initial)?;
     validate_native(initial, &initial_native)?;
     validate_capture(initial, &initial_capture, &identity, policy_sha256)?;
+    if backend.release_environment().tv_type() != Some(TvType::Pal) {
+        return Err(io::Error::other("Metal initialization lost PAL TV authority").into());
+    }
 
     let resize_transition = FixtureSpec {
         width: 8,
@@ -200,6 +211,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         &identity,
         policy_sha256,
     )?;
+    if backend.release_environment().tv_type() != Some(TvType::Pal) {
+        return Err(io::Error::other("Metal resize changed PAL TV authority").into());
+    }
 
     // A second distinct frame proves the new drawable geometry survives the
     // next present-worker pass instead of reverting to its old Cocoa cache.
@@ -231,7 +245,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         rgba16: 0x003f,
         guest_cycle: 303,
     };
-    backend.create(&RenderConfig::ntsc(recreated.width, recreated.height))?;
+    backend.create(&RenderConfig::for_tv(
+        recreated.width,
+        recreated.height,
+        TvType::Mpal,
+    ))?;
     if backend.active_settings() != Some(&settings) {
         return Err(
             io::Error::other("Metal recreation did not preserve configured settings").into(),
@@ -250,6 +268,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         &identity,
         recreated_policy_sha256,
     )?;
+    if backend.release_environment().tv_type() != Some(TvType::Mpal) {
+        return Err(io::Error::other("Metal recreation lost MPAL TV authority").into());
+    }
     if recreated_policy_sha256 != policy_sha256 {
         return Err(io::Error::other("Metal recreation changed the active policy identity").into());
     }
@@ -275,6 +296,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             "compatibility presentation entered release evidence: {compatibility_error}"
         ))
         .into());
+    }
+
+    let failed_recreate = backend
+        .create(&RenderConfig::for_tv(0, recreated.height, TvType::Ntsc))
+        .unwrap_err();
+    if !failed_recreate.to_string().contains("non-zero") {
+        return Err(io::Error::other(format!(
+            "invalid Metal recreation lost its named diagnostic: {failed_recreate}"
+        ))
+        .into());
+    }
+    if backend.release_environment().tv_type().is_some() {
+        return Err(io::Error::other("failed Metal recreation retained stale TV authority").into());
     }
 
     println!(

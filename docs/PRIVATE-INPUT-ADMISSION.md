@@ -19,7 +19,7 @@ that a full-ROM release matrix closed.
 
 ## Local-only manifest
 
-The schema is `fn64.private-input-admission.v5`. A populated manifest contains
+The schema is `fn64.private-input-admission.v6`. A populated manifest contains
 private paths, exact lengths, and SHA-256 values and must never enter git. Use
 this shape, replacing every angle-bracket placeholder locally. Quoted integer
 placeholders (`length` and `release_gate_cycle`) must become JSON integers,
@@ -27,13 +27,14 @@ not strings:
 
 ```json
 {
-  "schema": "fn64.private-input-admission.v5",
+  "schema": "fn64.private-input-admission.v6",
   "purpose": "combined",
   "intent": {
     "wire_family": "f3dex2_extended_gbi_v1",
     "report_scenario": "<release-report-scenario>",
     "recognition": "runtime_must_confirm_backend_known_pair",
     "program_evidence_lane": "typed_block_program",
+    "rom_class": "retail_cartridge",
     "extended_gbi_cases": [
       "activation",
       "disabled-negative-control",
@@ -69,7 +70,7 @@ not strings:
       "path": "/private/tmp/<owned-rom>",
       "length": "<exact-positive-integer>",
       "sha256": "<lowercase-sha256>",
-      "provenance": "user_owned_rom",
+      "provenance": "user_owned_retail_cartridge_dump",
       "git_identity": "excluded"
     },
     "recompiled": {
@@ -113,13 +114,23 @@ exactly 4096 bytes because the fixture must install the complete admitted IMEM
 image. `rom` and `recompiled` may be `null` for `extended_gbi`; both are
 required for `full_rom` and `combined`.
 
+`rom_class` is `retail_cartridge` or `public_homebrew` for a full-ROM run,
+and exactly `not_applicable` for an Extended-GBI-only fixture. The ROM
+descriptor must carry the matching class-specific provenance:
+`user_owned_retail_cartridge_dump` or
+`publicly_distributed_homebrew_rom`. The header cannot distinguish these
+classes. This is a contract-bound local provenance attestation, not a claim
+that header bytes prove retail or homebrew origin; independently transferable
+public-homebrew provenance would require a project-owned digest/build-receipt
+catalog or an external attestation.
+
 `report_scenario` is a content-free release label: 1–128 lowercase letters,
 digits, dots, underscores, or hyphens, beginning with a letter or digit. A raw
 64-character content hash is rejected as a scenario label.
 
 `program_evidence_lane` is the pre-run executable-authority contract. A
 `full_rom` or `combined` run must select `typed_observed_function`,
-`typed_block_program`, or `identified_native_archive`; the resulting v18
+`typed_block_program`, or `identified_native_archive`; the resulting v19
 report must carry that exact execution-destination source.
 `typed_observed_function` asserts that the host installed the generated
 artifact's `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA` marker and that the
@@ -130,13 +141,14 @@ bound. Use `no_program_fixture` only for an `extended_gbi`-only fixture that
 executes no full-ROM program. These failures occur during admission, before a
 ten-run series spends time booting the game.
 
-The v5 `runner` section binds the exact native entry image, program-build
+The v6 `runner` section binds the exact native entry image, program-build
 receipt, working directory, argument vector, fixed child environment, gate
-cycle, and expected v18 execution source. The executable and receipt must be
+cycle, and expected v19 execution source. The executable and receipt must be
 built before admission. The trusted runner clears the ambient environment,
-launches the executable directly, and owns `ROM` plus the three
-`FN64_RELEASE_*` values; manifests cannot override
-them. ELF, Mach-O, and PE entry images are accepted by the Rust runner;
+launches the executable directly, and owns `ROM`,
+`FN64_RELEASE_ROM_CLASS`, the gate/report/event variables, and the staged
+microcode paths; manifests cannot override them. ELF, Mach-O, and PE entry
+images are accepted by the Rust runner;
 scripts and interpreter-mediated launchers are rejected. Loader, interpreter,
 plugin, shader/ICD, and search-path override variables are also rejected,
 including the `LD_*`, `DYLD_*`, `PYTHON*`, `VK_*`, and analogous families.
@@ -160,8 +172,8 @@ mechanism coverage from each validated committed-boundary report. A backend-
 recognized microcode family is diagnostic/optimization evidence only.
 Public-microcode credit requires independent exact digest-to-family
 adjudication by the immutable project-owned catalog v1, which is currently
-empty pending allowed-source digest provenance; v14 therefore cannot yet
-satisfy any public-microcode requirement. Schema v18 binds RT64's resolved
+empty pending allowed-source digest provenance; matrix v15 therefore cannot yet
+satisfy any public-microcode requirement. Schema v19 binds RT64's resolved
 graphics API independently of the requested settings and derives
 `macos-metal` or `linux-vulkan` target credit only from an authoritative
 matching RT64 post-VI report. Windows D3D12 and Vulkan are distinguished, but
@@ -169,7 +181,11 @@ the frozen `windows_x86_64` platform does not identify Windows 10 versus 11,
 so it cannot satisfy any of the four versioned Windows targets. A readiness
 receipt, scenario label, reference renderer, or coarse host platform cannot
 satisfy ROM-class, TV-region, public-microcode, platform-case, or blocker
-requirements by itself.
+requirements by itself. TV-region credit is derived from normalized header,
+device, and renderer agreement. ROM-class credit additionally requires the
+opaque verified-series authority built from the v3 contract, exact-ten receipt,
+retained output files, and exact runner image; report-only matrix verification
+cannot promote a host-authored class.
 
 ## Filesystem and identity rules
 
@@ -183,6 +199,8 @@ Admission rejects:
   excessive lengths, length drift, and SHA-256 drift;
 - a reduced six-case Extended-GBI denominator;
 - full-ROM/combined admission without both ROM and recompiled artifacts;
+- a missing/unknown ROM class, ambiguous legacy `user_owned_rom` provenance,
+  or a retail/public-homebrew class and provenance mismatch;
 - an authoritative program lane without a private
   `fn64.release-program-build-receipt.v1`, or with a receipt whose bytes,
   child, lane, recompiled input, canonical digest, or recomputed execution
@@ -203,7 +221,7 @@ metadata remains outside this local single-owner admission guarantee.
 
 ## Content-free readiness report
 
-The emitted and revalidated schema is `fn64.private-input-readiness.v4`.
+The emitted and revalidated schema is `fn64.private-input-readiness.v5`.
 
 Run admission with explicit absolute paths:
 
@@ -217,7 +235,8 @@ python3 tools/private_input_admission.py \
 ```
 
 The readiness report contains policy labels, the selected program-evidence
-lane, a `verified`/`not_applicable` program-build-receipt state, admitted role
+lane, the content-free ROM-class attestation, a
+`verified`/`not_applicable` program-build-receipt state, admitted role
 names, and ready/not-supplied states only. It contains no input path, filename,
 byte length, SHA-256, manifest identity, or private byte-derived digest. It is
 safe as a content-free handoff, but it is not a substitute for retaining the
@@ -226,7 +245,7 @@ local manifest during the run.
 ## Private run contract and trusted series
 
 For `full_rom` or `combined`, admission can also emit the content-bearing
-`fn64.private-release-run-contract.v2` file:
+`fn64.private-release-run-contract.v3` file:
 
 ```sh
 python3 tools/private_input_admission.py \
@@ -239,10 +258,10 @@ python3 tools/private_input_admission.py \
 ```
 
 The contract binds the manifest, readiness, and program-build-receipt bytes;
-purpose; scenario; cycle; exact ROM and admitted artifacts; execution source;
+purpose; ROM class; scenario; cycle; exact ROM and admitted artifacts; execution source;
 native child image; working directory; arguments; and sorted environment. Its
 canonical SHA-256 wire uses domain
-`fn64.private-release-run-contract-digest.v2\0`, u64
+`fn64.private-release-run-contract-digest.v3\0`, u64
 big-endian lengths/counts, raw 32-byte hashes, and typed execution-source
 tags. This is integrity plus policy equivalence, not an authority signature.
 
@@ -251,7 +270,7 @@ It returns an opaque verified-contract type only after the repository policy
 script at `tools/private_input_admission.py` byte-matches the copy embedded in
 the runner. The runner resolves `/usr/bin/python3`, then feeds the embedded
 policy bytes directly to isolated Python over a pipe while it revalidates the
-full v5 manifest/readiness/receipt/contract mapping; Python never reopens a
+full v6 manifest/v5 readiness/receipt/v3 contract mapping; Python never reopens a
 mutable script path for execution. Repository-owned synthetic mechanism tests
 use a separate constructor that accepts only the exact fixed non-game
 manifest/readiness/input bytes, scenario, cycle, empty admitted-artifact set,
@@ -282,7 +301,7 @@ process able to discover, chmod, and replace staged paths between verification
 and operating-system open/spawn is outside scope, as is replacement of the
 OS-owned resolved Python image. Each child gets a distinct derived event
 identity and new report/journal/log paths.
-The runner verifies each terminal v3 journal, exact v18
+The runner verifies each terminal v3 journal, exact v19
 scenario/cycle/input/source, the five fixed-cycle artifacts, live-minimum
 closure, zero reached unsupported events, and the admitted microcode pair
 before starting the next child. For a
@@ -292,6 +311,24 @@ recognized family; matches split across events are rejected. A create-new,
 flushed, and file-synced `fn64.private-release-series-receipt.v1` binds the
 contract, runner and child entry-image hashes, nonce, ten event/file/report
 identities, and common semantic report SHA-256.
+
+For production ROM evidence, the runner also requires the report class to
+equal contract v3, the raw report input SHA-256 and byte length to equal the
+admitted ROM, and independently rereads those exact admitted bytes to
+recompute the normalized z64/n64/v64 identity, destination code, decoded TV
+region, and configured-TV agreement. A child cannot satisfy this check by
+copying the class label while fabricating different header evidence.
+
+Matrix verification keeps that authority boundary explicit. Generic report
+verification derives TV-region and other runtime/render coverage but always
+leaves ROM-class coverage empty. The private-series path accepts only opaque
+capabilities created by jointly revalidating the admitted contract, exact-ten
+receipt, retained reports/journals, raw ROM, runner image, bound files, and
+program-build receipt. It requires exact semantic-report and ordered run-event
+agreement with the matrix evidence and retains
+`fn64.verified-rom-class-authority.v1` in matrix v15. That record's digest
+detects later drift; it is not a signature and does not replace external
+attestation when transferable provenance is required.
 
 That receipt is deliberately an integrity record, not a signature. An
 observed runner invocation enforces the direct sequential launches, while
@@ -321,7 +358,7 @@ execution source, and carry a canonical receipt SHA-256. Admission and Rust
 independently reread the files and require the declared source, recomputed
 source, contract source, and eventual report source to agree. Exactly one lane
 input must equal the admitted `recompiled` descriptor. The manifest binds the
-receipt file's own exact identity, and contract v2 binds that descriptor.
+receipt file's own exact identity, and contract v3 binds that descriptor.
 
 Create the receipt from measured files; do not hand-author its JSON. The
 materializer sorts native labels, derives the execution source, publishes only
@@ -375,7 +412,7 @@ attestation connecting those identities.
 
 The build receipt does not claim microcode-data consumption. At graphics-task
 start, the ABI hashes the exact logical RDRAM bytes at the original task
-microcode-data address and length. Report schema `fn64.release-gate.v18`
+microcode-data address and length. Report schema `fn64.release-gate.v19`
 records those fields in
 the same recognition event as the live 4 KiB IMEM SHA-256 and recognized
 family, using `fn64.rsp-rdp-observations.v2`. The family comes only from the
