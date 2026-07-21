@@ -18,10 +18,33 @@ extern "C" void fn64_c_mmio_write_w(uint64_t vaddr, uint32_t value);
 extern "C" void fn64_c_mmio_bad_width(uint64_t vaddr, uint32_t width,
                                       uint32_t is_write);
 extern "C" void fn64_c_rdram_write(uint64_t vaddr, uint32_t width);
+extern "C" void fn64_c_mem_unaligned(uint64_t vaddr, uint32_t width,
+                                     uint32_t is_write);
 
 static inline bool fn64_is_rcp_mmio_word(gpr address) {
     const uint32_t low = static_cast<uint32_t>(address);
     return low >= 0xA4000000U && low < 0xA4900000U;
+}
+
+// KSEG1 uncached-mirror folding. On hardware, KSEG0 (0x80000000+) and KSEG1
+// (0xA0000000+) map the SAME physical DRAM -- an uncached pointer built by
+// `or $v0, $v0, 0xA0000000` (WM2000's own task loader does exactly this at
+// 0x80031E28 to read `ucode_data + 0xBFC`, and its raw-read helper at
+// 0x800373B8 does the same) must observe the bytes the cached KSEG0 view
+// holds. recomp.h's generated address math (`addr - 0xFFFFFFFF80000000`)
+// instead lands KSEG1 RAM at rdram offset 0x20000000 + phys: a disjoint,
+// permanently-zero region of the oversized mapping, so uncached reads
+// returned deterministic zeros and uncached writes vanished from the cached
+// view. Fold non-RCP KSEG1 RAM (0xA0000000..0xA4000000, i.e. phys < 64 MiB,
+// below the modeled RCP register window) down onto the KSEG0/physical bytes.
+// The RCP raw-register window (0xA4000000..0xA9000000) keeps its dedicated
+// backing range (0x24000000+) -- `sync_mmio_into_rdram` owns those bytes.
+static inline gpr fn64_fold_kseg1_mirror(gpr address) {
+    const uint32_t low = static_cast<uint32_t>(address);
+    if (low - 0xA0000000U < 0x04000000U) {
+        return address - UINT64_C(0x20000000);
+    }
+    return address;
 }
 
 template <typename T, gpr LaneXor>
@@ -31,6 +54,17 @@ public:
         : rdram(rdram_), address(address_) {}
 
     operator T() const {
+        // MIPS lw/lh REQUIRE natural alignment -- hardware raises an
+        // address-error exception (AdEL) on violation. recomp.h's raw
+        // pointer cast instead reads a byte-lane-swizzled CHIMERA of two
+        // adjacent native words, feeding the guest deterministic garbage
+        // that surfaces as a wild pointer far downstream (the WM2000
+        // demo-scene 0x27813FE8 crash). Trap loudly at the first violation.
+        if constexpr (sizeof(T) > 1) {
+            if ((address & (sizeof(T) - 1)) != 0) {
+                fn64_c_mem_unaligned(address, sizeof(T), 0);
+            }
+        }
         if (fn64_is_rcp_mmio_word(address)) {
             if constexpr (sizeof(T) != sizeof(uint32_t)) {
                 fn64_c_mmio_bad_width(address, sizeof(T), 0);
@@ -40,7 +74,8 @@ public:
             }
         }
         return *reinterpret_cast<T*>(
-            rdram + ((address ^ LaneXor) - UINT64_C(0xFFFFFFFF80000000)));
+            rdram + ((fn64_fold_kseg1_mirror(address) ^ LaneXor) -
+                     UINT64_C(0xFFFFFFFF80000000)));
     }
 
     template <typename U>
@@ -56,6 +91,12 @@ public:
 
 private:
     void store(T value) {
+        // See the load path: MIPS sw/sh trap AdES on unaligned addresses.
+        if constexpr (sizeof(T) > 1) {
+            if ((address & (sizeof(T) - 1)) != 0) {
+                fn64_c_mem_unaligned(address, sizeof(T), 1);
+            }
+        }
         if (fn64_is_rcp_mmio_word(address)) {
             if constexpr (sizeof(T) != sizeof(uint32_t)) {
                 fn64_c_mmio_bad_width(address, sizeof(T), 1);
@@ -65,9 +106,10 @@ private:
                 return;
             }
         }
+        const gpr folded = fn64_fold_kseg1_mirror(address);
         *reinterpret_cast<T*>(
-            rdram + ((address ^ LaneXor) - UINT64_C(0xFFFFFFFF80000000))) = value;
-        fn64_c_rdram_write(address, sizeof(T));
+            rdram + ((folded ^ LaneXor) - UINT64_C(0xFFFFFFFF80000000))) = value;
+        fn64_c_rdram_write(folded, sizeof(T));
     }
 
     uint8_t* rdram;
