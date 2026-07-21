@@ -888,6 +888,16 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         self.events.first_key_value().map(|(key, _)| key.0)
     }
 
+    /// The programmed `VI_WIDTH` register (pixels per framebuffer row the VI
+    /// scans out). 0 until the guest programs a video mode. Hosts capturing
+    /// the presented framebuffer need this: games switch widths mid-run
+    /// (WM2000's attract image scenes render 480-wide while its menus render
+    /// 320-wide), and a capture that assumes one fixed width shears every
+    /// row of the other mode.
+    pub fn vi_width(&self) -> u32 {
+        self.vi_registers[2] & 0xFFF
+    }
+
     pub fn trace(&self) -> &[DeviceTraceEvent] {
         &self.trace
     }
