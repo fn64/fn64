@@ -869,7 +869,17 @@ task calls out:
   plan identity, planned/observed generation counts, typed disposition and
   rejected generation, entry GBI availability, pre/post workload IDs, and
   initial/final microcode addresses. A complete result must exhaust the exact
-  ordered plan.
+  ordered plan. The adapter takes the native context out of its reusable slot
+  and snapshots the complete physical RDRAM plus persistent RSP memory before
+  crossing FFI. Only a schema/plan/count-validated completion commits that
+  guest-memory transaction and returns the context. A valid preflight
+  `NeedsLle` returns the context only after byte-for-byte proof that neither
+  guest-memory resource changed. Every other native failure restores both
+  resources, destroys the unrollbackable context, and clears its active
+  release identity. Raw RDP execution applies the same rule to RDRAM. RT64's
+  synchronous queue joins and call-scoped alias restoration are what make the
+  rollback occur after the last possible foreign access, never concurrently
+  with one.
   Pinned RT64 advances the workload ID only from `State::fullSync`, so the
   delta is typed native completion evidence and must agree with transactional
   public-command inspection. The address pair is diagnostic, not admission

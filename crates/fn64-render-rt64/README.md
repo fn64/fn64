@@ -68,7 +68,14 @@ Geometry tasks are admitted before native entry from immutable RDRAM/RSP
 inputs. Entry and self-loaded microcode generations remain ordered and
 content-addressed. Unknown or incompatible generations return
 `FrameStatus::NeedsLle` before interpreter mutation. A native generation
-mismatch after execution starts poisons the context and fails loudly.
+mismatch after execution starts poisons the context and fails loudly. The
+adapter snapshots both guest-memory resources before native execution and
+publishes them only after the complete task-result schema, plan identity, and
+exact FullSync count have been validated. Any other native error restores
+RDRAM and RSP byte-for-byte, destroys the unrollbackable RT64 context, and
+clears its active release identity; a schema-valid precommit `NeedsLle` must
+also prove that neither memory image changed before the context is retained.
+Raw RDP submissions use the same RDRAM rollback/context-destruction boundary.
 
 Presentation temporarily lends RT64 the live physical-RDRAM allocation and
 the vblank-latched VI image. Native queues are synchronized before the Rust

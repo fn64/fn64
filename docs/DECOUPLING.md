@@ -109,7 +109,12 @@ image, not backend-private scratch. It is explicit in the type boundary so
 `G_DMA_IO`, ucode overlays, CPU SP-memory access, and later commands in the
 same task cannot accidentally observe different banks. The backend still has
 no callback into runtime state: it receives exactly the two mutable memory
-resources the task can affect.
+resources the task can affect. A native adapter may snapshot those resources
+inside one synchronous call solely to provide rollback: RT64 publishes no
+renderer-context checkpoint, so fn64 commits the live RDRAM/RSP images only
+after the native result passes its schema, ordered-plan, and exact FullSync
+checks. A rejected call restores both live images and destroys the context;
+the snapshot is never retained as a second device-memory authority.
 
 The same crate owns exact SHA-256-to-wire-family catalogs for complete IMEM
 images, immutable plans retaining task entry plus every ordered self-load
