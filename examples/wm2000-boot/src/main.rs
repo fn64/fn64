@@ -400,6 +400,13 @@ fn main() {
     println!("[wm2000-boot] trace events recorded: {}", trace.len());
     write_trace_file(&trace, TRACE_PATH);
     println!("[wm2000-boot] trace written to {TRACE_PATH}");
+
+    // Clean shutdown: parked guest coroutines must NOT be force-unwound by
+    // the TLS destructor (they're suspended inside nounwind extern "C"
+    // shims -- that unwind is an instant abort). Abandon them explicitly;
+    // see `fn64_abi::shutdown_abandon_threads`'s doc comment.
+    fn64_abi::shutdown_abandon_threads();
+    println!("[wm2000-boot] clean shutdown: parked guest threads abandoned");
 }
 
 /// Hash the fb region (a fixed-size guess: 320x240 RGBA5551 = 153600 bytes,

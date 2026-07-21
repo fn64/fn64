@@ -81,6 +81,26 @@ pub unsafe fn boot_thread0(
     });
 }
 
+/// Explicit end-of-run shutdown: abandon every parked guest coroutine
+/// without unwinding its stack. A harness that booted real guest threads
+/// MUST call this before `main` returns.
+///
+/// Why: guest threads park suspended inside nounwind `extern "C"` `_recomp`
+/// shims (`osRecvMesg_recomp` et al). When the thread-local `EXECUTOR` cell
+/// is dropped by the TLS destructor at process exit, dropping each parked
+/// `corosensei::Coroutine` force-unwinds its stack -- straight through
+/// those nounwind frames -- and the process aborts ("panic in a function
+/// that cannot unwind") AFTER all real work already finished. This seam
+/// marks every parked coroutine completed instead (`Executor::
+/// abandon_parked_threads`), leaking the parked stacks' contents, which at
+/// process exit is exactly what would happen anyway.
+///
+/// Idempotent; scheduling anything after calling it is a caller bug (every
+/// thread is `Dead`).
+pub fn shutdown_abandon_threads() {
+    with_executor(|exec| exec.abandon_parked_threads());
+}
+
 /// Run one scheduling step (see `Executor::run_one_step`'s doc comment).
 /// Returns `false` when nothing was runnable -- the harness should then
 /// call `advance_virtual_time` to make host-driven progress (VI retrace,

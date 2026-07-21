@@ -339,6 +339,20 @@ impl Executor {
         }
     }
 
+    /// Process-exit teardown: abandon every parked coroutine without
+    /// unwinding its stack (see `GameThread::abandon` for why unwinding a
+    /// guest thread parked inside a nounwind `extern "C"` shim aborts the
+    /// process). After this call every thread is `Dead` and the executor's
+    /// eventual drop (e.g. the host's TLS destructor) is unwind-free. The
+    /// run queue is cleared too -- nothing is schedulable afterwards.
+    pub fn abandon_parked_threads(&mut self) {
+        for thread in self.threads.values_mut() {
+            thread.abandon();
+        }
+        self.run_queue.clear();
+        self.running = None;
+    }
+
     /// `osStopThread(t)` -- per the public libultra manual's Thread Manager
     /// section, distinct from `osDestroyThread`: removes the thread from
     /// the run queue (it stops being scheduled) but does NOT tear down its
