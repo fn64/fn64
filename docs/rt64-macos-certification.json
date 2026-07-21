@@ -152,7 +152,7 @@
       "id": "full-adapter-rom-coverage",
       "status": "open",
       "claims": ["base-rendering-accuracy"],
-      "reason": "The live suite is synthetic and predominantly raw-DPC. A twenty-phase native Metal gate now binds exact nondefault post-VI pixels, causal/restorable gamma and seeded gamma-dither, exact repeated-seed output across distinct presents, and different-seed divergence while retaining divot/dither-restoration/AA-selector behavior as named pixel-inert residuals. Complete HLE microcode, full-ROM, fixed-cycle device, zero-unsupported coverage, and physical-console VI parity are not established on macOS."
+      "reason": "The live suite is synthetic and predominantly raw-DPC. A twenty-phase native Metal gate now binds exact nondefault post-VI pixels, causal/restorable gamma, seeded gamma-dither, and coverage-gated horizontal divot: three full-coverage control rows remain unchanged, nine pixels in otherwise identical non-full rows take the exact componentwise median, and disabling divot restores exactly. Dither-restoration and AA-selector behavior remain named pixel-inert residuals; MSAA/downsample coverage semantics remain uncertified and bounded. Complete HLE microcode, full-ROM, fixed-cycle device, zero-unsupported coverage, and physical-console VI parity are not established on macOS."
     },
     {
       "id": "declared-host-range",

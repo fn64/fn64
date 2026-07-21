@@ -84,45 +84,57 @@ cargo test -p fn64-abi vi --lib
 ## Native RT64 pixel boundary
 
 `rt64_vi_filter_behavior` observes pinned RT64's native Metal post-VI output
-without treating RT64 as a silicon oracle. One asymmetric public raw-RDP
-RGBA16 fixture is submitted once, then twenty complete live VI register
+without treating RT64 as a silicon oracle. One coverage-isolated public
+raw-RDP RGBA16 fixture is submitted once, then twenty complete live VI register
 images cross the same context. Every phase retains the same nonzero workload
 identity, a strictly increasing present identity, and exact 8x6 BGRA8
-geometry. Five baseline observations return byte-for-byte to the first
+geometry. Six baseline observations return byte-for-byte to the first
 baseline, and disabling gamma dither restores the exact gamma-only image.
 
-The `vi-gamma-dither:v1` source overlay replaces only pinned RT64's final VI
-fullscreen shaders. It applies the shared
+The `vi-gamma-dither:v1` and `vi-divot:v1` source overlays replace only pinned
+RT64's final VI fullscreen shaders. Gamma dither applies the shared
 `fn64.vi-public-filters.bounded-v1` seven-bit quantizer after RT64's gamma
 stage. The shader mirrors the SplitMix64-derived coordinate/channel stream
 with paired 32-bit arithmetic because the supported Metal shader target lacks
 native 64-bit integers. The complete retrace seed crosses the Rust/C/C++ wire;
 one ordinary fn64 VI event enqueues one ordinary RT64 presentation even when
 the source/register image is unchanged. It does not relabel early presents or
-alter RT64 workload history.
+alter RT64 workload history. Divot consumes RT64's framebuffer-alpha coverage
+estimate, treats modulo-eight code seven as full coverage, and applies the
+public componentwise horizontal median when a left/center/right triplet
+contains a non-full sample. Nearest mode retains the graphics API's exact
+sampler choice; linear and pixel-scaling modes interpolate corrected source
+lattice texels before gamma.
 
-Twenty fresh Metal processes retained byte-identical complete logs and every
-exact SHA-256 identity enforced by the standalone gate. The run closes the
+Twenty fresh official watchdog-bounded backend-lifecycle Metal processes
+retained every exact SHA-256 identity enforced by the embedded gate. The run closes the
 present-queue interleaving named at the native wait site: a preceding
 process-time early present cannot retain the prior VI policy while the next
-retrace replaces its seed. The expanded full `rt64_metal_backend_behavior`
-process invokes this gate in a fresh context and separately completed the
-official watchdog-bounded 20-process backend-lifecycle bar with the required
-macOS surface-teardown interval:
+retrace replaces its seed. Every `rt64_metal_backend_behavior` process invokes
+this gate in a fresh context, and the 20/20 result includes the required macOS
+surface-teardown interval:
 
 | Native phase | Nonblack pixels | Unique colors |
 | --- | ---: | ---: |
-| Baseline, gamma, and their restorations | 48 | 48 |
-| Dither-only and gamma-plus-dither, two seeds plus exact repeats | 48 | 48 |
-| Nonidentity 1.5x X/Y scale under all four AA selectors | 40 | 41 |
+| Baseline, gamma, and their restorations | 48 | 8 |
+| Dither-only and gamma-plus-dither, two seeds plus exact repeats | 48 | 20-24 |
+| Coverage-gated divot median | 48 | 11 |
+| Nonidentity 1.5x X/Y scale under all four AA selectors | 40 | 9 |
 
-Gamma, gamma dither, and nonidentity scale each causally change the exact
-captured pixels. Gamma dither is independently causal with gamma disabled or
+Gamma, gamma dither, divot, and nonidentity scale each causally change the
+exact captured pixels. Three full-coverage control rows stay byte-identical;
+the otherwise identical non-full rows change exactly nine pixels, and every
+eligible BGRA component equals the baseline horizontal median. Borders and
+alpha remain unchanged, and the next phase restores the exact baseline.
+Gamma dither is independently causal with gamma disabled or
 enabled; two distinct retrace seeds produce distinct exact images, while an
 identical repeated seed reproduces the exact image across a distinct present.
-Divot and `DITHER_FILTER` remain identical to baseline, and AA selector values
-0-3 remain identical at the nonidentity scale. Those equalities are named
-native implementation residuals rather than positive filter results. The
+`DITHER_FILTER` remains identical to baseline, and AA selector values 0-3
+remain identical at the nonidentity scale. Those equalities are named native
+implementation residuals rather than positive filter results. MSAA and
+downsample configurations can transform the alpha/coverage estimate before
+the VI stage; their exact divot decisions remain uncertified and bounded rather
+than evidence for an N64 coverage lattice. The
 fixture fails if a source update changes either side of that boundary without
 an explicit review. This proves the bounded deterministic native mechanism;
 it does not establish the unpublished silicon random stream, physical-console
@@ -158,11 +170,11 @@ tool's consensus result cannot close the base-renderer row by itself.
 - Exact interaction timing between filter blocks and field/retrace state.
 - Mode-0 unconditional versus mode-1 conditional extra-line fetch timing and
   memory-bus behavior; their public pixel-stage selection is implemented.
-- Native RT64 divot, RGBA16 dither-restoration, and AA-selector pixel behavior.
-  The live Metal gate currently preserves each as an exact pixel-inert
-  implementation residual at the pinned source revision. Their exact public
-  mechanisms require source-neighborhood or coverage state that is not yet
-  available at the final sampled-color VI shader stage.
+- Native RT64 RGBA16 dither-restoration and AA-selector pixel behavior. The
+  live Metal gate currently preserves both as exact pixel-inert implementation
+  residuals at the pinned source revision. Divot is now causal over RT64's
+  retained coverage estimate, but MSAA/downsample resolve semantics and RT64's
+  incomplete N64 coverage generation remain bounded rather than silicon exact.
 - Video DAC conversion, composite/S-Video encoding, bandwidth limits, and
   analog NTSC/PAL/MPAL output characteristics.
 - Pixel-level hardware traces spanning the framebuffer through physical video

@@ -17,6 +17,10 @@ namespace interop {
         uint noiseSeedLow;
         uint noiseSeedHigh;
         uint policyVersion;
+        uint divot;
+        uint coverageRange;
+        uint filtering;
+        uint reserved;
     };
 #ifdef HLSL_CPU
 };
