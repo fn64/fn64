@@ -117,13 +117,16 @@ pub(crate) fn render_unsupported_panic(operation: &'static str, context: impl In
     panic!("{context}")
 }
 
+#[cfg(any(feature = "rt64", test))]
+use fn64_render::RenderGraphicsApi;
 #[cfg(test)]
 use fn64_render::ViPixelType;
 use fn64_render::{
-    FrameStatus, MicrocodeDataImageIdentity, NonRdpWrite16, NonRdpWrite16Disposition, OsTask,
-    RenderBackend, RenderConfig, RenderEmulatorSettings, RenderEnhancementSettings, RenderError,
-    RenderPolicyApply, RenderReplacementPackIdentity, RenderReplacementSettings,
-    RenderRuntimePolicy, RenderRuntimeSettings, RenderSettingsApply, UcodeId, ViPresentation,
+    ActiveRenderGraphicsApi, FrameStatus, MicrocodeDataImageIdentity, NonRdpWrite16,
+    NonRdpWrite16Disposition, OsTask, RenderBackend, RenderConfig, RenderEmulatorSettings,
+    RenderEnhancementSettings, RenderError, RenderPolicyApply, RenderReplacementPackIdentity,
+    RenderReplacementSettings, RenderRuntimePolicy, RenderRuntimeSettings, RenderSettingsApply,
+    UcodeId, ViPresentation,
 };
 use raster::Framebuffer;
 
@@ -2396,6 +2399,9 @@ pub struct Rt64PresentedPixels {
     pub height: u32,
     pub row_bytes: u32,
     pub format: Rt64PresentPixelFormat,
+    /// Backend type observed from the concrete framebuffer and command-list
+    /// pair that produced this capture, not inferred from requested settings.
+    pub graphics_api: ActiveRenderGraphicsApi,
     pub present_id: u64,
     /// Workload selected by the completed present carrying these pixels.
     pub workload_id: u64,
@@ -3142,11 +3148,34 @@ impl Rt64Backend {
         }
     }
 
-    /// Identity of the RT64 source and post-VI capture API in this feature
-    /// build. The build script derives Git state from the selected source tree
-    /// or records an explicit `FN64_RT64_SOURCE_ID` as declared provenance.
+    /// Platform-wide RT64 source/capture identity used by non-release behavior
+    /// examples. On Windows this intentionally retains its historical
+    /// D3D12-or-Vulkan label; fixed-cycle evidence must use
+    /// [`Self::release_identity_for_api`] instead.
+    ///
+    /// The build script derives Git state from the selected source tree or
+    /// records an explicit `FN64_RT64_SOURCE_ID` as declared provenance.
     #[cfg(feature = "rt64")]
     pub fn release_identity() -> Rt64BackendIdentity {
+        Self::release_identity_with_post_vi_api(if cfg!(target_os = "macos") {
+            "metal-bgra8-unorm"
+        } else if cfg!(target_os = "windows") {
+            "d3d12-or-vulkan-bgra8-rgba8-unorm"
+        } else {
+            "vulkan-bgra8-rgba8-unorm"
+        })
+    }
+
+    /// Identity of the RT64 source and the concrete graphics API that owns
+    /// the release image. Unlike [`Self::release_identity`], this cannot
+    /// carry the legacy ambiguous Windows API label.
+    #[cfg(feature = "rt64")]
+    pub fn release_identity_for_api(api: ActiveRenderGraphicsApi) -> Rt64BackendIdentity {
+        Self::release_identity_with_post_vi_api(post_vi_api_for_graphics_api(api))
+    }
+
+    #[cfg(feature = "rt64")]
+    fn release_identity_with_post_vi_api(post_vi_api: &'static str) -> Rt64BackendIdentity {
         let source_provenance = match env!("FN64_RT64_SOURCE_PROVENANCE") {
             "git-clean" => Rt64SourceProvenance::GitClean,
             "git-dirty" => Rt64SourceProvenance::GitDirty,
@@ -3159,13 +3188,7 @@ impl Rt64Backend {
             source_id: env!("FN64_RT64_SOURCE_ID"),
             source_provenance,
             source_overlay_id: env!("FN64_RT64_SOURCE_OVERLAY_ID"),
-            post_vi_api: if cfg!(target_os = "macos") {
-                "metal-bgra8-unorm"
-            } else if cfg!(target_os = "windows") {
-                "d3d12-or-vulkan-bgra8-rgba8-unorm"
-            } else {
-                "vulkan-bgra8-rgba8-unorm"
-            },
+            post_vi_api,
         }
     }
 
@@ -4164,6 +4187,29 @@ impl Default for Rt64Backend {
     }
 }
 
+#[cfg(any(feature = "rt64", test))]
+const fn graphics_api_matches_request(
+    requested: RenderGraphicsApi,
+    observed: ActiveRenderGraphicsApi,
+) -> bool {
+    matches!(requested, RenderGraphicsApi::Automatic)
+        || matches!(
+            (requested, observed),
+            (RenderGraphicsApi::D3d12, ActiveRenderGraphicsApi::D3d12)
+                | (RenderGraphicsApi::Vulkan, ActiveRenderGraphicsApi::Vulkan)
+                | (RenderGraphicsApi::Metal, ActiveRenderGraphicsApi::Metal)
+        )
+}
+
+#[cfg(any(feature = "rt64", test))]
+const fn post_vi_api_for_graphics_api(api: ActiveRenderGraphicsApi) -> &'static str {
+    match api {
+        ActiveRenderGraphicsApi::D3d12 => "d3d12-bgra8-rgba8-unorm",
+        ActiveRenderGraphicsApi::Vulkan => "vulkan-bgra8-rgba8-unorm",
+        ActiveRenderGraphicsApi::Metal => "metal-bgra8-unorm",
+    }
+}
+
 impl RenderBackend for Rt64Backend {
     fn release_environment(&self) -> fn64_render::RenderBackendEvidence {
         #[cfg(feature = "rt64")]
@@ -4171,10 +4217,20 @@ impl RenderBackend for Rt64Backend {
             let Some(policy) = self.active_runtime_policy() else {
                 return fn64_render::RenderBackendEvidence::Unidentified;
             };
-            let identity = Self::release_identity();
+            let Some(context) = self.context.as_ref() else {
+                return fn64_render::RenderBackendEvidence::Unidentified;
+            };
+            let Ok(graphics_api) = context.presented_graphics_api() else {
+                return fn64_render::RenderBackendEvidence::Unidentified;
+            };
+            if !graphics_api_matches_request(policy.user.graphics_api, graphics_api) {
+                return fn64_render::RenderBackendEvidence::Unidentified;
+            }
+            let identity = Self::release_identity_for_api(graphics_api);
             fn64_render::RenderBackendEvidence::Rt64 {
                 backend_identity: identity.canonical_id(),
                 source_authoritative: identity.is_source_authoritative(),
+                graphics_api,
                 settings_sha256: policy.sha256(),
                 replacement_packs_active: policy.replacement.enabled
                     && !policy.replacement.packs.is_empty(),
@@ -4520,14 +4576,22 @@ impl RenderBackend for Rt64Backend {
                     reason: "active replacement-pack bytes changed after activation; reload or recreate before capture".into(),
                 });
             }
-            let identity = Self::release_identity();
-            let settings_sha256 = self
-                .active_runtime_policy()
-                .ok_or(RenderError::NotReady(
-                    "RT64 release capture has no complete active runtime policy",
-                ))?
-                .sha256();
+            let policy = self.active_runtime_policy().ok_or(RenderError::NotReady(
+                "RT64 release capture has no complete active runtime policy",
+            ))?;
+            let settings_sha256 = policy.sha256();
             let mut pixels = self.presented_pixels()?;
+            let graphics_api = pixels.graphics_api;
+            if !graphics_api_matches_request(policy.user.graphics_api, graphics_api) {
+                return Err(RenderError::Backend {
+                    backend: "rt64-release-capture",
+                    reason: format!(
+                        "observed {graphics_api:?} capture backend disagrees with active {:?} request",
+                        policy.user.graphics_api
+                    ),
+                });
+            }
+            let identity = Self::release_identity_for_api(graphics_api);
             let workload_id = std::num::NonZeroU64::new(pixels.workload_id).ok_or_else(|| {
                 RenderError::Backend {
                     backend: "rt64-release-capture",
@@ -4774,6 +4838,88 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).expect("remove synthetic replacement pack");
         }
+    }
+
+    #[test]
+    fn explicit_graphics_api_request_must_match_the_observed_capture_backend() {
+        for (requested, observed) in [
+            (RenderGraphicsApi::D3d12, ActiveRenderGraphicsApi::D3d12),
+            (RenderGraphicsApi::Vulkan, ActiveRenderGraphicsApi::Vulkan),
+            (RenderGraphicsApi::Metal, ActiveRenderGraphicsApi::Metal),
+        ] {
+            assert!(graphics_api_matches_request(requested, observed));
+            for other in [
+                ActiveRenderGraphicsApi::D3d12,
+                ActiveRenderGraphicsApi::Vulkan,
+                ActiveRenderGraphicsApi::Metal,
+            ] {
+                assert_eq!(
+                    graphics_api_matches_request(requested, other),
+                    other == observed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn release_post_vi_api_identity_is_concrete_and_api_specific() {
+        assert_eq!(
+            post_vi_api_for_graphics_api(ActiveRenderGraphicsApi::D3d12),
+            "d3d12-bgra8-rgba8-unorm"
+        );
+        assert_eq!(
+            post_vi_api_for_graphics_api(ActiveRenderGraphicsApi::Vulkan),
+            "vulkan-bgra8-rgba8-unorm"
+        );
+        assert_eq!(
+            post_vi_api_for_graphics_api(ActiveRenderGraphicsApi::Metal),
+            "metal-bgra8-unorm"
+        );
+        for api in [
+            ActiveRenderGraphicsApi::D3d12,
+            ActiveRenderGraphicsApi::Vulkan,
+            ActiveRenderGraphicsApi::Metal,
+        ] {
+            assert!(!post_vi_api_for_graphics_api(api).contains("-or-"));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "rt64")]
+    fn release_backend_identity_binds_the_concrete_api() {
+        for (api, expected) in [
+            (ActiveRenderGraphicsApi::D3d12, "d3d12-bgra8-rgba8-unorm"),
+            (ActiveRenderGraphicsApi::Vulkan, "vulkan-bgra8-rgba8-unorm"),
+            (ActiveRenderGraphicsApi::Metal, "metal-bgra8-unorm"),
+        ] {
+            let identity = Rt64Backend::release_identity_for_api(api);
+            assert_eq!(identity.post_vi_api, expected);
+            assert!(identity.canonical_id().contains(expected));
+            assert!(!identity.canonical_id().contains("d3d12-or-vulkan"));
+        }
+    }
+
+    #[test]
+    fn automatic_graphics_api_evidence_accepts_only_the_observed_capture_backend() {
+        for observed in [
+            ActiveRenderGraphicsApi::D3d12,
+            ActiveRenderGraphicsApi::Vulkan,
+            ActiveRenderGraphicsApi::Metal,
+        ] {
+            assert!(graphics_api_matches_request(
+                RenderGraphicsApi::Automatic,
+                observed
+            ));
+        }
+    }
+
+    #[test]
+    fn rt64_release_environment_requires_a_completed_observed_capture_backend() {
+        let backend = Rt64Backend::new();
+        assert_eq!(
+            backend.release_environment(),
+            fn64_render::RenderBackendEvidence::Unidentified
+        );
     }
 
     #[test]

@@ -40,11 +40,19 @@ enum {
     FN64_RT64_PRESENT_FORMAT_RGBA8_UNORM = 2
 };
 
+enum {
+    FN64_RT64_PRESENT_GRAPHICS_API_D3D12 = 1,
+    FN64_RT64_PRESENT_GRAPHICS_API_VULKAN = 2,
+    FN64_RT64_PRESENT_GRAPHICS_API_METAL = 3
+};
+
 typedef struct Fn64Rt64PresentCapture {
     uint32_t width;
     uint32_t height;
     uint32_t row_bytes;
     uint32_t format;
+    uint32_t graphics_api;
+    uint32_t reserved;
     uint64_t byte_len;
     uint64_t present_id;
     uint64_t workload_id;
@@ -411,7 +419,7 @@ typedef struct Fn64Rt64TextureReplacementState {
 #ifdef __cplusplus
 static_assert(sizeof(Fn64Rt64Task) == 14 * sizeof(uint32_t));
 static_assert(sizeof(Fn64Rt64AdapterCapture) == 41 * sizeof(uint32_t));
-static_assert(sizeof(Fn64Rt64PresentCapture) == 40);
+static_assert(sizeof(Fn64Rt64PresentCapture) == 48);
 static_assert(sizeof(Fn64Rt64PresentSelection) == 32);
 static_assert(sizeof(Fn64Rt64DeferredWorkloadSnapshot) == 328);
 static_assert(sizeof(Fn64Rt64DeferredWorkloadEvidence) == 656);

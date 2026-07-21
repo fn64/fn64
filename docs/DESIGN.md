@@ -264,7 +264,7 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain one single recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Report schema
-`fn64.release-gate.v17` and the
+`fn64.release-gate.v18` and the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
 
 This mechanism makes a correctly formed production contract launchable; it is
@@ -409,7 +409,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v17 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v18 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -418,7 +418,7 @@ image and asks the registered backend only for exact catalog recognition; the
 backend cannot supply the digest or choose execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v17` binds it independently.
+clears it and report schema `fn64.release-gate.v18` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.

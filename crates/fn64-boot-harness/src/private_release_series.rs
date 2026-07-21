@@ -46,7 +46,7 @@ pub const REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES: &[u8] =
 pub const REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES: &[u8] =
     b"fn64 synthetic non-game release input v1";
 
-const RELEASE_REPORT_SCHEMA: &str = "fn64.release-gate.v17";
+const RELEASE_REPORT_SCHEMA: &str = "fn64.release-gate.v18";
 const CONTRACT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-run-contract-digest.v2\0";
 const RUN_EVENT_DOMAIN: &[u8] = b"fn64.private-release-run-event.v1\0";
 const RECEIPT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-series-receipt-digest.v1\0";

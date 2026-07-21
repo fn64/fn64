@@ -293,6 +293,17 @@ pub enum ReleaseGraphicsExecutionPolicy {
     LleAccuracy,
 }
 
+/// Concrete graphics API that produced an RT64 release image.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseGraphicsApi {
+    D3d12,
+    Vulkan,
+    Metal,
+}
+
 /// Concrete registered renderer state, self-reported by the owned backend.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -302,6 +313,7 @@ pub enum ReleaseRendererEvidence {
     },
     Rt64 {
         execution_policy: ReleaseGraphicsExecutionPolicy,
+        graphics_api: ReleaseGraphicsApi,
         backend_identity: String,
         source_authoritative: bool,
         settings_sha256: String,

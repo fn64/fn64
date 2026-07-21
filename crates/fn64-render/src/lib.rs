@@ -354,6 +354,19 @@ pub enum ReleaseCaptureFormat {
     PostViBgra8Unorm,
 }
 
+/// Concrete graphics API that produced an RT64 release image.
+///
+/// This is intentionally distinct from [`RenderGraphicsApi`], which models a
+/// requested runtime policy and therefore includes `Automatic`. Release
+/// evidence must name the API that actually became active; an unresolved
+/// automatic selection is not an identity.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ActiveRenderGraphicsApi {
+    D3d12,
+    Vulkan,
+    Metal,
+}
+
 /// Backend-owned identity used by fixed-cycle release evidence.
 ///
 /// This is a self-report from the registered trait object, not a label supplied
@@ -367,6 +380,9 @@ pub enum RenderBackendEvidence {
     Rt64 {
         backend_identity: String,
         source_authoritative: bool,
+        /// Concrete API backing the live RT64 device. This can never be an
+        /// unresolved automatic request.
+        graphics_api: ActiveRenderGraphicsApi,
         /// Canonical identity of the complete active RT64 runtime policy.
         settings_sha256: [u8; 32],
         /// True only when the active policy enables at least one identified

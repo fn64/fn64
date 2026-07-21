@@ -13,7 +13,8 @@ use crate::observation_evidence::RENDER_EVIDENCE_SCHEMA;
 use crate::{
     release_gate::LiveObservedArtifacts, ArtifactKind, FramebufferObservationFormat,
     FramebufferObservationGeometry, FramebufferObservationSource, GateError, LiveMemoryEvidence,
-    LiveReleaseGate, ReleaseGateReport, ReleaseHostPlatform, ReleaseObservationGeometry,
+    LiveReleaseGate, ReleaseGateReport, ReleaseGraphicsApi, ReleaseHostPlatform,
+    ReleaseObservationGeometry,
 };
 
 /// Position of the captured bytes in the renderer/presentation pipeline.
@@ -308,12 +309,14 @@ pub(crate) enum Rt64BackendIdentityError {
     SourceRevision,
     Provenance,
     EmptyOverlay,
+    PlatformApi,
     CaptureApi,
 }
 
 pub(crate) fn validate_authoritative_rt64_backend_identity(
     identity: &str,
     platform: ReleaseHostPlatform,
+    graphics_api: ReleaseGraphicsApi,
 ) -> Result<(), Rt64BackendIdentityError> {
     let fields = identity.split(';').collect::<Vec<_>>();
     let [adapter, adapter_sha256, source, provenance, overlay, post_vi_api] = fields.as_slice()
@@ -346,10 +349,18 @@ pub(crate) fn validate_authoritative_rt64_backend_identity(
     {
         return Err(Rt64BackendIdentityError::EmptyOverlay);
     }
-    let expected_api = match platform {
-        ReleaseHostPlatform::MacosArm64 => "post_vi_api=metal-bgra8-unorm",
-        ReleaseHostPlatform::LinuxX86_64 => "post_vi_api=vulkan-bgra8-rgba8-unorm",
-        ReleaseHostPlatform::WindowsX86_64 => "post_vi_api=d3d12-or-vulkan-bgra8-rgba8-unorm",
+    let expected_api = match (platform, graphics_api) {
+        (ReleaseHostPlatform::MacosArm64, ReleaseGraphicsApi::Metal) => {
+            "post_vi_api=metal-bgra8-unorm"
+        }
+        (ReleaseHostPlatform::LinuxX86_64, ReleaseGraphicsApi::Vulkan)
+        | (ReleaseHostPlatform::WindowsX86_64, ReleaseGraphicsApi::Vulkan) => {
+            "post_vi_api=vulkan-bgra8-rgba8-unorm"
+        }
+        (ReleaseHostPlatform::WindowsX86_64, ReleaseGraphicsApi::D3d12) => {
+            "post_vi_api=d3d12-bgra8-rgba8-unorm"
+        }
+        _ => return Err(Rt64BackendIdentityError::PlatformApi),
     };
     if *post_vi_api != expected_api {
         return Err(Rt64BackendIdentityError::CaptureApi);
@@ -438,12 +449,12 @@ mod tests {
     fn authoritative_identity_for(
         adapter_nibble: char,
         source_nibble: char,
-        platform: ReleaseHostPlatform,
+        graphics_api: ReleaseGraphicsApi,
     ) -> String {
-        let post_vi_api = match platform {
-            ReleaseHostPlatform::MacosArm64 => "metal-bgra8-unorm",
-            ReleaseHostPlatform::LinuxX86_64 => "vulkan-bgra8-rgba8-unorm",
-            ReleaseHostPlatform::WindowsX86_64 => "d3d12-or-vulkan-bgra8-rgba8-unorm",
+        let post_vi_api = match graphics_api {
+            ReleaseGraphicsApi::D3d12 => "d3d12-bgra8-rgba8-unorm",
+            ReleaseGraphicsApi::Vulkan => "vulkan-bgra8-rgba8-unorm",
+            ReleaseGraphicsApi::Metal => "metal-bgra8-unorm",
         };
         format!(
             "adapter=fn64-render-rt64/rt64;adapter_sha256={};source=git:{};provenance=git-clean;overlay=fn64-test;post_vi_api={post_vi_api}",
@@ -452,36 +463,76 @@ mod tests {
         )
     }
 
+    fn graphics_api_for_platform(platform: ReleaseHostPlatform) -> ReleaseGraphicsApi {
+        match platform {
+            ReleaseHostPlatform::MacosArm64 => ReleaseGraphicsApi::Metal,
+            ReleaseHostPlatform::LinuxX86_64 => ReleaseGraphicsApi::Vulkan,
+            ReleaseHostPlatform::WindowsX86_64 => ReleaseGraphicsApi::D3d12,
+        }
+    }
+
     fn authoritative_identity(adapter_nibble: char, source_nibble: char) -> String {
         authoritative_identity_for(
             adapter_nibble,
             source_nibble,
-            crate::release_host_platform().unwrap(),
+            graphics_api_for_platform(crate::release_host_platform().unwrap()),
         )
     }
 
     #[test]
     fn authoritative_identity_is_canonical_and_platform_specific() {
+        let valid = [
+            (ReleaseHostPlatform::MacosArm64, ReleaseGraphicsApi::Metal),
+            (ReleaseHostPlatform::LinuxX86_64, ReleaseGraphicsApi::Vulkan),
+            (
+                ReleaseHostPlatform::WindowsX86_64,
+                ReleaseGraphicsApi::D3d12,
+            ),
+            (
+                ReleaseHostPlatform::WindowsX86_64,
+                ReleaseGraphicsApi::Vulkan,
+            ),
+        ];
+        for &(platform, graphics_api) in &valid {
+            let identity = authoritative_identity_for('a', 'b', graphics_api);
+            validate_authoritative_rt64_backend_identity(&identity, platform, graphics_api)
+                .unwrap();
+        }
+
         for platform in [
             ReleaseHostPlatform::MacosArm64,
             ReleaseHostPlatform::LinuxX86_64,
             ReleaseHostPlatform::WindowsX86_64,
         ] {
-            let identity = authoritative_identity_for('a', 'b', platform);
-            validate_authoritative_rt64_backend_identity(&identity, platform).unwrap();
-            for other in [
-                ReleaseHostPlatform::MacosArm64,
-                ReleaseHostPlatform::LinuxX86_64,
-                ReleaseHostPlatform::WindowsX86_64,
+            for graphics_api in [
+                ReleaseGraphicsApi::D3d12,
+                ReleaseGraphicsApi::Vulkan,
+                ReleaseGraphicsApi::Metal,
             ] {
-                if other != platform {
-                    assert_eq!(
-                        validate_authoritative_rt64_backend_identity(&identity, other),
-                        Err(Rt64BackendIdentityError::CaptureApi)
-                    );
+                if valid.contains(&(platform, graphics_api)) {
+                    continue;
                 }
+                let identity = authoritative_identity_for('a', 'b', graphics_api);
+                assert_eq!(
+                    validate_authoritative_rt64_backend_identity(&identity, platform, graphics_api,),
+                    Err(Rt64BackendIdentityError::PlatformApi)
+                );
             }
         }
+
+        let ambiguous_windows = authoritative_identity_for('a', 'b', ReleaseGraphicsApi::D3d12)
+            .replace(
+                "post_vi_api=d3d12-bgra8-rgba8-unorm",
+                "post_vi_api=d3d12-or-vulkan-bgra8-rgba8-unorm",
+            );
+        assert_eq!(
+            validate_authoritative_rt64_backend_identity(
+                &ambiguous_windows,
+                ReleaseHostPlatform::WindowsX86_64,
+                ReleaseGraphicsApi::D3d12,
+            ),
+            Err(Rt64BackendIdentityError::CaptureApi)
+        );
     }
 
     fn report(render: &LiveRenderEvidence) -> ReleaseGateReport {

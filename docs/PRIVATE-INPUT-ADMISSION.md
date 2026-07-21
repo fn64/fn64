@@ -119,7 +119,7 @@ digits, dots, underscores, or hyphens, beginning with a letter or digit. A raw
 
 `program_evidence_lane` is the pre-run executable-authority contract. A
 `full_rom` or `combined` run must select `typed_observed_function`,
-`typed_block_program`, or `identified_native_archive`; the resulting v17
+`typed_block_program`, or `identified_native_archive`; the resulting v18
 report must carry that exact execution-destination source.
 `typed_observed_function` asserts that the host installed the generated
 artifact's `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA` marker and that the
@@ -132,7 +132,7 @@ ten-run series spends time booting the game.
 
 The v5 `runner` section binds the exact native entry image, program-build
 receipt, working directory, argument vector, fixed child environment, gate
-cycle, and expected v17 execution source. The executable and receipt must be
+cycle, and expected v18 execution source. The executable and receipt must be
 built before admission. The trusted runner clears the ambient environment,
 launches the executable directly, and owns `ROM` plus the three
 `FN64_RELEASE_*` values; manifests cannot override
@@ -160,9 +160,14 @@ mechanism coverage from each validated committed-boundary report. A backend-
 recognized microcode family is diagnostic/optimization evidence only.
 Public-microcode credit requires independent exact digest-to-family
 adjudication by the immutable project-owned catalog v1, which is currently
-empty pending allowed-source digest provenance; v13 therefore cannot yet
-satisfy any public-microcode requirement. Schema v17's coarse host platform
-still cannot satisfy an exact platform/API target. A readiness receipt cannot
+empty pending allowed-source digest provenance; v14 therefore cannot yet
+satisfy any public-microcode requirement. Schema v18 binds RT64's resolved
+graphics API independently of the requested settings and derives
+`macos-metal` or `linux-vulkan` target credit only from an authoritative
+matching RT64 post-VI report. Windows D3D12 and Vulkan are distinguished, but
+the frozen `windows_x86_64` platform does not identify Windows 10 versus 11,
+so it cannot satisfy any of the four versioned Windows targets. A readiness
+receipt, scenario label, reference renderer, or coarse host platform cannot
 satisfy ROM-class, TV-region, public-microcode, platform-case, or blocker
 requirements by itself.
 
@@ -277,7 +282,7 @@ process able to discover, chmod, and replace staged paths between verification
 and operating-system open/spawn is outside scope, as is replacement of the
 OS-owned resolved Python image. Each child gets a distinct derived event
 identity and new report/journal/log paths.
-The runner verifies each terminal v3 journal, exact v17
+The runner verifies each terminal v3 journal, exact v18
 scenario/cycle/input/source, the five fixed-cycle artifacts, live-minimum
 closure, zero reached unsupported events, and the admitted microcode pair
 before starting the next child. For a
@@ -370,7 +375,7 @@ attestation connecting those identities.
 
 The build receipt does not claim microcode-data consumption. At graphics-task
 start, the ABI hashes the exact logical RDRAM bytes at the original task
-microcode-data address and length. Report schema `fn64.release-gate.v17`
+microcode-data address and length. Report schema `fn64.release-gate.v18`
 records those fields in
 the same recognition event as the live 4 KiB IMEM SHA-256 and recognized
 family, using `fn64.rsp-rdp-observations.v2`. The family comes only from the

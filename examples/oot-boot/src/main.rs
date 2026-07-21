@@ -599,12 +599,12 @@ fn main() {
                             )
                         });
                         #[cfg(feature = "rt64")]
-                        let identity = fn64_render_rt64::Rt64Backend::release_identity();
+                        let source_identity = fn64_render_rt64::Rt64Backend::release_identity();
                         #[cfg(feature = "rt64")]
                         assert!(
-                            identity.is_source_authoritative(),
+                            source_identity.is_source_authoritative(),
                             "oot-boot: RT64 release evidence requires a clean Git source identity, got {}",
-                            identity.canonical_id()
+                            source_identity.canonical_id()
                         );
                         #[cfg(not(feature = "rt64"))]
                         unreachable!(
