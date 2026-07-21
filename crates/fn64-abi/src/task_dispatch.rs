@@ -868,8 +868,11 @@ unsafe fn dispatch_raw_rdp_xbus(rdram: *mut u8, stream: &[u8]) {
     // Observability knob: `FN64_XBUS_STREAM_DUMP_DIR=<dir>` writes each
     // coalesced XBUS command stream (logical big-endian bytes, exactly what
     // the raw-RDP decoder sees) as `<dir>/xbus-NNNN.bin`, capped at 16
-    // streams. This is how a stream that traps in the decoder is diagnosed
-    // offline instead of by guesswork.
+    // streams. `FN64_XBUS_STREAM_DUMP_SKIP=<n>` (default 0) skips the first
+    // n streams so a deep-boot window (e.g. the post-save title scene) can
+    // be captured without dumping thousands of earlier tasks. This is how a
+    // stream that traps in the decoder is diagnosed offline instead of by
+    // guesswork.
     if let Some(dir) = std::env::var_os("FN64_XBUS_STREAM_DUMP_DIR") {
         thread_local! {
             static XBUS_DUMP_INDEX: Cell<u64> = const { Cell::new(0) };
@@ -879,7 +882,14 @@ unsafe fn dispatch_raw_rdp_xbus(rdram: *mut u8, stream: &[u8]) {
             cell.set(index + 1);
             index
         });
-        if index < 16 {
+        let skip = std::env::var("FN64_XBUS_STREAM_DUMP_SKIP")
+            .ok()
+            .map_or(0u64, |raw| {
+                raw.parse().unwrap_or_else(|_| {
+                    panic!("FN64_XBUS_STREAM_DUMP_SKIP must be a u64, got {raw:?}")
+                })
+            });
+        if index >= skip && index < skip.saturating_add(16) {
             let dir = std::path::PathBuf::from(dir);
             std::fs::create_dir_all(&dir)
                 .unwrap_or_else(|error| panic!("FN64_XBUS_STREAM_DUMP_DIR {dir:?}: {error}"));
@@ -891,6 +901,31 @@ unsafe fn dispatch_raw_rdp_xbus(rdram: *mut u8, stream: &[u8]) {
                 stream.len(),
                 path.display()
             );
+            // `FN64_XBUS_STREAM_DUMP_RDRAM=<n>`: alongside stream #n, dump
+            // the full guest RDRAM image (native-word layout, exactly what
+            // the raw-RDP decoder reads texels from) so the offline
+            // `xbus_replay` example can replay the stream against the REAL
+            // texture/TLUT bytes instead of zeros.
+            if let Some(want) = std::env::var("FN64_XBUS_STREAM_DUMP_RDRAM")
+                .ok()
+                .map(|raw| {
+                    raw.parse::<u64>().unwrap_or_else(|_| {
+                        panic!("FN64_XBUS_STREAM_DUMP_RDRAM must be a u64, got {raw:?}")
+                    })
+                })
+            {
+                if want == index {
+                    let bytes = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
+                    let rdram_path = dir.join(format!("rdram-{index:04}.bin"));
+                    std::fs::write(&rdram_path, bytes).unwrap_or_else(|error| {
+                        panic!("writing RDRAM dump {rdram_path:?}: {error}")
+                    });
+                    eprintln!(
+                        "[fn64-abi] dumped RDRAM image ({rdram_len:#x} bytes) to {}",
+                        rdram_path.display()
+                    );
+                }
+            }
         }
     }
     let real = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
@@ -2276,7 +2311,9 @@ mod tests {
         let commands: [(u32, u32); 9] = [
             (0xff10_0007, TARGET),
             (0xfa00_0000, 0xff00_00ff),
-            (0x0980_0000 | yl, (ym << 16) | yh),
+            // lft=0: the vertical XM minor edge sits LEFT of the rightward-
+            // sloping XH major edge (right-major geometry).
+            (0x0900_0000 | yl, (ym << 16) | yh),
             (1 << 16, (5.0f32 / 3.0 * 65536.0).round() as u32),
             (1 << 16, (5.0f32 / 6.0 * 65536.0).round() as u32),
             (1 << 16, 0),
