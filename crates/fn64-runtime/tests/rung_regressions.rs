@@ -106,6 +106,81 @@ fn rung_12_recreating_a_queue_at_a_reused_address_wipes_prior_blocked_state() {
 // yield."
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// WM2000 streaming-loader size-underflow rung (2026-07-21): the C-ABI
+// `pause_self` boundary must PARK, never auto-resume. N64Recomp's C codegen
+// emits `pause_self()` for an unconditional guest self-branch with NO loop
+// back -- both permanent idle parks and assert-hang loops (NWXE
+// func_80003DD4 0x80003DF0's invalid-file-id trap). Auto-requeue semantics
+// (Yield::PauseSelf) let fn64 RETURN through such a call site and fall
+// through a guest assertion that is unpassable on hardware; in WM2000 the
+// fall-through lookup then indexed the AKI file table with an out-of-range
+// id (0xC5BE) and submitted a PI DMA sized 0xFFFFFFFC. Yield::StopSelf is
+// the fix: the thread parks in Stopped (the osCreateThread state) and only
+// an explicit osStartThread -- reference-runtime semantics -- resumes it,
+// at which point pause_self returns (the documented restart fall-through
+// the reference runtime also has).
+// ---------------------------------------------------------------------
+
+#[test]
+fn stop_self_parks_the_thread_until_an_explicit_restart() {
+    let mut exec = Executor::new();
+    let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+    let log2 = log.clone();
+    exec.create_thread(1, 10, move |yielder, _| {
+        log2.borrow_mut().push("reached-assert");
+        yielder.suspend(Yield::StopSelf);
+        // Only an explicit osStartThread may bring execution here (the
+        // reference runtime's restart fall-through) -- never the scheduler
+        // on its own.
+        log2.borrow_mut().push("fell-through");
+    });
+    exec.start_thread(1);
+    assert!(exec.run_one_step(), "thread runs up to the park");
+
+    // Arbitrarily many scheduling rounds must NOT resume a parked thread:
+    // this is the exact difference from Yield::PauseSelf, and the proof the
+    // WM2000 assert fall-through class cannot recur.
+    for _ in 0..100 {
+        exec.run_one_step();
+    }
+    assert_eq!(*log.borrow(), ["reached-assert"], "no scheduler-driven fall-through");
+    assert!(!exec.is_thread_dead(1), "parked, not dead");
+
+    // An explicit osStartThread is the ONE legal resume path (the parked
+    // state is ThreadState::Stopped, the same state start_thread demands).
+    exec.start_thread(1);
+    assert!(exec.run_one_step());
+    assert_eq!(*log.borrow(), ["reached-assert", "fell-through"]);
+    assert!(exec.is_thread_dead(1), "restarted thread ran to completion");
+}
+
+#[test]
+fn stop_self_parked_thread_never_starves_other_work() {
+    // The WM2000 shape: the game thread parks at a guest assert while other
+    // threads (audio pump, service threads) must keep running normally.
+    let mut exec = Executor::new();
+    let other_ran = Rc::new(RefCell::new(0u32));
+    let other_ran2 = other_ran.clone();
+    exec.create_thread(1, 20, |yielder, _| {
+        yielder.suspend(Yield::StopSelf);
+    });
+    exec.start_thread(1);
+    exec.create_thread(2, 10, move |yielder, _| {
+        for _ in 0..3 {
+            *other_ran2.borrow_mut() += 1;
+            yielder.suspend(Yield::PauseSelf);
+        }
+    });
+    exec.start_thread(2);
+
+    for _ in 0..10 {
+        exec.run_one_step();
+    }
+    assert_eq!(*other_ran.borrow(), 3, "lower-priority work still ran to completion");
+    assert!(!exec.is_thread_dead(1));
+}
+
 #[test]
 fn rung_14_pause_self_idle_loop_yields_every_iteration_and_never_starves_others() {
     let mut exec = Executor::new();
