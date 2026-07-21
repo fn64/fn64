@@ -32,8 +32,131 @@
 //! loudly with instructions, per `AGENTS.md`'s "loud traps, no silent
 //! shrugs."
 
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
+
+/// Parse `recomp_overlays.inl`'s per-section `FuncEntry` arrays into a
+/// fall-through successor map: function A -> function B iff A and B are
+/// consecutive entries of the SAME section and A's `offset + rom_size`
+/// equals B's `offset` (i.e. B starts at the very next ROM byte).
+///
+/// Why this exists (2026-07-21 DL-cursor rung, README "frontier"): the
+/// answer-key partition behind this corpus split several real functions at
+/// internal labels, so N64Recomp emitted each piece as a SEPARATE C
+/// function with no fall-through tail call. On hardware, execution simply
+/// continues at the next address; in the generated C, control falls off
+/// the end of the fragment and silently skips the real function's
+/// continuation. Watchpoint-proven instance: `func_8011F67C` (announcer
+/// sprite DL emitter) ends at 0x8011FE74 and falls through into
+/// `func_8011FE78` -- the register-restore + `sp += 0x88` epilogue --
+/// which the generated C never ran, shredding the caller chain's saved
+/// registers and stack pointer (the demo-frame "DL cursor into the
+/// stack" corruption).
+fn parse_fallthrough_successors(inl_source: &str) -> HashMap<String, String> {
+    let mut successors = HashMap::new();
+    let mut prev: Option<(String, u64, u64)> = None;
+    for line in inl_source.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("static FuncEntry ") {
+            // New section array: fragments never fall through across
+            // sections (different banks live at different ROM regions).
+            prev = None;
+            continue;
+        }
+        // Entry shape (N64Recomp's own emission):
+        //   { .func = func_8011FE78, .offset = 0x00003578, .rom_size = 0x0000003C },
+        let Some(rest) = trimmed.strip_prefix("{ .func = ") else {
+            continue;
+        };
+        let parse = |rest: &str, key: &str| -> Option<u64> {
+            let v = rest.split(key).nth(1)?;
+            let v = v.trim_start().strip_prefix("0x")?;
+            let end = v.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(v.len());
+            u64::from_str_radix(&v[..end], 16).ok()
+        };
+        let Some(name) = rest.split(',').next() else {
+            continue;
+        };
+        let name = name.trim().to_string();
+        let (Some(offset), Some(rom_size)) =
+            (parse(rest, ".offset = "), parse(rest, ".rom_size = "))
+        else {
+            continue;
+        };
+        if let Some((prev_name, prev_offset, prev_size)) = prev.take() {
+            if prev_offset + prev_size == offset {
+                successors.insert(prev_name, name.clone());
+            }
+        }
+        prev = Some((name, offset, rom_size));
+    }
+    successors
+}
+
+/// Append a fall-through tail call to every generated function body that
+/// (a) has an address-contiguous successor per the section tables and
+/// (b) can syntactically fall off its closing brace (its last reachable
+/// statement is not `return;`, an unconditional `goto`, or the generated
+/// `switch_error` abort). Returns the patched source and how many bodies
+/// were mended. See `parse_fallthrough_successors` for the full story.
+fn mend_fallthrough(
+    source: &str,
+    successors: &HashMap<String, String>,
+    file_name: &str,
+) -> (String, usize) {
+    let mut out = String::with_capacity(source.len());
+    let mut mended = 0usize;
+    let mut rest = source;
+    const FN_PREFIX: &str = "RECOMP_FUNC void ";
+    while let Some(start) = rest.find(FN_PREFIX) {
+        let after_prefix = &rest[start + FN_PREFIX.len()..];
+        let name_end = after_prefix
+            .find('(')
+            .unwrap_or_else(|| panic!("{file_name}: malformed RECOMP_FUNC header"));
+        let name = &after_prefix[..name_end];
+        // Generated bodies close with a line-leading `;}`.
+        let body_close_rel = rest[start..]
+            .find("\n;}")
+            .unwrap_or_else(|| panic!("{file_name}: {name}: no `;}}` body close found"));
+        let body_end = start + body_close_rel; // index of the '\n' before ";}"
+        let body = &rest[start..body_end];
+        let can_fall_off = {
+            let last_meaningful = body
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with("//"));
+            match last_meaningful {
+                // Header-only body (empty fragment): trivially falls off.
+                Some(l) => {
+                    l != "return;"
+                        && !l.starts_with("goto ")
+                        && !l.starts_with("switch_error(")
+                }
+                None => true,
+            }
+        };
+        out.push_str(&rest[..body_end]);
+        if can_fall_off {
+            if let Some(successor) = successors.get(name) {
+                out.push_str(&format!(
+                    "\n    // fn64 fall-through mend (wm2000-boot build.rs): this generated \
+                     function\n    // ends flush against `{successor}` in the same section; on \
+                     hardware\n    // execution continues at that next address. The answer-key \
+                     partition split\n    // them, so tail-call the successor exactly as \
+                     N64Recomp does for its own\n    // fall-through functions.\n    \
+                     {successor}(rdram, ctx);"
+                ));
+                mended += 1;
+            }
+        }
+        out.push_str("\n;}");
+        rest = &rest[body_end + 3..];
+    }
+    out.push_str(rest);
+    (out, mended)
+}
 
 fn required_env(name: &str, hint: &str) -> PathBuf {
     match env::var(name) {
@@ -128,6 +251,16 @@ fn main() {
     // N64Recomp changes its emission shape (then the C++ error returns loudly).
     let patched_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("cxx-safe-funcs");
     std::fs::create_dir_all(&patched_dir).unwrap();
+    let inl_source = std::fs::read_to_string(recompiled_dir.join("recomp_overlays.inl"))
+        .unwrap_or_else(|e| panic!("wm2000-boot build.rs: reading recomp_overlays.inl: {e}"));
+    let successors = parse_fallthrough_successors(&inl_source);
+    assert!(
+        !successors.is_empty(),
+        "wm2000-boot build.rs: recomp_overlays.inl parsed to an empty fall-through successor \
+         map -- the FuncEntry emission shape must have changed; fix parse_fallthrough_successors \
+         rather than silently skipping the fall-through mend."
+    );
+    let mut mended_total = 0usize;
     let mut c_file_count = 0usize;
     for entry in std::fs::read_dir(&recompiled_dir).unwrap_or_else(|e| {
         panic!(
@@ -156,6 +289,9 @@ fn main() {
                     format!("{line}\n")
                 })
                 .collect();
+            let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let (patched, mended) = mend_fallthrough(&patched, &successors, &file_name);
+            mended_total += mended;
             let out_path = patched_dir.join(path.file_name().unwrap());
             std::fs::write(&out_path, patched).unwrap_or_else(|e| {
                 panic!("wm2000-boot build.rs: writing {}: {e}", out_path.display())
@@ -171,8 +307,17 @@ fn main() {
         recompiled_dir.display()
     );
     println!(
-        "cargo:warning=wm2000-boot: compiling {c_file_count} RecompiledFuncs/*.c files from {}",
+        "cargo:warning=wm2000-boot: compiling {c_file_count} RecompiledFuncs/*.c files from {} \
+         ({mended_total} fall-through fragments mended with successor tail calls)",
         recompiled_dir.display()
+    );
+    assert!(
+        mended_total > 0,
+        "wm2000-boot build.rs: the fall-through mend matched zero function bodies -- either the \
+         corpus was regenerated with correct function boundaries (delete this assert and the \
+         mend) or the generated-code shape changed (fix mend_fallthrough). Silent no-op is not \
+         an option: unmended fall-through fragments corrupt the guest stack (see README \
+         frontier, func_8011F67C/func_8011FE78)."
     );
 
     build.compile("wm2000_recompiled");
