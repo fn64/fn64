@@ -3462,6 +3462,23 @@ extern "C" int fn64_rt64_wait_texture_replacement_state(
     }
 }
 
+static bool require_display_list_processing_enabled(
+    Fn64Rt64Context *context,
+    const char *operation,
+    char *error,
+    size_t error_capacity) {
+    // Pinned RT64's paused debugger path bypasses display-list parsing and
+    // fabricates a DP interrupt. It therefore cannot provide native command
+    // execution or FullSync-count evidence for either HLE or raw lists.
+    if (context->application->state->debuggerInspector.paused) {
+        set_error(error, error_capacity,
+                  std::string("RT64 ") + operation +
+                      " is unavailable while the debugger is paused");
+        return false;
+    }
+    return true;
+}
+
 extern "C" int fn64_rt64_process_task(
     Fn64Rt64Context *context,
     uint8_t *rdram,
@@ -3484,6 +3501,10 @@ extern "C" int fn64_rt64_process_task(
         if (context->ucode_admission_poisoned) {
             set_error(error, error_capacity,
                       "RT64 context is poisoned by an ordered microcode-plan divergence");
+            return 0;
+        }
+        if (!require_display_list_processing_enabled(
+                context, "native task processing", error, error_capacity)) {
             return 0;
         }
         if ((rdram == nullptr) || (dmem == nullptr) || (imem == nullptr) ||
@@ -3684,6 +3705,10 @@ extern "C" int fn64_rt64_process_rdp_commands(
     try {
         if ((context == nullptr) || !context->setup_complete) {
             set_error(error, error_capacity, "RT64 context is not initialized");
+            return 0;
+        }
+        if (!require_display_list_processing_enabled(
+                context, "raw RDP processing", error, error_capacity)) {
             return 0;
         }
         if (rdram == nullptr) {

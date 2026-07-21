@@ -138,8 +138,9 @@ The RT64 adapter passes
 the same current allocation and typed controls over its foreign boundary,
 waits the native worker queues idle, restores placeholder RDRAM aliases before
 returning, and does not rewrite the RDP image during presentation. Native
-preflight bounds only the source rows selected by public coordinate arithmetic;
-the deterministic reference filter halo remains a separate policy.
+preflight consumes `fn64-render`'s typed footprint for the source rows selected
+by public coordinate arithmetic; the deterministic reference filter halo
+remains a separate policy.
 
 ### Adapter today: `fn64-render-rt64` (= the current `fn64-rt64` (→ `fn64-render-rt64`), renamed by role)
 

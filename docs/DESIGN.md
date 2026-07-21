@@ -871,10 +871,13 @@ task calls out:
   Pinned RT64 advances the workload ID only from `State::fullSync`, so the
   delta is typed native completion evidence and must agree with transactional
   public-command inspection. The address pair is diagnostic, not admission
-  authority. The remaining reference-preflight dependency is implementation
-  structure: a focused backend-neutral walker must produce the ordered
-  self-load plan and FullSync observation before the full reference decoder can
-  be removed from the RT64 production path and extracted into its own crate.
+  authority. A focused backend-neutral walker in `fn64-render` now owns the
+  ordered entry/self-load plan, activation-time raw recognition windows, and
+  exact FullSync count over immutable inputs. RT64 production task submission
+  consumes that result directly and a structural test forbids calls into the
+  reference decoder or its `RenderOp` stream. The reference renderer can
+  therefore be extracted without leaving geometry-decode policy in the native
+  adapter.
   The reference rasterizer owns one deterministic, explicitly seedable
   per-fragment noise stream. Every covered one/two-cycle fragment consumes one
   typed eight-bit sample before combiner/alpha/depth rejection; combiner
@@ -950,9 +953,10 @@ task calls out:
   presentation state commit transactionally, leaving both the previous
   presented image and the resident RDP framebuffer unchanged on failure.
   RT64 receives the same current physical allocation and live VI origin/effective
-  stride for each presentation. Its Rust boundary validates only the rows
-  selected by public coordinate arithmetic; the reference-only filter halo is
-  not presented as evidence about RT64's internal or silicon bus fetches.
+  stride for each presentation. Its Rust boundary consumes `fn64-render`'s
+  typed programmed footprint and validates only the rows selected by public
+  coordinate arithmetic; the reference-only filter halo is not presented as
+  evidence about RT64's internal or silicon bus fetches.
   Those mechanisms follow the
   public VI manual and the clean-room hardware descriptions in
   [US 6,166,748](https://patents.google.com/patent/US6166748A/en) and

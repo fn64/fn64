@@ -127,7 +127,7 @@ use fn64_render::{
     ViPixelType, ViPresentation, ViScanoutRegisters,
 };
 #[cfg(feature = "rt64")]
-use fn64_render::{TaskAdmissionGeneration, TaskAdmissionPlan, TaskAdmissionSource, UcodeDigest};
+use fn64_render::{TaskAdmissionPlan, TaskAdmissionRawWindow};
 use raster::Framebuffer;
 
 #[cfg(feature = "rt64")]
@@ -164,16 +164,6 @@ struct ViSourceGeometry {
     rows: u64,
     bytes_per_pixel: u8,
     layout: gbi::ColorImageLayout,
-}
-
-/// Derive the rows addressed by the public VI coordinate generators. This span
-/// includes the lower sample required by linear resampling, but deliberately
-/// excludes any backend-specific filter halo.
-#[cfg(any(feature = "rt64", test))]
-fn programmed_vi_source_geometry(
-    vi: ViPresentation,
-) -> Result<Option<ViSourceGeometry>, RenderError> {
-    vi_source_geometry_with_bottom_halo(vi, 0)
 }
 
 /// Add the deterministic reference filter's bottom halo to the public
@@ -3368,111 +3358,24 @@ impl CompletedRt64Present {
 #[derive(Debug)]
 struct Rt64TaskAdmission {
     plan: TaskAdmissionPlan,
-    raw_windows: Vec<gbi::TaskAdmissionRawWindow>,
+    raw_windows: Box<[TaskAdmissionRawWindow]>,
 }
 
-#[cfg(feature = "rt64")]
-fn task_entry_admission_plan(
-    rdram: &[u8],
-    rsp_memory: &fn64_runtime::RspMemory,
-    task: &OsTask,
-    family: GeometryWireFamily,
-    self_loads: Vec<TaskAdmissionGeneration>,
-    self_load_raw_windows: Vec<gbi::TaskAdmissionRawWindow>,
-) -> Result<Rt64TaskAdmission, RenderError> {
-    let reject = |reason: String| RenderError::Backend {
-        backend: "rt64-task-admission",
-        reason,
-    };
-    let text_address = task.ucode & 0x00ff_ffff;
-    let data_address = task.ucode_data & 0x00ff_ffff;
-    let text_bytes = fn64_runtime::RSP_MEMORY_BANK_SIZE;
-    let data_bytes = usize::try_from(task.ucode_data_size)
-        .map_err(|_| reject("task ucode-data size does not fit usize".to_owned()))?;
-    if !text_address.is_multiple_of(8) || !data_address.is_multiple_of(8) {
-        return Err(reject(format!(
-            "task microcode text/data addresses must be 64-bit aligned: text={text_address:#010x}, data={data_address:#010x}"
-        )));
+#[cfg(any(feature = "rt64", test))]
+fn validate_native_full_sync_count(
+    inspected_count: u64,
+    native_count: u64,
+) -> Result<fn64_render::DpFullSyncStatus, String> {
+    if inspected_count != native_count {
+        return Err(format!(
+            "native RT64 executed {native_count} FullSync commands but transactional inspection executed {inspected_count}"
+        ));
     }
-    if data_bytes == 0
-        || data_bytes > fn64_runtime::RSP_MEMORY_BANK_SIZE
-        || !data_bytes.is_multiple_of(8)
-    {
-        return Err(reject(format!(
-            "task microcode data size {data_bytes} must be a nonzero 64-bit multiple no larger than one 4 KiB DMEM bank"
-        )));
-    }
-    let checked_end = |name: &str, address: u32, bytes: usize| {
-        let start = usize::try_from(address).expect("24-bit task address fits usize");
-        let end = start
-            .checked_add(bytes)
-            .ok_or_else(|| reject(format!("task microcode {name} range overflows")))?;
-        if end > rdram.len() {
-            return Err(reject(format!(
-                "task microcode {name} range {start:#010x}..{end:#010x} exceeds RDRAM length {:#x}",
-                rdram.len()
-            )));
-        }
-        Ok(start)
-    };
-    let text_start = checked_end("text", text_address, text_bytes)?;
-    let data_start = checked_end("data", data_address, data_bytes)?;
-    let raw_text_start = checked_end(
-        "native recognition text",
-        text_address,
-        RT64_GBI_TEXT_RECOGNITION_BYTES,
-    )?;
-    let raw_data_start = checked_end(
-        "native recognition data",
-        data_address,
-        RT64_GBI_DATA_RECOGNITION_BYTES,
-    )?;
-    let view = fn64_runtime::RdramView::from_storage(rdram);
-    let mut text = vec![0; text_bytes];
-    view.copy_logical_bytes(
-        fn64_runtime::RdramAddr::from_offset(text_start as u32),
-        &mut text,
-    );
-    let text_sha256 = UcodeDigest::from_text(&text);
-    let live_text_sha256 =
-        UcodeDigest::from_text(rsp_memory.bank(fn64_runtime::RspMemoryBank::Imem));
-    if text_sha256 != live_text_sha256 {
-        return Err(RenderError::RequiresLle {
-            ucode_sha256: live_text_sha256.as_bytes(),
-        });
-    }
-    let mut data = vec![0; data_bytes];
-    view.copy_logical_bytes(
-        fn64_runtime::RdramAddr::from_offset(data_start as u32),
-        &mut data,
-    );
-    let entry = TaskAdmissionGeneration {
-        source: TaskAdmissionSource::TaskEntry,
-        text_address,
-        data_address,
-        text_sha256,
-        data: MicrocodeDataImageIdentity {
-            bytes: task.ucode_data_size,
-            sha256: sha2::Sha256::digest(data).into(),
-        },
-        family: family.ucode_id(),
-    };
-    if self_loads.len() != self_load_raw_windows.len() {
-        return Err(reject(format!(
-            "ordered self-load identities ({}) and native recognition windows ({}) differ",
-            self_loads.len(),
-            self_load_raw_windows.len()
-        )));
-    }
-    let mut raw_windows = Vec::with_capacity(self_load_raw_windows.len() + 1);
-    raw_windows.push(gbi::TaskAdmissionRawWindow {
-        text: rdram[raw_text_start..raw_text_start + RT64_GBI_TEXT_RECOGNITION_BYTES].to_vec(),
-        data: rdram[raw_data_start..raw_data_start + RT64_GBI_DATA_RECOGNITION_BYTES].to_vec(),
-    });
-    raw_windows.extend(self_load_raw_windows);
-    let plan = TaskAdmissionPlan::new(entry, self_loads);
-    assert_eq!(plan.len(), raw_windows.len());
-    Ok(Rt64TaskAdmission { plan, raw_windows })
+    Ok(if native_count == 0 {
+        fn64_render::DpFullSyncStatus::NotReached
+    } else {
+        fn64_render::DpFullSyncStatus::Reached
+    })
 }
 
 pub struct Rt64Backend {
@@ -3487,8 +3390,6 @@ pub struct Rt64Backend {
     microcode_pairs: MicrocodePairCatalog,
     /// FullSync result of the last successfully committed submission.
     last_dp_full_sync: fn64_render::DpFullSyncStatus,
-    #[cfg(feature = "rt64")]
-    task_index: u64,
     #[cfg(feature = "rt64")]
     context: Option<ffi::Context>,
     #[cfg(not(feature = "rt64"))]
@@ -3519,8 +3420,6 @@ impl Rt64Backend {
             f3dex2_ucodes: F3dex2UcodeCatalog::default(),
             microcode_pairs: MicrocodePairCatalog::default(),
             last_dp_full_sync: fn64_render::DpFullSyncStatus::Unidentified,
-            #[cfg(feature = "rt64")]
-            task_index: 0,
             #[cfg(feature = "rt64")]
             context: None,
             #[cfg(not(feature = "rt64"))]
@@ -4709,7 +4608,6 @@ impl RenderBackend for Rt64Backend {
         self.active_replacement_settings = None;
         #[cfg(feature = "rt64")]
         {
-            self.task_index = 0;
             self.context = None;
             let replacement_inputs: Vec<_> = self
                 .configured_replacement_packs
@@ -4804,42 +4702,25 @@ impl RenderBackend for Rt64Backend {
         self.last_dp_full_sync = fn64_render::DpFullSyncStatus::Unidentified;
         #[cfg(feature = "rt64")]
         {
-            let family = match self
-                .f3dex2_ucodes
-                .require_text(rsp_memory.bank(fn64_runtime::RspMemoryBank::Imem))
-            {
-                Ok(family) => family,
-                Err(RenderError::RequiresLle { ucode_sha256 }) => {
-                    return Ok(FrameStatus::NeedsLle { ucode_sha256 });
-                }
-                Err(error) => return Err(error),
-            };
-            // FullSync is the public source of DP completion. Inspect the
-            // exact admitted display-list graph transactionally before RT64
-            // consumes it; cloned RDRAM/RSP/RDP state prevents this evidence
-            // pass from applying task effects twice.
-            let mut inspection_rdram = rdram.to_vec();
-            let mut inspection_rsp = rsp_memory.clone();
-            let mut inspection_rdp = gbi::RdpDecodeState::default();
             let force_branch = self
                 .active_enhancement_settings
                 .as_ref()
                 .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
                 .f3dex_force_branch;
-            let inspection = match gbi::inspect_display_list_geometry_admission_with_raw_windows(
-                &mut inspection_rdram,
-                &mut inspection_rsp,
-                task.data_ptr,
+            // FullSync and ordered microcode activation are public control-flow
+            // effects, not reference-renderer output. The shared walker owns
+            // its speculative memories, so late LLE fallback cannot leak a
+            // partial DMA or self-load into the live task state.
+            let inspection = match fn64_render::inspect_geometry_task(
+                rdram,
+                rsp_memory,
+                task,
                 &self.f3dex2_ucodes,
-                &mut inspection_rdp,
-                family,
-                gbi::GeometryTaskAdmissionOptions {
-                    raw_window_size: gbi::TaskAdmissionRawWindowSize {
-                        text: RT64_GBI_TEXT_RECOGNITION_BYTES,
-                        data: RT64_GBI_DATA_RECOGNITION_BYTES,
-                    },
-                    force_branch,
-                },
+                fn64_render::GeometryTaskInspectionPolicy { force_branch },
+                Some(fn64_render::TaskAdmissionRawWindowSize {
+                    text: RT64_GBI_TEXT_RECOGNITION_BYTES,
+                    data: RT64_GBI_DATA_RECOGNITION_BYTES,
+                }),
             ) {
                 Ok(inspection) => inspection,
                 Err(RenderError::RequiresLle { ucode_sha256 }) => {
@@ -4847,81 +4728,11 @@ impl RenderBackend for Rt64Backend {
                 }
                 Err(error) => return Err(error),
             };
-            let admission_plan = match task_entry_admission_plan(
-                rdram,
-                rsp_memory,
-                task,
-                family,
-                inspection.self_loads,
-                inspection.self_load_raw_windows,
-            ) {
-                Ok(plan) => plan,
-                Err(RenderError::RequiresLle { ucode_sha256 }) => {
-                    return Ok(FrameStatus::NeedsLle { ucode_sha256 });
-                }
-                Err(error) => return Err(error),
+            let inspected_full_sync_count = inspection.full_sync_count;
+            let admission_plan = Rt64TaskAdmission {
+                plan: inspection.admission_plan,
+                raw_windows: inspection.raw_windows,
             };
-            let full_sync = if inspection
-                .operations
-                .iter()
-                .any(|operation| matches!(operation, gbi::RenderOp::FullSync))
-            {
-                fn64_render::DpFullSyncStatus::Reached
-            } else {
-                fn64_render::DpFullSyncStatus::NotReached
-            };
-            let task_index = self.task_index;
-            self.task_index += 1;
-            if let Some(spec) = std::env::var_os("FN64_GFX_TASK_DUMP") {
-                let selected = spec.to_string_lossy().split(',').any(|entry| {
-                    entry.trim().parse::<u64>().unwrap_or_else(|error| {
-                        panic!(
-                            "FN64_GFX_TASK_DUMP entry {entry:?} is not a u64 task index: {error}"
-                        )
-                    }) == task_index
-                });
-                if selected {
-                    let directory = std::env::var_os("FN64_GFX_TASK_DUMP_DIR")
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/fn64-gfx-task-dumps"));
-                    std::fs::create_dir_all(&directory).unwrap_or_else(|error| {
-                        panic!("failed to create FN64_GFX_TASK_DUMP_DIR {directory:?}: {error}")
-                    });
-                    let mut diagnostic_rdram = rdram.to_vec();
-                    let mut diagnostic_rsp = rsp_memory.clone();
-                    let mut diagnostic_rdp = gbi::RdpDecodeState::default();
-                    let triangles = gbi::execute_display_list_geometry_ops_admitted_with_rdp_state(
-                        &mut diagnostic_rdram,
-                        &mut diagnostic_rsp,
-                        task.data_ptr,
-                        &self.f3dex2_ucodes,
-                        &mut diagnostic_rdp,
-                        family,
-                    )
-                    .unwrap_or_else(|error| {
-                        panic!("failed to decode diagnostic gfx task {task_index}: {error}")
-                    })
-                    .into_iter()
-                    .filter(|operation| matches!(operation, gbi::RenderOp::Triangle(_)))
-                    .count();
-                    let command_trace =
-                        gbi::trace_display_list_f3dex2(&diagnostic_rdram, task.data_ptr);
-                    let report = format!(
-                        "task_index={task_index}\noutput_addr={output_addr:#010x}\n\
-                         reference_triangle_count={}\ntask={task:#?}\n{command_trace}",
-                        triangles,
-                    );
-                    let path = directory.join(format!("task-{task_index:04}.txt"));
-                    std::fs::write(&path, report).unwrap_or_else(|error| {
-                        panic!("failed to write gfx task diagnostic {path:?}: {error}")
-                    });
-                    eprintln!(
-                        "[fn64-render-rt64] dumped gfx task #{task_index} ({} reference \
-                         triangles) to {path:?}",
-                        triangles
-                    );
-                }
-            }
             let native_outcome = self
                 .context
                 .as_mut()
@@ -4947,22 +4758,31 @@ impl RenderBackend for Rt64Backend {
                     });
                 }
             };
-            if native_result.dp_full_sync != full_sync {
-                return Err(RenderError::Backend {
-                    backend: "rt64-task-result",
-                    reason: format!(
-                        "native FullSync evidence {:?} (count {}, planned microcode generations {}, ucode addresses {:#010x}/{:#010x} -> {:#010x}/{:#010x}) disagrees with transactional inspection {full_sync:?}",
-                        native_result.dp_full_sync,
-                        native_result.full_sync_count,
-                        admission_plan.plan.len(),
-                        native_result.initial_ucode_addresses.0,
-                        native_result.initial_ucode_addresses.1,
-                        native_result.final_ucode_addresses.0,
-                        native_result.final_ucode_addresses.1,
-                    ),
-                });
-            }
-            self.last_dp_full_sync = native_result.dp_full_sync;
+            let full_sync = match validate_native_full_sync_count(
+                inspected_full_sync_count,
+                native_result.full_sync_count,
+            ) {
+                Ok(full_sync) => full_sync,
+                Err(reason) => {
+                    // Native execution has already mutated renderer state.
+                    // A count disagreement therefore invalidates the whole
+                    // context; continuing would let unverified post-task
+                    // state influence later submissions.
+                    self.context = None;
+                    return Err(RenderError::Backend {
+                        backend: "rt64-task-result",
+                        reason: format!(
+                            "{reason}; planned microcode generations {}, ucode addresses {:#010x}/{:#010x} -> {:#010x}/{:#010x}",
+                            admission_plan.plan.len(),
+                            native_result.initial_ucode_addresses.0,
+                            native_result.initial_ucode_addresses.1,
+                            native_result.final_ucode_addresses.0,
+                            native_result.final_ucode_addresses.1,
+                        ),
+                    });
+                }
+            };
+            self.last_dp_full_sync = full_sync;
             Ok(FrameStatus::Complete)
         }
 
@@ -5051,8 +4871,8 @@ impl RenderBackend for Rt64Backend {
             // RT64 receives the complete 8 MiB device and owns its internal
             // filter/bus fetch contract; the reference renderer's bounded
             // bottom halo is not evidence about that native implementation.
-            if let Some(geometry) = programmed_vi_source_geometry(vi)? {
-                validate_vi_source_footprint(&memory, geometry)?;
+            if let Some(footprint) = fn64_render::programmed_vi_source_footprint(vi)? {
+                footprint.validate_rdram_len(memory.len())?;
             }
             self.context
                 .as_mut()
@@ -5348,6 +5168,61 @@ impl RenderBackend for Rt64Backend {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rt64_process_task_has_no_reference_decoder_paths() {
+        let source = include_str!("lib.rs");
+        let rt64_impl = source
+            .find("impl RenderBackend for Rt64Backend")
+            .expect("Rt64Backend RenderBackend implementation exists");
+        let process_start = rt64_impl
+            + source[rt64_impl..]
+                .find("    fn process_task(")
+                .expect("Rt64Backend process_task exists");
+        let process_end = process_start
+            + source[process_start..]
+                .find("    fn process_rdp_commands(")
+                .expect("process_rdp_commands follows process_task");
+        let process_task = &source[process_start..process_end];
+
+        assert_eq!(
+            process_task
+                .matches("fn64_render::inspect_geometry_task(")
+                .count(),
+            1,
+            "RT64 production task submission must have one shared admission walk"
+        );
+        assert!(process_task.contains("f3dex_force_branch"));
+        assert!(process_task.contains("GeometryTaskInspectionPolicy { force_branch }"));
+        for forbidden in [
+            "gbi::inspect_",
+            "gbi::execute_",
+            "gbi::decode_",
+            "gbi::trace_",
+            "gbi::RenderOp",
+        ] {
+            assert!(
+                !process_task.contains(forbidden),
+                "RT64 production task submission still references {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_full_sync_count_comparison_is_exact_not_boolean() {
+        for (count, expected) in [
+            (0, fn64_render::DpFullSyncStatus::NotReached),
+            (1, fn64_render::DpFullSyncStatus::Reached),
+            (3, fn64_render::DpFullSyncStatus::Reached),
+        ] {
+            assert_eq!(validate_native_full_sync_count(count, count), Ok(expected));
+        }
+        for (inspected, native) in [(1, 2), (2, 1)] {
+            let error = validate_native_full_sync_count(inspected, native).unwrap_err();
+            assert!(error.contains(&format!("executed {native} FullSync")));
+            assert!(error.contains(&format!("executed {inspected}")));
+        }
+    }
+
     fn run_direct_8bit_copy(
         source_format: u8,
         width: u16,
@@ -5497,7 +5372,9 @@ mod tests {
     #[test]
     fn native_programmed_span_excludes_reference_filter_halo() {
         let vi = live_presentation(0x002, 0x100, 4, 1, 1);
-        let programmed = programmed_vi_source_geometry(vi).unwrap().unwrap();
+        let programmed = fn64_render::programmed_vi_source_footprint(vi)
+            .unwrap()
+            .unwrap();
         let reference = reference_vi_source_geometry(vi).unwrap().unwrap();
         assert_eq!(programmed.rows, 2);
         assert_eq!(reference.rows, 3);
@@ -5771,16 +5648,19 @@ mod tests {
 
     #[test]
     #[cfg(feature = "rt64")]
-    fn rt64_task_entry_plan_binds_native_rdram_to_admitted_live_imem() {
+    fn rt64_shared_task_entry_plan_binds_native_rdram_to_admitted_live_imem() {
         const TEXT: u32 = 0x1000;
         const DATA: u32 = 0x3000;
+        const DL: u32 = 0x4800;
         let text = [0x73; fn64_runtime::RSP_MEMORY_BANK_SIZE];
         let data = [0x29; 8];
-        let mut rdram = vec![0u8; 0x4000];
+        let mut rdram = vec![0u8; 0x5000];
         {
             let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
             view.write_logical_bytes(fn64_runtime::RdramAddr::from_offset(TEXT), &text);
             view.write_logical_bytes(fn64_runtime::RdramAddr::from_offset(DATA), &data);
+            view.write_u32(fn64_runtime::RdramAddr::from_offset(DL), 0xdf00_0000);
+            view.write_u32(fn64_runtime::RdramAddr::from_offset(DL + 4), 0);
         }
         let mut rsp_memory = fn64_runtime::RspMemory::new();
         rsp_memory
@@ -5793,20 +5673,36 @@ mod tests {
             ucode: TEXT,
             ucode_data: DATA,
             ucode_data_size: data.len() as u32,
+            data_ptr: DL,
             ..OsTask::default()
         };
-        let plan = task_entry_admission_plan(
+        let mut catalog = F3dex2UcodeCatalog::default();
+        catalog.admit_text(&text);
+        let inspection = fn64_render::inspect_geometry_task(
             &rdram,
             &rsp_memory,
             &task,
-            GeometryWireFamily::F3dex2,
-            Vec::new(),
-            Vec::new(),
+            &catalog,
+            fn64_render::GeometryTaskInspectionPolicy::default(),
+            Some(fn64_render::TaskAdmissionRawWindowSize {
+                text: RT64_GBI_TEXT_RECOGNITION_BYTES,
+                data: RT64_GBI_DATA_RECOGNITION_BYTES,
+            }),
         )
         .unwrap();
+        let plan = Rt64TaskAdmission {
+            plan: inspection.admission_plan,
+            raw_windows: inspection.raw_windows,
+        };
         assert_eq!(plan.plan.len(), 1);
-        assert_eq!(plan.plan.entry().source, TaskAdmissionSource::TaskEntry);
-        assert_eq!(plan.plan.entry().text_sha256, UcodeDigest::from_text(&text));
+        assert_eq!(
+            plan.plan.entry().source,
+            fn64_render::TaskAdmissionSource::TaskEntry
+        );
+        assert_eq!(
+            plan.plan.entry().text_sha256,
+            fn64_render::UcodeDigest::from_text(&text)
+        );
         let data_sha256: [u8; 32] = sha2::Sha256::digest(data).into();
         assert_eq!(plan.plan.entry().data.sha256, data_sha256);
         assert_eq!(plan.raw_windows.len(), 1);
@@ -5816,19 +5712,22 @@ mod tests {
         );
 
         rdram[TEXT as usize ^ 3] ^= 0xff;
-        let mismatch = task_entry_admission_plan(
+        let mismatch = fn64_render::inspect_geometry_task(
             &rdram,
             &rsp_memory,
             &task,
-            GeometryWireFamily::F3dex2,
-            Vec::new(),
-            Vec::new(),
+            &catalog,
+            fn64_render::GeometryTaskInspectionPolicy::default(),
+            Some(fn64_render::TaskAdmissionRawWindowSize {
+                text: RT64_GBI_TEXT_RECOGNITION_BYTES,
+                data: RT64_GBI_DATA_RECOGNITION_BYTES,
+            }),
         )
         .unwrap_err();
         assert!(matches!(
             mismatch,
             RenderError::RequiresLle { ucode_sha256 }
-                if ucode_sha256 == UcodeDigest::from_text(&text).as_bytes()
+                if ucode_sha256 == fn64_render::UcodeDigest::from_text(&text).as_bytes()
         ));
     }
 

@@ -4998,7 +4998,7 @@ pub(crate) fn execute_display_list_geometry_ops_admitted_with_rdp_state(
 pub(crate) struct GeometryTaskInspection {
     pub(crate) operations: Vec<RenderOp>,
     pub(crate) self_loads: Vec<TaskAdmissionGeneration>,
-    #[cfg_attr(not(any(feature = "rt64", test)), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) self_load_raw_windows: Vec<TaskAdmissionRawWindow>,
 }
 
@@ -5008,12 +5008,14 @@ pub(crate) struct TaskAdmissionRawWindow {
     pub(crate) data: Vec<u8>,
 }
 
+#[cfg(test)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TaskAdmissionRawWindowSize {
     pub(crate) text: usize,
     pub(crate) data: usize,
 }
 
+#[cfg(test)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GeometryTaskAdmissionOptions {
     pub(crate) raw_window_size: TaskAdmissionRawWindowSize,
@@ -5040,11 +5042,12 @@ pub(crate) fn inspect_display_list_geometry_admission_with_rdp_state(
     Ok(GeometryTaskInspection {
         operations: state.ops,
         self_loads: state.admission_generations,
+        #[cfg(test)]
         self_load_raw_windows: state.admission_raw_windows,
     })
 }
 
-#[cfg_attr(not(any(feature = "rt64", test)), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn inspect_display_list_geometry_admission_with_raw_windows(
     rdram: &mut [u8],
     rsp_memory: &mut fn64_runtime::RspMemory,
@@ -7520,6 +7523,173 @@ mod tests {
         ((G_LOAD_UCODE as u32) << 24) | (u32::from(data_size) - 1)
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct AdmissionProjection {
+        generations: Vec<TaskAdmissionGeneration>,
+        plan_sha256: [u8; 32],
+        raw_windows: Vec<(Vec<u8>, Vec<u8>)>,
+        dp_full_sync: fn64_render::DpFullSyncStatus,
+        full_sync_count: u64,
+    }
+
+    fn geometry_admission_fixture() -> (
+        Vec<u8>,
+        fn64_runtime::RspMemory,
+        fn64_render::OsTask,
+        GeometryUcodeCatalog,
+    ) {
+        const TEXT: u32 = 0x2000;
+        const DATA: u32 = 0x4000;
+        let mut rdram = vec![0; 0xa000];
+        let text = (0..SP_UCODE_SIZE)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect::<Vec<_>>();
+        let data = [0x31, 0x42, 0x53, 0x64, 0x75, 0x86, 0x97, 0xa8];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            view.write_logical_bytes(fn64_runtime::RdramAddr::from_offset(TEXT), &text);
+            view.write_logical_bytes(fn64_runtime::RdramAddr::from_offset(DATA), &data);
+        }
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
+        rsp_memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0),
+                &text,
+            )
+            .unwrap();
+        let mut catalog = GeometryUcodeCatalog::default();
+        catalog.admit_text(&text);
+        let task = fn64_render::OsTask {
+            ucode: TEXT,
+            ucode_data: DATA,
+            ucode_data_size: data.len() as u32,
+            data_ptr: 0x1000,
+            ..fn64_render::OsTask::default()
+        };
+        (rdram, rsp_memory, task, catalog)
+    }
+
+    fn reference_admission_projection(
+        rdram: &[u8],
+        rsp_memory: &fn64_runtime::RspMemory,
+        task: &fn64_render::OsTask,
+        catalog: &GeometryUcodeCatalog,
+        force_branch: bool,
+    ) -> Result<AdmissionProjection, RenderError> {
+        const WINDOW: TaskAdmissionRawWindowSize = TaskAdmissionRawWindowSize { text: 16, data: 8 };
+        let family = catalog.require_text(rsp_memory.bank(fn64_runtime::RspMemoryBank::Imem))?;
+        let text_address = task.ucode & 0x00ff_ffff;
+        let data_address = task.ucode_data & 0x00ff_ffff;
+        let mut text = vec![0; SP_UCODE_SIZE];
+        let mut data = vec![0; task.ucode_data_size as usize];
+        let view = fn64_runtime::RdramView::from_storage(rdram);
+        view.copy_logical_bytes(
+            fn64_runtime::RdramAddr::from_offset(text_address),
+            &mut text,
+        );
+        view.copy_logical_bytes(
+            fn64_runtime::RdramAddr::from_offset(data_address),
+            &mut data,
+        );
+        let entry = TaskAdmissionGeneration {
+            source: TaskAdmissionSource::TaskEntry,
+            text_address,
+            data_address,
+            text_sha256: UcodeDigest::from_text(&text),
+            data: MicrocodeDataImageIdentity {
+                bytes: task.ucode_data_size,
+                sha256: Sha256::digest(data).into(),
+            },
+            family: family.ucode_id(),
+        };
+
+        let mut scratch_rdram = rdram.to_vec();
+        let mut scratch_rsp = rsp_memory.clone();
+        let inspection = inspect_display_list_geometry_admission_with_raw_windows(
+            &mut scratch_rdram,
+            &mut scratch_rsp,
+            task.data_ptr,
+            catalog,
+            &mut RdpDecodeState::default(),
+            family,
+            GeometryTaskAdmissionOptions {
+                raw_window_size: WINDOW,
+                force_branch,
+            },
+        )?;
+        let full_sync_count = inspection
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation, RenderOp::FullSync))
+            .count() as u64;
+        let plan = fn64_render::TaskAdmissionPlan::new(entry, inspection.self_loads);
+        let mut raw_windows = vec![(
+            rdram[text_address as usize..text_address as usize + WINDOW.text].to_vec(),
+            rdram[data_address as usize..data_address as usize + WINDOW.data].to_vec(),
+        )];
+        raw_windows.extend(
+            inspection
+                .self_load_raw_windows
+                .into_iter()
+                .map(|window| (window.text, window.data)),
+        );
+        Ok(AdmissionProjection {
+            generations: plan.generations().to_vec(),
+            plan_sha256: plan.sha256(),
+            raw_windows,
+            dp_full_sync: if full_sync_count == 0 {
+                fn64_render::DpFullSyncStatus::NotReached
+            } else {
+                fn64_render::DpFullSyncStatus::Reached
+            },
+            full_sync_count,
+        })
+    }
+
+    fn shared_admission_projection(
+        rdram: &[u8],
+        rsp_memory: &fn64_runtime::RspMemory,
+        task: &fn64_render::OsTask,
+        catalog: &GeometryUcodeCatalog,
+        force_branch: bool,
+    ) -> Result<AdmissionProjection, RenderError> {
+        let inspection = fn64_render::inspect_geometry_task(
+            rdram,
+            rsp_memory,
+            task,
+            catalog,
+            fn64_render::GeometryTaskInspectionPolicy { force_branch },
+            Some(fn64_render::TaskAdmissionRawWindowSize { text: 16, data: 8 }),
+        )?;
+        Ok(AdmissionProjection {
+            generations: inspection.admission_plan.generations().to_vec(),
+            plan_sha256: inspection.admission_plan.sha256(),
+            raw_windows: inspection
+                .raw_windows
+                .into_vec()
+                .into_iter()
+                .map(|window| (window.text, window.data))
+                .collect(),
+            dp_full_sync: inspection.dp_full_sync,
+            full_sync_count: inspection.full_sync_count,
+        })
+    }
+
+    fn assert_shared_admission_matches_reference(
+        rdram: &[u8],
+        rsp_memory: &fn64_runtime::RspMemory,
+        task: &fn64_render::OsTask,
+        catalog: &GeometryUcodeCatalog,
+        force_branch: bool,
+    ) -> AdmissionProjection {
+        let reference =
+            reference_admission_projection(rdram, rsp_memory, task, catalog, force_branch).unwrap();
+        let shared =
+            shared_admission_projection(rdram, rsp_memory, task, catalog, force_branch).unwrap();
+        assert_eq!(shared, reference);
+        shared
+    }
+
     #[test]
     fn simple_decoder_rejects_unknown_opcode_with_wire_context() {
         fn64_runtime::arm_unsupported_events(None).unwrap();
@@ -7848,6 +8018,394 @@ mod tests {
             a[..16],
             "raw RT64 recognition bytes must remain distinct from the logical RSP DMA image"
         );
+    }
+
+    #[test]
+    fn shared_walker_matches_reference_nested_same_address_a_b_a() {
+        const ROOT: usize = 0x1000;
+        const CHILD: usize = 0x1800;
+        const TEXT: usize = 0x2000;
+        const DATA: usize = 0x4000;
+        const A_PREFIX: usize = 0x7000;
+        const B_PREFIX: usize = 0x7100;
+        let (mut rdram, rsp_memory, task, mut catalog) = geometry_admission_fixture();
+        let a = (0..SP_UCODE_SIZE)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect::<Vec<_>>();
+        let mut b = a.clone();
+        b[..8].copy_from_slice(&[0xe1, 0x02, 0xc3, 0x24, 0xa5, 0x46, 0x87, 0x68]);
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            view.write_logical_bytes(
+                fn64_runtime::RdramAddr::from_offset(A_PREFIX as u32),
+                &a[..8],
+            );
+            view.write_logical_bytes(
+                fn64_runtime::RdramAddr::from_offset(B_PREFIX as u32),
+                &b[..8],
+            );
+        }
+        catalog.admit_text(&b);
+
+        wr_cmd(&mut rdram, ROOT, (G_DL as u32) << 24, CHILD as u32);
+        wr_cmd(
+            &mut rdram,
+            ROOT + 8,
+            dma_io_word(false, 0, 8),
+            B_PREFIX as u32,
+        );
+        wr_cmd(&mut rdram, ROOT + 16, dma_io_word(true, 0, 8), TEXT as u32);
+        wr_cmd(
+            &mut rdram,
+            ROOT + 24,
+            (G_RDPHALF_1 as u32) << 24,
+            DATA as u32,
+        );
+        wr_cmd(&mut rdram, ROOT + 32, load_ucode_word(8), TEXT as u32);
+        wr_cmd(
+            &mut rdram,
+            ROOT + 40,
+            dma_io_word(false, 0, 8),
+            A_PREFIX as u32,
+        );
+        wr_cmd(&mut rdram, ROOT + 48, dma_io_word(true, 0, 8), TEXT as u32);
+        wr_cmd(
+            &mut rdram,
+            ROOT + 56,
+            (G_RDPHALF_1 as u32) << 24,
+            DATA as u32,
+        );
+        wr_cmd(&mut rdram, ROOT + 64, load_ucode_word(8), TEXT as u32);
+        wr_cmd(&mut rdram, ROOT + 72, (G_RDPFULLSYNC as u32) << 24, 0);
+        wr_cmd(&mut rdram, ROOT + 80, (G_ENDDL as u32) << 24, 0);
+        wr_cmd(&mut rdram, CHILD, (G_RDPHALF_1 as u32) << 24, DATA as u32);
+        wr_cmd(&mut rdram, CHILD + 8, load_ucode_word(8), TEXT as u32);
+        wr_cmd(&mut rdram, CHILD + 16, (G_RDPFULLSYNC as u32) << 24, 0);
+        wr_cmd(&mut rdram, CHILD + 24, (G_ENDDL as u32) << 24, 0);
+
+        let projection =
+            assert_shared_admission_matches_reference(&rdram, &rsp_memory, &task, &catalog, false);
+        assert_eq!(projection.generations.len(), 4);
+        assert_eq!(projection.raw_windows.len(), 4);
+        assert_eq!(projection.full_sync_count, 2);
+        assert_eq!(
+            projection
+                .generations
+                .iter()
+                .map(|generation| generation.text_sha256)
+                .collect::<Vec<_>>(),
+            [
+                UcodeDigest::from_text(&a),
+                UcodeDigest::from_text(&a),
+                UcodeDigest::from_text(&b),
+                UcodeDigest::from_text(&a),
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_walker_matches_reference_force_branch_paths() {
+        const ROOT: usize = 0x1000;
+        const TARGET: usize = 0x1800;
+        const OTHER_TEXT: usize = 0x5000;
+        const OTHER_DATA: usize = 0x6800;
+        let (mut rdram, rsp_memory, task, mut catalog) = geometry_admission_fixture();
+        let other = vec![0x5d; SP_UCODE_SIZE];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            view.write_logical_bytes(
+                fn64_runtime::RdramAddr::from_offset(OTHER_TEXT as u32),
+                &other,
+            );
+            view.write_logical_bytes(
+                fn64_runtime::RdramAddr::from_offset(OTHER_DATA as u32),
+                &[2, 4, 6, 8, 10, 12, 14, 16],
+            );
+        }
+        catalog.admit_text(&other);
+        wr_cmd(
+            &mut rdram,
+            ROOT,
+            ((G_MODIFYVTX as u32) << 24) | ((G_MWO_POINT_ZSCREEN as u32) << 16),
+            0x0002_0000,
+        );
+        wr_cmd(
+            &mut rdram,
+            ROOT + 8,
+            (G_RDPHALF_1 as u32) << 24,
+            TARGET as u32,
+        );
+        wr_cmd(
+            &mut rdram,
+            ROOT + 16,
+            (G_BRANCH_Z as u32) << 24,
+            0x0001_ffff,
+        );
+        wr_cmd(&mut rdram, ROOT + 24, (G_RDPFULLSYNC as u32) << 24, 0);
+        wr_cmd(&mut rdram, ROOT + 32, (G_ENDDL as u32) << 24, 0);
+        wr_cmd(
+            &mut rdram,
+            TARGET,
+            (G_RDPHALF_1 as u32) << 24,
+            OTHER_DATA as u32,
+        );
+        wr_cmd(
+            &mut rdram,
+            TARGET + 8,
+            load_ucode_word(8),
+            OTHER_TEXT as u32,
+        );
+        wr_cmd(&mut rdram, TARGET + 16, (G_ENDDL as u32) << 24, 0);
+
+        let ordinary =
+            assert_shared_admission_matches_reference(&rdram, &rsp_memory, &task, &catalog, false);
+        let forced =
+            assert_shared_admission_matches_reference(&rdram, &rsp_memory, &task, &catalog, true);
+        assert_eq!(ordinary.full_sync_count, 1);
+        assert_eq!(ordinary.generations.len(), 1);
+        assert_eq!(forced.full_sync_count, 0);
+        assert_eq!(forced.generations.len(), 2);
+    }
+
+    #[test]
+    fn shared_walker_matches_reference_culldl_child_return() {
+        const ROOT: usize = 0x1000;
+        const CHILD: usize = 0x1800;
+        const MATRIX: usize = 0x7000;
+        const VIEWPORT: usize = 0x7100;
+        const VERTICES: usize = 0x7200;
+        const OTHER_TEXT: usize = 0x5000;
+        const OTHER_DATA: usize = 0x6800;
+        let (mut rdram, rsp_memory, task, mut catalog) = geometry_admission_fixture();
+        let other = vec![0x5d; SP_UCODE_SIZE];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            view.write_logical_bytes(
+                fn64_runtime::RdramAddr::from_offset(OTHER_TEXT as u32),
+                &other,
+            );
+            view.write_logical_bytes(
+                fn64_runtime::RdramAddr::from_offset(OTHER_DATA as u32),
+                &[2, 4, 6, 8, 10, 12, 14, 16],
+            );
+        }
+        catalog.admit_text(&other);
+        wr_mtx(&mut rdram, MATRIX, identity());
+        wr_centered_viewport(&mut rdram, VIEWPORT);
+        for (slot, (x, y)) in [(2, 0), (2, 1)].into_iter().enumerate() {
+            wr_vtx(
+                &mut rdram,
+                VERTICES + slot * VTX_STRIDE,
+                x,
+                y,
+                0,
+                [255, 255, 255, 255],
+            );
+        }
+        let mtx_len = ((64u32 - 1) / 8) << 19;
+        wr_cmd(&mut rdram, ROOT, movemem_viewport_word(), VIEWPORT as u32);
+        wr_cmd(
+            &mut rdram,
+            ROOT + 8,
+            ((G_MTX as u32) << 24) | mtx_len | 0x07,
+            MATRIX as u32,
+        );
+        wr_cmd(
+            &mut rdram,
+            ROOT + 16,
+            ((G_VTX as u32) << 24) | (2 << 12) | (2 << 1),
+            VERTICES as u32,
+        );
+        wr_cmd(&mut rdram, ROOT + 24, (G_DL as u32) << 24, CHILD as u32);
+        wr_cmd(&mut rdram, ROOT + 32, (G_RDPFULLSYNC as u32) << 24, 0);
+        wr_cmd(&mut rdram, ROOT + 40, (G_ENDDL as u32) << 24, 0);
+        wr_cmd(&mut rdram, CHILD, (G_CULLDL as u32) << 24, 2);
+        wr_cmd(
+            &mut rdram,
+            CHILD + 8,
+            (G_RDPHALF_1 as u32) << 24,
+            OTHER_DATA as u32,
+        );
+        wr_cmd(
+            &mut rdram,
+            CHILD + 16,
+            load_ucode_word(8),
+            OTHER_TEXT as u32,
+        );
+        wr_cmd(&mut rdram, CHILD + 24, (G_RDPFULLSYNC as u32) << 24, 0);
+        wr_cmd(&mut rdram, CHILD + 32, (G_ENDDL as u32) << 24, 0);
+
+        let projection =
+            assert_shared_admission_matches_reference(&rdram, &rsp_memory, &task, &catalog, false);
+        assert_eq!(projection.generations.len(), 1);
+        assert_eq!(projection.full_sync_count, 1);
+    }
+
+    #[test]
+    fn shared_walker_matches_reference_dma_rewritten_commands() {
+        const ROOT: usize = 0x1000;
+        const DMEM_ADDRESS: u16 = 0x0080;
+        let (mut rdram, mut rsp_memory, task, catalog) = geometry_admission_fixture();
+        wr_cmd(
+            &mut rdram,
+            ROOT,
+            dma_io_word(true, DMEM_ADDRESS, 16),
+            (ROOT + 8) as u32,
+        );
+        wr_cmd(&mut rdram, ROOT + 8, (G_SPECIAL_1 as u32) << 24, 0);
+        wr_cmd(&mut rdram, ROOT + 16, (G_SPECIAL_1 as u32) << 24, 0);
+        rsp_memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_register(u32::from(DMEM_ADDRESS)),
+                &[
+                    G_RDPFULLSYNC,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    G_ENDDL,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+            .unwrap();
+
+        let projection =
+            assert_shared_admission_matches_reference(&rdram, &rsp_memory, &task, &catalog, false);
+        assert_eq!(projection.full_sync_count, 1);
+        assert_eq!(
+            projection.dp_full_sync,
+            fn64_render::DpFullSyncStatus::Reached
+        );
+    }
+
+    #[test]
+    fn shared_walker_matches_reference_texture_and_line_envelopes() {
+        const ROOT: usize = 0x1000;
+        for enveloped in [false, true] {
+            let (mut rdram, rsp_memory, task, catalog) = geometry_admission_fixture();
+            wr_cmd(&mut rdram, ROOT, (G_TEXRECT as u32) << 24, 0);
+            if enveloped {
+                wr_cmd(
+                    &mut rdram,
+                    ROOT + 8,
+                    (G_RDPHALF_1 as u32) << 24,
+                    0xe900_0000,
+                );
+                wr_cmd(
+                    &mut rdram,
+                    ROOT + 16,
+                    (G_RDPHALF_2 as u32) << 24,
+                    0xe900_0000,
+                );
+            } else {
+                wr_cmd(&mut rdram, ROOT + 8, 0xe900_0000, 0);
+            }
+            let sync = if enveloped { ROOT + 24 } else { ROOT + 16 };
+            wr_cmd(&mut rdram, sync, (G_RDPFULLSYNC as u32) << 24, 0);
+            wr_cmd(&mut rdram, sync + 8, (G_ENDDL as u32) << 24, 0);
+            let projection = assert_shared_admission_matches_reference(
+                &rdram,
+                &rsp_memory,
+                &task,
+                &catalog,
+                false,
+            );
+            assert_eq!(projection.full_sync_count, 1);
+        }
+
+        let (mut rdram, rsp_memory, task, catalog) = geometry_admission_fixture();
+        const VERTICES: usize = 0x7000;
+        wr_vtx(&mut rdram, VERTICES, 2, 4, 0, [255, 0, 0, 255]);
+        wr_vtx(
+            &mut rdram,
+            VERTICES + VTX_STRIDE,
+            10,
+            4,
+            0,
+            [0, 0, 255, 255],
+        );
+        wr_cmd(
+            &mut rdram,
+            ROOT,
+            ((G_VTX as u32) << 24) | (2 << 12) | (5 << 1),
+            VERTICES as u32,
+        );
+        wr_cmd(
+            &mut rdram,
+            ROOT + 8,
+            ((G_LINE3D as u32) << 24) | (8 << 16) | (6 << 8) | 3,
+            0,
+        );
+        wr_cmd(&mut rdram, ROOT + 16, (G_RDPFULLSYNC as u32) << 24, 0);
+        wr_cmd(&mut rdram, ROOT + 24, (G_ENDDL as u32) << 24, 0);
+        let projection =
+            assert_shared_admission_matches_reference(&rdram, &rsp_memory, &task, &catalog, false);
+        assert_eq!(projection.full_sync_count, 1);
+    }
+
+    #[test]
+    fn shared_walker_matches_reference_late_failure_digest_transactionally() {
+        const ROOT: usize = 0x1000;
+        const TEXT: usize = 0x2000;
+        const DATA: usize = 0x4000;
+        const OTHER_TEXT: usize = 0x5000;
+        const OTHER_DATA: usize = 0x6800;
+        let (mut rdram, rsp_memory, task, catalog) = geometry_admission_fixture();
+        let other = vec![0x5d; SP_UCODE_SIZE];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            view.write_logical_bytes(
+                fn64_runtime::RdramAddr::from_offset(OTHER_TEXT as u32),
+                &other,
+            );
+            view.write_logical_bytes(
+                fn64_runtime::RdramAddr::from_offset(OTHER_DATA as u32),
+                &[2, 4, 6, 8, 10, 12, 14, 16],
+            );
+        }
+        wr_cmd(&mut rdram, ROOT, (G_RDPHALF_1 as u32) << 24, DATA as u32);
+        wr_cmd(&mut rdram, ROOT + 8, load_ucode_word(8), TEXT as u32);
+        wr_cmd(
+            &mut rdram,
+            ROOT + 16,
+            (G_RDPHALF_1 as u32) << 24,
+            OTHER_DATA as u32,
+        );
+        wr_cmd(&mut rdram, ROOT + 24, load_ucode_word(8), OTHER_TEXT as u32);
+        wr_cmd(&mut rdram, ROOT + 32, (G_ENDDL as u32) << 24, 0);
+        let original_rdram = rdram.clone();
+        let original_rsp = rsp_memory.clone();
+
+        let reference_error =
+            reference_admission_projection(&rdram, &rsp_memory, &task, &catalog, false)
+                .unwrap_err();
+        let shared_error =
+            shared_admission_projection(&rdram, &rsp_memory, &task, &catalog, false).unwrap_err();
+        let RenderError::RequiresLle {
+            ucode_sha256: reference_digest,
+        } = reference_error
+        else {
+            panic!("reference walker returned {reference_error}");
+        };
+        let RenderError::RequiresLle {
+            ucode_sha256: shared_digest,
+        } = shared_error
+        else {
+            panic!("shared walker returned {shared_error}");
+        };
+        assert_eq!(reference_digest, UcodeDigest::from_text(&other).as_bytes());
+        assert_eq!(shared_digest, reference_digest);
+        assert_eq!(rdram, original_rdram);
+        assert_eq!(rsp_memory, original_rsp);
     }
 
     #[test]

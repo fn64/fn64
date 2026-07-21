@@ -299,7 +299,7 @@
         { "kind": "pinned_source", "path": "src/hle/rt64_state.cpp", "line": 1815, "needle": "inspect()" },
         { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 589, "needle": "globalDrawCallIndex + 1" },
         { "kind": "pinned_source", "path": "src/gui/rt64_inspector.cpp", "line": 139, "needle": "Unknown Graphics API" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_deferred_debugger_behavior.rs", "line": 342, "needle": "set_debugger_inspection_for_evidence(true, 0, 0", "claim_id": "debugger-frame-inspection" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_deferred_debugger_behavior.rs", "line": 355, "needle": "set_debugger_inspection_for_evidence(true, 0, 0", "claim_id": "debugger-frame-inspection" }
       ]
     },
     {
