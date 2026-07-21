@@ -177,7 +177,7 @@ fn start_timed_pi_dma(
     ret_mesg: u32,
     shim: &str,
 ) -> Result<(), DeviceFault> {
-    with_host(|host| {
+    let result = with_host(|host| {
         if matches!(request.direction, DmaDirection::FromRdram)
             && !fn64_runtime::rom::is_sram_dev_addr(request.cart_addr)
         {
@@ -216,7 +216,19 @@ fn start_timed_pi_dma(
         fabric.start_pi_dma(request)?;
         host.pending_pi_completion = Some(pending);
         Ok(())
-    })
+    });
+    if matches!(result, Err(DeviceFault::PiBusy)) {
+        // The command queue is genuinely full: the guest has outrun the PI
+        // engine and is (on hardware) about to burn real time in a retry
+        // spin while PI interrupts drain the queue. Charge that stall and
+        // checkpoint -- outside the `with_host` borrow -- so virtual time
+        // advances and the in-flight completion can commit; the guest's next
+        // retry then observes a freed slot. See
+        // `charge_guest_device_busy_retry`'s doc for the WM2000 livelock
+        // this prevents.
+        crate::charge_guest_device_busy_retry();
+    }
+    result
 }
 
 /// Execute one raw PI transfer through the single ROM/save engine. This is
@@ -1198,12 +1210,16 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
     let dev_addr = pi_bus_to_dev_addr(handle_base, read_offset_word(rdram, mb_addr.offset(), 0xC));
     let len = read_offset_word(rdram, mb_addr.offset(), 0x10);
 
-    let logical_end = usize::try_from(
-        dram_addr
-            .offset()
-            .checked_add(len)
-            .expect("PI DMA RDRAM range overflow"),
-    )
+    let logical_end = usize::try_from(dram_addr.offset().checked_add(len).unwrap_or_else(|| {
+        panic!(
+            "osEPiStartDma_recomp: PI DMA RDRAM range overflow -- OSIoMesg at {:#010x} carries \
+             dramAddr offset {:#010x} + size {len:#010x} (devAddr {dev_addr:#010x}); a garbage \
+             size like this usually means the guest OSIoMesg was never initialized by the code \
+             that owns it",
+            mb_addr.offset(),
+            dram_addr.offset(),
+        )
+    }))
     .expect("PI DMA RDRAM extent exceeds usize");
     let required_len = logical_end
         .checked_add(3)
