@@ -88,7 +88,34 @@ pub enum Yield {
     /// condition; the thread is immediately runnable again next scheduling
     /// round (rung 14's idle-loop fix: this is what an unconditional spin
     /// MUST call instead of looping forever without ever yielding).
+    ///
+    /// Correct ONLY for callers whose own code loops back around the yield
+    /// (fn64-recomp-rs emits `pause_self(); pc = self; continue 'run;` --
+    /// the guest self-branch is preserved, so auto-requeue faithfully
+    /// models "spin forever at this priority, yielding each iteration").
+    /// The C-ABI `pause_self` shim must NOT use this variant -- see
+    /// [`Yield::StopSelf`].
     PauseSelf,
+    /// The C-ABI `pause_self` boundary: park this thread in
+    /// `ThreadState::Stopped` until (and unless) some other thread
+    /// explicitly `osStartThread`s it, exactly like the reference
+    /// N64ModernRuntime's `pause_self`.
+    ///
+    /// Why this is a distinct variant from [`Yield::PauseSelf`]
+    /// (wm2000 boot, 2026-07-21): N64Recomp's C codegen translates an
+    /// unconditional guest self-branch (`j self; nop` -- both permanent
+    /// idle parks AND assert-hang loops like NWXE `func_80003DD4`
+    /// 0x80003DF0's invalid-file-id trap) into a bare `pause_self()` call
+    /// with NO loop back -- the reference runtime never returns from it
+    /// without an explicit restart, so the code after the call is
+    /// unreachable there. Auto-requeue semantics made fn64 RETURN through
+    /// that call site, falling through a guest assertion that can never be
+    /// passed on hardware: the WM2000 sound driver then read its file
+    /// table with an out-of-range id and submitted a PI DMA with size
+    /// 0xFFFFFFFC. Parking (resumable only via `osStartThread`, matching
+    /// the reference runtime) makes such an assert an honest permanent
+    /// park instead of silent state corruption.
+    StopSelf,
     /// A translated block exhausted its deterministic instruction slice.
     /// The executor charges these guest instructions to virtual time only
     /// after the coroutine has suspended, when its exclusive `&mut Executor`
