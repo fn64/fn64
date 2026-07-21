@@ -30,33 +30,36 @@ pub use observation_evidence::{
 };
 pub use private_release_series::{
     load_private_release_run_contract, run_private_release_series, verify_private_release_series,
+    verify_private_release_series_with_runner,
     verify_repository_synthetic_private_release_run_contract, PrivateArtifactIdentity,
     PrivateChildCommand, PrivateEnvironmentEntry, PrivateFileIdentity, PrivateReleaseRunContract,
     PrivateReleaseSeriesError, PrivateReleaseSeriesReceipt, PrivateReleaseSeriesRun,
-    VerifiedPrivateReleaseRunContract, PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA,
-    PRIVATE_RELEASE_SERIES_COUNT, PRIVATE_RELEASE_SERIES_RECEIPT_SCHEMA,
-    RELEASE_MICROCODE_DATA_PATH_ENV, RELEASE_MICROCODE_TEXT_PATH_ENV,
-    REPOSITORY_SYNTHETIC_RELEASE_CYCLE, REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES,
-    REPOSITORY_SYNTHETIC_RELEASE_MANIFEST_BYTES, REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES,
-    REPOSITORY_SYNTHETIC_RELEASE_SCENARIO,
+    VerifiedPrivateReleaseRunContract, VerifiedPrivateReleaseSeries,
+    PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA, PRIVATE_RELEASE_SERIES_COUNT,
+    PRIVATE_RELEASE_SERIES_RECEIPT_SCHEMA, RELEASE_MICROCODE_DATA_PATH_ENV,
+    RELEASE_MICROCODE_TEXT_PATH_ENV, REPOSITORY_SYNTHETIC_RELEASE_CYCLE,
+    REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES, REPOSITORY_SYNTHETIC_RELEASE_MANIFEST_BYTES,
+    REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES, REPOSITORY_SYNTHETIC_RELEASE_SCENARIO,
 };
 pub use release_gate::{
     ArtifactDigest, ArtifactKind, ClosureGate, ClosurePath, ClosurePathStatus, DeterministicDigest,
     ExecutionDestinationCountEvidence, ExecutionDestinationEventEvidence,
     ExecutionDestinationEvidence, ExecutionDestinationSource, FixedCycleDigestGate, GateError,
     LiveReleaseGate, ReleaseExecutionDestination, ReleaseGateReport, ReleaseMicrocodeFamily,
-    RspRdpEvidence, RspRdpObservationEventEvidence, RspRdpObservationKindEvidence,
-    UnsupportedEvent, LIVE_CONTROLLER_OPERATION_CLOSURE_PATHS, LIVE_MINIMUM_CLOSURE_PATHS,
-    LIVE_SAVE_OPERATION_CLOSURE_PATHS,
+    ReleaseRomByteOrder, ReleaseRomClass, ReleaseRomEvidence, ReleaseRomInput, ReleaseTvRegion,
+    ReleaseTvStandard, RspRdpEvidence, RspRdpObservationEventEvidence,
+    RspRdpObservationKindEvidence, UnsupportedEvent, LIVE_CONTROLLER_OPERATION_CLOSURE_PATHS,
+    LIVE_MINIMUM_CLOSURE_PATHS, LIVE_SAVE_OPERATION_CLOSURE_PATHS,
 };
 pub use release_matrix::{
-    verify_release_matrix, CertificationRequirementAssignment, ControllerFeature,
-    IncompleteReleaseMatrix, MicrocodeFeature, PresentationBoundaryEvidence, ProgramFeature,
-    ReleaseMatrixCoverage, ReleaseMatrixError, ReleaseMatrixManifest, ReleaseMatrixScenario,
-    ReleaseMatrixVerification, ReleasePlatform, RendererFeature, RspRdpMechanismFeature,
-    SaveFeature, VerifiedMatrixScenario, VerifiedReleaseMatrix, INCOMPLETE_RELEASE_MATRIX_SCHEMA,
+    verify_release_matrix, verify_release_matrix_with_private_series,
+    CertificationRequirementAssignment, ControllerFeature, IncompleteReleaseMatrix,
+    MicrocodeFeature, PresentationBoundaryEvidence, ProgramFeature, ReleaseMatrixCoverage,
+    ReleaseMatrixError, ReleaseMatrixManifest, ReleaseMatrixScenario, ReleaseMatrixVerification,
+    ReleasePlatform, RendererFeature, RspRdpMechanismFeature, SaveFeature, VerifiedMatrixScenario,
+    VerifiedReleaseMatrix, VerifiedRomClassAuthority, INCOMPLETE_RELEASE_MATRIX_SCHEMA,
     RELEASE_MATRIX_MAX_SCENARIOS, RELEASE_MATRIX_REPORT_COUNT, RELEASE_MATRIX_SCHEMA,
-    VERIFIED_RELEASE_MATRIX_SCHEMA,
+    VERIFIED_RELEASE_MATRIX_SCHEMA, VERIFIED_ROM_CLASS_AUTHORITY_SCHEMA,
 };
 pub use release_program_build_receipt::{
     materialize_release_program_build_receipt, MaterializedReleaseProgramBuildReceipt,
@@ -65,7 +68,7 @@ pub use release_program_build_receipt::{
 pub use release_run_env::{
     release_run_environment_from_process, release_run_environment_from_process_with_oot_aliases,
     ReleaseRunEnvironment, ReleaseRunEnvironmentError, RELEASE_GATE_CYCLE_ENV, RELEASE_REPORT_ENV,
-    RELEASE_RUN_EVENT_SHA256_ENV,
+    RELEASE_ROM_CLASS_ENV, RELEASE_RUN_EVENT_SHA256_ENV,
 };
 pub use render_evidence::{
     LiveReleaseGateRenderExt, LiveRenderEvidence, RenderCaptureStage, RenderEvidenceError,
@@ -310,15 +313,25 @@ pub enum ReleaseGraphicsApi {
 pub enum ReleaseRendererEvidence {
     Reference {
         execution_policy: ReleaseGraphicsExecutionPolicy,
+        tv_type: ReleaseTvStandard,
     },
     Rt64 {
         execution_policy: ReleaseGraphicsExecutionPolicy,
+        tv_type: ReleaseTvStandard,
         graphics_api: ReleaseGraphicsApi,
         backend_identity: String,
         source_authoritative: bool,
         settings_sha256: String,
         replacement_packs_active: bool,
     },
+}
+
+impl ReleaseRendererEvidence {
+    pub const fn tv_type(&self) -> ReleaseTvStandard {
+        match self {
+            Self::Reference { tv_type, .. } | Self::Rt64 { tv_type, .. } => *tv_type,
+        }
+    }
 }
 
 /// Host environment observed from owners frozen at one committed VI edge.
@@ -1534,6 +1547,7 @@ mod tests {
             boundary,
             "expired-boundary",
             b"input",
+            None,
             release_gate::LiveObservedArtifacts {
                 framebuffer_artifact_bytes: b"framebuffer",
                 framebuffer_payload_bytes: 2,
@@ -1569,6 +1583,7 @@ mod tests {
             boundary,
             "unidentified-native",
             b"input",
+            None,
             release_gate::LiveObservedArtifacts {
                 framebuffer_artifact_bytes: b"framebuffer",
                 framebuffer_payload_bytes: 2,

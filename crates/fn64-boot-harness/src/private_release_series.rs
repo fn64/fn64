@@ -17,8 +17,9 @@ use crate::release_program_build_receipt::{
 use crate::{
     parse_unsupported_journal, verify_release_evidence_series, verify_release_report_journal,
     ArtifactKind, ExecutionDestinationSource, ParsedUnsupportedJournal, ReleaseGateReport,
-    RspRdpObservationKindEvidence, LIVE_MINIMUM_CLOSURE_PATHS, RELEASE_GATE_CYCLE_ENV,
-    RELEASE_REPORT_ENV, RELEASE_RUN_EVENT_SHA256_ENV,
+    ReleaseRomClass, ReleaseRomEvidence, ReleaseTvStandard, RspRdpObservationKindEvidence,
+    LIVE_MINIMUM_CLOSURE_PATHS, RELEASE_GATE_CYCLE_ENV, RELEASE_REPORT_ENV, RELEASE_ROM_CLASS_ENV,
+    RELEASE_RUN_EVENT_SHA256_ENV,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -31,7 +32,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-pub const PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA: &str = "fn64.private-release-run-contract.v2";
+pub const PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA: &str = "fn64.private-release-run-contract.v3";
 pub const PRIVATE_RELEASE_SERIES_RECEIPT_SCHEMA: &str = "fn64.private-release-series-receipt.v1";
 pub const PRIVATE_RELEASE_SERIES_COUNT: usize = 10;
 pub const RELEASE_MICROCODE_TEXT_PATH_ENV: &str = "FN64_RELEASE_MICROCODE_TEXT_PATH";
@@ -46,8 +47,8 @@ pub const REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES: &[u8] =
 pub const REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES: &[u8] =
     b"fn64 synthetic non-game release input v1";
 
-const RELEASE_REPORT_SCHEMA: &str = "fn64.release-gate.v18";
-const CONTRACT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-run-contract-digest.v2\0";
+const RELEASE_REPORT_SCHEMA: &str = "fn64.release-gate.v19";
+const CONTRACT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-run-contract-digest.v3\0";
 const RUN_EVENT_DOMAIN: &[u8] = b"fn64.private-release-run-event.v1\0";
 const RECEIPT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-series-receipt-digest.v1\0";
 const RECEIPT_FILE: &str = "receipt.json";
@@ -100,6 +101,7 @@ pub struct PrivateReleaseRunContract {
     /// its lane inputs and binds it to the child executable image.
     pub program_build_receipt: Option<PrivateFileIdentity>,
     pub purpose: String,
+    pub rom_class: ReleaseRomClass,
     pub report_scenario: String,
     pub guest_cycle: u64,
     pub repeat_count: usize,
@@ -125,6 +127,46 @@ impl VerifiedPrivateReleaseRunContract {
     }
 }
 
+/// One exact retained series whose contract, receipt, runner, reports,
+/// journals, and admitted inputs passed a fresh verification together.
+///
+/// The fields stay private so a deserialized contract or self-hashed receipt
+/// cannot be upgraded into matrix authority without re-reading the retained
+/// files and independently reconstructing the admitted ROM evidence.
+#[derive(Debug)]
+pub struct VerifiedPrivateReleaseSeries {
+    contract: PrivateReleaseRunContract,
+    output_directory: PathBuf,
+    receipt: PrivateReleaseSeriesReceipt,
+    runner_executable: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct RevalidatedPrivateReleaseSeries {
+    pub(crate) contract: PrivateReleaseRunContract,
+    pub(crate) receipt: PrivateReleaseSeriesReceipt,
+}
+
+impl VerifiedPrivateReleaseSeries {
+    /// Re-read the complete retained series immediately before matrix use.
+    /// Returning owned identity snapshots prevents later authority derivation
+    /// from consulting ambient paths independently of this verification.
+    pub(crate) fn revalidate_for_release_matrix(
+        &self,
+    ) -> Result<RevalidatedPrivateReleaseSeries, PrivateReleaseSeriesError> {
+        verify_private_release_series_inner(
+            &self.contract,
+            &self.output_directory,
+            &self.receipt,
+            &self.runner_executable,
+        )?;
+        Ok(RevalidatedPrivateReleaseSeries {
+            contract: self.contract.clone(),
+            receipt: self.receipt.clone(),
+        })
+    }
+}
+
 impl PrivateReleaseRunContract {
     pub fn recompute_contract_sha256(&self) -> Result<String, PrivateReleaseSeriesError> {
         let mut wire = Vec::new();
@@ -140,6 +182,7 @@ impl PrivateReleaseRunContract {
             None => wire.push(0),
         }
         push_bytes(&mut wire, self.purpose.as_bytes());
+        push_bytes(&mut wire, self.rom_class.wire_name().as_bytes());
         push_bytes(&mut wire, self.report_scenario.as_bytes());
         push_u64(&mut wire, self.guest_cycle);
         push_u64(
@@ -229,6 +272,28 @@ impl PrivateReleaseRunContract {
                         self.purpose
                     )));
                 }
+                let expected_provenance = match self.rom_class {
+                    ReleaseRomClass::RetailCartridge => {
+                        "user_owned_retail_cartridge_dump"
+                    }
+                    ReleaseRomClass::PublicHomebrew => {
+                        "publicly_distributed_homebrew_rom"
+                    }
+                    ReleaseRomClass::Unclassified => {
+                        return Err(error(format!(
+                            "private {} contract requires an admitted retail_cartridge or public_homebrew ROM class",
+                            self.purpose
+                        )))
+                    }
+                };
+                if self.input.provenance != expected_provenance {
+                    return Err(error(format!(
+                        "private {} contract ROM provenance {:?} does not match class {}",
+                        self.purpose,
+                        self.input.provenance,
+                        self.rom_class.wire_name()
+                    )));
+                }
             }
             "synthetic_mechanism" => {
                 if self.input.role != "synthetic_input" {
@@ -240,6 +305,11 @@ impl PrivateReleaseRunContract {
                 if self.program_build_receipt.is_some() {
                     return Err(error(
                         "synthetic mechanism contract cannot bind a production program-build receipt",
+                    ));
+                }
+                if self.rom_class != ReleaseRomClass::Unclassified {
+                    return Err(error(
+                        "synthetic mechanism contract ROM class must be unclassified",
                     ));
                 }
             }
@@ -1034,6 +1104,7 @@ pub fn verify_repository_synthetic_private_release_run_contract(
         ))
     })?;
     if contract.purpose != "synthetic_mechanism"
+        || contract.rom_class != ReleaseRomClass::Unclassified
         || contract.report_scenario != REPOSITORY_SYNTHETIC_RELEASE_SCENARIO
         || contract.guest_cycle != REPOSITORY_SYNTHETIC_RELEASE_CYCLE
         || contract.input.role != "synthetic_input"
@@ -1156,6 +1227,7 @@ pub fn run_private_release_series(
         }
         command
             .env("ROM", &contract.input.path)
+            .env(RELEASE_ROM_CLASS_ENV, contract.rom_class.wire_name())
             .env(RELEASE_GATE_CYCLE_ENV, contract.guest_cycle.to_string())
             .env(RELEASE_REPORT_ENV, &report_path)
             .env(RELEASE_RUN_EVENT_SHA256_ENV, &run_event_sha256);
@@ -1245,14 +1317,86 @@ pub fn verify_private_release_series(
     verified_contract: &VerifiedPrivateReleaseRunContract,
     output_directory: impl AsRef<Path>,
     receipt: &PrivateReleaseSeriesReceipt,
+) -> Result<VerifiedPrivateReleaseSeries, PrivateReleaseSeriesError> {
+    let runner_executable = std::env::current_exe()
+        .map_err(|source| error(format!("resolve verifier executable: {source}")))?;
+    verify_private_release_series_with_runner(
+        verified_contract,
+        output_directory,
+        receipt,
+        runner_executable,
+    )
+}
+
+/// Verify a retained series against the exact executable image that ran it.
+///
+/// This explicit runner path is required when verification occurs in a
+/// different binary from `run-private-release-series`. The receipt binds only
+/// the runner digest, so accepting no path here would turn that identity into
+/// an unchecked caller assertion.
+pub fn verify_private_release_series_with_runner(
+    verified_contract: &VerifiedPrivateReleaseRunContract,
+    output_directory: impl AsRef<Path>,
+    receipt: &PrivateReleaseSeriesReceipt,
+    runner_executable: impl AsRef<Path>,
+) -> Result<VerifiedPrivateReleaseSeries, PrivateReleaseSeriesError> {
+    let output_directory = output_directory.as_ref();
+    let runner_executable = runner_executable.as_ref();
+    verify_private_release_series_inner(
+        verified_contract.contract(),
+        output_directory,
+        receipt,
+        runner_executable,
+    )?;
+    Ok(VerifiedPrivateReleaseSeries {
+        contract: verified_contract.contract().clone(),
+        output_directory: output_directory.canonicalize().map_err(|source| {
+            error(format!(
+                "resolve private release output directory {}: {source}",
+                output_directory.display()
+            ))
+        })?,
+        receipt: receipt.clone(),
+        runner_executable: runner_executable.canonicalize().map_err(|source| {
+            error(format!(
+                "resolve private release runner executable {}: {source}",
+                runner_executable.display()
+            ))
+        })?,
+    })
+}
+
+fn verify_private_release_series_inner(
+    contract: &PrivateReleaseRunContract,
+    output_directory: &Path,
+    receipt: &PrivateReleaseSeriesReceipt,
+    runner_executable: &Path,
 ) -> Result<(), PrivateReleaseSeriesError> {
-    let contract = verified_contract.contract();
     contract.verify_integrity()?;
     contract.verify_bound_files()?;
     verify_release_program_build_receipt_binding(contract)?;
     receipt.verify_integrity()?;
-    let output_directory = output_directory.as_ref();
     validate_private_existing_directory(output_directory, "private release output directory")?;
+    let retained_receipt_path = output_directory.join(RECEIPT_FILE);
+    validate_regular_no_symlink_file(&retained_receipt_path, "private release receipt")?;
+    let retained_receipt: PrivateReleaseSeriesReceipt =
+        serde_json::from_slice(&fs::read(&retained_receipt_path).map_err(|source| {
+            error(format!(
+                "read private release receipt {}: {source}",
+                retained_receipt_path.display()
+            ))
+        })?)
+        .map_err(|source| {
+            error(format!(
+                "parse private release receipt {}: {source}",
+                retained_receipt_path.display()
+            ))
+        })?;
+    if &retained_receipt != receipt {
+        return Err(error(
+            "supplied private release receipt differs from the exact receipt retained in its output directory",
+        ));
+    }
     if receipt.contract_sha256 != contract.contract_sha256
         || receipt.report_scenario != contract.report_scenario
         || receipt.input_sha256 != contract.input.sha256
@@ -1264,12 +1408,12 @@ pub fn verify_private_release_series(
             "private release receipt does not match its exact run contract",
         ));
     }
-    let runner_executable = std::env::current_exe()
-        .map_err(|source| error(format!("resolve verifier executable: {source}")))?;
-    let runner_sha256 = sha256_file(&runner_executable, "verifier executable")?.1;
+    validate_regular_no_symlink_file(runner_executable, "private release runner executable")?;
+    validate_native_executable(runner_executable)?;
+    let runner_sha256 = sha256_file(runner_executable, "private release runner executable")?.1;
     if receipt.runner_executable_sha256 != runner_sha256 {
         return Err(error(format!(
-            "private release receipt runner executable SHA {} differs from current verifier {}",
+            "private release receipt runner executable SHA {} differs from supplied runner {}",
             receipt.runner_executable_sha256, runner_sha256
         )));
     }
@@ -1357,13 +1501,13 @@ fn read_and_verify_pair(
     }
     if report.scenario != contract.report_scenario
         || report.digest.guest_cycle != contract.guest_cycle
-        || report.input_sha256 != contract.input.sha256
         || report.execution_destinations.source != contract.expected_execution_source
     {
         return Err(error(format!(
-            "private release child {ordinal} report does not match contract scenario/cycle/input/execution source"
+            "private release child {ordinal} report does not match contract scenario/cycle/execution source"
         )));
     }
+    verify_report_rom_binding(contract, ordinal, &report)?;
     require_exact_artifacts(&report)?;
     let journal = parse_unsupported_journal(&journal_bytes).map_err(|source| {
         error(format!(
@@ -1393,6 +1537,79 @@ fn read_and_verify_pair(
         report_file_sha256,
         journal_file_sha256,
     })
+}
+
+fn verify_report_rom_binding(
+    contract: &PrivateReleaseRunContract,
+    ordinal: u64,
+    report: &ReleaseGateReport,
+) -> Result<(), PrivateReleaseSeriesError> {
+    if report.input_sha256 != contract.input.sha256 {
+        return Err(error(format!(
+            "private release child {ordinal} report input SHA-256 does not match the contract ROM"
+        )));
+    }
+    if contract.purpose == "synthetic_mechanism" {
+        if report.rom.is_some() {
+            return Err(error(format!(
+                "private release child {ordinal} synthetic report fabricated ROM evidence"
+            )));
+        }
+    } else {
+        match &report.rom {
+            Some(rom)
+                if rom.class == contract.rom_class
+                    && rom.byte_len == contract.input.bytes => {
+                let input_bytes = fs::read(&contract.input.path).map_err(|source| {
+                    error(format!(
+                        "private release child {ordinal} reread admitted ROM for header verification: {source}"
+                    ))
+                })?;
+                if u64::try_from(input_bytes.len()).ok() != Some(contract.input.bytes)
+                    || sha256_hex(&input_bytes) != contract.input.sha256
+                {
+                    return Err(error(format!(
+                        "private release child {ordinal} admitted ROM identity drifted before header verification"
+                    )));
+                }
+                let configured_tv_type = match rom.configured_tv_type {
+                    ReleaseTvStandard::Ntsc => fn64_runtime::TvType::Ntsc,
+                    ReleaseTvStandard::Pal => fn64_runtime::TvType::Pal,
+                    ReleaseTvStandard::Mpal => fn64_runtime::TvType::Mpal,
+                };
+                let expected = ReleaseRomEvidence::from_bytes(
+                    &input_bytes,
+                    contract.rom_class,
+                    configured_tv_type,
+                )
+                .map_err(|source| {
+                    error(format!(
+                        "private release child {ordinal} admitted ROM header is invalid: {source}"
+                    ))
+                })?;
+                if rom != &expected {
+                    return Err(error(format!(
+                        "private release child {ordinal} ROM evidence does not match the independently decoded admitted ROM"
+                    )));
+                }
+            }
+            Some(rom) => {
+                return Err(error(format!(
+                    "private release child {ordinal} ROM evidence class/length {:?}/{} does not match contract {}/{}",
+                    rom.class,
+                    rom.byte_len,
+                    contract.rom_class.wire_name(),
+                    contract.input.bytes
+                )))
+            }
+            None => {
+                return Err(error(format!(
+                    "private release child {ordinal} omitted contract-bound ROM evidence"
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn verify_consumed_microcode_pair(
@@ -2245,6 +2462,7 @@ mod tests {
             readiness_report: file_identity(&readiness),
             program_build_receipt: None,
             purpose: "synthetic_mechanism".to_owned(),
+            rom_class: ReleaseRomClass::Unclassified,
             report_scenario: REPOSITORY_SYNTHETIC_RELEASE_SCENARIO.to_owned(),
             guest_cycle: REPOSITORY_SYNTHETIC_RELEASE_CYCLE,
             repeat_count: PRIVATE_RELEASE_SERIES_COUNT,
@@ -2302,7 +2520,7 @@ mod tests {
     #[test]
     fn launches_and_reverifies_ten_fresh_child_processes() {
         let directory = TestDirectory::new();
-        let (contract, _) = fixture_contract(&directory.0);
+        let (contract, non_runner) = fixture_contract(&directory.0);
         let contract = verify_repository_synthetic_private_release_run_contract(contract).unwrap();
         let output = directory.0.join("series");
         let receipt = run_private_release_series(&contract, &output).unwrap();
@@ -2317,10 +2535,41 @@ mod tests {
                 .len(),
             PRIVATE_RELEASE_SERIES_COUNT
         );
-        verify_private_release_series(&contract, &output, &receipt).unwrap();
+        let verified_series = verify_private_release_series(&contract, &output, &receipt).unwrap();
+        verified_series.revalidate_for_release_matrix().unwrap();
         let retained: PrivateReleaseSeriesReceipt =
             serde_json::from_slice(&fs::read(output.join(RECEIPT_FILE)).unwrap()).unwrap();
         assert_eq!(retained, receipt);
+
+        let mut substituted_receipt = receipt.clone();
+        substituted_receipt.runner_executable_sha256 = "aa".repeat(32);
+        substituted_receipt.receipt_sha256 =
+            substituted_receipt.recompute_receipt_sha256().unwrap();
+        assert!(verify_private_release_series_with_runner(
+            &contract,
+            &output,
+            &substituted_receipt,
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("differs from the exact receipt retained"));
+        assert!(verify_private_release_series_with_runner(
+            &contract,
+            &output,
+            &receipt,
+            &non_runner,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("not a native"));
+
+        fs::write(output.join(report_name(1)), b"retained report drift").unwrap();
+        assert!(verified_series
+            .revalidate_for_release_matrix()
+            .unwrap_err()
+            .to_string()
+            .contains("parse report"));
     }
 
     #[test]
@@ -2483,6 +2732,7 @@ mod tests {
             "FN64_PRIVATE_RUN_ID",
             RELEASE_MICROCODE_TEXT_PATH_ENV,
             RELEASE_MICROCODE_DATA_PATH_ENV,
+            RELEASE_ROM_CLASS_ENV,
         ] {
             let mut reserved = contract.clone();
             reserved.child.environment.push(PrivateEnvironmentEntry {
@@ -2506,6 +2756,15 @@ mod tests {
     fn repository_synthetic_authority_and_code_loading_fail_closed() {
         let directory = TestDirectory::new();
         let (contract, _) = fixture_contract(&directory.0);
+
+        let mut relabelled = contract.clone();
+        relabelled.rom_class = ReleaseRomClass::RetailCartridge;
+        relabelled.contract_sha256 = relabelled.recompute_contract_sha256().unwrap();
+        assert!(relabelled
+            .verify_integrity()
+            .unwrap_err()
+            .to_string()
+            .contains("must be unclassified"));
 
         let mut production = contract.clone();
         production.purpose = "full_rom".to_owned();
@@ -2655,7 +2914,7 @@ mod tests {
         };
         let program_receipt_identity = file_identity(&program_receipt_path);
         let manifest = serde_json::json!({
-            "schema": "fn64.private-input-admission.v5",
+            "schema": "fn64.private-input-admission.v6",
             "purpose": "full_rom",
             "intent": {
                 "wire_family": "full_rom_mixed",
@@ -2663,6 +2922,7 @@ mod tests {
                 "recognition": "runtime_must_confirm_backend_known_pair",
                 "extended_gbi_cases": [],
                 "program_evidence_lane": "typed_block_program",
+                "rom_class": "retail_cartridge",
             },
             "release_matrix": {
                 "platform": "macos_arm64",
@@ -2674,7 +2934,7 @@ mod tests {
             "artifacts": {
                 "microcode_text": descriptor(&text, "user_owned_rom_derived"),
                 "microcode_data": descriptor(&data, "user_owned_rom_derived"),
-                "rom": descriptor(&rom, "user_owned_rom"),
+                "rom": descriptor(&rom, "user_owned_retail_cartridge_dump"),
                 "recompiled": descriptor(&recompiled, "user_generated_from_owned_rom"),
             },
             "runner": {
@@ -2801,6 +3061,64 @@ mod tests {
     }
 
     #[test]
+    fn production_report_rom_binding_rejects_class_length_and_input_relabels() {
+        let directory = TestDirectory::new();
+        let (mut contract, _) = fixture_contract(&directory.0);
+        let mut rom_bytes = vec![0u8; 0x40];
+        rom_bytes[..4].copy_from_slice(&[0x80, 0x37, 0x12, 0x40]);
+        rom_bytes[0x3e] = b'E';
+        contract.purpose = "full_rom".to_owned();
+        contract.rom_class = ReleaseRomClass::RetailCartridge;
+        contract.input.role = "rom".to_owned();
+        contract.input.bytes = rom_bytes.len() as u64;
+        contract.input.sha256 = sha256_hex(&rom_bytes);
+        contract.input.provenance = "user_owned_retail_cartridge_dump".to_owned();
+        fs::write(&contract.input.path, &rom_bytes).unwrap();
+
+        let mut report = fixture_report(&rom_bytes, ExecutionDestinationSource::NoProgram);
+        report.rom = Some(
+            crate::ReleaseRomEvidence::from_bytes(
+                &rom_bytes,
+                ReleaseRomClass::RetailCartridge,
+                fn64_runtime::TvType::Ntsc,
+            )
+            .unwrap(),
+        );
+        verify_report_rom_binding(&contract, 1, &report).unwrap();
+
+        let mut relabelled = report.clone();
+        relabelled.rom.as_mut().unwrap().class = ReleaseRomClass::PublicHomebrew;
+        assert!(verify_report_rom_binding(&contract, 2, &relabelled)
+            .unwrap_err()
+            .to_string()
+            .contains("class/length"));
+
+        let mut resized = report.clone();
+        resized.rom.as_mut().unwrap().byte_len += 4;
+        assert!(verify_report_rom_binding(&contract, 3, &resized).is_err());
+
+        let mut forged_header_identity = report.clone();
+        forged_header_identity
+            .rom
+            .as_mut()
+            .unwrap()
+            .canonical_sha256 = "11".repeat(32);
+        assert!(
+            verify_report_rom_binding(&contract, 4, &forged_header_identity)
+                .unwrap_err()
+                .to_string()
+                .contains("independently decoded")
+        );
+
+        let mut other_input = report;
+        other_input.input_sha256 = "00".repeat(32);
+        assert!(verify_report_rom_binding(&contract, 5, &other_input)
+            .unwrap_err()
+            .to_string()
+            .contains("input SHA-256"));
+    }
+
+    #[test]
     fn canonical_wires_bind_order_context_and_receipt_tamper() {
         let directory = TestDirectory::new();
         let (contract, _) = fixture_contract(&directory.0);
@@ -2808,6 +3126,9 @@ mod tests {
         let mut changed = contract.clone();
         changed.child.argv.push("changed".to_owned());
         assert_ne!(changed.recompute_contract_sha256().unwrap(), baseline);
+        let mut relabelled = contract.clone();
+        relabelled.rom_class = ReleaseRomClass::RetailCartridge;
+        assert_ne!(relabelled.recompute_contract_sha256().unwrap(), baseline);
 
         let nonce = [0x5a; 32];
         let first = derive_run_event_sha256(
@@ -2879,6 +3200,7 @@ mod tests {
                 sha256: "12".repeat(32),
             }),
             purpose: "full_rom".to_owned(),
+            rom_class: ReleaseRomClass::RetailCartridge,
             report_scenario: "canonical-wire-fixture".to_owned(),
             guest_cycle: 42,
             repeat_count: 10,
@@ -2887,7 +3209,7 @@ mod tests {
                 path: "/private/game.z64".to_owned(),
                 bytes: 67_108_864,
                 sha256: "22".repeat(32),
-                provenance: "user_owned_rom".to_owned(),
+                provenance: "user_owned_retail_cartridge_dump".to_owned(),
             },
             admitted_artifacts: vec![
                 PrivateArtifactIdentity {
@@ -2939,7 +3261,7 @@ mod tests {
         };
         assert_eq!(
             contract.recompute_contract_sha256().unwrap(),
-            "d4b373cc9292da0025d71ced85f3a5fb647082de5ea4ed08aa9eb2e2278005cf"
+            "e4ca4cf7a3a6beaf88515ffc04d235c74fabf63f8d99cec5f20cb359a13712b3"
         );
     }
 

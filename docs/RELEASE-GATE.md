@@ -21,35 +21,54 @@ zero-unsupported full-ROM claim has been made.
 The digest rejects a wrong-cycle, duplicate, reordered, or omitted channel.
 Each channel has a canonical lowercase SHA-256, and both live construction and
 retained-report verification recompute the artifact root from the
-`fn64.release-gate.v18` schema,
-cycle, exact ordered channel set, byte lengths, and channel hashes. Schema v18
-emits each closure path's
-typed observation count and `report_sha256`, an explicit wire digest over the
-schema, scenario, private input hash, complete fixed-cycle digest, and
-canonical counted closure ledger. It additionally binds the exact entered
-execution-destination sequence, its canonical unique destination set and
-counts, and independent ordered/set SHA-256 values. V18 retains v17's
-ABI-owned ordered RSP/RDP stream: exact 4 KiB IMEM digests, diagnostic family
-recognition from the registered backend's runtime catalog, the original task
-microcode-data address plus exact logical byte length/SHA-256, committed IMEM
-replacements, and DRAM/XBUS DPC command digests. Those fields share the
-`fn64.rsp-rdp-observations.v2` wire; a recognition event binds text, data, and
-family together. Recognition is
-diagnostic/optimization evidence only; release reports still require
-`LleAccuracy`, so a backend label never substitutes HLE execution for the
-ROM's RSP instructions or independently certifies its family. V18 validation
-requires nondecreasing event cycles and global IMEM generations, strictly
-advancing replacement generations, and one consistent text digest per
-generation. It also binds framebuffer source, format,
-dimensions, tight row size, payload size, and either the physical RDRAM address
-or RT64 post-VI backend/settings/workload/present identity, plus the complete
-physical RDRAM observation range and boundary-frozen release environment. For
-RT64, v18 additionally binds the concrete active D3D12, Vulkan, or Metal API;
-the requested `Automatic` setting is never an evidence identity. The exact API
-is observed from the completed capture framebuffer and command-list types,
+`fn64.release-gate.v19` schema, cycle, exact ordered channel set, byte lengths,
+and channel hashes. Schema v19 emits each closure path's typed observation
+count and `report_sha256`, an explicit wire digest over the schema, scenario,
+private input hash, complete fixed-cycle digest, and canonical counted closure
+ledger.
+
+For ROM input, v19 additionally binds the declared class, source z64/n64/v64
+order, byte length, SHA-256 after canonical big-endian normalization, raw
+destination code, decoded NTSC/PAL/M-PAL or region-free class, and the concrete
+TV standard configured in the device and renderer. Construction compares the
+supplied raw bytes and SHA-256 with the identity frozen by the ABI host's PI
+owner. Fixed destination codes must agree with both the committed device
+fabric and the renderer's create-time TV authority; unknown codes and
+mismatches fail loudly. Region-free codes retain the concrete host choice but
+satisfy no fixed TV-region requirement. ROM class is never inferred from
+bytes. A generic declaration remains audit data, not certification authority;
+only the private admission/contract path described below can authorize class
+credit.
+
+The header offsets, destination-code table, and region-free values come from
+the public N64brew **ROM Header** specification (sections “Standard header” and
+“Game Code”). Byte-order normalization follows the same public header facts
+and fn64's existing clean-room `fn64-discover::rom` normalization. The
+retail/homebrew distinction has no header source and therefore remains a
+separate admitted provenance claim.
+
+V19 also binds the exact entered execution-destination sequence, its canonical
+unique destination set and counts, and independent ordered/set SHA-256 values.
+It retains v18's ABI-owned ordered RSP/RDP stream: exact 4 KiB IMEM digests,
+diagnostic family recognition from the registered backend's runtime catalog,
+the original task microcode-data address plus exact logical byte length/SHA-256,
+committed IMEM replacements, and DRAM/XBUS DPC command digests. Those fields
+share the `fn64.rsp-rdp-observations.v2` wire; a recognition event binds text,
+data, and family together. Recognition is diagnostic/optimization evidence
+only; release reports still require `LleAccuracy`, so a backend label never
+substitutes HLE execution for the ROM's RSP instructions or independently
+certifies its family. V19 validation requires nondecreasing event cycles and
+global IMEM generations, strictly advancing replacement generations, and one
+consistent text digest per generation. It also binds framebuffer source,
+format, dimensions, tight row size, payload size, and either the physical
+RDRAM address or RT64 post-VI backend/settings/workload/present identity, plus
+the complete physical RDRAM observation range and boundary-frozen release
+environment. V18 added the concrete active D3D12, Vulkan, or Metal API; the
+requested `Automatic` setting is never an evidence identity. The exact API is
+observed from the completed capture framebuffer and command-list types and
 must agree with any explicit request, the host platform, and the authoritative
-backend identity's post-VI capture API. V17 and earlier reports are rejected rather than
-reinterpreted under this new wire.
+backend identity's post-VI capture API. V18 and earlier reports are rejected
+rather than reinterpreted under the v19 ROM/TV wire.
 The Memory
 artifact byte count must be exactly eight
 MiB. A reference Framebuffer artifact count must equal its RGBA16 payload; a
@@ -61,7 +80,7 @@ truly program-free fixture from an unidentified linked native/C program. V10
 lacks the boundary-frozen platform, four-port, cartridge-save, and renderer
 environment, while v11 omits Controller Pak bank geometry and the active bank
 latch. Cite the report SHA for cross-run evidence; the artifact root
-alone does not bind the scenario's private-input or environment (although v18's
+alone does not bind the scenario's private-input or environment (although v19's
 DeviceState component binds installed-ROM and executable-program identities). The
 report never serializes ROM, framebuffer,
 audio, trace source, or RDRAM bytes. Device and trace encodings have explicit
@@ -69,25 +88,26 @@ big-endian wire formats; Rust `Debug`, host wall time, and the diagnostic
 sequence counter do not enter the root.
 
 The artifact-root wire is itself domain-separated by the release-report
-schema. Moving from v17 to v18 therefore intentionally changes both the
+schema. Moving from v18 to v19 therefore intentionally changes both the
 artifact root and `report_sha256`, even for reports whose five captured
-channels are otherwise unchanged. V18 adds the concrete active graphics API
-to the canonical RT64 environment. The preceding v17 transition replaced the
+channels are otherwise unchanged. V19 adds normalized ROM identity, declared
+class, decoded TV region, and renderer TV authority. V18 added the concrete
+active graphics API to the canonical RT64 environment. The preceding v17 transition replaced the
 v1 RSP/RDP observation wire with `fn64.rsp-rdp-observations.v2`, adding
 task-start microcode-data address, exact length, and digest to each recognition
 event. V16 had already added the ordered stream with text identity; no older
-root can be relabeled as v18 evidence.
+root can be relabeled as v19 evidence.
 
 Consumers call `ReleaseGateReport::verify_integrity()` after deserializing a
 retained JSON artifact. `require_closed()` performs that verification first,
 so a mutated scenario, input hash, digest, observation descriptor, or ledger
 cannot be accepted with a stale report SHA. Verification also rejects a stale
-pre-v18 artifact root and contradictory closure states: unexercised means zero
+pre-v19 artifact root and contradictory closure states: unexercised means zero
 observations and events, zero-unsupported requires a positive count and no
 events, and unsupported requires a positive count covering a nonempty event
 list.
 
-Schema v18 retains `execution.unsupported-event-source` as a twelfth mandatory
+Schema v19 retains `execution.unsupported-event-source` as a twelfth mandatory
 path and the host-owned machine-readable observation geometry introduced by
 v6. Its DeviceState channel retains schema v7's compact guest register projection,
 PI timing-policy identity, pending PI/SI/AI/SP/RCP work and exact scheduled
@@ -120,7 +140,7 @@ native program, identified native archive, and typed Rust. Live release capture
 rejects the unidentified-native class. Native coroutine continuations and
 callable pointers remain excluded. Append-only save and controller-operation
 histories are also excluded from DeviceState v7 because they cannot affect a
-future device result; their typed observations instead enter the canonical v18
+future device result; their typed observations instead enter the canonical v19
 closure ledger and therefore the report SHA. V18 likewise keeps historical
 execution outside DeviceState. Identified native archives retain guest cycle,
 section index, function offset, and link VRAM from the injected first-body-entry
@@ -133,10 +153,10 @@ holes, failed destinations, and host calls do not count. A no-program fixture
 must have an empty stream. Unidentified native programs, typed function lanes
 without a regenerated entry-observation schema marker, cross-lane entries, missing block-runner identity,
 future cycle-stamped entries, and any entry appended after the committed
-boundary fail closed. The v18 RSP/RDP stream is likewise append-only release
+boundary fail closed. The v19 RSP/RDP stream is likewise append-only release
 observation rather than future-affecting DeviceState. Previously retained v7
-through v16 reports remain historical evidence but are not valid inputs to the
-v18 series verifier.
+through v18 reports remain historical evidence but are not valid inputs to the
+v19 series verifier.
 Regenerate each scenario's ten-report series; do not reinterpret or edit old
 reports.
 
@@ -148,7 +168,7 @@ the producer-supplied artifact identity, stable `(link VRAM, symbol)` identity,
 and current guest cycle. Artifact identity alone is insufficient: authoritative
 installation must consume the regenerated artifact's exported
 `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA` marker. The committed-boundary freeze,
-v18 report, private admission, and paired verifier consume that stream as the
+v19 report, private admission, and paired verifier consume that stream as the
 distinct `typed_observed_function` lane. The stale `typed_function` label and
 identity-only installations remain rejected.
 
@@ -239,7 +259,7 @@ retain execution order; an undrained storage-owner history is a loud invariant
 failure rather than a best-effort merge with unknowable order.
 
 The live gate derives those entries from captured bytes and typed trace events;
-its host cannot mark them covered by declaration, and the schema-v18 report
+its host cannot mark them covered by declaration, and the schema-v19 report
 factory is crate-private so external callers cannot bypass the typed live
 capture methods accidentally. `unexercised` means no corresponding
 observation reached the gate. `exercised_zero_unsupported` means the path ran
@@ -270,7 +290,7 @@ typed event is appended and flushed immediately. Journal v3 binds a canonical,
 caller-supplied run-event SHA-256 in that armed header, then writes its
 completion record only after the fixed-cycle report itself is durable and
 binds the exact guest cycle, the report's `report_sha256`, and the same run
-identity. A closed v18 report is release evidence only when paired with that
+identity. A closed v19 report is release evidence only when paired with that
 terminal v3 journal. A
 journal with events but no completion identifies a reached loud trap; an
 armed-only journal identifies an early abort or otherwise unobserved path; and
@@ -358,7 +378,7 @@ their exact-edge freshness is a separate host responsibility.
 An instruction checkpoint reaching `C` never captures a report; a later step
 past `C` fails loudly. A step limit, swap limit, or idle exit before `C` also
 cannot return success without a report. This opaque-boundary rule is
-independent of the schema-v18 wire shape and its geometry-bound encoding.
+independent of the schema-v19 wire shape and its geometry-bound encoding.
 
 The cycle, report, and run-event variables are an inseparable triple. A
 partial, mixed generic/OoT, non-Unicode, relative-report-path, or noncanonical
@@ -384,7 +404,7 @@ buffers:
 - memory bytes are the complete physical eight-MiB RDRAM image, also copied in
   logical byte order.
 
-Schema v18 binds both paths through one typed descriptor. Reference capture can
+Schema v19 binds both paths through one typed descriptor. Reference capture can
 only construct physical-RDRAM RGBA16 evidence, RT64 capture can only construct
 post-VI BGRA8 evidence, and both require a complete logical-byte observation of
 physical eight-MiB RDRAM. The release-matrix verifier derives presentation
@@ -481,7 +501,7 @@ same private child build and first verifies that its SHA-256 equals the build's
 typed-function artifact identity. The concrete commands live in
 `PRIVATE-INPUT-ADMISSION.md`.
 
-Build evidence does not stand in for runtime microcode kickoff identity. Each v18
+Build evidence does not stand in for runtime microcode kickoff identity. Each v19
 production report must contain one single recognized microcode event whose
 text SHA-256, data length, and data SHA-256 equal the admitted
 `microcode_text`/`microcode_data` pair and whose family is present. Split
@@ -491,7 +511,7 @@ cannot populate it. The ABI hashes logical RDRAM data bytes
 at authoritative task start; replacement IMEM generations retain that original
 identity, and a one-way typed lifecycle retires ordinary completion while
 making each public yielded-resume authorization load-consumable exactly once.
-Retained v18 validation requires every task address to name a complete 64-byte
+Retained v19 validation requires every task address to name a complete 64-byte
 header inside physical 8 MiB RDRAM, every nonempty microcode-data and DRAM-DPC
 range to fit there, and every XBUS-DPC range to fit the 4 KiB DMEM bank.
 These mechanisms make a valid contract launchable, but no representative
@@ -522,7 +542,7 @@ cargo run -p fn64-boot-harness --bin verify-release-evidence-series -- \
 ```
 
 The required `--program-lane` value must match the content-free readiness
-report emitted before the run. The checker compares it with every v18
+report emitted before the run. The checker compares it with every v19
 report's `execution_destinations.source`; stale `typed_function` and
 `unidentified_native` are rejected with the exact remediation before any
 report pair is accepted, and a source mismatch says to rerun rather than
@@ -548,7 +568,7 @@ pairs; there is no report-only release verifier.
 It runs a real executor coroutine and message queue, commits timed PI, SI, and
 AI work, admits graphics and audio SP tasks, renders and presents a raw RDP
 fixture through the reference backend, commits the exact scheduled VI edge,
-and captures all five schema-v18 channels plus the ABI-owned RSP/RDP stream.
+and captures all five schema-v19 channels plus the ABI-owned RSP/RDP stream.
 One invocation writes one report and
 one bound v3 journal. The runner must generate a fresh canonical event identity
 before launch and pass it as the third argument:
@@ -574,7 +594,7 @@ contract, then verifies the receipt and all ten retained report/journal pairs.
 On 2026-07-20 this integration test passed ten consecutive parent processes:
 100 fresh children completed the live runtime/device/RSP/RDP/VI/reference-
 render path, with every exact-ten receipt accepted. That retained run is v16
-historical mechanism evidence; the v18-retained same-event microcode-data extension
+historical mechanism evidence; the v19-retained same-event microcode-data extension
 requires a new exact-ten run. Both are synthetic and cannot satisfy a ROM row.
 
 The schema-v7 complete-fabric change passed ten independent processes on
@@ -691,7 +711,7 @@ blockers on each target. Synthetic fixtures are mechanism evidence and cannot
 satisfy a real full-ROM class.
 
 Each of at most 64 scenario declarations binds only a stable diagnostic ID,
-one exact schema-v18 `report_scenario`, private-input SHA-256, report SHA-256,
+one exact schema-v19 `report_scenario`, private-input SHA-256, report SHA-256,
 and a canonical v5 `declaration_sha256` over those identities. The verifier
 first validates every report, then routes it by the report's own `scenario`
 value, which must match exactly one manifest declaration; command-line IDs
@@ -700,11 +720,11 @@ identities, cartridge-save hardware, renderer/presentation mode, and executable
 program lane are derived as scenario coverage from the committed-boundary
 report. The manifest cannot cross-label them. Committed DRAM-DPC, XBUS-DPC,
 and IMEM-replacement mechanisms are likewise derived solely from the validated
-v18 stream. A backend-recognized family remains diagnostic/optimization
+v19 stream. A backend-recognized family remains diagnostic/optimization
 evidence. Public-microcode credit instead requires the reported text digest to
 match the immutable project-owned certified-public-microcode catalog v1; a
 contradictory backend family is rejected. That catalog is currently empty
-pending allowed-source digest provenance, so v14 cannot yet satisfy any of the
+pending allowed-source digest provenance, so matrix v15 cannot yet satisfy any of the
 twelve public-microcode requirements. The current FullParityV1 assignment pass
 can satisfy program/renderer-lane, save, controller, and RSP/RDP mechanism
 requirements. It also credits `macos-metal` or `linux-vulkan` only when a
@@ -722,18 +742,32 @@ applicable; a controller with an accessory projects both
 `standard_controller` and that accessory. RT64 evidence requires the
 authoritative clean fn64 adapter identity, matching post-VI settings identity,
 LLE-accuracy policy, and exact post-VI capture. Every scenario still requires
-exactly ten schema-v18 reports, each paired with its terminal v3 journal and a
+exactly ten schema-v19 reports, each paired with its terminal v3 journal and a
 globally unique run-event identity, while proving all five fixed-cycle
 artifacts, every live-minimum path, and zero reached unsupported events.
 
-Schema v18 still cannot expose ROM class, decoded TV region, exact Windows OS
-version, platform case results, or blocker closure. Valid v18 evidence
+Schema v19 exposes normalized ROM identity, a host-supplied typed ROM class,
+and decoded TV region. A fixed NTSC/PAL/MPAL header earns TV-region coverage
+only after the report has also proved agreement with the boundary-frozen device
+and renderer TV standards; a region-free header earns no regional credit.
+Generic reports retain ROM class as evidence but cannot award ROM-class
+coverage, because only a verified private series can establish that class
+authoritatively. That path accepts an opaque `VerifiedPrivateReleaseSeries`
+created only after jointly revalidating the admitted contract, exact-ten
+receipt, retained reports/journals, independently decoded raw ROM, exact runner
+image, bound files, and program-build receipt. Its semantic report and ordered
+runner-derived event identities must equal the matrix evidence. It retains
+`fn64.verified-rom-class-authority.v1`; duplicate, unused, relabeled, or
+receipt-detached authorities fail closed. The retained authority digest is
+local integrity evidence, not a signature or transferable process attestation.
+Schema v19 still cannot expose exact Windows OS
+version, platform case results, or blocker closure. Valid v19 evidence
 therefore returns a typed `Incomplete` assessment listing the exact
 unsatisfied project-owned requirements; it never emits a smaller passing
 denominator. Allowed-source identities in a successor certified-public-
-microcode catalog, typed ROM/region and Windows-version evidence, and external
-platform/blocker results are required before a `Complete` v14 retained matrix
-is reachable.
+microcode catalog, Windows-version evidence, external platform/blocker results,
+and representative verified-series ROM-class assignments are required before a
+`Complete` v15 retained matrix is reachable.
 
 A minimal two-scenario shape is:
 
@@ -788,6 +822,8 @@ The report's validated `scenario` field performs the assignment:
 
 ```text
 cargo run -p fn64-boot-harness --bin verify-release-matrix -- \
+  --private-series /private/path/game-a-contract.json /private/path/game-a-series /private/path/game-a-series/receipt.json /private/path/run-private-release-series \
+  --private-series /private/path/game-b-contract.json /private/path/game-b-series /private/path/game-b-series/receipt.json /private/path/run-private-release-series \
   /private/path/matrix.json \
   /private/path/game-a-01.json,/private/path/game-a-01.unsupported.jsonl \
   ... \
@@ -797,24 +833,34 @@ cargo run -p fn64-boot-harness --bin verify-release-matrix -- \
   /private/path/game-b-10.json,/private/path/game-b-10.unsupported.jsonl
 ```
 
+Use one repeatable `--private-series CONTRACT OUTPUT RECEIPT RUNNER` tuple for
+every production scenario that should earn ROM-class credit. The exact runner
+file is rehashed because a receipt digest alone cannot prove that identity.
+Each tuple must authorize exactly one declared report scenario; duplicate or
+unused series fail. Bare `--private-contract` is rejected. Omitting all series
+tuples intentionally selects report-only verification and leaves the ROM-class
+dimension empty.
+
 Every report path and journal path must resolve to a distinct file, and the two
-halves of a pair cannot name the same file. Neither the library nor the CLI can
-prove that copied files came from independent executions; retaining one
-immutable pair per invocation remains the runner's responsibility. The verifier
-rejects a run-event identity repeated within or across matrix scenarios, while
-making no stronger claim than provenance about physical process independence.
+halves of a pair cannot name the same file. Private-series verification rechecks
+the receipt's exact output-file hashes and contract/child/nonce-derived event
+identities. It still cannot turn a self-hashed receipt into operating-system
+process attestation; the observed runner invocation is the authority for the
+ten fresh launches. The verifier rejects an event identity repeated within or
+across matrix scenarios.
 
 For a complete result, the default output is a human summary. Until all 162
 profile requirements are proved, `--json` emits a tagged `incomplete` result
-whose nested `fn64.release-matrix-incomplete.v3` assessment binds the manifest
+whose nested `fn64.release-matrix-incomplete.v4` assessment binds the manifest
 and profile identities, verified counts, evidence-derived satisfied
 assignments, the canonical missing requirement list, and its own SHA-256; the
 command then exits nonzero. It is diagnostic evidence, not a verified release
 artifact.
 
 Only a complete profile emits a retained, machine-readable
-`fn64.verified-release-matrix.v14` result. It contains the canonical manifest
-and profile identities, every scenario's derived coverage and exact
+`fn64.verified-release-matrix.v15` result. It contains the canonical manifest
+and profile identities, every scenario's derived coverage, normalized ROM
+evidence, optional verified-series ROM-class authority, and exact
 input/report/declaration identity, the five fixed-cycle artifact
 digests and byte lengths, the exact guest cycle, the canonical closure ledger
 and its redundant path count, exact
@@ -825,10 +871,10 @@ journal schema and binding count, the exact ordered run-event SHA-256 list, the 
 observation geometry (including RT64's nonzero completed workload and present
 IDs), and whether its source proves a committed-VI physical framebuffer or
 RT64's exact post-VI capture. A top-level verification SHA binds
-that complete result; no ROM, framebuffer, audio, RDRAM, or recompiled bytes are
-serialized.
+that complete result; no ROM bytes, framebuffer, audio, RDRAM, or recompiled
+bytes are serialized.
 
-`--verify-json` accepts only that complete v14 artifact and does not treat its
+`--verify-json` accepts only that complete v15 artifact and does not treat its
 self-digest as sufficient by itself. It
 revalidates the retained semantic envelope: one to 64 scenarios and valid,
 unique scenario/report identities,
@@ -840,8 +886,12 @@ rejects operation paths outside the frozen environment (including PFS without
 a Controller Pak), re-derives scenario coverage from the retained report,
 enforces renderer combinations and exact program-lane agreement, proves that
 every member of the immutable profile has a validated evidence assignment,
-recomputes every declaration SHA, reconstructs each retained v18 report and
-its report SHA, and reconstructs the canonical manifest SHA.
+recomputes every declaration SHA, reconstructs each retained v19 report and
+its report SHA, reconstructs the canonical manifest SHA, and re-derives any
+ROM-class assignment only from its retained authority record. This standalone
+check proves the artifact's canonical semantic integrity; without a signature
+or external attestation root it does not prove who originally held the opaque
+private capability.
 A freshly re-digested empty, zero-path, relabeled, under-covered, cross-labeled,
 or manifest-mismatched document is therefore rejected without the original
 manifest. Historical retained JSON through v10 omits some part of the current
@@ -852,14 +902,20 @@ stream, same-event microcode data identity, and derived assignments. V13 lacks
 the concrete active RT64 graphics API and its platform/API assignments. Every
 historical version through v13 is
 intentionally rejected; regenerate it from a v5 manifest and bound
-report/journal pairs rather than relabeling it as v14.
+report/journal pairs rather than relabeling it as v15. V14 lacks schema-v19 ROM
+identity, decoded TV-region coverage, renderer TV-standard binding, and the
+separately retained verified-series ROM-class authority, so it is intentionally
+rejected.
 
 Keep populated results private when their scenario names or hashes disclose
 game identity:
 
 ```text
 cargo run -p fn64-boot-harness --bin verify-release-matrix -- \
-  --json /private/path/matrix.json \
+  --json \
+  --private-series /private/path/game-a-contract.json /private/path/game-a-series /private/path/game-a-series/receipt.json /private/path/run-private-release-series \
+  --private-series /private/path/game-b-contract.json /private/path/game-b-series /private/path/game-b-series/receipt.json /private/path/run-private-release-series \
+  /private/path/matrix.json \
   /private/path/game-a-01.json,/private/path/game-a-01.unsupported.jsonl \
   ... \
   > /private/tmp/verified-matrix.json
@@ -876,10 +932,10 @@ certified release matrix**. The exact state is:
 | ROM/report class | Mechanism available | Certified evidence retained |
 | --- | --- | --- |
 | Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, a trusted exact-ten fresh-process runner and receipt, real executor/device/RSP/RDP/VI/reference-render boundaries, derived matrix coverage, and the canonical incomplete assessment are available. | Mechanism evidence only; synthetic bytes are not a ROM certification, and an incomplete assessment is not a retained verified matrix. |
-| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, a create-new receipt/source-wire producer, runner-staged exact microcode-pair admission, and same-event kickoff check exist. The v18 report and private policy admit the observed function stream; the host uses the schema-enabled boot API and a path-independent generated-source identity. | Regenerate the stale cached private generated crate so it exports the marker, then produce a ten-run `typed_observed_function` v18 series (or generate and select the real block pack). |
-| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, resolved graphics-API evidence, explicit `BlockProgram` host selection, an artifact/schema-bound whole-function entry stream, create-new receipt tooling, and runner-staged exact microcode-pair admission exist. The host consumes the schema marker and registers the same pair with RT64; earlier local private groups are pre-v18 historical evidence only. | Regenerate the private crate or generate the block pack, then run v18 with the ROM's successful banked 32-KiB SRAM operation path. |
+| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, a create-new receipt/source-wire producer, runner-staged exact ROM/microcode-pair admission, and same-event kickoff check exist. The v19 report and private policy admit the observed function stream and bind normalized ROM identity, class, and decoded TV region; the host uses the schema-enabled boot API and a path-independent generated-source identity. | Regenerate the stale cached private generated crate so it exports the marker, then produce a ten-run `typed_observed_function` v19 series (or generate and select the real block pack). |
+| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, resolved graphics-API and TV-standard evidence, explicit `BlockProgram` host selection, an artifact/schema-bound whole-function entry stream, create-new receipt tooling, and runner-staged exact ROM/microcode-pair admission exist. The host consumes the schema marker and registers the same pair with RT64; earlier local private groups are pre-v19 historical evidence only. | Regenerate the private crate or generate the block pack, then run v19 with the ROM's successful banked 32-KiB SRAM operation path. |
 | OoT NTSC 1.0, legacy C lane | Observation tooling and exact linked-archive identity wiring exist. | Non-authoritative: measured framebuffer parity is only claimed through swap 60, and the C oracle's missing bodies prevent deeper arbitration beyond the known swap-231 frontier. |
-| Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v18-visible save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, program-lane, committed RSP/RDP-mechanism, and authoritative macOS/Metal or Linux/Vulkan assignments while retaining the remaining project-owned profile entries as missing. Backend microcode labels are diagnostic only; independent public-microcode adjudication uses the empty project-owned catalog v1. | No public-microcode requirement can be credited until allowed-source identities populate a successor catalog; no private full-ROM v18 report series, typed ROM/region or Windows-version evidence, or complete platform result set has been supplied. |
+| Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v19-visible fixed TV region, save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, program-lane, committed RSP/RDP-mechanism, and authoritative macOS/Metal or Linux/Vulkan assignments while retaining the remaining project-owned profile entries as missing. Backend microcode labels are diagnostic only; independent public-microcode adjudication uses the empty project-owned catalog v1. Generic report verification deliberately cannot turn the retained ROM-class label into profile credit; the separate private-series path revalidates its contract, receipt, exact output files, raw ROM, and runner before retaining `fn64.verified-rom-class-authority.v1`. | No public-microcode requirement can be credited until allowed-source identities populate a successor catalog; no private full-ROM v19 report series carrying that verified ROM-class authority, Windows-version evidence, or complete platform result set has been supplied. |
 
 Therefore the generic report mechanism can validate multi-ROM
 zero-reached-unsupported evidence and retain its satisfied/missing profile
@@ -895,13 +951,13 @@ identity blockers are closed by the typed receipt plus the same-event
 microcode text/data check. Trusted evidence that the child was compiled or
 linked from those inputs remains open; the receipt alone is not build
 attestation. The remaining evidence frontier is to retain representative
-private exact-ten v18 series and satisfy
-the matrix's still-missing typed ROM/region, public-microcode-catalog,
-Windows-version, platform-case, and blocker-result classes.
+private exact-ten v19 series through the verified-series matrix path and satisfy
+the still-missing public-microcode-catalog, Windows-version, platform-case, and
+blocker-result classes.
 
 ## Remaining release frontier
 
-- Schema v18 aggregates the modeled device fabric, executor control,
+- Schema v19 aggregates the modeled device fabric, executor control,
   ABI HostState, typed-Rust program identity, and exact native/C linked-archive
   identity plus actual platform, four-port controller/accessory placement,
   typed cartridge-save configuration, and renderer identity/active API/policy at the
@@ -910,7 +966,7 @@ Windows-version, platform-case, and blocker-result classes.
   canonical or portable, and archive identity does not prove callable-body
   completeness. Exact ordered native/typed-function/block execution
   destinations and the ordered RSP/RDP observation stream are bound, but equal
-  v18 digests do not claim excluded
+  v19 digests do not claim excluded
   continuation state is equal.
 - Extend the typed unsupported-site registry whenever a new runtime, ABI, or
   renderer boundary is added; preserve failed-run journals with reports.

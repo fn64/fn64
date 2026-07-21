@@ -473,9 +473,10 @@ the display-list caller that performs logical-rate lookup. Teardown drains the
 RT64 workers and removes the per-context entry before RT64 destroys its state;
 the registry mutex isolates simultaneous contexts without a process-global
 region. This is workload-rate behavior; it does not claim physical compositor
-cadence or analog PAL output. Full-ROM release evidence must still bind its
-decoded TV authority to the renderer configuration rather than infer that
-agreement from this synthetic gate.
+cadence or analog PAL output. Report schema v19 now binds normalized ROM TV
+region, committed device TV state, and this renderer's retained create-time TV
+configuration. Representative private PAL/MPAL exact-ten evidence remains to
+be retained.
 
 The wrapper CMake build also applies an exact-source-checked Metal ownership fix
 to plume: several convenience-factory results (the command buffer, persistent

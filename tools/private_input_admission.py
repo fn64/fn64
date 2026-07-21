@@ -18,11 +18,11 @@ import tempfile
 from pathlib import Path
 
 
-MANIFEST_SCHEMA = "fn64.private-input-admission.v5"
-READINESS_SCHEMA = "fn64.private-input-readiness.v4"
-PRIVATE_RUN_CONTRACT_SCHEMA = "fn64.private-release-run-contract.v2"
+MANIFEST_SCHEMA = "fn64.private-input-admission.v6"
+READINESS_SCHEMA = "fn64.private-input-readiness.v5"
+PRIVATE_RUN_CONTRACT_SCHEMA = "fn64.private-release-run-contract.v3"
 PRIVATE_RUN_CONTRACT_DIGEST_DOMAIN = (
-    b"fn64.private-release-run-contract-digest.v2\0"
+    b"fn64.private-release-run-contract-digest.v3\0"
 )
 PROGRAM_BUILD_RECEIPT_SCHEMA = "fn64.release-program-build-receipt.v1"
 PROGRAM_BUILD_RECEIPT_DIGEST_DOMAIN = (
@@ -57,10 +57,15 @@ RENDERERS = {
     "reference_lle_accuracy", "rt64_lle_accuracy", "rt64_post_vi_capture",
     "rt64_replacement_packs",
 }
+ROM_CLASSES = {"retail_cartridge", "public_homebrew"}
+ROM_PROVENANCE_BY_CLASS = {
+    "retail_cartridge": "user_owned_retail_cartridge_dump",
+    "public_homebrew": "publicly_distributed_homebrew_rom",
+}
 ROLE_PROVENANCE = {
     "microcode_text": {"user_owned_rom_derived"},
     "microcode_data": {"user_owned_rom_derived"},
-    "rom": {"user_owned_rom"},
+    "rom": set(ROM_PROVENANCE_BY_CLASS.values()),
     "recompiled": {"user_generated_from_owned_rom"},
 }
 ROOT_FIELDS = {
@@ -72,7 +77,7 @@ PROGRAM_EVIDENCE_LANES = {
 }
 INTENT_FIELDS = {
     "wire_family", "report_scenario", "recognition", "extended_gbi_cases",
-    "program_evidence_lane",
+    "program_evidence_lane", "rom_class",
 }
 RELEASE_FIELDS = {"platform", "controllers", "save", "renderers", "repeat_bar"}
 ARTIFACT_FIELDS = {"microcode_text", "microcode_data", "rom", "recompiled"}
@@ -88,7 +93,7 @@ CONTRACT_INPUT_DESCRIPTOR_FIELDS = {
 }
 CONTRACT_FIELDS = {
     "schema", "admission_manifest", "readiness_report", "purpose",
-    "program_build_receipt", "report_scenario", "guest_cycle", "repeat_count", "input",
+    "program_build_receipt", "rom_class", "report_scenario", "guest_cycle", "repeat_count", "input",
     "admitted_artifacts", "expected_execution_source", "child",
     "contract_sha256",
 }
@@ -122,6 +127,7 @@ RESERVED_RUNNER_ENV = {
     "FN64_PRIVATE_RUN_CONTRACT_SHA256",
     "FN64_PRIVATE_RUN_ORDINAL",
     "FN64_PRIVATE_RUN_ID",
+    "FN64_RELEASE_ROM_CLASS",
 }
 FORBIDDEN_RUNNER_ENV_PREFIXES = (
     "LD_",
@@ -172,7 +178,7 @@ READINESS_FIELDS = {
     "artifact_roles_admitted", "extended_gbi_fixture", "full_rom_inputs",
     "release_matrix_policy", "repeat_bar", "required_extended_cases",
     "platform", "controllers", "save", "renderers", "program_evidence_lane",
-    "program_build_receipt",
+    "program_build_receipt", "rom_class",
 }
 PROGRAM_BUILD_RECEIPT_FIELDS = {
     "schema", "child_executable", "lane", "expected_execution_source",
@@ -770,6 +776,7 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
         "intent.recognition must preserve the exact backend text/data-pair gate",
     )
     program_lane = nonempty(intent["program_evidence_lane"], "intent.program_evidence_lane")
+    rom_class = nonempty(intent["rom_class"], "intent.rom_class")
     if program_lane == "typed_function":
         raise AdmissionError(
             "intent.program_evidence_lane='typed_function' is not release-admissible: "
@@ -828,6 +835,15 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
     if purpose in {"full_rom", "combined"}:
         require({"rom", "recompiled"} <= set(admitted), f"{purpose} admission requires ROM and recompiled artifacts")
         require(
+            rom_class in ROM_CLASSES,
+            f"{purpose} admission requires intent.rom_class to be one of {sorted(ROM_CLASSES)}",
+        )
+        expected_provenance = ROM_PROVENANCE_BY_CLASS[rom_class]
+        require(
+            artifacts["rom"]["provenance"] == expected_provenance,
+            f"artifacts.rom.provenance must be {expected_provenance!r} for ROM class {rom_class!r}",
+        )
+        require(
             program_lane in {
                 "identified_native_archive", "typed_observed_function",
                 "typed_block_program",
@@ -837,6 +853,10 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
             "'typed_block_program'",
         )
     else:
+        require(
+            rom_class == "not_applicable",
+            "extended_gbi-only admission must use intent.rom_class='not_applicable'",
+        )
         require(
             program_lane == "no_program_fixture",
             "extended_gbi-only admission must select 'no_program_fixture'; executable full-ROM "
@@ -855,6 +875,7 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
         "purpose": purpose,
         "wire_family": wire_family,
         "report_scenario": scenario,
+        "rom_class": rom_class,
         "program_evidence_lane": program_lane,
         "artifact_roles_admitted": sorted(admitted),
         "extended_gbi_fixture": "ready_for_runtime_recognition" if purpose in {"extended_gbi", "combined"} else "not_requested",
@@ -880,6 +901,7 @@ def validate_readiness(report: dict) -> None:
     require(report["purpose"] in PURPOSES, "readiness purpose is invalid")
     require(report["wire_family"] in WIRE_FAMILIES, "readiness wire family is invalid")
     scenario = nonempty(report["report_scenario"], "readiness report_scenario")
+    rom_class = nonempty(report["rom_class"], "readiness rom_class")
     require(SCENARIO_RE.fullmatch(scenario) is not None and re.fullmatch(r"[0-9a-f]{64}", scenario) is None, "readiness report_scenario is invalid")
     roles = set(unique_strings(report["artifact_roles_admitted"], "readiness artifact_roles_admitted"))
     program_lane = nonempty(report["program_evidence_lane"], "readiness program_evidence_lane")
@@ -911,6 +933,7 @@ def validate_readiness(report: dict) -> None:
     else:
         require(report["extended_gbi_fixture"] == "not_requested" and not cases, "readiness full-ROM-only report claims Extended GBI")
     if report["purpose"] in {"full_rom", "combined"}:
+        require(rom_class in ROM_CLASSES, "readiness full-ROM ROM class is invalid")
         require(report["full_rom_inputs"] == "ready" and {"rom", "recompiled"} <= roles, "readiness full-ROM inputs are incomplete")
         require(
             report["program_build_receipt"] == "verified",
@@ -924,6 +947,10 @@ def validate_readiness(report: dict) -> None:
             "readiness full-ROM program-evidence lane is not authoritative",
         )
     else:
+        require(
+            rom_class == "not_applicable",
+            "readiness fixture ROM class must be not_applicable",
+        )
         require(
             report["program_build_receipt"] == "not_applicable",
             "readiness fixture cannot claim a program-build receipt",
@@ -1417,6 +1444,11 @@ def private_run_contract_sha256(contract_without_sha256: dict) -> str:
     append_string(wire, contract_without_sha256["purpose"], "contract.purpose")
     append_string(
         wire,
+        contract_without_sha256["rom_class"],
+        "contract.rom_class",
+    )
+    append_string(
+        wire,
         contract_without_sha256["report_scenario"],
         "contract.report_scenario",
     )
@@ -1515,6 +1547,7 @@ def build_private_run_contract(
         ),
         "program_build_receipt": contract_descriptor(program_receipt_path),
         "purpose": manifest["purpose"],
+        "rom_class": manifest["intent"]["rom_class"],
         "report_scenario": manifest["intent"]["report_scenario"],
         "guest_cycle": runner["release_gate_cycle"],
         "repeat_count": 10,
@@ -1622,9 +1655,19 @@ def validate_private_run_contract(
     )
     require(
         manifest["purpose"] == contract["purpose"]
+        and manifest["intent"]["rom_class"] == contract["rom_class"]
         and manifest["intent"]["report_scenario"] == scenario
         and manifest["runner"]["release_gate_cycle"] == guest_cycle,
         "contract policy fields do not match the validated manifest",
+    )
+    require(
+        contract["rom_class"] in ROM_CLASSES,
+        "private run contract ROM class is invalid",
+    )
+    require(
+        contract["input"]["provenance"]
+        == ROM_PROVENANCE_BY_CLASS[contract["rom_class"]],
+        "private run contract ROM provenance does not match its class",
     )
     lane = manifest["intent"]["program_evidence_lane"]
     expected_source = contract["expected_execution_source"]
@@ -1768,6 +1811,7 @@ def synthetic_manifest(directory: Path) -> tuple[Path, dict]:
             "recognition": "runtime_must_confirm_backend_known_pair",
             "extended_gbi_cases": sorted(EXTENDED_CASES),
             "program_evidence_lane": "no_program_fixture",
+            "rom_class": "not_applicable",
         },
         "release_matrix": {
             "platform": "macos_arm64",
@@ -1853,12 +1897,14 @@ def selftest(root: Path) -> None:
             "sha256": "12" * 32,
         },
         "purpose": "full_rom",
+        "rom_class": "retail_cartridge",
         "report_scenario": "canonical-wire-fixture",
         "guest_cycle": 42,
         "repeat_count": 10,
         "input": {
             "role": "rom", "path": "/private/game.z64", "bytes": 67_108_864,
-            "sha256": "22" * 32, "provenance": "user_owned_rom",
+            "sha256": "22" * 32,
+            "provenance": "user_owned_retail_cartridge_dump",
         },
         "admitted_artifacts": [
             {
@@ -1894,10 +1940,12 @@ def selftest(root: Path) -> None:
             ],
         },
     }
+    canonical_contract_sha256 = private_run_contract_sha256(canonical_fixture)
     require(
-        private_run_contract_sha256(canonical_fixture)
-        == "d4b373cc9292da0025d71ced85f3a5fb647082de5ea4ed08aa9eb2e2278005cf",
-        "selftest: private run-contract canonical wire drifted",
+        canonical_contract_sha256
+        == "e4ca4cf7a3a6beaf88515ffc04d235c74fabf63f8d99cec5f20cb359a13712b3",
+        "selftest: private run-contract canonical wire drifted: "
+        f"{canonical_contract_sha256}",
     )
 
     base = Path("/private/tmp") if Path("/private/tmp").is_dir() else Path(tempfile.gettempdir()).resolve()
@@ -1964,6 +2012,7 @@ def selftest(root: Path) -> None:
         full_rom["intent"]["wire_family"] = "full_rom_mixed"
         full_rom["intent"]["extended_gbi_cases"] = []
         full_rom["intent"]["program_evidence_lane"] = "typed_block_program"
+        full_rom["intent"]["rom_class"] = "retail_cartridge"
         recompiled_sha256 = sha256_file(recompiled)
         full_rom["runner"]["execution_source"] = {
             "kind": "typed_block_program",
@@ -1971,7 +2020,9 @@ def selftest(root: Path) -> None:
             "dispatch_artifact_sha256": recompiled_sha256,
         }
         full_rom["release_matrix"]["renderers"] = ["reference_lle_accuracy"]
-        full_rom["artifacts"]["rom"] = descriptor(rom, "user_owned_rom")
+        full_rom["artifacts"]["rom"] = descriptor(
+            rom, "user_owned_retail_cartridge_dump"
+        )
         full_rom["artifacts"]["recompiled"] = descriptor(
             recompiled, "user_generated_from_owned_rom"
         )
@@ -2017,6 +2068,28 @@ def selftest(root: Path) -> None:
         )
         full_readiness, _ = validate_manifest(full_rom, manifest_path, root)
         validate_readiness(full_readiness)
+
+        relabelled_homebrew = json.loads(json.dumps(full_rom))
+        relabelled_homebrew["intent"]["rom_class"] = "public_homebrew"
+        expect_rejected(
+            lambda: validate_manifest(relabelled_homebrew, manifest_path, root),
+            "public-homebrew relabel over retail-cartridge provenance",
+        )
+        ambiguous_rom = json.loads(json.dumps(full_rom))
+        ambiguous_rom["artifacts"]["rom"]["provenance"] = "user_owned_rom"
+        expect_rejected(
+            lambda: validate_manifest(ambiguous_rom, manifest_path, root),
+            "ambiguous legacy ROM provenance",
+        )
+        public_homebrew = json.loads(json.dumps(full_rom))
+        public_homebrew["intent"]["rom_class"] = "public_homebrew"
+        public_homebrew["artifacts"]["rom"]["provenance"] = (
+            "publicly_distributed_homebrew_rom"
+        )
+        public_homebrew_readiness, _ = validate_manifest(
+            public_homebrew, manifest_path, root
+        )
+        validate_readiness(public_homebrew_readiness)
 
         observed_function = json.loads(json.dumps(full_rom))
         observed_function["intent"]["program_evidence_lane"] = "typed_observed_function"
@@ -2330,6 +2403,26 @@ def selftest(root: Path) -> None:
                 resign(wrong_contract_source), contract_path, root,
             ),
             "private run contract execution-source drift",
+        )
+
+        wrong_rom_class = json.loads(json.dumps(contract))
+        wrong_rom_class["rom_class"] = "public_homebrew"
+        expect_rejected(
+            lambda: validate_private_run_contract(
+                resign(wrong_rom_class), contract_path, root,
+            ),
+            "private run contract ROM-class drift",
+        )
+
+        wrong_rom_provenance = json.loads(json.dumps(contract))
+        wrong_rom_provenance["input"]["provenance"] = (
+            "publicly_distributed_homebrew_rom"
+        )
+        expect_rejected(
+            lambda: validate_private_run_contract(
+                resign(wrong_rom_provenance), contract_path, root,
+            ),
+            "private run contract ROM provenance/class mismatch",
         )
 
         reordered_artifacts = json.loads(json.dumps(contract))

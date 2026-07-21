@@ -205,11 +205,13 @@ Corollaries, each earned the hard way:
 #### Private release execution is a typed authority boundary
 
 Private admission and private execution are deliberately separate. Admission
-schema `fn64.private-input-admission.v5` validates local ownership/provenance
+schema `fn64.private-input-admission.v6` validates local ownership/provenance
 policy and content-addresses the
 ROM, recompiled output, microcode pair, native host entry image, typed
 program-build receipt, arguments, environment, fixed cycle, and expected
-execution source. The emitted `fn64.private-release-run-contract.v2` is an
+execution source. It also binds a retail-cartridge or public-homebrew class to
+class-specific ROM provenance; the header cannot prove that class. The emitted
+`fn64.private-release-run-contract.v3` is an
 integrity wire, not a signature:
 any caller can recompute a self-hash. Production runner APIs therefore accept
 only an opaque `VerifiedPrivateReleaseRunContract`. Its loader requires the
@@ -264,7 +266,7 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain one single recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Report schema
-`fn64.release-gate.v18` and the
+`fn64.release-gate.v19` and the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
 
 This mechanism makes a correctly formed production contract launchable; it is
@@ -274,6 +276,17 @@ demonstrates direct-process orchestration and mechanism determinism during the
 observed test invocation only. Its self-hashed receipt is retained integrity
 evidence, not a transferable process attestation, and the synthetic result
 cannot be promoted into private-ROM evidence.
+
+Representative matrix verification preserves the same capability boundary.
+Report-only matrix v5 verification never awards a ROM-class requirement from
+the report's host-supplied label. Its private-series path accepts only an
+opaque capability produced by jointly revalidating the policy-admitted v3
+contract, exact-ten receipt, retained reports/journals, raw ROM, runner image,
+and bound inputs. It exact-matches the v19 semantic report and ordered run-event
+identities, and retains a canonical `fn64.verified-rom-class-authority.v1`
+inside verified-matrix v15. The retained
+self-hash proves canonical integrity, not signer identity or transferable
+process provenance.
 
 #### Instruction-exact savestate transplant is NOT REPRESENTABLE here (negative result, 2026-07-14)
 
@@ -409,7 +422,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v18 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v19 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -418,7 +431,7 @@ image and asks the registered backend only for exact catalog recognition; the
 backend cannot supply the digest or choose execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v18` binds it independently.
+clears it and report schema `fn64.release-gate.v19` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.

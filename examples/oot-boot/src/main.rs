@@ -315,7 +315,23 @@ fn main() {
     let rom_bytes = std::fs::read(&rom_path)
         .unwrap_or_else(|e| panic!("oot-boot: failed to read ROM {}: {e}", rom_path.display()));
     println!("[oot-boot] ROM size: {} bytes", rom_bytes.len());
-    let tv_type = fn64_boot_harness::TvType::Ntsc;
+    let release_environment =
+        fn64_boot_harness::release_run_environment_from_process_with_oot_aliases()
+            .unwrap_or_else(|error| panic!("oot-boot: {error}"));
+    let tv_type = match fn64_boot_harness::ReleaseRomEvidence::decode_tv_type(&rom_bytes)
+        .unwrap_or_else(|error| panic!("oot-boot: decode ROM television standard: {error}"))
+    {
+        Some(tv_type) => tv_type,
+        None if release_environment.is_none() => {
+            println!(
+                "[oot-boot] region-free ROM has no fixed television standard; non-release boot uses explicit NTSC"
+            );
+            fn64_boot_harness::TvType::Ntsc
+        }
+        None => panic!(
+            "oot-boot: release ROM is region-free and this host has no separate typed television-standard authority"
+        ),
+    };
     let mut rdram = fn64_boot_harness::new_rdram(tv_type);
     fn64_boot_harness::seed_ipl3_image(&mut rdram, &rom_bytes);
     fn64_abi::load_rom(rom_bytes.clone());
@@ -412,8 +428,8 @@ fn main() {
     let _ = stand_in_audio_ucode; // kept for reference; real ucode wired below
 
     // Typed IPL video standard is the shared VI/AI clock authority. The first
-    // field uses nominal NTSC timing; the latched OSViMode H/V registers then
-    // refine it from the public VI clock.
+    // field uses that standard's nominal field rate; the latched OSViMode H/V
+    // registers then refine it from the corresponding public VI clock.
     fn64_abi::configure_tv_type(tv_type);
 
     // Opt-in crash-safe incremental trace flushing BEFORE booting thread 0 --
@@ -425,9 +441,6 @@ fn main() {
     // incremental sink already has every event that copy will contain).
     const TRACE_PATH: &str = "/tmp/oot-boot-trace.jsonl";
     let trace_file_enabled = std::env::var_os("OOT_TRACE").is_some();
-    let release_environment =
-        fn64_boot_harness::release_run_environment_from_process_with_oot_aliases()
-            .unwrap_or_else(|error| panic!("oot-boot: {error}"));
     let release_gate_raw = release_environment
         .as_ref()
         .map(|environment| environment.guest_cycle.to_string());
@@ -478,7 +491,7 @@ fn main() {
             environment.report_path.display(),
             journal_path.display()
         );
-        (gate, environment.report_path)
+        (gate, environment.report_path, environment.rom_class)
     });
     if trace_file_enabled {
         if let Err(e) = fn64_abi::set_trace_sink_file(TRACE_PATH) {
@@ -865,7 +878,7 @@ fn main() {
             let tick = fn64_boot_harness::select_release_vi_edge(
                 before_host_advance,
                 next_vi,
-                release_gate.as_ref().map(|(gate, _)| gate.guest_cycle()),
+                release_gate.as_ref().map(|(gate, _, _)| gate.guest_cycle()),
             )
             .unwrap_or_else(|error| panic!("oot-boot: {error}"));
             #[cfg(fn64_recomp_rs)]
@@ -920,18 +933,20 @@ fn main() {
                 }
             }
 
-            let release_due = release_gate.as_ref().is_some_and(|(gate, _)| {
+            let release_due = release_gate.as_ref().is_some_and(|(gate, _, _)| {
                 fn64_boot_harness::PresentationReleaseBoundary::new(gate.guest_cycle())
                     .matches(arrival, tick)
             });
             if release_due {
-                let (gate, report_path) = release_gate
+                let (gate, report_path, rom_class) = release_gate
                     .take()
                     .expect("live release gate disappeared before post-advance capture");
                 let report = capture_release_report(
                     gate,
                     boundary,
                     &report_path,
+                    rom_class,
+                    tv_type,
                     active_renderer,
                     &rom_bytes,
                     &rdram,
@@ -965,7 +980,7 @@ fn main() {
                 fn64_abi::task_counts().1
             );
         }
-        if let Some((gate, _)) = release_gate.as_ref() {
+        if let Some((gate, _, _)) = release_gate.as_ref() {
             let observed_cycle = fn64_abi::sim_time();
             assert!(
                 observed_cycle <= gate.guest_cycle(),
@@ -1302,7 +1317,7 @@ fn main() {
         }
     }
 
-    if let Some((gate, report_path)) = release_gate.as_ref() {
+    if let Some((gate, report_path, _)) = release_gate.as_ref() {
         panic!(
             "oot-boot: stopped before live release gate cycle {}; current cycle={}, report was not written to {}",
             gate.guest_cycle(),
@@ -1455,10 +1470,23 @@ fn find_guest_word(rdram: &[u8], needle: u32) -> Option<usize> {
         })
 }
 
+fn release_scenario_region_token(tv_type: fn64_boot_harness::TvType) -> &'static str {
+    match tv_type {
+        // Keep the established NTSC scenario identity stable for existing
+        // manifests. PAL and MPAL have no equivalent version claim here;
+        // their tokens state only the typed television standard.
+        fn64_boot_harness::TvType::Ntsc => "ntsc-1.0",
+        fn64_boot_harness::TvType::Pal => "pal",
+        fn64_boot_harness::TvType::Mpal => "mpal",
+    }
+}
+
 fn capture_release_report(
     gate: fn64_boot_harness::LiveReleaseGate,
     boundary: fn64_boot_harness::CommittedViBoundary,
     report_path: &std::path::Path,
+    rom_class: fn64_boot_harness::ReleaseRomClass,
+    tv_type: fn64_boot_harness::TvType,
     active_renderer: &str,
     rom_bytes: &[u8],
     rdram: &[u8],
@@ -1470,12 +1498,13 @@ fn capture_release_report(
         fn64_boot_harness::DEFAULT_RDRAM_SIZE,
     ))
     .unwrap_or_else(|error| panic!("oot-boot: validate complete physical RDRAM: {error}"));
+    let region_token = release_scenario_region_token(tv_type);
     #[cfg(fn64_recomp_rs)]
     let release_scenario =
-        format!("oot-ntsc-1.0-headless-rs-{active_renderer}-lle-accuracy-minimum");
+        format!("oot-{region_token}-headless-rs-{active_renderer}-lle-accuracy-minimum");
     #[cfg(not(fn64_recomp_rs))]
     let release_scenario =
-        format!("oot-ntsc-1.0-headless-c-legacy-{active_renderer}-lle-accuracy-observation");
+        format!("oot-{region_token}-headless-c-legacy-{active_renderer}-lle-accuracy-observation");
     if active_renderer == "rt64" {
         use fn64_boot_harness::LiveReleaseGateRenderExt as _;
 
@@ -1512,10 +1541,10 @@ fn capture_release_report(
         .unwrap_or_else(|error| {
             panic!("oot-boot: validate RT64 fixed-cycle presentation: {error}")
         });
-        gate.capture_and_write_render_evidence(
+        gate.capture_and_write_render_rom_evidence(
             boundary,
             release_scenario,
-            rom_bytes,
+            fn64_boot_harness::ReleaseRomInput::new(rom_class, rom_bytes),
             &render,
             &memory,
             report_path,
@@ -1534,10 +1563,10 @@ fn capture_release_report(
             framebuffer,
         )
         .unwrap_or_else(|error| panic!("oot-boot: validate release framebuffer: {error}"));
-        gate.capture_and_write_reference_evidence(
+        gate.capture_and_write_reference_rom_evidence(
             boundary,
             release_scenario,
-            rom_bytes,
+            fn64_boot_harness::ReleaseRomInput::new(rom_class, rom_bytes),
             &framebuffer,
             &memory,
             report_path,
@@ -1790,6 +1819,22 @@ fn write_trace_file(trace: &[fn64_runtime::TraceEvent], path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_scenario_region_tokens_cover_each_tv_standard() {
+        assert_eq!(
+            release_scenario_region_token(fn64_boot_harness::TvType::Ntsc),
+            "ntsc-1.0"
+        );
+        assert_eq!(
+            release_scenario_region_token(fn64_boot_harness::TvType::Pal),
+            "pal"
+        );
+        assert_eq!(
+            release_scenario_region_token(fn64_boot_harness::TvType::Mpal),
+            "mpal"
+        );
+    }
 
     #[test]
     fn interactive_script_contains_verified_menu_route_and_held_motion() {

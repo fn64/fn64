@@ -28,7 +28,373 @@ use crate::{
     ReleaseRendererEvidence,
 };
 
-pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v18";
+pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v19";
+
+/// Provenance class declared for a ROM input. The N64 header does not encode
+/// whether otherwise-valid bytes came from a retail cartridge or a public
+/// homebrew release, so this value is never inferred from ROM contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseRomClass {
+    Unclassified,
+    RetailCartridge,
+    PublicHomebrew,
+}
+
+/// One class declaration paired inseparably with the exact ROM bytes it
+/// describes. Production callers obtain the class from verified admission;
+/// the report builder derives every byte-level identity and header fact.
+#[derive(Clone, Copy, Debug)]
+pub struct ReleaseRomInput<'a> {
+    class: ReleaseRomClass,
+    bytes: &'a [u8],
+}
+
+impl<'a> ReleaseRomInput<'a> {
+    pub const fn new(class: ReleaseRomClass, bytes: &'a [u8]) -> Self {
+        Self { class, bytes }
+    }
+
+    pub const fn class(self) -> ReleaseRomClass {
+        self.class
+    }
+
+    pub const fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+impl ReleaseRomClass {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Unclassified => 0,
+            Self::RetailCartridge => 1,
+            Self::PublicHomebrew => 2,
+        }
+    }
+
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Unclassified => "unclassified",
+            Self::RetailCartridge => "retail_cartridge",
+            Self::PublicHomebrew => "public_homebrew",
+        }
+    }
+
+    pub fn from_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "unclassified" => Some(Self::Unclassified),
+            "retail_cartridge" => Some(Self::RetailCartridge),
+            "public_homebrew" => Some(Self::PublicHomebrew),
+            _ => None,
+        }
+    }
+}
+
+/// Source byte order normalized before hashing and decoding the N64 header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseRomByteOrder {
+    Z64,
+    N64,
+    V64,
+}
+
+impl ReleaseRomByteOrder {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Z64 => 0,
+            Self::N64 => 1,
+            Self::V64 => 2,
+        }
+    }
+}
+
+/// TV compatibility decoded from the normalized ROM destination code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseTvRegion {
+    Ntsc,
+    Pal,
+    Mpal,
+    RegionFree,
+}
+
+/// Concrete TV standard configured in the device fabric and renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseTvStandard {
+    Ntsc,
+    Pal,
+    Mpal,
+}
+
+impl From<fn64_runtime::TvType> for ReleaseTvStandard {
+    fn from(value: fn64_runtime::TvType) -> Self {
+        match value {
+            fn64_runtime::TvType::Ntsc => Self::Ntsc,
+            fn64_runtime::TvType::Pal => Self::Pal,
+            fn64_runtime::TvType::Mpal => Self::Mpal,
+        }
+    }
+}
+
+impl ReleaseTvStandard {
+    pub const fn tv_type(self) -> fn64_runtime::TvType {
+        match self {
+            Self::Ntsc => fn64_runtime::TvType::Ntsc,
+            Self::Pal => fn64_runtime::TvType::Pal,
+            Self::Mpal => fn64_runtime::TvType::Mpal,
+        }
+    }
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Ntsc => 0,
+            Self::Pal => 1,
+            Self::Mpal => 2,
+        }
+    }
+}
+
+impl ReleaseTvRegion {
+    pub const fn tv_type(self) -> Option<fn64_runtime::TvType> {
+        match self {
+            Self::Ntsc => Some(fn64_runtime::TvType::Ntsc),
+            Self::Pal => Some(fn64_runtime::TvType::Pal),
+            Self::Mpal => Some(fn64_runtime::TvType::Mpal),
+            Self::RegionFree => None,
+        }
+    }
+
+    const fn fixed_tv_type(self) -> Option<ReleaseTvStandard> {
+        match self {
+            Self::Ntsc => Some(ReleaseTvStandard::Ntsc),
+            Self::Pal => Some(ReleaseTvStandard::Pal),
+            Self::Mpal => Some(ReleaseTvStandard::Mpal),
+            Self::RegionFree => None,
+        }
+    }
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Ntsc => 0,
+            Self::Pal => 1,
+            Self::Mpal => 2,
+            Self::RegionFree => 3,
+        }
+    }
+}
+
+/// Canonical installed-ROM identity and header-derived TV evidence.
+///
+/// Header offsets and the z64/n64/v64 normalization follow the public
+/// N64brew ROM Header specification. The raw installed identity remains the
+/// report's `input_sha256`; this additional digest makes byte-order-equivalent
+/// inputs share one canonical big-endian identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseRomEvidence {
+    pub class: ReleaseRomClass,
+    pub source_byte_order: ReleaseRomByteOrder,
+    pub byte_len: u64,
+    pub canonical_sha256: String,
+    pub destination_code: u8,
+    pub decoded_tv_region: ReleaseTvRegion,
+    pub configured_tv_type: ReleaseTvStandard,
+}
+
+impl ReleaseRomEvidence {
+    /// Decode the normalized header's fixed TV authority before boot. A
+    /// region-free header returns `None`; callers must choose an explicit host
+    /// standard and the retained report will record it without crediting a
+    /// fixed TV-region requirement.
+    pub fn decode_tv_type(rom_bytes: &[u8]) -> Result<Option<fn64_runtime::TvType>, GateError> {
+        let (_, canonical) = normalize_rom_bytes(rom_bytes)?;
+        Ok(decode_rom_tv_region(canonical[0x3e])?.tv_type())
+    }
+
+    pub fn from_bytes(
+        rom_bytes: &[u8],
+        class: ReleaseRomClass,
+        configured_tv_type: fn64_runtime::TvType,
+    ) -> Result<Self, GateError> {
+        let (source_byte_order, canonical) = normalize_rom_bytes(rom_bytes)?;
+        let destination_code = canonical[0x3e];
+        let decoded_tv_region = decode_rom_tv_region(destination_code)?;
+        let configured_tv_type = ReleaseTvStandard::from(configured_tv_type);
+        if let Some(expected) = decoded_tv_region.fixed_tv_type() {
+            if configured_tv_type != expected {
+                return Err(GateError::RomTvTypeMismatch {
+                    authority: "normalized ROM destination code",
+                    expected,
+                    observed: configured_tv_type,
+                });
+            }
+        }
+        Ok(Self {
+            class,
+            source_byte_order,
+            byte_len: u64::try_from(rom_bytes.len())
+                .map_err(|_| GateError::RomByteLengthOverflow)?,
+            canonical_sha256: sha256_hex(&canonical),
+            destination_code,
+            decoded_tv_region,
+            configured_tv_type,
+        })
+    }
+
+    fn verify_integrity(&self) -> Result<(), GateError> {
+        if self.byte_len < ROM_HEADER_BYTES {
+            return Err(GateError::RomTooSmall {
+                bytes: self.byte_len,
+            });
+        }
+        if !self.byte_len.is_multiple_of(4) {
+            return Err(GateError::RomNotWordAligned {
+                bytes: self.byte_len,
+            });
+        }
+        decode_sha256(&self.canonical_sha256)
+            .ok_or(GateError::InvalidReportSha256("rom.canonical_sha256"))?;
+        let decoded = decode_rom_tv_region(self.destination_code)?;
+        if decoded != self.decoded_tv_region {
+            return Err(GateError::RomRegionDecodeMismatch {
+                destination_code: self.destination_code,
+                stored: self.decoded_tv_region,
+                decoded,
+            });
+        }
+        if let Some(expected) = decoded.fixed_tv_type() {
+            if self.configured_tv_type != expected {
+                return Err(GateError::RomTvTypeMismatch {
+                    authority: "retained ROM destination code",
+                    expected,
+                    observed: self.configured_tv_type,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+const ROM_HEADER_BYTES: u64 = 0x40;
+const MAGIC_Z64: u32 = 0x8037_1240;
+const MAGIC_N64: u32 = 0x4012_3780;
+const MAGIC_V64: u32 = 0x3780_4012;
+
+fn normalize_rom_bytes(input: &[u8]) -> Result<(ReleaseRomByteOrder, Vec<u8>), GateError> {
+    if input.len() < ROM_HEADER_BYTES as usize {
+        return Err(GateError::RomTooSmall {
+            bytes: input.len() as u64,
+        });
+    }
+    if !input.len().is_multiple_of(4) {
+        return Err(GateError::RomNotWordAligned {
+            bytes: input.len() as u64,
+        });
+    }
+    let first_word = u32::from_be_bytes(input[..4].try_into().expect("four-byte ROM magic"));
+    let source = match first_word {
+        MAGIC_Z64 => ReleaseRomByteOrder::Z64,
+        MAGIC_N64 => ReleaseRomByteOrder::N64,
+        MAGIC_V64 => ReleaseRomByteOrder::V64,
+        _ => return Err(GateError::UnknownRomByteOrder { first_word }),
+    };
+    let canonical = match source {
+        ReleaseRomByteOrder::Z64 => input.to_vec(),
+        ReleaseRomByteOrder::N64 => input
+            .chunks_exact(4)
+            .flat_map(|word| [word[3], word[2], word[1], word[0]])
+            .collect(),
+        ReleaseRomByteOrder::V64 => input
+            .chunks_exact(2)
+            .flat_map(|pair| [pair[1], pair[0]])
+            .collect(),
+    };
+    Ok((source, canonical))
+}
+
+fn has_recognized_rom_magic(input: &[u8]) -> bool {
+    input.get(..4).is_some_and(|bytes| {
+        matches!(
+            u32::from_be_bytes(bytes.try_into().expect("four-byte ROM magic")),
+            MAGIC_Z64 | MAGIC_N64 | MAGIC_V64
+        )
+    })
+}
+
+fn validate_installed_rom_identity(
+    host: &fn64_abi::AbiHostEvidenceSnapshot,
+    input_bytes: &[u8],
+) -> Result<(), GateError> {
+    let installed = host
+        .installed_rom
+        .ok_or(GateError::MissingInstalledRomIdentity)?;
+    let supplied_bytes =
+        u64::try_from(input_bytes.len()).map_err(|_| GateError::RomByteLengthOverflow)?;
+    let supplied_sha256: [u8; 32] = Sha256::digest(input_bytes).into();
+    if !host.rom_installed
+        || installed.byte_len != supplied_bytes
+        || installed.sha256 != supplied_sha256
+    {
+        return Err(GateError::InstalledRomIdentityMismatch {
+            installed_bytes: installed.byte_len,
+            supplied_bytes,
+            installed_sha256: hex(&installed.sha256),
+            supplied_sha256: hex(&supplied_sha256),
+        });
+    }
+    Ok(())
+}
+
+fn decode_rom_tv_region(destination_code: u8) -> Result<ReleaseTvRegion, GateError> {
+    // Public N64brew "ROM Header" destination table. Zero is the common
+    // homebrew region-free value; `A` means all destinations.
+    match destination_code {
+        0 | b'A' => Ok(ReleaseTvRegion::RegionFree),
+        b'B' => Ok(ReleaseTvRegion::Mpal),
+        b'C' | b'E' | b'G' | b'J' | b'K' | b'N' => Ok(ReleaseTvRegion::Ntsc),
+        b'D' | b'F' | b'H' | b'I' | b'L' | b'P' | b'S' | b'U' | b'W' | b'X' | b'Y' | b'Z' => {
+            Ok(ReleaseTvRegion::Pal)
+        }
+        _ => Err(GateError::UnknownRomDestinationCode(destination_code)),
+    }
+}
+
+fn validate_rom_environment(
+    rom: &Option<ReleaseRomEvidence>,
+    environment: &ReleaseEnvironmentEvidence,
+) -> Result<(), GateError> {
+    let Some(rom) = rom else {
+        return Ok(());
+    };
+    rom.verify_integrity()?;
+    let renderer_tv_type = environment.renderer.tv_type();
+    if renderer_tv_type != rom.configured_tv_type {
+        return Err(GateError::RomTvTypeMismatch {
+            authority: "retained renderer create-time configuration",
+            expected: rom.configured_tv_type,
+            observed: renderer_tv_type,
+        });
+    }
+    Ok(())
+}
+
+fn validate_rom_input(
+    rom: &Option<ReleaseRomEvidence>,
+    input_bytes: &[u8],
+) -> Result<(), GateError> {
+    let Some(rom) = rom else {
+        return Ok(());
+    };
+    let decoded =
+        ReleaseRomEvidence::from_bytes(input_bytes, rom.class, rom.configured_tv_type.tv_type())?;
+    if &decoded != rom {
+        return Err(GateError::RomInputEvidenceMismatch);
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -454,6 +820,7 @@ impl LiveReleaseGate {
         boundary: crate::CommittedViBoundary,
         scenario: impl Into<String>,
         input_bytes: &[u8],
+        rom_class: Option<ReleaseRomClass>,
         observed: LiveObservedArtifacts<'_>,
         report_path: impl AsRef<Path>,
     ) -> Result<ReleaseGateReport, GateError> {
@@ -481,6 +848,36 @@ impl LiveReleaseGate {
         let execution_destinations =
             capture_execution_destinations(&program, frozen_destinations, self.guest_cycle)?;
         let rsp_rdp = capture_rsp_rdp_evidence(frozen_rsp_rdp)?;
+        let device_tv_type = snapshot
+            .guest
+            .tv_type
+            .ok_or(GateError::MissingDeviceTvType)?;
+        let renderer_tv_type = render
+            .renderer_tv_type()
+            .ok_or(GateError::UnidentifiedRenderBackend)?;
+        if renderer_tv_type != device_tv_type {
+            return Err(GateError::RomTvTypeMismatch {
+                authority: "renderer create-time configuration",
+                expected: device_tv_type.into(),
+                observed: renderer_tv_type.into(),
+            });
+        }
+        validate_installed_rom_identity(&host, input_bytes)?;
+        let rom = if let Some(class) = rom_class {
+            Some(ReleaseRomEvidence::from_bytes(
+                input_bytes,
+                class,
+                device_tv_type,
+            )?)
+        } else if has_recognized_rom_magic(input_bytes) {
+            Some(ReleaseRomEvidence::from_bytes(
+                input_bytes,
+                ReleaseRomClass::Unclassified,
+                device_tv_type,
+            )?)
+        } else {
+            None
+        };
         let observed_cycle = fn64_abi::sim_time();
         if observed_cycle != self.guest_cycle {
             return Err(GateError::WrongLiveCycle {
@@ -552,6 +949,7 @@ impl LiveReleaseGate {
             input_bytes,
             digest.finish()?,
             ReleaseBoundaryReportEvidence {
+                rom,
                 observations: observed.observations,
                 environment,
                 execution_destinations,
@@ -1392,10 +1790,14 @@ fn environment_from_frozen(
         fn64_abi::RenderBackendEvidence::Unidentified => {
             return Err(GateError::UnidentifiedRenderBackend);
         }
-        fn64_abi::RenderBackendEvidence::Reference => {
-            ReleaseRendererEvidence::Reference { execution_policy }
+        fn64_abi::RenderBackendEvidence::Reference { tv_type } => {
+            ReleaseRendererEvidence::Reference {
+                execution_policy,
+                tv_type: tv_type.into(),
+            }
         }
         fn64_abi::RenderBackendEvidence::Rt64 {
+            tv_type,
             backend_identity,
             source_authoritative,
             graphics_api,
@@ -1403,6 +1805,7 @@ fn environment_from_frozen(
             replacement_packs_active,
         } => ReleaseRendererEvidence::Rt64 {
             execution_policy,
+            tv_type: tv_type.into(),
             graphics_api: match graphics_api {
                 fn64_abi::ActiveRenderGraphicsApi::D3d12 => ReleaseGraphicsApi::D3d12,
                 fn64_abi::ActiveRenderGraphicsApi::Vulkan => ReleaseGraphicsApi::Vulkan,
@@ -1464,7 +1867,9 @@ fn validate_environment_evidence(
     environment: &ReleaseEnvironmentEvidence,
 ) -> Result<(), GateError> {
     match &environment.renderer {
-        ReleaseRendererEvidence::Reference { execution_policy }
+        ReleaseRendererEvidence::Reference {
+            execution_policy, ..
+        }
         | ReleaseRendererEvidence::Rt64 {
             execution_policy, ..
         } => {
@@ -1510,6 +1915,7 @@ fn test_release_environment(
     let renderer = match &observations.framebuffer.source {
         FramebufferObservationSource::PhysicalRdram { .. } => ReleaseRendererEvidence::Reference {
             execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+            tv_type: ReleaseTvStandard::Ntsc,
         },
         FramebufferObservationSource::PostViSwapchain {
             backend_identity,
@@ -1517,6 +1923,7 @@ fn test_release_environment(
             ..
         } => ReleaseRendererEvidence::Rt64 {
             execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+            tv_type: ReleaseTvStandard::Ntsc,
             graphics_api: match super::release_host_platform()
                 .expect("test platform is release-supported")
             {
@@ -1580,6 +1987,9 @@ pub struct ReleaseGateReport {
     pub schema: String,
     pub scenario: String,
     pub input_sha256: String,
+    /// Installed-ROM identity and decoded header evidence. Synthetic mechanism
+    /// reports retain `None` and cannot satisfy ROM-class or TV-region rows.
+    pub rom: Option<ReleaseRomEvidence>,
     pub digest: DeterministicDigest,
     /// Machine-verifiable source and geometry for the private framebuffer and
     /// complete physical-RDRAM payloads represented by the artifact digests.
@@ -1601,6 +2011,7 @@ pub struct ReleaseGateReport {
 }
 
 struct ReleaseBoundaryReportEvidence {
+    rom: Option<ReleaseRomEvidence>,
     observations: ReleaseObservationGeometry,
     environment: ReleaseEnvironmentEvidence,
     execution_destinations: ExecutionDestinationEvidence,
@@ -1616,6 +2027,7 @@ impl ReleaseGateReport {
         mut closure: Vec<ClosurePath>,
     ) -> Result<Self, GateError> {
         let ReleaseBoundaryReportEvidence {
+            rom,
             observations,
             environment,
             execution_destinations,
@@ -1625,10 +2037,12 @@ impl ReleaseGateReport {
         if scenario.is_empty() {
             return Err(GateError::EmptyScenario);
         }
+        validate_rom_input(&rom, input_bytes)?;
         observations
             .validate()
             .map_err(GateError::InvalidObservationGeometry)?;
         validate_environment_evidence(&environment)?;
+        validate_rom_environment(&rom, &environment)?;
         validate_environment_observation(&environment, &observations)?;
         execution_destinations.verify_integrity()?;
         validate_execution_destination_cycles(digest.guest_cycle, &execution_destinations)?;
@@ -1649,6 +2063,7 @@ impl ReleaseGateReport {
             schema: REPORT_SCHEMA.to_owned(),
             scenario,
             input_sha256: sha256_hex(input_bytes),
+            rom,
             digest,
             observations,
             environment,
@@ -1676,6 +2091,7 @@ impl ReleaseGateReport {
             input_bytes,
             digest,
             ReleaseBoundaryReportEvidence {
+                rom: None,
                 observations,
                 environment,
                 execution_destinations: ExecutionDestinationEvidence::no_program(),
@@ -1700,6 +2116,7 @@ impl ReleaseGateReport {
             input_bytes,
             digest,
             ReleaseBoundaryReportEvidence {
+                rom: None,
                 observations,
                 environment,
                 execution_destinations: ExecutionDestinationEvidence::no_program(),
@@ -1725,6 +2142,7 @@ impl ReleaseGateReport {
             input_bytes,
             digest,
             ReleaseBoundaryReportEvidence {
+                rom: None,
                 observations,
                 environment,
                 execution_destinations,
@@ -1734,7 +2152,7 @@ impl ReleaseGateReport {
         )
     }
 
-    /// Recompute the schema-v18 evidence digest after loading a retained JSON
+    /// Recompute the schema-v19 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {
@@ -1745,6 +2163,7 @@ impl ReleaseGateReport {
             .validate()
             .map_err(GateError::InvalidObservationGeometry)?;
         validate_environment_evidence(&self.environment)?;
+        validate_rom_environment(&self.rom, &self.environment)?;
         validate_environment_observation(&self.environment, &self.observations)?;
         self.execution_destinations.verify_integrity()?;
         validate_execution_destination_cycles(
@@ -1910,6 +2329,36 @@ pub enum GateError {
         observed: String,
     },
     MissingGraphicsMicrocodeRecognition,
+    RomTooSmall {
+        bytes: u64,
+    },
+    RomNotWordAligned {
+        bytes: u64,
+    },
+    RomByteLengthOverflow,
+    UnknownRomByteOrder {
+        first_word: u32,
+    },
+    UnknownRomDestinationCode(u8),
+    RomRegionDecodeMismatch {
+        destination_code: u8,
+        stored: ReleaseTvRegion,
+        decoded: ReleaseTvRegion,
+    },
+    RomInputEvidenceMismatch,
+    MissingDeviceTvType,
+    MissingInstalledRomIdentity,
+    InstalledRomIdentityMismatch {
+        installed_bytes: u64,
+        supplied_bytes: u64,
+        installed_sha256: String,
+        supplied_sha256: String,
+    },
+    RomTvTypeMismatch {
+        authority: &'static str,
+        expected: ReleaseTvStandard,
+        observed: ReleaseTvStandard,
+    },
     UnidentifiedCartridgeSave,
     UnidentifiedRenderBackend,
     NonAccuracyRenderPolicy,
@@ -2130,6 +2579,62 @@ impl fmt::Display for GateError {
             Self::MissingGraphicsMicrocodeRecognition => write!(
                 f,
                 "exercised graphics-task closure lacks an ABI-owned microcode-recognition observation"
+            ),
+            Self::RomTooSmall { bytes } => write!(
+                f,
+                "release ROM has {bytes} bytes; the normalized N64 header requires at least {ROM_HEADER_BYTES}"
+            ),
+            Self::RomNotWordAligned { bytes } => write!(
+                f,
+                "release ROM has {bytes} bytes; z64/n64/v64 normalization requires a multiple of four"
+            ),
+            Self::RomByteLengthOverflow => {
+                write!(f, "release ROM byte length exceeds the u64 evidence wire")
+            }
+            Self::UnknownRomByteOrder { first_word } => write!(
+                f,
+                "release ROM first word {first_word:#010x} is not z64, n64, or v64 byte order"
+            ),
+            Self::UnknownRomDestinationCode(code) => write!(
+                f,
+                "release ROM destination code {code:#04x} has no admitted NTSC/PAL/M-PAL/region-free decode"
+            ),
+            Self::RomRegionDecodeMismatch {
+                destination_code,
+                stored,
+                decoded,
+            } => write!(
+                f,
+                "release ROM destination code {destination_code:#04x} decodes as {decoded:?}, not retained {stored:?}"
+            ),
+            Self::RomInputEvidenceMismatch => write!(
+                f,
+                "retained ROM identity/header evidence differs from the supplied input bytes"
+            ),
+            Self::MissingDeviceTvType => write!(
+                f,
+                "committed device evidence has no configured TV type for ROM-region certification"
+            ),
+            Self::MissingInstalledRomIdentity => write!(
+                f,
+                "committed ABI host evidence has no installed-ROM identity"
+            ),
+            Self::InstalledRomIdentityMismatch {
+                installed_bytes,
+                supplied_bytes,
+                installed_sha256,
+                supplied_sha256,
+            } => write!(
+                f,
+                "supplied release ROM ({supplied_bytes} bytes, {supplied_sha256}) differs from installed ROM ({installed_bytes} bytes, {installed_sha256})"
+            ),
+            Self::RomTvTypeMismatch {
+                authority,
+                expected,
+                observed,
+            } => write!(
+                f,
+                "{authority} requires TV type {expected:?}, observed {observed:?}"
             ),
             Self::UnidentifiedCartridgeSave => write!(
                 f,
@@ -3804,6 +4309,23 @@ pub(crate) fn encode_report_evidence(report: &ReleaseGateReport) -> Result<Vec<u
         &decode_sha256(&report.input_sha256)
             .ok_or(GateError::InvalidReportSha256("input_sha256"))?,
     );
+    match &report.rom {
+        Some(rom) => {
+            rom.verify_integrity()?;
+            out.push(1);
+            out.push(rom.class.tag());
+            out.push(rom.source_byte_order.tag());
+            push_u64(&mut out, rom.byte_len);
+            out.extend_from_slice(
+                &decode_sha256(&rom.canonical_sha256)
+                    .ok_or(GateError::InvalidReportSha256("rom.canonical_sha256"))?,
+            );
+            out.push(rom.destination_code);
+            out.push(rom.decoded_tv_region.tag());
+            out.push(rom.configured_tv_type.tag());
+        }
+        None => out.push(0),
+    }
     push_u64(&mut out, report.digest.guest_cycle);
     push_u64(&mut out, report.digest.artifacts.len() as u64);
     for artifact in &report.digest.artifacts {
@@ -3869,9 +4391,12 @@ pub(crate) fn encode_report_evidence(report: &ReleaseGateReport) -> Result<Vec<u
         ReleaseCartridgeSave::FlashRam128Kib => 4,
     });
     match &report.environment.renderer {
-        ReleaseRendererEvidence::Reference { execution_policy } => {
+        ReleaseRendererEvidence::Reference {
+            execution_policy, ..
+        } => {
             out.push(0);
             out.push(encode_graphics_execution_policy(*execution_policy));
+            out.push(report.environment.renderer.tv_type().tag());
         }
         ReleaseRendererEvidence::Rt64 {
             execution_policy,
@@ -3880,9 +4405,11 @@ pub(crate) fn encode_report_evidence(report: &ReleaseGateReport) -> Result<Vec<u
             source_authoritative,
             settings_sha256,
             replacement_packs_active,
+            ..
         } => {
             out.push(1);
             out.push(encode_graphics_execution_policy(*execution_policy));
+            out.push(report.environment.renderer.tv_type().tag());
             out.push(encode_graphics_api(*graphics_api));
             push_bytes(&mut out, backend_identity.as_bytes());
             out.push(*source_authoritative as u8);
@@ -3958,6 +4485,121 @@ mod tests {
 
     fn observations() -> ReleaseObservationGeometry {
         ReleaseObservationGeometry::reference_rdram(0, 1, 1).unwrap()
+    }
+
+    fn test_rom(destination_code: u8) -> Vec<u8> {
+        let mut rom = vec![0; 0x1000];
+        rom[..4].copy_from_slice(&MAGIC_Z64.to_be_bytes());
+        rom[0x3b..0x3f].copy_from_slice(&[b'N', b'F', b'6', destination_code]);
+        rom
+    }
+
+    fn n64_order(canonical: &[u8]) -> Vec<u8> {
+        canonical
+            .chunks_exact(4)
+            .flat_map(|word| [word[3], word[2], word[1], word[0]])
+            .collect()
+    }
+
+    fn v64_order(canonical: &[u8]) -> Vec<u8> {
+        canonical
+            .chunks_exact(2)
+            .flat_map(|pair| [pair[1], pair[0]])
+            .collect()
+    }
+
+    #[test]
+    fn schema_v19_rom_identity_normalizes_byte_order_and_decodes_every_tv_class() {
+        let ntsc = test_rom(b'E');
+        let expected =
+            ReleaseRomEvidence::from_bytes(&ntsc, ReleaseRomClass::RetailCartridge, TvType::Ntsc)
+                .unwrap();
+        assert_eq!(expected.source_byte_order, ReleaseRomByteOrder::Z64);
+        assert_eq!(expected.decoded_tv_region, ReleaseTvRegion::Ntsc);
+        assert_eq!(
+            ReleaseRomEvidence::decode_tv_type(&ntsc).unwrap(),
+            Some(TvType::Ntsc)
+        );
+
+        for (bytes, order) in [
+            (n64_order(&ntsc), ReleaseRomByteOrder::N64),
+            (v64_order(&ntsc), ReleaseRomByteOrder::V64),
+        ] {
+            let observed = ReleaseRomEvidence::from_bytes(
+                &bytes,
+                ReleaseRomClass::RetailCartridge,
+                TvType::Ntsc,
+            )
+            .unwrap();
+            assert_eq!(observed.source_byte_order, order);
+            assert_eq!(observed.canonical_sha256, expected.canonical_sha256);
+        }
+
+        let pal = ReleaseRomEvidence::from_bytes(
+            &test_rom(b'P'),
+            ReleaseRomClass::PublicHomebrew,
+            TvType::Pal,
+        )
+        .unwrap();
+        assert_eq!(pal.decoded_tv_region, ReleaseTvRegion::Pal);
+        let mpal = ReleaseRomEvidence::from_bytes(
+            &test_rom(b'B'),
+            ReleaseRomClass::Unclassified,
+            TvType::Mpal,
+        )
+        .unwrap();
+        assert_eq!(mpal.decoded_tv_region, ReleaseTvRegion::Mpal);
+
+        for destination_code in [0, b'A'] {
+            let region_free = test_rom(destination_code);
+            assert_eq!(
+                ReleaseRomEvidence::decode_tv_type(&region_free).unwrap(),
+                None
+            );
+            for tv_type in [TvType::Ntsc, TvType::Pal, TvType::Mpal] {
+                assert_eq!(
+                    ReleaseRomEvidence::from_bytes(
+                        &region_free,
+                        ReleaseRomClass::PublicHomebrew,
+                        tv_type,
+                    )
+                    .unwrap()
+                    .decoded_tv_region,
+                    ReleaseTvRegion::RegionFree
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schema_v19_rom_decode_rejects_unknown_or_inconsistent_authority() {
+        assert!(matches!(
+            ReleaseRomEvidence::from_bytes(
+                &test_rom(b'E'),
+                ReleaseRomClass::RetailCartridge,
+                TvType::Pal,
+            ),
+            Err(GateError::RomTvTypeMismatch { .. })
+        ));
+        assert!(matches!(
+            ReleaseRomEvidence::decode_tv_type(&test_rom(b'?')),
+            Err(GateError::UnknownRomDestinationCode(b'?'))
+        ));
+        let mut unknown_order = test_rom(b'E');
+        unknown_order[..4].fill(0);
+        assert!(matches!(
+            ReleaseRomEvidence::decode_tv_type(&unknown_order),
+            Err(GateError::UnknownRomByteOrder { .. })
+        ));
+        assert!(matches!(
+            ReleaseRomEvidence::decode_tv_type(&[0; 63]),
+            Err(GateError::RomTooSmall { bytes: 63 })
+        ));
+        assert!(matches!(
+            ReleaseRomEvidence::decode_tv_type(&[0; 65]),
+            Err(GateError::RomNotWordAligned { bytes: 65 })
+                | Err(GateError::UnknownRomByteOrder { .. })
+        ));
     }
 
     fn authoritative_rt64_identity_for(graphics_api: ReleaseGraphicsApi) -> String {
@@ -4196,6 +4838,7 @@ mod tests {
             b"input",
             complete_digest(),
             ReleaseBoundaryReportEvidence {
+                rom: None,
                 observations: geometry.clone(),
                 environment: test_release_environment(&geometry),
                 execution_destinations: evidence.clone(),
@@ -4209,6 +4852,7 @@ mod tests {
             b"input",
             complete_digest(),
             ReleaseBoundaryReportEvidence {
+                rom: None,
                 observations: geometry.clone(),
                 environment: test_release_environment(&geometry),
                 execution_destinations: reordered_canonical,
@@ -4529,13 +5173,109 @@ mod tests {
     }
 
     #[test]
-    fn schema_v18_fixed_cycle_digest_is_stable_and_complete() {
+    fn schema_v19_fixed_cycle_digest_is_stable_and_complete() {
         assert_eq!(complete_digest(), complete_digest());
         assert_eq!(complete_digest().artifacts.len(), 5);
         assert_eq!(
             complete_digest().root_sha256,
-            "59d8d53cf3bf84e24eb01406aa3b251385214c6e7bc97007df1bfca80bdcc8e4"
+            "8204997786632bc3eacf2261ceab9df9b99bd11c22dbe4f98207e250e006d566"
         );
+    }
+
+    #[test]
+    fn schema_v19_report_wire_binds_rom_identity_class_and_tv_authorities() {
+        let input = test_rom(b'E');
+        let geometry = observations();
+        let rom =
+            ReleaseRomEvidence::from_bytes(&input, ReleaseRomClass::RetailCartridge, TvType::Ntsc)
+                .unwrap();
+        let report = ReleaseGateReport::new_with_environment(
+            "rom-wire",
+            &input,
+            complete_digest(),
+            ReleaseBoundaryReportEvidence {
+                rom: Some(rom),
+                observations: geometry.clone(),
+                environment: test_release_environment(&geometry),
+                execution_destinations: ExecutionDestinationEvidence::no_program(),
+                rsp_rdp: RspRdpEvidence::from_ordered(Vec::new()).unwrap(),
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        report.verify_integrity().unwrap();
+
+        let baseline = report.report_sha256.clone();
+        let mut changed_class = report.clone();
+        changed_class.rom.as_mut().unwrap().class = ReleaseRomClass::PublicHomebrew;
+        assert_ne!(
+            sha256_hex(&encode_report_evidence(&changed_class).unwrap()),
+            baseline
+        );
+
+        let mut changed_order = report.clone();
+        changed_order.rom.as_mut().unwrap().source_byte_order = ReleaseRomByteOrder::V64;
+        assert_ne!(
+            sha256_hex(&encode_report_evidence(&changed_order).unwrap()),
+            baseline
+        );
+
+        let mut changed_identity = report.clone();
+        changed_identity.rom.as_mut().unwrap().canonical_sha256 = "ab".repeat(32);
+        assert_ne!(
+            sha256_hex(&encode_report_evidence(&changed_identity).unwrap()),
+            baseline
+        );
+
+        let mut changed_destination = report.clone();
+        changed_destination.rom.as_mut().unwrap().destination_code = b'P';
+        assert!(matches!(
+            changed_destination.verify_integrity(),
+            Err(GateError::RomRegionDecodeMismatch { .. })
+        ));
+
+        let mut changed_region = report.clone();
+        changed_region.rom.as_mut().unwrap().decoded_tv_region = ReleaseTvRegion::Pal;
+        assert!(matches!(
+            changed_region.verify_integrity(),
+            Err(GateError::RomRegionDecodeMismatch { .. })
+        ));
+
+        let mut changed_renderer_tv = report.clone();
+        let ReleaseRendererEvidence::Reference { tv_type, .. } =
+            &mut changed_renderer_tv.environment.renderer
+        else {
+            unreachable!()
+        };
+        *tv_type = ReleaseTvStandard::Mpal;
+        changed_renderer_tv.report_sha256 =
+            sha256_hex(&encode_report_evidence(&changed_renderer_tv).unwrap());
+        assert!(matches!(
+            changed_renderer_tv.verify_integrity(),
+            Err(GateError::RomTvTypeMismatch {
+                authority: "retained renderer create-time configuration",
+                ..
+            })
+        ));
+
+        let mut mismatched_input = input;
+        mismatched_input[0x100] ^= 1;
+        assert!(matches!(
+            ReleaseGateReport::new_with_environment(
+                "rom-wire",
+                &mismatched_input,
+                report.digest,
+                ReleaseBoundaryReportEvidence {
+                    rom: report.rom,
+                    observations: report.observations,
+                    environment: report.environment,
+                    execution_destinations: report.execution_destinations,
+                    rsp_rdp: report.rsp_rdp,
+                },
+                Vec::new(),
+            ),
+            Err(GateError::RomInputEvidenceMismatch)
+        ));
     }
 
     #[test]
@@ -5631,11 +6371,11 @@ mod tests {
         ));
 
         let mut stale_schema = report.clone();
-        stale_schema.schema = "fn64.release-gate.v17".to_owned();
+        stale_schema.schema = "fn64.release-gate.v18".to_owned();
         assert!(matches!(
             stale_schema.verify_integrity(),
             Err(GateError::UnsupportedReportSchema(schema))
-                if schema == "fn64.release-gate.v17"
+                if schema == "fn64.release-gate.v18"
         ));
 
         let duplicate = vec![report.closure[0].clone(), report.closure[0].clone()];
@@ -5652,7 +6392,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v18_report_wire_binds_every_release_environment_field() {
+    fn schema_v19_report_wire_binds_every_release_environment_field() {
         let report = ReleaseGateReport::new(
             "environment-wire",
             b"input",
@@ -5717,12 +6457,23 @@ mod tests {
         let mut changed_policy = report.clone();
         changed_policy.environment.renderer = ReleaseRendererEvidence::Reference {
             execution_policy: ReleaseGraphicsExecutionPolicy::HleOptimized,
+            tv_type: ReleaseTvStandard::Ntsc,
         };
         assert_ne!(digest(&changed_policy), baseline, "render policy collided");
+
+        let mut changed_tv = report.clone();
+        let ReleaseRendererEvidence::Reference { tv_type, .. } =
+            &mut changed_tv.environment.renderer
+        else {
+            unreachable!()
+        };
+        *tv_type = ReleaseTvStandard::Pal;
+        assert_ne!(digest(&changed_tv), baseline, "renderer TV type collided");
 
         let mut rt64 = report.clone();
         rt64.environment.renderer = ReleaseRendererEvidence::Rt64 {
             execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+            tv_type: ReleaseTvStandard::Ntsc,
             graphics_api: current_test_graphics_api(),
             backend_identity: authoritative_rt64_identity(),
             source_authoritative: true,
@@ -5808,7 +6559,9 @@ mod tests {
     fn frozen_environment_derivation_fails_closed() {
         let platform = crate::release_host_platform().expect("supported test platform");
         let reference = || fn64_abi::RenderEnvironmentEvidenceSnapshot {
-            backend: fn64_abi::RenderBackendEvidence::Reference,
+            backend: fn64_abi::RenderBackendEvidence::Reference {
+                tv_type: TvType::Ntsc,
+            },
             execution_policy: fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy,
         };
 
@@ -5836,7 +6589,9 @@ mod tests {
                 platform,
                 &host,
                 fn64_abi::RenderEnvironmentEvidenceSnapshot {
-                    backend: fn64_abi::RenderBackendEvidence::Reference,
+                    backend: fn64_abi::RenderBackendEvidence::Reference {
+                        tv_type: TvType::Ntsc,
+                    },
                     execution_policy: fn64_abi::GraphicsTaskExecutionPolicy::HleOptimized,
                 },
             ),
@@ -5869,6 +6624,7 @@ mod tests {
                 &host,
                 fn64_abi::RenderEnvironmentEvidenceSnapshot {
                     backend: fn64_abi::RenderBackendEvidence::Rt64 {
+                        tv_type: TvType::Ntsc,
                         backend_identity: authoritative_rt64_identity_for(expected),
                         source_authoritative: true,
                         graphics_api: active,
@@ -5920,6 +6676,7 @@ mod tests {
             cartridge_save: ReleaseCartridgeSave::NoCartridgeSave,
             renderer: ReleaseRendererEvidence::Rt64 {
                 execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+                tv_type: ReleaseTvStandard::Ntsc,
                 graphics_api: valid_api,
                 backend_identity: authoritative_rt64_identity_for(valid_api),
                 source_authoritative: true,
@@ -5957,6 +6714,7 @@ mod tests {
         let mut environment = test_release_environment(&observations());
         environment.renderer = ReleaseRendererEvidence::Rt64 {
             execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+            tv_type: ReleaseTvStandard::Ntsc,
             graphics_api: current_test_graphics_api(),
             backend_identity: "rt64-test".to_owned(),
             source_authoritative: false,
@@ -5978,6 +6736,7 @@ mod tests {
         let mut environment = test_release_environment(&observations());
         environment.renderer = ReleaseRendererEvidence::Rt64 {
             execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+            tv_type: ReleaseTvStandard::Ntsc,
             graphics_api: current_test_graphics_api(),
             backend_identity: "rt64-test".to_owned(),
             source_authoritative: true,
@@ -6452,7 +7211,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v18_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
+    fn schema_v19_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
         let geometry = observations();
         let graphics_closure = vec![ClosurePath {
             name: "rsp.graphics-task".to_owned(),
@@ -6495,6 +7254,7 @@ mod tests {
             b"input",
             complete_digest(),
             ReleaseBoundaryReportEvidence {
+                rom: None,
                 observations: geometry.clone(),
                 environment: test_release_environment(&geometry),
                 execution_destinations: ExecutionDestinationEvidence::no_program(),
@@ -6668,6 +7428,7 @@ mod tests {
                 b"input",
                 complete_digest(),
                 ReleaseBoundaryReportEvidence {
+                    rom: None,
                     observations: geometry.clone(),
                     environment: test_release_environment(&geometry),
                     execution_destinations: ExecutionDestinationEvidence::no_program(),
@@ -6784,6 +7545,7 @@ mod tests {
             crate::CommittedViBoundary::synthetic_for_test(0),
             "unarmed",
             b"input",
+            None,
             LiveObservedArtifacts {
                 framebuffer_artifact_bytes: b"fb",
                 framebuffer_payload_bytes: 2,

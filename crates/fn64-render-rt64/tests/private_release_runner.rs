@@ -9,10 +9,10 @@ use fn64_boot_harness::{
     run_private_release_series, verify_private_release_series,
     verify_repository_synthetic_private_release_run_contract, ExecutionDestinationSource,
     PrivateArtifactIdentity, PrivateChildCommand, PrivateEnvironmentEntry, PrivateFileIdentity,
-    PrivateReleaseRunContract, PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA, PRIVATE_RELEASE_SERIES_COUNT,
-    REPOSITORY_SYNTHETIC_RELEASE_CYCLE, REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES,
-    REPOSITORY_SYNTHETIC_RELEASE_MANIFEST_BYTES, REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES,
-    REPOSITORY_SYNTHETIC_RELEASE_SCENARIO,
+    PrivateReleaseRunContract, ReleaseRomClass, PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA,
+    PRIVATE_RELEASE_SERIES_COUNT, REPOSITORY_SYNTHETIC_RELEASE_CYCLE,
+    REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES, REPOSITORY_SYNTHETIC_RELEASE_MANIFEST_BYTES,
+    REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES, REPOSITORY_SYNTHETIC_RELEASE_SCENARIO,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -112,6 +112,7 @@ fn ten_fresh_processes_certify_live_runtime_device_and_render_path() {
         readiness_report: file_identity(&readiness),
         program_build_receipt: None,
         purpose: "synthetic_mechanism".to_owned(),
+        rom_class: ReleaseRomClass::Unclassified,
         report_scenario: REPOSITORY_SYNTHETIC_RELEASE_SCENARIO.to_owned(),
         guest_cycle: REPOSITORY_SYNTHETIC_RELEASE_CYCLE,
         repeat_count: PRIVATE_RELEASE_SERIES_COUNT,

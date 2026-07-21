@@ -754,6 +754,14 @@ pub struct RenderEnvironmentEvidenceSnapshot {
     pub execution_policy: GraphicsTaskExecutionPolicy,
 }
 
+impl RenderEnvironmentEvidenceSnapshot {
+    /// Renderer-owned TV standard from the last successful backend creation.
+    /// An unidentified compatibility backend has no release authority.
+    pub const fn renderer_tv_type(&self) -> Option<fn64_runtime::TvType> {
+        self.backend.tv_type()
+    }
+}
+
 unsafe fn commit_rsp_rdram_image(rdram: *mut u8, rdram_image: &[u8]) {
     let mut changed = false;
     for offset in (0..rdram_image.len()).step_by(4) {
@@ -3070,6 +3078,7 @@ mod tests {
         impl RenderBackend for CaptureBackend {
             fn release_environment(&self) -> fn64_render::RenderBackendEvidence {
                 fn64_render::RenderBackendEvidence::Rt64 {
+                    tv_type: fn64_runtime::TvType::Pal,
                     backend_identity: "synthetic-release-backend".to_string(),
                     source_authoritative: true,
                     graphics_api: fn64_render::ActiveRenderGraphicsApi::Vulkan,
@@ -3140,6 +3149,7 @@ mod tests {
             render_environment_evidence_snapshot(),
             RenderEnvironmentEvidenceSnapshot {
                 backend: fn64_render::RenderBackendEvidence::Rt64 {
+                    tv_type: fn64_runtime::TvType::Pal,
                     backend_identity: "synthetic-release-backend".to_string(),
                     source_authoritative: true,
                     graphics_api: fn64_render::ActiveRenderGraphicsApi::Vulkan,
@@ -3149,6 +3159,21 @@ mod tests {
                 execution_policy: GraphicsTaskExecutionPolicy::HleOptimized,
             }
         );
+        assert_eq!(
+            render_environment_evidence_snapshot().renderer_tv_type(),
+            Some(fn64_runtime::TvType::Pal)
+        );
+    }
+
+    #[test]
+    fn unidentified_renderer_snapshot_cannot_fabricate_tv_authority() {
+        set_render_backend(Box::new(StatusRenderBackend(FrameStatus::Complete)), 0);
+        let snapshot = render_environment_evidence_snapshot();
+        assert_eq!(
+            snapshot.backend,
+            fn64_render::RenderBackendEvidence::Unidentified
+        );
+        assert_eq!(snapshot.renderer_tv_type(), None);
     }
 
     #[test]

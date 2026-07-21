@@ -1,11 +1,14 @@
 use fn64_boot_harness::{
-    parse_unsupported_journal, verify_release_matrix, ParsedUnsupportedJournal, ReleaseGateReport,
-    ReleaseMatrixManifest, ReleaseMatrixVerification, VerifiedReleaseMatrix,
+    load_private_release_run_contract, parse_unsupported_journal,
+    verify_private_release_series_with_runner, verify_release_matrix,
+    verify_release_matrix_with_private_series, ParsedUnsupportedJournal,
+    PrivateReleaseSeriesReceipt, ReleaseGateReport, ReleaseMatrixManifest,
+    ReleaseMatrixVerification, VerifiedPrivateReleaseSeries, VerifiedReleaseMatrix,
 };
 use std::{
     collections::BTreeSet,
     env,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
     process,
@@ -53,17 +56,18 @@ fn run() -> Result<(), String> {
         );
         return Ok(());
     }
-    let (json, manifest_path) = if first == OsStr::new("--json") {
-        (true, args.next().map(PathBuf::from).ok_or_else(usage)?)
-    } else {
-        (false, PathBuf::from(first))
-    };
-    let assignments: Vec<_> = args.collect();
-    if assignments.is_empty() {
-        return Err(usage());
-    }
+    let NormalVerificationArguments {
+        json,
+        manifest_path,
+        private_series,
+        assignments,
+    } = parse_normal_verification_arguments(first, args)?;
 
     let manifest = read_manifest(&manifest_path)?;
+    let verified_private_series = private_series
+        .iter()
+        .map(load_and_verify_private_series)
+        .collect::<Result<Vec<VerifiedPrivateReleaseSeries>, String>>()?;
 
     let mut distinct_reports = BTreeSet::new();
     let mut distinct_journals = BTreeSet::new();
@@ -111,7 +115,13 @@ fn run() -> Result<(), String> {
         evidence.push((report, journal));
     }
 
-    let outcome = verify_release_matrix(&manifest, &evidence).map_err(|error| error.to_string())?;
+    let outcome = if verified_private_series.is_empty() {
+        verify_release_matrix(&manifest, &evidence)
+    } else {
+        let private_series_refs = verified_private_series.iter().collect::<Vec<_>>();
+        verify_release_matrix_with_private_series(&manifest, &evidence, &private_series_refs)
+    }
+    .map_err(|error| error.to_string())?;
     let verified = match outcome {
         ReleaseMatrixVerification::Complete(verified) => verified,
         ReleaseMatrixVerification::Incomplete(incomplete) => {
@@ -170,6 +180,138 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn load_and_verify_private_series(
+    paths: &PrivateSeriesPaths,
+) -> Result<VerifiedPrivateReleaseSeries, String> {
+    let contract = load_private_release_run_contract(&paths.contract).map_err(|error| {
+        format!(
+            "load private contract {}: {error}",
+            paths.contract.display()
+        )
+    })?;
+    let receipt_bytes = fs::read(&paths.receipt)
+        .map_err(|error| format!("read receipt {}: {error}", paths.receipt.display()))?;
+    let receipt = serde_json::from_slice::<PrivateReleaseSeriesReceipt>(&receipt_bytes)
+        .map_err(|error| format!("parse receipt {}: {error}", paths.receipt.display()))?;
+    verify_private_release_series_with_runner(
+        &contract,
+        &paths.output_directory,
+        &receipt,
+        &paths.runner_executable,
+    )
+    .map_err(|error| {
+        format!(
+            "verify private series contract={} output={} receipt={} runner={}: {error}",
+            paths.contract.display(),
+            paths.output_directory.display(),
+            paths.receipt.display(),
+            paths.runner_executable.display()
+        )
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NormalVerificationArguments {
+    json: bool,
+    manifest_path: PathBuf,
+    private_series: Vec<PrivateSeriesPaths>,
+    assignments: Vec<OsString>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PrivateSeriesPaths {
+    contract: PathBuf,
+    output_directory: PathBuf,
+    receipt: PathBuf,
+    runner_executable: PathBuf,
+}
+
+fn parse_normal_verification_arguments(
+    first: OsString,
+    rest: impl IntoIterator<Item = OsString>,
+) -> Result<NormalVerificationArguments, String> {
+    let mut arguments = std::iter::once(first).chain(rest).peekable();
+    let mut json = false;
+    let mut private_series = Vec::new();
+    let manifest_path = loop {
+        let argument = arguments.next().ok_or_else(usage)?;
+        if argument == OsStr::new("--json") {
+            if json {
+                return Err("--json may be specified only once".to_owned());
+            }
+            json = true;
+            continue;
+        }
+        if argument == OsStr::new("--private-series") {
+            let contract = arguments.next().ok_or_else(usage)?;
+            let output_directory = arguments.next().ok_or_else(usage)?;
+            let receipt = arguments.next().ok_or_else(usage)?;
+            let runner_executable = arguments.next().ok_or_else(usage)?;
+            if [&contract, &output_directory, &receipt, &runner_executable]
+                .into_iter()
+                .any(|path| is_normal_option(path))
+            {
+                return Err(
+                    "--private-series requires CONTRACT.json OUTPUT_DIRECTORY RECEIPT.json RUNNER_EXECUTABLE"
+                        .to_owned(),
+                );
+            }
+            private_series.push(PrivateSeriesPaths {
+                contract: PathBuf::from(contract),
+                output_directory: PathBuf::from(output_directory),
+                receipt: PathBuf::from(receipt),
+                runner_executable: PathBuf::from(runner_executable),
+            });
+            continue;
+        }
+        if argument == OsStr::new("--private-contract") {
+            return Err(
+                "--private-contract cannot authorize ROM-class credit; use --private-series CONTRACT.json OUTPUT_DIRECTORY RECEIPT.json RUNNER_EXECUTABLE"
+                    .to_owned(),
+            );
+        }
+        if is_mode_option(&argument) {
+            return Err(format!(
+                "{} is a standalone mode and cannot be combined with normal matrix verification",
+                argument.to_string_lossy()
+            ));
+        }
+        break PathBuf::from(argument);
+    };
+
+    let assignments = arguments.collect::<Vec<_>>();
+    if assignments.is_empty() {
+        return Err(usage());
+    }
+    if let Some(option) = assignments
+        .iter()
+        .find(|argument| is_normal_option(argument))
+    {
+        return Err(format!(
+            "option {} must precede MANIFEST.json",
+            option.to_string_lossy()
+        ));
+    }
+
+    Ok(NormalVerificationArguments {
+        json,
+        manifest_path,
+        private_series,
+        assignments,
+    })
+}
+
+fn is_normal_option(argument: &OsStr) -> bool {
+    argument == OsStr::new("--json")
+        || argument == OsStr::new("--private-series")
+        || argument == OsStr::new("--private-contract")
+        || is_mode_option(argument)
+}
+
+fn is_mode_option(argument: &OsStr) -> bool {
+    argument == OsStr::new("--print-declaration-digests") || argument == OsStr::new("--verify-json")
+}
+
 fn verify_retained_json(bytes: &[u8]) -> Result<VerifiedReleaseMatrix, String> {
     #[derive(serde::Deserialize)]
     struct RetainedSchema {
@@ -199,12 +341,18 @@ fn read_manifest(path: &Path) -> Result<ReleaseMatrixManifest, String> {
 }
 
 fn usage() -> String {
-    "usage: verify-release-matrix [--json] MANIFEST.json REPORT.json,JOURNAL.jsonl ...\n       verify-release-matrix --print-declaration-digests MANIFEST.json\n       verify-release-matrix --verify-json VERIFIED.json".to_owned()
+    "usage: verify-release-matrix [--json] [--private-series CONTRACT.json OUTPUT_DIRECTORY RECEIPT.json RUNNER_EXECUTABLE]... MANIFEST.json REPORT.json,JOURNAL.jsonl ...\n       verify-release-matrix --print-declaration-digests MANIFEST.json\n       verify-release-matrix --verify-json VERIFIED.json".to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_normal(arguments: &[&str]) -> Result<NormalVerificationArguments, String> {
+        let mut arguments = arguments.iter().map(OsString::from);
+        let first = arguments.next().ok_or_else(usage)?;
+        parse_normal_verification_arguments(first, arguments)
+    }
 
     fn empty_retained(schema: &str, verification_sha256: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
@@ -251,5 +399,129 @@ mod tests {
         ))
         .unwrap_err();
         assert!(error.contains("release matrix has 0 scenarios"));
+    }
+
+    #[test]
+    fn normal_parser_preserves_the_report_only_cli_shape() {
+        let parsed = parse_normal(&["--json", "matrix.json", "report.json,journal.jsonl"])
+            .expect("legacy report-only invocation parses");
+        assert!(parsed.json);
+        assert_eq!(parsed.manifest_path, PathBuf::from("matrix.json"));
+        assert!(parsed.private_series.is_empty());
+        assert_eq!(
+            parsed.assignments,
+            vec![OsString::from("report.json,journal.jsonl")]
+        );
+    }
+
+    #[test]
+    fn normal_parser_retains_repeated_private_series_in_argument_order() {
+        let parsed = parse_normal(&[
+            "--private-series",
+            "retail.json",
+            "retail-series",
+            "retail-receipt.json",
+            "retail-runner",
+            "--json",
+            "--private-series",
+            "homebrew.json",
+            "homebrew-series",
+            "homebrew-receipt.json",
+            "homebrew-runner",
+            "matrix.json",
+            "a.json,a.jsonl",
+            "b.json,b.jsonl",
+        ])
+        .expect("verified-series invocation parses");
+        assert!(parsed.json);
+        assert_eq!(parsed.manifest_path, PathBuf::from("matrix.json"));
+        assert_eq!(
+            parsed.private_series,
+            vec![
+                PrivateSeriesPaths {
+                    contract: PathBuf::from("retail.json"),
+                    output_directory: PathBuf::from("retail-series"),
+                    receipt: PathBuf::from("retail-receipt.json"),
+                    runner_executable: PathBuf::from("retail-runner"),
+                },
+                PrivateSeriesPaths {
+                    contract: PathBuf::from("homebrew.json"),
+                    output_directory: PathBuf::from("homebrew-series"),
+                    receipt: PathBuf::from("homebrew-receipt.json"),
+                    runner_executable: PathBuf::from("homebrew-runner"),
+                }
+            ]
+        );
+        assert_eq!(parsed.assignments.len(), 2);
+    }
+
+    #[test]
+    fn normal_parser_rejects_standalone_modes_after_private_series_options() {
+        for mode in ["--verify-json", "--print-declaration-digests"] {
+            let error = parse_normal(&[
+                "--private-series",
+                "authority.json",
+                "series",
+                "receipt.json",
+                "runner",
+                mode,
+                "artifact.json",
+            ])
+            .unwrap_err();
+            assert!(error.contains("standalone mode"), "{error}");
+        }
+    }
+
+    #[test]
+    fn normal_parser_rejects_options_after_the_manifest() {
+        for option in [
+            "--json",
+            "--private-series",
+            "--private-contract",
+            "--verify-json",
+        ] {
+            let error =
+                parse_normal(&["matrix.json", "report.json,journal.jsonl", option]).unwrap_err();
+            assert!(error.contains("must precede MANIFEST.json"), "{error}");
+        }
+    }
+
+    #[test]
+    fn normal_parser_rejects_bare_contract_authority() {
+        let error = parse_normal(&[
+            "--private-contract",
+            "contract.json",
+            "matrix.json",
+            "report.json,journal.jsonl",
+        ])
+        .unwrap_err();
+        assert!(
+            error.contains("cannot authorize ROM-class credit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn normal_parser_rejects_incomplete_private_series_tuple() {
+        let error = parse_normal(&[
+            "--private-series",
+            "contract.json",
+            "output-directory",
+            "receipt.json",
+        ])
+        .unwrap_err();
+        assert!(error.contains("usage:"), "{error}");
+
+        let error = parse_normal(&[
+            "--private-series",
+            "contract.json",
+            "--json",
+            "receipt.json",
+            "runner",
+            "matrix.json",
+            "report.json,journal.jsonl",
+        ])
+        .unwrap_err();
+        assert!(error.contains("requires CONTRACT.json"), "{error}");
     }
 }

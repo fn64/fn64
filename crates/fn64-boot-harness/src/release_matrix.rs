@@ -2,18 +2,19 @@
 //!
 //! The manifest contains only the immutable project profile and evidence
 //! identities, never ROM bytes, captured output, or caller-authored coverage.
-//! Dynamic evidence remains the schema-v18 report series; coverage is derived
+//! Dynamic evidence remains the schema-v19 report series; coverage is derived
 //! from each validated report before it is compared with the fixed profile.
 
 use crate::{
     verify_release_evidence_series, ArtifactDigest, ArtifactKind, CertificationProfileIdentity,
     CertificationRequirementClass, CertificationRequirementRef, ClosurePath, ClosurePathStatus,
-    DeterministicDigest, ExecutionDestinationEvidence, FramebufferObservationSource, FullParityV1,
-    ParsedUnsupportedJournal, ReleaseCartridgeSave, ReleaseControllerPort,
-    ReleaseEnvironmentEvidence, ReleaseGateReport, ReleaseGraphicsApi,
+    DeterministicDigest, ExecutionDestinationEvidence, ExecutionDestinationSource,
+    FramebufferObservationSource, FullParityV1, ParsedUnsupportedJournal, ReleaseCartridgeSave,
+    ReleaseControllerPort, ReleaseEnvironmentEvidence, ReleaseGateReport, ReleaseGraphicsApi,
     ReleaseGraphicsExecutionPolicy, ReleaseHostPlatform, ReleaseMicrocodeFamily,
-    ReleaseObservationGeometry, ReleaseRendererEvidence, ReportSeriesError, RspRdpEvidence,
-    RspRdpObservationKindEvidence, LIVE_MINIMUM_CLOSURE_PATHS,
+    ReleaseObservationGeometry, ReleaseRendererEvidence, ReleaseRomClass, ReleaseRomEvidence,
+    ReleaseTvRegion, ReportSeriesError, RspRdpEvidence, RspRdpObservationKindEvidence,
+    VerifiedPrivateReleaseSeries, LIVE_MINIMUM_CLOSURE_PATHS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,8 +24,9 @@ use std::{
 };
 
 pub const RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix.v5";
-pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v14";
-pub const INCOMPLETE_RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix-incomplete.v3";
+pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v15";
+pub const INCOMPLETE_RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix-incomplete.v4";
+pub const VERIFIED_ROM_CLASS_AUTHORITY_SCHEMA: &str = "fn64.verified-rom-class-authority.v1";
 pub const RELEASE_MATRIX_REPORT_COUNT: usize = 10;
 pub const RELEASE_MATRIX_MAX_SCENARIOS: usize = 64;
 
@@ -114,7 +116,7 @@ struct CertifiedMicrocodeIdentity {
     family: ReleaseMicrocodeFamily,
 }
 
-/// Immutable digest-to-family adjudication for matrix-v5/v14 certification.
+/// Immutable digest-to-family adjudication for matrix-v5/v15 certification.
 ///
 /// Runtime/backend admission remains host-configurable because it selects an
 /// optimization, not certification. Public-microcode denominator credit is
@@ -133,6 +135,14 @@ pub enum RspRdpMechanismFeature {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseMatrixCoverage {
+    /// Empty unless an admission-bound private run contract authorizes the
+    /// report's exact ROM class. A report field or scenario label alone never
+    /// populates this dimension.
+    pub rom_classes: Vec<ReleaseRomClass>,
+    /// Empty for synthetic, unclassified-header, or region-free evidence.
+    /// Only a fixed destination code co-bound to device and renderer TV
+    /// authority can satisfy a profile TV-region row.
+    pub tv_regions: Vec<ReleaseTvRegion>,
     pub platforms: Vec<ReleasePlatform>,
     pub controllers: Vec<ControllerFeature>,
     pub saves: Vec<SaveFeature>,
@@ -145,18 +155,157 @@ pub struct ReleaseMatrixCoverage {
     pub rsp_rdp_mechanisms: Vec<RspRdpMechanismFeature>,
 }
 
+/// Canonical retained proof that one opaque, revalidated private release
+/// series authorized the ROM class attached to the same report series.
+///
+/// This record deliberately retains identities rather than private paths. Its
+/// own digest is the evidence identity assigned to the ROM-class profile row,
+/// so an incomplete matrix still binds the authority that earned that credit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedRomClassAuthority {
+    pub schema: String,
+    pub contract_schema: String,
+    pub contract_sha256: String,
+    pub receipt_schema: String,
+    pub receipt_sha256: String,
+    pub runner_executable_sha256: String,
+    pub purpose: String,
+    pub report_scenario: String,
+    pub input_sha256: String,
+    pub input_bytes: u64,
+    pub rom_class: ReleaseRomClass,
+    pub guest_cycle: u64,
+    pub expected_execution_source: ExecutionDestinationSource,
+    pub child_executable_sha256: String,
+    pub semantic_report_sha256: String,
+    pub run_event_sha256s: Vec<String>,
+    pub authority_sha256: String,
+}
+
+impl VerifiedRomClassAuthority {
+    fn recompute_authority_sha256(&self) -> String {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"fn64.verified-rom-class-authority.v1\0");
+        push_bytes(&mut wire, self.schema.as_bytes());
+        push_bytes(&mut wire, self.contract_schema.as_bytes());
+        push_bytes(&mut wire, self.contract_sha256.as_bytes());
+        push_bytes(&mut wire, self.receipt_schema.as_bytes());
+        push_bytes(&mut wire, self.receipt_sha256.as_bytes());
+        push_bytes(&mut wire, self.runner_executable_sha256.as_bytes());
+        push_bytes(&mut wire, self.purpose.as_bytes());
+        push_bytes(&mut wire, self.report_scenario.as_bytes());
+        push_bytes(&mut wire, self.input_sha256.as_bytes());
+        wire.extend_from_slice(&self.input_bytes.to_be_bytes());
+        push_bytes(&mut wire, self.rom_class.wire_name().as_bytes());
+        wire.extend_from_slice(&self.guest_cycle.to_be_bytes());
+        push_execution_source(&mut wire, &self.expected_execution_source);
+        push_bytes(&mut wire, self.child_executable_sha256.as_bytes());
+        push_bytes(&mut wire, self.semantic_report_sha256.as_bytes());
+        wire.extend_from_slice(&(self.run_event_sha256s.len() as u64).to_be_bytes());
+        for run_event_sha256 in &self.run_event_sha256s {
+            push_bytes(&mut wire, run_event_sha256.as_bytes());
+        }
+        hex(&Sha256::digest(wire))
+    }
+
+    fn verify_integrity(&self, id: &str) -> Result<(), ReleaseMatrixError> {
+        if self.schema != VERIFIED_ROM_CLASS_AUTHORITY_SCHEMA {
+            return Err(ReleaseMatrixError::InvalidRomClassAuthority {
+                id: id.to_owned(),
+                detail: format!("unsupported authority schema {:?}", self.schema),
+            });
+        }
+        if self.contract_schema != crate::PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA {
+            return Err(ReleaseMatrixError::InvalidRomClassAuthority {
+                id: id.to_owned(),
+                detail: format!("unsupported contract schema {:?}", self.contract_schema),
+            });
+        }
+        if self.receipt_schema != crate::PRIVATE_RELEASE_SERIES_RECEIPT_SCHEMA {
+            return Err(ReleaseMatrixError::InvalidRomClassAuthority {
+                id: id.to_owned(),
+                detail: format!("unsupported receipt schema {:?}", self.receipt_schema),
+            });
+        }
+        for (field, value) in [
+            ("contract_sha256", self.contract_sha256.as_str()),
+            ("receipt_sha256", self.receipt_sha256.as_str()),
+            (
+                "runner_executable_sha256",
+                self.runner_executable_sha256.as_str(),
+            ),
+            ("input_sha256", self.input_sha256.as_str()),
+            (
+                "child_executable_sha256",
+                self.child_executable_sha256.as_str(),
+            ),
+            (
+                "semantic_report_sha256",
+                self.semantic_report_sha256.as_str(),
+            ),
+            ("authority_sha256", self.authority_sha256.as_str()),
+        ] {
+            validate_sha256(id, field, value)?;
+        }
+        validate_execution_source_identity(id, &self.expected_execution_source)?;
+        if !matches!(self.purpose.as_str(), "full_rom" | "combined")
+            || self.rom_class == ReleaseRomClass::Unclassified
+        {
+            return Err(ReleaseMatrixError::InvalidRomClassAuthority {
+                id: id.to_owned(),
+                detail: "ROM-class authority must be a classified full_rom or combined contract"
+                    .to_owned(),
+            });
+        }
+        if self.run_event_sha256s.len() != RELEASE_MATRIX_REPORT_COUNT {
+            return Err(ReleaseMatrixError::InvalidRomClassAuthority {
+                id: id.to_owned(),
+                detail: format!(
+                    "ROM-class authority retains {} run-event identities; exactly {} are required",
+                    self.run_event_sha256s.len(),
+                    RELEASE_MATRIX_REPORT_COUNT
+                ),
+            });
+        }
+        let mut unique_run_events = BTreeSet::new();
+        for run_event_sha256 in &self.run_event_sha256s {
+            validate_sha256(id, "authority.run_event_sha256s[]", run_event_sha256)?;
+            if !unique_run_events.insert(run_event_sha256) {
+                return Err(ReleaseMatrixError::InvalidRomClassAuthority {
+                    id: id.to_owned(),
+                    detail: format!(
+                        "ROM-class authority repeats run-event identity {run_event_sha256}"
+                    ),
+                });
+            }
+        }
+        let recomputed = self.recompute_authority_sha256();
+        if self.authority_sha256 != recomputed {
+            return Err(ReleaseMatrixError::InvalidRomClassAuthority {
+                id: id.to_owned(),
+                detail: format!(
+                    "authority digest mismatch: stored {}, recomputed {recomputed}",
+                    self.authority_sha256
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseMatrixScenario {
     /// Stable diagnostic key. Evidence is associated by `report_scenario`, not
     /// by a caller-provided command-line assignment.
     pub id: String,
-    /// Exact scenario string bound by every schema-v18 report in this series.
+    /// Exact scenario string bound by every schema-v19 report in this series.
     pub report_scenario: String,
     /// Exact private-input identity bound by every report; no input bytes are stored.
     pub input_sha256: String,
     pub report_sha256: String,
-    /// Canonical digest over this declaration and its exact v18 evidence IDs.
+    /// Canonical digest over this declaration and its exact v19 evidence IDs.
     pub declaration_sha256: String,
 }
 
@@ -220,6 +369,8 @@ pub struct VerifiedMatrixScenario {
     pub report_sha256: String,
     pub report_scenario: String,
     pub input_sha256: String,
+    pub rom: Option<ReleaseRomEvidence>,
+    pub rom_class_authority: Option<VerifiedRomClassAuthority>,
     /// Coverage assignments retained from the verified manifest. These make
     /// the retained matrix independently auditable without the manifest.
     pub coverage: ReleaseMatrixCoverage,
@@ -230,12 +381,12 @@ pub struct VerifiedMatrixScenario {
     pub environment: ReleaseEnvironmentEvidence,
     pub closure_paths: u64,
     /// Exact destination sequence and canonical unique/count summary retained
-    /// from the verified v18 series.
+    /// from the verified v19 series.
     pub execution_destinations: ExecutionDestinationEvidence,
-    /// Complete schema-v18 RSP/RDP observation stream retained for independent
+    /// Complete schema-v19 RSP/RDP observation stream retained for independent
     /// report reconstruction and coverage derivation.
     pub rsp_rdp: RspRdpEvidence,
-    /// Exact canonical closure ledger retained from the verified v18 series.
+    /// Exact canonical closure ledger retained from the verified v19 series.
     /// A count alone cannot prove which feature-specific operation paths ran.
     pub closure: Vec<ClosurePath>,
     pub unsupported_events: u64,
@@ -556,6 +707,7 @@ impl VerifiedReleaseMatrix {
                 schema: crate::release_gate::REPORT_SCHEMA.to_owned(),
                 scenario: scenario.report_scenario.clone(),
                 input_sha256: scenario.input_sha256.clone(),
+                rom: scenario.rom.clone(),
                 digest: scenario.fixed_cycle_digest.clone(),
                 observations: scenario.observations.clone(),
                 environment: scenario.environment.clone(),
@@ -570,7 +722,18 @@ impl VerifiedReleaseMatrix {
                     source,
                 }
             })?;
-            let derived = derive_scenario_coverage(&scenario.id, &retained_report)?;
+            let mut derived = derive_scenario_coverage(&scenario.id, &retained_report)?;
+            if let Some(authority) = &scenario.rom_class_authority {
+                authority.verify_integrity(&scenario.id)?;
+                if authority.run_event_sha256s != scenario.run_event_sha256s {
+                    return Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+                        id: scenario.id.clone(),
+                        field: "run_event_sha256s",
+                    });
+                }
+                verify_rom_class_authority_binding(&scenario.id, &retained_report, authority)?;
+                derived.rom_classes = vec![authority.rom_class];
+            }
             if scenario.coverage != derived {
                 return Err(ReleaseMatrixError::VerifiedDerivedCoverageMismatch {
                     id: scenario.id.clone(),
@@ -636,6 +799,98 @@ pub fn verify_release_matrix(
     manifest: &ReleaseMatrixManifest,
     evidence: &[(ReleaseGateReport, ParsedUnsupportedJournal)],
 ) -> Result<ReleaseMatrixVerification, ReleaseMatrixError> {
+    verify_release_matrix_with_authorities(manifest, evidence, &BTreeMap::new())
+}
+
+/// Verify a release matrix while granting ROM-class credit only from opaque,
+/// fully revalidated private release series.
+///
+/// Every supplied capability freshly re-reads its contract, program-build
+/// receipt, exact retained receipt, runner, reports, journals, and admitted
+/// ROM. Its semantic report digest and ordered run-event identities must equal
+/// the evidence supplied to this matrix. Duplicate or unused capabilities fail
+/// rather than being ignored.
+pub fn verify_release_matrix_with_private_series(
+    manifest: &ReleaseMatrixManifest,
+    evidence: &[(ReleaseGateReport, ParsedUnsupportedJournal)],
+    series: &[&VerifiedPrivateReleaseSeries],
+) -> Result<ReleaseMatrixVerification, ReleaseMatrixError> {
+    let mut authorities = BTreeMap::new();
+    for verified in series {
+        let revalidated = verified
+            .revalidate_for_release_matrix()
+            .map_err(|source| ReleaseMatrixError::InvalidPrivateSeriesAuthority { source })?;
+        let contract = &revalidated.contract;
+        let receipt = &revalidated.receipt;
+        let mut authority = VerifiedRomClassAuthority {
+            schema: VERIFIED_ROM_CLASS_AUTHORITY_SCHEMA.to_owned(),
+            contract_schema: contract.schema.clone(),
+            contract_sha256: contract.contract_sha256.clone(),
+            receipt_schema: receipt.schema.clone(),
+            receipt_sha256: receipt.receipt_sha256.clone(),
+            runner_executable_sha256: receipt.runner_executable_sha256.clone(),
+            purpose: contract.purpose.clone(),
+            report_scenario: contract.report_scenario.clone(),
+            input_sha256: contract.input.sha256.clone(),
+            input_bytes: contract.input.bytes,
+            rom_class: contract.rom_class,
+            guest_cycle: contract.guest_cycle,
+            expected_execution_source: contract.expected_execution_source.clone(),
+            child_executable_sha256: contract.child.executable.sha256.clone(),
+            semantic_report_sha256: receipt.semantic_report_sha256.clone(),
+            run_event_sha256s: receipt
+                .runs
+                .iter()
+                .map(|run| run.run_event_sha256.clone())
+                .collect(),
+            authority_sha256: String::new(),
+        };
+        authority.authority_sha256 = authority.recompute_authority_sha256();
+        authority.verify_integrity(&authority.report_scenario)?;
+        let report_scenario = authority.report_scenario.clone();
+        insert_private_series_authority(&mut authorities, report_scenario, authority)?;
+    }
+    validate_private_series_authority_usage(manifest, &authorities)?;
+    verify_release_matrix_with_authorities(manifest, evidence, &authorities)
+}
+
+fn insert_private_series_authority(
+    authorities: &mut BTreeMap<String, VerifiedRomClassAuthority>,
+    report_scenario: String,
+    authority: VerifiedRomClassAuthority,
+) -> Result<(), ReleaseMatrixError> {
+    if authorities
+        .insert(report_scenario.clone(), authority)
+        .is_some()
+    {
+        return Err(ReleaseMatrixError::DuplicatePrivateSeriesAuthority { report_scenario });
+    }
+    Ok(())
+}
+
+fn validate_private_series_authority_usage(
+    manifest: &ReleaseMatrixManifest,
+    authorities: &BTreeMap<String, VerifiedRomClassAuthority>,
+) -> Result<(), ReleaseMatrixError> {
+    for report_scenario in authorities.keys() {
+        if !manifest
+            .scenarios
+            .iter()
+            .any(|scenario| scenario.report_scenario == *report_scenario)
+        {
+            return Err(ReleaseMatrixError::UnusedPrivateSeriesAuthority {
+                report_scenario: report_scenario.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn verify_release_matrix_with_authorities(
+    manifest: &ReleaseMatrixManifest,
+    evidence: &[(ReleaseGateReport, ParsedUnsupportedJournal)],
+    authorities: &BTreeMap<String, VerifiedRomClassAuthority>,
+) -> Result<ReleaseMatrixVerification, ReleaseMatrixError> {
     let profile = validate_manifest(manifest)?;
 
     let mut evidence_by_report_scenario =
@@ -695,7 +950,24 @@ pub fn verify_release_matrix(
         for path_name in LIVE_MINIMUM_CLOSURE_PATHS {
             require_positive_path(&reports[0].closure, &scenario.id, path_name, false)?;
         }
-        let coverage = derive_scenario_coverage(&scenario.id, reports[0])?;
+        let authority = authorities.get(&scenario.report_scenario).cloned();
+        let mut coverage = derive_scenario_coverage(&scenario.id, reports[0])?;
+        if let Some(authority) = &authority {
+            if authority.semantic_report_sha256 != series.report_sha256 {
+                return Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+                    id: scenario.id.clone(),
+                    field: "semantic_report_sha256",
+                });
+            }
+            if authority.run_event_sha256s != series.run_event_sha256s {
+                return Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+                    id: scenario.id.clone(),
+                    field: "run_event_sha256s",
+                });
+            }
+            verify_rom_class_authority_binding(&scenario.id, reports[0], authority)?;
+            coverage.rom_classes = vec![authority.rom_class];
+        }
         validate_feature_operation_paths(&scenario.id, &coverage, &reports[0].closure)?;
         if series.scenario != scenario.report_scenario {
             return Err(ReleaseMatrixError::ReportScenarioMismatch {
@@ -725,6 +997,8 @@ pub fn verify_release_matrix(
             report_sha256: scenario.report_sha256.clone(),
             report_scenario: scenario.report_scenario.clone(),
             input_sha256: scenario.input_sha256.clone(),
+            rom: reports[0].rom.clone(),
+            rom_class_authority: authority,
             coverage,
             declaration_sha256: scenario.declaration_sha256.clone(),
             guest_cycle: series.guest_cycle,
@@ -800,6 +1074,24 @@ fn derive_profile_assignments(
 ) {
     let mut evidence = BTreeMap::<(CertificationRequirementClass, String), BTreeSet<String>>::new();
     for scenario in scenarios {
+        if let Some(authority) = &scenario.rom_class_authority {
+            for rom_class in &scenario.coverage.rom_classes {
+                insert_requirement_evidence(
+                    &mut evidence,
+                    CertificationRequirementClass::RomClass,
+                    rom_class_id(*rom_class).to_owned(),
+                    &authority.authority_sha256,
+                );
+            }
+        }
+        for tv_region in &scenario.coverage.tv_regions {
+            insert_requirement_evidence(
+                &mut evidence,
+                CertificationRequirementClass::TvRegion,
+                tv_region_id(*tv_region).to_owned(),
+                &scenario.declaration_sha256,
+            );
+        }
         let program = program_feature_id(scenario.coverage.programs[0]);
         let renderer = if scenario
             .coverage
@@ -870,6 +1162,81 @@ fn derive_profile_assignments(
         }
     }
     (assignments, missing)
+}
+
+const fn rom_class_id(value: ReleaseRomClass) -> &'static str {
+    match value {
+        ReleaseRomClass::Unclassified => "unclassified",
+        ReleaseRomClass::RetailCartridge => "retail_cartridge",
+        ReleaseRomClass::PublicHomebrew => "public_homebrew",
+    }
+}
+
+fn verify_rom_class_authority_binding(
+    id: &str,
+    report: &ReleaseGateReport,
+    authority: &VerifiedRomClassAuthority,
+) -> Result<(), ReleaseMatrixError> {
+    authority.verify_integrity(id)?;
+    let rom = report
+        .rom
+        .as_ref()
+        .ok_or_else(|| ReleaseMatrixError::RomClassAuthorityMismatch {
+            id: id.to_owned(),
+            field: "report.rom",
+        })?;
+    if authority.report_scenario != report.scenario {
+        return Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+            id: id.to_owned(),
+            field: "report_scenario",
+        });
+    }
+    if authority.input_sha256 != report.input_sha256 {
+        return Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+            id: id.to_owned(),
+            field: "input_sha256",
+        });
+    }
+    if authority.rom_class != rom.class {
+        return Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+            id: id.to_owned(),
+            field: "rom.class",
+        });
+    }
+    if authority.input_bytes != rom.byte_len {
+        return Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+            id: id.to_owned(),
+            field: "rom.byte_len",
+        });
+    }
+    if authority.guest_cycle != report.digest.guest_cycle {
+        return Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+            id: id.to_owned(),
+            field: "guest_cycle",
+        });
+    }
+    if authority.expected_execution_source != report.execution_destinations.source {
+        return Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+            id: id.to_owned(),
+            field: "execution_destinations.source",
+        });
+    }
+    if authority.semantic_report_sha256 != report.report_sha256 {
+        return Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+            id: id.to_owned(),
+            field: "report_sha256",
+        });
+    }
+    Ok(())
+}
+
+const fn tv_region_id(value: ReleaseTvRegion) -> &'static str {
+    match value {
+        ReleaseTvRegion::Ntsc => "ntsc",
+        ReleaseTvRegion::Pal => "pal",
+        ReleaseTvRegion::Mpal => "mpal",
+        ReleaseTvRegion::RegionFree => "region_free",
+    }
 }
 
 fn platform_api_target(environment: &ReleaseEnvironmentEvidence) -> Option<&'static str> {
@@ -999,6 +1366,7 @@ fn derive_scenario_coverage_with_catalog(
         (
             ReleaseRendererEvidence::Reference {
                 execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+                ..
             },
             FramebufferObservationSource::PhysicalRdram { .. },
         ) => vec![RendererFeature::ReferenceLleAccuracy],
@@ -1010,6 +1378,7 @@ fn derive_scenario_coverage_with_catalog(
                 source_authoritative: true,
                 settings_sha256,
                 replacement_packs_active,
+                ..
             },
             FramebufferObservationSource::PostViSwapchain {
                 backend_identity: observed_identity,
@@ -1047,6 +1416,12 @@ fn derive_scenario_coverage_with_catalog(
         ReleaseHostPlatform::LinuxX86_64 => ReleasePlatform::LinuxX86_64,
         ReleaseHostPlatform::WindowsX86_64 => ReleasePlatform::WindowsX86_64,
     }];
+    let tv_regions = match report.rom.as_ref().map(|rom| rom.decoded_tv_region) {
+        Some(ReleaseTvRegion::Ntsc) => vec![ReleaseTvRegion::Ntsc],
+        Some(ReleaseTvRegion::Pal) => vec![ReleaseTvRegion::Pal],
+        Some(ReleaseTvRegion::Mpal) => vec![ReleaseTvRegion::Mpal],
+        Some(ReleaseTvRegion::RegionFree) | None => Vec::new(),
+    };
     let mut observed_controllers = BTreeSet::new();
     for port in environment.controller_ports {
         match port {
@@ -1105,6 +1480,8 @@ fn derive_scenario_coverage_with_catalog(
         }
     }
     let coverage = ReleaseMatrixCoverage {
+        rom_classes: Vec::new(),
+        tv_regions,
         platforms,
         controllers: observed_controllers.into_iter().collect(),
         saves,
@@ -1427,6 +1804,28 @@ fn validate_coverage(
     coverage: &ReleaseMatrixCoverage,
     required: Option<&ReleaseMatrixCoverage>,
 ) -> Result<(), ReleaseMatrixError> {
+    validate_optional_dimension(scope, "rom_classes", &coverage.rom_classes)?;
+    if coverage.rom_classes.len() > 1 {
+        return Err(ReleaseMatrixError::ExactOneCoverage {
+            id: scope.to_owned(),
+            dimension: "rom_classes",
+            actual: coverage.rom_classes.len(),
+        });
+    }
+    if coverage.rom_classes == [ReleaseRomClass::Unclassified] {
+        return Err(ReleaseMatrixError::InvalidRomClassAuthority {
+            id: scope.to_owned(),
+            detail: "unclassified input cannot satisfy ROM-class coverage".to_owned(),
+        });
+    }
+    validate_optional_dimension(scope, "tv_regions", &coverage.tv_regions)?;
+    if coverage.tv_regions.len() > 1 {
+        return Err(ReleaseMatrixError::ExactOneCoverage {
+            id: scope.to_owned(),
+            dimension: "tv_regions",
+            actual: coverage.tv_regions.len(),
+        });
+    }
     validate_dimension(
         scope,
         "platforms",
@@ -1720,7 +2119,7 @@ fn push_assignment(wire: &mut Vec<u8>, assignment: &CertificationRequirementAssi
 
 fn incomplete_matrix_sha256(report: &IncompleteReleaseMatrix) -> String {
     let mut wire = Vec::new();
-    wire.extend_from_slice(b"fn64.release-matrix-incomplete.v3\0");
+    wire.extend_from_slice(b"fn64.release-matrix-incomplete.v4\0");
     push_bytes(&mut wire, report.schema.as_bytes());
     push_bytes(&mut wire, report.manifest_sha256.as_bytes());
     push_bytes(&mut wire, report.profile.schema.as_bytes());
@@ -1741,7 +2140,7 @@ fn incomplete_matrix_sha256(report: &IncompleteReleaseMatrix) -> String {
 
 fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
     let mut wire = Vec::new();
-    wire.extend_from_slice(b"fn64.verified-release-matrix.v14\0");
+    wire.extend_from_slice(b"fn64.verified-release-matrix.v15\0");
     push_bytes(&mut wire, report.schema.as_bytes());
     push_bytes(&mut wire, report.manifest_sha256.as_bytes());
     push_bytes(&mut wire, report.profile.schema.as_bytes());
@@ -1757,6 +2156,10 @@ fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
         push_bytes(&mut wire, scenario.report_sha256.as_bytes());
         push_bytes(&mut wire, scenario.report_scenario.as_bytes());
         push_bytes(&mut wire, scenario.input_sha256.as_bytes());
+        push_rom_evidence(&mut wire, &scenario.rom);
+        push_rom_class_authority(&mut wire, &scenario.rom_class_authority);
+        push_tags(&mut wire, &scenario.coverage.rom_classes, rom_class_tag);
+        push_tags(&mut wire, &scenario.coverage.tv_regions, tv_region_tag);
         push_tags(
             &mut wire,
             &scenario.coverage.platforms,
@@ -1866,6 +2269,137 @@ fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
     hex(&Sha256::digest(wire))
 }
 
+fn push_rom_class_authority(wire: &mut Vec<u8>, authority: &Option<VerifiedRomClassAuthority>) {
+    let Some(authority) = authority else {
+        wire.push(0);
+        return;
+    };
+    wire.push(1);
+    push_bytes(wire, authority.schema.as_bytes());
+    push_bytes(wire, authority.contract_schema.as_bytes());
+    push_bytes(wire, authority.contract_sha256.as_bytes());
+    push_bytes(wire, authority.receipt_schema.as_bytes());
+    push_bytes(wire, authority.receipt_sha256.as_bytes());
+    push_bytes(wire, authority.runner_executable_sha256.as_bytes());
+    push_bytes(wire, authority.purpose.as_bytes());
+    push_bytes(wire, authority.report_scenario.as_bytes());
+    push_bytes(wire, authority.input_sha256.as_bytes());
+    wire.extend_from_slice(&authority.input_bytes.to_be_bytes());
+    wire.push(rom_class_tag(authority.rom_class));
+    wire.extend_from_slice(&authority.guest_cycle.to_be_bytes());
+    push_execution_source(wire, &authority.expected_execution_source);
+    push_bytes(wire, authority.child_executable_sha256.as_bytes());
+    push_bytes(wire, authority.semantic_report_sha256.as_bytes());
+    wire.extend_from_slice(&(authority.run_event_sha256s.len() as u64).to_be_bytes());
+    for run_event_sha256 in &authority.run_event_sha256s {
+        push_bytes(wire, run_event_sha256.as_bytes());
+    }
+    push_bytes(wire, authority.authority_sha256.as_bytes());
+}
+
+const fn rom_class_tag(value: ReleaseRomClass) -> u8 {
+    match value {
+        ReleaseRomClass::Unclassified => 0,
+        ReleaseRomClass::RetailCartridge => 1,
+        ReleaseRomClass::PublicHomebrew => 2,
+    }
+}
+
+fn push_execution_source(wire: &mut Vec<u8>, source: &ExecutionDestinationSource) {
+    match source {
+        ExecutionDestinationSource::NoProgram => wire.push(0),
+        ExecutionDestinationSource::NativeArchive { artifact_sha256 } => {
+            wire.push(1);
+            push_bytes(wire, artifact_sha256.as_bytes());
+        }
+        ExecutionDestinationSource::TypedObservedFunctionProgram { artifact_sha256 } => {
+            wire.push(2);
+            push_bytes(wire, artifact_sha256.as_bytes());
+        }
+        ExecutionDestinationSource::TypedBlockProgram {
+            program_sha256,
+            dispatch_artifact_sha256,
+        } => {
+            wire.push(3);
+            push_bytes(wire, program_sha256.as_bytes());
+            push_bytes(wire, dispatch_artifact_sha256.as_bytes());
+        }
+    }
+}
+
+fn validate_execution_source_identity(
+    id: &str,
+    source: &ExecutionDestinationSource,
+) -> Result<(), ReleaseMatrixError> {
+    match source {
+        ExecutionDestinationSource::NoProgram => {
+            Err(ReleaseMatrixError::InvalidRomClassAuthority {
+                id: id.to_owned(),
+                detail: "production ROM-class authority cannot name NoProgram".to_owned(),
+            })
+        }
+        ExecutionDestinationSource::NativeArchive { artifact_sha256 }
+        | ExecutionDestinationSource::TypedObservedFunctionProgram { artifact_sha256 } => {
+            validate_sha256(
+                id,
+                "authority.execution_source.artifact_sha256",
+                artifact_sha256,
+            )
+        }
+        ExecutionDestinationSource::TypedBlockProgram {
+            program_sha256,
+            dispatch_artifact_sha256,
+        } => {
+            validate_sha256(
+                id,
+                "authority.execution_source.program_sha256",
+                program_sha256,
+            )?;
+            validate_sha256(
+                id,
+                "authority.execution_source.dispatch_artifact_sha256",
+                dispatch_artifact_sha256,
+            )
+        }
+    }
+}
+
+fn push_rom_evidence(wire: &mut Vec<u8>, rom: &Option<ReleaseRomEvidence>) {
+    let Some(rom) = rom else {
+        wire.push(0);
+        return;
+    };
+    wire.push(1);
+    wire.push(match rom.class {
+        crate::ReleaseRomClass::Unclassified => 0,
+        crate::ReleaseRomClass::RetailCartridge => 1,
+        crate::ReleaseRomClass::PublicHomebrew => 2,
+    });
+    wire.push(match rom.source_byte_order {
+        crate::ReleaseRomByteOrder::Z64 => 0,
+        crate::ReleaseRomByteOrder::N64 => 1,
+        crate::ReleaseRomByteOrder::V64 => 2,
+    });
+    wire.extend_from_slice(&rom.byte_len.to_be_bytes());
+    push_bytes(wire, rom.canonical_sha256.as_bytes());
+    wire.push(rom.destination_code);
+    wire.push(tv_region_tag(rom.decoded_tv_region));
+    wire.push(match rom.configured_tv_type {
+        crate::ReleaseTvStandard::Ntsc => 0,
+        crate::ReleaseTvStandard::Pal => 1,
+        crate::ReleaseTvStandard::Mpal => 2,
+    });
+}
+
+const fn tv_region_tag(value: ReleaseTvRegion) -> u8 {
+    match value {
+        ReleaseTvRegion::Ntsc => 0,
+        ReleaseTvRegion::Pal => 1,
+        ReleaseTvRegion::Mpal => 2,
+        ReleaseTvRegion::RegionFree => 3,
+    }
+}
+
 fn push_observations(wire: &mut Vec<u8>, observations: &ReleaseObservationGeometry) {
     match &observations.framebuffer.source {
         FramebufferObservationSource::PhysicalRdram { address } => {
@@ -1918,12 +2452,21 @@ fn push_environment(wire: &mut Vec<u8>, environment: &ReleaseEnvironmentEvidence
         ReleaseCartridgeSave::FlashRam128Kib => 4,
     });
     match &environment.renderer {
-        ReleaseRendererEvidence::Reference { execution_policy } => {
+        ReleaseRendererEvidence::Reference {
+            execution_policy,
+            tv_type,
+        } => {
             wire.push(0);
             wire.push(release_execution_policy_tag(*execution_policy));
+            wire.push(match tv_type {
+                crate::ReleaseTvStandard::Ntsc => 0,
+                crate::ReleaseTvStandard::Pal => 1,
+                crate::ReleaseTvStandard::Mpal => 2,
+            });
         }
         ReleaseRendererEvidence::Rt64 {
             execution_policy,
+            tv_type,
             graphics_api,
             backend_identity,
             source_authoritative,
@@ -1932,6 +2475,11 @@ fn push_environment(wire: &mut Vec<u8>, environment: &ReleaseEnvironmentEvidence
         } => {
             wire.push(1);
             wire.push(release_execution_policy_tag(*execution_policy));
+            wire.push(match tv_type {
+                crate::ReleaseTvStandard::Ntsc => 0,
+                crate::ReleaseTvStandard::Pal => 1,
+                crate::ReleaseTvStandard::Mpal => 2,
+            });
             wire.push(release_graphics_api_tag(*graphics_api));
             push_bytes(wire, backend_identity.as_bytes());
             wire.push(*source_authoritative as u8);
@@ -1975,6 +2523,23 @@ pub enum ReleaseMatrixError {
     InvalidUnassignedReport {
         scenario: String,
         source: crate::GateError,
+    },
+    InvalidPrivateSeriesAuthority {
+        source: crate::PrivateReleaseSeriesError,
+    },
+    DuplicatePrivateSeriesAuthority {
+        report_scenario: String,
+    },
+    UnusedPrivateSeriesAuthority {
+        report_scenario: String,
+    },
+    InvalidRomClassAuthority {
+        id: String,
+        detail: String,
+    },
+    RomClassAuthorityMismatch {
+        id: String,
+        field: &'static str,
     },
     UnexpectedReportScenario {
         scenario: String,
@@ -2234,6 +2799,11 @@ impl fmt::Display for ReleaseMatrixError {
             Self::UnsupportedIncompleteSchema(schema) => write!(f, "unsupported incomplete release-matrix schema {schema:?}"),
             Self::InvalidCertificationProfile(source) => write!(f, "invalid certification profile: {source}"),
             Self::InvalidUnassignedReport { scenario, source } => write!(f, "release report scenario {scenario:?} is invalid before matrix assignment: {source}"),
+            Self::InvalidPrivateSeriesAuthority { source } => write!(f, "private release series authority failed fresh revalidation: {source}"),
+            Self::DuplicatePrivateSeriesAuthority { report_scenario } => write!(f, "private release series authority for report scenario {report_scenario:?} was supplied more than once"),
+            Self::UnusedPrivateSeriesAuthority { report_scenario } => write!(f, "private release series authority for report scenario {report_scenario:?} has no declared matrix scenario"),
+            Self::InvalidRomClassAuthority { id, detail } => write!(f, "release-matrix scenario {id:?} has invalid ROM-class authority: {detail}"),
+            Self::RomClassAuthorityMismatch { id, field } => write!(f, "release-matrix scenario {id:?} ROM-class authority does not match retained report field {field}"),
             Self::UnexpectedReportScenario { scenario } => write!(f, "release report scenario {scenario:?} is not declared by the matrix manifest"),
             Self::VerifiedDerivedCoverageMismatch { id } => write!(f, "verified release-matrix scenario {id:?} stores coverage that does not match its retained report evidence"),
             Self::VerifiedProfileIncomplete { missing } => write!(f, "verified release matrix is missing project-owned profile requirements {missing:?}"),
@@ -2305,6 +2875,7 @@ impl std::error::Error for ReleaseMatrixError {
         match self {
             Self::InvalidCertificationProfile(source) => Some(source),
             Self::InvalidUnassignedReport { source, .. } => Some(source),
+            Self::InvalidPrivateSeriesAuthority { source } => Some(source),
             Self::InvalidSeries { source, .. } => Some(source),
             Self::InvalidVerifiedObservations { source, .. } => Some(source),
             Self::InvalidVerifiedDigest { source, .. } => Some(source),
@@ -2485,6 +3056,7 @@ mod tests {
             renderer: if is_rt64 {
                 ReleaseRendererEvidence::Rt64 {
                     execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+                    tv_type: crate::ReleaseTvStandard::Ntsc,
                     graphics_api: rt64_graphics_api,
                     backend_identity: rt64_identity.to_owned(),
                     source_authoritative: true,
@@ -2494,6 +3066,7 @@ mod tests {
             } else {
                 ReleaseRendererEvidence::Reference {
                     execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+                    tv_type: crate::ReleaseTvStandard::Ntsc,
                 }
             },
         };
@@ -2690,6 +3263,35 @@ mod tests {
         }
     }
 
+    fn with_rom(
+        mut report: ReleaseGateReport,
+        destination_code: u8,
+        class: crate::ReleaseRomClass,
+    ) -> ReleaseGateReport {
+        let mut bytes = vec![0; 0x1000];
+        bytes[..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        bytes[0x3b..0x3f].copy_from_slice(&[b'N', b'F', b'6', destination_code]);
+        let tv_type = crate::ReleaseRomEvidence::decode_tv_type(&bytes)
+            .unwrap()
+            .unwrap_or(fn64_runtime::TvType::Ntsc);
+        let tv_standard = crate::ReleaseTvStandard::from(tv_type);
+        match &mut report.environment.renderer {
+            ReleaseRendererEvidence::Reference { tv_type, .. }
+            | ReleaseRendererEvidence::Rt64 { tv_type, .. } => *tv_type = tv_standard,
+        }
+        report.input_sha256 = hex(&Sha256::digest(&bytes));
+        report.rom = Some(
+            crate::ReleaseRomEvidence::from_bytes(&bytes, class, tv_type)
+                .expect("test ROM header is valid"),
+        );
+        report.report_sha256 = hex(&Sha256::digest(
+            crate::release_gate::encode_report_evidence(&report)
+                .expect("test report evidence encodes"),
+        ));
+        report.verify_integrity().unwrap();
+        report
+    }
+
     fn assigned_requirement_ids(
         incomplete: &IncompleteReleaseMatrix,
         class: CertificationRequirementClass,
@@ -2700,6 +3302,42 @@ mod tests {
             .filter(|assignment| assignment.requirement.class() == class)
             .map(|assignment| assignment.requirement.id().to_owned())
             .collect()
+    }
+
+    fn rom_class_authority(report: &ReleaseGateReport) -> VerifiedRomClassAuthority {
+        let rom = report
+            .rom
+            .as_ref()
+            .expect("authority fixture has ROM evidence");
+        let mut authority = VerifiedRomClassAuthority {
+            schema: VERIFIED_ROM_CLASS_AUTHORITY_SCHEMA.to_owned(),
+            contract_schema: crate::PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA.to_owned(),
+            contract_sha256: "91".repeat(32),
+            receipt_schema: crate::PRIVATE_RELEASE_SERIES_RECEIPT_SCHEMA.to_owned(),
+            receipt_sha256: "93".repeat(32),
+            runner_executable_sha256: "94".repeat(32),
+            purpose: "full_rom".to_owned(),
+            report_scenario: report.scenario.clone(),
+            input_sha256: report.input_sha256.clone(),
+            input_bytes: rom.byte_len,
+            rom_class: rom.class,
+            guest_cycle: report.digest.guest_cycle,
+            expected_execution_source: report.execution_destinations.source.clone(),
+            child_executable_sha256: "92".repeat(32),
+            semantic_report_sha256: report.report_sha256.clone(),
+            run_event_sha256s: evidence_series(report.clone())
+                .into_iter()
+                .map(|(_, journal)| {
+                    journal
+                        .release_run_event_sha256()
+                        .expect("test journal has a run event")
+                        .to_owned()
+                })
+                .collect(),
+            authority_sha256: String::new(),
+        };
+        authority.authority_sha256 = authority.recompute_authority_sha256();
+        authority
     }
 
     fn replace_report(
@@ -2810,6 +3448,229 @@ mod tests {
             ReleaseMatrixVerification::Complete(_) => unreachable!(),
         };
         assert_eq!(rerun.assessment_sha256, incomplete.assessment_sha256);
+    }
+
+    #[test]
+    fn schema_v19_tv_region_credit_requires_fixed_header_evidence_not_labels_or_region_free() {
+        let fixed = with_rom(
+            closed_report(
+                "fixed-ntsc",
+                b"placeholder",
+                0xd1,
+                "save.sram-operation",
+                CLEAN_RT64_IDENTITY,
+                Some(ProgramFeature::TypedObservedFunction),
+            ),
+            b'E',
+            crate::ReleaseRomClass::RetailCartridge,
+        );
+        assert_eq!(
+            derive_scenario_coverage("fixed-ntsc", &fixed)
+                .unwrap()
+                .tv_regions,
+            vec![ReleaseTvRegion::Ntsc]
+        );
+        let fixed_incomplete = incomplete_for_report("fixed-ntsc", fixed);
+        assert_eq!(
+            assigned_requirement_ids(&fixed_incomplete, CertificationRequirementClass::TvRegion,),
+            BTreeSet::from(["ntsc".to_owned()])
+        );
+        assert!(assigned_requirement_ids(
+            &fixed_incomplete,
+            CertificationRequirementClass::RomClass,
+        )
+        .is_empty());
+
+        let region_free = with_rom(
+            closed_report(
+                "retail-pal-label",
+                b"placeholder",
+                0xd2,
+                "save.sram-operation",
+                CLEAN_RT64_IDENTITY,
+                Some(ProgramFeature::TypedObservedFunction),
+            ),
+            0,
+            crate::ReleaseRomClass::PublicHomebrew,
+        );
+        assert!(derive_scenario_coverage("retail-pal-label", &region_free)
+            .unwrap()
+            .tv_regions
+            .is_empty());
+        let region_free_incomplete = incomplete_for_report("retail-pal-label", region_free);
+        assert!(assigned_requirement_ids(
+            &region_free_incomplete,
+            CertificationRequirementClass::TvRegion,
+        )
+        .is_empty());
+        assert!(assigned_requirement_ids(
+            &region_free_incomplete,
+            CertificationRequirementClass::RomClass,
+        )
+        .is_empty());
+
+        let label_only = incomplete_for_report(
+            "retail-pal-label",
+            closed_report(
+                "retail-pal-label",
+                b"placeholder",
+                0xd3,
+                "save.sram-operation",
+                CLEAN_RT64_IDENTITY,
+                Some(ProgramFeature::TypedObservedFunction),
+            ),
+        );
+        assert!(
+            assigned_requirement_ids(&label_only, CertificationRequirementClass::TvRegion,)
+                .is_empty()
+        );
+        assert!(
+            assigned_requirement_ids(&label_only, CertificationRequirementClass::RomClass,)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rom_class_credit_requires_exact_contract_authority_and_binds_its_digest() {
+        let report = with_rom(
+            closed_report(
+                "authority-retail",
+                b"placeholder",
+                0xd4,
+                "save.sram-operation",
+                CLEAN_RT64_IDENTITY,
+                Some(ProgramFeature::TypedObservedFunction),
+            ),
+            b'E',
+            ReleaseRomClass::RetailCartridge,
+        );
+        let manifest = ReleaseMatrixManifest {
+            schema: RELEASE_MATRIX_SCHEMA.to_owned(),
+            profile: CertificationProfileIdentity::full_parity_v1(),
+            scenarios: vec![scenario("authority-retail", &report)],
+        };
+        let authority = rom_class_authority(&report);
+        let authority_sha256 = authority.authority_sha256.clone();
+        let authorities = BTreeMap::from([(report.scenario.clone(), authority)]);
+        let ReleaseMatrixVerification::Incomplete(incomplete) =
+            verify_release_matrix_with_authorities(
+                &manifest,
+                &evidence_series(report.clone()),
+                &authorities,
+            )
+            .unwrap()
+        else {
+            panic!("one authority-backed series remains intentionally incomplete")
+        };
+        let assignment = incomplete
+            .satisfied
+            .iter()
+            .find(|assignment| {
+                assignment.requirement.class() == CertificationRequirementClass::RomClass
+                    && assignment.requirement.id() == "retail_cartridge"
+            })
+            .expect("retail class receives authority-backed credit");
+        assert_eq!(assignment.evidence_sha256s, [authority_sha256]);
+
+        let mut relabelled = rom_class_authority(&report);
+        relabelled.rom_class = ReleaseRomClass::PublicHomebrew;
+        relabelled.authority_sha256 = relabelled.recompute_authority_sha256();
+        let relabelled = BTreeMap::from([(report.scenario.clone(), relabelled)]);
+        assert!(matches!(
+            verify_release_matrix_with_authorities(
+                &manifest,
+                &evidence_series(report.clone()),
+                &relabelled,
+            ),
+            Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+                field: "rom.class",
+                ..
+            })
+        ));
+
+        let mut tampered = rom_class_authority(&report);
+        tampered.input_bytes += 4;
+        let tampered = BTreeMap::from([(report.scenario.clone(), tampered)]);
+        assert!(matches!(
+            verify_release_matrix_with_authorities(
+                &manifest,
+                &evidence_series(report.clone()),
+                &tampered,
+            ),
+            Err(ReleaseMatrixError::InvalidRomClassAuthority { .. })
+        ));
+
+        let mut wrong_semantic_report = rom_class_authority(&report);
+        wrong_semantic_report.semantic_report_sha256 = "95".repeat(32);
+        wrong_semantic_report.authority_sha256 = wrong_semantic_report.recompute_authority_sha256();
+        let wrong_semantic_report =
+            BTreeMap::from([(report.scenario.clone(), wrong_semantic_report)]);
+        assert!(matches!(
+            verify_release_matrix_with_authorities(
+                &manifest,
+                &evidence_series(report.clone()),
+                &wrong_semantic_report,
+            ),
+            Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+                field: "semantic_report_sha256",
+                ..
+            })
+        ));
+
+        let mut reordered_runs = rom_class_authority(&report);
+        reordered_runs.run_event_sha256s.swap(0, 1);
+        reordered_runs.authority_sha256 = reordered_runs.recompute_authority_sha256();
+        let reordered_runs = BTreeMap::from([(report.scenario.clone(), reordered_runs)]);
+        assert!(matches!(
+            verify_release_matrix_with_authorities(
+                &manifest,
+                &evidence_series(report),
+                &reordered_runs,
+            ),
+            Err(ReleaseMatrixError::RomClassAuthorityMismatch {
+                field: "run_event_sha256s",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn private_series_authorities_reject_unused_and_duplicate_records() {
+        let report = with_rom(
+            closed_report(
+                "authority-homebrew",
+                b"placeholder",
+                0xd5,
+                "save.sram-operation",
+                CLEAN_RT64_IDENTITY,
+                Some(ProgramFeature::TypedObservedFunction),
+            ),
+            b'E',
+            ReleaseRomClass::PublicHomebrew,
+        );
+        let manifest = ReleaseMatrixManifest {
+            schema: RELEASE_MATRIX_SCHEMA.to_owned(),
+            profile: CertificationProfileIdentity::full_parity_v1(),
+            scenarios: vec![scenario("authority-homebrew", &report)],
+        };
+        let authority = rom_class_authority(&report);
+        let mut duplicate = BTreeMap::new();
+        insert_private_series_authority(&mut duplicate, report.scenario.clone(), authority.clone())
+            .unwrap();
+        assert!(matches!(
+            insert_private_series_authority(
+                &mut duplicate,
+                report.scenario.clone(),
+                authority.clone(),
+            ),
+            Err(ReleaseMatrixError::DuplicatePrivateSeriesAuthority { .. })
+        ));
+
+        let unused = BTreeMap::from([("unrelated-scenario".to_owned(), authority)]);
+        assert!(matches!(
+            validate_private_series_authority_usage(&manifest, &unused),
+            Err(ReleaseMatrixError::UnusedPrivateSeriesAuthority { .. })
+        ));
     }
 
     #[test]
@@ -3125,6 +3986,7 @@ mod tests {
             .unwrap();
         report.0.environment.renderer = ReleaseRendererEvidence::Reference {
             execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
+            tv_type: crate::ReleaseTvStandard::Ntsc,
         };
         assert!(matches!(
             verify_release_matrix(&manifest, &evidence),
@@ -3198,6 +4060,8 @@ mod tests {
         assert_eq!(
             derive_scenario_coverage("reference-evidence", &reference.0).unwrap(),
             ReleaseMatrixCoverage {
+                rom_classes: Vec::new(),
+                tv_regions: Vec::new(),
                 platforms: vec![ReleasePlatform::MacosArm64],
                 controllers: vec![ControllerFeature::StandardController],
                 saves: vec![SaveFeature::Eeprom4Kbit],
@@ -3210,6 +4074,8 @@ mod tests {
         assert_eq!(
             derive_scenario_coverage("rt64-evidence", &rt64.0).unwrap(),
             ReleaseMatrixCoverage {
+                rom_classes: Vec::new(),
+                tv_regions: Vec::new(),
                 platforms: vec![ReleasePlatform::LinuxX86_64],
                 controllers: vec![
                     ControllerFeature::StandardController,
@@ -3403,18 +4269,18 @@ mod tests {
     }
 
     #[test]
-    fn stale_verified_v13_and_incomplete_v2_schemas_are_rejected() {
+    fn stale_verified_v14_and_incomplete_v3_schemas_are_rejected() {
         let (_, _, incomplete) = incomplete_fixture();
         let mut stale_incomplete = incomplete;
-        stale_incomplete.schema = "fn64.release-matrix-incomplete.v2".to_owned();
+        stale_incomplete.schema = "fn64.release-matrix-incomplete.v3".to_owned();
         assert!(matches!(
             stale_incomplete.verify_integrity(),
             Err(ReleaseMatrixError::UnsupportedIncompleteSchema(schema))
-                if schema == "fn64.release-matrix-incomplete.v2"
+                if schema == "fn64.release-matrix-incomplete.v3"
         ));
 
         let stale_verified = VerifiedReleaseMatrix {
-            schema: "fn64.verified-release-matrix.v13".to_owned(),
+            schema: "fn64.verified-release-matrix.v14".to_owned(),
             manifest_sha256: "00".repeat(32),
             profile: CertificationProfileIdentity::full_parity_v1(),
             total_reports: 0,
@@ -3425,7 +4291,7 @@ mod tests {
         assert!(matches!(
             stale_verified.verify_integrity(),
             Err(ReleaseMatrixError::UnsupportedVerifiedSchema(schema))
-                if schema == "fn64.verified-release-matrix.v13"
+                if schema == "fn64.verified-release-matrix.v14"
         ));
     }
 
