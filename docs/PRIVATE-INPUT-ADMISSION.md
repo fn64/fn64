@@ -130,7 +130,7 @@ digits, dots, underscores, or hyphens, beginning with a letter or digit. A raw
 
 `program_evidence_lane` is the pre-run executable-authority contract. A
 `full_rom` or `combined` run must select `typed_observed_function`,
-`typed_block_program`, or `identified_native_archive`; the resulting v19
+`typed_block_program`, or `identified_native_archive`; the resulting v20
 report must carry that exact execution-destination source.
 `typed_observed_function` asserts that the host installed the generated
 artifact's `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA` marker and that the
@@ -143,7 +143,7 @@ ten-run series spends time booting the game.
 
 The v6 `runner` section binds the exact native entry image, program-build
 receipt, working directory, argument vector, fixed child environment, gate
-cycle, and expected v19 execution source. The executable and receipt must be
+cycle, and expected v20 execution source. The executable and receipt must be
 built before admission. The trusted runner clears the ambient environment,
 launches the executable directly, and owns `ROM`,
 `FN64_RELEASE_ROM_CLASS`, the gate/report/event variables, and the staged
@@ -172,13 +172,13 @@ mechanism coverage from each validated committed-boundary report. A backend-
 recognized microcode family is diagnostic/optimization evidence only.
 Public-microcode credit requires independent exact digest-to-family
 adjudication by the immutable project-owned catalog v1, which is currently
-empty pending allowed-source digest provenance; matrix v15 therefore cannot yet
-satisfy any public-microcode requirement. Schema v19 binds RT64's resolved
+empty pending allowed-source digest provenance; matrix v16 therefore cannot yet
+satisfy any public-microcode requirement. Schema v20 binds RT64's resolved
 graphics API independently of the requested settings and derives
 `macos-metal` or `linux-vulkan` target credit only from an authoritative
-matching RT64 post-VI report. Windows D3D12 and Vulkan are distinguished, but
-the frozen `windows_x86_64` platform does not identify Windows 10 versus 11,
-so it cannot satisfy any of the four versioned Windows targets. A readiness
+matching RT64 post-VI report. Windows D3D12 and Vulkan are distinguished, and
+an exact native workstation build/UBR derives Windows 10 versus 11; no positive
+Windows report has been retained. A readiness
 receipt, scenario label, reference renderer, or coarse host platform cannot
 satisfy ROM-class, TV-region, public-microcode, platform-case, or blocker
 requirements by itself. TV-region credit is derived from normalized header,
@@ -301,7 +301,7 @@ process able to discover, chmod, and replace staged paths between verification
 and operating-system open/spawn is outside scope, as is replacement of the
 OS-owned resolved Python image. Each child gets a distinct derived event
 identity and new report/journal/log paths.
-The runner verifies each terminal v3 journal, exact v19
+The runner verifies each terminal v3 journal, exact v20
 scenario/cycle/input/source, the five fixed-cycle artifacts, live-minimum
 closure, zero reached unsupported events, and the admitted microcode pair
 before starting the next child. For a
@@ -326,7 +326,7 @@ capabilities created by jointly revalidating the admitted contract, exact-ten
 receipt, retained reports/journals, raw ROM, runner image, bound files, and
 program-build receipt. It requires exact semantic-report and ordered run-event
 agreement with the matrix evidence and retains
-`fn64.verified-rom-class-authority.v1` in matrix v15. That record's digest
+`fn64.verified-rom-class-authority.v1` in matrix v16. That record's digest
 detects later drift; it is not a signature and does not replace external
 attestation when transferable provenance is required.
 
@@ -412,7 +412,7 @@ attestation connecting those identities.
 
 The build receipt does not claim microcode-data consumption. At graphics-task
 start, the ABI hashes the exact logical RDRAM bytes at the original task
-microcode-data address and length. Report schema `fn64.release-gate.v19`
+microcode-data address and length. Report schema `fn64.release-gate.v20`
 records those fields in
 the same recognition event as the live 4 KiB IMEM SHA-256 and recognized
 family, using `fn64.rsp-rdp-observations.v2`. The family comes only from the

@@ -25,10 +25,11 @@ use crate::{
     FramebufferObservationSource, ObservationEvidenceError, ReleaseCartridgeSave,
     ReleaseControllerPort, ReleaseEnvironmentEvidence, ReleaseGraphicsApi,
     ReleaseGraphicsExecutionPolicy, ReleaseHostPlatform, ReleaseObservationGeometry,
-    ReleaseRendererEvidence,
+    ReleaseRendererEvidence, ReleaseWindowsFamily, ReleaseWindowsProductType,
+    ReleaseWindowsVersionEvidence,
 };
 
-pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v19";
+pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v20";
 
 /// Provenance class declared for a ROM input. The N64 header does not encode
 /// whether otherwise-valid bytes came from a retail cartridge or a public
@@ -841,6 +842,7 @@ impl LiveReleaseGate {
             frozen_destinations,
             frozen_rsp_rdp,
             platform,
+            windows_version,
             render,
         ) = boundary
             .into_evidence()
@@ -892,7 +894,7 @@ impl LiveReleaseGate {
                 observed.memory_bytes.len(),
             )
             .map_err(GateError::InvalidObservationGeometry)?;
-        let environment = environment_from_frozen(platform, &host, render)?;
+        let environment = environment_from_frozen(platform, windows_version, &host, render)?;
         validate_environment_observation(&environment, &observed.observations)?;
         let audio_bytes =
             fn64_abi::copy_audio_digest_bytes().ok_or(GateError::AudioDigestCaptureNotArmed)?;
@@ -1742,6 +1744,7 @@ fn derive_live_closure(inputs: LiveClosureInputs<'_>) -> Result<Vec<ClosurePath>
 
 fn environment_from_frozen(
     platform: ReleaseHostPlatform,
+    windows_version: Option<ReleaseWindowsVersionEvidence>,
     host: &fn64_abi::AbiHostEvidenceSnapshot,
     render: fn64_abi::RenderEnvironmentEvidenceSnapshot,
 ) -> Result<ReleaseEnvironmentEvidence, GateError> {
@@ -1819,6 +1822,7 @@ fn environment_from_frozen(
     };
     Ok(ReleaseEnvironmentEvidence {
         platform,
+        windows_version,
         controller_ports,
         cartridge_save,
         renderer,
@@ -1866,6 +1870,22 @@ fn validate_environment_observation(
 fn validate_environment_evidence(
     environment: &ReleaseEnvironmentEvidence,
 ) -> Result<(), GateError> {
+    match (environment.platform, environment.windows_version) {
+        (ReleaseHostPlatform::WindowsX86_64, Some(version)) => version
+            .verify()
+            .map_err(GateError::InvalidWindowsVersionEvidence)?,
+        (ReleaseHostPlatform::WindowsX86_64, None) => {
+            return Err(GateError::InvalidWindowsVersionEvidence(
+                "windows_x86_64 requires exact native build evidence",
+            ));
+        }
+        (_, Some(_)) => {
+            return Err(GateError::InvalidWindowsVersionEvidence(
+                "non-Windows platform carries Windows version evidence",
+            ));
+        }
+        (_, None) => {}
+    }
     match &environment.renderer {
         ReleaseRendererEvidence::Reference {
             execution_policy, ..
@@ -1939,6 +1959,7 @@ fn test_release_environment(
     };
     ReleaseEnvironmentEvidence {
         platform: super::release_host_platform().expect("test platform is release-supported"),
+        windows_version: super::test_release_windows_version(),
         controller_ports: [
             ReleaseControllerPort::StandardControllerNoPak,
             ReleaseControllerPort::Absent,
@@ -2152,7 +2173,7 @@ impl ReleaseGateReport {
         )
     }
 
-    /// Recompute the schema-v19 evidence digest after loading a retained JSON
+    /// Recompute the schema-v20 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {
@@ -2362,6 +2383,7 @@ pub enum GateError {
     UnidentifiedCartridgeSave,
     UnidentifiedRenderBackend,
     NonAccuracyRenderPolicy,
+    InvalidWindowsVersionEvidence(&'static str),
     RendererObservationMismatch(&'static str),
     InvalidViBoundary(crate::ViBoundaryError),
     WrongLiveCycle {
@@ -2648,6 +2670,9 @@ impl fmt::Display for GateError {
                 f,
                 "live release evidence requires GraphicsTaskExecutionPolicy::LleAccuracy"
             ),
+            Self::InvalidWindowsVersionEvidence(detail) => {
+                write!(f, "invalid Windows release identity: {detail}")
+            }
             Self::RendererObservationMismatch(detail) => {
                 write!(f, "frozen renderer evidence disagrees with framebuffer observation: {detail}")
             }
@@ -4373,6 +4398,23 @@ pub(crate) fn encode_report_evidence(report: &ReleaseGateReport) -> Result<Vec<u
         ReleaseHostPlatform::LinuxX86_64 => 1,
         ReleaseHostPlatform::WindowsX86_64 => 2,
     });
+    match report.environment.windows_version {
+        None => out.push(0),
+        Some(version) => {
+            out.push(1);
+            out.push(match version.family {
+                ReleaseWindowsFamily::Windows10 => 0,
+                ReleaseWindowsFamily::Windows11 => 1,
+            });
+            push_u32(&mut out, version.major);
+            push_u32(&mut out, version.minor);
+            push_u32(&mut out, version.build);
+            push_u32(&mut out, version.update_build_revision);
+            out.push(match version.product_type {
+                ReleaseWindowsProductType::Workstation => 0,
+            });
+        }
+    }
     for port in report.environment.controller_ports {
         out.push(match port {
             ReleaseControllerPort::StandardControllerNoPak => 0,
@@ -4509,7 +4551,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v19_rom_identity_normalizes_byte_order_and_decodes_every_tv_class() {
+    fn schema_v20_rom_identity_normalizes_byte_order_and_decodes_every_tv_class() {
         let ntsc = test_rom(b'E');
         let expected =
             ReleaseRomEvidence::from_bytes(&ntsc, ReleaseRomClass::RetailCartridge, TvType::Ntsc)
@@ -4572,7 +4614,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v19_rom_decode_rejects_unknown_or_inconsistent_authority() {
+    fn schema_v20_rom_decode_rejects_unknown_or_inconsistent_authority() {
         assert!(matches!(
             ReleaseRomEvidence::from_bytes(
                 &test_rom(b'E'),
@@ -5173,17 +5215,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_v19_fixed_cycle_digest_is_stable_and_complete() {
+    fn schema_v20_fixed_cycle_digest_is_stable_and_complete() {
         assert_eq!(complete_digest(), complete_digest());
         assert_eq!(complete_digest().artifacts.len(), 5);
         assert_eq!(
             complete_digest().root_sha256,
-            "8204997786632bc3eacf2261ceab9df9b99bd11c22dbe4f98207e250e006d566"
+            "3001732227bad47cceeefe18ae478d58bbf321ba266f09474324cea269b6d423"
         );
     }
 
     #[test]
-    fn schema_v19_report_wire_binds_rom_identity_class_and_tv_authorities() {
+    fn schema_v20_report_wire_binds_rom_identity_class_and_tv_authorities() {
         let input = test_rom(b'E');
         let geometry = observations();
         let rom =
@@ -6371,11 +6413,11 @@ mod tests {
         ));
 
         let mut stale_schema = report.clone();
-        stale_schema.schema = "fn64.release-gate.v18".to_owned();
+        stale_schema.schema = "fn64.release-gate.v19".to_owned();
         assert!(matches!(
             stale_schema.verify_integrity(),
             Err(GateError::UnsupportedReportSchema(schema))
-                if schema == "fn64.release-gate.v18"
+                if schema == "fn64.release-gate.v19"
         ));
 
         let duplicate = vec![report.closure[0].clone(), report.closure[0].clone()];
@@ -6392,7 +6434,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v19_report_wire_binds_every_release_environment_field() {
+    fn schema_v20_report_wire_binds_every_release_environment_field() {
         let report = ReleaseGateReport::new(
             "environment-wire",
             b"input",
@@ -6417,6 +6459,43 @@ mod tests {
                 assert_ne!(digest(&changed), baseline, "platform tag collided");
             }
         }
+
+        let mut windows = report.clone();
+        windows.environment.platform = ReleaseHostPlatform::WindowsX86_64;
+        windows.environment.windows_version = Some(
+            ReleaseWindowsVersionEvidence::from_native_workstation(10, 0, 22_000, 123).unwrap(),
+        );
+        validate_environment_evidence(&windows.environment).unwrap();
+        let windows_baseline = digest(&windows);
+        for mutate in [
+            |version: &mut ReleaseWindowsVersionEvidence| version.major = 11,
+            |version: &mut ReleaseWindowsVersionEvidence| version.minor = 1,
+            |version: &mut ReleaseWindowsVersionEvidence| version.build += 1,
+            |version: &mut ReleaseWindowsVersionEvidence| version.update_build_revision += 1,
+            |version: &mut ReleaseWindowsVersionEvidence| {
+                version.family = ReleaseWindowsFamily::Windows10
+            },
+        ] {
+            let mut changed = windows.clone();
+            mutate(changed.environment.windows_version.as_mut().unwrap());
+            assert_ne!(
+                digest(&changed),
+                windows_baseline,
+                "Windows identity field collided"
+            );
+        }
+        let mut missing_windows_version = windows.clone();
+        missing_windows_version.environment.windows_version = None;
+        assert!(matches!(
+            validate_environment_evidence(&missing_windows_version.environment),
+            Err(GateError::InvalidWindowsVersionEvidence(_))
+        ));
+        let mut attached_to_macos = windows;
+        attached_to_macos.environment.platform = ReleaseHostPlatform::MacosArm64;
+        assert!(matches!(
+            validate_environment_evidence(&attached_to_macos.environment),
+            Err(GateError::InvalidWindowsVersionEvidence(_))
+        ));
 
         let port_states = [
             ReleaseControllerPort::StandardControllerNoPak,
@@ -6568,7 +6647,7 @@ mod tests {
         let mut host = host_snapshot();
         host.cartridge_save = fn64_abi::CartridgeSaveEvidenceSnapshot::Unidentified;
         assert!(matches!(
-            environment_from_frozen(platform, &host, reference()),
+            environment_from_frozen(platform, None, &host, reference()),
             Err(GateError::UnidentifiedCartridgeSave)
         ));
 
@@ -6576,6 +6655,7 @@ mod tests {
         assert!(matches!(
             environment_from_frozen(
                 platform,
+                None,
                 &host,
                 fn64_abi::RenderEnvironmentEvidenceSnapshot {
                     backend: fn64_abi::RenderBackendEvidence::Unidentified,
@@ -6587,6 +6667,7 @@ mod tests {
         assert!(matches!(
             environment_from_frozen(
                 platform,
+                None,
                 &host,
                 fn64_abi::RenderEnvironmentEvidenceSnapshot {
                     backend: fn64_abi::RenderBackendEvidence::Reference {
@@ -6621,6 +6702,7 @@ mod tests {
         ] {
             let environment = environment_from_frozen(
                 platform,
+                None,
                 &host,
                 fn64_abi::RenderEnvironmentEvidenceSnapshot {
                     backend: fn64_abi::RenderBackendEvidence::Rt64 {
@@ -6672,6 +6754,7 @@ mod tests {
         let valid_api = current_test_graphics_api();
         let environment = ReleaseEnvironmentEvidence {
             platform,
+            windows_version: crate::test_release_windows_version(),
             controller_ports: [ReleaseControllerPort::Absent; 4],
             cartridge_save: ReleaseCartridgeSave::NoCartridgeSave,
             renderer: ReleaseRendererEvidence::Rt64 {
@@ -7211,7 +7294,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v19_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
+    fn schema_v20_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
         let geometry = observations();
         let graphics_closure = vec![ClosurePath {
             name: "rsp.graphics-task".to_owned(),
