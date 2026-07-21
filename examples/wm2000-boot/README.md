@@ -123,8 +123,38 @@ task's done woke the GFX runner (the trace's crossover, seq
 making both blocked lists priority-sorted at insertion (descending,
 FIFO among equals), with the parking thread's priority captured at
 block time. With the fix the boot runs straight through the former
-3-frame wall (fade ramp white → black completes and gfx frames keep
-pacing 2 per second-ish of virtual time alongside the audio cadence).
+3-frame wall: 5 gfx tasks / 6 `osViSwapBuffer` swaps, and the fade
+ramp COMPLETES (near-white dither at swap #0 through near-black at
+swap #4/#5) before boot moves on to the next phase.
+
+## Second fix same day: PI-manager command-queue model
+
+Immediately past the fade, boot livelocked at 100% host CPU inside the
+chunked asset loader (`funcs_5.c` `func_80012064`, asm 0x8001214C:
+`while (osEPiStartDma(..) != 0);`). fn64 returned -1 whenever ONE PI
+transfer was in flight, but real `osEPiStartDma` enqueues the OSIoMesg
+on the PI manager's command queue and returns 0 — -1 means the command
+queue itself is full. The guest's retry loop never yields, so under
+the cooperative executor the pending completion could never commit.
+Fixed in `crates/fn64-abi` (`pi.rs`/`lib.rs`): managed requests
+accepted while busy are queued (capacity = the game's own
+`osCreatePiManager(cmdMsgCnt)`; NWXE passes 0x40, funcs_0.c asm
+0x800004F8) and started FIFO as each transfer completes.
+
+## Known frontier (2026-07-21): music-sequencer stub livelock
+
+With both fixes, boot progresses past the fade + asset loading into the
+AKI sound driver's sequencer tick and spins forever inside ONE
+scheduler step: `funcs_9.c` `func_80023930` (asm 0x80023A4C) loops
+`while (nextEventTime - clock < 0) func_80023C20(track);` — and
+`func_80023C20` (the 0x54C-byte music-sequence command interpreter,
+`disasm/asm/1050.s` line 40933, marked `nonmatching`, dispatching
+through the `D_80047F24` jump table) was emitted as an EMPTY stub in
+RecompiledFuncs, so the track's next-event time never advances. This is
+a CORPUS repair (aki-recomp side — same class as the repaired
+`func_80000B30` boot-bootstrap stub), not an fn64 runtime divergence:
+the interpreter and its ~0x80 jump-table handlers need real
+translations before boot can reach the logo scene.
 
 ## Known frontier (2026-07-14)
 
