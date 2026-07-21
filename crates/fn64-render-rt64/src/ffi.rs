@@ -2,10 +2,10 @@ use std::ffi::{c_char, c_int, CStr, CString};
 use std::ptr::NonNull;
 
 use fn64_render::{
-    ActiveRenderGraphicsApi, AspectTarget, DownsampleMultiplier, OsTask, RefreshRateTarget,
-    RenderAntialiasing, RenderAspectRatio, RenderDisplayBuffering, RenderEmulatorSettings,
-    RenderEnhancementSettings, RenderFiltering, RenderGraphicsApi, RenderHardwareResolve,
-    RenderInternalColorFormat, RenderPresentationMode, RenderRefreshRate,
+    ActiveRenderGraphicsApi, AspectTarget, DownsampleMultiplier, DpFullSyncStatus, OsTask,
+    RefreshRateTarget, RenderAntialiasing, RenderAspectRatio, RenderDisplayBuffering,
+    RenderEmulatorSettings, RenderEnhancementSettings, RenderFiltering, RenderGraphicsApi,
+    RenderHardwareResolve, RenderInternalColorFormat, RenderPresentationMode, RenderRefreshRate,
     RenderReplacementAutoPath, RenderReplacementOperation, RenderReplacementPackIdentity,
     RenderReplacementShift, RenderResolution, RenderRuntimeSettings, RenderUpscale2d,
     ResolutionMultiplier, ViPixelType, ViPresentation, ViScanoutState,
@@ -80,6 +80,68 @@ impl From<&OsTask> for RawTask {
             data_size: task.data_size,
         }
     }
+}
+
+const TASK_RESULT_SCHEMA: u32 = 1;
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+struct RawTaskResult {
+    schema: u32,
+    entry_gbi_available: u32,
+    workload_id_before: u64,
+    workload_id_after: u64,
+    initial_ucode_text_address: u32,
+    initial_ucode_data_address: u32,
+    final_ucode_text_address: u32,
+    final_ucode_data_address: u32,
+}
+
+const _: [(); 40] = [(); std::mem::size_of::<RawTaskResult>()];
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeTaskResult {
+    pub(crate) dp_full_sync: DpFullSyncStatus,
+    pub(crate) full_sync_count: u64,
+    pub(crate) initial_ucode_addresses: (u32, u32),
+    pub(crate) final_ucode_addresses: (u32, u32),
+}
+
+fn task_result_from_raw(raw: RawTaskResult) -> Result<NativeTaskResult, String> {
+    if raw.schema != TASK_RESULT_SCHEMA {
+        return Err(format!(
+            "RT64 task result schema {} does not match required schema {TASK_RESULT_SCHEMA}",
+            raw.schema
+        ));
+    }
+    if raw.entry_gbi_available != 1 {
+        return Err(format!(
+            "RT64 successful task returned entry_gbi_available={}",
+            raw.entry_gbi_available
+        ));
+    }
+    let full_sync_count = raw
+        .workload_id_after
+        .checked_sub(raw.workload_id_before)
+        .ok_or_else(|| {
+            format!(
+                "RT64 task workload ID moved backwards from {} to {}",
+                raw.workload_id_before, raw.workload_id_after
+            )
+        })?;
+    Ok(NativeTaskResult {
+        dp_full_sync: if full_sync_count == 0 {
+            DpFullSyncStatus::NotReached
+        } else {
+            DpFullSyncStatus::Reached
+        },
+        full_sync_count,
+        initial_ucode_addresses: (
+            raw.initial_ucode_text_address,
+            raw.initial_ucode_data_address,
+        ),
+        final_ucode_addresses: (raw.final_ucode_text_address, raw.final_ucode_data_address),
+    })
 }
 
 #[derive(Copy, Clone, Default)]
@@ -1613,6 +1675,7 @@ unsafe extern "C" {
         imem_len: usize,
         task: *const RawTask,
         output_addr: u32,
+        result: *mut RawTaskResult,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
@@ -2267,10 +2330,11 @@ impl Context {
         rsp_memory: &mut RspMemory,
         task: &OsTask,
         output_addr: u32,
-    ) -> Result<(), String> {
+    ) -> Result<NativeTaskResult, String> {
         let raw_task = RawTask::from(task);
         let mut dmem = *rsp_memory.bank(RspMemoryBank::Dmem);
         let mut imem = *rsp_memory.bank(RspMemoryBank::Imem);
+        let mut result = RawTaskResult::default();
         let mut error = [0; ERROR_CAPACITY];
         // SAFETY: the opaque context is alive and uniquely borrowed; both
         // slice pointer/length and the repr(C) task remain valid for the
@@ -2287,6 +2351,7 @@ impl Context {
                 imem.len(),
                 &raw_task,
                 output_addr,
+                &mut result,
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -2302,7 +2367,7 @@ impl Context {
                     .write_bytes(RspMemAddr::from_register(0x1000), &imem)
                     .expect("RT64 returned a complete 4 KiB IMEM bank");
             }
-            Ok(())
+            task_result_from_raw(result)
         } else {
             Err(error_string(
                 &error,
@@ -3188,6 +3253,61 @@ impl Drop for Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_task_result_derives_full_sync_count_and_ucode_transition() {
+        let result = task_result_from_raw(RawTaskResult {
+            schema: TASK_RESULT_SCHEMA,
+            entry_gbi_available: 1,
+            workload_id_before: 7,
+            workload_id_after: 10,
+            initial_ucode_text_address: 0x1000,
+            initial_ucode_data_address: 0x2000,
+            final_ucode_text_address: 0x3000,
+            final_ucode_data_address: 0x4000,
+        })
+        .unwrap();
+        assert_eq!(result.dp_full_sync, DpFullSyncStatus::Reached);
+        assert_eq!(result.full_sync_count, 3);
+        assert_eq!(result.initial_ucode_addresses, (0x1000, 0x2000));
+        assert_eq!(result.final_ucode_addresses, (0x3000, 0x4000));
+
+        let no_sync = task_result_from_raw(RawTaskResult {
+            schema: TASK_RESULT_SCHEMA,
+            entry_gbi_available: 1,
+            workload_id_before: 11,
+            workload_id_after: 11,
+            ..RawTaskResult::default()
+        })
+        .unwrap();
+        assert_eq!(no_sync.dp_full_sync, DpFullSyncStatus::NotReached);
+        assert_eq!(no_sync.full_sync_count, 0);
+    }
+
+    #[test]
+    fn native_task_result_rejects_untyped_or_inconsistent_success() {
+        for raw in [
+            RawTaskResult {
+                schema: TASK_RESULT_SCHEMA + 1,
+                entry_gbi_available: 1,
+                ..RawTaskResult::default()
+            },
+            RawTaskResult {
+                schema: TASK_RESULT_SCHEMA,
+                entry_gbi_available: 0,
+                ..RawTaskResult::default()
+            },
+            RawTaskResult {
+                schema: TASK_RESULT_SCHEMA,
+                entry_gbi_available: 1,
+                workload_id_before: 2,
+                workload_id_after: 1,
+                ..RawTaskResult::default()
+            },
+        ] {
+            assert!(task_result_from_raw(raw).is_err());
+        }
+    }
 
     #[test]
     fn vi_status_wire_preserves_every_typed_antialias_mode() {

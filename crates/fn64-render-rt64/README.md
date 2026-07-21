@@ -137,6 +137,17 @@ task. The raw renderer call carries that VI output explicitly, so CPU-only DPC
 streams do not depend on backend call history. Unknown microcode therefore
 does not require RT64 to recognize its GBI.
 
+Native HLE task submission returns a schema-checked typed result. The result
+binds whether RT64 had an entry GBI, workload IDs before and after the call,
+and RT64's initial/final microcode address pair. In pinned RT64, only the
+public FullSync path advances the state workload ID, so the delta provides
+native `Reached`/`NotReached` evidence and preserves the exact count when a
+task synchronizes more than once. While the reference preflight remains, its
+public-command result must agree exactly with the native delta or the adapter
+fails closed. Initial/final address changes are diagnostic only: they cannot
+prove that every intermediate `G_LOAD_UCODE` generation was admitted, so they
+do not yet authorize removing the transactional self-load preflight.
+
 The C++ and every Rust `unsafe` block used to call it are quarantined here, as
 required by `docs/DESIGN.md` section 1. `fn64-render`, `fn64-runtime`, and the
 Rust recompiler remain unaware of RT64 types and continue to forbid unsafe

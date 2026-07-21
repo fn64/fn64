@@ -4777,7 +4777,8 @@ impl RenderBackend for Rt64Backend {
                     );
                 }
             }
-            self.context
+            let native_result = self
+                .context
                 .as_mut()
                 .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
                 .process_task(rdram, rsp_memory, task, output_addr)
@@ -4785,7 +4786,21 @@ impl RenderBackend for Rt64Backend {
                     backend: "rt64",
                     reason,
                 })?;
-            self.last_dp_full_sync = full_sync;
+            if native_result.dp_full_sync != full_sync {
+                return Err(RenderError::Backend {
+                    backend: "rt64-task-result",
+                    reason: format!(
+                        "native FullSync evidence {:?} (count {}, ucode addresses {:#010x}/{:#010x} -> {:#010x}/{:#010x}) disagrees with transactional inspection {full_sync:?}",
+                        native_result.dp_full_sync,
+                        native_result.full_sync_count,
+                        native_result.initial_ucode_addresses.0,
+                        native_result.initial_ucode_addresses.1,
+                        native_result.final_ucode_addresses.0,
+                        native_result.final_ucode_addresses.1,
+                    ),
+                });
+            }
+            self.last_dp_full_sync = native_result.dp_full_sync;
             Ok(FrameStatus::Complete)
         }
 

@@ -27,6 +27,25 @@ typedef struct Fn64Rt64Task {
     uint32_t data_size;
 } Fn64Rt64Task;
 
+enum {
+    FN64_RT64_TASK_RESULT_SCHEMA = 1
+};
+
+/* Typed observations from one synchronous native HLE task. A workload-ID
+ * advance is emitted only by pinned RT64's FullSync path. Address changes are
+ * diagnostic until every intermediate G_LOAD_UCODE generation is observed;
+ * they are not sufficient by themselves to authorize HLE admission. */
+typedef struct Fn64Rt64TaskResult {
+    uint32_t schema;
+    uint32_t entry_gbi_available;
+    uint64_t workload_id_before;
+    uint64_t workload_id_after;
+    uint32_t initial_ucode_text_address;
+    uint32_t initial_ucode_data_address;
+    uint32_t final_ucode_text_address;
+    uint32_t final_ucode_data_address;
+} Fn64Rt64TaskResult;
+
 typedef struct Fn64Rt64ViState {
     uint32_t registers[14];
     uint8_t registers_present;
@@ -600,6 +619,7 @@ int fn64_rt64_process_task(
     size_t imem_len,
     const Fn64Rt64Task *task,
     uint32_t output_addr,
+    Fn64Rt64TaskResult *result,
     char *error,
     size_t error_capacity);
 
