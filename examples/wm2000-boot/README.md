@@ -528,18 +528,45 @@ watchpoint), plus the lldb script patterns in `/tmp/wm2000_dlwatch.py`
 (RecompContext register watch armed at the Nth call), and
 `/tmp/wm2000_slotwatch.py` (guest stack-slot watch).
 
-## Next frontier: rasterizer W-reciprocal trap in the deep demo scene
+## RESOLVED (2026-07-21, same cycle): rasterizer W-reciprocal trap
 
-With the fall-through mend in place the run ends at a NAMED renderer
-trap, not guest corruption: `raster.rs:1354` asserts
-`raw RDP textured triangle tile 0 produced non-positive W reciprocal
--4570513467 at (30, 206)` around gfx task #27. A perspective triangle
-crossing the near plane can legitimately present non-positive W at edge
-pixels; real RDP hardware's `tcdiv` reciprocal path produces garbage
-texels there but never faults. The reference rasterizer needs a
-faithful non-positive-W policy (clamp/garbage-texel like hardware)
-instead of the loud assert -- the assert was correct to exist until real
-content hit it; now it is the boot frontier.
+With the fall-through mend in place the run next ended at a NAMED
+renderer trap: `raster.rs` asserted `non-positive W reciprocal
+-4570513467 at (30, 206)` around gfx task #27 -- a perspective triangle
+crossing the near plane, which legitimately presents w <= 0 at edge
+pixels of the interpolated plane. Real RDP hardware's `tcdiv` derives
+1/w from the operand's top bits with no sign trap: garbage texels, no
+fault. The raw-RDP lane now divides by the magnitude (min one ULP) --
+defined-garbage tolerance, hardware's actual behavior. The F3DEX2 HLE
+lane keeps its asserts (there the ucode's near-plane cull enforces the
+invariant before rasterization).
+
+**Combined result of the two fixes this cycle:** boot runs from
+crash-after-gfx-task-#7 to **gfx task #781 / VI swap #272** (a 2M-step
+run, ~100x deeper than the previous frontier). The demo scene stays
+alive throughout -- per-task triangle counts cycle 50..1013 as the
+camera moves -- and the fade layer executes full visible ramps:
+near-black (`/tmp/fn64-fb-15.png`) -> mid-gray (`/tmp/fn64-fb-186.png`)
+-> near-white (`/tmp/fn64-fb-272.png`, the deepest presented frame).
+By task ~#780 the task shape changes to small 11-25-triangle DLs --
+logo/menu-scale content beginning, still under the fade cover.
+
+## Next frontier: SRAM read one page past the 32 KiB device
+
+The 2M-step run ends at a NAMED save-storage trap, not corruption:
+`InMemorySaveStorage::read_into: range 0x20..0x8020 exceeds device
+length 0x8000` (save.rs:192), immediately after swap #272 / gfx task
+#781. The game DMAs 0x8000 bytes of SRAM starting at device offset
+0x20 -- 0x20 past the 256 Kbit chip this harness registers
+(`SaveType::SramBanked`). Open questions for the next cycle: does NWXE
+actually use banked/larger SRAM (768 Kbit, 3x32 KiB banks -- the
+`SramBanked` type exists for exactly that shape), does hardware wrap
+the address lines (so the last 0x20 bytes alias offset 0..0x20), or is
+fn64's PI SRAM offset decode off by the 0x20-byte save-signature
+header the game writes at boot (`func_800F4B60`'s 0x19990901 block)?
+Evidence gathering: log the OSPiHandle fields + cart address of the
+offending `osEPiStartDma`, and compare against the game's own SRAM
+handle constructor (`func_80000A88`, baseAddress 0xA8000000, domain 2).
 
 ## Superseded framing (2026-07-21, earlier): wild-pointer crash in the demo scene, one task after first geometry
 
