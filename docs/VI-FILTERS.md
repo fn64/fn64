@@ -91,20 +91,27 @@ identity, a strictly increasing present identity, and exact 8x6 BGRA8
 geometry. Six baseline observations return byte-for-byte to the first
 baseline, and disabling gamma dither restores the exact gamma-only image.
 
-The `vi-gamma-dither:v1` and `vi-divot:v1` source overlays replace only pinned
-RT64's final VI fullscreen shaders. Gamma dither applies the shared
-`fn64.vi-public-filters.bounded-v1` seven-bit quantizer after RT64's gamma
-stage. The shader mirrors the SplitMix64-derived coordinate/channel stream
-with paired 32-bit arithmetic because the supported Metal shader target lacks
-native 64-bit integers. The complete retrace seed crosses the Rust/C/C++ wire;
+The `vi-gamma-dither:v1`, `vi-dither-filter:v1`, and `vi-divot:v1` source
+overlays replace only pinned RT64's final VI fullscreen shaders. Gamma dither
+applies the shared `fn64.vi-public-filters.bounded-v1` seven-bit quantizer
+after RT64's gamma stage. The shader mirrors the SplitMix64-derived
+coordinate/channel stream with paired 32-bit arithmetic because the supported
+Metal shader target lacks native 64-bit integers. The complete retrace seed
+crosses the Rust/C/C++ wire;
 one ordinary fn64 VI event enqueues one ordinary RT64 presentation even when
 the source/register image is unchanged. It does not relabel early presents or
 alter RT64 workload history. Divot consumes RT64's framebuffer-alpha coverage
 estimate, treats modulo-eight code seven as full coverage, and applies the
 public componentwise horizontal median when a left/center/right triplet
-contains a non-full sample. Nearest mode retains the graphics API's exact
-sampler choice; linear and pixel-scaling modes interpolate corrected source
-lattice texels before gamma.
+contains a non-full sample. Dither restoration recovers each five-bit RGB
+component from the synthetic RGBA16 source and applies the exact signed
+comparison against every available neighbor in its 3x3 footprint only when
+the center carries RT64's full-coverage code. It preserves alpha, feeds divot
+before presentation sampling, and never substitutes clamped duplicate texels
+for unavailable border neighbors. The positive restoration evidence below is
+limited to nearest host filtering at native scale in one progressive synthetic
+RGBA16 image; the shader's linear and anti-aliased-pixel-scaling paths are not
+promoted by that result.
 
 Twenty fresh official watchdog-bounded backend-lifecycle Metal processes
 retained every exact SHA-256 identity enforced by the embedded gate. The run closes the
@@ -116,29 +123,39 @@ surface-teardown interval:
 
 | Native phase | Nonblack pixels | Unique colors |
 | --- | ---: | ---: |
-| Baseline, gamma, and their restorations | 48 | 8 |
-| Dither-only and gamma-plus-dither, two seeds plus exact repeats | 48 | 20-24 |
-| Coverage-gated divot median | 48 | 11 |
-| Nonidentity 1.5x X/Y scale under all four AA selectors | 40 | 9 |
+| Baseline, gamma, and their restorations | 48 | 6 |
+| Dither-only and gamma-plus-dither, two seeds plus exact repeats | 48 | 15-17 |
+| Coverage-gated divot median | 48 | 8 |
+| Full-coverage RGBA16 dither restoration | 48 | 18 |
+| Nonidentity 1.5x X/Y scale under all four AA selectors | 40 | 7 |
 
-Gamma, gamma dither, divot, and nonidentity scale each causally change the
-exact captured pixels. Three full-coverage control rows stay byte-identical;
-the otherwise identical non-full rows change exactly nine pixels, and every
-eligible BGRA component equals the baseline horizontal median. Borders and
-alpha remain unchanged, and the next phase restores the exact baseline.
+Gamma, gamma dither, divot, dither restoration, and nonidentity scale each
+causally change the exact captured pixels. Three full-coverage divot-control
+rows stay byte-identical; exactly twelve eligible pixels in the otherwise
+identical non-full rows change, and every eligible BGRA component equals the
+baseline horizontal median. Dither restoration changes exactly eighteen
+eligible full-coverage pixels by the shared available-neighbor signed 3x3
+formula, leaves all twenty-four non-full pixels and all six flat
+full-coverage controls byte-identical, and preserves alpha everywhere.
+Borders follow their exact available-neighbor footprints, and the adjacent
+off phases restore the exact baseline.
 Gamma dither is independently causal with gamma disabled or
 enabled; two distinct retrace seeds produce distinct exact images, while an
 identical repeated seed reproduces the exact image across a distinct present.
-`DITHER_FILTER` remains identical to baseline, and AA selector values 0-3
-remain identical at the nonidentity scale. Those equalities are named native
-implementation residuals rather than positive filter results. MSAA and
-downsample configurations can transform the alpha/coverage estimate before
-the VI stage; their exact divot decisions remain uncertified and bounded rather
-than evidence for an N64 coverage lattice. The
+AA selector values 0-3 remain identical at the nonidentity scale, leaving the
+selector as the only native filter residual in this fixture. That equality is
+a named implementation residual rather than positive selector evidence. The
+restoration closure is deliberately no broader than clean pinned Metal,
+nearest filtering, native scale, progressive scanout, and this synthetic
+RGBA16 source. A managed RT64 target does not retain authoritative per-pixel
+N64 dither history or complete physical hidden coverage; linear and
+anti-aliased-pixel-scaling filtering, enhancement resolution, MSAA,
+downsampling, D3D12, Vulkan, and representative full-ROM presentation
+remain uncertified. The
 fixture fails if a source update changes either side of that boundary without
 an explicit review. This proves the bounded deterministic native mechanism;
-it does not establish the unpublished silicon random stream, physical-console
-filter arithmetic, or analog-video parity.
+it does not establish full-ROM behavior, the unpublished silicon random
+stream, physical-console filter arithmetic, or analog-video parity.
 
 Run the native gate directly with:
 
@@ -170,11 +187,14 @@ tool's consensus result cannot close the base-renderer row by itself.
 - Exact interaction timing between filter blocks and field/retrace state.
 - Mode-0 unconditional versus mode-1 conditional extra-line fetch timing and
   memory-bus behavior; their public pixel-stage selection is implemented.
-- Native RT64 RGBA16 dither-restoration and AA-selector pixel behavior. The
-  live Metal gate currently preserves both as exact pixel-inert implementation
-  residuals at the pinned source revision. Divot is now causal over RT64's
-  retained coverage estimate, but MSAA/downsample resolve semantics and RT64's
-  incomplete N64 coverage generation remain bounded rather than silicon exact.
+- Native RT64 AA-selector pixel behavior remains an exact pixel-inert
+  implementation residual at the pinned source revision. RGBA16 dither
+  restoration is causal only for the gate's pinned-Metal, nearest,
+  native-scale, progressive synthetic source. Managed-target per-pixel dither
+  history and complete coverage, linear/anti-aliased-pixel-scaling and
+  enhancement-resolution behavior, MSAA/downsample resolve semantics, D3D12,
+  Vulkan, and representative full-ROM presentation remain open rather
+  than inheriting that narrow result.
 - Video DAC conversion, composite/S-Video encoding, bandwidth limits, and
   analog NTSC/PAL/MPAL output characteristics.
 - Pixel-level hardware traces spanning the framebuffer through physical video

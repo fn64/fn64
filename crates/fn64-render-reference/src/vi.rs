@@ -8,7 +8,10 @@
 
 use crate::{gbi, raster::Framebuffer};
 use fn64_render::{
-    vi_public_filters::{gamma_dither_quantize_bounded_v1, reference_noise_bit_v1},
+    vi_public_filters::{
+        gamma_dither_quantize_bounded_v1, reference_noise_bit_v1,
+        restore_rgba16_component_bounded_v1,
+    },
     RenderError, ViPixelType, ViPresentation, ViResampleControl, ViScaleAxis,
 };
 
@@ -296,18 +299,20 @@ fn filter_scanout(
             }
             for channel in 0..3 {
                 let center = original[pixel * 4 + channel] >> 3;
-                let mut restored = i16::from(center) << 3;
+                let mut neighbors = [0u8; 8];
+                let mut neighbor_count = 0;
                 for neighbor_y in y.saturating_sub(1)..=(y + 1).min(height - 1) {
                     for neighbor_x in x.saturating_sub(1)..=(x + 1).min(width - 1) {
                         if neighbor_x == x && neighbor_y == y {
                             continue;
                         }
-                        let neighbor =
+                        neighbors[neighbor_count] =
                             original[(neighbor_y * width + neighbor_x) * 4 + channel] >> 3;
-                        restored += i16::from(neighbor.cmp(&center) as i8);
+                        neighbor_count += 1;
                     }
                 }
-                out[channel] = restored.clamp(0, 255) as u8;
+                out[channel] =
+                    restore_rgba16_component_bounded_v1(center, &neighbors[..neighbor_count]);
             }
         }
     }

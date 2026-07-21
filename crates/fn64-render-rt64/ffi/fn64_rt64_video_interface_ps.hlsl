@@ -97,6 +97,90 @@ float Median(float left, float center, float right) {
     return max(min(left, center), min(max(left, center), right));
 }
 
+uint3 Rgba16Components(float3 rgb) {
+    return uint3(round(saturate(rgb) * 255.0f)) >> 3u;
+}
+
+int CompareFiveBit(uint neighbor, uint center) {
+    return (neighbor > center) ? 1 : ((neighbor < center) ? -1 : 0);
+}
+
+void AccumulateRestoration(inout int3 restored, uint3 center, uint3 neighbor) {
+    restored.x += CompareFiveBit(neighbor.x, center.x);
+    restored.y += CompareFiveBit(neighbor.y, center.y);
+    restored.z += CompareFiveBit(neighbor.z, center.z);
+}
+
+// US 5,699,079 specifies the signed 3x3-neighbor comparisons used to
+// reconstruct full-coverage RGBA16 components. RT64's managed target is not
+// an authoritative N64 storage image, so source reconstruction and lattice
+// identity remain explicitly bounded even though this integer kernel is exact.
+float4 RestoredTexel(int2 coordinate) {
+    int2 extent = int2(SourceExtent());
+    coordinate = clamp(coordinate, int2(0, 0), extent - int2(1, 1));
+    float4 raw = gInput.Load(int3(coordinate, 0));
+    if ((gConstants.ditherFilter == 0u) || !HasFullCoverage(raw.a)) {
+        return raw;
+    }
+
+    uint3 center = Rgba16Components(raw.rgb);
+    int3 restored = int3(center << 3u);
+    for (int deltaY = -1; deltaY <= 1; deltaY++) {
+        for (int deltaX = -1; deltaX <= 1; deltaX++) {
+            if ((deltaX == 0) && (deltaY == 0)) {
+                continue;
+            }
+            int2 neighborCoordinate = coordinate + int2(deltaX, deltaY);
+            if (any(neighborCoordinate < int2(0, 0)) ||
+                any(neighborCoordinate >= extent)) {
+                continue;
+            }
+            uint3 neighbor = Rgba16Components(
+                gInput.Load(int3(neighborCoordinate, 0)).rgb);
+            AccumulateRestoration(restored, center, neighbor);
+        }
+    }
+    raw.rgb = float3(restored) / 255.0f;
+    return raw;
+}
+
+uint2 NearestSourceCoordinate(float2 uv) {
+    return min(
+        uint2(floor(uv * gConstants.textureResolution)),
+        SourceExtent() - uint2(1u, 1u));
+}
+
+float4 RestoredNearest(float2 uv, uint2 coordinate) {
+    float4 raw = gInput.SampleLevel(gSampler, uv, 0);
+    if ((gConstants.ditherFilter == 0u) || !HasFullCoverage(raw.a)) {
+        return raw;
+    }
+
+    uint3 center = Rgba16Components(raw.rgb);
+    int3 restored = int3(center << 3u);
+    int2 extent = int2(SourceExtent());
+    int2 centerCoordinate = int2(coordinate);
+    for (int deltaY = -1; deltaY <= 1; deltaY++) {
+        for (int deltaX = -1; deltaX <= 1; deltaX++) {
+            if ((deltaX == 0) && (deltaY == 0)) {
+                continue;
+            }
+            int2 neighborCoordinate = centerCoordinate + int2(deltaX, deltaY);
+            if (any(neighborCoordinate < int2(0, 0)) ||
+                any(neighborCoordinate >= extent)) {
+                continue;
+            }
+            float2 neighborUv = uv +
+                float2(deltaX, deltaY) / gConstants.textureResolution;
+            uint3 neighbor = Rgba16Components(
+                gInput.SampleLevel(gSampler, neighborUv, 0).rgb);
+            AccumulateRestoration(restored, center, neighbor);
+        }
+    }
+    raw.rgb = float3(restored) / 255.0f;
+    return raw;
+}
+
 // US 6,166,748 specifies a componentwise horizontal median on or adjacent to
 // a silhouette edge. RT64's color-target alpha is its modulo-eight coverage
 // estimate; code seven denotes full coverage. This stage intentionally runs
@@ -104,13 +188,13 @@ float Median(float left, float center, float right) {
 float4 DivotTexel(int2 coordinate) {
     int2 maximum = int2(SourceExtent()) - int2(1, 1);
     coordinate = clamp(coordinate, int2(0, 0), maximum);
-    float4 center = gInput.Load(int3(coordinate, 0));
+    float4 center = RestoredTexel(coordinate);
     if ((coordinate.x == 0) || (coordinate.x == maximum.x)) {
         return center;
     }
 
-    float4 left = gInput.Load(int3(coordinate + int2(-1, 0), 0));
-    float4 right = gInput.Load(int3(coordinate + int2(1, 0), 0));
+    float4 left = RestoredTexel(coordinate + int2(-1, 0));
+    float4 right = RestoredTexel(coordinate + int2(1, 0));
     if (HasFullCoverage(left.a) && HasFullCoverage(center.a) &&
         HasFullCoverage(right.a)) {
         return center;
@@ -123,17 +207,18 @@ float4 DivotTexel(int2 coordinate) {
 }
 
 float4 DivotNearest(float2 uv) {
-    float4 center = gInput.SampleLevel(gSampler, uv, 0);
-    uint sourceX = min(
-        uint(floor(uv.x * gConstants.textureResolution.x)),
-        SourceExtent().x - 1u);
+    uint2 sourceCoordinate = NearestSourceCoordinate(uv);
+    float4 center = RestoredNearest(uv, sourceCoordinate);
+    uint sourceX = sourceCoordinate.x;
     if ((sourceX == 0u) || (sourceX + 1u == SourceExtent().x)) {
         return center;
     }
 
     float2 horizontal = float2(1.0f, 0.0f) / gConstants.textureResolution;
-    float4 left = gInput.SampleLevel(gSampler, uv - horizontal, 0);
-    float4 right = gInput.SampleLevel(gSampler, uv + horizontal, 0);
+    float4 left = RestoredNearest(
+        uv - horizontal, sourceCoordinate - uint2(1u, 0u));
+    float4 right = RestoredNearest(
+        uv + horizontal, sourceCoordinate + uint2(1u, 0u));
     if (HasFullCoverage(left.a) && HasFullCoverage(center.a) &&
         HasFullCoverage(right.a)) {
         return center;
@@ -143,6 +228,28 @@ float4 DivotNearest(float2 uv) {
     center.g = Median(left.g, center.g, right.g);
     center.b = Median(left.b, center.b, right.b);
     return center;
+}
+
+float4 SampleRestored(float2 uv) {
+    const float2 LowerRight = gConstants.videoResolution / gConstants.textureResolution;
+    const float2 HalfPixel = float2(0.5f, 0.5f) / gConstants.textureResolution;
+    float2 boundedUv = clamp(uv, HalfPixel, LowerRight - HalfPixel);
+
+    if (gConstants.filtering == 0u) {
+        return RestoredNearest(boundedUv, NearestSourceCoordinate(boundedUv));
+    }
+
+    float2 texelPosition = boundedUv * gConstants.textureResolution - 0.5f;
+    int2 lower = int2(floor(texelPosition));
+    float2 fraction = frac(texelPosition);
+    float4 upperLeft = RestoredTexel(lower);
+    float4 upperRight = RestoredTexel(lower + int2(1, 0));
+    float4 lowerLeft = RestoredTexel(lower + int2(0, 1));
+    float4 lowerRight = RestoredTexel(lower + int2(1, 1));
+    return lerp(
+        lerp(upperLeft, upperRight, fraction.x),
+        lerp(lowerLeft, lowerRight, fraction.x),
+        fraction.y);
 }
 
 float4 SampleDivot(float2 uv) {
@@ -174,9 +281,17 @@ float4 SampleInput(float2 uv) {
     const float2 LowerRight = gConstants.videoResolution / gConstants.textureResolution;
     const float2 HalfPixel = float2(0.5f, 0.5f) / gConstants.textureResolution;
     float2 outsideBorder = step(LowerRight, uv);
-    float4 sampledColor = gConstants.divot != 0u
-        ? SampleDivot(uv)
-        : gInput.SampleLevel(gSampler, clamp(uv, HalfPixel, LowerRight - HalfPixel), 0);
+    float4 sampledColor;
+    if (gConstants.divot != 0u) {
+        sampledColor = SampleDivot(uv);
+    }
+    else if (gConstants.ditherFilter != 0u) {
+        sampledColor = SampleRestored(uv);
+    }
+    else {
+        sampledColor = gInput.SampleLevel(
+            gSampler, clamp(uv, HalfPixel, LowerRight - HalfPixel), 0);
+    }
     float4 gammaCorrectedColor = pow(sampledColor, gConstants.gamma);
     gammaCorrectedColor.rgb *= max(1.0f - outsideBorder.x - outsideBorder.y, 0.0f);
     gammaCorrectedColor.a = 1.0f;
