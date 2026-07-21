@@ -213,6 +213,19 @@ fn charge_c_lane_mmio_access() {
     }
 }
 
+/// Charge the stall a guest device-busy retry costs and give the executor a
+/// checkpoint, iff a guest coroutine is executing. This is what keeps a
+/// `while (osEPiStartDma(..) != 0);` retry loop live when the PI command
+/// queue is genuinely full: device completions only commit as virtual time
+/// advances, and a shim-level retry (unlike a raw MMIO poll) has no
+/// instruction checkpoint of its own -- without the charge the retrying
+/// thread spins forever inside one scheduling slice (observed: WM2000's
+/// voiced-audio sample loader, `func_80000660`, once the first real sequence
+/// saturated the 0x40-deep PI command queue).
+pub(crate) fn charge_guest_device_busy_retry() {
+    charge_c_lane_mmio_access();
+}
+
 /// Generated-C word-MMIO proxy entry points. The proxy header calls these
 /// only for KSEG1 RCP addresses; ordinary RDRAM accesses stay inline.
 #[no_mangle]
