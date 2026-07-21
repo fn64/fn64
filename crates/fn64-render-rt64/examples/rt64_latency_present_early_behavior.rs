@@ -81,16 +81,20 @@ fn submit_fill(
 
 fn explicit_present(
     backend: &mut Rt64Backend,
+    rdram: &[u8],
     guest_cycle: u64,
 ) -> Result<Rt64PresentedPixels, Box<dyn Error>> {
-    backend.present(ViPresentation {
-        noise_seed: guest_cycle,
-        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
-            pixel_type: ViPixelType::Rgba16,
-            ..ViFilterControl::default()
-        }),
-        ..ViPresentation::default()
-    })?;
+    backend.present_physical_compatibility(
+        rdram,
+        ViPresentation {
+            noise_seed: guest_cycle,
+            scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
+                pixel_type: ViPixelType::Rgba16,
+                ..ViFilterControl::default()
+            }),
+            ..ViPresentation::default()
+        },
+    )?;
     Ok(backend.presented_pixels()?)
 }
 
@@ -246,7 +250,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut rdram = seed_rdram();
     submit_fill(&mut backend, &mut rdram, RED)?;
     require_rdram(&rdram, RED)?;
-    let history = explicit_present(&mut backend, 100)?;
+    let history = explicit_present(&mut backend, &rdram, 100)?;
     let valid_pixels = require_seed_capture(&history)?;
 
     // Console control: raw FullSync completes and mutates the framebuffer,

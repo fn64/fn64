@@ -96,15 +96,22 @@ fn submit_fill(
     Ok(())
 }
 
-fn present(backend: &mut Rt64Backend, guest_cycle: u64) -> Result<PresentedFrame, Box<dyn Error>> {
-    backend.present(ViPresentation {
-        noise_seed: guest_cycle,
-        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
-            pixel_type: ViPixelType::Rgba16,
-            ..ViFilterControl::default()
-        }),
-        ..ViPresentation::default()
-    })?;
+fn present(
+    backend: &mut Rt64Backend,
+    rdram: &[u8],
+    guest_cycle: u64,
+) -> Result<PresentedFrame, Box<dyn Error>> {
+    backend.present_physical_compatibility(
+        rdram,
+        ViPresentation {
+            noise_seed: guest_cycle,
+            scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
+                pixel_type: ViPixelType::Rgba16,
+                ..ViFilterControl::default()
+            }),
+            ..ViPresentation::default()
+        },
+    )?;
     let capture = backend.presented_pixels()?;
     let selection = backend.present_selection()?;
     if selection.present_id != capture.present_id {
@@ -291,7 +298,7 @@ fn run_mode(mode: RenderPresentationMode) -> Result<ModeEvidence, Box<dyn Error>
     // capture belongs to this backend instance.
     submit_fill(&mut backend, &mut rdram, A, RED, A)?;
     require_uniform_rdram(&rdram, A, RED)?;
-    let initial = present(&mut backend, 100)?;
+    let initial = present(&mut backend, &rdram, 100)?;
     require_selection("initial A", &initial.selection, A)?;
     require_capture(
         &format!("initial A selected {:?}", initial.selection),
@@ -305,7 +312,7 @@ fn run_mode(mode: RenderPresentationMode) -> Result<ModeEvidence, Box<dyn Error>
     // presentation targets and makes the final VI change from A back to B.
     submit_fill(&mut backend, &mut rdram, B, GREEN, B)?;
     require_uniform_rdram(&rdram, B, GREEN)?;
-    let b_seed = present(&mut backend, 110)?;
+    let b_seed = present(&mut backend, &rdram, 110)?;
     require_selection("seed B", &b_seed.selection, B)?;
     require_capture(
         &format!("seed B selected {:?}", b_seed.selection),
@@ -323,7 +330,7 @@ fn run_mode(mode: RenderPresentationMode) -> Result<ModeEvidence, Box<dyn Error>
 
     submit_fill(&mut backend, &mut rdram, A, RED, A)?;
     require_uniform_rdram(&rdram, A, RED)?;
-    let a_return = present(&mut backend, 120)?;
+    let a_return = present(&mut backend, &rdram, 120)?;
     require_selection("return to A", &a_return.selection, A)?;
     require_capture(
         &format!("return to A selected {:?}", a_return.selection),
@@ -347,7 +354,7 @@ fn run_mode(mode: RenderPresentationMode) -> Result<ModeEvidence, Box<dyn Error>
     let b_pixels = require_uniform_rdram(&rdram, B, GREEN)?;
     require_guards(&rdram)?;
 
-    let final_frame = present(&mut backend, 200)?;
+    let final_frame = present(&mut backend, &rdram, 200)?;
     let expected_address = match mode {
         RenderPresentationMode::Console => B,
         RenderPresentationMode::SkipBuffering => A,

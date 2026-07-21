@@ -293,14 +293,17 @@ fn render(
     {
         return Err(io::Error::other("aspect fixture target guard changed").into());
     }
-    backend.present(ViPresentation {
-        noise_seed: guest_cycle,
-        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
-            pixel_type: ViPixelType::Rgba16,
-            ..ViFilterControl::default()
-        }),
-        ..ViPresentation::default()
-    })?;
+    backend.present_physical_compatibility(
+        &rdram,
+        ViPresentation {
+            noise_seed: guest_cycle,
+            scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
+                pixel_type: ViPixelType::Rgba16,
+                ..ViFilterControl::default()
+            }),
+            ..ViPresentation::default()
+        },
+    )?;
     let capture = backend.presented_pixels()?;
     let selection = backend.present_selection()?;
     if selection.present_id != capture.present_id

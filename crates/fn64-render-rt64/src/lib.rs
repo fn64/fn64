@@ -119,14 +119,13 @@ pub(crate) fn render_unsupported_panic(operation: &'static str, context: impl In
 
 #[cfg(any(feature = "rt64", test))]
 use fn64_render::RenderGraphicsApi;
-#[cfg(test)]
-use fn64_render::ViPixelType;
 use fn64_render::{
     ActiveRenderGraphicsApi, FrameStatus, MicrocodeDataImageIdentity, NonRdpWrite16,
-    NonRdpWrite16Disposition, OsTask, RenderBackend, RenderConfig, RenderEmulatorSettings,
-    RenderEnhancementSettings, RenderError, RenderPolicyApply, RenderReplacementPackIdentity,
-    RenderReplacementSettings, RenderRuntimePolicy, RenderRuntimeSettings, RenderSettingsApply,
-    UcodeId, ViPresentation,
+    NonRdpWrite16Disposition, OsTask, PresentMemory, PresentRequest, RenderBackend, RenderConfig,
+    RenderEmulatorSettings, RenderEnhancementSettings, RenderError, RenderPolicyApply,
+    RenderReplacementPackIdentity, RenderReplacementSettings, RenderRuntimePolicy,
+    RenderRuntimeSettings, RenderSettingsApply, UcodeId, ViPixelType, ViPresentation,
+    ViScanoutRegisters,
 };
 use raster::Framebuffer;
 
@@ -150,6 +149,224 @@ fn read_rdram_hidden_bits(
     // visible LSB into both physical hidden bits. A changed visible word is
     // therefore observable evidence that another RDRAM master wrote it.
     record_non_rdp_16bit_write(hidden, address, visible)
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ViSourceGeometry {
+    origin: u32,
+    stride_pixels: u32,
+    rows: u64,
+    bytes_per_pixel: u8,
+    layout: gbi::ColorImageLayout,
+}
+
+/// Derive the rows addressed by the public VI coordinate generators. This span
+/// includes the lower sample required by linear resampling, but deliberately
+/// excludes any backend-specific filter halo.
+#[cfg(any(feature = "rt64", test))]
+fn programmed_vi_source_geometry(
+    vi: ViPresentation,
+) -> Result<Option<ViSourceGeometry>, RenderError> {
+    vi_source_geometry_with_bottom_halo(vi, 0)
+}
+
+/// Add the deterministic reference filter's bottom halo to the public
+/// programmed span. The public patents establish the filter topology but not
+/// out-of-window bus fetches, so this remains a reference policy rather than a
+/// native RT64 or silicon footprint claim.
+fn reference_vi_source_geometry(
+    vi: ViPresentation,
+) -> Result<Option<ViSourceGeometry>, RenderError> {
+    let filters = vi.scanout.filters();
+    let resample = vi.scanout.registers().map(ViScanoutRegisters::resample);
+    let aa_halo = if filters.antialias_mode.silhouette_aa_enabled() {
+        if resample.is_some_and(|value| value.field.interlaced()) {
+            2
+        } else {
+            1
+        }
+    } else {
+        0
+    };
+    let restoration_halo = u64::from(filters.dither_filter);
+    let geometry = vi_source_geometry_with_bottom_halo(vi, aa_halo.max(restoration_halo))?;
+    if let Some(geometry) = geometry {
+        if geometry.bytes_per_pixel == 2 && !geometry.origin.is_multiple_of(2) {
+            return Err(RenderError::InvalidViSourceAlignment {
+                origin: geometry.origin,
+                bytes_per_pixel: geometry.bytes_per_pixel,
+            });
+        }
+    }
+    Ok(geometry)
+}
+
+fn vi_source_geometry_with_bottom_halo(
+    vi: ViPresentation,
+    bottom_halo: u64,
+) -> Result<Option<ViSourceGeometry>, RenderError> {
+    let filters = vi.scanout.filters();
+    if filters.pixel_type == ViPixelType::Reserved {
+        return Err(RenderError::Backend {
+            backend: "reference",
+            reason: "VI STATUS selects reserved pixel type 1".to_string(),
+        });
+    }
+    let Some(registers) = vi.scanout.registers() else {
+        return Ok(None);
+    };
+    let Some(window) = registers.active_window() else {
+        return Ok(None);
+    };
+    if vi.blanked || filters.pixel_type == ViPixelType::Blank {
+        return Ok(None);
+    }
+    let (bytes_per_pixel, layout) = match filters.pixel_type {
+        ViPixelType::Rgba16 => (2, gbi::ColorImageLayout::Rgba16),
+        ViPixelType::Rgba32 => (4, gbi::ColorImageLayout::Rgba32),
+        ViPixelType::Blank | ViPixelType::Reserved | ViPixelType::Unspecified => unreachable!(),
+    };
+    let origin = registers.origin();
+    let output_rows = u64::from(window.output_height());
+    let resample = registers.resample();
+    let last_output = output_rows
+        .checked_sub(1)
+        .expect("active VI window has no output rows");
+    let last_u10 = u64::from(resample.y.offset_u2_10())
+        .checked_add(
+            last_output
+                .checked_mul(u64::from(resample.y.step_u2_10()))
+                .expect("VI vertical coordinate product overflow"),
+        )
+        .expect("VI vertical coordinate sum overflow");
+    let last_center = last_u10 >> fn64_render::ViScaleAxis::FRACTION_BITS;
+    let sample_extra = u64::from(filters.antialias_mode.resampling_enabled());
+    let mut rows = last_center
+        .checked_add(sample_extra)
+        .and_then(|value| value.checked_add(bottom_halo))
+        .and_then(|value| value.checked_add(1))
+        .expect("VI reference source row count overflow");
+    if vi.fade.is_some() {
+        rows = rows.max(2);
+    }
+    Ok(Some(ViSourceGeometry {
+        origin,
+        stride_pixels: registers.width(),
+        rows,
+        bytes_per_pixel,
+        layout,
+    }))
+}
+
+fn load_vi_source(
+    memory: &fn64_runtime::PhysicalRdramRead<'_>,
+    geometry: ViSourceGeometry,
+    hidden: &HashMap<u32, RdramHiddenSample>,
+) -> Result<(Framebuffer, Vec<(u32, RdramHiddenSample)>), RenderError> {
+    validate_vi_source_footprint(memory, geometry)?;
+    let height = geometry.rows as u32;
+    let mut source = Framebuffer::new(geometry.stride_pixels, height);
+    source.set_color_layout(geometry.layout);
+    let pixel_count = u64::from(geometry.stride_pixels)
+        .checked_mul(geometry.rows)
+        .expect("VI source pixel count overflow");
+    let mut hidden_updates = Vec::new();
+    for index in 0..pixel_count {
+        let byte_offset = index
+            .checked_mul(u64::from(geometry.bytes_per_pixel))
+            .expect("VI source pixel offset overflow");
+        let logical = u64::from(geometry.origin)
+            .checked_add(byte_offset)
+            .expect("VI source pixel address overflow");
+        let logical = u32::try_from(logical).expect("bounded VI source address exceeds u32");
+        let destination = usize::try_from(index).expect("VI source index exceeds usize") * 4;
+        match geometry.layout {
+            gbi::ColorImageLayout::Rgba16 => {
+                let pixel = memory.read_u16(fn64_runtime::RdramAddr::from_offset(logical));
+                let hidden_bits = match hidden.get(&logical) {
+                    Some(sample) if sample.visible == pixel => sample.bits & 3,
+                    _ => {
+                        let bits = if pixel & 1 == 0 { 0 } else { 3 };
+                        hidden_updates.push((
+                            logical,
+                            RdramHiddenSample {
+                                visible: pixel,
+                                bits,
+                            },
+                        ));
+                        bits
+                    }
+                };
+                let expand = |value: u16| {
+                    let value = value as u8;
+                    (value << 3) | (value >> 2)
+                };
+                source.pixels[destination..destination + 4].copy_from_slice(&[
+                    expand((pixel >> 11) & 0x1f),
+                    expand((pixel >> 6) & 0x1f),
+                    expand((pixel >> 1) & 0x1f),
+                    255,
+                ]);
+                let stored_coverage = (((pixel & 1) as u8) << 2) | hidden_bits;
+                source.coverage[index as usize] = raster::Coverage::from_stored(stored_coverage);
+            }
+            gbi::ColorImageLayout::Rgba32 => {
+                let address = fn64_runtime::RdramAddr::from_offset(logical);
+                let red = memory.read_u8(address);
+                let green = memory.read_u8(
+                    address
+                        .checked_add(1)
+                        .expect("VI RGBA32 green address overflow"),
+                );
+                let blue = memory.read_u8(
+                    address
+                        .checked_add(2)
+                        .expect("VI RGBA32 blue address overflow"),
+                );
+                let alpha_coverage = memory.read_u8(
+                    address
+                        .checked_add(3)
+                        .expect("VI RGBA32 alpha address overflow"),
+                );
+                let alpha5 = alpha_coverage & 0x1f;
+                source.pixels[destination..destination + 4].copy_from_slice(&[
+                    red,
+                    green,
+                    blue,
+                    (alpha5 << 3) | (alpha5 >> 2),
+                ]);
+                source.coverage[index as usize] =
+                    raster::Coverage::from_stored(alpha_coverage >> 5);
+            }
+            gbi::ColorImageLayout::Index8 => unreachable!(),
+        }
+    }
+    Ok((source, hidden_updates))
+}
+
+fn validate_vi_source_footprint(
+    memory: &fn64_runtime::PhysicalRdramRead<'_>,
+    geometry: ViSourceGeometry,
+) -> Result<(), RenderError> {
+    let row_bytes = u64::from(geometry.stride_pixels)
+        .checked_mul(u64::from(geometry.bytes_per_pixel))
+        .expect("VI source row byte count overflow");
+    let byte_len = row_bytes
+        .checked_mul(geometry.rows)
+        .expect("VI source footprint overflow");
+    let end = u64::from(geometry.origin)
+        .checked_add(byte_len)
+        .expect("VI source end overflow");
+    if end > memory.len() as u64 || geometry.rows > u64::from(u32::MAX) {
+        return Err(RenderError::InvalidViSourceBounds {
+            origin: geometry.origin,
+            stride_pixels: geometry.stride_pixels,
+            rows: geometry.rows,
+            bytes_per_pixel: geometry.bytes_per_pixel,
+            rdram_len: memory.len(),
+        });
+    }
+    Ok(())
 }
 
 /// Record a known non-RDP 16-bit write to one physical RDRAM halfword.
@@ -1434,13 +1651,35 @@ impl RenderBackend for ReferenceBackend {
         fn64_render::RenderTaskChunking::Resumable
     }
 
-    fn present(&mut self, vi: ViPresentation) -> Result<(), RenderError> {
-        let source = self
+    fn present(&mut self, request: PresentRequest<'_>) -> Result<(), RenderError> {
+        let (vi, memory) = request.into_parts();
+        let resident = self
             .fb
             .as_ref()
             .ok_or(RenderError::NotReady("create() not called"))?;
-        self.presented_fb = Some(vi::scanout(source, vi)?);
+        let (presented, hidden_updates) = match memory {
+            PresentMemory::BackendResidentCompatibility => (vi::scanout(resident, vi)?, Vec::new()),
+            PresentMemory::Physical(memory) => {
+                if vi.scanout.registers().is_none() {
+                    return Err(RenderError::Backend {
+                        backend: "reference",
+                        reason: "physical VI presentation requires a live register image"
+                            .to_string(),
+                    });
+                }
+                match reference_vi_source_geometry(vi)? {
+                    Some(geometry) => {
+                        let (source, hidden_updates) =
+                            load_vi_source(&memory, geometry, &self.rdram_hidden_bits)?;
+                        (vi::scanout(&source, vi)?, hidden_updates)
+                    }
+                    None => (vi::scanout(resident, vi)?, Vec::new()),
+                }
+            }
+        };
+        self.presented_fb = Some(presented);
         self.presentation = vi;
+        self.rdram_hidden_bits.extend(hidden_updates);
         Ok(())
     }
 
@@ -1460,7 +1699,12 @@ impl RenderBackend for ReferenceBackend {
             );
             *fb = new_fb;
         }
-        if let Some(fb) = &self.fb {
+        if self.presentation.scanout.registers().is_some() {
+            // A resize has no retrace-scoped RDRAM authority. Never rebuild a
+            // live register image from the unrelated resident RDP surface;
+            // the next field reconstructs it from current physical bytes.
+            self.presented_fb = None;
+        } else if let Some(fb) = &self.fb {
             // `resize` is infallible by trait contract. If the new dimensions
             // cannot support the retained VI effect, leave no fabricated
             // scanout; the next `present` reports the named error.
@@ -3097,6 +3341,30 @@ fn replacement_ffi_inputs(
         .collect()
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Rt64PresentAuthority {
+    LiveRegisters,
+    BackendOnlyCompatibility,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct CompletedRt64Present {
+    guest_cycle: u64,
+    authority: Rt64PresentAuthority,
+}
+
+impl CompletedRt64Present {
+    #[cfg(any(feature = "rt64", test))]
+    fn release_guest_cycle(self) -> Result<u64, RenderError> {
+        if self.authority != Rt64PresentAuthority::LiveRegisters {
+            return Err(RenderError::NotReady(
+                "RT64 release capture requires a completed live-register VI present",
+            ));
+        }
+        Ok(self.guest_cycle)
+    }
+}
+
 pub struct Rt64Backend {
     /// RT64's GBI selection is still HLE. Apply the same exact task-entry
     /// admission as the Rust reference backend before crossing the C ABI.
@@ -3111,10 +3379,10 @@ pub struct Rt64Backend {
     context: Option<ffi::Context>,
     #[cfg(not(feature = "rt64"))]
     created: bool,
-    /// Guest cycle supplied at the last successfully completed VI present.
-    /// Keeping the cycle beside the backend-owned image prevents a release
-    /// gate from relabeling an older swapchain capture as current evidence.
-    last_present_cycle: Option<u64>,
+    /// Authority and guest cycle of the last successfully completed VI
+    /// present. A compatibility image remains observable to behavior tests but
+    /// cannot be relabeled as live-register release evidence.
+    last_present: Option<CompletedRt64Present>,
     /// Requested settings for the next create. This may differ from active
     /// settings only when an apply returned `RestartRequired`.
     configured_settings: RenderRuntimeSettings,
@@ -3142,7 +3410,7 @@ impl Rt64Backend {
             context: None,
             #[cfg(not(feature = "rt64"))]
             created: false,
-            last_present_cycle: None,
+            last_present: None,
             configured_settings: RenderRuntimeSettings::default(),
             active_settings: None,
             configured_enhancement_settings: RenderEnhancementSettings::default(),
@@ -3153,6 +3421,33 @@ impl Rt64Backend {
             configured_replacement_enabled: RenderReplacementSettings::default().enabled,
             active_replacement_settings: None,
         }
+    }
+
+    /// Present one complete live register image against a standalone
+    /// embedder's exact physical allocation. Integrated execution reaches the
+    /// same required trait seam through its raw, higher-ranked capability.
+    pub fn present_live(&mut self, rdram: &[u8], vi: ViPresentation) -> Result<(), RenderError> {
+        <Self as RenderBackend>::present(
+            self,
+            PresentRequest::live(vi, fn64_runtime::PhysicalRdramRead::from_storage(rdram)),
+        )
+    }
+
+    /// Present with explicit synthesized backend geometry. This compatibility
+    /// path can drive standalone behavior tests but cannot produce release
+    /// evidence.
+    pub fn present_physical_compatibility(
+        &mut self,
+        rdram: &[u8],
+        vi: ViPresentation,
+    ) -> Result<(), RenderError> {
+        <Self as RenderBackend>::present(
+            self,
+            PresentRequest::physical_compatibility(
+                vi,
+                fn64_runtime::PhysicalRdramRead::from_storage(rdram),
+            ),
+        )
     }
 
     /// Platform-wide RT64 source/capture identity used by non-release behavior
@@ -4251,7 +4546,7 @@ impl RenderBackend for Rt64Backend {
     }
 
     fn create(&mut self, cfg: &RenderConfig) -> Result<(), RenderError> {
-        self.last_present_cycle = None;
+        self.last_present = None;
         self.active_settings = None;
         self.active_enhancement_settings = None;
         self.active_emulator_settings = None;
@@ -4519,24 +4814,47 @@ impl RenderBackend for Rt64Backend {
         fn64_render::RenderTaskChunking::Atomic
     }
 
-    fn present(&mut self, vi: ViPresentation) -> Result<(), RenderError> {
+    fn present(&mut self, request: PresentRequest<'_>) -> Result<(), RenderError> {
+        let (vi, memory) = request.into_parts();
+        let authority = if vi.scanout.registers().is_some() {
+            Rt64PresentAuthority::LiveRegisters
+        } else {
+            Rt64PresentAuthority::BackendOnlyCompatibility
+        };
         #[cfg(feature = "rt64")]
         {
+            let PresentMemory::Physical(memory) = memory else {
+                return Err(RenderError::Backend {
+                    backend: "rt64",
+                    reason: "RT64 presentation requires current physical RDRAM authority"
+                        .to_string(),
+                });
+            };
+            // Validate only the rows selected by public coordinate arithmetic.
+            // RT64 receives the complete 8 MiB device and owns its internal
+            // filter/bus fetch contract; the reference renderer's bounded
+            // bottom halo is not evidence about that native implementation.
+            if let Some(geometry) = programmed_vi_source_geometry(vi)? {
+                validate_vi_source_footprint(&memory, geometry)?;
+            }
             self.context
                 .as_mut()
                 .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
-                .present(vi)
+                .present(&memory, vi)
                 .map_err(|reason| RenderError::Backend {
                     backend: "rt64",
                     reason,
                 })?;
-            self.last_present_cycle = Some(vi.noise_seed);
+            self.last_present = Some(CompletedRt64Present {
+                guest_cycle: vi.noise_seed,
+                authority,
+            });
             Ok(())
         }
 
         #[cfg(not(feature = "rt64"))]
         {
-            let _ = vi;
+            let _ = (vi, memory, authority);
             Err(RenderError::NotReady(
                 "Rt64Backend is unavailable without the `rt64` Cargo feature",
             ))
@@ -4546,9 +4864,10 @@ impl RenderBackend for Rt64Backend {
     fn release_capture(&mut self) -> Result<fn64_render::RenderReleaseCapture, RenderError> {
         #[cfg(feature = "rt64")]
         {
-            let guest_cycle = self.last_present_cycle.ok_or(RenderError::NotReady(
+            let completed = self.last_present.ok_or(RenderError::NotReady(
                 "RT64 release capture requested before a completed VI present",
             ))?;
+            let guest_cycle = completed.release_guest_cycle()?;
             let replacement_inputs: Vec<_> = self
                 .configured_replacement_packs
                 .iter()
@@ -4811,6 +5130,77 @@ impl RenderBackend for Rt64Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn present_resident(
+        backend: &mut ReferenceBackend,
+        vi: ViPresentation,
+    ) -> Result<(), RenderError> {
+        backend.present(PresentRequest::backend_resident(vi))
+    }
+
+    fn live_presentation(
+        status: u32,
+        origin: u32,
+        width: u32,
+        output_width: u32,
+        output_height: u32,
+    ) -> ViPresentation {
+        let mut words = [0u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
+        words[0] = status;
+        words[1] = origin;
+        words[2] = width;
+        words[9] = (100 << 16) | (100 + output_width);
+        words[10] = (20 << 16) | (20 + output_height * 2);
+        words[12] = u32::from(fn64_render::ViScaleAxis::ONE);
+        words[13] = u32::from(fn64_render::ViScaleAxis::ONE);
+        ViPresentation {
+            scanout: fn64_render::ViScanoutState::Registers(
+                fn64_render::ViScanoutRegisters::from_words(words),
+            ),
+            ..ViPresentation::default()
+        }
+    }
+
+    fn present_physical(
+        backend: &mut ReferenceBackend,
+        rdram: &[u8],
+        vi: ViPresentation,
+    ) -> Result<(), RenderError> {
+        backend.present(PresentRequest::live(
+            vi,
+            fn64_runtime::PhysicalRdramRead::from_storage(rdram),
+        ))
+    }
+
+    #[test]
+    fn rt64_release_authority_rejects_backend_only_compatibility() {
+        let compatibility = CompletedRt64Present {
+            guest_cycle: 17,
+            authority: Rt64PresentAuthority::BackendOnlyCompatibility,
+        };
+        assert!(matches!(
+            compatibility.release_guest_cycle(),
+            Err(RenderError::NotReady(
+                "RT64 release capture requires a completed live-register VI present"
+            ))
+        ));
+        let live = CompletedRt64Present {
+            guest_cycle: 19,
+            authority: Rt64PresentAuthority::LiveRegisters,
+        };
+        assert_eq!(live.release_guest_cycle().unwrap(), 19);
+    }
+
+    #[test]
+    fn native_programmed_span_excludes_reference_filter_halo() {
+        let vi = live_presentation(0x002, 0x100, 4, 1, 1);
+        let programmed = programmed_vi_source_geometry(vi).unwrap().unwrap();
+        let reference = reference_vi_source_geometry(vi).unwrap().unwrap();
+        assert_eq!(programmed.rows, 2);
+        assert_eq!(reference.rows, 3);
+        assert_eq!(programmed.origin, reference.origin);
+        assert_eq!(programmed.stride_pixels, reference.stride_pixels);
+    }
 
     #[cfg(feature = "rt64")]
     struct SyntheticPack(PathBuf);
@@ -5127,7 +5517,7 @@ mod tests {
             fn64_render::RenderTaskChunking::Resumable
         );
         backend.create(&RenderConfig::new(8, 8)).unwrap();
-        backend.present(ViPresentation::default()).unwrap();
+        present_resident(&mut backend, ViPresentation::default()).unwrap();
         assert!(!backend
             .framebuffer()
             .unwrap()
@@ -5328,18 +5718,20 @@ mod tests {
         backend.create(&RenderConfig::new(2, 1)).unwrap();
         backend.fb.as_mut().unwrap().pixels[0..4].copy_from_slice(&[9, 8, 7, 255]);
 
-        backend.present(ViPresentation::default()).unwrap();
+        present_resident(&mut backend, ViPresentation::default()).unwrap();
         assert_eq!(
             &backend.presented_framebuffer().unwrap().pixels[0..4],
             &[9, 8, 7, 255]
         );
 
-        backend
-            .present(ViPresentation {
+        present_resident(
+            &mut backend,
+            ViPresentation {
                 blanked: true,
                 ..ViPresentation::default()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert!(backend
             .presented_framebuffer()
             .unwrap()
@@ -5351,7 +5743,7 @@ mod tests {
             &[9, 8, 7, 255]
         );
 
-        backend.present(ViPresentation::default()).unwrap();
+        present_resident(&mut backend, ViPresentation::default()).unwrap();
         assert_eq!(
             &backend.presented_framebuffer().unwrap().pixels[0..4],
             &[9, 8, 7, 255]
@@ -5366,23 +5758,27 @@ mod tests {
             10, 20, 30, 255, 40, 50, 60, 255, 110, 120, 130, 255, 140, 150, 160, 255,
         ]);
 
-        backend
-            .present(ViPresentation {
+        present_resident(
+            &mut backend,
+            ViPresentation {
                 fade: Some(0x03ff),
                 ..ViPresentation::default()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(
             backend.presented_framebuffer().unwrap().pixels,
             [110, 120, 130, 255, 140, 150, 160, 255, 110, 120, 130, 255, 140, 150, 160, 255,]
         );
 
-        backend
-            .present(ViPresentation {
+        present_resident(
+            &mut backend,
+            ViPresentation {
                 repeat_line: true,
                 ..ViPresentation::default()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(
             backend.presented_framebuffer().unwrap().pixels,
             [10, 20, 30, 255, 40, 50, 60, 255, 10, 20, 30, 255, 40, 50, 60, 255,]
@@ -5403,12 +5799,14 @@ mod tests {
             pixel.copy_from_slice(&[88, 88, 88, 255]);
         }
         fb.pixels[4 * 4..4 * 4 + 4].copy_from_slice(&[80, 80, 80, 255]);
-        backend
-            .present(ViPresentation {
+        present_resident(
+            &mut backend,
+            ViPresentation {
                 scanout: fn64_render::ViScanoutState::BackendOnly(rgba16),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(
             &backend.presented_framebuffer().unwrap().pixels[4 * 4..4 * 4 + 4],
             &[88, 88, 88, 255]
@@ -5417,32 +5815,36 @@ mod tests {
         let fb = backend.fb.as_mut().unwrap();
         fb.pixels[0..12].copy_from_slice(&[10, 10, 10, 255, 200, 200, 200, 255, 20, 20, 20, 255]);
         fb.coverage[1] = raster::Coverage::new(4);
-        backend
-            .present(ViPresentation {
+        present_resident(
+            &mut backend,
+            ViPresentation {
                 scanout: fn64_render::ViScanoutState::BackendOnly(fn64_render::ViFilterControl {
                     pixel_type: ViPixelType::Rgba16,
                     divot: true,
                     ..Default::default()
                 }),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(
             &backend.presented_framebuffer().unwrap().pixels[4..8],
             &[20, 20, 20, 255]
         );
 
         backend.fb.as_mut().unwrap().pixels[0..4].copy_from_slice(&[64, 0, 255, 255]);
-        backend
-            .present(ViPresentation {
+        present_resident(
+            &mut backend,
+            ViPresentation {
                 scanout: fn64_render::ViScanoutState::BackendOnly(fn64_render::ViFilterControl {
                     pixel_type: ViPixelType::Rgba32,
                     gamma: true,
                     ..Default::default()
                 }),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(
             &backend.presented_framebuffer().unwrap().pixels[0..4],
             &[127, 0, 255, 255]
@@ -5463,9 +5865,9 @@ mod tests {
             noise_seed,
             ..Default::default()
         };
-        backend.present(presentation(0)).unwrap();
+        present_resident(&mut backend, presentation(0)).unwrap();
         let first = backend.presented_framebuffer().unwrap().pixels[0..3].to_vec();
-        backend.present(presentation(0)).unwrap();
+        present_resident(&mut backend, presentation(0)).unwrap();
         assert_eq!(
             &backend.presented_framebuffer().unwrap().pixels[0..3],
             first
@@ -5473,11 +5875,218 @@ mod tests {
 
         let variants = (0..64)
             .map(|seed| {
-                backend.present(presentation(seed)).unwrap();
+                present_resident(&mut backend, presentation(seed)).unwrap();
                 backend.presented_framebuffer().unwrap().pixels[0]
             })
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(variants, [100, 102].into_iter().collect());
+    }
+
+    #[test]
+    fn reference_vi_reads_rgba16_from_live_origin_and_effective_padded_stride() {
+        const ORIGIN: u32 = 0x120;
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (index, pixel) in [
+                0xf801u16, 0x07c1, 0xf83f, 0xffc1, 0x003f, 0xffff, 0x0001, 0x07ff,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                view.write_u16(
+                    fn64_runtime::RdramAddr::from_offset(ORIGIN + index as u32 * 2),
+                    pixel,
+                );
+            }
+        }
+        assert_eq!(
+            &rdram[ORIGIN as usize..ORIGIN as usize + 16],
+            &[
+                0xc1, 0x07, 0x01, 0xf8, 0xc1, 0xff, 0x3f, 0xf8, 0xff, 0xff, 0x3f, 0x00, 0xff, 0x07,
+                0x01, 0x00
+            ]
+        );
+
+        let mut backend = ReferenceBackend::new();
+        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        backend.fb.as_mut().unwrap().clear(9, 8, 7, 255);
+        let vi = live_presentation(0x302, ORIGIN, 0xf000_0004, 2, 2);
+        present_physical(&mut backend, &rdram, vi).unwrap();
+        assert_eq!(
+            backend.presented_framebuffer().unwrap().pixels,
+            [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,]
+        );
+        assert!(backend
+            .framebuffer()
+            .unwrap()
+            .pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel == [9, 8, 7, 255]));
+
+        fn64_runtime::RdramViewMut::from_storage(&mut rdram)
+            .write_u16(fn64_runtime::RdramAddr::from_offset(ORIGIN), 0x07ff);
+        present_physical(&mut backend, &rdram, vi).unwrap();
+        assert_eq!(
+            &backend.presented_framebuffer().unwrap().pixels[..4],
+            &[0, 255, 255, 255],
+            "a repeated field retained stale task-time or prior-present bytes"
+        );
+    }
+
+    #[test]
+    fn reference_vi_reads_unaligned_rgba32_rows_from_odd_live_stride() {
+        const ORIGIN: u32 = 0x181;
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let logical = [
+            0x10, 0x20, 0x30, 0xe4, 0x40, 0x50, 0x60, 0x63, 0xd1, 0xd2, 0xd3, 0xff, 0x70, 0x80,
+            0x90, 0xa2, 0xa0, 0xb0, 0xc0, 0xff, 0xe1, 0xe2, 0xe3, 0x00,
+        ];
+        fn64_runtime::RdramViewMut::from_storage(&mut rdram)
+            .write_logical_bytes(fn64_runtime::RdramAddr::from_offset(ORIGIN), &logical);
+
+        let mut backend = ReferenceBackend::new();
+        backend.create(&RenderConfig::new(3, 2)).unwrap();
+        present_physical(
+            &mut backend,
+            &rdram,
+            live_presentation(0x303, ORIGIN, 3, 2, 2),
+        )
+        .unwrap();
+        assert_eq!(
+            backend.presented_framebuffer().unwrap().pixels,
+            [
+                0x10, 0x20, 0x30, 33, 0x40, 0x50, 0x60, 24, 0x70, 0x80, 0x90, 16, 0xa0, 0xb0, 0xc0,
+                255,
+            ]
+        );
+    }
+
+    #[test]
+    fn reference_vi_uses_each_field_exact_live_origin_without_extra_bias() {
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            view.write_u16(fn64_runtime::RdramAddr::from_offset(0x220), 0xf801);
+            view.write_u16(fn64_runtime::RdramAddr::from_offset(0x222), 0x07c1);
+            view.write_u16(fn64_runtime::RdramAddr::from_offset(0x280), 0x003f);
+            view.write_u16(fn64_runtime::RdramAddr::from_offset(0x282), 0xffff);
+        }
+
+        let mut backend = ReferenceBackend::new();
+        backend.create(&RenderConfig::new(2, 1)).unwrap();
+        let odd = live_presentation(0x342, 0x280, 2, 2, 1);
+        let mut odd_words = odd.scanout.registers().unwrap().words();
+        odd_words[4] = 1;
+        let odd = ViPresentation {
+            scanout: fn64_render::ViScanoutState::Registers(
+                fn64_render::ViScanoutRegisters::from_words(odd_words),
+            ),
+            ..odd
+        };
+        present_physical(&mut backend, &rdram, odd).unwrap();
+        assert_eq!(
+            backend.presented_framebuffer().unwrap().pixels,
+            [0, 0, 255, 255, 255, 255, 255, 255]
+        );
+        present_physical(
+            &mut backend,
+            &rdram,
+            live_presentation(0x342, 0x220, 2, 2, 1),
+        )
+        .unwrap();
+        assert_eq!(
+            backend.presented_framebuffer().unwrap().pixels,
+            [255, 0, 0, 255, 0, 255, 0, 255]
+        );
+    }
+
+    #[test]
+    fn reference_vi_bounds_fail_transactionally_and_exact_edge_succeeds() {
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let mut backend = ReferenceBackend::new();
+        backend.create(&RenderConfig::new(2, 2)).unwrap();
+        present_resident(&mut backend, ViPresentation::default()).unwrap();
+        let before = backend.presented_framebuffer().unwrap().clone();
+
+        let error = present_physical(
+            &mut backend,
+            &rdram,
+            live_presentation(0x302, 0x7f_fff8, 4, 2, 2),
+        )
+        .unwrap_err();
+        assert!(matches!(error, RenderError::InvalidViSourceBounds { .. }));
+        assert_eq!(
+            backend.presented_framebuffer().unwrap().pixels,
+            before.pixels
+        );
+
+        fn64_runtime::RdramViewMut::from_storage(&mut rdram).write_logical_bytes(
+            fn64_runtime::RdramAddr::from_offset(0x7f_fff8),
+            &[1, 2, 3, 0xff, 4, 5, 6, 0xff],
+        );
+        present_physical(
+            &mut backend,
+            &rdram,
+            live_presentation(0x303, 0x7f_fff8, 2, 2, 1),
+        )
+        .unwrap();
+        let one_row = backend.presented_framebuffer().unwrap().pixels.clone();
+        let error = present_physical(
+            &mut backend,
+            &rdram,
+            live_presentation(0x303, 0x7f_fff8, 2, 2, 2),
+        )
+        .unwrap_err();
+        assert!(matches!(error, RenderError::InvalidViSourceBounds { .. }));
+        assert_eq!(backend.presented_framebuffer().unwrap().pixels, one_row);
+    }
+
+    #[test]
+    fn reference_vi_blank_and_inactive_paths_do_not_fetch_live_source() {
+        let rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let mut backend = ReferenceBackend::new();
+        backend.create(&RenderConfig::new(2, 2)).unwrap();
+
+        let mut inactive_words = [0u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
+        inactive_words[0] = 0x302;
+        inactive_words[1] = 0x00ff_ffff;
+        let inactive = ViPresentation {
+            scanout: fn64_render::ViScanoutState::Registers(
+                fn64_render::ViScanoutRegisters::from_words(inactive_words),
+            ),
+            ..Default::default()
+        };
+        present_physical(&mut backend, &rdram, inactive).unwrap();
+        assert_eq!(backend.presented_framebuffer().unwrap().width, 0);
+        assert_eq!(backend.presented_framebuffer().unwrap().height, 0);
+
+        let blanked = ViPresentation {
+            blanked: true,
+            ..live_presentation(0x302, 0x00ff_ffff, 2, 2, 2)
+        };
+        present_physical(&mut backend, &rdram, blanked).unwrap();
+        assert!(backend
+            .presented_framebuffer()
+            .unwrap()
+            .pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel == [0, 0, 0, 255]));
+
+        let status_blank = live_presentation(0x300, 0x00ff_ffff, 2, 2, 2);
+        present_physical(&mut backend, &rdram, status_blank).unwrap();
+        let reserved = ViPresentation {
+            blanked: true,
+            ..live_presentation(0x301, 0x00ff_ffff, 2, 2, 2)
+        };
+        let error = present_physical(&mut backend, &rdram, reserved).unwrap_err();
+        assert!(error.to_string().contains("reserved pixel type"));
+
+        let misaligned = live_presentation(0x302, 0x121, 2, 2, 1);
+        assert!(matches!(
+            present_physical(&mut backend, &rdram, misaligned).unwrap_err(),
+            RenderError::InvalidViSourceAlignment { .. }
+        ));
     }
 
     #[test]

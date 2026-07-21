@@ -187,14 +187,17 @@ fn render_at(
     if status != FrameStatus::Complete {
         return Err(io::Error::other(format!("texture fixture returned {status:?}")).into());
     }
-    backend.present(ViPresentation {
-        noise_seed: guest_cycle,
-        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
-            pixel_type: ViPixelType::Rgba16,
-            ..ViFilterControl::default()
-        }),
-        ..ViPresentation::default()
-    })?;
+    backend.present_physical_compatibility(
+        &rdram,
+        ViPresentation {
+            noise_seed: guest_cycle,
+            scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
+                pixel_type: ViPixelType::Rgba16,
+                ..ViFilterControl::default()
+            }),
+            ..ViPresentation::default()
+        },
+    )?;
     Ok(backend.presented_pixels()?.bytes)
 }
 

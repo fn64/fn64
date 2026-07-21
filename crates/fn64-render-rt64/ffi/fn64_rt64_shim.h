@@ -594,6 +594,8 @@ int fn64_rt64_process_rdp_commands(
 
 int fn64_rt64_present(
     Fn64Rt64Context *context,
+    uint8_t *rdram,
+    size_t rdram_len,
     const Fn64Rt64ViState *vi,
     char *error,
     size_t error_capacity);

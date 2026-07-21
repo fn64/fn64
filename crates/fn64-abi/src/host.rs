@@ -48,7 +48,7 @@ pub fn next_device_deadline() -> Option<u64> {
 /// # Safety
 /// `rdram` must address `rdram_len` live bytes until every guest coroutine and
 /// device request has stopped using the process allocation.
-pub(crate) unsafe fn register_process_rdram(rdram: *mut u8, rdram_len: usize) {
+pub unsafe fn register_process_rdram(rdram: *mut u8, rdram_len: usize) {
     assert!(!rdram.is_null(), "process RDRAM pointer must be non-null");
     assert!(rdram_len > 0, "process RDRAM length must be nonzero");
     with_host(|host| {

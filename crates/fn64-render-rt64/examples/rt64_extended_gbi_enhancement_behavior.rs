@@ -499,7 +499,7 @@ fn submit_scene(
         TARGET as u32,
         ORIGINAL_RATE,
     )?;
-    backend.present(presentation(scene.seed))?;
+    backend.present_physical_compatibility(&*rdram, presentation(scene.seed))?;
     Ok(())
 }
 

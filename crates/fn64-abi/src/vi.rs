@@ -452,6 +452,11 @@ mod tests {
         presentations: Arc<Mutex<Vec<fn64_render::ViPresentation>>>,
     }
 
+    struct ReferencePixelBackend {
+        inner: fn64_render_rt64::ReferenceBackend,
+        frames: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
     impl RenderBackend for ViCaptureBackend {
         fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
             Ok(())
@@ -474,10 +479,8 @@ mod tests {
             Ok(FrameStatus::Complete)
         }
 
-        fn present(
-            &mut self,
-            presentation: fn64_render::ViPresentation,
-        ) -> Result<(), RenderError> {
+        fn present(&mut self, request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {
+            let (presentation, _) = request.into_parts();
             self.presentations.lock().unwrap().push(presentation);
             Ok(())
         }
@@ -489,8 +492,50 @@ mod tests {
         }
     }
 
+    impl RenderBackend for ReferencePixelBackend {
+        fn create(&mut self, cfg: &RenderConfig) -> Result<(), RenderError> {
+            self.inner.create(cfg)
+        }
+
+        fn observe_non_rdp_write16(
+            &mut self,
+            write: fn64_render::NonRdpWrite16,
+        ) -> fn64_render::NonRdpWrite16Disposition {
+            self.inner.observe_non_rdp_write16(write)
+        }
+
+        fn process_task(
+            &mut self,
+            rdram: &mut [u8],
+            rsp_memory: &mut fn64_runtime::RspMemory,
+            task: &fn64_render::OsTask,
+            output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            self.inner
+                .process_task(rdram, rsp_memory, task, output_addr)
+        }
+
+        fn present(&mut self, request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {
+            self.inner.present(request)?;
+            self.frames
+                .lock()
+                .unwrap()
+                .push(self.inner.presented_framebuffer().unwrap().pixels.clone());
+            Ok(())
+        }
+
+        fn resize(&mut self, width: u32, height: u32) {
+            self.inner.resize(width, height);
+        }
+
+        fn supported_ucodes(&self) -> &[UcodeId] {
+            self.inner.supported_ucodes()
+        }
+    }
+
     fn install_vi_capture_backend() -> Arc<Mutex<Vec<fn64_render::ViPresentation>>> {
         let presentations = Arc::new(Mutex::new(Vec::new()));
+        crate::test_support::install_test_present_rdram();
         set_render_backend(
             Box::new(ViCaptureBackend {
                 presentations: Arc::clone(&presentations),
@@ -812,7 +857,11 @@ mod tests {
                 Ok(FrameStatus::Complete)
             }
 
-            fn present(&mut self, vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            fn present(
+                &mut self,
+                request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
+                let (vi, _) = request.into_parts();
                 self.last_blanked
                     .store(u32::from(vi.blanked), Ordering::SeqCst);
                 self.last_fade
@@ -836,6 +885,7 @@ mod tests {
         let last_fade = Arc::new(AtomicU32::new(u32::MAX));
         let last_repeat_line = Arc::new(AtomicU32::new(0));
         let last_scanout = Arc::new(Mutex::new(None));
+        crate::test_support::install_test_present_rdram();
         set_render_backend(
             Box::new(CountingBackend {
                 presents: Arc::clone(&presents),
@@ -1079,5 +1129,82 @@ mod tests {
         assert_eq!(registers.resample().x.step_u2_10(), 0x400);
         assert_eq!(registers.resample().y.offset_u2_10(), 0x200);
         assert_eq!(registers.resample().y.step_u2_10(), 0x400);
+    }
+
+    #[test]
+    fn raw_mmio_retrace_rereads_live_origin_bytes_without_a_graphics_task() {
+        const ORIGIN: u32 = 0x120;
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (index, pixel) in [
+                0xf801u16, 0x07c1, 0xf83f, 0xffc1, 0x003f, 0xffff, 0x0001, 0x07ff,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                view.write_u16(RdramAddr::from_offset(ORIGIN + index as u32 * 2), pixel);
+            }
+        }
+
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let mut inner = fn64_render_rt64::ReferenceBackend::new();
+        inner.create(&RenderConfig::new(4, 2)).unwrap();
+        set_render_backend(
+            Box::new(ReferencePixelBackend {
+                inner,
+                frames: Arc::clone(&frames),
+            }),
+            rdram.len(),
+        );
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+
+        for (index, value) in [
+            0x302,
+            ORIGIN,
+            0xf000_0004,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            (100 << 16) | 102,
+            (20 << 16) | 24,
+            0,
+            0x400,
+            0x400,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index == 4 {
+                continue;
+            }
+            assert!(crate::pi::write_live_device_mmio(
+                0xFFFF_FFFF_A440_0000 + index as u64 * 4,
+                value,
+            ));
+        }
+
+        let base = with_host(|host| host.device_fabric.now().get());
+        arm_vi_retrace(10);
+        crate::advance_virtual_time(base + 10);
+        fn64_runtime::RdramViewMut::from_storage(&mut rdram)
+            .write_u16(RdramAddr::from_offset(ORIGIN), 0x07ff);
+        crate::advance_virtual_time(base + 20);
+
+        let captured = frames.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            captured[0],
+            [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,]
+        );
+        assert_eq!(&captured[1][..4], &[0, 255, 255, 255]);
+        drop(captured);
+        with_host(|host| *host = HostState::default());
     }
 }

@@ -71,12 +71,25 @@ their documented blender-bypass behavior; `G_FILLRECT` in one/two-cycle mode
 instead follows the supported combiner, alpha-compare, depth, blender, dither,
 and color-write path with an exclusive lower-right edge.
 
-VI scanout is isolated from that RDP dither stage in `src/vi.rs`. The reference
-lane implements the public full-coverage RGBA16 3x3 restoration mechanism,
-horizontal median divot, a deterministic integer square-root gamma policy, and
-seven-bit stochastic gamma quantization. `docs/VI-FILTERS.md` records exact
-vectors and the honest frontier: partial-coverage VI AA/resampling, the silicon
-gamma ROM and random stream, and post-DAC analog video remain unproven.
+VI scanout is isolated from that RDP dither stage in `src/vi.rs`. Every live
+presentation receives a retrace-scoped physical-RDRAM capability and rereads
+the exact 24-bit `VI_ORIGIN` with the effective 12-bit `VI_WIDTH`; RGBA16 and
+RGBA32 decoding, padded stride, field-specific origins, checked source bounds,
+and blank/inactive no-read behavior have exact reference vectors. The resident
+RDP image is never a fallback for live registers. Native RT64 binds that same
+allocation only for the synchronous foreign call, waits its workload and
+presentation queues idle, then restores placeholder aliases before returning.
+It validates the public programmed source span rather than borrowing the
+reference renderer's policy-specific filter halo. Compatibility geometry can
+still drive standalone behavior fixtures, but only a completed live-register
+present can produce fixed-cycle release capture.
+The reference lane also implements the public full-coverage RGBA16 3x3
+restoration mechanism, partial-coverage silhouette AA, horizontal median divot,
+vertical-then-horizontal resampling or replication, a deterministic integer
+square-root gamma policy, and seven-bit stochastic gamma quantization.
+`docs/VI-FILTERS.md` records exact vectors and the honest frontier: fixed-point
+and border details, the silicon gamma ROM and random stream, and post-DAC analog
+video remain unproven.
 
 Raw RDP decode accepts the unassigned second word of Load/Pipe/Tile/Full Sync,
 while the atomic F3DEX2 macro path keeps its stricter reserved-payload check.

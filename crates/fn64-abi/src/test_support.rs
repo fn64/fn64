@@ -2,6 +2,16 @@
 
 use super::*;
 
+thread_local! {
+    /// ABI-only tests that drive live VI registers without booting a complete
+    /// process still need the same exact physical-device authority as
+    /// production presentation. Keeping this owned per test thread makes the
+    /// raw registration stable for the whole test and avoids an empty-memory
+    /// compatibility fallback at the renderer seam.
+    static TEST_PRESENT_RDRAM: std::cell::RefCell<Box<[u8]>> =
+        std::cell::RefCell::new(vec![0; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE].into_boxed_slice());
+}
+
 pub(crate) fn ctx_zeroed() -> RecompContext {
     RecompContext::zeroed()
 }
@@ -54,7 +64,7 @@ impl fn64_render::RenderBackend for CompleteRenderBackend {
 
     fn present(
         &mut self,
-        _vi: fn64_render::ViPresentation,
+        _request: fn64_render::PresentRequest<'_>,
     ) -> Result<(), fn64_render::RenderError> {
         Ok(())
     }
@@ -69,7 +79,18 @@ impl fn64_render::RenderBackend for CompleteRenderBackend {
 /// Make a test's renderer dependency explicit without assigning it drawing
 /// semantics irrelevant to that test.
 pub(crate) fn install_complete_render_backend(rdram_len: usize) {
+    install_test_present_rdram();
     set_render_backend(Box::new(CompleteRenderBackend), rdram_len);
+}
+
+pub(crate) fn install_test_present_rdram() {
+    TEST_PRESENT_RDRAM.with(|storage| {
+        let mut storage = storage.borrow_mut();
+        with_host(|host| {
+            host.runtime_rdram = storage.as_mut_ptr();
+            host.runtime_rdram_len = storage.len();
+        });
+    });
 }
 
 /// An rdram buffer for a test that hands guest KSEG0 vram addresses to a

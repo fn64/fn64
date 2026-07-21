@@ -80,7 +80,9 @@ fn fixture_display_list_renders_a_non_clear_frame() {
         .expect("process_task should succeed");
     assert_eq!(status, fn64_render::FrameStatus::Complete);
     backend
-        .present(fn64_render::ViPresentation::default())
+        .present(fn64_render::PresentRequest::backend_resident(
+            fn64_render::ViPresentation::default(),
+        ))
         .unwrap();
 
     let fb = backend

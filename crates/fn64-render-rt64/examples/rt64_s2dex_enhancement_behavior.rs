@@ -200,14 +200,17 @@ fn capture(
     backend.enable_deferred_workload_capture_for_evidence()?;
     backend.process_synthetic_s2dex2(rdram, S2DEX_COMMANDS as u32, TARGET)?;
     let route = backend.s2dex_fast_path_evidence()?;
-    backend.present(ViPresentation {
-        noise_seed: 0x5332_4445,
-        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
-            pixel_type: ViPixelType::Rgba16,
-            ..ViFilterControl::default()
-        }),
-        ..ViPresentation::default()
-    })?;
+    backend.present_physical_compatibility(
+        &*rdram,
+        ViPresentation {
+            noise_seed: 0x5332_4445,
+            scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
+                pixel_type: ViPixelType::Rgba16,
+                ..ViFilterControl::default()
+            }),
+            ..ViPresentation::default()
+        },
+    )?;
     let pixels = backend.presented_pixels()?;
     let mut target = vec![0; (WIDTH * HEIGHT * 2) as usize];
     RdramView::from_storage(rdram).copy_logical_bytes(RdramAddr::from_offset(TARGET), &mut target);

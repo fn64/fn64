@@ -480,14 +480,17 @@ fn render(
         )
         .into());
     }
-    backend.present(ViPresentation {
-        noise_seed,
-        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
-            pixel_type: ViPixelType::Rgba16,
-            ..ViFilterControl::default()
-        }),
-        ..ViPresentation::default()
-    })?;
+    backend.present_physical_compatibility(
+        &rdram,
+        ViPresentation {
+            noise_seed,
+            scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
+                pixel_type: ViPixelType::Rgba16,
+                ..ViFilterControl::default()
+            }),
+            ..ViPresentation::default()
+        },
+    )?;
     if u32::from_ne_bytes(rdram[target - 4..target].try_into()?) != GUARD
         || u32::from_ne_bytes(rdram[target + TARGET_BYTES..target + TARGET_BYTES + 4].try_into()?)
             != GUARD

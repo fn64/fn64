@@ -795,6 +795,7 @@ dependencies = [
  "corosensei",
  "fn64-recomp-rs",
  "sha2",
+ "static_assertions",
 ]
 
 [[package]]

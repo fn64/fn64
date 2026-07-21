@@ -265,7 +265,7 @@ fn submit(
         TARGET as u32,
         ORIGINAL_RATE,
     )?;
-    backend.present(presentation())?;
+    backend.present_physical_compatibility(&*rdram, presentation())?;
     Ok(())
 }
 
@@ -507,7 +507,7 @@ fn capture_pacing(
         // target. A repeated identical VI can be coalesced before it reaches
         // the swapchain-present path this evidence is measuring.
         pacing_presentation.repeat_line = burst % 2 == 0;
-        backend.present(pacing_presentation)?;
+        backend.present_physical_compatibility(&*rdram, pacing_presentation)?;
     }
     let pacing = backend.hfr_pacing_evidence()?;
     if pacing.samples.len() != PACING_BURSTS * 2 {

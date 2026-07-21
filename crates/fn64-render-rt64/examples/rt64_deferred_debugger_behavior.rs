@@ -76,15 +76,22 @@ fn fixture() -> (Vec<u8>, u32) {
     (rdram, end as u32)
 }
 
-fn present(backend: &mut Rt64Backend, guest_cycle: u64) -> Result<PresentedFrame, Box<dyn Error>> {
-    backend.present(ViPresentation {
-        noise_seed: guest_cycle,
-        scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
-            pixel_type: ViPixelType::Rgba16,
-            ..ViFilterControl::default()
-        }),
-        ..ViPresentation::default()
-    })?;
+fn present(
+    backend: &mut Rt64Backend,
+    rdram: &[u8],
+    guest_cycle: u64,
+) -> Result<PresentedFrame, Box<dyn Error>> {
+    backend.present_physical_compatibility(
+        rdram,
+        ViPresentation {
+            noise_seed: guest_cycle,
+            scanout: fn64_render::ViScanoutState::BackendOnly(ViFilterControl {
+                pixel_type: ViPixelType::Rgba16,
+                ..ViFilterControl::default()
+            }),
+            ..ViPresentation::default()
+        },
+    )?;
     let capture = backend.presented_pixels()?;
     let selection = backend.present_selection()?;
     if capture.present_id != selection.present_id {
@@ -302,7 +309,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Establish an ordinary last Present. Headless debugger controls below
     // then exercise State::updateScreen's real paused repeat path.
-    let initial = present(&mut backend, 100)?;
+    let initial = present(&mut backend, &rdram, 100)?;
     require_selection("initial B", &initial.selection, B)?;
     require_capture(
         "initial B",
@@ -313,7 +320,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     backend.set_debugger_inspection_for_evidence(true, 0, -1, false)?;
-    let full_a = present(&mut backend, 110)?;
+    let full_a = present(&mut backend, &rdram, 110)?;
     require_selection("paused full A", &full_a.selection, A)?;
     require_capture(
         "paused full A",
@@ -333,7 +340,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     backend.set_debugger_inspection_for_evidence(true, 0, 0, false)?;
-    let first_call_a = present(&mut backend, 120)?;
+    let first_call_a = present(&mut backend, &rdram, 120)?;
     require_selection("paused A draw call 0", &first_call_a.selection, A)?;
     require_capture(
         "paused A draw call 0",
@@ -353,7 +360,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     backend.set_debugger_inspection_for_evidence(true, 1, -1, false)?;
-    let full_b = present(&mut backend, 130)?;
+    let full_b = present(&mut backend, &rdram, 130)?;
     require_selection("paused full B", &full_b.selection, B)?;
     require_capture(
         "paused full B",

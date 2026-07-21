@@ -1605,6 +1605,8 @@ unsafe extern "C" {
     ) -> c_int;
     fn fn64_rt64_present(
         context: *mut RawContext,
+        rdram: *mut u8,
+        rdram_len: usize,
         vi: *const RawVi,
         error: *mut c_char,
         error_capacity: usize,
@@ -2315,14 +2317,28 @@ impl Context {
         }
     }
 
-    pub(crate) fn present(&mut self, vi: ViPresentation) -> Result<(), String> {
+    pub(crate) fn present(
+        &mut self,
+        memory: &fn64_runtime::PhysicalRdramRead<'_>,
+        vi: ViPresentation,
+    ) -> Result<(), String> {
         let mut error = [0; ERROR_CAPACITY];
         let vi = raw_vi(vi)?;
-        // SAFETY: the opaque context is alive and uniquely borrowed for the
-        // synchronous presentation call. Every scalar is passed by value;
-        // `ViPresentation` has already bounded fade to the public 10 bits.
-        let ok =
-            unsafe { fn64_rt64_present(self.0.as_ptr(), &vi, error.as_mut_ptr(), error.len()) };
+        // SAFETY: the opaque context is alive and uniquely borrowed. The
+        // call-scoped physical capability proves the exact 8 MiB allocation
+        // remains live. This entry only reads VI source bytes; the shim waits
+        // every present worker and restores its placeholder aliases before
+        // returning.
+        let ok = unsafe {
+            fn64_rt64_present(
+                self.0.as_ptr(),
+                memory.as_mut_ptr(),
+                memory.len(),
+                &vi,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
         if ok != 0 {
             Ok(())
         } else {
