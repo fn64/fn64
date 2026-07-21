@@ -394,7 +394,85 @@ below. New offline tool: `cargo run -p fn64-render-rt64 --example
 xbus_replay -- <xbus-NNNN.bin> <out-dir>` replays a captured stream
 through the reference backend without booting the game.
 
-## Known frontier (2026-07-21, latest): wild-pointer crash in the demo scene, one task after first geometry
+## RESOLVED-AS-DIAGNOSED (2026-07-21, latest): the wild-pointer SIGSEGV was a
+## deterministic guest cascade, now trapped loudly at its first symptom
+
+Full forensics on the demo-scene wild-pointer crash below (watchpoint
+sessions on the corrupted `s5` save slot, whole-RDRAM byte-diffs between
+runs, and macOS crash-report comparison):
+
+1. **The "run-variant host bytes" hypothesis is REFUTED for a fixed
+   binary.** Two bare (ASLR-on) runs of the same binary produce
+   byte-identical 656 MiB RDRAM images at scheduler steps 200k, 240k,
+   244k, 248k and 250k (`WM2000_SNAPSHOT_STEP`/`WM2000_SNAPSHOT_PATH`,
+   the new determinism-forensics knob in `src/main.rs`), and crash at the
+   IDENTICAL guest pointer (`0x27814010`) and host site
+   (`func_80030EC0`'s matrix store) both bare and under lldb. The
+   run-to-run variance observed last cycle was cross-BUILD variance:
+   different fn64 builds legitimately produce different guest-visible
+   bytes (renderer dither changes feed back through the framebuffer, the
+   KSEG1 fix below changes task-yield bytes), shifting where the same
+   cascade first faults.
+2. **The cascade (established by value-change watchpoints on the
+   `func_80121764` `s5` save slot at guest 0x800837FC):** in one demo
+   frame (~step 250k), `func_80122204`'s object loop calls
+   `func_80121764`, whose body stores G_ENDDL/zero words through a
+   DL-cursor that points INTO the game thread's own stack (stack top
+   0x800839A0, per `osCreateThread` at 0x80022280), zeroing its own
+   saved `s5`; the restored garbage then walks a phantom 0xEC-stride
+   object chain for tens of thousands of iterations (observed marching
+   monotonically for hundreds of MB through fn64's oversized mapping,
+   where real hardware faults at 8 MiB), until a store through the
+   chimera pointer `0x27813FE8` exceeds the 656 MiB mapping -> host
+   SIGSEGV.
+3. **Two real fn64 soundness bugs found and fixed on the way:**
+   - **KSEG1 uncached-mirror aliasing** (`fn64_mmio_proxy.h`,
+     `fn64_fold_kseg1_mirror`): generated-C accesses through `or
+     $v0, 0xA0000000`-built pointers (WM2000's own task loader does this
+     at 0x80031E28 to read `ucode_data+0xBFC` on OS_TASK_YIELDED reload;
+     its raw-read helper at 0x800373B8 does the same) previously landed
+     at rdram offset `0x20000000 + phys` -- a disjoint, permanently-zero
+     region -- so uncached reads returned deterministic ZEROS and
+     uncached writes vanished from the cached view. Hardware maps KSEG0
+     and KSEG1 to the same DRAM; the proxy now folds non-RCP KSEG1
+     (0xA0000000..0xA4000000) onto the physical bytes. (Verified by
+     rdram-snapshot scans: nothing had ever written 0x20000000..0x24000000,
+     i.e. every uncached read had been consuming zeros.)
+   - **Silent unaligned lw/sw/lh/sh** (`fn64_mmio_proxy.h` +
+     `fn64_c_mem_unaligned` in `fn64-abi`): MIPS requires natural
+     alignment (hardware raises AdEL/AdES); recomp.h's raw host-pointer
+     cast instead read/wrote a byte-lane CHIMERA of two adjacent native
+     words -- exactly the kind of value (`0x27813FE8`) the crash rode.
+     The C lane now traps loudly, naming the access.
+4. **Current state:** the boot no longer dies with a wild host SIGSEGV
+   inside recompiled code. It stops with a NAMED trap: `generated-C
+   4-byte load at unaligned guest address 0x1DB` inside
+   `func_80121764` (i.e. `lw 0xDC($s1)` with the object pointer
+   `s1 = 0xFF` -- the first observable symptom of the same demo-frame
+   cascade). With the KSEG1 fix the yielded-task reload now consumes
+   real yield bytes instead of zeros, and the fatal demo frame arrives
+   after gfx task #4 instead of #7 -- the cascade's entry is now the
+   frontier itself.
+
+## Next frontier: the demo frame whose DL cursor points into the stack
+
+The first-order corruption is `func_80121764` emitting its per-object DL
+through a cursor (`*a0`, threaded from `func_8011F078` ->
+`func_80122204` sp+0x10) that points at the game thread's stack instead
+of the frame's Gfx pool. Everything downstream (shredded saved
+registers, the phantom 0xEC object walk, the 0x27813FE8 chimera) follows
+from those stack-aimed DL stores. The open question is what fn64
+divergence hands the demo engine that cursor: the leading suspects are
+the task-yield/reload contract (the OS_TASK_YIELDED path whose real
+bytes the KSEG1 fix just surfaced -- fn64's LLE task dispatch may not
+write faithful yield data) and the known frame-pacing divergence (the
+scene loop runs ~1400 VI fields per game frame against hardware-cadence
+audio; the voice-map rung's precedent). Method that works: the
+value-change watchpoint scripts from this cycle (`/tmp/wm2000_watch2.py`
+pattern) on the DL-cursor cell, plus `WM2000_SNAPSHOT_STEP` byte-diffs
+to bracket the fatal frame (it begins between steps 250k and 260k).
+
+## Superseded framing (2026-07-21, earlier): wild-pointer crash in the demo scene, one task after first geometry
 
 Immediately after gfx task #7 and swap #8, the boot dies with a real
 host SIGSEGV inside recompiled guest code — not a renderer trap. Crash
