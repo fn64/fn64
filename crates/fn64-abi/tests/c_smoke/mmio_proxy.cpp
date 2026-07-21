@@ -19,8 +19,15 @@ int main(int argc, char** argv) {
     // Ordinary RDRAM remains recomp.h-compatible direct native-word storage.
     const gpr kseg0 = UINT64_C(0xFFFFFFFF80000000);
     const gpr kseg1 = UINT64_C(0xFFFFFFFFA0000000);
+    const gpr ddrom_kseg1 = UINT64_C(0xFFFFFFFFA6000000);
     if (fn64_mem_storage_offset(kseg0 + 8, 2) != 10 ||
         fn64_mem_storage_offset(kseg1 + 8, 2) != 10 ||
+        !fn64_is_sparse_direct_backing(ddrom_kseg1) ||
+        fn64_is_rcp_mmio_word(ddrom_kseg1) ||
+        fn64_is_rdram_direct_alias(ddrom_kseg1) ||
+        fn64_mem_storage_offset(ddrom_kseg1, 0) != UINT64_C(0x26000000) ||
+        fn64_mem_storage_offset(UINT64_C(0x00000000A6000000), 0) !=
+            UINT64_C(0x26000000) ||
         fn64_mem_storage_offset(UINT64_C(8), 2) == 10 ||
         fn64_mem_storage_offset(UINT64_C(0xFFFFFFFFC0000008), 2) == 10) {
         return 11;
@@ -129,6 +136,10 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "--bad-kseg2") == 0) {
         MEM_W(0, UINT64_C(0xFFFFFFFFC0000000)) = UINT32_C(1);
         return 13;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--bad-noncanonical-sparse") == 0) {
+        (void)static_cast<uint32_t>(MEM_W(0, UINT64_C(0x00000001A6000000)));
+        return 29;
     }
     if (argc > 1 && std::strcmp(argv[1], "--bad-pif-kuseg") == 0) {
         (void)static_cast<uint32_t>(MEM_W(0, UINT64_C(0x000000001FC007C0)));

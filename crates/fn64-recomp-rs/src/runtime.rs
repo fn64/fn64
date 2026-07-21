@@ -930,16 +930,46 @@ impl<'a> Rdram<'a> {
         self.mem
     }
 
-    /// Translate a sign-extended KSEG0/KSEG1 virtual address (the `reg + off`
-    /// sum the MIPS code computes) to a physical rdram byte offset.
+    /// Translate a canonical KSEG0/KSEG1 address to its generated-code backing
+    /// offset. Physical RDRAM aliases share the low 29-bit device prefix;
+    /// non-RDRAM direct windows retain N64Recomp's sparse `address - KSEG0`
+    /// layout. Modeled RCP/PIF words are excluded because their installed hook
+    /// is the sole device authority.
     #[inline]
-    fn phys(vaddr: u64) -> usize {
-        if let Some(offset) = Self::physical_rdram_offset(vaddr) {
-            return offset as usize;
+    fn direct_storage_offset(vaddr: u64) -> Option<usize> {
+        if Self::is_word_only_mmio(vaddr) {
+            return None;
+        }
+
+        let upper = vaddr >> 32;
+        let low = vaddr as u32;
+        let canonical_32 = upper == 0 || upper == u32::MAX as u64;
+        let direct_segment = (0x8000_0000..0xc000_0000).contains(&low);
+        if !canonical_32 || !direct_segment {
+            return None;
+        }
+
+        let physical = low & 0x1fff_ffff;
+        Some(if physical < RDRAM_LEN as u32 {
+            physical as usize
+        } else {
+            low.wrapping_sub(0x8000_0000) as usize
+        })
+    }
+
+    #[inline]
+    fn backing_offset(vaddr: u64) -> usize {
+        if let Some(offset) = Self::direct_storage_offset(vaddr) {
+            return offset;
         }
         let physical = (vaddr as u32) & 0x1fff_ffff;
+        let reason = if Self::is_word_only_mmio(vaddr) {
+            "modeled word-only device access was not consumed by the installed hook"
+        } else {
+            "only zero- or sign-extended KSEG0/KSEG1 are modeled"
+        };
         trap_unsupported(format!(
-            "Rdram: unsupported mapped address {vaddr:#018x} resolves to physical {physical:#x}; only zero- or sign-extended KSEG0/KSEG1 are modeled"
+            "Rdram: unsupported mapped address {vaddr:#018x} resolves to physical {physical:#x}; {reason}"
         ))
     }
 
@@ -1008,7 +1038,7 @@ impl<'a> Rdram<'a> {
         if let Some(value) = MMIO_READ.with(|slot| slot.get().and_then(|read| read(vaddr))) {
             return value as i32;
         }
-        let p = Self::phys(vaddr);
+        let p = Self::backing_offset(vaddr);
         i32::from_ne_bytes(self.mem[p..p + 4].try_into().unwrap())
     }
 
@@ -1017,7 +1047,7 @@ impl<'a> Rdram<'a> {
     pub fn load_h(&self, vaddr: u64) -> i16 {
         Self::reject_nonword_mmio(vaddr, 2, false);
         assert_eq!(vaddr & 1, 0, "unaligned LH at {vaddr:#018x}");
-        let p = Self::phys(vaddr) ^ 2;
+        let p = Self::backing_offset(vaddr) ^ 2;
         i16::from_ne_bytes(self.mem[p..p + 2].try_into().unwrap())
     }
 
@@ -1031,7 +1061,7 @@ impl<'a> Rdram<'a> {
     #[inline]
     pub fn load_b(&self, vaddr: u64) -> i8 {
         Self::reject_nonword_mmio(vaddr, 1, false);
-        let p = Self::phys(vaddr) ^ 3;
+        let p = Self::backing_offset(vaddr) ^ 3;
         self.mem[p] as i8
     }
 
@@ -1039,7 +1069,7 @@ impl<'a> Rdram<'a> {
     #[inline]
     pub fn load_bu(&self, vaddr: u64) -> u8 {
         Self::reject_nonword_mmio(vaddr, 1, false);
-        let p = Self::phys(vaddr) ^ 3;
+        let p = Self::backing_offset(vaddr) ^ 3;
         self.mem[p]
     }
 
@@ -1052,7 +1082,7 @@ impl<'a> Rdram<'a> {
         if MMIO_WRITE.with(|slot| slot.get().is_some_and(|write| write(vaddr, val))) {
             return;
         }
-        let p = Self::phys(vaddr);
+        let p = Self::backing_offset(vaddr);
         self.mem[p..p + 4].copy_from_slice(&val.to_ne_bytes());
         if let Some(offset) = Self::physical_rdram_offset(vaddr) {
             notify_guest_write(offset, 4);
@@ -1064,7 +1094,7 @@ impl<'a> Rdram<'a> {
     pub fn store_h(&mut self, vaddr: u64, val: u16) {
         Self::reject_nonword_mmio(vaddr, 2, true);
         assert_eq!(vaddr & 1, 0, "unaligned SH at {vaddr:#018x}");
-        let p = Self::phys(vaddr) ^ 2;
+        let p = Self::backing_offset(vaddr) ^ 2;
         self.mem[p..p + 2].copy_from_slice(&val.to_ne_bytes());
         if let Some(offset) = Self::physical_rdram_offset(vaddr) {
             notify_non_rdp_write16(offset, val);
@@ -1075,7 +1105,7 @@ impl<'a> Rdram<'a> {
     #[inline]
     pub fn store_b(&mut self, vaddr: u64, val: u8) {
         Self::reject_nonword_mmio(vaddr, 1, true);
-        let p = Self::phys(vaddr) ^ 3;
+        let p = Self::backing_offset(vaddr) ^ 3;
         self.mem[p] = val;
         if let Some(offset) = Self::physical_rdram_offset(vaddr) {
             notify_guest_write(offset, 1);
@@ -1175,8 +1205,8 @@ impl<'a> Rdram<'a> {
         Self::reject_nonword_mmio(vaddr, 8, true);
         assert_eq!(vaddr & 7, 0, "unaligned SD at {vaddr:#018x}");
         if let Some(offset) = Self::physical_rdram_offset(vaddr) {
-            let high = Self::phys(vaddr);
-            let low = Self::phys(vaddr.wrapping_add(4));
+            let high = Self::backing_offset(vaddr);
+            let low = Self::backing_offset(vaddr.wrapping_add(4));
             // Match N64Recomp's low-word then high-word commit order. The
             // observer runs only after both halves are coherent.
             self.mem[low..low + 4].copy_from_slice(&(val as u32).to_ne_bytes());
@@ -1242,22 +1272,23 @@ impl<'a> Rdram<'a> {
     // --- Checked accessors for the bank/sparse block-runner lane (U4) ---
     //
     // The historical whole-function lane calls the unchecked accessors above:
-    // an access outside backed RDRAM is a host panic there, and that panicking
-    // semantics is deliberately preserved. The block-runner lane instead needs
+    // an access outside backed generated-code storage is a host panic there,
+    // and that panicking semantics is deliberately preserved. The block-runner
+    // lane instead needs
     // a typed VR4300 memory fault it can turn into `BlockExit::Fault`, so it
     // calls these `try_` variants. On success they perform the identical access
     // as their unchecked twin; on an out-of-bounds effective address they
     // return `Err(vaddr)` carrying the faulting guest virtual address, and
-    // touch no memory. This models "access outside backed RDRAM storage"; it is
-    // not full VR4300 address-error/TLB semantics (see U4 in
+    // touch no memory. This models "access outside supplied backing storage";
+    // it is not full VR4300 address-error/TLB semantics (see U4 in
     // `docs/UNIVERSAL-RUNTIME-PLAN.md`).
 
-    /// True iff the `width`-byte physical range beginning at physical offset
-    /// `p` lies wholly inside backed storage. Every checked accessor reduces to
+    /// True iff the `width`-byte range beginning at storage offset `p` lies
+    /// wholly inside backed storage. Every checked accessor reduces to
     /// this after applying its own swizzle so the admitted set matches exactly
     /// which unchecked accesses would not panic.
     #[inline]
-    fn phys_range_backed(&self, p: usize, width: usize) -> bool {
+    fn storage_range_backed(&self, p: usize, width: usize) -> bool {
         p.checked_add(width)
             .is_some_and(|end| end <= self.mem.len())
     }
@@ -1265,11 +1296,11 @@ impl<'a> Rdram<'a> {
     /// Translate and bound a checked-lane access without entering the
     /// unchecked lane's loud unsupported-address trap. `try_*` callers must
     /// return the original virtual address as a typed fault for every
-    /// non-RDRAM segment, including opt-in MMIO windows with no installed port.
+    /// non-direct segment, including opt-in MMIO windows with no installed port.
     #[inline]
     fn virtual_range_backed(&self, vaddr: u64, lane_xor: usize, width: usize) -> bool {
-        Self::physical_rdram_offset(vaddr)
-            .is_some_and(|p| self.phys_range_backed((p as usize) ^ lane_xor, width))
+        Self::direct_storage_offset(vaddr)
+            .is_some_and(|p| self.storage_range_backed(p ^ lane_xor, width))
     }
 
     /// Whether the aligned-word effective address is backed (LW/LWU/LL/…).
@@ -1473,6 +1504,7 @@ impl<'a> Rdram<'a> {
 mod tests {
     use super::{
         set_unsupported_observer, trap_unsupported, GuestWriteEvent, Rdram, RecompContext,
+        RDRAM_LEN,
     };
 
     type RdramOperation = for<'a> fn(&mut Rdram<'a>);
@@ -1629,6 +1661,32 @@ mod tests {
         assert_eq!(Rdram::physical_rdram_offset(0x0000_0000_0000_1234), None);
         assert_eq!(Rdram::physical_rdram_offset(0xffff_ffff_c000_1234), None);
         assert_eq!(Rdram::physical_rdram_offset(0x0000_0001_8000_1234), None);
+    }
+
+    #[test]
+    fn sparse_direct_windows_share_one_classifier_across_canonical_forms() {
+        assert_eq!(
+            Rdram::direct_storage_offset(0xffff_ffff_a600_0000),
+            Some(0x2600_0000)
+        );
+        assert_eq!(
+            Rdram::direct_storage_offset(0x0000_0000_a600_0000),
+            Some(0x2600_0000)
+        );
+        assert_eq!(
+            Rdram::direct_storage_offset(0xffff_ffff_8600_0000),
+            Some(0x0600_0000)
+        );
+        assert_eq!(Rdram::direct_storage_offset(0xffff_ffff_a460_0000), None);
+        assert_eq!(Rdram::direct_storage_offset(0x0000_0001_a600_0000), None);
+        assert_eq!(Rdram::direct_storage_offset(0xffff_ffff_c600_0000), None);
+
+        let mut bytes = vec![0u8; RDRAM_LEN + 4];
+        bytes[RDRAM_LEN..RDRAM_LEN + 4].copy_from_slice(&0x1234_5678u32.to_ne_bytes());
+        let mem = Rdram::new(&mut bytes);
+        assert_eq!(mem.load_w(0xffff_ffff_8080_0000) as u32, 0x1234_5678);
+        assert_eq!(mem.load_w(0x0000_0000_8080_0000) as u32, 0x1234_5678);
+        assert_eq!(mem.try_load_w(0xffff_ffff_8080_0000), Ok(0x1234_5678));
     }
 
     #[test]

@@ -1072,7 +1072,14 @@ task calls out:
   replacing a live allocation traps because retained device/task authority may
   still name the original bytes. Raw-MMIO interception ends at the public RCP/SI boundary
   `0xA4900000`; cartridge-domain KSEG1 addresses at `0xA5000000` and above
-  remain ordinary mapped memory rather than being misdecoded as registers.
+  remain ordinary generated-code backing rather than being misdecoded as
+  registers. The C proxy and typed Rust lane share one classifier: physical
+  RDRAM aliases use the common 8 MiB prefix, while other canonical KSEG0/KSEG1
+  addresses use N64Recomp's sparse `low32(address) - 0x80000000` offset and
+  succeed only when the host supplied that complete range. This compatibility
+  backing is not evidence that a cartridge-domain device is attached; in
+  particular, completing the cart-only `osDriveRomInit` probe does not claim
+  mounted 64DD IPL-ROM storage or DMA support.
 - **Why rung-18-class races become unrepresentable, precisely.** Rung 18's
   actual root cause was not "the mutex was in the wrong place" — a mutex
   *was* added at exactly the TOCTOU the original hypothesis named, verified

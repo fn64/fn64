@@ -82,6 +82,22 @@ static inline bool fn64_is_unsupported_pif_alias(gpr address) {
         !fn64_is_rcp_mmio_word(address);
 }
 
+static inline bool fn64_is_sparse_direct_backing(gpr address) {
+    const uint64_t upper = address >> 32;
+    const uint32_t low = static_cast<uint32_t>(address);
+    const uint32_t physical = low & 0x1FFFFFFFU;
+    const bool canonical_32 = upper == 0 || upper == UINT32_MAX;
+    const bool direct_segment = low >= 0x80000000U && low < 0xC0000000U;
+    return canonical_32 && direct_segment && physical >= 0x00800000U &&
+        !fn64_is_rcp_mmio_word(address);
+}
+
+static inline bool fn64_is_unsupported_sparse_alias(gpr address) {
+    const uint32_t physical = static_cast<uint32_t>(address) & 0x1FFFFFFFU;
+    return physical >= 0x00800000U && !fn64_is_rcp_mmio_word(address) &&
+        !fn64_is_sparse_direct_backing(address);
+}
+
 static inline bool fn64_is_invalid_rdram_access(gpr address, uint32_t width) {
     if (!fn64_is_rdram_direct_alias(address)) {
         return false;
@@ -94,14 +110,19 @@ static inline bool fn64_is_invalid_rdram_access(gpr address, uint32_t width) {
 // N64Recomp's raw pointer formula gives KSEG1 a sparse host offset 512 MiB
 // above KSEG0. Real RDRAM is nevertheless one physical device: its cached
 // and uncached direct-segment aliases must address the same bytes. Keep the
-// sparse formula for non-RDRAM windows and unsupported mapped addresses; a
-// low-29-bit mask alone would silently invent TLB behavior for KUSEG.
+// sparse formula for canonical non-RDRAM direct windows. Normalize the
+// accepted zero/sign-extended forms through the low word; full-width unsigned
+// subtraction would send zero-extended KSEG addresses 4 GiB past their
+// sign-extended twin. Unsupported mapped addresses are rejected before this
+// helper, so a low-29-bit mask never silently invents TLB behavior for KUSEG.
 static inline uint64_t fn64_mem_storage_offset(gpr address, gpr lane_xor) {
     const uint32_t physical = static_cast<uint32_t>(address) & 0x1FFFFFFFU;
     if (fn64_is_rdram_direct_alias(address)) {
         return static_cast<uint64_t>(physical) ^ lane_xor;
     }
-    return (address ^ lane_xor) - UINT64_C(0xFFFFFFFF80000000);
+    return static_cast<uint64_t>(
+        (static_cast<uint32_t>(address) ^ static_cast<uint32_t>(lane_xor)) -
+        UINT32_C(0x80000000));
 }
 
 template <typename T, gpr LaneXor>
@@ -120,7 +141,8 @@ public:
             }
         }
         if (fn64_is_unsupported_rdram_alias(address) ||
-            fn64_is_unsupported_pif_alias(address)) {
+            fn64_is_unsupported_pif_alias(address) ||
+            fn64_is_unsupported_sparse_alias(address)) {
             fn64_c_bad_direct_address(address, sizeof(T), 0);
             return T{};
         }
@@ -155,7 +177,8 @@ private:
             }
         }
         if (fn64_is_unsupported_rdram_alias(address) ||
-            fn64_is_unsupported_pif_alias(address)) {
+            fn64_is_unsupported_pif_alias(address) ||
+            fn64_is_unsupported_sparse_alias(address)) {
             fn64_c_bad_direct_address(address, sizeof(T), 1);
             return;
         }
@@ -202,6 +225,7 @@ static inline void fn64_store_doubleword(uint8_t* rdram, gpr address, uint64_t v
     }
     if (fn64_is_unsupported_rdram_alias(address) ||
         fn64_is_unsupported_pif_alias(address) ||
+        fn64_is_unsupported_sparse_alias(address) ||
         fn64_is_invalid_rdram_access(address, 8)) {
         fn64_c_bad_direct_address(address, 8, 1);
         return;
@@ -234,6 +258,7 @@ static inline uint64_t load_doubleword(uint8_t* rdram, gpr reg, gpr offset) {
     }
     if (fn64_is_unsupported_rdram_alias(address) ||
         fn64_is_unsupported_pif_alias(address) ||
+        fn64_is_unsupported_sparse_alias(address) ||
         fn64_is_invalid_rdram_access(address, 8)) {
         fn64_c_bad_direct_address(address, 8, 0);
         return 0;

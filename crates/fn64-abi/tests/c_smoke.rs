@@ -167,6 +167,7 @@ fn c_caller_links_and_runs_against_fn64_abi_staticlib() {
     for argument in [
         "--bad-kuseg",
         "--bad-kseg2",
+        "--bad-noncanonical-sparse",
         "--bad-pif-kuseg",
         "--bad-pif-kseg2",
     ] {
