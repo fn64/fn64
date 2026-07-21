@@ -202,6 +202,50 @@ Corollaries, each earned the hard way:
   ROADMAP H3) produces numbers exactly one person can reproduce. Unreproducible
   evidence is not evidence — see AGENTS.md's validation bars.
 
+#### Private release execution is a typed authority boundary
+
+Private admission and private execution are deliberately separate. Schema-v4
+admission validates local ownership/provenance policy and content-addresses the
+ROM, recompiled output, microcode pair, native host entry image, arguments,
+environment, fixed cycle, and expected execution source. The emitted
+`fn64.private-release-run-contract.v1` is an integrity wire, not a signature:
+any caller can recompute a self-hash. Production runner APIs therefore accept
+only an opaque `VerifiedPrivateReleaseRunContract`. Its loader requires the
+runtime admission script to equal the bytes embedded when the runner was built
+and executes those embedded policy bytes directly through isolated Python while
+replaying the manifest/readiness/contract validation. A separate constructor
+is confined by exact byte identities and typed fields to fn64's fixed non-game
+`synthetic_mechanism` fixture and current test executable; arbitrary relabelled
+input cannot authorize a capability.
+
+The capability owns one exact-ten process series. It clears ambient
+environment state, copies the verified native ELF/Mach-O/PE bytes to a
+create-new executable beside the original, launches only that isolated stage,
+sets the ROM and release tuple itself, derives ten event identities from an
+OS-random nonce plus contract/child/ordinal/output context, validates each
+durable report/journal pair before continuing, and persists a canonical
+receipt only after all ten agree semantically. Script launchers and known
+loader/interpreter/plugin injection variables are rejected. Input paths and
+output directories remain private, non-symlink, and outside git (or explicitly
+ignored).
+
+The exact-stage boundary is local and single-owner: staged files are random,
+create-new, read-only, and rehashed, but a malicious same-UID process capable
+of chmod plus pathname replacement between verification and OS open/spawn is
+outside scope. The resolved system-Python executable is trusted as OS-owned.
+
+That still does not prove consumption. Rehashing an admitted microcode or
+recompiled file proves that it did not change, not that the child installed
+it. Consequently `full_rom` and `combined` currently fail before their first
+child with the missing `fn64.release-program-build-receipt.v1` boundary.
+Production becomes admissible only when typed build/runtime evidence connects
+the admitted recompiled bytes to the child/report execution source and the
+admitted microcode text/data to the ABI-owned task observations. The live
+synthetic runner test demonstrates direct-process orchestration and mechanism
+determinism during the observed test invocation only. Its self-hashed receipt
+is retained integrity evidence, not a transferable process attestation, and
+the synthetic result cannot be promoted into private-ROM evidence.
+
 #### Instruction-exact savestate transplant is NOT REPRESENTABLE here (negative result, 2026-07-14)
 
 This is an architecture fact about the runtime's shape, kept here because the

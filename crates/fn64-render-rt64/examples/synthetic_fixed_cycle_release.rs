@@ -59,32 +59,80 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
+pub(crate) fn run() -> Result<(), Box<dyn Error>> {
+    const USAGE: &str = "usage: set FN64_RELEASE_GATE_CYCLE, FN64_RELEASE_REPORT, and FN64_RELEASE_RUN_EVENT_SHA256, or pass REPORT.json JOURNAL.jsonl RUN_EVENT_SHA256";
+    let release_environment = fn64_boot_harness::release_run_environment_from_process()?;
     let mut arguments = env::args_os().skip(1);
-    let report_path = arguments.next().map(PathBuf::from).ok_or_else(|| {
-        io::Error::other(
-            "usage: synthetic_fixed_cycle_release REPORT.json JOURNAL.jsonl RUN_EVENT_SHA256",
-        )
-    })?;
-    let journal_path = arguments.next().map(PathBuf::from).ok_or_else(|| {
-        io::Error::other(
-            "usage: synthetic_fixed_cycle_release REPORT.json JOURNAL.jsonl RUN_EVENT_SHA256",
-        )
-    })?;
-    let run_event_sha256 = arguments.next().ok_or_else(|| {
-        io::Error::other(
-            "usage: synthetic_fixed_cycle_release REPORT.json JOURNAL.jsonl RUN_EVENT_SHA256",
-        )
-    })?;
-    let run_event_sha256 = run_event_sha256
-        .into_string()
-        .map_err(|_| io::Error::other("RUN_EVENT_SHA256 must be UTF-8"))?;
-    if arguments.next().is_some() {
-        return Err(io::Error::other(
-            "usage: synthetic_fixed_cycle_release REPORT.json JOURNAL.jsonl RUN_EVENT_SHA256",
-        )
-        .into());
+    let invocation = if release_environment.is_some() {
+        if arguments.next().is_some() {
+            return Err(io::Error::other(format!(
+                "{USAGE}; arguments cannot accompany FN64_RELEASE_*"
+            ))
+            .into());
+        }
+        return run_from_release_environment();
+    } else {
+        let report_path = arguments
+            .next()
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::other(USAGE))?;
+        let journal_path = arguments
+            .next()
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::other(USAGE))?;
+        let run_event_sha256 = arguments
+            .next()
+            .ok_or_else(|| io::Error::other(USAGE))?
+            .into_string()
+            .map_err(|_| io::Error::other("RUN_EVENT_SHA256 must be UTF-8"))?;
+        if arguments.next().is_some() {
+            return Err(io::Error::other(USAGE).into());
+        }
+        ReleaseInvocation {
+            report_path,
+            journal_path,
+            run_event_sha256,
+            expected_cycle: None,
+        }
+    };
+
+    run_invocation(invocation)
+}
+
+/// Fresh-process entry point for a Rust test harness launched by the trusted
+/// private-series runner. The normal example path rejects all process
+/// arguments in runner mode, while the test harness necessarily has its own.
+pub(crate) fn run_from_release_environment() -> Result<(), Box<dyn Error>> {
+    let environment = fn64_boot_harness::release_run_environment_from_process()?
+        .ok_or_else(|| io::Error::other("FN64_RELEASE_* runner environment is absent"))?;
+    run_invocation(ReleaseInvocation::from_environment(environment))
+}
+
+struct ReleaseInvocation {
+    report_path: PathBuf,
+    journal_path: PathBuf,
+    run_event_sha256: String,
+    expected_cycle: Option<u64>,
+}
+
+impl ReleaseInvocation {
+    fn from_environment(environment: fn64_boot_harness::ReleaseRunEnvironment) -> Self {
+        Self {
+            report_path: environment.report_path.clone(),
+            journal_path: environment.journal_path(),
+            run_event_sha256: environment.run_event_sha256,
+            expected_cycle: Some(environment.guest_cycle),
+        }
     }
+}
+
+fn run_invocation(invocation: ReleaseInvocation) -> Result<(), Box<dyn Error>> {
+    let ReleaseInvocation {
+        report_path,
+        journal_path,
+        run_event_sha256,
+        expected_cycle,
+    } = invocation;
 
     let (program, scenario) = release_program()?;
     let mut rdram = vec![0u8; RDRAM_LEN];
@@ -95,6 +143,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     fn64_abi::set_audio_rdram_len(rdram.len());
     let fixed_cycle = fn64_abi::next_vi_deadline()
         .ok_or_else(|| io::Error::other("NTSC configuration did not schedule a VI edge"))?;
+    if let Some(expected_cycle) = expected_cycle {
+        if fixed_cycle != expected_cycle {
+            return Err(io::Error::other(format!(
+                "FN64_RELEASE_GATE_CYCLE selected {expected_cycle}, synthetic scheduled VI edge is {fixed_cycle}"
+            ))
+            .into());
+        }
+    }
 
     let mut gate = LiveReleaseGate::new(fixed_cycle);
     gate.arm_with_unsupported_journal(&journal_path, &run_event_sha256)?;
@@ -298,10 +354,11 @@ unsafe extern "C" fn synthetic_entry(rdram: *mut u8, ctx: *mut fn64_abi::RecompC
     ctx.r5 = 32;
     unsafe { fn64_abi::osAiSetNextBuffer_recomp(rdram, ctx) };
 
-    for task in [GFX_TASK, AUDIO_TASK] {
+    for task in [AUDIO_TASK, GFX_TASK] {
         ctx.r4 = kseg(task) as u64;
         unsafe { fn64_abi::osSpTaskLoad_recomp(rdram, ctx) };
     }
+    unsafe { fn64_abi::osSpTaskStartGo_recomp(rdram, ctx) };
 }
 
 fn write_word(rdram: &mut [u8], offset: usize, value: u32) {

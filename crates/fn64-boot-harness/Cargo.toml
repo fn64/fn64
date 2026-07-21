@@ -15,6 +15,7 @@ recomp-rs = ["fn64-abi/recomp-rs", "dep:fn64-recomp-rs"]
 fn64-abi = { path = "../fn64-abi" }
 fn64-runtime = { path = "../fn64-runtime" }
 fn64-recomp-rs = { path = "../fn64-recomp-rs", optional = true }
+getrandom = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

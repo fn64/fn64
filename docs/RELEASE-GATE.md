@@ -268,7 +268,16 @@ destinations are still not enumerated.
 
 ## OoT private-host path
 
-`examples/oot-boot` accepts both variables together:
+`examples/oot-boot` accepts the generic runner-owned tuple:
+
+```text
+FN64_RELEASE_GATE_CYCLE=C
+FN64_RELEASE_REPORT=/private/path/report.json
+FN64_RELEASE_RUN_EVENT_SHA256=LOWERCASE_SHA256_FROM_THE_RUNNER_EVENT
+```
+
+For manual compatibility it also accepts the historical OoT aliases as one
+complete, unmixed tuple:
 
 ```text
 OOT_RELEASE_GATE_CYCLE=C
@@ -337,10 +346,11 @@ past `C` fails loudly. A step limit, swap limit, or idle exit before `C` also
 cannot return success without a report. This opaque-boundary rule is
 independent of the schema-v16 wire shape and its geometry-bound encoding.
 
-The cycle and report variables are an inseparable pair. Report-only,
-cycle-only, non-Unicode release/discovery values, and unknown renderers while a
-release or discovery mode is active all fail before boot instead of silently
-selecting ordinary reference execution.
+The cycle, report, and run-event variables are an inseparable triple. A
+partial, mixed generic/OoT, non-Unicode, relative-report-path, or noncanonical
+event identity fails before boot instead of silently selecting ordinary
+reference execution. Unknown renderers while release or discovery mode is
+active fail the same way.
 
 The OoT host supplies the two host-owned channels from live state, not fixture
 buffers:
@@ -397,6 +407,54 @@ the release-matrix platform/controller/save/renderer vocabulary. Its emitted
 readiness report is content-free and does not replace the private manifest,
 the runtime microcode-recognition gate, or this release gate's ten reports.
 
+During an observed invocation, the harness-owned
+`run-private-release-series` process closes the fresh-process orchestration gap
+for repository synthetic evidence. It accepts only an opaque verified
+contract, creates one OS-random series nonce, launches exactly ten child
+processes sequentially under `env_clear`, derives a distinct run-event identity
+and report path for each child, executes a create-new exact copy of the verified
+child image beside its original, seals the stage read-only, rehashes every bound
+input and the stage before each spawn and after the series, and verifies each
+report/journal pair before launching the next child. It then writes one
+create-new, flushed and file-synced
+`fn64.private-release-series-receipt.v1` binding the exact contract, runner and
+child entry images, ten event/file/report identities, and the common semantic
+report SHA-256. Retained evidence can be reverified from that receipt.
+
+The receipt is a canonical self-hashed integrity record, not a signature or
+operating-system process attestation. Later verification proves that the
+retained files still match the recorded series and runner image; it cannot by
+itself prove that the trusted runner originally performed the launches. A
+release that needs transferable process-provenance evidence must retain an
+external trusted CI/code-signing attestation over the receipt and runner image.
+The local execution guarantee assumes no malicious same-UID writer can chmod
+and replace the random staged contract/child path between validation and the
+operating-system open/spawn; the resolved system-Python image is likewise
+trusted as OS-owned. This is the same explicit single-owner boundary as private
+input admission, not a sandbox against the invoking user.
+
+Raw JSON is not runner authority. Production loading first requires the
+repository admission script to byte-match the copy embedded at runner build
+time, then executes those embedded policy bytes directly through isolated
+system Python while revalidating the v4 manifest/readiness/contract mapping.
+A separate synthetic-only constructor accepts only fn64's fixed non-game
+fixture, `NoProgram` source, and current test executable; arbitrary relabelled
+input and all ROM purposes fail closed. Production `full_rom` and `combined`
+launch currently fail before the first child because immutable admitted
+`recompiled`, `microcode_text`, and
+`microcode_data` descriptors are not yet typed proof that the executable
+consumed them. The loud frontier is
+`fn64.release-program-build-receipt.v1`; until that binding exists, the trusted
+runner makes no full-ROM certification claim.
+
+The current production loader specifically resolves and pins
+`/usr/bin/python3`; Windows production admission therefore remains fail-closed
+rather than certified.
+Receipt re-verification also requires the current verifier executable to hash
+to the exact runner image recorded by the receipt, so that binary is part of
+the retained evidence set. `--print-contract-sha256` is only a canonical-wire
+integrity diagnostic and cannot create the opaque runner authority.
+
 Verify a retained run-ordered series with the harness-owned paired checker. It
 revalidates each report's integrity and closed ledger, parses the corresponding
 journal, requires a terminal v3 cycle/report-SHA/run-event binding, rejects a
@@ -425,8 +483,11 @@ relabel retained evidence. Public no-program fixtures select
 The checker rejects duplicate report paths, duplicate journal paths, and a
 path used as both halves of a pair, so one retained file cannot be repeated to
 satisfy the deterministic bar. It also rejects copied pairs by their duplicate
-run-event identity. This identity is provenance supplied by the runner; it does
-not prove that the operating system created a physically distinct process.
+run-event identity. For manually assembled input this identity is provenance
+supplied by the caller and does not prove that the operating system created a
+physically distinct process. An observed trusted-runner invocation guarantees
+ten direct sequential launches; its retained receipt proves only integrity and
+semantic binding unless an external trusted execution attestation covers it.
 Retain one distinct pair per invocation and pass pairs in execution order. The
 `verify-release-series` compatibility command now takes the same report/journal
 pairs; there is no report-only release verifier.
@@ -452,6 +513,18 @@ Ten independent invocations can be passed to
 `verify-release-evidence-series`. This proves the public mechanism and its
 runtime/device/render boundaries are deterministic; it is not a full-ROM,
 microcode-family, save-medium, controller/accessory, or platform certification.
+The automated trusted-runner form is:
+
+```text
+cargo test -p fn64-render-rt64 --test private_release_runner
+```
+
+Its parent test constructs only a repository-owned `synthetic_mechanism`
+contract, then verifies the receipt and all ten retained report/journal pairs.
+On 2026-07-20 this integration test passed ten consecutive parent processes:
+100 fresh children completed the live runtime/device/RSP/RDP/VI/reference-
+render path, with every exact-ten receipt accepted. This is the current v16
+mechanism evidence; it remains synthetic and does not satisfy a ROM row.
 
 The schema-v7 complete-fabric change passed ten independent processes on
 2026-07-20. All ten bound v2 journals verified at guest cycle `1562500`.
@@ -742,7 +815,7 @@ certified release matrix**. The exact state is:
 
 | ROM/report class | Mechanism available | Certified evidence retained |
 | --- | --- | --- |
-| Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, paired ten-report series verification, real executor/device/VI/reference-render boundaries, derived matrix coverage, and the canonical incomplete assessment are available. | Mechanism evidence only; synthetic bytes are not a ROM certification, and an incomplete assessment is not a retained verified matrix. |
+| Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, a trusted exact-ten fresh-process runner and receipt, real executor/device/RSP/RDP/VI/reference-render boundaries, derived matrix coverage, and the canonical incomplete assessment are available. | Mechanism evidence only; synthetic bytes are not a ROM certification, and an incomplete assessment is not a retained verified matrix. |
 | OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, and an artifact/schema-bound whole-function entry stream exist. The v16 report and private policy admit the observed function stream; the host uses the schema-enabled boot API and a path-independent generated-source identity. | Regenerate the stale cached private generated crate so it exports the marker, then produce a ten-run `typed_observed_function` v16 series (or generate and select the real block pack). |
 | OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, explicit `BlockProgram` host selection, and an artifact/schema-bound whole-function entry stream exist. The host consumes the schema marker; earlier local private groups are pre-v16 historical evidence only. | Regenerate the private crate or generate the block pack, then run v16 with the ROM's successful banked 32-KiB SRAM operation path. |
 | OoT NTSC 1.0, legacy C lane | Observation tooling and exact linked-archive identity wiring exist. | Non-authoritative: measured framebuffer parity is only claimed through swap 60, and the C oracle's missing bodies prevent deeper arbitration beyond the known swap-231 frontier. |
@@ -756,6 +829,12 @@ executions per scenario, and the missing typed evidence classes above. The
 matrix still proves only reached paths: it cannot enumerate avoided unsupported
 destinations or convert representative scenarios into exhaustive reachable-ROM
 closure.
+
+The immediate private-runner blocker is narrower and precedes that matrix:
+install typed consumption evidence connecting the admitted recompiled artifact
+and both microcode descriptors to the child entry image and the v16
+execution/RSP observations. Until then, production contracts are admitted and
+content-addressed but deliberately not launchable.
 
 ## Remaining release frontier
 
