@@ -74,6 +74,10 @@ struct DepthFragment {
     coverage: Coverage,
     rgba: [u8; 4],
     shade_alpha: u8,
+    /// Per-pixel 3-bit RGB dither value drawn at fragment time (see
+    /// [`Framebuffer::fragment_dither`]), applied to the blender output
+    /// just before the pixel write. `None` = RGB dithering disabled.
+    rgb_dither: Option<u8>,
 }
 
 #[derive(Copy, Clone)]
@@ -81,6 +85,43 @@ struct ColorFragment {
     rgba: [u8; 4],
     coverage: Coverage,
     shade_alpha: u8,
+    /// See [`DepthFragment::rgb_dither`].
+    rgb_dither: Option<u8>,
+}
+
+/// One fragment's dither draw: the RDP computes a single per-pixel dither
+/// value for the RGB channels and one for alpha, and the public gbi.h
+/// couples them -- `G_AD_PATTERN` reuses the RGB stage's per-pixel value and
+/// `G_AD_NOTPATTERN` its 3-bit complement. Drawing both in one place keeps
+/// that coupling explicit instead of spreading generator state across the
+/// pre-blend (alpha) and post-blend (RGB) pipeline stages.
+#[derive(Copy, Clone)]
+struct FragmentDither {
+    rgb: Option<u8>,
+    alpha: Option<u8>,
+}
+
+impl FragmentDither {
+    /// Alpha dither applies between coverage/alpha selection and alpha
+    /// compare (Programming Manual pipeline order).
+    fn apply_alpha(self, mut rgba: [u8; 4]) -> [u8; 4] {
+        if let Some(noise) = self.alpha {
+            rgba[3] = rgba[3].saturating_add(noise);
+        }
+        rgba
+    }
+}
+
+/// RGB dither applies to the blender output, immediately before the pixel
+/// write (blend -> dither -> memory-interface truncation). Hardware applies
+/// the single per-pixel value to all three channels; alpha is untouched.
+fn apply_rgb_dither_value(mut rgba: [u8; 4], noise: Option<u8>) -> [u8; 4] {
+    if let Some(noise) = noise {
+        for channel in &mut rgba[..3] {
+            *channel = channel.saturating_add(noise);
+        }
+    }
+    rgba
 }
 
 /// RDP coverage is the intersection of a 4x4 subpixel grid with the public
@@ -613,56 +654,42 @@ impl Framebuffer {
         }
     }
 
-    /// Apply the selected alpha-dither stage to a combined fragment's alpha,
-    /// between coverage/alpha selection and alpha compare (Programming
-    /// Manual pipeline order). Only `G_AD_NOISE` is implemented: the manual
-    /// specifies pseudo-random noise perturbing the alpha LSBs before
-    /// memory-interface truncation but does not publish the hardware
-    /// generator, so this uses a documented deterministic xorshift32 source
-    /// -- REAL noise with the specified 3-bit magnitude, NOT claimed to be
-    /// sequence-exact against silicon. The ordered `Pattern`/`NotPattern`
-    /// matrices remain unimplemented and trap in
-    /// `require_supported_dither`.
-    fn apply_alpha_dither(&mut self, other_mode: OtherMode, mut rgba: [u8; 4]) -> [u8; 4] {
-        match other_mode.alpha_dither() {
-            AlphaDither::Disabled => rgba,
-            AlphaDither::Noise => {
-                let noise = self.dither_noise_3bit();
-                rgba[3] = rgba[3].saturating_add(noise);
-                rgba
-            }
-            AlphaDither::Pattern | AlphaDither::InversePattern => {
-                unreachable!("unsupported alpha dither is rejected before rasterization")
-            }
-        }
-    }
-
-    /// Apply the selected RGB-dither stage to a blended fragment, between
-    /// the blender and the pixel write (Programming Manual pipeline order:
-    /// dithering perturbs the three RGB LSBs before memory-interface
-    /// truncation). Only `G_CD_NOISE` is implemented, under exactly the
-    /// `apply_alpha_dither` precedent: the manual specifies pseudo-random
-    /// noise of 3-bit magnitude but does not publish the hardware
-    /// generator, so this draws one documented deterministic xorshift32
-    /// value per pixel (hardware likewise applies a single per-pixel dither
-    /// value to all three channels) -- REAL noise with the specified
-    /// magnitude, NOT claimed to be sequence-exact against silicon. The
-    /// ordered `MagicSquare`/`Bayer` matrices remain unimplemented and trap
-    /// in `require_supported_dither`.
-    fn apply_rgb_dither(&mut self, other_mode: OtherMode, mut rgba: [u8; 4]) -> [u8; 4] {
-        match other_mode.rgb_dither() {
-            RgbDither::Disabled => rgba,
-            RgbDither::Noise => {
-                let noise = self.dither_noise_3bit();
-                for channel in &mut rgba[..3] {
-                    *channel = channel.saturating_add(noise);
-                }
-                rgba
-            }
+    /// Draw one fragment's dither values. Only the noise-derived selectors
+    /// are implemented: the manual specifies pseudo-random noise of 3-bit
+    /// magnitude perturbing the color/alpha LSBs before memory-interface
+    /// truncation but does not publish the hardware generator, so this uses
+    /// a documented deterministic xorshift32 source -- REAL noise with the
+    /// specified magnitude, NOT claimed to be sequence-exact against
+    /// silicon. `G_AD_PATTERN`/`G_AD_NOTPATTERN` reuse the RGB stage's
+    /// per-pixel value (respectively its 3-bit complement), so they are
+    /// exactly representable whenever the RGB selector is `Noise`; with an
+    /// ordered RGB matrix they would need the unpublished table and remain
+    /// trapped in `require_supported_dither`, as do the ordered
+    /// `MagicSquare`/`Bayer` RGB selectors themselves.
+    fn fragment_dither(&mut self, other_mode: OtherMode) -> FragmentDither {
+        let rgb = match other_mode.rgb_dither() {
+            RgbDither::Disabled => None,
+            RgbDither::Noise => Some(self.dither_noise_3bit()),
             RgbDither::MagicSquare | RgbDither::Bayer => {
                 unreachable!("unsupported RGB dither is rejected before rasterization")
             }
-        }
+        };
+        let alpha = match other_mode.alpha_dither() {
+            AlphaDither::Disabled => None,
+            AlphaDither::Noise => Some(self.dither_noise_3bit()),
+            AlphaDither::Pattern | AlphaDither::InversePattern => {
+                let base = rgb.unwrap_or_else(|| {
+                    unreachable!(
+                        "pattern alpha dither without RGB noise is rejected before rasterization"
+                    )
+                });
+                match other_mode.alpha_dither() {
+                    AlphaDither::Pattern => Some(base),
+                    _ => Some(!base & 7),
+                }
+            }
+        };
+        FragmentDither { rgb, alpha }
     }
 
     /// One 3-bit draw from the deterministic xorshift32 noise source shared
@@ -1000,7 +1027,8 @@ impl Framebuffer {
                     texel1,
                 );
                 let (rgba, coverage) = apply_coverage_alpha(rect.other_mode, rgba, Coverage::FULL);
-                let rgba = self.apply_alpha_dither(rect.other_mode, rgba);
+                let dither = self.fragment_dither(rect.other_mode);
+                let rgba = dither.apply_alpha(rgba);
                 if coverage.count() == 0 {
                     continue;
                 }
@@ -1028,6 +1056,7 @@ impl Framebuffer {
                             coverage,
                             rgba,
                             shade_alpha: 0,
+                            rgb_dither: dither.rgb,
                         },
                         rect.blender,
                         depth,
@@ -1041,6 +1070,7 @@ impl Framebuffer {
                             rgba,
                             coverage,
                             shade_alpha: 0,
+                            rgb_dither: dither.rgb,
                         },
                         rect.blender,
                         rect.other_mode,
@@ -1077,7 +1107,7 @@ impl Framebuffer {
             result.blend_enabled,
             result.memory,
         );
-        let out = self.apply_rgb_dither(other_mode, out);
+        let out = apply_rgb_dither_value(out, fragment.rgb_dither);
         self.pixels[idx..idx + 4].copy_from_slice(&out);
         true
     }
@@ -1159,7 +1189,7 @@ impl Framebuffer {
                 coverage.blend_enabled,
                 coverage.memory,
             );
-            let out = self.apply_rgb_dither(other_mode, out);
+            let out = apply_rgb_dither_value(out, fragment.rgb_dither);
             // The fragment pipeline is combiner -> alpha compare -> depth
             // test -> blend -> write. Keep both writes after compositing so
             // a rejected fragment cannot mutate either target.
@@ -1452,7 +1482,8 @@ impl Framebuffer {
             fragment.texel1,
         );
         let (rgba, coverage) = apply_coverage_alpha(pipeline.other_mode, rgba, fragment.coverage);
-        let rgba = self.apply_alpha_dither(pipeline.other_mode, rgba);
+        let dither = self.fragment_dither(pipeline.other_mode);
+        let rgba = dither.apply_alpha(rgba);
         if coverage.count() == 0 {
             return false;
         }
@@ -1474,6 +1505,7 @@ impl Framebuffer {
                     coverage,
                     rgba,
                     shade_alpha: fragment.shade[3],
+                    rgb_dither: dither.rgb,
                 },
                 pipeline.blender,
                 pipeline.depth,
@@ -1487,6 +1519,7 @@ impl Framebuffer {
                     rgba,
                     coverage,
                     shade_alpha: fragment.shade[3],
+                    rgb_dither: dither.rgb,
                 },
                 pipeline.blender,
                 pipeline.other_mode,
@@ -1836,16 +1869,22 @@ fn require_supported_dither(other_mode: OtherMode, primitive: &str) {
             "{primitive} selected RGB dither {selector:?}, whose hardware matrix/noise sequence is not implemented"
         ),
     }
-    match other_mode.alpha_dither() {
-        // `Noise` is implemented (Framebuffer::apply_alpha_dither): the
+    match (other_mode.rgb_dither(), other_mode.alpha_dither()) {
+        // `Noise` is implemented (Framebuffer::fragment_dither): the
         // hardware generator is unpublished, but the manual-specified
         // effect (pseudo-random 3-bit perturbation of alpha before
-        // truncation) is real and documented there. The ordered matrices
-        // still trap: substituting a guessed table would silently change
-        // deterministic memory bytes.
-        AlphaDither::Disabled | AlphaDither::Noise => {}
-        selector => panic!(
-            "{primitive} selected alpha dither {selector:?}, whose hardware matrix/noise sequence is not implemented"
+        // truncation) is real and documented there.
+        (_, AlphaDither::Disabled | AlphaDither::Noise) => {}
+        // The public gbi.h couples `G_AD_PATTERN`/`G_AD_NOTPATTERN` to the
+        // RGB dither stage's per-pixel value (respectively its complement),
+        // so they are exactly representable whenever that value exists and
+        // is itself implemented -- i.e. under RGB noise.
+        (RgbDither::Noise, AlphaDither::Pattern | AlphaDither::InversePattern) => {}
+        // With an ordered RGB matrix (or RGB dithering disabled) a pattern
+        // alpha selector would need the unpublished 4x4 table; substituting
+        // a guessed one would silently change deterministic memory bytes.
+        (rgb, alpha) => panic!(
+            "{primitive} selected alpha dither {alpha:?} with RGB dither {rgb:?}; the ordered hardware dither matrix is not implemented"
         ),
     }
 }
@@ -3520,6 +3559,28 @@ mod tests {
     }
 
     #[test]
+    fn pattern_alpha_dither_reuses_the_rgb_noise_value() {
+        let mut fb = Framebuffer::new(1, 1);
+        // RGB noise (selector 2 at bits 6-7) + alpha pattern (0 at bits 4-5):
+        // one per-pixel draw serves both stages.
+        let pattern = fb.fragment_dither(OtherMode::from_raw(2 << 6, 0, 0));
+        assert!(pattern.rgb.unwrap() < 8);
+        assert_eq!(pattern.alpha, pattern.rgb);
+        // Inverse pattern (1 at bits 4-5) is the 3-bit complement of the
+        // same per-pixel value.
+        let inverse = fb.fragment_dither(OtherMode::from_raw((2 << 6) | (1 << 4), 0, 0));
+        assert_eq!(inverse.alpha, inverse.rgb.map(|noise| !noise & 7));
+        // Independent noise selectors draw separately: alpha noise (2 at
+        // bits 4-5) must not be forced equal to the RGB value forever.
+        let mut ever_distinct = false;
+        for _ in 0..32 {
+            let both = fb.fragment_dither(OtherMode::from_raw((2 << 6) | (2 << 4), 0, 0));
+            ever_distinct |= both.alpha != both.rgb;
+        }
+        assert!(ever_distinct, "alpha noise must be its own draw, not a copy");
+    }
+
+    #[test]
     #[should_panic(expected = "alpha dither Pattern")]
     fn active_alpha_dither_traps_instead_of_using_full_precision_alpha() {
         let tri = Triangle {
@@ -3801,6 +3862,7 @@ mod tests {
                     coverage: Coverage::new(1),
                     rgba,
                     shade_alpha: 255,
+                    rgb_dither: None,
                 },
                 BlenderState::default(),
                 depth,
@@ -3876,6 +3938,7 @@ mod tests {
                     coverage: Coverage::new(1),
                     rgba: [255, 0, 0, 255],
                     shade_alpha: 255,
+                    rgb_dither: None,
                 },
                 BlenderState::default(),
                 DepthControl {
@@ -4097,6 +4160,7 @@ mod tests {
                 rgba: [255, 0, 0, 255],
                 coverage: Coverage::new(4),
                 shade_alpha: 255,
+                rgb_dither: None,
             },
             BlenderState::default(),
             mode,
@@ -4111,6 +4175,7 @@ mod tests {
                 rgba: [255, 0, 0, 255],
                 coverage: Coverage::new(2),
                 shade_alpha: 255,
+                rgb_dither: None,
             },
             BlenderState::default(),
             mode,
@@ -4137,6 +4202,7 @@ mod tests {
                     coverage: Coverage::new(1),
                     rgba: [255, 0, 0, 255],
                     shade_alpha: 255,
+                    rgb_dither: None,
                 },
                 BlenderState::default(),
                 DepthControl {
