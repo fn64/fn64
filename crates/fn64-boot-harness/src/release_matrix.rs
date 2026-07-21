@@ -2,9 +2,12 @@
 //!
 //! The manifest contains only the immutable project profile and evidence
 //! identities, never ROM bytes, captured output, or caller-authored coverage.
-//! Dynamic evidence remains the schema-v19 report series; coverage is derived
+//! Dynamic evidence remains the schema-v20 report series; coverage is derived
 //! from each validated report before it is compared with the fixed profile.
 
+use crate::platform_certification::{
+    PlatformCertificationError, VerifiedRt64PlatformCaseAuthority,
+};
 use crate::{
     verify_release_evidence_series, ArtifactDigest, ArtifactKind, CertificationProfileIdentity,
     CertificationRequirementClass, CertificationRequirementRef, ClosurePath, ClosurePathStatus,
@@ -13,8 +16,9 @@ use crate::{
     ReleaseControllerPort, ReleaseEnvironmentEvidence, ReleaseGateReport, ReleaseGraphicsApi,
     ReleaseGraphicsExecutionPolicy, ReleaseHostPlatform, ReleaseMicrocodeFamily,
     ReleaseObservationGeometry, ReleaseRendererEvidence, ReleaseRomClass, ReleaseRomEvidence,
-    ReleaseTvRegion, ReportSeriesError, RspRdpEvidence, RspRdpObservationKindEvidence,
-    VerifiedPrivateReleaseSeries, LIVE_MINIMUM_CLOSURE_PATHS,
+    ReleaseTvRegion, ReleaseWindowsFamily, ReportSeriesError, RspRdpEvidence,
+    RspRdpObservationKindEvidence, Rt64PlatformCase, Rt64PlatformTarget,
+    VerifiedPrivateReleaseSeries, VerifiedRt64PlatformCaseSeries, LIVE_MINIMUM_CLOSURE_PATHS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,8 +28,8 @@ use std::{
 };
 
 pub const RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix.v5";
-pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v15";
-pub const INCOMPLETE_RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix-incomplete.v4";
+pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v16";
+pub const INCOMPLETE_RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix-incomplete.v5";
 pub const VERIFIED_ROM_CLASS_AUTHORITY_SCHEMA: &str = "fn64.verified-rom-class-authority.v1";
 pub const RELEASE_MATRIX_REPORT_COUNT: usize = 10;
 pub const RELEASE_MATRIX_MAX_SCENARIOS: usize = 64;
@@ -300,12 +304,12 @@ pub struct ReleaseMatrixScenario {
     /// Stable diagnostic key. Evidence is associated by `report_scenario`, not
     /// by a caller-provided command-line assignment.
     pub id: String,
-    /// Exact scenario string bound by every schema-v19 report in this series.
+    /// Exact scenario string bound by every schema-v20 report in this series.
     pub report_scenario: String,
     /// Exact private-input identity bound by every report; no input bytes are stored.
     pub input_sha256: String,
     pub report_sha256: String,
-    /// Canonical digest over this declaration and its exact v19 evidence IDs.
+    /// Canonical digest over this declaration and its exact v20 evidence IDs.
     pub declaration_sha256: String,
 }
 
@@ -381,12 +385,12 @@ pub struct VerifiedMatrixScenario {
     pub environment: ReleaseEnvironmentEvidence,
     pub closure_paths: u64,
     /// Exact destination sequence and canonical unique/count summary retained
-    /// from the verified v19 series.
+    /// from the verified v20 series.
     pub execution_destinations: ExecutionDestinationEvidence,
-    /// Complete schema-v19 RSP/RDP observation stream retained for independent
+    /// Complete schema-v20 RSP/RDP observation stream retained for independent
     /// report reconstruction and coverage derivation.
     pub rsp_rdp: RspRdpEvidence,
-    /// Exact canonical closure ledger retained from the verified v19 series.
+    /// Exact canonical closure ledger retained from the verified v20 series.
     /// A count alone cannot prove which feature-specific operation paths ran.
     pub closure: Vec<ClosurePath>,
     pub unsupported_events: u64,
@@ -405,6 +409,9 @@ pub struct VerifiedReleaseMatrix {
     pub profile: CertificationProfileIdentity,
     pub total_reports: usize,
     pub scenarios: Vec<VerifiedMatrixScenario>,
+    /// Opaque local process authorities projected into retained integrity
+    /// evidence. Deserializing these records cannot recreate the capability.
+    pub platform_case_authorities: Vec<VerifiedRt64PlatformCaseAuthority>,
     /// Every project-owned profile requirement and the exact validated
     /// evidence declarations that satisfy it. A complete retained matrix has
     /// no unassigned profile member.
@@ -428,6 +435,7 @@ pub struct IncompleteReleaseMatrix {
     pub profile: CertificationProfileIdentity,
     pub verified_scenarios: usize,
     pub verified_reports: usize,
+    pub platform_case_authorities: Vec<VerifiedRt64PlatformCaseAuthority>,
     pub satisfied: Vec<CertificationRequirementAssignment>,
     pub missing: Vec<CertificationRequirementRef>,
     pub assessment_sha256: String,
@@ -466,6 +474,10 @@ impl IncompleteReleaseMatrix {
             });
         }
         validate_assignment_partition(profile, &self.satisfied, &self.missing, false)?;
+        validate_incomplete_platform_authority_assignments(
+            &self.platform_case_authorities,
+            &self.satisfied,
+        )?;
         if self.missing.is_empty() {
             return Err(ReleaseMatrixError::IncompleteWithoutMissing);
         }
@@ -483,6 +495,55 @@ impl IncompleteReleaseMatrix {
         }
         Ok(())
     }
+}
+
+fn validate_incomplete_platform_authority_assignments(
+    authorities: &[VerifiedRt64PlatformCaseAuthority],
+    assignments: &[CertificationRequirementAssignment],
+) -> Result<(), ReleaseMatrixError> {
+    let mut seen = BTreeSet::new();
+    for authority in authorities {
+        authority
+            .verify_integrity()
+            .map_err(|source| ReleaseMatrixError::InvalidPlatformSeriesAuthority { source })?;
+        if !seen.insert((authority.target, authority.case)) {
+            return Err(ReleaseMatrixError::DuplicatePlatformSeriesAuthority {
+                target: authority.target.id().to_owned(),
+                case: authority.case.id().to_owned(),
+            });
+        }
+        let id = format!("{}/{}", authority.target.id(), authority.case.id());
+        let assignment = assignments.iter().find(|assignment| {
+            assignment.requirement.class() == CertificationRequirementClass::Rt64TargetCase
+                && assignment.requirement.id() == id
+        });
+        if assignment.is_none_or(|assignment| {
+            assignment.evidence_sha256s != [authority.authority_sha256.clone()]
+        }) {
+            return Err(ReleaseMatrixError::PlatformAuthorityAssignmentMismatch {
+                target: authority.target.id().to_owned(),
+                case: authority.case.id().to_owned(),
+            });
+        }
+    }
+    for assignment in assignments.iter().filter(|assignment| {
+        assignment.requirement.class() == CertificationRequirementClass::Rt64TargetCase
+    }) {
+        let id = assignment.requirement.id();
+        let authority = authorities
+            .iter()
+            .find(|authority| id == format!("{}/{}", authority.target.id(), authority.case.id()));
+        if authority.is_none_or(|authority| {
+            assignment.evidence_sha256s != [authority.authority_sha256.clone()]
+        }) {
+            let (target, case) = id.split_once('/').unwrap_or((id, ""));
+            return Err(ReleaseMatrixError::PlatformAuthorityAssignmentMismatch {
+                target: target.to_owned(),
+                case: case.to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl VerifiedReleaseMatrix {
@@ -740,7 +801,12 @@ impl VerifiedReleaseMatrix {
                 });
             }
         }
-        let (assignments, missing) = derive_profile_assignments(profile, &self.scenarios);
+        validate_platform_series_authority_usage_for_retained(
+            &self.scenarios,
+            &self.platform_case_authorities,
+        )?;
+        let (assignments, missing) =
+            derive_profile_assignments(profile, &self.scenarios, &self.platform_case_authorities);
         if !missing.is_empty() {
             return Err(ReleaseMatrixError::VerifiedProfileIncomplete {
                 missing: missing
@@ -799,7 +865,19 @@ pub fn verify_release_matrix(
     manifest: &ReleaseMatrixManifest,
     evidence: &[(ReleaseGateReport, ParsedUnsupportedJournal)],
 ) -> Result<ReleaseMatrixVerification, ReleaseMatrixError> {
-    verify_release_matrix_with_authorities(manifest, evidence, &BTreeMap::new())
+    verify_release_matrix_with_authorities(manifest, evidence, &BTreeMap::new(), &BTreeMap::new())
+}
+
+/// Verify a release matrix with opaque locally verified RT64 platform-case
+/// series. Phase one intentionally exposes no production constructor for the
+/// capability; retained or self-hashed JSON cannot enter this API.
+pub fn verify_release_matrix_with_platform_series(
+    manifest: &ReleaseMatrixManifest,
+    evidence: &[(ReleaseGateReport, ParsedUnsupportedJournal)],
+    series: &[&VerifiedRt64PlatformCaseSeries],
+) -> Result<ReleaseMatrixVerification, ReleaseMatrixError> {
+    let authorities = collect_platform_series_authorities(series)?;
+    verify_release_matrix_with_authorities(manifest, evidence, &BTreeMap::new(), &authorities)
 }
 
 /// Verify a release matrix while granting ROM-class credit only from opaque,
@@ -815,6 +893,14 @@ pub fn verify_release_matrix_with_private_series(
     evidence: &[(ReleaseGateReport, ParsedUnsupportedJournal)],
     series: &[&VerifiedPrivateReleaseSeries],
 ) -> Result<ReleaseMatrixVerification, ReleaseMatrixError> {
+    let authorities = collect_private_series_authorities(manifest, series)?;
+    verify_release_matrix_with_authorities(manifest, evidence, &authorities, &BTreeMap::new())
+}
+
+fn collect_private_series_authorities(
+    manifest: &ReleaseMatrixManifest,
+    series: &[&VerifiedPrivateReleaseSeries],
+) -> Result<BTreeMap<String, VerifiedRomClassAuthority>, ReleaseMatrixError> {
     let mut authorities = BTreeMap::new();
     for verified in series {
         let revalidated = verified
@@ -851,7 +937,25 @@ pub fn verify_release_matrix_with_private_series(
         insert_private_series_authority(&mut authorities, report_scenario, authority)?;
     }
     validate_private_series_authority_usage(manifest, &authorities)?;
-    verify_release_matrix_with_authorities(manifest, evidence, &authorities)
+    Ok(authorities)
+}
+
+/// Combine private ROM-class capability evidence with opaque RT64 platform
+/// case capabilities without allowing either authority to relabel the other.
+pub fn verify_release_matrix_with_private_and_platform_series(
+    manifest: &ReleaseMatrixManifest,
+    evidence: &[(ReleaseGateReport, ParsedUnsupportedJournal)],
+    private_series: &[&VerifiedPrivateReleaseSeries],
+    platform_series: &[&VerifiedRt64PlatformCaseSeries],
+) -> Result<ReleaseMatrixVerification, ReleaseMatrixError> {
+    let private_authorities = collect_private_series_authorities(manifest, private_series)?;
+    let platform_authorities = collect_platform_series_authorities(platform_series)?;
+    verify_release_matrix_with_authorities(
+        manifest,
+        evidence,
+        &private_authorities,
+        &platform_authorities,
+    )
 }
 
 fn insert_private_series_authority(
@@ -886,10 +990,36 @@ fn validate_private_series_authority_usage(
     Ok(())
 }
 
+fn collect_platform_series_authorities(
+    series: &[&VerifiedRt64PlatformCaseSeries],
+) -> Result<
+    BTreeMap<(Rt64PlatformTarget, Rt64PlatformCase), VerifiedRt64PlatformCaseAuthority>,
+    ReleaseMatrixError,
+> {
+    let mut authorities = BTreeMap::new();
+    for verified in series {
+        let authority = verified
+            .revalidate_for_release_matrix()
+            .map_err(|source| ReleaseMatrixError::InvalidPlatformSeriesAuthority { source })?;
+        let key = (authority.target, authority.case);
+        if authorities.insert(key, authority).is_some() {
+            return Err(ReleaseMatrixError::DuplicatePlatformSeriesAuthority {
+                target: key.0.id().to_owned(),
+                case: key.1.id().to_owned(),
+            });
+        }
+    }
+    Ok(authorities)
+}
+
 fn verify_release_matrix_with_authorities(
     manifest: &ReleaseMatrixManifest,
     evidence: &[(ReleaseGateReport, ParsedUnsupportedJournal)],
     authorities: &BTreeMap<String, VerifiedRomClassAuthority>,
+    platform_authorities: &BTreeMap<
+        (Rt64PlatformTarget, Rt64PlatformCase),
+        VerifiedRt64PlatformCaseAuthority,
+    >,
 ) -> Result<ReleaseMatrixVerification, ReleaseMatrixError> {
     let profile = validate_manifest(manifest)?;
 
@@ -1022,9 +1152,12 @@ fn verify_release_matrix_with_authorities(
     }
 
     verified.sort_by(|left, right| left.id.cmp(&right.id));
+    validate_platform_series_authority_usage(&verified, platform_authorities)?;
+    let retained_platform_authorities = platform_authorities.values().cloned().collect::<Vec<_>>();
     let manifest_sha256 = manifest.recompute_manifest_sha256();
     let total_reports = verified.iter().map(|scenario| scenario.count).sum();
-    let (assignments, missing) = derive_profile_assignments(profile, &verified);
+    let (assignments, missing) =
+        derive_profile_assignments(profile, &verified, &retained_platform_authorities);
     if !missing.is_empty() {
         let mut incomplete = IncompleteReleaseMatrix {
             schema: INCOMPLETE_RELEASE_MATRIX_SCHEMA.to_owned(),
@@ -1032,6 +1165,7 @@ fn verify_release_matrix_with_authorities(
             profile: manifest.profile.clone(),
             verified_scenarios: verified.len(),
             verified_reports: total_reports,
+            platform_case_authorities: retained_platform_authorities,
             satisfied: assignments,
             missing,
             assessment_sha256: String::new(),
@@ -1047,6 +1181,7 @@ fn verify_release_matrix_with_authorities(
         profile: manifest.profile.clone(),
         total_reports,
         scenarios: verified,
+        platform_case_authorities: retained_platform_authorities,
         assignments,
         verification_sha256: String::new(),
     };
@@ -1068,6 +1203,7 @@ fn retained_scenario_declaration(scenario: &VerifiedMatrixScenario) -> ReleaseMa
 fn derive_profile_assignments(
     profile: FullParityV1,
     scenarios: &[VerifiedMatrixScenario],
+    platform_authorities: &[VerifiedRt64PlatformCaseAuthority],
 ) -> (
     Vec<CertificationRequirementAssignment>,
     Vec<CertificationRequirementRef>,
@@ -1146,6 +1282,14 @@ fn derive_profile_assignments(
                 &scenario.declaration_sha256,
             );
         }
+    }
+    for authority in platform_authorities {
+        insert_requirement_evidence(
+            &mut evidence,
+            CertificationRequirementClass::Rt64TargetCase,
+            format!("{}/{}", authority.target.id(), authority.case.id()),
+            &authority.authority_sha256,
+        );
     }
 
     let mut assignments = Vec::new();
@@ -1255,8 +1399,110 @@ fn platform_api_target(environment: &ReleaseEnvironmentEvidence) -> Option<&'sta
                 ..
             },
         ) => Some("linux-vulkan"),
+        (
+            ReleaseHostPlatform::WindowsX86_64,
+            ReleaseRendererEvidence::Rt64 {
+                graphics_api: ReleaseGraphicsApi::D3d12,
+                ..
+            },
+        ) => match environment
+            .windows_version
+            .filter(|version| version.verify().is_ok())?
+            .family
+        {
+            ReleaseWindowsFamily::Windows10 => Some("windows10-d3d12"),
+            ReleaseWindowsFamily::Windows11 => Some("windows11-d3d12"),
+        },
+        (
+            ReleaseHostPlatform::WindowsX86_64,
+            ReleaseRendererEvidence::Rt64 {
+                graphics_api: ReleaseGraphicsApi::Vulkan,
+                ..
+            },
+        ) => match environment
+            .windows_version
+            .filter(|version| version.verify().is_ok())?
+            .family
+        {
+            ReleaseWindowsFamily::Windows10 => Some("windows10-vulkan"),
+            ReleaseWindowsFamily::Windows11 => Some("windows11-vulkan"),
+        },
         _ => None,
     }
+}
+
+fn validate_platform_series_authority_usage(
+    scenarios: &[VerifiedMatrixScenario],
+    authorities: &BTreeMap<
+        (Rt64PlatformTarget, Rt64PlatformCase),
+        VerifiedRt64PlatformCaseAuthority,
+    >,
+) -> Result<(), ReleaseMatrixError> {
+    for authority in authorities.values() {
+        authority
+            .verify_integrity()
+            .map_err(|source| ReleaseMatrixError::InvalidPlatformSeriesAuthority { source })?;
+        if !scenarios
+            .iter()
+            .any(|scenario| platform_authority_matches_scenario(authority, scenario))
+        {
+            return Err(ReleaseMatrixError::UnusedPlatformSeriesAuthority {
+                target: authority.target.id().to_owned(),
+                case: authority.case.id().to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_platform_series_authority_usage_for_retained(
+    scenarios: &[VerifiedMatrixScenario],
+    authorities: &[VerifiedRt64PlatformCaseAuthority],
+) -> Result<(), ReleaseMatrixError> {
+    let mut indexed = BTreeMap::new();
+    for authority in authorities {
+        let key = (authority.target, authority.case);
+        if indexed.insert(key, authority.clone()).is_some() {
+            return Err(ReleaseMatrixError::DuplicatePlatformSeriesAuthority {
+                target: key.0.id().to_owned(),
+                case: key.1.id().to_owned(),
+            });
+        }
+    }
+    validate_platform_series_authority_usage(scenarios, &indexed)
+}
+
+fn platform_authority_matches_scenario(
+    authority: &VerifiedRt64PlatformCaseAuthority,
+    scenario: &VerifiedMatrixScenario,
+) -> bool {
+    if scenario.environment.platform != authority.platform
+        || scenario.environment.windows_version != authority.windows_version
+        || scenario.report_scenario != authority.bound_report_scenario
+        || scenario.report_sha256 != authority.bound_report_sha256
+        || scenario.run_event_sha256s != authority.bound_matrix_run_event_sha256s
+    {
+        return false;
+    }
+    let ReleaseRendererEvidence::Rt64 {
+        graphics_api,
+        backend_identity,
+        source_authoritative: true,
+        ..
+    } = &scenario.environment.renderer
+    else {
+        return false;
+    };
+    *graphics_api == authority.graphics_api
+        && authority
+            .target
+            .matches_host(authority.platform, authority.windows_version)
+        && backend_identity.contains(&format!(
+            ";adapter_sha256={};",
+            authority.adapter_source_sha256
+        ))
+        && backend_identity.contains(&format!(";source={};", authority.rt64_source_id))
+        && backend_identity.ends_with(&format!("post_vi_api={}", authority.capture_api))
 }
 
 fn insert_requirement_evidence(
@@ -2117,15 +2363,30 @@ fn push_assignment(wire: &mut Vec<u8>, assignment: &CertificationRequirementAssi
     }
 }
 
+fn push_platform_authority_identities(
+    wire: &mut Vec<u8>,
+    authorities: &[VerifiedRt64PlatformCaseAuthority],
+) {
+    let mut ordered = authorities.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|authority| (authority.target, authority.case));
+    wire.extend_from_slice(&(ordered.len() as u32).to_be_bytes());
+    for authority in ordered {
+        push_bytes(wire, authority.target.id().as_bytes());
+        push_bytes(wire, authority.case.id().as_bytes());
+        push_bytes(wire, authority.authority_sha256.as_bytes());
+    }
+}
+
 fn incomplete_matrix_sha256(report: &IncompleteReleaseMatrix) -> String {
     let mut wire = Vec::new();
-    wire.extend_from_slice(b"fn64.release-matrix-incomplete.v4\0");
+    wire.extend_from_slice(b"fn64.release-matrix-incomplete.v5\0");
     push_bytes(&mut wire, report.schema.as_bytes());
     push_bytes(&mut wire, report.manifest_sha256.as_bytes());
     push_bytes(&mut wire, report.profile.schema.as_bytes());
     push_bytes(&mut wire, report.profile.definition_sha256.as_bytes());
     wire.extend_from_slice(&(report.verified_scenarios as u64).to_be_bytes());
     wire.extend_from_slice(&(report.verified_reports as u64).to_be_bytes());
+    push_platform_authority_identities(&mut wire, &report.platform_case_authorities);
     wire.extend_from_slice(&(report.satisfied.len() as u32).to_be_bytes());
     for assignment in &report.satisfied {
         push_assignment(&mut wire, assignment);
@@ -2140,12 +2401,13 @@ fn incomplete_matrix_sha256(report: &IncompleteReleaseMatrix) -> String {
 
 fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
     let mut wire = Vec::new();
-    wire.extend_from_slice(b"fn64.verified-release-matrix.v15\0");
+    wire.extend_from_slice(b"fn64.verified-release-matrix.v16\0");
     push_bytes(&mut wire, report.schema.as_bytes());
     push_bytes(&mut wire, report.manifest_sha256.as_bytes());
     push_bytes(&mut wire, report.profile.schema.as_bytes());
     push_bytes(&mut wire, report.profile.definition_sha256.as_bytes());
     wire.extend_from_slice(&(report.total_reports as u64).to_be_bytes());
+    push_platform_authority_identities(&mut wire, &report.platform_case_authorities);
 
     let mut scenarios: Vec<_> = report.scenarios.iter().collect();
     scenarios.sort_by(|left, right| left.id.cmp(&right.id));
@@ -2434,6 +2696,21 @@ fn push_environment(wire: &mut Vec<u8>, environment: &ReleaseEnvironmentEvidence
         ReleaseHostPlatform::LinuxX86_64 => 1,
         ReleaseHostPlatform::WindowsX86_64 => 2,
     });
+    match environment.windows_version {
+        None => wire.push(0),
+        Some(version) => {
+            wire.push(1);
+            wire.push(match version.family {
+                ReleaseWindowsFamily::Windows10 => 0,
+                ReleaseWindowsFamily::Windows11 => 1,
+            });
+            wire.extend_from_slice(&version.major.to_be_bytes());
+            wire.extend_from_slice(&version.minor.to_be_bytes());
+            wire.extend_from_slice(&version.build.to_be_bytes());
+            wire.extend_from_slice(&version.update_build_revision.to_be_bytes());
+            wire.push(0);
+        }
+    }
     for port in environment.controller_ports {
         wire.push(match port {
             ReleaseControllerPort::StandardControllerNoPak => 0,
@@ -2526,6 +2803,21 @@ pub enum ReleaseMatrixError {
     },
     InvalidPrivateSeriesAuthority {
         source: crate::PrivateReleaseSeriesError,
+    },
+    InvalidPlatformSeriesAuthority {
+        source: PlatformCertificationError,
+    },
+    DuplicatePlatformSeriesAuthority {
+        target: String,
+        case: String,
+    },
+    UnusedPlatformSeriesAuthority {
+        target: String,
+        case: String,
+    },
+    PlatformAuthorityAssignmentMismatch {
+        target: String,
+        case: String,
     },
     DuplicatePrivateSeriesAuthority {
         report_scenario: String,
@@ -2800,6 +3092,10 @@ impl fmt::Display for ReleaseMatrixError {
             Self::InvalidCertificationProfile(source) => write!(f, "invalid certification profile: {source}"),
             Self::InvalidUnassignedReport { scenario, source } => write!(f, "release report scenario {scenario:?} is invalid before matrix assignment: {source}"),
             Self::InvalidPrivateSeriesAuthority { source } => write!(f, "private release series authority failed fresh revalidation: {source}"),
+            Self::InvalidPlatformSeriesAuthority { source } => write!(f, "RT64 platform-case series authority failed fresh revalidation: {source}"),
+            Self::DuplicatePlatformSeriesAuthority { target, case } => write!(f, "RT64 platform-case authority for {target}/{case} was supplied more than once"),
+            Self::UnusedPlatformSeriesAuthority { target, case } => write!(f, "RT64 platform-case authority for {target}/{case} does not bind any exact retained matrix report series"),
+            Self::PlatformAuthorityAssignmentMismatch { target, case } => write!(f, "RT64 platform-case authority for {target}/{case} does not match its retained requirement assignment"),
             Self::DuplicatePrivateSeriesAuthority { report_scenario } => write!(f, "private release series authority for report scenario {report_scenario:?} was supplied more than once"),
             Self::UnusedPrivateSeriesAuthority { report_scenario } => write!(f, "private release series authority for report scenario {report_scenario:?} has no declared matrix scenario"),
             Self::InvalidRomClassAuthority { id, detail } => write!(f, "release-matrix scenario {id:?} has invalid ROM-class authority: {detail}"),
@@ -2876,6 +3172,7 @@ impl std::error::Error for ReleaseMatrixError {
             Self::InvalidCertificationProfile(source) => Some(source),
             Self::InvalidUnassignedReport { source, .. } => Some(source),
             Self::InvalidPrivateSeriesAuthority { source } => Some(source),
+            Self::InvalidPlatformSeriesAuthority { source } => Some(source),
             Self::InvalidSeries { source, .. } => Some(source),
             Self::InvalidVerifiedObservations { source, .. } => Some(source),
             Self::InvalidVerifiedDigest { source, .. } => Some(source),
@@ -2889,15 +3186,15 @@ impl std::error::Error for ReleaseMatrixError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ArtifactKind, ClosurePath, ClosurePathStatus, FixedCycleDigestGate, LiveRenderEvidence,
-        RenderPixelFormat, RspRdpObservationEventEvidence, LIVE_MINIMUM_CLOSURE_PATHS,
-    };
     #[cfg(unix)]
     use crate::{
         load_private_release_run_contract, materialize_release_program_build_receipt,
         parse_unsupported_journal, run_private_release_series, verify_private_release_series,
         ReleaseProgramBuildReceiptInput,
+    };
+    use crate::{
+        ArtifactKind, ClosurePath, ClosurePathStatus, FixedCycleDigestGate, LiveRenderEvidence,
+        RenderPixelFormat, RspRdpObservationEventEvidence, LIVE_MINIMUM_CLOSURE_PATHS,
     };
     #[cfg(unix)]
     use std::{
@@ -3083,6 +3380,12 @@ mod tests {
             } else {
                 ReleaseHostPlatform::MacosArm64
             },
+            windows_version: (is_rt64 && rt64_platform == ReleaseHostPlatform::WindowsX86_64).then(
+                || {
+                    crate::ReleaseWindowsVersionEvidence::from_native_workstation(10, 0, 19_045, 1)
+                        .unwrap()
+                },
+            ),
             controller_ports: [
                 if is_rt64 {
                     ReleaseControllerPort::StandardControllerRumblePak
@@ -3761,7 +4064,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v19_tv_region_credit_requires_fixed_header_evidence_not_labels_or_region_free() {
+    fn schema_v20_tv_region_credit_requires_fixed_header_evidence_not_labels_or_region_free() {
         let fixed = with_rom(
             closed_report(
                 "fixed-ntsc",
@@ -3867,6 +4170,7 @@ mod tests {
                 &manifest,
                 &evidence_series(report.clone()),
                 &authorities,
+                &BTreeMap::new(),
             )
             .unwrap()
         else {
@@ -3891,6 +4195,7 @@ mod tests {
                 &manifest,
                 &evidence_series(report.clone()),
                 &relabelled,
+                &BTreeMap::new(),
             ),
             Err(ReleaseMatrixError::RomClassAuthorityMismatch {
                 field: "rom.class",
@@ -3906,6 +4211,7 @@ mod tests {
                 &manifest,
                 &evidence_series(report.clone()),
                 &tampered,
+                &BTreeMap::new(),
             ),
             Err(ReleaseMatrixError::InvalidRomClassAuthority { .. })
         ));
@@ -3920,6 +4226,7 @@ mod tests {
                 &manifest,
                 &evidence_series(report.clone()),
                 &wrong_semantic_report,
+                &BTreeMap::new(),
             ),
             Err(ReleaseMatrixError::RomClassAuthorityMismatch {
                 field: "semantic_report_sha256",
@@ -3936,6 +4243,7 @@ mod tests {
                 &manifest,
                 &evidence_series(report),
                 &reordered_runs,
+                &BTreeMap::new(),
             ),
             Err(ReleaseMatrixError::RomClassAuthorityMismatch {
                 field: "run_event_sha256s",
@@ -4474,37 +4782,271 @@ mod tests {
         }
     }
 
+    fn platform_case_fixture(
+        report: &ReleaseGateReport,
+        evidence: &[(ReleaseGateReport, ParsedUnsupportedJournal)],
+        target: Rt64PlatformTarget,
+        case: Rt64PlatformCase,
+        seed: u8,
+    ) -> VerifiedRt64PlatformCaseSeries {
+        let verified = verify_release_evidence_series(evidence, RELEASE_MATRIX_REPORT_COUNT)
+            .expect("matrix fixture series is valid");
+        VerifiedRt64PlatformCaseSeries::fixture_for_test(
+            target,
+            case,
+            (
+                report.environment.platform,
+                report.environment.windows_version,
+            ),
+            (
+                &report.scenario,
+                report.report_sha256.clone(),
+                verified.run_event_sha256s,
+            ),
+            seed,
+        )
+        .unwrap()
+    }
+
+    fn pinned_platform_identity(api: ReleaseGraphicsApi, adapter_sha256: &str) -> String {
+        format!(
+            "adapter=fn64-render-rt64/rt64;adapter_sha256={adapter_sha256};source=git:f0728a2520d5aa735886240de3fee75cc805f6d6;provenance=git-clean;overlay=fn64-test;post_vi_api={}",
+            match api {
+                ReleaseGraphicsApi::D3d12 => "d3d12-bgra8-rgba8-unorm",
+                ReleaseGraphicsApi::Vulkan => "vulkan-bgra8-rgba8-unorm",
+                ReleaseGraphicsApi::Metal => "metal-bgra8-unorm",
+            }
+        )
+    }
+
     #[test]
-    fn exact_windows_apis_do_not_claim_an_unobserved_windows_version() {
-        for (scenario_name, graphics_api) in [
-            ("exact-windows-d3d12-rt64", ReleaseGraphicsApi::D3d12),
-            ("exact-windows-vulkan-rt64", ReleaseGraphicsApi::Vulkan),
+    fn opaque_platform_case_authority_binds_exact_matrix_series() {
+        let seed = 0x51;
+        let adapter_sha256 = hex(&Sha256::digest([seed, 0]));
+        let identity = pinned_platform_identity(ReleaseGraphicsApi::Metal, &adapter_sha256);
+        let report = closed_report_with_rt64_environment(
+            "bound-macos-rt64-platform-case",
+            b"bound-macos-rt64-platform-case",
+            0xc7,
+            "save.sram-operation",
+            &identity,
+            Some(ProgramFeature::TypedObservedFunction),
+            ReleaseHostPlatform::MacosArm64,
+            ReleaseGraphicsApi::Metal,
+        );
+        let evidence = evidence_series(report.clone());
+        let manifest = ReleaseMatrixManifest {
+            schema: RELEASE_MATRIX_SCHEMA.to_owned(),
+            profile: CertificationProfileIdentity::full_parity_v1(),
+            scenarios: vec![scenario("bound-macos-rt64-platform-case", &report)],
+        };
+        let series = platform_case_fixture(
+            &report,
+            &evidence,
+            Rt64PlatformTarget::MacosMetal,
+            Rt64PlatformCase::ResolutionDownsample,
+            seed,
+        );
+        let ReleaseMatrixVerification::Incomplete(incomplete) =
+            verify_release_matrix_with_platform_series(&manifest, &evidence, &[&series]).unwrap()
+        else {
+            panic!("one synthetic report remains incomplete")
+        };
+        let case_id = "macos-metal/resolution-downsample";
+        let assignment = incomplete
+            .satisfied
+            .iter()
+            .find(|assignment| {
+                assignment.requirement.class() == CertificationRequirementClass::Rt64TargetCase
+                    && assignment.requirement.id() == case_id
+            })
+            .expect("opaque authority earns only its exact case row");
+        assert_eq!(assignment.evidence_sha256s.len(), 1);
+        let platform_assignment = incomplete
+            .satisfied
+            .iter()
+            .find(|assignment| {
+                assignment.requirement.class() == CertificationRequirementClass::PlatformApiTarget
+                    && assignment.requirement.id() == "macos-metal"
+            })
+            .expect("the validated v20 report earns its exact platform/API row");
+        assert_eq!(
+            platform_assignment.evidence_sha256s,
+            [manifest.scenarios[0].declaration_sha256.clone()]
+        );
+        assert_eq!(incomplete.platform_case_authorities.len(), 1);
+
+        let mut detached_retained = incomplete.clone();
+        detached_retained.platform_case_authorities.clear();
+        detached_retained.assessment_sha256 = incomplete_matrix_sha256(&detached_retained);
+        assert!(matches!(
+            detached_retained.verify_integrity(),
+            Err(ReleaseMatrixError::PlatformAuthorityAssignmentMismatch { .. })
+        ));
+
+        assert!(matches!(
+            verify_release_matrix_with_platform_series(&manifest, &evidence, &[&series, &series],),
+            Err(ReleaseMatrixError::DuplicatePlatformSeriesAuthority { .. })
+        ));
+    }
+
+    #[test]
+    fn platform_case_authority_rejects_detached_report_and_run_events() {
+        let seed = 0x52;
+        let adapter_sha256 = hex(&Sha256::digest([seed, 0]));
+        let identity = pinned_platform_identity(ReleaseGraphicsApi::Metal, &adapter_sha256);
+        let report = closed_report_with_rt64_environment(
+            "rt64-platform-binding-original",
+            b"rt64-platform-binding-original",
+            0xc8,
+            "save.sram-operation",
+            &identity,
+            Some(ProgramFeature::TypedObservedFunction),
+            ReleaseHostPlatform::MacosArm64,
+            ReleaseGraphicsApi::Metal,
+        );
+        let evidence = evidence_series(report.clone());
+        let manifest = ReleaseMatrixManifest {
+            schema: RELEASE_MATRIX_SCHEMA.to_owned(),
+            profile: CertificationProfileIdentity::full_parity_v1(),
+            scenarios: vec![scenario("rt64-platform-binding-original", &report)],
+        };
+        let verified =
+            verify_release_evidence_series(&evidence, RELEASE_MATRIX_REPORT_COUNT).unwrap();
+        let detached = VerifiedRt64PlatformCaseSeries::fixture_for_test(
+            Rt64PlatformTarget::MacosMetal,
+            Rt64PlatformCase::FramebufferEnhancement,
+            (ReleaseHostPlatform::MacosArm64, None),
+            (
+                "different-report-scenario",
+                report.report_sha256.clone(),
+                verified.run_event_sha256s.clone(),
+            ),
+            seed,
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_release_matrix_with_platform_series(&manifest, &evidence, &[&detached]),
+            Err(ReleaseMatrixError::UnusedPlatformSeriesAuthority { .. })
+        ));
+
+        let wrong_report_sha = VerifiedRt64PlatformCaseSeries::fixture_for_test(
+            Rt64PlatformTarget::MacosMetal,
+            Rt64PlatformCase::FramebufferEnhancement,
+            (ReleaseHostPlatform::MacosArm64, None),
+            (
+                &report.scenario,
+                hex(&Sha256::digest(b"different-semantic-report")),
+                verified.run_event_sha256s.clone(),
+            ),
+            seed,
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_release_matrix_with_platform_series(&manifest, &evidence, &[&wrong_report_sha],),
+            Err(ReleaseMatrixError::UnusedPlatformSeriesAuthority { .. })
+        ));
+
+        let mut reordered_events = verified.run_event_sha256s;
+        reordered_events.rotate_left(1);
+        let reordered = VerifiedRt64PlatformCaseSeries::fixture_for_test(
+            Rt64PlatformTarget::MacosMetal,
+            Rt64PlatformCase::FramebufferEnhancement,
+            (ReleaseHostPlatform::MacosArm64, None),
+            (
+                &report.scenario,
+                report.report_sha256.clone(),
+                reordered_events,
+            ),
+            seed,
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_release_matrix_with_platform_series(&manifest, &evidence, &[&reordered]),
+            Err(ReleaseMatrixError::UnusedPlatformSeriesAuthority { .. })
+        ));
+    }
+
+    #[test]
+    fn exact_windows_build_and_observed_api_receive_only_their_target_credit() {
+        for (scenario_name, build, graphics_api, expected) in [
+            (
+                "exact-windows10-d3d12-rt64",
+                21_999,
+                ReleaseGraphicsApi::D3d12,
+                "windows10-d3d12",
+            ),
+            (
+                "exact-windows10-vulkan-rt64",
+                21_999,
+                ReleaseGraphicsApi::Vulkan,
+                "windows10-vulkan",
+            ),
+            (
+                "exact-windows11-d3d12-rt64",
+                22_000,
+                ReleaseGraphicsApi::D3d12,
+                "windows11-d3d12",
+            ),
+            (
+                "exact-windows11-vulkan-rt64",
+                22_000,
+                ReleaseGraphicsApi::Vulkan,
+                "windows11-vulkan",
+            ),
         ] {
-            let report = rt64_report_for_platform_api(
+            let mut report = rt64_report_for_platform_api(
                 scenario_name,
                 scenario_name.as_bytes(),
                 ReleaseHostPlatform::WindowsX86_64,
                 graphics_api,
             );
+            report.environment.windows_version = Some(
+                crate::ReleaseWindowsVersionEvidence::from_native_workstation(10, 0, build, 123)
+                    .unwrap(),
+            );
+            report.report_sha256 = hex(&Sha256::digest(
+                crate::release_gate::encode_report_evidence(&report).unwrap(),
+            ));
             let incomplete = incomplete_for_report(scenario_name, report);
-            assert!(assigned_requirement_ids(
-                &incomplete,
-                CertificationRequirementClass::PlatformApiTarget,
-            )
-            .is_empty());
-            let missing = requirement_keys(incomplete.missing);
-            for target in [
-                "windows10-d3d12",
-                "windows10-vulkan",
-                "windows11-d3d12",
-                "windows11-vulkan",
-            ] {
-                assert!(missing.contains(&(
+            assert_eq!(
+                assigned_requirement_ids(
+                    &incomplete,
                     CertificationRequirementClass::PlatformApiTarget,
-                    target.to_owned(),
-                )));
-            }
+                ),
+                BTreeSet::from([expected.to_owned()]),
+            );
         }
+    }
+
+    #[test]
+    fn windows_family_relabel_cannot_manufacture_platform_credit() {
+        let mut report = rt64_report_for_platform_api(
+            "relabeled-windows11-d3d12-rt64",
+            b"relabeled-windows11-d3d12-rt64",
+            ReleaseHostPlatform::WindowsX86_64,
+            ReleaseGraphicsApi::D3d12,
+        );
+        let mut version =
+            crate::ReleaseWindowsVersionEvidence::from_native_workstation(10, 0, 21_999, 123)
+                .unwrap();
+        version.family = ReleaseWindowsFamily::Windows11;
+        report.environment.windows_version = Some(version);
+        report.report_sha256 = hex(&Sha256::digest(
+            crate::release_gate::encode_report_evidence(&report).unwrap(),
+        ));
+        let manifest = ReleaseMatrixManifest {
+            schema: RELEASE_MATRIX_SCHEMA.to_owned(),
+            profile: CertificationProfileIdentity::full_parity_v1(),
+            scenarios: vec![scenario("relabeled-windows", &report)],
+        };
+        assert!(matches!(
+            verify_release_matrix(&manifest, &evidence_series(report)),
+            Err(ReleaseMatrixError::InvalidUnassignedReport {
+                source: crate::GateError::InvalidWindowsVersionEvidence(_),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4579,29 +5121,30 @@ mod tests {
     }
 
     #[test]
-    fn stale_verified_v14_and_incomplete_v3_schemas_are_rejected() {
+    fn stale_verified_v15_and_incomplete_v4_schemas_are_rejected() {
         let (_, _, incomplete) = incomplete_fixture();
         let mut stale_incomplete = incomplete;
-        stale_incomplete.schema = "fn64.release-matrix-incomplete.v3".to_owned();
+        stale_incomplete.schema = "fn64.release-matrix-incomplete.v4".to_owned();
         assert!(matches!(
             stale_incomplete.verify_integrity(),
             Err(ReleaseMatrixError::UnsupportedIncompleteSchema(schema))
-                if schema == "fn64.release-matrix-incomplete.v3"
+                if schema == "fn64.release-matrix-incomplete.v4"
         ));
 
         let stale_verified = VerifiedReleaseMatrix {
-            schema: "fn64.verified-release-matrix.v14".to_owned(),
+            schema: "fn64.verified-release-matrix.v15".to_owned(),
             manifest_sha256: "00".repeat(32),
             profile: CertificationProfileIdentity::full_parity_v1(),
             total_reports: 0,
             scenarios: Vec::new(),
+            platform_case_authorities: Vec::new(),
             assignments: Vec::new(),
             verification_sha256: "11".repeat(32),
         };
         assert!(matches!(
             stale_verified.verify_integrity(),
             Err(ReleaseMatrixError::UnsupportedVerifiedSchema(schema))
-                if schema == "fn64.verified-release-matrix.v14"
+                if schema == "fn64.verified-release-matrix.v15"
         ));
     }
 

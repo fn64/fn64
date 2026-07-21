@@ -365,6 +365,7 @@ mod tests {
             "total_reports": 0,
             "scenarios": [],
             "assignments": [],
+            "platform_case_authorities": [],
             "verification_sha256": verification_sha256
         }))
         .unwrap()
@@ -384,6 +385,9 @@ mod tests {
             "fn64.verified-release-matrix.v10",
             "fn64.verified-release-matrix.v11",
             "fn64.verified-release-matrix.v12",
+            "fn64.verified-release-matrix.v13",
+            "fn64.verified-release-matrix.v14",
+            "fn64.verified-release-matrix.v15",
         ] {
             let error =
                 verify_retained_json(&empty_retained(schema, &"00".repeat(32))).unwrap_err();

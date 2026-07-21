@@ -143,7 +143,7 @@ and scope limits that make an open item meaningful.
   into RT64 so PAL stable-factor workloads derive from 50 Hz rather than the
   pinned upstream 60 Hz constant. Ten fresh live Metal processes prove the
   production-context PAL/MPAL workload sequences `[0,0,0,50]` and
-  `[0,0,0,60]` without an Extended refresh override. Report schema v19 now
+  `[0,0,0,60]` without an Extended refresh override. Report schema v20 now
   co-binds normalized ROM TV region, committed device TV state, and renderer
   create-time TV configuration; representative private PAL/MPAL exact-ten
   evidence remains to be retained. cpal

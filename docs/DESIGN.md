@@ -239,12 +239,12 @@ of chmod plus pathname replacement between verification and OS open/spawn is
 outside scope. The resolved system-Python executable is trusted as OS-owned.
 
 Rehashing an admitted microcode or recompiled file proves only that it did not
-change, not that the child consumed it. Schema v5 therefore requires
+change, not that the child consumed it. Admission schema v6 therefore requires
 `fn64.release-program-build-receipt.v1` for `full_rom` and `combined`. The
 receipt binds the exact child entry image and recomputes the declared execution
 source from one typed lane: canonically labeled exact linked archives for a
 native program, the generated typed-observed-function identity wire, or the
-typed-block pack plus its expected live program identity. The private v2
+typed-block pack plus its expected live program identity. The private v3
 contract binds the receipt itself, requires exactly one receipt lane input to
 equal the admitted `recompiled` artifact, and requires both the declared and
 recomputed source to equal the report source. The runner revalidates these
@@ -266,7 +266,7 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain one single recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Report schema
-`fn64.release-gate.v19` and the
+`fn64.release-gate.v20` and the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
 
 This mechanism makes a correctly formed production contract launchable; it is
@@ -282,9 +282,9 @@ Report-only matrix v5 verification never awards a ROM-class requirement from
 the report's host-supplied label. Its private-series path accepts only an
 opaque capability produced by jointly revalidating the policy-admitted v3
 contract, exact-ten receipt, retained reports/journals, raw ROM, runner image,
-and bound inputs. It exact-matches the v19 semantic report and ordered run-event
+and bound inputs. It exact-matches the v20 semantic report and ordered run-event
 identities, and retains a canonical `fn64.verified-rom-class-authority.v1`
-inside verified-matrix v15. The retained
+inside verified-matrix v16. The retained
 self-hash proves canonical integrity, not signer identity or transferable
 process provenance.
 
@@ -422,7 +422,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v19 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v20 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -431,7 +431,7 @@ image and asks the registered backend only for exact catalog recognition; the
 backend cannot supply the digest or choose execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v19` binds it independently.
+clears it and report schema `fn64.release-gate.v20` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.

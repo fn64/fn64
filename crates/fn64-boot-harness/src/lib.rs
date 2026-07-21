@@ -9,6 +9,7 @@
 
 mod certification_profile;
 mod observation_evidence;
+mod platform_certification;
 mod private_release_series;
 mod release_gate;
 mod release_matrix;
@@ -27,6 +28,11 @@ pub use observation_evidence::{
     FramebufferObservationFormat, FramebufferObservationGeometry, FramebufferObservationSource,
     LiveMemoryEvidence, LiveReferenceFramebufferEvidence, LiveReleaseGateObservationExt,
     MemoryObservationGeometry, ObservationEvidenceError, ReleaseObservationGeometry,
+};
+pub use platform_certification::{
+    PlatformCertificationError, Rt64PlatformCase, Rt64PlatformTarget,
+    VerifiedRt64PlatformCaseAuthority, VerifiedRt64PlatformCaseSeries,
+    VERIFIED_RT64_PLATFORM_CASE_AUTHORITY_SCHEMA,
 };
 pub use private_release_series::{
     load_private_release_run_contract, run_private_release_series, verify_private_release_series,
@@ -52,14 +58,16 @@ pub use release_gate::{
     LIVE_MINIMUM_CLOSURE_PATHS, LIVE_SAVE_OPERATION_CLOSURE_PATHS,
 };
 pub use release_matrix::{
-    verify_release_matrix, verify_release_matrix_with_private_series,
-    CertificationRequirementAssignment, ControllerFeature, IncompleteReleaseMatrix,
-    MicrocodeFeature, PresentationBoundaryEvidence, ProgramFeature, ReleaseMatrixCoverage,
-    ReleaseMatrixError, ReleaseMatrixManifest, ReleaseMatrixScenario, ReleaseMatrixVerification,
-    ReleasePlatform, RendererFeature, RspRdpMechanismFeature, SaveFeature, VerifiedMatrixScenario,
-    VerifiedReleaseMatrix, VerifiedRomClassAuthority, INCOMPLETE_RELEASE_MATRIX_SCHEMA,
-    RELEASE_MATRIX_MAX_SCENARIOS, RELEASE_MATRIX_REPORT_COUNT, RELEASE_MATRIX_SCHEMA,
-    VERIFIED_RELEASE_MATRIX_SCHEMA, VERIFIED_ROM_CLASS_AUTHORITY_SCHEMA,
+    verify_release_matrix, verify_release_matrix_with_platform_series,
+    verify_release_matrix_with_private_and_platform_series,
+    verify_release_matrix_with_private_series, CertificationRequirementAssignment,
+    ControllerFeature, IncompleteReleaseMatrix, MicrocodeFeature, PresentationBoundaryEvidence,
+    ProgramFeature, ReleaseMatrixCoverage, ReleaseMatrixError, ReleaseMatrixManifest,
+    ReleaseMatrixScenario, ReleaseMatrixVerification, ReleasePlatform, RendererFeature,
+    RspRdpMechanismFeature, SaveFeature, VerifiedMatrixScenario, VerifiedReleaseMatrix,
+    VerifiedRomClassAuthority, INCOMPLETE_RELEASE_MATRIX_SCHEMA, RELEASE_MATRIX_MAX_SCENARIOS,
+    RELEASE_MATRIX_REPORT_COUNT, RELEASE_MATRIX_SCHEMA, VERIFIED_RELEASE_MATRIX_SCHEMA,
+    VERIFIED_ROM_CLASS_AUTHORITY_SCHEMA,
 };
 pub use release_program_build_receipt::{
     materialize_release_program_build_receipt, MaterializedReleaseProgramBuildReceipt,
@@ -251,6 +259,7 @@ pub struct CommittedViBoundary {
     host_snapshot: fn64_abi::AbiHostEvidenceSnapshot,
     program_snapshot: ProgramEvidenceSnapshot,
     platform: ReleaseHostPlatform,
+    windows_version: Option<ReleaseWindowsVersionEvidence>,
     render_snapshot: fn64_abi::RenderEnvironmentEvidenceSnapshot,
 }
 
@@ -263,6 +272,97 @@ pub enum ReleaseHostPlatform {
     MacosArm64,
     LinuxX86_64,
     WindowsX86_64,
+}
+
+/// Marketing-family classification derived from the native Windows kernel
+/// build, never from a caller-supplied product label.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseWindowsFamily {
+    Windows10,
+    Windows11,
+}
+
+/// Product class returned by the native Windows version query.
+///
+/// Server builds intentionally have no representable release-evidence value.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseWindowsProductType {
+    Workstation,
+}
+
+/// Exact native Windows version bound to one committed release boundary.
+///
+/// Host-source provenance: Microsoft Learn's public `OSVERSIONINFOEXW` and
+/// `RtlGetVersion` documentation define the native layout/query and workstation
+/// product type; the Windows release-health tables identify Windows 10 RTM as
+/// build 10240 and Windows 11 21H2 as build 22000; the OEM deployment guide
+/// identifies `HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\UBR` as
+/// the Windows build revision.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseWindowsVersionEvidence {
+    pub family: ReleaseWindowsFamily,
+    pub major: u32,
+    pub minor: u32,
+    pub build: u32,
+    pub update_build_revision: u32,
+    pub product_type: ReleaseWindowsProductType,
+}
+
+impl ReleaseWindowsVersionEvidence {
+    pub const WINDOWS_11_FIRST_BUILD: u32 = 22_000;
+    pub const WINDOWS_10_FIRST_BUILD: u32 = 10_240;
+
+    /// Classify native workstation version components. Windows Server and
+    /// compatibility-layer product labels are rejected before this boundary.
+    pub fn from_native_workstation(
+        major: u32,
+        minor: u32,
+        build: u32,
+        update_build_revision: u32,
+    ) -> Result<Self, &'static str> {
+        if major != 10 || minor != 0 {
+            return Err("Windows release evidence requires native version 10.0");
+        }
+        if build < Self::WINDOWS_10_FIRST_BUILD {
+            return Err("Windows release evidence predates Windows 10 build 10240");
+        }
+        let family = if build >= Self::WINDOWS_11_FIRST_BUILD {
+            ReleaseWindowsFamily::Windows11
+        } else {
+            ReleaseWindowsFamily::Windows10
+        };
+        Ok(Self {
+            family,
+            major,
+            minor,
+            build,
+            update_build_revision,
+            product_type: ReleaseWindowsProductType::Workstation,
+        })
+    }
+
+    pub fn verify(self) -> Result<(), &'static str> {
+        if Self::from_native_workstation(
+            self.major,
+            self.minor,
+            self.build,
+            self.update_build_revision,
+        ) == Ok(self)
+        {
+            Ok(())
+        } else {
+            Err("Windows family does not match its native version/build evidence")
+        }
+    }
 }
 
 /// Exact controller/accessory identity of one physical N64 port.
@@ -339,6 +439,9 @@ impl ReleaseRendererEvidence {
 #[serde(deny_unknown_fields)]
 pub struct ReleaseEnvironmentEvidence {
     pub platform: ReleaseHostPlatform,
+    /// Present exactly on Windows. The report schema rejects both a missing
+    /// Windows version and a version attached to a non-Windows platform.
+    pub windows_version: Option<ReleaseWindowsVersionEvidence>,
     pub controller_ports: [ReleaseControllerPort; 4],
     pub cartridge_save: ReleaseCartridgeSave,
     pub renderer: ReleaseRendererEvidence,
@@ -354,6 +457,164 @@ const fn release_host_platform() -> Option<ReleaseHostPlatform> {
     } else {
         None
     }
+}
+
+fn release_host_identity(
+) -> Result<(ReleaseHostPlatform, Option<ReleaseWindowsVersionEvidence>), ViBoundaryError> {
+    let platform = release_host_platform().ok_or(ViBoundaryError::UnsupportedReleasePlatform {
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+    })?;
+    #[cfg(target_os = "windows")]
+    {
+        let version = windows_native_version()
+            .map_err(|detail| ViBoundaryError::UnsupportedWindowsVersion { detail })?;
+        Ok((platform, Some(version)))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok((platform, None))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_release_windows_version() -> Option<ReleaseWindowsVersionEvidence> {
+    #[cfg(target_os = "windows")]
+    {
+        Some(
+            ReleaseWindowsVersionEvidence::from_native_workstation(10, 0, 19_045, 0)
+                .expect("fixed test Windows identity is valid"),
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_native_version() -> Result<ReleaseWindowsVersionEvidence, String> {
+    const VER_NT_WORKSTATION: u8 = 1;
+    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
+    const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+    const ERROR_SUCCESS: i32 = 0;
+
+    #[repr(C)]
+    struct OsVersionInfoExW {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform_id: u32,
+        service_pack: [u16; 128],
+        service_pack_major: u16,
+        service_pack_minor: u16,
+        suite_mask: u16,
+        product_type: u8,
+        reserved: u8,
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn RtlGetVersion(version: *mut OsVersionInfoExW) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(module_name: *const u16) -> isize;
+        fn GetProcAddress(module: isize, procedure_name: *const u8) -> *const std::ffi::c_void;
+    }
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            key: isize,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            value_type: *mut u32,
+            data: *mut std::ffi::c_void,
+            data_size: *mut u32,
+        ) -> i32;
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let ntdll = wide("ntdll.dll");
+    // SAFETY: both arguments are immutable NUL-terminated strings and the
+    // returned module handle is inspected only for one exported symbol.
+    let ntdll_module = unsafe { GetModuleHandleW(ntdll.as_ptr()) };
+    if ntdll_module == 0 {
+        return Err("GetModuleHandleW could not resolve ntdll.dll".to_owned());
+    }
+    // fn64's host policy rejects the conventional Wine marker documented by
+    // WineHQ as an ntdll `wine_get_version` export. This is deliberately not a
+    // claim that absence of the marker attests every compatibility layer away.
+    let wine_symbol = b"wine_get_version\0";
+    // SAFETY: `ntdll_module` came from GetModuleHandleW and the procedure name
+    // is NUL-terminated for the duration of the lookup.
+    if !unsafe { GetProcAddress(ntdll_module, wine_symbol.as_ptr()) }.is_null() {
+        return Err(
+            "Wine compatibility-layer hosts cannot produce Windows release evidence".into(),
+        );
+    }
+
+    let mut version = OsVersionInfoExW {
+        size: std::mem::size_of::<OsVersionInfoExW>() as u32,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform_id: 0,
+        service_pack: [0; 128],
+        service_pack_major: 0,
+        service_pack_minor: 0,
+        suite_mask: 0,
+        product_type: 0,
+        reserved: 0,
+    };
+    // SAFETY: `version` has the documented RTL_OSVERSIONINFOEXW layout and
+    // remains exclusively borrowed for the duration of the native query.
+    let status = unsafe { RtlGetVersion(&mut version) };
+    if status < 0 {
+        return Err(format!("RtlGetVersion failed with NTSTATUS {status:#010x}"));
+    }
+    if version.product_type != VER_NT_WORKSTATION {
+        return Err(format!(
+            "Windows product type {} is not a workstation",
+            version.product_type
+        ));
+    }
+    let current_version_key = wide("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+    let ubr_name = wide("UBR");
+    let mut ubr = 0u32;
+    let mut ubr_type = 0u32;
+    let mut ubr_size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: all pointers name live, correctly sized storage; RegGetValueW
+    // receives the fixed machine-wide CurrentVersion key and DWORD-only flag.
+    let ubr_status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            current_version_key.as_ptr(),
+            ubr_name.as_ptr(),
+            RRF_RT_REG_DWORD,
+            &mut ubr_type,
+            (&mut ubr as *mut u32).cast(),
+            &mut ubr_size,
+        )
+    };
+    if ubr_status != ERROR_SUCCESS || ubr_type != 4 || ubr_size != std::mem::size_of::<u32>() as u32
+    {
+        return Err(format!(
+            "Windows CurrentVersion UBR query failed: status={ubr_status}, type={ubr_type}, bytes={ubr_size}"
+        ));
+    }
+    ReleaseWindowsVersionEvidence::from_native_workstation(
+        version.major,
+        version.minor,
+        version.build,
+        ubr,
+    )
+    .map_err(str::to_owned)
 }
 
 /// Stable, pointer-free identity supplied by the build that owns a native
@@ -484,6 +745,7 @@ type CommittedEvidence = (
     FrozenExecutionDestinations,
     Vec<fn64_abi::RspRdpObservationEvent>,
     ReleaseHostPlatform,
+    Option<ReleaseWindowsVersionEvidence>,
     fn64_abi::RenderEnvironmentEvidenceSnapshot,
 );
 
@@ -532,6 +794,9 @@ pub enum ViBoundaryError {
         os: &'static str,
         arch: &'static str,
     },
+    UnsupportedWindowsVersion {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for ViBoundaryError {
@@ -565,6 +830,12 @@ impl std::fmt::Display for ViBoundaryError {
                 formatter,
                 "fixed-cycle release evidence has no closed platform identity for {os}/{arch}"
             ),
+            Self::UnsupportedWindowsVersion { detail } => {
+                write!(
+                    formatter,
+                    "fixed-cycle Windows identity is unsupported: {detail}"
+                )
+            }
         }
     }
 }
@@ -595,10 +866,7 @@ fn commit_scheduled_vi_boundary_inner(
     expected_cycle: u64,
     descriptor: Option<ReleaseProgramDescriptor>,
 ) -> Result<CommittedViBoundary, ViBoundaryError> {
-    let platform = release_host_platform().ok_or(ViBoundaryError::UnsupportedReleasePlatform {
-        os: std::env::consts::OS,
-        arch: std::env::consts::ARCH,
-    })?;
+    let (platform, windows_version) = release_host_identity()?;
     let current = fn64_abi::sim_time();
     let scheduled = fn64_abi::next_vi_deadline().ok_or(ViBoundaryError::ViNotScheduled)?;
     if scheduled != expected_cycle {
@@ -648,6 +916,7 @@ fn commit_scheduled_vi_boundary_inner(
         host_snapshot: fn64_abi::host_evidence_snapshot(),
         program_snapshot,
         platform,
+        windows_version,
         render_snapshot: fn64_abi::render_environment_evidence_snapshot(),
     })
 }
@@ -702,6 +971,7 @@ impl CommittedViBoundary {
             },
             self.rsp_rdp_observations,
             self.platform,
+            self.windows_version,
             self.render_snapshot,
         ))
     }
@@ -726,6 +996,7 @@ impl CommittedViBoundary {
             host_snapshot: fn64_abi::host_evidence_snapshot(),
             program_snapshot: capture_program_evidence(Some(ReleaseProgramDescriptor::NoProgram)),
             platform: release_host_platform().expect("test platform must be release-supported"),
+            windows_version: test_release_windows_version(),
             render_snapshot: fn64_abi::render_environment_evidence_snapshot(),
         }
     }
@@ -1383,6 +1654,7 @@ mod tests {
             _captured_destinations,
             _captured_rsp_rdp,
             _captured_platform,
+            _captured_windows_version,
             _captured_renderer,
         ) = boundary.into_evidence().unwrap();
         assert_eq!(captured_device, edge_device);
