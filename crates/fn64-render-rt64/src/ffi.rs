@@ -3647,13 +3647,13 @@ mod tests {
         };
         let entry = generation(fn64_render::TaskAdmissionSource::TaskEntry, 0x1000, 0x11);
         let self_load = generation(fn64_render::TaskAdmissionSource::SelfLoad, 0x2000, 0x22);
-        let raw_window = |byte| crate::gbi::TaskAdmissionRawWindow {
+        let raw_window = |byte| fn64_render::TaskAdmissionRawWindow {
             text: vec![byte; crate::RT64_GBI_TEXT_RECOGNITION_BYTES],
             data: vec![byte.wrapping_add(1); crate::RT64_GBI_DATA_RECOGNITION_BYTES],
         };
         let admission = crate::Rt64TaskAdmission {
             plan: fn64_render::TaskAdmissionPlan::new(entry, [self_load]),
-            raw_windows: vec![raw_window(0x31), raw_window(0x42)],
+            raw_windows: vec![raw_window(0x31), raw_window(0x42)].into_boxed_slice(),
         };
         let prepared = PreparedUcodePlan::new(&admission).unwrap();
         assert_eq!(prepared.generations.len(), 2);
@@ -3670,7 +3670,7 @@ mod tests {
         opaque_entry.family = UcodeId::Other(0x5645_4e44);
         let opaque = PreparedUcodePlan::new(&crate::Rt64TaskAdmission {
             plan: fn64_render::TaskAdmissionPlan::new(opaque_entry, []),
-            raw_windows: vec![raw_window(0x53)],
+            raw_windows: vec![raw_window(0x53)].into_boxed_slice(),
         })
         .unwrap();
         assert_eq!(opaque.generations[0].expected_family, 0);

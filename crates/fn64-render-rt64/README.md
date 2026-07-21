@@ -62,10 +62,13 @@ live raw recognition bytes, forces content recognition for every generation,
 and requires exact source/address order and plan exhaustion. Unknown or
 incompatible generations return typed `NeedsLle` before interpreter mutation;
 a missing, extra, reordered, or changed generation after native execution
-starts poisons the context and fails loudly. The full reference preflight still
-produces the ordered self-load list and public-command FullSync observation;
-replacing it with a focused backend-neutral walker is the prerequisite for
-extracting `ReferenceBackend` from this crate.
+starts poisons the context and fails loudly. A focused, backend-neutral walker
+in `fn64-render` now produces the complete entry/self-load plan, entry-inclusive
+raw recognition windows, and exact public-command FullSync count from immutable
+inputs. RT64 production task submission no longer invokes the reference
+decoder; a structural test rejects any reintroduction of its inspect, execute,
+decode, trace, or `RenderOp` paths. This removes the geometry dependency that
+previously blocked extracting `ReferenceBackend` from this crate.
 
 Device-free tests cover ABI identity, typed precommit rejection, exact plan
 exhaustion parsing, and retained same-address `A -> B -> A` raw windows. The
@@ -117,10 +120,10 @@ and blank/inactive no-read behavior have exact reference vectors. The resident
 RDP image is never a fallback for live registers. Native RT64 binds that same
 allocation only for the synchronous foreign call, waits its workload and
 presentation queues idle, then restores placeholder aliases before returning.
-It validates the public programmed source span rather than borrowing the
-reference renderer's policy-specific filter halo. Compatibility geometry can
-still drive standalone behavior fixtures, but only a completed live-register
-present can produce fixed-cycle release capture.
+It validates the backend-neutral `fn64-render` programmed source footprint
+rather than borrowing the reference renderer's policy-specific filter halo.
+Compatibility geometry can still drive standalone behavior fixtures, but only
+a completed live-register present can produce fixed-cycle release capture.
 The reference lane also implements the public full-coverage RGBA16 3x3
 restoration mechanism, partial-coverage silhouette AA, horizontal median divot,
 vertical-then-horizontal resampling or replication, a deterministic integer
@@ -171,8 +174,9 @@ plan; initial/final addresses remain diagnostic rather than admission
 authority. In pinned RT64, only the public FullSync path advances the state
 workload ID, so the delta provides native `Reached`/`NotReached` evidence and
 preserves the exact count when a task synchronizes more than once. While the
-reference preflight remains, its public-command result must agree exactly with
-the native delta or the adapter fails closed.
+shared transactional walker supplies the public-command count, it must agree
+exactly with the native delta or the adapter drops the already-mutated native
+context and fails closed.
 
 The C++ and every Rust `unsafe` block used to call it are quarantined here, as
 required by `docs/DESIGN.md` section 1. `fn64-render`, `fn64-runtime`, and the
@@ -433,6 +437,12 @@ These bytes are not post-analog N64 VI output and do not establish silicon
 gamma/divot/dither equivalence. Metal retains its measured 20-run control;
 macOS compiles the Vulkan branch and static tests retain the D3D12 seam, but no
 Linux/Vulkan or Windows/Vulkan/D3D12 actual-hardware result is claimed.
+
+RT64's paused debugger replays already completed workloads for inspection.
+Pinned RT64 otherwise bypasses both HLE and raw display-list parsing while
+paused and fabricates a DP interrupt, so the fn64 adapter rejects new command
+submission in that state. Presentation and debugger selection remain live;
+command execution resumes only after the debugger is unpaused.
 
 The focused native VI gate is also directly runnable:
 

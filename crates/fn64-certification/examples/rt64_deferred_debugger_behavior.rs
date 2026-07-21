@@ -320,6 +320,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     backend.set_debugger_inspection_for_evidence(true, 0, -1, false)?;
+    let paused_submission = backend
+        .process_rdp_commands(&mut rdram, COMMANDS as u32, end, B)
+        .expect_err("paused RT64 debugger must not bypass raw RDP parsing");
+    match paused_submission {
+        fn64_render::RenderError::Backend { backend, reason }
+            if backend == "rt64" && reason.contains("debugger is paused") => {}
+        error => {
+            return Err(io::Error::other(format!(
+                "paused raw RDP rejection lost its named diagnostic: {error}"
+            ))
+            .into());
+        }
+    }
     let full_a = present(&mut backend, &rdram, 110)?;
     require_selection("paused full A", &full_a.selection, A)?;
     require_capture(

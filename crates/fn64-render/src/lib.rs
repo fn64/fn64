@@ -32,12 +32,18 @@
 //! executor-seam glue rather than backend policy.
 #![forbid(unsafe_code)]
 
+mod geometry_task_inspection;
 mod microcode;
 mod rdp_completion;
 mod settings;
+mod vi_source;
 
 use std::{fmt, num::NonZeroU64};
 
+pub use geometry_task_inspection::{
+    inspect_geometry_task, GeometryTaskInspection, GeometryTaskInspectionPolicy,
+    TaskAdmissionRawWindow, TaskAdmissionRawWindowSize,
+};
 pub use microcode::{
     F3dex2UcodeCatalog, GeometryUcodeCatalog, GeometryWireFamily, MicrocodePairCatalog,
     S2dexUcodeCatalog, S2dexWireFamily, TaskAdmissionGeneration, TaskAdmissionPlan,
@@ -54,6 +60,7 @@ pub use settings::{
     RenderRuntimeSettings, RenderSettingsApply, RenderSettingsError, RenderUpscale2d,
     ResolutionMultiplier,
 };
+pub use vi_source::{programmed_vi_source_footprint, ViSourceFootprint};
 
 /// Public libultra manual's documented `OSTask_t` field shape -- the same
 /// fields as `fn64_runtime::rsp::OsTaskHeader`, redeclared here (see module
