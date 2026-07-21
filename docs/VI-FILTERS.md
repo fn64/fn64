@@ -117,7 +117,7 @@ parity.
 Run the native gate directly with:
 
 ```sh
-cargo run -p fn64-render-rt64 --features rt64 --example rt64_vi_filter_behavior
+cargo run -p fn64-certification --features rt64 --example rt64_vi_filter_behavior
 ```
 
 ## Physical-video capture admission

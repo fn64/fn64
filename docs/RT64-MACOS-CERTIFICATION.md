@@ -19,17 +19,17 @@ Recorded host: macOS 26.5 build 25F71; Darwin 25.5.0 arm64; Apple M5 Pro.
 
 | Case | Category | Example | Repeat bar | Recorded result | Closed claims |
 |---|---|---|---:|---|---|
-| `backend-lifecycle` | backend | [​`rt64_metal_backend_behavior`](../crates/fn64-render-rt64/examples/rt64_metal_backend_behavior.rs) | 20 | 20 clean (2026-07-21) | `backend-metal` |
-| `resolution-downsample` | resolution | [​`rt64_resolution_downsample_behavior`](../crates/fn64-render-rt64/examples/rt64_resolution_downsample_behavior.rs) | 10 | 10 clean (2026-07-19) | `high-resolution-renderer`, `downsample-to-original-like` |
-| `framebuffer-rdram-region` | framebuffer | [​`rt64_framebuffer_rdram_region_behavior`](../crates/fn64-render-rt64/examples/rt64_framebuffer_rdram_region_behavior.rs) | 10 | 10 clean (2026-07-19) | `native-renderer-rdram-sync`, `framebuffer-detection-region-copy` |
-| `framebuffer-enhancement` | framebuffer | [​`rt64_framebuffer_enhancement_behavior`](../crates/fn64-render-rt64/examples/rt64_framebuffer_enhancement_behavior.rs) | 10 | 10 clean (2026-07-19) | `framebuffer-upscaling`, `framebuffer-reinterpretation` |
-| `texture-replacements` | textures | [​`rt64_texture_replacement_behavior`](../crates/fn64-render-rt64/examples/rt64_texture_replacement_behavior.rs) | 10 | 10 clean (2026-07-19) | `texture-pack-dds`, `texture-pack-rice-filenames`, `texture-pack-async-streaming` |
-| `latency-skip-buffering` | latency | [​`rt64_latency_skip_buffering_behavior`](../crates/fn64-render-rt64/examples/rt64_latency_skip_buffering_behavior.rs) | 10 | 10 clean (2026-07-19) | `latency-skip-buffering` |
-| `latency-present-early` | latency | [​`rt64_latency_present_early_behavior`](../crates/fn64-render-rt64/examples/rt64_latency_present_early_behavior.rs) | 20 | 20 clean (2026-07-19) | `latency-present-early` |
-| `deferred-debugger` | inspection | [​`rt64_deferred_debugger_behavior`](../crates/fn64-render-rt64/examples/rt64_deferred_debugger_behavior.rs) | 20 | 20 clean (2026-07-19) | `deferred-frame-history`, `debugger-frame-inspection` |
-| `ubershader-critical-path` | pipelines | [​`rt64_ubershader_pipeline_behavior`](../crates/fn64-render-rt64/examples/rt64_ubershader_pipeline_behavior.rs) | 20 | 20 clean (2026-07-19) | `ubershader-no-pipeline-stutter` |
-| `hfr-hle-cooperation` | generated-frames | [​`rt64_hfr_interpolation_behavior`](../crates/fn64-render-rt64/examples/rt64_hfr_interpolation_behavior.rs) | 20 | 20 clean (2026-07-21) | `hfr-60-plus-interpolation` |
-| `extended-gbi-cooperation` | extended-gbi | [​`rt64_extended_gbi_enhancement_behavior`](../crates/fn64-render-rt64/examples/rt64_extended_gbi_enhancement_behavior.rs) | 10 | 10 clean (2026-07-20) | `extended-gbi` |
+| `backend-lifecycle` | backend | [​`rt64_metal_backend_behavior`](../crates/fn64-certification/examples/rt64_metal_backend_behavior.rs) | 20 | 20 clean (2026-07-21) | `backend-metal` |
+| `resolution-downsample` | resolution | [​`rt64_resolution_downsample_behavior`](../crates/fn64-certification/examples/rt64_resolution_downsample_behavior.rs) | 10 | 10 clean (2026-07-19) | `high-resolution-renderer`, `downsample-to-original-like` |
+| `framebuffer-rdram-region` | framebuffer | [​`rt64_framebuffer_rdram_region_behavior`](../crates/fn64-certification/examples/rt64_framebuffer_rdram_region_behavior.rs) | 10 | 10 clean (2026-07-19) | `native-renderer-rdram-sync`, `framebuffer-detection-region-copy` |
+| `framebuffer-enhancement` | framebuffer | [​`rt64_framebuffer_enhancement_behavior`](../crates/fn64-certification/examples/rt64_framebuffer_enhancement_behavior.rs) | 10 | 10 clean (2026-07-19) | `framebuffer-upscaling`, `framebuffer-reinterpretation` |
+| `texture-replacements` | textures | [​`rt64_texture_replacement_behavior`](../crates/fn64-certification/examples/rt64_texture_replacement_behavior.rs) | 10 | 10 clean (2026-07-19) | `texture-pack-dds`, `texture-pack-rice-filenames`, `texture-pack-async-streaming` |
+| `latency-skip-buffering` | latency | [​`rt64_latency_skip_buffering_behavior`](../crates/fn64-certification/examples/rt64_latency_skip_buffering_behavior.rs) | 10 | 10 clean (2026-07-19) | `latency-skip-buffering` |
+| `latency-present-early` | latency | [​`rt64_latency_present_early_behavior`](../crates/fn64-certification/examples/rt64_latency_present_early_behavior.rs) | 20 | 20 clean (2026-07-19) | `latency-present-early` |
+| `deferred-debugger` | inspection | [​`rt64_deferred_debugger_behavior`](../crates/fn64-certification/examples/rt64_deferred_debugger_behavior.rs) | 20 | 20 clean (2026-07-19) | `deferred-frame-history`, `debugger-frame-inspection` |
+| `ubershader-critical-path` | pipelines | [​`rt64_ubershader_pipeline_behavior`](../crates/fn64-certification/examples/rt64_ubershader_pipeline_behavior.rs) | 20 | 20 clean (2026-07-19) | `ubershader-no-pipeline-stutter` |
+| `hfr-hle-cooperation` | generated-frames | [​`rt64_hfr_interpolation_behavior`](../crates/fn64-certification/examples/rt64_hfr_interpolation_behavior.rs) | 20 | 20 clean (2026-07-21) | `hfr-60-plus-interpolation` |
+| `extended-gbi-cooperation` | extended-gbi | [​`rt64_extended_gbi_enhancement_behavior`](../crates/fn64-certification/examples/rt64_extended_gbi_enhancement_behavior.rs) | 10 | 10 clean (2026-07-20) | `extended-gbi` |
 
 A manifest result is record evidence only when its run count meets the case's
 repeat bar. A shorter runner invocation is labeled `diagnostic-only` even when
