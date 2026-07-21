@@ -15,6 +15,12 @@ fn64 typed policy already carried that exact boolean through
 changes executed render control flow rather than only changing its policy
 digest.
 
+Production transactional admission consumes the active value of that same
+field. Its executed-command inspection therefore applies the forced branch
+before freezing ordered self-loaded microcode generations and FullSync
+evidence. Preflight cannot approve the ordinary fallthrough while native RT64
+subsequently executes the forced target.
+
 The fixture uses the public F3DEX2 `gSPBranchLessZraw` envelope documented in
 `F3DEX2-CONCEPTS.md`: `G_RDPHALF_1` stages a tail-branch target and
 `G_BRANCH_Z` compares one transformed vertex's screen Z. Its threshold is zero
