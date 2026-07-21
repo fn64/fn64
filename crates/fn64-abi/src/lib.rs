@@ -311,6 +311,21 @@ struct HostState {
     /// OS-side information intentionally kept out of the hardware fabric.
     /// There is at most one entry because PI exposes one DMA channel.
     pending_pi_completion: Option<PendingPiCompletion>,
+    /// The PI manager's command queue: managed `osEPiStartDma` requests
+    /// accepted while a transfer is already in flight, started in FIFO
+    /// order as each prior transfer completes. Real libultra enqueues the
+    /// `OSIoMesg` on the PI manager's cmdQ and returns 0 -- `-1` means the
+    /// cmdQ itself is FULL, NOT "a DMA is in flight". WM2000 relies on
+    /// this: its chunked loader (`funcs_5.c` `func_80012064`, asm
+    /// 0x8001214C `while (osEPiStartDma(..) != 0);`) retries in a tight
+    /// loop that never yields, so a model that reports busy as -1
+    /// livelocks the whole cooperative executor (the pending completion
+    /// can only commit once the guest yields). Capacity is the game's own
+    /// `osCreatePiManager(cmdMsgCnt)` (NWXE passes 0x40); 0 until then.
+    queued_pi_requests: std::collections::VecDeque<PendingPiCompletion>,
+    /// `osCreatePiManager`'s `cmdMsgCnt`: how many requests may sit in
+    /// `queued_pi_requests` before `osEPiStartDma` reports a full queue.
+    pi_cmd_queue_capacity: usize,
     pending_si_completion: Option<PendingSiCompletion>,
     /// Public `OSViMode` register image queued by `osViSetMode`; the VI
     /// manager applies it at the next V-blank rather than at the shim call.
@@ -411,6 +426,8 @@ impl Default for HostState {
             ),
             rom_installed: false,
             pending_pi_completion: None,
+            queued_pi_requests: std::collections::VecDeque::new(),
+            pi_cmd_queue_capacity: 0,
             pending_si_completion: None,
             pending_vi_mode: None,
             active_vi_mode: None,
