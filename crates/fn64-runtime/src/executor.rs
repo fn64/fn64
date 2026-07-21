@@ -1037,11 +1037,30 @@ impl Executor {
                 // Immediately runnable again next round -- this is the
                 // exact semantics that fixes an idle spin loop: it gives up
                 // the CPU every iteration instead of never yielding.
+                // (Correct only for callers that loop back around the
+                // yield themselves -- see `Yield::StopSelf` for the C-ABI
+                // `pause_self` boundary, whose generated call sites do
+                // NOT loop.)
                 if let Some(thread) = self.threads.get_mut(&id) {
                     thread.set_state(ThreadState::Runnable);
                 }
                 self.run_queue.push(id);
                 self.sort_run_queue();
+                if self.running == Some(id) {
+                    self.running = None;
+                }
+            }
+            Yield::StopSelf => {
+                // The C-ABI `pause_self` park: back to `Stopped` (the same
+                // state `osCreateThread` leaves a thread in), off the run
+                // queue, resumable only by an explicit `osStartThread` --
+                // reference-runtime (N64ModernRuntime) parity. See
+                // `Yield::StopSelf`'s doc for the WM2000 fall-through
+                // corruption this closes.
+                if let Some(thread) = self.threads.get_mut(&id) {
+                    thread.set_state(ThreadState::Stopped);
+                }
+                self.run_queue.retain(|t| *t != id);
                 if self.running == Some(id) {
                     self.running = None;
                 }

@@ -6,9 +6,20 @@ use super::*;
 // ---------------------------------------------------------------------
 
 /// `pause_self(uint8_t *rdram)` -- ONE argument, no `ctx` (see module doc).
+///
+/// Parks the calling guest thread (`Yield::StopSelf`: `ThreadState::Stopped`
+/// until an explicit `osStartThread`), matching the reference
+/// N64ModernRuntime. It must NOT auto-resume: N64Recomp's C codegen emits
+/// this call for an unconditional guest self-branch with NO loop back, so
+/// returning here executes code the console can never reach. The WM2000
+/// frontier bug this fixes (2026-07-21): the sound driver's file-id bounds
+/// assert (`func_80003DD4` 0x80003DF0, `j self` hang) was fallen through,
+/// the out-of-range id (0xC5BE) indexed past the file tables, and the
+/// resulting garbage lookup submitted a PI DMA sized 0xFFFFFFFC (-4). See
+/// `Yield::StopSelf`'s doc comment for the full mechanism.
 #[no_mangle]
 pub extern "C" fn pause_self(_rdram: *mut u8) {
-    suspend_active_coroutine(Yield::PauseSelf);
+    suspend_active_coroutine(Yield::StopSelf);
 }
 
 /// `switch_error(const char* func, uint32_t vram, uint32_t jtbl)` --
