@@ -268,7 +268,7 @@ guest assert at sim ~19.23B and the rest of the machine keeps running
 106,000 tasks, VI keeps swapping the same last frame; 7 VI swaps / 7 gfx
 tasks, unchanged — all still untextured fade/fill frames, 0 triangles).
 
-## Known frontier (2026-07-21, latest): announcer voice request with an uninstalled voice map
+## RESOLVED (2026-07-21, latest): announcer voice request with an uninstalled voice map
 
 Why fileId was 0xC5BE at all (the next rung, fully forensically mapped):
 
@@ -297,16 +297,71 @@ Why fileId was 0xC5BE at all (the next rung, fully forensically mapped):
    over the whole dispatch subtree found only the already-annotated
    `func_80120D60` fragment, which is camera math, not the installer).
 
-So on real hardware this same sequence would only work if the wrestler /
-announcer voice map is installed into chan+4 between the scene-init load
-and the first entrance announcement — that installer (or the state that
-gates the request) is what diverges in fn64's run. Candidate directions
-for the next cycle: find the chan+4 writer in the sibling AKI titles'
-decomp (VPW2/WCW-Revenge sound driver "SndCtl" analogues), or trace which
-sound command SHOULD precede the pointer request (funcs_20's
-`func_800F4304`/`func_800F44F4` bcopy handlers copy wrestler name strings,
-not the 0x124-entry map), or check whether the request itself is spurious
-(fn64 heap-layout divergence from a skipped earlier allocation).
+RESOLUTION (same day, lldb function-tracing + state probes): the installer
+EXISTS, WORKS, and RAN — the frontier was a heap-content divergence, not a
+missing installer or a spurious request.
+
+The installer, end to end (all recompiled, none stubbed): the per-frame
+sound tick `func_800E1FB8` (called once per game frame from the scene
+loop `func_800E2704`, AFTER the 4-channel request resolver `func_800F53C8`
+pass) calls `func_800F5BB4`, which dispatches on the sound mode
+`D_8011B0F4` (1 = demo, set by the demo-engine init `func_8011EE44`) to
+`func_80122558`, which steps `func_800F5704` for each channel.
+`func_800F5704` runs a wrestler-assignment countdown at chan+0x2F0:
+assignment tick copies chan+0x268→0x264, next tick sees 0x266 != 0x264,
+sets the countdown to 3, and on the decrement-to-2 tick calls
+**`func_800F6ED8` — the voice-map builder**: bzero(chan+4, 0x248), then
+per announcer-code entries assembled from the decompressed sound-map
+file's tables (`D_80107EFC`/`D_80107EF8`/`D_80107198`, code list
+`D_8010718C`) into the 0x124-halfword map at chan+4 (the `sh v1, 0x4(v0)`
+loop at asm 0x800F723C). Probes watched it install chan0's real map at
+demo frame 6 (chan0's packed theme voice, id 2, code -5).
+
+Why the assert fired anyway: the demo pointer-voice protocol
+(`func_8011E4BC`) is DESIGNED to fire one frame after assignment — frame
+N assigns chan+0x268 and idles the channel (state |= 0x80), frame N+1
+sees the id already current and fires (`func_80122428` + state 0), and
+the tick's resolver pass reads the map (code 0 = "announce wrestler
+name" = map slot 0) BEFORE that same tick's 5BB4 phase can run the
+install countdown. The guest tolerates this BY DESIGN: `func_800F5190`'s
+code-0 rule (asm 0x800F5310) treats a ZERO map slot as "not installed
+yet" and falls back to the built-in announce tables (`D_801065A0`..) via
+a code -1 re-entry. Fresh chan arrays read zero on hardware because the
+AKI heap's arena is bzero'd at first alloc (`func_80000898`, 0x21D800
+bytes at 0x80172000) and the next-fit roving pointer's position at
+scene-init is the product of thousands of timing-dependent alloc/free
+pairs (probe: 3,310 heap events before the demo, dominated by repeating
+per-poll loader pairs). Under fn64's current pacing (the game frame loop
+completes one frame per ~1,400 VI fields against a hardware-cadence
+audio pump — thread 6 wakes on its vsync queue 0x838A8 every field but
+only finishes a demo frame rarely) that history collapses, and the chan
+array lands exactly on the freed decompression temp of sound-map file
+0x435 — so chan1's map slot 0 read the stale compressed pair 0xC5BE
+instead of virgin zeros, and the streamer asserted on the wild fileId.
+
+FIX (harness-level, documented in `src/main.rs`): reproduce the
+hardware-visible outcome — whenever a fresh chan-array pointer appears at
+`D_8011B5D8`, zero the four 0x248-byte voice maps at chan+4, exactly the
+virgin bytes the guest's own zero-tolerant fallback expects; real
+installs land later and overwrite freely. The honest root fix is fn64's
+game-frame pacing (the ~1,400-fields-per-frame stall against the
+audio-clock-synced demo timeline), which is its own rung.
+
+## Known frontier (2026-07-21, latest): first real RDP triangles
+
+With the voice maps virgin, the fileId assert never fires, the game
+thread survives the demo's announcer requests, and boot advances past
+the former park: gfx task #7 (first after the 7 fade/fill tasks)
+submits a raw RDP XBUS stream containing opcode 0xCE — an RDP
+triangle-family command (shade+texture triangle) — i.e. the intro scene
+is finally drawing REAL GEOMETRY. The in-repo software ReferenceBackend
+does not implement raw-RDP triangle rasterization and honestly panics
+(`dispatch_raw_rdp_xbus: raw RDP opcode G_<unrecognized> (0xce) at
+0x290004a8 is unsupported`, `fn64-abi/src/task_dispatch.rs:276`) rather
+than skipping geometry. Next rung: RDP triangle-command rasterization in
+the reference backend (edge-walker + shade/texture attribute
+interpolation), after which the AKI/THQ logo/title content becomes
+visible in the frame dumps.
 
 ## Known frontier (2026-07-14)
 
