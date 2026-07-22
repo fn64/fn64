@@ -22,12 +22,17 @@ denominator into two public controls plus all six point-light hypotheses at
 RDRAM, RSP memory, and native context, exactly one FullSync, guarded synthetic
 assets, and an exact task-workload-present association before pixels are
 accepted. Adaptive byte-lane probes remain subordinate to the record-boundary
-row.
+row. Every point-light candidate, knockout, and adaptive refinement vector
+sets `G_LIGHTING | G_POINT_LIGHTING`; the directional control sets only
+`G_LIGHTING`, and the lighting-disabled control sets neither bit.
 
-The runner re-executes the admission policy embedded in its binary against a
-staged immutable manifest, verifies the exact consumed raw-window bytes against
-their descriptors, and emits no private path, digest, content, or native result
-identity. No local admitted characterization pair is currently available, so
-the suite has not produced a 2.06H/2.08I/2.08J behavioral result. This is
-mechanism readiness only; it does not certify point-light semantics or open
-production HLE admission.
+The runner calls the boot harness's typed in-process Rust loader. It
+revalidates the current characterization manifest, requires the supplied
+readiness bytes to exact-match the canonical derived report, and returns only
+the two fixed-size raw-window captures read and hashed through their one stable
+no-follow descriptor or Windows handle. Python is a producer and differential
+oracle only, not runner authority. The runner emits no private path, digest,
+content, or native result identity. No local admitted characterization pair is
+currently available, so the suite has not produced a 2.06H/2.08I/2.08J
+behavioral result. This is mechanism readiness only; it does not certify
+point-light semantics or open production HLE admission.
