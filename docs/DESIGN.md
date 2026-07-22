@@ -1013,20 +1013,33 @@ task calls out:
   screen mask. SplitMix64 is a reproducible host policy for reference digests,
   not a claim about the manual's unpublished silicon generator, seed, or exact
   cycle advancement.
-  The native RT64 path has one narrower exact-source overlay at the pinned MIT
-  revision. It applies public `G_AD_PATTERN`, `G_AD_NOTPATTERN`, and
-  `G_AD_NOISE` selection only to combiner alpha after alpha compare/coverage
+  The native RT64 path has a narrower exact-source overlay at the pinned MIT
+  revision. It creates one typed fragment-noise sample from one
+  `nextRandUint` result: combiner NOISE and `G_AC_DITHER` consume the same
+  low-24-bit unit float, while `G_AD_NOISE` consumes the low three bits. The
+  overlay applies the public `G_AD_PATTERN`, `G_AD_NOTPATTERN`, and
+  `G_AD_NOISE` selectors only to combiner alpha after alpha compare/coverage
   rejection and immediately before blending; `G_AC_DITHER` therefore remains
-  a separate earlier gate over the unmodified alpha. A clean pinned-Metal
-  synthetic raw-DPC fixture binds exact 16x16 RGBA16 Pattern, InversePattern,
-  Noise, and Disabled output digests, exact ordered 4x4 tiles, live Noise, and
-  same-context reproduction for the deterministic selectors. The overlay does
-  not alter shade, fog, or coverage alpha and does not repair RT64's
-  framebuffer-wide/deferred RGB-dither selection. RT64's separate combiner and
-  alpha-compare random draws also remain unchanged. No claim follows for the
-  hardware random generator, seed or advancement, ordered matrices or ties,
-  internal fixed-point precision, non-Metal APIs, MSAA, or representative
-  full-ROM reach.
+  a separate earlier decision over the unmodified alpha even though its Noise
+  selector shares the sample. The
+  existing clean pinned-Metal synthetic raw-DPC fixture binds exact 16x16
+  RGBA16 Pattern, InversePattern, Noise, and Disabled output digests, exact
+  ordered 4x4 tiles, live Noise, and same-context reproduction for the
+  deterministic selectors. A paired live combiner-NOISE/`G_AC_DITHER` phase
+  accepts exactly 146 pixels and every survivor is grayscale at or below the
+  primitive half-alpha cutoff, binding the shared route on pinned Metal. The
+  complete twelve-phase, seven-repeat transcript was identical in 10/10 fresh
+  native processes; its ordinary G_AC, shared control, and shared G_AC digests
+  are respectively `1493e7af74f80caff7a0c645b0f522ec347ce38a198237ab3cbd802394e0c793`,
+  `0268d9c2410c25067f144983829a5a091525f357e2981fc53f25e3d2c054da7f`,
+  and `70289db3267cb703e806ee9ba86635ec651aab0ec56f434db1cf7988cbb34251`.
+  The overlay does not alter shade, fog, or coverage alpha and does not repair
+  RT64's framebuffer-wide/deferred RGB-dither selection. The reference lane
+  instead exposes one full eight-bit sample to `G_AC_DITHER`; sharing topology
+  does not establish identical threshold quantization or native/reference
+  random-stream parity. No claim follows for the hardware random generator,
+  seed or advancement, ordered matrices or ties, internal fixed-point
+  precision, non-Metal APIs, MSAA, or representative full-ROM reach.
   VI is scheduled in this fabric rather than asserted after an executor ticker
   fires. Its 14-word raw register image is shared with typed MMIO;
   `VI_CURRENT` is derived from the programmed `VI_V_SYNC`: progressive output

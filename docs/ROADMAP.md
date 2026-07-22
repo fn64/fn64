@@ -852,14 +852,24 @@ and deterministic output traces.
   the selected ordered matrix. RGB and alpha Noise use the explicit seedable
   deterministic reference stream; its silicon identity remains unclaimed. The
   clean pinned native RT64 path additionally overlays combiner-alpha `G_AD`
-  after alpha compare/coverage rejection and before blending. Its synthetic
-  raw-DPC Metal gate binds exact 16x16 RGBA16 Pattern, InversePattern, Noise,
-  and Disabled digests, exact ordered 4x4 tiles, and live Noise without
-  conflating that selector with the separate `G_AC_DITHER` gate. This is a
-  bounded native slice: shade/fog/coverage alpha, RT64's
-  framebuffer-wide/deferred RGB dither, random routing/seed/advancement,
+  after alpha compare/coverage rejection and before blending. One typed
+  fragment-noise sample now routes a single `nextRandUint` result to combiner
+  NOISE and `G_AC_DITHER` as the same low-24-bit unit float and to `G_AD_NOISE`
+  through its low three bits. The existing synthetic raw-DPC Metal gate binds
+  exact 16x16 RGBA16 Pattern, InversePattern, Noise, and Disabled digests,
+  exact ordered 4x4 tiles, and live Noise without conflating `G_AD` with the
+  separate `G_AC_DITHER` decision. A paired live combiner-NOISE/
+  `G_AC_DITHER` phase accepts exactly 146 pixels, all grayscale and no brighter
+  than the primitive half-alpha cutoff, which binds the shared route on pinned
+  Metal. The complete twelve-phase, seven-repeat transcript, including exact
+  ordinary G_AC/shared-control/shared-G_AC digests, was identical in 10/10
+  fresh native processes. This is a bounded native slice: shade/fog/coverage
+  alpha, RT64's framebuffer-wide/deferred RGB dither, native/reference threshold
+  quantization and random-stream parity, generator seed/advancement,
   matrices/ties/internal precision, non-Metal/MSAA paths, representative
-  full-ROM reach, and silicon remain open. The disabled path retains truncation behavior rather
+  full-ROM reach, and silicon remain open. The reference lane's eight-bit
+  `G_AC_DITHER` threshold is not an exact-value oracle for RT64's unit-float
+  threshold. The disabled path retains truncation behavior rather
   than rounding. Exact
   microcode catalog population/subdivision/rounding remains a frontier. The
   hardware NOISE combiner source consumes the same typed eight-bit sample

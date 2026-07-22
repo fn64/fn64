@@ -29,7 +29,11 @@ const ALPHA_NOISE_SHA256: &str = "303ad447f114bab719b0504e9c4fcfbe48da869f4b82ef
 const ALPHA_DISABLED_SHA256: &str =
     "cd48436ead99c7e4d42d1a940855fee742c16396b4c32a1e2ab3f4518923ae6c";
 const AC_NONE_SHA256: &str = "82d4429f93a2052ee806eab29b7a256097e3675e1c14263a8fe05452e83c9978";
-const AC_DITHER_SHA256: &str = "b4988b892caa5f2856fb52765f1f0c72d9ba4719d508f31d9bf90d6d1ebbc14f";
+const AC_DITHER_SHA256: &str = "1493e7af74f80caff7a0c645b0f522ec347ce38a198237ab3cbd802394e0c793";
+const SHARED_NOISE_AC_NONE_SHA256: &str =
+    "0268d9c2410c25067f144983829a5a091525f357e2981fc53f25e3d2c054da7f";
+const SHARED_NOISE_AC_DITHER_SHA256: &str =
+    "70289db3267cb703e806ee9ba86635ec651aab0ec56f434db1cf7988cbb34251";
 
 #[derive(Clone, Copy, Debug)]
 struct Case {
@@ -39,6 +43,7 @@ struct Case {
     other_mode_low: u32,
     primitive: u32,
     blend_alpha: u8,
+    combiner_noise_rgb: bool,
 }
 
 fn push(commands: &mut Vec<(u32, u32)>, word0: u32, word1: u32) {
@@ -67,14 +72,23 @@ fn fixture(case: Case) -> (Vec<u8>, u32) {
     push(&mut commands, 0xe700_0000, 0);
 
     // Public gbi.h selector topology: RGB bits 6..7, alpha bits 4..5,
-    // alpha-compare bits 0..1. The combiner selects PRIMITIVE for RGBA.
+    // alpha-compare bits 0..1. The default combiner selects PRIMITIVE for
+    // RGBA; the correlated-noise cases replace only its RGB equation below.
     let other_mode_high = (case.rgb_dither << 6) | (case.alpha_dither << 4);
     push(
         &mut commands,
         0xef00_0000 | other_mode_high,
         case.other_mode_low,
     );
-    push(&mut commands, 0xfcff_ffff, 0xfffd_f6fb);
+    if case.combiner_noise_rgb {
+        // Public gsDPSetCombineLERP packing for one-cycle
+        // (NOISE - 0) * PRIMITIVE + 0 in RGB and PRIMITIVE alpha. This
+        // exposes the fragment's combiner-noise sample in the written RGB
+        // while leaving alpha comparison on a caller-selected constant.
+        push(&mut commands, 0xfc00_00e3, 0x08fc_01fb);
+    } else {
+        push(&mut commands, 0xfcff_ffff, 0xfffd_f6fb);
+    }
     push(&mut commands, 0xf900_0000, u32::from(case.blend_alpha));
     push(&mut commands, 0xfa00_0000, case.primitive);
     // One-cycle lower/right coordinates are exclusive.
@@ -185,6 +199,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         other_mode_low: 0,
         primitive: 0x0707_07ff,
         blend_alpha: 0,
+        combiner_noise_rgb: false,
     });
     let alpha_cases = [
         ("alpha-pattern", 0),
@@ -202,6 +217,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         other_mode_low: 0x0040_4040,
         primitive: 0xff00_007f,
         blend_alpha: 0,
+        combiner_noise_rgb: false,
     });
     let ac_dither = Case {
         label: "alpha-compare-dither",
@@ -210,17 +226,37 @@ fn main() -> Result<(), Box<dyn Error>> {
         other_mode_low: 3,
         primitive: 0x00f8_0080,
         blend_alpha: 0,
+        combiner_noise_rgb: false,
     };
     let ac_none = Case {
         label: "alpha-compare-none",
         other_mode_low: 0,
         ..ac_dither
     };
+    let shared_noise_ac_none = Case {
+        label: "shared-noise-alpha-compare-none",
+        rgb_dither: 3,
+        alpha_dither: 3,
+        other_mode_low: 0,
+        primitive: 0xffff_ff80,
+        blend_alpha: 0,
+        combiner_noise_rgb: true,
+    };
+    let shared_noise_ac_dither = Case {
+        label: "shared-noise-alpha-compare-dither",
+        other_mode_low: 3,
+        ..shared_noise_ac_none
+    };
 
     let cases = rgb_cases
         .into_iter()
         .chain(alpha_cases)
-        .chain([ac_none, ac_dither])
+        .chain([
+            ac_none,
+            ac_dither,
+            shared_noise_ac_none,
+            shared_noise_ac_dither,
+        ])
         .collect::<Vec<_>>();
     let mut observations = Vec::new();
     for case in cases {
@@ -373,13 +409,67 @@ fn main() -> Result<(), Box<dyn Error>> {
         .filter(|&&pixel| pixel == 0x07c1)
         .count();
     if ac_none_pixels != &vec![0x07c1; (WIDTH * HEIGHT) as usize]
-        || ac_passes != 146
+        || ac_passes != 123
         || ac_dither_pixels
             .iter()
             .any(|&pixel| pixel != BACKGROUND && pixel != 0x07c1)
     {
         return Err(io::Error::other(format!(
             "G_AC_DITHER lost exact none/dither control separation: passes={ac_passes}"
+        ))
+        .into());
+    }
+
+    let shared_none_pixels = by_label("shared-noise-alpha-compare-none");
+    let shared_dither_pixels = by_label("shared-noise-alpha-compare-dither");
+    require_digest(
+        "shared-noise-alpha-compare-none",
+        shared_none_pixels,
+        SHARED_NOISE_AC_NONE_SHA256,
+    )?;
+    require_digest(
+        "shared-noise-alpha-compare-dither",
+        shared_dither_pixels,
+        SHARED_NOISE_AC_DITHER_SHA256,
+    )?;
+    let shared_none_foreground = shared_none_pixels
+        .iter()
+        .copied()
+        .filter(|&pixel| pixel != BACKGROUND)
+        .collect::<Vec<_>>();
+    let shared_none_levels = shared_none_foreground
+        .iter()
+        .map(|pixel| pixel >> 11)
+        .collect::<std::collections::BTreeSet<_>>();
+    if shared_none_foreground.len() != (WIDTH * HEIGHT) as usize || shared_none_levels.len() < 16 {
+        return Err(io::Error::other(format!(
+            "combiner NOISE control stopped exposing a full live grayscale range: foreground={} levels={shared_none_levels:?} sha256={}",
+            shared_none_foreground.len(),
+            digest(shared_none_pixels)
+        ))
+        .into());
+    }
+    let mut shared_passes = 0usize;
+    let mut shared_route_violations = Vec::new();
+    for (index, &pixel) in shared_dither_pixels.iter().enumerate() {
+        if pixel == BACKGROUND {
+            continue;
+        }
+        shared_passes += 1;
+        let red = pixel >> 11;
+        let green = (pixel >> 6) & 0x1f;
+        let blue = (pixel >> 1) & 0x1f;
+        if red != green || red != blue || red > 16 {
+            shared_route_violations.push((index, pixel, red, green, blue));
+        }
+    }
+    if shared_passes != 146 || !shared_route_violations.is_empty() {
+        return Err(io::Error::other(format!(
+            "combiner NOISE and G_AC_DITHER did not route one shared fragment sample: passes={shared_passes} violations={} first={:?} none_sha256={} dither_sha256={}",
+            shared_route_violations.len(),
+            shared_route_violations.first(),
+            digest(shared_none_pixels),
+            digest(shared_dither_pixels)
         ))
         .into());
     }
@@ -397,7 +487,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
     println!(
-        "rdp_dither_evidence rgb_selectors=distinct-exact alpha_selectors=distinct-exact ac_dither_passes=146 phases={} repeats={} target=rgba16 source=synthetic-raw-dpc bounded_residual=no-silicon-or-reference-noise-parity",
+        "rdp_dither_evidence rgb_selectors=distinct-exact alpha_selectors=distinct-exact ac_dither_passes=123 shared_noise_ac_passes={shared_passes} phases={} repeats={} target=rgba16 source=synthetic-raw-dpc bounded_residual=no-silicon-generator-seed-ties-or-reference-noise-parity",
         observations.len(),
         repeat_labels.len()
     );
