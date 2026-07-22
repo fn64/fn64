@@ -20,6 +20,11 @@ v16 binds those recognition events in order with committed IMEM replacements
 and DRAM/XBUS DPC command digests. It rejects decreasing event cycles,
 decreasing global IMEM generations, a replacement that does not strictly
 advance the generation, or different digests assigned to one generation.
+Before graphics LLE entry, the backend-neutral classifier independently hashes
+the raw task text/data prefixes required by pinned MIT RT64's three F3DZEX2
+rows. One intersecting row supplies the diagnostic family; a contradictory
+backend pair label traps. This identity remains unadmitted to HLE and cannot
+satisfy a public-microcode matrix requirement.
 
 Matrix v5 does not trust the backend's family label for public-microcode
 credit. It independently adjudicates each reported text digest through the

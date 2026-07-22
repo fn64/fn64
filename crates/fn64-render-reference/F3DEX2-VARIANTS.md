@@ -61,7 +61,7 @@ wire, 64-entry cache, rejection policy, and raster handoff.
 
 ## 4. F3DZEX2 remains an explicit unsupported identity
 
-The allowed public Nintendo materials above do not specify an F3DZEX2 command
+The public Nintendo materials above do not specify an F3DZEX2 command
 envelope. Public
 [`gbi.h`](https://ultra64.ca/files/documentation/online-manuals/man/header/gbi.htm)
 defines the common `F3DEX_GBI_2` envelope but leaves `G_SPECIAL_1`,
@@ -69,10 +69,27 @@ defines the common `F3DEX_GBI_2` envelope but leaves `G_SPECIAL_1`,
 transports and recompiles RSP/game code; it does not define the proprietary
 continuation and branch command semantics needed to decode this family.
 
+Pinned MIT RT64 does publish a software-parity definition in
+`src/gbi/rt64_gbi_f3dzex2.cpp` and identifies three NoN variants in
+`src/gbi/rt64_gbi.cpp`: F3DZEX2 replaces opcode `0x04` with `BranchW` and the
+2.08I/J variants enable point lighting. That is an allowed RT64 parity source,
+not a Nintendo specification or hardware-exact oracle. fn64 binds those raw
+text/data fingerprints only to backend-neutral identity; it has not validated
+the family-specific operations independently, so HLE remains unadmitted.
+
 fn64 names `GeometryWireFamily::F3dzex2` and `UcodeId::F3dzex2` so the frontier
 cannot be mistaken for ordinary F3DEX2. Catalog admission, command decode, and
 state initialization all trap with the missing-evidence requirement. In
 particular, fn64 does not reinterpret a reserved `G_SPECIAL_*` opcode, alias an
 F3DZEX2 digest to F3DEX2, or claim support from game-era naming alone. Closing
-this boundary requires an allowed complete wire specification or a clean-room
-hardware/black-box trace that distinguishes the family-specific commands.
+the RT64-parity HLE boundary requires an independently tested implementation of
+the allowed pinned behavior definition. A hardware-exact or Nintendo-public
+claim separately requires hardware/black-box evidence or a public specification.
+
+The backend-neutral identity classifier hashes the larger raw task text/data
+prefixes with pinned RT64's XXH3 rows before rspboot or LLE mutates state. A
+matching intersection supplies `UcodeId::F3dzex2`; a contradictory backend
+pair label traps. This independently binds the family written to recognition
+evidence, but it is still software-parity identity rather than HLE admission.
+The task executes through the RSP interpreter, and the identity earns no
+public-microcode coverage credit.

@@ -668,6 +668,22 @@ mod tests {
     }
 
     #[test]
+    fn exact_pair_may_retain_f3dzex2_diagnostic_identity_without_hle_admission() {
+        let text = [0x7a; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let data = MicrocodeDataImageIdentity {
+            bytes: 8,
+            sha256: [0x44; 32],
+        };
+        let mut pairs = MicrocodePairCatalog::default();
+        pairs.admit(UcodeId::F3dzex2, Sha256::digest(text).into(), data);
+
+        assert_eq!(pairs.identify(&text, data), Some(UcodeId::F3dzex2));
+        assert!(GeometryUcodeCatalog::default()
+            .supported_ucodes()
+            .is_empty());
+    }
+
+    #[test]
     fn default_admission_methods_select_the_documented_modern_families() {
         let text = [0x21; fn64_runtime::RSP_MEMORY_BANK_SIZE];
         let mut geometry = GeometryUcodeCatalog::default();

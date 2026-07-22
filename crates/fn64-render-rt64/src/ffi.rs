@@ -3777,6 +3777,35 @@ mod tests {
     }
 
     #[test]
+    fn native_ucode_plan_keeps_f3dzex2_distinct_from_f3dex2() {
+        let generation = |family| fn64_render::TaskAdmissionGeneration {
+            source: fn64_render::TaskAdmissionSource::TaskEntry,
+            text_address: 0x1000,
+            data_address: 0x4000,
+            text_sha256: fn64_render::UcodeDigest::from_sha256([0x31; 32]),
+            data: fn64_render::MicrocodeDataImageIdentity {
+                bytes: 8,
+                sha256: [0x41; 32],
+            },
+            family,
+        };
+        let admission = |family| crate::Rt64TaskAdmission {
+            plan: fn64_render::TaskAdmissionPlan::new(generation(family), []),
+            raw_windows: vec![fn64_render::TaskAdmissionRawWindow {
+                text: vec![0x51; crate::RT64_GBI_TEXT_RECOGNITION_BYTES],
+                data: vec![0x61; crate::RT64_GBI_DATA_RECOGNITION_BYTES],
+            }]
+            .into_boxed_slice(),
+        };
+
+        let f3dex2 = PreparedUcodePlan::new(&admission(UcodeId::F3dex2)).unwrap();
+        let f3dzex2 = PreparedUcodePlan::new(&admission(UcodeId::F3dzex2)).unwrap();
+        assert_eq!(f3dex2.generations[0].expected_family, 5);
+        assert_eq!(f3dzex2.generations[0].expected_family, 9);
+        assert_ne!(f3dex2.plan_sha256, f3dzex2.plan_sha256);
+    }
+
+    #[test]
     fn vi_status_wire_preserves_every_typed_antialias_mode() {
         for (mode, bits) in [
             (fn64_render::ViAaMode::AaResampleAlways, 0),
