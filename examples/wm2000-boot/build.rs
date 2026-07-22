@@ -38,6 +38,94 @@ use std::path::PathBuf;
 #[path = "../../crates/fn64-boot-harness/build_support.rs"]
 mod build_support;
 
+/// Route the game's own linked libultra `osGetTime` (`func_80032570` --
+/// verbatim: `__osDisableInt`; `osGetCount`; 64-bit `base pair (0x800974E8/
+/// 0x800974EC) + (Count - lastCount @0x80088410)`; `__osRestoreInt`; return
+/// v0:v1 = hi:lo) to fn64's `osGetTime_recomp` virtual-clock shim, exactly as
+/// the corpus syms already route its sibling `osGetCount` (0x80037690 ->
+/// `osGetCount_recomp`). The corpus simply failed to identify this one
+/// libultra symbol.
+///
+/// Why this is load-bearing and faithful (2026-07 title-reveal rung): on
+/// hardware the OS counter interrupt (`__osTimeServices`) refreshes the
+/// osGetTime base pair every CP0 Count wrap; fn64 never runs a guest counter
+/// interrupt, so the unpatched guest implementation SAWTOOTHS -- time jumps
+/// back 91.6s (2^32 Count units) every 91.6s of virtual time. WM2000's
+/// per-frame sound tick (funcs_16, asm 0x800E2110..0x800E2200) converts
+/// osGetTime deltas to usec (`*64/0xBB8`) and then to a 60Hz frame count
+/// (`(delta+0x208D)/0x411A`, 64-bit unsigned): at each wrap the negative
+/// delta becomes a rate of ~0x5899xxxx (~1.49e9; verified numerically:
+/// `(2^64 - 91,625,968usec)/0x411A mod 2^32 = 0x589985B2` + observed real
+/// elapsed frames), the attract clock at 0x8009749C leaps ~25M units past
+/// every attract-script end time (probed live: clock 1544 ->
+/// 1,486,459,755 in one frame while script ends sit at 780..2440), and the
+/// attract fade scheduler (funcs_22 `func_8011DFCC`, 0x8011E0D4..0x8011E188)
+/// computes its master fade level as `(end - clock) << 8 / duration` --
+/// astronomically negative forever, which is exactly the observed
+/// never-lifting opaque-black + sawing-white full-screen covers that hid
+/// every attract scene (title screen included) in the presented frames.
+///
+/// The shared build_support preparer (Codex's reconciled fall-through mend +
+/// entry instrumentation) has already written each generated source into
+/// OUT_DIR as C++; this transform runs per prepared file alongside that
+/// pipeline, replacing the identified body wholesale (dropping only its
+/// self-referential entry observer, which is moot once the body is a pure
+/// tail-call into the Rust shim).
+fn patch_osgettime(source: &str) -> (String, usize) {
+    const HEADER: &str =
+        "RECOMP_FUNC void func_80032570(uint8_t* rdram, recomp_context* ctx) {";
+    let Some(start) = source.find(HEADER) else {
+        return (source.to_string(), 0);
+    };
+    let close_rel = source[start..]
+        .find("\n;}")
+        .expect("wm2000-boot build.rs: func_80032570 body has no `;}` close");
+    let end = start + close_rel + 3;
+    let mut out = String::with_capacity(source.len());
+    out.push_str(&source[..start]);
+    out.push_str(
+        "// fn64 libultra-identification patch (wm2000-boot build.rs): this function\n\
+         // is the game's linked libultra osGetTime, which the corpus syms failed to\n\
+         // name (its sibling osGetCount IS routed to osGetCount_recomp). The guest\n\
+         // implementation depends on the OS counter-interrupt time service that fn64\n\
+         // does not run, so it sawtooths at every CP0 Count wrap and poisons the\n\
+         // attract-mode clock -- see patch_osgettime's doc comment in build.rs.\n\
+         extern \"C\" void osGetTime_recomp(uint8_t* rdram, recomp_context* ctx);\n\
+         RECOMP_FUNC void func_80032570(uint8_t* rdram, recomp_context* ctx) {\n    \
+         osGetTime_recomp(rdram, ctx);\n    return;\n;}",
+    );
+    out.push_str(&source[end..]);
+    (out, 1)
+}
+
+/// Apply `patch_osgettime` to the prepared C++ sources the shared preparer
+/// wrote into OUT_DIR, rewriting the matched file in place. Asserts the
+/// libultra osGetTime body was matched exactly once (its unique definition is
+/// funcs_14.c) -- a silent miss re-opens the attract-clock poison documented
+/// on `patch_osgettime`.
+fn route_osgettime_in_prepared_sources(cxx_sources: &[PathBuf]) {
+    let mut osgettime_total = 0usize;
+    for path in cxx_sources {
+        let source = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("wm2000-boot build.rs: reading {}: {e}", path.display()));
+        let (patched, hits) = patch_osgettime(&source);
+        if hits > 0 {
+            std::fs::write(path, patched).unwrap_or_else(|e| {
+                panic!("wm2000-boot build.rs: writing {}: {e}", path.display())
+            });
+        }
+        osgettime_total += hits;
+    }
+    assert_eq!(
+        osgettime_total, 1,
+        "wm2000-boot build.rs: the osGetTime identification patch must match exactly one \
+         function body (func_80032570 in funcs_14.c) -- {osgettime_total} matched. Either the \
+         corpus was regenerated with osGetTime properly named (delete patch_osgettime) or the \
+         generated shape changed (fix it). A silent miss re-opens the attract-clock poison \
+         (see patch_osgettime's doc comment)."
+    );
+}
+
 fn required_env(name: &str, hint: &str) -> PathBuf {
     match env::var(name) {
         Ok(v) => PathBuf::from(v),
@@ -129,6 +217,11 @@ fn main() {
             &out_dir,
         );
     let c_file_count = cxx_sources.len();
+    // Graft the ladder-3 libultra osGetTime routing onto Codex's reconciled
+    // preparer output: rewrite the one prepared source whose body is the
+    // game's unidentified osGetTime so the attract clock reads fn64's virtual
+    // clock instead of sawtoothing (see patch_osgettime).
+    route_osgettime_in_prepared_sources(&cxx_sources);
     build.files(cxx_sources);
     println!(
         "cargo:warning=wm2000-boot: compiling {c_file_count} RecompiledFuncs/*.c files from {} \

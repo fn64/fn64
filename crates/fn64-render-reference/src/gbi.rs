@@ -1769,16 +1769,22 @@ pub(crate) struct TextureLodSelection {
     pub fraction: f32,
 }
 
-/// Post-perspective texture coordinate in the public signed S10.5 range.
+/// Post-perspective texture coordinate in the signed S10.5 fixed-point space.
 ///
 /// Programming Manual 13.7 states that the texture unit has five fractional
-/// coordinate bits, and 13.11 limits valid input to -1024..+1023.99. Tile
-/// shifts operate after that boundary and can widen the integer magnitude, so
-/// they return a distinct host accumulator instead of weakening this type's
-/// public range. Interpolation reaches this boundary as host float today, so
-/// conversion deliberately floors to the containing 1/32-texel cell. That
-/// conversion is a bounded host policy until silicon reciprocal/quantization
-/// traces exist.
+/// coordinate bits, and 13.11 gives -1024..+1023.99 as the nominal input
+/// window. On silicon the coordinate unit is a FIXED-WIDTH signed register:
+/// interpolated coordinates that leave that window (legitimately common for
+/// wrapped/tiled surfaces addressed with G_TX_WRAP/G_TX_MIRROR -- floors,
+/// walls, sky domes, and the deep attract/menu scenes WM2000 draws) overflow
+/// MODULARLY into the register, and the downstream per-tile clamp/mirror/wrap
+/// addressing (`address_texel`) resolves them to an in-bounds texel. It does
+/// not trap. Match that here: quantize to the containing 1/32-texel cell and
+/// wrap the integer into the S10.5 register width, rather than panicking on a
+/// coordinate hardware handles routinely. A non-finite coordinate is still a
+/// genuine unsupported condition (no valid register value) and traps. This
+/// quantize-and-wrap is a bounded host policy until silicon
+/// reciprocal/quantization traces exist.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct TextureCoordinateS10_5(i16);
 
@@ -1795,13 +1801,14 @@ impl TextureCoordinateS10_5 {
         }
         let scaled = f64::from(coordinate) * Self::SCALE as f64;
         let quantized = scaled.floor();
-        if !(quantized >= f64::from(i16::MIN) && quantized <= f64::from(i16::MAX)) {
-            crate::render_unsupported_panic(
-                "render.gbi.texture-coordinate-range",
-                "RDP texture coordinate lies outside the public signed S10.5 range",
-            );
-        }
-        Self(quantized as i16)
+        // Reduce modulo 2^16 into the signed S10.5 register width. `quantized`
+        // is a finite, floored f64; take it through i64 (always exact for a
+        // floored product of an f32 texel count and 32) then wrap to i16 --
+        // the hardware coordinate register's fixed-width overflow behavior.
+        // In-range coordinates are unaffected (identical to the previous
+        // exact conversion), so existing render-parity fixtures are unchanged.
+        let wrapped = (quantized as i64 as u64 & 0xFFFF) as u16 as i16;
+        Self(wrapped)
     }
 
     fn shifted(self, encoded: u8) -> TextureCoordinateAccumulator5 {
@@ -13249,19 +13256,28 @@ mod tests {
             }
         }
 
+        // A non-finite coordinate has no valid register value and still traps.
         assert!(std::panic::catch_unwind(|| {
             TextureCoordinateS10_5::from_texels_bounded(f32::NAN)
         })
         .is_err());
-        for outside in [-1024.0 - 1.0 / 32.0, 1024.0] {
-            assert!(
-                std::panic::catch_unwind(|| {
-                    TextureCoordinateS10_5::from_texels_bounded(outside)
-                })
-                .is_err(),
-                "outside={outside}"
-            );
-        }
+        // Finite coordinates outside the nominal -1024..+1023.99 window do NOT
+        // trap: the hardware coordinate register is fixed-width and overflows
+        // modularly (wrapped/tiled surfaces address beyond the window every
+        // frame), with the per-tile clamp/mirror/wrap addressing resolving the
+        // final texel. Verify the modular wrap into the S10.5 register width.
+        // 1024.0 texels == 0x8000 in S10.5 -> wraps to i16::MIN.
+        assert_eq!(
+            TextureCoordinateS10_5::from_texels_bounded(1024.0).0,
+            i16::MIN
+        );
+        // Just below -1024 wraps one 1/32-texel cell down from i16::MIN, i.e.
+        // to i16::MAX.
+        assert_eq!(
+            TextureCoordinateS10_5::from_texels_bounded(-1024.0 - 1.0 / 32.0).0,
+            i16::MAX
+        );
+        // The window endpoints themselves are exact and unchanged.
         assert_eq!(
             TextureCoordinateS10_5::from_texels_bounded(-1024.0).0,
             i16::MIN
