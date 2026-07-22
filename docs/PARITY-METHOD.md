@@ -74,9 +74,11 @@ The usable evidence stack is deliberately split:
 - Schema-v21 fixed-cycle device/framebuffer/audio/memory digests,
   boundary-owned observations, the compiled unsupported-instrumentation
   identity, and the bound zero-unsupported journal provide the release
-  authority mechanism. The representative schema-v20 runs are historical and
-  have not been rerun under v21, so no current full-ROM
-  zero-unsupported claim has been made.
+  authority mechanism. Representative private NTSC reference and RT64
+  LLE/post-VI exact-ten schema-v21 series completed and were independently
+  reverified on 2026-07-22 with zero unsupported events. Their current matrix
+  credits 9 of 162 requirements and retains the other 153 explicitly, so this
+  is two-scenario evidence rather than a complete full-ROM parity claim.
 
 The residual limitation is exact: structural PC equality cannot detect a
 wrong translation of a covered instruction, the focused semantic oracles do

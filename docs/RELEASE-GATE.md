@@ -554,9 +554,10 @@ Retained v21 validation requires every task address to name a complete 64-byte
 header inside physical 8 MiB RDRAM, every nonempty microcode-data and DRAM-DPC
 range to fit there, and every XBUS-DPC range to fit the 4 KiB DMEM bank.
 These mechanisms make a valid contract launchable. Representative private NTSC
-full-ROM exact-ten series for reference and RT64 LLE/post-VI completed and were
-reverified locally on 2026-07-21; those results close this orchestration path
-for two scenarios, not the remaining release-matrix denominator.
+full-ROM schema-v21 exact-ten series for reference and RT64 LLE/post-VI
+completed and were reverified locally on 2026-07-22. Those results close the
+current orchestration and evidence path for two scenarios, not the remaining
+release-matrix denominator.
 
 The current production loader specifically resolves and pins
 `/usr/bin/python3`; Windows production admission therefore remains fail-closed
@@ -990,25 +991,28 @@ cargo run -p fn64-boot-harness --bin verify-release-matrix -- \
 
 ## Current certification census
 
-As of this document revision, **no representative full-ROM class has a
-certified release matrix**. The exact state is:
+As of this document revision, **no complete representative full-ROM
+certification matrix exists**. Two current v21 representative scenarios carry
+verified-series credit inside the canonical incomplete assessment. The exact
+state is:
 
 | ROM/report class | Mechanism available | Certified evidence retained |
 | --- | --- | --- |
 | Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, a trusted exact-ten fresh-process runner and receipt, real executor/device/RSP/RDP/VI/reference-render boundaries, derived matrix coverage, and the canonical incomplete assessment are available. | Mechanism evidence only; synthetic bytes are not a ROM certification, and an incomplete assessment is not a retained verified matrix. |
-| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, a create-new receipt/source-wire producer, runner-staged exact ROM/microcode-pair admission, and same-event kickoff check exist. The v21 report additionally owns memory/audio/trace bytes at the boundary and binds the unsupported-instrumentation denominator. | The 2026-07-21 exact-ten series is schema-v20 historical evidence. It must be rerun under v21 before current release credit is claimed. |
-| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, resolved graphics-API and TV-standard evidence, explicit program identity, and runner-staged exact ROM/microcode-pair admission exist. | The 2026-07-21 pinned-Metal exact-ten series is schema-v20 historical evidence. It must be rerun under v21 before current release credit is claimed. |
+| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, a create-new receipt/source-wire producer, runner-staged exact ROM/microcode-pair admission, and same-event kickoff check exist. The v21 report additionally owns memory/audio/trace bytes at the boundary and binds the unsupported-instrumentation denominator. | Ten fresh schema-v21 processes completed and reverified on 2026-07-22 at cycle `722368695`; the retained private receipt binds their exact semantic report and ten run identities. |
+| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, resolved graphics-API and TV-standard evidence, explicit program identity, and runner-staged exact ROM/microcode-pair admission exist. | Ten fresh pinned-Metal schema-v21 processes completed and reverified on 2026-07-22 at cycle `722368695`; the retained private receipt binds their exact semantic report and ten run identities. |
 | OoT NTSC 1.0, legacy C lane | Observation tooling and exact linked-archive identity wiring exist. | Non-authoritative: measured framebuffer parity is only claimed through swap 60, and the C oracle's missing bodies prevent deeper arbitration beyond the known swap-231 frontier. |
 | Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v21-visible fixed TV region, save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, program-lane, committed RSP/RDP-mechanism, and authoritative platform/API assignments while retaining the remaining project-owned profile entries as missing. Backend microcode labels are diagnostic only; independent public-microcode adjudication uses the empty project-owned catalog v1. Generic report verification deliberately cannot turn the retained ROM-class label into profile credit; the separate private-series path revalidates its contract, receipt, exact output files, raw ROM, and runner before retaining `fn64.verified-rom-class-authority.v1`. RT64 target-case credit additionally requires the opaque platform-series capability, for which phase one has no production constructor. | No public-microcode requirement can be credited until allowed-source identities populate a successor catalog; regional and additional save/controller/render scenarios, positive native Windows evidence, and production platform-case authority remain unsupplied. |
 
-Historical schema-v20 joint verification over the two representative NTSC
+Current schema-v21 joint verification over the two representative NTSC
 scenarios revalidated 20 reports and satisfied exactly 9 of 162 FullParityV1
 requirements: `retail_cartridge`, `ntsc`,
 `typed_observed_function/reference_lle_accuracy`,
 `typed_observed_function/rt64_lle_accuracy`, `sram_32_kib`,
 `standard_controller`, `dram-dpc`, `imem-replacement`, and `macos-metal`.
-The other 153 remained explicit in that historical incomplete assessment;
-schema-v21 has not yet been run on those private inputs.
+The other 153 remain explicit in incomplete assessment v6. The retained
+private manifest and assessment bind their exact identities, and all reports
+bind the current `fn64.unsupported-instrumentation.v1` denominator.
 
 Therefore the generic report mechanism can validate multi-ROM
 zero-reached-unsupported evidence and retain its satisfied/missing profile
@@ -1023,9 +1027,8 @@ The exact program-input identity-co-binding and runtime microcode-pair kickoff
 identity blockers are closed by the typed receipt plus the same-event
 microcode text/data check. Trusted evidence that the child was compiled or
 linked from those inputs remains open; the receipt alone is not build
-attestation. The remaining evidence frontier is to feed the retained
-representative series through the verified-series matrix path, add the other
-required private exact-ten scenarios, and satisfy the still-missing
+attestation. The remaining evidence frontier is to add the other required
+private exact-ten scenarios and satisfy the still-missing
 public-microcode-catalog, positive Windows, platform-case, and blocker-result
 classes.
 
