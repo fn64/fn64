@@ -211,4 +211,21 @@ fn c_caller_links_and_runs_against_fn64_abi_staticlib() {
             String::from_utf8_lossy(&bad_width.stderr)
         );
     }
+    for argument in ["--bad-unaligned-word-read", "--bad-unaligned-half-write"] {
+        let unaligned = Command::new(&proxy_bin)
+            .arg(argument)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("failed to execute {:?} {argument}: {error}", proxy_bin)
+            });
+        assert!(
+            !unaligned.status.success(),
+            "generated-C {argument} must trap before dereferencing host storage"
+        );
+        assert!(
+            String::from_utf8_lossy(&unaligned.stderr).contains("unaligned guest address"),
+            "generated-C {argument} trap lost its alignment diagnostic: {}",
+            String::from_utf8_lossy(&unaligned.stderr)
+        );
+    }
 }

@@ -15,6 +15,13 @@ pub unsafe extern "C" fn osCreateMesgQueue_recomp(_rdram: *mut u8, ctx: *mut Rec
     let ctx = unsafe { &*ctx };
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
     let count = ctx.r6 as usize;
+    if std::env::var("FN64_DEBUG_BOOT").is_ok() {
+        let tid = ACTIVE_THREAD_ID.with(|c| c.get());
+        eprintln!(
+            "[DEBUG osCreateMesgQueue] thread={tid:?} mq={:#x} count={count}",
+            mq_addr.offset()
+        );
+    }
     with_executor(|exec| exec.create_mesg_queue(mq_addr, count.max(1)));
 }
 
@@ -172,6 +179,13 @@ pub unsafe extern "C" fn osSetEventMesg_recomp(_rdram: *mut u8, ctx: *mut Recomp
     let event = ctx.r4 as u32;
     let mq_addr = RdramAddr::from_gpr(ctx.r5);
     let msg: Mesg = ctx.r6 as u32;
+    if std::env::var("FN64_DEBUG_BOOT").is_ok() {
+        let tid = ACTIVE_THREAD_ID.with(|c| c.get());
+        eprintln!(
+            "[DEBUG osSetEventMesg] thread={tid:?} event={event} mq={:#x} msg={msg:#x}",
+            mq_addr.offset()
+        );
+    }
     with_executor(|exec| exec.set_event_mesg(event, mq_addr, msg));
 }
 
@@ -602,6 +616,77 @@ mod tests {
         let marker_b_has_a =
             unsafe { std::ptr::read(rdram_b_ptr.add(0x30) as *const u32) } == 0xA0A0_A0A0u32;
         assert!(!marker_a_has_b && !marker_b_has_a);
+    }
+
+    /// End-to-end pin of the WM2000 (NWXE) grant-crossover fix: when TWO
+    /// threads block in `osRecvMesg` on the SAME queue, a send must wake the
+    /// HIGHER-priority waiter, even though the lower-priority one parked
+    /// first. This is libultra's real semantics (`__osEnqueueThread` keeps
+    /// `mq->mtqueue` priority-sorted; `osSendMesg` pops the head), and
+    /// WM2000's boot depends on it: gfx runner (thread 17, pri 0x64) and
+    /// audio runner (thread 18, pri 0x6E) share one OS_EVENT_SP done queue
+    /// (rdram 0x52320), and the audio runner's osSpTaskYield handshake
+    /// (funcs_0.c `func_80001024`) assumes every SP-done arriving while both
+    /// are parked goes to IT first. Arrival-FIFO handed the audio task's
+    /// done to the longer-parked gfx runner -- the crossover that froze boot
+    /// at 3 gfx frames / 9307 audio tasks.
+    #[test]
+    fn send_wakes_highest_priority_receiver_not_first_arrived() {
+        let mq_vram: u64 = 0xFFFF_FFFF_800E_0000;
+        let mq_addr = RdramAddr::from_gpr(mq_vram);
+        let mut create_ctx = ctx_with(mq_vram, 0, 8);
+        unsafe { osCreateMesgQueue_recomp(std::ptr::null_mut(), &mut create_ctx as *mut _) };
+
+        let got_gfx = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let got_gfx2 = got_gfx.clone();
+        let got_audio = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let got_audio2 = got_audio.clone();
+
+        // Mirror the deadlock's park order and priorities: the LOWER-pri
+        // "gfx runner" parks FIRST, the HIGHER-pri "audio runner" second.
+        spawn_test_thread(17, 0x64, move || {
+            let mut recv_ctx = ctx_with(mq_vram, 0, OS_MESG_BLOCK);
+            unsafe { osRecvMesg_recomp(std::ptr::null_mut(), &mut recv_ctx as *mut _) };
+            *got_gfx2.borrow_mut() = Some(());
+        });
+        run_one_step(); // 17 parks
+        spawn_test_thread(18, 0x6E, move || {
+            let mut recv_ctx = ctx_with(mq_vram, 0, OS_MESG_BLOCK);
+            unsafe { osRecvMesg_recomp(std::ptr::null_mut(), &mut recv_ctx as *mut _) };
+            *got_audio2.borrow_mut() = Some(());
+        });
+        run_one_step(); // 18 parks (later, but higher priority)
+
+        // One message: the "SP done". It must wake thread 18, not 17.
+        with_executor(|exec| {
+            assert_eq!(
+                exec.send_mesg(999, mq_addr, 0x29B, false),
+                SendMesgOutcome::Delivered
+            );
+        });
+        run_to_idle_with_yielder_plumbing();
+
+        assert!(
+            got_audio.borrow().is_some(),
+            "the higher-priority waiter (audio runner) must receive the SP-done \
+             even though it parked after the gfx runner"
+        );
+        assert!(
+            got_gfx.borrow().is_none(),
+            "the lower-priority, earlier-parked waiter must still be blocked -- \
+             waking it instead is exactly the WM2000 grant crossover"
+        );
+
+        // Release the still-parked thread 17 so the test tears down with no
+        // suspended coroutine (dropping one aborts the test process).
+        with_executor(|exec| {
+            assert_eq!(
+                exec.send_mesg(999, mq_addr, 0x29B, false),
+                SendMesgOutcome::Delivered
+            );
+        });
+        run_to_idle_with_yielder_plumbing();
+        assert!(got_gfx.borrow().is_some());
     }
 
     /// osJamMesg front-inserts (jammesg.c) and returns 0 on enqueue -- it must

@@ -360,7 +360,8 @@ impl Executor {
         let mut waiters = HashSet::new();
         for queue in self.queues.values() {
             let snapshot = queue.evidence_snapshot();
-            for id in snapshot.blocked_receivers {
+            for blocked in snapshot.blocked_receivers {
+                let id = blocked.id;
                 let Some(thread) = self.threads.get(&id) else {
                     return Err(ExecutorControlInvariantError::WaiterUnknownThread(id));
                 };
@@ -1167,9 +1168,8 @@ impl Executor {
 
     /// Shared delivery logic for both a guest `osSendMesg` and an external
     /// post (`inject_event`/`advance_time`): try a non-blocking send; if a
-    /// receiver is already blocked, wake exactly one (FIFO, per
-    /// `docs/DESIGN.md`'s "FIFO per-queue delivery" -- libultra's own
-    /// documented per-queue order) and hand it the message directly rather
+    /// receiver is already blocked, wake exactly one in libultra waiter order
+    /// (highest priority first, FIFO among ties) and hand it the message directly rather
     /// than routing it back through the ring buffer, matching the
     /// documented `osRecvMesg`/`osSendMesg` handoff shape. If the queue is
     /// full and nothing can be done, the message is dropped -- this is the
@@ -1483,6 +1483,20 @@ impl Executor {
                     self.running = None;
                 }
             }
+            Yield::StopSelf => {
+                // Generated-C pause_self has no guest loop-back continuation.
+                // Parking here closes the interleaving where an assert-hang
+                // resumed at the following host statement and corrupted state.
+                self.remove_thread_from_waiters(id);
+                if let Some(thread) = self.threads.get_mut(&id) {
+                    thread.set_state(ThreadState::Stopped);
+                }
+                self.run_queue.retain(|thread| *thread != id);
+                self.pending_resume.remove(&id);
+                if self.running == Some(id) {
+                    self.running = None;
+                }
+            }
             Yield::InstructionCheckpoint { instructions } => {
                 assert!(
                     instructions > 0,
@@ -1526,7 +1540,10 @@ impl Executor {
                             thread.set_state(ThreadState::BlockedOnRecv);
                         }
                         self.record_queue_op(mq_addr, QueueOpKind::Block, id);
-                        self.queue_mut(mq_addr).block_receiver(id);
+                        // libultra inserts waiters by descending priority;
+                        // stable equal priorities preserve arrival order.
+                        let priority = self.thread_pri(id);
+                        self.queue_mut(mq_addr).block_receiver(id, priority);
                     }
                     RecvOutcome::Blocked => {
                         // OS_MESG_NOBLOCK on an empty queue: never parked,
@@ -1579,7 +1596,11 @@ impl Executor {
                             thread.set_state(ThreadState::BlockedOnSend);
                         }
                         self.record_queue_op(mq_addr, QueueOpKind::Block, id);
-                        self.queue_mut(mq_addr).block_sender(id, msg, placement);
+                        // Capture priority at the park boundary, matching the
+                        // ordering rule used for blocked receivers above.
+                        let priority = self.thread_pri(id);
+                        self.queue_mut(mq_addr)
+                            .block_sender(id, priority, msg, placement);
                     }
                     SendOutcome::Blocked => {
                         // OS_MESG_NOBLOCK on a full queue: dropped, never
@@ -2178,7 +2199,7 @@ mod tests {
         let queue = RdramAddr::from_offset(0x100);
         wrong_waiter_state.create_mesg_queue(queue, 1);
         wrong_waiter_state.create_thread(2, 1, |_yielder, _resume| {});
-        wrong_waiter_state.queue_mut(queue).block_receiver(2);
+        wrong_waiter_state.queue_mut(queue).block_receiver(2, 1);
         assert_eq!(
             wrong_waiter_state.validate_control_evidence_invariants(),
             Err(ExecutorControlInvariantError::ReceiverWaiterStateMismatch(

@@ -1297,7 +1297,9 @@ pub struct MesgQueue {
   on the single executor thread, with no other coroutine able to observe or
   mutate the queue in between (nothing else is running).
 - **Blocked operation identity and lifecycle.** A blocked sender retains a
-  typed head/tail placement with its thread and message, so a delayed
+  typed head/tail placement with its thread, block-time priority, and message;
+  blocked receivers likewise retain block-time priority. Waiters wake in
+  descending priority with FIFO ties, so a delayed
   `osJamMesg` commit cannot become an ordinary tail `osSendMesg` when another
   thread frees space. `osStopThread` and `osDestroyThread` sweep every queue's
   sender and receiver roles before changing thread state. Thus the later
@@ -1748,7 +1750,8 @@ body identity for the legacy C archive.
 `Executor::control_evidence_snapshot` supplies the owner-local scheduler
 projection for the same aggregate: RDRAM registration presence and length
 (never its host pointer), canonical thread/queue/event maps, exact runnable and
-waiter FIFO order, pending resume payloads, stable timer firing/tie order, the
+waiter priority/FIFO-tie order (including each cached block-time priority),
+pending resume payloads, stable timer firing/tie order, the
 active run-token owner, virtual time, and CP0 Count/Compare/IP7 state. Snapshot
 construction first validates that runnable IDs are unique and match runnable
 thread state, queue waiters match blocked state, and pending resumes belong to

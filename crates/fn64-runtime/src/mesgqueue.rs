@@ -30,26 +30,50 @@ pub type CoroutineId = crate::trace::ThreadId;
 /// meaning.
 pub type Mesg = u32;
 
+/// Priority captured when a thread joins a libultra message-queue wait list.
+pub type WaiterPriority = i32;
+
+/// `__osEnqueueThread` inserts before the first strictly lower-priority
+/// waiter and after equal-priority waiters. The head is therefore the
+/// highest-priority waiter, with FIFO ordering only among ties.
+fn priority_insert_index<T>(
+    waiters: &[T],
+    priority: impl Fn(&T) -> WaiterPriority,
+    incoming: WaiterPriority,
+) -> usize {
+    waiters
+        .iter()
+        .position(|waiter| priority(waiter) < incoming)
+        .unwrap_or(waiters.len())
+}
+
 /// The blocked-list a queue's `blocked_on_recv`/`blocked_on_send` fields
 /// represent. Deliberately NOT a raw pointer or sentinel value — see the
 /// module doc above for why that shape (the real ROM's own struct layout,
 /// mirrored by a raw host pointer) was the rung-12 failure mode.
+///
+/// Waiters are priority-ordered, not arrival-ordered. This is load-bearing
+/// for WM2000: its graphics and higher-priority audio runners can both wait
+/// on the shared SP-event queue, and the audio yield handshake must receive
+/// the next completion before the lower-priority graphics runner.
 #[derive(Default)]
 struct BlockedList {
-    waiters: Vec<CoroutineId>,
+    waiters: Vec<BlockedReceiverEvidenceSnapshot>,
 }
 
 impl BlockedList {
-    fn push(&mut self, id: CoroutineId) {
-        self.waiters.push(id);
+    fn push(&mut self, id: CoroutineId, priority: WaiterPriority) {
+        let index = priority_insert_index(&self.waiters, |waiter| waiter.priority, priority);
+        self.waiters
+            .insert(index, BlockedReceiverEvidenceSnapshot { id, priority });
     }
 
-    /// FIFO pop, matching libultra's documented per-queue delivery order.
+    /// Pop the highest-priority waiter; arrival order breaks priority ties.
     fn pop(&mut self) -> Option<CoroutineId> {
         if self.waiters.is_empty() {
             None
         } else {
-            Some(self.waiters.remove(0))
+            Some(self.waiters.remove(0).id)
         }
     }
 
@@ -59,7 +83,7 @@ impl BlockedList {
 
     fn remove(&mut self, id: CoroutineId) -> usize {
         let before = self.waiters.len();
-        self.waiters.retain(|waiter| *waiter != id);
+        self.waiters.retain(|waiter| waiter.id != id);
         before - self.waiters.len()
     }
 }
@@ -74,13 +98,20 @@ pub enum SendPlacement {
     Head,
 }
 
-/// One blocked sender in the exact FIFO order in which a freed queue slot
-/// will service it. The placement is part of the suspended operation:
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BlockedReceiverEvidenceSnapshot {
+    pub id: CoroutineId,
+    pub priority: WaiterPriority,
+}
+
+/// One blocked sender in the exact priority/FIFO-tie order in which a freed
+/// queue slot will service it. The placement is part of the suspended operation:
 /// omitting it would make `osJamMesg` and `osSendMesg` evidence-identical
 /// even though their next successful delivery changes the queue differently.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BlockedSenderEvidenceSnapshot {
     pub id: CoroutineId,
+    pub priority: WaiterPriority,
     pub msg: Mesg,
     pub placement: SendPlacement,
 }
@@ -96,7 +127,7 @@ pub struct MesgQueueEvidenceSnapshot {
     pub capacity: u64,
     pub first: u64,
     pub messages: Vec<Mesg>,
-    pub blocked_receivers: Vec<CoroutineId>,
+    pub blocked_receivers: Vec<BlockedReceiverEvidenceSnapshot>,
     pub blocked_senders: Vec<BlockedSenderEvidenceSnapshot>,
 }
 
@@ -124,11 +155,12 @@ impl MesgQueueActivity {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct BlockedSend {
     id: CoroutineId,
+    priority: WaiterPriority,
     msg: Mesg,
     placement: SendPlacement,
 }
 
-/// Same FIFO shape as `BlockedList`, but for blocked SENDERS: a blocked
+/// Same priority-ordered shape as `BlockedList`, but for blocked SENDERS: a blocked
 /// sender is waiting to hand off a specific `Mesg` payload, not just an
 /// identity, so the queue must remember what to actually enqueue once a
 /// slot frees. Fixes a real bug this session's OoT boot run hit: the
@@ -148,11 +180,26 @@ struct BlockedSenderList {
 }
 
 impl BlockedSenderList {
-    fn push(&mut self, id: CoroutineId, msg: Mesg, placement: SendPlacement) {
-        self.waiters.push(BlockedSend { id, msg, placement });
+    fn push(
+        &mut self,
+        id: CoroutineId,
+        priority: WaiterPriority,
+        msg: Mesg,
+        placement: SendPlacement,
+    ) {
+        let index = priority_insert_index(&self.waiters, |waiter| waiter.priority, priority);
+        self.waiters.insert(
+            index,
+            BlockedSend {
+                id,
+                priority,
+                msg,
+                placement,
+            },
+        );
     }
 
-    /// FIFO pop, matching libultra's documented per-queue delivery order.
+    /// Pop the highest-priority waiter; arrival order breaks priority ties.
     fn pop(&mut self) -> Option<BlockedSend> {
         if self.waiters.is_empty() {
             None
@@ -285,6 +332,7 @@ impl MesgQueue {
                 .iter()
                 .map(|blocked| BlockedSenderEvidenceSnapshot {
                     id: blocked.id,
+                    priority: blocked.priority,
                     msg: blocked.msg,
                     placement: blocked.placement,
                 })
@@ -361,12 +409,18 @@ impl MesgQueue {
     /// executor -- see module doc: registration and yield are sequential
     /// steps on the one executor thread, never two threads racing this
     /// list.
-    pub fn block_sender(&mut self, id: CoroutineId, msg: Mesg, placement: SendPlacement) {
-        self.blocked_on_send.push(id, msg, placement);
+    pub fn block_sender(
+        &mut self,
+        id: CoroutineId,
+        priority: WaiterPriority,
+        msg: Mesg,
+        placement: SendPlacement,
+    ) {
+        self.blocked_on_send.push(id, priority, msg, placement);
     }
 
-    pub fn block_receiver(&mut self, id: CoroutineId) {
-        self.blocked_on_recv.push(id);
+    pub fn block_receiver(&mut self, id: CoroutineId, priority: WaiterPriority) {
+        self.blocked_on_recv.push(id, priority);
     }
 
     /// Remove `id` from every waiter role owned by this queue. Thread
@@ -454,7 +508,7 @@ mod tests {
         let mut q = MesgQueue::new(1);
         assert_eq!(q.try_send(1), SendResult::Delivered);
         assert_eq!(q.try_send(2), SendResult::WouldBlock);
-        q.block_sender(42, 2, SendPlacement::Tail);
+        q.block_sender(42, 10, 2, SendPlacement::Tail);
         assert!(q.has_blocked_senders());
 
         // Executor's job: a recv frees a slot, then wake a blocked sender.
@@ -484,6 +538,25 @@ mod tests {
         assert_eq!(full.try_jam(2), SendResult::WouldBlock);
     }
 
+    #[test]
+    fn blocked_waiters_wake_by_priority_with_fifo_ties() {
+        let mut queue = MesgQueue::new(1);
+        queue.block_receiver(17, 0x64);
+        queue.block_receiver(18, 0x6e);
+        queue.block_receiver(19, 0x6e);
+        assert_eq!(queue.wake_one_receiver(), Some(18));
+        assert_eq!(queue.wake_one_receiver(), Some(19));
+        assert_eq!(queue.wake_one_receiver(), Some(17));
+
+        assert_eq!(queue.try_send(0xaa), SendResult::Delivered);
+        queue.block_sender(40, 5, 0x1111, SendPlacement::Tail);
+        queue.block_sender(41, 20, 0x2222, SendPlacement::Head);
+        assert_eq!(queue.try_recv(), RecvResult::Delivered(0xaa));
+        assert_eq!(queue.wake_one_sender(), Some(41));
+        assert_eq!(queue.try_recv(), RecvResult::Delivered(0x2222));
+        assert_eq!(queue.wake_one_sender(), Some(40));
+    }
+
     /// The bug this session's OoT boot run actually hit: a blocked
     /// sender's message must be REALLY delivered into the queue, not just
     /// have its coroutine woken -- a later recv must see it, not stale/
@@ -493,7 +566,7 @@ mod tests {
         let mut q = MesgQueue::new(1);
         assert_eq!(q.try_send(0xAAAA), SendResult::Delivered);
         assert_eq!(q.try_send(0xBBBB), SendResult::WouldBlock);
-        q.block_sender(7, 0xBBBB, SendPlacement::Tail);
+        q.block_sender(7, 10, 0xBBBB, SendPlacement::Tail);
 
         // First recv drains the original message and wakes the blocked
         // sender, which must land ITS message (0xBBBB) into the queue.
@@ -516,7 +589,7 @@ mod tests {
         assert_eq!(q.try_send(0xAAAA), SendResult::Delivered);
         assert_eq!(q.try_send(0xBBBB), SendResult::Delivered);
         assert_eq!(q.try_jam(0xCCCC), SendResult::WouldBlock);
-        q.block_sender(7, 0xCCCC, SendPlacement::Head);
+        q.block_sender(7, 10, 0xCCCC, SendPlacement::Head);
 
         assert_eq!(q.try_recv(), RecvResult::Delivered(0xAAAA));
         assert_eq!(q.wake_one_sender(), Some(7));
@@ -527,10 +600,10 @@ mod tests {
     #[test]
     fn remove_waiter_clears_every_role_and_every_duplicate() {
         let mut q = MesgQueue::new(1);
-        q.block_receiver(9);
-        q.block_receiver(9);
-        q.block_sender(9, 1, SendPlacement::Tail);
-        q.block_sender(9, 2, SendPlacement::Head);
+        q.block_receiver(9, 10);
+        q.block_receiver(9, 10);
+        q.block_sender(9, 10, 1, SendPlacement::Tail);
+        q.block_sender(9, 10, 2, SendPlacement::Head);
 
         assert_eq!(
             q.remove_waiter(9),
@@ -546,16 +619,16 @@ mod tests {
     }
 
     #[test]
-    fn evidence_snapshot_uses_logical_ring_and_exact_waiter_fifo() {
+    fn evidence_snapshot_uses_logical_ring_and_exact_waiter_order() {
         let mut q = MesgQueue::new(3);
         assert_eq!(q.try_send(0x11), SendResult::Delivered);
         assert_eq!(q.try_send(0x22), SendResult::Delivered);
         assert_eq!(q.try_recv(), RecvResult::Delivered(0x11));
         assert_eq!(q.try_send(0x33), SendResult::Delivered);
-        q.block_receiver(7);
-        q.block_receiver(8);
-        q.block_sender(9, 0x44, SendPlacement::Head);
-        q.block_sender(10, 0x55, SendPlacement::Tail);
+        q.block_receiver(7, 20);
+        q.block_receiver(8, 10);
+        q.block_sender(9, 20, 0x44, SendPlacement::Head);
+        q.block_sender(10, 10, 0x55, SendPlacement::Tail);
 
         assert_eq!(
             q.evidence_snapshot(),
@@ -563,15 +636,26 @@ mod tests {
                 capacity: 3,
                 first: 1,
                 messages: vec![0x22, 0x33],
-                blocked_receivers: vec![7, 8],
+                blocked_receivers: vec![
+                    BlockedReceiverEvidenceSnapshot {
+                        id: 7,
+                        priority: 20
+                    },
+                    BlockedReceiverEvidenceSnapshot {
+                        id: 8,
+                        priority: 10
+                    },
+                ],
                 blocked_senders: vec![
                     BlockedSenderEvidenceSnapshot {
                         id: 9,
+                        priority: 20,
                         msg: 0x44,
                         placement: SendPlacement::Head,
                     },
                     BlockedSenderEvidenceSnapshot {
                         id: 10,
+                        priority: 10,
                         msg: 0x55,
                         placement: SendPlacement::Tail,
                     },

@@ -1728,6 +1728,9 @@ fn derive_live_closure(inputs: LiveClosureInputs<'_>) -> Result<Vec<ClosurePath>
                 task_kind: TaskKind::Audio,
                 ..
             } => Some("rsp.audio-task"),
+            // Registration is configuration, not proof that a queue or
+            // device event was exercised.
+            TraceKind::EventMesg { .. } => None,
         };
         if let Some(path) = path {
             closure.observe_supported(path)?;
@@ -3500,12 +3503,14 @@ fn encode_executor_control(
             push_u32(out, message);
         }
         push_u64(out, queue.queue.blocked_receivers.len() as u64);
-        for thread in queue.queue.blocked_receivers {
-            push_u32(out, thread);
+        for receiver in queue.queue.blocked_receivers {
+            push_u32(out, receiver.id);
+            push_u32(out, receiver.priority as u32);
         }
         push_u64(out, queue.queue.blocked_senders.len() as u64);
         for sender in queue.queue.blocked_senders {
             push_u32(out, sender.id);
+            push_u32(out, sender.priority as u32);
             push_u32(out, sender.msg);
             out.push(match sender.placement {
                 fn64_runtime::SendPlacement::Tail => 0,
@@ -3987,6 +3992,7 @@ fn encode_timing_trace(events: &[TraceEvent]) -> Vec<u8> {
                     QueueOpKind::Recv => 1,
                     QueueOpKind::Block => 2,
                     QueueOpKind::Wake => 3,
+                    QueueOpKind::Drop => 4,
                 });
                 push_u32(&mut out, thread);
             }
@@ -4012,6 +4018,16 @@ fn encode_timing_trace(events: &[TraceEvent]) -> Vec<u8> {
                     TaskKind::Audio => 1,
                 });
                 push_u32(&mut out, ucode);
+            }
+            TraceKind::EventMesg {
+                event,
+                queue,
+                thread,
+            } => {
+                out.push(4);
+                push_u32(&mut out, event);
+                push_u32(&mut out, queue.offset());
+                push_u32(&mut out, thread);
             }
         }
     }
@@ -6018,7 +6034,10 @@ mod tests {
                         capacity: 2,
                         first: 1,
                         messages: vec![0x55],
-                        blocked_receivers: vec![7],
+                        blocked_receivers: vec![fn64_runtime::BlockedReceiverEvidenceSnapshot {
+                            id: 7,
+                            priority: -2,
+                        }],
                         blocked_senders: Vec::new(),
                     },
                 });

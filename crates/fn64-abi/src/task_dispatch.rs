@@ -803,29 +803,22 @@ impl RenderEnvironmentEvidenceSnapshot {
     }
 }
 
-unsafe fn commit_rsp_rdram_image(rdram: *mut u8, rdram_image: &[u8]) {
-    let mut changed = false;
-    for offset in (0..rdram_image.len()).step_by(4) {
-        let width = (rdram_image.len() - offset).min(4);
-        let old = unsafe { std::slice::from_raw_parts(rdram.add(offset), width) };
-        if old != &rdram_image[offset..offset + width] {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    rdram_image.as_ptr().add(offset),
-                    rdram.add(offset),
-                    width,
-                );
-            }
-            #[cfg(feature = "recomp-rs")]
-            fn64_recomp_rs::notify_guest_write(offset as u32, width as u32);
-            changed = true;
-        }
+/// Publish the RSP core's guest-visible RDRAM effects after direct execution.
+/// The bytes are already in the live allocation; only recompiler bookkeeping
+/// and executable-page invalidation remain.
+#[cfg(feature = "recomp-rs")]
+fn commit_rsp_rdram_writes(written: &[(usize, usize)]) {
+    if written.is_empty() {
+        return;
     }
-    if changed {
-        #[cfg(feature = "recomp-rs")]
-        crate::recompiled::process_live_executable_writes_from_host();
+    for &(start, end) in written {
+        fn64_recomp_rs::notify_guest_write(start as u32, (end - start) as u32);
     }
+    crate::recompiled::process_live_executable_writes_from_host();
 }
+
+#[cfg(not(feature = "recomp-rs"))]
+fn commit_rsp_rdram_writes(_written: &[(usize, usize)]) {}
 
 fn rsp_visible_rdram_len(allocation_len: usize) -> usize {
     allocation_len.min(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE)
@@ -927,6 +920,108 @@ fn trace_rsp_dmem_words(dmem: &[u8], overlay: u64, pc: u32) {
     eprintln!("[fn64-abi/rsp] overlay={overlay} pc={pc:#06x} DMEM {offset:#x} words={words:08x?}");
 }
 
+#[allow(clippy::too_many_arguments)]
+fn dump_lle_debug_state(
+    dir: &std::path::Path,
+    initial_dmem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    initial_imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    initial_pc: u32,
+    imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    machine: &fn64_audio::rsp::runtime::RspMachine<'_>,
+    abort_pc: u32,
+    total_steps: u64,
+    overlays: u64,
+    pc_ring: &std::collections::VecDeque<u32>,
+) {
+    use std::fmt::Write as _;
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        eprintln!("[fn64-abi] LLE debug dump: cannot create {dir:?}: {error}");
+        return;
+    }
+    let write = |name: &str, bytes: &[u8]| {
+        if let Err(error) = std::fs::write(dir.join(name), bytes) {
+            eprintln!("[fn64-abi] LLE debug dump: cannot write {name}: {error}");
+        }
+    };
+    write("initial_dmem.bin", initial_dmem);
+    write("initial_imem.bin", initial_imem);
+    write("final_dmem.bin", &machine.dmem_logical());
+    write("final_imem.bin", imem);
+
+    let mut state = String::new();
+    let _ = writeln!(state, "abort_pc {abort_pc:#06x}");
+    let _ = writeln!(state, "initial_pc {initial_pc:#06x}");
+    let _ = writeln!(state, "total_steps {total_steps}");
+    let _ = writeln!(state, "overlays {overlays}");
+    let _ = writeln!(state, "sp_status {:#010x}", machine.sp_status());
+    let _ = writeln!(state, "sp_semaphore {}", machine.sp_semaphore_latch());
+    let _ = writeln!(
+        state,
+        "dma_mem_address {:#010x}",
+        machine.ctx.dma_mem_address
+    );
+    let _ = writeln!(
+        state,
+        "dma_dram_address {:#010x}",
+        machine.ctx.dma_dram_address
+    );
+    for reg in 0..32u8 {
+        let _ = writeln!(state, "r{reg} {:#010x}", machine.reg(reg));
+    }
+    write("state.txt", state.as_bytes());
+
+    let mut ring = String::new();
+    for pc in pc_ring {
+        let _ = writeln!(ring, "{pc:#06x}");
+    }
+    write("pc_ring.txt", ring.as_bytes());
+
+    let field = |image: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE], offset: usize| {
+        u32::from_be_bytes(
+            image[0xfc0 + offset..0xfc0 + offset + 4]
+                .try_into()
+                .expect("four OSTask bytes"),
+        )
+    };
+    let mut header = String::new();
+    for (name, offset) in [
+        ("type", 0x00),
+        ("flags", 0x04),
+        ("ucode_boot", 0x08),
+        ("ucode_boot_size", 0x0c),
+        ("ucode", 0x10),
+        ("ucode_size", 0x14),
+        ("ucode_data", 0x18),
+        ("ucode_data_size", 0x1c),
+        ("dram_stack", 0x20),
+        ("dram_stack_size", 0x24),
+        ("output_buff", 0x28),
+        ("output_buff_size", 0x2c),
+        ("data_ptr", 0x30),
+        ("data_size", 0x34),
+        ("yield_data_ptr", 0x38),
+        ("yield_data_size", 0x3c),
+    ] {
+        let _ = writeln!(header, "{name} {:#010x}", field(initial_dmem, offset));
+    }
+    write("task_header.txt", header.as_bytes());
+
+    let data_ptr = (field(initial_dmem, 0x30) as usize) & 0x00ff_ffff;
+    let data_size = (field(initial_dmem, 0x34) as usize).clamp(0x40, 0x20000);
+    let end = (data_ptr + data_size).min(machine.rdram.len());
+    if data_ptr < end {
+        let logical: Vec<u8> = (data_ptr..end)
+            .map(|offset| machine.rdram.get(offset ^ 3).copied().unwrap_or(0))
+            .collect();
+        write("task_data_logical.bin", &logical);
+    }
+    let raw_len = machine
+        .rdram
+        .len()
+        .min(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE);
+    write("rdram_raw.bin", &machine.rdram[..raw_len]);
+}
+
 fn commit_rsp_memory_state(
     dmem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
     imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
@@ -987,13 +1082,12 @@ unsafe fn dispatch_lle_task(
     );
     let initial_imem = imem;
     unsafe { trace_rsp_rdram_words(rdram, rdram_len) };
-    let (dma_ranges, snapshot_len) = rsp_dma_storage_layout(rdram_len, static_aliases);
-    let mut rdram_image = vec![0u8; snapshot_len];
-    unsafe {
-        std::ptr::copy_nonoverlapping(rdram, rdram_image.as_mut_ptr(), snapshot_len);
-    }
-
-    let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut rdram_image);
+    let (dma_ranges, _) = rsp_dma_storage_layout(rdram_len, static_aliases);
+    // Execute directly against the live allocation. RSP stores are bounded by
+    // the admitted DMA ranges and logged by the machine for post-run JIT
+    // invalidation; no full-allocation snapshot or memcmp is needed.
+    let rdram_slice = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
+    let mut machine = fn64_audio::rsp::runtime::RspMachine::new(rdram_slice);
     machine.set_dma_rdram_ranges(dma_ranges);
     machine.load_dmem_logical(&dmem);
     machine.set_sp_status_raw(
@@ -1005,21 +1099,59 @@ unsafe fn dispatch_lle_task(
     let mut total_steps = 0u64;
     let mut overlays = 0u64;
     let mut replacements = Vec::new();
+    let debug_dir = std::env::var_os("FN64_RSP_LLE_DEBUG_DIR").map(std::path::PathBuf::from);
+    const DEBUG_TAIL_STEPS: u64 = 1 << 16;
+    const DEBUG_PC_RING: usize = 4096;
+    let debug_initial = debug_dir.as_ref().map(|_| (dmem, imem, pc));
+    let mut debug_pc_ring = std::collections::VecDeque::with_capacity(DEBUG_PC_RING);
     trace_rsp_dmem_words(&machine.dmem_logical(), overlays, pc);
     loop {
         let words: Vec<u32> = imem
             .chunks_exact(4)
             .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("four IMEM bytes")))
             .collect();
-        let result = fn64_audio::rsp::run_imem(&words, pc, &mut machine, CHUNK_STEPS);
+        let chunk = if debug_dir.is_some() {
+            let tail_start = MAX_TASK_STEPS - DEBUG_TAIL_STEPS;
+            if total_steps >= tail_start {
+                1
+            } else {
+                CHUNK_STEPS.min(tail_start - total_steps)
+            }
+        } else {
+            CHUNK_STEPS
+        };
+        let result = fn64_audio::rsp::run_imem(&words, pc, &mut machine, chunk);
         total_steps = total_steps
             .checked_add(result.steps)
             .expect("RSP task step counter overflow");
-        assert!(
-            total_steps <= MAX_TASK_STEPS,
-            "RSP task exceeded deterministic {MAX_TASK_STEPS}-instruction admission bound at PC {:#06x}",
-            result.pc
-        );
+        if debug_dir.is_some() && chunk == 1 {
+            if debug_pc_ring.len() == DEBUG_PC_RING {
+                debug_pc_ring.pop_front();
+            }
+            debug_pc_ring.push_back(result.pc);
+        }
+        if total_steps > MAX_TASK_STEPS {
+            if let (Some(dir), Some((initial_dmem, initial_imem, initial_pc))) =
+                (debug_dir.as_ref(), debug_initial.as_ref())
+            {
+                dump_lle_debug_state(
+                    dir,
+                    initial_dmem,
+                    initial_imem,
+                    *initial_pc,
+                    &imem,
+                    &machine,
+                    result.pc,
+                    total_steps,
+                    overlays,
+                    &debug_pc_ring,
+                );
+            }
+            panic!(
+                "RSP task exceeded deterministic {MAX_TASK_STEPS}-instruction admission bound at PC {:#06x}",
+                result.pc
+            );
+        }
         pc = result.pc;
         match result.reason {
             fn64_audio::rsp::RspExitReason::Broke => break,
@@ -1047,9 +1179,10 @@ unsafe fn dispatch_lle_task(
     dmem = machine.dmem_logical();
     let final_status = machine.sp_status();
     let dp_submissions = machine.take_dp_submissions();
+    let rdram_writes = machine.take_rdram_writes();
     drop(machine);
 
-    unsafe { commit_rsp_rdram_image(rdram, &rdram_image) };
+    commit_rsp_rdram_writes(&rdram_writes);
     commit_rsp_memory_state(&dmem, &imem, overlays, pc, final_status);
     let committed_generation = with_host(|host| host.device_fabric.rsp_memory().imem_generation());
     assert_eq!(
@@ -1062,39 +1195,63 @@ unsafe fn dispatch_lle_task(
 
     let mut dp_full_sync = fn64_render::DpFullSyncStatus::NotReached;
     let mut dpc_observations = Vec::with_capacity(dp_submissions.len());
-    for submission in &dp_submissions {
-        if let Some(limit) = std::env::var("RSP_TRACE_DPC_WORDS").ok().map(|raw| {
-            raw.parse::<usize>().unwrap_or_else(|_| {
-                panic!("RSP_TRACE_DPC_WORDS must be a decimal word count, got {raw:?}")
-            })
-        }) {
-            let words = submission
-                .words
-                .iter()
-                .copied()
-                .take(limit)
+    let trace_limit = std::env::var("RSP_TRACE_DPC_WORDS").ok().map(|raw| {
+        raw.parse::<usize>()
+            .unwrap_or_else(|_| panic!("RSP_TRACE_DPC_WORDS must be decimal, got {raw:?}"))
+    });
+    // Consecutive END extensions are one hardware command stream. A 16-byte
+    // command can straddle two 8-byte END writes, so decoding each submission
+    // separately creates a false truncated-command trap.
+    let mut index = 0;
+    while index < dp_submissions.len() {
+        let (start, end, xbus, words) = if dp_submissions[index].xbus {
+            let start = dp_submissions[index].start;
+            let mut end = dp_submissions[index].end;
+            let mut stream = Vec::new();
+            while index < dp_submissions.len() && dp_submissions[index].xbus {
+                let submission = &dp_submissions[index];
+                assert_eq!(
+                    submission.payload.len(),
+                    submission.end.wrapping_sub(submission.start) as usize,
+                    "RSP XBUS DPC range [{:#010x}, {:#010x}) payload was not captured at submission time",
+                    submission.start,
+                    submission.end
+                );
+                stream.extend_from_slice(&submission.payload);
+                end = submission.end;
+                index += 1;
+            }
+            let words = stream
+                .chunks_exact(4)
+                .map(|word| u32::from_be_bytes(word.try_into().expect("four XBUS bytes")))
                 .collect::<Vec<_>>();
+            (start, end, true, words)
+        } else {
+            let start = dp_submissions[index].start;
+            let mut end = dp_submissions[index].end;
+            index += 1;
+            while index < dp_submissions.len()
+                && !dp_submissions[index].xbus
+                && dp_submissions[index].start == end
+            {
+                end = dp_submissions[index].end;
+                index += 1;
+            }
+            let storage = unsafe { renderer_rdram_slice(rdram) };
+            let words = storage[start as usize..end as usize]
+                .chunks_exact(4)
+                .map(|word| u32::from_ne_bytes(word.try_into().expect("four RDRAM bytes")))
+                .collect::<Vec<_>>();
+            (start, end, false, words)
+        };
+        if let Some(limit) = trace_limit {
+            let traced = words.iter().copied().take(limit).collect::<Vec<_>>();
             eprintln!(
-                "[fn64-rsp-dpc] range [{:#010x}, {:#010x}) xbus={} words={words:08x?}",
-                submission.start, submission.end, submission.xbus
+                "[fn64-rsp-dpc] range [{start:#010x}, {end:#010x}) xbus={xbus} words={traced:08x?}"
             );
         }
-        assert_eq!(
-            submission.words.len() * 4,
-            (submission.end - submission.start) as usize,
-            "captured RSP DPC word count does not match [{:#010x}, {:#010x})",
-            submission.start,
-            submission.end
-        );
-        let (full_sync, observation) = unsafe {
-            dispatch_captured_raw_rdp(
-                rdram,
-                &submission.words,
-                submission.start,
-                submission.end,
-                submission.xbus,
-            )
-        };
+        let (full_sync, observation) =
+            unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, xbus) };
         dpc_observations.push(observation);
         if full_sync == fn64_render::DpFullSyncStatus::Reached {
             dp_full_sync = fn64_render::DpFullSyncStatus::Reached;
@@ -1180,13 +1337,9 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) -> HleBootR
         !rdram.is_null() && rdram_len != 0,
         "RSP HLE rspboot has no registered process RDRAM allocation"
     );
-    let (dma_ranges, snapshot_len) = rsp_dma_storage_layout(rdram_len, static_aliases);
-    let mut rdram_image = vec![0u8; snapshot_len];
-    unsafe {
-        std::ptr::copy_nonoverlapping(rdram, rdram_image.as_mut_ptr(), snapshot_len);
-    }
-
-    let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut rdram_image);
+    let (dma_ranges, _) = rsp_dma_storage_layout(rdram_len, static_aliases);
+    let rdram_slice = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
+    let mut machine = fn64_audio::rsp::runtime::RspMachine::new(rdram_slice);
     machine.set_dma_rdram_ranges(dma_ranges);
     machine.load_dmem_logical(&dmem);
     machine.set_sp_status_raw(
@@ -1281,9 +1434,10 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) -> HleBootR
         "RSP HLE rspboot submitted {} DPC range(s) before entering ucode",
         dp_submissions.len()
     );
+    let rdram_writes = machine.take_rdram_writes();
     drop(machine);
 
-    unsafe { commit_rsp_rdram_image(rdram, &rdram_image) };
+    commit_rsp_rdram_writes(&rdram_writes);
     commit_rsp_memory_state(&dmem, &imem, overlays, pc, final_status);
     let committed_generation = with_host(|host| host.device_fabric.rsp_memory().imem_generation());
     assert_eq!(
@@ -1403,13 +1557,68 @@ unsafe fn dispatch_captured_raw_rdp(
         !words.is_empty() && words.len().is_multiple_of(2),
         "captured RSP DPC submission must contain a nonempty whole number of 64-bit commands"
     );
-    assert_eq!(
-        source_end.checked_sub(source_start),
-        Some(u32::try_from(words.len() * 4).expect("captured RSP DPC byte length exceeds u32")),
-        "captured RSP DPC source range does not match the captured command image"
-    );
+    if !xbus {
+        assert_eq!(
+            source_end.checked_sub(source_start),
+            Some(u32::try_from(words.len() * 4).expect("captured RSP DPC byte length exceeds u32")),
+            "captured DRAM DPC source range does not match the captured command image"
+        );
+    }
     let real = unsafe { renderer_rdram_slice(rdram) };
     let physical_len = real.len();
+    if xbus {
+        if let Some(dir) = std::env::var_os("FN64_XBUS_STREAM_DUMP_DIR") {
+            thread_local! {
+                static XBUS_DUMP_INDEX: Cell<u64> = const { Cell::new(0) };
+            }
+            let index = XBUS_DUMP_INDEX.with(|cell| {
+                let index = cell.get();
+                cell.set(index + 1);
+                index
+            });
+            let skip = std::env::var("FN64_XBUS_STREAM_DUMP_SKIP")
+                .ok()
+                .map_or(0, |raw| {
+                    raw.parse::<u64>().unwrap_or_else(|_| {
+                        panic!("FN64_XBUS_STREAM_DUMP_SKIP must be a u64, got {raw:?}")
+                    })
+                });
+            if index >= skip && index < skip.saturating_add(16) {
+                let dir = std::path::PathBuf::from(dir);
+                std::fs::create_dir_all(&dir)
+                    .unwrap_or_else(|error| panic!("FN64_XBUS_STREAM_DUMP_DIR {dir:?}: {error}"));
+                let stream = words
+                    .iter()
+                    .flat_map(|word| word.to_be_bytes())
+                    .collect::<Vec<_>>();
+                let path = dir.join(format!("xbus-{index:04}.bin"));
+                std::fs::write(&path, stream)
+                    .unwrap_or_else(|error| panic!("writing XBUS stream dump {path:?}: {error}"));
+                eprintln!(
+                    "[fn64-abi] dumped XBUS stream #{index} ({} bytes) to {}",
+                    words.len() * 4,
+                    path.display()
+                );
+                let dump_rdram = std::env::var("FN64_XBUS_STREAM_DUMP_RDRAM")
+                    .ok()
+                    .map(|raw| {
+                        raw.parse::<u64>().unwrap_or_else(|_| {
+                            panic!("FN64_XBUS_STREAM_DUMP_RDRAM must be a u64, got {raw:?}")
+                        })
+                    });
+                if dump_rdram == Some(index) {
+                    let rdram_path = dir.join(format!("rdram-{index:04}.bin"));
+                    std::fs::write(&rdram_path, &*real).unwrap_or_else(|error| {
+                        panic!("writing RDRAM dump {rdram_path:?}: {error}")
+                    });
+                    eprintln!(
+                        "[fn64-abi] dumped RDRAM image ({physical_len:#x} bytes) to {}",
+                        rdram_path.display()
+                    );
+                }
+            }
+        }
+    }
     let staging_start = physical_len;
     let staged_end = staging_start + words.len() * 4;
     assert!(
@@ -1434,6 +1643,23 @@ unsafe fn dispatch_captured_raw_rdp(
             dp_full_sync: backend.last_dp_full_sync(),
         })
     });
+    if xbus && std::env::var_os("FN64_XBUS_DIFF_TRACE").is_some() {
+        let mut offset = 0usize;
+        while offset < physical_len {
+            if image[offset] != real[offset] {
+                let start = offset;
+                while offset < physical_len && image[offset] != real[offset] {
+                    offset += 1;
+                }
+                eprintln!(
+                    "[fn64-abi] XBUS diff: renderer changed rdram [{start:#010x}, {offset:#010x}) ({} bytes)",
+                    offset - start
+                );
+            } else {
+                offset += 1;
+            }
+        }
+    }
     real.copy_from_slice(&image[..physical_len]);
     let full_sync = require_committed_full_sync_evidence(result, "dispatch_captured_raw_rdp");
     (
@@ -5040,7 +5266,9 @@ mod tests {
         let commands: [(u32, u32); 9] = [
             (0xff10_0007, TARGET),
             (0xfa00_0000, 0xff00_00ff),
-            (0x0980_0000 | yl, (ym << 16) | yh),
+            // lft=0: the vertical XM minor edge sits left of the rightward-
+            // sloping XH major edge (right-major geometry).
+            (0x0900_0000 | yl, (ym << 16) | yh),
             (1 << 16, (5.0f32 / 3.0 * 65536.0).round() as u32),
             (1 << 16, (5.0f32 / 6.0 * 65536.0).round() as u32),
             (1 << 16, 0),

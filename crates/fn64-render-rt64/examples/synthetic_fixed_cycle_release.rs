@@ -54,7 +54,9 @@ const RSP_COMPLETION_STORAGE: usize = 0x1020;
 const AUDIO_EXECUTION_MARKER: usize = 0x1040;
 const AUDIO_EXECUTION_MAGIC: u32 = 0x4155_4449;
 const OS_EVENT_SP: u64 = 4;
+const OS_EVENT_SI: u64 = 5;
 const RSP_DONE_MESSAGE: u64 = 0x5253_5044;
+const CONTROLLER_DONE_MESSAGE: u64 = 0x5349_444f;
 const WIDTH: usize = 4;
 const HEIGHT: usize = 2;
 #[cfg(feature = "synthetic-native-archive-evidence")]
@@ -422,6 +424,10 @@ unsafe extern "C" fn synthetic_entry(rdram: *mut u8, ctx: *mut fn64_abi::RecompC
     ctx.r5 = kseg(CONTROLLER_MESSAGE_STORAGE) as u64;
     ctx.r6 = 1;
     unsafe { fn64_abi::osCreateMesgQueue_recomp(rdram, ctx) };
+    ctx.r4 = OS_EVENT_SI;
+    ctx.r5 = kseg(CONTROLLER_QUEUE) as u64;
+    ctx.r6 = CONTROLLER_DONE_MESSAGE;
+    unsafe { fn64_abi::osSetEventMesg_recomp(rdram, ctx) };
     ctx.r4 = kseg(CONTROLLER_QUEUE) as u64;
     ctx.r5 = kseg(CONTROLLER_PATTERN) as u64;
     ctx.r6 = kseg(CONTROLLER_STATUS) as u64;
