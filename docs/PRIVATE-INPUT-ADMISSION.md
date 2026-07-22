@@ -224,7 +224,7 @@ The release policy mirrors the typed release-matrix vocabulary:
   `rt64_post_vi_capture`;
 - the deterministic repeat bar is exactly ten.
 
-These values are pre-run admission policy only. Matrix v6 does not copy them
+These values are pre-run admission policy only. Matrix v5 does not copy them
 into a certification denominator or trust them as scenario coverage: it derives
 platform, controller, save, renderer, program-lane, and committed RSP/RDP-
 mechanism coverage from each validated committed-boundary report. A backend-

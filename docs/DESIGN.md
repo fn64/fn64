@@ -291,7 +291,7 @@ attestation, and the synthetic result cannot be promoted into private-ROM
 evidence.
 
 Representative matrix verification preserves the same capability boundary.
-Report-only matrix v6 verification never awards a ROM-class requirement from
+Report-only matrix v5 verification never awards a ROM-class requirement from
 the report's host-supplied label. Its private-series path accepts only an
 opaque capability produced by jointly revalidating the policy-admitted v3
 contract, exact-ten receipt, retained reports/journals, raw ROM, runner image,
