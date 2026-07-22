@@ -86,6 +86,7 @@ use std::cell::{Cell, RefCell};
 use corosensei::Yielder;
 use fn64_audio::AudioBackend;
 use fn64_render::RenderBackend;
+pub use fn64_render::{ActiveRenderGraphicsApi, RenderBackendEvidence, UcodeId};
 use fn64_runtime::{
     AiDmaRequest, Cycles, DeviceFabric, DeviceFault, DeviceNotification, DmaDirection, Executor,
     ExternalEvent, FixedPiTiming, InMemoryRom, Mesg, MmioAddr, OsTaskHeader, PiDma, PiDmaError,
@@ -191,6 +192,72 @@ pub struct RecompContext {
 /// ctx);`).
 pub type RecompFunc = unsafe extern "C" fn(*mut u8, *mut RecompContext);
 
+/// Stable generated-C function identity recorded at the first instruction of
+/// an entered native recompiled body.
+///
+/// The section index and offset come from N64Recomp's generated section table;
+/// native pointer bits are used only to find this metadata and never escape
+/// into evidence. `link_vram` is retained explicitly so consumers do not have
+/// to recover section geometry in order to report a reached destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeExecutionDestination {
+    pub section_index: u32,
+    pub function_offset: u32,
+    pub link_vram: u32,
+}
+
+/// One successfully entered generated-C function, in exact entry order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeExecutionDestinationEvent {
+    pub at: Cycles,
+    pub destination: NativeExecutionDestination,
+}
+
+/// One committed RSP/RDP observation retained in exact ABI execution order.
+///
+/// This history is distinct from future-affecting device state. Microcode
+/// identity comes from the registered renderer's exact-digest catalog over a
+/// complete live IMEM image, while the ABI independently retains that image's
+/// digest. DPC observations appear only after the renderer accepts the exact
+/// command image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RspRdpObservationEvent {
+    pub at: Cycles,
+    pub kind: RspRdpObservationKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RspRdpObservationKind {
+    MicrocodeRecognition {
+        task_addr: RdramAddr,
+        imem_generation: u64,
+        text_sha256: [u8; 32],
+        /// Physical start of the original task microcode-data image. A
+        /// yielded resume retains the identity captured for its initial task;
+        /// the rewritten yield-buffer pointer is never represented as source
+        /// microcode data.
+        data_addr: RdramAddr,
+        data_size: u32,
+        data_sha256: [u8; 32],
+        family: Option<UcodeId>,
+    },
+    DramDpcCommitted {
+        start: u32,
+        end: u32,
+        command_sha256: [u8; 32],
+    },
+    XbusDpcCommitted {
+        start: u32,
+        end: u32,
+        command_sha256: [u8; 32],
+    },
+    ImemReplacementCommitted {
+        task_addr: RdramAddr,
+        imem_generation: u64,
+        text_sha256: [u8; 32],
+    },
+}
+
 /// Guest cycles charged per generated-C raw RCP register access. Uncached
 /// MMIO stalls the real VR4300 for tens of cycles, and charging that time is
 /// also what keeps a raw `while (AI_STATUS & FULL)`-style poll loop live:
@@ -214,16 +281,46 @@ fn charge_c_lane_mmio_access() {
 }
 
 /// Charge the stall a guest device-busy retry costs and give the executor a
-/// checkpoint, iff a guest coroutine is executing. This is what keeps a
-/// `while (osEPiStartDma(..) != 0);` retry loop live when the PI command
-/// queue is genuinely full: device completions only commit as virtual time
-/// advances, and a shim-level retry (unlike a raw MMIO poll) has no
-/// instruction checkpoint of its own -- without the charge the retrying
-/// thread spins forever inside one scheduling slice (observed: WM2000's
-/// voiced-audio sample loader, `func_80000660`, once the first real sequence
-/// saturated the 0x40-deep PI command queue).
+/// checkpoint, iff a guest coroutine is executing. This keeps a
+/// `while (osEPiStartDma(..) != 0);` retry loop live when the PI command queue
+/// is genuinely full: completions only commit as virtual time advances, while
+/// a shim-level retry has no instruction checkpoint of its own.
 pub(crate) fn charge_guest_device_busy_retry() {
     charge_c_lane_mmio_access();
+}
+
+/// Boot diagnostic: log when a thread's `$sp` jumps 16KB regions between
+/// message-queue calls -- catches stack switches/corruption cheaply.
+pub(crate) fn probe_sp_region(site: &str, ctx: &RecompContext) {
+    if !boot_probe_enabled() {
+        return;
+    }
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static LAST: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+    }
+    let thread = ACTIVE_THREAD_ID.with(|cell| cell.get()).unwrap_or(u32::MAX);
+    let sp = ctx.r29 as u32;
+    LAST.with(|map| {
+        let mut map = map.borrow_mut();
+        if let Some(prev) = map.insert(thread, sp >> 14) {
+            if prev != sp >> 14 {
+                eprintln!(
+                    "[boot-probe] thread {thread:#x} sp region change at {site}: {:#010x}-region -> sp={sp:#010x}",
+                    prev << 14
+                );
+            }
+        }
+    });
+}
+
+/// Env-gated boot diagnostics (`FN64_BOOT_PROBE=1`): one-line traces of the
+/// OS-level events that boot state machines hinge on (event registration,
+/// raw SI kicks). Cheap enough to keep compiled in; silent unless armed.
+pub(crate) fn boot_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FN64_BOOT_PROBE").is_some())
 }
 
 /// Generated-C word-MMIO proxy entry points. The proxy header calls these
@@ -231,28 +328,9 @@ pub(crate) fn charge_guest_device_busy_retry() {
 #[no_mangle]
 pub extern "C" fn fn64_c_mmio_read_w(vaddr: u64) -> i32 {
     charge_c_lane_mmio_access();
-    let value = pi::read_raw_mmio_word(vaddr).unwrap_or_else(|| {
+    pi::read_raw_mmio_word(vaddr).unwrap_or_else(|| {
         panic!("generated-C raw MMIO read is outside the modeled RCP window: {vaddr:#018X}")
-    });
-    if std::env::var("FN64_DEBUG_MMIO_POLL").is_ok() {
-        thread_local! {
-            static POLL_SEEN: std::cell::RefCell<std::collections::HashMap<(u32, u64), u64>> =
-                std::cell::RefCell::new(std::collections::HashMap::new());
-        }
-        let tid = ACTIVE_THREAD_ID.with(|c| c.get()).unwrap_or(u32::MAX);
-        POLL_SEEN.with(|cell| {
-            let mut map = cell.borrow_mut();
-            let count = map.entry((tid, vaddr)).or_insert(0);
-            *count += 1;
-            if *count <= 5 || count.is_power_of_two() {
-                eprintln!(
-                    "[DEBUG mmio_read] thread={tid} vaddr={vaddr:#010x} -> {value:#010x} \
-                     (occurrence {count})"
-                );
-            }
-        });
-    }
-    value as i32
+    }) as i32
 }
 
 #[no_mangle]
@@ -267,35 +345,89 @@ pub extern "C" fn fn64_c_mmio_write_w(vaddr: u64, value: u32) {
 #[no_mangle]
 pub extern "C" fn fn64_c_mmio_bad_width(vaddr: u64, width: u32, is_write: u32) {
     let operation = if is_write == 0 { "read" } else { "write" };
-    panic!(
+    let context = format!(
         "generated-C raw MMIO {operation} at {vaddr:#018X} used unsupported {width}-byte access; RCP registers require modeled word semantics"
     );
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Abi,
+        "abi.generated-c-mmio.bad-width",
+        &context,
+        Some(fn64_runtime::Cycles::new(sim_time())),
+        fn64_runtime::UnsupportedDisposition::LoudTrap,
+    );
+    panic!("{context}");
 }
 
-/// Generated-C unaligned-access trap (see `fn64_mmio_proxy.h`): MIPS lw/sw
-/// and lh/sh require natural alignment -- real hardware raises AdEL/AdES.
-/// recomp.h's raw host-pointer cast would instead read/write a byte-lane
-/// chimera of two adjacent native words, silently corrupting guest state
-/// (the WM2000 demo-scene wild-pointer crash rode exactly such a value).
-/// Loud trap per AGENTS.md, naming the access.
+/// Trap generated-C naturally aligned loads/stores before the host pointer
+/// cast can turn them into a byte-lane chimera. MIPS lw/sw/lh/sh raise an
+/// address-error exception for this shape.
 #[no_mangle]
 pub extern "C" fn fn64_c_mem_unaligned(vaddr: u64, width: u32, is_write: u32) {
     let operation = if is_write == 0 { "load" } else { "store" };
-    panic!(
+    let context = format!(
         "generated-C {width}-byte {operation} at unaligned guest address {vaddr:#018X}; real \
-         hardware raises an address-error exception here (MIPS lw/sw/lh/sh alignment rule) -- \
-         the recompiled access would otherwise read/write a byte-lane chimera of two adjacent \
-         words and silently corrupt guest state"
+         hardware raises an address-error exception here (MIPS lw/sw/lh/sh alignment rule)"
     );
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Abi,
+        "abi.generated-c-memory.unaligned",
+        &context,
+        Some(fn64_runtime::Cycles::new(sim_time())),
+        fn64_runtime::UnsupportedDisposition::LoudTrap,
+    );
+    panic!("{context}");
 }
 
 #[no_mangle]
-pub extern "C" fn fn64_c_rdram_write(vaddr: u64, width: u32) {
-    let offset = RdramAddr::from_gpr(vaddr).offset();
+pub extern "C" fn fn64_c_bad_direct_address(vaddr: u64, width: u32, is_write: u32) {
+    let operation = if is_write == 0 { "read" } else { "write" };
+    let context = format!(
+        "generated-C direct-device {operation} at {vaddr:#018X} used unsupported mapped address with width {width}; only zero- or sign-extended KSEG0/KSEG1 are modeled"
+    );
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Abi,
+        "abi.generated-c-direct-device.bad-address",
+        &context,
+        Some(fn64_runtime::Cycles::new(sim_time())),
+        fn64_runtime::UnsupportedDisposition::LoudTrap,
+    );
+    panic!("{context}");
+}
+
+fn generated_c_rdram_physical_offset(vaddr: u64) -> Option<u32> {
+    let upper = vaddr >> 32;
+    let low = vaddr as u32;
+    let physical_offset = low & 0x1fff_ffff;
+    ((upper == 0 || upper == u32::MAX as u64)
+        && (0x8000_0000..0xc000_0000).contains(&low)
+        && physical_offset < fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u32)
+        .then_some(physical_offset)
+}
+
+#[no_mangle]
+pub extern "C" fn fn64_c_rdram_write(vaddr: u64, width: u32, value: u64) {
+    assert!(
+        matches!(width, 1 | 2 | 4 | 8),
+        "generated-C RDRAM write at {vaddr:#018x} reported invalid width {width}"
+    );
+    let physical_offset = generated_c_rdram_physical_offset(vaddr).unwrap_or_else(|| {
+        panic!(
+            "generated-C RDRAM write at {vaddr:#018x} is outside the modeled zero- or sign-extended KSEG0/KSEG1 physical RDRAM aliases"
+        )
+    });
+    let end = physical_offset.checked_add(width).unwrap_or_else(|| {
+        panic!("generated-C RDRAM write at {vaddr:#018x} width {width} overflows physical address")
+    });
+    assert!(
+        physical_offset.is_multiple_of(width)
+            && end <= fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u32,
+        "generated-C RDRAM write at {vaddr:#018x} has invalid aligned physical range {physical_offset:#x}..{end:#x} for width {width}"
+    );
     #[cfg(feature = "recomp-rs")]
-    fn64_recomp_rs::notify_guest_write(offset, width);
-    #[cfg(not(feature = "recomp-rs"))]
-    let _ = (offset, width);
+    fn64_recomp_rs::notify_guest_write(physical_offset, width);
+    if width == 2 {
+        task_dispatch::observe_non_rdp_write16(physical_offset, value as u16);
+    }
 }
 
 type LiveDeviceFabric = DeviceFabric<InMemoryRom, FixedPiTiming>;
@@ -309,17 +441,311 @@ struct PendingPiCompletion {
     ret_mesg: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PfsIsPlugTransaction {
+    thread: ThreadId,
+    queue: RdramAddr,
+    message: Mesg,
+    result_addr: RdramAddr,
+    bitpattern: u8,
+}
+
+#[derive(Clone, Copy)]
+enum PendingSiCompletionOwner {
+    /// A raw PIF DMA owns the registered process allocation until byte commit.
+    ProcessRdram { rdram: *mut u8, rdram_len: usize },
+    /// Asynchronous Controller Manager calls notify the live OS_EVENT_SI target.
+    OsEvent,
+    /// Synchronous PFS owns both its exact completion route and future output.
+    PfsIsPlug(PfsIsPlugTransaction),
+}
+
 #[derive(Clone, Copy)]
 struct PendingSiCompletion {
     request: fn64_runtime::SiDmaRequest,
-    rdram: *mut u8,
-    rdram_len: usize,
+    owner: PendingSiCompletionOwner,
 }
 
 #[derive(Clone, Copy)]
 struct PendingViMode {
     registers: [u32; 14],
     fields: [[u32; 5]; 2],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingPiCompletionEvidenceSnapshot {
+    pub request: PiDmaRequest,
+    pub rdram_len: u64,
+    pub ret_queue: Option<RdramAddr>,
+    pub ret_mesg: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PfsIsPlugTransactionEvidenceSnapshot {
+    pub thread: ThreadId,
+    pub queue: RdramAddr,
+    pub message: Mesg,
+    pub result_addr: RdramAddr,
+    pub bitpattern: u8,
+}
+
+impl From<PfsIsPlugTransaction> for PfsIsPlugTransactionEvidenceSnapshot {
+    fn from(value: PfsIsPlugTransaction) -> Self {
+        Self {
+            thread: value.thread,
+            queue: value.queue,
+            message: value.message,
+            result_addr: value.result_addr,
+            bitpattern: value.bitpattern,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingSiCompletionOwnerEvidenceSnapshot {
+    ProcessRdram { rdram_len: u64 },
+    OsEvent,
+    PfsIsPlug(PfsIsPlugTransactionEvidenceSnapshot),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSiCompletionEvidenceSnapshot {
+    pub request: fn64_runtime::SiDmaRequest,
+    pub owner: PendingSiCompletionOwnerEvidenceSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingViModeEvidenceSnapshot {
+    pub registers: [u32; 14],
+    pub fields: [[u32; 5]; 2],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbiViEvidenceSnapshot {
+    pub pending_mode: Option<PendingViModeEvidenceSnapshot>,
+    pub active_mode: Option<PendingViModeEvidenceSnapshot>,
+    pub pending_control: Option<u32>,
+    pub pending_x_scale_bits: Option<u32>,
+    pub pending_y_scale_bits: Option<u32>,
+    pub active_x_scale_bits: u32,
+    pub active_y_scale_bits: u32,
+}
+
+/// Release-evidence view spanning both owners above the raw device fabric:
+/// executor-owned peripherals and the ABI's manager-side completion/latch
+/// metadata. Process pointer values are deliberately excluded; their stable
+/// identity is enforced by the one registered-RDRAM invariant, while the
+/// lengths and guest-visible request/delivery fields are future-affecting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimePeripheralEvidenceSnapshot {
+    pub peripherals: fn64_runtime::PeripheralsEvidenceSnapshot,
+    pub pending_pi_completions: Vec<PendingPiCompletionEvidenceSnapshot>,
+    pub pending_si_completion: Option<PendingSiCompletionEvidenceSnapshot>,
+    /// Canonical ascending thread order. These transactions have posted their
+    /// private completion but have not yet resumed to publish the output byte.
+    pub completed_pfs_is_plug: Vec<PfsIsPlugTransactionEvidenceSnapshot>,
+    pub vi: AbiViEvidenceSnapshot,
+}
+
+/// One retained CPU-side rspboot source image. RDRAM offsets are sorted in
+/// [`AbiHostEvidenceSnapshot`] so hash-table insertion order cannot perturb a
+/// release encoding; the bytes remain exact because the next task load can
+/// observe every one of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RspBootImageEvidenceSnapshot {
+    pub rdram_offset: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Exact logical identity of one task-named microcode-data image hashed at an
+/// RSP kickoff boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RspTaskDataIdentityEvidenceSnapshot {
+    pub rdram_offset: u32,
+    pub byte_len: u32,
+    pub sha256: [u8; 32],
+}
+
+/// The one task header most recently copied into RSP DMEM by
+/// `osSpTaskLoad`. `resumed_data_identity` is present only when the loaded
+/// header is a validated yielded rewrite whose original data image was
+/// retained through task lineage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadedRspTaskEvidenceSnapshot {
+    pub task_offset: u32,
+    pub header: OsTaskHeader,
+    pub resumed_data_identity: Option<RspTaskDataIdentityEvidenceSnapshot>,
+}
+
+/// Original task/data identity retained for a task that may be rewritten and
+/// reloaded after a public RSP yield handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RspTaskLineagePhaseEvidenceSnapshot {
+    Running,
+    ResumeAuthorized,
+    ResumeLoaded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RspTaskLineageEvidenceSnapshot {
+    pub task_offset: u32,
+    pub original_header: OsTaskHeader,
+    pub data_identity: Option<RspTaskDataIdentityEvidenceSnapshot>,
+    pub phase: RspTaskLineagePhaseEvidenceSnapshot,
+}
+
+/// Stable identity of the cartridge image installed behind the PI bus.
+///
+/// The digest is captured while the host still owns the installation bytes;
+/// release evidence never serializes the ROM itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstalledRomEvidenceSnapshot {
+    pub byte_len: u64,
+    pub sha256: [u8; 32],
+}
+
+/// Pointer-free identity of the one process RDRAM registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegisteredRdramEvidenceSnapshot {
+    pub present: bool,
+    pub byte_len: u64,
+}
+
+/// Cartridge-mounted save hardware. Controller Pak is intentionally absent:
+/// it belongs to a controller port and cannot be installed or certified as a
+/// cartridge save device through this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CartridgeSaveType {
+    Eeprom4k,
+    Eeprom16k,
+    SramBanked,
+    FlashRam,
+}
+
+impl CartridgeSaveType {
+    pub const fn byte_len(self) -> usize {
+        match self {
+            Self::Eeprom4k => fn64_runtime::SaveType::Eeprom4k.byte_len(),
+            Self::Eeprom16k => fn64_runtime::SaveType::Eeprom16k.byte_len(),
+            Self::SramBanked => fn64_runtime::SaveType::SramBanked.byte_len(),
+            Self::FlashRam => fn64_runtime::SaveType::FlashRam.byte_len(),
+        }
+    }
+}
+
+/// Release-evidence state of cartridge save configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CartridgeSaveEvidenceSnapshot {
+    /// A compatibility registration path was used, or the host has not made
+    /// an explicit no-save assertion. Live release capture rejects this.
+    Unidentified,
+    NoCartridgeSave,
+    Configured(CartridgeSaveType),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadHandleEvidenceSnapshot {
+    pub osthread_offset: u32,
+    pub executor_thread_id: ThreadId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadGuestIdEvidenceSnapshot {
+    pub executor_thread_id: ThreadId,
+    pub guest_os_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerHandleEvidenceSnapshot {
+    pub ostimer_offset: u32,
+    pub timer_id: fn64_runtime::timer::TimerId,
+}
+
+/// Future-affecting state owned by libultra's controller manager rather than
+/// by the physical PIF ports. The public Controller Manager manual makes the
+/// default four channels, one-time initialization, and `osContSetCh` polling
+/// limit observable through later query/read buffer extents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControllerManagerEvidenceSnapshot {
+    pub initialized: bool,
+    pub channels: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ControllerManagerState {
+    initialized: bool,
+    channels: u8,
+}
+
+impl Default for ControllerManagerState {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            channels: 4,
+        }
+    }
+}
+
+impl ControllerManagerState {
+    fn initialize(&mut self) -> bool {
+        if self.initialized {
+            return false;
+        }
+        self.initialized = true;
+        self.channels = 4;
+        true
+    }
+
+    fn set_channels(&mut self, channels: u8) {
+        assert!(
+            channels <= 4,
+            "osContSetCh: channel count {channels} exceeds MAXCONTROLLERS (4)"
+        );
+        self.channels = if self.initialized { channels } else { 4 };
+    }
+
+    fn channels(self) -> usize {
+        usize::from(self.channels)
+    }
+
+    fn evidence_snapshot(self) -> ControllerManagerEvidenceSnapshot {
+        ControllerManagerEvidenceSnapshot {
+            initialized: self.initialized,
+            channels: self.channels,
+        }
+    }
+}
+
+/// Complete owner-local, future-affecting view of ABI [`HostState`] above the
+/// separately captured raw [`device_evidence_snapshot`] channel.
+///
+/// Hash-backed maps are canonicalized by their semantic keys. Native RDRAM
+/// and generated-function pointers, append-only debug/operation/destination
+/// logs, and derived section lookup caches are deliberately excluded: none
+/// may change a later ABI result. Recompiled lane/program identity is a
+/// separate feature-gated owner seam in `recompiled` and must be bound
+/// alongside this snapshot by a release schema that admits that lane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbiHostEvidenceSnapshot {
+    pub runtime_peripherals: RuntimePeripheralEvidenceSnapshot,
+    pub controller_manager: ControllerManagerEvidenceSnapshot,
+    pub flash: save::FlashEvidenceSnapshot,
+    pub sections: fn64_runtime::SectionRegistryEvidenceSnapshot,
+    pub rsp_boot_images: Vec<RspBootImageEvidenceSnapshot>,
+    pub loaded_rsp_task: Option<LoadedRspTaskEvidenceSnapshot>,
+    pub rsp_task_lineages: Vec<RspTaskLineageEvidenceSnapshot>,
+    pub rom_installed: bool,
+    pub installed_rom: Option<InstalledRomEvidenceSnapshot>,
+    pub cartridge_save: CartridgeSaveEvidenceSnapshot,
+    pub cart_rom_handle_vram: Option<u32>,
+    pub flash_handle_vram: Option<u32>,
+    pub leo_disk: Option<pi::LeoDiskConfig>,
+    pub thread_handles: Vec<ThreadHandleEvidenceSnapshot>,
+    pub thread_guest_ids: Vec<ThreadGuestIdEvidenceSnapshot>,
+    pub timer_handles: Vec<TimerHandleEvidenceSnapshot>,
+    pub next_synthetic_thread_id: ThreadId,
+    pub registered_rdram: RegisteredRdramEvidenceSnapshot,
+    pub debug_hardware: debug::DebugHardware,
 }
 
 /// Host-side, non-guest state this crate owns beyond the executor: the
@@ -338,25 +764,25 @@ struct HostState {
     /// `rom_installed` preserves PI DMA's loud missing-ROM failure.
     device_fabric: LiveDeviceFabric,
     rom_installed: bool,
-    /// OS-side information intentionally kept out of the hardware fabric.
-    /// There is at most one entry because PI exposes one DMA channel.
-    pending_pi_completion: Option<PendingPiCompletion>,
-    /// The PI manager's command queue: managed `osEPiStartDma` requests
-    /// accepted while a transfer is already in flight, started in FIFO
-    /// order as each prior transfer completes. Real libultra enqueues the
-    /// `OSIoMesg` on the PI manager's cmdQ and returns 0 -- `-1` means the
-    /// cmdQ itself is FULL, NOT "a DMA is in flight". WM2000 relies on
-    /// this: its chunked loader (`funcs_5.c` `func_80012064`, asm
-    /// 0x8001214C `while (osEPiStartDma(..) != 0);`) retries in a tight
-    /// loop that never yields, so a model that reports busy as -1
-    /// livelocks the whole cooperative executor (the pending completion
-    /// can only commit once the guest yields). Capacity is the game's own
-    /// `osCreatePiManager(cmdMsgCnt)` (NWXE passes 0x40); 0 until then.
-    queued_pi_requests: std::collections::VecDeque<PendingPiCompletion>,
-    /// `osCreatePiManager`'s `cmdMsgCnt`: how many requests may sit in
-    /// `queued_pi_requests` before `osEPiStartDma` reports a full queue.
-    pi_cmd_queue_capacity: usize,
+    /// Stable content identity captured at the ROM-install boundary. Keeping
+    /// this beside `rom_installed` lets evidence distinguish an explicitly
+    /// installed zero-byte synthetic cartridge from no cartridge at all.
+    installed_rom: Option<InstalledRomEvidenceSnapshot>,
+    /// Exact cartridge save identity supplied at the same boundary that
+    /// installs its storage. This is separate from controller-port PFS state.
+    cartridge_save: CartridgeSaveEvidenceSnapshot,
+    /// OS-side requests accepted by the PI manager, in submission order.
+    /// The front entry owns the hardware fabric's sole in-flight PI transfer;
+    /// later entries are accepted manager work which has not reached the bus.
+    /// Keeping that distinction in this queue prevents managed EPI callers
+    /// from observing raw `PiBusy` contention between guest threads.
+    pending_pi_completions: std::collections::VecDeque<PendingPiCompletion>,
     pending_si_completion: Option<PendingSiCompletion>,
+    completed_pfs_is_plug: std::collections::BTreeMap<ThreadId, PfsIsPlugTransaction>,
+    /// Libultra Controller Manager policy above the raw PIF device model.
+    /// Explicit raw Joybus packets retain their encoded channel addressing;
+    /// high-level query/read adapters poll only this manager-selected prefix.
+    controller_manager: ControllerManagerState,
     /// Public `OSViMode` register image queued by `osViSetMode`; the VI
     /// manager applies it at the next V-blank rather than at the shim call.
     pending_vi_mode: Option<PendingViMode>,
@@ -376,6 +802,22 @@ struct HostState {
     /// starts record their call-local pointer/required extent directly.
     runtime_rdram: *mut u8,
     runtime_rdram_len: usize,
+    /// CPU-side images of immutable `OSTask::ucode_boot` ranges. The public
+    /// task contract points these fields at rspboot text, and the real CPU's
+    /// non-coherent data cache can retain that text while a CIC/custom RSP
+    /// task writes a response over the same physical DRAM bytes. Generated
+    /// CPU code and devices otherwise share one host buffer, so this typed
+    /// cache preserves the source image which `osSpTaskLoad` re-DMAs at the
+    /// beginning of every task.
+    rsp_boot_images: std::collections::HashMap<u32, Vec<u8>>,
+    /// Exact CPU task header/source most recently admitted to RSP DMEM. The
+    /// only StartGo path consumes this token; it never rereads mutable guest
+    /// task fields after Load returns.
+    loaded_rsp_task: Option<task_dispatch::LoadedRspTask>,
+    /// Original task/data identities retained independently of append-only
+    /// observation history so a yielded reload cannot inherit evidence from
+    /// an unrelated task that reused the same guest address.
+    rsp_task_lineages: std::collections::HashMap<u32, task_dispatch::RspTaskLineage>,
     /// Guest-visible `OSPiHandle*` returned by `osCartRomInit`. The handle
     /// storage is game-owned BSS, so the boot host supplies its link address;
     /// leaving it unset is a loud trap rather than returning a stale `$v0`.
@@ -398,6 +840,22 @@ struct HostState {
     /// Lossless host side of the RDB/printf transport. Debug output must not
     /// disappear into a silent no-op; shells consume this queue explicitly.
     debug_packets: Vec<debug::DebugPacket>,
+    /// Successful authoritative save/PFS operations retained for the live
+    /// release gate. Requests are appended only after their storage action
+    /// succeeds; rejected calls and staging-only operations never appear.
+    save_operations: Vec<fn64_runtime::SaveOperationEvent>,
+    /// Successful controller/accessory behavior retained for release-matrix
+    /// admission. Configuration and probes are excluded; only guest-visible
+    /// reads, writes, or controls append here.
+    controller_operations: Vec<fn64_runtime::ControllerOperationEvent>,
+    /// Exact microcode-recognition and committed RSP/RDP mechanism history.
+    /// This is release observation, not future-affecting device state.
+    rsp_rdp_observations: Vec<RspRdpObservationEvent>,
+    /// Stable destinations entered by prepared generated-C bodies. Native
+    /// pointers are retained only in the registration map used to translate
+    /// the in-body hook back to generated section identity.
+    native_execution_destinations: Vec<NativeExecutionDestinationEvent>,
+    native_destination_by_pointer: std::collections::HashMap<usize, NativeExecutionDestination>,
     /// `OSThread*` (rdram-relative offset) -> `OSId`, populated by
     /// `osCreateThread_recomp`. Needed because real call sites pass the SAME
     /// `OSThread*` handle to `osStartThread`/`osSetThreadPri`/etc, NOT the
@@ -455,10 +913,12 @@ impl Default for HostState {
                 FixedPiTiming(Cycles::new(1)),
             ),
             rom_installed: false,
-            pending_pi_completion: None,
-            queued_pi_requests: std::collections::VecDeque::new(),
-            pi_cmd_queue_capacity: 0,
+            installed_rom: None,
+            cartridge_save: CartridgeSaveEvidenceSnapshot::Unidentified,
+            pending_pi_completions: std::collections::VecDeque::new(),
             pending_si_completion: None,
+            completed_pfs_is_plug: std::collections::BTreeMap::new(),
+            controller_manager: ControllerManagerState::default(),
             pending_vi_mode: None,
             active_vi_mode: None,
             pending_vi_control: None,
@@ -468,12 +928,20 @@ impl Default for HostState {
             active_vi_y_scale: 1.0,
             runtime_rdram: std::ptr::null_mut(),
             runtime_rdram_len: 0,
+            rsp_boot_images: std::collections::HashMap::new(),
+            loaded_rsp_task: None,
+            rsp_task_lineages: std::collections::HashMap::new(),
             cart_rom_handle_vram: None,
             flash_handle_vram: None,
             leo_disk: None,
             flash: save::FlashState::default(),
             debug_hardware: debug::DebugHardware::default(),
             debug_packets: Vec::new(),
+            save_operations: Vec::new(),
+            controller_operations: Vec::new(),
+            rsp_rdp_observations: Vec::new(),
+            native_execution_destinations: Vec::new(),
+            native_destination_by_pointer: std::collections::HashMap::new(),
             thread_handles: std::collections::HashMap::new(),
             thread_guest_ids: std::collections::HashMap::new(),
             next_synthetic_thread_id: 0xF000_0000,
@@ -517,6 +985,408 @@ pub fn configured_tv_type() -> fn64_runtime::TvType {
 
 pub fn vi_field_interval() -> Option<u64> {
     with_host(|host| host.device_fabric.vi_field_interval().map(Cycles::get))
+}
+
+/// Exact currently scheduled VI interrupt edge. Unlike reconstructing an edge
+/// from a host-owned interval accumulator, this remains monotonic when guest
+/// checkpoints advance time and follows VI timing-register reschedules.
+pub fn next_vi_deadline() -> Option<u64> {
+    with_host(|host| host.device_fabric.next_vi_deadline().map(Cycles::get))
+}
+
+/// Guest-visible device state for a fixed-cycle release digest.
+///
+/// The snapshot is read from the same `DeviceFabric` used by raw MMIO and
+/// libultra shims. Hosts must compare `snapshot.now` with the executor's
+/// [`sim_time`] before making a fixed-cycle claim; `FixedCycleDigestGate`
+/// enforces that equality when the snapshot is captured.
+pub fn device_snapshot() -> fn64_runtime::DeviceSnapshot {
+    with_host(|host| host.device_fabric.snapshot())
+}
+
+/// Complete modeled-fabric state for the fixed-cycle release artifact.
+/// Unlike [`device_snapshot`], this includes future-affecting internal
+/// memories, queues, deadlines, policy bytes, and cartridge save state.
+pub fn device_evidence_snapshot() -> fn64_runtime::DeviceEvidenceSnapshot {
+    with_host(|host| host.device_fabric.evidence_snapshot())
+}
+
+/// Complete pointer-free scheduler, queue, timer, event-registration, clock,
+/// and registered-RDRAM control state owned by the live executor. Native
+/// coroutine continuations remain outside this portable evidence seam.
+pub fn executor_control_evidence_snapshot() -> fn64_runtime::ExecutorControlEvidenceSnapshot {
+    with_executor(|executor| executor.control_evidence_snapshot())
+}
+
+/// Complete executor-owned controller, accessory, and high-level VI state for
+/// the fixed-cycle release artifact. This complements the device-fabric view:
+/// neither owner is treated as a proxy for the other.
+pub fn peripherals_evidence_snapshot() -> RuntimePeripheralEvidenceSnapshot {
+    let peripherals = with_executor(|executor| executor.peripherals_evidence_snapshot());
+    with_host(|host| runtime_peripherals_from_host(host, peripherals))
+}
+
+fn runtime_peripherals_from_host(
+    host: &HostState,
+    peripherals: fn64_runtime::PeripheralsEvidenceSnapshot,
+) -> RuntimePeripheralEvidenceSnapshot {
+    RuntimePeripheralEvidenceSnapshot {
+        peripherals,
+        pending_pi_completions: host
+            .pending_pi_completions
+            .iter()
+            .map(|pending| {
+                assert_eq!(
+                    pending.rdram, host.runtime_rdram,
+                    "pending PI completion does not reference the registered process RDRAM"
+                );
+                assert_eq!(
+                    pending.rdram_len, host.runtime_rdram_len,
+                    "pending PI completion has a different process RDRAM extent"
+                );
+                PendingPiCompletionEvidenceSnapshot {
+                    request: pending.request,
+                    rdram_len: u64::try_from(pending.rdram_len)
+                        .expect("process RDRAM length exceeds release-evidence wire"),
+                    ret_queue: pending.ret_queue,
+                    ret_mesg: pending.ret_mesg,
+                }
+            })
+            .collect(),
+        pending_si_completion: host.pending_si_completion.map(|pending| {
+            let owner = match pending.owner {
+                PendingSiCompletionOwner::ProcessRdram { rdram, rdram_len } => {
+                    assert_eq!(
+                        rdram, host.runtime_rdram,
+                        "pending SI completion does not reference the registered process RDRAM"
+                    );
+                    assert_eq!(
+                        rdram_len, host.runtime_rdram_len,
+                        "pending SI completion has a different process RDRAM extent"
+                    );
+                    PendingSiCompletionOwnerEvidenceSnapshot::ProcessRdram {
+                        rdram_len: u64::try_from(rdram_len)
+                            .expect("process RDRAM length exceeds release-evidence wire"),
+                    }
+                }
+                PendingSiCompletionOwner::OsEvent => {
+                    PendingSiCompletionOwnerEvidenceSnapshot::OsEvent
+                }
+                PendingSiCompletionOwner::PfsIsPlug(transaction) => {
+                    PendingSiCompletionOwnerEvidenceSnapshot::PfsIsPlug(transaction.into())
+                }
+            };
+            PendingSiCompletionEvidenceSnapshot {
+                request: pending.request,
+                owner,
+            }
+        }),
+        completed_pfs_is_plug: host
+            .completed_pfs_is_plug
+            .values()
+            .copied()
+            .map(Into::into)
+            .collect(),
+        vi: AbiViEvidenceSnapshot {
+            pending_mode: host
+                .pending_vi_mode
+                .map(|mode| PendingViModeEvidenceSnapshot {
+                    registers: mode.registers,
+                    fields: mode.fields,
+                }),
+            active_mode: host
+                .active_vi_mode
+                .map(|mode| PendingViModeEvidenceSnapshot {
+                    registers: mode.registers,
+                    fields: mode.fields,
+                }),
+            pending_control: host.pending_vi_control,
+            pending_x_scale_bits: host.pending_vi_x_scale.map(f32::to_bits),
+            pending_y_scale_bits: host.pending_vi_y_scale.map(f32::to_bits),
+            active_x_scale_bits: host.active_vi_x_scale.to_bits(),
+            active_y_scale_bits: host.active_vi_y_scale.to_bits(),
+        },
+    }
+}
+
+/// Compiler-enforced classification of every HostState field. Adding a field
+/// requires deciding whether it enters this owner snapshot, an existing
+/// release channel, a diagnostic-only exclusion, or the recompiler companion
+/// seam; there is deliberately no `..` escape hatch.
+fn classify_host_evidence_fields(host: &HostState) {
+    let HostState {
+        sections: _,
+        // Already complete in `device_evidence_snapshot`; this aggregate
+        // binds only the ABI-owned state above that raw fabric.
+        device_fabric: _,
+        rom_installed: _,
+        installed_rom: _,
+        cartridge_save: _,
+        pending_pi_completions: _,
+        pending_si_completion: _,
+        completed_pfs_is_plug: _,
+        controller_manager: _,
+        pending_vi_mode: _,
+        active_vi_mode: _,
+        pending_vi_control: _,
+        pending_vi_x_scale: _,
+        pending_vi_y_scale: _,
+        active_vi_x_scale: _,
+        active_vi_y_scale: _,
+        runtime_rdram: _,
+        runtime_rdram_len: _,
+        rsp_boot_images: _,
+        loaded_rsp_task: _,
+        rsp_task_lineages: _,
+        cart_rom_handle_vram: _,
+        flash_handle_vram: _,
+        leo_disk: _,
+        flash: _,
+        debug_hardware: _,
+        // Append-only evidence/diagnostic outputs cannot affect a later ABI
+        // result and are tested not to enter the snapshot.
+        debug_packets: _,
+        save_operations: _,
+        controller_operations: _,
+        rsp_rdp_observations: _,
+        native_execution_destinations: _,
+        native_destination_by_pointer: _,
+        thread_handles: _,
+        thread_guest_ids: _,
+        next_synthetic_thread_id: _,
+        timer_handles: _,
+        // These have a separately owned, feature-gated evidence seam in
+        // `recompiled`; the schema aggregator must bind that companion.
+        #[cfg(feature = "recomp-rs")]
+            recompiled_lookup: _,
+        #[cfg(feature = "recomp-rs")]
+            recompiled_program: _,
+        #[cfg(feature = "recomp-rs")]
+            recompiled_rdram_len: _,
+    } = host;
+}
+
+/// Capture every ABI-owned HostState field that can change a later result,
+/// without consuming queues or exposing process-specific pointers.
+///
+/// This is an owner-local seam for the current release schema; historical
+/// schemas that omitted this aggregate must not be relabeled as if they did.
+pub fn host_evidence_snapshot() -> AbiHostEvidenceSnapshot {
+    let peripherals = with_executor(|executor| executor.peripherals_evidence_snapshot());
+    with_host(|host| {
+        classify_host_evidence_fields(host);
+        assert_eq!(
+            host.rom_installed,
+            host.installed_rom.is_some(),
+            "ROM installation flag and retained ROM identity disagree"
+        );
+        if let Some(installed) = host.installed_rom {
+            assert_eq!(
+                installed.byte_len,
+                u64::try_from(host.device_fabric.pi_dma_mut().rom_len())
+                    .expect("installed ROM length exceeds evidence wire"),
+                "retained ROM length disagrees with the live PI engine"
+            );
+        }
+        let installed_save_len = host.device_fabric.pi_dma_mut().save_len();
+        match host.cartridge_save {
+            CartridgeSaveEvidenceSnapshot::Unidentified => {}
+            CartridgeSaveEvidenceSnapshot::NoCartridgeSave => assert!(
+                installed_save_len.is_none(),
+                "no-cartridge-save evidence disagrees with installed PI save storage"
+            ),
+            CartridgeSaveEvidenceSnapshot::Configured(save_type) => assert_eq!(
+                installed_save_len,
+                Some(save_type.byte_len()),
+                "typed cartridge-save evidence disagrees with installed PI save storage"
+            ),
+        }
+
+        let rdram_present = !host.runtime_rdram.is_null();
+        assert_eq!(
+            rdram_present,
+            host.runtime_rdram_len != 0,
+            "registered RDRAM pointer presence and length disagree"
+        );
+
+        let mut rsp_boot_images: Vec<_> = host
+            .rsp_boot_images
+            .iter()
+            .map(|(&rdram_offset, bytes)| RspBootImageEvidenceSnapshot {
+                rdram_offset,
+                bytes: bytes.clone(),
+            })
+            .collect();
+        rsp_boot_images.sort_unstable_by_key(|image| image.rdram_offset);
+
+        let loaded_rsp_task = host
+            .loaded_rsp_task
+            .as_ref()
+            .map(task_dispatch::LoadedRspTask::evidence_snapshot);
+        let mut rsp_task_lineages: Vec<_> = host
+            .rsp_task_lineages
+            .iter()
+            .map(|(&task_offset, lineage)| lineage.evidence_snapshot(task_offset))
+            .collect();
+        rsp_task_lineages.sort_unstable_by_key(|lineage| lineage.task_offset);
+
+        let mut thread_handles: Vec<_> = host
+            .thread_handles
+            .iter()
+            .map(
+                |(&osthread_offset, &executor_thread_id)| ThreadHandleEvidenceSnapshot {
+                    osthread_offset,
+                    executor_thread_id,
+                },
+            )
+            .collect();
+        thread_handles.sort_unstable_by_key(|entry| entry.osthread_offset);
+
+        let mut thread_guest_ids: Vec<_> = host
+            .thread_guest_ids
+            .iter()
+            .map(
+                |(&executor_thread_id, &guest_os_id)| ThreadGuestIdEvidenceSnapshot {
+                    executor_thread_id,
+                    guest_os_id,
+                },
+            )
+            .collect();
+        thread_guest_ids.sort_unstable_by_key(|entry| entry.executor_thread_id);
+
+        let mut timer_handles: Vec<_> = host
+            .timer_handles
+            .iter()
+            .map(|(&ostimer_offset, &timer_id)| TimerHandleEvidenceSnapshot {
+                ostimer_offset,
+                timer_id,
+            })
+            .collect();
+        timer_handles.sort_unstable_by_key(|entry| entry.ostimer_offset);
+
+        AbiHostEvidenceSnapshot {
+            runtime_peripherals: runtime_peripherals_from_host(host, peripherals),
+            controller_manager: host.controller_manager.evidence_snapshot(),
+            flash: host.flash.evidence_snapshot(),
+            sections: host.sections.evidence_snapshot(),
+            rsp_boot_images,
+            loaded_rsp_task,
+            rsp_task_lineages,
+            rom_installed: host.rom_installed,
+            installed_rom: host.installed_rom,
+            cartridge_save: host.cartridge_save,
+            cart_rom_handle_vram: host.cart_rom_handle_vram,
+            flash_handle_vram: host.flash_handle_vram,
+            leo_disk: host.leo_disk,
+            thread_handles,
+            thread_guest_ids,
+            timer_handles,
+            next_synthetic_thread_id: host.next_synthetic_thread_id,
+            registered_rdram: RegisteredRdramEvidenceSnapshot {
+                present: rdram_present,
+                byte_len: u64::try_from(host.runtime_rdram_len)
+                    .expect("registered RDRAM length exceeds evidence wire"),
+            },
+            debug_hardware: host.debug_hardware,
+        }
+    })
+}
+
+/// Copy the typed, guest-cycle-ordered device-fabric transition trace.
+///
+/// Unlike the executor's optional differential trace, this is the fabric's
+/// authoritative record of accepted and committed PI/SI/AI/SP operations.
+/// Release evidence uses commit/completion variants rather than inferring DMA
+/// activity from queue traffic, addresses, or shim names.
+pub fn copy_device_trace() -> Vec<fn64_runtime::DeviceTraceEvent> {
+    with_host(|host| host.device_fabric.trace().to_vec())
+}
+
+/// Copy successful typed save operations observed through authoritative ABI
+/// storage boundaries. This is separate from device DMA trace because PFS and
+/// synchronous Flash APIs do not traverse `DeviceFabric`.
+pub fn copy_save_operations() -> Vec<fn64_runtime::SaveOperationEvent> {
+    with_host(|host| {
+        assert!(
+            host.device_fabric.pi_dma().save_operations().is_empty(),
+            "copy_save_operations: undrained PiDma observations make cross-owner save-operation order unknowable"
+        );
+        host.save_operations.clone()
+    })
+}
+
+/// Copy successful controller/accessory operations in guest-cycle and call
+/// order. Unlike the frozen peripheral state, this proves that a configured
+/// device was actually exercised by the guest.
+pub fn copy_controller_operations() -> Vec<fn64_runtime::ControllerOperationEvent> {
+    with_host(|host| host.controller_operations.clone())
+}
+
+/// Copy exact committed RSP/RDP observations in ABI execution order.
+///
+/// Capability lists, task headers, and pending device requests never enter
+/// this history. Microcode entries require an exact lookup over the complete
+/// live IMEM image; mechanism entries require their corresponding memory or
+/// renderer commit to have succeeded.
+pub fn copy_rsp_rdp_observations() -> Vec<RspRdpObservationEvent> {
+    with_host(|host| host.rsp_rdp_observations.clone())
+}
+
+pub(crate) fn record_rsp_rdp_observations(kinds: Vec<RspRdpObservationKind>) {
+    if kinds.is_empty() {
+        return;
+    }
+    let at = Cycles::new(sim_time());
+    with_host(|host| {
+        host.rsp_rdp_observations.extend(
+            kinds
+                .into_iter()
+                .map(|kind| RspRdpObservationEvent { at, kind }),
+        );
+    });
+}
+
+pub(crate) fn record_controller_operation(
+    port: usize,
+    device: fn64_runtime::ControllerOperationDevice,
+    operation: fn64_runtime::ControllerOperationKind,
+) {
+    let port = u8::try_from(port).expect("controller operation port exceeds u8");
+    assert!(
+        port < 4,
+        "controller operation port {port} exceeds four-port PIF"
+    );
+    let at = Cycles::new(sim_time());
+    with_host(|host| {
+        host.controller_operations
+            .push(fn64_runtime::ControllerOperationEvent {
+                at,
+                port,
+                device,
+                operation,
+            });
+    });
+}
+
+pub(crate) fn record_save_operation(
+    device: fn64_runtime::SaveType,
+    operation: fn64_runtime::SaveOperationKind,
+    offset: usize,
+    len: usize,
+) {
+    assert!(len > 0, "save evidence cannot record a zero-byte operation");
+    let offset = u32::try_from(offset).expect("save evidence offset exceeds u32");
+    let len = u32::try_from(len).expect("save evidence length exceeds u32");
+    let at = Cycles::new(sim_time());
+    with_host(|host| {
+        host.save_operations.push(fn64_runtime::SaveOperationEvent {
+            at,
+            device,
+            operation,
+            offset,
+            len,
+        });
+    });
 }
 
 /// Reentrant-safe interior mutability for `Executor`, replacing a plain
@@ -796,6 +1666,20 @@ fn suspend_active_coroutine(yield_value: Yield) -> Resume {
     // non-None for the dynamic extent of the installing `with_active_yielder`
     // call, on the same thread.
     let yielder = unsafe { &*ptr };
+    // Every OS-call yield charges a flat slice of guest time first. The C
+    // lane has no instruction counting, so without this a guest loop of
+    // OS calls (e.g. a degenerate audio refeed) generates unbounded work
+    // per virtual instant -- impossible on silicon, where the call path
+    // itself costs cycles. Checkpoint yields are exempt: those lanes
+    // already count their own instructions.
+    // ponytail: one flat cost; per-call calibration belongs to the R5
+    // faithful-rate work if a title ever needs it.
+    const C_LANE_OS_CALL_CYCLES: u32 = 250;
+    if !matches!(yield_value, Yield::InstructionCheckpoint { .. }) {
+        let _ = yielder.suspend(Yield::InstructionCheckpoint {
+            instructions: C_LANE_OS_CALL_CYCLES,
+        });
+    }
     yielder.suspend(yield_value)
 }
 

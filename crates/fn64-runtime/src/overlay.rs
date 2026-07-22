@@ -91,6 +91,64 @@ pub struct Section {
     pub funcs: Vec<FuncEntry>,
 }
 
+/// Pointer-independent function metadata retained by release evidence.
+///
+/// Function order is preserved because [`SectionRegistry::resolve`] selects
+/// the first exact offset in a section. `func_ptr` is deliberately absent:
+/// native address bits vary by process and do not identify the callable body.
+/// The program-owning layer must bind callable identity separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FuncEntryEvidenceSnapshot {
+    pub offset: u32,
+    pub rom_size: u32,
+}
+
+/// Registration-order section geometry and function metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SectionEvidenceSnapshot {
+    pub rom_addr: u32,
+    pub ram_addr: u32,
+    pub size: u32,
+    pub funcs: Vec<FuncEntryEvidenceSnapshot>,
+}
+
+/// One runtime-relocated section base, canonicalized by section index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SectionLoadEvidenceSnapshot {
+    pub section: SectionIndex,
+    pub load_vram: u32,
+}
+
+/// Furthest committed static-image byte for one section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaticStorageEndEvidenceSnapshot {
+    pub section: SectionIndex,
+    pub end: u32,
+}
+
+/// Exact in-flight cursor for a chunked static-image mirror.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaticMirrorEvidenceSnapshot {
+    pub section: SectionIndex,
+    pub next_rom: u32,
+    pub next_static_off: u32,
+}
+
+/// Canonical, future-affecting view of the section registry.
+///
+/// Registration order and per-section function order remain semantic and are
+/// retained. Hash-backed collections are sorted by section index so allocator
+/// seeds and equivalent insertion histories cannot perturb evidence. The
+/// derived lookup cache and process-specific function pointers are excluded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SectionRegistryEvidenceSnapshot {
+    pub sections: Vec<SectionEvidenceSnapshot>,
+    pub loaded_sections: Vec<SectionIndex>,
+    pub runtime_loads: Vec<SectionLoadEvidenceSnapshot>,
+    pub static_mirror: Option<StaticMirrorEvidenceSnapshot>,
+    pub static_storage_ends: Vec<StaticStorageEndEvidenceSnapshot>,
+}
+
 impl Section {
     /// Range check against an explicit load base -- `base` is the section's
     /// static `ram_addr` for resident/fixed-vram sections, or its runtime
@@ -144,6 +202,10 @@ pub struct SectionRegistry {
     /// overlay's chunked DMA is mirrored to its static link VRAM so the
     /// baked static-address DATA reads in this fully-static build resolve.
     static_mirror: Option<StaticMirror>,
+    /// Furthest byte actually mirrored for each static overlay image. Section
+    /// geometry describes recompiled text, while an overlay ROM image also
+    /// contains data referenced by baked absolute pointers.
+    static_storage_ends: HashMap<SectionIndex, u32>,
 }
 
 /// In-flight state for `plan_static_mirror`: the ROM cursor (where the next
@@ -151,6 +213,7 @@ pub struct SectionRegistry {
 /// rdram static-VRAM destination cursor.
 #[derive(Copy, Clone)]
 struct StaticMirror {
+    section: SectionIndex,
     next_rom: u32,
     next_static_off: u32,
 }
@@ -158,6 +221,59 @@ struct StaticMirror {
 impl SectionRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Capture every modeled registry field that can change later overlay
+    /// resolution or static-image mirroring, without binding native pointers.
+    pub fn evidence_snapshot(&self) -> SectionRegistryEvidenceSnapshot {
+        let sections = self
+            .sections
+            .iter()
+            .map(|section| SectionEvidenceSnapshot {
+                rom_addr: section.rom_addr,
+                ram_addr: section.ram_addr,
+                size: section.size,
+                funcs: section
+                    .funcs
+                    .iter()
+                    .map(|entry| FuncEntryEvidenceSnapshot {
+                        offset: entry.offset,
+                        rom_size: entry.rom_size,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        let mut loaded_sections: Vec<_> = self.loaded.iter().copied().collect();
+        loaded_sections.sort_unstable();
+
+        let mut runtime_loads: Vec<_> = self
+            .load_vram
+            .iter()
+            .map(|(&section, &load_vram)| SectionLoadEvidenceSnapshot { section, load_vram })
+            .collect();
+        runtime_loads.sort_unstable_by_key(|load| load.section);
+
+        let mut static_storage_ends: Vec<_> = self
+            .static_storage_ends
+            .iter()
+            .map(|(&section, &end)| StaticStorageEndEvidenceSnapshot { section, end })
+            .collect();
+        static_storage_ends.sort_unstable_by_key(|storage| storage.section);
+
+        SectionRegistryEvidenceSnapshot {
+            sections,
+            loaded_sections,
+            runtime_loads,
+            static_mirror: self
+                .static_mirror
+                .map(|mirror| StaticMirrorEvidenceSnapshot {
+                    section: mirror.section,
+                    next_rom: mirror.next_rom,
+                    next_static_off: mirror.next_static_off,
+                }),
+            static_storage_ends,
+        }
     }
 
     /// Register a section. Returns its `SectionIndex` (assigned in
@@ -300,7 +416,15 @@ impl SectionRegistry {
             // the caller's rdram buffer is oversized to cover it (see
             // fn64-runtime::Rdram::new_with_mmio / oot-boot's rdram sizing).
             let static_off = ram_addr & 0x1FFF_FFFF;
+            let mirrored_end = static_off
+                .checked_add(len)
+                .expect("static overlay mirror range overflow");
+            self.static_storage_ends
+                .entry(idx)
+                .and_modify(|end| *end = (*end).max(mirrored_end))
+                .or_insert(mirrored_end);
             self.static_mirror = Some(StaticMirror {
+                section: idx,
                 next_rom: dev_addr.wrapping_add(len),
                 next_static_off: static_off.wrapping_add(len),
             });
@@ -310,7 +434,15 @@ impl SectionRegistry {
         if let Some(m) = self.static_mirror {
             if m.next_rom == dev_addr {
                 let dest = m.next_static_off;
+                let mirrored_end = dest
+                    .checked_add(len)
+                    .expect("static overlay mirror continuation range overflow");
+                self.static_storage_ends
+                    .entry(m.section)
+                    .and_modify(|end| *end = (*end).max(mirrored_end))
+                    .or_insert(mirrored_end);
                 self.static_mirror = Some(StaticMirror {
+                    section: m.section,
                     next_rom: dev_addr.wrapping_add(len),
                     next_static_off: dest.wrapping_add(len),
                 });
@@ -376,7 +508,7 @@ impl SectionRegistry {
                 }
             }
         }
-        panic!(
+        let context = format!(
             "get_function: no loaded section resolves vram {vram:#010x} to a function -- either \
              the target address has no FuncEntry at that exact offset in any registered section, \
              or the section that would contain it is not currently marked loaded (see \
@@ -385,6 +517,14 @@ impl SectionRegistry {
              trap per AGENTS.md, not a silent no-op: a missing/wrong function pointer here would \
              let boot 'progress' while branching to garbage."
         );
+        crate::record_unsupported_event(
+            crate::UnsupportedSubsystem::Runtime,
+            "runtime.overlay.get-function",
+            &context,
+            None,
+            crate::UnsupportedDisposition::LoudTrap,
+        );
+        panic!("{context}");
     }
 
     /// Translate a loaded overlay's relocated heap address back to its
@@ -403,6 +543,38 @@ impl SectionRegistry {
             }
         }
         None
+    }
+
+    /// Host-storage ranges which represent the static-link image of every
+    /// loaded section. Fully static recompiled code retains absolute overlay
+    /// data addresses, so device adapters may admit these explicit aliases in
+    /// addition to physical RDRAM without treating the rest of the oversized
+    /// CPU backing allocation as hardware-visible memory.
+    pub fn loaded_static_storage_ranges(&self) -> Vec<std::ops::Range<u32>> {
+        let mut ranges: Vec<_> = self
+            .loaded
+            .iter()
+            .map(|&idx| {
+                let section = &self.sections[idx];
+                let start = section.ram_addr & 0x1fff_ffff;
+                let text_end = start.checked_add(section.size).unwrap_or_else(|| {
+                    panic!(
+                        "loaded section {idx} static storage range overflows: start {start:#x}, \
+                         size {:#x}",
+                        section.size
+                    )
+                });
+                let end = self
+                    .static_storage_ends
+                    .get(&idx)
+                    .copied()
+                    .unwrap_or(text_end)
+                    .max(text_end);
+                start..end
+            })
+            .collect();
+        ranges.sort_unstable_by_key(|range| (range.start, range.end));
+        ranges
     }
 
     pub fn section_count(&self) -> usize {
@@ -548,6 +720,35 @@ mod tests {
         assert_eq!(reg.canonical_vram(0x803b_4df0), Some(0x8080_07b0));
         assert_eq!(reg.canonical_vram(0x8080_07b0), None);
         assert_eq!(reg.resolve(0x803b_4df0), 0xc0de_1234);
+    }
+
+    #[test]
+    fn loaded_static_storage_ranges_are_deterministic_and_exclude_unloaded_sections() {
+        let mut reg = SectionRegistry::new();
+        let high = reg.register_section(section_at_rom(0x2000, 0x8080_0000, 0x1000, vec![]));
+        let low = reg.register_section(section_at_rom(0x1000, 0x8000_0400, 0x200, vec![]));
+        reg.set_section_loaded_at(high, 0x803b_4000);
+        reg.set_section_loaded(low);
+
+        assert_eq!(
+            reg.loaded_static_storage_ranges(),
+            vec![0x400..0x600, 0x80_0000..0x80_1000]
+        );
+        reg.set_section_unloaded(high);
+        assert_eq!(reg.loaded_static_storage_ranges(), vec![0x400..0x600]);
+    }
+
+    #[test]
+    fn loaded_static_storage_range_includes_mirrored_overlay_data_after_text() {
+        let mut reg = SectionRegistry::new();
+        let title = reg.register_section(section_at_rom(0x00b9_da40, 0x8080_0000, 0x910, vec![]));
+
+        assert_eq!(reg.plan_static_mirror(0x00b9_da40, 0x9c0), Some(0x80_0000));
+        reg.set_section_loaded_at(title, 0x803b_4640);
+        assert_eq!(
+            reg.loaded_static_storage_ranges(),
+            vec![0x80_0000..0x80_09c0]
+        );
     }
 
     /// OoT's pause and player overlays reuse the same Kaleido arena. Loading
@@ -698,5 +899,211 @@ mod tests {
             reg.plan_static_mirror(0x00bf_ac30, 0x1000),
             Some(0x0085_d350)
         );
+    }
+
+    fn evidence_section(
+        rom_addr: u32,
+        ram_addr: u32,
+        size: u32,
+        funcs: &[(u32, u32, usize)],
+    ) -> Section {
+        Section {
+            rom_addr,
+            ram_addr,
+            size,
+            funcs: funcs
+                .iter()
+                .map(|&(offset, rom_size, func_ptr)| FuncEntry {
+                    func_ptr,
+                    offset,
+                    rom_size,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn evidence_snapshot_is_cache_warm_equivalent_and_pointer_independent() {
+        let mut cold = SectionRegistry::new();
+        let cold_idx = cold.register_section(evidence_section(
+            0x1000,
+            0x8000_0400,
+            0x80,
+            &[(0x10, 0x20, 0x1111)],
+        ));
+        cold.set_section_loaded(cold_idx);
+        let before_resolve = cold.evidence_snapshot();
+        assert_eq!(cold.resolve(0x8000_0410), 0x1111);
+        assert_eq!(cold.evidence_snapshot(), before_resolve);
+
+        let mut different_native_pointer = SectionRegistry::new();
+        let pointer_idx = different_native_pointer.register_section(evidence_section(
+            0x1000,
+            0x8000_0400,
+            0x80,
+            &[(0x10, 0x20, 0xeeee)],
+        ));
+        different_native_pointer.set_section_loaded(pointer_idx);
+        assert_eq!(
+            different_native_pointer.evidence_snapshot(),
+            before_resolve,
+            "native function addresses do not identify callable body semantics"
+        );
+    }
+
+    #[test]
+    fn evidence_snapshot_is_hash_insertion_order_independent() {
+        fn registry(reverse: bool) -> SectionRegistry {
+            let mut reg = SectionRegistry::new();
+            let first = reg.register_section(evidence_section(
+                0x1000,
+                0x8080_0000,
+                0x100,
+                &[(0, 4, 0x1111)],
+            ));
+            let second = reg.register_section(evidence_section(
+                0x2000,
+                0x8081_0000,
+                0x200,
+                &[(0x20, 8, 0x2222)],
+            ));
+
+            let loads = [(first, 0x8030_0000), (second, 0x8040_0000)];
+            if reverse {
+                for &(section, base) in loads.iter().rev() {
+                    reg.set_section_loaded_at(section, base);
+                }
+                assert_eq!(reg.plan_static_mirror(0x2000, 0x20), Some(0x81_0000));
+                assert_eq!(reg.plan_static_mirror(0x1000, 0x10), Some(0x80_0000));
+            } else {
+                for &(section, base) in &loads {
+                    reg.set_section_loaded_at(section, base);
+                }
+                assert_eq!(reg.plan_static_mirror(0x1000, 0x10), Some(0x80_0000));
+                assert_eq!(reg.plan_static_mirror(0x2000, 0x20), Some(0x81_0000));
+                assert_eq!(reg.plan_static_mirror(0x1000, 0x10), Some(0x80_0000));
+            }
+            reg
+        }
+
+        assert_eq!(
+            registry(false).evidence_snapshot(),
+            registry(true).evidence_snapshot()
+        );
+    }
+
+    #[test]
+    fn evidence_snapshot_detects_section_and_function_metadata_mutations() {
+        fn snapshot(
+            rom_addr: u32,
+            ram_addr: u32,
+            size: u32,
+            funcs: &[(u32, u32, usize)],
+        ) -> SectionRegistryEvidenceSnapshot {
+            let mut reg = SectionRegistry::new();
+            reg.register_section(evidence_section(rom_addr, ram_addr, size, funcs));
+            reg.evidence_snapshot()
+        }
+
+        let base = snapshot(0x1000, 0x8080_0000, 0x100, &[(0x10, 0x20, 1)]);
+        assert_ne!(
+            snapshot(0x1004, 0x8080_0000, 0x100, &[(0x10, 0x20, 1)]),
+            base
+        );
+        assert_ne!(
+            snapshot(0x1000, 0x8080_0010, 0x100, &[(0x10, 0x20, 1)]),
+            base
+        );
+        assert_ne!(
+            snapshot(0x1000, 0x8080_0000, 0x104, &[(0x10, 0x20, 1)]),
+            base
+        );
+        assert_ne!(
+            snapshot(0x1000, 0x8080_0000, 0x100, &[(0x14, 0x20, 1)]),
+            base
+        );
+        assert_ne!(
+            snapshot(0x1000, 0x8080_0000, 0x100, &[(0x10, 0x24, 1)]),
+            base
+        );
+
+        let mut declared = SectionRegistry::new();
+        declared.register_section(evidence_section(0x1000, 0x8080_0000, 0x100, &[]));
+        declared.register_section(evidence_section(0x2000, 0x8081_0000, 0x100, &[]));
+        let mut reversed = SectionRegistry::new();
+        reversed.register_section(evidence_section(0x2000, 0x8081_0000, 0x100, &[]));
+        reversed.register_section(evidence_section(0x1000, 0x8080_0000, 0x100, &[]));
+        assert_ne!(declared.evidence_snapshot(), reversed.evidence_snapshot());
+    }
+
+    #[test]
+    fn evidence_snapshot_detects_residency_and_runtime_load_mutations() {
+        fn registry() -> (SectionRegistry, SectionIndex) {
+            let mut reg = SectionRegistry::new();
+            let idx =
+                reg.register_section(evidence_section(0x1000, 0x8080_0000, 0x100, &[(0, 4, 1)]));
+            (reg, idx)
+        }
+
+        let (unloaded, _) = registry();
+        let (mut static_load, static_idx) = registry();
+        static_load.set_section_loaded(static_idx);
+        assert_ne!(
+            unloaded.evidence_snapshot(),
+            static_load.evidence_snapshot()
+        );
+
+        let (mut runtime_load, runtime_idx) = registry();
+        runtime_load.set_section_loaded_at(runtime_idx, 0x8030_0000);
+        assert_ne!(
+            static_load.evidence_snapshot(),
+            runtime_load.evidence_snapshot()
+        );
+    }
+
+    #[test]
+    fn evidence_snapshot_detects_static_storage_and_exact_cursor_mutations() {
+        fn registry() -> SectionRegistry {
+            let mut reg = SectionRegistry::new();
+            reg.register_section(evidence_section(0x1000, 0x8080_0000, 0x100, &[]));
+            reg.register_section(evidence_section(0x2000, 0x8081_0000, 0x100, &[]));
+            reg
+        }
+
+        let mut active = registry();
+        assert_eq!(active.plan_static_mirror(0x1000, 0x20), Some(0x80_0000));
+        let active_snapshot = active.evidence_snapshot();
+        assert_eq!(
+            active_snapshot.static_mirror,
+            Some(StaticMirrorEvidenceSnapshot {
+                section: 0,
+                next_rom: 0x1020,
+                next_static_off: 0x80_0020,
+            })
+        );
+
+        let mut stopped = registry();
+        assert_eq!(stopped.plan_static_mirror(0x1000, 0x20), Some(0x80_0000));
+        assert_eq!(stopped.plan_static_mirror(0x3000, 4), None);
+        assert_eq!(
+            active_snapshot.static_storage_ends,
+            stopped.evidence_snapshot().static_storage_ends
+        );
+        assert_ne!(active_snapshot, stopped.evidence_snapshot());
+
+        let mut extra_storage = registry();
+        assert_eq!(
+            extra_storage.plan_static_mirror(0x2000, 0x10),
+            Some(0x81_0000)
+        );
+        assert_eq!(
+            extra_storage.plan_static_mirror(0x1000, 0x20),
+            Some(0x80_0000)
+        );
+        assert_eq!(
+            active_snapshot.static_mirror,
+            extra_storage.evidence_snapshot().static_mirror
+        );
+        assert_ne!(active_snapshot, extra_storage.evidence_snapshot());
     }
 }

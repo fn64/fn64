@@ -2,7 +2,7 @@
 
 OoT (NTSC 1.0) is fn64's correctness oracle. This is the durable status map.
 Every "done" here is verified (byte-exact test, or an actual frame/PCM looked
-at) — not a tracker label. Updated 2026-07-16.
+at) — not a tracker label. Updated 2026-07-19.
 
 ## Verification contract (do not weaken)
 - **Data** (ROM/savestate → verts/faces/matrices/PCM): byte/index-exact tests
@@ -28,11 +28,23 @@ at) — not a tracker label. Updated 2026-07-16.
   observability flags (`OOT_RENDER_DUMP_START`, `FN64_DUMP_PROJ`, `FN64_NO_DEPTH`,
   `FN64_AUDIO_UCODE_TIMING`, `FN64_SKIP_AUDIO_UCODE`, `OOT_STOP_ON_FRAME`).
 - Rs-lane real-time profiling: `OOT_PERF_NO_CAPTURE=1` removes only the
-  harness's per-swap diagnostic PNG work, while `FN64_PHASE_TIMING=1`
+  harness's per-swap and reference backend's per-task diagnostic PNG work,
+  while `FN64_PHASE_TIMING=1`
   attributes wall time to the executor, software renderer, and audio dispatch.
   Differential tracing is opt-in with `OOT_TRACE=1` (and remains crash-safe,
   flushing every event); `./oot trace` enables it automatically. Normal runs
   do not synchronously format, write, and flush every executor event.
+
+### Real RSP/DPC first-frame gate (2026-07-19)
+
+The C-lane boot now reaches its first presented swap at executor step 445 after
+28 graphics tasks through the real rspboot/LLE-to-DPC path. Twenty of twenty
+independent bounded runs reached that same clean exit without a runtime or
+renderer panic. DPC submission ordering is fixed at `CMD_END`: the runtime
+captures the bounded command words then stages that immutable image at the
+physical 8 MiB boundary outside guest RDRAM for renderer dispatch. A later
+guest store or RSP DMA therefore cannot rewrite a command stream that was
+already submitted.
 
 ### Rs-lane gameplay wall time (2026-07-16, Apple Silicon macOS)
 
@@ -65,12 +77,15 @@ range `-29,727..=29,376`. Audio ucode accounted for 5,288.28 ms total, or
 0.454 ms per task. Both configurations remain comfortably inside the NTSC
 16.7 ms VI budget.
 
-A ONE-TIME hand check compared independently built rs and C lanes at swap
-499: both framebuffer PNGs had SHA-256
-`bc19787324497d71c622c2bfd450dc9f2063cb4feb875c576b4c6c34236ec1db`, no test
-checks it, and were byte-identical. It is not a guard: nothing re-verifies it
-as either lane changes. Automating it is ROADMAP V1; until then this is a
-historical observation, not a standing claim.
+The current C/rs framebuffer **observation** is byte-identical through swap 60.
+Both boot harnesses now advance virtual time only after guest quiescence; an
+earlier swap-10 mismatch was caused by the retired 100-resume pacing policy
+observing the rs lane's denser host checkpoints, not by guest or renderer
+semantics. It is not an authoritative parity horizon. The mechanical body audit
+finds 116 callable empty C bodies with nonempty Rust counterparts and therefore
+rejects C arbitration from swap zero. A historical deeper observation first
+diverged around gfx task 232/framebuffer 234, but does not prove the missing
+bodies were irrelevant earlier. See `PARITY-METHOD.md`.
 
 ### Recompilers (both from-scratch, typed Rust, no external tool, no GPL)
 - **CPU** `fn64-recomp-rs`: MIPS III + COP1/FPU + 64-bit dword + COP0 +
@@ -342,14 +357,18 @@ road, but the top half misprojects).
    state, snapshotted per triangle. `G_AC_THRESHOLD` compares post-combiner
    alpha with `G_SETBLENDCOLOR.a`; rejected fragments leave both color and
    depth untouched. The public Programming Manual defines `G_AC_DITHER` as a
-   hardware-generated pseudo-random threshold, so the Rust reference path now
-   traps that mode rather than substituting the former screen-locked Bayer
-   matrix. Active one/two-cycle RGB/alpha dither selectors likewise trap
-   instead of silently rendering undithered pixels; the disabled path uses
-   documented three-bit truncation for RGBA16 RGB and RGBA32 memory alpha. The
+   hardware-generated pseudo-random threshold; the Rust reference path now
+   uses the same typed per-fragment byte as combiner and dither noise rather
+   than substituting a screen-locked Bayer threshold.
+   Ordered one/two-cycle dither is implemented: RGB MagicSquare/Bayer modifies
+   low color bits before target-format storage, and alpha Pattern/InversePattern
+   uses the selected ordered matrix. RGB Noise, alpha Noise, and `G_AC_DITHER`
+   use an explicit seedable SplitMix64 reference policy whose exact hardware
+   sequence remains unclaimed. The
+   disabled path retains truncation behavior rather than rounding. The
    fail-against-bug tests cover state carry, the OoT render-mode macro's
    embedded alpha-dither bits, a transparent cutout texel, depth preservation,
-   and named dither rejection. The bounded C-file boot reached 250 swaps and
+   ordered tables, shared-noise routing, and seeded reproducibility. The bounded C-file boot reached 250 swaps and
    produced a changed actual frame sequence. The eyes-on dump proves corrected
    alpha coverage rather than a finished scene.
 3. **Alpha blending: implemented and unit-verified; live visual exercise is
@@ -397,7 +416,8 @@ road, but the top half misprojects).
   self-loaded text must each match an explicitly registered 4 KiB SHA-256;
   selecting the F3DEX2 decoder no longer admits the live image. An unknown
   generation discards speculative clone state and replays
-  the whole ucode phase through LLE from untouched post-rspboot state instead
+  the whole ucode phase through LLE from untouched post-rspboot memory and the
+  typed scalar/VU/SP/DMA/DPC snapshot instead
   of being guessed F3DEX2. RT64 accepts the resulting bounded raw DPC ranges
   through its LLE RDP entry. Public RDP
   tagged no-op and RSP no-op commands are explicit, while all three reserved
@@ -435,9 +455,9 @@ road, but the top half misprojects).
   OoT modulate, decal/replace, primitive-tint, environment-blend, and
   shade-only source set. TEXEL1 is distinct for rectangles and both triangle
   paths; a missing tile+1 or LOD-selected tile traps instead of aliasing.
-  LOD_FRACTION is modeled. The hardware NOISE combiner source now traps by
-  name instead of substituting black; its long-period, frame-varying generator
-  remains a hardware-trace frontier.
+  LOD_FRACTION is modeled. The hardware NOISE combiner source consumes the
+  typed per-fragment byte instead of substituting black; the exact silicon
+  generator remains a hardware-trace frontier.
 - Bounded probes in BOTH lanes use `_exit(0)` after explicitly flushing the
   summary/trace (2026-07-16; was rs-lane-only, so C-lane probes aborted with
   exit 134 in TLS teardown after a clean summary and probe exit codes were
@@ -499,10 +519,14 @@ stubs. The AudioLoad repair is grounded in OoT decomp
 handle, so the host ABI must return the game-linked BSS object rather than an
 opaque token or stale register. Ten consecutive release probes now reach
 swap 250 with exit code 0; swaps 3-250 have non-uniform guest framebuffers. No
-new loud recompiled frontier appeared through that bound. A one-swap differential
-against the C lane had the same 550 event shapes; the raw trace first differs
-at event 294 only in `sim_time` (0 versus 100), where the rs harness
-injects its documented idle-loop clock pacing.
+new loud recompiled frontier appeared through that bound. The current C/rs
+framebuffer observation is byte-identical through swap 60 after both harnesses
+adopted guest-quiescence timing. The callable-body audit rejects the legacy C
+lane as a semantic arbiter independently of that output match; use
+`scripts/lane-parity.sh --observe 60` for the explicitly weaker check. The prior
+swap-10 trace difference was caused by advancing virtual time after 100 resumes
+despite unequal host-checkpoint density; it is retained only as a superseded
+harness finding.
 
 ## 🔲 Beyond OoT (deferred until it renders faithfully)
 - Generalize the pipeline: fn64 owns discover→decomp→recomp→run generically

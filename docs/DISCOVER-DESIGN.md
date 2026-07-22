@@ -403,6 +403,26 @@ or computed transfer into that gap returns to mapping resolution. The real
 NWXE gate emits 197 blocks / 1,039 words and requires the generated Rust to
 compile.
 
+`block_pack::emit_block_program_source` is the reusable pack-to-execution
+boundary. It re-materializes the pack against the normalized ROM and requires
+an explicit admitted `(BankId, GuestPc)` entry plus `InstructionBudget` before
+emitting deterministic Rust. The generated module exposes the boot-harness
+block contract (`build_block_program`, `entry`, `entry_lookup`,
+`transfer_lookup`, and `instruction_budget`), preserves every disjoint span,
+and binds every generated runner to the artifact identity supplied by the
+compiling host. There is no identity-free registration helper in this
+artifact.
+
+Virtual addresses remain bank-qualified. `transfer_lookup` first keeps an
+admitted target in its source bank; otherwise it accepts exactly one admitted
+bank. `entry_lookup`, which has no source-bank context, also requires exactly
+one match. Zero matches return an exact `CpuFault` (including source-bank
+bounds when known), while multiple matches return typed `AmbiguousPc`
+evidence with the ordered first two candidate banks and total candidate count.
+Thus overlapping overlay VAs remain representable without registration order
+or a default bank silently choosing an image. Synthetic tests compile and
+execute the emitted source; no private ROM or generated game output is used.
+
 CFG block starts are canonical leaders. Fixed-point discovery may find a new
 target inside an earlier straight-line scan; the earlier block is then split
 at that target. Without this normalization, nominal basic blocks overlap and
@@ -728,6 +748,12 @@ fn64-discover game.z64 \
   --trace boot.jsonl \
   --out discovery.json
 
+fn64-discover emit-block-program game.z64 block-pack.json \
+  --entry-bank 0x0123456789ABCDEF \
+  --entry-pc 0x80000400 \
+  --instruction-budget 4096 \
+  --out generated-block-program.rs
+
 faki-port audit-discovery discovery/
 
 faki-port plan-probes \
@@ -738,6 +764,18 @@ faki-port close-discovery \
   --discovery discovery/ \
   --output target-pack/
 ```
+
+`emit-block-program` is the operable public boundary described in the composed
+snapshot section. The entry bank and PC use exactly 16 and 8 uppercase
+hexadecimal digits after `0x`; the instruction budget is canonical unsigned
+decimal with no leading zeros and must satisfy `InstructionBudget`. Every
+option is mandatory, including `--out`: generated Rust contains ROM-derived
+instruction words and is user-local build output, never repository content.
+The command parses a deny-unknown-fields `BlockPackV1`, normalizes and hashes
+the ROM, revalidates schema, digests, geometry, and entry, then stages and
+syncs the source beside the destination. Publication is an atomic no-clobber
+hard link; an existing output is never replaced. Success prints the exact byte
+count and SHA-256 receipt without printing the generated source.
 
 An audit report should expose exact counts:
 

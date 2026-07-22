@@ -38,6 +38,7 @@ fn64-runtime = { path = "../fn64-runtime" }
 fn64-abi = { path = "../fn64-abi" }
 fn64-boot-harness = { path = "../fn64-boot-harness" }
 fn64-render = { path = "../fn64-render" }
+fn64-render-reference = { path = "../fn64-render-reference" }
 fn64-render-rt64 = { path = "../fn64-render-rt64" }
 # cpal-backed AudioBackend lives here; we register it via
 # fn64_abi::set_audio_backend to wire the audio OUTPUT path.

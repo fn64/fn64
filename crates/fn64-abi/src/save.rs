@@ -1,11 +1,14 @@
-//! EEPROM ABI adapters over the runtime's single save backing store.
+//! EEPROM and FlashRAM ABI adapters over the runtime's single save backing
+//! store.
 //!
 //! Signatures, 8-byte block addressing, type codes, and return values come
 //! from the public libultra EEPROM Manager manual. The queue argument is part
 //! of libultra's synchronous SI protocol but carries no completion visible to
 //! the caller. Writes latch immediately, program the backing store at a
 //! deterministic guest-cycle deadline, and share that busy state with raw
-//! Joybus commands.
+//! Joybus commands. Flash command sequencing and identity follow the public
+//! N64 FlashRAM Programming Manual; [`FlashEvidenceSnapshot`] is the exhaustive
+//! owner-local view of the ABI fields that can change a later Flash command.
 
 use super::*;
 use crate::pi::with_pi_dma;
@@ -21,10 +24,25 @@ const FLASH_PAGE_COUNT: usize = fn64_runtime::SaveType::FlashRam.byte_len() / FL
 const FLASH_TYPE_1MBIT: u32 = 0x1111_8001;
 const FLASH_MAKER_MACRONIX_C: u32 = 0x00C2_001E;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FlashIdentity {
     pub flash_type: u32,
     pub flash_maker: u32,
+}
+
+/// Owned, read-only evidence for every future-affecting field in the ABI's
+/// FlashRAM command sequencer. Guest pointers and the append-only save
+/// operation log are deliberately absent: neither changes a later Flash
+/// command's result.
+///
+/// This is an ABI-owner snapshot only. Release schemas may embed it later,
+/// but acquiring it neither consumes a staged page nor acknowledges an erase.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlashEvidenceSnapshot {
+    pub write_buffer: Option<[u8; FLASH_PAGE_SIZE]>,
+    pub erase_complete: bool,
+    pub status: u8,
+    pub identity: FlashIdentity,
 }
 
 pub(crate) struct FlashState {
@@ -46,6 +64,24 @@ impl Default for FlashState {
             },
         }
     }
+}
+
+impl FlashState {
+    pub(crate) fn evidence_snapshot(&self) -> FlashEvidenceSnapshot {
+        FlashEvidenceSnapshot {
+            write_buffer: self.write_buffer,
+            erase_complete: self.erase_complete,
+            status: self.status,
+            identity: self.identity,
+        }
+    }
+}
+
+/// Snapshot the complete ABI-owned FlashRAM command state without mutating
+/// it. This intentionally does not aggregate the snapshot into a release
+/// artifact; callers receive the typed owner-local evidence directly.
+pub fn flash_evidence_snapshot() -> FlashEvidenceSnapshot {
+    with_host(|host| host.flash.evidence_snapshot())
 }
 
 fn set_result(ctx: &mut RecompContext, result: i32) {
@@ -205,6 +241,11 @@ fn eeprom_write(
             match deadline {
                 Ok(deadline) if wait_after_each_block => {
                     crate::advance_virtual_time(deadline.get());
+                    // LongWrite's documented per-block wait is also the
+                    // authoritative programming boundary. Force the lazy
+                    // backing-store transition at that exact guest deadline
+                    // before release evidence can call the write committed.
+                    with_pi_dma(shim, |dma| dma.advance_eeprom_to(deadline));
                 }
                 Ok(_) => {}
                 Err(fn64_runtime::EepromError::NoDevice) => {
@@ -218,7 +259,10 @@ fn eeprom_write(
         }
         Ok(())
     })();
-    set_result(ctx, result.err().unwrap_or(0));
+    match result {
+        Ok(()) => set_result(ctx, 0),
+        Err(code) => set_result(ctx, code),
+    }
 }
 
 /// `osEepromRead(OSMesgQueue *mq, u8 address, u8 *buffer) -> s32`.
@@ -396,10 +440,17 @@ pub unsafe extern "C" fn osFlashClearStatus_recomp(_rdram: *mut u8, _ctx: *mut R
 }
 
 fn flash_all_erase(shim: &str) {
-    with_pi_dma(shim, |dma| {
+    let len = with_pi_dma(shim, |dma| {
         let len = require_flash_len(shim, dma);
         dma.save_erase(0, len);
+        len
     });
+    crate::record_save_operation(
+        fn64_runtime::SaveType::FlashRam,
+        fn64_runtime::SaveOperationKind::Erase,
+        0,
+        len,
+    );
 }
 
 fn flash_sector_erase(shim: &str, page: u32) -> i32 {
@@ -412,6 +463,12 @@ fn flash_sector_erase(shim: &str, page: u32) -> i32 {
         require_flash_len(shim, dma);
         dma.save_erase(sector * FLASH_SECTOR_SIZE, FLASH_SECTOR_SIZE);
     });
+    crate::record_save_operation(
+        fn64_runtime::SaveType::FlashRam,
+        fn64_runtime::SaveOperationKind::Erase,
+        sector * FLASH_SECTOR_SIZE,
+        FLASH_SECTOR_SIZE,
+    );
     0
 }
 
@@ -478,12 +535,13 @@ pub unsafe extern "C" fn osFlashSectorEraseThrough_recomp(
 /// Same guest-context contract as the other ABI shims.
 #[no_mangle]
 pub unsafe extern "C" fn osFlashCheckEraseEnd_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
-    let complete = with_host(|host| host.flash.erase_complete);
-    assert!(
-        complete,
-        "osFlashCheckEraseEnd_recomp: no through-erase operation is pending"
-    );
+    require_flash_erase_complete("osFlashCheckEraseEnd_recomp");
     set_result(unsafe { &mut *ctx }, 0);
+}
+
+fn require_flash_erase_complete(shim: &str) {
+    let complete = with_host(|host| host.flash.erase_complete);
+    assert!(complete, "{shim}: no through-erase operation is pending");
 }
 
 /// `osFlashWriteBuffer(OSIoMesg *mb, s32 priority, void *dramAddr,
@@ -531,6 +589,12 @@ pub unsafe extern "C" fn osFlashWriteArray_recomp(_rdram: *mut u8, ctx: *mut Rec
         require_flash_len("osFlashWriteArray_recomp", dma);
         dma.save_write_from(page * FLASH_PAGE_SIZE, &buffer);
     });
+    crate::record_save_operation(
+        fn64_runtime::SaveType::FlashRam,
+        fn64_runtime::SaveOperationKind::Write,
+        page * FLASH_PAGE_SIZE,
+        FLASH_PAGE_SIZE,
+    );
     set_result(ctx, 0);
 }
 
@@ -566,6 +630,14 @@ pub unsafe extern "C" fn osFlashReadArray_recomp(rdram: *mut u8, ctx: *mut Recom
     });
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     unsafe { copy_to_guest(storage, destination, &bytes) };
+    if len > 0 {
+        crate::record_save_operation(
+            fn64_runtime::SaveType::FlashRam,
+            fn64_runtime::SaveOperationKind::Read,
+            first_page * FLASH_PAGE_SIZE,
+            len,
+        );
+    }
     post_flash_completion(queue);
     set_result(ctx, 0);
 }
@@ -624,6 +696,10 @@ mod tests {
         unsafe { osEepromWrite_recomp(rdram.as_mut_ptr(), &mut write) };
         assert_eq!(write.r2, 0);
         assert_eq!(crate::sim_time(), 0);
+        assert!(
+            crate::copy_save_operations().is_empty(),
+            "an accepted EEPROM write is not committed save evidence"
+        );
         let (busy, stored_before) = with_pi_dma("timed EEPROM test", |dma| {
             let busy = dma.eeprom_status(Cycles::ZERO).unwrap().busy;
             let mut stored = [0; EEPROM_BLOCK_SIZE];
@@ -642,6 +718,25 @@ mod tests {
         for (index, expected) in payload.iter().copied().enumerate() {
             assert_eq!(rdram[(0x40 + index) ^ 3], expected);
         }
+        assert_eq!(
+            crate::copy_save_operations(),
+            vec![
+                fn64_runtime::SaveOperationEvent {
+                    at: fn64_runtime::EEPROM_WRITE_CYCLES,
+                    device: fn64_runtime::SaveType::Eeprom4k,
+                    operation: fn64_runtime::SaveOperationKind::Write,
+                    offset: 2 * EEPROM_BLOCK_SIZE as u32,
+                    len: EEPROM_BLOCK_SIZE as u32,
+                },
+                fn64_runtime::SaveOperationEvent {
+                    at: fn64_runtime::EEPROM_WRITE_CYCLES,
+                    device: fn64_runtime::SaveType::Eeprom4k,
+                    operation: fn64_runtime::SaveOperationKind::Read,
+                    offset: 2 * EEPROM_BLOCK_SIZE as u32,
+                    len: EEPROM_BLOCK_SIZE as u32,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -666,6 +761,13 @@ mod tests {
             crate::sim_time(),
             fn64_runtime::EEPROM_WRITE_CYCLES.get() * 2
         );
+        let operations = crate::copy_save_operations();
+        assert_eq!(operations.len(), 2);
+        assert!(operations
+            .iter()
+            .all(|event| event.operation == fn64_runtime::SaveOperationKind::Write));
+        assert_eq!(operations[0].offset, 3 * EEPROM_BLOCK_SIZE as u32);
+        assert_eq!(operations[1].offset, 4 * EEPROM_BLOCK_SIZE as u32);
 
         let mut read_ctx = ctx_zeroed();
         read_ctx.r5 = 3;
@@ -696,6 +798,155 @@ mod tests {
             fn64_runtime::SaveType::FlashRam,
         )));
         set_flash_handle_vram(0x8000_1200);
+        with_host(|host| host.flash = FlashState::default());
+    }
+
+    #[test]
+    fn flash_evidence_snapshot_covers_each_field_independently() {
+        install_flash();
+        let baseline = flash_evidence_snapshot();
+        assert_eq!(
+            baseline,
+            FlashEvidenceSnapshot {
+                write_buffer: None,
+                erase_complete: false,
+                status: 0,
+                identity: FlashIdentity {
+                    flash_type: FLASH_TYPE_1MBIT,
+                    flash_maker: FLASH_MAKER_MACRONIX_C,
+                },
+            }
+        );
+
+        let staged = [0x5A; FLASH_PAGE_SIZE];
+        with_host(|host| host.flash.write_buffer = Some(staged));
+        assert_eq!(
+            flash_evidence_snapshot(),
+            FlashEvidenceSnapshot {
+                write_buffer: Some(staged),
+                ..baseline.clone()
+            }
+        );
+
+        with_host(|host| {
+            host.flash = FlashState::default();
+            host.flash.erase_complete = true;
+        });
+        assert_eq!(
+            flash_evidence_snapshot(),
+            FlashEvidenceSnapshot {
+                erase_complete: true,
+                ..baseline.clone()
+            }
+        );
+
+        with_host(|host| {
+            host.flash = FlashState::default();
+            host.flash.status = 0x81;
+        });
+        assert_eq!(
+            flash_evidence_snapshot(),
+            FlashEvidenceSnapshot {
+                status: 0x81,
+                ..baseline.clone()
+            }
+        );
+
+        let identity = FlashIdentity {
+            flash_type: 0x0123_4567,
+            flash_maker: 0x89AB_CDEF,
+        };
+        with_host(|host| {
+            host.flash = FlashState::default();
+            host.flash.identity = identity;
+        });
+        assert_eq!(
+            flash_evidence_snapshot(),
+            FlashEvidenceSnapshot {
+                identity,
+                ..baseline
+            }
+        );
+    }
+
+    #[test]
+    fn flash_evidence_snapshot_does_not_consume_or_alias_staged_page() {
+        install_flash();
+        let staged = std::array::from_fn(|index| index as u8);
+        with_host(|host| host.flash.write_buffer = Some(staged));
+
+        let mut observed = flash_evidence_snapshot();
+        observed.write_buffer.as_mut().unwrap()[0] = 0xFF;
+        assert_eq!(flash_evidence_snapshot().write_buffer, Some(staged));
+
+        let mut commit = ctx_zeroed();
+        commit.r4 = 9;
+        unsafe { osFlashWriteArray_recomp(std::ptr::null_mut(), &mut commit) };
+        assert_eq!(commit.r2, 0);
+        assert_eq!(flash_evidence_snapshot().write_buffer, None);
+
+        let stored = with_pi_dma("Flash evidence staged-page test", |dma| {
+            let mut stored = [0; FLASH_PAGE_SIZE];
+            dma.save_read_into(9 * FLASH_PAGE_SIZE, &mut stored);
+            stored
+        });
+        assert_eq!(stored, staged);
+    }
+
+    #[test]
+    fn flash_erase_latch_predicts_the_next_completion_check() {
+        install_flash();
+        assert!(std::panic::catch_unwind(|| {
+            require_flash_erase_complete("Flash evidence erase-latch test")
+        })
+        .is_err());
+
+        with_host(|host| host.flash.erase_complete = true);
+        assert!(flash_evidence_snapshot().erase_complete);
+        let mut check = ctx_zeroed();
+        unsafe { osFlashCheckEraseEnd_recomp(std::ptr::null_mut(), &mut check) };
+        assert_eq!(check.r2, 0);
+
+        unsafe { osFlashClearStatus_recomp(std::ptr::null_mut(), std::ptr::null_mut()) };
+        assert!(!flash_evidence_snapshot().erase_complete);
+    }
+
+    #[test]
+    fn flash_status_snapshot_predicts_the_next_status_read() {
+        install_flash();
+        with_host(|host| host.flash.status = 0xC3);
+        assert_eq!(flash_evidence_snapshot().status, 0xC3);
+
+        let mut rdram = vec![0u8; 0x40];
+        let mut status = ctx_zeroed();
+        status.r4 = 0x8000_0020;
+        unsafe { osFlashReadStatus_recomp(rdram.as_mut_ptr(), &mut status) };
+        assert_eq!(rdram[0x20 ^ 3], 0xC3);
+    }
+
+    #[test]
+    fn flash_identity_snapshot_predicts_the_next_id_read() {
+        install_flash();
+        let identity = FlashIdentity {
+            flash_type: 0x1020_3040,
+            flash_maker: 0x5060_7080,
+        };
+        set_flash_identity(identity);
+        assert_eq!(flash_evidence_snapshot().identity, identity);
+
+        let mut rdram = vec![0u8; 0x80];
+        let mut read = ctx_zeroed();
+        read.r4 = 0x8000_0040;
+        read.r5 = 0x8000_0044;
+        unsafe { osFlashReadId_recomp(rdram.as_mut_ptr(), &mut read) };
+        assert_eq!(
+            u32::from_ne_bytes(rdram[0x40..0x44].try_into().unwrap()),
+            identity.flash_type
+        );
+        assert_eq!(
+            u32::from_ne_bytes(rdram[0x44..0x48].try_into().unwrap()),
+            identity.flash_maker
+        );
     }
 
     #[test]
@@ -728,6 +979,16 @@ mod tests {
         for index in 0..FLASH_PAGE_SIZE {
             assert_eq!(rdram[(0x300 + index) ^ 3], index as u8);
         }
+        assert_eq!(
+            crate::copy_save_operations()
+                .iter()
+                .map(|event| event.operation)
+                .collect::<Vec<_>>(),
+            vec![
+                fn64_runtime::SaveOperationKind::Write,
+                fn64_runtime::SaveOperationKind::Read,
+            ]
+        );
     }
 
     #[test]

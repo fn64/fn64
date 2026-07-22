@@ -782,3 +782,385 @@ Climb log (each a real frontier cleared):
 Gates: `cargo build/test/clippy/fmt --workspace` all green (51 suites, 0
 failures). `gate_b1`/`gate_b2`/`gate_d1`/`gate_static_closure` all pass;
 NWXE grade unchanged at 26 exact + 3 coarse + 0 wrong.
+
+## Main-line verification run (2026-07-19, after session-patch port)
+
+Ran the harness on the MAIN checkout (which now seeds IPL3 + resident
+sections into rdram, this morning's parallel work). The session-patch
+ports all engage correctly: cart handle consumed, NDEBUG active, and the
+first VI presentation initially tripped `present_render_backend`'s "no
+render backend registered" trap -- wm2000-boot now registers the software
+`ReferenceBackend` (320x240, auto-dump `/tmp/fn64-wm2000-render-*`), same
+pattern as oot-boot minus the RT64/env switch.
+
+**New main-line frontier -- duplicate thread id 3, and it's REAL game
+behavior:** with resident `.data` faithfully seeded, the gate byte at
+`0x8003BAD4` reads its actual ROM initializer **0x01** (rom offset
+0x3C6D4 -- verified against raw ROM bytes), so `func_80001410`'s
+previously-skipped `osCreateThread(3, func_800033D4, pri 0x46)` now runs
+(the earlier "reads 0 on a fresh boot" note was an artifact of unseeded
+.data), and `func_80026DE0`'s audio-manager create of thread id 3 then
+trips `Executor`'s duplicate-id trap (`executor.rs:283`). On real
+hardware both creates are legal: libultra's thread id is an informational
+tag (identity is the OSThread struct pointer -- the two creates use
+different structs); fn64's executor keys threads by numeric id. Thread
+identity needs to move to (or be disambiguated by) the OSThread vram
+address before seeded-data boots can proceed past audio bring-up.
+
+## Session 2026-07-19 (part 2): thread-identity gap FIXED; retrace loop alive; frame gated on dispatch registration
+
+**Fix landed (main + worktree):** libultra OSIds carry no uniqueness
+contract (identity = OSThread struct pointer), so `osCreateThread_recomp`
+now detects an OSId collision via the new `Executor::thread_exists` and
+keys the executor by a synthetic internal id (from 0xF000_0000 up);
+`HostState::thread_guest_ids` preserves the guest-supplied OSId, which
+`osGetThreadId_recomp` returns. All thread ops already resolved through
+`thread_handles` (OSThread* -> id), so the remap is invisible to guest
+code. Regression test:
+`colliding_osids_create_two_distinct_threads_and_keep_the_guest_osid`.
+NOTE: `docs/COMPLETENESS.md` records shim line numbers -- regenerate with
+`scripts/check-nmr-surface.py --write-doc` after edits to fn64-abi or the
+nmr_surface test fails on drift.
+
+**Result on the seeded-data boot:** duplicate-id trap cleared; the
+formerly-skipped id-3 thread (entry func_800033D4) runs as synthetic
+0xF0000000. Boot now reaches a steady 60 Hz VI cadence: thread 6 wakes
+exactly once per 1,562,500-cycle field and a 5-queue message cascade
+(0x83828/0x838F0/0x838B8/0x838E8/0x835D0-area) cycles every retrace --
+144 virtual seconds observed. Lifecycle probes confirmed threads 0 AND 1
+both RETURN cleanly at boot (bootstrap threads, not stuck); threads 3
+(queue 0x559A0), 6, and 0xF0000000 (queue 0xE0908) all park on
+osRecvMesg.
+
+**Frame gate, sharpened:** every live thread waits for messages that only
+the D_800481FC-family dispatch handlers would send, and those tables are
+still never populated even with fully-seeded .data (the ROM initializer
+at D_800481FC's backing bytes is zero; the phantom-writer evidence from
+the 2026-07-14 sessions still holds in the seeded world). vi_swaps=0,
+gfx_tasks=0. The path to a first frame is now purely the registration
+mystery: find what populates the audio/graphics dispatch tables (or what
+message source drives the parked game loop) on real hardware. That is an
+RE task, not a runtime gap -- the OS layer now idles indefinitely with
+correct 60 Hz timing, which is exactly what an N64 with an empty dispatch
+table would do.
+
+## Session 2026-07-19 (part 3): the "phantom writer" is CLOSED -- it never existed
+
+Three sessions of writer-hunting for `D_800481FC` rested on one wrong
+observation. Direct ROM read this session (offset 0x48DFC = vram
+0x800481FC via section 1's rom=0x1050/ram=0x80000450 mapping):
+
+```
+0x800481F0: 0x80026C3C   <- dispatch handler 0
+0x800481F4: 0x80026CA0   <- dispatch handler 1
+0x800481F8: 0x80026D00   <- dispatch handler 2
+0x800481FC: 0x800481F0   <- D_800481FC's .data INITIALIZER: points at them
+```
+
+`D_800481FC` is initialized DATA, not BSS. The 2026-07-14 note "the ROM
+bytes AT that exact rom offset are 00 00 00 00" was simply a misread, and
+every downstream conclusion (phantom writer, 4-method search, hooks A/B/C's
+"empty table" model) cascaded from it. Verified live: a seeded boot reads
+`D_800481FC == 0x800481F0` the moment thread 0's first slice completes; a
+raw-ROM scan for jal/j encodings of func_800236C0 (0x0C008DB0/0x08008DB0)
+and ori-built forms of the address found zero hits -- consistent, because
+no writer is NEEDED.
+
+**Root cause, ROM-agnostic, already fixed:** the C-lane boot host was not
+seeding resident `.data` into RDRAM (real hardware's boot copies
+rom[0x1000..] wholesale). Main's `seed_resident_sections`/
+`seed_ipl3_image` work fixes it generically for every ROM; the
+thread-identity remap (part 2) handles the second consequence of faithful
+seeding. Hooks A/B/C in aki-recomp's wm2000.toml are now inert (they only
+fire on a zero table read) and can be deleted at the next regen.
+
+**White-screen correction:** the shell's white window is the UNPRESENTED
+surface (macOS default), not game output -- a 100-second probed shell run
+never saw `current_vi_framebuffer()` become Some, printed no "presenting"
+line, and observed zero raw SP-register writes. Earlier optimism in this
+session's chat log was wrong; the log line to trust is
+`[fn64-shell] presenting VI framebuffer (swap #N)`, which has not yet
+appeared for NWXE.
+
+**True current frontier (seeded, identity-fixed, dispatch table
+populated):** boot reaches the steady 60 Hz retrace loop; threads 0/1
+return cleanly; threads 3 (queue 0x559A0), 6 (5-queue retrace cascade),
+and synthetic 0xF0000000 (queue 0xE0908) park on osRecvMesg; no VI mode/
+origin programming, no SP task submission (NWXE hand-rolls raw-MMIO SP
+task launch -- `funcs_15.c` 0xA404xxxx writers -- so when tasks DO start,
+the fabric's raw-SP lane, not osSpTaskStart, is the seam to watch).
+Next diagnostic: instrument which of the three dispatch handlers run per
+retrace and where thread 6's handler chain decides "nothing to do" --
+with aki-recomp's own rung ladder (which reached a waveform-filler stage
+on the same ROM) as the reference map for what should happen next.
+
+## Session 2026-07-19 (part 4): PIF RAM window + TLB COP0 modeling (ROM-agnostic)
+
+Two hardware-model gaps closed, both found by chasing NWXE but generic:
+
+1. **Direct CPU PIF RAM access** (`0x1FC007C0..0x1FC00800`, KSEG0/KSEG1):
+   real hardware exposes PIF RAM to uncached CPU loads/stores, and AKI-era
+   hand-rolled joybus code (NWXE links NO osCont*/osSi* shims -- its whole
+   controller stack is raw) plus boot-handshake polls read it directly.
+   The discovered-pack lane faulted at exactly 0xBFC007FC. Now:
+   `DeviceFabric::pif_ram_cpu_read_w/write_w` back the window with the SAME
+   64-byte PIF RAM SI DMA uses; routed through the one shared raw-MMIO seam
+   (`pi.rs::pif_ram_window_offset` in read/write_raw_mmio_word) so the C
+   lane (via a widened `fn64_is_rcp_mmio_word`) and the typed lane both get
+   it. ponytail: CPU stores don't run the PIF command interpreter yet (the
+   injected executor runs on DramToPif DMA, the path joybus commands use);
+   round-trip test in pi.rs.
+2. **TLB COP0 registers + management operations** (fn64-recomp-rs): Index/
+   Random/EntryLo0/EntryLo1/PageMask/Wired/EntryHi (0/1/2/3/5/6/10) are typed
+   state. TLBWI/TLBWR record staged entries into
+   `RecompContext::tlb_entries[32]`, TLBR reads them, and TLBP applies
+   PageMask plus Global/ASID matching. In the arbitrary-PC lanes fn64 applies
+   the public inclusive Random/Wired range through a bounded once-per-charged-
+   instruction-unit policy, not a silicon cycle-timing claim;
+   legacy whole-function Random/TLBWR stays loud without that clock. Libultra's
+   osInitialize installs a real valid mapping (observed live: EntryHi=
+   0xC0000000, EntryLo0=0x02000017) and boot must not die on it. Address
+   TRANSLATION through recorded entries stays unmodeled; a mapped-segment
+   access faults at the memory path. WatchLo/WatchHi (18/19) same session,
+   earlier.
+
+**Discovered-lane climb log this session:** 0xBFC007FC PIF fault ->
+mfc0 EntryHi -> tlbwi valid mapping -> NOW: load from KUSEG 0x60900184
+(TLB-mapped space). The recorded `tlb_entries` are exactly what a
+translation step needs to consult -- the next runtime work item is a
+TLB-translate fallback in the typed memory path (fault only when no
+recorded entry covers the address).
+
+**C-lane frontier unchanged** (60 Hz retrace idle, no VI programming, no
+SP tasks). NWXE's raw-SI controller probe is now unblocked
+infrastructure-wise; next diagnostic remains per-retrace handler tracing
+against aki-recomp's rung ladder.
+
+Gates: fn64-abi/fn64-runtime/fn64-recomp-rs suites + fmt + lint-docs +
+NMR surface doc all green after regen.
+
+## Session 2026-07-19 (part 5): the frame gate is the CONTROLLER QUERY -- mapped to one function
+
+Env-gated boot diagnostics landed (`FN64_BOOT_PROBE=1`, permanent):
+osSetEventMesg registrations and raw SI/SP register traffic, in
+`fn64-abi` (lib.rs helper, mesgqueue.rs, pi.rs).
+
+**The boot state machine, decoded from the seeded trace + probes:**
+- Thread 6, EVERY field: send+recv on queue `D_800B1368` (the SI access
+  token -- aki's notes identify func_80032074/func_800320E0 as this
+  create-once/acquire pair), then a NON-blocking recv poll on
+  `D_80057228` (the OS_EVENT_SI queue, registered via
+  `osSetEventMesg(5, 0x80057228)` -- observed live by the probe).
+- The poll comes back empty for ~8,500 consecutive fields (~142 virtual
+  seconds), then a fallback advances the state machine ONE stage (first
+  send to the main thread's `D_800559A0` at sim 13.315B), and the cycle
+  repeats on the next queue. The game IS running -- at roughly 1/1000th
+  speed, each stage gated on an SI completion that never arrives.
+- Root cause location: **zero raw SI register reads OR writes ever
+  happen** (probe-confirmed over minutes of wall time). The hand-rolled
+  `__osSiRawStartDma` (= `func_80031F70`, identified in aki-recomp's
+  rung-18 notes) is never called. Its caller `func_800338B0`
+  (acquire -> build 64-byte PIF command block -> jal 0x80031F70,
+  STRAIGHT-LINE once entered) is never entered. `func_800338B0`'s call
+  sites (0x800045BC/0x800047A0/0x80004804/0x80004850, funcs_1.c) all sit
+  inside **`func_800044D0` -- the controller manager**, whose init
+  provably RAN (it made the osSetEventMesg(5,...) registration the probe
+  saw). Its controller-query calls are conditional and the condition
+  never passes.
+
+**NEXT SESSION'S ENTRY POINT (precise):** read `func_800044D0`'s body
+(funcs_1.c, vram 0x800044D0 onward) and find the branch guarding the
+0x800045BC call to func_800338B0 -- what state must hold for the first
+controller query to fire, and which piece of it our runtime leaves wrong
+(candidates: a message the manager waits for first, a PIF/SI init flag in
+seeded .data, or a queue-capacity check). aki-recomp's own boot DID get
+SI traffic (their rung 18 crashed on D_80057228 corruption -- i.e. their
+runtime passed this gate), so their librecomp SI path is the behavioral
+reference. All boot-probe infrastructure needed to verify a fix is in
+place; the 142-second-per-stage fallback also means ANY fix here
+collapses ~20 minutes of virtual idle into real boot progress at once.
+
+Gates: fn64-abi/runtime/recomp-rs suites, fmt, NMR surface doc all green.
+
+## Session 2026-07-19 (part 6): osGetCount stub fixed; SI/joybus chain VERIFIED end-to-end
+
+**Root-cause fix landed (aki-recomp metadata + existing fn64 shim):**
+`func_80037690` = `osGetCount` -- the innermost counter read of the
+hand-rolled `osGetTime` (`func_80032570`) -- had been auto-stubbed by
+gen-stubs' cop0 pre-scan (empty body, `$v0` left stale on every call).
+Named in profile.toml `[syms.rename]` (evidence comment there), stub
+entry removed from wm2000.toml, symbols + RecompiledFuncs regenerated;
+`osGetTime` now reads the executor's real Count (probe-verified:
+0x4E48769 ticks = 1.75 virtual seconds at the contInit call).
+
+**The controller stack WORKS -- verified byte-level with the new probes**
+(`FN64_BOOT_PROBE=1` now also logs `osSetTimer`, `osGetCount`,
+`__osSiRawStartDma` calls with 64-byte block hexdumps, and the
+`PifToDram` post-execute response in fn64-runtime):
+- `func_8002F8E0` (hand-rolled osContInit) runs to completion: builds the
+  standard `__osContRequesFormat` block (`ff 01 03 00 ...` x4, `fe`
+  terminator, format byte), pumps it through `__osSiRawStartDma_recomp`
+  (HOST-side -- note: raw SI register probes see nothing on this path by
+  design), and our `execute_pif` answers correctly: port 0
+  `05 00 00` (standard controller present), ports 1-3 rx-error 0x80
+  (absent).
+- The game then write-probes the controller pak (cmd 0x03, addr 0x8001,
+  32x 0xFE payload) and receives the no-pak CRC answer; it resets and
+  re-queries the channel -- 3 query pairs observed at successive boot
+  stages, consistent with periodic pak re-probing, not an SI failure.
+
+**Remaining frontier (unchanged symptom, upstream causes now all
+eliminated):** boot stages still advance at the ~142-virtual-second
+fallback cadence (~8,500 fields) rather than per-frame. Everything this
+session checked -- time source, PIF window, SI DMA, joybus responses,
+event registration (two `osSetEventMesg(5, ...)` calls: the contInit-era
+stack queue 0x80083930, then D_80057228) -- now behaves correctly, so the
+next suspect list narrows to: (a) OS_EVENT_SI delivery going to the OLD
+queue after re-registration (check `Executor::set_event_mesg` replace
+semantics vs which queue the per-field NOBLOCK poll actually reads);
+(b) the game's own state machine intentionally pacing until some
+still-unmet condition (audio? gfx microcode load via the raw SP lane?).
+The per-field NOBLOCK poll queues in the trace (0x83828/0x838F0/0x838928
+area) are func_800044D0-frame STACK queues -- map them to the sp values
+of the live threads before assuming they are the SI event queue.
+
+Gates: fn64-abi/fn64-runtime green, fmt, NMR doc regen, lint-docs clean.
+
+## Session 2026-07-19 (part 7): the 142s mystery SOLVED; boot storms through streaming + save init; new frontier is a phantom mq=1
+
+Suspect (a) from part 6 (event re-registration delivery) led somewhere
+much bigger. Fixes landed, in causal order:
+
+1. **Device-delivery ordering (the ACTUAL 142s cause).** Guest slices
+   charge (nearly) zero virtual time, so every DMA completion's deadline
+   (`sim_time + latency`, latency 1) missed the post-slice fabric commit
+   (which only reaches `sim_time`) and waited for the NEXT FIELD's idle
+   advance -- every completion, one field late. The boot's overlay
+   streaming (megabytes in 4-byte and 0x200-byte chunked PI DMAs, via
+   `func_800E1C40 -> func_800F4CA4/497C/4B60`) therefore ran at one chunk
+   PER FIELD: the "142-second stages" were just multi-thousand-chunk
+   copies. Fixes: `fn64_abi::next_device_deadline()` + deadline-aware
+   pump in wm2000-boot (service due-before-next-field deadlines without
+   letting a chattering device starve the VI tick), and a flat 250-cycle
+   charge per C-lane OS-call yield (`suspend_active_coroutine`) so
+   OS-call loops consume virtual time like real silicon.
+2. **getenv on the PI hot path.** `start_timed_pi_dma` checked
+   `FN64_TRACE_PI_DMA` via an UNCACHED `env::var_os` on every DMA
+   (lldb-caught at ~26k DMAs/sec). Now OnceLock-cached.
+3. **Save-device routing through the PI handle.** Real
+   `osEPiStartDma(handle, mb, dir)` scopes `devAddr` by the handle's
+   domain. Our shim ignored `$a0` entirely, so NWXE's SRAM init
+   (`FromRdram devAddr=0x0` on its own save handle) routed to ROM offset
+   0 and its write-verify loop retried forever (the post-streaming
+   plateau at trace seq 34,739). Now: traffic on any non-cart handle
+   (cart = `set_cart_rom_handle_vram`'s) is save traffic, rebased into
+   `SRAM_DOMAIN2_BASE`. Handle-identity heuristic, ponytail-noted for a
+   future modeled OSPiHandle. wm2000-boot also registers
+   `InMemorySaveStorage(SramBanked)` (it never had save storage at all).
+   RESULT: the plateau shattered -- 253k+ trace events, streaming AND
+   save init complete, boot deep into new territory (sim 41M+).
+4. **Executor queue-mirror bounds trap.** The next frontier SIGSEGV'd
+   silently: `mirror_queue_to_rdram` writes guest OSMesgQueue structs
+   unchecked. `set_rdram_base_with_len` + a loud assert now name the
+   corrupt pointer instead of crashing.
+
+**Current frontier, precisely diagnosed by the new trap:** guest code
+calls osRecvMesg with `OSMesgQueue* == 0x1` -- the literal `msg=1` value
+from the game's FIRST `osSetEventMesg(5, mq=0x80083930, msg=1)`
+registration, consumed somewhere that treats received messages as queue
+POINTERS (AKI's manager protocol passes response queues as messages, and
+mixes flag-style event messages onto the same queues). Next session:
+find which handler recvs on the 0x83930-era queue family and how real
+hardware's delivery keeps flag messages and pointer messages apart --
+suspect either our event delivery posting to a queue the game considers
+retired (the 0x83930 stack frame dies with func_800044D0), or a message
+our runtime injects that real hardware wouldn't. Diagnosis env:
+`FN64_BOOT_PROBE=1` (all registrations + SI DMAs + handle identities),
+`FN64_TRACE_PI_DMA=1` (per-DMA), and the mq-mirror trap message itself.
+Repro: run wm2000-boot ~3-4 min wall; trap fires past step 100k at
+sim ~41M.
+
+Gates: fn64-abi/runtime/recomp-rs green, fmt, NMR doc regen clean.
+
+## Session 2026-07-19 (part 8): the mq=1 forensics -- thread 6 is executing with $sp inside the SI event queue
+
+Probe ladder (all `FN64_BOOT_PROBE=1`-gated; the NON-POINTER osRecvMesg
+diagnostic is now permanent in `mesgqueue.rs`):
+
+1. Guest `$ra` at the bogus recv reads 0 (generated code does not maintain
+   r31 across direct C calls) -- use HOST backtraces instead; guest
+   function names appear directly (`RECOMP_FUNC` symbols).
+2. Host backtrace at `osRecvMesg(mq=0x1)`: `func_80004628` (the
+   controller-manager reader from aki's rung-18 notes) <- overlay-bank
+   chain `func_800E24D4 <- func_800E2704 <- func_800E1BAC/1B90` <-
+   `func_80000870 <- func_800222D8` (thread 6). The OVERLAY GAME LOGIC is
+   executing -- boot is in real menu/logo-era code now.
+3. All three recv sites in func_80004628 pass the CONSTANT D_80057228;
+   each rebuilds `$a0` from `$s0` after `jal func_8002F660`, which
+   saves/restores s0 via its own frame. So the "corruption" is in what
+   the restore loads.
+4. **The punchline:** at the bogus recv, thread 6's `$sp` is
+   `0x80057240` -- INSIDE the D_80057228 OSMesgQueue region. The
+   "saved s0" slot at sp-8 = D_80057228+0x10 = the queue's msgCount
+   field, which our queue mirror faithfully writes as... 1 (capacity).
+   Nothing corrupted the stack; the STACK IS THE QUEUE. The msg=1
+   coincidence was a red herring.
+
+**Open question for next session (single, sharp):** how does thread 6
+come to run `func_8002F660` with `$sp ~= 0x80057240`? Candidates:
+(a) an AKI overlay-dispatch stack switch to a static system stack whose
+address our boot computes differently (earlier divergence poisons a
+stack-base global); (b) sp inherited from a struct field our runtime
+seeds differently (osCreateThread sp arg, or a context-switch helper the
+game hand-rolls); (c) genuine progressive stack overflow walking down
+into .data (0x838xx frames observed earlier are ~0x2C6xx bytes above
+0x57228 -- deep but finite; check thread 6's stack base/size in the
+game's thread table). Instrument: log per-OS-call (thread, sp>>16)
+transitions to find the exact call where sp jumps regions.
+
+Fixes landed this part: executor `set_rdram_base_with_len` + loud
+OSMesgQueue-mirror bounds trap (part 7 item 4 refined); permanent
+NON-POINTER recv diagnostic. Gates green, NMR doc regenerated.
+
+## Session 2026-07-19 (part 9): it's the MENU PUMP -- sp descent quantified, three ranked causes
+
+Probe results (creation table + sp-region transitions, both now permanent
+under FN64_BOOT_PROBE):
+
+- Thread creation table: id1 boot sp=0x8004BE70; id6 overlay-loader
+  sp=0x800839A0 (the stack TOP abuts the cart handle struct -- same
+  constant, not a conflict); id3 main sp=0x80055940 pri70; id3->synthetic
+  0xF0000000 audio sp=0x800E0900 pri80.
+- Thread 6's $sp descends MONOTONICALLY (0x839A0 -> 0x80010 -> 0x7BFE8
+  -> ... -> 0x57240 at the trap), ~0x550 bytes per iteration, plowing
+  through its own OSThread struct at 0x800807F0 long before the trap.
+  No guest code anywhere in the corpus loads $sp from memory or adjusts
+  it dynamically -- this is pure nested-frame accumulation.
+- The loop: `0x800E1BF4: jal func_800E2704; beq $v0, $zero, L_800E1BF4`
+  (funcs_16.c, section-2 overlay bank -- N64Recomp DID suffix the
+  same-VA twin as `_bank4_text`, so linking is unambiguous). This is the
+  game's menu/mode-select pump: iterate until the handler returns a
+  selection. On hardware it is sp-NEUTRAL per iteration.
+- `execute_pif` now clears the PIF control byte (pif_ram[63]=0) after
+  processing, like real hardware -- this alone took per-boot SI
+  transactions from 8 to 83 (controller reads now flow per iteration),
+  but the pump still never returns nonzero and still leaks stack.
+
+**Ranked causes for next session:**
+1. **The C-lane OS-call charge (OUR 2026-07-19 change) makes every OS
+   call a TWO-step suspension** (checkpoint yield, then the real yield).
+   Audit `Executor` resume delivery for wakes landing on the checkpoint
+   suspension instead of the following real Block yield (pending_resume /
+   wake_thread interleaving). A lost/misdelivered recv resume would make
+   the pump's input read misbehave every iteration. Quick falsification:
+   set the charge to 0 (or only charge AFTER the real yield) and see if
+   the descent changes.
+2. **Phantom menu descend**: the pump may be stacking menu screens on
+   misread pad data (neutral pad misparsed as repeated input). Dump
+   `read_data_response` bytes vs what func_80004628's parser expects.
+3. Genuine generated-code sp-leak on some func_800E2704 exit path
+   (least likely -- N64Recomp epilogues are per-exit-site faithful).
+
+Also landed this part: permanent creation-table and sp-region probes,
+PIF control-byte clear. Trap/back-stop diagnostics from parts 7-8 all
+still in place. Gates green.

@@ -74,10 +74,14 @@ delete the adapter when no one needs the fork.
 
 We reach RT64 through exactly one boundary: **process a gfx display-list task
 → a rendered frame**, plus lifecycle (create device/window, present, resize).
-Everything RT64-specific (D3D12/Vulkan/Metal, HLE microcode handling) lives
-behind that. `fn64-rt64` (→ `fn64-render-rt64`) already exists as the intended quarantine crate.
+Everything RT64-specific (D3D12/Vulkan/Metal and native HLE execution) lives
+behind that. Backend-neutral content-addressed microcode catalogs, immutable
+ordered task/self-load plans, and raw-DPC FullSync inspection live in
+`fn64-render`, so native and reference backends cannot drift on those handoff
+invariants. `fn64-rt64` (→
+`fn64-render-rt64`) already exists as the intended quarantine crate.
 
-### The trait (crate: `fn64-render`)
+### The shared seam (crate: `fn64-render`)
 
 ```rust
 /// A graphics backend: consumes N64 gfx tasks (F3DEX-family display lists from
@@ -92,7 +96,7 @@ pub trait RenderBackend {
         task: &OsTask,
         output_addr: u32,
     ) -> Result<FrameStatus, RenderError>;
-    fn present(&mut self, vi: ViPresentation) -> Result<(), RenderError>;
+    fn present(&mut self, request: PresentRequest<'_>) -> Result<(), RenderError>;
     fn resize(&mut self, w: u32, h: u32);
     /// Which microcode GBIs this backend actually implements — a task using an
     /// unlisted ucode traps by name (no silent black frame).
@@ -105,19 +109,51 @@ image, not backend-private scratch. It is explicit in the type boundary so
 `G_DMA_IO`, ucode overlays, CPU SP-memory access, and later commands in the
 same task cannot accidentally observe different banks. The backend still has
 no callback into runtime state: it receives exactly the two mutable memory
-resources the task can affect.
+resources the task can affect. A native adapter may snapshot those resources
+inside one synchronous call solely to provide rollback: RT64 publishes no
+renderer-context checkpoint, so fn64 commits the live RDRAM/RSP images only
+after the native result passes its schema, ordered-plan, and exact FullSync
+checks. A rejected call restores both live images and destroys the context;
+the snapshot is never retained as a second device-memory authority.
 
-`ViPresentation` carries V-blank-latched scanout state separately from RDP
-task execution. Its typed controls cover black, the public 10-bit fade factor,
-and first-line repetition. The reference backend keeps an RDP source image and
-a distinct presented image, so these effects never destroy the frame restored
-when they are disabled. The RT64 adapter passes those typed controls over its
-foreign boundary and realizes them with VI pixel type, zero vertical scale,
-and the 10-bit vertical subpixel offset; it does not rewrite the RDP image.
+The same crate owns exact SHA-256-to-wire-family catalogs for complete IMEM
+images, immutable plans retaining task entry plus every ordered self-load
+generation, and the public RDP Command Summary Table 11 width classifier used
+to inspect raw DPC ranges for FullSync. These are backend
+admission/completion mechanisms, not renderer implementations: the reference
+rasterizer and RT64 adapter consume them through the same typed API. The RT64
+adapter also binds each task to a schema-checked immutable ABI encoding of that
+plan. Its pinned pre-cache observer forces native recognition and requires
+exact ordered exhaustion, including same-address and `A -> B -> A` generations;
+precommit incompatibility returns typed `NeedsLle`, while divergence after
+execution begins poisons the context.
 
-### Adapter today: `fn64-render-rt64` (= the current `fn64-rt64` (→ `fn64-render-rt64`), renamed by role)
+`PresentRequest` co-binds `ViPresentation`'s V-blank-latched scanout state with
+a move-only `PhysicalRdramRead` capability for that exact retrace. Integrated
+execution creates the capability while the guest is suspended and without a
+competing Rust slice; its higher-ranked lifetime prevents a safe backend from
+retaining process memory. The `live` constructor requires `Registers`; explicit
+backend-resident and physical-memory compatibility constructors require
+`BackendOnly`, so neither can silently satisfy live `VI_ORIGIN` registers or
+produce authoritative release capture. The reference backend therefore keeps
+its RDP image and its RDRAM-derived presented image distinct, rereads
+RGBA16/RGBA32 source bytes on every field, and never destroys the RDP image
+while applying black, the public 10-bit fade factor, or first-line repetition.
+The RT64 adapter passes
+the same current allocation and typed controls over its foreign boundary,
+waits the native worker queues idle, restores placeholder RDRAM aliases before
+returning, and does not rewrite the RDP image during presentation. Native
+preflight consumes `fn64-render`'s typed footprint for the source rows selected
+by public coordinate arithmetic; the deterministic reference filter halo
+remains a separate policy.
 
-Implements `RenderBackend` over the MIT RT64 fork via FFI. Owns all C++ interop.
+### Adapters today: `fn64-render-reference` and `fn64-render-rt64`
+
+`fn64-render-reference` implements the deterministic pure-Rust
+`ReferenceBackend`, including the geometry/object decoders, software rasterizer,
+and reference VI path. `fn64-render-rt64` implements `RenderBackend` over the
+MIT RT64 fork via FFI and owns all C++ interop. The extraction preserves the
+frozen `fn64-render` seam.
 The runtime and shell see only `dyn RenderBackend`. Tests: task-fixture replays
 (a captured display list → a frame hash), and the trap path (unlisted ucode →
 named error, not a crash).
@@ -136,7 +172,8 @@ adapter first (we need the reference to diff against).
 This list is kept for the rationale, not as a work queue — read the annotations
 before following it.
 
-1. ~~**Define the traits**~~ **DONE.** `fn64-render`'s `RenderBackend` lives at
+1. ~~**Define the shared seam**~~ **DONE.** `fn64-render`'s `RenderBackend`,
+   content-addressed ordered admission, and raw-DPC completion inspection live at
    `crates/fn64-render/src/lib.rs`; the recomp side landed as the `c`/`rs` lane
    split (DESIGN.md §1.1).
 2. ~~**Wrap the recompiler fork** as `fn64-recomp-n64recomp`~~ **NOT DONE, and
@@ -146,7 +183,8 @@ before following it.
    instead of being adapter-wrapped. `aki_profile` is legacy (ROADMAP Phase H).
 3. ~~**Rename `fn64-rt64` → `fn64-render-rt64`**~~ **DONE**, behind the
    `RenderBackend` trait; fixture-replay tests live in
-   `crates/fn64-render-rt64/tests/`.
+   `crates/fn64-render-reference/tests/` for reference behavior and
+   `crates/fn64-render-rt64/tests/` for native-adapter behavior.
 4. **Rebrand the forks by role**: `fn64/n64recomp` stays (it's literally a fork,
    honest name), but our crates and docs speak in fn64-recomp / fn64-render terms
    so the *project's* vocabulary is already decoupled before the code is.
@@ -168,8 +206,9 @@ rebuilt correctly on our schedule.
 A crate marks a **swap boundary** (backend you can replace) or a **cross-tool shared type**.
 Not a topic. MMIO / save / libultra are modules *inside* `fn64-runtime`, not crates.
 
-**Exists:** fn64-runtime, fn64-abi, fn64-render (trait), fn64-render-rt64 (RT64 stub + reference
-raster), fn64-shell.
+**Exists:** fn64-runtime, fn64-abi, fn64-render (trait + neutral render
+mechanisms), fn64-render-reference (deterministic Rust reference renderer),
+fn64-render-rt64 (RT64 adapter), fn64-shell.
 
 **To add, prioritized:**
 1. **fn64-audio** — the `AudioBackend` trait (consume AI samples → host stream) + a cpal backend +

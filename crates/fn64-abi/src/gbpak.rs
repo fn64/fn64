@@ -249,6 +249,7 @@ pub unsafe extern "C" fn osGbpakReadWrite_recomp(rdram: *mut u8, ctx: *mut Recom
     let valid_range = address.is_multiple_of(GB_BLOCK as u16)
         && size.is_multiple_of(GB_BLOCK)
         && usize::from(address).saturating_add(size) <= 0xc000;
+    let mut observed = None;
     let result = if !valid_range {
         Err(PFS_ERR_INVALID)
     } else {
@@ -264,11 +265,13 @@ pub unsafe extern "C" fn osGbpakReadWrite_recomp(rdram: *mut u8, ctx: *mut Recom
                     OS_READ => {
                         let bytes = read_bus(pak, address, size);
                         unsafe { copy_to_guest(storage, ctx.r7, &bytes) };
+                        observed = Some((channel, fn64_runtime::ControllerOperationKind::Read));
                         Ok(())
                     }
                     OS_WRITE => {
                         let bytes = unsafe { copy_from_guest(storage, ctx.r7, size) };
                         write_bus(pak, address, &bytes);
+                        observed = Some((channel, fn64_runtime::ControllerOperationKind::Write));
                         Ok(())
                     }
                     _ => Err(PFS_ERR_INVALID),
@@ -276,6 +279,15 @@ pub unsafe extern "C" fn osGbpakReadWrite_recomp(rdram: *mut u8, ctx: *mut Recom
             })
         })
     };
+    if result.is_ok() {
+        let (channel, operation) =
+            observed.expect("successful Transfer Pak transfer lacks typed observation");
+        crate::record_controller_operation(
+            channel,
+            fn64_runtime::ControllerOperationDevice::TransferPak,
+            operation,
+        );
+    }
     set_result(ctx, result);
 }
 
@@ -422,6 +434,7 @@ mod tests {
     #[test]
     fn high_level_and_raw_paths_share_mapper_and_persistent_ram() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom(vec![0; 0x100]);
         set_controller_port_state(0, fn64_runtime::PortState::StandardControllerTransferPak);
         let mut rom = synthetic_rom(0x03, 64, 3);
         for bank in 0..64 {
@@ -469,11 +482,32 @@ mod tests {
             ),
             0x5a
         );
+        let operations = crate::copy_controller_operations();
+        assert_eq!(operations.len(), 2);
+        assert_eq!(
+            operations
+                .iter()
+                .map(|event| (event.port, event.device, event.operation))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    0,
+                    fn64_runtime::ControllerOperationDevice::TransferPak,
+                    fn64_runtime::ControllerOperationKind::Write,
+                ),
+                (
+                    0,
+                    fn64_runtime::ControllerOperationDevice::TransferPak,
+                    fn64_runtime::ControllerOperationKind::Read,
+                ),
+            ]
+        );
     }
 
     #[test]
     fn removal_is_sticky_once_and_invalid_transfers_are_rejected() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom(vec![0; 0x100]);
         set_controller_port_state(0, fn64_runtime::PortState::StandardControllerTransferPak);
         let rom = synthetic_rom(0, 2, 0);
         insert_transfer_pak_cartridge(0, rom.clone(), None).unwrap();
@@ -502,6 +536,7 @@ mod tests {
         unsafe { storage.write_u32(RdramAddr::from_offset(0x810), GB_BLOCK as u32) };
         unsafe { osGbpakReadWrite_recomp(rdram.as_mut_ptr(), &mut ctx) };
         assert_eq!(ctx.r2, PFS_ERR_INVALID as u64);
+        assert!(crate::copy_controller_operations().is_empty());
     }
 
     #[test]

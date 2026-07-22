@@ -45,9 +45,10 @@ toml = "0.8"
 dirs = "5"
 fn64-runtime = { path = "../../fn64-runtime" }
 fn64-abi = { path = "../../fn64-abi", features = ["recomp-rs"] }
-fn64-boot-harness = { path = "../../fn64-boot-harness" }
+fn64-boot-harness = { path = "../../fn64-boot-harness", features = ["recomp-rs"] }
 fn64-recomp-rs = { path = "../../fn64-recomp-rs" }
 fn64-render = { path = "../../fn64-render" }
+fn64-render-reference = { path = "../../fn64-render-reference" }
 fn64-render-rt64 = { path = "../../fn64-render-rt64" }
 fn64-audio = { path = "../../fn64-audio" }
 # Refreshed symlink to the env-selected out-of-tree emitted crate (Cargo

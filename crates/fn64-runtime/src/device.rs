@@ -27,7 +27,7 @@ use std::fmt;
 use crate::mmio::{AI_STATUS_BUSY, AI_STATUS_FULL};
 use crate::rdram::RdramAddr;
 use crate::rom::{DmaCompletion, DmaMemory, PiDma, PiDmaError, RomStorage};
-use crate::rsp::{RspMemAddr, RspMemory, RspMemoryError, RSP_MEMORY_BANK_SIZE};
+use crate::rsp::{RspMemAddr, RspMemory, RspMemoryBank, RspMemoryError, RSP_MEMORY_BANK_SIZE};
 use crate::trace::DmaDirection;
 use crate::tv::{TvType, CPU_CLOCK_HZ};
 
@@ -251,6 +251,19 @@ pub enum RcpTaskCompletion {
     Dp,
 }
 
+/// Architecturally observable completions produced by one RSP task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RcpTaskCompletionPlan {
+    SpOnly,
+    SpThenDpFullSync,
+}
+
+impl RcpTaskCompletionPlan {
+    const fn reaches_dp_full_sync(self) -> bool {
+        matches!(self, Self::SpThenDpFullSync)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PiDomain {
     Domain1,
@@ -285,6 +298,12 @@ pub struct PiDomainTiming {
 /// without changing PI state/event semantics or either caller path.
 pub trait PiTimingModel {
     fn completion_latency(&self, request: PiDmaRequest, timing: PiDomainTiming) -> Cycles;
+
+    /// Canonical policy bytes for deterministic fixed-cycle evidence.
+    /// Implementors must bind every field that can change a future
+    /// completion deadline; the release encoder adds its own length and
+    /// domain separation.
+    fn evidence_bytes(&self) -> Vec<u8>;
 }
 
 /// Explicit deterministic PI policy for hosts that do not yet install a
@@ -298,6 +317,12 @@ impl PiTimingModel for FixedPiTiming {
     fn completion_latency(&self, _request: PiDmaRequest, _timing: PiDomainTiming) -> Cycles {
         self.0
     }
+
+    fn evidence_bytes(&self) -> Vec<u8> {
+        let mut bytes = b"fn64.pi-timing.fixed.v1\0".to_vec();
+        bytes.extend_from_slice(&self.0.get().to_be_bytes());
+        bytes
+    }
 }
 
 /// OS-facing work produced after a device event is fully committed.
@@ -306,7 +331,7 @@ pub enum DeviceNotification {
     PiDmaComplete(DmaCompletion),
     AiDmaComplete(AiDmaRequest),
     SiDmaComplete(SiDmaRequest),
-    ViRetrace,
+    ViRetrace { at: Cycles },
     RcpTaskComplete(RcpTaskCompletion),
 }
 
@@ -359,6 +384,7 @@ pub enum DeviceFault {
     ZeroViInterval,
     SiBusy,
     SpBusy,
+    SpNotRunning,
     SpDmaFull,
     SpDmaMemory(RspMemoryError),
     SpDmaDramRangeOverflow { request: SpDmaRequest },
@@ -388,6 +414,7 @@ impl fmt::Display for DeviceFault {
             Self::ZeroViInterval => write!(f, "VI field interval must be nonzero"),
             Self::SiBusy => write!(f, "SI DMA start while the SI channel is busy"),
             Self::SpBusy => write!(f, "RSP task start while SP is busy"),
+            Self::SpNotRunning => write!(f, "RSP task completion without an in-flight task"),
             Self::SpDmaFull => write!(f, "SP DMA start while active and pending slots are full"),
             Self::SpDmaMemory(error) => write!(f, "SP DMA rejected: {error}"),
             Self::SpDmaDramRangeOverflow { request } => write!(
@@ -459,6 +486,51 @@ enum DeviceEvent {
     Dp { token: u64 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScheduledDeviceEventKind {
+    Pi,
+    Ai,
+    Si,
+    SpDma,
+    Vi,
+    Sp,
+    Dp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScheduledDeviceEventSnapshot {
+    pub at: Cycles,
+    pub sequence: u64,
+    pub token: u64,
+    pub kind: ScheduledDeviceEventKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingPiSnapshot {
+    pub token: u64,
+    pub request: PiDmaRequest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingAiSnapshot {
+    pub token: u64,
+    pub request: AiDmaRequest,
+    pub started_at: Cycles,
+    pub deadline: Cycles,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingSiSnapshot {
+    pub token: u64,
+    pub request: SiDmaRequest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingSpDmaSnapshot {
+    pub token: u64,
+    pub request: SpDmaRequest,
+}
+
 /// Guest-visible PI/MI snapshot used by deterministic traces and tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceSnapshot {
@@ -485,6 +557,43 @@ pub struct DeviceSnapshot {
     pub mi_mask: u32,
     pub pi_domain1: PiDomainTiming,
     pub pi_domain2: PiDomainTiming,
+}
+
+/// Release-only, future-state-complete view of the modeled device fabric.
+///
+/// [`DeviceSnapshot`] intentionally remains the compact guest-register view
+/// used by ordinary runtime code. This evidence view additionally binds all
+/// modeled memory, queues, policy, and scheduled ordering that can make the
+/// same later input produce a different device result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceEvidenceSnapshot {
+    pub guest: DeviceSnapshot,
+    pub pi_timing_policy: Vec<u8>,
+    pub pending_pi: Option<PendingPiSnapshot>,
+    pub current_ai: Option<PendingAiSnapshot>,
+    pub queued_ai: Option<AiDmaRequest>,
+    pub pending_si: Option<PendingSiSnapshot>,
+    pub si_dma_error: bool,
+    pub si_latency: Cycles,
+    pub pif_ram: [u8; 64],
+    pub rsp_dmem: [u8; RSP_MEMORY_BANK_SIZE],
+    pub rsp_imem: [u8; RSP_MEMORY_BANK_SIZE],
+    pub sp_rd_len: u32,
+    pub sp_wr_len: u32,
+    pub sp_pc: u32,
+    pub sp_semaphore: bool,
+    pub active_sp_dma: Option<PendingSpDmaSnapshot>,
+    pub queued_sp_dma: Option<SpDmaRequest>,
+    pub sp_dma_setup_cycles: Cycles,
+    pub vi_registers: [u32; 14],
+    pub vi_epoch: Cycles,
+    pub pending_vi_token: Option<u64>,
+    pub pending_sp_token: Option<u64>,
+    pub pending_dp_token: Option<u64>,
+    pub scheduled_events: Vec<ScheduledDeviceEventSnapshot>,
+    pub next_event_sequence: u64,
+    pub save_bytes: Option<Vec<u8>>,
+    pub pending_eeprom_write: Option<crate::rom::PendingEepromWriteSnapshot>,
 }
 
 /// One authoritative device state machine.
@@ -588,6 +697,12 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         &mut self.pi_dma
     }
 
+    /// Immutable access to the PI storage engine's typed observation history.
+    /// Mutating save protocols continue to use [`Self::pi_dma_mut`].
+    pub fn pi_dma(&self) -> &PiDma<R> {
+        &self.pi_dma
+    }
+
     pub const fn pending_pi_request(&self) -> Option<PiDmaRequest> {
         match self.pending_pi {
             Some(pending) => Some(pending.request),
@@ -627,6 +742,80 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             mi_mask: self.mi_mask,
             pi_domain1: self.pi_domain1,
             pi_domain2: self.pi_domain2,
+        }
+    }
+
+    pub fn evidence_snapshot(&mut self) -> DeviceEvidenceSnapshot {
+        let pi_timing_policy = self.pi_timing.evidence_bytes();
+        assert!(
+            !pi_timing_policy.is_empty(),
+            "PiTimingModel::evidence_bytes must identify every future-affecting timing policy"
+        );
+        let scheduled_events = self
+            .events
+            .iter()
+            .map(|(&(at, sequence), event)| {
+                let (token, kind) = match *event {
+                    DeviceEvent::Pi { token } => (token, ScheduledDeviceEventKind::Pi),
+                    DeviceEvent::Ai { token } => (token, ScheduledDeviceEventKind::Ai),
+                    DeviceEvent::Si { token } => (token, ScheduledDeviceEventKind::Si),
+                    DeviceEvent::SpDma { token } => (token, ScheduledDeviceEventKind::SpDma),
+                    DeviceEvent::Vi { token } => (token, ScheduledDeviceEventKind::Vi),
+                    DeviceEvent::Sp { token } => (token, ScheduledDeviceEventKind::Sp),
+                    DeviceEvent::Dp { token } => (token, ScheduledDeviceEventKind::Dp),
+                };
+                ScheduledDeviceEventSnapshot {
+                    at,
+                    sequence,
+                    token,
+                    kind,
+                }
+            })
+            .collect();
+        let pending_eeprom_write = self.pi_dma.pending_eeprom_write_snapshot();
+        let save_bytes = self.pi_dma.save_snapshot_bytes();
+        DeviceEvidenceSnapshot {
+            guest: self.snapshot(),
+            pi_timing_policy,
+            pending_pi: self.pending_pi.map(|pending| PendingPiSnapshot {
+                token: pending.token,
+                request: pending.request,
+            }),
+            current_ai: self.current_ai.map(|pending| PendingAiSnapshot {
+                token: pending.token,
+                request: pending.request,
+                started_at: pending.started_at,
+                deadline: pending.deadline,
+            }),
+            queued_ai: self.queued_ai,
+            pending_si: self.pending_si.map(|pending| PendingSiSnapshot {
+                token: pending.token,
+                request: pending.request,
+            }),
+            si_dma_error: self.si_dma_error,
+            si_latency: self.si_latency,
+            pif_ram: self.pif_ram,
+            rsp_dmem: *self.rsp_memory.bank(RspMemoryBank::Dmem),
+            rsp_imem: *self.rsp_memory.bank(RspMemoryBank::Imem),
+            sp_rd_len: self.sp_rd_len,
+            sp_wr_len: self.sp_wr_len,
+            sp_pc: self.sp_pc,
+            sp_semaphore: self.sp_semaphore,
+            active_sp_dma: self.active_sp_dma.map(|pending| PendingSpDmaSnapshot {
+                token: pending.token,
+                request: pending.request,
+            }),
+            queued_sp_dma: self.queued_sp_dma,
+            sp_dma_setup_cycles: self.sp_dma_setup_cycles,
+            vi_registers: self.vi_registers,
+            vi_epoch: self.vi_epoch,
+            pending_vi_token: self.pending_vi,
+            pending_sp_token: self.pending_sp,
+            pending_dp_token: self.pending_dp,
+            scheduled_events,
+            next_event_sequence: self.next_event_sequence,
+            save_bytes,
+            pending_eeprom_write,
         }
     }
 
@@ -697,6 +886,51 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 
     pub fn cpu_interrupt_pending(&self) -> bool {
         self.mi_pending & self.mi_mask != 0
+    }
+
+    /// Direct CPU word load from the 64-byte PIF RAM window
+    /// (`0x1FC007C0..0x1FC00800`). Real hardware exposes PIF RAM to uncached
+    /// CPU loads as well as SI DMA; AKI-era hand-rolled joybus code and
+    /// boot-handshake polls read it directly (e.g. the terminate-boot status
+    /// word at 0x1FC007FC).
+    pub fn pif_ram_cpu_read_w(&self, offset: usize) -> u32 {
+        let offset = offset & !3;
+        u32::from_be_bytes(self.pif_ram[offset..offset + 4].try_into().unwrap())
+    }
+
+    /// Direct CPU word store into PIF RAM. Bytes only -- the PIF command
+    /// interpreter is injected by the ABI layer and runs on the `DramToPif`
+    /// DMA completion path, which is how joybus command buffers arrive.
+    /// ponytail: a CPU store to the final command byte does not run the
+    /// interpreter yet; wire the injected executor through here if a title's
+    /// hand-rolled code ever issues commands by direct store.
+    pub fn pif_ram_cpu_write_w(&mut self, offset: usize, value: u32) {
+        let offset = offset & !3;
+        self.pif_ram[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    /// Stage one complete Controller Manager command image in the physical
+    /// PIF RAM owned by this fabric. The caller must first acquire the SI
+    /// engine with a typed controller request; otherwise a failed overlap
+    /// could overwrite the command belonging to the live transfer.
+    pub fn stage_controller_pif_command(&mut self, command: [u8; 64]) {
+        assert!(
+            matches!(
+                self.pending_si_request(),
+                Some(SiDmaRequest {
+                    kind: SiDmaKind::ControllerQuery | SiDmaKind::ControllerRead,
+                    ..
+                })
+            ),
+            "controller PIF command staged without an accepted Controller Manager SI request"
+        );
+        self.pif_ram = command;
+    }
+
+    /// Exact physical PIF RAM image. Controller Manager getters decode only
+    /// this completed device-owned transaction, never a second live sample.
+    pub const fn pif_ram(&self) -> &[u8; 64] {
+        &self.pif_ram
     }
 
     pub const fn ai_status(&self) -> u32 {
@@ -886,6 +1120,20 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 
     pub fn next_deadline(&self) -> Option<Cycles> {
         self.events.first_key_value().map(|(key, _)| key.0)
+    }
+
+    /// Exact pending VI interrupt deadline. Hosts use this rather than adding
+    /// a cached interval to an older host tick: instruction checkpoints may
+    /// advance the shared clock between quiescent field pumps, and VI timing
+    /// register writes may reschedule the next interrupt.
+    pub fn next_vi_deadline(&self) -> Option<Cycles> {
+        let pending = self.pending_vi?;
+        self.events
+            .iter()
+            .find_map(|(&(at, _), event)| match event {
+                DeviceEvent::Vi { token } if *token == pending => Some(at),
+                _ => None,
+            })
     }
 
     pub fn trace(&self) -> &[DeviceTraceEvent] {
@@ -1120,6 +1368,32 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         task_addr: RdramAddr,
         header: crate::rsp::OsTaskHeader,
     ) -> Result<(), DeviceFault> {
+        let boot_size = header
+            .ucode_boot_size
+            .checked_add(7)
+            .map(|size| size & !7)
+            .filter(|size| *size != 0 && *size as usize <= RSP_MEMORY_BANK_SIZE)
+            .ok_or(DeviceFault::InvalidSpTaskBootSize {
+                size: header.ucode_boot_size,
+            })? as usize;
+        // OSTask pointers may be physical or direct-mapped KSEG0/KSEG1.
+        // Both reduce to the public 29-bit physical bus address this way.
+        let boot_addr = (header.ucode_boot & 0x1fff_ffff) & !7;
+        let boot = rdram.dma_read_bytes_flat(boot_addr as usize, boot_size);
+        self.admit_sp_task_with_boot_image(rdram, task_addr, header, &boot)
+    }
+
+    /// Variant of [`Self::admit_sp_task`] for a host whose CPU cache and
+    /// physical DRAM share one backing allocation. `boot` is the CPU-visible
+    /// rspboot text selected by the OS loader, while `rdram` remains the
+    /// physical image used for the task header and all device-visible data.
+    pub fn admit_sp_task_with_boot_image<M: DmaMemory + ?Sized>(
+        &mut self,
+        rdram: &M,
+        task_addr: RdramAddr,
+        header: crate::rsp::OsTaskHeader,
+        boot: &[u8],
+    ) -> Result<(), DeviceFault> {
         if self.sp_status() & SP_STATUS_HALT == 0 || self.pending_sp.is_some() {
             return Err(DeviceFault::SpTaskNotHalted);
         }
@@ -1134,17 +1408,20 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             .ok_or(DeviceFault::InvalidSpTaskBootSize {
                 size: header.ucode_boot_size,
             })? as usize;
+        assert_eq!(
+            boot.len(),
+            boot_size,
+            "osSpTaskLoad cached rspboot image has {} bytes; aligned task size requires {boot_size}",
+            boot.len()
+        );
         let task_bytes = rdram.dma_read_bytes_flat(task_addr.offset() as usize, 64);
         self.rsp_memory
             .write_bytes(RspMemAddr::from_register(0x0fc0), &task_bytes)
             .map_err(DeviceFault::SpDmaMemory)?;
 
-        // OSTask pointers may be physical or direct-mapped KSEG0/KSEG1.
-        // Both reduce to the public 29-bit physical bus address this way.
         let boot_addr = (header.ucode_boot & 0x1fff_ffff) & !7;
-        let boot = rdram.dma_read_bytes_flat(boot_addr as usize, boot_size);
         self.rsp_memory
-            .write_bytes(RspMemAddr::from_register(0x1000), &boot)
+            .write_bytes(RspMemAddr::from_register(0x1000), boot)
             .map_err(DeviceFault::SpDmaMemory)?;
         self.sp_mem_addr = RspMemAddr::from_register(0x1000);
         self.sp_dram_addr = RdramAddr::from_offset(boot_addr);
@@ -1157,8 +1434,8 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// the HLE task backend. SP completes one deterministic guest cycle after
     /// the kick; graphics DP completion follows one cycle later, preserving
     /// the architectural SP-before-DP ordering without claiming RDP timing.
-    pub fn start_rcp_task(&mut self, needs_dp: bool) -> Result<(), DeviceFault> {
-        self.start_rcp_task_with_latency(needs_dp, Cycles::new(1))
+    pub fn start_rcp_task(&mut self, plan: RcpTaskCompletionPlan) -> Result<(), DeviceFault> {
+        self.start_rcp_task_with_latency(plan, Cycles::new(1))
     }
 
     /// Schedule completion after a measured amount of synchronous RSP work.
@@ -1166,10 +1443,50 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// this delay controls only when its architectural interrupt is observable.
     pub fn start_rcp_task_with_latency(
         &mut self,
-        needs_dp: bool,
+        plan: RcpTaskCompletionPlan,
         sp_latency: Cycles,
     ) -> Result<(), DeviceFault> {
         if self.pending_sp.is_some() {
+            return Err(DeviceFault::SpBusy);
+        }
+        if plan.reaches_dp_full_sync() && self.pending_dp.is_some() {
+            return Err(DeviceFault::DpBusy);
+        }
+        self.begin_rcp_task()?;
+        self.finish_rcp_task(plan, sp_latency)
+    }
+
+    /// Mark an asynchronously chunked RSP task as running without fabricating
+    /// a completion deadline. The retained token becomes schedulable exactly
+    /// once through [`Self::finish_rcp_task`].
+    pub fn begin_rcp_task(&mut self) -> Result<(), DeviceFault> {
+        if self.pending_sp.is_some() {
+            return Err(DeviceFault::SpBusy);
+        }
+        let sp_token = self.next_event_sequence;
+        self.next_event_sequence = self
+            .next_event_sequence
+            .checked_add(1)
+            .ok_or(DeviceFault::DeadlineOverflow)?;
+        self.pending_sp = Some(sp_token);
+        self.sp_status &= !(SP_STATUS_HALT | SP_STATUS_BROKE);
+        Ok(())
+    }
+
+    /// Schedule the sole completion of work previously admitted by
+    /// [`Self::begin_rcp_task`].
+    pub fn finish_rcp_task(
+        &mut self,
+        plan: RcpTaskCompletionPlan,
+        sp_latency: Cycles,
+    ) -> Result<(), DeviceFault> {
+        let needs_dp = plan.reaches_dp_full_sync();
+        let sp_token = self.pending_sp.ok_or(DeviceFault::SpNotRunning)?;
+        if self
+            .events
+            .values()
+            .any(|event| matches!(event, DeviceEvent::Sp { token } if *token == sp_token))
+        {
             return Err(DeviceFault::SpBusy);
         }
         if needs_dp && self.pending_dp.is_some() {
@@ -1179,13 +1496,6 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             .now
             .checked_add(sp_latency)
             .ok_or(DeviceFault::DeadlineOverflow)?;
-        let sp_token = self.next_event_sequence;
-        self.next_event_sequence = self
-            .next_event_sequence
-            .checked_add(1)
-            .ok_or(DeviceFault::DeadlineOverflow)?;
-        self.pending_sp = Some(sp_token);
-        self.sp_status &= !(SP_STATUS_HALT | SP_STATUS_BROKE);
         self.events
             .insert((sp_deadline, sp_token), DeviceEvent::Sp { token: sp_token });
         if needs_dp {
@@ -1207,6 +1517,33 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 .insert((dp_deadline, dp_token), DeviceEvent::Dp { token: dp_token });
         }
         self.record(DeviceTraceKind::RcpTaskStarted { needs_dp });
+        Ok(())
+    }
+
+    /// Schedule the DP interrupt generated by a raw CPU/RSP DPC range that
+    /// reached FullSync without starting a new SP task.
+    pub fn start_dp_full_sync(&mut self, latency: Cycles) -> Result<(), DeviceFault> {
+        assert!(latency.get() > 0, "DP FullSync latency must be nonzero");
+        // Interleaving closed here: CPU thread A may submit a second raw DPC
+        // FullSync after rendering has committed but before thread B services
+        // the first DP event. One hardware DP completion slot cannot identify
+        // both interrupts, so reject the second submission before allocating
+        // an event token instead of overwriting or coalescing the first.
+        if self.pending_dp.is_some() {
+            return Err(DeviceFault::DpBusy);
+        }
+        let deadline = self
+            .now
+            .checked_add(latency)
+            .ok_or(DeviceFault::DeadlineOverflow)?;
+        let token = self.next_event_sequence;
+        self.next_event_sequence = self
+            .next_event_sequence
+            .checked_add(1)
+            .ok_or(DeviceFault::DeadlineOverflow)?;
+        self.pending_dp = Some(token);
+        self.events
+            .insert((deadline, token), DeviceEvent::Dp { token });
         Ok(())
     }
 
@@ -1503,6 +1840,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                             request.len,
                         )
                         .map_err(DeviceFault::PiTransfer)?;
+                    self.pi_dma.record_sram_dma_commit(self.now, completion);
                     self.record(DeviceTraceKind::PiBytesCommitted(request));
                     self.pending_pi = None;
                     self.pi_status &= !PI_STATUS_DMA_BUSY;
@@ -1544,9 +1882,25 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                             self.pif_ram.copy_from_slice(&bytes);
                             execute_pif(self.now, &mut self.pif_ram, &mut self.pi_dma);
                         }
-                        SiDmaKind::PifToDram => rdram
-                            .dma_write_bytes(request.dram_addr.offset() as usize, &self.pif_ram),
-                        SiDmaKind::ControllerQuery | SiDmaKind::ControllerRead => {}
+                        SiDmaKind::PifToDram => {
+                            {
+                                static PROBE: std::sync::OnceLock<bool> =
+                                    std::sync::OnceLock::new();
+                                if *PROBE
+                                    .get_or_init(|| std::env::var_os("FN64_BOOT_PROBE").is_some())
+                                {
+                                    eprintln!(
+                                        "[boot-probe] PifToDram response: {:02x?}",
+                                        self.pif_ram
+                                    );
+                                }
+                            }
+                            rdram
+                                .dma_write_bytes(request.dram_addr.offset() as usize, &self.pif_ram)
+                        }
+                        SiDmaKind::ControllerQuery | SiDmaKind::ControllerRead => {
+                            execute_pif(self.now, &mut self.pif_ram, &mut self.pi_dma);
+                        }
                     }
                     self.record(DeviceTraceKind::SiBytesCommitted(request));
                     self.pending_si = None;
@@ -1607,7 +1961,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     self.pending_vi = None;
                     self.record(DeviceTraceKind::ViInterrupt);
                     self.raise_interrupt(InterruptSource::Vi);
-                    let notification = DeviceNotification::ViRetrace;
+                    let notification = DeviceNotification::ViRetrace { at: self.now };
                     notifications.push(notification);
                     self.record(DeviceTraceKind::NotificationReady(notification));
                     self.reschedule_vi_interrupt()?;
@@ -1678,6 +2032,12 @@ mod tests {
     impl PiTimingModel for TestTiming {
         fn completion_latency(&self, _request: PiDmaRequest, _timing: PiDomainTiming) -> Cycles {
             self.0
+        }
+
+        fn evidence_bytes(&self) -> Vec<u8> {
+            let mut bytes = b"fn64.pi-timing.test.v1\0".to_vec();
+            bytes.extend_from_slice(&self.0.get().to_be_bytes());
+            bytes
         }
     }
 
@@ -1773,6 +2133,124 @@ mod tests {
         raw.write_mmio(PI_STATUS_REG, 0b10).unwrap();
         assert!(!raw.interrupt_pending(InterruptSource::Pi));
         assert!(!raw.cpu_interrupt_pending());
+    }
+
+    #[test]
+    fn release_evidence_distinguishes_pif_state_that_the_compact_snapshot_cannot() {
+        let mut left = fabric();
+        let mut right = fabric();
+        left.pif_ram_cpu_write_w(0, 0x1122_3344);
+        right.pif_ram_cpu_write_w(0, 0x5566_7788);
+
+        assert_eq!(left.snapshot(), right.snapshot());
+        assert_ne!(left.evidence_snapshot(), right.evidence_snapshot());
+
+        let request = SiDmaRequest {
+            kind: SiDmaKind::PifToDram,
+            dram_addr: RdramAddr::from_offset(0),
+        };
+        left.start_si_dma(request).unwrap();
+        right.start_si_dma(request).unwrap();
+        let mut left_rdram = Rdram::new(64);
+        let mut right_rdram = Rdram::new(64);
+        left.advance_to_with_pif(Cycles::new(1), &mut left_rdram, |_, _, _| {})
+            .unwrap();
+        right
+            .advance_to_with_pif(Cycles::new(1), &mut right_rdram, |_, _, _| {})
+            .unwrap();
+        assert_ne!(left_rdram.read_bytes(0, 64), right_rdram.read_bytes(0, 64));
+    }
+
+    #[test]
+    fn release_evidence_binds_rsp_memory_and_queued_ai_identity() {
+        let mut left = fabric();
+        let mut right = fabric();
+        left.write_mmio(MmioAddr::new(SP_DMEM_START), 0x1122_3344)
+            .unwrap();
+        right
+            .write_mmio(MmioAddr::new(SP_DMEM_START), 0x5566_7788)
+            .unwrap();
+        assert_eq!(left.snapshot(), right.snapshot());
+        assert_ne!(left.evidence_snapshot(), right.evidence_snapshot());
+
+        let current = AiDmaRequest {
+            dram_addr: RdramAddr::from_offset(0x20),
+            len: 0x100,
+            sample_rate_hz: 32_000,
+        };
+        let mut left = fabric();
+        let mut right = fabric();
+        left.start_ai_dma(current).unwrap();
+        right.start_ai_dma(current).unwrap();
+        left.start_ai_dma(AiDmaRequest {
+            dram_addr: RdramAddr::from_offset(0x200),
+            ..current
+        })
+        .unwrap();
+        right
+            .start_ai_dma(AiDmaRequest {
+                dram_addr: RdramAddr::from_offset(0x300),
+                ..current
+            })
+            .unwrap();
+        assert_eq!(left.snapshot(), right.snapshot());
+        assert_ne!(left.evidence_snapshot(), right.evidence_snapshot());
+    }
+
+    #[test]
+    fn release_evidence_binds_save_bytes_and_pending_eeprom_programming() {
+        use crate::save::{InMemorySaveStorage, SaveType};
+
+        let mut left = fabric();
+        let mut right = fabric();
+        left.pi_dma_mut()
+            .set_save(Box::new(InMemorySaveStorage::for_device(
+                SaveType::Eeprom4k,
+            )));
+        right
+            .pi_dma_mut()
+            .set_save(Box::new(InMemorySaveStorage::for_device(
+                SaveType::Eeprom4k,
+            )));
+        left.pi_dma_mut().save_write_from(0, &[0x11; 8]);
+        right.pi_dma_mut().save_write_from(0, &[0x22; 8]);
+        assert_eq!(left.snapshot(), right.snapshot());
+        assert_ne!(left.evidence_snapshot(), right.evidence_snapshot());
+
+        left.pi_dma_mut().save_write_from(0, &[0x33; 8]);
+        right.pi_dma_mut().save_write_from(0, &[0x33; 8]);
+        left.pi_dma_mut()
+            .start_eeprom_write(Cycles::ZERO, 1, [0x44; 8])
+            .unwrap();
+        right
+            .pi_dma_mut()
+            .start_eeprom_write(Cycles::ZERO, 1, [0x55; 8])
+            .unwrap();
+        assert_eq!(left.snapshot(), right.snapshot());
+        assert_ne!(left.evidence_snapshot(), right.evidence_snapshot());
+    }
+
+    #[test]
+    #[should_panic(expected = "PiTimingModel::evidence_bytes must identify")]
+    fn release_evidence_rejects_an_unidentified_pi_timing_policy() {
+        struct UnidentifiedTiming;
+        impl PiTimingModel for UnidentifiedTiming {
+            fn completion_latency(
+                &self,
+                _request: PiDmaRequest,
+                _timing: PiDomainTiming,
+            ) -> Cycles {
+                Cycles::new(1)
+            }
+
+            fn evidence_bytes(&self) -> Vec<u8> {
+                Vec::new()
+            }
+        }
+
+        let mut fabric =
+            DeviceFabric::new(PiDma::new(InMemoryRom::new(Vec::new())), UnidentifiedTiming);
+        let _ = fabric.evidence_snapshot();
     }
 
     #[test]
@@ -2105,7 +2583,9 @@ mod tests {
     fn graphics_task_completes_sp_then_dp_on_distinct_guest_cycles() {
         let mut fabric = fabric();
         let mut rdram = Rdram::new(0x100);
-        fabric.start_rcp_task(true).unwrap();
+        fabric
+            .start_rcp_task(RcpTaskCompletionPlan::SpThenDpFullSync)
+            .unwrap();
         assert!(fabric.snapshot().sp_busy);
         assert!(fabric.snapshot().dp_busy);
         assert!(fabric
@@ -2130,6 +2610,88 @@ mod tests {
         );
         assert!(!fabric.snapshot().dp_busy);
         assert!(fabric.interrupt_pending(InterruptSource::Dp));
+    }
+
+    #[test]
+    fn task_without_dp_full_sync_completes_sp_only() {
+        let mut fabric = fabric();
+        let mut rdram = Rdram::new(0x100);
+        fabric
+            .start_rcp_task(RcpTaskCompletionPlan::SpOnly)
+            .unwrap();
+        assert!(fabric.snapshot().sp_busy);
+        assert!(!fabric.snapshot().dp_busy);
+
+        assert_eq!(
+            fabric.advance_to(Cycles::new(1), &mut rdram).unwrap(),
+            vec![DeviceNotification::RcpTaskComplete(RcpTaskCompletion::Sp)]
+        );
+        assert!(!fabric.interrupt_pending(InterruptSource::Dp));
+        assert!(fabric
+            .advance_to(Cycles::new(2), &mut rdram)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn chunked_rcp_task_is_busy_without_a_fabricated_completion_deadline() {
+        let mut fabric = fabric();
+        fabric.begin_rcp_task().unwrap();
+        assert!(fabric.snapshot().sp_busy);
+        assert_eq!(fabric.next_deadline(), None);
+
+        fabric
+            .finish_rcp_task(RcpTaskCompletionPlan::SpOnly, Cycles::new(2))
+            .unwrap();
+        assert_eq!(fabric.next_deadline(), Some(Cycles::new(2)));
+        assert_eq!(
+            fabric.finish_rcp_task(RcpTaskCompletionPlan::SpOnly, Cycles::new(1)),
+            Err(DeviceFault::SpBusy),
+            "one in-flight task token may acquire only one completion event"
+        );
+    }
+
+    #[test]
+    fn raw_dp_full_sync_completes_dp_without_starting_sp() {
+        let mut fabric = fabric();
+        let mut rdram = Rdram::new(0x100);
+        fabric.start_dp_full_sync(Cycles::new(3)).unwrap();
+        assert!(!fabric.snapshot().sp_busy);
+        assert!(fabric.snapshot().dp_busy);
+        assert!(fabric
+            .advance_to(Cycles::new(2), &mut rdram)
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(
+            fabric.advance_to(Cycles::new(3), &mut rdram).unwrap(),
+            vec![DeviceNotification::RcpTaskComplete(RcpTaskCompletion::Dp)]
+        );
+        assert!(!fabric.interrupt_pending(InterruptSource::Sp));
+        assert!(fabric.interrupt_pending(InterruptSource::Dp));
+    }
+
+    #[test]
+    fn second_raw_dp_full_sync_rejects_without_replacing_pending_completion() {
+        let mut fabric = fabric();
+        fabric.start_dp_full_sync(Cycles::new(3)).unwrap();
+        let before = fabric.evidence_snapshot();
+
+        assert_eq!(
+            fabric.start_dp_full_sync(Cycles::new(1)),
+            Err(DeviceFault::DpBusy)
+        );
+        assert_eq!(fabric.evidence_snapshot(), before);
+
+        let mut rdram = Rdram::new(0x100);
+        assert!(fabric
+            .advance_to(Cycles::new(1), &mut rdram)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fabric.advance_to(Cycles::new(3), &mut rdram).unwrap(),
+            vec![DeviceNotification::RcpTaskComplete(RcpTaskCompletion::Dp)]
+        );
     }
 
     #[test]
@@ -2245,7 +2807,12 @@ mod tests {
         assert_eq!(fabric.read_mmio(VI_CURRENT_REG).unwrap(), 98);
 
         let notifications = fabric.advance_to(Cycles::new(191), &mut rdram).unwrap();
-        assert_eq!(notifications, vec![DeviceNotification::ViRetrace]);
+        assert_eq!(
+            notifications,
+            vec![DeviceNotification::ViRetrace {
+                at: Cycles::new(191)
+            }]
+        );
         assert_eq!(fabric.read_mmio(VI_CURRENT_REG).unwrap(), 100);
         assert!(fabric.interrupt_pending(InterruptSource::Vi));
 
@@ -2257,7 +2824,9 @@ mod tests {
         );
         assert_eq!(
             tail[2].kind,
-            DeviceTraceKind::NotificationReady(DeviceNotification::ViRetrace)
+            DeviceTraceKind::NotificationReady(DeviceNotification::ViRetrace {
+                at: Cycles::new(191)
+            })
         );
 
         fabric.write_mmio(VI_CURRENT_REG, u32::MAX).unwrap();
@@ -2273,6 +2842,7 @@ mod tests {
             Cycles::new(1_875_000)
         );
         assert_eq!(fabric.tv_type(), Some(TvType::Pal));
+        assert_eq!(fabric.next_vi_deadline(), Some(Cycles::new(1_875_000)));
 
         fabric.write_mmio(VI_V_SYNC_REG, 525).unwrap();
         assert_eq!(
@@ -2287,6 +2857,7 @@ mod tests {
                 TvType::Pal.programmed_field_cycles(3_093, 525).unwrap()
             ))
         );
+        assert_eq!(fabric.next_vi_deadline(), fabric.vi_field_interval());
         assert_eq!(fabric.snapshot().tv_type, Some(TvType::Pal));
     }
 

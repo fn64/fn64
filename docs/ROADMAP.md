@@ -16,8 +16,10 @@ undermine every other item's evidence: a bar that does not measure what it
 claims makes all the greens beneath it worth less.
 
 - [ ] **V1a ROOT-CAUSED: fn64's recompiler is RIGHT; the C-lane oracle is
-  systematically wrong.** The c/rs divergence (identical through swap 231,
-  differs from 234) is not an opcode bug and not the renderer.
+  systematically wrong.** A historical deeper c/rs run remained identical
+  through swap 231 and first differed at framebuffer 234 after gfx task 232;
+  that is not an opcode bug and not the renderer. The current mechanically
+  repeated gate is deliberately bounded to the 60 swaps it measured.
 
   Both lanes read the same `oot.toml`, whose `[patches] stubs` lists **127**
   functions under the rule "any cop0/cache/cop2/**break** opcode -> stub". A
@@ -44,20 +46,9 @@ claims makes all the greens beneath it worth less.
   the legacy tree: the rs lane is correct, and P1 retires the C lane to
   CI-oracle-only. The real cost is to METHOD, not to output —
 
-- [ ] **V1b DESIGN.md §4's A/B is compromised: the oracle is wrong in a known
-  direction.** §4 says diff the lanes and investigate disagreements. But past
-  the title screen the C lane is missing bodies for ~127 functions that fn64
-  correctly recompiles, so every future disagreement opens with "is this our
-  bug, or stub #94?" A differential whose reference is systematically degraded
-  cannot arbitrate. Options: (a) run the A/B with `force_recompile` covering
-  the auto-un-stubbed set so both lanes carry the same bodies; (b) bound the
-  A/B to swaps < 232, where they provably agree, and say so; (c) retire the
-  C-lane A/B early and lean on `scripts/lane-parity.sh` only as a regression
-  detector, not an arbiter. Until one is chosen, DESIGN.md §4 overstates what
-  the A/B can prove.
-
-  Not proven: that no OTHER stub contributes before task 232. With 127 on the
-  same footing, others are plausibly live on this path.
+- [x] **V1b C/rs arbitration fails closed when callable bodies differ.** The audit finds 13,047 shared nonempty functions with identical unique instruction-PC sets, but 116 callable empty C bodies with nonempty Rust counterparts.
+  Default `scripts/lane-parity.sh` therefore rejects C authority from swap zero; `--observe` retains only a labeled, non-authoritative framebuffer comparison.
+  Focused semantic oracles remain independent evidence; fixed-cycle digests and zero-unsupported full-ROM closure remain the replacement release authority. See `PARITY-METHOD.md`.
 - [ ] **V0 doc hashes are now linted; 5 were unbacked.** `lint-docs.py` fails
   when a doc asserts a *content* hash no test contains (commit pins are
   provenance and exempt). All five in OOT-STATUS.md were unbacked — verified
@@ -148,7 +139,14 @@ and scope limits that make an open item meaningful.
 
   The mechanism now makes each boundary explicit: `RetraceDrain` treats swap
   as an observation and ends only at guest quiescence; `TvType` is a required
-  boot-harness input and seeds the IPL-owned global before thread 0; cpal
+  boot-harness input, seeds the IPL-owned global before thread 0, and is carried
+  into RT64 so PAL stable-factor workloads derive from 50 Hz rather than the
+  pinned upstream 60 Hz constant. Ten fresh live Metal processes prove the
+  production-context PAL/MPAL workload sequences `[0,0,0,50]` and
+  `[0,0,0,60]` without an Extended refresh override. Report schema v22 now
+  co-binds normalized ROM TV region, committed device TV state, and renderer
+  create-time TV configuration; representative private PAL/MPAL exact-ten
+  evidence remains to be retained. cpal
   resamples guest rate to device rate; and the audio backend distinguishes the
   current AI DMA (what `AI_LEN` exposes) from its host jitter prebuffer. Playback
   starts only after the N64-equivalent two-DMA queue is primed.
@@ -370,12 +368,22 @@ in `DISCOVER-PLAN.md`; `DISCOVER-STORAGE.md`, `DISCOVER-OWNER-PROOF.md`, and
 `DISCOVER-TOOLCHAIN.md` define the graph/index, exact-owner, and external-tool
 boundaries.
 
-Current grading (2026-07-17, `gate_d1` — but see H3: these numbers
-are reproducible on one machine only): OoT 98.7% precision / 72.3% recall;
-NW4E 82.4%/88.1%; NWXE 81.3%/84.1%. The AKI figures use SHA-bound external
-text intervals, so they measure the payoff from correct executable regions,
-not mechanical recovery of those regions. Mapping-only baselines and byte
-coverage remain separate in `DISCOVER-PLAN.md`.
+Current grading (2026-07-17, `gate_d1`; private inputs are declared through
+`FN64_DISCOVER_*` rather than machine-specific paths): OoT is 98.7% precision /
+72.3% recall. The AKI mapping-only baselines are NW4E 48.4%/89.7% and NWXE
+50.0%/86.9%; applying SHA-bound external text intervals gives NW4E
+82.4%/88.1% and NWXE 81.3%/84.1%. The filtered figures measure the payoff from
+known executable regions, not mechanical recovery of those regions. The
+mapping-only baselines, filtered measurements, and byte coverage remain
+separate in `DISCOVER-PLAN.md`; the private inputs also mean these measurements
+are not a repository-contained reproducibility claim.
+
+NWXE's mapping-only overlay gap is closed mechanically: ROM-only
+descriptor-family recovery plus unique delta/destination agreement produces
+four proven load images, and wiring the overlay bank-table geometry into the
+gate took the held-out D1 grade from 36.4%/28.5% boot-only to 50.0%/86.9%.
+Whole-image data scanning is still why that mapping-only precision remains
+below the external-text-filter result.
 
 Two findings worth not rediscovering:
 - **Recall is a Phase-2 problem, not a detector problem.** OoT recall was
@@ -510,9 +518,11 @@ and deterministic output traces.
   typed return. Static known-host JALs now emit a typed host/resume boundary;
   `jr`/`jalr` returns terminate only at the installed thread sentinel.
   Dynamic JAL/JALR calls resolve distinctly to the installed host table or an
-  active guest bank. Installing a real discovered pack and automatically
-  detecting executable PI/decompression writes remain open, so this is not a
-  full execution lane.
+  active guest bank. The OoT host can explicitly select and source-hash-bind a
+  generated pack, rejects a missing artifact, and cannot fall back to guest
+  whole-function lookup in that mode. Generating the real OoT pack and
+  automatically detecting executable PI/decompression writes remain open, so
+  this is not a full execution lane.
 - [~] **U2 deterministic PI/device slice** — the typed fabric is now live for
   managed/raw PI starts and typed-Rust word MMIO. It schedules one deadline,
   leaves bytes untouched while busy, then orders byte commit, PI-idle, MI
@@ -580,9 +590,14 @@ and deterministic output traces.
   PIF RAM, BUSY/error/interrupt status, distinct write/execute/read phases,
   and shim/raw-register convergence. Its current one-cycle latency is an
   explicit deterministic policy, not hardware timing. HLE ucode effects still
-  execute atomically, but their visible SP and DP completions are distinct
-  fabric events after measured rspboot work and at successive deadlines, with
-  SP-before-DP MI/message ordering. The same fabric now owns persistent 4 KiB RSP DMEM and IMEM, PC,
+  execute atomically. Successful renderer operations now publish typed
+  FullSync evidence: tasks without it schedule SP only, tasks reaching it
+  schedule SP then DP, and raw CPU/RSP DPC FullSync schedules DP without a
+  fabricated SP event. Exact-width raw decoding prevents triangle payload
+  words from masquerading as commands; unresolved successful backends trap.
+  The visible SP and DP completions are distinct fabric events after measured
+  rspboot work and at successive deadlines, with SP-before-DP MI/message
+  ordering when both exist. The same fabric now owns persistent 4 KiB RSP DMEM and IMEM, PC,
   status, semaphore, and a double-buffered SP DMA engine. Raw word MMIO models
   the public 8-byte address/length alignment plus length/count/skip rectangle,
   keeps DMA_BUSY asserted while a queued request becomes active, and changes an
@@ -594,7 +609,10 @@ and deterministic output traces.
   boundary: `osSpTaskYield` sets SIG0, `osSpTaskYielded` distinguishes SIG1
   from normal completion and prepares the acknowledged task's yield buffer for
   restart, task load clears stale SIG0/SIG1, and the query cannot redispatch
-  graphics or audio work. A renderer `Yielded` result now sets SIG1 and posts
+  graphics or audio work. Known tasks classify boot-overlay versus direct
+  IMEM admission: physical `ucode_boot == ucode` plus a covering aligned copy
+  enters at PC zero, while ordinary rspboot still must reach a DMA-loaded
+  generation and truncated equal-pointer images remain loud failures. A renderer `Yielded` result now sets SIG1 and posts
   SP completion without fabricating DP completion. Missing/failed task, raw
   DPC, XBUS DPC, and presentation backends share one loud error gate. A
   subsequent Load+StartGo supplies `OS_TASK_YIELDED` and the saved data range
@@ -603,9 +621,18 @@ and deterministic output traces.
   the saved PC, commit DMEM/RDRAM/status at BREAK, and forward both DRAM and
   XBUS/DMEM DPC ranges. Exact graphics/audio HLE paths now execute admitted
   rspboot until the first DMA-loaded ucode instruction and commit RDRAM, DMEM,
-  IMEM, status, and entry PC before backend dispatch. Scalar/VU register
-  continuity across that boundary, mid-HLE-task preemption/resume, and real DP FullSync timing remain open, so complete
-  device timing is not yet claimed. VI now joins the same event
+  IMEM, status, and entry PC before backend dispatch; direct-image tasks use
+  their already-admitted PC-zero state. Transactional LLE fallback restores
+  the rspboot scalar/VU/SP/DMA/DPC snapshot or the untouched direct state.
+  Command-triggered DP completion is now closed for successful admitted HLE,
+  LLE DPC, and raw DPC operations. The ABI/device seam now also owns a typed
+  resumable-HLE protocol: one opaque backend token is retained after each real
+  committed chunk, SIG0 is checked before token consumption, the matching task
+  and yield buffer own suspension, and reload/resume consumes each token once.
+  Exact hardware RDP latency remains open, so complete device timing is not yet
+  claimed. Reference and native RT64 adapters explicitly report `Atomic`:
+  reference decode/raster state still needs a checkpoint representation, while
+  RT64's public native task entry exposes no continuation. VI now joins the same event
   heap and MI gate: typed raw access covers its complete 14-register block,
   `VI_CURRENT` advances through the documented progressive even and serrated
   interlaced even/odd half-line sequences over `VI_V_SYNC`, `VI_INTR` schedules the interrupt,
@@ -628,20 +655,62 @@ and deterministic output traces.
   `osViRepeatLine` are now exported through both recompiler lanes, latch at
   V-blank, and execute on the Rust scanout image without modifying the RDP
   source. The RT64 adapter now maps the same state to VI pixel type, vertical
-  scale, and vertical subpixel offset through its C boundary; the feature build
-  proves that boundary, while GPU screenshot validation remains open. The typed
+  scale, vertical subpixel offset, and the latched gamma/gamma-dither/divot/
+  dither-filter status through its C boundary. The Rust lane implements the
+  public square-root gamma transfer, partial-coverage horizontal-median divot,
+  RGBA16 3x3-neighbor dither restoration, and retrace-seeded stochastic
+  seven-bit gamma dither. The same named bounded-v1 noise/quantization policy
+  now crosses the native RT64 VI shader: a twenty-phase Metal gate proves
+  dither-only and gamma-plus-dither are seed-causal, exact-repeatable, and
+  restorable across distinct ordinary presents. `VI-FILTERS.md` separates those
+  deterministic digital mechanisms from the bounded partial-coverage fallback:
+  native divot/restoration/AA, exact coverage AA/resampling, the silicon gamma
+  ROM and random stream, and post-DAC analog video remain open. The typed
   IPL standard now selects the shared VI/AI clock; nominal
   60/50 Hz boot timing gives way to H_SYNC/V_SYNC-derived field deadlines once
   a mode latches, and host loops consume the live interval. Hardware-trace
-  validation and the remaining VI output filtering remain open. The other
-  fault classes and remaining CP0/TLB/FPU/controller/save
-  behavior remain open.
+  validation, exact random-stream identity, resampling/AA arithmetic, and
+  pixel-level RT64 capture remain open. The arbitrary-PC generated and
+  interpreted CPU lanes now share typed 32-bit COP0 moves plus indexed/random
+  TLB write/read/probe state, including the public inclusive Random/Wired
+  range, TLBWR, and PageMask plus Global/ASID matching. Random advancement is
+  a bounded once-per-charged-instruction-unit policy, including the runner's
+  second unit for an annulled likely slot, not silicon cycle timing. The legacy
+  whole-function lane keeps Random/TLBWR loud because it has no instruction
+  clock. Canonical 32-bit mapped data loads/stores now translate through those
+  recorded entries in both arbitrary-PC lanes. Legal PageMask sizes, paired
+  EntryLo selection, PFN/offset assembly, ASID/global matching, V and store-D
+  checks produce typed refill/invalid/modified faults with precise EPC/BD;
+  exception entry updates BadVAddr, Context.BadVPN2, and EntryHi.VPN2 and
+  distinguishes the first-level refill vector from common/nested vectors.
+  Canonical 32-bit instruction fetch now separates architectural virtual PC
+  from `BankId`-qualified physical word identity, translates KSEG0/KSEG1
+  directly and KUSEG/KSSEG/KSEG3 through those entries, fetches a delay-slot VA
+  independently across page boundaries, and returns precise refill/invalid
+  EPC/BD/vector state in both the one-unit AOT and interpreter lanes through
+  the main `BlockProgram::run`/`dispatch` abstraction. Canonical program
+  evidence binds the physical spans/words and each mapped entry's exact
+  `BankId`/PA sequence, preflight-expected words, and generated artifact
+  identity. Artifact-identified mapped AOT destination observations carry that
+  real artifact and are schema-v22 fixed-cycle eligible; compatibility AOT
+  without one and mapped-interpreter observations are not. The latter remain
+  operational/differential-only until a successor typed destination schema
+  exists. Multiple matches remain loud. Data-side Status.KSU plus UX/SX/KX now
+  classify the documented 64-bit XUSEG/XKSSEG/XKUSEG, XSSEG, XKPHYS, and XKSEG
+  ranges. Mapped spaces compare EntryHi.Region plus VA[39:13]; width/privilege
+  failures return typed AdEL/AdES, and extended refill entry updates full
+  BadVAddr, Context, XContext, and EntryHi before selecting the XTLB vector.
+  Silicon-exact Random timing, 64-bit instruction-PC/catalog identity,
+  generated-lane translated physical device routing, and the other fault classes plus remaining
+  CP0/FPU/controller/save behavior remain open.
 - [~] **U6 general RSP/RDP** — the F3DEX2 reference lane now emits ordered
   triangle/color-image/fill/full-sync operations and executes all three legal
   public color-image layouts: size-defined 8-bit index/intensity, RGBA16, and
   RGBA32. One typed classifier drives validation, import, fill, copy, and
   commit; target switches can reinterpret the same RDRAM bytes. The 8-bit path
-  supports undereferenced CI8 copy-cycle indices, and RGBA32 preserves the
+  supports direct I8, packed IA8, and undereferenced CI8 copy-cycle sources,
+  preserving each original TMEM byte while comparing format-correct alpha;
+  RGBA32 preserves the
   public five-bit memory alpha and three-bit coverage packing. It also decodes the
   F3DEX2 control path now retains six homogeneous clip-plane codes,
   executes inclusive-range `G_CULLDL` as an end of the current list,
@@ -654,8 +723,76 @@ and deterministic output traces.
   six-plane homogeneous clipping, flat/smooth shade, perspective texture
   attributes, scissor/eight-sample coverage, blender state, and read-only Z
   through a typed operation. Exact microcode line-edge coefficients remain a
-  hardware-trace item. Public `gSPLookAt` X/Y DMAs now feed typed
-  screen-direction state, and regular/linear texture generation maps signed
+  hardware-trace item. Exact task-text digest admission now distinguishes
+  legacy L3DEX from L3DEX2 and F3DEX2 without opcode guessing. The public
+  legacy vertex/line envelope and the L3DEX2 line form normalize into that
+  same typed operation; their equivalent raster output is regression-tested.
+  Line-microcode `G_TRI1` is a validated no-op, while polygon-only and
+  undocumented commands remain loud. See
+  `crates/fn64-render-reference/L3DEX-CONCEPTS.md`. Exact digest admission now
+  also distinguishes the public Fast3D, F3DEX, and F3DEX2 polygon envelopes. Their
+  distinct vertex, matrix, move, cull, modify, branch, and triangle layouts
+  normalize into the same typed mechanisms, and equivalent display lists have
+  byte-identical raster regressions. Legacy self-load resets all published RSP
+  geometry state while preserving independent RDP state; undocumented base
+  quadrangle forms and unrepresented clipping policy remain loud. Both public
+  texture-rectangle continuation forms now share one typed mechanism: raw RDP
+  coefficient words and digest-selected legacy/modern `G_RDPHALF_1/2`
+  envelopes are exhaustive across all admitted geometry/line families;
+  malformed or mixed-family wrappers trap. See
+  `crates/fn64-render-reference/FAST3D-F3DEX-CONCEPTS.md`. Exact digest identity
+  now also distinguishes F3DLX and F3DLX.Rej despite their F3DEX-compatible wire.
+  The bounded decoder enforces the ordinary 32-entry versus Rej 64-entry
+  caches, legacy 32-vertex load maximum, F3DLX-only clipping toggle, Rej
+  front-cull restriction, default `FRUSTRATIO_2`, and whole-triangle X/Y/far
+  reject policy with no near rejection. Transformed F3DLX vertices remain a
+  loud frontier because the public manuals name pixel precision without
+  specifying its exact fixed-point rounding. Current F3DEX quadrangle
+  emulation and F3DEX2 `G_QUAD` have byte-identical raster regressions; the
+  removed historical dedicated Fast3D form remains loud because no allowed
+  public source specifies its opcode/layout. See
+  `crates/fn64-render-reference/F3DLX-CONCEPTS.md`. Exact digest identity also
+  distinguishes public F3DEX2.NoN, F3DEX2.Rej, and F3DLX2.Rej. Their bounded
+  policies cover the public 32/64-entry cache split, modern Rej 1--64 vertex
+  loads, initial `FRUSTRATIO_2`, NoN near-admission distinction, and
+  whole-triangle X/Y/far rejection without near rejection. F3DLX2.Rej
+  transformed vertices remain loud at the same unpublished pixel-rounding
+  boundary as legacy F3DLX. F3DZEX2 has a typed three-variant identity and its
+  pinned MIT RT64 BranchW control-flow delta is implemented in both walkers.
+  Its behavior-bearing profile now survives shared/reference decode state and
+  all three typed variants apply bounded NoN near admission. It still cannot
+  enter HLE: point-light wire/arithmetic characterization, exact F3DZEX2
+  raw-pair self-load resolution, native pixel differentials, and representative
+  full-task evidence remain open, while the other public `G_SPECIAL_*` opcodes
+  remain reserved. A non-default, entry-only RT64 characterization transport
+  now classifies a locally supplied exact raw pair and reuses production
+  native validation/rollback without changing `RenderBackend`. Its strict
+  repository-owned v1 suite expands eight fixed rows across public controls
+  and 16/24/32-byte point-light hypotheses, then binds every successful
+  one-FullSync task to its exact post-VI capture. No admitted local pair exists,
+  so it has not yet produced a private native point-light result and is not HLE
+  admission evidence. See
+  `crates/fn64-render-reference/F3DEX2-VARIANTS.md`. The content-admitted
+  S2DEX slice now retains object clamp, filter correction, perimeter, and ignored
+  legacy edge requests as typed task-local state. It admits the current public
+  header's ignored XLU/AA bits, Point-or-Average filtering with the shared RDP
+  four-sample box path, exact-quarter-pixel 3/8-texel WIDEN edges, and
+  NOTXCLAMP only where point samples provably remain inside the image. Integer
+  point-sampled Copy backgrounds share an exhaustive row-major wrap
+  partitioner across both S2DEX wires and LoadBlock/LoadTile. A distinct typed
+  scaled planner preserves u10.5/u5.10 sample identity across both wrap axes,
+  both wires/loaders, flip, fractional horizontal origins, and integer-valued
+  `imageYorig`; its exhaustive sweep covers 168,000 configurations. Filtered
+  scaled partitioning, vertical subpixel origins, filtered clamp bypass,
+  WIDEN now composes with either public SHRINKSIZE through one exact typed
+  perimeter mechanism across rectangle/matrix/rotating/compound paths and
+  both S2DEX wires. WIDEN/filter/flip/Copy composition, historical XLU/AA
+  revisions, and any required sub-quarter-pixel rounding remain loud. See
+  `crates/fn64-render-reference/S2DEX-CONCEPTS.md`. The admitted family/opcode
+  audit and its evidence boundary are recorded in `docs/MICROCODE-DENOMINATOR.md`.
+  Public `gSPLookAt` X/Y
+  DMAs now feed typed screen-direction state, and regular/linear texture
+  generation maps signed
   normal projections or their inverse cosine through the `gSPTexture` scale.
   The two-command F3DEX2 `gSPForceMatrix` path now replaces the concatenated
   vertex transform while retaining the real stacks, and ordinary/modelview-
@@ -702,17 +839,17 @@ and deterministic output traces.
   vertex/triangle cache range, and incomplete vertex/matrix/viewport/light DMA
   before retaining partial or stale state. Transformed vertices now require
   the display list's explicit `G_MV_VIEWPORT` DMA rather than a fabricated
-  320×240 host default. `G_AC_DITHER` likewise traps instead of using the old
-  ordered Bayer approximation: the public manual specifies a pseudo-random
-  hardware threshold, whose exact generator remains trace work. One/two-cycle
-  RGB/alpha dither selectors now also trap unless disabled; silently ignoring
-  an active matrix/noise selector changed both RGBA16 bytes and RGBA32 RGB.
-  The proven disabled path truncates RGBA16 RGB and RGBA32 memory alpha at the
-  documented three-bit boundary instead of rounding. The ordered tables and
-  long-period noise generator remain clean-room hardware-trace frontiers. Exact
+  320×240 host default. `G_AC_DITHER` uses the same typed per-fragment noise
+  byte as combiner/dither noise instead of an ordered approximation. The
+  public manual's exact pseudo-random hardware generator remains trace work. One/two-cycle ordered
+  dither is implemented: RGB magic-square and Bayer selectors modify low color
+  bits before target-format storage, while alpha Pattern and InversePattern use
+  the selected ordered matrix. RGB and alpha Noise use the explicit seedable
+  deterministic reference stream; its silicon identity remains unclaimed. The disabled path retains truncation behavior rather
+  than rounding. Exact
   microcode catalog population/subdivision/rounding remains a frontier. The
-  hardware NOISE combiner source also traps rather than using the former zero
-  approximation, pending a trace-derived long-period generator. The lane decodes the
+  hardware NOISE combiner source consumes the same typed eight-bit sample
+  rather than the former zero approximation. The lane decodes the
   full 16-byte texture-rectangle command and executes the public non-flipped
   RGBA16 copy-cycle path with per-tile state, fixed-point stepping, and the
   format-specific threshold rule: RGBA16's alpha bit is a direct write enable,
@@ -728,7 +865,15 @@ and deterministic output traces.
   Copy-cycle TEXRECTFLIP now applies the public S/T screen-axis swap while
   retaining copy-mode gradient scaling. Bounded DRAM command ranges submitted
   through `osDpSetNextBuffer` or raw DPC START/END execute the proven
-  state/fill/texture subset without requiring a synthetic `G_ENDDL`. All eight
+  state/fill/texture subset without requiring a synthetic `G_ENDDL`. At
+  `CMD_END`, the runtime captures the submitted words and stages that immutable
+  command image at the physical 8 MiB boundary outside guest RDRAM before
+  backend dispatch; task and raw-DPC renderer entries expose exactly the full
+  8 MiB physical device and exclude the host allocation's appended MMIO/non-RDRAM
+  backing. Later guest or RSP DMA writes cannot rewrite an already queued
+  stream. The real C-lane boot reaches its first presented swap at
+  executor step 445 after 28 graphics tasks, and 20/20 independent bounded
+  runs completed cleanly. All eight
   raw RDP triangle layouts now have bounded widths and typed signed edge,
   shade, texture, and Z coefficient ingestion from SGI *RDP Command Summary*
   Tables 11-15. Edge-only, shade, Z, loaded-texture, and combined `0x0f`
@@ -747,22 +892,28 @@ and deterministic output traces.
   raw-range, depth-image-clear, and focused raw-triangle gates each passed 10
   consecutive clean runs.
   `G_SETPRIMDEPTH`/`G_ZS_PRIM` now supply persistent uniform Z/DeltaZ to raw
-  triangles and combined texture rectangles. Raw edge coverage now evaluates
-  the public eight-sample checkerboard mask. RGBA16 coverage persists across
+  triangles and combined texture rectangles. Raw triangles, high-level
+  triangles, and lines now retain the public eight-sample checkerboard identity
+  in one type until the fragment boundary; exhaustive raw edge/scissor sweeps
+  reject count-correct but identity-wrong masks. RGBA16 coverage persists across
   its visible LSB and the shared physical-address hidden-bit sidecar; all four
   `CVG_DST` rules, coverage/alpha selection, clear-on-wrap color writes,
   memory-coverage blending, and opaque coverage-wrap strict Z execute. The
   high-level F3DEX2 path now evaluates the same eight sample centers at polygon
-  edges instead of manufacturing full center coverage. `G_SETSCISSOR` now
+  edges instead of manufacturing full center coverage. Full-coverage triangles
+  retain center attributes; partial raw/high-level triangles share a typed
+  covered checkerboard sample for shade, texture, and Z. Nearest-to-center and
+  stable tie order remain a bounded policy because the silicon selector is
+  unpublished. `G_SETSCISSOR` now
   retains the public field-enable and odd/even-line selector, and every color,
   depth, rectangle, raw-triangle, and high-level-triangle raster path rejects
   opposite-parity scanlines.
   Shade-dependent rectangle programs, pixel-Z rectangles,
-  interpenetration coverage adjustment, high-level coverage-centroid correction,
+  interpenetration coverage adjustment, exact coverage representative lookup,
   exact LOD derivative norm/fixed-point boundary behavior, exact alpha-coverage rounding,
   silicon-internal
   accumulator truncation/subpixel coefficient correction, same-visible-value CPU hidden-bit rewrites,
-  HLE-boundary scalar/VU register continuity, mid-task RSP preemption/resume, arbitrary depth-
+  mid-task RSP preemption/resume, arbitrary depth-
   fill hidden-bit behavior, and hardware-derived SP/DP timing are still
   required; no
   non-proven task may skip or synthetic-complete.

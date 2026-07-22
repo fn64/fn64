@@ -44,13 +44,43 @@
 //! method's doc comment for the exact shape carried over.
 
 use crate::device::Cycles;
-use crate::pfs::ControllerPak;
+use crate::pfs::{ControllerPak, ControllerPakEvidenceSnapshot};
 use crate::rdram::RdramAddr;
 use crate::rsp::{OsTaskHeader, TaskLog};
-use crate::si::{PifModel, PortState, RumbleError};
-use crate::transfer_pak::{TransferPak, TransferPakError};
-use crate::vi::{RetraceSchedule, ViState};
-use crate::voice::VoiceUnit;
+use crate::si::{PifEvidenceSnapshot, PifModel, PortState, RumbleError};
+use crate::transfer_pak::{
+    HostUnixNanos, Mbc3BatteryMetadata, Mbc3BatteryRestore, TransferPak, TransferPakError,
+    TransferPakEvidenceSnapshot,
+};
+use crate::vi::{RetraceSchedule, RetraceScheduleEvidenceSnapshot, ViEvidenceSnapshot, ViState};
+use crate::voice::{VoiceEvidenceSnapshot, VoiceUnit};
+
+/// Controller/accessory family whose successful guest operation reached the
+/// authoritative ABI/device boundary. This is historical release evidence,
+/// not future device state, so it is intentionally absent from
+/// [`PeripheralsEvidenceSnapshot`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ControllerOperationDevice {
+    StandardController,
+    RumblePak,
+    TransferPak,
+    VoiceRecognitionUnit,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ControllerOperationKind {
+    Read,
+    Write,
+    Control,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ControllerOperationEvent {
+    pub at: Cycles,
+    pub port: u8,
+    pub device: ControllerOperationDevice,
+    pub operation: ControllerOperationKind,
+}
 
 /// VI (video interface) + SI/PIF (controller probe) + RSP (task submission)
 /// host-side hardware-model state. See module doc for why these three are
@@ -72,7 +102,7 @@ pub struct Peripherals {
     retrace: Option<RetraceSchedule>,
     /// Minimal SI/PIF controller-probe model (`si.rs`).
     pif: PifModel,
-    /// Persistent semantic file systems for attached Controller Paks.
+    /// Persistent physical images and bank latches for attached Controller Paks.
     controller_paks: [Option<ControllerPak>; 4],
     /// Persistent Transfer Pak register and inserted-cartridge state.
     transfer_paks: [Option<TransferPak>; 4],
@@ -80,6 +110,20 @@ pub struct Peripherals {
     voice_units: [Option<VoiceUnit>; 4],
     /// RSP task submissions observed (`rsp.rs`).
     tasks: TaskLog,
+}
+
+/// Complete future-affecting evidence view of the executor-owned peripheral
+/// state. Accessory slots are retained independently of current port identity:
+/// detaching and later reattaching an accessory restores the same modeled
+/// object, so hashing only active accessors would omit real future state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeripheralsEvidenceSnapshot {
+    pub vi: ViEvidenceSnapshot,
+    pub retrace: Option<RetraceScheduleEvidenceSnapshot>,
+    pub pif: PifEvidenceSnapshot,
+    pub controller_paks: [Option<ControllerPakEvidenceSnapshot>; 4],
+    pub transfer_paks: [Option<TransferPakEvidenceSnapshot>; 4],
+    pub voice_units: [Option<VoiceEvidenceSnapshot>; 4],
 }
 
 /// What `Peripherals::advance_retrace` found this tick -- the caller
@@ -96,6 +140,32 @@ pub struct RetraceTick {
 impl Peripherals {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn evidence_snapshot(&self) -> PeripheralsEvidenceSnapshot {
+        PeripheralsEvidenceSnapshot {
+            vi: self.vi.evidence_snapshot(),
+            retrace: self
+                .retrace
+                .as_ref()
+                .map(RetraceSchedule::evidence_snapshot),
+            pif: self.pif.evidence_snapshot(),
+            controller_paks: std::array::from_fn(|port| {
+                self.controller_paks[port]
+                    .as_ref()
+                    .map(ControllerPak::evidence_snapshot)
+            }),
+            transfer_paks: std::array::from_fn(|port| {
+                self.transfer_paks[port]
+                    .as_ref()
+                    .map(TransferPak::evidence_snapshot)
+            }),
+            voice_units: std::array::from_fn(|port| {
+                self.voice_units[port]
+                    .as_ref()
+                    .map(VoiceUnit::evidence_snapshot)
+            }),
+        }
     }
 
     // ---- VI (video interface) -------------------------------------------
@@ -210,6 +280,15 @@ impl Peripherals {
         }
     }
 
+    /// Install one host-configured Controller Pak and make it the active
+    /// accessory on `port`. Capacity is carried by the Pak's validated bank
+    /// count rather than a compile-time game setting.
+    pub fn attach_controller_pak(&mut self, port: usize, pak: ControllerPak) {
+        self.pif
+            .set_port_state(port, PortState::StandardControllerControllerPak);
+        self.controller_paks[port] = Some(pak);
+    }
+
     pub fn set_rumble(&mut self, port: usize, active: bool) -> Result<(), RumbleError> {
         self.pif.set_rumble(port, active)
     }
@@ -274,6 +353,29 @@ impl Peripherals {
             .insert_cartridge(rom, ram)
     }
 
+    pub fn insert_transfer_pak_cartridge_with_battery(
+        &mut self,
+        port: usize,
+        rom: Vec<u8>,
+        ram: Option<Vec<u8>>,
+        restore: Option<Mbc3BatteryRestore>,
+    ) -> Result<(), TransferPakError> {
+        self.transfer_pak_mut(port)
+            .unwrap_or_else(|| panic!("no Transfer Pak attached to controller port {port}"))
+            .insert_cartridge_with_battery(rom, ram, restore)
+    }
+
+    pub fn checkpoint_transfer_pak_battery(
+        &mut self,
+        port: usize,
+        now: Cycles,
+        checkpoint: HostUnixNanos,
+    ) -> Result<Option<Mbc3BatteryMetadata>, TransferPakError> {
+        self.transfer_pak_mut(port)
+            .unwrap_or_else(|| panic!("no Transfer Pak attached to controller port {port}"))
+            .checkpoint_mbc3_battery(now, checkpoint)
+    }
+
     pub fn voice_unit_mut(&mut self, port: usize) -> Option<&mut VoiceUnit> {
         if !matches!(self.pif.port_state(port), PortState::VoiceRecognitionUnit) {
             return None;
@@ -294,15 +396,68 @@ impl Peripherals {
         &self.tasks
     }
 
-    /// Record an RSP task submission. Returns the task's `TaskKind`, if any,
-    /// so the caller (`Executor::submit_task`) can still emit the shared
-    /// `TaskSubmit` trace event itself (see module doc: trace recording
-    /// needs `sim_time`, not modeled here) -- same information
-    /// `Executor::submit_task`'s prior single-body version derived from
-    /// `header.kind()` before calling `self.tasks.record(header)`.
-    pub fn submit_task(&mut self, header: OsTaskHeader) -> Option<crate::trace::TaskKind> {
-        let kind = header.kind();
+    /// Record the complete task header at the synchronous `osSpTaskLoad`
+    /// admission boundary. The executor emits its lighter `TaskSubmit` trace
+    /// only when `osSpTaskStartGo` actually kicks the admitted task.
+    pub fn admit_task(&mut self, header: OsTaskHeader) {
         self.tasks.record(header);
-        kind
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pfs::PfsKey;
+
+    #[test]
+    fn evidence_retains_detached_accessories_and_all_controller_state() {
+        let mut peripherals = Peripherals::new();
+        peripherals.set_controller_input(
+            0,
+            crate::si::ContInput {
+                button: 0x9000,
+                stick_x: -12,
+                stick_y: 34,
+            },
+        );
+
+        peripherals.set_controller_port_state(0, PortState::StandardControllerControllerPak);
+        peripherals
+            .controller_pak_mut(0)
+            .unwrap()
+            .allocate(
+                PfsKey {
+                    company_code: 1,
+                    game_code: 2,
+                    game_name: [3; 16],
+                    ext_name: [4; 4],
+                },
+                256,
+            )
+            .unwrap();
+
+        peripherals.set_controller_port_state(0, PortState::StandardControllerTransferPak);
+        let mut rom = vec![0xff; 0x8000];
+        rom[0x147] = 0;
+        rom[0x149] = 0;
+        peripherals
+            .insert_transfer_pak_cartridge(0, rom, None)
+            .unwrap();
+
+        peripherals.set_controller_port_state(0, PortState::VoiceRecognitionUnit);
+        peripherals.voice_unit_mut(0).unwrap().initialize();
+        peripherals.set_controller_port_state(0, PortState::Absent);
+
+        let snapshot = peripherals.evidence_snapshot();
+        assert_eq!(snapshot.pif.ports[0], PortState::Absent);
+        assert_eq!(snapshot.pif.inputs[0].button, 0x9000);
+        assert!(snapshot.controller_paks[0].is_some());
+        assert!(snapshot.controller_paks[0].as_ref().unwrap().notes[0].is_some());
+        assert!(snapshot.transfer_paks[0]
+            .as_ref()
+            .unwrap()
+            .cartridge
+            .is_some());
+        assert!(snapshot.voice_units[0].as_ref().unwrap().initialized);
     }
 }

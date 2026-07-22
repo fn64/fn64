@@ -1,9 +1,12 @@
+use fn64_discover::block_pack::{emit_block_program_source, BlockPackV1, BlockProgramSourceConfig};
 use fn64_discover::evidence::EvidenceManifest;
 use fn64_discover::{run_discovery, run_discovery_with_manifest, FactDb, NormalizedRom};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::io::BufReader;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::io::{BufReader, Write as IoWrite};
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize)]
 struct DiscoveryArtifact<'a> {
@@ -16,14 +19,26 @@ struct DiscoveryArtifact<'a> {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("fn64-discover: {error}");
-        std::process::exit(1);
+    match run() {
+        Ok(Some(receipt)) => println!("{receipt}"),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("fn64-discover: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> Result<(), String> {
-    let mut args = std::env::args_os().skip(1);
+fn run() -> Result<Option<String>, String> {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.first().and_then(|argument| argument.to_str()) == Some("emit-block-program") {
+        return emit_block_program_command(args.into_iter().skip(1)).map(Some);
+    }
+    run_discovery_command(args.into_iter())?;
+    Ok(None)
+}
+
+fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
     let rom_path = args.next().map(PathBuf::from).ok_or_else(usage)?;
     let mut evidence_path = None;
     let mut output_path = None;
@@ -100,6 +115,240 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn emit_block_program_command(mut args: impl Iterator<Item = OsString>) -> Result<String, String> {
+    let rom_path = args
+        .next()
+        .map(PathBuf::from)
+        .ok_or_else(emit_block_program_usage)?;
+    let pack_path = args
+        .next()
+        .map(PathBuf::from)
+        .ok_or_else(emit_block_program_usage)?;
+    let mut entry_bank = None;
+    let mut entry_pc = None;
+    let mut instruction_budget = None;
+    let mut output_path = None;
+    while let Some(argument) = args.next() {
+        match argument.to_str() {
+            Some("--entry-bank") => {
+                if entry_bank.is_some() {
+                    return Err("--entry-bank may be supplied exactly once".to_owned());
+                }
+                let value = next_utf8(&mut args, "--entry-bank", "a canonical u64 hex value")?;
+                entry_bank = Some(parse_fixed_upper_hex("--entry-bank", &value, 16)?);
+            }
+            Some("--entry-pc") => {
+                if entry_pc.is_some() {
+                    return Err("--entry-pc may be supplied exactly once".to_owned());
+                }
+                let value = next_utf8(&mut args, "--entry-pc", "a canonical u32 hex value")?;
+                entry_pc = Some(
+                    u32::try_from(parse_fixed_upper_hex("--entry-pc", &value, 8)?)
+                        .expect("eight hexadecimal digits fit u32"),
+                );
+            }
+            Some("--instruction-budget") => {
+                if instruction_budget.is_some() {
+                    return Err("--instruction-budget may be supplied exactly once".to_owned());
+                }
+                let value = next_utf8(&mut args, "--instruction-budget", "a decimal u32 value")?;
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(format!(
+                        "--instruction-budget must be canonical unsigned decimal, got {value:?}"
+                    ));
+                }
+                if value.len() > 1 && value.starts_with('0') {
+                    return Err(format!(
+                        "--instruction-budget must not contain leading zeros, got {value:?}"
+                    ));
+                }
+                let value = value.parse::<u32>().map_err(|_| {
+                    format!("--instruction-budget exceeds u32 or is malformed: {value:?}")
+                })?;
+                instruction_budget = Some(
+                    fn64_recomp_rs::InstructionBudget::new(value).ok_or_else(|| {
+                        format!(
+                            "--instruction-budget must be at least {}, got {value}",
+                            fn64_recomp_rs::InstructionBudget::MIN
+                        )
+                    })?,
+                );
+            }
+            Some("--out") => {
+                if output_path.is_some() {
+                    return Err("--out may be supplied exactly once".to_owned());
+                }
+                output_path = Some(PathBuf::from(args.next().ok_or_else(|| {
+                    "--out requires an explicit generated Rust source path".to_owned()
+                })?));
+            }
+            Some(other) => {
+                return Err(format!(
+                    "unknown emit-block-program argument {other:?}\n{}",
+                    emit_block_program_usage()
+                ));
+            }
+            None => return Err("emit-block-program option names must be valid UTF-8".to_owned()),
+        }
+    }
+    let entry_bank =
+        entry_bank.ok_or_else(|| "emit-block-program requires --entry-bank".to_owned())?;
+    let entry_pc = entry_pc.ok_or_else(|| "emit-block-program requires --entry-pc".to_owned())?;
+    let instruction_budget = instruction_budget
+        .ok_or_else(|| "emit-block-program requires --instruction-budget".to_owned())?;
+    let output_path = output_path.ok_or_else(|| {
+        "emit-block-program requires explicit --out because generated source contains ROM-derived instruction words"
+            .to_owned()
+    })?;
+
+    let rom_bytes = std::fs::read(&rom_path)
+        .map_err(|error| format!("reading ROM {}: {error}", rom_path.display()))?;
+    let rom = fn64_discover::normalize(&rom_bytes)
+        .map_err(|error| format!("normalizing ROM {}: {error}", rom_path.display()))?;
+    let pack_bytes = std::fs::read(&pack_path)
+        .map_err(|error| format!("reading block pack {}: {error}", pack_path.display()))?;
+    let pack: BlockPackV1 = serde_json::from_slice(&pack_bytes)
+        .map_err(|error| format!("parsing block pack {}: {error}", pack_path.display()))?;
+    let source = emit_block_program_source(
+        &pack,
+        &rom,
+        BlockProgramSourceConfig {
+            entry: fn64_recomp_rs::ExecutionKey::new(
+                fn64_recomp_rs::BankId::new(entry_bank),
+                fn64_recomp_rs::GuestPc::new(entry_pc),
+            ),
+            instruction_budget,
+        },
+    )
+    .map_err(|error| format!("emitting block program: {error}"))?;
+    atomic_write(&output_path, source.as_bytes())?;
+    let digest = lowercase_hex(Sha256::digest(source.as_bytes()).into());
+    Ok(format!(
+        "fn64-discover emit-block-program: sha256={digest} bytes={} out={}",
+        source.len(),
+        output_path.display()
+    ))
+}
+
+fn next_utf8(
+    args: &mut impl Iterator<Item = OsString>,
+    option: &str,
+    expected: &str,
+) -> Result<String, String> {
+    args.next()
+        .ok_or_else(|| format!("{option} requires {expected}"))?
+        .into_string()
+        .map_err(|_| format!("{option} value must be valid UTF-8"))
+}
+
+fn parse_fixed_upper_hex(option: &str, value: &str, digits: usize) -> Result<u64, String> {
+    let Some(hex) = value.strip_prefix("0x") else {
+        return Err(format!(
+            "{option} must use canonical 0x-prefixed uppercase hexadecimal"
+        ));
+    };
+    if hex.len() != digits {
+        return Err(format!(
+            "{option} must contain exactly {digits} hexadecimal digits after 0x, got {}",
+            hex.len()
+        ));
+    }
+    if hex.bytes().any(|byte| matches!(byte, b'a'..=b'f')) {
+        return Err(format!(
+            "{option} must use uppercase hexadecimal digits, got {value:?}"
+        ));
+    }
+    if !hex
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F'))
+    {
+        return Err(format!(
+            "{option} contains a non-hexadecimal digit: {value:?}"
+        ));
+    }
+    u64::from_str_radix(hex, 16)
+        .map_err(|_| format!("{option} exceeds its declared hexadecimal width"))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let file_name = path.file_name().ok_or_else(|| {
+        format!(
+            "--out must name a generated Rust source file, got {}",
+            path.display()
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for attempt in 0..128u32 {
+        let temporary = parent.join(format!(
+            ".{}.fn64-tmp-{}-{attempt}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "creating temporary output beside {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let staged = file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("staging generated source for {}: {error}", path.display()));
+        drop(file);
+        if let Err(error) = staged {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::hard_link(&temporary, path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!(
+                "publishing generated source without clobber at {}: {error}",
+                path.display()
+            ));
+        }
+        std::fs::remove_file(&temporary).map_err(|error| {
+            format!(
+                "generated source was published at {}, but removing staging file {} failed: {error}",
+                path.display(),
+                temporary.display()
+            )
+        })?;
+        return Ok(());
+    }
+    Err(format!(
+        "could not reserve a temporary output name beside {} after 128 attempts",
+        path.display()
+    ))
+}
+
+fn lowercase_hex(bytes: [u8; 32]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 fn usage() -> String {
-    "usage: fn64-discover <rom> [--evidence manifest.toml] [--trace events.jsonl]... [--out facts.json]".to_string()
+    format!(
+        "usage: fn64-discover <rom> [--evidence manifest.toml] [--trace events.jsonl]... [--out facts.json]\n       {}",
+        emit_block_program_usage()
+    )
+}
+
+fn emit_block_program_usage() -> String {
+    "fn64-discover emit-block-program <rom> <block-pack.json> --entry-bank 0xNNNNNNNNNNNNNNNN --entry-pc 0xNNNNNNNN --instruction-budget N --out generated.rs".to_owned()
 }

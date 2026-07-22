@@ -34,11 +34,86 @@
 //! not a wholly separate storage mechanism -- matching real hardware, where
 //! a Controller Pak IS Flash-like paged storage with a filesystem the SDK
 //! layers over it.
+//!
+//! MBC3 RTC persistence uses a separate fixed-format sidecar because its
+//! timestamp and live clock registers are not bytes in Game Boy cartridge
+//! RAM. This module performs only explicit file load/store; construction and
+//! wall-time materialization stay in `transfer_pak`, and no production path
+//! samples the host clock.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::device::Cycles;
+use crate::transfer_pak::{Mbc3BatteryMetadata, Mbc3BatteryMetadataError};
 use crate::tv::CPU_CLOCK_HZ;
+
+#[derive(Debug)]
+pub enum Mbc3BatteryFileError {
+    Io(std::io::Error),
+    Metadata(Mbc3BatteryMetadataError),
+}
+
+impl std::fmt::Display for Mbc3BatteryFileError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "MBC3 battery sidecar I/O failed: {error}"),
+            Self::Metadata(error) => {
+                write!(formatter, "MBC3 battery sidecar is invalid: {error:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Mbc3BatteryFileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Metadata(_) => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Mbc3BatteryFileError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<Mbc3BatteryMetadataError> for Mbc3BatteryFileError {
+    fn from(value: Mbc3BatteryMetadataError) -> Self {
+        Self::Metadata(value)
+    }
+}
+
+/// Load an MBC3 RTC sidecar. Absence is the sole fresh-state migration;
+/// every other I/O, format, version, or integrity failure is returned.
+pub fn load_mbc3_battery_sidecar(
+    path: &std::path::Path,
+) -> Result<Option<Mbc3BatteryMetadata>, Mbc3BatteryFileError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(Mbc3BatteryMetadata::decode(&bytes)?))
+}
+
+/// Persist one canonical MBC3 RTC sidecar. The caller owns path selection and
+/// supplies the already-materialized metadata; this function never samples a
+/// host clock. Truncation prevents a prior schema's trailing bytes from being
+/// silently accepted, and flush matches `FileSaveStorage`'s durability seam.
+pub fn store_mbc3_battery_sidecar(
+    path: &std::path::Path,
+    metadata: &Mbc3BatteryMetadata,
+) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(&metadata.encode())?;
+    file.flush()
+}
 
 /// Which save device a game's cartridge is wired to, per its
 /// `profile.toml` -- purely descriptive; this module does not act on it.
@@ -49,6 +124,28 @@ pub enum SaveType {
     SramBanked,
     FlashRam,
     ControllerPak,
+}
+
+/// Successful storage operation exposed to release evidence.
+///
+/// This vocabulary is intentionally below shim names: a trace event is
+/// emitted only after the authoritative backing-store or PFS operation has
+/// succeeded. Probes, staged Flash buffers, and rejected requests are not
+/// positive save evidence.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SaveOperationKind {
+    Read,
+    Write,
+    Erase,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SaveOperationEvent {
+    pub at: Cycles,
+    pub device: SaveType,
+    pub operation: SaveOperationKind,
+    pub offset: u32,
+    pub len: u32,
 }
 
 /// Public EEPROM device identities carried by the Joybus Info response.
@@ -75,6 +172,16 @@ impl EepromKind {
         match self {
             Self::Eeprom4k => 512,
             Self::Eeprom16k => 2048,
+        }
+    }
+
+    /// Release-observation identity for the same physical EEPROM part. Keeping
+    /// this mapping beside the wire/capacity type prevents raw Joybus and
+    /// high-level libultra paths from classifying one store differently.
+    pub const fn save_type(self) -> SaveType {
+        match self {
+            Self::Eeprom4k => SaveType::Eeprom4k,
+            Self::Eeprom16k => SaveType::Eeprom16k,
         }
     }
 
@@ -147,6 +254,17 @@ pub trait SaveStorage {
     }
 
     fn read_into(&mut self, offset: usize, buf: &mut [u8]);
+
+    /// Copy the complete authoritative storage image for deterministic
+    /// fixed-cycle evidence. This returns bytes rather than a hash so the
+    /// release layer remains the sole owner of the canonical digest wire.
+    /// Implementations may move an internal file cursor while reading, but
+    /// must not change any guest-observable storage byte.
+    fn snapshot_bytes(&mut self) -> Vec<u8> {
+        let mut bytes = vec![0; self.len()];
+        self.read_into(0, &mut bytes);
+        bytes
+    }
 
     fn write_from(&mut self, offset: usize, data: &[u8]);
 
@@ -371,6 +489,22 @@ pub fn pfs_write_page(storage: &mut dyn SaveStorage, page: u16, buf: &[u8; PFS_P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transfer_pak::{HostUnixNanos, TransferPak};
+
+    fn timer_rom() -> Vec<u8> {
+        let mut rom = vec![0xff; 4 * 0x4000];
+        rom[0x147] = 0x10;
+        rom[0x149] = 0x03;
+        rom
+    }
+
+    fn battery_metadata() -> Mbc3BatteryMetadata {
+        let mut pak = TransferPak::new();
+        pak.insert_cartridge(timer_rom(), None).unwrap();
+        pak.checkpoint_mbc3_battery(Cycles::new(123), HostUnixNanos::new(456))
+            .unwrap()
+            .unwrap()
+    }
 
     #[test]
     fn fresh_storage_reads_as_erased_0xff() {
@@ -526,6 +660,55 @@ mod tests {
             SaveType::FlashRam.byte_len()
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mbc3_sidecar_missing_is_fresh_and_valid_file_roundtrips_exactly() {
+        let dir = std::env::temp_dir().join(format!(
+            "fn64_mbc3_sidecar_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cartridge.rtc");
+        assert!(load_mbc3_battery_sidecar(&path).unwrap().is_none());
+
+        let metadata = battery_metadata();
+        store_mbc3_battery_sidecar(&path, &metadata).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            crate::transfer_pak::MBC3_BATTERY_METADATA_LEN
+        );
+        assert_eq!(load_mbc3_battery_sidecar(&path).unwrap(), Some(metadata));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mbc3_sidecar_corruption_is_not_migrated_to_fresh_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "fn64_mbc3_sidecar_corrupt_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cartridge.rtc");
+        store_mbc3_battery_sidecar(&path, &battery_metadata()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[48] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            load_mbc3_battery_sidecar(&path),
+            Err(Mbc3BatteryFileError::Metadata(
+                Mbc3BatteryMetadataError::ChecksumMismatch
+            ))
+        ));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

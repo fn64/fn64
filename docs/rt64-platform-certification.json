@@ -1,0 +1,333 @@
+{
+  "schema": "fn64.rt64-platform-certification.v1",
+  "source": {
+    "rt64_commit": "f0728a2520d5aa735886240de3fee75cc805f6d6",
+    "source_id": "git:f0728a2520d5aa735886240de3fee75cc805f6d6",
+    "provenance": "GitClean"
+  },
+  "legacy_macos_manifest": "docs/rt64-macos-certification.json",
+  "denominator": "The same thirteen fn64 RT64 adapter cases on every supported platform/API target, plus seven platform-wide blockers that remain open until actual-hardware evidence closes them.",
+  "cases": [
+    {
+      "id": "backend-lifecycle",
+      "category": "backend",
+      "example": "rt64_metal_backend_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 20,
+      "claims": ["backend-metal"]
+    },
+    {
+      "id": "resolution-downsample",
+      "category": "resolution",
+      "example": "rt64_resolution_downsample_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 10,
+      "claims": ["high-resolution-renderer", "downsample-to-original-like"]
+    },
+    {
+      "id": "user-controls-rebuild",
+      "category": "user-controls",
+      "example": "rt64_user_controls_rebuild_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 20,
+      "claims": ["backend-metal", "framebuffer-upscaling"],
+      "recorded": {
+        "status": "pass",
+        "clean_runs": 20,
+        "verified_on": "2026-07-20",
+        "host": {
+          "product": "macOS",
+          "version": "26.5",
+          "build": "25F71",
+          "kernel": "Darwin 25.5.0",
+          "architecture": "arm64",
+          "gpu": "Apple M5 Pro"
+        },
+        "note": "Two bounded failures were sampled at /tmp/fn64-rt64-control-89452.sample.txt and /tmp/fn64-rt64-control-86646.sample.txt: the main thread joined RasterShaderCache::CompilationThread while every shader worker waited on descQueueChanged. Pinned RT64 launched each idle-priority worker before publishing threadRunning=false, while the delayed worker later overwrote the destructor's false stop with true and slept after its only notification. Exact-source overlay fn64:raster-shader-start-stop:v1 publishes true before launch and leaves the destructor as the only post-launch writer. The expanded gate passed twenty consecutive fresh processes on 2026-07-20. Each process additionally isolated Manual 72 Hz refresh targeting, disabled hardware resolve under MSAA4x, enabled idle work, and developer mode, restoring the prior policy after every phase. All four live changes retained their exact distinct policy digests, the same nonzero source-resource identity, advancing present IDs, and exact post-VI pixels; logs are /tmp/fn64-rt64-expanded-user-controls-{1..20}.log."
+      }
+    },
+    {
+      "id": "enhancement-emulator-controls",
+      "category": "enhancement-emulator-controls",
+      "example": "rt64_enhancement_emulator_controls_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 10,
+      "claims": ["backend-metal", "native-renderer-rdram-sync", "framebuffer-detection-region-copy"],
+      "recorded": {
+        "status": "pass",
+        "clean_runs": 10,
+        "verified_on": "2026-07-19",
+        "host": {
+          "product": "macOS",
+          "version": "26.5",
+          "build": "25F71",
+          "kernel": "Darwin 25.5.0",
+          "architecture": "arm64",
+          "gpu": "Apple M5 Pro"
+        },
+        "note": "Ten consecutive hard-watchdog-bounded processes retained exact active-policy, post-VI, RDRAM, workload, present, and managed-resource evidence for remove-black-borders, lower-right rectangle correction, positive/negative post-blend noise, render-to-RAM, and copy-with-GPU. An early combined probe failed during a transient shared present-capture ABI mismatch, a same-context probe was discarded after cross-profile framebuffer contamination, and the first single-workload copy fixture was discarded when the new mechanism seam proved it selected no GPU tile-copy route; none count. The final two-workload fixture requires a nonzero prior managed source-framebuffer identity with exact address/width/size, a source write timestamp strictly before the captured sample target, and no source pair in the current workload. With identical exact source fd2466..., sampled 8b89d3..., post-VI 43da36..., workload 91684b9b1134f961, and four guard results, copyWithGPU=true exclusively records one CreateTileCopy operation, one tileCopyUsed dispatch, zero ordinary/raw-TMEM uploads, and one synchronized pair; false exclusively records zero GPU operations/tiles, one ordinary RDRAM-to-TMEM upload, zero raw-TMEM tiles, and zero synchronized pairs. Zero, mixed, or multiple routes fail loudly."
+      }
+    },
+    {
+      "id": "framebuffer-rdram-region",
+      "category": "framebuffer",
+      "example": "rt64_framebuffer_rdram_region_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 10,
+      "claims": ["native-renderer-rdram-sync", "framebuffer-detection-region-copy"]
+    },
+    {
+      "id": "framebuffer-enhancement",
+      "category": "framebuffer",
+      "example": "rt64_framebuffer_enhancement_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 10,
+      "claims": ["framebuffer-upscaling", "framebuffer-reinterpretation"]
+    },
+    {
+      "id": "texture-replacements",
+      "category": "textures",
+      "example": "rt64_texture_replacement_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 10,
+      "claims": ["texture-pack-dds", "texture-pack-rice-filenames", "texture-pack-async-streaming"]
+    },
+    {
+      "id": "latency-skip-buffering",
+      "category": "latency",
+      "example": "rt64_latency_skip_buffering_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 10,
+      "claims": ["latency-skip-buffering"]
+    },
+    {
+      "id": "latency-present-early",
+      "category": "latency",
+      "example": "rt64_latency_present_early_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 20,
+      "claims": ["latency-present-early"]
+    },
+    {
+      "id": "deferred-debugger",
+      "category": "inspection",
+      "example": "rt64_deferred_debugger_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 20,
+      "claims": ["deferred-frame-history", "debugger-frame-inspection"]
+    },
+    {
+      "id": "ubershader-critical-path",
+      "category": "pipelines",
+      "example": "rt64_ubershader_pipeline_behavior",
+      "features": ["rt64"],
+      "repeat_bar": 20,
+      "claims": ["ubershader-no-pipeline-stutter"]
+    },
+    {
+      "id": "hfr-hle-cooperation",
+      "category": "generated-frames",
+      "example": "rt64_hfr_interpolation_behavior",
+      "features": ["hfr-evidence"],
+      "repeat_bar": 20,
+      "claims": ["hfr-60-plus-interpolation"]
+    },
+    {
+      "id": "extended-gbi-cooperation",
+      "category": "extended-gbi",
+      "example": "rt64_extended_gbi_enhancement_behavior",
+      "features": ["extended-gbi-evidence"],
+      "repeat_bar": 10,
+      "claims": ["extended-gbi"]
+    }
+  ],
+  "blockers": [
+    {
+      "id": "recognized-hle-and-extended-gbi",
+      "claims": [],
+      "description": "Public Extended command behavior is closed through guarded non-ROM HLE-dialect evidence while production hash recognition stays strict. User-owned production-recognized microcode and full-ROM coverage remain incomplete."
+    },
+    {
+      "id": "aspect-and-generated-frames",
+      "claims": [],
+      "description": "Widescreen, ultrawide, and HFR renderer behavior are closed on Metal through public non-ROM HLE-dialect fixtures while production hash recognition stays strict. The HFR gate binds required Extended-v1 negotiation, typed 60 Hz refresh and transform-group cooperation, live Manual 120 Hz selection, source/current workload and present IDs, exact midpoint/endpoint pixels, and post-sleep present-call cadence across twenty fresh processes. This platform blocker remains for equivalent D3D12/Vulkan coverage and physical compositor/scanout timestamps."
+    },
+    {
+      "id": "remaining-user-controls",
+      "claims": [],
+      "description": "Metal now isolates Manual refresh targeting, hardware resolve under MSAA4x, idle work, and developer mode with exact active-policy, post-VI, present, and source-resource continuity through live apply and restoration. Existing cases cover MSAA rebuild, filtering, 2D upscale, display buffering, internal color format, post-blend noise, render-to-RAM, and an exclusive GPU-tile-copy-versus-ordinary-RDRAM/TMEM-upload mechanism. Keep this blocker open for broader mixed-control combinations, recognized-HLE workloads, physical refresh/resolve-path evidence, and every other platform/API target."
+    },
+    {
+      "id": "remaining-enhancement-controls",
+      "claims": [],
+      "description": "Metal has causal evidence for every pinned EnhancementConfiguration field: force-branch, texture-LOD scale, both S2DEX controls, latency, and the remaining scalar controls. The S2DEX bilerp matrix proves point/point and bilerp/bilerp invariance plus the mismatched three-load to exact point two-load transition and restoration. Other platform/API targets retain this blocker until the same bounded behavior suite runs there; this does not close recognized-game cooperation."
+    },
+    {
+      "id": "inspector-gui",
+      "claims": [],
+      "description": "Backend-specific Inspector GUI construction and interaction is not certified across the matrix."
+    },
+    {
+      "id": "full-adapter-rom-coverage",
+      "claims": ["base-rendering-accuracy"],
+      "description": "One private NTSC RT64 LLE/post-VI schema-v22 exact-ten series completed and was independently reverified on Metal at fixed cycle 722368695 with zero unsupported events, supplying one current full-ROM scenario rather than broad adapter or recognized-HLE coverage. Bounded native Metal VI gates observe exact nondefault post-VI pixels and prove fn64's seeded gamma-dither policy, coverage-gated horizontal divot, DITHER_FILTER RGBA16 restoration, and qualified AA-selector output are causal and restorable in pinned RT64. Divot changes twelve exact componentwise-median pixels. Restoration changes eighteen exact full-coverage pixels while twenty-four non-full controls and six flat full-coverage controls remain unchanged and alpha is preserved. A separate adapter-capture integration test plus eleven-phase gate preserve hardware mode 0 versus compatibility Unspecified across the wire and native callback, makes modes 0/1 match an independent Figure-11 coverage-four oracle at RGB [132,78,99], restores modes 2/3 exactly, and proves AA-before-divot order with two changed pixels versus one for either stage alone. Remaining evidence is bounded to nearest-filter progressive synthetic RGBA16 and deliberately generated code 4 with opaque code-7 controls; pinned RT64 aliases managed 7/8 with clamped 8/8 at code 7, partial codes 1-3/5-6 lack native vectors, and code-0/save, natural or imported hidden coverage, wider filtering/scaling lattices, MSAA/downsample, other APIs, recognized-HLE/full-profile ROM breadth, silicon, and analog behavior remain uncertified."
+    },
+    {
+      "id": "declared-host-range",
+      "claims": [],
+      "description": "Minimum OS versions, architectures, GPU families, and driver ranges are not certified."
+    }
+  ],
+  "targets": [
+    {
+      "id": "macos-metal",
+      "platform_claim": "platform-macos",
+      "os_family": "macos",
+      "graphics_api": "metal",
+      "capture_api": "metal-bgra8-unorm",
+      "status": "open",
+      "case_statuses": {
+        "backend-lifecycle": "pass",
+        "resolution-downsample": "pass",
+        "user-controls-rebuild": "pass",
+        "enhancement-emulator-controls": "pass",
+        "framebuffer-rdram-region": "pass",
+        "framebuffer-enhancement": "pass",
+        "texture-replacements": "pass",
+        "latency-skip-buffering": "pass",
+        "latency-present-early": "pass",
+        "deferred-debugger": "pass",
+        "ubershader-critical-path": "pass",
+        "hfr-hle-cooperation": "pass",
+        "extended-gbi-cooperation": "pass"
+      },
+      "open_blockers": ["recognized-hle-and-extended-gbi", "aspect-and-generated-frames", "remaining-user-controls", "remaining-enhancement-controls", "inspector-gui", "full-adapter-rom-coverage", "declared-host-range"],
+      "frontier": "Every required Metal case retains its applicable 10/20-run evidence, including HFR and Extended-GBI cooperation; user-controls/rebuild has a separate 20-clean-run race-fix result and enhancement/emulator controls retain bounded causal results on the same macOS 26.5 arm64 Apple-M5-Pro host. Both S2DEX controls additionally pass twenty fresh processes with complete load-program and exact pixel/RDRAM evidence. One private NTSC RT64 LLE/post-VI schema-v22 exact-ten series completed and was independently reverified on this Metal host at fixed cycle 722368695 with zero unsupported events. The changed native VI shader/cadence/qualified-AA overlay and setup-registration path passed the official watchdog-bounded backend-lifecycle runner in 20/20 fresh Darwin 25.5.0 arm64 processes on 2026-07-21. One recreated context retains exact identities from compatibility present 1/2 through filter workload 2 presents 3 through 22 and selector workload 3 presents 23 through 33. The twenty-phase gate keeps exact gamma, seeded gamma-dither, divot, and restoration results. A separate adapter-capture test plus eleven-phase gate prove compatibility Unspecified differs from explicit mode 0 across the wire and native callback, modes 0/1 match an independent Figure-11 coverage-four oracle, modes 2/3 restore exactly, and AA precedes divot. Remaining evidence is bounded to pinned-Metal nearest/progressive synthetic RGBA16 and deliberately generated code 4 with opaque code-7 controls; pinned RT64's code-7 alias, untested partial codes, code-0/save, natural/imported hidden coverage, wider filtering/scaling lattices, MSAA/downsample, other APIs, recognized-HLE/full-profile ROM breadth, silicon, and analog behavior remain uncertified. All seven non-shrinking platform blockers remain open pending broader production-ROM coverage, physical VI evidence, and wider platform certification."
+    },
+    {
+      "id": "linux-vulkan",
+      "platform_claim": "platform-linux",
+      "os_family": "linux",
+      "graphics_api": "vulkan",
+      "capture_api": "vulkan-bgra8-rgba8-unorm",
+      "status": "open",
+      "case_statuses": {
+        "backend-lifecycle": "blocked",
+        "resolution-downsample": "blocked",
+        "user-controls-rebuild": "blocked",
+        "enhancement-emulator-controls": "blocked",
+        "framebuffer-rdram-region": "blocked",
+        "framebuffer-enhancement": "blocked",
+        "texture-replacements": "blocked",
+        "latency-skip-buffering": "blocked",
+        "latency-present-early": "blocked",
+        "deferred-debugger": "blocked",
+        "ubershader-critical-path": "blocked",
+        "hfr-hle-cooperation": "blocked",
+        "extended-gbi-cooperation": "blocked"
+      },
+      "open_blockers": ["recognized-hle-and-extended-gbi", "aspect-and-generated-frames", "remaining-user-controls", "remaining-enhancement-controls", "inspector-gui", "full-adapter-rom-coverage", "declared-host-range"],
+      "frontier": "The backend-neutral post-VI hook and Vulkan image-to-buffer path compile on macOS and retain static ABI/copy/fence tests, but no retained Linux/Vulkan actual-hardware result exists."
+    },
+    {
+      "id": "windows10-d3d12",
+      "platform_claim": "platform-windows-10",
+      "os_family": "windows10",
+      "graphics_api": "d3d12",
+      "capture_api": "d3d12-bgra8-rgba8-unorm",
+      "status": "open",
+      "case_statuses": {
+        "backend-lifecycle": "blocked",
+        "resolution-downsample": "blocked",
+        "user-controls-rebuild": "blocked",
+        "enhancement-emulator-controls": "blocked",
+        "framebuffer-rdram-region": "blocked",
+        "framebuffer-enhancement": "blocked",
+        "texture-replacements": "blocked",
+        "latency-skip-buffering": "blocked",
+        "latency-present-early": "blocked",
+        "deferred-debugger": "blocked",
+        "ubershader-critical-path": "blocked",
+        "hfr-hle-cooperation": "blocked",
+        "extended-gbi-cooperation": "blocked"
+      },
+      "open_blockers": ["recognized-hle-and-extended-gbi", "aspect-and-generated-frames", "remaining-user-controls", "remaining-enhancement-controls", "inspector-gui", "full-adapter-rom-coverage", "declared-host-range"],
+      "frontier": "The backend-neutral post-VI hook retains a static D3D12 placed-footprint copy/fence seam, but it has not been Windows-compiled and no retained Windows 10/D3D12 actual-hardware result exists."
+    },
+    {
+      "id": "windows10-vulkan",
+      "platform_claim": "platform-windows-10",
+      "os_family": "windows10",
+      "graphics_api": "vulkan",
+      "capture_api": "vulkan-bgra8-rgba8-unorm",
+      "status": "open",
+      "case_statuses": {
+        "backend-lifecycle": "blocked",
+        "resolution-downsample": "blocked",
+        "user-controls-rebuild": "blocked",
+        "enhancement-emulator-controls": "blocked",
+        "framebuffer-rdram-region": "blocked",
+        "framebuffer-enhancement": "blocked",
+        "texture-replacements": "blocked",
+        "latency-skip-buffering": "blocked",
+        "latency-present-early": "blocked",
+        "deferred-debugger": "blocked",
+        "ubershader-critical-path": "blocked",
+        "hfr-hle-cooperation": "blocked",
+        "extended-gbi-cooperation": "blocked"
+      },
+      "open_blockers": ["recognized-hle-and-extended-gbi", "aspect-and-generated-frames", "remaining-user-controls", "remaining-enhancement-controls", "inspector-gui", "full-adapter-rom-coverage", "declared-host-range"],
+      "frontier": "The backend-neutral post-VI hook and Vulkan image-to-buffer path compile on macOS and retain static ABI/copy/fence tests, but no retained Windows 10/Vulkan actual-hardware result exists."
+    },
+    {
+      "id": "windows11-d3d12",
+      "platform_claim": "platform-windows-11",
+      "os_family": "windows11",
+      "graphics_api": "d3d12",
+      "capture_api": "d3d12-bgra8-rgba8-unorm",
+      "status": "open",
+      "case_statuses": {
+        "backend-lifecycle": "blocked",
+        "resolution-downsample": "blocked",
+        "user-controls-rebuild": "blocked",
+        "enhancement-emulator-controls": "blocked",
+        "framebuffer-rdram-region": "blocked",
+        "framebuffer-enhancement": "blocked",
+        "texture-replacements": "blocked",
+        "latency-skip-buffering": "blocked",
+        "latency-present-early": "blocked",
+        "deferred-debugger": "blocked",
+        "ubershader-critical-path": "blocked",
+        "hfr-hle-cooperation": "blocked",
+        "extended-gbi-cooperation": "blocked"
+      },
+      "open_blockers": ["recognized-hle-and-extended-gbi", "aspect-and-generated-frames", "remaining-user-controls", "remaining-enhancement-controls", "inspector-gui", "full-adapter-rom-coverage", "declared-host-range"],
+      "frontier": "The backend-neutral post-VI hook retains a static D3D12 placed-footprint copy/fence seam, but it has not been Windows-compiled and no retained Windows 11/D3D12 actual-hardware result exists."
+    },
+    {
+      "id": "windows11-vulkan",
+      "platform_claim": "platform-windows-11",
+      "os_family": "windows11",
+      "graphics_api": "vulkan",
+      "capture_api": "vulkan-bgra8-rgba8-unorm",
+      "status": "open",
+      "case_statuses": {
+        "backend-lifecycle": "blocked",
+        "resolution-downsample": "blocked",
+        "user-controls-rebuild": "blocked",
+        "enhancement-emulator-controls": "blocked",
+        "framebuffer-rdram-region": "blocked",
+        "framebuffer-enhancement": "blocked",
+        "texture-replacements": "blocked",
+        "latency-skip-buffering": "blocked",
+        "latency-present-early": "blocked",
+        "deferred-debugger": "blocked",
+        "ubershader-critical-path": "blocked",
+        "hfr-hle-cooperation": "blocked",
+        "extended-gbi-cooperation": "blocked"
+      },
+      "open_blockers": ["recognized-hle-and-extended-gbi", "aspect-and-generated-frames", "remaining-user-controls", "remaining-enhancement-controls", "inspector-gui", "full-adapter-rom-coverage", "declared-host-range"],
+      "frontier": "The backend-neutral post-VI hook and Vulkan image-to-buffer path compile on macOS and retain static ABI/copy/fence tests, but no retained Windows 11/Vulkan actual-hardware result exists."
+    }
+  ]
+}

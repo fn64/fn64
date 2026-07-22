@@ -19,8 +19,95 @@ pub fn inject_external_event(event: ExternalEvent) {
 /// read back from the executor rather than predicted, so the probe counts what
 /// actually fired, not what the caller expected to fire.
 pub fn advance_virtual_time(now: u64) {
+    crate::task_dispatch::advance_hle_render_task();
     crate::pi::advance_device_time(now);
     with_executor(|exec| exec.advance_time(now));
+}
+
+/// Next pending device-fabric deadline or immediately runnable HLE renderer
+/// continuation, if any.
+/// Guest slices charge little or no virtual time in the C lane, so a DMA
+/// issued mid-slice lands its deadline at `sim_time + latency` -- one cycle
+/// past what the post-slice commit reaches. A pump that only advances in
+/// field-sized steps therefore delivers EVERY completion a full field late,
+/// which breaks real issue-then-poll-next-cycle guest code (observed:
+/// NWXE's hand-rolled joybus pipeline). Idle loops should advance to this
+/// deadline first when it falls before their next scheduled tick.
+/// ponytail: fabric deadlines only; the timer wheel still quantizes to the
+/// pump interval -- surface it here too if a title's timers prove
+/// sub-field-sensitive.
+pub fn next_device_deadline() -> Option<u64> {
+    if crate::task_dispatch::hle_render_needs_progress() {
+        return Some(sim_time());
+    }
+    with_host(|host| host.device_fabric.next_deadline().map(|d| d.get()))
+}
+
+/// Register the one process-wide RDRAM allocation with every runtime owner.
+///
+/// # Safety
+/// `rdram` must address `rdram_len` live bytes until every guest coroutine and
+/// device request has stopped using the process allocation.
+pub unsafe fn register_process_rdram(rdram: *mut u8, rdram_len: usize) {
+    assert!(!rdram.is_null(), "process RDRAM pointer must be non-null");
+    assert!(rdram_len > 0, "process RDRAM length must be nonzero");
+    with_host(|host| {
+        if !host.runtime_rdram.is_null() {
+            assert!(
+                host.runtime_rdram == rdram && host.runtime_rdram_len == rdram_len,
+                "process RDRAM registration cannot replace the live allocation: registered pointer={:?} length={}, requested pointer={rdram:?} length={rdram_len}",
+                host.runtime_rdram,
+                host.runtime_rdram_len,
+            );
+        }
+        host.runtime_rdram = rdram;
+        host.runtime_rdram_len = rdram_len;
+        host.native_execution_destinations.clear();
+    });
+    with_executor(|exec| unsafe { exec.set_rdram_base_with_len(rdram, rdram_len) });
+}
+
+/// Copy the complete physical RDRAM device in logical guest-byte order.
+///
+/// The registered allocation can include fn64's host-only sparse MMIO window;
+/// release evidence must cover exactly the first eight MiB visible to the N64.
+/// `None` means no process RDRAM has been registered. A partial registration is
+/// an invalid runtime configuration and traps by name rather than producing a
+/// partial observation.
+///
+/// The process runtime is single-threaded. Callers must invoke this only at a
+/// host boundary where no guest coroutine or device operation is executing;
+/// the boot harness's committed-VI token is the production owner of that
+/// boundary.
+pub fn copy_registered_physical_rdram_logical() -> Option<Vec<u8>> {
+    let (rdram, allocation_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+    if rdram.is_null() {
+        assert_eq!(
+            allocation_len, 0,
+            "registered process RDRAM has a length but no storage pointer"
+        );
+        return None;
+    }
+    assert!(
+        allocation_len >= fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        "registered process RDRAM length {allocation_len:#x} does not cover the required {:#x}-byte physical device",
+        fn64_runtime::rdram::DEFAULT_RDRAM_SIZE
+    );
+
+    // SAFETY: registration owns a process-lifetime allocation, the length
+    // check above covers the complete physical device, and the host-boundary
+    // contract excludes concurrent guest/device access for this call.
+    Some(unsafe {
+        fn64_runtime::rdram::with_physical_rdram_read(rdram, allocation_len, |physical| {
+            let mut logical = vec![0; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+            for (offset, byte) in logical.iter_mut().enumerate() {
+                *byte = physical.read_u8(RdramAddr::from_offset(
+                    u32::try_from(offset).expect("physical RDRAM offset exceeds u32"),
+                ));
+            }
+            logical
+        })
+    })
 }
 
 /// Create and start thread 0 running `recomp_entrypoint` -- the harness's
@@ -32,22 +119,11 @@ pub fn advance_virtual_time(now: u64) {
 /// game code has run), not a placeholder.
 ///
 /// # Safety
-/// `rdram` must be a valid pointer to the process's one shared rdram
-/// buffer of at least `rdram_len` bytes, live for at least as long as any
-/// coroutine spawned here might run (the whole process, per
-/// `docs/DESIGN.md` section 3). `entry` must be `recomp_entrypoint` (or a
-/// real `recomp_func_t`-shaped function with the same contract) -- the
-/// boot harness passes the real generated symbol.
-///
-/// `rdram_len` (new 2026-07-21): the C lane previously never registered
-/// the process RDRAM with the host (`host.runtime_rdram` stayed null), so
-/// the FIRST raw MMIO device-DMA start a real game performed --
-/// WM2000's own `__osSpRawStartDma` (`func_80037760`) inside its
-/// `osSpTaskLoad` (`func_80031CC0`), reached as soon as the game's real
-/// event bootstrap (`func_80000B30`) started its task threads -- hit
-/// `write_live_device_mmio`'s "no registered process RDRAM" trap. The
-/// recompiled-lane boots (`recompiled::boot_thread0*`) already register
-/// it; this brings the C lane to parity.
+/// `rdram` must be a valid pointer to the process's one shared `rdram_len`-byte
+/// buffer, live for at least as long as any coroutine spawned here might run
+/// (the whole process, per `docs/DESIGN.md` section 3). `entry` must be
+/// `recomp_entrypoint` (or a real `recomp_func_t`-shaped function with the
+/// same contract) -- the boot harness passes the real generated symbol.
 pub unsafe fn boot_thread0(
     rdram: *mut u8,
     rdram_len: usize,
@@ -55,19 +131,9 @@ pub unsafe fn boot_thread0(
     thread_id: ThreadId,
     priority: Priority,
 ) {
-    with_host(|host| {
-        host.runtime_rdram = rdram;
-        host.runtime_rdram_len = rdram_len;
-    });
+    unsafe { register_process_rdram(rdram, rdram_len) };
     let rdram_addr = rdram as usize;
     with_executor(|exec| {
-        // Register the process-wide rdram base so the executor can mirror
-        // each OSMesgQueue's validCount/first/msgCount back into the guest's
-        // real struct after every queue mutation -- guest code reads those
-        // fields directly (MQ_IS_FULL/MQ_GET_COUNT). SAFETY: `rdram` is the
-        // harness's single live rdram buffer, valid for the whole run, the
-        // same buffer every shim already receives.
-        unsafe { exec.set_rdram_base(rdram) };
         exec.create_thread(thread_id, priority, move |yielder, first_input| {
             let rdram_ptr = rdram_addr as *mut u8;
             with_active_yielder(thread_id, rdram_ptr, yielder, || {
@@ -79,26 +145,6 @@ pub unsafe fn boot_thread0(
         });
         exec.start_thread(thread_id);
     });
-}
-
-/// Explicit end-of-run shutdown: abandon every parked guest coroutine
-/// without unwinding its stack. A harness that booted real guest threads
-/// MUST call this before `main` returns.
-///
-/// Why: guest threads park suspended inside nounwind `extern "C"` `_recomp`
-/// shims (`osRecvMesg_recomp` et al). When the thread-local `EXECUTOR` cell
-/// is dropped by the TLS destructor at process exit, dropping each parked
-/// `corosensei::Coroutine` force-unwinds its stack -- straight through
-/// those nounwind frames -- and the process aborts ("panic in a function
-/// that cannot unwind") AFTER all real work already finished. This seam
-/// marks every parked coroutine completed instead (`Executor::
-/// abandon_parked_threads`), leaking the parked stacks' contents, which at
-/// process exit is exactly what would happen anyway.
-///
-/// Idempotent; scheduling anything after calling it is a caller bug (every
-/// thread is `Dead`).
-pub fn shutdown_abandon_threads() {
-    with_executor(|exec| exec.abandon_parked_threads());
 }
 
 /// Run one scheduling step (see `Executor::run_one_step`'s doc comment).
@@ -175,9 +221,15 @@ pub fn is_thread_dead(id: ThreadId) -> bool {
     with_executor(|exec| exec.is_thread_dead(id))
 }
 
-/// Gfx/audio task submission counts observed so far (`Executor::task_log`).
+/// Gfx/audio task admission counts observed so far (`Executor::task_log`).
 pub fn task_counts() -> (u64, u64) {
     with_executor(|exec| (exec.task_log().gfx_count(), exec.task_log().audio_count()))
+}
+
+/// Always-on monotonic guest-resume epoch. Release evidence uses this instead
+/// of optional trace length to prove no coroutine ran after a VI boundary.
+pub fn executor_resume_epoch() -> u64 {
+    with_executor(|exec| exec.resume_epoch())
 }
 
 /// Copy the full recorded trace out as an owned `Vec` -- the harness's
@@ -213,6 +265,399 @@ pub fn sim_time() -> u64 {
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use sha2::Digest;
+
+    fn reset_evidence_owners() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_host(|host| *host = HostState::default());
+    }
+
+    #[test]
+    fn registered_physical_rdram_copy_is_complete_and_logical() {
+        reset_evidence_owners();
+        assert_eq!(copy_registered_physical_rdram_logical(), None);
+
+        let mut storage = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE + 16];
+        fn64_runtime::RdramViewMut::from_storage(&mut storage)
+            .write_u32(RdramAddr::from_offset(0), 0x0123_4567);
+        fn64_runtime::RdramViewMut::from_storage(&mut storage).write_u32(
+            RdramAddr::from_offset(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u32 - 4),
+            0x89ab_cdef,
+        );
+        unsafe { register_process_rdram(storage.as_mut_ptr(), storage.len()) };
+
+        let logical = copy_registered_physical_rdram_logical().unwrap();
+        assert_eq!(logical.len(), fn64_runtime::rdram::DEFAULT_RDRAM_SIZE);
+        assert_eq!(&logical[..4], &[0x01, 0x23, 0x45, 0x67]);
+        assert_eq!(
+            &logical[fn64_runtime::rdram::DEFAULT_RDRAM_SIZE - 4..],
+            &[0x89, 0xab, 0xcd, 0xef]
+        );
+
+        reset_evidence_owners();
+    }
+
+    #[test]
+    #[should_panic(expected = "does not cover the required 0x800000-byte physical device")]
+    fn registered_physical_rdram_copy_rejects_partial_registration() {
+        reset_evidence_owners();
+        let mut storage = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE - 4];
+        unsafe { register_process_rdram(storage.as_mut_ptr(), storage.len()) };
+        let _ = copy_registered_physical_rdram_logical();
+    }
+
+    fn populated_host_snapshot(
+        reverse_hash_insertions: bool,
+        rdram: &mut [u8],
+    ) -> AbiHostEvidenceSnapshot {
+        reset_evidence_owners();
+        crate::load_rom_with_fixed_pi_latency(vec![0x12, 0x34, 0x56, 0x78], 7);
+        let section = crate::register_recompiled_section(0x1000, 0x8080_0000, 0x200);
+        crate::set_section_loaded(section);
+        crate::set_cart_rom_handle_vram(0x8000_1000);
+        crate::set_flash_handle_vram(0x8000_1100);
+        crate::configure_leo_disk(crate::LeoDiskConfig {
+            handle_vram: 0x8000_1200,
+            latency: 3,
+            page_size: 4,
+            release: 2,
+            pulse_width: 5,
+        });
+        crate::set_debug_hardware(crate::DebugHardware::Kmc);
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+            let mut install = |first: bool| {
+                if first {
+                    host.rsp_boot_images.insert(0x300, vec![3, 2, 1]);
+                    host.thread_handles.insert(0x80, 8);
+                    host.thread_guest_ids.insert(8, 0x18);
+                    host.timer_handles.insert(0x180, 18);
+                } else {
+                    host.rsp_boot_images.insert(0x100, vec![1, 2, 3, 4]);
+                    host.thread_handles.insert(0x40, 4);
+                    host.thread_guest_ids.insert(4, 0x14);
+                    host.timer_handles.insert(0x140, 14);
+                }
+            };
+            install(reverse_hash_insertions);
+            install(!reverse_hash_insertions);
+            host.next_synthetic_thread_id = 0xF000_0042;
+        });
+        host_evidence_snapshot()
+    }
+
+    #[test]
+    fn peripheral_evidence_accessor_combines_executor_and_manager_owners() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_host(|host| *host = HostState::default());
+        let mut rdram = vec![0; 0x1000];
+        unsafe { register_process_rdram(rdram.as_mut_ptr(), rdram.len()) };
+        crate::si::set_controller_port_state(
+            0,
+            fn64_runtime::PortState::StandardControllerRumblePak,
+        );
+        crate::si::set_controller_state(0, 0x9000, -12, 34);
+        with_executor(|executor| executor.set_rumble(0, true).unwrap());
+        with_host(|host| {
+            let pi_request = PiDmaRequest {
+                direction: DmaDirection::ToRdram,
+                dram_addr: RdramAddr::from_offset(0x20),
+                cart_addr: 0x1000_0000,
+                len: 0x20,
+            };
+            host.pending_pi_completions.push_back(PendingPiCompletion {
+                request: pi_request,
+                rdram: rdram.as_mut_ptr(),
+                rdram_len: rdram.len(),
+                ret_queue: Some(RdramAddr::from_offset(0x80)),
+                ret_mesg: 7,
+            });
+            host.pending_si_completion = Some(PendingSiCompletion {
+                request: fn64_runtime::SiDmaRequest {
+                    kind: fn64_runtime::SiDmaKind::ControllerRead,
+                    dram_addr: RdramAddr::from_offset(0x40),
+                },
+                owner: PendingSiCompletionOwner::ProcessRdram {
+                    rdram: rdram.as_mut_ptr(),
+                    rdram_len: rdram.len(),
+                },
+            });
+            host.pending_vi_mode = Some(PendingViMode {
+                registers: [1; 14],
+                fields: [[2; 5], [3; 5]],
+            });
+            host.pending_vi_x_scale = Some(0.5);
+            host.active_vi_y_scale = 0.75;
+        });
+
+        let snapshot = peripherals_evidence_snapshot();
+        assert_eq!(
+            snapshot.peripherals.pif.ports[0],
+            fn64_runtime::PortState::StandardControllerRumblePak
+        );
+        assert_eq!(snapshot.peripherals.pif.inputs[0].button, 0x9000);
+        assert!(snapshot.peripherals.pif.rumble_on[0]);
+        assert_eq!(snapshot.vi.pending_mode.unwrap().registers, [1; 14]);
+        assert_eq!(snapshot.vi.pending_x_scale_bits, Some(0.5f32.to_bits()));
+        assert_eq!(snapshot.vi.active_y_scale_bits, 0.75f32.to_bits());
+        assert_eq!(snapshot.pending_pi_completions.len(), 1);
+        assert_eq!(snapshot.pending_pi_completions[0].rdram_len, 0x1000);
+        assert_eq!(
+            snapshot.pending_si_completion.unwrap().owner,
+            PendingSiCompletionOwnerEvidenceSnapshot::ProcessRdram { rdram_len: 0x1000 }
+        );
+        with_host(|host| *host = HostState::default());
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+    }
+
+    #[test]
+    fn host_evidence_is_hash_insertion_order_and_pointer_independent() {
+        let mut rdram_a = vec![0xAA; 0x2000];
+        let mut rdram_b = vec![0x55; 0x2000];
+        assert_ne!(rdram_a.as_mut_ptr(), rdram_b.as_mut_ptr());
+
+        let forward = populated_host_snapshot(false, &mut rdram_a);
+        let reverse = populated_host_snapshot(true, &mut rdram_b);
+        assert_eq!(forward, reverse);
+        assert_eq!(
+            forward
+                .rsp_boot_images
+                .iter()
+                .map(|image| image.rdram_offset)
+                .collect::<Vec<_>>(),
+            vec![0x100, 0x300]
+        );
+        assert_eq!(forward.rsp_boot_images[0].bytes, vec![1, 2, 3, 4]);
+        assert_eq!(
+            forward
+                .thread_handles
+                .iter()
+                .map(|entry| entry.osthread_offset)
+                .collect::<Vec<_>>(),
+            vec![0x40, 0x80]
+        );
+        assert_eq!(
+            forward
+                .thread_guest_ids
+                .iter()
+                .map(|entry| entry.executor_thread_id)
+                .collect::<Vec<_>>(),
+            vec![4, 8]
+        );
+        assert_eq!(
+            forward
+                .timer_handles
+                .iter()
+                .map(|entry| entry.ostimer_offset)
+                .collect::<Vec<_>>(),
+            vec![0x140, 0x180]
+        );
+        assert_eq!(
+            forward.registered_rdram,
+            RegisteredRdramEvidenceSnapshot {
+                present: true,
+                byte_len: 0x2000,
+            }
+        );
+    }
+
+    #[test]
+    fn host_evidence_covers_each_abi_owned_field_family() {
+        reset_evidence_owners();
+        let mut previous = host_evidence_snapshot();
+        assert!(!previous.rom_installed);
+        assert_eq!(previous.installed_rom, None);
+
+        crate::load_rom_with_fixed_pi_latency(vec![0x10, 0x20, 0x30], 2);
+        let mut current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        assert_eq!(
+            current.installed_rom,
+            Some(InstalledRomEvidenceSnapshot {
+                byte_len: 3,
+                sha256: sha2::Sha256::digest([0x10, 0x20, 0x30]).into(),
+            })
+        );
+        previous = current;
+
+        crate::load_rom_with_fixed_pi_latency(vec![0x10, 0x20, 0x31], 2);
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        assert_eq!(current.installed_rom.unwrap().byte_len, 3);
+        previous = current;
+
+        with_executor(|executor| {
+            executor.set_controller_input(
+                0,
+                fn64_runtime::ContInput {
+                    button: 0x8000,
+                    stick_x: -3,
+                    stick_y: 4,
+                },
+            )
+        });
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        previous = current;
+
+        crate::set_flash_identity(crate::FlashIdentity {
+            flash_type: 0x1020_3040,
+            flash_maker: 0x5060_7080,
+        });
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        previous = current;
+
+        crate::register_recompiled_section(0x2000, 0x8080_0000, 0x400);
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        previous = current;
+
+        with_host(|host| {
+            host.rsp_boot_images.insert(0x80, vec![0xDE, 0xAD]);
+        });
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        previous = current;
+
+        crate::set_cart_rom_handle_vram(0x8000_2000);
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        previous = current;
+
+        crate::set_flash_handle_vram(0x8000_2100);
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        previous = current;
+
+        crate::configure_leo_disk(crate::LeoDiskConfig {
+            handle_vram: 0x8000_2200,
+            latency: 1,
+            page_size: 2,
+            release: 3,
+            pulse_width: 4,
+        });
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        previous = current;
+
+        with_host(|host| {
+            host.thread_handles.insert(0x40, 7);
+        });
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        previous = current;
+
+        with_host(|host| {
+            host.thread_guest_ids.insert(7, 0x77);
+        });
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        previous = current;
+
+        with_host(|host| {
+            host.timer_handles.insert(0x80, 9);
+        });
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        previous = current;
+
+        with_host(|host| host.next_synthetic_thread_id = 0xF000_0010);
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        previous = current;
+
+        let mut rdram = vec![0; 0x400];
+        unsafe { register_process_rdram(rdram.as_mut_ptr(), rdram.len()) };
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+        previous = current;
+
+        crate::set_debug_hardware(crate::DebugHardware::Isv);
+        current = host_evidence_snapshot();
+        assert_ne!(current, previous);
+    }
+
+    #[test]
+    fn host_evidence_excludes_diagnostic_and_operation_logs() {
+        reset_evidence_owners();
+        let before = host_evidence_snapshot();
+        with_host(|host| {
+            host.debug_packets.push(crate::DebugPacket {
+                packet_type: 1,
+                bytes: vec![1, 2, 3],
+            });
+            host.save_operations.push(fn64_runtime::SaveOperationEvent {
+                at: Cycles::new(5),
+                device: fn64_runtime::SaveType::SramBanked,
+                operation: fn64_runtime::SaveOperationKind::Write,
+                offset: 8,
+                len: 4,
+            });
+            host.controller_operations
+                .push(fn64_runtime::ControllerOperationEvent {
+                    at: Cycles::new(6),
+                    port: 1,
+                    device: fn64_runtime::ControllerOperationDevice::TransferPak,
+                    operation: fn64_runtime::ControllerOperationKind::Read,
+                });
+            host.native_execution_destinations
+                .push(NativeExecutionDestinationEvent {
+                    at: Cycles::new(7),
+                    destination: NativeExecutionDestination {
+                        section_index: 2,
+                        function_offset: 0x40,
+                        link_vram: 0x8080_0040,
+                    },
+                });
+        });
+        assert_eq!(host_evidence_snapshot(), before);
+    }
+
+    #[test]
+    fn process_rdram_registration_updates_the_shared_runtime_owner() {
+        reset_evidence_owners();
+        let mut bytes = vec![0u8; 0x100];
+        with_host(|host| {
+            host.native_execution_destinations
+                .push(NativeExecutionDestinationEvent {
+                    at: Cycles::new(1),
+                    destination: NativeExecutionDestination {
+                        section_index: 0,
+                        function_offset: 0,
+                        link_vram: 0x8000_0000,
+                    },
+                });
+        });
+
+        unsafe { register_process_rdram(bytes.as_mut_ptr(), bytes.len()) };
+
+        with_host(|host| {
+            assert_eq!(host.runtime_rdram, bytes.as_mut_ptr());
+            assert_eq!(host.runtime_rdram_len, bytes.len());
+            assert!(host.native_execution_destinations.is_empty());
+        });
+
+        unsafe { register_process_rdram(bytes.as_mut_ptr(), bytes.len()) };
+    }
+
+    #[test]
+    fn process_rdram_registration_rejects_a_replacement_allocation() {
+        reset_evidence_owners();
+        let mut first = vec![0u8; 0x100];
+        let mut replacement = vec![0u8; 0x100];
+        unsafe { register_process_rdram(first.as_mut_ptr(), first.len()) };
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            register_process_rdram(replacement.as_mut_ptr(), replacement.len());
+        }));
+        assert!(rejected.is_err());
+        with_host(|host| {
+            assert_eq!(host.runtime_rdram, first.as_mut_ptr());
+            assert_eq!(host.runtime_rdram_len, first.len());
+        });
+    }
 
     /// Regression: `arm_fpr_alias` must make an odd-register `mtc1` (which
     /// generated C emits as `ctx->f_odd[(N-1)*2] = value`) land in the HIGH
@@ -267,6 +712,7 @@ mod tests {
     fn retrace_progress_raises_the_shared_mi_vi_source() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
         crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::test_support::install_complete_render_backend(0);
         crate::pi::set_mi_interrupt_mask(fn64_runtime::InterruptSource::Vi.bit());
         crate::vi::arm_vi_retrace(10);
 

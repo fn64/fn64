@@ -58,7 +58,8 @@ pub const OS_PRIORITY_IDLE: Priority = 0;
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ThreadState {
     /// Created via `osCreateThread` but not yet `osStartThread`'d. Real
-    /// libultra threads sit here with no coroutine stack allocated yet.
+    /// libultra threads are not runnable in this state; fn64 may already have
+    /// allocated the host coroutine storage that will carry the guest stack.
     Stopped,
     /// On the run queue, eligible to be resumed (may not be the one
     /// actually running right now -- that's the executor's run queue's
@@ -71,7 +72,7 @@ pub enum ThreadState {
     /// Parked in `osSendMesg` on a full queue.
     BlockedOnSend,
     /// The coroutine's body returned (thread function fell off the end) or
-    /// `osStopThread`/`osDestroyThread` was called.
+    /// `osDestroyThread` was called.
     Dead,
 }
 
@@ -89,32 +90,14 @@ pub enum Yield {
     /// round (rung 14's idle-loop fix: this is what an unconditional spin
     /// MUST call instead of looping forever without ever yielding).
     ///
-    /// Correct ONLY for callers whose own code loops back around the yield
-    /// (fn64-recomp-rs emits `pause_self(); pc = self; continue 'run;` --
-    /// the guest self-branch is preserved, so auto-requeue faithfully
-    /// models "spin forever at this priority, yielding each iteration").
-    /// The C-ABI `pause_self` shim must NOT use this variant -- see
-    /// [`Yield::StopSelf`].
+    /// Correct only for translated callers that explicitly loop back around
+    /// the yield. A generated-C `pause_self` call has no such continuation
+    /// and must use [`Yield::StopSelf`].
     PauseSelf,
-    /// The C-ABI `pause_self` boundary: park this thread in
-    /// `ThreadState::Stopped` until (and unless) some other thread
-    /// explicitly `osStartThread`s it, exactly like the reference
-    /// N64ModernRuntime's `pause_self`.
-    ///
-    /// Why this is a distinct variant from [`Yield::PauseSelf`]
-    /// (wm2000 boot, 2026-07-21): N64Recomp's C codegen translates an
-    /// unconditional guest self-branch (`j self; nop` -- both permanent
-    /// idle parks AND assert-hang loops like NWXE `func_80003DD4`
-    /// 0x80003DF0's invalid-file-id trap) into a bare `pause_self()` call
-    /// with NO loop back -- the reference runtime never returns from it
-    /// without an explicit restart, so the code after the call is
-    /// unreachable there. Auto-requeue semantics made fn64 RETURN through
-    /// that call site, falling through a guest assertion that can never be
-    /// passed on hardware: the WM2000 sound driver then read its file
-    /// table with an out-of-range id and submitted a PI DMA with size
-    /// 0xFFFFFFFC. Parking (resumable only via `osStartThread`, matching
-    /// the reference runtime) makes such an assert an honest permanent
-    /// park instead of silent state corruption.
+    /// Park the current thread in `Stopped` until another thread explicitly
+    /// starts it. This is the generated-C `pause_self` boundary: returning to
+    /// the statement after the call would turn a guest assert/idle park into
+    /// impossible fall-through execution.
     StopSelf,
     /// A translated block exhausted its deterministic instruction slice.
     /// The executor charges these guest instructions to virtual time only
@@ -209,6 +192,7 @@ pub struct GameThread {
     pub id: ThreadId,
     pub priority: Priority,
     state: ThreadState,
+    started: bool,
     coroutine: Option<ThreadCoroutine>,
 }
 
@@ -230,6 +214,7 @@ impl GameThread {
             id,
             priority,
             state: ThreadState::Stopped,
+            started: false,
             coroutine: Some(Coroutine::with_stack(
                 DefaultStack::new(COROUTINE_STACK_SIZE)
                     .expect("failed to allocate GameThread coroutine stack"),
@@ -256,32 +241,8 @@ impl GameThread {
         matches!(self.state, ThreadState::Dead)
     }
 
-    /// Abandon this thread's parked coroutine WITHOUT unwinding its stack,
-    /// marking it `Dead`. Process-exit teardown only.
-    ///
-    /// Why this exists: dropping a *suspended* `corosensei::Coroutine`
-    /// force-unwinds its stack with a special panic payload. A parked
-    /// recompiled guest thread is suspended inside an `extern "C"` `_recomp`
-    /// shim frame (e.g. `osRecvMesg_recomp`), which Rust marks nounwind --
-    /// so the forced unwind is instant UB-by-abort ("panic in a function
-    /// that cannot unwind"). At process exit the stacks are about to be
-    /// reclaimed by the OS anyway; `force_reset` (corosensei's own escape
-    /// hatch for exactly this) marks the coroutine completed so its `Drop`
-    /// is a no-op, at the cost of leaking whatever was live on the guest
-    /// stack -- which is the honest, correct trade at teardown.
-    pub fn abandon(&mut self) {
-        if let Some(coroutine) = self.coroutine.as_mut() {
-            if coroutine.started() && !coroutine.done() {
-                // SAFETY: equivalent to longjmp past the parked frames; the
-                // objects on the coroutine stack are leaked, never touched
-                // again. Only sound because nothing will resume or inspect
-                // this thread afterwards -- guaranteed by marking it Dead
-                // (a dead thread is never scheduled again) and by this
-                // method's process-exit-teardown-only contract.
-                unsafe { coroutine.force_reset() };
-            }
-        }
-        self.state = ThreadState::Dead;
+    pub fn has_started(&self) -> bool {
+        self.started
     }
 
     /// Resume this thread's coroutine. Requires a `RunToken` -- see that
@@ -295,6 +256,20 @@ impl GameThread {
     /// calling this function and does not call `issue()` again until this
     /// call has returned.
     pub fn resume(&mut self, _token: RunToken, input: Resume) -> CoroutineResult<Yield, ()> {
+        if self.started {
+            assert_ne!(
+                input,
+                Resume::Start,
+                "Resume::Start may only be delivered on a GameThread's first resume"
+            );
+        } else {
+            assert_eq!(
+                input,
+                Resume::Start,
+                "a GameThread's first resume must use Resume::Start"
+            );
+            self.started = true;
+        }
         let coroutine = self
             .coroutine
             .as_mut()

@@ -30,8 +30,9 @@ pub unsafe extern "C" fn osCreateMesgQueue_recomp(_rdram: *mut u8, ctx: *mut Rec
 /// # Safety
 /// Same contract as `osCreateMesgQueue_recomp`.
 #[no_mangle]
-pub unsafe extern "C" fn osSendMesg_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+pub unsafe extern "C" fn osSendMesg_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
+    crate::probe_sp_region("send", ctx);
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
     let msg: Mesg = ctx.r5 as u32;
     let may_block = ctx.r6 == OS_MESG_BLOCK;
@@ -43,6 +44,27 @@ pub unsafe extern "C" fn osSendMesg_recomp(_rdram: *mut u8, ctx: *mut RecompCont
             mq_addr.offset(),
             ctx.r29
         );
+        if let Ok(raw_count) = std::env::var("FN64_DEBUG_SEND_WORDS") {
+            let count = raw_count.parse::<usize>().unwrap_or_else(|_| {
+                panic!("FN64_DEBUG_SEND_WORDS must be an integer, got {raw_count:?}")
+            });
+            let offset = RdramAddr::from_gpr(u64::from(msg)).offset() as usize;
+            let byte_len = count
+                .checked_mul(4)
+                .expect("FN64_DEBUG_SEND_WORDS byte length overflow");
+            let end = offset
+                .checked_add(byte_len)
+                .expect("FN64_DEBUG_SEND_WORDS range overflow");
+            let allocation_len = with_host(|host| host.runtime_rdram_len);
+            if end <= allocation_len {
+                let bytes = unsafe { std::slice::from_raw_parts(rdram.add(offset), byte_len) };
+                let words: Vec<_> = bytes
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_ne_bytes(bytes.try_into().expect("four message bytes")))
+                    .collect();
+                eprintln!("[DEBUG osSendMesg_recomp] msg_words={words:08x?}");
+            }
+        }
     }
 
     let sent = match suspend_active_coroutine(Yield::BlockOnSend {
@@ -78,6 +100,15 @@ const OS_MESG_BLOCK: u64 = 1;
 pub unsafe extern "C" fn osRecvMesg_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
+    crate::probe_sp_region("recv", ctx);
+    if crate::boot_probe_enabled() && (ctx.r4 as u32) < 0x8000_0400 {
+        eprintln!(
+            "[boot-probe] osRecvMesg NON-POINTER mq={:#x} thread={:#x} restored_slot={:#010x}",
+            ctx.r4 as u32,
+            crate::current_thread_id("probe"),
+            (ctx.r29 as u32).wrapping_sub(8),
+        );
+    }
     // Correction (2026-07-14): check the RAW register for null, not the
     // translated `RdramAddr`. A real `msg == NULL` call (public libultra
     // manual's documented "pass NULL to just wait, discarding the message"
@@ -139,6 +170,12 @@ pub unsafe extern "C" fn osRecvMesg_recomp(rdram: *mut u8, ctx: *mut RecompConte
 #[no_mangle]
 pub unsafe extern "C" fn osSetEventMesg_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &*ctx };
+    if crate::boot_probe_enabled() {
+        eprintln!(
+            "[boot-probe] osSetEventMesg(event={}, mq={:#010x}, msg={:#010x})",
+            ctx.r4 as u32, ctx.r5 as u32, ctx.r6 as u32
+        );
+    }
     let event = ctx.r4 as u32;
     let mq_addr = RdramAddr::from_gpr(ctx.r5);
     let msg: Mesg = ctx.r6 as u32;

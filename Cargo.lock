@@ -703,8 +703,9 @@ dependencies = [
  "fn64-audio",
  "fn64-recomp-rs",
  "fn64-render",
- "fn64-render-rt64",
+ "fn64-render-reference",
  "fn64-runtime",
+ "sha2",
 ]
 
 [[package]]
@@ -712,6 +713,7 @@ name = "fn64-audio"
 version = "0.0.0"
 dependencies = [
  "cpal",
+ "fn64-runtime",
 ]
 
 [[package]]
@@ -719,7 +721,26 @@ name = "fn64-boot-harness"
 version = "0.0.0"
 dependencies = [
  "fn64-abi",
+ "fn64-recomp-rs",
+ "fn64-render",
  "fn64-runtime",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "fn64-certification"
+version = "0.0.0"
+dependencies = [
+ "fn64-boot-harness",
+ "fn64-render",
+ "fn64-render-reference",
+ "fn64-render-rt64",
+ "fn64-runtime",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -754,6 +775,7 @@ version = "0.0.0"
 dependencies = [
  "fn64-recomp",
  "serde",
+ "sha2",
  "toml",
 ]
 
@@ -762,10 +784,12 @@ name = "fn64-render"
 version = "0.0.0"
 dependencies = [
  "fn64-runtime",
+ "sha2",
+ "twox-hash",
 ]
 
 [[package]]
-name = "fn64-render-rt64"
+name = "fn64-render-reference"
 version = "0.0.0"
 dependencies = [
  "fn64-render",
@@ -775,11 +799,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "fn64-render-rt64"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "fn64-abi",
+ "fn64-boot-harness",
+ "fn64-render",
+ "fn64-render-reference",
+ "fn64-runtime",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "fn64-runtime"
 version = "0.0.0"
 dependencies = [
  "corosensei",
  "fn64-recomp-rs",
+ "sha2",
+ "static_assertions",
 ]
 
 [[package]]
@@ -794,6 +834,7 @@ dependencies = [
  "fn64-audio",
  "fn64-boot-harness",
  "fn64-render",
+ "fn64-render-reference",
  "fn64-render-rt64",
  "fn64-runtime",
  "gilrs",
@@ -2535,6 +2576,12 @@ name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+
+[[package]]
+name = "twox-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
 
 [[package]]
 name = "type-map"

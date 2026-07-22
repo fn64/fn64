@@ -72,9 +72,44 @@ pub extern "C" fn do_break(vram: u32) {
 /// from the game's `recomp_overlays.inl`-derived data -- `fn64-runtime`
 /// itself has no `.inl`-parsing knowledge, per `docs/DESIGN.md` section 1's
 /// crate split).
+///
+/// Resolution is deliberately not execution evidence. The returned pointer
+/// may be compared, cached, or discarded. Official generated-C builds inject
+/// [`fn64_c_recompiled_function_enter`] inside every generated body, which is
+/// the first boundary that proves native control actually entered it.
 #[no_mangle]
 pub extern "C" fn get_function(vram: i32) -> *const () {
     with_host(|host| host.sections.resolve(vram as u32) as *const ())
+}
+
+/// Record entry into one prepared N64Recomp-generated native function.
+///
+/// `fn64-boot-harness` injects this call immediately inside every generated
+/// `RECOMP_FUNC` body. A lookup alone never reaches this hook, while direct
+/// generated C-to-C calls do, so this is execution evidence for the prepared
+/// native archive rather than a log of resolution attempts.
+#[no_mangle]
+pub extern "C" fn fn64_c_recompiled_function_enter(function: RecompFunc) {
+    let at = Cycles::new(sim_time());
+    with_host(|host| {
+        let pointer = function as usize;
+        let destination = *host
+            .native_destination_by_pointer
+            .get(&pointer)
+            .unwrap_or_else(|| {
+                panic!(
+                    "fn64_c_recompiled_function_enter: entered native callable {pointer:#x} was not registered in the generated section table"
+                )
+            });
+        host.native_execution_destinations
+            .push(NativeExecutionDestinationEvent { at, destination });
+    });
+}
+
+/// Copy successfully entered native generated-C destinations in exact entry
+/// order. The history is append-only until a new ROM/process lifetime begins.
+pub fn copy_native_execution_destinations() -> Vec<NativeExecutionDestinationEvent> {
+    with_host(|host| host.native_execution_destinations.clone())
 }
 
 /// Register a section's `FuncEntry` table with the overlay registry, in the
@@ -103,12 +138,39 @@ pub unsafe fn register_section(
         })
         .collect();
     with_host(|host| {
-        host.sections.register_section(Section {
+        let section_index = host.sections.register_section(Section {
             rom_addr,
             ram_addr,
             size,
             funcs: entries,
-        })
+        });
+        let stable_section_index = u32::try_from(section_index)
+            .expect("generated section index exceeds native destination evidence wire");
+        for &(offset, _, function) in funcs {
+            let link_vram = ram_addr.checked_add(offset).unwrap_or_else(|| {
+                panic!(
+                    "registered function offset {offset:#x} overflows section link base {ram_addr:#010x}"
+                )
+            });
+            let destination = NativeExecutionDestination {
+                section_index: stable_section_index,
+                function_offset: offset,
+                link_vram,
+            };
+            match host.native_destination_by_pointer.entry(function as usize) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(destination);
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    assert_eq!(
+                        *entry.get(),
+                        destination,
+                        "one native callable pointer is assigned to multiple generated destinations"
+                    );
+                }
+            }
+        }
+        section_index
     })
 }
 
@@ -160,6 +222,67 @@ pub fn note_dma_overlay_load(rom_addr: u32, dest_vram: u32) -> Option<fn64_runti
 mod tests {
     use super::*;
     use crate::test_support::*;
+
+    unsafe extern "C" fn observed_native_first(_rdram: *mut u8, _ctx: *mut RecompContext) {
+        fn64_c_recompiled_function_enter(observed_native_first);
+    }
+
+    unsafe extern "C" fn observed_native_second(_rdram: *mut u8, _ctx: *mut RecompContext) {
+        fn64_c_recompiled_function_enter(observed_native_second);
+    }
+
+    #[test]
+    fn native_destinations_record_entry_not_lookup_and_preserve_direct_call_order() {
+        with_host(|host| *host = HostState::default());
+        load_rom(Vec::new());
+        let section = unsafe {
+            register_section(
+                0x0010_0000,
+                0x8000_4000,
+                0x100,
+                &[
+                    (0x10, 4, observed_native_first),
+                    (0x40, 4, observed_native_second),
+                ],
+            )
+        };
+        set_section_loaded(section);
+
+        let resolved = get_function(0x8000_4010u32 as i32);
+        assert!(copy_native_execution_destinations().is_empty());
+
+        let mut context = RecompContext::zeroed();
+        let first: RecompFunc = unsafe { std::mem::transmute(resolved) };
+        unsafe { first(std::ptr::null_mut(), &mut context) };
+        unsafe { observed_native_second(std::ptr::null_mut(), &mut context) };
+
+        let section_index = u32::try_from(section).unwrap();
+        assert_eq!(
+            copy_native_execution_destinations(),
+            vec![
+                NativeExecutionDestinationEvent {
+                    at: Cycles::new(0),
+                    destination: NativeExecutionDestination {
+                        section_index,
+                        function_offset: 0x10,
+                        link_vram: 0x8000_4010,
+                    },
+                },
+                NativeExecutionDestinationEvent {
+                    at: Cycles::new(0),
+                    destination: NativeExecutionDestination {
+                        section_index,
+                        function_offset: 0x40,
+                        link_vram: 0x8000_4040,
+                    },
+                },
+            ]
+        );
+
+        load_rom(Vec::new());
+        assert!(copy_native_execution_destinations().is_empty());
+        with_host(|host| *host = HostState::default());
+    }
 
     #[test]
     fn get_function_miss_panics_naming_the_vram() {
@@ -273,6 +396,9 @@ mod tests {
         // from the static VRAM so a heap-vs-static confusion is caught.
         let heap_vram: u32 = 0x8038_8b60;
         let mut rdram = vec![0u8; fn64_runtime::RDRAM_MMIO_WINDOW_END as usize];
+        set_cart_rom_handle_vram(0x8000_1000);
+        let mut cart = ctx_zeroed();
+        unsafe { osCartRomInit_recomp(rdram.as_mut_ptr(), &mut cart) };
         let mb_off = 0x2000usize;
         let mb_vram: u64 = 0x8000_2000;
         rdram[mb_off + 0x4..mb_off + 0x8].copy_from_slice(&0u32.to_ne_bytes()); // retQueue
@@ -281,6 +407,7 @@ mod tests {
         rdram[mb_off + 0x10..mb_off + 0x14].copy_from_slice(&file_len.to_ne_bytes()); // size
 
         let mut ctx = ctx_zeroed();
+        ctx.r4 = cart.r2;
         ctx.r5 = mb_vram;
         ctx.r6 = 0; // OS_READ / ToRdram
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };

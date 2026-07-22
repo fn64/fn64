@@ -8,9 +8,12 @@
 use std::{cell::RefCell, rc::Rc};
 
 use fn64_recomp_rs::{
-    enter_pending_interrupt, BankId, BlockExit, BlockProgram, CallResolution, CodeBank, CpuFault,
-    CpuInterruptLine, ExecutableRegion, ExecutionKey, GeneratedBankRunner, GenerationError,
-    GuestPc, InstructionBudget, Rdram, RecompContext as RsContext, RecompFunc, TransferResolver,
+    enter_pending_interrupt, BankId, BlockExit, BlockProgram, BlockProgramEvidenceSnapshot,
+    CallResolution, CodeBank, CpuFault, CpuInterruptLine, ExecutableRegion,
+    ExecutionDestinationObservation, ExecutionKey, FunctionEntryObservationSchema,
+    GeneratedBankRunner, GenerationError, GuestPc, GuestWriteEvent, InstructionBudget,
+    ProgramArtifactIdentity, ProgramIdentityEvidenceSnapshot, ProgramIdentitySource, Rdram,
+    RecompContext as RsContext, RecompFunc, TransferResolver, TranslatedFunctionIdentity,
 };
 use fn64_runtime::{Priority, ThreadId};
 
@@ -29,12 +32,32 @@ struct ObservedExecutableRegion {
     region: ExecutableRegion,
     next_generation: u64,
     builder: LiveGenerationBuilder,
+    builder_artifact_identity: Option<ProgramArtifactIdentity>,
 }
 
 thread_local! {
     static PENDING_EXECUTABLE_WRITES: RefCell<Vec<(u32, u32)>> = const {
         RefCell::new(Vec::new())
     };
+    static FUNCTION_LANE_ARTIFACT_IDENTITY: std::cell::Cell<Option<ProgramArtifactIdentity>> =
+        const { std::cell::Cell::new(None) };
+    static FUNCTION_LANE_ENTRY_OBSERVATION_SCHEMA:
+        std::cell::Cell<Option<FunctionEntryObservationSchema>> =
+        const { std::cell::Cell::new(None) };
+    static FUNCTION_EXECUTION_DESTINATIONS:
+        RefCell<Vec<FunctionExecutionDestinationObservation>> = const {
+        RefCell::new(Vec::new())
+    };
+}
+
+/// One successfully entered emitted whole-function destination. The artifact
+/// identity and `(vram, symbol)` pair are pointer-independent; `at` is the
+/// guest device cycle sampled before the first translated instruction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionExecutionDestinationObservation {
+    pub at: fn64_runtime::Cycles,
+    pub artifact_identity: ProgramArtifactIdentity,
+    pub function: TranslatedFunctionIdentity,
 }
 
 /// One immutable arbitrary-PC program plus the active executable-mapping
@@ -45,7 +68,52 @@ pub(super) struct LiveBlockProgram {
     entry_lookup: ProgramEntryLookup,
     transfer_lookup: ProgramTransferLookup,
     budget: InstructionBudget,
+    dispatch_artifact_identity: Option<ProgramArtifactIdentity>,
     executable_regions: Rc<RefCell<Vec<ObservedExecutableRegion>>>,
+}
+
+/// One canonical half-open physical write range awaiting executable-image
+/// invalidation at the next host boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingExecutableWriteEvidenceSnapshot {
+    pub physical_start: u32,
+    pub physical_end: u32,
+}
+
+/// Canonical state of one dynamically replaceable executable region.
+///
+/// The builder and its native address are absent. `active_generation` is the
+/// generation whose bank is installed now; `next_generation` is retained
+/// because it determines the identity passed to the next pure builder call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveExecutableRegionEvidenceSnapshot {
+    pub physical_start: u32,
+    pub physical_end: u32,
+    pub virtual_start: GuestPc,
+    pub virtual_end: GuestPc,
+    pub active_bank: BankId,
+    pub active_generation: u64,
+    pub next_generation: u64,
+    pub builder_artifact_identity: ProgramArtifactIdentity,
+}
+
+/// Pointer-independent executable evidence for the active typed-Rust lane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecompiledProgramEvidenceSnapshot {
+    /// Whole-function native callables. Their bodies are opaque at runtime,
+    /// so only a producer-supplied artifact identity is authoritative.
+    Function {
+        identity: ProgramIdentityEvidenceSnapshot,
+    },
+    /// Bank-qualified arbitrary-PC execution with its complete code image and
+    /// future-affecting dynamic-generation state.
+    Block {
+        program: BlockProgramEvidenceSnapshot,
+        dispatch_artifact_identity: ProgramArtifactIdentity,
+        instruction_budget: u32,
+        executable_regions: Vec<LiveExecutableRegionEvidenceSnapshot>,
+        pending_executable_writes: Vec<PendingExecutableWriteEvidenceSnapshot>,
+    },
 }
 
 struct LiveTransferResolver {
@@ -106,8 +174,186 @@ impl LiveBlockProgram {
     }
 }
 
-fn record_executable_write(offset: u32, len: u32) {
+fn canonical_pending_executable_writes() -> Vec<PendingExecutableWriteEvidenceSnapshot> {
+    let mut writes = PENDING_EXECUTABLE_WRITES.with(|pending| {
+        pending
+            .borrow()
+            .iter()
+            .map(|&(physical_start, len)| {
+                assert!(len > 0, "pending executable write has zero length");
+                let physical_end = physical_start
+                    .checked_add(len)
+                    .expect("pending executable write exceeds physical address space");
+                PendingExecutableWriteEvidenceSnapshot {
+                    physical_start,
+                    physical_end,
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    writes.sort_unstable_by_key(|write| (write.physical_start, write.physical_end));
+    let mut canonical: Vec<PendingExecutableWriteEvidenceSnapshot> = Vec::new();
+    for write in writes {
+        if let Some(previous) = canonical.last_mut() {
+            if write.physical_start <= previous.physical_end {
+                previous.physical_end = previous.physical_end.max(write.physical_end);
+                continue;
+            }
+        }
+        canonical.push(write);
+    }
+    canonical
+}
+
+/// Capture the installed typed-Rust program without runner, resolver,
+/// builder, lookup, or native function-pointer values.
+///
+/// The legacy function install API remains executable for compatibility, but
+/// it is intentionally not evidence-capable: callers must use
+/// [`set_entry_lookup_with_artifact_identity`] (or the matching boot helper)
+/// before this function will describe a function lane. This prevents section
+/// geometry or process-specific pointer bits from impersonating code identity.
+pub fn recompiled_program_evidence_snapshot() -> Option<RecompiledProgramEvidenceSnapshot> {
+    let (function_lane, block_lane) = with_host(|host| {
+        (
+            host.recompiled_lookup.is_some(),
+            host.recompiled_program.clone(),
+        )
+    });
+    assert!(
+        !(function_lane && block_lane.is_some()),
+        "function and block recompiled lanes are installed simultaneously"
+    );
+    if function_lane {
+        let identity = FUNCTION_LANE_ARTIFACT_IDENTITY
+            .with(std::cell::Cell::get)
+            .unwrap_or_else(|| {
+                panic!(
+                    "function-lane release evidence requires a stable host-provided artifact identity"
+                )
+            });
+        return Some(RecompiledProgramEvidenceSnapshot::Function {
+            identity: ProgramIdentityEvidenceSnapshot {
+                identity,
+                source: ProgramIdentitySource::CallerSupplied,
+            },
+        });
+    }
+    let live = block_lane?;
+    let program = live.program.borrow().evidence_snapshot();
+    let dispatch_artifact_identity = live.dispatch_artifact_identity.unwrap_or_else(|| {
+        panic!(
+            "block-lane release evidence requires a stable host-provided dispatch artifact identity"
+        )
+    });
+    let mut executable_regions = live
+        .executable_regions
+        .borrow()
+        .iter()
+        .map(|observed| {
+            let active_bank = observed.region.active_bank().unwrap_or_else(|| {
+                panic!("observed executable region has no active bank during evidence capture")
+            });
+            let active_generation = observed
+                .next_generation
+                .checked_sub(1)
+                .expect("observed executable region has no active generation");
+            let builder_artifact_identity = observed.builder_artifact_identity.unwrap_or_else(|| {
+                panic!(
+                    "executable-region release evidence requires a stable host-provided builder artifact identity"
+                )
+            });
+            LiveExecutableRegionEvidenceSnapshot {
+                physical_start: observed.physical_start,
+                physical_end: observed.physical_end,
+                virtual_start: observed.region.start(),
+                virtual_end: observed.region.end(),
+                active_bank,
+                active_generation,
+                next_generation: observed.next_generation,
+                builder_artifact_identity,
+            }
+        })
+        .collect::<Vec<_>>();
+    executable_regions.sort_unstable_by_key(|region| {
+        (
+            region.physical_start,
+            region.physical_end,
+            region.virtual_start,
+            region.virtual_end,
+        )
+    });
+    Some(RecompiledProgramEvidenceSnapshot::Block {
+        program,
+        dispatch_artifact_identity,
+        instruction_budget: live.budget.get(),
+        executable_regions,
+        pending_executable_writes: canonical_pending_executable_writes(),
+    })
+}
+
+/// Copy successfully entered arbitrary-PC destinations in exact runner-entry
+/// order. An empty vector means either that no block lane is installed or that
+/// its admitted program has not executed; callers select the authoritative
+/// interpretation from [`recompiled_program_evidence_snapshot`].
+pub fn copy_block_execution_destinations() -> Vec<ExecutionDestinationObservation> {
+    let live = with_host(|host| host.recompiled_program.clone());
+    live.map_or_else(Vec::new, |live| {
+        live.program.borrow().copy_execution_destinations()
+    })
+}
+
+/// Copy successfully entered emitted whole-function destinations in exact
+/// entry order. An installed legacy function lane fails closed: only the API
+/// which consumes the generated artifact's observation-schema marker can make
+/// this history authoritative.
+pub fn copy_function_execution_destinations() -> Vec<FunctionExecutionDestinationObservation> {
+    let function_lane = with_host(|host| host.recompiled_lookup.is_some());
+    if !function_lane {
+        return Vec::new();
+    }
+    FUNCTION_LANE_ENTRY_OBSERVATION_SCHEMA.with(|schema| {
+        schema.get().unwrap_or_else(|| {
+            panic!(
+                "function-lane destination evidence requires the generated artifact's entry-observation schema"
+            )
+        });
+    });
+    FUNCTION_EXECUTION_DESTINATIONS.with(|destinations| destinations.borrow().clone())
+}
+
+fn observe_function_entry(function: TranslatedFunctionIdentity) {
+    let artifact_identity = FUNCTION_LANE_ARTIFACT_IDENTITY
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| {
+            panic!("observed function entry has no stable generated-artifact identity")
+        });
+    let at = fn64_runtime::Cycles::new(crate::sim_time());
+    FUNCTION_EXECUTION_DESTINATIONS.with(|destinations| {
+        destinations
+            .borrow_mut()
+            .push(FunctionExecutionDestinationObservation {
+                at,
+                artifact_identity,
+                function,
+            });
+    });
+}
+
+fn observe_renderer_write(event: GuestWriteEvent) {
+    if let GuestWriteEvent::NonRdpWrite16 {
+        logical_offset,
+        value,
+    } = event
+    {
+        super::task_dispatch::observe_non_rdp_write16(logical_offset, value);
+    }
+}
+
+fn record_executable_and_renderer_write(event: GuestWriteEvent) {
+    let (offset, len) = event.range();
     PENDING_EXECUTABLE_WRITES.with(|writes| writes.borrow_mut().push((offset, len)));
+    observe_renderer_write(event);
 }
 
 fn process_executable_writes(
@@ -164,9 +410,55 @@ pub fn canonical_vram(vram: u32) -> Option<u32> {
 /// Install the generated module's dispatcher for both thread 0 and every
 /// OSThread subsequently created by `osCreateThread`.
 pub fn set_entry_lookup(lookup: Lookup, rdram_len: usize) {
+    set_entry_lookup_config(lookup, rdram_len, None);
+}
+
+/// Install a function-lane dispatcher and bind the stable identity of its
+/// generated native artifact for release evidence.
+///
+/// The identity must come from the artifact producer (normally its SHA-256),
+/// not from section geometry or native callable addresses. Reinstalling via
+/// [`set_entry_lookup`] deliberately clears it.
+pub fn set_entry_lookup_with_artifact_identity(
+    lookup: Lookup,
+    rdram_len: usize,
+    identity: ProgramArtifactIdentity,
+) {
+    set_entry_lookup_config(lookup, rdram_len, Some(identity));
+}
+
+/// Install a function-lane dispatcher whose generated artifact exports the
+/// current whole-function entry-observation schema.
+///
+/// `schema` must be the `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA` constant from
+/// the same generated artifact identified by `identity`. Keeping this separate
+/// from [`set_entry_lookup_with_artifact_identity`] makes stale or handwritten
+/// callable sets non-authoritative instead of silently producing a partial
+/// destination history.
+pub fn set_entry_lookup_with_execution_observation(
+    lookup: Lookup,
+    rdram_len: usize,
+    identity: ProgramArtifactIdentity,
+    schema: FunctionEntryObservationSchema,
+) {
+    set_entry_lookup_config(lookup, rdram_len, Some(identity));
+    FUNCTION_LANE_ENTRY_OBSERVATION_SCHEMA.with(|installed| installed.set(Some(schema)));
+    fn64_recomp_rs::set_function_entry_observer(Some(observe_function_entry));
+}
+
+fn set_entry_lookup_config(
+    lookup: Lookup,
+    rdram_len: usize,
+    identity: Option<ProgramArtifactIdentity>,
+) {
     assert!(rdram_len > 0, "recompiled RDRAM length must be nonzero");
     PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
-    fn64_recomp_rs::set_write_observer(None);
+    FUNCTION_EXECUTION_DESTINATIONS.with(|destinations| destinations.borrow_mut().clear());
+    FUNCTION_LANE_ARTIFACT_IDENTITY.with(|installed| installed.set(identity));
+    FUNCTION_LANE_ENTRY_OBSERVATION_SCHEMA.with(|installed| installed.set(None));
+    fn64_recomp_rs::set_function_entry_observer(None);
+    fn64_recomp_rs::set_write_observer(Some(observe_renderer_write));
+    fn64_recomp_rs::set_unsupported_observer(Some(record_recompiled_unsupported));
     with_host(|host| {
         host.recompiled_lookup = Some(lookup);
         host.recompiled_program = None;
@@ -177,6 +469,11 @@ pub fn set_entry_lookup(lookup: Lookup, rdram_len: usize) {
 fn set_block_program(program: LiveBlockProgram, rdram_len: usize) {
     assert!(rdram_len > 0, "recompiled RDRAM length must be nonzero");
     PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+    FUNCTION_EXECUTION_DESTINATIONS.with(|destinations| destinations.borrow_mut().clear());
+    FUNCTION_LANE_ARTIFACT_IDENTITY.with(|installed| installed.set(None));
+    FUNCTION_LANE_ENTRY_OBSERVATION_SCHEMA.with(|installed| installed.set(None));
+    fn64_recomp_rs::set_function_entry_observer(None);
+    fn64_recomp_rs::set_unsupported_observer(Some(record_recompiled_unsupported));
     with_host(|host| {
         host.recompiled_lookup = None;
         host.recompiled_program = Some(program);
@@ -214,6 +511,34 @@ pub fn register_live_executable_region(
     physical_end: u32,
     region: ExecutableRegion,
     builder: LiveGenerationBuilder,
+) {
+    register_live_executable_region_config(physical_start, physical_end, region, builder, None);
+}
+
+/// Register a dynamic executable region while binding the stable artifact
+/// which implements its pure generation builder.
+pub fn register_live_executable_region_with_artifact_identity(
+    physical_start: u32,
+    physical_end: u32,
+    region: ExecutableRegion,
+    builder: LiveGenerationBuilder,
+    builder_artifact_identity: ProgramArtifactIdentity,
+) {
+    register_live_executable_region_config(
+        physical_start,
+        physical_end,
+        region,
+        builder,
+        Some(builder_artifact_identity),
+    );
+}
+
+fn register_live_executable_region_config(
+    physical_start: u32,
+    physical_end: u32,
+    region: ExecutableRegion,
+    builder: LiveGenerationBuilder,
+    builder_artifact_identity: Option<ProgramArtifactIdentity>,
 ) {
     assert!(
         physical_start < physical_end,
@@ -274,6 +599,7 @@ pub fn register_live_executable_region(
         region,
         next_generation: 1,
         builder,
+        builder_artifact_identity,
     });
 }
 
@@ -313,6 +639,22 @@ fn write_raw_mmio(vaddr: u64, value: u32) -> bool {
     crate::pi::write_raw_mmio_word(vaddr, value)
 }
 
+fn record_recompiled_unsupported(context: &str) {
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Recompiler,
+        "recompiler.cpu.unsupported-instruction",
+        context,
+        Some(fn64_runtime::Cycles::new(crate::sim_time())),
+        fn64_runtime::UnsupportedDisposition::LoudTrap,
+    );
+}
+
+fn recompiled_gap_panic(context: impl Into<String>) -> ! {
+    let context = context.into();
+    record_recompiled_unsupported(&context);
+    panic!("{context}")
+}
+
 /// Create and start thread 0 with a typed recompiled entrypoint on fn64's existing
 /// single executor. No second executor, RDRAM allocation, or host thread is
 /// created.
@@ -328,19 +670,103 @@ pub unsafe fn boot_thread0(
     thread_id: ThreadId,
     priority: Priority,
 ) {
-    set_entry_lookup(lookup, rdram_len);
-    with_host(|host| {
-        host.runtime_rdram = rdram;
-        host.runtime_rdram_len = rdram_len;
-    });
+    unsafe {
+        boot_thread0_config(
+            rdram, rdram_len, lookup, entry, None, None, thread_id, priority,
+        )
+    };
+}
+
+/// Boot the function lane while binding its stable generated-artifact
+/// identity for pointer-independent release evidence.
+///
+/// # Safety
+/// Identical to [`boot_thread0`]. The identity describes the native artifact
+/// containing both `lookup` and `entry`; it is not derived from either pointer.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn boot_thread0_with_artifact_identity(
+    rdram: *mut u8,
+    rdram_len: usize,
+    lookup: Lookup,
+    entry: RecompFunc,
+    artifact_identity: ProgramArtifactIdentity,
+    thread_id: ThreadId,
+    priority: Priority,
+) {
+    unsafe {
+        boot_thread0_config(
+            rdram,
+            rdram_len,
+            lookup,
+            entry,
+            Some(artifact_identity),
+            None,
+            thread_id,
+            priority,
+        )
+    };
+}
+
+/// Boot an artifact emitted with authoritative whole-function entry
+/// observation enabled.
+///
+/// `schema` must be the generated artifact's
+/// `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA` export.
+///
+/// # Safety
+/// Identical to [`boot_thread0`]. The artifact identity and schema must both
+/// describe the native artifact containing `lookup` and `entry`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn boot_thread0_with_execution_observation(
+    rdram: *mut u8,
+    rdram_len: usize,
+    lookup: Lookup,
+    entry: RecompFunc,
+    artifact_identity: ProgramArtifactIdentity,
+    schema: FunctionEntryObservationSchema,
+    thread_id: ThreadId,
+    priority: Priority,
+) {
+    unsafe {
+        boot_thread0_config(
+            rdram,
+            rdram_len,
+            lookup,
+            entry,
+            Some(artifact_identity),
+            Some(schema),
+            thread_id,
+            priority,
+        )
+    };
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn boot_thread0_config(
+    rdram: *mut u8,
+    rdram_len: usize,
+    lookup: Lookup,
+    entry: RecompFunc,
+    artifact_identity: Option<ProgramArtifactIdentity>,
+    observation_schema: Option<FunctionEntryObservationSchema>,
+    thread_id: ThreadId,
+    priority: Priority,
+) {
+    match (artifact_identity, observation_schema) {
+        (Some(identity), Some(schema)) => {
+            set_entry_lookup_with_execution_observation(lookup, rdram_len, identity, schema);
+        }
+        (identity, None) => set_entry_lookup_config(lookup, rdram_len, identity),
+        (None, Some(_)) => {
+            panic!("function entry observation requires a stable generated-artifact identity")
+        }
+    }
+    unsafe { super::register_process_rdram(rdram, rdram_len) };
     fn64_recomp_rs::set_host_pause(Some(pause_active_recompiled_thread));
     fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
 
     let rdram_addr = rdram as usize;
     with_executor(|exec| {
-        // SAFETY: inherited from this function's process-lifetime buffer
-        // contract; this is the same executor registration as the C path.
-        unsafe { exec.set_rdram_base(rdram) };
         exec.create_thread(thread_id, priority, move |yielder, first_input| {
             let rdram_ptr = rdram_addr as *mut u8;
             with_active_yielder(thread_id, rdram_ptr, yielder, || {
@@ -377,28 +803,85 @@ pub unsafe fn boot_thread0_block_program(
     thread_id: ThreadId,
     priority: Priority,
 ) {
+    unsafe {
+        boot_thread0_block_program_config(
+            rdram,
+            rdram_len,
+            program,
+            entry,
+            entry_lookup,
+            transfer_lookup,
+            budget,
+            None,
+            thread_id,
+            priority,
+        )
+    };
+}
+
+/// Boot the block lane while binding the stable artifact which supplies its
+/// entry/transfer resolver implementations.
+///
+/// # Safety
+/// Identical to [`boot_thread0_block_program`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn boot_thread0_block_program_with_artifact_identity(
+    rdram: *mut u8,
+    rdram_len: usize,
+    program: BlockProgram,
+    entry: ExecutionKey,
+    entry_lookup: ProgramEntryLookup,
+    transfer_lookup: ProgramTransferLookup,
+    budget: InstructionBudget,
+    dispatch_artifact_identity: ProgramArtifactIdentity,
+    thread_id: ThreadId,
+    priority: Priority,
+) {
+    unsafe {
+        boot_thread0_block_program_config(
+            rdram,
+            rdram_len,
+            program,
+            entry,
+            entry_lookup,
+            transfer_lookup,
+            budget,
+            Some(dispatch_artifact_identity),
+            thread_id,
+            priority,
+        )
+    };
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn boot_thread0_block_program_config(
+    rdram: *mut u8,
+    rdram_len: usize,
+    program: BlockProgram,
+    entry: ExecutionKey,
+    entry_lookup: ProgramEntryLookup,
+    transfer_lookup: ProgramTransferLookup,
+    budget: InstructionBudget,
+    dispatch_artifact_identity: Option<ProgramArtifactIdentity>,
+    thread_id: ThreadId,
+    priority: Priority,
+) {
     let live = LiveBlockProgram {
         program: Rc::new(RefCell::new(program)),
         entry_lookup,
         transfer_lookup,
         budget,
+        dispatch_artifact_identity,
         executable_regions: Rc::new(RefCell::new(Vec::new())),
     };
     set_block_program(live.clone(), rdram_len);
-    with_host(|host| {
-        host.runtime_rdram = rdram;
-        host.runtime_rdram_len = rdram_len;
-    });
+    unsafe { super::register_process_rdram(rdram, rdram_len) };
     fn64_recomp_rs::set_host_pause(Some(pause_active_recompiled_thread));
     fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
-    fn64_recomp_rs::set_write_observer(Some(record_executable_write));
+    fn64_recomp_rs::set_write_observer(Some(record_executable_and_renderer_write));
 
     let rdram_addr = rdram as usize;
     with_executor(|exec| {
-        // SAFETY: inherited from this function's process-lifetime buffer
-        // contract; this is the same executor registration as both legacy
-        // function-granularity boot lanes.
-        unsafe { exec.set_rdram_base(rdram) };
         exec.create_thread(thread_id, priority, move |yielder, first_input| {
             let rdram_ptr = rdram_addr as *mut u8;
             with_active_yielder(thread_id, rdram_ptr, yielder, || {
@@ -451,7 +934,9 @@ fn run_block_program(
             program
                 .dispatch(entry, live.budget, ctx, mem, &mut resolver)
                 .unwrap_or_else(|error| {
-                    panic!("live BlockProgram dispatch failed at {entry}: {error}")
+                    recompiled_gap_panic(format!(
+                        "live BlockProgram dispatch failed at {entry}: {error}"
+                    ))
                 })
         };
         process_executable_writes(live, |offset| {
@@ -487,29 +972,31 @@ fn run_block_program(
                 entry = live
                     .resolve_transfer(next.bank, next.pc)
                     .unwrap_or_else(|fault| {
-                        panic!("live BlockProgram checkpoint {next} no longer resolves: {fault:?}")
+                        recompiled_gap_panic(format!(
+                            "live BlockProgram checkpoint {next} no longer resolves: {fault:?}"
+                        ))
                     });
             }
             BlockExit::HostCall { vram, resume } => {
                 let host = fn64_recomp_rs::resolve_host_function(vram.get()).unwrap_or_else(|| {
-                    panic!(
+                    recompiled_gap_panic(format!(
                         "live BlockProgram requested unknown host call {:#010x}",
                         vram.get()
-                    )
+                    ))
                 });
                 host(ctx, mem);
                 entry = live
                     .resolve_transfer(resume.bank, resume.pc)
                     .unwrap_or_else(|fault| {
-                        panic!(
+                        recompiled_gap_panic(format!(
                             "live BlockProgram host resume {resume} no longer resolves: {fault:?}"
-                        )
+                        ))
                     });
             }
             BlockExit::ThreadReturn => return,
-            BlockExit::Fault(fault) => {
-                panic!("live BlockProgram stopped on unresolved guest fault: {fault:?}")
-            }
+            BlockExit::Fault(fault) => recompiled_gap_panic(format!(
+                "live BlockProgram stopped on unresolved guest fault: {fault:?}"
+            )),
             BlockExit::Transfer(_)
             | BlockExit::ResolveTransfer { .. }
             | BlockExit::ResolveCall { .. } => {
@@ -678,6 +1165,7 @@ c_adapters!(
     (os_eeprom_write, osEepromWrite_recomp),
     (os_eeprom_long_read, osEepromLongRead_recomp),
     (os_eeprom_long_write, osEepromLongWrite_recomp),
+    (os_pfs_is_plug, osPfsIsPlug_recomp),
     (os_pfs_init_pak, osPfsInitPak_recomp),
     (os_pfs_free_blocks, osPfsFreeBlocks_recomp),
     (os_pfs_allocate_file, osPfsAllocateFile_recomp),
@@ -842,6 +1330,423 @@ mod tests {
         static REWRITE_BUILDS: std::cell::RefCell<Vec<(u64, Vec<u8>)>> = const {
             std::cell::RefCell::new(Vec::new())
         };
+    }
+
+    fn evidence_callable(_ctx: &mut RsContext, _mem: &mut Rdram<'_>) {}
+
+    fn alternate_evidence_callable(_ctx: &mut RsContext, _mem: &mut Rdram<'_>) {}
+
+    fn evidence_lookup(_vram: u32) -> RecompFunc {
+        evidence_callable
+    }
+
+    fn alternate_evidence_lookup(_vram: u32) -> RecompFunc {
+        alternate_evidence_callable
+    }
+
+    fn unused_evidence_builder(
+        _bytes: &[u8],
+        _generation: u64,
+    ) -> Result<(CodeBank, GeneratedBankRunner), String> {
+        Err("evidence-only builder must not run".to_string())
+    }
+
+    fn alternate_unused_evidence_builder(
+        _bytes: &[u8],
+        _generation: u64,
+    ) -> Result<(CodeBank, GeneratedBankRunner), String> {
+        Err("alternate evidence-only builder must not run".to_string())
+    }
+
+    fn install_evidence_block_lane(budget: u32, reverse_regions: bool, alternate_builders: bool) {
+        let first_bank = BankId::new(0xE100);
+        let second_bank = BankId::new(0xE200);
+        let first_start = GuestPc::new(0x8000_5000);
+        let second_start = GuestPc::new(0x8000_6000);
+        let mut program = BlockProgram::new();
+        let mut first_region =
+            ExecutableRegion::new(first_start, GuestPc::new(first_start.get() + 4));
+        let mut second_region =
+            ExecutableRegion::new(second_start, GuestPc::new(second_start.get() + 4));
+        let runner_artifact = ProgramArtifactIdentity::new([0xE5; 32]);
+        first_region
+            .install(
+                &mut program,
+                CodeBank::new(first_bank, first_start, vec![0x1111_2222]).unwrap(),
+                GeneratedBankRunner::new_with_artifact_identity(
+                    first_bank,
+                    live_test_runner,
+                    runner_artifact,
+                ),
+            )
+            .unwrap();
+        second_region
+            .install(
+                &mut program,
+                CodeBank::new(second_bank, second_start, vec![0x3333_4444]).unwrap(),
+                GeneratedBankRunner::new_with_artifact_identity(
+                    second_bank,
+                    live_test_runner,
+                    runner_artifact,
+                ),
+            )
+            .unwrap();
+        let live = LiveBlockProgram {
+            program: Rc::new(RefCell::new(program)),
+            entry_lookup: live_entry_lookup,
+            transfer_lookup: live_transfer_lookup,
+            budget: InstructionBudget::new(budget).unwrap(),
+            dispatch_artifact_identity: Some(ProgramArtifactIdentity::new([0xD1; 32])),
+            executable_regions: Rc::new(RefCell::new(Vec::new())),
+        };
+        set_block_program(live, 0x100);
+        let first_builder = if alternate_builders {
+            alternate_unused_evidence_builder
+        } else {
+            unused_evidence_builder
+        };
+        let registrations = [
+            (0x20, 0x24, first_region, first_builder),
+            (0x40, 0x44, second_region, unused_evidence_builder),
+        ];
+        if reverse_regions {
+            for (start, end, region, builder) in registrations.into_iter().rev() {
+                register_live_executable_region_with_artifact_identity(
+                    start,
+                    end,
+                    region,
+                    builder,
+                    ProgramArtifactIdentity::new([0xB1; 32]),
+                );
+            }
+        } else {
+            for (start, end, region, builder) in registrations {
+                register_live_executable_region_with_artifact_identity(
+                    start,
+                    end,
+                    region,
+                    builder,
+                    ProgramArtifactIdentity::new([0xB1; 32]),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn translated_cpu_unsupported_gap_records_the_typed_release_event() {
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        record_recompiled_unsupported("unsupported COP0 register 7");
+
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].subsystem,
+            fn64_runtime::UnsupportedSubsystem::Recompiler
+        );
+        assert_eq!(
+            events[0].operation,
+            concat!("recompiler.cpu.", "unsupported-instruction")
+        );
+        assert_eq!(
+            events[0].disposition,
+            fn64_runtime::UnsupportedDisposition::LoudTrap
+        );
+        assert!(events[0].guest_cycle.is_some());
+    }
+
+    #[test]
+    fn function_lane_evidence_requires_identity_and_excludes_callable_pointers() {
+        with_host(|host| *host = super::super::HostState::default());
+        set_entry_lookup(evidence_lookup, 0x100);
+        let missing = std::panic::catch_unwind(recompiled_program_evidence_snapshot)
+            .expect_err("unidentified function lane must fail evidence capture");
+        let message = missing
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| missing.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(message.contains("stable host-provided artifact identity"));
+
+        let identity = ProgramArtifactIdentity::new([0xA5; 32]);
+        set_entry_lookup_with_artifact_identity(evidence_lookup, 0x100, identity);
+        let first = recompiled_program_evidence_snapshot().unwrap();
+        set_entry_lookup_with_artifact_identity(alternate_evidence_lookup, 0x100, identity);
+        assert_eq!(first, recompiled_program_evidence_snapshot().unwrap());
+
+        set_entry_lookup_with_artifact_identity(
+            evidence_lookup,
+            0x100,
+            ProgramArtifactIdentity::new([0x5A; 32]),
+        );
+        assert_ne!(first, recompiled_program_evidence_snapshot().unwrap());
+    }
+
+    #[test]
+    fn function_destination_history_binds_artifact_function_cycle_and_schema() {
+        with_host(|host| *host = super::super::HostState::default());
+        let identity = ProgramArtifactIdentity::new([0xC3; 32]);
+        set_entry_lookup_with_execution_observation(
+            evidence_lookup,
+            0x100,
+            identity,
+            fn64_recomp_rs::FUNCTION_ENTRY_OBSERVATION_SCHEMA,
+        );
+        with_executor(|executor| executor.set_sim_time(37));
+        fn64_recomp_rs::notify_function_entry(TranslatedFunctionIdentity::new(
+            0x8000_1000,
+            "entry",
+        ));
+        with_executor(|executor| executor.set_sim_time(41));
+        fn64_recomp_rs::notify_function_entry(TranslatedFunctionIdentity::new(
+            0x8000_2000,
+            "callee",
+        ));
+
+        assert_eq!(
+            copy_function_execution_destinations(),
+            vec![
+                FunctionExecutionDestinationObservation {
+                    at: fn64_runtime::Cycles::new(37),
+                    artifact_identity: identity,
+                    function: TranslatedFunctionIdentity::new(0x8000_1000, "entry"),
+                },
+                FunctionExecutionDestinationObservation {
+                    at: fn64_runtime::Cycles::new(41),
+                    artifact_identity: identity,
+                    function: TranslatedFunctionIdentity::new(0x8000_2000, "callee"),
+                },
+            ]
+        );
+
+        set_entry_lookup_with_artifact_identity(evidence_lookup, 0x100, identity);
+        let stale = std::panic::catch_unwind(copy_function_execution_destinations)
+            .expect_err("identity-only function install must not claim a complete history");
+        let message = stale
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| stale.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(message.contains("entry-observation schema"));
+    }
+
+    #[test]
+    fn block_lane_evidence_sorts_regions_and_excludes_builder_pointers() {
+        with_host(|host| *host = super::super::HostState::default());
+        install_evidence_block_lane(8, false, false);
+        PENDING_EXECUTABLE_WRITES
+            .with(|pending| *pending.borrow_mut() = vec![(0x42, 2), (0x20, 2), (0x21, 3)]);
+        let forward = recompiled_program_evidence_snapshot().unwrap();
+
+        install_evidence_block_lane(8, true, true);
+        PENDING_EXECUTABLE_WRITES
+            .with(|pending| *pending.borrow_mut() = vec![(0x21, 3), (0x42, 2), (0x20, 2)]);
+        let reverse = recompiled_program_evidence_snapshot().unwrap();
+        assert_eq!(forward, reverse);
+
+        let RecompiledProgramEvidenceSnapshot::Block {
+            instruction_budget,
+            executable_regions,
+            pending_executable_writes,
+            ..
+        } = forward
+        else {
+            panic!("block install captured as function lane")
+        };
+        assert_eq!(instruction_budget, 8);
+        assert_eq!(
+            executable_regions
+                .iter()
+                .map(|region| region.physical_start)
+                .collect::<Vec<_>>(),
+            vec![0x20, 0x40]
+        );
+        assert_eq!(
+            pending_executable_writes,
+            vec![
+                PendingExecutableWriteEvidenceSnapshot {
+                    physical_start: 0x20,
+                    physical_end: 0x24,
+                },
+                PendingExecutableWriteEvidenceSnapshot {
+                    physical_start: 0x42,
+                    physical_end: 0x44,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn block_destination_copy_api_reads_the_live_program_history() {
+        with_host(|host| *host = super::super::HostState::default());
+        install_evidence_block_lane(8, false, false);
+        assert!(copy_block_execution_destinations().is_empty());
+        let live = with_host(|host| {
+            host.recompiled_program
+                .clone()
+                .expect("evidence fixture installs a live block program")
+        });
+        let entry = ExecutionKey::new(BankId::new(0xE100), GuestPc::new(0x8000_5000));
+        let mut bytes = [0u8; 4];
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RsContext::new();
+        live.program.borrow().run(
+            entry,
+            InstructionBudget::new(2).unwrap(),
+            &mut ctx,
+            &mut mem,
+        );
+        assert_eq!(
+            copy_block_execution_destinations(),
+            vec![ExecutionDestinationObservation {
+                destination: entry,
+                runner_artifact_identity: Some(ProgramArtifactIdentity::new([0xE5; 32])),
+            }]
+        );
+    }
+
+    #[test]
+    fn block_lane_evidence_binds_budget_region_generation_and_pending_writes() {
+        with_host(|host| *host = super::super::HostState::default());
+        install_evidence_block_lane(8, false, false);
+        let baseline = recompiled_program_evidence_snapshot().unwrap();
+
+        install_evidence_block_lane(12, false, false);
+        let changed_budget = recompiled_program_evidence_snapshot().unwrap();
+        assert_ne!(baseline, changed_budget);
+
+        install_evidence_block_lane(8, false, false);
+        let live = with_host(|host| host.recompiled_program.clone().unwrap());
+        live.executable_regions.borrow_mut()[0].next_generation = 2;
+        let changed_generation = recompiled_program_evidence_snapshot().unwrap();
+        assert_ne!(baseline, changed_generation);
+
+        install_evidence_block_lane(8, false, false);
+        let live = with_host(|host| host.recompiled_program.clone().unwrap());
+        {
+            let mut regions = live.executable_regions.borrow_mut();
+            regions[0].physical_start += 4;
+            regions[0].physical_end += 4;
+        }
+        let changed_region_geometry = recompiled_program_evidence_snapshot().unwrap();
+        assert_ne!(baseline, changed_region_geometry);
+
+        install_evidence_block_lane(8, false, false);
+        with_host(|host| {
+            host.recompiled_program
+                .as_mut()
+                .unwrap()
+                .dispatch_artifact_identity = Some(ProgramArtifactIdentity::new([0xD2; 32]));
+        });
+        let changed_dispatch_artifact = recompiled_program_evidence_snapshot().unwrap();
+        assert_ne!(baseline, changed_dispatch_artifact);
+
+        install_evidence_block_lane(8, false, false);
+        let live = with_host(|host| host.recompiled_program.clone().unwrap());
+        live.executable_regions.borrow_mut()[0].builder_artifact_identity =
+            Some(ProgramArtifactIdentity::new([0xB2; 32]));
+        let changed_builder_artifact = recompiled_program_evidence_snapshot().unwrap();
+        assert_ne!(baseline, changed_builder_artifact);
+
+        install_evidence_block_lane(8, false, false);
+        PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().push((0x30, 4)));
+        let changed_pending = recompiled_program_evidence_snapshot().unwrap();
+        assert_ne!(baseline, changed_pending);
+    }
+
+    #[test]
+    #[should_panic(expected = "pending executable write has zero length")]
+    fn block_lane_evidence_never_omits_malformed_pending_write() {
+        with_host(|host| *host = super::super::HostState::default());
+        install_evidence_block_lane(8, false, false);
+        PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().push((0x30, 0)));
+        let _ = recompiled_program_evidence_snapshot();
+    }
+
+    #[test]
+    #[should_panic(expected = "stable host-provided dispatch artifact identity")]
+    fn block_lane_evidence_rejects_unidentified_dispatch_artifact() {
+        with_host(|host| *host = super::super::HostState::default());
+        install_evidence_block_lane(8, false, false);
+        with_host(|host| {
+            host.recompiled_program
+                .as_mut()
+                .unwrap()
+                .dispatch_artifact_identity = None;
+        });
+        let _ = recompiled_program_evidence_snapshot();
+    }
+
+    #[test]
+    #[should_panic(expected = "stable host-provided builder artifact identity")]
+    fn block_lane_evidence_rejects_unidentified_builder_artifact() {
+        with_host(|host| *host = super::super::HostState::default());
+        install_evidence_block_lane(8, false, false);
+        let live = with_host(|host| host.recompiled_program.clone().unwrap());
+        live.executable_regions.borrow_mut()[0].builder_artifact_identity = None;
+        let _ = recompiled_program_evidence_snapshot();
+    }
+
+    #[test]
+    fn typed_halfword_write_multiplexes_invalidation_and_renderer_once() {
+        use std::{cell::Cell, rc::Rc};
+
+        struct CountBackend(Rc<Cell<u32>>);
+
+        impl fn64_render::RenderBackend for CountBackend {
+            fn create(
+                &mut self,
+                _cfg: &fn64_render::RenderConfig,
+            ) -> Result<(), fn64_render::RenderError> {
+                Ok(())
+            }
+
+            fn observe_non_rdp_write16(
+                &mut self,
+                _write: fn64_render::NonRdpWrite16,
+            ) -> fn64_render::NonRdpWrite16Disposition {
+                self.0.set(self.0.get() + 1);
+                fn64_render::NonRdpWrite16Disposition::AppliedHiddenSidecar
+            }
+
+            fn process_task(
+                &mut self,
+                _rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+            ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
+                Ok(fn64_render::FrameStatus::Complete)
+            }
+
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), fn64_render::RenderError> {
+                Ok(())
+            }
+
+            fn resize(&mut self, _width: u32, _height: u32) {}
+
+            fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
+                &[]
+            }
+        }
+
+        PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+        let renderer_calls = Rc::new(Cell::new(0));
+        crate::set_render_backend(Box::new(CountBackend(renderer_calls.clone())), 0x100);
+        let previous =
+            fn64_recomp_rs::set_write_observer(Some(record_executable_and_renderer_write));
+        let mut bytes = [0u8; 0x100];
+        Rdram::new(&mut bytes).store_h(0xffff_ffff_a000_0040, 0x1235);
+        fn64_recomp_rs::set_write_observer(previous);
+
+        assert_eq!(
+            PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow().clone()),
+            vec![(0x40, 2)]
+        );
+        assert_eq!(renderer_calls.get(), 1);
+        PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
     }
 
     fn unmapped(bank: BankId, pc: GuestPc, start: GuestPc, end: GuestPc) -> CpuFault {
@@ -1656,6 +2561,9 @@ mod tests {
 
     #[test]
     fn typed_raw_vi_registers_drive_half_line_timing_and_shared_mi() {
+        crate::test_support::install_complete_render_backend(
+            fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        );
         let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
         let mut bytes = [0; 4];
         let mut mem = Rdram::new(&mut bytes);

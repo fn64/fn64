@@ -8,18 +8,21 @@
 //! recommendation's load-bearing implementation. Every design choice below
 //! traces back to a specific rung's evidence, cited inline.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use corosensei::CoroutineResult;
 
 use crate::device::Cycles;
-use crate::mesgqueue::{Mesg, MesgQueue, RecvResult, SendResult};
+use crate::mesgqueue::{
+    Mesg, MesgQueue, MesgQueueActivity, MesgQueueEvidenceSnapshot, RecvResult, SendPlacement,
+    SendResult,
+};
 use crate::peripherals::Peripherals;
 use crate::rdram::RdramAddr;
 use crate::rsp::{OsTaskHeader, TaskLog};
 use crate::si::PifModel;
 use crate::thread::{GameThread, Priority, Resume, RunToken, ThreadState, Yield};
-use crate::timer::TimerWheel;
+use crate::timer::{TimerWheel, TimerWheelEvidenceSnapshot};
 use crate::trace::{QueueOpKind, SwitchReason, TaskKind, ThreadId, TraceKind, TraceLog};
 use crate::vi::ViState;
 
@@ -56,6 +59,112 @@ const MQ_VALIDCOUNT_OFF: u32 = 0x08;
 const MQ_FIRST_OFF: u32 = 0x0C;
 const MQ_MSGCOUNT_OFF: u32 = 0x10;
 
+/// Pointer-free registration state for the guest RDRAM buffer.
+///
+/// The legacy length-less registration API cannot truthfully supply a bound,
+/// so it remains distinguishable from both absence and a measured length.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RdramRegistrationEvidenceSnapshot {
+    Absent,
+    LegacyUnbounded,
+    Present { len: u64 },
+}
+
+/// Scheduler-visible metadata for one guest thread. `started` is retained
+/// because stopping and restarting a never-resumed thread must deliver
+/// `Resume::Start`, while restarting an established coroutine must not.
+/// Native coroutine stack/continuation bytes are intentionally absent.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ThreadEvidenceSnapshot {
+    pub id: ThreadId,
+    pub priority: Priority,
+    pub state: ThreadState,
+    pub started: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PendingResumeEvidenceSnapshot {
+    pub thread: ThreadId,
+    pub resume: Resume,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutorQueueEvidenceSnapshot {
+    pub address: RdramAddr,
+    pub queue: MesgQueueEvidenceSnapshot,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EventRegistrationEvidenceSnapshot {
+    pub event: u32,
+    pub queue_addr: RdramAddr,
+    pub msg: Mesg,
+}
+
+/// Whether a snapshot was observed between scheduling steps or while a
+/// coroutine held the sole run token. `Active` identifies the owner honestly;
+/// it does not pretend to encode that coroutine's native continuation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ExecutorRunningEvidenceSnapshot {
+    Quiescent,
+    Active(ThreadId),
+}
+
+/// Complete owner-local, pointer-free projection of executor control state.
+///
+/// This is evidence for deterministic fixed-cycle comparison, not a savestate:
+/// native coroutine continuations and diagnostic traces are deliberately not
+/// representable. [`Executor::control_evidence_snapshot`] validates all
+/// cross-owner scheduler invariants before producing this value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutorControlEvidenceSnapshot {
+    pub rdram: RdramRegistrationEvidenceSnapshot,
+    /// Canonical ascending `ThreadId` order.
+    pub threads: Vec<ThreadEvidenceSnapshot>,
+    /// Exact scheduling order; unlike map-owned families, this is not sorted.
+    pub run_queue: Vec<ThreadId>,
+    /// Canonical ascending `ThreadId` order.
+    pub pending_resumes: Vec<PendingResumeEvidenceSnapshot>,
+    /// Canonical ascending guest-address order.
+    pub queues: Vec<ExecutorQueueEvidenceSnapshot>,
+    pub timers: TimerWheelEvidenceSnapshot,
+    /// Canonical ascending event-code order.
+    pub event_table: Vec<EventRegistrationEvidenceSnapshot>,
+    pub running: ExecutorRunningEvidenceSnapshot,
+    pub sim_time: u64,
+    pub cp0_count: u32,
+    pub cp0_count_phase: u8,
+    pub cp0_compare: u32,
+    pub cp0_timer_pending: bool,
+}
+
+/// A corrupt executor relationship that would make control-state evidence
+/// ambiguous. These are structural bugs, never legitimate guest outcomes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ExecutorControlInvariantError {
+    RunQueueUnknownThread(ThreadId),
+    DuplicateRunQueueThread(ThreadId),
+    RunQueueThreadNotRunnable(ThreadId, ThreadState),
+    RunnableThreadMissingFromRunQueue(ThreadId),
+    RunningUnknownThread(ThreadId),
+    RunningThreadStateMismatch(ThreadId, ThreadState),
+    RunningThreadNeverStarted(ThreadId),
+    RunningThreadQueued(ThreadId),
+    RunningThreadHasPendingResume(ThreadId),
+    RunningStateWithoutOwner(ThreadId),
+    MultipleRunningThreads(ThreadId, ThreadId),
+    WaiterUnknownThread(ThreadId),
+    DuplicateWaiterThread(ThreadId),
+    ReceiverWaiterStateMismatch(ThreadId, ThreadState),
+    SenderWaiterStateMismatch(ThreadId, ThreadState),
+    BlockedThreadMissingWaiter(ThreadId),
+    PendingResumeUnknownThread(ThreadId),
+    PendingResumeThreadNotRunnable(ThreadId, ThreadState),
+    PendingResumeThreadNotQueued(ThreadId),
+    StartResumeForStartedThread(ThreadId),
+    NeverStartedRunnableThreadMissingStart(ThreadId),
+}
+
 #[derive(Default)]
 pub struct Executor {
     /// Base of the one process-wide rdram buffer, set once at boot via
@@ -65,6 +174,11 @@ pub struct Executor {
     /// `None` until set (tests that never boot a real rdram just skip the
     /// mirror, which is correct: there is no guest struct to keep in sync).
     rdram_base: Option<*mut u8>,
+    /// Byte length of the `rdram_base` allocation. Zero means "not yet
+    /// registered"; the length-less legacy registration stores `usize::MAX`
+    /// (no bounds enforcement). Default-derived as 0, which is fine: mirrors
+    /// only run once a base is registered, and both registration paths set it.
+    rdram_len: usize,
     /// `Box<GameThread>`, NOT a bare `GameThread` -- see `run_one_step`'s
     /// doc comment for the second block/wake defect this closes (the OoT
     /// Main-resume SIGBUS): a `GameThread`'s coroutine body can
@@ -109,6 +223,10 @@ pub struct Executor {
     /// entry point for VI-tick-equivalent progress) -- never wall-clock,
     /// per the task's explicit "no wall-clock in core" requirement.
     sim_time: u64,
+    /// Always-on monotonic count of guest coroutine resumes. Unlike the
+    /// optional diagnostic trace, release-boundary freshness can rely on this
+    /// even when tracing is disabled or cleared.
+    resume_epoch: u64,
     /// MIPS CP0 Count register. It advances by the same deterministic guest
     /// cycle delta as `sim_time`, but `osSetTime` does not rewrite it: the OS
     /// time base and the hardware free-running Count register are distinct
@@ -167,6 +285,244 @@ impl Executor {
         Self::default()
     }
 
+    /// Validate relationships distributed across the scheduler, queues, and
+    /// pending-resume table. A failure means the executor has already entered
+    /// a state its next scheduling operation cannot interpret unambiguously.
+    pub fn validate_control_evidence_invariants(
+        &self,
+    ) -> Result<(), ExecutorControlInvariantError> {
+        let mut queued = HashSet::with_capacity(self.run_queue.len());
+        for &id in &self.run_queue {
+            let Some(thread) = self.threads.get(&id) else {
+                return Err(ExecutorControlInvariantError::RunQueueUnknownThread(id));
+            };
+            if !queued.insert(id) {
+                return Err(ExecutorControlInvariantError::DuplicateRunQueueThread(id));
+            }
+            if thread.state() != ThreadState::Runnable {
+                return Err(ExecutorControlInvariantError::RunQueueThreadNotRunnable(
+                    id,
+                    thread.state(),
+                ));
+            }
+        }
+
+        let mut state_running = None;
+        for (&id, thread) in &self.threads {
+            match thread.state() {
+                ThreadState::Runnable if !queued.contains(&id) => {
+                    return Err(
+                        ExecutorControlInvariantError::RunnableThreadMissingFromRunQueue(id),
+                    );
+                }
+                ThreadState::Running => {
+                    if let Some(first) = state_running.replace(id) {
+                        return Err(ExecutorControlInvariantError::MultipleRunningThreads(
+                            first, id,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match self.running {
+            Some(id) => {
+                let Some(thread) = self.threads.get(&id) else {
+                    return Err(ExecutorControlInvariantError::RunningUnknownThread(id));
+                };
+                if thread.state() != ThreadState::Running {
+                    return Err(ExecutorControlInvariantError::RunningThreadStateMismatch(
+                        id,
+                        thread.state(),
+                    ));
+                }
+                if !thread.has_started() {
+                    return Err(ExecutorControlInvariantError::RunningThreadNeverStarted(id));
+                }
+                if queued.contains(&id) {
+                    return Err(ExecutorControlInvariantError::RunningThreadQueued(id));
+                }
+                if self.pending_resume.contains_key(&id) {
+                    return Err(ExecutorControlInvariantError::RunningThreadHasPendingResume(id));
+                }
+                if state_running != Some(id) {
+                    return Err(ExecutorControlInvariantError::RunningStateWithoutOwner(id));
+                }
+            }
+            None => {
+                if let Some(id) = state_running {
+                    return Err(ExecutorControlInvariantError::RunningStateWithoutOwner(id));
+                }
+            }
+        }
+
+        let mut waiters = HashSet::new();
+        for queue in self.queues.values() {
+            let snapshot = queue.evidence_snapshot();
+            for blocked in snapshot.blocked_receivers {
+                let id = blocked.id;
+                let Some(thread) = self.threads.get(&id) else {
+                    return Err(ExecutorControlInvariantError::WaiterUnknownThread(id));
+                };
+                if !waiters.insert(id) {
+                    return Err(ExecutorControlInvariantError::DuplicateWaiterThread(id));
+                }
+                if thread.state() != ThreadState::BlockedOnRecv {
+                    return Err(ExecutorControlInvariantError::ReceiverWaiterStateMismatch(
+                        id,
+                        thread.state(),
+                    ));
+                }
+            }
+            for blocked in snapshot.blocked_senders {
+                let id = blocked.id;
+                let Some(thread) = self.threads.get(&id) else {
+                    return Err(ExecutorControlInvariantError::WaiterUnknownThread(id));
+                };
+                if !waiters.insert(id) {
+                    return Err(ExecutorControlInvariantError::DuplicateWaiterThread(id));
+                }
+                if thread.state() != ThreadState::BlockedOnSend {
+                    return Err(ExecutorControlInvariantError::SenderWaiterStateMismatch(
+                        id,
+                        thread.state(),
+                    ));
+                }
+            }
+        }
+        for (&id, thread) in &self.threads {
+            if matches!(
+                thread.state(),
+                ThreadState::BlockedOnRecv | ThreadState::BlockedOnSend
+            ) && !waiters.contains(&id)
+            {
+                return Err(ExecutorControlInvariantError::BlockedThreadMissingWaiter(
+                    id,
+                ));
+            }
+        }
+
+        for (&id, &resume) in &self.pending_resume {
+            let Some(thread) = self.threads.get(&id) else {
+                return Err(ExecutorControlInvariantError::PendingResumeUnknownThread(
+                    id,
+                ));
+            };
+            if thread.state() != ThreadState::Runnable {
+                return Err(
+                    ExecutorControlInvariantError::PendingResumeThreadNotRunnable(
+                        id,
+                        thread.state(),
+                    ),
+                );
+            }
+            if !queued.contains(&id) {
+                return Err(ExecutorControlInvariantError::PendingResumeThreadNotQueued(
+                    id,
+                ));
+            }
+            if resume == Resume::Start && thread.has_started() {
+                return Err(ExecutorControlInvariantError::StartResumeForStartedThread(
+                    id,
+                ));
+            }
+        }
+        for (&id, thread) in &self.threads {
+            if thread.state() == ThreadState::Runnable
+                && !thread.has_started()
+                && self.pending_resume.get(&id) != Some(&Resume::Start)
+            {
+                return Err(
+                    ExecutorControlInvariantError::NeverStartedRunnableThreadMissingStart(id),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Capture deterministic executor-control evidence. Hash-owned families
+    /// are canonicalized; behaviorally meaningful FIFO/run order is retained.
+    /// Traces, host pointers, and native coroutine continuations are excluded.
+    pub fn control_evidence_snapshot(&self) -> ExecutorControlEvidenceSnapshot {
+        self.validate_control_evidence_invariants()
+            .unwrap_or_else(|error| {
+                panic!("Executor control evidence invariant failed: {error:?}")
+            });
+
+        let rdram = match (self.rdram_base, self.rdram_len) {
+            (None, _) => RdramRegistrationEvidenceSnapshot::Absent,
+            (Some(_), usize::MAX) => RdramRegistrationEvidenceSnapshot::LegacyUnbounded,
+            (Some(_), len) => RdramRegistrationEvidenceSnapshot::Present {
+                len: u64::try_from(len).expect("RDRAM length does not fit evidence width"),
+            },
+        };
+        let mut threads: Vec<_> = self
+            .threads
+            .values()
+            .map(|thread| ThreadEvidenceSnapshot {
+                id: thread.id,
+                priority: thread.priority,
+                state: thread.state(),
+                started: thread.has_started(),
+            })
+            .collect();
+        threads.sort_by_key(|thread| thread.id);
+
+        let mut pending_resumes: Vec<_> = self
+            .pending_resume
+            .iter()
+            .map(|(&thread, &resume)| PendingResumeEvidenceSnapshot { thread, resume })
+            .collect();
+        pending_resumes.sort_by_key(|pending| pending.thread);
+
+        let mut queues: Vec<_> = self
+            .queues
+            .iter()
+            .map(|(&address, queue)| ExecutorQueueEvidenceSnapshot {
+                address: RdramAddr::from_offset(address),
+                queue: queue.evidence_snapshot(),
+            })
+            .collect();
+        queues.sort_by_key(|queue| queue.address.offset());
+
+        let mut event_table: Vec<_> = self
+            .event_table
+            .iter()
+            .map(
+                |(&event, &(queue_addr, msg))| EventRegistrationEvidenceSnapshot {
+                    event,
+                    queue_addr: RdramAddr::from_offset(queue_addr),
+                    msg,
+                },
+            )
+            .collect();
+        event_table.sort_by_key(|registration| registration.event);
+
+        ExecutorControlEvidenceSnapshot {
+            rdram,
+            threads,
+            run_queue: self.run_queue.clone(),
+            pending_resumes,
+            queues,
+            timers: self.timers.evidence_snapshot(),
+            event_table,
+            running: self.running.map_or(
+                ExecutorRunningEvidenceSnapshot::Quiescent,
+                ExecutorRunningEvidenceSnapshot::Active,
+            ),
+            sim_time: self.sim_time,
+            cp0_count: self.cp0_count,
+            cp0_count_phase: self.cp0_count_phase,
+            cp0_compare: self.cp0_compare,
+            cp0_timer_pending: self.cp0_timer_pending,
+        }
+    }
+
+    pub fn peripherals_evidence_snapshot(&self) -> crate::PeripheralsEvidenceSnapshot {
+        self.peripherals.evidence_snapshot()
+    }
+
     pub fn trace(&self) -> &[crate::trace::TraceEvent] {
         self.trace.events()
     }
@@ -184,6 +540,10 @@ impl Executor {
 
     pub fn sim_time(&self) -> u64 {
         self.sim_time
+    }
+
+    pub fn resume_epoch(&self) -> u64 {
+        self.resume_epoch
     }
 
     /// Cumulative OS_EVENT_VI retrace ticks fired since boot (ROADMAP R5
@@ -238,7 +598,19 @@ impl Executor {
     /// receives). Passing a dangling or wrong-sized base is UB, identical to
     /// the contract every `*_recomp` shim's `rdram` argument already carries.
     pub unsafe fn set_rdram_base(&mut self, base: *mut u8) {
+        self.set_rdram_base_with_len(base, usize::MAX);
+    }
+
+    /// Like [`Self::set_rdram_base`], with the allocation's byte length so
+    /// queue mirrors can bounds-check guest-supplied `OSMesgQueue*` addresses
+    /// and fail loudly instead of writing out of bounds (a corrupt guest
+    /// pointer used to SIGSEGV with no diagnosis).
+    ///
+    /// # Safety
+    /// Same contract as [`Self::set_rdram_base`].
+    pub unsafe fn set_rdram_base_with_len(&mut self, base: *mut u8, len: usize) {
         self.rdram_base = Some(base);
+        self.rdram_len = len;
     }
 
     /// Mirror a queue's live count/head into its rdram `OSMesgQueue` struct
@@ -258,6 +630,14 @@ impl Executor {
         // Same KSEG0-relative translation MEM_W uses: RdramAddr::offset() is
         // already the physical rdram byte offset, so write straight there in
         // native byte order (matching the recomp's `*(int32_t*)` MEM_W).
+        let end = mq_addr.offset() as usize + MQ_MSGCOUNT_OFF as usize + 4;
+        assert!(
+            end <= self.rdram_len,
+            "OSMesgQueue mirror at rdram offset {:#x} runs past the {:#x}-byte RDRAM \
+             allocation -- guest code handed the executor a corrupt OSMesgQueue pointer",
+            mq_addr.offset(),
+            self.rdram_len,
+        );
         let write = |off: u32, val: i32| unsafe {
             let o = mq_addr.offset().wrapping_add(off) as usize;
             std::ptr::copy_nonoverlapping(val.to_ne_bytes().as_ptr(), base.add(o), 4);
@@ -288,8 +668,9 @@ impl Executor {
             .insert(id, Box::new(GameThread::new(id, priority, body)));
     }
 
-    /// `osStartThread(t)`. Puts the thread on the run queue for the first
-    /// time.
+    /// `osStartThread(t)`. Puts a stopped thread on the run queue. Its first
+    /// start installs `Resume::Start`; a later restart preserves the
+    /// coroutine's already-established continuation protocol.
     pub fn start_thread(&mut self, id: ThreadId) {
         let thread = self
             .threads
@@ -300,6 +681,9 @@ impl Executor {
             ThreadState::Stopped,
             "osStartThread: thread {id} is not in the Stopped state"
         );
+        if !thread.has_started() {
+            self.pending_resume.insert(id, Resume::Start);
+        }
         thread.set_state(ThreadState::Runnable);
         self.run_queue.push(id);
         self.sort_run_queue();
@@ -330,27 +714,15 @@ impl Executor {
     /// `osDestroyThread(t)` / a thread's coroutine body returning. Removes
     /// it from the run queue and any blocked list it might be on.
     pub fn destroy_thread(&mut self, id: ThreadId) {
+        self.remove_thread_from_waiters(id);
         if let Some(thread) = self.threads.get_mut(&id) {
             thread.set_state(ThreadState::Dead);
         }
         self.run_queue.retain(|t| *t != id);
+        self.pending_resume.remove(&id);
         if self.running == Some(id) {
             self.running = None;
         }
-    }
-
-    /// Process-exit teardown: abandon every parked coroutine without
-    /// unwinding its stack (see `GameThread::abandon` for why unwinding a
-    /// guest thread parked inside a nounwind `extern "C"` shim aborts the
-    /// process). After this call every thread is `Dead` and the executor's
-    /// eventual drop (e.g. the host's TLS destructor) is unwind-free. The
-    /// run queue is cleared too -- nothing is schedulable afterwards.
-    pub fn abandon_parked_threads(&mut self) {
-        for thread in self.threads.values_mut() {
-            thread.abandon();
-        }
-        self.run_queue.clear();
-        self.running = None;
     }
 
     /// `osStopThread(t)` -- per the public libultra manual's Thread Manager
@@ -366,12 +738,31 @@ impl Executor {
     /// `fn64-abi`'s concern, not this module's -- `destroy_thread` doesn't
     /// touch it either).
     pub fn stop_thread(&mut self, id: ThreadId) {
+        self.remove_thread_from_waiters(id);
         if let Some(thread) = self.threads.get_mut(&id) {
             thread.set_state(ThreadState::Stopped);
         }
         self.run_queue.retain(|t| *t != id);
+        // Interleaving closed here: A is woken with a pending queue result,
+        // B stops A before its next resume, then B restarts A. The stopped
+        // interval cancels that scheduled resume; retaining it would replay a
+        // stale delivery after restart (and violates the invariant that every
+        // pending resume belongs to a currently runnable thread).
+        self.pending_resume.remove(&id);
         if self.running == Some(id) {
             self.running = None;
+        }
+    }
+
+    fn remove_thread_from_waiters(&mut self, id: ThreadId) {
+        // Interleaving closed here: thread A is parked on a queue, thread B
+        // stops or destroys A, then a device/timer post reaches that queue.
+        // Removing A from every queue-owned role before changing its state
+        // prevents the later post from popping the stale id and making A
+        // runnable again. One sweep covers recv and send waiters across every
+        // queue, including any inconsistent duplicate that must not survive.
+        for queue in self.queues.values_mut() {
+            queue.remove_waiter(id);
         }
     }
 
@@ -427,12 +818,6 @@ impl Executor {
 
     /// `osSetEventMesg(event, mq, msg)`.
     pub fn set_event_mesg(&mut self, event: u32, mq_addr: RdramAddr, msg: Mesg) {
-        let thread = self.running.unwrap_or(0);
-        self.trace.record(self.sim_time, TraceKind::EventMesg {
-            event,
-            queue: mq_addr,
-            thread,
-        });
         self.event_table.insert(event, (mq_addr.offset(), msg));
     }
 
@@ -445,6 +830,17 @@ impl Executor {
     /// `__osSiRawStartDma_recomp` for the two current callers.
     pub fn event_table_contains(&self, event: u32) -> bool {
         self.event_table.contains_key(&event)
+    }
+
+    /// Return the exact queue/message target registered for an OS event.
+    /// Synchronous manager calls use this read-only view to validate that
+    /// the queue they are about to block on is the event target that can
+    /// wake them; accepting only the event code would permit a completion
+    /// to post to a different queue and strand the caller forever.
+    pub fn event_registration(&self, event: u32) -> Option<(RdramAddr, Mesg)> {
+        self.event_table
+            .get(&event)
+            .map(|&(queue_offset, msg)| (RdramAddr::from_offset(queue_offset), msg))
     }
 
     /// THE single, explicit host-side injection point. Every SI/PI/VI/AI
@@ -532,8 +928,12 @@ impl Executor {
     /// this only after MI has latched; the standalone executor ticker has no
     /// MI owner. Pending VI state becomes
     /// current before either notification path can wake a guest thread.
-    /// Returns whether scanout-visible framebuffer or blanking state changed
-    /// at this V-blank.
+    /// Returns whether manager-owned framebuffer, special-feature bits,
+    /// black, fade, or repeat-line state changed at this V-blank; mode and
+    /// scale changes are omitted. The integrated device path presents every
+    /// field because field registers and retrace-seeded noise can change even
+    /// when this high-level state does not. Callers must not use this partial
+    /// manager delta as presentation admission authority.
     pub fn deliver_vi_retrace(&mut self) -> bool {
         let framebuffer_changed = self.peripherals.vi_latch_retrace();
         self.retrace_ticks_fired = self.retrace_ticks_fired.saturating_add(1);
@@ -639,6 +1039,10 @@ impl Executor {
             .advance_transfer_paks_to(Cycles::new(self.sim_time));
     }
 
+    pub fn attach_controller_pak(&mut self, port: usize, pak: crate::pfs::ControllerPak) {
+        self.peripherals.attach_controller_pak(port, pak);
+    }
+
     pub fn set_rumble(&mut self, port: usize, active: bool) -> Result<(), crate::si::RumbleError> {
         self.peripherals.set_rumble(port, active)
     }
@@ -674,6 +1078,34 @@ impl Executor {
             .insert_transfer_pak_cartridge(port, rom, ram)
     }
 
+    pub fn insert_transfer_pak_cartridge_with_battery(
+        &mut self,
+        port: usize,
+        rom: Vec<u8>,
+        ram: Option<Vec<u8>>,
+        restore: Option<crate::transfer_pak::Mbc3BatteryRestore>,
+    ) -> Result<(), crate::transfer_pak::TransferPakError> {
+        self.peripherals
+            .advance_transfer_paks_to(Cycles::new(self.sim_time));
+        self.peripherals
+            .insert_transfer_pak_cartridge_with_battery(port, rom, ram, restore)
+    }
+
+    pub fn checkpoint_transfer_pak_battery(
+        &mut self,
+        port: usize,
+        checkpoint: crate::transfer_pak::HostUnixNanos,
+    ) -> Result<
+        Option<crate::transfer_pak::Mbc3BatteryMetadata>,
+        crate::transfer_pak::TransferPakError,
+    > {
+        self.peripherals.checkpoint_transfer_pak_battery(
+            port,
+            Cycles::new(self.sim_time),
+            checkpoint,
+        )
+    }
+
     pub fn advance_transfer_paks_to(&mut self, now: Cycles) {
         self.peripherals.advance_transfer_paks_to(now);
     }
@@ -692,17 +1124,19 @@ impl Executor {
         self.peripherals.task_log()
     }
 
-    /// Record an RSP task submission (gfx: acknowledged only; audio: the
-    /// caller has already invoked the real translated ucode function before
-    /// calling this -- see `fn64-abi`'s `osSpTaskYielded_recomp`/task-submit
-    /// shim doc comments for the actual dispatch). Emits the shared
-    /// `TaskSubmit` trace event alongside the fuller `OsTaskHeader`
-    /// `Peripherals`' own `TaskLog` keeps. Trace recording stays here (needs
-    /// `sim_time` -- see `peripherals.rs`'s module doc).
-    pub fn submit_task(&mut self, header: OsTaskHeader) {
+    /// Retain the complete header admitted by `osSpTaskLoad`. Admission is
+    /// deliberately distinct from the later task kickoff trace.
+    pub fn admit_task(&mut self, header: OsTaskHeader) {
+        self.peripherals.admit_task(header);
+    }
+
+    /// Record the `osSpTaskStartGo` boundary after the loaded-task token has
+    /// been consumed. A load that is replaced before kickoff cannot emit this
+    /// event or satisfy an execution-qualified release closure path.
+    pub fn start_task(&mut self, header: OsTaskHeader) {
         let sim_time = self.sim_time;
         let ucode = header.ucode;
-        if let Some(kind) = self.peripherals.submit_task(header) {
+        if let Some(kind) = header.kind() {
             self.trace.record(
                 sim_time,
                 TraceKind::TaskSubmit {
@@ -734,9 +1168,8 @@ impl Executor {
 
     /// Shared delivery logic for both a guest `osSendMesg` and an external
     /// post (`inject_event`/`advance_time`): try a non-blocking send; if a
-    /// receiver is already blocked, wake exactly one (FIFO, per
-    /// `docs/DESIGN.md`'s "FIFO per-queue delivery" -- libultra's own
-    /// documented per-queue order) and hand it the message directly rather
+    /// receiver is already blocked, wake exactly one in libultra waiter order
+    /// (highest priority first, FIFO among ties) and hand it the message directly rather
     /// than routing it back through the ring buffer, matching the
     /// documented `osRecvMesg`/`osSendMesg` handoff shape. If the queue is
     /// full and nothing can be done, the message is dropped -- this is the
@@ -782,15 +1215,6 @@ impl Executor {
                 // park (this is an external/timer source) -- real hardware
                 // drops the message here exactly as OS_MESG_NOBLOCK would;
                 // there is nothing else a non-coroutine caller could do.
-                // Traced (2026-07-21): a dropped completion message (SP/DP
-                // done, timer) is invisible in the queue-op stream otherwise,
-                // and was the prime suspect in WM2000's post-frame-3 boot
-                // deadlock -- see `QueueOpKind::Drop`'s doc comment.
-                self.record_queue_op(
-                    queue_addr,
-                    QueueOpKind::Drop,
-                    attributed_thread.unwrap_or(0),
-                );
             }
         }
         self.mirror_queue_to_rdram(queue_addr);
@@ -799,9 +1223,19 @@ impl Executor {
     /// Move a blocked (or newly-woken-by-timer/external-event) thread back
     /// onto the run queue.
     fn wake_thread(&mut self, id: ThreadId, resume_with: Resume) {
-        if let Some(thread) = self.threads.get_mut(&id) {
-            thread.set_state(ThreadState::Runnable);
-        }
+        let thread = self
+            .threads
+            .get_mut(&id)
+            .unwrap_or_else(|| panic!("queue waiter references unknown thread id {id}"));
+        assert!(
+            matches!(
+                thread.state(),
+                ThreadState::BlockedOnRecv | ThreadState::BlockedOnSend
+            ),
+            "queue waiter references thread {id} in non-blocked state {:?}",
+            thread.state()
+        );
+        thread.set_state(ThreadState::Runnable);
         self.run_queue.push(id);
         self.sort_run_queue();
         self.pending_resume.insert(id, resume_with);
@@ -824,12 +1258,12 @@ impl Executor {
         sender: ThreadId,
         mq_addr: RdramAddr,
         msg: Mesg,
-        jam: bool,
+        placement: SendPlacement,
     ) -> SendOutcome {
         if std::env::var("FN64_DEBUG_SEND").is_ok() {
             eprintln!(
                 "[DEBUG try_deliver_send] sender={sender} mq_addr_offset={:#x} msg={msg:#x} \
-                 jam={jam}",
+                 placement={placement:?}",
                 mq_addr.offset()
             );
         }
@@ -847,10 +1281,9 @@ impl Executor {
             return SendOutcome::Delivered;
         }
         // Front-insert for jam (osJamMesg), tail-insert for send.
-        let insert = if jam {
-            queue.try_jam(msg)
-        } else {
-            queue.try_send(msg)
+        let insert = match placement {
+            SendPlacement::Head => queue.try_jam(msg),
+            SendPlacement::Tail => queue.try_send(msg),
         };
         let outcome = match insert {
             SendResult::Delivered => {
@@ -1007,6 +1440,10 @@ impl Executor {
         if std::env::var("FN64_DEBUG_SEND").is_ok() {
             eprintln!("[DEBUG run_one_step] about to resume id={id} resume_with={resume_with:?}");
         }
+        self.resume_epoch = self
+            .resume_epoch
+            .checked_add(1)
+            .expect("executor resume epoch overflow");
         let thread = self.threads.get_mut(&id).expect("run queue had stale id");
         let result = thread.resume(RunToken::issue(), resume_with);
         if std::env::var("FN64_DEBUG_SEND").is_ok() {
@@ -1037,10 +1474,6 @@ impl Executor {
                 // Immediately runnable again next round -- this is the
                 // exact semantics that fixes an idle spin loop: it gives up
                 // the CPU every iteration instead of never yielding.
-                // (Correct only for callers that loop back around the
-                // yield themselves -- see `Yield::StopSelf` for the C-ABI
-                // `pause_self` boundary, whose generated call sites do
-                // NOT loop.)
                 if let Some(thread) = self.threads.get_mut(&id) {
                     thread.set_state(ThreadState::Runnable);
                 }
@@ -1051,16 +1484,15 @@ impl Executor {
                 }
             }
             Yield::StopSelf => {
-                // The C-ABI `pause_self` park: back to `Stopped` (the same
-                // state `osCreateThread` leaves a thread in), off the run
-                // queue, resumable only by an explicit `osStartThread` --
-                // reference-runtime (N64ModernRuntime) parity. See
-                // `Yield::StopSelf`'s doc for the WM2000 fall-through
-                // corruption this closes.
+                // Generated-C pause_self has no guest loop-back continuation.
+                // Parking here closes the interleaving where an assert-hang
+                // resumed at the following host statement and corrupted state.
+                self.remove_thread_from_waiters(id);
                 if let Some(thread) = self.threads.get_mut(&id) {
                     thread.set_state(ThreadState::Stopped);
                 }
-                self.run_queue.retain(|t| *t != id);
+                self.run_queue.retain(|thread| *thread != id);
+                self.pending_resume.remove(&id);
                 if self.running == Some(id) {
                     self.running = None;
                 }
@@ -1108,11 +1540,10 @@ impl Executor {
                             thread.set_state(ThreadState::BlockedOnRecv);
                         }
                         self.record_queue_op(mq_addr, QueueOpKind::Block, id);
-                        // Park in PRIORITY order (libultra __osEnqueueThread;
-                        // see mesgqueue.rs `BlockedList`'s doc for the WM2000
-                        // grant-crossover this fixes).
-                        let pri = self.thread_pri(id);
-                        self.queue_mut(mq_addr).block_receiver(id, pri);
+                        // libultra inserts waiters by descending priority;
+                        // stable equal priorities preserve arrival order.
+                        let priority = self.thread_pri(id);
+                        self.queue_mut(mq_addr).block_receiver(id, priority);
                     }
                     RecvOutcome::Blocked => {
                         // OS_MESG_NOBLOCK on an empty queue: never parked,
@@ -1146,7 +1577,12 @@ impl Executor {
                 // waiting) by the time the coroutine actually suspended --
                 // only truly park it if delivery genuinely cannot happen
                 // yet AND the caller allows blocking.
-                match self.try_deliver_send(id, mq_addr, msg, jam) {
+                let placement = if jam {
+                    SendPlacement::Head
+                } else {
+                    SendPlacement::Tail
+                };
+                match self.try_deliver_send(id, mq_addr, msg, placement) {
                     SendOutcome::Delivered => {
                         self.pending_resume.insert(id, Resume::SendUnblocked);
                         if let Some(thread) = self.threads.get_mut(&id) {
@@ -1160,9 +1596,11 @@ impl Executor {
                             thread.set_state(ThreadState::BlockedOnSend);
                         }
                         self.record_queue_op(mq_addr, QueueOpKind::Block, id);
-                        // Priority-ordered park, same as the recv side.
-                        let pri = self.thread_pri(id);
-                        self.queue_mut(mq_addr).block_sender(id, pri, msg);
+                        // Capture priority at the park boundary, matching the
+                        // ordering rule used for blocked receivers above.
+                        let priority = self.thread_pri(id);
+                        self.queue_mut(mq_addr)
+                            .block_sender(id, priority, msg, placement);
                     }
                     SendOutcome::Blocked => {
                         // OS_MESG_NOBLOCK on a full queue: dropped, never
@@ -1197,7 +1635,7 @@ impl Executor {
         msg: Mesg,
         blocking: bool,
     ) -> SendMesgOutcome {
-        match self.try_deliver_send(sender, mq_addr, msg, /* jam */ false) {
+        match self.try_deliver_send(sender, mq_addr, msg, SendPlacement::Tail) {
             SendOutcome::Delivered => SendMesgOutcome::Delivered,
             SendOutcome::Blocked if blocking => SendMesgOutcome::MustYield,
             SendOutcome::Blocked => SendMesgOutcome::DroppedWouldBlock,
@@ -1243,6 +1681,20 @@ impl Executor {
             .get(&mq_addr.offset())
             .map(|q| q.capacity())
             .unwrap_or(0)
+    }
+
+    pub fn queue_valid_count(&self, mq_addr: RdramAddr) -> Option<usize> {
+        self.queues
+            .get(&mq_addr.offset())
+            .map(MesgQueue::valid_count)
+    }
+
+    /// Complete queue-use preflight for synchronous APIs whose public contract
+    /// requires an unshared queue. In particular, an empty queue with an older
+    /// blocked receiver is not private: that receiver would steal the next
+    /// completion post and strand the synchronous caller.
+    pub fn queue_activity(&self, mq_addr: RdramAddr) -> Option<MesgQueueActivity> {
+        self.queues.get(&mq_addr.offset()).map(MesgQueue::activity)
     }
 
     /// Run until the run queue is empty (every thread finished, blocked, or
@@ -1462,5 +1914,371 @@ mod tests {
         combined.advance_time(7);
         assert_eq!(split.cp0_count(), combined.cp0_count());
         assert_eq!(split.cp0_count(), 3);
+    }
+
+    #[test]
+    fn executor_delivers_start_once_then_continue_after_pause() {
+        let inputs = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = inputs.clone();
+        let mut exec = Executor::new();
+        exec.create_thread(1, 1, move |yielder, first| {
+            observed.borrow_mut().push(first);
+            let resumed = yielder.suspend(Yield::PauseSelf);
+            observed.borrow_mut().push(resumed);
+        });
+        exec.start_thread(1);
+
+        assert!(exec.run_one_step());
+        assert_eq!(&*inputs.borrow(), &[Resume::Start]);
+        assert!(exec.run_one_step());
+        assert_eq!(&*inputs.borrow(), &[Resume::Start, Resume::Continue]);
+        assert!(exec.is_thread_dead(1));
+    }
+
+    /// Exact interleaving regression: A blocks receiving, B destroys A, then
+    /// a host event posts to the queue. The post must enqueue normally; it
+    /// must not pop A's stale waiter id and revive the destroyed coroutine.
+    #[test]
+    fn destroyed_blocked_receiver_cannot_be_revived_by_a_later_post() {
+        let mut exec = Executor::new();
+        let queue = RdramAddr::from_offset(0x3000);
+        exec.create_mesg_queue(queue, 1);
+        exec.create_thread(1, 1, move |yielder, _| {
+            let _ = yielder.suspend(Yield::BlockOnRecv {
+                mq_addr: queue,
+                may_block: true,
+            });
+        });
+        exec.start_thread(1);
+        assert!(exec.run_one_step());
+
+        exec.destroy_thread(1);
+        exec.inject_event(ExternalEvent::DirectPost {
+            queue_addr: queue,
+            msg: 0xABCD,
+        });
+
+        assert!(exec.is_thread_dead(1));
+        assert_eq!(exec.peek_next_thread(), None);
+        assert_eq!(
+            exec.recv_mesg(99, queue, false),
+            RecvMesgOutcome::Delivered(0xABCD)
+        );
+    }
+
+    /// Exact interleaving regression: A blocks jamming into a full queue, B
+    /// stops A, then B receives and frees a slot. The receive must not replay
+    /// A's removed blocked operation or make A runnable again.
+    #[test]
+    fn stopped_blocked_sender_cannot_be_revived_when_space_frees() {
+        let mut exec = Executor::new();
+        let queue = RdramAddr::from_offset(0x4000);
+        exec.create_mesg_queue(queue, 1);
+        exec.inject_event(ExternalEvent::DirectPost {
+            queue_addr: queue,
+            msg: 0x1111,
+        });
+        exec.create_thread(1, 1, move |yielder, _| {
+            let _ = yielder.suspend(Yield::BlockOnSend {
+                mq_addr: queue,
+                msg: 0x2222,
+                may_block: true,
+                jam: true,
+            });
+        });
+        exec.start_thread(1);
+        assert!(exec.run_one_step());
+
+        exec.stop_thread(1);
+        assert_eq!(
+            exec.recv_mesg(99, queue, false),
+            RecvMesgOutcome::Delivered(0x1111)
+        );
+        assert_eq!(
+            exec.recv_mesg(99, queue, false),
+            RecvMesgOutcome::WouldBlock
+        );
+        assert_eq!(exec.peek_next_thread(), None);
+        assert!(!exec.is_thread_dead(1));
+    }
+
+    #[test]
+    fn control_evidence_canonicalizes_hash_owned_insertion_order() {
+        fn build(reversed: bool) -> Executor {
+            let mut exec = Executor::new();
+            let thread_ids = if reversed { [9, 3] } else { [3, 9] };
+            for id in thread_ids {
+                exec.create_thread(id, id as Priority, |_yielder, _resume| {});
+            }
+
+            let queue_offsets = if reversed {
+                [0x2200, 0x1100]
+            } else {
+                [0x1100, 0x2200]
+            };
+            for offset in queue_offsets {
+                let queue = RdramAddr::from_offset(offset);
+                exec.create_mesg_queue(queue, 3);
+                exec.inject_event(ExternalEvent::DirectPost {
+                    queue_addr: queue,
+                    msg: offset,
+                });
+            }
+
+            let events = if reversed {
+                [(8, 0x2200, 0x88), (2, 0x1100, 0x22)]
+            } else {
+                [(2, 0x1100, 0x22), (8, 0x2200, 0x88)]
+            };
+            for (event, queue, msg) in events {
+                exec.set_event_mesg(event, RdramAddr::from_offset(queue), msg);
+            }
+            exec
+        }
+
+        let snapshot = build(false).control_evidence_snapshot();
+        assert_eq!(snapshot, build(true).control_evidence_snapshot());
+        assert_eq!(
+            snapshot
+                .threads
+                .iter()
+                .map(|thread| thread.id)
+                .collect::<Vec<_>>(),
+            vec![3, 9]
+        );
+        assert_eq!(
+            snapshot
+                .queues
+                .iter()
+                .map(|queue| queue.address.offset())
+                .collect::<Vec<_>>(),
+            vec![0x1100, 0x2200]
+        );
+        assert_eq!(
+            snapshot
+                .event_table
+                .iter()
+                .map(|registration| registration.event)
+                .collect::<Vec<_>>(),
+            vec![2, 8]
+        );
+    }
+
+    #[test]
+    fn control_evidence_preserves_exact_equal_priority_run_order() {
+        fn build(order: [ThreadId; 2]) -> ExecutorControlEvidenceSnapshot {
+            let mut exec = Executor::new();
+            exec.create_thread(1, 10, |_yielder, _resume| {});
+            exec.create_thread(2, 10, |_yielder, _resume| {});
+            exec.start_thread(order[0]);
+            exec.start_thread(order[1]);
+            exec.control_evidence_snapshot()
+        }
+
+        let first = build([1, 2]);
+        let reversed = build([2, 1]);
+        assert_eq!(first.threads, reversed.threads);
+        assert_eq!(first.pending_resumes, reversed.pending_resumes);
+        assert_eq!(
+            first
+                .pending_resumes
+                .iter()
+                .map(|pending| pending.thread)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_ne!(first.run_queue, reversed.run_queue);
+    }
+
+    #[test]
+    fn control_evidence_is_pointer_independent_and_nonmutating() {
+        let mut first_rdram = vec![0u8; 0x4000];
+        let mut second_rdram = vec![0u8; 0x4000];
+        assert_ne!(first_rdram.as_mut_ptr(), second_rdram.as_mut_ptr());
+
+        let mut first = Executor::new();
+        let mut second = Executor::new();
+        unsafe {
+            first.set_rdram_base_with_len(first_rdram.as_mut_ptr(), first_rdram.len());
+            second.set_rdram_base_with_len(second_rdram.as_mut_ptr(), second_rdram.len());
+        }
+        first.create_thread(4, 7, |_yielder, _resume| {});
+        second.create_thread(4, 7, |_yielder, _resume| {});
+
+        let snapshot = first.control_evidence_snapshot();
+        assert_eq!(snapshot, second.control_evidence_snapshot());
+        assert_eq!(first.control_evidence_snapshot(), snapshot);
+        assert_eq!(first.peek_next_thread(), None);
+    }
+
+    #[test]
+    fn control_evidence_detects_each_owner_family_perturbation() {
+        let baseline = Executor::new().control_evidence_snapshot();
+
+        let mut rdram_bytes = vec![0u8; 32];
+        let mut rdram = Executor::new();
+        unsafe { rdram.set_rdram_base_with_len(rdram_bytes.as_mut_ptr(), rdram_bytes.len()) };
+        assert_ne!(baseline.rdram, rdram.control_evidence_snapshot().rdram);
+
+        let mut thread = Executor::new();
+        thread.create_thread(1, 3, |_yielder, _resume| {});
+        assert_ne!(baseline.threads, thread.control_evidence_snapshot().threads);
+
+        let mut queue = Executor::new();
+        queue.create_mesg_queue(RdramAddr::from_offset(0x100), 2);
+        assert_ne!(baseline.queues, queue.control_evidence_snapshot().queues);
+
+        let mut timer = Executor::new();
+        timer.set_timer(7, 0, RdramAddr::from_offset(0x100), 5, 1);
+        assert_ne!(baseline.timers, timer.control_evidence_snapshot().timers);
+
+        let mut event = Executor::new();
+        event.set_event_mesg(7, RdramAddr::from_offset(0x100), 5);
+        assert_ne!(
+            baseline.event_table,
+            event.control_evidence_snapshot().event_table
+        );
+
+        let mut clock = Executor::new();
+        clock.write_cp0_compare(1);
+        clock.advance_time(3);
+        let clock = clock.control_evidence_snapshot();
+        assert_ne!(baseline.sim_time, clock.sim_time);
+        assert_ne!(baseline.cp0_count, clock.cp0_count);
+        assert_ne!(baseline.cp0_count_phase, clock.cp0_count_phase);
+        assert_ne!(baseline.cp0_compare, clock.cp0_compare);
+        assert_ne!(baseline.cp0_timer_pending, clock.cp0_timer_pending);
+
+        let mut active = Executor::new();
+        active.create_thread(1, 1, |yielder, _resume| {
+            yielder.suspend(Yield::PauseSelf);
+        });
+        active.start_thread(1);
+        assert!(active.run_one_step());
+        active.run_queue.clear();
+        active
+            .threads
+            .get_mut(&1)
+            .expect("thread exists")
+            .set_state(ThreadState::Running);
+        active.running = Some(1);
+        assert_eq!(
+            active.control_evidence_snapshot().running,
+            ExecutorRunningEvidenceSnapshot::Active(1)
+        );
+
+        let mut pending = Executor::new();
+        pending.create_thread(1, 1, |yielder, _resume| {
+            yielder.suspend(Yield::PauseSelf);
+        });
+        pending.start_thread(1);
+        assert!(pending.run_one_step());
+        let without_pending = pending.control_evidence_snapshot();
+        pending.pending_resume.insert(1, Resume::WouldBlock);
+        let with_pending = pending.control_evidence_snapshot();
+        assert_eq!(without_pending.threads, with_pending.threads);
+        assert_eq!(without_pending.run_queue, with_pending.run_queue);
+        assert_ne!(
+            without_pending.pending_resumes,
+            with_pending.pending_resumes
+        );
+    }
+
+    #[test]
+    fn control_evidence_rejects_corrupt_cross_owner_relationships() {
+        let mut duplicate = Executor::new();
+        duplicate.create_thread(1, 1, |_yielder, _resume| {});
+        duplicate.start_thread(1);
+        duplicate.run_queue.push(1);
+        assert_eq!(
+            duplicate.validate_control_evidence_invariants(),
+            Err(ExecutorControlInvariantError::DuplicateRunQueueThread(1))
+        );
+
+        let mut wrong_waiter_state = Executor::new();
+        let queue = RdramAddr::from_offset(0x100);
+        wrong_waiter_state.create_mesg_queue(queue, 1);
+        wrong_waiter_state.create_thread(2, 1, |_yielder, _resume| {});
+        wrong_waiter_state.queue_mut(queue).block_receiver(2, 1);
+        assert_eq!(
+            wrong_waiter_state.validate_control_evidence_invariants(),
+            Err(ExecutorControlInvariantError::ReceiverWaiterStateMismatch(
+                2,
+                ThreadState::Stopped
+            ))
+        );
+
+        let mut stale_resume = Executor::new();
+        stale_resume.create_thread(3, 1, |_yielder, _resume| {});
+        stale_resume.pending_resume.insert(3, Resume::Continue);
+        assert_eq!(
+            stale_resume.validate_control_evidence_invariants(),
+            Err(
+                ExecutorControlInvariantError::PendingResumeThreadNotRunnable(
+                    3,
+                    ThreadState::Stopped
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn stopping_a_woken_thread_discards_its_stale_pending_resume() {
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed_by_thread = observed.clone();
+        let queue = RdramAddr::from_offset(0x100);
+        let mut exec = Executor::new();
+        exec.create_mesg_queue(queue, 1);
+        exec.create_thread(1, 1, move |yielder, first| {
+            observed_by_thread.borrow_mut().push(first);
+            let resumed = yielder.suspend(Yield::BlockOnRecv {
+                mq_addr: queue,
+                may_block: true,
+            });
+            observed_by_thread.borrow_mut().push(resumed);
+        });
+        exec.start_thread(1);
+        assert!(exec.run_one_step());
+        exec.inject_event(ExternalEvent::DirectPost {
+            queue_addr: queue,
+            msg: 0xCAFE,
+        });
+
+        exec.stop_thread(1);
+        exec.start_thread(1);
+        assert!(exec.run_one_step());
+        assert_eq!(&*observed.borrow(), &[Resume::Start, Resume::Continue]);
+    }
+
+    #[test]
+    fn opaque_native_continuations_are_intentionally_evidence_equal() {
+        let mut yields_again = Executor::new();
+        yields_again.create_thread(1, 1, |yielder, _resume| {
+            yielder.suspend(Yield::PauseSelf);
+            yielder.suspend(Yield::PauseSelf);
+        });
+        yields_again.start_thread(1);
+        assert!(yields_again.run_one_step());
+
+        let mut returns_next = Executor::new();
+        returns_next.create_thread(1, 1, |yielder, _resume| {
+            yielder.suspend(Yield::PauseSelf);
+        });
+        returns_next.start_thread(1);
+        assert!(returns_next.run_one_step());
+
+        assert_eq!(
+            yields_again.control_evidence_snapshot(),
+            returns_next.control_evidence_snapshot(),
+            "native continuation differences are outside this evidence projection"
+        );
+
+        assert!(yields_again.run_one_step());
+        assert!(returns_next.run_one_step());
+        assert_ne!(
+            yields_again.control_evidence_snapshot(),
+            returns_next.control_evidence_snapshot(),
+            "the next scheduling step exposes the intentionally opaque difference"
+        );
     }
 }

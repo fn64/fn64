@@ -34,6 +34,11 @@
 //! video clock and the live H_SYNC/V_SYNC pair, using the public register
 //! units. The nominal public 60/50 Hz rate is only the pre-mode bootstrap;
 //! `RetraceSchedule` remains an explicit compatibility/test ticker.
+//!
+//! Fixed-cycle evidence uses [`ViState::evidence_snapshot`] together with
+//! [`RetraceSchedule::evidence_snapshot`]. These views include private queued
+//! latch/divisor state and the standalone ticker deadline because equal raw VI
+//! registers alone do not imply equal behavior at the next retrace.
 use crate::rdram::RdramAddr;
 
 /// Current/next libultra VI-manager state. `fn64-abi` separately decodes the
@@ -89,9 +94,79 @@ pub struct ViState {
     retrace_phase: u32,
 }
 
+/// Release-evidence view of every future-affecting high-level VI-manager
+/// value owned by [`ViState`]. Floating-point scales are retained as their
+/// exact IEEE-754 bit patterns so downstream canonical encoders never depend
+/// on text formatting or host float serialization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViEvidenceSnapshot {
+    pub mode_ptr: Option<u32>,
+    pub next_mode_ptr: Option<u32>,
+    pub next_mode_resets_overrides: bool,
+    pub special_features: Option<u32>,
+    pub next_special_features: Option<u32>,
+    pub x_scale_bits: Option<u32>,
+    pub y_scale_bits: Option<u32>,
+    pub next_x_scale_bits: Option<u32>,
+    pub next_y_scale_bits: Option<u32>,
+    pub blanked: bool,
+    pub next_blanked: Option<bool>,
+    pub fade: Option<u16>,
+    pub next_fade: PendingViFade,
+    pub repeat_line: bool,
+    pub next_repeat_line: Option<bool>,
+    pub current_framebuffer: Option<u32>,
+    pub next_framebuffer: Option<u32>,
+    pub swap_count: u64,
+    pub retrace_target: Option<(u32, u32)>,
+    pub retrace_count: u32,
+    pub retrace_phase: u32,
+}
+
+/// Three-state encoding of `ViState::next_fade`: no queued change, queued
+/// disable, or a queued ten-bit interpolation factor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingViFade {
+    Unchanged,
+    Disabled,
+    Factor(u16),
+}
+
 impl ViState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Snapshot every high-level VI-manager value that can affect current
+    /// observation or the result of a later retrace under identical input.
+    pub fn evidence_snapshot(&self) -> ViEvidenceSnapshot {
+        ViEvidenceSnapshot {
+            mode_ptr: self.mode_ptr,
+            next_mode_ptr: self.next_mode_ptr,
+            next_mode_resets_overrides: self.next_mode_resets_overrides,
+            special_features: self.special_features,
+            next_special_features: self.next_special_features,
+            x_scale_bits: self.x_scale.map(f32::to_bits),
+            y_scale_bits: self.y_scale.map(f32::to_bits),
+            next_x_scale_bits: self.next_x_scale.map(f32::to_bits),
+            next_y_scale_bits: self.next_y_scale.map(f32::to_bits),
+            blanked: self.blanked,
+            next_blanked: self.next_blanked,
+            fade: self.fade,
+            next_fade: match self.next_fade {
+                None => PendingViFade::Unchanged,
+                Some(None) => PendingViFade::Disabled,
+                Some(Some(factor)) => PendingViFade::Factor(factor),
+            },
+            repeat_line: self.repeat_line,
+            next_repeat_line: self.next_repeat_line,
+            current_framebuffer: self.current_framebuffer.map(RdramAddr::offset),
+            next_framebuffer: self.next_framebuffer.map(RdramAddr::offset),
+            swap_count: self.swap_count,
+            retrace_target: self.retrace_target,
+            retrace_count: self.retrace_count,
+            retrace_phase: self.retrace_phase,
+        }
     }
 
     pub fn set_mode(&mut self, mode_ptr: u32) {
@@ -138,10 +213,12 @@ impl ViState {
     }
 
     /// Atomically apply every VI-manager change pending for V-blank. Returns
-    /// whether scanout-visible state changed, allowing the host renderer to
-    /// present framebuffer swaps and VI scanout-effect transitions at this
-    /// boundary rather than at submission time.
+    /// whether the manager-owned framebuffer, special-feature bits, black,
+    /// fade, or repeat-line state changed. Mode and scale changes are omitted.
+    /// Integrated execution presents every hardware field independently; this
+    /// partial manager delta is never presentation admission authority.
     pub fn latch_retrace(&mut self) -> bool {
+        let old_special_features = self.special_features;
         let old_blanked = self.blanked;
         let old_fade = self.fade;
         let old_repeat_line = self.repeat_line;
@@ -167,19 +244,6 @@ impl ViState {
             self.y_scale = Some(scale);
         }
         if let Some(blanked) = self.next_blanked {
-            let effective_y_scale = self.next_y_scale.or(self.y_scale).unwrap_or(1.0);
-            assert!(
-                !blanked || effective_y_scale == 1.0,
-                "osViBlack(TRUE) requires an effective Y scale of 1.0"
-            );
-            assert!(
-                !blanked || self.next_fade.unwrap_or(self.fade).is_none(),
-                "osViBlack(TRUE) requires osViFade to be disabled"
-            );
-            assert!(
-                !blanked || !self.next_repeat_line.unwrap_or(self.repeat_line),
-                "osViBlack(TRUE) requires osViRepeatLine to be disabled"
-            );
             self.blanked = blanked;
         }
         if let Some(fade) = self.next_fade {
@@ -189,6 +253,18 @@ impl ViState {
             self.repeat_line = repeat_line;
         }
         assert!(
+            !self.blanked || self.y_scale.unwrap_or(1.0) == 1.0,
+            "osViBlack(TRUE) requires an effective Y scale of 1.0"
+        );
+        assert!(
+            !self.blanked || self.fade.is_none(),
+            "osViBlack(TRUE) requires osViFade to be disabled"
+        );
+        assert!(
+            !self.blanked || !self.repeat_line,
+            "osViBlack(TRUE) requires osViRepeatLine to be disabled"
+        );
+        assert!(
             self.fade.is_none() || !self.repeat_line,
             "osViFade and osViRepeatLine cannot be enabled together"
         );
@@ -197,6 +273,7 @@ impl ViState {
             self.current_framebuffer = Some(framebuffer);
         }
         changed
+            || self.special_features != old_special_features
             || self.blanked != old_blanked
             || self.fade != old_fade
             || self.repeat_line != old_repeat_line
@@ -239,11 +316,25 @@ pub struct RetraceSchedule {
     next_due: u64,
 }
 
+/// Future-affecting state of the standalone compatibility retrace ticker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetraceScheduleEvidenceSnapshot {
+    pub interval: u64,
+    pub next_due: u64,
+}
+
 impl RetraceSchedule {
     pub fn new(interval: u64) -> Self {
         RetraceSchedule {
             interval: interval.max(1),
             next_due: interval.max(1),
+        }
+    }
+
+    pub const fn evidence_snapshot(&self) -> RetraceScheduleEvidenceSnapshot {
+        RetraceScheduleEvidenceSnapshot {
+            interval: self.interval,
+            next_due: self.next_due,
         }
     }
 
@@ -316,12 +407,63 @@ mod tests {
     }
 
     #[test]
+    fn feature_only_transition_is_scanout_visible() {
+        let mut vi = ViState::new();
+        vi.set_special_features(0x01);
+        assert!(vi.latch_retrace());
+        assert_eq!(vi.special_features, Some(0x01));
+        assert!(!vi.latch_retrace());
+    }
+
+    #[test]
     #[should_panic(expected = "osViBlack(TRUE) requires an effective Y scale of 1.0")]
     fn black_rejects_non_unit_effective_y_scale_at_the_latch_boundary() {
         let mut vi = ViState::new();
         vi.set_y_scale(0.5);
         vi.set_black(true);
         vi.latch_retrace();
+    }
+
+    #[test]
+    #[should_panic(expected = "osViBlack(TRUE) requires an effective Y scale of 1.0")]
+    fn already_black_scanout_rejects_a_later_non_unit_y_scale() {
+        let mut vi = ViState::new();
+        vi.set_black(true);
+        vi.latch_retrace();
+        vi.set_y_scale(0.5);
+        vi.latch_retrace();
+    }
+
+    #[test]
+    #[should_panic(expected = "osViBlack(TRUE) requires osViFade to be disabled")]
+    fn already_black_scanout_rejects_a_later_fade() {
+        let mut vi = ViState::new();
+        vi.set_black(true);
+        vi.latch_retrace();
+        vi.set_fade(true, 0x0200);
+        vi.latch_retrace();
+    }
+
+    #[test]
+    #[should_panic(expected = "osViBlack(TRUE) requires osViRepeatLine to be disabled")]
+    fn already_black_scanout_rejects_a_later_repeated_line() {
+        let mut vi = ViState::new();
+        vi.set_black(true);
+        vi.latch_retrace();
+        vi.set_repeat_line(true);
+        vi.latch_retrace();
+    }
+
+    #[test]
+    fn unblank_and_scanout_effect_may_latch_together() {
+        let mut vi = ViState::new();
+        vi.set_black(true);
+        vi.latch_retrace();
+        vi.set_black(false);
+        vi.set_fade(true, 0x0200);
+        assert!(vi.latch_retrace());
+        assert!(!vi.blanked);
+        assert_eq!(vi.fade, Some(0x0200));
     }
 
     #[test]
@@ -371,5 +513,80 @@ mod tests {
         vi.set_repeat_line(true);
         assert!(vi.latch_retrace());
         assert!(vi.repeat_line);
+    }
+
+    #[test]
+    fn evidence_snapshot_preserves_every_active_and_pending_vi_family() {
+        let mut vi = ViState::new();
+        assert_eq!(vi.evidence_snapshot().next_fade, PendingViFade::Unchanged);
+        vi.set_mode(0x8000_1000);
+        vi.set_special_features(0x11);
+        vi.set_x_scale(0.5);
+        vi.set_y_scale(0.75);
+        vi.set_fade(true, 0x155);
+        vi.swap_buffer(RdramAddr::from_offset(0x1000));
+        assert!(vi.latch_retrace());
+        assert_eq!(
+            vi.evidence_snapshot().next_fade,
+            PendingViFade::Factor(0x155)
+        );
+
+        vi.set_mode(0x8000_2000);
+        vi.set_special_features(0x22);
+        vi.set_x_scale(-0.0);
+        vi.set_y_scale(1.25);
+        vi.set_black(false);
+        vi.set_fade(false, 0);
+        vi.set_repeat_line(true);
+        vi.swap_buffer(RdramAddr::from_offset(0x2000));
+        vi.set_event(RdramAddr::from_offset(0x3000), 0x44, 3);
+        assert_eq!(vi.manager_target_for_retrace(), None);
+
+        assert_eq!(
+            vi.evidence_snapshot(),
+            ViEvidenceSnapshot {
+                mode_ptr: Some(0x8000_1000),
+                next_mode_ptr: Some(0x8000_2000),
+                next_mode_resets_overrides: true,
+                special_features: Some(0x11),
+                next_special_features: Some(0x22),
+                x_scale_bits: Some(0.5f32.to_bits()),
+                y_scale_bits: Some(0.75f32.to_bits()),
+                next_x_scale_bits: Some((-0.0f32).to_bits()),
+                next_y_scale_bits: Some(1.25f32.to_bits()),
+                blanked: false,
+                next_blanked: Some(false),
+                fade: Some(0x155),
+                next_fade: PendingViFade::Disabled,
+                repeat_line: false,
+                next_repeat_line: Some(true),
+                current_framebuffer: Some(0x1000),
+                next_framebuffer: Some(0x2000),
+                swap_count: 2,
+                retrace_target: Some((0x3000, 0x44)),
+                retrace_count: 3,
+                retrace_phase: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn retrace_schedule_evidence_preserves_policy_and_next_deadline() {
+        let mut schedule = RetraceSchedule::new(10);
+        assert_eq!(
+            schedule.evidence_snapshot(),
+            RetraceScheduleEvidenceSnapshot {
+                interval: 10,
+                next_due: 10,
+            }
+        );
+        assert_eq!(schedule.advance(25), 2);
+        assert_eq!(
+            schedule.evidence_snapshot(),
+            RetraceScheduleEvidenceSnapshot {
+                interval: 10,
+                next_due: 30,
+            }
+        );
     }
 }

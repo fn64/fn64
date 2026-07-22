@@ -501,16 +501,21 @@ with the scripts noted below):
    `func_80120B28/B84/BA0/D20/D98`, consecutive fragments of one
    emitter).
 4. **The fix (faithful, systematic): build-time fall-through mend.**
-   `build.rs` now parses `recomp_overlays.inl`'s per-section
-   `FuncEntry` tables into an address-contiguity successor map and
-   appends `func_<successor>(rdram, ctx);` to every generated body that
-   can fall off its end -- exactly the tail call N64Recomp itself emits
+   The harness opts into `fn64-boot-harness/build_support.rs`'s shared
+   generated-C preparation, which parses `recomp_overlays.inl`'s
+   per-section `FuncEntry` tables into an address-contiguity successor
+   map and appends `func_<successor>(rdram, ctx);` to every generated body
+   that can fall off its end -- exactly the tail call N64Recomp itself emits
    when its function list is correct, and exactly what hardware does
    (execution continues at the next address). 1996 bodies get the
    append (most are dead code after an unreachable trailing delay-slot
    dup -- harmless by construction; the reachable ones are the real
    fixes). Zero game bytes involved: pure source-to-source mend of
-   out-of-tree generated C, in OUT_DIR only.
+   out-of-tree generated C, in OUT_DIR only. The same pass retains the
+   native function-entry observer required by release evidence. The repair is
+   explicitly WM2000-only; the shared default used by other generated-C
+   consumers performs normalization and entry instrumentation without adding
+   successor calls.
 
 **Result:** the demo frame survives. Boot now runs to gfx task #26+
 (previous frontier: crash after #7), with real scene geometry growing

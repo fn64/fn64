@@ -530,9 +530,9 @@ fn interpreter_matches_aot_bank_runner_on_ordinary_programs() {
     let source = format!(
         r#"#![allow(unused_imports)]
 use fn64_recomp_rs::{{
-    run_bank, BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeCatalog, CodeSpan, CpuFault,
-    CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError,
-    Rdram, RecompContext,
+    run_bank, BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeCatalog, CodeSpan,
+    CpuException, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc,
+    InstructionBudget, ProgramError, Rdram, RecompContext,
 }};
 
 {emitted}
@@ -541,8 +541,8 @@ type AotRunner = fn(ExecutionKey, InstructionBudget, &mut RecompContext, &mut Rd
 
 /// A comparable snapshot of all *observable* architectural state. FPU register
 /// bits and FCSR are private and untouched by this integer/control/memory slice,
-/// so the observable set (GPRs, HI/LO, COP0 Count/Compare/cond, FPU cond flag)
-/// plus the full RDRAM image is the complete differential surface here.
+/// so the observable set (GPRs, HI/LO, COP0 Count/Compare/Random/cond, FPU cond
+/// flag) plus the full RDRAM image is the complete differential surface here.
 #[derive(PartialEq, Eq, Debug)]
 struct State {{
     gprs: [u64; 32],
@@ -550,6 +550,7 @@ struct State {{
     lo: u64,
     cop0_count: u32,
     cop0_compare: u32,
+    cop0_random: u32,
     cop0_cond: bool,
     fpu_cond: bool,
     mem: Vec<u8>,
@@ -562,6 +563,7 @@ fn snapshot(ctx: &RecompContext, mem: &[u8]) -> State {{
         lo: ctx.lo,
         cop0_count: ctx.cop0_count,
         cop0_compare: ctx.cop0_compare,
+        cop0_random: ctx.read_cop0(1),
         cop0_cond: ctx.cop0_cond,
         fpu_cond: ctx.fpu_cond,
         mem: mem.to_vec(),

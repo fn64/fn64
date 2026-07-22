@@ -33,24 +33,32 @@
 //! is snapshotted before a delay slot that overwrites the source register), the
 //! `j self`/`b self` cooperative [`BlockExit::Yield`], deterministic
 //! instruction-budget [`BlockExit::Checkpoint`]s that never split a branch/delay
-//! pair, and a guest memory access outside backed RDRAM as a typed
-//! [`CpuFaultKind::MemoryFault`] reusing the U4 `Rdram::try_*` accessors.
+//! pair, canonical 32-bit data translation through recorded TLB entries,
+//! precise aligned-memory AdEL/AdES plus TLB refill/invalid/modified faults,
+//! and an access outside owned backing as a typed
+//! [`CpuFaultKind::MemoryFault`] reusing the U4 checked `Rdram` accessors.
 //!
 //! Explicitly OUT (each a loud [`StepFault::Unsupported`] naming the opcode, the
 //! same frontier the AOT lane leaves open — see `Still open in U4` in
-//! `docs/UNIVERSAL-RUNTIME-PLAN.md`): the entire COP1/FPU environment, COP0
-//! (Count/Compare included — modeled by the AOT lane but not yet by this slice),
-//! COP2, TLB/`ERET`, `SYSCALL`/`BREAK`, and the conditional trap ops. Precise
-//! VR4300 exception vectoring, `BadVAddr`/`EPC`/`Cause`, TLB-miss vs.
-//! address-error, and alignment (`AdEL`/`AdES`) faulting are likewise absent, as
-//! in the AOT lane's first U4 slice.
+//! `docs/UNIVERSAL-RUNTIME-PLAN.md`): the entire COP1/FPU environment, COP2,
+//! 64-bit TLB translation, `ERET`, `SYSCALL`/`BREAK`, and the
+//! conditional trap ops.
+//! Canonical 32-bit instruction translation is supplied by the one-unit
+//! [`crate::fetch::run_mapped_bank`] wrapper, which fetches by physical identity
+//! before constructing this interpreter's execution-local virtual view.
+//! Modeled 32-bit COP0 moves, the inclusive Random/Wired instruction countdown,
+//! and `TLBWI`/`TLBWR`/`TLBR`/`TLBP` share the typed context with the arbitrary-PC
+//! AOT lane. The outer `BlockProgram` dispatcher applies the same typed CPU
+//! faults to CP0 and selects the guest exception vector in either lane.
 
 use crate::decoder::{decode, Instruction};
 use crate::execution::{
-    BankId, BlockExit, BlockRun, CodeCatalog, CpuFault, CpuFaultKind, ExecutionKey, GuestPc,
-    InstructionBudget,
+    BankId, BlockExit, BlockRun, CodeCatalog, CpuException, CpuFault, CpuFaultKind, ExecutionKey,
+    GuestPc, InstructionBudget,
 };
-use crate::runtime::{Rdram, RecompContext};
+use crate::runtime::{
+    DataAccessError, DataAccessKind, Rdram, RecompContext, TranslatedDataAddress,
+};
 
 /// A hardware-register (KSEG1 MMIO) access the interpreter recognizes as
 /// *not* backed RDRAM and routes to a modeled device instead of faulting.
@@ -171,8 +179,18 @@ enum Step {
 /// unsupported-opcode coverage boundary. Both are typed; neither panics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StepFault {
-    Cpu(CpuFault),
+    Cpu { fault: CpuFault, attempted: u32 },
     Unsupported(UnsupportedOp),
+}
+
+/// Precise architectural location of one straight instruction. Keeping the
+/// branch owner with the delay-slot PC prevents a memory helper from
+/// accidentally reporting the delay PC as EPC or clearing Cause.BD.
+#[derive(Clone, Copy)]
+struct FaultSite {
+    pc: u32,
+    epc: u32,
+    branch_delay: bool,
 }
 
 /// Run one admitted immutable bank (identified by `bank` within `catalog`) as
@@ -217,13 +235,91 @@ pub fn run_bank_with_mmio(
     mem: &mut Rdram<'_>,
     port: &mut dyn MmioPort,
 ) -> Result<BlockRun, UnsupportedOp> {
-    let interp = Interp { catalog, bank };
+    let interp = Interp {
+        instructions: catalog,
+        bank,
+    };
     interp.run(entry, budget, ctx, mem, port)
 }
 
-/// The interpreter bound to one immutable bank inside a catalog.
+trait InstructionSource {
+    fn resolve(&self, key: ExecutionKey) -> Result<u32, CpuFault>;
+}
+
+impl InstructionSource for CodeCatalog {
+    fn resolve(&self, key: ExecutionKey) -> Result<u32, CpuFault> {
+        CodeCatalog::resolve(self, key).map(|resolved| resolved.word)
+    }
+}
+
+struct InstructionUnit<'a> {
+    bank: BankId,
+    entry: GuestPc,
+    words: &'a [u32],
+}
+
+impl InstructionSource for InstructionUnit<'_> {
+    fn resolve(&self, key: ExecutionKey) -> Result<u32, CpuFault> {
+        if key.bank != self.bank {
+            return Err(CpuFault {
+                at: key,
+                kind: CpuFaultKind::UnknownBank,
+            });
+        }
+        if !key.pc.is_instruction_aligned() {
+            return Err(CpuFault::instruction_address_error(key));
+        }
+        let index = self
+            .words
+            .iter()
+            .enumerate()
+            .find(|(index, _)| {
+                self.entry.get().wrapping_add(
+                    u32::try_from(*index).expect("instruction unit index exceeds u32") * 4,
+                ) == key.pc.get()
+            })
+            .map(|(index, _)| index);
+        index.map(|index| self.words[index]).ok_or(CpuFault {
+            at: key,
+            kind: CpuFaultKind::UnmappedPc {
+                bank_start: self.entry.get(),
+                bank_end: self.entry.get().wrapping_add(self.words.len() as u32 * 4),
+            },
+        })
+    }
+}
+
+/// Run one already-admitted mapped instruction unit without imposing a
+/// non-wrapping virtual-span geometry on the architectural 32-bit PC.
+pub(crate) fn run_instruction_unit(
+    bank: BankId,
+    entry: GuestPc,
+    words: &[u32],
+    budget: InstructionBudget,
+    ctx: &mut RecompContext,
+    mem: &mut Rdram<'_>,
+) -> Result<BlockRun, UnsupportedOp> {
+    assert!(
+        matches!(words.len(), 1 | 2),
+        "mapped instruction unit must contain one straight word or one branch/delay pair"
+    );
+    let instructions = InstructionUnit { bank, entry, words };
+    let interp = Interp {
+        instructions: &instructions,
+        bank,
+    };
+    interp.run(
+        ExecutionKey::new(bank, entry),
+        budget,
+        ctx,
+        mem,
+        &mut NoMmio,
+    )
+}
+
+/// The interpreter bound to one immutable instruction source.
 struct Interp<'a> {
-    catalog: &'a CodeCatalog,
+    instructions: &'a dyn InstructionSource,
     bank: BankId,
 }
 
@@ -301,18 +397,29 @@ impl Interp<'_> {
                     Ok(Step::Fallthrough { .. }) => {
                         unreachable!("a control transfer never falls through")
                     }
-                    Err(StepFault::Cpu(fault)) => {
+                    Err(StepFault::Cpu { fault, attempted }) => {
                         // Delay-slot fault annuls the branch: neither the branch
                         // nor the slot retire, matching MemFault::Fault's
                         // `(executed - 2)` accounting in the AOT lane.
-                        return Ok(BlockRun::new(BlockExit::Fault(fault), executed));
+                        return Ok(BlockRun::new(BlockExit::Fault(fault), executed + attempted));
                     }
                     Err(StepFault::Unsupported(op)) => return Err(op),
                 }
             }
 
             // Ordinary straight-line instruction.
-            match self.straight(pc, word, instr, ctx, mem, port) {
+            match self.straight(
+                FaultSite {
+                    pc,
+                    epc: pc,
+                    branch_delay: false,
+                },
+                word,
+                instr,
+                ctx,
+                mem,
+                port,
+            ) {
                 Ok(Step::Fallthrough { next, retired }) => {
                     executed += retired;
                     if self.contains(next) {
@@ -338,8 +445,8 @@ impl Interp<'_> {
                 Ok(Step::Exit { .. }) => {
                     unreachable!("a straight-line instruction never produces a transfer exit")
                 }
-                Err(StepFault::Cpu(fault)) => {
-                    return Ok(BlockRun::new(BlockExit::Fault(fault), executed));
+                Err(StepFault::Cpu { fault, attempted }) => {
+                    return Ok(BlockRun::new(BlockExit::Fault(fault), executed + attempted));
                 }
                 Err(StepFault::Unsupported(op)) => return Err(op),
             }
@@ -349,9 +456,7 @@ impl Interp<'_> {
     /// Resolve an aligned in-bank PC to its instruction word, or the typed
     /// fault the AOT runner's `_ =>` arm would raise (an unmapped hole).
     fn resolve(&self, pc: u32) -> Result<u32, CpuFault> {
-        self.catalog
-            .resolve(self.key(pc))
-            .map(|resolved| resolved.word)
+        self.instructions.resolve(self.key(pc))
     }
 
     fn key(&self, pc: u32) -> ExecutionKey {
@@ -361,7 +466,7 @@ impl Interp<'_> {
     /// Whether `target` lands inside this bank's admitted (executable) words.
     /// A bounding-range hole is NOT admitted, mirroring the sparse AOT domain.
     fn contains(&self, target: u32) -> bool {
-        self.catalog.resolve(self.key(target)).is_ok()
+        self.instructions.resolve(self.key(target)).is_ok()
     }
 
     /// A statically-known in-bank target is a proven [`BlockExit::Transfer`];
@@ -413,6 +518,12 @@ impl Interp<'_> {
         let fallthrough = delay_pc.wrapping_add(4);
         let target = branch_target(&instr, pc);
 
+        // Random is coupled to explicit arbitrary-PC instruction boundaries.
+        // The branch executes before its delay instruction; a taken delay
+        // observes the decremented value, while an annulled likely slot still
+        // consumes the block lane's second deterministic instruction unit.
+        ctx.advance_cop0_random(1);
+
         // Run the delay slot as an ordinary instruction. It may fault (memory)
         // or be unsupported; either annuls the branch and propagates typed. The
         // delay slot is itself an ordinary instruction, so it too may be an MMIO
@@ -421,7 +532,18 @@ impl Interp<'_> {
                          mem: &mut Rdram<'_>,
                          port: &mut dyn MmioPort|
          -> Result<(), StepFault> {
-            match self.straight(delay_pc, delay_word, delay, ctx, mem, port)? {
+            match self.straight(
+                FaultSite {
+                    pc: delay_pc,
+                    epc: pc,
+                    branch_delay: true,
+                },
+                delay_word,
+                delay,
+                ctx,
+                mem,
+                port,
+            )? {
                 Step::Fallthrough { .. } => Ok(()),
                 Step::Exit { .. } => {
                     unreachable!("a delay-slot instruction is never itself a control transfer")
@@ -477,6 +599,7 @@ impl Interp<'_> {
                         run_delay(ctx, mem, port)?;
                         self.proven_or_resolved(target)
                     } else {
+                        ctx.advance_cop0_random(1);
                         self.proven_or_resolved(fallthrough)
                     }
                 } else {
@@ -491,6 +614,7 @@ impl Interp<'_> {
                     run_delay(ctx, mem, port)?;
                     self.proven_or_resolved(target)
                 } else {
+                    ctx.advance_cop0_random(1);
                     self.proven_or_resolved(fallthrough)
                 }
             }
@@ -512,31 +636,50 @@ impl Interp<'_> {
     /// Semantics mirror `emit_straight` exactly (the AOT lane is the oracle).
     fn straight(
         &self,
-        pc: u32,
+        site: FaultSite,
         word: u32,
         instr: Instruction,
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
         port: &mut dyn MmioPort,
     ) -> Result<Step, StepFault> {
-        let next = pc.wrapping_add(4);
+        let next = site.pc.wrapping_add(4);
         let ok = Ok(Step::Fallthrough { next, retired: 1 });
-        let mem_fault = |addr: u64| {
-            StepFault::Cpu(CpuFault {
-                at: self.key(pc),
-                kind: CpuFaultKind::MemoryFault { addr },
-            })
+        let mem_fault = |error: DataAccessError| {
+            let attempted = u32::from(error.is_architectural_exception())
+                * if site.branch_delay { 2 } else { 1 };
+            StepFault::Cpu {
+                fault: CpuFault {
+                    at: self.key(site.pc),
+                    kind: error.into_cpu_fault_kind(GuestPc::new(site.epc), site.branch_delay),
+                },
+                attempted,
+            }
+        };
+        let address_fault = |exception, addr: u64| StepFault::Cpu {
+            fault: CpuFault {
+                at: self.key(site.pc),
+                kind: CpuFaultKind::Exception {
+                    exception,
+                    epc: GuestPc::new(site.epc),
+                    branch_delay: site.branch_delay,
+                    instruction_code: 0,
+                    bad_vaddr: Some(addr),
+                    coprocessor: None,
+                },
+            },
+            attempted: if site.branch_delay { 2 } else { 1 },
         };
         let unsupported = || {
             StepFault::Unsupported(UnsupportedOp {
-                at: self.key(pc),
+                at: self.key(site.pc),
                 instruction: instr,
                 word,
             })
         };
 
-        // The MMIO seam: a word load/store is offered to the device `port`
-        // FIRST. The port is the sole authority on which effective addresses are
+        // The MMIO seam: after architectural alignment/TLB checks, a word
+        // load/store is offered to the device `port`. The port is the sole authority on which effective addresses are
         // modeled registers (`MmioOutcome::NotMmio` for everything else), so this
         // diverts ONLY register accesses to the modeled device and leaves every
         // other address — backed RDRAM or an out-of-RDRAM hole — to
@@ -546,23 +689,70 @@ impl Interp<'_> {
         // routed here (the one proven device-word interaction); every other
         // width/op stays on the plain RDRAM path — a deliberately narrow first
         // slice (`docs/UNIVERSAL-RUNTIME-PLAN.md` U2).
+        if let Some((base, off, alignment, exception)) = aligned_memory_access(instr) {
+            let addr = Rdram::eff_addr(ctx.r(base), off);
+            if addr & (alignment - 1) != 0 {
+                return Err(address_fault(exception, addr));
+            }
+        }
+
         match instr {
             Instruction::Lw { rt, base, off } => {
                 let addr = Rdram::eff_addr(ctx.r(base), off);
-                match port.read_w(addr) {
+                let port_addr = match ctx
+                    .translate_data_address(addr, DataAccessKind::Load)
+                    .map_err(mem_fault)?
+                {
+                    TranslatedDataAddress::Direct(address) => Some(address),
+                    TranslatedDataAddress::DirectPhysical(physical)
+                    | TranslatedDataAddress::Mapped(physical)
+                        if physical < 0x2000_0000 =>
+                    {
+                        Some(0xffff_ffff_a000_0000 | u64::from(physical))
+                    }
+                    TranslatedDataAddress::DirectPhysical(_) | TranslatedDataAddress::Mapped(_) => {
+                        None
+                    }
+                };
+                match port_addr.map_or(MmioOutcome::NotMmio, |address| port.read_w(address)) {
                     MmioOutcome::Handled(v) => {
                         ctx.set_r32(rt, v as i32);
+                        ctx.advance_cop0_random(1);
                         return ok;
                     }
-                    MmioOutcome::Fault { addr } => return Err(mem_fault(addr)),
+                    MmioOutcome::Fault { .. } => {
+                        return Err(mem_fault(DataAccessError::Unbacked { vaddr: addr }));
+                    }
                     MmioOutcome::NotMmio => {}
                 }
             }
             Instruction::Sw { rt, base, off } => {
                 let addr = Rdram::eff_addr(ctx.r(base), off);
-                match port.write_w(addr, ctx.r_u32(rt)) {
-                    MmioOutcome::Handled(()) => return ok,
-                    MmioOutcome::Fault { addr } => return Err(mem_fault(addr)),
+                let port_addr = match ctx
+                    .translate_data_address(addr, DataAccessKind::Store)
+                    .map_err(mem_fault)?
+                {
+                    TranslatedDataAddress::Direct(address) => Some(address),
+                    TranslatedDataAddress::DirectPhysical(physical)
+                    | TranslatedDataAddress::Mapped(physical)
+                        if physical < 0x2000_0000 =>
+                    {
+                        Some(0xffff_ffff_a000_0000 | u64::from(physical))
+                    }
+                    TranslatedDataAddress::DirectPhysical(_) | TranslatedDataAddress::Mapped(_) => {
+                        None
+                    }
+                };
+                match port_addr.map_or(MmioOutcome::NotMmio, |address| {
+                    port.write_w(address, ctx.r_u32(rt))
+                }) {
+                    MmioOutcome::Handled(()) => {
+                        ctx.advance_cop0_random(1);
+                        return ok;
+                    }
+                    MmioOutcome::Fault { .. } => {
+                        return Err(mem_fault(DataAccessError::Unbacked { vaddr: addr }));
+                    }
                     MmioOutcome::NotMmio => {}
                 }
             }
@@ -570,6 +760,7 @@ impl Interp<'_> {
         }
 
         exec_straight(instr, ctx, mem, &mem_fault, &unsupported)?;
+        ctx.advance_cop0_random(1);
         ok
     }
 }
@@ -623,6 +814,29 @@ fn branch_condition(instr: &Instruction, ctx: &RecompContext) -> Option<bool> {
     })
 }
 
+fn aligned_memory_access(instr: Instruction) -> Option<(u8, i16, u64, CpuException)> {
+    use Instruction::*;
+    Some(match instr {
+        Lh { base, off, .. } | Lhu { base, off, .. } => {
+            (base, off, 2, CpuException::AddressErrorLoad)
+        }
+        Lw { base, off, .. } | Lwu { base, off, .. } | Ll { base, off, .. } => {
+            (base, off, 4, CpuException::AddressErrorLoad)
+        }
+        Ld { base, off, .. } | Lld { base, off, .. } => {
+            (base, off, 8, CpuException::AddressErrorLoad)
+        }
+        Sh { base, off, .. } => (base, off, 2, CpuException::AddressErrorStore),
+        Sw { base, off, .. } | Sc { base, off, .. } => {
+            (base, off, 4, CpuException::AddressErrorStore)
+        }
+        Sd { base, off, .. } | Scd { base, off, .. } => {
+            (base, off, 8, CpuException::AddressErrorStore)
+        }
+        _ => return None,
+    })
+}
+
 /// Execute one straight-line instruction, driving `ctx`/`mem` through the SAME
 /// typed accessors the AOT emitter open-codes. `mem_fault(addr)` builds the
 /// typed fault for an out-of-bounds effective address; `unsupported()` builds
@@ -635,7 +849,7 @@ fn exec_straight(
     instr: Instruction,
     ctx: &mut RecompContext,
     mem: &mut Rdram<'_>,
-    mem_fault: &dyn Fn(u64) -> StepFault,
+    mem_fault: &dyn Fn(DataAccessError) -> StepFault,
     unsupported: &dyn Fn() -> StepFault,
 ) -> Result<(), StepFault> {
     use Instruction::*;
@@ -714,74 +928,87 @@ fn exec_straight(
 
         // --- Loads ---
         Lw { rt, base, off } => {
-            let v = mem.try_load_w(eff(ctx, base, off)).map_err(mem_fault)?;
+            let v = mem
+                .try_load_w_translated(ctx, eff(ctx, base, off))
+                .map_err(mem_fault)?;
             ctx.set_r32(rt, v);
         }
         Lwu { rt, base, off } => {
-            let v = mem.try_load_w(eff(ctx, base, off)).map_err(mem_fault)?;
+            let v = mem
+                .try_load_w_translated(ctx, eff(ctx, base, off))
+                .map_err(mem_fault)?;
             ctx.set_r(rt, v as u32 as u64);
         }
         Ll { rt, base, off } => {
             let a = eff(ctx, base, off);
-            let v = mem.try_load_w(a).map_err(mem_fault)?;
+            let v = mem.try_load_w_translated(ctx, a).map_err(mem_fault)?;
             ctx.set_r32(rt, v);
             ctx.set_ll_reservation(a, 4);
         }
         Lh { rt, base, off } => {
-            let v = mem.try_load_h(eff(ctx, base, off)).map_err(mem_fault)?;
+            let v = mem
+                .try_load_h_translated(ctx, eff(ctx, base, off))
+                .map_err(mem_fault)?;
             ctx.set_r32(rt, v as i32);
         }
         Lhu { rt, base, off } => {
-            let v = mem.try_load_hu(eff(ctx, base, off)).map_err(mem_fault)?;
+            let v = mem
+                .try_load_hu_translated(ctx, eff(ctx, base, off))
+                .map_err(mem_fault)?;
             ctx.set_r(rt, v as u64);
         }
         Lb { rt, base, off } => {
-            let v = mem.try_load_b(eff(ctx, base, off)).map_err(mem_fault)?;
+            let v = mem
+                .try_load_b_translated(ctx, eff(ctx, base, off))
+                .map_err(mem_fault)?;
             ctx.set_r32(rt, v as i32);
         }
         Lbu { rt, base, off } => {
-            let v = mem.try_load_bu(eff(ctx, base, off)).map_err(mem_fault)?;
+            let v = mem
+                .try_load_bu_translated(ctx, eff(ctx, base, off))
+                .map_err(mem_fault)?;
             ctx.set_r(rt, v as u64);
         }
         Lwl { rt, base, off } => {
             let v = mem
-                .try_load_wl(ctx.r(rt), eff(ctx, base, off))
+                .try_load_wl_translated(ctx, ctx.r(rt), eff(ctx, base, off))
                 .map_err(mem_fault)?;
             ctx.set_r32(rt, v);
         }
         Lwr { rt, base, off } => {
             let v = mem
-                .try_load_wr(ctx.r(rt), eff(ctx, base, off))
+                .try_load_wr_translated(ctx, ctx.r(rt), eff(ctx, base, off))
                 .map_err(mem_fault)?;
             ctx.set_r32(rt, v);
         }
 
         // --- Stores ---
         Sw { rt, base, off } => {
-            mem.try_store_w(eff(ctx, base, off), ctx.r_u32(rt))
+            mem.try_store_w_translated(ctx, eff(ctx, base, off), ctx.r_u32(rt))
                 .map_err(mem_fault)?;
         }
         Sh { rt, base, off } => {
-            mem.try_store_h(eff(ctx, base, off), ctx.r_u32(rt) as u16)
+            mem.try_store_h_translated(ctx, eff(ctx, base, off), ctx.r_u32(rt) as u16)
                 .map_err(mem_fault)?;
         }
         Sb { rt, base, off } => {
-            mem.try_store_b(eff(ctx, base, off), ctx.r_u32(rt) as u8)
+            mem.try_store_b_translated(ctx, eff(ctx, base, off), ctx.r_u32(rt) as u8)
                 .map_err(mem_fault)?;
         }
         Swl { rt, base, off } => {
-            mem.try_store_wl(eff(ctx, base, off), ctx.r_u32(rt))
+            mem.try_store_wl_translated(ctx, eff(ctx, base, off), ctx.r_u32(rt))
                 .map_err(mem_fault)?;
         }
         Swr { rt, base, off } => {
-            mem.try_store_wr(eff(ctx, base, off), ctx.r_u32(rt))
+            mem.try_store_wr_translated(ctx, eff(ctx, base, off), ctx.r_u32(rt))
                 .map_err(mem_fault)?;
         }
         Sc { rt, base, off } => {
             let a = eff(ctx, base, off);
             let v = ctx.r_u32(rt);
+            Rdram::check_store_translation(ctx, a).map_err(mem_fault)?;
             if ctx.take_ll_reservation(a, 4) {
-                mem.try_store_w(a, v).map_err(mem_fault)?;
+                mem.try_store_w_translated(ctx, a, v).map_err(mem_fault)?;
                 ctx.set_r(rt, 1);
             } else {
                 ctx.set_r(rt, 0);
@@ -842,51 +1069,78 @@ fn exec_straight(
 
         // --- Doubleword loads ---
         Ld { rt, base, off } => {
-            let v = mem.try_load_d(eff(ctx, base, off)).map_err(mem_fault)?;
+            let v = mem
+                .try_load_d_translated(ctx, eff(ctx, base, off))
+                .map_err(mem_fault)?;
             ctx.set_r(rt, v);
         }
         Lld { rt, base, off } => {
             let a = eff(ctx, base, off);
-            let v = mem.try_load_d(a).map_err(mem_fault)?;
+            let v = mem.try_load_d_translated(ctx, a).map_err(mem_fault)?;
             ctx.set_r(rt, v);
             ctx.set_ll_reservation(a, 8);
         }
         Ldl { rt, base, off } => {
             let v = mem
-                .try_load_dl(ctx.r(rt), eff(ctx, base, off))
+                .try_load_dl_translated(ctx, ctx.r(rt), eff(ctx, base, off))
                 .map_err(mem_fault)?;
             ctx.set_r(rt, v);
         }
         Ldr { rt, base, off } => {
             let v = mem
-                .try_load_dr(ctx.r(rt), eff(ctx, base, off))
+                .try_load_dr_translated(ctx, ctx.r(rt), eff(ctx, base, off))
                 .map_err(mem_fault)?;
             ctx.set_r(rt, v);
         }
 
         // --- Doubleword stores ---
         Sd { rt, base, off } => {
-            mem.try_store_d(eff(ctx, base, off), ctx.r_u64(rt))
+            mem.try_store_d_translated(ctx, eff(ctx, base, off), ctx.r_u64(rt))
                 .map_err(mem_fault)?;
         }
         Sdl { rt, base, off } => {
-            mem.try_store_dl(eff(ctx, base, off), ctx.r_u64(rt))
+            mem.try_store_dl_translated(ctx, eff(ctx, base, off), ctx.r_u64(rt))
                 .map_err(mem_fault)?;
         }
         Sdr { rt, base, off } => {
-            mem.try_store_dr(eff(ctx, base, off), ctx.r_u64(rt))
+            mem.try_store_dr_translated(ctx, eff(ctx, base, off), ctx.r_u64(rt))
                 .map_err(mem_fault)?;
         }
         Scd { rt, base, off } => {
             let a = eff(ctx, base, off);
             let v = ctx.r_u64(rt);
+            Rdram::check_store_translation(ctx, a).map_err(mem_fault)?;
             if ctx.take_ll_reservation(a, 8) {
-                mem.try_store_d(a, v).map_err(mem_fault)?;
+                mem.try_store_d_translated(ctx, a, v).map_err(mem_fault)?;
                 ctx.set_r(rt, 1);
             } else {
                 ctx.set_r(rt, 0);
             }
         }
+
+        // --- Modeled COP0/TLB management ---
+        Mfc0 { rt, cop0d } => match cop0d {
+            0 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 20 | 30 => {
+                ctx.set_r32(rt, ctx.read_cop0(cop0d) as i32);
+            }
+            _ => return Err(unsupported()),
+        },
+        Mtc0 { rt, cop0d } => match cop0d {
+            0 | 2 | 3 | 4 | 5 | 6 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30 => {
+                ctx.write_cop0(cop0d, ctx.r_u32(rt));
+            }
+            _ => return Err(unsupported()),
+        },
+        Dmfc0 { rt, cop0d } if matches!(cop0d, 8 | 10 | 20) => {
+            ctx.set_r(rt, ctx.read_cop0_64(cop0d));
+        }
+        Dmtc0 { rt, cop0d } if matches!(cop0d, 10 | 20) => {
+            ctx.write_cop0_64(cop0d, ctx.r_u64(rt));
+        }
+        Tlbwi => ctx.tlbwi_record(),
+        Tlbwr => ctx.tlbwr_record(),
+        Tlbr => ctx.tlbr_read(),
+        Tlbp => ctx.tlbp_probe(),
 
         // --- Cache / sync: no-ops on a coherent host rdram (as the AOT lane) ---
         Cache { .. } | Sync => {}
@@ -979,14 +1233,111 @@ mod tests {
 
     #[test]
     fn unsupported_opcode_is_a_loud_typed_fault_not_a_panic_or_nop() {
-        // mtc0 $v0,$Status(12) is privileged/out of scope: decoded, then a typed
-        // unsupported fault naming the op, exactly where the AOT lane panics.
-        let mtc0_status = 0x4082_6000; // MTC0 rt=2, rd=12
-        let catalog = catalog_of(&[mtc0_status, 0x03E0_0008, 0x0000_0000]);
+        // DMFC0 remains outside this slice: decoded, then a typed unsupported
+        // fault naming the op, exactly where the AOT lane traps.
+        let dmfc0 = 0x4022_4800;
+        let catalog = catalog_of(&[dmfc0, 0x03E0_0008, 0x0000_0000]);
         let mut ctx = RecompContext::new();
         let err = run(&catalog, VA, 8, &mut ctx).unwrap_err();
         assert_eq!(err.at, ExecutionKey::new(BANK, GuestPc::new(VA)));
-        assert!(matches!(err.instruction, Instruction::Mtc0 { .. }));
+        assert_eq!(err.instruction, Instruction::Dmfc0 { rt: 2, cop0d: 9 });
+    }
+
+    #[test]
+    fn random_and_tlbwr_follow_interpreter_instruction_order() {
+        let words = [
+            0x2402_001d, // addiu $v0,$zero,29
+            0x4082_3000, // mtc0  $v0,Wired: Random resets to 31, then advances
+            0x4200_0006, // tlbwr: samples 30, then advances to 29
+            0x4003_0800, // mfc0  $v1,Random: observes 29
+            0x03e0_0008, // jr $ra
+            0x0000_0000, // nop
+        ];
+        let catalog = catalog_of(&words);
+        let mut ctx = RecompContext::new();
+        ctx.set_r(31, 0x8000_9000);
+        ctx.cop0_entry_hi = 0x1234_500a;
+        ctx.cop0_entry_lo0 = 0x46;
+        ctx.cop0_entry_lo1 = 0x86;
+        ctx.cop0_page_mask = 0x6000;
+
+        let result = run(&catalog, VA, words.len() as u32, &mut ctx).unwrap();
+        assert_eq!(result.instructions, words.len() as u32);
+        assert_eq!(ctx.r_u32(3), 29);
+        assert_eq!(ctx.tlb_entries[30].entry_hi, 0x1234_500a);
+        assert_eq!(ctx.tlb_entries[30].entry_lo0, 0x46);
+        assert_eq!(ctx.tlb_entries[30].entry_lo1, 0x86);
+        assert_eq!(ctx.tlb_entries[30].page_mask, 0x6000);
+        assert_eq!(ctx.read_cop0(1), 29);
+    }
+
+    #[test]
+    fn annulled_likely_slot_consumes_the_runners_second_random_unit() {
+        let words = [
+            0x5002_0001, // beql $zero,$v0,+1: not taken when v0=1
+            0x2403_0077, // addiu $v1,$zero,0x77: annulled
+            0x4004_0800, // mfc0 $a0,Random
+        ];
+        let catalog = catalog_of(&words);
+        let mut ctx = RecompContext::new();
+        ctx.set_r(2, 1);
+
+        let branch = run(&catalog, VA, 3, &mut ctx).unwrap();
+        assert_eq!(branch.instructions, 2);
+        assert_eq!(
+            branch.exit,
+            BlockExit::Transfer(ExecutionKey::new(BANK, GuestPc::new(VA + 8)))
+        );
+        assert_eq!(
+            ctx.r_u32(3),
+            0,
+            "likely delay instruction must stay annulled"
+        );
+        let sample = run(&catalog, VA + 8, 2, &mut ctx).unwrap();
+        assert_eq!(sample.instructions, 1);
+        assert_eq!(
+            ctx.r_u32(4),
+            29,
+            "branch plus annulled charged unit advance Random twice"
+        );
+        assert_eq!(ctx.read_cop0(1), 28, "MFC0 retires after sampling Random");
+    }
+
+    #[test]
+    fn modeled_cop0_and_indexed_tlb_management_execute_in_the_interpreter() {
+        let mtc0 = |rt: u32, rd: u32| 0x4080_0000 | (rt << 16) | (rd << 11);
+        let mfc0 = |rt: u32, rd: u32| 0x4000_0000 | (rt << 16) | (rd << 11);
+        let words = [
+            mtc0(2, 10), // EntryHi
+            mtc0(3, 2),  // EntryLo0
+            mtc0(4, 3),  // EntryLo1
+            mtc0(5, 5),  // PageMask
+            mtc0(6, 0),  // Index
+            0x4200_0002, // TLBWI
+            mtc0(7, 10), // probe EntryHi
+            0x4200_0008, // TLBP
+            mfc0(8, 0),  // matched Index
+            0x4200_0001, // TLBR
+            mfc0(9, 10), // reloaded EntryHi
+            0x03e0_0008, // jr $ra
+            0,
+        ];
+        let catalog = catalog_of(&words);
+        let mut ctx = RecompContext::new();
+        ctx.set_r(2, 0x1234_400a);
+        ctx.set_r(3, 0x0000_0046);
+        ctx.set_r(4, 0x0000_0086);
+        ctx.set_r(5, 0x0000_6000);
+        ctx.set_r(6, 7);
+        ctx.set_r(7, 0x1234_200a);
+
+        let result = run(&catalog, VA, words.len() as u32, &mut ctx).unwrap();
+        assert_eq!(result.instructions, words.len() as u32);
+        assert_eq!(ctx.r_u32(8), 7);
+        assert_eq!(ctx.r_u32(9), 0x1234_400a);
+        assert_eq!(ctx.cop0_page_mask, 0x0000_6000);
+        assert_eq!(ctx.cop0_entry_lo0, 0x0000_0046);
+        assert_eq!(ctx.cop0_entry_lo1, 0x0000_0086);
     }
 
     #[test]

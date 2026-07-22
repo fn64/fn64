@@ -1,0 +1,9 @@
+---
+source: crates/fn64-render-reference/tests/render_snapshot.rs
+expression: "framebuffer_digest(fb, clear)"
+---
+dims: 64x64
+non_clear_pixels: 1200
+fb_fnv1a: 6b46acd0846e8b3b
+centroid_rgba: [81, 86, 87, 255]
+corner_rgba: [10, 10, 10, 255]

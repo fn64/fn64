@@ -37,6 +37,7 @@ pub mod drive;
 pub mod emit;
 pub mod execution;
 pub mod fallback;
+pub mod fetch;
 pub mod interp;
 pub mod module;
 pub mod runtime;
@@ -44,23 +45,40 @@ pub mod runtime;
 pub use decoder::{decode, Instruction};
 pub use drive::ExecutorAction;
 pub use emit::{
-    classify_bank_words, emit_bank_runner, emit_function, emit_function_resolved,
-    emit_sparse_bank_runner, BankBlockInput, BankInput, BankWordCatalog, BankWordKind, BankWordRun,
-    CallResolver, CallTarget, FuncInput, NullResolver, SparseBankInput,
+    classify_bank_words, emit_bank_runner, emit_bank_runner_with_host_calls, emit_function,
+    emit_function_resolved, emit_sparse_bank_runner, emit_sparse_bank_runner_function,
+    emit_sparse_bank_runner_function_with_host_calls, emit_sparse_bank_runner_with_host_calls,
+    BankBlockInput, BankInput, BankWordCatalog, BankWordKind, BankWordRun, CallResolver,
+    CallTarget, FuncInput, NullResolver, SparseBankInput,
 };
 pub use execution::{
-    dispatch_until_boundary, BankError, BankId, BlockExit, BlockProgram, BlockRun, BlockRunner,
-    CodeBank, CodeCatalog, CodeSpan, CpuFault, CpuFaultKind, DispatchError, DispatchRun,
-    ExecutionKey, GeneratedBankFn, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError,
-    ResolvedInstruction, TransferResolver,
+    dispatch_until_boundary, enter_pending_interrupt, BankError, BankId, BlockExit, BlockProgram,
+    BlockProgramEvidenceSnapshot, BlockRun, BlockRunner, CallResolution, CodeBank,
+    CodeBankEvidenceSnapshot, CodeCatalog, CodeSpan, CodeSpanEvidenceSnapshot, CpuException,
+    CpuFault, CpuFaultKind, CpuInterruptLine, DispatchError, DispatchRun, ExecutableRegion,
+    ExecutionDestinationObservation, ExecutionKey, GeneratedBankFn, GeneratedBankRunner,
+    GenerationError, GuestPc, InstructionBudget, InstructionWordIdentity, ProgramArtifactIdentity,
+    ProgramError, ProgramIdentityEvidenceSnapshot, ProgramIdentitySource, ResolvedInstruction,
+    TransferResolver,
 };
 pub use fallback::{EvidenceClass, FallbackProgram, FallbackRunner};
+pub use fetch::{
+    fetch_instruction, run_mapped_bank, FetchedInstruction, InstructionFetchSite, MappedAotBlock,
+    MappedAotError, MappedAotEvidenceSnapshot, PhysicalCodeBank, PhysicalCodeBankEvidenceSnapshot,
+    PhysicalCodeCatalog, PhysicalCodeError, PhysicalCodeSpan, PhysicalCodeSpanEvidenceSnapshot,
+};
 pub use interp::{run_bank, run_bank_with_mmio, MmioOutcome, MmioPort, NoMmio, UnsupportedOp};
 pub use module::{emit_lookup_dispatcher, emit_module, ModuleFunc, SymbolTable};
 pub use runtime::{
-    call_host_or_recompiled, pause_self, resolve_host_function, round_ties_even_f32,
-    round_ties_even_f64, set_host_lookup, set_host_pause, HostLookup, HostPause, Rdram,
-    RecompContext, RecompFunc, RDRAM_LEN, RDRAM_VBASE,
+    call_host_or_recompiled, notify_function_entry, notify_guest_write, notify_non_rdp_write16,
+    pause_self, resolve_host_function, round_ties_even_f32, round_ties_even_f64,
+    set_function_entry_observer, set_host_lookup, set_host_pause, set_mmio_hooks,
+    set_unsupported_observer, set_write_observer, trap_unsupported, DataAccessError,
+    DataAccessKind, FunctionEntryObservationSchema, FunctionEntryObserver, GuestWriteEvent,
+    HostLookup, HostPause, MmioRead, MmioWrite, Rdram, RecompContext, RecompFunc, TlbEntryRaw,
+    TlbFault, TlbFaultKind, TranslatedDataAddress, TranslatedFunctionIdentity,
+    TranslatedInstructionAddress, UnsupportedObserver, WriteObserver,
+    FUNCTION_ENTRY_OBSERVATION_SCHEMA, RDRAM_LEN, RDRAM_VBASE,
 };
 
 use fn64_recomp::{AbiVersion, RecompConfig, RecompError, RecompOutput, Recompiler, RspConfig};
@@ -122,6 +140,7 @@ impl Recompiler for RsRecompiler {
             "// Whole-program: inter-function JAL/J resolve to direct Rust calls where known.\n",
         );
         body.push_str("#![allow(clippy::all, unused, non_snake_case)]\n");
+        body.push_str("pub const FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA: fn64_recomp_rs::FunctionEntryObservationSchema = fn64_recomp_rs::FUNCTION_ENTRY_OBSERVATION_SCHEMA;\n");
         body.push_str("#[allow(unused_imports)]\n");
         body.push_str(
             "use fn64_recomp_rs::{call_host_or_recompiled, pause_self, resolve_host_function, RecompContext, RecompFunc, Rdram, round_ties_even_f32, round_ties_even_f64};\n\n",

@@ -38,8 +38,10 @@ One workspace, separate crates, each publishable alone:
 | `fn64-abi` | The `extern "C"` surface recompiled code links against |
 | `fn64-boot-harness` | Shared generated-section bridge, registration callback, and RDRAM allocation for boot hosts |
 | `fn64-shell` | The executable: window, input, audio out, ROM intake |
-| `fn64-render` | Backend-agnostic render seam + the pure-Rust `ReferenceBackend` (headless CI oracle) |
-| `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/fn64/rt64) (MIT, C++) — all C++ interop quarantined here |
+| `fn64-render` | Backend-neutral render seam, content-addressed ordered microcode admission, and raw-DPC completion inspection |
+| `fn64-render-reference` | Deterministic pure-Rust `ReferenceBackend`, geometry/object decoders, software rasterizer, and VI reference path |
+| `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/fn64/rt64) (MIT, C++); all C++ interop remains quarantined here |
+| `fn64-certification` | Executable cross-backend and native RT64 behavioral evidence gates |
 | `fn64-recomp` / `fn64-recomp-rs` | The Rust-emitting recompiler and its whole-ROM driver — the `rs` lane |
 | `fn64-audio` | RSP audio ucode execution |
 | `fn64-diff` | The first-divergence comparator (pure; no I/O) |
@@ -63,6 +65,14 @@ fn64 behavior gets A/B'd against reality before the swap. The boot ladder is
 the test suite; it does not grade on a curve. What is NOT done is tracked
 honestly in `docs/ROADMAP.md` — audio is still broken (R5) and the outdoor
 gameplay eye-gate is unmet (R3b).
+
+The renderer target includes RT64's modern host features, not only stock N64
+pixels. `docs/RT64-PUBLIC-FEATURE-INVENTORY.md` is the machine-generated
+denominator: runtime settings, build capabilities, and the small subset that
+requires game/Extended-GBI cooperation are tracked separately so base-renderer
+evidence cannot silently close an enhancement claim. The exact host-control
+families and their live/recreate/game-cooperation boundaries are recorded in
+`docs/RT64-RUNTIME-CONTROLS.md`.
 
 ### Discovery corpus
 
@@ -105,10 +115,12 @@ tribal:
   runs. Concurrency fix: 20+. One green run proves nothing and we treat it
   that way.
 - **Differential testing.** Behavior changes get diffed against something that
-  actually runs: `scripts/lane-parity.sh` A/Bs our two recompiler lanes over
-  identical ROM by per-swap framebuffer SHA, `c_smoke` link-tests the ABI with
-  a real C caller, and the recompiler has a per-instruction oracle suite. Each
-  has a documented blind spot, named where it's used — a differential you can't
+  actually runs. `scripts/lane-parity.sh` first audits whether the two generated
+  callable-body sets are aligned; it currently rejects the legacy C lane as a
+  semantic arbiter, while `--observe` retains a labeled, non-authoritative
+  per-swap framebuffer comparison. `c_smoke` link-tests the ABI with a real C
+  caller, and the recompiler has per-instruction oracle suites. Each has a
+  documented blind spot in `docs/PARITY-METHOD.md` — a differential you can't
   run isn't evidence.
 - **Types carry the invariants.** One-runnable-game-thread, queue ownership,
   rdram addressing — modeled so misuse fails to compile where possible, and

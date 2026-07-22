@@ -1,7 +1,13 @@
 /target
 examples/*/target
 examples/*/target-c
+/examples/*/rs/target
+/crates/*/rs/target
+/tools/*/target
 /examples/oot-boot/rs/recompiled
+/examples/oot-boot/native/recompiled
+**/__pycache__/
+*.py[cod]
 # Agent scratch: worktrees + per-user settings. settings.local.json is
 # per-machine by design; .claude/worktrees holds live checkouts.
 /.claude/
