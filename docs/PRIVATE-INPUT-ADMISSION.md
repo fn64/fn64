@@ -2,11 +2,11 @@
 
 Status: local admission, typed program/microcode-kickoff identity checks, and
 the trusted series mechanism are wired. Representative private NTSC full-ROM
-exact-ten schema-v20 series completed on 2026-07-21, but are historical after
-v21 made observations boundary-owned and bound the unsupported-instrumentation
-denominator. Their private content remains outside the repository. Historical
-joint verification satisfied 9 of 162 requirements; current v21 credit needs
-a fresh run.
+reference and RT64 LLE/post-VI exact-ten series completed under schema v21 and
+were reverified on 2026-07-22. Their private content remains outside the
+repository. Joint verified-series matrix assessment accepted 2 scenarios and
+20 reports, satisfied 9 of 162 requirements, and retained the other 153 as
+explicit gaps.
 
 `tools/private_input_admission.py` validates private inputs before an
 Extended-GBI fixture or full-ROM release run consumes them. It never copies
@@ -523,9 +523,13 @@ This proves which pair the task named at the authoritative kickoff boundary;
 it does not independently trace every later RSP read of the data image.
 
 These checks make a valid production contract launchable. Representative
-private reference and RT64 LLE/post-VI exact-ten series completed under v20 on
-2026-07-21. They are historical mechanism evidence and must be rerun under v21;
-no current v21 private series is claimed.
+private reference and RT64 LLE/post-VI exact-ten series completed under v21 on
+2026-07-22 and were independently reverified from their retained contracts,
+runner, receipts, reports, and journals. The retained private receipts carry
+the exact semantic-report and series identities. The private-series matrix
+path accepted all 20 reports and emitted a canonical incomplete-v6
+assessment: 9 of 162 FullParityV1 requirements are satisfied and 153 remain
+explicit.
 The series receipt remains a self-hashed integrity record, not external process
 attestation; transferable provenance still requires a trusted CI/code-signing
 root over the receipt and runner.

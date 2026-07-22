@@ -279,11 +279,10 @@ data length, and data SHA equal the admitted pair. Report schema
 This mechanism makes a correctly formed production contract launchable; it is
 not representative-ROM evidence by itself. Representative private NTSC
 full-ROM exact-ten series for reference and RT64 LLE/post-VI completed under
-schema v20 and were reverified locally on 2026-07-21 after the backend-neutral
-F3DZEX2 classifier replaced host/backend pair registration. Those retained
-runs are historical after report v21 made the observations boundary-owned and
-bound the unsupported-instrumentation identity; both scenarios require fresh
-v21 runs. The live
+schema v21 and were independently reverified locally on 2026-07-22. Both
+series bind boundary-owned observations and the compiled unsupported-
+instrumentation identity; their joint incomplete matrix accepted all 20
+reports, satisfied 9 of 162 requirements, and retained 153 explicit gaps. The live
 synthetic runner test separately demonstrates direct-process orchestration and
 mechanism determinism during the observed test invocation only. Self-hashed
 receipts are retained integrity evidence, not transferable process
@@ -301,10 +300,10 @@ inside verified-matrix v17. The retained
 self-hash proves canonical integrity, not signer identity or transferable
 process provenance.
 
-The historical local 2026-07-21 v5 assessment jointly revalidated both representative
-series as 20 reports and retained the full 162-requirement denominator. It
-satisfied 9 assignments and left 153 explicit; incomplete matrix verification
-did not discard or relabel the missing requirements.
+The current local 2026-07-22 v5 assessment jointly revalidated both
+representative series as 20 reports and retained the full 162-requirement
+denominator. It satisfied 9 assignments and left 153 explicit; incomplete
+matrix verification did not discard or relabel the missing requirements.
 
 #### Instruction-exact savestate transplant is NOT REPRESENTABLE here (negative result, 2026-07-14)
 
