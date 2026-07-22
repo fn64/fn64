@@ -52,14 +52,14 @@ pub use emit::{
     CallTarget, FuncInput, NullResolver, SparseBankInput,
 };
 pub use execution::{
-    dispatch_until_boundary, enter_pending_interrupt, BankError, BankId, BlockExit, BlockProgram,
-    BlockProgramEvidenceSnapshot, BlockRun, BlockRunner, CallResolution, CodeBank,
-    CodeBankEvidenceSnapshot, CodeCatalog, CodeSpan, CodeSpanEvidenceSnapshot, CpuException,
-    CpuFault, CpuFaultKind, CpuInterruptLine, DispatchError, DispatchRun, ExecutableRegion,
-    ExecutionDestinationObservation, ExecutionKey, GeneratedBankFn, GeneratedBankRunner,
-    GenerationError, GuestPc, InstructionBudget, InstructionWordIdentity, ProgramArtifactIdentity,
-    ProgramError, ProgramIdentityEvidenceSnapshot, ProgramIdentitySource, ResolvedInstruction,
-    TransferResolver,
+    dispatch_until_boundary, enter_pending_interrupt, finalize_executable_write_exit, BankError,
+    BankId, BlockExit, BlockProgram, BlockProgramEvidenceSnapshot, BlockRun, BlockRunner,
+    CallResolution, CodeBank, CodeBankEvidenceSnapshot, CodeCatalog, CodeSpan,
+    CodeSpanEvidenceSnapshot, CpuException, CpuFault, CpuFaultKind, CpuInterruptLine,
+    DispatchError, DispatchRun, ExecutableRegion, ExecutionDestinationObservation, ExecutionKey,
+    GeneratedBankFn, GeneratedBankRunner, GenerationError, GuestPc, InstructionBudget,
+    InstructionWordIdentity, ProgramArtifactIdentity, ProgramError,
+    ProgramIdentityEvidenceSnapshot, ProgramIdentitySource, ResolvedInstruction, TransferResolver,
 };
 pub use fallback::{EvidenceClass, FallbackProgram, FallbackRunner};
 pub use fetch::{
@@ -70,15 +70,16 @@ pub use fetch::{
 pub use interp::{run_bank, run_bank_with_mmio, MmioOutcome, MmioPort, NoMmio, UnsupportedOp};
 pub use module::{emit_lookup_dispatcher, emit_module, ModuleFunc, SymbolTable};
 pub use runtime::{
-    call_host_or_recompiled, notify_function_entry, notify_guest_write, notify_non_rdp_write16,
-    pause_self, resolve_host_function, round_ties_even_f32, round_ties_even_f64,
-    set_function_entry_observer, set_host_lookup, set_host_pause, set_mmio_hooks,
-    set_unsupported_observer, set_write_observer, trap_unsupported, DataAccessError,
-    DataAccessKind, FunctionEntryObservationSchema, FunctionEntryObserver, GuestWriteEvent,
-    HostLookup, HostPause, MmioRead, MmioWrite, Rdram, RecompContext, RecompFunc, TlbEntryRaw,
-    TlbFault, TlbFaultKind, TranslatedDataAddress, TranslatedFunctionIdentity,
-    TranslatedInstructionAddress, UnsupportedObserver, WriteObserver,
-    FUNCTION_ENTRY_OBSERVATION_SCHEMA, RDRAM_LEN, RDRAM_VBASE,
+    call_host_or_recompiled, discard_executable_write_boundary, notify_function_entry,
+    notify_guest_write, notify_non_rdp_write16, pause_self, resolve_host_function,
+    round_ties_even_f32, round_ties_even_f64, set_function_entry_observer,
+    set_guest_write_boundary_observer, set_host_lookup, set_host_pause, set_mmio_hooks,
+    set_unsupported_observer, set_write_observer, take_executable_write_boundary, trap_unsupported,
+    DataAccessError, DataAccessKind, FunctionEntryObservationSchema, FunctionEntryObserver,
+    GuestWriteBoundary, GuestWriteBoundaryObserver, GuestWriteEvent, HostLookup, HostPause,
+    MmioRead, MmioWrite, Rdram, RecompContext, RecompFunc, TlbEntryRaw, TlbFault, TlbFaultKind,
+    TranslatedDataAddress, TranslatedFunctionIdentity, TranslatedInstructionAddress,
+    UnsupportedObserver, WriteObserver, FUNCTION_ENTRY_OBSERVATION_SCHEMA, RDRAM_LEN, RDRAM_VBASE,
 };
 
 use fn64_recomp::{AbiVersion, RecompConfig, RecompError, RecompOutput, Recompiler, RspConfig};

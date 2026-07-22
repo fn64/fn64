@@ -1263,6 +1263,20 @@ impl GuestWriteEvent {
 /// renderer notification are multiplexed by the host callback.
 pub type WriteObserver = fn(GuestWriteEvent);
 
+/// Whether one committed guest write changed bytes owned by the active
+/// executable image.
+///
+/// The ordinary observation callback above remains notification-only. A live
+/// block-program owner installs this second callback only when it can prove
+/// that a write intersects one of its registered executable regions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestWriteBoundary {
+    Continue,
+    ExecutableChanged,
+}
+
+pub type GuestWriteBoundaryObserver = fn(GuestWriteEvent) -> GuestWriteBoundary;
+
 /// Host callback reached immediately before translated code preserves a loud
 /// panic for an instruction shape this runtime does not model.
 pub type UnsupportedObserver = fn(&str);
@@ -1317,6 +1331,13 @@ thread_local! {
     static WRITE_OBSERVER: std::cell::Cell<Option<WriteObserver>> = const {
         std::cell::Cell::new(None)
     };
+    static GUEST_WRITE_BOUNDARY_OBSERVER:
+        std::cell::Cell<Option<GuestWriteBoundaryObserver>> = const {
+            std::cell::Cell::new(None)
+        };
+    static EXECUTABLE_WRITE_BOUNDARY: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
     static UNSUPPORTED_OBSERVER: std::cell::Cell<Option<UnsupportedObserver>> = const {
         std::cell::Cell::new(None)
     };
@@ -1356,6 +1377,37 @@ pub fn set_mmio_hooks(
 
 pub fn set_write_observer(observer: Option<WriteObserver>) -> Option<WriteObserver> {
     WRITE_OBSERVER.with(|slot| slot.replace(observer))
+}
+
+/// Install the live executable-owner callback and clear any request belonging
+/// to the previous owner.
+pub fn set_guest_write_boundary_observer(
+    observer: Option<GuestWriteBoundaryObserver>,
+) -> Option<GuestWriteBoundaryObserver> {
+    EXECUTABLE_WRITE_BOUNDARY.with(|pending| pending.set(false));
+    GUEST_WRITE_BOUNDARY_OBSERVER.with(|slot| slot.replace(observer))
+}
+
+/// Consume one post-store executable invalidation request.
+///
+/// Generated and interpreted runners call this only at architectural
+/// instruction boundaries. A control-transfer owner deliberately waits until
+/// its delay slot has completed, so invalidation cannot split the pair.
+#[inline]
+pub fn take_executable_write_boundary() -> bool {
+    EXECUTABLE_WRITE_BOUNDARY.with(|pending| pending.replace(false))
+}
+
+/// Discard a boundary request after an external writer's owner has already
+/// published the replacement executable generation.
+///
+/// Device DMA and RSP writeback use the same post-commit notification seam as
+/// CPU stores, but execute while no translated runner is active. Their host
+/// boundary processes the replacement directly; retaining the request would
+/// make the next generation stop after its first instruction for a write that
+/// has already been serviced.
+pub fn discard_executable_write_boundary() {
+    EXECUTABLE_WRITE_BOUNDARY.with(|pending| pending.set(false));
 }
 
 /// Install the host's unsupported-instruction evidence sink. The translated
@@ -1405,25 +1457,45 @@ pub fn trap_unsupported(context: impl Into<String>) -> ! {
 /// committed. DMA and generated-C adapters use this same seam as typed stores.
 pub fn notify_guest_write(offset: u32, len: u32) {
     if len != 0 {
+        let event = GuestWriteEvent::Range {
+            physical_offset: offset,
+            len,
+        };
         WRITE_OBSERVER.with(|slot| {
             if let Some(observer) = slot.get() {
-                observer(GuestWriteEvent::Range {
-                    physical_offset: offset,
-                    len,
-                });
+                observer(event);
             }
         });
+        request_guest_write_boundary(event);
     }
 }
 
 /// Notify one aligned CPU halfword store after the visible bytes commit.
 pub fn notify_non_rdp_write16(logical_offset: u32, value: u16) {
+    let event = GuestWriteEvent::NonRdpWrite16 {
+        logical_offset,
+        value,
+    };
     WRITE_OBSERVER.with(|slot| {
         if let Some(observer) = slot.get() {
-            observer(GuestWriteEvent::NonRdpWrite16 {
-                logical_offset,
-                value,
-            });
+            observer(event);
+        }
+    });
+    request_guest_write_boundary(event);
+}
+
+#[inline]
+fn request_guest_write_boundary(event: GuestWriteEvent) {
+    GUEST_WRITE_BOUNDARY_OBSERVER.with(|slot| {
+        if slot
+            .get()
+            .is_some_and(|observer| observer(event) == GuestWriteBoundary::ExecutableChanged)
+        {
+            // Closes the exact interleaving `generation-A store commits -> A
+            // executes a later translated instruction -> host retires A`.
+            // The runner consumes this only after the current instruction, or
+            // after the complete branch/delay pair when the store is its slot.
+            EXECUTABLE_WRITE_BOUNDARY.with(|pending| pending.set(true));
         }
     });
 }
