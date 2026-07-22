@@ -38,9 +38,10 @@
 //!
 //! Explicitly OUT (each a loud [`StepFault::Unsupported`] naming the opcode, the
 //! same frontier the AOT lane leaves open — see `Still open in U4` in
-//! `docs/UNIVERSAL-RUNTIME-PLAN.md`): the entire COP1/FPU environment, COP0
-//! (Count/Compare included — modeled by the AOT lane but not yet by this slice),
-//! COP2, TLB/`ERET`, `SYSCALL`/`BREAK`, and the conditional trap ops. Precise
+//! `docs/UNIVERSAL-RUNTIME-PLAN.md`): the entire COP1/FPU environment, COP2,
+//! `TLBWR`, TLB translation, `ERET`, `SYSCALL`/`BREAK`, and the conditional trap ops. Modeled
+//! 32-bit COP0 moves and `TLBWI`/`TLBR`/`TLBP` share the typed context with the
+//! AOT lane. Precise
 //! VR4300 exception vectoring, `BadVAddr`/`EPC`/`Cause`, TLB-miss vs.
 //! address-error, and alignment (`AdEL`/`AdES`) faulting are likewise absent, as
 //! in the AOT lane's first U4 slice.
@@ -888,6 +889,23 @@ fn exec_straight(
             }
         }
 
+        // --- Modeled COP0/TLB management ---
+        Mfc0 { rt, cop0d } => match cop0d {
+            0 | 2 | 3 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30 => {
+                ctx.set_r32(rt, ctx.read_cop0(cop0d) as i32);
+            }
+            _ => return Err(unsupported()),
+        },
+        Mtc0 { rt, cop0d } => match cop0d {
+            0 | 2 | 3 | 5 | 6 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30 => {
+                ctx.write_cop0(cop0d, ctx.r_u32(rt));
+            }
+            _ => return Err(unsupported()),
+        },
+        Tlbwi => ctx.tlbwi_record(),
+        Tlbr => ctx.tlbr_read(),
+        Tlbp => ctx.tlbp_probe(),
+
         // --- Cache / sync: no-ops on a coherent host rdram (as the AOT lane) ---
         Cache { .. } | Sync => {}
 
@@ -979,14 +997,52 @@ mod tests {
 
     #[test]
     fn unsupported_opcode_is_a_loud_typed_fault_not_a_panic_or_nop() {
-        // mtc0 $v0,$Status(12) is privileged/out of scope: decoded, then a typed
-        // unsupported fault naming the op, exactly where the AOT lane panics.
-        let mtc0_status = 0x4082_6000; // MTC0 rt=2, rd=12
-        let catalog = catalog_of(&[mtc0_status, 0x03E0_0008, 0x0000_0000]);
+        // TLBWR depends on the per-instruction Random countdown and remains
+        // outside this slice: decoded, then a typed unsupported fault naming
+        // the op, exactly where the AOT lane traps.
+        let tlbwr = 0x4200_0006;
+        let catalog = catalog_of(&[tlbwr, 0x03E0_0008, 0x0000_0000]);
         let mut ctx = RecompContext::new();
         let err = run(&catalog, VA, 8, &mut ctx).unwrap_err();
         assert_eq!(err.at, ExecutionKey::new(BANK, GuestPc::new(VA)));
-        assert!(matches!(err.instruction, Instruction::Mtc0 { .. }));
+        assert_eq!(err.instruction, Instruction::Tlbwr);
+    }
+
+    #[test]
+    fn modeled_cop0_and_indexed_tlb_management_execute_in_the_interpreter() {
+        let mtc0 = |rt: u32, rd: u32| 0x4080_0000 | (rt << 16) | (rd << 11);
+        let mfc0 = |rt: u32, rd: u32| 0x4000_0000 | (rt << 16) | (rd << 11);
+        let words = [
+            mtc0(2, 10), // EntryHi
+            mtc0(3, 2),  // EntryLo0
+            mtc0(4, 3),  // EntryLo1
+            mtc0(5, 5),  // PageMask
+            mtc0(6, 0),  // Index
+            0x4200_0002, // TLBWI
+            mtc0(7, 10), // probe EntryHi
+            0x4200_0008, // TLBP
+            mfc0(8, 0),  // matched Index
+            0x4200_0001, // TLBR
+            mfc0(9, 10), // reloaded EntryHi
+            0x03e0_0008, // jr $ra
+            0,
+        ];
+        let catalog = catalog_of(&words);
+        let mut ctx = RecompContext::new();
+        ctx.set_r(2, 0x1234_400a);
+        ctx.set_r(3, 0x0000_0046);
+        ctx.set_r(4, 0x0000_0086);
+        ctx.set_r(5, 0x0000_6000);
+        ctx.set_r(6, 7);
+        ctx.set_r(7, 0x1234_200a);
+
+        let result = run(&catalog, VA, words.len() as u32, &mut ctx).unwrap();
+        assert_eq!(result.instructions, words.len() as u32);
+        assert_eq!(ctx.r_u32(8), 7);
+        assert_eq!(ctx.r_u32(9), 0x1234_400a);
+        assert_eq!(ctx.cop0_page_mask, 0x0000_6000);
+        assert_eq!(ctx.cop0_entry_lo0, 0x0000_0046);
+        assert_eq!(ctx.cop0_entry_lo1, 0x0000_0086);
     }
 
     #[test]

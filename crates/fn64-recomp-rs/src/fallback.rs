@@ -377,9 +377,10 @@ mod tests {
 
     #[test]
     fn unsupported_op_in_the_interpreter_is_a_typed_fault_not_a_panic() {
-        // mtc0 $v0,$Status(12) — decoded but out of scope: a typed fault.
+        // TLBWR requires the instruction-coupled Random countdown that the
+        // interpreter does not yet model, so it remains a typed fault.
         let id = BankId::new(0x72);
-        let words = [0x4082_6000, 0x03E0_0008, 0x0000_0000];
+        let words = [0x4200_0006, 0x03E0_0008, 0x0000_0000];
         let mut program = FallbackProgram::new();
         program
             .register_dynamic_mips(contiguous(0x72, &words))
@@ -400,7 +401,7 @@ mod tests {
                 kind: CpuFaultKind::UnsupportedInstruction { word },
             }) => {
                 assert_eq!(at, ExecutionKey::new(id, GuestPc::new(VA)));
-                assert_eq!(word, 0x4082_6000);
+                assert_eq!(word, 0x4200_0006);
             }
             other => panic!("expected typed UnsupportedInstruction fault, got {other:?}"),
         }

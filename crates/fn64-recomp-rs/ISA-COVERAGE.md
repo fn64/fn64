@@ -128,11 +128,19 @@ write and honors an encoded `rd=0`.
 ## COP0
 
 MFC0, DMFC0, MTC0, DMTC0, BC0F/T/FL/TL, TLBR, TLBWI, TLBWR, TLBP, and ERET
-all decode. BadVAddr (8), Count (9), Compare (11), Status (12), Cause (13), EPC
-(14), and ErrorEPC (30) have typed 32-bit reads; Count, Compare, Status, EPC,
-and ErrorEPC have typed writes. Cause accepts its two writable software-pending
-bits while preserving hardware-pending lines. The other registers, doubleword
-moves, and TLB operations remain loud host-boundary traps. In the arbitrary-PC
+all decode. Index (0), EntryLo0/1 (2/3), PageMask (5), Wired (6), BadVAddr
+(8), Count (9), EntryHi (10), Compare (11), Status (12), Cause (13), EPC (14),
+WatchLo/Hi (18/19), and ErrorEPC (30) have typed 32-bit reads; all except
+BadVAddr have their modeled typed writes. Cause accepts its two writable
+software-pending bits while preserving hardware-pending lines. Indexed TLB
+write/read and probe share one 32-entry raw management array in both generated
+and interpreted lanes; probe applies each entry's PageMask plus the paired
+Global-bit/ASID rule and traps the architecturally undefined multiple-match
+case. A failed probe sets `Index.P` and deterministically clears the
+architecturally unpredictable low Index field; this bounded choice is not a
+silicon-exact claim. TLBWR's per-instruction Random countdown and address
+translation through the recorded entries remain loud. Doubleword moves and
+other registers likewise remain host-boundary traps. In the arbitrary-PC
 bank lane, ERET selects ErrorEPC/ERL or EPC/EXL, clears the LL reservation, and
 returns a typed resolved transfer; the historical whole-function lane still
 traps because its callable ABI cannot return a transfer. BC0 uses a typed
@@ -220,7 +228,7 @@ Bottom line: encoding coverage is complete for the documented MIPS III CPU
 table, with COP2 decoded as architecturally unusable. Execution is complete
 for the ordinary integer, control-flow, aligned/unaligned memory, shift, and
 HI/LO paths OoT can execute. It is not a complete VR4300 CPU model until the
-remaining P items—especially full FPU environment behavior, TLB/translation,
+remaining P items—especially full FPU environment behavior, TLBWR/translation,
 COP0/COP2 exception behavior, and the whole-function lane's exception
 boundary—are implemented or deliberately moved behind a documented host ABI
 boundary.
