@@ -306,35 +306,6 @@ impl LiveReferenceFramebufferEvidence {
     }
 }
 
-/// Complete logical-byte observation of physical N64 RDRAM.
-pub struct LiveMemoryEvidence {
-    bytes: Vec<u8>,
-}
-
-impl LiveMemoryEvidence {
-    pub fn full_physical_rdram(bytes: Vec<u8>) -> Result<Self, ObservationEvidenceError> {
-        if bytes.len() != DEFAULT_RDRAM_SIZE {
-            return Err(ObservationEvidenceError::IncompletePhysicalRdram {
-                address: 0,
-                expected_bytes: DEFAULT_RDRAM_SIZE as u64,
-                observed_bytes: bytes.len() as u64,
-            });
-        }
-        Ok(Self { bytes })
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    pub(crate) fn geometry(&self) -> MemoryObservationGeometry {
-        MemoryObservationGeometry {
-            physical_address: 0,
-            payload_bytes: self.bytes.len() as u64,
-        }
-    }
-}
-
 pub trait LiveReleaseGateObservationExt {
     fn capture_and_write_reference_evidence(
         self,
@@ -342,7 +313,6 @@ pub trait LiveReleaseGateObservationExt {
         scenario: impl Into<String>,
         input_bytes: &[u8],
         framebuffer: &LiveReferenceFramebufferEvidence,
-        memory: &LiveMemoryEvidence,
         report_path: impl AsRef<Path>,
     ) -> Result<ReleaseGateReport, GateError>;
 
@@ -354,7 +324,6 @@ pub trait LiveReleaseGateObservationExt {
         scenario: impl Into<String>,
         rom: crate::ReleaseRomInput<'_>,
         framebuffer: &LiveReferenceFramebufferEvidence,
-        memory: &LiveMemoryEvidence,
         report_path: impl AsRef<Path>,
     ) -> Result<ReleaseGateReport, GateError>;
 }
@@ -366,7 +335,6 @@ impl LiveReleaseGateObservationExt for LiveReleaseGate {
         scenario: impl Into<String>,
         input_bytes: &[u8],
         framebuffer: &LiveReferenceFramebufferEvidence,
-        memory: &LiveMemoryEvidence,
         report_path: impl AsRef<Path>,
     ) -> Result<ReleaseGateReport, GateError> {
         self.capture_and_write_observed(
@@ -377,10 +345,12 @@ impl LiveReleaseGateObservationExt for LiveReleaseGate {
             LiveObservedArtifacts {
                 framebuffer_artifact_bytes: framebuffer.bytes(),
                 framebuffer_payload_bytes: framebuffer.bytes().len(),
-                memory_bytes: memory.bytes(),
                 observations: ReleaseObservationGeometry {
                     framebuffer: framebuffer.geometry(),
-                    memory: memory.geometry(),
+                    memory: MemoryObservationGeometry {
+                        physical_address: 0,
+                        payload_bytes: DEFAULT_RDRAM_SIZE as u64,
+                    },
                 },
             },
             report_path,
@@ -393,7 +363,6 @@ impl LiveReleaseGateObservationExt for LiveReleaseGate {
         scenario: impl Into<String>,
         rom: crate::ReleaseRomInput<'_>,
         framebuffer: &LiveReferenceFramebufferEvidence,
-        memory: &LiveMemoryEvidence,
         report_path: impl AsRef<Path>,
     ) -> Result<ReleaseGateReport, GateError> {
         self.capture_and_write_observed(
@@ -404,10 +373,12 @@ impl LiveReleaseGateObservationExt for LiveReleaseGate {
             LiveObservedArtifacts {
                 framebuffer_artifact_bytes: framebuffer.bytes(),
                 framebuffer_payload_bytes: framebuffer.bytes().len(),
-                memory_bytes: memory.bytes(),
                 observations: ReleaseObservationGeometry {
                     framebuffer: framebuffer.geometry(),
-                    memory: memory.geometry(),
+                    memory: MemoryObservationGeometry {
+                        physical_address: 0,
+                        payload_bytes: DEFAULT_RDRAM_SIZE as u64,
+                    },
                 },
             },
             report_path,
@@ -486,14 +457,6 @@ mod tests {
         assert!(matches!(
             LiveReferenceFramebufferEvidence::rgba16(0, 2, 1, vec![0; 8]),
             Err(ObservationEvidenceError::WrongFramebufferPayload { .. })
-        ));
-    }
-
-    #[test]
-    fn complete_memory_type_rejects_partial_rdram() {
-        assert!(matches!(
-            LiveMemoryEvidence::full_physical_rdram(vec![0; DEFAULT_RDRAM_SIZE - 1]),
-            Err(ObservationEvidenceError::IncompletePhysicalRdram { .. })
         ));
     }
 

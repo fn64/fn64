@@ -12,6 +12,8 @@ use std::path::Path;
 
 use crate::{trace::next_sequence, Cycles};
 
+include!("unsupported_instrumentation_generated.rs");
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnsupportedSubsystem {
     Runtime,

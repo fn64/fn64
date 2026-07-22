@@ -26,8 +26,8 @@ pub use certification_profile::{
 };
 pub use observation_evidence::{
     FramebufferObservationFormat, FramebufferObservationGeometry, FramebufferObservationSource,
-    LiveMemoryEvidence, LiveReferenceFramebufferEvidence, LiveReleaseGateObservationExt,
-    MemoryObservationGeometry, ObservationEvidenceError, ReleaseObservationGeometry,
+    LiveReferenceFramebufferEvidence, LiveReleaseGateObservationExt, MemoryObservationGeometry,
+    ObservationEvidenceError, ReleaseObservationGeometry,
 };
 pub use platform_certification::{
     PlatformCertificationError, Rt64PlatformCase, Rt64PlatformTarget,
@@ -54,8 +54,9 @@ pub use release_gate::{
     LiveReleaseGate, ReleaseExecutionDestination, ReleaseGateReport, ReleaseMicrocodeFamily,
     ReleaseRomByteOrder, ReleaseRomClass, ReleaseRomEvidence, ReleaseRomInput, ReleaseTvRegion,
     ReleaseTvStandard, RspRdpEvidence, RspRdpObservationEventEvidence,
-    RspRdpObservationKindEvidence, UnsupportedEvent, LIVE_CONTROLLER_OPERATION_CLOSURE_PATHS,
-    LIVE_MINIMUM_CLOSURE_PATHS, LIVE_SAVE_OPERATION_CLOSURE_PATHS,
+    RspRdpObservationKindEvidence, UnsupportedEvent, UnsupportedInstrumentationEvidence,
+    LIVE_CONTROLLER_OPERATION_CLOSURE_PATHS, LIVE_MINIMUM_CLOSURE_PATHS,
+    LIVE_SAVE_OPERATION_CLOSURE_PATHS,
 };
 pub use release_matrix::{
     verify_release_matrix, verify_release_matrix_with_platform_series,
@@ -261,6 +262,22 @@ pub struct CommittedViBoundary {
     platform: ReleaseHostPlatform,
     windows_version: Option<ReleaseWindowsVersionEvidence>,
     render_snapshot: fn64_abi::RenderEnvironmentEvidenceSnapshot,
+    fixed_cycle: FrozenFixedCycleObservations,
+}
+
+/// Raw observation channels copied while the committed VI edge owns the
+/// single-threaded guest/device boundary. Production report construction
+/// consumes these bytes; a boot host cannot substitute a later memory image
+/// or extend an audio/trace history after the edge.
+#[derive(Debug, Clone)]
+pub(crate) struct FrozenFixedCycleObservations {
+    pub(crate) physical_rdram_logical: Option<Vec<u8>>,
+    pub(crate) audio_pcm_s16le: Option<Vec<u8>>,
+    pub(crate) trace: Vec<fn64_runtime::TraceEvent>,
+    pub(crate) device_trace: Vec<fn64_runtime::DeviceTraceEvent>,
+    pub(crate) save_operations: Vec<fn64_runtime::SaveOperationEvent>,
+    pub(crate) controller_operations: Vec<fn64_runtime::ControllerOperationEvent>,
+    pub(crate) unsupported_events: Vec<fn64_runtime::UnsupportedEvent>,
 }
 
 /// Exact host target on which a fixed-cycle report was produced.
@@ -747,6 +764,7 @@ type CommittedEvidence = (
     ReleaseHostPlatform,
     Option<ReleaseWindowsVersionEvidence>,
     fn64_abi::RenderEnvironmentEvidenceSnapshot,
+    FrozenFixedCycleObservations,
 );
 
 fn capture_program_evidence(
@@ -898,6 +916,15 @@ fn commit_scheduled_vi_boundary_inner(
     let program_snapshot = capture_program_evidence(descriptor);
     #[cfg(feature = "recomp-rs")]
     let function_execution_destinations = copy_function_destinations_for_program(&program_snapshot);
+    let fixed_cycle = FrozenFixedCycleObservations {
+        physical_rdram_logical: fn64_abi::copy_registered_physical_rdram_logical(),
+        audio_pcm_s16le: fn64_abi::copy_audio_digest_bytes(),
+        trace: fn64_abi::copy_trace(),
+        device_trace: device_trace.clone(),
+        save_operations: fn64_abi::copy_save_operations(),
+        controller_operations: fn64_abi::copy_controller_operations(),
+        unsupported_events: fn64_runtime::copy_unsupported_events(),
+    };
     Ok(CommittedViBoundary {
         cycle: scheduled,
         resume_epoch: fn64_abi::executor_resume_epoch(),
@@ -918,6 +945,7 @@ fn commit_scheduled_vi_boundary_inner(
         platform,
         windows_version,
         render_snapshot: fn64_abi::render_environment_evidence_snapshot(),
+        fixed_cycle,
     })
 }
 
@@ -973,6 +1001,7 @@ impl CommittedViBoundary {
             self.platform,
             self.windows_version,
             self.render_snapshot,
+            self.fixed_cycle,
         ))
     }
 
@@ -998,6 +1027,15 @@ impl CommittedViBoundary {
             platform: release_host_platform().expect("test platform must be release-supported"),
             windows_version: test_release_windows_version(),
             render_snapshot: fn64_abi::render_environment_evidence_snapshot(),
+            fixed_cycle: FrozenFixedCycleObservations {
+                physical_rdram_logical: fn64_abi::copy_registered_physical_rdram_logical(),
+                audio_pcm_s16le: fn64_abi::copy_audio_digest_bytes(),
+                trace: fn64_abi::copy_trace(),
+                device_trace: fn64_abi::copy_device_trace(),
+                save_operations: fn64_abi::copy_save_operations(),
+                controller_operations: fn64_abi::copy_controller_operations(),
+                unsupported_events: fn64_runtime::copy_unsupported_events(),
+            },
         }
     }
 }
@@ -1656,10 +1694,53 @@ mod tests {
             _captured_platform,
             _captured_windows_version,
             _captured_renderer,
+            _captured_fixed_cycle,
         ) = boundary.into_evidence().unwrap();
         assert_eq!(captured_device, edge_device);
         assert_eq!(captured_executor, edge_executor);
         assert_eq!(captured_host, edge_host);
+    }
+
+    #[test]
+    fn committed_vi_boundary_owns_memory_and_audio_before_post_edge_host_mutation() {
+        fn64_abi::load_rom(Vec::new());
+        fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+        fn64_abi::set_audio_digest_capture(true);
+        install_boundary_render_backend();
+        BOUNDARY_RDRAM.with(|cell| {
+            let mut storage = cell.borrow_mut();
+            fn64_runtime::RdramViewMut::from_storage(&mut storage)
+                .write_u32(fn64_runtime::RdramAddr::from_offset(0), 0x0123_4567);
+        });
+
+        let scheduled = fn64_abi::next_vi_deadline().unwrap();
+        let boundary = commit_synthetic_boundary(scheduled).unwrap();
+        assert_eq!(
+            &boundary
+                .fixed_cycle
+                .physical_rdram_logical
+                .as_ref()
+                .unwrap()[..4],
+            &[0x01, 0x23, 0x45, 0x67]
+        );
+        assert_eq!(boundary.fixed_cycle.audio_pcm_s16le, Some(Vec::new()));
+
+        BOUNDARY_RDRAM.with(|cell| {
+            let mut storage = cell.borrow_mut();
+            fn64_runtime::RdramViewMut::from_storage(&mut storage)
+                .write_u32(fn64_runtime::RdramAddr::from_offset(0), 0x89ab_cdef);
+        });
+        fn64_abi::set_audio_digest_capture(false);
+
+        // Raw host writes and capture-control changes are not guest execution;
+        // the boundary remains consumable and retains its edge-owned bytes.
+        assert_eq!(boundary.validate_unconsumed(), Ok(()));
+        let (_, _, _, _, _, _, _, _, _, fixed_cycle) = boundary.into_evidence().unwrap();
+        assert_eq!(
+            &fixed_cycle.physical_rdram_logical.unwrap()[..4],
+            &[0x01, 0x23, 0x45, 0x67]
+        );
+        assert_eq!(fixed_cycle.audio_pcm_s16le, Some(Vec::new()));
     }
 
     #[test]
@@ -1823,7 +1904,6 @@ mod tests {
             release_gate::LiveObservedArtifacts {
                 framebuffer_artifact_bytes: b"framebuffer",
                 framebuffer_payload_bytes: 2,
-                memory_bytes: b"memory",
                 observations: ReleaseObservationGeometry::reference_rdram(0, 1, 1).unwrap(),
             },
             &path,
@@ -1859,7 +1939,6 @@ mod tests {
             release_gate::LiveObservedArtifacts {
                 framebuffer_artifact_bytes: b"framebuffer",
                 framebuffer_payload_bytes: 2,
-                memory_bytes: b"memory",
                 observations: ReleaseObservationGeometry::reference_rdram(0, 1, 1).unwrap(),
             },
             &path,

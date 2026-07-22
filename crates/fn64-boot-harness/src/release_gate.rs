@@ -29,7 +29,7 @@ use crate::{
     ReleaseWindowsVersionEvidence,
 };
 
-pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v20";
+pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v21";
 
 /// Provenance class declared for a ROM input. The N64 header does not encode
 /// whether otherwise-valid bytes came from a retail cartridge or a public
@@ -707,11 +707,11 @@ pub const LIVE_CONTROLLER_OPERATION_CLOSURE_PATHS: [(ControllerOperationDevice, 
 
 /// Opt-in production seam around [`FixedCycleDigestGate`].
 ///
-/// Arming is allowed only before guest time or trace events exist. Finishing
-/// samples the ABI's typed device/trace/audio sources itself; the boot host
-/// must supply its framebuffer and memory bytes from live backend state. The
-/// gate derives the closure ledger from those observations, preventing a host
-/// from turning an unconditional declaration into fabricated coverage.
+/// Arming is allowed only before guest time or trace events exist. The
+/// committed VI boundary freezes the ABI's memory/audio/device/trace sources;
+/// finishing consumes those owned observations. The boot host supplies only
+/// typed presentation evidence, which the reference path cross-checks against
+/// the frozen physical-RDRAM image.
 pub struct LiveReleaseGate {
     guest_cycle: u64,
     armed: bool,
@@ -720,7 +720,6 @@ pub struct LiveReleaseGate {
 pub(crate) struct LiveObservedArtifacts<'a> {
     pub(crate) framebuffer_artifact_bytes: &'a [u8],
     pub(crate) framebuffer_payload_bytes: usize,
-    pub(crate) memory_bytes: &'a [u8],
     pub(crate) observations: ReleaseObservationGeometry,
 }
 
@@ -844,6 +843,7 @@ impl LiveReleaseGate {
             platform,
             windows_version,
             render,
+            fixed_cycle,
         ) = boundary
             .into_evidence()
             .map_err(GateError::InvalidViBoundary)?;
@@ -887,22 +887,26 @@ impl LiveReleaseGate {
                 observed: observed_cycle,
             });
         }
+        let memory_bytes = require_boundary_physical_rdram(fixed_cycle.physical_rdram_logical)?;
         observed
             .observations
-            .validate_payload_lengths(
-                observed.framebuffer_payload_bytes,
-                observed.memory_bytes.len(),
-            )
+            .validate_payload_lengths(observed.framebuffer_payload_bytes, memory_bytes.len())
             .map_err(GateError::InvalidObservationGeometry)?;
         let environment = environment_from_frozen(platform, windows_version, &host, render)?;
         validate_environment_observation(&environment, &observed.observations)?;
-        let audio_bytes =
-            fn64_abi::copy_audio_digest_bytes().ok_or(GateError::AudioDigestCaptureNotArmed)?;
-        let trace = fn64_abi::copy_trace();
-        let device_trace = fn64_abi::copy_device_trace();
-        let save_operations = fn64_abi::copy_save_operations();
-        let controller_operations = fn64_abi::copy_controller_operations();
-        let unsupported_events = fn64_runtime::copy_unsupported_events();
+        let audio_bytes = fixed_cycle
+            .audio_pcm_s16le
+            .ok_or(GateError::AudioDigestCaptureNotArmed)?;
+        let trace = fixed_cycle.trace;
+        let device_trace = fixed_cycle.device_trace;
+        let save_operations = fixed_cycle.save_operations;
+        let controller_operations = fixed_cycle.controller_operations;
+        let unsupported_events = fixed_cycle.unsupported_events;
+        validate_reference_framebuffer_against_memory(
+            &observed.observations,
+            observed.framebuffer_artifact_bytes,
+            &memory_bytes,
+        )?;
         if let Some(event) = save_operations
             .iter()
             .find(|event| event.at.get() > observed_cycle)
@@ -932,14 +936,14 @@ impl LiveReleaseGate {
             observed.framebuffer_artifact_bytes,
         )?;
         digest.capture(observed_cycle, ArtifactKind::Audio, &audio_bytes)?;
-        digest.capture(observed_cycle, ArtifactKind::Memory, observed.memory_bytes)?;
+        digest.capture(observed_cycle, ArtifactKind::Memory, &memory_bytes)?;
         digest.capture_device_snapshot(snapshot, executor, host, program)?;
         digest.capture_live_timing_trace(observed_cycle, &trace, &device_trace)?;
 
         let closure = derive_live_closure(LiveClosureInputs {
             framebuffer_bytes: observed.framebuffer_artifact_bytes,
             audio_bytes: &audio_bytes,
-            memory_bytes: observed.memory_bytes,
+            memory_bytes: &memory_bytes,
             trace: &trace,
             device_trace: &device_trace,
             save_operations: &save_operations,
@@ -967,6 +971,43 @@ impl LiveReleaseGate {
         report.require_closed()?;
         Ok(report)
     }
+}
+
+fn require_boundary_physical_rdram(memory_bytes: Option<Vec<u8>>) -> Result<Vec<u8>, GateError> {
+    memory_bytes.ok_or(GateError::BoundaryPhysicalRdramUnavailable)
+}
+
+fn validate_reference_framebuffer_against_memory(
+    observations: &ReleaseObservationGeometry,
+    framebuffer_bytes: &[u8],
+    memory_bytes: &[u8],
+) -> Result<(), GateError> {
+    let FramebufferObservationSource::PhysicalRdram { address } = &observations.framebuffer.source
+    else {
+        return Ok(());
+    };
+    let address = *address;
+    let start = usize::try_from(address).expect("physical framebuffer address exceeds usize");
+    let end = start.checked_add(framebuffer_bytes.len()).ok_or(
+        GateError::ReferenceFramebufferOutsideFrozenMemory {
+            address,
+            bytes: framebuffer_bytes.len() as u64,
+        },
+    )?;
+    let frozen =
+        memory_bytes
+            .get(start..end)
+            .ok_or(GateError::ReferenceFramebufferOutsideFrozenMemory {
+                address,
+                bytes: framebuffer_bytes.len() as u64,
+            })?;
+    if frozen != framebuffer_bytes {
+        return Err(GateError::ReferenceFramebufferDoesNotMatchFrozenMemory {
+            address,
+            bytes: framebuffer_bytes.len() as u64,
+        });
+    }
+    Ok(())
 }
 
 fn validate_controller_operation_cycles(
@@ -2004,6 +2045,37 @@ fn test_rsp_rdp_evidence(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnsupportedInstrumentationEvidence {
+    pub schema: String,
+    pub sha256: String,
+}
+
+impl UnsupportedInstrumentationEvidence {
+    fn current() -> Self {
+        Self {
+            schema: fn64_runtime::UNSUPPORTED_INSTRUMENTATION_SCHEMA.to_owned(),
+            sha256: hex(&fn64_runtime::UNSUPPORTED_INSTRUMENTATION_SHA256),
+        }
+    }
+
+    pub(crate) fn verify_current(&self) -> Result<(), GateError> {
+        let expected_sha256 = hex(&fn64_runtime::UNSUPPORTED_INSTRUMENTATION_SHA256);
+        if self.schema != fn64_runtime::UNSUPPORTED_INSTRUMENTATION_SCHEMA
+            || self.sha256 != expected_sha256
+        {
+            return Err(GateError::UnsupportedInstrumentationIdentityMismatch {
+                expected_schema: fn64_runtime::UNSUPPORTED_INSTRUMENTATION_SCHEMA,
+                observed_schema: self.schema.clone(),
+                expected_sha256,
+                observed_sha256: self.sha256.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseGateReport {
     pub schema: String,
     pub scenario: String,
@@ -2024,6 +2096,9 @@ pub struct ReleaseGateReport {
     /// Exact ABI-owned graphics-microcode recognition, IMEM replacement, and
     /// committed DPC history frozen at the same boundary.
     pub rsp_rdp: RspRdpEvidence,
+    /// Exact audited denominator of production unsupported-event
+    /// instrumentation compiled into the runtime that produced this report.
+    pub unsupported_instrumentation: UnsupportedInstrumentationEvidence,
     pub closure: Vec<ClosurePath>,
     /// SHA-256 over every other semantic report field in an explicit wire
     /// order. Cite this value, rather than the artifact-only digest root, when
@@ -2090,6 +2165,7 @@ impl ReleaseGateReport {
             environment,
             execution_destinations,
             rsp_rdp,
+            unsupported_instrumentation: UnsupportedInstrumentationEvidence::current(),
             closure,
             report_sha256: String::new(),
         };
@@ -2173,7 +2249,7 @@ impl ReleaseGateReport {
         )
     }
 
-    /// Recompute the schema-v20 evidence digest after loading a retained JSON
+    /// Recompute the schema-v21 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {
@@ -2192,6 +2268,7 @@ impl ReleaseGateReport {
             &self.execution_destinations,
         )?;
         self.rsp_rdp.verify_integrity(self.digest.guest_cycle)?;
+        self.unsupported_instrumentation.verify_current()?;
         self.digest.verify_integrity()?;
         validate_artifact_observation_bytes(&self.digest, &self.observations)?;
         validate_closure_paths(&self.closure)?;
@@ -2390,7 +2467,22 @@ pub enum GateError {
         expected: u64,
         observed: u64,
     },
+    BoundaryPhysicalRdramUnavailable,
+    ReferenceFramebufferOutsideFrozenMemory {
+        address: u32,
+        bytes: u64,
+    },
+    ReferenceFramebufferDoesNotMatchFrozenMemory {
+        address: u32,
+        bytes: u64,
+    },
     AudioDigestCaptureNotArmed,
+    UnsupportedInstrumentationIdentityMismatch {
+        expected_schema: &'static str,
+        observed_schema: String,
+        expected_sha256: String,
+        observed_sha256: String,
+    },
     InvalidObservationGeometry(ObservationEvidenceError),
     ArmUnsupportedJournal(io::Error),
     EmptyScenario,
@@ -2448,6 +2540,27 @@ impl fmt::Display for GateError {
             ),
             Self::DuplicateArtifact(kind) => write!(f, "duplicate {kind:?} digest artifact"),
             Self::InvalidObservationGeometry(error) => error.fmt(f),
+            Self::BoundaryPhysicalRdramUnavailable => write!(
+                f,
+                "committed VI boundary has no registered complete physical RDRAM observation"
+            ),
+            Self::UnsupportedInstrumentationIdentityMismatch {
+                expected_schema,
+                observed_schema,
+                expected_sha256,
+                observed_sha256,
+            } => write!(
+                f,
+                "release report unsupported-instrumentation identity mismatch: expected {expected_schema}/{expected_sha256}, observed {observed_schema}/{observed_sha256}"
+            ),
+            Self::ReferenceFramebufferOutsideFrozenMemory { address, bytes } => write!(
+                f,
+                "reference framebuffer observation at {address:#010x} for {bytes} bytes lies outside the committed physical RDRAM image"
+            ),
+            Self::ReferenceFramebufferDoesNotMatchFrozenMemory { address, bytes } => write!(
+                f,
+                "reference framebuffer observation at {address:#010x} for {bytes} bytes does not match the committed physical RDRAM image"
+            ),
             Self::MissingArtifacts(kinds) => write!(f, "missing digest artifacts: {kinds:?}"),
             Self::FutureTraceEvent {
                 gate_cycle,
@@ -4334,6 +4447,16 @@ pub(crate) fn encode_report_evidence(report: &ReleaseGateReport) -> Result<Vec<u
         &decode_sha256(&report.input_sha256)
             .ok_or(GateError::InvalidReportSha256("input_sha256"))?,
     );
+    report.unsupported_instrumentation.verify_current()?;
+    push_bytes(
+        &mut out,
+        report.unsupported_instrumentation.schema.as_bytes(),
+    );
+    out.extend_from_slice(
+        &decode_sha256(&report.unsupported_instrumentation.sha256).ok_or(
+            GateError::InvalidReportSha256("unsupported_instrumentation.sha256"),
+        )?,
+    );
     match &report.rom {
         Some(rom) => {
             rom.verify_integrity()?;
@@ -5215,17 +5338,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_v20_fixed_cycle_digest_is_stable_and_complete() {
+    fn schema_v21_fixed_cycle_digest_is_stable_and_complete() {
         assert_eq!(complete_digest(), complete_digest());
         assert_eq!(complete_digest().artifacts.len(), 5);
         assert_eq!(
             complete_digest().root_sha256,
-            "3001732227bad47cceeefe18ae478d58bbf321ba266f09474324cea269b6d423"
+            "a61c502ff15bbe74d736b40ac09814d1d1fb9ceb751d7bc5ad6de0e7efb577df"
         );
     }
 
     #[test]
-    fn schema_v20_report_wire_binds_rom_identity_class_and_tv_authorities() {
+    fn schema_v21_report_wire_binds_rom_identity_class_and_tv_authorities() {
         let input = test_rom(b'E');
         let geometry = observations();
         let rom =
@@ -6412,12 +6535,19 @@ mod tests {
             Err(GateError::ReportIntegrityMismatch { .. })
         ));
 
+        let mut changed_instrumentation = report.clone();
+        changed_instrumentation.unsupported_instrumentation.sha256 = "00".repeat(32);
+        assert!(matches!(
+            changed_instrumentation.verify_integrity(),
+            Err(GateError::UnsupportedInstrumentationIdentityMismatch { .. })
+        ));
+
         let mut stale_schema = report.clone();
-        stale_schema.schema = "fn64.release-gate.v19".to_owned();
+        stale_schema.schema = "fn64.release-gate.v20".to_owned();
         assert!(matches!(
             stale_schema.verify_integrity(),
             Err(GateError::UnsupportedReportSchema(schema))
-                if schema == "fn64.release-gate.v19"
+                if schema == "fn64.release-gate.v20"
         ));
 
         let duplicate = vec![report.closure[0].clone(), report.closure[0].clone()];
@@ -6434,7 +6564,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v20_report_wire_binds_every_release_environment_field() {
+    fn schema_v21_report_wire_binds_every_release_environment_field() {
         let report = ReleaseGateReport::new(
             "environment-wire",
             b"input",
@@ -7294,7 +7424,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v20_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
+    fn schema_v21_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
         let geometry = observations();
         let graphics_closure = vec![ClosurePath {
             name: "rsp.graphics-task".to_owned(),
@@ -7561,6 +7691,26 @@ mod tests {
     }
 
     #[test]
+    fn reference_framebuffer_must_match_boundary_owned_memory() {
+        let observations = ReleaseObservationGeometry::reference_rdram(4, 1, 1).unwrap();
+        let mut memory = vec![0; crate::DEFAULT_RDRAM_SIZE];
+        memory[4..6].copy_from_slice(&[0x12, 0x34]);
+        assert!(validate_reference_framebuffer_against_memory(
+            &observations,
+            &[0x12, 0x34],
+            &memory,
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_reference_framebuffer_against_memory(&observations, &[0xde, 0xad], &memory,),
+            Err(GateError::ReferenceFramebufferDoesNotMatchFrozenMemory {
+                address: 4,
+                bytes: 2,
+            })
+        ));
+    }
+
+    #[test]
     fn generic_executor_dma_cannot_satisfy_device_qualified_closure() {
         let trace = [TraceEvent {
             seq: 1,
@@ -7632,11 +7782,18 @@ mod tests {
             LiveObservedArtifacts {
                 framebuffer_artifact_bytes: b"fb",
                 framebuffer_payload_bytes: 2,
-                memory_bytes: b"memory",
                 observations: observations(),
             },
             path,
         );
         assert!(matches!(result, Err(GateError::LiveGateNotArmed)));
+    }
+
+    #[test]
+    fn missing_boundary_memory_has_its_own_error_before_geometry_validation() {
+        assert!(matches!(
+            require_boundary_physical_rdram(None),
+            Err(GateError::BoundaryPhysicalRdramUnavailable)
+        ));
     }
 }

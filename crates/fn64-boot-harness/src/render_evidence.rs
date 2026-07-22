@@ -12,9 +12,9 @@ use sha2::{Digest, Sha256};
 use crate::observation_evidence::RENDER_EVIDENCE_SCHEMA;
 use crate::{
     release_gate::LiveObservedArtifacts, ArtifactKind, FramebufferObservationFormat,
-    FramebufferObservationGeometry, FramebufferObservationSource, GateError, LiveMemoryEvidence,
-    LiveReleaseGate, ReleaseGateReport, ReleaseGraphicsApi, ReleaseHostPlatform,
-    ReleaseObservationGeometry,
+    FramebufferObservationGeometry, FramebufferObservationSource, GateError, LiveReleaseGate,
+    MemoryObservationGeometry, ReleaseGateReport, ReleaseGraphicsApi, ReleaseHostPlatform,
+    ReleaseObservationGeometry, DEFAULT_RDRAM_SIZE,
 };
 
 /// Position of the captured bytes in the renderer/presentation pipeline.
@@ -205,7 +205,6 @@ pub trait LiveReleaseGateRenderExt {
         scenario: impl Into<String>,
         input_bytes: &[u8],
         render: &LiveRenderEvidence,
-        memory: &LiveMemoryEvidence,
         report_path: impl AsRef<Path>,
     ) -> Result<ReleaseGateReport, GateError>;
 
@@ -217,7 +216,6 @@ pub trait LiveReleaseGateRenderExt {
         scenario: impl Into<String>,
         rom: crate::ReleaseRomInput<'_>,
         render: &LiveRenderEvidence,
-        memory: &LiveMemoryEvidence,
         report_path: impl AsRef<Path>,
     ) -> Result<ReleaseGateReport, GateError>;
 }
@@ -229,7 +227,6 @@ impl LiveReleaseGateRenderExt for LiveReleaseGate {
         scenario: impl Into<String>,
         input_bytes: &[u8],
         render: &LiveRenderEvidence,
-        memory: &LiveMemoryEvidence,
         report_path: impl AsRef<Path>,
     ) -> Result<ReleaseGateReport, GateError> {
         if render.guest_cycle != self.guest_cycle() {
@@ -254,7 +251,10 @@ impl LiveReleaseGateRenderExt for LiveReleaseGate {
                 format: FramebufferObservationFormat::Bgra8Unorm,
                 payload_bytes: render.bytes().len() as u64,
             },
-            memory: memory.geometry(),
+            memory: MemoryObservationGeometry {
+                physical_address: 0,
+                payload_bytes: DEFAULT_RDRAM_SIZE as u64,
+            },
         };
         self.capture_and_write_observed(
             boundary,
@@ -264,7 +264,6 @@ impl LiveReleaseGateRenderExt for LiveReleaseGate {
             LiveObservedArtifacts {
                 framebuffer_artifact_bytes: &render.canonical_bytes(),
                 framebuffer_payload_bytes: render.bytes().len(),
-                memory_bytes: memory.bytes(),
                 observations,
             },
             report_path,
@@ -277,7 +276,6 @@ impl LiveReleaseGateRenderExt for LiveReleaseGate {
         scenario: impl Into<String>,
         rom: crate::ReleaseRomInput<'_>,
         render: &LiveRenderEvidence,
-        memory: &LiveMemoryEvidence,
         report_path: impl AsRef<Path>,
     ) -> Result<ReleaseGateReport, GateError> {
         if render.guest_cycle != self.guest_cycle() {
@@ -302,7 +300,10 @@ impl LiveReleaseGateRenderExt for LiveReleaseGate {
                 format: FramebufferObservationFormat::Bgra8Unorm,
                 payload_bytes: render.bytes().len() as u64,
             },
-            memory: memory.geometry(),
+            memory: MemoryObservationGeometry {
+                physical_address: 0,
+                payload_bytes: DEFAULT_RDRAM_SIZE as u64,
+            },
         };
         self.capture_and_write_observed(
             boundary,
@@ -312,7 +313,6 @@ impl LiveReleaseGateRenderExt for LiveReleaseGate {
             LiveObservedArtifacts {
                 framebuffer_artifact_bytes: &render.canonical_bytes(),
                 framebuffer_payload_bytes: render.bytes().len(),
-                memory_bytes: memory.bytes(),
                 observations,
             },
             report_path,
@@ -751,15 +751,12 @@ mod tests {
     fn extension_rejects_render_capture_from_another_cycle_first() {
         let gate = LiveReleaseGate::new(43);
         let render = evidence("rt64", 1, 1, 1, 1, vec![0; 4]);
-        let memory =
-            LiveMemoryEvidence::full_physical_rdram(vec![0; crate::DEFAULT_RDRAM_SIZE]).unwrap();
         let error = gate
             .capture_and_write_render_evidence(
                 crate::CommittedViBoundary::synthetic_for_test(43),
                 "scenario",
                 b"input",
                 &render,
-                &memory,
                 "/tmp/unused",
             )
             .unwrap_err();

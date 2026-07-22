@@ -280,6 +280,17 @@ fn with_render_backend<T>(
             }
             Err(error) => {
                 let reason = error.to_string();
+                if let fn64_render::RenderError::UnsupportedUcode { ucode_addr } = &error {
+                    fn64_runtime::record_unsupported_event(
+                        fn64_runtime::UnsupportedSubsystem::Render,
+                        "render.backend.unsupported-ucode",
+                        format!(
+                            "{context}: backend rejected unlisted microcode at RDRAM offset {ucode_addr:#010x}"
+                        ),
+                        Some(fn64_runtime::Cycles::new(crate::sim_time())),
+                        fn64_runtime::UnsupportedDisposition::LoudTrap,
+                    );
+                }
                 RENDER_LAST_ERROR.with(|last| last.replace(Some(reason.clone())));
                 panic!("{context}: {reason}");
             }
@@ -2837,6 +2848,41 @@ mod tests {
         }
     }
 
+    struct UnsupportedUcodeBackend;
+
+    impl RenderBackend for UnsupportedUcodeBackend {
+        fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        no_rust_hidden_sidecar!();
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            Err(RenderError::UnsupportedUcode {
+                ucode_addr: task.ucode,
+            })
+        }
+
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[UcodeId] {
+            &[]
+        }
+    }
+
     struct ExactIdentityBackend {
         admitted: [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
         admitted_data: fn64_render::MicrocodeDataImageIdentity,
@@ -3122,6 +3168,51 @@ mod tests {
         set_render_backend(Box::new(StatusRenderBackend(FrameStatus::Complete)), 0);
         assert!(panic_message(panic.as_ref())
             .contains("renderer_gate_test: no render backend registered"));
+    }
+
+    #[test]
+    fn unsupported_backend_ucode_records_typed_event_before_loud_failure() {
+        set_render_backend(Box::new(UnsupportedUcodeBackend), 0);
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        let mut rdram = [];
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
+        let task = fn64_render::OsTask {
+            ucode: 0x0012_3450,
+            ..Default::default()
+        };
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_render_backend::<FrameStatus>("unsupported_ucode_test", |backend| {
+                backend.process_task(&mut rdram, &mut rsp_memory, &task, 0)
+            });
+        }))
+        .expect_err("unsupported backend ucode must remain a loud failure");
+
+        assert!(
+            panic_message(panic.as_ref()).contains("unsupported ucode at rdram offset 0x00123450")
+        );
+        assert_eq!(
+            last_render_error().as_deref(),
+            Some("unsupported ucode at rdram offset 0x00123450")
+        );
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].subsystem,
+            fn64_runtime::UnsupportedSubsystem::Render
+        );
+        assert_eq!(events[0].operation, "render.backend.unsupported-ucode");
+        assert_eq!(
+            events[0].context,
+            "unsupported_ucode_test: backend rejected unlisted microcode at RDRAM offset 0x00123450"
+        );
+        assert_eq!(events[0].guest_cycle, Some(fn64_runtime::Cycles::ZERO));
+        assert_eq!(
+            events[0].disposition,
+            fn64_runtime::UnsupportedDisposition::LoudTrap
+        );
+        fn64_runtime::complete_unsupported_observation(fn64_runtime::Cycles::ZERO, &"0".repeat(64));
+        RENDER_BACKEND.with(|cell| cell.replace(None));
     }
 
     #[test]

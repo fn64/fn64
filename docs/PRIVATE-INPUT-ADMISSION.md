@@ -1,13 +1,12 @@
 # Private-input admission
 
-Status: local admission, typed program/microcode-kickoff identity checks, and the
-trusted series mechanism are wired. Representative private NTSC full-ROM
-exact-ten series for reference and RT64 LLE/post-VI were retained and
-reverified locally on 2026-07-21. A fresh classifier-backed rerun retained the
-admitted pair as `F3dzex2` without host/backend pair registration. Their content-bearing evidence remains
-outside the repository; no private game content, path, length, or content hash
-is tracked here. Joint private-series matrix verification retains all 162
-FullParityV1 requirements and currently satisfies 9, leaving 153 explicit.
+Status: local admission, typed program/microcode-kickoff identity checks, and
+the trusted series mechanism are wired. Representative private NTSC full-ROM
+exact-ten schema-v20 series completed on 2026-07-21, but are historical after
+v21 made observations boundary-owned and bound the unsupported-instrumentation
+denominator. Their private content remains outside the repository. Historical
+joint verification satisfied 9 of 162 requirements; current v21 credit needs
+a fresh run.
 
 `tools/private_input_admission.py` validates private inputs before an
 Extended-GBI fixture or full-ROM release run consumes them. It never copies
@@ -190,7 +189,7 @@ digits, dots, underscores, or hyphens, beginning with a letter or digit. A raw
 
 `program_evidence_lane` is the pre-run executable-authority contract. A
 `full_rom` or `combined` run must select `typed_observed_function`,
-`typed_block_program`, or `identified_native_archive`; the resulting v20
+`typed_block_program`, or `identified_native_archive`; the resulting v21
 report must carry that exact execution-destination source.
 `typed_observed_function` asserts that the host installed the generated
 artifact's `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA` marker and that the
@@ -203,7 +202,7 @@ ten-run series spends time booting the game.
 
 The v7 `runner` section retains the v6 contract: it binds the exact native entry image, program-build
 receipt, working directory, argument vector, fixed child environment, gate
-cycle, and expected v20 execution source. The executable and receipt must be
+cycle, and expected v21 execution source. The executable and receipt must be
 built before admission. The trusted runner clears the ambient environment,
 launches the executable directly, and owns `ROM`,
 `FN64_RELEASE_ROM_CLASS`, the gate/report/event variables, and the staged
@@ -225,15 +224,15 @@ The release policy mirrors the typed release-matrix vocabulary:
   `rt64_post_vi_capture`;
 - the deterministic repeat bar is exactly ten.
 
-These values are pre-run admission policy only. Matrix v5 does not copy them
+These values are pre-run admission policy only. Matrix v6 does not copy them
 into a certification denominator or trust them as scenario coverage: it derives
 platform, controller, save, renderer, program-lane, and committed RSP/RDP-
 mechanism coverage from each validated committed-boundary report. A backend-
 recognized microcode family is diagnostic/optimization evidence only.
 Public-microcode credit requires independent exact digest-to-family
 adjudication by the immutable project-owned catalog v1, which is currently
-empty pending allowed-source digest provenance; matrix v16 therefore cannot yet
-satisfy any public-microcode requirement. Schema v20 binds RT64's resolved
+empty pending allowed-source digest provenance; matrix v17 therefore cannot yet
+satisfy any public-microcode requirement. Schema v21 binds RT64's resolved
 graphics API independently of the requested settings and derives
 `macos-metal` or `linux-vulkan` target credit only from an authoritative
 matching RT64 post-VI report. Windows D3D12 and Vulkan are distinguished, and
@@ -396,7 +395,7 @@ process able to discover, chmod, and replace staged paths between verification
 and operating-system open/spawn is outside scope, as is replacement of the
 OS-owned resolved Python image. Each child gets a distinct derived event
 identity and new report/journal/log paths.
-The runner verifies each terminal v3 journal, exact v20
+The runner verifies each terminal v3 journal, exact v21
 scenario/cycle/input/source, the five fixed-cycle artifacts, live-minimum
 closure, zero reached unsupported events, and the admitted microcode pair
 before starting the next child. For a
@@ -421,7 +420,7 @@ capabilities created by jointly revalidating the admitted contract, exact-ten
 receipt, retained reports/journals, raw ROM, runner image, bound files, and
 program-build receipt. It requires exact semantic-report and ordered run-event
 agreement with the matrix evidence and retains
-`fn64.verified-rom-class-authority.v1` in matrix v16. That record's digest
+`fn64.verified-rom-class-authority.v1` in matrix v17. That record's digest
 detects later drift; it is not a signature and does not replace external
 attestation when transferable provenance is required.
 
@@ -507,7 +506,7 @@ attestation connecting those identities.
 
 The build receipt does not claim microcode-data consumption. At graphics-task
 start, the ABI hashes the exact logical RDRAM bytes at the original task
-microcode-data address and length. Report schema `fn64.release-gate.v20`
+microcode-data address and length. Report schema `fn64.release-gate.v21`
 records those fields in
 the same recognition event as the live 4 KiB IMEM SHA-256 and recognized
 family, using `fn64.rsp-rdp-observations.v2`. Pinned raw-window classification
@@ -523,11 +522,10 @@ data SHA-256 with a recognized family.
 This proves which pair the task named at the authoritative kickoff boundary;
 it does not independently trace every later RSP read of the data image.
 
-These checks make a valid production contract launchable. A representative
-private NTSC full-ROM exact-ten series for reference and RT64 LLE/post-VI
-completed and were reverified locally on 2026-07-21 after the pinned raw-window
-classifier replaced host/backend pair registration, closing this mechanism
-path for those two scenarios only.
+These checks make a valid production contract launchable. Representative
+private reference and RT64 LLE/post-VI exact-ten series completed under v20 on
+2026-07-21. They are historical mechanism evidence and must be rerun under v21;
+no current v21 private series is claimed.
 The series receipt remains a self-hashed integrity record, not external process
 attestation; transferable provenance still requires a trusted CI/code-signing
 root over the receipt and runner.

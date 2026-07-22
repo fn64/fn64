@@ -67,6 +67,49 @@ pub unsafe fn register_process_rdram(rdram: *mut u8, rdram_len: usize) {
     with_executor(|exec| unsafe { exec.set_rdram_base_with_len(rdram, rdram_len) });
 }
 
+/// Copy the complete physical RDRAM device in logical guest-byte order.
+///
+/// The registered allocation can include fn64's host-only sparse MMIO window;
+/// release evidence must cover exactly the first eight MiB visible to the N64.
+/// `None` means no process RDRAM has been registered. A partial registration is
+/// an invalid runtime configuration and traps by name rather than producing a
+/// partial observation.
+///
+/// The process runtime is single-threaded. Callers must invoke this only at a
+/// host boundary where no guest coroutine or device operation is executing;
+/// the boot harness's committed-VI token is the production owner of that
+/// boundary.
+pub fn copy_registered_physical_rdram_logical() -> Option<Vec<u8>> {
+    let (rdram, allocation_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+    if rdram.is_null() {
+        assert_eq!(
+            allocation_len, 0,
+            "registered process RDRAM has a length but no storage pointer"
+        );
+        return None;
+    }
+    assert!(
+        allocation_len >= fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        "registered process RDRAM length {allocation_len:#x} does not cover the required {:#x}-byte physical device",
+        fn64_runtime::rdram::DEFAULT_RDRAM_SIZE
+    );
+
+    // SAFETY: registration owns a process-lifetime allocation, the length
+    // check above covers the complete physical device, and the host-boundary
+    // contract excludes concurrent guest/device access for this call.
+    Some(unsafe {
+        fn64_runtime::rdram::with_physical_rdram_read(rdram, allocation_len, |physical| {
+            let mut logical = vec![0; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+            for (offset, byte) in logical.iter_mut().enumerate() {
+                *byte = physical.read_u8(RdramAddr::from_offset(
+                    u32::try_from(offset).expect("physical RDRAM offset exceeds u32"),
+                ));
+            }
+            logical
+        })
+    })
+}
+
 /// Create and start thread 0 running `recomp_entrypoint` -- the harness's
 /// boot entry point. `recomp_entrypoint`'s own body (verified directly
 /// against `RecompiledFuncs/funcs_0.c`) computes its own jump target from
@@ -227,6 +270,40 @@ mod tests {
     fn reset_evidence_owners() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
         with_host(|host| *host = HostState::default());
+    }
+
+    #[test]
+    fn registered_physical_rdram_copy_is_complete_and_logical() {
+        reset_evidence_owners();
+        assert_eq!(copy_registered_physical_rdram_logical(), None);
+
+        let mut storage = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE + 16];
+        fn64_runtime::RdramViewMut::from_storage(&mut storage)
+            .write_u32(RdramAddr::from_offset(0), 0x0123_4567);
+        fn64_runtime::RdramViewMut::from_storage(&mut storage).write_u32(
+            RdramAddr::from_offset(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u32 - 4),
+            0x89ab_cdef,
+        );
+        unsafe { register_process_rdram(storage.as_mut_ptr(), storage.len()) };
+
+        let logical = copy_registered_physical_rdram_logical().unwrap();
+        assert_eq!(logical.len(), fn64_runtime::rdram::DEFAULT_RDRAM_SIZE);
+        assert_eq!(&logical[..4], &[0x01, 0x23, 0x45, 0x67]);
+        assert_eq!(
+            &logical[fn64_runtime::rdram::DEFAULT_RDRAM_SIZE - 4..],
+            &[0x89, 0xab, 0xcd, 0xef]
+        );
+
+        reset_evidence_owners();
+    }
+
+    #[test]
+    #[should_panic(expected = "does not cover the required 0x800000-byte physical device")]
+    fn registered_physical_rdram_copy_rejects_partial_registration() {
+        reset_evidence_owners();
+        let mut storage = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE - 4];
+        unsafe { register_process_rdram(storage.as_mut_ptr(), storage.len()) };
+        let _ = copy_registered_physical_rdram_logical();
     }
 
     fn populated_host_snapshot(

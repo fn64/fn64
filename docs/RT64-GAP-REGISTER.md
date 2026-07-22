@@ -237,11 +237,12 @@ one Q16 LSB above every checkerboard X position. These characterize fn64's
 policy and commanded fixed-point boundary without changing the public
 checkerboard output or claiming an internal accumulator width. Allowed public sources still do not
 establish whether silicon uses a representative lookup or any arithmetic
-centroid. Full-coverage triangles retain pixel-center attributes. Partial raw
-and high-level triangles share one typed covered attribute sample for shade,
-texture, and Z, matching Programming Manual 15.4's requirement that corrected
-Z intersect the primitive. Nearest-covered selection and stable tie order are
-a declared bounded host policy. The raw executor no longer converts
+centroid. Full-coverage triangles and lines retain pixel-center attributes.
+Partial raw and high-level triangles plus normalized lines share one typed
+covered attribute sample for shade, texture, and Z, matching Programming
+Manual 15.4's requirement that corrected Z intersect the primitive.
+Nearest-covered selection and stable tie order are a declared bounded host
+policy. The raw executor no longer converts
 coefficient stepping to host floats, but gate-level truncation remains a
 black-box differential frontier.
 
@@ -345,7 +346,7 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
   creation and ordinary VI events, then observe exact completed-workload rate
   sequences `[0,0,0,50]` and `[0,0,0,60]` without an Extended override. The
   overlay does not alter the later Extended-GBI refresh-rate override. A
-  schema-v20 full-ROM path now co-binds normalized destination-code TV region,
+  schema-v21 full-ROM path now co-binds normalized destination-code TV region,
   committed device TV state, and renderer create-time configuration. No
   representative private exact-ten PAL/MPAL series has yet been retained;
   physical compositor cadence, field timing, and analog PAL output remain
