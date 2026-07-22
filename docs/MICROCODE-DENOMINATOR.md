@@ -34,6 +34,14 @@ or differently classified raw pair before native entry, as well as a raw
 F3DZEX2 pair labeled as another family. This is prerequisite identity and
 capability plumbing, not HLE admission or public-microcode credit.
 
+The first behavior-bearing slice is also present without broadening that
+denominator: both control-flow interpreters implement pinned RT64 BranchW as a
+strict transformed-W comparison with exact seven-bit slot selection,
+u32-to-f32 threshold conversion, forced-branch ordering, persistent HALF_1,
+and masked segmented tail targets. F3DEX2 opcode `0x04` remains BranchZ. The
+F3DZEX2 catalog stays closed until all three variants' NoN/point-lighting and
+self-load transitions are implemented and differentially validated.
+
 Matrix v5 does not trust the backend's family label for public-microcode
 credit. It independently adjudicates each reported text digest through the
 immutable, project-owned certified-public-microcode catalog v1, and rejects a

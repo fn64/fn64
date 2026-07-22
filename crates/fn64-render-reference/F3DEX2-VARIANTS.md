@@ -59,7 +59,7 @@ fixed-point rounding at negative or boundary coordinates. An F3DLX2.Rej
 substituting host rounding. Raw screen-coordinate fixtures still prove its
 wire, 64-entry cache, rejection policy, and raster handoff.
 
-## 4. F3DZEX2 remains an explicit unsupported identity
+## 4. F3DZEX2 remains an explicit unadmitted identity
 
 The public Nintendo materials above do not specify an F3DZEX2 command
 envelope. Public
@@ -75,7 +75,7 @@ Pinned MIT RT64 does publish a software-parity definition in
 2.08I/J variants enable point lighting. That is an allowed RT64 parity source,
 not a Nintendo specification or hardware-exact oracle. fn64 binds those raw
 text/data fingerprints only to backend-neutral identity; it has not validated
-the family-specific operations independently, so HLE remains unadmitted.
+all family-specific operations independently, so HLE remains unadmitted.
 
 Ordered HLE admission nevertheless retains the behavior-bearing identity
 explicitly. `TaskAdmissionUcode::F3dzex2` requires one of the three classified
@@ -85,16 +85,31 @@ The canonical plan-v2 identity and native schema-v2 wire bind variant tags 1,
 three, point lighting disabled for 2.06H, and point lighting enabled for
 2.08I/J. The raw text/data pool remains the authority that distinguishes I
 from J because pinned RT64 exposes identical native behavior flags for those
-two rows. This closes identity collapse only; it does not open the decoder.
+two rows. This closes identity collapse only; it does not open production
+admission.
+
+The common BranchW control-flow delta is now implemented independently in the
+backend-neutral transactional inspector and deterministic reference decoder.
+Both retain the transformed homogeneous W at `G_VTX`, decode the seven-bit
+slot from bits 1..7, apply pinned RT64's strict `W < float(u32 threshold)`
+condition (including integer-to-float rounding), validate the vertex even for
+a forced branch, require persistent HALF_1 only on a taken path, and
+resolve/align the segmented tail target. Adversarial tests keep opcode `0x04`
+as ordinary BranchZ under F3DEX2, exercise loaded slot 126 and unloaded slot
+127, preserve W across screen-coordinate modification, and trap non-finite W
+or an invalid target extent. This is pinned RT64 software behavior, not a
+hardware-exact BranchW claim.
 
 fn64 names `GeometryWireFamily::F3dzex2` and `UcodeId::F3dzex2` so the frontier
-cannot be mistaken for ordinary F3DEX2. Catalog admission, command decode, and
-state initialization all trap with the missing-evidence requirement. In
-particular, fn64 does not reinterpret a reserved `G_SPECIAL_*` opcode, alias an
-F3DZEX2 digest to F3DEX2, or claim support from game-era naming alone. Closing
-the RT64-parity HLE boundary requires an independently tested implementation of
-the allowed pinned behavior definition. A hardware-exact or Nintendo-public
-claim separately requires hardware/black-box evidence or a public specification.
+cannot be mistaken for ordinary F3DEX2. Catalog admission still traps with the
+missing-evidence requirement. The internal decoder admits only the now-tested
+BranchW delta; it does not reinterpret the remaining reserved `G_SPECIAL_*`
+opcodes, alias an F3DZEX2 digest to F3DEX2, or claim support from game-era
+naming alone. Closing the RT64-parity HLE boundary still requires variant-gated
+NoN and point-lighting implementation, shared self-load profile propagation,
+native pixel differentials, and repeated representative full-task evidence. A
+hardware-exact or Nintendo-public claim separately requires hardware/black-box
+evidence or a public specification.
 
 The backend-neutral identity classifier hashes the larger raw task text/data
 prefixes with pinned RT64's XXH3 rows before rspboot or LLE mutates state. A
