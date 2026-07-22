@@ -969,11 +969,20 @@ task calls out:
   point-light hypotheses at each 16/24/32-byte candidate transfer width. Each
   subcase receives fresh RDRAM/RSP/native state, exactly one FullSync, guarded
   synthetic inputs, and a subsequent present whose workload identity must
-  equal the task's final counter. Admission fixes the suite; private manifests
-  cannot select a variant, commands, cases, or expected results. This remains
-  characterization transport only, currently entry-only and not yet exercised
-  with an admitted private point-light pair; it neither opens production HLE
-  nor supplies the missing wire/arithmetic evidence.
+  equal the task's final counter. Candidate, knockout, and adaptive refinement
+  vectors set `G_LIGHTING | G_POINT_LIGHTING`; the directional control sets
+  only `G_LIGHTING`, and the lighting-disabled control sets neither bit.
+  Admission fixes the suite; private manifests cannot select a variant,
+  commands, cases, or expected results. The runner obtains its two raw windows
+  only from the boot harness's typed in-process Rust loader. That loader
+  revalidates current v7 scope, exact-matches the supplied readiness bytes to
+  its canonical derivation, and returns the bytes captured while each window
+  was read and hashed through one stable no-follow descriptor or Windows
+  handle. Python remains a producer and differential oracle, never loader
+  authority. This remains characterization transport only, currently
+  entry-only and not yet exercised with an admitted private point-light pair;
+  it neither opens production HLE nor supplies the missing wire/arithmetic
+  evidence.
   Internally, the transactional inspector and reference decoder now share the
   pinned BranchW control-flow rule: opcode `0x04` selects bits 1..7, validates
   a loaded finite transformed W, compares it strictly with `float(u32 w1)`,

@@ -37,6 +37,10 @@ pub use platform_certification::{
     VerifiedRt64PlatformCaseAuthority, VerifiedRt64PlatformCaseSeries,
     RT64_PLATFORM_CHILD_IDENTITY_SCHEMA, VERIFIED_RT64_PLATFORM_CASE_AUTHORITY_SCHEMA,
 };
+pub use private_input_admission::{
+    load_private_f3dzex2_characterization_input, PrivateF3dzex2CharacterizationError,
+    VerifiedPrivateF3dzex2CharacterizationInput,
+};
 pub use private_release_series::{
     load_private_release_run_contract, run_private_release_series, verify_private_release_series,
     verify_private_release_series_with_runner,
