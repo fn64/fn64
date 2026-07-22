@@ -27,6 +27,4 @@ fn64-runtime = { path = "../../crates/fn64-runtime" }
 fn64-abi = { path = "../../crates/fn64-abi" }
 fn64-boot-harness = { path = "../../crates/fn64-boot-harness" }
 fn64-render = { path = "../../crates/fn64-render" }
-# Default features only (pure-Rust ReferenceBackend + LLE raw-RDP lane); the
-# `rt64` GPU feature is deliberately NOT enabled -- this harness is headless.
-fn64-render-rt64 = { path = "../../crates/fn64-render-rt64" }
+fn64-render-reference = { path = "../../crates/fn64-render-reference" }

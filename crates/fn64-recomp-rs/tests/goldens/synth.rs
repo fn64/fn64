@@ -2,6 +2,7 @@
 // Emitted by fn64-recomp-rs (typed Rust, no unsafe).
 #[allow(unused_variables)]
 pub fn synth_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(0x80100000, "synth_recomp"));
     let mut pc: u32 = 0x80100000;
     'run: loop { match pc {
         0x80100000 => {

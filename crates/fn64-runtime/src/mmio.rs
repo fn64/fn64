@@ -81,10 +81,16 @@
 pub const RDRAM_MMIO_WINDOW_START: u32 = 0x2400_0000;
 
 /// One-past-the-end of the modeled hardware-register window, `RdramAddr`
-/// space. Real KSEG1 registers span `0xA400_0000..0xA900_0000` (`SI`'s
-/// block at `0xA800_0000` is the last one this crate models); translated
-/// the same way, `0x2900_0000`.
+/// space. This is the backing-allocation extent for raw generated KSEG1
+/// accesses, including cartridge-domain addresses that are not decoded as RCP
+/// registers. The narrower [`RDRAM_RCP_MMIO_END`] is the decoder boundary.
 pub const RDRAM_MMIO_WINDOW_END: u32 = 0x2900_0000;
+
+/// Exclusive end of the actual RCP register decode. SI starts at
+/// `0xA480_0000` and is the final block before `0xA490_0000`; translated into
+/// `RdramAddr` space, that boundary is `0x2490_0000`. Cartridge-domain KSEG1
+/// addresses such as `0xA600_1010` remain ordinary backed memory.
+pub const RDRAM_RCP_MMIO_END: u32 = 0x2490_0000;
 
 /// Base offsets of each hardware unit's register block, relative to
 /// `RDRAM_MMIO_WINDOW_START` (i.e. already in `RdramAddr`-offset space, NOT
@@ -328,7 +334,7 @@ pub struct MmioSpace {
 /// decoded by `MmioSpace::read_w`/`write_w` falls through to that
 /// function's own loud trap rather than a silent wraparound into `Rdram`.
 pub fn is_mmio_offset(offset: u32) -> bool {
-    (RDRAM_MMIO_WINDOW_START..RDRAM_MMIO_WINDOW_END).contains(&offset)
+    (RDRAM_MMIO_WINDOW_START..RDRAM_RCP_MMIO_END).contains(&offset)
 }
 
 // `base::UNIT | 0x00` below is deliberate, uniform "base + register offset"
@@ -564,6 +570,14 @@ mod tests {
             crate::RdramAddr::from_gpr(0xA450_000C).offset()
         ));
         assert!(is_mmio_offset(RDRAM_MMIO_WINDOW_START));
+        assert!(is_mmio_offset(
+            crate::RdramAddr::from_gpr(0xA480_0018).offset()
+        ));
+        assert!(!is_mmio_offset(RDRAM_RCP_MMIO_END));
+        assert!(
+            !is_mmio_offset(crate::RdramAddr::from_gpr(0xA600_1010).offset()),
+            "KSEG1 cartridge space is not RCP MMIO"
+        );
         assert!(
             !is_mmio_offset(0x0000_1000),
             "a plain low rdram offset is not MMIO"

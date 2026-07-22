@@ -235,6 +235,9 @@ version = "0.0.0"
 dependencies = [
  "fn64-abi",
  "fn64-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -273,6 +276,7 @@ name = "fn64-render"
 version = "0.0.0"
 dependencies = [
  "fn64-runtime",
+ "sha2",
 ]
 
 [[package]]

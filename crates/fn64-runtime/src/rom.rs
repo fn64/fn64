@@ -39,7 +39,8 @@
 use crate::device::Cycles;
 use crate::rdram::RdramAddr;
 use crate::save::{
-    EepromError, EepromKind, EepromStatus, SaveStorage, EEPROM_BLOCK_SIZE, EEPROM_WRITE_CYCLES,
+    EepromError, EepromKind, EepromStatus, SaveOperationEvent, SaveOperationKind, SaveStorage,
+    SaveType, EEPROM_BLOCK_SIZE, EEPROM_WRITE_CYCLES,
 };
 use crate::trace::DmaDirection;
 
@@ -212,6 +213,10 @@ pub struct PiDma<R: RomStorage> {
     /// not a silent ROM read past its end -- the old bug this fix removes.
     save: Option<Box<dyn SaveStorage>>,
     pending_eeprom_write: Option<PendingEepromWrite>,
+    /// Successful EEPROM storage actions and timed SRAM DMA commits observed
+    /// at their authoritative boundaries. This history is release evidence,
+    /// not future device state, so it is intentionally absent from snapshots.
+    save_operations: Vec<SaveOperationEvent>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,12 +226,22 @@ struct PendingEepromWrite {
     ready_at: Cycles,
 }
 
+/// Immutable view of an EEPROM programming operation that has been accepted
+/// but has not reached its guest-cycle completion deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingEepromWriteSnapshot {
+    pub offset: u32,
+    pub data: [u8; EEPROM_BLOCK_SIZE],
+    pub ready_at: Cycles,
+}
+
 impl<R: RomStorage> PiDma<R> {
     pub fn new(rom: R) -> Self {
         PiDma {
             rom,
             save: None,
             pending_eeprom_write: None,
+            save_operations: Vec::new(),
         }
     }
 
@@ -252,6 +267,52 @@ impl<R: RomStorage> PiDma<R> {
         self.save.as_deref().map(SaveStorage::len)
     }
 
+    /// Successful EEPROM reads, matured programming operations, and SRAM DMA
+    /// commits in exact guest-cycle order. Raw and high-level callers enter
+    /// through these primitives, so neither path needs shim-name heuristics.
+    pub fn save_operations(&self) -> &[SaveOperationEvent] {
+        &self.save_operations
+    }
+
+    /// Move completed EEPROM observations to the ABI's unified release log.
+    /// Draining at each host boundary preserves same-cycle order relative to
+    /// PFS, FlashRAM, and SRAM operations owned above this storage primitive.
+    pub fn take_save_operations(&mut self) -> Vec<SaveOperationEvent> {
+        std::mem::take(&mut self.save_operations)
+    }
+
+    pub(crate) fn record_sram_dma_commit(&mut self, at: Cycles, completion: DmaCompletion) {
+        if !is_sram_dev_addr(completion.dev_addr)
+            || self.save_len() != Some(SaveType::SramBanked.byte_len())
+        {
+            return;
+        }
+        self.save_operations.push(SaveOperationEvent {
+            at,
+            device: SaveType::SramBanked,
+            operation: match completion.direction {
+                DmaDirection::ToRdram => SaveOperationKind::Read,
+                DmaDirection::FromRdram => SaveOperationKind::Write,
+            },
+            offset: completion.dev_addr - SRAM_DOMAIN2_BASE,
+            len: completion.len,
+        });
+    }
+
+    /// Copy the complete installed save image without changing device bytes.
+    pub fn save_snapshot_bytes(&mut self) -> Option<Vec<u8>> {
+        self.save.as_deref_mut().map(SaveStorage::snapshot_bytes)
+    }
+
+    pub fn pending_eeprom_write_snapshot(&self) -> Option<PendingEepromWriteSnapshot> {
+        self.pending_eeprom_write
+            .map(|pending| PendingEepromWriteSnapshot {
+                offset: u32::try_from(pending.offset).expect("EEPROM pending offset exceeds u32"),
+                data: pending.data,
+                ready_at: pending.ready_at,
+            })
+    }
+
     fn eeprom_kind(&self) -> Result<EepromKind, EepromError> {
         self.save_len()
             .and_then(EepromKind::from_byte_len)
@@ -268,9 +329,19 @@ impl<R: RomStorage> PiDma<R> {
         if pending.ready_at > now {
             return;
         }
+        let kind = self
+            .eeprom_kind()
+            .expect("a pending EEPROM write exists without an EEPROM store");
         self.pending_eeprom_write = None;
         self.save_mut("EEPROM write completion")
             .write_from(pending.offset, &pending.data);
+        self.save_operations.push(SaveOperationEvent {
+            at: pending.ready_at,
+            device: kind.save_type(),
+            operation: SaveOperationKind::Write,
+            offset: u32::try_from(pending.offset).expect("EEPROM offset exceeds u32"),
+            len: u32::try_from(EEPROM_BLOCK_SIZE).expect("EEPROM block size exceeds u32"),
+        });
     }
 
     pub fn eeprom_status(&mut self, now: Cycles) -> Option<EepromStatus> {
@@ -305,6 +376,13 @@ impl<R: RomStorage> PiDma<R> {
         let offset = usize::from(kind.normalize_hardware_block(block)) * EEPROM_BLOCK_SIZE;
         let mut data = [0; EEPROM_BLOCK_SIZE];
         self.save_mut("EEPROM read").read_into(offset, &mut data);
+        self.save_operations.push(SaveOperationEvent {
+            at: now,
+            device: kind.save_type(),
+            operation: SaveOperationKind::Read,
+            offset: u32::try_from(offset).expect("EEPROM offset exceeds u32"),
+            len: u32::try_from(EEPROM_BLOCK_SIZE).expect("EEPROM block size exceeds u32"),
+        });
         Ok(data)
     }
 
@@ -347,43 +425,19 @@ impl<R: RomStorage> PiDma<R> {
         })
     }
 
-    /// SRAM address decode shared by [`Self::sram_read_into`] /
-    /// [`Self::sram_write_from`]: a discrete SRAM part decodes only the
-    /// address lines it physically has (a 256 Kbit part: A0..A14), so the PI
-    /// byte address reaching the chip aliases **modulo the power-of-two
-    /// device size** -- there is no such thing as an out-of-range SRAM
-    /// access on real hardware, only a wrapped one.
-    ///
-    /// Shipped-game evidence this aliasing is load-bearing (not an invented
-    /// leniency): WM2000 (NWXE) boots by reading its whole save payload as a
-    /// round `0x8000` bytes from device offset `0x20` (`func_800F497C`:
-    /// OSIoMesg `devAddr=0x20, size=0x8000`, OS_READ -- immediately after
-    /// validating the 0x19990901 signature header at `devAddr=0`). On the
-    /// cart's 256 Kbit chip (mupen64plus.ini NWXE `SaveType=SRAM`; the
-    /// game's own save-region table at `0x8010625C`, 13 entries, caps real
-    /// payload use at device offset `0x66E4`) the final `0x20` bytes of that
-    /// read alias back to `0x0..0x20` -- returning the signature header into
-    /// a buffer tail the game never consumes. Writes never wrap: every
-    /// region write is `region_offset + 0x20 .. + size + 4-byte checksum`,
-    /// max end `0x66E4`.
-    ///
-    /// A transfer LONGER than the whole device would alias every byte more
-    /// than once -- no shipped access pattern does that, so it stays a loud
-    /// trap (a mis-decoded length, not hardware behavior worth modeling
-    /// silently). Likewise a non-power-of-two device has no well-defined
-    /// "undriven address line" model, so it keeps the strict bounds trap.
-    fn sram_decode(&mut self, dir: &str, sram_offset: u32, len: usize) -> (usize, usize) {
-        let device_len = self.save_mut(dir).len();
+    /// Decode PI SRAM addresses using only the address lines present on the
+    /// discrete power-of-two device. Transfers may wrap once at the device
+    /// boundary; a transfer longer than the whole part remains a loud fault.
+    fn sram_decode(&mut self, direction: &str, offset: u32, len: usize) -> (usize, usize) {
+        let device_len = self.save_mut(direction).len();
         assert!(
             len <= device_len,
-            "PiDma: SRAM {dir} of {len:#x} bytes exceeds the whole {device_len:#x}-byte device \
-             -- every byte would alias more than once; a mis-decoded DMA length, not the \
-             single-wrap tail real carts exercise (see sram_decode's doc comment)"
+            "PiDma: SRAM {direction} of {len:#x} bytes exceeds the whole {device_len:#x}-byte device"
         );
         let start = if device_len.is_power_of_two() {
-            sram_offset as usize & (device_len - 1)
+            offset as usize & (device_len - 1)
         } else {
-            sram_offset as usize
+            offset as usize
         };
         (start, device_len)
     }
@@ -394,9 +448,6 @@ impl<R: RomStorage> PiDma<R> {
     /// `osEPiStartDma_recomp`), exactly like a ROM DMA-in, because the guest
     /// reads the destination back via `MEM_BU` (`^3` byte-lane XOR, recomp.h)
     /// -- a flat rdram write would read back byte-swapped within each word.
-    ///
-    /// A transfer running past the last device byte wraps to offset 0, per
-    /// the chip's real address decode -- see [`Self::sram_decode`].
     pub fn sram_read_into(&mut self, sram_offset: u32, buf: &mut [u8]) {
         let (start, device_len) = self.sram_decode("read", sram_offset, buf.len());
         let first = buf.len().min(device_len - start);
@@ -411,9 +462,6 @@ impl<R: RomStorage> PiDma<R> {
     /// `devAddr - SRAM_DOMAIN2_BASE`). The caller un-swizzles rdram's
     /// native-word bytes back to flat save order first (see
     /// `osEPiStartDma_recomp`'s FromRdram arm).
-    ///
-    /// Wraps at the device boundary exactly like [`Self::sram_read_into`]
-    /// (same chip, same address lines) -- see [`Self::sram_decode`].
     pub fn sram_write_from(&mut self, sram_offset: u32, data: &[u8]) {
         let (start, device_len) = self.sram_decode("write", sram_offset, data.len());
         let first = data.len().min(device_len - start);
@@ -463,13 +511,13 @@ impl<R: RomStorage> PiDma<R> {
     }
 
     /// `osEPiStartDma(handle, mb, direction)`'s core transfer, once the
-    /// caller (`fn64-abi`'s shim) has already resolved the `OSIoMesg`'s
-    /// `dramAddr`/`devAddr`/`size` fields and the handle's cartridge-domain
-    /// timing (`osCartRomInit`'s role, per rung 10b -- validated but not
-    /// modeled numerically here: this milestone's shims don't yet need PI
-    /// timing-register values, only a valid handle to have existed before
-    /// the first real DMA, matching the rung's actual failure mode being
-    /// "reads zero garbage from an unnamed handle," not a timing bug).
+    /// caller (`fn64-abi`'s shim) has decoded the `OSIoMesg`, formed the
+    /// public `handle->baseAddress | devAddr`, normalized the supported
+    /// Game Pak/SRAM physical spaces into this engine's address convention,
+    /// and applied the handle timing to `DeviceFabric`'s raw PI registers.
+    /// Keeping handle parsing above this storage primitive lets managed/raw
+    /// EPI and programmed I/O share one authority without teaching the
+    /// runtime core about guest C-struct layout.
     ///
     /// Copies `len` ROM bytes starting at `dev_addr` into `rdram` at
     /// `dram_addr`, matching real cartridge-domain PI DMA's actual effect --
@@ -672,10 +720,21 @@ mod tests {
         dma.advance_eeprom_to(Cycles::new(deadline.get() - 1));
         dma.save_read_into(3 * EEPROM_BLOCK_SIZE, &mut physical);
         assert_eq!(physical, [0xFF; EEPROM_BLOCK_SIZE]);
+        assert!(dma.save_operations().is_empty());
         dma.advance_eeprom_to(deadline);
         dma.save_read_into(3 * EEPROM_BLOCK_SIZE, &mut physical);
         assert_eq!(physical, first);
         assert_eq!(dma.eeprom_busy_until(deadline), None);
+        assert_eq!(
+            dma.save_operations(),
+            &[SaveOperationEvent {
+                at: deadline,
+                device: SaveType::Eeprom4k,
+                operation: SaveOperationKind::Write,
+                offset: 3 * EEPROM_BLOCK_SIZE as u32,
+                len: EEPROM_BLOCK_SIZE as u32,
+            }]
+        );
     }
 
     #[test]
@@ -688,6 +747,65 @@ mod tests {
         let deadline = dma.start_eeprom_write(Cycles::ZERO, 0xC2, data).unwrap();
         dma.advance_eeprom_to(deadline);
         assert_eq!(dma.eeprom_read_block(deadline, 0x02).unwrap(), data);
+        assert_eq!(
+            dma.save_operations(),
+            &[
+                SaveOperationEvent {
+                    at: deadline,
+                    device: SaveType::Eeprom4k,
+                    operation: SaveOperationKind::Write,
+                    offset: 2 * EEPROM_BLOCK_SIZE as u32,
+                    len: EEPROM_BLOCK_SIZE as u32,
+                },
+                SaveOperationEvent {
+                    at: deadline,
+                    device: SaveType::Eeprom4k,
+                    operation: SaveOperationKind::Read,
+                    offset: 2 * EEPROM_BLOCK_SIZE as u32,
+                    len: EEPROM_BLOCK_SIZE as u32,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn replacing_an_idle_save_store_preserves_append_only_release_history() {
+        let mut dma = PiDma::new(InMemoryRom::new(vec![]));
+        dma.set_save(Box::new(InMemorySaveStorage::for_device(
+            SaveType::Eeprom4k,
+        )));
+        let first_deadline = dma
+            .start_eeprom_write(Cycles::new(7), 1, [0x3c; EEPROM_BLOCK_SIZE])
+            .unwrap();
+        dma.advance_eeprom_to(first_deadline);
+
+        dma.set_save(Box::new(InMemorySaveStorage::for_device(
+            SaveType::Eeprom16k,
+        )));
+        let second_deadline = dma
+            .start_eeprom_write(first_deadline, 2, [0xa5; EEPROM_BLOCK_SIZE])
+            .unwrap();
+        dma.advance_eeprom_to(second_deadline);
+
+        assert_eq!(
+            dma.save_operations(),
+            &[
+                SaveOperationEvent {
+                    at: first_deadline,
+                    device: SaveType::Eeprom4k,
+                    operation: SaveOperationKind::Write,
+                    offset: EEPROM_BLOCK_SIZE as u32,
+                    len: EEPROM_BLOCK_SIZE as u32,
+                },
+                SaveOperationEvent {
+                    at: second_deadline,
+                    device: SaveType::Eeprom16k,
+                    operation: SaveOperationKind::Write,
+                    offset: 2 * EEPROM_BLOCK_SIZE as u32,
+                    len: EEPROM_BLOCK_SIZE as u32,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -767,35 +885,20 @@ mod tests {
     }
 
     #[test]
-    fn sram_read_past_the_last_byte_wraps_to_offset_zero_like_the_real_chip() {
-        // WM2000 (NWXE) boot: after validating the 0x19990901 signature
-        // header at device offset 0, `func_800F497C` reads the payload as a
-        // round 0x8000 bytes from device offset 0x20 -- 0x20 past a 256 Kbit
-        // chip's end. The chip only decodes A0..A14, so the tail aliases back
-        // to 0x0..0x20 and the read returns the header again (harmless: the
-        // game's region table caps real payload use at 0x66E4). Model that
-        // wrap exactly; scaled here to a small power-of-two device.
+    fn sram_read_wraps_at_the_power_of_two_device_boundary() {
         let mut dma = PiDma::new(InMemoryRom::new(vec![0u8; 0x10]));
         let mut save = InMemorySaveStorage::new(0x100);
-        save.write_from(0x00, &[0xA1, 0xA2, 0xA3, 0xA4]); // "header"
-        save.write_from(0xFC, &[0xB1, 0xB2, 0xB3, 0xB4]); // last device bytes
+        save.write_from(0, &[0xA1, 0xA2, 0xA3, 0xA4]);
+        save.write_from(0xFC, &[0xB1, 0xB2, 0xB3, 0xB4]);
         dma.set_save(Box::new(save));
 
-        // Read 8 bytes starting 4 short of the device end: 4 real tail bytes,
-        // then the wrap delivers the 4 "header" bytes.
         let mut buf = [0u8; 8];
         dma.sram_read_into(0xFC, &mut buf);
-        assert_eq!(
-            buf,
-            [0xB1, 0xB2, 0xB3, 0xB4, 0xA1, 0xA2, 0xA3, 0xA4],
-            "the over-the-end tail must alias to offset 0, not trap or zero-fill"
-        );
+        assert_eq!(buf, [0xB1, 0xB2, 0xB3, 0xB4, 0xA1, 0xA2, 0xA3, 0xA4]);
     }
 
     #[test]
-    fn sram_write_past_the_last_byte_wraps_to_offset_zero_like_the_real_chip() {
-        // Same address decode as the read direction -- one chip, one set of
-        // address lines. A write spanning the end lands its tail at offset 0.
+    fn sram_write_wraps_at_the_power_of_two_device_boundary() {
         let mut dma = PiDma::new(InMemoryRom::new(vec![0u8; 0x10]));
         dma.set_save(Box::new(InMemorySaveStorage::new(0x100)));
 
@@ -804,17 +907,15 @@ mod tests {
         dma.save_read_into(0xFE, &mut tail);
         assert_eq!(tail, [0x71, 0x72]);
         let mut head = [0u8; 2];
-        dma.save_read_into(0x00, &mut head);
-        assert_eq!(head, [0x73, 0x74], "wrapped write tail must land at offset 0");
+        dma.save_read_into(0, &mut head);
+        assert_eq!(head, [0x73, 0x74]);
     }
 
     #[test]
-    fn sram_offset_beyond_the_device_masks_down_via_undriven_address_lines() {
-        // High address bits the chip has no lines for simply don't reach it:
-        // offset 0x104 on a 0x100-byte part addresses byte 0x04.
+    fn sram_offset_masks_to_the_available_address_lines() {
         let mut dma = PiDma::new(InMemoryRom::new(vec![0u8; 0x10]));
         let mut save = InMemorySaveStorage::new(0x100);
-        save.write_from(0x04, &[0xEE]);
+        save.write_from(4, &[0xEE]);
         dma.set_save(Box::new(save));
 
         let mut buf = [0u8; 1];
@@ -824,9 +925,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "exceeds the whole")]
-    fn sram_transfer_longer_than_the_device_still_traps_loudly() {
-        // A transfer longer than the whole device would alias every byte more
-        // than once -- no real access pattern; keep the honest trap.
+    fn sram_transfer_longer_than_the_device_traps_loudly() {
         let mut dma = PiDma::new(InMemoryRom::new(vec![0u8; 0x10]));
         dma.set_save(Box::new(InMemorySaveStorage::new(0x100)));
         let mut buf = [0u8; 0x101];

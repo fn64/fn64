@@ -11,10 +11,12 @@ use crate::NormalizedRom;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 
 pub const BLOCK_PACK_SCHEMA_V1: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackedBlockV1 {
     pub start_va: u32,
     pub end_va: u32,
@@ -25,6 +27,7 @@ pub struct PackedBlockV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackedBankV1 {
     pub bank: String,
     pub bank_id: u64,
@@ -32,6 +35,7 @@ pub struct PackedBankV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockPackV1 {
     pub schema_version: u32,
     pub normalized_rom_sha256: String,
@@ -53,6 +57,10 @@ pub struct MaterializedPackedBank {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockPackError {
+    UnsupportedSchema {
+        expected: u32,
+        actual: u32,
+    },
     RomIdentityMismatch,
     NoProvenBlocks {
         bank: String,
@@ -70,6 +78,10 @@ pub enum BlockPackError {
         left: u32,
         right: u32,
     },
+    DuplicateBankId {
+        bank: String,
+        bank_id: u64,
+    },
     RomRangeOutsideImage {
         bank: String,
         rom_start: u32,
@@ -79,6 +91,59 @@ pub enum BlockPackError {
         bank: String,
         start_va: u32,
     },
+}
+
+/// Explicit host policy needed to turn a portable pack into an executable
+/// generated-source artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockProgramSourceConfig {
+    pub entry: fn64_recomp_rs::ExecutionKey,
+    pub instruction_budget: fn64_recomp_rs::InstructionBudget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockProgramSourceError {
+    Pack(BlockPackError),
+    InvalidBank {
+        bank: String,
+        error: fn64_recomp_rs::BankError,
+    },
+    DuplicateBankId {
+        bank: fn64_recomp_rs::BankId,
+    },
+    EntryFault(fn64_recomp_rs::CpuFault),
+    TooManyBanks {
+        count: usize,
+    },
+}
+
+impl std::fmt::Display for BlockProgramSourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pack(error) => write!(f, "block pack: {error}"),
+            Self::InvalidBank { bank, error } => {
+                write!(f, "materialized bank {bank:?} is invalid: {error}")
+            }
+            Self::DuplicateBankId { bank } => {
+                write!(f, "block pack repeats executable identity {bank}")
+            }
+            Self::EntryFault(fault) => {
+                write!(f, "declared block-program entry is not admitted: {fault}")
+            }
+            Self::TooManyBanks { count } => write!(
+                f,
+                "block program has {count} banks, exceeding the u32 resolver ambiguity wire"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BlockProgramSourceError {}
+
+impl From<BlockPackError> for BlockProgramSourceError {
+    fn from(error: BlockPackError) -> Self {
+        Self::Pack(error)
+    }
 }
 
 impl std::fmt::Display for BlockPackError {
@@ -118,10 +183,9 @@ pub fn emit_block_pack_v1(
         validate_completed_geometry(bank, &geometry)?;
         let bank_id = stable_bank_id(&snapshot.normalized_rom_sha256, bank);
         if !bank_ids.insert(bank_id) {
-            return Err(BlockPackError::OverlappingBlocks {
+            return Err(BlockPackError::DuplicateBankId {
                 bank: bank.clone(),
-                left: 0,
-                right: 0,
+                bank_id,
             });
         }
         let mut blocks = Vec::with_capacity(geometry.len());
@@ -167,11 +231,30 @@ pub fn materialize_block_pack(
     pack: &BlockPackV1,
     rom: &NormalizedRom,
 ) -> Result<Vec<MaterializedPackedBank>, BlockPackError> {
+    if pack.schema_version != BLOCK_PACK_SCHEMA_V1 {
+        return Err(BlockPackError::UnsupportedSchema {
+            expected: BLOCK_PACK_SCHEMA_V1,
+            actual: pack.schema_version,
+        });
+    }
     if pack.normalized_rom_sha256 != rom.sha256 {
         return Err(BlockPackError::RomIdentityMismatch);
     }
     let mut output = Vec::with_capacity(pack.banks.len());
+    let mut bank_ids = BTreeSet::new();
     for bank in &pack.banks {
+        if bank.blocks.is_empty() {
+            return Err(BlockPackError::NoProvenBlocks {
+                bank: bank.bank.clone(),
+            });
+        }
+        validate_packed_geometry(&bank.bank, &bank.blocks)?;
+        if !bank_ids.insert(bank.bank_id) {
+            return Err(BlockPackError::DuplicateBankId {
+                bank: bank.bank.clone(),
+                bank_id: bank.bank_id,
+            });
+        }
         let mut blocks = Vec::with_capacity(bank.blocks.len());
         for block in &bank.blocks {
             let bytes = rom
@@ -203,6 +286,98 @@ pub fn materialize_block_pack(
         });
     }
     Ok(output)
+}
+
+/// Emit one deterministic, standalone Rust source module implementing the
+/// typed block-program contract consumed by the public boot harness.
+///
+/// The pack is re-materialized from the supplied normalized ROM before any
+/// instruction enters the source. The caller must choose an admitted
+/// bank-qualified entry and a valid instruction budget explicitly. Generated
+/// registration binds every runner to the artifact identity supplied later by
+/// the compiling host; no identity-free registration path is emitted.
+pub fn emit_block_program_source(
+    pack: &BlockPackV1,
+    rom: &NormalizedRom,
+    config: BlockProgramSourceConfig,
+) -> Result<String, BlockProgramSourceError> {
+    let mut banks = materialize_block_pack(pack, rom)?;
+    u32::try_from(banks.len())
+        .map_err(|_| BlockProgramSourceError::TooManyBanks { count: banks.len() })?;
+    for bank in &mut banks {
+        bank.blocks.sort_by_key(|block| block.start_va);
+    }
+    banks.sort_by_key(|bank| bank.bank_id);
+
+    let mut catalog = fn64_recomp_rs::CodeCatalog::new();
+    let mut ids = BTreeSet::new();
+    for bank in &banks {
+        let id = fn64_recomp_rs::BankId::new(bank.bank_id);
+        if !ids.insert(id) {
+            return Err(BlockProgramSourceError::DuplicateBankId { bank: id });
+        }
+        let code =
+            materialized_code_bank(bank).map_err(|error| BlockProgramSourceError::InvalidBank {
+                bank: bank.bank.clone(),
+                error,
+            })?;
+        catalog
+            .register(code)
+            .map_err(|error| BlockProgramSourceError::InvalidBank {
+                bank: bank.bank.clone(),
+                error,
+            })?;
+    }
+    catalog
+        .resolve(config.entry)
+        .map_err(BlockProgramSourceError::EntryFault)?;
+
+    let mut source = String::new();
+    writeln!(
+        source,
+        "// Generated by fn64-discover from BlockPackV1. No ROM bytes belong in the repository."
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const FN64_BLOCK_PROGRAM_SOURCE_SCHEMA: u32 = 1;"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const FN64_BLOCK_PACK_ROM_SHA256: &str = {:?};",
+        pack.normalized_rom_sha256
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "use fn64_recomp_rs::{{BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeSpan, CpuException, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramArtifactIdentity, Rdram, RecompContext}};\n"
+    )
+    .unwrap();
+
+    for bank in &banks {
+        let name = format!("run_bank_{:016x}", bank.bank_id);
+        let blocks = bank
+            .blocks
+            .iter()
+            .map(|block| fn64_recomp_rs::BankBlockInput {
+                vram: block.start_va,
+                words: &block.words,
+            })
+            .collect::<Vec<_>>();
+        source.push_str(&fn64_recomp_rs::emit_sparse_bank_runner_function(
+            &fn64_recomp_rs::SparseBankInput {
+                name: &name,
+                bank: fn64_recomp_rs::BankId::new(bank.bank_id),
+                blocks: &blocks,
+            },
+        ));
+        source.push('\n');
+    }
+
+    emit_source_catalog_helpers(&mut source, &banks, config);
+    emit_source_builder(&mut source, &banks);
+    Ok(source)
 }
 
 /// Feed a re-verified materialized bank into the sparse arbitrary-PC emitter.
@@ -246,6 +421,226 @@ pub fn materialized_code_bank(
     fn64_recomp_rs::CodeBank::from_spans(id, spans)
 }
 
+fn emit_source_catalog_helpers(
+    source: &mut String,
+    banks: &[MaterializedPackedBank],
+    config: BlockProgramSourceConfig,
+) {
+    writeln!(
+        source,
+        "const ENTRY_BANK: BankId = BankId::new({:#018X});",
+        config.entry.bank.get()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "const ENTRY_PC: GuestPc = GuestPc::new({:#010X});",
+        config.entry.pc.get()
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "const INSTRUCTION_BUDGET: u32 = {};",
+        config.instruction_budget.get()
+    )
+    .unwrap();
+    writeln!(source, "const BANKS: [BankId; {}] = [", banks.len()).unwrap();
+    for bank in banks {
+        writeln!(source, "    BankId::new({:#018X}),", bank.bank_id).unwrap();
+    }
+    writeln!(source, "];\n").unwrap();
+
+    writeln!(
+        source,
+        "fn bank_admits(bank: BankId, pc: GuestPc) -> bool {{"
+    )
+    .unwrap();
+    writeln!(source, "    let pc = pc.get();").unwrap();
+    writeln!(source, "    match bank.get() {{").unwrap();
+    for bank in banks {
+        write!(source, "        {:#018X} => matches!(pc, ", bank.bank_id).unwrap();
+        for (index, block) in bank.blocks.iter().enumerate() {
+            if index != 0 {
+                source.push_str(" | ");
+            }
+            let end = block.start_va + block.words.len() as u32 * 4 - 1;
+            write!(source, "{:#010X}..={end:#010X}", block.start_va).unwrap();
+        }
+        writeln!(source, "),").unwrap();
+    }
+    writeln!(source, "        _ => false,").unwrap();
+    writeln!(source, "    }}").unwrap();
+    writeln!(source, "}}\n").unwrap();
+
+    writeln!(
+        source,
+        "fn bank_bounds(bank: BankId) -> Option<(u32, u32)> {{"
+    )
+    .unwrap();
+    writeln!(source, "    match bank.get() {{").unwrap();
+    for bank in banks {
+        let start = bank
+            .blocks
+            .first()
+            .expect("validated nonempty bank")
+            .start_va;
+        let last = bank.blocks.last().expect("validated nonempty bank");
+        let end = last.start_va + last.words.len() as u32 * 4;
+        writeln!(
+            source,
+            "        {:#018X} => Some(({start:#010X}, {end:#010X})),",
+            bank.bank_id
+        )
+        .unwrap();
+    }
+    writeln!(source, "        _ => None,").unwrap();
+    writeln!(source, "    }}").unwrap();
+    writeln!(source, "}}\n").unwrap();
+
+    source.push_str(
+        "fn missing_mapping(fault_bank: BankId, target_pc: GuestPc) -> CpuFault {\n\
+         \x20   let at = ExecutionKey::new(fault_bank, target_pc);\n\
+         \x20   match bank_bounds(fault_bank) {\n\
+         \x20       Some((bank_start, bank_end)) => CpuFault {\n\
+         \x20           at,\n\
+         \x20           kind: CpuFaultKind::UnmappedPc { bank_start, bank_end },\n\
+         \x20       },\n\
+         \x20       None => CpuFault { at, kind: CpuFaultKind::UnknownBank },\n\
+         \x20   }\n\
+         }\n\n\
+         fn resolve_unique(fault_bank: BankId, target_pc: GuestPc) -> Result<ExecutionKey, CpuFault> {\n\
+         \x20   let mut first = None;\n\
+         \x20   let mut second = None;\n\
+         \x20   let mut candidate_count = 0u32;\n\
+         \x20   for bank in BANKS {\n\
+         \x20       if bank_admits(bank, target_pc) {\n\
+         \x20           candidate_count += 1;\n\
+         \x20           if first.is_none() {\n\
+         \x20               first = Some(bank);\n\
+         \x20           } else if second.is_none() {\n\
+         \x20               second = Some(bank);\n\
+         \x20           }\n\
+         \x20       }\n\
+         \x20   }\n\
+         \x20   match candidate_count {\n\
+         \x20       0 => Err(missing_mapping(fault_bank, target_pc)),\n\
+         \x20       1 => Ok(ExecutionKey::new(first.expect(\"one candidate was counted\"), target_pc)),\n\
+         \x20       _ => Err(CpuFault {\n\
+         \x20           at: ExecutionKey::new(fault_bank, target_pc),\n\
+         \x20           kind: CpuFaultKind::AmbiguousPc {\n\
+         \x20               first_candidate: first.expect(\"ambiguous lookup has a first candidate\"),\n\
+         \x20               second_candidate: second.expect(\"ambiguous lookup has a second candidate\"),\n\
+         \x20               candidate_count,\n\
+         \x20           },\n\
+         \x20       }),\n\
+         \x20   }\n\
+         }\n\n\
+         pub fn entry() -> ExecutionKey {\n\
+         \x20   ExecutionKey::new(ENTRY_BANK, ENTRY_PC)\n\
+         }\n\n\
+         pub fn entry_lookup(target_pc: GuestPc) -> Result<ExecutionKey, CpuFault> {\n\
+         \x20   if !target_pc.is_instruction_aligned() {\n\
+         \x20       return Err(CpuFault::instruction_address_error(ExecutionKey::new(ENTRY_BANK, target_pc)));\n\
+         \x20   }\n\
+         \x20   resolve_unique(ENTRY_BANK, target_pc)\n\
+         }\n\n\
+         pub fn transfer_lookup(source_bank: BankId, target_pc: GuestPc) -> Result<ExecutionKey, CpuFault> {\n\
+         \x20   if !target_pc.is_instruction_aligned() {\n\
+         \x20       return Err(CpuFault::instruction_address_error(ExecutionKey::new(source_bank, target_pc)));\n\
+         \x20   }\n\
+         \x20   if bank_admits(source_bank, target_pc) {\n\
+         \x20       return Ok(ExecutionKey::new(source_bank, target_pc));\n\
+         \x20   }\n\
+         \x20   resolve_unique(source_bank, target_pc)\n\
+         }\n\n\
+         pub fn instruction_budget() -> InstructionBudget {\n\
+         \x20   InstructionBudget::new(INSTRUCTION_BUDGET)\n\
+         \x20       .expect(\"fn64-discover admitted the generated instruction budget\")\n\
+         }\n\n",
+    );
+}
+
+fn emit_source_builder(source: &mut String, banks: &[MaterializedPackedBank]) {
+    source.push_str(
+        "pub fn build_block_program(artifact_identity: ProgramArtifactIdentity) -> Result<BlockProgram, String> {\n\
+         \x20   let mut program = BlockProgram::new();\n",
+    );
+    for bank in banks {
+        let runner = format!("run_bank_{:016x}", bank.bank_id);
+        writeln!(
+            source,
+            "    let bank = BankId::new({:#018X});",
+            bank.bank_id
+        )
+        .unwrap();
+        writeln!(source, "    let spans = vec![").unwrap();
+        for block in &bank.blocks {
+            writeln!(
+                source,
+                "        CodeSpan::new(bank, GuestPc::new({:#010X}), vec![",
+                block.start_va
+            )
+            .unwrap();
+            for chunk in block.words.chunks(8) {
+                source.push_str("            ");
+                for word in chunk {
+                    write!(source, "{word:#010X}, ").unwrap();
+                }
+                source.push('\n');
+            }
+            writeln!(
+                source,
+                "        ]).map_err(|error| format!(\"construct {{bank}} span: {{error}}\"))?,"
+            )
+            .unwrap();
+        }
+        source.push_str(
+            "    ];\n\
+             \x20   let code = CodeBank::from_spans(bank, spans)\n\
+             \x20       .map_err(|error| format!(\"construct {bank}: {error}\"))?;\n",
+        );
+        writeln!(
+            source,
+            "    program.register(code, GeneratedBankRunner::new_with_artifact_identity(bank, {runner}, artifact_identity))"
+        )
+        .unwrap();
+        source.push_str("        .map_err(|error| format!(\"register {bank}: {error}\"))?;\n");
+    }
+    source.push_str("    Ok(program)\n}\n");
+}
+
+fn validate_packed_geometry(bank: &str, blocks: &[PackedBlockV1]) -> Result<(), BlockPackError> {
+    let mut sorted = blocks.iter().collect::<Vec<_>>();
+    sorted.sort_by_key(|block| block.start_va);
+    let mut previous_end = None;
+    for block in sorted {
+        if !block.start_va.is_multiple_of(4)
+            || !block.end_va.is_multiple_of(4)
+            || !block.rom_start.is_multiple_of(4)
+            || !block.rom_end.is_multiple_of(4)
+            || block.end_va <= block.start_va
+            || block.rom_end.checked_sub(block.rom_start)
+                != block.end_va.checked_sub(block.start_va)
+        {
+            return Err(BlockPackError::InvalidGeometry {
+                bank: bank.into(),
+                start_va: block.start_va,
+            });
+        }
+        if let Some(end) = previous_end {
+            if block.start_va < end {
+                return Err(BlockPackError::OverlappingBlocks {
+                    bank: bank.into(),
+                    left: end,
+                    right: block.start_va,
+                });
+            }
+        }
+        previous_end = Some(block.end_va);
+    }
+    Ok(())
+}
+
 /// A proven block's emitted VA/ROM extents after delay-slot completion. Byte
 /// length is preserved between the VA and ROM views.
 #[derive(Clone, Copy)]
@@ -261,33 +656,11 @@ struct CompletedGeometry {
 ///
 /// `canonicalize_blocks` cuts a block at any later-discovered leader inside it,
 /// replacing the control terminator with `Fallthrough` and handing the trailing
-/// words to the leader's block. When the leader lands *on* a delay slot — the
-/// rare MIPS "`jal`/branch into a delay slot" hazard — the cut strands the
-/// control transfer (now the block's last word) from its delay slot. If the
-/// leader's block is itself proven the delay slot is admitted and nothing is
-/// needed; but when that leader is a contested owner root its block is only a
-/// candidate and is dropped, so the delay slot is admitted by no proven block.
-///
-/// This re-attaches exactly that one stranded delay slot: a proven block whose
-/// final word is a delay-slotted control transfer and whose end address (that
-/// control transfer's delay slot) is *proven code* admitted by no proven block
-/// is extended by that one contiguous ROM word. The `ProvenCode` requirement is
-/// the precise discriminator: a genuine control transfer's delay slot is always
-/// proven code (the CFG's delay-slot validation marks it so before the block is
-/// proven), so it is exactly the stranded word to re-attach. A block whose last
-/// word merely *decodes* as a control transfer but is actually a delay slot or
-/// misclassified data has an unproven (or absent) successor word, so this leaves
-/// it untouched — the emitter handles that word as the ordinary or unexecutable
-/// instruction it is.
-///
-/// Soundness: the delay slot is architecturally proven code reached whenever the
-/// control transfer is, its ROM backing is the block's own next contiguous word
-/// under the same physical mapping, and the extension only ever fills a word no
-/// proven block admits — so it never overlaps a sibling. Blocks whose delay slot
-/// is already admitted are left byte-for-byte unchanged, so the
-/// CFG/owner/block-proof geometry the scoreboard reads is untouched: this
-/// regroups proven words for emission, it never changes which words are proven
-/// code.
+/// words to the leader's block. When the leader lands *on* a delay slot, the cut
+/// can strand the control transfer from a contested leader block that is later
+/// dropped. Re-attach exactly that one proven, unadmitted delay-slot word. The
+/// proof state and owner geometry remain unchanged; this only regroups already
+/// proven code for emission.
 fn complete_severed_delay_slots(
     blocks: &[&ReachableCodeBlock],
     word_class: &BTreeMap<u32, WordClass>,
@@ -380,115 +753,363 @@ mod tests {
     use super::*;
     use crate::cfg::BlockTerminator;
     use crate::facts::RomAddressSpace;
-    use crate::normalize;
+    use fn64_recomp_rs::{BankId, CpuFaultKind, ExecutionKey, GuestPc, InstructionBudget};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    const BASE: u32 = 0x8000_0000;
-    const ROM_START: u32 = 0x1000;
-    const JR_RA: u32 = 0x03e0_0008; // jr $ra (control transfer, has delay slot)
+    const BANK_A: u64 = 0x11;
+    const BANK_B: u64 = 0x22;
+    const ENTRY_PC: u32 = 0x8000_1000;
+    const HOLE_PC: u32 = 0x8000_1010;
+    const UNIQUE_B_PC: u32 = 0x8000_2000;
+    const ROM_BASE: u32 = 0x1000;
+    const JR_RA: u32 = 0x03e0_0008;
     const NOP: u32 = 0x0000_0000;
 
-    fn asm(words: &[u32]) -> Vec<u8> {
-        words.iter().flat_map(|w| w.to_be_bytes()).collect()
-    }
-
     fn rom_with(words: &[u32]) -> NormalizedRom {
-        let bank = asm(words);
-        let mut bytes = vec![0u8; ROM_START as usize + bank.len()];
+        let bank = words
+            .iter()
+            .flat_map(|word| word.to_be_bytes())
+            .collect::<Vec<_>>();
+        let mut bytes = vec![0u8; ROM_BASE as usize + bank.len()];
         bytes[0..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
-        bytes[8..12].copy_from_slice(&BASE.to_be_bytes());
-        bytes[ROM_START as usize..].copy_from_slice(&bank);
-        normalize(&bytes).unwrap()
+        bytes[8..12].copy_from_slice(&ENTRY_PC.to_be_bytes());
+        bytes[ROM_BASE as usize..].copy_from_slice(&bank);
+        crate::normalize(&bytes).unwrap()
     }
 
-    fn block(start_va: u32, end_va: u32, terminator: BlockTerminator) -> ReachableCodeBlock {
+    fn reachable_block(
+        start_va: u32,
+        end_va: u32,
+        terminator: BlockTerminator,
+    ) -> ReachableCodeBlock {
         ReachableCodeBlock {
             bank: "boot".into(),
             start_va,
             end_va,
-            owner_root: BASE,
+            owner_root: ENTRY_PC,
             rom_space: RomAddressSpace::Physical,
-            rom_start: ROM_START + (start_va - BASE),
-            rom_end: ROM_START + (end_va - BASE),
+            rom_start: ROM_BASE + (start_va - ENTRY_PC),
+            rom_end: ROM_BASE + (end_va - ENTRY_PC),
             terminator,
         }
     }
 
-    /// A `jal` whose target lands ON a delay slot makes that delay-slot address
-    /// a canonical block leader; `canonicalize_blocks` truncates the control
-    /// block there and drops the ambiguous leader block, so the control transfer
-    /// is stranded at its block's last word with a proven-but-unadmitted delay
-    /// slot. `complete_severed_delay_slots` must re-attach that one word, keeping
-    /// the control transfer and its delay slot in one emitted unit.
     #[test]
     fn severed_proven_delay_slot_is_reattached_to_its_control_block() {
-        // Bank: nop ; jr $ra ; nop(delay). A separate leader landed on the delay
-        // slot (index 2), truncating the block to [0,2) with the jr as its last
-        // word and the delay slot admitted by no proven block.
         let rom = rom_with(&[NOP, JR_RA, NOP]);
-        // Control block ends at the delay slot (BASE+8): jr at BASE+4 is its last
-        // word, delay slot BASE+8 is proven code but in no proven block.
-        let control = block(
-            BASE,
-            BASE + 8,
-            BlockTerminator::Fallthrough { next: BASE + 8 },
+        let control = reachable_block(
+            ENTRY_PC,
+            ENTRY_PC + 8,
+            BlockTerminator::Fallthrough { next: ENTRY_PC + 8 },
         );
         let word_class = BTreeMap::from([
-            (BASE, WordClass::ProvenCode),
-            (BASE + 4, WordClass::ProvenCode),
-            (BASE + 8, WordClass::ProvenCode),
+            (ENTRY_PC, WordClass::ProvenCode),
+            (ENTRY_PC + 4, WordClass::ProvenCode),
+            (ENTRY_PC + 8, WordClass::ProvenCode),
         ]);
-        let geom = complete_severed_delay_slots(&[&control], &word_class, &rom);
-        assert_eq!(geom.len(), 1);
-        // Re-attached: the block now spans through the delay slot (BASE+0xC).
-        assert_eq!(geom[0].end_va, BASE + 0x0C);
-        assert_eq!(geom[0].rom_end, ROM_START + 0x0C);
+        let geometry = complete_severed_delay_slots(&[&control], &word_class, &rom);
+        assert_eq!(geometry[0].end_va, ENTRY_PC + 0x0c);
+        assert_eq!(geometry[0].rom_end, ROM_BASE + 0x0c);
     }
 
-    /// When the delay slot of a severed control transfer is already admitted by
-    /// the next proven block, nothing is re-attached: the unit is whole and
-    /// extending would overlap the sibling.
     #[test]
-    fn already_admitted_delay_slot_is_left_unchanged() {
+    fn admitted_delay_slot_is_not_duplicated() {
         let rom = rom_with(&[NOP, JR_RA, NOP, JR_RA, NOP]);
-        let control = block(
-            BASE,
-            BASE + 8,
-            BlockTerminator::Fallthrough { next: BASE + 8 },
+        let control = reachable_block(
+            ENTRY_PC,
+            ENTRY_PC + 8,
+            BlockTerminator::Fallthrough { next: ENTRY_PC + 8 },
         );
-        // The delay slot BASE+8 starts the next proven block, so it is admitted.
-        let next = block(BASE + 8, BASE + 0x14, BlockTerminator::Return);
-        let word_class: BTreeMap<u32, WordClass> = (0..5)
-            .map(|i| (BASE + i * 4, WordClass::ProvenCode))
+        let next = reachable_block(ENTRY_PC + 8, ENTRY_PC + 0x14, BlockTerminator::Return);
+        let word_class = (0..5)
+            .map(|index| (ENTRY_PC + index * 4, WordClass::ProvenCode))
             .collect();
-        let geom = complete_severed_delay_slots(&[&control, &next], &word_class, &rom);
-        assert_eq!(
-            geom[0].end_va,
-            BASE + 8,
-            "admitted delay slot must not extend"
-        );
-        assert_eq!(geom[1].start_va, BASE + 8);
+        let geometry = complete_severed_delay_slots(&[&control, &next], &word_class, &rom);
+        assert_eq!(geometry[0].end_va, ENTRY_PC + 8);
+        assert_eq!(geometry[1].start_va, ENTRY_PC + 8);
     }
 
-    /// A block whose last word merely DECODES as a control transfer but is a
-    /// delay slot / misclassified data (its successor word is unproven) is left
-    /// untouched: the `ProvenCode` discriminator excludes it, so the emitter —
-    /// not the pack — handles that word.
     #[test]
     fn control_shaped_word_with_unproven_successor_is_not_extended() {
         let rom = rom_with(&[NOP, JR_RA, JR_RA]);
-        let control = block(BASE, BASE + 0x0C, BlockTerminator::Return);
-        // The block's last word (BASE+8) decodes as jr but its successor BASE+0xC
-        // is NOT proven code (data run) — do not extend.
+        let control = reachable_block(ENTRY_PC, ENTRY_PC + 0x0c, BlockTerminator::Return);
         let word_class = BTreeMap::from([
-            (BASE, WordClass::ProvenCode),
-            (BASE + 4, WordClass::ProvenCode),
-            (BASE + 8, WordClass::ProvenCode),
+            (ENTRY_PC, WordClass::ProvenCode),
+            (ENTRY_PC + 4, WordClass::ProvenCode),
+            (ENTRY_PC + 8, WordClass::ProvenCode),
         ]);
-        let geom = complete_severed_delay_slots(&[&control], &word_class, &rom);
+        let geometry = complete_severed_delay_slots(&[&control], &word_class, &rom);
+        assert_eq!(geometry[0].end_va, ENTRY_PC + 0x0c);
+    }
+
+    fn synthetic_pack() -> (BlockPackV1, NormalizedRom) {
+        let words = [0x2402_0007u32, 0, 0x2402_0009, 0x2403_0005];
+        let mut bytes = vec![0u8; ROM_BASE as usize + words.len() * 4];
+        bytes[..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        bytes[8..12].copy_from_slice(&ENTRY_PC.to_be_bytes());
+        for (index, word) in words.into_iter().enumerate() {
+            let start = ROM_BASE as usize + index * 4;
+            bytes[start..start + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        let rom = crate::normalize(&bytes).unwrap();
+        let block = |start_va: u32, word_index: u32| {
+            let rom_start = ROM_BASE + word_index * 4;
+            PackedBlockV1 {
+                start_va,
+                end_va: start_va + 4,
+                rom_start,
+                rom_end: rom_start + 4,
+                bytes_sha256: sha256_hex(&rom.bytes[rom_start as usize..rom_start as usize + 4]),
+                terminator: crate::cfg::BlockTerminator::Fallthrough { next: start_va + 4 },
+            }
+        };
+        (
+            BlockPackV1 {
+                schema_version: BLOCK_PACK_SCHEMA_V1,
+                normalized_rom_sha256: rom.sha256.clone(),
+                banks: vec![
+                    PackedBankV1 {
+                        bank: "resident".into(),
+                        bank_id: BANK_A,
+                        blocks: vec![block(ENTRY_PC, 0), block(0x8000_1020, 1)],
+                    },
+                    PackedBankV1 {
+                        bank: "overlay".into(),
+                        bank_id: BANK_B,
+                        blocks: vec![block(ENTRY_PC, 2), block(UNIQUE_B_PC, 3)],
+                    },
+                ],
+            },
+            rom,
+        )
+    }
+
+    fn source_config() -> BlockProgramSourceConfig {
+        BlockProgramSourceConfig {
+            entry: ExecutionKey::new(BankId::new(BANK_A), GuestPc::new(ENTRY_PC)),
+            instruction_budget: InstructionBudget::new(2).unwrap(),
+        }
+    }
+
+    #[test]
+    fn block_program_source_is_deterministic_sparse_and_identity_bound() {
+        let (pack, rom) = synthetic_pack();
+        let source = emit_block_program_source(&pack, &rom, source_config()).unwrap();
+        let mut reordered = pack.clone();
+        reordered.banks.reverse();
+        for bank in &mut reordered.banks {
+            bank.blocks.reverse();
+        }
         assert_eq!(
-            geom[0].end_va,
-            BASE + 0x0C,
-            "unproven successor must not be pulled in"
+            source,
+            emit_block_program_source(&reordered, &rom, source_config()).unwrap()
         );
+        assert_eq!(
+            source
+                .matches("GeneratedBankRunner::new_with_artifact_identity")
+                .count(),
+            2
+        );
+        assert!(!source.contains("GeneratedBankRunner::new("));
+        assert!(source.contains("0x80001000..=0x80001003 | 0x80001020..=0x80001023"));
+        assert!(!source.contains("0x80001004..=0x8000101F"));
+        assert!(source.contains("pub fn entry_lookup(target_pc: GuestPc)"));
+        assert!(source.contains("CpuFaultKind::AmbiguousPc"));
+    }
+
+    #[test]
+    fn block_program_source_rejects_unadmitted_entry_and_malformed_pack() {
+        let (pack, rom) = synthetic_pack();
+        let config = BlockProgramSourceConfig {
+            entry: ExecutionKey::new(BankId::new(BANK_A), GuestPc::new(HOLE_PC)),
+            instruction_budget: InstructionBudget::new(2).unwrap(),
+        };
+        assert!(matches!(
+            emit_block_program_source(&pack, &rom, config),
+            Err(BlockProgramSourceError::EntryFault(fn64_recomp_rs::CpuFault {
+                at,
+                kind: CpuFaultKind::UnmappedPc {
+                    bank_start: ENTRY_PC,
+                    bank_end: 0x8000_1024,
+                },
+            })) if at == config.entry
+        ));
+
+        let mut wrong_schema = pack.clone();
+        wrong_schema.schema_version += 1;
+        assert!(matches!(
+            materialize_block_pack(&wrong_schema, &rom),
+            Err(BlockPackError::UnsupportedSchema { .. })
+        ));
+
+        let mut malformed = pack;
+        malformed.banks[0].blocks[0].end_va += 4;
+        assert!(matches!(
+            materialize_block_pack(&malformed, &rom),
+            Err(BlockPackError::InvalidGeometry { .. })
+        ));
+
+        let (mut trailing_bytes, rom) = synthetic_pack();
+        trailing_bytes.banks[0].blocks[0].rom_end += 1;
+        assert!(matches!(
+            materialize_block_pack(&trailing_bytes, &rom),
+            Err(BlockPackError::InvalidGeometry { .. })
+        ));
+    }
+
+    #[test]
+    fn generated_block_program_compiles_executes_and_rejects_ambiguity() {
+        let (pack, rom) = synthetic_pack();
+        let source = emit_block_program_source(&pack, &rom, source_config()).unwrap();
+        let wrapper = format!(
+            r#"{source}
+
+fn main() {{
+    let artifact = ProgramArtifactIdentity::new([0xA5; 32]);
+    let program = build_block_program(artifact).unwrap();
+    assert_eq!(entry(), ExecutionKey::new(BankId::new({BANK_A}), GuestPc::new({ENTRY_PC})));
+    assert_eq!(instruction_budget().get(), 2);
+
+    let evidence = program.evidence_snapshot();
+    assert_eq!(evidence.banks.len(), 2);
+    assert!(evidence.banks.iter().all(|bank| bank.runner_artifact_identity == artifact));
+    assert_eq!(evidence.banks[0].spans.len(), 2);
+    assert_eq!(evidence.banks[0].spans[0].vram_start, GuestPc::new({ENTRY_PC}));
+    assert_eq!(evidence.banks[0].spans[1].vram_start, GuestPc::new(0x8000_1020));
+
+    assert!(matches!(
+        entry_lookup(GuestPc::new({ENTRY_PC})),
+        Err(CpuFault {{
+            kind: CpuFaultKind::AmbiguousPc {{
+                first_candidate,
+                second_candidate,
+                candidate_count: 2,
+            }},
+            ..
+        }}) if first_candidate == BankId::new({BANK_A}) && second_candidate == BankId::new({BANK_B})
+    ));
+    assert_eq!(
+        transfer_lookup(BankId::new({BANK_A}), GuestPc::new({ENTRY_PC})).unwrap(),
+        ExecutionKey::new(BankId::new({BANK_A}), GuestPc::new({ENTRY_PC}))
+    );
+    assert_eq!(
+        transfer_lookup(BankId::new({BANK_B}), GuestPc::new({ENTRY_PC})).unwrap(),
+        ExecutionKey::new(BankId::new({BANK_B}), GuestPc::new({ENTRY_PC}))
+    );
+    assert_eq!(
+        transfer_lookup(BankId::new({BANK_A}), GuestPc::new({UNIQUE_B_PC})).unwrap(),
+        ExecutionKey::new(BankId::new({BANK_B}), GuestPc::new({UNIQUE_B_PC}))
+    );
+    assert!(matches!(
+        entry_lookup(GuestPc::new({HOLE_PC})),
+        Err(CpuFault {{
+            at,
+            kind: CpuFaultKind::UnmappedPc {{
+                bank_start: {ENTRY_PC},
+                bank_end: 0x8000_1024,
+            }},
+        }}) if at == ExecutionKey::new(BankId::new({BANK_A}), GuestPc::new({HOLE_PC}))
+    ));
+    assert!(matches!(
+        transfer_lookup(BankId::new({BANK_A}), GuestPc::new({HOLE_PC})),
+        Err(CpuFault {{
+            at,
+            kind: CpuFaultKind::UnmappedPc {{
+                bank_start: {ENTRY_PC},
+                bank_end: 0x8000_1024,
+            }},
+        }}) if at == ExecutionKey::new(BankId::new({BANK_A}), GuestPc::new({HOLE_PC}))
+    ));
+
+    let mut backing = vec![0u8; fn64_recomp_rs::RDRAM_LEN];
+    let mut mem = Rdram::new(&mut backing);
+    let mut ctx = RecompContext::default();
+    let run = program.run(entry(), instruction_budget(), &mut ctx, &mut mem);
+    assert_eq!(ctx.r_u32(2), 7);
+    assert_eq!(run.instructions, 1);
+    assert_eq!(
+        run.exit,
+        BlockExit::ResolveTransfer {{
+            source_bank: BankId::new({BANK_A}),
+            target_pc: GuestPc::new(0x8000_1004),
+        }}
+    );
+}}
+"#
+        );
+        compile_and_run(&wrapper);
+    }
+
+    fn compile_and_run(source: &str) {
+        let deps = current_dependency_dir();
+        let rlib = current_recomp_rlib(&deps);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "fn64-block-program-source-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&temp).unwrap();
+        let source_path = temp.join("main.rs");
+        let binary_path = temp.join("generated-block-program");
+        std::fs::write(&source_path, source).unwrap();
+        let compile = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+            .arg("--edition=2021")
+            .arg(&source_path)
+            .arg("--extern")
+            .arg(format!("fn64_recomp_rs={}", rlib.display()))
+            .arg("-L")
+            .arg(format!("dependency={}", deps.display()))
+            .arg("-o")
+            .arg(&binary_path)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "generated source failed to compile:\nstdout:\n{}\nstderr:\n{}\nsource:\n{}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr),
+            source
+        );
+        let run = Command::new(&binary_path).output().unwrap();
+        assert!(
+            run.status.success(),
+            "generated source failed to execute:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    fn current_dependency_dir() -> PathBuf {
+        let executable = std::env::current_exe().unwrap();
+        executable
+            .parent()
+            .expect("fn64-discover test executable has a dependency directory")
+            .to_owned()
+    }
+
+    fn current_recomp_rlib(deps: &Path) -> PathBuf {
+        std::fs::read_dir(deps)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("libfn64_recomp_rs-") && name.ends_with(".rlib")
+                    })
+            })
+            .max_by_key(|path| {
+                path.metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+            })
+            .expect("fn64-recomp-rs rlib is beside fn64-discover test executable")
     }
 }

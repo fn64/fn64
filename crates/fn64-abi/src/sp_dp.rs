@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn dp_buffer_uses_o32_aligned_u64_and_reaches_idle_end_pointer() {
         MMIO.with(|cell| *cell.borrow_mut() = fn64_runtime::MmioSpace::new());
-        let mut rdram = [0u8; 1];
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
         install_complete_render_backend(rdram.len());
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0xFFFF_FFFF_8000_1000;
@@ -135,7 +135,7 @@ mod tests {
     fn dp_buffer_executes_bounded_raw_rdp_commands_without_an_enddl_sentinel() {
         const START: usize = 0x100;
         const TARGET: u32 = 0x400;
-        let mut rdram = vec![0u8; 0x1000];
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
         let commands: [(u32, u32); 4] = [
             (0xef00_0000 | (3 << 20), 0),           // fill cycle
             (0xff10_0003, TARGET),                  // RGBA16 width 4
@@ -147,8 +147,8 @@ mod tests {
             rdram[offset..offset + 4].copy_from_slice(&w0.to_ne_bytes());
             rdram[offset + 4..offset + 8].copy_from_slice(&w1.to_ne_bytes());
         }
-        let mut backend = fn64_render_rt64::ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        let mut backend = fn64_render_reference::ReferenceBackend::new().with_f3dex2();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         crate::set_render_backend(Box::new(backend), rdram.len());
         with_host(|host| {
             host.runtime_rdram = rdram.as_mut_ptr();
@@ -163,6 +163,14 @@ mod tests {
 
         assert_eq!(ctx.r2, 0);
         assert_eq!(crate::last_render_error(), None);
+        with_host(|host| {
+            let snapshot = host.device_fabric.snapshot();
+            assert!(!snapshot.sp_busy);
+            assert!(
+                !snapshot.dp_busy,
+                "a raw DPC range without FullSync must not fabricate DP completion"
+            );
+        });
         let view = fn64_runtime::RdramView::from_storage(&rdram);
         for index in 0..8 {
             assert_eq!(
@@ -195,6 +203,48 @@ mod tests {
                 "raw DPC MMIO pixel {index}"
             );
         }
+    }
+
+    #[test]
+    fn raw_dpc_full_sync_schedules_dp_without_sp() {
+        const START: usize = 0x100;
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        rdram[START..START + 4].copy_from_slice(&0xe900_0000u32.to_ne_bytes());
+        let mut backend = fn64_render_reference::ReferenceBackend::new().with_f3dex2();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
+        crate::load_rom_with_fixed_pi_latency(Vec::new(), 1);
+        crate::set_render_backend(Box::new(backend), rdram.len());
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0xFFFF_FFFF_8000_0100;
+        ctx.r6 = 0;
+        ctx.r7 = 8;
+        unsafe { osDpSetNextBuffer_recomp(rdram.as_mut_ptr(), &mut ctx) };
+
+        assert_eq!(ctx.r2, 0);
+        with_host(|host| {
+            let snapshot = host.device_fabric.snapshot();
+            assert!(!snapshot.sp_busy);
+            assert!(snapshot.dp_busy);
+        });
+        crate::advance_virtual_time(1);
+        with_host(|host| {
+            let snapshot = host.device_fabric.snapshot();
+            assert!(!snapshot.sp_busy);
+            assert!(!snapshot.dp_busy);
+            assert_ne!(
+                snapshot.mi_pending & fn64_runtime::InterruptSource::Dp.bit(),
+                0
+            );
+            assert_eq!(
+                snapshot.mi_pending & fn64_runtime::InterruptSource::Sp.bit(),
+                0
+            );
+        });
     }
 
     #[test]

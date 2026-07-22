@@ -144,7 +144,11 @@ fn stop_self_parks_the_thread_until_an_explicit_restart() {
     for _ in 0..100 {
         exec.run_one_step();
     }
-    assert_eq!(*log.borrow(), ["reached-assert"], "no scheduler-driven fall-through");
+    assert_eq!(
+        *log.borrow(),
+        ["reached-assert"],
+        "no scheduler-driven fall-through"
+    );
     assert!(!exec.is_thread_dead(1), "parked, not dead");
 
     // An explicit osStartThread is the ONE legal resume path (the parked
@@ -177,7 +181,11 @@ fn stop_self_parked_thread_never_starves_other_work() {
     for _ in 0..10 {
         exec.run_one_step();
     }
-    assert_eq!(*other_ran.borrow(), 3, "lower-priority work still ran to completion");
+    assert_eq!(
+        *other_ran.borrow(),
+        3,
+        "lower-priority work still ran to completion"
+    );
     assert!(!exec.is_thread_dead(1));
 }
 

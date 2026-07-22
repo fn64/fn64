@@ -160,14 +160,27 @@ mod game {
                 panic!("fn64-shell: failed to read ROM {}: {e}", rom_path.display())
             });
             println!("[fn64-shell] ROM size: {} bytes", rom_bytes.len());
-            fn64_abi::load_rom(rom_bytes);
+            let tv_type = fn64_boot_harness::TvType::Ntsc;
+            let mut rdram = fn64_boot_harness::new_rdram(tv_type);
+            fn64_boot_harness::seed_ipl3_image(&mut rdram, &rom_bytes);
+            fn64_abi::load_rom(rom_bytes.clone());
 
-            // OoT NTSC 1.0's aligned __CartRomHandle BSS address: guest code
+            // The game's aligned __CartRomHandle BSS address: guest code
             // dereferences osCartRomInit's returned handle, so the shim must
             // return the game-linked object, not an opaque token (same
             // registration as oot-boot main.rs -- its absence aborts boot in
-            // bootproc's osCartRomInit call).
-            fn64_abi::set_cart_rom_handle_vram(0x8000_9EA0);
+            // bootproc's osCartRomInit call). Default is OoT NTSC 1.0's;
+            // other titles override via FN64_CART_HANDLE_VRAM (hex), e.g.
+            // WM2000/NWXE's D_800839A0.
+            let cart_handle_vram = std::env::var("FN64_CART_HANDLE_VRAM")
+                .ok()
+                .map(|raw| {
+                    u32::from_str_radix(raw.trim_start_matches("0x"), 16).unwrap_or_else(|_| {
+                        panic!("FN64_CART_HANDLE_VRAM must be a hex vram address, got {raw:?}")
+                    })
+                })
+                .unwrap_or(0x8000_9EA0);
+            fn64_abi::set_cart_rom_handle_vram(cart_handle_vram);
 
             // Save-backing store (banked SRAM), same as oot-boot -- domain-2
             // PI DMAs need somewhere to land.
@@ -182,13 +195,34 @@ mod game {
                     "[fn64-shell] bridge reports {} sections",
                     registration.reported_count()
                 );
-                // Always-resident sections 0/1/2 (makerom.ent/boot/code), same
-                // as oot-boot -- the ovl_* overlays are DMA-loaded on demand.
-                for section_key in [0usize, 1usize, 2usize] {
+                // Always-resident section count: OoT keeps 0/1/2
+                // (makerom.ent/boot/code) resident; NWXE only 0/1 (its
+                // section 2 is an overlay bank). FN64_RESIDENT_SECTIONS
+                // overrides; overlays stay DMA-loaded on demand either way.
+                let resident_count: usize = std::env::var("FN64_RESIDENT_SECTIONS")
+                    .ok()
+                    .map(|raw| {
+                        raw.parse().unwrap_or_else(|_| {
+                            panic!("FN64_RESIDENT_SECTIONS must be a count, got {raw:?}")
+                        })
+                    })
+                    .unwrap_or(3);
+                for section_key in 0..resident_count {
                     if let Some(idx) = registration.registry_index(section_key) {
                         fn64_abi::set_section_loaded(idx);
                     }
                 }
+                let resident_sections: Vec<_> = registration
+                    .sections()
+                    .iter()
+                    .take(resident_count)
+                    .map(|section| (section.rom_addr, section.ram_addr, section.size))
+                    .collect();
+                fn64_boot_harness::seed_resident_sections(
+                    &mut rdram,
+                    &rom_bytes,
+                    &resident_sections,
+                );
             }
             #[cfg(fn64_recomp_rs)]
             {
@@ -201,6 +235,11 @@ mod game {
                 for &section_key in &[0usize, 1, 2] {
                     fn64_abi::set_section_loaded(section_indices[section_key]);
                 }
+                fn64_boot_harness::seed_resident_sections(
+                    &mut rdram,
+                    &rom_bytes,
+                    &recompiled::RECOMPILED_SECTION_GEOMETRY[..3],
+                );
                 println!(
                     "[fn64-shell] registered {} recompiled section geometries; marked 0/1/2 resident",
                     section_indices.len()
@@ -210,9 +249,8 @@ mod game {
             // The typed IPL standard owns both VI and AI clocks. The nominal
             // NTSC interval bootstraps the first field; OSViMode H/V timing
             // replaces it when the mode latches.
-            fn64_abi::configure_tv_type(fn64_boot_harness::TvType::Ntsc);
+            fn64_abi::configure_tv_type(tv_type);
 
-            let mut rdram = fn64_boot_harness::new_rdram(fn64_boot_harness::TvType::Ntsc);
             let rdram_ptr = rdram.as_mut_ptr();
 
             // Render backend selection (same contract as oot-boot):
@@ -222,12 +260,13 @@ mod game {
             // default remains the software ReferenceBackend (the CI oracle).
             use fn64_render::RenderBackend as _;
             let create_reference = || -> Box<dyn fn64_render::RenderBackend> {
-                let mut backend = fn64_render_rt64::ReferenceBackend::new()
+                let mut backend = fn64_render_reference::ReferenceBackend::new()
                     .with_f3dex2()
                     .with_clear_color([0, 0, 0, 255]);
-                if let Err(e) = backend.create(&fn64_render::RenderConfig::new(
+                if let Err(e) = backend.create(&fn64_render::RenderConfig::for_tv(
                     FB_WIDTH as u32,
                     FB_HEIGHT as u32,
+                    tv_type,
                 )) {
                     eprintln!("[fn64-shell] WARNING: render backend create() failed: {e}");
                 }
@@ -241,9 +280,10 @@ mod game {
                 &'static str,
             ) = if requested_renderer == "rt64" {
                 let mut backend = fn64_render_rt64::Rt64Backend::new();
-                match backend.create(&fn64_render::RenderConfig::new(
+                match backend.create(&fn64_render::RenderConfig::for_tv(
                     FB_WIDTH as u32,
                     FB_HEIGHT as u32,
+                    tv_type,
                 )) {
                     Ok(()) => (Box::new(backend), "rt64"),
                     Err(error) => {
@@ -305,7 +345,13 @@ mod game {
             }
             #[cfg(not(fn64_recomp_rs))]
             unsafe {
-                fn64_abi::boot_thread0(rdram_ptr, fn64_boot_harness::c_recomp_entrypoint(), 0, 10);
+                fn64_abi::boot_thread0(
+                    rdram_ptr,
+                    rdram.len(),
+                    fn64_boot_harness::c_recomp_entrypoint(),
+                    0,
+                    10,
+                );
             }
 
             Shell {

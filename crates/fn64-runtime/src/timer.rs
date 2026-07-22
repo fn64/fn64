@@ -36,6 +36,27 @@ struct Timer {
     armed_by: ThreadId,
 }
 
+/// One pending timer in the exact order [`TimerWheel::advance`] will inspect
+/// it. Equal-deadline entries retain their current stable FIFO order.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TimerEvidenceSnapshot {
+    pub id: TimerId,
+    pub deadline: u64,
+    pub interval: u64,
+    pub queue_addr: crate::RdramAddr,
+    pub msg: Mesg,
+    pub armed_by: ThreadId,
+}
+
+/// Complete pointer-free scheduling evidence for the timer wheel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimerWheelEvidenceSnapshot {
+    pub next_id: TimerId,
+    /// Deadline order, with stable insertion order among ties. This is the
+    /// same ordering rule used by [`TimerWheel::advance`].
+    pub firing_order: Vec<TimerEvidenceSnapshot>,
+}
+
 /// The timer wheel. Owned by the executor (see `executor.rs`), which is the
 /// only thing that both advances virtual time and can act on a fired
 /// timer's queue-post side effect -- matching §2's "VI/timer event delivery"
@@ -59,6 +80,30 @@ pub struct FiredTimer {
 }
 
 impl TimerWheel {
+    /// Project the future firing schedule without sorting or otherwise
+    /// mutating the live wheel.
+    pub fn evidence_snapshot(&self) -> TimerWheelEvidenceSnapshot {
+        let mut firing_order: Vec<_> = self
+            .timers
+            .iter()
+            .map(|&(id, ref timer)| TimerEvidenceSnapshot {
+                id,
+                deadline: timer.deadline,
+                interval: timer.interval,
+                queue_addr: timer.queue_addr,
+                msg: timer.msg,
+                armed_by: timer.armed_by,
+            })
+            .collect();
+        // Stable sort is intentional: `advance` uses the same operation, so
+        // equal-deadline timers retain their current FIFO order.
+        firing_order.sort_by_key(|timer| timer.deadline);
+        TimerWheelEvidenceSnapshot {
+            next_id: self.next_id,
+            firing_order,
+        }
+    }
+
     /// `osSetTimer(t, countdown, interval, mq, msg)`. `countdown` and
     /// `interval` are `OSTime` (already-converted virtual-clock ticks, not
     /// raw `OS_CYCLES` -- that conversion is `fn64-abi`'s job per
@@ -186,5 +231,44 @@ mod tests {
         let fired = wheel.advance(20);
         let order: Vec<_> = fired.iter().map(|f| f.msg).collect();
         assert_eq!(order, vec![5, 10, 20]);
+    }
+
+    #[test]
+    fn evidence_snapshot_preserves_stable_tie_order_without_mutating_wheel() {
+        let mut wheel = TimerWheel::default();
+        wheel.set_timer(0, 20, 0, addr(0x20), 0x20, 2);
+        wheel.set_timer(0, 10, 0, addr(0x11), 0x11, 1);
+        wheel.set_timer(0, 10, 0, addr(0x12), 0x12, 1);
+
+        let before = wheel.evidence_snapshot();
+        assert_eq!(before.next_id, 3);
+        assert_eq!(
+            before
+                .firing_order
+                .iter()
+                .map(|timer| timer.msg)
+                .collect::<Vec<_>>(),
+            vec![0x11, 0x12, 0x20]
+        );
+        assert_eq!(wheel.evidence_snapshot(), before);
+
+        let fired = wheel.advance(20);
+        assert_eq!(
+            fired.iter().map(|timer| timer.msg).collect::<Vec<_>>(),
+            vec![0x11, 0x12, 0x20]
+        );
+    }
+
+    #[test]
+    fn evidence_snapshot_distinguishes_equal_deadline_insertion_order() {
+        let mut first = TimerWheel::default();
+        first.set_timer(0, 10, 0, addr(1), 1, 1);
+        first.set_timer(0, 10, 0, addr(2), 2, 1);
+
+        let mut reversed = TimerWheel::default();
+        reversed.set_timer(0, 10, 0, addr(2), 2, 1);
+        reversed.set_timer(0, 10, 0, addr(1), 1, 1);
+
+        assert_ne!(first.evidence_snapshot(), reversed.evidence_snapshot());
     }
 }

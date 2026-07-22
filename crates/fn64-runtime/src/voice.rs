@@ -12,6 +12,12 @@ pub const VOICE_STATUS_CANCEL: u8 = 3;
 pub const VOICE_STATUS_BUSY: u8 = 5;
 pub const VOICE_STATUS_END: u8 = 7;
 
+/// Captured raw command `0x0D` initialization addresses, including neither
+/// the Joybus address CRC nor any inferred meaning for the five registers.
+/// The public captures establish their order and successful response, but do
+/// not establish semantics for treating them as independent writes.
+const RAW_INIT_ADDRESSES: [u16; 5] = [0x1E00, 0x6E00, 0x0800, 0x5600, 0x0300];
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 enum VoiceStatus {
@@ -41,9 +47,24 @@ pub enum VoiceError {
     NotReady,
 }
 
+/// Complete executor-owned VRU state for fixed-cycle release evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoiceEvidenceSnapshot {
+    pub initialized: bool,
+    pub raw_init_step: u8,
+    pub expected_words: Option<u8>,
+    pub words: Vec<Vec<u8>>,
+    pub mask: Vec<u8>,
+    pub analog_gain: u8,
+    pub digital_gain: u8,
+    pub status: u8,
+    pub pending_result: Option<VoiceData>,
+}
+
 #[derive(Clone, Debug)]
 pub struct VoiceUnit {
     initialized: bool,
+    raw_init_step: u8,
     expected_words: Option<u8>,
     words: Vec<Vec<u8>>,
     mask: Vec<u8>,
@@ -57,6 +78,7 @@ impl Default for VoiceUnit {
     fn default() -> Self {
         Self {
             initialized: false,
+            raw_init_step: 0,
             expected_words: None,
             words: Vec::new(),
             mask: Vec::new(),
@@ -73,8 +95,23 @@ impl VoiceUnit {
         Self::default()
     }
 
+    pub fn evidence_snapshot(&self) -> VoiceEvidenceSnapshot {
+        VoiceEvidenceSnapshot {
+            initialized: self.initialized,
+            raw_init_step: self.raw_init_step,
+            expected_words: self.expected_words,
+            words: self.words.clone(),
+            mask: self.mask.clone(),
+            analog_gain: self.analog_gain,
+            digital_gain: self.digital_gain,
+            status: self.status as u8,
+            pending_result: self.pending_result,
+        }
+    }
+
     pub fn initialize(&mut self) {
         self.initialized = true;
+        self.raw_init_step = 0;
         self.status = VoiceStatus::Ready;
         self.pending_result = None;
     }
@@ -83,8 +120,44 @@ impl VoiceUnit {
         self.initialized
     }
 
+    /// Accept one member of the only complete raw initialization sequence in
+    /// the public hardware captures. Requiring the captured order prevents an
+    /// unidentified `0x0D` power/gain register write from being accepted as a
+    /// fabricated generic success.
+    pub fn raw_initialize_step(&mut self, address: u16) -> Result<(), VoiceError> {
+        if self.initialized {
+            return Err(VoiceError::Invalid);
+        }
+        if RAW_INIT_ADDRESSES.get(usize::from(self.raw_init_step)) != Some(&address) {
+            return Err(VoiceError::Invalid);
+        }
+        self.raw_init_step += 1;
+        Ok(())
+    }
+
+    /// Complete raw initialization after all five captured `0x0D` writes.
+    pub fn finish_raw_initialize(&mut self) -> Result<(), VoiceError> {
+        if self.initialized || usize::from(self.raw_init_step) != RAW_INIT_ADDRESSES.len() {
+            return Err(VoiceError::Invalid);
+        }
+        self.initialize();
+        Ok(())
+    }
+
     pub fn status(&self) -> u8 {
         self.status as u8
+    }
+
+    /// Two-byte raw command `0x0B` reports START before initialization, then
+    /// the same public lifecycle status observed by the high-level API. This
+    /// distinction is present in the public hardware captures: the same
+    /// query returns `01 00` before initialization and `00 00` once READY.
+    pub fn wire_status(&self) -> u8 {
+        if self.initialized {
+            self.status()
+        } else {
+            VOICE_STATUS_START
+        }
     }
 
     pub fn clear_dictionary(&mut self, words: u8) -> Result<(), VoiceError> {
@@ -219,16 +292,34 @@ mod tests {
     fn initialization_and_recognition_transitions_are_explicit() {
         let mut voice = VoiceUnit::new();
         assert!(!voice.initialized());
+        assert_eq!(voice.wire_status(), VOICE_STATUS_START);
         assert_eq!(voice.clear_dictionary(1), Err(VoiceError::Invalid));
         assert_eq!(voice.mark_voice_detected(), Err(VoiceError::NotReady));
 
         voice.initialize();
         assert!(voice.initialized());
+        assert_eq!(voice.wire_status(), VOICE_STATUS_READY);
         voice.clear_dictionary(1).unwrap();
         voice.set_word(b"test").unwrap();
         voice.start().unwrap();
         voice.mark_voice_detected().unwrap();
         assert_eq!(voice.status(), VOICE_STATUS_BUSY);
         assert_eq!(voice.mark_voice_detected(), Err(VoiceError::NotReady));
+    }
+
+    #[test]
+    fn raw_initialization_requires_the_complete_captured_sequence() {
+        let mut voice = VoiceUnit::new();
+        assert_eq!(voice.raw_initialize_step(0x6E00), Err(VoiceError::Invalid));
+        assert_eq!(voice.finish_raw_initialize(), Err(VoiceError::Invalid));
+
+        for address in RAW_INIT_ADDRESSES {
+            voice.raw_initialize_step(address).unwrap();
+        }
+        assert_eq!(voice.evidence_snapshot().raw_init_step, 5);
+        voice.finish_raw_initialize().unwrap();
+        assert!(voice.initialized());
+        assert_eq!(voice.evidence_snapshot().raw_init_step, 0);
+        assert_eq!(voice.raw_initialize_step(0x1E00), Err(VoiceError::Invalid));
     }
 }

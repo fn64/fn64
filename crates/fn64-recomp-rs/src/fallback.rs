@@ -43,7 +43,7 @@
 use std::collections::BTreeMap;
 
 use crate::execution::{
-    BlockExit, BlockRun, BlockRunner, CodeBank, ExecutionKey, GeneratedBankFn, GeneratedBankRunner,
+    BlockExit, BlockProgram, BlockRun, BlockRunner, CodeBank, ExecutionKey, GeneratedBankRunner,
     InstructionBudget, ProgramError,
 };
 use crate::interp::{run_bank_with_mmio, MmioPort, NoMmio};
@@ -71,7 +71,9 @@ pub enum EvidenceClass {
 
 /// One installed execution lane for a bank.
 enum Lane {
-    Aot(GeneratedBankFn),
+    /// Keep the evolved runner wrapper inside the primary AOT ownership
+    /// mechanism so its artifact identity is not discarded as a bare callable.
+    Aot(BlockProgram),
     DynamicMips,
 }
 
@@ -122,10 +124,14 @@ impl FallbackProgram {
         if self.contains(bank) {
             return Err(ProgramError::DuplicateBank { bank });
         }
+        let mut program = BlockProgram::new();
+        program
+            .register(code.clone(), runner)
+            .expect("runner identity and duplicate admission were checked before registration");
         self.code
             .register(code)
             .expect("duplicate program bank was checked before catalog registration");
-        self.lanes.insert(bank, Lane::Aot(runner.into_fn()));
+        self.lanes.insert(bank, Lane::Aot(program));
         Ok(())
     }
 
@@ -213,7 +219,7 @@ impl FallbackProgram {
             )
         });
         match lane {
-            Lane::Aot(run) => run(entry, budget, ctx, mem),
+            Lane::Aot(program) => program.run(entry, budget, ctx, mem),
             Lane::DynamicMips => {
                 match run_bank_with_mmio(&self.code, entry.bank, entry, budget, ctx, mem, port) {
                     Ok(run) => run,
@@ -371,9 +377,10 @@ mod tests {
 
     #[test]
     fn unsupported_op_in_the_interpreter_is_a_typed_fault_not_a_panic() {
-        // mtc0 $v0,$Status(12) — decoded but out of scope: a typed fault.
+        // DMFC0 remains outside the modeled privileged-register slice, so it
+        // remains a typed fault rather than becoming a host panic or no-op.
         let id = BankId::new(0x72);
-        let words = [0x4082_6000, 0x03E0_0008, 0x0000_0000];
+        let words = [0x4022_4800, 0x03E0_0008, 0x0000_0000];
         let mut program = FallbackProgram::new();
         program
             .register_dynamic_mips(contiguous(0x72, &words))
@@ -394,7 +401,7 @@ mod tests {
                 kind: CpuFaultKind::UnsupportedInstruction { word },
             }) => {
                 assert_eq!(at, ExecutionKey::new(id, GuestPc::new(VA)));
-                assert_eq!(word, 0x4082_6000);
+                assert_eq!(word, 0x4022_4800);
             }
             other => panic!("expected typed UnsupportedInstruction fault, got {other:?}"),
         }

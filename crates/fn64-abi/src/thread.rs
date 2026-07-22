@@ -53,13 +53,6 @@ pub unsafe extern "C" fn osCreateThread_recomp(rdram: *mut u8, ctx: *mut RecompC
     let arg = ctx.r7;
     let sp = read_stack_word(rdram, ctx.r29, 0x10) as u64;
     let priority = read_stack_word(rdram, ctx.r29, 0x14) as Priority;
-    if std::env::var("FN64_DEBUG_BOOT").is_ok() {
-        eprintln!(
-            "[DEBUG osCreateThread] osid={requested_osid} entry={entry_vram:#010x} pri={priority} \
-             handle={:#x}",
-            thread_handle.offset()
-        );
-    }
 
     // Libultra's OSId is an informational tag, not a key: thread identity on
     // real hardware is the OSThread struct pointer, and NWXE's retail boot
@@ -83,6 +76,11 @@ pub unsafe extern "C" fn osCreateThread_recomp(rdram: *mut u8, ctx: *mut RecompC
         host.thread_handles.insert(thread_handle.offset(), id);
         host.thread_guest_ids.insert(id, requested_osid);
     });
+    if crate::boot_probe_enabled() {
+        eprintln!(
+            "[boot-probe] osCreateThread(id={requested_osid} -> {id:#x}, entry={entry_vram:#010x}, sp={sp:#010x}, pri={priority})"
+        );
+    }
 
     // rdram is one shared allocation for the whole process lifetime
     // (docs/DESIGN.md section 3) -- capturing its raw pointer in this
@@ -161,10 +159,6 @@ pub unsafe extern "C" fn osSetThreadPri_recomp(_rdram: *mut u8, ctx: *mut Recomp
     let ctx = unsafe { &*ctx };
     let target = resolve_thread_arg(ctx.r4, "osSetThreadPri_recomp");
     let pri = ctx.r5 as Priority;
-    if std::env::var("FN64_DEBUG_BOOT").is_ok() {
-        let tid = ACTIVE_THREAD_ID.with(|c| c.get());
-        eprintln!("[DEBUG osSetThreadPri] caller={tid:?} target={target} pri={pri}");
-    }
     with_executor(|exec| exec.set_thread_pri(target, pri));
 }
 
@@ -280,12 +274,8 @@ mod tests {
     use super::*;
     use crate::test_support::*;
 
-    /// The C-ABI `pause_self` parks the thread until an explicit
-    /// `osStartThread` (reference-runtime semantics; `Yield::StopSelf`).
-    /// N64Recomp's C codegen emits `pause_self()` for guest self-branch
-    /// hangs with NO loop back, so an auto-resume here returns through
-    /// code the console can never reach -- the WM2000 streaming-loader
-    /// size-underflow bug (2026-07-21, see `dispatch.rs::pause_self`).
+    /// Generated C emits `pause_self()` for guest self-branch hangs with no
+    /// loop back, so the thread must remain parked until an explicit start.
     #[test]
     fn pause_self_parks_via_real_executor_until_explicit_restart() {
         let fell_through = std::rc::Rc::new(std::cell::RefCell::new(0));
@@ -296,14 +286,10 @@ mod tests {
         });
         assert!(run_one_step());
         assert_eq!(*fell_through.borrow(), 0);
-        // Parked: the scheduler on its own must NEVER resume it (this was
-        // the assert-hang fall-through bug).
         for _ in 0..10 {
             run_one_step();
         }
         assert_eq!(*fell_through.borrow(), 0);
-        // The one legal resume path: an explicit osStartThread, after which
-        // pause_self returns (the reference runtime's restart fall-through).
         with_executor(|exec| exec.start_thread(100));
         assert!(run_one_step());
         assert_eq!(*fell_through.borrow(), 1);

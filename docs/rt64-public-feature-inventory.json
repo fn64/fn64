@@ -1,0 +1,473 @@
+{
+  "schema": "fn64.rt64-public-feature-inventory.v2",
+  "upstream": {
+    "repository": "https://github.com/rt64/rt64",
+    "commit": "f0728a2520d5aa735886240de3fee75cc805f6d6",
+    "official_readme": "https://github.com/rt64/rt64/blob/f0728a2520d5aa735886240de3fee75cc805f6d6/README.md"
+  },
+  "runtime_control_families": {
+    "backend-d3d12": ["user_configuration"],
+    "backend-vulkan": ["user_configuration"],
+    "backend-metal": ["user_configuration"],
+    "latency-skip-buffering": ["enhancement_configuration"],
+    "latency-present-early": ["enhancement_configuration"],
+    "high-resolution-renderer": ["user_configuration"],
+    "downsample-to-original-like": ["user_configuration"],
+    "widescreen-arbitrary-aspect": ["user_configuration"],
+    "ultrawide": ["user_configuration"],
+    "hfr-60-plus-interpolation": ["user_configuration"],
+    "texture-pack-dds": ["texture_replacements"],
+    "texture-pack-rice-filenames": ["texture_replacements"],
+    "texture-pack-async-streaming": ["texture_replacements"],
+    "debugger-frame-inspection": ["user_configuration"]
+  },
+  "items": [
+    {
+      "id": "base-rendering-accuracy",
+      "title": "Accurate base rendering without game-specific workarounds",
+      "scope": "behavior",
+      "status": "open",
+      "controls": ["build_capability"],
+      "closure": "Close only from `BASE-RENDERER-BEHAVIOR-MATRIX.md` after every silicon and full-ROM behavior row is exact; this base claim cannot close any enhancement row.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 16, "needle": "no tolerance for game-specific workarounds" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_state.cpp", "line": 1133, "needle": "resolutionScale(1.0f, 1.0f)" }
+      ]
+    },
+    {
+      "id": "backend-d3d12",
+      "title": "D3D12 graphics backend",
+      "scope": "behavior",
+      "status": "open",
+      "controls": ["build_capability", "runtime_setting"],
+      "closure": "Exercise fn64 through D3D12 with backend-specific initialization, task, presentation, and resize evidence.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 13, "needle": "D3D12, Vulkan and Metal" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_application.cpp", "line": 160, "needle": "GraphicsAPI::D3D12" }
+      ]
+    },
+    {
+      "id": "backend-vulkan",
+      "title": "Vulkan graphics backend",
+      "scope": "behavior",
+      "status": "open",
+      "controls": ["build_capability", "runtime_setting"],
+      "closure": "Exercise fn64 through Vulkan with backend-specific initialization, task, presentation, and resize evidence.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 13, "needle": "D3D12, Vulkan and Metal" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_application.cpp", "line": 176, "needle": "GraphicsAPI::Vulkan" }
+      ]
+    },
+    {
+      "id": "backend-metal",
+      "title": "Metal graphics backend",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["build_capability", "runtime_setting"],
+      "closure": "Twenty consecutive clean live runs against clean pinned RT64 explicitly select Metal, initialize the backend, submit exact raw-RDP fills, present from nonzero live VI origins through the current physical-RDRAM capability, bind post-VI BGRA8 captures, resize from 4x2 to 8x4 across two distinct worker presents without stale-cache reversion, and recreate at 4x2 with the same active policy identity. Each process also proves a later backend-geometry compatibility present cannot enter release capture.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 13, "needle": "D3D12, Vulkan and Metal" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_application.cpp", "line": 168, "needle": "GraphicsAPI::Metal" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_metal_backend_behavior.rs", "line": 234, "needle": "validate_capture(resized, &resized_capture, &identity, policy_sha256)", "claim_id": "backend-metal" }
+      ]
+    },
+    {
+      "id": "ubershader-no-pipeline-stutter",
+      "title": "Ubershaders prevent pipeline-compilation stutter",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["build_capability"],
+      "closure": "Twenty consecutive clean live Metal runs against clean pinned RT64 prove this at the construction mechanism rather than through a wall-clock threshold. Before arming, fn64 waits for and verifies all eight zCmp/zUpd/cvgAdd raster ubershader PSOs. A five-call post-create workload then introduces five unique ordered shader descriptions spanning point and average texture filtering, distinct texture sources, force-blend primitive color, primitive depth update, and coverage wrap. Every call selects the exact expected precreated ubershader pointer at pipeline indices 0,0,0,2,4. An exact Metal newRenderPipelineState hook observes all five specialized PSO constructions only on RT64's background shader threads and zero on the caller, workload, and present critical paths in every run. Workload/present IDs advance to 1/1 and the exact five-band post-VI BGRA8 output remains SHA-256 9d26bec4..., so a no-op cannot satisfy the gate. Pointer-derived pipeline digests are intentionally process-local; the ordered descriptor digest 5aa5ed384e770f74 is stable.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 14, "needle": "no stutters due to pipeline compilation" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_state.cpp", "line": 1130, "needle": "waitForPipelineCreation" },
+        { "kind": "pinned_source", "path": "src/render/rt64_raster_shader.cpp", "line": 460, "needle": "Generate all possible combinations" },
+        { "kind": "pinned_source", "path": "src/render/rt64_framebuffer_renderer.cpp", "line": 1610, "needle": "ubershadersOnly ? nullptr" },
+        { "kind": "pinned_source", "path": "src/render/rt64_raster_shader_cache.cpp", "line": 33, "needle": "idle priority" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_ubershader_pipeline_behavior.rs", "line": 143, "needle": "fn require_evidence", "claim_id": "ubershader-no-pipeline-stutter" }
+      ]
+    },
+    {
+      "id": "latency-skip-buffering",
+      "title": "Latency mode skips native game buffering",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["runtime_setting"],
+      "closure": "Ten consecutive clean live Metal runs against clean pinned RT64 seed two exact 320x240 RGBA16 history buffers, then modify prior-history A to blue while VI requests established green B. The read-only descriptor evidence waits both RT64 queue workers idle and proves completed present 4 binds B at 0x00140000 in Console but A at 0x00100000 in SkipBuffering. Every post-VI pixel is exact, including the measured opaque crop: Console SHA-256 21816d46... is green in rows 2 through 233, while SkipBuffering SHA-256 eace5bb8... is blue there. Both RDRAM targets, four guards, policy identities, source identity, dimensions, pixel size, and all advancing present IDs remain exact.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 17, "needle": "skip the game's native buffering" },
+        { "kind": "pinned_source", "path": "src/common/rt64_enhancement_configuration.h", "line": 18, "needle": "SkipBuffering" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_latency_skip_buffering_behavior.rs", "line": 365, "needle": "require_selection(", "claim_id": "latency-skip-buffering" }
+      ]
+    },
+    {
+      "id": "latency-present-early",
+      "title": "Latency mode presents as early as possible",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["runtime_setting"],
+      "closure": "Twenty consecutive clean live Metal runs against clean pinned RT64 seed exact Console-mode VI history, prove another Console raw FullSync changes RDRAM without changing the captured image or present ID, then live-apply the exact PresentEarly policy and prove the next raw FullSync publishes a fresh process-time present ID, exact valid green pixels, exact opaque border pixels, and exact green RDRAM without an explicit present call. The shim waits the advanced present ID and capture generation before returning the RDRAM borrow.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 17, "needle": "draw as early as possible" },
+        { "kind": "pinned_source", "path": "src/common/rt64_enhancement_configuration.h", "line": 19, "needle": "PresentEarly" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_latency_present_early_behavior.rs", "line": 297, "needle": "require_recolored_capture(&early_capture, [0x00, 0xff, 0x00, 0xff])?", "claim_id": "latency-present-early" }
+      ]
+    },
+    {
+      "id": "high-resolution-renderer",
+      "title": "Render above original resolution",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["runtime_setting"],
+      "closure": "Ten consecutive clean live Metal runs against clean pinned RT64 pair a certified 4x4 control with a fractional 16x16 high-frequency diagonal texture rectangle, then live-apply exact Manual 1x and 2x policies against the same target. Native presentation is byte-stable at bounds [4,4,14,8] with 32 red pixels and SHA-256 fe756dbf..., while 2x is byte-stable at bounds [4,4,14,9] with 35 red pixels and SHA-256 0deba793...: exactly three post-VI pixels change while layout, interior/background anchors, policy identity, and presentation ordering remain exact.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 18, "needle": "higher resolution" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 211, "needle": "resolutionScale" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_resolution_downsample_behavior.rs", "line": 397, "needle": "high_changed_pixels != 3", "claim_id": "high-resolution-renderer" }
+      ]
+    },
+    {
+      "id": "downsample-to-original-like",
+      "title": "Downsample high-resolution output toward original resolution",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["runtime_setting"],
+      "closure": "Ten consecutive clean live Metal runs against clean pinned RT64 first prove that a 16x16 swapchain collapses the high and downsample paths to identical pixels, then resize through a certified 32x32 handoff and compare exact 2x high output with the same policy plus 2x downsampling. Both 32x32 captures retain row-bytes 128, bounds [5,7,14,12], 33 red pixels, exact policy identities, and advancing present IDs, while the downsample filter changes exactly seven pixels and moves the stable SHA-256 from f06f2043... to 867d0aab....",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 18, "needle": "downsample to a resolution closer" },
+        { "kind": "pinned_source", "path": "src/render/rt64_render_target.cpp", "line": 354, "needle": "downsampleTarget" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_resolution_downsample_behavior.rs", "line": 551, "needle": "downsample_32_changed_pixels != 7", "claim_id": "downsample-to-original-like" }
+      ]
+    },
+    {
+      "id": "widescreen-arbitrary-aspect",
+      "title": "Widescreen at arbitrary aspect ratios",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["runtime_setting", "game_or_extended_gbi_cooperation"],
+      "closure": "Ten fresh clean Metal processes against pinned RT64 run one hand-authored non-ROM F3DEX2/Extended workload twice each at 4:3, 16:9, 2:1, and 21:9 while live typed settings take the framebuffer-discard path. The explicit viewport, non-full scissor, transformed asymmetric triangle, and Adjust rectangle with Left/Right origins and six-pixel offsets are bound to one workload/present and exact post-VI SHA-256 per mode. Triangle and 2D rectangle geometry follow different horizontal mappings, rejecting a global-stretch implementation. The opt-in evidence admission substitutes only the declared F3DEX2 dialect; production hash recognition returns NeedsLle before and after and is not broadened.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 19, "needle": "arbitrary aspect ratios" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 210, "needle": "aspectRatioScale" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_aspect_ratio_behavior.rs", "line": 329, "needle": "fn main()", "claim_id": "widescreen-arbitrary-aspect" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_hle_aspect_behavior.rs", "line": 650, "needle": "if !captures.windows(2).all", "claim_id": "widescreen-arbitrary-aspect" }
+      ]
+    },
+    {
+      "id": "ultrawide",
+      "title": "Ultrawide rendering with limited game support",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["runtime_setting", "game_or_extended_gbi_cooperation"],
+      "closure": "The same ten-process clean Metal HLE matrix includes live 21:9 selection and an exact post-VI SHA-256 of c5aa2d5a.... Its explicit viewport/scissor produces the expected bounded source, transformed triangle, and Extended Adjust rectangle with independent Left/Right origin treatment; their unequal geometry response rejects global stretching. The fixture is public and non-ROM, and its opt-in admission substitutes only the F3DEX2 dialect while negative controls prove production recognition remains strict.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 19, "needle": "Ultrawide support (limited game support)" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 210, "needle": "aspectRatioTarget" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_aspect_ratio_behavior.rs", "line": 329, "needle": "fn main()", "claim_id": "ultrawide" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_hle_aspect_behavior.rs", "line": 650, "needle": "if !captures.windows(2).all", "claim_id": "ultrawide" }
+      ]
+    },
+    {
+      "id": "hfr-60-plus-interpolation",
+      "title": "Generate spatially modified interpolated frames at 60 FPS or above",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["runtime_setting", "game_or_extended_gbi_cooperation"],
+      "closure": "Twenty fresh watchdog-bounded Metal processes against clean pinned RT64 run one public non-ROM F3DEX2/Extended fixture through the opt-in typed-dialect admission. A required GetVersion handshake yields v1; every cooperating workload emits Enable, SetRefreshRate 60, and decomposed Auto-order matrix group 7 with position/rotation interpolation. The live Original-to-Manual-120-Hz transition binds source workloads 3/4, present 3, exact generated fractions 1/2 and 2/2, stable post-VI SHA-256 values af5e25c1... and b7116e22..., and the same 161-pixel shape at ordered x sums 4508/4830/5152; the endpoint exactly equals the Original control. Every process also passes eight post-sleep two-call pacing bursts, exact toggle-back restoration, HFR/Extended arm exclusion, and production `process_task` `NeedsLle` before and after, so the evidence admission does not broaden hash recognition. A device-free exact-source C++ probe separately requires stable-factor results 60/30, 50/25, and 60/30 Hz. Ten fresh live Metal processes then carry typed PAL and MPAL `RenderConfig` values through production context creation, ordinary VI events, and FullSync without an Extended refresh override; every run produces exact completed-workload sequences [0,0,0,50] and [0,0,0,60], preserves configured/registered authority, and retains production `NeedsLle` rejection. Full-ROM evidence must still co-bind decoded TV authority to renderer configuration. Physical compositor/scanout timing remains a separately bounded platform-certification residual rather than part of this renderer-API behavior row.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 20, "needle": "60 FPS or above" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 989, "needle": "generateInterpolatedFrames" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_hfr_interpolation_behavior.rs", "line": 846, "needle": "fn main()", "claim_id": "hfr-60-plus-interpolation" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/src/ffi.rs", "line": 4157, "needle": "fn cpp_vi_history_uses_context_region_rate_for_stable_factors", "claim_id": "hfr-60-plus-interpolation" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_region_rate_behavior.rs", "line": 161, "needle": "fn main()", "claim_id": "hfr-60-plus-interpolation" }
+      ]
+    },
+    {
+      "id": "extended-gbi",
+      "title": "Extended GBI for enhancement integration",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["game_or_extended_gbi_cooperation"],
+      "closure": "Ten fresh 60-second-watchdog-bounded Metal processes against clean pinned RT64 complete the public non-ROM F3DEX2/Extended cooperation denominator while production hash recognition remains strict. Existing gates retain disabled policy, live GetVersion v1, Enable, optional fallback, named required failure, exact SetRectAspect/SetRectAlign geometry, and 4:3/16:9/2:1/21:9 3D-versus-2D pixels. The closure fixture adds two exact decomposed Auto-order transform groups, Extended SetRefreshRate 60 under live Manual 120 Hz, source/current workload and present provenance, generated fractions 1/2 and 2/2, and exact ordered 161-pixel shapes with post-VI SHA-256 af5e25c1... and b7116e22.... Separate far/near primitive-depth controls bind typed VertexZ begin/end markers and one exact three-index affected range to unchanged visible b7116e22... and fully occluded 5e9d5b68... output. Every case has bounded RDRAM guards and requires `process_task` `NeedsLle` before and after, so this closes the Extended command-set behavior rather than broadening or claiming the production microcode catalog.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 21, "needle": "Extended command set" },
+        { "kind": "pinned_source", "path": "include/rt64_extended_gbi.h", "line": 16, "needle": "RT64_HOOK_OP_ENABLE" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_extended_gbi_enhancement_behavior.rs", "line": 744, "needle": "fn run_once()", "claim_id": "extended-gbi" }
+      ]
+    },
+    {
+      "id": "texture-pack-dds",
+      "title": "DDS texture-pack replacements",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["runtime_setting"],
+      "closure": "Ten consecutive clean live Metal runs against clean pinned RT64 discover the same TMEM hash, select a generated DDS by RT64 auto-path, change pixels, and distinguish multi-mip from single-mip minification with identical digests.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 22, "needle": "Texture packs with DDS" },
+        { "kind": "pinned_source", "path": "src/render/rt64_texture_cache.cpp", "line": 735, "needle": "TextureCache::setDDS" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_texture_replacement_behavior.rs", "line": 294, "needle": "if rt64_minified == single_minified", "claim_id": "texture-pack-dds" }
+      ]
+    },
+    {
+      "id": "texture-pack-rice-filenames",
+      "title": "Texture packs compatible with Rice filenames",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["runtime_setting"],
+      "closure": "Ten consecutive clean live Metal runs against clean pinned RT64 select the same generated DDS through Rice-compatible and RT64 auto-path names with byte-identical output.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 22, "needle": "Compatible with Rice filenames" },
+        { "kind": "pinned_source", "path": "src/common/rt64_replacement_database.cpp", "line": 158, "needle": "ReplacementAutoPath::Rice" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_texture_replacement_behavior.rs", "line": 306, "needle": "if rice_full != rt64_full", "claim_id": "texture-pack-rice-filenames" }
+      ]
+    },
+    {
+      "id": "texture-pack-async-streaming",
+      "title": "Asynchronous texture-pack streaming",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["runtime_setting"],
+      "closure": "Ten consecutive clean live Metal runs against clean pinned RT64 establish a stable cleared baseline, replace it, then hold a real resolved/queued Stream job with workers paused; fallback returns to the controlled baseline while the queue remains unchanged with zero loads, and resuming the exact worker count installs changed final pixels.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 22, "needle": "asynchronous streaming support" },
+        { "kind": "pinned_source", "path": "src/render/rt64_texture_cache.cpp", "line": 396, "needle": "std::thread" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_texture_replacement_behavior.rs", "line": 368, "needle": "if stream_fallback != stream_base", "claim_id": "texture-pack-async-streaming" }
+      ]
+    },
+    {
+      "id": "native-renderer-rdram-sync",
+      "title": "Native-resolution renderer preserves game-visible RDRAM behavior",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["build_capability"],
+      "closure": "Ten consecutive clean live Metal runs against clean pinned RT64 render a native RGBA16 framebuffer and prove all 32 pixels transition from seeded guest bytes to the exact expected game-visible RDRAM values after FullSync; a second 16-pixel target transitions independently and boundary guards prove both writes remain region-bounded.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 66, "needle": "game will see the correct data in RAM" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_state.cpp", "line": 604, "needle": "storeRAM" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_framebuffer_rdram_region_behavior.rs", "line": 197, "needle": "if source_after != expected_source", "claim_id": "native-renderer-rdram-sync" }
+      ]
+    },
+    {
+      "id": "framebuffer-detection-region-copy",
+      "title": "Framebuffer detection copies sampled framebuffer regions",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["build_capability"],
+      "closure": "The existing ten-run Metal gate retains exact within-workload red/blue region-copy output. A second ten-run hard-watchdog gate renders the same guarded source as a prior completed workload, requires its exact nonzero managed-framebuffer identity and earlier write timestamp, then proves copyWithGPU=true exclusively dispatches one CreateTileCopy operation and one tileCopyUsed tile while false exclusively dispatches one ordinary RDRAM/TMEM upload. Zero, mixed, raw-TMEM, or multiple routes fail loudly; both routes retain exact source fd2466..., sampled 8b89d3..., and post-VI 43da36... SHA-256 results.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 69, "needle": "direct copy of one of its regions" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_framebuffer_manager.cpp", "line": 105, "needle": "createTileCopySetup" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_framebuffer_rdram_region_behavior.rs", "line": 205, "needle": "if sampled_after != expected_sampled", "claim_id": "framebuffer-detection-region-copy" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_enhancement_emulator_controls_behavior.rs", "line": 677, "needle": "gpu_copy.copy_path.path != Rt64FramebufferCopyPath::GpuTileCopy", "claim_id": "framebuffer-detection-region-copy" }
+      ]
+    },
+    {
+      "id": "framebuffer-upscaling",
+      "title": "Upscale framebuffer effects and associated region copies",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["build_capability"],
+      "closure": "Ten consecutive clean live Metal runs against clean pinned RT64 activate the exact 2x resolution and upscale-all policy, copy the nonzero framebuffer subregion (2,1) through (5,2), and produce the exact eight-pixel transformed result. The surrounding source is blue and the selected region has asymmetric rows, so native coordinates or unadjusted extents cannot satisfy the fixture; source and destination transitions plus four guards remain exact.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 74, "needle": "upscale these effects" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_framebuffer_manager.cpp", "line": 114, "needle": "resolutionScale.x" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_framebuffer_enhancement_behavior.rs", "line": 238, "needle": "if reinterpreted_after != EXPECTED_REINTERPRETED", "claim_id": "framebuffer-upscaling" }
+      ]
+    },
+    {
+      "id": "framebuffer-reinterpretation",
+      "title": "High-resolution per-pixel framebuffer reinterpretation",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["build_capability"],
+      "closure": "Ten consecutive clean live Metal runs against clean pinned RT64 exercise the advertised case-by-case grayscale behavior through the actual 2x RGBA16-to-IA16 framebuffer compute path. Eight red-intensity input texels become the exact RGBA16 grayscale vector 4211,8421,c631,ffff,ffff,c631,8421,4211, which differs per pixel from both the ordinary RGBA copy and seeded guest bytes. This evidence does not claim unexercised reinterpret formats.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 77, "needle": "per-pixel reinterpretation" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_framebuffer_manager.cpp", "line": 247, "needle": "reinterpretTileSetup" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_framebuffer_enhancement_behavior.rs", "line": 238, "needle": "if reinterpreted_after != EXPECTED_REINTERPRETED", "claim_id": "framebuffer-reinterpretation" }
+      ]
+    },
+    {
+      "id": "debugger-frame-inspection",
+      "title": "In-game debugger inspects recorded frame contents",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["runtime_setting"],
+      "closure": "Twenty consecutive clean live Metal runs against clean pinned RT64 use fn64's deterministic host evidence API to set the same backend-independent DebuggerInspector pause, framebuffer, and global draw-call fields consumed by State::updateScreen and WorkloadQueue. The actual paused repeat path advances workload IDs 1 through 4 and present IDs 1 through 4 while preserving the exact deferred content digest e3307aadeb400f41. Selecting framebuffer A renders exact red-left/blue-right pixels (SHA-256 8196dea5...), truncating A at global draw call 0 renders exact all-red pixels (SHA-256 9eeb1941...), and selecting framebuffer B renders exact all-green pixels (SHA-256 55d73fed...); selected RDRAM addresses are exactly 0x00100000, 0x00100000, and 0x00140000. The pinned ImGui Inspector frontend has only D3D12 and Vulkan constructors and asserts on Metal, so this closes the host API plus backend-independent pause/inspection behavior only; a Metal GUI frontend is not claimed.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 52, "needle": "in-game debugger" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_state.cpp", "line": 1815, "needle": "inspect()" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 589, "needle": "globalDrawCallIndex + 1" },
+        { "kind": "pinned_source", "path": "src/gui/rt64_inspector.cpp", "line": 139, "needle": "Unknown Graphics API" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_deferred_debugger_behavior.rs", "line": 355, "needle": "set_debugger_inspection_for_evidence(true, 0, 0", "claim_id": "debugger-frame-inspection" }
+      ]
+    },
+    {
+      "id": "deferred-frame-history",
+      "title": "Deferred frame records complete draw-call history before GPU submission",
+      "scope": "behavior",
+      "status": "closed",
+      "controls": ["build_capability"],
+      "closure": "Twenty consecutive clean live Metal runs against clean pinned RT64 capture the completed workload in its queue slot before the worker can consume it, with the workload mutex spanning FullSync enqueue through snapshot to close the worker-before-snapshot interleaving. The structural digest e3307aadeb400f41 binds submission frame 1, ordered framebuffer addresses 0x00100000/0x00140000, ordered per-pair draw-call counts 2/1 and projection counts 1/1, three ordered fill commands (red, blue, green), six triangles, and all stable recorded descriptors. Pre-submit workload 1 and paused replay workload 4 have distinct identity digests but identical structural content, and exact framebuffer/draw-call replay pixels prove the history remains inspectable and replayable. Independent live Metal resize/recreate and Console-versus-SkipBuffering controls remain clean.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 52, "needle": "logs the history of an entire frame" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_state.cpp", "line": 1605, "needle": "Inspect the current workload before submission" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_deferred_debugger_behavior.rs", "line": 201, "needle": "fn require_initial_history", "claim_id": "deferred-frame-history" }
+      ]
+    },
+    {
+      "id": "platform-windows-10",
+      "title": "Windows 10 support",
+      "scope": "behavior",
+      "status": "open",
+      "controls": ["build_capability"],
+      "closure": "The non-shrinking matrix in `RT64-PLATFORM-CERTIFICATION.md` keeps Windows 10/D3D12 and Windows 10/Vulkan open with all eleven cases blocked until matching actual-hardware, pinned-source, repeat-bar, and retained-result evidence exists.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 23, "needle": "Windows 10" },
+        { "kind": "pinned_source", "path": "CMakeLists.txt", "line": 461, "needle": "if (WIN32)" }
+      ]
+    },
+    {
+      "id": "platform-windows-11",
+      "title": "Windows 11 support",
+      "scope": "behavior",
+      "status": "open",
+      "controls": ["build_capability"],
+      "closure": "The non-shrinking matrix in `RT64-PLATFORM-CERTIFICATION.md` keeps Windows 11/D3D12 and Windows 11/Vulkan open with all eleven cases blocked until matching actual-hardware, pinned-source, repeat-bar, and retained-result evidence exists.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 23, "needle": "Windows 11" },
+        { "kind": "pinned_source", "path": "CMakeLists.txt", "line": 461, "needle": "if (WIN32)" }
+      ]
+    },
+    {
+      "id": "platform-linux",
+      "title": "Linux support",
+      "scope": "behavior",
+      "status": "open",
+      "controls": ["build_capability"],
+      "closure": "The non-shrinking matrix in `RT64-PLATFORM-CERTIFICATION.md` keeps Linux/Vulkan open with all eleven cases blocked until matching actual-hardware, pinned-source, repeat-bar, post-VI capture, and retained-result evidence exists.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 23, "needle": "Linux" },
+        { "kind": "pinned_source", "path": "CMakeLists.txt", "line": 482, "needle": "CMAKE_SYSTEM_NAME MATCHES \"Linux\"" }
+      ]
+    },
+    {
+      "id": "platform-macos",
+      "title": "macOS support",
+      "scope": "behavior",
+      "status": "open",
+      "controls": ["build_capability"],
+      "closure": "The cross-platform matrix in `RT64-PLATFORM-CERTIFICATION.md` preserves the nine feature-specific macOS/Metal cases recorded in `RT64-MACOS-CERTIFICATION.md` at their exact 10/20-run bars and adds separately recorded twenty-run user-controls/resource-rebuild and ten-run enhancement/emulator-controls cases. The platform-wide row remains open across the same seven blockers; evidence still names only one macOS 26.5 arm64 Apple-M5-Pro host.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 23, "needle": "macOS" },
+        { "kind": "pinned_source", "path": "CMakeLists.txt", "line": 450, "needle": "if (APPLE)" }
+      ]
+    },
+    {
+      "id": "strategy-enhancement-oriented-architecture",
+      "title": "Architecture designed to host novel enhancements",
+      "scope": "implementation_strategy",
+      "status": "documented_upstream",
+      "controls": ["build_capability"],
+      "closure": "Track as architecture only; each advertised enhancement closes from its own behavioral evidence.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 15, "needle": "architecture designed around offering novel enhancements" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_workload.cpp", "line": 288, "needle": "Workload::begin" }
+      ]
+    },
+    {
+      "id": "strategy-deferred-rdp",
+      "title": "Defer memory-backed RDP operations until full synchronization",
+      "scope": "implementation_strategy",
+      "status": "documented_upstream",
+      "controls": ["build_capability"],
+      "closure": "Track as provenance only; behavioral framebuffer and synchronization claims close independently.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 55, "needle": "deferred until the game requires a full synchronization" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_state.cpp", "line": 617, "needle": "fullSyncFramebufferPairTiles" }
+      ]
+    },
+    {
+      "id": "strategy-deferred-rsp-compute",
+      "title": "Perform deferred RSP vertex transformations in a compute shader",
+      "scope": "implementation_strategy",
+      "status": "documented_upstream",
+      "controls": ["build_capability"],
+      "closure": "Track as provenance only; fn64 may reach the same behavior through another implementation.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 58, "needle": "compute shader" },
+        { "kind": "pinned_source", "path": "src/shaders/RSPProcessCS.hlsl", "line": 44, "needle": "numthreads" }
+      ]
+    },
+    {
+      "id": "strategy-texture-decoder-compute",
+      "title": "Decode uploaded TMEM with a compute shader",
+      "scope": "implementation_strategy",
+      "status": "documented_upstream",
+      "controls": ["build_capability"],
+      "closure": "Track as provenance only; texture decoding behavior is graded independently from CPU/GPU placement.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 61, "needle": "decoded and cached using a compute shader" },
+        { "kind": "pinned_source", "path": "src/shaders/TextureDecodeCS.hlsl", "line": 23, "needle": "numthreads" }
+      ]
+    },
+    {
+      "id": "strategy-dual-renderers",
+      "title": "Run native-resolution synchronization and high-resolution presentation renderers",
+      "scope": "implementation_strategy",
+      "status": "documented_upstream",
+      "controls": ["build_capability"],
+      "closure": "Track as architecture; close native-RDRAM and high-resolution outcomes with separate behavior evidence.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 66, "needle": "run two renderers at the same time" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_state.cpp", "line": 1132, "needle": "renderToRDRAM" },
+        { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 211, "needle": "resolutionScale" }
+      ]
+    },
+    {
+      "id": "future-path-tracing",
+      "title": "Fully path-traced renderer",
+      "scope": "upstream_future",
+      "status": "upstream_in_development",
+      "controls": ["build_capability", "runtime_setting", "game_or_extended_gbi_cooperation"],
+      "closure": "Exclude until the pinned public repository advertises it as available; then add behavior claims and feature-specific tests.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 26, "needle": "Fully path traced renderer" }
+      ]
+    },
+    {
+      "id": "future-model-replacements",
+      "title": "Model replacements",
+      "scope": "upstream_future",
+      "status": "upstream_in_development",
+      "controls": ["build_capability", "runtime_setting", "game_or_extended_gbi_cooperation"],
+      "closure": "Exclude until the pinned public repository advertises it as available; then add behavior claims and feature-specific tests.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 30, "needle": "Model replacements" }
+      ]
+    },
+    {
+      "id": "future-game-script-interpreter",
+      "title": "Game script interpreter",
+      "scope": "upstream_future",
+      "status": "upstream_in_development",
+      "controls": ["build_capability", "runtime_setting", "game_or_extended_gbi_cooperation"],
+      "closure": "Exclude until the pinned public repository advertises it as available; then add behavior claims and feature-specific tests.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 32, "needle": "Game script interpreter" }
+      ]
+    },
+    {
+      "id": "future-emulator-integration",
+      "title": "Emulator plugin integration",
+      "scope": "upstream_future",
+      "status": "upstream_in_development",
+      "controls": ["build_capability", "runtime_setting"],
+      "closure": "Exclude from native-port parity unless product scope changes; upstream also states the plugin is unavailable in this repository.",
+      "evidence": [
+        { "kind": "official_readme", "path": "README.md", "line": 35, "needle": "Emulator integration" },
+        { "kind": "official_readme", "path": "README.md", "line": 6, "needle": "not available in this repository yet" }
+      ]
+    }
+  ]
+}

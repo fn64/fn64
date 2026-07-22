@@ -172,7 +172,7 @@ pub fn emit_lookup_dispatcher(symbols: &SymbolTable) -> String {
     out.push_str("    }\n");
     out.push_str("    match LOOKUP_TABLE.binary_search_by_key(&vram, |(addr, _)| *addr) {\n");
     out.push_str("        Ok(index) => LOOKUP_TABLE[index].1,\n");
-    out.push_str("        Err(_) => panic!(\"lookup: no recompiled function or host shim at vram {vram:#010X}\"),\n");
+    out.push_str("        Err(_) => fn64_recomp_rs::trap_unsupported(format!(\"lookup: no recompiled function or host shim at vram {vram:#010X}\")),\n");
     out.push_str("    }\n");
     out.push_str("}\n");
     out
@@ -193,6 +193,7 @@ pub fn emit_module(funcs: &[ModuleFunc], symbols: &SymbolTable) -> String {
     out.push_str("// Whole-program: inter-function JAL/J resolve to direct Rust calls.\n");
     out.push_str("// Typed Rust, no unsafe, no pointer casts.\n");
     out.push_str("#![allow(clippy::all, unused, non_snake_case)]\n");
+    out.push_str("pub const FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA: fn64_recomp_rs::FunctionEntryObservationSchema = fn64_recomp_rs::FUNCTION_ENTRY_OBSERVATION_SCHEMA;\n");
     out.push_str(
         "use fn64_recomp_rs::{call_host_or_recompiled, pause_self, resolve_host_function, RecompContext, RecompFunc, Rdram};\n\n",
     );

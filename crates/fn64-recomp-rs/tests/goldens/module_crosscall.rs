@@ -2,12 +2,14 @@
 // Whole-program: inter-function JAL/J resolve to direct Rust calls.
 // Typed Rust, no unsafe, no pointer casts.
 #![allow(clippy::all, unused, non_snake_case)]
+pub const FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA: fn64_recomp_rs::FunctionEntryObservationSchema = fn64_recomp_rs::FUNCTION_ENTRY_OBSERVATION_SCHEMA;
 use fn64_recomp_rs::{call_host_or_recompiled, pause_self, resolve_host_function, RecompContext, RecompFunc, Rdram};
 
 // Recompiled from MIPS function `callee` @ 0x80001000 (3 instructions).
 // Emitted by fn64-recomp-rs (typed Rust, no unsafe).
 #[allow(unused_variables)]
 pub fn callee(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(0x80001000, "callee"));
     let mut pc: u32 = 0x80001000;
     'run: loop { match pc {
         0x80001000 => {
@@ -26,6 +28,7 @@ pub fn callee(ctx: &mut RecompContext, mem: &mut Rdram) {
 // Emitted by fn64-recomp-rs (typed Rust, no unsafe).
 #[allow(unused_variables)]
 pub fn caller(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(0x80002000, "caller"));
     let mut pc: u32 = 0x80002000;
     'run: loop { match pc {
         0x80002000 => {
@@ -50,6 +53,7 @@ pub fn caller(ctx: &mut RecompContext, mem: &mut Rdram) {
 // Emitted by fn64-recomp-rs (typed Rust, no unsafe).
 #[allow(unused_variables)]
 pub fn tail_caller(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(0x80003000, "tail_caller"));
     let mut pc: u32 = 0x80003000;
     'run: loop { match pc {
         0x80003000 => {
@@ -75,6 +79,6 @@ pub fn lookup(vram: u32) -> RecompFunc {
     }
     match LOOKUP_TABLE.binary_search_by_key(&vram, |(addr, _)| *addr) {
         Ok(index) => LOOKUP_TABLE[index].1,
-        Err(_) => panic!("lookup: no recompiled function or host shim at vram {vram:#010X}"),
+        Err(_) => fn64_recomp_rs::trap_unsupported(format!("lookup: no recompiled function or host shim at vram {vram:#010X}")),
     }
 }

@@ -17,8 +17,10 @@ Pre/post live screenshots are local evidence at `/tmp/fn64-before.png` and
 
 Working-tree validation: 10/10 consecutive integrated nextest runs clean;
 630/630 workspace tests; strict clippy clean; layout/doc lints clean; and the
-C/rs lane differential matched all 58 captured non-uniform framebuffers
-through swap 60. The live post-fix image was inspected, not inferred from the
+C/rs lane observation matched all 58 captured non-uniform framebuffers
+through swap 60. That observation is not an authority claim: the later
+whole-corpus audit in `PARITY-METHOD.md` found callable empty C bodies and made
+the default lane gate fail closed. The live post-fix image was inspected, not inferred from the
 heartbeat. R8 stays open in ROADMAP only because `[x]` means merged+verified.
 
 Post-fix timing was subsequently closed at the mechanism level. The ~31 ms
@@ -39,8 +41,8 @@ the device's 48 kHz stream. Live rs+RT64 evidence through swap 900 held 60.0
 windowed retraces/sec, stable 2.6–3.1k host frames, no overflow, and zero
 callback underrun samples. `/tmp/fn64-timing-audio-fixed.png` is the inspected
 live-window capture. The final tree passed 10/10 consecutive whole-workspace
-nextest runs (635/635 each), strict clippy, both repository lints, and C/rs
-framebuffer parity through swap 60. ROADMAP R5 remains open only for
+nextest runs (635/635 each), strict clippy, both repository lints, and matching
+non-authoritative C/rs framebuffer observation through swap 60. ROADMAP R5 remains open only for
 foreground/backgrounded listening confirmation.
 
 Written 2026-07-17 after a session that chased this live and burned the

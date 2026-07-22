@@ -15,8 +15,10 @@ fn64-runtime   core: scheduler, OSMesgQueue, timers, PI/SI/VI/AI plumbing, rdram
 fn64-abi       the extern "C" surface recompiled code links against
 fn64-boot-harness shared generated-section bridge/registration and ABI-sized rdram allocation
 fn64-shell     the executable: window, input, audio out, ROM/RecompiledFuncs intake
-fn64-render    backend-agnostic render seam + the pure-Rust ReferenceBackend (A/B oracle)
-fn64-render-rt64 FFI bridge to RT64 (C++) -- all C++ interop quarantined here
+fn64-render    backend-neutral render seam, exact microcode admission, and raw-DPC completion inspection
+fn64-render-reference deterministic pure-Rust ReferenceBackend
+fn64-render-rt64 FFI bridge to RT64 (C++)
+fn64-certification executable behavioral evidence gates over the public renderer seams
 fn64-recomp / fn64-recomp-rs  the Rust-emitting recompiler and its whole-ROM driver (§1.1's `rs` lane)
 fn64-audio     RSP audio ucode execution
 fn64-diff      the first-divergence comparator, pure/no-I/O (§4's comparator lane)
@@ -33,7 +35,9 @@ fn64-shell ──depends on──> fn64-abi ──depends on──> fn64-runtime
     │                                                    ^
     └──────────────────depends on───────────────────────┘
     └──depends on──> fn64-boot-harness ──depends on──> fn64-abi + fn64-runtime
-    └──depends on──> fn64-rt64 ──depends on──> fn64-runtime (types only)
+    ├──depends on──> fn64-render-reference ──depends on──> fn64-render ──depends on──> fn64-runtime
+    └──depends on──> fn64-render-rt64 ────────depends on──> fn64-render
+fn64-certification ──depends on──> fn64-render + fn64-render-reference + fn64-render-rt64 + fn64-runtime
 ```
 
 `fn64-runtime` depends on nothing else in this workspace. It is pure, safe
@@ -59,13 +63,29 @@ game-agnostic generated-C boot boundary shared by `fn64-shell` and the
 headless boot examples: the clean-room `recomp_overlays.inl` bridge, its
 `fn64_register_func` callback and section accumulator, registration-order
 adapter, generated `recomp_entrypoint` declaration, and the one RDRAM
-allocation sized for physical RDRAM plus the raw MMIO/KSEG1 window. Which
+allocation sized for physical RDRAM plus the raw MMIO/non-RDRAM window. Which
 sections begin resident and all input/save/render/audio policy remain local
 to each harness because those choices differ by game and host.
 The allocation API requires a typed `TvType` (`Pal`/`Ntsc`/`Mpal`) and writes
 the IPL-owned `osTvType` boot global before thread 0 runs. A zero-filled buffer
 is not valid console boot state: generated initialization reads this global to
 choose region-dependent VI/audio parameters before any ABI shim can repair it.
+The same seam reproduces IPL3's initial DMA—one MiB from cartridge ROM
+`0x1000` to RDRAM `0x400`—so translated CPU execution and hardware DMA
+consumers such as rspboot observe one resident boot image. Once game policy
+selects the registered sections that begin resident, the harness also copies
+each section's declared ROM range to its static RDRAM range. That geometry
+comes directly from the generated section table; overlay sections remain
+unloaded until the game requests their DMA.
+
+The ABI task loader retains a typed CPU-side image for each immutable
+`OSTask::ucode_boot` range and re-DMAs that image at every `osSpTaskLoad`.
+This represents the public R4300/RSP cache-coherency contract at the seam where
+generated CPU accesses and physical device DMA otherwise share one host
+allocation: a CIC/custom task may write its response over rspboot's physical
+DRAM bytes while the CPU cache still owns the boot text used by the next task.
+The device write remains visible in RDRAM; only the subsequent boot-code DMA
+uses the retained CPU image.
 
 `fn64-shell` depends on `fn64-abi`, `fn64-runtime`, and `fn64-rt64`. It owns
 the parts every recompiled game needs but that aren't part of the libultra
@@ -82,10 +102,11 @@ starts after two AI DMAs are queued, and exists only to absorb callback jitter;
 letting its depth leak into `AI_LEN` would make guest buffer sizing depend on
 host latency rather than N64 hardware state.
 
-`fn64-rt64` depends on `fn64-runtime` (for the shared types the gfx task
-handoff needs to name -- e.g. an rdram-relative address newtype, task
-buffers) but is the ONLY crate in the workspace permitted to contain C++ or
-call into RT64's C++ API. Rationale, three reasons:
+`fn64-rt64` depends on `fn64-render`, which owns the backend-neutral task,
+microcode-admission, runtime-policy, and raw-DPC completion seams, and on
+`fn64-runtime` for persistent RSP memory and device value types. It is the ONLY
+crate in the workspace permitted to contain C++ or call into RT64's C++ API.
+Rationale, three reasons:
 
 1. **License and language boundary are the same boundary.** RT64 is MIT but
    C++; keeping all `cxx`/`bindgen`/raw-FFI surface in one crate means a
@@ -186,6 +207,104 @@ Corollaries, each earned the hard way:
   ROADMAP H3) produces numbers exactly one person can reproduce. Unreproducible
   evidence is not evidence — see AGENTS.md's validation bars.
 
+#### Private release execution is a typed authority boundary
+
+Private admission and private execution are deliberately separate. Current
+admission schema `fn64.private-input-admission.v7` validates local
+ownership/provenance policy and content-addresses the
+ROM, recompiled output, microcode pair, native host entry image, typed
+program-build receipt, arguments, environment, fixed cycle, and expected
+execution source. It also binds a retail-cartridge or public-homebrew class to
+class-specific ROM provenance; the header cannot prove that class. Retained v6
+manifests remain strictly read-only verifiable and cannot select v7's
+F3DZEX2-characterization purpose or raw-window roles. The emitted
+`fn64.private-release-run-contract.v3` is an
+integrity wire, not a signature:
+any caller can recompute a self-hash. Production runner APIs therefore accept
+only an opaque `VerifiedPrivateReleaseRunContract`. Its loader requires the
+runtime admission script to equal the bytes embedded when the runner was built
+and executes those embedded policy bytes directly through isolated Python while
+replaying the manifest/readiness/contract validation. A separate constructor
+is confined by exact byte identities and typed fields to fn64's fixed non-game
+`synthetic_mechanism` fixture and current test executable; arbitrary relabelled
+input cannot authorize a capability.
+
+The capability owns one exact-ten process series. It clears ambient
+environment state, copies the verified native ELF/Mach-O/PE bytes to a
+create-new executable beside the original, launches only that isolated stage,
+sets the ROM and release tuple itself, derives ten event identities from an
+OS-random nonce plus contract/child/ordinal/output context, validates each
+durable report/journal pair before continuing, and persists a canonical
+receipt only after all ten agree semantically. Script launchers and known
+loader/interpreter/plugin injection variables are rejected. Input paths and
+output directories remain private, non-symlink, and outside git (or explicitly
+ignored).
+
+The exact-stage boundary is local and single-owner: staged files are random,
+create-new, read-only, and rehashed, but a malicious same-UID process capable
+of chmod plus pathname replacement between verification and OS open/spawn is
+outside scope. The resolved system-Python executable is trusted as OS-owned.
+
+Rehashing an admitted microcode or recompiled file proves only that it did not
+change, not that the child consumed it. Admission schema v6 therefore requires
+`fn64.release-program-build-receipt.v1` for `full_rom` and `combined`. The
+receipt binds the exact child entry image and recomputes the declared execution
+source from one typed lane: canonically labeled exact linked archives for a
+native program, the generated typed-observed-function identity wire, or the
+typed-block pack plus its expected live program identity. The private v3
+contract binds the receipt itself, requires exactly one receipt lane input to
+equal the admitted `recompiled` artifact, and requires both the declared and
+recomputed source to equal the report source. The runner revalidates these
+files before the series, before each child, after the final child, and during
+retained-series verification. This is exact identity co-binding, not proof that
+the child was compiled or linked from the lane inputs; that stronger claim
+requires a trusted build/link record or external attestation.
+
+Runtime task-start identity is separate from program-input identity. At the authoritative
+graphics-task start, the ABI hashes the exact logical RDRAM bytes named by the
+original task's microcode-data address and length and records that identity in
+the same recognition event as the live 4 KiB IMEM digest and recognized
+family. That family comes only from the selected backend's exact text/data-pair
+catalog; text-only HLE recognition cannot populate release evidence. Overlay
+recognition pairs each replacement IMEM generation with that
+same original data identity; a yielded resume never promotes the rewritten
+yield-buffer pointer to admitted microcode data. One typed lifecycle permits
+`Running -> ResumeAuthorized -> ResumeLoaded -> Running`; ordinary completion
+retires `Running`, and each authorization is load-consumed exactly once. Every production report in
+the exact-ten series must contain at least one individual recognized event whose text SHA,
+data length, and data SHA equal the admitted pair. Report schema
+`fn64.release-gate.v22` and the
+`fn64.rsp-rdp-observations.v2` wire bind those fields.
+
+This mechanism makes a correctly formed production contract launchable; it is
+not representative-ROM evidence by itself. Representative private NTSC
+full-ROM exact-ten series for reference and RT64 LLE/post-VI completed under
+schema v22 and were independently reverified locally on 2026-07-22. Both
+series bind boundary-owned observations and the compiled unsupported-
+instrumentation identity. A retained public synthetic identified-native XBUS
+series binds the same denominator without acquiring private-ROM authority.
+Their combined incomplete matrix accepted all 30 reports, satisfied 12 of 162
+requirements, and retained 150 explicit gaps. Self-hashed receipts are
+retained integrity evidence, not transferable process attestation, and the
+synthetic result cannot be promoted into private-ROM evidence.
+
+Representative matrix verification preserves the same capability boundary.
+Report-only matrix v5 verification never awards a ROM-class requirement from
+the report's host-supplied label. Its private-series path accepts only an
+opaque capability produced by jointly revalidating the policy-admitted v3
+contract, exact-ten receipt, retained reports/journals, raw ROM, runner image,
+and bound inputs. It exact-matches the v22 semantic report and ordered run-event
+identities, and retains a canonical `fn64.verified-rom-class-authority.v1`
+inside verified-matrix v18. The retained
+self-hash proves canonical integrity, not signer identity or transferable
+process provenance.
+
+The current local 2026-07-22 v5 assessment jointly revalidated both private
+representative series plus the public synthetic XBUS series as 30 reports and
+retained the full 162-requirement denominator. It satisfied 12 assignments and
+left 150 explicit; incomplete matrix verification did not discard or relabel
+the missing requirements.
+
 #### Instruction-exact savestate transplant is NOT REPRESENTABLE here (negative result, 2026-07-14)
 
 This is an architecture fact about the runtime's shape, kept here because the
@@ -234,7 +353,11 @@ executor now has an explicit `boot_thread0_block_program` lane that owns the
 registered program for thread 0 and spawned OSThreads. Generated instruction
 checkpoints suspend to the executor, which charges their instruction count to
 virtual time and services device deadlines before another block can run. The
-real discovered pack is not installed by a boot target yet. Arbitrary-PC
+OoT Rust host can now explicitly select an out-of-tree generated pack source,
+hash-bind and preflight its entry/runner identities, and install it without a
+whole-function guest fallback. Missing pack input fails the build. The current
+OoT `recompile_rom` generator still emits only the whole-function crate, so no
+real OoT pack artifact exists to exercise that host path yet. Arbitrary-PC
 codegen emits direct boundaries for a supplied static host-JAL inventory and a
 distinct `ResolveCall` for dynamic JAL/JALR targets. The live resolver types
 those as either an installed host function or a bank-qualified guest target;
@@ -274,12 +397,64 @@ same visual artifact means different things in each.
 - `rs`: `fn64-recomp-rs` emits the whole ROM as a typed-Rust crate
   (`recompile_rom`), linked directly.
 
-Both lanes are the same recompiled semantics in two forms, so they A/B each
-other. This is a *different axis* from §4's A/B, which swaps which **runtime**
-implements the `_recomp` surface under an identical game; this swaps the
-**game's form** under an identical runtime. §4's `nm`-based completeness gate
-applies to the `c` lane's archive; the `rs` lane resolves the same surface
-through Rust linkage instead.
+The intended experiment is the same recompiled semantics in two forms, but
+that is a precondition to prove, not an assumption the framebuffer comparison
+may make. The current legacy OoT C corpus contains callable empty bodies that
+the Rust driver recompiles. `scripts/lane-parity.sh` now compares the generated
+body inventories first and rejects semantic authority when they differ; only
+its explicit `--observe` mode will compare framebuffers under that admitted
+limitation. The executable contract, current counts, and residual blind spots
+are in `PARITY-METHOD.md`.
+
+This is a *different axis* from §4's A/B, which swaps which **runtime**
+implements the `_recomp` surface under one identical generated-C game; this
+swaps the **game's form** under an identical runtime. §4's `nm`-based
+completeness gate applies to the `c` lane's archive; the `rs` lane resolves the
+same host surface through Rust linkage instead.
+
+The native lane's official build preparation inserts one call to
+`fn64_c_recompiled_function_enter` as the first statement of every generated
+`RECOMP_FUNC` body. This location is intentional: `get_function` is only a
+resolver, and its result can be cached, compared, or discarded without ever
+being called, while ordinary generated C-to-C calls bypass it entirely. The
+in-body hook therefore records both direct and indirect successful entries.
+`fn64-abi` translates the callable pointer through the already-registered
+generated section table and retains only `(section index, function offset,
+link VRAM, guest cycle)` in exact entry order; probes and resolution misses do
+not append. Installing a ROM or the process RDRAM clears the append-only
+history. This authority is bounded to generated sources passed through fn64's
+preparation function: a third-party native build that bypasses that pass has
+no universal ABI call boundary and cannot claim complete entry observation.
+
+The typed-Rust whole-function lane uses the equivalent mechanism at its own
+single body template. `emit_function_resolved` writes
+`notify_function_entry` before the local PC dispatcher in every emitted
+callable, so root, direct sibling/tail, and lookup-resolved guest entries share
+one boundary while host overrides and lookup misses remain excluded. A current
+generated module exports `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA`; the ABI
+accepts authoritative installation only when the host passes that marker plus
+a stable artifact identity. OoT derives the identity from a canonical,
+path-independent wire over the exact emitter manifest contract and every
+regular generated file under `src/`. Only the validated machine-local runtime
+path is normalized; extra targets, features, dependencies, build scripts, and
+symlinks are rejected. A stale or handwritten callable table therefore cannot
+silently claim a complete stream. The committed-VI release boundary freezes
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v22 binds its
+ordered and canonical unique/count digests as `typed_observed_function`.
+
+The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
+Before task mutation the ABI hashes the raw RDRAM prefixes required by pinned
+MIT RT64's F3DZEX2 identity rows. For each graphics LLE generation, it also
+hashes the complete live 4 KiB IMEM image and asks the registered backend only
+for exact catalog recognition. The pinned identity wins agreement or absence;
+a contradictory backend label traps. Neither source can choose the digest or
+execution policy. Successful IMEM
+replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
+release observation, not future-affecting DeviceState, so ROM installation
+clears it and report schema `fn64.release-gate.v22` binds it independently.
+Each microcode recognition entry also binds the original task data address,
+exact logical byte length, and SHA-256 in the
+`fn64.rsp-rdp-observations.v2` wire.
 
 The emitted crate is out-of-tree, game-derived material, and per `AGENTS.md`
 it must never enter git or the main workspace graph. That constraint — not
@@ -532,8 +707,28 @@ task calls out:
   RCP/MI authority exists from `HostState` construction and is not optional or
   coupled to cartridge ROM load order; a separate `rom_installed` invariant
   keeps PI DMA's missing-content path loud.
-  `DeviceFabric` owns PI's sole in-flight request and guest-cycle deadline;
-  managed EPI, raw PI APIs, and typed-Rust PI register writes all enter it.
+  `DeviceFabric` owns PI's sole in-flight hardware request and guest-cycle
+  deadline. An ABI-side FIFO models the PI manager's accepted managed work:
+  `osEPiStartDma` requests submitted while that hardware slot is occupied wait
+  in order and still return success, while raw PI starts retain loud busy
+  behavior. This distinction is load-bearing: exposing hardware `PiBusy` to a
+  second managed caller made OoT's DmaMgr report a multi-chunk load complete
+  after only its first chunk. Managed EPI, raw PI APIs, and typed-Rust PI
+  register writes otherwise converge on the same fabric. Public
+  `OSPiHandle` state is not an opaque host token: one ABI decoder validates
+  its public type/domain/timing/base fields, including the uncached KSEG1
+  base-address form shown by Chapter 27's SRAM acquisition example, publishes
+  timing through that fabric's raw PI registers, and applies the documented
+  KSEG1 `baseAddress | devAddr` rule for managed DMA, raw DMA, and programmed
+  I/O before converting the result at the physical PI boundary.
+  The supported Game Pak ROM and SRAM physical spaces normalize into the
+  fabric's one storage authority. A malformed handle or a documented bulk/64DD space without
+  attached storage records `abi.pi.epi-handle` before trapping; it cannot be
+  guessed from pointer inequality or routed into zero-filled ROM bytes.
+  `osCartRomInit` and `osLeoDiskInit` write the same public handle layout
+  from typed domain state. Provenance: public libultra
+  Programming Manual Chapter 27, “EPI Manager” and “SRAM,” plus the public
+  `osEPiStartDma` and `osEPiRawStartDma` function pages.
   At the deadline it writes the process's one RDRAM allocation, clears PI
   busy, raises MI PI pending, and only then returns an executor notification.
   `advance_virtual_time` injects that notification before it returns. The
@@ -556,13 +751,75 @@ task calls out:
   DRAM-to-PIF command and PIF-to-DRAM response transfers. Completion order is
   `PIF/RDRAM bytes -> SI idle -> MI SI -> OS_EVENT_SI`; the current one-cycle
   deadline is an explicit policy because the public register definitions do
-  not supply a transfer-cycle formula. Raw controller query/read commands are
-  implemented; other raw PIF device commands remain loud gaps. The fabric also
+  not supply a transfer-cycle formula. Above that physical PIF authority, the
+  ABI owns the public libultra Controller Manager lifecycle and polling prefix:
+  `osContInit` initializes once with four channels, while a later
+  `osContSetCh(ch)` limits high-level query/read copies and `osPfsIsPlug` to
+  ports `0..ch`, leaving query/read caller storage beyond that prefix untouched.
+  A pre-init `osContSetCh` retains the four-channel default, and a count above
+  `MAXCONTROLLERS` traps. Controller initialization now validates the supplied
+  initialized, exclusively idle `OS_EVENT_SI` queue, encodes all four query
+  channels into the fabric-owned PIF RAM, blocks internally, and publishes its
+  bit pattern/status only after the timed SI completion wakes it. Subsequent
+  query/read starts validate the supplied event target and encode the manager's
+  current channel prefix into that same device-owned packet. Their getters
+  decode only the completed PIF RAM image: input changes after completion and
+  later `osContSetCh` calls cannot rewrite or expand an already-finished poll.
+  The fixed SI compatibility latency remains channel-independent because the
+  public manual gives only approximate per-channel savings, not an exact cycle
+  formula. Device evidence retains the exact pending request and complete PIF
+  command/response bytes without a host pointer. As elsewhere in the native-C
+  lane, `osContInit`'s suspended coroutine continuation (including its guest
+  output destinations) remains outside portable executor evidence; no broader
+  continuation claim follows from the device transaction. `osPfsIsPlug`
+  validates that its caller-created
+  queue is the live `OS_EVENT_SI` target and is exclusively idle: queued
+  messages and either blocked-receiver or blocked-sender role reject the call
+  loudly, so an older waiter cannot steal its completion. It then enters the
+  same timed `ControllerQuery` fabric. A typed transaction owns the caller
+  thread, exact queue/message route, registered-RDRAM result address, and
+  latched Pak bitmap across both hardware-pending and completion-posted phases.
+  This makes the future output fixed-cycle evidence rather than an invisible
+  coroutine-stack local. Completion posts directly through that captured route;
+  the coroutine consumes the matching transaction and writes the bitmap only
+  after byte commit, SI-idle, MI-SI, and completion-message order are established.
+  A busy SI start returns the older public function page's
+  failure value `1` without touching the output; the later 5.2 page instead
+  documents `-1`, so version-specific return-code parity remains bounded by
+  the title's linked libultra revision.
+  The manager policy is future-affecting ABI evidence; raw packets retain their
+  explicit channel addressing and both paths observe the same `PifModel` port
+  identities and input. Provenance: public libultra Programming Manual Chapter
+  26, “Controller Manager,” plus the public `osContSetCh` function page. Raw
+  controller query/read commands are implemented; other raw PIF device commands
+  remain loud gaps. The manual also describes approximate polling-time savings
+  as channels are removed, but does not provide a transfer-cycle formula. The
+  fabric's explicit one-cycle SI compatibility policy therefore does not yet
+  vary by controller count; channel-count-dependent `osContSetCh` timing
+  parity remains unverified. The fabric also
   owns the RSP's persistent 4 KiB DMEM/IMEM, PC, status, atomic semaphore, and
   double-buffered SP DMA. DMA forces public 64-bit alignment, decodes
   length/count/skip rows, commits at an eight-setup-cycle plus one-cycle-per-
   64-bit-beat deterministic deadline, and increments an IMEM generation only
-  after commit. The public `osSpTaskLoad` sequence copies all 64 OSTask bytes
+  after commit. RSP execution admits the installed physical RDRAM (8 MiB in
+  the current console profile) plus only the static-storage ranges of overlays
+  the registry proves are loaded. The latter are a static-recompiler seam:
+  generated overlay code retains absolute link-time data pointers (for example
+  ConsoleLogo's `G_MOVEMEM` pointer `0x80800920`) where the console's overlay
+  relocation would have rewritten the instruction, and PI already mirrors the
+  loaded image at that explicit static alias for CPU access. The admitted
+  extent is the union of registered text geometry and bytes actually committed
+  by the PI static-image mirror, so trailing overlay data is included without
+  blessing the unused gap before the next section. The rest of the
+  larger host allocation—including raw RCP/cartridge windows and unloaded
+  overlay space—remains invisible to SP. Every rectangular DMA row must fit
+  wholly inside one merged admitted range and otherwise traps with its
+  descriptor and first invalid row; zero-filled host address space cannot turn
+  a corrupt SP pointer into a silent transfer. The
+  Scalar DMEM halfword/word accesses walk architectural big-endian bytes at
+  the complete 12-bit effective address, including unaligned and bank-wrapped
+  accesses; native-word backing is only a storage representation, never an
+  unaligned host integer view. The public `osSpTaskLoad` sequence copies all 64 OSTask bytes
   to DMEM `0xfc0`, aligned rspboot bytes to IMEM zero, resets PC, and clears a
   preceding task's SIG0/SIG1 yield handshake. `osSpTaskYield` writes the public
   `SP_SET_YIELD`/SIG0 command and returns immediately. After SP completion,
@@ -577,36 +834,185 @@ task calls out:
   without a premature DP completion; missing or failed renderer operations all
   pass through one loud gate rather than synthetic-completing. Reloading the
   rewritten task then calls the backend with `OS_TASK_YIELDED` and the saved
-  data range, providing cooperative HLE resume even though host-atomic backend
-  calls cannot yet be preempted mid-call. Known graphics/audio tasks now run
-  the admitted rspboot through its real scalar interpreter until control first
-  reaches an IMEM range installed by read DMA. RDRAM DMA writes, DMEM, the
-  final IMEM generation, SP status, and ucode entry PC commit before the HLE
-  backend represents the loaded-ucode phase; BREAK, DPC submission, or a
-  bounded failure before that handoff traps loudly. Scalar/VU register state
-  does not cross this optimization boundary. Unknown
+  data range, providing cooperative HLE resume. A second, typed continuation
+  protocol lets a capable backend return an opaque token only after committing
+  a real chunk. The fabric keeps SP busy without inventing a deadline; the next
+  host scheduling boundary checks SIG0 before consuming that token. A hit
+  moves the sole token to `Suspended`, sets SIG1, and schedules SP completion;
+  reload/start validates the same task address and public yield-buffer rewrite
+  before consuming it exactly once. The ABI never serializes or reconstructs
+  backend-local stacks. Known graphics/audio admission is
+  classified by image shape. An ordinary boot-overlay task runs admitted
+  rspboot through its real scalar interpreter until control first reaches an
+  IMEM range installed by read DMA. A direct task whose physical
+  `ucode_boot == ucode` and whose aligned boot copy covers the complete ucode
+  is already at ucode PC zero after `osSpTaskLoad`; it enters HLE there, or
+  starts accuracy LLE from the live admitted image, without misinterpreting
+  the ucode's terminal BREAK as a failed rspboot handoff. Equal pointers with
+  an incomplete copy remain on the boot-overlay path and trap loudly rather
+  than admitting truncated content. RDRAM DMA writes, DMEM, the final IMEM
+  generation, SP status, and ucode entry PC commit before the HLE backend
+  represents the loaded-ucode phase; BREAK, DPC submission, or a bounded
+  failure before an ordinary rspboot handoff traps loudly. Exact HLE calls consume
+  the public task contract, while a transactional LLE fallback carries a typed
+  snapshot of all non-memory RSP state from rspboot into the interpreter.
+  Graphics microcode selection is an explicit host policy:
+  `HleOptimized` preserves the interactive compatibility path and its exact-
+  digest transactional fallback, while `LleAccuracy` always continues the
+  loaded graphics ucode from that same rspboot snapshot through the interpreter
+  and exposes only its raw DPC submissions to the renderer. The generic
+  `set_render_backend` entry point intentionally defaults to `HleOptimized`;
+  release/parity harnesses must opt into `LleAccuracy` through the typed
+  registration API, so an accuracy claim cannot depend on an ambient flag or
+  silently change unrelated callers. Unknown
   and custom tasks execute from that persistent image through the clean-room
   scalar/vector interpreter: IMEM DMA replaces a generation and resumes at the
   saved PC; BREAK commits DMEM, RDRAM DMA writes, status, and DRAM/XBUS DPC
-  submissions before the guest resumes. Graphics HLE preflight is
+  submissions before the guest resumes. Every renderer task and DRAM-backed
+  raw-DPC entry receives an 8 MiB physical-RDRAM
+  view. Registration must cover that complete device, including its final
+  byte, while the generated-code allocation's appended MMIO/non-RDRAM backing is
+  never exposed or transactionally cloned. Captured XBUS/LLE command words use
+  a private immutable staging suffix at the physical boundary; only the
+  physical prefix is copied back. The synchronous DPC model treats
+  `START == END` as the public empty-FIFO initialization and emits only each
+  newly exposed `[CURRENT, END)` span, advancing `CURRENT` after consumption;
+  repeated `END` writes cannot replay an already-rendered prefix. Graphics HLE preflight is
   transactional and content-addressed: selecting an HLE decode mode admits no
   content. Both HLE backends return `NeedsLle` when the task-entry IMEM digest
   is unregistered; the reference renderer additionally decodes admitted tasks
   against cloned RDRAM/RSP state and rejects an unadmitted `G_LOAD_UCODE`
   generation. The clone is discarded and the complete ucode phase runs from
-  untouched post-rspboot state through that interpreter. DRAM and staged XBUS
+  untouched post-rspboot memory and scalar/VU/SP/DMA/DPC state through that
+  interpreter. DRAM and staged XBUS
   DPC ranges then reach either the Rust raw renderer or RT64's bounded LLE RDP
   entry with the submission boundary's explicit VI output address; no raw path
-  infers it from a preceding HLE call. This avoids an
+  infers it from a preceding HLE call. Each successful backend operation also
+  returns typed `Reached`/`NotReached` FullSync evidence. HLE derives it from
+  the admitted display-list operation stream; raw DRAM and staged XBUS ranges
+  use the backend-neutral `fn64-render` inspector to walk exact public command
+  widths, so a triangle coefficient that resembles opcode `0xe9` cannot
+  fabricate completion. `Unidentified` is accepted only
+  as a backend's pre-operation state and traps if a successful operation leaves
+  it unresolved. This implements the public RDP Programming Manual's
+  Sync Full command-to-DP-interrupt relationship without treating every
+  graphics task or every DPC range as if it had reached FullSync. This avoids an
   impossible fabricated mid-HLE scalar/VU transplant while preserving BREAK
-  and DRAM/XBUS DPC effects. Exact graphics/audio HLE task
-  effects after rspboot remain atomic backend calls, so SIG0 cannot yet
-  preempt and resume them in the middle of a task. Completion no longer wakes
+  and DRAM/XBUS DPC effects. The scheduler now supports actual mid-HLE SIG0
+  preemption at backend-declared committed chunk boundaries. The pure-Rust
+  `ReferenceBackend` now owns its decoded operation stream, active color/depth
+  targets, primitive-depth registers, dirty state, and cumulative FullSync
+  evidence in a typed checkpoint. It commits one `RenderOp` to RDRAM per call,
+  returns a fresh opaque token while operations remain, removes that token
+  before executing the next operation, and rejects stale, mismatched, or
+  overlapping task ownership by name. Its historical atomic `process_task`
+  entry drives those same chunks internally to completion. RT64 remains
+  `Atomic` because its public native task call exposes no resumable
+  continuation. Completion no longer wakes
   the scheduler from inside `osSpTaskStartGo`: the fabric schedules SP at the
-  measured rspboot instruction count plus one HLE policy cycle and graphics DP
-  one cycle later, raising each MI source and returning each OS event in order.
-  Those deadlines are a compatibility policy until hardware-derived RSP
-  timing and real RDP FullSync provide the timing.
+  measured pre-ucode instruction count (zero for a direct image) plus one HLE
+  policy cycle. It schedules the later DP event only when that operation's
+  evidence says FullSync was reached. A raw CPU/RSP DPC FullSync schedules DP
+  without fabricating an SP event. The DP deadline remains one cycle after the
+  SP deadline, or one cycle after a raw synchronous submission, preserving
+  deterministic ordering while making no hardware-timing claim. Hardware-
+  derived RSP/RDP latency remains a prerequisite for exact timing. Native RT64
+  chunking still requires an upstream-owned checkpoint representation; a
+  yield-buffer image cannot reconstruct an arbitrary host call stack or
+  renderer-local state.
+  Exact task-entry and self-loaded microcode admission is likewise owned by
+  `fn64-render`: catalogs bind the complete IMEM SHA-256 to an explicit public
+  wire family, while release recognition can additionally bind the exact data
+  image identity. Backends consume that shared mechanism rather than carrying
+  independent digest maps. The admission rule follows the public GBI family
+  boundaries; it does not infer compatibility from a task header or colliding
+  opcode byte. The RT64 transactional preflight additionally freezes an
+  immutable shared `TaskAdmissionPlan`: task entry is generation zero and
+  every admitted `G_LOAD_UCODE` follows in executed order with physical
+  addresses, complete text/data identities, and behavior-bearing microcode
+  identity. F3DZEX2 cannot be represented there as a broad family: plan-v2
+  requires its classified 2.06H, 2.08I, or 2.08J variant and hashes that tag.
+  Duplicate
+  addresses and `A -> B -> A` generations are deliberately retained. The
+  native adapter consumes that plan at pinned RT64's pre-cache
+  `loadUCodeGBI` boundary, compares the live raw recognition windows, forces
+  recognition for every generation, and preserves the old active GBI through
+  the self-load flush before applying the admitted replacement. Unknown or
+  incompatible generations return typed `NeedsLle` before live interpreter
+  mutation. Missing, extra, reordered, or changed generations after execution
+  begins poison the native context and fail loudly.
+  The native schema-v2 generation wire mirrors that variant in
+  `expected_detail`; preflight requires NoN for all three F3DZEX2 rows and the
+  variant-specific point-lighting capability. Its immutable raw pool remains
+  the I/J discriminator because pinned RT64 exposes the same native flags for
+  those two variants. This typed plumbing does not itself admit the F3DZEX2
+  command decoder. `GeometryUcodeProfile`, backed only by the typed admission
+  identity, now survives the shared inspector and reference decode state plus
+  catalog-admitted self-load transitions. All three typed F3DZEX2 profiles
+  apply the bounded NoN near-admission policy, while ordinary F3DEX2 retains
+  its near gate and side/far clip codes keep the existing raster-clipping
+  handoff. Exact clipping remains a separate trace frontier. Until point-light
+  behavior and exact F3DZEX2 raw-pair self-load resolution pass their separate
+  gates, the production catalog continues to select LLE.
+  A non-default `f3dzex2-characterization-evidence` feature exposes one
+  explicitly evidence-named RT64 method outside `RenderBackend`. It accepts no
+  caller-selected identity: the exact raw task-entry pair selects 2.06H,
+  2.08I, or 2.08J, the logical plan is derived from live RDRAM/IMEM, and the
+  existing native schema, context-poisoning, and full RDRAM/RSP rollback
+  transaction execute the entry generation. The result retains the native
+  workload counter before and after execution. The repository-owned v1 suite
+  expands eight fixed policy rows into two public controls plus all six
+  point-light hypotheses at each 16/24/32-byte candidate transfer width. Each
+  subcase receives fresh RDRAM/RSP/native state, exactly one FullSync, guarded
+  synthetic inputs, and a subsequent present whose workload identity must
+  equal the task's final counter. Admission fixes the suite; private manifests
+  cannot select a variant, commands, cases, or expected results. This remains
+  characterization transport only, currently entry-only and not yet exercised
+  with an admitted private point-light pair; it neither opens production HLE
+  nor supplies the missing wire/arithmetic evidence.
+  Internally, the transactional inspector and reference decoder now share the
+  pinned BranchW control-flow rule: opcode `0x04` selects bits 1..7, validates
+  a loaded finite transformed W, compares it strictly with `float(u32 w1)`,
+  and on a taken/forced path resolves persistent HALF_1 before applying the
+  24-bit eight-byte command mask. Equality falls through and F3DEX2 retains
+  its distinct BranchZ packing/comparison. This mechanism is testable before
+  admission. The variant profile now governs the bounded NoN slice; point-light
+  wire activation, layout, arithmetic, and rounding remain unimplemented and
+  must be characterized without treating the capability flag as behavior.
+  Native RT64 task submission returns a schema-checked result containing the
+  plan identity, planned/observed generation counts, typed disposition and
+  rejected generation, entry GBI availability, pre/post workload IDs, and
+  initial/final microcode addresses. A complete result must exhaust the exact
+  ordered plan. The adapter takes the native context out of its reusable slot
+  and snapshots the complete physical RDRAM plus persistent RSP memory before
+  crossing FFI. Only a schema/plan/count-validated completion commits that
+  guest-memory transaction and returns the context. A valid preflight
+  `NeedsLle` returns the context only after byte-for-byte proof that neither
+  guest-memory resource changed. Every other native failure restores both
+  resources, destroys the unrollbackable context, and clears its active
+  release identity. Raw RDP execution applies the same rule to RDRAM. RT64's
+  synchronous queue joins and call-scoped alias restoration are what make the
+  rollback occur after the last possible foreign access, never concurrently
+  with one.
+  Pinned RT64 advances the workload ID only from `State::fullSync`, so the
+  delta is typed native completion evidence and must agree with transactional
+  public-command inspection. The address pair is diagnostic, not admission
+  authority. A focused backend-neutral walker in `fn64-render` now owns the
+  ordered entry/self-load plan, activation-time raw recognition windows, and
+  exact FullSync count over immutable inputs. RT64 production task submission
+  consumes that result directly and a structural test forbids calls into the
+  reference decoder or its `RenderOp` stream. The reference renderer can
+  therefore be extracted without leaving geometry-decode policy in the native
+  adapter.
+  The reference rasterizer owns one deterministic, explicitly seedable
+  per-fragment noise stream. Every covered one/two-cycle fragment consumes one
+  typed eight-bit sample before combiner/alpha/depth rejection; combiner
+  NOISE and `G_AC_DITHER` use the byte, while RGB and alpha Noise use its low
+  three bits. This implements the public Programming Manual's common random
+  per-pixel routing and frame-varying behavior without substituting an ordered
+  screen mask. SplitMix64 is a reproducible host policy for reference digests,
+  not a claim about the manual's unpublished silicon generator, seed, or exact
+  cycle advancement.
   VI is scheduled in this fabric rather than asserted after an executor ticker
   fires. Its 14-word raw register image is shared with typed MMIO;
   `VI_CURRENT` is derived from the programmed `VI_V_SYNC`: progressive output
@@ -628,34 +1034,151 @@ task calls out:
   `osViGetCurrentLine`, `osViGetCurrentField`, `osViGetStatus`, and
   `osViGetCurrentMode` query that live state; a queued mode does not become
   current until the interrupt latch.
-  At the interrupt, pending mode/scales/blanking/framebuffer state becomes
+  Device advancement stops at each due deadline rather than collecting
+  multiple field notifications at the final requested cycle. At each VI
+  interrupt, pending mode/scales/blanking/framebuffer state becomes
   current before the general OS_EVENT_VI target or `osViSetEvent` target can
   wake. The general event fires every field; the VI-manager target honors its
-  public nonzero `retraceCount` divisor independently. Framebuffer and
-  black/unblack transitions each trigger the renderer only after that latch.
-  Typed `ViPresentation` state crosses the renderer boundary; the Rust
+  public nonzero `retraceCount` divisor independently. Framebuffer,
+  black/unblack, and special-feature transitions become visible only after
+  that latch. Every field triggers the renderer, including unchanged
+  progressive register images: field cadence and the retrace-cycle noise seed
+  are scanout inputs in their own right. One `ViScanoutRegisters` value
+  snapshots all fourteen live words after field selection; it crosses the
+  renderer boundary atomically with `ViPresentation`, so origin, source width,
+  timing, active H/V window, X/Y scale, STATUS filters, event cycle, and sampled
+  field cannot drift independently even when one checkpoint jump spans multiple
+  fields. A jointly
+  zero H/V window stays an inactive live register image rather than selecting
+  backend compatibility geometry. The Rust
   reference backend keeps its RDP image separate from VI scanout, presents
   black without erasing that image, implements the public `osViFade` 10-bit
   interpolation of its first two rows, implements `osViRepeatLine`, and
-  restores the unmodified source when each effect is disabled. These two
+  restores the unmodified source when each effect is disabled. It also applies
+  the public square-root gamma transfer, the three-horizontal-sample median
+  divot correction at partial-coverage silhouettes, and RGBA16 dither
+  restoration's signed comparison against the available 3x3 neighbors. The
+  exact implemented arithmetic and the boundary between public mechanism,
+  deterministic host policy, bounded hardware-unverified coverage
+  AA/resampling, and post-DAC analog behavior are recorded in `VI-FILTERS.md`.
+  Its post-VI allocation uses the public H start/end pixel extent and V
+  start/end half-line extent independently of the RDP source dimensions; the
+  same coordinate generators implement filtered modes and mode-3 replication.
+  Presentation receives a move-only, retrace-scoped physical-RDRAM read
+  capability together with that register image. Integrated execution creates
+  the capability from the one registered process allocation only while the
+  guest coroutine is suspended, without manufacturing a Rust slice that would
+  alias the typed recompiler's dormant mutable view. The deterministic
+  reference path rereads the exact live 24-bit origin and effective 12-bit
+  stride on every field, decodes RGBA16 or RGBA32 in the generated-code storage
+  layout, and never substitutes its resident RDP framebuffer. Its checked fetch
+  envelope includes the vertical resampling sample and the largest active
+  restoration/coverage-AA row halo; an out-of-bounds footprint or an odd
+  RGBA16 origin is a named error. Inactive and blank images do not fetch source
+  bytes. Source decoding, hidden-coverage inference, the full VI pipeline, and
+  presentation state commit transactionally, leaving both the previous
+  presented image and the resident RDP framebuffer unchanged on failure.
+  RT64 receives the same current physical allocation and live VI origin/effective
+  stride for each presentation. Its Rust boundary consumes `fn64-render`'s
+  typed programmed footprint and validates only the rows selected by public
+  coordinate arithmetic; the reference-only filter halo is not presented as
+  evidence about RT64's internal or silicon bus fetches.
+  Those mechanisms follow the
+  public VI manual and the clean-room hardware descriptions in
+  [US 6,166,748](https://patents.google.com/patent/US6166748A/en) and
+  [US 5,699,079](https://patents.google.com/patent/US5699079A/en).
+  Gamma dither stochastically rounds the final video value to the documented
+  seven bits using a coordinate/channel hash keyed by the exact retrace guest
+  cycle. The patent specifies fresh random low-bit noise but does not publish
+  its generator or seed, so this is an explicit deterministic emulation policy,
+  not a claim that fn64 reproduces the silicon's random stream. These two
   public functions are beyond the canonical NMR inventory but are exported
   for general N64 software in both C and Rust-recompiler host-call lanes.
   Enabling black with an effective Y scale other than the manual-required 1.0
   traps loudly, as do blacking while fade/repeat is active and enabling fade
-  and repeat together. The RT64 adapter sends the same typed state through its
-  quarantined C boundary and programs the VI mechanisms directly: disabled
-  pixel type for black, zero Y scale for repeat-line, and zero Y scale plus
-  the 10-bit Y subpixel offset for fade. This was feature-compiled and its
-  Rust/C/C++ ABI exercised by the RT64 unit build; pixel-level GPU capture is
-  still an integration gate. A typed IPL television standard is
-  the common VI/AI clock authority. Before a mode exists, VI uses the public
+  and repeat together. The RT64 adapter sends the complete register image
+  through its quarantined C boundary, compensates RT64's origin convention
+  with the image's own source width and RGBA16/RGBA32 pixel size, and retains
+  that image when later HLE/raw submissions or resizes refresh address aliases.
+  A scoped foreign binding installs the call's RDRAM pointer in RT64 Core and
+  State, waits both workload and presentation queues idle—including exception
+  exits—and restores placeholder aliases before the Rust capability ends.
+  Standalone backend-geometry compatibility remains available for behavior
+  fixtures, but the backend records that authority and refuses to emit a
+  fixed-cycle release capture until a complete live-register presentation has
+  succeeded.
+  Black still disables pixel type, repeat-line uses zero Y scale, and fade uses
+  zero Y scale plus the 10-bit Y subpixel offset without discarding the retained
+  image. The no-device adapter capture proves the first and post-submission
+  24-word RT64 images are identical. A live pinned-Metal gate now observes
+  twenty complete register phases over one workload at nondefault 8x6 active
+  geometry: off-state restorations are byte-identical, gamma and 1.5x X/Y
+  scale causally change exact pixels, and every present identity advances.
+  Gamma dither, coverage-gated horizontal divot, and full-coverage RGBA16
+  dither restoration are causal and restorable in the native VI shader. The
+  divot gate proves that three full-coverage control rows stay unchanged while
+  exactly twelve eligible pixels in the otherwise identical non-full rows
+  change to the exact componentwise median over RT64's modulo-eight
+  framebuffer-alpha coverage estimate. The restoration gate applies the
+  shared signed available-neighbor 3x3 formula: exactly eighteen eligible
+  full-coverage pixels change, all twenty-four non-full pixels and six flat
+  full-coverage controls stay byte-identical, and alpha is preserved. This
+  restoration claim is limited to clean pinned Metal with nearest host
+  filtering, native scale, progressive scanout, and the synthetic RGBA16
+  fixture. Managed-target per-pixel dither history and complete coverage,
+  linear and anti-aliased-pixel-scaling filtering, enhancement resolution,
+  MSAA/downsample behavior, D3D12, Vulkan, and representative full-ROM
+  presentation remain uncertified. A separate eleven-phase pinned-Metal
+  fixture distinguishes supplied hardware mode 0 from compatibility-only
+  `Unspecified` at the native callback; a separate adapter-capture integration
+  test proves the Rust/C/C++ wire distinction. The fixture applies the public
+  Figure-11 AA arithmetic to deliberately generated RT64-managed code 4 with
+  opaque code-7 controls, and proves modes 0/1 equal an independent
+  coverage-four oracle while modes 2/3 restore the baseline. AA precedes
+  divot causally. Pinned RT64 aliases managed 7/8 and clamped 8/8 at code 7;
+  untested partial codes, natural/imported hidden coverage, code-0/save
+  semantics, wider sampling lattices, silicon, and analog parity remain
+  explicitly bounded. A typed IPL television
+  standard is the common VI/AI clock authority. Before a mode exists, VI uses the public
   nominal 60 Hz NTSC/MPAL or 50 Hz PAL rate; once H_SYNC and V_SYNC are
   nonzero, their public line/half-line units derive the next guest-cycle field
   interval from that standard's video clock. Hosts query the live interval at
   every injection point, so a latched mode changes the next deadline. This
   formula is clean-room derived from public register definitions and has not
-  yet been checked against a hardware timing trace. Analog VI output filtering
-  remains open.
+  yet been checked against a hardware timing trace. Exact VI random-stream
+  identity, broader native coverage/filter-lattice certification, and
+  physical-console filter capture remain open.
+  Per VR4300 User's Manual chapters 3 and 6, the arbitrary-PC block lane's canonical 32-bit instruction-fetch boundary
+  keeps the architectural virtual PC used by branch/J/JAL, EPC, and Cause.BD
+  separate from the admitted `InstructionWordIdentity { BankId, physical
+  address }`. KSEG0/KSEG1 select PA directly; KUSEG/KSSEG/KSEG3 use the
+  recorded PageMask, ASID/global, and valid state. AOT translations contain
+  exactly one straight word or one branch plus a separately translated slot,
+  and the interpreter constructs the same unit from the physical catalog, so
+  cross-page nonadjacent mappings and remaps cannot borrow virtual adjacency
+  or stale bytes. Its typed unit source also admits the canonical
+  `0xffff_fffc -> 0` slot wrap without relaxing the ordinary code catalog's
+  non-wrapping span invariant. This is selected inside the ordinary `BlockProgram::run` and
+  `dispatch` contract whenever a destination bank owns physical code; exact
+  mapped AOT entries override that bank's mapped-interpreter fallback without
+  creating another dispatcher. Canonical `BlockProgram` evidence binds all
+  physical spans/words and every mapped entry's exact `BankId`/PA sequence,
+  preflight-expected words, and generated artifact identity, independent of
+  native pointers and registration order. Mapped-interpreter destination
+  observations honestly retain no
+  generated artifact and are operational/differential-only, not fixed-cycle
+  release evidence under schema v22; artifact-identified mapped AOT retains its
+  real artifact and is eligible, while compatibility AOT without one is not.
+  Refill and invalid fetch faults retain exact EPC/BD, BadVAddr, Context/EntryHi,
+  and refill/common vector selection. The legacy whole-function boundary,
+  64-bit instruction-PC/catalog identity, and translated physical device
+  routing remain loud. Data-side translation is wider: Status.KSU plus UX/SX/KX
+  classify the documented XUSEG/XKSSEG/XKUSEG, XSSEG, XKPHYS, and XKSEG ranges;
+  mapped spaces compare EntryHi.Region plus VA[39:13], while XKPHYS requires
+  VA[58:32]=0 before using PA[31:0]. Width/privilege violations become typed
+  AdEL/AdES. Extended refill entry preserves full BadVAddr and updates Context,
+  XContext, and EntryHi before selecting the first-level XTLB vector; nested
+  exceptions retain the common-vector rule.
   In the block
   lane, raw MI mask commands and RCP completion drive CPU IP2; the next
   instruction boundary applies the
@@ -664,12 +1187,44 @@ task calls out:
   executor-owned half-rate Count/Compare clock: equality latches CPU IP7 and a
   handler's MTC0 Compare acknowledges it before ERET can resume. Generated-C
   translation units compile as C++ solely for `fn64_mmio_proxy.h`: its lvalue
-  proxy preserves direct native-word RDRAM reads/writes but routes KSEG1 RCP
-  `MEM_W` loads and assignments through the same raw handlers as the typed
-  block lane. Subword RCP access traps loudly. This closes split register
-  authority, but not the function lane's inability to suspend inside one
-  generated function; tight timed-device polling still requires block-lane
-  checkpoints.
+  proxy maps zero- or sign-extended KSEG0/KSEG1 RDRAM aliases onto one
+  low-29-bit physical prefix, preserves the `^2`/`^3` byte lanes, and routes
+  canonical KSEG1 RCP plus KSEG0/KSEG1 PIF `MEM_W` accesses through the same
+  raw handlers as the typed block lane. KUSEG, KSEG2/3, and noncanonical
+  64-bit aliases never acquire implicit TLB behavior. The wrapper also
+  replaces the vendor header's pre-expanded LD/SD and unaligned helpers so
+  every width uses that boundary; non-word RCP/PIF operations and partial
+  SWL/SWR selectors trap before a device read or write. Because N64Recomp's C
+  permits `goto` to cross an initialized
+  scalar declaration while C++ rejects it, the shared build boundary copies
+  each generated translation unit into Cargo's `OUT_DIR`, supplies the uniform
+  recompiled-function prototype for calls omitted from generated `funcs.h`, and
+  splits only the exact `gpr jr_addend_<hex> = value;` shape into a declaration
+  plus assignment at the same program point. The missing-prototype set is
+  derived from each generated input rather than game names baked into fn64.
+  The proxy's C++ `RECOMP_FUNC` keeps C linkage plus weak/noinline attributes
+  but omits N64Recomp's C-specific `extern inline` spelling, whose different
+  C++ semantics can suppress every externally linkable generated body.
+  The out-of-tree source stays untouched and no derived game code enters git.
+  Subword RCP access traps loudly. This closes
+  split register authority, but not the function lane's inability to suspend
+  inside one generated function; tight timed-device polling still requires
+  block-lane checkpoints. Both boot lanes pass the allocation length with its
+  pointer through the public `register_process_rdram` seam (also invoked by
+  `boot_thread0`); the executor, timed DMA
+  paths, and RSP HLE/LLE task runners therefore share one explicit bounds
+  authority. Re-registering the identical pointer/length is idempotent;
+  replacing a live allocation traps because retained device/task authority may
+  still name the original bytes. Raw-MMIO interception ends at the public RCP/SI boundary
+  `0xA4900000`; cartridge-domain KSEG1 addresses at `0xA5000000` and above
+  remain ordinary generated-code backing rather than being misdecoded as
+  registers. The C proxy and typed Rust lane share one classifier: physical
+  RDRAM aliases use the common 8 MiB prefix, while other canonical KSEG0/KSEG1
+  addresses use N64Recomp's sparse `low32(address) - 0x80000000` offset and
+  succeed only when the host supplied that complete range. This compatibility
+  backing is not evidence that a cartridge-domain device is attached; in
+  particular, completing the cart-only `osDriveRomInit` probe does not claim
+  mounted 64DD IPL-ROM storage or DMA support.
 - **Why rung-18-class races become unrepresentable, precisely.** Rung 18's
   actual root cause was not "the mutex was in the wrong place" — a mutex
   *was* added at exactly the TOCTOU the original hypothesis named, verified
@@ -707,7 +1262,7 @@ pub struct MesgQueue {
     valid_count: usize,       // validCount: how many slots currently hold a real message
     first: usize,             // ring index of the oldest valid message
     blocked_on_recv: BlockedList,  // OSThreads parked in osRecvMesg on an empty queue
-    blocked_on_send: BlockedList,  // OSThreads parked in osSendMesg on a full queue
+    blocked_on_send: BlockedSenderList, // OSThreads + message + head/tail operation
 }
 ```
 
@@ -741,6 +1296,15 @@ pub struct MesgQueue {
   `BlockedList` and yielding are two steps of one sequential function running
   on the single executor thread, with no other coroutine able to observe or
   mutate the queue in between (nothing else is running).
+- **Blocked operation identity and lifecycle.** A blocked sender retains a
+  typed head/tail placement with its thread, block-time priority, and message;
+  blocked receivers likewise retain block-time priority. Waiters wake in
+  descending priority with FIFO ties, so a delayed
+  `osJamMesg` commit cannot become an ordinary tail `osSendMesg` when another
+  thread frees space. `osStopThread` and `osDestroyThread` sweep every queue's
+  sender and receiver roles before changing thread state. Thus the later
+  receive/event interleaving cannot rediscover a stale waiter and revive a
+  stopped or destroyed coroutine.
 - **Event queue registration (`osSetEventMesg`, VI/SI/PI sources).**
   Modeled as a small `EventTable: HashMap<OsEvent, (QueueHandle, Mesg)>` in
   `fn64-runtime`, populated by `osSetEventMesg_recomp`. VI/timer/SI/PI
@@ -769,7 +1333,7 @@ out, recorded here honestly per `AGENTS.md`'s "mark revisions honestly":
   deciding to yield. That pre-check is exactly what caused the bug below,
   so the real shape unifies `OS_MESG_BLOCK`/`OS_MESG_NOBLOCK` into ONE
   suspend point per operation: `Yield::BlockOnRecv { mq_addr, may_block }`/
-  `Yield::BlockOnSend { mq_addr, msg, may_block }`. The executor's
+  `Yield::BlockOnSend { mq_addr, msg, may_block, jam }`. The executor's
   `handle_yield` (the only place that safely holds `&mut Executor` at this
   point) does the check-then-deliver-or-block-or-drop logic uniformly; a
   new `Resume::WouldBlock` variant carries the `OS_MESG_NOBLOCK`-on-
@@ -778,6 +1342,13 @@ out, recorded here honestly per `AGENTS.md`'s "mark revisions honestly":
   a strictly more precise version of the same design intent (§2's
   "Send/recv as coroutine yield points, not thread ops"), not a course
   reversal.
+- **First resume and blocked-send intent are explicit state.** `osStartThread`
+  installs `Resume::Start` only until `GameThread` records its first resume;
+  a previously resumed coroutine can never receive `Start` again. A blocked
+  send stores `SendPlacement::Head` or `Tail`, and
+  queue-owned waiter removal clears both sender and receiver roles for thread
+  stop/destruction. These types preserve the operation across every scheduler
+  interleaving rather than asking the eventual wake site to reconstruct it.
 - **A real reentrancy bug, caught by this crate's own tests, in exactly the
   shape the pre-check above created.** `fn64-abi`'s coroutine bodies run
   physically nested inside `Executor::run_one_step`'s call to
@@ -1080,6 +1651,23 @@ this crate's testability goal):
   sequence-numbered log, not a hand-run debugger recipe that has to be
   redone from scratch for the next investigation.
 
+The renderer consumes one narrower typed event from that same write boundary:
+`NonRdpWrite16` carries the canonical physical halfword and the exact value
+after a CPU store commits. N64Recomp-generated C reaches it through the
+build-wide `MEM_H` lvalue proxy, while typed-Rust output reaches it through
+`Rdram::store_h`; KSEG0 and KSEG1 stores update the same visible physical
+bytes before that event, and neither path suppresses a same-value assignment.
+Word and unaligned-word stores publish one aligned four-byte range; SD/SDL/SDR
+publish one eight-byte range only after both native words are coherent. The host
+multiplexes Rust executable-region invalidation and renderer notification
+without entering the executor. Programming Manual 15.5.6 is the behavioral
+source: only the documented 16-bit visible-LSB replication is modeled here;
+byte and word stores remain range notifications without inferred hidden-bit
+effects. A backend must explicitly return whether it applied a Rust-owned
+sidecar, so native RT64's separate ownership cannot become a silent parity
+claim. Raw RCP and PIF registers remain word-only in both lanes: subword,
+doubleword, and partial unaligned stores trap before any device side effect.
+
 ## 4. A/B migration: link-time swap over identical `RecompiledFuncs`
 
 ### The core mechanism
@@ -1102,6 +1690,90 @@ fails to link, loudly, before ever running).
 
 ### Shared event-trace format
 
+The machine-readable fixed-cycle digest and minimum-scenario closure format
+built on this trace is specified in `docs/RELEASE-GATE.md`. Its current live
+ledger proves typed observations and absence of a reached loud trap only for
+the exercised scenario; it is not full-runtime semantic closure. The digest deliberately
+excludes the process-global diagnostic sequence number from timing digests:
+the event order is retained, while unrelated tests or earlier tracing in the
+same process cannot perturb release evidence.
+
+DMA closure does not use the executor trace's legacy unqualified `Dma`
+variant. `DeviceFabric` already owns a second typed transition trace at the
+actual device boundary; the ABI copies it without translation. Schema v12
+domain-separates and hashes PI/SI/AI/raw-SP start plus commit/completion events
+and synchronous `SpTaskAdmitted`, binds each path's serialized observation
+count into the report SHA, and hashes the complete future-affecting state of
+the modeled `DeviceFabric`: its internal memories, queues, event ordering,
+timing policy, and cartridge-save/programming state. It also hashes the
+executor-owned PIF identities/input/rumble and all four retained Controller
+Pak, Transfer Pak, and VRU slots; their complete authoritative storage,
+semantic metadata, mapper/RTC/timing state; high-level VI/retrace state; and
+the ABI manager's pending PI/SI delivery and VI-latch metadata. V9 additionally
+binds the owner-local executor control and complete modeled ABI HostState
+projections described below. V8 and earlier artifacts lack that aggregate and
+are rejected. Pointer identity is excluded while the one-process-RDRAM
+invariant, buffer length, and guest-visible delivery fields are retained.
+MBC3 powered-off persistence keeps this boundary deterministic: the host
+explicitly injects sidecar checkpoint/resume timestamps, restore materializes
+their elapsed interval into the live RTC/guest-cycle phase once, and the
+runtime discards the timestamps. Evidence therefore binds the resulting
+future-visible RTC/phase but no host wall-clock value. The sidecar is a
+versioned fn64 host format bound to the exact Game Boy ROM SHA-256 and public
+timer+battery cartridge type; Pan Docs supplies the hardware RTC/oscillator/
+battery semantics, not the file format or Unix-time policy.
+`SectionRegistry::evidence_snapshot` provides the corresponding typed overlay
+projection: registration-order section geometry and function offset/ROM-size
+metadata, canonical sorted residency/runtime-load/static-storage maps, and the
+exact in-flight static-mirror cursor. Its derived lookup cache and native
+function-pointer bits are intentionally absent. This runtime projection alone
+does not prove callable-body identity; the program-owning ABI aggregate must
+bind that identity before a release schema can claim complete program state.
+The typed-Rust program owner now has that separate owner-local projection. A
+function-lane install must supply a stable 256-bit identity for the actual
+generated native artifact; compatibility installs still run, but evidence
+capture traps loudly while they remain unidentified. A block-lane snapshot
+sorts every bank/span, retains every instruction word, and derives a
+domain-separated SHA-256 over that image plus the caller-supplied artifact
+identity of each generated bank runner. Code words alone are not treated as
+proof of runner semantics. The live ABI projection additionally requires
+stable artifact identities for the entry/transfer dispatch implementation and
+each registered dynamic builder, then binds those identities, the instruction
+budget, sorted physical/virtual executable-region geometry, active bank and
+generation counters, and the canonical union of pending executable-write
+ranges. Compatibility installs without those identities still execute, but
+their evidence capture traps. Runner, resolver, builder, lookup, and native
+pointer values are excluded. Schema v12 aggregates this projection at the
+committed VI edge when the boot harness is built with `recomp-rs`; a stable
+no-typed-program tag remains explicit for C/default builds and is not callable
+body identity for the legacy C archive.
+`Executor::control_evidence_snapshot` supplies the owner-local scheduler
+projection for the same aggregate: RDRAM registration presence and length
+(never its host pointer), canonical thread/queue/event maps, exact runnable and
+waiter priority/FIFO-tie order (including each cached block-time priority),
+pending resume payloads, stable timer firing/tie order, the
+active run-token owner, virtual time, and CP0 Count/Compare/IP7 state. Snapshot
+construction first validates that runnable IDs are unique and match runnable
+thread state, queue waiters match blocked state, and pending resumes belong to
+runnable queued threads. Diagnostic traces and native coroutine stacks/
+continuations are excluded. Consequently two executors paused at different
+opaque native continuation points can have equal control snapshots; this is a
+fixed-cycle evidence projection for aggregation, explicitly not a whole-
+executor savestate or a claim that native continuation state is portable.
+Schema v12 aggregates this control projection with the raw device and ABI-owner
+snapshots at the committed VI edge. The same opaque boundary freezes the
+supported host target, exact four-port PIF identities, closed cartridge-save
+configuration, graphics execution policy, and renderer self-report. The live
+gate performs no later ambient query to construct those fields. Compatibility
+save/backend registrations remain runnable but are rejected as unidentified;
+RT64 evidence also binds its authoritative build identity, active settings
+digest, and whether an enabled nonempty replacement-pack set was active.
+Only byte-commit/completion variants and the
+post-`osSpTaskLoad` admission boundary satisfy their narrowly named closure
+paths. This keeps an accepted or queued request distinct from bytes that
+became observable, and it does not use synchronous task loading to claim raw
+timed SP DMA. VI interrupts remain VI events rather than being relabeled DMA.
+
 Both runtimes, when built with tracing enabled, emit the same structured
 event stream so a diff tool never has to reconcile two different logging
 formats:
@@ -1119,9 +1791,14 @@ pub enum TraceKind {
     ThreadSwitch { from: ThreadId, to: ThreadId, reason: SwitchReason },
     QueueOp { queue: RdramAddr, op: QueueOpKind, thread: ThreadId }, // send/recv/block/wake
     Dma { direction: DmaDirection, dram: RdramAddr, dev_addr: u32, len: u32 },
-    TaskSubmit { task_kind: TaskKind, ucode: u32 }, // RSP gfx/audio task handoff
+    TaskSubmit { task_kind: TaskKind, ucode: u32 }, // RSP gfx/audio StartGo handoff
 }
 ```
+
+The complete `TaskLog` records synchronous `osSpTaskLoad` admission, while
+`TaskSubmit` is emitted only after `osSpTaskStartGo` consumes that admitted
+token. A later Load can replace an unstarted task image without fabricating an
+execution trace or satisfying an RSP task-execution closure path.
 
 Each event names *what changed*, not implementation-internal state, so it's
 comparable across two structurally different implementations (OS-thread

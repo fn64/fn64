@@ -155,6 +155,10 @@ const ALU2_VRAM: u32 = 0x80300000;
 
 #[allow(unused_variables, unused_mut, unused_labels, clippy::all)]
 pub fn dword_alu(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(
+        0x80100000,
+        "dword_alu",
+    ));
     let mut pc: u32 = 0x80100000;
     'run: loop {
         match pc {
@@ -213,6 +217,10 @@ pub fn dword_alu(ctx: &mut RecompContext, mem: &mut Rdram) {
 
 #[allow(unused_variables, unused_mut, unused_labels, clippy::all)]
 pub fn dword_mem(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(
+        0x80200000,
+        "dword_mem",
+    ));
     let mut pc: u32 = 0x80200000;
     'run: loop {
         match pc {
@@ -237,19 +245,19 @@ pub fn dword_mem(ctx: &mut RecompContext, mem: &mut Rdram) {
                 mem.store_dr(Rdram::eff_addr(ctx.r(4), 39), ctx.r_u64(8));
                 // 0x80200024: Lld { rt: 12, base: 4, off: 40 }
                 {
-                    let a = Rdram::eff_addr(ctx.r(4), 40);
-                    let v = mem.load_d(a);
-                    ctx.set_r(12, v);
-                    ctx.set_ll_reservation(a, 8);
+                    let addr = Rdram::eff_addr(ctx.r(4), 40);
+                    let value = mem.load_d(addr);
+                    ctx.set_r(12, value);
+                    ctx.set_ll_reservation(addr, 8);
                 }
                 // 0x80200028: Daddiu { rt: 12, rs: 12, imm: 1 }
                 ctx.set_r(12, (ctx.r_u64(12)).wrapping_add(1i64 as u64));
                 // 0x8020002C: Scd { rt: 12, base: 4, off: 40 }
                 {
-                    let a = Rdram::eff_addr(ctx.r(4), 40);
-                    let v = ctx.r_u64(12);
-                    if ctx.take_ll_reservation(a, 8) {
-                        mem.store_d(a, v);
+                    let addr = Rdram::eff_addr(ctx.r(4), 40);
+                    let value = ctx.r_u64(12);
+                    if ctx.take_ll_reservation(addr, 8) {
+                        mem.store_d(addr, value);
                         ctx.set_r(12, 1);
                     } else {
                         ctx.set_r(12, 0);
@@ -267,6 +275,10 @@ pub fn dword_mem(ctx: &mut RecompContext, mem: &mut Rdram) {
 
 #[allow(unused_variables, unused_mut, unused_labels, clippy::all)]
 pub fn dword_alu2(ctx: &mut RecompContext, mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(
+        0x80300000,
+        "dword_alu2",
+    ));
     let mut pc: u32 = 0x80300000;
     'run: loop {
         match pc {

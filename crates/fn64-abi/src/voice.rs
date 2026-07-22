@@ -24,9 +24,10 @@ fn voice_error_code(error: fn64_runtime::VoiceError) -> u32 {
 
 fn with_voice<R>(
     channel: usize,
+    evidence: fn64_runtime::ControllerOperationKind,
     operation: impl FnOnce(&mut fn64_runtime::VoiceUnit) -> Result<R, fn64_runtime::VoiceError>,
 ) -> Result<R, u32> {
-    with_executor(|exec| match exec.pif().port_state(channel) {
+    let result = with_executor(|exec| match exec.pif().port_state(channel) {
         fn64_runtime::PortState::VoiceRecognitionUnit => operation(
             exec.voice_unit_mut(channel)
                 .expect("VRU identity exists without VoiceUnit state"),
@@ -38,7 +39,15 @@ fn with_voice<R>(
         fn64_runtime::PortState::StandardControllerControllerPak
         | fn64_runtime::PortState::StandardControllerRumblePak
         | fn64_runtime::PortState::StandardControllerTransferPak => Err(CONT_ERR_DEVICE),
-    })
+    });
+    if result.is_ok() {
+        crate::record_controller_operation(
+            channel,
+            fn64_runtime::ControllerOperationDevice::VoiceRecognitionUnit,
+            evidence,
+        );
+    }
+    result
 }
 
 fn handle_channel(storage: fn64_runtime::RdramPtr, raw: u64) -> Result<usize, u32> {
@@ -147,10 +156,14 @@ pub fn mark_voice_detected(port: usize) {
 pub unsafe extern "C" fn osVoiceInit_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     let channel = ctx.r6 as usize;
-    let result = with_voice(channel, |voice| {
-        voice.initialize();
-        Ok(())
-    });
+    let result = with_voice(
+        channel,
+        fn64_runtime::ControllerOperationKind::Control,
+        |voice| {
+            voice.initialize();
+            Ok(())
+        },
+    );
     if result.is_ok() {
         let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
         let handle = RdramAddr::from_gpr(ctx.r5);
@@ -199,7 +212,11 @@ pub unsafe extern "C" fn osVoiceClearDictionary_recomp(rdram: *mut u8, ctx: *mut
     let ctx = unsafe { &mut *ctx };
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     let result = handle_channel(storage, ctx.r4).and_then(|channel| {
-        let result = with_voice(channel, |voice| voice.clear_dictionary(ctx.r5 as u8));
+        let result = with_voice(
+            channel,
+            fn64_runtime::ControllerOperationKind::Control,
+            |voice| voice.clear_dictionary(ctx.r5 as u8),
+        );
         if result.is_ok() {
             update_handle_status(storage, ctx.r4, channel);
         }
@@ -218,7 +235,11 @@ pub unsafe extern "C" fn osVoiceSetWord_recomp(rdram: *mut u8, ctx: *mut RecompC
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     let result = handle_channel(storage, ctx.r4).and_then(|channel| {
         let word = read_voice_word(storage, ctx.r5)?;
-        with_voice(channel, |voice| voice.set_word(&word))
+        with_voice(
+            channel,
+            fn64_runtime::ControllerOperationKind::Write,
+            |voice| voice.set_word(&word),
+        )
     });
     set_result(ctx, result);
 }
@@ -233,7 +254,11 @@ pub unsafe extern "C" fn osVoiceMaskDictionary_recomp(rdram: *mut u8, ctx: *mut 
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     let result = handle_channel(storage, ctx.r4).and_then(|channel| {
         let mask = unsafe { copy_from_guest(storage, ctx.r5, ctx.r6 as u32 as usize) };
-        with_voice(channel, |voice| voice.set_mask(&mask))
+        with_voice(
+            channel,
+            fn64_runtime::ControllerOperationKind::Write,
+            |voice| voice.set_mask(&mask),
+        )
     });
     set_result(ctx, result);
 }
@@ -247,9 +272,11 @@ pub unsafe extern "C" fn osVoiceControlGain_recomp(rdram: *mut u8, ctx: *mut Rec
     let ctx = unsafe { &mut *ctx };
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     let result = handle_channel(storage, ctx.r4).and_then(|channel| {
-        with_voice(channel, |voice| {
-            voice.set_gain(ctx.r5 as i32, ctx.r6 as i32)
-        })
+        with_voice(
+            channel,
+            fn64_runtime::ControllerOperationKind::Control,
+            |voice| voice.set_gain(ctx.r5 as i32, ctx.r6 as i32),
+        )
     });
     set_result(ctx, result);
 }
@@ -263,7 +290,11 @@ pub unsafe extern "C" fn osVoiceStartReadData_recomp(rdram: *mut u8, ctx: *mut R
     let ctx = unsafe { &mut *ctx };
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     let result = handle_channel(storage, ctx.r4).and_then(|channel| {
-        let result = with_voice(channel, fn64_runtime::VoiceUnit::start);
+        let result = with_voice(
+            channel,
+            fn64_runtime::ControllerOperationKind::Control,
+            fn64_runtime::VoiceUnit::start,
+        );
         if result.is_ok() {
             update_handle_status(storage, ctx.r4, channel);
         }
@@ -281,10 +312,14 @@ pub unsafe extern "C" fn osVoiceStopReadData_recomp(rdram: *mut u8, ctx: *mut Re
     let ctx = unsafe { &mut *ctx };
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     let result = handle_channel(storage, ctx.r4).and_then(|channel| {
-        with_voice(channel, |voice| {
-            voice.stop();
-            Ok(())
-        })?;
+        with_voice(
+            channel,
+            fn64_runtime::ControllerOperationKind::Control,
+            |voice| {
+                voice.stop();
+                Ok(())
+            },
+        )?;
         update_handle_status(storage, ctx.r4, channel);
         Ok(())
     });
@@ -300,7 +335,11 @@ pub unsafe extern "C" fn osVoiceGetReadData_recomp(rdram: *mut u8, ctx: *mut Rec
     let ctx = unsafe { &mut *ctx };
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     let result = handle_channel(storage, ctx.r4).and_then(|channel| {
-        let result = with_voice(channel, fn64_runtime::VoiceUnit::take_result);
+        let result = with_voice(
+            channel,
+            fn64_runtime::ControllerOperationKind::Read,
+            fn64_runtime::VoiceUnit::take_result,
+        );
         update_handle_status(storage, ctx.r4, channel);
         result.map(|data| {
             let out = RdramAddr::from_gpr(ctx.r5);
@@ -335,6 +374,7 @@ mod tests {
     #[test]
     fn voice_dictionary_and_host_result_flow_through_public_structs() {
         with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        crate::load_rom(vec![0; 0x100]);
         crate::si::set_controller_port_state(0, fn64_runtime::PortState::VoiceRecognitionUnit);
         let mut rdram = vec![0u8; 0x200];
         let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram.as_mut_ptr()) };
@@ -414,5 +454,24 @@ mod tests {
             9
         );
         assert_eq!(unsafe { storage.read_u8(RdramAddr::from_offset(0x4C)) }, 0);
+        assert_eq!(
+            crate::copy_controller_operations(),
+            [
+                fn64_runtime::ControllerOperationKind::Control,
+                fn64_runtime::ControllerOperationKind::Control,
+                fn64_runtime::ControllerOperationKind::Write,
+                fn64_runtime::ControllerOperationKind::Write,
+                fn64_runtime::ControllerOperationKind::Control,
+                fn64_runtime::ControllerOperationKind::Read,
+            ]
+            .into_iter()
+            .map(|operation| fn64_runtime::ControllerOperationEvent {
+                at: fn64_runtime::Cycles::ZERO,
+                port: 0,
+                device: fn64_runtime::ControllerOperationDevice::VoiceRecognitionUnit,
+                operation,
+            })
+            .collect::<Vec<_>>()
+        );
     }
 }

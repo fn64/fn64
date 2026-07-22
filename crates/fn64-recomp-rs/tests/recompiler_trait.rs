@@ -72,6 +72,9 @@ fn recompile_produces_typed_rust_module() {
     // The generated module must be typed Rust with no unsafe / no pointer casts.
     assert!(src.contains("pub fn f_ret(ctx: &mut RecompContext, mem: &mut Rdram)"));
     assert!(src.contains("pub fn f_addu(ctx: &mut RecompContext, mem: &mut Rdram)"));
+    assert!(src.contains("pub const FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA"));
+    assert!(src.contains("TranslatedFunctionIdentity::new(0x80000000, \"f_ret\")"));
+    assert!(src.contains("TranslatedFunctionIdentity::new(0x80000008, \"f_addu\")"));
     assert!(src.contains("ctx.set_r32(2, (ctx.r_s32(4)).wrapping_add(ctx.r_s32(5)));"));
     // No `unsafe` blocks/fns and no pointer casts in the generated code. (The
     // banner comment says "no unsafe", so match the keyword usage, not the

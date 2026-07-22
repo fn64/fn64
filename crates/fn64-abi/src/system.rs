@@ -147,6 +147,14 @@ pub unsafe extern "C" fn osGetTime_recomp(_rdram: *mut u8, ctx: *mut RecompConte
 pub unsafe extern "C" fn osGetCount_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     ctx.r2 = with_executor(|exec| exec.cp0_count()) as u64;
+    if crate::boot_probe_enabled() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed);
+        if n < 8 {
+            eprintln!("[boot-probe] osGetCount -> {:#x}", ctx.r2);
+        }
+    }
 }
 
 /// `osSetCount(u32 count)` -- writes the MIPS CP0 Count register without

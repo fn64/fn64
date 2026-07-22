@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 
 /// The `OOT_*` spellings these knobs shipped under before they were renamed to
 /// the game-agnostic `FN64_*` prefix. Nothing about dumping PCM or skipping
@@ -162,6 +163,13 @@ pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: u
         })
         .collect();
 
+    AUDIO_DIGEST_CAPTURE.with(|cell| {
+        let mut capture = cell.borrow_mut();
+        if let Some(bytes) = capture.as_mut() {
+            bytes.extend(samples.iter().flat_map(|sample| sample.to_le_bytes()));
+        }
+    });
+
     let nonzero = samples.iter().filter(|&&sample| sample != 0).count() as u64;
     let buffer_min = samples.iter().copied().min();
     let buffer_max = samples.iter().copied().max();
@@ -272,10 +280,43 @@ fn with_render_backend<T>(
             }
             Err(error) => {
                 let reason = error.to_string();
+                if let fn64_render::RenderError::UnsupportedUcode { ucode_addr } = &error {
+                    fn64_runtime::record_unsupported_event(
+                        fn64_runtime::UnsupportedSubsystem::Render,
+                        "render.backend.unsupported-ucode",
+                        format!(
+                            "{context}: backend rejected unlisted microcode at RDRAM offset {ucode_addr:#010x}"
+                        ),
+                        Some(fn64_runtime::Cycles::new(crate::sim_time())),
+                        fn64_runtime::UnsupportedDisposition::LoudTrap,
+                    );
+                }
                 RENDER_LAST_ERROR.with(|last| last.replace(Some(reason.clone())));
                 panic!("{context}: {reason}");
             }
         }
+    })
+}
+
+/// Deliver one completed CPU halfword store to the currently registered
+/// renderer. Guest execution is single-threaded and renderer calls never run
+/// guest code, so a borrow collision is a real recursive-entry bug rather
+/// than contention to retry. No registered renderer is a valid early-boot or
+/// unit-test state and therefore has no sidecar owner to notify.
+pub(crate) fn observe_non_rdp_write16(
+    logical_offset: u32,
+    value: u16,
+) -> Option<fn64_render::NonRdpWrite16Disposition> {
+    let write = fn64_render::NonRdpWrite16::new(logical_offset, value);
+    RENDER_BACKEND.with(|cell| {
+        let mut registered = cell.try_borrow_mut().unwrap_or_else(|_| {
+            panic!(
+                "observe_non_rdp_write16: recursive renderer entry while delivering physical RDRAM halfword {logical_offset:#x}"
+            )
+        });
+        registered
+            .as_mut()
+            .map(|backend| backend.observe_non_rdp_write16(write))
     })
 }
 
@@ -302,27 +343,75 @@ fn render_output_addr() -> u32 {
 ///
 /// # Safety
 /// `rdram` valid for the call; `o` a valid task-header offset within it.
-unsafe fn dispatch_gfx_task(rdram: *mut u8, header: &OsTaskHeader) -> fn64_render::FrameStatus {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderDispatchResult {
+    status: fn64_render::FrameStatus,
+    dp_full_sync: fn64_render::DpFullSyncStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderChunkDispatchResult {
+    status: fn64_render::RenderTaskChunkStatus,
+    dp_full_sync: fn64_render::DpFullSyncStatus,
+    chunking: fn64_render::RenderTaskChunking,
+}
+
+fn render_task(header: &OsTaskHeader) -> fn64_render::OsTask {
+    fn64_render::OsTask {
+        task_type: header.task_type,
+        flags: header.flags,
+        ucode_boot: header.ucode_boot,
+        ucode_boot_size: header.ucode_boot_size,
+        ucode: header.ucode,
+        ucode_size: header.ucode_size,
+        ucode_data: header.ucode_data,
+        ucode_data_size: header.ucode_data_size,
+        dram_stack: header.dram_stack,
+        dram_stack_size: header.dram_stack_size,
+        output_buff: header.output_buff,
+        output_buff_size: header.output_buff_size,
+        data_ptr: header.data_ptr,
+        data_size: header.data_size,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+unsafe fn dispatch_gfx_task(rdram: *mut u8, header: &OsTaskHeader) -> RenderDispatchResult {
+    let result = unsafe {
+        dispatch_gfx_task_chunk(
+            rdram,
+            header,
+            fn64_render::RenderTaskStep::Start,
+            render_output_addr(),
+        )
+    };
+    let status = match result.status {
+        fn64_render::RenderTaskChunkStatus::Complete => fn64_render::FrameStatus::Complete,
+        fn64_render::RenderTaskChunkStatus::Yielded => fn64_render::FrameStatus::Yielded,
+        fn64_render::RenderTaskChunkStatus::NeedsLle { ucode_sha256 } => {
+            fn64_render::FrameStatus::NeedsLle { ucode_sha256 }
+        }
+        fn64_render::RenderTaskChunkStatus::Continue(token) => panic!(
+            "dispatch_gfx_task: resumable backend retained continuation token {}; caller requires atomic completion",
+            token.get()
+        ),
+    };
+    RenderDispatchResult {
+        status,
+        dp_full_sync: result.dp_full_sync,
+    }
+}
+
+unsafe fn dispatch_gfx_task_chunk(
+    rdram: *mut u8,
+    header: &OsTaskHeader,
+    step: fn64_render::RenderTaskStep,
+    output_addr: u32,
+) -> RenderChunkDispatchResult {
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
-    let status = with_render_backend("dispatch_gfx_task", |backend| {
-        let task = fn64_render::OsTask {
-            task_type: header.task_type,
-            flags: header.flags,
-            ucode_boot: header.ucode_boot,
-            ucode_boot_size: header.ucode_boot_size,
-            ucode: header.ucode,
-            ucode_size: header.ucode_size,
-            ucode_data: header.ucode_data,
-            ucode_data_size: header.ucode_data_size,
-            dram_stack: header.dram_stack,
-            dram_stack_size: header.dram_stack_size,
-            output_buff: header.output_buff,
-            output_buff_size: header.output_buff_size,
-            data_ptr: header.data_ptr,
-            data_size: header.data_size,
-        };
-        let rdram_len = RDRAM_LEN.with(|cell| cell.get());
-        let rdram_slice = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
+    let status = with_render_backend("dispatch_gfx_task_chunk", |backend| {
+        let task = render_task(header);
+        let rdram_slice = unsafe { renderer_rdram_slice(rdram) };
         // The color framebuffer the VI presents (`osViSwapBuffer`'s frame
         // buffer, e.g. OoT's 0x3b5000/0x3da800) -- NOT `task.output_buff`
         // (OoT's is 0x80151640, the RSP's DRAM command-FIFO output region,
@@ -330,14 +419,19 @@ unsafe fn dispatch_gfx_task(rdram: *mut u8, header: &OsTaskHeader) -> fn64_rende
         // own surface and copies the result here so the VI-presented frame
         // isn't blank. `0` (no VI framebuffer set yet) tells the backend
         // "no known color target": it renders to its own surface only.
-        let output_addr = render_output_addr();
         with_host(|host| {
-            backend.process_task(
+            let status = backend.process_task_chunk(
                 rdram_slice,
                 host.device_fabric.rsp_memory_mut(),
                 &task,
                 output_addr,
-            )
+                step,
+            )?;
+            Ok(RenderChunkDispatchResult {
+                status,
+                dp_full_sync: backend.last_dp_full_sync(),
+                chunking: backend.task_chunking(),
+            })
         })
     });
     if let Some(started) = started {
@@ -353,54 +447,479 @@ unsafe fn dispatch_gfx_task(rdram: *mut u8, header: &OsTaskHeader) -> fn64_rende
     status
 }
 
-/// Present the registered graphics backend at the guest's real VI swap
+/// Present the registered graphics backend at the guest's real VI retrace
 /// boundary. Task submission and VI presentation are distinct on N64; this
 /// closes the second half of `RenderBackend` without exposing RT64 or any
 /// foreign type outside `fn64-render-rt64`.
 pub(crate) fn present_render_backend(vi: fn64_render::ViPresentation) {
-    with_render_backend("present_render_backend", |backend| backend.present(vi));
+    let (rdram, allocation_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+    // SAFETY: every retrace presentation runs after device commit and before
+    // any guest coroutine resumes. The boot contract keeps this one process
+    // allocation live, while the higher-ranked capability prevents a backend
+    // from retaining it beyond the call. No competing Rust slice is created:
+    // typed recompiled execution may retain its dormant checked RDRAM borrow.
+    unsafe {
+        fn64_runtime::with_physical_rdram_read(rdram, allocation_len, |memory| {
+            with_render_backend("present_render_backend", |backend| {
+                backend.present(fn64_render::PresentRequest::live(vi, memory))
+            })
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LleTaskResult {
     steps: u64,
-    needs_dp: bool,
+    dp_full_sync: fn64_render::DpFullSyncStatus,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct HleBootResult {
     steps: u64,
     task: OsTaskHeader,
+    machine_state: fn64_audio::rsp::runtime::RspMachineState,
 }
 
-/// Publish the RSP core's guest-visible rdram effects after a task/boot run.
+#[derive(Clone, Debug)]
+struct PendingImemReplacement {
+    generation: u64,
+    image: [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+}
+
+fn imem_sha256(imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE]) -> [u8; 32] {
+    Sha256::digest(imem).into()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TaskMicrocodeDataIdentity {
+    addr: RdramAddr,
+    size: u32,
+    sha256: [u8; 32],
+}
+
+impl TaskMicrocodeDataIdentity {
+    fn evidence_snapshot(self) -> RspTaskDataIdentityEvidenceSnapshot {
+        RspTaskDataIdentityEvidenceSnapshot {
+            rdram_offset: self.addr.offset(),
+            byte_len: self.size,
+            sha256: self.sha256,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RspTaskLineagePhase {
+    Running,
+    ResumeAuthorized,
+    ResumeLoaded,
+}
+
+impl RspTaskLineagePhase {
+    fn evidence_snapshot(self) -> RspTaskLineagePhaseEvidenceSnapshot {
+        match self {
+            Self::Running => RspTaskLineagePhaseEvidenceSnapshot::Running,
+            Self::ResumeAuthorized => RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized,
+            Self::ResumeLoaded => RspTaskLineagePhaseEvidenceSnapshot::ResumeLoaded,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RspTaskLineage {
+    original_header: OsTaskHeader,
+    data_identity: Option<TaskMicrocodeDataIdentity>,
+    phase: RspTaskLineagePhase,
+}
+
+impl RspTaskLineage {
+    pub(crate) fn evidence_snapshot(&self, task_offset: u32) -> RspTaskLineageEvidenceSnapshot {
+        RspTaskLineageEvidenceSnapshot {
+            task_offset,
+            original_header: self.original_header,
+            data_identity: self
+                .data_identity
+                .map(TaskMicrocodeDataIdentity::evidence_snapshot),
+            phase: self.phase.evidence_snapshot(),
+        }
+    }
+
+    fn yielded_header(self) -> OsTaskHeader {
+        OsTaskHeader {
+            flags: self.original_header.flags | fn64_runtime::OS_TASK_YIELDED,
+            ucode_data: self.original_header.yield_data_ptr,
+            ucode_data_size: self.original_header.yield_data_size,
+            ..self.original_header
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoadedRspTask {
+    task_addr: RdramAddr,
+    header: OsTaskHeader,
+    resumed_data_identity: Option<TaskMicrocodeDataIdentity>,
+}
+
+impl LoadedRspTask {
+    pub(crate) fn evidence_snapshot(&self) -> LoadedRspTaskEvidenceSnapshot {
+        LoadedRspTaskEvidenceSnapshot {
+            task_offset: self.task_addr.offset(),
+            header: self.header,
+            resumed_data_identity: self
+                .resumed_data_identity
+                .map(TaskMicrocodeDataIdentity::evidence_snapshot),
+        }
+    }
+}
+
+/// Capture the original task microcode-data image at the RSP kickoff boundary.
 ///
-/// The RSP machine now executes directly against the real guest RDRAM slice
-/// (its ONLY rdram store path is `dma_write`, which logs every written span),
-/// so the bytes are already in place -- what remains is the recompiler-side
-/// bookkeeping a host-side write owes: notify each written range and re-check
-/// live executable pages. A prior version snapshotted the FULL host RDRAM
-/// mapping and memcmp-diffed all of it per task; on the wm2000 harness that
-/// mapping is 656 MiB (`RDRAM_MMIO_WINDOW_END`), which capped the whole boot
-/// at ~5 RSP tasks/second of pure memcpy+memcmp.
+/// The source address and size come from the typed header retained by
+/// `osSpTaskLoad`, never from the mutable CPU `OSTask` storage. SP_DRAM_ADDR
+/// canonicalizes addresses to 24 bits; the result must remain inside physical
+/// RDRAM even when the host allocation appends sparse MMIO backing.
+///
+/// # Safety
+/// `rdram` must address the process allocation registered in `HostState`.
+unsafe fn task_microcode_data_identity(
+    rdram: *mut u8,
+    task_addr: RdramAddr,
+    source_addr: u32,
+    size: u32,
+) -> TaskMicrocodeDataIdentity {
+    let (registered_rdram, allocation_len) =
+        with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+    assert!(
+        !rdram.is_null() && allocation_len != 0,
+        "RSP task {:#010x} microcode-data capture has no registered process RDRAM allocation",
+        task_addr.offset()
+    );
+    assert_eq!(
+        registered_rdram, rdram,
+        "RSP task {:#010x} microcode-data capture does not use the registered process RDRAM allocation",
+        task_addr.offset()
+    );
+    let addr = RdramAddr::from_offset(source_addr & 0x00ff_ffff);
+    let start = addr.offset() as usize;
+    let end = start.checked_add(size as usize).unwrap_or_else(|| {
+        panic!(
+            "RSP task {:#010x} microcode-data range overflows host usize: start={:#010x} size={size:#x}",
+            task_addr.offset(),
+            addr.offset()
+        )
+    });
+    assert!(
+        end <= fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        "RSP task {:#010x} microcode-data range [{:#010x}, {end:#010x}) exceeds physical RDRAM length {:#x}",
+        task_addr.offset(),
+        addr.offset(),
+        fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+    );
+    assert!(
+        end <= allocation_len,
+        "RSP task {:#010x} microcode-data range [{:#010x}, {end:#010x}) exceeds registered allocation length {allocation_len:#x}",
+        task_addr.offset(),
+        addr.offset(),
+    );
+
+    let memory = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    let mut digest = Sha256::new();
+    for offset in 0..size {
+        let byte_addr = addr.checked_add(offset).unwrap_or_else(|| {
+            panic!(
+                "RSP task {:#010x} microcode-data logical address overflow at byte {offset:#x}",
+                task_addr.offset()
+            )
+        });
+        digest.update([unsafe { memory.read_u8(byte_addr) }]);
+    }
+    TaskMicrocodeDataIdentity {
+        addr,
+        size,
+        sha256: digest.finalize().into(),
+    }
+}
+
+fn identify_microcode_pair(
+    imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    data: TaskMicrocodeDataIdentity,
+    authoritative_family: Option<fn64_render::UcodeId>,
+) -> Option<fn64_render::UcodeId> {
+    let backend_family = with_render_backend("identify_microcode_pair", |backend| {
+        Ok(backend.identify_microcode_pair(
+            imem,
+            fn64_render::MicrocodeDataImageIdentity {
+                bytes: data.size,
+                sha256: data.sha256,
+            },
+        ))
+    });
+    match (authoritative_family, backend_family) {
+        (Some(authoritative), Some(backend)) if authoritative != backend => {
+            panic!(
+                "pinned microcode classifier identified {authoritative:?}, but the backend pair catalog claimed {backend:?}"
+            )
+        }
+        (Some(authoritative), _) => Some(authoritative),
+        (None, backend) => backend,
+    }
+}
+
+/// Classify the immutable task-entry raw text/data storage through the pinned
+/// MIT RT64 identity table. This does not admit HLE; it prevents a backend or
+/// private pair declaration from choosing the family written to LLE evidence.
+///
+/// # Safety
+/// `rdram` must be the registered process allocation.
+unsafe fn classify_task_microcode_family(
+    rdram: *mut u8,
+    header: &OsTaskHeader,
+) -> Option<fn64_render::UcodeId> {
+    let storage = unsafe { renderer_rdram_slice(rdram) };
+    let window = fn64_render::capture_task_admission_raw_window(
+        storage,
+        RdramAddr::from_offset(header.ucode & 0x00ff_ffff),
+        RdramAddr::from_offset(header.ucode_data & 0x00ff_ffff),
+        fn64_render::F3DZEX2_RAW_WINDOW_SIZE,
+    )?;
+    fn64_render::identify_f3dzex2(&window).map(fn64_render::F3dzex2Variant::family)
+}
+
+fn canonical_rdp_words_sha256(words: &[u32]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for word in words {
+        digest.update(word.to_be_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn dpc_observation(xbus: bool, start: u32, end: u32, words: &[u32]) -> RspRdpObservationKind {
+    let command_sha256 = canonical_rdp_words_sha256(words);
+    if xbus {
+        RspRdpObservationKind::XbusDpcCommitted {
+            start,
+            end,
+            command_sha256,
+        }
+    } else {
+        RspRdpObservationKind::DramDpcCommitted {
+            start,
+            end,
+            command_sha256,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmittedTaskImageShape {
+    BootOverlay,
+    DirectImem,
+}
+
+#[derive(Clone, Debug)]
+enum AdmittedHleEntry {
+    BootOverlay(Box<HleBootResult>),
+    DirectImem { task: OsTaskHeader },
+}
+
+impl AdmittedHleEntry {
+    fn task(&self) -> OsTaskHeader {
+        match self {
+            Self::BootOverlay(boot) => boot.task,
+            Self::DirectImem { task } => *task,
+        }
+    }
+
+    fn pre_ucode_steps(&self) -> u64 {
+        match self {
+            Self::BootOverlay(boot) => boot.steps,
+            Self::DirectImem { .. } => 0,
+        }
+    }
+
+    fn into_lle_machine_state(self) -> Option<fn64_audio::rsp::runtime::RspMachineState> {
+        match self {
+            Self::BootOverlay(boot) => Some(boot.machine_state),
+            Self::DirectImem { .. } => None,
+        }
+    }
+}
+
+fn aligned_sp_image_size(size: u32) -> Option<u32> {
+    size.checked_add(7)
+        .map(|size| size & !7)
+        .filter(|size| *size != 0 && *size as usize <= fn64_runtime::RSP_MEMORY_BANK_SIZE)
+}
+
+fn admitted_task_image_shape(header: &OsTaskHeader) -> AdmittedTaskImageShape {
+    let boot = header.ucode_boot & 0x1fff_ffff;
+    let ucode = header.ucode & 0x1fff_ffff;
+    let direct_image = boot == ucode
+        && boot.is_multiple_of(8)
+        && header.ucode_size != 0
+        && header.ucode_size as usize <= fn64_runtime::RSP_MEMORY_BANK_SIZE
+        && aligned_sp_image_size(header.ucode_boot_size)
+            .is_some_and(|copy_size| copy_size >= header.ucode_size);
+    if direct_image {
+        AdmittedTaskImageShape::DirectImem
+    } else {
+        AdmittedTaskImageShape::BootOverlay
+    }
+}
+
+/// Host policy for the graphics microcode phase of an admitted `M_GFXTASK`.
+///
+/// Both policies classify the admitted image first. Boot-overlay tasks execute
+/// rspboot through the clean-room RSP interpreter and commit its complete
+/// post-DMA machine state; direct IMEM images already enter at the fabric's PC
+/// zero. `HleOptimized` then offers that task-entry state to the registered
+/// graphics backend, retaining the transactional LLE fallback for an
+/// unadmitted digest. `LleAccuracy` instead continues the loaded graphics
+/// microcode through the existing interpreter unconditionally and forwards
+/// only its raw DPC submissions to the backend.
+/// The latter avoids making an HLE decoder's arithmetic part of an accuracy
+/// claim; it does not select a different RDP implementation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GraphicsTaskExecutionPolicy {
+    /// Prefer an exact-digest HLE implementation, falling back transactionally.
+    #[default]
+    HleOptimized,
+    /// Execute every loaded graphics microcode instruction through LLE.
+    LleAccuracy,
+}
+
+/// Exact registered renderer state frozen for fixed-cycle release evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderEnvironmentEvidenceSnapshot {
+    pub backend: fn64_render::RenderBackendEvidence,
+    pub execution_policy: GraphicsTaskExecutionPolicy,
+}
+
+impl RenderEnvironmentEvidenceSnapshot {
+    /// Renderer-owned TV standard from the last successful backend creation.
+    /// An unidentified compatibility backend has no release authority.
+    pub const fn renderer_tv_type(&self) -> Option<fn64_runtime::TvType> {
+        self.backend.tv_type()
+    }
+}
+
+/// Publish the RSP core's guest-visible RDRAM effects after direct execution.
+/// The bytes are already in the live allocation; only recompiler bookkeeping
+/// and executable-page invalidation remain.
+#[cfg(feature = "recomp-rs")]
 fn commit_rsp_rdram_writes(written: &[(usize, usize)]) {
     if written.is_empty() {
         return;
     }
-    #[cfg(feature = "recomp-rs")]
-    {
-        for &(start, end) in written {
-            fn64_recomp_rs::notify_guest_write(start as u32, (end - start) as u32);
-        }
-        crate::recompiled::process_live_executable_writes_from_host();
+    for &(start, end) in written {
+        fn64_recomp_rs::notify_guest_write(start as u32, (end - start) as u32);
     }
+    crate::recompiled::process_live_executable_writes_from_host();
 }
 
-/// Write the forensic capture for a runaway LLE task (see
-/// `FN64_RSP_LLE_DEBUG_DIR` in `dispatch_lle_task`): the admitted DMEM/IMEM
-/// images, the current DMEM/IMEM images, the scalar machine state, a ring of
-/// the most recent PCs, the parsed OSTask header, and a logical-byte-order
-/// window of the task's rdram data area.
+#[cfg(not(feature = "recomp-rs"))]
+fn commit_rsp_rdram_writes(_written: &[(usize, usize)]) {}
+
+fn rsp_visible_rdram_len(allocation_len: usize) -> usize {
+    allocation_len.min(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE)
+}
+
+/// Expose the renderer and RDP to physical RDRAM, never the host-only MMIO
+/// backing appended to the generated-code allocation. Retail commands can
+/// address the final byte of the 8 MiB device, so a short registration is a
+/// caller error rather than a reason to truncate the hardware-visible span.
+unsafe fn renderer_rdram_slice<'a>(rdram: *mut u8) -> &'a mut [u8] {
+    let allocation_len = RDRAM_LEN.with(Cell::get);
+    assert!(
+        allocation_len >= fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        "renderer RDRAM allocation length {allocation_len:#x} does not cover the required 8 MiB physical device"
+    );
+    unsafe { std::slice::from_raw_parts_mut(rdram, fn64_runtime::rdram::DEFAULT_RDRAM_SIZE) }
+}
+
+fn rsp_dma_storage_layout(
+    allocation_len: usize,
+    static_aliases: Vec<std::ops::Range<u32>>,
+) -> (Vec<std::ops::Range<usize>>, usize) {
+    let physical_len = rsp_visible_rdram_len(allocation_len);
+    let mut ranges: Vec<_> = std::iter::once(0..physical_len).collect();
+    let mut snapshot_len = physical_len;
+    for alias in static_aliases {
+        let start = alias.start as usize;
+        let end = alias.end as usize;
+        assert!(
+            start < end && end <= allocation_len,
+            "loaded static-overlay RSP alias [{start:#x}, {end:#x}) is invalid for host RDRAM \
+             allocation length {allocation_len:#x}"
+        );
+        ranges.push(start..end);
+        snapshot_len = snapshot_len.max(end);
+    }
+    (ranges, snapshot_len)
+}
+
+unsafe fn trace_rsp_rdram_words(rdram: *const u8, rdram_len: usize) {
+    let Some(spec) = std::env::var_os("RSP_TRACE_RDRAM_WORDS") else {
+        return;
+    };
+    let spec = spec
+        .to_str()
+        .unwrap_or_else(|| panic!("RSP_TRACE_RDRAM_WORDS must be UTF-8"));
+    let (offset, count) = spec
+        .split_once(':')
+        .unwrap_or_else(|| panic!("RSP_TRACE_RDRAM_WORDS must be OFFSET:COUNT, got {spec:?}"));
+    let offset = usize::from_str_radix(offset.trim_start_matches("0x"), 16)
+        .unwrap_or_else(|_| panic!("RSP_TRACE_RDRAM_WORDS offset must be hexadecimal"));
+    let count = count
+        .parse::<usize>()
+        .unwrap_or_else(|_| panic!("RSP_TRACE_RDRAM_WORDS count must be decimal"));
+    let byte_len = count
+        .checked_mul(4)
+        .expect("RSP_TRACE_RDRAM_WORDS byte length overflow");
+    let end = offset
+        .checked_add(byte_len)
+        .expect("RSP_TRACE_RDRAM_WORDS range overflow");
+    assert!(
+        end <= rdram_len,
+        "RSP_TRACE_RDRAM_WORDS range exceeds host allocation"
+    );
+    let bytes = unsafe { std::slice::from_raw_parts(rdram.add(offset), byte_len) };
+    let words: Vec<_> = bytes
+        .chunks_exact(4)
+        .map(|bytes| u32::from_ne_bytes(bytes.try_into().expect("four RDRAM bytes")))
+        .collect();
+    eprintln!("[fn64-abi/rsp] RDRAM {offset:#x} words={words:08x?}");
+}
+
+fn trace_rsp_dmem_words(dmem: &[u8], overlay: u64, pc: u32) {
+    let Some(spec) = std::env::var_os("RSP_TRACE_DMEM_WORDS") else {
+        return;
+    };
+    let spec = spec
+        .to_str()
+        .unwrap_or_else(|| panic!("RSP_TRACE_DMEM_WORDS must be UTF-8"));
+    let (offset, count) = spec
+        .split_once(':')
+        .unwrap_or_else(|| panic!("RSP_TRACE_DMEM_WORDS must be OFFSET:COUNT, got {spec:?}"));
+    let offset = usize::from_str_radix(offset.trim_start_matches("0x"), 16)
+        .unwrap_or_else(|_| panic!("RSP_TRACE_DMEM_WORDS offset must be hexadecimal"));
+    let count = count
+        .parse::<usize>()
+        .unwrap_or_else(|_| panic!("RSP_TRACE_DMEM_WORDS count must be decimal"));
+    let byte_len = count
+        .checked_mul(4)
+        .expect("RSP_TRACE_DMEM_WORDS byte length overflow");
+    let end = offset
+        .checked_add(byte_len)
+        .expect("RSP_TRACE_DMEM_WORDS range overflow");
+    assert!(end <= dmem.len(), "RSP_TRACE_DMEM_WORDS range exceeds DMEM");
+    let words: Vec<_> = dmem[offset..end]
+        .chunks_exact(4)
+        .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("four DMEM bytes")))
+        .collect();
+    eprintln!("[fn64-abi/rsp] overlay={overlay} pc={pc:#06x} DMEM {offset:#x} words={words:08x?}");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dump_lle_debug_state(
     dir: &std::path::Path,
@@ -436,7 +955,11 @@ fn dump_lle_debug_state(
     let _ = writeln!(state, "overlays {overlays}");
     let _ = writeln!(state, "sp_status {:#010x}", machine.sp_status());
     let _ = writeln!(state, "sp_semaphore {}", machine.sp_semaphore_latch());
-    let _ = writeln!(state, "dma_mem_address {:#010x}", machine.ctx.dma_mem_address);
+    let _ = writeln!(
+        state,
+        "dma_mem_address {:#010x}",
+        machine.ctx.dma_mem_address
+    );
     let _ = writeln!(
         state,
         "dma_dram_address {:#010x}",
@@ -453,7 +976,6 @@ fn dump_lle_debug_state(
     }
     write("pc_ring.txt", ring.as_bytes());
 
-    // OSTask header (rspboot leaves it at DMEM 0xFC0; public libultra layout).
     let field = |image: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE], offset: usize| {
         u32::from_be_bytes(
             image[0xfc0 + offset..0xfc0 + offset + 4]
@@ -484,9 +1006,6 @@ fn dump_lle_debug_state(
     }
     write("task_header.txt", header.as_bytes());
 
-    // The task's rdram data area, exported in logical (big-endian guest) byte
-    // order: fn64's rdram backing stores each 32-bit word natively, so the
-    // logical byte at `offset` lives at `offset ^ 3`.
     let data_ptr = (field(initial_dmem, 0x30) as usize) & 0x00ff_ffff;
     let data_size = (field(initial_dmem, 0x34) as usize).clamp(0x40, 0x20000);
     let end = (data_ptr + data_size).min(machine.rdram.len());
@@ -496,13 +1015,10 @@ fn dump_lle_debug_state(
             .collect();
         write("task_data_logical.bin", &logical);
     }
-
-    // Raw (native backing layout) rdram image, clamped to the 8 MiB guest
-    // window, so the failing task can be replayed offline against the same
-    // memory the machine saw. Post-abort rdram has absorbed the task's own
-    // DMA writes; replays reading those regions may diverge slightly, but
-    // command-list-driven control flow replays exactly.
-    let raw_len = machine.rdram.len().min(0x0080_0000);
+    let raw_len = machine
+        .rdram
+        .len()
+        .min(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE);
     write("rdram_raw.bin", &machine.rdram[..raw_len]);
 }
 
@@ -536,59 +1052,65 @@ fn commit_rsp_memory_state(
 /// Run the persistent RSP state from its admitted PC through BREAK, resolving
 /// every IMEM overlay generation and forwarding DPC work to the renderer.
 /// This is the universal clean-room path for custom/unknown task types.
-unsafe fn dispatch_lle_task(rdram: *mut u8) -> LleTaskResult {
+unsafe fn dispatch_lle_task(
+    rdram: *mut u8,
+    task_addr: RdramAddr,
+    recognize_graphics_microcode: bool,
+    machine_state: Option<fn64_audio::rsp::runtime::RspMachineState>,
+    microcode_data: Option<TaskMicrocodeDataIdentity>,
+    authoritative_family: Option<fn64_render::UcodeId>,
+) -> LleTaskResult {
     const CHUNK_STEPS: u64 = 1 << 20;
     const MAX_TASK_STEPS: u64 = 1 << 26;
 
-    let (mut dmem, mut imem, status, mut pc, rdram_len) = with_host(|host| {
-        let fabric = &host.device_fabric;
-        (
-            *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Dmem),
-            *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Imem),
-            fabric.sp_status(),
-            fabric.sp_pc(),
-            host.runtime_rdram_len,
-        )
-    });
+    let (mut dmem, mut imem, status, mut pc, imem_generation, rdram_len, static_aliases) =
+        with_host(|host| {
+            let fabric = &host.device_fabric;
+            (
+                *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Dmem),
+                *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Imem),
+                fabric.sp_status(),
+                fabric.sp_pc(),
+                fabric.rsp_memory().imem_generation(),
+                host.runtime_rdram_len,
+                host.sections.loaded_static_storage_ranges(),
+            )
+        });
     assert!(
         !rdram.is_null() && rdram_len != 0,
         "RSP LLE task has no registered process RDRAM allocation"
     );
-    // The machine executes directly against the guest allocation: bounded DMA
-    // through a checked slice, with every written span logged for
-    // `commit_rsp_rdram_writes`. No aliasing access happens while the borrow
-    // lives -- the loop below touches only the machine, and `with_host` is
-    // not re-entered until after `drop(machine)`.
+    let initial_imem = imem;
+    unsafe { trace_rsp_rdram_words(rdram, rdram_len) };
+    let (dma_ranges, _) = rsp_dma_storage_layout(rdram_len, static_aliases);
+    // Execute directly against the live allocation. RSP stores are bounded by
+    // the admitted DMA ranges and logged by the machine for post-run JIT
+    // invalidation; no full-allocation snapshot or memcmp is needed.
     let rdram_slice = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
     let mut machine = fn64_audio::rsp::runtime::RspMachine::new(rdram_slice);
+    machine.set_dma_rdram_ranges(dma_ranges);
     machine.load_dmem_logical(&dmem);
     machine.set_sp_status_raw(
         status & !(fn64_runtime::SP_STATUS_HALT | fn64_runtime::SP_STATUS_BROKE),
     );
+    if let Some(state) = machine_state {
+        machine.restore_state(state);
+    }
     let mut total_steps = 0u64;
     let mut overlays = 0u64;
-    // Env-gated forensic capture (`FN64_RSP_LLE_DEBUG_DIR=<dir>`): snapshot
-    // the admitted task state up front, single-step the final stretch before
-    // the admission bound to build a PC ring, and dump everything to files
-    // when the bound is exceeded so a runaway loop can be analyzed offline.
+    let mut replacements = Vec::new();
     let debug_dir = std::env::var_os("FN64_RSP_LLE_DEBUG_DIR").map(std::path::PathBuf::from);
     const DEBUG_TAIL_STEPS: u64 = 1 << 16;
     const DEBUG_PC_RING: usize = 4096;
-    let debug_initial: Option<(
-        [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
-        [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
-        u32,
-    )> = debug_dir.as_ref().map(|_| (dmem, imem, pc));
-    let mut debug_pc_ring: std::collections::VecDeque<u32> =
-        std::collections::VecDeque::with_capacity(DEBUG_PC_RING);
+    let debug_initial = debug_dir.as_ref().map(|_| (dmem, imem, pc));
+    let mut debug_pc_ring = std::collections::VecDeque::with_capacity(DEBUG_PC_RING);
+    trace_rsp_dmem_words(&machine.dmem_logical(), overlays, pc);
     loop {
         let words: Vec<u32> = imem
             .chunks_exact(4)
             .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("four IMEM bytes")))
             .collect();
         let chunk = if debug_dir.is_some() {
-            // Land exactly on the tail boundary, then single-step so the PC
-            // ring records every instruction leading up to the bound.
             let tail_start = MAX_TASK_STEPS - DEBUG_TAIL_STEPS;
             if total_steps >= tail_start {
                 1
@@ -638,6 +1160,13 @@ unsafe fn dispatch_lle_task(rdram: *mut u8) -> LleTaskResult {
                 overlays = overlays
                     .checked_add(1)
                     .expect("RSP IMEM overlay generation counter overflow");
+                replacements.push(PendingImemReplacement {
+                    generation: imem_generation
+                        .checked_add(overlays)
+                        .expect("RSP IMEM generation evidence overflow"),
+                    image: imem,
+                });
+                trace_rsp_dmem_words(&machine.dmem_logical(), overlays, pc);
             }
             fn64_audio::rsp::RspExitReason::StepLimit => {}
             reason => panic!(
@@ -655,33 +1184,48 @@ unsafe fn dispatch_lle_task(rdram: *mut u8) -> LleTaskResult {
 
     commit_rsp_rdram_writes(&rdram_writes);
     commit_rsp_memory_state(&dmem, &imem, overlays, pc, final_status);
+    let committed_generation = with_host(|host| host.device_fabric.rsp_memory().imem_generation());
+    assert_eq!(
+        committed_generation,
+        imem_generation
+            .checked_add(overlays)
+            .expect("RSP IMEM generation evidence overflow"),
+        "RSP transactional IMEM replacement count diverged from the committed fabric generation"
+    );
 
-    // Consecutive DPC_END extensions are ONE hardware command stream, not
-    // independent lists: a 16-byte command (G_TEXRECT, G_FILLRECT with
-    // sync, raw triangles) may straddle two END writes -- F3DEX xbus 2.08
-    // extends its run 8 bytes at a time -- so per-submission decode would
-    // trap on a "truncated" command that hardware simply stalls on until
-    // the next END write. Coalesce before dispatch: XBUS runs concatenate
-    // their submission-time payload bytes (the DMEM ring is reused across
-    // generations); DRAM runs merge address-contiguous ranges.
+    let mut dp_full_sync = fn64_render::DpFullSyncStatus::NotReached;
+    let mut dpc_observations = Vec::with_capacity(dp_submissions.len());
+    let trace_limit = std::env::var("RSP_TRACE_DPC_WORDS").ok().map(|raw| {
+        raw.parse::<usize>()
+            .unwrap_or_else(|_| panic!("RSP_TRACE_DPC_WORDS must be decimal, got {raw:?}"))
+    });
+    // Consecutive END extensions are one hardware command stream. A 16-byte
+    // command can straddle two 8-byte END writes, so decoding each submission
+    // separately creates a false truncated-command trap.
     let mut index = 0;
     while index < dp_submissions.len() {
-        if dp_submissions[index].xbus {
+        let (start, end, xbus, words) = if dp_submissions[index].xbus {
+            let start = dp_submissions[index].start;
+            let mut end = dp_submissions[index].end;
             let mut stream = Vec::new();
             while index < dp_submissions.len() && dp_submissions[index].xbus {
                 let submission = &dp_submissions[index];
                 assert_eq!(
                     submission.payload.len(),
-                    (submission.end.wrapping_sub(submission.start)) as usize,
-                    "RSP XBUS DPC range [{:#010x}, {:#010x}) payload was not captured at \
-                     submission time",
+                    submission.end.wrapping_sub(submission.start) as usize,
+                    "RSP XBUS DPC range [{:#010x}, {:#010x}) payload was not captured at submission time",
                     submission.start,
                     submission.end
                 );
                 stream.extend_from_slice(&submission.payload);
+                end = submission.end;
                 index += 1;
             }
-            unsafe { dispatch_raw_rdp_xbus(rdram, &stream) };
+            let words = stream
+                .chunks_exact(4)
+                .map(|word| u32::from_be_bytes(word.try_into().expect("four XBUS bytes")))
+                .collect::<Vec<_>>();
+            (start, end, true, words)
         } else {
             let start = dp_submissions[index].start;
             let mut end = dp_submissions[index].end;
@@ -693,27 +1237,73 @@ unsafe fn dispatch_lle_task(rdram: *mut u8) -> LleTaskResult {
                 end = dp_submissions[index].end;
                 index += 1;
             }
-            assert!(
-                start < end
-                    && start.is_multiple_of(8)
-                    && end.is_multiple_of(8)
-                    && end as usize <= rdram_len,
-                "RSP DPC range [{start:#010x}, {end:#010x}) is invalid for RDRAM length \
-                 {rdram_len:#x}",
+            let storage = unsafe { renderer_rdram_slice(rdram) };
+            let words = storage[start as usize..end as usize]
+                .chunks_exact(4)
+                .map(|word| u32::from_ne_bytes(word.try_into().expect("four RDRAM bytes")))
+                .collect::<Vec<_>>();
+            (start, end, false, words)
+        };
+        if let Some(limit) = trace_limit {
+            let traced = words.iter().copied().take(limit).collect::<Vec<_>>();
+            eprintln!(
+                "[fn64-rsp-dpc] range [{start:#010x}, {end:#010x}) xbus={xbus} words={traced:08x?}"
             );
-            if std::env::var_os("FN64_XBUS_STREAM_DUMP_DIR").is_some() {
-                eprintln!(
-                    "[fn64-abi] LLE task dispatching DRAM raw-RDP group [{start:#010x}, \
-                     {end:#010x})"
-                );
-            }
-            unsafe { dispatch_raw_rdp(rdram, start, end) };
+        }
+        let (full_sync, observation) =
+            unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, xbus) };
+        dpc_observations.push(observation);
+        if full_sync == fn64_render::DpFullSyncStatus::Reached {
+            dp_full_sync = fn64_render::DpFullSyncStatus::Reached;
         }
     }
 
+    let mut observations = Vec::new();
+    let recognition_data = if recognize_graphics_microcode {
+        Some(microcode_data.unwrap_or_else(|| {
+            panic!(
+                "RSP graphics task {:#010x} has no task-start microcode-data identity",
+                task_addr.offset()
+            )
+        }))
+    } else {
+        None
+    };
+    if let Some(data) = recognition_data {
+        observations.push(RspRdpObservationKind::MicrocodeRecognition {
+            task_addr,
+            imem_generation,
+            text_sha256: imem_sha256(&initial_imem),
+            data_addr: data.addr,
+            data_size: data.size,
+            data_sha256: data.sha256,
+            family: identify_microcode_pair(&initial_imem, data, authoritative_family),
+        });
+    }
+    for replacement in replacements {
+        observations.push(RspRdpObservationKind::ImemReplacementCommitted {
+            task_addr,
+            imem_generation: replacement.generation,
+            text_sha256: imem_sha256(&replacement.image),
+        });
+        if let Some(data) = recognition_data {
+            observations.push(RspRdpObservationKind::MicrocodeRecognition {
+                task_addr,
+                imem_generation: replacement.generation,
+                text_sha256: imem_sha256(&replacement.image),
+                data_addr: data.addr,
+                data_size: data.size,
+                data_sha256: data.sha256,
+                family: identify_microcode_pair(&replacement.image, data, authoritative_family),
+            });
+        }
+    }
+    observations.extend(dpc_observations);
+    record_rsp_rdp_observations(observations);
+
     LleTaskResult {
         steps: total_steps.max(1),
-        needs_dp: !dp_submissions.is_empty(),
+        dp_full_sync,
     }
 }
 
@@ -723,31 +1313,34 @@ unsafe fn dispatch_lle_task(rdram: *mut u8) -> LleTaskResult {
 ///
 /// The phase boundary comes from the public SGI RSP guide's task protocol:
 /// rspboot consumes the task header, loads the selected ucode into IMEM, and
-/// starts that ucode. Scalar/VU registers are intentionally local to this
-/// optimization boundary; HLE backends consume the public `OSTask` contract,
-/// while every guest-observable memory and device effect is committed.
-unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
+/// starts that ucode. HLE backends consume the public `OSTask` contract, while
+/// a transactional LLE fallback receives the complete non-memory machine
+/// snapshot alongside the committed memory image.
+unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) -> HleBootResult {
     const BOOT_CHUNK_STEPS: u64 = 1 << 12;
     const MAX_BOOT_STEPS: u64 = 1 << 20;
 
-    let (mut dmem, mut imem, status, mut pc, rdram_len) = with_host(|host| {
-        let fabric = &host.device_fabric;
-        (
-            *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Dmem),
-            *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Imem),
-            fabric.sp_status(),
-            fabric.sp_pc(),
-            host.runtime_rdram_len,
-        )
-    });
+    let (mut dmem, mut imem, status, mut pc, imem_generation, rdram_len, static_aliases) =
+        with_host(|host| {
+            let fabric = &host.device_fabric;
+            (
+                *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Dmem),
+                *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Imem),
+                fabric.sp_status(),
+                fabric.sp_pc(),
+                fabric.rsp_memory().imem_generation(),
+                host.runtime_rdram_len,
+                host.sections.loaded_static_storage_ranges(),
+            )
+        });
     assert!(
         !rdram.is_null() && rdram_len != 0,
         "RSP HLE rspboot has no registered process RDRAM allocation"
     );
-    // Direct guest-RDRAM execution with span-logged writes; see
-    // `dispatch_lle_task`'s matching comment and `commit_rsp_rdram_writes`.
+    let (dma_ranges, _) = rsp_dma_storage_layout(rdram_len, static_aliases);
     let rdram_slice = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
     let mut machine = fn64_audio::rsp::runtime::RspMachine::new(rdram_slice);
+    machine.set_dma_rdram_ranges(dma_ranges);
     machine.load_dmem_logical(&dmem);
     machine.set_sp_status_raw(
         status & !(fn64_runtime::SP_STATUS_HALT | fn64_runtime::SP_STATUS_BROKE),
@@ -755,6 +1348,7 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
     let mut total_steps = 0u64;
     let mut overlays = 0u64;
     let mut loaded_spans = Vec::new();
+    let mut replacements = Vec::new();
 
     loop {
         let execution_pc = if machine.ctx.resume_address != 0 {
@@ -784,10 +1378,17 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
         total_steps = total_steps
             .checked_add(result.steps)
             .expect("RSP rspboot step counter overflow");
+        let imem_word_0 = u32::from_be_bytes(imem[0..4].try_into().expect("one IMEM word"));
+        let task_boot = u32::from_be_bytes(dmem[0x0fc8..0x0fcc].try_into().expect("OSTask boot"));
+        let task_boot_size =
+            u32::from_be_bytes(dmem[0x0fcc..0x0fd0].try_into().expect("OSTask boot size"));
+        let task_ucode = u32::from_be_bytes(dmem[0x0fd0..0x0fd4].try_into().expect("OSTask ucode"));
         assert!(
             total_steps <= MAX_BOOT_STEPS,
-            "RSP HLE rspboot exceeded deterministic {MAX_BOOT_STEPS}-instruction bound at PC {:#06x}",
-            result.pc
+            "RSP HLE rspboot exceeded deterministic {MAX_BOOT_STEPS}-instruction bound at PC \
+             {:#06x}; IMEM[0]={imem_word_0:#010x}, SP status={status:#010x}, admitted OSTask \
+             boot={task_boot:#010x}/size={task_boot_size:#x}, ucode={task_ucode:#010x}",
+            result.pc,
         );
         pc = result.pc;
         match result.reason {
@@ -797,6 +1398,12 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
                 overlays = overlays
                     .checked_add(1)
                     .expect("RSP rspboot IMEM generation counter overflow");
+                replacements.push(PendingImemReplacement {
+                    generation: imem_generation
+                        .checked_add(overlays)
+                        .expect("RSP rspboot IMEM generation evidence overflow"),
+                    image: imem,
+                });
             }
             fn64_audio::rsp::RspExitReason::StepLimit => {}
             fn64_audio::rsp::RspExitReason::Broke => panic!(
@@ -821,6 +1428,7 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
     });
     let final_status = machine.sp_status();
     let dp_submissions = machine.take_dp_submissions();
+    let machine_state = machine.snapshot_state();
     assert!(
         dp_submissions.is_empty(),
         "RSP HLE rspboot submitted {} DPC range(s) before entering ucode",
@@ -831,9 +1439,30 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
 
     commit_rsp_rdram_writes(&rdram_writes);
     commit_rsp_memory_state(&dmem, &imem, overlays, pc, final_status);
+    let committed_generation = with_host(|host| host.device_fabric.rsp_memory().imem_generation());
+    assert_eq!(
+        committed_generation,
+        imem_generation
+            .checked_add(overlays)
+            .expect("RSP rspboot IMEM generation evidence overflow"),
+        "RSP rspboot IMEM replacement count diverged from the committed fabric generation"
+    );
+    record_rsp_rdp_observations(
+        replacements
+            .into_iter()
+            .map(
+                |replacement| RspRdpObservationKind::ImemReplacementCommitted {
+                    task_addr,
+                    imem_generation: replacement.generation,
+                    text_sha256: imem_sha256(&replacement.image),
+                },
+            )
+            .collect(),
+    );
     HleBootResult {
         steps: total_steps.max(1),
         task,
+        machine_state,
     }
 }
 
@@ -841,127 +1470,189 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8) -> HleBootResult {
 /// renderer. DPC state is committed by the caller before this runs; missing
 /// backends and backend failures trap rather than completing nonexistent work.
 pub(crate) unsafe fn dispatch_raw_rdp(rdram: *mut u8, start: u32, end: u32) {
-    with_render_backend("dispatch_raw_rdp", |backend| {
-        let rdram_len = RDRAM_LEN.with(Cell::get);
-        let rdram_slice = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
-        backend.process_rdp_commands(rdram_slice, start, end, render_output_addr())
+    let words = {
+        let rdram_slice = unsafe { renderer_rdram_slice(rdram) };
+        let start_usize = start as usize;
+        let end_usize = end as usize;
+        assert!(
+            start_usize < end_usize && start_usize.is_multiple_of(8) && end_usize.is_multiple_of(8),
+            "DRAM DPC range [{start:#010x}, {end:#010x}) must be nonempty and 8-byte aligned"
+        );
+        assert!(
+            end_usize <= rdram_slice.len(),
+            "DRAM DPC range end {end:#010x} exceeds registered RDRAM length {:#x}",
+            rdram_slice.len()
+        );
+        rdram_slice[start_usize..end_usize]
+            .chunks_exact(4)
+            .map(|word| u32::from_ne_bytes(word.try_into().expect("four RDRAM bytes")))
+            .collect::<Vec<_>>()
+    };
+    let result = with_render_backend("dispatch_raw_rdp", |backend| {
+        let rdram_slice = unsafe { renderer_rdram_slice(rdram) };
+        let status = backend.process_rdp_commands(rdram_slice, start, end, render_output_addr())?;
+        Ok(RenderDispatchResult {
+            status,
+            dp_full_sync: backend.last_dp_full_sync(),
+        })
     });
+    let full_sync = require_committed_full_sync_evidence(result, "dispatch_raw_rdp");
+    record_rsp_rdp_observations(vec![dpc_observation(false, start, end, &words)]);
+    if full_sync == fn64_render::DpFullSyncStatus::Reached {
+        crate::pi::start_live_dp_full_sync()
+            .unwrap_or_else(|error| panic!("dispatch_raw_rdp: DP FullSync completion: {error}"));
+    }
 }
 
-/// Submit one coalesced XBUS command stream (logical big-endian bytes,
-/// captured from DMEM at each DPC_END submission -- see `RspDpSubmission::
-/// payload`). The renderer seam accepts an RDRAM image, so the command span
-/// is staged after the real allocation in a private image. Only the original
-/// RDRAM prefix is copied back after rendering; the staging range is
-/// unobservable.
-unsafe fn dispatch_raw_rdp_xbus(rdram: *mut u8, stream: &[u8]) {
+/// Submit an XBUS DPC range whose command bytes live in persistent RSP DMEM.
+/// The renderer seam accepts an RDRAM image, so the command span is staged
+/// after the real allocation in a private image. Only the original RDRAM
+/// prefix is copied back after rendering; the staging range is unobservable.
+#[cfg_attr(not(test), allow(dead_code))]
+unsafe fn dispatch_raw_rdp_xbus(
+    rdram: *mut u8,
+    dmem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+    start: u32,
+    end: u32,
+) {
+    let start = start & 0x0fff;
+    let end = end & 0x0fff;
+    let start_usize = start as usize;
+    let end_usize = end as usize;
     assert!(
-        !stream.is_empty() && stream.len().is_multiple_of(8),
-        "RSP XBUS DPC stream length {:#x} must be nonempty and 8-byte aligned",
-        stream.len()
+        start < end && start.is_multiple_of(8) && end.is_multiple_of(8),
+        "RSP XBUS DPC range [{start:#05x}, {end:#05x}) must be nonempty and 8-byte aligned"
     );
-    let rdram_len = RDRAM_LEN.with(Cell::get);
     assert!(
-        rdram_len != 0,
-        "RSP XBUS DPC submission requires a registered renderer RDRAM length"
+        end_usize <= dmem.len(),
+        "RSP XBUS DPC range end {end:#05x} exceeds 4 KiB DMEM"
     );
-    // Observability knob: `FN64_XBUS_STREAM_DUMP_DIR=<dir>` writes each
-    // coalesced XBUS command stream (logical big-endian bytes, exactly what
-    // the raw-RDP decoder sees) as `<dir>/xbus-NNNN.bin`, capped at 16
-    // streams. `FN64_XBUS_STREAM_DUMP_SKIP=<n>` (default 0) skips the first
-    // n streams so a deep-boot window (e.g. the post-save title scene) can
-    // be captured without dumping thousands of earlier tasks. This is how a
-    // stream that traps in the decoder is diagnosed offline instead of by
-    // guesswork.
-    if let Some(dir) = std::env::var_os("FN64_XBUS_STREAM_DUMP_DIR") {
-        thread_local! {
-            static XBUS_DUMP_INDEX: Cell<u64> = const { Cell::new(0) };
-        }
-        let index = XBUS_DUMP_INDEX.with(|cell| {
-            let index = cell.get();
-            cell.set(index + 1);
-            index
+    let words = dmem[start_usize..end_usize]
+        .chunks_exact(4)
+        .map(|word| u32::from_be_bytes(word.try_into().expect("four DMEM bytes")))
+        .collect::<Vec<_>>();
+    let (full_sync, observation) =
+        unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true) };
+    record_rsp_rdp_observations(vec![observation]);
+    if full_sync == fn64_render::DpFullSyncStatus::Reached {
+        crate::pi::start_live_dp_full_sync().unwrap_or_else(|error| {
+            panic!("dispatch_raw_rdp_xbus: DP FullSync completion: {error}")
         });
-        let skip = std::env::var("FN64_XBUS_STREAM_DUMP_SKIP")
-            .ok()
-            .map_or(0u64, |raw| {
-                raw.parse().unwrap_or_else(|_| {
-                    panic!("FN64_XBUS_STREAM_DUMP_SKIP must be a u64, got {raw:?}")
-                })
+    }
+}
+
+/// Submit command words already captured at the DPC CMD_END boundary through
+/// an address-disjoint staging range. RDP commands carry physical image and
+/// texture addresses in their payload; their own fetch address is not part of
+/// command semantics, so staging preserves those references while preventing
+/// framebuffer writeback from corrupting a later captured FIFO range.
+unsafe fn dispatch_captured_raw_rdp(
+    rdram: *mut u8,
+    words: &[u32],
+    source_start: u32,
+    source_end: u32,
+    xbus: bool,
+) -> (fn64_render::DpFullSyncStatus, RspRdpObservationKind) {
+    assert!(
+        !words.is_empty() && words.len().is_multiple_of(2),
+        "captured RSP DPC submission must contain a nonempty whole number of 64-bit commands"
+    );
+    if !xbus {
+        assert_eq!(
+            source_end.checked_sub(source_start),
+            Some(u32::try_from(words.len() * 4).expect("captured RSP DPC byte length exceeds u32")),
+            "captured DRAM DPC source range does not match the captured command image"
+        );
+    }
+    let real = unsafe { renderer_rdram_slice(rdram) };
+    let physical_len = real.len();
+    if xbus {
+        if let Some(dir) = std::env::var_os("FN64_XBUS_STREAM_DUMP_DIR") {
+            thread_local! {
+                static XBUS_DUMP_INDEX: Cell<u64> = const { Cell::new(0) };
+            }
+            let index = XBUS_DUMP_INDEX.with(|cell| {
+                let index = cell.get();
+                cell.set(index + 1);
+                index
             });
-        if index >= skip && index < skip.saturating_add(16) {
-            let dir = std::path::PathBuf::from(dir);
-            std::fs::create_dir_all(&dir)
-                .unwrap_or_else(|error| panic!("FN64_XBUS_STREAM_DUMP_DIR {dir:?}: {error}"));
-            let path = dir.join(format!("xbus-{index:04}.bin"));
-            std::fs::write(&path, stream)
-                .unwrap_or_else(|error| panic!("writing XBUS stream dump {path:?}: {error}"));
-            eprintln!(
-                "[fn64-abi] dumped XBUS stream #{index} ({} bytes) to {}",
-                stream.len(),
-                path.display()
-            );
-            // `FN64_XBUS_STREAM_DUMP_RDRAM=<n>`: alongside stream #n, dump
-            // the full guest RDRAM image (native-word layout, exactly what
-            // the raw-RDP decoder reads texels from) so the offline
-            // `xbus_replay` example can replay the stream against the REAL
-            // texture/TLUT bytes instead of zeros.
-            if let Some(want) = std::env::var("FN64_XBUS_STREAM_DUMP_RDRAM")
+            let skip = std::env::var("FN64_XBUS_STREAM_DUMP_SKIP")
                 .ok()
-                .map(|raw| {
+                .map_or(0, |raw| {
                     raw.parse::<u64>().unwrap_or_else(|_| {
-                        panic!("FN64_XBUS_STREAM_DUMP_RDRAM must be a u64, got {raw:?}")
+                        panic!("FN64_XBUS_STREAM_DUMP_SKIP must be a u64, got {raw:?}")
                     })
-                })
-            {
-                if want == index {
-                    let bytes = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
+                });
+            if index >= skip && index < skip.saturating_add(16) {
+                let dir = std::path::PathBuf::from(dir);
+                std::fs::create_dir_all(&dir)
+                    .unwrap_or_else(|error| panic!("FN64_XBUS_STREAM_DUMP_DIR {dir:?}: {error}"));
+                let stream = words
+                    .iter()
+                    .flat_map(|word| word.to_be_bytes())
+                    .collect::<Vec<_>>();
+                let path = dir.join(format!("xbus-{index:04}.bin"));
+                std::fs::write(&path, stream)
+                    .unwrap_or_else(|error| panic!("writing XBUS stream dump {path:?}: {error}"));
+                eprintln!(
+                    "[fn64-abi] dumped XBUS stream #{index} ({} bytes) to {}",
+                    words.len() * 4,
+                    path.display()
+                );
+                let dump_rdram = std::env::var("FN64_XBUS_STREAM_DUMP_RDRAM")
+                    .ok()
+                    .map(|raw| {
+                        raw.parse::<u64>().unwrap_or_else(|_| {
+                            panic!("FN64_XBUS_STREAM_DUMP_RDRAM must be a u64, got {raw:?}")
+                        })
+                    });
+                if dump_rdram == Some(index) {
                     let rdram_path = dir.join(format!("rdram-{index:04}.bin"));
-                    std::fs::write(&rdram_path, bytes).unwrap_or_else(|error| {
+                    std::fs::write(&rdram_path, &*real).unwrap_or_else(|error| {
                         panic!("writing RDRAM dump {rdram_path:?}: {error}")
                     });
                     eprintln!(
-                        "[fn64-abi] dumped RDRAM image ({rdram_len:#x} bytes) to {}",
+                        "[fn64-abi] dumped RDRAM image ({physical_len:#x} bytes) to {}",
                         rdram_path.display()
                     );
                 }
             }
         }
     }
-    let real = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
-    let staging_start = (rdram_len + 7) & !7;
-    let mut image = vec![0u8; staging_start + stream.len()];
-    image[..rdram_len].copy_from_slice(real);
-    for (word_index, word) in stream.chunks_exact(4).enumerate() {
-        let value = u32::from_be_bytes(word.try_into().expect("four stream bytes"));
+    let staging_start = physical_len;
+    let staged_end = staging_start + words.len() * 4;
+    assert!(
+        staged_end <= 0x0100_0000,
+        "captured RSP DPC staging range [{staging_start:#010x}, {staged_end:#010x}) exceeds the 24-bit RDP address space"
+    );
+    let mut image = vec![0u8; staged_end];
+    image[..physical_len].copy_from_slice(real);
+    for (word_index, value) in words.iter().copied().enumerate() {
         let offset = staging_start + word_index * 4;
         image[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
     }
-    let staged_end = staging_start + stream.len();
-    with_render_backend("dispatch_raw_rdp_xbus", |backend| {
-        backend
-            .process_rdp_commands(
-                &mut image,
-                staging_start as u32,
-                staged_end as u32,
-                render_output_addr(),
-            )
-            .map(|_| ())
+    let result = with_render_backend("dispatch_captured_raw_rdp", |backend| {
+        let status = backend.process_rdp_commands(
+            &mut image,
+            staging_start as u32,
+            staged_end as u32,
+            render_output_addr(),
+        )?;
+        Ok(RenderDispatchResult {
+            status,
+            dp_full_sync: backend.last_dp_full_sync(),
+        })
     });
-    if std::env::var_os("FN64_XBUS_DIFF_TRACE").is_some() {
-        // Diagnostic: log every rdram span the renderer changed in the staged
-        // image (i.e. everything the copy-back below will inject into live
-        // guest memory).
+    if xbus && std::env::var_os("FN64_XBUS_DIFF_TRACE").is_some() {
         let mut offset = 0usize;
-        while offset < rdram_len {
+        while offset < physical_len {
             if image[offset] != real[offset] {
                 let start = offset;
-                while offset < rdram_len && image[offset] != real[offset] {
+                while offset < physical_len && image[offset] != real[offset] {
                     offset += 1;
                 }
                 eprintln!(
-                    "[fn64-abi] XBUS diff: renderer changed rdram [{start:#010x}, {offset:#010x}) \
-                     ({} bytes)",
+                    "[fn64-abi] XBUS diff: renderer changed rdram [{start:#010x}, {offset:#010x}) ({} bytes)",
                     offset - start
                 );
             } else {
@@ -969,7 +1660,32 @@ unsafe fn dispatch_raw_rdp_xbus(rdram: *mut u8, stream: &[u8]) {
             }
         }
     }
-    real.copy_from_slice(&image[..rdram_len]);
+    real.copy_from_slice(&image[..physical_len]);
+    let full_sync = require_committed_full_sync_evidence(result, "dispatch_captured_raw_rdp");
+    (
+        full_sync,
+        dpc_observation(xbus, source_start, source_end, words),
+    )
+}
+
+fn require_committed_full_sync_evidence(
+    result: RenderDispatchResult,
+    operation: &'static str,
+) -> fn64_render::DpFullSyncStatus {
+    match result.status {
+        fn64_render::FrameStatus::Complete => match result.dp_full_sync {
+            fn64_render::DpFullSyncStatus::Unidentified => {
+                panic!("{operation}: renderer completed without identifying DP FullSync state")
+            }
+            status => status,
+        },
+        fn64_render::FrameStatus::Yielded => {
+            panic!("{operation}: raw RDP submission cannot yield as an RSP task")
+        }
+        fn64_render::FrameStatus::NeedsLle { .. } => {
+            panic!("{operation}: raw RDP submission cannot request RSP LLE fallback")
+        }
+    }
 }
 
 /// Dispatch an audio task (`M_AUDTASK`) once, at the point the RSP is kicked.
@@ -977,8 +1693,8 @@ unsafe fn dispatch_raw_rdp_xbus(rdram: *mut u8, stream: &[u8]) {
 ///  1. Run the registered translated audio ucode (`AUDIO_UCODE_FN`,
 ///     `set_audio_ucode_fn`) with `(rdram, task_offset)` -- `o` is the OSTask's
 ///     rdram OFFSET, which the recompiled ucode's FFI wrapper uses to seed RSP
-///     DMEM[0xFC0] (rspboot pre-loads the 64-byte OSTask there; aspMain's first
-///     act is `lw 0x18(0xFC0)` = read `ucode_data`). No ucode registered -> the
+///     DMEM[0xFC0] (`osSpTaskLoad` pre-loads the 64-byte OSTask there; aspMain's
+///     first act is `lw 0x18(0xFC0)` = read `ucode_data`). No ucode registered -> the
 ///     task is still counted by the caller's `submit_task`, honestly reflecting
 ///     "submitted but this process never ran its ucode."
 ///  2. Sample delivery happens later at `osAiSetNextBuffer_recomp`, the public
@@ -1033,8 +1749,8 @@ unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
                 if rdram_len == 0 {
                     rdram_len = RDRAM_LEN.with(|cell| cell.get());
                 }
-                // The harness allocation includes a sparse KSEG1/MMIO mirror
-                // hundreds of MiB above physical RDRAM. Audio ucode masks DMA
+                // The harness allocation includes a sparse MMIO/non-RDRAM
+                // window hundreds of MiB above physical RDRAM. Audio ucode masks DMA
                 // addresses to the N64's physical RDRAM window, so replay only
                 // needs the real 8 MiB image; dumping the whole host mapping
                 // made one diagnostic task capture 656 MiB.
@@ -1111,16 +1827,63 @@ pub unsafe extern "C" fn osSpTaskYielded_recomp(rdram: *mut u8, ctx: *mut Recomp
     let task_addr = RdramAddr::from_gpr(ctx.r4);
     let o = task_addr.offset() as usize;
     if crate::pi::live_sp_status() & fn64_runtime::SP_STATUS_YIELDED == 0 {
+        with_host(|host| {
+            let retire = host
+                .rsp_task_lineages
+                .get(&task_addr.offset())
+                .is_some_and(|lineage| lineage.phase == RspTaskLineagePhase::Running);
+            if retire {
+                host.rsp_task_lineages.remove(&task_addr.offset());
+            }
+        });
         ctx.r2 = 0;
         return;
     }
 
     let header = unsafe { read_os_task_header(rdram, o) };
+    let lineage = with_host(|host| host.rsp_task_lineages.get(&task_addr.offset()).copied())
+        .unwrap_or_else(|| {
+            panic!(
+                "osSpTaskYielded_recomp: yielded RSP task {:#010x} has no started task lineage",
+                task_addr.offset()
+            )
+        });
+    assert_eq!(
+        lineage.phase,
+        RspTaskLineagePhase::Running,
+        "osSpTaskYielded_recomp: yielded RSP task {:#010x} cannot authorize a resume from phase {:?}",
+        task_addr.offset(),
+        lineage.phase,
+    );
+    let expected = if header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
+        lineage.yielded_header()
+    } else {
+        lineage.original_header
+    };
+    assert_eq!(
+        header,
+        expected,
+        "osSpTaskYielded_recomp: task {:#010x} changed after its loaded task admission",
+        task_addr.offset()
+    );
     unsafe {
         write_os_task_word(rdram, o, 0x04, header.flags | fn64_runtime::OS_TASK_YIELDED);
         write_os_task_word(rdram, o, 0x18, header.yield_data_ptr);
         write_os_task_word(rdram, o, 0x1c, header.yield_data_size);
     }
+    with_host(|host| {
+        let lineage = host
+            .rsp_task_lineages
+            .get_mut(&task_addr.offset())
+            .expect("yielded task lineage was validated above");
+        assert_eq!(
+            lineage.phase,
+            RspTaskLineagePhase::Running,
+            "osSpTaskYielded_recomp: yielded RSP task {:#010x} changed lineage phase during its public rewrite",
+            task_addr.offset()
+        );
+        lineage.phase = RspTaskLineagePhase::ResumeAuthorized;
+    });
     ctx.r2 = u64::from(fn64_runtime::OS_TASK_YIELDED);
 }
 
@@ -1131,6 +1894,11 @@ thread_local! {
     /// and needs `&mut` access across calls to drive its own internal
     /// state (`create`/`process_task`/`present`).
     static RENDER_BACKEND: RefCell<Option<Box<dyn RenderBackend>>> = const { RefCell::new(None) };
+    /// Graphics microcode execution is a host policy, not a renderer
+    /// capability guess. Compatibility callers retain the optimized default;
+    /// accuracy/release harnesses opt into LLE at registration.
+    static GRAPHICS_TASK_EXECUTION_POLICY: Cell<GraphicsTaskExecutionPolicy> =
+        const { Cell::new(GraphicsTaskExecutionPolicy::HleOptimized) };
     /// The rdram buffer length the registered backend should treat as
     /// valid, set once by `set_render_backend`'s caller. Needed because
     /// `osSpTaskYielded_recomp` only receives a raw `*mut u8` (matching
@@ -1144,6 +1912,9 @@ thread_local! {
     /// `GFX_RENDER_NOTE`'s doc comment for why this isn't surfaced as a
     /// MIPS-side fault instead).
     static RENDER_LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The scheduler owns only this opaque token and immutable task identity;
+    /// renderer-local stacks/state remain behind `RenderBackend`.
+    static HLE_RENDER_CONTINUATION: RefCell<Option<HleRenderContinuation>> = const { RefCell::new(None) };
 
     /// The single registered audio backend, if the shell/harness has called
     /// `set_audio_backend`. Finished samples enter it at
@@ -1169,6 +1940,7 @@ thread_local! {
     pub(crate) static AUDIO_PCM_DUMPED: Cell<bool> = const { Cell::new(false) };
     static AUDIO_PCM_STREAM_DUMP: RefCell<Option<AudioStreamDump>> = const { RefCell::new(None) };
     pub(crate) static AUDIO_OUTPUT_STATS: Cell<AudioOutputStats> = const { Cell::new(AudioOutputStats::new()) };
+    static AUDIO_DIGEST_CAPTURE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
 
     /// Coarse wall-time attribution for the rs-lane OoT performance harness.
     /// Kept behind an environment flag so ordinary execution pays no
@@ -1181,6 +1953,141 @@ thread_local! {
     pub(crate) static GFX_CALLS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_CALLS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HleRenderContinuationPhase {
+    Running,
+    Suspended,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HleRenderContinuation {
+    phase: HleRenderContinuationPhase,
+    token: fn64_render::RenderTaskContinuation,
+    task_addr: RdramAddr,
+    task: OsTaskHeader,
+    rdram: usize,
+    output_addr: u32,
+    dp_full_sync: fn64_render::DpFullSyncStatus,
+    completion_latency: u64,
+}
+
+fn merge_dp_full_sync(
+    prior: fn64_render::DpFullSyncStatus,
+    next: fn64_render::DpFullSyncStatus,
+    operation: &'static str,
+) -> fn64_render::DpFullSyncStatus {
+    match (prior, next) {
+        (_, fn64_render::DpFullSyncStatus::Unidentified) => {
+            panic!("{operation}: resumable renderer chunk did not identify DP FullSync state")
+        }
+        (fn64_render::DpFullSyncStatus::Reached, _)
+        | (_, fn64_render::DpFullSyncStatus::Reached) => fn64_render::DpFullSyncStatus::Reached,
+        _ => fn64_render::DpFullSyncStatus::NotReached,
+    }
+}
+
+fn retain_running_hle_continuation(
+    mut pending: HleRenderContinuation,
+    result: RenderChunkDispatchResult,
+    operation: &'static str,
+) {
+    let fn64_render::RenderTaskChunkStatus::Continue(token) = result.status else {
+        panic!("{operation}: internal continuation retention requires Continue")
+    };
+    assert_eq!(
+        result.chunking,
+        fn64_render::RenderTaskChunking::Resumable,
+        "{operation}: atomic backend returned a resumable continuation"
+    );
+    pending.token = token;
+    pending.phase = HleRenderContinuationPhase::Running;
+    pending.dp_full_sync = merge_dp_full_sync(pending.dp_full_sync, result.dp_full_sync, operation);
+    HLE_RENDER_CONTINUATION.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "{operation}: renderer continuation ownership is already occupied"
+        );
+        cell.replace(Some(pending));
+    });
+}
+
+/// Advance at most one committed HLE renderer chunk at a host scheduling
+/// boundary. Returning to the host after each `Continue` is what gives guest
+/// code a real interval in which to issue SIG0.
+pub(crate) fn advance_hle_render_task() {
+    let Some(mut pending) = HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take()) else {
+        return;
+    };
+    if pending.phase == HleRenderContinuationPhase::Suspended {
+        HLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
+        return;
+    }
+
+    // Interleaving closed here: renderer chunk A has committed and returned
+    // its owned continuation; guest CPU execution may then set SIG0 before
+    // host boundary B. B must observe SIG0 before consuming the token, or the
+    // next chunk would run past the sole representable yield boundary.
+    if crate::pi::live_sp_status() & fn64_runtime::SP_STATUS_YIELD != 0 {
+        pending.phase = HleRenderContinuationPhase::Suspended;
+        HLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
+        crate::pi::write_live_sp_status(fn64_runtime::SP_SET_YIELDED);
+        crate::pi::finish_live_rcp_task(
+            rcp_completion_plan(pending.dp_full_sync, "chunk-boundary HLE yield"),
+            pending.completion_latency,
+        )
+        .unwrap_or_else(|error| panic!("chunk-boundary HLE yield completion: {error}"));
+        return;
+    }
+
+    let result = unsafe {
+        dispatch_gfx_task_chunk(
+            pending.rdram as *mut u8,
+            &pending.task,
+            fn64_render::RenderTaskStep::Resume(pending.token),
+            pending.output_addr,
+        )
+    };
+    match result.status {
+        fn64_render::RenderTaskChunkStatus::Continue(_) => {
+            pending.completion_latency = 1;
+            retain_running_hle_continuation(pending, result, "resume HLE chunk")
+        }
+        fn64_render::RenderTaskChunkStatus::Complete => {
+            let full_sync = merge_dp_full_sync(
+                pending.dp_full_sync,
+                result.dp_full_sync,
+                "complete HLE chunk",
+            );
+            crate::pi::finish_live_rcp_task(
+                rcp_completion_plan(full_sync, "complete HLE chunk"),
+                1,
+            )
+            .unwrap_or_else(|error| panic!("complete HLE chunk completion: {error}"));
+            retire_running_rsp_task_lineage(pending.task_addr, "complete HLE chunk");
+        }
+        fn64_render::RenderTaskChunkStatus::Yielded => {
+            assert_ne!(
+                result.dp_full_sync,
+                fn64_render::DpFullSyncStatus::Reached,
+                "cooperatively yielded HLE chunk cannot also complete DP FullSync"
+            );
+            crate::pi::write_live_sp_status(fn64_runtime::SP_SET_YIELDED);
+            crate::pi::finish_live_rcp_task(fn64_runtime::RcpTaskCompletionPlan::SpOnly, 1)
+                .unwrap_or_else(|error| panic!("cooperative HLE chunk completion: {error}"));
+        }
+        fn64_render::RenderTaskChunkStatus::NeedsLle { .. } => {
+            panic!("resumed HLE continuation requested LLE after committing an earlier chunk")
+        }
+    }
+}
+
+pub(crate) fn hle_render_needs_progress() -> bool {
+    HLE_RENDER_CONTINUATION.with(|cell| {
+        cell.borrow()
+            .is_some_and(|pending| pending.phase == HleRenderContinuationPhase::Running)
+    })
 }
 
 /// Aggregate evidence from real `osAiSetNextBuffer` submissions.
@@ -1221,6 +2128,21 @@ pub fn audio_frames_remaining() -> Option<u32> {
 
 pub fn audio_output_stats() -> AudioOutputStats {
     AUDIO_OUTPUT_STATS.with(Cell::get)
+}
+
+/// Begin or end deterministic capture of guest PCM at the AI boundary.
+/// Enabling clears an earlier capture; disabling releases its storage.
+pub fn set_audio_digest_capture(enabled: bool) {
+    AUDIO_DIGEST_CAPTURE.with(|cell| {
+        *cell.borrow_mut() = enabled.then(Vec::new);
+    });
+}
+
+/// Copy the pre-resample stereo s16le stream accumulated since capture began.
+/// `None` distinguishes a host that did not request audio evidence from a
+/// requested, exercised capture that legitimately contains zero bytes.
+pub fn copy_audio_digest_bytes() -> Option<Vec<u8>> {
+    AUDIO_DIGEST_CAPTURE.with(|cell| cell.borrow().clone())
 }
 
 pub fn audio_stream_health() -> Option<fn64_audio::AudioStreamHealth> {
@@ -1324,16 +2246,46 @@ pub fn last_audio_error() -> Option<String> {
 }
 
 /// Register the graphics backend `osSpTaskStartGo_recomp` dispatches
-/// `M_GFXTASK` submissions to, and the rdram buffer length it may safely
-/// read (`rdram_len` must match the actual backing buffer's size -- a
-/// mismatch here is a caller bug, not something this function can check
-/// given it only stores a length, not the buffer itself). Mirrors
+/// `M_GFXTASK` submissions to, and the RDRAM buffer length it may safely
+/// read. The host must separately call [`crate::register_process_rdram`] (or
+/// [`crate::boot_thread0`], which performs that registration) before the
+/// first VI retrace. `rdram_len` must match that allocation's size; a mismatch
+/// is a caller bug. Mirrors
 /// `set_audio_ucode_fn`'s "the shell wires this once at startup" shape,
 /// generalized to a trait object since a graphics backend is stateful
-/// (unlike a single ucode function pointer).
+/// (unlike a single ucode function pointer). This compatibility entry point
+/// intentionally selects [`GraphicsTaskExecutionPolicy::HleOptimized`]; a
+/// caller making an accuracy claim must use [`set_render_backend_with_policy`]
+/// and opt in explicitly.
 pub fn set_render_backend(backend: Box<dyn RenderBackend>, rdram_len: usize) {
+    set_render_backend_with_policy(
+        backend,
+        rdram_len,
+        GraphicsTaskExecutionPolicy::HleOptimized,
+    );
+}
+
+/// Register a graphics backend and choose how graphics microcode executes.
+///
+/// Use [`GraphicsTaskExecutionPolicy::LleAccuracy`] for release/parity evidence
+/// that must execute the ROM's loaded RSP program rather than an HLE model.
+/// [`set_render_backend`] intentionally preserves the historical optimized
+/// policy for interactive shells and callers whose performance contract has
+/// not opted into LLE.
+pub fn set_render_backend_with_policy(
+    backend: Box<dyn RenderBackend>,
+    rdram_len: usize,
+    policy: GraphicsTaskExecutionPolicy,
+) {
+    HLE_RENDER_CONTINUATION.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "set_render_backend_with_policy: cannot replace a backend that owns an HLE continuation"
+        );
+    });
     RENDER_BACKEND.with(|cell| cell.replace(Some(backend)));
     RDRAM_LEN.with(|cell| cell.set(rdram_len));
+    GRAPHICS_TASK_EXECUTION_POLICY.with(|cell| cell.set(policy));
 }
 
 /// The most recent registered backend's `process_task` error, if the last
@@ -1342,6 +2294,54 @@ pub fn set_render_backend(backend: Box<dyn RenderBackend>, rdram_len: usize) {
 /// observability hook -- see `set_render_backend`'s doc comment.
 pub fn last_render_error() -> Option<String> {
     RENDER_LAST_ERROR.with(|cell| cell.borrow().clone())
+}
+
+/// Capture the registered backend's most recent completed presentation for a
+/// fixed-cycle release report. This deliberately goes through the owned
+/// `RenderBackend` seam: a host neither downcasts the backend nor reaches into
+/// RT64 after registration. Unsupported capture and a missing presentation
+/// remain typed errors.
+pub fn capture_render_release_frame(
+) -> Result<fn64_render::RenderReleaseCapture, fn64_render::RenderError> {
+    if HLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_some()) {
+        return Err(fn64_render::RenderError::Backend {
+            backend: "render-release-capture",
+            reason: "an HLE renderer continuation is still live".into(),
+        });
+    }
+    RENDER_BACKEND.with(|cell| {
+        let mut registered = cell.borrow_mut();
+        let backend = registered
+            .as_mut()
+            .ok_or(fn64_render::RenderError::NotReady(
+                "capture_render_release_frame: no render backend registered",
+            ))?;
+        let result = backend.release_capture();
+        RENDER_LAST_ERROR.with(|last| {
+            last.replace(result.as_ref().err().map(ToString::to_string));
+        });
+        result
+    })
+}
+
+/// Snapshot the concrete registered backend and graphics execution policy.
+/// The backend self-reports through the trait object; callers cannot attach a
+/// separate label after registration.
+pub fn render_environment_evidence_snapshot() -> RenderEnvironmentEvidenceSnapshot {
+    assert!(
+        HLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_none()),
+        "render environment evidence cannot omit a live HLE renderer continuation"
+    );
+    let backend = RENDER_BACKEND.with(|cell| {
+        cell.borrow().as_ref().map_or(
+            fn64_render::RenderBackendEvidence::Unidentified,
+            |backend| backend.release_environment(),
+        )
+    });
+    RenderEnvironmentEvidenceSnapshot {
+        backend,
+        execution_policy: GRAPHICS_TASK_EXECUTION_POLICY.with(Cell::get),
+    }
 }
 
 /// Real translated audio-ucode function signature. Matches RSPRecomp's
@@ -1361,28 +2361,6 @@ thread_local! {
     /// that -- `osSpTaskYielded_recomp` treats that as "can't actually run
     /// the ucode" (see its doc comment), never a silent substitute.
     static AUDIO_UCODE_FN: Cell<Option<AudioUcodeFn>> = const { Cell::new(None) };
-
-    /// Opt-in: run `M_AUDTASK`s through `dispatch_lle_task` -- the SAME
-    /// clean-room RSP interpreter replay every non-catalog gfx task already
-    /// takes -- instead of `dispatch_audio_task`'s registered-function path.
-    /// This executes the game's real, in-ROM audio ucode instruction by
-    /// instruction against guest RDRAM, so the CPU-side sound driver
-    /// observes the genuine mixer/sequence state the RSP wrote (a harness
-    /// with no linkable translated ucode otherwise runs a stand-in that
-    /// writes nothing, starving any driver handshake that reads RSP
-    /// output). Off by default: existing tests/hosts that submit synthetic
-    /// audio tasks with no real admitted ucode must keep the
-    /// count-but-don't-run behavior. Set via `set_audio_task_lle` or env
-    /// `FN64_AUDIO_LLE=1`.
-    static AUDIO_TASK_LLE: Cell<bool> =
-        Cell::new(std::env::var_os("FN64_AUDIO_LLE").is_some());
-}
-
-/// Route `M_AUDTASK`s through the clean-room RSP LLE interpreter (see
-/// `AUDIO_TASK_LLE`'s doc comment). Host-facing seam, same shape as
-/// `set_audio_ucode_fn`.
-pub fn set_audio_task_lle(enabled: bool) {
-    AUDIO_TASK_LLE.with(|cell| cell.set(enabled));
 }
 
 /// Register the real translated audio ucode function. Called once by the
@@ -1451,6 +2429,176 @@ unsafe fn write_os_task_word(rdram: *mut u8, base: usize, field: usize, value: u
     };
 }
 
+fn loaded_rsp_task_from_header(task_addr: RdramAddr, header: OsTaskHeader) -> LoadedRspTask {
+    let resumed_data_identity = if header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
+        let lineage = with_host(|host| host.rsp_task_lineages.get(&task_addr.offset()).copied())
+            .unwrap_or_else(|| {
+                panic!(
+                    "osSpTaskLoad_recomp: yielded RSP task {:#010x} has no retained task lineage",
+                    task_addr.offset()
+                )
+            });
+        assert_eq!(
+            lineage.phase,
+            RspTaskLineagePhase::ResumeAuthorized,
+            "osSpTaskLoad_recomp: yielded RSP task {:#010x} has no unused resume authorization (phase {:?})",
+            task_addr.offset(),
+            lineage.phase,
+        );
+        assert_eq!(
+            header,
+            lineage.yielded_header(),
+            "osSpTaskLoad_recomp: yielded RSP task {:#010x} does not match its retained task lineage",
+            task_addr.offset()
+        );
+        lineage.data_identity
+    } else {
+        None
+    };
+    LoadedRspTask {
+        task_addr,
+        header,
+        resumed_data_identity,
+    }
+}
+
+fn retain_loaded_rsp_task(loaded: LoadedRspTask) {
+    with_host(|host| {
+        if let Some(replaced) = host.loaded_rsp_task.take() {
+            let remove_replaced_lineage = host
+                .rsp_task_lineages
+                .get(&replaced.task_addr.offset())
+                .is_some_and(|lineage| lineage.phase == RspTaskLineagePhase::ResumeLoaded);
+            if remove_replaced_lineage {
+                host.rsp_task_lineages.remove(&replaced.task_addr.offset());
+            }
+        }
+        if loaded.header.flags & fn64_runtime::OS_TASK_YIELDED == 0 {
+            host.rsp_task_lineages.remove(&loaded.task_addr.offset());
+        } else {
+            let lineage = host
+                .rsp_task_lineages
+                .get_mut(&loaded.task_addr.offset())
+                .expect("yielded loaded task lineage was validated before SP admission");
+            assert_eq!(
+                lineage.phase,
+                RspTaskLineagePhase::ResumeAuthorized,
+                "osSpTaskLoad_recomp: yielded RSP task {:#010x} consumed a stale resume authorization",
+                loaded.task_addr.offset()
+            );
+            lineage.phase = RspTaskLineagePhase::ResumeLoaded;
+        }
+        // RSP has one admitted task image. A later successful Load replaces
+        // that image and therefore replaces the sole unconsumed token too.
+        host.loaded_rsp_task = Some(loaded);
+    });
+}
+
+fn take_loaded_rsp_task(task_addr: RdramAddr) -> LoadedRspTask {
+    with_host(|host| {
+        let loaded = host.loaded_rsp_task.as_ref().unwrap_or_else(|| {
+            panic!(
+                "osSpTaskStartGo_recomp: task {:#010x} has no unconsumed osSpTaskLoad admission",
+                task_addr.offset()
+            )
+        });
+        assert_eq!(
+            loaded.task_addr, task_addr,
+            "osSpTaskStartGo_recomp: task {:#010x} does not own the loaded RSP task token for {:#010x}",
+            task_addr.offset(),
+            loaded.task_addr.offset()
+        );
+        host.loaded_rsp_task
+            .take()
+            .expect("loaded RSP task was present above")
+    })
+}
+
+fn retain_started_rsp_task_lineage(
+    loaded: LoadedRspTask,
+    data_identity: Option<TaskMicrocodeDataIdentity>,
+) {
+    with_host(|host| {
+        let running = host
+            .rsp_task_lineages
+            .iter()
+            .find_map(|(&task_offset, lineage)| {
+                (lineage.phase == RspTaskLineagePhase::Running).then_some(task_offset)
+            });
+        assert!(
+            running.is_none(),
+            "osSpTaskStartGo_recomp: task {:#010x} cannot start while task {:#010x} owns the Running RSP lineage",
+            loaded.task_addr.offset(),
+            running.unwrap_or_default(),
+        );
+        if loaded.header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
+            let lineage = host
+                .rsp_task_lineages
+                .get_mut(&loaded.task_addr.offset())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "osSpTaskStartGo_recomp: yielded RSP task {:#010x} lost its retained task lineage",
+                        loaded.task_addr.offset()
+                    )
+                });
+            assert_eq!(
+                lineage.data_identity, data_identity,
+                "osSpTaskStartGo_recomp: yielded RSP task {:#010x} changed its original microcode-data identity",
+                loaded.task_addr.offset()
+            );
+            assert_eq!(
+                lineage.phase,
+                RspTaskLineagePhase::ResumeLoaded,
+                "osSpTaskStartGo_recomp: yielded RSP task {:#010x} does not own a loaded resume token",
+                loaded.task_addr.offset()
+            );
+            lineage.phase = RspTaskLineagePhase::Running;
+        } else {
+            let previous = host.rsp_task_lineages.insert(
+                loaded.task_addr.offset(),
+                RspTaskLineage {
+                    original_header: loaded.header,
+                    data_identity,
+                    phase: RspTaskLineagePhase::Running,
+                },
+            );
+            assert!(
+                previous.is_none(),
+                "osSpTaskStartGo_recomp: fresh RSP task {:#010x} unexpectedly retained an older lineage",
+                loaded.task_addr.offset()
+            );
+        }
+    });
+}
+
+fn retire_running_rsp_task_lineage(task_addr: RdramAddr, operation: &'static str) {
+    with_host(|host| {
+        let lineage = host
+            .rsp_task_lineages
+            .get(&task_addr.offset())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{operation}: task {:#010x} has no Running RSP lineage to retire",
+                    task_addr.offset()
+                )
+            });
+        assert_eq!(
+            lineage.phase,
+            RspTaskLineagePhase::Running,
+            "{operation}: task {:#010x} cannot retire RSP lineage phase {:?}",
+            task_addr.offset(),
+            lineage.phase,
+        );
+        host.rsp_task_lineages.remove(&task_addr.offset());
+    });
+}
+
+fn retire_rsp_task_lineage_after_synchronous_result(task_addr: RdramAddr, operation: &'static str) {
+    if crate::pi::live_sp_status() & fn64_runtime::SP_STATUS_YIELDED == 0 {
+        retire_running_rsp_task_lineage(task_addr, operation);
+    }
+}
+
 /// `osSpTaskLoad(OSSpTask *sptask)` -- performs the public RSP guide's
 /// CPU-side admission algorithm: with SP halted, copy the complete 64-byte
 /// `OSTask` to DMEM `0xfc0`, copy aligned rspboot bytes to IMEM `0`, and set
@@ -1467,24 +2615,79 @@ pub unsafe extern "C" fn osSpTaskLoad_recomp(rdram: *mut u8, ctx: *mut RecompCon
     let task_addr = RdramAddr::from_gpr(ctx.r4);
     let o = task_addr.offset() as usize;
     let header = unsafe { read_os_task_header(rdram, o) };
+    let loaded = loaded_rsp_task_from_header(task_addr, header);
     // A newly admitted task must not inherit either half of the preceding
     // task's yield handshake. In particular, stale SIG1 would make the next
     // `osSpTaskYielded` rewrite a task that actually completed normally.
     crate::pi::write_live_sp_status(fn64_runtime::SP_CLR_YIELD | fn64_runtime::SP_CLR_YIELDED);
-    unsafe { crate::pi::admit_live_sp_task(rdram, task_addr, header) }
+    let boot_size = aligned_sp_image_size(header.ucode_boot_size).unwrap_or_else(|| {
+        panic!(
+            "osSpTaskLoad_recomp: invalid rspboot size {:#x}",
+            header.ucode_boot_size
+        )
+    }) as usize;
+    let boot_addr = (header.ucode_boot & 0x1fff_ffff) & !7;
+    let memory = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    let boot = with_host(|host| {
+        let image = host.rsp_boot_images.entry(boot_addr).or_default();
+        for offset in image.len()..boot_size {
+            image.push(unsafe {
+                memory.read_u8(RdramAddr::from_offset(
+                    boot_addr
+                        .checked_add(offset as u32)
+                        .expect("rspboot cache address overflow"),
+                ))
+            });
+        }
+        image[..boot_size].to_vec()
+    });
+    unsafe { crate::pi::admit_live_sp_task(rdram, task_addr, header, &boot) }
         .unwrap_or_else(|error| panic!("osSpTaskLoad_recomp: {error}"));
-    with_executor(|exec| exec.submit_task(header));
+    retain_loaded_rsp_task(loaded);
+    if std::env::var_os("RSP_TRACE_TASK").is_some() {
+        let memory = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+        let boot_word = unsafe {
+            memory.read_u32(fn64_runtime::RdramAddr::from_gpr(u64::from(
+                header.ucode_boot,
+            )))
+        };
+        let ucode_word =
+            unsafe { memory.read_u32(fn64_runtime::RdramAddr::from_gpr(u64::from(header.ucode))) };
+        let imem_words = with_host(|host| {
+            let imem = host
+                .device_fabric
+                .rsp_memory()
+                .bank(fn64_runtime::RspMemoryBank::Imem);
+            [
+                u32::from_be_bytes(imem[0..4].try_into().expect("one IMEM word")),
+                u32::from_be_bytes(imem[4..8].try_into().expect("one IMEM word")),
+            ]
+        });
+        eprintln!(
+            "[fn64-rsp-task] admit task={:#010x} type={} boot={:#010x}/size={:#x} \
+             word={boot_word:#010x} ucode={:#010x}/size={:#x} word={ucode_word:#010x} \
+             IMEM[0..8]={imem_words:08x?}",
+            task_addr.offset(),
+            header.task_type,
+            header.ucode_boot,
+            header.ucode_boot_size,
+            header.ucode,
+            header.ucode_size,
+        );
+    }
+    with_executor(|exec| exec.admit_task(header));
 }
 
 /// `osSpTaskStartGo(OSSpTask *sptask)` -- the actual RSP-kickoff half of
 /// the pair `osSpTaskLoad_recomp` above bookkeeps. `a0` = `ctx->r4` is the
 /// `OSTask*` (same pointer shape `osSpTaskLoad`/`osSpTaskYielded` read).
 ///
-/// This crate executes the admitted rspboot through its IMEM-DMA handoff,
-/// then runs the selected task's HLE effect (audio ucode call or gfx backend
-/// dispatch) synchronously while the shim owns the guest. Its externally
-/// visible completion is scheduled separately, with the measured rspboot
-/// instruction count included in SP latency. What a real
+/// This crate classifies boot-overlay versus direct-IMEM admission. It either
+/// executes rspboot through its IMEM-DMA handoff or enters the already-loaded
+/// image at PC zero, then runs the selected task effect (audio HLE, or the
+/// graphics policy's HLE/LLE ucode phase) synchronously while the shim owns
+/// the guest. Its externally visible completion is scheduled separately, with
+/// measured pre-ucode work included in SP latency. What a real
 /// `osSpTaskStartGo` DOES have that this stub was missing: kicking the RSP
 /// eventually raises the SP-done interrupt (and, for a task that drives the
 /// RDP to a `DPFullSync`, the DP-done interrupt), which libultra delivers
@@ -1519,83 +2722,272 @@ pub unsafe extern "C" fn osSpTaskLoad_recomp(rdram: *mut u8, ctx: *mut RecompCon
 pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &*ctx };
     let task_addr = RdramAddr::from_gpr(ctx.r4);
+    let loaded = take_loaded_rsp_task(task_addr);
     let o = task_addr.offset() as usize;
-    let header = unsafe { read_os_task_header(rdram, o) };
+    let header = loaded.header;
     let is_gfx = header.task_type == M_GFXTASK;
+    let recognition_header = if header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
+        with_host(|host| {
+            host.rsp_task_lineages
+                .get(&task_addr.offset())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "osSpTaskStartGo_recomp: yielded RSP task {:#010x} lost its original microcode identity header",
+                        task_addr.offset()
+                    )
+                })
+                .original_header
+        })
+    } else {
+        header
+    };
+    let authoritative_microcode_family = if is_gfx {
+        unsafe { classify_task_microcode_family(rdram, &recognition_header) }
+    } else {
+        None
+    };
+    // Hash fresh task data at the actual kickoff boundary using only the
+    // address/size admitted by Load. A yielded token owns the original
+    // identity directly and never hashes its rewritten yield buffer.
+    let initial_microcode_data = if is_gfx {
+        Some(loaded.resumed_data_identity.unwrap_or_else(|| unsafe {
+            task_microcode_data_identity(
+                rdram,
+                task_addr,
+                header.ucode_data,
+                header.ucode_data_size,
+            )
+        }))
+    } else {
+        None
+    };
+    retain_started_rsp_task_lineage(loaded, initial_microcode_data);
+    with_executor(|exec| exec.start_task(header));
 
-    // Kicking the RSP is where the HLE task effect runs, so the work happens
-    // here -- this is the path OoT uses (Load then
+    // Kicking the RSP is where the selected task effect runs, so the work
+    // happens here -- this is the path OoT uses (Load then
     // StartGo, never the yield path) for BOTH its gfx and its audio tasks.
     // Dispatch before scheduling completion so the work is done by the time
     // the scheduler is woken. A graphics task rasterizes; an audio task
     // runs its registered ucode + forwards samples (previously dispatched only
     // from the never-taken yield path -- same latent bug the gfx path hit).
-    let boot = if is_gfx || header.task_type == M_AUDTASK {
-        let boot = unsafe { dispatch_hle_rspboot(rdram) };
-        assert_eq!(
-            boot.task.task_type, header.task_type,
-            "RSP rspboot changed OSTask type from {} to {}; HLE selection is no longer valid",
-            header.task_type, boot.task.task_type
-        );
-        Some(boot)
+    let mut hle_entry = if is_gfx || header.task_type == M_AUDTASK {
+        Some(match admitted_task_image_shape(&header) {
+            AdmittedTaskImageShape::BootOverlay => {
+                let boot = unsafe { dispatch_hle_rspboot(rdram, task_addr) };
+                assert_eq!(
+                    boot.task.task_type, header.task_type,
+                    "RSP rspboot changed OSTask type from {} to {}; HLE selection is no longer valid",
+                    header.task_type, boot.task.task_type
+                );
+                AdmittedHleEntry::BootOverlay(Box::new(boot))
+            }
+            // osSpTaskLoad has already installed this complete image at IMEM
+            // zero and reset PC to zero. Executing it as rspboot would consume
+            // the ucode's legitimate terminal BREAK while waiting for an IMEM
+            // DMA generation that this admission shape does not require.
+            AdmittedTaskImageShape::DirectImem => AdmittedHleEntry::DirectImem { task: header },
+        })
     } else {
         None
     };
-    let hle_header = boot.map_or(header, |boot| boot.task);
-    let needs_dp = if is_gfx {
-        let status = unsafe { dispatch_gfx_task(rdram, &hle_header) };
-        match status {
-            fn64_render::FrameStatus::Complete => true,
-            fn64_render::FrameStatus::Yielded => {
-                crate::pi::write_live_sp_status(fn64_runtime::SP_SET_YIELDED);
-                false
+    let hle_header = hle_entry.as_ref().map_or(header, AdmittedHleEntry::task);
+    let dp_full_sync = if is_gfx
+        && GRAPHICS_TASK_EXECUTION_POLICY.with(Cell::get)
+            == GraphicsTaskExecutionPolicy::LleAccuracy
+    {
+        let entry = hle_entry
+            .take()
+            .expect("gfx accuracy LLE requires an admitted HLE entry");
+        let pre_ucode_steps = entry.pre_ucode_steps();
+        let microcode_data = initial_microcode_data
+            .expect("gfx accuracy LLE requires admitted microcode-data identity");
+        let lle = unsafe {
+            dispatch_lle_task(
+                rdram,
+                task_addr,
+                true,
+                entry.into_lle_machine_state(),
+                Some(microcode_data),
+                authoritative_microcode_family,
+            )
+        };
+        crate::pi::start_live_rcp_task_with_latency(
+            rcp_completion_plan(lle.dp_full_sync, "gfx accuracy LLE"),
+            pre_ucode_steps.saturating_add(lle.steps),
+        )
+        .unwrap_or_else(|error| {
+            panic!("osSpTaskStartGo_recomp gfx accuracy LLE completion: {error}")
+        });
+        retire_rsp_task_lineage_after_synchronous_result(task_addr, "gfx accuracy LLE");
+        return;
+    } else if is_gfx {
+        let retained = HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take());
+        let (step, output_addr, prior_full_sync, resumed_internal) = match retained {
+            Some(pending) => {
+                assert_eq!(
+                    pending.phase,
+                    HleRenderContinuationPhase::Suspended,
+                    "osSpTaskStartGo_recomp: cannot start while an HLE continuation is running"
+                );
+                assert_eq!(
+                    pending.task_addr, task_addr,
+                    "osSpTaskStartGo_recomp: yielded task address does not own the retained renderer continuation"
+                );
+                assert_ne!(
+                    hle_header.flags & fn64_runtime::OS_TASK_YIELDED,
+                    0,
+                    "osSpTaskStartGo_recomp: retained renderer continuation requires OS_TASK_YIELDED"
+                );
+                assert_eq!(
+                    (hle_header.ucode_data, hle_header.ucode_data_size),
+                    (pending.task.yield_data_ptr, pending.task.yield_data_size),
+                    "osSpTaskStartGo_recomp: yielded task buffer does not match retained continuation owner"
+                );
+                (
+                    fn64_render::RenderTaskStep::Resume(pending.token),
+                    pending.output_addr,
+                    pending.dp_full_sync,
+                    true,
+                )
             }
-            fn64_render::FrameStatus::NeedsLle { .. } => {
+            None => (
+                fn64_render::RenderTaskStep::Start,
+                render_output_addr(),
+                fn64_render::DpFullSyncStatus::NotReached,
+                false,
+            ),
+        };
+        let chunk_completion_latency = hle_entry
+            .as_ref()
+            .expect("gfx HLE chunk requires an admitted entry")
+            .pre_ucode_steps()
+            .saturating_add(1);
+        let result = unsafe { dispatch_gfx_task_chunk(rdram, &hle_header, step, output_addr) };
+        match result.status {
+            fn64_render::RenderTaskChunkStatus::Complete => {
+                merge_dp_full_sync(prior_full_sync, result.dp_full_sync, "complete HLE task")
+            }
+            fn64_render::RenderTaskChunkStatus::Continue(token) => {
+                crate::pi::begin_live_rcp_task().unwrap_or_else(|error| {
+                    panic!("osSpTaskStartGo_recomp chunked HLE admission: {error}")
+                });
+                retain_running_hle_continuation(
+                    HleRenderContinuation {
+                        phase: HleRenderContinuationPhase::Running,
+                        token,
+                        task_addr,
+                        task: hle_header,
+                        rdram: rdram as usize,
+                        output_addr,
+                        dp_full_sync: prior_full_sync,
+                        completion_latency: chunk_completion_latency,
+                    },
+                    result,
+                    if resumed_internal {
+                        "resume HLE task"
+                    } else {
+                        "start HLE task"
+                    },
+                );
+                return;
+            }
+            fn64_render::RenderTaskChunkStatus::Yielded => {
+                assert_ne!(
+                    result.dp_full_sync,
+                    fn64_render::DpFullSyncStatus::Reached,
+                    "yielded HLE graphics task cannot also report completed DP FullSync"
+                );
+                crate::pi::write_live_sp_status(fn64_runtime::SP_SET_YIELDED);
+                fn64_render::DpFullSyncStatus::NotReached
+            }
+            fn64_render::RenderTaskChunkStatus::NeedsLle { ucode_sha256 } => {
+                assert!(
+                    !resumed_internal,
+                    "resumed HLE continuation requested LLE after committing an earlier chunk"
+                );
+                let mut digest = String::with_capacity(64);
+                for byte in ucode_sha256 {
+                    use std::fmt::Write as _;
+                    write!(&mut digest, "{byte:02x}").expect("writing to String cannot fail");
+                }
+                fn64_runtime::record_unsupported_event(
+                    fn64_runtime::UnsupportedSubsystem::Render,
+                    "render.hle-ucode.needs-lle",
+                    format!("microcode_sha256={digest}"),
+                    Some(fn64_runtime::Cycles::new(crate::sim_time())),
+                    fn64_runtime::UnsupportedDisposition::NeedsLle,
+                );
                 // The renderer's preflight is transactional, so persistent
-                // state is still exactly the post-rspboot ucode entry. Run
-                // the complete ucode phase through LLE; attempting a
-                // mid-HLE transplant would fabricate scalar/VU registers.
-                let lle = unsafe { dispatch_lle_task(rdram) };
-                let boot_steps = boot.expect("gfx LLE fallback requires rspboot").steps;
+                // state is still exactly the classified ucode entry. Run the
+                // complete phase through LLE with the boot snapshot or the
+                // untouched direct PC-zero state; this is task-entry
+                // continuation, not a fabricated mid-HLE transplant.
+                let entry = hle_entry
+                    .take()
+                    .expect("gfx LLE fallback requires an admitted HLE entry");
+                let pre_ucode_steps = entry.pre_ucode_steps();
+                let microcode_data = initial_microcode_data
+                    .expect("gfx LLE fallback requires admitted microcode-data identity");
+                let lle = unsafe {
+                    dispatch_lle_task(
+                        rdram,
+                        task_addr,
+                        true,
+                        entry.into_lle_machine_state(),
+                        Some(microcode_data),
+                        authoritative_microcode_family,
+                    )
+                };
                 crate::pi::start_live_rcp_task_with_latency(
-                    lle.needs_dp,
-                    boot_steps.saturating_add(lle.steps),
+                    rcp_completion_plan(lle.dp_full_sync, "gfx LLE fallback"),
+                    pre_ucode_steps.saturating_add(lle.steps),
                 )
                 .unwrap_or_else(|error| {
                     panic!("osSpTaskStartGo_recomp gfx LLE completion: {error}")
                 });
+                retire_rsp_task_lineage_after_synchronous_result(task_addr, "gfx LLE fallback");
                 return;
             }
         }
     } else if header.task_type == M_AUDTASK {
-        if AUDIO_TASK_LLE.with(Cell::get) {
-            // Honest fallback parity with gfx: replay the game's real audio
-            // ucode through the RSP interpreter (see `AUDIO_TASK_LLE`).
-            // rspboot already ran above, so persistent RSP state is at the
-            // ucode entry -- exactly the state `dispatch_lle_task` continues.
-            let lle = unsafe { dispatch_lle_task(rdram) };
-            let boot_steps = boot.expect("audio LLE requires rspboot").steps;
-            crate::pi::start_live_rcp_task_with_latency(
-                lle.needs_dp,
-                boot_steps.saturating_add(lle.steps),
-            )
-            .unwrap_or_else(|error| {
-                panic!("osSpTaskStartGo_recomp audio LLE completion: {error}")
-            });
-            return;
-        }
         unsafe { dispatch_audio_task(rdram, o, &hle_header) };
-        false
+        fn64_render::DpFullSyncStatus::NotReached
     } else {
-        let lle = unsafe { dispatch_lle_task(rdram) };
-        crate::pi::start_live_rcp_task_with_latency(lle.needs_dp, lle.steps)
-            .unwrap_or_else(|error| panic!("osSpTaskStartGo_recomp LLE completion: {error}"));
+        let lle = unsafe { dispatch_lle_task(rdram, task_addr, false, None, None, None) };
+        crate::pi::start_live_rcp_task_with_latency(
+            rcp_completion_plan(lle.dp_full_sync, "custom-task LLE"),
+            lle.steps,
+        )
+        .unwrap_or_else(|error| panic!("osSpTaskStartGo_recomp LLE completion: {error}"));
+        retire_rsp_task_lineage_after_synchronous_result(task_addr, "custom-task LLE");
         return;
     };
 
-    let boot_steps = boot.expect("known HLE task must execute rspboot").steps;
-    crate::pi::start_live_rcp_task_with_latency(needs_dp, boot_steps.saturating_add(1))
-        .unwrap_or_else(|error| panic!("osSpTaskStartGo_recomp: {error}"));
+    let pre_ucode_steps = hle_entry
+        .expect("known HLE task must have an admitted entry")
+        .pre_ucode_steps();
+    crate::pi::start_live_rcp_task_with_latency(
+        rcp_completion_plan(dp_full_sync, "known HLE task"),
+        pre_ucode_steps.saturating_add(1),
+    )
+    .unwrap_or_else(|error| panic!("osSpTaskStartGo_recomp: {error}"));
+    retire_rsp_task_lineage_after_synchronous_result(task_addr, "known HLE task");
+}
+
+fn rcp_completion_plan(
+    dp_full_sync: fn64_render::DpFullSyncStatus,
+    operation: &'static str,
+) -> fn64_runtime::RcpTaskCompletionPlan {
+    match dp_full_sync {
+        fn64_render::DpFullSyncStatus::Reached => {
+            fn64_runtime::RcpTaskCompletionPlan::SpThenDpFullSync
+        }
+        fn64_render::DpFullSyncStatus::NotReached => fn64_runtime::RcpTaskCompletionPlan::SpOnly,
+        fn64_render::DpFullSyncStatus::Unidentified => {
+            panic!("{operation}: renderer completed without identifying DP FullSync state")
+        }
+    }
 }
 
 /// `osSpTaskYield(void)` -- signals the RSP to yield its current task back
@@ -1623,12 +3015,33 @@ mod tests {
     use fn64_render::{FrameStatus, RenderConfig, RenderError, UcodeId};
     use fn64_runtime::RecvMesgOutcome;
 
+    macro_rules! no_rust_hidden_sidecar {
+        () => {
+            fn observe_non_rdp_write16(
+                &mut self,
+                _write: fn64_render::NonRdpWrite16,
+            ) -> fn64_render::NonRdpWrite16Disposition {
+                fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+            }
+        };
+    }
+
+    fn prepare_renderer_rdram(rdram: &mut Vec<u8>) {
+        rdram.resize(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE, 0);
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+    }
+
     struct StatusRenderBackend(FrameStatus);
 
     impl RenderBackend for StatusRenderBackend {
         fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
             Ok(())
         }
+
+        no_rust_hidden_sidecar!();
 
         fn process_task(
             &mut self,
@@ -1640,7 +3053,18 @@ mod tests {
             Ok(self.0)
         }
 
-        fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+        fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
+            if self.0 == FrameStatus::Complete {
+                fn64_render::DpFullSyncStatus::Reached
+            } else {
+                fn64_render::DpFullSyncStatus::NotReached
+            }
+        }
+
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), RenderError> {
             Ok(())
         }
 
@@ -1649,6 +3073,207 @@ mod tests {
         fn supported_ucodes(&self) -> &[UcodeId] {
             &[]
         }
+    }
+
+    struct UnsupportedUcodeBackend;
+
+    impl RenderBackend for UnsupportedUcodeBackend {
+        fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        no_rust_hidden_sidecar!();
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            Err(RenderError::UnsupportedUcode {
+                ucode_addr: task.ucode,
+            })
+        }
+
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[UcodeId] {
+            &[]
+        }
+    }
+
+    struct ExactIdentityBackend {
+        admitted: [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        admitted_data: fn64_render::MicrocodeDataImageIdentity,
+        family: UcodeId,
+    }
+
+    impl RenderBackend for ExactIdentityBackend {
+        fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        no_rust_hidden_sidecar!();
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            _task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            Ok(FrameStatus::Complete)
+        }
+
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn identify_microcode(
+            &self,
+            imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        ) -> Option<UcodeId> {
+            (imem == &self.admitted).then_some(self.family)
+        }
+
+        fn identify_microcode_pair(
+            &self,
+            imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+            data: fn64_render::MicrocodeDataImageIdentity,
+        ) -> Option<UcodeId> {
+            (imem == &self.admitted && data == self.admitted_data).then_some(self.family)
+        }
+
+        fn supported_ucodes(&self) -> &[UcodeId] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn generated_c_kseg1_same_value_halfword_keeps_visible_bytes_and_renderer_sidecar_coherent() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct WriteCaptureBackend {
+            write: Rc<Cell<Option<fn64_render::NonRdpWrite16>>>,
+            hidden_bits: Rc<Cell<Option<u8>>>,
+        }
+
+        impl RenderBackend for WriteCaptureBackend {
+            fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn observe_non_rdp_write16(
+                &mut self,
+                write: fn64_render::NonRdpWrite16,
+            ) -> fn64_render::NonRdpWrite16Disposition {
+                self.write.set(Some(write));
+                self.hidden_bits
+                    .set(Some(if write.value() & 1 == 0 { 0 } else { 3 }));
+                fn64_render::NonRdpWrite16Disposition::AppliedHiddenSidecar
+            }
+
+            fn process_task(
+                &mut self,
+                _rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+            ) -> Result<FrameStatus, RenderError> {
+                Ok(FrameStatus::Complete)
+            }
+
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn supported_ucodes(&self) -> &[UcodeId] {
+                &[]
+            }
+        }
+
+        RENDER_BACKEND.with(|cell| cell.replace(None));
+        assert_eq!(observe_non_rdp_write16(0x40, 0x1235), None);
+
+        let captured = Rc::new(Cell::new(None));
+        let hidden_bits = Rc::new(Cell::new(None));
+        set_render_backend(
+            Box::new(WriteCaptureBackend {
+                write: captured.clone(),
+                hidden_bits: hidden_bits.clone(),
+            }),
+            0x100,
+        );
+        let mut visible = vec![0u8; 0x100];
+        fn64_runtime::RdramViewMut::from_storage(&mut visible)
+            .write_u16(fn64_runtime::RdramAddr::from_offset(0x40), 0x1235);
+        crate::fn64_c_rdram_write(0xffff_ffff_a000_0040, 2, 0x1235);
+        let write = captured
+            .get()
+            .expect("generated-C SH event was not delivered");
+        assert_eq!(write.logical_offset().offset(), 0x40);
+        assert_eq!(write.value(), 0x1235);
+        assert_eq!(
+            fn64_runtime::RdramView::from_storage(&visible)
+                .read_u16(fn64_runtime::RdramAddr::from_offset(0x40)),
+            0x1235
+        );
+        assert_eq!(hidden_bits.get(), Some(3));
+
+        // A second identical assignment is still a distinct architectural
+        // write and must be delivered rather than suppressed by equality.
+        captured.set(None);
+        crate::fn64_c_rdram_write(0xffff_ffff_a000_0040, 2, 0x1235);
+        assert_eq!(captured.get(), Some(write));
+        assert_eq!(hidden_bits.get(), Some(3));
+    }
+
+    #[test]
+    fn generated_c_rdram_callback_rejects_mapped_aliases() {
+        assert_eq!(
+            crate::generated_c_rdram_physical_offset(0xffff_ffff_8000_0040),
+            Some(0x40)
+        );
+        assert_eq!(
+            crate::generated_c_rdram_physical_offset(0xffff_ffff_a000_0040),
+            Some(0x40)
+        );
+        assert_eq!(
+            crate::generated_c_rdram_physical_offset(0x0000_0000_8000_0040),
+            Some(0x40)
+        );
+        assert_eq!(
+            crate::generated_c_rdram_physical_offset(0x0000_0000_a000_0040),
+            Some(0x40)
+        );
+        assert_eq!(crate::generated_c_rdram_physical_offset(0x40), None);
+        assert_eq!(
+            crate::generated_c_rdram_physical_offset(0xffff_ffff_c000_0040),
+            None
+        );
+        assert_eq!(
+            crate::generated_c_rdram_physical_offset(0x0000_0001_8000_0040),
+            None
+        );
     }
 
     fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -1668,6 +3293,8 @@ mod tests {
                 Ok(())
             }
 
+            no_rust_hidden_sidecar!();
+
             fn process_task(
                 &mut self,
                 _rdram: &mut [u8],
@@ -1681,7 +3308,10 @@ mod tests {
                 Ok(FrameStatus::Complete)
             }
 
-            fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
                 Ok(())
             }
 
@@ -1693,13 +3323,18 @@ mod tests {
         }
 
         let mut rdram = vec![0u8; 0x1000];
+        prepare_renderer_rdram(&mut rdram);
         set_render_backend(Box::new(RspMemoryBackend), rdram.len());
         let header = OsTaskHeader {
             task_type: fn64_runtime::M_GFXTASK,
             ..Default::default()
         };
         let status = unsafe { dispatch_gfx_task(rdram.as_mut_ptr(), &header) };
-        assert_eq!(status, FrameStatus::Complete);
+        assert_eq!(status.status, FrameStatus::Complete);
+        assert_eq!(
+            status.dp_full_sync,
+            fn64_render::DpFullSyncStatus::Unidentified
+        );
         with_host(|host| {
             assert_eq!(
                 host.device_fabric
@@ -1729,7 +3364,7 @@ mod tests {
             0x2404_0007,
             mtc0(4, 2),
             0x0800_0020,
-            0,
+            0x2407_7777,
         ];
         for (index, word) in boot.into_iter().enumerate() {
             let offset = boot_off + index * 4;
@@ -1763,6 +3398,299 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_backend_ucode_records_typed_event_before_loud_failure() {
+        set_render_backend(Box::new(UnsupportedUcodeBackend), 0);
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        let mut rdram = [];
+        let mut rsp_memory = fn64_runtime::RspMemory::new();
+        let task = fn64_render::OsTask {
+            ucode: 0x0012_3450,
+            ..Default::default()
+        };
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_render_backend::<FrameStatus>("unsupported_ucode_test", |backend| {
+                backend.process_task(&mut rdram, &mut rsp_memory, &task, 0)
+            });
+        }))
+        .expect_err("unsupported backend ucode must remain a loud failure");
+
+        assert!(
+            panic_message(panic.as_ref()).contains("unsupported ucode at rdram offset 0x00123450")
+        );
+        assert_eq!(
+            last_render_error().as_deref(),
+            Some("unsupported ucode at rdram offset 0x00123450")
+        );
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].subsystem,
+            fn64_runtime::UnsupportedSubsystem::Render
+        );
+        assert_eq!(events[0].operation, "render.backend.unsupported-ucode");
+        assert_eq!(
+            events[0].context,
+            "unsupported_ucode_test: backend rejected unlisted microcode at RDRAM offset 0x00123450"
+        );
+        assert_eq!(events[0].guest_cycle, Some(fn64_runtime::Cycles::ZERO));
+        assert_eq!(
+            events[0].disposition,
+            fn64_runtime::UnsupportedDisposition::LoudTrap
+        );
+        fn64_runtime::complete_unsupported_observation(fn64_runtime::Cycles::ZERO, &"0".repeat(64));
+        RENDER_BACKEND.with(|cell| cell.replace(None));
+    }
+
+    #[test]
+    fn release_capture_crosses_the_owned_renderer_seam_without_downcasting() {
+        struct CaptureBackend;
+
+        impl RenderBackend for CaptureBackend {
+            fn release_environment(&self) -> fn64_render::RenderBackendEvidence {
+                fn64_render::RenderBackendEvidence::Rt64 {
+                    tv_type: fn64_runtime::TvType::Pal,
+                    backend_identity: "synthetic-release-backend".to_string(),
+                    source_authoritative: true,
+                    graphics_api: fn64_render::ActiveRenderGraphicsApi::Vulkan,
+                    settings_sha256: [0x5a; 32],
+                    replacement_packs_active: false,
+                }
+            }
+
+            fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            no_rust_hidden_sidecar!();
+
+            fn process_task(
+                &mut self,
+                _rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+            ) -> Result<FrameStatus, RenderError> {
+                Ok(FrameStatus::Complete)
+            }
+
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn release_capture(
+                &mut self,
+            ) -> Result<fn64_render::RenderReleaseCapture, RenderError> {
+                Ok(fn64_render::RenderReleaseCapture {
+                    guest_cycle: 0x1234,
+                    backend_identity: "synthetic-release-backend".to_string(),
+                    source_authoritative: true,
+                    settings_sha256: [0x5a; 32],
+                    width: 2,
+                    height: 1,
+                    row_bytes: 8,
+                    format: fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm,
+                    workload_id: std::num::NonZeroU64::new(5).unwrap(),
+                    present_id: 7,
+                    bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                })
+            }
+
+            fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn supported_ucodes(&self) -> &[UcodeId] {
+                &[]
+            }
+        }
+
+        set_render_backend(Box::new(CaptureBackend), 0);
+        let capture = capture_render_release_frame().unwrap();
+        assert_eq!(capture.guest_cycle, 0x1234);
+        assert_eq!(capture.backend_identity, "synthetic-release-backend");
+        assert!(capture.source_authoritative);
+        assert_eq!(capture.workload_id.get(), 5);
+        assert_eq!(capture.settings_sha256, [0x5a; 32]);
+        assert_eq!(capture.present_id, 7);
+        assert_eq!(capture.bytes, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(last_render_error(), None);
+        assert_eq!(
+            render_environment_evidence_snapshot(),
+            RenderEnvironmentEvidenceSnapshot {
+                backend: fn64_render::RenderBackendEvidence::Rt64 {
+                    tv_type: fn64_runtime::TvType::Pal,
+                    backend_identity: "synthetic-release-backend".to_string(),
+                    source_authoritative: true,
+                    graphics_api: fn64_render::ActiveRenderGraphicsApi::Vulkan,
+                    settings_sha256: [0x5a; 32],
+                    replacement_packs_active: false,
+                },
+                execution_policy: GraphicsTaskExecutionPolicy::HleOptimized,
+            }
+        );
+        assert_eq!(
+            render_environment_evidence_snapshot().renderer_tv_type(),
+            Some(fn64_runtime::TvType::Pal)
+        );
+    }
+
+    #[test]
+    fn unidentified_renderer_snapshot_cannot_fabricate_tv_authority() {
+        set_render_backend(Box::new(StatusRenderBackend(FrameStatus::Complete)), 0);
+        let snapshot = render_environment_evidence_snapshot();
+        assert_eq!(
+            snapshot.backend,
+            fn64_render::RenderBackendEvidence::Unidentified
+        );
+        assert_eq!(snapshot.renderer_tv_type(), None);
+    }
+
+    #[test]
+    fn rsp_visibility_excludes_host_only_address_windows() {
+        assert_eq!(
+            rsp_visible_rdram_len(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE + 0x2490_0000),
+            fn64_runtime::rdram::DEFAULT_RDRAM_SIZE
+        );
+        assert_eq!(rsp_visible_rdram_len(0x1000), 0x1000);
+
+        let (ranges, snapshot_len) = rsp_dma_storage_layout(
+            fn64_runtime::rdram::DEFAULT_RDRAM_SIZE + 0x2000,
+            std::iter::once(0x80_0000..0x80_1000).collect(),
+        );
+        assert_eq!(
+            ranges,
+            vec![
+                0..fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+                0x80_0000..0x80_1000
+            ]
+        );
+        assert_eq!(snapshot_len, 0x80_1000);
+    }
+
+    #[test]
+    fn renderer_entries_expose_exact_physical_rdram_and_its_last_byte() {
+        use std::rc::Rc;
+
+        crate::load_rom(Vec::new());
+
+        struct SpanBackend(Rc<RefCell<Vec<(usize, u8)>>>);
+
+        impl RenderBackend for SpanBackend {
+            fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            no_rust_hidden_sidecar!();
+
+            fn process_task(
+                &mut self,
+                rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+            ) -> Result<FrameStatus, RenderError> {
+                self.0
+                    .borrow_mut()
+                    .push((rdram.len(), *rdram.last().unwrap()));
+                Ok(FrameStatus::Complete)
+            }
+
+            fn process_rdp_commands(
+                &mut self,
+                rdram: &mut [u8],
+                _start: u32,
+                _end: u32,
+                _output_addr: u32,
+            ) -> Result<FrameStatus, RenderError> {
+                self.0
+                    .borrow_mut()
+                    .push((rdram.len(), *rdram.last().unwrap()));
+                Ok(FrameStatus::Complete)
+            }
+
+            fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
+                fn64_render::DpFullSyncStatus::NotReached
+            }
+
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn supported_ucodes(&self) -> &[UcodeId] {
+                &[]
+            }
+        }
+
+        let physical_len = fn64_runtime::rdram::DEFAULT_RDRAM_SIZE;
+        let mut allocation = vec![0u8; physical_len + 0x2000];
+        allocation[physical_len - 1] = 0xa5;
+        allocation[physical_len] = 0x5a;
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        set_render_backend(
+            Box::new(SpanBackend(Rc::clone(&observations))),
+            allocation.len(),
+        );
+
+        let header = OsTaskHeader {
+            task_type: fn64_runtime::M_GFXTASK,
+            ..Default::default()
+        };
+        unsafe {
+            dispatch_gfx_task(allocation.as_mut_ptr(), &header);
+            dispatch_raw_rdp(allocation.as_mut_ptr(), 0, 8);
+        }
+
+        assert_eq!(observations.borrow().as_slice(), [(physical_len, 0xa5); 2]);
+        assert_eq!(allocation[physical_len], 0x5a);
+        assert_eq!(
+            copy_rsp_rdp_observations()
+                .into_iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![RspRdpObservationKind::DramDpcCommitted {
+                start: 0,
+                end: 8,
+                command_sha256: canonical_rdp_words_sha256(&[0, 0]),
+            }]
+        );
+    }
+
+    #[test]
+    fn renderer_entry_rejects_a_registration_shorter_than_physical_rdram() {
+        let mut allocation = [0u8; 1];
+        set_render_backend(
+            Box::new(StatusRenderBackend(FrameStatus::Complete)),
+            allocation.len(),
+        );
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            dispatch_gfx_task(allocation.as_mut_ptr(), &OsTaskHeader::default())
+        }))
+        .expect_err("a short renderer registration must trap before constructing a slice");
+        assert!(panic_message(panic.as_ref()).contains("does not cover the required 8 MiB"));
+    }
+
+    #[test]
+    fn completed_renderer_without_dp_full_sync_evidence_traps() {
+        let panic = std::panic::catch_unwind(|| {
+            rcp_completion_plan(
+                fn64_render::DpFullSyncStatus::Unidentified,
+                "synthetic completed renderer",
+            )
+        })
+        .expect_err("successful graphics completion must identify FullSync state");
+        assert!(panic_message(panic.as_ref()).contains(
+            "synthetic completed renderer: renderer completed without identifying DP FullSync state"
+        ));
+    }
+
+    #[test]
     fn every_renderer_entry_traps_and_records_a_backend_error() {
         set_render_backend(Box::new(StatusRenderBackend(FrameStatus::Complete)), 0);
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1780,6 +3708,23 @@ mod tests {
             last_render_error().as_deref(),
             Some("synthetic backend error: deliberate failure")
         );
+    }
+
+    #[test]
+    fn rejected_raw_dpc_does_not_enter_the_committed_observation_history() {
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        set_render_backend(
+            Box::new(StatusRenderBackend(FrameStatus::Complete)),
+            rdram.len(),
+        );
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            dispatch_raw_rdp(rdram.as_mut_ptr(), 0, 8)
+        }));
+
+        assert!(rejected.is_err());
+        assert!(copy_rsp_rdp_observations().is_empty());
     }
 
     /// The rename is only honest if the retired spelling is LOUD: an unset var
@@ -1853,6 +3798,19 @@ mod tests {
             }
         }
         let prior_count = with_executor(|exec| exec.task_log().submissions().len());
+        crate::set_trace_enabled(true);
+        let prior_starts = crate::copy_trace()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    fn64_runtime::TraceKind::TaskSubmit {
+                        task_kind: fn64_runtime::TaskKind::Graphics,
+                        ucode,
+                    } if ucode == header.ucode
+                )
+            })
+            .count();
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + TASK_OFFSET as u64;
         unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
@@ -1880,6 +3838,59 @@ mod tests {
             assert_eq!(exec.task_log().submissions().len(), prior_count + 1);
             assert_eq!(exec.task_log().submissions().last(), Some(&header));
         });
+        assert_eq!(
+            crate::copy_trace()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        fn64_runtime::TraceKind::TaskSubmit {
+                            task_kind: fn64_runtime::TaskKind::Graphics,
+                            ucode,
+                        } if ucode == header.ucode
+                    )
+                })
+                .count(),
+            prior_starts,
+            "osSpTaskLoad admission cannot emit the StartGo-qualified TaskSubmit trace"
+        );
+    }
+
+    #[test]
+    fn repeated_task_load_uses_the_cpu_cached_rspboot_image_after_rsp_dma_writes() {
+        const HEADER: usize = 0x40;
+        let mut rdram = vec![0u8; 0x200];
+        rdram[HEADER..HEADER + 4].copy_from_slice(&fn64_runtime::M_GFXTASK.to_ne_bytes());
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + HEADER as u64;
+        with_host(|host| host.rsp_boot_images.clear());
+        admit_synthetic_hle_task(&mut rdram, HEADER, &mut ctx);
+        let boot_off = u32::from_ne_bytes(rdram[HEADER + 8..HEADER + 12].try_into().unwrap());
+        let original = with_host(|host| {
+            host.device_fabric
+                .rsp_memory()
+                .read_bytes(fn64_runtime::RspMemAddr::from_register(0x1000), 8)
+                .unwrap()
+        });
+
+        fn64_runtime::RdramViewMut::from_storage(&mut rdram)
+            .write_logical_bytes(RdramAddr::from_offset(boot_off), &[0; 8]);
+        unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
+
+        let mut physical = [0xff; 8];
+        fn64_runtime::RdramView::from_storage(&rdram)
+            .copy_logical_bytes(RdramAddr::from_offset(boot_off), &mut physical);
+        assert_eq!(physical, [0; 8], "the RSP's physical write stays visible");
+        with_host(|host| {
+            assert_eq!(
+                host.device_fabric
+                    .rsp_memory()
+                    .read_bytes(fn64_runtime::RspMemAddr::from_register(0x1000), 8)
+                    .unwrap(),
+                original,
+                "osSpTaskLoad must re-DMA the CPU-cached boot text"
+            );
+        });
     }
 
     #[test]
@@ -1897,7 +3908,9 @@ mod tests {
         }
         let generation_before = with_host(|host| host.device_fabric.rsp_memory().imem_generation());
 
-        let boot = unsafe { dispatch_hle_rspboot(rdram.as_mut_ptr()) };
+        let boot = unsafe {
+            dispatch_hle_rspboot(rdram.as_mut_ptr(), RdramAddr::from_offset(HEADER as u32))
+        };
 
         assert_eq!(boot.steps, 7);
         assert_eq!(boot.task.task_type, fn64_runtime::M_GFXTASK);
@@ -1948,7 +3961,7 @@ mod tests {
         });
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            dispatch_hle_rspboot(rdram.as_mut_ptr())
+            dispatch_hle_rspboot(rdram.as_mut_ptr(), RdramAddr::from_offset(HEADER as u32))
         }))
         .expect_err("rspboot BREAK before ucode must trap");
         assert!(panic_message(panic.as_ref())
@@ -1956,7 +3969,603 @@ mod tests {
     }
 
     #[test]
-    fn graphics_hle_fallback_replays_the_untouched_ucode_phase_through_lle() {
+    fn direct_imem_shape_requires_the_admitted_boot_copy_to_cover_the_ucode() {
+        let direct = OsTaskHeader {
+            ucode_boot: 0x8000_0200,
+            ucode_boot_size: 0x1000,
+            ucode: 0xA000_0200,
+            ucode_size: 0x1000,
+            ..Default::default()
+        };
+        assert_eq!(
+            admitted_task_image_shape(&direct),
+            AdmittedTaskImageShape::DirectImem
+        );
+        assert_eq!(
+            admitted_task_image_shape(&OsTaskHeader {
+                ucode_boot_size: 8,
+                ucode_size: 16,
+                ..direct
+            }),
+            AdmittedTaskImageShape::BootOverlay,
+            "equal pointers alone must not bypass rspboot when the admitted copy is incomplete"
+        );
+    }
+
+    #[test]
+    fn direct_imem_graphics_task_starts_lle_at_pc_zero_without_rspboot_overlay() {
+        const HEADER: usize = 0x40;
+        const IMAGE: usize = 0x100;
+        const DATA: u32 = 0x181;
+        const MUTATED_DATA: u32 = 0x1d1;
+        const INITIAL_DATA: [u8; 5] = [0x01, 0x23, 0x45, 0x67, 0x89];
+        const START_DATA: [u8; 5] = [0xfe, 0xdc, 0xba, 0x98, 0x76];
+        const MUTATED_DATA_BYTES: [u8; 3] = [0xaa, 0xbb, 0xcc];
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x220];
+        for (field, value) in [
+            (0x00, fn64_runtime::M_GFXTASK),
+            (0x08, 0x8000_0000 | IMAGE as u32),
+            (0x0c, 12),
+            (0x10, 0xA000_0000 | IMAGE as u32),
+            (0x14, 12),
+            (0x18, 0xA000_0000 | DATA),
+            (0x1c, INITIAL_DATA.len() as u32),
+        ] {
+            rdram[HEADER + field..HEADER + field + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        for (index, word) in [0x2408_1234u32, 0xac08_0100, 0x0000_000d]
+            .into_iter()
+            .enumerate()
+        {
+            let offset = IMAGE + index * 4;
+            rdram[offset..offset + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (offset, byte) in INITIAL_DATA.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(DATA + offset as u32), byte);
+            }
+        }
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+        prepare_renderer_rdram(&mut rdram);
+        set_render_backend_with_policy(
+            Box::new(StatusRenderBackend(FrameStatus::Complete)),
+            rdram.len(),
+            GraphicsTaskExecutionPolicy::LleAccuracy,
+        );
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + HEADER as u64;
+        let admitted_header = unsafe { read_os_task_header(rdram.as_mut_ptr(), HEADER) };
+        unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(
+            crate::host_evidence_snapshot().loaded_rsp_task,
+            Some(LoadedRspTaskEvidenceSnapshot {
+                task_offset: HEADER as u32,
+                header: admitted_header,
+                resumed_data_identity: None,
+            })
+        );
+        // StartGo hashes current bytes at the address/size admitted by Load.
+        // Mutating the CPU header to a second source must not change that
+        // admitted source, while mutation of source A's bytes remains visible.
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (offset, byte) in START_DATA.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(DATA + offset as u32), byte);
+            }
+            for (offset, byte) in MUTATED_DATA_BYTES.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(MUTATED_DATA + offset as u32), byte);
+            }
+        }
+        rdram[HEADER + 0x18..HEADER + 0x1c]
+            .copy_from_slice(&(0xA000_0000 | MUTATED_DATA).to_ne_bytes());
+        rdram[HEADER + 0x1c..HEADER + 0x20]
+            .copy_from_slice(&(MUTATED_DATA_BYTES.len() as u32).to_ne_bytes());
+        let expected_at = Cycles::new(sim_time());
+        let (imem_generation, expected_digest) = with_host(|host| {
+            let memory = host.device_fabric.rsp_memory();
+            (
+                memory.imem_generation(),
+                imem_sha256(memory.bank(fn64_runtime::RspMemoryBank::Imem)),
+            )
+        });
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+
+        let host_evidence = crate::host_evidence_snapshot();
+        assert_eq!(host_evidence.loaded_rsp_task, None);
+        assert!(
+            host_evidence.rsp_task_lineages.is_empty(),
+            "a synchronous normal completion must retire its Running lineage"
+        );
+
+        with_host(|host| {
+            let fabric = &host.device_fabric;
+            assert_eq!(
+                fabric
+                    .rsp_memory()
+                    .read_word(fn64_runtime::RspMemAddr::from_parts(
+                        fn64_runtime::RspMemoryBank::Dmem,
+                        0x100,
+                    ))
+                    .unwrap(),
+                0x0000_1234,
+                "direct-image LLE must execute the instruction at admitted IMEM PC zero"
+            );
+            assert!(fabric.snapshot().sp_busy);
+        });
+        assert_eq!(
+            copy_rsp_rdp_observations(),
+            vec![RspRdpObservationEvent {
+                at: expected_at,
+                kind: RspRdpObservationKind::MicrocodeRecognition {
+                    task_addr: RdramAddr::from_offset(HEADER as u32),
+                    imem_generation,
+                    text_sha256: expected_digest,
+                    data_addr: RdramAddr::from_offset(DATA),
+                    data_size: START_DATA.len() as u32,
+                    data_sha256: Sha256::digest(START_DATA).into(),
+                    family: None,
+                },
+            }]
+        );
+        crate::advance_virtual_time(3);
+    }
+
+    #[test]
+    fn yielded_resume_reuses_typed_original_data_lineage_until_rom_reset() {
+        const TASK: u32 = 0x40;
+        const ORIGINAL: u32 = 0x101;
+        const YIELD: u32 = 0x181;
+        const ORIGINAL_BYTES: [u8; 5] = [0x11, 0x22, 0x33, 0x44, 0x55];
+        const YIELD_BYTES: [u8; 5] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x200];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (offset, byte) in ORIGINAL_BYTES.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(ORIGINAL + offset as u32), byte);
+            }
+            for (offset, byte) in YIELD_BYTES.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(YIELD + offset as u32), byte);
+            }
+        }
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+        let task_addr = RdramAddr::from_offset(TASK);
+        let initial_header = OsTaskHeader {
+            task_type: M_GFXTASK,
+            ucode_data: 0x8000_0000 | ORIGINAL,
+            ucode_data_size: ORIGINAL_BYTES.len() as u32,
+            yield_data_ptr: 0xA000_0000 | YIELD,
+            yield_data_size: YIELD_BYTES.len() as u32,
+            ..Default::default()
+        };
+        let original = unsafe {
+            task_microcode_data_identity(
+                rdram.as_mut_ptr(),
+                task_addr,
+                initial_header.ucode_data,
+                initial_header.ucode_data_size,
+            )
+        };
+        with_host(|host| {
+            host.rsp_task_lineages.insert(
+                task_addr.offset(),
+                RspTaskLineage {
+                    original_header: initial_header,
+                    data_identity: Some(original),
+                    phase: RspTaskLineagePhase::ResumeAuthorized,
+                },
+            );
+        });
+
+        let resumed_header = OsTaskHeader {
+            flags: fn64_runtime::OS_TASK_YIELDED,
+            ucode_data: initial_header.yield_data_ptr,
+            ucode_data_size: initial_header.yield_data_size,
+            ..initial_header
+        };
+        let resumed = loaded_rsp_task_from_header(task_addr, resumed_header);
+        assert_eq!(resumed.resumed_data_identity, Some(original));
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_task_lineages[0].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized
+        );
+        let yield_sha256: [u8; 32] = Sha256::digest(YIELD_BYTES).into();
+        assert_ne!(
+            resumed
+                .resumed_data_identity
+                .expect("yielded load retains data identity")
+                .sha256,
+            yield_sha256
+        );
+
+        retain_loaded_rsp_task(resumed);
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_task_lineages[0].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::ResumeLoaded
+        );
+        let replay =
+            std::panic::catch_unwind(|| loaded_rsp_task_from_header(task_addr, resumed_header))
+                .unwrap_err();
+        let replay_message = panic_message(replay.as_ref());
+        assert!(replay_message.contains("has no unused resume authorization"));
+
+        let loaded = take_loaded_rsp_task(task_addr);
+        retain_started_rsp_task_lineage(loaded, Some(original));
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_task_lineages[0].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::Running
+        );
+
+        crate::load_rom(Vec::new());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loaded_rsp_task_from_header(task_addr, resumed_header)
+        }))
+        .unwrap_err();
+        let message = panic_message(panic.as_ref());
+        assert!(message.contains("yielded RSP task 0x00000040 has no retained task lineage"));
+    }
+
+    #[test]
+    fn rom_reset_invalidates_unconsumed_loaded_task_authority() {
+        let task_addr = RdramAddr::from_offset(0x40);
+        retain_loaded_rsp_task(LoadedRspTask {
+            task_addr,
+            header: OsTaskHeader {
+                task_type: M_GFXTASK,
+                ..Default::default()
+            },
+            resumed_data_identity: None,
+        });
+        crate::load_rom(Vec::new());
+
+        let panic = std::panic::catch_unwind(|| take_loaded_rsp_task(task_addr)).unwrap_err();
+        let message = panic_message(panic.as_ref());
+        assert!(message.contains("has no unconsumed osSpTaskLoad admission"));
+        assert!(crate::host_evidence_snapshot().rsp_task_lineages.is_empty());
+    }
+
+    #[test]
+    fn loading_one_suspended_task_preserves_other_resume_authorizations() {
+        crate::load_rom(Vec::new());
+        let original = |yield_data_ptr| OsTaskHeader {
+            yield_data_ptr,
+            yield_data_size: 0x40,
+            ..Default::default()
+        };
+        let first_addr = RdramAddr::from_offset(0x40);
+        let second_addr = RdramAddr::from_offset(0x80);
+        let first = RspTaskLineage {
+            original_header: original(0x180),
+            data_identity: None,
+            phase: RspTaskLineagePhase::ResumeAuthorized,
+        };
+        let second = RspTaskLineage {
+            original_header: original(0x1c0),
+            data_identity: None,
+            phase: RspTaskLineagePhase::ResumeAuthorized,
+        };
+        with_host(|host| {
+            host.rsp_task_lineages.insert(first_addr.offset(), first);
+            host.rsp_task_lineages.insert(second_addr.offset(), second);
+        });
+
+        let loaded = loaded_rsp_task_from_header(first_addr, first.yielded_header());
+        retain_loaded_rsp_task(loaded);
+        let snapshot = crate::host_evidence_snapshot();
+        assert_eq!(snapshot.rsp_task_lineages.len(), 2);
+        assert_eq!(
+            snapshot.rsp_task_lineages[0].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::ResumeLoaded
+        );
+        assert_eq!(
+            snapshot.rsp_task_lineages[1].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized
+        );
+
+        let loaded = take_loaded_rsp_task(first_addr);
+        retain_started_rsp_task_lineage(loaded, None);
+        retire_running_rsp_task_lineage(first_addr, "multiple-suspended test completion");
+        let snapshot = crate::host_evidence_snapshot();
+        assert_eq!(snapshot.rsp_task_lineages.len(), 1);
+        assert_eq!(
+            snapshot.rsp_task_lineages[0].task_offset,
+            second_addr.offset()
+        );
+        assert_eq!(
+            snapshot.rsp_task_lineages[0].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized
+        );
+    }
+
+    #[test]
+    fn fresh_load_reuse_cancels_same_address_resume_authorization() {
+        crate::load_rom(Vec::new());
+        let task_addr = RdramAddr::from_offset(0x40);
+        with_host(|host| {
+            host.rsp_task_lineages.insert(
+                task_addr.offset(),
+                RspTaskLineage {
+                    original_header: OsTaskHeader {
+                        yield_data_ptr: 0x180,
+                        yield_data_size: 0x40,
+                        ..Default::default()
+                    },
+                    data_identity: None,
+                    phase: RspTaskLineagePhase::ResumeAuthorized,
+                },
+            );
+        });
+
+        retain_loaded_rsp_task(LoadedRspTask {
+            task_addr,
+            header: OsTaskHeader::default(),
+            resumed_data_identity: None,
+        });
+
+        assert!(crate::host_evidence_snapshot().rsp_task_lineages.is_empty());
+    }
+
+    #[test]
+    fn microcode_data_capture_rejects_out_of_bounds_task_range() {
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x100];
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+        let header = OsTaskHeader {
+            task_type: M_GFXTASK,
+            ucode_data: 0x8000_00ff,
+            ucode_data_size: 2,
+            ..Default::default()
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            task_microcode_data_identity(
+                rdram.as_mut_ptr(),
+                RdramAddr::from_offset(0x40),
+                header.ucode_data,
+                header.ucode_data_size,
+            )
+        }))
+        .unwrap_err();
+        let message = panic_message(panic.as_ref());
+        assert!(message.contains("microcode-data range [0x000000ff, 0x00000101)"));
+        assert!(message.contains("registered allocation length 0x100"));
+    }
+
+    #[test]
+    fn microcode_data_capture_uses_sp_dram_addr_high_alias() {
+        const DATA: u32 = 0x81;
+        const BYTES: [u8; 5] = [0x10, 0x32, 0x54, 0x76, 0x98];
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x100];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (offset, byte) in BYTES.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(DATA + offset as u32), byte);
+            }
+        }
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+
+        let identity = unsafe {
+            task_microcode_data_identity(
+                rdram.as_mut_ptr(),
+                RdramAddr::from_offset(0x40),
+                0xab00_0000 | DATA,
+                BYTES.len() as u32,
+            )
+        };
+
+        assert_eq!(identity.addr, RdramAddr::from_offset(DATA));
+        let expected_sha256: [u8; 32] = Sha256::digest(BYTES).into();
+        assert_eq!(identity.sha256, expected_sha256);
+    }
+
+    #[test]
+    fn microcode_data_capture_rejects_sparse_host_bytes_beyond_physical_rdram() {
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE + 0x100];
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            task_microcode_data_identity(
+                rdram.as_mut_ptr(),
+                RdramAddr::from_offset(0x40),
+                fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u32 - 1,
+                2,
+            )
+        }))
+        .unwrap_err();
+        let message = panic_message(panic.as_ref());
+        assert!(message.contains("microcode-data range [0x007fffff, 0x00800001)"));
+        assert!(message.contains("exceeds physical RDRAM length 0x800000"));
+    }
+
+    #[test]
+    fn text_only_backend_identity_cannot_set_a_microcode_pair_family() {
+        struct TextOnlyBackend {
+            admitted: [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+        }
+
+        impl RenderBackend for TextOnlyBackend {
+            fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            no_rust_hidden_sidecar!();
+
+            fn process_task(
+                &mut self,
+                _rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+            ) -> Result<FrameStatus, RenderError> {
+                Ok(FrameStatus::Complete)
+            }
+
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn identify_microcode(
+                &self,
+                imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
+            ) -> Option<UcodeId> {
+                (imem == &self.admitted).then_some(UcodeId::F3dex2)
+            }
+
+            fn supported_ucodes(&self) -> &[UcodeId] {
+                &[]
+            }
+        }
+
+        let admitted = [0x5a; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let backend = TextOnlyBackend { admitted };
+        assert_eq!(backend.identify_microcode(&admitted), Some(UcodeId::F3dex2));
+        set_render_backend(Box::new(backend), fn64_runtime::rdram::DEFAULT_RDRAM_SIZE);
+        assert_eq!(
+            identify_microcode_pair(
+                &admitted,
+                TaskMicrocodeDataIdentity {
+                    addr: RdramAddr::from_offset(0x100),
+                    size: 3,
+                    sha256: Sha256::digest([1, 2, 3]).into(),
+                },
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pinned_family_authority_fills_absent_backend_identity_and_rejects_conflict() {
+        let imem = [0x5a; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let data = TaskMicrocodeDataIdentity {
+            addr: RdramAddr::from_offset(0x100),
+            size: 3,
+            sha256: Sha256::digest([1, 2, 3]).into(),
+        };
+        set_render_backend(
+            Box::new(StatusRenderBackend(FrameStatus::Complete)),
+            fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        );
+        assert_eq!(
+            identify_microcode_pair(&imem, data, Some(UcodeId::F3dzex2)),
+            Some(UcodeId::F3dzex2)
+        );
+
+        set_render_backend(
+            Box::new(ExactIdentityBackend {
+                admitted: imem,
+                admitted_data: fn64_render::MicrocodeDataImageIdentity {
+                    bytes: data.size,
+                    sha256: data.sha256,
+                },
+                family: UcodeId::F3dex2,
+            }),
+            fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        );
+        let panic = std::panic::catch_unwind(|| {
+            identify_microcode_pair(&imem, data, Some(UcodeId::F3dzex2))
+        })
+        .unwrap_err();
+        assert!(panic_message(panic.as_ref()).contains("backend pair catalog claimed F3dex2"));
+    }
+
+    #[test]
+    fn lle_microcode_recognition_requires_the_backends_exact_text_data_pair() {
+        const HEADER: usize = 0x40;
+        const IMAGE: usize = 0x100;
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x200];
+        for (field, value) in [
+            (0x00, fn64_runtime::M_GFXTASK),
+            (0x08, 0x8000_0000 | IMAGE as u32),
+            (0x0c, 12),
+            (0x10, 0xA000_0000 | IMAGE as u32),
+            (0x14, 12),
+        ] {
+            rdram[HEADER + field..HEADER + field + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        for (index, word) in [0x2408_4321u32, 0xac08_0100, 0x0000_000d]
+            .into_iter()
+            .enumerate()
+        {
+            let offset = IMAGE + index * 4;
+            rdram[offset..offset + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        prepare_renderer_rdram(&mut rdram);
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + HEADER as u64;
+        unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        let (admitted, imem_generation) = with_host(|host| {
+            let memory = host.device_fabric.rsp_memory();
+            (
+                *memory.bank(fn64_runtime::RspMemoryBank::Imem),
+                memory.imem_generation(),
+            )
+        });
+        let expected_digest = imem_sha256(&admitted);
+        let expected_at = Cycles::new(sim_time());
+        set_render_backend_with_policy(
+            Box::new(ExactIdentityBackend {
+                admitted,
+                admitted_data: fn64_render::MicrocodeDataImageIdentity {
+                    bytes: 0,
+                    sha256: Sha256::digest([]).into(),
+                },
+                family: UcodeId::F3dzex2,
+            }),
+            rdram.len(),
+            GraphicsTaskExecutionPolicy::LleAccuracy,
+        );
+
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+
+        assert_eq!(
+            copy_rsp_rdp_observations(),
+            vec![RspRdpObservationEvent {
+                at: expected_at,
+                kind: RspRdpObservationKind::MicrocodeRecognition {
+                    task_addr: RdramAddr::from_offset(HEADER as u32),
+                    imem_generation,
+                    text_sha256: expected_digest,
+                    data_addr: RdramAddr::from_offset(0),
+                    data_size: 0,
+                    data_sha256: Sha256::digest([]).into(),
+                    family: Some(UcodeId::F3dzex2),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn graphics_hle_unsupported_fallback_records_then_replays_untouched_ucode_through_lle() {
         const HEADER: usize = 0x40;
         let mut rdram = vec![0u8; 0x200];
         rdram[HEADER..HEADER + 4].copy_from_slice(&fn64_runtime::M_GFXTASK.to_ne_bytes());
@@ -1965,7 +4574,7 @@ mod tests {
         admit_synthetic_hle_task(&mut rdram, HEADER, &mut ctx);
         let ucode_off =
             u32::from_ne_bytes(rdram[HEADER + 0x10..HEADER + 0x14].try_into().unwrap()) as usize;
-        for (index, word) in [0x2405_5678u32, 0xac05_0100].into_iter().enumerate() {
+        for (index, word) in [0x2405_5678u32, 0xac07_0100].into_iter().enumerate() {
             let offset = ucode_off + index * 4;
             rdram[offset..offset + 4].copy_from_slice(&word.to_ne_bytes());
         }
@@ -1978,14 +4587,25 @@ mod tests {
                 )
                 .unwrap();
         });
+        prepare_renderer_rdram(&mut rdram);
         set_render_backend(
             Box::new(StatusRenderBackend(FrameStatus::NeedsLle {
                 ucode_sha256: [0; 32],
             })),
             rdram.len(),
         );
+        fn64_runtime::arm_unsupported_events(None).unwrap();
 
         unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+
+        let unsupported = fn64_runtime::copy_unsupported_events();
+        assert_eq!(unsupported.len(), 1);
+        assert!(unsupported[0].operation.starts_with("render.hle-ucode."));
+        assert_eq!(
+            unsupported[0].disposition,
+            fn64_runtime::UnsupportedDisposition::NeedsLle
+        );
+        assert_eq!(unsupported[0].guest_cycle, Some(fn64_runtime::Cycles::ZERO));
 
         with_host(|host| {
             let fabric = &host.device_fabric;
@@ -1997,7 +4617,8 @@ mod tests {
                         0x100,
                     ))
                     .unwrap(),
-                0x0000_5678
+                0x0000_7777,
+                "LLE fallback must retain the rspboot jump-delay scalar register state"
             );
             assert_eq!(fabric.sp_pc(), 0x88);
             assert!(
@@ -2008,16 +4629,24 @@ mod tests {
     }
 
     #[test]
-    fn graphics_hle_fallback_forwards_lle_dpc_submissions() {
+    fn graphics_lle_accuracy_policy_forwards_raw_dpc_without_hle_dispatch() {
         use std::cell::RefCell;
         use std::rc::Rc;
 
-        struct LleDpcBackend(Rc<RefCell<Vec<(u32, u32, u32)>>>);
+        crate::load_rom(Vec::new());
+
+        type DpcCall = (u32, u32, u32, u32);
+        struct LleDpcBackend {
+            hle_calls: Rc<Cell<u32>>,
+            dpc_calls: Rc<RefCell<Vec<DpcCall>>>,
+        }
 
         impl RenderBackend for LleDpcBackend {
             fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
                 Ok(())
             }
+
+            no_rust_hidden_sidecar!();
 
             fn process_task(
                 &mut self,
@@ -2026,27 +4655,37 @@ mod tests {
                 _task: &fn64_render::OsTask,
                 _output_addr: u32,
             ) -> Result<FrameStatus, RenderError> {
-                Ok(FrameStatus::NeedsLle {
-                    ucode_sha256: [0; 32],
-                })
+                self.hle_calls.set(self.hle_calls.get() + 1);
+                Ok(FrameStatus::Complete)
             }
 
             fn process_rdp_commands(
                 &mut self,
-                _rdram: &mut [u8],
+                rdram: &mut [u8],
                 start: u32,
                 end: u32,
                 output_addr: u32,
             ) -> Result<FrameStatus, RenderError> {
-                self.0.borrow_mut().push((start, end, output_addr));
+                let first = fn64_runtime::RdramView::from_storage(rdram)
+                    .read_u32(fn64_runtime::RdramAddr::from_offset(start));
+                self.dpc_calls
+                    .borrow_mut()
+                    .push((start, end, output_addr, first));
                 Ok(FrameStatus::Complete)
             }
 
-            fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
                 Ok(())
             }
 
             fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
+                fn64_render::DpFullSyncStatus::Reached
+            }
 
             fn supported_ucodes(&self) -> &[UcodeId] {
                 &[]
@@ -2057,9 +4696,24 @@ mod tests {
         const DPC_START: u32 = 0x180;
         const DPC_END: u32 = 0x188;
         const VI_OUTPUT: u32 = 0x100;
+        const MICROCODE_DATA: u32 = 0x1a1;
+        const MICROCODE_DATA_BYTES: [u8; 5] = [0x13, 0x57, 0x9b, 0xdf, 0x24];
         let mtc0 = |rt: u32, rd: u32| (0x10 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11);
         let mut rdram = vec![0u8; 0x200];
+        rdram[DPC_START as usize..DPC_START as usize + 4]
+            .copy_from_slice(&0xe900_0000u32.to_ne_bytes());
+        rdram[DPC_START as usize + 4..DPC_END as usize].copy_from_slice(&0u32.to_ne_bytes());
         rdram[HEADER..HEADER + 4].copy_from_slice(&fn64_runtime::M_GFXTASK.to_ne_bytes());
+        rdram[HEADER + 0x18..HEADER + 0x1c]
+            .copy_from_slice(&(0xA000_0000 | MICROCODE_DATA).to_ne_bytes());
+        rdram[HEADER + 0x1c..HEADER + 0x20]
+            .copy_from_slice(&(MICROCODE_DATA_BYTES.len() as u32).to_ne_bytes());
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (offset, byte) in MICROCODE_DATA_BYTES.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(MICROCODE_DATA + offset as u32), byte);
+            }
+        }
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + HEADER as u64;
         admit_synthetic_hle_task(&mut rdram, HEADER, &mut ctx);
@@ -2091,9 +4745,15 @@ mod tests {
             }
         });
         let submissions = Rc::new(RefCell::new(Vec::new()));
-        set_render_backend(
-            Box::new(LleDpcBackend(Rc::clone(&submissions))),
+        let hle_calls = Rc::new(Cell::new(0));
+        prepare_renderer_rdram(&mut rdram);
+        set_render_backend_with_policy(
+            Box::new(LleDpcBackend {
+                hle_calls: Rc::clone(&hle_calls),
+                dpc_calls: Rc::clone(&submissions),
+            }),
             rdram.len(),
+            GraphicsTaskExecutionPolicy::LleAccuracy,
         );
         let mut vi_ctx = ctx_zeroed();
         vi_ctx.r4 = u64::from(0x8000_0000 | VI_OUTPUT);
@@ -2101,11 +4761,145 @@ mod tests {
 
         unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
 
-        assert_eq!(*submissions.borrow(), vec![(DPC_START, DPC_END, VI_OUTPUT)]);
+        let submissions = submissions.borrow();
+        assert_eq!(
+            hle_calls.get(),
+            0,
+            "LLE accuracy policy must not offer graphics microcode to HLE"
+        );
+        assert_eq!(submissions.len(), 1);
+        let (start, end, output, first) = submissions[0];
+        assert_eq!(end - start, DPC_END - DPC_START);
+        assert_eq!(output, VI_OUTPUT);
+        assert_eq!(first, 0xe900_0000);
         with_host(|host| {
             let snapshot = host.device_fabric.snapshot();
             assert!(snapshot.sp_busy);
             assert!(snapshot.dp_busy);
+        });
+        let observations = copy_rsp_rdp_observations();
+        assert_eq!(observations.len(), 3);
+        let microcode_data_sha256: [u8; 32] = Sha256::digest(MICROCODE_DATA_BYTES).into();
+        let replacement_generation = match &observations[0].kind {
+            RspRdpObservationKind::ImemReplacementCommitted {
+                task_addr,
+                imem_generation,
+                ..
+            } => {
+                assert_eq!(*task_addr, RdramAddr::from_offset(HEADER as u32));
+                *imem_generation
+            }
+            ref other => panic!("expected rspboot replacement first, got {other:?}"),
+        };
+        assert!(matches!(
+            &observations[1].kind,
+            RspRdpObservationKind::MicrocodeRecognition {
+                task_addr,
+                imem_generation,
+                data_addr,
+                data_size,
+                data_sha256,
+                family: None,
+                ..
+            } if *task_addr == RdramAddr::from_offset(HEADER as u32)
+                && *imem_generation == replacement_generation
+                && *data_addr == RdramAddr::from_offset(MICROCODE_DATA)
+                && *data_size == MICROCODE_DATA_BYTES.len() as u32
+                && *data_sha256 == microcode_data_sha256
+        ));
+        assert_eq!(
+            observations[2].kind,
+            RspRdpObservationKind::DramDpcCommitted {
+                start: DPC_START,
+                end: DPC_END,
+                command_sha256: canonical_rdp_words_sha256(&[0xe900_0000, 0]),
+            }
+        );
+    }
+
+    #[test]
+    fn graphics_hle_optimized_policy_remains_explicitly_selectable() {
+        use std::rc::Rc;
+
+        struct CountingHleBackend(Rc<Cell<u32>>);
+
+        impl RenderBackend for CountingHleBackend {
+            fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            no_rust_hidden_sidecar!();
+
+            fn process_task(
+                &mut self,
+                _rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+            ) -> Result<FrameStatus, RenderError> {
+                self.0.set(self.0.get() + 1);
+                Ok(FrameStatus::Complete)
+            }
+
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
+                fn64_render::DpFullSyncStatus::NotReached
+            }
+
+            fn supported_ucodes(&self) -> &[UcodeId] {
+                &[]
+            }
+        }
+
+        const HEADER: usize = 0x40;
+        let mut rdram = vec![0u8; 0x200];
+        rdram[HEADER..HEADER + 4].copy_from_slice(&fn64_runtime::M_GFXTASK.to_ne_bytes());
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + HEADER as u64;
+        admit_synthetic_hle_task(&mut rdram, HEADER, &mut ctx);
+        let ucode_off =
+            u32::from_ne_bytes(rdram[HEADER + 0x10..HEADER + 0x14].try_into().unwrap()) as usize;
+        for (index, word) in [0x2405_5678u32, 0xac05_0100].into_iter().enumerate() {
+            let offset = ucode_off + index * 4;
+            rdram[offset..offset + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        let calls = Rc::new(Cell::new(0));
+        prepare_renderer_rdram(&mut rdram);
+        set_render_backend_with_policy(
+            Box::new(CountingHleBackend(Rc::clone(&calls))),
+            rdram.len(),
+            GraphicsTaskExecutionPolicy::HleOptimized,
+        );
+
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+
+        assert_eq!(calls.get(), 1);
+        with_host(|host| {
+            let snapshot = host.device_fabric.snapshot();
+            assert!(snapshot.sp_busy);
+            assert!(
+                !snapshot.dp_busy,
+                "an HLE graphics task without FullSync must schedule SP only"
+            );
+            assert_eq!(
+                host.device_fabric
+                    .rsp_memory()
+                    .read_word(fn64_runtime::RspMemAddr::from_parts(
+                        fn64_runtime::RspMemoryBank::Dmem,
+                        0x100,
+                    ))
+                    .unwrap(),
+                0,
+                "optimized HLE must retain the loaded ucode behind its backend boundary"
+            );
         });
     }
 
@@ -2126,13 +4920,22 @@ mod tests {
                 .unwrap();
         });
 
-        let result = unsafe { dispatch_lle_task(rdram.as_mut_ptr()) };
+        let result = unsafe {
+            dispatch_lle_task(
+                rdram.as_mut_ptr(),
+                RdramAddr::from_offset(0),
+                false,
+                None,
+                None,
+                None,
+            )
+        };
 
         assert_eq!(
             result,
             LleTaskResult {
                 steps: 3,
-                needs_dp: false
+                dp_full_sync: fn64_render::DpFullSyncStatus::NotReached,
             }
         );
         with_host(|host| {
@@ -2175,6 +4978,11 @@ mod tests {
         });
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + HEADER as u64;
+        retain_loaded_rsp_task(LoadedRspTask {
+            task_addr: RdramAddr::from_offset(HEADER as u32),
+            header: OsTaskHeader::default(),
+            resumed_data_identity: None,
+        });
 
         unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
 
@@ -2198,7 +5006,50 @@ mod tests {
     }
 
     #[test]
+    fn two_consecutive_normal_tasks_retire_running_lineage_without_yield_query() {
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x1000];
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+            let program = [0x0000_000du32];
+            let bytes: Vec<u8> = program.into_iter().flat_map(u32::to_be_bytes).collect();
+            host.device_fabric
+                .rsp_memory_mut()
+                .write_bytes(
+                    fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0),
+                    &bytes,
+                )
+                .unwrap();
+        });
+        let mut ctx = ctx_zeroed();
+
+        for task_offset in [0x40, 0x80] {
+            crate::pi::set_live_sp_pc(0);
+            let task_addr = RdramAddr::from_offset(task_offset);
+            retain_loaded_rsp_task(LoadedRspTask {
+                task_addr,
+                header: OsTaskHeader::default(),
+                resumed_data_identity: None,
+            });
+            ctx.r4 = 0x8000_0000 + u64::from(task_offset);
+
+            unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+
+            assert!(
+                crate::host_evidence_snapshot().rsp_task_lineages.is_empty(),
+                "normal task {task_offset:#x} must retire before another task starts"
+            );
+            let deadline = crate::next_device_deadline().expect("normal task completion deadline");
+            crate::advance_virtual_time(deadline);
+        }
+    }
+
+    #[test]
     fn unknown_task_lle_resolves_rspboot_style_imem_overlay_and_resumes() {
+        const DATA: u32 = 0x281;
+        const DATA_BYTES: [u8; 7] = [0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc];
+        crate::load_rom(Vec::new());
         let mtc0 = |rt: u32, rd: u32| (0x10 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11);
         let boot = [
             0x2402_0200u32,
@@ -2212,9 +5063,16 @@ mod tests {
         ];
         let overlay = [0u32, 0, 0, 0, 0, 0, 0x2405_5678, 0xAC05_0104];
         let mut rdram = vec![0u8; 0x1000];
+        prepare_renderer_rdram(&mut rdram);
         for (index, word) in overlay.into_iter().enumerate() {
             let offset = 0x200 + index * 4;
             rdram[offset..offset + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (offset, byte) in DATA_BYTES.into_iter().enumerate() {
+                view.write_u8(RdramAddr::from_offset(DATA + offset as u32), byte);
+            }
         }
         // The 32-byte DMA resumes at 0x1018; put BREAK in the still-existing
         // word immediately after the overlay transfer.
@@ -2236,15 +5094,50 @@ mod tests {
                 )
                 .unwrap();
         });
-        let generation_before = with_host(|host| host.device_fabric.rsp_memory().imem_generation());
+        let (generation_before, initial_digest) = with_host(|host| {
+            let memory = host.device_fabric.rsp_memory();
+            (
+                memory.imem_generation(),
+                imem_sha256(memory.bank(fn64_runtime::RspMemoryBank::Imem)),
+            )
+        });
+        set_render_backend_with_policy(
+            Box::new(StatusRenderBackend(FrameStatus::Complete)),
+            rdram.len(),
+            GraphicsTaskExecutionPolicy::LleAccuracy,
+        );
+        let expected_at = Cycles::new(sim_time());
 
-        let result = unsafe { dispatch_lle_task(rdram.as_mut_ptr()) };
+        let task_addr = RdramAddr::from_offset(0x40);
+        let task = OsTaskHeader {
+            ucode_data: 0x8000_0000 | DATA,
+            ucode_data_size: DATA_BYTES.len() as u32,
+            ..Default::default()
+        };
+        let microcode_data = unsafe {
+            task_microcode_data_identity(
+                rdram.as_mut_ptr(),
+                task_addr,
+                task.ucode_data,
+                task.ucode_data_size,
+            )
+        };
+        let result = unsafe {
+            dispatch_lle_task(
+                rdram.as_mut_ptr(),
+                task_addr,
+                true,
+                None,
+                Some(microcode_data),
+                None,
+            )
+        };
 
         assert_eq!(
             result,
             LleTaskResult {
                 steps: 9,
-                needs_dp: false
+                dp_full_sync: fn64_render::DpFullSyncStatus::NotReached,
             }
         );
         with_host(|host| {
@@ -2260,12 +5153,57 @@ mod tests {
                 0x0000_5678
             );
         });
+        let final_digest = with_host(|host| {
+            imem_sha256(
+                host.device_fabric
+                    .rsp_memory()
+                    .bank(fn64_runtime::RspMemoryBank::Imem),
+            )
+        });
+        assert_eq!(
+            copy_rsp_rdp_observations(),
+            vec![
+                RspRdpObservationEvent {
+                    at: expected_at,
+                    kind: RspRdpObservationKind::MicrocodeRecognition {
+                        task_addr: RdramAddr::from_offset(0x40),
+                        imem_generation: generation_before,
+                        text_sha256: initial_digest,
+                        data_addr: microcode_data.addr,
+                        data_size: microcode_data.size,
+                        data_sha256: microcode_data.sha256,
+                        family: None,
+                    },
+                },
+                RspRdpObservationEvent {
+                    at: expected_at,
+                    kind: RspRdpObservationKind::ImemReplacementCommitted {
+                        task_addr: RdramAddr::from_offset(0x40),
+                        imem_generation: generation_before + 1,
+                        text_sha256: final_digest,
+                    },
+                },
+                RspRdpObservationEvent {
+                    at: expected_at,
+                    kind: RspRdpObservationKind::MicrocodeRecognition {
+                        task_addr: RdramAddr::from_offset(0x40),
+                        imem_generation: generation_before + 1,
+                        text_sha256: final_digest,
+                        data_addr: microcode_data.addr,
+                        data_size: microcode_data.size,
+                        data_sha256: microcode_data.sha256,
+                        family: None,
+                    },
+                },
+            ]
+        );
     }
 
     #[test]
     fn xbus_dpc_submission_stages_logical_dmem_commands_for_renderer() {
         use fn64_render::RenderConfig;
 
+        crate::load_rom(Vec::new());
         const TARGET: u32 = 0x400;
         let mut rdram = vec![0u8; 0x1000];
         let commands: [(u32, u32); 4] = [
@@ -2274,18 +5212,19 @@ mod tests {
             (0xf700_0000, 0x07c1_07c1),
             (0xf600_0000 | ((3 * 4) << 12) | 4, 0),
         ];
-        let mut stream = vec![0u8; commands.len() * 8];
+        let mut dmem = [0u8; fn64_runtime::RSP_MEMORY_BANK_SIZE];
         for (index, (w0, w1)) in commands.into_iter().enumerate() {
             let offset = index * 8;
-            stream[offset..offset + 4].copy_from_slice(&w0.to_be_bytes());
-            stream[offset + 4..offset + 8].copy_from_slice(&w1.to_be_bytes());
+            dmem[offset..offset + 4].copy_from_slice(&w0.to_be_bytes());
+            dmem[offset + 4..offset + 8].copy_from_slice(&w1.to_be_bytes());
         }
-        let mut backend = fn64_render_rt64::ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(4, 2)).unwrap();
+        let mut backend = fn64_render_reference::ReferenceBackend::new().with_f3dex2();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
+        prepare_renderer_rdram(&mut rdram);
         set_render_backend(Box::new(backend), rdram.len());
 
         unsafe {
-            dispatch_raw_rdp_xbus(rdram.as_mut_ptr(), &stream);
+            dispatch_raw_rdp_xbus(rdram.as_mut_ptr(), &dmem, 0, (commands.len() * 8) as u32);
         }
 
         assert_eq!(last_render_error(), None);
@@ -2297,6 +5236,22 @@ mod tests {
                 "XBUS raw RDP pixel {index}"
             );
         }
+        assert_eq!(
+            copy_rsp_rdp_observations()
+                .into_iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![RspRdpObservationKind::XbusDpcCommitted {
+                start: 0,
+                end: (commands.len() * 8) as u32,
+                command_sha256: canonical_rdp_words_sha256(
+                    &commands
+                        .into_iter()
+                        .flat_map(|(w0, w1)| [w0, w1])
+                        .collect::<Vec<_>>()
+                ),
+            }]
+        );
     }
 
     #[test]
@@ -2311,7 +5266,7 @@ mod tests {
         let commands: [(u32, u32); 9] = [
             (0xff10_0007, TARGET),
             (0xfa00_0000, 0xff00_00ff),
-            // lft=0: the vertical XM minor edge sits LEFT of the rightward-
+            // lft=0: the vertical XM minor edge sits left of the rightward-
             // sloping XH major edge (right-major geometry).
             (0x0900_0000 | yl, (ym << 16) | yh),
             (1 << 16, (5.0f32 / 3.0 * 65536.0).round() as u32),
@@ -2321,18 +5276,19 @@ mod tests {
             (0, 0),
             (0xe900_0000, 0),
         ];
-        let mut stream = vec![0u8; commands.len() * 8];
+        let mut dmem = [0u8; fn64_runtime::RSP_MEMORY_BANK_SIZE];
         for (index, (w0, w1)) in commands.into_iter().enumerate() {
             let offset = index * 8;
-            stream[offset..offset + 4].copy_from_slice(&w0.to_be_bytes());
-            stream[offset + 4..offset + 8].copy_from_slice(&w1.to_be_bytes());
+            dmem[offset..offset + 4].copy_from_slice(&w0.to_be_bytes());
+            dmem[offset + 4..offset + 8].copy_from_slice(&w1.to_be_bytes());
         }
-        let mut backend = fn64_render_rt64::ReferenceBackend::new().with_f3dex2();
-        backend.create(&RenderConfig::new(8, 8)).unwrap();
+        let mut backend = fn64_render_reference::ReferenceBackend::new().with_f3dex2();
+        backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
+        prepare_renderer_rdram(&mut rdram);
         set_render_backend(Box::new(backend), rdram.len());
 
         unsafe {
-            dispatch_raw_rdp_xbus(rdram.as_mut_ptr(), &stream);
+            dispatch_raw_rdp_xbus(rdram.as_mut_ptr(), &dmem, 0, (commands.len() * 8) as u32);
         }
 
         assert_eq!(last_render_error(), None);
@@ -2413,6 +5369,7 @@ mod tests {
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + header_off as u64;
         admit_synthetic_hle_task(&mut rdram, header_off, &mut ctx);
+        prepare_renderer_rdram(&mut rdram);
         set_render_backend(
             Box::new(StatusRenderBackend(FrameStatus::Complete)),
             rdram.len(),
@@ -2500,6 +5457,7 @@ mod tests {
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
         admit_synthetic_hle_task(&mut rdram, HEADER_OFF, &mut ctx);
+        prepare_renderer_rdram(&mut rdram);
         set_render_backend(
             Box::new(StatusRenderBackend(FrameStatus::Yielded)),
             rdram.len(),
@@ -2556,6 +5514,8 @@ mod tests {
                 Ok(())
             }
 
+            no_rust_hidden_sidecar!();
+
             fn process_task(
                 &mut self,
                 _rdram: &mut [u8],
@@ -2572,11 +5532,18 @@ mod tests {
                 })
             }
 
-            fn present(&mut self, _vi: fn64_render::ViPresentation) -> Result<(), RenderError> {
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
                 Ok(())
             }
 
             fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
+                fn64_render::DpFullSyncStatus::NotReached
+            }
 
             fn supported_ucodes(&self) -> &[UcodeId] {
                 &[]
@@ -2604,6 +5571,7 @@ mod tests {
         ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
         admit_synthetic_hle_task(&mut rdram, HEADER_OFF, &mut ctx);
         let calls = Arc::new(Mutex::new(Vec::new()));
+        prepare_renderer_rdram(&mut rdram);
         set_render_backend(
             Box::new(SequenceBackend {
                 calls: Arc::clone(&calls),
@@ -2631,6 +5599,163 @@ mod tests {
         assert_ne!(calls[1].flags & fn64_runtime::OS_TASK_YIELDED, 0);
         assert_eq!(calls[1].ucode_data, YIELD_DATA);
         assert_eq!(calls[1].ucode_data_size, YIELD_SIZE);
+    }
+
+    #[test]
+    fn chunked_hle_observes_sig0_between_commits_and_consumes_resume_once() {
+        use std::sync::{Arc, Mutex};
+
+        struct ChunkedBackend {
+            steps: Arc<Mutex<Vec<fn64_render::RenderTaskStep>>>,
+        }
+
+        impl RenderBackend for ChunkedBackend {
+            fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            no_rust_hidden_sidecar!();
+
+            fn process_task(
+                &mut self,
+                _rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+            ) -> Result<FrameStatus, RenderError> {
+                Err(RenderError::Backend {
+                    backend: "chunked-test",
+                    reason: "atomic entry must not be used".into(),
+                })
+            }
+
+            fn process_task_chunk(
+                &mut self,
+                _rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+                step: fn64_render::RenderTaskStep,
+            ) -> Result<fn64_render::RenderTaskChunkStatus, RenderError> {
+                self.steps.lock().unwrap().push(step);
+                Ok(match step {
+                    fn64_render::RenderTaskStep::Start => {
+                        fn64_render::RenderTaskChunkStatus::Continue(
+                            fn64_render::RenderTaskContinuation::new(1),
+                        )
+                    }
+                    fn64_render::RenderTaskStep::Resume(token) if token.get() == 1 => {
+                        fn64_render::RenderTaskChunkStatus::Continue(
+                            fn64_render::RenderTaskContinuation::new(2),
+                        )
+                    }
+                    fn64_render::RenderTaskStep::Resume(token) if token.get() == 2 => {
+                        fn64_render::RenderTaskChunkStatus::Complete
+                    }
+                    fn64_render::RenderTaskStep::Resume(token) => panic!(
+                        "unexpected or multiply consumed continuation token {}",
+                        token.get()
+                    ),
+                })
+            }
+
+            fn task_chunking(&self) -> fn64_render::RenderTaskChunking {
+                fn64_render::RenderTaskChunking::Resumable
+            }
+
+            fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
+                fn64_render::DpFullSyncStatus::NotReached
+            }
+
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn supported_ucodes(&self) -> &[UcodeId] {
+                &[]
+            }
+        }
+
+        const HEADER_OFF: usize = 0x40;
+        const YIELD_DATA: u32 = 0x200;
+        const YIELD_SIZE: u32 = 0x80;
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x400];
+        for (field, value) in [
+            (0x00, fn64_runtime::M_GFXTASK),
+            (0x38, YIELD_DATA),
+            (0x3c, YIELD_SIZE),
+        ] {
+            rdram[HEADER_OFF + field..HEADER_OFF + field + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
+        admit_synthetic_hle_task(&mut rdram, HEADER_OFF, &mut ctx);
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        prepare_renderer_rdram(&mut rdram);
+        set_render_backend(
+            Box::new(ChunkedBackend {
+                steps: Arc::clone(&steps),
+            }),
+            rdram.len(),
+        );
+
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(
+            steps.lock().unwrap().as_slice(),
+            [fn64_render::RenderTaskStep::Start]
+        );
+        assert!(with_host(|host| host.device_fabric.snapshot().sp_busy));
+        assert_eq!(
+            crate::next_device_deadline(),
+            Some(crate::sim_time()),
+            "a running continuation must remain visible to the host pump"
+        );
+
+        unsafe { osSpTaskYield_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        crate::advance_virtual_time(8);
+        assert_eq!(
+            steps.lock().unwrap().len(),
+            1,
+            "SIG0 must win before token consumption"
+        );
+        assert_ne!(
+            crate::pi::live_sp_status() & fn64_runtime::SP_STATUS_YIELDED,
+            0
+        );
+        unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(ctx.r2, u64::from(fn64_runtime::OS_TASK_YIELDED));
+
+        unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(
+            steps.lock().unwrap().as_slice(),
+            [
+                fn64_render::RenderTaskStep::Start,
+                fn64_render::RenderTaskStep::Resume(fn64_render::RenderTaskContinuation::new(1))
+            ]
+        );
+        crate::advance_virtual_time(16);
+        crate::advance_virtual_time(17);
+        assert_eq!(
+            steps.lock().unwrap().as_slice(),
+            [
+                fn64_render::RenderTaskStep::Start,
+                fn64_render::RenderTaskStep::Resume(fn64_render::RenderTaskContinuation::new(1)),
+                fn64_render::RenderTaskStep::Resume(fn64_render::RenderTaskContinuation::new(2))
+            ],
+            "each backend continuation is consumed exactly once"
+        );
+        with_host(|host| {
+            let snapshot = host.device_fabric.snapshot();
+            assert!(!snapshot.sp_busy);
+            assert!(!snapshot.dp_busy);
+        });
     }
 
     /// A NON-graphics RSP task (e.g. `M_AUDTASK`) posts ONLY the SP-done
@@ -2682,7 +5807,7 @@ mod tests {
 
     /// Proves the executor gfx-task seam actually reaches a real `dyn
     /// RenderBackend` end-to-end: `set_render_backend` registers a real
-    /// `fn64_render_rt64::ReferenceBackend`, a real F3DEX2-family display
+    /// `fn64_render_reference::ReferenceBackend`, a real F3DEX2-family display
     /// list (same tiny triangle fixture shape as
     /// `fn64-render-rt64/tests/fixture_replay.rs` -- see that file's doc
     /// comment for why this is a hand-built, not ROM-captured, fixture) is
@@ -2695,7 +5820,7 @@ mod tests {
     #[test]
     fn os_sp_task_start_go_routes_gfx_tasks_through_the_registered_render_backend() {
         use fn64_render::RenderConfig;
-        use fn64_render_rt64::{gbi, ReferenceBackend};
+        use fn64_render_reference::{gbi, ReferenceBackend};
 
         const RDRAM_LEN: usize = 0x4000;
         const VTX_ADDR: usize = 0x1000;
@@ -2728,6 +5853,10 @@ mod tests {
         let w1 = (1u32 << 8) | 2u32; // v0 index is 0, so its <<16 term is omitted (identity op)
         dl.extend_from_slice(&w0.to_be_bytes());
         dl.extend_from_slice(&w1.to_be_bytes());
+        // A second ordered primitive forces the production ReferenceBackend
+        // through one real continuation/resume boundary at this ABI seam.
+        dl.extend_from_slice(&w0.to_be_bytes());
+        dl.extend_from_slice(&w1.to_be_bytes());
         let w0 = (gbi::G_ENDDL as u32) << 24;
         dl.extend_from_slice(&w0.to_be_bytes());
         dl.extend_from_slice(&0u32.to_be_bytes());
@@ -2742,9 +5871,19 @@ mod tests {
         ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
         admit_synthetic_hle_task(&mut rdram, HEADER_OFF, &mut ctx);
         let mut backend = ReferenceBackend::new().with_clear_color([1, 2, 3, 255]);
-        backend.create(&RenderConfig::new(64, 64)).unwrap();
+        backend.create(&RenderConfig::ntsc(64, 64)).unwrap();
+        prepare_renderer_rdram(&mut rdram);
         set_render_backend(Box::new(backend), rdram.len());
         unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+        assert!(
+            hle_render_needs_progress(),
+            "the first real ReferenceBackend operation must retain its backend-owned continuation"
+        );
+        advance_hle_render_task();
+        assert!(
+            !hle_render_needs_progress(),
+            "the second real ReferenceBackend operation must consume the continuation exactly once"
+        );
 
         assert_eq!(
             last_render_error(),
@@ -2766,7 +5905,7 @@ mod tests {
         // the seam call really executed the real decode+rasterize path on
         // this fixture, not a silent no-op.
         let mut direct = ReferenceBackend::new().with_clear_color([1, 2, 3, 255]);
-        direct.create(&RenderConfig::new(64, 64)).unwrap();
+        direct.create(&RenderConfig::ntsc(64, 64)).unwrap();
         let task = fn64_render::OsTask {
             task_type: fn64_render::M_GFXTASK,
             data_ptr: DL_ADDR as u32,
@@ -2838,6 +5977,7 @@ mod tests {
         CALLED.store(false, Ordering::SeqCst);
         SEEN_OFFSET.store(0, Ordering::SeqCst);
         crate::load_rom(Vec::new());
+        crate::set_trace_enabled(true);
 
         let mut rdram = vec![0u8; 128];
         let header_off = 0x30usize;
@@ -2845,7 +5985,35 @@ mod tests {
 
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + header_off as u64;
+        let prior_starts = crate::copy_trace()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    fn64_runtime::TraceKind::TaskSubmit {
+                        task_kind: fn64_runtime::TaskKind::Audio,
+                        ..
+                    }
+                )
+            })
+            .count();
         admit_synthetic_hle_task(&mut rdram, header_off, &mut ctx);
+        assert_eq!(
+            crate::copy_trace()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        fn64_runtime::TraceKind::TaskSubmit {
+                            task_kind: fn64_runtime::TaskKind::Audio,
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            prior_starts,
+            "audio admission alone cannot claim task execution"
+        );
         unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
         assert!(
@@ -2857,7 +6025,71 @@ mod tests {
             header_off as u32,
             "ucode receives the OSTask rdram offset"
         );
+        assert_eq!(
+            crate::copy_trace()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        fn64_runtime::TraceKind::TaskSubmit {
+                            task_kind: fn64_runtime::TaskKind::Audio,
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            prior_starts + 1,
+            "audio StartGo must emit exactly one execution-qualified task trace"
+        );
         crate::advance_virtual_time(8);
+    }
+
+    #[test]
+    fn os_sp_task_start_go_dispatches_a_direct_4k_audio_image_without_rspboot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static CALLED: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "C" fn fake_ucode(_rdram: *mut u8, _task_offset: u32) -> u32 {
+            CALLED.store(true, Ordering::SeqCst);
+            0
+        }
+
+        const HEADER: usize = 0x40;
+        const IMAGE: usize = 0x200;
+        crate::load_rom(Vec::new());
+        unsafe { set_audio_ucode_fn(fake_ucode) };
+        CALLED.store(false, Ordering::SeqCst);
+        let mut rdram = vec![0u8; IMAGE + fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        for (field, value) in [
+            (0x00, fn64_runtime::M_AUDTASK),
+            (0x08, 0x8000_0000 | IMAGE as u32),
+            (0x0c, fn64_runtime::RSP_MEMORY_BANK_SIZE as u32),
+            (0x10, 0xA000_0000 | IMAGE as u32),
+            (0x14, fn64_runtime::RSP_MEMORY_BANK_SIZE as u32),
+        ] {
+            rdram[HEADER + field..HEADER + field + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        // A direct ucode is allowed to terminate with BREAK. If StartGo
+        // mistakes this image for rspboot, this first word takes the existing
+        // loud "BREAK before DMA-loaded ucode" trap instead of calling HLE.
+        rdram[IMAGE..IMAGE + 4].copy_from_slice(&0x0000_000du32.to_ne_bytes());
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + HEADER as u64;
+        unsafe {
+            osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx);
+            osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx);
+        }
+
+        assert!(
+            CALLED.load(Ordering::SeqCst),
+            "a complete direct IMEM audio image must enter its registered HLE backend"
+        );
+        assert_eq!(with_executor(|exec| exec.task_log().audio_count()), 1);
+        crate::advance_virtual_time(1);
     }
 
     #[test]
@@ -2902,6 +6134,23 @@ mod tests {
         }
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + HEADER_OFF as u64;
+        with_host(|host| {
+            host.rsp_task_lineages.insert(
+                HEADER_OFF as u32,
+                RspTaskLineage {
+                    original_header: OsTaskHeader {
+                        flags: FLAGS,
+                        ucode_data: OLD_UCODE_DATA,
+                        ucode_data_size: OLD_UCODE_DATA_SIZE,
+                        yield_data_ptr: YIELD_DATA,
+                        yield_data_size: YIELD_DATA_SIZE,
+                        ..Default::default()
+                    },
+                    data_identity: None,
+                    phase: RspTaskLineagePhase::Running,
+                },
+            );
+        });
 
         unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
@@ -2916,6 +6165,10 @@ mod tests {
         assert_eq!(word(0x04), FLAGS | fn64_runtime::OS_TASK_YIELDED);
         assert_eq!(word(0x18), YIELD_DATA);
         assert_eq!(word(0x1c), YIELD_DATA_SIZE);
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_task_lineages[0].phase,
+            RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized
+        );
         assert_ne!(
             crate::pi::live_sp_status() & fn64_runtime::SP_STATUS_YIELDED,
             0,
@@ -2963,5 +6216,24 @@ mod tests {
             ctx.r2, 0,
             "0 = completed (did not yield); 1 = OS_TASK_YIELDED"
         );
+    }
+
+    #[test]
+    fn audio_digest_capture_distinguishes_unrequested_empty_and_real_pcm() {
+        set_audio_digest_capture(false);
+        assert_eq!(copy_audio_digest_bytes(), None);
+
+        let mut rdram = vec![0u8; 8];
+        let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+        view.write_u16(RdramAddr::from_offset(0), 0x1234);
+        view.write_u16(RdramAddr::from_offset(2), 0xfffe);
+        set_audio_rdram_len(rdram.len());
+        set_audio_digest_capture(true);
+        unsafe { deliver_ai_buffer(rdram.as_mut_ptr(), 0, 4) };
+        assert_eq!(
+            copy_audio_digest_bytes(),
+            Some(vec![0x34, 0x12, 0xfe, 0xff])
+        );
+        set_audio_digest_capture(false);
     }
 }

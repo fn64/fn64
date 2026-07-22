@@ -71,13 +71,27 @@ fn main() {
             if now != last_header {
                 let changed: Vec<String> = (0..0x40)
                     .filter(|&i| now[i] != last_header[i])
-                    .map(|i| format!("dmem[{:#05x}] {:02x}->{:02x}", 0xfc0 + i, last_header[i], now[i]))
+                    .map(|i| {
+                        format!(
+                            "dmem[{:#05x}] {:02x}->{:02x}",
+                            0xfc0 + i,
+                            last_header[i],
+                            now[i]
+                        )
+                    })
                     .collect();
-                println!("HEADER WRITE at step {steps}, pc now {:#06x}: {}", pc, changed.join(", "));
+                println!(
+                    "HEADER WRITE at step {steps}, pc now {:#06x}: {}",
+                    pc,
+                    changed.join(", ")
+                );
                 dump_context(&ring, &machine);
                 last_header = now;
                 // Keep going; report only the first few header events.
-                if changed.iter().any(|c| c.contains("0xff0") || c.contains("0xff4")) {
+                if changed
+                    .iter()
+                    .any(|c| c.contains("0xff0") || c.contains("0xff4"))
+                {
                     println!("(data_ptr/data_size words touched)");
                     header_reported = true;
                 }
@@ -119,7 +133,13 @@ fn main() {
 }
 
 fn dump_context(ring: &VecDeque<u32>, machine: &RspMachine<'_>) {
-    let pcs: Vec<String> = ring.iter().rev().take(48).rev().map(|p| format!("{p:#06x}")).collect();
+    let pcs: Vec<String> = ring
+        .iter()
+        .rev()
+        .take(48)
+        .rev()
+        .map(|p| format!("{p:#06x}"))
+        .collect();
     println!("  recent pcs: {}", pcs.join(" "));
     for reg in (0u8..32).step_by(4) {
         println!(

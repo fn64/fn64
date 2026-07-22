@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 
 struct LiveRdramDma {
     storage: fn64_runtime::RdramPtr,
@@ -10,6 +11,10 @@ impl LiveRdramDma {
     /// `rdram` must remain valid for `len` bytes while this adapter is used,
     /// and guest execution must be suspended for every access.
     unsafe fn new(rdram: *mut u8, len: usize) -> Self {
+        assert!(
+            len.is_multiple_of(4),
+            "PI DMA RDRAM storage extent {len:#x} must cover complete native words"
+        );
         Self {
             storage: unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) },
             len,
@@ -18,10 +23,9 @@ impl LiveRdramDma {
 
     fn checked_addr(&self, offset: usize) -> RdramAddr {
         let offset = u32::try_from(offset).expect("PI DMA RDRAM offset exceeds u32");
-        let physical = (offset ^ 3) as usize;
         assert!(
-            physical < self.len,
-            "PI DMA logical byte {offset:#x} maps outside RDRAM allocation {:#x}",
+            (offset as usize) < self.len,
+            "PI DMA logical byte {offset:#x} is outside RDRAM allocation {:#x}",
             self.len
         );
         RdramAddr::from_offset(offset)
@@ -76,6 +80,10 @@ pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
         latency_cycles > 0,
         "PI latency must be at least one guest cycle so start and completion remain observable"
     );
+    let installed_rom = InstalledRomEvidenceSnapshot {
+        byte_len: u64::try_from(bytes.len()).expect("installed ROM length exceeds evidence wire"),
+        sha256: Sha256::digest(&bytes).into(),
+    };
     with_host(|host| {
         let tv_type = host.device_fabric.tv_type();
         let mut device_fabric = DeviceFabric::new(
@@ -89,8 +97,15 @@ pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
         }
         host.device_fabric = device_fabric;
         host.rom_installed = true;
-        host.pending_pi_completion = None;
-        host.queued_pi_requests.clear();
+        host.installed_rom = Some(installed_rom);
+        host.cartridge_save = CartridgeSaveEvidenceSnapshot::Unidentified;
+        host.pending_pi_completions.clear();
+        host.save_operations.clear();
+        host.controller_operations.clear();
+        host.rsp_rdp_observations.clear();
+        host.loaded_rsp_task = None;
+        host.rsp_task_lineages.clear();
+        host.native_execution_destinations.clear();
     });
 }
 
@@ -123,6 +138,261 @@ pub struct LeoDiskConfig {
     pub pulse_width: u8,
 }
 
+const DEVICE_TYPE_CART: u8 = 0;
+const DEVICE_TYPE_64DD: u8 = 2;
+const DEVICE_TYPE_SRAM: u8 = 3;
+const PI_DOMAIN1: u8 = 0;
+const PI_DOMAIN2: u8 = 1;
+const KSEG1_BASE: u32 = 0xa000_0000;
+const KSEG1_END: u32 = 0xc000_0000;
+const PI_DOM1_ADDR1: std::ops::RangeInclusive<u32> = 0x0600_0000..=0x07ff_ffff;
+const PI_DOM1_ADDR2: std::ops::RangeInclusive<u32> = 0x1000_0000..=0x1fbf_ffff;
+const PI_DOM1_ADDR3: std::ops::RangeInclusive<u32> = 0x1fd0_0000..=0x7fff_ffff;
+const PI_DOM2_ADDR1: std::ops::RangeInclusive<u32> = 0x0500_0000..=0x05ff_ffff;
+const PI_DOM2_ADDR2: std::ops::RangeInclusive<u32> = 0x0800_0000..=0x0fff_ffff;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EpiHandle {
+    device_type: u8,
+    domain: fn64_runtime::PiDomain,
+    timing: fn64_runtime::PiDomainTiming,
+    base_address: u32,
+}
+
+fn trap_epi_handle(shim: &str, detail: impl std::fmt::Display) -> ! {
+    let message = format!("{shim}: {detail}");
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Abi,
+        "abi.pi.epi-handle",
+        &message,
+        Some(with_host(|host| host.device_fabric.now())),
+        fn64_runtime::UnsupportedDisposition::LoudTrap,
+    );
+    panic!("{message}")
+}
+
+fn epi_domain_for_address(shim: &str, address: u32) -> fn64_runtime::PiDomain {
+    if PI_DOM1_ADDR1.contains(&address)
+        || PI_DOM1_ADDR2.contains(&address)
+        || PI_DOM1_ADDR3.contains(&address)
+    {
+        fn64_runtime::PiDomain::Domain1
+    } else if PI_DOM2_ADDR1.contains(&address) || PI_DOM2_ADDR2.contains(&address) {
+        fn64_runtime::PiDomain::Domain2
+    } else {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle base address {address:#010x} is outside the public PI domain map"
+            ),
+        )
+    }
+}
+
+fn epi_physical_base(shim: &str, base_address: u32) -> u32 {
+    if !(KSEG1_BASE..KSEG1_END).contains(&base_address) {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle base address {base_address:#010x} is not the public uncached KSEG1 device address form"
+            ),
+        );
+    }
+    base_address & 0x1fff_ffff
+}
+
+/// Decode one public `OSPiHandle` and apply its bus parameters to the same
+/// domain registers exposed through raw PI MMIO. Chapter 27 defines this as
+/// the common authority for managed and raw EPI calls: a handle switch updates
+/// the bus before the operation. The public SRAM example stores
+/// `PHYS_TO_K1(device_start)` in `baseAddress`; the decoder applies the
+/// documented `baseAddress | devAddr` operation in that public address form,
+/// then removes the uncached CPU segment tag at the PI boundary.
+///
+/// # Safety
+/// `rdram` must point at guest storage containing the complete handle named by
+/// `handle_gpr`.
+unsafe fn resolve_epi_device_address(
+    rdram: *mut u8,
+    handle_gpr: u64,
+    dev_addr: u32,
+    shim: &str,
+) -> u32 {
+    let upper = handle_gpr >> 32;
+    let handle_vram = handle_gpr as u32;
+    if (upper != 0 && upper != u32::MAX as u64)
+        || !(0x8000_0000..0xc000_0000).contains(&handle_vram)
+        || !handle_vram.is_multiple_of(4)
+    {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle pointer {handle_gpr:#018x} is not an aligned zero/sign-extended KSEG0/KSEG1 address"
+            ),
+        );
+    }
+    let handle_offset = handle_vram & 0x1fff_ffff;
+    let public_end = handle_offset
+        .checked_add(20)
+        .expect("OSPiHandle public range overflow");
+    if public_end > fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u32 {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle pointer {handle_gpr:#018x} maps outside physical RDRAM: {handle_offset:#010x}..{public_end:#010x}"
+            ),
+        );
+    }
+
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    let base = RdramAddr::from_gpr(handle_gpr);
+    let handle = EpiHandle {
+        device_type: unsafe { storage.read_u8(base.checked_add(4).unwrap()) },
+        timing: fn64_runtime::PiDomainTiming {
+            latency: unsafe { storage.read_u8(base.checked_add(5).unwrap()) },
+            page_size: unsafe { storage.read_u8(base.checked_add(6).unwrap()) },
+            release: unsafe { storage.read_u8(base.checked_add(7).unwrap()) },
+            pulse_width: unsafe { storage.read_u8(base.checked_add(8).unwrap()) },
+        },
+        domain: match unsafe { storage.read_u8(base.checked_add(9).unwrap()) } {
+            PI_DOMAIN1 => fn64_runtime::PiDomain::Domain1,
+            PI_DOMAIN2 => fn64_runtime::PiDomain::Domain2,
+            value => trap_epi_handle(shim, format_args!("OSPiHandle has invalid domain {value}")),
+        },
+        base_address: unsafe { storage.read_u32(base.checked_add(12).unwrap()) },
+    };
+    if handle.device_type > DEVICE_TYPE_SRAM {
+        trap_epi_handle(
+            shim,
+            format_args!("OSPiHandle has invalid device type {}", handle.device_type),
+        );
+    }
+    if handle.timing.page_size > 0x0f || handle.timing.release > 0x03 {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle timing fields exceed PI register width: pageSize={:#04x}, relDuration={:#04x}",
+                handle.timing.page_size, handle.timing.release
+            ),
+        );
+    }
+    let physical_base = epi_physical_base(shim, handle.base_address);
+    let mapped_domain = epi_domain_for_address(shim, physical_base);
+    if mapped_domain != handle.domain {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle domain {:?} disagrees with base address {:#010x} ({mapped_domain:?})",
+                handle.domain, handle.base_address
+            ),
+        );
+    }
+    let device_address = handle.base_address | dev_addr;
+    let physical = epi_physical_base(shim, device_address);
+    if epi_domain_for_address(shim, physical) != handle.domain {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle base {:#010x} OR device address {dev_addr:#010x} escapes {:?}",
+                handle.base_address, handle.domain
+            ),
+        );
+    }
+    with_host(|host| {
+        host.device_fabric
+            .set_pi_domain_timing(handle.domain, handle.timing)
+    });
+
+    if PI_DOM1_ADDR2.contains(&physical) {
+        if handle.device_type != DEVICE_TYPE_CART {
+            trap_epi_handle(
+                shim,
+                format_args!(
+                    "OSPiHandle type {} cannot use the Game Pak ROM address space",
+                    handle.device_type
+                ),
+            );
+        }
+        physical - 0x1000_0000
+    } else if PI_DOM2_ADDR2.contains(&physical) {
+        if handle.device_type != DEVICE_TYPE_SRAM {
+            trap_epi_handle(
+                shim,
+                format_args!(
+                    "OSPiHandle type {} cannot use the SRAM address space",
+                    handle.device_type
+                ),
+            );
+        }
+        physical
+    } else {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle selects documented PI device space {physical:#010x}, but no backing device is attached for that space"
+            ),
+        )
+    }
+}
+
+/// Write the public portion of an `OSPiHandle` from typed device state. The
+/// base address is the public uncached KSEG1 form used by Chapter 27's SRAM
+/// acquisition example, not a raw PI physical address.
+/// Acquisition shims share this constructor so Cart ROM and 64DD handles
+/// cannot drift in field layout or timing-register authority.
+///
+/// # Safety
+/// `rdram` must contain writable storage for the complete public handle.
+pub(crate) unsafe fn write_epi_handle(
+    rdram: *mut u8,
+    handle_vram: u32,
+    device_type: u8,
+    domain: fn64_runtime::PiDomain,
+    timing: fn64_runtime::PiDomainTiming,
+    base_address: u32,
+) {
+    assert!(
+        (0x8000_0000..0xc000_0000).contains(&handle_vram) && handle_vram.is_multiple_of(4),
+        "OSPiHandle storage must be an aligned KSEG0/KSEG1 address, got {handle_vram:#010x}"
+    );
+    assert!(
+        device_type <= DEVICE_TYPE_SRAM,
+        "OSPiHandle device type {device_type} exceeds the public range"
+    );
+    assert!(
+        timing.page_size <= 0x0f && timing.release <= 0x03,
+        "OSPiHandle timing exceeds PI register width"
+    );
+    assert_eq!(
+        epi_domain_for_address(
+            "write_epi_handle",
+            epi_physical_base("write_epi_handle", base_address),
+        ),
+        domain,
+        "OSPiHandle domain disagrees with its public base address"
+    );
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    let base = RdramAddr::from_gpr(handle_vram as u64);
+    unsafe {
+        storage.write_u32(base, 0);
+        storage.write_u8(base.checked_add(4).unwrap(), device_type);
+        storage.write_u8(base.checked_add(5).unwrap(), timing.latency);
+        storage.write_u8(base.checked_add(6).unwrap(), timing.page_size);
+        storage.write_u8(base.checked_add(7).unwrap(), timing.release);
+        storage.write_u8(base.checked_add(8).unwrap(), timing.pulse_width);
+        storage.write_u8(
+            base.checked_add(9).unwrap(),
+            match domain {
+                fn64_runtime::PiDomain::Domain1 => PI_DOMAIN1,
+                fn64_runtime::PiDomain::Domain2 => PI_DOMAIN2,
+            },
+        );
+        storage.write_u16(base.checked_add(10).unwrap(), 0);
+        storage.write_u32(base.checked_add(12).unwrap(), base_address);
+        storage.write_u32(base.checked_add(16).unwrap(), 0);
+    }
+}
+
 /// Install a 64DD-register handle configuration. This does not fabricate a
 /// mounted disk; it makes the public EPI device description available to a
 /// host that also supplies the general 64DD device path.
@@ -153,7 +423,60 @@ pub fn configure_leo_disk(config: LeoDiskConfig) {
 /// domain-2 DMA with no save registered is a loud trap, not a silent ROM
 /// read past its end (see `PiDma::set_save`).
 pub fn set_save(save: Box<dyn fn64_runtime::SaveStorage>) {
-    with_pi_dma("set_save", |dma| dma.set_save(save));
+    with_host(|host| {
+        assert!(
+            host.rom_installed,
+            "set_save: no ROM installed -- call fn64_abi::load_rom(bytes) before installing save storage"
+        );
+        host.save_operations
+            .extend(host.device_fabric.pi_dma_mut().take_save_operations());
+        host.device_fabric.pi_dma_mut().set_save(save);
+        host.cartridge_save = CartridgeSaveEvidenceSnapshot::Unidentified;
+    });
+}
+
+/// Install cartridge save storage with an exact closed hardware identity.
+///
+/// The type excludes Controller Pak by construction. Storage length is
+/// checked before ownership moves into the PI engine, preventing an EEPROM,
+/// SRAM, or Flash declaration from labeling a differently sized device.
+pub fn set_cartridge_save(save_type: CartridgeSaveType, save: Box<dyn fn64_runtime::SaveStorage>) {
+    assert_eq!(
+        save.len(),
+        save_type.byte_len(),
+        "cartridge save storage length does not match {save_type:?}"
+    );
+    with_host(|host| {
+        assert!(
+            host.rom_installed,
+            "set_cartridge_save: no ROM installed -- call fn64_abi::load_rom(bytes) before installing save storage"
+        );
+        host.save_operations
+            .extend(host.device_fabric.pi_dma_mut().take_save_operations());
+        host.device_fabric.pi_dma_mut().set_save(save);
+        host.cartridge_save = CartridgeSaveEvidenceSnapshot::Configured(save_type);
+    });
+}
+
+/// Assert that this cartridge has no mounted save hardware.
+///
+/// This does not remove a device. Calling it after any save installation is a
+/// host configuration error and traps rather than relabeling live storage.
+pub fn configure_no_cartridge_save() {
+    with_host(|host| {
+        assert!(
+            host.rom_installed,
+            "configure_no_cartridge_save: no ROM installed"
+        );
+        assert!(
+            host.device_fabric
+                .pi_dma_mut()
+                .save_snapshot_bytes()
+                .is_none(),
+            "configure_no_cartridge_save cannot relabel installed save storage"
+        );
+        host.cartridge_save = CartridgeSaveEvidenceSnapshot::NoCartridgeSave;
+    });
 }
 
 pub(crate) fn with_pi_dma<R>(shim: &str, f: impl FnOnce(&mut PiDma<InMemoryRom>) -> R) -> R {
@@ -165,7 +488,12 @@ pub(crate) fn with_pi_dma<R>(shim: &str, f: impl FnOnce(&mut PiDma<InMemoryRom>)
                  content, so there is no default ROM to fall back to)"
             )
         }
-        f(host.device_fabric.pi_dma_mut())
+        host.save_operations
+            .extend(host.device_fabric.pi_dma_mut().take_save_operations());
+        let result = f(host.device_fabric.pi_dma_mut());
+        host.save_operations
+            .extend(host.device_fabric.pi_dma_mut().take_save_operations());
+        result
     })
 }
 
@@ -177,6 +505,21 @@ fn start_timed_pi_dma(
     ret_mesg: u32,
     shim: &str,
 ) -> Result<(), DeviceFault> {
+    // Cached: this sits on the per-chunk PI DMA hot path -- an uncached
+    // getenv per 0x200-byte chunk dominated wall time on multi-megabyte
+    // overlay streams (lldb-confirmed, BOOT-NOTES-WM2000.md part 7).
+    static TRACE_PI_DMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *TRACE_PI_DMA.get_or_init(|| std::env::var_os("FN64_TRACE_PI_DMA").is_some()) {
+        let thread = crate::current_thread_id("FN64_TRACE_PI_DMA");
+        eprintln!(
+            "[fn64-abi/pi] thread={thread} {shim} {:?} cart={:#010x} dram={:#010x} len={:#x} \
+             ret_queue={ret_queue:?}",
+            request.direction,
+            request.cart_addr,
+            request.dram_addr.offset(),
+            request.len
+        );
+    }
     let result = with_host(|host| {
         if matches!(request.direction, DmaDirection::FromRdram)
             && !fn64_runtime::rom::is_sram_dev_addr(request.cart_addr)
@@ -190,6 +533,10 @@ fn start_timed_pi_dma(
                 "{shim}: no ROM installed -- call fn64_abi::load_rom(bytes) before any PI/EPI DMA"
             )
         }
+        if request.len == 0 {
+            return Err(DeviceFault::ZeroLengthPiDma);
+        }
+
         let pending = PendingPiCompletion {
             request,
             rdram,
@@ -197,35 +544,20 @@ fn start_timed_pi_dma(
             ret_queue,
             ret_mesg,
         };
-        if host.pending_pi_completion.is_some() {
-            // A transfer is in flight. Real `osEPiStartDma` does NOT report
-            // that as -1 -- it enqueues the OSIoMesg on the PI manager's
-            // command queue and returns 0; -1 means the COMMAND QUEUE is
-            // full (`!__osPiDevMgr.active` aside). Model exactly that:
-            // accept up to the game's own `osCreatePiManager(cmdMsgCnt)`
-            // requests, started in FIFO order as prior transfers complete
-            // (see `HostState::queued_pi_requests`' doc for the WM2000
-            // tight-retry livelock a busy=-1 model causes).
-            if host.queued_pi_requests.len() >= host.pi_cmd_queue_capacity {
-                return Err(DeviceFault::PiBusy);
-            }
-            host.queued_pi_requests.push_back(pending);
-            return Ok(());
+        // Interleaving closed here: thread A starts a managed PI transfer and
+        // blocks on its completion queue; before that deadline, thread B
+        // submits another managed transfer. The PI manager must accept B and
+        // serialize it behind A. Returning raw `PiBusy` to B makes DmaMgr
+        // report a completed-but-truncated multi-chunk load to its client.
+        if host.pending_pi_completions.is_empty() {
+            host.device_fabric.start_pi_dma(request)?;
         }
-        let fabric = &mut host.device_fabric;
-        fabric.start_pi_dma(request)?;
-        host.pending_pi_completion = Some(pending);
+        host.pending_pi_completions.push_back(pending);
         Ok(())
     });
     if matches!(result, Err(DeviceFault::PiBusy)) {
-        // The command queue is genuinely full: the guest has outrun the PI
-        // engine and is (on hardware) about to burn real time in a retry
-        // spin while PI interrupts drain the queue. Charge that stall and
-        // checkpoint -- outside the `with_host` borrow -- so virtual time
-        // advances and the in-flight completion can commit; the guest's next
-        // retry then observes a freed slot. See
-        // `charge_guest_device_busy_retry`'s doc for the WM2000 livelock
-        // this prevents.
+        // Charge outside the HostState borrow so the checkpoint may advance
+        // virtual time and commit the in-flight transfer before the retry.
         crate::charge_guest_device_busy_retry();
     }
     result
@@ -284,6 +616,10 @@ fn start_raw_pi_dma(
 }
 
 fn live_device_mmio_addr(vaddr: u64, write: bool) -> Option<MmioAddr> {
+    let upper = vaddr >> 32;
+    if upper != 0 && upper != u32::MAX as u64 {
+        return None;
+    }
     let addr = vaddr as u32;
     let is_sp = (0xA400_0000..0xA400_2000).contains(&addr)
         || matches!(
@@ -365,32 +701,90 @@ pub(crate) fn clear_device_interrupt(source: fn64_runtime::InterruptSource) {
 }
 
 pub(crate) fn start_live_ai_dma(request: AiDmaRequest) -> Result<(), DeviceFault> {
+    if crate::boot_probe_enabled() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed);
+        if n < 6 || n.is_multiple_of(2048) {
+            eprintln!(
+                "[boot-probe] start_live_ai_dma #{n} len={:#x} rate={}Hz",
+                request.len, request.sample_rate_hz
+            );
+        }
+    }
     with_host(|host| host.device_fabric.start_ai_dma(request))
 }
 
 pub(crate) fn start_live_si_dma(
     request: fn64_runtime::SiDmaRequest,
-    rdram: *mut u8,
-    rdram_len: usize,
+    owner: PendingSiCompletionOwner,
 ) -> Result<(), DeviceFault> {
     with_host(|host| {
         host.device_fabric.start_si_dma(request)?;
-        host.pending_si_completion = Some(PendingSiCompletion {
-            request,
-            rdram,
-            rdram_len,
-        });
+        assert!(
+            host.pending_si_completion.is_none(),
+            "SI hardware accepted a request while prior completion ownership remained live"
+        );
+        host.pending_si_completion = Some(PendingSiCompletion { request, owner });
+        Ok(())
+    })
+}
+
+pub(crate) fn start_live_controller_si_dma(
+    request: fn64_runtime::SiDmaRequest,
+    owner: PendingSiCompletionOwner,
+    command: [u8; 64],
+) -> Result<(), DeviceFault> {
+    assert!(
+        matches!(
+            request.kind,
+            fn64_runtime::SiDmaKind::ControllerQuery | fn64_runtime::SiDmaKind::ControllerRead
+        ),
+        "Controller Manager attempted to stage a non-controller SI request"
+    );
+    with_host(|host| {
+        host.device_fabric.start_si_dma(request)?;
+        assert!(
+            host.pending_si_completion.is_none(),
+            "SI hardware accepted a request while prior completion ownership remained live"
+        );
+        host.device_fabric.stage_controller_pif_command(command);
+        host.pending_si_completion = Some(PendingSiCompletion { request, owner });
         Ok(())
     })
 }
 
 pub(crate) fn start_live_rcp_task_with_latency(
-    needs_dp: bool,
+    plan: fn64_runtime::RcpTaskCompletionPlan,
     rsp_steps: u64,
 ) -> Result<(), DeviceFault> {
     with_host(|host| {
         host.device_fabric
-            .start_rcp_task_with_latency(needs_dp, fn64_runtime::Cycles::new(rsp_steps.max(1)))
+            .start_rcp_task_with_latency(plan, fn64_runtime::Cycles::new(rsp_steps.max(1)))
+    })
+}
+
+pub(crate) fn begin_live_rcp_task() -> Result<(), DeviceFault> {
+    with_host(|host| host.device_fabric.begin_rcp_task())
+}
+
+pub(crate) fn finish_live_rcp_task(
+    plan: fn64_runtime::RcpTaskCompletionPlan,
+    rsp_steps: u64,
+) -> Result<(), DeviceFault> {
+    with_host(|host| {
+        host.device_fabric
+            .finish_rcp_task(plan, fn64_runtime::Cycles::new(rsp_steps.max(1)))
+    })
+}
+
+pub(crate) fn start_live_dp_full_sync() -> Result<(), DeviceFault> {
+    // Public documentation defines the FullSync -> DP-interrupt relationship,
+    // but not a cycle formula. Keep the existing one-cycle compatibility
+    // policy explicit at this single host/device boundary.
+    with_host(|host| {
+        host.device_fabric
+            .start_dp_full_sync(fn64_runtime::Cycles::new(1))
     })
 }
 
@@ -420,6 +814,7 @@ pub(crate) unsafe fn admit_live_sp_task(
     rdram: *mut u8,
     task_addr: RdramAddr,
     header: fn64_runtime::OsTaskHeader,
+    boot: &[u8],
 ) -> Result<(), DeviceFault> {
     let boot_size = header
         .ucode_boot_size
@@ -433,7 +828,10 @@ pub(crate) unsafe fn admit_live_sp_task(
         .expect("osSpTaskLoad rspboot range overflow");
     let required_len = task_end.max(boot_end);
     let view = unsafe { LiveRdramDma::new(rdram, required_len) };
-    with_host(|host| host.device_fabric.admit_sp_task(&view, task_addr, header))
+    with_host(|host| {
+        host.device_fabric
+            .admit_sp_task_with_boot_image(&view, task_addr, header, boot)
+    })
 }
 
 pub(crate) fn arm_live_vi(interval: u64) -> Result<(), DeviceFault> {
@@ -579,7 +977,7 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
         let is_pi_dma_start = matches!(addr.get(), 0xA460_0008 | 0xA460_000C);
         let is_si_dma_start = matches!(addr.get(), 0xA480_0004 | 0xA480_0010);
         let is_sp_dma_start = matches!(addr.get(), 0xA404_0008 | 0xA404_000C);
-        if is_pi_dma_start && host.pending_pi_completion.is_some() {
+        if is_pi_dma_start && !host.pending_pi_completions.is_empty() {
             panic!("raw MMIO PI DMA start while the PI channel is busy");
         }
         if is_pi_dma_start && !host.rom_installed {
@@ -620,7 +1018,7 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
                 end <= rdram_len,
                 "raw PI DMA RDRAM range ends at {end:#x}, beyond registered allocation {rdram_len:#x}"
             );
-            host.pending_pi_completion = Some(PendingPiCompletion {
+            host.pending_pi_completions.push_back(PendingPiCompletion {
                 request,
                 rdram,
                 rdram_len,
@@ -633,11 +1031,10 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
                 .expect("SI start register write succeeded without a pending transfer");
             host.pending_si_completion = Some(PendingSiCompletion {
                 request,
-                rdram,
-                rdram_len,
+                owner: PendingSiCompletionOwner::ProcessRdram { rdram, rdram_len },
             });
         } else if addr.get() == 0xA460_0010 && value & 1 != 0 {
-            host.pending_pi_completion = None;
+            host.pending_pi_completions.clear();
         }
     });
     true
@@ -646,7 +1043,34 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
 /// Shared raw word path for typed block execution and the generated-C MMIO
 /// proxy. Non-device RCP registers remain in `MmioSpace`; modeled timed
 /// devices are intercepted by `DeviceFabric` first.
+/// Physical-window match for direct CPU access to the 64-byte PIF RAM
+/// (`0x1FC007C0..0x1FC00800`), accepting both KSEG0 and KSEG1 views. Raw
+/// PIF polling is real hardware behavior (AKI-era joybus code and boot
+/// handshakes); without this window such a load computes an out-of-range
+/// flat-RDRAM index instead.
+fn pif_ram_window_offset(vaddr: u64) -> Option<usize> {
+    let upper = vaddr >> 32;
+    let low = vaddr as u32;
+    let physical = low & 0x1FFF_FFFF;
+    ((upper == 0 || upper == u32::MAX as u64)
+        && (0x8000_0000..0xC000_0000).contains(&low)
+        && (0x1FC0_07C0..0x1FC0_0800).contains(&physical))
+    .then(|| (physical - 0x1FC0_07C0) as usize)
+}
+
 pub(crate) fn read_raw_mmio_word(vaddr: u64) -> Option<u32> {
+    if crate::boot_probe_enabled() {
+        let low = vaddr as u32;
+        if (0xA480_0000..0xA480_0020).contains(&low) {
+            let value = read_live_rcp_interrupt_mmio(vaddr);
+            eprintln!("[boot-probe] raw SI read {low:#010x} -> {value:?}");
+        }
+    }
+    if let Some(offset) = pif_ram_window_offset(vaddr) {
+        return Some(with_host(|host| {
+            host.device_fabric.pif_ram_cpu_read_w(offset)
+        }));
+    }
     if let Some(value) = read_live_device_mmio(vaddr) {
         return Some(value);
     }
@@ -663,6 +1087,16 @@ pub(crate) fn read_raw_mmio_word(vaddr: u64) -> Option<u32> {
 }
 
 pub(crate) fn write_raw_mmio_word(vaddr: u64, value: u32) -> bool {
+    if crate::boot_probe_enabled() {
+        let low = vaddr as u32;
+        if (0xA480_0000..0xA480_0020).contains(&low) || (0xA404_0000..0xA404_0020).contains(&low) {
+            eprintln!("[boot-probe] raw SI/SP write {low:#010x} = {value:#010x}");
+        }
+    }
+    if let Some(offset) = pif_ram_window_offset(vaddr) {
+        with_host(|host| host.device_fabric.pif_ram_cpu_write_w(offset, value));
+        return true;
+    }
     if write_live_device_mmio(vaddr, value) {
         return true;
     }
@@ -704,15 +1138,48 @@ pub(crate) fn write_raw_mmio_word(vaddr: u64, value: u32) -> bool {
 
 /// Commit due device work before any executor resume is possible.
 pub(crate) fn advance_device_time(now: u64) {
+    loop {
+        let step = with_host(|host| {
+            let current = host.device_fabric.now().get();
+            assert!(
+                now >= current,
+                "device time moved backwards from {current} to {now}"
+            );
+            host.device_fabric
+                .next_deadline()
+                .filter(|deadline| deadline.get() <= now)
+                .map_or(now, fn64_runtime::Cycles::get)
+        });
+        advance_device_time_step(step);
+        if step == now {
+            break;
+        }
+    }
+}
+
+/// Advance through exactly one due device deadline. Keeping notification
+/// handling at this boundary lets a VI mode latch reschedule the following
+/// field before the fabric advances again, while executor wakeups remain
+/// deferred until the committed event has been converted to owned messages.
+fn advance_device_time_step(now: u64) {
+    if crate::boot_probe_enabled() {
+        let next = with_host(|host| host.device_fabric.next_deadline().map(|d| d.get()));
+        if next.is_some_and(|d| d <= now) {
+            eprintln!("[boot-probe] advance_device_time(now={now}) due_deadline={next:?}");
+        }
+    }
     enum ReadyNotification {
         External(ExternalEvent),
-        ViRetrace,
+        ViRetrace {
+            scanout: fn64_render::ViScanoutState,
+            noise_seed: u64,
+        },
     }
 
     let pending_vi_framebuffer =
         with_executor(|exec| exec.vi().next_framebuffer.map(RdramAddr::offset));
     let (events, overlays) = with_host(|host| {
-        let pending_pi = host.pending_pi_completion;
+        let pending_pi = host.pending_pi_completions.front().copied();
         let pending_si = host.pending_si_completion;
         let sp_memory = host
             .device_fabric
@@ -720,9 +1187,12 @@ pub(crate) fn advance_device_time(now: u64) {
             .then_some((host.runtime_rdram, host.runtime_rdram_len));
         let memory = [
             pending_pi.map(|pending| (pending.rdram, pending.rdram_len)),
-            pending_si
-                .filter(|pending| !pending.rdram.is_null())
-                .map(|pending| (pending.rdram, pending.rdram_len)),
+            pending_si.and_then(|pending| match pending.owner {
+                PendingSiCompletionOwner::ProcessRdram { rdram, rdram_len } => {
+                    Some((rdram, rdram_len))
+                }
+                PendingSiCompletionOwner::OsEvent | PendingSiCompletionOwner::PfsIsPlug(_) => None,
+            }),
             sp_memory,
         ]
         .into_iter()
@@ -740,6 +1210,8 @@ pub(crate) fn advance_device_time(now: u64) {
                 None => Some((ptr, len)),
             },
         );
+        let mut raw_save_operations = Vec::new();
+        let mut raw_controller_operations = Vec::new();
         let fabric = &mut host.device_fabric;
         let notifications = if let Some((rdram, rdram_len)) = memory {
             assert!(
@@ -757,7 +1229,12 @@ pub(crate) fn advance_device_time(now: u64) {
                     Cycles::new(now),
                     &mut view,
                     |device_time, pif_ram, pi_dma| {
-                        crate::si::execute_controller_pif(device_time, pif_ram, pi_dma)
+                        raw_save_operations.extend(pi_dma.take_save_operations());
+                        let observations =
+                            crate::si::execute_controller_pif(device_time, pif_ram, pi_dma);
+                        raw_save_operations.extend(observations.save_operations);
+                        raw_controller_operations.extend(observations.controller_operations);
+                        raw_save_operations.extend(pi_dma.take_save_operations());
                     },
                 )
                 .unwrap_or_else(|error| panic!("device advance failed: {error}"))
@@ -768,20 +1245,28 @@ pub(crate) fn advance_device_time(now: u64) {
                     Cycles::new(now),
                     &mut empty,
                     |device_time, pif_ram, pi_dma| {
-                        crate::si::execute_controller_pif(device_time, pif_ram, pi_dma)
+                        raw_save_operations.extend(pi_dma.take_save_operations());
+                        let observations =
+                            crate::si::execute_controller_pif(device_time, pif_ram, pi_dma);
+                        raw_save_operations.extend(observations.save_operations);
+                        raw_controller_operations.extend(observations.controller_operations);
+                        raw_save_operations.extend(pi_dma.take_save_operations());
                     },
                 )
                 .unwrap_or_else(|error| panic!("device clock advance failed: {error}"))
         };
 
+        raw_save_operations.extend(fabric.pi_dma_mut().take_save_operations());
+        host.save_operations.extend(raw_save_operations);
+        host.controller_operations.extend(raw_controller_operations);
         let mut events = Vec::new();
         let mut overlays = Vec::new();
         for notification in notifications {
             match notification {
                 DeviceNotification::PiDmaComplete(completion) => {
                     let pending = host
-                        .pending_pi_completion
-                        .take()
+                        .pending_pi_completions
+                        .pop_front()
                         .expect("PI hardware completed without OS-side completion metadata");
                     assert_eq!(
                         pending.request,
@@ -835,22 +1320,15 @@ pub(crate) fn advance_device_time(now: u64) {
                             msg: pending.ret_mesg,
                         }));
                     }
-                    // PI-manager serialization: the single PI channel is
-                    // free again -- start the next command-queue request
-                    // (FIFO), exactly as libultra's PI manager thread pops
-                    // its cmdQ after each completion. Its own completion is
-                    // scheduled by the fabric and commits on a subsequent
-                    // advance. See `HostState::queued_pi_requests`.
-                    if let Some(next) = host.queued_pi_requests.pop_front() {
+                    if let Some(next) = host.pending_pi_completions.front().copied() {
                         host.device_fabric
                             .start_pi_dma(next.request)
                             .unwrap_or_else(|error| {
                                 panic!(
-                                    "queued PI request failed to start after the prior \
-                                     completion freed the channel: {error}"
+                                    "PI manager could not start queued request {:?}: {error}",
+                                    next.request
                                 )
                             });
-                        host.pending_pi_completion = Some(next);
                     }
                 }
                 DeviceNotification::AiDmaComplete(_) => {
@@ -860,17 +1338,44 @@ pub(crate) fn advance_device_time(now: u64) {
                     )));
                 }
                 DeviceNotification::SiDmaComplete(request) => {
+                    if crate::boot_probe_enabled() {
+                        eprintln!("[boot-probe] SiDmaComplete delivered at now={now}");
+                    }
                     let pending = host
                         .pending_si_completion
                         .take()
                         .expect("SI hardware completed without OS-side completion metadata");
                     assert_eq!(pending.request, request, "SI completion request drifted");
-                    const OS_EVENT_SI: u32 = 5;
-                    events.push(ReadyNotification::External(ExternalEvent::OsEvent(
-                        OS_EVENT_SI,
-                    )));
+                    match pending.owner {
+                        PendingSiCompletionOwner::PfsIsPlug(transaction) => {
+                            let replaced = host
+                                .completed_pfs_is_plug
+                                .insert(transaction.thread, transaction);
+                            assert!(
+                                replaced.is_none(),
+                                "osPfsIsPlug completion collided with an unconsumed transaction for thread {}",
+                                transaction.thread
+                            );
+                            events.push(ReadyNotification::External(ExternalEvent::DirectPost {
+                                queue_addr: transaction.queue,
+                                msg: transaction.message,
+                            }));
+                        }
+                        PendingSiCompletionOwner::ProcessRdram { .. }
+                        | PendingSiCompletionOwner::OsEvent => {
+                            const OS_EVENT_SI: u32 = 5;
+                            events.push(ReadyNotification::External(ExternalEvent::OsEvent(
+                                OS_EVENT_SI,
+                            )));
+                        }
+                    }
                 }
-                DeviceNotification::ViRetrace => {
+                DeviceNotification::ViRetrace { at } => {
+                    assert_eq!(
+                        host.device_fabric.now(),
+                        at,
+                        "VI retrace notification escaped its device deadline"
+                    );
                     if let Some(mode) = host.pending_vi_mode.take() {
                         const FIELD_REGISTER_INDICES: [usize; 5] = [1, 13, 10, 11, 3];
                         for (index, value) in mode.registers.into_iter().enumerate() {
@@ -952,7 +1457,22 @@ pub(crate) fn advance_device_time(now: u64) {
                                 panic!("VI framebuffer-origin latch failed: {error}")
                             });
                     }
-                    events.push(ReadyNotification::ViRetrace);
+                    let mut words = [0u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
+                    for (index, word) in words.iter_mut().enumerate() {
+                        let address = 0xA440_0000
+                            + u32::try_from(index).expect("VI register index exceeds u32") * 4;
+                        *word = host
+                            .device_fabric
+                            .read_mmio(MmioAddr::new(address))
+                            .expect("complete VI register image is not mapped");
+                    }
+                    let scanout = fn64_render::ViScanoutState::Registers(
+                        fn64_render::ViScanoutRegisters::from_words(words),
+                    );
+                    events.push(ReadyNotification::ViRetrace {
+                        scanout,
+                        noise_seed: at.get(),
+                    });
                 }
                 DeviceNotification::RcpTaskComplete(completion) => {
                     let code = match completion {
@@ -993,15 +1513,19 @@ pub(crate) fn advance_device_time(now: u64) {
                         }
                         exec.inject_event(event);
                     }
-                    ReadyNotification::ViRetrace => {
+                    ReadyNotification::ViRetrace {
+                        scanout,
+                        noise_seed,
+                    } => {
                         vi_ticks = vi_ticks.saturating_add(1);
-                        if exec.deliver_vi_retrace() {
-                            presentations.push(fn64_render::ViPresentation {
-                                blanked: exec.vi().blanked,
-                                fade: exec.vi().fade,
-                                repeat_line: exec.vi().repeat_line,
-                            });
-                        }
+                        exec.deliver_vi_retrace();
+                        presentations.push(fn64_render::ViPresentation {
+                            blanked: exec.vi().blanked,
+                            fade: exec.vi().fade,
+                            repeat_line: exec.vi().repeat_line,
+                            scanout,
+                            noise_seed,
+                        });
                     }
                 }
             }
@@ -1037,76 +1561,38 @@ pub(crate) fn advance_device_time(now: u64) {
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn osCartRomInit_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+pub unsafe extern "C" fn osCartRomInit_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     with_pi_dma("osCartRomInit_recomp", |_dma| {});
-    let handle_vram = with_host(|host| {
-        host.cart_rom_handle_vram.unwrap_or_else(|| {
+    let (handle_vram, timing) = with_host(|host| {
+        let handle_vram = host.cart_rom_handle_vram.unwrap_or_else(|| {
             panic!(
                 "osCartRomInit_recomp: no guest OSPiHandle address registered -- call \
                  fn64_abi::set_cart_rom_handle_vram with the ROM's aligned __CartRomHandle \
                  BSS address before boot"
             )
-        })
+        });
+        (
+            handle_vram,
+            host.device_fabric
+                .pi_domain_timing(fn64_runtime::PiDomain::Domain1),
+        )
     });
+    unsafe {
+        write_epi_handle(
+            rdram,
+            handle_vram,
+            DEVICE_TYPE_CART,
+            fn64_runtime::PiDomain::Domain1,
+            timing,
+            0xb000_0000,
+        )
+    };
     let ctx = unsafe { &mut *ctx };
     ctx.r2 = (handle_vram as i32 as i64) as u64;
 }
 
-/// Resolve the physical PI bus base a guest `OSPiHandle` carries, or 0 when
-/// no usable handle was supplied. Real `osEPiStartDma`'s device manager
-/// programs `PI_CART_ADDR` with `K1_TO_PHYS(handle->baseAddress | devAddr)`
-/// (public libultra manual; `baseAddress` is at handle offset +0xC per the
-/// public `OSPiHandle` layout -- byte-verified against NWXE's own SRAM-handle
-/// constructor `func_80000A88`, asm 0x80000A9C-0x80000ABC, which stores
-/// `0xA8000000` at handle+0xC and links the handle with `osEPiLinkHandle`).
-/// Ignoring the handle entirely (the prior behavior) silently retargeted
-/// every domain-2 SRAM transfer at cartridge-ROM offset `devAddr`: NWXE's
-/// save-signature write (`func_800F4B60`, devAddr 0, OS_WRITE) then hit the
-/// read-only-ROM rejection and the game's `while (osEPiStartDma(..) != 0)`
-/// retry loop span forever -- the boot hang this helper fixes.
-///
-/// Returns 0 (identity: cart-domain devAddrs pass through unchanged) when
-/// the handle GPR is not a KSEG0/KSEG1 RDRAM pointer or the struct would
-/// read out of RDRAM bounds -- `osPiStartDma_recomp` has no handle argument
-/// at all and delegates with `r4` zeroed, and the cart handle registered by
-/// [`set_cart_rom_handle_vram`] is game BSS whose `baseAddress` field the
-/// host never populates (reads 0), keeping the long-standing "cart devAddr
-/// == plain ROM offset" convention intact for both.
-///
-/// # Safety
-/// `rdram` must be the live RDRAM allocation; guest execution suspended.
-unsafe fn epi_handle_phys_base(rdram: *mut u8, handle_gpr: u64) -> u32 {
-    let vram = handle_gpr as u32;
-    // KSEG0 (0x80000000..) or KSEG1 (0xA0000000..) direct-mapped pointer.
-    if vram & 0xC000_0000 != 0x8000_0000 {
-        return 0;
-    }
-    let offset = vram & 0x1FFF_FFFF;
-    // OSPiHandle is 0x74 bytes; only baseAddress (+0xC) is read. Bounds are
-    // against plain RDRAM (8 MiB) -- a handle pointer outside it is not a
-    // real guest struct.
-    if u64::from(offset) + 0x10 > 0x0080_0000 {
-        return 0;
-    }
-    let base = unsafe { read_offset_word(rdram, offset, 0xC) };
-    base & 0x1FFF_FFFF
-}
-
-/// Map a `handle->baseAddress | devAddr` physical bus address onto fn64's
-/// `PiDma` device-address convention: domain-2 SRAM addresses
-/// (`0x08000000..0x10000000`, see `fn64_runtime::rom::is_sram_dev_addr`)
-/// pass through so the save engine routes them; domain-1 cart-space
-/// addresses (`>= 0x10000000`) drop the cart base because `PiDma`'s ROM
-/// backing indexes by plain ROM offset (every existing caller already
-/// passes bare offsets with a zero `baseAddress`).
-fn pi_bus_to_dev_addr(phys_base: u32, dev_addr: u32) -> u32 {
-    let bus = phys_base | dev_addr;
-    if bus >= 0x1000_0000 { bus - 0x1000_0000 } else { bus }
-}
-
 /// `osEPiStartDma(OSPiHandle *handle, OSIoMesg *mb, s32 direction)` --
-/// `a0`=handle (`ctx->r4`, resolved via [`epi_handle_phys_base`] for the
-/// domain routing real hardware derives from `handle->baseAddress`),
+/// `a0`=handle (`ctx->r4`, decoded through the public `OSPiHandle` layout),
 /// `a1`=mb (`ctx->r5`, an `OSIoMesg*`), `a2`=direction (`ctx->r6`,
 /// `OS_READ`=0/`OS_WRITE`=1 per the public manual).
 ///
@@ -1150,6 +1636,10 @@ fn pi_bus_to_dev_addr(phys_base: u32, dev_addr: u32) -> u32 {
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
+    unsafe { epi_start_dma_impl(rdram, ctx, true) }
+}
+
+unsafe fn epi_start_dma_impl(rdram: *mut u8, ctx: *mut RecompContext, use_handle: bool) {
     let ctx = unsafe { &mut *ctx };
     let mb_addr = RdramAddr::from_gpr(ctx.r5);
     let direction = if ctx.r6 == 0 {
@@ -1203,12 +1693,24 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
     // wave's own regression test after the sibling double-translation bug
     // (see the correction note above `read_offset_word`'s introduction).
     let dram_addr = RdramAddr::from_gpr(read_offset_word(rdram, mb_addr.offset(), 0x8) as u64);
-    // Real osEPiStartDma routes through handle->baseAddress (domain-1 cart
-    // vs domain-2 SRAM) -- see epi_handle_phys_base's doc comment for the
-    // NWXE save-write boot hang that ignoring the handle caused.
-    let handle_base = unsafe { epi_handle_phys_base(rdram, ctx.r4) };
-    let dev_addr = pi_bus_to_dev_addr(handle_base, read_offset_word(rdram, mb_addr.offset(), 0xC));
+    let mut dev_addr = read_offset_word(rdram, mb_addr.offset(), 0xC);
     let len = read_offset_word(rdram, mb_addr.offset(), 0x10);
+    if use_handle {
+        dev_addr =
+            unsafe { resolve_epi_device_address(rdram, ctx.r4, dev_addr, "osEPiStartDma_recomp") };
+    }
+    if crate::boot_probe_enabled() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed);
+        if n < 12 || n.is_multiple_of(65536) {
+            eprintln!(
+                "[boot-probe] osEPiStartDma handle={:#010x} dev={:#x}",
+                ctx.r4 as u32,
+                read_offset_word(rdram, mb_addr.offset(), 0xC)
+            );
+        }
+    }
 
     let logical_end = usize::try_from(dram_addr.offset().checked_add(len).unwrap_or_else(|| {
         panic!(
@@ -1261,9 +1763,9 @@ pub unsafe extern "C" fn osEPiRawStartDma_recomp(rdram: *mut u8, ctx: *mut Recom
     };
     let dram_addr = RdramAddr::from_gpr(ctx.r7);
     let len = unsafe { read_stack_word(rdram, ctx.r29, 0x10) };
-    // Same handle->baseAddress domain routing as osEPiStartDma_recomp.
-    let handle_base = unsafe { epi_handle_phys_base(rdram, ctx.r4) };
-    let dev_addr = pi_bus_to_dev_addr(handle_base, ctx.r6 as u32);
+    let dev_addr = unsafe {
+        resolve_epi_device_address(rdram, ctx.r4, ctx.r6 as u32, "osEPiRawStartDma_recomp")
+    };
     ctx.r2 = if start_raw_pi_dma(
         rdram,
         direction,
@@ -1302,8 +1804,11 @@ pub unsafe extern "C" fn osVirtualToPhysical_recomp(_rdram: *mut u8, ctx: *mut R
 /// section 2's stackful-coroutine model, "the PI manager" is not a second
 /// host thread in this design (there is exactly one executor thread) --
 /// its role (serializing `osEPiStartDma` requests onto the single PI bus,
-/// posting completions) is owned by the shared timed `DeviceFabric` used by
-/// `osEPiStartDma_recomp` and raw PI MMIO. This shim's remaining setup effect is
+/// posting completions) is owned by the ABI manager queue in front of the
+/// shared timed `DeviceFabric` used by `osEPiStartDma_recomp` and raw PI MMIO.
+/// The fabric still has exactly one hardware transfer; accepted managed
+/// requests wait FIFO behind it instead of observing `PiBusy` as an API error.
+/// This shim's remaining setup effect is
 /// registering `cmdQ` as a genuine `MesgQueue` (so a real ROM's own
 /// `osSendMesg`/`osRecvMesg` calls against it, if any, behave correctly),
 /// matching the one piece of `osCreatePiManager`'s documented contract this
@@ -1318,11 +1823,6 @@ pub unsafe extern "C" fn osCreatePiManager_recomp(_rdram: *mut u8, ctx: *mut Rec
     let cmd_q = RdramAddr::from_gpr(ctx.r5);
     let cmd_msg_cnt = ctx.r7 as usize;
     with_executor(|exec| exec.create_mesg_queue(cmd_q, cmd_msg_cnt.max(1)));
-    // The cmdQ depth is also the managed-DMA queueing capacity: how many
-    // `osEPiStartDma` requests may wait behind the in-flight transfer
-    // before the shim reports a full command queue (-1). NWXE passes 0x40
-    // (funcs_0.c asm 0x800004F8). See `HostState::queued_pi_requests`.
-    with_host(|host| host.pi_cmd_queue_capacity = cmd_msg_cnt);
 }
 
 /// `__osPiGetAccess(void)` -- no arguments (verified: real call site
@@ -1353,8 +1853,8 @@ pub unsafe extern "C" fn __osPiGetAccess_recomp(_rdram: *mut u8, _ctx: *mut Reco
 pub unsafe extern "C" fn __osPiRelAccess_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
 
 /// `osEPiReadIo(OSPiHandle *handle, u32 devAddr, void *dramAddr) -> s32` --
-/// `a0`=handle (`ctx->r4`, unused, same as `osEPiStartDma_recomp`'s
-/// `osCartRomInit_recomp`-established handle stance), `a1`=devAddr
+/// `a0`=handle (`ctx->r4`, the common handle/address/timing authority shared
+/// with raw EPI DMA), `a1`=devAddr
 /// (`ctx->r5`), `a2`=dramAddr (`ctx->r6`) -- verified against the real call
 /// site (`funcs_0.c:2611`: `ctx->r4=MEM_W(...)` a handle-shaped global,
 /// `ctx->r5=0x3C` a devAddr, `ctx->r6=sp+0x24` a stack dramAddr). Public
@@ -1367,12 +1867,26 @@ pub unsafe extern "C" fn __osPiRelAccess_recomp(_rdram: *mut u8, _ctx: *mut Reco
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osEPiReadIo_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
+    unsafe { epi_read_io_impl(rdram, ctx, true) }
+}
+
+unsafe fn epi_read_io_impl(rdram: *mut u8, ctx: *mut RecompContext, use_handle: bool) {
     let ctx = unsafe { &mut *ctx };
-    let dev_addr = ctx.r5 as u32;
+    let dev_addr = if use_handle {
+        unsafe { resolve_epi_device_address(rdram, ctx.r4, ctx.r5 as u32, "osEPiReadIo_recomp") }
+    } else {
+        ctx.r5 as u32
+    };
     let dram_addr = RdramAddr::from_gpr(ctx.r6).offset() as usize;
-    with_pi_dma("osEPiReadIo_recomp", |dma| {
+    let record_sram = with_pi_dma("osEPiReadIo_recomp", |dma| {
         let mut buf = [0u8; 4];
-        dma.read_rom_bytes(dev_addr, &mut buf);
+        let record_sram = if fn64_runtime::rom::is_sram_dev_addr(dev_addr) {
+            dma.sram_read_into(dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE, &mut buf);
+            dma.save_len() == Some(fn64_runtime::SaveType::SramBanked.byte_len())
+        } else {
+            dma.read_rom_bytes(dev_addr, &mut buf);
+            false
+        };
         // Same word-swizzle as PiDma::start_dma / Rdram::write_bytes: rdram is
         // native-endian-WORD storage, so a big-endian cartridge word must be
         // stored byte-reversed or a later MEM_W/MEM_BU reads it swapped. A flat
@@ -1381,7 +1895,16 @@ pub unsafe extern "C" fn osEPiReadIo_recomp(rdram: *mut u8, ctx: *mut RecompCont
         unsafe {
             std::ptr::copy_nonoverlapping(swz.as_ptr(), rdram.add(dram_addr), 4);
         }
+        record_sram
     });
+    if record_sram {
+        crate::record_save_operation(
+            fn64_runtime::SaveType::SramBanked,
+            fn64_runtime::SaveOperationKind::Read,
+            (dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE) as usize,
+            4,
+        );
+    }
     ctx.r2 = 0;
 }
 
@@ -1399,7 +1922,7 @@ pub unsafe extern "C" fn osPiReadIo_recomp(rdram: *mut u8, ctx: *mut RecompConte
     let data = ctx.r5;
     ctx.r5 = dev_addr;
     ctx.r6 = data;
-    unsafe { osEPiReadIo_recomp(rdram, ctx) };
+    unsafe { epi_read_io_impl(rdram, ctx, false) };
 }
 
 unsafe fn write_io_mesg_word(rdram: *mut u8, mb: RdramAddr, offset: u32, value: u32) {
@@ -1448,13 +1971,9 @@ pub unsafe extern "C" fn osPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCon
         write_io_mesg_word(rdram, mb, 0x10, nbytes);
     }
 
-    // osPiStartDma has no OSPiHandle argument (implicit domain-1 cart).
-    // Zero r4 so the delegate's epi_handle_phys_base doesn't misread the
-    // OSIoMesg pointer still sitting there as a handle struct.
-    ctx.r4 = 0;
     ctx.r5 = mb.to_kseg0() as i32 as u64;
     ctx.r6 = direction;
-    unsafe { osEPiStartDma_recomp(rdram, ctx) };
+    unsafe { epi_start_dma_impl(rdram, ctx, false) };
 }
 
 /// `osPiGetStatus(void) -> u32`. Reads the same authoritative PI status used
@@ -1469,27 +1988,49 @@ pub unsafe extern "C" fn osPiGetStatus_recomp(_rdram: *mut u8, ctx: *mut RecompC
 }
 
 /// `osEPiWriteIo(OSPiHandle *handle, u32 devAddr, u32 data) -> s32` --
-/// `a0`=handle (unused), `a1`=devAddr (`ctx->r5`), `a2`=data (`ctx->r6`).
-/// Public libultra manual's synchronous single-word cartridge-domain
-/// WRITE counterpart to `osEPiReadIo_recomp`. `PiDma`/`InMemoryRom` (this
-/// crate's ROM backing) has no write-to-cart-domain support (`rom.rs`'s
-/// `PiDma` doc: ROM is read-only host state). As with the managed and raw DMA
-/// entry points, rejection is reported through the public `s32` result rather
-/// than aborting the host or pretending the write succeeded.
+/// the synchronous single-word counterpart to `osEPiReadIo_recomp`. The
+/// shared handle resolver applies `baseAddress | devAddr` and publishes the
+/// handle's bus timing through the raw PI registers. SRAM writes reach the
+/// same `PiDma` save store as DMA; cartridge-ROM writes return -1 because the
+/// installed ROM source is read-only.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn osEPiWriteIo_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
-    unsafe { &mut *ctx }.r2 = u64::MAX;
+pub unsafe extern "C" fn osEPiWriteIo_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let dev_addr =
+        unsafe { resolve_epi_device_address(rdram, ctx.r4, ctx.r5 as u32, "osEPiWriteIo_recomp") };
+    if fn64_runtime::rom::is_sram_dev_addr(dev_addr) {
+        let record_sram = with_pi_dma("osEPiWriteIo_recomp", |dma| {
+            dma.sram_write_from(
+                dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE,
+                &(ctx.r6 as u32).to_be_bytes(),
+            );
+            dma.save_len() == Some(fn64_runtime::SaveType::SramBanked.byte_len())
+        });
+        if record_sram {
+            crate::record_save_operation(
+                fn64_runtime::SaveType::SramBanked,
+                fn64_runtime::SaveOperationKind::Write,
+                (dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE) as usize,
+                4,
+            );
+        }
+        ctx.r2 = 0;
+    } else {
+        ctx.r2 = u64::MAX;
+    }
 }
 
 /// `osLeoDiskInit(void) -> OSPiHandle *` -- constructs the public EPI handle
 /// for the N64 Disk Drive register range. Public Chapter 27 documentation
-/// defines device type 2, domain-2 address 0x0500_0000, and the handle field
-/// layout. Timing parameters are supplied by the host configuration rather
-/// than guessed. A retail boot that reaches this path without configuring a
-/// drive traps with setup context instead of inventing attached hardware.
+/// defines device type 2 and the domain-2 physical address 0x0500_0000; the
+/// public handle stores its uncached KSEG1 form 0xA500_0000, matching Chapter
+/// 27's acquisition pattern. Timing parameters are supplied by the host
+/// configuration rather than guessed. A retail boot that reaches this path
+/// without configuring a drive traps with setup context instead of inventing
+/// attached hardware.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
@@ -1504,19 +2045,20 @@ pub unsafe extern "C" fn osLeoDiskInit_recomp(rdram: *mut u8, ctx: *mut RecompCo
             )
         })
     });
-    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
-    let base = RdramAddr::from_gpr(config.handle_vram as u64);
     unsafe {
-        storage.write_u32(base, 0); // next
-        storage.write_u8(base.checked_add(4).unwrap(), 2); // DEVICE_TYPE_64DD
-        storage.write_u8(base.checked_add(5).unwrap(), config.latency);
-        storage.write_u8(base.checked_add(6).unwrap(), config.page_size);
-        storage.write_u8(base.checked_add(7).unwrap(), config.release);
-        storage.write_u8(base.checked_add(8).unwrap(), config.pulse_width);
-        storage.write_u8(base.checked_add(9).unwrap(), 1); // PI_DOMAIN2
-        storage.write_u16(base.checked_add(10).unwrap(), 0); // ABI padding
-        storage.write_u32(base.checked_add(12).unwrap(), 0x0500_0000);
-        storage.write_u32(base.checked_add(16).unwrap(), 0);
+        write_epi_handle(
+            rdram,
+            config.handle_vram,
+            DEVICE_TYPE_64DD,
+            fn64_runtime::PiDomain::Domain2,
+            fn64_runtime::PiDomainTiming {
+                latency: config.latency,
+                page_size: config.page_size,
+                release: config.release,
+                pulse_width: config.pulse_width,
+            },
+            0xa500_0000,
+        )
     }
     unsafe { &mut *ctx }.r2 = (config.handle_vram as i32 as i64) as u64;
 }
@@ -1525,6 +2067,195 @@ pub unsafe extern "C" fn osLeoDiskInit_recomp(rdram: *mut u8, ctx: *mut RecompCo
 mod tests {
     use super::*;
     use crate::test_support::*;
+
+    fn install_cart_handle(rdram: &mut [u8], offset: u32) -> u64 {
+        let handle_vram = 0x8000_0000 | offset;
+        set_cart_rom_handle_vram(handle_vram);
+        let mut ctx = ctx_zeroed();
+        unsafe { osCartRomInit_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(ctx.r2 as u32, handle_vram);
+        ctx.r2
+    }
+
+    fn install_sram_handle(
+        rdram: &mut [u8],
+        offset: u32,
+        timing: fn64_runtime::PiDomainTiming,
+    ) -> u64 {
+        let handle_vram = 0x8000_0000 | offset;
+        unsafe {
+            write_epi_handle(
+                rdram.as_mut_ptr(),
+                handle_vram,
+                DEVICE_TYPE_SRAM,
+                fn64_runtime::PiDomain::Domain2,
+                timing,
+                0xa800_0000,
+            )
+        };
+        handle_vram as i32 as u64
+    }
+
+    #[test]
+    fn loading_a_rom_clears_prior_rsp_rdp_observations() {
+        load_rom(vec![0]);
+        crate::record_rsp_rdp_observations(vec![crate::RspRdpObservationKind::DramDpcCommitted {
+            start: 0,
+            end: 8,
+            command_sha256: [0x5a; 32],
+        }]);
+        assert_eq!(crate::copy_rsp_rdp_observations().len(), 1);
+
+        load_rom(vec![1]);
+
+        assert!(crate::copy_rsp_rdp_observations().is_empty());
+    }
+
+    #[test]
+    fn synchronous_pi_boundaries_preserve_same_cycle_cross_owner_save_order() {
+        load_rom(vec![0; 0x100]);
+        set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+            fn64_runtime::SaveType::Eeprom4k,
+        )));
+
+        with_pi_dma("same-cycle save ordering", |dma| {
+            dma.eeprom_read_block(Cycles::ZERO, 0).unwrap();
+        });
+        crate::record_save_operation(
+            fn64_runtime::SaveType::ControllerPak,
+            fn64_runtime::SaveOperationKind::Read,
+            0x20,
+            fn64_runtime::pfs::PFS_BLOCK_SIZE,
+        );
+        with_pi_dma("same-cycle save ordering", |dma| {
+            dma.eeprom_read_block(Cycles::ZERO, 1).unwrap();
+        });
+
+        assert_eq!(
+            crate::copy_save_operations()
+                .iter()
+                .map(|event| (event.device, event.offset))
+                .collect::<Vec<_>>(),
+            vec![
+                (fn64_runtime::SaveType::Eeprom4k, 0),
+                (fn64_runtime::SaveType::ControllerPak, 0x20),
+                (
+                    fn64_runtime::SaveType::Eeprom4k,
+                    fn64_runtime::save::EEPROM_BLOCK_SIZE as u32,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn sram_evidence_uses_pi_commit_cycle_not_outer_advance_target() {
+        load_rom(vec![0; 0x100]);
+        set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+            fn64_runtime::SaveType::SramBanked,
+        )));
+        let mut rdram = vec![0u8; 64];
+        let started_at = crate::sim_time();
+        start_timed_pi_dma(
+            rdram.as_mut_ptr(),
+            rdram.len(),
+            PiDmaRequest {
+                direction: DmaDirection::ToRdram,
+                dram_addr: RdramAddr::from_offset(0),
+                cart_addr: fn64_runtime::rom::SRAM_DOMAIN2_BASE,
+                len: 4,
+            },
+            None,
+            0,
+            "SRAM evidence timing test",
+        )
+        .unwrap();
+        crate::advance_virtual_time(started_at + 9);
+
+        assert_eq!(
+            crate::copy_save_operations(),
+            vec![fn64_runtime::SaveOperationEvent {
+                at: Cycles::new(started_at + 1),
+                device: fn64_runtime::SaveType::SramBanked,
+                operation: fn64_runtime::SaveOperationKind::Read,
+                offset: 0,
+                len: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn typed_cartridge_save_configuration_is_exact_release_evidence() {
+        load_rom(vec![0; 0x100]);
+        set_cartridge_save(
+            CartridgeSaveType::SramBanked,
+            Box::new(fn64_runtime::InMemorySaveStorage::new(
+                CartridgeSaveType::SramBanked.byte_len(),
+            )),
+        );
+        assert_eq!(
+            host_evidence_snapshot().cartridge_save,
+            CartridgeSaveEvidenceSnapshot::Configured(CartridgeSaveType::SramBanked)
+        );
+
+        load_rom(vec![1; 0x100]);
+        assert_eq!(
+            host_evidence_snapshot().cartridge_save,
+            CartridgeSaveEvidenceSnapshot::Unidentified
+        );
+        configure_no_cartridge_save();
+        assert_eq!(
+            host_evidence_snapshot().cartridge_save,
+            CartridgeSaveEvidenceSnapshot::NoCartridgeSave
+        );
+    }
+
+    #[test]
+    fn legacy_or_wrong_sized_save_configuration_cannot_claim_a_type() {
+        load_rom(vec![0; 0x100]);
+        let wrong_size = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            set_cartridge_save(
+                CartridgeSaveType::Eeprom4k,
+                Box::new(fn64_runtime::InMemorySaveStorage::new(511)),
+            );
+        }));
+        assert!(wrong_size.is_err());
+        assert_eq!(
+            host_evidence_snapshot().cartridge_save,
+            CartridgeSaveEvidenceSnapshot::Unidentified
+        );
+
+        set_save(Box::new(fn64_runtime::InMemorySaveStorage::new(512)));
+        assert_eq!(
+            host_evidence_snapshot().cartridge_save,
+            CartridgeSaveEvidenceSnapshot::Unidentified
+        );
+        let relabel = std::panic::catch_unwind(configure_no_cartridge_save);
+        assert!(relabel.is_err());
+    }
+
+    #[test]
+    fn raw_pif_ram_window_round_trips_through_the_device_fabric() {
+        // KSEG1 and KSEG0 views hit the same 64-byte PIF RAM; the boot
+        // handshake's status word lives in the final word (0x1FC007FC).
+        assert_eq!(read_raw_mmio_word(0xFFFF_FFFF_BFC0_07C0), Some(0));
+        assert!(write_raw_mmio_word(0xFFFF_FFFF_BFC0_07C8, 0xDEAD_BEEF));
+        assert_eq!(read_raw_mmio_word(0xFFFF_FFFF_BFC0_07C8), Some(0xDEAD_BEEF));
+        assert_eq!(read_raw_mmio_word(0xFFFF_FFFF_9FC0_07C8), Some(0xDEAD_BEEF));
+        // The final-word store runs the PIF command interpreter; a zero
+        // command byte must leave a readable (non-faulting) window behind.
+        assert!(write_raw_mmio_word(0xFFFF_FFFF_BFC0_07FC, 0));
+        assert_eq!(read_raw_mmio_word(0xFFFF_FFFF_BFC0_07FC), Some(0));
+        assert!(write_raw_mmio_word(0x0000_0000_9FC0_07CC, 0x1234_5678));
+        assert_eq!(read_raw_mmio_word(0x0000_0000_BFC0_07CC), Some(0x1234_5678));
+        // One byte past the window is NOT PIF RAM.
+        assert_eq!(pif_ram_window_offset(0xFFFF_FFFF_BFC0_0800), None);
+        assert_eq!(pif_ram_window_offset(0x0000_0000_1FC0_07C0), None);
+        assert_eq!(pif_ram_window_offset(0xFFFF_FFFF_DFC0_07C0), None);
+        assert_eq!(pif_ram_window_offset(0x0000_0001_BFC0_07C0), None);
+        assert_eq!(read_raw_mmio_word(0x0000_0000_1FC0_07C0), None);
+        assert!(!write_raw_mmio_word(0xFFFF_FFFF_DFC0_07C0, 1));
+        assert_eq!(live_device_mmio_addr(0x0000_0001_A440_0000, false), None);
+    }
 
     fn complete_pi_dma() {
         let deadline = with_host(|host| {
@@ -1537,12 +2268,30 @@ mod tests {
     }
 
     #[test]
+    fn live_rdram_dma_bounds_logical_bytes_by_complete_native_words() {
+        let mut storage = [0u8; 4];
+        let mut dma = unsafe { LiveRdramDma::new(storage.as_mut_ptr(), storage.len()) };
+
+        fn64_runtime::DmaMemory::dma_write_bytes(&mut dma, 3, &[0xA5]);
+        assert_eq!(
+            fn64_runtime::RdramView::from_storage(&storage).read_u8(RdramAddr::from_offset(3)),
+            0xA5
+        );
+
+        let outside = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fn64_runtime::DmaMemory::dma_write_bytes(&mut dma, 4, &[0x5A]);
+        }));
+        assert!(outside.is_err(), "one-past-end PI DMA byte must trap");
+    }
+
+    #[test]
     fn managed_pi_dma_commits_state_then_posts_completion_before_resume() {
         let mut rom = vec![0u8; 0x100];
         rom[0x20..0x24].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
         load_rom_with_fixed_pi_latency(rom, 5);
 
         let mut rdram = vec![0u8; 0x1000];
+        let cart_handle = install_cart_handle(&mut rdram, 0x800);
         let queue = RdramAddr::from_offset(0x300);
         with_executor(|exec| exec.create_mesg_queue(queue, 1));
         let mb = 0x100usize;
@@ -1552,6 +2301,7 @@ mod tests {
         rdram[mb + 0x10..mb + 0x14].copy_from_slice(&4u32.to_ne_bytes());
 
         let mut ctx = ctx_zeroed();
+        ctx.r4 = cart_handle;
         ctx.r5 = 0x8000_0100;
         ctx.r6 = 0;
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx) };
@@ -1608,106 +2358,89 @@ mod tests {
             kinds[4],
             fn64_runtime::DeviceTraceKind::NotificationReady(_)
         ));
+        assert_eq!(
+            copy_device_trace()
+                .into_iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            kinds,
+            "public release-evidence accessor must copy the fabric-owned trace verbatim"
+        );
     }
 
-    /// WM2000 chunked-loader regression (`funcs_5.c` `func_80012064`, asm
-    /// 0x8001214C `while (osEPiStartDma(..) != 0);`): a second managed DMA
-    /// issued while one is in flight must be QUEUED and return 0 -- real
-    /// `osEPiStartDma` enqueues on the PI manager's cmdQ; -1 means the
-    /// cmdQ is full, not "channel busy". Reporting busy as -1 livelocks
-    /// the cooperative executor inside the guest's tight retry loop (the
-    /// pending completion can only commit once the guest yields, which
-    /// the retry loop never does). Also pins FIFO start order and the
-    /// full-queue -1, and that capacity comes from `osCreatePiManager`.
+    /// Regression for the real OoT interleaving: the object-loading thread
+    /// submitted DmaMgr's second chunk while another guest thread's managed
+    /// PI request still owned the hardware channel. Exposing `PiBusy` made
+    /// DmaMgr return after its first 0x2000-byte chunk and left the display
+    /// list tail zero. Both calls must succeed immediately, while bytes and
+    /// completion posts remain strictly FIFO at their separate deadlines.
     #[test]
-    fn epi_start_dma_queues_while_busy_and_completes_fifo() {
+    fn managed_pi_dma_serializes_concurrent_callers_fifo() {
         let mut rom = vec![0u8; 0x100];
-        rom[0x20..0x24].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
-        rom[0x30..0x34].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        rom[0x20..0x24].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        rom[0x40..0x44].copy_from_slice(&[0x55, 0x66, 0x77, 0x88]);
         load_rom_with_fixed_pi_latency(rom, 5);
 
-        // osCreatePiManager(pri, cmdQ, cmdBuf, 1): capacity 1 queued entry.
-        let mut pim_ctx = ctx_zeroed();
-        pim_ctx.r5 = 0x8000_0900;
-        pim_ctx.r7 = 1;
-        unsafe { osCreatePiManager_recomp(std::ptr::null_mut(), &mut pim_ctx) };
-
         let mut rdram = vec![0u8; 0x1000];
-        let queue_a = RdramAddr::from_offset(0x300);
-        let queue_b = RdramAddr::from_offset(0x340);
+        let cart_handle = install_cart_handle(&mut rdram, 0x800);
+        let first_queue = RdramAddr::from_offset(0x300);
+        let second_queue = RdramAddr::from_offset(0x340);
         with_executor(|exec| {
-            exec.create_mesg_queue(queue_a, 1);
-            exec.create_mesg_queue(queue_b, 1);
+            exec.create_mesg_queue(first_queue, 1);
+            exec.create_mesg_queue(second_queue, 1);
         });
 
-        // Two OSIoMesg structs: A reads ROM 0x20 -> rdram 0x400, B reads
-        // ROM 0x30 -> rdram 0x500.
-        for (mb, retq, dev, dram) in [
-            (0x100usize, 0x8000_0300u32, 0x20u32, 0x8000_0400u32),
-            (0x140usize, 0x8000_0340u32, 0x30u32, 0x8000_0500u32),
-        ] {
-            rdram[mb + 0x4..mb + 0x8].copy_from_slice(&retq.to_ne_bytes());
+        let write_mb = |rdram: &mut [u8], mb: usize, queue: u32, dram: u32, dev: u32| {
+            rdram[mb + 0x4..mb + 0x8].copy_from_slice(&queue.to_ne_bytes());
             rdram[mb + 0x8..mb + 0xC].copy_from_slice(&dram.to_ne_bytes());
             rdram[mb + 0xC..mb + 0x10].copy_from_slice(&dev.to_ne_bytes());
             rdram[mb + 0x10..mb + 0x14].copy_from_slice(&4u32.to_ne_bytes());
-        }
+        };
+        write_mb(&mut rdram, 0x100, 0x8000_0300, 0x8000_0400, 0x20);
+        write_mb(&mut rdram, 0x140, 0x8000_0340, 0x8000_0440, 0x40);
 
-        let mut ctx = ctx_zeroed();
-        ctx.r5 = 0x8000_0100;
-        ctx.r6 = 0;
-        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx) };
-        assert_eq!(ctx.r2, 0, "first DMA starts immediately");
+        let mut first = ctx_zeroed();
+        first.r4 = cart_handle;
+        first.r5 = 0x8000_0100;
+        first.r6 = 0;
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut first) };
+        assert_eq!(first.r2, 0);
 
-        let mut ctx_b = ctx_zeroed();
-        ctx_b.r5 = 0x8000_0140;
-        ctx_b.r6 = 0;
-        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx_b) };
-        assert_eq!(
-            ctx_b.r2, 0,
-            "second DMA while busy must be QUEUED (return 0), not busy=-1 -- \
-             the WM2000 tight-retry livelock"
-        );
+        let mut second = ctx_zeroed();
+        second.r4 = cart_handle;
+        second.r5 = 0x8000_0140;
+        second.r6 = 0;
+        second.r2 = 0xBAD0_BAD0;
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut second) };
+        assert_eq!(second.r2, 0, "queued managed PI work is accepted");
+        assert_eq!(with_host(|host| host.pending_pi_completions.len()), 2);
 
-        // Third submit: command queue (capacity 1) is full -> real -1.
-        let mut ctx_c = ctx_zeroed();
-        ctx_c.r5 = 0x8000_0140;
-        ctx_c.r6 = 0;
-        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx_c) };
-        assert_eq!(
-            ctx_c.r2,
-            u64::MAX,
-            "beyond cmdQ capacity osEPiStartDma reports a full queue (-1)"
-        );
-
-        // First completion: A's bytes land, A's queue gets its post, B has
-        // NOT completed yet (serialized single channel).
-        complete_pi_dma();
-        // Native-endian word storage, same as
-        // `managed_pi_dma_commits_state_then_posts_completion_before_resume`.
+        advance_virtual_time(5);
         assert_eq!(
             u32::from_ne_bytes(rdram[0x400..0x404].try_into().unwrap()),
-            0xAABB_CCDD
-        );
-        assert_eq!(
-            with_executor(|exec| exec.recv_mesg(99, queue_a, false)),
-            fn64_runtime::RecvMesgOutcome::Delivered(0)
-        );
-        assert_eq!(
-            with_executor(|exec| exec.recv_mesg(99, queue_b, false)),
-            fn64_runtime::RecvMesgOutcome::WouldBlock,
-            "queued request must not complete before the in-flight one"
-        );
-
-        // Second completion: B follows in FIFO order.
-        complete_pi_dma();
-        assert_eq!(
-            u32::from_ne_bytes(rdram[0x500..0x504].try_into().unwrap()),
             0x1122_3344
         );
+        assert_eq!(&rdram[0x440..0x444], &[0, 0, 0, 0]);
         assert_eq!(
-            with_executor(|exec| exec.recv_mesg(99, queue_b, false)),
+            with_executor(|exec| exec.recv_mesg(99, first_queue, false)),
             fn64_runtime::RecvMesgOutcome::Delivered(0)
         );
+        assert_eq!(
+            with_executor(|exec| exec.recv_mesg(99, second_queue, false)),
+            fn64_runtime::RecvMesgOutcome::WouldBlock
+        );
+        assert_eq!(with_host(|host| host.pending_pi_completions.len()), 1);
+
+        advance_virtual_time(10);
+        assert_eq!(
+            u32::from_ne_bytes(rdram[0x440..0x444].try_into().unwrap()),
+            0x5566_7788
+        );
+        assert_eq!(
+            with_executor(|exec| exec.recv_mesg(99, second_queue, false)),
+            fn64_runtime::RecvMesgOutcome::Delivered(0)
+        );
+        assert!(with_host(|host| host.pending_pi_completions.is_empty()));
     }
 
     #[test]
@@ -1760,7 +2493,7 @@ mod tests {
         assert_eq!(view.read_u8(base.checked_add(7).unwrap()), 0x02);
         assert_eq!(view.read_u8(base.checked_add(8).unwrap()), 0x34);
         assert_eq!(view.read_u8(base.checked_add(9).unwrap()), 1);
-        assert_eq!(view.read_u32(base.checked_add(12).unwrap()), 0x0500_0000);
+        assert_eq!(view.read_u32(base.checked_add(12).unwrap()), 0xa500_0000);
         assert_eq!(view.read_u32(base.checked_add(16).unwrap()), 0);
     }
 
@@ -1836,13 +2569,22 @@ mod tests {
     fn os_cart_rom_init_replaces_stale_unaligned_v0_with_guest_handle() {
         load_rom(vec![0u8; 0x100]);
         set_cart_rom_handle_vram(0x8000_9EA0);
+        let mut rdram = vec![0u8; 0x9f00];
 
         let mut ctx = ctx_zeroed();
         ctx.r2 = 0xFFFF_FFFF_8012_5636;
-        unsafe { osCartRomInit_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+        unsafe { osCartRomInit_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
         assert_eq!(ctx.r2, 0xFFFF_FFFF_8000_9EA0);
         assert_eq!(ctx.r2 & 3, 0, "returned OSPiHandle must be word-aligned");
+        let view = fn64_runtime::RdramView::from_storage(&rdram);
+        let handle = RdramAddr::from_offset(0x9ea0);
+        assert_eq!(
+            view.read_u8(handle.checked_add(4).unwrap()),
+            DEVICE_TYPE_CART
+        );
+        assert_eq!(view.read_u8(handle.checked_add(9).unwrap()), PI_DOMAIN1);
+        assert_eq!(view.read_u32(handle.checked_add(12).unwrap()), 0xb000_0000);
     }
 
     /// Regression test for the real double-KSEG0-translation bug
@@ -1875,6 +2617,7 @@ mod tests {
         load_rom(rom);
 
         let mut rdram = vec![0u8; 0x10000];
+        let cart_handle = install_cart_handle(&mut rdram, 0x1000);
         let mb_vram: u64 = 0x8000_2000; // a REAL, nonzero vram address
         let mb_offset = 0x2000usize;
 
@@ -1889,6 +2632,7 @@ mod tests {
         rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&size.to_ne_bytes());
 
         let mut ctx = ctx_zeroed();
+        ctx.r4 = cart_handle;
         ctx.r5 = mb_vram;
         ctx.r6 = 0; // OS_READ / ToRdram
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
@@ -1930,10 +2674,12 @@ mod tests {
         load_rom(rom);
 
         let mut rdram = vec![0u8; 0x1000];
+        let cart_handle = install_cart_handle(&mut rdram, 0x100);
         let dram_vram: u64 = 0x8000_0024;
         let dram_off = 0x24usize;
 
         let mut ctx = ctx_zeroed();
+        ctx.r4 = cart_handle;
         ctx.r5 = 0x3C; // devAddr
         ctx.r6 = dram_vram; // dramAddr
         unsafe { osEPiReadIo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
@@ -1972,9 +2718,21 @@ mod tests {
         )));
 
         let mut rdram = vec![0u8; 0x10000];
+        let sram_handle = install_sram_handle(
+            &mut rdram,
+            0x1000,
+            fn64_runtime::PiDomainTiming {
+                latency: 0x12,
+                pulse_width: 0x34,
+                page_size: 0x0d,
+                release: 2,
+            },
+        );
         let mb_offset = 0x2000usize;
         let mb_vram: u64 = 0x8000_2000;
-        let sram_dev_addr: u32 = 0x0800_0010; // domain-2 base + 0x10
+        // EPI callers provide the offset from the handle's base; the shared
+        // resolver must form 0x0800_0010 before entering the PI fabric.
+        let sram_dev_addr: u32 = 0x10;
         let size: u32 = 8;
 
         // Guest lays 8 distinct bytes at rdram 0x5000 via MEM_BU (byte-lane
@@ -1990,15 +2748,29 @@ mod tests {
         rdram[mb_offset + 0xC..mb_offset + 0x10].copy_from_slice(&sram_dev_addr.to_ne_bytes());
         rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&size.to_ne_bytes());
         let mut ctx = ctx_zeroed();
+        ctx.r4 = sram_handle;
         ctx.r5 = mb_vram;
         ctx.r6 = 1; // OS_WRITE
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+        assert_eq!(
+            with_host(|host| {
+                host.device_fabric
+                    .pi_domain_timing(fn64_runtime::PiDomain::Domain2)
+            }),
+            fn64_runtime::PiDomainTiming {
+                latency: 0x12,
+                pulse_width: 0x34,
+                page_size: 0x0d,
+                release: 2,
+            }
+        );
         complete_pi_dma();
 
         // OSIoMesg for the READ back into a DIFFERENT region (0x6000).
         let dst_off = 0x6000usize;
         rdram[mb_offset + 0x8..mb_offset + 0xC].copy_from_slice(&0x8000_6000u32.to_ne_bytes());
         let mut ctx = ctx_zeroed();
+        ctx.r4 = sram_handle;
         ctx.r5 = mb_vram;
         ctx.r6 = 0; // OS_READ
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
@@ -2017,6 +2789,28 @@ mod tests {
         // The ROM byte at offset 0 (0xAA) must NOT appear -- proves the read
         // hit the save store, not the ROM image.
         assert_ne!(rdram[dst_off ^ 3], 0xAA);
+        let save_operations = crate::copy_save_operations();
+        assert_eq!(save_operations.len(), 2);
+        assert_eq!(
+            save_operations
+                .iter()
+                .map(|event| (event.device, event.operation, event.offset, event.len))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    fn64_runtime::SaveType::SramBanked,
+                    fn64_runtime::SaveOperationKind::Write,
+                    0x10,
+                    8,
+                ),
+                (
+                    fn64_runtime::SaveType::SramBanked,
+                    fn64_runtime::SaveOperationKind::Read,
+                    0x10,
+                    8,
+                ),
+            ]
+        );
     }
 
     /// Regression test for the real infinite-loop bug `examples/wm2000-boot`
@@ -2034,6 +2828,7 @@ mod tests {
         load_rom(vec![0xCDu8; 0x1000]);
 
         let mut rdram = vec![0u8; 0x10000];
+        let cart_handle = install_cart_handle(&mut rdram, 0x1000);
         let mb_offset = 0x2000usize;
         // DmaMgr's real OSIoMesg layout: retQueue +0x4, dramAddr +0x8,
         // devAddr +0xC, size +0x10 (0x08-byte OSIoMesgHdr).
@@ -2043,6 +2838,7 @@ mod tests {
         rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&4u32.to_ne_bytes());
 
         let mut ctx = ctx_zeroed();
+        ctx.r4 = cart_handle;
         ctx.r5 = 0x8000_2000;
         ctx.r6 = 0; // OS_READ / ToRdram
         ctx.r2 = 0x1234; // stale non-zero, as a real caller's register would hold
@@ -2061,10 +2857,11 @@ mod tests {
         rom[0x20..0x28].copy_from_slice(&[0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87]);
         load_rom(rom);
         let mut rdram = vec![0u8; 0x100];
+        let cart_handle = install_cart_handle(&mut rdram, 0x20);
         rdram[0x40 + 0x10..0x40 + 0x14].copy_from_slice(&8u32.to_ne_bytes());
 
         let mut ctx = ctx_zeroed();
-        ctx.r4 = 0x8000_0100;
+        ctx.r4 = cart_handle;
         ctx.r5 = 0;
         ctx.r6 = 0x20;
         ctx.r7 = 0x8000_0080;
@@ -2084,14 +2881,252 @@ mod tests {
     fn pi_writes_to_read_only_rom_return_minus_one() {
         load_rom(vec![0u8; 0x100]);
         let mut rdram = vec![0u8; 0x100];
+        let cart_handle = install_cart_handle(&mut rdram, 0x20);
         rdram[0x40 + 0x10..0x40 + 0x14].copy_from_slice(&8u32.to_ne_bytes());
         let mut ctx = ctx_zeroed();
+        ctx.r4 = cart_handle;
         ctx.r5 = 1;
         ctx.r6 = 0x20;
         ctx.r7 = 0x8000_0080;
         ctx.r29 = 0x8000_0040;
         unsafe { osEPiRawStartDma_recomp(rdram.as_mut_ptr(), &mut ctx) };
         assert_eq!(ctx.r2, u64::MAX);
+    }
+
+    #[test]
+    fn managed_raw_and_programmed_epi_calls_share_handle_address_and_timing_authority() {
+        let mut rom = vec![0u8; 0x100];
+        rom[0x20..0x24].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        load_rom(rom);
+        set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+            fn64_runtime::SaveType::SramBanked,
+        )));
+        let mut rdram = vec![0u8; 0x800];
+        let cart_timing = fn64_runtime::PiDomainTiming {
+            latency: 0x21,
+            pulse_width: 0x32,
+            page_size: 0x0b,
+            release: 1,
+        };
+        let save_timing = fn64_runtime::PiDomainTiming {
+            latency: 0x43,
+            pulse_width: 0x54,
+            page_size: 0x0c,
+            release: 2,
+        };
+        unsafe {
+            write_epi_handle(
+                rdram.as_mut_ptr(),
+                0x8000_0100,
+                DEVICE_TYPE_CART,
+                fn64_runtime::PiDomain::Domain1,
+                cart_timing,
+                0xb000_0000,
+            )
+        };
+        let cart_handle = 0xFFFF_FFFF_8000_0100;
+        let save_handle = install_sram_handle(&mut rdram, 0x140, save_timing);
+
+        // Raw EPI DMA consumes the same handle decode as managed EPI. The
+        // request stores fn64's internal ROM offset while raw MMIO exposes
+        // the handle's domain timing immediately.
+        rdram[0x40 + 0x10..0x40 + 0x14].copy_from_slice(&4u32.to_ne_bytes());
+        let mut raw = ctx_zeroed();
+        raw.r4 = cart_handle;
+        raw.r5 = 0;
+        raw.r6 = 0x20;
+        raw.r7 = 0x8000_0200;
+        raw.r29 = 0x8000_0040;
+        unsafe { osEPiRawStartDma_recomp(rdram.as_mut_ptr(), &mut raw) };
+        assert_eq!(raw.r2, 0);
+        assert_eq!(
+            with_host(|host| host.device_fabric.pending_pi_request().unwrap().cart_addr),
+            0x20
+        );
+        assert_eq!(
+            read_raw_mmio_word(0xA460_0014),
+            Some(cart_timing.latency as u32)
+        );
+        assert_eq!(
+            read_raw_mmio_word(0xA460_0018),
+            Some(cart_timing.pulse_width as u32)
+        );
+        complete_pi_dma();
+
+        // The public OR rule also admits an already-absolute KSEG1 device
+        // address. Segment removal happens only after the OR, at the PI
+        // boundary, so this reaches the same ROM byte as offset 0x20 above.
+        let mut absolute = ctx_zeroed();
+        absolute.r4 = cart_handle;
+        absolute.r5 = 0xb000_0020;
+        absolute.r6 = 0x8000_0204;
+        unsafe { osEPiReadIo_recomp(rdram.as_mut_ptr(), &mut absolute) };
+        assert_eq!(absolute.r2, 0);
+        assert_eq!(
+            u32::from_ne_bytes(rdram[0x204..0x208].try_into().unwrap()),
+            0x1234_5678
+        );
+
+        // Managed EPI forms baseAddress | devAddr for SRAM and publishes the
+        // second handle's settings through those same raw registers.
+        let mb = 0x300usize;
+        rdram[mb + 0x4..mb + 0x8].copy_from_slice(&0u32.to_ne_bytes());
+        rdram[mb + 0x8..mb + 0xC].copy_from_slice(&0x8000_0240u32.to_ne_bytes());
+        rdram[mb + 0xC..mb + 0x10].copy_from_slice(&0x10u32.to_ne_bytes());
+        rdram[mb + 0x10..mb + 0x14].copy_from_slice(&4u32.to_ne_bytes());
+        let mut managed = ctx_zeroed();
+        managed.r4 = save_handle;
+        managed.r5 = 0x8000_0300;
+        managed.r6 = 0;
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut managed) };
+        assert_eq!(managed.r2, 0);
+        assert_eq!(
+            with_host(|host| host.device_fabric.pending_pi_request().unwrap().cart_addr),
+            fn64_runtime::rom::SRAM_DOMAIN2_BASE + 0x10
+        );
+        assert_eq!(
+            read_raw_mmio_word(0xA460_0024),
+            Some(save_timing.latency as u32)
+        );
+        assert_eq!(
+            read_raw_mmio_word(0xA460_0028),
+            Some(save_timing.pulse_width as u32)
+        );
+        complete_pi_dma();
+
+        // Programmed I/O uses the same resolver in both directions rather
+        // than retaining a third handle/address implementation.
+        let mut write = ctx_zeroed();
+        write.r4 = save_handle;
+        write.r5 = 0x20;
+        write.r6 = 0xCAFE_BABE;
+        unsafe { osEPiWriteIo_recomp(rdram.as_mut_ptr(), &mut write) };
+        assert_eq!(write.r2, 0);
+        let mut read = ctx_zeroed();
+        read.r4 = save_handle;
+        read.r5 = 0x20;
+        read.r6 = 0x8000_0280;
+        unsafe { osEPiReadIo_recomp(rdram.as_mut_ptr(), &mut read) };
+        assert_eq!(read.r2, 0);
+        assert_eq!(
+            u32::from_ne_bytes(rdram[0x280..0x284].try_into().unwrap()),
+            0xCAFE_BABE
+        );
+        assert_eq!(
+            crate::copy_save_operations()
+                .iter()
+                .map(|event| (event.operation, event.offset, event.len))
+                .collect::<Vec<_>>(),
+            vec![
+                (fn64_runtime::SaveOperationKind::Read, 0x10, 4),
+                (fn64_runtime::SaveOperationKind::Write, 0x20, 4),
+                (fn64_runtime::SaveOperationKind::Read, 0x20, 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn epi_handle_for_unbacked_public_device_space_is_a_loud_typed_trap() {
+        let mut rdram = vec![0u8; 0x200];
+        unsafe {
+            write_epi_handle(
+                rdram.as_mut_ptr(),
+                0x8000_0100,
+                DEVICE_TYPE_64DD,
+                fn64_runtime::PiDomain::Domain2,
+                fn64_runtime::PiDomainTiming::default(),
+                0xa500_0000,
+            )
+        };
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            resolve_epi_device_address(rdram.as_mut_ptr(), 0x8000_0100, 0, "typed EPI test")
+        }));
+        assert!(result.is_err());
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].subsystem, fn64_runtime::UnsupportedSubsystem::Abi);
+        assert_eq!(events[0].operation, "abi.pi.epi-handle");
+        assert_eq!(
+            events[0].disposition,
+            fn64_runtime::UnsupportedDisposition::LoudTrap
+        );
+        assert!(events[0].context.contains("0x05000000"));
+        fn64_runtime::complete_unsupported_observation(Cycles::ZERO, &"0".repeat(64));
+
+        assert_subprocess_aborts("pi::tests::__unbacked_epi_handle_abort_subprocess_entry");
+    }
+
+    #[test]
+    fn epi_handle_outside_physical_rdram_is_a_loud_typed_trap() {
+        let mut rdram = vec![0u8; 0x100];
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            resolve_epi_device_address(
+                rdram.as_mut_ptr(),
+                0xffff_ffff_807f_fff0,
+                0,
+                "out-of-range EPI test",
+            )
+        }));
+        assert!(result.is_err());
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, "abi.pi.epi-handle");
+        assert!(events[0].context.contains("outside physical RDRAM"));
+        fn64_runtime::complete_unsupported_observation(Cycles::ZERO, &"0".repeat(64));
+    }
+
+    #[test]
+    fn epi_handle_rejects_a_raw_physical_base_instead_of_guessing_its_address_form() {
+        let mut rdram = vec![0u8; 0x200];
+        unsafe {
+            write_epi_handle(
+                rdram.as_mut_ptr(),
+                0x8000_0100,
+                DEVICE_TYPE_SRAM,
+                fn64_runtime::PiDomain::Domain2,
+                fn64_runtime::PiDomainTiming::default(),
+                0xa800_0000,
+            )
+        };
+        rdram[0x10c..0x110].copy_from_slice(&0x0800_0000u32.to_ne_bytes());
+
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            resolve_epi_device_address(rdram.as_mut_ptr(), 0x8000_0100, 0, "physical-base test")
+        }));
+        assert!(result.is_err());
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, "abi.pi.epi-handle");
+        assert!(events[0].context.contains("uncached KSEG1"));
+        fn64_runtime::complete_unsupported_observation(Cycles::ZERO, &"0".repeat(64));
+    }
+
+    #[test]
+    #[ignore]
+    fn __unbacked_epi_handle_abort_subprocess_entry() {
+        if std::env::var_os("FN64_ABI_RUN_ABORT_CHECK").is_some() {
+            load_rom(vec![0; 0x100]);
+            let mut rdram = vec![0u8; 0x400];
+            unsafe {
+                write_epi_handle(
+                    rdram.as_mut_ptr(),
+                    0x8000_0100,
+                    2,
+                    fn64_runtime::PiDomain::Domain2,
+                    fn64_runtime::PiDomainTiming::default(),
+                    0xa500_0000,
+                )
+            };
+            fn64_runtime::arm_unsupported_events(None).unwrap();
+            let mut ctx = ctx_zeroed();
+            ctx.r4 = 0x8000_0100;
+            ctx.r5 = 0;
+            ctx.r6 = 0x8000_0200;
+            unsafe { osEPiReadIo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        }
     }
 
     #[test]
@@ -2118,7 +3153,18 @@ mod tests {
             // `!status.success()` while proving nothing about the trap.
             const MB_VRAM: u64 = 0xFFFF_FFFF_8000_0000;
             let mut ctx = ctx_zeroed();
-            let mut rdram = rdram_for_vram(MB_VRAM + 0x14); // OSIoMesg ends at +0x14
+            let mut rdram = rdram_for_vram(MB_VRAM + 0x40);
+            unsafe {
+                write_epi_handle(
+                    rdram.as_mut_ptr(),
+                    0x8000_0020,
+                    DEVICE_TYPE_CART,
+                    fn64_runtime::PiDomain::Domain1,
+                    fn64_runtime::PiDomainTiming::default(),
+                    0xb000_0000,
+                )
+            };
+            ctx.r4 = 0x8000_0020;
             ctx.r5 = MB_VRAM;
             ctx.r6 = 0; // direction = ToRdram
             unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };

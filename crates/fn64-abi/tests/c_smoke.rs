@@ -164,4 +164,68 @@ fn c_caller_links_and_runs_against_fn64_abi_staticlib() {
         !bad_width.status.success(),
         "generated-C subword MMIO must trap loudly rather than bypass DeviceFabric"
     );
+    for argument in [
+        "--bad-kuseg",
+        "--bad-kseg2",
+        "--bad-noncanonical-sparse",
+        "--bad-pif-kuseg",
+        "--bad-pif-kseg2",
+    ] {
+        let bad_address = Command::new(&proxy_bin)
+            .arg(argument)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("failed to execute {:?} {argument}: {error}", proxy_bin)
+            });
+        assert!(
+            !bad_address.status.success(),
+            "generated-C {argument} access must trap before dereferencing host storage"
+        );
+        assert!(
+            String::from_utf8_lossy(&bad_address.stderr)
+                .contains("only zero- or sign-extended KSEG0/KSEG1 are modeled"),
+            "generated-C {argument} trap lost its named address diagnostic: {}",
+            String::from_utf8_lossy(&bad_address.stderr)
+        );
+    }
+    for argument in [
+        "--bad-dword-read",
+        "--bad-dword-write",
+        "--bad-swl",
+        "--bad-swr",
+    ] {
+        let bad_width = Command::new(&proxy_bin)
+            .arg(argument)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("failed to execute {:?} {argument}: {error}", proxy_bin)
+            });
+        assert!(
+            !bad_width.status.success(),
+            "generated-C {argument} must trap before decomposing into word MMIO"
+        );
+        assert!(
+            String::from_utf8_lossy(&bad_width.stderr)
+                .contains("RCP registers require modeled word semantics"),
+            "generated-C {argument} trap lost its named width diagnostic: {}",
+            String::from_utf8_lossy(&bad_width.stderr)
+        );
+    }
+    for argument in ["--bad-unaligned-word-read", "--bad-unaligned-half-write"] {
+        let unaligned = Command::new(&proxy_bin)
+            .arg(argument)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("failed to execute {:?} {argument}: {error}", proxy_bin)
+            });
+        assert!(
+            !unaligned.status.success(),
+            "generated-C {argument} must trap before dereferencing host storage"
+        );
+        assert!(
+            String::from_utf8_lossy(&unaligned.stderr).contains("unaligned guest address"),
+            "generated-C {argument} trap lost its alignment diagnostic: {}",
+            String::from_utf8_lossy(&unaligned.stderr)
+        );
+    }
 }

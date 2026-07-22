@@ -2182,6 +2182,81 @@ fn decode_cop1_d(w: u32) -> Instruction {
 }
 
 impl Instruction {
+    /// Whether executing this instruction requires Status.CU1. Keeping this
+    /// classification beside the decoder makes the block emitter's
+    /// coprocessor guard exhaustive across arithmetic, moves, memory, compare,
+    /// conversion, and branch families.
+    pub const fn requires_cop1(&self) -> bool {
+        use Instruction::*;
+        matches!(
+            self,
+            Mfc1 { .. }
+                | Mtc1 { .. }
+                | Dmfc1 { .. }
+                | Dmtc1 { .. }
+                | Cfc1 { .. }
+                | Ctc1 { .. }
+                | Lwc1 { .. }
+                | Swc1 { .. }
+                | Ldc1 { .. }
+                | Sdc1 { .. }
+                | AddS { .. }
+                | SubS { .. }
+                | MulS { .. }
+                | DivS { .. }
+                | AbsS { .. }
+                | NegS { .. }
+                | SqrtS { .. }
+                | MovS { .. }
+                | AddD { .. }
+                | SubD { .. }
+                | MulD { .. }
+                | DivD { .. }
+                | AbsD { .. }
+                | NegD { .. }
+                | SqrtD { .. }
+                | MovD { .. }
+                | CvtSW { .. }
+                | CvtDW { .. }
+                | CvtSD { .. }
+                | CvtDS { .. }
+                | CvtSL { .. }
+                | CvtDL { .. }
+                | CvtWS { .. }
+                | CvtWD { .. }
+                | CvtLS { .. }
+                | CvtLD { .. }
+                | TruncWS { .. }
+                | TruncWD { .. }
+                | TruncLS { .. }
+                | TruncLD { .. }
+                | RoundWS { .. }
+                | CeilWS { .. }
+                | FloorWS { .. }
+                | RoundLS { .. }
+                | CeilLS { .. }
+                | FloorLS { .. }
+                | RoundWD { .. }
+                | CeilWD { .. }
+                | FloorWD { .. }
+                | RoundLD { .. }
+                | CeilLD { .. }
+                | FloorLD { .. }
+                | CEqS { .. }
+                | CLtS { .. }
+                | CLeS { .. }
+                | CEqD { .. }
+                | CLtD { .. }
+                | CLeD { .. }
+                | CCondS { .. }
+                | CCondD { .. }
+                | Bc1t { .. }
+                | Bc1f { .. }
+                | Bc1tl { .. }
+                | Bc1fl { .. }
+        )
+    }
+
     /// Whether this instruction is a control-transfer whose *following*
     /// instruction is in its delay slot (all branches and jumps on MIPS).
     pub fn has_delay_slot(&self) -> bool {

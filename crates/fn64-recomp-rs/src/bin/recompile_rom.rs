@@ -335,6 +335,7 @@ fn run(cfg: &RecompConfig, rom: &[u8], force_recompile: &HashSet<String>) -> Rep
     // crate root and when a boot harness `include!`s it inside its own module.
     // An inner `#![allow]` is rejected in the latter context.
     module.push_str("#[allow(clippy::all, unused, non_snake_case)]\nmod generated {\n");
+    module.push_str("pub const FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA: fn64_recomp_rs::FunctionEntryObservationSchema = fn64_recomp_rs::FUNCTION_ENTRY_OBSERVATION_SCHEMA;\n");
     module.push_str("#[allow(unused_imports)]\n");
     module.push_str(
         "use fn64_recomp_rs::{call_host_or_recompiled, pause_self, resolve_host_function, RecompContext, RecompFunc, Rdram, round_ties_even_f32, round_ties_even_f64};\n\n",
@@ -505,6 +506,7 @@ fn render_generated_lib(symbols: &SymbolTable, sections: &[Section]) -> String {
     );
     root.push_str("#![forbid(unsafe_code)]\n");
     root.push_str("#![allow(clippy::all, unused, non_snake_case)]\n\n");
+    root.push_str("pub const FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA: fn64_recomp_rs::FunctionEntryObservationSchema = fn64_recomp_rs::FUNCTION_ENTRY_OBSERVATION_SCHEMA;\n\n");
     for index in 0..RECOMPILED_PART_COUNT {
         root.push_str(&format!(
             "mod part_{index:03};\npub use part_{index:03}::*;\n"
@@ -584,11 +586,21 @@ impl FuncResult {
 fn trap_kind(instr: &Instruction) -> Option<&'static str> {
     use Instruction::*;
     Some(match instr {
-        Mfc0 { cop0d: 9 | 11, .. } | Mtc0 { cop0d: 9 | 11, .. } => return None,
+        Mfc0 {
+            cop0d: 0 | 2 | 3 | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30,
+            ..
+        }
+        | Mtc0 {
+            cop0d: 0 | 2 | 3 | 4 | 5 | 6 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30,
+            ..
+        }
+        | Tlbwi
+        | Tlbp
+        | Tlbr => return None,
         Mfc0 { .. } | Mtc0 { .. } => "cop0-move",
         Dmfc0 { .. } | Dmtc0 { .. } => "cop0-dmove",
         Eret => "eret",
-        Tlbwi | Tlbwr | Tlbp | Tlbr => "tlb",
+        Tlbwr => "tlb",
         Mfc2 { .. } | Mtc2 { .. } | Cfc2 { .. } | Ctc2 { .. } => "cop2",
         Syscall { .. } => "syscall",
         Break { .. } => "break",
@@ -924,19 +936,25 @@ mod tests {
     }
 
     #[test]
-    fn modeled_cop0_count_and_compare_are_not_runtime_traps() {
+    fn modeled_whole_function_cop0_operations_are_not_runtime_traps() {
         for instruction in [
             Instruction::Mfc0 { rt: 2, cop0d: 9 },
             Instruction::Mfc0 { rt: 2, cop0d: 11 },
             Instruction::Mtc0 { rt: 2, cop0d: 9 },
             Instruction::Mtc0 { rt: 2, cop0d: 11 },
+            Instruction::Mfc0 { rt: 2, cop0d: 12 },
+            Instruction::Mtc0 { rt: 2, cop0d: 12 },
+            Instruction::Tlbwi,
+            Instruction::Tlbp,
+            Instruction::Tlbr,
         ] {
             assert_eq!(trap_kind(&instruction), None);
         }
         assert_eq!(
-            trap_kind(&Instruction::Mfc0 { rt: 2, cop0d: 12 }),
+            trap_kind(&Instruction::Mfc0 { rt: 2, cop0d: 1 }),
             Some("cop0-move")
         );
+        assert_eq!(trap_kind(&Instruction::Tlbwr), Some("tlb"));
     }
 
     #[test]
@@ -1044,6 +1062,7 @@ mod tests {
             .map(|(_, contents)| contents)
             .expect("generated crate root");
         assert!(lib.contains("#![forbid(unsafe_code)]"));
+        assert!(lib.contains("pub const FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA"));
         assert!(lib.contains("pub fn lookup(vram: u32) -> RecompFunc"));
         assert!(lib.contains("pub static RECOMPILED_SECTION_GEOMETRY"));
         assert_eq!(

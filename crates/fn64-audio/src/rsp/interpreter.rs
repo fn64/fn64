@@ -13,7 +13,10 @@ use super::decode::{
 };
 use super::ops::{dispatch, OpInvocation, OpStatus};
 use super::recomp::runtime::RspMachine;
-use super::recomp::{trap_unknown, trap_unknown_vu};
+use super::recomp::{trap_delay_slot_control, trap_imem_overrun, trap_unknown, trap_unknown_vu};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static EXEC_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InterpreterResult {
@@ -45,6 +48,33 @@ pub fn run_imem(
         0x1000 | (pc & 0x0fff)
     };
     let mut steps = 0u64;
+    let trace_execution = std::env::var_os("RSP_TRACE_EXEC").is_some();
+    let trace_limit = std::env::var("RSP_TRACE_EXEC_LIMIT")
+        .ok()
+        .map(|raw| {
+            raw.parse::<u64>()
+                .unwrap_or_else(|_| panic!("RSP_TRACE_EXEC_LIMIT must be an integer, got {raw:?}"))
+        })
+        .unwrap_or(u64::MAX);
+    let trace_gprs = std::env::var("RSP_TRACE_EXEC_GPRS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|field| {
+                    let register = field.trim().parse::<u8>().unwrap_or_else(|_| {
+                        panic!(
+                            "RSP_TRACE_EXEC_GPRS must be comma-separated register indices, got {raw:?}"
+                        )
+                    });
+                    assert!(
+                        register < 32,
+                        "RSP_TRACE_EXEC_GPRS register index must be below 32, got {register}"
+                    );
+                    register
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     loop {
         if steps == step_budget {
@@ -59,17 +89,33 @@ pub fn run_imem(
         let Some(&word) = words.get(idx) else {
             machine.ctx.steps = machine.ctx.steps.saturating_add(steps);
             return InterpreterResult {
-                reason: RspExitReason::ImemOverrun,
+                reason: trap_imem_overrun(pc),
                 pc,
                 steps,
             };
         };
         steps += 1;
+        let delay_word = words.get(idx + 1).copied();
+        if trace_execution {
+            let sequence = EXEC_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            if sequence < trace_limit {
+                eprintln!(
+                    "[fn64-rsp-exec] seq={} step={steps} pc={pc:#06x} word={word:#010x} \
+                     delay={:#010x}",
+                    sequence + 1,
+                    delay_word.unwrap_or_default(),
+                );
+                if !trace_gprs.is_empty() {
+                    let values = trace_gprs
+                        .iter()
+                        .map(|&register| (register, machine.reg(register)))
+                        .collect::<Vec<_>>();
+                    eprintln!("[fn64-rsp-gpr] {values:08x?}");
+                }
+            }
+        }
         let instr = decode(word, pc);
-        let delay = words
-            .get(idx + 1)
-            .copied()
-            .map(|delay_word| decode(delay_word, pc.wrapping_add(4)));
+        let delay = delay_word.map(|delay_word| decode(delay_word, pc.wrapping_add(4)));
 
         let reason = match instr {
             Instr::Break => {
@@ -406,9 +452,7 @@ fn run_delay(
             | Instr::Jal { .. }
             | Instr::Jr { .. }
             | Instr::Jalr { .. }),
-        ) => panic!(
-            "unsupported RSP control transfer {illegal:?} in delay slot at IMEM {delay_pc:#06x}"
-        ),
+        ) => trap_delay_slot_control(delay_pc, illegal),
     }
 }
 
