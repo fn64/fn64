@@ -138,6 +138,261 @@ pub struct LeoDiskConfig {
     pub pulse_width: u8,
 }
 
+const DEVICE_TYPE_CART: u8 = 0;
+const DEVICE_TYPE_64DD: u8 = 2;
+const DEVICE_TYPE_SRAM: u8 = 3;
+const PI_DOMAIN1: u8 = 0;
+const PI_DOMAIN2: u8 = 1;
+const KSEG1_BASE: u32 = 0xa000_0000;
+const KSEG1_END: u32 = 0xc000_0000;
+const PI_DOM1_ADDR1: std::ops::RangeInclusive<u32> = 0x0600_0000..=0x07ff_ffff;
+const PI_DOM1_ADDR2: std::ops::RangeInclusive<u32> = 0x1000_0000..=0x1fbf_ffff;
+const PI_DOM1_ADDR3: std::ops::RangeInclusive<u32> = 0x1fd0_0000..=0x7fff_ffff;
+const PI_DOM2_ADDR1: std::ops::RangeInclusive<u32> = 0x0500_0000..=0x05ff_ffff;
+const PI_DOM2_ADDR2: std::ops::RangeInclusive<u32> = 0x0800_0000..=0x0fff_ffff;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EpiHandle {
+    device_type: u8,
+    domain: fn64_runtime::PiDomain,
+    timing: fn64_runtime::PiDomainTiming,
+    base_address: u32,
+}
+
+fn trap_epi_handle(shim: &str, detail: impl std::fmt::Display) -> ! {
+    let message = format!("{shim}: {detail}");
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Abi,
+        "abi.pi.epi-handle",
+        &message,
+        Some(with_host(|host| host.device_fabric.now())),
+        fn64_runtime::UnsupportedDisposition::LoudTrap,
+    );
+    panic!("{message}")
+}
+
+fn epi_domain_for_address(shim: &str, address: u32) -> fn64_runtime::PiDomain {
+    if PI_DOM1_ADDR1.contains(&address)
+        || PI_DOM1_ADDR2.contains(&address)
+        || PI_DOM1_ADDR3.contains(&address)
+    {
+        fn64_runtime::PiDomain::Domain1
+    } else if PI_DOM2_ADDR1.contains(&address) || PI_DOM2_ADDR2.contains(&address) {
+        fn64_runtime::PiDomain::Domain2
+    } else {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle base address {address:#010x} is outside the public PI domain map"
+            ),
+        )
+    }
+}
+
+fn epi_physical_base(shim: &str, base_address: u32) -> u32 {
+    if !(KSEG1_BASE..KSEG1_END).contains(&base_address) {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle base address {base_address:#010x} is not the public uncached KSEG1 device address form"
+            ),
+        );
+    }
+    base_address & 0x1fff_ffff
+}
+
+/// Decode one public `OSPiHandle` and apply its bus parameters to the same
+/// domain registers exposed through raw PI MMIO. Chapter 27 defines this as
+/// the common authority for managed and raw EPI calls: a handle switch updates
+/// the bus before the operation. The public SRAM example stores
+/// `PHYS_TO_K1(device_start)` in `baseAddress`; the decoder applies the
+/// documented `baseAddress | devAddr` operation in that public address form,
+/// then removes the uncached CPU segment tag at the PI boundary.
+///
+/// # Safety
+/// `rdram` must point at guest storage containing the complete handle named by
+/// `handle_gpr`.
+unsafe fn resolve_epi_device_address(
+    rdram: *mut u8,
+    handle_gpr: u64,
+    dev_addr: u32,
+    shim: &str,
+) -> u32 {
+    let upper = handle_gpr >> 32;
+    let handle_vram = handle_gpr as u32;
+    if (upper != 0 && upper != u32::MAX as u64)
+        || !(0x8000_0000..0xc000_0000).contains(&handle_vram)
+        || !handle_vram.is_multiple_of(4)
+    {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle pointer {handle_gpr:#018x} is not an aligned zero/sign-extended KSEG0/KSEG1 address"
+            ),
+        );
+    }
+    let handle_offset = handle_vram & 0x1fff_ffff;
+    let public_end = handle_offset
+        .checked_add(20)
+        .expect("OSPiHandle public range overflow");
+    if public_end > fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u32 {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle pointer {handle_gpr:#018x} maps outside physical RDRAM: {handle_offset:#010x}..{public_end:#010x}"
+            ),
+        );
+    }
+
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    let base = RdramAddr::from_gpr(handle_gpr);
+    let handle = EpiHandle {
+        device_type: unsafe { storage.read_u8(base.checked_add(4).unwrap()) },
+        timing: fn64_runtime::PiDomainTiming {
+            latency: unsafe { storage.read_u8(base.checked_add(5).unwrap()) },
+            page_size: unsafe { storage.read_u8(base.checked_add(6).unwrap()) },
+            release: unsafe { storage.read_u8(base.checked_add(7).unwrap()) },
+            pulse_width: unsafe { storage.read_u8(base.checked_add(8).unwrap()) },
+        },
+        domain: match unsafe { storage.read_u8(base.checked_add(9).unwrap()) } {
+            PI_DOMAIN1 => fn64_runtime::PiDomain::Domain1,
+            PI_DOMAIN2 => fn64_runtime::PiDomain::Domain2,
+            value => trap_epi_handle(shim, format_args!("OSPiHandle has invalid domain {value}")),
+        },
+        base_address: unsafe { storage.read_u32(base.checked_add(12).unwrap()) },
+    };
+    if handle.device_type > DEVICE_TYPE_SRAM {
+        trap_epi_handle(
+            shim,
+            format_args!("OSPiHandle has invalid device type {}", handle.device_type),
+        );
+    }
+    if handle.timing.page_size > 0x0f || handle.timing.release > 0x03 {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle timing fields exceed PI register width: pageSize={:#04x}, relDuration={:#04x}",
+                handle.timing.page_size, handle.timing.release
+            ),
+        );
+    }
+    let physical_base = epi_physical_base(shim, handle.base_address);
+    let mapped_domain = epi_domain_for_address(shim, physical_base);
+    if mapped_domain != handle.domain {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle domain {:?} disagrees with base address {:#010x} ({mapped_domain:?})",
+                handle.domain, handle.base_address
+            ),
+        );
+    }
+    let device_address = handle.base_address | dev_addr;
+    let physical = epi_physical_base(shim, device_address);
+    if epi_domain_for_address(shim, physical) != handle.domain {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle base {:#010x} OR device address {dev_addr:#010x} escapes {:?}",
+                handle.base_address, handle.domain
+            ),
+        );
+    }
+    with_host(|host| {
+        host.device_fabric
+            .set_pi_domain_timing(handle.domain, handle.timing)
+    });
+
+    if PI_DOM1_ADDR2.contains(&physical) {
+        if handle.device_type != DEVICE_TYPE_CART {
+            trap_epi_handle(
+                shim,
+                format_args!(
+                    "OSPiHandle type {} cannot use the Game Pak ROM address space",
+                    handle.device_type
+                ),
+            );
+        }
+        physical - 0x1000_0000
+    } else if PI_DOM2_ADDR2.contains(&physical) {
+        if handle.device_type != DEVICE_TYPE_SRAM {
+            trap_epi_handle(
+                shim,
+                format_args!(
+                    "OSPiHandle type {} cannot use the SRAM address space",
+                    handle.device_type
+                ),
+            );
+        }
+        physical
+    } else {
+        trap_epi_handle(
+            shim,
+            format_args!(
+                "OSPiHandle selects documented PI device space {physical:#010x}, but no backing device is attached for that space"
+            ),
+        )
+    }
+}
+
+/// Write the public portion of an `OSPiHandle` from typed device state. The
+/// base address is the public uncached KSEG1 form used by Chapter 27's SRAM
+/// acquisition example, not a raw PI physical address.
+/// Acquisition shims share this constructor so Cart ROM and 64DD handles
+/// cannot drift in field layout or timing-register authority.
+///
+/// # Safety
+/// `rdram` must contain writable storage for the complete public handle.
+pub(crate) unsafe fn write_epi_handle(
+    rdram: *mut u8,
+    handle_vram: u32,
+    device_type: u8,
+    domain: fn64_runtime::PiDomain,
+    timing: fn64_runtime::PiDomainTiming,
+    base_address: u32,
+) {
+    assert!(
+        (0x8000_0000..0xc000_0000).contains(&handle_vram) && handle_vram.is_multiple_of(4),
+        "OSPiHandle storage must be an aligned KSEG0/KSEG1 address, got {handle_vram:#010x}"
+    );
+    assert!(
+        device_type <= DEVICE_TYPE_SRAM,
+        "OSPiHandle device type {device_type} exceeds the public range"
+    );
+    assert!(
+        timing.page_size <= 0x0f && timing.release <= 0x03,
+        "OSPiHandle timing exceeds PI register width"
+    );
+    assert_eq!(
+        epi_domain_for_address(
+            "write_epi_handle",
+            epi_physical_base("write_epi_handle", base_address),
+        ),
+        domain,
+        "OSPiHandle domain disagrees with its public base address"
+    );
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    let base = RdramAddr::from_gpr(handle_vram as u64);
+    unsafe {
+        storage.write_u32(base, 0);
+        storage.write_u8(base.checked_add(4).unwrap(), device_type);
+        storage.write_u8(base.checked_add(5).unwrap(), timing.latency);
+        storage.write_u8(base.checked_add(6).unwrap(), timing.page_size);
+        storage.write_u8(base.checked_add(7).unwrap(), timing.release);
+        storage.write_u8(base.checked_add(8).unwrap(), timing.pulse_width);
+        storage.write_u8(
+            base.checked_add(9).unwrap(),
+            match domain {
+                fn64_runtime::PiDomain::Domain1 => PI_DOMAIN1,
+                fn64_runtime::PiDomain::Domain2 => PI_DOMAIN2,
+            },
+        );
+        storage.write_u16(base.checked_add(10).unwrap(), 0);
+        storage.write_u32(base.checked_add(12).unwrap(), base_address);
+        storage.write_u32(base.checked_add(16).unwrap(), 0);
+    }
+}
+
 /// Install a 64DD-register handle configuration. This does not fabricate a
 /// mounted disk; it makes the public EPI device description available to a
 /// host that also supplies the general 64DD device path.
@@ -1256,23 +1511,38 @@ fn advance_device_time_step(now: u64) {
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn osCartRomInit_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+pub unsafe extern "C" fn osCartRomInit_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     with_pi_dma("osCartRomInit_recomp", |_dma| {});
-    let handle_vram = with_host(|host| {
-        host.cart_rom_handle_vram.unwrap_or_else(|| {
+    let (handle_vram, timing) = with_host(|host| {
+        let handle_vram = host.cart_rom_handle_vram.unwrap_or_else(|| {
             panic!(
                 "osCartRomInit_recomp: no guest OSPiHandle address registered -- call \
                  fn64_abi::set_cart_rom_handle_vram with the ROM's aligned __CartRomHandle \
                  BSS address before boot"
             )
-        })
+        });
+        (
+            handle_vram,
+            host.device_fabric
+                .pi_domain_timing(fn64_runtime::PiDomain::Domain1),
+        )
     });
+    unsafe {
+        write_epi_handle(
+            rdram,
+            handle_vram,
+            DEVICE_TYPE_CART,
+            fn64_runtime::PiDomain::Domain1,
+            timing,
+            0xb000_0000,
+        )
+    };
     let ctx = unsafe { &mut *ctx };
     ctx.r2 = (handle_vram as i32 as i64) as u64;
 }
 
 /// `osEPiStartDma(OSPiHandle *handle, OSIoMesg *mb, s32 direction)` --
-/// `a0`=handle (`ctx->r4`, unused per `osCartRomInit_recomp`'s doc comment),
+/// `a0`=handle (`ctx->r4`, decoded through the public `OSPiHandle` layout),
 /// `a1`=mb (`ctx->r5`, an `OSIoMesg*`), `a2`=direction (`ctx->r6`,
 /// `OS_READ`=0/`OS_WRITE`=1 per the public manual).
 ///
@@ -1316,6 +1586,10 @@ pub unsafe extern "C" fn osCartRomInit_recomp(_rdram: *mut u8, ctx: *mut RecompC
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
+    unsafe { epi_start_dma_impl(rdram, ctx, true) }
+}
+
+unsafe fn epi_start_dma_impl(rdram: *mut u8, ctx: *mut RecompContext, use_handle: bool) {
     let ctx = unsafe { &mut *ctx };
     let mb_addr = RdramAddr::from_gpr(ctx.r5);
     let direction = if ctx.r6 == 0 {
@@ -1371,36 +1645,21 @@ pub unsafe extern "C" fn osEPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCo
     let dram_addr = RdramAddr::from_gpr(read_offset_word(rdram, mb_addr.offset(), 0x8) as u64);
     let mut dev_addr = read_offset_word(rdram, mb_addr.offset(), 0xC);
     let len = read_offset_word(rdram, mb_addr.offset(), 0x10);
-
-    // Real `osEPiStartDma(handle, mb, dir)` scopes `devAddr` to the HANDLE's
-    // device domain (`handle->baseAddress | devAddr`). Cart hardware has
-    // exactly two PI handles -- the ROM handle (registered via
-    // `set_cart_rom_handle_vram`) and the domain-2 save handle -- so traffic
-    // on any other handle is save traffic and its device address is
-    // save-relative. Without this, a save write like NWXE's SRAM init
-    // (`FromRdram devAddr=0x0` on its save handle) routes to ROM offset 0
-    // and the game's write-verify loop retries forever.
-    // ponytail: handle-identity heuristic, not a modeled OSPiHandle struct;
-    // parse `baseAddress` from the handle if a title ever needs 64DD or
-    // multiple mapped domains.
-    let handle_vram = ctx.r4 as u32;
-    let is_save_handle = with_host(|host| {
-        host.cart_rom_handle_vram
-            .is_some_and(|cart| cart != handle_vram && handle_vram != 0)
-    });
+    if use_handle {
+        dev_addr =
+            unsafe { resolve_epi_device_address(rdram, ctx.r4, dev_addr, "osEPiStartDma_recomp") };
+    }
     if crate::boot_probe_enabled() {
         use std::sync::atomic::{AtomicU32, Ordering};
         static CALLS: AtomicU32 = AtomicU32::new(0);
         let n = CALLS.fetch_add(1, Ordering::Relaxed);
         if n < 12 || n.is_multiple_of(65536) {
             eprintln!(
-                "[boot-probe] osEPiStartDma handle={handle_vram:#010x} save={is_save_handle} dev={:#x}",
+                "[boot-probe] osEPiStartDma handle={:#010x} dev={:#x}",
+                ctx.r4 as u32,
                 read_offset_word(rdram, mb_addr.offset(), 0xC)
             );
         }
-    }
-    if is_save_handle && dev_addr < fn64_runtime::rom::SRAM_DOMAIN2_BASE {
-        dev_addr += fn64_runtime::rom::SRAM_DOMAIN2_BASE;
     }
 
     let logical_end = usize::try_from(
@@ -1450,11 +1709,14 @@ pub unsafe extern "C" fn osEPiRawStartDma_recomp(rdram: *mut u8, ctx: *mut Recom
     };
     let dram_addr = RdramAddr::from_gpr(ctx.r7);
     let len = unsafe { read_stack_word(rdram, ctx.r29, 0x10) };
+    let dev_addr = unsafe {
+        resolve_epi_device_address(rdram, ctx.r4, ctx.r6 as u32, "osEPiRawStartDma_recomp")
+    };
     ctx.r2 = if start_raw_pi_dma(
         rdram,
         direction,
         dram_addr,
-        ctx.r6 as u32,
+        dev_addr,
         len,
         "osEPiRawStartDma_recomp",
     ) {
@@ -1537,8 +1799,8 @@ pub unsafe extern "C" fn __osPiGetAccess_recomp(_rdram: *mut u8, _ctx: *mut Reco
 pub unsafe extern "C" fn __osPiRelAccess_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {}
 
 /// `osEPiReadIo(OSPiHandle *handle, u32 devAddr, void *dramAddr) -> s32` --
-/// `a0`=handle (`ctx->r4`, unused, same as `osEPiStartDma_recomp`'s
-/// `osCartRomInit_recomp`-established handle stance), `a1`=devAddr
+/// `a0`=handle (`ctx->r4`, the common handle/address/timing authority shared
+/// with raw EPI DMA), `a1`=devAddr
 /// (`ctx->r5`), `a2`=dramAddr (`ctx->r6`) -- verified against the real call
 /// site (`funcs_0.c:2611`: `ctx->r4=MEM_W(...)` a handle-shaped global,
 /// `ctx->r5=0x3C` a devAddr, `ctx->r6=sp+0x24` a stack dramAddr). Public
@@ -1551,12 +1813,26 @@ pub unsafe extern "C" fn __osPiRelAccess_recomp(_rdram: *mut u8, _ctx: *mut Reco
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osEPiReadIo_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
+    unsafe { epi_read_io_impl(rdram, ctx, true) }
+}
+
+unsafe fn epi_read_io_impl(rdram: *mut u8, ctx: *mut RecompContext, use_handle: bool) {
     let ctx = unsafe { &mut *ctx };
-    let dev_addr = ctx.r5 as u32;
+    let dev_addr = if use_handle {
+        unsafe { resolve_epi_device_address(rdram, ctx.r4, ctx.r5 as u32, "osEPiReadIo_recomp") }
+    } else {
+        ctx.r5 as u32
+    };
     let dram_addr = RdramAddr::from_gpr(ctx.r6).offset() as usize;
-    with_pi_dma("osEPiReadIo_recomp", |dma| {
+    let record_sram = with_pi_dma("osEPiReadIo_recomp", |dma| {
         let mut buf = [0u8; 4];
-        dma.read_rom_bytes(dev_addr, &mut buf);
+        let record_sram = if fn64_runtime::rom::is_sram_dev_addr(dev_addr) {
+            dma.sram_read_into(dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE, &mut buf);
+            dma.save_len() == Some(fn64_runtime::SaveType::SramBanked.byte_len())
+        } else {
+            dma.read_rom_bytes(dev_addr, &mut buf);
+            false
+        };
         // Same word-swizzle as PiDma::start_dma / Rdram::write_bytes: rdram is
         // native-endian-WORD storage, so a big-endian cartridge word must be
         // stored byte-reversed or a later MEM_W/MEM_BU reads it swapped. A flat
@@ -1565,7 +1841,16 @@ pub unsafe extern "C" fn osEPiReadIo_recomp(rdram: *mut u8, ctx: *mut RecompCont
         unsafe {
             std::ptr::copy_nonoverlapping(swz.as_ptr(), rdram.add(dram_addr), 4);
         }
+        record_sram
     });
+    if record_sram {
+        crate::record_save_operation(
+            fn64_runtime::SaveType::SramBanked,
+            fn64_runtime::SaveOperationKind::Read,
+            (dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE) as usize,
+            4,
+        );
+    }
     ctx.r2 = 0;
 }
 
@@ -1583,7 +1868,7 @@ pub unsafe extern "C" fn osPiReadIo_recomp(rdram: *mut u8, ctx: *mut RecompConte
     let data = ctx.r5;
     ctx.r5 = dev_addr;
     ctx.r6 = data;
-    unsafe { osEPiReadIo_recomp(rdram, ctx) };
+    unsafe { epi_read_io_impl(rdram, ctx, false) };
 }
 
 unsafe fn write_io_mesg_word(rdram: *mut u8, mb: RdramAddr, offset: u32, value: u32) {
@@ -1634,7 +1919,7 @@ pub unsafe extern "C" fn osPiStartDma_recomp(rdram: *mut u8, ctx: *mut RecompCon
 
     ctx.r5 = mb.to_kseg0() as i32 as u64;
     ctx.r6 = direction;
-    unsafe { osEPiStartDma_recomp(rdram, ctx) };
+    unsafe { epi_start_dma_impl(rdram, ctx, false) };
 }
 
 /// `osPiGetStatus(void) -> u32`. Reads the same authoritative PI status used
@@ -1649,27 +1934,49 @@ pub unsafe extern "C" fn osPiGetStatus_recomp(_rdram: *mut u8, ctx: *mut RecompC
 }
 
 /// `osEPiWriteIo(OSPiHandle *handle, u32 devAddr, u32 data) -> s32` --
-/// `a0`=handle (unused), `a1`=devAddr (`ctx->r5`), `a2`=data (`ctx->r6`).
-/// Public libultra manual's synchronous single-word cartridge-domain
-/// WRITE counterpart to `osEPiReadIo_recomp`. `PiDma`/`InMemoryRom` (this
-/// crate's ROM backing) has no write-to-cart-domain support (`rom.rs`'s
-/// `PiDma` doc: ROM is read-only host state). As with the managed and raw DMA
-/// entry points, rejection is reported through the public `s32` result rather
-/// than aborting the host or pretending the write succeeded.
+/// the synchronous single-word counterpart to `osEPiReadIo_recomp`. The
+/// shared handle resolver applies `baseAddress | devAddr` and publishes the
+/// handle's bus timing through the raw PI registers. SRAM writes reach the
+/// same `PiDma` save store as DMA; cartridge-ROM writes return -1 because the
+/// installed ROM source is read-only.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
-pub unsafe extern "C" fn osEPiWriteIo_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
-    unsafe { &mut *ctx }.r2 = u64::MAX;
+pub unsafe extern "C" fn osEPiWriteIo_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let dev_addr =
+        unsafe { resolve_epi_device_address(rdram, ctx.r4, ctx.r5 as u32, "osEPiWriteIo_recomp") };
+    if fn64_runtime::rom::is_sram_dev_addr(dev_addr) {
+        let record_sram = with_pi_dma("osEPiWriteIo_recomp", |dma| {
+            dma.sram_write_from(
+                dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE,
+                &(ctx.r6 as u32).to_be_bytes(),
+            );
+            dma.save_len() == Some(fn64_runtime::SaveType::SramBanked.byte_len())
+        });
+        if record_sram {
+            crate::record_save_operation(
+                fn64_runtime::SaveType::SramBanked,
+                fn64_runtime::SaveOperationKind::Write,
+                (dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE) as usize,
+                4,
+            );
+        }
+        ctx.r2 = 0;
+    } else {
+        ctx.r2 = u64::MAX;
+    }
 }
 
 /// `osLeoDiskInit(void) -> OSPiHandle *` -- constructs the public EPI handle
 /// for the N64 Disk Drive register range. Public Chapter 27 documentation
-/// defines device type 2, domain-2 address 0x0500_0000, and the handle field
-/// layout. Timing parameters are supplied by the host configuration rather
-/// than guessed. A retail boot that reaches this path without configuring a
-/// drive traps with setup context instead of inventing attached hardware.
+/// defines device type 2 and the domain-2 physical address 0x0500_0000; the
+/// public handle stores its uncached KSEG1 form 0xA500_0000, matching Chapter
+/// 27's acquisition pattern. Timing parameters are supplied by the host
+/// configuration rather than guessed. A retail boot that reaches this path
+/// without configuring a drive traps with setup context instead of inventing
+/// attached hardware.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
@@ -1684,19 +1991,20 @@ pub unsafe extern "C" fn osLeoDiskInit_recomp(rdram: *mut u8, ctx: *mut RecompCo
             )
         })
     });
-    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
-    let base = RdramAddr::from_gpr(config.handle_vram as u64);
     unsafe {
-        storage.write_u32(base, 0); // next
-        storage.write_u8(base.checked_add(4).unwrap(), 2); // DEVICE_TYPE_64DD
-        storage.write_u8(base.checked_add(5).unwrap(), config.latency);
-        storage.write_u8(base.checked_add(6).unwrap(), config.page_size);
-        storage.write_u8(base.checked_add(7).unwrap(), config.release);
-        storage.write_u8(base.checked_add(8).unwrap(), config.pulse_width);
-        storage.write_u8(base.checked_add(9).unwrap(), 1); // PI_DOMAIN2
-        storage.write_u16(base.checked_add(10).unwrap(), 0); // ABI padding
-        storage.write_u32(base.checked_add(12).unwrap(), 0x0500_0000);
-        storage.write_u32(base.checked_add(16).unwrap(), 0);
+        write_epi_handle(
+            rdram,
+            config.handle_vram,
+            DEVICE_TYPE_64DD,
+            fn64_runtime::PiDomain::Domain2,
+            fn64_runtime::PiDomainTiming {
+                latency: config.latency,
+                page_size: config.page_size,
+                release: config.release,
+                pulse_width: config.pulse_width,
+            },
+            0xa500_0000,
+        )
     }
     unsafe { &mut *ctx }.r2 = (config.handle_vram as i32 as i64) as u64;
 }
@@ -1705,6 +2013,34 @@ pub unsafe extern "C" fn osLeoDiskInit_recomp(rdram: *mut u8, ctx: *mut RecompCo
 mod tests {
     use super::*;
     use crate::test_support::*;
+
+    fn install_cart_handle(rdram: &mut [u8], offset: u32) -> u64 {
+        let handle_vram = 0x8000_0000 | offset;
+        set_cart_rom_handle_vram(handle_vram);
+        let mut ctx = ctx_zeroed();
+        unsafe { osCartRomInit_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(ctx.r2 as u32, handle_vram);
+        ctx.r2
+    }
+
+    fn install_sram_handle(
+        rdram: &mut [u8],
+        offset: u32,
+        timing: fn64_runtime::PiDomainTiming,
+    ) -> u64 {
+        let handle_vram = 0x8000_0000 | offset;
+        unsafe {
+            write_epi_handle(
+                rdram.as_mut_ptr(),
+                handle_vram,
+                DEVICE_TYPE_SRAM,
+                fn64_runtime::PiDomain::Domain2,
+                timing,
+                0xa800_0000,
+            )
+        };
+        handle_vram as i32 as u64
+    }
 
     #[test]
     fn loading_a_rom_clears_prior_rsp_rdp_observations() {
@@ -1901,6 +2237,7 @@ mod tests {
         load_rom_with_fixed_pi_latency(rom, 5);
 
         let mut rdram = vec![0u8; 0x1000];
+        let cart_handle = install_cart_handle(&mut rdram, 0x800);
         let queue = RdramAddr::from_offset(0x300);
         with_executor(|exec| exec.create_mesg_queue(queue, 1));
         let mb = 0x100usize;
@@ -1910,6 +2247,7 @@ mod tests {
         rdram[mb + 0x10..mb + 0x14].copy_from_slice(&4u32.to_ne_bytes());
 
         let mut ctx = ctx_zeroed();
+        ctx.r4 = cart_handle;
         ctx.r5 = 0x8000_0100;
         ctx.r6 = 0;
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx) };
@@ -1990,6 +2328,7 @@ mod tests {
         load_rom_with_fixed_pi_latency(rom, 5);
 
         let mut rdram = vec![0u8; 0x1000];
+        let cart_handle = install_cart_handle(&mut rdram, 0x800);
         let first_queue = RdramAddr::from_offset(0x300);
         let second_queue = RdramAddr::from_offset(0x340);
         with_executor(|exec| {
@@ -2007,12 +2346,14 @@ mod tests {
         write_mb(&mut rdram, 0x140, 0x8000_0340, 0x8000_0440, 0x40);
 
         let mut first = ctx_zeroed();
+        first.r4 = cart_handle;
         first.r5 = 0x8000_0100;
         first.r6 = 0;
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut first) };
         assert_eq!(first.r2, 0);
 
         let mut second = ctx_zeroed();
+        second.r4 = cart_handle;
         second.r5 = 0x8000_0140;
         second.r6 = 0;
         second.r2 = 0xBAD0_BAD0;
@@ -2098,7 +2439,7 @@ mod tests {
         assert_eq!(view.read_u8(base.checked_add(7).unwrap()), 0x02);
         assert_eq!(view.read_u8(base.checked_add(8).unwrap()), 0x34);
         assert_eq!(view.read_u8(base.checked_add(9).unwrap()), 1);
-        assert_eq!(view.read_u32(base.checked_add(12).unwrap()), 0x0500_0000);
+        assert_eq!(view.read_u32(base.checked_add(12).unwrap()), 0xa500_0000);
         assert_eq!(view.read_u32(base.checked_add(16).unwrap()), 0);
     }
 
@@ -2174,13 +2515,22 @@ mod tests {
     fn os_cart_rom_init_replaces_stale_unaligned_v0_with_guest_handle() {
         load_rom(vec![0u8; 0x100]);
         set_cart_rom_handle_vram(0x8000_9EA0);
+        let mut rdram = vec![0u8; 0x9f00];
 
         let mut ctx = ctx_zeroed();
         ctx.r2 = 0xFFFF_FFFF_8012_5636;
-        unsafe { osCartRomInit_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+        unsafe { osCartRomInit_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
         assert_eq!(ctx.r2, 0xFFFF_FFFF_8000_9EA0);
         assert_eq!(ctx.r2 & 3, 0, "returned OSPiHandle must be word-aligned");
+        let view = fn64_runtime::RdramView::from_storage(&rdram);
+        let handle = RdramAddr::from_offset(0x9ea0);
+        assert_eq!(
+            view.read_u8(handle.checked_add(4).unwrap()),
+            DEVICE_TYPE_CART
+        );
+        assert_eq!(view.read_u8(handle.checked_add(9).unwrap()), PI_DOMAIN1);
+        assert_eq!(view.read_u32(handle.checked_add(12).unwrap()), 0xb000_0000);
     }
 
     /// Regression test for the real double-KSEG0-translation bug
@@ -2213,6 +2563,7 @@ mod tests {
         load_rom(rom);
 
         let mut rdram = vec![0u8; 0x10000];
+        let cart_handle = install_cart_handle(&mut rdram, 0x1000);
         let mb_vram: u64 = 0x8000_2000; // a REAL, nonzero vram address
         let mb_offset = 0x2000usize;
 
@@ -2227,6 +2578,7 @@ mod tests {
         rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&size.to_ne_bytes());
 
         let mut ctx = ctx_zeroed();
+        ctx.r4 = cart_handle;
         ctx.r5 = mb_vram;
         ctx.r6 = 0; // OS_READ / ToRdram
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
@@ -2268,10 +2620,12 @@ mod tests {
         load_rom(rom);
 
         let mut rdram = vec![0u8; 0x1000];
+        let cart_handle = install_cart_handle(&mut rdram, 0x100);
         let dram_vram: u64 = 0x8000_0024;
         let dram_off = 0x24usize;
 
         let mut ctx = ctx_zeroed();
+        ctx.r4 = cart_handle;
         ctx.r5 = 0x3C; // devAddr
         ctx.r6 = dram_vram; // dramAddr
         unsafe { osEPiReadIo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
@@ -2310,9 +2664,21 @@ mod tests {
         )));
 
         let mut rdram = vec![0u8; 0x10000];
+        let sram_handle = install_sram_handle(
+            &mut rdram,
+            0x1000,
+            fn64_runtime::PiDomainTiming {
+                latency: 0x12,
+                pulse_width: 0x34,
+                page_size: 0x0d,
+                release: 2,
+            },
+        );
         let mb_offset = 0x2000usize;
         let mb_vram: u64 = 0x8000_2000;
-        let sram_dev_addr: u32 = 0x0800_0010; // domain-2 base + 0x10
+        // EPI callers provide the offset from the handle's base; the shared
+        // resolver must form 0x0800_0010 before entering the PI fabric.
+        let sram_dev_addr: u32 = 0x10;
         let size: u32 = 8;
 
         // Guest lays 8 distinct bytes at rdram 0x5000 via MEM_BU (byte-lane
@@ -2328,15 +2694,29 @@ mod tests {
         rdram[mb_offset + 0xC..mb_offset + 0x10].copy_from_slice(&sram_dev_addr.to_ne_bytes());
         rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&size.to_ne_bytes());
         let mut ctx = ctx_zeroed();
+        ctx.r4 = sram_handle;
         ctx.r5 = mb_vram;
         ctx.r6 = 1; // OS_WRITE
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+        assert_eq!(
+            with_host(|host| {
+                host.device_fabric
+                    .pi_domain_timing(fn64_runtime::PiDomain::Domain2)
+            }),
+            fn64_runtime::PiDomainTiming {
+                latency: 0x12,
+                pulse_width: 0x34,
+                page_size: 0x0d,
+                release: 2,
+            }
+        );
         complete_pi_dma();
 
         // OSIoMesg for the READ back into a DIFFERENT region (0x6000).
         let dst_off = 0x6000usize;
         rdram[mb_offset + 0x8..mb_offset + 0xC].copy_from_slice(&0x8000_6000u32.to_ne_bytes());
         let mut ctx = ctx_zeroed();
+        ctx.r4 = sram_handle;
         ctx.r5 = mb_vram;
         ctx.r6 = 0; // OS_READ
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
@@ -2394,6 +2774,7 @@ mod tests {
         load_rom(vec![0xCDu8; 0x1000]);
 
         let mut rdram = vec![0u8; 0x10000];
+        let cart_handle = install_cart_handle(&mut rdram, 0x1000);
         let mb_offset = 0x2000usize;
         // DmaMgr's real OSIoMesg layout: retQueue +0x4, dramAddr +0x8,
         // devAddr +0xC, size +0x10 (0x08-byte OSIoMesgHdr).
@@ -2403,6 +2784,7 @@ mod tests {
         rdram[mb_offset + 0x10..mb_offset + 0x14].copy_from_slice(&4u32.to_ne_bytes());
 
         let mut ctx = ctx_zeroed();
+        ctx.r4 = cart_handle;
         ctx.r5 = 0x8000_2000;
         ctx.r6 = 0; // OS_READ / ToRdram
         ctx.r2 = 0x1234; // stale non-zero, as a real caller's register would hold
@@ -2421,10 +2803,11 @@ mod tests {
         rom[0x20..0x28].copy_from_slice(&[0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87]);
         load_rom(rom);
         let mut rdram = vec![0u8; 0x100];
+        let cart_handle = install_cart_handle(&mut rdram, 0x20);
         rdram[0x40 + 0x10..0x40 + 0x14].copy_from_slice(&8u32.to_ne_bytes());
 
         let mut ctx = ctx_zeroed();
-        ctx.r4 = 0x8000_0100;
+        ctx.r4 = cart_handle;
         ctx.r5 = 0;
         ctx.r6 = 0x20;
         ctx.r7 = 0x8000_0080;
@@ -2444,14 +2827,252 @@ mod tests {
     fn pi_writes_to_read_only_rom_return_minus_one() {
         load_rom(vec![0u8; 0x100]);
         let mut rdram = vec![0u8; 0x100];
+        let cart_handle = install_cart_handle(&mut rdram, 0x20);
         rdram[0x40 + 0x10..0x40 + 0x14].copy_from_slice(&8u32.to_ne_bytes());
         let mut ctx = ctx_zeroed();
+        ctx.r4 = cart_handle;
         ctx.r5 = 1;
         ctx.r6 = 0x20;
         ctx.r7 = 0x8000_0080;
         ctx.r29 = 0x8000_0040;
         unsafe { osEPiRawStartDma_recomp(rdram.as_mut_ptr(), &mut ctx) };
         assert_eq!(ctx.r2, u64::MAX);
+    }
+
+    #[test]
+    fn managed_raw_and_programmed_epi_calls_share_handle_address_and_timing_authority() {
+        let mut rom = vec![0u8; 0x100];
+        rom[0x20..0x24].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        load_rom(rom);
+        set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+            fn64_runtime::SaveType::SramBanked,
+        )));
+        let mut rdram = vec![0u8; 0x800];
+        let cart_timing = fn64_runtime::PiDomainTiming {
+            latency: 0x21,
+            pulse_width: 0x32,
+            page_size: 0x0b,
+            release: 1,
+        };
+        let save_timing = fn64_runtime::PiDomainTiming {
+            latency: 0x43,
+            pulse_width: 0x54,
+            page_size: 0x0c,
+            release: 2,
+        };
+        unsafe {
+            write_epi_handle(
+                rdram.as_mut_ptr(),
+                0x8000_0100,
+                DEVICE_TYPE_CART,
+                fn64_runtime::PiDomain::Domain1,
+                cart_timing,
+                0xb000_0000,
+            )
+        };
+        let cart_handle = 0xFFFF_FFFF_8000_0100;
+        let save_handle = install_sram_handle(&mut rdram, 0x140, save_timing);
+
+        // Raw EPI DMA consumes the same handle decode as managed EPI. The
+        // request stores fn64's internal ROM offset while raw MMIO exposes
+        // the handle's domain timing immediately.
+        rdram[0x40 + 0x10..0x40 + 0x14].copy_from_slice(&4u32.to_ne_bytes());
+        let mut raw = ctx_zeroed();
+        raw.r4 = cart_handle;
+        raw.r5 = 0;
+        raw.r6 = 0x20;
+        raw.r7 = 0x8000_0200;
+        raw.r29 = 0x8000_0040;
+        unsafe { osEPiRawStartDma_recomp(rdram.as_mut_ptr(), &mut raw) };
+        assert_eq!(raw.r2, 0);
+        assert_eq!(
+            with_host(|host| host.device_fabric.pending_pi_request().unwrap().cart_addr),
+            0x20
+        );
+        assert_eq!(
+            read_raw_mmio_word(0xA460_0014),
+            Some(cart_timing.latency as u32)
+        );
+        assert_eq!(
+            read_raw_mmio_word(0xA460_0018),
+            Some(cart_timing.pulse_width as u32)
+        );
+        complete_pi_dma();
+
+        // The public OR rule also admits an already-absolute KSEG1 device
+        // address. Segment removal happens only after the OR, at the PI
+        // boundary, so this reaches the same ROM byte as offset 0x20 above.
+        let mut absolute = ctx_zeroed();
+        absolute.r4 = cart_handle;
+        absolute.r5 = 0xb000_0020;
+        absolute.r6 = 0x8000_0204;
+        unsafe { osEPiReadIo_recomp(rdram.as_mut_ptr(), &mut absolute) };
+        assert_eq!(absolute.r2, 0);
+        assert_eq!(
+            u32::from_ne_bytes(rdram[0x204..0x208].try_into().unwrap()),
+            0x1234_5678
+        );
+
+        // Managed EPI forms baseAddress | devAddr for SRAM and publishes the
+        // second handle's settings through those same raw registers.
+        let mb = 0x300usize;
+        rdram[mb + 0x4..mb + 0x8].copy_from_slice(&0u32.to_ne_bytes());
+        rdram[mb + 0x8..mb + 0xC].copy_from_slice(&0x8000_0240u32.to_ne_bytes());
+        rdram[mb + 0xC..mb + 0x10].copy_from_slice(&0x10u32.to_ne_bytes());
+        rdram[mb + 0x10..mb + 0x14].copy_from_slice(&4u32.to_ne_bytes());
+        let mut managed = ctx_zeroed();
+        managed.r4 = save_handle;
+        managed.r5 = 0x8000_0300;
+        managed.r6 = 0;
+        unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut managed) };
+        assert_eq!(managed.r2, 0);
+        assert_eq!(
+            with_host(|host| host.device_fabric.pending_pi_request().unwrap().cart_addr),
+            fn64_runtime::rom::SRAM_DOMAIN2_BASE + 0x10
+        );
+        assert_eq!(
+            read_raw_mmio_word(0xA460_0024),
+            Some(save_timing.latency as u32)
+        );
+        assert_eq!(
+            read_raw_mmio_word(0xA460_0028),
+            Some(save_timing.pulse_width as u32)
+        );
+        complete_pi_dma();
+
+        // Programmed I/O uses the same resolver in both directions rather
+        // than retaining a third handle/address implementation.
+        let mut write = ctx_zeroed();
+        write.r4 = save_handle;
+        write.r5 = 0x20;
+        write.r6 = 0xCAFE_BABE;
+        unsafe { osEPiWriteIo_recomp(rdram.as_mut_ptr(), &mut write) };
+        assert_eq!(write.r2, 0);
+        let mut read = ctx_zeroed();
+        read.r4 = save_handle;
+        read.r5 = 0x20;
+        read.r6 = 0x8000_0280;
+        unsafe { osEPiReadIo_recomp(rdram.as_mut_ptr(), &mut read) };
+        assert_eq!(read.r2, 0);
+        assert_eq!(
+            u32::from_ne_bytes(rdram[0x280..0x284].try_into().unwrap()),
+            0xCAFE_BABE
+        );
+        assert_eq!(
+            crate::copy_save_operations()
+                .iter()
+                .map(|event| (event.operation, event.offset, event.len))
+                .collect::<Vec<_>>(),
+            vec![
+                (fn64_runtime::SaveOperationKind::Read, 0x10, 4),
+                (fn64_runtime::SaveOperationKind::Write, 0x20, 4),
+                (fn64_runtime::SaveOperationKind::Read, 0x20, 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn epi_handle_for_unbacked_public_device_space_is_a_loud_typed_trap() {
+        let mut rdram = vec![0u8; 0x200];
+        unsafe {
+            write_epi_handle(
+                rdram.as_mut_ptr(),
+                0x8000_0100,
+                DEVICE_TYPE_64DD,
+                fn64_runtime::PiDomain::Domain2,
+                fn64_runtime::PiDomainTiming::default(),
+                0xa500_0000,
+            )
+        };
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            resolve_epi_device_address(rdram.as_mut_ptr(), 0x8000_0100, 0, "typed EPI test")
+        }));
+        assert!(result.is_err());
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].subsystem, fn64_runtime::UnsupportedSubsystem::Abi);
+        assert_eq!(events[0].operation, "abi.pi.epi-handle");
+        assert_eq!(
+            events[0].disposition,
+            fn64_runtime::UnsupportedDisposition::LoudTrap
+        );
+        assert!(events[0].context.contains("0x05000000"));
+        fn64_runtime::complete_unsupported_observation(Cycles::ZERO, &"0".repeat(64));
+
+        assert_subprocess_aborts("pi::tests::__unbacked_epi_handle_abort_subprocess_entry");
+    }
+
+    #[test]
+    fn epi_handle_outside_physical_rdram_is_a_loud_typed_trap() {
+        let mut rdram = vec![0u8; 0x100];
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            resolve_epi_device_address(
+                rdram.as_mut_ptr(),
+                0xffff_ffff_807f_fff0,
+                0,
+                "out-of-range EPI test",
+            )
+        }));
+        assert!(result.is_err());
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, "abi.pi.epi-handle");
+        assert!(events[0].context.contains("outside physical RDRAM"));
+        fn64_runtime::complete_unsupported_observation(Cycles::ZERO, &"0".repeat(64));
+    }
+
+    #[test]
+    fn epi_handle_rejects_a_raw_physical_base_instead_of_guessing_its_address_form() {
+        let mut rdram = vec![0u8; 0x200];
+        unsafe {
+            write_epi_handle(
+                rdram.as_mut_ptr(),
+                0x8000_0100,
+                DEVICE_TYPE_SRAM,
+                fn64_runtime::PiDomain::Domain2,
+                fn64_runtime::PiDomainTiming::default(),
+                0xa800_0000,
+            )
+        };
+        rdram[0x10c..0x110].copy_from_slice(&0x0800_0000u32.to_ne_bytes());
+
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            resolve_epi_device_address(rdram.as_mut_ptr(), 0x8000_0100, 0, "physical-base test")
+        }));
+        assert!(result.is_err());
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation, "abi.pi.epi-handle");
+        assert!(events[0].context.contains("uncached KSEG1"));
+        fn64_runtime::complete_unsupported_observation(Cycles::ZERO, &"0".repeat(64));
+    }
+
+    #[test]
+    #[ignore]
+    fn __unbacked_epi_handle_abort_subprocess_entry() {
+        if std::env::var_os("FN64_ABI_RUN_ABORT_CHECK").is_some() {
+            load_rom(vec![0; 0x100]);
+            let mut rdram = vec![0u8; 0x400];
+            unsafe {
+                write_epi_handle(
+                    rdram.as_mut_ptr(),
+                    0x8000_0100,
+                    2,
+                    fn64_runtime::PiDomain::Domain2,
+                    fn64_runtime::PiDomainTiming::default(),
+                    0xa500_0000,
+                )
+            };
+            fn64_runtime::arm_unsupported_events(None).unwrap();
+            let mut ctx = ctx_zeroed();
+            ctx.r4 = 0x8000_0100;
+            ctx.r5 = 0;
+            ctx.r6 = 0x8000_0200;
+            unsafe { osEPiReadIo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        }
     }
 
     #[test]
@@ -2478,7 +3099,18 @@ mod tests {
             // `!status.success()` while proving nothing about the trap.
             const MB_VRAM: u64 = 0xFFFF_FFFF_8000_0000;
             let mut ctx = ctx_zeroed();
-            let mut rdram = rdram_for_vram(MB_VRAM + 0x14); // OSIoMesg ends at +0x14
+            let mut rdram = rdram_for_vram(MB_VRAM + 0x40);
+            unsafe {
+                write_epi_handle(
+                    rdram.as_mut_ptr(),
+                    0x8000_0020,
+                    DEVICE_TYPE_CART,
+                    fn64_runtime::PiDomain::Domain1,
+                    fn64_runtime::PiDomainTiming::default(),
+                    0xb000_0000,
+                )
+            };
+            ctx.r4 = 0x8000_0020;
             ctx.r5 = MB_VRAM;
             ctx.r6 = 0; // direction = ToRdram
             unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };

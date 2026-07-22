@@ -93,6 +93,13 @@
       "trigger": "used unsupported mapped address with width"
     },
     {
+      "operation": "abi.pi.epi-handle",
+      "subsystem": "abi",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-abi/src/pi.rs",
+      "trigger": "fn64_runtime::UnsupportedSubsystem::Abi,\n        \"abi.pi.epi-handle\""
+    },
+    {
       "operation": "audio.rsp.unknown-instruction",
       "subsystem": "audio",
       "disposition": "returned_error",
