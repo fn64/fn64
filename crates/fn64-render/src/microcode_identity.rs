@@ -22,6 +22,24 @@ impl F3dzex2Variant {
     pub const fn family(self) -> UcodeId {
         UcodeId::F3dzex2
     }
+
+    /// Stable admission-wire tag. These values are append-only because they
+    /// participate in canonical task-plan identities and the native ABI.
+    pub const fn canonical_tag(self) -> u32 {
+        match self {
+            Self::NoNFifo206H => 1,
+            Self::NoNFifo208I => 2,
+            Self::NoNFifo208J => 3,
+        }
+    }
+
+    pub const fn point_lighting(self) -> bool {
+        matches!(self, Self::NoNFifo208I | Self::NoNFifo208J)
+    }
+
+    pub const fn no_near_clip(self) -> bool {
+        true
+    }
 }
 
 /// Largest raw prefix required by pinned RT64's F3DZEX2 recognition rows.
@@ -118,6 +136,19 @@ mod tests {
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         assert_eq!(Hasher::oneshot(&bytes), 0xe5d7_8baf_a45b_2aa5);
+    }
+
+    #[test]
+    fn f3dzex2_variant_tags_bind_non_and_point_lighting_capabilities() {
+        assert_eq!(F3dzex2Variant::NoNFifo206H.canonical_tag(), 1);
+        assert_eq!(F3dzex2Variant::NoNFifo208I.canonical_tag(), 2);
+        assert_eq!(F3dzex2Variant::NoNFifo208J.canonical_tag(), 3);
+        assert!(!F3dzex2Variant::NoNFifo206H.point_lighting());
+        assert!(F3dzex2Variant::NoNFifo208I.point_lighting());
+        assert!(F3dzex2Variant::NoNFifo208J.point_lighting());
+        assert!(F3dzex2Variant::NoNFifo206H.no_near_clip());
+        assert!(F3dzex2Variant::NoNFifo208I.no_near_clip());
+        assert!(F3dzex2Variant::NoNFifo208J.no_near_clip());
     }
 
     #[test]

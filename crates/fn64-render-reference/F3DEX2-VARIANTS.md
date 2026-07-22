@@ -77,6 +77,16 @@ not a Nintendo specification or hardware-exact oracle. fn64 binds those raw
 text/data fingerprints only to backend-neutral identity; it has not validated
 the family-specific operations independently, so HLE remains unadmitted.
 
+Ordered HLE admission nevertheless retains the behavior-bearing identity
+explicitly. `TaskAdmissionUcode::F3dzex2` requires one of the three classified
+variants; a broad `UcodeId::F3dzex2` cannot construct an executable task plan.
+The canonical plan-v2 identity and native schema-v2 wire bind variant tags 1,
+2, and 3 respectively. Native preflight additionally requires NoN for all
+three, point lighting disabled for 2.06H, and point lighting enabled for
+2.08I/J. The raw text/data pool remains the authority that distinguishes I
+from J because pinned RT64 exposes identical native behavior flags for those
+two rows. This closes identity collapse only; it does not open the decoder.
+
 fn64 names `GeometryWireFamily::F3dzex2` and `UcodeId::F3dzex2` so the frontier
 cannot be mistaken for ordinary F3DEX2. Catalog admission, command decode, and
 state initialization all trap with the missing-evidence requirement. In

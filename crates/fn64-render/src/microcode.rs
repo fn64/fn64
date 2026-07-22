@@ -11,7 +11,7 @@
 //! F3DZEX2 remains named but unadmitted because those allowed sources do not
 //! specify its family-specific continuation and branch commands.
 
-use crate::{MicrocodeDataImageIdentity, RenderError, UcodeId};
+use crate::{F3dzex2Variant, MicrocodeDataImageIdentity, RenderError, UcodeId};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -54,6 +54,97 @@ pub enum TaskAdmissionSource {
     SelfLoad,
 }
 
+/// Behavior-bearing microcode identity at one activation boundary.
+///
+/// `UcodeId` remains the public family denominator, while this type prevents
+/// F3DZEX2 variants with different point-lighting behavior from collapsing to
+/// the same executable admission identity.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TaskAdmissionUcode {
+    Fast3d,
+    F3dex,
+    F3dlx,
+    F3dlxRej,
+    F3dex2,
+    F3dex2NoN,
+    F3dex2Rej,
+    F3dlx2Rej,
+    F3dzex2(F3dzex2Variant),
+    S2dex,
+    S2dex2,
+    L3dex,
+    L3dex2,
+    Other(u32),
+}
+
+impl TaskAdmissionUcode {
+    pub const fn from_family(family: UcodeId) -> Self {
+        match family {
+            UcodeId::Fast3d => Self::Fast3d,
+            UcodeId::F3dex => Self::F3dex,
+            UcodeId::F3dlx => Self::F3dlx,
+            UcodeId::F3dlxRej => Self::F3dlxRej,
+            UcodeId::F3dex2 => Self::F3dex2,
+            UcodeId::F3dex2NoN => Self::F3dex2NoN,
+            UcodeId::F3dex2Rej => Self::F3dex2Rej,
+            UcodeId::F3dlx2Rej => Self::F3dlx2Rej,
+            UcodeId::F3dzex2 => {
+                panic!("F3DZEX2 task admission requires an exact typed variant")
+            }
+            UcodeId::S2dex => Self::S2dex,
+            UcodeId::S2dex2 => Self::S2dex2,
+            UcodeId::L3dex => Self::L3dex,
+            UcodeId::L3dex2 => Self::L3dex2,
+            UcodeId::Other(value) => Self::Other(value),
+        }
+    }
+
+    pub const fn family(self) -> UcodeId {
+        match self {
+            Self::Fast3d => UcodeId::Fast3d,
+            Self::F3dex => UcodeId::F3dex,
+            Self::F3dlx => UcodeId::F3dlx,
+            Self::F3dlxRej => UcodeId::F3dlxRej,
+            Self::F3dex2 => UcodeId::F3dex2,
+            Self::F3dex2NoN => UcodeId::F3dex2NoN,
+            Self::F3dex2Rej => UcodeId::F3dex2Rej,
+            Self::F3dlx2Rej => UcodeId::F3dlx2Rej,
+            Self::F3dzex2(_) => UcodeId::F3dzex2,
+            Self::S2dex => UcodeId::S2dex,
+            Self::S2dex2 => UcodeId::S2dex2,
+            Self::L3dex => UcodeId::L3dex,
+            Self::L3dex2 => UcodeId::L3dex2,
+            Self::Other(value) => UcodeId::Other(value),
+        }
+    }
+
+    pub const fn f3dzex2_variant(self) -> Option<F3dzex2Variant> {
+        match self {
+            Self::F3dzex2(variant) => Some(variant),
+            _ => None,
+        }
+    }
+
+    const fn canonical_tags(self) -> (u8, u32) {
+        match self {
+            Self::Fast3d => (1, 0),
+            Self::F3dex => (2, 0),
+            Self::F3dlx => (3, 0),
+            Self::F3dlxRej => (4, 0),
+            Self::F3dex2 => (5, 0),
+            Self::F3dex2NoN => (6, 0),
+            Self::F3dex2Rej => (7, 0),
+            Self::F3dlx2Rej => (8, 0),
+            Self::F3dzex2(variant) => (9, variant.canonical_tag()),
+            Self::S2dex => (10, 0),
+            Self::S2dex2 => (11, 0),
+            Self::L3dex => (12, 0),
+            Self::L3dex2 => (13, 0),
+            Self::Other(value) => (u8::MAX, value),
+        }
+    }
+}
+
 /// Exact identity expected at one ordered microcode activation boundary.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TaskAdmissionGeneration {
@@ -62,10 +153,14 @@ pub struct TaskAdmissionGeneration {
     pub data_address: u32,
     pub text_sha256: UcodeDigest,
     pub data: MicrocodeDataImageIdentity,
-    pub family: UcodeId,
+    pub ucode: TaskAdmissionUcode,
 }
 
 impl TaskAdmissionGeneration {
+    pub const fn family(self) -> UcodeId {
+        self.ucode.family()
+    }
+
     fn validate(self, ordinal: usize) {
         assert!(
             self.text_address < 0x0100_0000 && self.text_address.is_multiple_of(8),
@@ -152,7 +247,7 @@ impl TaskAdmissionPlan {
     /// generation source and order are part of the hash domain.
     pub fn sha256(&self) -> [u8; 32] {
         let mut hash = Sha256::new();
-        hash.update(b"fn64-task-admission-plan-v1\0");
+        hash.update(b"fn64-task-admission-plan-v2\0");
         hash.update(
             u64::try_from(self.generations.len())
                 .expect("task admission generation count fits u64")
@@ -168,24 +263,9 @@ impl TaskAdmissionPlan {
             hash.update(generation.text_sha256.as_bytes());
             hash.update(generation.data.bytes.to_be_bytes());
             hash.update(generation.data.sha256);
-            let (family, other) = match generation.family {
-                UcodeId::Fast3d => (1, 0),
-                UcodeId::F3dex => (2, 0),
-                UcodeId::F3dlx => (3, 0),
-                UcodeId::F3dlxRej => (4, 0),
-                UcodeId::F3dex2 => (5, 0),
-                UcodeId::F3dex2NoN => (6, 0),
-                UcodeId::F3dex2Rej => (7, 0),
-                UcodeId::F3dlx2Rej => (8, 0),
-                UcodeId::F3dzex2 => (9, 0),
-                UcodeId::S2dex => (10, 0),
-                UcodeId::S2dex2 => (11, 0),
-                UcodeId::L3dex => (12, 0),
-                UcodeId::L3dex2 => (13, 0),
-                UcodeId::Other(value) => (u8::MAX, value),
-            };
+            let (family, detail) = generation.ucode.canonical_tags();
             hash.update([family]);
-            hash.update(other.to_be_bytes());
+            hash.update(detail.to_be_bytes());
         }
         hash.finalize().into()
     }
@@ -551,7 +631,7 @@ mod tests {
                 bytes: 8,
                 sha256: [digest_byte.wrapping_add(1); 32],
             },
-            family: UcodeId::F3dex2,
+            ucode: TaskAdmissionUcode::F3dex2,
         }
     }
 
@@ -631,11 +711,39 @@ mod tests {
             TaskAdmissionPlan::new(entry, [changed, b]).sha256()
         );
         changed = a;
-        changed.family = UcodeId::Other(7);
+        changed.ucode = TaskAdmissionUcode::Other(7);
         assert_ne!(
             baseline.sha256(),
             TaskAdmissionPlan::new(entry, [changed, b]).sha256()
         );
+    }
+
+    #[test]
+    fn task_admission_identity_cannot_collapse_f3dzex2_behavior_variants() {
+        let baseline = admission_generation(TaskAdmissionSource::TaskEntry, 0x1000, 0x10);
+        let plan = |variant| {
+            let mut generation = baseline;
+            generation.ucode = TaskAdmissionUcode::F3dzex2(variant);
+            TaskAdmissionPlan::new(generation, [])
+        };
+        let h206 = plan(F3dzex2Variant::NoNFifo206H);
+        let i208 = plan(F3dzex2Variant::NoNFifo208I);
+        let j208 = plan(F3dzex2Variant::NoNFifo208J);
+
+        assert_eq!(h206.entry().family(), UcodeId::F3dzex2);
+        assert_eq!(
+            h206.entry().ucode.f3dzex2_variant(),
+            Some(F3dzex2Variant::NoNFifo206H)
+        );
+        assert_ne!(h206.sha256(), i208.sha256());
+        assert_ne!(h206.sha256(), j208.sha256());
+        assert_ne!(i208.sha256(), j208.sha256());
+    }
+
+    #[test]
+    #[should_panic(expected = "F3DZEX2 task admission requires an exact typed variant")]
+    fn broad_f3dzex2_family_cannot_construct_executable_admission() {
+        let _ = TaskAdmissionUcode::from_family(UcodeId::F3dzex2);
     }
 
     #[test]

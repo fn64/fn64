@@ -28,7 +28,7 @@ typedef struct Fn64Rt64Task {
 } Fn64Rt64Task;
 
 enum {
-    FN64_RT64_UCODE_PLAN_SCHEMA = 1,
+    FN64_RT64_UCODE_PLAN_SCHEMA = 2,
     FN64_RT64_TASK_RESULT_SCHEMA = 2,
     FN64_RT64_UCODE_SOURCE_TASK_ENTRY = 1,
     FN64_RT64_UCODE_SOURCE_SELF_LOAD = 2,
@@ -43,8 +43,10 @@ enum {
  * into Fn64Rt64UcodePlan::raw_pool and must have the exact recognition lengths
  * above. The logical digests retain fn64's full admitted text/data identities
  * independently of RT64's shorter recognition windows. expected_family zero
- * denotes UcodeId::Other and carries its opaque value in reserved0; named
- * families require reserved0 zero. The reserved array must always be zero. */
+ * denotes UcodeId::Other and carries its opaque value in expected_detail.
+ * Named families other than F3DZEX2 require expected_detail zero. F3DZEX2
+ * requires detail 1 for NoN fifo 2.06H, 2 for 2.08I, or 3 for 2.08J. The
+ * reserved array must always be zero. */
 typedef struct Fn64Rt64UcodeGeneration {
     uint32_t source;
     uint32_t text_address;
@@ -55,13 +57,13 @@ typedef struct Fn64Rt64UcodeGeneration {
     uint32_t raw_text_len;
     uint32_t raw_data_offset;
     uint32_t raw_data_len;
-    uint32_t reserved0;
+    uint32_t expected_detail;
     uint8_t logical_text_sha256[32];
     uint8_t logical_data_sha256[32];
     uint32_t reserved[4];
 } Fn64Rt64UcodeGeneration;
 
-/* plan_sha256 is SHA-256 over the schema-1 canonical encoding documented by
+/* plan_sha256 is SHA-256 over the schema-2 canonical encoding documented by
  * the shim implementation: domain, little-endian scalar generation fields,
  * logical digests, zero reserved fields, little-endian raw length, then the
  * complete raw pool. Pointer values are deliberately excluded. */

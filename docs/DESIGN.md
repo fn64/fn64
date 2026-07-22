@@ -868,7 +868,10 @@ task calls out:
   opcode byte. The RT64 transactional preflight additionally freezes an
   immutable shared `TaskAdmissionPlan`: task entry is generation zero and
   every admitted `G_LOAD_UCODE` follows in executed order with physical
-  addresses, complete text/data identities, and public family. Duplicate
+  addresses, complete text/data identities, and behavior-bearing microcode
+  identity. F3DZEX2 cannot be represented there as a broad family: plan-v2
+  requires its classified 2.06H, 2.08I, or 2.08J variant and hashes that tag.
+  Duplicate
   addresses and `A -> B -> A` generations are deliberately retained. The
   native adapter consumes that plan at pinned RT64's pre-cache
   `loadUCodeGBI` boundary, compares the live raw recognition windows, forces
@@ -877,6 +880,13 @@ task calls out:
   incompatible generations return typed `NeedsLle` before live interpreter
   mutation. Missing, extra, reordered, or changed generations after execution
   begins poison the native context and fail loudly.
+  The native schema-v2 generation wire mirrors that variant in
+  `expected_detail`; preflight requires NoN for all three F3DZEX2 rows and the
+  variant-specific point-lighting capability. Its immutable raw pool remains
+  the I/J discriminator because pinned RT64 exposes the same native flags for
+  those two variants. This typed plumbing does not itself admit the F3DZEX2
+  command decoder: until BranchW, NoN, and point-lighting behavior pass their
+  separate gates, the catalog continues to select LLE.
   Native RT64 task submission returns a schema-checked result containing the
   plan identity, planned/observed generation counts, typed disposition and
   rejected generation, entry GBI availability, pre/post workload IDs, and

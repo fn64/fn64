@@ -49,7 +49,7 @@ pub use geometry_task_inspection::{
 pub use microcode::{
     F3dex2UcodeCatalog, GeometryUcodeCatalog, GeometryWireFamily, MicrocodePairCatalog,
     S2dexUcodeCatalog, S2dexWireFamily, TaskAdmissionGeneration, TaskAdmissionPlan,
-    TaskAdmissionSource, UcodeDigest,
+    TaskAdmissionSource, TaskAdmissionUcode, UcodeDigest,
 };
 pub use microcode_identity::{
     capture_task_admission_raw_window, identify_f3dzex2, F3dzex2Variant, F3DZEX2_IDENTITY_SOURCE,
