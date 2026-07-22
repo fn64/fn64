@@ -9,10 +9,11 @@ Primary sources:
 - *MIPS IV Instruction Set*, revision 3.2, tables A-39 (MIPS III CPU encoding,
   pp. A-179–A-181) and B-25 (MIPS III FPU encoding, pp. B-73–B-75):
   <https://www.cs.cmu.edu/afs/cs/academic/class/15740-f97/public/doc/mips-isa.pdf>
-- *NEC VR4300 User's Manual*, chapter 6 (exception processing, Cause/EPC/BD,
-  BadVAddr, and the AdEL/AdES exception codes), sections 6.3.2.1–6.3.2.3
-  (FCR0/FCR31 and rounding), 10.8/11.8 (LL/SC), and appendix D.2 (division by
-  zero):
+- *NEC VR4300 User's Manual*, chapter 3 (32-bit virtual-address translation,
+  PageMask, EntryHi/EntryLo, and TLB exceptions), chapter 6 (exception
+  processing, vectors, Context/BadVAddr, Cause/EPC/BD, and exception codes),
+  sections 6.3.2.1–6.3.2.3 (FCR0/FCR31 and rounding), chapter 16 SC
+  (pp. 486–488) and SCD (pp. 488–490), and appendix D.2 (division by zero):
   <https://bitsavers.org/components/nec/mips/1995_NEC_VR4300_MIPS_RISC_Microprocessor_Users_Manual.pdf>
 - The host RDRAM representation is the project ABI: native-endian word access,
   halfword address `^ 2`, byte address `^ 3`. The MIT N64Recomp `recomp.h`
@@ -65,9 +66,12 @@ trapping SPECIAL adds construct precise Cause/EPC/BD state and vector through
 the installed guest handler; the historical whole-function callable lane still
 panics because its ABI cannot return a control transfer. CACHE preserves host
 coherence but does not model cache tags or Status.CH. LL/LLD and SC/SCD
-implement one address-and-width reservation, one-shot clear, and mismatched
-failure; DMA/external writes and the architecture's permitted
-implementation-dependent invalidations are outside this single-context model.
+implement one address-and-width reservation and one-shot clear. The manual's
+SC/SCD pseudocode consults only LLbit and declares a different address from the
+linked instruction undefined; mismatched failure is fn64's bounded
+deterministic choice, not a physical-alias or silicon-granule parity claim.
+DMA/external writes and the architecture's permitted implementation-dependent
+invalidations are outside this single-context model.
 
 The arbitrary-PC lane checks every naturally aligned integer, LL/SC, and COP1
 load/store before executing it. Misaligned loads produce AdEL (ExcCode 4),
@@ -128,7 +132,7 @@ write and honors an encoded `rd=0`.
 ## COP0
 
 MFC0, DMFC0, MTC0, DMTC0, BC0F/T/FL/TL, TLBR, TLBWI, TLBWR, TLBP, and ERET
-all decode. Index (0), Random (1), EntryLo0/1 (2/3), PageMask (5), Wired (6),
+all decode. Index (0), Random (1), EntryLo0/1 (2/3), Context (4), PageMask (5), Wired (6),
 BadVAddr (8), Count (9), EntryHi (10), Compare (11), Status (12), Cause (13), EPC (14),
 WatchLo/Hi (18/19), and ErrorEPC (30) have typed 32-bit reads; writable
 registers other than BadVAddr/Random have modeled typed writes. Cause accepts
@@ -145,9 +149,19 @@ architecturally undefined multiple-match case. A failed probe sets `Index.P`
 and deterministically clears the architecturally unpredictable low Index field;
 this bounded choice is not a silicon-exact claim. The historical whole-function
 lane keeps Random reads and TLBWR loud because its callable ABI has no
-instruction clock. Address translation through the recorded entries remains
-loud in every lane. Doubleword moves and other registers likewise remain
-host-boundary traps. In the arbitrary-PC
+instruction clock. Canonical 32-bit KUSEG/KSSEG/KSEG3 data loads and stores in
+the arbitrary-PC generated and interpreted lanes now use those same entries.
+The shared translator applies each legal VR4300 PageMask, selects EntryLo0/1,
+assembles PFN plus page offset, and enforces V and store-D before any memory
+side effect. No match, V=0, and store with D=0 return distinct typed refill,
+invalid, and modified exceptions with precise EPC/BD/BadVAddr. Exception entry
+updates Context.BadVPN2 and EntryHi.VPN2 while preserving PTEBase/ASID, then
+selects the 32-bit refill vector only for a first-level miss; invalid, modified,
+and nested misses use the common vector. KSEG0/KSEG1 remain direct. Multiple
+matches and unsupported PageMask encodings trap loudly. Instruction fetch,
+64-bit mapped spaces/XContext, privilege checks, and generated-lane translated
+physical device routing remain open rather than being silently direct-mapped. Doubleword moves
+and other registers likewise remain host-boundary traps. In the arbitrary-PC
 bank lane, ERET selects ErrorEPC/ERL or EPC/EXL, clears the LL reservation, and
 returns a typed resolved transfer; the historical whole-function lane still
 traps because its callable ABI cannot return a transfer. BC0 uses a typed
@@ -230,12 +244,15 @@ therefore become compile-time errors, never silent no-ops.
   checkpointing, handler-selected aligned resumption, COP1 unusable straight
   and branch paths, delay-slot BD/EPC, CU1-enabled execution, exception
   priority over COP1 address alignment, Cause.CE, and ERET.
+  The same compiled gate differentially executes TLB-backed load/store plus
+  refill, invalid, modified, and delay-slot refill cases in the emitted and
+  interpreted lanes.
 
 Bottom line: encoding coverage is complete for the documented MIPS III CPU
 table, with COP2 decoded as architecturally unusable. Execution is complete
 for the ordinary integer, control-flow, aligned/unaligned memory, shift, and
 HI/LO paths OoT can execute. It is not a complete VR4300 CPU model until the
-remaining P items—especially full FPU environment behavior, TLB translation,
-COP0/COP2 exception behavior, and the whole-function lane's exception
-boundary—are implemented or deliberately moved behind a documented host ABI
-boundary.
+remaining P items—especially full FPU environment behavior, instruction and
+64-bit/privileged TLB translation, COP0/COP2 exception behavior, and the
+whole-function lane's exception boundary—are implemented or deliberately moved
+behind a documented host ABI boundary.
