@@ -3510,7 +3510,7 @@ mod tests {
             let yh = 4;
             let ym = 4 * 4;
             let yl = 7 * 4;
-            command(0x0880_0000 | yl, (ym << 16) | yh);
+            command(0x0800_0000 | yl, (ym << 16) | yh);
             command(1 << 16, (5.0f32 / 3.0 * 65536.0).round() as u32);
             command(1 << 16, (5.0f32 / 6.0 * 65536.0).round() as u32);
             command(1 << 16, 0);
@@ -3587,14 +3587,14 @@ mod tests {
             let yh = 4;
             let ym = 4 * 4;
             let yl = 7 * 4;
-            command(0x0980_0000 | yl, (ym << 16) | yh);
+            command(0x0900_0000 | yl, (ym << 16) | yh);
             command(1 << 16, (5.0f32 / 3.0 * 65536.0).round() as u32);
             command(1 << 16, (5.0f32 / 6.0 * 65536.0).round() as u32);
             command(1 << 16, 0);
             command(2 << 16, 0); // near plane is Z=0
             command(0, 0);
             command(0xfa00_0000, 0xff00_00ff); // opaque red primitive
-            command(0x0980_0000 | yl, (ym << 16) | yh);
+            command(0x0900_0000 | yl, (ym << 16) | yh);
             command(1 << 16, (5.0f32 / 3.0 * 65536.0).round() as u32);
             command(1 << 16, (5.0f32 / 6.0 * 65536.0).round() as u32);
             command(1 << 16, 0);
@@ -3646,7 +3646,7 @@ mod tests {
         let yh = 4;
         let ym = 4 * 4;
         let yl = 7 * 4;
-        let triangle = 0x0980_0000 | yl;
+        let triangle = 0x0900_0000 | yl;
         let edge_ym_yh = (ym << 16) | yh;
         let major_slope = (5.0f32 / 3.0 * 65536.0).round() as u32;
         let minor_slope = (5.0f32 / 6.0 * 65536.0).round() as u32;
@@ -3738,7 +3738,7 @@ mod tests {
         command(0xee00_0000, (8 << 16) | 32); // primitive Z=8, DeltaZ=32
         command(0xef00_00f0, 0x34); // dither off | G_ZS_PRIM | Z_CMP | Z_UPD
         command(0xfa00_0000, 0x0000_ffff); // opaque blue primitive
-        command(0x0880_0000 | yl, (ym << 16) | yh); // no Z coefficient words
+        command(0x0800_0000 | yl, (ym << 16) | yh); // no Z coefficient words
         command(1 << 16, (5.0f32 / 3.0 * 65536.0).round() as u32);
         command(1 << 16, (5.0f32 / 6.0 * 65536.0).round() as u32);
         command(1 << 16, 0);
@@ -3802,7 +3802,7 @@ mod tests {
         let yh = 4;
         let ym = 4 * 4;
         let yl = 7 * 4;
-        let triangle = 0x0880_0000 | yl;
+        let triangle = 0x0800_0000 | yl;
         let edge_ym_yh = (ym << 16) | yh;
         let major_slope = (5.0f32 / 3.0 * 65536.0).round() as u32;
         let minor_slope = (5.0f32 / 6.0 * 65536.0).round() as u32;
@@ -3874,7 +3874,7 @@ mod tests {
             let yh = 4;
             let ym = 4 * 4;
             let yl = 7 * 4;
-            command(0x0c80_0000 | yl, (ym << 16) | yh);
+            command(0x0c00_0000 | yl, (ym << 16) | yh);
             command(1 << 16, lower_slope as u32);
             command(1 << 16, major_slope as u32);
             command(1 << 16, 0);
@@ -3903,7 +3903,7 @@ mod tests {
             ))
         };
         let raw_edge = gbi::RdpEdgeCoefficients {
-            right_major: true,
+            left_major: false,
             level: 0,
             tile: 0,
             yl: 7 * 4,
@@ -3967,7 +3967,7 @@ mod tests {
             let ym = 4 * 4;
             let yl = 7 * 4;
             let dsde = (5.0f32 / 6.0 * 65536.0).round() as u32;
-            command(0x0f80_0000 | yl, (ym << 16) | yh);
+            command(0x0f00_0000 | yl, (ym << 16) | yh);
             command(1 << 16, (5.0f32 / 3.0 * 65536.0).round() as u32);
             command(1 << 16, (5.0f32 / 6.0 * 65536.0).round() as u32);
             command(1 << 16, 0);
@@ -3979,7 +3979,7 @@ mod tests {
             command(0, 0);
             command(0, 0);
             command(0, 0);
-            command(0, 1 << 16); // S=0, T=0, inverse-W=1
+            command(0, 1024 << 16); // S=0, T=0, perspective unity W
             command(1 << 16, 0); // dS/dX=1
             command(0, 0);
             command(0, 0);
@@ -4048,7 +4048,10 @@ mod tests {
                                           // Two-cycle, texture LOD enabled, clamp-detail mode, filter-only,
                                           // and deterministic dither disable. Raw edge `level=2` below is
                                           // the RDP primitive's maximum mip level.
-            command(0xef00_0000 | (1 << 20) | (1 << 16) | (6 << 9) | 0xf0, 0);
+            command(
+                0xef00_0000 | (1 << 20) | (1 << 19) | (1 << 16) | (6 << 9) | 0xf0,
+                0,
+            );
             command(combine_w0, combine_w1);
             for (tile, address) in TEXTURES.into_iter().enumerate() {
                 let tile = tile as u32;
@@ -4061,13 +4064,13 @@ mod tests {
             let yh = 4;
             let ym = 4 * 4;
             let yl = 7 * 4;
-            command(0x0a80_0000 | (2 << 19) | yl, (ym << 16) | yh);
+            command(0x0a00_0000 | (2 << 19) | yl, (ym << 16) | yh);
             command(1 << 16, (5.0f32 / 3.0 * 65536.0).round() as u32);
             command(1 << 16, (5.0f32 / 6.0 * 65536.0).round() as u32);
             command(1 << 16, 0);
-            // S=T=0, W=1; dS/dX=dT/dY=2.5. Chapter 13.7 selects
+            // S=T=0, perspective-unity W; dS/dX=dT/dY=2.5. Chapter 13.7 selects
             // tiles 1 and 2 with LOD fraction 0.25.
-            command(0, 1 << 16);
+            command(0, 1024 << 16);
             command(2 << 16, 0);
             command(0, 0);
             command(0x8000_0000, 0);

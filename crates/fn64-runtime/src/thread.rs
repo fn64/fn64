@@ -89,7 +89,16 @@ pub enum Yield {
     /// condition; the thread is immediately runnable again next scheduling
     /// round (rung 14's idle-loop fix: this is what an unconditional spin
     /// MUST call instead of looping forever without ever yielding).
+    ///
+    /// Correct only for translated callers that explicitly loop back around
+    /// the yield. A generated-C `pause_self` call has no such continuation
+    /// and must use [`Yield::StopSelf`].
     PauseSelf,
+    /// Park the current thread in `Stopped` until another thread explicitly
+    /// starts it. This is the generated-C `pause_self` boundary: returning to
+    /// the statement after the call would turn a guest assert/idle park into
+    /// impossible fall-through execution.
+    StopSelf,
     /// A translated block exhausted its deterministic instruction slice.
     /// The executor charges these guest instructions to virtual time only
     /// after the coroutine has suspended, when its exclusive `&mut Executor`

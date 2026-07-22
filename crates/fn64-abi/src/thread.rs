@@ -274,39 +274,25 @@ mod tests {
     use super::*;
     use crate::test_support::*;
 
+    /// Generated C emits `pause_self()` for guest self-branch hangs with no
+    /// loop back, so the thread must remain parked until an explicit start.
     #[test]
-    fn pause_self_yields_via_real_executor_and_thread_keeps_running() {
-        const MAX_RESUMES_AFTER_PAUSE: usize = 8;
-
-        let entered_pause = std::rc::Rc::new(std::cell::Cell::new(false));
-        let continued_after_pause = std::rc::Rc::new(std::cell::Cell::new(false));
-        let entered_pause2 = entered_pause.clone();
-        let continued_after_pause2 = continued_after_pause.clone();
+    fn pause_self_parks_via_real_executor_until_explicit_restart() {
+        let fell_through = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let fell_through2 = fell_through.clone();
         spawn_test_thread(100, 5, move || {
-            entered_pause2.set(true);
             pause_self(std::ptr::null_mut());
-            continued_after_pause2.set(true);
+            *fell_through2.borrow_mut() += 1;
         });
         assert!(run_one_step());
-        assert!(entered_pause.get(), "thread never reached pause_self");
-        assert!(
-            !continued_after_pause.get(),
-            "pause_self returned without yielding to the executor"
-        );
-
-        for _ in 0..MAX_RESUMES_AFTER_PAUSE {
-            if continued_after_pause.get() {
-                break;
-            }
-            assert!(
-                run_one_step(),
-                "pause_self blocked the thread instead of keeping it runnable"
-            );
+        assert_eq!(*fell_through.borrow(), 0);
+        for _ in 0..10 {
+            run_one_step();
         }
-        assert!(
-            continued_after_pause.get(),
-            "pause_self did not resume within {MAX_RESUMES_AFTER_PAUSE} scheduler steps"
-        );
+        assert_eq!(*fell_through.borrow(), 0);
+        with_executor(|exec| exec.start_thread(100));
+        assert!(run_one_step());
+        assert_eq!(*fell_through.borrow(), 1);
     }
 
     /// Test-only helper: register an `OSThread*` handle -> `OSId` mapping,

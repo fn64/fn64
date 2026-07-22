@@ -165,6 +165,14 @@ int main(int argc, char** argv) {
         do_swr(rdram, 2, UINT64_C(0xFFFFFFFFA4400000), UINT32_C(1));
         return 28;
     }
+    if (argc > 1 && std::strcmp(argv[1], "--bad-unaligned-word-read") == 0) {
+        (void)static_cast<uint32_t>(MEM_W(1, kseg0));
+        return 30;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--bad-unaligned-half-write") == 0) {
+        MEM_H(1, kseg1) = UINT16_C(1);
+        return 31;
+    }
 
     fn64_proxy_generated_shape(rdram, nullptr);
     if (static_cast<uint32_t>(MEM_W(0, UINT64_C(0xFFFFFFFFA4400000))) !=

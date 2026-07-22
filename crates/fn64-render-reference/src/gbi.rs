@@ -2331,7 +2331,7 @@ struct LineDecodeSnapshot {
 /// Provenance: SGI *RDP Command Summary*, Tables 11-12 (1996-04-11).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RdpEdgeCoefficients {
-    pub right_major: bool,
+    pub left_major: bool,
     pub level: u8,
     pub tile: u8,
     pub yl: i16,
@@ -4418,6 +4418,26 @@ impl TmemTexture {
         }
 
         let raw = self.raw_texel(x, y);
+        // EN_TLUT is a pipeline mode, not a tile-format property. With it
+        // enabled, every 4-bit texel is palette-relative and every 8-bit
+        // texel is a direct high-TMEM index regardless of the tile's declared
+        // format. WM2000 relies on this for an IA8-declared title image.
+        if self.texture_lut != 0 {
+            match self.tile.siz {
+                G_IM_SIZ_4B => {
+                    let index = (usize::from(self.tile.palette) << 4) | raw as usize;
+                    return self.storage.read_tlut(index, self.texture_lut);
+                }
+                G_IM_SIZ_8B => return self.storage.read_tlut(raw as usize, self.texture_lut),
+                _ => crate::render_unsupported_panic(
+                    "render.gbi.texture-lut-size",
+                    format!(
+                        "texture-LUT sampling of a {}-coded {}b tile at TMEM word {} is unsupported",
+                        self.tile.fmt, self.tile.siz, self.tile.tmem
+                    ),
+                ),
+            }
+        }
         match (self.tile.fmt, self.tile.siz) {
             (G_IM_FMT_RGBA, G_IM_SIZ_16B) => rgba5551_to_rgba8888(raw as u16),
             (G_IM_FMT_RGBA, G_IM_SIZ_32B) => raw.to_be_bytes(),
@@ -4426,8 +4446,11 @@ impl TmemTexture {
             (G_IM_FMT_IA, G_IM_SIZ_16B) => ia16_to_rgba8888((raw >> 8) as u8, raw as u8),
             (G_IM_FMT_IA, G_IM_SIZ_8B) => ia8_to_rgba8888(raw as u8),
             (G_IM_FMT_IA, G_IM_SIZ_4B) => ia4_to_rgba8888(raw as u8),
-            (G_IM_FMT_CI, G_IM_SIZ_8B) if self.texture_lut == 0 => i8_to_rgba8888(raw as u8),
-            (G_IM_FMT_CI, G_IM_SIZ_8B) => self.storage.read_tlut(raw as usize, self.texture_lut),
+            // The TLUT-enabled paths returned above; without the TLUT an
+            // 8-bit index decodes as intensity (hardware's CI-as-I behavior)
+            // and a 4-bit index still has no palette to resolve through --
+            // `read_tlut` keeps its loud mode trap for that case.
+            (G_IM_FMT_CI, G_IM_SIZ_8B) => i8_to_rgba8888(raw as u8),
             (G_IM_FMT_CI, G_IM_SIZ_4B) => {
                 let index = (usize::from(self.tile.palette) << 4) | raw as usize;
                 self.storage.read_tlut(index, self.texture_lut)
@@ -5273,9 +5296,8 @@ pub fn validate_raw_rdp_command_range(
     let mut pc = start;
     while pc < end {
         let wire_opcode = (read_u32(rdram, pc as usize) >> 24) as u8;
-        let triangle_opcode = wire_opcode & 0x3f;
-        let opcode = if matches!(triangle_opcode, 0x08..=0x0f) {
-            triangle_opcode
+        let opcode = if matches!(wire_opcode, 0x08..=0x0f | 0xc8..=0xcf) {
+            wire_opcode & 0x3f
         } else {
             wire_opcode
         };
@@ -5369,7 +5391,7 @@ fn decode_rdp_edge_coefficients(rdram: &[u8], pc: usize) -> Option<RdpEdgeCoeffi
     let w0 = read_u32(rdram, pc);
     let w1 = read_u32(rdram, pc + 4);
     Some(RdpEdgeCoefficients {
-        right_major: w0 & (1 << 23) != 0,
+        left_major: w0 & (1 << 23) != 0,
         level: ((w0 >> 19) & 0x07) as u8,
         tile: ((w0 >> 16) & 0x07) as u8,
         yl: sign_extend_u32(w0 & 0x3fff, 14) as i16,
@@ -5862,9 +5884,8 @@ fn decode_stream_impl(
             normalize_geometry_command(*family, wire_w0, wire_w1, command_pc)
         };
         let wire_opcode = (w0 >> 24) as u8;
-        let triangle_opcode = wire_opcode & 0x3f;
-        let opcode = if raw_rdp && matches!(triangle_opcode, 0x08..=0x0f) {
-            triangle_opcode
+        let opcode = if raw_rdp && matches!(wire_opcode, 0x08..=0x0f | 0xc8..=0xcf) {
+            wire_opcode & 0x3f
         } else {
             wire_opcode
         };
@@ -5899,7 +5920,9 @@ fn decode_stream_impl(
                 );
                 assert_eq!(w1, 0, "G_SPNOOP reserved second word must be zero");
             }
-            opcode @ (0x08..=0x0f) if raw_rdp => {
+            // The raw-lane wire spelling was normalized above. The low three
+            // bits select shade (4), texture (2), and Z (1).
+            opcode @ 0x08..=0x0f if raw_rdp => {
                 let command_pc = pc - 8;
                 let coefficients = decode_rdp_edge_coefficients(rdram, command_pc)
                     .expect("validated raw RDP edge triangle became truncated during decode");
@@ -13821,6 +13844,31 @@ mod tests {
     }
 
     #[test]
+    fn tlut_mode_palettizes_eight_bit_texels_regardless_of_tile_format() {
+        // EN_TLUT is a pipeline mode, not a tile-format property: WM2000's
+        // title scene draws its full-screen CI8 logo image through a render
+        // tile DECLARED IA8 with G_TT_RGBA16 enabled, and hardware still
+        // palettizes every 8-bit texel through high TMEM. A previous
+        // revision keyed the TLUT lookup on the tile's CI format and decoded
+        // these texels as literal IA8 -- wrong colors, wrong alpha.
+        let mut storage = Tmem::default();
+        let tile = Tile {
+            fmt: G_IM_FMT_IA,
+            siz: G_IM_SIZ_8B,
+            line: 9,
+            ..Default::default()
+        };
+        storage.write_texel(tile, 0, 0, false, G_IM_SIZ_8B, 0x42);
+        storage.write_tlut(256, 0x42, 0xf801);
+        let texture = TmemTexture {
+            storage: std::rc::Rc::new(storage),
+            tile,
+            texture_lut: 2,
+        };
+        assert_eq!(texture.sample(0, 0), [255, 0, 0, 255]);
+    }
+
+    #[test]
     fn load_tile_uses_settimg_stride_and_tile_coordinate_origin() {
         // A synthetic 4x2 CI8 source. Load the rightmost two texels of row 1
         // as a 2x1 tile whose render coordinates begin at (2, 1).
@@ -14584,7 +14632,7 @@ mod tests {
 
         validate_raw_rdp_command_range(&rdram, 0, 32).unwrap();
         let coefficients = decode_rdp_edge_coefficients(&rdram, 0).unwrap();
-        assert!(coefficients.right_major);
+        assert!(coefficients.left_major);
         assert_eq!((coefficients.level, coefficients.tile), (2, 3));
         assert_eq!(
             (coefficients.yh, coefficients.ym, coefficients.yl),

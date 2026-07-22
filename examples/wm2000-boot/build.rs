@@ -120,15 +120,25 @@ fn main() {
         .warnings(false);
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("Cargo must provide OUT_DIR"));
-    let (cxx_sources, jump_snapshot_count, prototype_count) =
-        build_support::prepare_recompiled_cxx_sources(&recompiled_dir, &out_dir);
+    // WM2000's admitted corpus is known to split hardware fall-through at
+    // internal labels. Keep the repair explicit here; every other generated-C
+    // consumer uses the default preparation path without this transform.
+    let (cxx_sources, jump_snapshot_count, prototype_count, fallthrough_count) =
+        build_support::prepare_recompiled_cxx_sources_with_fallthrough_repair(
+            &recompiled_dir,
+            &out_dir,
+        );
     let c_file_count = cxx_sources.len();
     build.files(cxx_sources);
     println!(
         "cargo:warning=wm2000-boot: compiling {c_file_count} RecompiledFuncs/*.c files from {} \
-         ({jump_snapshot_count} C jump snapshots normalized and {prototype_count} missing C \
-         prototypes supplied for C++)",
+         ({jump_snapshot_count} C jump snapshots normalized, {prototype_count} missing C \
+         prototypes supplied for C++, and {fallthrough_count} address-proven fragments mended)",
         recompiled_dir.display()
+    );
+    assert!(
+        fallthrough_count > 0,
+        "wm2000-boot: the admitted corpus needed no fall-through repairs; either its partition is fixed (remove the opt-in) or the generated shape changed"
     );
 
     build.compile("wm2000_recompiled");

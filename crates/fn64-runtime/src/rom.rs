@@ -425,6 +425,23 @@ impl<R: RomStorage> PiDma<R> {
         })
     }
 
+    /// Decode PI SRAM addresses using only the address lines present on the
+    /// discrete power-of-two device. Transfers may wrap once at the device
+    /// boundary; a transfer longer than the whole part remains a loud fault.
+    fn sram_decode(&mut self, direction: &str, offset: u32, len: usize) -> (usize, usize) {
+        let device_len = self.save_mut(direction).len();
+        assert!(
+            len <= device_len,
+            "PiDma: SRAM {direction} of {len:#x} bytes exceeds the whole {device_len:#x}-byte device"
+        );
+        let start = if device_len.is_power_of_two() {
+            offset as usize & (device_len - 1)
+        } else {
+            offset as usize
+        };
+        (start, device_len)
+    }
+
     /// Read `buf.len()` SRAM bytes at `sram_offset` (already `devAddr -
     /// SRAM_DOMAIN2_BASE`) into `buf` as FLAT bytes -- the save chip is a
     /// plain byte buffer. The caller word-swizzles into rdram (see
@@ -432,7 +449,13 @@ impl<R: RomStorage> PiDma<R> {
     /// reads the destination back via `MEM_BU` (`^3` byte-lane XOR, recomp.h)
     /// -- a flat rdram write would read back byte-swapped within each word.
     pub fn sram_read_into(&mut self, sram_offset: u32, buf: &mut [u8]) {
-        self.save_read_into(sram_offset as usize, buf);
+        let (start, device_len) = self.sram_decode("read", sram_offset, buf.len());
+        let first = buf.len().min(device_len - start);
+        let (head, tail) = buf.split_at_mut(first);
+        self.save_read_into(start, head);
+        if !tail.is_empty() {
+            self.save_read_into(0, tail);
+        }
     }
 
     /// Write FLAT `data` bytes to the save chip at `sram_offset` (already
@@ -440,7 +463,12 @@ impl<R: RomStorage> PiDma<R> {
     /// native-word bytes back to flat save order first (see
     /// `osEPiStartDma_recomp`'s FromRdram arm).
     pub fn sram_write_from(&mut self, sram_offset: u32, data: &[u8]) {
-        self.save_write_from(sram_offset as usize, data);
+        let (start, device_len) = self.sram_decode("write", sram_offset, data.len());
+        let first = data.len().min(device_len - start);
+        self.save_write_from(start, &data[..first]);
+        if first < data.len() {
+            self.save_write_from(0, &data[first..]);
+        }
     }
 
     /// Protocol-neutral save read. EEPROM, FlashRAM, Controller Pak, and PI
@@ -854,6 +882,54 @@ mod tests {
         // MEM_BU(0x40) is the FIRST SRAM byte (0xC1), not the ROM byte (0xAA).
         assert_eq!(rdram.read_bu(RdramAddr::from_offset(0x40)), 0xC1);
         assert_ne!(rdram.read_bu(RdramAddr::from_offset(0x40)), 0xAA);
+    }
+
+    #[test]
+    fn sram_read_wraps_at_the_power_of_two_device_boundary() {
+        let mut dma = PiDma::new(InMemoryRom::new(vec![0u8; 0x10]));
+        let mut save = InMemorySaveStorage::new(0x100);
+        save.write_from(0, &[0xA1, 0xA2, 0xA3, 0xA4]);
+        save.write_from(0xFC, &[0xB1, 0xB2, 0xB3, 0xB4]);
+        dma.set_save(Box::new(save));
+
+        let mut buf = [0u8; 8];
+        dma.sram_read_into(0xFC, &mut buf);
+        assert_eq!(buf, [0xB1, 0xB2, 0xB3, 0xB4, 0xA1, 0xA2, 0xA3, 0xA4]);
+    }
+
+    #[test]
+    fn sram_write_wraps_at_the_power_of_two_device_boundary() {
+        let mut dma = PiDma::new(InMemoryRom::new(vec![0u8; 0x10]));
+        dma.set_save(Box::new(InMemorySaveStorage::new(0x100)));
+
+        dma.sram_write_from(0xFE, &[0x71, 0x72, 0x73, 0x74]);
+        let mut tail = [0u8; 2];
+        dma.save_read_into(0xFE, &mut tail);
+        assert_eq!(tail, [0x71, 0x72]);
+        let mut head = [0u8; 2];
+        dma.save_read_into(0, &mut head);
+        assert_eq!(head, [0x73, 0x74]);
+    }
+
+    #[test]
+    fn sram_offset_masks_to_the_available_address_lines() {
+        let mut dma = PiDma::new(InMemoryRom::new(vec![0u8; 0x10]));
+        let mut save = InMemorySaveStorage::new(0x100);
+        save.write_from(4, &[0xEE]);
+        dma.set_save(Box::new(save));
+
+        let mut buf = [0u8; 1];
+        dma.sram_read_into(0x104, &mut buf);
+        assert_eq!(buf, [0xEE]);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the whole")]
+    fn sram_transfer_longer_than_the_device_traps_loudly() {
+        let mut dma = PiDma::new(InMemoryRom::new(vec![0u8; 0x10]));
+        dma.set_save(Box::new(InMemorySaveStorage::new(0x100)));
+        let mut buf = [0u8; 0x101];
+        dma.sram_read_into(0, &mut buf);
     }
 
     #[test]

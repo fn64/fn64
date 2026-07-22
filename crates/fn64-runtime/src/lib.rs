@@ -49,8 +49,9 @@ pub use executor::{
     RecvMesgOutcome, SendMesgOutcome, ThreadEvidenceSnapshot,
 };
 pub use mesgqueue::{
-    BlockedSenderEvidenceSnapshot, Mesg, MesgQueue, MesgQueueActivity, MesgQueueEvidenceSnapshot,
-    RecvResult, SendPlacement, SendResult,
+    BlockedReceiverEvidenceSnapshot, BlockedSenderEvidenceSnapshot, Mesg, MesgQueue,
+    MesgQueueActivity, MesgQueueEvidenceSnapshot, RecvResult, SendPlacement, SendResult,
+    WaiterPriority,
 };
 pub use mmio::{
     is_mmio_offset, AiRegs, MmioSpace, AI_STATUS_BUSY, AI_STATUS_FULL, RDRAM_MMIO_WINDOW_END,

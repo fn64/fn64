@@ -280,6 +280,15 @@ fn charge_c_lane_mmio_access() {
     }
 }
 
+/// Charge the stall a guest device-busy retry costs and give the executor a
+/// checkpoint, iff a guest coroutine is executing. This keeps a
+/// `while (osEPiStartDma(..) != 0);` retry loop live when the PI command queue
+/// is genuinely full: completions only commit as virtual time advances, while
+/// a shim-level retry has no instruction checkpoint of its own.
+pub(crate) fn charge_guest_device_busy_retry() {
+    charge_c_lane_mmio_access();
+}
+
 /// Boot diagnostic: log when a thread's `$sp` jumps 16KB regions between
 /// message-queue calls -- catches stack switches/corruption cheaply.
 pub(crate) fn probe_sp_region(site: &str, ctx: &RecompContext) {
@@ -342,6 +351,26 @@ pub extern "C" fn fn64_c_mmio_bad_width(vaddr: u64, width: u32, is_write: u32) {
     fn64_runtime::record_unsupported_event(
         fn64_runtime::UnsupportedSubsystem::Abi,
         "abi.generated-c-mmio.bad-width",
+        &context,
+        Some(fn64_runtime::Cycles::new(sim_time())),
+        fn64_runtime::UnsupportedDisposition::LoudTrap,
+    );
+    panic!("{context}");
+}
+
+/// Trap generated-C naturally aligned loads/stores before the host pointer
+/// cast can turn them into a byte-lane chimera. MIPS lw/sw/lh/sh raise an
+/// address-error exception for this shape.
+#[no_mangle]
+pub extern "C" fn fn64_c_mem_unaligned(vaddr: u64, width: u32, is_write: u32) {
+    let operation = if is_write == 0 { "load" } else { "store" };
+    let context = format!(
+        "generated-C {width}-byte {operation} at unaligned guest address {vaddr:#018X}; real \
+         hardware raises an address-error exception here (MIPS lw/sw/lh/sh alignment rule)"
+    );
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Abi,
+        "abi.generated-c-memory.unaligned",
         &context,
         Some(fn64_runtime::Cycles::new(sim_time())),
         fn64_runtime::UnsupportedDisposition::LoudTrap,

@@ -34,11 +34,15 @@ static DMA_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// One RDP command-DMA range submitted through the RSP's DPC CP0 registers.
 /// `xbus` records whether the command source is RSP DMEM rather than RDRAM.
+/// XBUS bytes are captured at submission time because the ucode reuses its
+/// small DMEM command ring before deferred host rendering consumes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RspDpSubmission {
     pub start: u32,
     pub end: u32,
     pub xbus: bool,
+    /// Logical big-endian XBUS bytes; empty for RDRAM-backed submissions.
+    pub payload: Vec<u8>,
     /// Logical command words captured when CMD_END admits the range.
     pub words: Vec<u32>,
 }
@@ -120,6 +124,10 @@ pub struct RspMachine<'a> {
     dp_pipe_busy: u32,
     dp_tmem_busy: u32,
     dp_submissions: Vec<RspDpSubmission>,
+    /// Half-open RDRAM byte ranges written by SP DMA since the previous
+    /// drain. The admitted-range check above the copy remains authoritative;
+    /// this log lets callers commit only bytes the RSP could have changed.
+    rdram_writes: Vec<(usize, usize)>,
 }
 
 impl<'a> RspMachine<'a> {
@@ -148,6 +156,7 @@ impl<'a> RspMachine<'a> {
             dp_pipe_busy: 0,
             dp_tmem_busy: 0,
             dp_submissions: Vec::new(),
+            rdram_writes: Vec::new(),
         }
     }
 
@@ -237,6 +246,12 @@ impl<'a> RspMachine<'a> {
 
     pub const fn sp_status(&self) -> u32 {
         self.sp_status
+    }
+
+    /// Inspect the semaphore without performing CP0's architectural
+    /// read-and-set. This accessor is diagnostic-only.
+    pub const fn sp_semaphore_latch(&self) -> bool {
+        self.sp_semaphore
     }
 
     /// Drain the DPC ranges produced since the last call.
@@ -418,6 +433,13 @@ impl<'a> RspMachine<'a> {
                     // close the interleaving where a later SP DMA or an
                     // earlier framebuffer write aliases and overwrites this
                     // command range before deferred host rendering begins.
+                    let payload = if xbus {
+                        (start..end)
+                            .map(|address| self.dmem.read_bu(address & 0x0fff))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     let words = if xbus {
                         let start = (start & 0x0fff) as usize;
                         let end = (end & 0x0fff) as usize;
@@ -450,6 +472,7 @@ impl<'a> RspMachine<'a> {
                         start,
                         end,
                         xbus,
+                        payload,
                         words,
                     });
                 }
@@ -895,11 +918,30 @@ impl<'a> RspMachine<'a> {
             for i in 0..line_len {
                 self.rdram[dram + i] = self.dmem.as_bytes()[(mem + i) & (DMEM_SIZE - 1)];
             }
+            self.record_rdram_write(dram, line_len);
             dram = dram.wrapping_add(line_len + skip);
             mem = (mem + line_len) & (DMEM_SIZE - 1);
         }
         self.ctx.dma_dram_address = dram as u32;
         self.ctx.dma_mem_address = mem as u32;
+    }
+
+    fn record_rdram_write(&mut self, start: usize, len: usize) {
+        let end = start
+            .checked_add(len)
+            .expect("validated RSP DMA write span overflow");
+        if let Some(last) = self.rdram_writes.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                return;
+            }
+        }
+        self.rdram_writes.push((start, end));
+    }
+
+    /// Drain the coalesced RDRAM write spans produced by SP DMA.
+    pub fn take_rdram_writes(&mut self) -> Vec<(usize, usize)> {
+        std::mem::take(&mut self.rdram_writes)
     }
 
     /// Convenience accessor for the VU state the compute-op dispatcher wants.
@@ -1375,6 +1417,7 @@ mod tests {
                 start: 0x000008,
                 end: 0x000018,
                 xbus: false,
+                payload: Vec::new(),
                 words: vec![0; 4],
             }]
         );
@@ -1405,12 +1448,14 @@ mod tests {
                     start: 0x180,
                     end: 0x1a0,
                     xbus: false,
+                    payload: Vec::new(),
                     words: vec![0; 8],
                 },
                 RspDpSubmission {
                     start: 0x1a0,
                     end: 0x1c8,
                     xbus: false,
+                    payload: Vec::new(),
                     words: vec![0; 10],
                 },
             ],

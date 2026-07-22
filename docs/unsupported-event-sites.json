@@ -86,6 +86,13 @@
       "trigger": "used unsupported {width}-byte access"
     },
     {
+      "operation": "abi.generated-c-memory.unaligned",
+      "subsystem": "abi",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-abi/src/lib.rs",
+      "trigger": "generated-C {width}-byte {operation} at unaligned guest address"
+    },
+    {
       "operation": "abi.generated-c-direct-device.bad-address",
       "subsystem": "abi",
       "disposition": "loud_trap",

@@ -39,6 +39,8 @@ extern "C" int32_t fn64_c_mmio_read_w(uint64_t vaddr);
 extern "C" void fn64_c_mmio_write_w(uint64_t vaddr, uint32_t value);
 extern "C" void fn64_c_mmio_bad_width(uint64_t vaddr, uint32_t width,
                                       uint32_t is_write);
+extern "C" void fn64_c_mem_unaligned(uint64_t vaddr, uint32_t width,
+                                     uint32_t is_write);
 extern "C" void fn64_c_bad_direct_address(uint64_t vaddr, uint32_t width,
                                            uint32_t is_write);
 extern "C" void fn64_c_rdram_write(uint64_t vaddr, uint32_t width,
@@ -132,6 +134,11 @@ public:
         : rdram(rdram_), address(address_) {}
 
     operator T() const {
+        if constexpr (sizeof(T) > 1) {
+            if ((address & (sizeof(T) - 1)) != 0) {
+                fn64_c_mem_unaligned(address, sizeof(T), 0);
+            }
+        }
         if (fn64_is_rcp_mmio_word(address)) {
             if constexpr (sizeof(T) != sizeof(uint32_t)) {
                 fn64_c_mmio_bad_width(address, sizeof(T), 0);
@@ -167,6 +174,11 @@ public:
 
 private:
     void store(T value) {
+        if constexpr (sizeof(T) > 1) {
+            if ((address & (sizeof(T) - 1)) != 0) {
+                fn64_c_mem_unaligned(address, sizeof(T), 1);
+            }
+        }
         if (fn64_is_rcp_mmio_word(address)) {
             if constexpr (sizeof(T) != sizeof(uint32_t)) {
                 fn64_c_mmio_bad_width(address, sizeof(T), 1);

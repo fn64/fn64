@@ -520,7 +520,7 @@ fn start_timed_pi_dma(
             request.len
         );
     }
-    with_host(|host| {
+    let result = with_host(|host| {
         if matches!(request.direction, DmaDirection::FromRdram)
             && !fn64_runtime::rom::is_sram_dev_addr(request.cart_addr)
         {
@@ -554,7 +554,13 @@ fn start_timed_pi_dma(
         }
         host.pending_pi_completions.push_back(pending);
         Ok(())
-    })
+    });
+    if matches!(result, Err(DeviceFault::PiBusy)) {
+        // Charge outside the HostState borrow so the checkpoint may advance
+        // virtual time and commit the in-flight transfer before the retry.
+        crate::charge_guest_device_busy_retry();
+    }
+    result
 }
 
 /// Execute one raw PI transfer through the single ROM/save engine. This is
@@ -1706,12 +1712,16 @@ unsafe fn epi_start_dma_impl(rdram: *mut u8, ctx: *mut RecompContext, use_handle
         }
     }
 
-    let logical_end = usize::try_from(
-        dram_addr
-            .offset()
-            .checked_add(len)
-            .expect("PI DMA RDRAM range overflow"),
-    )
+    let logical_end = usize::try_from(dram_addr.offset().checked_add(len).unwrap_or_else(|| {
+        panic!(
+            "osEPiStartDma_recomp: PI DMA RDRAM range overflow -- OSIoMesg at {:#010x} carries \
+             dramAddr offset {:#010x} + size {len:#010x} (devAddr {dev_addr:#010x}); a garbage \
+             size like this usually means the guest OSIoMesg was never initialized by the code \
+             that owns it",
+            mb_addr.offset(),
+            dram_addr.offset(),
+        )
+    }))
     .expect("PI DMA RDRAM extent exceeds usize");
     let required_len = logical_end
         .checked_add(3)
