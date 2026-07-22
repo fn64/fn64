@@ -209,7 +209,15 @@ that layout does not truncate them and lists the 8-bit layout alongside the
 two RGBA layouts. One typed per-fragment noise byte now
 feeds combiner NOISE, RGB/alpha Noise, and `G_AC_DITHER`; the default seedable
 SplitMix64 policy is deterministic and long-period. Nintendo's unpublished
-silicon generator and seed remain a hardware-trace frontier. Silicon-internal
+silicon generator and seed remain a hardware-trace frontier. Separately, the
+clean pinned native RT64 path has an exact-source overlay for the combiner-alpha
+`G_AD` selectors. It runs after alpha compare/coverage rejection and before the
+blender, so `G_AC_DITHER` remains an independent earlier decision. A synthetic
+raw-DPC Metal gate binds exact 16x16 RGBA16 Pattern, InversePattern, Noise, and
+Disabled digests plus exact ordered 4x4 tiles and live Noise. This bounded
+slice does not alter shade, fog, or coverage alpha; it does not repair RT64's
+framebuffer-wide/deferred RGB-dither choice or its separate random draws for
+combiner NOISE and alpha compare. Silicon-internal
 accumulator width/truncation and subpixel attribute/Z correction remain open. Public
 coverage-wrap routing for depth-compared fragments is now typed for every Z
 mode: a wrapping opaque fragment selects strict `In Front`, while wrapping
@@ -310,7 +318,19 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
 
 ## C. What RT64 itself does NOT do well / at all (from code + domain knowledge)
 - **2-cycle RDP register timing** (#200) — fundamentally approximate; can't be bit-exact.
-- **Coverage / AA / dither** — RT64 renders on a modern rasterizer; N64 3-point coverage-based AA and RDP dither are approximated, not emulated (issue #38, #73/#107 MSAA sample positions). fn64's reference lane models the public eight-sample coverage mask, exact disabled-dither truncation, ordered matrices, and one typed deterministic per-fragment sample for combiner/RGB/alpha noise plus `G_AC_DITHER`. The sample stream is deliberately not claimed as the unpublished hardware generator.
+- **Coverage / AA / dither** — RT64 renders on a modern rasterizer; N64 3-point
+  coverage-based AA and RDP dither remain approximate (issue #38, #73/#107
+  MSAA sample positions). fn64's reference lane models the public eight-sample
+  coverage mask, exact disabled-dither truncation, ordered matrices, and one
+  typed deterministic per-fragment sample for combiner/RGB/alpha noise plus
+  `G_AC_DITHER`. The clean pinned native path now overlays only combiner-alpha
+  `G_AD` immediately before blending and has exact synthetic Metal evidence
+  for distinct Pattern/InversePattern/Disabled output and live Noise.
+  Shade/fog/coverage alpha, framebuffer-wide/deferred RGB dither, random
+  routing/seed/advancement, ordered matrices/ties, internal precision,
+  non-Metal/MSAA paths, full-ROM reach, and silicon remain open. The reference
+  sample stream and native outputs are deliberately not claimed as the
+  unpublished hardware generator.
 - **TMEM edge cases** (#196) and **TLUT copy/bilerp** (#189) — partial in RT64;
   fn64 has physical TMEM, per-sample TLUT lookup, independent fractional load
   edges whose integer parts select the inclusive span, source-sized mismatched-

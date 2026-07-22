@@ -126,6 +126,11 @@ cargo run --quiet --manifest-path tools/rdp-silicon-vectors/Cargo.toml -- \
   analyze-alpha-dither sample-zero /path/to/capture.json
 ```
 
+Despite the historical CLI spelling, this intent and analyzer cover only the
+`G_AC_DITHER` alpha-compare threshold. They do not measure the distinct
+`G_AD_PATTERN`, `G_AD_NOTPATTERN`, or `G_AD_NOISE` alpha-quantization selector
+that runs before blending. Evidence for either axis must not close the other.
+
 The analyzer requires all 256 combined-alpha values for both `one_cycle` and
 `two_cycle`, exactly one point per value. Every point must declare replay from
 reset, the same fragment-noise sample index, and the same distinct pass/reject
