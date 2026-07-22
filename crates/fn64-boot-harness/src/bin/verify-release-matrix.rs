@@ -162,7 +162,7 @@ fn run() -> Result<(), String> {
                     )
                 })
         },
-        |request| {
+        |request, preflight| {
             let bound = request
                 .private_series_ordinal
                 .checked_sub(1)
@@ -170,13 +170,7 @@ fn run() -> Result<(), String> {
                 .ok_or_else(|| {
                     missing_private_series_error(request, verified_private_series.len())
                 })?;
-            run_rt64_platform_case_series(
-                request.target,
-                request.case,
-                &request.rt64_source_directory,
-                bound,
-            )
-            .map_err(|error| {
+            run_rt64_platform_case_series(preflight, bound).map_err(|error| {
                 format!(
                     "run RT64 platform case {}:{}: {error}",
                     request.target.id(),
@@ -276,17 +270,22 @@ fn verify_matrix_without_platform_authority(
     }
 }
 
-fn run_preflighted_platform_cases<T>(
+fn run_preflighted_platform_cases<P, T>(
     requests: &[PlatformCaseRunRequest],
-    mut preflight: impl FnMut(&PlatformCaseRunRequest) -> Result<(), String>,
-    mut runner: impl FnMut(&PlatformCaseRunRequest) -> Result<T, String>,
+    mut preflight: impl FnMut(&PlatformCaseRunRequest) -> Result<P, String>,
+    mut runner: impl FnMut(&PlatformCaseRunRequest, P) -> Result<T, String>,
 ) -> Result<Vec<T>, String> {
     // Keep this as two loops: a later unbindable request must not be
     // discovered only after an earlier request has spent its native series.
-    for request in requests {
-        preflight(request)?;
-    }
-    requests.iter().map(&mut runner).collect()
+    let preflighted = requests
+        .iter()
+        .map(&mut preflight)
+        .collect::<Result<Vec<_>, _>>()?;
+    requests
+        .iter()
+        .zip(preflighted)
+        .map(|(request, preflight)| runner(request, preflight))
+        .collect()
 }
 
 fn missing_private_series_error(request: &PlatformCaseRunRequest, supplied: usize) -> String {
@@ -783,7 +782,7 @@ mod tests {
                     Ok(())
                 }
             },
-            |_| {
+            |_, ()| {
                 native_runs.set(native_runs.get() + 1);
                 Ok(())
             },
@@ -793,5 +792,54 @@ mod tests {
         assert!(error.contains("stale RT64 adapter"));
         assert_eq!(preflights.get(), 2);
         assert_eq!(native_runs.get(), 0);
+    }
+
+    #[test]
+    fn identity_mutation_between_cases_prevents_affected_native_run() {
+        #[derive(Clone, Copy)]
+        struct PreflightTicket(u32);
+
+        let requests = vec![
+            PlatformCaseRunRequest {
+                target: Rt64PlatformTarget::MacosMetal,
+                case: Rt64PlatformCase::BackendLifecycle,
+                rt64_source_directory: PathBuf::from("/private/pinned-rt64"),
+                private_series_ordinal: 1,
+            },
+            PlatformCaseRunRequest {
+                target: Rt64PlatformTarget::MacosMetal,
+                case: Rt64PlatformCase::ResolutionDownsample,
+                rt64_source_directory: PathBuf::from("/private/pinned-rt64"),
+                private_series_ordinal: 1,
+            },
+        ];
+        let live_identity = Cell::new(7);
+        let backend_native_runs = Cell::new(0);
+        let downsample_native_runs = Cell::new(0);
+        let error = run_preflighted_platform_cases(
+            &requests,
+            |_| Ok(PreflightTicket(live_identity.get())),
+            |request, ticket| {
+                if ticket.0 != live_identity.get() {
+                    return Err("preflight identity changed before native execution".to_owned());
+                }
+                match request.case {
+                    Rt64PlatformCase::BackendLifecycle => {
+                        backend_native_runs.set(backend_native_runs.get() + 1);
+                        live_identity.set(8);
+                    }
+                    Rt64PlatformCase::ResolutionDownsample => {
+                        downsample_native_runs.set(downsample_native_runs.get() + 1);
+                    }
+                    _ => unreachable!("test requests exactly two cases"),
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("identity changed"), "{error}");
+        assert_eq!(backend_native_runs.get(), 1);
+        assert_eq!(downsample_native_runs.get(), 0);
     }
 }
