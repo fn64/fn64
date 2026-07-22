@@ -725,9 +725,11 @@ dependencies = [
  "fn64-render",
  "fn64-runtime",
  "getrandom 0.3.4",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

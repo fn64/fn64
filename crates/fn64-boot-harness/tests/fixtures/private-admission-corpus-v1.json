@@ -1,0 +1,275 @@
+{
+  "schema": "fn64.private-admission-rejection-corpus.v1",
+  "recipes": [
+    {
+      "id": "accept-v7-full-rom",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "accept",
+      "operation": { "kind": "validate" },
+      "semantics": "v7-full-rom",
+      "rejection_token": null
+    },
+    {
+      "id": "accept-v7-characterization",
+      "baseline": "manifest-v7-characterization",
+      "capability": "all",
+      "expect": "accept",
+      "operation": { "kind": "validate" },
+      "semantics": "v7-characterization",
+      "rejection_token": null
+    },
+    {
+      "id": "accept-v7-contract",
+      "baseline": "contract-v3-from-v7",
+      "capability": "all",
+      "expect": "accept",
+      "operation": { "kind": "validate" },
+      "semantics": "v3-contract",
+      "rejection_token": null
+    },
+    {
+      "id": "accept-v6-retained",
+      "baseline": "manifest-v6-retained",
+      "capability": "all",
+      "expect": "accept",
+      "operation": { "kind": "validate" },
+      "semantics": "v6-retained",
+      "rejection_token": null
+    },
+    {
+      "id": "reject-duplicate-root-field",
+      "baseline": "json-document",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "duplicate-root-field" },
+      "semantics": null,
+      "rejection_token": "duplicate field 'schema'"
+    },
+    {
+      "id": "reject-duplicate-nested-env-field",
+      "baseline": "json-document",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "duplicate-nested-env-field" },
+      "semantics": null,
+      "rejection_token": "duplicate field 'A'"
+    },
+    {
+      "id": "reject-symlink-manifest",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "symlink",
+      "expect": "reject",
+      "operation": { "kind": "symlink-manifest" },
+      "semantics": null,
+      "rejection_token": "symlink path component"
+    },
+    {
+      "id": "reject-symlink-artifact-parent",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "symlink",
+      "expect": "reject",
+      "operation": { "kind": "symlink-artifact-parent" },
+      "semantics": null,
+      "rejection_token": "symlink path component"
+    },
+    {
+      "id": "reject-symlink-working-directory",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "symlink",
+      "expect": "reject",
+      "operation": { "kind": "symlink-working-directory" },
+      "semantics": null,
+      "rejection_token": "symlink path component"
+    },
+    {
+      "id": "reject-same-length-descriptor-swap",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "same-length-descriptor-swap" },
+      "semantics": null,
+      "rejection_token": "artifacts.microcode_data SHA-256 drift"
+    },
+    {
+      "id": "reject-same-length-path-swap",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "same-length-path-swap" },
+      "semantics": null,
+      "rejection_token": "artifacts.microcode_data SHA-256 drift"
+    },
+    {
+      "id": "accept-captured-contract-source-replacement",
+      "baseline": "contract-v3-from-v7",
+      "capability": "all",
+      "expect": "accept",
+      "operation": { "kind": "captured-contract-source-replacement" },
+      "semantics": "captured-v3-contract",
+      "rejection_token": null
+    },
+    {
+      "id": "reject-relative-artifact-path",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "relative-artifact-path" },
+      "semantics": null,
+      "rejection_token": "artifacts.microcode_data.path must be absolute"
+    },
+    {
+      "id": "reject-parent-artifact-path",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "parent-artifact-path" },
+      "semantics": null,
+      "rejection_token": "artifacts.microcode_data.path must not contain '..'"
+    },
+    {
+      "id": "reject-tracked-artifact-path",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "tracked-artifact-path" },
+      "semantics": null,
+      "rejection_token": "inside the repository and not gitignored"
+    },
+    {
+      "id": "reject-case-alias-tracked-path",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "case-insensitive",
+      "expect": "reject",
+      "operation": { "kind": "case-alias-tracked-path" },
+      "semantics": null,
+      "rejection_token": "inside the repository and not gitignored"
+    },
+    {
+      "id": "reject-reserved-rom-env",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "reserved-rom-env" },
+      "semantics": null,
+      "rejection_token": "reserved for the trusted runner"
+    },
+    {
+      "id": "reject-future-release-env",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "future-release-env" },
+      "semantics": null,
+      "rejection_token": "reserved for the trusted runner"
+    },
+    {
+      "id": "reject-ld-preload-env",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "ld-preload-env" },
+      "semantics": null,
+      "rejection_token": "can inject or replace child process code"
+    },
+    {
+      "id": "reject-d3d12sdk-path-env",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "d3d12sdk-path-env" },
+      "semantics": null,
+      "rejection_token": "can inject or replace child process code"
+    },
+    {
+      "id": "reject-lowercase-env",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "lowercase-env" },
+      "semantics": null,
+      "rejection_token": "runner.env name 'lowercase' is invalid"
+    },
+    {
+      "id": "reject-artifact-tamper",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "artifact-tamper" },
+      "semantics": null,
+      "rejection_token": "artifacts.microcode_data length drift"
+    },
+    {
+      "id": "reject-receipt-inner-tamper",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "receipt-inner-tamper" },
+      "semantics": null,
+      "rejection_token": "execution source does not match recomputed"
+    },
+    {
+      "id": "reject-receipt-outer-tamper",
+      "baseline": "manifest-v7-full-rom",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "receipt-outer-tamper" },
+      "semantics": null,
+      "rejection_token": "runner.program_build_receipt length drift"
+    },
+    {
+      "id": "reject-contract-digest-tamper",
+      "baseline": "contract-v3-from-v7",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "contract-digest-tamper" },
+      "semantics": null,
+      "rejection_token": "private run contract SHA-256 drift"
+    },
+    {
+      "id": "reject-contract-descriptor-tamper",
+      "baseline": "contract-v3-from-v7",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "contract-descriptor-tamper" },
+      "semantics": null,
+      "rejection_token": "contract.admission_manifest SHA-256 drift"
+    },
+    {
+      "id": "reject-v6-new-admission",
+      "baseline": "manifest-v6-retained",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "v6-new-admission" },
+      "semantics": null,
+      "rejection_token": "new --manifest admission requires schema"
+    },
+    {
+      "id": "reject-v6-with-v7-field",
+      "baseline": "manifest-v6-retained",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "v6-with-v7-field" },
+      "semantics": null,
+      "rejection_token": "intent fields are invalid"
+    },
+    {
+      "id": "reject-v6-f3dzex2-raw-role",
+      "baseline": "manifest-v6-retained",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "v6-f3dzex2-raw-role" },
+      "semantics": null,
+      "rejection_token": "unsupported wire family 'f3dzex2'"
+    },
+    {
+      "id": "reject-v5-with-current-field",
+      "baseline": "readiness-v5-retained",
+      "capability": "all",
+      "expect": "reject",
+      "operation": { "kind": "v5-with-current-field" },
+      "semantics": null,
+      "rejection_token": "readiness report has unknown or missing fields"
+    }
+  ]
+}

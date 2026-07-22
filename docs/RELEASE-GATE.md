@@ -512,16 +512,16 @@ itself prove that the trusted runner originally performed the launches. A
 release that needs transferable process-provenance evidence must retain an
 external trusted CI/code-signing attestation over the receipt and runner image.
 The local execution guarantee assumes no malicious same-UID writer can chmod
-and replace the random staged contract, child, or microcode-pair paths between
-validation and the operating-system open/spawn; the resolved system-Python
-image is likewise trusted as OS-owned. This is the same explicit single-owner
+and replace the random child or microcode-pair stages between validation and
+the operating-system open/spawn. The source contract is read once through a
+no-follow descriptor/handle and parsed from those captured bytes. This is the same explicit single-owner
 boundary as private input admission, not a sandbox against the invoking user.
 
-Raw JSON is not runner authority. Production loading first requires the
-repository admission script to byte-match the copy embedded at runner build
-time, then executes those embedded policy bytes directly through isolated
-system Python while revalidating the v6 admission manifest, v5 readiness
-report, typed build receipt, and v3 private contract.
+Raw JSON is not runner authority. Production loading runs the typed in-process
+Rust policy over stable-captured bytes and revalidates the current v7/v6 or
+retained v6/v5 manifest/readiness pair, typed build receipt, and v3 private
+contract before constructing the opaque capability. Python remains a producer
+and differential oracle, not loader authority.
 A separate synthetic-only constructor accepts only fn64's fixed non-game
 fixture, `NoProgram` source, and current test executable; arbitrary relabelled
 input and all ROM purposes fail closed.
@@ -568,9 +568,10 @@ not the remaining release-matrix denominator. A separately retained public
 synthetic XBUS series supplies a third generic mechanism scenario without
 private-ROM authority.
 
-The current production loader specifically resolves and pins
-`/usr/bin/python3`; Windows production admission therefore remains fail-closed
-rather than certified.
+The production loader no longer resolves or launches `/usr/bin/python3` and
+cross-compiles with its stable Windows file-ID path for
+`x86_64-pc-windows-msvc`. Native Windows execution and positive Windows v22
+full-ROM/platform-case evidence remain missing and therefore uncredited.
 Receipt re-verification also requires the current verifier executable to hash
 to the exact runner image recorded by the receipt, so that binary is part of
 the retained evidence set. `--print-contract-sha256` is only a canonical-wire
@@ -843,10 +844,11 @@ runner-derived event identities must equal the matrix evidence. It retains
 `fn64.verified-rom-class-authority.v1`; duplicate, unused, relabeled, or
 receipt-detached authorities fail closed. The retained authority digest is
 local integrity evidence, not a signature or transferable process attestation.
-The Unix test `exported_private_series_matrix_path_admits_public_fixture_and_rejects_tamper`
+The host-portable test
+`exported_private_series_matrix_path_admits_public_fixture_and_rejects_tamper`
 exercises that exported path end to end with a generated, non-game public
-homebrew-shaped fixture: the repository Python policy emits the production
-contract, a typed-block build receipt binds the child, the trusted runner
+homebrew-shaped fixture: the Rust test admission helper emits the contract
+wire, a typed-block build receipt binds the child, the trusted runner
 retains ten fresh processes, and the opaque series earns only its exact
 fixture ROM-class row. Reordered supplied run events and a changed retained
 report both fail. The child's schema-v22 report template makes this authority-

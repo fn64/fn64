@@ -221,10 +221,13 @@ F3DZEX2-characterization purpose or raw-window roles. The emitted
 `fn64.private-release-run-contract.v3` is an
 integrity wire, not a signature:
 any caller can recompute a self-hash. Production runner APIs therefore accept
-only an opaque `VerifiedPrivateReleaseRunContract`. Its loader requires the
-runtime admission script to equal the bytes embedded when the runner was built
-and executes those embedded policy bytes directly through isolated Python while
-replaying the manifest/readiness/contract validation. A separate constructor
+only an opaque `VerifiedPrivateReleaseRunContract`. Its loader runs the typed
+in-process Rust policy over stable-captured bytes and replays the complete
+v7/v6 manifest/readiness/receipt/contract mapping. Files are measured through
+one no-follow descriptor or Windows handle, with object identity and metadata
+checked before and after hashing and the path chain checked afterward. Python
+remains a producer and differential oracle, not production loader authority. A
+separate constructor
 is confined by exact byte identities and typed fields to fn64's fixed non-game
 `synthetic_mechanism` fixture and current test executable; arbitrary relabelled
 input cannot authorize a capability.
@@ -243,10 +246,11 @@ ignored).
 The exact-stage boundary is local and single-owner: staged files are random,
 create-new, read-only, and rehashed, but a malicious same-UID process capable
 of chmod plus pathname replacement between verification and OS open/spawn is
-outside scope. The resolved system-Python executable is trusted as OS-owned.
+outside scope. Renaming an external ancestor and restoring it with the same
+identity remains outside the admission boundary as well.
 
 Rehashing an admitted microcode or recompiled file proves only that it did not
-change, not that the child consumed it. Admission schema v6 therefore requires
+change, not that the child consumed it. Admission schema v7 therefore requires
 `fn64.release-program-build-receipt.v1` for `full_rom` and `combined`. The
 receipt binds the exact child entry image and recomputes the declared execution
 source from one typed lane: canonically labeled exact linked archives for a
