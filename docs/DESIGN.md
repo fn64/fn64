@@ -1013,6 +1013,20 @@ task calls out:
   screen mask. SplitMix64 is a reproducible host policy for reference digests,
   not a claim about the manual's unpublished silicon generator, seed, or exact
   cycle advancement.
+  The native RT64 path has one narrower exact-source overlay at the pinned MIT
+  revision. It applies public `G_AD_PATTERN`, `G_AD_NOTPATTERN`, and
+  `G_AD_NOISE` selection only to combiner alpha after alpha compare/coverage
+  rejection and immediately before blending; `G_AC_DITHER` therefore remains
+  a separate earlier gate over the unmodified alpha. A clean pinned-Metal
+  synthetic raw-DPC fixture binds exact 16x16 RGBA16 Pattern, InversePattern,
+  Noise, and Disabled output digests, exact ordered 4x4 tiles, live Noise, and
+  same-context reproduction for the deterministic selectors. The overlay does
+  not alter shade, fog, or coverage alpha and does not repair RT64's
+  framebuffer-wide/deferred RGB-dither selection. RT64's separate combiner and
+  alpha-compare random draws also remain unchanged. No claim follows for the
+  hardware random generator, seed or advancement, ordered matrices or ties,
+  internal fixed-point precision, non-Metal APIs, MSAA, or representative
+  full-ROM reach.
   VI is scheduled in this fabric rather than asserted after an executor ticker
   fires. Its 14-word raw register image is shared with typed MMIO;
   `VI_CURRENT` is derived from the programmed `VI_V_SYNC`: progressive output
