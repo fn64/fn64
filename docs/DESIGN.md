@@ -1132,13 +1132,16 @@ task calls out:
   fixture distinguishes supplied hardware mode 0 from compatibility-only
   `Unspecified` at the native callback; a separate adapter-capture integration
   test proves the Rust/C/C++ wire distinction. The fixture applies the public
-  Figure-11 AA arithmetic to deliberately generated RT64-managed code 4 with
-  opaque code-7 controls, and proves modes 0/1 equal an independent
-  coverage-four oracle while modes 2/3 restore the baseline. AA precedes
-  divot causally. Pinned RT64 aliases managed 7/8 and clamped 8/8 at code 7;
-  untested partial codes, natural/imported hidden coverage, code-0/save
-  semantics, wider sampling lattices, silicon, and analog parity remain
-  explicitly bounded. A typed IPL television
+  Figure-11 AA arithmetic to deliberately generated RT64-managed codes 1-6
+  with opaque code-7 controls, and proves modes 0/1 equal an independent
+  per-code CPU oracle while modes 2/3 restore the baseline. Its divot oracle
+  reconstructs the declared RDP source before projection; AA, divot, and
+  AA-before-divot each change the six target pixels causally. This result is
+  bounded to pinned Metal's nearest, progressive, synthetic RGBA16 path under
+  the original-aspect (4:3) presentation policy. Pinned RT64 aliases managed
+  7/8 and clamped 8/8 at code 7; natural/imported hidden coverage, code-0/save
+  semantics, insufficient neighborhoods, wider sampling lattices, silicon,
+  and analog parity remain explicitly bounded. A typed IPL television
   standard is the common VI/AI clock authority. Before a mode exists, VI uses the public
   nominal 60 Hz NTSC/MPAL or 50 Hz PAL rate; once H_SYNC and V_SYNC are
   nonzero, their public line/half-line units derive the next guest-cycle field
