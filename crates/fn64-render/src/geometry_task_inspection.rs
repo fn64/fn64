@@ -13,7 +13,8 @@
 
 use crate::{
     DpFullSyncStatus, GeometryUcodeCatalog, GeometryWireFamily, MicrocodeDataImageIdentity, OsTask,
-    RenderError, TaskAdmissionGeneration, TaskAdmissionPlan, TaskAdmissionSource, UcodeDigest,
+    RenderError, TaskAdmissionGeneration, TaskAdmissionPlan, TaskAdmissionSource,
+    TaskAdmissionUcode, UcodeDigest,
 };
 use fn64_runtime::{RdramAddr, RdramView, RdramViewMut, RspMemAddr, RspMemory, RspMemoryBank};
 use sha2::{Digest, Sha256};
@@ -321,7 +322,7 @@ fn task_entry(
             bytes: task.ucode_data_size,
             sha256: Sha256::digest(data).into(),
         },
-        family: family.ucode_id(),
+        ucode: TaskAdmissionUcode::from_family(family.ucode_id()),
     })
 }
 
@@ -430,7 +431,7 @@ fn walk(
                     data_address: loaded.data_address,
                     text_sha256: loaded.text_sha256,
                     data: loaded.data,
-                    family: next_family.ucode_id(),
+                    ucode: TaskAdmissionUcode::from_family(next_family.ucode_id()),
                 };
                 if let Some(size) = raw_window_size {
                     state.raw_windows.push(capture_raw_window(
@@ -1391,7 +1392,7 @@ mod tests {
                 None,
             )
             .unwrap_or_else(|error| panic!("{} inspection failed: {error}", family.name()));
-            assert_eq!(result.admission_plan.entry().family, family.ucode_id());
+            assert_eq!(result.admission_plan.entry().family(), family.ucode_id());
         }
     }
 

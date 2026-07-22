@@ -26,6 +26,14 @@ rows. One intersecting row supplies the diagnostic family; a contradictory
 backend pair label traps. This identity remains unadmitted to HLE and cannot
 satisfy a public-microcode matrix requirement.
 
+The ordered task boundary does not reduce that classification back to a broad
+family. `TaskAdmissionUcode` carries 2.06H, 2.08I, or 2.08J as a typed variant;
+plan-v2 hashes bind the tag, and RT64 native schema v2 binds the same detail to
+the raw recognition pool. The adapter rejects an unclassified, cross-paired,
+or differently classified raw pair before native entry, as well as a raw
+F3DZEX2 pair labeled as another family. This is prerequisite identity and
+capability plumbing, not HLE admission or public-microcode credit.
+
 Matrix v5 does not trust the backend's family label for public-microcode
 credit. It independently adjudicates each reported text digest through the
 immutable, project-owned certified-public-microcode catalog v1, and rejects a

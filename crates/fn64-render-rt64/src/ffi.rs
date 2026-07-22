@@ -10,7 +10,7 @@ use fn64_render::{
     RenderHardwareResolve, RenderInternalColorFormat, RenderPresentationMode, RenderRefreshRate,
     RenderReplacementAutoPath, RenderReplacementOperation, RenderReplacementPackIdentity,
     RenderReplacementShift, RenderResolution, RenderRuntimeSettings, RenderUpscale2d,
-    ResolutionMultiplier, UcodeId, ViPixelType, ViPresentation, ViScanoutState,
+    ResolutionMultiplier, TaskAdmissionUcode, ViPixelType, ViPresentation, ViScanoutState,
 };
 use fn64_runtime::{RspMemAddr, RspMemory, RspMemoryBank};
 use sha2::{Digest, Sha256};
@@ -87,7 +87,7 @@ impl From<&OsTask> for RawTask {
 
 const TASK_RESULT_SCHEMA: u32 = 2;
 
-const UCODE_PLAN_SCHEMA: u32 = 1;
+const UCODE_PLAN_SCHEMA: u32 = 2;
 const UCODE_SOURCE_TASK_ENTRY: u32 = 1;
 const UCODE_SOURCE_SELF_LOAD: u32 = 2;
 const UCODE_DISPOSITION_COMPLETE: u32 = 1;
@@ -105,7 +105,7 @@ struct RawUcodeGeneration {
     raw_text_len: u32,
     raw_data_offset: u32,
     raw_data_len: u32,
-    reserved0: u32,
+    expected_detail: u32,
     text_sha256: [u8; 32],
     data_sha256: [u8; 32],
     reserved: [u32; 4],
@@ -133,22 +133,41 @@ struct PreparedUcodePlan {
     plan_sha256: [u8; 32],
 }
 
-fn raw_ucode_family(family: UcodeId) -> (u32, u32) {
-    match family {
-        UcodeId::Fast3d => (1, 0),
-        UcodeId::F3dex => (2, 0),
-        UcodeId::F3dlx => (3, 0),
-        UcodeId::F3dlxRej => (4, 0),
-        UcodeId::F3dex2 => (5, 0),
-        UcodeId::F3dex2NoN => (6, 0),
-        UcodeId::F3dex2Rej => (7, 0),
-        UcodeId::F3dlx2Rej => (8, 0),
-        UcodeId::F3dzex2 => (9, 0),
-        UcodeId::S2dex => (10, 0),
-        UcodeId::S2dex2 => (11, 0),
-        UcodeId::L3dex => (12, 0),
-        UcodeId::L3dex2 => (13, 0),
-        UcodeId::Other(value) => (0, value),
+fn raw_ucode_identity(ucode: TaskAdmissionUcode) -> (u32, u32) {
+    match ucode {
+        TaskAdmissionUcode::Fast3d => (1, 0),
+        TaskAdmissionUcode::F3dex => (2, 0),
+        TaskAdmissionUcode::F3dlx => (3, 0),
+        TaskAdmissionUcode::F3dlxRej => (4, 0),
+        TaskAdmissionUcode::F3dex2 => (5, 0),
+        TaskAdmissionUcode::F3dex2NoN => (6, 0),
+        TaskAdmissionUcode::F3dex2Rej => (7, 0),
+        TaskAdmissionUcode::F3dlx2Rej => (8, 0),
+        TaskAdmissionUcode::F3dzex2(variant) => (9, variant.canonical_tag()),
+        TaskAdmissionUcode::S2dex => (10, 0),
+        TaskAdmissionUcode::S2dex2 => (11, 0),
+        TaskAdmissionUcode::L3dex => (12, 0),
+        TaskAdmissionUcode::L3dex2 => (13, 0),
+        TaskAdmissionUcode::Other(value) => (0, value),
+    }
+}
+
+fn validate_f3dzex2_profile(
+    expected: TaskAdmissionUcode,
+    observed: Option<fn64_render::F3dzex2Variant>,
+) -> Result<(), String> {
+    match (expected, observed) {
+        (TaskAdmissionUcode::F3dzex2(expected), Some(observed)) if expected == observed => Ok(()),
+        (TaskAdmissionUcode::F3dzex2(_), Some(_)) => {
+            Err("typed F3DZEX2 variant disagrees with the raw recognition pair".into())
+        }
+        (TaskAdmissionUcode::F3dzex2(_), None) => {
+            Err("typed F3DZEX2 admission lacks a recognized raw text/data pair".into())
+        }
+        (_, Some(_)) => {
+            Err("raw F3DZEX2 text/data pair contradicts the planned microcode family".into())
+        }
+        (_, None) => Ok(()),
     }
 }
 
@@ -169,7 +188,7 @@ impl PreparedUcodePlan {
             .iter()
             .zip(&admission.raw_windows)
         {
-            let (expected_family, reserved0) = raw_ucode_family(generation.family);
+            let (expected_family, expected_detail) = raw_ucode_identity(generation.ucode);
             if window.text.len() != crate::RT64_GBI_TEXT_RECOGNITION_BYTES
                 || window.data.len() != crate::RT64_GBI_DATA_RECOGNITION_BYTES
             {
@@ -181,6 +200,7 @@ impl PreparedUcodePlan {
                     crate::RT64_GBI_DATA_RECOGNITION_BYTES
                 ));
             }
+            validate_f3dzex2_profile(generation.ucode, fn64_render::identify_f3dzex2(window))?;
             let raw_text_offset = u32::try_from(raw_pool.len())
                 .map_err(|_| "microcode raw byte pool exceeds u32 offsets".to_owned())?;
             raw_pool.extend_from_slice(&window.text);
@@ -202,7 +222,7 @@ impl PreparedUcodePlan {
                 raw_data_offset,
                 raw_data_len: u32::try_from(window.data.len())
                     .expect("pinned RT64 data recognition window fits u32"),
-                reserved0,
+                expected_detail,
                 text_sha256: generation.text_sha256.as_bytes(),
                 data_sha256: generation.data.sha256,
                 reserved: [0; 4],
@@ -211,7 +231,7 @@ impl PreparedUcodePlan {
         let raw_pool_len = u64::try_from(raw_pool.len())
             .map_err(|_| "microcode raw byte pool length exceeds u64".to_owned())?;
         let mut hash = Sha256::new();
-        hash.update(b"fn64-rt64-ucode-plan-v1");
+        hash.update(b"fn64-rt64-ucode-plan-v2");
         hash.update(UCODE_PLAN_SCHEMA.to_le_bytes());
         hash.update(
             u32::try_from(generations.len())
@@ -229,7 +249,7 @@ impl PreparedUcodePlan {
                 generation.raw_text_len,
                 generation.raw_data_offset,
                 generation.raw_data_len,
-                generation.reserved0,
+                generation.expected_detail,
             ] {
                 hash.update(value.to_le_bytes());
             }
@@ -3735,7 +3755,7 @@ mod tests {
                 bytes: 8,
                 sha256: [digest.wrapping_add(1); 32],
             },
-            family: UcodeId::F3dex2,
+            ucode: TaskAdmissionUcode::F3dex2,
         };
         let entry = generation(fn64_render::TaskAdmissionSource::TaskEntry, 0x1000, 0x11);
         let self_load = generation(fn64_render::TaskAdmissionSource::SelfLoad, 0x2000, 0x22);
@@ -3759,14 +3779,14 @@ mod tests {
         assert_eq!(prepared.raw().plan_sha256, prepared.plan_sha256);
 
         let mut opaque_entry = entry;
-        opaque_entry.family = UcodeId::Other(0x5645_4e44);
+        opaque_entry.ucode = TaskAdmissionUcode::Other(0x5645_4e44);
         let opaque = PreparedUcodePlan::new(&crate::Rt64TaskAdmission {
             plan: fn64_render::TaskAdmissionPlan::new(opaque_entry, []),
             raw_windows: vec![raw_window(0x53)].into_boxed_slice(),
         })
         .unwrap();
         assert_eq!(opaque.generations[0].expected_family, 0);
-        assert_eq!(opaque.generations[0].reserved0, 0x5645_4e44);
+        assert_eq!(opaque.generations[0].expected_detail, 0x5645_4e44);
 
         let mut changed = admission;
         changed.raw_windows[1].text[0] ^= 0xff;
@@ -3777,32 +3797,32 @@ mod tests {
     }
 
     #[test]
-    fn native_ucode_plan_keeps_f3dzex2_distinct_from_f3dex2() {
-        let generation = |family| fn64_render::TaskAdmissionGeneration {
-            source: fn64_render::TaskAdmissionSource::TaskEntry,
-            text_address: 0x1000,
-            data_address: 0x4000,
-            text_sha256: fn64_render::UcodeDigest::from_sha256([0x31; 32]),
-            data: fn64_render::MicrocodeDataImageIdentity {
-                bytes: 8,
-                sha256: [0x41; 32],
-            },
-            family,
-        };
-        let admission = |family| crate::Rt64TaskAdmission {
-            plan: fn64_render::TaskAdmissionPlan::new(generation(family), []),
-            raw_windows: vec![fn64_render::TaskAdmissionRawWindow {
-                text: vec![0x51; crate::RT64_GBI_TEXT_RECOGNITION_BYTES],
-                data: vec![0x61; crate::RT64_GBI_DATA_RECOGNITION_BYTES],
-            }]
-            .into_boxed_slice(),
-        };
-
-        let f3dex2 = PreparedUcodePlan::new(&admission(UcodeId::F3dex2)).unwrap();
-        let f3dzex2 = PreparedUcodePlan::new(&admission(UcodeId::F3dzex2)).unwrap();
-        assert_eq!(f3dex2.generations[0].expected_family, 5);
-        assert_eq!(f3dzex2.generations[0].expected_family, 9);
-        assert_ne!(f3dex2.plan_sha256, f3dzex2.plan_sha256);
+    fn native_ucode_identity_keeps_every_f3dzex2_variant_typed() {
+        assert_eq!(raw_ucode_identity(TaskAdmissionUcode::F3dex2), (5, 0));
+        for (variant, detail) in [
+            (fn64_render::F3dzex2Variant::NoNFifo206H, 1),
+            (fn64_render::F3dzex2Variant::NoNFifo208I, 2),
+            (fn64_render::F3dzex2Variant::NoNFifo208J, 3),
+        ] {
+            let typed = TaskAdmissionUcode::F3dzex2(variant);
+            assert_eq!(raw_ucode_identity(typed), (9, detail));
+            assert!(validate_f3dzex2_profile(typed, Some(variant)).is_ok());
+        }
+        assert!(validate_f3dzex2_profile(
+            TaskAdmissionUcode::F3dzex2(fn64_render::F3dzex2Variant::NoNFifo206H),
+            Some(fn64_render::F3dzex2Variant::NoNFifo208I),
+        )
+        .is_err());
+        assert!(validate_f3dzex2_profile(
+            TaskAdmissionUcode::F3dex2,
+            Some(fn64_render::F3dzex2Variant::NoNFifo208J)
+        )
+        .is_err());
+        assert!(validate_f3dzex2_profile(
+            TaskAdmissionUcode::F3dzex2(fn64_render::F3dzex2Variant::NoNFifo208J),
+            None,
+        )
+        .is_err());
     }
 
     #[test]

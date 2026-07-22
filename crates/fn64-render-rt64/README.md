@@ -66,7 +66,10 @@ stale policy digest.
 
 Geometry tasks are admitted before native entry from immutable RDRAM/RSP
 inputs. Entry and self-loaded microcode generations remain ordered and
-content-addressed. Unknown or incompatible generations return
+content-addressed. The schema-v2 plan carries a behavior-bearing identity;
+F3DZEX2 requires its exact 2.06H, 2.08I, or 2.08J classifier result and native
+preflight checks the corresponding NoN/point-lighting capability without
+opening HLE admission. Unknown or incompatible generations return
 `FrameStatus::NeedsLle` before interpreter mutation. A native generation
 mismatch after execution starts poisons the context and fails loudly. The
 adapter snapshots both guest-memory resources before native execution and

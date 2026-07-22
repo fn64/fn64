@@ -1780,6 +1780,7 @@ bool same_native_ucode_identity(const NativeUcodeIdentity &left,
 }
 
 bool expected_family_matches(uint32_t family,
+                             uint32_t detail,
                              const NativeUcodeIdentity &identity) {
     using UCode = RT64::GBIUCode;
     switch (family) {
@@ -1808,8 +1809,11 @@ bool expected_family_matches(uint32_t family,
         return (identity.ucode == UCode::F3DEX2) && identity.low_p &&
                !identity.no_n && identity.rej;
     case 9U:
+        // RT64 exposes the I/J distinction only through the admitted raw
+        // identity; their native behavior flags are intentionally identical.
         return (identity.ucode == UCode::F3DZEX2) && !identity.low_p &&
-               identity.no_n && !identity.rej;
+               identity.no_n && !identity.rej &&
+               (identity.point_lighting == (detail != 1U));
     case 10U:
         return (identity.ucode == UCode::S2DEX) && !identity.low_p &&
                !identity.no_n && !identity.rej;
@@ -1835,7 +1839,7 @@ std::array<uint8_t, 32> canonical_plan_sha256(
     const Fn64Rt64UcodePlan &plan,
     const std::vector<Fn64Rt64UcodeGeneration> &entries,
     const std::vector<uint8_t> &raw) {
-    static constexpr uint8_t Domain[] = "fn64-rt64-ucode-plan-v1";
+    static constexpr uint8_t Domain[] = "fn64-rt64-ucode-plan-v2";
     Sha256 sha;
     sha.update(Domain, sizeof(Domain) - 1U);
     sha256_u32_le(sha, plan.schema);
@@ -1851,7 +1855,7 @@ std::array<uint8_t, 32> canonical_plan_sha256(
             generation.raw_text_len,
             generation.raw_data_offset,
             generation.raw_data_len,
-            generation.reserved0};
+            generation.expected_detail};
         for (const uint32_t scalar : scalars) {
             sha256_u32_le(sha, scalar);
         }
@@ -1948,6 +1952,13 @@ UcodePlanPreflight preflight_ucode_plan(
             diagnostic = "RT64 ordered microcode-plan entry addresses disagree with OSTask";
             return UcodePlanPreflight::Invalid;
         }
+        const bool valid_expected_detail =
+            (generation.expected_family == 0U) ||
+            ((generation.expected_family == 9U) &&
+             (generation.expected_detail >= 1U) &&
+             (generation.expected_detail <= 3U)) ||
+            ((generation.expected_family != 9U) &&
+             (generation.expected_detail == 0U));
         if ((generation.data_bytes == 0U) ||
             (generation.data_bytes > 4096U) ||
             ((generation.data_bytes & 7U) != 0U) ||
@@ -1955,12 +1966,11 @@ UcodePlanPreflight preflight_ucode_plan(
              FN64_RT64_UCODE_TEXT_RECOGNITION_BYTES) ||
             (generation.raw_data_len !=
              FN64_RT64_UCODE_DATA_RECOGNITION_BYTES) ||
-            ((generation.expected_family != 0U) &&
-             (generation.reserved0 != 0U)) ||
+            !valid_expected_detail ||
             std::any_of(std::begin(generation.reserved),
                         std::end(generation.reserved),
                         [](uint32_t value) { return value != 0U; })) {
-            diagnostic = "RT64 ordered microcode-plan generation shape is invalid at generation " +
+            diagnostic = "RT64 ordered microcode-plan generation shape or expected detail is invalid at generation " +
                          std::to_string(index);
             return UcodePlanPreflight::Invalid;
         }
@@ -2015,9 +2025,11 @@ UcodePlanPreflight preflight_ucode_plan(
             return UcodePlanPreflight::NeedsLle;
         }
         const NativeUcodeIdentity identity = native_ucode_identity(*recognized);
-        if (!expected_family_matches(generation.expected_family, identity)) {
+        if (!expected_family_matches(generation.expected_family,
+                                     generation.expected_detail,
+                                     identity)) {
             rejected_generation = index;
-            diagnostic = "RT64 native microcode family disagrees with ordered preflight at generation " +
+            diagnostic = "RT64 native microcode family or expected detail disagrees with ordered preflight at generation " +
                          std::to_string(index);
             return UcodePlanPreflight::NeedsLle;
         }

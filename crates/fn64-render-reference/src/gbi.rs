@@ -6170,7 +6170,9 @@ fn decode_stream_impl(
                             data_address: loaded.data_address,
                             text_sha256: loaded.text_sha256,
                             data: loaded.data,
-                            family: next_family.ucode_id(),
+                            ucode: fn64_render::TaskAdmissionUcode::from_family(
+                                next_family.ucode_id(),
+                            ),
                         };
                         if let Some((text_bytes, data_bytes)) = state.admission_raw_window_bytes {
                             let raw_window = capture_raw_recognition_window(
@@ -7600,7 +7602,7 @@ mod tests {
                 bytes: task.ucode_data_size,
                 sha256: Sha256::digest(data).into(),
             },
-            family: family.ucode_id(),
+            ucode: fn64_render::TaskAdmissionUcode::from_family(family.ucode_id()),
         };
 
         let mut scratch_rdram = rdram.to_vec();
@@ -8002,7 +8004,7 @@ mod tests {
             generation.source == TaskAdmissionSource::SelfLoad
                 && generation.data.bytes == 8
                 && generation.data.sha256 == data_sha256
-                && generation.family == UcodeId::F3dex2
+                && generation.family() == UcodeId::F3dex2
         }));
         assert_eq!(inspection.self_load_raw_windows.len(), 3);
         assert_eq!(
