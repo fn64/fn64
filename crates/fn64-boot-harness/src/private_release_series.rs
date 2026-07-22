@@ -8,7 +8,7 @@
 //! launching the next child. Its retained receipt is an integrity record, not
 //! a signature or later proof that this process performed those launches.
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::release_program_build_receipt::ReleaseProgramBuildReceipt;
 use crate::release_program_build_receipt::{
     load_release_program_build_receipt, ReleaseProgramBuildLane, ReleaseProgramFileIdentity,
@@ -52,10 +52,6 @@ const CONTRACT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-run-contract-digest
 const RUN_EVENT_DOMAIN: &[u8] = b"fn64.private-release-run-event.v1\0";
 const RECEIPT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-series-receipt-digest.v1\0";
 const RECEIPT_FILE: &str = "receipt.json";
-const SYSTEM_PYTHON3: &str = "/usr/bin/python3";
-const PYTHON_EMBEDDED_SCRIPT_BOOTSTRAP: &str = "import sys\nscript_path = sys.argv.pop(1)\nsource = sys.stdin.buffer.read()\nexec(compile(source, script_path, 'exec'), {'__name__': '__main__', '__file__': script_path})";
-const PRIVATE_INPUT_ADMISSION_SCRIPT: &[u8] =
-    include_bytes!("../../../tools/private_input_admission.py");
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -586,15 +582,6 @@ impl fmt::Display for PrivateReleaseSeriesError {
 
 impl std::error::Error for PrivateReleaseSeriesError {}
 
-struct StagedAdmissionContract(PathBuf);
-
-impl Drop for StagedAdmissionContract {
-    fn drop(&mut self) {
-        make_removable(&self.0);
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
 struct StagedChildExecutable(PathBuf);
 
 impl Drop for StagedChildExecutable {
@@ -821,134 +808,6 @@ fn stage_microcode_pair(
     Ok(Some(pair))
 }
 
-fn stage_contract_for_admission(
-    source_path: &Path,
-    bytes: &[u8],
-) -> Result<StagedAdmissionContract, PrivateReleaseSeriesError> {
-    let parent = source_path
-        .parent()
-        .ok_or_else(|| error("private run contract has no parent directory"))?;
-    for _ in 0..32 {
-        let mut random = [0u8; 16];
-        getrandom::fill(&mut random)
-            .map_err(|source| error(format!("obtain admission-stage nonce: {source}")))?;
-        let path = parent.join(format!(
-            ".fn64-private-contract-admission-{}.json",
-            hex(&random)
-        ));
-        match open_private_stage(&path) {
-            Ok(mut file) => {
-                let staged = StagedAdmissionContract(path.clone());
-                file.write_all(bytes)
-                    .and_then(|()| file.flush())
-                    .and_then(|()| file.sync_all())
-                    .map_err(|source| {
-                        error(format!(
-                            "persist admission-stage contract {}: {source}",
-                            path.display()
-                        ))
-                    })?;
-                seal_private_stage(&path, false).map_err(|source| {
-                    error(format!(
-                        "seal admission-stage contract {} owner-only: {source}",
-                        path.display()
-                    ))
-                })?;
-                return Ok(staged);
-            }
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(source) => {
-                return Err(error(format!(
-                    "create admission-stage contract in {}: {source}",
-                    parent.display()
-                )))
-            }
-        }
-    }
-    Err(error(format!(
-        "could not allocate a unique admission-stage contract in {}",
-        parent.display()
-    )))
-}
-
-fn verify_with_repository_admission(
-    source_path: &Path,
-    contract_bytes: &[u8],
-) -> Result<(), PrivateReleaseSeriesError> {
-    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .map_err(|source| error(format!("resolve fn64 repository root: {source}")))?;
-    let script_path = repository_root.join("tools/private_input_admission.py");
-    validate_regular_no_symlink_file(&script_path, "private input admission script")?;
-    let runtime_script = fs::read(&script_path).map_err(|source| {
-        error(format!(
-            "read private input admission script {}: {source}",
-            script_path.display()
-        ))
-    })?;
-    if runtime_script != PRIVATE_INPUT_ADMISSION_SCRIPT {
-        return Err(error(format!(
-            "private input admission script {} differs from the bytes embedded in this runner; rebuild the runner from the current repository before verifying a production contract",
-            script_path.display()
-        )));
-    }
-
-    let system_python = Path::new(SYSTEM_PYTHON3)
-        .canonicalize()
-        .map_err(|source| error(format!("resolve pinned system python3: {source}")))?;
-    validate_regular_no_symlink_file(&system_python, "resolved system python3")?;
-    validate_native_executable(&system_python)?;
-    // Python and Rust must authorize the same immutable document. Verifying a
-    // create-new staged copy closes the pathname swap between the policy
-    // process and Rust deserialization; the source path remains provenance,
-    // while these exact bytes are the authority consumed below.
-    let staged = stage_contract_for_admission(source_path, contract_bytes)?;
-    let mut child = Command::new(&system_python)
-        .args(["-I", "-B"])
-        .args(["-c", PYTHON_EMBEDDED_SCRIPT_BOOTSTRAP])
-        .arg(&script_path)
-        .arg("--verify-private-run-contract")
-        .arg(&staged.0)
-        .current_dir(&repository_root)
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| {
-            error(format!(
-                "spawn embedded private input admission verifier with {}: {source}",
-                system_python.display()
-            ))
-        })?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| error("embedded admission verifier stdin was not piped"))?
-        .write_all(PRIVATE_INPUT_ADMISSION_SCRIPT)
-        .map_err(|source| {
-            error(format!(
-                "write embedded admission policy to python3: {source}"
-            ))
-        })?;
-    let output = child.wait_with_output().map_err(|source| {
-        error(format!(
-            "wait for embedded private input admission verifier: {source}"
-        ))
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(error(format!(
-            "repository private input admission verifier rejected staged bytes from {} with {}: {}",
-            source_path.display(),
-            output.status,
-            stderr.trim()
-        )));
-    }
-    Ok(())
-}
-
 fn same_program_file_identity(
     build: &ReleaseProgramFileIdentity,
     contract_path: &str,
@@ -1061,22 +920,15 @@ fn verify_release_program_build_receipt_binding(
 pub fn load_private_release_run_contract(
     path: impl AsRef<Path>,
 ) -> Result<VerifiedPrivateReleaseRunContract, PrivateReleaseSeriesError> {
-    let path = path.as_ref();
-    validate_private_existing_path(path, "private run contract")?;
-    let bytes = fs::read(path).map_err(|source| {
-        error(format!(
-            "read private run contract {}: {source}",
-            path.display()
-        ))
-    })?;
-    verify_with_repository_admission(path, &bytes)?;
-    let contract: PrivateReleaseRunContract = serde_json::from_slice(&bytes).map_err(|source| {
-        error(format!(
-            "parse private run contract {}: {source}",
-            path.display()
-        ))
-    })?;
-    contract.verify_integrity()?;
+    let admitted =
+        crate::private_input_admission::verify_retained_private_run_contract(path.as_ref())
+            .map_err(|source| {
+                error(format!(
+                    "in-process private input admission rejected {}: {source}",
+                    path.as_ref().display()
+                ))
+            })?;
+    let contract = admitted.into_contract();
     verify_release_program_build_receipt_binding(&contract)?;
     Ok(VerifiedPrivateReleaseRunContract { contract })
 }
@@ -1087,7 +939,7 @@ fn identity_matches_bytes(identity: &PrivateFileIdentity, bytes: &[u8]) -> bool 
 }
 
 /// Admit only fn64's fixed, non-game synthetic mechanism fixture without the
-/// content-bearing Python path. Arbitrary caller-labelled synthetic inputs do
+/// content-bearing production path. Arbitrary caller-labelled synthetic inputs do
 /// not create runner authority.
 pub fn verify_repository_synthetic_private_release_run_contract(
     contract: PrivateReleaseRunContract,
@@ -2099,14 +1951,6 @@ fn validate_absolute_no_symlink_directory(
     Ok(())
 }
 
-fn validate_private_existing_path(
-    path: &Path,
-    field: &str,
-) -> Result<(), PrivateReleaseSeriesError> {
-    validate_regular_no_symlink_file(path, field)?;
-    require_outside_or_ignored(path, field)
-}
-
 fn validate_private_existing_directory(
     path: &Path,
     field: &str,
@@ -2573,30 +2417,6 @@ mod tests {
     }
 
     #[test]
-    fn admission_policy_receives_the_exact_bytes_rust_will_parse() {
-        let directory = TestDirectory::new();
-        let source = directory.0.join("contract.json");
-        fs::write(&source, b"source pathname may change after capture").unwrap();
-        let captured = b"exact captured contract bytes";
-        let staged_path;
-        {
-            let staged = stage_contract_for_admission(&source, captured).unwrap();
-            staged_path = staged.0.clone();
-            assert_ne!(staged_path, source);
-            assert_eq!(fs::read(&staged_path).unwrap(), captured);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                assert_eq!(
-                    fs::metadata(&staged_path).unwrap().permissions().mode() & 0o777,
-                    0o400
-                );
-            }
-        }
-        assert!(!staged_path.exists());
-    }
-
-    #[test]
     fn child_stage_is_an_exact_independent_inode() {
         let directory = TestDirectory::new();
         let source = directory.0.join("synthetic-native-image");
@@ -2833,21 +2653,14 @@ mod tests {
     }
 
     #[test]
-    fn repository_admission_script_matches_compiled_runner_bytes() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/private_input_admission.py");
-        assert!(
-            fs::read(path).unwrap() == PRIVATE_INPUT_ADMISSION_SCRIPT,
-            "runtime admission script differs from runner-embedded bytes"
-        );
-
+    fn in_process_admission_rejects_an_invalid_contract() {
         let directory = TestDirectory::new();
         let invalid = directory.0.join("invalid-contract.json");
         fs::write(&invalid, b"{}\n").unwrap();
         assert!(load_private_release_run_contract(&invalid)
             .unwrap_err()
             .to_string()
-            .contains("repository private input admission verifier rejected"));
+            .contains("in-process private input admission rejected"));
     }
 
     #[cfg(unix)]
@@ -2971,7 +2784,7 @@ mod tests {
         .unwrap();
         let script =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/private_input_admission.py");
-        let status = Command::new(SYSTEM_PYTHON3)
+        let status = Command::new("/usr/bin/python3")
             .arg(&script)
             .arg("--manifest")
             .arg(&manifest_path)

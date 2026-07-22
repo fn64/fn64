@@ -30,6 +30,58 @@ PROGRAM_BUILD_RECEIPT_SCHEMA = "fn64.release-program-build-receipt.v1"
 PROGRAM_BUILD_RECEIPT_DIGEST_DOMAIN = (
     b"fn64.release-program-build-receipt-digest.v1\0"
 )
+PRIVATE_ADMISSION_CORPUS_SCHEMA = "fn64.private-admission-rejection-corpus.v1"
+PRIVATE_ADMISSION_CORPUS_FIELDS = {"schema", "recipes"}
+PRIVATE_ADMISSION_RECIPE_FIELDS = {
+    "id", "baseline", "capability", "expect", "operation", "semantics",
+    "rejection_token",
+}
+PRIVATE_ADMISSION_RECIPE_BASELINES = {
+    "json-document",
+    "manifest-v7-full-rom",
+    "manifest-v7-characterization",
+    "manifest-v6-retained",
+    "readiness-v5-retained",
+    "contract-v3-from-v7",
+}
+PRIVATE_ADMISSION_RECIPE_CAPABILITIES = {"all", "symlink", "case-insensitive"}
+PRIVATE_ADMISSION_RECIPE_EXPECTATIONS = {"accept", "reject"}
+PRIVATE_ADMISSION_RECIPE_SEMANTICS = {
+    "v7-full-rom",
+    "v7-characterization",
+    "v6-retained",
+    "v3-contract",
+    "captured-v3-contract",
+}
+PRIVATE_ADMISSION_RECIPE_OPERATIONS = {
+    "validate",
+    "duplicate-root-field",
+    "duplicate-nested-env-field",
+    "symlink-manifest",
+    "symlink-artifact-parent",
+    "symlink-working-directory",
+    "same-length-descriptor-swap",
+    "same-length-path-swap",
+    "captured-contract-source-replacement",
+    "relative-artifact-path",
+    "parent-artifact-path",
+    "tracked-artifact-path",
+    "case-alias-tracked-path",
+    "reserved-rom-env",
+    "future-release-env",
+    "ld-preload-env",
+    "d3d12sdk-path-env",
+    "lowercase-env",
+    "artifact-tamper",
+    "receipt-inner-tamper",
+    "receipt-outer-tamper",
+    "contract-digest-tamper",
+    "contract-descriptor-tamper",
+    "v6-new-admission",
+    "v6-with-v7-field",
+    "v6-f3dzex2-raw-role",
+    "v5-with-current-field",
+}
 PURPOSES = {
     "extended_gbi", "f3dzex2_characterization", "full_rom", "combined",
 }
@@ -2054,6 +2106,605 @@ def expect_rejected(action, label: str) -> None:
     raise AdmissionError(f"selftest: {label} was accepted")
 
 
+def validate_private_admission_corpus_document(corpus: dict) -> list[dict]:
+    require(
+        set(corpus) == PRIVATE_ADMISSION_CORPUS_FIELDS,
+        "private-admission corpus has unknown or missing root fields",
+    )
+    require(
+        corpus["schema"] == PRIVATE_ADMISSION_CORPUS_SCHEMA,
+        "private-admission corpus schema is invalid",
+    )
+    recipes = corpus["recipes"]
+    require(
+        isinstance(recipes, list) and bool(recipes),
+        "private-admission corpus recipes must be a nonempty array",
+    )
+
+    def reject_identity_material(value: object, where: str) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                require(
+                    key not in {"path", "sha256", "bytes", "length"},
+                    f"{where} contains forbidden private identity field {key!r}",
+                )
+                reject_identity_material(item, f"{where}.{key}")
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                reject_identity_material(item, f"{where}[{index}]")
+        elif isinstance(value, str):
+            require(
+                not Path(value).is_absolute(),
+                f"{where} contains an absolute path",
+            )
+            require(
+                re.fullmatch(r"[0-9a-f]{64}", value) is None,
+                f"{where} contains a content identity",
+            )
+
+    reject_identity_material(corpus, "private-admission corpus")
+    expected_validate_semantics = {
+        "manifest-v7-full-rom": "v7-full-rom",
+        "manifest-v7-characterization": "v7-characterization",
+        "manifest-v6-retained": "v6-retained",
+        "contract-v3-from-v7": "v3-contract",
+    }
+    expected_baselines = {
+        "duplicate-root-field": "json-document",
+        "duplicate-nested-env-field": "json-document",
+        "symlink-manifest": "manifest-v7-full-rom",
+        "symlink-artifact-parent": "manifest-v7-full-rom",
+        "symlink-working-directory": "manifest-v7-full-rom",
+        "same-length-descriptor-swap": "manifest-v7-full-rom",
+        "same-length-path-swap": "manifest-v7-full-rom",
+        "captured-contract-source-replacement": "contract-v3-from-v7",
+        "relative-artifact-path": "manifest-v7-full-rom",
+        "parent-artifact-path": "manifest-v7-full-rom",
+        "tracked-artifact-path": "manifest-v7-full-rom",
+        "case-alias-tracked-path": "manifest-v7-full-rom",
+        "reserved-rom-env": "manifest-v7-full-rom",
+        "future-release-env": "manifest-v7-full-rom",
+        "ld-preload-env": "manifest-v7-full-rom",
+        "d3d12sdk-path-env": "manifest-v7-full-rom",
+        "lowercase-env": "manifest-v7-full-rom",
+        "artifact-tamper": "manifest-v7-full-rom",
+        "receipt-inner-tamper": "manifest-v7-full-rom",
+        "receipt-outer-tamper": "manifest-v7-full-rom",
+        "contract-digest-tamper": "contract-v3-from-v7",
+        "contract-descriptor-tamper": "contract-v3-from-v7",
+        "v6-new-admission": "manifest-v6-retained",
+        "v6-with-v7-field": "manifest-v6-retained",
+        "v6-f3dzex2-raw-role": "manifest-v6-retained",
+        "v5-with-current-field": "readiness-v5-retained",
+    }
+    expected_rejection_tokens = {
+        "duplicate-root-field": "duplicate field 'schema'",
+        "duplicate-nested-env-field": "duplicate field 'A'",
+        "symlink-manifest": "symlink path component",
+        "symlink-artifact-parent": "symlink path component",
+        "symlink-working-directory": "symlink path component",
+        "same-length-descriptor-swap": "artifacts.microcode_data SHA-256 drift",
+        "same-length-path-swap": "artifacts.microcode_data SHA-256 drift",
+        "relative-artifact-path": "artifacts.microcode_data.path must be absolute",
+        "parent-artifact-path": "artifacts.microcode_data.path must not contain '..'",
+        "tracked-artifact-path": "inside the repository and not gitignored",
+        "case-alias-tracked-path": "inside the repository and not gitignored",
+        "reserved-rom-env": "reserved for the trusted runner",
+        "future-release-env": "reserved for the trusted runner",
+        "ld-preload-env": "can inject or replace child process code",
+        "d3d12sdk-path-env": "can inject or replace child process code",
+        "lowercase-env": "runner.env name 'lowercase' is invalid",
+        "artifact-tamper": "artifacts.microcode_data length drift",
+        "receipt-inner-tamper": "execution source does not match recomputed",
+        "receipt-outer-tamper": "runner.program_build_receipt length drift",
+        "contract-digest-tamper": "private run contract SHA-256 drift",
+        "contract-descriptor-tamper": "contract.admission_manifest SHA-256 drift",
+        "v6-new-admission": "new --manifest admission requires schema",
+        "v6-with-v7-field": "intent fields are invalid",
+        "v6-f3dzex2-raw-role": "unsupported wire family 'f3dzex2'",
+        "v5-with-current-field": "readiness report has unknown or missing fields",
+    }
+    ids: list[str] = []
+    operations: set[str] = set()
+    accepted_baselines: set[str] = set()
+    for index, recipe in enumerate(recipes):
+        where = f"private-admission corpus.recipes[{index}]"
+        require(
+            isinstance(recipe, dict)
+            and set(recipe) == PRIVATE_ADMISSION_RECIPE_FIELDS,
+            f"{where} fields are invalid",
+        )
+        recipe_id = nonempty(recipe["id"], f"{where}.id")
+        require(
+            SCENARIO_RE.fullmatch(recipe_id) is not None,
+            f"{where}.id is not canonical",
+        )
+        ids.append(recipe_id)
+        baseline = recipe["baseline"]
+        capability = recipe["capability"]
+        expectation = recipe["expect"]
+        semantics = recipe["semantics"]
+        rejection_token = recipe["rejection_token"]
+        require(
+            isinstance(baseline, str)
+            and baseline in PRIVATE_ADMISSION_RECIPE_BASELINES,
+            f"{where}.baseline is invalid",
+        )
+        require(
+            isinstance(capability, str)
+            and capability in PRIVATE_ADMISSION_RECIPE_CAPABILITIES,
+            f"{where}.capability is invalid",
+        )
+        require(
+            isinstance(expectation, str)
+            and expectation in PRIVATE_ADMISSION_RECIPE_EXPECTATIONS,
+            f"{where}.expect is invalid",
+        )
+        operation = recipe["operation"]
+        require(
+            isinstance(operation, dict) and set(operation) == {"kind"},
+            f"{where}.operation fields are invalid",
+        )
+        kind = operation["kind"]
+        require(
+            isinstance(kind, str)
+            and kind in PRIVATE_ADMISSION_RECIPE_OPERATIONS,
+            f"{where}.operation.kind is invalid",
+        )
+        operations.add(kind)
+        expected_capability = (
+            "symlink" if kind.startswith("symlink-")
+            else "case-insensitive" if kind == "case-alias-tracked-path"
+            else "all"
+        )
+        require(
+            capability == expected_capability,
+            f"{where} has the wrong capability tag",
+        )
+        if kind == "validate":
+            require(
+                baseline in expected_validate_semantics,
+                f"{where} has an invalid validation baseline",
+            )
+            expected_semantics = expected_validate_semantics[baseline]
+            expected_id = {
+                "manifest-v7-full-rom": "accept-v7-full-rom",
+                "manifest-v7-characterization": "accept-v7-characterization",
+                "manifest-v6-retained": "accept-v6-retained",
+                "contract-v3-from-v7": "accept-v7-contract",
+            }[baseline]
+            accepted_baselines.add(baseline)
+        elif kind == "captured-contract-source-replacement":
+            expected_semantics = "captured-v3-contract"
+            expected_id = "accept-captured-contract-source-replacement"
+            require(
+                baseline == expected_baselines[kind],
+                f"{where} has an invalid operation baseline",
+            )
+        else:
+            expected_semantics = None
+            expected_id = f"reject-{kind}"
+            require(
+                baseline == expected_baselines[kind],
+                f"{where} has an invalid operation baseline",
+            )
+        require(
+            expectation == (
+                "accept" if expected_semantics is not None else "reject"
+            ),
+            f"{where} has an invalid expected verdict",
+        )
+        require(recipe_id == expected_id, f"{where}.id does not match its operation")
+        require(
+            semantics == expected_semantics
+            and (semantics is None or semantics in PRIVATE_ADMISSION_RECIPE_SEMANTICS),
+            f"{where}.semantics is invalid",
+        )
+        expected_rejection_token = expected_rejection_tokens.get(kind)
+        require(
+            rejection_token == expected_rejection_token,
+            f"{where}.rejection_token does not match its operation",
+        )
+    require(len(ids) == len(set(ids)), "private-admission corpus recipe IDs repeat")
+    require(
+        PRIVATE_ADMISSION_RECIPE_OPERATIONS <= operations,
+        "private-admission corpus is missing a required operation",
+    )
+    require(
+        accepted_baselines == set(expected_validate_semantics),
+        "private-admission corpus is missing an accepted baseline",
+    )
+    return recipes
+
+
+def load_private_admission_corpus(root: Path) -> list[dict]:
+    corpus_path = (
+        root / "crates" / "fn64-boot-harness" / "tests" / "fixtures"
+        / "private-admission-corpus-v1.json"
+    )
+    return validate_private_admission_corpus_document(load_json(corpus_path))
+
+
+def private_admission_corpus_capability(
+    capability: str, root: Path, directory: Path,
+) -> bool:
+    if capability == "all":
+        return True
+    if capability == "case-insensitive":
+        canonical = root / "README.md"
+        alias = root / "readme.md"
+        try:
+            return alias != canonical and alias.exists() and os.path.samefile(alias, canonical)
+        except OSError:
+            return False
+    probe_target = directory / "corpus-symlink-probe-target"
+    probe_link = directory / "corpus-symlink-probe-link"
+    probe_target.write_bytes(b"synthetic")
+    try:
+        probe_link.symlink_to(probe_target)
+        return probe_link.is_symlink()
+    except OSError:
+        return False
+    finally:
+        try:
+            probe_link.unlink()
+        except FileNotFoundError:
+            pass
+        probe_target.unlink()
+
+
+def run_private_admission_corpus(
+    root: Path,
+    directory: Path,
+    manifest_path: Path,
+    full_manifest: dict,
+    full_manifest_path: Path,
+    characterization_manifest: dict,
+    legacy_manifest: dict,
+    legacy_readiness: dict,
+    contract: dict,
+    contract_path: Path,
+) -> None:
+    recipes = load_private_admission_corpus(root)
+    data_path = Path(full_manifest["artifacts"]["microcode_data"]["path"])
+    receipt_path = Path(full_manifest["runner"]["program_build_receipt"]["path"])
+    snapshots = {
+        data_path: data_path.read_bytes(),
+        receipt_path: receipt_path.read_bytes(),
+        contract_path: contract_path.read_bytes(),
+    }
+    disposable_paths = [
+        directory / "corpus-document.json",
+        directory / "corpus-symlink-manifest.json",
+        directory / "corpus-artifact-parent",
+        directory / "corpus-working-directory",
+        directory / "corpus-same-length-data.bin",
+        directory / "corpus-contract-replacement.json",
+        directory / "corpus-v6-manifest.json",
+        directory / "corpus-v6-readiness.json",
+    ]
+
+    def reset_files() -> None:
+        for path, payload in snapshots.items():
+            path.write_bytes(payload)
+        for path in disposable_paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def clone(value: dict) -> dict:
+        return json.loads(json.dumps(value))
+
+    def validate_semantics(semantics: str, readiness: dict | None = None,
+                           admitted: dict[str, Path] | None = None,
+                           value: dict | None = None) -> None:
+        if semantics == "v7-full-rom":
+            require(
+                readiness is not None and admitted is not None
+                and readiness["schema"] == READINESS_SCHEMA
+                and readiness["purpose"] == "full_rom"
+                and readiness["program_evidence_lane"] == "typed_block_program"
+                and sorted(admitted) == [
+                    "microcode_data", "microcode_text", "recompiled", "rom",
+                ],
+                "corpus: v7 full-ROM accepted semantics drifted",
+            )
+        elif semantics == "v7-characterization":
+            require(
+                readiness is not None and admitted is not None
+                and readiness["schema"] == READINESS_SCHEMA
+                and readiness["purpose"] == "f3dzex2_characterization"
+                and readiness["characterization_suite"]
+                == F3DZEX2_CHARACTERIZATION_SUITE
+                and readiness["required_characterization_cases"]
+                == sorted(F3DZEX2_CHARACTERIZATION_CASES)
+                and sorted(admitted) == [
+                    "microcode_data_raw_window", "microcode_text_raw_window",
+                ],
+                "corpus: v7 characterization accepted semantics drifted",
+            )
+        elif semantics == "v6-retained":
+            require(
+                readiness is not None and admitted is not None
+                and readiness["schema"] == LEGACY_READINESS_SCHEMA
+                and set(readiness) == LEGACY_READINESS_FIELDS
+                and sorted(admitted) == ["microcode_data", "microcode_text"],
+                "corpus: retained v6 accepted semantics drifted",
+            )
+        else:
+            require(
+                value is not None
+                and value["schema"] == PRIVATE_RUN_CONTRACT_SCHEMA
+                and value["contract_sha256"] == private_run_contract_sha256({
+                    key: item for key, item in value.items()
+                    if key != "contract_sha256"
+                }),
+                "corpus: accepted v3 contract digest semantics drifted",
+            )
+
+    def execute(recipe: dict) -> bool:
+        reset_files()
+        kind = recipe["operation"]["kind"]
+        semantics = recipe["semantics"]
+        rejection_token = recipe["rejection_token"]
+
+        def target_accepts(action) -> bool:
+            try:
+                action()
+            except AdmissionError as error:
+                if rejection_token is not None:
+                    require(
+                        rejection_token in str(error),
+                        f"corpus: recipe {recipe['id']!r} rejected for the wrong "
+                        f"reason: {error}",
+                    )
+                return False
+            return True
+
+        if kind == "validate":
+            def validate_baseline() -> None:
+                baseline = recipe["baseline"]
+                if baseline == "manifest-v7-full-rom":
+                    readiness, admitted = validate_manifest(
+                        clone(full_manifest), full_manifest_path, root,
+                    )
+                    validate_readiness(readiness)
+                    validate_semantics(semantics, readiness, admitted)
+                elif baseline == "manifest-v7-characterization":
+                    readiness, admitted = validate_manifest(
+                        clone(characterization_manifest), manifest_path, root,
+                    )
+                    validate_readiness(readiness)
+                    validate_semantics(semantics, readiness, admitted)
+                elif baseline == "manifest-v6-retained":
+                    readiness, admitted = validate_manifest(
+                        clone(legacy_manifest), manifest_path, root,
+                    )
+                    validate_readiness(readiness)
+                    validate_semantics(semantics, readiness, admitted)
+                elif baseline == "contract-v3-from-v7":
+                    value = clone(contract)
+                    validate_private_run_contract(value, contract_path, root)
+                    validate_semantics(semantics, value=value)
+                else:
+                    raise RuntimeError(f"unhandled validation baseline {baseline!r}")
+            return target_accepts(validate_baseline)
+
+        if kind in {"duplicate-root-field", "duplicate-nested-env-field"}:
+            document_path = directory / "corpus-document.json"
+            raw = (
+                '{"schema":"first","schema":"second"}\n'
+                if kind == "duplicate-root-field"
+                else '{"runner":{"env":{"A":"1","A":"2"}}}\n'
+            )
+            document_path.write_text(raw, encoding="utf-8")
+            return target_accepts(lambda: load_json(document_path))
+        if kind == "symlink-manifest":
+            link = directory / "corpus-symlink-manifest.json"
+            link.symlink_to(full_manifest_path)
+            return target_accepts(
+                lambda: validate_manifest(clone(full_manifest), link, root),
+            )
+        if kind == "symlink-artifact-parent":
+            link = directory / "corpus-artifact-parent"
+            link.symlink_to(data_path.parent, target_is_directory=True)
+            value = clone(full_manifest)
+            value["artifacts"]["microcode_data"]["path"] = str(link / data_path.name)
+            return target_accepts(
+                lambda: validate_manifest(value, full_manifest_path, root),
+            )
+        if kind == "symlink-working-directory":
+            link = directory / "corpus-working-directory"
+            link.symlink_to(directory, target_is_directory=True)
+            value = clone(full_manifest)
+            value["runner"]["working_directory"] = str(link)
+            return target_accepts(
+                lambda: validate_manifest(value, full_manifest_path, root),
+            )
+        if kind == "same-length-descriptor-swap":
+            alternate = directory / "corpus-same-length-data.bin"
+            alternate.write_bytes(bytes(byte ^ 0xFF for byte in snapshots[data_path]))
+            value = clone(full_manifest)
+            value["artifacts"]["microcode_data"]["path"] = str(alternate)
+            return target_accepts(
+                lambda: validate_manifest(value, full_manifest_path, root),
+            )
+        if kind == "same-length-path-swap":
+            alternate = directory / "corpus-same-length-data.bin"
+            alternate.write_bytes(bytes(byte ^ 0xFF for byte in snapshots[data_path]))
+            os.replace(alternate, data_path)
+            return target_accepts(
+                lambda: validate_manifest(clone(full_manifest), full_manifest_path, root),
+            )
+        if kind == "captured-contract-source-replacement":
+            captured = load_json(contract_path)
+            replacement = directory / "corpus-contract-replacement.json"
+            original_length = len(snapshots[contract_path])
+            replacement.write_bytes(b"{}" + b" " * (original_length - 3) + b"\n")
+            os.replace(replacement, contract_path)
+
+            def validate_captured_contract() -> None:
+                validate_private_run_contract(captured, contract_path, root)
+                validate_semantics(semantics, value=captured)
+
+            return target_accepts(validate_captured_contract)
+        if kind in {"relative-artifact-path", "parent-artifact-path"}:
+            value = clone(full_manifest)
+            value["artifacts"]["microcode_data"]["path"] = (
+                data_path.name
+                if kind == "relative-artifact-path"
+                else str(directory / "missing" / ".." / data_path.name)
+            )
+            return target_accepts(
+                lambda: validate_manifest(value, full_manifest_path, root),
+            )
+        if kind in {"tracked-artifact-path", "case-alias-tracked-path"}:
+            tracked = root / (
+                "readme.md" if kind == "case-alias-tracked-path" else "README.md"
+            )
+            value = clone(full_manifest)
+            value["artifacts"]["microcode_data"] = descriptor(
+                tracked, "user_owned_rom_derived",
+            )
+            return target_accepts(
+                lambda: validate_manifest(value, full_manifest_path, root),
+            )
+        if kind in {
+            "reserved-rom-env", "future-release-env", "ld-preload-env",
+            "d3d12sdk-path-env", "lowercase-env",
+        }:
+            env_name = {
+                "reserved-rom-env": "ROM",
+                "future-release-env": "FN64_RELEASE_FUTURE",
+                "ld-preload-env": "LD_PRELOAD",
+                "d3d12sdk-path-env": "D3D12SDK_PATH",
+                "lowercase-env": "lowercase",
+            }[kind]
+            value = clone(full_manifest)
+            value["runner"]["env"][env_name] = "synthetic"
+            return target_accepts(
+                lambda: validate_manifest(value, full_manifest_path, root),
+            )
+        if kind == "artifact-tamper":
+            data_path.write_bytes(snapshots[data_path] + b"synthetic")
+            return target_accepts(
+                lambda: validate_manifest(clone(full_manifest), full_manifest_path, root),
+            )
+        if kind == "receipt-inner-tamper":
+            receipt = load_json(receipt_path)
+            receipt["lane"]["expected_program_sha256"] = "22" * 32
+            unsigned = {
+                key: item for key, item in receipt.items()
+                if key != "receipt_sha256"
+            }
+            receipt["receipt_sha256"] = program_build_receipt_sha256(unsigned)
+            receipt_path.write_bytes(serialize_json_document(receipt))
+            value = clone(full_manifest)
+            value["runner"]["program_build_receipt"]["length"] = receipt_path.stat().st_size
+            value["runner"]["program_build_receipt"]["sha256"] = sha256_file(receipt_path)
+            return target_accepts(
+                lambda: validate_manifest(value, full_manifest_path, root),
+            )
+        if kind == "receipt-outer-tamper":
+            receipt_path.write_bytes(snapshots[receipt_path] + b" ")
+            return target_accepts(
+                lambda: validate_manifest(clone(full_manifest), full_manifest_path, root),
+            )
+        if kind == "contract-digest-tamper":
+            value = clone(contract)
+            value["contract_sha256"] = "00" * 32
+            return target_accepts(
+                lambda: validate_private_run_contract(value, contract_path, root),
+            )
+        if kind == "contract-descriptor-tamper":
+            value = clone(contract)
+            value["admission_manifest"]["sha256"] = "00" * 32
+            unsigned = {
+                key: item for key, item in value.items()
+                if key != "contract_sha256"
+            }
+            value["contract_sha256"] = private_run_contract_sha256(unsigned)
+            return target_accepts(
+                lambda: validate_private_run_contract(value, contract_path, root),
+            )
+        if kind == "v6-new-admission":
+            retained_path = directory / "corpus-v6-manifest.json"
+            report_path = directory / "corpus-v6-readiness.json"
+            retained_path.write_bytes(serialize_json_document(legacy_manifest))
+
+            def attempt_new_v6_admission() -> None:
+                result = subprocess.run(
+                    [
+                        sys.executable, str(Path(__file__).resolve()),
+                        "--manifest", str(retained_path),
+                        "--report", str(report_path),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    require(
+                        report_path.exists(),
+                        "corpus: successful retained-v6 admission emitted no report",
+                    )
+                    return
+                require(
+                    not report_path.exists(),
+                    "corpus: rejected retained-v6 admission left a report",
+                )
+                raise AdmissionError(result.stderr.strip())
+
+            return target_accepts(attempt_new_v6_admission)
+        if kind == "v6-with-v7-field":
+            value = clone(legacy_manifest)
+            value["intent"]["characterization_suite"] = None
+            return target_accepts(lambda: validate_manifest(value, manifest_path, root))
+        if kind == "v6-f3dzex2-raw-role":
+            value = clone(legacy_manifest)
+            value["intent"]["wire_family"] = "f3dzex2"
+            value["artifacts"]["microcode_text_raw_window"] = clone(
+                characterization_manifest["artifacts"]["microcode_text_raw_window"]
+            )
+            return target_accepts(lambda: validate_manifest(value, manifest_path, root))
+        if kind == "v5-with-current-field":
+            value = clone(legacy_readiness)
+            value["characterization_suite"] = "not_requested"
+            return target_accepts(lambda: validate_readiness(value))
+        raise RuntimeError(f"unhandled private-admission corpus operation {kind!r}")
+
+    executed_all: set[str] = set()
+    executed: set[str] = set()
+    for recipe in recipes:
+        if not private_admission_corpus_capability(
+            recipe["capability"], root, directory,
+        ):
+            require(
+                recipe["capability"] != "all",
+                f"corpus: capability=all recipe {recipe['id']!r} was skipped",
+            )
+            continue
+        accepted = execute(recipe)
+        require(
+            accepted == (recipe["expect"] == "accept"),
+            f"corpus: recipe {recipe['id']!r} verdict drifted",
+        )
+        executed.add(recipe["id"])
+        if recipe["capability"] == "all":
+            executed_all.add(recipe["id"])
+    required_all = {
+        recipe["id"] for recipe in recipes if recipe["capability"] == "all"
+    }
+    require(
+        executed_all == required_all,
+        "corpus: one or more capability=all recipes were not executed",
+    )
+    require(executed, "corpus: no recipes executed")
+    reset_files()
+
+
 def selftest(root: Path) -> None:
     canonical_program_receipt = {
         "schema": PROGRAM_BUILD_RECEIPT_SCHEMA,
@@ -2975,6 +3626,19 @@ def selftest(root: Path) -> None:
                 wrong_contract_hash, contract_path, root,
             ),
             "private run contract digest drift",
+        )
+
+        run_private_admission_corpus(
+            root,
+            directory,
+            manifest_path,
+            full_rom,
+            full_manifest_path,
+            characterization,
+            legacy_manifest,
+            legacy_readiness,
+            contract,
+            contract_path,
         )
 
 

@@ -3220,7 +3220,6 @@ impl std::error::Error for ReleaseMatrixError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     use crate::{
         load_private_release_run_contract, materialize_release_program_build_receipt,
         parse_unsupported_journal, run_private_release_series, verify_private_release_series,
@@ -3230,22 +3229,17 @@ mod tests {
         ArtifactKind, ClosurePath, ClosurePathStatus, FixedCycleDigestGate, LiveRenderEvidence,
         RenderPixelFormat, RspRdpObservationEventEvidence, LIVE_MINIMUM_CLOSURE_PATHS,
     };
-    #[cfg(unix)]
     use std::{
         fs,
         io::Write as _,
         path::{Path, PathBuf},
-        process::Command,
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    #[cfg(unix)]
     static PRODUCTION_MATRIX_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    #[cfg(unix)]
     struct ProductionMatrixFixtureDirectory(PathBuf);
 
-    #[cfg(unix)]
     impl ProductionMatrixFixtureDirectory {
         fn new() -> Self {
             let counter = PRODUCTION_MATRIX_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -3263,7 +3257,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     impl Drop for ProductionMatrixFixtureDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
@@ -3722,7 +3715,6 @@ mod tests {
         authority
     }
 
-    #[cfg(unix)]
     #[test]
     fn exported_private_series_matrix_path_admits_public_fixture_and_rejects_tamper() {
         const REPORT_SCENARIO: &str = "public-homebrew-production-matrix-mechanism-v1";
@@ -3785,12 +3777,14 @@ mod tests {
             CLEAN_RT64_IDENTITY,
             Some(ProgramFeature::TypedBlock),
         );
-        let (platform, platform_wire) = if cfg!(target_os = "macos") {
-            (ReleaseHostPlatform::MacosArm64, "macos_arm64")
-        } else {
-            (ReleaseHostPlatform::LinuxX86_64, "linux_x86_64")
-        };
+        #[cfg(target_os = "macos")]
+        let (platform, platform_wire) = (ReleaseHostPlatform::MacosArm64, "macos_arm64");
+        #[cfg(target_os = "linux")]
+        let (platform, platform_wire) = (ReleaseHostPlatform::LinuxX86_64, "linux_x86_64");
+        #[cfg(target_os = "windows")]
+        let (platform, platform_wire) = (ReleaseHostPlatform::WindowsX86_64, "windows_x86_64");
         report.environment.platform = platform;
+        report.environment.windows_version = crate::test_release_windows_version();
         report.execution_destinations = ExecutionDestinationEvidence::from_ordered(
             source.clone(),
             vec![crate::ExecutionDestinationEventEvidence {
@@ -3895,22 +3889,29 @@ mod tests {
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        let admission_script =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/private_input_admission.py");
-        let admission = Command::new("/usr/bin/python3")
-            .arg(&admission_script)
-            .arg("--manifest")
-            .arg(&manifest_path)
-            .arg("--report")
-            .arg(&readiness_path)
-            .arg("--emit-private-run-contract")
-            .arg(&contract_path)
-            .output()
-            .unwrap();
-        assert!(
-            admission.status.success(),
-            "production fixture admission failed: {}",
-            String::from_utf8_lossy(&admission.stderr)
+        let admitted = crate::private_input_admission::admit_current_v7_manifest(
+            &manifest_path,
+            &readiness_path,
+        )
+        .unwrap();
+        assert!(admitted.contract.is_some());
+        let write_new = |path: &Path, payload: &[u8]| {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap();
+            file.write_all(payload).unwrap();
+            file.flush().unwrap();
+            file.sync_all().unwrap();
+        };
+        write_new(&readiness_path, &admitted.readiness_bytes);
+        write_new(
+            &contract_path,
+            admitted
+                .contract_bytes
+                .as_deref()
+                .expect("full-ROM admission emits a contract"),
         );
 
         let contract = load_private_release_run_contract(&contract_path).unwrap();

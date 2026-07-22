@@ -10,6 +10,8 @@
 mod certification_profile;
 mod observation_evidence;
 mod platform_certification;
+mod private_fs;
+mod private_input_admission;
 mod private_release_series;
 mod release_gate;
 mod release_matrix;

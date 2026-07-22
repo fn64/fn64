@@ -5,14 +5,18 @@
 
 #[cfg(test)]
 use crate::native_program_archives_sha256;
+use crate::private_fs::{
+    check_directory_nofollow, measure_regular_stable, measure_regular_stable_with,
+    read_regular_stable, same_lexical_path, validate_absolute_no_parent, StableFileStream,
+};
 use crate::ExecutionDestinationSource;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fmt,
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    path::{Component, Path, PathBuf},
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
 };
 
 pub(crate) const RELEASE_PROGRAM_BUILD_RECEIPT_SCHEMA: &str =
@@ -327,19 +331,20 @@ pub(crate) fn load_release_program_build_receipt(
     path: impl AsRef<Path>,
 ) -> Result<VerifiedReleaseProgramBuildReceipt, ReleaseProgramBuildReceiptError> {
     let path = path.as_ref();
-    validate_regular_no_symlink_file(path, "release program build receipt")?;
-    let bytes = fs::read(path).map_err(|source| {
+    let retained = read_regular_stable(path, "release program build receipt").map_err(error)?;
+    verify_release_program_build_receipt_document(&retained.contents).map_err(|source| {
         error(format!(
-            "read release program build receipt {}: {source}",
+            "verify release program build receipt {}: {source}",
             path.display()
         ))
-    })?;
-    let receipt: ReleaseProgramBuildReceipt = serde_json::from_slice(&bytes).map_err(|source| {
-        error(format!(
-            "parse release program build receipt {}: {source}",
-            path.display()
-        ))
-    })?;
+    })
+}
+
+pub(crate) fn verify_release_program_build_receipt_document(
+    bytes: &[u8],
+) -> Result<VerifiedReleaseProgramBuildReceipt, ReleaseProgramBuildReceiptError> {
+    let receipt: ReleaseProgramBuildReceipt = serde_json::from_slice(bytes)
+        .map_err(|source| error(format!("parse release program build receipt: {source}")))?;
     verify_release_program_build_receipt(receipt)
 }
 
@@ -416,17 +421,9 @@ fn validate_file_identity(
     identity: &ReleaseProgramFileIdentity,
     field: &str,
 ) -> Result<(), ReleaseProgramBuildReceiptError> {
-    if identity.bytes == 0 {
-        return Err(error(format!("{field}.bytes must be positive")));
-    }
-    if identity.bytes > MAX_RELEASE_PROGRAM_FILE_BYTES {
-        return Err(error(format!(
-            "{field}.bytes exceeds the {}-byte release-program limit",
-            MAX_RELEASE_PROGRAM_FILE_BYTES
-        )));
-    }
+    validate_program_file_bytes(identity.bytes, field)?;
     require_sha256(&identity.sha256, &format!("{field}.sha256"))?;
-    validate_absolute_no_parent(Path::new(&identity.path), &format!("{field}.path"))
+    validate_absolute_no_parent(Path::new(&identity.path), &format!("{field}.path")).map_err(error)
 }
 
 fn validate_label(value: &str, field: &str) -> Result<(), ReleaseProgramBuildReceiptError> {
@@ -484,7 +481,10 @@ fn verify_bound_file_and_update(
 ) -> Result<(u64, String), ReleaseProgramBuildReceiptError> {
     validate_file_identity(identity, field)?;
     let observed = measure_program_file(Path::new(&identity.path), field, aggregate)?;
-    if observed.bytes != identity.bytes || observed.sha256 != identity.sha256 {
+    if !same_lexical_path(Path::new(&observed.path), Path::new(&identity.path))
+        || observed.bytes != identity.bytes
+        || observed.sha256 != identity.sha256
+    {
         return Err(error(format!(
             "{field} identity drift at {}: expected bytes={} sha256={}, observed bytes={} sha256={}",
             identity.path, identity.bytes, identity.sha256, observed.bytes, observed.sha256
@@ -496,138 +496,57 @@ fn verify_bound_file_and_update(
 fn measure_program_file(
     path: &Path,
     field: &str,
-    mut aggregate: Option<&mut Sha256>,
+    aggregate: Option<&mut Sha256>,
 ) -> Result<ReleaseProgramFileIdentity, ReleaseProgramBuildReceiptError> {
-    validate_regular_no_symlink_file(path, field)?;
     let path_string = path
         .to_str()
         .ok_or_else(|| error(format!("{field} path must be valid UTF-8")))?
         .to_owned();
-    let path_before = fs::symlink_metadata(path)
-        .map_err(|source| error(format!("inspect {field} {}: {source}", path.display())))?;
-    let mut file = File::open(path)
-        .map_err(|source| error(format!("open {field} {}: {source}", path.display())))?;
-    let handle_before = file
-        .metadata()
-        .map_err(|source| error(format!("inspect open {field} {}: {source}", path.display())))?;
-    if !same_file_identity(&path_before, &handle_before) {
-        return Err(error(format!(
-            "{field} {} changed between path validation and open",
-            path.display()
-        )));
+    let measurement = match aggregate {
+        Some(aggregate) => measure_regular_stable_with(path, field, |event| {
+            match event {
+                StableFileStream::Length(bytes) => {
+                    validate_program_file_bytes(bytes, field)
+                        .map_err(|source| source.to_string())?;
+                    aggregate.update(bytes.to_be_bytes());
+                }
+                StableFileStream::Chunk(bytes) => aggregate.update(bytes),
+            }
+            Ok(())
+        }),
+        None => measure_regular_stable(path, field),
     }
-    if handle_before.len() == 0 {
-        return Err(error(format!("{field}.bytes must be positive")));
-    }
-    if handle_before.len() > MAX_RELEASE_PROGRAM_FILE_BYTES {
-        return Err(error(format!(
-            "{field}.bytes exceeds the {}-byte release-program limit",
-            MAX_RELEASE_PROGRAM_FILE_BYTES
-        )));
-    }
-    if let Some(aggregate) = aggregate.as_deref_mut() {
-        aggregate.update(handle_before.len().to_be_bytes());
-    }
-    let mut digest = Sha256::new();
-    let mut observed_bytes = 0u64;
-    let mut buffer = [0u8; 1024 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|source| error(format!("read {field} {}: {source}", path.display())))?;
-        if read == 0 {
-            break;
-        }
-        observed_bytes = observed_bytes
-            .checked_add(u64::try_from(read).expect("buffer length fits u64"))
-            .ok_or_else(|| error(format!("{field} {} length overflow", path.display())))?;
-        digest.update(&buffer[..read]);
-        if let Some(aggregate) = aggregate.as_deref_mut() {
-            aggregate.update(&buffer[..read]);
-        }
-    }
-    let handle_after = file.metadata().map_err(|source| {
-        error(format!(
-            "reinspect open {field} {}: {source}",
-            path.display()
-        ))
-    })?;
-    validate_regular_no_symlink_file(path, field)?;
-    let path_after = fs::symlink_metadata(path)
-        .map_err(|source| error(format!("reinspect {field} {}: {source}", path.display())))?;
-    if !same_file_identity(&handle_before, &handle_after)
-        || !same_file_identity(&handle_after, &path_after)
-        || observed_bytes != handle_after.len()
-    {
-        return Err(error(format!(
-            "{field} {} changed while it was being measured",
-            path.display()
-        )));
-    }
-    let observed_sha256 = hex(&digest.finalize());
+    .map_err(error)?;
+    validate_program_file_bytes(measurement.bytes, field)?;
     Ok(ReleaseProgramFileIdentity {
         path: path_string,
-        bytes: observed_bytes,
-        sha256: observed_sha256,
+        bytes: measurement.bytes,
+        sha256: measurement.sha256,
     })
 }
 
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        left.dev() == right.dev()
-            && left.ino() == right.ino()
-            && left.len() == right.len()
-            && left.mtime() == right.mtime()
-            && left.mtime_nsec() == right.mtime_nsec()
-            && left.ctime() == right.ctime()
-            && left.ctime_nsec() == right.ctime_nsec()
-    }
-    #[cfg(not(unix))]
-    {
-        left.len() == right.len()
-            && left.modified().ok() == right.modified().ok()
-            && left.created().ok() == right.created().ok()
-            && left.permissions().readonly() == right.permissions().readonly()
-    }
-}
-
-fn validate_regular_no_symlink_file(
-    path: &Path,
+fn validate_program_file_bytes(
+    bytes: u64,
     field: &str,
 ) -> Result<(), ReleaseProgramBuildReceiptError> {
-    validate_absolute_no_parent(path, field)?;
-    reject_symlink_components(path, field)?;
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|source| error(format!("inspect {field} {}: {source}", path.display())))?;
-    if !metadata.file_type().is_file() {
+    if bytes == 0 {
+        return Err(error(format!("{field}.bytes must be positive")));
+    }
+    if bytes > MAX_RELEASE_PROGRAM_FILE_BYTES {
         return Err(error(format!(
-            "{field} {} is not a regular file",
-            path.display()
+            "{field}.bytes exceeds the {}-byte release-program limit",
+            MAX_RELEASE_PROGRAM_FILE_BYTES
         )));
     }
     Ok(())
 }
 
 fn validate_new_receipt_output(path: &Path) -> Result<(), ReleaseProgramBuildReceiptError> {
-    validate_absolute_no_parent(path, "output")?;
+    validate_absolute_no_parent(path, "output").map_err(error)?;
     let parent = path
         .parent()
         .ok_or_else(|| error("output must have an existing parent directory"))?;
-    reject_symlink_components(parent, "output parent")?;
-    let parent_metadata = fs::symlink_metadata(parent).map_err(|source| {
-        error(format!(
-            "inspect output parent {}: {source}",
-            parent.display()
-        ))
-    })?;
-    if !parent_metadata.is_dir() {
-        return Err(error(format!(
-            "output parent {} is not a directory",
-            parent.display()
-        )));
-    }
+    check_directory_nofollow(parent, "output parent").map_err(error)?;
     match fs::symlink_metadata(path) {
         Ok(_) => Err(error(format!(
             "output {} already exists; receipt publication never replaces a path",
@@ -680,47 +599,6 @@ fn publish_release_program_build_receipt(
             path.display()
         ))
     })
-}
-
-fn validate_absolute_no_parent(
-    path: &Path,
-    field: &str,
-) -> Result<(), ReleaseProgramBuildReceiptError> {
-    if !path.is_absolute()
-        || path.as_os_str().is_empty()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err(error(format!(
-            "{field} {} must be absolute and contain no '..' component",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn reject_symlink_components(
-    path: &Path,
-    field: &str,
-) -> Result<(), ReleaseProgramBuildReceiptError> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&current).map_err(|source| {
-            error(format!(
-                "inspect {field} component {}: {source}",
-                current.display()
-            ))
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(error(format!(
-                "{field} has forbidden symlink component {}",
-                current.display()
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn encode_file_identity(
