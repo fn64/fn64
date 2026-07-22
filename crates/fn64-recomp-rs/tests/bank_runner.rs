@@ -305,6 +305,182 @@ fn emitted_and_interpreted_tlb_translation_and_faults_are_identical() {
 }
 
 #[test]
+fn emitted_and_interpreted_extended_address_spaces_are_identical() {
+    let words = [
+        0x8c82_0000, // lw $v0,0($a0)
+        0xac83_0004, // sw $v1,4($a0)
+        0x03e0_0008, // jr $ra
+        0,
+    ];
+    let bank = BankId::new(0xA6);
+    let emitted = emit_bank_runner(&BankInput {
+        name: "run_extended_data_bank",
+        bank,
+        vram: BASE,
+        words: &words,
+    });
+    let stdout = compile_and_run(
+        &emitted,
+        r#"
+    const WORDS: [u32; 4] = [0x8c82_0000, 0xac83_0004, 0x03e0_0008, 0];
+    const MAPPED: u64 = 0x0000_0012_3456_0000;
+    const XKPHYS: u64 = 0x9000_0000_0000_0000;
+    let bank = BankId::new(0xA6);
+    let code = CodeBank::new(bank, GuestPc::new(0x8000_1000), WORDS.to_vec()).unwrap();
+    let mut catalog = CodeCatalog::new();
+    catalog.register(code).unwrap();
+    let budget = InstructionBudget::new(8).unwrap();
+
+    let make_ctx = |status: u32, address: u64, install: bool| {
+        let mut ctx = RecompContext::new();
+        ctx.cop0_status = status;
+        ctx.cop0_entry_hi = 0x2a;
+        ctx.set_r(4, address);
+        ctx.set_r(3, 0xa1b2_c3d4);
+        ctx.set_r(31, 0x8000_9000);
+        if install {
+            ctx.tlb_entries[7] = TlbEntryRaw {
+                page_mask: 0,
+                entry_hi: (address & 0xc000_00ff_ffff_e000) | 0x2a,
+                entry_lo0: 0x6,
+                entry_lo1: (1 << 6) | 0x6,
+            };
+        }
+        ctx
+    };
+    let compare = |status: u32, address: u64, install: bool, initial: [u8; 16]| {
+        let key = ExecutionKey::new(bank, GuestPc::new(0x8000_1000));
+        let mut ictx = make_ctx(status, address, install);
+        let mut actx = make_ctx(status, address, install);
+        let mut imem = initial;
+        let mut amem = initial;
+        let irun = run_bank(
+            &catalog,
+            bank,
+            key,
+            budget,
+            &mut ictx,
+            &mut Rdram::new(&mut imem),
+        ).unwrap();
+        let arun = run_extended_data_bank(
+            key,
+            budget,
+            &mut actx,
+            &mut Rdram::new(&mut amem),
+        );
+        assert_eq!(irun, arun);
+        assert_eq!(ictx.gprs(), actx.gprs());
+        assert_eq!(imem, amem);
+        (arun, actx, amem)
+    };
+
+    let mut initial = [0u8; 16];
+    initial[0..4].copy_from_slice(&0x1122_3344u32.to_ne_bytes());
+
+    // User mode plus UX selects mapped XUSEG and compares the full VPN2 tag.
+    let (mapped, mapped_ctx, mapped_mem) = compare((2 << 3) | (1 << 5), MAPPED, true, initial);
+    assert_eq!(mapped.instructions, 4);
+    assert_eq!(mapped_ctx.r_u32(2), 0x1122_3344);
+    assert_eq!(&mapped_mem[4..8], &0xa1b2_c3d4u32.to_ne_bytes());
+
+    let (refill, _, _) = compare((2 << 3) | (1 << 5), MAPPED, false, initial);
+    assert!(matches!(refill.exit, BlockExit::Fault(CpuFault {
+        kind: CpuFaultKind::Exception {
+            exception: CpuException::XTlbRefillLoad,
+            bad_vaddr: Some(MAPPED),
+            ..
+        }, ..
+    })));
+    assert_eq!(refill.instructions, 1);
+
+    // Kernel KX reaches valid XKPHYS directly; the same VA is illegal in user mode.
+    let (direct, direct_ctx, direct_mem) = compare(1 << 7, XKPHYS, false, initial);
+    assert_eq!(direct.instructions, 4);
+    assert_eq!(direct_ctx.r_u32(2), 0x1122_3344);
+    assert_eq!(&direct_mem[4..8], &0xa1b2_c3d4u32.to_ne_bytes());
+
+    let (address_error, _, unchanged) = compare((2 << 3) | (1 << 5), XKPHYS, false, initial);
+    assert!(matches!(address_error.exit, BlockExit::Fault(CpuFault {
+        kind: CpuFaultKind::Exception {
+            exception: CpuException::AddressErrorLoad,
+            bad_vaddr: Some(XKPHYS),
+            ..
+        }, ..
+    })));
+    assert_eq!(address_error.instructions, 1);
+    assert_eq!(unchanged, initial);
+    println!("extended-data-differential-ok");
+"#,
+    );
+    assert_eq!(stdout.trim(), "extended-data-differential-ok");
+}
+
+#[test]
+fn emitted_and_interpreted_doubleword_translation_register_moves_are_identical() {
+    let words = [
+        0x40a4_5000, // dmtc0 $a0,EntryHi
+        0x4022_5000, // dmfc0 $v0,EntryHi
+        0x40a5_a000, // dmtc0 $a1,XContext
+        0x4023_a000, // dmfc0 $v1,XContext
+        0x03e0_0008, // jr $ra
+        0,
+    ];
+    let bank = BankId::new(0xA7);
+    let emitted = emit_bank_runner(&BankInput {
+        name: "run_doubleword_cop0_bank",
+        bank,
+        vram: BASE,
+        words: &words,
+    });
+    let stdout = compile_and_run(
+        &emitted,
+        r#"
+    const WORDS: [u32; 6] = [
+        0x40a4_5000, 0x4022_5000, 0x40a5_a000,
+        0x4023_a000, 0x03e0_0008, 0,
+    ];
+    let bank = BankId::new(0xA7);
+    let code = CodeBank::new(bank, GuestPc::new(0x8000_1000), WORDS.to_vec()).unwrap();
+    let mut catalog = CodeCatalog::new();
+    catalog.register(code).unwrap();
+    let key = ExecutionKey::new(bank, GuestPc::new(0x8000_1000));
+    let budget = InstructionBudget::new(8).unwrap();
+    let mut ictx = RecompContext::new();
+    let mut actx = RecompContext::new();
+    for ctx in [&mut ictx, &mut actx] {
+        ctx.set_r(4, 0x4000_0088_7654_205a);
+        ctx.set_r(5, 0x1234_5678_9abc_def0);
+        ctx.set_r(31, 0x8000_9000);
+    }
+    let mut imem = [];
+    let mut amem = [];
+    let irun = run_bank(
+        &catalog,
+        bank,
+        key,
+        budget,
+        &mut ictx,
+        &mut Rdram::new(&mut imem),
+    ).unwrap();
+    let arun = run_doubleword_cop0_bank(
+        key,
+        budget,
+        &mut actx,
+        &mut Rdram::new(&mut amem),
+    );
+    assert_eq!(irun, arun);
+    assert_eq!(ictx.gprs(), actx.gprs());
+    assert_eq!(ictx.cop0_entry_hi, 0x4000_0088_7654_205a);
+    assert_eq!(ictx.cop0_xcontext, 0x1234_5678_9abc_def0);
+    assert_eq!(ictx.r_u64(2), ictx.cop0_entry_hi);
+    assert_eq!(ictx.r_u64(3), ictx.cop0_xcontext);
+    println!("doubleword-cop0-differential-ok");
+"#,
+    );
+    assert_eq!(stdout.trim(), "doubleword-cop0-differential-ok");
+}
+
+#[test]
 fn emitted_random_and_tlbwr_use_explicit_instruction_order() {
     let words = [
         0x2402_001d, // addiu $v0,$zero,29
@@ -585,7 +761,7 @@ fn main() {{
                 epc,
                 branch_delay: false,
                 instruction_code: 0,
-                bad_vaddr: Some(0x8000_0001),
+                bad_vaddr: Some(0xffff_ffff_8000_0001),
                 coprocessor: None,
             }},
         }}) if pc == GuestPc::new(0x8000_B000) && epc == GuestPc::new(0x8000_B000)
@@ -608,7 +784,7 @@ fn main() {{
                 epc,
                 branch_delay: true,
                 instruction_code: 0,
-                bad_vaddr: Some(0x8000_0002),
+                bad_vaddr: Some(0xffff_ffff_8000_0002),
                 coprocessor: None,
             }},
         }}) if pc == GuestPc::new(0x8000_B008) && epc == GuestPc::new(0x8000_B004)
@@ -749,7 +925,7 @@ fn main() {{
         BlockExit::Fault(CpuFault {{
             kind: CpuFaultKind::Exception {{
                 exception: CpuException::AddressErrorLoad,
-                bad_vaddr: Some(0x8000_0001),
+                bad_vaddr: Some(0xffff_ffff_8000_0001),
                 coprocessor: None,
                 ..
             }},
@@ -931,7 +1107,7 @@ fn main() {{
         &mut mem,
         &mut resolve_address,
     ).unwrap();
-    assert_eq!(address_dispatch_ctx.cop0_badvaddr, 0x8000_0001);
+    assert_eq!(address_dispatch_ctx.cop0_badvaddr, 0xffff_ffff_8000_0001);
     assert_eq!(address_dispatch_ctx.cop0_epc, 0x8000_B004);
     assert_eq!((address_dispatch_ctx.cop0_cause >> 2) & 0x1F, 4);
     assert_eq!(address_dispatch_ctx.cop0_cause & (1 << 31), 0);

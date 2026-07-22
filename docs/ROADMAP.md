@@ -695,10 +695,13 @@ and deterministic output traces.
   real artifact and are schema-v22 fixed-cycle eligible; compatibility AOT
   without one and mapped-interpreter observations are not. The latter remain
   operational/differential-only until a successor typed destination schema
-  exists. Multiple matches remain loud. Silicon-exact Random timing,
-  64-bit mapped translation,
-  XContext, non-kernel privilege checks, generated-lane translated physical
-  device routing, and the other fault classes plus remaining
+  exists. Multiple matches remain loud. Data-side Status.KSU plus UX/SX/KX now
+  classify the documented 64-bit XUSEG/XKSSEG/XKUSEG, XSSEG, XKPHYS, and XKSEG
+  ranges. Mapped spaces compare EntryHi.Region plus VA[39:13]; width/privilege
+  failures return typed AdEL/AdES, and extended refill entry updates full
+  BadVAddr, Context, XContext, and EntryHi before selecting the XTLB vector.
+  Silicon-exact Random timing, 64-bit instruction-PC/catalog identity,
+  generated-lane translated physical device routing, and the other fault classes plus remaining
   CP0/FPU/controller/save behavior remain open.
 - [~] **U6 general RSP/RDP** — the F3DEX2 reference lane now emits ordered
   triangle/color-image/fill/full-sync operations and executes all three legal

@@ -1101,6 +1101,15 @@ stores `coverage - 1`: its high bit occupies the visible word's LSB and its
 low two bits share the physical-address hidden-bit sidecar with depth DeltaZ.
 RGBA32 instead stores those three bits in the alpha byte's MSBs and the
 five-bit memory alpha in its LSBs, so it does not consume the hidden sidecar.
+Programming Manual Chapter 15's mode-bit table defines `IM_RD` as the enable
+for framebuffer color/coverage read-modify-write access. The reference path
+now represents that access as an optional typed memory sample: with `IM_RD`
+clear, Clamp and Wrap write only the new pixel coverage and cannot wrap from
+prior coverage; Full still writes full coverage and Save still suppresses the
+coverage write. A framebuffer color or coverage-alpha blender selector with
+`IM_RD` clear traps by the public bit name rather than silently observing the
+old framebuffer. Exhaustive destination/AA/force-blend sweeps plus matching
+raw-coefficient and high-level partial triangles cover this gate.
 The disabled-dither store truncates eight-bit components to those five-bit
 fields; it does not round to the nearest bit-replicated display value.
 An observed CPU-visible word change reconstructs both hidden bits from the new

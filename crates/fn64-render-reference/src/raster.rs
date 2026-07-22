@@ -209,6 +209,18 @@ struct CoverageResult {
     blend_enabled: bool,
 }
 
+/// Framebuffer color/coverage made available to the blender by `IM_RD`.
+///
+/// Programming Manual Chapter 15, "Mode Bit Descriptions," defines `IM_RD`
+/// as enabling the color/coverage read-modify-write access. Keeping the old
+/// sample optional prevents a disabled read from remaining accidentally
+/// observable through either a framebuffer color mux or `G_BL_A_MEM`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ReadFramebufferMemory {
+    rgba: [u8; 4],
+    coverage: Coverage,
+}
+
 /// Publicly specified routing between coverage wrap and the four Z modes.
 ///
 /// Programming Manual Chapter 15, "Blender Modes and Assumptions," requires
@@ -246,22 +258,33 @@ fn depth_coverage_decision(
 }
 
 fn coverage_result(pixel: Coverage, memory: Coverage, other_mode: OtherMode) -> CoverageResult {
-    let sum = pixel.count() + memory.count();
-    let wraps = sum > Coverage::FULL.count();
+    let image_read = other_mode.image_read_enabled();
+    let sum = if image_read {
+        pixel.count() + memory.count()
+    } else {
+        pixel.count()
+    };
+    let wraps = image_read && sum > Coverage::FULL.count();
     let blend_enabled = other_mode.force_blend() || (other_mode.antialias_enabled() && !wraps);
     let destination = match other_mode.coverage_destination() {
         CoverageDestination::Clamp => {
-            if blend_enabled {
+            if image_read && blend_enabled {
                 Coverage::new(sum.min(Coverage::FULL.count()))
             } else {
                 pixel
             }
         }
-        CoverageDestination::Wrap => Coverage::new(if wraps {
-            sum - Coverage::FULL.count()
-        } else {
-            sum
-        }),
+        CoverageDestination::Wrap => {
+            if image_read {
+                Coverage::new(if wraps {
+                    sum - Coverage::FULL.count()
+                } else {
+                    sum
+                })
+            } else {
+                pixel
+            }
+        }
         CoverageDestination::Full => Coverage::FULL,
         CoverageDestination::Save => memory,
     };
@@ -1440,13 +1463,19 @@ impl Framebuffer {
             return false;
         }
         let pix = (y as u32 * self.width + x as u32) as usize;
+        let memory = other_mode.image_read_enabled().then(|| {
+            let idx = pix * 4;
+            ReadFramebufferMemory {
+                rgba: self.pixels[idx..idx + 4].try_into().unwrap(),
+                coverage: self.coverage[pix],
+            }
+        });
         let result = coverage_result(fragment.coverage, self.coverage[pix], other_mode);
         self.coverage[pix] = result.destination;
         if other_mode.clear_on_coverage() && !result.wraps {
             return false;
         }
         let idx = pix * 4;
-        let dst = self.pixels[idx..idx + 4].try_into().unwrap();
         let mut rgba = fragment.rgba;
         rgba[3] = apply_alpha_dither(
             rgba[3],
@@ -1458,11 +1487,10 @@ impl Framebuffer {
         );
         let out = blend_fragment(
             rgba,
-            dst,
+            memory,
             fragment.shade_alpha,
             blender,
             result.blend_enabled,
-            result.memory,
         );
         let out = apply_rgb_dither(out, other_mode.rgb_dither(), x, y, fragment.noise);
         self.pixels[idx..idx + 4].copy_from_slice(&out);
@@ -1511,6 +1539,13 @@ impl Framebuffer {
             return false;
         }
         let pix = (y as u32 * self.width + x as u32) as usize;
+        let memory = other_mode.image_read_enabled().then(|| {
+            let idx = pix * 4;
+            ReadFramebufferMemory {
+                rgba: self.pixels[idx..idx + 4].try_into().unwrap(),
+                coverage: self.coverage[pix],
+            }
+        });
         let coverage = coverage_result(fragment.coverage, self.coverage[pix], other_mode);
         let passes_depth = if !depth.compare {
             true
@@ -1548,7 +1583,6 @@ impl Framebuffer {
                 return false;
             }
             let idx = pix * 4;
-            let dst = self.pixels[idx..idx + 4].try_into().unwrap();
             let mut rgba = fragment.rgba;
             rgba[3] = apply_alpha_dither(
                 rgba[3],
@@ -1560,11 +1594,10 @@ impl Framebuffer {
             );
             let out = blend_fragment(
                 rgba,
-                dst,
+                memory,
                 fragment.shade_alpha,
                 blender,
                 coverage.blend_enabled,
-                coverage.memory,
             );
             let out = apply_rgb_dither(out, other_mode.rgb_dither(), x, y, fragment.noise);
             // The fragment pipeline is combiner -> alpha compare -> depth
@@ -2382,11 +2415,10 @@ fn copy_alpha_compare_value(
 /// `shared/rt64_blender.h:68-81,366-504`.
 fn blend_fragment(
     src: [u8; 4],
-    dst: [u8; 4],
+    memory: Option<ReadFramebufferMemory>,
     shade_alpha: u8,
     state: BlenderState,
     blend_enabled: bool,
-    memory_coverage: Coverage,
 ) -> [u8; 4] {
     if state.cycle_count == 0 {
         return src;
@@ -2405,7 +2437,7 @@ fn blend_fragment(
         // arrangement). RT64's cycle count/bypass has the same structure at
         // shared/rt64_blender.h:45-65,370-383.
         if is_last && !blend_enabled {
-            blender_rgb = blend_color(cycle.p, src_rgb, dst, state, blender_rgb, cycle_index);
+            blender_rgb = blend_color(cycle.p, src_rgb, memory, state, blender_rgb, cycle_index);
             final_alpha = if cycle.p == BlendColorInput::Framebuffer {
                 0.0
             } else {
@@ -2415,8 +2447,8 @@ fn blend_fragment(
         }
 
         let a = blend_a(cycle.a, src[3], shade_alpha, state.fog_color[3]);
-        let p = blend_color(cycle.p, src_rgb, dst, state, blender_rgb, cycle_index);
-        let m = blend_color(cycle.m, src_rgb, dst, state, blender_rgb, cycle_index);
+        let p = blend_color(cycle.p, src_rgb, memory, state, blender_rgb, cycle_index);
+        let m = blend_color(cycle.m, src_rgb, memory, state, blender_rgb, cycle_index);
 
         // RT64 emits framebuffer terms through dual-source alpha blending
         // (`rt64_blender.h:414-424`; `rt64_raster_shader.cpp:332-339`). This
@@ -2430,7 +2462,7 @@ fn blend_fragment(
             blender_rgb = p;
             final_alpha = a;
         } else {
-            let b = blend_b(cycle.b, a, memory_coverage);
+            let b = blend_b(cycle.b, a, memory);
             if a == 0.0 {
                 blender_rgb = m;
             } else if b == 0.0 {
@@ -2446,14 +2478,21 @@ fn blend_fragment(
         }
     }
 
+    let dst = memory.map(|sample| sample.rgba);
+    assert!(
+        dst.is_some() || final_alpha == 1.0,
+        "IM_RD-disabled blender produced a framebuffer-dependent composite"
+    );
     let mut out_rgb = [0u8; 3];
     for channel in 0..3 {
+        let memory_channel = dst.map_or(0.0, |rgba| rgba[channel] as f32);
         out_rgb[channel] = (blender_rgb[channel] * final_alpha
-            + dst[channel] as f32 * (1.0 - final_alpha))
+            + memory_channel * (1.0 - final_alpha))
             .round()
             .clamp(0.0, 255.0) as u8;
     }
-    let alpha = (255.0 * final_alpha + dst[3] as f32 * (1.0 - final_alpha))
+    let memory_alpha = dst.map_or(0.0, |rgba| rgba[3] as f32);
+    let alpha = (255.0 * final_alpha + memory_alpha * (1.0 - final_alpha))
         .round()
         .clamp(0.0, 255.0) as u8;
     [out_rgb[0], out_rgb[1], out_rgb[2], alpha]
@@ -2462,7 +2501,7 @@ fn blend_fragment(
 fn blend_color(
     input: BlendColorInput,
     src_rgb: [f32; 3],
-    dst: [u8; 4],
+    memory: Option<ReadFramebufferMemory>,
     state: BlenderState,
     blender_rgb: [f32; 3],
     cycle_index: usize,
@@ -2470,7 +2509,10 @@ fn blend_color(
     match input {
         BlendColorInput::Combined if cycle_index == 0 => src_rgb,
         BlendColorInput::Combined => blender_rgb,
-        BlendColorInput::Framebuffer => [dst[0] as f32, dst[1] as f32, dst[2] as f32],
+        BlendColorInput::Framebuffer => {
+            let rgba = read_framebuffer_memory(memory, "framebuffer color").rgba;
+            [rgba[0] as f32, rgba[1] as f32, rgba[2] as f32]
+        }
         BlendColorInput::Blend => [
             state.blend_color[0] as f32,
             state.blend_color[1] as f32,
@@ -2494,13 +2536,30 @@ fn blend_a(input: BlendAlphaInput, combined: u8, shade: u8, fog: u8) -> f32 {
     value as f32 / 255.0
 }
 
-fn blend_b(input: BlendBInput, a: f32, memory_coverage: Coverage) -> f32 {
+fn blend_b(input: BlendBInput, a: f32, memory: Option<ReadFramebufferMemory>) -> f32 {
     match input {
         BlendBInput::OneMinusA => 1.0 - a,
-        BlendBInput::FramebufferAlpha => memory_coverage.count() as f32 / 8.0,
+        BlendBInput::FramebufferAlpha => {
+            read_framebuffer_memory(memory, "framebuffer coverage alpha")
+                .coverage
+                .count() as f32
+                / 8.0
+        }
         BlendBInput::One => 1.0,
         BlendBInput::Zero => 0.0,
     }
+}
+
+fn read_framebuffer_memory(
+    memory: Option<ReadFramebufferMemory>,
+    selector: &str,
+) -> ReadFramebufferMemory {
+    memory.unwrap_or_else(|| {
+        crate::render_unsupported_panic(
+            "render.reference.raster.image-read-disabled",
+            format!("blender selects {selector} while IM_RD is disabled"),
+        )
+    })
 }
 
 fn edge(a: Vertex, b: Vertex, c: Vertex) -> f32 {
@@ -4404,7 +4463,7 @@ mod tests {
                 v(12.0, 2.0, 255, 0, 0, 128),
                 v(7.0, 12.0, 255, 0, 0, 128),
             ],
-            other_mode: OtherMode::from_raw(0xf0, 0x4000, 0),
+            other_mode: OtherMode::from_raw(0xf0, 0x4040, 0),
             blender: standard_alpha_blender(1),
             ..Default::default()
         };
@@ -4443,11 +4502,13 @@ mod tests {
         assert_eq!(
             blend_fragment(
                 [255, 0, 0, 128],
-                [0, 0, 0, 255],
+                Some(ReadFramebufferMemory {
+                    rgba: [0, 0, 0, 255],
+                    coverage: Coverage::FULL,
+                }),
                 128,
                 state,
                 true,
-                Coverage::FULL,
             ),
             [64, 64, 127, 255]
         );
@@ -4481,11 +4542,13 @@ mod tests {
         assert_eq!(
             blend_fragment(
                 [0, 0, 255, 255],
-                [0, 255, 0, 255],
+                Some(ReadFramebufferMemory {
+                    rgba: [0, 255, 0, 255],
+                    coverage: Coverage::FULL,
+                }),
                 64,
                 fog_then_pass,
                 false,
-                Coverage::FULL,
             ),
             [64, 0, 191, 255]
         );
@@ -4838,7 +4901,7 @@ mod tests {
                     update: false,
                     mode: crate::gbi::DepthMode::Interpenetrating,
                 },
-                OtherMode::from_raw(0, 0x0110, 0),
+                OtherMode::from_raw(0, 0x0150, 0),
             );
         }))
         .expect_err("wrapping ZMODE_INTER must trap before rendering");
@@ -5434,34 +5497,184 @@ mod tests {
         let pixel = Coverage::new(3);
         let memory = Coverage::new(5);
 
-        let clamp_blend = coverage_result(pixel, memory, mode(0x0008));
+        let clamp_blend = coverage_result(pixel, memory, mode(0x0048));
         assert!(clamp_blend.blend_enabled);
         assert!(!clamp_blend.wraps);
         assert_eq!(clamp_blend.destination, Coverage::FULL);
 
-        let clamp_new = coverage_result(pixel, Coverage::new(6), mode(0x0008));
+        let clamp_new = coverage_result(pixel, Coverage::new(6), mode(0x0048));
         assert!(!clamp_new.blend_enabled);
         assert!(clamp_new.wraps);
         assert_eq!(clamp_new.destination, pixel);
 
-        let force_clamp = coverage_result(pixel, Coverage::new(6), mode(0x4000));
+        let force_clamp = coverage_result(pixel, Coverage::new(6), mode(0x4040));
         assert!(force_clamp.blend_enabled);
         assert_eq!(force_clamp.destination, Coverage::FULL);
 
-        let wrap_at_unity = coverage_result(pixel, memory, mode(0x0100));
+        let wrap_at_unity = coverage_result(pixel, memory, mode(0x0140));
         assert!(!wrap_at_unity.wraps);
         assert_eq!(wrap_at_unity.destination, Coverage::FULL);
-        let wrap_over_unity = coverage_result(pixel, Coverage::new(6), mode(0x0100));
+        let wrap_over_unity = coverage_result(pixel, Coverage::new(6), mode(0x0140));
         assert!(wrap_over_unity.wraps);
         assert_eq!(wrap_over_unity.destination, Coverage::new(1));
 
         assert_eq!(
-            coverage_result(pixel, memory, mode(0x0200)).destination,
+            coverage_result(pixel, memory, mode(0x0240)).destination,
             Coverage::FULL
         );
         assert_eq!(
-            coverage_result(pixel, memory, mode(0x0300)).destination,
+            coverage_result(pixel, memory, mode(0x0340)).destination,
             memory
+        );
+    }
+
+    #[test]
+    fn image_read_disabled_coverage_sweep_never_merges_prior_coverage() {
+        for destination in 0u32..4 {
+            for antialias in [false, true] {
+                for force_blend in [false, true] {
+                    let low = (destination << 8)
+                        | if antialias { 0x0008 } else { 0 }
+                        | if force_blend { 0x4000 } else { 0 };
+                    let mode = OtherMode::from_raw(0, low, 0);
+                    assert!(!mode.image_read_enabled());
+                    for pixel_count in 1..=Coverage::FULL.count() {
+                        for memory_count in 1..=Coverage::FULL.count() {
+                            let pixel = Coverage::new(pixel_count);
+                            let memory = Coverage::new(memory_count);
+                            let result = coverage_result(pixel, memory, mode);
+                            assert!(!result.wraps);
+                            assert_eq!(result.blend_enabled, force_blend || antialias);
+                            let expected = match mode.coverage_destination() {
+                                CoverageDestination::Clamp | CoverageDestination::Wrap => pixel,
+                                CoverageDestination::Full => Coverage::FULL,
+                                // SAVE suppresses the coverage write. Retaining
+                                // the host-side sample is not an RDP memory read.
+                                CoverageDestination::Save => memory,
+                            };
+                            assert_eq!(
+                                result.destination, expected,
+                                "IM_RD-off destination differs for destination={destination} aa={antialias} force={force_blend} pixel={pixel_count} memory={memory_count}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_and_high_level_partial_coverage_obey_image_read_gate() {
+        let raw_edge = crate::gbi::RdpEdgeCoefficients {
+            right_major: true,
+            level: 0,
+            tile: 0,
+            yl: 4,
+            ym: 0,
+            yh: 0,
+            xl: 0,
+            dxldy: 0,
+            xh: Q16_ONE as i32 / 2,
+            dxhdy: 0,
+            xm: 0,
+            dxmdy: 0,
+        };
+        assert_eq!(
+            raw_pixel_coverage(raw_edge, ScissorRect::framebuffer(1, 1), 0, 0).coverage(),
+            Coverage::new(4)
+        );
+        let high_vertices = [
+            v(-10.0, -10.0, 255, 0, 0, 255),
+            v(0.5, -10.0, 255, 0, 0, 255),
+            v(0.5, 10.0, 255, 0, 0, 255),
+        ];
+        assert_eq!(
+            triangle_pixel_coverage(
+                high_vertices,
+                edge(high_vertices[0], high_vertices[1], high_vertices[2]),
+                ScissorRect::framebuffer(1, 1),
+                0,
+                0,
+            )
+            .coverage(),
+            Coverage::new(4)
+        );
+
+        for image_read in [false, true] {
+            for raw in [false, true] {
+                for memory_count in [2, 6] {
+                    let low = 0x0100 | if image_read { 0x0040 } else { 0 };
+                    let other_mode = OtherMode::from_raw(0xf0, low, 0);
+                    let mut framebuffer = Framebuffer::new(1, 1);
+                    framebuffer.clear(0, 0, 255, 255);
+                    framebuffer.coverage[0] = Coverage::new(memory_count);
+                    if raw {
+                        framebuffer.draw_raw_rdp_triangle_no_depth(&RawRdpTriangle {
+                            edge: raw_edge,
+                            shade: None,
+                            texture_coefficients: None,
+                            z: None,
+                            texture: None,
+                            other_mode,
+                            combiner: CombinerState {
+                                primitive: [255, 0, 0, 255],
+                                ..CombinerState::default()
+                            },
+                            blender: BlenderState::default(),
+                            scissor: None,
+                        });
+                    } else {
+                        framebuffer.draw_triangle_no_depth_culled(
+                            &Triangle {
+                                v: high_vertices,
+                                other_mode,
+                                ..Triangle::default()
+                            },
+                            CullMode::None,
+                        );
+                    }
+
+                    assert_eq!(&framebuffer.pixels[..4], &[255, 0, 0, 255]);
+                    let expected = if !image_read {
+                        4
+                    } else if memory_count == 2 {
+                        6
+                    } else {
+                        2
+                    };
+                    assert_eq!(
+                        framebuffer.coverage[0],
+                        Coverage::new(expected),
+                        "raw={raw} IM_RD={image_read} memory={memory_count}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn image_read_disabled_memory_blender_traps_by_public_bit_name() {
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        let panic = std::panic::catch_unwind(|| {
+            blend_fragment([255, 0, 0, 128], None, 128, standard_alpha_blender(1), true)
+        })
+        .expect_err("a framebuffer color selector without IM_RD must trap");
+        let panic = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("unsupported raster panic payload must be text");
+        assert!(panic.contains("blender selects framebuffer color while IM_RD is disabled"));
+
+        let events = fn64_runtime::copy_unsupported_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].operation,
+            "render.reference.raster.image-read-disabled"
+        );
+        assert_eq!(
+            events[0].disposition,
+            fn64_runtime::UnsupportedDisposition::LoudTrap
         );
     }
 
@@ -5571,7 +5784,7 @@ mod tests {
         let mut framebuffer = Framebuffer::new(1, 1);
         framebuffer.clear(0, 0, 255, 255);
         framebuffer.coverage[0] = Coverage::new(3);
-        let mode = OtherMode::from_raw(0, 0x4180, 0);
+        let mode = OtherMode::from_raw(0, 0x41c0, 0);
 
         assert!(!framebuffer.set_blended(
             0,
@@ -5630,7 +5843,7 @@ mod tests {
                     update: false,
                     mode: crate::gbi::DepthMode::Opaque,
                 },
-                OtherMode::from_raw(0, 0x0110, 0),
+                OtherMode::from_raw(0, 0x0150, 0),
             )
         };
 

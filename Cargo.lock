@@ -734,6 +734,7 @@ dependencies = [
 name = "fn64-certification"
 version = "0.0.0"
 dependencies = [
+ "fn64-boot-harness",
  "fn64-render",
  "fn64-render-reference",
  "fn64-render-rt64",

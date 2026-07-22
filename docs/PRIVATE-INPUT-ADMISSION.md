@@ -232,7 +232,7 @@ mechanism coverage from each validated committed-boundary report. A backend-
 recognized microcode family is diagnostic/optimization evidence only.
 Public-microcode credit requires independent exact digest-to-family
 adjudication by the immutable project-owned catalog v1, which is currently
-empty pending allowed-source digest provenance; matrix v17 therefore cannot yet
+empty pending allowed-source digest provenance; matrix v18 therefore cannot yet
 satisfy any public-microcode requirement. Schema v22 binds RT64's resolved
 graphics API independently of the requested settings and derives
 `macos-metal` or `linux-vulkan` target credit only from an authoritative
@@ -421,7 +421,7 @@ capabilities created by jointly revalidating the admitted contract, exact-ten
 receipt, retained reports/journals, raw ROM, runner image, bound files, and
 program-build receipt. It requires exact semantic-report and ordered run-event
 agreement with the matrix evidence and retains
-`fn64.verified-rom-class-authority.v1` in matrix v17. That record's digest
+`fn64.verified-rom-class-authority.v1` in matrix v18. That record's digest
 detects later drift; it is not a signature and does not replace external
 attestation when transferable provenance is required.
 

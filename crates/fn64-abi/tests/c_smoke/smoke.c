@@ -99,14 +99,16 @@ int main(void) {
     RecompContext init_ctx = {0};
     osInitialize_recomp(rdram, &init_ctx);
 
-    // Controller Manager signatures: initialize the manager and select one
-    // channel. osPfsIsPlug is synchronous and therefore requires a live guest
-    // coroutine; retaining its address still forces the C linker to resolve
-    // the exact exported shim without invoking it outside that contract.
-    RecompContext cont_init_ctx = {0};
-    cont_init_ctx.r5 = 0x80000020;
-    cont_init_ctx.r6 = 0x80000030;
-    osContInit_recomp(rdram, &cont_init_ctx);
+    // Controller Manager signatures: initialization and osPfsIsPlug are
+    // synchronous and therefore require a live guest coroutine. Retaining
+    // their addresses still forces the C linker to resolve the exact exported
+    // shims without invoking either outside that contract.
+    void (*volatile cont_init_fn)(uint8_t *, RecompContext *) =
+        osContInit_recomp;
+    if (cont_init_fn == NULL) {
+        fprintf(stderr, "osContInit_recomp: unresolved function address\n");
+        return 1;
+    }
     RecompContext set_ch_ctx = {0};
     set_ch_ctx.r4 = 1;
     osContSetCh_recomp(rdram, &set_ch_ctx);

@@ -1408,7 +1408,7 @@ fn emit_bank_address_exception(
     let _ = writeln!(out, "                        instruction_code: 0,");
     let _ = writeln!(
         out,
-        "                        bad_vaddr: Some(effective_address as u32),"
+        "                        bad_vaddr: Some(effective_address),"
     );
     let _ = writeln!(out, "                        coprocessor: None,");
     let _ = writeln!(out, "                    }},");
@@ -1595,7 +1595,7 @@ impl MemFault {
                 branch_delay,
                 retired,
             } => format!(
-                "let __tlb = __fa.is_tlb(); let __kind = __fa.into_cpu_fault_kind(GuestPc::new({epc:#010X}), {branch_delay}); if __tlb {{ if !{branch_delay} {{ executed += 1; }} return BlockRun::new(BlockExit::Fault(CpuFault {{ at: ExecutionKey::new(expected_bank, GuestPc::new({pc:#010X})), kind: __kind }}), executed); }} return BlockRun::new(BlockExit::Fault(CpuFault {{ at: ExecutionKey::new(expected_bank, GuestPc::new({pc:#010X})), kind: __kind }}), {retired});"
+                "let __architectural = __fa.is_architectural_exception(); let __kind = __fa.into_cpu_fault_kind(GuestPc::new({epc:#010X}), {branch_delay}); if __architectural {{ if !{branch_delay} {{ executed += 1; }} return BlockRun::new(BlockExit::Fault(CpuFault {{ at: ExecutionKey::new(expected_bank, GuestPc::new({pc:#010X})), kind: __kind }}), executed); }} return BlockRun::new(BlockExit::Fault(CpuFault {{ at: ExecutionKey::new(expected_bank, GuestPc::new({pc:#010X})), kind: __kind }}), {retired});"
             ),
         }
     }
@@ -2253,7 +2253,7 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
                 out,
                 format!("ctx.set_r32({}, ctx.read_cop0(1) as i32);", rt),
             ),
-            0 | 2 | 3 | 4 | 5 | 6 | 8 | 10 | 12 | 13 | 14 | 18 | 19 | 30 => line(
+            0 | 2 | 3 | 4 | 5 | 6 | 8 | 10 | 12 | 13 | 14 | 18 | 19 | 20 | 30 => line(
                 out,
                 format!("ctx.set_r32({}, ctx.read_cop0({}) as i32);", rt, cop0d),
             ),
@@ -2272,17 +2272,29 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
                 format!("unsupported mtc0 to COP0 register {other}"),
             ),
         },
+        Dmfc0 { rt, cop0d }
+            if matches!(mem_fault, MemFault::Fault { .. }) && matches!(cop0d, 8 | 10 | 20) =>
+        {
+            line(
+                out,
+                format!("ctx.set_r({}, ctx.read_cop0_64({}));", rt, cop0d),
+            )
+        }
+        Dmtc0 { rt, cop0d }
+            if matches!(mem_fault, MemFault::Fault { .. }) && matches!(cop0d, 10 | 20) =>
+        {
+            line(
+                out,
+                format!("ctx.write_cop0_64({}, {});", cop0d, r(rt)),
+            )
+        }
         Dmfc0 { cop0d, .. } => unsupported(
             out,
-            format!(
-                "unsupported dmfc0 from COP0 register {cop0d} (64-bit privileged access)"
-            ),
+            format!("unsupported dmfc0 from COP0 register {cop0d}"),
         ),
         Dmtc0 { cop0d, .. } => unsupported(
             out,
-            format!(
-                "unsupported dmtc0 to COP0 register {cop0d} (64-bit privileged access)"
-            ),
+            format!("unsupported dmtc0 to COP0 register {cop0d}"),
         ),
         Eret => unsupported(
             out,

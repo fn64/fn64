@@ -22,3 +22,6 @@ sha2 = "0.10"
 
 [dev-dependencies]
 fn64-render = { path = "../fn64-render" }
+
+[build-dependencies]
+sha2 = "0.10"

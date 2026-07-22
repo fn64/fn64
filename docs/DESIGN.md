@@ -295,7 +295,7 @@ opaque capability produced by jointly revalidating the policy-admitted v3
 contract, exact-ten receipt, retained reports/journals, raw ROM, runner image,
 and bound inputs. It exact-matches the v22 semantic report and ordered run-event
 identities, and retains a canonical `fn64.verified-rom-class-authority.v1`
-inside verified-matrix v17. The retained
+inside verified-matrix v18. The retained
 self-hash proves canonical integrity, not signer identity or transferable
 process provenance.
 
@@ -757,7 +757,22 @@ task calls out:
   `osContSetCh(ch)` limits high-level query/read copies and `osPfsIsPlug` to
   ports `0..ch`, leaving query/read caller storage beyond that prefix untouched.
   A pre-init `osContSetCh` retains the four-channel default, and a count above
-  `MAXCONTROLLERS` traps. `osPfsIsPlug` validates that its caller-created
+  `MAXCONTROLLERS` traps. Controller initialization now validates the supplied
+  initialized, exclusively idle `OS_EVENT_SI` queue, encodes all four query
+  channels into the fabric-owned PIF RAM, blocks internally, and publishes its
+  bit pattern/status only after the timed SI completion wakes it. Subsequent
+  query/read starts validate the supplied event target and encode the manager's
+  current channel prefix into that same device-owned packet. Their getters
+  decode only the completed PIF RAM image: input changes after completion and
+  later `osContSetCh` calls cannot rewrite or expand an already-finished poll.
+  The fixed SI compatibility latency remains channel-independent because the
+  public manual gives only approximate per-channel savings, not an exact cycle
+  formula. Device evidence retains the exact pending request and complete PIF
+  command/response bytes without a host pointer. As elsewhere in the native-C
+  lane, `osContInit`'s suspended coroutine continuation (including its guest
+  output destinations) remains outside portable executor evidence; no broader
+  continuation claim follows from the device transaction. `osPfsIsPlug`
+  validates that its caller-created
   queue is the live `OS_EVENT_SI` target and is exclusively idle: queued
   messages and either blocked-receiver or blocked-sender role reject the call
   loudly, so an older waiter cannot steal its completion. It then enters the
@@ -1156,7 +1171,14 @@ task calls out:
   real artifact and is eligible, while compatibility AOT without one is not.
   Refill and invalid fetch faults retain exact EPC/BD, BadVAddr, Context/EntryHi,
   and refill/common vector selection. The legacy whole-function boundary,
-  64-bit spaces/XContext, and non-kernel privilege behavior remain loud.
+  64-bit instruction-PC/catalog identity, and translated physical device
+  routing remain loud. Data-side translation is wider: Status.KSU plus UX/SX/KX
+  classify the documented XUSEG/XKSSEG/XKUSEG, XSSEG, XKPHYS, and XKSEG ranges;
+  mapped spaces compare EntryHi.Region plus VA[39:13], while XKPHYS requires
+  VA[58:32]=0 before using PA[31:0]. Width/privilege violations become typed
+  AdEL/AdES. Extended refill entry preserves full BadVAddr and updates Context,
+  XContext, and EntryHi before selecting the first-level XTLB vector; nested
+  exceptions retain the common-vector rule.
   In the block
   lane, raw MI mask commands and RCP completion drive CPU IP2; the next
   instruction boundary applies the

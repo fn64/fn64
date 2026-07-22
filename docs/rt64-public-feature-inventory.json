@@ -177,7 +177,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 20, "needle": "60 FPS or above" },
         { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 989, "needle": "generateInterpolatedFrames" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_hfr_interpolation_behavior.rs", "line": 845, "needle": "fn main()", "claim_id": "hfr-60-plus-interpolation" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_hfr_interpolation_behavior.rs", "line": 846, "needle": "fn main()", "claim_id": "hfr-60-plus-interpolation" },
         { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/src/ffi.rs", "line": 4157, "needle": "fn cpp_vi_history_uses_context_region_rate_for_stable_factors", "claim_id": "hfr-60-plus-interpolation" },
         { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_region_rate_behavior.rs", "line": 161, "needle": "fn main()", "claim_id": "hfr-60-plus-interpolation" }
       ]
@@ -192,7 +192,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 21, "needle": "Extended command set" },
         { "kind": "pinned_source", "path": "include/rt64_extended_gbi.h", "line": 16, "needle": "RT64_HOOK_OP_ENABLE" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_extended_gbi_enhancement_behavior.rs", "line": 743, "needle": "fn run_once()", "claim_id": "extended-gbi" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_extended_gbi_enhancement_behavior.rs", "line": 744, "needle": "fn run_once()", "claim_id": "extended-gbi" }
       ]
     },
     {

@@ -909,6 +909,30 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         self.pif_ram[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
     }
 
+    /// Stage one complete Controller Manager command image in the physical
+    /// PIF RAM owned by this fabric. The caller must first acquire the SI
+    /// engine with a typed controller request; otherwise a failed overlap
+    /// could overwrite the command belonging to the live transfer.
+    pub fn stage_controller_pif_command(&mut self, command: [u8; 64]) {
+        assert!(
+            matches!(
+                self.pending_si_request(),
+                Some(SiDmaRequest {
+                    kind: SiDmaKind::ControllerQuery | SiDmaKind::ControllerRead,
+                    ..
+                })
+            ),
+            "controller PIF command staged without an accepted Controller Manager SI request"
+        );
+        self.pif_ram = command;
+    }
+
+    /// Exact physical PIF RAM image. Controller Manager getters decode only
+    /// this completed device-owned transaction, never a second live sample.
+    pub const fn pif_ram(&self) -> &[u8; 64] {
+        &self.pif_ram
+    }
+
     pub const fn ai_status(&self) -> u32 {
         let mut status = 0;
         if self.current_ai.is_some() {
@@ -1874,7 +1898,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                             rdram
                                 .dma_write_bytes(request.dram_addr.offset() as usize, &self.pif_ram)
                         }
-                        SiDmaKind::ControllerQuery | SiDmaKind::ControllerRead => {}
+                        SiDmaKind::ControllerQuery | SiDmaKind::ControllerRead => {
+                            execute_pif(self.now, &mut self.pif_ram, &mut self.pi_dma);
+                        }
                     }
                     self.record(DeviceTraceKind::SiBytesCommitted(request));
                     self.pending_si = None;

@@ -646,7 +646,8 @@ impl Interp<'_> {
         let next = site.pc.wrapping_add(4);
         let ok = Ok(Step::Fallthrough { next, retired: 1 });
         let mem_fault = |error: DataAccessError| {
-            let attempted = u32::from(error.is_tlb()) * if site.branch_delay { 2 } else { 1 };
+            let attempted = u32::from(error.is_architectural_exception())
+                * if site.branch_delay { 2 } else { 1 };
             StepFault::Cpu {
                 fault: CpuFault {
                     at: self.key(site.pc),
@@ -663,7 +664,7 @@ impl Interp<'_> {
                     epc: GuestPc::new(site.epc),
                     branch_delay: site.branch_delay,
                     instruction_code: 0,
-                    bad_vaddr: Some(addr as u32),
+                    bad_vaddr: Some(addr),
                     coprocessor: None,
                 },
             },
@@ -700,13 +701,18 @@ impl Interp<'_> {
                 let addr = Rdram::eff_addr(ctx.r(base), off);
                 let port_addr = match ctx
                     .translate_data_address(addr, DataAccessKind::Load)
-                    .map_err(|fault| mem_fault(DataAccessError::Tlb(fault)))?
+                    .map_err(mem_fault)?
                 {
                     TranslatedDataAddress::Direct(address) => Some(address),
-                    TranslatedDataAddress::Mapped(physical) if physical < 0x2000_0000 => {
+                    TranslatedDataAddress::DirectPhysical(physical)
+                    | TranslatedDataAddress::Mapped(physical)
+                        if physical < 0x2000_0000 =>
+                    {
                         Some(0xffff_ffff_a000_0000 | u64::from(physical))
                     }
-                    TranslatedDataAddress::Mapped(_) => None,
+                    TranslatedDataAddress::DirectPhysical(_) | TranslatedDataAddress::Mapped(_) => {
+                        None
+                    }
                 };
                 match port_addr.map_or(MmioOutcome::NotMmio, |address| port.read_w(address)) {
                     MmioOutcome::Handled(v) => {
@@ -724,13 +730,18 @@ impl Interp<'_> {
                 let addr = Rdram::eff_addr(ctx.r(base), off);
                 let port_addr = match ctx
                     .translate_data_address(addr, DataAccessKind::Store)
-                    .map_err(|fault| mem_fault(DataAccessError::Tlb(fault)))?
+                    .map_err(mem_fault)?
                 {
                     TranslatedDataAddress::Direct(address) => Some(address),
-                    TranslatedDataAddress::Mapped(physical) if physical < 0x2000_0000 => {
+                    TranslatedDataAddress::DirectPhysical(physical)
+                    | TranslatedDataAddress::Mapped(physical)
+                        if physical < 0x2000_0000 =>
+                    {
                         Some(0xffff_ffff_a000_0000 | u64::from(physical))
                     }
-                    TranslatedDataAddress::Mapped(_) => None,
+                    TranslatedDataAddress::DirectPhysical(_) | TranslatedDataAddress::Mapped(_) => {
+                        None
+                    }
                 };
                 match port_addr.map_or(MmioOutcome::NotMmio, |address| {
                     port.write_w(address, ctx.r_u32(rt))
@@ -1109,7 +1120,7 @@ fn exec_straight(
 
         // --- Modeled COP0/TLB management ---
         Mfc0 { rt, cop0d } => match cop0d {
-            0 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30 => {
+            0 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 20 | 30 => {
                 ctx.set_r32(rt, ctx.read_cop0(cop0d) as i32);
             }
             _ => return Err(unsupported()),
@@ -1120,6 +1131,12 @@ fn exec_straight(
             }
             _ => return Err(unsupported()),
         },
+        Dmfc0 { rt, cop0d } if matches!(cop0d, 8 | 10 | 20) => {
+            ctx.set_r(rt, ctx.read_cop0_64(cop0d));
+        }
+        Dmtc0 { rt, cop0d } if matches!(cop0d, 10 | 20) => {
+            ctx.write_cop0_64(cop0d, ctx.r_u64(rt));
+        }
         Tlbwi => ctx.tlbwi_record(),
         Tlbwr => ctx.tlbwr_record(),
         Tlbr => ctx.tlbr_read(),

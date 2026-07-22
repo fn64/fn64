@@ -30,8 +30,9 @@ pub use observation_evidence::{
     ObservationEvidenceError, ReleaseObservationGeometry,
 };
 pub use platform_certification::{
-    PlatformCertificationError, Rt64PlatformCase, Rt64PlatformTarget,
-    VerifiedRt64PlatformCaseAuthority, VerifiedRt64PlatformCaseSeries,
+    emit_rt64_platform_child_identity, run_rt64_platform_case_series, PlatformCertificationError,
+    Rt64PlatformCase, Rt64PlatformTarget, VerifiedRt64PlatformCaseAuthority,
+    VerifiedRt64PlatformCaseSeries, RT64_PLATFORM_CHILD_IDENTITY_SCHEMA,
     VERIFIED_RT64_PLATFORM_CASE_AUTHORITY_SCHEMA,
 };
 pub use private_release_series::{
@@ -464,7 +465,7 @@ pub struct ReleaseEnvironmentEvidence {
     pub renderer: ReleaseRendererEvidence,
 }
 
-const fn release_host_platform() -> Option<ReleaseHostPlatform> {
+pub(crate) const fn release_host_platform() -> Option<ReleaseHostPlatform> {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Some(ReleaseHostPlatform::MacosArm64)
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -476,7 +477,7 @@ const fn release_host_platform() -> Option<ReleaseHostPlatform> {
     }
 }
 
-fn release_host_identity(
+pub(crate) fn release_host_identity(
 ) -> Result<(ReleaseHostPlatform, Option<ReleaseWindowsVersionEvidence>), ViBoundaryError> {
     let platform = release_host_platform().ok_or(ViBoundaryError::UnsupportedReleasePlatform {
         os: std::env::consts::OS,
@@ -1751,12 +1752,27 @@ mod tests {
         let scheduled = fn64_abi::next_vi_deadline().unwrap();
         let boundary = commit_synthetic_boundary(scheduled).unwrap();
 
-        let mut rdram = vec![0u8; 4 * 6];
-        let mut context: fn64_abi::RecompContext = unsafe { std::mem::zeroed() };
-        context.r4 = 0x8000_0000;
-        unsafe {
-            fn64_abi::osContGetReadData_recomp(rdram.as_mut_ptr(), &mut context);
+        let operations_before = fn64_abi::copy_controller_operations().len();
+        let mut rdram = vec![0u8; 64];
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            view.write_u8(fn64_runtime::RdramAddr::from_offset(0), 1);
+            view.write_u8(fn64_runtime::RdramAddr::from_offset(1), 4);
+            view.write_u8(fn64_runtime::RdramAddr::from_offset(2), 0x01);
+            view.write_u8(fn64_runtime::RdramAddr::from_offset(7), 0xFE);
         }
+        let mut context: fn64_abi::RecompContext = unsafe { std::mem::zeroed() };
+        context.r4 = 1;
+        context.r5 = 0x8000_0000;
+        unsafe {
+            fn64_abi::__osSiRawStartDma_recomp(rdram.as_mut_ptr(), &mut context);
+        }
+        assert_eq!(context.r2, 0);
+        fn64_abi::advance_virtual_time(fn64_abi::next_device_deadline().unwrap());
+        assert_eq!(
+            fn64_abi::copy_controller_operations().len(),
+            operations_before + 1
+        );
 
         assert_eq!(
             boundary.validate_unconsumed(),
