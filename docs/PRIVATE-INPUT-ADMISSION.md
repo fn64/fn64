@@ -548,6 +548,8 @@ tracked repository files, symlinks, and report overwrite:
 ```sh
 python3 tools/private_input_admission.py --check
 python3 tools/private_input_admission.py --selftest
+python3 tools/private_input_admission.py --corpus-snapshot
+cargo test -p fn64-boot-harness shared_content_free_corpus_matches_rust_policy
 cargo test -p fn64-render-rt64 --test private_release_runner
 ```
 
@@ -555,8 +557,12 @@ The content-free `fn64.private-admission-rejection-corpus.v1` recipes add
 duplicate-object, path-replacement, case-alias, environment-injection,
 receipt/contract-tamper, and retained-schema cases without storing paths,
 hashes, or content identities. The Python producer executes every host-capable
-recipe. Rust currently has focused tests for the corresponding loader rules;
-consuming this shared recipe wire in Rust remains follow-up differential work.
+recipe and emits only its ordered recipe ID plus `accept`, `reject`, or
+capability `skip`. Rust strictly parses the same recipe wire, forces every
+`capability=all` recipe to execute, verifies an operation-specific native
+rejection cause so unrelated setup failures cannot satisfy a reject recipe,
+and produces the same content-free snapshot. On Unix the test suite executes
+both implementations and requires their ordered snapshots to match exactly.
 
 The Rust integration test makes the trusted runner launch ten fresh test
 processes. Every child executes the real executor, PI/SI/AI device fabric,
