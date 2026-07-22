@@ -356,22 +356,23 @@ big-endian lengths/counts, raw 32-byte hashes, and typed execution-source
 tags. This is integrity plus policy equivalence, not an authority signature.
 
 The Rust loader therefore does not accept a deserialized contract directly.
-It returns an opaque verified-contract type only after the repository policy
-script at `tools/private_input_admission.py` byte-matches the copy embedded in
-the runner. The runner resolves `/usr/bin/python3`, then feeds the embedded
-policy bytes directly to isolated Python over a pipe while it revalidates the
-full v7/v6 manifest/readiness/receipt/v3 contract mapping, including the
-strict retained v6/v5 branch; Python never reopens a
-mutable script path for execution. Repository-owned synthetic mechanism tests
+It returns an opaque verified-contract type only after the in-process Rust
+policy revalidates the full v7/v6 manifest/readiness/receipt/v3 contract
+mapping, including the strict retained v6/v5 branch. The contract and every
+referenced file are opened without following links; hashing, native-image
+inspection, and Unix execute-mode inspection use the retained descriptor or
+Windows handle, and object/path-chain identity is checked after the read.
+`tools/private_input_admission.py` remains the current create-new producer and
+a differential oracle, but the production loader neither embeds nor launches
+it. Repository-owned synthetic mechanism tests
 use a separate constructor that accepts only the exact fixed non-game
 manifest/readiness/input bytes, scenario, cycle, empty admitted-artifact set,
 `NoProgram` source, and current test executable. Caller-labelled synthetic
 input cannot mint authority.
 
-That pinned verifier path is presently a `/usr/bin/python3` system-layout
-boundary, not a cross-platform claim: hosts without that path, including
-Windows, fail closed until an equivalently pinned verifier is implemented.
-Retained verification also
+The in-process loader and its Windows handle implementation compile for
+`x86_64-pc-windows-msvc`; that removes the former `/usr/bin/python3` layout
+blocker but is not native Windows execution evidence. Retained verification also
 requires the exact runner image named by the receipt, so the certifying binary
 must be preserved alongside the receipt and evidence. The CLI's
 `--print-contract-sha256` mode recomputes integrity only; its output is never
@@ -391,10 +392,11 @@ F3DZEX2 XXH3 rows; the report event must then match the staged logical pair.
 This binds recognition without admitting F3DZEX2 HLE or minting
 public-microcode credit. Before every launch and after the series
 the runner rehashes the contract-bound files, child stage, and both pair
-stages. This is a local single-owner execution guarantee: a malicious same-UID
-process able to discover, chmod, and replace staged paths between verification
-and operating-system open/spawn is outside scope, as is replacement of the
-OS-owned resolved Python image. Each child gets a distinct derived event
+stages. The source contract itself is consumed from one stable captured
+descriptor; a later pathname replacement cannot change the bytes parsed by
+Rust. This is a local single-owner execution guarantee: a malicious same-UID
+process able to discover, chmod, and replace child or microcode stages between
+verification and operating-system open/spawn is outside scope. Each child gets a distinct derived event
 identity and new report/journal/log paths.
 The runner verifies each terminal v3 journal, exact v22
 scenario/cycle/input/source, the five fixed-cycle artifacts, live-minimum
@@ -548,6 +550,13 @@ python3 tools/private_input_admission.py --check
 python3 tools/private_input_admission.py --selftest
 cargo test -p fn64-render-rt64 --test private_release_runner
 ```
+
+The content-free `fn64.private-admission-rejection-corpus.v1` recipes add
+duplicate-object, path-replacement, case-alias, environment-injection,
+receipt/contract-tamper, and retained-schema cases without storing paths,
+hashes, or content identities. The Python producer executes every host-capable
+recipe. Rust currently has focused tests for the corresponding loader rules;
+consuming this shared recipe wire in Rust remains follow-up differential work.
 
 The Rust integration test makes the trusted runner launch ten fresh test
 processes. Every child executes the real executor, PI/SI/AI device fabric,
