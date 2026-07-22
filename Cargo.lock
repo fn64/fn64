@@ -741,7 +741,6 @@ dependencies = [
  "fn64-render-reference",
  "fn64-render-rt64",
  "fn64-runtime",
- "serde_json",
  "sha2",
 ]
 

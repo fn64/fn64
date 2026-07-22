@@ -571,13 +571,12 @@ enum StoredReadiness {
     V5(ReadinessV5),
 }
 
-#[derive(Clone, Debug)]
 struct AdmittedArtifact {
     descriptor: ArtifactDescriptor,
     measurement: StableFileMeasurement,
+    captured_contents: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug)]
 struct ValidatedManifest {
     schema: &'static str,
     purpose: Purpose,
@@ -600,6 +599,120 @@ pub(crate) struct CurrentPrivateAdmissionPayloads {
     pub(crate) readiness_bytes: Vec<u8>,
     pub(crate) contract_bytes: Option<Vec<u8>>,
     pub(crate) contract: Option<PrivateReleaseRunContract>,
+}
+
+/// Opaque, stable-handle capture of the two raw windows admitted for the
+/// repository-owned F3DZEX2 characterization suite.
+pub struct VerifiedPrivateF3dzex2CharacterizationInput {
+    text_raw_window: Box<[u8; 0x18d0]>,
+    data_raw_window: Box<[u8; 0x0fc0]>,
+}
+
+impl VerifiedPrivateF3dzex2CharacterizationInput {
+    pub fn raw_text_window(&self) -> &[u8] {
+        &*self.text_raw_window
+    }
+
+    pub fn raw_data_window(&self) -> &[u8] {
+        &*self.data_raw_window
+    }
+}
+
+/// Content-free public failure for private characterization admission. The
+/// detailed policy error can contain private paths and therefore remains
+/// inside this crate.
+pub struct PrivateF3dzex2CharacterizationError;
+
+impl fmt::Debug for PrivateF3dzex2CharacterizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PrivateF3dzex2CharacterizationError")
+    }
+}
+
+impl fmt::Display for PrivateF3dzex2CharacterizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("private F3DZEX2 characterization admission failed")
+    }
+}
+
+impl std::error::Error for PrivateF3dzex2CharacterizationError {}
+
+/// Revalidate a current F3DZEX2 characterization manifest and its canonical
+/// content-free readiness report, returning only the raw bytes captured from
+/// the stable descriptors used by admission.
+pub fn load_private_f3dzex2_characterization_input(
+    manifest_path: impl AsRef<Path>,
+    readiness_path: impl AsRef<Path>,
+) -> Result<VerifiedPrivateF3dzex2CharacterizationInput, PrivateF3dzex2CharacterizationError> {
+    load_private_f3dzex2_characterization_input_inner(
+        manifest_path.as_ref(),
+        readiness_path.as_ref(),
+    )
+    .map_err(|_| PrivateF3dzex2CharacterizationError)
+}
+
+fn validate_current_v7_manifest(
+    repository: &PrivateRepository,
+    manifest_contents: &[u8],
+) -> Result<(ValidatedManifest, Vec<u8>), PrivateInputAdmissionError> {
+    let stored = parse_manifest(manifest_contents, "manifest")?;
+    let StoredManifest::V7(manifest) = stored else {
+        return Err(error(format!(
+            "new admission requires schema {MANIFEST_SCHEMA:?}; retained {LEGACY_MANIFEST_SCHEMA:?} is read-only"
+        )));
+    };
+    let validated = validate_manifest_v7(repository, *manifest)?;
+    let readiness = derive_readiness(&validated)?;
+    validate_readiness(&readiness)?;
+    let readiness_bytes = serialize_json_document(&readiness, "readiness report")?;
+    Ok((validated, readiness_bytes))
+}
+
+fn load_private_f3dzex2_characterization_input_inner(
+    manifest_path: &Path,
+    readiness_path: &Path,
+) -> Result<VerifiedPrivateF3dzex2CharacterizationInput, PrivateInputAdmissionError> {
+    let repository = map_fs(PrivateRepository::discover(), "discover fn64 repository")?;
+    let manifest_read = read_private_file(&repository, manifest_path, "manifest")?;
+    let (mut validated, expected_readiness) =
+        validate_current_v7_manifest(&repository, &manifest_read.contents)?;
+    if validated.purpose != Purpose::F3dzex2Characterization {
+        return Err(error(
+            "private admission purpose is not f3dzex2_characterization",
+        ));
+    }
+
+    let supplied_readiness = read_private_file(&repository, readiness_path, "readiness report")?;
+    if supplied_readiness.contents != expected_readiness {
+        return Err(error(
+            "supplied readiness does not match current F3DZEX2 admission",
+        ));
+    }
+
+    let mut take_window = |role: ArtifactRole| {
+        validated
+            .artifacts
+            .remove(&role)
+            .and_then(|artifact| artifact.captured_contents)
+            .ok_or_else(|| {
+                error(format!(
+                    "admitted {} bytes were not captured from the stable descriptor",
+                    role.wire_name()
+                ))
+            })
+    };
+    let text_raw_window = take_window(ArtifactRole::MicrocodeTextRawWindow)?
+        .into_boxed_slice()
+        .try_into()
+        .map_err(|_| error("admitted F3DZEX2 text window geometry changed after validation"))?;
+    let data_raw_window = take_window(ArtifactRole::MicrocodeDataRawWindow)?
+        .into_boxed_slice()
+        .try_into()
+        .map_err(|_| error("admitted F3DZEX2 data window geometry changed after validation"))?;
+    Ok(VerifiedPrivateF3dzex2CharacterizationInput {
+        text_raw_window,
+        data_raw_window,
+    })
 }
 
 /// Opaque production authority reconstructed by replaying a retained v3
@@ -626,16 +739,8 @@ pub(crate) fn admit_current_v7_manifest(
     let repository = map_fs(PrivateRepository::discover(), "discover fn64 repository")?;
     validate_private_output_path(&repository, readiness_path, "readiness output")?;
     let manifest_read = read_private_file(&repository, manifest_path, "manifest")?;
-    let stored = parse_manifest(&manifest_read.contents, "manifest")?;
-    let StoredManifest::V7(manifest) = stored else {
-        return Err(error(format!(
-            "new admission requires schema {MANIFEST_SCHEMA:?}; retained {LEGACY_MANIFEST_SCHEMA:?} is read-only"
-        )));
-    };
-    let validated = validate_manifest_v7(&repository, *manifest)?;
-    let readiness = derive_readiness(&validated)?;
-    validate_readiness(&readiness)?;
-    let readiness_bytes = serialize_json_document(&readiness, "readiness report")?;
+    let (validated, readiness_bytes) =
+        validate_current_v7_manifest(&repository, &manifest_read.contents)?;
 
     let (contract, contract_bytes) = if validated.purpose.is_private_run() {
         let mut contract = build_private_run_contract(
@@ -877,14 +982,8 @@ fn validate_manifest_common(
     let mut artifacts = BTreeMap::new();
     for (role, descriptor) in descriptors {
         if let Some(descriptor) = descriptor {
-            let measurement = validate_artifact(repository, role, &descriptor)?;
-            artifacts.insert(
-                role,
-                AdmittedArtifact {
-                    descriptor,
-                    measurement,
-                },
-            );
+            let artifact = validate_artifact(repository, role, descriptor)?;
+            artifacts.insert(role, artifact);
         }
     }
     validate_artifact_denominator(purpose, program_lane, rom_class, &artifacts)?;
@@ -948,8 +1047,8 @@ fn validate_release_policy(
 fn validate_artifact(
     repository: &PrivateRepository,
     role: ArtifactRole,
-    descriptor: &ArtifactDescriptor,
-) -> Result<StableFileMeasurement, PrivateInputAdmissionError> {
+    descriptor: ArtifactDescriptor,
+) -> Result<AdmittedArtifact, PrivateInputAdmissionError> {
     if descriptor.git_identity != "excluded" {
         return Err(error(format!(
             "artifacts.{}.git_identity must be 'excluded'",
@@ -988,18 +1087,25 @@ fn validate_artifact(
         &descriptor.sha256,
         &format!("artifacts.{}.sha256", role.wire_name()),
     )?;
-    let measurement = measure_private_file(
-        repository,
-        Path::new(&descriptor.path),
-        &format!("artifacts.{}", role.wire_name()),
-    )?;
-    require_measurement(
-        &measurement,
-        descriptor.length,
-        &descriptor.sha256,
-        &format!("artifacts.{}", role.wire_name()),
-    )?;
-    Ok(measurement)
+    let field = format!("artifacts.{}", role.wire_name());
+    let (measurement, captured_contents) = if matches!(
+        role,
+        ArtifactRole::MicrocodeTextRawWindow | ArtifactRole::MicrocodeDataRawWindow
+    ) {
+        let read = read_private_file(repository, Path::new(&descriptor.path), &field)?;
+        (read.measurement, Some(read.contents))
+    } else {
+        (
+            measure_private_file(repository, Path::new(&descriptor.path), &field)?,
+            None,
+        )
+    };
+    require_measurement(&measurement, descriptor.length, &descriptor.sha256, &field)?;
+    Ok(AdmittedArtifact {
+        descriptor,
+        measurement,
+        captured_contents,
+    })
 }
 
 fn validate_artifact_denominator(
@@ -2214,7 +2320,6 @@ fn parse_artifact_role(value: &str) -> Result<ArtifactRole, PrivateInputAdmissio
     }
 }
 
-#[cfg(test)]
 fn serialize_json_document<T: Serialize>(
     value: &T,
     field: &str,

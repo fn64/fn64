@@ -9,9 +9,11 @@ XBUS series, the matrix assessment accepted 3 scenarios and 30 reports,
 satisfied 12 of 162 requirements, and retained the other 150 as explicit
 gaps. The public series receives no private-input or ROM-class authority.
 
-`tools/private_input_admission.py` validates private inputs before an
-Extended-GBI fixture or full-ROM release run consumes them. It never copies
-the inputs. The populated manifest and emitted readiness report must remain in
+`tools/private_input_admission.py` is the manifest/readiness producer and a
+differential oracle for the typed Rust policy; it is not loader authority.
+Extended-GBI, full-ROM, and F3DZEX2 consumers revalidate admission in process
+before consuming private bytes. The Python producer never copies the inputs.
+The populated manifest and emitted readiness report must remain in
 `/private/tmp` or another path outside the repository (a repository-local path
 is accepted only when git itself confirms it is ignored).
 
@@ -169,6 +171,15 @@ view, then loads/hashes those derived logical images. It must retain the
 original storage ranges unchanged for raw recognition. No independently
 supplied logical artifact may override or contradict that derivation.
 
+The characterization runner uses the boot harness's narrow typed Rust loader.
+That loader revalidates the current v7 characterization scope, derives the
+canonical content-free readiness bytes and requires the supplied readiness to
+exact-match them, then returns only the two fixed-size raw windows. Each raw
+window is read and hashed through one no-follow descriptor or Windows handle;
+the returned bytes are the capture from that same stable handle, not a later
+pathname reopen. Detailed failures stay inside the harness and the public
+error is content-free. Python remains only the producer/oracle for this path.
+
 This purpose is characterization intake only. Readiness does not admit
 F3DZEX2 HLE, convert its diagnostic family into public-microcode credit, or
 authorize relabeling it as F3DEX2. A production catalog remains closed until
@@ -321,6 +332,9 @@ Its Extended-GBI and full-ROM states are respectively `not_requested` and
 for the three characterization labels and an empty characterization-case
 array. No readiness field contains a private path, filename, length, digest,
 derived logical identity, command payload, expected result, or variant choice.
+The typed characterization loader compares the complete supplied readiness
+document byte-for-byte with the canonical serialization derived from the
+revalidated manifest; semantically similar or noncanonical JSON is rejected.
 
 For retained evidence, contract and readiness verification continue to accept
 the exact v6 manifest/v5 readiness vocabulary. That compatibility branch is
@@ -550,6 +564,7 @@ python3 tools/private_input_admission.py --check
 python3 tools/private_input_admission.py --selftest
 python3 tools/private_input_admission.py --corpus-snapshot
 cargo test -p fn64-boot-harness shared_content_free_corpus_matches_rust_policy
+cargo test -p fn64-boot-harness typed_characterization_loader
 cargo test -p fn64-render-rt64 --test private_release_runner
 ```
 
