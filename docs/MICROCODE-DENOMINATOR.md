@@ -39,8 +39,12 @@ denominator: both control-flow interpreters implement pinned RT64 BranchW as a
 strict transformed-W comparison with exact seven-bit slot selection,
 u32-to-f32 threshold conversion, forced-branch ordering, persistent HALF_1,
 and masked segmented tail targets. F3DEX2 opcode `0x04` remains BranchZ. The
-F3DZEX2 catalog stays closed until all three variants' NoN/point-lighting and
-self-load transitions are implemented and differentially validated.
+behavior-bearing geometry profile now survives the shared and reference
+decode state, and all three typed variants apply the bounded NoN near-admission
+policy without changing the side/far raster-clipping handoff. The F3DZEX2
+catalog stays closed until point-light behavior is characterized and
+implemented, exact raw-pair self-load resolution is validated, and native
+pixel/full-task differentials pass.
 
 Matrix v5 does not trust the backend's family label for public-microcode
 credit. It independently adjudicates each reported text digest through the

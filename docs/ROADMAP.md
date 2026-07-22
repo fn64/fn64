@@ -728,11 +728,13 @@ and deterministic output traces.
   whole-triangle X/Y/far rejection without near rejection. F3DLX2.Rej
   transformed vertices remain loud at the same unpublished pixel-rounding
   boundary as legacy F3DLX. F3DZEX2 has a typed three-variant identity and its
-  pinned MIT RT64 BranchW control-flow delta is implemented in both walkers,
-  but it still cannot enter HLE: variant-gated NoN/point-lighting, self-load
-  transitions, native pixel differentials, and representative full-task
-  evidence remain open, while the other public `G_SPECIAL_*` opcodes remain
-  reserved. See
+  pinned MIT RT64 BranchW control-flow delta is implemented in both walkers.
+  Its behavior-bearing profile now survives shared/reference decode state and
+  all three typed variants apply bounded NoN near admission. It still cannot
+  enter HLE: point-light wire/arithmetic characterization, exact F3DZEX2
+  raw-pair self-load resolution, native pixel differentials, and representative
+  full-task evidence remain open, while the other public `G_SPECIAL_*` opcodes
+  remain reserved. See
   `crates/fn64-render-reference/F3DEX2-VARIANTS.md`. The content-admitted
   S2DEX slice now retains object clamp, filter correction, perimeter, and ignored
   legacy edge requests as typed task-local state. It admits the current public

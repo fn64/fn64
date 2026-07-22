@@ -378,6 +378,103 @@ impl GeometryWireFamily {
     }
 }
 
+/// Behavior-bearing identity for one active geometry microcode generation.
+///
+/// [`GeometryWireFamily`] identifies the command envelope, while this profile
+/// retains the exact [`TaskAdmissionUcode`] needed by behavior variants that
+/// share that envelope. Construction does not admit a microcode image: the
+/// catalog remains the sole production HLE-admission authority.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GeometryUcodeProfile(TaskAdmissionUcode);
+
+impl GeometryUcodeProfile {
+    /// Construct the profile for one catalog-admitted public wire family.
+    ///
+    /// F3DZEX2 cannot pass through this broad-family constructor because its
+    /// executable identity requires an exact classified variant.
+    pub const fn from_public_family(family: GeometryWireFamily) -> Self {
+        match family {
+            GeometryWireFamily::F3dzex2 => {
+                panic!("F3DZEX2 geometry profile requires an exact typed variant")
+            }
+            _ => Self(TaskAdmissionUcode::from_family(family.ucode_id())),
+        }
+    }
+
+    /// Convert an already-typed admission identity into a geometry profile.
+    ///
+    /// This is an identity conversion, not an admission decision. Non-geometry
+    /// microcodes have no geometry command profile and return `None`.
+    pub const fn from_admission_ucode(ucode: TaskAdmissionUcode) -> Option<Self> {
+        match ucode {
+            TaskAdmissionUcode::Fast3d
+            | TaskAdmissionUcode::F3dex
+            | TaskAdmissionUcode::F3dlx
+            | TaskAdmissionUcode::F3dlxRej
+            | TaskAdmissionUcode::F3dex2
+            | TaskAdmissionUcode::F3dex2NoN
+            | TaskAdmissionUcode::F3dex2Rej
+            | TaskAdmissionUcode::F3dlx2Rej
+            | TaskAdmissionUcode::F3dzex2(_)
+            | TaskAdmissionUcode::L3dex
+            | TaskAdmissionUcode::L3dex2 => Some(Self(ucode)),
+            TaskAdmissionUcode::S2dex
+            | TaskAdmissionUcode::S2dex2
+            | TaskAdmissionUcode::Other(_) => None,
+        }
+    }
+
+    pub const fn wire_family(self) -> GeometryWireFamily {
+        match self.0 {
+            TaskAdmissionUcode::Fast3d => GeometryWireFamily::Fast3d,
+            TaskAdmissionUcode::F3dex => GeometryWireFamily::F3dex,
+            TaskAdmissionUcode::F3dlx => GeometryWireFamily::F3dlx,
+            TaskAdmissionUcode::F3dlxRej => GeometryWireFamily::F3dlxRej,
+            TaskAdmissionUcode::F3dex2 => GeometryWireFamily::F3dex2,
+            TaskAdmissionUcode::F3dex2NoN => GeometryWireFamily::F3dex2NoN,
+            TaskAdmissionUcode::F3dex2Rej => GeometryWireFamily::F3dex2Rej,
+            TaskAdmissionUcode::F3dlx2Rej => GeometryWireFamily::F3dlx2Rej,
+            TaskAdmissionUcode::F3dzex2(_) => GeometryWireFamily::F3dzex2,
+            TaskAdmissionUcode::L3dex => GeometryWireFamily::L3dex,
+            TaskAdmissionUcode::L3dex2 => GeometryWireFamily::L3dex2,
+            TaskAdmissionUcode::S2dex
+            | TaskAdmissionUcode::S2dex2
+            | TaskAdmissionUcode::Other(_) => {
+                panic!("non-geometry admission identity reached a geometry profile")
+            }
+        }
+    }
+
+    pub const fn admission_ucode(self) -> TaskAdmissionUcode {
+        self.0
+    }
+
+    pub const fn family(self) -> UcodeId {
+        self.0.family()
+    }
+
+    pub const fn f3dzex2_variant(self) -> Option<F3dzex2Variant> {
+        self.0.f3dzex2_variant()
+    }
+
+    /// Whether the active microcode carries RT64's exact NoN capability.
+    pub const fn no_n(self) -> bool {
+        match self.0 {
+            TaskAdmissionUcode::F3dex2NoN => true,
+            TaskAdmissionUcode::F3dzex2(variant) => variant.no_near_clip(),
+            _ => false,
+        }
+    }
+
+    /// Whether the active variant can interpret point-light records.
+    pub const fn point_lighting(self) -> bool {
+        match self.0 {
+            TaskAdmissionUcode::F3dzex2(variant) => variant.point_lighting(),
+            _ => false,
+        }
+    }
+}
+
 /// Exact public polygon/line-family text images admitted for geometry HLE.
 #[derive(Clone, Debug, Default)]
 pub struct GeometryUcodeCatalog {
@@ -436,9 +533,20 @@ impl GeometryUcodeCatalog {
         })
     }
 
+    pub fn require_profile_text(&self, text: &[u8]) -> Result<GeometryUcodeProfile, RenderError> {
+        self.require_text(text)
+            .map(GeometryUcodeProfile::from_public_family)
+    }
+
     #[doc(hidden)]
     pub fn family(&self, digest: UcodeDigest) -> Option<GeometryWireFamily> {
         self.digests.get(&digest).copied()
+    }
+
+    #[doc(hidden)]
+    pub fn profile(&self, digest: UcodeDigest) -> Option<GeometryUcodeProfile> {
+        self.family(digest)
+            .map(GeometryUcodeProfile::from_public_family)
     }
 
     pub fn identify_text(
@@ -752,6 +860,66 @@ mod tests {
     }
 
     #[test]
+    fn geometry_profiles_roundtrip_every_public_wire_family() {
+        for family in [
+            GeometryWireFamily::Fast3d,
+            GeometryWireFamily::F3dex,
+            GeometryWireFamily::F3dlx,
+            GeometryWireFamily::F3dlxRej,
+            GeometryWireFamily::F3dex2,
+            GeometryWireFamily::F3dex2NoN,
+            GeometryWireFamily::F3dex2Rej,
+            GeometryWireFamily::F3dlx2Rej,
+            GeometryWireFamily::L3dex,
+            GeometryWireFamily::L3dex2,
+        ] {
+            let profile = GeometryUcodeProfile::from_public_family(family);
+            assert_eq!(profile.wire_family(), family);
+            assert_eq!(profile.family(), family.ucode_id());
+            assert_eq!(profile.f3dzex2_variant(), None);
+            assert_eq!(profile.no_n(), family == GeometryWireFamily::F3dex2NoN);
+            assert!(!profile.point_lighting());
+            assert_eq!(
+                GeometryUcodeProfile::from_admission_ucode(profile.admission_ucode()),
+                Some(profile)
+            );
+        }
+        assert_eq!(
+            GeometryUcodeProfile::from_admission_ucode(TaskAdmissionUcode::S2dex2),
+            None
+        );
+        assert_eq!(
+            GeometryUcodeProfile::from_admission_ucode(TaskAdmissionUcode::Other(7)),
+            None
+        );
+    }
+
+    #[test]
+    fn typed_f3dzex2_profiles_bind_non_and_point_lighting_capabilities() {
+        for (variant, point_lighting) in [
+            (F3dzex2Variant::NoNFifo206H, false),
+            (F3dzex2Variant::NoNFifo208I, true),
+            (F3dzex2Variant::NoNFifo208J, true),
+        ] {
+            let ucode = TaskAdmissionUcode::F3dzex2(variant);
+            let profile = GeometryUcodeProfile::from_admission_ucode(ucode)
+                .expect("typed F3DZEX2 identity is a geometry profile");
+            assert_eq!(profile.wire_family(), GeometryWireFamily::F3dzex2);
+            assert_eq!(profile.family(), UcodeId::F3dzex2);
+            assert_eq!(profile.admission_ucode(), ucode);
+            assert_eq!(profile.f3dzex2_variant(), Some(variant));
+            assert!(profile.no_n());
+            assert_eq!(profile.point_lighting(), point_lighting);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "F3DZEX2 geometry profile requires an exact typed variant")]
+    fn broad_f3dzex2_family_cannot_construct_a_geometry_profile() {
+        let _ = GeometryUcodeProfile::from_public_family(GeometryWireFamily::F3dzex2);
+    }
+
+    #[test]
     fn geometry_admission_is_exact_and_family_typed() {
         let text = [0x5a; fn64_runtime::RSP_MEMORY_BANK_SIZE];
         let mut catalog = GeometryUcodeCatalog::default();
@@ -761,6 +929,10 @@ mod tests {
             catalog.require_text(&text).unwrap(),
             GeometryWireFamily::L3dex2
         );
+        let profile = catalog.require_profile_text(&text).unwrap();
+        assert_eq!(catalog.profile(digest), Some(profile));
+        assert_eq!(profile.wire_family(), GeometryWireFamily::L3dex2);
+        assert_eq!(profile.admission_ucode(), TaskAdmissionUcode::L3dex2);
         assert_eq!(catalog.supported_ucodes(), &[UcodeId::L3dex2]);
     }
 

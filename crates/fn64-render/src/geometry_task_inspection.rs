@@ -15,9 +15,9 @@
 //! MIT RT64's public enhancement.
 
 use crate::{
-    DpFullSyncStatus, GeometryUcodeCatalog, GeometryWireFamily, MicrocodeDataImageIdentity, OsTask,
-    RenderError, TaskAdmissionGeneration, TaskAdmissionPlan, TaskAdmissionSource,
-    TaskAdmissionUcode, UcodeDigest,
+    DpFullSyncStatus, GeometryUcodeCatalog, GeometryUcodeProfile, GeometryWireFamily,
+    MicrocodeDataImageIdentity, OsTask, RenderError, TaskAdmissionGeneration, TaskAdmissionPlan,
+    TaskAdmissionSource, UcodeDigest,
 };
 use fn64_runtime::{RdramAddr, RdramView, RdramViewMut, RspMemAddr, RspMemory, RspMemoryBank};
 use sha2::{Digest, Sha256};
@@ -146,7 +146,7 @@ struct Viewport {
 }
 
 struct WalkState {
-    family: GeometryWireFamily,
+    profile: GeometryUcodeProfile,
     segments: [u32; 16],
     vertices: [ControlVertex; 128],
     projection: Option<Mat4>,
@@ -165,9 +165,9 @@ struct WalkState {
 }
 
 impl WalkState {
-    fn new(family: GeometryWireFamily) -> Self {
+    fn new(profile: GeometryUcodeProfile) -> Self {
         Self {
-            family,
+            profile,
             segments: [0; 16],
             vertices: [ControlVertex::default(); 128],
             projection: None,
@@ -188,11 +188,11 @@ impl WalkState {
 
     fn reset_after_ucode_load(
         &mut self,
-        loading_family: GeometryWireFamily,
+        loading_profile: GeometryUcodeProfile,
     ) -> Result<(), RenderError> {
         self.vertices = [ControlVertex::default(); 128];
         self.rdp_half_1 = None;
-        if loading_family.is_legacy_loadable() {
+        if loading_profile.wire_family().is_legacy_loadable() {
             if !self.return_stack.is_empty() {
                 return Err(reject_unsupported(
                     "F3DEX/L3DEX G_LOAD_UCODE inside a called display list resets link state and cannot return",
@@ -211,6 +211,10 @@ impl WalkState {
             self.pending_forced_mvp = None;
         }
         Ok(())
+    }
+
+    fn family(&self) -> GeometryWireFamily {
+        self.profile.wire_family()
     }
 
     fn recompute_mvp(&mut self) {
@@ -239,14 +243,15 @@ pub fn inspect_geometry_task(
     }
 
     let live_text = rsp_memory.bank(RspMemoryBank::Imem);
-    let family = catalog.require_text(live_text)?;
+    let profile = catalog.require_profile_text(live_text)?;
+    let family = profile.wire_family();
     if !is_supported_polygon_family(family) {
         return Err(reject_unsupported(format!(
             "{} task inspection is outside the supported public polygon-family frontier",
             family.name()
         )));
     }
-    let entry = task_entry(rdram, live_text, task, family)?;
+    let entry = task_entry(rdram, live_text, task, profile)?;
     let mut raw_windows = Vec::new();
     if let Some(size) = raw_window_size {
         raw_windows.push(capture_raw_window(
@@ -259,7 +264,7 @@ pub fn inspect_geometry_task(
 
     let mut scratch_rdram = rdram.to_vec();
     let mut scratch_rsp = rsp_memory.clone();
-    let mut state = WalkState::new(family);
+    let mut state = WalkState::new(profile);
     state.raw_windows = raw_windows;
     walk(
         &mut scratch_rdram,
@@ -295,7 +300,7 @@ fn task_entry(
     rdram: &[u8],
     live_text: &[u8; SP_UCODE_SIZE],
     task: &OsTask,
-    family: GeometryWireFamily,
+    profile: GeometryUcodeProfile,
 ) -> Result<TaskAdmissionGeneration, RenderError> {
     let text_address = task.ucode & 0x00ff_ffff;
     let data_address = task.ucode_data & 0x00ff_ffff;
@@ -326,7 +331,7 @@ fn task_entry(
             bytes: task.ucode_data_size,
             sha256: Sha256::digest(data).into(),
         },
-        ucode: TaskAdmissionUcode::from_family(family.ucode_id()),
+        ucode: profile.admission_ucode(),
     })
 }
 
@@ -355,10 +360,10 @@ fn walk(
         let wire_w0 = read_u32(rdram, pc)?;
         let wire_w1 = read_u32(rdram, pc + 4)?;
         pc += 8;
-        if consume_line_triangle_noop(state.family, wire_w0, wire_w1)? {
+        if consume_line_triangle_noop(state.family(), wire_w0, wire_w1)? {
             continue;
         }
-        let (w0, w1) = normalize_command(state.family, wire_w0, wire_w1, command_pc)?;
+        let (w0, w1) = normalize_command(state.family(), wire_w0, wire_w1, command_pc)?;
         let opcode = (w0 >> 24) as u8;
 
         match opcode {
@@ -366,11 +371,11 @@ fn walk(
             G_CULLDL => {
                 let start = usize::try_from(w0 & 0xffff).expect("u16 fits usize") / 2;
                 let end = usize::try_from(w1 & 0xffff).expect("u16 fits usize") / 2;
-                let capacity = state.family.cache_capacity();
+                let capacity = state.family().cache_capacity();
                 if !(start < end && end < capacity) {
                     return Err(reject(format!(
                         "{} G_CULLDL range {start}..={end} is outside its {capacity}-entry cache",
-                        state.family.name()
+                        state.family().name()
                     )));
                 }
                 let common = state.vertices[start..=end]
@@ -384,24 +389,24 @@ fn walk(
                     }
                 }
             }
-            G_BRANCH_Z if state.family == GeometryWireFamily::F3dzex2 => {
+            G_BRANCH_Z if state.family() == GeometryWireFamily::F3dzex2 => {
                 let slot = ((w0 >> 1) & 0x7f) as usize;
-                if slot >= state.family.cache_capacity() {
+                if slot >= state.family().cache_capacity() {
                     return Err(reject(format!(
                         "{} G_BRANCH_W selects out-of-range cache slot {slot}",
-                        state.family.name()
+                        state.family().name()
                     )));
                 }
                 let clip_w = state.vertices[slot].clip_w.ok_or_else(|| {
                     reject(format!(
                         "{} G_BRANCH_W selects unloaded cache slot {slot}",
-                        state.family.name()
+                        state.family().name()
                     ))
                 })?;
                 if !clip_w.is_finite() {
                     return Err(reject(format!(
                         "{} G_BRANCH_W cache slot {slot} has non-finite transformed W",
-                        state.family.name()
+                        state.family().name()
                     )));
                 }
                 if policy.force_branch || clip_w < w1 as f32 {
@@ -420,10 +425,10 @@ fn walk(
                     )));
                 }
                 let slot = encoded_vertex / 5;
-                if slot != encoded_z / 2 || slot >= state.family.cache_capacity() {
+                if slot != encoded_z / 2 || slot >= state.family().cache_capacity() {
                     return Err(reject(format!(
                         "{} G_BRANCH_Z selects inconsistent/out-of-range cache slot {slot}",
-                        state.family.name()
+                        state.family().name()
                     )));
                 }
                 if policy.force_branch || state.vertices[slot].z_screen <= w1 {
@@ -442,14 +447,15 @@ fn walk(
                 let data_address = state.rdp_half_1.ok_or_else(|| {
                     reject("G_LOAD_UCODE reached without a preceding G_RDPHALF_1 data address")
                 })?;
-                let loading_family = state.family;
+                let loading_profile = state.profile;
                 let loaded = execute_load_ucode(rdram, rsp_memory, w0, w1, data_address)?;
-                state.reset_after_ucode_load(loading_family)?;
-                let Some(next_family) = catalog.family(loaded.text_sha256) else {
+                state.reset_after_ucode_load(loading_profile)?;
+                let Some(next_profile) = catalog.profile(loaded.text_sha256) else {
                     return Err(RenderError::RequiresLle {
                         ucode_sha256: loaded.text_sha256.as_bytes(),
                     });
                 };
+                let next_family = next_profile.wire_family();
                 if !is_supported_polygon_family(next_family) {
                     return Err(reject_unsupported(format!(
                         "G_LOAD_UCODE selected {}, outside the supported public polygon-family frontier",
@@ -462,7 +468,7 @@ fn walk(
                     data_address: loaded.data_address,
                     text_sha256: loaded.text_sha256,
                     data: loaded.data,
-                    ucode: TaskAdmissionUcode::from_family(next_family.ucode_id()),
+                    ucode: next_profile.admission_ucode(),
                 };
                 if let Some(size) = raw_window_size {
                     state.raw_windows.push(capture_raw_window(
@@ -473,7 +479,7 @@ fn walk(
                     )?);
                 }
                 state.self_loads.push(generation);
-                state.family = next_family;
+                state.profile = next_profile;
             }
             G_MOVEWORD => apply_moveword(rdram, w0, w1, state)?,
             G_MOVEMEM => apply_movemem(rdram, w0, w1, state)?,
@@ -483,7 +489,7 @@ fn walk(
                 if branch {
                     pc = target;
                 } else {
-                    let limit = if is_modern(state.family) {
+                    let limit = if is_modern(state.family()) {
                         MODERN_DL_DEPTH
                     } else {
                         LEGACY_DL_DEPTH
@@ -491,7 +497,7 @@ fn walk(
                     if state.return_stack.len() >= limit {
                         return Err(reject(format!(
                             "{} G_DL call exceeds its {limit}-entry display-list stack",
-                            state.family.name()
+                            state.family().name()
                         )));
                     }
                     state.return_stack.push(pc);
@@ -499,7 +505,7 @@ fn walk(
                 }
             }
             G_TEXRECT | G_TEXRECTFLIP => {
-                let next = skip_texture_rectangle_continuation(rdram, pc, state.family, opcode)?;
+                let next = skip_texture_rectangle_continuation(rdram, pc, state.family(), opcode)?;
                 let continuation_commands = u32::try_from((next - pc) / 8)
                     .expect("texture-rectangle continuation count fits u32");
                 state.commands = state
@@ -529,14 +535,14 @@ fn walk(
             G_SPECIAL_1 | G_SPECIAL_2 | G_SPECIAL_3 => {
                 return Err(reject_unsupported(format!(
                     "reserved {} command {opcode:#04x} at RDRAM {command_pc:#010x}",
-                    state.family.name()
+                    state.family().name()
                 )));
             }
             opcode if is_non_control_command(opcode) => {}
             _ => {
                 return Err(reject_unsupported(format!(
                     "unsupported {} command {opcode:#04x} at RDRAM {command_pc:#010x}: w0={wire_w0:#010x} w1={wire_w1:#010x}",
-                    state.family.name()
+                    state.family().name()
                 )));
             }
         }
@@ -856,7 +862,7 @@ fn apply_moveword(
         _ => {
             return Err(reject_unsupported(format!(
                 "unsupported {} G_MOVEWORD index {index:#04x} offset {offset:#06x}",
-                state.family.name()
+                state.family().name()
             )))
         }
     }
@@ -891,7 +897,7 @@ fn apply_movemem(rdram: &[u8], w0: u32, w1: u32, state: &mut WalkState) -> Resul
         _ => {
             return Err(reject_unsupported(format!(
                 "unsupported {} G_MOVEMEM index {index:#04x} offset/8 {offset:#04x}",
-                state.family.name()
+                state.family().name()
             )))
         }
     }
@@ -902,13 +908,13 @@ fn load_vertices(rdram: &[u8], w0: u32, w1: u32, state: &mut WalkState) -> Resul
     let count = ((w0 >> 12) & 0xff) as usize;
     let end = ((w0 >> 1) & 0x7f) as usize;
     if count == 0
-        || count > state.family.max_vertex_load_count()
+        || count > state.family().max_vertex_load_count()
         || end < count
-        || end > state.family.cache_capacity()
+        || end > state.family().cache_capacity()
     {
         return Err(reject(format!(
             "{} G_VTX count/end {count}/{end} is outside its cache",
-            state.family.name()
+            state.family().name()
         )));
     }
     let start = end - count;
@@ -927,7 +933,7 @@ fn load_vertices(rdram: &[u8], w0: u32, w1: u32, state: &mut WalkState) -> Resul
 fn modify_vertex(w0: u32, w1: u32, state: &mut WalkState) -> Result<(), RenderError> {
     let field = ((w0 >> 16) & 0xff) as u8;
     let encoded = (w0 & 0xffff) as usize;
-    if !encoded.is_multiple_of(2) || encoded / 2 >= state.family.cache_capacity() {
+    if !encoded.is_multiple_of(2) || encoded / 2 >= state.family().cache_capacity() {
         return Err(reject("G_MODIFYVTX cache index is malformed"));
     }
     match field {
@@ -1356,6 +1362,7 @@ fn reject_unsupported(reason: impl Into<String>) -> RenderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{F3dzex2Variant, TaskAdmissionUcode};
 
     const DL: u32 = 0x1000;
     const TEXT: u32 = 0x2000;
@@ -1401,8 +1408,20 @@ mod tests {
         fixture_for_family(GeometryWireFamily::F3dex2)
     }
 
-    fn walk_direct(
-        family: GeometryWireFamily,
+    fn f3dzex2_profile(variant: F3dzex2Variant) -> GeometryUcodeProfile {
+        GeometryUcodeProfile::from_admission_ucode(TaskAdmissionUcode::F3dzex2(variant))
+            .expect("typed F3DZEX2 admission identity is a geometry profile")
+    }
+
+    fn profile_for_wire(family: GeometryWireFamily) -> GeometryUcodeProfile {
+        match family {
+            GeometryWireFamily::F3dzex2 => f3dzex2_profile(F3dzex2Variant::NoNFifo206H),
+            _ => GeometryUcodeProfile::from_public_family(family),
+        }
+    }
+
+    fn walk_direct_profile(
+        profile: GeometryUcodeProfile,
         commands: &[(u32, u32, u32)],
         vertices: &[(usize, ControlVertex)],
         policy: GeometryTaskInspectionPolicy,
@@ -1411,7 +1430,7 @@ mod tests {
         for &(address, w0, w1) in commands {
             write_command(&mut rdram, address, w0, w1);
         }
-        let mut state = WalkState::new(family);
+        let mut state = WalkState::new(profile);
         for &(slot, vertex) in vertices {
             state.vertices[slot] = vertex;
         }
@@ -1425,6 +1444,15 @@ mod tests {
             &mut state,
         )?;
         Ok(state)
+    }
+
+    fn walk_direct(
+        family: GeometryWireFamily,
+        commands: &[(u32, u32, u32)],
+        vertices: &[(usize, ControlVertex)],
+        policy: GeometryTaskInspectionPolicy,
+    ) -> Result<WalkState, RenderError> {
+        walk_direct_profile(profile_for_wire(family), commands, vertices, policy)
     }
 
     fn control_vertex(clip_w: f32, z_screen: u32) -> ControlVertex {
@@ -1594,15 +1622,25 @@ mod tests {
             (TARGET, u32::from(G_ENDDL) << 24, 0),
         ];
 
-        for (clip_w, expected_full_syncs) in [(9.0, 0), (10.0, 1), (11.0, 1)] {
-            let state = walk_direct(
-                GeometryWireFamily::F3dzex2,
-                &commands,
-                &[(SLOT, control_vertex(clip_w, 0))],
-                GeometryTaskInspectionPolicy::default(),
-            )
-            .unwrap();
-            assert_eq!(state.full_sync_count, expected_full_syncs, "W={clip_w}");
+        for variant in [
+            F3dzex2Variant::NoNFifo206H,
+            F3dzex2Variant::NoNFifo208I,
+            F3dzex2Variant::NoNFifo208J,
+        ] {
+            for (clip_w, expected_full_syncs) in [(9.0, 0), (10.0, 1), (11.0, 1)] {
+                let state = walk_direct_profile(
+                    f3dzex2_profile(variant),
+                    &commands,
+                    &[(SLOT, control_vertex(clip_w, 0))],
+                    GeometryTaskInspectionPolicy::default(),
+                )
+                .unwrap();
+                assert_eq!(state.profile.f3dzex2_variant(), Some(variant));
+                assert_eq!(
+                    state.full_sync_count, expected_full_syncs,
+                    "variant={variant:?}, W={clip_w}"
+                );
+            }
         }
     }
 
@@ -1819,7 +1857,7 @@ mod tests {
     #[test]
     fn z_screen_modify_does_not_replace_f3dzex2_transformed_w() {
         const SLOT: usize = 9;
-        let mut state = WalkState::new(GeometryWireFamily::F3dzex2);
+        let mut state = WalkState::new(f3dzex2_profile(F3dzex2Variant::NoNFifo206H));
         state.vertices[SLOT] = control_vertex(12.25, 3);
         modify_vertex(
             (u32::from(G_MODIFYVTX) << 24)
@@ -1835,7 +1873,7 @@ mod tests {
 
     #[test]
     fn projected_vertex_retains_homogeneous_w_for_f3dzex2_branching() {
-        let mut state = WalkState::new(GeometryWireFamily::F3dzex2);
+        let mut state = WalkState::new(f3dzex2_profile(F3dzex2Variant::NoNFifo208J));
         let mut matrix = identity();
         matrix[3][3] = 2.0;
         state.mvp = Some(matrix);

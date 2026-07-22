@@ -47,9 +47,9 @@ pub use geometry_task_inspection::{
     TaskAdmissionRawWindow, TaskAdmissionRawWindowSize,
 };
 pub use microcode::{
-    F3dex2UcodeCatalog, GeometryUcodeCatalog, GeometryWireFamily, MicrocodePairCatalog,
-    S2dexUcodeCatalog, S2dexWireFamily, TaskAdmissionGeneration, TaskAdmissionPlan,
-    TaskAdmissionSource, TaskAdmissionUcode, UcodeDigest,
+    F3dex2UcodeCatalog, GeometryUcodeCatalog, GeometryUcodeProfile, GeometryWireFamily,
+    MicrocodePairCatalog, S2dexUcodeCatalog, S2dexWireFamily, TaskAdmissionGeneration,
+    TaskAdmissionPlan, TaskAdmissionSource, TaskAdmissionUcode, UcodeDigest,
 };
 pub use microcode_identity::{
     capture_task_admission_raw_window, identify_f3dzex2, F3dzex2Variant, F3DZEX2_IDENTITY_SOURCE,

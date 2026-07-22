@@ -102,11 +102,22 @@ hardware-exact BranchW claim.
 
 fn64 names `GeometryWireFamily::F3dzex2` and `UcodeId::F3dzex2` so the frontier
 cannot be mistaken for ordinary F3DEX2. Catalog admission still traps with the
-missing-evidence requirement. The internal decoder admits only the now-tested
-BranchW delta; it does not reinterpret the remaining reserved `G_SPECIAL_*`
-opcodes, alias an F3DZEX2 digest to F3DEX2, or claim support from game-era
-naming alone. Closing the RT64-parity HLE boundary still requires variant-gated
-NoN and point-lighting implementation, shared self-load profile propagation,
+missing-evidence requirement. `GeometryUcodeProfile` now carries the exact
+behavior-bearing admission identity through the shared inspector and reference
+decode state, including catalog-admitted self-load transitions, without
+allowing a broad F3DZEX2 family to construct a profile. All three typed
+F3DZEX2 variants apply the same bounded NoN near-admission policy already used
+for public F3DEX2.NoN, while ordinary F3DEX2 retains its near rejection. Tests
+also prove that side/far clip codes remain the same raster-clipping handoff;
+this is not a claim of exact polygon subdivision, fixed-point clipping, or
+silicon boundary behavior.
+
+The internal decoder therefore covers the tested BranchW and bounded NoN
+slices, but it does not reinterpret the remaining reserved `G_SPECIAL_*`
+opcodes, alias an F3DZEX2 digest to F3DEX2, or claim point-light behavior from
+the variant capability flag alone. Closing the RT64-parity HLE boundary still
+requires black-box characterization and implementation of 2.08I/J point-light
+records and arithmetic, exact raw-pair resolution across F3DZEX2 self-loads,
 native pixel differentials, and repeated representative full-task evidence. A
 hardware-exact or Nintendo-public claim separately requires hardware/black-box
 evidence or a public specification.
