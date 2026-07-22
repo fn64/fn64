@@ -49,9 +49,13 @@ contract gives the rendered width as `1.5 + wd * 0.5` pixels and encodes the
 flat-shade selector by swapping the two endpoints. The decoder validates those
 wire fields, normalizes both envelopes into one typed `RenderOp::Line`, and
 uses the established line raster path for homogeneous clipping, shade/texture
-attributes, scissor, sample coverage, blending, and read-only depth. Equivalent
-legacy and modern command streams are regression-tested to produce identical
-typed endpoints and framebuffer bytes.
+attributes, scissor, sample coverage, blending, and read-only depth. The line
+footprint retains the public eight-sample checkerboard identity. A partial
+pixel evaluates smooth shade, perspective texture coordinates, and Z at the
+same typed covered-sample point as the triangle paths; a full pixel remains at
+pixel center. Equivalent legacy and modern command streams are regression-
+tested to produce identical masks, selected points, typed endpoints, and
+framebuffer bytes.
 
 ## 3. Admitted adjacent F3DEX forms
 
@@ -76,9 +80,13 @@ silent polygon fallback exists.
 ## 4. Remaining fidelity frontier
 
 The typed line primitive preserves the public width, endpoint order, clipping,
-texture, combiner, blender, and depth contracts. Exact microcode fixed-point
-transform rounding and the silicon line-edge coefficient generator still
-require hardware-trace evidence. The public modern F3DEX2 Rej variants are
-separately digest-typed as described in
+texture, combiner, blender, and depth contracts. Programming Manual Chapter
+15.4 establishes that Z is subpixel-corrected onto the primitive, but does not
+publish the representative-sample lookup or correction arithmetic. Lines
+therefore share the reference renderer's explicit nearest-covered,
+stable-order bounded policy; this is not a silicon centroid claim. Exact
+microcode fixed-point transform rounding and the silicon line-edge coefficient
+generator still require hardware-trace evidence. The public modern F3DEX2 Rej
+variants are separately digest-typed as described in
 [`F3DEX2-VARIANTS.md`](F3DEX2-VARIANTS.md). F3DZEX variants and other
 game-specific microcodes remain unadmitted and take LLE or trap by name.

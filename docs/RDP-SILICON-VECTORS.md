@@ -673,7 +673,11 @@ of silicon centroid behavior. These in-process sweeps do not upgrade the
 capture schema: its normalized
 coverage plane still records only a count/storage representation, so it cannot
 close the representative-sample lookup or correction arithmetic without a new
-hardware-observable selector-sensitive shade, texture, or depth output.
+hardware-observable selector-sensitive shade, texture, or depth output. The
+normalized line path now consumes the same bounded selected point for partial
+smooth shade, perspective texture, and read-only Z while preserving pixel
+center for a full mask; that internal consistency is not line-edge or centroid
+silicon evidence.
 
 ### Alpha/coverage boundary inventory
 

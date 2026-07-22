@@ -383,8 +383,8 @@ impl CoverageMask {
     /// center. For partial coverage, the bounded reference chooses the
     /// covered checkerboard sample nearest that center, breaking equal-
     /// distance ties by the public sample-array order above. Keeping this as
-    /// a typed policy prevents raw and high-level triangles from silently
-    /// choosing different correction points.
+    /// a typed policy prevents raw triangles, high-level triangles, and lines
+    /// from silently choosing different correction points.
     fn attribute_sample(self) -> AttributeSamplePoint {
         assert!(self.0 != 0, "zero coverage has no attribute sample");
         if self.0 == u8::MAX {
@@ -849,14 +849,7 @@ fn line_pixel_coverage(line: &Line, scissor: ScissorRect, x: i32, y: i32) -> Cov
 /// stores only coverage population, so these assertions must inspect the mask
 /// before that boundary.
 #[cfg(test)]
-pub(crate) fn test_triangle_attribute_sample(
-    vertices: [Vertex; 3],
-    scissor: ScissorRect,
-    x: i32,
-    y: i32,
-) -> (u8, Option<(u8, i32, i32)>) {
-    let area = edge(vertices[0], vertices[1], vertices[2]);
-    let mask = triangle_pixel_coverage(vertices, area, scissor, x, y);
+fn test_attribute_sample(mask: CoverageMask) -> (u8, Option<(u8, i32, i32)>) {
     let sample = if mask.0 == 0 {
         None
     } else {
@@ -871,24 +864,34 @@ pub(crate) fn test_triangle_attribute_sample(
 }
 
 #[cfg(test)]
+pub(crate) fn test_triangle_attribute_sample(
+    vertices: [Vertex; 3],
+    scissor: ScissorRect,
+    x: i32,
+    y: i32,
+) -> (u8, Option<(u8, i32, i32)>) {
+    let area = edge(vertices[0], vertices[1], vertices[2]);
+    test_attribute_sample(triangle_pixel_coverage(vertices, area, scissor, x, y))
+}
+
+#[cfg(test)]
 pub(crate) fn test_raw_attribute_sample(
     edge: crate::gbi::RdpEdgeCoefficients,
     scissor: ScissorRect,
     x: i32,
     y: i32,
 ) -> (u8, Option<(u8, i32, i32)>) {
-    let mask = raw_pixel_coverage(edge, scissor, x, y);
-    let sample = if mask.0 == 0 {
-        None
-    } else {
-        match mask.attribute_sample() {
-            AttributeSamplePoint::PixelCenter => None,
-            AttributeSamplePoint::Covered(sample) => {
-                Some((sample.sample_index, sample.x_eighth, sample.y_eighth))
-            }
-        }
-    };
-    (mask.0, sample)
+    test_attribute_sample(raw_pixel_coverage(edge, scissor, x, y))
+}
+
+#[cfg(test)]
+pub(crate) fn test_line_attribute_sample(
+    line: &Line,
+    scissor: ScissorRect,
+    x: i32,
+    y: i32,
+) -> (u8, Option<(u8, i32, i32)>) {
+    test_attribute_sample(line_pixel_coverage(line, scissor, x, y))
 }
 
 impl Framebuffer {
@@ -2151,9 +2154,11 @@ impl Framebuffer {
                 if coverage.count() == 0 {
                     continue;
                 }
-                let center_x = x as f32 + 0.5;
-                let center_y = y as f32 + 0.5;
-                let parameter = parameter_at(center_x, center_y);
+                let attribute_sample = coverage_mask.attribute_sample();
+                let (sample_x_eighth, sample_y_eighth) = attribute_sample.offsets_eighth();
+                let sample_x = x as f32 + sample_x_eighth as f32 / 8.0;
+                let sample_y = y as f32 + sample_y_eighth as f32 / 8.0;
+                let parameter = parameter_at(sample_x, sample_y);
                 let shade = if line.smooth_shading {
                     [
                         lerp_channel(a.r, b.r, parameter),
@@ -2165,9 +2170,9 @@ impl Framebuffer {
                     [a.r, a.g, a.b, a.a]
                 };
                 let (texel0, texel1, lod_fraction) = if let Some(texture) = &line.texture {
-                    let (s, t) = texture_coordinates_at(center_x, center_y);
-                    let (sx, tx) = texture_coordinates_at(center_x + 1.0, center_y);
-                    let (sy, ty) = texture_coordinates_at(center_x, center_y + 1.0);
+                    let (s, t) = texture_coordinates_at(sample_x, sample_y);
+                    let (sx, tx) = texture_coordinates_at(sample_x + 1.0, sample_y);
+                    let (sy, ty) = texture_coordinates_at(sample_x, sample_y + 1.0);
                     texture.sample_rdp_pair(
                         None,
                         TextureSampleRequest {
@@ -2599,6 +2604,55 @@ mod tests {
         }
     }
 
+    fn partial_attribute_line() -> Line {
+        Line {
+            v: [v(0.0, 0.5, 0, 0, 0, 255), v(0.5, 0.5, 200, 0, 0, 255)],
+            width: 1.5,
+            smooth_shading: true,
+            scissor: None,
+            texture: None,
+            other_mode: OtherMode::from_raw(0xf0, 0, 0),
+            combiner: shade_only_combiner(),
+            blender: BlenderState::default(),
+        }
+    }
+
+    #[test]
+    fn partial_line_shade_uses_the_shared_covered_attribute_sample() {
+        let line = partial_attribute_line();
+        let mask = line_pixel_coverage(&line, ScissorRect::framebuffer(1, 1), 0, 0);
+        assert_eq!(mask, CoverageMask(0x55));
+        assert_eq!(
+            mask.attribute_sample(),
+            AttributeSamplePoint::Covered(CoveredAttributeSample {
+                sample_index: 2,
+                x_eighth: 3,
+                y_eighth: 3,
+            })
+        );
+
+        let mut framebuffer = Framebuffer::new(1, 1);
+        framebuffer.draw_line_no_depth(&line);
+        assert_eq!(
+            &framebuffer.pixels[..4],
+            &[150, 0, 0, 255],
+            "x=3/8 selects parameter 3/4; the old pixel-center path selected endpoint red 200"
+        );
+    }
+
+    #[test]
+    fn full_coverage_line_attributes_remain_at_pixel_center() {
+        let mut line = partial_attribute_line();
+        line.v[1].x = 1.0;
+        let mask = line_pixel_coverage(&line, ScissorRect::framebuffer(1, 1), 0, 0);
+        assert_eq!(mask, CoverageMask(u8::MAX));
+        assert_eq!(mask.attribute_sample(), AttributeSamplePoint::PixelCenter);
+
+        let mut framebuffer = Framebuffer::new(1, 1);
+        framebuffer.draw_line_no_depth(&line);
+        assert_eq!(&framebuffer.pixels[..4], &[100, 0, 0, 255]);
+    }
+
     #[test]
     fn line_raster_uses_public_minimum_width_and_butt_endpoints() {
         let mut framebuffer = Framebuffer::new(10, 8);
@@ -2662,6 +2716,73 @@ mod tests {
             tmem: None,
             lod: None,
         }
+    }
+
+    #[test]
+    fn partial_line_texture_coordinates_use_the_shared_covered_attribute_sample() {
+        let mut line = partial_attribute_line();
+        line.v[0].s = 0.0;
+        line.v[1].s = 5.0;
+        line.v[1].w = 2.0;
+        line.other_mode = OtherMode::default();
+        line.texture = Some(crate::gbi::Texture {
+            format: 0,
+            size: 2,
+            width: 6,
+            height: 1,
+            texels: std::rc::Rc::new(
+                [10u8, 20, 30, 40, 50, 60]
+                    .into_iter()
+                    .flat_map(|red| [red, 0, 0, 255])
+                    .collect(),
+            ),
+            clamp_s: true,
+            clamp_t: true,
+            mirror_s: false,
+            mirror_t: false,
+            mask_s: 0,
+            mask_t: 0,
+            shift_s: 0,
+            shift_t: 0,
+            origin_s: 0.0,
+            origin_t: 0.0,
+            tmem: None,
+            lod: None,
+        });
+        line.combiner = repeated_state(
+            texel_passthrough_cycle(ColorSource::Texel0, AlphaSource::Texel0),
+            [0; 4],
+            [0; 4],
+        );
+
+        let mut framebuffer = Framebuffer::new(1, 1);
+        framebuffer.draw_line_no_depth(&line);
+        assert_eq!(
+            &framebuffer.pixels[..4],
+            &[40, 0, 0, 255],
+            "perspective correction at x=3/8 selects S=3; the old pixel-center path selected endpoint S=5"
+        );
+    }
+
+    #[test]
+    fn partial_line_depth_compare_uses_the_shared_sample_and_remains_read_only() {
+        let mut line = partial_attribute_line();
+        line.v[0].z = 100.0;
+        line.v[1].z = 200.0;
+        line.v[0].r = 255;
+        line.v[1].r = 255;
+        line.smooth_shading = false;
+        // G_Z_CMP plus ZMODE_XLU gives a strict in-front comparison. The
+        // selected x=3/8 point yields Z=1400 in the RDP 15.3 domain, while
+        // the old pixel-center endpoint yielded Z=1600.
+        line.other_mode = OtherMode::from_raw(0xf0, 0x0810, 0);
+
+        let mut framebuffer = Framebuffer::new(1, 1);
+        framebuffer.depth[0] = 1500.0;
+        framebuffer.draw_line(&line);
+        assert_eq!(&framebuffer.pixels[..4], &[255, 0, 0, 255]);
+        assert_eq!(framebuffer.depth[0], 1500.0);
+        assert_eq!(framebuffer.encoded_depth[0], None);
     }
 
     #[test]
