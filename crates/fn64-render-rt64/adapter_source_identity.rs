@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn rdp_alpha_dither_overlay_is_exact_guarded_and_replaces_every_variant() {
+    fn rdp_dither_overlay_is_exact_guarded_and_shares_one_typed_noise_sample() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let root = if manifest_dir.join("src/ffi.rs").is_file() {
             manifest_dir.to_path_buf()
@@ -269,20 +269,38 @@ mod tests {
         assert!(cmake
             .contains("Alpha compare and coverage intentionally observe the original combiner"));
         assert!(cmake.contains("Only the combiner input to blending receives this bounded policy"));
-        assert!(
-            cmake.contains("otherMode, combinerColor.a, floor(vertexPosition.xy), randomSeed);")
+        assert!(cmake.contains("Fn64RdpTakeFragmentNoiseSample(randomSeed);"));
+        assert_eq!(
+            cmake
+                .matches("Fn64RdpFragmentNoiseUnitFloat(fragmentNoise)")
+                .count(),
+            2,
+            "combiner NOISE and G_AC_DITHER must consume the same sample"
         );
+        assert!(
+            cmake.contains("otherMode, combinerColor.a, floor(vertexPosition.xy), fragmentNoise);")
+        );
+        assert!(cmake.contains("RT64 raster PS retains an unshared fragment-noise draw"));
 
         for mechanism in [
+            "struct Fn64RdpFragmentNoiseSample",
+            "Fn64RdpTakeFragmentNoiseSample(",
+            "Fn64RdpFragmentNoiseUnitFloat(",
+            "Fn64RdpFragmentNoiseLowThreeBits(",
             "otherMode.alphaDither() == G_AD_DISABLE",
             "AlphaDitherValue(",
-            "fragmentRandomState);",
+            "Fn64RdpFragmentNoiseLowThreeBits(fragmentNoise));",
             "round(clamp(combinerAlpha, 0.0f, 1.0f) * 255.0f)",
             "(alpha8 & 7U) > threshold",
             "(rounded5 << 3U) | (rounded5 >> 2U)",
         ] {
             assert!(shader.contains(mechanism), "alpha policy lost {mechanism}");
         }
+        assert_eq!(
+            shader.matches("nextRandUint(").count(),
+            1,
+            "typed fragment sample must advance the generator exactly once"
+        );
         assert!(!shader.contains("nextRand("));
         assert!(!shader.contains("shadeColor"));
         assert!(!shader.contains("fogColor"));
