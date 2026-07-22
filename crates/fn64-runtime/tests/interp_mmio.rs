@@ -101,7 +101,7 @@ impl<R: fn64_runtime::RomStorage, T: PiTimingModel> MmioPort for FabricPort<'_, 
             return MmioOutcome::NotMmio;
         }
         match self.fabric.write_mmio(Self::mmio_addr(vaddr), value) {
-            Ok(()) => MmioOutcome::Handled(()),
+            Ok(_) => MmioOutcome::Handled(()),
             Err(_) => MmioOutcome::Fault { addr: vaddr },
         }
     }
@@ -237,6 +237,130 @@ fn interpreted_sw_to_pi_status_updates_modeled_device_state() {
         !fabric.interrupt_pending(fn64_runtime::InterruptSource::Pi),
         "the interpreted sw cleared the modeled PI interrupt"
     );
+}
+
+#[test]
+fn interpreted_ai_programming_uses_the_fabric_latches_and_timed_fifo() {
+    // Enable DMA, program DACRATE, DRAM_ADDR, and LEN, then read STATUS and
+    // LEN back.
+    let catalog = catalog_of(&[
+        0x3C08_A450, // lui $t0,0xA450
+        0x3409_0001, // ori $t1,$zero,1
+        0xAD09_0008, // sw $t1,AI_CONTROL($t0)
+        0x3409_0097, // ori $t1,$zero,151
+        0xAD09_0010, // sw $t1,AI_DACRATE($t0)
+        0x3409_0200, // ori $t1,$zero,0x200
+        0xAD09_0000, // sw $t1,AI_DRAM_ADDR($t0)
+        0x3409_0080, // ori $t1,$zero,0x80
+        0xAD09_0004, // sw $t1,AI_LEN($t0)
+        0x8D02_000C, // lw $v0,AI_STATUS($t0)
+        0x8D03_0004, // lw $v1,AI_LEN($t0)
+        0x03E0_0008, // jr $ra
+        0x0000_0000, // nop
+    ]);
+    let mut fabric = fabric();
+    fabric
+        .configure_tv_type(fn64_runtime::TvType::Ntsc)
+        .unwrap();
+    let mut storage = vec![0u8; 64];
+    let mut mem = Rdram::new(&mut storage);
+    let mut ctx = RecompContext::new();
+    let mut port = FabricPort {
+        fabric: &mut fabric,
+    };
+    run_bank_with_mmio(
+        &catalog,
+        BANK,
+        ExecutionKey::new(BANK, GuestPc::new(VA)),
+        InstructionBudget::new(18).unwrap(),
+        &mut ctx,
+        &mut mem,
+        &mut port,
+    )
+    .unwrap();
+
+    let snapshot = fabric.snapshot();
+    assert_eq!(snapshot.ai_dram_addr, RdramAddr::from_offset(0x200));
+    assert_eq!(snapshot.ai_dacrate, 151);
+    assert_eq!(snapshot.ai_length, 0x80);
+    assert_eq!(
+        ctx.r(2) as u32,
+        fn64_runtime::AI_STATUS_ENABLED | fn64_runtime::AI_STATUS_BUSY
+    );
+    assert_eq!(ctx.r(3), 0x80);
+}
+
+#[test]
+fn interpreted_dpc_end_waits_for_commit_and_identical_end_does_not_replay() {
+    let submit = catalog_of(&[
+        0x3C08_A410, // lui $t0,0xA410
+        0x3409_0100, // ori $t1,$zero,0x100
+        0xAD09_0000, // sw $t1,DPC_START($t0)
+        0x3409_0140, // ori $t1,$zero,0x140
+        0xAD09_0004, // sw $t1,DPC_END($t0)
+        0x8D02_0008, // lw $v0,DPC_CURRENT($t0)
+        0x8D03_000C, // lw $v1,DPC_STATUS($t0)
+        0x03E0_0008, // jr $ra
+        0x0000_0000, // nop
+    ]);
+    let mut fabric = fabric();
+    let mut storage = vec![0u8; 64];
+    let mut mem = Rdram::new(&mut storage);
+    let mut ctx = RecompContext::new();
+    let mut port = FabricPort {
+        fabric: &mut fabric,
+    };
+    run_bank_with_mmio(
+        &submit,
+        BANK,
+        ExecutionKey::new(BANK, GuestPc::new(VA)),
+        InstructionBudget::new(16).unwrap(),
+        &mut ctx,
+        &mut mem,
+        &mut port,
+    )
+    .unwrap();
+    let transaction = fabric
+        .pending_dpc_submission()
+        .expect("interpreted END must retain a renderer transaction");
+    assert_eq!(transaction.source, fn64_runtime::DpcSubmissionSource::Rdram);
+    assert_eq!((transaction.start, transaction.end), (0x100, 0x140));
+    assert_eq!(
+        ctx.r(2),
+        0x100,
+        "CURRENT stops at START before renderer commit"
+    );
+    assert_ne!(ctx.r(3) as u32 & fn64_runtime::DPC_STATUS_DMA_BUSY, 0);
+
+    fabric.commit_dpc_submission(transaction.token).unwrap();
+    assert_eq!(fabric.snapshot().dpc_current, 0x140);
+
+    // A later interpreted write of the same END pointer is a valid no-op,
+    // not a second submission of the already consumed command bytes.
+    let repeat = catalog_of(&[
+        0x3C08_A410,
+        0x3409_0140,
+        0xAD09_0004,
+        0x8D02_0008,
+        0x03E0_0008,
+        0x0000_0000,
+    ]);
+    let mut ctx = RecompContext::new();
+    let mut port = FabricPort {
+        fabric: &mut fabric,
+    };
+    run_bank_with_mmio(
+        &repeat,
+        BANK,
+        ExecutionKey::new(BANK, GuestPc::new(VA)),
+        InstructionBudget::new(12).unwrap(),
+        &mut ctx,
+        &mut mem,
+        &mut port,
+    )
+    .unwrap();
+    assert_eq!(ctx.r(2), 0x140);
+    assert_eq!(fabric.pending_dpc_submission(), None);
 }
 
 /// (3a) Canonical non-RDRAM KSEG windows use the same sparse backing layout as
