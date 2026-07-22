@@ -25,8 +25,10 @@
 //! spanning zero, small, sign-bit-set, and max. This is the strong check, not
 //! a bbox/fuzzy one.
 //!
-//! The arbitrary-PC lane models Status/Cause/EPC moves, ERET, and typed
-//! synchronous exceptions. TLB and unavailable coprocessor state remain loud.
+//! The arbitrary-PC lane models Status/Cause/EPC moves, ERET, typed
+//! synchronous exceptions, and the public indexed write/read/probe TLB
+//! management operations. TLBWR, address translation, and unavailable
+//! coprocessor state remain loud.
 //! Decoder and structural emitter tests keep that boundary explicit.
 
 use fn64_recomp_rs::{decode, emit_function, FuncInput, Instruction, Rdram, RecompContext};
@@ -309,14 +311,6 @@ fn privileged_ops_emit_loud_traps() {
             needle: "tlbwr",
         }, // tlbwr
         Case {
-            word: 0x42000008,
-            needle: "tlbp",
-        }, // tlbp
-        Case {
-            word: 0x42000001,
-            needle: "tlbr",
-        }, // tlbr
-        Case {
             word: 0x48021800,
             needle: "COP2 access in recompiled code",
         }, // mfc2
@@ -460,5 +454,92 @@ fn tlbwi_records_the_staged_entry_instead_of_trapping() {
     assert!(
         emitted.contains("ctx.tlbwi_record();"),
         "tlbwi must record the staged entry; emitted:\n{emitted}"
+    );
+}
+
+#[test]
+fn tlbr_and_tlbp_emit_typed_management_operations() {
+    for (word, needle) in [
+        (0x4200_0001, "ctx.tlbr_read();"),
+        (0x4200_0008, "ctx.tlbp_probe();"),
+    ] {
+        let emitted = emit_function(&FuncInput {
+            name: "t",
+            vram: 0x8000_1000,
+            words: &[word, 0x03E0_0008, 0],
+        });
+        assert!(
+            emitted.contains(needle),
+            "TLB management op {word:#010x} must use typed state:\n{emitted}"
+        );
+        assert!(!emitted.contains("trap_unsupported"));
+    }
+}
+
+#[test]
+fn tlb_read_and_probe_follow_vpn_mask_asid_and_global_rules() {
+    let mut ctx = RecompContext::new();
+    ctx.cop0_index = 7;
+    ctx.cop0_page_mask = 0x0000_6000;
+    ctx.cop0_entry_hi = 0x1234_400a;
+    ctx.cop0_entry_lo0 = 0x0000_0046;
+    ctx.cop0_entry_lo1 = 0x0000_0086;
+    ctx.tlbwi_record();
+
+    ctx.cop0_page_mask = 0;
+    ctx.cop0_entry_hi = 0;
+    ctx.cop0_entry_lo0 = 0;
+    ctx.cop0_entry_lo1 = 0;
+    ctx.tlbr_read();
+    assert_eq!(ctx.cop0_page_mask, 0x0000_6000);
+    assert_eq!(ctx.cop0_entry_hi, 0x1234_400a);
+    assert_eq!(ctx.cop0_entry_lo0, 0x0000_0046);
+    assert_eq!(ctx.cop0_entry_lo1, 0x0000_0086);
+
+    // The entry's 16 KiB pair masks VPN2 bits 14:13; same ASID matches.
+    ctx.cop0_entry_hi = 0x1234_200a;
+    ctx.tlbp_probe();
+    assert_eq!(ctx.cop0_index, 7);
+
+    // A non-global entry requires ASID equality.
+    ctx.cop0_entry_hi = 0x1234_200b;
+    ctx.tlbp_probe();
+    assert_eq!(ctx.cop0_index, 0x8000_0000);
+
+    // Both EntryLo G bits make the mapping global; Valid is irrelevant to the
+    // probe comparison.
+    ctx.tlb_entries[7].entry_lo0 = 1;
+    ctx.tlb_entries[7].entry_lo1 = 1;
+    ctx.tlbp_probe();
+    assert_eq!(ctx.cop0_index, 7);
+
+    ctx.cop0_entry_hi = 0x2234_200b;
+    ctx.tlbp_probe();
+    assert_eq!(ctx.cop0_index, 0x8000_0000);
+}
+
+#[test]
+fn tlbp_rejects_the_architecturally_undefined_multiple_match_case() {
+    let mut ctx = RecompContext::new();
+    ctx.cop0_entry_hi = 0x3456_700c;
+    for index in [2u32, 19] {
+        ctx.cop0_index = index;
+        ctx.cop0_page_mask = 0;
+        ctx.cop0_entry_hi = 0x3456_600c;
+        ctx.cop0_entry_lo0 = 0;
+        ctx.cop0_entry_lo1 = 0;
+        ctx.tlbwi_record();
+    }
+    ctx.cop0_entry_hi = 0x3456_700c;
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.tlbp_probe()))
+        .expect_err("multiple matching TLB entries must remain loud");
+    let message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .expect("TLBP undefined-case panic must be text");
+    assert_eq!(
+        message,
+        "TLBP found multiple matching entries; VR4300 behavior is undefined"
     );
 }

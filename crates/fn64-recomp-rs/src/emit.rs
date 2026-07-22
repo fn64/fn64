@@ -2261,8 +2261,8 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
         ),
         Tlbwi => line(out, "ctx.tlbwi_record();".to_string()),
         Tlbwr => unsupported(out, "tlbwr: TLB is host-managed, not modeled".to_owned()),
-        Tlbp => unsupported(out, "tlbp: TLB is host-managed, not modeled".to_owned()),
-        Tlbr => unsupported(out, "tlbr: TLB is host-managed, not modeled".to_owned()),
+        Tlbp => line(out, "ctx.tlbp_probe();".to_string()),
+        Tlbr => line(out, "ctx.tlbr_read();".to_string()),
 
         // --- Cache / sync: no-ops on a coherent host rdram ---
         Cache { op, .. } => {

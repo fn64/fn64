@@ -34,7 +34,10 @@
 /// …) enforce the sign/zero-extension contract so emitted code never open-codes
 /// a cast.
 /// One raw TLB entry as staged by the COP0 registers at `tlbwi` time.
-/// Bookkeeping only -- no translation is performed through these.
+///
+/// The entry participates in the public `TLBR` and `TLBP` management
+/// operations, but guest address translation through it remains a separate
+/// loud frontier.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TlbEntryRaw {
     pub page_mask: u32,
@@ -117,7 +120,8 @@ pub struct RecompContext {
     /// through recorded entries is not modeled (use faults at the memory
     /// path).
     pub cop0_index: u32,
-    /// Raw recorded TLB entries (see `tlbwi_record`).
+    /// Raw recorded TLB entries (see `tlbwi_record`, `tlbr_read`, and
+    /// `tlbp_probe`).
     pub tlb_entries: [TlbEntryRaw; 32],
     pub cop0_entry_lo0: u32,
     pub cop0_entry_lo1: u32,
@@ -298,9 +302,6 @@ impl RecompContext {
         }
     }
 
-    /// Read a modeled 32-bit COP0 register for MFC0. Registers whose
-    /// architectural behavior is not represented here remain loud instead of
-    /// fabricating a value.
     /// `tlbwi`: record the indexed entry from the staged COP0 TLB registers.
     /// Address TRANSLATION through recorded entries is not modeled -- KSEG0/
     /// KSEG1 code never needs it, and an actual load/store through a mapped
@@ -316,6 +317,49 @@ impl RecompContext {
             entry_lo0: self.cop0_entry_lo0,
             entry_lo1: self.cop0_entry_lo1,
         };
+    }
+
+    /// `tlbr`: load the staged COP0 registers from the indexed TLB entry.
+    ///
+    /// VR4300 User's Manual section 5.4.11 names exactly these four
+    /// destinations. Index bit 5 and the probe-failure bit do not participate
+    /// in the 32-entry array index.
+    pub fn tlbr_read(&mut self) {
+        let entry = self.tlb_entries[(self.cop0_index & 31) as usize];
+        self.cop0_page_mask = entry.page_mask;
+        self.cop0_entry_hi = entry.entry_hi;
+        self.cop0_entry_lo0 = entry.entry_lo0;
+        self.cop0_entry_lo1 = entry.entry_lo1;
+    }
+
+    /// `tlbp`: probe all recorded entries using VPN2/PageMask plus ASID or the
+    /// entry's paired Global bits, and publish the result in COP0 Index.
+    ///
+    /// Valid and Dirty do not participate in a tag match. More than one match
+    /// is architecturally undefined, so the deterministic runtime traps rather
+    /// than selecting an arbitrary entry. On a miss the architecture leaves
+    /// the low Index field unpredictable; fn64's bounded deterministic policy
+    /// clears that field and sets only the probe-failure bit.
+    pub fn tlbp_probe(&mut self) {
+        const VPN2_MASK: u32 = 0xffff_e000;
+        const PAGE_MASK: u32 = 0x01ff_e000;
+        const ASID_MASK: u32 = 0x0000_00ff;
+        const GLOBAL: u32 = 1;
+
+        let probe = self.cop0_entry_hi;
+        let mut matched = None;
+        for (index, entry) in self.tlb_entries.iter().enumerate() {
+            let compared_vpn = VPN2_MASK & !(entry.page_mask & PAGE_MASK);
+            let vpn_matches = (probe ^ entry.entry_hi) & compared_vpn == 0;
+            let global = entry.entry_lo0 & GLOBAL != 0 && entry.entry_lo1 & GLOBAL != 0;
+            let asid_matches = (probe ^ entry.entry_hi) & ASID_MASK == 0;
+            if vpn_matches && (global || asid_matches) && matched.replace(index).is_some() {
+                trap_unsupported(
+                    "TLBP found multiple matching entries; VR4300 behavior is undefined",
+                );
+            }
+        }
+        self.cop0_index = matched.map_or(1 << 31, |index| index as u32);
     }
 
     #[inline]
