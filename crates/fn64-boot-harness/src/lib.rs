@@ -31,9 +31,9 @@ pub use observation_evidence::{
 };
 pub use platform_certification::{
     emit_rt64_platform_child_identity, run_rt64_platform_case_series, PlatformCertificationError,
-    Rt64PlatformCase, Rt64PlatformTarget, VerifiedRt64PlatformCaseAuthority,
-    VerifiedRt64PlatformCaseSeries, RT64_PLATFORM_CHILD_IDENTITY_SCHEMA,
-    VERIFIED_RT64_PLATFORM_CASE_AUTHORITY_SCHEMA,
+    PreflightedRt64PlatformCase, Rt64PlatformCase, Rt64PlatformTarget,
+    VerifiedRt64PlatformCaseAuthority, VerifiedRt64PlatformCaseSeries,
+    RT64_PLATFORM_CHILD_IDENTITY_SCHEMA, VERIFIED_RT64_PLATFORM_CASE_AUTHORITY_SCHEMA,
 };
 pub use private_release_series::{
     load_private_release_run_contract, run_private_release_series, verify_private_release_series,
