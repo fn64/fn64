@@ -749,8 +749,9 @@ green 2000 at swap #2620, with the blinking PRESS START at #2700**
 `/tmp/wm2000-title-press-start-LIVE.png`). Crash-free throughout.
 Workspace tests: 1364 passed / 0 failed.
 
-## IN PROGRESS (2026-07-21, ladder 3 "press START" rung): scripted input
-## works -- START leaves the title for the Rumble Pak notice
+## SUCCESS (2026-07-21, ladder 3 "press START" rung): scripted input
+## drives the game INTO ITS MENUS -- title -> Rumble Pak notice -> main
+## menu -> Exhibition submenu, all presented live
 
 Deterministic scripted controller input landed in the harness (this is
 the mechanism, see `src/main.rs`):
@@ -770,18 +771,42 @@ own raw `__osSiRawStartDma` polls consume (NWXE never calls high-level
 two runs of the same binary produce byte-identical frame PNGs at the
 same swap index.
 
-**Result so far:** START held over swaps 2640..2650 (title screen live
-on screen, PRESS START blinking) EXITS THE ATTRACT LOOP: by swap ~2660
-the PRESS START prompt is gone, and at ~2680 the game presents the
-post-title **"Rumble Pak supported. Insert a Rumble Pak now."** notice
-over the title art -- the documented pre-menu screen. Frames:
+**The full result (two scripted runs, one control):**
+
+1. START held over swaps 2640..2650 (title live, PRESS START blinking)
+   EXITS THE ATTRACT LOOP: by ~2660 the prompt is gone and at ~2680 the
+   game presents the post-title **"Rumble Pak supported. Insert a
+   Rumble Pak now."** notice over the title art. The no-input control
+   run proved the notice does NOT time out on its own under current
+   pacing (still up 1,429 swaps later when the control was stopped) --
+   it waits for a press, matching its "insert a pak now" invitation.
+2. A (0x8000) at swaps 2820..2830 DISMISSES the notice: by swap ~2860
+   the game presents its full MAIN MENU -- Exhibition (highlighted),
+   RoadtoWrestleMania, KINGoftheRING, Pay Per View, Edit, Royal Rumble,
+   Options, Data -- pixel-crisp over the WF diamond-plate backdrop.
+3. A again at swaps 3150..3160 SELECTS Exhibition: the menu plays its
+   spinning fly-in/fly-out transition (captured mid-flight at #3161)
+   and settles on the **Exhibition submenu: Single Match / Tag Match /
+   3 Way Match / Cage Match** by #3190, then idles there stably
+   (crash-free through #3500, where the run was stopped).
+
+Frames parked in `/Users/jer/Code/wm2000-run/artifacts/`:
 `wm2000-title-start-pressed-swap2640.png`,
-`wm2000-rumble-pak-notice-swap2680.png` (parked in
-`/Users/jer/Code/wm2000-run/artifacts/`). The no-further-input control
-run shows the notice persisting 1,100+ swaps -- it does not appear to
-time out on its own under current pacing; a second scripted run
-(START, then A at 2820 to dismiss, A again at 3150 to descend into the
-menus) is the next probe.
+`wm2000-rumble-pak-notice-swap2680.png`,
+`wm2000-main-menu-swap2860.png`,
+`wm2000-menu-transition-swap3161.png`,
+`wm2000-exhibition-submenu-swap3190.png`, plus
+`wm2000-attract-demo-match-swap700.png` (the attract demo match, ring +
+crowd + signs, en route). Scripted determinism verified: the input run
+is byte-identical to the control at every shared swap (`cmp` on the
+swap-100 and swap-2680 PNGs) -- presses only perturb what follows them.
+
+The game's menu stack runs on the SAME frame/timing machinery as the
+attract (one game frame per ~2 swaps, osGetTime-clocked transitions),
+so this rung consumed no new fn64 surface: zero runtime changes, pure
+harness scripting through the existing PIF input seam. A deeper run
+(A at 3400 to enter Single Match toward the wrestler-select grid) is
+the natural next rung.
 
 ## Superseded framing (2026-07-21, earlier): the fade's opaque black under-cover (game timeline, not blending)
 
