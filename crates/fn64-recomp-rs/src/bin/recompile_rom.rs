@@ -586,11 +586,21 @@ impl FuncResult {
 fn trap_kind(instr: &Instruction) -> Option<&'static str> {
     use Instruction::*;
     Some(match instr {
-        Mfc0 { cop0d: 9 | 11, .. } | Mtc0 { cop0d: 9 | 11, .. } => return None,
+        Mfc0 {
+            cop0d: 0 | 2 | 3 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30,
+            ..
+        }
+        | Mtc0 {
+            cop0d: 0 | 2 | 3 | 5 | 6 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30,
+            ..
+        }
+        | Tlbwi
+        | Tlbp
+        | Tlbr => return None,
         Mfc0 { .. } | Mtc0 { .. } => "cop0-move",
         Dmfc0 { .. } | Dmtc0 { .. } => "cop0-dmove",
         Eret => "eret",
-        Tlbwi | Tlbwr | Tlbp | Tlbr => "tlb",
+        Tlbwr => "tlb",
         Mfc2 { .. } | Mtc2 { .. } | Cfc2 { .. } | Ctc2 { .. } => "cop2",
         Syscall { .. } => "syscall",
         Break { .. } => "break",
@@ -926,19 +936,25 @@ mod tests {
     }
 
     #[test]
-    fn modeled_cop0_count_and_compare_are_not_runtime_traps() {
+    fn modeled_whole_function_cop0_operations_are_not_runtime_traps() {
         for instruction in [
             Instruction::Mfc0 { rt: 2, cop0d: 9 },
             Instruction::Mfc0 { rt: 2, cop0d: 11 },
             Instruction::Mtc0 { rt: 2, cop0d: 9 },
             Instruction::Mtc0 { rt: 2, cop0d: 11 },
+            Instruction::Mfc0 { rt: 2, cop0d: 12 },
+            Instruction::Mtc0 { rt: 2, cop0d: 12 },
+            Instruction::Tlbwi,
+            Instruction::Tlbp,
+            Instruction::Tlbr,
         ] {
             assert_eq!(trap_kind(&instruction), None);
         }
         assert_eq!(
-            trap_kind(&Instruction::Mfc0 { rt: 2, cop0d: 12 }),
+            trap_kind(&Instruction::Mfc0 { rt: 2, cop0d: 1 }),
             Some("cop0-move")
         );
+        assert_eq!(trap_kind(&Instruction::Tlbwr), Some("tlb"));
     }
 
     #[test]

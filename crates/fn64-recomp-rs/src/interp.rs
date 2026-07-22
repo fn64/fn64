@@ -39,8 +39,9 @@
 //! Explicitly OUT (each a loud [`StepFault::Unsupported`] naming the opcode, the
 //! same frontier the AOT lane leaves open — see `Still open in U4` in
 //! `docs/UNIVERSAL-RUNTIME-PLAN.md`): the entire COP1/FPU environment, COP2,
-//! `TLBWR`, TLB translation, `ERET`, `SYSCALL`/`BREAK`, and the conditional trap ops. Modeled
-//! 32-bit COP0 moves and `TLBWI`/`TLBR`/`TLBP` share the typed context with the
+//! TLB translation, `ERET`, `SYSCALL`/`BREAK`, and the conditional trap ops.
+//! Modeled 32-bit COP0 moves, the inclusive Random/Wired instruction countdown,
+//! and `TLBWI`/`TLBWR`/`TLBR`/`TLBP` share the typed context with the arbitrary-PC
 //! AOT lane. Precise
 //! VR4300 exception vectoring, `BadVAddr`/`EPC`/`Cause`, TLB-miss vs.
 //! address-error, and alignment (`AdEL`/`AdES`) faulting are likewise absent, as
@@ -414,6 +415,12 @@ impl Interp<'_> {
         let fallthrough = delay_pc.wrapping_add(4);
         let target = branch_target(&instr, pc);
 
+        // Random is coupled to explicit arbitrary-PC instruction boundaries.
+        // The branch executes before its delay instruction; a taken delay
+        // observes the decremented value, while an annulled likely slot still
+        // consumes the block lane's second deterministic instruction unit.
+        ctx.advance_cop0_random(1);
+
         // Run the delay slot as an ordinary instruction. It may fault (memory)
         // or be unsupported; either annuls the branch and propagates typed. The
         // delay slot is itself an ordinary instruction, so it too may be an MMIO
@@ -478,6 +485,7 @@ impl Interp<'_> {
                         run_delay(ctx, mem, port)?;
                         self.proven_or_resolved(target)
                     } else {
+                        ctx.advance_cop0_random(1);
                         self.proven_or_resolved(fallthrough)
                     }
                 } else {
@@ -492,6 +500,7 @@ impl Interp<'_> {
                     run_delay(ctx, mem, port)?;
                     self.proven_or_resolved(target)
                 } else {
+                    ctx.advance_cop0_random(1);
                     self.proven_or_resolved(fallthrough)
                 }
             }
@@ -553,6 +562,7 @@ impl Interp<'_> {
                 match port.read_w(addr) {
                     MmioOutcome::Handled(v) => {
                         ctx.set_r32(rt, v as i32);
+                        ctx.advance_cop0_random(1);
                         return ok;
                     }
                     MmioOutcome::Fault { addr } => return Err(mem_fault(addr)),
@@ -562,7 +572,10 @@ impl Interp<'_> {
             Instruction::Sw { rt, base, off } => {
                 let addr = Rdram::eff_addr(ctx.r(base), off);
                 match port.write_w(addr, ctx.r_u32(rt)) {
-                    MmioOutcome::Handled(()) => return ok,
+                    MmioOutcome::Handled(()) => {
+                        ctx.advance_cop0_random(1);
+                        return ok;
+                    }
                     MmioOutcome::Fault { addr } => return Err(mem_fault(addr)),
                     MmioOutcome::NotMmio => {}
                 }
@@ -571,6 +584,7 @@ impl Interp<'_> {
         }
 
         exec_straight(instr, ctx, mem, &mem_fault, &unsupported)?;
+        ctx.advance_cop0_random(1);
         ok
     }
 }
@@ -891,7 +905,7 @@ fn exec_straight(
 
         // --- Modeled COP0/TLB management ---
         Mfc0 { rt, cop0d } => match cop0d {
-            0 | 2 | 3 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30 => {
+            0 | 1 | 2 | 3 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30 => {
                 ctx.set_r32(rt, ctx.read_cop0(cop0d) as i32);
             }
             _ => return Err(unsupported()),
@@ -903,6 +917,7 @@ fn exec_straight(
             _ => return Err(unsupported()),
         },
         Tlbwi => ctx.tlbwi_record(),
+        Tlbwr => ctx.tlbwr_record(),
         Tlbr => ctx.tlbr_read(),
         Tlbp => ctx.tlbp_probe(),
 
@@ -997,15 +1012,74 @@ mod tests {
 
     #[test]
     fn unsupported_opcode_is_a_loud_typed_fault_not_a_panic_or_nop() {
-        // TLBWR depends on the per-instruction Random countdown and remains
-        // outside this slice: decoded, then a typed unsupported fault naming
-        // the op, exactly where the AOT lane traps.
-        let tlbwr = 0x4200_0006;
-        let catalog = catalog_of(&[tlbwr, 0x03E0_0008, 0x0000_0000]);
+        // DMFC0 remains outside this slice: decoded, then a typed unsupported
+        // fault naming the op, exactly where the AOT lane traps.
+        let dmfc0 = 0x4022_4800;
+        let catalog = catalog_of(&[dmfc0, 0x03E0_0008, 0x0000_0000]);
         let mut ctx = RecompContext::new();
         let err = run(&catalog, VA, 8, &mut ctx).unwrap_err();
         assert_eq!(err.at, ExecutionKey::new(BANK, GuestPc::new(VA)));
-        assert_eq!(err.instruction, Instruction::Tlbwr);
+        assert_eq!(err.instruction, Instruction::Dmfc0 { rt: 2, cop0d: 9 });
+    }
+
+    #[test]
+    fn random_and_tlbwr_follow_interpreter_instruction_order() {
+        let words = [
+            0x2402_001d, // addiu $v0,$zero,29
+            0x4082_3000, // mtc0  $v0,Wired: Random resets to 31, then advances
+            0x4200_0006, // tlbwr: samples 30, then advances to 29
+            0x4003_0800, // mfc0  $v1,Random: observes 29
+            0x03e0_0008, // jr $ra
+            0x0000_0000, // nop
+        ];
+        let catalog = catalog_of(&words);
+        let mut ctx = RecompContext::new();
+        ctx.set_r(31, 0x8000_9000);
+        ctx.cop0_entry_hi = 0x1234_500a;
+        ctx.cop0_entry_lo0 = 0x46;
+        ctx.cop0_entry_lo1 = 0x86;
+        ctx.cop0_page_mask = 0x6000;
+
+        let result = run(&catalog, VA, words.len() as u32, &mut ctx).unwrap();
+        assert_eq!(result.instructions, words.len() as u32);
+        assert_eq!(ctx.r_u32(3), 29);
+        assert_eq!(ctx.tlb_entries[30].entry_hi, 0x1234_500a);
+        assert_eq!(ctx.tlb_entries[30].entry_lo0, 0x46);
+        assert_eq!(ctx.tlb_entries[30].entry_lo1, 0x86);
+        assert_eq!(ctx.tlb_entries[30].page_mask, 0x6000);
+        assert_eq!(ctx.read_cop0(1), 29);
+    }
+
+    #[test]
+    fn annulled_likely_slot_consumes_the_runners_second_random_unit() {
+        let words = [
+            0x5002_0001, // beql $zero,$v0,+1: not taken when v0=1
+            0x2403_0077, // addiu $v1,$zero,0x77: annulled
+            0x4004_0800, // mfc0 $a0,Random
+        ];
+        let catalog = catalog_of(&words);
+        let mut ctx = RecompContext::new();
+        ctx.set_r(2, 1);
+
+        let branch = run(&catalog, VA, 3, &mut ctx).unwrap();
+        assert_eq!(branch.instructions, 2);
+        assert_eq!(
+            branch.exit,
+            BlockExit::Transfer(ExecutionKey::new(BANK, GuestPc::new(VA + 8)))
+        );
+        assert_eq!(
+            ctx.r_u32(3),
+            0,
+            "likely delay instruction must stay annulled"
+        );
+        let sample = run(&catalog, VA + 8, 2, &mut ctx).unwrap();
+        assert_eq!(sample.instructions, 1);
+        assert_eq!(
+            ctx.r_u32(4),
+            29,
+            "branch plus annulled charged unit advance Random twice"
+        );
+        assert_eq!(ctx.read_cop0(1), 28, "MFC0 retires after sampling Random");
     }
 
     #[test]

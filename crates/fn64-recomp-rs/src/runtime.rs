@@ -35,7 +35,7 @@
 /// a cast.
 /// One raw TLB entry as staged by the COP0 registers at `tlbwi` time.
 ///
-/// The entry participates in the public `TLBR` and `TLBP` management
+/// The entry participates in the public `TLBR`, `TLBWR`, and `TLBP` management
 /// operations, but guest address translation through it remains a separate
 /// loud frontier.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -115,19 +115,23 @@ pub struct RecompContext {
     /// paths remain open.
     pub cop0_badvaddr: u32,
     /// COP0 TLB registers (Index 0, EntryLo0/1 2/3, PageMask 5, Wired 6,
-    /// EntryHi 10). Stored round-trip state only: boot-time unmap-all loops
-    /// save/clear these and `tlbwi` records entries; address translation
-    /// through recorded entries is not modeled (use faults at the memory
-    /// path).
+    /// EntryHi 10). Boot-time unmap-all loops save/clear these; TLBWI/TLBWR
+    /// record entries and TLBR/TLBP inspect them. Address translation through
+    /// recorded entries is not modeled (use faults at the memory path).
     pub cop0_index: u32,
-    /// Raw recorded TLB entries (see `tlbwi_record`, `tlbr_read`, and
-    /// `tlbp_probe`).
+    /// Raw recorded TLB entries (see `tlbwi_record`, `tlbwr_record`,
+    /// `tlbr_read`, and `tlbp_probe`).
     pub tlb_entries: [TlbEntryRaw; 32],
     pub cop0_entry_lo0: u32,
     pub cop0_entry_lo1: u32,
     pub cop0_page_mask: u32,
-    pub cop0_wired: u32,
+    cop0_wired: u32,
     pub cop0_entry_hi: u32,
+    /// Instruction-coupled position within the inclusive Random countdown
+    /// `[31, Wired]`. Zero denotes Random=31, including after reset and every
+    /// Wired write. Keeping the phase rather than a second writable register
+    /// makes the lower bound structural.
+    cop0_random_phase: u32,
     /// COP0 WatchLo/WatchHi (registers 18/19). Stored round-trip state only:
     /// SDK boot code writes 0 to disarm the watchpoint on the way up, and
     /// nothing in this runtime models the watch exception itself (a set
@@ -303,7 +307,7 @@ impl RecompContext {
     }
 
     /// `tlbwi`: record the indexed entry from the staged COP0 TLB registers.
-    /// Address TRANSLATION through recorded entries is not modeled -- KSEG0/
+    /// Address translation through recorded entries is not modeled -- KSEG0/
     /// KSEG1 code never needs it, and an actual load/store through a mapped
     /// segment (e.g. libultra's osInitialize page at 0xC0000000) faults
     /// loudly at the memory path if a title ever dereferences one. Recording
@@ -311,6 +315,62 @@ impl RecompContext {
     /// as on hardware.
     pub fn tlbwi_record(&mut self) {
         let index = (self.cop0_index & 31) as usize;
+        self.tlb_entries[index] = TlbEntryRaw {
+            page_mask: self.cop0_page_mask,
+            entry_hi: self.cop0_entry_hi,
+            entry_lo0: self.cop0_entry_lo0,
+            entry_lo1: self.cop0_entry_lo1,
+        };
+    }
+
+    /// Current COP0 Random value. VR4300 User's Manual section 5.3.1 defines
+    /// the inclusive range from 31 through Wired and the Wired-write reset to
+    /// 31. Wired=31 therefore denotes the stable one-entry range containing 31.
+    #[inline]
+    pub fn cop0_random(&self) -> u32 {
+        let span = 32u32
+            .checked_sub(self.cop0_wired)
+            .filter(|span| *span != 0)
+            .unwrap_or_else(|| {
+                trap_unsupported(format!(
+                    "COP0 Wired value {} exceeds the 32-entry VR4300 TLB",
+                    self.cop0_wired
+                ))
+            });
+        31 - self.cop0_random_phase % span
+    }
+
+    /// Advance Random by fn64's charged guest-instruction units.
+    ///
+    /// The arbitrary-PC generated and interpreter lanes call this at their
+    /// explicit instruction boundaries. This is a bounded deterministic clock
+    /// policy, not a claim about the silicon cycle at which Random changes:
+    /// an ordinary successful instruction advances once, a branch/delay pair
+    /// advances twice, including the runner's charged unit for an annulled
+    /// likely slot, and a faulting straight instruction does not advance.
+    /// Whole-function execution has no such boundary and deliberately does
+    /// not call it; TLBWR remains loud in that lane.
+    #[inline]
+    pub fn advance_cop0_random(&mut self, instructions: u32) {
+        let span = 32u32
+            .checked_sub(self.cop0_wired)
+            .filter(|span| *span != 0)
+            .unwrap_or_else(|| {
+                trap_unsupported(format!(
+                    "COP0 Wired value {} exceeds the 32-entry VR4300 TLB",
+                    self.cop0_wired
+                ))
+            });
+        self.cop0_random_phase = (self.cop0_random_phase + instructions % span) % span;
+    }
+
+    /// `tlbwr`: record the staged entry at the current Random index.
+    ///
+    /// Random is sampled before the TLBWR instruction itself advances the
+    /// instruction clock, matching the ordinary read-before-retire ordering
+    /// used by the arbitrary-PC lanes.
+    pub fn tlbwr_record(&mut self) {
+        let index = self.cop0_random() as usize;
         self.tlb_entries[index] = TlbEntryRaw {
             page_mask: self.cop0_page_mask,
             entry_hi: self.cop0_entry_hi,
@@ -365,6 +425,7 @@ impl RecompContext {
     #[inline]
     pub fn read_cop0(&self, reg: u8) -> u32 {
         match reg {
+            1 => self.cop0_random(),
             8 => self.cop0_badvaddr,
             9 => self.cop0_count,
             11 => self.cop0_compare,
@@ -411,7 +472,15 @@ impl RecompContext {
             2 => self.cop0_entry_lo0 = value,
             3 => self.cop0_entry_lo1 = value,
             5 => self.cop0_page_mask = value,
-            6 => self.cop0_wired = value,
+            6 => {
+                if value > 31 {
+                    trap_unsupported(format!(
+                        "COP0 Wired value {value} exceeds the 32-entry VR4300 TLB"
+                    ));
+                }
+                self.cop0_wired = value;
+                self.cop0_random_phase = 0;
+            }
             10 => self.cop0_entry_hi = value,
             18 => self.cop0_watch_lo = value,
             19 => self.cop0_watch_hi = value,

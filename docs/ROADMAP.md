@@ -670,12 +670,16 @@ and deterministic output traces.
   60/50 Hz boot timing gives way to H_SYNC/V_SYNC-derived field deadlines once
   a mode latches, and host loops consume the live interval. Hardware-trace
   validation, exact random-stream identity, resampling/AA arithmetic, and
-  pixel-level RT64 capture remain open. Generated and arbitrary-PC CPU lanes
-  now share typed 32-bit COP0 moves plus indexed TLB write/read/probe state,
-  including PageMask and Global/ASID matching. TLBWR still requires an
-  instruction-coupled Random register, recorded entries do not yet translate
-  guest addresses, and the other fault classes plus remaining CP0/FPU/
-  controller/save behavior remain open.
+  pixel-level RT64 capture remain open. The arbitrary-PC generated and
+  interpreted CPU lanes now share typed 32-bit COP0 moves plus indexed/random
+  TLB write/read/probe state, including the public inclusive Random/Wired
+  range, TLBWR, and PageMask plus Global/ASID matching. Random advancement is
+  a bounded once-per-charged-instruction-unit policy, including the runner's
+  second unit for an annulled likely slot, not silicon cycle timing. The legacy
+  whole-function lane keeps Random/TLBWR loud because it has no instruction
+  clock. Recorded entries do not yet translate guest addresses; silicon-exact
+  Random timing, precise TLB refill/invalid/modified faults, and the other
+  fault classes plus remaining CP0/FPU/controller/save behavior remain open.
 - [~] **U6 general RSP/RDP** — the F3DEX2 reference lane now emits ordered
   triangle/color-image/fill/full-sync operations and executes all three legal
   public color-image layouts: size-defined 8-bit index/intensity, RGBA16, and
