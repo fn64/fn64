@@ -210,6 +210,145 @@ fn main() {
     let mut thread0_death_logged = false;
     let mut consecutive_idle_ticks = 0u32;
 
+    // WM2000_STOP_AT_SWAP=<n>: clean, bounded scripted runs -- stop (with the
+    // normal summary + trace + shutdown path) as soon as the VI swap counter
+    // reaches <n>. Swap-indexed like the input script, so a scripted ladder
+    // run can end deterministically right after its last press window's
+    // outcome has presented, instead of being killed by hand.
+    let stop_at_swap = std::env::var("WM2000_STOP_AT_SWAP").ok().map(|raw| {
+        raw.parse::<u64>()
+            .unwrap_or_else(|_| panic!("WM2000_STOP_AT_SWAP must be a positive integer, got {raw:?}"))
+    });
+
+    // Voice-map virgin-allocation reproduction (2026-07-21, ladder 3 rung):
+    // the AKI sound driver allocates its 4x0x30C per-channel array
+    // (func_800E1DF0, pointer stored at D_8011B5D8) UNCLEARED from the
+    // game's own next-fit heap, and its announcer request protocol
+    // (func_8011E4BC fires exactly one frame after assigning a wrestler id)
+    // resolves sound code 0 through the per-channel code->fileId voice map
+    // at chan+4 BEFORE the frame-paced installer (func_800F6ED8, reached via
+    // func_800F5704's assignment countdown) has populated it. The guest code
+    // is explicitly robust to a ZERO map entry -- func_800F5190's code-0 rule
+    // (asm 0x800F5310) falls back to the built-in announce tables
+    // (D_801065A0..D_80106610) when the slot reads 0 -- but NOT to arbitrary
+    // garbage. On hardware the fresh array reads the virgin (arena-init
+    // bzero'd, func_80000898 first call) zeros because the heap's next-fit
+    // roving pointer position at scene-init time is a function of thousands
+    // of timing-dependent alloc/free pairs (the chunked/streamed loaders);
+    // under fn64's current virtual-time pacing (the game frame loop runs
+    // ~1400 VI fields per frame against a hardware-cadence audio pump) that
+    // history collapses and the array lands exactly on the freed
+    // decompression temp of sound-map file 0x435, so slot 0 reads the stale
+    // compressed byte pair 0xC5BE and the streamer asserts on a wild fileId
+    // (the previously-parked func_80003DD4 bounds assert). Until fn64's
+    // frame pacing reproduces hardware's heap history, reproduce the
+    // hardware-visible OUTCOME at the harness level: whenever a NEW chan
+    // array pointer appears at D_8011B5D8, zero the four 0x124-entry
+    // (0x248-byte) voice maps at chan+4 -- exactly the virgin bytes the
+    // guest's own zero-tolerant fallback is designed for. Real installs
+    // (func_800F6ED8 runs, verified) land later and overwrite freely.
+    const WM2000_CHAN_ARRAY_PTR: u32 = 0x11B5D8; // D_8011B5D8 - 0x80000000
+    const WM2000_CHAN_STRIDE: u32 = 0x30C;
+    const WM2000_VOICE_MAP_BYTES: u32 = 0x248;
+    let mut last_chan_array_ptr = 0u32;
+
+    // Scripted controller input (2026-07-21, ladder-3 "press START" rung):
+    // deterministic, swap-indexed input injection through the REAL input seam
+    // (`fn64_abi::set_controller_state` -> `PifModel::set_input` -> the PIF
+    // command-1 read-data response the game's own osContGetReadData/raw SI
+    // DMA consumes). Swap-count indexing (not wall-clock) keeps runs
+    // reproducible: the swap counter is itself a pure function of virtual
+    // time. Two env knobs, composable:
+    //
+    // - `WM2000_PRESS_START=<swap>[+<hold>]` -- convenience: hold START
+    //   (0x1000, `OSContPad.button` bit) on port 0 from swap <swap> for
+    //   <hold> swaps (default 10), then release.
+    // - `WM2000_INPUT_SCRIPT=<from>..<to>:<buttons_hex>[:<sx>:<sy>];...` --
+    //   general form: during swaps [from, to) hold `buttons` (hex u16, e.g.
+    //   8000=A, 1000=START, 0800..0100=dpad) with optional signed decimal
+    //   stick values. Overlapping entries OR their buttons (sticks: last
+    //   entry wins), so chords are expressible.
+    //
+    // The composed state is re-evaluated at every swap-count change and fed
+    // through the seam only when it CHANGES -- an idle script leaves the pad
+    // untouched (honest neutral default).
+    struct InputScriptEntry {
+        from: u64,
+        to: u64,
+        buttons: u16,
+        stick_x: i8,
+        stick_y: i8,
+    }
+    let mut input_script: Vec<InputScriptEntry> = Vec::new();
+    if let Ok(raw) = std::env::var("WM2000_PRESS_START") {
+        let (swap, hold) = match raw.split_once('+') {
+            Some((s, h)) => (
+                s.parse::<u64>().unwrap_or_else(|_| {
+                    panic!("WM2000_PRESS_START swap must be an integer, got {raw:?}")
+                }),
+                h.parse::<u64>().unwrap_or_else(|_| {
+                    panic!("WM2000_PRESS_START hold must be an integer, got {raw:?}")
+                }),
+            ),
+            None => (
+                raw.parse::<u64>().unwrap_or_else(|_| {
+                    panic!("WM2000_PRESS_START must be <swap>[+<hold>], got {raw:?}")
+                }),
+                10,
+            ),
+        };
+        input_script.push(InputScriptEntry {
+            from: swap,
+            to: swap + hold,
+            buttons: 0x1000, // BTN_START
+            stick_x: 0,
+            stick_y: 0,
+        });
+    }
+    if let Ok(raw) = std::env::var("WM2000_INPUT_SCRIPT") {
+        for entry in raw.split(';').filter(|s| !s.trim().is_empty()) {
+            let mut parts = entry.trim().split(':');
+            let range = parts.next().unwrap_or_default();
+            let (from, to) = range
+                .split_once("..")
+                .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+                .unwrap_or_else(|| {
+                    panic!("WM2000_INPUT_SCRIPT entry {entry:?}: range must be <from>..<to>")
+                });
+            let buttons = parts
+                .next()
+                .and_then(|s| u16::from_str_radix(s, 16).ok())
+                .unwrap_or_else(|| {
+                    panic!("WM2000_INPUT_SCRIPT entry {entry:?}: buttons must be hex u16")
+                });
+            let stick_x = parts.next().map_or(0, |s| {
+                s.parse::<i8>()
+                    .unwrap_or_else(|_| panic!("WM2000_INPUT_SCRIPT entry {entry:?}: stick_x must be i8"))
+            });
+            let stick_y = parts.next().map_or(0, |s| {
+                s.parse::<i8>()
+                    .unwrap_or_else(|_| panic!("WM2000_INPUT_SCRIPT entry {entry:?}: stick_y must be i8"))
+            });
+            assert!(from < to, "WM2000_INPUT_SCRIPT entry {entry:?}: empty swap range");
+            input_script.push(InputScriptEntry {
+                from,
+                to,
+                buttons,
+                stick_x,
+                stick_y,
+            });
+        }
+    }
+    if !input_script.is_empty() {
+        for e in &input_script {
+            println!(
+                "[wm2000-input] scripted: swaps {}..{} buttons={:#06x} stick=({}, {})",
+                e.from, e.to, e.buttons, e.stick_x, e.stick_y
+            );
+        }
+    }
+    let mut last_applied_input: (u16, i8, i8) = (0, 0, 0);
+
     let mut tick = 0u64;
     let mut steps = 0u64;
     let mut drain = fn64_boot_harness::GuestDrain::default();
@@ -234,16 +373,27 @@ fn main() {
         let advanced_field =
             drain.before_step(next_priority) == fn64_boot_harness::DrainDecision::AdvanceField;
         if advanced_field {
+            // Anchor the field cursor to virtual time that has ACTUALLY
+            // elapsed. WM2000's corpus (unlike oot-boot) emits translated
+            // `InstructionCheckpoint` yields that charge real virtual time
+            // per guest step, so `sim_time` races ahead of a free-running
+            // `tick` cursor between field boundaries. Basing the next field
+            // on a stale `tick` alone would compute a `next_field` BELOW
+            // `sim_time`, and `advance_virtual_time(next_field)` then asserts
+            // "device time moved backwards" (pi.rs). Re-anchor to the current
+            // clock every field so the VI cadence tracks elapsed virtual time
+            // and never regresses.
+            let sim_now = fn64_abi::sim_time();
+            tick = tick.max(sim_now);
             let next_field = tick
                 + fn64_abi::vi_field_interval()
                     .expect("typed television standard must keep VI armed");
-            // Device completions land between fields: a guest slice charges
-            // (almost) no virtual time in the C lane, so a DMA issued
-            // mid-slice arms its deadline just past sim_time. Jumping a
-            // whole field would deliver EVERY completion a field late and
-            // break real issue-then-poll-next-frame guest pipelines
-            // (BOOT-NOTES-WM2000.md part 7: NWXE's joybus). Service any
-            // deadline due before the next field boundary first.
+            // Device completions land between fields: a DMA issued mid-slice
+            // arms its deadline just past sim_time. Jumping a whole field
+            // would deliver EVERY completion a field late and break real
+            // issue-then-poll-next-frame guest pipelines (BOOT-NOTES-WM2000.md
+            // part 7: NWXE's joybus). Service any deadline due before the next
+            // field boundary first.
             let device_deadline = fn64_abi::next_device_deadline()
                 .filter(|deadline| *deadline < next_field);
             match device_deadline {
@@ -251,7 +401,7 @@ fn main() {
                     // Service the earlier hardware event, but do NOT reset
                     // the field target: a chattering device (e.g. degenerate
                     // audio refeed) must never starve the VI tick.
-                    fn64_abi::advance_virtual_time(deadline.max(fn64_abi::sim_time()));
+                    fn64_abi::advance_virtual_time(deadline.max(sim_now));
                 }
                 None => {
                     tick = next_field;
@@ -267,6 +417,38 @@ fn main() {
             );
             drain.record_step(next_priority.expect("guest drain lost runnable priority"));
             steps += 1;
+        }
+        // Virgin-allocation reproduction for the AKI voice maps -- see the
+        // block comment above `last_chan_array_ptr` for the full story.
+        {
+            let view = fn64_runtime::RdramView::from_storage(&rdram);
+            let chan_ptr =
+                view.read_u32(fn64_runtime::RdramAddr::from_offset(WM2000_CHAN_ARRAY_PTR));
+            if chan_ptr != last_chan_array_ptr {
+                if chan_ptr >= 0x8000_0000
+                    && (chan_ptr as u64 - 0x8000_0000 + u64::from(WM2000_CHAN_STRIDE) * 4)
+                        < fn64_boot_harness::rdram_len() as u64
+                    && chan_ptr.is_multiple_of(4)
+                {
+                    let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+                    for chan in 0..4u32 {
+                        let map_guest = chan_ptr + chan * WM2000_CHAN_STRIDE + 4;
+                        for w in (0..WM2000_VOICE_MAP_BYTES).step_by(4) {
+                            view.write_u32(
+                                fn64_runtime::RdramAddr::from_offset(map_guest - 0x8000_0000 + w),
+                                0,
+                            );
+                        }
+                    }
+                    println!(
+                        "[wm2000-boot] fresh sound-channel array at {chan_ptr:#010x} \
+                         (step {steps}): zeroed the 4 per-channel voice maps (chan+4, \
+                         {WM2000_VOICE_MAP_BYTES:#x} bytes each) to the virgin-arena bytes the \
+                         guest's zero-tolerant code-0 fallback expects -- see source comment."
+                    );
+                }
+                last_chan_array_ptr = chan_ptr;
+            }
         }
         if steps.is_multiple_of(LOG_EVERY) {
             println!(
@@ -298,10 +480,46 @@ fn main() {
         // non-uniform (Task requirement 3).
         let swap_count = fn64_abi::vi_swap_count();
         if swap_count > last_swap_count {
+            // Scripted input: compose the pad state for THIS swap index and
+            // feed it through the real seam only on change (see the script
+            // block above the main loop).
+            if !input_script.is_empty() {
+                let mut buttons = 0u16;
+                let mut stick = (0i8, 0i8);
+                for e in &input_script {
+                    if swap_count >= e.from && swap_count < e.to {
+                        buttons |= e.buttons;
+                        if e.stick_x != 0 || e.stick_y != 0 {
+                            stick = (e.stick_x, e.stick_y);
+                        }
+                    }
+                }
+                let desired = (buttons, stick.0, stick.1);
+                if desired != last_applied_input {
+                    fn64_abi::set_controller_state(0, desired.0, desired.1, desired.2);
+                    println!(
+                        "[wm2000-input] swap #{swap_count}: pad0 -> buttons={:#06x} \
+                         stick=({}, {})",
+                        desired.0, desired.1, desired.2
+                    );
+                    let _ = std::io::stdout().flush();
+                    last_applied_input = desired;
+                }
+            }
             if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
                 capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);
             }
             last_swap_count = swap_count;
+            if let Some(stop) = stop_at_swap {
+                if swap_count >= stop {
+                    println!(
+                        "[wm2000-boot] WM2000_STOP_AT_SWAP={stop} reached (swap #{swap_count}, \
+                         step {steps}, sim_time={}) -- stopping",
+                        fn64_abi::sim_time()
+                    );
+                    break;
+                }
+            }
         }
 
         if advanced_field {
@@ -389,7 +607,10 @@ fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_index: u64, dumps: &mu
         "[wm2000-boot] swap #{swap_index}: framebuffer at {fb_offset:#010x} is NON-UNIFORM -- \
          dumping PNG."
     );
-    let path = format!("/tmp/fn64-fb-{swap_index}.png");
+    // WM2000_FB_DUMP_DIR: where swap PNGs land (default /tmp) -- lets two
+    // scripted runs coexist without clobbering each other's frames.
+    let dir = std::env::var("WM2000_FB_DUMP_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let path = format!("{dir}/fn64-fb-{swap_index}.png");
     match dump_rgba5551_as_png(rdram, start, FB_WIDTH, FB_HEIGHT, &path) {
         Ok(()) => {
             println!("[wm2000-boot] *** NON-UNIFORM FRAMEBUFFER DUMPED: {path} ***");
