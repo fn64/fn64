@@ -3817,7 +3817,7 @@ mod tests {
         };
         let execution_source = serde_json::to_value(&source).unwrap();
         let manifest = serde_json::json!({
-            "schema": "fn64.private-input-admission.v6",
+            "schema": "fn64.private-input-admission.v7",
             "purpose": "full_rom",
             "intent": {
                 "wire_family": "full_rom_mixed",
@@ -3837,6 +3837,8 @@ mod tests {
             "artifacts": {
                 "microcode_text": descriptor(&text_path, "user_owned_rom_derived"),
                 "microcode_data": descriptor(&data_path, "user_owned_rom_derived"),
+                "microcode_text_raw_window": null,
+                "microcode_data_raw_window": null,
                 "rom": descriptor(&rom_path, "publicly_distributed_homebrew_rom"),
                 "recompiled": descriptor(&recompiled_path, "user_generated_from_owned_rom"),
             },

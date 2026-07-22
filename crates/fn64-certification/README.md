@@ -12,3 +12,11 @@ The compatibility examples left in `fn64-render-rt64` include these sources
 temporarily so existing commands keep working. New evidence and documentation
 must use this package; the wrappers will be removed with the deliberate RT64
 adapter-identity v2 transition.
+
+The non-default `f3dzex2-characterization-evidence` feature owns the local
+private-input transport smoke for exact F3DZEX2 pairs. It forwards the
+renderer adapter's evidence-only API, re-executes the admission policy embedded
+in the compiled runner against a staged immutable manifest, verifies the exact
+consumed raw-window bytes against their descriptors, and emits no private
+path, digest, or content. This is mechanism evidence only; it does not certify
+point-light semantics or open production HLE admission.

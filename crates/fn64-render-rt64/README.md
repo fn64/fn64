@@ -42,6 +42,17 @@ Enable the native adapter with:
 cargo build -p fn64-render-rt64 --features rt64
 ```
 
+`f3dzex2-characterization-evidence` is a separate non-default research
+feature. Its explicitly evidence-named API classifies an exact raw 2.06H,
+2.08I, or 2.08J text/data pair, derives the logical entry plan from live
+RDRAM/RSP state, and runs that single generation through the same native
+schema and rollback boundary as production tasks. The caller cannot select or
+relabel the variant. This transport does not add F3DZEX2 to
+`RenderBackend::supported_ucodes`, change `RenderBackend::process_task`, or
+claim point-light behavior. It is entry-only: a task that self-loads another
+microcode generation must fail until exact raw-pair self-load planning is
+implemented.
+
 By default, the build expects RT64 at
 `../no-mercy-recompiled/third_party/rt64`. An allowed pinned checkout can be
 selected explicitly:
@@ -84,6 +95,11 @@ Presentation temporarily lends RT64 the live physical-RDRAM allocation and
 the vblank-latched VI image. Native queues are synchronized before the Rust
 borrow returns. Resize and capture paths validate workload/present identity so
 stale output cannot satisfy release evidence.
+
+Every native task path validates a complete aligned declared display-list
+range before FFI. A nonzero physical output address must be 64-bit aligned and
+cover the active surface's complete RGBA16 footprint; the same output check
+guards raw-DPC submission. Invalid ingress never leases the native context.
 
 ## Validation
 

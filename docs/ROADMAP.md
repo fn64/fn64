@@ -734,7 +734,10 @@ and deterministic output traces.
   enter HLE: point-light wire/arithmetic characterization, exact F3DZEX2
   raw-pair self-load resolution, native pixel differentials, and representative
   full-task evidence remain open, while the other public `G_SPECIAL_*` opcodes
-  remain reserved. See
+  remain reserved. A non-default, entry-only RT64 characterization transport
+  now classifies a locally supplied exact raw pair and reuses production
+  native validation/rollback without changing `RenderBackend`; it has not yet
+  produced a private native point-light vector and is not admission evidence. See
   `crates/fn64-render-reference/F3DEX2-VARIANTS.md`. The content-admitted
   S2DEX slice now retains object clamp, filter correction, perimeter, and ignored
   legacy edge requests as typed task-local state. It admits the current public

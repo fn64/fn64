@@ -209,13 +209,15 @@ Corollaries, each earned the hard way:
 
 #### Private release execution is a typed authority boundary
 
-Private admission and private execution are deliberately separate. Admission
-schema `fn64.private-input-admission.v6` validates local ownership/provenance
-policy and content-addresses the
+Private admission and private execution are deliberately separate. Current
+admission schema `fn64.private-input-admission.v7` validates local
+ownership/provenance policy and content-addresses the
 ROM, recompiled output, microcode pair, native host entry image, typed
 program-build receipt, arguments, environment, fixed cycle, and expected
 execution source. It also binds a retail-cartridge or public-homebrew class to
-class-specific ROM provenance; the header cannot prove that class. The emitted
+class-specific ROM provenance; the header cannot prove that class. Retained v6
+manifests remain strictly read-only verifiable and cannot select v7's
+F3DZEX2-characterization purpose or raw-window roles. The emitted
 `fn64.private-release-run-contract.v3` is an
 integrity wire, not a signature:
 any caller can recompute a self-hash. Production runner APIs therefore accept
@@ -893,6 +895,15 @@ task calls out:
   handoff. Exact clipping remains a separate trace frontier. Until point-light
   behavior and exact F3DZEX2 raw-pair self-load resolution pass their separate
   gates, the production catalog continues to select LLE.
+  A non-default `f3dzex2-characterization-evidence` feature exposes one
+  explicitly evidence-named RT64 method outside `RenderBackend`. It accepts no
+  caller-selected identity: the exact raw task-entry pair selects 2.06H,
+  2.08I, or 2.08J, the logical plan is derived from live RDRAM/IMEM, and the
+  existing native schema, context-poisoning, and full RDRAM/RSP rollback
+  transaction execute the entry generation. This is characterization
+  transport only, currently entry-only and not yet exercised with a private
+  native point-light vector; it neither opens production HLE nor supplies the
+  missing wire/arithmetic evidence.
   Internally, the transactional inspector and reference decoder now share the
   pinned BranchW control-flow rule: opcode `0x04` selects bits 1..7, validates
   a loaded finite transformed W, compares it strictly with `float(u32 w1)`,
