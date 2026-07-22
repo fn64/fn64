@@ -31,6 +31,9 @@ PROGRAM_BUILD_RECEIPT_DIGEST_DOMAIN = (
     b"fn64.release-program-build-receipt-digest.v1\0"
 )
 PRIVATE_ADMISSION_CORPUS_SCHEMA = "fn64.private-admission-rejection-corpus.v1"
+PRIVATE_ADMISSION_CORPUS_SNAPSHOT_SCHEMA = (
+    "fn64.private-admission-corpus-snapshot.v1"
+)
 PRIVATE_ADMISSION_CORPUS_FIELDS = {"schema", "recipes"}
 PRIVATE_ADMISSION_RECIPE_FIELDS = {
     "id", "baseline", "capability", "expect", "operation", "semantics",
@@ -2364,7 +2367,7 @@ def run_private_admission_corpus(
     legacy_readiness: dict,
     contract: dict,
     contract_path: Path,
-) -> None:
+) -> dict:
     recipes = load_private_admission_corpus(root)
     data_path = Path(full_manifest["artifacts"]["microcode_data"]["path"])
     receipt_path = Path(full_manifest["runner"]["program_build_receipt"]["path"])
@@ -2677,6 +2680,7 @@ def run_private_admission_corpus(
 
     executed_all: set[str] = set()
     executed: set[str] = set()
+    results: list[dict[str, str]] = []
     for recipe in recipes:
         if not private_admission_corpus_capability(
             recipe["capability"], root, directory,
@@ -2685,6 +2689,7 @@ def run_private_admission_corpus(
                 recipe["capability"] != "all",
                 f"corpus: capability=all recipe {recipe['id']!r} was skipped",
             )
+            results.append({"id": recipe["id"], "verdict": "skip"})
             continue
         accepted = execute(recipe)
         require(
@@ -2692,6 +2697,10 @@ def run_private_admission_corpus(
             f"corpus: recipe {recipe['id']!r} verdict drifted",
         )
         executed.add(recipe["id"])
+        results.append({
+            "id": recipe["id"],
+            "verdict": "accept" if accepted else "reject",
+        })
         if recipe["capability"] == "all":
             executed_all.add(recipe["id"])
     required_all = {
@@ -2703,9 +2712,13 @@ def run_private_admission_corpus(
     )
     require(executed, "corpus: no recipes executed")
     reset_files()
+    return {
+        "schema": PRIVATE_ADMISSION_CORPUS_SNAPSHOT_SCHEMA,
+        "results": results,
+    }
 
 
-def selftest(root: Path) -> None:
+def selftest(root: Path) -> dict:
     canonical_program_receipt = {
         "schema": PROGRAM_BUILD_RECEIPT_SCHEMA,
         "child_executable": {
@@ -3628,7 +3641,7 @@ def selftest(root: Path) -> None:
             "private run contract digest drift",
         )
 
-        run_private_admission_corpus(
+        corpus_snapshot = run_private_admission_corpus(
             root,
             directory,
             manifest_path,
@@ -3640,6 +3653,7 @@ def selftest(root: Path) -> None:
             contract,
             contract_path,
         )
+    return corpus_snapshot
 
 
 def main() -> int:
@@ -3647,6 +3661,7 @@ def main() -> int:
     actions = parser.add_mutually_exclusive_group(required=True)
     actions.add_argument("--check", action="store_true", help="run the synthetic policy selftest")
     actions.add_argument("--selftest", action="store_true")
+    actions.add_argument("--corpus-snapshot", action="store_true")
     actions.add_argument("--manifest", type=Path)
     actions.add_argument("--verify-readiness", type=Path)
     actions.add_argument("--verify-private-run-contract", type=Path)
@@ -3655,12 +3670,15 @@ def main() -> int:
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     try:
-        if args.check or args.selftest:
+        if args.check or args.selftest or args.corpus_snapshot:
             require(
                 args.report is None and args.emit_private_run_contract is None,
                 "--report/--emit-private-run-contract require --manifest",
             )
-            selftest(root)
+            corpus_snapshot = selftest(root)
+            if args.corpus_snapshot:
+                sys.stdout.buffer.write(serialize_json_document(corpus_snapshot))
+                return 0
             print("private-input-admission: selftest passed (synthetic non-game bytes only)")
             return 0
         if args.verify_readiness:

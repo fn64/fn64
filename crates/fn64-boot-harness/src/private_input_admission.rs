@@ -2267,7 +2267,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -2293,6 +2293,10 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).expect("remove private admission test directory");
         }
+    }
+
+    mod corpus {
+        include!("private_input_admission_corpus_tests.rs");
     }
 
     #[test]
