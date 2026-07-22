@@ -724,6 +724,30 @@ pub(crate) fn start_live_si_dma(
     })
 }
 
+pub(crate) fn start_live_controller_si_dma(
+    request: fn64_runtime::SiDmaRequest,
+    owner: PendingSiCompletionOwner,
+    command: [u8; 64],
+) -> Result<(), DeviceFault> {
+    assert!(
+        matches!(
+            request.kind,
+            fn64_runtime::SiDmaKind::ControllerQuery | fn64_runtime::SiDmaKind::ControllerRead
+        ),
+        "Controller Manager attempted to stage a non-controller SI request"
+    );
+    with_host(|host| {
+        host.device_fabric.start_si_dma(request)?;
+        assert!(
+            host.pending_si_completion.is_none(),
+            "SI hardware accepted a request while prior completion ownership remained live"
+        );
+        host.device_fabric.stage_controller_pif_command(command);
+        host.pending_si_completion = Some(PendingSiCompletion { request, owner });
+        Ok(())
+    })
+}
+
 pub(crate) fn start_live_rcp_task_with_latency(
     plan: fn64_runtime::RcpTaskCompletionPlan,
     rsp_steps: u64,

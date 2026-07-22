@@ -385,6 +385,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         recreated_capture.present_id,
         digest(&policy_sha256),
     );
+    fn64_boot_harness::emit_rt64_platform_child_identity(
+        identity.source_id,
+        identity.is_source_authoritative(),
+        identity.adapter_source_sha256,
+        identity.post_vi_api,
+    )?;
     Ok(())
 }
 

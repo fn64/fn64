@@ -256,21 +256,22 @@ fn execute_pif_commands<R: fn64_runtime::RomStorage>(
             }
             0x01 if port < EEPROM_CHANNEL => {
                 require_pif_shape(command, port, tx_size, rx_size, 1, 4);
-                pif_ram[rx_off..next]
-                    .copy_from_slice(&executor.pif().read_data_response(port));
-                if matches!(
-                    executor.pif().port_state(port),
+                match executor.pif().port_state(port) {
                     fn64_runtime::PortState::StandardControllerNoPak
-                        | fn64_runtime::PortState::StandardControllerControllerPak
-                        | fn64_runtime::PortState::StandardControllerRumblePak
-                        | fn64_runtime::PortState::StandardControllerTransferPak
-                ) {
-                    observations.record_controller(
-                        now,
-                        port,
-                        fn64_runtime::ControllerOperationDevice::StandardController,
-                        fn64_runtime::ControllerOperationKind::Read,
-                    );
+                    | fn64_runtime::PortState::StandardControllerControllerPak
+                    | fn64_runtime::PortState::StandardControllerRumblePak
+                    | fn64_runtime::PortState::StandardControllerTransferPak => {
+                        pif_ram[rx_off..next]
+                            .copy_from_slice(&executor.pif().read_data_response(port));
+                        observations.record_controller(
+                            now,
+                            port,
+                            fn64_runtime::ControllerOperationDevice::StandardController,
+                            fn64_runtime::ControllerOperationKind::Read,
+                        );
+                    }
+                    fn64_runtime::PortState::VoiceRecognitionUnit
+                    | fn64_runtime::PortState::Absent => mark_no_response(pif_ram, cursor),
                 }
             }
             0x02 if port < EEPROM_CHANNEL => {
@@ -803,6 +804,171 @@ pub fn rumble_active(port: usize) -> bool {
     with_executor(|exec| exec.pif().rumble_active(port))
 }
 
+/// Public Controller Manager maximum: the four physical controller ports.
+const MAXCONTROLLERS: usize = 4;
+const OS_EVENT_SI: u32 = 5;
+const PIF_CONTROLLER_CONTROL: usize = 63;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControllerPollKind {
+    Query,
+    Read,
+}
+
+impl ControllerPollKind {
+    const fn request(self) -> fn64_runtime::SiDmaKind {
+        match self {
+            Self::Query => fn64_runtime::SiDmaKind::ControllerQuery,
+            Self::Read => fn64_runtime::SiDmaKind::ControllerRead,
+        }
+    }
+
+    const fn command(self) -> u8 {
+        match self {
+            Self::Query => 0xFF,
+            Self::Read => 0x01,
+        }
+    }
+
+    const fn response_len(self) -> usize {
+        match self {
+            Self::Query => 3,
+            Self::Read => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompletedControllerChannel {
+    error: u8,
+    response: [u8; 4],
+}
+
+fn controller_pif_command(kind: ControllerPollKind, channels: usize) -> [u8; 64] {
+    assert!(
+        channels <= MAXCONTROLLERS,
+        "Controller Manager channel prefix {channels} exceeds MAXCONTROLLERS (4)"
+    );
+    let mut packet = [0u8; 64];
+    let mut cursor = 0usize;
+    for _ in 0..channels {
+        packet[cursor] = 1;
+        packet[cursor + 1] = kind.response_len() as u8;
+        packet[cursor + 2] = kind.command();
+        cursor += 3 + kind.response_len();
+    }
+    packet[cursor] = 0xFE;
+    // The public PIF command-byte protocol clears this control byte only
+    // after command execution. Getters use it to reject a still-live poll.
+    packet[PIF_CONTROLLER_CONTROL] = 1;
+    packet
+}
+
+fn completed_controller_channels(
+    packet: &[u8; 64],
+    kind: ControllerPollKind,
+) -> Vec<CompletedControllerChannel> {
+    assert_eq!(
+        packet[PIF_CONTROLLER_CONTROL], 0,
+        "Controller Manager {:?} result requested before the SI/PIF transaction completed",
+        kind
+    );
+    let mut channels = Vec::new();
+    let mut cursor = 0usize;
+    while packet[cursor] != 0xFE {
+        assert!(
+            channels.len() < MAXCONTROLLERS,
+            "completed Controller Manager packet exceeds MAXCONTROLLERS (4)"
+        );
+        let tx = packet[cursor] & 0x3F;
+        let rx = packet[cursor + 1] & 0x3F;
+        assert_eq!(tx, 1, "completed Controller Manager packet has tx={tx}");
+        assert_eq!(
+            usize::from(rx),
+            kind.response_len(),
+            "completed Controller Manager {:?} packet has rx={rx}",
+            kind
+        );
+        assert_eq!(
+            packet[cursor + 2],
+            kind.command(),
+            "completed PIF packet is not the paired Controller Manager {:?} transaction",
+            kind
+        );
+        let response_offset = cursor + 3;
+        let mut response = [0u8; 4];
+        response[..kind.response_len()]
+            .copy_from_slice(&packet[response_offset..response_offset + kind.response_len()]);
+        channels.push(CompletedControllerChannel {
+            error: (packet[cursor + 1] & 0xC0) >> 4,
+            response,
+        });
+        cursor = response_offset + kind.response_len();
+        assert!(
+            cursor < PIF_CONTROLLER_CONTROL,
+            "completed Controller Manager packet lacks a format terminator"
+        );
+    }
+    channels
+}
+
+fn completed_controller_packet(kind: ControllerPollKind) -> Vec<CompletedControllerChannel> {
+    let packet = with_host(|host| *host.device_fabric.pif_ram());
+    completed_controller_channels(&packet, kind)
+}
+
+fn controller_completion_message(mq_addr: RdramAddr, exclusive: bool, shim: &str) -> Mesg {
+    with_executor(|exec| {
+        let (registered, message) = exec.event_registration(OS_EVENT_SI).unwrap_or_else(|| {
+            panic!("{shim}: OS_EVENT_SI has no registered completion message queue")
+        });
+        assert_eq!(
+            registered,
+            mq_addr,
+            "{shim}: queue {:#010x} is not the OS_EVENT_SI target {:#010x}",
+            mq_addr.offset(),
+            registered.offset()
+        );
+        let activity = exec.queue_activity(mq_addr).unwrap_or_else(|| {
+            panic!(
+                "{shim}: queue {:#010x} was not initialized by osCreateMesgQueue",
+                mq_addr.offset()
+            )
+        });
+        if exclusive {
+            assert!(
+                activity.is_exclusively_idle(),
+                "{shim}: initialization queue {:#010x} is shared or not idle: {activity:?}",
+                mq_addr.offset()
+            );
+        }
+        message
+    })
+}
+
+fn start_controller_poll(
+    mq_addr: RdramAddr,
+    kind: ControllerPollKind,
+    channels: usize,
+) -> Result<(), DeviceFault> {
+    let _ = controller_completion_message(
+        mq_addr,
+        false,
+        match kind {
+            ControllerPollKind::Query => "osContStartQuery_recomp",
+            ControllerPollKind::Read => "osContStartReadData_recomp",
+        },
+    );
+    crate::pi::start_live_controller_si_dma(
+        fn64_runtime::SiDmaRequest {
+            kind: kind.request(),
+            dram_addr: RdramAddr::from_offset(0),
+        },
+        PendingSiCompletionOwner::OsEvent,
+        controller_pif_command(kind, channels),
+    )
+}
+
 /// `osContGetQuery(OSContStatus *data)` -- ONE argument, `a0`=data
 /// (`ctx->r4`), returns void. Byte-verified against the OoT decomp
 /// (`oot-decomp/src/libultra/io/contquery.c:31`,
@@ -845,11 +1011,12 @@ pub unsafe extern "C" fn osContGetQuery_recomp(rdram: *mut u8, ctx: *mut RecompC
     let ctx = unsafe { &mut *ctx };
     let data_addr = RdramAddr::from_gpr(ctx.r4).offset() as usize;
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
-    let pif = with_executor(|exec| *exec.pif());
-    let channels = with_host(|host| host.controller_manager.channels());
-    for port in 0..channels {
-        let resp = pif.query_response(port);
-        let absent = (resp[2] & fn64_runtime::si::CONT_ABSENT) != 0;
+    for (port, channel) in completed_controller_packet(ControllerPollKind::Query)
+        .into_iter()
+        .enumerate()
+    {
+        let resp = channel.response;
+        let absent = channel.error != 0 || (resp[2] & fn64_runtime::si::CONT_ABSENT) != 0;
         // `query_response` returns the PIF wire bytes `[typeh, typel,
         // status]`. `__osContGetInitData` assembles the game-visible
         // `OSContStatus.type` u16 as `typel << 8 | typeh`
@@ -888,17 +1055,13 @@ pub unsafe extern "C" fn osContGetQuery_recomp(rdram: *mut u8, ctx: *mut RecompC
 /// reports (`CHNL_ERR` of a PIF no-response = `(CHNL_ERR_NORESP=0x80) >> 4`).
 const CONT_NO_RESPONSE_ERROR: u8 = 0x08;
 
-/// `MAXCONTROLLERS` (`oot-decomp/include/ultra64/controller.h:9`): the N64
-/// has four controller ports; the Controller Manager defaults to all four.
-#[cfg(test)]
-const MAXCONTROLLERS: usize = 4;
-
 /// `osContGetReadData(OSContPad *pad) -> void` -- `a0`=`ctx->r4`, the base of
 /// an `OSContPad[MAXCONTROLLERS]` array (`padMgr->pads`, decomp
 /// `oot-decomp/src/code/padmgr.c:364` `osContGetReadData(padMgr->pads)`).
 /// This is the INPUT SEAM's game-facing half: the per-port button/stick state
-/// a host harness fed via `PifModel::set_input` lands in the pad array the
-/// game reads each retrace to drive Link.
+/// a host harness fed via `PifModel::set_input` is sampled when the paired
+/// timed SI/PIF transaction completes, and this getter copies that immutable
+/// completed packet into the pad array the game reads each retrace.
 ///
 /// ## OSContPad layout + swizzle (byte-cited)
 ///
@@ -930,28 +1093,28 @@ pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut Reco
     let ctx = unsafe { &mut *ctx };
     let base_addr = RdramAddr::from_gpr(ctx.r4).offset() as usize;
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
-    let pif = with_executor(|exec| *exec.pif());
+    let channels = completed_controller_packet(ControllerPollKind::Read);
     // Diagnostic (opt-in via FN64_TRACE_CONT): proves PadMgr actually polls
     // input, and echoes what port-0 state the game is about to see -- the
     // observable evidence a scripted press reaches the game.
     if std::env::var_os("FN64_TRACE_CONT").is_some() {
-        let p0 = pif.read_data_response(0);
-        eprintln!(
-            "[fn64-abi] osContGetReadData(pad@{base_addr:#x}): port0 button={:#06x} stick=({},{})",
-            u16::from_be_bytes([p0[0], p0[1]]),
-            p0[2] as i8,
-            p0[3] as i8,
-        );
+        if let Some(p0) = channels.first() {
+            eprintln!(
+                "[fn64-abi] osContGetReadData(pad@{base_addr:#x}): port0 button={:#06x} stick=({},{})",
+                u16::from_be_bytes([p0.response[0], p0.response[1]]),
+                p0.response[2] as i8,
+                p0.response[3] as i8,
+            );
+        }
     }
-    let channels = with_host(|host| host.controller_manager.channels());
-    for port in 0..channels {
+    for (port, channel) in channels.into_iter().enumerate() {
         // A present standard controller reports errno == 0 and its live input;
         // an absent port reports no-response, matching the decomp's
         // `errno = CHNL_ERR(read)` branch (button/stick left zero here).
-        let absent = (pif.query_response(port)[2] & fn64_runtime::si::CONT_ABSENT) != 0;
+        let absent = channel.error != 0;
         // `read_data_response` is the `[button_hi, button_lo, stick_x, stick_y]`
         // PIF wire shape filled from the fed input (idle default).
-        let resp = pif.read_data_response(port);
+        let resp = channel.response;
         // Assemble the 6-byte OSContPad in LOGICAL struct-offset order:
         // button hi@0, button lo@1, stick_x@2, stick_y@3, errno@4, pad@5.
         let (button_hi, button_lo, stick_x, stick_y, errno) = if absent {
@@ -974,19 +1137,6 @@ pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut Reco
                 );
             }
         }
-        if matches!(
-            pif.port_state(port),
-            fn64_runtime::PortState::StandardControllerNoPak
-                | fn64_runtime::PortState::StandardControllerControllerPak
-                | fn64_runtime::PortState::StandardControllerRumblePak
-                | fn64_runtime::PortState::StandardControllerTransferPak
-        ) {
-            crate::record_controller_operation(
-                port,
-                fn64_runtime::ControllerOperationDevice::StandardController,
-                fn64_runtime::ControllerOperationKind::Read,
-            );
-        }
     }
     // osContGetReadData returns void; leave $v0 as the decomp does (unset).
 }
@@ -995,7 +1145,10 @@ pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut Reco
 /// -- `a0`=mq (`ctx->r4`), `a1`=bitpattern (`ctx->r5`), `a2`=data
 /// (`ctx->r6`). Public libultra manual's documented one-time controller-
 /// manager bring-up: probes all 4 ports and sets one bit per populated
-/// port in `*bitpattern`. Function-table slot only
+/// port in `*bitpattern`. The supplied queue must be the initialized,
+/// unshared `OS_EVENT_SI` target. The call blocks internally and publishes
+/// both outputs only after the fabric executes the four-channel PIF query,
+/// clears SI busy, raises MI SI, and posts completion. Function-table slot only
 /// (`recomp_overlays.inl:2918`), reached from `PadMgr_Init`
 /// (BOOT-PLAN.md rung 15's forcing-function call) -- implemented for real
 /// against `PifModel`'s "port 0 populated, 1-3 absent" model
@@ -1006,50 +1159,80 @@ pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut Reco
 #[no_mangle]
 pub unsafe extern "C" fn osContInit_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
-    if !with_host(|host| host.controller_manager.initialize()) {
+    if with_host(|host| host.controller_manager.initialized) {
         // The public Controller Manager manual specifies that only the first
         // call initializes the manager; later calls do not rewrite caller
         // buffers or reset an `osContSetCh` selection.
         ctx.r2 = 0;
         return;
     }
+    let mq_addr = RdramAddr::from_gpr(ctx.r4);
+    let completion_message = controller_completion_message(mq_addr, true, "osContInit_recomp");
     let bitpattern_addr = RdramAddr::from_gpr(ctx.r5).offset() as usize;
     let data_addr = RdramAddr::from_gpr(ctx.r6).offset() as usize;
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    assert!(
+        with_host(|host| host.controller_manager.initialize()),
+        "osContInit_recomp: Controller Manager initialization raced after queue validation"
+    );
+    match start_controller_poll(mq_addr, ControllerPollKind::Query, MAXCONTROLLERS) {
+        Ok(()) => {}
+        Err(DeviceFault::SiBusy) => {
+            with_host(|host| host.controller_manager = ControllerManagerState::default());
+            ctx.r2 = u64::MAX;
+            return;
+        }
+        Err(error) => panic!("osContInit_recomp: SI request failed: {error}"),
+    }
+
+    let delivered = match suspend_active_coroutine(Yield::BlockOnRecv {
+        mq_addr,
+        may_block: true,
+    }) {
+        Resume::Delivered(message) => message,
+        other => panic!("osContInit_recomp: synchronous SI wait resumed with unexpected {other:?}"),
+    };
+    assert_eq!(
+        delivered, completion_message,
+        "osContInit_recomp: private queue delivered a non-SI-transaction message"
+    );
+
+    let channels = completed_controller_packet(ControllerPollKind::Query);
+    assert_eq!(
+        channels.len(),
+        MAXCONTROLLERS,
+        "osContInit_recomp: completed initialization did not probe all four ports"
+    );
     let mut mask: u8 = 0;
-    with_executor(|exec| {
-        let pif = *exec.pif();
-        for port in 0..4usize {
-            let resp = pif.query_response(port);
-            let absent = (resp[2] & fn64_runtime::si::CONT_ABSENT) != 0;
-            if !absent {
-                mask |= 1 << port;
-            }
-            // Write each OSContStatus entry SWIZZLED (`^3`), exactly like
-            // osContGetQuery_recomp -- the game reads type/status/errno back
-            // via MEM_HU/MEM_BU (recomp.h), so flat stores would transpose
-            // them. type u16 = (resp[1]<<8)|resp[0] (controller.c:72);
-            // absent ports report no-response in errno with type/status 0.
-            let type_u16: u16 = ((resp[1] as u16) << 8) | resp[0] as u16;
-            let entry: [u8; 4] = if absent {
-                [0, 0, 0, CONT_NO_RESPONSE_ERROR]
-            } else {
-                [(type_u16 >> 8) as u8, (type_u16 & 0xFF) as u8, resp[2], 0]
-            };
-            let base = data_addr + port * 4;
-            for (o, &b) in entry.iter().enumerate() {
-                unsafe {
-                    storage.write_u8(
-                        RdramAddr::from_offset(
-                            u32::try_from(base + o)
-                                .expect("OSContStatus RDRAM address exceeds u32"),
-                        ),
-                        b,
-                    );
-                }
+    for (port, channel) in channels.into_iter().enumerate() {
+        let resp = channel.response;
+        let absent = channel.error != 0 || (resp[2] & fn64_runtime::si::CONT_ABSENT) != 0;
+        if !absent {
+            mask |= 1 << port;
+        }
+        // Write each OSContStatus entry SWIZZLED (`^3`), exactly like
+        // osContGetQuery_recomp -- the game reads type/status/errno back
+        // via MEM_HU/MEM_BU (recomp.h), so flat stores would transpose
+        // them. type u16 = (resp[1]<<8)|resp[0] (controller.c:72);
+        // absent ports report no-response in errno with type/status 0.
+        let type_u16: u16 = ((resp[1] as u16) << 8) | resp[0] as u16;
+        let entry: [u8; 4] = if absent {
+            [0, 0, 0, CONT_NO_RESPONSE_ERROR]
+        } else {
+            [(type_u16 >> 8) as u8, (type_u16 & 0xFF) as u8, resp[2], 0]
+        };
+        let base = data_addr + port * 4;
+        for (o, &b) in entry.iter().enumerate() {
+            unsafe {
+                storage.write_u8(
+                    RdramAddr::from_offset(
+                        u32::try_from(base + o).expect("OSContStatus RDRAM address exceeds u32"),
+                    ),
+                    b,
+                );
             }
         }
-    });
+    }
     unsafe {
         // ctlBitfield is a `u8*`: the decomp writes a SINGLE byte
         // `*ctlBitfield = bits` (controller.c:96), bits<=0x0F. Write one
@@ -1105,15 +1288,14 @@ pub unsafe extern "C" fn osContSetCh_recomp(_rdram: *mut u8, ctx: *mut RecompCon
 pub unsafe extern "C" fn osContStartQuery_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
-    const OS_EVENT_SI: u32 = 5;
-    with_executor(|exec| exec.set_event_mesg(OS_EVENT_SI, mq_addr, 0));
-    ctx.r2 = match crate::pi::start_live_si_dma(
-        fn64_runtime::SiDmaRequest {
-            kind: fn64_runtime::SiDmaKind::ControllerQuery,
-            dram_addr: RdramAddr::from_offset(0),
-        },
-        PendingSiCompletionOwner::OsEvent,
-    ) {
+    let channels = with_host(|host| {
+        assert!(
+            host.controller_manager.initialized,
+            "osContStartQuery_recomp: osContInit must initialize the Controller Manager first"
+        );
+        host.controller_manager.channels()
+    });
+    ctx.r2 = match start_controller_poll(mq_addr, ControllerPollKind::Query, channels) {
         Ok(()) => 0,
         Err(DeviceFault::SiBusy) => u64::MAX,
         Err(error) => panic!("osContStartQuery_recomp: {error}"),
@@ -1122,7 +1304,10 @@ pub unsafe extern "C" fn osContStartQuery_recomp(_rdram: *mut u8, ctx: *mut Reco
 
 /// `osContStartReadData(OSMesgQueue *mq) -> s32` -- same shape/reasoning as
 /// `osContStartQuery_recomp` (Public libultra manual's paired async
-/// button/stick-read DMA kickoff). Function-table slot only
+/// button/stick-read DMA kickoff). The active channel prefix is encoded into
+/// device-owned PIF RAM at acceptance, and the response is sampled only at
+/// the SI deadline; `osContGetReadData` decodes that completed image rather
+/// than current host input. Function-table slot only
 /// (`recomp_overlays.inl:2919`), reached from PadMgr's polling thread body.
 ///
 /// # Safety
@@ -1131,15 +1316,14 @@ pub unsafe extern "C" fn osContStartQuery_recomp(_rdram: *mut u8, ctx: *mut Reco
 pub unsafe extern "C" fn osContStartReadData_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
-    const OS_EVENT_SI: u32 = 5;
-    with_executor(|exec| exec.set_event_mesg(OS_EVENT_SI, mq_addr, 0));
-    ctx.r2 = match crate::pi::start_live_si_dma(
-        fn64_runtime::SiDmaRequest {
-            kind: fn64_runtime::SiDmaKind::ControllerRead,
-            dram_addr: RdramAddr::from_offset(0),
-        },
-        PendingSiCompletionOwner::OsEvent,
-    ) {
+    let channels = with_host(|host| {
+        assert!(
+            host.controller_manager.initialized,
+            "osContStartReadData_recomp: osContInit must initialize the Controller Manager first"
+        );
+        host.controller_manager.channels()
+    });
+    ctx.r2 = match start_controller_poll(mq_addr, ControllerPollKind::Read, channels) {
         Ok(()) => 0,
         Err(DeviceFault::SiBusy) => u64::MAX,
         Err(error) => panic!("osContStartReadData_recomp: {error}"),
@@ -1311,7 +1495,69 @@ mod tests {
 
     fn reset_controller_manager() {
         with_executor(|exec| *exec = fn64_runtime::Executor::new());
-        with_host(|host| host.controller_manager = ControllerManagerState::default());
+        with_host(|host| *host = HostState::default());
+    }
+
+    fn initialize_controller_manager_for_test(channels: u8) {
+        with_host(|host| {
+            if !host.controller_manager.initialized {
+                assert!(host.controller_manager.initialize());
+            }
+            host.controller_manager.set_channels(channels);
+        });
+    }
+
+    fn complete_controller_poll(kind: ControllerPollKind, channels: u8) {
+        initialize_controller_manager_for_test(channels);
+        let queue = RdramAddr::from_offset(8);
+        with_executor(|exec| {
+            if exec.queue_activity(queue).is_none() {
+                exec.create_mesg_queue(queue, 1);
+            }
+            exec.set_event_mesg(OS_EVENT_SI, queue, 0xCAFE);
+        });
+        start_controller_poll(queue, kind, usize::from(channels)).unwrap();
+        crate::advance_virtual_time(crate::sim_time().saturating_add(1));
+        assert_eq!(
+            with_executor(|exec| exec.recv_mesg(999, queue, false)),
+            fn64_runtime::RecvMesgOutcome::Delivered(0xCAFE)
+        );
+    }
+
+    fn run_controller_init(
+        rdram: &mut [u8],
+        queue_vram: u64,
+        bitpattern_vram: u64,
+        status_vram: u64,
+        thread: ThreadId,
+    ) -> u64 {
+        let queue = RdramAddr::from_gpr(queue_vram);
+        with_executor(|exec| {
+            exec.create_mesg_queue(queue, 1);
+            exec.set_event_mesg(OS_EVENT_SI, queue, 0xCAFE);
+        });
+        unsafe { crate::register_process_rdram(rdram.as_mut_ptr(), rdram.len()) };
+        let result = std::rc::Rc::new(std::cell::Cell::new(None));
+        let thread_result = result.clone();
+        let rdram_addr = rdram.as_mut_ptr() as usize;
+        spawn_test_thread(thread, 10, move || {
+            let mut init = ctx_zeroed();
+            init.r4 = queue_vram;
+            init.r5 = bitpattern_vram;
+            init.r6 = status_vram;
+            unsafe { osContInit_recomp(rdram_addr as *mut u8, &mut init) };
+            thread_result.set(Some(init.r2));
+        });
+        assert!(crate::run_one_step());
+        if result.get().is_none() {
+            if let Some(deadline) = crate::next_device_deadline() {
+                crate::advance_virtual_time(deadline);
+            }
+            crate::run_to_idle();
+        }
+        result
+            .get()
+            .expect("osContInit test coroutine did not resume after SI completion")
     }
 
     #[test]
@@ -1322,11 +1568,7 @@ mod tests {
         set_controller_state(1, 0x9000, -12, 34);
 
         let mut rdram = vec![0xA5; 0x200];
-        let mut init = ctx_zeroed();
-        init.r5 = 0x8000_0010;
-        init.r6 = 0x8000_0020;
-        unsafe { osContInit_recomp(rdram.as_mut_ptr(), &mut init) };
-        assert_eq!(init.r2, 0);
+        initialize_controller_manager_for_test(4);
 
         let mut set_ch = ctx_zeroed();
         set_ch.r4 = 1;
@@ -1334,6 +1576,7 @@ mod tests {
         assert_eq!(set_ch.r2, 0);
 
         rdram[0x40..0x50].fill(0xA5);
+        complete_controller_poll(ControllerPollKind::Query, 1);
         let mut query = ctx_zeroed();
         query.r4 = 0x8000_0040;
         unsafe { osContGetQuery_recomp(rdram.as_mut_ptr(), &mut query) };
@@ -1341,6 +1584,7 @@ mod tests {
         assert_eq!(&rdram[0x44..0x50], &[0xA5; 12]);
 
         rdram[0x60..0x78].fill(0xA5);
+        complete_controller_poll(ControllerPollKind::Read, 1);
         let mut read = ctx_zeroed();
         read.r4 = 0x8000_0060;
         unsafe { osContGetReadData_recomp(rdram.as_mut_ptr(), &mut read) };
@@ -1391,10 +1635,10 @@ mod tests {
             }
         );
 
-        let mut init = ctx_zeroed();
-        init.r5 = 0x8000_0010;
-        init.r6 = 0x8000_0020;
-        unsafe { osContInit_recomp(rdram.as_mut_ptr(), &mut init) };
+        assert_eq!(
+            run_controller_init(&mut rdram, 0x8000_0008, 0x8000_0010, 0x8000_0020, 350,),
+            0
+        );
 
         let mut set_after_init = ctx_zeroed();
         set_after_init.r4 = 1;
@@ -1402,6 +1646,7 @@ mod tests {
 
         rdram[0x40..0x60].fill(0x6B);
         let mut repeated_init = ctx_zeroed();
+        repeated_init.r4 = 0x8000_0008;
         repeated_init.r5 = 0x8000_0040;
         repeated_init.r6 = 0x8000_0050;
         unsafe { osContInit_recomp(rdram.as_mut_ptr(), &mut repeated_init) };
@@ -1440,7 +1685,8 @@ mod tests {
     #[test]
     fn os_cont_get_query_reads_array_pointer_from_a0_and_fills_all_ports() {
         // Fresh PIF state (default: port 0 standard, 1-3 absent).
-        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        reset_controller_manager();
+        complete_controller_poll(ControllerPollKind::Query, 4);
 
         let mut buf = vec![0u8; fn64_runtime::RDRAM_MMIO_WINDOW_END as usize];
 
@@ -1522,8 +1768,9 @@ mod tests {
     fn os_cont_get_read_data_writes_swizzled_input_into_pad_array() {
         // Fresh state, then feed a distinctive input on port 0: Start+A held,
         // stick pushed. (BTN_A = 0x8000, BTN_START = 0x1000 -> 0x9000.)
-        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        reset_controller_manager();
         set_controller_state(0, 0x9000, -50, 70);
+        complete_controller_poll(ControllerPollKind::Read, 4);
 
         let mut buf = vec![0u8; fn64_runtime::RDRAM_MMIO_WINDOW_END as usize];
         let pad_vram: u64 = 0xFFFF_FFFF_8020_0000;
@@ -1572,11 +1819,83 @@ mod tests {
     }
 
     #[test]
+    fn controller_read_is_unavailable_before_deadline_and_latched_after_completion() {
+        reset_controller_manager();
+        initialize_controller_manager_for_test(1);
+        set_controller_state(0, 0x9000, -50, 70);
+        let queue = RdramAddr::from_offset(8);
+        with_executor(|exec| {
+            exec.create_mesg_queue(queue, 1);
+            exec.set_event_mesg(OS_EVENT_SI, queue, 0xCAFE);
+        });
+        start_controller_poll(queue, ControllerPollKind::Read, 1).unwrap();
+
+        let pending_evidence = with_host(|host| host.device_fabric.evidence_snapshot());
+        assert_eq!(
+            pending_evidence
+                .pending_si
+                .expect("controller read is pending in DeviceState evidence")
+                .request
+                .kind,
+            fn64_runtime::SiDmaKind::ControllerRead
+        );
+        let staged = pending_evidence.pif_ram;
+        let premature = std::panic::catch_unwind(|| {
+            completed_controller_channels(&staged, ControllerPollKind::Read)
+        })
+        .expect_err("a live SI transaction must not expose controller data");
+        let message = premature
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| premature.downcast_ref::<&str>().copied())
+            .expect("premature Controller Manager read panic has context");
+        assert!(message.contains("before the SI/PIF transaction completed"));
+
+        crate::advance_virtual_time(1);
+        // Input changes after byte commit belong to the next poll, not this
+        // already-completed packet.
+        set_controller_state(0, 0x4000, 12, -34);
+        let mut rdram = vec![0xA5; 0x20];
+        let mut get = ctx_zeroed();
+        get.r4 = 0x8000_0010;
+        unsafe { osContGetReadData_recomp(rdram.as_mut_ptr(), &mut get) };
+        let view = fn64_runtime::RdramView::from_storage(&rdram);
+        assert_eq!(view.read_u16(RdramAddr::from_offset(0x10)), 0x9000);
+        assert_eq!(view.read_u8(RdramAddr::from_offset(0x12)) as i8, -50);
+        assert_eq!(view.read_u8(RdramAddr::from_offset(0x13)) as i8, 70);
+    }
+
+    #[test]
+    fn controller_read_latches_start_channel_prefix() {
+        reset_controller_manager();
+        initialize_controller_manager_for_test(1);
+        set_controller_port_state(1, fn64_runtime::PortState::StandardControllerNoPak);
+        set_controller_state(1, 0x8000, 5, 6);
+        let queue = RdramAddr::from_offset(8);
+        with_executor(|exec| {
+            exec.create_mesg_queue(queue, 1);
+            exec.set_event_mesg(OS_EVENT_SI, queue, 0xCAFE);
+        });
+        start_controller_poll(queue, ControllerPollKind::Read, 1).unwrap();
+        with_host(|host| host.controller_manager.set_channels(2));
+        crate::advance_virtual_time(1);
+
+        let mut rdram = vec![0xA5; 0x30];
+        let mut get = ctx_zeroed();
+        get.r4 = 0x8000_0010;
+        unsafe { osContGetReadData_recomp(rdram.as_mut_ptr(), &mut get) };
+        let view = fn64_runtime::RdramView::from_storage(&rdram);
+        assert!((0..6).any(|offset| view.read_u8(RdramAddr::from_offset(0x10 + offset)) != 0xA5));
+        assert!((6..12).all(|offset| view.read_u8(RdramAddr::from_offset(0x10 + offset)) == 0xA5));
+    }
+
+    #[test]
     fn high_level_input_evidence_excludes_voice_ports() {
-        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        reset_controller_manager();
         load_rom(vec![0; 0x100]);
         set_controller_port_state(0, fn64_runtime::PortState::VoiceRecognitionUnit);
         set_controller_port_state(1, fn64_runtime::PortState::StandardControllerNoPak);
+        complete_controller_poll(ControllerPollKind::Read, 4);
 
         let mut rdram = vec![0u8; 0x40];
         let mut ctx = ctx_zeroed();
@@ -1586,7 +1905,7 @@ mod tests {
         assert_eq!(
             crate::copy_controller_operations(),
             vec![fn64_runtime::ControllerOperationEvent {
-                at: Cycles::ZERO,
+                at: Cycles::new(1),
                 port: 1,
                 device: fn64_runtime::ControllerOperationDevice::StandardController,
                 operation: fn64_runtime::ControllerOperationKind::Read,
@@ -2858,13 +3177,13 @@ mod tests {
     /// bitfield bytes at flat +0/+1).
     #[test]
     fn os_cont_init_swizzles_status_and_writes_single_bitfield_byte() {
+        reset_controller_manager();
         // data at offset 0x40 (16 bytes = 4 OSContStatus), bitfield at 0x80.
         let mut rdram = vec![0xEEu8; 256]; // 0xEE sentinel: catch stray writes.
-        let mut ctx = ctx_zeroed();
-        ctx.r4 = 0; // mq (unused for the byte layout under test)
-        ctx.r5 = 0x8000_0080; // ctlBitfield
-        ctx.r6 = 0x8000_0040; // data (OSContStatus[4])
-        unsafe { osContInit_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
+        assert_eq!(
+            run_controller_init(&mut rdram, 0x8000_0008, 0x8000_0080, 0x8000_0040, 351,),
+            0
+        );
 
         // Port 0 is a standard controller (type 0x0005). The swizzled entry
         // [type_hi=0x00, type_lo=0x05, status=0x00, pad=0x00] lands at
@@ -2942,10 +3261,14 @@ mod tests {
 
     #[test]
     fn controller_dma_completion_raises_the_shared_mi_si_source() {
-        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        reset_controller_manager();
+        initialize_controller_manager_for_test(4);
         crate::pi::set_mi_interrupt_mask(fn64_runtime::InterruptSource::Si.bit());
         let queue = RdramAddr::from_offset(0x40);
-        with_executor(|exec| exec.create_mesg_queue(queue, 1));
+        with_executor(|exec| {
+            exec.create_mesg_queue(queue, 1);
+            exec.set_event_mesg(OS_EVENT_SI, queue, 0);
+        });
         let mut ctx = ctx_zeroed();
         ctx.r4 = queue.to_kseg0() as u64;
         unsafe { osContStartQuery_recomp(std::ptr::null_mut(), &mut ctx) };

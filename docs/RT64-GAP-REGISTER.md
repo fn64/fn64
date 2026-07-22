@@ -180,7 +180,12 @@ checkerboard mask, and edge/attribute planes remain signed fixed point through
 evaluation using Table 12's documented X reference points. Coverage persists through RGBA16's visible LSB plus shared
 physical hidden bits; all four `CVG_DST` rules, coverage-alpha selection,
 `CLR_ON_CVG`, memory-coverage blending, and the documented opaque-wrap strict
-Z override execute. High-level F3DEX2 triangles now use the same eight sample
+Z override execute. Chapter 15's public `IM_RD` contract now gates both old
+color and old coverage through one typed optional framebuffer sample. With the
+bit clear, Clamp/Wrap writes cannot merge or wrap prior coverage, while a
+framebuffer color or coverage-alpha mux traps instead of silently reading
+memory. Exhaustive mode/coverage sweeps and paired raw/high-level partial
+triangles cover the mechanism. High-level F3DEX2 triangles now use the same eight sample
 positions for edge coverage. Set Scissor field/odd controls survive decode and
 gate scanlines across fill, depth-fill, copy/combined rectangle, raw-triangle,
 and high-level-triangle paths. The three public 8-bit/RGBA16/RGBA32 color

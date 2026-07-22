@@ -12,11 +12,12 @@ use fn64_render::{
     RenderGraphicsApi, RenderRefreshRate, RenderRuntimeSettings, ViFilterControl, ViPixelType,
     ViPresentation, M_GFXTASK,
 };
+use fn64_render_reference::gbi;
 use fn64_render_rt64::{
     extended_gbi::{
         AspectMode, Availability, Component, MatrixGroup, MatrixMode, MatrixOrder, Policy, Version1,
     },
-    gbi, Rt64Backend, Rt64ExtendedGbiEvidence, Rt64ExtendedPresentedPixels, Rt64PresentPixelFormat,
+    Rt64Backend, Rt64ExtendedGbiEvidence, Rt64ExtendedPresentedPixels, Rt64PresentPixelFormat,
     Rt64SourceProvenance, Rt64TransformClass, Rt64TransformComponentSelector,
     Rt64TransformOrdering, Rt64VertexZMarkerKind,
 };
@@ -836,5 +837,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         evidence.interpolation.midpoint,
         evidence.interpolation.current,
     );
+    fn64_boot_harness::emit_rt64_platform_child_identity(
+        identity.source_id,
+        identity.is_source_authoritative(),
+        identity.adapter_source_sha256,
+        identity.post_vi_api,
+    )?;
     Ok(())
 }

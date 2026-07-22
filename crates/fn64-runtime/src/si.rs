@@ -16,10 +16,13 @@
 //! present with a standard N64 controller (`CONT_TYPE_STANDARD = 0x0500`)
 //! and no accessory (status byte clears `CONT_CARD_ON`/pak-present bits);
 //! ports 1-3 report not-present (status byte's `CONT_ABSENT` bit set), which
-//! is the documented PIF response for an empty port. `osContStartReadData`'s
-//! button/stick response is modeled as "everything neutral, no buttons
-//! held" -- a real, honest idle-controller state, not a fabricated
-//! button-mash.
+//! is the documented PIF response for an empty port. Controller Manager
+//! query/read calls encode their active channel prefix into this same 64-byte
+//! PIF command format; the device executes it only at the timed SI deadline,
+//! so the completed PIF RAM image is the sole result later getters decode.
+//! `osContStartReadData`'s default button/stick response is "everything
+//! neutral, no buttons held" -- a real, honest idle-controller state, not a
+//! fabricated button-mash.
 //!
 //! This module has no host input-device polling of its own (that's
 //! `fn64-shell`'s wave-5 concern per `docs/DESIGN.md` section 1) -- it is

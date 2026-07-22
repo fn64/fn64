@@ -21,8 +21,9 @@
 //!   window map through their shared low-29-bit physical offset. Canonical
 //!   32-bit mapped data addresses use the context's recorded TLB entries;
 //!   instruction fetch has a separate physical-address result so architectural
-//!   PCs are never reused as admitted code identity. 64-bit mapped spaces
-//!   remain a loud boundary.
+//!   PCs are never reused as admitted code identity. The arbitrary-PC data
+//!   path classifies the VR4300's 32- and 64-bit segments before either TLB or
+//!   direct-physical translation; instruction PCs remain a 32-bit schema.
 //! - Word accesses use the host-native representation used by the ABI buffer;
 //!   sub-word accesses XOR the byte offset: halfword `^2`, byte `^3`. This is
 //!   the N64's big-endian view over a little-endian host buffer. It is applied
@@ -39,7 +40,7 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TlbEntryRaw {
     pub page_mask: u32,
-    pub entry_hi: u32,
+    pub entry_hi: u64,
     pub entry_lo0: u32,
     pub entry_lo1: u32,
 }
@@ -51,7 +52,7 @@ pub enum DataAccessKind {
     Store,
 }
 
-/// Why a mapped 32-bit guest data address did not translate.
+/// Why a mapped guest data address did not translate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TlbFaultKind {
     Refill,
@@ -62,9 +63,11 @@ pub enum TlbFaultKind {
 /// Typed result of a failed TLB translation before any memory side effect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TlbFault {
-    pub vaddr: u32,
+    pub vaddr: u64,
     pub access: DataAccessKind,
     pub kind: TlbFaultKind,
+    /// A first-level refill for this access uses the XTLB refill vector.
+    pub extended: bool,
 }
 
 /// Address selected by the VR4300's 32-bit data-address translation rules.
@@ -72,6 +75,9 @@ pub struct TlbFault {
 pub enum TranslatedDataAddress {
     /// KSEG0/KSEG1 keep their existing direct virtual form.
     Direct(u64),
+    /// XKPHYS, or ERL's low user window, selected this physical address
+    /// without consulting the TLB.
+    DirectPhysical(u32),
     /// A mapped segment selected this physical byte address through the TLB.
     Mapped(u32),
 }
@@ -95,6 +101,20 @@ impl TranslatedInstructionAddress {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddressRoute {
+    DirectVirtual(u64),
+    DirectPhysical(u32),
+    Mapped { extended: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CpuMode {
+    Kernel,
+    Supervisor,
+    User,
+}
+
 /// Typed checked-memory failure shared by generated and interpreted blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataAccessError {
@@ -103,12 +123,16 @@ pub enum DataAccessError {
     Unbacked {
         vaddr: u64,
     },
+    AddressError {
+        vaddr: u64,
+        access: DataAccessKind,
+    },
     Tlb(TlbFault),
 }
 
 impl DataAccessError {
-    pub const fn is_tlb(self) -> bool {
-        matches!(self, Self::Tlb(_))
+    pub const fn is_architectural_exception(self) -> bool {
+        matches!(self, Self::AddressError { .. } | Self::Tlb(_))
     }
 
     /// Convert a checked-memory failure into the arbitrary-PC lane's typed
@@ -122,8 +146,25 @@ impl DataAccessError {
 
         match self {
             Self::Unbacked { vaddr } => CpuFaultKind::MemoryFault { addr: vaddr },
+            Self::AddressError { vaddr, access } => CpuFaultKind::Exception {
+                exception: match access {
+                    DataAccessKind::Load => CpuException::AddressErrorLoad,
+                    DataAccessKind::Store => CpuException::AddressErrorStore,
+                },
+                epc,
+                branch_delay,
+                instruction_code: 0,
+                bad_vaddr: Some(vaddr),
+                coprocessor: None,
+            },
             Self::Tlb(fault) => {
                 let exception = match (fault.kind, fault.access) {
+                    (TlbFaultKind::Refill, DataAccessKind::Load) if fault.extended => {
+                        CpuException::XTlbRefillLoad
+                    }
+                    (TlbFaultKind::Refill, DataAccessKind::Store) if fault.extended => {
+                        CpuException::XTlbRefillStore
+                    }
                     (TlbFaultKind::Refill, DataAccessKind::Load) => CpuException::TlbRefillLoad,
                     (TlbFaultKind::Refill, DataAccessKind::Store) => CpuException::TlbRefillStore,
                     (TlbFaultKind::Invalid, DataAccessKind::Load) => CpuException::TlbInvalidLoad,
@@ -210,13 +251,16 @@ pub struct RecompContext {
     pub cop0_epc: u32,
     /// COP0 ErrorEPC (register 30), selected by ERET while Status.ERL is set.
     pub cop0_error_epc: u32,
-    /// COP0 BadVAddr (register 8). The arbitrary-PC lane populates it for
-    /// instruction-fetch AdEL, aligned-memory AdEL/AdES, and typed 32-bit data
-    /// TLB exceptions.
-    pub cop0_badvaddr: u32,
+    /// COP0 BadVAddr (register 8). The arbitrary-PC lane populates the complete
+    /// effective address for instruction-fetch AdEL, aligned-memory AdEL/AdES,
+    /// and typed data TLB exceptions.
+    pub cop0_badvaddr: u64,
     /// Low 32 bits of COP0 Context (register 4). TLB exceptions replace
     /// BadVPN2 while retaining the software-owned PTEBase field.
     pub cop0_context: u32,
+    /// COP0 XContext (register 20). TLB exceptions replace Region/BadVPN2
+    /// while retaining the software-owned 31-bit PTEBase field.
+    pub cop0_xcontext: u64,
     /// COP0 TLB registers (Index 0, EntryLo0/1 2/3, PageMask 5, Wired 6,
     /// EntryHi 10). Boot-time unmap-all loops save/clear these; TLBWI/TLBWR
     /// record entries and TLBR/TLBP inspect them. Canonical 32-bit mapped data
@@ -229,7 +273,7 @@ pub struct RecompContext {
     pub cop0_entry_lo1: u32,
     pub cop0_page_mask: u32,
     cop0_wired: u32,
-    pub cop0_entry_hi: u32,
+    pub cop0_entry_hi: u64,
     /// Instruction-coupled position within the inclusive Random countdown
     /// `[31, Wired]`. Zero denotes Random=31, including after reset and every
     /// Wired write. Keeping the phase rather than a second writable register
@@ -503,15 +547,15 @@ impl RecompContext {
     /// the low Index field unpredictable; fn64's bounded deterministic policy
     /// clears that field and sets only the probe-failure bit.
     pub fn tlbp_probe(&mut self) {
-        const VPN2_MASK: u32 = 0xffff_e000;
-        const PAGE_MASK: u32 = 0x01ff_e000;
-        const ASID_MASK: u32 = 0x0000_00ff;
+        const VPN2_MASK: u64 = 0xc000_00ff_ffff_e000;
+        const PAGE_MASK: u64 = 0x01ff_e000;
+        const ASID_MASK: u64 = 0x0000_00ff;
         const GLOBAL: u32 = 1;
 
         let probe = self.cop0_entry_hi;
         let mut matched = None;
         for (index, entry) in self.tlb_entries.iter().enumerate() {
-            let compared_vpn = VPN2_MASK & !(entry.page_mask & PAGE_MASK);
+            let compared_vpn = VPN2_MASK & !(u64::from(entry.page_mask) & PAGE_MASK);
             let vpn_matches = (probe ^ entry.entry_hi) & compared_vpn == 0;
             let global = entry.entry_lo0 & GLOBAL != 0 && entry.entry_lo1 & GLOBAL != 0;
             let asid_matches = (probe ^ entry.entry_hi) & ASID_MASK == 0;
@@ -524,37 +568,155 @@ impl RecompContext {
         self.cop0_index = matched.map_or(1 << 31, |index| index as u32);
     }
 
-    /// Translate one canonical 32-bit guest data address.
+    fn cpu_mode(&self) -> CpuMode {
+        const STATUS_EXL: u32 = 1 << 1;
+        const STATUS_ERL: u32 = 1 << 2;
+        const STATUS_KSU_MASK: u32 = 0b11 << 3;
+
+        if self.cop0_status & (STATUS_EXL | STATUS_ERL) != 0 {
+            return CpuMode::Kernel;
+        }
+        match (self.cop0_status & STATUS_KSU_MASK) >> 3 {
+            0 => CpuMode::Kernel,
+            1 => CpuMode::Supervisor,
+            2 => CpuMode::User,
+            mode => trap_unsupported(format!(
+                "reserved VR4300 Status.KSU={mode} cannot classify an address"
+            )),
+        }
+    }
+
+    /// Classify one effective address before translation.
     ///
-    /// VR4300 User's Manual chapter 3 (32-bit mode address translation,
-    /// PageMask, and EntryLo0/1) supplies the segment split, masked VPN2
-    /// comparison, paired even/odd page selection, and PFN/offset assembly.
-    /// KSEG0/KSEG1 bypass the TLB. KUSEG, KSSEG, and KSEG3 use the recorded
-    /// entries and the current EntryHi ASID. Noncanonical 64-bit addresses are
-    /// deliberately left to the existing unbacked-address boundary; XKPHYS,
-    /// XUSEG/XKSSEG/XKSEG and privilege checks are not silently approximated
-    /// by this 32-bit data slice. Instruction fetch uses the separate
-    /// physical-only result of [`Self::translate_instruction_address`].
+    /// VR4300 User's Manual chapter 3, Tables 3-2 through 3-4, define the
+    /// UX/SX/KX-selected user, supervisor, and kernel spaces. Kernel XKPHYS
+    /// requires VA[58:32]=0 and supplies PA[31:0] directly; mapped 64-bit
+    /// spaces implement VA[39:0] plus EntryHi.Region. The four sign-extended
+    /// compatibility spaces retain the existing 32-bit behavior.
+    fn classify_data_address(&self, vaddr: u64) -> Result<AddressRoute, ()> {
+        const STATUS_ERL: u32 = 1 << 2;
+        const STATUS_UX: u32 = 1 << 5;
+        const STATUS_SX: u32 = 1 << 6;
+        const STATUS_KX: u32 = 1 << 7;
+        const LOW_40_MAX: u64 = 0x0000_00ff_ffff_ffff;
+        const SUPERVISOR_64_START: u64 = 0x4000_0000_0000_0000;
+        const SUPERVISOR_64_END: u64 = 0x4000_00ff_ffff_ffff;
+        const KERNEL_64_START: u64 = 0xc000_0000_0000_0000;
+        const KERNEL_64_END: u64 = 0xc000_00ff_7fff_ffff;
+
+        let mode = self.cpu_mode();
+        let extended = match mode {
+            CpuMode::Kernel => self.cop0_status & STATUS_KX != 0,
+            CpuMode::Supervisor => self.cop0_status & STATUS_SX != 0,
+            CpuMode::User => self.cop0_status & STATUS_UX != 0,
+        };
+        if mode == CpuMode::Kernel && self.cop0_status & STATUS_ERL != 0 && vaddr <= 0x7fff_ffff {
+            return Ok(AddressRoute::DirectPhysical(vaddr as u32));
+        }
+        if !extended {
+            let upper = vaddr >> 32;
+            let low = vaddr as u32;
+            let compatibility = upper == 0 || (upper == u32::MAX as u64 && low & 0x8000_0000 != 0);
+            if !compatibility {
+                return Err(());
+            }
+            return match mode {
+                CpuMode::User if low < 0x8000_0000 => Ok(AddressRoute::Mapped { extended: false }),
+                CpuMode::Supervisor if low < 0x8000_0000 => {
+                    Ok(AddressRoute::Mapped { extended: false })
+                }
+                CpuMode::Supervisor if (0xc000_0000..0xe000_0000).contains(&low) => {
+                    Ok(AddressRoute::Mapped { extended: false })
+                }
+                CpuMode::Kernel if (0x8000_0000..0xc000_0000).contains(&low) => {
+                    Ok(AddressRoute::DirectVirtual(vaddr))
+                }
+                CpuMode::Kernel => Ok(AddressRoute::Mapped { extended: false }),
+                CpuMode::User | CpuMode::Supervisor => Err(()),
+            };
+        }
+
+        match mode {
+            CpuMode::User => (vaddr <= LOW_40_MAX)
+                .then_some(AddressRoute::Mapped { extended: true })
+                .ok_or(()),
+            CpuMode::Supervisor => {
+                if vaddr <= LOW_40_MAX
+                    || (SUPERVISOR_64_START..=SUPERVISOR_64_END).contains(&vaddr)
+                    || (0xffff_ffff_c000_0000..=0xffff_ffff_dfff_ffff).contains(&vaddr)
+                {
+                    Ok(AddressRoute::Mapped { extended: true })
+                } else {
+                    Err(())
+                }
+            }
+            CpuMode::Kernel => {
+                if vaddr <= LOW_40_MAX {
+                    if self.cop0_status & STATUS_ERL != 0 {
+                        return Err(());
+                    }
+                    return Ok(AddressRoute::Mapped { extended: true });
+                }
+                if (SUPERVISOR_64_START..=SUPERVISOR_64_END).contains(&vaddr) {
+                    return Ok(AddressRoute::Mapped { extended: true });
+                }
+                if vaddr >> 62 == 0b10 {
+                    return if vaddr & 0x07ff_ffff_0000_0000 == 0 {
+                        Ok(AddressRoute::DirectPhysical(vaddr as u32))
+                    } else {
+                        Err(())
+                    };
+                }
+                if (KERNEL_64_START..=KERNEL_64_END).contains(&vaddr)
+                    || (0xffff_ffff_c000_0000..=u64::MAX).contains(&vaddr)
+                {
+                    return Ok(AddressRoute::Mapped { extended: true });
+                }
+                if (0xffff_ffff_8000_0000..=0xffff_ffff_bfff_ffff).contains(&vaddr) {
+                    return Ok(AddressRoute::DirectVirtual(vaddr));
+                }
+                Err(())
+            }
+        }
+    }
+
+    /// Translate one VR4300 guest data address.
+    ///
+    /// Chapter 3 supplies the segment classifier above plus PageMask,
+    /// EntryLo0/1, Region/VPN2, ASID/global, V, D, and PFN rules. Address-space
+    /// and privilege failures return AdEL/AdES currency before any TLB lookup
+    /// or memory side effect. Instruction fetch retains a separate 32-bit-PC
+    /// boundary in [`Self::translate_instruction_address`].
     pub fn translate_data_address(
         &self,
         vaddr: u64,
         access: DataAccessKind,
-    ) -> Result<TranslatedDataAddress, TlbFault> {
+    ) -> Result<TranslatedDataAddress, DataAccessError> {
         const PAGE_MASK_BITS: u32 = 0x01ff_e000;
-        const VPN2_BITS: u32 = 0xffff_e000;
-        const ASID_BITS: u32 = 0xff;
+        const VPN2_32_BITS: u64 = 0x0000_0000_ffff_e000;
+        const VPN2_64_BITS: u64 = 0x0000_00ff_ffff_e000;
+        const REGION_BITS: u64 = 0xc000_0000_0000_0000;
+        const ASID_BITS: u64 = 0xff;
         const GLOBAL: u32 = 1;
         const VALID: u32 = 1 << 1;
         const DIRTY: u32 = 1 << 2;
 
-        let upper = vaddr >> 32;
+        let route = self
+            .classify_data_address(vaddr)
+            .map_err(|()| DataAccessError::AddressError { vaddr, access })?;
+        match route {
+            AddressRoute::DirectVirtual(address) => {
+                return Ok(TranslatedDataAddress::Direct(address));
+            }
+            AddressRoute::DirectPhysical(physical) => {
+                return Ok(TranslatedDataAddress::DirectPhysical(physical));
+            }
+            AddressRoute::Mapped { .. } => {}
+        }
+        let AddressRoute::Mapped { extended } = route else {
+            unreachable!("direct routes returned above")
+        };
         let low = vaddr as u32;
-        if upper != 0 && !(upper == u32::MAX as u64 && low & 0x8000_0000 != 0) {
-            return Ok(TranslatedDataAddress::Direct(vaddr));
-        }
-        if (0x8000_0000..0xc000_0000).contains(&low) {
-            return Ok(TranslatedDataAddress::Direct(vaddr));
-        }
 
         let mut matched = None;
         for (index, entry) in self.tlb_entries.iter().copied().enumerate() {
@@ -573,24 +735,29 @@ impl RecompContext {
                     entry.page_mask
                 ));
             }
-            let compared_vpn = VPN2_BITS & !page_mask;
-            let vpn_matches = (low ^ entry.entry_hi) & compared_vpn == 0;
+            let compared_vpn = if extended {
+                (VPN2_64_BITS & !(u64::from(page_mask))) | REGION_BITS
+            } else {
+                VPN2_32_BITS & !(u64::from(page_mask))
+            };
+            let vpn_matches = (vaddr ^ entry.entry_hi) & compared_vpn == 0;
             let global = entry.entry_lo0 & GLOBAL != 0 && entry.entry_lo1 & GLOBAL != 0;
             let asid_matches = (self.cop0_entry_hi ^ entry.entry_hi) & ASID_BITS == 0;
             if vpn_matches && (global || asid_matches) && matched.replace((index, entry)).is_some()
             {
                 trap_unsupported(format!(
-                    "data translation for {low:#010x} matched multiple TLB entries; VR4300 behavior is undefined"
+                    "data translation for {vaddr:#018x} matched multiple TLB entries; VR4300 behavior is undefined"
                 ));
             }
         }
 
         let Some((_index, entry)) = matched else {
-            return Err(TlbFault {
-                vaddr: low,
+            return Err(DataAccessError::Tlb(TlbFault {
+                vaddr,
                 access,
                 kind: TlbFaultKind::Refill,
-            });
+                extended,
+            }));
         };
         let page_mask = entry.page_mask & PAGE_MASK_BITS;
         let page_size = (page_mask + 0x2000) >> 1;
@@ -600,18 +767,20 @@ impl RecompContext {
             entry.entry_lo1
         };
         if entry_lo & VALID == 0 {
-            return Err(TlbFault {
-                vaddr: low,
+            return Err(DataAccessError::Tlb(TlbFault {
+                vaddr,
                 access,
                 kind: TlbFaultKind::Invalid,
-            });
+                extended,
+            }));
         }
         if access == DataAccessKind::Store && entry_lo & DIRTY == 0 {
-            return Err(TlbFault {
-                vaddr: low,
+            return Err(DataAccessError::Tlb(TlbFault {
+                vaddr,
                 access,
                 kind: TlbFaultKind::Modified,
-            });
+                extended,
+            }));
         }
 
         // User's Manual figure 3-10 defines the VR4300 EntryLo PFN as the 20
@@ -638,11 +807,7 @@ impl RecompContext {
     pub fn translate_instruction_address(
         &self,
         vaddr: u64,
-    ) -> Result<TranslatedInstructionAddress, TlbFault> {
-        const STATUS_EXL: u32 = 1 << 1;
-        const STATUS_ERL: u32 = 1 << 2;
-        const STATUS_KSU_MASK: u32 = 0b11 << 3;
-
+    ) -> Result<TranslatedInstructionAddress, DataAccessError> {
         let upper = vaddr >> 32;
         let low = vaddr as u32;
         if upper != 0 && !(upper == u32::MAX as u64 && low & 0x8000_0000 != 0) {
@@ -650,18 +815,13 @@ impl RecompContext {
                 "64-bit instruction address translation is unsupported for {vaddr:#018x}"
             ));
         }
-        if self.cop0_status & (STATUS_EXL | STATUS_ERL) == 0
-            && self.cop0_status & STATUS_KSU_MASK != 0
-        {
-            trap_unsupported(format!(
-                "instruction translation privilege checks are unsupported with Status.KSU={}",
-                (self.cop0_status & STATUS_KSU_MASK) >> 3
-            ));
-        }
 
         match self.translate_data_address(vaddr, DataAccessKind::Load)? {
             TranslatedDataAddress::Direct(_) => {
                 Ok(TranslatedInstructionAddress::new(low & 0x1fff_ffff))
+            }
+            TranslatedDataAddress::DirectPhysical(physical) => {
+                Ok(TranslatedInstructionAddress::new(physical))
             }
             TranslatedDataAddress::Mapped(physical) => {
                 Ok(TranslatedInstructionAddress::new(physical))
@@ -674,7 +834,7 @@ impl RecompContext {
         match reg {
             1 => self.cop0_random(),
             4 => self.cop0_context,
-            8 => self.cop0_badvaddr,
+            8 => self.cop0_badvaddr as u32,
             9 => self.cop0_count,
             11 => self.cop0_compare,
             12 => self.cop0_status,
@@ -685,11 +845,23 @@ impl RecompContext {
             3 => self.cop0_entry_lo1,
             5 => self.cop0_page_mask,
             6 => self.cop0_wired,
-            10 => self.cop0_entry_hi,
+            10 => self.cop0_entry_hi as u32,
             18 => self.cop0_watch_lo,
             19 => self.cop0_watch_hi,
+            20 => self.cop0_xcontext as u32,
             30 => self.cop0_error_epc,
             _ => trap_unsupported(format!("unsupported MFC0 from COP0 register {reg}")),
+        }
+    }
+
+    /// Read one architecturally 64-bit COP0 address register for DMFC0.
+    #[inline]
+    pub fn read_cop0_64(&self, reg: u8) -> u64 {
+        match reg {
+            8 => self.cop0_badvaddr,
+            10 => self.cop0_entry_hi,
+            20 => self.cop0_xcontext,
+            _ => trap_unsupported(format!("unsupported DMFC0 from COP0 register {reg}")),
         }
     }
 
@@ -730,11 +902,21 @@ impl RecompContext {
                 self.cop0_wired = value;
                 self.cop0_random_phase = 0;
             }
-            10 => self.cop0_entry_hi = value,
+            10 => self.cop0_entry_hi = u64::from(value),
             18 => self.cop0_watch_lo = value,
             19 => self.cop0_watch_hi = value,
             30 => self.cop0_error_epc = value,
             _ => trap_unsupported(format!("unsupported MTC0 to COP0 register {reg}")),
+        }
+    }
+
+    /// Write one architecturally 64-bit COP0 address register for DMTC0.
+    #[inline]
+    pub fn write_cop0_64(&mut self, reg: u8, value: u64) {
+        match reg {
+            10 => self.cop0_entry_hi = value,
+            20 => self.cop0_xcontext = value,
+            _ => trap_unsupported(format!("unsupported DMTC0 to COP0 register {reg}")),
         }
     }
 
@@ -1665,7 +1847,7 @@ impl<'a> Rdram<'a> {
             .is_some_and(|p| self.storage_range_backed(p ^ lane_xor, width))
     }
 
-    /// Resolve the typed 32-bit MMU result into the direct alias understood by
+    /// Resolve the typed MMU result into the direct alias understood by
     /// the shared RDRAM/device backing layout. Physical addresses beyond the
     /// N64's 29-bit direct window remain a loud unbacked boundary after a
     /// successful TLB lookup; they are never truncated into a different page.
@@ -1674,15 +1856,17 @@ impl<'a> Rdram<'a> {
         vaddr: u64,
         access: DataAccessKind,
     ) -> Result<u64, DataAccessError> {
-        match ctx
-            .translate_data_address(vaddr, access)
-            .map_err(DataAccessError::Tlb)?
-        {
+        match ctx.translate_data_address(vaddr, access)? {
             TranslatedDataAddress::Direct(address) => Ok(address),
-            TranslatedDataAddress::Mapped(physical) if physical < 0x2000_0000 => {
+            TranslatedDataAddress::DirectPhysical(physical)
+            | TranslatedDataAddress::Mapped(physical)
+                if physical < 0x2000_0000 =>
+            {
                 Ok(0xffff_ffff_a000_0000 | u64::from(physical))
             }
-            TranslatedDataAddress::Mapped(_) => Err(DataAccessError::Unbacked { vaddr }),
+            TranslatedDataAddress::DirectPhysical(_) | TranslatedDataAddress::Mapped(_) => {
+                Err(DataAccessError::Unbacked { vaddr })
+            }
         }
     }
 
@@ -1701,7 +1885,6 @@ impl<'a> Rdram<'a> {
     pub fn check_store_translation(ctx: &RecompContext, vaddr: u64) -> Result<(), DataAccessError> {
         ctx.translate_data_address(vaddr, DataAccessKind::Store)
             .map(|_| ())
-            .map_err(DataAccessError::Tlb)
     }
 
     /// Whether the aligned-word effective address is backed (LW/LWU/LL/…).
@@ -2320,21 +2503,23 @@ mod tests {
         );
         assert_eq!(
             ctx.translate_data_address(0x0040_5234, DataAccessKind::Store),
-            Err(TlbFault {
+            Err(DataAccessError::Tlb(TlbFault {
                 vaddr: 0x0040_5234,
                 access: DataAccessKind::Store,
                 kind: TlbFaultKind::Modified,
-            })
+                extended: false,
+            }))
         );
 
         ctx.cop0_entry_hi = 0x0000_002b;
         assert_eq!(
             ctx.translate_data_address(0x0040_1234, DataAccessKind::Load),
-            Err(TlbFault {
+            Err(DataAccessError::Tlb(TlbFault {
                 vaddr: 0x0040_1234,
                 access: DataAccessKind::Load,
                 kind: TlbFaultKind::Refill,
-            })
+                extended: false,
+            }))
         );
     }
 
@@ -2384,12 +2569,161 @@ mod tests {
         );
         assert_eq!(
             ctx.translate_data_address(0xffff_ffff_c000_0040, DataAccessKind::Load),
-            Err(TlbFault {
-                vaddr: 0xc000_0040,
+            Err(DataAccessError::Tlb(TlbFault {
+                vaddr: 0xffff_ffff_c000_0040,
                 access: DataAccessKind::Load,
                 kind: TlbFaultKind::Invalid,
+                extended: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn extended_segments_enforce_region_privilege_and_xkphys_width() {
+        const STATUS_KSU_USER: u32 = 0b10 << 3;
+        const STATUS_KSU_SUPERVISOR: u32 = 0b01 << 3;
+        const STATUS_UX: u32 = 1 << 5;
+        const STATUS_SX: u32 = 1 << 6;
+        const STATUS_KX: u32 = 1 << 7;
+        const USER_VA: u64 = 0x0000_0012_3456_0040;
+        const SUPERVISOR_VA: u64 = 0x4000_0012_3456_0040;
+
+        let mut user = RecompContext::new();
+        user.cop0_status = STATUS_KSU_USER | STATUS_UX;
+        user.cop0_entry_hi = 0x2a;
+        user.tlb_entries[4] = TlbEntryRaw {
+            page_mask: 0,
+            entry_hi: (USER_VA & 0xc000_00ff_ffff_e000) | 0x2a,
+            entry_lo0: 0x6,
+            entry_lo1: 0x46,
+        };
+        assert_eq!(
+            user.translate_data_address(USER_VA, DataAccessKind::Load),
+            Ok(TranslatedDataAddress::Mapped(0x40))
+        );
+        assert_eq!(
+            user.translate_data_address(SUPERVISOR_VA, DataAccessKind::Load),
+            Err(DataAccessError::AddressError {
+                vaddr: SUPERVISOR_VA,
+                access: DataAccessKind::Load,
             })
         );
+        assert_eq!(
+            user.translate_data_address(0x9000_0000_0000_0040, DataAccessKind::Store),
+            Err(DataAccessError::AddressError {
+                vaddr: 0x9000_0000_0000_0040,
+                access: DataAccessKind::Store,
+            })
+        );
+
+        let mut supervisor = RecompContext::new();
+        supervisor.cop0_status = STATUS_KSU_SUPERVISOR | STATUS_SX;
+        supervisor.cop0_entry_hi = 0x2a;
+        supervisor.tlb_entries[4] = TlbEntryRaw {
+            page_mask: 0,
+            entry_hi: (SUPERVISOR_VA & 0xc000_00ff_ffff_e000) | 0x2a,
+            entry_lo0: 0x6,
+            entry_lo1: 0x46,
+        };
+        assert_eq!(
+            supervisor.translate_data_address(SUPERVISOR_VA, DataAccessKind::Load),
+            Ok(TranslatedDataAddress::Mapped(0x40))
+        );
+        assert!(matches!(
+            supervisor.translate_data_address(0xc000_0012_3456_0040, DataAccessKind::Load),
+            Err(DataAccessError::AddressError { .. })
+        ));
+
+        let mut kernel = RecompContext::new();
+        kernel.cop0_status = STATUS_KX;
+        assert_eq!(
+            kernel.translate_data_address(0x9000_0000_0000_0040, DataAccessKind::Load),
+            Ok(TranslatedDataAddress::DirectPhysical(0x40))
+        );
+        assert_eq!(
+            kernel.translate_data_address(0x9000_0001_0000_0040, DataAccessKind::Load),
+            Err(DataAccessError::AddressError {
+                vaddr: 0x9000_0001_0000_0040,
+                access: DataAccessKind::Load,
+            })
+        );
+    }
+
+    #[test]
+    fn extended_tlb_faults_retain_full_address_and_refill_class() {
+        const STATUS_KSU_USER: u32 = 0b10 << 3;
+        const STATUS_UX: u32 = 1 << 5;
+        const VA: u64 = 0x0000_0088_7654_2040;
+
+        let mut ctx = RecompContext::new();
+        ctx.cop0_status = STATUS_KSU_USER | STATUS_UX;
+        ctx.cop0_entry_hi = 0x51;
+        assert_eq!(
+            ctx.translate_data_address(VA, DataAccessKind::Load),
+            Err(DataAccessError::Tlb(TlbFault {
+                vaddr: VA,
+                access: DataAccessKind::Load,
+                kind: TlbFaultKind::Refill,
+                extended: true,
+            }))
+        );
+
+        ctx.tlb_entries[2] = TlbEntryRaw {
+            page_mask: 0,
+            entry_hi: (VA & 0xc000_00ff_ffff_e000) | 0x51,
+            entry_lo0: 0x6,
+            entry_lo1: 0x46,
+        };
+        assert_eq!(
+            ctx.translate_data_address(VA, DataAccessKind::Load),
+            Ok(TranslatedDataAddress::Mapped(0x40))
+        );
+
+        ctx.tlb_entries[2].entry_hi |= 0x4000_0000_0000_0000;
+        assert!(matches!(
+            ctx.translate_data_address(VA, DataAccessKind::Load),
+            Err(DataAccessError::Tlb(TlbFault {
+                kind: TlbFaultKind::Refill,
+                extended: true,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn erl_directs_only_the_low_user_segment_in_both_address_widths() {
+        const STATUS_ERL: u32 = 1 << 2;
+        const STATUS_KX: u32 = 1 << 7;
+
+        for status in [STATUS_ERL, STATUS_ERL | STATUS_KX] {
+            let mut ctx = RecompContext::new();
+            ctx.cop0_status = status;
+            assert_eq!(
+                ctx.translate_data_address(0x1234_5040, DataAccessKind::Load),
+                Ok(TranslatedDataAddress::DirectPhysical(0x1234_5040))
+            );
+        }
+
+        let mut extended = RecompContext::new();
+        extended.cop0_status = STATUS_ERL | STATUS_KX;
+        assert_eq!(
+            extended.translate_data_address(0x0000_0000_8000_0040, DataAccessKind::Load),
+            Err(DataAccessError::AddressError {
+                vaddr: 0x0000_0000_8000_0040,
+                access: DataAccessKind::Load,
+            })
+        );
+    }
+
+    #[test]
+    fn doubleword_cop0_moves_round_trip_entry_hi_and_xcontext() {
+        let mut ctx = RecompContext::new();
+        ctx.write_cop0_64(10, 0xc000_0088_7654_3051);
+        ctx.write_cop0_64(20, 0x1234_5679_0abc_def0);
+        assert_eq!(ctx.read_cop0_64(10), 0xc000_0088_7654_3051);
+        assert_eq!(ctx.read_cop0_64(20), 0x1234_5679_0abc_def0);
+        assert_eq!(ctx.read_cop0(10), 0x7654_3051);
+        assert_eq!(ctx.read_cop0(20), 0x0abc_def0);
     }
 
     #[test]
@@ -2421,7 +2755,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_instruction_address_spaces_and_privilege_remain_loud() {
+    fn unsupported_instruction_width_stays_loud_while_privilege_is_typed() {
         let result = std::panic::catch_unwind(|| {
             RecompContext::new().translate_instruction_address(0x0000_0001_0000_0000)
         });
@@ -2439,18 +2773,22 @@ mod tests {
 
         let mut user = RecompContext::new();
         user.cop0_status = 0b10 << 3;
-        let result = std::panic::catch_unwind(|| user.translate_instruction_address(0x0040_0000));
-        let message = result
-            .expect_err("instruction privilege modeling must remain loud")
-            .downcast::<String>()
-            .map(|message| *message)
-            .unwrap_or_else(|payload| {
-                payload
-                    .downcast::<&'static str>()
-                    .map(|message| (*message).to_owned())
-                    .unwrap_or_default()
-            });
-        assert!(message.contains("instruction translation privilege checks are unsupported"));
+        assert_eq!(
+            user.translate_instruction_address(0x0040_0000),
+            Err(DataAccessError::Tlb(TlbFault {
+                vaddr: 0x0040_0000,
+                access: DataAccessKind::Load,
+                kind: TlbFaultKind::Refill,
+                extended: false,
+            }))
+        );
+        assert_eq!(
+            user.translate_instruction_address(0xffff_ffff_8000_0000),
+            Err(DataAccessError::AddressError {
+                vaddr: 0xffff_ffff_8000_0000,
+                access: DataAccessKind::Load,
+            })
+        );
     }
 
     #[test]

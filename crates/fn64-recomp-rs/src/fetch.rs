@@ -18,7 +18,7 @@ use crate::execution::{
     ProgramArtifactIdentity,
 };
 use crate::interp::{run_instruction_unit, UnsupportedOp};
-use crate::runtime::{Rdram, RecompContext, TlbFaultKind};
+use crate::runtime::{DataAccessError, Rdram, RecompContext, TlbFaultKind};
 
 /// One immutable contiguous physical code span.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,28 +330,42 @@ pub fn fetch_instruction(
                 epc: site.epc(),
                 branch_delay: site.branch_delay(),
                 instruction_code: 0,
-                bad_vaddr: Some(pc.get()),
+                bad_vaddr: Some(u64::from(pc.get())),
                 coprocessor: None,
             },
         });
     }
     let translated = ctx
         .translate_instruction_address(u64::from(pc.get()))
-        .map_err(|fault| CpuFault {
+        .map_err(|error| CpuFault {
             at,
-            kind: CpuFaultKind::Exception {
-                exception: match fault.kind {
-                    TlbFaultKind::Refill => CpuException::TlbRefillLoad,
-                    TlbFaultKind::Invalid => CpuException::TlbInvalidLoad,
-                    TlbFaultKind::Modified => {
-                        unreachable!("instruction fetch cannot raise TLB Modified")
-                    }
+            kind: match error {
+                DataAccessError::AddressError { vaddr, .. } => CpuFaultKind::Exception {
+                    exception: CpuException::AddressErrorLoad,
+                    epc: site.epc(),
+                    branch_delay: site.branch_delay(),
+                    instruction_code: 0,
+                    bad_vaddr: Some(vaddr),
+                    coprocessor: None,
                 },
-                epc: site.epc(),
-                branch_delay: site.branch_delay(),
-                instruction_code: 0,
-                bad_vaddr: Some(fault.vaddr),
-                coprocessor: None,
+                DataAccessError::Tlb(fault) => CpuFaultKind::Exception {
+                    exception: match (fault.kind, fault.extended) {
+                        (TlbFaultKind::Refill, true) => CpuException::XTlbRefillLoad,
+                        (TlbFaultKind::Refill, false) => CpuException::TlbRefillLoad,
+                        (TlbFaultKind::Invalid, _) => CpuException::TlbInvalidLoad,
+                        (TlbFaultKind::Modified, _) => {
+                            unreachable!("instruction fetch cannot raise TLB Modified")
+                        }
+                    },
+                    epc: site.epc(),
+                    branch_delay: site.branch_delay(),
+                    instruction_code: 0,
+                    bad_vaddr: Some(fault.vaddr),
+                    coprocessor: None,
+                },
+                DataAccessError::Unbacked { .. } => {
+                    unreachable!("instruction translation does not inspect host backing")
+                }
             },
         })?;
     let identity = InstructionWordIdentity::new(bank, translated.get());

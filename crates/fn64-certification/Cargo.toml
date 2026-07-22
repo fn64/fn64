@@ -17,6 +17,7 @@ f3dzex2-characterization-evidence = [
 ]
 
 [dependencies]
+fn64-boot-harness = { path = "../fn64-boot-harness", default-features = false }
 fn64-render = { path = "../fn64-render" }
 fn64-render-rt64 = { path = "../fn64-render-rt64", default-features = false }
 fn64-runtime = { path = "../fn64-runtime" }

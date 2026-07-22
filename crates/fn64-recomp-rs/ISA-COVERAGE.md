@@ -158,9 +158,12 @@ write and honors an encoded `rd=0`.
 MFC0, DMFC0, MTC0, DMTC0, BC0F/T/FL/TL, TLBR, TLBWI, TLBWR, TLBP, and ERET
 all decode. Index (0), Random (1), EntryLo0/1 (2/3), Context (4), PageMask (5), Wired (6),
 BadVAddr (8), Count (9), EntryHi (10), Compare (11), Status (12), Cause (13), EPC (14),
-WatchLo/Hi (18/19), and ErrorEPC (30) have typed 32-bit reads; writable
+WatchLo/Hi (18/19), XContext (20), and ErrorEPC (30) have typed 32-bit reads; writable
 registers other than BadVAddr/Random have modeled typed writes. Cause accepts
-its two writable software-pending bits while preserving hardware-pending lines. Indexed TLB
+its two writable software-pending bits while preserving hardware-pending lines.
+The arbitrary-PC lanes also implement DMFC0 for BadVAddr, EntryHi, and XContext
+and DMTC0 for EntryHi and XContext, retaining the full 64-bit address fields.
+Indexed TLB
 write/read/probe and random-indexed write share one 32-entry raw management
 array in both arbitrary-PC generated and interpreted lanes. The public manual supplies
 Random's inclusive 31-through-Wired range and Wired-write reset to 31. Fn64's
@@ -181,12 +184,19 @@ side effect. No match, V=0, and store with D=0 return distinct typed refill,
 invalid, and modified exceptions with precise EPC/BD/BadVAddr. Exception entry
 updates Context.BadVPN2 and EntryHi.VPN2 while preserving PTEBase/ASID, then
 selects the 32-bit refill vector only for a first-level miss; invalid, modified,
-and nested misses use the common vector. KSEG0/KSEG1 remain direct. Multiple
-matches and unsupported PageMask encodings trap loudly. 64-bit mapped
-spaces/XContext, privilege checks beyond the kernel-mode slice, and
-generated-lane translated physical device routing remain open rather than
-being silently direct-mapped. Doubleword moves and other registers likewise
-remain host-boundary traps. In the arbitrary-PC
+and nested misses use the common vector. KSEG0/KSEG1 remain direct. The same
+translator now applies Status.KSU plus UX/SX/KX to the documented 64-bit
+XUSEG/XKSSEG/XKUSEG, XSSEG, XKPHYS, and XKSEG ranges. Mapped entries compare
+EntryHi.Region plus the 40-bit VPN2; XKPHYS validates VA[58:32] before using
+PA[31:0] directly. Privilege or width violations return typed AdEL/AdES before
+any TLB lookup or memory side effect. Extended refill entry preserves the full
+BadVAddr, updates Context, XContext.Region/BadVPN2 and EntryHi.Region/VPN2 while
+retaining both PTEBase fields and ASID, and selects the first-level XTLB vector;
+nested misses still use the common vector. Multiple matches and unsupported
+PageMask encodings trap loudly. Full 64-bit instruction-PC admission remains
+open because GuestPc, ExecutionKey, and code-catalog identity are still u32;
+generated-lane translated physical device routing is also open. Other
+doubleword COP0 register moves remain host-boundary traps. In the arbitrary-PC
 bank lane, ERET selects ErrorEPC/ERL or EPC/EXL, clears the LL reservation, and
 returns a typed resolved transfer; the historical whole-function lane still
 traps because its callable ABI cannot return a transfer. BC0 uses a typed
@@ -271,13 +281,16 @@ therefore become compile-time errors, never silent no-ops.
   priority over COP1 address alignment, Cause.CE, and ERET.
   The same compiled gate differentially executes TLB-backed load/store plus
   refill, invalid, modified, and delay-slot refill cases in the emitted and
-  interpreted lanes.
+  interpreted lanes. It also compares 64-bit XUSEG translation, XKPHYS direct
+  access, user privilege address faults, and EntryHi/XContext doubleword moves.
+  Unit tests separately assert full BadVAddr/EntryHi/XContext exception state
+  and normal, BEV, and nested XTLB vector selection.
 
 Bottom line: encoding coverage is complete for the documented MIPS III CPU
 table, with COP2 decoded as architecturally unusable. Execution is complete
 for the ordinary integer, control-flow, aligned/unaligned memory, shift, and
 HI/LO paths OoT can execute. It is not a complete VR4300 CPU model until the
-remaining P items—especially full FPU environment behavior, instruction and
-64-bit/privileged TLB translation, COP0/COP2 exception behavior, and the
+remaining P items—especially full FPU environment behavior, 64-bit instruction
+PC/catalog identity, translated physical device routing, COP0/COP2 exception behavior, and the
 whole-function lane's exception boundary—are implemented or deliberately moved
 behind a documented host ABI boundary.

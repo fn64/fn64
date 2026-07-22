@@ -807,7 +807,7 @@ v20 stream. A backend-recognized family remains diagnostic/optimization
 evidence. Public-microcode credit instead requires the reported text digest to
 match the immutable project-owned certified-public-microcode catalog v1; a
 contradictory backend family is rejected. That catalog is currently empty
-pending allowed-source digest provenance, so matrix v17 cannot yet satisfy any of the
+pending allowed-source digest provenance, so matrix v18 cannot yet satisfy any of the
 twelve public-microcode requirements. The current FullParityV1 assignment pass
 can satisfy program/renderer-lane, save, controller, and RSP/RDP mechanism
 requirements. It also credits `macos-metal` or `linux-vulkan` only when a
@@ -858,12 +858,26 @@ RT64 target-case credit has a separate opaque
 `VerifiedRt64PlatformCaseSeries` boundary. Its retained projection binds the
 exact v22 report scenario and semantic report SHA, exact ordered matrix run
 events, native host identity, observed graphics/capture API, pinned RT64 and
-adapter identities, child identity, case semantic digest, and the case's exact
-10- or 20-run event set. Duplicate, unused, relabeled, report-detached, or
+adapter identities, the fn64 certification-source digest, the builder Cargo
+binary digest, child identity, case semantic digest, and the case's exact 10-
+or 20-run event set. Duplicate, unused, relabeled, report-detached, or
 run-order-detached capabilities fail closed. Retained/self-hashed JSON cannot
-enter matrix construction as authority, and phase one deliberately exposes no
-production constructor for the opaque capability. Therefore no target-case
-credit or positive Windows evidence is claimed yet.
+enter matrix construction as authority. The production constructor selects a
+repository-owned certification example and feature set, validates the clean
+pinned RT64 tree before and after execution, revalidates the Cargo binary
+embedded into the verifier build, uses an isolated fresh target directory,
+hashes Cargo's exact executable artifact, and independently recomputes the
+adapter identity expected from the selected target/features. It runs the
+case's complete 10/20 fresh-process bar under a 60-second per-process
+watchdog, requires identical semantic stdout and one child-observed source/API
+identity envelope, then revalidates the sources, child, builder, and bound
+private series. All 13 macOS/Metal examples emit the envelope after their
+behavioral assertions pass. Other target/API rows fail before building until
+target-owned examples can observe their active API. This is retained
+integrity authority, not protection from a same-UID process that can mutate
+the verifier or sources during execution. No capability has yet been retained
+through this constructor, so no new target-case credit or positive Windows
+evidence is claimed here.
 
 Schema v22 still cannot expose blocker closure. Valid v22 evidence
 therefore returns a typed `Incomplete` assessment listing the exact
@@ -871,7 +885,7 @@ unsatisfied project-owned requirements; it never emits a smaller passing
 denominator. Allowed-source identities in a successor certified-public-
 microcode catalog, Windows-version evidence, external platform/blocker results,
 and representative verified-series ROM-class assignments are required before a
-`Complete` v17 retained matrix is reachable.
+`Complete` v18 retained matrix is reachable.
 
 A minimal two-scenario shape is:
 
@@ -928,6 +942,7 @@ The report's validated `scenario` field performs the assignment:
 cargo run -p fn64-boot-harness --bin verify-release-matrix -- \
   --private-series /private/path/game-a-contract.json /private/path/game-a-series /private/path/game-a-series/receipt.json /private/path/run-private-release-series \
   --private-series /private/path/game-b-contract.json /private/path/game-b-series /private/path/game-b-series/receipt.json /private/path/run-private-release-series \
+  --rt64-platform-case macos-metal:resolution-downsample /absolute/path/to/clean/pinned/rt64 2 \
   /private/path/matrix.json \
   /private/path/game-a-01.json,/private/path/game-a-01.unsupported.jsonl \
   ... \
@@ -945,6 +960,16 @@ unused series fail. Bare `--private-contract` is rejected. Omitting all series
 tuples intentionally selects report-only verification and leaves the ROM-class
 dimension empty.
 
+Each repeatable `--rt64-platform-case TARGET:CASE RT64_DIR
+PRIVATE_SERIES_ORDINAL` tuple runs after all manifest, report, journal, and
+private-series inputs have passed preflight but before matrix construction. It binds its
+opaque capability to the named one-based `--private-series` tuple. The RT64
+directory must be an absolute canonical path to the clean pinned source. A
+failed build or failed, timed-out, identity-mismatched, or nondeterministic
+child preserves its stdout/stderr logs under a named private temporary
+directory and grants no authority. Duplicate target/case requests fail before
+any native case runs.
+
 Every report path and journal path must resolve to a distinct file, and the two
 halves of a pair cannot name the same file. Private-series verification rechecks
 the receipt's exact output-file hashes and contract/child/nonce-derived event
@@ -955,14 +980,14 @@ across matrix scenarios.
 
 For a complete result, the default output is a human summary. Until all 162
 profile requirements are proved, `--json` emits a tagged `incomplete` result
-whose nested `fn64.release-matrix-incomplete.v6` assessment binds the manifest
+whose nested `fn64.release-matrix-incomplete.v7` assessment binds the manifest
 and profile identities, verified counts, evidence-derived satisfied
 assignments, the canonical missing requirement list, and its own SHA-256; the
 command then exits nonzero. It is diagnostic evidence, not a verified release
 artifact.
 
 Only a complete profile emits a retained, machine-readable
-`fn64.verified-release-matrix.v17` result. It contains the canonical manifest
+`fn64.verified-release-matrix.v18` result. It contains the canonical manifest
 and profile identities, every scenario's derived coverage, normalized ROM
 evidence, optional verified-series ROM-class authority, and exact
 input/report/declaration identity, the five fixed-cycle artifact
@@ -978,7 +1003,7 @@ RT64's exact post-VI capture. A top-level verification SHA binds
 that complete result; no ROM bytes, framebuffer, audio, RDRAM, or recompiled
 bytes are serialized.
 
-`--verify-json` accepts only that complete v17 artifact and does not treat its
+`--verify-json` accepts only that complete v18 artifact and does not treat its
 self-digest as sufficient by itself. It
 revalidates the retained semantic envelope: one to 64 scenarios and valid,
 unique scenario/report identities,
@@ -1006,7 +1031,7 @@ stream, same-event microcode data identity, and derived assignments. V13 lacks
 the concrete active RT64 graphics API and its platform/API assignments. Every
 historical version through v13 is
 intentionally rejected; regenerate it from a v5 manifest and bound
-report/journal pairs rather than relabeling it as v17. V14 lacks schema-v19 ROM
+report/journal pairs rather than relabeling it as v18. V14 lacks schema-v19 ROM
 identity, decoded TV-region coverage, renderer TV-standard binding, and the
 separately retained verified-series ROM-class authority, so it is intentionally
 rejected. V15 lacks schema-v20 Windows host identity and retained opaque RT64
@@ -1043,7 +1068,7 @@ the canonical incomplete assessment. The exact state is:
 | OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, a create-new receipt/source-wire producer, runner-staged exact ROM/microcode-pair admission, and same-event kickoff check exist. The v22 report additionally owns memory/audio/trace bytes at the boundary, binds the unsupported-instrumentation denominator, and requires DeviceState v9. | Ten fresh schema-v22 processes completed and reverified on 2026-07-22 at cycle `722368695`; the retained private receipt binds their exact semantic report and ten run identities. |
 | OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, resolved graphics-API and TV-standard evidence, explicit program identity, and runner-staged exact ROM/microcode-pair admission exist. | Ten fresh pinned-Metal schema-v22 processes completed and reverified on 2026-07-22 at cycle `722368695`; the retained private receipt binds their exact semantic report and ten run identities. |
 | OoT NTSC 1.0, legacy C lane | Observation tooling and exact linked-archive identity wiring exist. | Non-authoritative: measured framebuffer parity is only claimed through swap 60, and the C oracle's missing bodies prevent deeper arbitration beyond the known swap-231 frontier. |
-| Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v22-visible fixed TV region, save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, program-lane, committed RSP/RDP-mechanism, and authoritative platform/API assignments while retaining the remaining project-owned profile entries as missing. Backend microcode labels are diagnostic only; independent public-microcode adjudication uses the empty project-owned catalog v1. Generic report verification deliberately cannot turn the retained ROM-class label into profile credit; the separate private-series path revalidates its contract, receipt, exact output files, raw ROM, and runner before retaining `fn64.verified-rom-class-authority.v1`. RT64 target-case credit additionally requires the opaque platform-series capability, for which phase one has no production constructor. | No public-microcode requirement can be credited until allowed-source identities populate a successor catalog; regional and additional save/controller/render scenarios, positive native Windows evidence, and production platform-case authority remain unsupplied. |
+| Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v22-visible fixed TV region, save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, program-lane, committed RSP/RDP-mechanism, and authoritative platform/API assignments while retaining the remaining project-owned profile entries as missing. Backend microcode labels are diagnostic only; independent public-microcode adjudication uses the empty project-owned catalog v1. Generic report verification deliberately cannot turn the retained ROM-class label into profile credit; the separate private-series path revalidates its contract, receipt, exact output files, raw ROM, and runner before retaining `fn64.verified-rom-class-authority.v1`. RT64 target-case credit additionally requires the opaque platform-series capability; its production runner owns the exact child and repeat bar, and all 13 macOS/Metal cases now emit the required identity envelope. | No public-microcode requirement can be credited until allowed-source identities populate a successor catalog; regional and additional save/controller/render scenarios, positive native Windows evidence, and an actual retained production platform-case authority remain unsupplied. |
 
 Current schema-v22 joint verification over all three scenarios revalidated 30
 reports and satisfied exactly 12 of 162 FullParityV1 requirements:
@@ -1052,7 +1077,8 @@ reports and satisfied exactly 12 of 162 FullParityV1 requirements:
 `typed_observed_function/rt64_lle_accuracy`, `no_cartridge_save`,
 `sram_32_kib`, `standard_controller`, `dram-dpc`, `xbus-dpc`,
 `imem-replacement`, and `macos-metal`. The other 150 remain explicit in
-incomplete assessment v6. Both private exact-ten series and the public XBUS
+the previous incomplete assessment v6. Current code emits v7 and must be
+remeasured before that assessment is current. Both private exact-ten series and the public XBUS
 series bind the same compiled unsupported-instrumentation denominator; the
 private capabilities and combined manifest bind their distinct authorities
 and exact identities.

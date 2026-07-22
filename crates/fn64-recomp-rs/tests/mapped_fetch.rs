@@ -81,7 +81,7 @@ fn entry_lo(physical_page: u32, valid: bool) -> u32 {{
 fn map_pair(ctx: &mut RecompContext, index: usize, virtual_pair: u32, even_pa: u32, odd_pa: u32) {{
     ctx.tlb_entries[index] = TlbEntryRaw {{
         page_mask: 0,
-        entry_hi: virtual_pair & 0xffff_e000,
+        entry_hi: u64::from(virtual_pair & 0xffff_e000),
         entry_lo0: entry_lo(even_pa, true),
         entry_lo1: entry_lo(odd_pa, true),
     }};
@@ -112,7 +112,7 @@ fn build_catalog() -> PhysicalCodeCatalog {{
     catalog
 }}
 
-fn state(ctx: &RecompContext) -> ([u64; 32], u32, u32, u32, u32, u32, u32) {{
+fn state(ctx: &RecompContext) -> ([u64; 32], u32, u32, u32, u64, u32, u64) {{
     (
         ctx.gprs(), ctx.cop0_status, ctx.cop0_cause, ctx.cop0_epc,
         ctx.cop0_badvaddr, ctx.cop0_context, ctx.cop0_entry_hi,

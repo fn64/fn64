@@ -569,6 +569,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         ))
         .into());
     }
+    fn64_boot_harness::emit_rt64_platform_child_identity(
+        source.source_id,
+        source.is_source_authoritative(),
+        source.adapter_source_sha256,
+        source.post_vi_api,
+    )?;
     Ok(())
 }
 

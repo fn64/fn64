@@ -28,8 +28,8 @@ use std::{
 };
 
 pub const RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix.v5";
-pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v17";
-pub const INCOMPLETE_RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix-incomplete.v6";
+pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v18";
+pub const INCOMPLETE_RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix-incomplete.v7";
 pub const VERIFIED_ROM_CLASS_AUTHORITY_SCHEMA: &str = "fn64.verified-rom-class-authority.v1";
 pub const RELEASE_MATRIX_REPORT_COUNT: usize = 10;
 pub const RELEASE_MATRIX_MAX_SCENARIOS: usize = 64;
@@ -879,7 +879,7 @@ pub fn verify_release_matrix(
 }
 
 /// Verify a release matrix with opaque locally verified RT64 platform-case
-/// series. Phase one intentionally exposes no production constructor for the
+/// series. Only the repository-owned platform runner can construct the
 /// capability; retained or self-hashed JSON cannot enter this API.
 pub fn verify_release_matrix_with_platform_series(
     manifest: &ReleaseMatrixManifest,
@@ -2394,7 +2394,7 @@ fn push_platform_authority_identities(
 
 fn incomplete_matrix_sha256(report: &IncompleteReleaseMatrix) -> String {
     let mut wire = Vec::new();
-    wire.extend_from_slice(b"fn64.release-matrix-incomplete.v6\0");
+    wire.extend_from_slice(b"fn64.release-matrix-incomplete.v7\0");
     push_bytes(&mut wire, report.schema.as_bytes());
     push_bytes(&mut wire, report.manifest_sha256.as_bytes());
     push_bytes(&mut wire, report.profile.schema.as_bytes());
@@ -2424,7 +2424,7 @@ fn incomplete_matrix_sha256(report: &IncompleteReleaseMatrix) -> String {
 
 fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
     let mut wire = Vec::new();
-    wire.extend_from_slice(b"fn64.verified-release-matrix.v17\0");
+    wire.extend_from_slice(b"fn64.verified-release-matrix.v18\0");
     push_bytes(&mut wire, report.schema.as_bytes());
     push_bytes(&mut wire, report.manifest_sha256.as_bytes());
     push_bytes(&mut wire, report.profile.schema.as_bytes());

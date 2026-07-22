@@ -492,10 +492,9 @@ mod tests {
 
         let mut rdram = vec![0u8; 0x80];
         unsafe { crate::register_process_rdram(rdram.as_mut_ptr(), rdram.len()) };
-        let mut init = ctx_zeroed();
-        init.r5 = 0x8000_0010;
-        init.r6 = 0x8000_0020;
-        unsafe { crate::si::osContInit_recomp(rdram.as_mut_ptr(), &mut init) };
+        with_host(|host| {
+            assert!(host.controller_manager.initialize());
+        });
 
         let mut set_ch = ctx_zeroed();
         set_ch.r4 = 2;

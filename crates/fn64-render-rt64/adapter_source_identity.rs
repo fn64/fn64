@@ -174,8 +174,13 @@ mod tests {
 
     #[test]
     fn crate_identity_covers_rust_cpp_manifest_and_build_inputs() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let paths = adapter_source_paths(root).unwrap();
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = if manifest_dir.join("src/ffi.rs").is_file() {
+            manifest_dir.to_path_buf()
+        } else {
+            manifest_dir.join("../fn64-render-rt64")
+        };
+        let paths = adapter_source_paths(&root).unwrap();
         for required in [
             "Cargo.toml",
             "adapter_source_identity.rs",
@@ -199,7 +204,7 @@ mod tests {
             );
         }
         assert_ne!(
-            adapter_source_sha256(root, "test-target", &["RT64".to_owned()]).unwrap(),
+            adapter_source_sha256(&root, "test-target", &["RT64".to_owned()]).unwrap(),
             [0; 32]
         );
     }

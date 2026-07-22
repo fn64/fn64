@@ -1,9 +1,12 @@
 use fn64_boot_harness::{
-    load_private_release_run_contract, parse_unsupported_journal,
+    load_private_release_run_contract, parse_unsupported_journal, run_rt64_platform_case_series,
     verify_private_release_series_with_runner, verify_release_matrix,
+    verify_release_matrix_with_platform_series,
+    verify_release_matrix_with_private_and_platform_series,
     verify_release_matrix_with_private_series, ParsedUnsupportedJournal,
     PrivateReleaseSeriesReceipt, ReleaseGateReport, ReleaseMatrixManifest,
-    ReleaseMatrixVerification, VerifiedPrivateReleaseSeries, VerifiedReleaseMatrix,
+    ReleaseMatrixVerification, Rt64PlatformCase, Rt64PlatformTarget, VerifiedPrivateReleaseSeries,
+    VerifiedReleaseMatrix, VerifiedRt64PlatformCaseSeries,
 };
 use std::{
     collections::BTreeSet,
@@ -60,10 +63,21 @@ fn run() -> Result<(), String> {
         json,
         manifest_path,
         private_series,
+        platform_cases,
         assignments,
     } = parse_normal_verification_arguments(first, args)?;
 
     let manifest = read_manifest(&manifest_path)?;
+    let mut distinct_platform_cases = BTreeSet::new();
+    for request in &platform_cases {
+        if !distinct_platform_cases.insert((request.target, request.case)) {
+            return Err(format!(
+                "RT64 platform case {}:{} is requested more than once",
+                request.target.id(),
+                request.case.id()
+            ));
+        }
+    }
     let verified_private_series = private_series
         .iter()
         .map(load_and_verify_private_series)
@@ -115,11 +129,57 @@ fn run() -> Result<(), String> {
         evidence.push((report, journal));
     }
 
-    let outcome = if verified_private_series.is_empty() {
-        verify_release_matrix(&manifest, &evidence)
-    } else {
-        let private_series_refs = verified_private_series.iter().collect::<Vec<_>>();
-        verify_release_matrix_with_private_series(&manifest, &evidence, &private_series_refs)
+    let verified_platform_series = platform_cases
+        .iter()
+        .map(|request| {
+            let bound = request
+                .private_series_ordinal
+                .checked_sub(1)
+                .and_then(|index| verified_private_series.get(index))
+                .ok_or_else(|| {
+                    format!(
+                        "RT64 platform case {}:{} binds private-series ordinal {}, but only {} private series were supplied",
+                        request.target.id(),
+                        request.case.id(),
+                        request.private_series_ordinal,
+                        verified_private_series.len()
+                    )
+                })?;
+            run_rt64_platform_case_series(
+                request.target,
+                request.case,
+                &request.rt64_source_directory,
+                bound,
+            )
+            .map_err(|error| {
+                format!(
+                    "run RT64 platform case {}:{}: {error}",
+                    request.target.id(),
+                    request.case.id()
+                )
+            })
+        })
+        .collect::<Result<Vec<VerifiedRt64PlatformCaseSeries>, String>>()?;
+
+    let private_series_refs = verified_private_series.iter().collect::<Vec<_>>();
+    let platform_series_refs = verified_platform_series.iter().collect::<Vec<_>>();
+    let outcome = match (
+        private_series_refs.is_empty(),
+        platform_series_refs.is_empty(),
+    ) {
+        (true, true) => verify_release_matrix(&manifest, &evidence),
+        (false, true) => {
+            verify_release_matrix_with_private_series(&manifest, &evidence, &private_series_refs)
+        }
+        (true, false) => {
+            verify_release_matrix_with_platform_series(&manifest, &evidence, &platform_series_refs)
+        }
+        (false, false) => verify_release_matrix_with_private_and_platform_series(
+            &manifest,
+            &evidence,
+            &private_series_refs,
+            &platform_series_refs,
+        ),
     }
     .map_err(|error| error.to_string())?;
     let verified = match outcome {
@@ -215,6 +275,7 @@ struct NormalVerificationArguments {
     json: bool,
     manifest_path: PathBuf,
     private_series: Vec<PrivateSeriesPaths>,
+    platform_cases: Vec<PlatformCaseRunRequest>,
     assignments: Vec<OsString>,
 }
 
@@ -226,6 +287,14 @@ struct PrivateSeriesPaths {
     runner_executable: PathBuf,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct PlatformCaseRunRequest {
+    target: Rt64PlatformTarget,
+    case: Rt64PlatformCase,
+    rt64_source_directory: PathBuf,
+    private_series_ordinal: usize,
+}
+
 fn parse_normal_verification_arguments(
     first: OsString,
     rest: impl IntoIterator<Item = OsString>,
@@ -233,6 +302,7 @@ fn parse_normal_verification_arguments(
     let mut arguments = std::iter::once(first).chain(rest).peekable();
     let mut json = false;
     let mut private_series = Vec::new();
+    let mut platform_cases = Vec::new();
     let manifest_path = loop {
         let argument = arguments.next().ok_or_else(usage)?;
         if argument == OsStr::new("--json") {
@@ -270,6 +340,43 @@ fn parse_normal_verification_arguments(
                     .to_owned(),
             );
         }
+        if argument == OsStr::new("--rt64-platform-case") {
+            let selection = arguments.next().ok_or_else(usage)?;
+            let rt64_source_directory = arguments.next().ok_or_else(usage)?;
+            let private_series_ordinal = arguments.next().ok_or_else(usage)?;
+            if [&selection, &rt64_source_directory, &private_series_ordinal]
+                .into_iter()
+                .any(|value| is_normal_option(value))
+            {
+                return Err(
+                    "--rt64-platform-case requires TARGET:CASE RT64_DIR PRIVATE_SERIES_ORDINAL"
+                        .to_owned(),
+                );
+            }
+            let selection = selection
+                .into_string()
+                .map_err(|_| "RT64 platform target/case is not UTF-8".to_owned())?;
+            let (target, case) = selection.split_once(':').ok_or_else(usage)?;
+            let target = Rt64PlatformTarget::from_id(target)
+                .ok_or_else(|| format!("unknown RT64 platform target {target:?}"))?;
+            let case = Rt64PlatformCase::from_id(case)
+                .ok_or_else(|| format!("unknown RT64 platform case {case:?}"))?;
+            let private_series_ordinal = private_series_ordinal
+                .into_string()
+                .map_err(|_| "private-series ordinal is not UTF-8".to_owned())?
+                .parse::<usize>()
+                .map_err(|_| "private-series ordinal must be a positive integer".to_owned())?;
+            if private_series_ordinal == 0 {
+                return Err("private-series ordinal must be one-based and positive".to_owned());
+            }
+            platform_cases.push(PlatformCaseRunRequest {
+                target,
+                case,
+                rt64_source_directory: PathBuf::from(rt64_source_directory),
+                private_series_ordinal,
+            });
+            continue;
+        }
         if is_mode_option(&argument) {
             return Err(format!(
                 "{} is a standalone mode and cannot be combined with normal matrix verification",
@@ -297,6 +404,7 @@ fn parse_normal_verification_arguments(
         json,
         manifest_path,
         private_series,
+        platform_cases,
         assignments,
     })
 }
@@ -305,6 +413,7 @@ fn is_normal_option(argument: &OsStr) -> bool {
     argument == OsStr::new("--json")
         || argument == OsStr::new("--private-series")
         || argument == OsStr::new("--private-contract")
+        || argument == OsStr::new("--rt64-platform-case")
         || is_mode_option(argument)
 }
 
@@ -341,7 +450,7 @@ fn read_manifest(path: &Path) -> Result<ReleaseMatrixManifest, String> {
 }
 
 fn usage() -> String {
-    "usage: verify-release-matrix [--json] [--private-series CONTRACT.json OUTPUT_DIRECTORY RECEIPT.json RUNNER_EXECUTABLE]... MANIFEST.json REPORT.json,JOURNAL.jsonl ...\n       verify-release-matrix --print-declaration-digests MANIFEST.json\n       verify-release-matrix --verify-json VERIFIED.json".to_owned()
+    "usage: verify-release-matrix [--json] [--private-series CONTRACT.json OUTPUT_DIRECTORY RECEIPT.json RUNNER_EXECUTABLE]... [--rt64-platform-case TARGET:CASE RT64_DIR PRIVATE_SERIES_ORDINAL]... MANIFEST.json REPORT.json,JOURNAL.jsonl ...\n       verify-release-matrix --print-declaration-digests MANIFEST.json\n       verify-release-matrix --verify-json VERIFIED.json".to_owned()
 }
 
 #[cfg(test)]
@@ -388,6 +497,8 @@ mod tests {
             "fn64.verified-release-matrix.v13",
             "fn64.verified-release-matrix.v14",
             "fn64.verified-release-matrix.v15",
+            "fn64.verified-release-matrix.v16",
+            "fn64.verified-release-matrix.v17",
         ] {
             let error =
                 verify_retained_json(&empty_retained(schema, &"00".repeat(32))).unwrap_err();
@@ -412,6 +523,7 @@ mod tests {
         assert!(parsed.json);
         assert_eq!(parsed.manifest_path, PathBuf::from("matrix.json"));
         assert!(parsed.private_series.is_empty());
+        assert!(parsed.platform_cases.is_empty());
         assert_eq!(
             parsed.assignments,
             vec![OsString::from("report.json,journal.jsonl")]
@@ -457,6 +569,60 @@ mod tests {
             ]
         );
         assert_eq!(parsed.assignments.len(), 2);
+        assert!(parsed.platform_cases.is_empty());
+    }
+
+    #[test]
+    fn normal_parser_binds_platform_case_to_one_based_private_series() {
+        let parsed = parse_normal(&[
+            "--private-series",
+            "rt64.json",
+            "rt64-series",
+            "rt64-receipt.json",
+            "rt64-runner",
+            "--rt64-platform-case",
+            "macos-metal:resolution-downsample",
+            "/tmp/pinned-rt64",
+            "1",
+            "matrix.json",
+            "report.json,journal.jsonl",
+        ])
+        .expect("platform case invocation parses");
+        assert_eq!(
+            parsed.platform_cases,
+            vec![PlatformCaseRunRequest {
+                target: Rt64PlatformTarget::MacosMetal,
+                case: Rt64PlatformCase::ResolutionDownsample,
+                rt64_source_directory: PathBuf::from("/tmp/pinned-rt64"),
+                private_series_ordinal: 1,
+            }]
+        );
+        assert_eq!(parsed.private_series.len(), 1);
+    }
+
+    #[test]
+    fn normal_parser_rejects_unknown_or_zero_platform_case_binding() {
+        for selection in ["unknown:resolution-downsample", "macos-metal:unknown"] {
+            assert!(parse_normal(&[
+                "--rt64-platform-case",
+                selection,
+                "/tmp/pinned-rt64",
+                "1",
+                "matrix.json",
+                "report.json,journal.jsonl",
+            ])
+            .is_err());
+        }
+        let zero = parse_normal(&[
+            "--rt64-platform-case",
+            "macos-metal:resolution-downsample",
+            "/tmp/pinned-rt64",
+            "0",
+            "matrix.json",
+            "report.json,journal.jsonl",
+        ])
+        .unwrap_err();
+        assert!(zero.contains("one-based"), "{zero}");
     }
 
     #[test]
@@ -482,6 +648,7 @@ mod tests {
             "--json",
             "--private-series",
             "--private-contract",
+            "--rt64-platform-case",
             "--verify-json",
         ] {
             let error =

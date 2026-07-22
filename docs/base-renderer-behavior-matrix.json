@@ -311,9 +311,11 @@
       "category": "coverage",
       "title": "Coverage/alpha coupling and memory coverage",
       "exactness": "bounded_reference",
-      "behavior": "All CVG_DST modes, coverage-times-alpha, alpha-coverage select, clear-on-coverage, RGBA16 hidden coverage, RGBA32 memory alpha, and opaque-wrap strict-front behavior are typed. Strict capture analyzers require and preserve the complete 8-coverage by 256-alpha domain in both one-cycle and two-cycle modes for both alpha-product and coverage-to-alpha directions.",
+      "behavior": "All CVG_DST modes, coverage-times-alpha, alpha-coverage select, clear-on-coverage, RGBA16 hidden coverage, RGBA32 memory alpha, opaque-wrap strict-front behavior, and the public IM_RD color/coverage read-modify-write gate are typed. With IM_RD clear, Clamp/Wrap use only new pixel coverage and framebuffer color/coverage-alpha selectors fail loudly. Strict capture analyzers require and preserve the complete 8-coverage by 256-alpha domain in both one-cycle and two-cycle modes for both alpha-product and coverage-to-alpha directions.",
       "evidence": [
         { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn coverage_destinations_follow_public_clamp_wrap_full_and_save_rules" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn image_read_disabled_coverage_sweep_never_merges_prior_coverage" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn raw_and_high_level_partial_coverage_obey_image_read_gate" },
         { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn alpha_coverage_current_policy_is_bounded_monotonic_and_endpoint_exact" },
         { "kind": "tool", "path": "tools/rdp-silicon-vectors/src/lib.rs", "needle": "analyze_alpha_coverage_product_sweep" },
         { "kind": "tool", "path": "tools/rdp-silicon-vectors/src/lib.rs", "needle": "analyze_coverage_to_alpha_sweep" },

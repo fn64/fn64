@@ -163,7 +163,7 @@ pub enum CpuFaultKind {
         epc: GuestPc,
         branch_delay: bool,
         instruction_code: u32,
-        bad_vaddr: Option<u32>,
+        bad_vaddr: Option<u64>,
         coprocessor: Option<u8>,
     },
 }
@@ -176,6 +176,8 @@ pub enum CpuException {
     TlbModified,
     TlbRefillLoad,
     TlbRefillStore,
+    XTlbRefillLoad,
+    XTlbRefillStore,
     TlbInvalidLoad,
     TlbInvalidStore,
     AddressErrorLoad,
@@ -332,8 +334,8 @@ impl CpuException {
     pub const fn cause_code(self) -> u32 {
         match self {
             Self::TlbModified => 1,
-            Self::TlbRefillLoad | Self::TlbInvalidLoad => 2,
-            Self::TlbRefillStore | Self::TlbInvalidStore => 3,
+            Self::TlbRefillLoad | Self::XTlbRefillLoad | Self::TlbInvalidLoad => 2,
+            Self::TlbRefillStore | Self::XTlbRefillStore | Self::TlbInvalidStore => 3,
             Self::AddressErrorLoad => 4,
             Self::AddressErrorStore => 5,
             Self::Syscall => 8,
@@ -350,13 +352,25 @@ impl CpuException {
             Self::TlbModified
                 | Self::TlbRefillLoad
                 | Self::TlbRefillStore
+                | Self::XTlbRefillLoad
+                | Self::XTlbRefillStore
                 | Self::TlbInvalidLoad
                 | Self::TlbInvalidStore
         )
     }
 
     const fn is_tlb_refill(self) -> bool {
-        matches!(self, Self::TlbRefillLoad | Self::TlbRefillStore)
+        matches!(
+            self,
+            Self::TlbRefillLoad
+                | Self::TlbRefillStore
+                | Self::XTlbRefillLoad
+                | Self::XTlbRefillStore
+        )
+    }
+
+    const fn is_xtlb_refill(self) -> bool {
+        matches!(self, Self::XTlbRefillLoad | Self::XTlbRefillStore)
     }
 }
 
@@ -372,7 +386,7 @@ impl CpuFault {
                 epc: at.pc,
                 branch_delay: false,
                 instruction_code: 0,
-                bad_vaddr: Some(at.pc.get()),
+                bad_vaddr: Some(at.pc.get() as u64),
                 coprocessor: None,
             },
         }
@@ -416,11 +430,16 @@ impl CpuFault {
             ctx.cop0_badvaddr = bad_vaddr;
             if exception.is_tlb_exception() {
                 // VR4300 User's Manual TLB exception processing: Context gets
-                // VA[31:13] as BadVPN2 while preserving PTEBase, and EntryHi
-                // gets the faulting VPN2 while preserving the current ASID.
-                ctx.cop0_context =
-                    (ctx.cop0_context & 0xff80_0000) | ((bad_vaddr >> 9) & 0x007f_fff0);
-                ctx.cop0_entry_hi = (bad_vaddr & 0xffff_e000) | (ctx.cop0_entry_hi & 0xff);
+                // VA[31:13] as BadVPN2, XContext gets Region plus VA[39:13],
+                // and EntryHi gets Region/VPN2. Both context registers retain
+                // their software-owned PTEBase and EntryHi retains ASID.
+                let low = bad_vaddr as u32;
+                ctx.cop0_context = (ctx.cop0_context & 0xff80_0000) | ((low >> 9) & 0x007f_fff0);
+                ctx.cop0_xcontext = (ctx.cop0_xcontext & 0xffff_fffe_0000_0000)
+                    | ((bad_vaddr >> 31) & 0x0000_0001_8000_0000)
+                    | ((bad_vaddr >> 9) & 0x0000_0000_7fff_fff0);
+                ctx.cop0_entry_hi =
+                    (bad_vaddr & 0xc000_00ff_ffff_e000) | (ctx.cop0_entry_hi & 0xff);
             }
         }
         if let Some(coprocessor) = coprocessor {
@@ -434,12 +453,17 @@ impl CpuFault {
         ctx.cop0_status |= STATUS_EXL;
 
         let refill_vector = exception.is_tlb_refill() && !was_exl;
+        let extended_refill_vector = exception.is_xtlb_refill() && !was_exl;
         Some(GuestPc::new(if ctx.cop0_status & STATUS_BEV != 0 {
-            if refill_vector {
+            if extended_refill_vector {
+                0xBFC0_0280
+            } else if refill_vector {
                 0xBFC0_0200
             } else {
                 0xBFC0_0380
             }
+        } else if extended_refill_vector {
+            0x8000_0080
         } else if refill_vector {
             0x8000_0000
         } else {
@@ -1886,6 +1910,100 @@ mod tests {
     }
 
     #[test]
+    fn xtlb_refill_commits_full_translation_state_and_selects_extended_vector() {
+        const BAD_VADDR: u64 = 0x4000_0088_7654_2040;
+        let bank = BankId::new(0x73);
+        let fault = CpuFault {
+            at: ExecutionKey::new(bank, GuestPc::new(0x8000_4000)),
+            kind: CpuFaultKind::Exception {
+                exception: CpuException::XTlbRefillLoad,
+                epc: GuestPc::new(0x8000_4000),
+                branch_delay: false,
+                instruction_code: 0,
+                bad_vaddr: Some(BAD_VADDR),
+                coprocessor: None,
+            },
+        };
+
+        let mut ctx = RecompContext::new();
+        ctx.cop0_context = 0xab80_0000;
+        ctx.cop0_xcontext = 0x1234_5678_0000_0000;
+        ctx.cop0_entry_hi = 0x51;
+        assert_eq!(
+            fault.enter_exception(&mut ctx),
+            Some(GuestPc::new(0x8000_0080))
+        );
+        assert_eq!(ctx.cop0_badvaddr, BAD_VADDR);
+        assert_eq!(ctx.cop0_context & 0xff80_0000, 0xab80_0000);
+        assert_eq!(
+            ctx.cop0_context & 0x007f_fff0,
+            ((BAD_VADDR as u32) >> 9) & 0x007f_fff0
+        );
+        assert_eq!(
+            ctx.cop0_xcontext & 0xffff_fffe_0000_0000,
+            0x1234_5678_0000_0000 & 0xffff_fffe_0000_0000
+        );
+        assert_eq!((ctx.cop0_xcontext >> 31) & 0b11, BAD_VADDR >> 62);
+        assert_eq!(
+            (ctx.cop0_xcontext >> 4) & 0x07ff_ffff,
+            (BAD_VADDR >> 13) & 0x07ff_ffff
+        );
+        assert_eq!(
+            ctx.cop0_entry_hi,
+            (BAD_VADDR & 0xc000_00ff_ffff_e000) | 0x51
+        );
+        assert_eq!((ctx.cop0_cause >> 2) & 0x1f, 2);
+
+        let mut bev_ctx = RecompContext::new();
+        bev_ctx.cop0_status = 1 << 22;
+        assert_eq!(
+            fault.enter_exception(&mut bev_ctx),
+            Some(GuestPc::new(0xbfc0_0280))
+        );
+
+        let mut nested = RecompContext::new();
+        nested.cop0_status = 1 << 1;
+        nested.cop0_epc = 0x8000_1234;
+        assert_eq!(
+            fault.enter_exception(&mut nested),
+            Some(GuestPc::new(0x8000_0180))
+        );
+        assert_eq!(nested.cop0_epc, 0x8000_1234);
+        assert_eq!(nested.cop0_badvaddr, BAD_VADDR);
+    }
+
+    #[test]
+    fn extended_address_error_retains_full_badvaddr_without_tlb_state_updates() {
+        const BAD_VADDR: u64 = 0x9000_0001_0000_0040;
+        let bank = BankId::new(0x74);
+        let mut ctx = RecompContext::new();
+        ctx.cop0_context = 0xabcd_1234;
+        ctx.cop0_xcontext = 0x1234_5678_9abc_def0;
+        ctx.cop0_entry_hi = 0x4000_0042;
+        let fault = CpuFault {
+            at: ExecutionKey::new(bank, GuestPc::new(0x8000_4000)),
+            kind: CpuFaultKind::Exception {
+                exception: CpuException::AddressErrorStore,
+                epc: GuestPc::new(0x8000_4000),
+                branch_delay: false,
+                instruction_code: 0,
+                bad_vaddr: Some(BAD_VADDR),
+                coprocessor: None,
+            },
+        };
+
+        assert_eq!(
+            fault.enter_exception(&mut ctx),
+            Some(GuestPc::new(0x8000_0180))
+        );
+        assert_eq!(ctx.cop0_badvaddr, BAD_VADDR);
+        assert_eq!(ctx.cop0_context, 0xabcd_1234);
+        assert_eq!(ctx.cop0_xcontext, 0x1234_5678_9abc_def0);
+        assert_eq!(ctx.cop0_entry_hi, 0x4000_0042);
+        assert_eq!((ctx.cop0_cause >> 2) & 0x1f, 5);
+    }
+
+    #[test]
     fn invalid_modified_and_nested_refill_use_the_common_vector() {
         let bank = BankId::new(0x72);
         for (exception, expected_code) in [
@@ -2031,7 +2149,7 @@ mod tests {
     ) {
         ctx.tlb_entries[0] = crate::runtime::TlbEntryRaw {
             page_mask: 0,
-            entry_hi: virtual_pair & 0xffff_e000,
+            entry_hi: u64::from(virtual_pair & 0xffff_e000),
             entry_lo0: instruction_entry_lo(even_physical, true),
             entry_lo1: instruction_entry_lo(odd_physical, odd_valid),
         };
@@ -2941,7 +3059,7 @@ mod tests {
             assert_eq!(physical_address & 0xfff, 0);
             ctx.tlb_entries[index] = crate::runtime::TlbEntryRaw {
                 page_mask: 0,
-                entry_hi: entry.get() & 0xffff_e000,
+                entry_hi: u64::from(entry.get() & 0xffff_e000),
                 entry_lo0: ((physical_address >> 6) & 0x03ff_ffc0) | 0x7,
                 entry_lo1: 0,
             };
