@@ -11,9 +11,10 @@ use fn64_recomp_rs::{
     enter_pending_interrupt, BankId, BlockExit, BlockProgram, BlockProgramEvidenceSnapshot,
     CallResolution, CodeBank, CpuFault, CpuInterruptLine, ExecutableRegion,
     ExecutionDestinationObservation, ExecutionKey, FunctionEntryObservationSchema,
-    GeneratedBankRunner, GenerationError, GuestPc, GuestWriteEvent, InstructionBudget,
-    ProgramArtifactIdentity, ProgramIdentityEvidenceSnapshot, ProgramIdentitySource, Rdram,
-    RecompContext as RsContext, RecompFunc, TransferResolver, TranslatedFunctionIdentity,
+    GeneratedBankRunner, GenerationError, GuestPc, GuestWriteBoundary, GuestWriteEvent,
+    InstructionBudget, ProgramArtifactIdentity, ProgramIdentityEvidenceSnapshot,
+    ProgramIdentitySource, Rdram, RecompContext as RsContext, RecompFunc, TransferResolver,
+    TranslatedFunctionIdentity,
 };
 use fn64_runtime::{Priority, ThreadId};
 
@@ -37,6 +38,9 @@ struct ObservedExecutableRegion {
 
 thread_local! {
     static PENDING_EXECUTABLE_WRITES: RefCell<Vec<(u32, u32)>> = const {
+        RefCell::new(Vec::new())
+    };
+    static EXECUTABLE_WRITE_RANGES: RefCell<Vec<(u32, u32)>> = const {
         RefCell::new(Vec::new())
     };
     static FUNCTION_LANE_ARTIFACT_IDENTITY: std::cell::Cell<Option<ProgramArtifactIdentity>> =
@@ -356,6 +360,21 @@ fn record_executable_and_renderer_write(event: GuestWriteEvent) {
     observe_renderer_write(event);
 }
 
+fn classify_live_executable_write(event: GuestWriteEvent) -> GuestWriteBoundary {
+    let (start, len) = event.range();
+    let end = start.saturating_add(len);
+    if EXECUTABLE_WRITE_RANGES.with(|ranges| {
+        ranges
+            .borrow()
+            .iter()
+            .any(|&(physical_start, physical_end)| start < physical_end && end > physical_start)
+    }) {
+        GuestWriteBoundary::ExecutableChanged
+    } else {
+        GuestWriteBoundary::Continue
+    }
+}
+
 fn process_executable_writes(
     live: &LiveBlockProgram,
     mut read_logical_byte: impl FnMut(u32) -> u8,
@@ -453,11 +472,13 @@ fn set_entry_lookup_config(
 ) {
     assert!(rdram_len > 0, "recompiled RDRAM length must be nonzero");
     PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+    EXECUTABLE_WRITE_RANGES.with(|ranges| ranges.borrow_mut().clear());
     FUNCTION_EXECUTION_DESTINATIONS.with(|destinations| destinations.borrow_mut().clear());
     FUNCTION_LANE_ARTIFACT_IDENTITY.with(|installed| installed.set(identity));
     FUNCTION_LANE_ENTRY_OBSERVATION_SCHEMA.with(|installed| installed.set(None));
     fn64_recomp_rs::set_function_entry_observer(None);
     fn64_recomp_rs::set_write_observer(Some(observe_renderer_write));
+    fn64_recomp_rs::set_guest_write_boundary_observer(None);
     fn64_recomp_rs::set_unsupported_observer(Some(record_recompiled_unsupported));
     with_host(|host| {
         host.recompiled_lookup = Some(lookup);
@@ -469,11 +490,13 @@ fn set_entry_lookup_config(
 fn set_block_program(program: LiveBlockProgram, rdram_len: usize) {
     assert!(rdram_len > 0, "recompiled RDRAM length must be nonzero");
     PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+    EXECUTABLE_WRITE_RANGES.with(|ranges| ranges.borrow_mut().clear());
     FUNCTION_EXECUTION_DESTINATIONS.with(|destinations| destinations.borrow_mut().clear());
     FUNCTION_LANE_ARTIFACT_IDENTITY.with(|installed| installed.set(None));
     FUNCTION_LANE_ENTRY_OBSERVATION_SCHEMA.with(|installed| installed.set(None));
     fn64_recomp_rs::set_function_entry_observer(None);
     fn64_recomp_rs::set_unsupported_observer(Some(record_recompiled_unsupported));
+    fn64_recomp_rs::set_guest_write_boundary_observer(Some(classify_live_executable_write));
     with_host(|host| {
         host.recompiled_lookup = None;
         host.recompiled_program = Some(program);
@@ -601,6 +624,9 @@ fn register_live_executable_region_config(
         builder,
         builder_artifact_identity,
     });
+    EXECUTABLE_WRITE_RANGES.with(|ranges| {
+        ranges.borrow_mut().push((physical_start, physical_end));
+    });
 }
 
 /// Apply DMA-originated executable writes after the device fabric has
@@ -610,6 +636,7 @@ pub(crate) fn process_live_executable_writes_from_host() {
     let live = with_host(|host| host.recompiled_program.clone());
     let Some(live) = live else {
         PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+        fn64_recomp_rs::discard_executable_write_boundary();
         return;
     };
     let (rdram, rdram_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
@@ -625,6 +652,7 @@ pub(crate) fn process_live_executable_writes_from_host() {
     process_executable_writes(&live, |offset| unsafe {
         storage.read_u8(fn64_runtime::RdramAddr::from_offset(offset))
     });
+    fn64_recomp_rs::discard_executable_write_boundary();
 }
 
 fn pause_active_recompiled_thread() {
@@ -942,6 +970,29 @@ fn run_block_program(
         process_executable_writes(live, |offset| {
             mem.load_b(0xFFFF_FFFF_8000_0000u64 + u64::from(offset)) as u8
         });
+        let executable_write_fault_entry = match dispatched.exit {
+            BlockExit::ExecutableWriteFault(fault) => {
+                assert!(
+                    dispatched.instructions > 0,
+                    "live BlockProgram returned {:?} without guest progress",
+                    dispatched.exit
+                );
+                let vector = fault.enter_exception(ctx).unwrap_or_else(|| {
+                    recompiled_gap_panic(format!(
+                        "live BlockProgram executable-write boundary retained a non-architectural fault: {fault:?}"
+                    ))
+                });
+                Some(
+                    live.resolve_transfer(fault.at.bank, vector)
+                        .unwrap_or_else(|mapping_fault| {
+                            recompiled_gap_panic(format!(
+                                "live BlockProgram executable-write exception vector {vector} does not resolve after generation replacement: {mapping_fault:?}"
+                            ))
+                        }),
+                )
+            }
+            _ => None,
+        };
         let (count_write, compare_write) = ctx.take_cop0_timing_writes();
         if count_write.is_some() || compare_write.is_some() {
             // Commit a handler's same-value Compare write before suspending:
@@ -976,6 +1027,65 @@ fn run_block_program(
                             "live BlockProgram checkpoint {next} no longer resolves: {fault:?}"
                         ))
                     });
+            }
+            BlockExit::ExecutableWrite {
+                source_bank,
+                resume,
+            } => {
+                assert!(
+                    dispatched.instructions > 0,
+                    "live BlockProgram returned {:?} without guest progress",
+                    dispatched.exit
+                );
+                entry = live
+                    .resolve_transfer(source_bank, resume.pc)
+                    .unwrap_or_else(|fault| {
+                        recompiled_gap_panic(format!(
+                            "live BlockProgram executable-write resume {resume} no longer resolves after generation replacement: {fault:?}"
+                        ))
+                    });
+            }
+            BlockExit::ExecutableWriteResolveCall {
+                source_bank,
+                target_pc,
+                resume,
+            } => {
+                assert!(
+                    dispatched.instructions > 0,
+                    "live BlockProgram returned {:?} without guest progress",
+                    dispatched.exit
+                );
+                let mut resolver = LiveTransferResolver { live: live.clone() };
+                match resolver.resolve_call(source_bank, target_pc, resume) {
+                    Ok(CallResolution::Guest(next)) => entry = next,
+                    Ok(CallResolution::Host) => {
+                        let host = fn64_recomp_rs::resolve_host_function(target_pc.get())
+                            .unwrap_or_else(|| {
+                                recompiled_gap_panic(format!(
+                                    "live BlockProgram requested unknown host call {:#010x}",
+                                    target_pc.get()
+                                ))
+                            });
+                        host(ctx, mem);
+                        entry = live
+                            .resolve_transfer(source_bank, resume.pc)
+                            .unwrap_or_else(|fault| {
+                                recompiled_gap_panic(format!(
+                                    "live BlockProgram executable-write host resume {resume} no longer resolves after generation replacement: {fault:?}"
+                                ))
+                            });
+                    }
+                    Err(fault) => recompiled_gap_panic(format!(
+                        "live BlockProgram executable-write call target {target_pc} does not resolve after generation replacement: {fault:?}"
+                    )),
+                }
+            }
+            BlockExit::ExecutableWriteFault(_) => {
+                entry = executable_write_fault_entry.unwrap_or_else(|| {
+                    unreachable!(
+                        "executable-write fault continuation was not prepared before suspension"
+                    )
+                });
             }
             BlockExit::HostCall { vram, resume } => {
                 let host = fn64_recomp_rs::resolve_host_function(vram.get()).unwrap_or_else(|| {
@@ -1304,7 +1414,9 @@ pub fn os_get_int_mask(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fn64_recomp_rs::{BlockRun, CodeBank, CpuFaultKind, GeneratedBankRunner};
+    use fn64_recomp_rs::{
+        run_bank, BlockRun, CodeBank, CodeCatalog, CpuFaultKind, GeneratedBankRunner,
+    };
 
     const LIVE_BANK: BankId = BankId::new(0xA11CE);
     const LIVE_SECOND_BANK: BankId = BankId::new(0xA11CF);
@@ -1319,7 +1431,38 @@ mod tests {
     const REWRITE_OLD_BANK: BankId = BankId::new(0xC0DE_0000);
     const REWRITE_NEW_BANK: BankId = BankId::new(0xC0DE_0001);
     const REWRITE_ENTRY: GuestPc = GuestPc::new(0x8000_3000);
+    const REWRITE_RESUME: GuestPc = GuestPc::new(REWRITE_ENTRY.get() + 0x24);
     const REWRITE_PHYSICAL: u32 = 0x80;
+    const REWRITE_A_WORDS: [u32; 13] = [
+        0x3c09_8000, // lui t1, 0x8000
+        0x240c_0055, // addiu t4, zero, 0x55
+        0xad2c_0020, // sw t4, 0x20(t1) -- non-executable store
+        0x240d_0066, // addiu t5, zero, 0x66
+        0xad2d_0024, // sw t5, 0x24(t1) -- proves ordinary stores do not split
+        0x240a_0001, // addiu t2, zero, 1 -- prepare the post-store sentinel
+        0x3c08_1122, // lui t0, 0x1122
+        0x3508_3344, // ori t0, t0, 0x3344
+        0xad28_0080, // sw t0, 0x80(t1) -- replaces this executable image
+        0xad2a_0010, // generation-A post-store sentinel
+        0x03e0_0008, // jr ra
+        0,
+        0,
+    ];
+    const REWRITE_B_WORDS: [u32; 13] = [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0x240b_0002, // addiu t3, zero, 2
+        0xad2b_0014, // sw t3, 0x14(t1)
+        0x03e0_0008, // jr ra
+        0,
+    ];
     const DMA_OLD_BANK: BankId = BankId::new(0xD00D_0000);
     const DMA_NEW_BANK: BankId = BankId::new(0xD00D_0001);
     const DMA_ENTRY: GuestPc = GuestPc::new(0x8000_4000);
@@ -1328,6 +1471,9 @@ mod tests {
     thread_local! {
         static LIVE_ACTIVE_BANK: std::cell::Cell<BankId> = const { std::cell::Cell::new(LIVE_BANK) };
         static REWRITE_BUILDS: std::cell::RefCell<Vec<(u64, Vec<u8>)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+        static REWRITE_B_ENTRIES: std::cell::RefCell<Vec<ExecutionKey>> = const {
             std::cell::RefCell::new(Vec::new())
         };
     }
@@ -1764,7 +1910,7 @@ mod tests {
             REWRITE_OLD_BANK,
             pc,
             REWRITE_ENTRY,
-            GuestPc::new(REWRITE_ENTRY.get() + 8),
+            GuestPc::new(REWRITE_ENTRY.get() + 0x34),
         ))
     }
 
@@ -1772,33 +1918,45 @@ mod tests {
         rewrite_lookup(pc)
     }
 
-    fn rewrite_runner(
+    fn rewrite_interpreter_runner(
         entry: ExecutionKey,
-        _budget: InstructionBudget,
-        _ctx: &mut RsContext,
+        budget: InstructionBudget,
+        ctx: &mut RsContext,
         mem: &mut Rdram<'_>,
     ) -> BlockRun {
-        match (entry.bank, entry.pc) {
-            (REWRITE_OLD_BANK, REWRITE_ENTRY) => {
-                mem.store_w(
-                    0xFFFF_FFFF_8000_0000 | u64::from(REWRITE_PHYSICAL),
-                    0x1122_3344,
+        let words = match entry.bank {
+            REWRITE_OLD_BANK => REWRITE_A_WORDS,
+            REWRITE_NEW_BANK => {
+                REWRITE_B_ENTRIES.with(|entries| entries.borrow_mut().push(entry));
+                REWRITE_B_WORDS
+            }
+            bank => {
+                return BlockRun::new(
+                    BlockExit::Fault(unmapped(
+                        bank,
+                        entry.pc,
+                        REWRITE_ENTRY,
+                        GuestPc::new(REWRITE_ENTRY.get() + 0x34),
+                    )),
+                    0,
                 );
-                BlockRun::new(BlockExit::Checkpoint(entry), 2)
             }
-            (REWRITE_NEW_BANK, REWRITE_ENTRY) => {
-                mem.store_w(0xFFFF_FFFF_8000_0010, 0xA11C_E001);
-                BlockRun::new(BlockExit::ThreadReturn, 2)
+        };
+        let mut catalog = CodeCatalog::new();
+        catalog
+            .register(CodeBank::new(entry.bank, REWRITE_ENTRY, words.to_vec()).unwrap())
+            .unwrap();
+        let run =
+            run_bank(&catalog, entry.bank, entry, budget, ctx, mem).unwrap_or_else(|unsupported| {
+                panic!("rewrite interpreter hit unsupported op: {unsupported:?}")
+            });
+        match run.exit {
+            BlockExit::ResolveTransfer { target_pc, .. }
+                if ctx.is_thread_return(target_pc.get()) =>
+            {
+                BlockRun::new(BlockExit::ThreadReturn, run.instructions)
             }
-            (bank, pc) => BlockRun::new(
-                BlockExit::Fault(unmapped(
-                    bank,
-                    pc,
-                    REWRITE_ENTRY,
-                    GuestPc::new(REWRITE_ENTRY.get() + 8),
-                )),
-                0,
-            ),
+            _ => run,
         }
     }
 
@@ -1807,15 +1965,19 @@ mod tests {
         generation: u64,
     ) -> Result<(CodeBank, GeneratedBankRunner), String> {
         REWRITE_BUILDS.with(|builds| builds.borrow_mut().push((generation, bytes.to_vec())));
-        if generation != 1 || bytes != [0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0] {
+        let expected = std::iter::once(0x1122_3344)
+            .chain(REWRITE_A_WORDS.into_iter().skip(1))
+            .flat_map(u32::to_be_bytes)
+            .collect::<Vec<_>>();
+        if generation != 1 || bytes != expected {
             return Err(format!(
                 "unexpected CPU rewrite generation/image: {generation} {bytes:02x?}"
             ));
         }
         Ok((
-            CodeBank::new(REWRITE_NEW_BANK, REWRITE_ENTRY, vec![1, 1])
+            CodeBank::new(REWRITE_NEW_BANK, REWRITE_ENTRY, REWRITE_B_WORDS.to_vec())
                 .map_err(|error| error.to_string())?,
-            GeneratedBankRunner::new(REWRITE_NEW_BANK, rewrite_runner),
+            GeneratedBankRunner::new(REWRITE_NEW_BANK, rewrite_interpreter_runner),
         ))
     }
 
@@ -1847,7 +2009,17 @@ mod tests {
             }
             (DMA_NEW_BANK, DMA_ENTRY) => {
                 mem.store_w(0xFFFF_FFFF_8000_0014, 0xD00D_0001);
-                BlockRun::new(BlockExit::ThreadReturn, 2)
+                BlockRun::new(
+                    BlockExit::Transfer(ExecutionKey::new(
+                        DMA_NEW_BANK,
+                        GuestPc::new(DMA_ENTRY.get() + 4),
+                    )),
+                    1,
+                )
+            }
+            (DMA_NEW_BANK, pc) if pc == GuestPc::new(DMA_ENTRY.get() + 4) => {
+                mem.store_w(0xFFFF_FFFF_8000_0018, 0xD00D_0002);
+                BlockRun::new(BlockExit::ThreadReturn, 1)
             }
             (bank, pc) => BlockRun::new(
                 BlockExit::Fault(unmapped(
@@ -2138,19 +2310,34 @@ mod tests {
     }
 
     #[test]
-    fn cpu_store_rebuilds_executable_region_before_old_checkpoint_can_resume() {
+    fn interpreter_cpu_store_retires_generation_before_its_next_instruction() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
         with_host(|host| *host = super::super::HostState::default());
         REWRITE_BUILDS.with(|builds| builds.borrow_mut().clear());
+        REWRITE_B_ENTRIES.with(|entries| entries.borrow_mut().clear());
         let mut bytes = vec![0u8; 0x200];
+        fn64_recomp_rs::set_write_observer(None);
+        fn64_recomp_rs::set_guest_write_boundary_observer(None);
+        {
+            let mut mem = Rdram::new(&mut bytes);
+            for (index, word) in REWRITE_A_WORDS.into_iter().enumerate() {
+                mem.store_w(
+                    0xFFFF_FFFF_8000_0000
+                        | u64::from(REWRITE_PHYSICAL + u32::try_from(index * 4).unwrap()),
+                    word,
+                );
+            }
+        }
         let mut program = BlockProgram::new();
-        let mut region =
-            ExecutableRegion::new(REWRITE_ENTRY, GuestPc::new(REWRITE_ENTRY.get() + 8));
+        let mut region = ExecutableRegion::new(
+            REWRITE_ENTRY,
+            GuestPc::new(REWRITE_ENTRY.get() + u32::try_from(REWRITE_A_WORDS.len() * 4).unwrap()),
+        );
         region
             .install(
                 &mut program,
-                CodeBank::new(REWRITE_OLD_BANK, REWRITE_ENTRY, vec![0, 0]).unwrap(),
-                GeneratedBankRunner::new(REWRITE_OLD_BANK, rewrite_runner),
+                CodeBank::new(REWRITE_OLD_BANK, REWRITE_ENTRY, REWRITE_A_WORDS.to_vec()).unwrap(),
+                GeneratedBankRunner::new(REWRITE_OLD_BANK, rewrite_interpreter_runner),
             )
             .unwrap();
         let thread_id = 0xC0DE;
@@ -2164,19 +2351,28 @@ mod tests {
                 ExecutionKey::new(REWRITE_OLD_BANK, REWRITE_ENTRY),
                 rewrite_lookup,
                 rewrite_transfer_lookup,
-                InstructionBudget::new(8).unwrap(),
+                InstructionBudget::new(13).unwrap(),
                 thread_id,
                 10,
             );
         }
         register_live_executable_region(
             REWRITE_PHYSICAL,
-            REWRITE_PHYSICAL + 8,
+            REWRITE_PHYSICAL + u32::try_from(REWRITE_A_WORDS.len() * 4).unwrap(),
             region,
             rewrite_builder,
         );
 
         assert!(crate::run_one_step());
+        let mem = Rdram::new(&mut bytes);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0020) as u32, 0x55);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0024) as u32, 0x66);
+        assert_eq!(
+            mem.load_w(0xFFFF_FFFF_8000_0010) as u32,
+            0,
+            "generation A executed its post-store sentinel before invalidation"
+        );
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0014) as u32, 0);
         let live = with_host(|host| host.recompiled_program.clone().unwrap());
         assert!(live
             .program
@@ -2195,13 +2391,29 @@ mod tests {
             REWRITE_NEW_BANK
         );
         assert_eq!(
-            REWRITE_BUILDS.with(|builds| builds.borrow().clone()),
-            vec![(1, vec![0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0])]
+            live.resolve_entry(REWRITE_RESUME).unwrap(),
+            ExecutionKey::new(REWRITE_NEW_BANK, REWRITE_RESUME)
         );
+        assert_eq!(
+            REWRITE_BUILDS.with(|builds| builds.borrow().clone()),
+            vec![(
+                1,
+                std::iter::once(0x1122_3344)
+                    .chain(REWRITE_A_WORDS.into_iter().skip(1))
+                    .flat_map(u32::to_be_bytes)
+                    .collect::<Vec<_>>()
+            )]
+        );
+        assert!(REWRITE_B_ENTRIES.with(|entries| entries.borrow().is_empty()));
 
         assert!(crate::run_one_step());
         let mem = Rdram::new(&mut bytes);
-        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0010) as u32, 0xA11C_E001);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0010) as u32, 0);
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0014) as u32, 2);
+        assert_eq!(
+            REWRITE_B_ENTRIES.with(|entries| entries.borrow().clone()),
+            vec![ExecutionKey::new(REWRITE_NEW_BANK, REWRITE_RESUME)]
+        );
         assert!(crate::run_one_step());
         assert!(crate::is_thread_dead(thread_id));
     }
@@ -2260,6 +2472,11 @@ mod tests {
         assert!(crate::run_one_step());
         let mem = Rdram::new(&mut bytes);
         assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0014) as u32, 0xD00D_0001);
+        assert_eq!(
+            mem.load_w(0xFFFF_FFFF_8000_0018) as u32,
+            0xD00D_0002,
+            "the already-serviced DMA boundary split generation B's first turn"
+        );
         assert!(crate::run_one_step());
         assert!(crate::is_thread_dead(thread_id));
     }

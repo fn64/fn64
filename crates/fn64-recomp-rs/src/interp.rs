@@ -388,11 +388,24 @@ impl Interp<'_> {
                     }
                 };
 
-                match self.control_transfer(pc, instr, delay_pc, delay_word, delay, ctx, mem, port)
-                {
+                let attempt_runtime_fetch = executed + 2 < budget.get();
+                match self.control_transfer(
+                    pc,
+                    instr,
+                    delay_pc,
+                    delay_word,
+                    delay,
+                    attempt_runtime_fetch,
+                    ctx,
+                    mem,
+                    port,
+                ) {
                     Ok(Step::Exit { exit, retired }) => {
                         let executed = executed + retired;
-                        return Ok(BlockRun::new(exit, executed));
+                        return Ok(BlockRun::new(
+                            crate::execution::finalize_executable_write_exit(self.bank, exit),
+                            executed,
+                        ));
                     }
                     Ok(Step::Fallthrough { .. }) => {
                         unreachable!("a control transfer never falls through")
@@ -401,7 +414,13 @@ impl Interp<'_> {
                         // Delay-slot fault annuls the branch: neither the branch
                         // nor the slot retire, matching MemFault::Fault's
                         // `(executed - 2)` accounting in the AOT lane.
-                        return Ok(BlockRun::new(BlockExit::Fault(fault), executed + attempted));
+                        return Ok(BlockRun::new(
+                            crate::execution::finalize_executable_write_exit(
+                                self.bank,
+                                BlockExit::Fault(fault),
+                            ),
+                            executed + attempted,
+                        ));
                     }
                     Err(StepFault::Unsupported(op)) => return Err(op),
                 }
@@ -422,6 +441,15 @@ impl Interp<'_> {
             ) {
                 Ok(Step::Fallthrough { next, retired }) => {
                     executed += retired;
+                    if crate::runtime::take_executable_write_boundary() {
+                        return Ok(BlockRun::new(
+                            BlockExit::ExecutableWrite {
+                                source_bank: self.bank,
+                                resume: self.key(next),
+                            },
+                            executed,
+                        ));
+                    }
                     if self.contains(next) {
                         if executed >= budget.get() {
                             return Ok(BlockRun::new(
@@ -483,18 +511,21 @@ impl Interp<'_> {
         }
     }
 
-    /// The runtime (`jr`/`jalr`) transfer resolution: an unaligned computed
-    /// target is a typed [`CpuFaultKind::UnalignedPc`]; an in-bank target is a
-    /// proven transfer; otherwise a resolve transfer. Mirrors the AOT
-    /// `emit_runtime_transfer` sequence exactly.
-    fn runtime_transfer(&self, target: u32) -> BlockExit {
+    /// The runtime (`jr`/`jalr`) transfer resolution. An unaligned computed
+    /// target is a separate instruction-fetch attempt after the branch/delay
+    /// pair: it checkpoints when the pair exhausts the budget, otherwise it
+    /// contributes one retired unit and raises AdEL. An aligned in-bank target
+    /// is a proven transfer; any other aligned target is resolved by the owner.
+    fn runtime_transfer(&self, target: u32, attempt_fetch: bool) -> (BlockExit, u32) {
         if target & 3 != 0 {
-            return BlockExit::Fault(CpuFault {
-                at: self.key(target),
-                kind: CpuFaultKind::UnalignedPc,
-            });
+            let at = self.key(target);
+            return if attempt_fetch {
+                (BlockExit::Fault(CpuFault::instruction_address_error(at)), 1)
+            } else {
+                (BlockExit::Checkpoint(at), 0)
+            };
         }
-        self.proven_or_resolved(target)
+        (self.proven_or_resolved(target), 0)
     }
 
     /// Execute a control-transfer instruction and its delay slot, producing the
@@ -509,6 +540,7 @@ impl Interp<'_> {
         delay_pc: u32,
         delay_word: u32,
         delay: Instruction,
+        attempt_runtime_fetch: bool,
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
         port: &mut dyn MmioPort,
@@ -570,13 +602,21 @@ impl Interp<'_> {
                 // that writes `rs` must not redirect the already-issued jump.
                 let target = ctx.r_u32(rs);
                 run_delay(ctx, mem, port)?;
-                self.runtime_transfer(target)
+                let (exit, target_fetch) = self.runtime_transfer(target, attempt_runtime_fetch);
+                return Ok(Step::Exit {
+                    exit,
+                    retired: 2 + target_fetch,
+                });
             }
             Jalr { rd, rs } => {
                 let target = ctx.r_u32(rs);
                 ctx.set_r32(rd, fallthrough as i32);
                 run_delay(ctx, mem, port)?;
-                self.runtime_transfer(target)
+                let (exit, target_fetch) = self.runtime_transfer(target, attempt_runtime_fetch);
+                return Ok(Step::Exit {
+                    exit,
+                    retired: 2 + target_fetch,
+                });
             }
             J { .. } => {
                 run_delay(ctx, mem, port)?;
@@ -1674,5 +1714,191 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn executable_boundary(
+        event: crate::runtime::GuestWriteEvent,
+    ) -> crate::runtime::GuestWriteBoundary {
+        let (start, len) = event.range();
+        if start < 0x24 && start.saturating_add(len) > 0x20 {
+            crate::runtime::GuestWriteBoundary::ExecutableChanged
+        } else {
+            crate::runtime::GuestWriteBoundary::Continue
+        }
+    }
+
+    #[test]
+    fn interpreted_delay_slot_store_stops_at_selected_target_without_splitting_pair() {
+        // beq $zero,$zero,+2 ; sw $t0,0($a0) ; stale ; target
+        let catalog = catalog_of(&[0x1000_0002, 0xac88_0000, 0x2402_0001, 0x2403_0002]);
+        let mut storage = vec![0u8; 0x100];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        ctx.set_r(4, 0xffff_ffff_8000_0020);
+        ctx.set_r(8, 0x1122_3344);
+        crate::runtime::set_guest_write_boundary_observer(Some(executable_boundary));
+
+        let run = run_bank(
+            &catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(8).unwrap(),
+            &mut ctx,
+            &mut mem,
+        )
+        .unwrap();
+        assert_eq!(run.instructions, 2);
+        assert_eq!(ctx.r(2), 0, "fallthrough sentinel must not execute");
+        assert_eq!(ctx.r(3), 0, "selected-target sentinel must not execute");
+        assert_eq!(mem.load_w(0xffff_ffff_8000_0020) as u32, 0x1122_3344);
+        assert_eq!(
+            run.exit,
+            BlockExit::ExecutableWrite {
+                source_bank: BANK,
+                resume: ExecutionKey::new(BANK, GuestPc::new(VA + 12)),
+            }
+        );
+        assert!(!crate::runtime::take_executable_write_boundary());
+        crate::runtime::set_guest_write_boundary_observer(None);
+    }
+
+    #[test]
+    fn annulled_likely_slot_does_not_fabricate_an_executable_write() {
+        // bnel $zero,$zero,+2 is not taken, so its store slot is annulled.
+        let catalog = catalog_of(&[0x5400_0002, 0xac88_0000, 0x2402_0001, 0x2403_0002]);
+        let mut storage = vec![0u8; 0x100];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        ctx.set_r(4, 0xffff_ffff_8000_0020);
+        ctx.set_r(8, 0x1122_3344);
+        crate::runtime::set_guest_write_boundary_observer(Some(executable_boundary));
+
+        let run = run_bank(
+            &catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(8).unwrap(),
+            &mut ctx,
+            &mut mem,
+        )
+        .unwrap();
+        assert_eq!(run.instructions, 2);
+        assert!(matches!(run.exit, BlockExit::Transfer(_)));
+        assert_eq!(mem.load_w(0xffff_ffff_8000_0020), 0);
+        assert!(!crate::runtime::take_executable_write_boundary());
+        crate::runtime::set_guest_write_boundary_observer(None);
+    }
+
+    #[test]
+    fn faulting_and_failed_conditional_stores_request_no_boundary() {
+        let sw_catalog = catalog_of(&[0xac88_0000, 0x2402_0001]);
+        let mut storage = vec![0u8; 0x100];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        ctx.set_r(4, 0xffff_ffff_8000_0021);
+        ctx.set_r(8, 0x1122_3344);
+        crate::runtime::set_guest_write_boundary_observer(Some(executable_boundary));
+        let fault = run_bank(
+            &sw_catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(8).unwrap(),
+            &mut ctx,
+            &mut mem,
+        )
+        .unwrap();
+        assert!(matches!(fault.exit, BlockExit::Fault(_)));
+        assert!(!crate::runtime::take_executable_write_boundary());
+
+        let sc_catalog = catalog_of(&[0xe088_0000, 0x2402_0001, 0x03e0_0008, 0]);
+        ctx.set_r(4, 0xffff_ffff_8000_0020);
+        ctx.set_r(8, 0x5566_7788);
+        ctx.set_r(31, 0x8000_9000);
+        let failed = run_bank(
+            &sc_catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(8).unwrap(),
+            &mut ctx,
+            &mut mem,
+        )
+        .unwrap();
+        assert_eq!(ctx.r(8), 0);
+        assert_eq!(ctx.r(2), 1, "failed SC continues to the sentinel");
+        assert!(!matches!(failed.exit, BlockExit::ExecutableWrite { .. }));
+        assert!(!crate::runtime::take_executable_write_boundary());
+        crate::runtime::set_guest_write_boundary_observer(None);
+    }
+
+    #[test]
+    fn successful_conditional_store_stops_before_the_next_instruction() {
+        let catalog = catalog_of(&[0xe088_0000, 0x2402_0001, 0x03e0_0008, 0]);
+        let mut storage = vec![0u8; 0x100];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        let addr = 0xffff_ffff_8000_0020;
+        ctx.set_r(4, addr);
+        ctx.set_r(8, 0x99aa_bbcc);
+        ctx.set_ll_reservation(addr, 4);
+        crate::runtime::set_guest_write_boundary_observer(Some(executable_boundary));
+        let run = run_bank(
+            &catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(8).unwrap(),
+            &mut ctx,
+            &mut mem,
+        )
+        .unwrap();
+        assert_eq!(run.instructions, 1);
+        assert_eq!(ctx.r(8), 1);
+        assert_eq!(ctx.r(2), 0);
+        assert_eq!(
+            run.exit,
+            BlockExit::ExecutableWrite {
+                source_bank: BANK,
+                resume: ExecutionKey::new(BANK, GuestPc::new(VA + 4)),
+            }
+        );
+        crate::runtime::set_guest_write_boundary_observer(None);
+    }
+
+    #[test]
+    fn delay_slot_executable_store_preserves_target_fetch_budget_and_fault() {
+        // jr $t1 ; sw $t0,0($a0). The pair retires first. An exactly exhausted
+        // budget checkpoints the selected target; one more unit admits the
+        // counted fetch attempt and its AdEL without entering a handler before
+        // the executable owner rebuilds.
+        let catalog = catalog_of(&[0x0120_0008, 0xac88_0000]);
+        let target = ExecutionKey::new(BANK, GuestPc::new(0x8000_2002));
+        for budget in [2, 3] {
+            let mut storage = vec![0u8; 0x100];
+            let mut mem = Rdram::new(&mut storage);
+            let mut ctx = RecompContext::new();
+            ctx.set_r(4, 0xffff_ffff_8000_0020);
+            ctx.set_r(8, 0x1122_3344);
+            ctx.set_r(9, u64::from(target.pc.get()));
+            crate::runtime::set_guest_write_boundary_observer(Some(executable_boundary));
+            let run = run_bank(
+                &catalog,
+                BANK,
+                ExecutionKey::new(BANK, GuestPc::new(VA)),
+                InstructionBudget::new(budget).unwrap(),
+                &mut ctx,
+                &mut mem,
+            )
+            .unwrap();
+            if budget == 2 {
+                assert_eq!(run, BlockRun::new(BlockExit::Checkpoint(target), 2));
+            } else {
+                assert_eq!(run.instructions, 3);
+                assert_eq!(
+                    run.exit,
+                    BlockExit::ExecutableWriteFault(CpuFault::instruction_address_error(target))
+                );
+            }
+            assert!(!crate::runtime::take_executable_write_boundary());
+        }
+        crate::runtime::set_guest_write_boundary_observer(None);
     }
 }

@@ -496,6 +496,25 @@ pub enum BlockExit {
         vram: GuestPc,
         resume: ExecutionKey,
     },
+    /// A committed store changed the active executable image. The owner must
+    /// publish the replacement generation before resolving `resume` again.
+    ExecutableWrite {
+        source_bank: BankId,
+        resume: ExecutionKey,
+    },
+    /// An executable-changing store occurred in the delay slot of a call whose
+    /// target still needs guest-versus-host classification. A dispatcher must
+    /// resolve that classification without entering either target first.
+    ExecutableWriteResolveCall {
+        source_bank: BankId,
+        target_pc: GuestPc,
+        resume: ExecutionKey,
+    },
+    /// A delay-slot store changed executable bytes before the selected target
+    /// raised an architectural fetch fault. Exception state must be applied,
+    /// but its handler may not execute until the replacement generation is
+    /// visible.
+    ExecutableWriteFault(CpuFault),
     Checkpoint(ExecutionKey),
     Yield(ExecutionKey),
     /// The guest thread entry returned through its configured sentinel. This
@@ -504,6 +523,47 @@ pub enum BlockExit {
     /// boundary.
     ThreadReturn,
     Fault(CpuFault),
+}
+
+/// Drain a request left by a store in a control transfer's delay slot and
+/// preserve the selected continuation without entering it.
+///
+/// Straight-line runners consume the request at `PC + 4` so they can stop
+/// before their own loop advances. Control transfers already return a typed
+/// exit after the indivisible branch/delay pair; this conversion makes direct
+/// runner invocation just as leak-free as dispatcher-driven invocation.
+pub fn finalize_executable_write_exit(source_bank: BankId, exit: BlockExit) -> BlockExit {
+    if !crate::runtime::take_executable_write_boundary() {
+        return exit;
+    }
+    match exit {
+        BlockExit::Transfer(next) => BlockExit::ExecutableWrite {
+            source_bank,
+            resume: next,
+        },
+        BlockExit::ResolveTransfer {
+            source_bank,
+            target_pc,
+        } => BlockExit::ExecutableWrite {
+            source_bank,
+            resume: ExecutionKey::new(source_bank, target_pc),
+        },
+        BlockExit::ResolveCall {
+            source_bank,
+            target_pc,
+            resume,
+        } => BlockExit::ExecutableWriteResolveCall {
+            source_bank,
+            target_pc,
+            resume,
+        },
+        BlockExit::Fault(fault) => BlockExit::ExecutableWriteFault(fault),
+        // Each of these already returns to the host owner before another guest
+        // instruction can execute. Draining the request prevents it from
+        // contaminating a later direct runner invocation; the host processes
+        // committed executable writes at every such outer boundary.
+        outer => outer,
+    }
 }
 
 /// Maximum number of ordinary instructions a runner may execute before it
@@ -740,6 +800,10 @@ where
         let turn_budget = InstructionBudget::new(remaining)
             .expect("remaining budget was checked against InstructionBudget::MIN");
         let run = runner.run(entry, turn_budget);
+        let run = BlockRun::new(
+            finalize_executable_write_exit(entry.bank, run.exit),
+            run.instructions,
+        );
         if run.instructions > remaining {
             return Err(DispatchError::RunnerExceededBudget {
                 at: entry,
@@ -753,6 +817,9 @@ where
                 BlockExit::Transfer(_)
                     | BlockExit::ResolveTransfer { .. }
                     | BlockExit::ResolveCall { .. }
+                    | BlockExit::ExecutableWrite { .. }
+                    | BlockExit::ExecutableWriteResolveCall { .. }
+                    | BlockExit::ExecutableWriteFault(_)
             )
         {
             return Err(DispatchError::ContinuingExitWithoutProgress {
@@ -768,6 +835,41 @@ where
             .ok_or(DispatchError::BlockCountOverflow)?;
 
         match run.exit {
+            BlockExit::ExecutableWrite {
+                source_bank,
+                resume,
+            } => {
+                return Ok(DispatchRun {
+                    exit: BlockExit::ExecutableWrite {
+                        source_bank,
+                        resume,
+                    },
+                    instructions,
+                    blocks,
+                });
+            }
+            BlockExit::ExecutableWriteResolveCall {
+                source_bank,
+                target_pc,
+                resume,
+            } => {
+                return Ok(DispatchRun {
+                    exit: BlockExit::ExecutableWriteResolveCall {
+                        source_bank,
+                        target_pc,
+                        resume,
+                    },
+                    instructions,
+                    blocks,
+                });
+            }
+            BlockExit::ExecutableWriteFault(fault) => {
+                return Ok(DispatchRun {
+                    exit: BlockExit::ExecutableWriteFault(fault),
+                    instructions,
+                    blocks,
+                });
+            }
             BlockExit::Transfer(next) => entry = next,
             BlockExit::ResolveTransfer {
                 source_bank,
@@ -1575,6 +1677,10 @@ impl BlockProgram {
             let turn_budget = InstructionBudget::new(remaining)
                 .expect("remaining budget was checked against InstructionBudget::MIN");
             let run = self.run(entry, turn_budget, ctx, mem);
+            let run = BlockRun::new(
+                finalize_executable_write_exit(entry.bank, run.exit),
+                run.instructions,
+            );
             if run.instructions > remaining {
                 return Err(DispatchError::RunnerExceededBudget {
                     at: entry,
@@ -1588,6 +1694,9 @@ impl BlockProgram {
                     BlockExit::Transfer(_)
                         | BlockExit::ResolveTransfer { .. }
                         | BlockExit::ResolveCall { .. }
+                        | BlockExit::ExecutableWrite { .. }
+                        | BlockExit::ExecutableWriteResolveCall { .. }
+                        | BlockExit::ExecutableWriteFault(_)
                         | BlockExit::Fault(CpuFault {
                             kind: CpuFaultKind::Exception { .. },
                             ..
@@ -1607,6 +1716,41 @@ impl BlockProgram {
                 .ok_or(DispatchError::BlockCountOverflow)?;
 
             let resolution = match run.exit {
+                BlockExit::ExecutableWrite {
+                    source_bank,
+                    resume,
+                } => {
+                    return Ok(DispatchRun {
+                        exit: BlockExit::ExecutableWrite {
+                            source_bank,
+                            resume,
+                        },
+                        instructions,
+                        blocks,
+                    });
+                }
+                BlockExit::ExecutableWriteResolveCall {
+                    source_bank,
+                    target_pc,
+                    resume,
+                } => {
+                    return Ok(DispatchRun {
+                        exit: BlockExit::ExecutableWriteResolveCall {
+                            source_bank,
+                            target_pc,
+                            resume,
+                        },
+                        instructions,
+                        blocks,
+                    });
+                }
+                BlockExit::ExecutableWriteFault(fault) => {
+                    return Ok(DispatchRun {
+                        exit: BlockExit::ExecutableWriteFault(fault),
+                        instructions,
+                        blocks,
+                    });
+                }
                 BlockExit::Transfer(next) => {
                     entry = next;
                     continue;
@@ -2173,6 +2317,29 @@ mod tests {
     ) -> BlockRun {
         ctx.set_r32(2, 2);
         BlockRun::new(BlockExit::Yield(entry), 1)
+    }
+
+    fn zero_progress_executable_write_runner(
+        entry: ExecutionKey,
+        _budget: InstructionBudget,
+        _ctx: &mut RecompContext,
+        _mem: &mut Rdram<'_>,
+    ) -> BlockRun {
+        let resume = ExecutionKey::new(entry.bank, GuestPc::new(VA.get() + 12));
+        let exit = match entry.pc.get() - VA.get() {
+            0 => BlockExit::ExecutableWrite {
+                source_bank: entry.bank,
+                resume,
+            },
+            4 => BlockExit::ExecutableWriteResolveCall {
+                source_bank: entry.bank,
+                target_pc: GuestPc::new(0x8000_2000),
+                resume,
+            },
+            8 => BlockExit::ExecutableWriteFault(CpuFault::instruction_address_error(entry)),
+            _ => unreachable!("test runner received an unexpected entry"),
+        };
+        BlockRun::new(exit, 0)
     }
 
     fn observation_transfer_runner(
@@ -3477,6 +3644,132 @@ mod tests {
                 budget,
                 actual: 3,
             })
+        );
+    }
+
+    #[test]
+    fn both_dispatchers_reject_zero_progress_executable_write_exits() {
+        let bank_id = BankId::new(0x71);
+        let budget = InstructionBudget::new(2).unwrap();
+        let resume = ExecutionKey::new(bank_id, GuestPc::new(VA.get() + 12));
+        let entries_and_exits = [
+            (
+                ExecutionKey::new(bank_id, VA),
+                BlockExit::ExecutableWrite {
+                    source_bank: bank_id,
+                    resume,
+                },
+            ),
+            (
+                ExecutionKey::new(bank_id, GuestPc::new(VA.get() + 4)),
+                BlockExit::ExecutableWriteResolveCall {
+                    source_bank: bank_id,
+                    target_pc: GuestPc::new(0x8000_2000),
+                    resume,
+                },
+            ),
+            (
+                ExecutionKey::new(bank_id, GuestPc::new(VA.get() + 8)),
+                BlockExit::ExecutableWriteFault(CpuFault::instruction_address_error(
+                    ExecutionKey::new(bank_id, GuestPc::new(VA.get() + 8)),
+                )),
+            ),
+        ];
+
+        let mut program = BlockProgram::new();
+        program
+            .register(
+                CodeBank::new(bank_id, VA, vec![0; 3]).unwrap(),
+                GeneratedBankRunner::new(bank_id, zero_progress_executable_write_runner),
+            )
+            .unwrap();
+        let mut ctx = RecompContext::new();
+        let mut storage = [];
+        let mut mem = Rdram::new(&mut storage);
+
+        for (entry, exit) in entries_and_exits {
+            let mut runner = move |_entry, _budget| BlockRun::new(exit, 0);
+            let mut resolver = |_source_bank, _target_pc| unreachable!();
+            assert_eq!(
+                dispatch_until_boundary(entry, budget, &mut runner, &mut resolver),
+                Err(DispatchError::ContinuingExitWithoutProgress { at: entry, exit })
+            );
+            assert_eq!(
+                program.dispatch(entry, budget, &mut ctx, &mut mem, &mut resolver),
+                Err(DispatchError::ContinuingExitWithoutProgress { at: entry, exit })
+            );
+        }
+    }
+
+    #[test]
+    fn executable_write_boundary_preserves_cross_bank_source_lineage() {
+        fn changed(_: crate::runtime::GuestWriteEvent) -> crate::runtime::GuestWriteBoundary {
+            crate::runtime::GuestWriteBoundary::ExecutableChanged
+        }
+
+        let source = BankId::new(0xA);
+        let target = ExecutionKey::new(BankId::new(0xC), GuestPc::new(0x8000_4000));
+        crate::runtime::set_guest_write_boundary_observer(Some(changed));
+        crate::runtime::notify_guest_write(0x20, 4);
+        assert_eq!(
+            finalize_executable_write_exit(source, BlockExit::Transfer(target)),
+            BlockExit::ExecutableWrite {
+                source_bank: source,
+                resume: target,
+            }
+        );
+        assert!(!crate::runtime::take_executable_write_boundary());
+        crate::runtime::set_guest_write_boundary_observer(None);
+    }
+
+    #[test]
+    fn executable_write_special_continuations_escape_dispatch_unresolved() {
+        let source = BankId::new(0xA);
+        let target = GuestPc::new(0x8000_5000);
+        let resume = ExecutionKey::new(source, GuestPc::new(0x8000_1008));
+        let call = BlockExit::ExecutableWriteResolveCall {
+            source_bank: source,
+            target_pc: target,
+            resume,
+        };
+        let mut call_runner = move |_entry, _budget| BlockRun::new(call, 2);
+        let mut resolver = |_source_bank, _target_pc| -> Result<ExecutionKey, CpuFault> {
+            panic!("executable-write continuation resolved before owner rebuild")
+        };
+        assert_eq!(
+            dispatch_until_boundary(
+                ExecutionKey::new(source, VA),
+                InstructionBudget::new(4).unwrap(),
+                &mut call_runner,
+                &mut resolver,
+            )
+            .unwrap(),
+            DispatchRun {
+                exit: call,
+                instructions: 2,
+                blocks: 1,
+            }
+        );
+
+        let fault = CpuFault::instruction_address_error(ExecutionKey::new(
+            source,
+            GuestPc::new(0x8000_2002),
+        ));
+        let mut fault_runner =
+            move |_entry, _budget| BlockRun::new(BlockExit::ExecutableWriteFault(fault), 3);
+        assert_eq!(
+            dispatch_until_boundary(
+                ExecutionKey::new(source, VA),
+                InstructionBudget::new(4).unwrap(),
+                &mut fault_runner,
+                &mut resolver,
+            )
+            .unwrap(),
+            DispatchRun {
+                exit: BlockExit::ExecutableWriteFault(fault),
+                instructions: 3,
+                blocks: 1,
+            }
         );
     }
 }
