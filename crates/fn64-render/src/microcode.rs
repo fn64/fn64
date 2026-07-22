@@ -330,12 +330,16 @@ impl GeometryWireFamily {
     pub const fn cache_capacity(self) -> usize {
         match self {
             Self::Fast3d => 16,
+            // Pinned RT64's F3DZEX2 BranchW exposes a seven-bit cache index.
+            // The inherited G_VTX end field is also seven bits, so ordinary
+            // loads can populate through slot 126 while slot 127 remains a
+            // representable malformed/unloaded BranchW selection.
+            Self::F3dzex2 => 128,
             Self::F3dlxRej | Self::F3dex2Rej | Self::F3dlx2Rej => 64,
             Self::F3dex
             | Self::F3dlx
             | Self::F3dex2
             | Self::F3dex2NoN
-            | Self::F3dzex2
             | Self::L3dex
             | Self::L3dex2 => 32,
         }
@@ -357,6 +361,7 @@ impl GeometryWireFamily {
     #[doc(hidden)]
     pub const fn max_vertex_load_count(self) -> usize {
         match self {
+            Self::F3dzex2 => 127,
             Self::F3dex2Rej | Self::F3dlx2Rej => 64,
             _ => 32,
         }
@@ -757,6 +762,14 @@ mod tests {
             GeometryWireFamily::L3dex2
         );
         assert_eq!(catalog.supported_ucodes(), &[UcodeId::L3dex2]);
+    }
+
+    #[test]
+    fn f3dzex2_branchw_index_domain_is_not_collapsed_to_public_f3dex2() {
+        assert_eq!(GeometryWireFamily::F3dex2.cache_capacity(), 32);
+        assert_eq!(GeometryWireFamily::F3dex2.max_vertex_load_count(), 32);
+        assert_eq!(GeometryWireFamily::F3dzex2.cache_capacity(), 128);
+        assert_eq!(GeometryWireFamily::F3dzex2.max_vertex_load_count(), 127);
     }
 
     #[test]

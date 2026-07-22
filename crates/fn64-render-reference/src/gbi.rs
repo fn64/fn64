@@ -25,10 +25,11 @@
 //! ## Scope
 //!
 //! Interpreted (real effect): `G_VTX` (load transformed vertices into the
-//! 32-slot cache), `G_MODIFYVTX` (all four public post-transform cache
+//! active family's cache), `G_MODIFYVTX` (all four public post-transform cache
 //! fields), `G_TRI1`/`G_TRI2`/`G_QUAD` (triangles referencing loaded slots),
 //! `G_MTX`/`G_POPMTX` (modelview/projection stack), `G_CULLDL` (clip-code
 //! volume culling), `G_RDPHALF_1` + `G_BRANCH_Z` (screen-depth tail branch),
+//! F3DZEX2 `G_BRANCH_W` (strict homogeneous-W tail branch),
 //! `G_LINE3D` (clipped variable-width lines), `G_MOVEWORD` (segment,
 //! light-count/color, fog, and force-matrix writes), `G_DL` (call/jump into a nested display
 //! list), `G_SETOTHERMODE_H/L` (RDP cycle/filter/dither/render/alpha/
@@ -213,16 +214,13 @@ fn normalize_geometry_command(
     wire_w1: u32,
     command_pc: usize,
 ) -> (u32, u32) {
-    assert!(
-        !family.has_unpublished_wire(),
-        "F3DZEX2 command decode requires an allowed-source wire specification before HLE admission"
-    );
     if matches!(
         family,
         GeometryWireFamily::F3dex2
             | GeometryWireFamily::F3dex2NoN
             | GeometryWireFamily::F3dex2Rej
             | GeometryWireFamily::F3dlx2Rej
+            | GeometryWireFamily::F3dzex2
             | GeometryWireFamily::L3dex2
     ) {
         return (wire_w0, wire_w1);
@@ -230,8 +228,18 @@ fn normalize_geometry_command(
     let opcode = (wire_w0 >> 24) as u8;
     match opcode {
         LEGACY_G_SPNOOP => {
-            assert_eq!(wire_w0, 0, "{} G_SPNOOP command word must be zero", family.name());
-            assert_eq!(wire_w1, 0, "{} G_SPNOOP second word must be zero", family.name());
+            assert_eq!(
+                wire_w0,
+                0,
+                "{} G_SPNOOP command word must be zero",
+                family.name()
+            );
+            assert_eq!(
+                wire_w1,
+                0,
+                "{} G_SPNOOP second word must be zero",
+                family.name()
+            );
             (u32::from(G_SPNOOP) << 24, 0)
         }
         L3DEX_G_MTX => {
@@ -248,9 +256,8 @@ fn normalize_geometry_command(
                 "{} G_MTX parameter {old_params:#04x} contains non-public bits",
                 family.name()
             );
-            let new_params = ((old_params & 0x01) << 2)
-                | (old_params & 0x02)
-                | ((old_params & 0x04) >> 2);
+            let new_params =
+                ((old_params & 0x01) << 2) | (old_params & 0x02) | ((old_params & 0x04) >> 2);
             let wire_index = new_params ^ 0x01;
             (
                 (u32::from(G_MTX) << 24) | (7 << 19) | u32::from(wire_index),
@@ -260,7 +267,12 @@ fn normalize_geometry_command(
         L3DEX_G_MOVEMEM => {
             let index = ((wire_w0 >> 16) & 0xff) as u8;
             let length = wire_w0 & 0xffff;
-            assert_eq!(length, 16, "{} G_MOVEMEM must carry one 16-byte record", family.name());
+            assert_eq!(
+                length,
+                16,
+                "{} G_MOVEMEM must carry one 16-byte record",
+                family.name()
+            );
             let (modern_index, ofs_div8) = match index {
                 0x80 => (G_MV_VIEWPORT, 0),
                 0x82 => (G_MV_LIGHT, 3),
@@ -306,8 +318,7 @@ fn normalize_geometry_command(
                 let v0 = parameter / 2;
                 let n = ((length >> 10) & 0x3f) as usize;
                 assert!(
-                    (1..=32).contains(&n)
-                        && length & 0x03ff == (n as u32 * VTX_STRIDE as u32 - 1),
+                    (1..=32).contains(&n) && length & 0x03ff == (n as u32 * VTX_STRIDE as u32 - 1),
                     "{} G_VTX length/count field {length:#06x} is not ((n<<10)|(16*n-1))",
                     family.name()
                 );
@@ -320,9 +331,7 @@ fn normalize_geometry_command(
                 v0 + n
             );
             (
-                (u32::from(G_VTX) << 24)
-                    | ((n as u32) << 12)
-                    | (((v0 + n) as u32) << 1),
+                (u32::from(G_VTX) << 24) | ((n as u32) << 12) | (((v0 + n) as u32) << 1),
                 wire_w1,
             )
         }
@@ -350,9 +359,14 @@ fn normalize_geometry_command(
             let slots = if family == GeometryWireFamily::Fast3d {
                 let flag = (wire_w1 >> 24) as usize;
                 assert!(flag <= 1, "Fast3D G_LINE3D flat-shade flag must be 0 or 1");
-                let encoded = [((wire_w1 >> 16) & 0xff) as usize, ((wire_w1 >> 8) & 0xff) as usize];
+                let encoded = [
+                    ((wire_w1 >> 16) & 0xff) as usize,
+                    ((wire_w1 >> 8) & 0xff) as usize,
+                ];
                 assert!(
-                    encoded.iter().all(|value| value.is_multiple_of(10) && *value <= 150),
+                    encoded
+                        .iter()
+                        .all(|value| value.is_multiple_of(10) && *value <= 150),
                     "Fast3D G_LINE3D endpoints must use public v*10 packing: {encoded:?}"
                 );
                 let mut slots = [encoded[0] / 10, encoded[1] / 10];
@@ -362,7 +376,10 @@ fn normalize_geometry_command(
                 slots
             } else {
                 assert_eq!(wire_w1 >> 24, 0, "L3DEX G_LINE3D reserves w1[31:24]");
-                let encoded = [((wire_w1 >> 16) & 0xff) as usize, ((wire_w1 >> 8) & 0xff) as usize];
+                let encoded = [
+                    ((wire_w1 >> 16) & 0xff) as usize,
+                    ((wire_w1 >> 8) & 0xff) as usize,
+                ];
                 let max_encoded = family.cache_capacity() * 2 - 2;
                 assert!(
                     encoded
@@ -396,8 +413,18 @@ fn normalize_geometry_command(
                 );
                 (start, end_exclusive - 1)
             } else {
-                assert_eq!(wire_w0 & 0x00ff_0000, 0, "{} G_CULLDL reserves w0[23:16]", family.name());
-                assert_eq!(wire_w1 & 0xffff_0000, 0, "{} G_CULLDL reserves w1[31:16]", family.name());
+                assert_eq!(
+                    wire_w0 & 0x00ff_0000,
+                    0,
+                    "{} G_CULLDL reserves w0[23:16]",
+                    family.name()
+                );
+                assert_eq!(
+                    wire_w1 & 0xffff_0000,
+                    0,
+                    "{} G_CULLDL reserves w1[31:16]",
+                    family.name()
+                );
                 let encoded = [(wire_w0 & 0xffff) as usize, (wire_w1 & 0xffff) as usize];
                 let max_encoded = family.cache_capacity() * 2 - 2;
                 assert!(
@@ -416,7 +443,12 @@ fn normalize_geometry_command(
         }
         L3DEX_G_TRI1 if family != GeometryWireFamily::L3dex => {
             let normalized = normalize_legacy_triangle_word(family, wire_w1);
-            assert_eq!(wire_w0 & 0x00ff_ffff, 0, "{} G_TRI1 reserves its first-word payload", family.name());
+            assert_eq!(
+                wire_w0 & 0x00ff_ffff,
+                0,
+                "{} G_TRI1 reserves its first-word payload",
+                family.name()
+            );
             ((u32::from(G_TRI1) << 24) | normalized, 0)
         }
         F3DEX_G_TRI2 if family.uses_legacy_polygon_wire() => {
@@ -437,21 +469,36 @@ fn normalize_geometry_command(
                 wire_w1,
             )
         }
-        F3DEX_G_BRANCH_Z if family.uses_legacy_polygon_wire() => {
-            ((u32::from(G_BRANCH_Z) << 24) | (wire_w0 & 0x00ff_ffff), wire_w1)
-        }
-        F3DEX_G_LOAD_UCODE if family.is_legacy_loadable() => {
-            ((u32::from(G_LOAD_UCODE) << 24) | (wire_w0 & 0x00ff_ffff), wire_w1)
-        }
+        F3DEX_G_BRANCH_Z if family.uses_legacy_polygon_wire() => (
+            (u32::from(G_BRANCH_Z) << 24) | (wire_w0 & 0x00ff_ffff),
+            wire_w1,
+        ),
+        F3DEX_G_LOAD_UCODE if family.is_legacy_loadable() => (
+            (u32::from(G_LOAD_UCODE) << 24) | (wire_w0 & 0x00ff_ffff),
+            wire_w1,
+        ),
         LEGACY_G_RDPHALF_1 => (u32::from(G_RDPHALF_1) << 24, wire_w1),
         LEGACY_G_RDPHALF_2 => (u32::from(G_RDPHALF_2) << 24, wire_w1),
         L3DEX_G_CLEARGEOMETRYMODE => {
-            assert_eq!(wire_w0 & 0x00ff_ffff, 0, "{} G_CLEARGEOMETRYMODE payload must be zero", family.name());
+            assert_eq!(
+                wire_w0 & 0x00ff_ffff,
+                0,
+                "{} G_CLEARGEOMETRYMODE payload must be zero",
+                family.name()
+            );
             let clear = normalize_legacy_geometry_mode(family, wire_w1);
-            ((u32::from(G_GEOMETRYMODE) << 24) | ((!clear) & 0x00ff_ffff), 0)
+            (
+                (u32::from(G_GEOMETRYMODE) << 24) | ((!clear) & 0x00ff_ffff),
+                0,
+            )
         }
         L3DEX_G_SETGEOMETRYMODE => {
-            assert_eq!(wire_w0 & 0x00ff_ffff, 0, "{} G_SETGEOMETRYMODE payload must be zero", family.name());
+            assert_eq!(
+                wire_w0 & 0x00ff_ffff,
+                0,
+                "{} G_SETGEOMETRYMODE payload must be zero",
+                family.name()
+            );
             let set = normalize_legacy_geometry_mode(family, wire_w1);
             ((u32::from(G_GEOMETRYMODE) << 24) | 0x00ff_ffff, set)
         }
@@ -462,7 +509,12 @@ fn normalize_geometry_command(
                 "{} G_ENDDL reserved first-word payload must be zero",
                 family.name()
             );
-            assert_eq!(wire_w1, 0, "{} G_ENDDL reserved second word must be zero", family.name());
+            assert_eq!(
+                wire_w1,
+                0,
+                "{} G_ENDDL reserved second word must be zero",
+                family.name()
+            );
             (u32::from(G_ENDDL) << 24, 0)
         }
         L3DEX_G_SETOTHERMODE_L | L3DEX_G_SETOTHERMODE_H => {
@@ -479,19 +531,19 @@ fn normalize_geometry_command(
                 G_SETOTHERMODE_L
             };
             (
-                (u32::from(normalized_opcode) << 24)
-                    | ((32 - shift - length) << 8)
-                    | (length - 1),
+                (u32::from(normalized_opcode) << 24) | ((32 - shift - length) << 8) | (length - 1),
                 wire_w1,
             )
         }
         L3DEX_G_TEXTURE => {
             let on = wire_w0 & 0xff;
-            assert!(matches!(on, 0 | 1), "{} G_TEXTURE on={on} is outside G_OFF/G_ON", family.name());
+            assert!(
+                matches!(on, 0 | 1),
+                "{} G_TEXTURE on={on} is outside G_OFF/G_ON",
+                family.name()
+            );
             (
-                (u32::from(G_TEXTURE) << 24)
-                    | (wire_w0 & 0x00ff_ff00)
-                    | (on << 1),
+                (u32::from(G_TEXTURE) << 24) | (wire_w0 & 0x00ff_ff00) | (on << 1),
                 wire_w1,
             )
         }
@@ -513,44 +565,76 @@ fn normalize_geometry_command(
                     family.name()
                 );
                 return (
-                    (u32::from(G_MODIFYVTX) << 24)
-                        | (where_field << 16)
-                        | (slot * 2),
+                    (u32::from(G_MODIFYVTX) << 24) | (where_field << 16) | (slot * 2),
                     wire_w1,
                 );
             }
             let (offset, data) = if index == u32::from(G_MW_NUMLIGHT) {
-                assert_eq!(offset, 0, "{} G_MW_NUMLIGHT offset must be zero", family.name());
+                assert_eq!(
+                    offset,
+                    0,
+                    "{} G_MW_NUMLIGHT offset must be zero",
+                    family.name()
+                );
                 assert!(
                     wire_w1 & 0x8000_0000 != 0 && (wire_w1 & 0x7fff_ffff).is_multiple_of(32),
                     "{} G_MW_NUMLIGHT data is not public ((n+1)*32)|0x80000000 packing",
                     family.name()
                 );
                 let n = (wire_w1 & 0x7fff_ffff) / 32;
-                assert!((2..=8).contains(&n), "{} G_MW_NUMLIGHT count is outside 1..=7", family.name());
+                assert!(
+                    (2..=8).contains(&n),
+                    "{} G_MW_NUMLIGHT count is outside 1..=7",
+                    family.name()
+                );
                 (offset, (n - 1) * 24)
             } else if index == u32::from(G_MW_LIGHTCOL) {
-                assert!(offset.is_multiple_of(4), "{} G_MW_LIGHTCOL offset must be word aligned", family.name());
+                assert!(
+                    offset.is_multiple_of(4),
+                    "{} G_MW_LIGHTCOL offset must be word aligned",
+                    family.name()
+                );
                 let light = offset / 0x20;
                 let copy = offset % 0x20;
-                assert!(light < 8 && matches!(copy, 0 | 4), "{} G_MW_LIGHTCOL offset {offset:#06x} is outside public light colors", family.name());
+                assert!(
+                    light < 8 && matches!(copy, 0 | 4),
+                    "{} G_MW_LIGHTCOL offset {offset:#06x} is outside public light colors",
+                    family.name()
+                );
                 (light * 0x18 + copy, wire_w1)
             } else {
                 (offset, wire_w1)
             };
-            (
-                (u32::from(G_MOVEWORD) << 24) | (index << 16) | offset,
-                data,
-            )
+            ((u32::from(G_MOVEWORD) << 24) | (index << 16) | offset, data)
         }
         L3DEX_G_POPMTX => {
-            assert_eq!(wire_w0 & 0x00ff_ffff, 0, "{} G_POPMTX payload must be zero", family.name());
-            assert_eq!(wire_w1, 0, "{} G_POPMTX supports only G_MTX_MODELVIEW", family.name());
+            assert_eq!(
+                wire_w0 & 0x00ff_ffff,
+                0,
+                "{} G_POPMTX payload must be zero",
+                family.name()
+            );
+            assert_eq!(
+                wire_w1,
+                0,
+                "{} G_POPMTX supports only G_MTX_MODELVIEW",
+                family.name()
+            );
             (u32::from(G_POPMTX) << 24, 64)
         }
         L3DEX_G_NOOP => {
-            assert_eq!(wire_w0 & 0x00ff_ffff, 0, "{} G_NOOP payload must be zero", family.name());
-            assert_eq!(wire_w1, 0, "{} G_NOOP second word must be zero", family.name());
+            assert_eq!(
+                wire_w0 & 0x00ff_ffff,
+                0,
+                "{} G_NOOP payload must be zero",
+                family.name()
+            );
+            assert_eq!(
+                wire_w1,
+                0,
+                "{} G_NOOP second word must be zero",
+                family.name()
+            );
             (u32::from(G_NOOP) << 24, 0)
         }
         0xe4..=0xff => (wire_w0, wire_w1),
@@ -3686,7 +3770,11 @@ struct DecodeAdmissionPolicy {
 /// Decoder state carried across (possibly nested via `G_DL`) command
 /// streams.
 struct DecodeState {
-    vtx_cache: [Vertex; 64],
+    vtx_cache: [Vertex; MAX_GEOMETRY_VERTEX_CACHE],
+    /// Slot validity is distinct from vertex contents: the all-zero default
+    /// is a possible transformed vertex, but BranchW must not observe a slot
+    /// that the active microcode generation has never loaded.
+    vtx_loaded: [bool; MAX_GEOMETRY_VERTEX_CACHE],
     ops: Vec<RenderOp>,
     segments: [u32; 16],
     /// Projection * modelview, recomputed whenever either changes. `None`
@@ -3858,7 +3946,8 @@ impl ClipRatio {
 
 fn fresh_decode_state() -> DecodeState {
     DecodeState {
-        vtx_cache: [Vertex::default(); 64],
+        vtx_cache: [Vertex::default(); MAX_GEOMETRY_VERTEX_CACHE],
+        vtx_loaded: [false; MAX_GEOMETRY_VERTEX_CACHE],
         ops: Vec::new(),
         segments: [0u32; 16],
         mvp: None,
@@ -3901,7 +3990,8 @@ fn fresh_decode_state() -> DecodeState {
 /// not retained. Independent RDP state also remains live. State absent from
 /// the exhaustive maintained list is reset rather than guessed persistent.
 fn reset_rsp_state_from_ucode_load(state: &mut DecodeState) {
-    state.vtx_cache = [Vertex::default(); 64];
+    state.vtx_cache = [Vertex::default(); MAX_GEOMETRY_VERTEX_CACHE];
+    state.vtx_loaded = [false; MAX_GEOMETRY_VERTEX_CACHE];
     state.mvp = None;
     state.pending_forced_mvp = None;
     state.geometry_mode = 0;
@@ -3925,7 +4015,8 @@ fn reset_legacy_rsp_state_from_ucode_load(state: &mut DecodeState) {
         state.dl_depth, 0,
         "F3DEX/L3DEX G_LOAD_UCODE inside a called display list resets link state and cannot return"
     );
-    state.vtx_cache = [Vertex::default(); 64];
+    state.vtx_cache = [Vertex::default(); MAX_GEOMETRY_VERTEX_CACHE];
+    state.vtx_loaded = [false; MAX_GEOMETRY_VERTEX_CACHE];
     state.segments = [0; 16];
     state.mvp = None;
     state.pending_forced_mvp = None;
@@ -3965,7 +4056,10 @@ fn initialize_geometry_family_state(state: &mut DecodeState, family: GeometryWir
                 pos_y: 2,
             };
         }
-        GeometryWireFamily::F3dex2 | GeometryWireFamily::F3dex2NoN | GeometryWireFamily::L3dex2 => {
+        GeometryWireFamily::F3dex2
+        | GeometryWireFamily::F3dex2NoN
+        | GeometryWireFamily::F3dzex2
+        | GeometryWireFamily::L3dex2 => {
             // F3DEX2 changed the public CLIPRATIO default from 1 to 2.
             state.clip_ratio = ClipRatio {
                 neg_x: 2,
@@ -3975,11 +4069,6 @@ fn initialize_geometry_family_state(state: &mut DecodeState, family: GeometryWir
             };
         }
         GeometryWireFamily::Fast3d | GeometryWireFamily::F3dex | GeometryWireFamily::L3dex => {}
-        GeometryWireFamily::F3dzex2 => {
-            panic!(
-                "F3DZEX2 state initialization requires an allowed-source execution specification"
-            )
-        }
     }
 }
 
@@ -4658,6 +4747,7 @@ const MAX_DL_DEPTH: u32 = 18;
 /// A real OoT frame decodes on the order of 10^4 commands; 2^20 is far above
 /// any legitimate frame while still terminating promptly on a cycle.
 const MAX_DL_COMMANDS: u32 = 1 << 20;
+const MAX_GEOMETRY_VERTEX_CACHE: usize = 128;
 
 /// The simple ("reference-fixture") F3D-style decoder retained for backward
 /// compatibility: `G_VTX`/`G_TRI1`/`G_TRI2`/`G_ENDDL` with raw screen-space
@@ -5810,6 +5900,49 @@ fn decode_stream_impl(
                 }
             }
             G_BRANCH_Z => {
+                if *family == GeometryWireFamily::F3dzex2 {
+                    // Pinned MIT RT64 maps F3DZEX2 opcode 0x04 to BranchW:
+                    // bits 1..7 select one of 128 cache slots and the
+                    // retained transformed homogeneous W is compared
+                    // strictly against the unsigned command threshold.
+                    let vertex_slot = ((w0 >> 1) & 0x7f) as usize;
+                    let cache_capacity = family.cache_capacity();
+                    assert!(
+                        vertex_slot < cache_capacity,
+                        "F3DZEX2 G_BRANCH_W cache slot {vertex_slot} is outside slots 0..={}",
+                        cache_capacity - 1
+                    );
+                    assert!(
+                        state.vtx_loaded[vertex_slot],
+                        "F3DZEX2 G_BRANCH_W cache slot {vertex_slot} has not been loaded"
+                    );
+                    let vertex_w = state.vtx_cache[vertex_slot].w;
+                    assert!(
+                        vertex_w.is_finite(),
+                        "F3DZEX2 G_BRANCH_W cache slot {vertex_slot} has non-finite transformed W {vertex_w}"
+                    );
+                    if state.force_branch || vertex_w < w1 as f32 {
+                        let target = state.rdp_half_1.unwrap_or_else(|| {
+                            panic!(
+                                "F3DZEX2 G_BRANCH_W reached without a preceding G_RDPHALF_1 target"
+                            )
+                        });
+                        let target_pc = resolve_addr(&state.segments, target) & 0x00ff_fff8;
+                        let target_end = target_pc.checked_add(8).unwrap_or_else(|| {
+                            panic!(
+                                "F3DZEX2 G_BRANCH_W target {target_pc:#010x} overflows the host address space"
+                            )
+                        });
+                        assert!(
+                            target_end <= rdram.len(),
+                            "F3DZEX2 G_BRANCH_W target {target_pc:#010x} has no complete 8-byte command in rdram_bytes={}",
+                            rdram.len()
+                        );
+                        pc = target_pc;
+                        continue;
+                    }
+                    continue;
+                }
                 // gSPBranchLessZraw redundantly packs the same cache slot as
                 // v*5 (vertex record offset) and v*2 (screen-Z offset).
                 let encoded_vertex = ((w0 >> 12) & 0x0fff) as usize;
@@ -7060,6 +7193,7 @@ fn load_vertices(
             clip_code,
             clip_position,
         };
+        state.vtx_loaded[v0 + i] = true;
     }
 }
 
@@ -8911,6 +9045,308 @@ mod tests {
         let not_taken = decode_branch_z_fixture(0x0001_ffff);
         assert_eq!(not_taken.len(), 1);
         assert_eq!(not_taken[0].v[0].x, 0.0);
+    }
+
+    #[derive(Copy, Clone)]
+    struct BranchWFixture {
+        family: GeometryWireFamily,
+        vertex_slot: usize,
+        vertex_w: f32,
+        vertex_z: u32,
+        threshold: u32,
+        force_branch: bool,
+        loaded: bool,
+        branch_payload_noise: u32,
+        staged_target: Option<u32>,
+        segment_three: u32,
+        modify_where: Option<u8>,
+    }
+
+    impl Default for BranchWFixture {
+        fn default() -> Self {
+            Self {
+                family: GeometryWireFamily::F3dzex2,
+                vertex_slot: 0,
+                vertex_w: 1.0,
+                vertex_z: 0,
+                threshold: 2,
+                force_branch: false,
+                loaded: true,
+                branch_payload_noise: 0,
+                staged_target: Some(0x1200),
+                segment_three: 0,
+                modify_where: None,
+            }
+        }
+    }
+
+    fn run_branch_w_fixture(fixture: BranchWFixture) -> DecodeState {
+        let BranchWFixture {
+            family,
+            vertex_slot,
+            vertex_w,
+            vertex_z,
+            threshold,
+            force_branch,
+            loaded,
+            branch_payload_noise,
+            staged_target,
+            segment_three,
+            modify_where,
+        } = fixture;
+        const ROOT: usize = 0x1000;
+        const TARGET: usize = 0x1200;
+        let mut rdram = vec![0u8; 0x1300];
+        let mut pc = ROOT;
+        if let Some(where_field) = modify_where {
+            wr_cmd(
+                &mut rdram,
+                pc,
+                ((G_MODIFYVTX as u32) << 24)
+                    | (u32::from(where_field) << 16)
+                    | (vertex_slot as u32 * 2),
+                if where_field == G_MWO_POINT_ZSCREEN {
+                    0xffff_0000
+                } else {
+                    0x0040_0080
+                },
+            );
+            pc += 8;
+        }
+        if let Some(target) = staged_target {
+            wr_cmd(&mut rdram, pc, (G_RDPHALF_1 as u32) << 24, target);
+            pc += 8;
+        }
+        let branch_slot_payload = if family == GeometryWireFamily::F3dzex2 {
+            (vertex_slot as u32) << 1
+        } else {
+            ((vertex_slot as u32 * 5) << 12) | (vertex_slot as u32 * 2)
+        };
+        wr_cmd(
+            &mut rdram,
+            pc,
+            ((G_BRANCH_Z as u32) << 24) | branch_payload_noise | branch_slot_payload,
+            threshold,
+        );
+        wr_cmd(&mut rdram, pc + 8, (G_ENDDL as u32) << 24, 0);
+        wr_cmd(&mut rdram, TARGET, (G_RDPFULLSYNC as u32) << 24, 0);
+        wr_cmd(&mut rdram, TARGET + 8, (G_ENDDL as u32) << 24, 0);
+
+        let mut state = fresh_decode_state();
+        state.vtx_cache[vertex_slot].w = vertex_w;
+        state.vtx_cache[vertex_slot].z_screen = vertex_z;
+        state.vtx_cache[vertex_slot].clip_position = Some([0.0, 0.0, 0.0, vertex_w]);
+        state.vtx_loaded[vertex_slot] = loaded;
+        state.force_branch = force_branch;
+        state.segments[3] = segment_three;
+        initialize_geometry_family_state(&mut state, family);
+        let mut active_family = family;
+        decode_stream(
+            &mut rdram,
+            ROOT as u32,
+            &mut state,
+            None,
+            None,
+            &mut active_family,
+        );
+        state
+    }
+
+    fn reached_branch_w_target(state: &DecodeState) -> bool {
+        state
+            .ops
+            .iter()
+            .any(|operation| matches!(operation, RenderOp::FullSync))
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_is_strict_across_below_equal_and_above_thresholds() {
+        for (vertex_w, expected_taken) in [(1.0, true), (2.0, false), (3.0, false)] {
+            let state = run_branch_w_fixture(BranchWFixture {
+                vertex_w,
+                ..Default::default()
+            });
+            assert_eq!(reached_branch_w_target(&state), expected_taken);
+        }
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_uses_cpp_u32_to_f32_threshold_rounding() {
+        let state = run_branch_w_fixture(BranchWFixture {
+            vertex_w: 16_777_216.0,
+            threshold: 16_777_217,
+            staged_target: None,
+            ..Default::default()
+        });
+
+        assert_eq!(16_777_217_u32 as f32, 16_777_216.0);
+        assert!(!reached_branch_w_target(&state));
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_force_branch_takes_after_validating_vertex() {
+        let state = run_branch_w_fixture(BranchWFixture {
+            vertex_w: 3.0,
+            force_branch: true,
+            ..Default::default()
+        });
+        assert!(reached_branch_w_target(&state));
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_uses_only_w0_bits_one_through_seven_for_the_slot() {
+        let state = run_branch_w_fixture(BranchWFixture {
+            vertex_slot: 73,
+            branch_payload_noise: 0x00ff_ff01,
+            ..Default::default()
+        });
+        assert!(reached_branch_w_target(&state));
+    }
+
+    #[test]
+    fn f3dzex2_g_vtx_marks_high_cache_slot_loaded_for_branch_w() {
+        const ROOT: usize = 0x1000;
+        const TARGET: usize = 0x1200;
+        const VERTEX: usize = 0x2000;
+        const SLOT: usize = 126;
+        let mut rdram = vec![0u8; 0x2100];
+        wr_vtx(&mut rdram, VERTEX, 0, 0, 0, [255; 4]);
+        wr_cmd(
+            &mut rdram,
+            ROOT,
+            ((G_VTX as u32) << 24) | (1 << 12) | (127 << 1),
+            VERTEX as u32,
+        );
+        wr_cmd(
+            &mut rdram,
+            ROOT + 8,
+            (G_RDPHALF_1 as u32) << 24,
+            TARGET as u32,
+        );
+        wr_cmd(
+            &mut rdram,
+            ROOT + 16,
+            ((G_BRANCH_Z as u32) << 24) | ((SLOT as u32) << 1),
+            2,
+        );
+        wr_cmd(&mut rdram, ROOT + 24, (G_ENDDL as u32) << 24, 0);
+        wr_cmd(&mut rdram, TARGET, (G_RDPFULLSYNC as u32) << 24, 0);
+        wr_cmd(&mut rdram, TARGET + 8, (G_ENDDL as u32) << 24, 0);
+
+        let mut state = fresh_decode_state();
+        let mut family = GeometryWireFamily::F3dzex2;
+        initialize_geometry_family_state(&mut state, family);
+        decode_stream(&mut rdram, ROOT as u32, &mut state, None, None, &mut family);
+
+        assert!(state.vtx_loaded[SLOT]);
+        assert_eq!(state.vtx_cache[SLOT].w, 1.0);
+        assert!(reached_branch_w_target(&state));
+    }
+
+    #[test]
+    fn opcode_0x04_keeps_f3dex2_branch_z_separate_from_f3dzex2_branch_w() {
+        let opposite_predicates = BranchWFixture {
+            vertex_w: 0.0,
+            vertex_z: 10,
+            threshold: 5,
+            ..Default::default()
+        };
+        let f3dex2 = run_branch_w_fixture(BranchWFixture {
+            family: GeometryWireFamily::F3dex2,
+            ..opposite_predicates
+        });
+        let f3dzex2 = run_branch_w_fixture(opposite_predicates);
+        assert!(!reached_branch_w_target(&f3dex2));
+        assert!(reached_branch_w_target(&f3dzex2));
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_requires_half_one_only_when_taken() {
+        let fallthrough = run_branch_w_fixture(BranchWFixture {
+            vertex_w: 2.0,
+            staged_target: None,
+            ..Default::default()
+        });
+        assert!(!reached_branch_w_target(&fallthrough));
+
+        let taken = std::panic::catch_unwind(|| {
+            run_branch_w_fixture(BranchWFixture {
+                staged_target: None,
+                ..Default::default()
+            })
+        });
+        assert!(taken.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "F3DZEX2 G_BRANCH_W cache slot 127 has not been loaded")]
+    fn f3dzex2_branch_w_rejects_an_unloaded_cache_slot() {
+        let _ = run_branch_w_fixture(BranchWFixture {
+            vertex_slot: 127,
+            force_branch: true,
+            loaded: false,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_rejects_nonfinite_transformed_w_even_when_forced() {
+        for vertex_w in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let result = std::panic::catch_unwind(|| {
+                run_branch_w_fixture(BranchWFixture {
+                    vertex_w,
+                    force_branch: true,
+                    ..Default::default()
+                })
+            });
+            assert!(result.is_err(), "accepted non-finite W {vertex_w}");
+        }
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_resolves_segment_then_masks_target_to_command_alignment() {
+        let state = run_branch_w_fixture(BranchWFixture {
+            staged_target: Some(0x0300_0207),
+            segment_three: 0x1000,
+            ..Default::default()
+        });
+        assert!(reached_branch_w_target(&state));
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_rejects_a_taken_target_without_a_complete_command() {
+        let result = std::panic::catch_unwind(|| {
+            run_branch_w_fixture(BranchWFixture {
+                staged_target: Some(0x00ff_fff8),
+                ..Default::default()
+            })
+        });
+        let panic = match result {
+            Ok(_) => panic!("out-of-range BranchW target must trap"),
+            Err(panic) => panic,
+        };
+        let message = if let Some(message) = panic.downcast_ref::<String>() {
+            message.as_str()
+        } else if let Some(message) = panic.downcast_ref::<&str>() {
+            message
+        } else {
+            ""
+        };
+        assert!(message.contains("G_BRANCH_W target"));
+        assert!(message.contains("no complete 8-byte command"));
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_retains_w_across_modify_vertex_xy_and_z() {
+        for where_field in [G_MWO_POINT_XYSCREEN, G_MWO_POINT_ZSCREEN] {
+            let state = run_branch_w_fixture(BranchWFixture {
+                modify_where: Some(where_field),
+                ..Default::default()
+            });
+            assert!(reached_branch_w_target(&state));
+            assert_eq!(state.vtx_cache[0].w, 1.0);
+            assert_eq!(state.vtx_cache[0].clip_position, None);
+        }
     }
 
     fn force_branch_admission_reaches_target(force_branch: bool) -> bool {
@@ -11176,7 +11612,8 @@ mod tests {
     /// harness for exercising the light math directly.
     fn lit_state() -> DecodeState {
         DecodeState {
-            vtx_cache: [Vertex::default(); 64],
+            vtx_cache: [Vertex::default(); MAX_GEOMETRY_VERTEX_CACHE],
+            vtx_loaded: [false; MAX_GEOMETRY_VERTEX_CACHE],
             ops: Vec::new(),
             segments: [0u32; 16],
             mvp: None,
@@ -11351,7 +11788,11 @@ mod tests {
 
         reset_legacy_rsp_state_from_ucode_load(&mut state);
 
-        assert_eq!(state.vtx_cache, [Vertex::default(); 64]);
+        assert_eq!(
+            state.vtx_cache,
+            [Vertex::default(); MAX_GEOMETRY_VERTEX_CACHE]
+        );
+        assert_eq!(state.vtx_loaded, [false; MAX_GEOMETRY_VERTEX_CACHE]);
         assert_eq!(state.segments, [0; 16]);
         assert!(state.proj.is_none());
         assert_eq!(state.modelview, identity());
@@ -12757,14 +13198,7 @@ mod tests {
                                 }
                             };
                             assert_eq!(
-                                texture_axis_address(
-                                    input,
-                                    DIMENSION,
-                                    clamp,
-                                    mirror,
-                                    mask,
-                                    mode,
-                                ),
+                                texture_axis_address(input, DIMENSION, clamp, mirror, mask, mode,),
                                 expected,
                                 "mode={mode:?} coordinate={input} mask={mask} clamp={clamp} mirror={mirror}"
                             );

@@ -3,13 +3,16 @@
 //! This is deliberately not a renderer. It executes only the published GBI
 //! state that can change which command is reached: display-list links,
 //! segmented pointers, debug DMA, microcode replacement, and the transform /
-//! vertex fields consumed by `G_CULLDL` and `G_BRANCH_Z`. RDP drawing state is
-//! irrelevant here; the only RDP command retained is FullSync completion.
+//! vertex fields consumed by `G_CULLDL`, `G_BRANCH_Z`, and F3DZEX2
+//! `G_BRANCH_W`. RDP drawing state is irrelevant here; the only RDP command
+//! retained is FullSync completion.
 //!
 //! Provenance: command encodings and retained-state rules are from the public
 //! `gbi.h`, Fast3D/F3DEX/F3DEX2/L3DEX manuals, SGI RSP Programmer's Guide
-//! chapter 4, and SGI RDP Command Summary. The optional forced-branch policy
-//! is fn64's typed rendering policy for pinned MIT RT64's public enhancement.
+//! chapter 4, SGI RDP Command Summary, and pinned MIT RT64
+//! `rt64_gbi_f3dzex2.cpp`/`rt64_rsp.cpp` for BranchW software parity. The
+//! optional forced-branch policy is fn64's typed rendering policy for pinned
+//! MIT RT64's public enhancement.
 
 use crate::{
     DpFullSyncStatus, GeometryUcodeCatalog, GeometryWireFamily, MicrocodeDataImageIdentity, OsTask,
@@ -98,7 +101,7 @@ const G_MWO_POINT_ZSCREEN: u8 = 0x1c;
 /// Host policy that changes public display-list control flow.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct GeometryTaskInspectionPolicy {
-    /// Force every supported depth branch to take its staged target.
+    /// Force every supported geometry branch to take its staged target.
     pub force_branch: bool,
 }
 
@@ -133,6 +136,7 @@ type Mat4 = [[f32; 4]; 4];
 struct ControlVertex {
     clip_code: u8,
     z_screen: u32,
+    clip_w: Option<f32>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -144,7 +148,7 @@ struct Viewport {
 struct WalkState {
     family: GeometryWireFamily,
     segments: [u32; 16],
-    vertices: [ControlVertex; 64],
+    vertices: [ControlVertex; 128],
     projection: Option<Mat4>,
     modelview: Mat4,
     mvp: Option<Mat4>,
@@ -165,7 +169,7 @@ impl WalkState {
         Self {
             family,
             segments: [0; 16],
-            vertices: [ControlVertex::default(); 64],
+            vertices: [ControlVertex::default(); 128],
             projection: None,
             modelview: identity(),
             mvp: None,
@@ -186,7 +190,7 @@ impl WalkState {
         &mut self,
         loading_family: GeometryWireFamily,
     ) -> Result<(), RenderError> {
-        self.vertices = [ControlVertex::default(); 64];
+        self.vertices = [ControlVertex::default(); 128];
         self.rdp_half_1 = None;
         if loading_family.is_legacy_loadable() {
             if !self.return_stack.is_empty() {
@@ -380,6 +384,33 @@ fn walk(
                     }
                 }
             }
+            G_BRANCH_Z if state.family == GeometryWireFamily::F3dzex2 => {
+                let slot = ((w0 >> 1) & 0x7f) as usize;
+                if slot >= state.family.cache_capacity() {
+                    return Err(reject(format!(
+                        "{} G_BRANCH_W selects out-of-range cache slot {slot}",
+                        state.family.name()
+                    )));
+                }
+                let clip_w = state.vertices[slot].clip_w.ok_or_else(|| {
+                    reject(format!(
+                        "{} G_BRANCH_W selects unloaded cache slot {slot}",
+                        state.family.name()
+                    ))
+                })?;
+                if !clip_w.is_finite() {
+                    return Err(reject(format!(
+                        "{} G_BRANCH_W cache slot {slot} has non-finite transformed W",
+                        state.family.name()
+                    )));
+                }
+                if policy.force_branch || clip_w < w1 as f32 {
+                    let target = state.rdp_half_1.ok_or_else(|| {
+                        reject("G_BRANCH_W reached without a preceding G_RDPHALF_1 target")
+                    })?;
+                    pc = resolve_branch_w_target(&state.segments, target, rdram.len())?;
+                }
+            }
             G_BRANCH_Z => {
                 let encoded_vertex = ((w0 >> 12) & 0x0fff) as usize;
                 let encoded_z = (w0 & 0x0fff) as usize;
@@ -518,9 +549,6 @@ fn normalize_command(
     w1: u32,
     pc: usize,
 ) -> Result<(u32, u32), RenderError> {
-    if family.has_unpublished_wire() {
-        return Err(reject_unsupported("F3DZEX2 command wire is not admitted"));
-    }
     if is_modern(family) {
         return Ok((w0, w1));
     }
@@ -757,6 +785,7 @@ fn is_modern(family: GeometryWireFamily) -> bool {
             | GeometryWireFamily::F3dex2NoN
             | GeometryWireFamily::F3dex2Rej
             | GeometryWireFamily::F3dlx2Rej
+            | GeometryWireFamily::F3dzex2
             | GeometryWireFamily::L3dex2
     )
 }
@@ -969,10 +998,19 @@ fn pop_matrix(w0: u32, w1: u32, state: &mut WalkState) -> Result<(), RenderError
 
 fn project_vertex(state: &WalkState, x: f32, y: f32, z: f32) -> Result<ControlVertex, RenderError> {
     if state.persp_normalize == Some(0) {
-        return Ok(ControlVertex::default());
+        return Ok(ControlVertex {
+            clip_w: Some(0.0),
+            ..ControlVertex::default()
+        });
     }
     let Some(mvp) = state.mvp else {
-        return Ok(ControlVertex::default());
+        // The decoder's raw-fixture path has no explicit matrix commands,
+        // which is the identity transform and therefore homogeneous W=1.
+        // Loaded state must remain distinct from an untouched cache slot.
+        return Ok(ControlVertex {
+            clip_w: Some(1.0),
+            ..ControlVertex::default()
+        });
     };
     let clip = transform_point(&mvp, x, y, z);
     let clip_code = homogeneous_clip_code(clip);
@@ -985,6 +1023,7 @@ fn project_vertex(state: &WalkState, x: f32, y: f32, z: f32) -> Result<ControlVe
     Ok(ControlVertex {
         clip_code,
         z_screen: screen_depth_to_fixed(screen_z),
+        clip_w: Some(clip[3]),
     })
 }
 
@@ -1180,6 +1219,16 @@ fn resolve_addr(segments: &[u32; 16], address: u32) -> Result<usize, RenderError
     Ok(resolved as usize)
 }
 
+fn resolve_branch_w_target(
+    segments: &[u32; 16],
+    address: u32,
+    rdram_len: usize,
+) -> Result<usize, RenderError> {
+    let resolved = resolve_addr(segments, address)? & 0x00ff_fff8;
+    checked_range(resolved, 8, rdram_len, "G_BRANCH_W target")?;
+    Ok(resolved)
+}
+
 fn checked_range(
     start: usize,
     bytes: usize,
@@ -1352,6 +1401,40 @@ mod tests {
         fixture_for_family(GeometryWireFamily::F3dex2)
     }
 
+    fn walk_direct(
+        family: GeometryWireFamily,
+        commands: &[(u32, u32, u32)],
+        vertices: &[(usize, ControlVertex)],
+        policy: GeometryTaskInspectionPolicy,
+    ) -> Result<WalkState, RenderError> {
+        let mut rdram = vec![0; 0x9000];
+        for &(address, w0, w1) in commands {
+            write_command(&mut rdram, address, w0, w1);
+        }
+        let mut state = WalkState::new(family);
+        for &(slot, vertex) in vertices {
+            state.vertices[slot] = vertex;
+        }
+        walk(
+            &mut rdram,
+            &mut RspMemory::new(),
+            DL,
+            &GeometryUcodeCatalog::default(),
+            policy,
+            None,
+            &mut state,
+        )?;
+        Ok(state)
+    }
+
+    fn control_vertex(clip_w: f32, z_screen: u32) -> ControlVertex {
+        ControlVertex {
+            clip_code: 0,
+            z_screen,
+            clip_w: Some(clip_w),
+        }
+    }
+
     fn load_word(bytes: usize) -> u32 {
         (u32::from(G_LOAD_UCODE) << 24) | (bytes as u32 - 1)
     }
@@ -1493,6 +1576,281 @@ mod tests {
         assert_eq!(normal.admission_plan.len(), 1);
         assert_eq!(forced.full_sync_count, 0);
         assert_eq!(forced.admission_plan.len(), 2);
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_uses_strict_transformed_w_comparison() {
+        const TARGET: u32 = 0x1800;
+        const SLOT: usize = 5;
+        let commands = [
+            (DL, u32::from(G_RDPHALF_1) << 24, TARGET),
+            (
+                DL + 8,
+                (u32::from(G_BRANCH_Z) << 24) | ((SLOT as u32) << 1),
+                10,
+            ),
+            (DL + 16, u32::from(G_RDPFULLSYNC) << 24, 0),
+            (DL + 24, u32::from(G_ENDDL) << 24, 0),
+            (TARGET, u32::from(G_ENDDL) << 24, 0),
+        ];
+
+        for (clip_w, expected_full_syncs) in [(9.0, 0), (10.0, 1), (11.0, 1)] {
+            let state = walk_direct(
+                GeometryWireFamily::F3dzex2,
+                &commands,
+                &[(SLOT, control_vertex(clip_w, 0))],
+                GeometryTaskInspectionPolicy::default(),
+            )
+            .unwrap();
+            assert_eq!(state.full_sync_count, expected_full_syncs, "W={clip_w}");
+        }
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_uses_cpp_u32_to_f32_threshold_rounding() {
+        const SLOT: usize = 6;
+        let state = walk_direct(
+            GeometryWireFamily::F3dzex2,
+            &[
+                (
+                    DL,
+                    (u32::from(G_BRANCH_Z) << 24) | ((SLOT as u32) << 1),
+                    16_777_217,
+                ),
+                (DL + 8, u32::from(G_RDPFULLSYNC) << 24, 0),
+                (DL + 16, u32::from(G_ENDDL) << 24, 0),
+            ],
+            &[(SLOT, control_vertex(16_777_216.0, 0))],
+            GeometryTaskInspectionPolicy::default(),
+        )
+        .unwrap();
+
+        assert_eq!(16_777_217_u32 as f32, 16_777_216.0);
+        assert_eq!(state.full_sync_count, 1);
+    }
+
+    #[test]
+    fn f3dzex2_forced_branch_takes_after_validating_the_vertex() {
+        const TARGET: u32 = 0x1800;
+        const SLOT: usize = 7;
+        let state = walk_direct(
+            GeometryWireFamily::F3dzex2,
+            &[
+                (DL, u32::from(G_RDPHALF_1) << 24, TARGET),
+                (
+                    DL + 8,
+                    (u32::from(G_BRANCH_Z) << 24) | ((SLOT as u32) << 1),
+                    10,
+                ),
+                (DL + 16, u32::from(G_RDPFULLSYNC) << 24, 0),
+                (DL + 24, u32::from(G_ENDDL) << 24, 0),
+                (TARGET, u32::from(G_ENDDL) << 24, 0),
+            ],
+            &[(SLOT, control_vertex(11.0, 0))],
+            GeometryTaskInspectionPolicy { force_branch: true },
+        )
+        .unwrap();
+        assert_eq!(state.full_sync_count, 0);
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_ignores_bits_23_through_8_and_bit_zero() {
+        const TARGET: u32 = 0x1800;
+        const SLOT: usize = 5;
+        let state = walk_direct(
+            GeometryWireFamily::F3dzex2,
+            &[
+                (DL, u32::from(G_RDPHALF_1) << 24, TARGET),
+                (
+                    DL + 8,
+                    (u32::from(G_BRANCH_Z) << 24) | 0x00ff_ff00 | ((SLOT as u32) << 1) | 1,
+                    10,
+                ),
+                (DL + 16, u32::from(G_RDPFULLSYNC) << 24, 0),
+                (DL + 24, u32::from(G_ENDDL) << 24, 0),
+                (TARGET, u32::from(G_ENDDL) << 24, 0),
+            ],
+            &[(SLOT, control_vertex(9.0, 0))],
+            GeometryTaskInspectionPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(state.full_sync_count, 0);
+    }
+
+    #[test]
+    fn f3dex2_branch_z_and_f3dzex2_branch_w_keep_opposite_fixture_paths() {
+        const TARGET: u32 = 0x1800;
+        const SLOT: usize = 1;
+        let branch = (u32::from(G_BRANCH_Z) << 24) | ((SLOT as u32 * 5) << 12) | (SLOT as u32 * 2);
+        let commands = [
+            (DL, u32::from(G_RDPHALF_1) << 24, TARGET),
+            (DL + 8, branch, 15),
+            (DL + 16, u32::from(G_RDPFULLSYNC) << 24, 0),
+            (DL + 24, u32::from(G_ENDDL) << 24, 0),
+            (TARGET, u32::from(G_ENDDL) << 24, 0),
+        ];
+        let vertex = control_vertex(10.0, 20);
+
+        let branch_z = walk_direct(
+            GeometryWireFamily::F3dex2,
+            &commands,
+            &[(SLOT, vertex)],
+            GeometryTaskInspectionPolicy::default(),
+        )
+        .unwrap();
+        let branch_w = walk_direct(
+            GeometryWireFamily::F3dzex2,
+            &commands,
+            &[(SLOT, vertex)],
+            GeometryTaskInspectionPolicy::default(),
+        )
+        .unwrap();
+
+        assert_eq!(branch_z.full_sync_count, 1);
+        assert_eq!(branch_w.full_sync_count, 0);
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_requires_half_1_only_on_a_taken_path() {
+        const SLOT: usize = 3;
+        let commands = [
+            (DL, (u32::from(G_BRANCH_Z) << 24) | ((SLOT as u32) << 1), 10),
+            (DL + 8, u32::from(G_RDPFULLSYNC) << 24, 0),
+            (DL + 16, u32::from(G_ENDDL) << 24, 0),
+        ];
+
+        let error = walk_direct(
+            GeometryWireFamily::F3dzex2,
+            &commands,
+            &[(SLOT, control_vertex(9.0, 0))],
+            GeometryTaskInspectionPolicy::default(),
+        )
+        .err()
+        .expect("taken BranchW without HALF_1 must fail");
+        assert!(error.to_string().contains("G_BRANCH_W"));
+        assert!(error.to_string().contains("G_RDPHALF_1"));
+
+        let state = walk_direct(
+            GeometryWireFamily::F3dzex2,
+            &commands,
+            &[(SLOT, control_vertex(10.0, 0))],
+            GeometryTaskInspectionPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(state.full_sync_count, 1);
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_rejects_unloaded_and_non_finite_vertices() {
+        const SLOT: usize = 127;
+        let commands = [(DL, (u32::from(G_BRANCH_Z) << 24) | ((SLOT as u32) << 1), 10)];
+
+        let unloaded = walk_direct(
+            GeometryWireFamily::F3dzex2,
+            &commands,
+            &[],
+            GeometryTaskInspectionPolicy::default(),
+        )
+        .err()
+        .expect("unloaded BranchW vertex must fail");
+        assert!(unloaded.to_string().contains("unloaded cache slot 127"));
+
+        let non_finite = walk_direct(
+            GeometryWireFamily::F3dzex2,
+            &commands,
+            &[(SLOT, control_vertex(f32::NAN, 0))],
+            GeometryTaskInspectionPolicy { force_branch: true },
+        )
+        .err()
+        .expect("non-finite BranchW vertex must fail");
+        assert!(non_finite.to_string().contains("non-finite transformed W"));
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_resolves_and_masks_segmented_tail_targets() {
+        const SLOT: usize = 2;
+        let state = walk_direct(
+            GeometryWireFamily::F3dzex2,
+            &[
+                (
+                    DL,
+                    (u32::from(G_MOVEWORD) << 24) | (u32::from(G_MW_SEGMENT) << 16) | 12,
+                    0x1003,
+                ),
+                (DL + 8, u32::from(G_RDPHALF_1) << 24, 0x0300_080a),
+                (
+                    DL + 16,
+                    (u32::from(G_BRANCH_Z) << 24) | ((SLOT as u32) << 1),
+                    10,
+                ),
+                (DL + 24, u32::from(G_ENDDL) << 24, 0),
+                (0x1808, u32::from(G_RDPFULLSYNC) << 24, 0),
+                (0x1810, u32::from(G_ENDDL) << 24, 0),
+            ],
+            &[(SLOT, control_vertex(9.0, 0))],
+            GeometryTaskInspectionPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(state.full_sync_count, 1);
+    }
+
+    #[test]
+    fn f3dzex2_branch_w_rejects_an_invalid_taken_target_immediately() {
+        const SLOT: usize = 4;
+        let error = walk_direct(
+            GeometryWireFamily::F3dzex2,
+            &[
+                (DL, u32::from(G_RDPHALF_1) << 24, 0x00ff_fff8),
+                (
+                    DL + 8,
+                    (u32::from(G_BRANCH_Z) << 24) | ((SLOT as u32) << 1),
+                    10,
+                ),
+            ],
+            &[(SLOT, control_vertex(9.0, 0))],
+            GeometryTaskInspectionPolicy::default(),
+        )
+        .err()
+        .expect("invalid BranchW target must fail");
+        assert!(error.to_string().contains("G_BRANCH_W target"));
+        assert!(error.to_string().contains("exceeds RDRAM length"));
+    }
+
+    #[test]
+    fn z_screen_modify_does_not_replace_f3dzex2_transformed_w() {
+        const SLOT: usize = 9;
+        let mut state = WalkState::new(GeometryWireFamily::F3dzex2);
+        state.vertices[SLOT] = control_vertex(12.25, 3);
+        modify_vertex(
+            (u32::from(G_MODIFYVTX) << 24)
+                | (u32::from(G_MWO_POINT_ZSCREEN) << 16)
+                | (SLOT as u32 * 2),
+            u32::MAX,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.vertices[SLOT].z_screen, u32::MAX);
+        assert_eq!(state.vertices[SLOT].clip_w, Some(12.25));
+    }
+
+    #[test]
+    fn projected_vertex_retains_homogeneous_w_for_f3dzex2_branching() {
+        let mut state = WalkState::new(GeometryWireFamily::F3dzex2);
+        let mut matrix = identity();
+        matrix[3][3] = 2.0;
+        state.mvp = Some(matrix);
+        state.viewport = Some(Viewport { sz: 1.0, tz: 0.0 });
+
+        let vertex = project_vertex(&state, 1.0, 2.0, 3.0).unwrap();
+        assert_eq!(vertex.clip_w, Some(2.0));
+
+        state.mvp = None;
+        let identity_vertex = project_vertex(&state, 1.0, 2.0, 3.0).unwrap();
+        assert_eq!(identity_vertex.clip_w, Some(1.0));
+
+        state.persp_normalize = Some(0);
+        let collapsed = project_vertex(&state, 1.0, 2.0, 3.0).unwrap();
+        assert_eq!(collapsed.clip_w, Some(0.0));
     }
 
     #[test]

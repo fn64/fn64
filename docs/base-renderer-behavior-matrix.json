@@ -102,22 +102,24 @@
       "category": "microcode",
       "title": "F3DZEX2, Wave, and other game-specific microcodes",
       "exactness": "bounded_reference",
-      "behavior": "These identities remain explicit non-aliasing HLE frontiers rather than being decoded as neighboring public GBIs. Unadmitted graphics images transactionally replay from untouched post-rspboot state through the manual-complete public RSP interpreter, and the accuracy policy can select that LLE path unconditionally before forwarding captured raw DPC work to the renderer.",
+      "behavior": "These identities remain explicit non-aliasing HLE frontiers rather than being decoded as neighboring public GBIs. F3DZEX2's pinned RT64 BranchW delta is implemented and adversarially separated from F3DEX2 BranchZ inside both control-flow walkers, but production admission remains closed while NoN, point lighting, self-load profile transitions, and end-to-end differentials are incomplete. Unadmitted graphics images transactionally replay from untouched post-rspboot state through the manual-complete public RSP interpreter, and the accuracy policy can select that LLE path unconditionally before forwarding captured raw DPC work to the renderer.",
       "evidence": [
         { "kind": "test", "path": "crates/fn64-abi/src/task_dispatch.rs", "needle": "fn graphics_hle_unsupported_fallback_records_then_replays_untouched_ucode_through_lle" },
         { "kind": "test", "path": "crates/fn64-abi/src/task_dispatch.rs", "needle": "fn graphics_lle_accuracy_policy_forwards_raw_dpc_without_hle_dispatch" },
         { "kind": "test", "path": "crates/fn64-abi/src/task_dispatch.rs", "needle": "fn direct_imem_graphics_task_starts_lle_at_pc_zero_without_rspboot_overlay" },
         { "kind": "test", "path": "crates/fn64-render/src/microcode.rs", "needle": "fn exact_pair_may_retain_f3dzex2_diagnostic_identity_without_hle_admission" },
+        { "kind": "test", "path": "crates/fn64-render/src/geometry_task_inspection.rs", "needle": "fn f3dzex2_branch_w_uses_strict_transformed_w_comparison" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn f3dzex2_branch_w_is_strict_across_below_equal_and_above_thresholds" },
         { "kind": "doc", "path": "crates/fn64-audio/RSP-ISA-COVERAGE.md", "needle": "The instruction-level model is therefore manual-complete." },
-        { "kind": "doc", "path": "crates/fn64-render-reference/F3DEX2-VARIANTS.md", "needle": "## 4. F3DZEX2 remains an explicit unsupported identity" },
+        { "kind": "doc", "path": "crates/fn64-render-reference/F3DEX2-VARIANTS.md", "needle": "## 4. F3DZEX2 remains an explicit unadmitted identity" },
         { "kind": "doc", "path": "docs/RT64-GAP-REGISTER.md", "needle": "Rej / line (L3DEX2) / Wave microcodes" }
       ],
       "blockers": [
-        { "kind": "allowed_spec", "detail": "No allowed complete wire specification currently defines the proprietary family-specific commands." },
+        { "kind": "allowed_spec", "detail": "Pinned MIT RT64 defines the software-parity BranchW and variant flags, but Nintendo-public/hardware-exact semantics remain unavailable and the remaining reserved family commands have no admitted definition." },
         { "kind": "hardware_trace", "detail": "The public instruction-level RSP model is not cycle-accurate: DMA completes synchronously, pipeline timing is collapsed to instruction boundaries, and exact RSP/RDP overlap remains unmeasured." },
         { "kind": "full_rom", "detail": "No representative F3DZEX2, Wave, or other game-specific full-task corpus proves the LLE path reaches BREAK, commits memory/status, and forwards every reached DRAM/XBUS DPC submission without unsupported behavior." }
       ],
-      "next_action": "Run representative F3DZEX2, Wave, and other game-specific full-task corpora through forced LLE with repeated DMEM/RDRAM/DPC evidence; obtain an allowed wire specification only before adding optional typed HLE acceleration."
+      "next_action": "Implement and differentially validate F3DZEX2 NoN, 2.08I/J point lighting, and typed self-load transitions before optional HLE admission; meanwhile run representative F3DZEX2, Wave, and other game-specific full-task corpora through forced LLE with repeated DMEM/RDRAM/DPC evidence."
     },
     {
       "id": "raw-dpc-command-envelope",

@@ -885,8 +885,16 @@ task calls out:
   variant-specific point-lighting capability. Its immutable raw pool remains
   the I/J discriminator because pinned RT64 exposes the same native flags for
   those two variants. This typed plumbing does not itself admit the F3DZEX2
-  command decoder: until BranchW, NoN, and point-lighting behavior pass their
-  separate gates, the catalog continues to select LLE.
+  command decoder: until NoN and point-lighting behavior pass their separate
+  gates, the catalog continues to select LLE.
+  Internally, the transactional inspector and reference decoder now share the
+  pinned BranchW control-flow rule: opcode `0x04` selects bits 1..7, validates
+  a loaded finite transformed W, compares it strictly with `float(u32 w1)`,
+  and on a taken/forced path resolves persistent HALF_1 before applying the
+  24-bit eight-byte command mask. Equality falls through and F3DEX2 retains
+  its distinct BranchZ packing/comparison. This mechanism is testable before
+  admission, but cannot execute in production until the variant profile also
+  governs NoN and point lighting.
   Native RT64 task submission returns a schema-checked result containing the
   plan identity, planned/observed generation counts, typed disposition and
   rejected generation, entry GBI availability, pre/post workload IDs, and
