@@ -749,6 +749,40 @@ green 2000 at swap #2620, with the blinking PRESS START at #2700**
 `/tmp/wm2000-title-press-start-LIVE.png`). Crash-free throughout.
 Workspace tests: 1364 passed / 0 failed.
 
+## IN PROGRESS (2026-07-21, ladder 3 "press START" rung): scripted input
+## works -- START leaves the title for the Rumble Pak notice
+
+Deterministic scripted controller input landed in the harness (this is
+the mechanism, see `src/main.rs`):
+
+- `WM2000_PRESS_START=<swap>[+<hold>]` -- hold START (0x1000) on port 0
+  from VI swap `<swap>` for `<hold>` swaps (default 10), then release.
+- `WM2000_INPUT_SCRIPT=<from>..<to>:<buttons_hex>[:<sx>:<sy>];...` --
+  general ranges (overlapping entries OR their buttons).
+- `WM2000_FB_DUMP_DIR` / `WM2000_TRACE_PATH` -- per-run output isolation
+  so parallel scripted runs never clobber each other.
+
+Everything is swap-count indexed (a pure function of virtual time), fed
+through the REAL input seam: `fn64_abi::set_controller_state` ->
+`PifModel::set_input` -> the PIF command-1 read-data response the game's
+own raw `__osSiRawStartDma` polls consume (NWXE never calls high-level
+`osCont*` read shims -- verified against the corpus). Determinism held:
+two runs of the same binary produce byte-identical frame PNGs at the
+same swap index.
+
+**Result so far:** START held over swaps 2640..2650 (title screen live
+on screen, PRESS START blinking) EXITS THE ATTRACT LOOP: by swap ~2660
+the PRESS START prompt is gone, and at ~2680 the game presents the
+post-title **"Rumble Pak supported. Insert a Rumble Pak now."** notice
+over the title art -- the documented pre-menu screen. Frames:
+`wm2000-title-start-pressed-swap2640.png`,
+`wm2000-rumble-pak-notice-swap2680.png` (parked in
+`/Users/jer/Code/wm2000-run/artifacts/`). The no-further-input control
+run shows the notice persisting 1,100+ swaps -- it does not appear to
+time out on its own under current pacing; a second scripted run
+(START, then A at 2820 to dismiss, A again at 3150 to descend into the
+menus) is the next probe.
+
 ## Superseded framing (2026-07-21, earlier): the fade's opaque black under-cover (game timeline, not blending)
 
 Presented frames are still the fade fill because the game's own DL
