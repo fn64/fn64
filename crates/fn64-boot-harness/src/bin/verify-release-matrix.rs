@@ -6,7 +6,7 @@ use fn64_boot_harness::{
     verify_release_matrix_with_private_series, ParsedUnsupportedJournal,
     PrivateReleaseSeriesReceipt, ReleaseGateReport, ReleaseMatrixManifest,
     ReleaseMatrixVerification, Rt64PlatformCase, Rt64PlatformTarget, VerifiedPrivateReleaseSeries,
-    VerifiedReleaseMatrix, VerifiedRt64PlatformCaseSeries,
+    VerifiedReleaseMatrix,
 };
 use std::{
     collections::BTreeSet,
@@ -129,21 +129,46 @@ fn run() -> Result<(), String> {
         evidence.push((report, journal));
     }
 
-    let verified_platform_series = platform_cases
-        .iter()
-        .map(|request| {
+    let private_series_refs = verified_private_series.iter().collect::<Vec<_>>();
+    if !platform_cases.is_empty() {
+        verify_matrix_without_platform_authority(&manifest, &evidence, &private_series_refs)
+            .map_err(|error| {
+                format!("preflight release matrix before RT64 platform cases: {error}")
+            })?;
+    }
+    let verified_platform_series = run_preflighted_platform_cases(
+        &platform_cases,
+        |request| {
             let bound = request
                 .private_series_ordinal
                 .checked_sub(1)
                 .and_then(|index| verified_private_series.get(index))
                 .ok_or_else(|| {
+                    missing_private_series_error(request, verified_private_series.len())
+                })?;
+            request
+                .case
+                .preflight_series_binding(
+                    request.target,
+                    &request.rt64_source_directory,
+                    bound,
+                    &evidence,
+                )
+                .map_err(|error| {
                     format!(
-                        "RT64 platform case {}:{} binds private-series ordinal {}, but only {} private series were supplied",
+                        "preflight RT64 platform case {}:{}: {error}",
                         request.target.id(),
-                        request.case.id(),
-                        request.private_series_ordinal,
-                        verified_private_series.len()
+                        request.case.id()
                     )
+                })
+        },
+        |request| {
+            let bound = request
+                .private_series_ordinal
+                .checked_sub(1)
+                .and_then(|index| verified_private_series.get(index))
+                .ok_or_else(|| {
+                    missing_private_series_error(request, verified_private_series.len())
                 })?;
             run_rt64_platform_case_series(
                 request.target,
@@ -158,10 +183,9 @@ fn run() -> Result<(), String> {
                     request.case.id()
                 )
             })
-        })
-        .collect::<Result<Vec<VerifiedRt64PlatformCaseSeries>, String>>()?;
+        },
+    )?;
 
-    let private_series_refs = verified_private_series.iter().collect::<Vec<_>>();
     let platform_series_refs = verified_platform_series.iter().collect::<Vec<_>>();
     let outcome = match (
         private_series_refs.is_empty(),
@@ -238,6 +262,40 @@ fn run() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn verify_matrix_without_platform_authority(
+    manifest: &ReleaseMatrixManifest,
+    evidence: &[(ReleaseGateReport, ParsedUnsupportedJournal)],
+    private_series: &[&VerifiedPrivateReleaseSeries],
+) -> Result<ReleaseMatrixVerification, fn64_boot_harness::ReleaseMatrixError> {
+    if private_series.is_empty() {
+        verify_release_matrix(manifest, evidence)
+    } else {
+        verify_release_matrix_with_private_series(manifest, evidence, private_series)
+    }
+}
+
+fn run_preflighted_platform_cases<T>(
+    requests: &[PlatformCaseRunRequest],
+    mut preflight: impl FnMut(&PlatformCaseRunRequest) -> Result<(), String>,
+    mut runner: impl FnMut(&PlatformCaseRunRequest) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
+    // Keep this as two loops: a later unbindable request must not be
+    // discovered only after an earlier request has spent its native series.
+    for request in requests {
+        preflight(request)?;
+    }
+    requests.iter().map(&mut runner).collect()
+}
+
+fn missing_private_series_error(request: &PlatformCaseRunRequest, supplied: usize) -> String {
+    format!(
+        "RT64 platform case {}:{} binds private-series ordinal {}, but only {supplied} private series were supplied",
+        request.target.id(),
+        request.case.id(),
+        request.private_series_ordinal,
+    )
 }
 
 fn load_and_verify_private_series(
@@ -456,6 +514,7 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     fn parse_normal(arguments: &[&str]) -> Result<NormalVerificationArguments, String> {
         let mut arguments = arguments.iter().map(OsString::from);
@@ -694,5 +753,45 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.contains("requires CONTRACT.json"), "{error}");
+    }
+
+    #[test]
+    fn unbindable_platform_request_invokes_no_native_runner() {
+        let requests = vec![
+            PlatformCaseRunRequest {
+                target: Rt64PlatformTarget::MacosMetal,
+                case: Rt64PlatformCase::BackendLifecycle,
+                rt64_source_directory: PathBuf::from("/private/pinned-rt64"),
+                private_series_ordinal: 1,
+            },
+            PlatformCaseRunRequest {
+                target: Rt64PlatformTarget::MacosMetal,
+                case: Rt64PlatformCase::ResolutionDownsample,
+                rt64_source_directory: PathBuf::from("/private/pinned-rt64"),
+                private_series_ordinal: 1,
+            },
+        ];
+        let preflights = Cell::new(0);
+        let native_runs = Cell::new(0);
+        let error = run_preflighted_platform_cases(
+            &requests,
+            |request| {
+                preflights.set(preflights.get() + 1);
+                if request.case == Rt64PlatformCase::ResolutionDownsample {
+                    Err("stale RT64 adapter source identity".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                native_runs.set(native_runs.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("stale RT64 adapter"));
+        assert_eq!(preflights.get(), 2);
+        assert_eq!(native_runs.get(), 0);
     }
 }
