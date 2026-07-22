@@ -123,7 +123,7 @@ generated artifact identity; it does not hash native pointers or depend on
 registration order.
 Mapped-interpreter destination observations deliberately retain no generated
 runner artifact. They are operational and differential evidence only, and
-remain ineligible for fixed-cycle release evidence under report schema v22;
+remain ineligible for fixed-cycle release evidence under report schema v23;
 artifact-identified mapped AOT observations carry their real artifact identity
 and are eligible; compatibility AOT without one is not.
 

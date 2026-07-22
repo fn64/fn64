@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::mmio::{AI_STATUS_BUSY, AI_STATUS_FULL};
+use crate::mmio::{AI_STATUS_BUSY, AI_STATUS_ENABLED, AI_STATUS_FULL};
 use crate::rdram::RdramAddr;
 use crate::rom::{DmaCompletion, DmaMemory, PiDma, PiDmaError, RomStorage};
 use crate::rsp::{RspMemAddr, RspMemory, RspMemoryBank, RspMemoryError, RSP_MEMORY_BANK_SIZE};
@@ -35,8 +35,26 @@ pub const PI_STATUS_DMA_BUSY: u32 = 1;
 pub const PI_STATUS_IO_BUSY: u32 = 1 << 1;
 pub const PI_STATUS_ERROR: u32 = 1 << 2;
 
+pub const DPC_STATUS_XBUS_DMEM_DMA: u32 = 1;
+pub const DPC_STATUS_FREEZE: u32 = 1 << 1;
+pub const DPC_STATUS_FLUSH: u32 = 1 << 2;
+pub const DPC_STATUS_CMD_BUSY: u32 = 1 << 6;
+pub const DPC_STATUS_DMA_BUSY: u32 = 1 << 8;
+pub const DPC_STATUS_END_VALID: u32 = 1 << 9;
+pub const DPC_STATUS_START_VALID: u32 = 1 << 10;
+
+const AI_DRAM_ADDR_MASK: u32 = 0x00ff_fff8;
+const AI_LEN_MASK: u32 = 0x0003_fff8;
+const AI_DACRATE_MASK: u32 = 0x0000_3fff;
+const AI_BITRATE_MASK: u32 = 0x0000_000f;
+const DPC_ADDR_MASK: u32 = 0x00ff_fff8;
+
 const MI_INTR_REG: MmioAddr = MmioAddr::new(0xA430_0008);
 const MI_INTR_MASK_REG: MmioAddr = MmioAddr::new(0xA430_000C);
+const DPC_START_REG: MmioAddr = MmioAddr::new(0xA410_0000);
+const DPC_END_REG: MmioAddr = MmioAddr::new(0xA410_0004);
+const DPC_CURRENT_REG: MmioAddr = MmioAddr::new(0xA410_0008);
+const DPC_STATUS_REG: MmioAddr = MmioAddr::new(0xA410_000C);
 const VI_STATUS_REG: MmioAddr = MmioAddr::new(0xA440_0000);
 const VI_ORIGIN_REG: MmioAddr = MmioAddr::new(0xA440_0004);
 const VI_INTR_REG: MmioAddr = MmioAddr::new(0xA440_000C);
@@ -44,6 +62,12 @@ const VI_CURRENT_REG: MmioAddr = MmioAddr::new(0xA440_0010);
 const VI_V_SYNC_REG: MmioAddr = MmioAddr::new(0xA440_0018);
 const VI_H_SYNC_REG: MmioAddr = MmioAddr::new(0xA440_001C);
 const VI_Y_SCALE_REG: MmioAddr = MmioAddr::new(0xA440_0034);
+const AI_DRAM_ADDR_REG: MmioAddr = MmioAddr::new(0xA450_0000);
+const AI_LEN_REG: MmioAddr = MmioAddr::new(0xA450_0004);
+const AI_CONTROL_REG: MmioAddr = MmioAddr::new(0xA450_0008);
+const AI_STATUS_REG: MmioAddr = MmioAddr::new(0xA450_000C);
+const AI_DACRATE_REG: MmioAddr = MmioAddr::new(0xA450_0010);
+const AI_BITRATE_REG: MmioAddr = MmioAddr::new(0xA450_0014);
 const SI_DRAM_ADDR_REG: MmioAddr = MmioAddr::new(0xA480_0000);
 const SI_PIF_ADDR_RD64B_REG: MmioAddr = MmioAddr::new(0xA480_0004);
 const SI_PIF_ADDR_WR64B_REG: MmioAddr = MmioAddr::new(0xA480_0010);
@@ -194,6 +218,41 @@ pub struct AiDmaRequest {
     pub dram_addr: RdramAddr,
     pub len: u32,
     pub sample_rate_hz: u32,
+}
+
+/// Physical command source selected when a DPC END write is accepted.
+/// XBUS reads the RSP's 4 KiB DMEM bank; ordinary submissions read the
+/// 24-bit RDRAM physical domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DpcSubmissionSource {
+    Rdram,
+    Dmem,
+}
+
+/// One renderer transaction owned by the device fabric until explicitly
+/// committed or cancelled. The token prevents a stale renderer result from
+/// advancing the CURRENT register of a later submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DpcSubmission {
+    pub token: u64,
+    pub source: DpcSubmissionSource,
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Host work made necessary by a successfully latched MMIO write.
+///
+/// The device mutation has already happened when this value is returned. A
+/// production caller must perform the named host action before allowing the
+/// guest to retire another instruction. In particular, a DPC request remains
+/// pending until its exact token is committed or cancelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "MMIO write effects must be handled before guest execution resumes"]
+pub enum DeviceMmioWriteEffect {
+    None,
+    AiFrequencyChanged { sample_rate_hz: u32 },
+    AiDmaStarted(AiDmaRequest),
+    DpcSubmissionRequested(DpcSubmission),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,29 +433,63 @@ pub enum DeviceTraceKind {
 /// Typed failure at the raw/shim device boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceFault {
-    UnalignedMmio { addr: MmioAddr },
-    UnmodeledMmioRead { addr: MmioAddr },
-    UnmodeledMmioWrite { addr: MmioAddr, value: u32 },
+    UnalignedMmio {
+        addr: MmioAddr,
+    },
+    UnmodeledMmioRead {
+        addr: MmioAddr,
+    },
+    UnmodeledMmioWrite {
+        addr: MmioAddr,
+        value: u32,
+    },
     PiBusy,
     AiFull,
+    AiDmaDisabled,
+    AiControlWhileBusy {
+        current: u32,
+        requested: u32,
+    },
     ZeroLengthAiDma,
     ZeroAiSampleRate,
+    AiClockUnconfigured,
     ZeroViInterval,
     SiBusy,
     SpBusy,
     SpNotRunning,
     SpDmaFull,
     SpDmaMemory(RspMemoryError),
-    SpDmaDramRangeOverflow { request: SpDmaRequest },
-    InvalidSpSemaphoreWrite { value: u32 },
+    SpDmaDramRangeOverflow {
+        request: SpDmaRequest,
+    },
+    InvalidSpSemaphoreWrite {
+        value: u32,
+    },
     SpTaskNotHalted,
-    InvalidSpTaskBootSize { size: u32 },
+    InvalidSpTaskBootSize {
+        size: u32,
+    },
     DpBusy,
+    InvalidDpcRange {
+        source: DpcSubmissionSource,
+        start: u32,
+        end: u32,
+    },
+    NoPendingDpcSubmission,
+    StaleDpcSubmission {
+        pending_token: u64,
+        received_token: u64,
+    },
     ZeroLengthPiDma,
-    PiLengthOverflow { encoded: u32 },
+    PiLengthOverflow {
+        encoded: u32,
+    },
     PiTransfer(PiDmaError),
     DeadlineOverflow,
-    TimeWentBack { now: Cycles, requested: Cycles },
+    TimeWentBack {
+        now: Cycles,
+        requested: Cycles,
+    },
 }
 
 impl fmt::Display for DeviceFault {
@@ -409,8 +502,17 @@ impl fmt::Display for DeviceFault {
             }
             Self::PiBusy => write!(f, "PI DMA start while the PI channel is busy"),
             Self::AiFull => write!(f, "AI DMA start while both FIFO slots are occupied"),
+            Self::AiDmaDisabled => write!(f, "AI DMA start while AI_CONTROL.DMA_ENABLE is clear"),
+            Self::AiControlWhileBusy { current, requested } => write!(
+                f,
+                "AI_CONTROL transition {current:#x}->{requested:#x} while the AI FIFO is active has no admitted hardware behavior"
+            ),
             Self::ZeroLengthAiDma => write!(f, "AI DMA length must be nonzero"),
             Self::ZeroAiSampleRate => write!(f, "AI DMA sample rate must be nonzero"),
+            Self::AiClockUnconfigured => write!(
+                f,
+                "AI DAC rate requires an IPL-selected television clock before guest execution"
+            ),
             Self::ZeroViInterval => write!(f, "VI field interval must be nonzero"),
             Self::SiBusy => write!(f, "SI DMA start while the SI channel is busy"),
             Self::SpBusy => write!(f, "RSP task start while SP is busy"),
@@ -431,6 +533,20 @@ impl fmt::Display for DeviceFault {
                 "SP task boot microcode size {size:#x} does not fit the 4 KiB IMEM bank"
             ),
             Self::DpBusy => write!(f, "graphics task start while DP is busy"),
+            Self::InvalidDpcRange { source, start, end } => write!(
+                f,
+                "invalid {source:?} DPC command range [{start:#010X}, {end:#010X})"
+            ),
+            Self::NoPendingDpcSubmission => {
+                write!(f, "DPC transaction completion without a pending submission")
+            }
+            Self::StaleDpcSubmission {
+                pending_token,
+                received_token,
+            } => write!(
+                f,
+                "DPC transaction token {received_token} does not own pending token {pending_token}"
+            ),
             Self::ZeroLengthPiDma => write!(f, "PI DMA length must be nonzero"),
             Self::PiLengthOverflow { encoded } => {
                 write!(f, "PI encoded DMA length {encoded:#010X} overflows")
@@ -461,6 +577,20 @@ struct PendingAi {
     request: AiDmaRequest,
     started_at: Cycles,
     deadline: Cycles,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DpcRegisters {
+    start: u32,
+    end: u32,
+    current: u32,
+    status: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingDpc {
+    submission: DpcSubmission,
+    rollback: DpcRegisters,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -520,6 +650,15 @@ pub struct PendingAiSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingDpcSnapshot {
+    pub submission: DpcSubmission,
+    pub rollback_start: u32,
+    pub rollback_end: u32,
+    pub rollback_current: u32,
+    pub rollback_status: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingSiSnapshot {
     pub token: u64,
     pub request: SiDmaRequest,
@@ -540,6 +679,10 @@ pub struct DeviceSnapshot {
     pub pi_status: u32,
     pub ai_status: u32,
     pub ai_length: u32,
+    pub ai_dram_addr: RdramAddr,
+    pub ai_control: u32,
+    pub ai_dacrate: u32,
+    pub ai_bitrate: u32,
     pub si_dram_addr: RdramAddr,
     pub si_status: u32,
     pub vi_current: u32,
@@ -553,6 +696,11 @@ pub struct DeviceSnapshot {
     pub sp_dram_addr: RdramAddr,
     pub sp_imem_generation: u64,
     pub dp_busy: bool,
+    pub dpc_start: u32,
+    pub dpc_end: u32,
+    pub dpc_current: u32,
+    pub dpc_status: u32,
+    pub pending_dpc: Option<DpcSubmission>,
     pub mi_pending: u32,
     pub mi_mask: u32,
     pub pi_domain1: PiDomainTiming,
@@ -572,6 +720,7 @@ pub struct DeviceEvidenceSnapshot {
     pub pending_pi: Option<PendingPiSnapshot>,
     pub current_ai: Option<PendingAiSnapshot>,
     pub queued_ai: Option<AiDmaRequest>,
+    pub pending_dpc: Option<PendingDpcSnapshot>,
     pub pending_si: Option<PendingSiSnapshot>,
     pub si_dma_error: bool,
     pub si_latency: Cycles,
@@ -609,8 +758,14 @@ pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
     pi_domain1: PiDomainTiming,
     pi_domain2: PiDomainTiming,
     pending_pi: Option<PendingPi>,
+    ai_dram_addr: RdramAddr,
+    ai_control: u32,
+    ai_dacrate: u32,
+    ai_bitrate: u32,
     current_ai: Option<PendingAi>,
     queued_ai: Option<AiDmaRequest>,
+    dpc: DpcRegisters,
+    pending_dpc: Option<PendingDpc>,
     si_dram_addr: RdramAddr,
     si_dma_error: bool,
     pending_si: Option<PendingSi>,
@@ -654,8 +809,19 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             pi_domain1: PiDomainTiming::default(),
             pi_domain2: PiDomainTiming::default(),
             pending_pi: None,
+            ai_dram_addr: RdramAddr::from_offset(0),
+            ai_control: 0,
+            ai_dacrate: 0,
+            ai_bitrate: 0,
             current_ai: None,
             queued_ai: None,
+            dpc: DpcRegisters {
+                start: 0,
+                end: 0,
+                current: 0,
+                status: 0,
+            },
+            pending_dpc: None,
             si_dram_addr: RdramAddr::from_offset(0),
             si_dma_error: false,
             pending_si: None,
@@ -725,6 +891,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             pi_status: self.pi_status,
             ai_status: self.ai_status(),
             ai_length: self.ai_length(),
+            ai_dram_addr: self.ai_dram_addr,
+            ai_control: self.ai_control,
+            ai_dacrate: self.ai_dacrate,
+            ai_bitrate: self.ai_bitrate,
             si_dram_addr: self.si_dram_addr,
             si_status: self.si_status(),
             vi_current: self.vi_current(),
@@ -737,7 +907,12 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             sp_mem_addr: self.sp_mem_addr,
             sp_dram_addr: self.sp_dram_addr,
             sp_imem_generation: self.rsp_memory.imem_generation(),
-            dp_busy: self.pending_dp.is_some(),
+            dp_busy: self.pending_dp.is_some() || self.pending_dpc.is_some(),
+            dpc_start: self.dpc.start,
+            dpc_end: self.dpc.end,
+            dpc_current: self.dpc.current,
+            dpc_status: self.dpc.status,
+            pending_dpc: self.pending_dpc.map(|pending| pending.submission),
             mi_pending: self.mi_pending,
             mi_mask: self.mi_mask,
             pi_domain1: self.pi_domain1,
@@ -788,6 +963,13 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 deadline: pending.deadline,
             }),
             queued_ai: self.queued_ai,
+            pending_dpc: self.pending_dpc.map(|pending| PendingDpcSnapshot {
+                submission: pending.submission,
+                rollback_start: pending.rollback.start,
+                rollback_end: pending.rollback.end,
+                rollback_current: pending.rollback.current,
+                rollback_status: pending.rollback.status,
+            }),
             pending_si: self.pending_si.map(|pending| PendingSiSnapshot {
                 token: pending.token,
                 request: pending.request,
@@ -935,6 +1117,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 
     pub const fn ai_status(&self) -> u32 {
         let mut status = 0;
+        if self.ai_control & 1 != 0 {
+            status |= AI_STATUS_ENABLED;
+        }
         if self.current_ai.is_some() {
             status |= AI_STATUS_BUSY;
         }
@@ -942,6 +1127,30 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             status |= AI_STATUS_FULL;
         }
         status
+    }
+
+    pub const fn ai_dram_addr(&self) -> RdramAddr {
+        self.ai_dram_addr
+    }
+
+    pub const fn ai_control(&self) -> u32 {
+        self.ai_control
+    }
+
+    pub const fn ai_dacrate(&self) -> u32 {
+        self.ai_dacrate
+    }
+
+    pub const fn ai_bitrate(&self) -> u32 {
+        self.ai_bitrate
+    }
+
+    /// True sample rate selected by the latched DAC period and the IPL-owned
+    /// television clock. Production may not guess NTSC when boot has not
+    /// established that clock authority.
+    pub fn ai_sample_rate_hz(&self) -> Result<u32, DeviceFault> {
+        let tv_type = self.tv_type.ok_or(DeviceFault::AiClockUnconfigured)?;
+        Ok(tv_type.vi_clock_hz() / (self.ai_dacrate + 1))
     }
 
     /// Guest-visible bytes remaining in the active DMA. The device fabric is
@@ -956,6 +1165,119 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         let remaining = (u128::from(current.request.len) * u128::from(remaining_cycles))
             .div_ceil(u128::from(duration));
         u32::try_from(remaining).expect("AI remaining length exceeds u32")
+    }
+
+    pub const fn pending_dpc_submission(&self) -> Option<DpcSubmission> {
+        match self.pending_dpc {
+            Some(pending) => Some(pending.submission),
+            None => None,
+        }
+    }
+
+    fn validate_dpc_range(
+        source: DpcSubmissionSource,
+        start: u32,
+        end: u32,
+    ) -> Result<(), DeviceFault> {
+        let upper_bound = match source {
+            DpcSubmissionSource::Rdram => 0x0100_0000,
+            DpcSubmissionSource::Dmem => RSP_MEMORY_BANK_SIZE as u32,
+        };
+        if !start.is_multiple_of(8) || !end.is_multiple_of(8) || start >= end || end > upper_bound {
+            return Err(DeviceFault::InvalidDpcRange { source, start, end });
+        }
+        Ok(())
+    }
+
+    fn begin_dpc_submission(
+        &mut self,
+        source: DpcSubmissionSource,
+        start: u32,
+        end: u32,
+        rollback: DpcRegisters,
+    ) -> Result<DpcSubmission, DeviceFault> {
+        if self.pending_dpc.is_some() {
+            return Err(DeviceFault::DpBusy);
+        }
+        Self::validate_dpc_range(source, start, end)?;
+        let token = self.next_event_sequence;
+        self.next_event_sequence = self
+            .next_event_sequence
+            .checked_add(1)
+            .ok_or(DeviceFault::DeadlineOverflow)?;
+        let submission = DpcSubmission {
+            token,
+            source,
+            start,
+            end,
+        };
+        self.dpc.status &= !DPC_STATUS_START_VALID;
+        self.dpc.status |= DPC_STATUS_END_VALID | DPC_STATUS_DMA_BUSY | DPC_STATUS_CMD_BUSY;
+        self.pending_dpc = Some(PendingDpc {
+            submission,
+            rollback,
+        });
+        Ok(submission)
+    }
+
+    /// Begin one renderer transaction through the same state used by raw
+    /// START/END MMIO. The range is not architecturally consumed until the
+    /// renderer returns and the caller commits this exact token.
+    pub fn request_dpc_submission(
+        &mut self,
+        source: DpcSubmissionSource,
+        start: u32,
+        end: u32,
+    ) -> Result<DpcSubmission, DeviceFault> {
+        if self.pending_dpc.is_some() {
+            return Err(DeviceFault::DpBusy);
+        }
+        Self::validate_dpc_range(source, start, end)?;
+        let rollback = self.dpc;
+        self.dpc.start = start;
+        self.dpc.end = end;
+        self.dpc.current = start;
+        match source {
+            DpcSubmissionSource::Rdram => self.dpc.status &= !DPC_STATUS_XBUS_DMEM_DMA,
+            DpcSubmissionSource::Dmem => self.dpc.status |= DPC_STATUS_XBUS_DMEM_DMA,
+        }
+        self.begin_dpc_submission(source, start, end, rollback)
+    }
+
+    /// Commit renderer acceptance. CURRENT advances only here, after the
+    /// selected backend has consumed the submitted bytes.
+    pub fn commit_dpc_submission(&mut self, token: u64) -> Result<(), DeviceFault> {
+        let pending = self
+            .pending_dpc
+            .ok_or(DeviceFault::NoPendingDpcSubmission)?;
+        if pending.submission.token != token {
+            return Err(DeviceFault::StaleDpcSubmission {
+                pending_token: pending.submission.token,
+                received_token: token,
+            });
+        }
+        self.dpc.current = pending.submission.end;
+        self.dpc.status &= !(DPC_STATUS_END_VALID | DPC_STATUS_DMA_BUSY | DPC_STATUS_CMD_BUSY);
+        self.pending_dpc = None;
+        Ok(())
+    }
+
+    /// Roll back every register mutation made while accepting a renderer
+    /// transaction. This closes the interleaving where a backend rejection
+    /// could otherwise consume START_VALID or advance a range that never ran.
+    pub fn cancel_dpc_submission(&mut self, token: u64) -> Result<(), DeviceFault> {
+        let pending = self
+            .pending_dpc
+            .ok_or(DeviceFault::NoPendingDpcSubmission)?;
+        if pending.submission.token != token {
+            return Err(DeviceFault::StaleDpcSubmission {
+                pending_token: pending.submission.token,
+                received_token: token,
+            });
+        }
+        self.dpc = pending.rollback;
+        self.pending_dpc = None;
+        Ok(())
     }
 
     pub const fn si_status(&self) -> u32 {
@@ -1183,18 +1505,23 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// Timing uses the N64 CPU clock and four bytes per stereo 16-bit frame;
     /// the explicit ceiling prevents a nonempty buffer from completing early.
     pub fn start_ai_dma(&mut self, request: AiDmaRequest) -> Result<(), DeviceFault> {
+        if self.ai_control & 1 == 0 {
+            return Err(DeviceFault::AiDmaDisabled);
+        }
         if request.len == 0 {
             return Err(DeviceFault::ZeroLengthAiDma);
         }
         if request.sample_rate_hz == 0 {
             return Err(DeviceFault::ZeroAiSampleRate);
         }
+        if self.current_ai.is_some() && self.queued_ai.is_some() {
+            return Err(DeviceFault::AiFull);
+        }
+        self.ai_dram_addr = request.dram_addr;
         if self.current_ai.is_none() {
             self.begin_ai_dma(request, self.now)?;
-        } else if self.queued_ai.is_none() {
-            self.queued_ai = Some(request);
         } else {
-            return Err(DeviceFault::AiFull);
+            self.queued_ai = Some(request);
         }
         Ok(())
     }
@@ -1531,27 +1858,41 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         Ok(())
     }
 
-    /// Schedule the DP interrupt generated by a raw CPU/RSP DPC range that
-    /// reached FullSync without starting a new SP task.
-    pub fn start_dp_full_sync(&mut self, latency: Cycles) -> Result<(), DeviceFault> {
+    /// Prove that one raw FullSync can reserve the sole DP completion slot.
+    /// This is nonmutating so a renderer can be rejected before it observes
+    /// or changes guest memory.
+    pub fn preflight_dp_full_sync(&self, latency: Cycles) -> Result<(), DeviceFault> {
         assert!(latency.get() > 0, "DP FullSync latency must be nonzero");
         // Interleaving closed here: CPU thread A may submit a second raw DPC
-        // FullSync after rendering has committed but before thread B services
-        // the first DP event. One hardware DP completion slot cannot identify
-        // both interrupts, so reject the second submission before allocating
-        // an event token instead of overwriting or coalescing the first.
+        // FullSync before thread B services the first DP event. The synchronous
+        // renderer path calls this before backend entry, and the single-owner
+        // dispatcher cannot advance devices until it either commits or
+        // unwinds, so the checked slot/deadline/token remain available.
         if self.pending_dp.is_some() {
             return Err(DeviceFault::DpBusy);
         }
+        self.now
+            .checked_add(latency)
+            .ok_or(DeviceFault::DeadlineOverflow)?;
+        self.next_event_sequence
+            .checked_add(1)
+            .ok_or(DeviceFault::DeadlineOverflow)?;
+        Ok(())
+    }
+
+    /// Schedule the DP interrupt generated by a raw CPU/RSP DPC range that
+    /// reached FullSync without starting a new SP task.
+    pub fn start_dp_full_sync(&mut self, latency: Cycles) -> Result<(), DeviceFault> {
+        self.preflight_dp_full_sync(latency)?;
         let deadline = self
             .now
             .checked_add(latency)
-            .ok_or(DeviceFault::DeadlineOverflow)?;
+            .expect("DP FullSync deadline was preflighted");
         let token = self.next_event_sequence;
         self.next_event_sequence = self
             .next_event_sequence
             .checked_add(1)
-            .ok_or(DeviceFault::DeadlineOverflow)?;
+            .expect("DP FullSync event token was preflighted");
         self.pending_dp = Some(token);
         self.events
             .insert((deadline, token), DeviceEvent::Dp { token });
@@ -1578,6 +1919,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 Ok(previous)
             }
             SP_PC_REG => Ok(self.sp_pc),
+            DPC_START_REG => Ok(self.dpc.start),
+            DPC_END_REG => Ok(self.dpc.end),
+            DPC_CURRENT_REG => Ok(self.dpc.current),
+            DPC_STATUS_REG => Ok(self.dpc.status),
             MI_INTR_REG => Ok(self.mi_pending),
             MI_INTR_MASK_REG => Ok(self.mi_mask),
             VI_CURRENT_REG => Ok(self.vi_current()),
@@ -1585,6 +1930,12 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 let index = ((addr.get() - VI_STATUS_REG.get()) / 4) as usize;
                 Ok(self.vi_registers[index])
             }
+            AI_DRAM_ADDR_REG => Ok(self.ai_dram_addr.offset()),
+            AI_LEN_REG => Ok(self.ai_length()),
+            AI_CONTROL_REG => Ok(self.ai_control),
+            AI_STATUS_REG => Ok(self.ai_status()),
+            AI_DACRATE_REG => Ok(self.ai_dacrate),
+            AI_BITRATE_REG => Ok(self.ai_bitrate),
             PI_DRAM_ADDR_REG => Ok(self.pi_dram_addr.offset()),
             PI_CART_ADDR_REG => Ok(self.pi_cart_addr),
             PI_STATUS_REG => Ok(self.pi_status),
@@ -1602,8 +1953,115 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         }
     }
 
-    pub fn write_mmio(&mut self, addr: MmioAddr, value: u32) -> Result<(), DeviceFault> {
+    pub fn write_mmio(
+        &mut self,
+        addr: MmioAddr,
+        value: u32,
+    ) -> Result<DeviceMmioWriteEffect, DeviceFault> {
         self.validate_mmio(addr)?;
+        match addr {
+            AI_DRAM_ADDR_REG => {
+                self.ai_dram_addr = RdramAddr::from_offset(value & AI_DRAM_ADDR_MASK);
+                return Ok(DeviceMmioWriteEffect::None);
+            }
+            AI_LEN_REG => {
+                let request = AiDmaRequest {
+                    dram_addr: self.ai_dram_addr,
+                    len: value & AI_LEN_MASK,
+                    sample_rate_hz: self.ai_sample_rate_hz()?,
+                };
+                self.start_ai_dma(request)?;
+                return Ok(DeviceMmioWriteEffect::AiDmaStarted(request));
+            }
+            AI_CONTROL_REG => {
+                let requested = value & 1;
+                if requested != self.ai_control
+                    && (self.current_ai.is_some() || self.queued_ai.is_some())
+                {
+                    return Err(DeviceFault::AiControlWhileBusy {
+                        current: self.ai_control,
+                        requested,
+                    });
+                }
+                self.ai_control = requested;
+                return Ok(DeviceMmioWriteEffect::None);
+            }
+            AI_STATUS_REG => {
+                self.clear_interrupt(InterruptSource::Ai);
+                return Ok(DeviceMmioWriteEffect::None);
+            }
+            AI_DACRATE_REG => {
+                let dacrate = value & AI_DACRATE_MASK;
+                let tv_type = self.tv_type.ok_or(DeviceFault::AiClockUnconfigured)?;
+                self.ai_dacrate = dacrate;
+                return Ok(DeviceMmioWriteEffect::AiFrequencyChanged {
+                    sample_rate_hz: tv_type.vi_clock_hz() / (dacrate + 1),
+                });
+            }
+            AI_BITRATE_REG => {
+                self.ai_bitrate = value & AI_BITRATE_MASK;
+                return Ok(DeviceMmioWriteEffect::None);
+            }
+            DPC_START_REG => {
+                if self.pending_dpc.is_some() {
+                    return Err(DeviceFault::DpBusy);
+                }
+                if self.dpc.status & DPC_STATUS_START_VALID == 0 {
+                    self.dpc.start = value & DPC_ADDR_MASK;
+                    self.dpc.status |= DPC_STATUS_START_VALID;
+                }
+                return Ok(DeviceMmioWriteEffect::None);
+            }
+            DPC_END_REG => {
+                if self.pending_dpc.is_some() {
+                    return Err(DeviceFault::DpBusy);
+                }
+                let rollback = self.dpc;
+                let end = value & DPC_ADDR_MASK;
+                let start = if self.dpc.status & DPC_STATUS_START_VALID != 0 {
+                    self.dpc.start
+                } else {
+                    self.dpc.current
+                };
+                if start == end {
+                    self.dpc.end = end;
+                    self.dpc.current = start;
+                    self.dpc.status &= !DPC_STATUS_START_VALID;
+                    return Ok(DeviceMmioWriteEffect::None);
+                }
+                let source = if self.dpc.status & DPC_STATUS_XBUS_DMEM_DMA != 0 {
+                    DpcSubmissionSource::Dmem
+                } else {
+                    DpcSubmissionSource::Rdram
+                };
+                Self::validate_dpc_range(source, start, end)?;
+                self.dpc.end = end;
+                self.dpc.current = start;
+                let submission = self.begin_dpc_submission(source, start, end, rollback)?;
+                return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested(submission));
+            }
+            DPC_CURRENT_REG => {
+                return Err(DeviceFault::UnmodeledMmioWrite { addr, value });
+            }
+            DPC_STATUS_REG => {
+                apply_device_clear_set_pair(
+                    &mut self.dpc.status,
+                    value,
+                    0,
+                    1,
+                    DPC_STATUS_XBUS_DMEM_DMA,
+                );
+                apply_device_clear_set_pair(&mut self.dpc.status, value, 2, 3, DPC_STATUS_FREEZE);
+                apply_device_clear_set_pair(&mut self.dpc.status, value, 4, 5, DPC_STATUS_FLUSH);
+                return Ok(DeviceMmioWriteEffect::None);
+            }
+            _ => {}
+        }
+        self.write_mmio_without_effect(addr, value)?;
+        Ok(DeviceMmioWriteEffect::None)
+    }
+
+    fn write_mmio_without_effect(&mut self, addr: MmioAddr, value: u32) -> Result<(), DeviceFault> {
         match addr {
             addr if (SP_DMEM_START..SP_IMEM_END).contains(&addr.get()) => self
                 .rsp_memory
@@ -2032,6 +2490,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 }
 
 #[cfg(test)]
+#[allow(unused_must_use)]
 mod tests {
     use super::*;
     use crate::rdram::Rdram;
@@ -2059,6 +2518,201 @@ mod tests {
             PiDma::new(InMemoryRom::new(rom)),
             TestTiming(Cycles::new(12)),
         )
+    }
+
+    #[test]
+    fn raw_ai_registers_derive_one_fifo_request_from_the_authoritative_tv_clock() {
+        let mut fabric = fabric();
+        assert_eq!(
+            fabric.write_mmio(AI_DACRATE_REG, 151),
+            Err(DeviceFault::AiClockUnconfigured),
+            "raw AI programming must not guess an NTSC clock before IPL configuration"
+        );
+        assert_eq!(fabric.ai_dacrate(), 0);
+
+        fabric.configure_tv_type(TvType::Ntsc).unwrap();
+        let sample_rate_hz = TvType::Ntsc.vi_clock_hz() / 152;
+        assert_eq!(
+            fabric.write_mmio(AI_DACRATE_REG, 151).unwrap(),
+            DeviceMmioWriteEffect::AiFrequencyChanged { sample_rate_hz }
+        );
+        assert_eq!(
+            fabric.write_mmio(AI_DRAM_ADDR_REG, 0x01ff_123f).unwrap(),
+            DeviceMmioWriteEffect::None
+        );
+        fabric.write_mmio(AI_CONTROL_REG, u32::MAX).unwrap();
+        fabric.write_mmio(AI_BITRATE_REG, 0x25).unwrap();
+        let request = AiDmaRequest {
+            dram_addr: RdramAddr::from_offset(0x00ff_1238),
+            len: 0x80,
+            sample_rate_hz,
+        };
+        assert_eq!(
+            fabric.write_mmio(AI_LEN_REG, 0x87).unwrap(),
+            DeviceMmioWriteEffect::AiDmaStarted(request)
+        );
+        assert_eq!(fabric.read_mmio(AI_DRAM_ADDR_REG).unwrap(), 0x00ff_1238);
+        assert_eq!(fabric.read_mmio(AI_CONTROL_REG).unwrap(), 1);
+        assert_eq!(fabric.read_mmio(AI_DACRATE_REG).unwrap(), 151);
+        assert_eq!(fabric.read_mmio(AI_BITRATE_REG).unwrap(), 5);
+        assert_eq!(fabric.read_mmio(AI_LEN_REG).unwrap(), 0x80);
+        assert_eq!(
+            fabric.read_mmio(AI_STATUS_REG).unwrap(),
+            AI_STATUS_ENABLED | AI_STATUS_BUSY
+        );
+
+        fabric.raise_interrupt(InterruptSource::Ai);
+        fabric.write_mmio(AI_STATUS_REG, u32::MAX).unwrap();
+        assert!(!fabric.interrupt_pending(InterruptSource::Ai));
+        assert_eq!(fabric.pending_dpc_submission(), None);
+    }
+
+    #[test]
+    fn raw_dpc_end_is_transactional_and_does_not_replay_after_commit() {
+        let mut fabric = fabric();
+        fabric.write_mmio(DPC_START_REG, 0x103).unwrap();
+        let before_end = fabric.snapshot();
+        let first = match fabric.write_mmio(DPC_END_REG, 0x147).unwrap() {
+            DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => submission,
+            other => panic!("DPC END did not request renderer work: {other:?}"),
+        };
+        assert_eq!(first.source, DpcSubmissionSource::Rdram);
+        assert_eq!((first.start, first.end), (0x100, 0x140));
+        assert_eq!(fabric.read_mmio(DPC_CURRENT_REG).unwrap(), 0x100);
+        assert_eq!(
+            fabric.read_mmio(DPC_STATUS_REG).unwrap()
+                & (DPC_STATUS_DMA_BUSY | DPC_STATUS_CMD_BUSY | DPC_STATUS_END_VALID),
+            DPC_STATUS_DMA_BUSY | DPC_STATUS_CMD_BUSY | DPC_STATUS_END_VALID
+        );
+        assert_eq!(
+            fabric.write_mmio(DPC_END_REG, 0x140),
+            Err(DeviceFault::DpBusy)
+        );
+        assert!(matches!(
+            fabric.commit_dpc_submission(first.token + 1),
+            Err(DeviceFault::StaleDpcSubmission { .. })
+        ));
+
+        fabric.cancel_dpc_submission(first.token).unwrap();
+        let cancelled = fabric.snapshot();
+        assert_eq!(cancelled.dpc_start, before_end.dpc_start);
+        assert_eq!(cancelled.dpc_end, before_end.dpc_end);
+        assert_eq!(cancelled.dpc_current, before_end.dpc_current);
+        assert_eq!(cancelled.dpc_status, before_end.dpc_status);
+
+        let retry = match fabric.write_mmio(DPC_END_REG, 0x140).unwrap() {
+            DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => submission,
+            other => panic!("cancelled DPC END was not retryable: {other:?}"),
+        };
+        fabric.commit_dpc_submission(retry.token).unwrap();
+        assert_eq!(fabric.read_mmio(DPC_CURRENT_REG).unwrap(), 0x140);
+        assert_eq!(fabric.pending_dpc_submission(), None);
+
+        assert_eq!(
+            fabric.write_mmio(DPC_END_REG, 0x140).unwrap(),
+            DeviceMmioWriteEffect::None,
+            "repeating the committed END pointer must not replay the range"
+        );
+        let extension = match fabric.write_mmio(DPC_END_REG, 0x180).unwrap() {
+            DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => submission,
+            other => panic!("DPC END extension did not request renderer work: {other:?}"),
+        };
+        assert_eq!((extension.start, extension.end), (0x140, 0x180));
+    }
+
+    #[test]
+    fn empty_dpc_start_end_pair_sets_the_extension_origin() {
+        let mut fabric = fabric();
+        fabric.write_mmio(DPC_START_REG, 0x100).unwrap();
+
+        assert_eq!(
+            fabric.write_mmio(DPC_END_REG, 0x100).unwrap(),
+            DeviceMmioWriteEffect::None
+        );
+        assert_eq!(fabric.read_mmio(DPC_CURRENT_REG).unwrap(), 0x100);
+        assert_eq!(
+            fabric.read_mmio(DPC_STATUS_REG).unwrap() & DPC_STATUS_START_VALID,
+            0
+        );
+
+        let extension = match fabric.write_mmio(DPC_END_REG, 0x108).unwrap() {
+            DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => submission,
+            other => panic!("DPC END extension did not request renderer work: {other:?}"),
+        };
+        assert_eq!((extension.start, extension.end), (0x100, 0x108));
+    }
+
+    #[test]
+    fn dpc_status_commands_select_xbus_without_overwriting_transaction_bits() {
+        let mut fabric = fabric();
+        fabric
+            .write_mmio(DPC_STATUS_REG, 0x02 | 0x08 | 0x20)
+            .unwrap();
+        assert_eq!(
+            fabric.read_mmio(DPC_STATUS_REG).unwrap(),
+            DPC_STATUS_XBUS_DMEM_DMA | DPC_STATUS_FREEZE | DPC_STATUS_FLUSH
+        );
+        fabric.write_mmio(DPC_START_REG, 0x20).unwrap();
+        let submission = match fabric.write_mmio(DPC_END_REG, 0x40).unwrap() {
+            DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => submission,
+            other => panic!("XBUS END did not request renderer work: {other:?}"),
+        };
+        assert_eq!(submission.source, DpcSubmissionSource::Dmem);
+        assert_ne!(
+            fabric.read_mmio(DPC_STATUS_REG).unwrap() & DPC_STATUS_DMA_BUSY,
+            0
+        );
+        fabric
+            .write_mmio(DPC_STATUS_REG, 0x01 | 0x04 | 0x10)
+            .unwrap();
+        assert_eq!(
+            fabric.read_mmio(DPC_STATUS_REG).unwrap()
+                & (DPC_STATUS_XBUS_DMEM_DMA | DPC_STATUS_FREEZE | DPC_STATUS_FLUSH),
+            0
+        );
+        assert_ne!(
+            fabric.read_mmio(DPC_STATUS_REG).unwrap()
+                & (DPC_STATUS_DMA_BUSY | DPC_STATUS_END_VALID),
+            0,
+            "status mode commands cannot consume the renderer transaction"
+        );
+    }
+
+    #[test]
+    fn dpc_source_domains_reject_wrapped_or_out_of_range_command_bytes() {
+        let mut fabric = fabric();
+        for (source, start, end) in [
+            (DpcSubmissionSource::Dmem, 0x0ff8, 0x1008),
+            (DpcSubmissionSource::Dmem, 0x0800, 0x0400),
+            (DpcSubmissionSource::Rdram, 0x00ff_fff8, 0x0100_0008),
+            (DpcSubmissionSource::Rdram, 0x0100, 0x0104),
+        ] {
+            assert_eq!(
+                fabric.request_dpc_submission(source, start, end),
+                Err(DeviceFault::InvalidDpcRange { source, start, end })
+            );
+            assert_eq!(fabric.pending_dpc_submission(), None);
+        }
+    }
+
+    #[test]
+    fn snapshots_distinguish_future_affecting_ai_and_dpc_latches() {
+        let mut baseline = fabric();
+        let mut ai_changed = fabric();
+        let mut dpc_changed = fabric();
+        for fabric in [&mut baseline, &mut ai_changed, &mut dpc_changed] {
+            fabric.configure_tv_type(TvType::Ntsc).unwrap();
+        }
+        ai_changed.write_mmio(AI_CONTROL_REG, 1).unwrap();
+        dpc_changed.write_mmio(DPC_START_REG, 0x80).unwrap();
+
+        assert_ne!(baseline.snapshot(), ai_changed.snapshot());
+        assert_ne!(baseline.snapshot(), dpc_changed.snapshot());
+        assert_ne!(baseline.evidence_snapshot(), ai_changed.evidence_snapshot());
+        assert_ne!(
+            baseline.evidence_snapshot(),
+            dpc_changed.evidence_snapshot()
+        );
     }
 
     #[test]
@@ -2191,6 +2845,8 @@ mod tests {
         };
         let mut left = fabric();
         let mut right = fabric();
+        left.write_mmio(AI_CONTROL_REG, 1).unwrap();
+        right.write_mmio(AI_CONTROL_REG, 1).unwrap();
         left.start_ai_dma(current).unwrap();
         right.start_ai_dma(current).unwrap();
         left.start_ai_dma(AiDmaRequest {
@@ -2200,7 +2856,8 @@ mod tests {
         .unwrap();
         right
             .start_ai_dma(AiDmaRequest {
-                dram_addr: RdramAddr::from_offset(0x300),
+                dram_addr: RdramAddr::from_offset(0x200),
+                sample_rate_hz: 44_100,
                 ..current
             })
             .unwrap();
@@ -2331,6 +2988,7 @@ mod tests {
     #[test]
     fn ai_fifo_drains_on_guest_cycles_and_raises_one_shared_mi_source() {
         let mut fabric = fabric();
+        fabric.write_mmio(AI_CONTROL_REG, 1).unwrap();
         let first = AiDmaRequest {
             dram_addr: RdramAddr::from_offset(0x1000),
             len: 400,
@@ -2342,7 +3000,10 @@ mod tests {
         };
         fabric.start_ai_dma(first).unwrap();
         fabric.start_ai_dma(second).unwrap();
-        assert_eq!(fabric.ai_status(), AI_STATUS_BUSY | AI_STATUS_FULL);
+        assert_eq!(
+            fabric.ai_status(),
+            AI_STATUS_ENABLED | AI_STATUS_BUSY | AI_STATUS_FULL
+        );
         assert_eq!(fabric.ai_length(), 400);
         assert_eq!(fabric.start_ai_dma(first), Err(DeviceFault::AiFull));
 
@@ -2354,16 +3015,52 @@ mod tests {
         assert!(fabric.ai_length() > 0);
         let first_done = fabric.advance_to(Cycles::new(9_375), &mut rdram).unwrap();
         assert_eq!(first_done, vec![DeviceNotification::AiDmaComplete(first)]);
-        assert_eq!(fabric.ai_status(), AI_STATUS_BUSY);
+        assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED | AI_STATUS_BUSY);
         assert_eq!(fabric.ai_length(), 400);
         assert!(fabric.interrupt_pending(InterruptSource::Ai));
 
         fabric.clear_interrupt(InterruptSource::Ai);
         let second_done = fabric.advance_to(Cycles::new(18_750), &mut rdram).unwrap();
         assert_eq!(second_done, vec![DeviceNotification::AiDmaComplete(second)]);
-        assert_eq!(fabric.ai_status(), 0);
+        assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED);
         assert_eq!(fabric.ai_length(), 0);
         assert!(fabric.interrupt_pending(InterruptSource::Ai));
+    }
+
+    #[test]
+    fn ai_control_is_behavioral_and_unknown_busy_transitions_are_loud() {
+        let mut fabric = fabric();
+        fabric.configure_tv_type(TvType::Ntsc).unwrap();
+        let request = AiDmaRequest {
+            dram_addr: RdramAddr::from_offset(0x1000),
+            len: 0x80,
+            sample_rate_hz: TvType::Ntsc.vi_clock_hz(),
+        };
+
+        assert_eq!(
+            fabric.start_ai_dma(request),
+            Err(DeviceFault::AiDmaDisabled)
+        );
+        fabric.write_mmio(AI_DRAM_ADDR_REG, 0x1000).unwrap();
+        let before_disabled_len = fabric.evidence_snapshot();
+        assert_eq!(
+            fabric.write_mmio(AI_LEN_REG, 0x80),
+            Err(DeviceFault::AiDmaDisabled)
+        );
+        assert_eq!(fabric.evidence_snapshot(), before_disabled_len);
+        assert_eq!(fabric.ai_status(), 0);
+        fabric.write_mmio(AI_CONTROL_REG, 1).unwrap();
+        assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED);
+        fabric.start_ai_dma(request).unwrap();
+        assert_eq!(
+            fabric.write_mmio(AI_CONTROL_REG, 0),
+            Err(DeviceFault::AiControlWhileBusy {
+                current: 1,
+                requested: 0,
+            })
+        );
+        assert_eq!(fabric.ai_control(), 1);
+        assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED | AI_STATUS_BUSY);
     }
 
     #[test]

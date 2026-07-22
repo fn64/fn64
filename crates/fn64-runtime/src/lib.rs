@@ -31,16 +31,18 @@ pub mod vi;
 pub mod voice;
 
 pub use device::{
-    AiDmaRequest, Cycles, DeviceEvidenceSnapshot, DeviceFabric, DeviceFault, DeviceNotification,
-    DeviceSnapshot, DeviceTraceEvent, DeviceTraceKind, FixedPiTiming, InterruptSource, MmioAddr,
-    PendingAiSnapshot, PendingPiSnapshot, PendingSiSnapshot, PendingSpDmaSnapshot, PiDmaRequest,
+    AiDmaRequest, Cycles, DeviceEvidenceSnapshot, DeviceFabric, DeviceFault, DeviceMmioWriteEffect,
+    DeviceNotification, DeviceSnapshot, DeviceTraceEvent, DeviceTraceKind, DpcSubmission,
+    DpcSubmissionSource, FixedPiTiming, InterruptSource, MmioAddr, PendingAiSnapshot,
+    PendingDpcSnapshot, PendingPiSnapshot, PendingSiSnapshot, PendingSpDmaSnapshot, PiDmaRequest,
     PiDomain, PiDomainTiming, PiTimingModel, RcpTaskCompletion, RcpTaskCompletionPlan,
     ScheduledDeviceEventKind, ScheduledDeviceEventSnapshot, SiDmaKind, SiDmaRequest,
-    SpDmaDirection, SpDmaRequest, PI_STATUS_DMA_BUSY, PI_STATUS_ERROR, PI_STATUS_IO_BUSY,
-    SP_CLR_YIELD, SP_CLR_YIELDED, SP_SET_YIELD, SP_SET_YIELDED, SP_STATUS_BROKE,
-    SP_STATUS_DMA_BUSY, SP_STATUS_DMA_FULL, SP_STATUS_HALT, SP_STATUS_INTERRUPT_ON_BREAK,
-    SP_STATUS_SIGNAL_0, SP_STATUS_SIGNAL_1, SP_STATUS_SINGLE_STEP, SP_STATUS_YIELD,
-    SP_STATUS_YIELDED,
+    SpDmaDirection, SpDmaRequest, DPC_STATUS_CMD_BUSY, DPC_STATUS_DMA_BUSY, DPC_STATUS_END_VALID,
+    DPC_STATUS_FLUSH, DPC_STATUS_FREEZE, DPC_STATUS_START_VALID, DPC_STATUS_XBUS_DMEM_DMA,
+    PI_STATUS_DMA_BUSY, PI_STATUS_ERROR, PI_STATUS_IO_BUSY, SP_CLR_YIELD, SP_CLR_YIELDED,
+    SP_SET_YIELD, SP_SET_YIELDED, SP_STATUS_BROKE, SP_STATUS_DMA_BUSY, SP_STATUS_DMA_FULL,
+    SP_STATUS_HALT, SP_STATUS_INTERRUPT_ON_BREAK, SP_STATUS_SIGNAL_0, SP_STATUS_SIGNAL_1,
+    SP_STATUS_SINGLE_STEP, SP_STATUS_YIELD, SP_STATUS_YIELDED,
 };
 pub use executor::{
     EventRegistrationEvidenceSnapshot, Executor, ExecutorControlEvidenceSnapshot,
@@ -54,8 +56,8 @@ pub use mesgqueue::{
     WaiterPriority,
 };
 pub use mmio::{
-    is_mmio_offset, AiRegs, MmioSpace, AI_STATUS_BUSY, AI_STATUS_FULL, RDRAM_MMIO_WINDOW_END,
-    RDRAM_MMIO_WINDOW_START, RDRAM_RCP_MMIO_END,
+    is_mmio_offset, AiRegs, MmioSpace, AI_STATUS_BUSY, AI_STATUS_ENABLED, AI_STATUS_FULL,
+    RDRAM_MMIO_WINDOW_END, RDRAM_MMIO_WINDOW_START, RDRAM_RCP_MMIO_END,
 };
 pub use overlay::{
     FuncEntry, FuncEntryEvidenceSnapshot, Section, SectionEvidenceSnapshot, SectionIndex,

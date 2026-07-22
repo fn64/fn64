@@ -1,9 +1,11 @@
 use super::*;
 #[cfg(test)]
 use crate::task_dispatch::AUDIO_OUTPUT_STATS;
-use crate::task_dispatch::{deliver_ai_buffer, AUDIO_RDRAM_LEN};
 
 const AI_MIN_DAC_RATE: u32 = 132;
+const AI_MAX_BIT_RATE: u32 = 16;
+const AI_CONTROL_REG: u64 = 0xA450_0008;
+const AI_CONTROL_DMA_ON: u32 = 1;
 
 /// `osAiSetFrequency(u32 frequency) -> s32` -- configures the audio DAC
 /// sample rate and returns the TRUE playback rate, or -1 if the frequency is
@@ -16,11 +18,12 @@ const AI_MIN_DAC_RATE: u32 = 132;
 /// `aiSamplingFrequency` and then DIVIDES by it (heap.c:1002), so a
 /// stale/zero $v0 divides by garbage.
 ///
-/// Byte-exact to aisetfreq.c:12-36: `dacRate = (osViClock/freq + 0.5)`;
-/// `dacRate < AI_MIN_DAC_RATE(132)` -> -1; else `osViClock / (s32)dacRate`.
-/// `osViClock` is selected from the public NTSC/PAL/MPAL clock constants by
-/// the IPL television type; AI_MIN_DAC_RATE=132 (rcp.h). Single u32 arg in
-/// $a0=r4, return $v0=r2.
+/// The public AI register contract requires both DACRATE and BITRATE:
+/// `dac_rate = (osViClock/freq + 0.5)`, `dac_rate < 132` returns -1, and the
+/// serial bit-clock divider is `min(dac_rate / 66, 16)`. The registers encode
+/// each divider minus one. `osViClock` is selected from the public
+/// NTSC/PAL/MPAL clock constants by the IPL television type. Single u32 arg
+/// in $a0=r4, return $v0=r2.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
@@ -36,8 +39,9 @@ pub unsafe extern "C" fn osAiSetFrequency_recomp(_rdram: *mut u8, ctx: *mut Reco
         -1i32 as u32 as u64
     } else {
         let true_rate = vi_clock / dac_rate;
-        MMIO.with(|cell| cell.borrow_mut().ai.dacrate = dac_rate - 1);
-        crate::task_dispatch::notify_audio_frequency(true_rate);
+        let bit_rate = (dac_rate / 66).min(AI_MAX_BIT_RATE);
+        crate::pi::set_live_ai_rates(dac_rate - 1, bit_rate - 1)
+            .unwrap_or_else(|error| panic!("osAiSetFrequency_recomp: {error}"));
         true_rate as u64
     };
 }
@@ -48,38 +52,10 @@ thread_local! {
     static AI_STATUS_BUSY_RETURNS: Cell<u64> = const { Cell::new(0) };
     static AI_LENGTH_READS: Cell<u64> = const { Cell::new(0) };
     static AI_LENGTH_LAST: Cell<u32> = const { Cell::new(0) };
-    /// AI/VI/PI/SI/SP/DP/MI hardware-register model (`fn64_runtime::mmio`).
-    /// Backs both the shim-level `osAi*` family below AND (via
-    /// `sync_mmio_into_rdram`, called from `boot_thread0`/before each
-    /// coroutine resume) a raw guest `MEM_W` load at the same address --
-    /// see `mmio.rs`'s module doc for the real crash
-    /// (`docs/BOOT-NOTES-WM2000.md`) this closes.
+    /// Compatibility backing for RCP registers not yet owned by
+    /// `DeviceFabric`. AI and DPC never consult this state: their raw and
+    /// libultra paths share the fabric's typed transactions.
     pub(crate) static MMIO: RefCell<fn64_runtime::MmioSpace> = RefCell::new(fn64_runtime::MmioSpace::new());
-}
-
-pub(crate) fn observe_live_ai_mmio_write(vaddr: u64, value: u32) {
-    match vaddr as u32 {
-        0xA450_0010 => {
-            let divisor = value
-                .checked_add(1)
-                .expect("raw AI_DACRATE divisor overflows u32");
-            crate::task_dispatch::notify_audio_frequency(crate::vi_clock_hz() / divisor);
-        }
-        0xA450_0004 => {
-            let (dram_addr, dacrate) =
-                MMIO.with(|cell| (cell.borrow().ai.dram_addr, cell.borrow().ai.dacrate));
-            let divisor = dacrate
-                .checked_add(1)
-                .expect("raw AI_DACRATE divisor overflows u32");
-            let result = crate::pi::start_live_ai_dma(AiDmaRequest {
-                dram_addr: RdramAddr::from_offset(dram_addr),
-                len: value,
-                sample_rate_hz: crate::vi_clock_hz() / divisor,
-            });
-            result.unwrap_or_else(|error| panic!("raw AI_LEN DMA start failed: {error}"));
-        }
-        _ => {}
-    }
 }
 
 /// Write every modeled MMIO register's current value into `rdram`'s real
@@ -97,24 +73,21 @@ pub(crate) fn observe_live_ai_mmio_write(vaddr: u64, value: u32) {
 /// `Rdram::new_with_mmio`, not plain `Rdram::new`/a bare `Vec::new`).
 pub unsafe fn sync_mmio_into_rdram(rdram: *mut u8) {
     MMIO.with(|cell| unsafe { cell.borrow_mut().sync_into_rdram(rdram) });
+    unsafe { crate::pi::sync_live_ai_dpc_mmio_into_rdram(rdram) };
 }
 
 /// `osAiGetStatus() -> u32` -- no arguments; real hardware `AI_STATUS`
 /// register read (`AI_STATUS_BUSY`/`AI_STATUS_FULL` bits, public libultra
-/// manual's AI Manager section). Backed by `fn64_runtime::mmio::AiRegs`,
-/// the same model a raw guest `MEM_W` at the register's real address reads
-/// (see `MMIO`'s doc comment) -- this shim and a raw load return the SAME
-/// value, since both go through `AiRegs::status`'s one-shot-busy logic
-/// (this call also mutates the one-shot flag, exactly like a real register
-/// read would consume the interrupt-pending latch).
+/// manual's AI Manager section). The authoritative `DeviceFabric` owns the
+/// two-slot DMA FIFO and control latch, so this shim and a raw register load
+/// return the same nonmutating status snapshot.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osAiGetStatus_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
-    let status = crate::pi::live_ai_status()
-        .unwrap_or_else(|| MMIO.with(|cell| cell.borrow_mut().ai.status()));
+    let status = crate::pi::live_ai_status();
     AI_STATUS_READS.with(|cell| cell.set(cell.get() + 1));
     if status & fn64_runtime::AI_STATUS_BUSY != 0 {
         AI_STATUS_BUSY_RETURNS.with(|cell| cell.set(cell.get() + 1));
@@ -131,21 +104,16 @@ pub fn ai_status_stats() -> (u64, u64) {
 
 /// `osAiGetLength() -> u32` -- no arguments; real hardware `AI_LEN` register
 /// read (bytes remaining in the current/last DMA, counting DOWN as the DAC
-/// drains). When a live audio backend exists, this reports the REAL
-/// drain-aware current-DMA length
-/// (`task_dispatch::audio_remaining_guest_bytes`). Host playback prebuffer
-/// is not part of AI_LEN. Without a backend (headless
-/// probes with audio off), the latched-register model remains, per
-/// `AiRegs::length`'s no-fabricated-value stance.
+/// drains). The authoritative `DeviceFabric` derives this only from guest
+/// cycles and the active DMA deadline. Host playback telemetry and prebuffer
+/// depth never manufacture guest-visible device work.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osAiGetLength_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
-    let len = crate::pi::live_ai_length()
-        .or_else(crate::task_dispatch::audio_remaining_guest_bytes)
-        .unwrap_or_else(|| MMIO.with(|cell| cell.borrow().ai.length()));
+    let len = crate::pi::live_ai_length();
     AI_LENGTH_READS.with(|cell| cell.set(cell.get() + 1));
     AI_LENGTH_LAST.with(|cell| cell.set(len));
     ctx.r2 = len as u64;
@@ -164,10 +132,15 @@ pub fn ai_length_stats() -> (u64, u32) {
 /// source/length and starts the transfer; per the public libultra manual,
 /// returns 0 on success or
 /// a negative error code if a DMA is already in progress and the queue is
-/// full. This crate's DMA is synchronous-modeled (see `AiRegs::set_next_buffer`'s
-/// doc comment: "DMA proceeds" stance, same as `rom.rs`'s PI DMA), so this
-/// always succeeds (returns 0) -- no evidence yet of a call site needing the
-/// error path.
+/// full. The authoritative `DeviceFabric` owns the timed two-slot FIFO, so an
+/// accepted request returns 0 and a request made while both slots are occupied
+/// returns -1 without mutating the latched DRAM address.
+///
+/// The public `rcp.h` AI-control definition makes bit 0 the DMA enable. This
+/// shim performs that public enable transition through the same typed MMIO
+/// path as a raw guest write before it latches DRAM/LEN; fn64 does not invent
+/// an earlier hidden AI-control write during `osInitialize`. The FIFO-full
+/// rejection remains side-effect free, including leaving CONTROL unchanged.
 ///
 /// This is also the one correct host-output boundary. A live OoT `M_AUDTASK`
 /// has `OSTask.output_buff == 0`/`output_buff_size == 0`; its `A_SAVEBUFF`
@@ -184,21 +157,15 @@ pub unsafe extern "C" fn osAiSetNextBuffer_recomp(rdram: *mut u8, ctx: *mut Reco
     let ctx = unsafe { &mut *ctx };
     let buf_addr = RdramAddr::from_gpr(ctx.r4).offset();
     let size = ctx.r5 as u32;
-    let sample_rate_hz = crate::task_dispatch::AUDIO_GUEST_RATE.with(Cell::get);
-    let sample_rate_hz = if sample_rate_hz == 0 {
-        let divisor = MMIO
-            .with(|cell| cell.borrow().ai.dacrate)
-            .checked_add(1)
-            .expect("AI_DACRATE divisor overflows u32");
-        crate::vi_clock_hz() / divisor
-    } else {
-        sample_rate_hz
-    };
-    let accepted = match crate::pi::start_live_ai_dma(AiDmaRequest {
-        dram_addr: RdramAddr::from_offset(buf_addr),
-        len: size,
-        sample_rate_hz,
-    }) {
+    if crate::pi::live_ai_status() & fn64_runtime::AI_STATUS_FULL != 0 {
+        ctx.r2 = u64::MAX;
+        return;
+    }
+    assert!(
+        crate::pi::write_raw_mmio_word(AI_CONTROL_REG, AI_CONTROL_DMA_ON),
+        "osAiSetNextBuffer_recomp: authoritative AI_CONTROL register is unmapped"
+    );
+    let accepted = match unsafe { crate::pi::submit_live_ai_dma(rdram, buf_addr, size) } {
         Ok(()) => true,
         Err(DeviceFault::AiFull) => false,
         Err(error) => panic!("osAiSetNextBuffer_recomp: {error}"),
@@ -206,13 +173,6 @@ pub unsafe extern "C" fn osAiSetNextBuffer_recomp(rdram: *mut u8, ctx: *mut Reco
     if !accepted {
         ctx.r2 = u64::MAX;
         return;
-    }
-    MMIO.with(|cell| cell.borrow_mut().ai.set_next_buffer(buf_addr, size));
-    // Host audio is optional. Once a shell/harness registers a bound, every
-    // submitted AI range must satisfy it loudly; an unset bound means no host
-    // consumer was requested, not that a malformed configured range is okay.
-    if AUDIO_RDRAM_LEN.with(Cell::get) != 0 {
-        unsafe { deliver_ai_buffer(rdram, buf_addr as usize, size as usize) };
     }
     ctx.r2 = 0;
 }
@@ -222,8 +182,13 @@ mod tests {
     use super::*;
     use crate::test_support::*;
 
+    fn configure_ntsc() {
+        crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
+    }
+
     #[test]
     fn os_ai_set_frequency_stores_value() {
+        configure_ntsc();
         let mut ctx = ctx_zeroed();
         ctx.r4 = 48000;
         unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
@@ -232,10 +197,7 @@ mod tests {
 
     #[test]
     fn os_ai_set_next_buffer_stays_busy_until_guest_cycle_completion() {
-        // Reset MMIO's AI state to a known starting point -- other tests in
-        // this file share the same thread_local, and test order is not
-        // guaranteed.
-        MMIO.with(|cell| *cell.borrow_mut() = fn64_runtime::MmioSpace::new());
+        configure_ntsc();
 
         let mut set_ctx = ctx_zeroed();
         set_ctx.r4 = 0xFFFF_FFFF_8010_0000; // buf, a plausible vram address
@@ -262,12 +224,12 @@ mod tests {
         crate::advance_virtual_time(deadline);
         let mut completed_ctx = ctx_zeroed();
         unsafe { osAiGetStatus_recomp(std::ptr::null_mut(), &mut completed_ctx as *mut _) };
-        assert_eq!(completed_ctx.r2, 0);
+        assert_eq!(completed_ctx.r2 as u32, fn64_runtime::AI_STATUS_ENABLED);
     }
 
     #[test]
     fn os_ai_get_length_reports_latched_length() {
-        MMIO.with(|cell| *cell.borrow_mut() = fn64_runtime::MmioSpace::new());
+        configure_ntsc();
 
         let mut set_ctx = ctx_zeroed();
         set_ctx.r4 = 0xFFFF_FFFF_8010_0000;
@@ -282,6 +244,7 @@ mod tests {
     #[test]
     fn live_ai_fifo_drains_before_event_delivery_and_raises_mi() {
         crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        configure_ntsc();
         crate::pi::set_mi_interrupt_mask(fn64_runtime::InterruptSource::Ai.bit());
         let queue = RdramAddr::from_offset(0x300);
         with_executor(|exec| {
@@ -308,13 +271,20 @@ mod tests {
         unsafe { osAiSetNextBuffer_recomp(std::ptr::null_mut(), &mut full) };
         assert_eq!(full.r2, u64::MAX);
         assert_eq!(
+            with_host(|host| host.device_fabric.snapshot().ai_dram_addr.offset()),
+            0x2000,
+            "a rejected libultra submit must not replace the accepted next-buffer latch"
+        );
+        assert_eq!(
             crate::pi::live_ai_status(),
-            Some(fn64_runtime::AI_STATUS_BUSY | fn64_runtime::AI_STATUS_FULL)
+            fn64_runtime::AI_STATUS_ENABLED
+                | fn64_runtime::AI_STATUS_BUSY
+                | fn64_runtime::AI_STATUS_FULL
         );
 
         let first_deadline = with_host(|host| host.device_fabric.next_deadline().unwrap().get());
         crate::advance_virtual_time(first_deadline - 1);
-        assert!(crate::pi::live_ai_length().unwrap() > 0);
+        assert!(crate::pi::live_ai_length() > 0);
         assert_eq!(
             with_executor(|exec| exec.recv_mesg(99, queue, false)),
             fn64_runtime::RecvMesgOutcome::WouldBlock
@@ -324,7 +294,7 @@ mod tests {
         assert!(crate::pi::cpu_interrupt_pending());
         assert_eq!(
             crate::pi::live_ai_status(),
-            Some(fn64_runtime::AI_STATUS_BUSY)
+            fn64_runtime::AI_STATUS_ENABLED | fn64_runtime::AI_STATUS_BUSY
         );
         assert_eq!(
             with_executor(|exec| exec.recv_mesg(99, queue, false)),
@@ -335,7 +305,7 @@ mod tests {
         let second_deadline = with_host(|host| host.device_fabric.next_deadline().unwrap().get());
         crate::advance_virtual_time(second_deadline);
         assert!(crate::pi::cpu_interrupt_pending());
-        assert_eq!(crate::pi::live_ai_status(), Some(0));
+        assert_eq!(crate::pi::live_ai_status(), fn64_runtime::AI_STATUS_ENABLED);
         assert_eq!(
             with_executor(|exec| exec.recv_mesg(99, queue, false)),
             fn64_runtime::RecvMesgOutcome::Delivered(0xA1)
@@ -343,8 +313,70 @@ mod tests {
     }
 
     #[test]
+    fn raw_and_libultra_ai_submissions_share_one_future_state() {
+        fn reset() {
+            crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
+            crate::load_rom_with_fixed_pi_latency(Vec::new(), 1);
+        }
+
+        reset();
+        assert!(crate::pi::write_raw_mmio_word(
+            AI_CONTROL_REG,
+            AI_CONTROL_DMA_ON
+        ));
+        assert!(crate::pi::write_raw_mmio_word(0xA450_0010, 1_520));
+        assert!(crate::pi::write_raw_mmio_word(0xA450_0014, 15));
+        assert!(crate::pi::write_raw_mmio_word(0xA450_0000, 0x2_000));
+        assert!(crate::pi::write_raw_mmio_word(0xA450_0004, 0x80));
+        let raw = crate::device_evidence_snapshot();
+
+        reset();
+        let mut frequency = ctx_with(32_000, 0, 0);
+        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut frequency) };
+        let mut submit = ctx_with(0xFFFF_FFFF_8000_2000, 0x80, 0);
+        unsafe { osAiSetNextBuffer_recomp(std::ptr::null_mut(), &mut submit) };
+        let managed = crate::device_evidence_snapshot();
+
+        assert_eq!(frequency.r2, 32_006);
+        assert_eq!(submit.r2, 0);
+        assert_eq!(managed.guest.ai_bitrate, 15);
+        assert_eq!(managed, raw);
+    }
+
+    #[test]
+    fn control_off_raw_and_libultra_submissions_share_the_enable_transition() {
+        fn reset() {
+            crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
+            crate::load_rom_with_fixed_pi_latency(Vec::new(), 1);
+            assert!(crate::pi::write_raw_mmio_word(AI_CONTROL_REG, 0));
+            assert_eq!(
+                with_host(|host| host.device_fabric.snapshot().ai_control),
+                0
+            );
+        }
+
+        reset();
+        assert!(crate::pi::write_raw_mmio_word(
+            AI_CONTROL_REG,
+            AI_CONTROL_DMA_ON
+        ));
+        assert!(crate::pi::write_raw_mmio_word(0xA450_0000, 0x2_000));
+        assert!(crate::pi::write_raw_mmio_word(0xA450_0004, 0x80));
+        let raw = crate::device_evidence_snapshot();
+
+        reset();
+        let mut submit = ctx_with(0xFFFF_FFFF_8000_2000, 0x80, 0);
+        unsafe { osAiSetNextBuffer_recomp(std::ptr::null_mut(), &mut submit) };
+        let managed = crate::device_evidence_snapshot();
+
+        assert_eq!(submit.r2, 0);
+        assert_eq!(managed.guest.ai_control, AI_CONTROL_DMA_ON);
+        assert_eq!(managed, raw);
+    }
+
+    #[test]
     fn sync_mmio_into_rdram_backs_a_raw_guest_ai_status_load() {
-        MMIO.with(|cell| *cell.borrow_mut() = fn64_runtime::MmioSpace::new());
+        configure_ntsc();
         let mut set_ctx = ctx_zeroed();
         set_ctx.r4 = 0xFFFF_FFFF_8010_0000;
         set_ctx.r5 = 0x40;
@@ -414,6 +446,7 @@ mod tests {
         }
 
         const RDRAM_LEN: usize = 4096;
+        configure_ntsc();
         let mut rdram = vec![0u8; RDRAM_LEN];
         const HEADER_OFF: usize = 0x40;
         const AI_BUF_OFF: usize = 0x800; // arbitrary in-bounds output buffer
@@ -479,6 +512,7 @@ mod tests {
     /// Fails against the bug (never writes r2): stale $v0 survives.
     #[test]
     fn os_ai_set_frequency_returns_true_dac_rate_in_v0() {
+        configure_ntsc();
         // 32000 Hz: dacRate = round(48681812/32000) = round(1521.3) = 1521;
         // true rate = 48681812 / 1521 = 32006. Distinct from the input.
         let mut ctx = ctx_zeroed();
@@ -486,6 +520,9 @@ mod tests {
         ctx.r2 = 0xBADD_C0DE; // stale $v0 the bug would leave in place.
         unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
         assert_eq!(ctx.r2, 32006, "true DAC rate 48681812/1521");
+        let snapshot = with_host(|host| host.device_fabric.snapshot());
+        assert_eq!(snapshot.ai_dacrate, 1_520);
+        assert_eq!(snapshot.ai_bitrate, 15);
 
         // An unusably-high frequency drives dacRate below AI_MIN_DAC_RATE
         // (132) and must return -1: freq 400000 -> dacRate = round(121.7) =
@@ -501,13 +538,19 @@ mod tests {
         let mut pal = ctx_with(32_000, 0, 0);
         unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut pal) };
         assert_eq!(pal.r2, 31_995);
-        assert_eq!(MMIO.with(|cell| cell.borrow().ai.dacrate), 1_551);
+        assert_eq!(
+            with_host(|host| host.device_fabric.snapshot().ai_dacrate),
+            1_551
+        );
 
         crate::configure_tv_type(fn64_runtime::TvType::Mpal);
         let mut mpal = ctx_with(32_000, 0, 0);
         unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut mpal) };
         assert_eq!(mpal.r2, 31_992);
-        assert_eq!(MMIO.with(|cell| cell.borrow().ai.dacrate), 1_519);
+        assert_eq!(
+            with_host(|host| host.device_fabric.snapshot().ai_dacrate),
+            1_519
+        );
 
         crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
     }
@@ -544,6 +587,7 @@ mod tests {
             }
         }
 
+        configure_ntsc();
         let rates = Arc::new(Mutex::new(Vec::new()));
         crate::set_audio_backend(
             Box::new(RateRecorder {

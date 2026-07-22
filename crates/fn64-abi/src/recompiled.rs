@@ -2809,9 +2809,11 @@ mod tests {
     #[test]
     fn typed_raw_ai_registers_schedule_the_live_guest_cycle_fifo() {
         crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
         let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
         let mut bytes = [0; 4];
         let mut mem = Rdram::new(&mut bytes);
+        mem.store_w(0xFFFF_FFFF_A450_0008, 1);
         mem.store_w(0xFFFF_FFFF_A450_0010, 151);
         mem.store_w(0xFFFF_FFFF_A450_0000, 0x1000);
         mem.store_w(0xFFFF_FFFF_A450_0004, 0x80);
@@ -2821,7 +2823,10 @@ mod tests {
         );
         let deadline = with_host(|host| host.device_fabric.next_deadline().unwrap().get());
         crate::advance_virtual_time(deadline);
-        assert_eq!(mem.load_w(0xFFFF_FFFF_A450_000C), 0);
+        assert_eq!(
+            mem.load_w(0xFFFF_FFFF_A450_000C) as u32,
+            fn64_runtime::AI_STATUS_ENABLED
+        );
         assert_ne!(
             with_host(|host| host.device_fabric.snapshot().mi_pending)
                 & fn64_runtime::InterruptSource::Ai.bit(),

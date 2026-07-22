@@ -143,7 +143,7 @@ and scope limits that make an open item meaningful.
   into RT64 so PAL stable-factor workloads derive from 50 Hz rather than the
   pinned upstream 60 Hz constant. Ten fresh live Metal processes prove the
   production-context PAL/MPAL workload sequences `[0,0,0,50]` and
-  `[0,0,0,60]` without an Extended refresh override. Report schema v22 now
+  `[0,0,0,60]` without an Extended refresh override. Report schema v23 now
   co-binds normalized ROM TV region, committed device TV state, and renderer
   create-time TV configuration; representative private PAL/MPAL exact-ten
   evidence remains to be retained. cpal
@@ -587,12 +587,21 @@ and deterministic output traces.
   (20 consecutive clean live-gate runs).
   The RCP/MI fabric is now always present rather than being created as a side
   effect of cartridge ROM installation; a separate typed flag preserves loud
-  missing-ROM PI failures. AI has a deterministic two-slot current/next FIFO:
-  shim and typed raw submissions share BUSY/FULL, guest-cycle drain deadlines,
+  missing-ROM PI failures. That fabric is the sole AI/DPC register and
+  transaction authority: shims and raw word MMIO share AI DRAM/CONTROL/
+  DACRATE/BITRATE latches and the deterministic two-slot current/next FIFO,
+  while DPC START/END/CURRENT/STATUS and each typed RDRAM-or-DMEM pending range
+  remain owned until explicit renderer commit or cancellation. AI shim and
+  typed raw submissions share CONTROL enable, BUSY/FULL, guest-cycle drain deadlines,
   decrementing `AI_LEN`, MI AI assertion, and OS_EVENT_AI delivery after the
   device transition. The duration uses the 93.75 MHz CPU clock and libultra's
   quantized playback rate and the IPL-selected NTSC/PAL/MPAL video clock;
-  hardware timing traces remain open. SI now has a scheduled 64-byte DRAM/PIF
+  hardware timing traces remain open. CONTROL-disabled raw starts and
+  CONTROL changes while a FIFO slot is active fail loudly because the public
+  register definition names the enable bit but does not define the latter
+  transition. Exact AI/DPC timing and counters, the hardware AI-interrupt
+  phase, mid-transfer AI control, FREEZE/FLUSH, subword raw access, native-C
+  mid-task visibility, and silicon behavior remain open. SI now has a scheduled 64-byte DRAM/PIF
   engine with persistent
   PIF RAM, BUSY/error/interrupt status, distinct write/execute/read phases,
   and shim/raw-register convergence. Its current one-cycle latency is an
@@ -704,7 +713,7 @@ and deterministic output traces.
   evidence binds the physical spans/words and each mapped entry's exact
   `BankId`/PA sequence, preflight-expected words, and generated artifact
   identity. Artifact-identified mapped AOT destination observations carry that
-  real artifact and are schema-v22 fixed-cycle eligible; compatibility AOT
+  real artifact and are schema-v23 fixed-cycle eligible; compatibility AOT
   without one and mapped-interpreter observations are not. The latter remain
   operational/differential-only until a successor typed destination schema
   exists. Multiple matches remain loud. Data-side Status.KSU plus UX/SX/KX now

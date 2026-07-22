@@ -71,14 +71,15 @@ The usable evidence stack is deliberately split:
   oracles for their named instruction families.
 - `lane-parity.sh --observe` compares end-to-end framebuffer bytes while
   labeling the legacy lane's missing-body defect.
-- Schema-v22 fixed-cycle device/framebuffer/audio/memory digests,
+- Schema-v23 fixed-cycle device/framebuffer/audio/memory digests,
   boundary-owned observations, the compiled unsupported-instrumentation
   identity, and the bound zero-unsupported journal provide the release
   authority mechanism. Representative private NTSC reference and RT64
   LLE/post-VI exact-ten schema-v22 series completed and were independently
-  reverified on 2026-07-22 with zero unsupported events. Combined with the
+  reverified on 2026-07-22 with zero unsupported events; these are historical
+  and require schema-v23 regeneration. Combined with the
   retained public synthetic identified-native XBUS exact-ten series, the
-  current three-scenario matrix credits 12 of 162 requirements and retains the
+  previous three-scenario matrix credited 12 of 162 requirements and retained the
   other 150 explicitly. The public series adds mechanism coverage, not another
   representative full-ROM parity claim.
 
