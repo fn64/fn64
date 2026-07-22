@@ -962,13 +962,25 @@ dimension empty.
 
 Each repeatable `--rt64-platform-case TARGET:CASE RT64_DIR
 PRIVATE_SERIES_ORDINAL` tuple runs after all manifest, report, journal, and
-private-series inputs have passed preflight but before matrix construction. It binds its
-opaque capability to the named one-based `--private-series` tuple. The RT64
-directory must be an absolute canonical path to the clean pinned source. A
-failed build or failed, timed-out, identity-mismatched, or nondeterministic
+private-series inputs have passed a complete platform-authority-free matrix
+verification but before final matrix construction. Every requested platform case is then
+preflighted before any native case starts: its named one-based
+`--private-series` tuple must bind an exact validated report series from the
+matrix, that report must name the exact current host identity (including the
+complete native Windows-version evidence), matching API, and pinned RT64
+source, and its adapter identity must equal the current case-feature source
+digest. Successful preflight produces an opaque ticket binding the target,
+case, host, retained-series identity, canonical pinned RT64 tree, repository
+workspace, and adapter source digest. The native runner consumes that ticket
+and rechecks its mutable identities immediately before the build and again
+after the build before the first case child launches; a source or retained-
+series change while an earlier requested case runs therefore cannot make a
+later case spend its native repeat bar. The RT64 directory must be an absolute
+canonical path to the clean pinned source.
+A failed build or failed, timed-out, identity-mismatched, or nondeterministic
 child preserves its stdout/stderr logs under a named private temporary
-directory and grants no authority. Duplicate target/case requests fail before
-any native case runs.
+directory and grants no authority. Duplicate or unbindable target/case
+requests fail before any native case runs.
 
 Every report path and journal path must resolve to a distinct file, and the two
 halves of a pair cannot name the same file. Private-series verification rechecks

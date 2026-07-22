@@ -11,8 +11,9 @@
 mod rt64_adapter_source_identity;
 
 use crate::{
-    ReleaseGraphicsApi, ReleaseHostPlatform, ReleaseWindowsFamily, ReleaseWindowsVersionEvidence,
-    VerifiedPrivateReleaseSeries,
+    ParsedUnsupportedJournal, ReleaseGateReport, ReleaseGraphicsApi, ReleaseHostPlatform,
+    ReleaseRendererEvidence, ReleaseWindowsFamily, ReleaseWindowsVersionEvidence,
+    VerifiedPrivateReleaseSeries, RELEASE_MATRIX_REPORT_COUNT,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -272,6 +273,86 @@ impl Rt64PlatformCase {
         // API-selecting examples before the production runner can admit them.
         matches!(target, Rt64PlatformTarget::MacosMetal)
     }
+
+    /// Reject a target/case request that cannot bind the supplied, already
+    /// retained matrix evidence before Cargo builds or a native child runs.
+    ///
+    /// This creates no platform authority. The opaque capability still comes
+    /// only from [`run_rt64_platform_case_series`] after the complete native
+    /// repeat bar succeeds.
+    pub fn preflight_series_binding(
+        self,
+        target: Rt64PlatformTarget,
+        rt64_source_directory: impl AsRef<Path>,
+        bound_series: &VerifiedPrivateReleaseSeries,
+        evidence: &[(ReleaseGateReport, ParsedUnsupportedJournal)],
+    ) -> Result<PreflightedRt64PlatformCase, PlatformCertificationError> {
+        let host = crate::release_host_identity().map_err(|source| {
+            PlatformCertificationError::Runner(format!(
+                "observe native host identity for RT64 platform preflight: {source}"
+            ))
+        })?;
+        if !target.matches_host(host.0, host.1) {
+            return Err(PlatformCertificationError::TargetHostMismatch);
+        }
+        if !self.supports_target(target) {
+            return Err(PlatformCertificationError::Runner(format!(
+                "RT64 platform case {} is not enrolled for target {}",
+                self.id(),
+                target.id()
+            )));
+        }
+
+        let rt64_source_directory = validate_rt64_source_tree(rt64_source_directory.as_ref())?;
+        let binding = bound_matrix_series(bound_series)?;
+        let matching = evidence
+            .iter()
+            .filter(|(report, _)| report.scenario == binding.scenario)
+            .cloned()
+            .collect::<Vec<_>>();
+        let verified =
+            crate::verify_release_evidence_series(&matching, RELEASE_MATRIX_REPORT_COUNT).map_err(
+                |source| {
+                    PlatformCertificationError::Runner(format!(
+                        "verify bound matrix evidence for RT64 platform preflight: {source}"
+                    ))
+                },
+            )?;
+        if verified.scenario != binding.scenario
+            || verified.report_sha256 != binding.report_sha256
+            || verified.run_event_sha256s != binding.run_event_sha256s
+        {
+            return Err(PlatformCertificationError::Runner(
+                "RT64 platform request does not bind the exact retained private report series"
+                    .to_owned(),
+            ));
+        }
+
+        let report = matching
+            .first()
+            .map(|(report, _)| report)
+            .expect("a verified positive-count series has a first report");
+        let workspace = repository_workspace()?;
+        let expected_adapter_source_sha256 = expected_adapter_source_sha256(&workspace, self)?;
+        validate_report_binding(
+            target,
+            host,
+            report.environment.platform,
+            report.environment.windows_version,
+            &report.environment.renderer,
+            &expected_adapter_source_sha256,
+        )?;
+        Ok(PreflightedRt64PlatformCase {
+            target,
+            case: self,
+            host,
+            workspace,
+            rt64_source_directory,
+            rt64_source_id: PINNED_RT64_SOURCE_ID.to_owned(),
+            adapter_source_sha256: expected_adapter_source_sha256,
+            bound_series: binding,
+        })
+    }
 }
 
 /// Retained, integrity-checkable projection of one opaque verified series.
@@ -465,65 +546,90 @@ struct BoundMatrixSeries {
     run_event_sha256s: Vec<String>,
 }
 
+/// Opaque result of validating one exact platform-case request against the
+/// current host, repository sources, pinned RT64 tree, and retained matrix
+/// series. Native execution consumes this ticket and rechecks every mutable
+/// identity before it builds or launches the case child.
+#[derive(Debug)]
+pub struct PreflightedRt64PlatformCase {
+    target: Rt64PlatformTarget,
+    case: Rt64PlatformCase,
+    host: (ReleaseHostPlatform, Option<ReleaseWindowsVersionEvidence>),
+    workspace: PathBuf,
+    rt64_source_directory: PathBuf,
+    rt64_source_id: String,
+    adapter_source_sha256: String,
+    bound_series: BoundMatrixSeries,
+}
+
+impl PreflightedRt64PlatformCase {
+    fn revalidate_before_native(
+        &self,
+        bound_series: &VerifiedPrivateReleaseSeries,
+    ) -> Result<(), PlatformCertificationError> {
+        let host = crate::release_host_identity().map_err(|source| {
+            PlatformCertificationError::Runner(format!(
+                "observe native host identity for RT64 platform execution: {source}"
+            ))
+        })?;
+        if host != self.host || !self.target.matches_host(host.0, host.1) {
+            return Err(PlatformCertificationError::TargetHostMismatch);
+        }
+        if !self.case.supports_target(self.target) {
+            return Err(PlatformCertificationError::Runner(format!(
+                "RT64 platform case {} is not enrolled for target {}",
+                self.case.id(),
+                self.target.id()
+            )));
+        }
+        if repository_workspace()? != self.workspace {
+            return Err(PlatformCertificationError::Runner(
+                "repository workspace changed after RT64 platform preflight".to_owned(),
+            ));
+        }
+        if self.rt64_source_id != PINNED_RT64_SOURCE_ID
+            || validate_rt64_source_tree(&self.rt64_source_directory)? != self.rt64_source_directory
+        {
+            return Err(PlatformCertificationError::SourceMismatch);
+        }
+        if bound_matrix_series(bound_series)? != self.bound_series {
+            return Err(PlatformCertificationError::Runner(
+                "bound private release series changed after RT64 platform preflight".to_owned(),
+            ));
+        }
+        if expected_adapter_source_sha256(&self.workspace, self.case)? != self.adapter_source_sha256
+        {
+            return Err(PlatformCertificationError::AdapterSourceMismatch);
+        }
+        Ok(())
+    }
+}
+
 /// Build and execute one repository-owned RT64 behavior case on the current
 /// host, then return the only capability that can grant that target/case
 /// release-matrix credit.
 ///
-/// The caller supplies no executable, command, source label, API label, or
-/// semantic digest. This function selects the exact example and features,
-/// validates the pinned clean RT64 tree, hashes the built child, launches it
-/// directly for the case's full 10/20-run bar, and derives all identities from
-/// child output and an opaque, freshly revalidated private release series.
+/// The caller supplies only the opaque preflight ticket and its retained
+/// private series, never an executable, command, source label, API label, or
+/// semantic digest. This function revalidates the ticket before build and
+/// child launch, selects the exact example and features, hashes the built
+/// child, launches it directly for the case's full 10/20-run bar, and derives
+/// all identities from child output and the freshly revalidated series.
 pub fn run_rt64_platform_case_series(
-    target: Rt64PlatformTarget,
-    case: Rt64PlatformCase,
-    rt64_source_directory: impl AsRef<Path>,
+    preflight: PreflightedRt64PlatformCase,
     bound_series: &VerifiedPrivateReleaseSeries,
 ) -> Result<VerifiedRt64PlatformCaseSeries, PlatformCertificationError> {
-    let host = crate::release_host_identity().map_err(|source| {
-        PlatformCertificationError::Runner(format!(
-            "observe native host identity for RT64 platform case: {source}"
-        ))
-    })?;
-    if !target.matches_host(host.0, host.1) {
-        return Err(PlatformCertificationError::TargetHostMismatch);
-    }
-    if !case.supports_target(target) {
-        return Err(PlatformCertificationError::Runner(format!(
-            "RT64 platform case {} is not enrolled for target {}",
-            case.id(),
-            target.id()
-        )));
-    }
-
-    let rt64_source_directory = validate_rt64_source_tree(rt64_source_directory.as_ref())?;
-    let before = bound_matrix_series(bound_series)?;
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .map_err(|source| {
-            PlatformCertificationError::Runner(format!(
-                "resolve repository workspace for RT64 platform runner: {source}"
-            ))
-        })?;
+    preflight.revalidate_before_native(bound_series)?;
+    let target = preflight.target;
+    let case = preflight.case;
+    let host = preflight.host;
+    let workspace = preflight.workspace.clone();
+    let rt64_source_directory = preflight.rt64_source_directory.clone();
+    let expected_adapter_source_sha256 = preflight.adapter_source_sha256.clone();
+    let before = preflight.bound_series.clone();
     let builder_cargo = verified_build_cargo()?;
     let builder_cargo_sha256 = env!("FN64_BUILD_CARGO_SHA256").to_owned();
     let fn64_source_sha256 = certification_source_sha256(&workspace, case)?;
-    let adapter_features = case
-        .rt64_adapter_features()
-        .iter()
-        .map(|feature| (*feature).to_owned())
-        .collect::<Vec<_>>();
-    let expected_adapter_source_sha256 = hex(&rt64_adapter_source_identity::adapter_source_sha256(
-        &workspace.join("crates/fn64-render-rt64"),
-        env!("FN64_BUILD_TARGET"),
-        &adapter_features,
-    )
-    .map_err(|source| {
-        PlatformCertificationError::Runner(format!(
-            "compute expected RT64 adapter source identity: {source}"
-        ))
-    })?);
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|source| {
         PlatformCertificationError::Runner(format!(
@@ -550,6 +656,13 @@ pub fn run_rt64_platform_case_series(
     verified_build_cargo()?;
     let child_executable_sha256 = sha256_file(&child, "RT64 platform case executable")?;
     let staged_child = stage_case_child(&child, scratch.path(), &child_executable_sha256)?;
+    if let Err(source) = preflight.revalidate_before_native(bound_series) {
+        scratch.preserve();
+        return Err(PlatformCertificationError::Runner(format!(
+            "revalidate RT64 platform preflight before child launch: {source}; preserved build logs in {}",
+            scratch.path().display()
+        )));
+    }
     let run_result = run_case_children(
         &workspace,
         &staged_child,
@@ -619,6 +732,80 @@ pub fn run_rt64_platform_case_series(
     authority.verify_integrity()?;
     scratch.finish()?;
     Ok(VerifiedRt64PlatformCaseSeries { authority })
+}
+
+fn repository_workspace() -> Result<PathBuf, PlatformCertificationError> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .map_err(|source| {
+            PlatformCertificationError::Runner(format!(
+                "resolve repository workspace for RT64 platform runner: {source}"
+            ))
+        })
+}
+
+fn expected_adapter_source_sha256(
+    workspace: &Path,
+    case: Rt64PlatformCase,
+) -> Result<String, PlatformCertificationError> {
+    let adapter_features = case
+        .rt64_adapter_features()
+        .iter()
+        .map(|feature| (*feature).to_owned())
+        .collect::<Vec<_>>();
+    rt64_adapter_source_identity::adapter_source_sha256(
+        &workspace.join("crates/fn64-render-rt64"),
+        env!("FN64_BUILD_TARGET"),
+        &adapter_features,
+    )
+    .map(|sha256| hex(&sha256))
+    .map_err(|source| {
+        PlatformCertificationError::Runner(format!(
+            "compute expected RT64 adapter source identity: {source}"
+        ))
+    })
+}
+
+fn validate_report_binding(
+    target: Rt64PlatformTarget,
+    expected_host: (ReleaseHostPlatform, Option<ReleaseWindowsVersionEvidence>),
+    platform: ReleaseHostPlatform,
+    windows_version: Option<ReleaseWindowsVersionEvidence>,
+    renderer: &ReleaseRendererEvidence,
+    expected_adapter_source_sha256: &str,
+) -> Result<(), PlatformCertificationError> {
+    if (platform, windows_version) != expected_host
+        || !target.matches_host(platform, windows_version)
+    {
+        return Err(PlatformCertificationError::TargetHostMismatch);
+    }
+    let ReleaseRendererEvidence::Rt64 {
+        graphics_api,
+        backend_identity,
+        source_authoritative: true,
+        ..
+    } = renderer
+    else {
+        return Err(PlatformCertificationError::Runner(
+            "RT64 platform request is bound to a report without authoritative RT64 renderer evidence"
+                .to_owned(),
+        ));
+    };
+    if *graphics_api != target.graphics_api()
+        || !backend_identity.ends_with(&format!("post_vi_api={}", target.capture_api()))
+    {
+        return Err(PlatformCertificationError::TargetApiMismatch);
+    }
+    if !backend_identity.contains(&format!(";source={PINNED_RT64_SOURCE_ID};")) {
+        return Err(PlatformCertificationError::SourceMismatch);
+    }
+    if !backend_identity.contains(&format!(
+        ";adapter_sha256={expected_adapter_source_sha256};"
+    )) {
+        return Err(PlatformCertificationError::AdapterSourceMismatch);
+    }
+    Ok(())
 }
 
 fn bound_matrix_series(
@@ -1495,6 +1682,24 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn rt64_renderer(
+        target: Rt64PlatformTarget,
+        adapter_source_sha256: &str,
+    ) -> ReleaseRendererEvidence {
+        ReleaseRendererEvidence::Rt64 {
+            execution_policy: crate::ReleaseGraphicsExecutionPolicy::LleAccuracy,
+            tv_type: crate::ReleaseTvStandard::Ntsc,
+            graphics_api: target.graphics_api(),
+            backend_identity: format!(
+                "adapter=fn64-render-rt64/rt64;adapter_sha256={adapter_source_sha256};source={PINNED_RT64_SOURCE_ID};provenance=git-clean;overlay=none;post_vi_api={}",
+                target.capture_api()
+            ),
+            source_authoritative: true,
+            settings_sha256: "11".repeat(32),
+            replacement_packs_active: false,
+        }
+    }
+
     fn windows(build: u32) -> ReleaseWindowsVersionEvidence {
         ReleaseWindowsVersionEvidence::from_native_workstation(10, 0, build, 123).unwrap()
     }
@@ -1753,5 +1958,67 @@ mod tests {
     #[test]
     fn embedded_cargo_identity_revalidates() {
         assert!(verified_build_cargo().unwrap().is_file());
+    }
+
+    #[test]
+    fn platform_binding_preflight_rejects_stale_adapter_source() {
+        let current = "ab".repeat(32);
+        let stale = rt64_renderer(Rt64PlatformTarget::MacosMetal, &"cd".repeat(32));
+        assert_eq!(
+            validate_report_binding(
+                Rt64PlatformTarget::MacosMetal,
+                (ReleaseHostPlatform::MacosArm64, None),
+                ReleaseHostPlatform::MacosArm64,
+                None,
+                &stale,
+                &current,
+            ),
+            Err(PlatformCertificationError::AdapterSourceMismatch)
+        );
+
+        let matching = rt64_renderer(Rt64PlatformTarget::MacosMetal, &current);
+        assert_eq!(
+            validate_report_binding(
+                Rt64PlatformTarget::MacosMetal,
+                (ReleaseHostPlatform::MacosArm64, None),
+                ReleaseHostPlatform::MacosArm64,
+                None,
+                &matching,
+                &current,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn platform_binding_preflight_requires_exact_windows_host_evidence() {
+        let target = Rt64PlatformTarget::Windows11D3d12;
+        let adapter_source_sha256 = "ab".repeat(32);
+        let renderer = rt64_renderer(target, &adapter_source_sha256);
+        let current = windows(26100);
+        let retained = windows(22631);
+        assert_eq!(current.family, retained.family);
+        assert_eq!(
+            validate_report_binding(
+                target,
+                (ReleaseHostPlatform::WindowsX86_64, Some(current)),
+                ReleaseHostPlatform::WindowsX86_64,
+                Some(retained),
+                &renderer,
+                &adapter_source_sha256,
+            ),
+            Err(PlatformCertificationError::TargetHostMismatch)
+        );
+        assert_eq!(
+            validate_report_binding(
+                target,
+                (ReleaseHostPlatform::WindowsX86_64, Some(current)),
+                ReleaseHostPlatform::WindowsX86_64,
+                Some(current),
+                &renderer,
+                &adapter_source_sha256,
+            ),
+            Ok(())
+        );
     }
 }

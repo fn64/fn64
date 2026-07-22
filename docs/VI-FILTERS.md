@@ -124,18 +124,31 @@ Code 0 remains ambiguous across modulo-wrap and zero-destination
 save/unqualified paths. Code 7 is treated as full, but pinned RT64 aliases
 managed 7/8 and clamped 8/8 at that code; the fixture's opaque code-7 controls
 are known full by construction, not by the encoding alone. An independent CPU
-oracle expands the declared RGB5 source, asserts all six admitted neighbors
-are the fixture's full controls, discards one componentwise minimum and
-maximum, applies the penultimate interval and coverage-four Equation-4 blend,
-and expects exact RGB `[132, 78, 99]`. The eleven-phase Metal fixture proves
-modes 0/1 are identical, modes 2/3 restore the pinned baseline, compatibility
-`Unspecified` matches compatibility replicate while explicit compatibility
-mode 0 matches the AA oracle, AA changes exactly one projected pixel, divot
-alone changes one, and AA-before-divot changes two.
-The four exact BGRA8 digests are stable while one workload is retained and
-presentation identity advances. This proves the bounded public arithmetic and
-stage order over a deliberately generated RT64 code-4/code-7 managed source;
-it does not promote that managed alpha to authoritative N64 hidden coverage.
+oracle expands each declared RGB5 source, asserts all six admitted neighbors
+around each target are the fixture's full controls, discards one
+componentwise minimum and maximum, and applies the penultimate interval and
+Equation-4 blend independently for managed coverage codes 1 through 6. The
+resulting exact RGB8 vectors, in coverage-code order, are `[50, 45, 35]`,
+`[76, 60, 53]`, `[102, 70, 75]`, `[128, 87, 95]`, `[158, 95, 109]`, and
+`[185, 113, 128]`. The divot oracle independently reconstructs each
+horizontal triplet from the declared RDP source before projection rather than
+borrowing already projected neighboring pixels. The eleven-phase Metal
+fixture proves modes 0/1 are identical, modes 2/3 restore the pinned baseline,
+compatibility `Unspecified` matches compatibility replicate while explicit
+compatibility mode 0 matches the AA oracle, and AA, divot alone, and
+AA-before-divot each change exactly the six projected target pixels. The four
+exact BGRA8 SHA-256 digests are baseline
+`6639c251163aa9dc6d660abf9da11a20bf29222b5d6d16ba0743f599e0666730`, AA
+`83cf93557a7ad54d2a3d6badee86664b07f3df46383b28e16393a032ca9895f9`, divot
+`8220a101f0de0ffdcefef798c2cec0fd46d3ff653de584a062c8fa86785e1801`, and
+combined
+`af2739c8bb26869cafbf62f62f52e343b61a38addb0df31aba3e09b5f4bda17b`; they
+remain stable while one workload is retained and presentation identity
+advances. This proves the bounded public arithmetic and stage order over
+deliberately generated RT64-managed codes 1-6 with opaque code-7 controls in
+pinned Metal's nearest, progressive, synthetic RGBA16 path under the
+original-aspect (4:3) presentation policy. It does not promote that managed
+alpha to authoritative N64 hidden coverage.
 
 The eleven-phase selector fixture is embedded in every
 `rt64_metal_backend_behavior` process. The recreated context remains live
@@ -143,11 +156,11 @@ across the compatibility present, live nearest-policy application, the
 twenty-phase filter gate, a resize, and this selector gate. Exact identity is
 `workload/present 1/1` for the recreated release present, `1/2` for
 compatibility, workload 2 with presents 3 through 22 for filters, and workload
-3 with presents 23 through 33 for the selector. On 2026-07-21 that unchanged
-source passed the official watchdog-bounded backend-lifecycle runner in 20/20
-fresh processes on Darwin 25.5.0 arm64. The runner also enforces the macOS
-surface-teardown interval, while each successful child drains the present
-queue before destroying the final context.
+3 with presents 23 through 33 for the selector. On 2026-07-22 the expanded
+codes-1-6 source passed the official watchdog-bounded backend-lifecycle runner
+in 20/20 fresh processes on Darwin 25.5.0 arm64. The runner also enforces the
+macOS surface-teardown interval, while each successful child drains the
+present queue before destroying the final context.
 
 | Native phase | Nonblack pixels | Unique colors |
 | --- | ---: | ---: |
@@ -216,14 +229,14 @@ tool's consensus result cannot close the base-renderer row by itself.
 - Exact interaction timing between filter blocks and field/retrace state.
 - Mode-0 unconditional versus mode-1 conditional extra-line fetch timing and
   memory-bus behavior; their public pixel-stage selection is implemented.
-- Native RT64 AA-selector arithmetic is certified only for deliberately
-  generated code 4 with opaque code-7 controls in the pinned-Metal, nearest,
-  progressive synthetic projection. The shader admits managed codes 1-6, but
-  codes 1, 2, 3, 5, and 6 do not yet have native pixel vectors. Code 7 aliases
-  RT64's managed 7/8 and clamped 8/8 estimates. Code 0/save semantics, natural
-  triangle coverage, imported framebuffer
-  hidden coverage, insufficient-neighborhood output, interlaced/scaled and
-  linear/anti-aliased-pixel-scaling paths, enhancement resolution,
+- Native RT64 AA-selector arithmetic is certified for deliberately generated
+  managed codes 1-6 with opaque code-7 controls in the pinned-Metal, nearest,
+  progressive synthetic RGBA16 projection under the original-aspect (4:3)
+  presentation policy. Code 7 aliases RT64's managed 7/8 and clamped 8/8
+  estimates. Code 0/save semantics, natural triangle coverage, imported
+  framebuffer hidden coverage, insufficient-neighborhood output,
+  interlaced/scaled and linear/anti-aliased-pixel-scaling paths, enhancement
+  resolution,
   MSAA/downsample resolve semantics, D3D12, Vulkan, and representative
   full-ROM presentation remain open rather than inheriting that narrow
   result. RGBA16 dither restoration has the same bounded managed-source

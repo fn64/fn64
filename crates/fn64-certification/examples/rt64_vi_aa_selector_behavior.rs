@@ -14,13 +14,36 @@ use sha2::{Digest, Sha256};
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
 const COMMANDS: usize = 0x100;
 const TARGET: u32 = 0x8000;
-const WIDTH: u32 = 8;
+const WIDTH: u32 = 32;
 const HEIGHT: u32 = 5;
 // Pinned RT64's public VI-size heuristic expands this five-line viewport to
 // an eight-row source lattice. Populate the complete lattice so nearest
 // sampling never relies on an uninitialized border.
 const SOURCE_HEIGHT: u32 = 8;
-const CENTER: (u32, u32) = (3, 2);
+const PARTIALS: [(u32, u32, u8); 6] = [
+    (3, 2, 1),
+    (8, 2, 2),
+    (13, 2, 3),
+    (18, 2, 4),
+    (23, 2, 5),
+    (27, 2, 6),
+];
+const PATCH_SHIFTS: [[u8; 3]; 6] = [
+    [0, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1],
+    [0, 1, 1],
+    [1, 0, 0],
+    [1, 1, 0],
+];
+const EXPECTED_AA_RGB8: [[u8; 3]; 6] = [
+    [50, 45, 35],
+    [76, 60, 53],
+    [102, 70, 75],
+    [128, 87, 95],
+    [158, 95, 109],
+    [185, 113, 128],
+];
 const STATUS_RGBA16_AA_ALWAYS: u32 = 0x002;
 const STATUS_RGBA16_AA_NEEDED: u32 = 0x102;
 const STATUS_RGBA16_RESAMPLE: u32 = 0x202;
@@ -29,10 +52,10 @@ const STATUS_DIVOT: u32 = 1 << 4;
 const CVG_DST_CLAMP: u32 = 0;
 const CVG_X_ALPHA: u32 = 0x1000;
 
-const BASELINE_SHA256: &str = "dc2f73283b7663a236726bc08eb5c941cac5010cb91104e3b90bd1dab8ec12c3";
-const AA_SHA256: &str = "bbc7e1e3c901e25bdc513246f119f1f6289f5cbc4994c5379dbdf0e6e07068a6";
-const DIVOT_SHA256: &str = "50367cf303140a240d094981f54a6b1eaa2160f40890c4872edd6aa457f45156";
-const AA_DIVOT_SHA256: &str = "3649aadadcfb778f6e163414dbee0a20b5a5f26845ca4542da3959580846a992";
+const BASELINE_SHA256: &str = "6639c251163aa9dc6d660abf9da11a20bf29222b5d6d16ba0743f599e0666730";
+const AA_SHA256: &str = "83cf93557a7ad54d2a3d6badee86664b07f3df46383b28e16393a032ca9895f9";
+const DIVOT_SHA256: &str = "8220a101f0de0ffdcefef798c2cec0fd46d3ff653de584a062c8fa86785e1801";
+const AA_DIVOT_SHA256: &str = "af2739c8bb26869cafbf62f62f52e343b61a38addb0df31aba3e09b5f4bda17b";
 
 #[derive(Clone, Copy, Debug)]
 struct Phase {
@@ -64,26 +87,42 @@ pub struct ViAaSelectorRunSummary {
 }
 
 fn rgb5(x: u32, y: u32) -> [u8; 3] {
-    match (x, y) {
-        CENTER => [28, 16, 20],
-        (2, 1) => [2, 1, 2],
-        (4, 1) => [24, 3, 4],
-        (1, 2) => [4, 5, 6],
-        (5, 2) => [22, 7, 8],
-        (2, 3) => [6, 9, 10],
-        (4, 3) => [20, 11, 12],
-        (2, 2) => [10, 6, 8],
-        (4, 2) => [22, 13, 16],
-        _ => [2 + y as u8, 3 + y as u8, 1 + y as u8],
+    const PATCH: [((i32, i32), [u8; 3]); 9] = [
+        ((0, 0), [28, 16, 20]),
+        ((-1, -1), [3, 4, 2]),
+        ((1, -1), [3, 4, 2]),
+        ((-2, 0), [3, 4, 2]),
+        ((2, 0), [3, 4, 2]),
+        ((-1, 1), [3, 4, 2]),
+        ((1, 1), [3, 4, 2]),
+        ((-1, 0), [10, 6, 8]),
+        ((1, 0), [22, 13, 16]),
+    ];
+    for (index, &(center_x, center_y, _)) in PARTIALS.iter().enumerate() {
+        let relative = (x as i32 - center_x as i32, y as i32 - center_y as i32);
+        if let Some((_, color)) = PATCH.iter().find(|(offset, _)| *offset == relative) {
+            let shift = if relative.1 == 0 && relative.0.abs() <= 1 {
+                PATCH_SHIFTS[index]
+            } else {
+                [0, 0, 0]
+            };
+            return [
+                color[0] + shift[0],
+                color[1] + shift[1],
+                color[2] + shift[2],
+            ];
+        }
     }
+    [2 + y as u8, 3 + y as u8, 1 + y as u8]
 }
 
 fn coverage_code(x: u32, y: u32) -> u8 {
-    if (x, y) == CENTER {
-        4
-    } else {
-        7
-    }
+    PARTIALS
+        .iter()
+        .find_map(|&(center_x, center_y, coverage)| {
+            ((x, y) == (center_x, center_y)).then_some(coverage)
+        })
+        .unwrap_or(7)
 }
 
 fn expand5(value: u8) -> u8 {
@@ -99,6 +138,14 @@ fn push(commands: &mut Vec<(u32, u32)>, word0: u32, word1: u32) {
 }
 
 fn fixture() -> (Vec<u8>, u32) {
+    assert_eq!(
+        PARTIALS
+            .iter()
+            .map(|&(_, _, coverage)| coverage)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([1, 2, 3, 4, 5, 6]),
+        "fixture must cover every qualified managed code exactly once"
+    );
     let mut commands = Vec::new();
     push(&mut commands, 0xff10_0000 | (WIDTH - 1), TARGET);
     push(
@@ -126,22 +173,29 @@ fn fixture() -> (Vec<u8>, u32) {
         0xed00_0000,
         ((WIDTH * 4) << 12) | (SOURCE_HEIGHT * 4),
     );
-    let [red, green, blue] = rgb5(CENTER.0, CENTER.1).map(expand5);
-    push(
-        &mut commands,
-        0xfa00_0000,
-        (u32::from(red) << 24) | (u32::from(green) << 16) | (u32::from(blue) << 8) | 0x80,
-    );
-    push(
-        &mut commands,
-        0xf600_0000 | (((WIDTH - 1) * 4) << 12) | ((SOURCE_HEIGHT - 1) * 4),
-        0,
-    );
+    for (x, y, coverage) in PARTIALS {
+        let [red, green, blue] = rgb5(x, y).map(expand5);
+        push(
+            &mut commands,
+            0xfa00_0000,
+            (u32::from(red) << 24)
+                | (u32::from(green) << 16)
+                | (u32::from(blue) << 8)
+                | u32::from(coverage * 0x20),
+        );
+        // One-cycle rectangles use an exclusive lower-right edge. Keep each
+        // alpha-derived managed-coverage probe isolated to one source pixel.
+        push(
+            &mut commands,
+            0xf600_0000 | (((x + 1) * 4) << 12) | ((y + 1) * 4),
+            ((x * 4) << 12) | (y * 4),
+        );
+    }
     push(&mut commands, 0xe700_0000, 0);
     push(&mut commands, 0xef30_00f0, CVG_DST_CLAMP);
     for y in 0..SOURCE_HEIGHT {
         for x in 0..WIDTH {
-            if (x, y) == CENTER {
+            if coverage_code(x, y) != 7 {
                 continue;
             }
             let color = u32::from(rgba16(rgb5(x, y)));
@@ -212,57 +266,49 @@ fn pixel(bytes: &[u8], x: u32, y: u32) -> &[u8] {
     &bytes[start..start + 4]
 }
 
-fn validate_projected_lattice(baseline: &[u8]) -> (u32, u32) {
+fn validate_projected_lattice(baseline: &[u8]) -> Vec<(u32, u32, u8)> {
     assert_eq!(baseline.len(), (WIDTH * HEIGHT * 4) as usize);
-    let center = rgb5(CENTER.0, CENTER.1);
-    let mut projected_center = None;
     for y in 0..HEIGHT {
         for x in 0..WIDTH {
             let observed = pixel(baseline, x, y);
             assert_eq!(observed[3], 0xff, "post-VI alpha drifted at ({x}, {y})");
-            if [observed[2] >> 3, observed[1] >> 3, observed[0] >> 3] == center {
-                assert!(
-                    projected_center.replace((x, y)).is_none(),
-                    "declared partial foreground projected more than once"
-                );
-            }
         }
     }
-    let projected_center = projected_center.expect("declared partial foreground was not sampled");
-    assert_eq!(projected_center, (3, 1));
-    for (x, declared) in [
-        (projected_center.0 - 1, rgb5(CENTER.0 - 1, CENTER.1)),
-        (projected_center.0 + 1, rgb5(CENTER.0 + 1, CENTER.1)),
-    ] {
-        let observed = pixel(baseline, x, projected_center.1);
+    let mut projected = Vec::new();
+    for (source_x, source_y, coverage) in PARTIALS {
+        let center = rgb5(source_x, source_y);
+        let matches = (0..HEIGHT)
+            .flat_map(|y| (0..WIDTH).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let observed = pixel(baseline, x, y);
+                [observed[2] >> 3, observed[1] >> 3, observed[0] >> 3] == center
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            [observed[2] >> 3, observed[1] >> 3, observed[0] >> 3],
-            declared,
-            "projected horizontal source lattice drifted at x={x}"
+            matches.len(),
+            1,
+            "declared coverage-{coverage} foreground did not project exactly once"
         );
+        let projected_center = matches[0];
+        assert_eq!(
+            projected_center.1, 1,
+            "coverage-{coverage} vertical projection drifted"
+        );
+        projected.push((projected_center.0, projected_center.1, coverage));
     }
-    assert_eq!(
-        baseline
-            .chunks_exact(4)
-            .filter(|pixel| pixel[..3] == [0, 0, 0])
-            .count(),
-        10,
-        "pinned RT64 projection border drifted"
-    );
-    projected_center
+    projected
 }
 
-fn coverage_aa_center_rgb() -> [u8; 3] {
+fn coverage_aa_center_rgb(center: (u32, u32), coverage: u8, foreground: [u8; 3]) -> [u8; 3] {
     const OFFSETS: [(i32, i32); 6] = [(-1, -1), (1, -1), (-2, 0), (2, 0), (-1, 1), (1, 1)];
-    let foreground = rgb5(CENTER.0, CENTER.1).map(expand5);
     let mut neighbors = Vec::new();
     for (delta_x, delta_y) in OFFSETS {
-        let neighbor_x = (CENTER.0 as i32 + delta_x) as u32;
-        let neighbor_y = (CENTER.1 as i32 + delta_y) as u32;
+        let neighbor_x = (center.0 as i32 + delta_x) as u32;
+        let neighbor_y = (center.1 as i32 + delta_y) as u32;
         assert_eq!(coverage_code(neighbor_x, neighbor_y), 7);
         neighbors.push(rgb5(neighbor_x, neighbor_y).map(expand5));
     }
-    let coverage = coverage_code(CENTER.0, CENTER.1);
+    assert_eq!(coverage_code(center.0, center.1), coverage);
     let mut filtered = foreground;
     for channel in 0..3 {
         let mut components: Vec<u8> = neighbors.iter().map(|neighbor| neighbor[channel]).collect();
@@ -278,15 +324,33 @@ fn coverage_aa_center_rgb() -> [u8; 3] {
             + 4)
             / 8) as u8;
     }
-    assert_eq!(filtered, [132, 78, 99]);
     filtered
 }
 
-fn coverage_aa_oracle(source: &[u8], projected_center: (u32, u32)) -> Vec<u8> {
+fn coverage_aa_oracle(
+    source: &[u8],
+    projected: &[(u32, u32, u8)],
+    expected_rgb: Option<&[[u8; 3]; 6]>,
+) -> Vec<u8> {
     let mut output = source.to_vec();
-    let filtered = coverage_aa_center_rgb();
-    let start = ((projected_center.1 * WIDTH + projected_center.0) * 4) as usize;
-    output[start..start + 3].copy_from_slice(&[filtered[2], filtered[1], filtered[0]]);
+    for (
+        index,
+        (&(source_x, source_y, coverage), &(projected_x, projected_y, projected_coverage)),
+    ) in PARTIALS.iter().zip(projected).enumerate()
+    {
+        assert_eq!(projected_coverage, coverage);
+        let raw = pixel(source, projected_x, projected_y);
+        let filtered =
+            coverage_aa_center_rgb((source_x, source_y), coverage, [raw[2], raw[1], raw[0]]);
+        if let Some(expected_rgb) = expected_rgb {
+            assert_eq!(
+                filtered, expected_rgb[index],
+                "coverage-{coverage} Equation-4 oracle drifted"
+            );
+        }
+        let start = ((projected_y * WIDTH + projected_x) * 4) as usize;
+        output[start..start + 3].copy_from_slice(&[filtered[2], filtered[1], filtered[0]]);
+    }
     output
 }
 
@@ -296,20 +360,18 @@ fn median(left: u8, center: u8, right: u8) -> u8 {
     values[1]
 }
 
-fn divot_oracle(source: &[u8], partial: (u32, u32)) -> Vec<u8> {
+fn divot_oracle(source: &[u8], partials: &[(u32, u32, u8)]) -> Vec<u8> {
     let mut output = source.to_vec();
-    for y in 0..HEIGHT {
-        for x in 1..WIDTH - 1 {
-            if y != partial.1 || ![x - 1, x, x + 1].contains(&partial.0) {
-                continue;
-            }
-            let left = pixel(source, x - 1, y);
-            let center = pixel(source, x, y);
-            let right = pixel(source, x + 1, y);
-            let start = ((y * WIDTH + x) * 4) as usize;
-            for channel in 0..3 {
-                output[start + channel] = median(left[channel], center[channel], right[channel]);
-            }
+    for (&(source_x, source_y, _), &(projected_x, projected_y, _)) in PARTIALS.iter().zip(partials)
+    {
+        let left_rgb = rgb5(source_x - 1, source_y).map(expand5);
+        let right_rgb = rgb5(source_x + 1, source_y).map(expand5);
+        let left = [left_rgb[2], left_rgb[1], left_rgb[0]];
+        let right = [right_rgb[2], right_rgb[1], right_rgb[0]];
+        let center = pixel(source, projected_x, projected_y);
+        let start = ((projected_y * WIDTH + projected_x) * 4) as usize;
+        for channel in 0..3 {
+            output[start + channel] = median(left[channel], center[channel], right[channel]);
         }
     }
     output
@@ -462,11 +524,11 @@ fn run_created(backend: &mut Rt64Backend) -> Result<ViAaSelectorRunSummary, Box<
             .unwrap_or_else(|| panic!("missing AA-selector observation {label}"))
     };
     let baseline = &by_label("mode-3-baseline").bytes;
-    let projected_center = validate_projected_lattice(baseline);
-    let expected_aa = coverage_aa_oracle(baseline, projected_center);
-    let expected_divot = divot_oracle(baseline, projected_center);
-    let expected_aa_divot = divot_oracle(&expected_aa, projected_center);
-    let reverse_divot_then_aa = coverage_aa_oracle(&expected_divot, projected_center);
+    let projected = validate_projected_lattice(baseline);
+    let expected_aa = coverage_aa_oracle(baseline, &projected, Some(&EXPECTED_AA_RGB8));
+    let expected_divot = divot_oracle(baseline, &projected);
+    let expected_aa_divot = divot_oracle(&expected_aa, &projected);
+    let reverse_divot_then_aa = coverage_aa_oracle(&expected_divot, &projected, None);
     assert_ne!(
         reverse_divot_then_aa, expected_aa_divot,
         "fixture no longer distinguishes AA-before-divot from the reverse order"
@@ -494,9 +556,12 @@ fn run_created(backend: &mut Rt64Backend) -> Result<ViAaSelectorRunSummary, Box<
     assert_eq!(by_label("mode-3-divot").bytes, expected_divot);
     assert_eq!(by_label("mode-0-aa-divot").bytes, expected_aa_divot);
     let compatibility_baseline = &by_label("compat-replicate").bytes;
-    let compatibility_center = validate_projected_lattice(compatibility_baseline);
-    let expected_compatibility_aa =
-        coverage_aa_oracle(compatibility_baseline, compatibility_center);
+    let compatibility_projected = validate_projected_lattice(compatibility_baseline);
+    let expected_compatibility_aa = coverage_aa_oracle(
+        compatibility_baseline,
+        &compatibility_projected,
+        Some(&EXPECTED_AA_RGB8),
+    );
     assert_eq!(compatibility_baseline, baseline);
     assert_eq!(expected_compatibility_aa, expected_aa);
     assert_eq!(
@@ -507,11 +572,13 @@ fn run_created(backend: &mut Rt64Backend) -> Result<ViAaSelectorRunSummary, Box<
         by_label("compat-mode-0-aa").bytes,
         expected_compatibility_aa
     );
-    assert_eq!(changed_pixels(baseline, &expected_aa), 1);
-    assert_eq!(changed_pixels(baseline, &expected_divot), 1);
-    assert_eq!(changed_pixels(baseline, &expected_aa_divot), 2);
-    for (left, right) in baseline.chunks_exact(4).zip(expected_aa.chunks_exact(4)) {
-        assert_eq!(left[3], right[3], "AA oracle changed alpha");
+    assert_eq!(changed_pixels(baseline, &expected_aa), 6);
+    assert_eq!(changed_pixels(baseline, &expected_divot), 6);
+    assert_eq!(changed_pixels(baseline, &expected_aa_divot), 6);
+    for expected in [&expected_aa, &expected_divot, &expected_aa_divot] {
+        for (left, right) in baseline.chunks_exact(4).zip(expected.chunks_exact(4)) {
+            assert_eq!(left[3], right[3], "VI filter oracle changed alpha");
+        }
     }
 
     let release = backend.release_capture()?;
@@ -545,7 +612,7 @@ fn run_created(backend: &mut Rt64Backend) -> Result<ViAaSelectorRunSummary, Box<
         }
     }
     println!(
-        "vi_aa_selector_evidence baseline_sha256={} aa_sha256={} divot_sha256={} aa_divot_sha256={} compat_baseline_sha256={} compat_mode0_sha256={} aa_changed_pixels=1 divot_changed_pixels=1 aa_divot_changed_pixels=2 phases={} bounded_residual=rt64-managed-coverage",
+        "vi_aa_selector_evidence baseline_sha256={} aa_sha256={} divot_sha256={} aa_divot_sha256={} compat_baseline_sha256={} compat_mode0_sha256={} coverage_codes=1-6 aa_changed_pixels=6 divot_changed_pixels=6 aa_divot_changed_pixels=6 phases={} bounded_residual=rt64-managed-coverage",
         by_label("mode-3-baseline").sha256,
         by_label("mode-0-aa").sha256,
         by_label("mode-3-divot").sha256,
