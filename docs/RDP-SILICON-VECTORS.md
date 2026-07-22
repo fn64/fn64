@@ -131,6 +131,21 @@ Despite the historical CLI spelling, this intent and analyzer cover only the
 `G_AD_PATTERN`, `G_AD_NOTPATTERN`, or `G_AD_NOISE` alpha-quantization selector
 that runs before blending. Evidence for either axis must not close the other.
 
+The clean pinned RT64 overlay routes one `nextRandUint` result through a typed
+fragment-noise sample: its low-24-bit unit float feeds both combiner NOISE and
+the `G_AC_DITHER` threshold, while its low three bits feed `G_AD_NOISE`. That
+is bounded host routing policy, not evidence for the silicon generator, reset
+seed, advancement, threshold ties, or internal precision. A pinned-Metal
+synthetic phase binds the route relationally: its shared combiner-NOISE/
+`G_AC_DITHER` case accepts exactly 146 pixels, all grayscale and no brighter
+than the primitive half-alpha cutoff. Its complete twelve-phase, seven-repeat
+transcript was identical in 10/10 fresh native processes. That remains
+synthetic native evidence, not exact value parity with the reference lane,
+whose typed `G_AC_DITHER` threshold is derived from a full eight-bit sample. A
+future hardware sequence probe must therefore preserve combiner, G_AD, and
+G_AC observations from the same reset and fragment sequence instead of
+comparing any one selector in isolation.
+
 The analyzer requires all 256 combined-alpha values for both `one_cycle` and
 `two_cycle`, exactly one point per value. Every point must declare replay from
 reset, the same fragment-noise sample index, and the same distinct pass/reject

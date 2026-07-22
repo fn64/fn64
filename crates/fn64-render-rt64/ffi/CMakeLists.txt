@@ -84,8 +84,8 @@ set_source_files_properties(
 
 # Compile one exact-source raster overlay into every native pixel-shader
 # permutation selected by pinned RT64. The generated HLSL retains RT64's
-# complete shader while inserting the fn64-owned alpha quantizer only after
-# alpha compare and coverage have completed and immediately before blending.
+# complete shader while routing one typed fragment-noise sample through the
+# combiner, alpha compare, and fn64-owned pre-blend alpha quantizer.
 set(FN64_RT64_RASTER_PS_SOURCE
     "${FN64_RT64_SOURCE_DIR}/src/shaders/RasterPS.hlsl")
 file(SHA256
@@ -117,13 +117,66 @@ string(REPLACE
     "${FN64_RT64_RASTER_PS_INCLUDE_PATCHED}"
     FN64_RT64_RASTER_PS_PATCHED
     "${FN64_RT64_RASTER_PS_PATCHED}")
+set(FN64_RT64_RASTER_PS_NOISE_SAMPLE_ORIGINAL [=[    int2 pixelPosSeed = floor(vertexPosition.xy);
+    uint randomSeed = initRand(FrParams.frameCount, instanceIndex * pixelPosSeed.y * pixelPosSeed.x, 16); // TODO: Review seed.]=])
+set(FN64_RT64_RASTER_PS_NOISE_SAMPLE_PATCHED [=[    int2 pixelPosSeed = floor(vertexPosition.xy);
+    uint randomSeed = initRand(FrParams.frameCount, instanceIndex * pixelPosSeed.y * pixelPosSeed.x, 16); // TODO: Review seed.
+    Fn64RdpFragmentNoiseSample fragmentNoise =
+        Fn64RdpTakeFragmentNoiseSample(randomSeed);]=])
+string(FIND
+    "${FN64_RT64_RASTER_PS_PATCHED}"
+    "${FN64_RT64_RASTER_PS_NOISE_SAMPLE_ORIGINAL}"
+    FN64_RT64_RASTER_PS_NOISE_SAMPLE_OFFSET)
+if(FN64_RT64_RASTER_PS_NOISE_SAMPLE_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 raster PS random-seed context changed; review the fn64 shared fragment-noise overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_RASTER_PS_NOISE_SAMPLE_ORIGINAL}"
+    "${FN64_RT64_RASTER_PS_NOISE_SAMPLE_PATCHED}"
+    FN64_RT64_RASTER_PS_PATCHED
+    "${FN64_RT64_RASTER_PS_PATCHED}")
+set(FN64_RT64_RASTER_PS_COMBINER_NOISE_ORIGINAL
+    "    ccInputs.noise = nextRand(randomSeed);")
+set(FN64_RT64_RASTER_PS_COMBINER_NOISE_PATCHED
+    "    ccInputs.noise = Fn64RdpFragmentNoiseUnitFloat(fragmentNoise);")
+string(FIND
+    "${FN64_RT64_RASTER_PS_PATCHED}"
+    "${FN64_RT64_RASTER_PS_COMBINER_NOISE_ORIGINAL}"
+    FN64_RT64_RASTER_PS_COMBINER_NOISE_OFFSET)
+if(FN64_RT64_RASTER_PS_COMBINER_NOISE_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 raster PS combiner-noise context changed; review the fn64 shared fragment-noise overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_RASTER_PS_COMBINER_NOISE_ORIGINAL}"
+    "${FN64_RT64_RASTER_PS_COMBINER_NOISE_PATCHED}"
+    FN64_RT64_RASTER_PS_PATCHED
+    "${FN64_RT64_RASTER_PS_PATCHED}")
+set(FN64_RT64_RASTER_PS_ALPHA_COMPARE_NOISE_ORIGINAL
+    "        if (alphaCompareValue < nextRand(randomSeed)) {")
+set(FN64_RT64_RASTER_PS_ALPHA_COMPARE_NOISE_PATCHED
+    "        if (alphaCompareValue < Fn64RdpFragmentNoiseUnitFloat(fragmentNoise)) {")
+string(FIND
+    "${FN64_RT64_RASTER_PS_PATCHED}"
+    "${FN64_RT64_RASTER_PS_ALPHA_COMPARE_NOISE_ORIGINAL}"
+    FN64_RT64_RASTER_PS_ALPHA_COMPARE_NOISE_OFFSET)
+if(FN64_RT64_RASTER_PS_ALPHA_COMPARE_NOISE_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 raster PS alpha-compare-noise context changed; review the fn64 shared fragment-noise overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_RASTER_PS_ALPHA_COMPARE_NOISE_ORIGINAL}"
+    "${FN64_RT64_RASTER_PS_ALPHA_COMPARE_NOISE_PATCHED}"
+    FN64_RT64_RASTER_PS_PATCHED
+    "${FN64_RT64_RASTER_PS_PATCHED}")
 set(FN64_RT64_RASTER_PS_BLEND_ORIGINAL [=[    // Add the blender if it can be replicated with simple emulation.
     Blender::Inputs blInputs;]=])
 set(FN64_RT64_RASTER_PS_BLEND_PATCHED [=[    // Alpha compare and coverage intentionally observe the original combiner
     // alpha. Only the combiner input to blending receives this bounded policy;
     // shade, fog, alpha-compare, and coverage alpha remain unchanged.
     combinerColor.a = Fn64RdpAlphaDitherCombinerAlpha(
-        otherMode, combinerColor.a, floor(vertexPosition.xy), randomSeed);
+        otherMode, combinerColor.a, floor(vertexPosition.xy), fragmentNoise);
 
     // Add the blender if it can be replicated with simple emulation.
     Blender::Inputs blInputs;]=])
@@ -140,6 +193,14 @@ string(REPLACE
     "${FN64_RT64_RASTER_PS_BLEND_PATCHED}"
     FN64_RT64_RASTER_PS_PATCHED
     "${FN64_RT64_RASTER_PS_PATCHED}")
+string(FIND
+    "${FN64_RT64_RASTER_PS_PATCHED}"
+    "nextRand(randomSeed)"
+    FN64_RT64_RASTER_PS_UNSHARED_NOISE_OFFSET)
+if(NOT FN64_RT64_RASTER_PS_UNSHARED_NOISE_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 raster PS retains an unshared fragment-noise draw")
+endif()
 set(FN64_RT64_RASTER_PS_PATCHED_SOURCE
     "${CMAKE_CURRENT_BINARY_DIR}/fn64_rt64_raster_ps.hlsl")
 file(WRITE
