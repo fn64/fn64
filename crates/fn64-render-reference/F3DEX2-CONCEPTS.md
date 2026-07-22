@@ -1005,11 +1005,20 @@ hardware-trace work; this is not claimed bit-exact.
   blender and are unaffected.
 - **`G_FILLRECT`** (`0xF6`) snapshots the RDP state at its command position.
   Fill cycle uses the raw fill register and inclusive lower-right rule.
+  The public *N64 Functions Reference* `gDPFillRectangle` Note forbids a
+  Z-buffer render mode in Fill cycle, while `gDPSetCycleType` Notes require
+  `G_RM_NOOP`/`G_RM_NOOP2` because a depth read can hang the RDP. One typed
+  bypass-hazard validator therefore rejects retained `Z_CMP`, `Z_UPD`, or
+  `IM_RD` before any color/depth mutation; the backend error and direct
+  framebuffer/depth entry points consume the same validator.
   One/two-cycle rectangles use exclusive lower-right bounds and the supported
   combiner, alpha-compare, primitive-depth, framebuffer-blender, ordered-
   dither, coverage, and color-write path. A rectangle whose combiner requires
   texture, shade, LOD, or an unavailable prior COMBINED value traps by
-  source name; copy-cycle `G_FILLRECT` remains a loud gap.
+  source name. Copy-cycle `G_FILLRECT` remains a loud rejection because the
+  public Functions Reference says its rendering result is not guaranteed and
+  directs callers to `gSPTextureRectangle`; no result is invented for that
+  invalid public use.
 - **`G_SETPRIMCOLOR`/`G_SETENVCOLOR`/`G_SETFOGCOLOR`/`G_SETFILLCOLOR`/
   `G_SETBLENDCOLOR`** (`0xFA`/`0xFB`/`0xF8`/`0xF7`/`0xF9`): flat color
   registers fed to the combiner/blender. Primitive and environment RGBA are

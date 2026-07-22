@@ -1873,12 +1873,23 @@ fn validate_fill_rectangle(rectangle: &gbi::FillRectangle) -> Result<(), RenderE
         reason,
     };
     match rectangle.cycle_type {
-        CycleType::Fill => return Ok(()),
+        CycleType::Fill => {
+            if let Err(hazards) = rectangle.other_mode.validate_fill_cycle_bypass() {
+                return Err(render_unsupported_error(
+                    "reference",
+                    "render.rdp.fill-cycle-hazard-state",
+                    format!(
+                        "G_FILLRECT in Fill cycle retains unsafe {hazards} state; the public fill contract requires G_RM_NOOP/G_RM_NOOP2, and retaining Z/framebuffer consumers is outside that safe contract (a depth read can hang the RDP)"
+                    ),
+                ));
+            }
+            return Ok(());
+        }
         CycleType::Copy => {
             return Err(render_unsupported_error(
                 "reference",
                 "render.rdp.fill-rectangle-cycle",
-                "G_FILLRECT in copy cycle is not implemented",
+                "G_FILLRECT in copy cycle has no guaranteed public result; use G_TEXRECT",
             ));
         }
         CycleType::OneCycle | CycleType::TwoCycle => {}
@@ -4820,6 +4831,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fill_cycle_rejects_every_unsafe_bypass_state_before_mutation() {
+        let rectangle = |low| gbi::FillRectangle {
+            ulx: 0.0,
+            uly: 0.0,
+            lrx: 1.0,
+            lry: 0.0,
+            fill_color: 0xffff_ffff,
+            cycle_type: gbi::CycleType::Fill,
+            scissor: None,
+            other_mode: gbi::OtherMode::from_raw(3 << 20, low, 0),
+            combiner: gbi::CombinerState::default(),
+            blender: gbi::BlenderState::default(),
+        };
+
+        assert!(validate_fill_rectangle(&rectangle(0)).is_ok());
+        for hazards in 1u32..8 {
+            let low = ((hazards & 1) << 4) | ((hazards & 2) << 4) | ((hazards & 4) << 4);
+            let error = validate_fill_rectangle(&rectangle(low))
+                .expect_err("every nonempty Fill-cycle hazard set must fail closed");
+            let message = error.to_string();
+            assert!(message.contains("unsafe"));
+            assert!(message.contains("G_RM_NOOP/G_RM_NOOP2"));
+        }
+
+        const START: usize = 0x100;
+        const TARGET: u32 = 0x400;
+        let commands: [(u32, u32); 5] = [
+            (0xff10_0001, TARGET),
+            // Fill cycle with IM_RD retained. This was the silent old path:
+            // it wrote the target even though the public fill contract
+            // requires the bypass-safe NOOP render mode.
+            (0xef00_0000 | (3 << 20), 1 << 6),
+            (0xf700_0000, 0xffff_ffff),
+            (0xf600_0000 | (4 << 12), 0),
+            (0xe900_0000, 0),
+        ];
+        let mut rdram = vec![0xa5; 0x800];
+        for (index, (w0, w1)) in commands.into_iter().enumerate() {
+            let offset = START + index * 8;
+            rdram[offset..offset + 4].copy_from_slice(&w0.to_ne_bytes());
+            rdram[offset + 4..offset + 8].copy_from_slice(&w1.to_ne_bytes());
+        }
+        let before = rdram.clone();
+        let mut backend = ReferenceBackend::new();
+        backend.create(&RenderConfig::ntsc(2, 1)).unwrap();
+        let error = backend
+            .process_rdp_commands(
+                &mut rdram,
+                START as u32,
+                (START + commands.len() * 8) as u32,
+                0,
+            )
+            .expect_err("unsafe Fill-cycle IM_RD must reject before target writeback");
+        assert!(error.to_string().contains("unsafe IM_RD state"));
+        assert_eq!(rdram, before);
     }
 
     #[test]

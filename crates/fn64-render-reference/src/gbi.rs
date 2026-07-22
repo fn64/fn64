@@ -1353,6 +1353,26 @@ impl OtherMode {
         self.low & 0x0040 != 0
     }
 
+    /// Classify state that is unsafe while the RDP arithmetic pipeline is
+    /// bypassed by Fill cycle.
+    ///
+    /// Provenance: Nintendo 64 Functions Reference, `gDPFillRectangle`,
+    /// "Note" (Fill mode must not use a Z-buffer render mode), and
+    /// `gDPSetCycleType`, "Notes" (Fill mode requires
+    /// `G_RM_NOOP`/`G_RM_NOOP2`; a Z read can hang the RDP).
+    pub(crate) fn validate_fill_cycle_bypass(self) -> Result<(), FillCycleBypassHazards> {
+        let hazards = FillCycleBypassHazards {
+            depth_compare: self.depth_compare_enabled(),
+            depth_update: self.depth_update_enabled(),
+            image_read: self.image_read_enabled(),
+        };
+        if hazards.is_empty() {
+            Ok(())
+        } else {
+            Err(hazards)
+        }
+    }
+
     pub fn clear_on_coverage(self) -> bool {
         self.low & 0x0080 != 0
     }
@@ -1412,6 +1432,39 @@ impl OtherMode {
             low,
             blend_color_alpha,
         }
+    }
+}
+
+/// Unsafe memory/depth consumers retained in Other Modes while Fill cycle
+/// bypasses the ordinary RDP pixel pipeline.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FillCycleBypassHazards {
+    pub depth_compare: bool,
+    pub depth_update: bool,
+    pub image_read: bool,
+}
+
+impl FillCycleBypassHazards {
+    const fn is_empty(self) -> bool {
+        !self.depth_compare && !self.depth_update && !self.image_read
+    }
+}
+
+impl std::fmt::Display for FillCycleBypassHazards {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut separator = "";
+        for (enabled, name) in [
+            (self.depth_compare, "Z_CMP"),
+            (self.depth_update, "Z_UPD"),
+            (self.image_read, "IM_RD"),
+        ] {
+            if enabled {
+                f.write_str(separator)?;
+                f.write_str(name)?;
+                separator = "+";
+            }
+        }
+        Ok(())
     }
 }
 
