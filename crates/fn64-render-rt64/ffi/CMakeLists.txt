@@ -26,7 +26,7 @@ add_subdirectory("${FN64_RT64_SOURCE_DIR}" rt64-build EXCLUDE_FROM_ALL)
 # their directory-local compiler variables into this caller before invoking
 # them against the fn64-owned source staged beside this file.
 foreach(FN64_SHADER_VARIABLE
-        DXC DXC_DXIL_OPTS DXC_SPV_OPTS DXC_PS_OPTS SPIRVCROSS)
+        DXC DXC_DXIL_OPTS DXC_SPV_OPTS DXC_LB_OPTS DXC_PS_OPTS SPIRVCROSS)
     get_directory_property(
         FN64_IMPORTED_${FN64_SHADER_VARIABLE}
         DIRECTORY "${FN64_RT64_SOURCE_DIR}"
@@ -81,6 +81,293 @@ set_source_files_properties(
     ${FN64_RT64_ORIGINAL_VI_SHADER_OBJECTS}
     TARGET_DIRECTORY rt64
     PROPERTIES HEADER_FILE_ONLY TRUE)
+
+# Compile one exact-source raster overlay into every native pixel-shader
+# permutation selected by pinned RT64. The generated HLSL retains RT64's
+# complete shader while inserting the fn64-owned alpha quantizer only after
+# alpha compare and coverage have completed and immediately before blending.
+set(FN64_RT64_RASTER_PS_SOURCE
+    "${FN64_RT64_SOURCE_DIR}/src/shaders/RasterPS.hlsl")
+file(SHA256
+    "${FN64_RT64_RASTER_PS_SOURCE}"
+    FN64_RT64_RASTER_PS_SHA256)
+if(NOT FN64_RT64_RASTER_PS_SHA256 STREQUAL
+   "957b283411550457573421015580f84ca750c68a050981dbc1a4fe2634507820")
+    message(FATAL_ERROR
+        "RT64 raster PS changed; review the fn64 RDP alpha-dither overlay")
+endif()
+file(READ
+    "${FN64_RT64_RASTER_PS_SOURCE}"
+    FN64_RT64_RASTER_PS_PATCHED)
+set(FN64_RT64_RASTER_PS_INCLUDE_ORIGINAL [=[#include "Random.hlsli"
+#include "TextureSampler.hlsli"]=])
+set(FN64_RT64_RASTER_PS_INCLUDE_PATCHED [=[#include "Random.hlsli"
+#include "TextureSampler.hlsli"
+#include "fn64_rt64_raster_ps_overlay.hlsli"]=])
+string(FIND
+    "${FN64_RT64_RASTER_PS_PATCHED}"
+    "${FN64_RT64_RASTER_PS_INCLUDE_ORIGINAL}"
+    FN64_RT64_RASTER_PS_INCLUDE_OFFSET)
+if(FN64_RT64_RASTER_PS_INCLUDE_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 raster PS include context changed; review the fn64 RDP alpha-dither overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_RASTER_PS_INCLUDE_ORIGINAL}"
+    "${FN64_RT64_RASTER_PS_INCLUDE_PATCHED}"
+    FN64_RT64_RASTER_PS_PATCHED
+    "${FN64_RT64_RASTER_PS_PATCHED}")
+set(FN64_RT64_RASTER_PS_BLEND_ORIGINAL [=[    // Add the blender if it can be replicated with simple emulation.
+    Blender::Inputs blInputs;]=])
+set(FN64_RT64_RASTER_PS_BLEND_PATCHED [=[    // Alpha compare and coverage intentionally observe the original combiner
+    // alpha. Only the combiner input to blending receives this bounded policy;
+    // shade, fog, alpha-compare, and coverage alpha remain unchanged.
+    combinerColor.a = Fn64RdpAlphaDitherCombinerAlpha(
+        otherMode, combinerColor.a, floor(vertexPosition.xy), randomSeed);
+
+    // Add the blender if it can be replicated with simple emulation.
+    Blender::Inputs blInputs;]=])
+string(FIND
+    "${FN64_RT64_RASTER_PS_PATCHED}"
+    "${FN64_RT64_RASTER_PS_BLEND_ORIGINAL}"
+    FN64_RT64_RASTER_PS_BLEND_OFFSET)
+if(FN64_RT64_RASTER_PS_BLEND_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 raster PS blend context changed; review the fn64 RDP alpha-dither overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_RASTER_PS_BLEND_ORIGINAL}"
+    "${FN64_RT64_RASTER_PS_BLEND_PATCHED}"
+    FN64_RT64_RASTER_PS_PATCHED
+    "${FN64_RT64_RASTER_PS_PATCHED}")
+set(FN64_RT64_RASTER_PS_PATCHED_SOURCE
+    "${CMAKE_CURRENT_BINARY_DIR}/fn64_rt64_raster_ps.hlsl")
+file(WRITE
+    "${FN64_RT64_RASTER_PS_PATCHED_SOURCE}"
+    "${FN64_RT64_RASTER_PS_PATCHED}")
+
+set(FN64_RT64_RASTER_PS_OUTPUT_DIRECTORY
+    "${CMAKE_BINARY_DIR}/src/shaders")
+file(MAKE_DIRECTORY "${FN64_RT64_RASTER_PS_OUTPUT_DIRECTORY}")
+set(FN64_RT64_RASTER_PS_INCLUDE_OPTIONS
+    "-I${FN64_RT64_SOURCE_DIR}/src/shaders"
+    "-I${CMAKE_CURRENT_SOURCE_DIR}")
+
+# RT64's public helpers assume shader sources live under PROJECT_SOURCE_DIR.
+# This absolute-input wrapper keeps the generated exact-source overlay in the
+# build tree while retaining the same compiler options and output symbols.
+function(fn64_rt64_build_raster_pixel_shader VARIANT)
+    set(FN64_OUTPUT
+        "${FN64_RT64_RASTER_PS_OUTPUT_DIRECTORY}/Fn64RdpDither${VARIANT}.hlsl")
+    if(WIN32)
+        build_shader_dxil_impl(
+            rt64 "${FN64_RT64_RASTER_PS_PATCHED_SOURCE}"
+            "Fn64RdpDither${VARIANT}" "${FN64_OUTPUT}"
+            ${DXC_PS_OPTS} ${ARGN} ${FN64_RT64_RASTER_PS_INCLUDE_OPTIONS})
+    endif()
+    if(APPLE)
+        build_shader_msl_impl(
+            rt64 "${FN64_RT64_RASTER_PS_PATCHED_SOURCE}"
+            "Fn64RdpDither${VARIANT}" "${FN64_OUTPUT}"
+            ${DXC_PS_OPTS} ${ARGN} ${FN64_RT64_RASTER_PS_INCLUDE_OPTIONS})
+    endif()
+    build_shader_spirv_impl(
+        rt64 "${FN64_RT64_RASTER_PS_PATCHED_SOURCE}"
+        "Fn64RdpDither${VARIANT}" "${FN64_OUTPUT}"
+        ${DXC_PS_OPTS} ${ARGN} ${FN64_RT64_RASTER_PS_INCLUDE_OPTIONS})
+endfunction()
+
+function(fn64_rt64_build_raster_spec_shader VARIANT)
+    set(FN64_OUTPUT
+        "${FN64_RT64_RASTER_PS_OUTPUT_DIRECTORY}/Fn64RdpDither${VARIANT}.hlsl")
+    build_shader_spirv_impl(
+        rt64 "${FN64_RT64_RASTER_PS_PATCHED_SOURCE}"
+        "Fn64RdpDither${VARIANT}" "${FN64_OUTPUT}"
+        ${DXC_PS_OPTS} ${ARGN} ${FN64_RT64_RASTER_PS_INCLUDE_OPTIONS})
+    if(APPLE)
+        build_shader_msl_impl(
+            rt64 "${FN64_RT64_RASTER_PS_PATCHED_SOURCE}"
+            "Fn64RdpDither${VARIANT}" "${FN64_OUTPUT}"
+            ${DXC_PS_OPTS} ${ARGN} ${FN64_RT64_RASTER_PS_INCLUDE_OPTIONS})
+    endif()
+endfunction()
+
+if(WIN32)
+    foreach(FN64_RT64_RASTER_PS_LIBRARY_VARIANT Library LibraryMS)
+        set(FN64_RT64_RASTER_PS_LIBRARY_OPTIONS)
+        if(FN64_RT64_RASTER_PS_LIBRARY_VARIANT STREQUAL "LibraryMS")
+            list(APPEND FN64_RT64_RASTER_PS_LIBRARY_OPTIONS "-D" "MULTISAMPLING")
+        endif()
+        build_shader_dxil_impl(
+            rt64 "${FN64_RT64_RASTER_PS_PATCHED_SOURCE}"
+            "Fn64RdpDither${FN64_RT64_RASTER_PS_LIBRARY_VARIANT}"
+            "${FN64_RT64_RASTER_PS_OUTPUT_DIRECTORY}/Fn64RdpDither${FN64_RT64_RASTER_PS_LIBRARY_VARIANT}.hlsl"
+            ${DXC_LB_OPTS}
+            ${FN64_RT64_RASTER_PS_LIBRARY_OPTIONS}
+            ${FN64_RT64_RASTER_PS_INCLUDE_OPTIONS})
+    endforeach()
+endif()
+fn64_rt64_build_raster_pixel_shader(Dynamic "-D" "DYNAMIC_RENDER_PARAMS")
+fn64_rt64_build_raster_pixel_shader(
+    DynamicMS "-D" "DYNAMIC_RENDER_PARAMS" "-D" "MULTISAMPLING")
+fn64_rt64_build_raster_spec_shader(
+    SpecConstant "-D" "SPEC_CONSTANT_RENDER_PARAMS")
+fn64_rt64_build_raster_spec_shader(
+    SpecConstantMS "-D" "SPEC_CONSTANT_RENDER_PARAMS" "-D" "MULTISAMPLING")
+fn64_rt64_build_raster_spec_shader(
+    SpecConstantFlat "-D" "SPEC_CONSTANT_RENDER_PARAMS" "-D" "VERTEX_FLAT_COLOR")
+fn64_rt64_build_raster_spec_shader(
+    SpecConstantFlatMS
+    "-D" "SPEC_CONSTANT_RENDER_PARAMS"
+    "-D" "VERTEX_FLAT_COLOR"
+    "-D" "MULTISAMPLING")
+
+set(FN64_RT64_RASTER_PS_SHADER_OUTPUTS
+    "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherDynamic.hlsl.spirv.c"
+    "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherDynamicMS.hlsl.spirv.c"
+    "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherSpecConstant.hlsl.spirv.c"
+    "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherSpecConstantMS.hlsl.spirv.c"
+    "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherSpecConstantFlat.hlsl.spirv.c"
+    "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherSpecConstantFlatMS.hlsl.spirv.c")
+if(APPLE)
+    list(APPEND FN64_RT64_RASTER_PS_SHADER_OUTPUTS
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherDynamic.hlsl.metal.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherDynamicMS.hlsl.metal.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherSpecConstant.hlsl.metal.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherSpecConstantMS.hlsl.metal.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherSpecConstantFlat.hlsl.metal.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherSpecConstantFlatMS.hlsl.metal.c")
+elseif(WIN32)
+    list(APPEND FN64_RT64_RASTER_PS_SHADER_OUTPUTS
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherDynamic.hlsl.dxil.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherDynamicMS.hlsl.dxil.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherLibrary.hlsl.dxil.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RdpDitherLibraryMS.hlsl.dxil.c")
+endif()
+add_custom_target(
+    fn64_rt64_raster_ps_shaders
+    DEPENDS ${FN64_RT64_RASTER_PS_SHADER_OUTPUTS})
+add_dependencies(rt64 fn64_rt64_raster_ps_shaders)
+
+set(FN64_RT64_ORIGINAL_RASTER_PS_SHADER_OBJECTS
+    "${CMAKE_BINARY_DIR}/src/shaders/RasterPSDynamic.hlsl.spirv.c"
+    "${CMAKE_BINARY_DIR}/src/shaders/RasterPSDynamicMS.hlsl.spirv.c"
+    "${CMAKE_BINARY_DIR}/src/shaders/RasterPSSpecConstant.hlsl.spirv.c"
+    "${CMAKE_BINARY_DIR}/src/shaders/RasterPSSpecConstantMS.hlsl.spirv.c"
+    "${CMAKE_BINARY_DIR}/src/shaders/RasterPSSpecConstantFlat.hlsl.spirv.c"
+    "${CMAKE_BINARY_DIR}/src/shaders/RasterPSSpecConstantFlatMS.hlsl.spirv.c")
+if(APPLE)
+    list(APPEND FN64_RT64_ORIGINAL_RASTER_PS_SHADER_OBJECTS
+        "${CMAKE_BINARY_DIR}/src/shaders/RasterPSDynamic.hlsl.metal.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/RasterPSDynamicMS.hlsl.metal.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/RasterPSSpecConstant.hlsl.metal.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/RasterPSSpecConstantMS.hlsl.metal.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/RasterPSSpecConstantFlat.hlsl.metal.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/RasterPSSpecConstantFlatMS.hlsl.metal.c")
+elseif(WIN32)
+    list(APPEND FN64_RT64_ORIGINAL_RASTER_PS_SHADER_OBJECTS
+        "${CMAKE_BINARY_DIR}/src/shaders/RasterPSDynamic.hlsl.dxil.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/RasterPSDynamicMS.hlsl.dxil.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/RasterPSLibrary.hlsl.dxil.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/RasterPSLibraryMS.hlsl.dxil.c")
+endif()
+set_source_files_properties(
+    ${FN64_RT64_ORIGINAL_RASTER_PS_SHADER_OBJECTS}
+    TARGET_DIRECTORY rt64
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+
+# Replace every raster-PS blob selected by the pinned raster shader with the
+# corresponding fn64 overlay blob. Both complete source digests and exact
+# token checks fail closed if the upstream selection graph changes.
+set(FN64_RT64_RASTER_SHADER_SOURCE
+    "${FN64_RT64_SOURCE_DIR}/src/render/rt64_raster_shader.cpp")
+file(SHA256
+    "${FN64_RT64_RASTER_SHADER_SOURCE}"
+    FN64_RT64_RASTER_SHADER_SHA256)
+if(NOT FN64_RT64_RASTER_SHADER_SHA256 STREQUAL
+   "5e5de4bbd8a22192e857c277bae5af033b8606a6464aa73863d2efe0fd0a0d4d")
+    message(FATAL_ERROR
+        "RT64 raster shader changed; review every fn64 raster-PS blob replacement")
+endif()
+file(READ
+    "${FN64_RT64_RASTER_SHADER_SOURCE}"
+    FN64_RT64_RASTER_SHADER_PATCHED)
+macro(fn64_rt64_replace_raster_shader_token ORIGINAL REPLACEMENT)
+    string(FIND
+        "${FN64_RT64_RASTER_SHADER_PATCHED}"
+        "${ORIGINAL}"
+        FN64_RT64_RASTER_SHADER_TOKEN_OFFSET)
+    if(FN64_RT64_RASTER_SHADER_TOKEN_OFFSET EQUAL -1)
+        message(FATAL_ERROR
+            "RT64 raster shader token ${ORIGINAL} changed; review every fn64 raster-PS blob replacement")
+    endif()
+    string(REPLACE
+        "${ORIGINAL}"
+        "${REPLACEMENT}"
+        FN64_RT64_RASTER_SHADER_PATCHED
+        "${FN64_RT64_RASTER_SHADER_PATCHED}")
+endmacro()
+
+foreach(FN64_RT64_RASTER_PS_VARIANT
+        Dynamic DynamicMS
+        SpecConstant SpecConstantMS SpecConstantFlat SpecConstantFlatMS)
+    foreach(FN64_RT64_RASTER_PS_FORMAT SPIRV MSL)
+        fn64_rt64_replace_raster_shader_token(
+            "RasterPS${FN64_RT64_RASTER_PS_VARIANT}Blob${FN64_RT64_RASTER_PS_FORMAT}"
+            "Fn64RdpDither${FN64_RT64_RASTER_PS_VARIANT}Blob${FN64_RT64_RASTER_PS_FORMAT}")
+    endforeach()
+endforeach()
+foreach(FN64_RT64_RASTER_PS_VARIANT Dynamic DynamicMS Library LibraryMS)
+    fn64_rt64_replace_raster_shader_token(
+        "RasterPS${FN64_RT64_RASTER_PS_VARIANT}BlobDXIL"
+        "Fn64RdpDither${FN64_RT64_RASTER_PS_VARIANT}BlobDXIL")
+endforeach()
+foreach(FN64_RT64_RASTER_PS_VARIANT
+        Dynamic DynamicMS
+        SpecConstant SpecConstantMS SpecConstantFlat SpecConstantFlatMS)
+    foreach(FN64_RT64_RASTER_PS_FORMAT spirv metal)
+        fn64_rt64_replace_raster_shader_token(
+            "shaders/RasterPS${FN64_RT64_RASTER_PS_VARIANT}.hlsl.${FN64_RT64_RASTER_PS_FORMAT}.h"
+            "shaders/Fn64RdpDither${FN64_RT64_RASTER_PS_VARIANT}.hlsl.${FN64_RT64_RASTER_PS_FORMAT}.h")
+    endforeach()
+endforeach()
+foreach(FN64_RT64_RASTER_PS_VARIANT Dynamic DynamicMS Library LibraryMS)
+    fn64_rt64_replace_raster_shader_token(
+        "shaders/RasterPS${FN64_RT64_RASTER_PS_VARIANT}.hlsl.dxil.h"
+        "shaders/Fn64RdpDither${FN64_RT64_RASTER_PS_VARIANT}.hlsl.dxil.h")
+endforeach()
+
+set(FN64_RT64_ORIGINAL_RASTER_PS_BLOBS
+    RasterPSDynamicBlobDXIL RasterPSDynamicMSBlobDXIL
+    RasterPSDynamicBlobSPIRV RasterPSDynamicMSBlobSPIRV
+    RasterPSDynamicBlobMSL RasterPSDynamicMSBlobMSL
+    RasterPSSpecConstantBlobSPIRV RasterPSSpecConstantMSBlobSPIRV
+    RasterPSSpecConstantFlatBlobSPIRV RasterPSSpecConstantFlatMSBlobSPIRV
+    RasterPSSpecConstantBlobMSL RasterPSSpecConstantMSBlobMSL
+    RasterPSSpecConstantFlatBlobMSL RasterPSSpecConstantFlatMSBlobMSL
+    RasterPSLibraryBlobDXIL RasterPSLibraryMSBlobDXIL)
+foreach(FN64_RT64_ORIGINAL_RASTER_PS_BLOB
+        IN LISTS FN64_RT64_ORIGINAL_RASTER_PS_BLOBS)
+    string(FIND
+        "${FN64_RT64_RASTER_SHADER_PATCHED}"
+        "${FN64_RT64_ORIGINAL_RASTER_PS_BLOB}"
+        FN64_RT64_ORIGINAL_RASTER_PS_BLOB_OFFSET)
+    if(NOT FN64_RT64_ORIGINAL_RASTER_PS_BLOB_OFFSET EQUAL -1)
+        message(FATAL_ERROR
+            "original raster PS blob remains selected: ${FN64_RT64_ORIGINAL_RASTER_PS_BLOB}")
+    endif()
+endforeach()
+
+set(FN64_RT64_RASTER_SHADER_PATCHED_SOURCE
+    "${CMAKE_CURRENT_BINARY_DIR}/fn64_rt64_raster_shader.cpp")
+file(WRITE
+    "${FN64_RT64_RASTER_SHADER_PATCHED_SOURCE}"
+    "${FN64_RT64_RASTER_SHADER_PATCHED}")
+set_source_files_properties(
+    "${FN64_RT64_RASTER_SHADER_SOURCE}"
+    TARGET_DIRECTORY rt64
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+target_sources(rt64 PRIVATE "${FN64_RT64_RASTER_SHADER_PATCHED_SOURCE}")
 
 # Bind the replacement shader blobs and expanded push constants to the exact
 # reviewed pinned MIT sources. A pin update must review this overlay rather

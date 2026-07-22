@@ -434,7 +434,7 @@ mod tests {
             source_id: PINNED_SOURCE,
             source_provenance: Rt64SourceProvenance::GitClean,
             source_overlay_id:
-                "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1",
+                "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1",
             post_vi_api: "metal-bgra8-unorm",
         };
         let capture = RenderReleaseCapture {

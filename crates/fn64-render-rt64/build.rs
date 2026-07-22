@@ -9,8 +9,8 @@ mod adapter_source_identity;
 mod native_program_identity;
 
 const RT64_SOURCE_OVERLAY_ID: &str =
-    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1";
-const RT64_HFR_SOURCE_OVERLAY_ID: &str = "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+hfr-post-present-call:v1";
+    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1";
+const RT64_HFR_SOURCE_OVERLAY_ID: &str = "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+hfr-post-present-call:v1";
 
 fn run(command: &mut Command, description: &str) {
     let status = command
@@ -227,6 +227,7 @@ fn main() {
         "CMakeLists.txt",
         "fn64_rt64_shim.cpp",
         "fn64_rt64_shim.h",
+        "fn64_rt64_raster_ps_overlay.hlsli",
         "fn64_rt64_video_interface.h",
         "fn64_rt64_video_interface_ps.hlsl",
     ] {

@@ -850,7 +850,16 @@ and deterministic output traces.
   dither is implemented: RGB magic-square and Bayer selectors modify low color
   bits before target-format storage, while alpha Pattern and InversePattern use
   the selected ordered matrix. RGB and alpha Noise use the explicit seedable
-  deterministic reference stream; its silicon identity remains unclaimed. The disabled path retains truncation behavior rather
+  deterministic reference stream; its silicon identity remains unclaimed. The
+  clean pinned native RT64 path additionally overlays combiner-alpha `G_AD`
+  after alpha compare/coverage rejection and before blending. Its synthetic
+  raw-DPC Metal gate binds exact 16x16 RGBA16 Pattern, InversePattern, Noise,
+  and Disabled digests, exact ordered 4x4 tiles, and live Noise without
+  conflating that selector with the separate `G_AC_DITHER` gate. This is a
+  bounded native slice: shade/fog/coverage alpha, RT64's
+  framebuffer-wide/deferred RGB dither, random routing/seed/advancement,
+  matrices/ties/internal precision, non-Metal/MSAA paths, representative
+  full-ROM reach, and silicon remain open. The disabled path retains truncation behavior rather
   than rounding. Exact
   microcode catalog population/subdivision/rounding remains a frontier. The
   hardware NOISE combiner source consumes the same typed eight-bit sample
