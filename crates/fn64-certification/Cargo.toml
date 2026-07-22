@@ -22,7 +22,6 @@ fn64-render = { path = "../fn64-render" }
 fn64-render-rt64 = { path = "../fn64-render-rt64", default-features = false }
 fn64-runtime = { path = "../fn64-runtime" }
 sha2 = "0.10"
-serde_json = "1"
 
 [dev-dependencies]
 fn64-render-reference = { path = "../fn64-render-reference" }

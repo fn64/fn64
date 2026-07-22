@@ -8,11 +8,10 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::io;
+use std::path::PathBuf;
 
+use fn64_boot_harness::load_private_f3dzex2_characterization_input;
 use fn64_certification::f3dzex2_point_light::{
     CharacterizationSuite, InstalledVector, RequiredCase, VectorCase, DISPLAY_LIST_ADDRESS, HEIGHT,
     OUTPUT_ADDRESS, RDRAM_BYTES, WIDTH,
@@ -26,15 +25,8 @@ use fn64_render_rt64::{
     Rt64Backend, Rt64PresentPixelFormat, Rt64PresentedPixels, Rt64SourceProvenance,
 };
 use fn64_runtime::{RdramAddr, RdramView, RdramViewMut, RspMemAddr, RspMemory, RspMemoryBank};
-use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 const PINNED_SOURCE: &str = "git:f0728a2520d5aa735886240de3fee75cc805f6d6";
-const CHARACTERIZATION_SUITE: &str = "fn64.f3dzex2-point-light.v1";
-const SYSTEM_PYTHON3: &str = "/usr/bin/python3";
-const PYTHON_EMBEDDED_SCRIPT_BOOTSTRAP: &str = "import sys\nscript_path = sys.argv.pop(1)\nsource = sys.stdin.buffer.read()\nexec(compile(source, script_path, 'exec'), {'__name__': '__main__', '__file__': script_path})";
-const PRIVATE_INPUT_ADMISSION_SCRIPT: &[u8] =
-    include_bytes!("../../../tools/private_input_admission.py");
 const RAW_TEXT_BYTES: usize = 0x18d0;
 const RAW_DATA_BYTES: usize = 0x0fc0;
 const LOGICAL_TEXT_BYTES: usize = fn64_runtime::RSP_MEMORY_BANK_SIZE;
@@ -59,78 +51,6 @@ struct StagedTask {
     rsp_memory: RspMemory,
     task: OsTask,
     vector: InstalledVector,
-}
-
-struct PrivateStage {
-    directory: PathBuf,
-    manifest: PathBuf,
-    report: PathBuf,
-    armed: bool,
-}
-
-impl PrivateStage {
-    fn create(manifest_bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
-        for ordinal in 0..128u32 {
-            let directory = std::env::temp_dir().join(format!(
-                "fn64-f3dzex2-characterization-{}-{ordinal}",
-                std::process::id()
-            ));
-            match fs::create_dir(&directory) {
-                Ok(()) => {
-                    let manifest = directory.join("manifest.json");
-                    let report = directory.join("readiness.json");
-                    let mut file = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&manifest)
-                        .map_err(|_| {
-                            private_error("private manifest stage could not be created")
-                        })?;
-                    file.write_all(manifest_bytes).map_err(|_| {
-                        private_error("private manifest stage could not be written")
-                    })?;
-                    file.sync_all()
-                        .map_err(|_| private_error("private manifest stage could not be synced"))?;
-                    return Ok(Self {
-                        directory,
-                        manifest,
-                        report,
-                        armed: true,
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(_) => {
-                    return Err(
-                        private_error("private staging directory could not be created").into(),
-                    )
-                }
-            }
-        }
-        Err(private_error("private staging directory attempts were exhausted").into())
-    }
-
-    fn cleanup(mut self) -> Result<(), Box<dyn Error>> {
-        fs::remove_file(&self.manifest)
-            .map_err(|_| private_error("private manifest-stage cleanup failed"))?;
-        if self.report.exists() {
-            fs::remove_file(&self.report)
-                .map_err(|_| private_error("private readiness cleanup failed"))?;
-        }
-        fs::remove_dir(&self.directory)
-            .map_err(|_| private_error("private staging-directory cleanup failed"))?;
-        self.armed = false;
-        Ok(())
-    }
-}
-
-impl Drop for PrivateStage {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_file(&self.manifest);
-            let _ = fs::remove_file(&self.report);
-            let _ = fs::remove_dir(&self.directory);
-        }
-    }
 }
 
 fn private_error(message: &'static str) -> io::Error {
@@ -165,165 +85,13 @@ fn parse_arguments(
     })
 }
 
-struct ArtifactDescriptor {
-    path: PathBuf,
-    length: usize,
-    sha256: [u8; 32],
-}
-
-fn decode_sha256(value: &str) -> Result<[u8; 32], Box<dyn Error>> {
-    if value.len() != 64 {
-        return Err(private_error("admitted artifact digest shape changed").into());
-    }
-    let mut digest = [0; 32];
-    for (index, byte) in digest.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| private_error("admitted artifact digest shape changed"))?;
-    }
-    Ok(digest)
-}
-
-fn artifact_descriptor(manifest: &Value, role: &str) -> Result<ArtifactDescriptor, Box<dyn Error>> {
-    let descriptor = &manifest["artifacts"][role];
-    let path = descriptor["path"]
-        .as_str()
-        .map(PathBuf::from)
-        .ok_or_else(|| private_error("admitted artifact shape changed"))?;
-    let length = descriptor["length"]
-        .as_u64()
-        .and_then(|value| usize::try_from(value).ok())
-        .ok_or_else(|| private_error("admitted artifact shape changed"))?;
-    let sha256_text = descriptor["sha256"]
-        .as_str()
-        .ok_or_else(|| private_error("admitted artifact shape changed"))?;
-    let sha256 = decode_sha256(sha256_text)?;
-    Ok(ArtifactDescriptor {
-        path,
-        length,
-        sha256,
-    })
-}
-
-fn require_manifest_scope(manifest: &Value) -> Result<(), Box<dyn Error>> {
-    if manifest["schema"] != "fn64.private-input-admission.v7"
-        || manifest["purpose"] != "f3dzex2_characterization"
-        || manifest["intent"]["wire_family"] != "f3dzex2"
-        || manifest["intent"]["characterization_suite"] != CHARACTERIZATION_SUITE
-    {
-        return Err(private_error("private admission scope differs from this runner").into());
-    }
-    Ok(())
-}
-
-fn load_verified_artifact(descriptor: &ArtifactDescriptor) -> Result<Vec<u8>, Box<dyn Error>> {
-    let link_metadata = fs::symlink_metadata(&descriptor.path)
-        .map_err(|_| private_error("admitted artifact could not be inspected"))?;
-    if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
-        return Err(private_error("admitted artifact is not a regular non-symlink file").into());
-    }
-    let mut file = File::open(&descriptor.path)
-        .map_err(|_| private_error("admitted artifact could not be opened"))?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|_| private_error("opened artifact could not be inspected"))?;
-    if !opened_metadata.is_file()
-        || usize::try_from(opened_metadata.len()).ok() != Some(descriptor.length)
-    {
-        return Err(private_error("opened artifact geometry differs from admission").into());
-    }
-    let mut bytes = Vec::with_capacity(descriptor.length);
-    file.read_to_end(&mut bytes)
-        .map_err(|_| private_error("admitted artifact could not be read"))?;
-    if bytes.len() != descriptor.length
-        || <[u8; 32]>::from(Sha256::digest(&bytes)) != descriptor.sha256
-    {
-        return Err(private_error("consumed artifact differs from admission").into());
-    }
-    Ok(bytes)
-}
-
 fn load_private_windows(arguments: &Arguments) -> Result<PrivateRawWindows, Box<dyn Error>> {
-    let validator =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/private_input_admission.py");
-    let runtime_policy = fs::read(&validator)
-        .map_err(|_| private_error("private admission policy could not be read"))?;
-    if runtime_policy != PRIVATE_INPUT_ADMISSION_SCRIPT {
-        return Err(
-            private_error("private admission policy differs from the compiled runner").into(),
-        );
-    }
-    let manifest_bytes = fs::read(&arguments.manifest)
-        .map_err(|_| private_error("admitted manifest could not be read"))?;
-    let supplied = fs::read(&arguments.readiness)
-        .map_err(|_| private_error("supplied readiness could not be read"))?;
-    let stage = PrivateStage::create(&manifest_bytes)?;
-    let python = Path::new(SYSTEM_PYTHON3)
-        .canonicalize()
-        .map_err(|_| private_error("pinned system Python could not be resolved"))?;
-    if !python.is_file() {
-        return Err(private_error("pinned system Python is not a regular file").into());
-    }
-    let mut child = Command::new(&python)
-        .args(["-I", "-B", "-c", PYTHON_EMBEDDED_SCRIPT_BOOTSTRAP])
-        .arg(&validator)
-        .arg("--manifest")
-        .arg(&stage.manifest)
-        .arg("--report")
-        .arg(&stage.report)
-        .current_dir(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .canonicalize()
-                .map_err(|_| private_error("repository root could not be resolved"))?,
-        )
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| private_error("private admission validator could not run"))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| private_error("private admission validator stdin was unavailable"))?
-        .write_all(PRIVATE_INPUT_ADMISSION_SCRIPT)
-        .map_err(|_| private_error("private admission policy could not be supplied"))?;
-    let status = child
-        .wait()
-        .map_err(|_| private_error("private admission validator could not finish"))?;
-    if !status.success() {
-        return Err(private_error("private admission validation failed").into());
-    }
-    let regenerated = fs::read(&stage.report)
-        .map_err(|_| private_error("regenerated readiness could not be read"))?;
-    if regenerated != supplied {
-        return Err(private_error("supplied readiness does not match current admission").into());
-    }
-    if fs::read(&arguments.manifest)
-        .map_err(|_| private_error("admitted manifest could not be rechecked"))?
-        != manifest_bytes
-        || fs::read(&arguments.readiness)
-            .map_err(|_| private_error("supplied readiness could not be rechecked"))?
-            != supplied
-    {
-        return Err(private_error("private admission inputs changed during validation").into());
-    }
-    let manifest: Value = serde_json::from_slice(&manifest_bytes)
-        .map_err(|_| private_error("admitted manifest could not be decoded"))?;
-    require_manifest_scope(&manifest)?;
-    let text = load_verified_artifact(&artifact_descriptor(
-        &manifest,
-        "microcode_text_raw_window",
-    )?)?;
-    let data = load_verified_artifact(&artifact_descriptor(
-        &manifest,
-        "microcode_data_raw_window",
-    )?)?;
-    stage.cleanup()?;
-    if text.len() != RAW_TEXT_BYTES || data.len() != RAW_DATA_BYTES {
-        return Err(private_error("admitted raw windows have invalid geometry").into());
-    }
-    Ok(PrivateRawWindows { text, data })
+    let admitted =
+        load_private_f3dzex2_characterization_input(&arguments.manifest, &arguments.readiness)?;
+    Ok(PrivateRawWindows {
+        text: admitted.raw_text_window().to_vec(),
+        data: admitted.raw_data_window().to_vec(),
+    })
 }
 
 fn write_guard(rdram: &mut [u8], start: usize, len: usize) {
@@ -666,28 +434,6 @@ mod tests {
     }
 
     #[test]
-    fn consumed_artifact_is_bound_to_the_admitted_length_and_digest() {
-        let stage = PrivateStage::create(b"{}\n").unwrap();
-        let path = stage.directory.join("artifact.bin");
-        let admitted = b"exact admitted private bytes";
-        fs::write(&path, admitted).unwrap();
-        let descriptor = ArtifactDescriptor {
-            path: path.clone(),
-            length: admitted.len(),
-            sha256: Sha256::digest(admitted).into(),
-        };
-        assert_eq!(load_verified_artifact(&descriptor).unwrap(), admitted);
-
-        let mut changed = admitted.to_vec();
-        changed[0] ^= 0xff;
-        fs::write(&path, changed).unwrap();
-        assert!(load_verified_artifact(&descriptor).is_err());
-
-        fs::remove_file(path).unwrap();
-        stage.cleanup().unwrap();
-    }
-
-    #[test]
     fn argument_parser_requires_two_absolute_artifacts_without_echoing_them() {
         let parsed = parse_arguments(
             [
@@ -700,8 +446,14 @@ mod tests {
             .map(OsString::from),
         )
         .unwrap();
-        assert_eq!(parsed.manifest, Path::new("/private/admission.json"));
-        assert_eq!(parsed.readiness, Path::new("/private/readiness.json"));
+        assert_eq!(
+            parsed.manifest,
+            std::path::Path::new("/private/admission.json")
+        );
+        assert_eq!(
+            parsed.readiness,
+            std::path::Path::new("/private/readiness.json")
+        );
 
         let error = parse_arguments(
             [
@@ -717,21 +469,6 @@ mod tests {
         .to_string();
         assert!(!error.contains("relative.json"));
         assert!(!error.contains("/private/readiness.json"));
-    }
-
-    #[test]
-    fn manifest_scope_binds_the_repository_owned_suite() {
-        let mut manifest = serde_json::json!({
-            "schema": "fn64.private-input-admission.v7",
-            "purpose": "f3dzex2_characterization",
-            "intent": {
-                "wire_family": "f3dzex2",
-                "characterization_suite": CHARACTERIZATION_SUITE,
-            },
-        });
-        require_manifest_scope(&manifest).unwrap();
-        manifest["intent"]["characterization_suite"] = Value::Null;
-        assert!(require_manifest_scope(&manifest).is_err());
     }
 
     #[test]

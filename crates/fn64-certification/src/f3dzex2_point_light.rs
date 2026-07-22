@@ -16,7 +16,9 @@
 //! command/structure contracts, as summarized in the checked-in
 //! `fn64-render-reference/F3DEX2-CONCEPTS.md`. The existence of point-light
 //! capability in F3DZEX2 2.08I/J is checked-in software-parity evidence in
-//! `F3DEX2-VARIANTS.md`; no RT64 implementation is used here.
+//! `F3DEX2-VARIANTS.md`. The activation bit comes from pinned MIT RT64
+//! `src/shared/rt64_f3d_defines.h`; its conjunction with the typed capability
+//! comes from `src/hle/rt64_rsp.cpp`.
 
 use std::error::Error;
 use std::fmt;
@@ -71,6 +73,7 @@ const G_MV_LIGHT: u32 = 0x0a;
 const G_SHADE: u32 = 0x0000_0004;
 const G_LIGHTING: u32 = 0x0002_0000;
 const G_SHADING_SMOOTH: u32 = 0x0020_0000;
+const G_POINT_LIGHTING: u32 = 0x0040_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryRegion {
@@ -758,10 +761,10 @@ fn build_commands(setup: SceneSetup) -> Vec<(u32, u32)> {
 
     let geometry_mode = G_SHADE
         | G_SHADING_SMOOTH
-        | if matches!(setup.light_mode, LightMode::Disabled) {
-            0
-        } else {
-            G_LIGHTING
+        | match setup.light_mode {
+            LightMode::Disabled => 0,
+            LightMode::Directional => G_LIGHTING,
+            LightMode::Candidate(_) => G_LIGHTING | G_POINT_LIGHTING,
         };
     commands.push((op(G_GEOMETRYMODE), geometry_mode));
 
@@ -1129,6 +1132,42 @@ mod tests {
                 (u32::from(G_RDPFULLSYNC) << 24, 0)
             );
             assert_eq!(commands.last(), Some(&(u32::from(G_ENDDL) << 24, 0)));
+        }
+    }
+
+    #[test]
+    fn point_light_geometry_mode_is_exactly_scoped_to_candidate_cases() {
+        let suite = CharacterizationSuite;
+        let all_fields: Vec<_> = TransferWidth::ALL
+            .into_iter()
+            .flat_map(|width| {
+                RecordFieldGroup::ALL
+                    .into_iter()
+                    .filter(move |group| width.contains(*group))
+                    .map(move |group| ResponsiveField { width, group })
+            })
+            .collect();
+        let cases = suite
+            .initial_cases()
+            .into_iter()
+            .chain(suite.knockout_cases(&TransferWidth::ALL))
+            .chain(suite.refinement_cases(&all_fields).unwrap());
+
+        for case in cases {
+            let mode = case
+                .commands()
+                .unwrap()
+                .into_iter()
+                .find_map(|(word0, word1)| ((word0 >> 24) as u8 == G_GEOMETRYMODE).then_some(word1))
+                .expect("every vector has one geometry-mode command");
+            let expected = match case.id() {
+                CaseId::LightingDisabledControl => G_SHADE | G_SHADING_SMOOTH,
+                CaseId::DirectionalLightControl => G_SHADE | G_SHADING_SMOOTH | G_LIGHTING,
+                CaseId::Point { .. } | CaseId::Knockout { .. } | CaseId::Refinement { .. } => {
+                    G_SHADE | G_SHADING_SMOOTH | G_LIGHTING | G_POINT_LIGHTING
+                }
+            };
+            assert_eq!(mode, expected, "{}", case.id().name());
         }
     }
 

@@ -1313,6 +1313,151 @@ fn rust_private_admission_corpus_snapshot() -> CorpusSnapshotDocument {
     }
 }
 
+fn write_characterization_admission(
+    harness: &CorpusHarness,
+    manifest: &serde_json::Value,
+    label: &str,
+) -> (PathBuf, PathBuf) {
+    let manifest_path = harness.directory.join(format!("{label}-manifest.json"));
+    let readiness_path = harness.directory.join(format!("{label}-readiness.json"));
+    write_json_value(&manifest_path, manifest);
+    let admitted = admit_current_v7_manifest(&manifest_path, &readiness_path)
+        .expect("derive synthetic characterization readiness");
+    assert!(admitted.contract.is_none());
+    assert!(admitted.contract_bytes.is_none());
+    std::fs::write(&readiness_path, admitted.readiness_bytes)
+        .expect("write synthetic characterization readiness");
+    (manifest_path, readiness_path)
+}
+
+#[test]
+fn typed_characterization_loader_returns_only_stable_captured_raw_windows() {
+    let harness = CorpusHarness::new();
+    let (manifest_path, readiness_path) = write_characterization_admission(
+        &harness,
+        &harness.characterization_manifest,
+        "typed-success",
+    );
+    let expected_text = std::fs::read(
+        harness.characterization_manifest["artifacts"]["microcode_text_raw_window"]["path"]
+            .as_str()
+            .expect("raw text fixture path"),
+    )
+    .expect("read expected raw text fixture");
+    let expected_data = std::fs::read(
+        harness.characterization_manifest["artifacts"]["microcode_data_raw_window"]["path"]
+            .as_str()
+            .expect("raw data fixture path"),
+    )
+    .expect("read expected raw data fixture");
+
+    let admitted =
+        load_private_f3dzex2_characterization_input_inner(&manifest_path, &readiness_path)
+            .expect("load typed characterization input");
+    assert_eq!(admitted.raw_text_window(), expected_text);
+    assert_eq!(admitted.raw_data_window(), expected_data);
+    assert_eq!(admitted.raw_text_window().len(), 0x18d0);
+    assert_eq!(admitted.raw_data_window().len(), 0x0fc0);
+}
+
+#[test]
+fn typed_characterization_loader_rejects_non_characterization_scope() {
+    let harness = CorpusHarness::new();
+    let mut manifest = harness.characterization_manifest.clone();
+    manifest["purpose"] = serde_json::json!("extended_gbi");
+    manifest["intent"]["wire_family"] = serde_json::json!("f3dex2_extended_gbi_v1");
+    manifest["intent"]["extended_gbi_cases"] = serde_json::json!([
+        "activation",
+        "disabled-negative-control",
+        "hook-control",
+        "interpolation",
+        "vertex-z",
+        "widescreen"
+    ]);
+    manifest["intent"]["characterization_suite"] = serde_json::Value::Null;
+    manifest["artifacts"]["microcode_text"] = harness.full_manifest["artifacts"]["microcode_text"].clone();
+    manifest["artifacts"]["microcode_data"] = harness.full_manifest["artifacts"]["microcode_data"].clone();
+    manifest["artifacts"]["microcode_text_raw_window"] = serde_json::Value::Null;
+    manifest["artifacts"]["microcode_data_raw_window"] = serde_json::Value::Null;
+    let (manifest_path, readiness_path) =
+        write_characterization_admission(&harness, &manifest, "typed-wrong-scope");
+
+    let error = match load_private_f3dzex2_characterization_input_inner(
+        &manifest_path,
+        &readiness_path,
+    ) {
+        Ok(_) => panic!("narrow loader accepted another admitted purpose"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("not f3dzex2_characterization"));
+}
+
+#[test]
+fn typed_characterization_loader_rejects_readiness_and_artifact_drift() {
+    let harness = CorpusHarness::new();
+    let (manifest_path, readiness_path) = write_characterization_admission(
+        &harness,
+        &harness.characterization_manifest,
+        "typed-drift",
+    );
+    let mut readiness = std::fs::read(&readiness_path).expect("read readiness fixture");
+    readiness.push(b' ');
+    std::fs::write(&readiness_path, readiness).expect("drift readiness fixture");
+    let readiness_error = match load_private_f3dzex2_characterization_input_inner(
+        &manifest_path,
+        &readiness_path,
+    ) {
+        Ok(_) => panic!("narrow loader accepted noncanonical readiness"),
+        Err(error) => error,
+    };
+    assert!(readiness_error.to_string().contains("does not match"));
+
+    let (manifest_path, readiness_path) = write_characterization_admission(
+        &harness,
+        &harness.characterization_manifest,
+        "typed-artifact-drift",
+    );
+    let raw_data_path = Path::new(
+        harness.characterization_manifest["artifacts"]["microcode_data_raw_window"]["path"]
+            .as_str()
+            .expect("raw data fixture path"),
+    );
+    let mut changed = std::fs::read(raw_data_path).expect("read raw data fixture");
+    changed[0] ^= 0xff;
+    std::fs::write(raw_data_path, changed).expect("replace raw data fixture bytes");
+    let artifact_error = match load_private_f3dzex2_characterization_input_inner(
+        &manifest_path,
+        &readiness_path,
+    ) {
+        Ok(_) => panic!("narrow loader accepted changed artifact bytes"),
+        Err(error) => error,
+    };
+    assert!(
+        artifact_error
+            .to_string()
+            .contains("artifacts.microcode_data_raw_window identity drift")
+    );
+}
+
+#[test]
+fn public_characterization_error_is_content_free() {
+    let private_manifest = Path::new("/private/sensitive-characterization-manifest.json");
+    let private_readiness = Path::new("/private/sensitive-characterization-readiness.json");
+    let error = match load_private_f3dzex2_characterization_input(
+        private_manifest,
+        private_readiness,
+    ) {
+        Ok(_) => panic!("narrow loader accepted missing private input"),
+        Err(error) => error,
+    };
+    let rendered = format!("{error:?}: {error}");
+    assert_eq!(
+        rendered,
+        "PrivateF3dzex2CharacterizationError: private F3DZEX2 characterization admission failed"
+    );
+    assert!(!rendered.contains("sensitive"));
+}
+
 #[test]
 fn shared_content_free_corpus_matches_rust_policy() {
     let snapshot = rust_private_admission_corpus_snapshot();
