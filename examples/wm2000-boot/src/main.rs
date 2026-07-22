@@ -129,16 +129,37 @@ fn main() {
         fn64_runtime::SaveType::SramBanked,
     )));
 
+    // Perf-run knobs, resolved once up front (used by both the render-backend
+    // dump gate below and the trace sink further down):
+    //   WM2000_NO_TRACE=1  -- skip the per-step JSONL trace sink entirely
+    //   WM2000_NO_DUMP=1   -- skip the per-swap PNG surface dumps
+    //   WM2000_TRACE_PATH  -- override the trace sink path
+    // Both dumps/traces are real per-frame overhead (a live profile showed the
+    // PNG encode + trace formatting on the hot path); disabling them is the
+    // headless throughput configuration.
+    let trace_disabled = std::env::var_os("WM2000_NO_TRACE").is_some();
+    let trace_path: String = std::env::var("WM2000_TRACE_PATH")
+        .unwrap_or_else(|_| "/tmp/wm2000-boot-trace.jsonl".to_string());
+    // Both the backend's per-swap surface dump AND the harness's per-swap
+    // framebuffer PNG are gated off together on a perf run (NO_DUMP, or the
+    // trace-disabling flag which also signals "I'm measuring, not capturing").
+    let dumps_disabled = trace_disabled || std::env::var_os("WM2000_NO_DUMP").is_some();
+
     // Main's VI pump now delivers real presentations; without a registered
     // backend the first retrace trips present_render_backend's loud trap.
     // The software ReferenceBackend keeps this harness headless.
     // ponytail: no RT64/env switch like oot-boot until a wm2000 frame exists.
     {
         use fn64_render::RenderBackend as _;
+        // The backend's per-swap surface PNG dump (encode_rgba8/write_png) is
+        // real per-frame cost; skip it on a throughput run (gated together
+        // with the harness fb dump via `dumps_disabled`).
         let mut backend = fn64_render_reference::ReferenceBackend::new()
             .with_f3dex2()
-            .with_clear_color([0, 0, 0, 255])
-            .with_auto_dump("/tmp", "fn64-wm2000-render", 240);
+            .with_clear_color([0, 0, 0, 255]);
+        if !dumps_disabled {
+            backend = backend.with_auto_dump("/tmp", "fn64-wm2000-render", 240);
+        }
         backend
             .create(&fn64_render::RenderConfig::for_tv(320, 240, tv_type))
             .expect("ReferenceBackend create must be infallible for 320x240");
@@ -157,14 +178,19 @@ fn main() {
     // call below (which still runs too, on a clean exit, and rewrites the
     // same path from the in-memory copy -- harmless, since by then the
     // incremental sink already has every event that copy will contain).
-    const TRACE_PATH: &str = "/tmp/wm2000-boot-trace.jsonl";
-    if let Err(e) = fn64_abi::set_trace_sink_file(TRACE_PATH) {
+    // The incremental trace sink appends+flushes a JSONL event per executor
+    // step; invaluable for boot debugging but pure overhead on a throughput
+    // run. `WM2000_NO_TRACE=1` skips arming it (the end-of-run write_trace_file
+    // is also gated on it below); `WM2000_TRACE_PATH` overrides the location.
+    if trace_disabled {
+        println!("[wm2000-boot] trace sink DISABLED (WM2000_NO_TRACE)");
+    } else if let Err(e) = fn64_abi::set_trace_sink_file(&trace_path) {
         eprintln!(
-            "[wm2000-boot] WARNING: failed to arm incremental trace sink at {TRACE_PATH}: {e} -- \
+            "[wm2000-boot] WARNING: failed to arm incremental trace sink at {trace_path}: {e} -- \
              a crash mid-boot will lose the trace (falling back to end-of-run-only)."
         );
     } else {
-        println!("[wm2000-boot] incremental trace sink armed at {TRACE_PATH}");
+        println!("[wm2000-boot] incremental trace sink armed at {trace_path}");
     }
 
     // rdram: this process's one shared buffer (docs/DESIGN.md section 3).
@@ -506,8 +532,10 @@ fn main() {
                     last_applied_input = desired;
                 }
             }
-            if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
-                capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);
+            if !dumps_disabled {
+                if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
+                    capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);
+                }
             }
             last_swap_count = swap_count;
             if let Some(stop) = stop_at_swap {
@@ -561,10 +589,12 @@ fn main() {
         fb_dumps
     );
 
-    let trace = fn64_abi::copy_trace();
-    println!("[wm2000-boot] trace events recorded: {}", trace.len());
-    write_trace_file(&trace, TRACE_PATH);
-    println!("[wm2000-boot] trace written to {TRACE_PATH}");
+    if !trace_disabled {
+        let trace = fn64_abi::copy_trace();
+        println!("[wm2000-boot] trace events recorded: {}", trace.len());
+        write_trace_file(&trace, &trace_path);
+        println!("[wm2000-boot] trace written to {trace_path}");
+    }
 }
 
 /// Hash the fb region (a fixed-size guess: 320x240 RGBA5551 = 153600 bytes,
