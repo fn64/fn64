@@ -900,10 +900,17 @@ task calls out:
   caller-selected identity: the exact raw task-entry pair selects 2.06H,
   2.08I, or 2.08J, the logical plan is derived from live RDRAM/IMEM, and the
   existing native schema, context-poisoning, and full RDRAM/RSP rollback
-  transaction execute the entry generation. This is characterization
-  transport only, currently entry-only and not yet exercised with a private
-  native point-light vector; it neither opens production HLE nor supplies the
-  missing wire/arithmetic evidence.
+  transaction execute the entry generation. The result retains the native
+  workload counter before and after execution. The repository-owned v1 suite
+  expands eight fixed policy rows into two public controls plus all six
+  point-light hypotheses at each 16/24/32-byte candidate transfer width. Each
+  subcase receives fresh RDRAM/RSP/native state, exactly one FullSync, guarded
+  synthetic inputs, and a subsequent present whose workload identity must
+  equal the task's final counter. Admission fixes the suite; private manifests
+  cannot select a variant, commands, cases, or expected results. This remains
+  characterization transport only, currently entry-only and not yet exercised
+  with an admitted private point-light pair; it neither opens production HLE
+  nor supplies the missing wire/arithmetic evidence.
   Internally, the transactional inspector and reference decoder now share the
   pinned BranchW control-flow rule: opcode `0x04` selects bits 1..7, validates
   a loaded finite transformed W, compares it strictly with `float(u32 w1)`,

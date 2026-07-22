@@ -51,7 +51,9 @@ relabel the variant. This transport does not add F3DZEX2 to
 `RenderBackend::supported_ucodes`, change `RenderBackend::process_task`, or
 claim point-light behavior. It is entry-only: a task that self-loads another
 microcode generation must fail until exact raw-pair self-load planning is
-implemented.
+implemented. Characterization evidence preserves the native workload counter
+before and after the call so a controlled FullSync vector can bind a later
+pixel capture to the final workload produced by that exact task.
 
 By default, the build expects RT64 at
 `../no-mercy-recompiled/third_party/rt64`. An allowed pinned checkout can be

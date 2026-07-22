@@ -2921,6 +2921,7 @@ mod tests {
                 "report_scenario": "synthetic-python-rust-policy-parity",
                 "recognition": "runtime_must_confirm_backend_known_pair",
                 "extended_gbi_cases": [],
+                "characterization_suite": null,
                 "program_evidence_lane": "typed_block_program",
                 "rom_class": "retail_cartridge",
             },

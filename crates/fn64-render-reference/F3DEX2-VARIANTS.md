@@ -119,13 +119,16 @@ the variant capability flag alone. An opt-in RT64 characterization transport
 now derives the exact variant and logical entry generation from locally
 supplied raw recognition windows, then reuses the production native
 plan/result validation and guest-memory rollback boundary. It is intentionally
-entry-only, is not reachable through `RenderBackend`, and has not yet produced
-a private native point-light vector. Closing the RT64-parity HLE boundary still
-requires running that black-box characterization and implementing the measured
-2.08I/J point-light records and arithmetic, exact raw-pair resolution across
-F3DZEX2 self-loads, native pixel differentials, and repeated representative
-full-task evidence. A hardware-exact or Nintendo-public claim separately
-requires hardware/black-box evidence or a public specification.
+entry-only and is not reachable through `RenderBackend`. A strict
+repository-owned suite now supplies two public controls and all six point-light
+hypotheses at 16/24/32-byte candidate transfer widths, with guarded memory and
+exact task-workload-present pixel association. It has not yet run against an
+admitted private pair. Closing the RT64-parity HLE boundary still requires
+running that black-box characterization and implementing the measured 2.08I/J
+point-light records and arithmetic, exact raw-pair resolution across F3DZEX2
+self-loads, native pixel differentials, and repeated representative full-task
+evidence. A hardware-exact or Nintendo-public claim separately requires
+hardware/black-box evidence or a public specification.
 
 The backend-neutral identity classifier hashes the larger raw task text/data
 prefixes with pinned RT64's XXH3 rows before rspboot or LLE mutates state. A

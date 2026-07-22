@@ -309,6 +309,8 @@ const _: [(); 88] = [(); std::mem::size_of::<RawTaskResult>()];
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NativeTaskResult {
     pub(crate) dp_full_sync: DpFullSyncStatus,
+    pub(crate) workload_id_before: u64,
+    pub(crate) workload_id_after: u64,
     pub(crate) full_sync_count: u64,
     pub(crate) initial_ucode_addresses: (u32, u32),
     pub(crate) final_ucode_addresses: (u32, u32),
@@ -401,6 +403,8 @@ fn task_result_from_raw(
         } else {
             DpFullSyncStatus::Reached
         },
+        workload_id_before: raw.workload_id_before,
+        workload_id_after: raw.workload_id_after,
         full_sync_count,
         initial_ucode_addresses: (
             raw.initial_ucode_text_address,
@@ -3594,6 +3598,8 @@ mod tests {
             panic!("complete native result decoded as NeedsLle");
         };
         assert_eq!(result.dp_full_sync, DpFullSyncStatus::Reached);
+        assert_eq!(result.workload_id_before, 7);
+        assert_eq!(result.workload_id_after, 10);
         assert_eq!(result.full_sync_count, 3);
         assert_eq!(result.initial_ucode_addresses, (0x1000, 0x2000));
         assert_eq!(result.final_ucode_addresses, (0x3000, 0x4000));
@@ -3622,6 +3628,8 @@ mod tests {
             panic!("complete no-sync result decoded as NeedsLle");
         };
         assert_eq!(no_sync.dp_full_sync, DpFullSyncStatus::NotReached);
+        assert_eq!(no_sync.workload_id_before, 11);
+        assert_eq!(no_sync.workload_id_after, 11);
         assert_eq!(no_sync.full_sync_count, 0);
     }
 
