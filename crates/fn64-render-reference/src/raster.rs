@@ -971,16 +971,20 @@ impl Framebuffer {
         let layout = target
             .layout()
             .expect("fill target must be I8/CI8, RGBA16, or RGBA32");
+        if rect.cycle_type == CycleType::Fill {
+            require_safe_fill_cycle_bypass(rect.other_mode, "G_FILLRECT");
+        }
+        assert_ne!(
+            rect.cycle_type,
+            CycleType::Copy,
+            "G_FILLRECT in copy cycle has no guaranteed public result; use G_TEXRECT"
+        );
         self.color_layout = layout;
         if matches!(rect.cycle_type, CycleType::OneCycle | CycleType::TwoCycle) {
             self.draw_combined_fill_rectangle(rect);
             return;
         }
-        assert_eq!(
-            rect.cycle_type,
-            CycleType::Fill,
-            "G_FILLRECT in copy cycle is not implemented"
-        );
+        debug_assert_eq!(rect.cycle_type, CycleType::Fill);
         let decode_16 = |pixel: u16| {
             let expand = |value: u16| -> u8 {
                 let value = value as u8;
@@ -1165,6 +1169,7 @@ impl Framebuffer {
     /// Clear software depth samples under a fill directed at the depth image.
     /// The coverage calculation intentionally mirrors `draw_fill_rectangle`.
     pub fn clear_depth_rectangle(&mut self, rect: &FillRectangle) {
+        require_safe_fill_cycle_bypass(rect.other_mode, "depth G_FILLRECT");
         let scissor = rect
             .scissor
             .unwrap_or_else(|| ScissorRect::framebuffer(self.width, self.height));
@@ -2231,6 +2236,17 @@ fn require_supported_alpha_compare(other_mode: OtherMode, primitive: &str) {
     }
 }
 
+fn require_safe_fill_cycle_bypass(other_mode: OtherMode, primitive: &str) {
+    if let Err(hazards) = other_mode.validate_fill_cycle_bypass() {
+        crate::render_unsupported_panic(
+            "render.rdp.fill-cycle-hazard-state",
+            format!(
+                "{primitive} in Fill cycle retains unsafe {hazards} state; the public fill contract requires G_RM_NOOP/G_RM_NOOP2, and retaining Z/framebuffer consumers is outside that safe contract (a depth read can hang the RDP)"
+            ),
+        );
+    }
+}
+
 /// Screen-registered three-bit thresholds for the two ordered RGB modes.
 /// Each 4x4 tile contains every threshold 0..=7 twice. The standard Bayer
 /// tile maximizes spatial separation; the magic-square tile gives every row
@@ -3011,6 +3027,50 @@ mod tests {
         raw_fb.clear(0, 0, 0, 255);
         raw_fb.draw_raw_rdp_triangle(&raw);
         assert_rows(&raw_fb, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn direct_fill_and_depth_entries_share_the_bypass_hazard_trap() {
+        let rectangle = FillRectangle {
+            ulx: 0.0,
+            uly: 0.0,
+            lrx: 0.0,
+            lry: 0.0,
+            fill_color: 0xffff_ffff,
+            cycle_type: CycleType::Fill,
+            scissor: None,
+            other_mode: OtherMode::from_raw(3 << 20, 1 << 6, 0),
+            combiner: CombinerState::default(),
+            blender: BlenderState::default(),
+        };
+        let target = ColorImage {
+            format: ColorImage::RGBA_FORMAT,
+            size: ColorImage::BITS_32,
+            width: 1,
+            address: 0,
+        };
+
+        for depth_entry in [false, true] {
+            let mut framebuffer = Framebuffer::new(1, 1);
+            let before_pixels = framebuffer.pixels.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if depth_entry {
+                    framebuffer.clear_depth_rectangle(&rectangle);
+                } else {
+                    framebuffer.draw_fill_rectangle(&rectangle, target);
+                }
+            }));
+            let payload = result.expect_err("direct Fill entry must retain the loud hazard trap");
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .expect("panic payload must be text");
+            assert!(message.contains("unsafe IM_RD state"));
+            assert_eq!(framebuffer.pixels, before_pixels);
+            assert!(framebuffer.depth.iter().all(|value| value.is_infinite()));
+            assert_eq!(framebuffer.color_layout(), ColorImageLayout::Rgba16);
+        }
     }
 
     #[test]

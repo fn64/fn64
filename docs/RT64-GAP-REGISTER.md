@@ -93,8 +93,12 @@ pixel. Both apply the public fill-cycle inclusive-lower-right rule clipped by
 the exclusive scissor. One/two-cycle `G_FILLRECT` uses exclusive lower-right
 bounds and the supported combiner, alpha-compare, primitive-depth, blender,
 ordered-dither, coverage, and color-write path; unsupported texture, shade,
-LOD, noise, or unavailable prior-COMBINED sources and copy-cycle fill remain
-loud gaps. It now
+LOD, noise, or unavailable prior-COMBINED sources remain loud. Fill-cycle
+`G_FILLRECT` rejects every retained `Z_CMP`, `Z_UPD`, or `IM_RD` combination
+through one shared bypass-hazard validator before color/depth mutation, as
+required by the public `gDPFillRectangle`/`gDPSetCycleType` safe-mode notes.
+Copy-cycle fill remains a loud rejection because the public result is
+explicitly unguaranteed, not a locally implementable contract. It now
 also preserves both words of TextureRectangle and executes the public
 non-flipped RGBA16 copy-cycle rule, including inclusive bounds, fixed-point
 origins/gradients, `dsdx=4<<10`, per-tile source identity, and the public

@@ -149,10 +149,12 @@
       "category": "command",
       "title": "Ordered RDP state and synchronization commands",
       "exactness": "exact_public",
-      "behavior": "Color/depth/texture targets, other modes, tiles/TMEM, fills, and sync commands are retained in display-list order and snapshotted onto emitted work.",
+      "behavior": "Color/depth/texture targets, other modes, tiles/TMEM, fills, and sync commands are retained in display-list order and snapshotted onto emitted work. Fill-cycle G_FILLRECT additionally rejects every nonempty Z_CMP/Z_UPD/IM_RD bypass-hazard combination before framebuffer or depth mutation through one validator shared by backend validation and direct raster entry points.",
       "evidence": [
         { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn ordered_ops_preserve_color_target_fill_and_full_sync" },
-        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn rdp_registers_tiles_and_tmem_survive_f3dex2_task_boundaries" }
+        { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn rdp_registers_tiles_and_tmem_survive_f3dex2_task_boundaries" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/backend.rs", "needle": "fn fill_cycle_rejects_every_unsafe_bypass_state_before_mutation" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn direct_fill_and_depth_entries_share_the_bypass_hazard_trap" }
       ],
       "blockers": [],
       "next_action": "Require any new state command to prove ordering, snapshot timing, reset behavior, and loud malformed bounds."
