@@ -751,7 +751,7 @@ Workspace tests: 1364 passed / 0 failed.
 
 ## SUCCESS (2026-07-21, ladder 3 "press START" rung): scripted input
 ## drives the game INTO ITS MENUS -- title -> Rumble Pak notice -> main
-## menu -> Exhibition submenu, all presented live
+## menu -> Exhibition -> Single Match -> RAW -> 1P VS 2P -> superstar select, all presented live
 
 Deterministic scripted controller input landed in the harness (this is
 the mechanism, see `src/main.rs`):
@@ -804,9 +804,38 @@ swap-100 and swap-2680 PNGs) -- presses only perturb what follows them.
 The game's menu stack runs on the SAME frame/timing machinery as the
 attract (one game frame per ~2 swaps, osGetTime-clocked transitions),
 so this rung consumed no new fn64 surface: zero runtime changes, pure
-harness scripting through the existing PIF input seam. A deeper run
-(A at 3400 to enter Single Match toward the wrestler-select grid) is
-the natural next rung.
+harness scripting through the existing PIF input seam.
+
+**Third run, same day: SIX menu levels deep, ending on the wrestler
+select screen with a live 3D Stone Cold model.** Extending the script
+(`A` presses at swaps 3400 / 3700 / 4000 / 4300) walked the full match
+setup flow, every screen presented live and pixel-crisp:
+
+4. A at 3400 selects Single Match -> the **show select** screen
+   (breadcrumb "Exhibition > Single Match": RAW is WAR highlighted,
+   Royal Rumble, WrestleMania, King of the Ring, SummerSlam, Sunday
+   Night Heat, Survivor Series -- the licensed show/PPV logo card wall).
+5. A at 3700 picks RAW is WAR -> the **match mode** screen
+   (1P VS 2P / 1P VS CPU / Watch).
+6. A at 4000 picks 1P VS 2P -> the **belt select** screen
+   ("New Belt", Non Title Match / Controller Pak tabs).
+7. A at 4300 picks Non Title Match -> the **superstar select** screen:
+   "Superstars 1" roster (STEVE AUSTIN highlighted, THE ROCK, TRIPLE H,
+   MANKIND, UNDERTAKER, KANE, BIG SHOW, Random) with the full 3D STONE
+   COLD model posed beside his stats card ("6'2\" 252lbs") -- a live,
+   textured character model rendered by the reference rasterizer inside
+   a menu scene. Stable there through swap #4435 (run stopped manually,
+   crash-free; all 7 scripted press pairs fired on schedule).
+
+Additional frames parked in the same artifacts directory:
+`wm2000-show-select-swap3420.png`, `wm2000-match-mode-select-swap3760.png`,
+`wm2000-belt-select-swap4060.png`,
+`wm2000-superstar-select-stone-cold-swap4360.png`. Reproduction:
+`WM2000_PRESS_START=2640 WM2000_INPUT_SCRIPT="2820..2830:8000;
+3150..3160:8000;3400..3410:8000;3700..3710:8000;4000..4010:8000;
+4300..4310:8000"`. The natural next rung: pick both wrestlers and an
+arena and see whether the ENTRANCE/MATCH scene itself boots -- the
+first in-match frame would be the deepest milestone yet.
 
 ## Superseded framing (2026-07-21, earlier): the fade's opaque black under-cover (game timeline, not blending)
 
