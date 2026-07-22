@@ -11,12 +11,17 @@ default = []
 rt64 = ["fn64-render-rt64/rt64"]
 hfr-evidence = ["rt64", "fn64-render-rt64/hfr-evidence"]
 extended-gbi-evidence = ["rt64", "fn64-render-rt64/extended-gbi-evidence"]
+f3dzex2-characterization-evidence = [
+    "rt64",
+    "fn64-render-rt64/f3dzex2-characterization-evidence",
+]
 
 [dependencies]
 fn64-render = { path = "../fn64-render" }
 fn64-render-rt64 = { path = "../fn64-render-rt64", default-features = false }
 fn64-runtime = { path = "../fn64-runtime" }
 sha2 = "0.10"
+serde_json = "1"
 
 [dev-dependencies]
 fn64-render-reference = { path = "../fn64-render-reference" }
@@ -80,3 +85,7 @@ required-features = ["rt64", "hfr-evidence"]
 [[example]]
 name = "rt64_extended_gbi_enhancement_behavior"
 required-features = ["rt64", "extended-gbi-evidence"]
+
+[[example]]
+name = "rt64_f3dzex2_characterization"
+required-features = ["rt64", "f3dzex2-characterization-evidence"]

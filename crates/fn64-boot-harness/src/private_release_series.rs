@@ -2914,7 +2914,7 @@ mod tests {
         };
         let program_receipt_identity = file_identity(&program_receipt_path);
         let manifest = serde_json::json!({
-            "schema": "fn64.private-input-admission.v6",
+            "schema": "fn64.private-input-admission.v7",
             "purpose": "full_rom",
             "intent": {
                 "wire_family": "full_rom_mixed",
@@ -2934,6 +2934,8 @@ mod tests {
             "artifacts": {
                 "microcode_text": descriptor(&text, "user_owned_rom_derived"),
                 "microcode_data": descriptor(&data, "user_owned_rom_derived"),
+                "microcode_text_raw_window": null,
+                "microcode_data_raw_window": null,
                 "rom": descriptor(&rom, "user_owned_retail_cartridge_dump"),
                 "recompiled": descriptor(&recompiled, "user_generated_from_owned_rom"),
             },

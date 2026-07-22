@@ -115,12 +115,17 @@ silicon boundary behavior.
 The internal decoder therefore covers the tested BranchW and bounded NoN
 slices, but it does not reinterpret the remaining reserved `G_SPECIAL_*`
 opcodes, alias an F3DZEX2 digest to F3DEX2, or claim point-light behavior from
-the variant capability flag alone. Closing the RT64-parity HLE boundary still
-requires black-box characterization and implementation of 2.08I/J point-light
-records and arithmetic, exact raw-pair resolution across F3DZEX2 self-loads,
-native pixel differentials, and repeated representative full-task evidence. A
-hardware-exact or Nintendo-public claim separately requires hardware/black-box
-evidence or a public specification.
+the variant capability flag alone. An opt-in RT64 characterization transport
+now derives the exact variant and logical entry generation from locally
+supplied raw recognition windows, then reuses the production native
+plan/result validation and guest-memory rollback boundary. It is intentionally
+entry-only, is not reachable through `RenderBackend`, and has not yet produced
+a private native point-light vector. Closing the RT64-parity HLE boundary still
+requires running that black-box characterization and implementing the measured
+2.08I/J point-light records and arithmetic, exact raw-pair resolution across
+F3DZEX2 self-loads, native pixel differentials, and repeated representative
+full-task evidence. A hardware-exact or Nintendo-public claim separately
+requires hardware/black-box evidence or a public specification.
 
 The backend-neutral identity classifier hashes the larger raw task text/data
 prefixes with pinned RT64's XXH3 rows before rspboot or LLE mutates state. A

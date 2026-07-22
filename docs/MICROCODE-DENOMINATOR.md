@@ -46,6 +46,15 @@ catalog stays closed until point-light behavior is characterized and
 implemented, exact raw-pair self-load resolution is validated, and native
 pixel/full-task differentials pass.
 
+The RT64 adapter has a non-default, evidence-only entry transport for that
+characterization. It derives the typed variant and logical task-entry plan
+from locally supplied raw recognition windows and retains the production
+native validation and rollback boundary. It is not part of `RenderBackend`,
+does not admit F3DZEX2, does not yet plan self-loaded generations, and no
+private native point-light result has been retained. The transport therefore
+narrows how the missing evidence will be measured without narrowing the
+denominator or closing any behavior row.
+
 Matrix v5 does not trust the backend's family label for public-microcode
 credit. It independently adjudicates each reported text digest through the
 immutable, project-owned certified-public-microcode catalog v1, and rejects a

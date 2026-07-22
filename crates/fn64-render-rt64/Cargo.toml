@@ -11,6 +11,10 @@ default = []
 # Builds the sibling RT64 checkout's static `rt64` core/HLE target and the
 # crate-local C ABI shim. The default remains pure Rust for CI/no-GPU hosts.
 rt64 = []
+# Non-default, private-input characterization transport for exact pinned
+# F3DZEX2 variants. This executes only through an explicitly evidence-named
+# API and does not add F3DZEX2 to production HLE admission.
+f3dzex2-characterization-evidence = ["rt64"]
 # Non-default, synthetic-only HLE transport used by live renderer evidence.
 # Production builds must not bypass RT64's recognized-microcode admission.
 synthetic-f3dex2-evidence = ["rt64"]

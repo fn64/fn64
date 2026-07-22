@@ -18,8 +18,10 @@ import tempfile
 from pathlib import Path
 
 
-MANIFEST_SCHEMA = "fn64.private-input-admission.v6"
-READINESS_SCHEMA = "fn64.private-input-readiness.v5"
+MANIFEST_SCHEMA = "fn64.private-input-admission.v7"
+LEGACY_MANIFEST_SCHEMA = "fn64.private-input-admission.v6"
+READINESS_SCHEMA = "fn64.private-input-readiness.v6"
+LEGACY_READINESS_SCHEMA = "fn64.private-input-readiness.v5"
 PRIVATE_RUN_CONTRACT_SCHEMA = "fn64.private-release-run-contract.v3"
 PRIVATE_RUN_CONTRACT_DIGEST_DOMAIN = (
     b"fn64.private-release-run-contract-digest.v3\0"
@@ -28,14 +30,18 @@ PROGRAM_BUILD_RECEIPT_SCHEMA = "fn64.release-program-build-receipt.v1"
 PROGRAM_BUILD_RECEIPT_DIGEST_DOMAIN = (
     b"fn64.release-program-build-receipt-digest.v1\0"
 )
-PURPOSES = {"extended_gbi", "full_rom", "combined"}
-WIRE_FAMILIES = {
+PURPOSES = {
+    "extended_gbi", "f3dzex2_characterization", "full_rom", "combined",
+}
+LEGACY_PURPOSES = {"extended_gbi", "full_rom", "combined"}
+LEGACY_WIRE_FAMILIES = {
     "f3dex2_extended_gbi_v1",
     "f3dex2",
     "fast3d_f3dex",
     "s2dex_s2dex2",
     "full_rom_mixed",
 }
+WIRE_FAMILIES = LEGACY_WIRE_FAMILIES | {"f3dzex2"}
 EXTENDED_CASES = {
     "hook-control",
     "disabled-negative-control",
@@ -65,6 +71,8 @@ ROM_PROVENANCE_BY_CLASS = {
 ROLE_PROVENANCE = {
     "microcode_text": {"user_owned_rom_derived"},
     "microcode_data": {"user_owned_rom_derived"},
+    "microcode_text_raw_window": {"user_owned_rom_derived"},
+    "microcode_data_raw_window": {"user_owned_rom_derived"},
     "rom": set(ROM_PROVENANCE_BY_CLASS.values()),
     "recompiled": {"user_generated_from_owned_rom"},
 }
@@ -80,7 +88,12 @@ INTENT_FIELDS = {
     "program_evidence_lane", "rom_class",
 }
 RELEASE_FIELDS = {"platform", "controllers", "save", "renderers", "repeat_bar"}
-ARTIFACT_FIELDS = {"microcode_text", "microcode_data", "rom", "recompiled"}
+LEGACY_ARTIFACT_FIELDS = {
+    "microcode_text", "microcode_data", "rom", "recompiled",
+}
+ARTIFACT_FIELDS = LEGACY_ARTIFACT_FIELDS | {
+    "microcode_text_raw_window", "microcode_data_raw_window",
+}
 FILE_FIELDS = {"path", "length", "sha256", "provenance", "git_identity"}
 RUNNER_FIELDS = {
     "executable", "working_directory", "argv", "env", "release_gate_cycle",
@@ -508,6 +521,16 @@ def validate_artifact(role: str, descriptor: object, root: Path) -> Path:
     require(isinstance(length, int) and not isinstance(length, bool) and 0 < length <= MAX_ARTIFACT_BYTES, f"artifacts.{role}.length is invalid")
     if role == "microcode_text":
         require(length == 4096, "artifacts.microcode_text.length must be the exact 4 KiB IMEM image")
+    elif role == "microcode_text_raw_window":
+        require(
+            length == 0x18D0,
+            "artifacts.microcode_text_raw_window.length must be the exact 0x18d0-byte native recognition window",
+        )
+    elif role == "microcode_data_raw_window":
+        require(
+            length == 0x0FC0,
+            "artifacts.microcode_data_raw_window.length must be the exact 0x0fc0-byte native recognition window",
+        )
     expected_hash = validate_sha256(descriptor["sha256"], f"artifacts.{role}.sha256")
     path = validate_local_regular_file(descriptor["path"], f"artifacts.{role}", root)
     actual_length, actual_hash, _ = regular_file_measurement(path)
@@ -756,15 +779,29 @@ def validate_runner(
 
 def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[dict, dict[str, Path]]:
     require(set(manifest) == ROOT_FIELDS, "manifest has unknown or missing root fields")
-    require(manifest["schema"] == MANIFEST_SCHEMA, f"schema must be {MANIFEST_SCHEMA!r}")
+    schema = manifest["schema"]
+    require(
+        schema in {MANIFEST_SCHEMA, LEGACY_MANIFEST_SCHEMA},
+        f"schema must be {MANIFEST_SCHEMA!r} or retained {LEGACY_MANIFEST_SCHEMA!r}",
+    )
     validate_local_regular_file(str(manifest_path), "manifest", root)
     purpose = manifest["purpose"]
-    require(purpose in PURPOSES, f"purpose must be one of {sorted(PURPOSES)}")
+    allowed_purposes = PURPOSES if schema == MANIFEST_SCHEMA else LEGACY_PURPOSES
+    require(
+        purpose in allowed_purposes,
+        f"purpose must be one of {sorted(allowed_purposes)} for {schema}",
+    )
 
     intent = manifest["intent"]
     require(isinstance(intent, dict) and set(intent) == INTENT_FIELDS, "intent fields are invalid")
     wire_family = nonempty(intent["wire_family"], "intent.wire_family")
-    require(wire_family in WIRE_FAMILIES, f"unsupported wire family {wire_family!r}")
+    allowed_wire_families = (
+        WIRE_FAMILIES if schema == MANIFEST_SCHEMA else LEGACY_WIRE_FAMILIES
+    )
+    require(
+        wire_family in allowed_wire_families,
+        f"unsupported wire family {wire_family!r} for {schema}",
+    )
     scenario = nonempty(intent["report_scenario"], "intent.report_scenario")
     require(
         SCENARIO_RE.fullmatch(scenario) is not None
@@ -797,7 +834,12 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
         require(wire_family == "f3dex2_extended_gbi_v1", "Extended GBI requires f3dex2_extended_gbi_v1")
         require(cases == EXTENDED_CASES, f"Extended GBI case denominator drifted: missing={sorted(EXTENDED_CASES - cases)}, extra={sorted(cases - EXTENDED_CASES)}")
     else:
-        require(not cases, "full_rom-only admission must not claim Extended GBI cases")
+        require(not cases, f"{purpose} admission must not claim Extended GBI cases")
+    if purpose == "f3dzex2_characterization":
+        require(
+            wire_family == "f3dzex2",
+            "F3DZEX2 characterization requires wire family f3dzex2",
+        )
 
     release = manifest["release_matrix"]
     require(isinstance(release, dict) and set(release) == RELEASE_FIELDS, "release_matrix fields are invalid")
@@ -813,25 +855,52 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
         require("rt64_lle_accuracy" in renderers, "RT64 renderer coverage requires rt64_lle_accuracy")
     if purpose in {"extended_gbi", "combined"}:
         require({"rt64_lle_accuracy", "rt64_post_vi_capture"} <= renderers, "Extended GBI requires RT64 LLE and post-VI capture coverage")
+    if purpose == "f3dzex2_characterization":
+        require(
+            {"rt64_lle_accuracy", "rt64_post_vi_capture"} <= renderers,
+            "F3DZEX2 characterization requires RT64 LLE and post-VI capture coverage",
+        )
     require(release["repeat_bar"] == 10, "release_matrix.repeat_bar must be exactly 10")
 
     artifacts = manifest["artifacts"]
-    require(isinstance(artifacts, dict) and set(artifacts) == ARTIFACT_FIELDS, "artifacts fields are invalid")
+    artifact_fields = (
+        ARTIFACT_FIELDS if schema == MANIFEST_SCHEMA else LEGACY_ARTIFACT_FIELDS
+    )
+    require(
+        isinstance(artifacts, dict) and set(artifacts) == artifact_fields,
+        f"artifacts fields are invalid for {schema}",
+    )
     admitted: dict[str, Path] = {}
-    for required_role in ("microcode_text", "microcode_data"):
+    required_roles = (
+        ("microcode_text_raw_window", "microcode_data_raw_window")
+        if purpose == "f3dzex2_characterization"
+        else ("microcode_text", "microcode_data")
+    )
+    for required_role in required_roles:
         require(artifacts[required_role] is not None, f"artifacts.{required_role} is required")
-    for role in ARTIFACT_FIELDS:
+    for role in artifact_fields:
         descriptor = artifacts[role]
         if descriptor is not None:
             admitted[role] = validate_artifact(role, descriptor, root)
-    require(
-        artifacts["microcode_text"]["length"] == 4096,
-        "artifacts.microcode_text must contain the exact 4096-byte RSP IMEM image",
-    )
-    require(
-        artifacts["microcode_data"]["length"] <= (1 << 32) - 1,
-        "artifacts.microcode_data length exceeds the task-header u32 size field",
-    )
+    if purpose == "f3dzex2_characterization":
+        require(
+            set(admitted)
+            == {"microcode_text_raw_window", "microcode_data_raw_window"},
+            "F3DZEX2 characterization admits exactly the two native raw recognition windows",
+        )
+    else:
+        require(
+            not ({"microcode_text_raw_window", "microcode_data_raw_window"} & set(admitted)),
+            f"{purpose} admission cannot mix logical microcode artifacts with raw characterization windows",
+        )
+        require(
+            artifacts["microcode_text"]["length"] == 4096,
+            "artifacts.microcode_text must contain the exact 4096-byte RSP IMEM image",
+        )
+        require(
+            artifacts["microcode_data"]["length"] <= (1 << 32) - 1,
+            "artifacts.microcode_data length exceeds the task-header u32 size field",
+        )
     if purpose in {"full_rom", "combined"}:
         require({"rom", "recompiled"} <= set(admitted), f"{purpose} admission requires ROM and recompiled artifacts")
         require(
@@ -852,7 +921,7 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
             "'identified_native_archive', 'typed_observed_function', or "
             "'typed_block_program'",
         )
-    else:
+    elif purpose == "extended_gbi":
         require(
             rom_class == "not_applicable",
             "extended_gbi-only admission must use intent.rom_class='not_applicable'",
@@ -862,6 +931,15 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
             "extended_gbi-only admission must select 'no_program_fixture'; executable full-ROM "
             "lane claims require purpose 'full_rom' or 'combined'",
         )
+    else:
+        require(
+            rom_class == "not_applicable",
+            "F3DZEX2 characterization must use intent.rom_class='not_applicable'",
+        )
+        require(
+            program_lane == "no_program_fixture",
+            "F3DZEX2 characterization must select 'no_program_fixture'",
+        )
     validate_runner(
         manifest["runner"],
         program_lane,
@@ -870,7 +948,11 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
     )
 
     readiness = {
-        "schema": READINESS_SCHEMA,
+        "schema": (
+            READINESS_SCHEMA
+            if schema == MANIFEST_SCHEMA
+            else LEGACY_READINESS_SCHEMA
+        ),
         "status": "ready",
         "purpose": purpose,
         "wire_family": wire_family,
@@ -896,17 +978,46 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
 
 def validate_readiness(report: dict) -> None:
     require(set(report) == READINESS_FIELDS, "readiness report has unknown or missing fields")
-    require(report["schema"] == READINESS_SCHEMA, f"readiness schema must be {READINESS_SCHEMA!r}")
+    schema = report["schema"]
+    require(
+        schema in {READINESS_SCHEMA, LEGACY_READINESS_SCHEMA},
+        f"readiness schema must be {READINESS_SCHEMA!r} or retained {LEGACY_READINESS_SCHEMA!r}",
+    )
     require(report["status"] == "ready", "readiness status must be ready")
-    require(report["purpose"] in PURPOSES, "readiness purpose is invalid")
-    require(report["wire_family"] in WIRE_FAMILIES, "readiness wire family is invalid")
+    purpose = report["purpose"]
+    allowed_purposes = PURPOSES if schema == READINESS_SCHEMA else LEGACY_PURPOSES
+    require(purpose in allowed_purposes, "readiness purpose is invalid")
+    allowed_wire_families = (
+        WIRE_FAMILIES if schema == READINESS_SCHEMA else LEGACY_WIRE_FAMILIES
+    )
+    require(
+        report["wire_family"] in allowed_wire_families,
+        "readiness wire family is invalid",
+    )
     scenario = nonempty(report["report_scenario"], "readiness report_scenario")
     rom_class = nonempty(report["rom_class"], "readiness rom_class")
     require(SCENARIO_RE.fullmatch(scenario) is not None and re.fullmatch(r"[0-9a-f]{64}", scenario) is None, "readiness report_scenario is invalid")
     roles = set(unique_strings(report["artifact_roles_admitted"], "readiness artifact_roles_admitted"))
     program_lane = nonempty(report["program_evidence_lane"], "readiness program_evidence_lane")
     require(program_lane in PROGRAM_EVIDENCE_LANES, "readiness program-evidence lane is invalid")
-    require({"microcode_text", "microcode_data"} <= roles <= ARTIFACT_FIELDS, "readiness artifact roles are invalid")
+    artifact_fields = (
+        ARTIFACT_FIELDS if schema == READINESS_SCHEMA else LEGACY_ARTIFACT_FIELDS
+    )
+    require(roles <= artifact_fields, "readiness artifact roles are invalid")
+    if purpose == "f3dzex2_characterization":
+        require(
+            roles == {"microcode_text_raw_window", "microcode_data_raw_window"},
+            "readiness F3DZEX2 characterization roles are incomplete or ambiguous",
+        )
+    else:
+        require(
+            {"microcode_text", "microcode_data"} <= roles,
+            "readiness logical microcode artifact roles are incomplete",
+        )
+        require(
+            not ({"microcode_text_raw_window", "microcode_data_raw_window"} & roles),
+            "readiness non-characterization purpose claims raw recognition windows",
+        )
     require(report["extended_gbi_fixture"] in {"ready_for_runtime_recognition", "not_requested"}, "readiness Extended GBI state is invalid")
     require(report["full_rom_inputs"] in {"ready", "not_supplied"}, "readiness full-ROM state is invalid")
     require(
@@ -931,7 +1042,12 @@ def validate_readiness(report: dict) -> None:
         require(report["extended_gbi_fixture"] == "ready_for_runtime_recognition" and cases == EXTENDED_CASES, "readiness Extended GBI state is inconsistent")
         require({"rt64_lle_accuracy", "rt64_post_vi_capture"} <= renderers, "readiness Extended GBI renderer policy is incomplete")
     else:
-        require(report["extended_gbi_fixture"] == "not_requested" and not cases, "readiness full-ROM-only report claims Extended GBI")
+        require(report["extended_gbi_fixture"] == "not_requested" and not cases, f"readiness {purpose} report claims Extended GBI")
+    if purpose == "f3dzex2_characterization":
+        require(
+            {"rt64_lle_accuracy", "rt64_post_vi_capture"} <= renderers,
+            "readiness F3DZEX2 characterization renderer policy is incomplete",
+        )
     if report["purpose"] in {"full_rom", "combined"}:
         require(rom_class in ROM_CLASSES, "readiness full-ROM ROM class is invalid")
         require(report["full_rom_inputs"] == "ready" and {"rom", "recompiled"} <= roles, "readiness full-ROM inputs are incomplete")
@@ -1823,6 +1939,8 @@ def synthetic_manifest(directory: Path) -> tuple[Path, dict]:
         "artifacts": {
             "microcode_text": descriptor(text, "user_owned_rom_derived"),
             "microcode_data": descriptor(data, "user_owned_rom_derived"),
+            "microcode_text_raw_window": None,
+            "microcode_data_raw_window": None,
             "rom": None,
             "recompiled": None,
         },
@@ -1984,6 +2102,208 @@ def selftest(root: Path) -> None:
             str(manifest["artifacts"]["microcode_text"]["length"]),
         ):
             require(private_value not in serialized, "selftest: readiness report leaked private identity")
+
+        legacy_manifest = json.loads(json.dumps(manifest))
+        legacy_manifest["schema"] = LEGACY_MANIFEST_SCHEMA
+        legacy_manifest["artifacts"].pop("microcode_text_raw_window")
+        legacy_manifest["artifacts"].pop("microcode_data_raw_window")
+        legacy_readiness, _ = validate_manifest(
+            legacy_manifest, manifest_path, root,
+        )
+        require(
+            legacy_readiness["schema"] == LEGACY_READINESS_SCHEMA,
+            "selftest: retained v6 manifest did not emit retained v5 readiness",
+        )
+        validate_readiness(legacy_readiness)
+        legacy_new_wire = json.loads(json.dumps(legacy_manifest))
+        legacy_new_wire["intent"]["wire_family"] = "f3dzex2"
+        expect_rejected(
+            lambda: validate_manifest(legacy_new_wire, manifest_path, root),
+            "new F3DZEX2 wire family under retained v6 manifest schema",
+        )
+        legacy_new_wire_readiness = json.loads(json.dumps(legacy_readiness))
+        legacy_new_wire_readiness["wire_family"] = "f3dzex2"
+        expect_rejected(
+            lambda: validate_readiness(legacy_new_wire_readiness),
+            "new F3DZEX2 wire family under retained v5 readiness schema",
+        )
+        legacy_manifest_path = directory / "legacy-manifest.json"
+        legacy_report_path = directory / "legacy-readiness.json"
+        legacy_manifest_path.write_bytes(serialize_json_document(legacy_manifest))
+        legacy_admission = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--manifest",
+                str(legacy_manifest_path),
+                "--report",
+                str(legacy_report_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        require(
+            legacy_admission.returncode != 0 and not legacy_report_path.exists(),
+            "selftest: retained v6 manifest compatibility was not read-only",
+        )
+
+        raw_text = directory / "synthetic-text-raw-window.bin"
+        raw_data = directory / "synthetic-data-raw-window.bin"
+        raw_text.write_bytes(
+            bytes((index * 37 + 7) & 0xFF for index in range(0x18D0))
+        )
+        raw_data.write_bytes(
+            bytes((index * 41 + 11) & 0xFF for index in range(0x0FC0))
+        )
+        characterization = json.loads(json.dumps(manifest))
+        characterization["purpose"] = "f3dzex2_characterization"
+        characterization["intent"]["wire_family"] = "f3dzex2"
+        characterization["intent"]["report_scenario"] = (
+            "synthetic-f3dzex2-characterization-selftest"
+        )
+        characterization["intent"]["extended_gbi_cases"] = []
+        characterization["artifacts"]["microcode_text"] = None
+        characterization["artifacts"]["microcode_data"] = None
+        characterization["artifacts"]["microcode_text_raw_window"] = descriptor(
+            raw_text, "user_owned_rom_derived",
+        )
+        characterization["artifacts"]["microcode_data_raw_window"] = descriptor(
+            raw_data, "user_owned_rom_derived",
+        )
+        characterization_readiness, characterization_admitted = validate_manifest(
+            characterization, manifest_path, root,
+        )
+        require(
+            set(characterization_admitted)
+            == {"microcode_text_raw_window", "microcode_data_raw_window"},
+            "selftest: characterization admitted an ambiguous artifact set",
+        )
+        require(
+            characterization_readiness["schema"] == READINESS_SCHEMA
+            and characterization_readiness["purpose"]
+            == "f3dzex2_characterization"
+            and characterization_readiness["extended_gbi_fixture"]
+            == "not_requested"
+            and characterization_readiness["full_rom_inputs"]
+            == "not_supplied",
+            "selftest: characterization readiness policy drifted",
+        )
+        validate_readiness(characterization_readiness)
+        characterization_serialized = json.dumps(
+            characterization_readiness, sort_keys=True,
+        )
+        for role in ("microcode_text_raw_window", "microcode_data_raw_window"):
+            private_descriptor = characterization["artifacts"][role]
+            for private_value in (
+                private_descriptor["path"],
+                private_descriptor["sha256"],
+                str(private_descriptor["length"]),
+            ):
+                require(
+                    private_value not in characterization_serialized,
+                    "selftest: characterization readiness leaked private identity",
+                )
+
+        legacy_characterization = json.loads(json.dumps(characterization))
+        legacy_characterization["schema"] = LEGACY_MANIFEST_SCHEMA
+        legacy_characterization["artifacts"].pop("microcode_text_raw_window")
+        legacy_characterization["artifacts"].pop("microcode_data_raw_window")
+        expect_rejected(
+            lambda: validate_manifest(
+                legacy_characterization, manifest_path, root,
+            ),
+            "F3DZEX2 characterization under retained v6 manifest schema",
+        )
+        legacy_characterization_readiness = json.loads(
+            json.dumps(characterization_readiness)
+        )
+        legacy_characterization_readiness["schema"] = LEGACY_READINESS_SCHEMA
+        expect_rejected(
+            lambda: validate_readiness(legacy_characterization_readiness),
+            "F3DZEX2 characterization under retained v5 readiness schema",
+        )
+
+        for role in ("microcode_text_raw_window", "microcode_data_raw_window"):
+            for delta in (-1, 1):
+                wrong_raw_length = json.loads(json.dumps(characterization))
+                wrong_raw_length["artifacts"][role]["length"] += delta
+                expect_rejected(
+                    lambda value=wrong_raw_length: validate_manifest(
+                        value, manifest_path, root,
+                    ),
+                    f"{role} off-by-one length {delta:+d}",
+                )
+
+        for missing_role in (
+            "microcode_text_raw_window", "microcode_data_raw_window",
+        ):
+            missing_raw_role = json.loads(json.dumps(characterization))
+            missing_raw_role["artifacts"][missing_role] = None
+            expect_rejected(
+                lambda value=missing_raw_role: validate_manifest(
+                    value, manifest_path, root,
+                ),
+                f"characterization missing {missing_role}",
+            )
+
+        mixed_authority = json.loads(json.dumps(characterization))
+        mixed_authority["artifacts"]["microcode_text"] = manifest["artifacts"][
+            "microcode_text"
+        ]
+        expect_rejected(
+            lambda: validate_manifest(mixed_authority, manifest_path, root),
+            "characterization with logical and raw text authorities",
+        )
+        wrong_characterization_family = json.loads(json.dumps(characterization))
+        wrong_characterization_family["intent"]["wire_family"] = "f3dex2"
+        expect_rejected(
+            lambda: validate_manifest(
+                wrong_characterization_family, manifest_path, root,
+            ),
+            "characterization with neighboring wire family",
+        )
+        characterization_cases = json.loads(json.dumps(characterization))
+        characterization_cases["intent"]["extended_gbi_cases"] = sorted(
+            EXTENDED_CASES
+        )
+        expect_rejected(
+            lambda: validate_manifest(
+                characterization_cases, manifest_path, root,
+            ),
+            "characterization claiming Extended GBI cases",
+        )
+        characterization_program = json.loads(json.dumps(characterization))
+        characterization_program["intent"]["program_evidence_lane"] = (
+            "typed_block_program"
+        )
+        expect_rejected(
+            lambda: validate_manifest(
+                characterization_program, manifest_path, root,
+            ),
+            "characterization claiming an executable program lane",
+        )
+        characterization_reference = json.loads(json.dumps(characterization))
+        characterization_reference["release_matrix"]["renderers"] = [
+            "reference_lle_accuracy"
+        ]
+        expect_rejected(
+            lambda: validate_manifest(
+                characterization_reference, manifest_path, root,
+            ),
+            "characterization without RT64 post-VI coverage",
+        )
+        characterization_with_logical_readiness = json.loads(
+            json.dumps(characterization_readiness)
+        )
+        characterization_with_logical_readiness[
+            "artifact_roles_admitted"
+        ].append("microcode_text")
+        expect_rejected(
+            lambda: validate_readiness(characterization_with_logical_readiness),
+            "characterization readiness with mixed logical/raw authority",
+        )
 
         text_path = Path(manifest["artifacts"]["microcode_text"]["path"])
         original = text_path.read_bytes()
@@ -2513,6 +2833,11 @@ def main() -> int:
         require(args.manifest.is_absolute(), "--manifest must be absolute")
         validate_local_regular_file(str(args.manifest), "manifest", root)
         manifest = load_json(args.manifest)
+        require(
+            manifest.get("schema") == MANIFEST_SCHEMA,
+            f"new --manifest admission requires schema {MANIFEST_SCHEMA!r}; "
+            f"retained {LEGACY_MANIFEST_SCHEMA!r} is read-only compatibility for contract verification",
+        )
         readiness, admitted = validate_manifest(manifest, args.manifest, root)
         if args.emit_private_run_contract is not None:
             require(

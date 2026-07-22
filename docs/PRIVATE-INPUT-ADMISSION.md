@@ -23,7 +23,7 @@ that a full-ROM release matrix closed.
 
 ## Local-only manifest
 
-The schema is `fn64.private-input-admission.v6`. A populated manifest contains
+The current schema is `fn64.private-input-admission.v7`. A populated manifest contains
 private paths, exact lengths, and SHA-256 values and must never enter git. Use
 this shape, replacing every angle-bracket placeholder locally. Quoted integer
 placeholders (`length` and `release_gate_cycle`) must become JSON integers,
@@ -31,7 +31,7 @@ not strings:
 
 ```json
 {
-  "schema": "fn64.private-input-admission.v6",
+  "schema": "fn64.private-input-admission.v7",
   "purpose": "combined",
   "intent": {
     "wire_family": "f3dex2_extended_gbi_v1",
@@ -70,6 +70,8 @@ not strings:
       "provenance": "user_owned_rom_derived",
       "git_identity": "excluded"
     },
+    "microcode_text_raw_window": null,
+    "microcode_data_raw_window": null,
     "rom": {
       "path": "/private/tmp/<owned-rom>",
       "length": "<exact-positive-integer>",
@@ -113,10 +115,57 @@ not strings:
 }
 ```
 
-`microcode_text` and `microcode_data` are always required. The text length is
-exactly 4096 bytes because the fixture must install the complete admitted IMEM
-image. `rom` and `recompiled` may be `null` for `extended_gbi`; both are
-required for `full_rom` and `combined`.
+`microcode_text` and `microcode_data` are required for `extended_gbi`,
+`full_rom`, and `combined`. The text length is exactly 4096 bytes because the
+fixture must install the complete admitted IMEM image. The two raw-window
+roles must be `null` for those purposes. `rom` and `recompiled` may be `null`
+for `extended_gbi`; both are required for `full_rom` and `combined`.
+
+### F3DZEX2 characterization input
+
+Purpose `f3dzex2_characterization` admits native RDRAM-storage recognition
+windows without treating those storage bytes as logical N64 byte order. Its
+intent is fixed to `wire_family: "f3dzex2"`, an empty
+`extended_gbi_cases` array, `program_evidence_lane: "no_program_fixture"`,
+and `rom_class: "not_applicable"`. It requires RT64 LLE and post-VI capture
+in the release policy. Its artifact object has this exclusive shape:
+
+```json
+{
+  "microcode_text": null,
+  "microcode_data": null,
+  "microcode_text_raw_window": {
+    "path": "/private/tmp/<raw-text-window>",
+    "length": 6352,
+    "sha256": "<lowercase-sha256>",
+    "provenance": "user_owned_rom_derived",
+    "git_identity": "excluded"
+  },
+  "microcode_data_raw_window": {
+    "path": "/private/tmp/<raw-data-window>",
+    "length": 4032,
+    "sha256": "<lowercase-sha256>",
+    "provenance": "user_owned_rom_derived",
+    "git_identity": "excluded"
+  },
+  "rom": null,
+  "recompiled": null
+}
+```
+
+The lengths are exactly `0x18d0` text-storage bytes and `0x0fc0`
+data-storage bytes, matching the native RT64 adapter recognition boundary.
+After admission, a characterization consumer copies those bytes directly to
+non-overlapping scratch RDRAM ranges. It derives the logical 4096-byte IMEM
+image and logical `0x0fc0` task-data image through the normal RDRAM byte-lane
+view, then loads/hashes those derived logical images. It must retain the
+original storage ranges unchanged for raw recognition. No independently
+supplied logical artifact may override or contradict that derivation.
+
+This purpose is characterization intake only. Readiness does not admit
+F3DZEX2 HLE, convert its diagnostic family into public-microcode credit, or
+authorize relabeling it as F3DEX2. A production catalog remains closed until
+the separate behavioral gates are met.
 
 `rom_class` is `retail_cartridge` or `public_homebrew` for a full-ROM run,
 and exactly `not_applicable` for an Extended-GBI-only fixture. The ROM
@@ -145,7 +194,7 @@ bound. Use `no_program_fixture` only for an `extended_gbi`-only fixture that
 executes no full-ROM program. These failures occur during admission, before a
 ten-run series spends time booting the game.
 
-The v6 `runner` section binds the exact native entry image, program-build
+The v7 `runner` section retains the v6 contract: it binds the exact native entry image, program-build
 receipt, working directory, argument vector, fixed child environment, gate
 cycle, and expected v20 execution source. The executable and receipt must be
 built before admission. The trusted runner clears the ambient environment,
@@ -225,7 +274,8 @@ metadata remains outside this local single-owner admission guarantee.
 
 ## Content-free readiness report
 
-The emitted and revalidated schema is `fn64.private-input-readiness.v5`.
+The emitted and revalidated current schema is
+`fn64.private-input-readiness.v6`.
 
 Run admission with explicit absolute paths:
 
@@ -245,6 +295,19 @@ names, and ready/not-supplied states only. It contains no input path, filename,
 byte length, SHA-256, manifest identity, or private byte-derived digest. It is
 safe as a content-free handoff, but it is not a substitute for retaining the
 local manifest during the run.
+
+Characterization readiness names only the purpose and the two admitted raw
+role labels. Its Extended-GBI and full-ROM states are respectively
+`not_requested` and `not_supplied`; it contains no private path, filename,
+length, digest, or derived logical identity.
+
+For retained evidence, contract and readiness verification continue to accept
+the exact v6 manifest/v5 readiness vocabulary. That compatibility branch is
+read-only: a new `--manifest` admission must use v7. It does not accept
+`f3dzex2_characterization`, the `f3dzex2` wire-family label, the raw-window
+roles, or any v7 field shape. New admission is emitted as v7/v6. This
+preserves revalidation of retained v3 contracts without silently broadening
+their older schema.
 
 ## Private run contract and trusted series
 
@@ -274,7 +337,8 @@ It returns an opaque verified-contract type only after the repository policy
 script at `tools/private_input_admission.py` byte-matches the copy embedded in
 the runner. The runner resolves `/usr/bin/python3`, then feeds the embedded
 policy bytes directly to isolated Python over a pipe while it revalidates the
-full v6 manifest/v5 readiness/receipt/v3 contract mapping; Python never reopens a
+full v7/v6 manifest/readiness/receipt/v3 contract mapping, including the
+strict retained v6/v5 branch; Python never reopens a
 mutable script path for execution. Repository-owned synthetic mechanism tests
 use a separate constructor that accepts only the exact fixed non-game
 manifest/readiness/input bytes, scenario, cycle, empty admitted-artifact set,

@@ -15,8 +15,11 @@
 mod adapter_source_identity;
 
 pub mod extended_gbi;
+#[cfg(feature = "f3dzex2-characterization-evidence")]
+mod f3dzex2_characterization;
 #[cfg(feature = "rt64")]
 mod ffi;
+mod ingress;
 #[cfg(any(feature = "rt64", test))]
 mod transaction;
 
@@ -43,6 +46,11 @@ use transaction::{NativeContextLease, NativeRdramRollback, NativeTaskMemoryRollb
 const RT64_GBI_TEXT_RECOGNITION_BYTES: usize = 0x18d0;
 #[cfg(feature = "rt64")]
 const RT64_GBI_DATA_RECOGNITION_BYTES: usize = 0x0fc0;
+
+#[cfg(feature = "f3dzex2-characterization-evidence")]
+pub use f3dzex2_characterization::{
+    Rt64F3dzex2CharacterizationEvidence, Rt64F3dzex2UcodeAddresses,
+};
 
 /// C++-observed scalar state at the RT64 adapter boundary.
 ///
@@ -926,6 +934,9 @@ pub struct Rt64Backend {
     /// independent of surface resizing and is published only with the live
     /// RT64 policy/device evidence created from the same configuration.
     active_tv_type: Option<fn64_runtime::TvType>,
+    /// Dimensions owned by the current native context. Native task/raw-DPC
+    /// ingress uses this exact image to bound a nonzero RGBA16 output target.
+    active_surface_size: Option<ingress::ActiveSurfaceSize>,
     /// RT64's GBI selection is still HLE. Apply the same exact task-entry
     /// admission as the Rust reference backend before crossing the C ABI.
     f3dex2_ucodes: F3dex2UcodeCatalog,
@@ -964,6 +975,7 @@ impl Rt64Backend {
     pub fn new() -> Self {
         Rt64Backend {
             active_tv_type: None,
+            active_surface_size: None,
             f3dex2_ucodes: F3dex2UcodeCatalog::default(),
             microcode_pairs: MicrocodePairCatalog::default(),
             last_dp_full_sync: fn64_render::DpFullSyncStatus::Unidentified,
@@ -989,6 +1001,7 @@ impl Rt64Backend {
     #[cfg(any(feature = "rt64", test))]
     fn clear_active_native_identity(&mut self) {
         self.active_tv_type = None;
+        self.active_surface_size = None;
         self.last_present = None;
         self.active_settings = None;
         self.active_enhancement_settings = None;
@@ -2182,6 +2195,7 @@ impl RenderBackend for Rt64Backend {
 
     fn create(&mut self, cfg: &RenderConfig) -> Result<(), RenderError> {
         self.active_tv_type = None;
+        self.active_surface_size = None;
         self.last_present = None;
         self.active_settings = None;
         self.active_enhancement_settings = None;
@@ -2251,6 +2265,10 @@ impl RenderBackend for Rt64Backend {
                     .collect(),
             });
             self.active_tv_type = Some(cfg.tv_type);
+            self.active_surface_size = Some(ingress::ActiveSurfaceSize {
+                width: cfg.width,
+                height: cfg.height,
+            });
             Ok(())
         }
 
@@ -2283,6 +2301,12 @@ impl RenderBackend for Rt64Backend {
         self.last_dp_full_sync = fn64_render::DpFullSyncStatus::Unidentified;
         #[cfg(feature = "rt64")]
         {
+            ingress::validate_task_ingress(
+                rdram.len(),
+                task,
+                output_addr,
+                self.active_surface_size,
+            )?;
             let force_branch = self
                 .active_enhancement_settings
                 .as_ref()
@@ -2419,6 +2443,7 @@ impl RenderBackend for Rt64Backend {
         self.last_dp_full_sync = fn64_render::DpFullSyncStatus::Unidentified;
         #[cfg(feature = "rt64")]
         {
+            ingress::validate_output_target(rdram.len(), output_addr, self.active_surface_size)?;
             let start_usize = usize::try_from(start).expect("u32 RDP start fits usize");
             let end_usize = usize::try_from(end).expect("u32 RDP end fits usize");
             if start >= end
@@ -2755,6 +2780,10 @@ impl RenderBackend for Rt64Backend {
         #[cfg(feature = "rt64")]
         if let Some(context) = &mut self.context {
             context.resize(w, h);
+            self.active_surface_size = Some(ingress::ActiveSurfaceSize {
+                width: w,
+                height: h,
+            });
         }
 
         #[cfg(not(feature = "rt64"))]
