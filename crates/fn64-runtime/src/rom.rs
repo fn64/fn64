@@ -483,13 +483,13 @@ impl<R: RomStorage> PiDma<R> {
     }
 
     /// `osEPiStartDma(handle, mb, direction)`'s core transfer, once the
-    /// caller (`fn64-abi`'s shim) has already resolved the `OSIoMesg`'s
-    /// `dramAddr`/`devAddr`/`size` fields and the handle's cartridge-domain
-    /// timing (`osCartRomInit`'s role, per rung 10b -- validated but not
-    /// modeled numerically here: this milestone's shims don't yet need PI
-    /// timing-register values, only a valid handle to have existed before
-    /// the first real DMA, matching the rung's actual failure mode being
-    /// "reads zero garbage from an unnamed handle," not a timing bug).
+    /// caller (`fn64-abi`'s shim) has decoded the `OSIoMesg`, formed the
+    /// public `handle->baseAddress | devAddr`, normalized the supported
+    /// Game Pak/SRAM physical spaces into this engine's address convention,
+    /// and applied the handle timing to `DeviceFabric`'s raw PI registers.
+    /// Keeping handle parsing above this storage primitive lets managed/raw
+    /// EPI and programmed I/O share one authority without teaching the
+    /// runtime core about guest C-struct layout.
     ///
     /// Copies `len` ROM bytes starting at `dev_addr` into `rdram` at
     /// `dram_addr`, matching real cartridge-domain PI DMA's actual effect --

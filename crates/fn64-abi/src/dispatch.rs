@@ -378,6 +378,9 @@ mod tests {
         // from the static VRAM so a heap-vs-static confusion is caught.
         let heap_vram: u32 = 0x8038_8b60;
         let mut rdram = vec![0u8; fn64_runtime::RDRAM_MMIO_WINDOW_END as usize];
+        set_cart_rom_handle_vram(0x8000_1000);
+        let mut cart = ctx_zeroed();
+        unsafe { osCartRomInit_recomp(rdram.as_mut_ptr(), &mut cart) };
         let mb_off = 0x2000usize;
         let mb_vram: u64 = 0x8000_2000;
         rdram[mb_off + 0x4..mb_off + 0x8].copy_from_slice(&0u32.to_ne_bytes()); // retQueue
@@ -386,6 +389,7 @@ mod tests {
         rdram[mb_off + 0x10..mb_off + 0x14].copy_from_slice(&file_len.to_ne_bytes()); // size
 
         let mut ctx = ctx_zeroed();
+        ctx.r4 = cart.r2;
         ctx.r5 = mb_vram;
         ctx.r6 = 0; // OS_READ / ToRdram
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };

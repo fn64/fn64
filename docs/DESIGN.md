@@ -714,7 +714,21 @@ task calls out:
   behavior. This distinction is load-bearing: exposing hardware `PiBusy` to a
   second managed caller made OoT's DmaMgr report a multi-chunk load complete
   after only its first chunk. Managed EPI, raw PI APIs, and typed-Rust PI
-  register writes otherwise converge on the same fabric.
+  register writes otherwise converge on the same fabric. Public
+  `OSPiHandle` state is not an opaque host token: one ABI decoder validates
+  its public type/domain/timing/base fields, including the uncached KSEG1
+  base-address form shown by Chapter 27's SRAM acquisition example, publishes
+  timing through that fabric's raw PI registers, and applies the documented
+  KSEG1 `baseAddress | devAddr` rule for managed DMA, raw DMA, and programmed
+  I/O before converting the result at the physical PI boundary.
+  The supported Game Pak ROM and SRAM physical spaces normalize into the
+  fabric's one storage authority. A malformed handle or a documented bulk/64DD space without
+  attached storage records `abi.pi.epi-handle` before trapping; it cannot be
+  guessed from pointer inequality or routed into zero-filled ROM bytes.
+  `osCartRomInit` and `osLeoDiskInit` write the same public handle layout
+  from typed domain state. Provenance: public libultra
+  Programming Manual Chapter 27, “EPI Manager” and “SRAM,” plus the public
+  `osEPiStartDma` and `osEPiRawStartDma` function pages.
   At the deadline it writes the process's one RDRAM allocation, clears PI
   busy, raises MI PI pending, and only then returns an executor notification.
   `advance_virtual_time` injects that notification before it returns. The

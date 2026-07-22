@@ -405,7 +405,20 @@ raises MI AI, and OS_EVENT_AI is posted only after that state is visible. The
 public `rcp.h` command semantics also converge SP/SI/VI/AI/DP acknowledgement
 on the common MI source. That RCP/MI authority exists from host-state creation,
 independent of cartridge ROM installation; PI separately retains a loud
-missing-ROM gate. The typed IPL standard selects NTSC/PAL/MPAL VI and AI
+missing-ROM gate. Public `OSPiHandle` decoding is now the common managed/raw
+EPI and programmed-I/O authority: every EPI entry validates Chapter 27's
+uncached KSEG1 handle base, applies the handle's domain timing to the same raw
+PI registers, and forms the public KSEG1 `baseAddress | devAddr` before
+converting at the physical PI boundary and entering the fabric. Game Pak ROM
+and SRAM normalize into the existing one
+ROM/save engine; malformed handles, domain/base mismatches, and documented
+64DD/bulk spaces without an attached backing device record one typed
+unsupported event and trap instead of falling through to ROM bytes. The old
+`osPi*` family retains its documented Game Pak-relative address convention
+while converging below handle decode on the same fabric. These semantics come
+from the public Programming Manual Chapter 27, “EPI Manager” and “SRAM,” and the public
+`osEPiStartDma`/`osEPiRawStartDma` function pages; no runtime implementation
+was used as a source. The typed IPL standard selects NTSC/PAL/MPAL VI and AI
 clocks and now crosses `RenderConfig` into native RT64 workload-rate inference,
 so stable VI factors derive from 60/50/60 Hz without changing an Extended-GBI
 refresh override. Ten fresh Metal processes observe exact PAL/MPAL completed-
