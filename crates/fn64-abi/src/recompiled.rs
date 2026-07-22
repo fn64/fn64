@@ -1165,6 +1165,7 @@ c_adapters!(
     (os_eeprom_write, osEepromWrite_recomp),
     (os_eeprom_long_read, osEepromLongRead_recomp),
     (os_eeprom_long_write, osEepromLongWrite_recomp),
+    (os_pfs_is_plug, osPfsIsPlug_recomp),
     (os_pfs_init_pak, osPfsInitPak_recomp),
     (os_pfs_free_blocks, osPfsFreeBlocks_recomp),
     (os_pfs_allocate_file, osPfsAllocateFile_recomp),
@@ -2560,6 +2561,9 @@ mod tests {
 
     #[test]
     fn typed_raw_vi_registers_drive_half_line_timing_and_shared_mi() {
+        crate::test_support::install_complete_render_backend(
+            fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        );
         let previous = fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
         let mut bytes = [0; 4];
         let mut mem = Rdram::new(&mut bytes);

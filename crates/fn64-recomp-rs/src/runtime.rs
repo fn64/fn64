@@ -20,7 +20,9 @@
 //! - Zero- or sign-extended KSEG0/KSEG1 addresses in the physical RDRAM
 //!   window map through their shared low-29-bit physical offset. Canonical
 //!   32-bit mapped data addresses use the context's recorded TLB entries;
-//!   64-bit mapped spaces and instruction translation remain loud boundaries.
+//!   instruction fetch has a separate physical-address result so architectural
+//!   PCs are never reused as admitted code identity. 64-bit mapped spaces
+//!   remain a loud boundary.
 //! - Word accesses use the host-native representation used by the ABI buffer;
 //!   sub-word accesses XOR the byte offset: halfword `^2`, byte `^3`. This is
 //!   the N64's big-endian view over a little-endian host buffer. It is applied
@@ -72,6 +74,25 @@ pub enum TranslatedDataAddress {
     Direct(u64),
     /// A mapped segment selected this physical byte address through the TLB.
     Mapped(u32),
+}
+
+/// Physical instruction-word address selected by the VR4300's 32-bit fetch
+/// translation rules.
+///
+/// This deliberately has no direct-segment variant: KSEG0/KSEG1 are aliases
+/// only at the architectural VA layer. Code admission and generation identity
+/// are always qualified by the resulting physical word address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranslatedInstructionAddress(u32);
+
+impl TranslatedInstructionAddress {
+    pub const fn new(physical: u32) -> Self {
+        Self(physical)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
 }
 
 /// Typed checked-memory failure shared by generated and interpreted blocks.
@@ -511,8 +532,9 @@ impl RecompContext {
     /// KSEG0/KSEG1 bypass the TLB. KUSEG, KSSEG, and KSEG3 use the recorded
     /// entries and the current EntryHi ASID. Noncanonical 64-bit addresses are
     /// deliberately left to the existing unbacked-address boundary; XKPHYS,
-    /// XUSEG/XKSSEG/XKSEG, privilege checks, and instruction translation are
-    /// not silently approximated by this 32-bit data slice.
+    /// XUSEG/XKSSEG/XKSEG and privilege checks are not silently approximated
+    /// by this 32-bit data slice. Instruction fetch uses the separate
+    /// physical-only result of [`Self::translate_instruction_address`].
     pub fn translate_data_address(
         &self,
         vaddr: u64,
@@ -602,6 +624,49 @@ impl RecompContext {
         Ok(TranslatedDataAddress::Mapped(
             physical_page | (low & (page_size - 1)),
         ))
+    }
+
+    /// Translate one canonical 32-bit architectural instruction address to
+    /// physical instruction-word identity.
+    ///
+    /// VR4300 User's Manual chapter 3 supplies the same KSEG0/KSEG1 direct and
+    /// KUSEG/KSSEG/KSEG3 TLB geometry used by data translation. Fetch differs
+    /// at the result boundary: callers receive only the physical address and
+    /// must retain the architectural VA separately for branch/link/EPC state.
+    /// The currently unsupported 64-bit address spaces and non-kernel
+    /// privilege modes trap here instead of being approximated.
+    pub fn translate_instruction_address(
+        &self,
+        vaddr: u64,
+    ) -> Result<TranslatedInstructionAddress, TlbFault> {
+        const STATUS_EXL: u32 = 1 << 1;
+        const STATUS_ERL: u32 = 1 << 2;
+        const STATUS_KSU_MASK: u32 = 0b11 << 3;
+
+        let upper = vaddr >> 32;
+        let low = vaddr as u32;
+        if upper != 0 && !(upper == u32::MAX as u64 && low & 0x8000_0000 != 0) {
+            trap_unsupported(format!(
+                "64-bit instruction address translation is unsupported for {vaddr:#018x}"
+            ));
+        }
+        if self.cop0_status & (STATUS_EXL | STATUS_ERL) == 0
+            && self.cop0_status & STATUS_KSU_MASK != 0
+        {
+            trap_unsupported(format!(
+                "instruction translation privilege checks are unsupported with Status.KSU={}",
+                (self.cop0_status & STATUS_KSU_MASK) >> 3
+            ));
+        }
+
+        match self.translate_data_address(vaddr, DataAccessKind::Load)? {
+            TranslatedDataAddress::Direct(_) => {
+                Ok(TranslatedInstructionAddress::new(low & 0x1fff_ffff))
+            }
+            TranslatedDataAddress::Mapped(physical) => {
+                Ok(TranslatedInstructionAddress::new(physical))
+            }
+        }
     }
 
     #[inline]
@@ -2031,7 +2096,7 @@ mod tests {
     use super::{
         set_unsupported_observer, trap_unsupported, DataAccessError, DataAccessKind,
         GuestWriteEvent, Rdram, RecompContext, TlbEntryRaw, TlbFault, TlbFaultKind,
-        TranslatedDataAddress, RDRAM_LEN,
+        TranslatedDataAddress, TranslatedInstructionAddress, RDRAM_LEN,
     };
 
     type RdramOperation = for<'a> fn(&mut Rdram<'a>);
@@ -2325,6 +2390,67 @@ mod tests {
                 kind: TlbFaultKind::Invalid,
             })
         );
+    }
+
+    #[test]
+    fn instruction_translation_returns_physical_identity_for_direct_and_mapped_aliases() {
+        let mut ctx = RecompContext::new();
+        ctx.tlb_entries[0] = TlbEntryRaw {
+            page_mask: 0,
+            entry_hi: 0x0040_0000,
+            entry_lo0: ((0x0010_0000 >> 6) & 0x03ff_ffc0) | 0b111,
+            entry_lo1: ((0x0030_0000 >> 6) & 0x03ff_ffc0) | 0b111,
+        };
+
+        assert_eq!(
+            ctx.translate_instruction_address(0x8000_0040),
+            Ok(TranslatedInstructionAddress::new(0x40))
+        );
+        assert_eq!(
+            ctx.translate_instruction_address(0xa000_0040),
+            Ok(TranslatedInstructionAddress::new(0x40))
+        );
+        assert_eq!(
+            ctx.translate_instruction_address(0x0040_0ffc),
+            Ok(TranslatedInstructionAddress::new(0x0010_0ffc))
+        );
+        assert_eq!(
+            ctx.translate_instruction_address(0x0040_1000),
+            Ok(TranslatedInstructionAddress::new(0x0030_0000))
+        );
+    }
+
+    #[test]
+    fn unsupported_instruction_address_spaces_and_privilege_remain_loud() {
+        let result = std::panic::catch_unwind(|| {
+            RecompContext::new().translate_instruction_address(0x0000_0001_0000_0000)
+        });
+        let message = result
+            .expect_err("64-bit instruction translation must remain loud")
+            .downcast::<String>()
+            .map(|message| *message)
+            .unwrap_or_else(|payload| {
+                payload
+                    .downcast::<&'static str>()
+                    .map(|message| (*message).to_owned())
+                    .unwrap_or_default()
+            });
+        assert!(message.contains("64-bit instruction address translation is unsupported"));
+
+        let mut user = RecompContext::new();
+        user.cop0_status = 0b10 << 3;
+        let result = std::panic::catch_unwind(|| user.translate_instruction_address(0x0040_0000));
+        let message = result
+            .expect_err("instruction privilege modeling must remain loud")
+            .downcast::<String>()
+            .map(|message| *message)
+            .unwrap_or_else(|payload| {
+                payload
+                    .downcast::<&'static str>()
+                    .map(|message| (*message).to_owned())
+                    .unwrap_or_default()
+            });
+        assert!(message.contains("instruction translation privilege checks are unsupported"));
     }
 
     #[test]

@@ -100,6 +100,27 @@ pub struct MesgQueueEvidenceSnapshot {
     pub blocked_senders: Vec<BlockedSenderEvidenceSnapshot>,
 }
 
+/// Minimal read-only lifecycle state used when a libultra API requires an
+/// exclusively owned message queue. Keeping queued messages and both waiter
+/// roles in one value prevents callers from mistaking "validCount == 0" for
+/// "nobody else can consume the next post."
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MesgQueueActivity {
+    pub capacity: usize,
+    pub valid_count: usize,
+    pub blocked_receivers: usize,
+    pub blocked_senders: usize,
+}
+
+impl MesgQueueActivity {
+    pub const fn is_exclusively_idle(self) -> bool {
+        self.capacity > 0
+            && self.valid_count == 0
+            && self.blocked_receivers == 0
+            && self.blocked_senders == 0
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct BlockedSend {
     id: CoroutineId,
@@ -268,6 +289,15 @@ impl MesgQueue {
                     placement: blocked.placement,
                 })
                 .collect(),
+        }
+    }
+
+    pub fn activity(&self) -> MesgQueueActivity {
+        MesgQueueActivity {
+            capacity: self.capacity(),
+            valid_count: self.valid_count,
+            blocked_receivers: self.blocked_on_recv.waiters.len(),
+            blocked_senders: self.blocked_on_send.waiters.len(),
         }
     }
 

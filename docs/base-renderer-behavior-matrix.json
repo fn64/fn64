@@ -499,7 +499,7 @@
       "category": "integration",
       "title": "Fixed-cycle full-ROM zero-unsupported evidence",
       "exactness": "missing",
-      "behavior": "Schema-v21 binds all five fixed-cycle channels, boundary-owned physical RDRAM/audio/traces, reference pixels checked against frozen memory, the compiled unsupported-instrumentation denominator, complete observation geometry, environment, execution destinations, and the ABI-owned microcode/IMEM/DPC stream. Private admission v7 and contract v3 bind class-specific ROM provenance and exact input/build/child identities. Representative private NTSC reference and RT64 LLE/post-VI exact-ten series completed and were reverified on 2026-07-22. Their current incomplete matrix accepted 2 scenarios and 20 reports, satisfied 9 of 162 FullParityV1 requirements, and retained 153 explicit gaps. Positive Windows evidence, RT64 platform-case/blocker results, allowed-source public-microcode identities, and the other representative scenarios remain missing.",
+      "behavior": "Schema-v22 binds all five fixed-cycle channels, boundary-owned physical RDRAM/audio/traces, reference pixels checked against frozen memory, the compiled unsupported-instrumentation denominator, complete observation geometry, environment, execution destinations, and the ABI-owned microcode/IMEM/DPC stream. Private admission v7 and contract v3 bind class-specific ROM provenance and exact input/build/child identities. Representative private NTSC reference and RT64 LLE/post-VI exact-ten series plus a public synthetic identified-native XBUS exact-ten series completed and were reverified on 2026-07-22. Their current incomplete matrix accepted 3 scenarios and 30 reports, satisfied 12 of 162 FullParityV1 requirements, and retained 150 explicit gaps. Positive Windows evidence, RT64 platform-case/blocker results, allowed-source public-microcode identities, and the other representative scenarios remain missing.",
       "evidence": [
         { "kind": "doc", "path": "docs/RELEASE-GATE.md", "needle": "no complete representative full-ROM" },
         { "kind": "test", "path": "crates/fn64-boot-harness/src/release_gate.rs", "needle": "fn device_evidence_wire_binds_executor_peripheral_and_manager_state" },
@@ -508,9 +508,9 @@
         { "kind": "doc", "path": "docs/PARITY-METHOD.md", "needle": "current measured observation matches through swap 60" }
       ],
       "blockers": [
-        { "kind": "full_rom", "detail": "The current v21 private-series assessment canonically retains 9 satisfied and 153 missing FullParityV1 assignments; only all 162 requirements can produce a complete retained matrix. The certified-public-microcode catalog, positive Windows evidence, RT64 target cases, blocker closure, and other scenario series remain missing." }
+        { "kind": "full_rom", "detail": "The current v22 three-scenario assessment canonically retains 12 satisfied and 150 missing FullParityV1 assignments; only all 162 requirements can produce a complete retained matrix. The public XBUS scenario carries no private-ROM authority. The certified-public-microcode catalog, positive Windows evidence, RT64 target cases, blocker closure, and other scenario series remain missing." }
       ],
-      "next_action": "Add allowed-source identities to a successor certified-public-microcode catalog, produce native Windows v21 evidence and production platform-case/blocker authorities, then populate private v5 manifests through the verified-series path with ten distinct schema-v21 report/journal pairs per scenario until the fixed profile reaches Complete."
+      "next_action": "Add allowed-source identities to a successor certified-public-microcode catalog, produce native Windows v22 evidence and production platform-case/blocker authorities, then populate private v5 manifests through the verified-series path with ten distinct schema-v22 report/journal pairs per scenario until the fixed profile reaches Complete."
     }
   ]
 }

@@ -396,16 +396,11 @@ impl Peripherals {
         &self.tasks
     }
 
-    /// Record an RSP task submission. Returns the task's `TaskKind`, if any,
-    /// so the caller (`Executor::submit_task`) can still emit the shared
-    /// `TaskSubmit` trace event itself (see module doc: trace recording
-    /// needs `sim_time`, not modeled here) -- same information
-    /// `Executor::submit_task`'s prior single-body version derived from
-    /// `header.kind()` before calling `self.tasks.record(header)`.
-    pub fn submit_task(&mut self, header: OsTaskHeader) -> Option<crate::trace::TaskKind> {
-        let kind = header.kind();
+    /// Record the complete task header at the synchronous `osSpTaskLoad`
+    /// admission boundary. The executor emits its lighter `TaskSubmit` trace
+    /// only when `osSpTaskStartGo` actually kicks the admitted task.
+    pub fn admit_task(&mut self, header: OsTaskHeader) {
         self.tasks.record(header);
-        kind
     }
 }
 

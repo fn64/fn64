@@ -711,16 +711,15 @@ pub(crate) fn start_live_ai_dma(request: AiDmaRequest) -> Result<(), DeviceFault
 
 pub(crate) fn start_live_si_dma(
     request: fn64_runtime::SiDmaRequest,
-    rdram: *mut u8,
-    rdram_len: usize,
+    owner: PendingSiCompletionOwner,
 ) -> Result<(), DeviceFault> {
     with_host(|host| {
         host.device_fabric.start_si_dma(request)?;
-        host.pending_si_completion = Some(PendingSiCompletion {
-            request,
-            rdram,
-            rdram_len,
-        });
+        assert!(
+            host.pending_si_completion.is_none(),
+            "SI hardware accepted a request while prior completion ownership remained live"
+        );
+        host.pending_si_completion = Some(PendingSiCompletion { request, owner });
         Ok(())
     })
 }
@@ -1002,8 +1001,7 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
                 .expect("SI start register write succeeded without a pending transfer");
             host.pending_si_completion = Some(PendingSiCompletion {
                 request,
-                rdram,
-                rdram_len,
+                owner: PendingSiCompletionOwner::ProcessRdram { rdram, rdram_len },
             });
         } else if addr.get() == 0xA460_0010 && value & 1 != 0 {
             host.pending_pi_completions.clear();
@@ -1159,9 +1157,12 @@ fn advance_device_time_step(now: u64) {
             .then_some((host.runtime_rdram, host.runtime_rdram_len));
         let memory = [
             pending_pi.map(|pending| (pending.rdram, pending.rdram_len)),
-            pending_si
-                .filter(|pending| !pending.rdram.is_null())
-                .map(|pending| (pending.rdram, pending.rdram_len)),
+            pending_si.and_then(|pending| match pending.owner {
+                PendingSiCompletionOwner::ProcessRdram { rdram, rdram_len } => {
+                    Some((rdram, rdram_len))
+                }
+                PendingSiCompletionOwner::OsEvent | PendingSiCompletionOwner::PfsIsPlug(_) => None,
+            }),
             sp_memory,
         ]
         .into_iter()
@@ -1315,10 +1316,29 @@ fn advance_device_time_step(now: u64) {
                         .take()
                         .expect("SI hardware completed without OS-side completion metadata");
                     assert_eq!(pending.request, request, "SI completion request drifted");
-                    const OS_EVENT_SI: u32 = 5;
-                    events.push(ReadyNotification::External(ExternalEvent::OsEvent(
-                        OS_EVENT_SI,
-                    )));
+                    match pending.owner {
+                        PendingSiCompletionOwner::PfsIsPlug(transaction) => {
+                            let replaced = host
+                                .completed_pfs_is_plug
+                                .insert(transaction.thread, transaction);
+                            assert!(
+                                replaced.is_none(),
+                                "osPfsIsPlug completion collided with an unconsumed transaction for thread {}",
+                                transaction.thread
+                            );
+                            events.push(ReadyNotification::External(ExternalEvent::DirectPost {
+                                queue_addr: transaction.queue,
+                                msg: transaction.message,
+                            }));
+                        }
+                        PendingSiCompletionOwner::ProcessRdram { .. }
+                        | PendingSiCompletionOwner::OsEvent => {
+                            const OS_EVENT_SI: u32 = 5;
+                            events.push(ReadyNotification::External(ExternalEvent::OsEvent(
+                                OS_EVENT_SI,
+                            )));
+                        }
+                    }
                 }
                 DeviceNotification::ViRetrace { at } => {
                     assert_eq!(

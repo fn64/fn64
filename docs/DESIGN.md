@@ -273,37 +273,37 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain at least one individual recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Report schema
-`fn64.release-gate.v21` and the
+`fn64.release-gate.v22` and the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
 
 This mechanism makes a correctly formed production contract launchable; it is
 not representative-ROM evidence by itself. Representative private NTSC
 full-ROM exact-ten series for reference and RT64 LLE/post-VI completed under
-schema v21 and were independently reverified locally on 2026-07-22. Both
+schema v22 and were independently reverified locally on 2026-07-22. Both
 series bind boundary-owned observations and the compiled unsupported-
-instrumentation identity; their joint incomplete matrix accepted all 20
-reports, satisfied 9 of 162 requirements, and retained 153 explicit gaps. The live
-synthetic runner test separately demonstrates direct-process orchestration and
-mechanism determinism during the observed test invocation only. Self-hashed
-receipts are retained integrity evidence, not transferable process
-attestation, and the synthetic result cannot be promoted into private-ROM
-evidence.
+instrumentation identity. A retained public synthetic identified-native XBUS
+series binds the same denominator without acquiring private-ROM authority.
+Their combined incomplete matrix accepted all 30 reports, satisfied 12 of 162
+requirements, and retained 150 explicit gaps. Self-hashed receipts are
+retained integrity evidence, not transferable process attestation, and the
+synthetic result cannot be promoted into private-ROM evidence.
 
 Representative matrix verification preserves the same capability boundary.
 Report-only matrix v5 verification never awards a ROM-class requirement from
 the report's host-supplied label. Its private-series path accepts only an
 opaque capability produced by jointly revalidating the policy-admitted v3
 contract, exact-ten receipt, retained reports/journals, raw ROM, runner image,
-and bound inputs. It exact-matches the v21 semantic report and ordered run-event
+and bound inputs. It exact-matches the v22 semantic report and ordered run-event
 identities, and retains a canonical `fn64.verified-rom-class-authority.v1`
 inside verified-matrix v17. The retained
 self-hash proves canonical integrity, not signer identity or transferable
 process provenance.
 
-The current local 2026-07-22 v5 assessment jointly revalidated both
-representative series as 20 reports and retained the full 162-requirement
-denominator. It satisfied 9 assignments and left 153 explicit; incomplete
-matrix verification did not discard or relabel the missing requirements.
+The current local 2026-07-22 v5 assessment jointly revalidated both private
+representative series plus the public synthetic XBUS series as 30 reports and
+retained the full 162-requirement denominator. It satisfied 12 assignments and
+left 150 explicit; incomplete matrix verification did not discard or relabel
+the missing requirements.
 
 #### Instruction-exact savestate transplant is NOT REPRESENTABLE here (negative result, 2026-07-14)
 
@@ -439,7 +439,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v21 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v22 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -451,7 +451,7 @@ a contradictory backend label traps. Neither source can choose the digest or
 execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v21` binds it independently.
+clears it and report schema `fn64.release-gate.v22` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.
@@ -751,8 +751,37 @@ task calls out:
   DRAM-to-PIF command and PIF-to-DRAM response transfers. Completion order is
   `PIF/RDRAM bytes -> SI idle -> MI SI -> OS_EVENT_SI`; the current one-cycle
   deadline is an explicit policy because the public register definitions do
-  not supply a transfer-cycle formula. Raw controller query/read commands are
-  implemented; other raw PIF device commands remain loud gaps. The fabric also
+  not supply a transfer-cycle formula. Above that physical PIF authority, the
+  ABI owns the public libultra Controller Manager lifecycle and polling prefix:
+  `osContInit` initializes once with four channels, while a later
+  `osContSetCh(ch)` limits high-level query/read copies and `osPfsIsPlug` to
+  ports `0..ch`, leaving query/read caller storage beyond that prefix untouched.
+  A pre-init `osContSetCh` retains the four-channel default, and a count above
+  `MAXCONTROLLERS` traps. `osPfsIsPlug` validates that its caller-created
+  queue is the live `OS_EVENT_SI` target and is exclusively idle: queued
+  messages and either blocked-receiver or blocked-sender role reject the call
+  loudly, so an older waiter cannot steal its completion. It then enters the
+  same timed `ControllerQuery` fabric. A typed transaction owns the caller
+  thread, exact queue/message route, registered-RDRAM result address, and
+  latched Pak bitmap across both hardware-pending and completion-posted phases.
+  This makes the future output fixed-cycle evidence rather than an invisible
+  coroutine-stack local. Completion posts directly through that captured route;
+  the coroutine consumes the matching transaction and writes the bitmap only
+  after byte commit, SI-idle, MI-SI, and completion-message order are established.
+  A busy SI start returns the older public function page's
+  failure value `1` without touching the output; the later 5.2 page instead
+  documents `-1`, so version-specific return-code parity remains bounded by
+  the title's linked libultra revision.
+  The manager policy is future-affecting ABI evidence; raw packets retain their
+  explicit channel addressing and both paths observe the same `PifModel` port
+  identities and input. Provenance: public libultra Programming Manual Chapter
+  26, “Controller Manager,” plus the public `osContSetCh` function page. Raw
+  controller query/read commands are implemented; other raw PIF device commands
+  remain loud gaps. The manual also describes approximate polling-time savings
+  as channels are removed, but does not provide a transfer-cycle formula. The
+  fabric's explicit one-cycle SI compatibility policy therefore does not yet
+  vary by controller count; channel-count-dependent `osContSetCh` timing
+  parity remains unverified. The fabric also
   owns the RSP's persistent 4 KiB DMEM/IMEM, PC, status, atomic semaphore, and
   double-buffered SP DMA. DMA forces public 64-bit alignment, decodes
   length/count/skip rows, commits at an eight-setup-cycle plus one-cycle-per-
@@ -1104,6 +1133,30 @@ task calls out:
   yet been checked against a hardware timing trace. Exact VI random-stream
   identity, broader native coverage/filter-lattice certification, and
   physical-console filter capture remain open.
+  Per VR4300 User's Manual chapters 3 and 6, the arbitrary-PC block lane's canonical 32-bit instruction-fetch boundary
+  keeps the architectural virtual PC used by branch/J/JAL, EPC, and Cause.BD
+  separate from the admitted `InstructionWordIdentity { BankId, physical
+  address }`. KSEG0/KSEG1 select PA directly; KUSEG/KSSEG/KSEG3 use the
+  recorded PageMask, ASID/global, and valid state. AOT translations contain
+  exactly one straight word or one branch plus a separately translated slot,
+  and the interpreter constructs the same unit from the physical catalog, so
+  cross-page nonadjacent mappings and remaps cannot borrow virtual adjacency
+  or stale bytes. Its typed unit source also admits the canonical
+  `0xffff_fffc -> 0` slot wrap without relaxing the ordinary code catalog's
+  non-wrapping span invariant. This is selected inside the ordinary `BlockProgram::run` and
+  `dispatch` contract whenever a destination bank owns physical code; exact
+  mapped AOT entries override that bank's mapped-interpreter fallback without
+  creating another dispatcher. Canonical `BlockProgram` evidence binds all
+  physical spans/words and every mapped entry's exact `BankId`/PA sequence,
+  preflight-expected words, and generated artifact identity, independent of
+  native pointers and registration order. Mapped-interpreter destination
+  observations honestly retain no
+  generated artifact and are operational/differential-only, not fixed-cycle
+  release evidence under schema v22; artifact-identified mapped AOT retains its
+  real artifact and is eligible, while compatibility AOT without one is not.
+  Refill and invalid fetch faults retain exact EPC/BD, BadVAddr, Context/EntryHi,
+  and refill/common vector selection. The legacy whole-function boundary,
+  64-bit spaces/XContext, and non-kernel privilege behavior remain loud.
   In the block
   lane, raw MI mask commands and RCP completion drive CPU IP2; the next
   instruction boundary applies the
@@ -1713,9 +1766,14 @@ pub enum TraceKind {
     ThreadSwitch { from: ThreadId, to: ThreadId, reason: SwitchReason },
     QueueOp { queue: RdramAddr, op: QueueOpKind, thread: ThreadId }, // send/recv/block/wake
     Dma { direction: DmaDirection, dram: RdramAddr, dev_addr: u32, len: u32 },
-    TaskSubmit { task_kind: TaskKind, ucode: u32 }, // RSP gfx/audio task handoff
+    TaskSubmit { task_kind: TaskKind, ucode: u32 }, // RSP gfx/audio StartGo handoff
 }
 ```
+
+The complete `TaskLog` records synchronous `osSpTaskLoad` admission, while
+`TaskSubmit` is emitted only after `osSpTaskStartGo` consumes that admitted
+token. A later Load can replace an unstarted task image without fabricating an
+execution trace or satisfying an RSP task-execution closure path.
 
 Each event names *what changed*, not implementation-internal state, so it's
 comparable across two structurally different implementations (OS-thread

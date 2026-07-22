@@ -221,7 +221,7 @@ pub fn is_thread_dead(id: ThreadId) -> bool {
     with_executor(|exec| exec.is_thread_dead(id))
 }
 
-/// Gfx/audio task submission counts observed so far (`Executor::task_log`).
+/// Gfx/audio task admission counts observed so far (`Executor::task_log`).
 pub fn task_counts() -> (u64, u64) {
     with_executor(|exec| (exec.task_log().gfx_count(), exec.task_log().audio_count()))
 }
@@ -378,8 +378,10 @@ mod tests {
                     kind: fn64_runtime::SiDmaKind::ControllerRead,
                     dram_addr: RdramAddr::from_offset(0x40),
                 },
-                rdram: rdram.as_mut_ptr(),
-                rdram_len: rdram.len(),
+                owner: PendingSiCompletionOwner::ProcessRdram {
+                    rdram: rdram.as_mut_ptr(),
+                    rdram_len: rdram.len(),
+                },
             });
             host.pending_vi_mode = Some(PendingViMode {
                 registers: [1; 14],
@@ -401,7 +403,10 @@ mod tests {
         assert_eq!(snapshot.vi.active_y_scale_bits, 0.75f32.to_bits());
         assert_eq!(snapshot.pending_pi_completions.len(), 1);
         assert_eq!(snapshot.pending_pi_completions[0].rdram_len, 0x1000);
-        assert_eq!(snapshot.pending_si_completion.unwrap().rdram_len, 0x1000);
+        assert_eq!(
+            snapshot.pending_si_completion.unwrap().owner,
+            PendingSiCompletionOwnerEvidenceSnapshot::ProcessRdram { rdram_len: 0x1000 }
+        );
         with_host(|host| *host = HostState::default());
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
     }

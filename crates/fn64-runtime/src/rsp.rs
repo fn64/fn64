@@ -240,12 +240,11 @@ impl OsTaskHeader {
     }
 }
 
-/// Host-side counters/log for every RSP task this run submitted -- the
-/// task's explicit "record the task header in the trace + count them"
-/// requirement, kept separate from the shared `TraceLog` (which records the
-/// lighter-weight `TaskSubmit{task_kind, ucode}` event for the A/B
-/// comparator) so a harness/test can inspect full headers, not just the
-/// trace-log summary.
+/// Host-side counters/log for every RSP task image admitted by `osSpTaskLoad`.
+/// This stays separate from the shared `TraceLog`, whose lighter
+/// `TaskSubmit{task_kind, ucode}` event records the later `osSpTaskStartGo`
+/// kickoff, so a harness can inspect complete admitted headers without
+/// treating a replaced load as execution.
 #[derive(Default)]
 pub struct TaskLog {
     submissions: Vec<OsTaskHeader>,

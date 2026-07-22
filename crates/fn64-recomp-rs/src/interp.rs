@@ -41,8 +41,11 @@
 //! Explicitly OUT (each a loud [`StepFault::Unsupported`] naming the opcode, the
 //! same frontier the AOT lane leaves open — see `Still open in U4` in
 //! `docs/UNIVERSAL-RUNTIME-PLAN.md`): the entire COP1/FPU environment, COP2,
-//! instruction/64-bit TLB translation, `ERET`, `SYSCALL`/`BREAK`, and the
+//! 64-bit TLB translation, `ERET`, `SYSCALL`/`BREAK`, and the
 //! conditional trap ops.
+//! Canonical 32-bit instruction translation is supplied by the one-unit
+//! [`crate::fetch::run_mapped_bank`] wrapper, which fetches by physical identity
+//! before constructing this interpreter's execution-local virtual view.
 //! Modeled 32-bit COP0 moves, the inclusive Random/Wired instruction countdown,
 //! and `TLBWI`/`TLBWR`/`TLBR`/`TLBP` share the typed context with the arbitrary-PC
 //! AOT lane. The outer `BlockProgram` dispatcher applies the same typed CPU
@@ -232,13 +235,91 @@ pub fn run_bank_with_mmio(
     mem: &mut Rdram<'_>,
     port: &mut dyn MmioPort,
 ) -> Result<BlockRun, UnsupportedOp> {
-    let interp = Interp { catalog, bank };
+    let interp = Interp {
+        instructions: catalog,
+        bank,
+    };
     interp.run(entry, budget, ctx, mem, port)
 }
 
-/// The interpreter bound to one immutable bank inside a catalog.
+trait InstructionSource {
+    fn resolve(&self, key: ExecutionKey) -> Result<u32, CpuFault>;
+}
+
+impl InstructionSource for CodeCatalog {
+    fn resolve(&self, key: ExecutionKey) -> Result<u32, CpuFault> {
+        CodeCatalog::resolve(self, key).map(|resolved| resolved.word)
+    }
+}
+
+struct InstructionUnit<'a> {
+    bank: BankId,
+    entry: GuestPc,
+    words: &'a [u32],
+}
+
+impl InstructionSource for InstructionUnit<'_> {
+    fn resolve(&self, key: ExecutionKey) -> Result<u32, CpuFault> {
+        if key.bank != self.bank {
+            return Err(CpuFault {
+                at: key,
+                kind: CpuFaultKind::UnknownBank,
+            });
+        }
+        if !key.pc.is_instruction_aligned() {
+            return Err(CpuFault::instruction_address_error(key));
+        }
+        let index = self
+            .words
+            .iter()
+            .enumerate()
+            .find(|(index, _)| {
+                self.entry.get().wrapping_add(
+                    u32::try_from(*index).expect("instruction unit index exceeds u32") * 4,
+                ) == key.pc.get()
+            })
+            .map(|(index, _)| index);
+        index.map(|index| self.words[index]).ok_or(CpuFault {
+            at: key,
+            kind: CpuFaultKind::UnmappedPc {
+                bank_start: self.entry.get(),
+                bank_end: self.entry.get().wrapping_add(self.words.len() as u32 * 4),
+            },
+        })
+    }
+}
+
+/// Run one already-admitted mapped instruction unit without imposing a
+/// non-wrapping virtual-span geometry on the architectural 32-bit PC.
+pub(crate) fn run_instruction_unit(
+    bank: BankId,
+    entry: GuestPc,
+    words: &[u32],
+    budget: InstructionBudget,
+    ctx: &mut RecompContext,
+    mem: &mut Rdram<'_>,
+) -> Result<BlockRun, UnsupportedOp> {
+    assert!(
+        matches!(words.len(), 1 | 2),
+        "mapped instruction unit must contain one straight word or one branch/delay pair"
+    );
+    let instructions = InstructionUnit { bank, entry, words };
+    let interp = Interp {
+        instructions: &instructions,
+        bank,
+    };
+    interp.run(
+        ExecutionKey::new(bank, entry),
+        budget,
+        ctx,
+        mem,
+        &mut NoMmio,
+    )
+}
+
+/// The interpreter bound to one immutable instruction source.
 struct Interp<'a> {
-    catalog: &'a CodeCatalog,
+    instructions: &'a dyn InstructionSource,
     bank: BankId,
 }
 
@@ -375,9 +456,7 @@ impl Interp<'_> {
     /// Resolve an aligned in-bank PC to its instruction word, or the typed
     /// fault the AOT runner's `_ =>` arm would raise (an unmapped hole).
     fn resolve(&self, pc: u32) -> Result<u32, CpuFault> {
-        self.catalog
-            .resolve(self.key(pc))
-            .map(|resolved| resolved.word)
+        self.instructions.resolve(self.key(pc))
     }
 
     fn key(&self, pc: u32) -> ExecutionKey {
@@ -387,7 +466,7 @@ impl Interp<'_> {
     /// Whether `target` lands inside this bank's admitted (executable) words.
     /// A bounding-range hole is NOT admitted, mirroring the sparse AOT domain.
     fn contains(&self, target: u32) -> bool {
-        self.catalog.resolve(self.key(target)).is_ok()
+        self.instructions.resolve(self.key(target)).is_ok()
     }
 
     /// A statically-known in-bank target is a proven [`BlockExit::Transfer`];

@@ -143,7 +143,7 @@ and scope limits that make an open item meaningful.
   into RT64 so PAL stable-factor workloads derive from 50 Hz rather than the
   pinned upstream 60 Hz constant. Ten fresh live Metal processes prove the
   production-context PAL/MPAL workload sequences `[0,0,0,50]` and
-  `[0,0,0,60]` without an Extended refresh override. Report schema v21 now
+  `[0,0,0,60]` without an Extended refresh override. Report schema v22 now
   co-binds normalized ROM TV region, committed device TV state, and renderer
   create-time TV configuration; representative private PAL/MPAL exact-ten
   evidence remains to be retained. cpal
@@ -683,10 +683,23 @@ and deterministic output traces.
   checks produce typed refill/invalid/modified faults with precise EPC/BD;
   exception entry updates BadVAddr, Context.BadVPN2, and EntryHi.VPN2 and
   distinguishes the first-level refill vector from common/nested vectors.
-  KSEG0/KSEG1 remain direct and multiple matches remain loud. Silicon-exact
-  Random timing, instruction and 64-bit mapped translation, XContext,
-  privilege checks, generated-lane translated physical device routing, and the other fault
-  classes plus remaining CP0/FPU/controller/save behavior remain open.
+  Canonical 32-bit instruction fetch now separates architectural virtual PC
+  from `BankId`-qualified physical word identity, translates KSEG0/KSEG1
+  directly and KUSEG/KSSEG/KSEG3 through those entries, fetches a delay-slot VA
+  independently across page boundaries, and returns precise refill/invalid
+  EPC/BD/vector state in both the one-unit AOT and interpreter lanes through
+  the main `BlockProgram::run`/`dispatch` abstraction. Canonical program
+  evidence binds the physical spans/words and each mapped entry's exact
+  `BankId`/PA sequence, preflight-expected words, and generated artifact
+  identity. Artifact-identified mapped AOT destination observations carry that
+  real artifact and are schema-v22 fixed-cycle eligible; compatibility AOT
+  without one and mapped-interpreter observations are not. The latter remain
+  operational/differential-only until a successor typed destination schema
+  exists. Multiple matches remain loud. Silicon-exact Random timing,
+  64-bit mapped translation,
+  XContext, non-kernel privilege checks, generated-lane translated physical
+  device routing, and the other fault classes plus remaining
+  CP0/FPU/controller/save behavior remain open.
 - [~] **U6 general RSP/RDP** — the F3DEX2 reference lane now emits ordered
   triangle/color-image/fill/full-sync operations and executes all three legal
   public color-image layouts: size-defined 8-bit index/intensity, RGBA16, and

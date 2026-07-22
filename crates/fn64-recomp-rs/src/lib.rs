@@ -37,6 +37,7 @@ pub mod drive;
 pub mod emit;
 pub mod execution;
 pub mod fallback;
+pub mod fetch;
 pub mod interp;
 pub mod module;
 pub mod runtime;
@@ -56,10 +57,16 @@ pub use execution::{
     CodeBankEvidenceSnapshot, CodeCatalog, CodeSpan, CodeSpanEvidenceSnapshot, CpuException,
     CpuFault, CpuFaultKind, CpuInterruptLine, DispatchError, DispatchRun, ExecutableRegion,
     ExecutionDestinationObservation, ExecutionKey, GeneratedBankFn, GeneratedBankRunner,
-    GenerationError, GuestPc, InstructionBudget, ProgramArtifactIdentity, ProgramError,
-    ProgramIdentityEvidenceSnapshot, ProgramIdentitySource, ResolvedInstruction, TransferResolver,
+    GenerationError, GuestPc, InstructionBudget, InstructionWordIdentity, ProgramArtifactIdentity,
+    ProgramError, ProgramIdentityEvidenceSnapshot, ProgramIdentitySource, ResolvedInstruction,
+    TransferResolver,
 };
 pub use fallback::{EvidenceClass, FallbackProgram, FallbackRunner};
+pub use fetch::{
+    fetch_instruction, run_mapped_bank, FetchedInstruction, InstructionFetchSite, MappedAotBlock,
+    MappedAotError, MappedAotEvidenceSnapshot, PhysicalCodeBank, PhysicalCodeBankEvidenceSnapshot,
+    PhysicalCodeCatalog, PhysicalCodeError, PhysicalCodeSpan, PhysicalCodeSpanEvidenceSnapshot,
+};
 pub use interp::{run_bank, run_bank_with_mmio, MmioOutcome, MmioPort, NoMmio, UnsupportedOp};
 pub use module::{emit_lookup_dispatcher, emit_module, ModuleFunc, SymbolTable};
 pub use runtime::{
@@ -69,8 +76,9 @@ pub use runtime::{
     set_unsupported_observer, set_write_observer, trap_unsupported, DataAccessError,
     DataAccessKind, FunctionEntryObservationSchema, FunctionEntryObserver, GuestWriteEvent,
     HostLookup, HostPause, MmioRead, MmioWrite, Rdram, RecompContext, RecompFunc, TlbEntryRaw,
-    TlbFault, TlbFaultKind, TranslatedDataAddress, TranslatedFunctionIdentity, UnsupportedObserver,
-    WriteObserver, FUNCTION_ENTRY_OBSERVATION_SCHEMA, RDRAM_LEN, RDRAM_VBASE,
+    TlbFault, TlbFaultKind, TranslatedDataAddress, TranslatedFunctionIdentity,
+    TranslatedInstructionAddress, UnsupportedObserver, WriteObserver,
+    FUNCTION_ENTRY_OBSERVATION_SCHEMA, RDRAM_LEN, RDRAM_VBASE,
 };
 
 use fn64_recomp::{AbiVersion, RecompConfig, RecompError, RecompOutput, Recompiler, RspConfig};

@@ -29,7 +29,7 @@
 //! synchronous exceptions, and the public indexed write/read/probe TLB
 //! management operations. The arbitrary-PC lanes additionally model Random
 //! and TLBWR. Canonical 32-bit mapped data translation uses that state;
-//! instruction/64-bit translation and unavailable coprocessor state remain
+//! 64-bit translation and unavailable coprocessor state remain
 //! loud, as do Random/TLBWR in the legacy whole-function lane.
 //! Decoder and structural emitter tests keep that boundary explicit.
 
