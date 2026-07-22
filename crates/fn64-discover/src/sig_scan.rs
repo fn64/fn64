@@ -26,10 +26,17 @@
 use crate::homology::relocation_masked_word;
 use std::collections::HashMap;
 
-/// Shortest body worth a signature: 8 words / 32 bytes. Below this the
+/// Shortest body worth a signature: 5 words / 20 bytes. This is the
+/// empirical floor that holds `wrong == 0` across the whole 6-game corpus
+/// with same-engine donors: 5 recovers +26 functions (mostly the AKI
+/// titles' short callback handlers, which have byte-identical 5-7-word
+/// twins in a sibling AKI donor) at zero false splits; 4 trips a real
+/// split (NWXE `func_800036B4` by a 4-word masked collision — below 5 the
 /// masked body is mostly opcode skeleton and collides across unrelated
-/// leaf functions.
-pub const MIN_SIGNATURE_WORDS: usize = 8;
+/// leaf functions, as this constant's history warned). The
+/// [`MAX_MATCHES_PER_SIGNATURE`] degeneracy guard is what keeps 5 safe: a
+/// short body that matches >4 sites is dropped whole.
+pub const MIN_SIGNATURE_WORDS: usize = 5;
 
 /// A signature matching more sites than this is not identifying anything.
 pub const MAX_MATCHES_PER_SIGNATURE: usize = 4;
