@@ -448,7 +448,8 @@ pub fn emit_bank_runner_with_host_calls(bank: &BankInput<'_>, host_calls: &[u32]
     let _ = writeln!(out, "    macro_rules! finish {{");
     let _ = writeln!(
         out,
-        "        ($exit:expr) => {{ return BlockRun::new($exit, executed) }};"
+        "        ($exit:expr) => {{ return BlockRun::new(fn64_recomp_rs::finalize_executable_write_exit(BankId::new({:#018X}), $exit), executed) }};",
+        bank.bank.get()
     );
     let _ = writeln!(out, "    }}");
     let _ = writeln!(
@@ -518,6 +519,15 @@ pub fn emit_bank_runner_with_host_calls(bank: &BankInput<'_>, host_calls: &[u32]
             let _ = writeln!(out, "            ctx.advance_cop0_random(1);");
             let _ = writeln!(out, "            executed += 1;");
             let next = vram + 4;
+            let _ = writeln!(
+                out,
+                "            if fn64_recomp_rs::take_executable_write_boundary() {{"
+            );
+            let _ = writeln!(
+                out,
+                "                finish!(BlockExit::ExecutableWrite {{ source_bank: expected_bank, resume: ExecutionKey::new(expected_bank, GuestPc::new({next:#010X})) }});"
+            );
+            let _ = writeln!(out, "            }}");
             if domain.contains(next) {
                 let _ = writeln!(out, "            if executed >= budget.get() {{");
                 let _ = writeln!(
@@ -695,7 +705,8 @@ fn emit_sparse_bank_runner_inner(
     let _ = writeln!(out, "    macro_rules! finish {{");
     let _ = writeln!(
         out,
-        "        ($exit:expr) => {{ return BlockRun::new($exit, executed) }};"
+        "        ($exit:expr) => {{ return BlockRun::new(fn64_recomp_rs::finalize_executable_write_exit(BankId::new({:#018X}), $exit), executed) }};",
+        bank.bank.get()
     );
     let _ = writeln!(out, "    }}");
     let _ = writeln!(
@@ -781,6 +792,15 @@ fn emit_sparse_bank_runner_inner(
             let next = vram
                 .checked_add(4)
                 .expect("sparse bank fallthrough address exceeds u32");
+            let _ = writeln!(
+                out,
+                "            if fn64_recomp_rs::take_executable_write_boundary() {{"
+            );
+            let _ = writeln!(
+                out,
+                "                finish!(BlockExit::ExecutableWrite {{ source_bank: expected_bank, resume: ExecutionKey::new(expected_bank, GuestPc::new({next:#010X})) }});"
+            );
+            let _ = writeln!(out, "            }}");
             if domain.contains(next) {
                 let _ = writeln!(out, "            if executed >= budget.get() {{");
                 let _ = writeln!(

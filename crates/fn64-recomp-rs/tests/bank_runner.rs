@@ -121,9 +121,11 @@ fn compile_and_run(emitted: &str, main_body: &str) -> String {
     let source = format!(
         r#"#![allow(unused_imports)]
 use fn64_recomp_rs::{{
-    run_bank, BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeCatalog, CodeSpan,
-    CpuException, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc,
-    InstructionBudget, ProgramError, Rdram, RecompContext, TlbEntryRaw,
+    finalize_executable_write_exit, run_bank, set_guest_write_boundary_observer,
+    take_executable_write_boundary, BankId, BlockExit, BlockProgram, BlockRun, CodeBank,
+    CodeCatalog, CodeSpan, CpuException, CpuFault, CpuFaultKind, ExecutionKey,
+    GeneratedBankRunner, GuestPc, GuestWriteBoundary, GuestWriteEvent, InstructionBudget,
+    ProgramError, Rdram, RecompContext, TlbEntryRaw,
 }};
 
 {emitted}
@@ -176,6 +178,299 @@ fn main() {{
         String::from_utf8_lossy(&run.stderr)
     );
     String::from_utf8_lossy(&run.stdout).into_owned()
+}
+
+#[test]
+fn contiguous_and_sparse_runners_stop_after_executable_store() {
+    let words = [
+        0xac88_0000, // sw    $t0,0($a0)
+        0x2402_0001, // addiu $v0,$zero,1 -- stale sentinel
+        0x03e0_0008, // jr    $ra
+        0x0000_0000, // nop
+    ];
+    let contiguous_bank = BankId::new(0xC100);
+    let sparse_bank = BankId::new(0xC200);
+    let contiguous = emit_bank_runner(&BankInput {
+        name: "run_exec_write_contiguous",
+        bank: contiguous_bank,
+        vram: BASE,
+        words: &words,
+    });
+    let sparse_base = BASE + 0x100;
+    let sparse = emit_sparse_bank_runner(&SparseBankInput {
+        name: "run_exec_write_sparse",
+        bank: sparse_bank,
+        blocks: &[BankBlockInput {
+            vram: sparse_base,
+            words: &words,
+        }],
+    });
+    let emitted = format!("{contiguous}\n{sparse}");
+    compile_and_run(
+        &emitted,
+        &format!(
+            r#"
+fn executable_boundary(event: GuestWriteEvent) -> GuestWriteBoundary {{
+    let (start, len) = event.range();
+    let end = start + len;
+    if start < 0x24 && end > 0x20 {{
+        GuestWriteBoundary::ExecutableChanged
+    }} else {{
+        GuestWriteBoundary::Continue
+    }}
+}}
+
+let mut bytes = vec![0u8; 0x100];
+let mut mem = Rdram::new(&mut bytes);
+set_guest_write_boundary_observer(Some(executable_boundary));
+
+let mut contiguous_ctx = RecompContext::new();
+contiguous_ctx.set_r(4, 0xffff_ffff_8000_0020);
+contiguous_ctx.set_r(8, 0x1122_3344);
+contiguous_ctx.set_r(31, 0x8000_9000);
+let stopped = run_exec_write_contiguous(
+    ExecutionKey::new(BankId::new({}), GuestPc::new({BASE:#010x})),
+    InstructionBudget::new(8).unwrap(),
+    &mut contiguous_ctx,
+    &mut mem,
+);
+assert_eq!(stopped.instructions, 1);
+assert_eq!(contiguous_ctx.r(2), 0);
+assert_eq!(mem.load_w(0xffff_ffff_8000_0020) as u32, 0x1122_3344);
+assert_eq!(stopped.exit, BlockExit::ExecutableWrite {{
+    source_bank: BankId::new({}),
+    resume: ExecutionKey::new(BankId::new({}), GuestPc::new({:#010x})),
+}});
+
+// A non-overlapping store remains ordinary and the stale sentinel therefore
+// executes in the same runner turn.
+let mut ordinary_ctx = RecompContext::new();
+ordinary_ctx.set_r(4, 0xffff_ffff_8000_0010);
+ordinary_ctx.set_r(8, 0x5566_7788);
+ordinary_ctx.set_r(31, 0x8000_9000);
+let ordinary = run_exec_write_contiguous(
+    ExecutionKey::new(BankId::new({}), GuestPc::new({BASE:#010x})),
+    InstructionBudget::new(8).unwrap(),
+    &mut ordinary_ctx,
+    &mut mem,
+);
+assert_eq!(ordinary_ctx.r(2), 1);
+assert!(!matches!(ordinary.exit, BlockExit::ExecutableWrite {{ .. }}));
+
+let mut sparse_ctx = RecompContext::new();
+sparse_ctx.set_r(4, 0xffff_ffff_8000_0020);
+sparse_ctx.set_r(8, 0x99aa_bbcc);
+sparse_ctx.set_r(31, 0x8000_9000);
+let sparse_stopped = run_exec_write_sparse(
+    ExecutionKey::new(BankId::new({}), GuestPc::new({sparse_base:#010x})),
+    InstructionBudget::new(8).unwrap(),
+    &mut sparse_ctx,
+    &mut mem,
+);
+assert_eq!(sparse_stopped.instructions, 1);
+assert_eq!(sparse_ctx.r(2), 0);
+assert_eq!(sparse_stopped.exit, BlockExit::ExecutableWrite {{
+    source_bank: BankId::new({}),
+    resume: ExecutionKey::new(BankId::new({}), GuestPc::new({:#010x})),
+}});
+set_guest_write_boundary_observer(None);
+"#,
+            contiguous_bank.get(),
+            contiguous_bank.get(),
+            contiguous_bank.get(),
+            BASE + 4,
+            contiguous_bank.get(),
+            sparse_bank.get(),
+            sparse_bank.get(),
+            sparse_bank.get(),
+            sparse_base + 4,
+        ),
+    );
+}
+
+#[test]
+fn emitted_and_interpreted_delay_slot_store_choose_the_same_boundary() {
+    let words = [
+        0x1000_0002, // beq   $zero,$zero,+2
+        0xac88_0000, // sw    $t0,0($a0) -- delay slot
+        0x2402_0001, // addiu $v0,$zero,1 -- fallthrough sentinel
+        0x2403_0002, // addiu $v1,$zero,2 -- selected target sentinel
+    ];
+    let bank = BankId::new(0xC300);
+    let emitted = emit_bank_runner(&BankInput {
+        name: "run_exec_write_delay",
+        bank,
+        vram: BASE,
+        words: &words,
+    });
+    compile_and_run(
+        &emitted,
+        &format!(
+            r#"
+fn executable_boundary(event: GuestWriteEvent) -> GuestWriteBoundary {{
+    let (start, len) = event.range();
+    if start < 0x24 && start + len > 0x20 {{
+        GuestWriteBoundary::ExecutableChanged
+    }} else {{
+        GuestWriteBoundary::Continue
+    }}
+}}
+
+let mut aot_bytes = vec![0u8; 0x100];
+let mut aot_mem = Rdram::new(&mut aot_bytes);
+let mut aot_ctx = RecompContext::new();
+aot_ctx.set_r(4, 0xffff_ffff_8000_0020);
+aot_ctx.set_r(8, 0x1122_3344);
+set_guest_write_boundary_observer(Some(executable_boundary));
+let aot = run_exec_write_delay(
+    ExecutionKey::new(BankId::new({}), GuestPc::new({BASE:#010x})),
+    InstructionBudget::new(8).unwrap(),
+    &mut aot_ctx,
+    &mut aot_mem,
+);
+
+let mut catalog = CodeCatalog::new();
+catalog.register(CodeBank::new(
+    BankId::new({}),
+    GuestPc::new({BASE:#010x}),
+    vec!{words:?},
+).unwrap()).unwrap();
+let mut interp_bytes = vec![0u8; 0x100];
+let mut interp_mem = Rdram::new(&mut interp_bytes);
+let mut interp_ctx = RecompContext::new();
+interp_ctx.set_r(4, 0xffff_ffff_8000_0020);
+interp_ctx.set_r(8, 0x1122_3344);
+set_guest_write_boundary_observer(Some(executable_boundary));
+let interpreted = run_bank(
+    &catalog,
+    BankId::new({}),
+    ExecutionKey::new(BankId::new({}), GuestPc::new({BASE:#010x})),
+    InstructionBudget::new(8).unwrap(),
+    &mut interp_ctx,
+    &mut interp_mem,
+).unwrap();
+
+assert_eq!(aot.instructions, 2);
+assert_eq!(aot, interpreted);
+assert_eq!(aot_ctx.r(2), interp_ctx.r(2));
+assert_eq!(aot_ctx.r(3), interp_ctx.r(3));
+assert_eq!(aot_ctx.r(8), interp_ctx.r(8));
+assert_eq!(aot_mem.load_w(0xffff_ffff_8000_0020), interp_mem.load_w(0xffff_ffff_8000_0020));
+assert_eq!(aot_ctx.r(2), 0);
+assert_eq!(aot_ctx.r(3), 0);
+assert_eq!(aot.exit, BlockExit::ExecutableWrite {{
+    source_bank: BankId::new({}),
+    resume: ExecutionKey::new(BankId::new({}), GuestPc::new({:#010x})),
+}});
+set_guest_write_boundary_observer(None);
+"#,
+            bank.get(),
+            bank.get(),
+            bank.get(),
+            bank.get(),
+            bank.get(),
+            bank.get(),
+            BASE + 12,
+        ),
+    );
+}
+
+#[test]
+fn executable_delay_store_and_unaligned_runtime_transfer_match_across_lanes() {
+    let words = [
+        0x0120_0008, // jr    $t1
+        0xac88_0000, // sw    $t0,0($a0) -- delay slot
+        0x0120_8009, // jalr  $s0,$t1
+        0xac88_0000, // sw    $t0,0($a0) -- delay slot
+    ];
+    let bank = BankId::new(0xC301);
+    let emitted = emit_bank_runner(&BankInput {
+        name: "run_exec_write_unaligned",
+        bank,
+        vram: BASE,
+        words: &words,
+    });
+    compile_and_run(
+        &emitted,
+        &format!(
+            r#"
+fn executable_boundary(event: GuestWriteEvent) -> GuestWriteBoundary {{
+    let (start, len) = event.range();
+    if start < 0x24 && start + len > 0x20 {{
+        GuestWriteBoundary::ExecutableChanged
+    }} else {{
+        GuestWriteBoundary::Continue
+    }}
+}}
+
+let words = vec!{words:?};
+for entry_offset in [0u32, 8] {{
+    for budget in [2u32, 3] {{
+        let mut aot_bytes = vec![0u8; 0x100];
+        let mut aot_mem = Rdram::new(&mut aot_bytes);
+        let mut aot_ctx = RecompContext::new();
+        aot_ctx.set_r(4, 0xffff_ffff_8000_0020);
+        aot_ctx.set_r(8, 0x1122_3344);
+        aot_ctx.set_r(9, 0x8000_2002);
+        set_guest_write_boundary_observer(Some(executable_boundary));
+        let aot = run_exec_write_unaligned(
+            ExecutionKey::new(BankId::new({}), GuestPc::new({BASE:#010x} + entry_offset)),
+            InstructionBudget::new(budget).unwrap(),
+            &mut aot_ctx,
+            &mut aot_mem,
+        );
+        assert!(!take_executable_write_boundary());
+
+        let mut catalog = CodeCatalog::new();
+        catalog.register(CodeBank::new(
+            BankId::new({}),
+            GuestPc::new({BASE:#010x}),
+            words.clone(),
+        ).unwrap()).unwrap();
+        let mut interp_bytes = vec![0u8; 0x100];
+        let mut interp_mem = Rdram::new(&mut interp_bytes);
+        let mut interp_ctx = RecompContext::new();
+        interp_ctx.set_r(4, 0xffff_ffff_8000_0020);
+        interp_ctx.set_r(8, 0x1122_3344);
+        interp_ctx.set_r(9, 0x8000_2002);
+        set_guest_write_boundary_observer(Some(executable_boundary));
+        let interpreted = run_bank(
+            &catalog,
+            BankId::new({}),
+            ExecutionKey::new(BankId::new({}), GuestPc::new({BASE:#010x} + entry_offset)),
+            InstructionBudget::new(budget).unwrap(),
+            &mut interp_ctx,
+            &mut interp_mem,
+        ).unwrap();
+        assert!(!take_executable_write_boundary());
+
+        assert_eq!(aot, interpreted, "entry offset {{entry_offset}}, budget {{budget}}");
+        assert_eq!(aot_ctx.r(16), interp_ctx.r(16));
+        assert_eq!(aot_mem.load_w(0xffff_ffff_8000_0020), interp_mem.load_w(0xffff_ffff_8000_0020));
+        let target = ExecutionKey::new(BankId::new({}), GuestPc::new(0x8000_2002));
+        if budget == 2 {{
+            assert_eq!(aot, BlockRun::new(BlockExit::Checkpoint(target), 2));
+        }} else {{
+            assert_eq!(aot.instructions, 3);
+            assert_eq!(aot.exit, BlockExit::ExecutableWriteFault(
+                CpuFault::instruction_address_error(target),
+            ));
+        }}
+        if entry_offset == 8 {{
+            assert_eq!(aot_ctx.r_u32(16), {:#010x});
+        }}
+    }}
+}}
+set_guest_write_boundary_observer(None);
+"#,
+            bank.get(),
+            bank.get(),
+            bank.get(),
+            bank.get(),
+            bank.get(),
+            BASE + 16,
+        ),
+    );
 }
 
 #[test]

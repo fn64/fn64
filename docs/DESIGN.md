@@ -373,12 +373,22 @@ stores, generated-C direct RDRAM stores, and device DMA writes through one
 post-commit range seam. At the next host boundary it snapshots architectural
 byte order, builds and publishes the replacement pair, retires the old pair,
 and re-resolves interrupt, checkpoint, host-resume, and spawned-thread entries
-through the active mapping before executing. A generated runner can still
-execute later instructions from its current immutable body after a store and
-before that runner returns; store-interior checkpoints remain required for the
-strict per-instruction invalidation rule. No real pack supplies a dynamic
-builder or boot registration yet, so this does not make real-ROM
-transplant/resume available by itself.
+through the active mapping before executing. The ordinary post-commit write
+observer remains notification-only. A live program owner separately installs
+the typed `GuestWriteBoundaryObserver`, which reports `ExecutableChanged` only
+for a proven active-region overlap. Generated AOT and interpreted runners
+consume that mark after one straight instruction or after the full indivisible
+branch/delay pair. `BlockExit::ExecutableWrite` preserves source-bank lineage
+and the resume PC; its resolve-call and fault variants carry unresolved targets
+out of generation A so the live owner can publish B before resolving a call,
+resume, or exception vector. Non-overlapping stores continue normally. The
+project-owned contiguous/sparse runner, emitted/interpreted delay-slot,
+deferred-continuation, and live stale-sentinel gates define this contract and
+prevent A's post-store sentinel from running. This is not a hardware-cache
+claim. Cache tags, silicon self-modifying-code rules, page-granular ownership,
+automatic executable detection, and a real translator/pack plus boot
+registration remain open, so this does not make real-ROM transplant/resume
+available by itself.
 
 Provenance of the removal: `crates/fn64-diff` once carried a subprocess client
 for the *faki-tools* `oracle` CLI plus a mupen64plus `.m64p` savestate parser,
@@ -1703,13 +1713,19 @@ bytes before that event, and neither path suppresses a same-value assignment.
 Word and unaligned-word stores publish one aligned four-byte range; SD/SDL/SDR
 publish one eight-byte range only after both native words are coherent. The host
 multiplexes Rust executable-region invalidation and renderer notification
-without entering the executor. Programming Manual 15.5.6 is the behavioral
-source: only the documented 16-bit visible-LSB replication is modeled here;
-byte and word stores remain range notifications without inferred hidden-bit
-effects. A backend must explicitly return whether it applied a Rust-owned
-sidecar, so native RT64's separate ownership cannot become a silent parity
-claim. Raw RCP and PIF registers remain word-only in both lanes: subword,
-doubleword, and partial unaligned stores trap before any device side effect.
+without entering the executor. That `WriteObserver` remains notification-only;
+the block lane installs a distinct `GuestWriteBoundaryObserver` whose typed
+result marks a proven post-commit overlap with the live executable-region map.
+Runners consume the mark only after the current straight instruction or full
+branch/delay pair, so renderer observation neither chooses nor delays the
+execution boundary. Programming Manual 15.5.6 is the behavioral source for
+the renderer side only: only the documented 16-bit visible-LSB replication is
+modeled here; byte and word stores remain range notifications without inferred
+hidden-bit effects. A backend must explicitly return whether it applied a
+Rust-owned sidecar, so native RT64's separate ownership cannot become a silent
+parity claim. Raw RCP and PIF registers remain word-only in both lanes:
+subword, doubleword, and partial unaligned stores trap before any device side
+effect.
 
 ## 4. A/B migration: link-time swap over identical `RecompiledFuncs`
 
