@@ -344,6 +344,18 @@ fn main() {
         }),
         Err(_) => MAX_STEPS,
     };
+    // WM2000_STOP_AT_SWAP=<n>: clean, bounded scripted runs -- stop (with the
+    // normal summary + trace + shutdown path) as soon as the VI swap counter
+    // reaches <n>. Swap-indexed like the input script, so a scripted ladder
+    // run can end deterministically right after its last press window's
+    // outcome has presented, instead of being killed by hand.
+    let stop_at_swap = std::env::var("WM2000_STOP_AT_SWAP")
+        .ok()
+        .map(|raw| {
+            raw.parse::<u64>().unwrap_or_else(|_| {
+                panic!("WM2000_STOP_AT_SWAP must be a positive integer, got {raw:?}")
+            })
+        });
     // How many consecutive "nothing was runnable, and advancing the
     // virtual clock didn't wake anything either" ticks before concluding
     // boot has reached a genuinely idle steady state (not just a thread
@@ -691,6 +703,16 @@ fn main() {
                 capture_framebuffer(&rdram, fb_offset, width, swap_count, &mut fb_dumps);
             }
             last_swap_count = swap_count;
+            if let Some(stop) = stop_at_swap {
+                if swap_count >= stop {
+                    println!(
+                        "[wm2000-boot] WM2000_STOP_AT_SWAP={stop} reached (swap #{swap_count}, \
+                         step {steps}, sim_time={}) -- stopping",
+                        fn64_abi::sim_time()
+                    );
+                    break;
+                }
+            }
         }
 
         if !stepped {
