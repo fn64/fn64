@@ -3824,6 +3824,7 @@ mod tests {
                 "report_scenario": REPORT_SCENARIO,
                 "recognition": "runtime_must_confirm_backend_known_pair",
                 "extended_gbi_cases": [],
+                "characterization_suite": null,
                 "program_evidence_lane": "typed_block_program",
                 "rom_class": "public_homebrew",
             },

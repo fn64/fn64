@@ -39,6 +39,12 @@ pub struct Rt64F3dzex2CharacterizationEvidence {
     pub variant: F3dzex2Variant,
     pub planned_generation_count: u32,
     pub observed_generation_count: u32,
+    /// Native workload counter immediately before this task executed.
+    pub workload_id_before: u64,
+    /// Native workload counter after this task completed. A subsequent
+    /// presentation must report this value to prove it selected the final
+    /// FullSync workload produced by this characterized task.
+    pub workload_id_after: u64,
     pub full_sync_count: u64,
     pub initial_ucode: Rt64F3dzex2UcodeAddresses,
     pub final_ucode: Rt64F3dzex2UcodeAddresses,
@@ -334,6 +340,8 @@ impl Rt64Backend {
             variant,
             planned_generation_count: native_result.planned_generation_count,
             observed_generation_count: native_result.observed_generation_count,
+            workload_id_before: native_result.workload_id_before,
+            workload_id_after: native_result.workload_id_after,
             full_sync_count: native_result.full_sync_count,
             initial_ucode: Rt64F3dzex2UcodeAddresses {
                 text: native_result.initial_ucode_addresses.0,
@@ -535,6 +543,8 @@ mod tests {
         };
         let result = ffi::NativeTaskResult {
             dp_full_sync: fn64_render::DpFullSyncStatus::NotReached,
+            workload_id_before: 12,
+            workload_id_after: 12,
             full_sync_count: 0,
             initial_ucode_addresses: (entry.text_address, entry.data_address),
             final_ucode_addresses: (entry.text_address, entry.data_address),

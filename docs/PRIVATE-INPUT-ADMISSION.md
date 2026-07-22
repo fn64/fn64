@@ -39,6 +39,7 @@ not strings:
     "recognition": "runtime_must_confirm_backend_known_pair",
     "program_evidence_lane": "typed_block_program",
     "rom_class": "retail_cartridge",
+    "characterization_suite": null,
     "extended_gbi_cases": [
       "activation",
       "disabled-negative-control",
@@ -127,7 +128,13 @@ Purpose `f3dzex2_characterization` admits native RDRAM-storage recognition
 windows without treating those storage bytes as logical N64 byte order. Its
 intent is fixed to `wire_family: "f3dzex2"`, an empty
 `extended_gbi_cases` array, `program_evidence_lane: "no_program_fixture"`,
-and `rom_class: "not_applicable"`. It requires RT64 LLE and post-VI capture
+`rom_class: "not_applicable"`, and
+`characterization_suite: "fn64.f3dzex2-point-light.v1"`. Every other v7
+purpose must set `characterization_suite` to JSON `null`. Retained v6
+manifests keep their exact older intent object and do not contain this field.
+The suite identifier selects only the repository-owned vector denominator;
+the manifest cannot provide commands, expected results, a microcode variant,
+or additional cases. Characterization requires RT64 LLE and post-VI capture
 in the release policy. Its artifact object has this exclusive shape:
 
 ```json
@@ -297,15 +304,31 @@ safe as a content-free handoff, but it is not a substitute for retaining the
 local manifest during the run.
 
 Characterization readiness names only the purpose and the two admitted raw
-role labels. Its Extended-GBI and full-ROM states are respectively
-`not_requested` and `not_supplied`; it contains no private path, filename,
-length, digest, or derived logical identity.
+role labels. It also derives these fixed, content-free values from the suite
+identifier rather than accepting them from the manifest:
+
+- `characterization_fixture: "ready_for_controlled_native_evidence"`;
+- `characterization_suite: "fn64.f3dzex2-point-light.v1"`;
+- `characterization_vector_source: "repository_generated"`;
+- `required_characterization_cases`, in exact sorted order:
+  `directional-light-control`, `lighting-disabled-control`,
+  `point-light-far-distance`, `point-light-near-distance`,
+  `point-light-negative-axis`, `point-light-positive-axis`,
+  `point-light-record-boundary`, and `point-light-zero-distance`.
+
+Its Extended-GBI and full-ROM states are respectively `not_requested` and
+`not_supplied`. Current readiness for every other purpose uses `not_requested`
+for the three characterization labels and an empty characterization-case
+array. No readiness field contains a private path, filename, length, digest,
+derived logical identity, command payload, expected result, or variant choice.
 
 For retained evidence, contract and readiness verification continue to accept
 the exact v6 manifest/v5 readiness vocabulary. That compatibility branch is
 read-only: a new `--manifest` admission must use v7. It does not accept
 `f3dzex2_characterization`, the `f3dzex2` wire-family label, the raw-window
-roles, or any v7 field shape. New admission is emitted as v7/v6. This
+roles, `characterization_suite`, the current readiness characterization
+fields, or any other v7/v6-current field shape. New admission is emitted as
+v7/v6. This
 preserves revalidation of retained v3 contracts without silently broadening
 their older schema.
 

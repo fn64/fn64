@@ -50,6 +50,17 @@ EXTENDED_CASES = {
     "interpolation",
     "vertex-z",
 }
+F3DZEX2_CHARACTERIZATION_SUITE = "fn64.f3dzex2-point-light.v1"
+F3DZEX2_CHARACTERIZATION_CASES = {
+    "directional-light-control",
+    "lighting-disabled-control",
+    "point-light-far-distance",
+    "point-light-near-distance",
+    "point-light-negative-axis",
+    "point-light-positive-axis",
+    "point-light-record-boundary",
+    "point-light-zero-distance",
+}
 PLATFORMS = {"macos_arm64", "linux_x86_64", "windows_x86_64"}
 CONTROLLERS = {
     "standard_controller", "controller_pak", "rumble_pak", "transfer_pak",
@@ -83,10 +94,11 @@ PROGRAM_EVIDENCE_LANES = {
     "no_program_fixture", "identified_native_archive",
     "typed_observed_function", "typed_block_program",
 }
-INTENT_FIELDS = {
+LEGACY_INTENT_FIELDS = {
     "wire_family", "report_scenario", "recognition", "extended_gbi_cases",
     "program_evidence_lane", "rom_class",
 }
+INTENT_FIELDS = LEGACY_INTENT_FIELDS | {"characterization_suite"}
 RELEASE_FIELDS = {"platform", "controllers", "save", "renderers", "repeat_bar"}
 LEGACY_ARTIFACT_FIELDS = {
     "microcode_text", "microcode_data", "rom", "recompiled",
@@ -186,12 +198,16 @@ FORBIDDEN_RUNNER_ENV = {
     "EGL_PLATFORM",
 }
 ENV_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
-READINESS_FIELDS = {
+LEGACY_READINESS_FIELDS = {
     "schema", "status", "purpose", "wire_family", "report_scenario",
     "artifact_roles_admitted", "extended_gbi_fixture", "full_rom_inputs",
     "release_matrix_policy", "repeat_bar", "required_extended_cases",
     "platform", "controllers", "save", "renderers", "program_evidence_lane",
     "program_build_receipt", "rom_class",
+}
+READINESS_FIELDS = LEGACY_READINESS_FIELDS | {
+    "characterization_fixture", "characterization_suite",
+    "characterization_vector_source", "required_characterization_cases",
 }
 PROGRAM_BUILD_RECEIPT_FIELDS = {
     "schema", "child_executable", "lane", "expected_execution_source",
@@ -793,7 +809,13 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
     )
 
     intent = manifest["intent"]
-    require(isinstance(intent, dict) and set(intent) == INTENT_FIELDS, "intent fields are invalid")
+    intent_fields = (
+        INTENT_FIELDS if schema == MANIFEST_SCHEMA else LEGACY_INTENT_FIELDS
+    )
+    require(
+        isinstance(intent, dict) and set(intent) == intent_fields,
+        f"intent fields are invalid for {schema}",
+    )
     wire_family = nonempty(intent["wire_family"], "intent.wire_family")
     allowed_wire_families = (
         WIRE_FAMILIES if schema == MANIFEST_SCHEMA else LEGACY_WIRE_FAMILIES
@@ -839,6 +861,16 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
         require(
             wire_family == "f3dzex2",
             "F3DZEX2 characterization requires wire family f3dzex2",
+        )
+        require(
+            intent["characterization_suite"]
+            == F3DZEX2_CHARACTERIZATION_SUITE,
+            "F3DZEX2 characterization requires the repository-owned point-light suite",
+        )
+    elif schema == MANIFEST_SCHEMA:
+        require(
+            intent["characterization_suite"] is None,
+            f"{purpose} admission must set intent.characterization_suite to null",
         )
 
     release = manifest["release_matrix"]
@@ -973,15 +1005,41 @@ def validate_manifest(manifest: dict, manifest_path: Path, root: Path) -> tuple[
         "save": release["save"],
         "renderers": sorted(renderers),
     }
+    if schema == MANIFEST_SCHEMA:
+        if purpose == "f3dzex2_characterization":
+            readiness.update({
+                "characterization_fixture": "ready_for_controlled_native_evidence",
+                "characterization_suite": F3DZEX2_CHARACTERIZATION_SUITE,
+                "characterization_vector_source": "repository_generated",
+                "required_characterization_cases": sorted(
+                    F3DZEX2_CHARACTERIZATION_CASES
+                ),
+            })
+        else:
+            readiness.update({
+                "characterization_fixture": "not_requested",
+                "characterization_suite": "not_requested",
+                "characterization_vector_source": "not_requested",
+                "required_characterization_cases": [],
+            })
     return readiness, admitted
 
 
 def validate_readiness(report: dict) -> None:
-    require(set(report) == READINESS_FIELDS, "readiness report has unknown or missing fields")
-    schema = report["schema"]
+    require(isinstance(report, dict), "readiness report must be an object")
+    schema = report.get("schema")
     require(
         schema in {READINESS_SCHEMA, LEGACY_READINESS_SCHEMA},
         f"readiness schema must be {READINESS_SCHEMA!r} or retained {LEGACY_READINESS_SCHEMA!r}",
+    )
+    readiness_fields = (
+        READINESS_FIELDS
+        if schema == READINESS_SCHEMA
+        else LEGACY_READINESS_FIELDS
+    )
+    require(
+        set(report) == readiness_fields,
+        f"readiness report has unknown or missing fields for {schema}",
     )
     require(report["status"] == "ready", "readiness status must be ready")
     purpose = report["purpose"]
@@ -1047,6 +1105,29 @@ def validate_readiness(report: dict) -> None:
         require(
             {"rt64_lle_accuracy", "rt64_post_vi_capture"} <= renderers,
             "readiness F3DZEX2 characterization renderer policy is incomplete",
+        )
+        characterization_cases = unique_strings(
+            report["required_characterization_cases"],
+            "readiness required_characterization_cases",
+        )
+        require(
+            report["characterization_fixture"]
+            == "ready_for_controlled_native_evidence"
+            and report["characterization_suite"]
+            == F3DZEX2_CHARACTERIZATION_SUITE
+            and report["characterization_vector_source"]
+            == "repository_generated"
+            and characterization_cases
+            == sorted(F3DZEX2_CHARACTERIZATION_CASES),
+            "readiness F3DZEX2 characterization suite contract is incomplete",
+        )
+    elif schema == READINESS_SCHEMA:
+        require(
+            report["characterization_fixture"] == "not_requested"
+            and report["characterization_suite"] == "not_requested"
+            and report["characterization_vector_source"] == "not_requested"
+            and report["required_characterization_cases"] == [],
+            f"readiness {purpose} report claims F3DZEX2 characterization",
         )
     if report["purpose"] in {"full_rom", "combined"}:
         require(rom_class in ROM_CLASSES, "readiness full-ROM ROM class is invalid")
@@ -1926,6 +2007,7 @@ def synthetic_manifest(directory: Path) -> tuple[Path, dict]:
             "report_scenario": "synthetic-private-admission-selftest",
             "recognition": "runtime_must_confirm_backend_known_pair",
             "extended_gbi_cases": sorted(EXTENDED_CASES),
+            "characterization_suite": None,
             "program_evidence_lane": "no_program_fixture",
             "rom_class": "not_applicable",
         },
@@ -2075,6 +2157,38 @@ def selftest(root: Path) -> None:
         manifest_path, manifest = synthetic_manifest(directory)
         readiness, _ = validate_manifest(manifest, manifest_path, root)
         validate_readiness(readiness)
+        require(
+            readiness["characterization_fixture"] == "not_requested"
+            and readiness["characterization_suite"] == "not_requested"
+            and readiness["characterization_vector_source"] == "not_requested"
+            and readiness["required_characterization_cases"] == [],
+            "selftest: non-characterization readiness claimed a suite",
+        )
+        missing_suite_field = json.loads(json.dumps(manifest))
+        missing_suite_field["intent"].pop("characterization_suite")
+        expect_rejected(
+            lambda: validate_manifest(missing_suite_field, manifest_path, root),
+            "v7 manifest without characterization-suite field",
+        )
+        wrong_non_characterization_suite = json.loads(json.dumps(manifest))
+        wrong_non_characterization_suite["intent"]["characterization_suite"] = (
+            F3DZEX2_CHARACTERIZATION_SUITE
+        )
+        expect_rejected(
+            lambda: validate_manifest(
+                wrong_non_characterization_suite, manifest_path, root,
+            ),
+            "non-characterization manifest selecting a characterization suite",
+        )
+        for forbidden_selector in ("commands", "expected_results", "variant"):
+            manifest_selector = json.loads(json.dumps(manifest))
+            manifest_selector["intent"][forbidden_selector] = "forbidden"
+            expect_rejected(
+                lambda value=manifest_selector: validate_manifest(
+                    value, manifest_path, root,
+                ),
+                f"manifest-controlled characterization {forbidden_selector}",
+            )
         script = directory / "script-runner"
         script.write_bytes(b"#!/bin/sh\nexit 0\n")
         script.chmod(0o700)
@@ -2105,6 +2219,7 @@ def selftest(root: Path) -> None:
 
         legacy_manifest = json.loads(json.dumps(manifest))
         legacy_manifest["schema"] = LEGACY_MANIFEST_SCHEMA
+        legacy_manifest["intent"].pop("characterization_suite")
         legacy_manifest["artifacts"].pop("microcode_text_raw_window")
         legacy_manifest["artifacts"].pop("microcode_data_raw_window")
         legacy_readiness, _ = validate_manifest(
@@ -2114,7 +2229,24 @@ def selftest(root: Path) -> None:
             legacy_readiness["schema"] == LEGACY_READINESS_SCHEMA,
             "selftest: retained v6 manifest did not emit retained v5 readiness",
         )
+        require(
+            set(legacy_manifest["intent"]) == LEGACY_INTENT_FIELDS
+            and set(legacy_readiness) == LEGACY_READINESS_FIELDS,
+            "selftest: retained v6/v5 field shape drifted",
+        )
         validate_readiness(legacy_readiness)
+        legacy_suite_field = json.loads(json.dumps(legacy_manifest))
+        legacy_suite_field["intent"]["characterization_suite"] = None
+        expect_rejected(
+            lambda: validate_manifest(legacy_suite_field, manifest_path, root),
+            "v7 characterization-suite field under retained v6 manifest schema",
+        )
+        legacy_readiness_suite_field = json.loads(json.dumps(legacy_readiness))
+        legacy_readiness_suite_field["characterization_suite"] = "not_requested"
+        expect_rejected(
+            lambda: validate_readiness(legacy_readiness_suite_field),
+            "current characterization field under retained v5 readiness schema",
+        )
         legacy_new_wire = json.loads(json.dumps(legacy_manifest))
         legacy_new_wire["intent"]["wire_family"] = "f3dzex2"
         expect_rejected(
@@ -2164,6 +2296,9 @@ def selftest(root: Path) -> None:
             "synthetic-f3dzex2-characterization-selftest"
         )
         characterization["intent"]["extended_gbi_cases"] = []
+        characterization["intent"]["characterization_suite"] = (
+            F3DZEX2_CHARACTERIZATION_SUITE
+        )
         characterization["artifacts"]["microcode_text"] = None
         characterization["artifacts"]["microcode_data"] = None
         characterization["artifacts"]["microcode_text_raw_window"] = descriptor(
@@ -2191,6 +2326,17 @@ def selftest(root: Path) -> None:
             "selftest: characterization readiness policy drifted",
         )
         validate_readiness(characterization_readiness)
+        require(
+            characterization_readiness["characterization_fixture"]
+            == "ready_for_controlled_native_evidence"
+            and characterization_readiness["characterization_suite"]
+            == F3DZEX2_CHARACTERIZATION_SUITE
+            and characterization_readiness["characterization_vector_source"]
+            == "repository_generated"
+            and characterization_readiness["required_characterization_cases"]
+            == sorted(F3DZEX2_CHARACTERIZATION_CASES),
+            "selftest: characterization suite denominator drifted",
+        )
         characterization_serialized = json.dumps(
             characterization_readiness, sort_keys=True,
         )
@@ -2208,6 +2354,7 @@ def selftest(root: Path) -> None:
 
         legacy_characterization = json.loads(json.dumps(characterization))
         legacy_characterization["schema"] = LEGACY_MANIFEST_SCHEMA
+        legacy_characterization["intent"].pop("characterization_suite")
         legacy_characterization["artifacts"].pop("microcode_text_raw_window")
         legacy_characterization["artifacts"].pop("microcode_data_raw_window")
         expect_rejected(
@@ -2220,6 +2367,8 @@ def selftest(root: Path) -> None:
             json.dumps(characterization_readiness)
         )
         legacy_characterization_readiness["schema"] = LEGACY_READINESS_SCHEMA
+        for field in READINESS_FIELDS - LEGACY_READINESS_FIELDS:
+            legacy_characterization_readiness.pop(field)
         expect_rejected(
             lambda: validate_readiness(legacy_characterization_readiness),
             "F3DZEX2 characterization under retained v5 readiness schema",
@@ -2264,6 +2413,19 @@ def selftest(root: Path) -> None:
             ),
             "characterization with neighboring wire family",
         )
+        for wrong_suite in (None, "fn64.f3dzex2-point-light.v2"):
+            wrong_characterization_suite = json.loads(
+                json.dumps(characterization)
+            )
+            wrong_characterization_suite["intent"]["characterization_suite"] = (
+                wrong_suite
+            )
+            expect_rejected(
+                lambda value=wrong_characterization_suite: validate_manifest(
+                    value, manifest_path, root,
+                ),
+                "characterization with unowned suite",
+            )
         characterization_cases = json.loads(json.dumps(characterization))
         characterization_cases["intent"]["extended_gbi_cases"] = sorted(
             EXTENDED_CASES
@@ -2304,6 +2466,38 @@ def selftest(root: Path) -> None:
             lambda: validate_readiness(characterization_with_logical_readiness),
             "characterization readiness with mixed logical/raw authority",
         )
+        for field, wrong_value in (
+            ("characterization_fixture", "not_requested"),
+            ("characterization_suite", "fn64.f3dzex2-point-light.v2"),
+            ("characterization_vector_source", "manifest_selected"),
+        ):
+            wrong_characterization_readiness = json.loads(
+                json.dumps(characterization_readiness)
+            )
+            wrong_characterization_readiness[field] = wrong_value
+            expect_rejected(
+                lambda value=wrong_characterization_readiness: validate_readiness(
+                    value
+                ),
+                f"characterization readiness with drifted {field}",
+            )
+        for changed_cases in (
+            sorted(F3DZEX2_CHARACTERIZATION_CASES)[:-1],
+            list(reversed(sorted(F3DZEX2_CHARACTERIZATION_CASES))),
+            sorted(F3DZEX2_CHARACTERIZATION_CASES) + ["manifest-selected-case"],
+        ):
+            wrong_characterization_cases = json.loads(
+                json.dumps(characterization_readiness)
+            )
+            wrong_characterization_cases["required_characterization_cases"] = (
+                changed_cases
+            )
+            expect_rejected(
+                lambda value=wrong_characterization_cases: validate_readiness(
+                    value
+                ),
+                "characterization readiness with drifted case denominator",
+            )
 
         text_path = Path(manifest["artifacts"]["microcode_text"]["path"])
         original = text_path.read_bytes()
