@@ -66,10 +66,11 @@ pub use runtime::{
     call_host_or_recompiled, notify_function_entry, notify_guest_write, notify_non_rdp_write16,
     pause_self, resolve_host_function, round_ties_even_f32, round_ties_even_f64,
     set_function_entry_observer, set_host_lookup, set_host_pause, set_mmio_hooks,
-    set_unsupported_observer, set_write_observer, trap_unsupported, FunctionEntryObservationSchema,
-    FunctionEntryObserver, GuestWriteEvent, HostLookup, HostPause, MmioRead, MmioWrite, Rdram,
-    RecompContext, RecompFunc, TranslatedFunctionIdentity, UnsupportedObserver, WriteObserver,
-    FUNCTION_ENTRY_OBSERVATION_SCHEMA, RDRAM_LEN, RDRAM_VBASE,
+    set_unsupported_observer, set_write_observer, trap_unsupported, DataAccessError,
+    DataAccessKind, FunctionEntryObservationSchema, FunctionEntryObserver, GuestWriteEvent,
+    HostLookup, HostPause, MmioRead, MmioWrite, Rdram, RecompContext, RecompFunc, TlbEntryRaw,
+    TlbFault, TlbFaultKind, TranslatedDataAddress, TranslatedFunctionIdentity, UnsupportedObserver,
+    WriteObserver, FUNCTION_ENTRY_OBSERVATION_SCHEMA, RDRAM_LEN, RDRAM_VBASE,
 };
 
 use fn64_recomp::{AbiVersion, RecompConfig, RecompError, RecompOutput, Recompiler, RspConfig};

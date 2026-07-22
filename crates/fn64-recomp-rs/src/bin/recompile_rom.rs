@@ -587,11 +587,11 @@ fn trap_kind(instr: &Instruction) -> Option<&'static str> {
     use Instruction::*;
     Some(match instr {
         Mfc0 {
-            cop0d: 0 | 2 | 3 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30,
+            cop0d: 0 | 2 | 3 | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30,
             ..
         }
         | Mtc0 {
-            cop0d: 0 | 2 | 3 | 5 | 6 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30,
+            cop0d: 0 | 2 | 3 | 4 | 5 | 6 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 30,
             ..
         }
         | Tlbwi

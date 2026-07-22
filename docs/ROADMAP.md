@@ -677,9 +677,16 @@ and deterministic output traces.
   a bounded once-per-charged-instruction-unit policy, including the runner's
   second unit for an annulled likely slot, not silicon cycle timing. The legacy
   whole-function lane keeps Random/TLBWR loud because it has no instruction
-  clock. Recorded entries do not yet translate guest addresses; silicon-exact
-  Random timing, precise TLB refill/invalid/modified faults, and the other
-  fault classes plus remaining CP0/FPU/controller/save behavior remain open.
+  clock. Canonical 32-bit mapped data loads/stores now translate through those
+  recorded entries in both arbitrary-PC lanes. Legal PageMask sizes, paired
+  EntryLo selection, PFN/offset assembly, ASID/global matching, V and store-D
+  checks produce typed refill/invalid/modified faults with precise EPC/BD;
+  exception entry updates BadVAddr, Context.BadVPN2, and EntryHi.VPN2 and
+  distinguishes the first-level refill vector from common/nested vectors.
+  KSEG0/KSEG1 remain direct and multiple matches remain loud. Silicon-exact
+  Random timing, instruction and 64-bit mapped translation, XContext,
+  privilege checks, generated-lane translated physical device routing, and the other fault
+  classes plus remaining CP0/FPU/controller/save behavior remain open.
 - [~] **U6 general RSP/RDP** — the F3DEX2 reference lane now emits ordered
   triangle/color-image/fill/full-sync operations and executes all three legal
   public color-image layouts: size-defined 8-bit index/intensity, RGBA16, and

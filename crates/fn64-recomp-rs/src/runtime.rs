@@ -18,9 +18,9 @@
 //!   sign-extended into it (that is what `S32`/`ADD32` do). We store GPRs as
 //!   `u64` and expose typed read/write helpers.
 //! - Zero- or sign-extended KSEG0/KSEG1 addresses in the physical RDRAM
-//!   window map through their shared low-29-bit physical offset. Unsupported
-//!   mapped addresses retain the generated C lane's sparse/failing behavior;
-//!   this runtime does not silently invent TLB translation.
+//!   window map through their shared low-29-bit physical offset. Canonical
+//!   32-bit mapped data addresses use the context's recorded TLB entries;
+//!   64-bit mapped spaces and instruction translation remain loud boundaries.
 //! - Word accesses use the host-native representation used by the ABI buffer;
 //!   sub-word accesses XOR the byte offset: halfword `^2`, byte `^3`. This is
 //!   the N64's big-endian view over a little-endian host buffer. It is applied
@@ -34,16 +34,95 @@
 /// …) enforce the sign/zero-extension contract so emitted code never open-codes
 /// a cast.
 /// One raw TLB entry as staged by the COP0 registers at `tlbwi` time.
-///
-/// The entry participates in the public `TLBR`, `TLBWR`, and `TLBP` management
-/// operations, but guest address translation through it remains a separate
-/// loud frontier.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TlbEntryRaw {
     pub page_mask: u32,
     pub entry_hi: u32,
     pub entry_lo0: u32,
     pub entry_lo1: u32,
+}
+
+/// Direction of one guest data-memory translation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataAccessKind {
+    Load,
+    Store,
+}
+
+/// Why a mapped 32-bit guest data address did not translate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlbFaultKind {
+    Refill,
+    Invalid,
+    Modified,
+}
+
+/// Typed result of a failed TLB translation before any memory side effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TlbFault {
+    pub vaddr: u32,
+    pub access: DataAccessKind,
+    pub kind: TlbFaultKind,
+}
+
+/// Address selected by the VR4300's 32-bit data-address translation rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TranslatedDataAddress {
+    /// KSEG0/KSEG1 keep their existing direct virtual form.
+    Direct(u64),
+    /// A mapped segment selected this physical byte address through the TLB.
+    Mapped(u32),
+}
+
+/// Typed checked-memory failure shared by generated and interpreted blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataAccessError {
+    /// Translation succeeded (or was direct), but fn64 owns no backing/device
+    /// path for the resulting address.
+    Unbacked {
+        vaddr: u64,
+    },
+    Tlb(TlbFault),
+}
+
+impl DataAccessError {
+    pub const fn is_tlb(self) -> bool {
+        matches!(self, Self::Tlb(_))
+    }
+
+    /// Convert a checked-memory failure into the arbitrary-PC lane's typed
+    /// fault currency while retaining the instruction's precise EPC/BD state.
+    pub fn into_cpu_fault_kind(
+        self,
+        epc: crate::execution::GuestPc,
+        branch_delay: bool,
+    ) -> crate::execution::CpuFaultKind {
+        use crate::execution::{CpuException, CpuFaultKind};
+
+        match self {
+            Self::Unbacked { vaddr } => CpuFaultKind::MemoryFault { addr: vaddr },
+            Self::Tlb(fault) => {
+                let exception = match (fault.kind, fault.access) {
+                    (TlbFaultKind::Refill, DataAccessKind::Load) => CpuException::TlbRefillLoad,
+                    (TlbFaultKind::Refill, DataAccessKind::Store) => CpuException::TlbRefillStore,
+                    (TlbFaultKind::Invalid, DataAccessKind::Load) => CpuException::TlbInvalidLoad,
+                    (TlbFaultKind::Invalid, DataAccessKind::Store) => CpuException::TlbInvalidStore,
+                    (TlbFaultKind::Modified, DataAccessKind::Store) => CpuException::TlbModified,
+                    (TlbFaultKind::Modified, DataAccessKind::Load) => {
+                        unreachable!("a load cannot raise TLB Modified")
+                    }
+                };
+                CpuFaultKind::Exception {
+                    exception,
+                    epc,
+                    branch_delay,
+                    instruction_code: 0,
+                    bad_vaddr: Some(fault.vaddr),
+                    coprocessor: None,
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -111,13 +190,16 @@ pub struct RecompContext {
     /// COP0 ErrorEPC (register 30), selected by ERET while Status.ERL is set.
     pub cop0_error_epc: u32,
     /// COP0 BadVAddr (register 8). The arbitrary-PC lane populates it for
-    /// instruction-fetch AdEL and aligned-memory AdEL/AdES; TLB exception
-    /// paths remain open.
+    /// instruction-fetch AdEL, aligned-memory AdEL/AdES, and typed 32-bit data
+    /// TLB exceptions.
     pub cop0_badvaddr: u32,
+    /// Low 32 bits of COP0 Context (register 4). TLB exceptions replace
+    /// BadVPN2 while retaining the software-owned PTEBase field.
+    pub cop0_context: u32,
     /// COP0 TLB registers (Index 0, EntryLo0/1 2/3, PageMask 5, Wired 6,
     /// EntryHi 10). Boot-time unmap-all loops save/clear these; TLBWI/TLBWR
-    /// record entries and TLBR/TLBP inspect them. Address translation through
-    /// recorded entries is not modeled (use faults at the memory path).
+    /// record entries and TLBR/TLBP inspect them. Canonical 32-bit mapped data
+    /// accesses translate through the same entries.
     pub cop0_index: u32,
     /// Raw recorded TLB entries (see `tlbwi_record`, `tlbwr_record`,
     /// `tlbr_read`, and `tlbp_probe`).
@@ -275,14 +357,19 @@ impl RecompContext {
     }
 
     /// Establish the single architectural LLbit reservation.
+    ///
+    /// VR4300 User's Manual "Load Linked Address (LLAddr) Register" identifies
+    /// LLAddr as diagnostic-only. Chapter 16's SC (pp. 486-488) and SCD
+    /// (pp. 488-490) definitions consult only LLbit and declare a different
+    /// address from the preceding LL/LLD undefined. fn64 therefore retains a
+    /// bounded same-guest-address/same-width choice for that undefined domain;
+    /// it is not a physical-alias or silicon-granule parity claim.
     #[inline]
     pub fn set_ll_reservation(&mut self, vaddr: u64, width: u8) {
         self.ll_reservation = Some((vaddr, width));
     }
 
-    /// Test and clear the LLbit for SC/SCD. The VR4300 User's Manual LL/SC
-    /// descriptions require the linked access to target the same block; this
-    /// typed runtime uses the stricter same-address/same-width condition.
+    /// Test and clear the LLbit for SC/SCD under fn64's bounded policy above.
     #[inline]
     pub fn take_ll_reservation(&mut self, vaddr: u64, width: u8) -> bool {
         self.ll_reservation.take() == Some((vaddr, width))
@@ -307,12 +394,6 @@ impl RecompContext {
     }
 
     /// `tlbwi`: record the indexed entry from the staged COP0 TLB registers.
-    /// Address translation through recorded entries is not modeled -- KSEG0/
-    /// KSEG1 code never needs it, and an actual load/store through a mapped
-    /// segment (e.g. libultra's osInitialize page at 0xC0000000) faults
-    /// loudly at the memory path if a title ever dereferences one. Recording
-    /// instead of trapping lets boot-time TLB setup/unmap loops run exactly
-    /// as on hardware.
     pub fn tlbwi_record(&mut self) {
         let index = (self.cop0_index & 31) as usize;
         self.tlb_entries[index] = TlbEntryRaw {
@@ -422,10 +503,112 @@ impl RecompContext {
         self.cop0_index = matched.map_or(1 << 31, |index| index as u32);
     }
 
+    /// Translate one canonical 32-bit guest data address.
+    ///
+    /// VR4300 User's Manual chapter 3 (32-bit mode address translation,
+    /// PageMask, and EntryLo0/1) supplies the segment split, masked VPN2
+    /// comparison, paired even/odd page selection, and PFN/offset assembly.
+    /// KSEG0/KSEG1 bypass the TLB. KUSEG, KSSEG, and KSEG3 use the recorded
+    /// entries and the current EntryHi ASID. Noncanonical 64-bit addresses are
+    /// deliberately left to the existing unbacked-address boundary; XKPHYS,
+    /// XUSEG/XKSSEG/XKSEG, privilege checks, and instruction translation are
+    /// not silently approximated by this 32-bit data slice.
+    pub fn translate_data_address(
+        &self,
+        vaddr: u64,
+        access: DataAccessKind,
+    ) -> Result<TranslatedDataAddress, TlbFault> {
+        const PAGE_MASK_BITS: u32 = 0x01ff_e000;
+        const VPN2_BITS: u32 = 0xffff_e000;
+        const ASID_BITS: u32 = 0xff;
+        const GLOBAL: u32 = 1;
+        const VALID: u32 = 1 << 1;
+        const DIRTY: u32 = 1 << 2;
+
+        let upper = vaddr >> 32;
+        let low = vaddr as u32;
+        if upper != 0 && !(upper == u32::MAX as u64 && low & 0x8000_0000 != 0) {
+            return Ok(TranslatedDataAddress::Direct(vaddr));
+        }
+        if (0x8000_0000..0xc000_0000).contains(&low) {
+            return Ok(TranslatedDataAddress::Direct(vaddr));
+        }
+
+        let mut matched = None;
+        for (index, entry) in self.tlb_entries.iter().copied().enumerate() {
+            let page_mask = entry.page_mask & PAGE_MASK_BITS;
+            if !matches!(
+                page_mask,
+                0 | 0x0000_6000
+                    | 0x0001_e000
+                    | 0x0007_e000
+                    | 0x001f_e000
+                    | 0x007f_e000
+                    | 0x01ff_e000
+            ) {
+                trap_unsupported(format!(
+                    "TLB entry {index} has unsupported VR4300 PageMask {:#010x}",
+                    entry.page_mask
+                ));
+            }
+            let compared_vpn = VPN2_BITS & !page_mask;
+            let vpn_matches = (low ^ entry.entry_hi) & compared_vpn == 0;
+            let global = entry.entry_lo0 & GLOBAL != 0 && entry.entry_lo1 & GLOBAL != 0;
+            let asid_matches = (self.cop0_entry_hi ^ entry.entry_hi) & ASID_BITS == 0;
+            if vpn_matches && (global || asid_matches) && matched.replace((index, entry)).is_some()
+            {
+                trap_unsupported(format!(
+                    "data translation for {low:#010x} matched multiple TLB entries; VR4300 behavior is undefined"
+                ));
+            }
+        }
+
+        let Some((_index, entry)) = matched else {
+            return Err(TlbFault {
+                vaddr: low,
+                access,
+                kind: TlbFaultKind::Refill,
+            });
+        };
+        let page_mask = entry.page_mask & PAGE_MASK_BITS;
+        let page_size = (page_mask + 0x2000) >> 1;
+        let entry_lo = if low & page_size == 0 {
+            entry.entry_lo0
+        } else {
+            entry.entry_lo1
+        };
+        if entry_lo & VALID == 0 {
+            return Err(TlbFault {
+                vaddr: low,
+                access,
+                kind: TlbFaultKind::Invalid,
+            });
+        }
+        if access == DataAccessKind::Store && entry_lo & DIRTY == 0 {
+            return Err(TlbFault {
+                vaddr: low,
+                access,
+                kind: TlbFaultKind::Modified,
+            });
+        }
+
+        // User's Manual figure 3-10 defines the VR4300 EntryLo PFN as the 20
+        // bits 25:6 and bits 31:26 as zero. The accompanying LLAddr text
+        // confirms that PA(31) is this processor's most-significant physical
+        // address bit (unlike the 36-bit VR4000). Keep the complete 32-bit
+        // result here; the backing boundary below rejects rather than aliases
+        // physical addresses outside the N64's 29-bit direct window.
+        let physical_page = ((entry_lo & 0x03ff_ffc0) << 6) & !(page_size - 1);
+        Ok(TranslatedDataAddress::Mapped(
+            physical_page | (low & (page_size - 1)),
+        ))
+    }
+
     #[inline]
     pub fn read_cop0(&self, reg: u8) -> u32 {
         match reg {
             1 => self.cop0_random(),
+            4 => self.cop0_context,
             8 => self.cop0_badvaddr,
             9 => self.cop0_count,
             11 => self.cop0_compare,
@@ -471,6 +654,7 @@ impl RecompContext {
             0 => self.cop0_index = value,
             2 => self.cop0_entry_lo0 = value,
             3 => self.cop0_entry_lo1 = value,
+            4 => self.cop0_context = value,
             5 => self.cop0_page_mask = value,
             6 => {
                 if value > 31 {
@@ -1416,6 +1600,45 @@ impl<'a> Rdram<'a> {
             .is_some_and(|p| self.storage_range_backed(p ^ lane_xor, width))
     }
 
+    /// Resolve the typed 32-bit MMU result into the direct alias understood by
+    /// the shared RDRAM/device backing layout. Physical addresses beyond the
+    /// N64's 29-bit direct window remain a loud unbacked boundary after a
+    /// successful TLB lookup; they are never truncated into a different page.
+    fn translated_backing_address(
+        ctx: &RecompContext,
+        vaddr: u64,
+        access: DataAccessKind,
+    ) -> Result<u64, DataAccessError> {
+        match ctx
+            .translate_data_address(vaddr, access)
+            .map_err(DataAccessError::Tlb)?
+        {
+            TranslatedDataAddress::Direct(address) => Ok(address),
+            TranslatedDataAddress::Mapped(physical) if physical < 0x2000_0000 => {
+                Ok(0xffff_ffff_a000_0000 | u64::from(physical))
+            }
+            TranslatedDataAddress::Mapped(_) => Err(DataAccessError::Unbacked { vaddr }),
+        }
+    }
+
+    fn translated_load_address(ctx: &RecompContext, vaddr: u64) -> Result<u64, DataAccessError> {
+        Self::translated_backing_address(ctx, vaddr, DataAccessKind::Load)
+    }
+
+    fn translated_store_address(ctx: &RecompContext, vaddr: u64) -> Result<u64, DataAccessError> {
+        Self::translated_backing_address(ctx, vaddr, DataAccessKind::Store)
+    }
+
+    /// Perform the architectural translation/access-bit checks for a store
+    /// without touching backing memory. SC/SCD use this before consulting the
+    /// LLbit: a failed conditional store still addresses memory and can raise
+    /// a TLB refill, invalid, or modified exception.
+    pub fn check_store_translation(ctx: &RecompContext, vaddr: u64) -> Result<(), DataAccessError> {
+        ctx.translate_data_address(vaddr, DataAccessKind::Store)
+            .map(|_| ())
+            .map_err(DataAccessError::Tlb)
+    }
+
     /// Whether the aligned-word effective address is backed (LW/LWU/LL/…).
     #[inline]
     fn word_backed(&self, vaddr: u64) -> bool {
@@ -1438,6 +1661,16 @@ impl<'a> Rdram<'a> {
         }
     }
 
+    pub fn try_load_w_translated(
+        &self,
+        ctx: &RecompContext,
+        vaddr: u64,
+    ) -> Result<i32, DataAccessError> {
+        let translated = Self::translated_load_address(ctx, vaddr)?;
+        self.try_load_w(translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
+    }
+
     /// Checked LH (aligned, sign-extended halfword).
     #[inline]
     pub fn try_load_h(&self, vaddr: u64) -> Result<i16, u64> {
@@ -1448,10 +1681,28 @@ impl<'a> Rdram<'a> {
         }
     }
 
+    pub fn try_load_h_translated(
+        &self,
+        ctx: &RecompContext,
+        vaddr: u64,
+    ) -> Result<i16, DataAccessError> {
+        let translated = Self::translated_load_address(ctx, vaddr)?;
+        self.try_load_h(translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
+    }
+
     /// Checked LHU (aligned, zero-extended halfword).
     #[inline]
     pub fn try_load_hu(&self, vaddr: u64) -> Result<u16, u64> {
         self.try_load_h(vaddr).map(|v| v as u16)
+    }
+
+    pub fn try_load_hu_translated(
+        &self,
+        ctx: &RecompContext,
+        vaddr: u64,
+    ) -> Result<u16, DataAccessError> {
+        self.try_load_h_translated(ctx, vaddr).map(|v| v as u16)
     }
 
     /// Checked LB (sign-extended byte).
@@ -1464,6 +1715,16 @@ impl<'a> Rdram<'a> {
         }
     }
 
+    pub fn try_load_b_translated(
+        &self,
+        ctx: &RecompContext,
+        vaddr: u64,
+    ) -> Result<i8, DataAccessError> {
+        let translated = Self::translated_load_address(ctx, vaddr)?;
+        self.try_load_b(translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
+    }
+
     /// Checked LBU (zero-extended byte).
     #[inline]
     pub fn try_load_bu(&self, vaddr: u64) -> Result<u8, u64> {
@@ -1472,6 +1733,16 @@ impl<'a> Rdram<'a> {
         } else {
             Err(vaddr)
         }
+    }
+
+    pub fn try_load_bu_translated(
+        &self,
+        ctx: &RecompContext,
+        vaddr: u64,
+    ) -> Result<u8, DataAccessError> {
+        let translated = Self::translated_load_address(ctx, vaddr)?;
+        self.try_load_bu(translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
     }
 
     /// Checked LWL (the aligned word it merges from must be backed).
@@ -1484,6 +1755,17 @@ impl<'a> Rdram<'a> {
         }
     }
 
+    pub fn try_load_wl_translated(
+        &self,
+        ctx: &RecompContext,
+        initial: u64,
+        vaddr: u64,
+    ) -> Result<i32, DataAccessError> {
+        let translated = Self::translated_load_address(ctx, vaddr)?;
+        self.try_load_wl(initial, translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
+    }
+
     /// Checked LWR.
     #[inline]
     pub fn try_load_wr(&self, initial: u64, vaddr: u64) -> Result<i32, u64> {
@@ -1492,6 +1774,17 @@ impl<'a> Rdram<'a> {
         } else {
             Err(vaddr)
         }
+    }
+
+    pub fn try_load_wr_translated(
+        &self,
+        ctx: &RecompContext,
+        initial: u64,
+        vaddr: u64,
+    ) -> Result<i32, DataAccessError> {
+        let translated = Self::translated_load_address(ctx, vaddr)?;
+        self.try_load_wr(initial, translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
     }
 
     /// Checked LD/LLD (aligned doubleword).
@@ -1504,6 +1797,16 @@ impl<'a> Rdram<'a> {
         }
     }
 
+    pub fn try_load_d_translated(
+        &self,
+        ctx: &RecompContext,
+        vaddr: u64,
+    ) -> Result<u64, DataAccessError> {
+        let translated = Self::translated_load_address(ctx, vaddr)?;
+        self.try_load_d(translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
+    }
+
     /// Checked LDL.
     #[inline]
     pub fn try_load_dl(&self, initial: u64, vaddr: u64) -> Result<u64, u64> {
@@ -1514,6 +1817,17 @@ impl<'a> Rdram<'a> {
         }
     }
 
+    pub fn try_load_dl_translated(
+        &self,
+        ctx: &RecompContext,
+        initial: u64,
+        vaddr: u64,
+    ) -> Result<u64, DataAccessError> {
+        let translated = Self::translated_load_address(ctx, vaddr)?;
+        self.try_load_dl(initial, translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
+    }
+
     /// Checked LDR.
     #[inline]
     pub fn try_load_dr(&self, initial: u64, vaddr: u64) -> Result<u64, u64> {
@@ -1522,6 +1836,17 @@ impl<'a> Rdram<'a> {
         } else {
             Err(vaddr)
         }
+    }
+
+    pub fn try_load_dr_translated(
+        &self,
+        ctx: &RecompContext,
+        initial: u64,
+        vaddr: u64,
+    ) -> Result<u64, DataAccessError> {
+        let translated = Self::translated_load_address(ctx, vaddr)?;
+        self.try_load_dr(initial, translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
     }
 
     /// Checked SW.
@@ -1535,6 +1860,17 @@ impl<'a> Rdram<'a> {
         }
     }
 
+    pub fn try_store_w_translated(
+        &mut self,
+        ctx: &RecompContext,
+        vaddr: u64,
+        val: u32,
+    ) -> Result<(), DataAccessError> {
+        let translated = Self::translated_store_address(ctx, vaddr)?;
+        self.try_store_w(translated, val)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
+    }
+
     /// Checked SH.
     #[inline]
     pub fn try_store_h(&mut self, vaddr: u64, val: u16) -> Result<(), u64> {
@@ -1544,6 +1880,17 @@ impl<'a> Rdram<'a> {
         } else {
             Err(vaddr)
         }
+    }
+
+    pub fn try_store_h_translated(
+        &mut self,
+        ctx: &RecompContext,
+        vaddr: u64,
+        val: u16,
+    ) -> Result<(), DataAccessError> {
+        let translated = Self::translated_store_address(ctx, vaddr)?;
+        self.try_store_h(translated, val)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
     }
 
     /// Checked SB.
@@ -1557,6 +1904,17 @@ impl<'a> Rdram<'a> {
         }
     }
 
+    pub fn try_store_b_translated(
+        &mut self,
+        ctx: &RecompContext,
+        vaddr: u64,
+        val: u8,
+    ) -> Result<(), DataAccessError> {
+        let translated = Self::translated_store_address(ctx, vaddr)?;
+        self.try_store_b(translated, val)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
+    }
+
     /// Checked SWL (reads and writes the aligned word it straddles).
     #[inline]
     pub fn try_store_wl(&mut self, vaddr: u64, val: u32) -> Result<(), u64> {
@@ -1566,6 +1924,17 @@ impl<'a> Rdram<'a> {
         } else {
             Err(vaddr)
         }
+    }
+
+    pub fn try_store_wl_translated(
+        &mut self,
+        ctx: &RecompContext,
+        vaddr: u64,
+        val: u32,
+    ) -> Result<(), DataAccessError> {
+        let translated = Self::translated_store_address(ctx, vaddr)?;
+        self.try_store_wl(translated, val)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
     }
 
     /// Checked SWR.
@@ -1579,6 +1948,17 @@ impl<'a> Rdram<'a> {
         }
     }
 
+    pub fn try_store_wr_translated(
+        &mut self,
+        ctx: &RecompContext,
+        vaddr: u64,
+        val: u32,
+    ) -> Result<(), DataAccessError> {
+        let translated = Self::translated_store_address(ctx, vaddr)?;
+        self.try_store_wr(translated, val)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
+    }
+
     /// Checked SD/SCD (aligned doubleword).
     #[inline]
     pub fn try_store_d(&mut self, vaddr: u64, val: u64) -> Result<(), u64> {
@@ -1588,6 +1968,17 @@ impl<'a> Rdram<'a> {
         } else {
             Err(vaddr)
         }
+    }
+
+    pub fn try_store_d_translated(
+        &mut self,
+        ctx: &RecompContext,
+        vaddr: u64,
+        val: u64,
+    ) -> Result<(), DataAccessError> {
+        let translated = Self::translated_store_address(ctx, vaddr)?;
+        self.try_store_d(translated, val)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
     }
 
     /// Checked SDL.
@@ -1601,6 +1992,17 @@ impl<'a> Rdram<'a> {
         }
     }
 
+    pub fn try_store_dl_translated(
+        &mut self,
+        ctx: &RecompContext,
+        vaddr: u64,
+        val: u64,
+    ) -> Result<(), DataAccessError> {
+        let translated = Self::translated_store_address(ctx, vaddr)?;
+        self.try_store_dl(translated, val)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
+    }
+
     /// Checked SDR.
     #[inline]
     pub fn try_store_dr(&mut self, vaddr: u64, val: u64) -> Result<(), u64> {
@@ -1611,13 +2013,25 @@ impl<'a> Rdram<'a> {
             Err(vaddr)
         }
     }
+
+    pub fn try_store_dr_translated(
+        &mut self,
+        ctx: &RecompContext,
+        vaddr: u64,
+        val: u64,
+    ) -> Result<(), DataAccessError> {
+        let translated = Self::translated_store_address(ctx, vaddr)?;
+        self.try_store_dr(translated, val)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        set_unsupported_observer, trap_unsupported, GuestWriteEvent, Rdram, RecompContext,
-        RDRAM_LEN,
+        set_unsupported_observer, trap_unsupported, DataAccessError, DataAccessKind,
+        GuestWriteEvent, Rdram, RecompContext, TlbEntryRaw, TlbFault, TlbFaultKind,
+        TranslatedDataAddress, RDRAM_LEN,
     };
 
     type RdramOperation = for<'a> fn(&mut Rdram<'a>);
@@ -1818,6 +2232,99 @@ mod tests {
 
         mem.store_w(0x0000_0000_8000_0008, 0xdead_beef);
         assert_eq!(mem.load_w(0x0000_0000_a000_0008) as u32, 0xdead_beef);
+    }
+
+    #[test]
+    fn mapped_data_translation_selects_page_half_size_asid_and_access_bits() {
+        let mut ctx = RecompContext::new();
+        ctx.cop0_entry_hi = 0x0000_002a;
+        ctx.tlb_entries[3] = TlbEntryRaw {
+            page_mask: 0x0000_6000, // paired 16 KiB pages
+            entry_hi: 0x0040_002a,
+            entry_lo0: (0x20 << 6) | 0x6,
+            entry_lo1: (0x30 << 6) | 0x2,
+        };
+
+        assert_eq!(
+            ctx.translate_data_address(0x0040_1234, DataAccessKind::Load),
+            Ok(TranslatedDataAddress::Mapped(0x0002_1234))
+        );
+        assert_eq!(
+            ctx.translate_data_address(0x0040_5234, DataAccessKind::Load),
+            Ok(TranslatedDataAddress::Mapped(0x0003_1234))
+        );
+        assert_eq!(
+            ctx.translate_data_address(0x0040_5234, DataAccessKind::Store),
+            Err(TlbFault {
+                vaddr: 0x0040_5234,
+                access: DataAccessKind::Store,
+                kind: TlbFaultKind::Modified,
+            })
+        );
+
+        ctx.cop0_entry_hi = 0x0000_002b;
+        assert_eq!(
+            ctx.translate_data_address(0x0040_1234, DataAccessKind::Load),
+            Err(TlbFault {
+                vaddr: 0x0040_1234,
+                access: DataAccessKind::Load,
+                kind: TlbFaultKind::Refill,
+            })
+        );
+    }
+
+    #[test]
+    fn mapped_physical_address_above_direct_window_is_unbacked_not_aliased() {
+        let mut ctx = RecompContext::new();
+        ctx.cop0_entry_hi = 0x0040_002a;
+        ctx.tlb_entries[0] = TlbEntryRaw {
+            page_mask: 0,
+            entry_hi: 0x0040_002a,
+            // Figure 3-10 PFN bit 17 becomes PA(29), the first physical byte
+            // beyond the N64's 29-bit direct window.
+            entry_lo0: (0x0002_0000 << 6) | 0x7,
+            entry_lo1: 0x7,
+        };
+        assert_eq!(
+            ctx.translate_data_address(0x0040_0000, DataAccessKind::Load),
+            Ok(TranslatedDataAddress::Mapped(0x2000_0000))
+        );
+
+        let mut bytes = 0x1000_0000u32.to_ne_bytes();
+        let mem = Rdram::new(&mut bytes);
+        assert_eq!(
+            mem.try_load_w_translated(&ctx, 0x0040_0000),
+            Err(DataAccessError::Unbacked { vaddr: 0x0040_0000 })
+        );
+        assert_eq!(bytes, 0x1000_0000u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn direct_segments_bypass_tlb_while_mapped_invalid_is_typed() {
+        let mut ctx = RecompContext::new();
+        ctx.tlb_entries[0] = TlbEntryRaw {
+            page_mask: 0,
+            entry_hi: 0xc000_0000,
+            entry_lo0: 1,
+            entry_lo1: 1,
+        };
+
+        assert_eq!(
+            ctx.translate_data_address(0xffff_ffff_8000_0040, DataAccessKind::Load),
+            Ok(TranslatedDataAddress::Direct(0xffff_ffff_8000_0040))
+        );
+        assert_eq!(
+            ctx.translate_data_address(0xffff_ffff_a000_0040, DataAccessKind::Store),
+            Ok(TranslatedDataAddress::Direct(0xffff_ffff_a000_0040))
+        );
+        assert_eq!(
+            ctx.translate_data_address(0xffff_ffff_c000_0040, DataAccessKind::Load),
+            Err(TlbFault {
+                vaddr: 0xc000_0040,
+                access: DataAccessKind::Load,
+                kind: TlbFaultKind::Invalid,
+            })
+        );
     }
 
     #[test]

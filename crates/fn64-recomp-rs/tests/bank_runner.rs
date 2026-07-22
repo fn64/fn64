@@ -121,9 +121,9 @@ fn compile_and_run(emitted: &str, main_body: &str) -> String {
     let source = format!(
         r#"#![allow(unused_imports)]
 use fn64_recomp_rs::{{
-    BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeSpan, CpuException, CpuFault,
-    CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError,
-    Rdram, RecompContext,
+    run_bank, BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeCatalog, CodeSpan,
+    CpuException, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc,
+    InstructionBudget, ProgramError, Rdram, RecompContext, TlbEntryRaw,
 }};
 
 {emitted}
@@ -176,6 +176,132 @@ fn main() {{
         String::from_utf8_lossy(&run.stderr)
     );
     String::from_utf8_lossy(&run.stdout).into_owned()
+}
+
+#[test]
+fn emitted_and_interpreted_tlb_translation_and_faults_are_identical() {
+    let words = [
+        0x8c82_0000, // lw $v0,0($a0)
+        0xac83_0004, // sw $v1,4($a0)
+        0x03e0_0008, // jr $ra
+        0,
+        0x1000_0001, // beq $zero,$zero,+1
+        0x8c82_0000, // lw $v0,0($a0) -- delay slot
+        0x03e0_0008, // jr $ra
+        0,
+    ];
+    let bank = BankId::new(0xA5);
+    let emitted = emit_bank_runner(&BankInput {
+        name: "run_tlb_data_bank",
+        bank,
+        vram: BASE,
+        words: &words,
+    });
+    let stdout = compile_and_run(
+        &emitted,
+        r#"
+    const WORDS: [u32; 8] = [
+        0x8c82_0000, 0xac83_0004, 0x03e0_0008, 0,
+        0x1000_0001, 0x8c82_0000, 0x03e0_0008, 0,
+    ];
+    let bank = BankId::new(0xA5);
+    let code = CodeBank::new(bank, GuestPc::new(0x8000_1000), WORDS.to_vec()).unwrap();
+    let mut catalog = CodeCatalog::new();
+    catalog.register(code).unwrap();
+    let budget = InstructionBudget::new(8).unwrap();
+
+    let make_ctx = |entry_lo0: u32, install: bool| {
+        let mut ctx = RecompContext::new();
+        ctx.set_r(4, 0x0040_0000);
+        ctx.set_r(3, 0xa1b2_c3d4);
+        ctx.set_r(31, 0x8000_9000);
+        ctx.cop0_entry_hi = 0x0040_002a;
+        if install {
+            ctx.tlb_entries[7] = TlbEntryRaw {
+                page_mask: 0,
+                entry_hi: 0x0040_002a,
+                entry_lo0,
+                entry_lo1: (1 << 6) | 0x6,
+            };
+        }
+        ctx
+    };
+    let compare = |entry: u32, entry_lo0: u32, install: bool, initial: [u8; 16]| {
+        let key = ExecutionKey::new(bank, GuestPc::new(entry));
+        let mut ictx = make_ctx(entry_lo0, install);
+        let mut actx = make_ctx(entry_lo0, install);
+        let mut imem = initial;
+        let mut amem = initial;
+        let irun = run_bank(
+            &catalog,
+            bank,
+            key,
+            budget,
+            &mut ictx,
+            &mut Rdram::new(&mut imem),
+        ).unwrap();
+        let arun = run_tlb_data_bank(
+            key,
+            budget,
+            &mut actx,
+            &mut Rdram::new(&mut amem),
+        );
+        assert_eq!(irun, arun);
+        assert_eq!(ictx.gprs(), actx.gprs());
+        assert_eq!(imem, amem);
+        (arun, actx, amem)
+    };
+
+    let mut initial = [0u8; 16];
+    initial[0..4].copy_from_slice(&0x1122_3344u32.to_ne_bytes());
+    let (valid, valid_ctx, valid_mem) = compare(0x8000_1000, 0x6, true, initial);
+    assert_eq!(valid.instructions, 4);
+    assert_eq!(valid_ctx.r_u32(2), 0x1122_3344);
+    assert_eq!(&valid_mem[4..8], &0xa1b2_c3d4u32.to_ne_bytes());
+
+    let (refill, _, _) = compare(0x8000_1000, 0, false, initial);
+    assert!(matches!(refill.exit, BlockExit::Fault(CpuFault {
+        kind: CpuFaultKind::Exception {
+            exception: CpuException::TlbRefillLoad,
+            bad_vaddr: Some(0x0040_0000),
+            ..
+        }, ..
+    })));
+    assert_eq!(refill.instructions, 1);
+
+    let (invalid, _, _) = compare(0x8000_1000, 0, true, initial);
+    assert!(matches!(invalid.exit, BlockExit::Fault(CpuFault {
+        kind: CpuFaultKind::Exception {
+            exception: CpuException::TlbInvalidLoad,
+            ..
+        }, ..
+    })));
+
+    let (modified, _, unchanged) = compare(0x8000_1004, 0x2, true, initial);
+    assert!(matches!(modified.exit, BlockExit::Fault(CpuFault {
+        kind: CpuFaultKind::Exception {
+            exception: CpuException::TlbModified,
+            ..
+        }, ..
+    })));
+    assert_eq!(modified.instructions, 1);
+    assert_eq!(unchanged, initial);
+
+    let (delay_refill, _, _) = compare(0x8000_1010, 0, false, initial);
+    assert!(matches!(delay_refill.exit, BlockExit::Fault(CpuFault {
+        at: ExecutionKey { pc, .. },
+        kind: CpuFaultKind::Exception {
+            exception: CpuException::TlbRefillLoad,
+            epc,
+            branch_delay: true,
+            ..
+        },
+    }) if pc == GuestPc::new(0x8000_1014) && epc == GuestPc::new(0x8000_1010)));
+    assert_eq!(delay_refill.instructions, 2);
+    println!("tlb-data-differential-ok");
+"#,
+    );
+    assert_eq!(stdout.trim(), "tlb-data-differential-ok");
 }
 
 #[test]

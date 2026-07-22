@@ -28,7 +28,8 @@
 //! The arbitrary-PC lane models Status/Cause/EPC moves, ERET, typed
 //! synchronous exceptions, and the public indexed write/read/probe TLB
 //! management operations. The arbitrary-PC lanes additionally model Random
-//! and TLBWR; address translation and unavailable coprocessor state remain
+//! and TLBWR. Canonical 32-bit mapped data translation uses that state;
+//! instruction/64-bit translation and unavailable coprocessor state remain
 //! loud, as do Random/TLBWR in the legacy whole-function lane.
 //! Decoder and structural emitter tests keep that boundary explicit.
 
@@ -446,8 +447,7 @@ fn modeled_exception_register_reads_emit_typed_accesses() {
 
 #[test]
 fn tlbwi_records_the_staged_entry_instead_of_trapping() {
-    // tlbwi ; jr $ra ; nop -- boot-time TLB setup must run, not trap;
-    // translation through recorded entries stays unmodeled (use faults).
+    // tlbwi ; jr $ra ; nop -- boot-time TLB setup must run, not trap.
     let words = [0x42000002, 0x03E00008, 0x00000000];
     let input = FuncInput {
         name: "t",

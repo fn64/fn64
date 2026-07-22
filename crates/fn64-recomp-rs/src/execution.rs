@@ -135,6 +135,11 @@ pub enum CpuFaultKind {
 /// instruction paths stop using host panics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CpuException {
+    TlbModified,
+    TlbRefillLoad,
+    TlbRefillStore,
+    TlbInvalidLoad,
+    TlbInvalidStore,
     AddressErrorLoad,
     AddressErrorStore,
     CoprocessorUnusable,
@@ -274,6 +279,9 @@ impl CpuException {
     /// VR4300 Cause.ExcCode value (User's Manual, exception-code table).
     pub const fn cause_code(self) -> u32 {
         match self {
+            Self::TlbModified => 1,
+            Self::TlbRefillLoad | Self::TlbInvalidLoad => 2,
+            Self::TlbRefillStore | Self::TlbInvalidStore => 3,
             Self::AddressErrorLoad => 4,
             Self::AddressErrorStore => 5,
             Self::Syscall => 8,
@@ -282,6 +290,21 @@ impl CpuException {
             Self::IntegerOverflow => 12,
             Self::Trap => 13,
         }
+    }
+
+    const fn is_tlb_exception(self) -> bool {
+        matches!(
+            self,
+            Self::TlbModified
+                | Self::TlbRefillLoad
+                | Self::TlbRefillStore
+                | Self::TlbInvalidLoad
+                | Self::TlbInvalidStore
+        )
+    }
+
+    const fn is_tlb_refill(self) -> bool {
+        matches!(self, Self::TlbRefillLoad | Self::TlbRefillStore)
     }
 }
 
@@ -328,7 +351,8 @@ impl CpuFault {
         const CAUSE_CE_MASK: u32 = 0b11 << 28;
         const CAUSE_EXCCODE_MASK: u32 = 0x1F << 2;
 
-        if ctx.cop0_status & STATUS_EXL == 0 {
+        let was_exl = ctx.cop0_status & STATUS_EXL != 0;
+        if !was_exl {
             ctx.cop0_epc = epc.get();
             if branch_delay {
                 ctx.cop0_cause |= CAUSE_BD;
@@ -338,6 +362,14 @@ impl CpuFault {
         }
         if let Some(bad_vaddr) = bad_vaddr {
             ctx.cop0_badvaddr = bad_vaddr;
+            if exception.is_tlb_exception() {
+                // VR4300 User's Manual TLB exception processing: Context gets
+                // VA[31:13] as BadVPN2 while preserving PTEBase, and EntryHi
+                // gets the faulting VPN2 while preserving the current ASID.
+                ctx.cop0_context =
+                    (ctx.cop0_context & 0xff80_0000) | ((bad_vaddr >> 9) & 0x007f_fff0);
+                ctx.cop0_entry_hi = (bad_vaddr & 0xffff_e000) | (ctx.cop0_entry_hi & 0xff);
+            }
         }
         if let Some(coprocessor) = coprocessor {
             assert!(
@@ -349,8 +381,15 @@ impl CpuFault {
         ctx.cop0_cause = (ctx.cop0_cause & !CAUSE_EXCCODE_MASK) | (exception.cause_code() << 2);
         ctx.cop0_status |= STATUS_EXL;
 
+        let refill_vector = exception.is_tlb_refill() && !was_exl;
         Some(GuestPc::new(if ctx.cop0_status & STATUS_BEV != 0 {
-            0xBFC0_0380
+            if refill_vector {
+                0xBFC0_0200
+            } else {
+                0xBFC0_0380
+            }
+        } else if refill_vector {
+            0x8000_0000
         } else {
             0x8000_0180
         }))
@@ -1606,6 +1645,89 @@ mod tests {
         assert_eq!(ctx.cop0_epc, 0x8000_4000);
         assert_eq!((ctx.cop0_cause >> 2) & 0x1F, 4);
         assert_eq!(ctx.cop0_cause & (1 << 31), 0);
+    }
+
+    #[test]
+    fn tlb_refill_commits_translation_registers_and_selects_refill_vector() {
+        let bank = BankId::new(0x71);
+        let mut ctx = RecompContext::new();
+        ctx.cop0_context = 0xab80_0000;
+        ctx.cop0_entry_hi = 0x0000_0042;
+        let fault = CpuFault {
+            at: ExecutionKey::new(bank, GuestPc::new(0x8000_4000)),
+            kind: CpuFaultKind::Exception {
+                exception: CpuException::TlbRefillLoad,
+                epc: GuestPc::new(0x8000_4000),
+                branch_delay: false,
+                instruction_code: 0,
+                bad_vaddr: Some(0x1234_5678),
+                coprocessor: None,
+            },
+        };
+
+        assert_eq!(
+            fault.enter_exception(&mut ctx),
+            Some(GuestPc::new(0x8000_0000))
+        );
+        assert_eq!(ctx.cop0_badvaddr, 0x1234_5678);
+        assert_eq!(ctx.cop0_context, 0xab89_1a20);
+        assert_eq!(ctx.cop0_entry_hi, 0x1234_4042);
+        assert_eq!((ctx.cop0_cause >> 2) & 0x1f, 2);
+
+        let mut bev_ctx = RecompContext::new();
+        bev_ctx.cop0_status = 1 << 22;
+        assert_eq!(
+            fault.enter_exception(&mut bev_ctx),
+            Some(GuestPc::new(0xbfc0_0200))
+        );
+    }
+
+    #[test]
+    fn invalid_modified_and_nested_refill_use_the_common_vector() {
+        let bank = BankId::new(0x72);
+        for (exception, expected_code) in [
+            (CpuException::TlbInvalidStore, 3),
+            (CpuException::TlbModified, 1),
+        ] {
+            let mut ctx = RecompContext::new();
+            let fault = CpuFault {
+                at: ExecutionKey::new(bank, GuestPc::new(0x8000_5000)),
+                kind: CpuFaultKind::Exception {
+                    exception,
+                    epc: GuestPc::new(0x8000_5000),
+                    branch_delay: false,
+                    instruction_code: 0,
+                    bad_vaddr: Some(0x0040_0000),
+                    coprocessor: None,
+                },
+            };
+            assert_eq!(
+                fault.enter_exception(&mut ctx),
+                Some(GuestPc::new(0x8000_0180))
+            );
+            assert_eq!((ctx.cop0_cause >> 2) & 0x1f, expected_code);
+        }
+
+        let mut nested = RecompContext::new();
+        nested.cop0_status = 1 << 1;
+        nested.cop0_epc = 0x8000_1234;
+        let refill = CpuFault {
+            at: ExecutionKey::new(bank, GuestPc::new(0x8000_6000)),
+            kind: CpuFaultKind::Exception {
+                exception: CpuException::TlbRefillStore,
+                epc: GuestPc::new(0x8000_6000),
+                branch_delay: false,
+                instruction_code: 0,
+                bad_vaddr: Some(0xc001_2345),
+                coprocessor: None,
+            },
+        };
+        assert_eq!(
+            refill.enter_exception(&mut nested),
+            Some(GuestPc::new(0x8000_0180))
+        );
+        assert_eq!(nested.cop0_epc, 0x8000_1234);
+        assert_eq!(nested.cop0_badvaddr, 0xc001_2345);
     }
 
     #[test]
