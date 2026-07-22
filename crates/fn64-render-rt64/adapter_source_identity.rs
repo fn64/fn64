@@ -9,6 +9,7 @@ const FFI_FILES: &[&str] = &[
     "ffi/CMakeLists.txt",
     "ffi/fn64_rt64_shim.cpp",
     "ffi/fn64_rt64_shim.h",
+    "ffi/fn64_rt64_raster_ps_overlay.hlsli",
     "ffi/fn64_rt64_video_interface.h",
     "ffi/fn64_rt64_video_interface_ps.hlsl",
 ];
@@ -190,6 +191,7 @@ mod tests {
             "ffi/CMakeLists.txt",
             "ffi/fn64_rt64_shim.cpp",
             "ffi/fn64_rt64_shim.h",
+            "ffi/fn64_rt64_raster_ps_overlay.hlsli",
             "ffi/fn64_rt64_video_interface.h",
             "ffi/fn64_rt64_video_interface_ps.hlsl",
             "../fn64-render/Cargo.toml",
@@ -207,5 +209,82 @@ mod tests {
             adapter_source_sha256(&root, "test-target", &["RT64".to_owned()]).unwrap(),
             [0; 32]
         );
+    }
+
+    #[test]
+    fn rdp_alpha_dither_overlay_is_exact_guarded_and_replaces_every_variant() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = if manifest_dir.join("src/ffi.rs").is_file() {
+            manifest_dir.to_path_buf()
+        } else {
+            manifest_dir.join("../fn64-render-rt64")
+        };
+        let cmake = fs::read_to_string(root.join("ffi/CMakeLists.txt")).unwrap();
+        let shader =
+            fs::read_to_string(root.join("ffi/fn64_rt64_raster_ps_overlay.hlsli")).unwrap();
+
+        for guard in [
+            "957b283411550457573421015580f84ca750c68a050981dbc1a4fe2634507820",
+            "5e5de4bbd8a22192e857c277bae5af033b8606a6464aa73863d2efe0fd0a0d4d",
+        ] {
+            assert!(
+                cmake.contains(guard),
+                "missing exact RT64 source guard {guard}"
+            );
+        }
+
+        for variant in [
+            "Fn64RdpDitherDynamic",
+            "Fn64RdpDitherDynamicMS",
+            "Fn64RdpDitherSpecConstant",
+            "Fn64RdpDitherSpecConstantMS",
+            "Fn64RdpDitherSpecConstantFlat",
+            "Fn64RdpDitherSpecConstantFlatMS",
+            "Fn64RdpDitherLibrary",
+            "Fn64RdpDitherLibraryMS",
+        ] {
+            assert!(
+                cmake.contains(variant),
+                "missing replacement variant {variant}"
+            );
+        }
+        for mechanism in [
+            "FN64_RT64_ORIGINAL_RASTER_PS_SHADER_OBJECTS",
+            "HEADER_FILE_ONLY TRUE",
+            "FN64_RT64_ORIGINAL_RASTER_PS_BLOBS",
+            "original raster PS blob remains selected",
+            "fn64_rt64_raster_shader.cpp",
+            "${CMAKE_CURRENT_BINARY_DIR}/fn64_rt64_raster_ps.hlsl",
+            "build_shader_dxil_impl(",
+            "build_shader_msl_impl(",
+            "build_shader_spirv_impl(",
+        ] {
+            assert!(
+                cmake.contains(mechanism),
+                "missing structural guard {mechanism}"
+            );
+        }
+        assert!(!cmake.contains("${CMAKE_CURRENT_SOURCE_DIR}/fn64_rt64_raster_ps.hlsl"));
+
+        assert!(cmake
+            .contains("Alpha compare and coverage intentionally observe the original combiner"));
+        assert!(cmake.contains("Only the combiner input to blending receives this bounded policy"));
+        assert!(
+            cmake.contains("otherMode, combinerColor.a, floor(vertexPosition.xy), randomSeed);")
+        );
+
+        for mechanism in [
+            "otherMode.alphaDither() == G_AD_DISABLE",
+            "AlphaDitherValue(",
+            "fragmentRandomState);",
+            "round(clamp(combinerAlpha, 0.0f, 1.0f) * 255.0f)",
+            "(alpha8 & 7U) > threshold",
+            "(rounded5 << 3U) | (rounded5 >> 2U)",
+        ] {
+            assert!(shader.contains(mechanism), "alpha policy lost {mechanism}");
+        }
+        assert!(!shader.contains("nextRand("));
+        assert!(!shader.contains("shadeColor"));
+        assert!(!shader.contains("fogColor"));
     }
 }
