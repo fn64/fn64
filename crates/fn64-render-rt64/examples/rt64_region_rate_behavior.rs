@@ -17,7 +17,7 @@ use fn64_runtime::{RspMemory, TvType};
 
 const PINNED_SOURCE: &str = "git:f0728a2520d5aa735886240de3fee75cc805f6d6";
 const PINNED_OVERLAY: &str =
-    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1";
+    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1";
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
 const DISPLAY_LIST: usize = 0x0000_2000;
 const TARGET: usize = 0x0040_0000;

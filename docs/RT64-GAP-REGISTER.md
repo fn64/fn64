@@ -211,13 +211,27 @@ feeds combiner NOISE, RGB/alpha Noise, and `G_AC_DITHER`; the default seedable
 SplitMix64 policy is deterministic and long-period. Nintendo's unpublished
 silicon generator and seed remain a hardware-trace frontier. Separately, the
 clean pinned native RT64 path has an exact-source overlay for the combiner-alpha
-`G_AD` selectors. It runs after alpha compare/coverage rejection and before the
-blender, so `G_AC_DITHER` remains an independent earlier decision. A synthetic
-raw-DPC Metal gate binds exact 16x16 RGBA16 Pattern, InversePattern, Noise, and
-Disabled digests plus exact ordered 4x4 tiles and live Noise. This bounded
-slice does not alter shade, fog, or coverage alpha; it does not repair RT64's
-framebuffer-wide/deferred RGB-dither choice or its separate random draws for
-combiner NOISE and alpha compare. Silicon-internal
+`G_AD` selectors and their random-source topology. One typed fragment-noise
+sample derives from one `nextRandUint` result; combiner NOISE and
+`G_AC_DITHER` consume its low-24-bit unit float, and `G_AD_NOISE` consumes its
+low three bits. The overlaid `G_AD` quantizer still runs after alpha
+compare/coverage rejection and before the blender, so `G_AC_DITHER` remains an
+independent earlier decision over unmodified alpha even though the Noise
+selector shares the sample. The
+existing synthetic raw-DPC Metal gate binds exact 16x16 RGBA16 Pattern,
+InversePattern, Noise, and Disabled digests plus exact ordered 4x4 tiles and
+live Noise. Its paired combiner-NOISE/`G_AC_DITHER` phase accepts exactly 146
+pixels, all grayscale and no brighter than the primitive half-alpha cutoff,
+which binds the shared route on pinned Metal. The complete twelve-phase,
+seven-repeat transcript was identical in 10/10 fresh native processes. Its
+ordinary G_AC, shared control, and shared G_AC digests are respectively
+`1493e7af74f80caff7a0c645b0f522ec347ce38a198237ab3cbd802394e0c793`,
+`0268d9c2410c25067f144983829a5a091525f357e2981fc53f25e3d2c054da7f`, and
+`70289db3267cb703e806ee9ba86635ec651aab0ec56f434db1cf7988cbb34251`.
+This bounded slice does not alter shade, fog, or coverage alpha; it does not
+repair RT64's framebuffer-wide/deferred RGB-dither choice. The reference path's full
+eight-bit `G_AC_DITHER` sample and RT64's unit-float threshold are not claimed
+to quantize identically. Silicon-internal
 accumulator width/truncation and subpixel attribute/Z correction remain open. Public
 coverage-wrap routing for depth-compared fragments is now typed for every Z
 mode: a wrapping opaque fragment selects strict `In Front`, while wrapping
@@ -323,11 +337,17 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
   MSAA sample positions). fn64's reference lane models the public eight-sample
   coverage mask, exact disabled-dither truncation, ordered matrices, and one
   typed deterministic per-fragment sample for combiner/RGB/alpha noise plus
-  `G_AC_DITHER`. The clean pinned native path now overlays only combiner-alpha
-  `G_AD` immediately before blending and has exact synthetic Metal evidence
-  for distinct Pattern/InversePattern/Disabled output and live Noise.
-  Shade/fog/coverage alpha, framebuffer-wide/deferred RGB dither, random
-  routing/seed/advancement, ordered matrices/ties, internal precision,
+  `G_AC_DITHER`. The clean pinned native path overlays only combiner-alpha
+  `G_AD` immediately before blending and creates one typed sample from one
+  `nextRandUint` result for combiner NOISE, `G_AC_DITHER`, and `G_AD_NOISE`.
+  Exact synthetic Metal evidence covers distinct
+  Pattern/InversePattern/Disabled output, live Noise, and the paired shared
+  combiner-NOISE/`G_AC_DITHER` relation: exactly 146 accepted pixels are all
+  grayscale at or below the primitive half-alpha cutoff, with an identical
+  twelve-phase, seven-repeat transcript in 10/10 fresh native processes.
+  Shade/fog/coverage alpha, framebuffer-wide/deferred RGB dither,
+  native/reference threshold quantization and random-stream parity,
+  generator seed/advancement, ordered matrices/ties, internal precision,
   non-Metal/MSAA paths, full-ROM reach, and silicon remain open. The reference
   sample stream and native outputs are deliberately not claimed as the
   unpublished hardware generator.
