@@ -548,11 +548,18 @@ and deterministic output traces.
   physical/virtual regions now share post-commit CPU-store, generated-C-store,
   and DMA write observation. Focused live gates prove a CPU rewrite retires A
   before its suspended checkpoint resolves and a due PI DMA snapshots final
-  architectural bytes and installs B before completion visibility; both gates
-  passed 10 consecutive clean runs. A runner may still execute instructions
-  after its store until its next boundary;
-  store-interior checkpoints, translation of newly uploaded words,
-  page-granular regions, and real-pack boot wiring remain open.
+  architectural bytes and installs B before completion visibility. The
+  notification-only write observer is unchanged; a separate typed
+  `GuestWriteBoundaryObserver` marks only a proven post-commit overlap with an
+  active executable region. Generated AOT and the interpreter consume that
+  mark after one straight instruction or after the complete indivisible
+  branch/delay pair, preserving the source bank and any unresolved call/fault
+  continuation in typed exits. The live owner publishes generation B before
+  resolving those continuations, and an integration gate keeps generation A's
+  post-store stale sentinel unreachable. A non-overlapping store continues in
+  the current runner. Translation of newly uploaded words, page-granular
+  regions, automatic executable PI/decompression detection, a real
+  translator/pack, and real-pack boot wiring remain open.
 - [~] **U4/U5 CPU + device closure** — bank runners now return typed
   SYSCALL/BREAK/conditional-trap, signed-overflow, instruction-fetch AdEL, and
   aligned-memory AdEL/AdES faults with exact PC/EPC/BD/BadVAddr context and can

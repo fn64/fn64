@@ -73,6 +73,19 @@ deterministic choice, not a physical-alias or silicon-granule parity claim.
 DMA/external writes and the architecture's permitted implementation-dependent
 invalidations are outside this single-context model.
 
+Executable-write invalidation is a separate project-owned runner contract, not
+a broader hardware-cache claim. The notification-only `WriteObserver` remains
+unchanged. When a live owner can prove that a committed store overlaps its
+active executable region, its typed `GuestWriteBoundaryObserver` returns
+`ExecutableChanged`. Generated AOT and interpreted runners then stop after the
+one straight instruction or after the complete indivisible branch/delay pair.
+Typed executable-write exits retain the source bank and defer resume, call
+classification, or exception-vector resolution until the replacement
+generation is published. A non-overlapping store continues normally; a
+faulting store, failed conditional store, or annulled likely delay slot does
+not fabricate the boundary. This does not model cache tags, `Status.CH`, or
+silicon self-modifying-code synchronization, so `CACHE` remains **P**.
+
 The arbitrary-PC lane checks every naturally aligned integer, LL/SC, and COP1
 load/store before executing it. Misaligned loads produce AdEL (ExcCode 4),
 misaligned stores produce AdES (ExcCode 5), and exception entry records the
@@ -285,6 +298,16 @@ therefore become compile-time errors, never silent no-ops.
   access, user privilege address faults, and EntryHi/XContext doubleword moves.
   Unit tests separately assert full BadVAddr/EntryHi/XContext exception state
   and normal, BEV, and nested XTLB vector selection.
+- `tests/bank_runner.rs::contiguous_and_sparse_runners_stop_after_executable_store`
+  proves a committed overlapping straight store returns after one instruction,
+  suppresses the stale sentinel in both emitter shapes, and leaves non-overlap
+  in the ordinary turn.
+- `tests/bank_runner.rs::emitted_and_interpreted_delay_slot_store_choose_the_same_boundary`
+  proves AOT/interpreter identity for the full branch/delay pair and selected
+  resume. The interpreter's conditional/fault/annul and the execution module's
+  source-lineage/deferred-continuation tests cover the typed negative and
+  unresolved exits; the ABI live stale-sentinel gate proves generation A is
+  retired before its next instruction and B owns the resume PC.
 
 Bottom line: encoding coverage is complete for the documented MIPS III CPU
 table, with COP2 decoded as architecturally unusable. Execution is complete

@@ -74,6 +74,22 @@ pub enum ExecutorAction {
     /// [`Transfer`]: BlockExit::Transfer
     /// [`Checkpoint`]: BlockExit::Checkpoint
     Continue { resume: ExecutionKey },
+    /// A store changed the active executable image. The executor must publish
+    /// the replacement generation before resolving `resume` for another turn.
+    ExecutableWrite {
+        source_bank: crate::execution::BankId,
+        resume: ExecutionKey,
+    },
+    /// An executable-changing delay-slot store occurred before a computed call
+    /// whose guest-versus-host target still needs classification.
+    ExecutableWriteResolveCall {
+        source_bank: crate::execution::BankId,
+        target_pc: GuestPc,
+        resume: ExecutionKey,
+    },
+    /// An executable-changing store completed before an architectural fault
+    /// selected its exception path.
+    ExecutableWriteFault(CpuFault),
     /// The guest cooperatively yielded ([`BlockExit::Yield`], e.g. a `j self`
     /// idle spin). The executor should give up the CPU for this thread and let
     /// the run queue pick the next one; the thread is immediately runnable
@@ -134,6 +150,23 @@ impl ExecutorAction {
             BlockExit::Transfer(resume) | BlockExit::Checkpoint(resume) => {
                 ExecutorAction::Continue { resume }
             }
+            BlockExit::ExecutableWrite {
+                source_bank,
+                resume,
+            } => ExecutorAction::ExecutableWrite {
+                source_bank,
+                resume,
+            },
+            BlockExit::ExecutableWriteResolveCall {
+                source_bank,
+                target_pc,
+                resume,
+            } => ExecutorAction::ExecutableWriteResolveCall {
+                source_bank,
+                target_pc,
+                resume,
+            },
+            BlockExit::ExecutableWriteFault(fault) => ExecutorAction::ExecutableWriteFault(fault),
             BlockExit::Yield(resume) => ExecutorAction::Yield { resume },
             BlockExit::HostCall { vram, resume } => ExecutorAction::HostCall { vram, resume },
             BlockExit::ResolveTransfer {
