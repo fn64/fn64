@@ -29,7 +29,7 @@ use crate::{
     ReleaseWindowsVersionEvidence,
 };
 
-pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v21";
+pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v22";
 
 /// Provenance class declared for a ROM input. The N64 header does not encode
 /// whether otherwise-valid bytes came from a retail cartridge or a public
@@ -1718,6 +1718,8 @@ fn derive_live_closure(inputs: LiveClosureInputs<'_>) -> Result<Vec<ClosurePath>
             // This legacy comparator vocabulary has no device identity or
             // commit phase, so it cannot satisfy a device-qualified path.
             TraceKind::Dma { .. } => None,
+            // TaskSubmit is emitted only after StartGo consumes the admitted
+            // task token; SpTaskAdmitted above remains the separate Load proof.
             TraceKind::TaskSubmit {
                 task_kind: TaskKind::Graphics,
                 ..
@@ -2249,7 +2251,7 @@ impl ReleaseGateReport {
         )
     }
 
-    /// Recompute the schema-v21 evidence digest after loading a retained JSON
+    /// Recompute the schema-v22 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {
@@ -3324,6 +3326,17 @@ fn encode_vi_mode(out: &mut Vec<u8>, mode: fn64_abi::PendingViModeEvidenceSnapsh
     }
 }
 
+fn encode_pfs_is_plug_transaction(
+    out: &mut Vec<u8>,
+    transaction: fn64_abi::PfsIsPlugTransactionEvidenceSnapshot,
+) {
+    push_u32(out, transaction.thread);
+    push_u32(out, transaction.queue.offset());
+    push_u32(out, transaction.message);
+    push_u32(out, transaction.result_addr.offset());
+    out.push(transaction.bitpattern);
+}
+
 fn encode_runtime_peripherals(
     out: &mut Vec<u8>,
     snapshot: fn64_abi::RuntimePeripheralEvidenceSnapshot,
@@ -3387,9 +3400,23 @@ fn encode_runtime_peripherals(
         Some(pending) => {
             out.push(1);
             encode_si_request(out, pending.request);
-            push_u64(out, pending.rdram_len);
+            match pending.owner {
+                fn64_abi::PendingSiCompletionOwnerEvidenceSnapshot::ProcessRdram { rdram_len } => {
+                    out.push(0);
+                    push_u64(out, rdram_len);
+                }
+                fn64_abi::PendingSiCompletionOwnerEvidenceSnapshot::OsEvent => out.push(1),
+                fn64_abi::PendingSiCompletionOwnerEvidenceSnapshot::PfsIsPlug(transaction) => {
+                    out.push(2);
+                    encode_pfs_is_plug_transaction(out, transaction);
+                }
+            }
         }
         None => out.push(0),
+    }
+    push_u64(out, snapshot.completed_pfs_is_plug.len() as u64);
+    for transaction in snapshot.completed_pfs_is_plug {
+        encode_pfs_is_plug_transaction(out, transaction);
     }
     for mode in [snapshot.vi.pending_mode, snapshot.vi.active_mode] {
         match mode {
@@ -3608,6 +3635,8 @@ fn encode_rsp_task_data_identity(
 
 fn encode_abi_host(out: &mut Vec<u8>, snapshot: fn64_abi::AbiHostEvidenceSnapshot) {
     encode_runtime_peripherals(out, snapshot.runtime_peripherals);
+    out.push(snapshot.controller_manager.initialized as u8);
+    out.push(snapshot.controller_manager.channels);
     match snapshot.flash.write_buffer {
         Some(bytes) => {
             out.push(1);
@@ -3754,6 +3783,33 @@ fn encode_program(out: &mut Vec<u8>, snapshot: crate::ProgramEvidenceSnapshot) {
                         }
                     }
                 }
+                push_u64(out, program.physical_banks.len() as u64);
+                for bank in program.physical_banks {
+                    push_u64(out, bank.id.get());
+                    push_u64(out, bank.spans.len() as u64);
+                    for span in bank.spans {
+                        push_u32(out, span.physical_start);
+                        push_u64(out, span.words.len() as u64);
+                        for word in span.words {
+                            push_u32(out, word);
+                        }
+                    }
+                }
+                push_u64(out, program.mapped_aot.len() as u64);
+                for block in program.mapped_aot {
+                    push_u64(out, block.entry.bank.get());
+                    push_u32(out, block.entry.pc.get());
+                    push_u64(out, block.instructions.len() as u64);
+                    for instruction in block.instructions {
+                        push_u64(out, instruction.bank.get());
+                        push_u32(out, instruction.physical_address);
+                    }
+                    push_u64(out, block.expected_words.len() as u64);
+                    for word in block.expected_words {
+                        push_u32(out, word);
+                    }
+                    out.extend_from_slice(&block.runner_artifact_identity.bytes());
+                }
                 out.extend_from_slice(&dispatch_artifact_identity.bytes());
                 push_u32(out, instruction_budget);
                 push_u64(out, executable_regions.len() as u64);
@@ -3784,7 +3840,7 @@ fn encode_device_snapshot(
     program: crate::ProgramEvidenceSnapshot,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 * 1024 + snapshot.save_bytes.as_ref().map_or(0, Vec::len));
-    out.extend_from_slice(b"fn64.device-evidence.v7\0");
+    out.extend_from_slice(b"fn64.device-evidence.v9\0");
     encode_guest_device_snapshot(&mut out, snapshot.guest);
     push_bytes(&mut out, &snapshot.pi_timing_policy);
 
@@ -4853,6 +4909,7 @@ mod tests {
             peripherals: fn64_runtime::Peripherals::new().evidence_snapshot(),
             pending_pi_completions: Vec::new(),
             pending_si_completion: None,
+            completed_pfs_is_plug: Vec::new(),
             vi: fn64_abi::AbiViEvidenceSnapshot {
                 pending_mode: None,
                 active_mode: None,
@@ -4951,6 +5008,8 @@ mod tests {
                         words: vec![0],
                     }],
                 }],
+                physical_banks: Vec::new(),
+                mapped_aot: Vec::new(),
             },
             dispatch_artifact_identity: identity(0x34),
             instruction_budget: 100,
@@ -5338,17 +5397,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_v21_fixed_cycle_digest_is_stable_and_complete() {
+    fn schema_v22_fixed_cycle_digest_is_stable_and_complete() {
         assert_eq!(complete_digest(), complete_digest());
         assert_eq!(complete_digest().artifacts.len(), 5);
         assert_eq!(
             complete_digest().root_sha256,
-            "a61c502ff15bbe74d736b40ac09814d1d1fb9ceb751d7bc5ad6de0e7efb577df"
+            "1f4fd872ce05e5c2301dc844e51d70e665822773ecb8ae741f89aa3635784869"
         );
     }
 
     #[test]
-    fn schema_v21_report_wire_binds_rom_identity_class_and_tv_authorities() {
+    fn schema_v22_report_wire_binds_rom_identity_class_and_tv_authorities() {
         let input = test_rom(b'E');
         let geometry = observations();
         let rom =
@@ -5800,7 +5859,43 @@ mod tests {
                         kind: SiDmaKind::ControllerRead,
                         dram_addr: RdramAddr::from_offset(24),
                     },
-                    rdram_len: 8 * 1024 * 1024,
+                    owner: fn64_abi::PendingSiCompletionOwnerEvidenceSnapshot::ProcessRdram {
+                        rdram_len: 8 * 1024 * 1024,
+                    },
+                });
+            }
+        );
+        changed!(
+            "completed PFS is-plug transaction",
+            |value: &mut fn64_abi::RuntimePeripheralEvidenceSnapshot| {
+                value
+                    .completed_pfs_is_plug
+                    .push(fn64_abi::PfsIsPlugTransactionEvidenceSnapshot {
+                        thread: 7,
+                        queue: RdramAddr::from_offset(0x20),
+                        message: 0xCAFE,
+                        result_addr: RdramAddr::from_offset(0x40),
+                        bitpattern: 0b1010,
+                    });
+            }
+        );
+        changed!(
+            "pending PFS is-plug transaction",
+            |value: &mut fn64_abi::RuntimePeripheralEvidenceSnapshot| {
+                value.pending_si_completion = Some(fn64_abi::PendingSiCompletionEvidenceSnapshot {
+                    request: SiDmaRequest {
+                        kind: SiDmaKind::ControllerQuery,
+                        dram_addr: RdramAddr::from_offset(0),
+                    },
+                    owner: fn64_abi::PendingSiCompletionOwnerEvidenceSnapshot::PfsIsPlug(
+                        fn64_abi::PfsIsPlugTransactionEvidenceSnapshot {
+                            thread: 7,
+                            queue: RdramAddr::from_offset(0x20),
+                            message: 0xCAFE,
+                            result_addr: RdramAddr::from_offset(0x40),
+                            bitpattern: 0b0101,
+                        },
+                    ),
                 });
             }
         );
@@ -5824,10 +5919,29 @@ mod tests {
                 "device evidence omitted {name}"
             );
         }
+
+        let transaction_digest = |bitpattern| {
+            let mut value = baseline.clone();
+            value
+                .completed_pfs_is_plug
+                .push(fn64_abi::PfsIsPlugTransactionEvidenceSnapshot {
+                    thread: 7,
+                    queue: RdramAddr::from_offset(0x20),
+                    message: 0xCAFE,
+                    result_addr: RdramAddr::from_offset(0x40),
+                    bitpattern,
+                });
+            sha256_hex(&encode_test_device(device.clone(), value))
+        };
+        assert_ne!(
+            transaction_digest(0b0101),
+            transaction_digest(0b1010),
+            "completed PFS transactions with different future output collided"
+        );
     }
 
     #[test]
-    fn device_state_v7_wire_binds_executor_and_abi_host_families() {
+    fn device_state_v9_wire_binds_executor_and_abi_host_families() {
         use fn64_runtime::{
             EventRegistrationEvidenceSnapshot, ExecutorQueueEvidenceSnapshot,
             ExecutorRunningEvidenceSnapshot, MesgQueueEvidenceSnapshot,
@@ -5858,7 +5972,7 @@ mod tests {
                         crate::ProgramEvidenceSnapshot::NoProgram,
                     )),
                     baseline,
-                    "device-state-v7 evidence omitted executor family {}",
+                    "device-state-v9 evidence omitted executor family {}",
                     $name
                 );
             }};
@@ -5955,11 +6069,20 @@ mod tests {
                         crate::ProgramEvidenceSnapshot::NoProgram,
                     )),
                     baseline,
-                    "device-state-v7 evidence omitted ABI HostState family {}",
+                    "device-state-v9 evidence omitted ABI HostState family {}",
                     $name
                 );
             }};
         }
+        changed_host!(
+            "controller manager",
+            |value: &mut fn64_abi::AbiHostEvidenceSnapshot| {
+                value.controller_manager = fn64_abi::ControllerManagerEvidenceSnapshot {
+                    initialized: true,
+                    channels: 1,
+                };
+            }
+        );
         changed_host!(
             "Flash sequencer",
             |value: &mut fn64_abi::AbiHostEvidenceSnapshot| {
@@ -6130,7 +6253,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v7_wire_distinguishes_rsp_task_lineage_phases() {
+    fn device_state_v9_wire_distinguishes_rsp_task_lineage_phases() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let digest = |phase| {
@@ -6169,7 +6292,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v7_wire_distinguishes_native_program_classes_and_identity() {
+    fn device_state_v9_wire_distinguishes_native_program_classes_and_identity() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let host = host_snapshot();
@@ -6199,14 +6322,16 @@ mod tests {
 
     #[cfg(feature = "recomp-rs")]
     #[test]
-    fn device_state_v7_wire_binds_typed_program_identity_and_dynamic_state() {
+    fn device_state_v9_wire_binds_typed_program_identity_and_dynamic_state() {
         use fn64_abi::recompiled::{
             LiveExecutableRegionEvidenceSnapshot, PendingExecutableWriteEvidenceSnapshot,
             RecompiledProgramEvidenceSnapshot,
         };
         use fn64_recomp_rs::{
             BankId, BlockProgramEvidenceSnapshot, CodeBankEvidenceSnapshot,
-            CodeSpanEvidenceSnapshot, GuestPc, ProgramArtifactIdentity,
+            CodeSpanEvidenceSnapshot, ExecutionKey, GuestPc, InstructionWordIdentity,
+            MappedAotEvidenceSnapshot, PhysicalCodeBankEvidenceSnapshot,
+            PhysicalCodeSpanEvidenceSnapshot, ProgramArtifactIdentity,
             ProgramIdentityEvidenceSnapshot, ProgramIdentitySource,
         };
 
@@ -6251,6 +6376,8 @@ mod tests {
                             words: vec![0x1234_5678],
                         }],
                     }],
+                    physical_banks: Vec::new(),
+                    mapped_aot: Vec::new(),
                 },
                 dispatch_artifact_identity: identity(5),
                 instruction_budget: 100,
@@ -6269,9 +6396,73 @@ mod tests {
                     physical_end: 0x1200,
                 }],
             });
-        let block_sha = sha256_hex(&encode_device_snapshot(device, executor, host, block));
+        let block_sha = sha256_hex(&encode_device_snapshot(
+            device.clone(),
+            executor.clone(),
+            host.clone(),
+            block.clone(),
+        ));
         assert_ne!(block_sha, baseline);
         assert_ne!(block_sha, function_sha);
+
+        let mut physical = block.clone();
+        let crate::ProgramEvidenceSnapshot::TypedRust(RecompiledProgramEvidenceSnapshot::Block {
+            program,
+            ..
+        }) = &mut physical
+        else {
+            unreachable!("fixture is a typed block program")
+        };
+        program
+            .physical_banks
+            .push(PhysicalCodeBankEvidenceSnapshot {
+                id: BankId::new(9),
+                spans: vec![PhysicalCodeSpanEvidenceSnapshot {
+                    physical_start: 0x3000,
+                    words: vec![0x8765_4321],
+                }],
+            });
+        let physical_sha = sha256_hex(&encode_device_snapshot(
+            device.clone(),
+            executor.clone(),
+            host.clone(),
+            physical.clone(),
+        ));
+        assert_ne!(physical_sha, block_sha);
+
+        let mut mapped = physical;
+        let crate::ProgramEvidenceSnapshot::TypedRust(RecompiledProgramEvidenceSnapshot::Block {
+            program,
+            ..
+        }) = &mut mapped
+        else {
+            unreachable!("fixture is a typed block program")
+        };
+        program.mapped_aot.push(MappedAotEvidenceSnapshot {
+            entry: ExecutionKey::new(BankId::new(9), GuestPc::new(0x0040_0000)),
+            instructions: vec![InstructionWordIdentity::new(BankId::new(9), 0x3000)],
+            expected_words: vec![0x8765_4321],
+            runner_artifact_identity: identity(10),
+        });
+        let mapped_sha = sha256_hex(&encode_device_snapshot(
+            device.clone(),
+            executor.clone(),
+            host.clone(),
+            mapped.clone(),
+        ));
+        assert_ne!(mapped_sha, physical_sha);
+
+        let crate::ProgramEvidenceSnapshot::TypedRust(RecompiledProgramEvidenceSnapshot::Block {
+            program,
+            ..
+        }) = &mut mapped
+        else {
+            unreachable!("fixture is a typed block program")
+        };
+        program.mapped_aot[0].expected_words[0] ^= 1;
+        let changed_expected_word_sha =
+            sha256_hex(&encode_device_snapshot(device, executor, host, mapped));
+        assert_ne!(changed_expected_word_sha, mapped_sha);
     }
 
     #[test]
@@ -6543,11 +6734,11 @@ mod tests {
         ));
 
         let mut stale_schema = report.clone();
-        stale_schema.schema = "fn64.release-gate.v20".to_owned();
+        stale_schema.schema = "fn64.release-gate.v21".to_owned();
         assert!(matches!(
             stale_schema.verify_integrity(),
             Err(GateError::UnsupportedReportSchema(schema))
-                if schema == "fn64.release-gate.v20"
+                if schema == "fn64.release-gate.v21"
         ));
 
         let duplicate = vec![report.closure[0].clone(), report.closure[0].clone()];
@@ -6564,7 +6755,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v21_report_wire_binds_every_release_environment_field() {
+    fn schema_v22_report_wire_binds_every_release_environment_field() {
         let report = ReleaseGateReport::new(
             "environment-wire",
             b"input",
@@ -7424,7 +7615,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v21_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
+    fn schema_v22_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
         let geometry = observations();
         let graphics_closure = vec![ClosurePath {
             name: "rsp.graphics-task".to_owned(),

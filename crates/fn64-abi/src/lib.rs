@@ -412,11 +412,29 @@ struct PendingPiCompletion {
     ret_mesg: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PfsIsPlugTransaction {
+    thread: ThreadId,
+    queue: RdramAddr,
+    message: Mesg,
+    result_addr: RdramAddr,
+    bitpattern: u8,
+}
+
+#[derive(Clone, Copy)]
+enum PendingSiCompletionOwner {
+    /// A raw PIF DMA owns the registered process allocation until byte commit.
+    ProcessRdram { rdram: *mut u8, rdram_len: usize },
+    /// Asynchronous Controller Manager calls notify the live OS_EVENT_SI target.
+    OsEvent,
+    /// Synchronous PFS owns both its exact completion route and future output.
+    PfsIsPlug(PfsIsPlugTransaction),
+}
+
 #[derive(Clone, Copy)]
 struct PendingSiCompletion {
     request: fn64_runtime::SiDmaRequest,
-    rdram: *mut u8,
-    rdram_len: usize,
+    owner: PendingSiCompletionOwner,
 }
 
 #[derive(Clone, Copy)]
@@ -433,10 +451,38 @@ pub struct PendingPiCompletionEvidenceSnapshot {
     pub ret_mesg: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PfsIsPlugTransactionEvidenceSnapshot {
+    pub thread: ThreadId,
+    pub queue: RdramAddr,
+    pub message: Mesg,
+    pub result_addr: RdramAddr,
+    pub bitpattern: u8,
+}
+
+impl From<PfsIsPlugTransaction> for PfsIsPlugTransactionEvidenceSnapshot {
+    fn from(value: PfsIsPlugTransaction) -> Self {
+        Self {
+            thread: value.thread,
+            queue: value.queue,
+            message: value.message,
+            result_addr: value.result_addr,
+            bitpattern: value.bitpattern,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingSiCompletionOwnerEvidenceSnapshot {
+    ProcessRdram { rdram_len: u64 },
+    OsEvent,
+    PfsIsPlug(PfsIsPlugTransactionEvidenceSnapshot),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingSiCompletionEvidenceSnapshot {
     pub request: fn64_runtime::SiDmaRequest,
-    pub rdram_len: u64,
+    pub owner: PendingSiCompletionOwnerEvidenceSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -466,6 +512,9 @@ pub struct RuntimePeripheralEvidenceSnapshot {
     pub peripherals: fn64_runtime::PeripheralsEvidenceSnapshot,
     pub pending_pi_completions: Vec<PendingPiCompletionEvidenceSnapshot>,
     pub pending_si_completion: Option<PendingSiCompletionEvidenceSnapshot>,
+    /// Canonical ascending thread order. These transactions have posted their
+    /// private completion but have not yet resumed to publish the output byte.
+    pub completed_pfs_is_plug: Vec<PfsIsPlugTransactionEvidenceSnapshot>,
     pub vi: AbiViEvidenceSnapshot,
 }
 
@@ -583,6 +632,61 @@ pub struct TimerHandleEvidenceSnapshot {
     pub timer_id: fn64_runtime::timer::TimerId,
 }
 
+/// Future-affecting state owned by libultra's controller manager rather than
+/// by the physical PIF ports. The public Controller Manager manual makes the
+/// default four channels, one-time initialization, and `osContSetCh` polling
+/// limit observable through later query/read buffer extents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControllerManagerEvidenceSnapshot {
+    pub initialized: bool,
+    pub channels: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ControllerManagerState {
+    initialized: bool,
+    channels: u8,
+}
+
+impl Default for ControllerManagerState {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            channels: 4,
+        }
+    }
+}
+
+impl ControllerManagerState {
+    fn initialize(&mut self) -> bool {
+        if self.initialized {
+            return false;
+        }
+        self.initialized = true;
+        self.channels = 4;
+        true
+    }
+
+    fn set_channels(&mut self, channels: u8) {
+        assert!(
+            channels <= 4,
+            "osContSetCh: channel count {channels} exceeds MAXCONTROLLERS (4)"
+        );
+        self.channels = if self.initialized { channels } else { 4 };
+    }
+
+    fn channels(self) -> usize {
+        usize::from(self.channels)
+    }
+
+    fn evidence_snapshot(self) -> ControllerManagerEvidenceSnapshot {
+        ControllerManagerEvidenceSnapshot {
+            initialized: self.initialized,
+            channels: self.channels,
+        }
+    }
+}
+
 /// Complete owner-local, future-affecting view of ABI [`HostState`] above the
 /// separately captured raw [`device_evidence_snapshot`] channel.
 ///
@@ -595,6 +699,7 @@ pub struct TimerHandleEvidenceSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AbiHostEvidenceSnapshot {
     pub runtime_peripherals: RuntimePeripheralEvidenceSnapshot,
+    pub controller_manager: ControllerManagerEvidenceSnapshot,
     pub flash: save::FlashEvidenceSnapshot,
     pub sections: fn64_runtime::SectionRegistryEvidenceSnapshot,
     pub rsp_boot_images: Vec<RspBootImageEvidenceSnapshot>,
@@ -644,6 +749,11 @@ struct HostState {
     /// from observing raw `PiBusy` contention between guest threads.
     pending_pi_completions: std::collections::VecDeque<PendingPiCompletion>,
     pending_si_completion: Option<PendingSiCompletion>,
+    completed_pfs_is_plug: std::collections::BTreeMap<ThreadId, PfsIsPlugTransaction>,
+    /// Libultra Controller Manager policy above the raw PIF device model.
+    /// Explicit raw Joybus packets retain their encoded channel addressing;
+    /// high-level query/read adapters poll only this manager-selected prefix.
+    controller_manager: ControllerManagerState,
     /// Public `OSViMode` register image queued by `osViSetMode`; the VI
     /// manager applies it at the next V-blank rather than at the shim call.
     pending_vi_mode: Option<PendingViMode>,
@@ -778,6 +888,8 @@ impl Default for HostState {
             cartridge_save: CartridgeSaveEvidenceSnapshot::Unidentified,
             pending_pi_completions: std::collections::VecDeque::new(),
             pending_si_completion: None,
+            completed_pfs_is_plug: std::collections::BTreeMap::new(),
+            controller_manager: ControllerManagerState::default(),
             pending_vi_mode: None,
             active_vi_mode: None,
             pending_vi_control: None,
@@ -913,20 +1025,39 @@ fn runtime_peripherals_from_host(
             })
             .collect(),
         pending_si_completion: host.pending_si_completion.map(|pending| {
-            assert_eq!(
-                pending.rdram, host.runtime_rdram,
-                "pending SI completion does not reference the registered process RDRAM"
-            );
-            assert_eq!(
-                pending.rdram_len, host.runtime_rdram_len,
-                "pending SI completion has a different process RDRAM extent"
-            );
+            let owner = match pending.owner {
+                PendingSiCompletionOwner::ProcessRdram { rdram, rdram_len } => {
+                    assert_eq!(
+                        rdram, host.runtime_rdram,
+                        "pending SI completion does not reference the registered process RDRAM"
+                    );
+                    assert_eq!(
+                        rdram_len, host.runtime_rdram_len,
+                        "pending SI completion has a different process RDRAM extent"
+                    );
+                    PendingSiCompletionOwnerEvidenceSnapshot::ProcessRdram {
+                        rdram_len: u64::try_from(rdram_len)
+                            .expect("process RDRAM length exceeds release-evidence wire"),
+                    }
+                }
+                PendingSiCompletionOwner::OsEvent => {
+                    PendingSiCompletionOwnerEvidenceSnapshot::OsEvent
+                }
+                PendingSiCompletionOwner::PfsIsPlug(transaction) => {
+                    PendingSiCompletionOwnerEvidenceSnapshot::PfsIsPlug(transaction.into())
+                }
+            };
             PendingSiCompletionEvidenceSnapshot {
                 request: pending.request,
-                rdram_len: u64::try_from(pending.rdram_len)
-                    .expect("process RDRAM length exceeds release-evidence wire"),
+                owner,
             }
         }),
+        completed_pfs_is_plug: host
+            .completed_pfs_is_plug
+            .values()
+            .copied()
+            .map(Into::into)
+            .collect(),
         vi: AbiViEvidenceSnapshot {
             pending_mode: host
                 .pending_vi_mode
@@ -964,6 +1095,8 @@ fn classify_host_evidence_fields(host: &HostState) {
         cartridge_save: _,
         pending_pi_completions: _,
         pending_si_completion: _,
+        completed_pfs_is_plug: _,
+        controller_manager: _,
         pending_vi_mode: _,
         active_vi_mode: _,
         pending_vi_control: _,
@@ -1104,6 +1237,7 @@ pub fn host_evidence_snapshot() -> AbiHostEvidenceSnapshot {
 
         AbiHostEvidenceSnapshot {
             runtime_peripherals: runtime_peripherals_from_host(host, peripherals),
+            controller_manager: host.controller_manager.evidence_snapshot(),
             flash: host.flash.evidence_snapshot(),
             sections: host.sections.evidence_snapshot(),
             rsp_boot_images,

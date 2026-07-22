@@ -14,7 +14,8 @@ use corosensei::CoroutineResult;
 
 use crate::device::Cycles;
 use crate::mesgqueue::{
-    Mesg, MesgQueue, MesgQueueEvidenceSnapshot, RecvResult, SendPlacement, SendResult,
+    Mesg, MesgQueue, MesgQueueActivity, MesgQueueEvidenceSnapshot, RecvResult, SendPlacement,
+    SendResult,
 };
 use crate::peripherals::Peripherals;
 use crate::rdram::RdramAddr;
@@ -830,6 +831,17 @@ impl Executor {
         self.event_table.contains_key(&event)
     }
 
+    /// Return the exact queue/message target registered for an OS event.
+    /// Synchronous manager calls use this read-only view to validate that
+    /// the queue they are about to block on is the event target that can
+    /// wake them; accepting only the event code would permit a completion
+    /// to post to a different queue and strand the caller forever.
+    pub fn event_registration(&self, event: u32) -> Option<(RdramAddr, Mesg)> {
+        self.event_table
+            .get(&event)
+            .map(|&(queue_offset, msg)| (RdramAddr::from_offset(queue_offset), msg))
+    }
+
     /// THE single, explicit host-side injection point. Every SI/PI/VI/AI
     /// completion, and every fired timer (see `advance_time`), funnels
     /// through this same function -- see `ExternalEvent`'s doc comment and
@@ -1111,17 +1123,19 @@ impl Executor {
         self.peripherals.task_log()
     }
 
-    /// Record an RSP task submission (gfx: acknowledged only; audio: the
-    /// caller has already invoked the real translated ucode function before
-    /// calling this -- see `fn64-abi`'s `osSpTaskYielded_recomp`/task-submit
-    /// shim doc comments for the actual dispatch). Emits the shared
-    /// `TaskSubmit` trace event alongside the fuller `OsTaskHeader`
-    /// `Peripherals`' own `TaskLog` keeps. Trace recording stays here (needs
-    /// `sim_time` -- see `peripherals.rs`'s module doc).
-    pub fn submit_task(&mut self, header: OsTaskHeader) {
+    /// Retain the complete header admitted by `osSpTaskLoad`. Admission is
+    /// deliberately distinct from the later task kickoff trace.
+    pub fn admit_task(&mut self, header: OsTaskHeader) {
+        self.peripherals.admit_task(header);
+    }
+
+    /// Record the `osSpTaskStartGo` boundary after the loaded-task token has
+    /// been consumed. A load that is replaced before kickoff cannot emit this
+    /// event or satisfy an execution-qualified release closure path.
+    pub fn start_task(&mut self, header: OsTaskHeader) {
         let sim_time = self.sim_time;
         let ucode = header.ucode;
-        if let Some(kind) = self.peripherals.submit_task(header) {
+        if let Some(kind) = header.kind() {
             self.trace.record(
                 sim_time,
                 TraceKind::TaskSubmit {
@@ -1646,6 +1660,20 @@ impl Executor {
             .get(&mq_addr.offset())
             .map(|q| q.capacity())
             .unwrap_or(0)
+    }
+
+    pub fn queue_valid_count(&self, mq_addr: RdramAddr) -> Option<usize> {
+        self.queues
+            .get(&mq_addr.offset())
+            .map(MesgQueue::valid_count)
+    }
+
+    /// Complete queue-use preflight for synchronous APIs whose public contract
+    /// requires an unshared queue. In particular, an empty queue with an older
+    /// blocked receiver is not private: that receiver would steal the next
+    /// completion post and strand the synchronous caller.
+    pub fn queue_activity(&self, mq_addr: RdramAddr) -> Option<MesgQueueActivity> {
+        self.queues.get(&mq_addr.offset()).map(MesgQueue::activity)
     }
 
     /// Run until the run queue is empty (every thread finished, blocked, or

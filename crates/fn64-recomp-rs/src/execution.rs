@@ -14,6 +14,10 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
+use crate::fetch::{
+    admit_mapped_unit, run_admitted_mapped_unit, MappedAotBlock, MappedAotEvidenceSnapshot,
+    PhysicalCodeBank, PhysicalCodeBankEvidenceSnapshot, PhysicalCodeCatalog, PhysicalCodeError,
+};
 use crate::runtime::{Rdram, RecompContext};
 
 /// Stable identity of one admitted code image.
@@ -74,6 +78,27 @@ pub struct ExecutionKey {
     pub pc: GuestPc,
 }
 
+/// Identity of one admitted physical instruction word.
+///
+/// `BankId` is the immutable image/generation evidence; `physical_address`
+/// selects the word inside that generation. This is intentionally not an
+/// [`ExecutionKey`]: branch arithmetic, link registers, EPC, and Cause.BD use
+/// the architectural virtual PC even when two VAs name this same identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InstructionWordIdentity {
+    pub bank: BankId,
+    pub physical_address: u32,
+}
+
+impl InstructionWordIdentity {
+    pub const fn new(bank: BankId, physical_address: u32) -> Self {
+        Self {
+            bank,
+            physical_address,
+        }
+    }
+}
+
 impl ExecutionKey {
     pub const fn new(bank: BankId, pc: GuestPc) -> Self {
         Self { bank, pc }
@@ -106,6 +131,19 @@ pub enum CpuFaultKind {
         first_candidate: BankId,
         second_candidate: BankId,
         candidate_count: u32,
+    },
+    /// VA translation succeeded, but that physical word was not admitted in
+    /// the selected immutable generation.
+    UnmappedPhysicalInstruction {
+        physical_address: u32,
+    },
+    /// A translated AOT unit was entered after its VA-to-physical binding
+    /// changed. Retrying stale native code would execute the wrong word, so
+    /// this remains a loud generation boundary for the mapping owner to
+    /// rebuild and re-resolve.
+    StaleInstructionIdentity {
+        expected: InstructionWordIdentity,
+        actual: InstructionWordIdentity,
     },
     /// A guest data access whose effective address is outside the RDRAM bytes
     /// owned by the executing host. This remains distinct from architectural
@@ -246,6 +284,20 @@ impl fmt::Display for CpuFault {
                 f,
                 "ambiguous execution PC at {}; {candidate_count} admitted banks match, beginning with {first_candidate} and {second_candidate}",
                 self.at
+            ),
+            CpuFaultKind::UnmappedPhysicalInstruction { physical_address } => write!(
+                f,
+                "physical instruction word {physical_address:#010X} is not admitted at {}",
+                self.at
+            ),
+            CpuFaultKind::StaleInstructionIdentity { expected, actual } => write!(
+                f,
+                "stale translated instruction at {}: expected {}:{:#010X}, fetched {}:{:#010X}",
+                self.at,
+                expected.bank,
+                expected.physical_address,
+                actual.bank,
+                actual.physical_address
             ),
             CpuFaultKind::MemoryFault { addr } => write!(
                 f,
@@ -526,6 +578,10 @@ impl GeneratedBankRunner {
 
     pub const fn artifact_identity(self) -> Option<ProgramArtifactIdentity> {
         self.artifact_identity
+    }
+
+    pub const fn callable(self) -> GeneratedBankFn {
+        self.run
     }
 }
 
@@ -867,24 +923,27 @@ pub struct CodeBankEvidenceSnapshot {
 
 /// Complete canonical executable image owned by a [`BlockProgram`].
 ///
-/// Banks and spans are sorted by their typed identities/addresses. Instruction
-/// word order is architectural and is retained verbatim. Generated runner
-/// pointers are deliberately absent, but each bank retains the stable artifact
-/// identity supplied with that runner: the words alone cannot prove two native
-/// callables implement the same semantics.
+/// Virtual and physical banks, spans, and mapped AOT entries are sorted by
+/// their typed identities/addresses. Instruction word order is architectural
+/// and is retained verbatim. Generated runner pointers are deliberately
+/// absent, but each generated unit retains its stable artifact identity: the
+/// words alone cannot prove two native callables implement the same semantics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockProgramEvidenceSnapshot {
     pub identity: ProgramIdentityEvidenceSnapshot,
     pub banks: Vec<CodeBankEvidenceSnapshot>,
+    pub physical_banks: Vec<PhysicalCodeBankEvidenceSnapshot>,
+    pub mapped_aot: Vec<MappedAotEvidenceSnapshot>,
 }
 
 /// One successfully entered bank-qualified guest execution destination.
 ///
 /// The bank identity names the immutable code-image generation, while the
 /// optional runner identity names the generated native artifact that was
-/// actually entered. `None` is retained only for the compatibility
-/// [`GeneratedBankRunner::new`] path and must not be promoted to release
-/// evidence without the program's separate artifact-authority proof.
+/// actually entered. `None` is retained for the compatibility
+/// [`GeneratedBankRunner::new`] path and the mapped-interpreter fallback;
+/// neither may be promoted to release evidence without a typed artifact
+/// authority.
 /// Historical execution observations are intentionally separate from
 /// [`BlockProgramEvidenceSnapshot`]: they describe what happened, not state
 /// which can affect future execution.
@@ -1121,6 +1180,10 @@ pub enum ProgramError {
     DuplicateBank {
         bank: BankId,
     },
+    PhysicalCode(PhysicalCodeError),
+    DuplicateMappedEntry {
+        entry: ExecutionKey,
+    },
 }
 
 impl fmt::Display for ProgramError {
@@ -1134,6 +1197,10 @@ impl fmt::Display for ProgramError {
                 "generated runner for {runner_bank} cannot execute code admitted as {code_bank}"
             ),
             Self::DuplicateBank { bank } => write!(f, "block program already contains {bank}"),
+            Self::PhysicalCode(error) => error.fmt(f),
+            Self::DuplicateMappedEntry { entry } => {
+                write!(f, "block program already contains mapped AOT entry {entry}")
+            }
         }
     }
 }
@@ -1150,6 +1217,8 @@ impl std::error::Error for ProgramError {}
 pub struct BlockProgram {
     code: CodeCatalog,
     runners: BTreeMap<BankId, (GeneratedBankFn, Option<ProgramArtifactIdentity>)>,
+    physical_code: PhysicalCodeCatalog,
+    mapped_aot: BTreeMap<ExecutionKey, MappedAotBlock>,
     execution_destinations: RefCell<Vec<ExecutionDestinationObservation>>,
 }
 
@@ -1170,7 +1239,10 @@ impl BlockProgram {
                 runner_bank: runner.bank,
             });
         }
-        if self.code.bank(code_bank).is_some() || self.runners.contains_key(&code_bank) {
+        if self.code.bank(code_bank).is_some()
+            || self.runners.contains_key(&code_bank)
+            || self.physical_code.contains_bank(code_bank)
+        {
             return Err(ProgramError::DuplicateBank { bank: code_bank });
         }
         self.code
@@ -1181,8 +1253,42 @@ impl BlockProgram {
         Ok(())
     }
 
+    /// Admit one immutable physical code generation for canonical 32-bit
+    /// mapped fetch. Every aligned VA resolved to this `BankId` can execute
+    /// immediately through the interpreter fallback; registered mapped AOT
+    /// units override individual entries without changing the fetch contract.
+    pub fn register_physical_code(&mut self, code: PhysicalCodeBank) -> Result<(), ProgramError> {
+        let bank = code.id();
+        if self.code.bank(bank).is_some() || self.runners.contains_key(&bank) {
+            return Err(ProgramError::DuplicateBank { bank });
+        }
+        self.physical_code
+            .register(code)
+            .map_err(ProgramError::PhysicalCode)
+    }
+
+    /// Install one fetch-bound generated unit into the main program runner.
+    /// The containing physical generation must already be registered so no
+    /// optional side catalog can become a second execution authority.
+    pub fn register_mapped_aot(&mut self, block: MappedAotBlock) -> Result<(), ProgramError> {
+        let entry = ExecutionKey::new(block.bank(), block.entry());
+        assert!(
+            self.physical_code.contains_bank(block.bank()),
+            "mapped AOT entry {entry} has no admitted physical code generation"
+        );
+        if self.mapped_aot.contains_key(&entry) {
+            return Err(ProgramError::DuplicateMappedEntry { entry });
+        }
+        self.mapped_aot.insert(entry, block);
+        Ok(())
+    }
+
     pub fn code(&self) -> &CodeCatalog {
         &self.code
+    }
+
+    pub fn physical_code(&self) -> &PhysicalCodeCatalog {
+        &self.physical_code
     }
 
     /// Copy the append-only execution history in authoritative entry order.
@@ -1201,12 +1307,13 @@ impl BlockProgram {
     /// Capture the complete immutable guest-code image without native
     /// callable addresses.
     ///
-    /// `CodeCatalog` is a `BTreeMap` and `CodeBank` construction sorts spans,
-    /// so equivalent registration order produces byte-identical evidence.
-    /// The domain-separated SHA-256 covers every runner artifact identity,
-    /// bank identity, span start, length, and instruction word encoded
-    /// big-endian. Code words alone are insufficient because registration
-    /// accepts independently generated native runners.
+    /// Catalog maps sort bank/AOT identities and bank construction sorts
+    /// spans, so equivalent registration order produces byte-identical
+    /// evidence. The domain-separated SHA-256 covers every virtual and
+    /// physical bank identity, span address, length, instruction word, mapped
+    /// entry, translated instruction identity, and runner artifact identity,
+    /// all encoded big-endian. Code words alone are insufficient because
+    /// registration accepts independently generated native runners.
     pub fn evidence_snapshot(&self) -> BlockProgramEvidenceSnapshot {
         let banks = self
             .code
@@ -1237,8 +1344,18 @@ impl BlockProgram {
                 }
             })
             .collect::<Vec<_>>();
+        let physical_banks = self.physical_code.evidence_snapshot();
+        let mapped_aot = self
+            .mapped_aot
+            .values()
+            .map(MappedAotBlock::evidence_snapshot)
+            .collect::<Vec<_>>();
         let mut hasher = Sha256::new();
-        hasher.update(b"fn64.block-program.identity.v1\0");
+        if physical_banks.is_empty() {
+            hasher.update(b"fn64.block-program.identity.v1\0");
+        } else {
+            hasher.update(b"fn64.block-program.identity.v2\0");
+        }
         hasher.update(
             u64::try_from(banks.len())
                 .expect("block-program bank count exceeds identity wire")
@@ -1264,12 +1381,67 @@ impl BlockProgram {
                 }
             }
         }
+        if !physical_banks.is_empty() {
+            hasher.update(
+                u64::try_from(physical_banks.len())
+                    .expect("physical block-program bank count exceeds identity wire")
+                    .to_be_bytes(),
+            );
+            for bank in &physical_banks {
+                hasher.update(bank.id.get().to_be_bytes());
+                hasher.update(
+                    u64::try_from(bank.spans.len())
+                        .expect("physical block-program span count exceeds identity wire")
+                        .to_be_bytes(),
+                );
+                for span in &bank.spans {
+                    hasher.update(span.physical_start.to_be_bytes());
+                    hasher.update(
+                        u64::try_from(span.words.len())
+                            .expect("physical block-program word count exceeds identity wire")
+                            .to_be_bytes(),
+                    );
+                    for word in &span.words {
+                        hasher.update(word.to_be_bytes());
+                    }
+                }
+            }
+            hasher.update(
+                u64::try_from(mapped_aot.len())
+                    .expect("mapped AOT unit count exceeds identity wire")
+                    .to_be_bytes(),
+            );
+            for unit in &mapped_aot {
+                hasher.update(unit.entry.bank.get().to_be_bytes());
+                hasher.update(unit.entry.pc.get().to_be_bytes());
+                hasher.update(unit.runner_artifact_identity.bytes());
+                hasher.update(
+                    u64::try_from(unit.instructions.len())
+                        .expect("mapped AOT instruction count exceeds identity wire")
+                        .to_be_bytes(),
+                );
+                for instruction in &unit.instructions {
+                    hasher.update(instruction.bank.get().to_be_bytes());
+                    hasher.update(instruction.physical_address.to_be_bytes());
+                }
+                hasher.update(
+                    u64::try_from(unit.expected_words.len())
+                        .expect("mapped AOT expected-word count exceeds identity wire")
+                        .to_be_bytes(),
+                );
+                for word in &unit.expected_words {
+                    hasher.update(word.to_be_bytes());
+                }
+            }
+        }
         BlockProgramEvidenceSnapshot {
             identity: ProgramIdentityEvidenceSnapshot {
                 identity: ProgramArtifactIdentity::new(hasher.finalize().into()),
                 source: ProgramIdentitySource::CanonicalBlockProgramSha256,
             },
             banks,
+            physical_banks,
+            mapped_aot,
         }
     }
 
@@ -1277,6 +1449,10 @@ impl BlockProgram {
     /// Returning `false` means neither half existed; a one-sided presence is
     /// an internal invariant violation rather than a recoverable stale state.
     pub fn unregister(&mut self, bank: BankId) -> bool {
+        if let Some(_physical) = self.physical_code.unregister(bank) {
+            self.mapped_aot.retain(|entry, _| entry.bank != bank);
+            return true;
+        }
         let code = self.code.unregister(bank);
         let runner = self.runners.remove(&bank);
         assert_eq!(
@@ -1294,6 +1470,33 @@ impl BlockProgram {
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
     ) -> BlockRun {
+        if self.physical_code.contains_bank(entry.bank) {
+            if let Some(block) = self.mapped_aot.get(&entry) {
+                if let Err(run) = block.preflight(&self.physical_code, ctx) {
+                    return run;
+                }
+                self.execution_destinations
+                    .borrow_mut()
+                    .push(ExecutionDestinationObservation {
+                        destination: entry,
+                        runner_artifact_identity: block.runner_artifact_identity(),
+                    });
+                return block.run_preflighted(budget, ctx, mem);
+            }
+            let unit = match admit_mapped_unit(&self.physical_code, entry.bank, entry.pc, ctx) {
+                Ok(unit) => unit,
+                Err(run) => return run,
+            };
+            self.execution_destinations
+                .borrow_mut()
+                .push(ExecutionDestinationObservation {
+                    destination: entry,
+                    runner_artifact_identity: None,
+                });
+            return run_admitted_mapped_unit(unit, budget, ctx, mem).unwrap_or_else(
+                |unsupported| BlockRun::new(BlockExit::Fault(unsupported.into_cpu_fault()), 0),
+            );
+        }
         if let Err(fault) = self.code.resolve(entry) {
             let attempted_fetch = u32::from(matches!(fault.kind, CpuFaultKind::Exception { .. }));
             return BlockRun::new(BlockExit::Fault(fault), attempted_fetch);
@@ -1815,6 +2018,25 @@ mod tests {
         CodeBank::new(BankId::new(id), VA, words.to_vec()).unwrap()
     }
 
+    fn instruction_entry_lo(physical_page: u32, valid: bool) -> u32 {
+        ((physical_page >> 6) & 0x03ff_ffc0) | 1 | ((valid as u32) << 1) | (1 << 2)
+    }
+
+    fn map_instruction_pair(
+        ctx: &mut RecompContext,
+        virtual_pair: u32,
+        even_physical: u32,
+        odd_physical: u32,
+        odd_valid: bool,
+    ) {
+        ctx.tlb_entries[0] = crate::runtime::TlbEntryRaw {
+            page_mask: 0,
+            entry_hi: virtual_pair & 0xffff_e000,
+            entry_lo0: instruction_entry_lo(even_physical, true),
+            entry_lo1: instruction_entry_lo(odd_physical, odd_valid),
+        };
+    }
+
     fn first_runner(
         entry: ExecutionKey,
         _budget: InstructionBudget,
@@ -2306,6 +2528,296 @@ mod tests {
         assert!(program.code().bank(bank).is_some());
     }
 
+    fn mapped_observation_bank(bank: BankId) -> PhysicalCodeBank {
+        PhysicalCodeBank::from_spans(
+            bank,
+            vec![
+                crate::fetch::PhysicalCodeSpan::new(bank, 0x0000_0040, vec![0x4022_4800]).unwrap(),
+                crate::fetch::PhysicalCodeSpan::new(bank, 0x0010_0000, vec![0x2402_0001]).unwrap(),
+                crate::fetch::PhysicalCodeSpan::new(bank, 0x0010_0ffc, vec![0x1000_0001]).unwrap(),
+                crate::fetch::PhysicalCodeSpan::new(bank, 0x0020_0000, vec![0x2402_0002]).unwrap(),
+                crate::fetch::PhysicalCodeSpan::new(bank, 0x0030_0000, vec![0x2403_0003]).unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mapped_fetch_failures_do_not_record_an_entered_destination() {
+        let bank = BankId::new(0x505);
+        let mut program = BlockProgram::new();
+        program
+            .register_physical_code(mapped_observation_bank(bank))
+            .unwrap();
+        let mut storage = [];
+        let mut mem = Rdram::new(&mut storage);
+        let budget = InstructionBudget::new(2).unwrap();
+
+        let mut misaligned_ctx = RecompContext::new();
+        let misaligned = program.run(
+            ExecutionKey::new(bank, GuestPc::new(0x8000_0042)),
+            budget,
+            &mut misaligned_ctx,
+            &mut mem,
+        );
+        assert!(matches!(
+            misaligned.exit,
+            BlockExit::Fault(CpuFault {
+                kind: CpuFaultKind::Exception {
+                    exception: CpuException::AddressErrorLoad,
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let mut refill_ctx = RecompContext::new();
+        let refill = program.run(
+            ExecutionKey::new(bank, GuestPc::new(0x0060_0000)),
+            budget,
+            &mut refill_ctx,
+            &mut mem,
+        );
+        assert!(matches!(
+            refill.exit,
+            BlockExit::Fault(CpuFault {
+                kind: CpuFaultKind::Exception {
+                    exception: CpuException::TlbRefillLoad,
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let mut unmapped_ctx = RecompContext::new();
+        map_instruction_pair(
+            &mut unmapped_ctx,
+            0x0080_0000,
+            0x0040_0000,
+            0x0040_1000,
+            true,
+        );
+        let unmapped = program.run(
+            ExecutionKey::new(bank, GuestPc::new(0x0080_0000)),
+            budget,
+            &mut unmapped_ctx,
+            &mut mem,
+        );
+        assert!(matches!(
+            unmapped.exit,
+            BlockExit::Fault(CpuFault {
+                kind: CpuFaultKind::UnmappedPhysicalInstruction { .. },
+                ..
+            })
+        ));
+
+        let mut delay_ctx = RecompContext::new();
+        map_instruction_pair(&mut delay_ctx, 0x0040_0000, 0x0010_0000, 0x0030_0000, false);
+        let delay = program.run(
+            ExecutionKey::new(bank, GuestPc::new(0x0040_0ffc)),
+            budget,
+            &mut delay_ctx,
+            &mut mem,
+        );
+        assert!(matches!(
+            delay.exit,
+            BlockExit::Fault(CpuFault {
+                kind: CpuFaultKind::Exception {
+                    exception: CpuException::TlbInvalidLoad,
+                    branch_delay: true,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(program.copy_execution_destinations().is_empty());
+    }
+
+    #[test]
+    fn mapped_history_records_only_admitted_units_with_honest_lane_identity() {
+        let bank = BankId::new(0x506);
+        let mut program = BlockProgram::new();
+        program
+            .register_physical_code(mapped_observation_bank(bank))
+            .unwrap();
+        let aot_artifact = ProgramArtifactIdentity::new([0x56; 32]);
+        let direct_aot_entry = GuestPc::new(0x8010_0000);
+        let aot = MappedAotBlock::new(
+            program.physical_code(),
+            &RecompContext::new(),
+            bank,
+            direct_aot_entry,
+            &[0x2402_0001],
+            GeneratedBankRunner::new_with_artifact_identity(bank, first_runner, aot_artifact),
+        )
+        .unwrap();
+        program.register_mapped_aot(aot).unwrap();
+
+        let mut storage = [];
+        let mut mem = Rdram::new(&mut storage);
+        let budget = InstructionBudget::new(2).unwrap();
+        let mut ctx = RecompContext::new();
+        let interpreted_entry = GuestPc::new(0x8000_0040);
+        let interpreted = program.run(
+            ExecutionKey::new(bank, interpreted_entry),
+            budget,
+            &mut ctx,
+            &mut mem,
+        );
+        assert!(matches!(interpreted.exit, BlockExit::Fault(_)));
+        program.run(
+            ExecutionKey::new(bank, direct_aot_entry),
+            budget,
+            &mut ctx,
+            &mut mem,
+        );
+        assert_eq!(
+            program.copy_execution_destinations(),
+            vec![
+                ExecutionDestinationObservation {
+                    destination: ExecutionKey::new(bank, interpreted_entry),
+                    runner_artifact_identity: None,
+                },
+                ExecutionDestinationObservation {
+                    destination: ExecutionKey::new(bank, direct_aot_entry),
+                    runner_artifact_identity: Some(aot_artifact),
+                },
+            ]
+        );
+
+        let mut stale_program = BlockProgram::new();
+        stale_program
+            .register_physical_code(mapped_observation_bank(bank))
+            .unwrap();
+        let stale_entry = GuestPc::new(0x0080_0000);
+        let mut original_ctx = RecompContext::new();
+        map_instruction_pair(
+            &mut original_ctx,
+            stale_entry.get(),
+            0x0010_0000,
+            0x0030_0000,
+            true,
+        );
+        let stale = MappedAotBlock::new(
+            stale_program.physical_code(),
+            &original_ctx,
+            bank,
+            stale_entry,
+            &[0x2402_0001],
+            GeneratedBankRunner::new_with_artifact_identity(bank, first_runner, aot_artifact),
+        )
+        .unwrap();
+        stale_program.register_mapped_aot(stale).unwrap();
+        let mut remapped_ctx = RecompContext::new();
+        map_instruction_pair(
+            &mut remapped_ctx,
+            stale_entry.get(),
+            0x0020_0000,
+            0x0030_0000,
+            true,
+        );
+        let stale_run = stale_program.run(
+            ExecutionKey::new(bank, stale_entry),
+            budget,
+            &mut remapped_ctx,
+            &mut mem,
+        );
+        assert!(matches!(
+            stale_run.exit,
+            BlockExit::Fault(CpuFault {
+                kind: CpuFaultKind::StaleInstructionIdentity { .. },
+                ..
+            })
+        ));
+        assert!(stale_program.copy_execution_destinations().is_empty());
+    }
+
+    #[test]
+    fn mapped_wraparound_delay_fetch_is_precise_and_records_only_after_admission() {
+        let bank = BankId::new(0x507);
+        let branch_word = 0x1000_0001;
+        let delay_word = 0x2442_0005;
+        let physical = PhysicalCodeBank::from_spans(
+            bank,
+            vec![
+                crate::fetch::PhysicalCodeSpan::new(bank, 0x0010_0ffc, vec![branch_word]).unwrap(),
+                crate::fetch::PhysicalCodeSpan::new(bank, 0x0020_0000, vec![delay_word]).unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut program = BlockProgram::new();
+        program.register_physical_code(physical).unwrap();
+        let entry = GuestPc::new(0xffff_fffc);
+        let budget = InstructionBudget::new(2).unwrap();
+        let mut storage = [];
+        let mut mem = Rdram::new(&mut storage);
+
+        let mut invalid_ctx = RecompContext::new();
+        for tlb in &mut invalid_ctx.tlb_entries {
+            tlb.entry_hi = 0x0040_0000;
+        }
+        invalid_ctx.tlb_entries[0] = crate::runtime::TlbEntryRaw {
+            page_mask: 0,
+            entry_hi: 0xffff_e000,
+            entry_lo0: instruction_entry_lo(0x0010_0000, true),
+            entry_lo1: instruction_entry_lo(0x0010_0000, true),
+        };
+        invalid_ctx.tlb_entries[1] = crate::runtime::TlbEntryRaw {
+            page_mask: 0,
+            entry_hi: 0,
+            entry_lo0: instruction_entry_lo(0x0020_0000, false),
+            entry_lo1: instruction_entry_lo(0x0020_1000, false),
+        };
+        let invalid = program.run(
+            ExecutionKey::new(bank, entry),
+            budget,
+            &mut invalid_ctx,
+            &mut mem,
+        );
+        assert!(matches!(
+            invalid.exit,
+            BlockExit::Fault(CpuFault {
+                at: ExecutionKey {
+                    pc: GuestPc(0),
+                    ..
+                },
+                kind: CpuFaultKind::Exception {
+                    exception: CpuException::TlbInvalidLoad,
+                    epc,
+                    branch_delay: true,
+                    bad_vaddr: Some(0),
+                    ..
+                },
+            }) if epc == entry
+        ));
+        assert!(program.copy_execution_destinations().is_empty());
+
+        let mut valid_ctx = invalid_ctx;
+        valid_ctx.tlb_entries[1].entry_lo0 = instruction_entry_lo(0x0020_0000, true);
+        let valid = program.run(
+            ExecutionKey::new(bank, entry),
+            budget,
+            &mut valid_ctx,
+            &mut mem,
+        );
+        assert_eq!(valid.instructions, 2);
+        assert_eq!(
+            valid.exit,
+            BlockExit::ResolveTransfer {
+                source_bank: bank,
+                target_pc: GuestPc::new(4),
+            }
+        );
+        assert_eq!(valid_ctx.r_u32(2), 5);
+        assert_eq!(
+            program.copy_execution_destinations(),
+            vec![ExecutionDestinationObservation {
+                destination: ExecutionKey::new(bank, entry),
+                runner_artifact_identity: None,
+            }]
+        );
+    }
+
     #[test]
     fn block_program_evidence_is_sorted_and_runner_pointer_independent() {
         let first = BankId::new(0x21);
@@ -2403,6 +2915,225 @@ mod tests {
             baseline.identity.identity,
             changed_runner_artifact.identity.identity
         );
+    }
+
+    fn mapped_evidence_snapshot(
+        bank: BankId,
+        spans: &[(u32, u32)],
+        mappings: &[(GuestPc, u32, u32, ProgramArtifactIdentity)],
+    ) -> BlockProgramEvidenceSnapshot {
+        let physical = PhysicalCodeBank::from_spans(
+            bank,
+            spans
+                .iter()
+                .map(|&(physical_start, word)| {
+                    crate::fetch::PhysicalCodeSpan::new(bank, physical_start, vec![word]).unwrap()
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut program = BlockProgram::new();
+        program.register_physical_code(physical).unwrap();
+
+        let mut ctx = RecompContext::new();
+        for (index, &(entry, physical_address, word, artifact)) in mappings.iter().enumerate() {
+            assert_eq!(entry.get() & 0x1fff, 0);
+            assert_eq!(physical_address & 0xfff, 0);
+            ctx.tlb_entries[index] = crate::runtime::TlbEntryRaw {
+                page_mask: 0,
+                entry_hi: entry.get() & 0xffff_e000,
+                entry_lo0: ((physical_address >> 6) & 0x03ff_ffc0) | 0x7,
+                entry_lo1: 0,
+            };
+            let block = MappedAotBlock::new(
+                program.physical_code(),
+                &ctx,
+                bank,
+                entry,
+                &[word],
+                GeneratedBankRunner::new_with_artifact_identity(bank, first_runner, artifact),
+            )
+            .unwrap();
+            program.register_mapped_aot(block).unwrap();
+        }
+        program.evidence_snapshot()
+    }
+
+    #[test]
+    fn mapped_block_program_evidence_is_canonical_across_registration_order() {
+        let bank = BankId::new(0x51);
+        let first_entry = GuestPc::new(0x0040_0000);
+        let second_entry = GuestPc::new(0x0040_2000);
+        let first_word = 0x2402_0001;
+        let second_word = 0x2403_0002;
+        let first_artifact = ProgramArtifactIdentity::new([0x11; 32]);
+        let second_artifact = ProgramArtifactIdentity::new([0x22; 32]);
+        let forward = mapped_evidence_snapshot(
+            bank,
+            &[(0x0010_0000, first_word), (0x0020_0000, second_word)],
+            &[
+                (first_entry, 0x0010_0000, first_word, first_artifact),
+                (second_entry, 0x0020_0000, second_word, second_artifact),
+            ],
+        );
+        let reverse = mapped_evidence_snapshot(
+            bank,
+            &[(0x0020_0000, second_word), (0x0010_0000, first_word)],
+            &[
+                (second_entry, 0x0020_0000, second_word, second_artifact),
+                (first_entry, 0x0010_0000, first_word, first_artifact),
+            ],
+        );
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.physical_banks.len(), 1);
+        assert_eq!(forward.mapped_aot.len(), 2);
+    }
+
+    #[test]
+    fn mapped_block_program_identity_binds_physical_and_aot_identity_families() {
+        let bank = BankId::new(0x61);
+        let entry = GuestPc::new(0x0040_0000);
+        let word = 0x2402_0001;
+        let artifact = ProgramArtifactIdentity::new([0x33; 32]);
+        let baseline = mapped_evidence_snapshot(
+            bank,
+            &[(0x0010_0000, word)],
+            &[(entry, 0x0010_0000, word, artifact)],
+        );
+        let changed_bank = mapped_evidence_snapshot(
+            BankId::new(0x62),
+            &[(0x0010_0000, word)],
+            &[(entry, 0x0010_0000, word, artifact)],
+        );
+        let changed_physical_address = mapped_evidence_snapshot(
+            bank,
+            &[(0x0020_0000, word)],
+            &[(entry, 0x0020_0000, word, artifact)],
+        );
+        let changed_entry = mapped_evidence_snapshot(
+            bank,
+            &[(0x0010_0000, word)],
+            &[(GuestPc::new(0x0040_2000), 0x0010_0000, word, artifact)],
+        );
+        let changed_word = mapped_evidence_snapshot(
+            bank,
+            &[(0x0010_0000, word + 1)],
+            &[(entry, 0x0010_0000, word + 1, artifact)],
+        );
+        let changed_artifact = mapped_evidence_snapshot(
+            bank,
+            &[(0x0010_0000, word)],
+            &[(
+                entry,
+                0x0010_0000,
+                word,
+                ProgramArtifactIdentity::new([0x44; 32]),
+            )],
+        );
+
+        for changed in [
+            &changed_bank,
+            &changed_physical_address,
+            &changed_entry,
+            &changed_word,
+            &changed_artifact,
+        ] {
+            assert_ne!(baseline, *changed);
+            assert_ne!(baseline.identity.identity, changed.identity.identity);
+        }
+        assert_eq!(baseline.mapped_aot[0].entry.pc, entry);
+        assert_eq!(
+            baseline.mapped_aot[0].instructions,
+            vec![InstructionWordIdentity::new(bank, 0x0010_0000)]
+        );
+        assert_eq!(baseline.mapped_aot[0].expected_words, vec![word]);
+    }
+
+    fn cross_catalog_mapped_program(compiled_word: u32) -> BlockProgram {
+        let bank = BankId::new(0x63);
+        let entry = GuestPc::new(0x8010_0000);
+        let mut compilation_catalog = PhysicalCodeCatalog::new();
+        compilation_catalog
+            .register(PhysicalCodeBank::new(bank, 0x0010_0000, vec![compiled_word]).unwrap())
+            .unwrap();
+        let block = MappedAotBlock::new(
+            &compilation_catalog,
+            &RecompContext::new(),
+            bank,
+            entry,
+            &[compiled_word],
+            GeneratedBankRunner::new_with_artifact_identity(
+                bank,
+                first_runner,
+                ProgramArtifactIdentity::new([0x63; 32]),
+            ),
+        )
+        .unwrap();
+        let mut program = BlockProgram::new();
+        program
+            .register_physical_code(
+                PhysicalCodeBank::new(bank, 0x0010_0000, vec![0x2402_0001]).unwrap(),
+            )
+            .unwrap();
+        program.register_mapped_aot(block).unwrap();
+        program
+    }
+
+    #[test]
+    fn mapped_aot_evidence_binds_future_preflight_expected_words() {
+        let valid = cross_catalog_mapped_program(0x2402_0001);
+        let stale = cross_catalog_mapped_program(0x2402_0002);
+        let valid_snapshot = valid.evidence_snapshot();
+        let stale_snapshot = stale.evidence_snapshot();
+        assert_eq!(valid_snapshot.physical_banks, stale_snapshot.physical_banks);
+        assert_eq!(
+            valid_snapshot.mapped_aot[0].instructions,
+            stale_snapshot.mapped_aot[0].instructions
+        );
+        assert_ne!(
+            valid_snapshot.mapped_aot[0].expected_words,
+            stale_snapshot.mapped_aot[0].expected_words
+        );
+        assert_ne!(
+            valid_snapshot.identity.identity,
+            stale_snapshot.identity.identity
+        );
+
+        let entry = ExecutionKey::new(BankId::new(0x63), GuestPc::new(0x8010_0000));
+        let budget = InstructionBudget::new(2).unwrap();
+        let mut valid_ctx = RecompContext::new();
+        let mut stale_ctx = RecompContext::new();
+        let mut valid_storage = [];
+        let mut stale_storage = [];
+        assert!(!matches!(
+            valid
+                .run(
+                    entry,
+                    budget,
+                    &mut valid_ctx,
+                    &mut Rdram::new(&mut valid_storage),
+                )
+                .exit,
+            BlockExit::Fault(CpuFault {
+                kind: CpuFaultKind::StaleInstructionIdentity { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            stale
+                .run(
+                    entry,
+                    budget,
+                    &mut stale_ctx,
+                    &mut Rdram::new(&mut stale_storage),
+                )
+                .exit,
+            BlockExit::Fault(CpuFault {
+                kind: CpuFaultKind::StaleInstructionIdentity { .. },
+                ..
+            })
+        ));
     }
 
     #[test]

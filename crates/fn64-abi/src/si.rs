@@ -719,8 +719,7 @@ pub unsafe extern "C" fn __osSiRawStartDma_recomp(rdram: *mut u8, ctx: *mut Reco
         & !3;
     ctx.r2 = match crate::pi::start_live_si_dma(
         fn64_runtime::SiDmaRequest { kind, dram_addr },
-        rdram,
-        rdram_len,
+        PendingSiCompletionOwner::ProcessRdram { rdram, rdram_len },
     ) {
         Ok(()) => 0,
         Err(DeviceFault::SiBusy) => u64::MAX,
@@ -821,9 +820,10 @@ pub fn rumble_active(port: usize) -> bool {
 /// after DmaMgr delivered the code-segment DMA (thread 3 died mid-C, before
 /// the next shim/yield).
 ///
-/// Fills the whole `OSContStatus[MAXCONTROLLERS]` array, one entry per port
-/// (`__osContGetInitData`, `oot-decomp/src/libultra/io/controller.c:58`,
-/// iterates all `__osMaxControllers` and advances `data++` each). Each
+/// Fills one entry per channel in the Controller Manager's active prefix.
+/// The public `osContSetCh` manual specifies the default as
+/// `MAXCONTROLLERS` and permits callers to allocate a smaller array after
+/// reducing the count. Each
 /// 4-byte entry is `{type: u16 @0, status: u8 @2, errno: u8 @3}`
 /// (`oot-decomp/include/ultra64/controller.h:121`). The game reads these
 /// back with `MEM_HU`/`MEM_BU` (`funcs_55.c:2205/2214`:
@@ -846,7 +846,8 @@ pub unsafe extern "C" fn osContGetQuery_recomp(rdram: *mut u8, ctx: *mut RecompC
     let data_addr = RdramAddr::from_gpr(ctx.r4).offset() as usize;
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     let pif = with_executor(|exec| *exec.pif());
-    for port in 0..MAXCONTROLLERS {
+    let channels = with_host(|host| host.controller_manager.channels());
+    for port in 0..channels {
         let resp = pif.query_response(port);
         let absent = (resp[2] & fn64_runtime::si::CONT_ABSENT) != 0;
         // `query_response` returns the PIF wire bytes `[typeh, typel,
@@ -888,8 +889,8 @@ pub unsafe extern "C" fn osContGetQuery_recomp(rdram: *mut u8, ctx: *mut RecompC
 const CONT_NO_RESPONSE_ERROR: u8 = 0x08;
 
 /// `MAXCONTROLLERS` (`oot-decomp/include/ultra64/controller.h:9`): the N64
-/// has four controller ports; `osContGetQuery` fills one `OSContStatus` per
-/// port.
+/// has four controller ports; the Controller Manager defaults to all four.
+#[cfg(test)]
 const MAXCONTROLLERS: usize = 4;
 
 /// `osContGetReadData(OSContPad *pad) -> void` -- `a0`=`ctx->r4`, the base of
@@ -942,7 +943,8 @@ pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut Reco
             p0[3] as i8,
         );
     }
-    for port in 0..MAXCONTROLLERS {
+    let channels = with_host(|host| host.controller_manager.channels());
+    for port in 0..channels {
         // A present standard controller reports errno == 0 and its live input;
         // an absent port reports no-response, matching the decomp's
         // `errno = CHNL_ERR(read)` branch (button/stick left zero here).
@@ -1004,6 +1006,13 @@ pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut Reco
 #[no_mangle]
 pub unsafe extern "C" fn osContInit_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
+    if !with_host(|host| host.controller_manager.initialize()) {
+        // The public Controller Manager manual specifies that only the first
+        // call initializes the manager; later calls do not rewrite caller
+        // buffers or reset an `osContSetCh` selection.
+        ctx.r2 = 0;
+        return;
+    }
     let bitpattern_addr = RdramAddr::from_gpr(ctx.r5).offset() as usize;
     let data_addr = RdramAddr::from_gpr(ctx.r6).offset() as usize;
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
@@ -1061,27 +1070,25 @@ pub unsafe extern "C" fn osContInit_recomp(rdram: *mut u8, ctx: *mut RecompConte
 }
 
 /// `osContSetCh(u8 ch) -> s32` -- `a0`=`ctx->r4`. Public libultra manual:
-/// restricts subsequent controller-manager polling to the first `ch`
-/// channels. This crate's `PifModel` always reports the same fixed 4-port
-/// state regardless of channel count (`si.rs`'s module doc: "one standard
-/// controller on port 0... ports 1-3 absent" is not parameterized by a
-/// runtime channel-count setting) -- stored as plain host state for
-/// fidelity/logging, with no other behavioral effect, matching
-/// `osAiSetFrequency_recomp`'s existing "store it, no consumer needs it
-/// yet" pattern for an unconsumed configuration value. Function-table slot
-/// only (`recomp_overlays.inl:2958`), reached from `PadMgr_Init`.
+/// restricts subsequent controller-manager polling to ports `0..ch`. The
+/// manual also requires `osContInit` first: a premature call leaves the
+/// manager at its default `MAXCONTROLLERS`, and `ch` may not exceed four.
+/// This manager policy is separate from `PifModel`'s physical port state, so
+/// an explicit raw PIF packet can still address a channel outside the
+/// high-level polling prefix. The manual's approximate per-channel polling
+/// savings are not an exact cycle formula; `DeviceFabric` retains its explicit
+/// fixed SI compatibility latency, so timing parity for this selector remains
+/// unverified. Function-table slot only
+/// (`recomp_overlays.inl:2958`), reached from `PadMgr_Init`.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osContSetCh_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
-    CONT_CHANNELS.with(|cell| cell.set((ctx.r4 & 0xFF) as u8));
+    let channels = (ctx.r4 & 0xFF) as u8;
+    with_host(|host| host.controller_manager.set_channels(channels));
     ctx.r2 = 0;
-}
-
-thread_local! {
-    static CONT_CHANNELS: Cell<u8> = const { Cell::new(4) };
 }
 
 /// `osContStartQuery(OSMesgQueue *mq) -> s32` -- `a0`=`ctx->r4`. Public
@@ -1105,8 +1112,7 @@ pub unsafe extern "C" fn osContStartQuery_recomp(_rdram: *mut u8, ctx: *mut Reco
             kind: fn64_runtime::SiDmaKind::ControllerQuery,
             dram_addr: RdramAddr::from_offset(0),
         },
-        std::ptr::null_mut(),
-        0,
+        PendingSiCompletionOwner::OsEvent,
     ) {
         Ok(()) => 0,
         Err(DeviceFault::SiBusy) => u64::MAX,
@@ -1132,8 +1138,7 @@ pub unsafe extern "C" fn osContStartReadData_recomp(_rdram: *mut u8, ctx: *mut R
             kind: fn64_runtime::SiDmaKind::ControllerRead,
             dram_addr: RdramAddr::from_offset(0),
         },
-        std::ptr::null_mut(),
-        0,
+        PendingSiCompletionOwner::OsEvent,
     ) {
         Ok(()) => 0,
         Err(DeviceFault::SiBusy) => u64::MAX,
@@ -1302,6 +1307,120 @@ mod tests {
         unsafe { __osSiRawStartDma_recomp(rdram.as_mut_ptr(), &mut ctx) };
         assert_eq!(ctx.r2, 0);
         crate::advance_virtual_time(write_deadline + 1);
+    }
+
+    fn reset_controller_manager() {
+        with_executor(|exec| *exec = fn64_runtime::Executor::new());
+        with_host(|host| host.controller_manager = ControllerManagerState::default());
+    }
+
+    #[test]
+    fn os_cont_set_ch_limits_high_level_buffers_but_not_raw_channel_addressing() {
+        reset_controller_manager();
+        load_rom(vec![0; 0x100]);
+        set_controller_port_state(1, fn64_runtime::PortState::StandardControllerNoPak);
+        set_controller_state(1, 0x9000, -12, 34);
+
+        let mut rdram = vec![0xA5; 0x200];
+        let mut init = ctx_zeroed();
+        init.r5 = 0x8000_0010;
+        init.r6 = 0x8000_0020;
+        unsafe { osContInit_recomp(rdram.as_mut_ptr(), &mut init) };
+        assert_eq!(init.r2, 0);
+
+        let mut set_ch = ctx_zeroed();
+        set_ch.r4 = 1;
+        unsafe { osContSetCh_recomp(rdram.as_mut_ptr(), &mut set_ch) };
+        assert_eq!(set_ch.r2, 0);
+
+        rdram[0x40..0x50].fill(0xA5);
+        let mut query = ctx_zeroed();
+        query.r4 = 0x8000_0040;
+        unsafe { osContGetQuery_recomp(rdram.as_mut_ptr(), &mut query) };
+        assert!(rdram[0x40..0x44].iter().any(|&byte| byte != 0xA5));
+        assert_eq!(&rdram[0x44..0x50], &[0xA5; 12]);
+
+        rdram[0x60..0x78].fill(0xA5);
+        let mut read = ctx_zeroed();
+        read.r4 = 0x8000_0060;
+        unsafe { osContGetReadData_recomp(rdram.as_mut_ptr(), &mut read) };
+        let view = fn64_runtime::RdramView::from_storage(&rdram);
+        assert!(
+            (0..6).any(|offset| { view.read_u8(RdramAddr::from_offset(0x60 + offset)) != 0xA5 })
+        );
+        assert!(
+            (6..24).all(|offset| { view.read_u8(RdramAddr::from_offset(0x60 + offset)) == 0xA5 })
+        );
+
+        // A leading zero advances an explicit Joybus packet to port 1. The
+        // high-level manager's one-channel prefix must not hide that physical
+        // port from raw PIF authority.
+        let mut packet = [0u8; 64];
+        packet[0] = 0;
+        packet[1] = 1;
+        packet[2] = 4;
+        packet[3] = 0x01;
+        packet[8] = 0xFE;
+        crate::pi::with_pi_dma("raw port-1 read after osContSetCh(1)", |pi_dma| {
+            execute_controller_pif(Cycles::ZERO, &mut packet, pi_dma)
+        });
+        assert_eq!(&packet[4..8], &[0x90, 0x00, 0xF4, 0x22]);
+
+        assert_eq!(
+            crate::host_evidence_snapshot().controller_manager,
+            ControllerManagerEvidenceSnapshot {
+                initialized: true,
+                channels: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn controller_manager_enforces_initialization_and_one_time_init() {
+        reset_controller_manager();
+        let mut rdram = vec![0xA5; 0x100];
+
+        let mut set_before_init = ctx_zeroed();
+        set_before_init.r4 = 1;
+        unsafe { osContSetCh_recomp(rdram.as_mut_ptr(), &mut set_before_init) };
+        assert_eq!(
+            with_host(|host| host.controller_manager.evidence_snapshot()),
+            ControllerManagerEvidenceSnapshot {
+                initialized: false,
+                channels: 4,
+            }
+        );
+
+        let mut init = ctx_zeroed();
+        init.r5 = 0x8000_0010;
+        init.r6 = 0x8000_0020;
+        unsafe { osContInit_recomp(rdram.as_mut_ptr(), &mut init) };
+
+        let mut set_after_init = ctx_zeroed();
+        set_after_init.r4 = 1;
+        unsafe { osContSetCh_recomp(rdram.as_mut_ptr(), &mut set_after_init) };
+
+        rdram[0x40..0x60].fill(0x6B);
+        let mut repeated_init = ctx_zeroed();
+        repeated_init.r5 = 0x8000_0040;
+        repeated_init.r6 = 0x8000_0050;
+        unsafe { osContInit_recomp(rdram.as_mut_ptr(), &mut repeated_init) };
+        assert_eq!(&rdram[0x40..0x60], &[0x6B; 32]);
+        assert_eq!(
+            with_host(|host| host.controller_manager.evidence_snapshot()),
+            ControllerManagerEvidenceSnapshot {
+                initialized: true,
+                channels: 1,
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "osContSetCh: channel count 5 exceeds MAXCONTROLLERS (4)")]
+    fn controller_manager_traps_above_maxcontrollers() {
+        let mut manager = ControllerManagerState::default();
+        manager.initialize();
+        manager.set_channels(5);
     }
 
     /// Regression for the OoT-boot `PadSetup_Init` EXC_BAD_ACCESS: the real

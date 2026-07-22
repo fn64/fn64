@@ -88,7 +88,31 @@ requested target and Cause.BD clear: the fault is on the next fetch, after any
 branch delay instruction has retired. A fetch attempt consumes one
 deterministic dispatcher unit. When a branch/delay pair exactly exhausts its
 budget, execution checkpoints at the bad target and raises AdEL on the next
-dispatch rather than splitting the pair or exceeding the budget.
+dispatch rather than splitting the pair or exceeding the budget. Canonical
+32-bit mapped fetch now keeps that architectural virtual PC separate from
+`InstructionWordIdentity { BankId, physical_address }`. KSEG0/KSEG1 translate
+directly; KUSEG/KSSEG/KSEG3 use the recorded PageMask/ASID/global/V state.
+Physical code admission is indexed by the resulting PA, and a branch's slot VA
+is translated independently before either instruction executes, including at
+a page boundary whose two PFNs are nonadjacent. Generated AOT uses one bound
+straight or branch/slot unit so it cannot fall through to an unvalidated word;
+the interpreter builds the equivalent execution-local virtual view from the
+same PA-fetched words, including the canonical `0xffff_fffc -> 0` slot wrap
+without weakening ordinary non-wrapping code-span geometry. Refill and invalid
+faults retain the faulting VA plus
+precise EPC/BD and select the existing first-level/common exception vectors.
+This is the main `BlockProgram::run`/`dispatch` path: registering a physical
+generation makes its remaining entries use the mapped interpreter, while an
+exact registered `MappedAotBlock` replaces one entry under the same fetch seam.
+Canonical block-program evidence binds every physical span/word plus each
+mapped entry's exact `BankId`/PA sequence, preflight-expected words, and
+generated artifact identity; it does not hash native pointers or depend on
+registration order.
+Mapped-interpreter destination observations deliberately retain no generated
+runner artifact. They are operational and differential evidence only, and
+remain ineligible for fixed-cycle release evidence under report schema v22;
+artifact-identified mapped AOT observations carry their real artifact identity
+and are eligible; compatibility AOT without one is not.
 
 ## SPECIAL funct, bits 5:0
 
@@ -158,10 +182,11 @@ invalid, and modified exceptions with precise EPC/BD/BadVAddr. Exception entry
 updates Context.BadVPN2 and EntryHi.VPN2 while preserving PTEBase/ASID, then
 selects the 32-bit refill vector only for a first-level miss; invalid, modified,
 and nested misses use the common vector. KSEG0/KSEG1 remain direct. Multiple
-matches and unsupported PageMask encodings trap loudly. Instruction fetch,
-64-bit mapped spaces/XContext, privilege checks, and generated-lane translated
-physical device routing remain open rather than being silently direct-mapped. Doubleword moves
-and other registers likewise remain host-boundary traps. In the arbitrary-PC
+matches and unsupported PageMask encodings trap loudly. 64-bit mapped
+spaces/XContext, privilege checks beyond the kernel-mode slice, and
+generated-lane translated physical device routing remain open rather than
+being silently direct-mapped. Doubleword moves and other registers likewise
+remain host-boundary traps. In the arbitrary-PC
 bank lane, ERET selects ErrorEPC/ERL or EPC/EXL, clears the LL reservation, and
 returns a typed resolved transfer; the historical whole-function lane still
 traps because its callable ABI cannot return a transfer. BC0 uses a typed

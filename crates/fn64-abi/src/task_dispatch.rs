@@ -2449,7 +2449,7 @@ pub unsafe extern "C" fn osSpTaskLoad_recomp(rdram: *mut u8, ctx: *mut RecompCon
             header.ucode_size,
         );
     }
-    with_executor(|exec| exec.submit_task(header));
+    with_executor(|exec| exec.admit_task(header));
 }
 
 /// `osSpTaskStartGo(OSSpTask *sptask)` -- the actual RSP-kickoff half of
@@ -2536,6 +2536,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         None
     };
     retain_started_rsp_task_lineage(loaded, initial_microcode_data);
+    with_executor(|exec| exec.start_task(header));
 
     // Kicking the RSP is where the selected task effect runs, so the work
     // happens here -- this is the path OoT uses (Load then
@@ -3571,6 +3572,19 @@ mod tests {
             }
         }
         let prior_count = with_executor(|exec| exec.task_log().submissions().len());
+        crate::set_trace_enabled(true);
+        let prior_starts = crate::copy_trace()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    fn64_runtime::TraceKind::TaskSubmit {
+                        task_kind: fn64_runtime::TaskKind::Graphics,
+                        ucode,
+                    } if ucode == header.ucode
+                )
+            })
+            .count();
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + TASK_OFFSET as u64;
         unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
@@ -3598,6 +3612,22 @@ mod tests {
             assert_eq!(exec.task_log().submissions().len(), prior_count + 1);
             assert_eq!(exec.task_log().submissions().last(), Some(&header));
         });
+        assert_eq!(
+            crate::copy_trace()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        fn64_runtime::TraceKind::TaskSubmit {
+                            task_kind: fn64_runtime::TaskKind::Graphics,
+                            ucode,
+                        } if ucode == header.ucode
+                    )
+                })
+                .count(),
+            prior_starts,
+            "osSpTaskLoad admission cannot emit the StartGo-qualified TaskSubmit trace"
+        );
     }
 
     #[test]
@@ -5719,6 +5749,7 @@ mod tests {
         CALLED.store(false, Ordering::SeqCst);
         SEEN_OFFSET.store(0, Ordering::SeqCst);
         crate::load_rom(Vec::new());
+        crate::set_trace_enabled(true);
 
         let mut rdram = vec![0u8; 128];
         let header_off = 0x30usize;
@@ -5726,7 +5757,35 @@ mod tests {
 
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + header_off as u64;
+        let prior_starts = crate::copy_trace()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    fn64_runtime::TraceKind::TaskSubmit {
+                        task_kind: fn64_runtime::TaskKind::Audio,
+                        ..
+                    }
+                )
+            })
+            .count();
         admit_synthetic_hle_task(&mut rdram, header_off, &mut ctx);
+        assert_eq!(
+            crate::copy_trace()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        fn64_runtime::TraceKind::TaskSubmit {
+                            task_kind: fn64_runtime::TaskKind::Audio,
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            prior_starts,
+            "audio admission alone cannot claim task execution"
+        );
         unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx as *mut _) };
 
         assert!(
@@ -5737,6 +5796,22 @@ mod tests {
             SEEN_OFFSET.load(Ordering::SeqCst),
             header_off as u32,
             "ucode receives the OSTask rdram offset"
+        );
+        assert_eq!(
+            crate::copy_trace()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        fn64_runtime::TraceKind::TaskSubmit {
+                            task_kind: fn64_runtime::TaskKind::Audio,
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            prior_starts + 1,
+            "audio StartGo must emit exactly one execution-qualified task trace"
         );
         crate::advance_virtual_time(8);
     }
