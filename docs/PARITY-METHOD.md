@@ -71,9 +71,11 @@ The usable evidence stack is deliberately split:
   oracles for their named instruction families.
 - `lane-parity.sh --observe` compares end-to-end framebuffer bytes while
   labeling the legacy lane's missing-body defect.
-- Schema-v6 fixed-cycle device/framebuffer/audio/memory digests and the bound
-  zero-unsupported journal provide the release authority mechanism. No
-  representative full-ROM matrix has yet been populated, so no full-ROM
+- Schema-v21 fixed-cycle device/framebuffer/audio/memory digests,
+  boundary-owned observations, the compiled unsupported-instrumentation
+  identity, and the bound zero-unsupported journal provide the release
+  authority mechanism. The representative schema-v20 runs are historical and
+  have not been rerun under v21, so no current full-ROM
   zero-unsupported claim has been made.
 
 The residual limitation is exact: structural PC equality cannot detect a

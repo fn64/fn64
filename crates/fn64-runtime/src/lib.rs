@@ -106,7 +106,7 @@ pub use unsupported::{
     arm_unsupported_events, arm_unsupported_events_with_run_identity,
     complete_unsupported_observation, copy_unsupported_events, record_unsupported_event,
     unsupported_events_armed, unsupported_journal_error, UnsupportedDisposition, UnsupportedEvent,
-    UnsupportedSubsystem,
+    UnsupportedSubsystem, UNSUPPORTED_INSTRUMENTATION_SCHEMA, UNSUPPORTED_INSTRUMENTATION_SHA256,
 };
 pub use vi::{
     PendingViFade, RetraceSchedule, RetraceScheduleEvidenceSnapshot, ViEvidenceSnapshot, ViState,

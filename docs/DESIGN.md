@@ -273,15 +273,17 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain at least one individual recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Report schema
-`fn64.release-gate.v20` and the
+`fn64.release-gate.v21` and the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
 
 This mechanism makes a correctly formed production contract launchable; it is
 not representative-ROM evidence by itself. Representative private NTSC
-full-ROM exact-ten series for reference and RT64 LLE/post-VI completed and
-were reverified locally on 2026-07-21 after the backend-neutral F3DZEX2
-classifier replaced host/backend pair registration, closing this mechanism path for those
-two scenarios. The live
+full-ROM exact-ten series for reference and RT64 LLE/post-VI completed under
+schema v20 and were reverified locally on 2026-07-21 after the backend-neutral
+F3DZEX2 classifier replaced host/backend pair registration. Those retained
+runs are historical after report v21 made the observations boundary-owned and
+bound the unsupported-instrumentation identity; both scenarios require fresh
+v21 runs. The live
 synthetic runner test separately demonstrates direct-process orchestration and
 mechanism determinism during the observed test invocation only. Self-hashed
 receipts are retained integrity evidence, not transferable process
@@ -289,17 +291,17 @@ attestation, and the synthetic result cannot be promoted into private-ROM
 evidence.
 
 Representative matrix verification preserves the same capability boundary.
-Report-only matrix v5 verification never awards a ROM-class requirement from
+Report-only matrix v6 verification never awards a ROM-class requirement from
 the report's host-supplied label. Its private-series path accepts only an
 opaque capability produced by jointly revalidating the policy-admitted v3
 contract, exact-ten receipt, retained reports/journals, raw ROM, runner image,
-and bound inputs. It exact-matches the v20 semantic report and ordered run-event
+and bound inputs. It exact-matches the v21 semantic report and ordered run-event
 identities, and retains a canonical `fn64.verified-rom-class-authority.v1`
-inside verified-matrix v16. The retained
+inside verified-matrix v17. The retained
 self-hash proves canonical integrity, not signer identity or transferable
 process provenance.
 
-The local 2026-07-21 v5 assessment jointly revalidated both representative
+The historical local 2026-07-21 v5 assessment jointly revalidated both representative
 series as 20 reports and retained the full 162-requirement denominator. It
 satisfied 9 assignments and left 153 explicit; incomplete matrix verification
 did not discard or relabel the missing requirements.
@@ -438,7 +440,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v20 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v21 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -450,7 +452,7 @@ a contradictory backend label traps. Neither source can choose the digest or
 execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v20` binds it independently.
+clears it and report schema `fn64.release-gate.v21` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.

@@ -67,13 +67,17 @@
       "category": "microcode",
       "title": "L3DEX and L3DEX2 line microcodes",
       "exactness": "bounded_reference",
-      "behavior": "Legacy and modern public line envelopes normalize to typed width, ordered endpoints, clipping, texture/shade attributes, scissor, coverage, blender, and read-only depth behavior.",
+      "behavior": "Legacy and modern public line envelopes normalize to typed width, ordered endpoints, clipping, texture/shade attributes, scissor, coverage, blender, and read-only depth behavior. The shared eight-sample mask evaluates partial smooth shade, perspective texture coordinates, and Z at one typed covered checkerboard point while full coverage retains pixel center.",
       "evidence": [
         { "kind": "test", "path": "crates/fn64-render-reference/src/gbi.rs", "needle": "fn l3dex_and_l3dex2_public_line_forms_normalize_to_identical_raster_input" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn partial_line_shade_uses_the_shared_covered_attribute_sample" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn partial_line_texture_coordinates_use_the_shared_covered_attribute_sample" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn partial_line_depth_compare_uses_the_shared_sample_and_remains_read_only" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn full_coverage_line_attributes_remain_at_pixel_center" },
         { "kind": "doc", "path": "crates/fn64-render-reference/L3DEX-CONCEPTS.md", "needle": "## 4. Remaining fidelity frontier" }
       ],
       "blockers": [
-        { "kind": "hardware_trace", "detail": "Exact microcode transform rounding and silicon line-edge coefficient generation are unmeasured." },
+        { "kind": "hardware_trace", "detail": "Exact microcode transform rounding, silicon line-edge coefficient generation, representative-sample lookup, and correction arithmetic are unmeasured; the shared nearest-covered selector remains a bounded host policy." },
         { "kind": "full_rom", "detail": "No representative L3DEX/L3DEX2 ROM/task corpus demonstrates zero unsupported behavior." }
       ],
       "next_action": "Capture width/endpoint/subpixel edge vectors and add representative line-microcode task coverage."
@@ -276,7 +280,7 @@
       "category": "coverage",
       "title": "Eight-sample coverage and on-primitive attributes",
       "exactness": "bounded_reference",
-      "behavior": "Raw and high-level triangles retain the public eight-sample checkerboard mask through axis, shared-edge, scissor, preceding-scanline, and one-Q16-LSB boundary sweeps. Full masks evaluate attributes at pixel center; partial masks use one typed bounded-policy covered checkerboard point for shade, texture, and Z. The policy has one explicit total preference order and exhausts every nonzero mask plus every equal-distance tie subset. Strict raw-DPC analyzers preserve all 1,530 mask/cycle/independent-observable selector results and a producer-selected narrow-edge matrix of raw one-LSB-below/on/above accumulator values, exact declared mask/count, and independent shade/texture/depth observations without promoting synthetic fixtures to hardware evidence or encoding a correction formula.",
+      "behavior": "Raw and high-level triangles retain the public eight-sample checkerboard mask through axis, shared-edge, scissor, preceding-scanline, and one-Q16-LSB boundary sweeps; normalized lines retain the same identity through their footprint. Full masks evaluate attributes at pixel center; partial triangle and line masks use one typed bounded-policy covered checkerboard point for shade, texture, and Z. The policy has one explicit total preference order and exhausts every nonzero mask plus every equal-distance tie subset. Strict raw-DPC analyzers preserve all 1,530 mask/cycle/independent-observable selector results and a producer-selected narrow-edge matrix of raw one-LSB-below/on/above accumulator values, exact declared mask/count, and independent shade/texture/depth observations without promoting synthetic fixtures to hardware evidence or encoding a correction formula.",
       "evidence": [
         { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn raw_coverage_axis_aligned_boundaries_exhaustively_preserve_sample_identity" },
         { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn raw_coverage_q16_lsb_sweep_preserves_every_checkerboard_boundary" },
@@ -286,6 +290,10 @@
         { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn raw_and_high_level_partial_attributes_use_the_shared_covered_sample" },
         { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn raw_and_high_level_partial_texture_coordinates_use_the_shared_covered_sample" },
         { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn shared_edge_attribute_samples_stay_on_their_own_triangle" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn partial_line_shade_uses_the_shared_covered_attribute_sample" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn partial_line_texture_coordinates_use_the_shared_covered_attribute_sample" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn partial_line_depth_compare_uses_the_shared_sample_and_remains_read_only" },
+        { "kind": "test", "path": "crates/fn64-render-reference/src/raster.rs", "needle": "fn full_coverage_line_attributes_remain_at_pixel_center" },
         { "kind": "test", "path": "tools/rdp-silicon-vectors/tests/schema.rs", "needle": "fn representative_sample_analysis_is_deterministic_and_complete" },
         { "kind": "test", "path": "tools/rdp-silicon-vectors/tests/schema.rs", "needle": "fn narrow_edge_coverage_analysis_is_deterministic_complete_and_exact" },
         { "kind": "doc", "path": "docs/RDP-SILICON-VECTORS.md", "needle": "## Representative covered-sample selector sweep" },
@@ -489,7 +497,7 @@
       "category": "integration",
       "title": "Fixed-cycle full-ROM zero-unsupported evidence",
       "exactness": "missing",
-      "behavior": "Schema-v20 mechanism code binds all five fixed-cycle channels, complete observation geometry, environment, execution destinations, the ABI-owned microcode/IMEM/DPC stream, typed unsupported events, and fail-closed exact native Windows workstation build/UBR evidence. It additionally binds normalized ROM identity/class, destination-derived TV region, and exact agreement among ROM, device, and renderer TV authority. Private admission v7 and contract v3 bind class-specific ROM provenance, exact input/build/child identities, and runner-owned class propagation; retained v6 manifests remain read-only. The runner independently re-decodes the admitted ROM before accepting each report. Matrix v5 derives TV-region and existing runtime/render coverage from validated reports, while ROM-class credit requires an opaque verified-series capability that rechecks the contract, exact-ten receipt, retained files, raw ROM, and runner image. Concrete D3D12, Vulkan, or Metal identity remains bound to the authoritative post-VI capture. Representative private NTSC reference and RT64 LLE/post-VI exact-ten series completed and were reverified locally on 2026-07-21. Joint verification retained all 162 FullParityV1 requirements, satisfying 9 and leaving 153 explicit. Positive Windows evidence, RT64 platform-case/blocker results, allowed-source public-microcode identities, and the other representative scenarios remain missing.",
+      "behavior": "Schema-v21 mechanism code binds all five fixed-cycle channels, boundary-owned physical RDRAM/audio/traces, reference pixels checked against frozen memory, the compiled unsupported-instrumentation denominator, complete observation geometry, environment, execution destinations, the ABI-owned microcode/IMEM/DPC stream, and exact native Windows workstation build/UBR evidence. Private admission v7 and contract v3 bind class-specific ROM provenance and exact input/build/child identities. Historical schema-v20 private NTSC reference and RT64 exact-ten series completed on 2026-07-21 and satisfied 9 of 162 FullParityV1 requirements, but must be rerun under v21. Positive Windows evidence, RT64 platform-case/blocker results, allowed-source public-microcode identities, and the other representative scenarios remain missing.",
       "evidence": [
         { "kind": "doc", "path": "docs/RELEASE-GATE.md", "needle": "no representative full-ROM class has a" },
         { "kind": "test", "path": "crates/fn64-boot-harness/src/release_gate.rs", "needle": "fn device_evidence_wire_binds_executor_peripheral_and_manager_state" },
@@ -498,9 +506,9 @@
         { "kind": "doc", "path": "docs/PARITY-METHOD.md", "needle": "current measured observation matches through swap 60" }
       ],
       "blockers": [
-        { "kind": "full_rom", "detail": "Valid evidence produces an explicit incomplete assessment with canonical satisfied/missing FullParityV1 assignments; only all 162 requirements can produce a complete retained matrix. Schema v20 closes typed ROM identity, fixed TV-region reporting, and exact Windows host identity; ROM-class assignment requires an opaque verified-series capability whose contract, exact-ten receipt, output files, raw ROM, runner image, semantic report, and ordered event identities all agree. RT64 target-case assignment likewise requires an opaque exact-series capability bound to one report and its ordered matrix run events, and phase one exposes no production constructor for it. Representative private NTSC reference and RT64 LLE/post-VI exact-ten series completed and were reverified locally on 2026-07-21, but the certified-public-microcode catalog remains empty and positive Windows evidence, RT64 target cases, blocker closure, and the other scenario series remain missing. Native-archive identity does not repair the legacy C oracle's missing bodies, retained self-hashes are not external process attestation, and measured parity only reaches swap 60." }
+        { "kind": "full_rom", "detail": "Valid evidence produces an explicit incomplete assessment with canonical satisfied/missing FullParityV1 assignments; only all 162 requirements can produce a complete retained matrix. Schema v21 closes boundary ownership and unsupported-instrumentation identity in addition to v20's typed ROM/TV/Windows evidence. The historical private v20 series must be rerun. The certified-public-microcode catalog, positive Windows evidence, RT64 target cases, blocker closure, and other scenario series remain missing." }
       ],
-      "next_action": "Add allowed-source identities to a successor certified-public-microcode catalog, produce native Windows v20 evidence and production platform-case/blocker authorities, then populate private v5 manifests through the verified-series path with ten distinct schema-v20 report/journal pairs per scenario until the fixed profile reaches Complete."
+      "next_action": "Add allowed-source identities to a successor certified-public-microcode catalog, produce native Windows v21 evidence and production platform-case/blocker authorities, then populate private v5 manifests through the verified-series path with ten distinct schema-v21 report/journal pairs per scenario until the fixed profile reaches Complete."
     }
   ]
 }

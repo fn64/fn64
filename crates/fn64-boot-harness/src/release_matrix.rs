@@ -2,7 +2,7 @@
 //!
 //! The manifest contains only the immutable project profile and evidence
 //! identities, never ROM bytes, captured output, or caller-authored coverage.
-//! Dynamic evidence remains the schema-v20 report series; coverage is derived
+//! Dynamic evidence remains the schema-v21 report series; coverage is derived
 //! from each validated report before it is compared with the fixed profile.
 
 use crate::platform_certification::{
@@ -28,8 +28,8 @@ use std::{
 };
 
 pub const RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix.v5";
-pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v16";
-pub const INCOMPLETE_RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix-incomplete.v5";
+pub const VERIFIED_RELEASE_MATRIX_SCHEMA: &str = "fn64.verified-release-matrix.v17";
+pub const INCOMPLETE_RELEASE_MATRIX_SCHEMA: &str = "fn64.release-matrix-incomplete.v6";
 pub const VERIFIED_ROM_CLASS_AUTHORITY_SCHEMA: &str = "fn64.verified-rom-class-authority.v1";
 pub const RELEASE_MATRIX_REPORT_COUNT: usize = 10;
 pub const RELEASE_MATRIX_MAX_SCENARIOS: usize = 64;
@@ -304,7 +304,7 @@ pub struct ReleaseMatrixScenario {
     /// Stable diagnostic key. Evidence is associated by `report_scenario`, not
     /// by a caller-provided command-line assignment.
     pub id: String,
-    /// Exact scenario string bound by every schema-v20 report in this series.
+    /// Exact scenario string bound by every schema-v21 report in this series.
     pub report_scenario: String,
     /// Exact private-input identity bound by every report; no input bytes are stored.
     pub input_sha256: String,
@@ -385,12 +385,13 @@ pub struct VerifiedMatrixScenario {
     pub environment: ReleaseEnvironmentEvidence,
     pub closure_paths: u64,
     /// Exact destination sequence and canonical unique/count summary retained
-    /// from the verified v20 series.
+    /// from the verified v21 series.
     pub execution_destinations: ExecutionDestinationEvidence,
-    /// Complete schema-v20 RSP/RDP observation stream retained for independent
+    /// Complete schema-v21 RSP/RDP observation stream retained for independent
     /// report reconstruction and coverage derivation.
     pub rsp_rdp: RspRdpEvidence,
-    /// Exact canonical closure ledger retained from the verified v20 series.
+    pub unsupported_instrumentation: crate::UnsupportedInstrumentationEvidence,
+    /// Exact canonical closure ledger retained from the verified v21 series.
     /// A count alone cannot prove which feature-specific operation paths ran.
     pub closure: Vec<ClosurePath>,
     pub unsupported_events: u64,
@@ -435,6 +436,7 @@ pub struct IncompleteReleaseMatrix {
     pub profile: CertificationProfileIdentity,
     pub verified_scenarios: usize,
     pub verified_reports: usize,
+    pub unsupported_instrumentation: crate::UnsupportedInstrumentationEvidence,
     pub platform_case_authorities: Vec<VerifiedRt64PlatformCaseAuthority>,
     pub satisfied: Vec<CertificationRequirementAssignment>,
     pub missing: Vec<CertificationRequirementRef>,
@@ -459,6 +461,9 @@ impl IncompleteReleaseMatrix {
             .profile
             .verify()
             .map_err(ReleaseMatrixError::InvalidCertificationProfile)?;
+        self.unsupported_instrumentation
+            .verify_current()
+            .map_err(ReleaseMatrixError::InvalidUnsupportedInstrumentation)?;
         validate_sha256(
             "incomplete-matrix",
             "manifest_sha256",
@@ -577,6 +582,10 @@ impl VerifiedReleaseMatrix {
             ArtifactKind::TimingTrace,
         ]);
         for scenario in &self.scenarios {
+            scenario
+                .unsupported_instrumentation
+                .verify_current()
+                .map_err(ReleaseMatrixError::InvalidUnsupportedInstrumentation)?;
             validate_id(&scenario.id)?;
             if !ids.insert(scenario.id.clone()) {
                 return Err(ReleaseMatrixError::DuplicateScenarioId(scenario.id.clone()));
@@ -774,6 +783,7 @@ impl VerifiedReleaseMatrix {
                 environment: scenario.environment.clone(),
                 execution_destinations: scenario.execution_destinations.clone(),
                 rsp_rdp: scenario.rsp_rdp.clone(),
+                unsupported_instrumentation: scenario.unsupported_instrumentation.clone(),
                 closure: scenario.closure.clone(),
                 report_sha256: scenario.report_sha256.clone(),
             };
@@ -1066,7 +1076,7 @@ fn verify_release_matrix_with_authorities(
         let series = verify_release_evidence_series(evidence, RELEASE_MATRIX_REPORT_COUNT)
             .map_err(|source| ReleaseMatrixError::InvalidSeries {
                 id: scenario.id.clone(),
-                source,
+                source: Box::new(source),
             })?;
         for run_event_sha256 in &series.run_event_sha256s {
             if !matrix_run_events.insert(run_event_sha256.clone()) {
@@ -1137,6 +1147,7 @@ fn verify_release_matrix_with_authorities(
             environment: reports[0].environment.clone(),
             execution_destinations: reports[0].execution_destinations.clone(),
             rsp_rdp: reports[0].rsp_rdp.clone(),
+            unsupported_instrumentation: reports[0].unsupported_instrumentation.clone(),
             closure_paths: reports[0].closure.len() as u64,
             closure: reports[0].closure.clone(),
             unsupported_events: reports[0]
@@ -1165,6 +1176,10 @@ fn verify_release_matrix_with_authorities(
             profile: manifest.profile.clone(),
             verified_scenarios: verified.len(),
             verified_reports: total_reports,
+            unsupported_instrumentation: crate::UnsupportedInstrumentationEvidence {
+                schema: fn64_runtime::UNSUPPORTED_INSTRUMENTATION_SCHEMA.to_owned(),
+                sha256: hex(&fn64_runtime::UNSUPPORTED_INSTRUMENTATION_SHA256),
+            },
             platform_case_authorities: retained_platform_authorities,
             satisfied: assignments,
             missing,
@@ -2379,13 +2394,21 @@ fn push_platform_authority_identities(
 
 fn incomplete_matrix_sha256(report: &IncompleteReleaseMatrix) -> String {
     let mut wire = Vec::new();
-    wire.extend_from_slice(b"fn64.release-matrix-incomplete.v5\0");
+    wire.extend_from_slice(b"fn64.release-matrix-incomplete.v6\0");
     push_bytes(&mut wire, report.schema.as_bytes());
     push_bytes(&mut wire, report.manifest_sha256.as_bytes());
     push_bytes(&mut wire, report.profile.schema.as_bytes());
     push_bytes(&mut wire, report.profile.definition_sha256.as_bytes());
     wire.extend_from_slice(&(report.verified_scenarios as u64).to_be_bytes());
     wire.extend_from_slice(&(report.verified_reports as u64).to_be_bytes());
+    push_bytes(
+        &mut wire,
+        report.unsupported_instrumentation.schema.as_bytes(),
+    );
+    push_bytes(
+        &mut wire,
+        report.unsupported_instrumentation.sha256.as_bytes(),
+    );
     push_platform_authority_identities(&mut wire, &report.platform_case_authorities);
     wire.extend_from_slice(&(report.satisfied.len() as u32).to_be_bytes());
     for assignment in &report.satisfied {
@@ -2401,7 +2424,7 @@ fn incomplete_matrix_sha256(report: &IncompleteReleaseMatrix) -> String {
 
 fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
     let mut wire = Vec::new();
-    wire.extend_from_slice(b"fn64.verified-release-matrix.v16\0");
+    wire.extend_from_slice(b"fn64.verified-release-matrix.v17\0");
     push_bytes(&mut wire, report.schema.as_bytes());
     push_bytes(&mut wire, report.manifest_sha256.as_bytes());
     push_bytes(&mut wire, report.profile.schema.as_bytes());
@@ -2418,6 +2441,14 @@ fn verified_matrix_sha256(report: &VerifiedReleaseMatrix) -> String {
         push_bytes(&mut wire, scenario.report_sha256.as_bytes());
         push_bytes(&mut wire, scenario.report_scenario.as_bytes());
         push_bytes(&mut wire, scenario.input_sha256.as_bytes());
+        push_bytes(
+            &mut wire,
+            scenario.unsupported_instrumentation.schema.as_bytes(),
+        );
+        push_bytes(
+            &mut wire,
+            scenario.unsupported_instrumentation.sha256.as_bytes(),
+        );
         push_rom_evidence(&mut wire, &scenario.rom);
         push_rom_class_authority(&mut wire, &scenario.rom_class_authority);
         push_tags(&mut wire, &scenario.coverage.rom_classes, rom_class_tag);
@@ -2797,6 +2828,7 @@ pub enum ReleaseMatrixError {
     UnsupportedVerifiedSchema(String),
     UnsupportedIncompleteSchema(String),
     InvalidCertificationProfile(crate::CertificationProfileError),
+    InvalidUnsupportedInstrumentation(crate::GateError),
     InvalidUnassignedReport {
         scenario: String,
         source: crate::GateError,
@@ -3045,7 +3077,7 @@ pub enum ReleaseMatrixError {
     },
     InvalidSeries {
         id: String,
-        source: ReportSeriesError,
+        source: Box<ReportSeriesError>,
     },
     InvalidLivePathEvidence {
         id: String,
@@ -3090,6 +3122,7 @@ impl fmt::Display for ReleaseMatrixError {
             Self::UnsupportedVerifiedSchema(schema) => write!(f, "unsupported verified release-matrix schema {schema:?}"),
             Self::UnsupportedIncompleteSchema(schema) => write!(f, "unsupported incomplete release-matrix schema {schema:?}"),
             Self::InvalidCertificationProfile(source) => write!(f, "invalid certification profile: {source}"),
+            Self::InvalidUnsupportedInstrumentation(source) => write!(f, "invalid unsupported-instrumentation identity: {source}"),
             Self::InvalidUnassignedReport { scenario, source } => write!(f, "release report scenario {scenario:?} is invalid before matrix assignment: {source}"),
             Self::InvalidPrivateSeriesAuthority { source } => write!(f, "private release series authority failed fresh revalidation: {source}"),
             Self::InvalidPlatformSeriesAuthority { source } => write!(f, "RT64 platform-case series authority failed fresh revalidation: {source}"),
@@ -3170,10 +3203,11 @@ impl std::error::Error for ReleaseMatrixError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidCertificationProfile(source) => Some(source),
+            Self::InvalidUnsupportedInstrumentation(source) => Some(source),
             Self::InvalidUnassignedReport { source, .. } => Some(source),
             Self::InvalidPrivateSeriesAuthority { source } => Some(source),
             Self::InvalidPlatformSeriesAuthority { source } => Some(source),
-            Self::InvalidSeries { source, .. } => Some(source),
+            Self::InvalidSeries { source, .. } => Some(source.as_ref()),
             Self::InvalidVerifiedObservations { source, .. } => Some(source),
             Self::InvalidVerifiedDigest { source, .. } => Some(source),
             Self::InvalidVerifiedReport { source, .. } => Some(source),
@@ -4872,7 +4906,7 @@ mod tests {
                 assignment.requirement.class() == CertificationRequirementClass::PlatformApiTarget
                     && assignment.requirement.id() == "macos-metal"
             })
-            .expect("the validated v20 report earns its exact platform/API row");
+            .expect("the validated v21 report earns its exact platform/API row");
         assert_eq!(
             platform_assignment.evidence_sha256s,
             [manifest.scenarios[0].declaration_sha256.clone()]
@@ -5124,18 +5158,18 @@ mod tests {
     }
 
     #[test]
-    fn stale_verified_v15_and_incomplete_v4_schemas_are_rejected() {
+    fn stale_verified_v16_and_incomplete_v5_schemas_are_rejected() {
         let (_, _, incomplete) = incomplete_fixture();
         let mut stale_incomplete = incomplete;
-        stale_incomplete.schema = "fn64.release-matrix-incomplete.v4".to_owned();
+        stale_incomplete.schema = "fn64.release-matrix-incomplete.v5".to_owned();
         assert!(matches!(
             stale_incomplete.verify_integrity(),
             Err(ReleaseMatrixError::UnsupportedIncompleteSchema(schema))
-                if schema == "fn64.release-matrix-incomplete.v4"
+                if schema == "fn64.release-matrix-incomplete.v5"
         ));
 
         let stale_verified = VerifiedReleaseMatrix {
-            schema: "fn64.verified-release-matrix.v15".to_owned(),
+            schema: "fn64.verified-release-matrix.v16".to_owned(),
             manifest_sha256: "00".repeat(32),
             profile: CertificationProfileIdentity::full_parity_v1(),
             total_reports: 0,
@@ -5147,7 +5181,7 @@ mod tests {
         assert!(matches!(
             stale_verified.verify_integrity(),
             Err(ReleaseMatrixError::UnsupportedVerifiedSchema(schema))
-                if schema == "fn64.verified-release-matrix.v15"
+                if schema == "fn64.verified-release-matrix.v16"
         ));
     }
 
@@ -5336,6 +5370,15 @@ mod tests {
     #[test]
     fn incomplete_integrity_rejects_cross_class_duplicates_partition_and_hash_tampering() {
         let (_, _, baseline) = incomplete_fixture();
+
+        let mut instrumentation_drift = baseline.clone();
+        instrumentation_drift.unsupported_instrumentation.schema =
+            "fn64.unsupported-instrumentation.future".to_owned();
+        instrumentation_drift.assessment_sha256 = incomplete_matrix_sha256(&instrumentation_drift);
+        assert!(matches!(
+            instrumentation_drift.verify_integrity(),
+            Err(ReleaseMatrixError::InvalidUnsupportedInstrumentation(_))
+        ));
 
         let mut cross_class = baseline.clone();
         cross_class.missing[0] =

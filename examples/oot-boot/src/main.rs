@@ -1486,12 +1486,6 @@ fn capture_release_report(
     rdram: &[u8],
 ) -> fn64_boot_harness::ReleaseGateReport {
     let observed_cycle = fn64_abi::sim_time();
-    let memory = fn64_boot_harness::LiveMemoryEvidence::full_physical_rdram(logical_rdram_bytes(
-        rdram,
-        0,
-        fn64_boot_harness::DEFAULT_RDRAM_SIZE,
-    ))
-    .unwrap_or_else(|error| panic!("oot-boot: validate complete physical RDRAM: {error}"));
     let region_token = release_scenario_region_token(tv_type);
     #[cfg(fn64_recomp_rs)]
     let release_scenario =
@@ -1540,7 +1534,6 @@ fn capture_release_report(
             release_scenario,
             fn64_boot_harness::ReleaseRomInput::new(rom_class, rom_bytes),
             &render,
-            &memory,
             report_path,
         )
     } else {
@@ -1562,7 +1555,6 @@ fn capture_release_report(
             release_scenario,
             fn64_boot_harness::ReleaseRomInput::new(rom_class, rom_bytes),
             &framebuffer,
-            &memory,
             report_path,
         )
     }

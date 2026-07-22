@@ -4,8 +4,8 @@
 use fn64_boot_harness::NativeProgramArtifactIdentity;
 use fn64_boot_harness::{
     commit_scheduled_vi_boundary_with_program, parse_unsupported_journal,
-    verify_release_report_journal, LiveMemoryEvidence, LiveReferenceFramebufferEvidence,
-    LiveReleaseGate, LiveReleaseGateObservationExt as _, ReleaseProgramDescriptor,
+    verify_release_report_journal, LiveReferenceFramebufferEvidence, LiveReleaseGate,
+    LiveReleaseGateObservationExt as _, ReleaseProgramDescriptor,
     REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES,
 };
 use fn64_render::{
@@ -186,19 +186,22 @@ fn run_invocation(invocation: ReleaseInvocation) -> Result<(), Box<dyn Error>> {
     if let Some(error) = fn64_abi::last_render_error() {
         return Err(io::Error::other(format!("registered render path failed: {error}")).into());
     }
+    let mut framebuffer_bytes = vec![0; WIDTH * HEIGHT * 2];
+    fn64_runtime::RdramView::from_storage(&rdram).copy_logical_bytes(
+        fn64_runtime::RdramAddr::from_offset(FRAMEBUFFER as u32),
+        &mut framebuffer_bytes,
+    );
     let framebuffer = LiveReferenceFramebufferEvidence::rgba16(
         FRAMEBUFFER as u32,
         WIDTH as u32,
         HEIGHT as u32,
-        rdram[FRAMEBUFFER..FRAMEBUFFER + WIDTH * HEIGHT * 2].to_vec(),
+        framebuffer_bytes,
     )?;
-    let memory = LiveMemoryEvidence::full_physical_rdram(rdram[..RDRAM_LEN].to_vec())?;
     let report = gate.capture_and_write_reference_evidence(
         boundary,
         scenario,
         REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES,
         &framebuffer,
-        &memory,
         &report_path,
     )?;
 

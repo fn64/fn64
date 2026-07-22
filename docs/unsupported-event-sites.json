@@ -65,6 +65,20 @@
       "trigger": "Transfer Pak write uses unsupported accessory address"
     },
     {
+      "operation": "runtime.transfer-pak.battery-metadata-version",
+      "subsystem": "runtime",
+      "disposition": "returned_error",
+      "path": "crates/fn64-runtime/src/transfer_pak.rs",
+      "trigger": "MBC3 battery metadata version {version} is unsupported"
+    },
+    {
+      "operation": "runtime.transfer-pak.cartridge-type",
+      "subsystem": "runtime",
+      "disposition": "returned_error",
+      "path": "crates/fn64-runtime/src/transfer_pak.rs",
+      "trigger": "Game Boy cartridge type {other:#04x} is unsupported"
+    },
+    {
       "operation": "abi.generated-c-mmio.bad-width",
       "subsystem": "abi",
       "disposition": "loud_trap",
@@ -147,6 +161,13 @@
       "disposition": "returned_error",
       "path": "crates/fn64-render/src/geometry_task_inspection.rs",
       "trigger": "inspector={INSPECTOR}; reason={reason}"
+    },
+    {
+      "operation": "render.backend.unsupported-ucode",
+      "subsystem": "render",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-abi/src/task_dispatch.rs",
+      "trigger": "backend rejected unlisted microcode at RDRAM offset"
     },
     {
       "operation": "render.hle-ucode.needs-lle",

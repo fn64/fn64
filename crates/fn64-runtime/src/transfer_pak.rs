@@ -78,6 +78,15 @@ impl Mbc3BatteryMetadata {
         }
         let version = u16::from_be_bytes([bytes[8], bytes[9]]);
         if version != MBC3_BATTERY_VERSION {
+            crate::record_unsupported_event(
+                crate::UnsupportedSubsystem::Runtime,
+                "runtime.transfer-pak.battery-metadata-version",
+                format!(
+                    "MBC3 battery metadata version {version} is unsupported; expected {MBC3_BATTERY_VERSION}"
+                ),
+                None,
+                crate::UnsupportedDisposition::ReturnedError,
+            );
             return Err(Mbc3BatteryMetadataError::UnsupportedVersion(version));
         }
         let declared_len = usize::from(u16::from_be_bytes([bytes[10], bytes[11]]));
@@ -781,7 +790,16 @@ impl GameBoyCartridge {
                 ram_bank: 0,
                 rumble_variant: matches!(cartridge_type, 0x1c..=0x1e),
             },
-            other => return Err(TransferPakError::UnsupportedCartridgeType(other)),
+            other => {
+                crate::record_unsupported_event(
+                    crate::UnsupportedSubsystem::Runtime,
+                    "runtime.transfer-pak.cartridge-type",
+                    format!("Game Boy cartridge type {other:#04x} is unsupported"),
+                    None,
+                    crate::UnsupportedDisposition::ReturnedError,
+                );
+                return Err(TransferPakError::UnsupportedCartridgeType(other));
+            }
         };
         let expected_ram = if matches!(cartridge_type, 0x05 | 0x06) {
             512
@@ -1616,5 +1634,41 @@ mod tests {
                 actual: 8
             }
         );
+    }
+
+    #[test]
+    fn typed_unsupported_input_errors_enter_the_armed_event_source() {
+        crate::arm_unsupported_events(None).unwrap();
+
+        let mut future_metadata = [0; MBC3_BATTERY_METADATA_LEN];
+        future_metadata[..8].copy_from_slice(&MBC3_BATTERY_MAGIC);
+        future_metadata[8..10].copy_from_slice(&2_u16.to_be_bytes());
+        assert_eq!(
+            Mbc3BatteryMetadata::decode(&future_metadata).unwrap_err(),
+            Mbc3BatteryMetadataError::UnsupportedVersion(2)
+        );
+        assert_eq!(
+            GameBoyCartridge::new(rom(0xfc, 2, 0), None).unwrap_err(),
+            TransferPakError::UnsupportedCartridgeType(0xfc)
+        );
+
+        let events = crate::copy_unsupported_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].operation,
+            "runtime.transfer-pak.battery-metadata-version"
+        );
+        assert_eq!(events[0].guest_cycle, None);
+        assert_eq!(
+            events[0].disposition,
+            crate::UnsupportedDisposition::ReturnedError
+        );
+        assert_eq!(events[1].operation, "runtime.transfer-pak.cartridge-type");
+        assert_eq!(events[1].guest_cycle, None);
+        assert_eq!(
+            events[1].disposition,
+            crate::UnsupportedDisposition::ReturnedError
+        );
+        crate::complete_unsupported_observation(Cycles::ZERO, &"0".repeat(64));
     }
 }
