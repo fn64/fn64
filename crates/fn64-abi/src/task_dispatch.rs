@@ -632,8 +632,9 @@ unsafe fn task_microcode_data_identity(
 fn identify_microcode_pair(
     imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
     data: TaskMicrocodeDataIdentity,
+    authoritative_family: Option<fn64_render::UcodeId>,
 ) -> Option<fn64_render::UcodeId> {
-    with_render_backend("identify_microcode_pair", |backend| {
+    let backend_family = with_render_backend("identify_microcode_pair", |backend| {
         Ok(backend.identify_microcode_pair(
             imem,
             fn64_render::MicrocodeDataImageIdentity {
@@ -641,7 +642,36 @@ fn identify_microcode_pair(
                 sha256: data.sha256,
             },
         ))
-    })
+    });
+    match (authoritative_family, backend_family) {
+        (Some(authoritative), Some(backend)) if authoritative != backend => {
+            panic!(
+                "pinned microcode classifier identified {authoritative:?}, but the backend pair catalog claimed {backend:?}"
+            )
+        }
+        (Some(authoritative), _) => Some(authoritative),
+        (None, backend) => backend,
+    }
+}
+
+/// Classify the immutable task-entry raw text/data storage through the pinned
+/// MIT RT64 identity table. This does not admit HLE; it prevents a backend or
+/// private pair declaration from choosing the family written to LLE evidence.
+///
+/// # Safety
+/// `rdram` must be the registered process allocation.
+unsafe fn classify_task_microcode_family(
+    rdram: *mut u8,
+    header: &OsTaskHeader,
+) -> Option<fn64_render::UcodeId> {
+    let storage = unsafe { renderer_rdram_slice(rdram) };
+    let window = fn64_render::capture_task_admission_raw_window(
+        storage,
+        RdramAddr::from_offset(header.ucode & 0x00ff_ffff),
+        RdramAddr::from_offset(header.ucode_data & 0x00ff_ffff),
+        fn64_render::F3DZEX2_RAW_WINDOW_SIZE,
+    )?;
+    fn64_render::identify_f3dzex2(&window).map(fn64_render::F3dzex2Variant::family)
 }
 
 fn canonical_rdp_words_sha256(words: &[u32]) -> [u8; 32] {
@@ -922,6 +952,7 @@ unsafe fn dispatch_lle_task(
     recognize_graphics_microcode: bool,
     machine_state: Option<fn64_audio::rsp::runtime::RspMachineState>,
     microcode_data: Option<TaskMicrocodeDataIdentity>,
+    authoritative_family: Option<fn64_render::UcodeId>,
 ) -> LleTaskResult {
     const CHUNK_STEPS: u64 = 1 << 20;
     const MAX_TASK_STEPS: u64 = 1 << 26;
@@ -1078,7 +1109,7 @@ unsafe fn dispatch_lle_task(
             data_addr: data.addr,
             data_size: data.size,
             data_sha256: data.sha256,
-            family: identify_microcode_pair(&initial_imem, data),
+            family: identify_microcode_pair(&initial_imem, data, authoritative_family),
         });
     }
     for replacement in replacements {
@@ -1095,7 +1126,7 @@ unsafe fn dispatch_lle_task(
                 data_addr: data.addr,
                 data_size: data.size,
                 data_sha256: data.sha256,
-                family: identify_microcode_pair(&replacement.image, data),
+                family: identify_microcode_pair(&replacement.image, data, authoritative_family),
             });
         }
     }
@@ -2458,6 +2489,26 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     let o = task_addr.offset() as usize;
     let header = loaded.header;
     let is_gfx = header.task_type == M_GFXTASK;
+    let recognition_header = if header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
+        with_host(|host| {
+            host.rsp_task_lineages
+                .get(&task_addr.offset())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "osSpTaskStartGo_recomp: yielded RSP task {:#010x} lost its original microcode identity header",
+                        task_addr.offset()
+                    )
+                })
+                .original_header
+        })
+    } else {
+        header
+    };
+    let authoritative_microcode_family = if is_gfx {
+        unsafe { classify_task_microcode_family(rdram, &recognition_header) }
+    } else {
+        None
+    };
     // Hash fresh task data at the actual kickoff boundary using only the
     // address/size admitted by Load. A yielded token owns the original
     // identity directly and never hashes its rewritten yield buffer.
@@ -2520,6 +2571,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                 true,
                 entry.into_lle_machine_state(),
                 Some(microcode_data),
+                authoritative_microcode_family,
             )
         };
         crate::pi::start_live_rcp_task_with_latency(
@@ -2646,6 +2698,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                         true,
                         entry.into_lle_machine_state(),
                         Some(microcode_data),
+                        authoritative_microcode_family,
                     )
                 };
                 crate::pi::start_live_rcp_task_with_latency(
@@ -2663,7 +2716,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         unsafe { dispatch_audio_task(rdram, o, &hle_header) };
         fn64_render::DpFullSyncStatus::NotReached
     } else {
-        let lle = unsafe { dispatch_lle_task(rdram, task_addr, false, None, None) };
+        let lle = unsafe { dispatch_lle_task(rdram, task_addr, false, None, None, None) };
         crate::pi::start_live_rcp_task_with_latency(
             rcp_completion_plan(lle.dp_full_sync, "custom-task LLE"),
             lle.steps,
@@ -4052,9 +4105,45 @@ mod tests {
                     size: 3,
                     sha256: Sha256::digest([1, 2, 3]).into(),
                 },
+                None,
             ),
             None
         );
+    }
+
+    #[test]
+    fn pinned_family_authority_fills_absent_backend_identity_and_rejects_conflict() {
+        let imem = [0x5a; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let data = TaskMicrocodeDataIdentity {
+            addr: RdramAddr::from_offset(0x100),
+            size: 3,
+            sha256: Sha256::digest([1, 2, 3]).into(),
+        };
+        set_render_backend(
+            Box::new(StatusRenderBackend(FrameStatus::Complete)),
+            fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        );
+        assert_eq!(
+            identify_microcode_pair(&imem, data, Some(UcodeId::F3dzex2)),
+            Some(UcodeId::F3dzex2)
+        );
+
+        set_render_backend(
+            Box::new(ExactIdentityBackend {
+                admitted: imem,
+                admitted_data: fn64_render::MicrocodeDataImageIdentity {
+                    bytes: data.size,
+                    sha256: data.sha256,
+                },
+                family: UcodeId::F3dex2,
+            }),
+            fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        );
+        let panic = std::panic::catch_unwind(|| {
+            identify_microcode_pair(&imem, data, Some(UcodeId::F3dzex2))
+        })
+        .unwrap_err();
+        assert!(panic_message(panic.as_ref()).contains("backend pair catalog claimed F3dex2"));
     }
 
     #[test]
@@ -4103,7 +4192,7 @@ mod tests {
                     bytes: 0,
                     sha256: Sha256::digest([]).into(),
                 },
-                family: UcodeId::F3dex2,
+                family: UcodeId::F3dzex2,
             }),
             rdram.len(),
             GraphicsTaskExecutionPolicy::LleAccuracy,
@@ -4122,7 +4211,7 @@ mod tests {
                     data_addr: RdramAddr::from_offset(0),
                     data_size: 0,
                     data_sha256: Sha256::digest([]).into(),
-                    family: Some(UcodeId::F3dex2),
+                    family: Some(UcodeId::F3dzex2),
                 },
             }]
         );
@@ -4491,6 +4580,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
             )
         };
 
@@ -4692,6 +4782,7 @@ mod tests {
                 true,
                 None,
                 Some(microcode_data),
+                None,
             )
         };
 

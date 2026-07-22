@@ -34,6 +34,7 @@
 
 mod geometry_task_inspection;
 mod microcode;
+mod microcode_identity;
 mod rdp_completion;
 mod settings;
 pub mod vi_public_filters;
@@ -49,6 +50,10 @@ pub use microcode::{
     F3dex2UcodeCatalog, GeometryUcodeCatalog, GeometryWireFamily, MicrocodePairCatalog,
     S2dexUcodeCatalog, S2dexWireFamily, TaskAdmissionGeneration, TaskAdmissionPlan,
     TaskAdmissionSource, UcodeDigest,
+};
+pub use microcode_identity::{
+    capture_task_admission_raw_window, identify_f3dzex2, F3dzex2Variant, F3DZEX2_IDENTITY_SOURCE,
+    F3DZEX2_RAW_WINDOW_SIZE,
 };
 pub use rdp_completion::{inspect_raw_rdp_full_sync, raw_rdp_command_width};
 pub use settings::{
@@ -129,9 +134,9 @@ pub enum UcodeId {
     /// Public F3DLX2.Rej variant: 64 vertices and reject-box processing,
     /// without subpixel vertex calculations.
     F3dlx2Rej,
-    /// Known game-era F3DZEX2 identity. Public/allowed materials do not
-    /// specify its family-specific command envelope, so HLE admission is
-    /// intentionally unavailable.
+    /// Known game-era F3DZEX2 identity. Pinned MIT RT64 supplies software
+    /// parity identity and BranchW behavior, but public Nintendo materials do
+    /// not specify the family-specific envelope; HLE remains unavailable.
     F3dzex2,
     /// Original S2DEX family using the F3DEX_GBI command layout.
     S2dex,

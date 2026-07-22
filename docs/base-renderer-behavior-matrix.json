@@ -107,6 +107,7 @@
         { "kind": "test", "path": "crates/fn64-abi/src/task_dispatch.rs", "needle": "fn graphics_hle_unsupported_fallback_records_then_replays_untouched_ucode_through_lle" },
         { "kind": "test", "path": "crates/fn64-abi/src/task_dispatch.rs", "needle": "fn graphics_lle_accuracy_policy_forwards_raw_dpc_without_hle_dispatch" },
         { "kind": "test", "path": "crates/fn64-abi/src/task_dispatch.rs", "needle": "fn direct_imem_graphics_task_starts_lle_at_pc_zero_without_rspboot_overlay" },
+        { "kind": "test", "path": "crates/fn64-render/src/microcode.rs", "needle": "fn exact_pair_may_retain_f3dzex2_diagnostic_identity_without_hle_admission" },
         { "kind": "doc", "path": "crates/fn64-audio/RSP-ISA-COVERAGE.md", "needle": "The instruction-level model is therefore manual-complete." },
         { "kind": "doc", "path": "crates/fn64-render-reference/F3DEX2-VARIANTS.md", "needle": "## 4. F3DZEX2 remains an explicit unsupported identity" },
         { "kind": "doc", "path": "docs/RT64-GAP-REGISTER.md", "needle": "Rej / line (L3DEX2) / Wave microcodes" }

@@ -480,8 +480,11 @@ input and the stage before each spawn and after the series, and verifies each
 report/journal pair before launching the next child. Production contracts also
 produce separate create-new, read-only stages for the admitted microcode text
 and data. The runner injects only those paths through reserved release
-variables, revalidates both stages at every child boundary, and the OoT host
-registers the exact pair with whichever release backend it selected. It then
+variables and revalidates both stages at every child boundary. The OoT host
+opens and shape-checks them, while the ABI independently identifies F3DZEX2
+from pinned RT64's larger raw text/data XXH3 prefixes at the live task
+boundary. That software-parity identity is neither HLE nor public-family
+credit. The runner then
 writes one create-new, flushed and file-synced
 `fn64.private-release-series-receipt.v1` binding the exact contract, runner and
 child entry images, ten event/file/report identities, and the common semantic
@@ -530,12 +533,12 @@ typed-function artifact identity. The concrete commands live in
 `PRIVATE-INPUT-ADMISSION.md`.
 
 Build evidence does not stand in for runtime microcode kickoff identity. Each v20
-production report must contain one single recognized microcode event whose
+production report must contain at least one individual recognized microcode event whose
 text SHA-256, data length, and data SHA-256 equal the admitted
 `microcode_text`/`microcode_data` pair and whose family is present. Split
-matches across different events fail. The family is admitted only by the
-selected backend's exact text/data-pair catalog; text-only HLE recognition
-cannot populate it. The ABI hashes logical RDRAM data bytes
+matches across different events fail. Pinned raw-window classification supplies
+the family when available and traps on a contradictory backend catalog label;
+text-only HLE recognition cannot populate it. The ABI hashes logical RDRAM data bytes
 at authoritative task start; replacement IMEM generations retain that original
 identity, and a one-way typed lifecycle retires ordinary completion while
 making each public yielded-resume authorization load-consumable exactly once.
@@ -984,8 +987,8 @@ certified release matrix**. The exact state is:
 | ROM/report class | Mechanism available | Certified evidence retained |
 | --- | --- | --- |
 | Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, a trusted exact-ten fresh-process runner and receipt, real executor/device/RSP/RDP/VI/reference-render boundaries, derived matrix coverage, and the canonical incomplete assessment are available. | Mechanism evidence only; synthetic bytes are not a ROM certification, and an incomplete assessment is not a retained verified matrix. |
-| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, a create-new receipt/source-wire producer, runner-staged exact ROM/microcode-pair admission, and same-event kickoff check exist. The v20 report and private policy admit the observed function stream and bind normalized ROM identity, class, and decoded TV region; the host uses the schema-enabled boot API and a path-independent generated-source identity. | A `typed_observed_function` exact-ten v20 series completed and was reverified locally on 2026-07-21 at the first scheduled VI edge after the audio-task closure path became observed. Its content-bearing artifacts and exact runner remain private and untracked; the broader verified matrix is still incomplete. |
-| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, resolved graphics-API and TV-standard evidence, explicit `BlockProgram` host selection, an artifact/schema-bound whole-function entry stream, create-new receipt tooling, and runner-staged exact ROM/microcode-pair admission exist. The host consumes the schema marker and registers the same pair with RT64; earlier local private groups are pre-v20 historical evidence only. | A `typed_observed_function` exact-ten v20 pinned-Metal LLE/post-VI series completed and was reverified locally on 2026-07-21 at the same fixed cycle as the reference series. Its content-bearing artifacts and exact runner remain private and untracked; the broader verified matrix is still incomplete. |
+| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, a create-new receipt/source-wire producer, runner-staged exact ROM/microcode-pair admission, and same-event kickoff check exist. The v20 report and private policy admit the observed function stream and bind normalized ROM identity, class, and decoded TV region; the host uses the schema-enabled boot API and a path-independent generated-source identity. | A fresh classifier-backed `typed_observed_function` exact-ten v20 series completed and was reverified locally on 2026-07-21 at the first scheduled VI edge after the audio-task closure path became observed. The admitted pair was independently retained as `F3dzex2` without host/backend pair registration. Its content-bearing artifacts and exact runner remain private and untracked; the broader verified matrix is still incomplete. |
+| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, resolved graphics-API and TV-standard evidence, explicit `BlockProgram` host selection, an artifact/schema-bound whole-function entry stream, create-new receipt tooling, and runner-staged exact ROM/microcode-pair admission exist. The host shape-checks the staged pair while the ABI independently classifies the live raw task window; earlier local private groups are pre-v20 historical evidence only. | A fresh classifier-backed `typed_observed_function` exact-ten v20 pinned-Metal LLE/post-VI series completed and was reverified locally on 2026-07-21 at the same fixed cycle as the reference series. The admitted pair was independently retained as `F3dzex2` without host/backend pair registration. Its content-bearing artifacts and exact runner remain private and untracked; the broader verified matrix is still incomplete. |
 | OoT NTSC 1.0, legacy C lane | Observation tooling and exact linked-archive identity wiring exist. | Non-authoritative: measured framebuffer parity is only claimed through swap 60, and the C oracle's missing bodies prevent deeper arbitration beyond the known swap-231 frontier. |
 | Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v20-visible fixed TV region, save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, program-lane, committed RSP/RDP-mechanism, and authoritative platform/API assignments while retaining the remaining project-owned profile entries as missing. Backend microcode labels are diagnostic only; independent public-microcode adjudication uses the empty project-owned catalog v1. Generic report verification deliberately cannot turn the retained ROM-class label into profile credit; the separate private-series path revalidates its contract, receipt, exact output files, raw ROM, and runner before retaining `fn64.verified-rom-class-authority.v1`. RT64 target-case credit additionally requires the opaque platform-series capability, for which phase one has no production constructor. | No public-microcode requirement can be credited until allowed-source identities populate a successor catalog; regional and additional save/controller/render scenarios, positive native Windows evidence, and production platform-case authority remain unsupplied. |
 

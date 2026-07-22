@@ -9,3 +9,4 @@ description = "Backend-neutral graphics seam, content-addressed microcode admiss
 [dependencies]
 fn64-runtime = { path = "../fn64-runtime" }
 sha2 = "0.10"
+twox-hash = { version = "=2.1.2", default-features = false, features = ["xxhash3_64"] }

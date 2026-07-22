@@ -1786,16 +1786,17 @@ impl Rt64Backend {
         self
     }
 
-    /// Admit one exact F3DEX2 text/data identity for RT64 runtime-recognition
-    /// evidence. This does not replace the separate HLE text admission.
-    pub fn with_f3dex2_ucode_pair_sha256(
+    /// Admit one exact complete microcode text/data identity for runtime
+    /// recognition evidence. This is separate from HLE text admission.
+    pub fn with_microcode_pair_sha256(
         mut self,
+        family: UcodeId,
         text_sha256: [u8; 32],
         data_bytes: u32,
         data_sha256: [u8; 32],
     ) -> Self {
         self.microcode_pairs.admit(
-            UcodeId::F3dex2,
+            family,
             text_sha256,
             MicrocodeDataImageIdentity {
                 bytes: data_bytes,
@@ -1805,18 +1806,17 @@ impl Rt64Backend {
         self
     }
 
-    /// Byte-backed fixture convenience for
-    /// [`Self::with_f3dex2_ucode_pair_sha256`].
-    pub fn with_f3dex2_ucode_pair(mut self, text: &[u8], data: &[u8]) -> Self {
+    /// Byte-backed fixture convenience for [`Self::with_microcode_pair_sha256`].
+    pub fn with_microcode_pair(mut self, family: UcodeId, text: &[u8], data: &[u8]) -> Self {
         assert_eq!(
             text.len(),
             fn64_runtime::RSP_MEMORY_BANK_SIZE,
-            "F3DEX2 pair admission requires one complete 4 KiB IMEM image"
+            "microcode pair admission requires one complete 4 KiB IMEM image"
         );
         let data_bytes = u32::try_from(data.len())
-            .expect("F3DEX2 pair data length exceeds the OSTask u32 size field");
+            .expect("microcode pair data length exceeds the OSTask u32 size field");
         self.microcode_pairs.admit(
-            UcodeId::F3dex2,
+            family,
             sha2::Sha256::digest(text).into(),
             MicrocodeDataImageIdentity {
                 bytes: data_bytes,
@@ -1824,6 +1824,21 @@ impl Rt64Backend {
             },
         );
         self
+    }
+
+    /// Compatibility helper for exact F3DEX2 runtime-recognition identity.
+    pub fn with_f3dex2_ucode_pair_sha256(
+        self,
+        text_sha256: [u8; 32],
+        data_bytes: u32,
+        data_sha256: [u8; 32],
+    ) -> Self {
+        self.with_microcode_pair_sha256(UcodeId::F3dex2, text_sha256, data_bytes, data_sha256)
+    }
+
+    /// Compatibility helper for exact F3DEX2 runtime-recognition bytes.
+    pub fn with_f3dex2_ucode_pair(self, text: &[u8], data: &[u8]) -> Self {
+        self.with_microcode_pair(UcodeId::F3dex2, text, data)
     }
 
     /// Stage a complete settings image for the next backend creation.
@@ -3181,6 +3196,36 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn rt64_f3dzex2_pair_recognition_does_not_admit_hle() {
+        let text = [0x7a; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let other_text = [0x7b; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let data = [0x5a, 0x45, 0x58, 0x32];
+        let identity = MicrocodeDataImageIdentity {
+            bytes: data.len() as u32,
+            sha256: sha2::Sha256::digest(data).into(),
+        };
+        let backend = Rt64Backend::new().with_microcode_pair(UcodeId::F3dzex2, &text, &data);
+
+        assert_eq!(
+            backend.identify_microcode_pair(&text, identity),
+            Some(UcodeId::F3dzex2)
+        );
+        assert_eq!(backend.identify_microcode_pair(&other_text, identity), None);
+        assert_eq!(
+            backend.identify_microcode_pair(
+                &text,
+                MicrocodeDataImageIdentity {
+                    sha256: [0xff; 32],
+                    ..identity
+                }
+            ),
+            None
+        );
+        assert_eq!(backend.identify_microcode(&text), None);
+        assert!(backend.supported_ucodes().is_empty());
     }
 
     #[test]

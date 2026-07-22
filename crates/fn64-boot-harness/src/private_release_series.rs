@@ -3023,7 +3023,7 @@ mod tests {
                     data_address: 0x2000,
                     data_bytes: 257,
                     data_sha256: "22".repeat(32),
-                    family: Some(crate::ReleaseMicrocodeFamily::F3dex2),
+                    family: Some(crate::ReleaseMicrocodeFamily::F3dzex2),
                 },
             }])
             .unwrap();

@@ -3,7 +3,8 @@
 Status: local admission, typed program/microcode-kickoff identity checks, and the
 trusted series mechanism are wired. Representative private NTSC full-ROM
 exact-ten series for reference and RT64 LLE/post-VI were retained and
-reverified locally on 2026-07-21. Their content-bearing evidence remains
+reverified locally on 2026-07-21. A fresh classifier-backed rerun retained the
+admitted pair as `F3dzex2` without host/backend pair registration. Their content-bearing evidence remains
 outside the repository; no private game content, path, length, or content hash
 is tracked here. Joint private-series matrix verification retains all 162
 FullParityV1 requirements and currently satisfies 9, leaving 153 explicit.
@@ -296,8 +297,12 @@ only that read-only isolated stage. Production runs likewise copy the admitted
 microcode text and data into separate create-new, read-only stages and inject
 their paths through runner-owned `FN64_RELEASE_MICROCODE_TEXT_PATH` and
 `FN64_RELEASE_MICROCODE_DATA_PATH` variables.
-The OoT host reads those exact staged bytes and admits the pair to the selected
-reference or RT64 backend before boot. Before every launch and after the series
+The OoT host reads and shape-checks those exact staged bytes but does not use
+them to choose a family. At the live task boundary the ABI independently
+classifies the larger raw RDRAM text/data prefixes through pinned MIT RT64's
+F3DZEX2 XXH3 rows; the report event must then match the staged logical pair.
+This binds recognition without admitting F3DZEX2 HLE or minting
+public-microcode credit. Before every launch and after the series
 the runner rehashes the contract-bound files, child stage, and both pair
 stages. This is a local single-owner execution guarantee: a malicious same-UID
 process able to discover, chmod, and replace staged paths between verification
@@ -308,7 +313,7 @@ The runner verifies each terminal v3 journal, exact v20
 scenario/cycle/input/source, the five fixed-cycle artifacts, live-minimum
 closure, zero reached unsupported events, and the admitted microcode pair
 before starting the next child. For a
-production report, one single recognized microcode event must contain the
+production report, at least one individual recognized microcode event must contain the
 admitted text SHA-256 and admitted data length/SHA-256 together with a
 recognized family; matches split across events are rejected. A create-new,
 flushed, and file-synced `fn64.private-release-series-receipt.v1` binds the
@@ -418,8 +423,9 @@ start, the ABI hashes the exact logical RDRAM bytes at the original task
 microcode-data address and length. Report schema `fn64.release-gate.v20`
 records those fields in
 the same recognition event as the live 4 KiB IMEM SHA-256 and recognized
-family, using `fn64.rsp-rdp-observations.v2`. The family comes only from the
-selected backend's exact text/data-pair catalog; text-only HLE recognition is
+family, using `fn64.rsp-rdp-observations.v2`. Pinned raw-window classification
+has priority; an exact backend pair catalog may fill an otherwise unknown
+identity but cannot contradict the classifier. Text-only HLE recognition is
 insufficient. Replacement IMEM generations
 retain the original data identity; yielded resume state cannot masquerade as
 the admitted data. A typed one-way lifecycle retires ordinary completion and
@@ -432,7 +438,8 @@ it does not independently trace every later RSP read of the data image.
 
 These checks make a valid production contract launchable. A representative
 private NTSC full-ROM exact-ten series for reference and RT64 LLE/post-VI
-completed and were reverified locally on 2026-07-21, closing this mechanism
+completed and were reverified locally on 2026-07-21 after the pinned raw-window
+classifier replaced host/backend pair registration, closing this mechanism
 path for those two scenarios only.
 The series receipt remains a self-hashed integrity record, not external process
 attestation; transferable provenance still requires a trusted CI/code-signing

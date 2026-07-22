@@ -269,7 +269,7 @@ same original data identity; a yielded resume never promotes the rewritten
 yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 `Running -> ResumeAuthorized -> ResumeLoaded -> Running`; ordinary completion
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
-the exact-ten series must contain one single recognized event whose text SHA,
+the exact-ten series must contain at least one individual recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Report schema
 `fn64.release-gate.v20` and the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
@@ -277,7 +277,8 @@ data length, and data SHA equal the admitted pair. Report schema
 This mechanism makes a correctly formed production contract launchable; it is
 not representative-ROM evidence by itself. Representative private NTSC
 full-ROM exact-ten series for reference and RT64 LLE/post-VI completed and
-were reverified locally on 2026-07-21, closing this mechanism path for those
+were reverified locally on 2026-07-21 after the backend-neutral F3DZEX2
+classifier replaced host/backend pair registration, closing this mechanism path for those
 two scenarios. The live
 synthetic runner test separately demonstrates direct-process orchestration and
 mechanism determinism during the observed test invocation only. Self-hashed
@@ -439,9 +440,12 @@ the exact `(cycle, artifact, link VRAM, symbol)` order and schema v20 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
-For each graphics LLE generation, the ABI hashes the complete live 4 KiB IMEM
-image and asks the registered backend only for exact catalog recognition; the
-backend cannot supply the digest or choose execution policy. Successful IMEM
+Before task mutation the ABI hashes the raw RDRAM prefixes required by pinned
+MIT RT64's F3DZEX2 identity rows. For each graphics LLE generation, it also
+hashes the complete live 4 KiB IMEM image and asks the registered backend only
+for exact catalog recognition. The pinned identity wins agreement or absence;
+a contradictory backend label traps. Neither source can choose the digest or
+execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
 clears it and report schema `fn64.release-gate.v20` binds it independently.
