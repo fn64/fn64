@@ -920,6 +920,23 @@ fn trace_rsp_dmem_words(dmem: &[u8], overlay: u64, pc: u32) {
     eprintln!("[fn64-abi/rsp] overlay={overlay} pc={pc:#06x} DMEM {offset:#x} words={words:08x?}");
 }
 
+fn lle_debug_task_data(rdram: &[u8], source_addr: u32, source_size: u32) -> Option<Vec<u8>> {
+    let addr = RdramAddr::from_offset(source_addr & 0x00ff_ffff);
+    let requested_len = (source_size as usize).clamp(0x40, 0x20000);
+    let start = addr.offset() as usize;
+    let end = start
+        .checked_add(requested_len)
+        .expect("LLE debug task-data range overflow")
+        .min(rdram.len());
+    if start >= end {
+        return None;
+    }
+
+    let mut logical = vec![0; end - start];
+    fn64_runtime::RdramView::from_storage(rdram).copy_logical_bytes(addr, &mut logical);
+    Some(logical)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dump_lle_debug_state(
     dir: &std::path::Path,
@@ -1006,13 +1023,11 @@ fn dump_lle_debug_state(
     }
     write("task_header.txt", header.as_bytes());
 
-    let data_ptr = (field(initial_dmem, 0x30) as usize) & 0x00ff_ffff;
-    let data_size = (field(initial_dmem, 0x34) as usize).clamp(0x40, 0x20000);
-    let end = (data_ptr + data_size).min(machine.rdram.len());
-    if data_ptr < end {
-        let logical: Vec<u8> = (data_ptr..end)
-            .map(|offset| machine.rdram.get(offset ^ 3).copied().unwrap_or(0))
-            .collect();
+    if let Some(logical) = lle_debug_task_data(
+        machine.rdram,
+        field(initial_dmem, 0x30),
+        field(initial_dmem, 0x34),
+    ) {
         write("task_data_logical.bin", &logical);
     }
     let raw_len = machine
@@ -3567,6 +3582,34 @@ mod tests {
             ]
         );
         assert_eq!(snapshot_len, 0x80_1000);
+    }
+
+    #[test]
+    fn lle_debug_task_data_preserves_logical_order_at_the_rdram_boundary() {
+        let logical = [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87];
+        let mut storage = [0u8; 8];
+        fn64_runtime::RdramViewMut::from_storage(&mut storage)
+            .write_logical_bytes(RdramAddr::from_offset(0), &logical);
+
+        assert_eq!(
+            lle_debug_task_data(&storage, 0xab00_0001, 1).as_deref(),
+            Some(&logical[1..]),
+            "the diagnostic's 0x40-byte minimum must truncate at RDRAM's end in guest byte order"
+        );
+        assert_eq!(
+            lle_debug_task_data(&storage, storage.len() as u32, 1),
+            None,
+            "a task-data start at the allocation boundary must not create an empty dump"
+        );
+    }
+
+    #[test]
+    fn lle_debug_task_data_loudly_rejects_an_unmapped_native_word_lane() {
+        let storage = [0u8; 7];
+        let panic = std::panic::catch_unwind(|| lle_debug_task_data(&storage, 4, 1))
+            .expect_err("an incomplete final native word must trap instead of supplying zero");
+        assert!(panic_message(panic.as_ref())
+            .contains("read_u8: logical RDRAM range 0x4..0x5 maps outside 7 storage bytes"));
     }
 
     #[test]

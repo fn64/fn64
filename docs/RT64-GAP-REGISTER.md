@@ -376,21 +376,24 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
   flat full-coverage controls remain unchanged. A separate eleven-phase
   qualified-coverage fixture, together with the adapter-capture integration
   test, preserves the hardware-mode-0 versus compatibility-`Unspecified`
-  wire and native-callback distinction. Modes 0/1
-  match an independent Figure-11 coverage-four oracle at exact RGB
-  `[132, 78, 99]`, modes 2/3 restore the exact baseline, compatibility
-  `Unspecified` matches replicate while explicit compatibility mode 0 matches
-  AA, and AA-before-divot changes two exact pixels where either stage alone
-  changes one. This closure is bounded to pinned Metal, nearest filtering,
-  progressive synthetic RGBA16 input, and deliberately generated code 4 with
-  opaque code-7 controls. Pinned RT64 aliases managed 7/8 and clamped 8/8 at
-  code 7. The context-reuse gate binds exact workload/present continuity
-  through both fixtures and passed the official watchdog-bounded lifecycle
-  runner in 20/20 fresh Darwin 25.5.0 arm64 processes on 2026-07-21.
+  wire and native-callback distinction. For deliberately generated managed
+  codes 1-6, modes 0/1 match an independent per-code Figure-11 CPU oracle at
+  exact RGB8 vectors `[50, 45, 35]`, `[76, 60, 53]`, `[102, 70, 75]`,
+  `[128, 87, 95]`, `[158, 95, 109]`, and `[185, 113, 128]`; modes 2/3 restore
+  the exact baseline, and compatibility `Unspecified` matches replicate while
+  explicit compatibility mode 0 matches AA. The divot oracle reconstructs
+  the declared RDP source before projection, and AA, divot, and
+  AA-before-divot each change exactly the six projected targets. This closure
+  is bounded to pinned Metal, nearest filtering, progressive synthetic RGBA16
+  input, opaque code-7 controls, and the original-aspect (4:3) presentation
+  policy. Pinned RT64 aliases managed 7/8 and clamped 8/8 at code 7. The
+  context-reuse gate binds exact workload/present continuity through both
+  fixtures. The expanded codes-1-6 source passed the official
+  watchdog-bounded lifecycle runner in 20/20 fresh Darwin 25.5.0 arm64
+  processes on 2026-07-22.
   RT64's managed target does not retain authoritative RGBA16 storage or RDP
   dither history, and its alpha supplies only the native coverage estimate;
-  code-0/save, untested partial codes 1-3/5-6, natural triangle coverage,
-  imported hidden coverage, other
+  code-0/save, natural triangle coverage, imported hidden coverage, other
   filtering/scaling modes, MSAA/downsample behavior, other graphics APIs,
   full-ROM coverage, silicon behavior and random-stream identity, DAC output,
   and analog video remain unproven.
