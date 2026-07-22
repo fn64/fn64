@@ -9609,6 +9609,20 @@ mod tests {
         assert_eq!(legacy_line.v[1].x, modern_line.v[1].x);
         assert_eq!(legacy_line.width, modern_line.width);
         assert_eq!(legacy_line.smooth_shading, modern_line.smooth_shading);
+        let legacy_sample = crate::raster::test_line_attribute_sample(
+            legacy_line,
+            ScissorRect::framebuffer(16, 10),
+            3,
+            2,
+        );
+        let modern_sample = crate::raster::test_line_attribute_sample(
+            modern_line,
+            ScissorRect::framebuffer(16, 10),
+            3,
+            2,
+        );
+        assert_eq!(legacy_sample, modern_sample);
+        assert_eq!(legacy_sample, (0xf0, Some((5, 5, 5))));
         let mut legacy_fb = crate::raster::Framebuffer::new(16, 10);
         legacy_fb.draw_line_no_depth(legacy_line);
         let mut modern_fb = crate::raster::Framebuffer::new(16, 10);
