@@ -885,16 +885,23 @@ task calls out:
   variant-specific point-lighting capability. Its immutable raw pool remains
   the I/J discriminator because pinned RT64 exposes the same native flags for
   those two variants. This typed plumbing does not itself admit the F3DZEX2
-  command decoder: until NoN and point-lighting behavior pass their separate
-  gates, the catalog continues to select LLE.
+  command decoder. `GeometryUcodeProfile`, backed only by the typed admission
+  identity, now survives the shared inspector and reference decode state plus
+  catalog-admitted self-load transitions. All three typed F3DZEX2 profiles
+  apply the bounded NoN near-admission policy, while ordinary F3DEX2 retains
+  its near gate and side/far clip codes keep the existing raster-clipping
+  handoff. Exact clipping remains a separate trace frontier. Until point-light
+  behavior and exact F3DZEX2 raw-pair self-load resolution pass their separate
+  gates, the production catalog continues to select LLE.
   Internally, the transactional inspector and reference decoder now share the
   pinned BranchW control-flow rule: opcode `0x04` selects bits 1..7, validates
   a loaded finite transformed W, compares it strictly with `float(u32 w1)`,
   and on a taken/forced path resolves persistent HALF_1 before applying the
   24-bit eight-byte command mask. Equality falls through and F3DEX2 retains
   its distinct BranchZ packing/comparison. This mechanism is testable before
-  admission, but cannot execute in production until the variant profile also
-  governs NoN and point lighting.
+  admission. The variant profile now governs the bounded NoN slice; point-light
+  wire activation, layout, arithmetic, and rounding remain unimplemented and
+  must be characterized without treating the capability flag as behavior.
   Native RT64 task submission returns a schema-checked result containing the
   plan identity, planned/observed generation counts, typed disposition and
   rejected generation, entry GBI availability, pre/post workload IDs, and

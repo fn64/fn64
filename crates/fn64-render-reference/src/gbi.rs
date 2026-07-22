@@ -47,7 +47,8 @@
 //! other-mode, alpha compare, and the color-combiner and framebuffer-blender
 //! inputs needed by OoT are decoded.
 use fn64_render::{
-    MicrocodeDataImageIdentity, RenderError, TaskAdmissionGeneration, TaskAdmissionSource, UcodeId,
+    GeometryUcodeProfile, MicrocodeDataImageIdentity, RenderError, TaskAdmissionGeneration,
+    TaskAdmissionSource, UcodeId,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt::Write as _};
@@ -3770,6 +3771,10 @@ struct DecodeAdmissionPolicy {
 /// Decoder state carried across (possibly nested via `G_DL`) command
 /// streams.
 struct DecodeState {
+    /// Behavior-bearing identity for the active geometry microcode generation.
+    /// Wire decoding derives its family from this value, while NoN and future
+    /// variant behavior must not collapse to that broad family.
+    profile: GeometryUcodeProfile,
     vtx_cache: [Vertex; MAX_GEOMETRY_VERTEX_CACHE],
     /// Slot validity is distinct from vertex contents: the all-zero default
     /// is a possible transformed vertex, but BranchW must not observe a slot
@@ -3945,7 +3950,14 @@ impl ClipRatio {
 }
 
 fn fresh_decode_state() -> DecodeState {
+    fresh_decode_state_for_profile(GeometryUcodeProfile::from_public_family(
+        GeometryWireFamily::F3dex2,
+    ))
+}
+
+fn fresh_decode_state_for_profile(profile: GeometryUcodeProfile) -> DecodeState {
     DecodeState {
+        profile,
         vtx_cache: [Vertex::default(); MAX_GEOMETRY_VERTEX_CACHE],
         vtx_loaded: [false; MAX_GEOMETRY_VERTEX_CACHE],
         ops: Vec::new(),
@@ -4038,7 +4050,9 @@ fn reset_legacy_rsp_state_from_ucode_load(state: &mut DecodeState) {
     state.clip_ratio = ClipRatio::default();
 }
 
-fn initialize_geometry_family_state(state: &mut DecodeState, family: GeometryWireFamily) {
+fn initialize_geometry_profile_state(state: &mut DecodeState, profile: GeometryUcodeProfile) {
+    state.profile = profile;
+    let family = profile.wire_family();
     match family {
         GeometryWireFamily::F3dlx => {
             // The public F3DLX contract starts with clipping enabled and
@@ -4070,6 +4084,11 @@ fn initialize_geometry_family_state(state: &mut DecodeState, family: GeometryWir
         }
         GeometryWireFamily::Fast3d | GeometryWireFamily::F3dex | GeometryWireFamily::L3dex => {}
     }
+}
+
+#[cfg(test)]
+fn initialize_geometry_family_state(state: &mut DecodeState, family: GeometryWireFamily) {
+    initialize_geometry_profile_state(state, GeometryUcodeProfile::from_public_family(family));
 }
 
 /// F3DEX2 vertex-lighting decode state (`F3DEX2-CONCEPTS.md` §2.4). The
@@ -4921,7 +4940,7 @@ fn execute_display_list_f3dex2_state_with_catalog(
         dl_addr,
         catalog,
         None,
-        GeometryWireFamily::F3dex2,
+        GeometryUcodeProfile::from_public_family(GeometryWireFamily::F3dex2),
         DecodeAdmissionPolicy::default(),
     )
 }
@@ -4932,7 +4951,7 @@ fn execute_display_list_f3dex2_state_with_catalog_and_rdp(
     dl_addr: u32,
     catalog: Option<&F3dex2UcodeCatalog>,
     rdp_state: Option<&mut RdpDecodeState>,
-    initial_family: GeometryWireFamily,
+    initial_profile: GeometryUcodeProfile,
     admission_policy: DecodeAdmissionPolicy,
 ) -> Result<DecodeState, RenderError> {
     let mut state = rdp_state
@@ -4943,8 +4962,8 @@ fn execute_display_list_f3dex2_state_with_catalog_and_rdp(
     state.force_branch = admission_policy.force_branch;
     #[cfg(not(test))]
     projdump::reset_frame();
-    let mut family = initial_family;
-    initialize_geometry_family_state(&mut state, family);
+    let mut family = initial_profile.wire_family();
+    initialize_geometry_profile_state(&mut state, initial_profile);
     decode_stream(
         rdram,
         dl_addr,
@@ -5064,7 +5083,7 @@ pub(crate) fn execute_display_list_f3dex2_ops_admitted_with_rdp_state(
         dl_addr,
         Some(catalog),
         Some(rdp_state),
-        GeometryWireFamily::F3dex2,
+        GeometryUcodeProfile::from_public_family(GeometryWireFamily::F3dex2),
         DecodeAdmissionPolicy::default(),
     )?
     .ops)
@@ -5126,7 +5145,7 @@ pub(crate) fn inspect_display_list_geometry_admission_with_rdp_state(
         dl_addr,
         Some(catalog),
         Some(rdp_state),
-        family,
+        GeometryUcodeProfile::from_public_family(family),
         DecodeAdmissionPolicy::default(),
     )?;
     Ok(GeometryTaskInspection {
@@ -5155,7 +5174,7 @@ pub(crate) fn inspect_display_list_geometry_admission_with_raw_windows(
         dl_addr,
         Some(catalog),
         Some(rdp_state),
-        family,
+        GeometryUcodeProfile::from_public_family(family),
         DecodeAdmissionPolicy {
             raw_window_bytes: Some((raw_window_size.text, raw_window_size.data)),
             force_branch: options.force_branch,
@@ -5748,6 +5767,11 @@ fn decode_stream_impl(
     ucode_catalog: Option<&F3dex2UcodeCatalog>,
     family: &mut GeometryWireFamily,
 ) {
+    assert_eq!(
+        state.profile.wire_family(),
+        *family,
+        "active geometry profile and command wire family diverged"
+    );
     let mut pc = resolve_addr(&state.segments, dl_addr);
 
     loop {
@@ -6095,10 +6119,10 @@ fn decode_stream_impl(
                 let texture = active_texture(&state.tex, state.other_mode);
                 let blender = active_blender(state);
                 let idx = tri_indices(w0);
-                if let Some(mut t) = resolve_tri_for_family(
+                if let Some(mut t) = resolve_tri_for_profile(
                     &state.vtx_cache,
                     idx,
-                    *family,
+                    state.profile,
                     state.geometry_mode,
                     state.clip_ratio,
                     cull,
@@ -6120,10 +6144,10 @@ fn decode_stream_impl(
                 let blender = active_blender(state);
                 let idx_a = tri_indices(w0);
                 let idx_b = tri_indices(w1);
-                if let Some(mut t) = resolve_tri_for_family(
+                if let Some(mut t) = resolve_tri_for_profile(
                     &state.vtx_cache,
                     idx_a,
-                    *family,
+                    state.profile,
                     state.geometry_mode,
                     state.clip_ratio,
                     cull,
@@ -6135,10 +6159,10 @@ fn decode_stream_impl(
                     t.scissor = state.scissor;
                     state.ops.push(RenderOp::Triangle(t));
                 }
-                if let Some(mut t) = resolve_tri_for_family(
+                if let Some(mut t) = resolve_tri_for_profile(
                     &state.vtx_cache,
                     idx_b,
-                    *family,
+                    state.profile,
                     state.geometry_mode,
                     state.clip_ratio,
                     cull,
@@ -6296,16 +6320,15 @@ fn decode_stream_impl(
                     reset_rsp_state_from_ucode_load(state);
                 }
                 if let Some(catalog) = ucode_catalog {
-                    if let Some(next_family) = catalog.family(loaded.text_sha256) {
+                    if let Some(next_profile) = catalog.profile(loaded.text_sha256) {
+                        let next_family = next_profile.wire_family();
                         let generation = TaskAdmissionGeneration {
                             source: TaskAdmissionSource::SelfLoad,
                             text_address: loaded.text_address,
                             data_address: loaded.data_address,
                             text_sha256: loaded.text_sha256,
                             data: loaded.data,
-                            ucode: fn64_render::TaskAdmissionUcode::from_family(
-                                next_family.ucode_id(),
-                            ),
+                            ucode: next_profile.admission_ucode(),
                         };
                         if let Some((text_bytes, data_bytes)) = state.admission_raw_window_bytes {
                             let raw_window = capture_raw_recognition_window(
@@ -6333,7 +6356,7 @@ fn decode_stream_impl(
                         }
                         state.admission_generations.push(generation);
                         *family = next_family;
-                        initialize_geometry_family_state(state, next_family);
+                        initialize_geometry_profile_state(state, next_profile);
                     } else {
                         state.unsupported_ucode_reload = Some(loaded.text_sha256);
                         break;
@@ -7342,16 +7365,17 @@ enum TriangleAdmission {
     RejectBox(ClipRatio),
 }
 
-fn family_triangle_admission(
-    family: GeometryWireFamily,
+fn profile_triangle_admission(
+    profile: GeometryUcodeProfile,
     geometry_mode: u32,
     clip_ratio: ClipRatio,
 ) -> TriangleAdmission {
+    let family = profile.wire_family();
     match family {
         GeometryWireFamily::F3dlx if geometry_mode & LEGACY_G_CLIPPING == 0 => {
             TriangleAdmission::Unclipped
         }
-        GeometryWireFamily::F3dex2NoN => TriangleAdmission::Unclipped,
+        _ if profile.no_n() => TriangleAdmission::Unclipped,
         family if family.is_reject() => TriangleAdmission::RejectBox(clip_ratio),
         _ => TriangleAdmission::ClipNear,
     }
@@ -7374,6 +7398,7 @@ fn vertex_inside_reject_box(vertex: &Vertex, ratio: ClipRatio) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn resolve_tri_for_family(
     vtx_cache: &[Vertex],
     idx: [u32; 3],
@@ -7386,11 +7411,39 @@ fn resolve_tri_for_family(
     combiner: CombinerState,
     blender: BlenderState,
 ) -> Option<Triangle> {
+    resolve_tri_for_profile(
+        vtx_cache,
+        idx,
+        GeometryUcodeProfile::from_public_family(family),
+        geometry_mode,
+        clip_ratio,
+        cull,
+        texture,
+        other_mode,
+        combiner,
+        blender,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_tri_for_profile(
+    vtx_cache: &[Vertex],
+    idx: [u32; 3],
+    profile: GeometryUcodeProfile,
+    geometry_mode: u32,
+    clip_ratio: ClipRatio,
+    cull: CullMode,
+    texture: Option<Texture>,
+    other_mode: OtherMode,
+    combiner: CombinerState,
+    blender: BlenderState,
+) -> Option<Triangle> {
+    let family = profile.wire_family();
     resolve_tri_with_admission(
         vtx_cache,
         idx,
         family.cache_capacity(),
-        family_triangle_admission(family, geometry_mode, clip_ratio),
+        profile_triangle_admission(profile, geometry_mode, clip_ratio),
         cull,
         texture,
         other_mode,
@@ -7593,6 +7646,19 @@ pub const SUPPORTED: &[UcodeId] = &[UcodeId::F3dex2];
 )]
 mod tests {
     use super::*;
+    use fn64_render::{F3dzex2Variant, TaskAdmissionUcode};
+
+    fn f3dzex2_profile(variant: F3dzex2Variant) -> GeometryUcodeProfile {
+        GeometryUcodeProfile::from_admission_ucode(TaskAdmissionUcode::F3dzex2(variant))
+            .expect("typed F3DZEX2 admission identity is a geometry profile")
+    }
+
+    fn profile_for_test_family(family: GeometryWireFamily) -> GeometryUcodeProfile {
+        match family {
+            GeometryWireFamily::F3dzex2 => f3dzex2_profile(F3dzex2Variant::NoNFifo206H),
+            _ => GeometryUcodeProfile::from_public_family(family),
+        }
+    }
 
     fn set_convert_command(coefficients: [i16; 6]) -> (u32, u32) {
         let field = |value: i16| u32::from(value as u16) & 0x1ff;
@@ -7713,7 +7779,9 @@ mod tests {
         force_branch: bool,
     ) -> Result<AdmissionProjection, RenderError> {
         const WINDOW: TaskAdmissionRawWindowSize = TaskAdmissionRawWindowSize { text: 16, data: 8 };
-        let family = catalog.require_text(rsp_memory.bank(fn64_runtime::RspMemoryBank::Imem))?;
+        let profile =
+            catalog.require_profile_text(rsp_memory.bank(fn64_runtime::RspMemoryBank::Imem))?;
+        let family = profile.wire_family();
         let text_address = task.ucode & 0x00ff_ffff;
         let data_address = task.ucode_data & 0x00ff_ffff;
         let mut text = vec![0; SP_UCODE_SIZE];
@@ -7736,7 +7804,7 @@ mod tests {
                 bytes: task.ucode_data_size,
                 sha256: Sha256::digest(data).into(),
             },
-            ucode: fn64_render::TaskAdmissionUcode::from_family(family.ucode_id()),
+            ucode: profile.admission_ucode(),
         };
 
         let mut scratch_rdram = rdram.to_vec();
@@ -9132,14 +9200,15 @@ mod tests {
         wr_cmd(&mut rdram, TARGET, (G_RDPFULLSYNC as u32) << 24, 0);
         wr_cmd(&mut rdram, TARGET + 8, (G_ENDDL as u32) << 24, 0);
 
-        let mut state = fresh_decode_state();
+        let profile = profile_for_test_family(family);
+        let mut state = fresh_decode_state_for_profile(profile);
         state.vtx_cache[vertex_slot].w = vertex_w;
         state.vtx_cache[vertex_slot].z_screen = vertex_z;
         state.vtx_cache[vertex_slot].clip_position = Some([0.0, 0.0, 0.0, vertex_w]);
         state.vtx_loaded[vertex_slot] = loaded;
         state.force_branch = force_branch;
         state.segments[3] = segment_three;
-        initialize_geometry_family_state(&mut state, family);
+        initialize_geometry_profile_state(&mut state, profile);
         let mut active_family = family;
         decode_stream(
             &mut rdram,
@@ -9233,9 +9302,10 @@ mod tests {
         wr_cmd(&mut rdram, TARGET, (G_RDPFULLSYNC as u32) << 24, 0);
         wr_cmd(&mut rdram, TARGET + 8, (G_ENDDL as u32) << 24, 0);
 
-        let mut state = fresh_decode_state();
+        let profile = f3dzex2_profile(F3dzex2Variant::NoNFifo206H);
+        let mut state = fresh_decode_state_for_profile(profile);
         let mut family = GeometryWireFamily::F3dzex2;
-        initialize_geometry_family_state(&mut state, family);
+        initialize_geometry_profile_state(&mut state, profile);
         decode_stream(&mut rdram, ROOT as u32, &mut state, None, None, &mut family);
 
         assert!(state.vtx_loaded[SLOT]);
@@ -9450,6 +9520,24 @@ mod tests {
             family,
         )
         .unwrap()
+    }
+
+    fn decode_geometry_fixture_profile(
+        rdram: &[u8],
+        profile: GeometryUcodeProfile,
+    ) -> Vec<RenderOp> {
+        let mut scratch = rdram.to_vec();
+        execute_display_list_f3dex2_state_with_catalog_and_rdp(
+            &mut scratch,
+            &mut fn64_runtime::RspMemory::new(),
+            0x1000,
+            None,
+            None,
+            profile,
+            DecodeAdmissionPolicy::default(),
+        )
+        .unwrap()
+        .ops
     }
 
     fn equivalent_l3dex_line_fixture(family: GeometryWireFamily) -> Vec<RenderOp> {
@@ -9760,11 +9848,115 @@ mod tests {
     }
 
     #[test]
-    fn f3dex2_non_disables_only_the_reference_near_admission_gate() {
+    fn f3dzex2_variants_and_public_non_disable_the_reference_near_admission_gate() {
         let mut cache = [Vertex::default(); 64];
         for vertex in &mut cache[..3] {
             vertex.w = 0.0;
             vertex.clip_position = Some([0.0, 0.0, -1.0, 0.0]);
+        }
+        let resolve = |profile| {
+            resolve_tri_for_profile(
+                &cache,
+                [0, 1, 2],
+                profile,
+                0,
+                ClipRatio::default(),
+                CullMode::None,
+                None,
+                OtherMode::default(),
+                CombinerState::default(),
+                BlenderState::default(),
+            )
+        };
+        assert!(resolve(GeometryUcodeProfile::from_public_family(
+            GeometryWireFamily::F3dex2
+        ))
+        .is_none());
+        assert!(resolve(GeometryUcodeProfile::from_public_family(
+            GeometryWireFamily::F3dex2NoN
+        ))
+        .is_some());
+        for variant in [
+            F3dzex2Variant::NoNFifo206H,
+            F3dzex2Variant::NoNFifo208I,
+            F3dzex2Variant::NoNFifo208J,
+        ] {
+            assert!(
+                resolve(f3dzex2_profile(variant)).is_some(),
+                "{variant:?} did not apply its typed NoN profile"
+            );
+        }
+    }
+
+    #[test]
+    fn f3dzex2_non_changes_only_near_admission_in_the_bounded_triangle_model() {
+        let ordinary = GeometryUcodeProfile::from_public_family(GeometryWireFamily::F3dex2);
+        let profiles = [
+            f3dzex2_profile(F3dzex2Variant::NoNFifo206H),
+            f3dzex2_profile(F3dzex2Variant::NoNFifo208I),
+            f3dzex2_profile(F3dzex2Variant::NoNFifo208J),
+        ];
+        for (clip_position, clip_code) in [
+            ([2.0, 0.0, 0.0, 1.0], CLIP_POS_X),
+            ([-2.0, 0.0, 0.0, 1.0], CLIP_NEG_X),
+            ([0.0, 2.0, 0.0, 1.0], CLIP_POS_Y),
+            ([0.0, -2.0, 0.0, 1.0], CLIP_NEG_Y),
+            ([0.0, 0.0, 2.0, 1.0], CLIP_POS_Z),
+        ] {
+            let mut cache = [Vertex::default(); 64];
+            for vertex in &mut cache[..3] {
+                vertex.w = 1.0;
+                vertex.clip_position = Some(clip_position);
+                vertex.clip_code = clip_code;
+            }
+            let resolve = |profile| {
+                resolve_tri_for_profile(
+                    &cache,
+                    [0, 1, 2],
+                    profile,
+                    0,
+                    ClipRatio::default(),
+                    CullMode::None,
+                    None,
+                    OtherMode::default(),
+                    CombinerState::default(),
+                    BlenderState::default(),
+                )
+                .expect("positive-W side/far fixture remains a raster clipping handoff")
+            };
+            let ordinary_triangle = resolve(ordinary);
+            assert!(ordinary_triangle
+                .v
+                .iter()
+                .all(|vertex| vertex.clip_code == clip_code));
+            for profile in profiles {
+                assert_eq!(resolve(profile).v, ordinary_triangle.v);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_f3dzex2_profiles_keep_other_special_opcodes_reserved() {
+        let mut rdram = vec![0u8; 0x1020];
+        wr_cmd(&mut rdram, 0x1000, (G_SPECIAL_1 as u32) << 24, 0);
+        wr_cmd(&mut rdram, 0x1008, (G_ENDDL as u32) << 24, 0);
+        for variant in [
+            F3dzex2Variant::NoNFifo206H,
+            F3dzex2Variant::NoNFifo208I,
+            F3dzex2Variant::NoNFifo208J,
+        ] {
+            let result = std::panic::catch_unwind(|| {
+                decode_geometry_fixture_profile(&rdram, f3dzex2_profile(variant))
+            });
+            assert!(result.is_err(), "{variant:?} accepted reserved G_SPECIAL_1");
+        }
+    }
+
+    #[test]
+    fn public_family_boundary_still_maps_f3dex2_non_without_typed_f3dzex2() {
+        let mut cache = [Vertex::default(); 64];
+        for vertex in &mut cache[..3] {
+            vertex.w = 0.0;
         }
         assert!(resolve_tri_for_family(
             &cache,
@@ -11611,40 +11803,7 @@ mod tests {
     /// A `DecodeState` with identity modelview and no MVP -- the minimal
     /// harness for exercising the light math directly.
     fn lit_state() -> DecodeState {
-        DecodeState {
-            vtx_cache: [Vertex::default(); MAX_GEOMETRY_VERTEX_CACHE],
-            vtx_loaded: [false; MAX_GEOMETRY_VERTEX_CACHE],
-            ops: Vec::new(),
-            segments: [0u32; 16],
-            mvp: None,
-            pending_forced_mvp: None,
-            proj: None,
-            modelview: identity(),
-            mv_stack: Vec::new(),
-            viewport: None,
-            scissor: None,
-            geometry_mode: 0,
-            other_mode: OtherMode::default(),
-            combiner: CombinerState::default(),
-            blend_color: [0; 4],
-            fog_color: [0; 4],
-            fill_color: 0,
-            rdp_half_1: None,
-            dl_depth: 0,
-            cmds_decoded: 0,
-            tex: TexState::default(),
-            lights: LightState::default(),
-            look_at: LookAtState::default(),
-            fog: FogFactor::default(),
-            persp_normalize: PerspectiveNormalize::default(),
-            clip_ratio: ClipRatio::default(),
-            unsupported_ucode_reload: None,
-            admission_generations: Vec::new(),
-            admission_raw_window_bytes: None,
-            admission_raw_windows: Vec::new(),
-            admission_raw_window_error: None,
-            force_branch: false,
-        }
+        fresh_decode_state()
     }
 
     #[test]
