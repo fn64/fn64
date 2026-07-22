@@ -228,14 +228,20 @@ fn main() {
     // call below (which still runs too, on a clean exit, and rewrites the
     // same path from the in-memory copy -- harmless, since by then the
     // incremental sink already has every event that copy will contain).
-    const TRACE_PATH: &str = "/tmp/wm2000-boot-trace.jsonl";
-    if let Err(e) = fn64_abi::set_trace_sink_file(TRACE_PATH) {
+    // WM2000_TRACE_PATH: trace destination override (default the historic
+    // /tmp path) -- parallel scripted runs must not interleave one sink.
+    let trace_path: &'static str = Box::leak(
+        std::env::var("WM2000_TRACE_PATH")
+            .unwrap_or_else(|_| "/tmp/wm2000-boot-trace.jsonl".to_string())
+            .into_boxed_str(),
+    );
+    if let Err(e) = fn64_abi::set_trace_sink_file(trace_path) {
         eprintln!(
-            "[wm2000-boot] WARNING: failed to arm incremental trace sink at {TRACE_PATH}: {e} -- \
+            "[wm2000-boot] WARNING: failed to arm incremental trace sink at {trace_path}: {e} -- \
              a crash mid-boot will lose the trace (falling back to end-of-run-only)."
         );
     } else {
-        println!("[wm2000-boot] incremental trace sink armed at {TRACE_PATH}");
+        println!("[wm2000-boot] incremental trace sink armed at {trace_path}");
     }
 
     // rdram: this process's one shared buffer (docs/DESIGN.md section 3).
@@ -741,8 +747,8 @@ fn main() {
 
     let trace = fn64_abi::copy_trace();
     println!("[wm2000-boot] trace events recorded: {}", trace.len());
-    write_trace_file(&trace, TRACE_PATH);
-    println!("[wm2000-boot] trace written to {TRACE_PATH}");
+    write_trace_file(&trace, trace_path);
+    println!("[wm2000-boot] trace written to {trace_path}");
 
     // Clean shutdown: parked guest coroutines must NOT be force-unwound by
     // the TLS destructor (they're suspended inside nounwind extern "C"
@@ -797,7 +803,10 @@ fn capture_framebuffer(
         "[wm2000-boot] swap #{swap_index}: framebuffer at {fb_offset:#010x} is NON-UNIFORM -- \
          dumping PNG."
     );
-    let path = format!("/tmp/fn64-fb-{swap_index}.png");
+    // WM2000_FB_DUMP_DIR: where swap PNGs land (default /tmp) -- lets two
+    // scripted runs coexist without clobbering each other's frames.
+    let dir = std::env::var("WM2000_FB_DUMP_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let path = format!("{dir}/fn64-fb-{swap_index}.png");
     match dump_rgba5551_as_png(rdram, start, fb_width, FB_HEIGHT, &path) {
         Ok(()) => {
             println!("[wm2000-boot] *** NON-UNIFORM FRAMEBUFFER DUMPED: {path} ***");
