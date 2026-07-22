@@ -179,6 +179,52 @@ fn main() {{
 }
 
 #[test]
+fn emitted_random_and_tlbwr_use_explicit_instruction_order() {
+    let words = [
+        0x2402_001d, // addiu $v0,$zero,29
+        0x4082_3000, // mtc0  $v0,Wired
+        0x4200_0006, // tlbwr
+        0x4003_0800, // mfc0  $v1,Random
+        0x03e0_0008, // jr    $ra
+        0x0000_0000, // nop
+    ];
+    let emitted = emit_bank_runner(&BankInput {
+        name: "run_tlb_random_bank",
+        bank: BankId::new(0xA4),
+        vram: BASE,
+        words: &words,
+    });
+    let stdout = compile_and_run(
+        &emitted,
+        r#"
+    let mut bytes = vec![];
+    let mut mem = Rdram::new(&mut bytes);
+    let mut ctx = RecompContext::new();
+    ctx.set_r(31, 0x8000_9000);
+    ctx.cop0_entry_hi = 0x1234_500a;
+    ctx.cop0_entry_lo0 = 0x46;
+    ctx.cop0_entry_lo1 = 0x86;
+    ctx.cop0_page_mask = 0x6000;
+    let run = run_tlb_random_bank(
+        ExecutionKey::new(BankId::new(0xA4), GuestPc::new(0x8000_1000)),
+        InstructionBudget::new(6).unwrap(),
+        &mut ctx,
+        &mut mem,
+    );
+    assert_eq!(run.instructions, 6);
+    assert_eq!(ctx.r_u32(3), 29);
+    assert_eq!(ctx.tlb_entries[30].entry_hi, 0x1234_500a);
+    assert_eq!(ctx.tlb_entries[30].entry_lo0, 0x46);
+    assert_eq!(ctx.tlb_entries[30].entry_lo1, 0x86);
+    assert_eq!(ctx.tlb_entries[30].page_mask, 0x6000);
+    assert_eq!(ctx.read_cop0(1), 29);
+    println!("tlb-random-ok");
+"#,
+    );
+    assert_eq!(stdout.trim(), "tlb-random-ok");
+}
+
+#[test]
 fn emitted_bank_runner_compiles_and_executes_from_arbitrary_pcs() {
     let emitted = emit_bank_runner(&BankInput {
         name: "run_test_bank",

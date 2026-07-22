@@ -513,6 +513,7 @@ pub fn emit_bank_runner_with_host_calls(bank: &BankInput<'_>, host_calls: &[u32]
                     },
                 );
             }
+            let _ = writeln!(out, "            ctx.advance_cop0_random(1);");
             let _ = writeln!(out, "            executed += 1;");
             let next = vram + 4;
             if domain.contains(next) {
@@ -771,6 +772,7 @@ fn emit_sparse_bank_runner_inner(
                     },
                 );
             }
+            let _ = writeln!(out, "            ctx.advance_cop0_random(1);");
             let _ = writeln!(out, "            executed += 1;");
             let next = vram
                 .checked_add(4)
@@ -925,6 +927,7 @@ fn emit_bank_control_transfer(
     use Instruction::*;
     let target = branch_target(&instr, vram);
     let fallthrough = delay_vram + 4;
+    let _ = writeln!(out, "            ctx.advance_cop0_random(1);");
     let emit_delay = |out: &mut String| {
         if let Some(delay) = delay {
             let _ = writeln!(out, "            // delay: {delay_vram:#010X}: {delay:?}");
@@ -946,6 +949,7 @@ fn emit_bank_control_transfer(
                         },
                     );
                 }
+                let _ = writeln!(out, "            ctx.advance_cop0_random(1);");
             }
         }
     };
@@ -1011,6 +1015,7 @@ fn emit_bank_control_transfer(
                 emit_delay(out);
                 emit_call_transfer(out, bank, target, fallthrough, domain, 16);
                 let _ = writeln!(out, "            }}");
+                let _ = writeln!(out, "            ctx.advance_cop0_random(1);");
                 emit_proven_or_resolved_transfer(out, bank, fallthrough, domain, 12);
             } else {
                 if domain.host_calls.contains(&target) {
@@ -1033,6 +1038,7 @@ fn emit_bank_control_transfer(
             emit_delay(out);
             emit_proven_or_resolved_transfer(out, bank, target, domain, 16);
             let _ = writeln!(out, "            }}");
+            let _ = writeln!(out, "            ctx.advance_cop0_random(1);");
             emit_proven_or_resolved_transfer(out, bank, fallthrough, domain, 12);
         }
         _ => {
@@ -1428,6 +1434,7 @@ fn emit_bank_eret(out: &mut String, instr: Instruction, bank: BankId) -> bool {
     }
     let _ = writeln!(out, "            executed += 1;");
     let _ = writeln!(out, "            let target = ctx.exception_return_pc();");
+    let _ = writeln!(out, "            ctx.advance_cop0_random(1);");
     let _ = writeln!(out, "            finish!(BlockExit::ResolveTransfer {{");
     let _ = writeln!(
         out,
@@ -2223,6 +2230,10 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
         Mfc0 { rt, cop0d } => match cop0d {
             9 => line(out, format!("ctx.set_r32({}, ctx.cop0_count as i32);", rt)),
             11 => line(out, format!("ctx.set_r32({}, ctx.cop0_compare as i32);", rt)),
+            1 if matches!(mem_fault, MemFault::Fault { .. }) => line(
+                out,
+                format!("ctx.set_r32({}, ctx.read_cop0(1) as i32);", rt),
+            ),
             0 | 2 | 3 | 5 | 6 | 8 | 10 | 12 | 13 | 14 | 18 | 19 | 30 => line(
                 out,
                 format!("ctx.set_r32({}, ctx.read_cop0({}) as i32);", rt, cop0d),
@@ -2260,7 +2271,13 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
                 .to_owned(),
         ),
         Tlbwi => line(out, "ctx.tlbwi_record();".to_string()),
-        Tlbwr => unsupported(out, "tlbwr: TLB is host-managed, not modeled".to_owned()),
+        Tlbwr => match mem_fault {
+            MemFault::Panic => unsupported(
+                out,
+                "tlbwr in whole-function code requires an instruction clock".to_owned(),
+            ),
+            MemFault::Fault { .. } => line(out, "ctx.tlbwr_record();".to_string()),
+        },
         Tlbp => line(out, "ctx.tlbp_probe();".to_string()),
         Tlbr => line(out, "ctx.tlbr_read();".to_string()),
 

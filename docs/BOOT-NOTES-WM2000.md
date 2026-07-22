@@ -910,10 +910,14 @@ Two hardware-model gaps closed, both found by chasing NWXE but generic:
    it. ponytail: CPU stores don't run the PIF command interpreter yet (the
    injected executor runs on DramToPif DMA, the path joybus commands use);
    round-trip test in pi.rs.
-2. **TLB COP0 registers + `tlbwi` recording** (fn64-recomp-rs): Index/
-   EntryLo0/EntryLo1/PageMask/Wired/EntryHi (0/2/3/5/6/10) are stored
-   round-trip state, and `tlbwi` RECORDS the staged entry into
-   `RecompContext::tlb_entries[32]` instead of trapping -- libultra's
+2. **TLB COP0 registers + management operations** (fn64-recomp-rs): Index/
+   Random/EntryLo0/EntryLo1/PageMask/Wired/EntryHi (0/1/2/3/5/6/10) are typed
+   state. TLBWI/TLBWR record staged entries into
+   `RecompContext::tlb_entries[32]`, TLBR reads them, and TLBP applies
+   PageMask plus Global/ASID matching. In the arbitrary-PC lanes fn64 applies
+   the public inclusive Random/Wired range through a bounded once-per-charged-
+   instruction-unit policy, not a silicon cycle-timing claim;
+   legacy whole-function Random/TLBWR stays loud without that clock. Libultra's
    osInitialize installs a real valid mapping (observed live: EntryHi=
    0xC0000000, EntryLo0=0x02000017) and boot must not die on it. Address
    TRANSLATION through recorded entries stays unmodeled; a mapped-segment

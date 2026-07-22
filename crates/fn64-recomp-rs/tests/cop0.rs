@@ -27,11 +27,15 @@
 //!
 //! The arbitrary-PC lane models Status/Cause/EPC moves, ERET, typed
 //! synchronous exceptions, and the public indexed write/read/probe TLB
-//! management operations. TLBWR, address translation, and unavailable
-//! coprocessor state remain loud.
+//! management operations. The arbitrary-PC lanes additionally model Random
+//! and TLBWR; address translation and unavailable coprocessor state remain
+//! loud, as do Random/TLBWR in the legacy whole-function lane.
 //! Decoder and structural emitter tests keep that boundary explicit.
 
-use fn64_recomp_rs::{decode, emit_function, FuncInput, Instruction, Rdram, RecompContext};
+use fn64_recomp_rs::{
+    decode, emit_bank_runner, emit_function, BankId, BankInput, FuncInput, Instruction, Rdram,
+    RecompContext,
+};
 
 /// Real ROM bytes of `osGetCount` (big-endian words).
 const OSGETCOUNT_WORDS: [u32; 4] = [
@@ -474,6 +478,95 @@ fn tlbr_and_tlbp_emit_typed_management_operations() {
         );
         assert!(!emitted.contains("trap_unsupported"));
     }
+}
+
+#[test]
+fn arbitrary_pc_emission_models_random_and_tlbwr_but_legacy_functions_stay_loud() {
+    let emitted = emit_bank_runner(&BankInput {
+        name: "tlb_random_bank",
+        bank: BankId::new(0x77),
+        vram: 0x8000_1000,
+        words: &[0x4002_0800, 0x4200_0006], // mfc0 $v0,Random; tlbwr
+    });
+    assert!(emitted.contains("ctx.set_r32(2, ctx.read_cop0(1) as i32);"));
+    assert!(emitted.contains("ctx.tlbwr_record();"));
+
+    for (word, needle) in [
+        (0x4002_0800, "unsupported mfc0 from COP0 register 1"),
+        (
+            0x4200_0006,
+            "tlbwr in whole-function code requires an instruction clock",
+        ),
+    ] {
+        let legacy = emit_function(&FuncInput {
+            name: "legacy_tlb_clock",
+            vram: 0x8000_1000,
+            words: &[word, 0x03E0_0008, 0],
+        });
+        assert!(
+            legacy.contains(needle),
+            "legacy boundary must stay loud:\n{legacy}"
+        );
+    }
+}
+
+#[test]
+fn random_counts_down_through_wired_and_tlbwr_samples_before_advancing() {
+    let mut ctx = RecompContext::new();
+    assert_eq!(ctx.read_cop0(1), 31);
+
+    ctx.advance_cop0_random(2);
+    assert_eq!(ctx.read_cop0(1), 29);
+    ctx.write_cop0(6, 29);
+    assert_eq!(ctx.read_cop0(1), 31, "Wired write resets Random");
+    ctx.advance_cop0_random(1);
+    assert_eq!(ctx.read_cop0(1), 30);
+
+    ctx.cop0_entry_hi = 0x1234_500a;
+    ctx.cop0_entry_lo0 = 0x46;
+    ctx.cop0_entry_lo1 = 0x86;
+    ctx.cop0_page_mask = 0x6000;
+    ctx.tlbwr_record();
+    assert_eq!(ctx.tlb_entries[30].entry_hi, 0x1234_500a);
+    assert_eq!(ctx.tlb_entries[30].entry_lo0, 0x46);
+    assert_eq!(ctx.tlb_entries[30].entry_lo1, 0x86);
+    assert_eq!(ctx.tlb_entries[30].page_mask, 0x6000);
+    assert_eq!(
+        ctx.read_cop0(1),
+        30,
+        "record helper samples before the lane retires TLBWR"
+    );
+
+    ctx.advance_cop0_random(1);
+    assert_eq!(ctx.read_cop0(1), 29);
+    ctx.advance_cop0_random(1);
+    assert_eq!(ctx.read_cop0(1), 31, "countdown wraps at Wired");
+
+    ctx.write_cop0(6, 31);
+    ctx.advance_cop0_random(u32::MAX);
+    assert_eq!(
+        ctx.read_cop0(1),
+        31,
+        "Wired=31 is a stable one-entry countdown"
+    );
+}
+
+#[test]
+fn wired_outside_the_physical_tlb_stays_loud() {
+    let mut ctx = RecompContext::new();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.write_cop0(6, 32);
+    }))
+    .expect_err("Wired > 31 is architecturally undefined and must not be masked");
+    let message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .expect("Wired panic must be text");
+    assert_eq!(
+        message,
+        "COP0 Wired value 32 exceeds the 32-entry VR4300 TLB"
+    );
 }
 
 #[test]
