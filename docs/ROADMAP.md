@@ -663,14 +663,19 @@ and deterministic output traces.
   now crosses the native RT64 VI shader: a twenty-phase Metal gate proves
   dither-only and gamma-plus-dither are seed-causal, exact-repeatable, and
   restorable across distinct ordinary presents. `VI-FILTERS.md` separates those
-  deterministic digital mechanisms from the bounded partial-coverage fallback:
-  native divot/restoration/AA, exact coverage AA/resampling, the silicon gamma
-  ROM and random stream, and post-DAC analog video remain open. The typed
+  deterministic digital mechanisms from broader native and silicon claims. A
+  pinned-Metal, nearest, progressive, synthetic RGBA16 fixture now retains
+  exact managed codes-1-6 AA and source-before-projection divot pixels under
+  the original-aspect (4:3) presentation policy. Code-0/save,
+  natural/imported coverage, insufficient neighborhoods, broader filter
+  lattices, exact coverage AA/resampling, the silicon gamma ROM and random
+  stream, and post-DAC analog video remain open. The typed
   IPL standard now selects the shared VI/AI clock; nominal
   60/50 Hz boot timing gives way to H_SYNC/V_SYNC-derived field deadlines once
   a mode latches, and host loops consume the live interval. Hardware-trace
-  validation, exact random-stream identity, resampling/AA arithmetic, and
-  pixel-level RT64 capture remain open. The arbitrary-PC generated and
+  validation, exact random-stream identity, silicon resampling/AA arithmetic,
+  and pixel-level RT64 capture beyond the bounded fixture remain open. The
+  arbitrary-PC generated and
   interpreted CPU lanes now share typed 32-bit COP0 moves plus indexed/random
   TLB write/read/probe state, including the public inclusive Random/Wired
   range, TLBWR, and PageMask plus Global/ASID matching. Random advancement is
