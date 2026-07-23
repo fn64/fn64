@@ -197,11 +197,12 @@ consumes it without fabricating a commit. DeviceState v10 binds all of this
 future-affecting state, preventing equal status projections from hiding
 different DACRATE, START, source, or range futures. The public
 [N64brew Audio Interface register map](https://n64brew.dev/wiki/Audio_Interface?oldid=5924)
-defines `AI_CONTROL.DMA_ENABLE` and the reflected `AI_STATUS.ENABLED` bit, so
-disabled raw starts now fail loudly instead of silently draining; the managed
-libultra submission performs the same enable write before DRAM/LEN. The public
-source does not define a mid-transfer disable/pause transition, so changing
-CONTROL while either FIFO slot is active remains a named unsupported fault.
+defines `AI_CONTROL.DMA_ENABLE` and the reflected `AI_STATUS.ENABLED` bit.
+`AI_LEN` fills the two-slot FIFO while disabled but cannot drain until CONTROL
+is enabled; `osInitialize` establishes the initial enable used by raw libultra
+DRAM/LEN callers, and the managed submission repeats that idempotent write.
+The public source does not define a mid-transfer disable/pause transition, so
+changing CONTROL while either FIFO slot is active remains a named unsupported fault.
 Exact AI/DPC timing and counters, the precise AI-interrupt phase, mid-transfer
 AI control, FREEZE/FLUSH, subword raw access, native-C mid-task visibility,
 and silicon bus behavior remain outside the current model.
