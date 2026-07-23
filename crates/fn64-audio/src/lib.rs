@@ -42,9 +42,11 @@
 //! path and its immutable-RDRAM/returned-PCM shape is not suitable for HLE.
 #![forbid(unsafe_code)]
 
+pub mod characterize;
 pub mod hle;
 pub mod hle_commit;
 pub mod hle_lle;
+pub mod hle_memory;
 pub mod hle_outcome;
 pub mod hle_rspboot;
 pub mod hle_snapshot;

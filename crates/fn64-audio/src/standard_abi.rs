@@ -179,7 +179,7 @@ impl StandardAbiPacket {
                 state_addr: self.w1,
             },
             StandardAbiOpcode::LoadBuffer => StandardAbiCommand::LoadBuffer {
-                source_addr: self.w1,
+                raw_source: self.w1,
             },
             StandardAbiOpcode::Resample => StandardAbiCommand::Resample {
                 flags,
@@ -187,12 +187,9 @@ impl StandardAbiPacket {
                 state_addr: self.w1,
             },
             StandardAbiOpcode::SaveBuffer => StandardAbiCommand::SaveBuffer {
-                destination_addr: self.w1,
+                raw_destination: self.w1,
             },
-            StandardAbiOpcode::Segment => StandardAbiCommand::Segment {
-                segment: (self.w1 >> 24) as u8,
-                base: self.w1 & 0x00ff_ffff,
-            },
+            StandardAbiOpcode::Segment => StandardAbiCommand::Segment { raw_w1: self.w1 },
             StandardAbiOpcode::SetBuffer => StandardAbiCommand::SetBuffer {
                 flags,
                 input: low16,
@@ -212,7 +209,7 @@ impl StandardAbiPacket {
             },
             StandardAbiOpcode::LoadAdpcm => StandardAbiCommand::LoadAdpcm {
                 count: self.w0 & 0x00ff_ffff,
-                table_addr: self.w1,
+                raw_table: self.w1,
             },
             StandardAbiOpcode::Mixer => StandardAbiCommand::Mixer {
                 flags,
@@ -229,9 +226,7 @@ impl StandardAbiPacket {
                 gain: low16,
                 state_addr: self.w1,
             },
-            StandardAbiOpcode::SetLoop => StandardAbiCommand::SetLoop {
-                state_addr: self.w1,
-            },
+            StandardAbiOpcode::SetLoop => StandardAbiCommand::SetLoop { raw_state: self.w1 },
         };
 
         Ok(DecodedStandardAbiPacket {
@@ -269,7 +264,7 @@ pub enum StandardAbiCommand {
         state_addr: u32,
     },
     LoadBuffer {
-        source_addr: u32,
+        raw_source: u32,
     },
     Resample {
         flags: u8,
@@ -277,11 +272,12 @@ pub enum StandardAbiCommand {
         state_addr: u32,
     },
     SaveBuffer {
-        destination_addr: u32,
+        raw_destination: u32,
     },
     Segment {
-        segment: u8,
-        base: u32,
+        /// The public struct and macro evidence disagree about selector
+        /// width, so this word stays uninterpreted until characterization.
+        raw_w1: u32,
     },
     SetBuffer {
         flags: u8,
@@ -302,7 +298,7 @@ pub enum StandardAbiCommand {
     },
     LoadAdpcm {
         count: u32,
-        table_addr: u32,
+        raw_table: u32,
     },
     Mixer {
         flags: u8,
@@ -320,15 +316,30 @@ pub enum StandardAbiCommand {
         state_addr: u32,
     },
     SetLoop {
-        state_addr: u32,
+        raw_state: u32,
     },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodedStandardAbiPacket {
-    pub raw: StandardAbiPacket,
-    pub opcode: StandardAbiOpcode,
-    pub command: StandardAbiCommand,
+    raw: StandardAbiPacket,
+    opcode: StandardAbiOpcode,
+    command: StandardAbiCommand,
+}
+
+impl DecodedStandardAbiPacket {
+    /// The complete packet whose successful decode constructed this value.
+    pub const fn raw(self) -> StandardAbiPacket {
+        self.raw
+    }
+
+    pub const fn opcode(self) -> StandardAbiOpcode {
+        self.opcode
+    }
+
+    pub const fn command(self) -> StandardAbiCommand {
+        self.command
+    }
 }
 
 #[cfg(test)]
@@ -390,8 +401,8 @@ mod tests {
     #[test]
     fn decodes_spnoop_macro_shape() {
         let decoded = decode(StandardAbiOpcode::SpNoop, 0, 0);
-        assert_eq!(decoded.command, StandardAbiCommand::SpNoop);
-        assert_eq!(decoded.raw, StandardAbiPacket::new(0, 0));
+        assert_eq!(decoded.command(), StandardAbiCommand::SpNoop);
+        assert_eq!(decoded.raw(), StandardAbiPacket::new(0, 0));
     }
 
     #[test]
@@ -402,7 +413,7 @@ mod tests {
             0x0012_3400,
         );
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::Adpcm {
                 flags: A_INIT | A_LOOP,
                 gain: 0x2468,
@@ -415,7 +426,7 @@ mod tests {
     fn decodes_clear_buffer_macro_shape() {
         let decoded = decode(StandardAbiOpcode::ClearBuffer, 0x00a2_0240, 0x1234_0060);
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::ClearBuffer {
                 dmem: 0x00a2_0240,
                 count: 0x1234_0060,
@@ -431,7 +442,7 @@ mod tests {
             0x0008_1200,
         );
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::EnvMixer {
                 flags: A_AUX,
                 state_addr: 0x0008_1200,
@@ -443,9 +454,9 @@ mod tests {
     fn decodes_load_buffer_macro_shape() {
         let decoded = decode(StandardAbiOpcode::LoadBuffer, 0, 0x0020_4000);
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::LoadBuffer {
-                source_addr: 0x0020_4000,
+                raw_source: 0x0020_4000,
             }
         );
     }
@@ -458,7 +469,7 @@ mod tests {
             0x0004_2000,
         );
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::Resample {
                 flags: A_INIT | A_MIX,
                 pitch: UNITY_PITCH,
@@ -471,9 +482,9 @@ mod tests {
     fn decodes_save_buffer_macro_shape() {
         let decoded = decode(StandardAbiOpcode::SaveBuffer, 0, 0x0030_8000);
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::SaveBuffer {
-                destination_addr: 0x0030_8000,
+                raw_destination: 0x0030_8000,
             }
         );
     }
@@ -482,10 +493,9 @@ mod tests {
     fn decodes_segment_macro_shape() {
         let decoded = decode(StandardAbiOpcode::Segment, 0, (5 << 24) | 0x0034_5678);
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::Segment {
-                segment: 5,
-                base: 0x0034_5678,
+                raw_w1: 0x0534_5678
             }
         );
     }
@@ -498,7 +508,7 @@ mod tests {
             0x0660_0170,
         );
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::SetBuffer {
                 flags: A_AUX,
                 input: 0x0110,
@@ -516,7 +526,7 @@ mod tests {
             0x4000_1234,
         );
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::SetVolume {
                 flags: A_LEFT | A_VOL,
                 volume: 0x7fff,
@@ -530,7 +540,7 @@ mod tests {
     fn decodes_dmem_move_macro_shape() {
         let decoded = decode(StandardAbiOpcode::DmemMove, 0x00a3_0320, 0x0780_0080);
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::DmemMove {
                 input: 0x00a3_0320,
                 output: 0x0780,
@@ -543,10 +553,10 @@ mod tests {
     fn decodes_load_adpcm_macro_shape() {
         let decoded = decode(StandardAbiOpcode::LoadAdpcm, 0x00b0_0080, 0x0018_2000);
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::LoadAdpcm {
                 count: 0x00b0_0080,
-                table_addr: 0x0018_2000,
+                raw_table: 0x0018_2000,
             }
         );
     }
@@ -559,7 +569,7 @@ mod tests {
             0x0220_0880,
         );
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::Mixer {
                 flags: A_MIX,
                 gain: 0x6000,
@@ -573,7 +583,7 @@ mod tests {
     fn decodes_interleave_macro_shape() {
         let decoded = decode(StandardAbiOpcode::Interleave, 0, 0x04e0_0650);
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::Interleave {
                 left: 0x04e0,
                 right: 0x0650,
@@ -589,7 +599,7 @@ mod tests {
             0x0009_1000,
         );
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::PoleFilter {
                 flags: A_INIT,
                 gain: 0x5000,
@@ -602,9 +612,9 @@ mod tests {
     fn decodes_set_loop_macro_shape() {
         let decoded = decode(StandardAbiOpcode::SetLoop, 0, 0x0014_0800);
         assert_eq!(
-            decoded.command,
+            decoded.command(),
             StandardAbiCommand::SetLoop {
-                state_addr: 0x0014_0800,
+                raw_state: 0x0014_0800,
             }
         );
     }
@@ -613,8 +623,8 @@ mod tests {
     fn raw_words_retain_padding_the_header_does_not_assign() {
         let raw = StandardAbiPacket::new(0x00ab_cdef, 0x89ab_cdef);
         let decoded = raw.decode().unwrap();
-        assert_eq!(decoded.raw, raw);
-        assert_eq!(decoded.command, StandardAbiCommand::SpNoop);
+        assert_eq!(decoded.raw(), raw);
+        assert_eq!(decoded.command(), StandardAbiCommand::SpNoop);
     }
 
     #[test]

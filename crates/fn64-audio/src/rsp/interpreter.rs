@@ -48,7 +48,8 @@ pub fn run_imem(
         0x1000 | (pc & 0x0fff)
     };
     let mut steps = 0u64;
-    let trace_execution = std::env::var_os("RSP_TRACE_EXEC").is_some();
+    let trace_execution = !crate::rsp::recomp::content_safe_diagnostics()
+        && std::env::var_os("RSP_TRACE_EXEC").is_some();
     let trace_limit = std::env::var("RSP_TRACE_EXEC_LIMIT")
         .ok()
         .map(|raw| {

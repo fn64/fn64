@@ -32,6 +32,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static DMA_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// One diagnostic observation of an SP DMA command at its execution point.
+///
+/// This journal is intentionally absent from [`RspArchitecturalState`] and
+/// [`RspMachineState`]. It can characterize a microcode as a black box, but
+/// cannot influence execution, comparison, or commit authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RspDmaJournalEntry {
+    pub direction: RspDmaDirection,
+    pub effective_dram_address: u32,
+    pub sp_mem_address: u32,
+    pub raw_length_descriptor: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RspDmaDirection {
+    Read,
+    Write,
+}
+
 /// One RDP command-DMA range submitted through the RSP's DPC CP0 registers.
 /// `xbus` records whether the command source is RSP DMEM rather than RDRAM.
 /// XBUS bytes are captured at submission time because the ucode reuses its
@@ -201,6 +220,20 @@ impl RspMachineState {
     pub const fn diagnostic_steps(&self) -> u64 {
         self.diagnostic_steps
     }
+
+    /// Convert an rspboot-to-ucode handoff into the bounded state retained
+    /// after an optimized HLE backend reports success.
+    ///
+    /// The backend does not expose the ucode's post-execution scalar/VU
+    /// image, so this preserves rspboot-entry registers while consuming the
+    /// overlay resume latch that only the represented ucode phase could use.
+    /// Callers must label this as compatibility evidence, never as exact LLE
+    /// post-task state.
+    pub fn into_hle_compatibility_architectural_state(mut self) -> RspArchitecturalState {
+        self.architectural.resume_address = 0;
+        self.architectural.resume_delay = false;
+        self.architectural
+    }
 }
 
 impl ImemDmaSpan {
@@ -249,6 +282,7 @@ pub struct RspMachine<'a> {
     /// drain. The admitted-range check above the copy remains authoritative;
     /// this log lets callers commit only bytes the RSP could have changed.
     rdram_writes: Vec<(usize, usize)>,
+    dma_journal: Vec<RspDmaJournalEntry>,
 }
 
 impl<'a> RspMachine<'a> {
@@ -278,6 +312,7 @@ impl<'a> RspMachine<'a> {
             dp_tmem_busy: 0,
             dp_submissions: Vec::new(),
             rdram_writes: Vec::new(),
+            dma_journal: Vec::new(),
         }
     }
 
@@ -397,6 +432,36 @@ impl<'a> RspMachine<'a> {
     /// begins. BUSY/FULL remain owned by the outer device fabric.
     pub fn set_sp_status_raw(&mut self, status: u32) {
         self.sp_status = status;
+    }
+
+    /// Overlay the registers owned authoritatively by the outer device
+    /// fabric while retaining scalar, vector, and continuation state.
+    ///
+    /// CPU MMIO and `osSpTaskLoad` may change these latches between two
+    /// interpreter entries. Restoring their stale duplicate from the prior
+    /// task would make the next CP0 read depend on which execution lane ran
+    /// last. Pending interpreter-produced DPC submissions must be drained by
+    /// the prior commit before the fabric image can replace their register
+    /// context.
+    pub fn overlay_device_execution_state(&mut self, state: fn64_runtime::RspExecutionState) {
+        assert!(
+            self.dp_submissions.is_empty(),
+            "cannot overlay device-owned RSP registers with queued interpreter DPC submissions"
+        );
+        self.ctx.dma_mem_address = u32::from(state.sp_dma_mem_addr.get());
+        self.ctx.dma_dram_address = state.sp_dma_dram_addr.offset();
+        self.sp_status = state.sp_status;
+        self.sp_semaphore = state.sp_semaphore;
+        self.dma_read_length = state.sp_dma_read_length;
+        self.dma_write_length = state.sp_dma_write_length;
+        self.dp_start = state.dpc_start;
+        self.dp_end = state.dpc_end;
+        self.dp_current = state.dpc_current;
+        self.dp_status = state.dpc_status;
+        self.dp_clock = state.dpc_clock;
+        self.dp_busy = state.dpc_busy;
+        self.dp_pipe_busy = state.dpc_pipe_busy;
+        self.dp_tmem_busy = state.dpc_tmem_busy;
     }
 
     pub const fn sp_status(&self) -> u32 {
@@ -548,7 +613,7 @@ impl<'a> RspMachine<'a> {
     /// Write one RSP-view CP0 register. A read-DMA into IMEM returns
     /// `SwapOverlay`; all other writes complete synchronously.
     pub fn write_cp0(&mut self, reg: u8, value: u32) -> Option<RspExitReason> {
-        if std::env::var_os("RSP_TRACE_CP0").is_some() {
+        if !super::content_safe_diagnostics() && std::env::var_os("RSP_TRACE_CP0").is_some() {
             eprintln!("[fn64-rsp-cp0] write c{reg}={value:#010x}");
         }
         match reg {
@@ -949,6 +1014,12 @@ impl<'a> RspMachine<'a> {
                 skip,
             },
         );
+        self.dma_journal.push(RspDmaJournalEntry {
+            direction: RspDmaDirection::Read,
+            effective_dram_address: dram as u32,
+            sp_mem_address: self.ctx.dma_mem_address & 0x1ff8,
+            raw_length_descriptor: len,
+        });
         trace_dma(DmaTrace {
             direction: if self.ctx.dma_mem_address & 0x1000 != 0 {
                 "read-imem"
@@ -1059,6 +1130,12 @@ impl<'a> RspMachine<'a> {
                 skip,
             },
         );
+        self.dma_journal.push(RspDmaJournalEntry {
+            direction: RspDmaDirection::Write,
+            effective_dram_address: dram as u32,
+            sp_mem_address: self.ctx.dma_mem_address & 0x1ff8,
+            raw_length_descriptor: len,
+        });
         trace_dma(DmaTrace {
             direction: "write",
             dram,
@@ -1109,6 +1186,11 @@ impl<'a> RspMachine<'a> {
     /// Drain the sorted, disjoint RDRAM write coverage produced by SP DMA.
     pub fn take_rdram_writes(&mut self) -> Vec<(usize, usize)> {
         std::mem::take(&mut self.rdram_writes)
+    }
+
+    /// Drain diagnostic observations without changing architectural state.
+    pub fn take_dma_journal(&mut self) -> Vec<RspDmaJournalEntry> {
+        std::mem::take(&mut self.dma_journal)
     }
 
     /// Convenience accessor for the VU state the compute-op dispatcher wants.
@@ -1202,7 +1284,7 @@ struct DmaTrace {
 }
 
 fn trace_dma(trace: DmaTrace) {
-    if std::env::var_os("RSP_TRACE_DMA").is_none() {
+    if super::content_safe_diagnostics() || std::env::var_os("RSP_TRACE_DMA").is_none() {
         return;
     }
     let seq = DMA_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1233,6 +1315,9 @@ fn trace_dma(trace: DmaTrace) {
 }
 
 fn trace_dma_words(rdram: &[u8], mut dram: usize, line_len: usize, lines: usize, skip: usize) {
+    if super::content_safe_diagnostics() {
+        return;
+    }
     let Some(limit) = std::env::var("RSP_TRACE_DMA_WORDS").ok().map(|raw| {
         raw.parse::<usize>()
             .unwrap_or_else(|_| panic!("RSP_TRACE_DMA_WORDS must be an integer, got {raw:?}"))
@@ -1407,6 +1492,60 @@ mod tests {
     }
 
     #[test]
+    fn device_overlay_replaces_only_fabric_owned_registers() {
+        let mut rdram = vec![0u8; 32];
+        let mut machine = RspMachine::new(&mut rdram);
+        populate_distinct_architectural_state(&mut machine);
+        machine.dp_submissions.clear();
+        let scalar = machine.ctx.r;
+        let jump_target = machine.ctx.jump_target;
+        let resume_address = machine.ctx.resume_address;
+        let resume_delay = machine.ctx.resume_delay;
+        let vu = machine.ctx.rsp.clone();
+        let diagnostic_steps = machine.ctx.steps;
+        let fabric = fn64_runtime::RspExecutionState {
+            pc: 0x0abc,
+            sp_status: 0x0102_0304,
+            sp_semaphore: false,
+            sp_dma_mem_addr: fn64_runtime::RspMemAddr::from_register(0x1234),
+            sp_dma_dram_addr: fn64_runtime::RdramAddr::from_offset(0x456788),
+            sp_dma_read_length: 0x1112_1314,
+            sp_dma_write_length: 0x2122_2324,
+            dpc_start: 0x100,
+            dpc_end: 0x180,
+            dpc_current: 0x140,
+            dpc_status: 0x3132_3334,
+            dpc_clock: 0x4142_4344,
+            dpc_busy: 0x5152_5354,
+            dpc_pipe_busy: 0x6162_6364,
+            dpc_tmem_busy: 0x7172_7374,
+        };
+
+        machine.overlay_device_execution_state(fabric);
+        let state = machine.snapshot_architectural_state();
+        assert_eq!(state.gprs(), &scalar);
+        assert_eq!(state.jump_target(), jump_target);
+        assert_eq!(state.resume_address(), resume_address);
+        assert_eq!(state.resume_delay(), resume_delay);
+        assert_eq!(state.vu(), &vu);
+        assert_eq!(machine.ctx.steps, diagnostic_steps);
+        assert_eq!(state.sp_status(), fabric.sp_status);
+        assert_eq!(state.sp_semaphore(), fabric.sp_semaphore);
+        assert_eq!(state.dma_mem_address(), 0x1234);
+        assert_eq!(state.dma_dram_address(), 0x456788);
+        assert_eq!(state.dma_read_length(), fabric.sp_dma_read_length);
+        assert_eq!(state.dma_write_length(), fabric.sp_dma_write_length);
+        assert_eq!(state.dp_start(), fabric.dpc_start);
+        assert_eq!(state.dp_end(), fabric.dpc_end);
+        assert_eq!(state.dp_current(), fabric.dpc_current);
+        assert_eq!(state.dp_status(), fabric.dpc_status);
+        assert_eq!(state.dp_clock(), fabric.dpc_clock);
+        assert_eq!(state.dp_busy(), fabric.dpc_busy);
+        assert_eq!(state.dp_pipe_busy(), fabric.dpc_pipe_busy);
+        assert_eq!(state.dp_tmem_busy(), fabric.dpc_tmem_busy);
+    }
+
+    #[test]
     fn complete_machine_snapshot_keeps_diagnostics_separate() {
         let mut source_rdram = vec![0u8; 32];
         let mut source = RspMachine::new(&mut source_rdram);
@@ -1435,6 +1574,40 @@ mod tests {
         machine.record_rdram_write(0x28, 0x38);
         machine.record_rdram_write(0x58, 0x28);
         assert_eq!(machine.take_rdram_writes(), vec![(0x20, 0x88)]);
+    }
+
+    #[test]
+    fn rejected_dma_does_not_enter_diagnostic_journal() {
+        let mut rdram = [0; 8];
+        let mut machine = RspMachine::new(&mut rdram);
+        machine.set_dma_dram(8);
+        machine.set_dma_mem(0);
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            machine.dma_read(7);
+        }));
+        assert!(rejected.is_err());
+        assert!(machine.take_dma_journal().is_empty());
+    }
+
+    #[test]
+    fn draining_diagnostic_journal_cannot_change_machine_state() {
+        let mut rdram = [0; 16];
+        let mut machine = RspMachine::new(&mut rdram);
+        machine.set_dma_dram(0);
+        machine.set_dma_mem(0);
+        assert_eq!(machine.dma_read(7), None);
+        let before = machine.snapshot_state();
+        assert_eq!(
+            machine.take_dma_journal(),
+            vec![RspDmaJournalEntry {
+                direction: RspDmaDirection::Read,
+                effective_dram_address: 0,
+                sp_mem_address: 0,
+                raw_length_descriptor: 7,
+            }]
+        );
+        assert_eq!(machine.snapshot_state(), before);
+        assert!(machine.take_dma_journal().is_empty());
     }
 
     #[test]

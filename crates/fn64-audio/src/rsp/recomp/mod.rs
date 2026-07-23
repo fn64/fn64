@@ -25,8 +25,49 @@ pub mod runtime;
 
 pub use emit::emit_module;
 
+use std::cell::Cell;
+
 use crate::rsp::context::RspExitReason;
 use crate::rsp::ops::VuOp;
+
+thread_local! {
+    static CONTENT_SAFE_DIAGNOSTIC_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Thread-local guard used by private-input characterization to suppress any
+/// diagnostic that would reproduce instruction or guest-memory values.
+pub(crate) struct ContentSafeDiagnosticsGuard;
+
+impl ContentSafeDiagnosticsGuard {
+    pub(crate) fn enter() -> Self {
+        CONTENT_SAFE_DIAGNOSTIC_DEPTH.with(|depth| {
+            depth.set(
+                depth
+                    .get()
+                    .checked_add(1)
+                    .expect("diagnostic guard depth overflow"),
+            );
+        });
+        Self
+    }
+}
+
+impl Drop for ContentSafeDiagnosticsGuard {
+    fn drop(&mut self) {
+        CONTENT_SAFE_DIAGNOSTIC_DEPTH.with(|depth| {
+            depth.set(
+                depth
+                    .get()
+                    .checked_sub(1)
+                    .expect("unbalanced diagnostic guard"),
+            );
+        });
+    }
+}
+
+pub(crate) fn content_safe_diagnostics() -> bool {
+    CONTENT_SAFE_DIAGNOSTIC_DEPTH.with(|depth| depth.get() != 0)
+}
 
 /// Loud trap for an instruction word the decoder did not recognize. The
 /// generated code returns this instead of silently skipping — the address and
@@ -37,8 +78,11 @@ use crate::rsp::ops::VuOp;
 #[cold]
 #[inline(never)]
 pub fn trap_unknown(imem_addr: u32, word: u32) -> RspExitReason {
-    let context =
-        format!("unimplemented RSP instruction word 0x{word:08X} at IMEM 0x{imem_addr:04X}");
+    let context = if content_safe_diagnostics() {
+        format!("unimplemented RSP instruction at IMEM 0x{imem_addr:04X} (word redacted)")
+    } else {
+        format!("unimplemented RSP instruction word 0x{word:08X} at IMEM 0x{imem_addr:04X}")
+    };
     fn64_runtime::record_unsupported_event(
         fn64_runtime::UnsupportedSubsystem::Audio,
         "audio.rsp.unknown-instruction",
@@ -58,7 +102,11 @@ pub fn trap_unknown(imem_addr: u32, word: u32) -> RspExitReason {
 #[cold]
 #[inline(never)]
 pub fn trap_unknown_vu(imem_addr: u32, op: VuOp) -> RspExitReason {
-    let context = format!("VU op {op:?} at IMEM 0x{imem_addr:04X} has no dispatch body");
+    let context = if content_safe_diagnostics() {
+        format!("unimplemented VU operation at IMEM 0x{imem_addr:04X} (operation redacted)")
+    } else {
+        format!("VU op {op:?} at IMEM 0x{imem_addr:04X} has no dispatch body")
+    };
     fn64_runtime::record_unsupported_event(
         fn64_runtime::UnsupportedSubsystem::Audio,
         "audio.rsp.unimplemented-vu-op",
@@ -122,9 +170,16 @@ pub fn trap_step_budget(imem_addr: u32) -> RspExitReason {
 #[cold]
 #[inline(never)]
 pub fn trap_delay_slot_control(imem_addr: u32, instruction: impl std::fmt::Debug) -> ! {
-    let context = format!(
-        "unsupported RSP control transfer {instruction:?} in delay slot at IMEM 0x{imem_addr:04X}"
-    );
+    let context = if content_safe_diagnostics() {
+        format!(
+            "RSP delay-slot control transfer is unsupported at IMEM 0x{imem_addr:04X} \
+             (instruction redacted)"
+        )
+    } else {
+        format!(
+            "unsupported RSP control transfer {instruction:?} in delay slot at IMEM 0x{imem_addr:04X}"
+        )
+    };
     fn64_runtime::record_unsupported_event(
         fn64_runtime::UnsupportedSubsystem::Audio,
         "audio.rsp.delay-slot-control-transfer",
@@ -191,6 +246,25 @@ mod unsupported_event_tests {
             events[5].operation,
             concat!("audio.rsp.", "recompiler-step-budget")
         );
+
+        fn64_runtime::arm_unsupported_events(None).unwrap();
+        {
+            let _guard = ContentSafeDiagnosticsGuard::enter();
+            assert_eq!(
+                trap_unknown(0x1040, 0xdead_beef),
+                RspExitReason::Unsupported
+            );
+            assert_eq!(
+                trap_unknown_vu(0x1080, VuOp::Vmulf),
+                RspExitReason::Unsupported
+            );
+        }
+        let redacted = fn64_runtime::copy_unsupported_events();
+        assert_eq!(redacted.len(), 2);
+        assert!(redacted[0].context.contains("word redacted"));
+        assert!(!redacted[0].context.contains("DEADBEEF"));
+        assert!(redacted[1].context.contains("operation redacted"));
+        assert!(!redacted[1].context.contains("Vmulf"));
     }
 }
 

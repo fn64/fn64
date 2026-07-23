@@ -2193,7 +2193,7 @@ mod tests {
 
     #[test]
     fn private_series_tracks_the_current_release_report_schema() {
-        assert_eq!(RELEASE_REPORT_SCHEMA, "fn64.release-gate.v25");
+        assert_eq!(RELEASE_REPORT_SCHEMA, "fn64.release-gate.v27");
     }
 
     struct TestDirectory(PathBuf);

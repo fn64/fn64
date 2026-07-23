@@ -35,6 +35,7 @@
 mod geometry_task_inspection;
 mod microcode;
 mod microcode_identity;
+mod raw_dpc_batch;
 mod rdp_completion;
 mod settings;
 pub mod vi_public_filters;
@@ -54,6 +55,11 @@ pub use microcode::{
 pub use microcode_identity::{
     capture_task_admission_raw_window, identify_f3dzex2, F3dzex2Variant, F3DZEX2_IDENTITY_SOURCE,
     F3DZEX2_RAW_WINDOW_SIZE,
+};
+pub use raw_dpc_batch::{
+    OwnedRawDpcSubmission, PreflightedRawDpcBatch, RawDpcBatch, RawDpcBatchCapability,
+    RawDpcBatchOutcome, RawDpcBatchPreflightError, RawDpcSource, RawDpcStreamGroup,
+    RawDpcSubmissionError, RawDpcSubmissionIdentity,
 };
 pub use rdp_completion::{inspect_raw_rdp_full_sync, raw_rdp_command_width};
 pub use settings::{
@@ -1186,6 +1192,31 @@ pub trait RenderBackend {
         })
     }
 
+    /// Availability of the explicitly non-certifying staged-RDRAM diagnostic.
+    /// `DiagnosticOnly` is never authority to publish guest or device state.
+    fn raw_dpc_batch_capability(&self) -> RawDpcBatchCapability {
+        RawDpcBatchCapability::Unsupported
+    }
+
+    /// Consume a completely preflighted batch for render-only diagnostics.
+    ///
+    /// The default is a loud capability failure. Implementations must never
+    /// loop over `process_rdp_commands` unless it owns a complete backend-state
+    /// snapshot: an error after an earlier stream group would otherwise expose
+    /// a partial diagnostic result. This seam does not represent `CMD_END`
+    /// timing, interrupt ordering, or intermediate memory visibility.
+    fn process_raw_dpc_batch(
+        &mut self,
+        _rdram: &mut [u8],
+        _batch: PreflightedRawDpcBatch,
+        _output_addr: u32,
+    ) -> Result<RawDpcBatchOutcome, RenderError> {
+        Err(RenderError::Backend {
+            backend: "raw-dpc-batch",
+            reason: "registered backend does not implement diagnostic raw-DPC batches".to_string(),
+        })
+    }
+
     /// FullSync result of the immediately preceding successful task, raw DPC
     /// submission, or committed task chunk. For a resumable task this result
     /// is cumulative through the returned continuation. Implementations reset
@@ -1549,6 +1580,36 @@ mod tests {
             events[0].disposition,
             fn64_runtime::UnsupportedDisposition::ReturnedError
         );
+    }
+
+    #[test]
+    fn default_raw_dpc_batch_capability_rejects_without_memory_mutation() {
+        let mut backend = FakeBackend {
+            ready: true,
+            ucodes: vec![],
+            frames_presented: 0,
+        };
+        let mut rdram = vec![0x5a; 0x200];
+        let before = rdram.clone();
+        let submission =
+            OwnedRawDpcSubmission::from_rdram_words(0x100, 0x108, vec![0xe900_0000, 0]).unwrap();
+        let batch = RawDpcBatch::new(vec![submission])
+            .unwrap()
+            .preflight(rdram.len())
+            .unwrap();
+
+        let error = backend
+            .process_raw_dpc_batch(&mut rdram, batch, 0)
+            .unwrap_err();
+
+        assert_eq!(
+            backend.raw_dpc_batch_capability(),
+            RawDpcBatchCapability::Unsupported
+        );
+        assert!(error
+            .to_string()
+            .contains("does not implement diagnostic raw-DPC batches"));
+        assert_eq!(rdram, before);
     }
 
     #[test]

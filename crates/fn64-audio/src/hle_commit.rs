@@ -242,8 +242,12 @@ impl VerifiedUcodePhaseCommit {
     }
 
     /// Move every field into the dependency-direction-neutral adapter parts.
-    pub fn into_parts(self) -> VerifiedUcodePhaseCommitParts {
+    pub fn into_parts(
+        self,
+        task_admission_generation: NonZeroU64,
+    ) -> VerifiedUcodePhaseCommitParts {
         VerifiedUcodePhaseCommitParts {
+            task_admission_generation,
             selection: self.selection,
             terminal: self.terminal,
             rdram_patches: self.rdram_patches,
@@ -268,6 +272,7 @@ impl VerifiedUcodePhaseCommit {
 /// use fn64_audio::hle_commit::VerifiedUcodePhaseCommitParts;
 ///
 /// let forged = VerifiedUcodePhaseCommitParts {
+///     task_admission_generation: todo!(),
 ///     selection: todo!(),
 ///     terminal: todo!(),
 ///     rdram_patches: todo!(),
@@ -281,6 +286,7 @@ impl VerifiedUcodePhaseCommit {
 /// ```
 #[derive(Debug)]
 pub struct VerifiedUcodePhaseCommitParts {
+    task_admission_generation: NonZeroU64,
     selection: AudioHleSelection,
     terminal: AudioTaskTerminalReason,
     rdram_patches: CanonicalRdramPatches,
@@ -298,6 +304,7 @@ impl VerifiedUcodePhaseCommitParts {
     pub fn consume_with<T>(
         self,
         apply: impl FnOnce(
+            NonZeroU64,
             AudioHleSelection,
             AudioTaskTerminalReason,
             CanonicalRdramPatches,
@@ -310,6 +317,7 @@ impl VerifiedUcodePhaseCommitParts {
         ) -> T,
     ) -> T {
         apply(
+            self.task_admission_generation,
             self.selection,
             self.terminal,
             self.rdram_patches,
@@ -569,9 +577,19 @@ mod tests {
         .unwrap();
         let reference = outcome(1, vec![submission.clone()]);
         let token = verify_ucode_phase_commit(&reference, candidate(reference.clone())).unwrap();
-        let parts = token.into_commit().into_parts();
+        let parts = token.into_commit().into_parts(NonZeroU64::new(7).unwrap());
         let (dpc_submissions, pc_low12, rsp_memory, machine_state, steps) = parts.consume_with(
-            |_, _, _, _, rsp_memory, machine_state, pc_low12, dpc_submissions, steps| {
+            |generation,
+             _,
+             _,
+             _,
+             _,
+             rsp_memory,
+             machine_state,
+             pc_low12,
+             dpc_submissions,
+             steps| {
+                assert_eq!(generation.get(), 7);
                 (dpc_submissions, pc_low12, rsp_memory, machine_state, steps)
             },
         );

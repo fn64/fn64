@@ -25,7 +25,7 @@ use crate::hle_outcome::{
 use crate::hle_snapshot::{
     AudioHleSnapshotError, AudioTaskEntrySnapshot, PostRspbootAudioTaskParts,
 };
-use crate::rsp::runtime::{ImemDmaSpan, RspMachine, RspMachineState};
+use crate::rsp::runtime::{ImemDmaSpan, RspDmaJournalEntry, RspMachine, RspMachineState};
 use crate::rsp::{run_imem, RspExitReason};
 
 const BOOT_CHUNK_STEPS: u64 = 1 << 12;
@@ -198,6 +198,7 @@ pub struct AudioRspbootEntry {
     boot_rdram_write_ranges: Vec<RdramByteRange>,
     boot_rdram_patches: CanonicalRdramPatches,
     imem_replacements: Vec<RspbootImemReplacement>,
+    dma_journal: Vec<RspDmaJournalEntry>,
 }
 
 impl AudioRspbootEntry {
@@ -215,6 +216,11 @@ impl AudioRspbootEntry {
 
     pub fn imem_replacements(&self) -> &[RspbootImemReplacement] {
         &self.imem_replacements
+    }
+
+    /// Diagnostic observations only; never part of commit authority.
+    pub fn dma_journal(&self) -> &[RspDmaJournalEntry] {
+        &self.dma_journal
     }
 
     pub fn into_entry(self) -> AudioTaskEntrySnapshot {
@@ -324,6 +330,7 @@ pub fn execute_audio_rspboot_to_entry(
         });
     }
     let storage_write_ranges = machine.take_rdram_writes();
+    let dma_journal = machine.take_dma_journal();
     drop(machine);
 
     persistent_memory
@@ -371,6 +378,7 @@ pub fn execute_audio_rspboot_to_entry(
         boot_rdram_write_ranges,
         boot_rdram_patches,
         imem_replacements: replacements,
+        dma_journal,
     })
 }
 
