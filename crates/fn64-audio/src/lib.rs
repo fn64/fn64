@@ -44,6 +44,7 @@
 
 pub mod hle;
 pub mod hle_outcome;
+pub mod hle_snapshot;
 pub mod hle_transaction;
 pub mod rsp;
 pub mod standard_abi;
