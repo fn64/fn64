@@ -26,6 +26,12 @@ rt64 = ["fn64-render-rt64/rt64"]
 # workspace build; the rs manifest (crates/fn64-shell/rs/Cargo.toml) redefines
 # it as the real `dep:oot-audio-ucode` link.
 oot-audio = []
+# AKI-family audio: links the aki-audio-ucode adapter, which recompiles the AKI
+# audio ucode from the ROM at build time. Unlike oot-audio-ucode this crate
+# depends on THIS workspace's fn64-audio (same path), so there is no lockfile
+# cross-pin -- it can be a real optional dependency here. Works in both the C
+# and rs lanes since it's registered via fn64_abi::set_audio_ucode_fn.
+aki-audio = ["dep:aki-audio-ucode"]
 
 [build-dependencies]
 # Compiles the out-of-tree RecompiledFuncs/*.c plus fn64-boot-harness's shared
@@ -43,6 +49,10 @@ fn64-render-rt64 = { path = "../fn64-render-rt64" }
 # cpal-backed AudioBackend lives here; we register it via
 # fn64_abi::set_audio_backend to wire the audio OUTPUT path.
 fn64-audio = { path = "../fn64-audio" }
+# AKI audio ucode adapter (recompiles the ucode from the ROM at build time).
+# Optional, behind the `aki-audio` feature; depends on the same fn64-audio path
+# as this crate, so no lockfile cross-pin.
+aki-audio-ucode = { path = "../../examples/wm2000-boot/audio-ucode", optional = true }
 
 # Window + live framebuffer present. Both MIT/Apache-2.0 (permissive).
 # `pixels` is a thin wgpu-backed pixel-buffer presenter -- the simplest way
