@@ -839,7 +839,6 @@ dependencies = [
  "fn64-render-rt64",
  "fn64-runtime",
  "gilrs",
- "libc",
  "pixels",
  "serde",
  "toml",

@@ -751,10 +751,14 @@ The rest of boot waits on something never delivered -- plausibly a
 notification one of the SKIPPED empty-dispatch-table handlers
 (D_800481FC entries 0/1/2, hooks A/B/C) would have sent. The rung-3
 mystery is now load-bearing: the table's writer is still unfound, and its
-handlers appear to be what advances boot past audio bring-up. Exit-time
-teardown also aborts (`panic_cannot_unwind` force-unwinding a coroutine
-parked inside extern "C" `fn64_c_mmio_read_w`) -- cosmetic, post-summary,
-worth an `extern "C-unwind"` follow-up.
+handlers appear to be what advances boot past audio bring-up. The former
+post-summary teardown abort was not guest execution: TLS tried to force-unwind
+a suspended coroutine through extern-C `fn64_c_mmio_read_w`. The shared
+terminal `fn64_abi::prepare_process_exit` boundary now detaches only
+started/unfinished foreign stacks, discards a retained renderer continuation
+at its committed boundary without resuming it, clears saved pointers, and
+allows ordinary Rust process teardown; changing individual shims to
+`extern "C-unwind"` would not cover the generated-C frames above them.
 
 ## Lane 2 same session: wm2000-block-boot -- the DISCOVERY lane executes real ROM code
 

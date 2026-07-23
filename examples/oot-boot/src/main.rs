@@ -861,9 +861,8 @@ fn main() {
             }
             let _ = std::io::stdout().flush();
             let _ = std::io::stderr().flush();
-            // SAFETY: diagnostic state is flushed above; skipping coroutine
-            // TLS teardown avoids unwinding suspended extern-C guest frames.
-            unsafe { libc::_exit(0) }
+            prepare_clean_process_exit("quiescent discovery");
+            return;
         }
         if advanced_field {
             let before_host_advance = fn64_abi::sim_time();
@@ -913,9 +912,8 @@ fn main() {
                         );
                         let _ = std::io::stdout().flush();
                         let _ = std::io::stderr().flush();
-                        // SAFETY: diagnostic state is flushed above; skipping
-                        // TLS teardown avoids suspended extern-C guest frames.
-                        unsafe { libc::_exit(0) }
+                        prepare_clean_process_exit("presentation discovery");
+                        return;
                     }
                     Ok(_) => {}
                     Err(fn64_render::RenderError::NotReady(
@@ -1418,20 +1416,17 @@ fn main() {
         println!("[oot-boot] trace written to {TRACE_PATH}");
     }
 
-    // Recompiled threads may be suspended inside an existing `extern "C"`
-    // ABI shim (most commonly blocking osRecvMesg) in BOTH lanes: the C lane
-    // aborted with exit 134 in `osRecvMesg_recomp` during TLS teardown the
-    // same way the rs lane once did. Rust TLS teardown would make corosensei
-    // force-unwind that stack across the non-unwind FFI boundary and abort
-    // after an otherwise complete bounded probe. All diagnostic state is
-    // explicitly flushed above, so terminate the harness process without
-    // running that invalid coroutine destructor — exit code 0 is then a
-    // trustworthy probe-success signal for both lanes.
+    prepare_clean_process_exit("bounded probe");
+}
+
+fn prepare_clean_process_exit(reason: &str) {
+    let exit = fn64_abi::prepare_process_exit();
+    println!(
+        "[oot-boot] {reason} process exit prepared: threads={} detached_coroutines={}",
+        exit.threads, exit.detached_coroutines
+    );
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    // SAFETY: `_exit` has no memory contract; unlike `exit`, it skips C
-    // atexit/TLS destructors. That distinction is the purpose here.
-    unsafe { libc::_exit(0) }
 }
 
 fn read_guest_u32(rdram: &[u8], offset: usize) -> u32 {
