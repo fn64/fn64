@@ -13,7 +13,7 @@ the device fabric. `osAiSetNextBuffer` later identifies the PCM range consumed
 by AI. An HLE task therefore cannot be modeled as an immutable RDRAM input that
 returns a `Vec<i16>`: its result is a transactional set of machine effects.
 
-The HLE foundation has three independent pieces:
+The HLE foundation has four independent pieces:
 
 - `hle.rs` validates and iterates family-neutral 8-byte command framing without
   assigning semantics to an unknown family.
@@ -22,6 +22,12 @@ The HLE foundation has three independent pieces:
 - `hle_transaction.rs` owns checked 4 KiB DMEM and a logical-byte,
   copy-on-write RDRAM overlay. It produces canonical patches without mutating
   the live task input.
+- `hle_snapshot.rs` validates an owned post-rspboot capture and forks deep,
+  pointer-free lane state. It retains the load-time and DMEM-entry headers
+  separately, exact native-word physical RDRAM, complete RSP memory and
+  non-memory state, canonical low-12 SP PC, and rspboot work. HLE receives
+  logical transactional access; only a consumed LLE lane exposes native
+  backing.
 
 The standard ABI decoder is a separate layer. Possessing a valid standard
 packet does not prove that the loaded microcode implements that packet family.
@@ -82,6 +88,14 @@ memory owner supports segmented copy-on-write storage. Speculative lanes do not
 notify executable writes, submit DPC work, schedule completion, or touch live
 device state; those effects occur once after comparison.
 
+The snapshot constructor proves that caller-supplied boundary state is
+internally consistent; it does not prove that rspboot historically produced
+that state. Runtime integration must construct it only from the boot-overlay
+handoff, initially grant exactly physical `0..8 MiB` DMA authority, and trap if
+the task actually requires a static alias. Direct-IMEM tasks remain a loud
+differential frontier. Moving the pure rspboot-to-entry capture behind the
+`fn64-audio` seam is the next step toward making provenance structural.
+
 ## Work sequence
 
 1. **Framing and outcomes** — complete the allocation-free command view,
@@ -89,16 +103,19 @@ device state; those effects occur once after comparison.
    first-divergence comparator.
 2. **Standard wire decoder** — decode all 16 documented packets and reject
    unknown selectors/unsupported flag combinations without mutating state.
-3. **Memory commands** — implement `SETBUFF`, `LOADBUFF`, `SAVEBUFF`,
+3. **Task-entry snapshot** — capture complete RSP memory/non-memory state and
+   exact physical RDRAM once after rspboot, then fork independently owned LLE
+   and HLE lanes. The owned types are complete; runtime capture wiring is next.
+4. **Memory commands** — implement `SETBUFF`, `LOADBUFF`, `SAVEBUFF`,
    `CLEARBUFF`, `DMEMMOVE`, `SEGMENT`, and `LOADADPCM` with complete preflight
    and overlap/bounds tests.
-4. **DSP commands** — add ADPCM, resample, mixer/envelope, interleave, and
+5. **DSP commands** — add ADPCM, resample, mixer/envelope, interleave, and
    pole-filter behavior incrementally. Each arithmetic edge is accepted only
    through exact LLE differentials.
-5. **Runtime policy** — add a non-release HLE/differential policy, task-entry
-   snapshot seam, catalog identity, and transactional commit. Keep
-   `LleAccuracy` as the default and release authority.
-6. **End-to-end evidence** — run fixed-cycle framebuffer/audio/device/memory
+6. **Runtime policy** — add a non-release HLE/differential policy and
+   transactional commit. Keep `LleAccuracy` as the default and release
+   authority.
+7. **End-to-end evidence** — run fixed-cycle framebuffer/audio/device/memory
    digests and zero-unsupported reports over representative games.
 
 Each deterministic behavior claim requires ten consecutive clean runs. A
