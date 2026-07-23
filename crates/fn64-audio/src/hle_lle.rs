@@ -18,6 +18,7 @@ use fn64_runtime::rsp::RspMemorySnapshot;
 use fn64_runtime::{RdramAddr, RdramView, RspMemAddr, RspMemory, RspMemoryBank};
 
 use crate::hle::AdmittedAudioMicrocode;
+use crate::hle_effects::AudioImemReplacement;
 use crate::hle_outcome::{
     AudioMicrocodeIdentity, AudioTaskOutcome, AudioTaskOutcomeError, AudioTaskTerminalReason,
     CanonicalRdramError, CanonicalRdramPatches, CanonicalRdramRanges, DeferredDpcSubmission,
@@ -119,6 +120,7 @@ pub struct SpeculativeAudioLleEffects {
     machine_state: RspMachineState,
     pc_low12: u32,
     dpc_submissions: Vec<DeferredDpcSubmission>,
+    imem_replacements: Vec<AudioImemReplacement>,
 }
 
 /// Failure to project an authoritative LLE result into the comparison model.
@@ -167,6 +169,14 @@ impl SpeculativeAudioLleResult {
 
     pub fn dpc_submissions(&self) -> &[DeferredDpcSubmission] {
         self.effects.dpc_submissions()
+    }
+
+    /// Complete ucode-phase IMEM images, in DMA installation order.
+    ///
+    /// This journal is evidence beside the architectural state; it is not
+    /// embedded in [`RspMachineState`].
+    pub fn imem_replacements(&self) -> &[AudioImemReplacement] {
+        self.effects.imem_replacements()
     }
 
     pub const fn rspboot_steps(&self) -> NonZeroU64 {
@@ -219,6 +229,11 @@ impl SpeculativeAudioLleEffects {
 
     pub fn dpc_submissions(&self) -> &[DeferredDpcSubmission] {
         &self.dpc_submissions
+    }
+
+    /// Complete ucode-phase IMEM images, in DMA installation order.
+    pub fn imem_replacements(&self) -> &[AudioImemReplacement] {
+        &self.imem_replacements
     }
 
     pub fn into_rdram_storage(self) -> Vec<u8> {
@@ -329,6 +344,8 @@ fn run_speculative_audio_lle_with_limits(
 
     let mut pc = entry_pc_low12;
     let mut ucode_steps = 0u64;
+    let initial_imem_generation = persistent_memory.imem_generation();
+    let mut imem_replacements = Vec::new();
     loop {
         let remaining = maximum_steps
             .checked_sub(ucode_steps)
@@ -353,6 +370,10 @@ fn run_speculative_audio_lle_with_limits(
                 persistent_memory
                     .write_bytes(RspMemAddr::from_parts(RspMemoryBank::Imem, 0), &imem)
                     .expect("complete IMEM bank replacement is always in range");
+                imem_replacements.push(AudioImemReplacement::from_image(
+                    persistent_memory.imem_generation(),
+                    imem,
+                ));
             }
             RspExitReason::StepLimit if ucode_steps < maximum_steps => {}
             RspExitReason::StepLimit => {
@@ -385,6 +406,13 @@ fn run_speculative_audio_lle_with_limits(
         .write_bytes(RspMemAddr::from_parts(RspMemoryBank::Dmem, 0), &final_dmem)
         .expect("complete DMEM bank replacement is always in range");
     let rsp_memory = persistent_memory.snapshot();
+    assert_eq!(
+        rsp_memory.imem_generation(),
+        initial_imem_generation
+            .checked_add(imem_replacements.len() as u64)
+            .expect("ucode IMEM generation overflow"),
+        "ucode replacement count diverged from owned RSP-memory generation"
+    );
     let (rdram_write_ranges, rdram_patches) =
         collect_logical_rdram_effects(&rdram_storage, storage_write_ranges)?;
 
@@ -399,6 +427,7 @@ fn run_speculative_audio_lle_with_limits(
             machine_state,
             pc_low12: pc,
             dpc_submissions,
+            imem_replacements,
         },
         rspboot_steps,
         ucode_steps,
@@ -665,6 +694,7 @@ mod tests {
         assert_eq!(result.rspboot_steps().get(), 3);
         assert_eq!(result.terminal(), AudioTaskTerminalReason::Broke);
         assert_eq!(result.pc_low12(), 0);
+        assert!(result.imem_replacements().is_empty());
         let mut imem = [0; DMEM_SIZE];
         imem[0..4].copy_from_slice(&BREAK.to_be_bytes());
         assert_eq!(
@@ -674,6 +704,7 @@ mod tests {
         let effects = result.into_effects();
         assert_eq!(effects.rdram_storage(), source);
         assert!(effects.dpc_submissions().is_empty());
+        assert!(effects.imem_replacements().is_empty());
     }
 
     #[test]
@@ -755,10 +786,113 @@ mod tests {
         let result = run_speculative_audio_lle(entry).unwrap();
 
         assert_eq!(result.rsp_memory().imem_generation(), entry_generation + 1);
+        assert_eq!(result.imem_replacements().len(), 1);
+        let replacement = &result.imem_replacements()[0];
+        assert_eq!(replacement.generation(), entry_generation + 1);
+        assert_eq!(
+            replacement.identity(),
+            Sha256Digest::hash(replacement.image())
+        );
+        assert_eq!(
+            replacement.image(),
+            result.rsp_memory().bank(RspMemoryBank::Imem)
+        );
         assert_eq!(result.ucode_steps().get(), 7);
         assert_eq!(
             &result.rsp_memory().bank(RspMemoryBank::Imem)[0..8],
             &[0; 8]
+        );
+    }
+
+    #[test]
+    fn multiple_imem_replacements_retain_dma_order_and_contiguous_generations() {
+        let program = [
+            addiu(2, 0, 0x1000),
+            mtc0(2, 0),
+            addiu(3, 0, 0x300),
+            mtc0(3, 1),
+            addiu(4, 0, 7),
+            mtc0(4, 2),
+            addiu(2, 0, 0x1008),
+            mtc0(2, 0),
+            addiu(3, 0, 0x308),
+            mtc0(3, 1),
+            addiu(4, 0, 7),
+            mtc0(4, 2),
+            BREAK,
+        ];
+        let entry = lane_parts(&program, [0; DMEM_SIZE], vec![0; DEFAULT_RDRAM_SIZE]);
+        let initial_memory = entry.clone().into_execution_parts().rsp_memory;
+        let initial_generation = initial_memory.imem_generation();
+        let initial_image = *initial_memory.bank(RspMemoryBank::Imem);
+
+        let result = run_speculative_audio_lle(entry).unwrap();
+        let replacements = result.imem_replacements();
+
+        assert_eq!(replacements.len(), 2);
+        assert_eq!(replacements[0].generation(), initial_generation + 1);
+        assert_eq!(replacements[1].generation(), initial_generation + 2);
+        assert_eq!(
+            replacements
+                .iter()
+                .map(AudioImemReplacement::generation)
+                .collect::<Vec<_>>(),
+            [initial_generation + 1, initial_generation + 2]
+        );
+        assert_eq!(&replacements[0].image()[0..8], &[0; 8]);
+        assert_eq!(
+            &replacements[0].image()[8..16],
+            &initial_image[8..16],
+            "the first DMA must be recorded before the second image is installed"
+        );
+        assert_eq!(&replacements[1].image()[0..16], &[0; 16]);
+        assert_eq!(
+            replacements[1].image(),
+            result.rsp_memory().bank(RspMemoryBank::Imem)
+        );
+        for replacement in replacements {
+            assert_eq!(
+                replacement.identity(),
+                Sha256Digest::hash(replacement.image())
+            );
+        }
+        assert_eq!(
+            result.rsp_memory().imem_generation(),
+            initial_generation + replacements.len() as u64
+        );
+    }
+
+    #[test]
+    fn imem_replacement_journal_is_separate_from_architectural_machine_state() {
+        let program = [
+            addiu(2, 0, 0x1000),
+            mtc0(2, 0),
+            addiu(3, 0, 0x300),
+            mtc0(3, 1),
+            addiu(4, 0, 7),
+            mtc0(4, 2),
+            BREAK,
+        ];
+        let result = run_speculative_audio_lle(lane_parts(
+            &program,
+            [0; DMEM_SIZE],
+            vec![0; DEFAULT_RDRAM_SIZE],
+        ))
+        .unwrap();
+        let machine_state = result.machine_state().clone();
+        let replacements = result.imem_replacements().to_vec();
+
+        let effects = result.into_effects();
+
+        assert_eq!(effects.machine_state(), &machine_state);
+        assert_eq!(effects.imem_replacements(), replacements);
+        assert!(
+            effects
+                .machine_state()
+                .architectural_state()
+                .dp_submissions()
+                .is_empty(),
+            "effect journals must not be smuggled through architectural submission state"
         );
     }
 

@@ -17,7 +17,7 @@ PCM range consumed by AI. An HLE task therefore cannot be modeled as an
 immutable RDRAM input that returns a `Vec<i16>`: its result is a transactional
 set of machine effects.
 
-The HLE foundation has seven independent pieces:
+The HLE foundation has nine independent pieces:
 
 - `hle.rs` validates and iterates family-neutral 8-byte command framing without
   assigning semantics to an unknown family.
@@ -26,6 +26,10 @@ The HLE foundation has seven independent pieces:
 - `hle_transaction.rs` owns checked 4 KiB DMEM and a logical-byte,
   copy-on-write RDRAM overlay. It produces canonical patches without mutating
   the live task input.
+- `hle_effects.rs` defines the phase-neutral, content-bound IMEM replacement
+  record used by both rspboot and ucode execution. Replacement journals retain
+  complete images in DMA installation order without becoming scalar/vector
+  architectural state.
 - `hle_snapshot.rs` validates an owned post-rspboot capture and forks deep,
   pointer-free lane state. It retains the load-time and DMEM-entry headers
   separately, exact native-word physical RDRAM, complete RSP memory and
@@ -36,12 +40,19 @@ The HLE foundation has seven independent pieces:
   image through BREAK without access to the live device fabric, renderer,
   executable-write notifier, scheduler, interrupts, or timing. It returns
   complete final RSP state, exact written RDRAM coverage and logical patches,
-  and deferred raw DPC submissions for later comparison and one-time commit.
+  ordered ucode IMEM replacements, and deferred raw DPC submissions for later
+  comparison and one-time commit.
 - `hle_rspboot.rs` owns physical RDRAM and RSP memory while it executes the
   boot overlay to the first instruction of the image that overlay installed.
   It returns the neutral entry snapshot plus exact boot-phase RDRAM patches
   and ordered IMEM replacements; direct-IMEM and static-alias tasks remain
   typed loud frontiers.
+- `whole_task.rs` consumes one pre-boot snapshot, runs pure rspboot once, forks
+  the proven entry into admitted HLE and authoritative LLE lanes, and prepares
+  a whole-task reference with no deferred DPC submission. It composes exact boot-plus-ucode write
+  intent using final LLE bytes, so later ucode writes win overlaps while
+  same-valued DMA writes remain visible to publication preflight. The value is
+  deliberately not a commit token: no complete family HLE executor exists yet.
 - `hle_commit.rs` consumes matching LLE/HLE ucode-phase outcomes into a
   non-cloneable commit authority. The ABI adapter can publish the empty-DPC
   ucode phase once; boot-phase patches are deliberately not part of that
@@ -137,7 +148,11 @@ post-commit notification seam.
 
 This adapter is still not selected by live audio-task policy. Its authority
 begins after rspboot, so it cannot claim whole-task atomicity or publish
-rspboot's earlier effects. `LleAccuracy` replaces the cross-task owner with the
+rspboot's earlier effects. The pure whole-task reference now retains the
+pre-boot baseline, boot and ucode write intent, ordered replacement history,
+complete final LLE state, and an inseparable no-submission seal, but exposes no
+publication authority until a concrete HLE lane produces an exact comparison.
+`LleAccuracy` replaces the cross-task owner with the
 exact terminal image after draining DPC submissions. Optimized boot-overlay HLE
 exposes no post-ucode scalar/VU image, so successful completion is explicitly
 labeled `HleCompatibility` and carries the rspboot-entry image with the
@@ -154,9 +169,14 @@ accuracy claims.
    first-divergence comparator.
 2. **Standard wire decoder** — decode all 16 documented packets and reject
    unknown selectors/unsupported flag combinations without mutating state.
-3. **Task-entry snapshot** — run pure owned rspboot, capture complete RSP
-   memory/non-memory state and exact physical RDRAM at its handoff, then fork
-   independently owned LLE and HLE lanes. Live whole-task wiring is next.
+3. **Task-entry and whole-task reference** — run pure owned rspboot once,
+   capture complete RSP memory/non-memory state and exact physical RDRAM at its
+   handoff, fork independently owned LLE and HLE lanes, and retain an
+   overlap-correct whole-task LLE reference with no deferred DPC submission.
+   DPC register changes remain part of the compared final RSP state rather than
+   being implied absent by that seal. The ABI can now acquire a
+   non-cloneable exact-generation pre-boot owner without publishing boot
+   effects. Candidate comparison and atomic publication remain next.
 4. **Memory commands** — implement `SETBUFF`, `LOADBUFF`, `SAVEBUFF`,
    `CLEARBUFF`, `DMEMMOVE`, `SEGMENT`, and `LOADADPCM` with complete preflight
    and overlap/bounds tests.

@@ -45,6 +45,7 @@
 pub mod characterize;
 pub mod hle;
 pub mod hle_commit;
+pub mod hle_effects;
 pub mod hle_lle;
 pub mod hle_memory;
 pub mod hle_outcome;
@@ -53,6 +54,7 @@ pub mod hle_snapshot;
 pub mod hle_transaction;
 pub mod rsp;
 pub mod standard_abi;
+pub mod whole_task;
 
 use std::collections::VecDeque;
 use std::fmt;

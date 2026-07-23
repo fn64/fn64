@@ -34,7 +34,10 @@ pub struct AudioTaskStepTotals {
 }
 
 impl AudioTaskStepTotals {
-    fn new(rspboot: NonZeroU64, ucode: NonZeroU64) -> Result<Self, PrepareUcodeCommitError> {
+    pub(crate) fn new(
+        rspboot: NonZeroU64,
+        ucode: NonZeroU64,
+    ) -> Result<Self, PrepareUcodeCommitError> {
         let whole_task = rspboot
             .get()
             .checked_add(ucode.get())

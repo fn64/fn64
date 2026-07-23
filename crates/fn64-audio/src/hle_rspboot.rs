@@ -18,9 +18,10 @@ use fn64_runtime::{
     SP_STATUS_BROKE, SP_STATUS_HALT,
 };
 
+pub use crate::hle_effects::AudioImemReplacement as RspbootImemReplacement;
 use crate::hle_outcome::{
     CanonicalRdramError, CanonicalRdramPatches, RdramByteRange, RdramPatch, RdramPatchError,
-    RdramRangeError, Sha256Digest, RSP_BANK_BYTES,
+    RdramRangeError, RSP_BANK_BYTES,
 };
 use crate::hle_snapshot::{
     AudioHleSnapshotError, AudioTaskEntrySnapshot, PostRspbootAudioTaskParts,
@@ -169,28 +170,6 @@ impl AudioRspbootInput {
     }
 }
 
-/// One complete IMEM image installed by rspboot, in installation order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RspbootImemReplacement {
-    generation: u64,
-    identity: Sha256Digest,
-    image: [u8; RSP_BANK_BYTES],
-}
-
-impl RspbootImemReplacement {
-    pub const fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub const fn identity(&self) -> Sha256Digest {
-        self.identity
-    }
-
-    pub const fn image(&self) -> &[u8; RSP_BANK_BYTES] {
-        &self.image
-    }
-}
-
 /// Owned post-rspboot entry plus the exact effects of the boot phase.
 #[derive(Clone, Debug)]
 pub struct AudioRspbootEntry {
@@ -296,11 +275,10 @@ pub fn execute_audio_rspboot_to_entry(
                 persistent_memory
                     .write_bytes(RspMemAddr::from_parts(RspMemoryBank::Imem, 0), &imem)
                     .expect("complete IMEM image is always in range");
-                replacements.push(RspbootImemReplacement {
-                    generation: persistent_memory.imem_generation(),
-                    identity: Sha256Digest::hash(&imem),
-                    image: imem,
-                });
+                replacements.push(RspbootImemReplacement::from_image(
+                    persistent_memory.imem_generation(),
+                    imem,
+                ));
             }
             RspExitReason::StepLimit => {}
             RspExitReason::Broke => {
@@ -627,6 +605,7 @@ fn header_fields(header: OsTaskHeader) -> [u32; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hle_outcome::Sha256Digest;
     use fn64_runtime::{RdramViewMut, RspMemory};
 
     const HEADER: u32 = 0x40;

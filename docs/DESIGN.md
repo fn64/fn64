@@ -888,6 +888,16 @@ task calls out:
   failure before an ordinary rspboot handoff traps loudly. Exact HLE calls consume
   the public task contract, while a transactional LLE fallback carries a typed
   snapshot of all non-memory RSP state from rspboot into the interpreter.
+  Audio's next migration seam can instead acquire the exact Running task
+  generation as a non-cloneable `InFlight` owner before copying any state,
+  then execute pure owned rspboot once and fork its proven entry into HLE and
+  LLE lanes. The reference with no deferred DPC submission retains the pre-boot 8 MiB/RSP baseline,
+  exact boot-plus-ucode write intent, ordered IMEM generations, final LLE
+  machine state, and measured phase work without publishing an intermediate
+  boot state. It carries no commit authority and is not selected by live
+  policy until a concrete audio-family HLE executor compares exactly; the
+  current memory-command characterization and missing DSP arithmetic keep that
+  frontier loud.
   Graphics microcode selection is an explicit host policy:
   `HleOptimized` preserves the interactive compatibility path and its exact-
   digest transactional fallback, while `LleAccuracy` always continues the
