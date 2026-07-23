@@ -193,9 +193,48 @@ fn main() -> Result<(), Box<dyn Error>> {
         .active_runtime_policy()
         .ok_or_else(|| io::Error::other("Metal initialization has no active runtime policy"))?
         .sha256();
+
+    // Real games can run their VI thread before their graphics thread has
+    // published a first workload. Exercise two such presents so the
+    // present-worker/readback interleaving remains successful while the
+    // zero-workload pixels stay unavailable as release evidence.
+    let pre_workload_rdram = fixture(initial);
+    for guest_cycle in [91, 92] {
+        backend.present_live(
+            &pre_workload_rdram,
+            presentation(FixtureSpec {
+                guest_cycle,
+                ..initial
+            }),
+        )?;
+        match backend.release_capture() {
+            Err(fn64_render::RenderError::NotReady(
+                "RT64 has no completed post-workload present capture",
+            )) => {}
+            result => {
+                return Err(io::Error::other(format!(
+                    "pre-workload VI pixels became release capture evidence: {result:?}"
+                ))
+                .into())
+            }
+        }
+        if backend.release_environment().tv_type().is_some() {
+            return Err(io::Error::other(
+                "pre-workload VI present claimed release-environment authority",
+            )
+            .into());
+        }
+    }
     let (initial_native, initial_capture) = submit_raw(&mut backend, initial)?;
     validate_native(initial, &initial_native)?;
     validate_capture(initial, &initial_capture, &identity, policy_sha256)?;
+    if initial_capture.workload_id.get() != 1 || initial_capture.present_id != 3 {
+        return Err(io::Error::other(format!(
+            "first post-workload capture did not follow the two unpublished VI presents: {}/{}",
+            initial_capture.workload_id, initial_capture.present_id
+        ))
+        .into());
+    }
     if backend.release_environment().tv_type() != Some(TvType::Pal) {
         return Err(io::Error::other("Metal initialization lost PAL TV authority").into());
     }
@@ -358,7 +397,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!(
-        "metal_backend_evidence source={} provenance={:?} initial_native={} initial_post_vi={} initial_workload_id={} initial_present_id={} transition_native={} transition_post_vi={} transition={}x{} transition_workload_id={} transition_present_id={} resized_native={} resized_post_vi={} resized={}x{} resized_workload_id={} resized_present_id={} recreated_native={} recreated_post_vi={} recreated={}x{} recreated_workload_id={} recreated_present_id={} policy_sha256={}",
+        "metal_backend_evidence source={} provenance={:?} pre_workload_presents=2 initial_native={} initial_post_vi={} initial_workload_id={} initial_present_id={} transition_native={} transition_post_vi={} transition={}x{} transition_workload_id={} transition_present_id={} resized_native={} resized_post_vi={} resized={}x{} resized_workload_id={} resized_present_id={} recreated_native={} recreated_post_vi={} recreated={}x{} recreated_workload_id={} recreated_present_id={} policy_sha256={}",
         identity.source_id,
         identity.source_provenance,
         digest(&initial_native),

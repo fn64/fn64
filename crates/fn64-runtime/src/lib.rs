@@ -45,8 +45,8 @@ pub use device::{
 pub use executor::{
     EventRegistrationEvidenceSnapshot, Executor, ExecutorControlEvidenceSnapshot,
     ExecutorControlInvariantError, ExecutorQueueEvidenceSnapshot, ExecutorRunningEvidenceSnapshot,
-    ExternalEvent, PendingResumeEvidenceSnapshot, RdramRegistrationEvidenceSnapshot,
-    RecvMesgOutcome, SendMesgOutcome, ThreadEvidenceSnapshot,
+    ExternalEvent, PendingResumeEvidenceSnapshot, ProcessExitSummary,
+    RdramRegistrationEvidenceSnapshot, RecvMesgOutcome, SendMesgOutcome, ThreadEvidenceSnapshot,
 };
 pub use mesgqueue::{
     BlockedReceiverEvidenceSnapshot, BlockedSenderEvidenceSnapshot, Mesg, MesgQueue,
