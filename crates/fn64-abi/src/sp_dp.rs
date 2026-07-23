@@ -1,5 +1,4 @@
 use super::*;
-use crate::ai::MMIO;
 
 /// `__osSpSetPc(u32 pc)` -- `a0`=`ctx->r4` (verified: `funcs_57.c:1011`,
 /// `ctx->r4 = 0 | 0;` immediately before the call -- a direct RSP-PC
@@ -45,7 +44,10 @@ pub unsafe extern "C" fn __osSpSetStatus_recomp(_rdram: *mut u8, ctx: *mut Recom
 #[no_mangle]
 pub unsafe extern "C" fn osDpSetStatus_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &*ctx };
-    MMIO.with(|cell| cell.borrow_mut().dp.apply_status_command(ctx.r4 as u32));
+    assert!(
+        crate::pi::write_live_device_mmio(0xFFFF_FFFF_A410_000C, ctx.r4 as u32),
+        "osDpSetStatus_recomp: DPC_STATUS is not mapped"
+    );
 }
 
 /// `osDpSetNextBuffer(void *bufPtr, u64 size) -> s32`. Under o32 the aligned
@@ -76,12 +78,22 @@ pub unsafe extern "C" fn osDpSetNextBuffer_recomp(rdram: *mut u8, ctx: *mut Reco
         ctx.r2 = u64::MAX;
         return;
     };
-    if MMIO.with(|cell| cell.borrow_mut().dp.set_next_buffer(start, end)) {
-        unsafe { crate::task_dispatch::dispatch_raw_rdp(rdram, start, end) };
-        ctx.r2 = 0;
-    } else {
-        ctx.r2 = u64::MAX;
-    }
+    let submission = match with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            start,
+            end,
+        )
+    }) {
+        Ok(submission) => submission,
+        Err(DeviceFault::DpBusy) => {
+            ctx.r2 = u64::MAX;
+            return;
+        }
+        Err(error) => panic!("osDpSetNextBuffer_recomp: {error}"),
+    };
+    unsafe { crate::task_dispatch::dispatch_dpc_submission(rdram, submission) };
+    ctx.r2 = 0;
 }
 
 /// `__osSpGetStatus(void) -> u32` -- raw RCP `SP_STATUS_REG` read from the
@@ -101,20 +113,77 @@ pub unsafe extern "C" fn __osSpGetStatus_recomp(_rdram: *mut u8, ctx: *mut Recom
 /// Same contract as every other shim in this file.
 #[no_mangle]
 pub unsafe extern "C" fn osDpGetStatus_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
-    unsafe { &mut *ctx }.r2 = MMIO.with(|cell| cell.borrow().dp.status as u64);
+    unsafe { &mut *ctx }.r2 = crate::pi::read_raw_mmio_word(0xFFFF_FFFF_A410_000C)
+        .expect("osDpGetStatus_recomp: DPC_STATUS is not mapped")
+        as u64;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{ctx_zeroed, install_complete_render_backend};
-    use fn64_render::{RenderBackend, RenderConfig};
+    use crate::test_support::ctx_zeroed;
+    use fn64_render::{FrameStatus, RenderBackend, RenderConfig, RenderError};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct CountingRawBackend(Rc<Cell<u32>>);
+
+    impl RenderBackend for CountingRawBackend {
+        fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn observe_non_rdp_write16(
+            &mut self,
+            _write: fn64_render::NonRdpWrite16,
+        ) -> fn64_render::NonRdpWrite16Disposition {
+            fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+        }
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            _task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            Ok(FrameStatus::Complete)
+        }
+
+        fn process_rdp_commands(
+            &mut self,
+            _rdram: &mut [u8],
+            _start: u32,
+            _end: u32,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            self.0.set(self.0.get() + 1);
+            Ok(FrameStatus::Complete)
+        }
+
+        fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
+            fn64_render::DpFullSyncStatus::NotReached
+        }
+
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[fn64_render::UcodeId] {
+            &[]
+        }
+    }
 
     #[test]
     fn dp_buffer_uses_o32_aligned_u64_and_reaches_idle_end_pointer() {
-        MMIO.with(|cell| *cell.borrow_mut() = fn64_runtime::MmioSpace::new());
         let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
-        install_complete_render_backend(rdram.len());
+        let calls = Rc::new(Cell::new(0));
+        crate::set_render_backend(Box::new(CountingRawBackend(Rc::clone(&calls))), rdram.len());
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0xFFFF_FFFF_8000_1000;
         ctx.r5 = 0xDEAD_BEEF;
@@ -122,13 +191,47 @@ mod tests {
         ctx.r7 = 0x80;
         unsafe { osDpSetNextBuffer_recomp(rdram.as_mut_ptr(), &mut ctx) };
         assert_eq!(ctx.r2, 0);
-        MMIO.with(|cell| {
-            let mmio = cell.borrow();
-            assert_eq!(mmio.dp.start, 0x1000);
-            assert_eq!(mmio.dp.end, 0x1080);
-            assert_eq!(mmio.dp.current, 0x1080);
-            assert_eq!(mmio.dp.status, 0);
+        assert_eq!(calls.get(), 1);
+        with_host(|host| {
+            let snapshot = host.device_fabric.snapshot();
+            assert_eq!(snapshot.dpc_start, 0x1000);
+            assert_eq!(snapshot.dpc_end, 0x1080);
+            assert_eq!(snapshot.dpc_current, 0x1080);
+            assert_eq!(snapshot.dpc_status, 0);
+            assert_eq!(snapshot.pending_dpc, None);
         });
+    }
+
+    #[test]
+    fn raw_end_and_libultra_buffer_share_current_without_replay() {
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let calls = Rc::new(Cell::new(0));
+        crate::set_render_backend(Box::new(CountingRawBackend(Rc::clone(&calls))), rdram.len());
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+
+        assert!(crate::pi::write_raw_mmio_word(0xA410_0000, 0x100));
+        assert!(crate::pi::write_raw_mmio_word(0xA410_0004, 0x108));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(crate::pi::read_raw_mmio_word(0xA410_0008), Some(0x108));
+
+        assert!(crate::pi::write_raw_mmio_word(0xA410_0004, 0x108));
+        assert_eq!(calls.get(), 1, "an unchanged END must not replay the range");
+
+        let mut managed = ctx_zeroed();
+        managed.r4 = 0xFFFF_FFFF_8000_0108;
+        managed.r6 = 0;
+        managed.r7 = 8;
+        unsafe { osDpSetNextBuffer_recomp(rdram.as_mut_ptr(), &mut managed) };
+        assert_eq!(managed.r2, 0);
+        assert_eq!(calls.get(), 2);
+        let snapshot = with_host(|host| host.device_fabric.snapshot());
+        assert_eq!(snapshot.dpc_start, 0x108);
+        assert_eq!(snapshot.dpc_end, 0x110);
+        assert_eq!(snapshot.dpc_current, 0x110);
+        assert_eq!(snapshot.pending_dpc, None);
     }
 
     #[test]
@@ -186,7 +289,6 @@ mod tests {
                 view.write_u16(fn64_runtime::RdramAddr::from_offset(TARGET + index * 2), 0);
             }
         }
-        MMIO.with(|cell| *cell.borrow_mut() = fn64_runtime::MmioSpace::new());
         assert!(crate::pi::write_raw_mmio_word(
             0xFFFF_FFFF_A410_0000,
             START as u32
@@ -230,6 +332,8 @@ mod tests {
             let snapshot = host.device_fabric.snapshot();
             assert!(!snapshot.sp_busy);
             assert!(snapshot.dp_busy);
+            assert_eq!(snapshot.dpc_current, (START + 8) as u32);
+            assert_eq!(snapshot.pending_dpc, None);
         });
         crate::advance_virtual_time(1);
         with_host(|host| {
@@ -249,7 +353,6 @@ mod tests {
 
     #[test]
     fn dp_set_and_get_status_apply_public_command_pairs() {
-        MMIO.with(|cell| *cell.borrow_mut() = fn64_runtime::MmioSpace::new());
         let mut set = ctx_zeroed();
         set.r4 = 0x02 | 0x08 | 0x20;
         unsafe { osDpSetStatus_recomp(std::ptr::null_mut(), &mut set) };

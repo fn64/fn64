@@ -1,5 +1,13 @@
-//! Legacy hardware-register mirror for the `0xA4xxxxxx`/`0xA8xxxxxx` KSEG1
+//! Legacy generated-C byte mirror for the `0xA4xxxxxx`/`0xA8xxxxxx` KSEG1
 //! range: AI, VI, PI, SI, DP, MI.
+//!
+//! This module is not production device authority. Timed AI and transactional
+//! DPC state live only in [`crate::device::DeviceFabric`]; typed/interpreted
+//! and generated-C proxy accesses must reach that fabric before this fallback.
+//! `AiRegs` and `DpRegs` remain solely to materialize safe compatibility bytes
+//! for native generated C whose pointer loads cannot be intercepted. Their
+//! state must never start a DMA, select a renderer range, raise MI, or enter a
+//! release snapshot.
 //!
 //! ## Why this exists (real crash this closes)
 //!
@@ -108,7 +116,7 @@ mod base {
     pub const SI: u32 = 0x0080_0000;
 }
 
-/// AI (Audio Interface) register block. Real register offsets (from
+/// Compatibility-only AI byte image. Real register offsets (from
 /// `base::AI`): `DRAM_ADDR` @0x00, `LEN` @0x04, `CONTROL` @0x08, `STATUS`
 /// @0x0C (write-any-value clears the AI interrupt; read returns status
 /// bits), `DACRATE` @0x10, `BITRATE` @0x14.
@@ -130,12 +138,15 @@ pub struct AiRegs {
 }
 
 /// `AI_STATUS` register bits, per the public libultra manual / hardware
-/// docs (`AI_STATUS_BUSY = 1<<30`, `AI_STATUS_FULL = 1<<31`).
+/// docs (`AI_STATUS_ENABLED = 1<<25`, `AI_STATUS_BUSY = 1<<30`,
+/// `AI_STATUS_FULL = 1<<31`).
+pub const AI_STATUS_ENABLED: u32 = 1 << 25;
 pub const AI_STATUS_BUSY: u32 = 1 << 30;
 pub const AI_STATUS_FULL: u32 = 1 << 31;
 
 impl AiRegs {
-    /// `osAiSetNextBuffer`'s effect: latch a DMA source/length and mark it
+    /// Mirror `osAiSetNextBuffer` bytes for generated-C loads. This does not
+    /// start a device DMA; production work enters `DeviceFabric`. Latch a DMA source/length and mark it
     /// pending. Faithful "DMA proceeds" behavior (module doc): the very
     /// next status read reports not-busy/not-full so a guest audio-manager
     /// loop that submits a buffer then immediately polls status is never
@@ -151,11 +162,16 @@ impl AiRegs {
     /// sees a true bit at least once), then clears it -- see `dma_pending`'s
     /// doc comment.
     pub fn status(&mut self) -> u32 {
-        if self.dma_pending {
-            self.dma_pending = false;
-            AI_STATUS_BUSY
+        let enabled = if self.control & 1 != 0 {
+            AI_STATUS_ENABLED
         } else {
             0
+        };
+        if self.dma_pending {
+            self.dma_pending = false;
+            enabled | AI_STATUS_BUSY
+        } else {
+            enabled
         }
     }
 
@@ -214,12 +230,12 @@ fn apply_clear_set_pair(
     }
 }
 
-/// DP (Display Processor / RDP command) register block. `STATUS` bits:
+/// Compatibility-only DP byte image. `STATUS` bits:
 /// `DP_STATUS_XBUS_DMA = 1`, `DP_STATUS_FREEZE = 2`, `DP_STATUS_FLUSH = 4`,
-/// `DP_STATUS_START_GCLK = 0x10`, `DP_STATUS_TMEM_BUSY = 0x20`,
-/// `DP_STATUS_PIPE_BUSY = 0x40`, `DP_STATUS_CMD_BUSY = 0x80`,
-/// `DP_STATUS_CBUF_READY = 0x100`, `DP_STATUS_DMA_BUSY = 0x200`,
-/// `DP_STATUS_END_VALID = 0x400`, `DP_STATUS_START_VALID = 0x800`. Idle (0)
+/// `DP_STATUS_START_GCLK = 0x08`, `DP_STATUS_TMEM_BUSY = 0x10`,
+/// `DP_STATUS_PIPE_BUSY = 0x20`, `DP_STATUS_CMD_BUSY = 0x40`,
+/// `DP_STATUS_CBUF_READY = 0x80`, `DP_STATUS_DMA_BUSY = 0x100`,
+/// `DP_STATUS_END_VALID = 0x200`, `DP_STATUS_START_VALID = 0x400`. Idle (0)
 /// by default -- no real RDP command execution happens in this crate
 /// (`fn64-render`/`fn64-render-rt64` own the actual GBI interpretation, per
 /// `docs/DECOUPLING.md`).
@@ -260,7 +276,7 @@ impl DpRegs {
         }
     }
 
-    /// Submit one DRAM-backed RDP command range. The current HLE renderer
+    /// Mirror one consumed DRAM-backed RDP command range. The current HLE renderer
     /// consumes graphics work synchronously, so the observable current
     /// pointer reaches `end` and no busy/valid bit remains set on return.
     pub fn set_next_buffer(&mut self, start: u32, end: u32) -> bool {
@@ -310,7 +326,7 @@ impl MiRegs {
     }
 }
 
-/// The full hardware-register MMIO space: one instance per running game,
+/// The legacy hardware-register byte-mirror space: one instance per running game,
 /// alongside (not inside) `Rdram` -- see `rdram.rs`'s doc comment on why
 /// `Rdram` itself stays a plain flat buffer rather than growing a special
 /// case for this range (this module is the dedicated seam instead, and

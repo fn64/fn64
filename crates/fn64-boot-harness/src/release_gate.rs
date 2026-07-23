@@ -29,7 +29,7 @@ use crate::{
     ReleaseWindowsVersionEvidence,
 };
 
-pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v22";
+pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v23";
 
 /// Provenance class declared for a ROM input. The N64 header does not encode
 /// whether otherwise-valid bytes came from a retail cartridge or a public
@@ -2254,7 +2254,7 @@ impl ReleaseGateReport {
         )
     }
 
-    /// Recompute the schema-v22 evidence digest after loading a retained JSON
+    /// Recompute the schema-v23 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {
@@ -3044,6 +3044,14 @@ fn encode_guest_device_snapshot(out: &mut Vec<u8>, snapshot: DeviceSnapshot) {
     ] {
         push_u32(out, value);
     }
+    push_u32(out, snapshot.ai_dram_addr.offset());
+    for value in [
+        snapshot.ai_control,
+        snapshot.ai_dacrate,
+        snapshot.ai_bitrate,
+    ] {
+        push_u32(out, value);
+    }
     push_u32(out, snapshot.tv_type.map_or(u32::MAX, |tv| tv as u32));
     push_u64(
         out,
@@ -3060,6 +3068,21 @@ fn encode_guest_device_snapshot(out: &mut Vec<u8>, snapshot: DeviceSnapshot) {
     push_u32(out, snapshot.sp_dram_addr.offset());
     push_u64(out, snapshot.sp_imem_generation);
     out.push(snapshot.dp_busy as u8);
+    for value in [
+        snapshot.dpc_start,
+        snapshot.dpc_end,
+        snapshot.dpc_current,
+        snapshot.dpc_status,
+    ] {
+        push_u32(out, value);
+    }
+    match snapshot.pending_dpc {
+        Some(submission) => {
+            out.push(1);
+            encode_dpc_submission(out, submission);
+        }
+        None => out.push(0),
+    }
     for value in [snapshot.mi_pending, snapshot.mi_mask] {
         push_u32(out, value);
     }
@@ -3087,6 +3110,16 @@ fn encode_ai_request(out: &mut Vec<u8>, request: fn64_runtime::AiDmaRequest) {
     push_u32(out, request.dram_addr.offset());
     push_u32(out, request.len);
     push_u32(out, request.sample_rate_hz);
+}
+
+fn encode_dpc_submission(out: &mut Vec<u8>, submission: fn64_runtime::DpcSubmission) {
+    push_u64(out, submission.token);
+    out.push(match submission.source {
+        fn64_runtime::DpcSubmissionSource::Rdram => 0,
+        fn64_runtime::DpcSubmissionSource::Dmem => 1,
+    });
+    push_u32(out, submission.start);
+    push_u32(out, submission.end);
 }
 
 fn encode_si_request(out: &mut Vec<u8>, request: fn64_runtime::SiDmaRequest) {
@@ -3845,7 +3878,7 @@ fn encode_device_snapshot(
     program: crate::ProgramEvidenceSnapshot,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 * 1024 + snapshot.save_bytes.as_ref().map_or(0, Vec::len));
-    out.extend_from_slice(b"fn64.device-evidence.v9\0");
+    out.extend_from_slice(b"fn64.device-evidence.v10\0");
     encode_guest_device_snapshot(&mut out, snapshot.guest);
     push_bytes(&mut out, &snapshot.pi_timing_policy);
 
@@ -3871,6 +3904,21 @@ fn encode_device_snapshot(
         Some(request) => {
             out.push(1);
             encode_ai_request(&mut out, request);
+        }
+        None => out.push(0),
+    }
+    match snapshot.pending_dpc {
+        Some(pending) => {
+            out.push(1);
+            encode_dpc_submission(&mut out, pending.submission);
+            for value in [
+                pending.rollback_start,
+                pending.rollback_end,
+                pending.rollback_current,
+                pending.rollback_status,
+            ] {
+                push_u32(&mut out, value);
+            }
         }
         None => out.push(0),
     }
@@ -4873,6 +4921,10 @@ mod tests {
                 pi_status: 1,
                 ai_status: 0,
                 ai_length: 0x200,
+                ai_dram_addr: RdramAddr::from_offset(0x400),
+                ai_control: 1,
+                ai_dacrate: 0x2ef,
+                ai_bitrate: 0xf,
                 si_dram_addr: RdramAddr::from_offset(0x200),
                 si_status: 0,
                 vi_current: 20,
@@ -4886,6 +4938,11 @@ mod tests {
                 sp_dram_addr: RdramAddr::from_offset(0x300),
                 sp_imem_generation: 2,
                 dp_busy: false,
+                dpc_start: 0x100,
+                dpc_end: 0x180,
+                dpc_current: 0x180,
+                dpc_status: 0,
+                pending_dpc: None,
                 mi_pending: 8,
                 mi_mask: 8,
                 pi_domain1: PiDomainTiming::default(),
@@ -4895,6 +4952,7 @@ mod tests {
             pending_pi: None,
             current_ai: None,
             queued_ai: None,
+            pending_dpc: None,
             pending_si: None,
             si_dma_error: false,
             si_latency: Cycles::new(1),
@@ -5413,17 +5471,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_v22_fixed_cycle_digest_is_stable_and_complete() {
+    fn schema_v23_fixed_cycle_digest_is_stable_and_complete() {
         assert_eq!(complete_digest(), complete_digest());
         assert_eq!(complete_digest().artifacts.len(), 5);
         assert_eq!(
             complete_digest().root_sha256,
-            "1f4fd872ce05e5c2301dc844e51d70e665822773ecb8ae741f89aa3635784869"
+            "20bbd97ab01691b75a884ecda3bec510a5f1f106509082ab071b14d60859361e"
         );
     }
 
     #[test]
-    fn schema_v22_report_wire_binds_rom_identity_class_and_tv_authorities() {
+    fn schema_v23_report_wire_binds_rom_identity_class_and_tv_authorities() {
         let input = test_rom(b'E');
         let geometry = observations();
         let rom =
@@ -5521,12 +5579,26 @@ mod tests {
     #[test]
     fn device_evidence_wire_binds_every_future_state_family() {
         use fn64_runtime::{
-            PendingAiSnapshot, PendingEepromWriteSnapshot, PendingPiSnapshot, PendingSiSnapshot,
-            PendingSpDmaSnapshot, ScheduledDeviceEventKind, ScheduledDeviceEventSnapshot,
-            SpDmaRequest,
+            DpcSubmission, DpcSubmissionSource, PendingAiSnapshot, PendingDpcSnapshot,
+            PendingEepromWriteSnapshot, PendingPiSnapshot, PendingSiSnapshot, PendingSpDmaSnapshot,
+            ScheduledDeviceEventKind, ScheduledDeviceEventSnapshot, SpDmaRequest,
         };
 
-        let baseline = snapshot(42);
+        let mut baseline = snapshot(42);
+        let dpc_submission = DpcSubmission {
+            token: 7,
+            source: DpcSubmissionSource::Rdram,
+            start: 0x100,
+            end: 0x180,
+        };
+        baseline.guest.pending_dpc = Some(dpc_submission);
+        baseline.pending_dpc = Some(PendingDpcSnapshot {
+            submission: dpc_submission,
+            rollback_start: 0x80,
+            rollback_end: 0x100,
+            rollback_current: 0x80,
+            rollback_status: 0x400,
+        });
         let baseline_sha = sha256_hex(&encode_test_device(
             baseline.clone(),
             peripherals_snapshot(),
@@ -5543,6 +5615,100 @@ mod tests {
         changed!(
             "guest register projection",
             |value: &mut DeviceEvidenceSnapshot| { value.guest.pi_cart_addr ^= 1 }
+        );
+        changed!(
+            "AI DRAM address latch",
+            |value: &mut DeviceEvidenceSnapshot| {
+                value.guest.ai_dram_addr =
+                    RdramAddr::from_offset(value.guest.ai_dram_addr.offset() ^ 8)
+            }
+        );
+        changed!("AI control latch", |value: &mut DeviceEvidenceSnapshot| {
+            value.guest.ai_control ^= 1
+        });
+        changed!("AI DACRATE latch", |value: &mut DeviceEvidenceSnapshot| {
+            value.guest.ai_dacrate ^= 1
+        });
+        changed!("AI BITRATE latch", |value: &mut DeviceEvidenceSnapshot| {
+            value.guest.ai_bitrate ^= 1
+        });
+        changed!(
+            "DPC START register",
+            |value: &mut DeviceEvidenceSnapshot| { value.guest.dpc_start ^= 8 }
+        );
+        changed!("DPC END register", |value: &mut DeviceEvidenceSnapshot| {
+            value.guest.dpc_end ^= 8
+        });
+        changed!(
+            "DPC CURRENT register",
+            |value: &mut DeviceEvidenceSnapshot| { value.guest.dpc_current ^= 8 }
+        );
+        changed!(
+            "DPC STATUS register",
+            |value: &mut DeviceEvidenceSnapshot| { value.guest.dpc_status ^= 1 }
+        );
+        changed!(
+            "guest pending DPC token",
+            |value: &mut DeviceEvidenceSnapshot| {
+                value.guest.pending_dpc.as_mut().unwrap().token ^= 1
+            }
+        );
+        changed!(
+            "guest pending DPC source",
+            |value: &mut DeviceEvidenceSnapshot| {
+                value.guest.pending_dpc.as_mut().unwrap().source = DpcSubmissionSource::Dmem
+            }
+        );
+        changed!(
+            "guest pending DPC start",
+            |value: &mut DeviceEvidenceSnapshot| {
+                value.guest.pending_dpc.as_mut().unwrap().start ^= 8
+            }
+        );
+        changed!(
+            "guest pending DPC end",
+            |value: &mut DeviceEvidenceSnapshot| {
+                value.guest.pending_dpc.as_mut().unwrap().end ^= 8
+            }
+        );
+        changed!("pending DPC token", |value: &mut DeviceEvidenceSnapshot| {
+            value.pending_dpc.as_mut().unwrap().submission.token ^= 1
+        });
+        changed!(
+            "pending DPC source",
+            |value: &mut DeviceEvidenceSnapshot| {
+                value.pending_dpc.as_mut().unwrap().submission.source = DpcSubmissionSource::Dmem
+            }
+        );
+        changed!("pending DPC start", |value: &mut DeviceEvidenceSnapshot| {
+            value.pending_dpc.as_mut().unwrap().submission.start ^= 8
+        });
+        changed!("pending DPC end", |value: &mut DeviceEvidenceSnapshot| {
+            value.pending_dpc.as_mut().unwrap().submission.end ^= 8
+        });
+        changed!(
+            "pending DPC rollback START",
+            |value: &mut DeviceEvidenceSnapshot| {
+                value.pending_dpc.as_mut().unwrap().rollback_start ^= 8
+            }
+        );
+        changed!(
+            "pending DPC rollback END",
+            |value: &mut DeviceEvidenceSnapshot| {
+                value.pending_dpc.as_mut().unwrap().rollback_end ^= 8
+            }
+        );
+        changed!(
+            "pending DPC rollback CURRENT",
+            |value: &mut DeviceEvidenceSnapshot| {
+                value.pending_dpc.as_mut().unwrap().rollback_current ^= 8
+            }
+        );
+        changed!(
+            "pending DPC rollback STATUS",
+            |value: &mut DeviceEvidenceSnapshot| {
+                value.pending_dpc.as_mut().unwrap().rollback_status ^= 1
+            }
         );
         changed!("pi domain timing", |value: &mut DeviceEvidenceSnapshot| {
             value.guest.pi_domain2.release ^= 1
@@ -5957,7 +6123,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v9_wire_binds_executor_and_abi_host_families() {
+    fn device_state_v10_wire_binds_executor_and_abi_host_families() {
         use fn64_runtime::{
             EventRegistrationEvidenceSnapshot, ExecutorQueueEvidenceSnapshot,
             ExecutorRunningEvidenceSnapshot, MesgQueueEvidenceSnapshot,
@@ -6272,7 +6438,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v9_wire_distinguishes_rsp_task_lineage_phases() {
+    fn device_state_v10_wire_distinguishes_rsp_task_lineage_phases() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let digest = |phase| {
@@ -6311,7 +6477,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v9_wire_distinguishes_native_program_classes_and_identity() {
+    fn device_state_v10_wire_distinguishes_native_program_classes_and_identity() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let host = host_snapshot();
@@ -6341,7 +6507,7 @@ mod tests {
 
     #[cfg(feature = "recomp-rs")]
     #[test]
-    fn device_state_v9_wire_binds_typed_program_identity_and_dynamic_state() {
+    fn device_state_v10_wire_binds_typed_program_identity_and_dynamic_state() {
         use fn64_abi::recompiled::{
             LiveExecutableRegionEvidenceSnapshot, PendingExecutableWriteEvidenceSnapshot,
             RecompiledProgramEvidenceSnapshot,
@@ -6753,11 +6919,11 @@ mod tests {
         ));
 
         let mut stale_schema = report.clone();
-        stale_schema.schema = "fn64.release-gate.v21".to_owned();
+        stale_schema.schema = "fn64.release-gate.v22".to_owned();
         assert!(matches!(
             stale_schema.verify_integrity(),
             Err(GateError::UnsupportedReportSchema(schema))
-                if schema == "fn64.release-gate.v21"
+                if schema == "fn64.release-gate.v22"
         ));
 
         let duplicate = vec![report.closure[0].clone(), report.closure[0].clone()];
@@ -6774,7 +6940,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v22_report_wire_binds_every_release_environment_field() {
+    fn schema_v23_report_wire_binds_every_release_environment_field() {
         let report = ReleaseGateReport::new(
             "environment-wire",
             b"input",
@@ -7634,7 +7800,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v22_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
+    fn schema_v23_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
         let geometry = observations();
         let graphics_closure = vec![ClosurePath {
             name: "rsp.graphics-task".to_owned(),

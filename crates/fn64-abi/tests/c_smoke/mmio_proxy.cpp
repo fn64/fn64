@@ -188,14 +188,21 @@ int main(int argc, char** argv) {
         return 4;
     }
 
-    // A generated-C raw AI start reaches the timed FIFO, not the old shadow
-    // register: BUSY is live immediately after the length command.
-    MEM_W(0, UINT64_C(0xFFFFFFFFA4500010)) = UINT32_C(151);
+    // Generated-C AI register writes and reads round-trip through DeviceFabric,
+    // not the compatibility sparse-window shadow. The standalone smoke host
+    // has not selected an IPL television standard, so it deliberately does
+    // not issue DACRATE/LEN (those timed paths are covered by Rust ABI tests).
     MEM_W(0, UINT64_C(0xFFFFFFFFA4500000)) = UINT32_C(0x1000);
-    MEM_W(0, UINT64_C(0xFFFFFFFFA4500004)) = UINT32_C(0x80);
-    if ((static_cast<uint32_t>(
-             MEM_W(0, UINT64_C(0xFFFFFFFFA450000C))) &
-         UINT32_C(0x40000000)) == 0) {
+    MEM_W(0, UINT64_C(0xFFFFFFFFA4500008)) = UINT32_C(1);
+    MEM_W(0, UINT64_C(0xFFFFFFFFA4500014)) = UINT32_C(10);
+    if (static_cast<uint32_t>(MEM_W(0, UINT64_C(0xFFFFFFFFA4500000))) !=
+            UINT32_C(0x1000) ||
+        static_cast<uint32_t>(MEM_W(0, UINT64_C(0xFFFFFFFFA4500008))) !=
+            UINT32_C(1) ||
+        static_cast<uint32_t>(MEM_W(0, UINT64_C(0xFFFFFFFFA4500014))) !=
+            UINT32_C(10) ||
+        static_cast<uint32_t>(MEM_W(0, UINT64_C(0xFFFFFFFFA450000C))) !=
+            UINT32_C(0x02000000)) {
         return 7;
     }
 

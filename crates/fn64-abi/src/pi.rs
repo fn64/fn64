@@ -652,7 +652,14 @@ fn live_device_mmio_addr(vaddr: u64, write: bool) -> Option<MmioAddr> {
         );
     let is_mi_read = !write && matches!(addr, 0xA430_0008 | 0xA430_000C);
     let is_mi_write = write && addr == 0xA430_000C;
+    let is_dpc_read =
+        !write && matches!(addr, 0xA410_0000 | 0xA410_0004 | 0xA410_0008 | 0xA410_000C);
+    let is_dpc_write = write && matches!(addr, 0xA410_0000 | 0xA410_0004 | 0xA410_000C);
     let is_vi = (0xA440_0000..=0xA440_0034).contains(&addr);
+    let is_ai = matches!(
+        addr,
+        0xA450_0000 | 0xA450_0004 | 0xA450_0008 | 0xA450_000C | 0xA450_0010 | 0xA450_0014
+    );
     let is_si_read = !write && matches!(addr, 0xA480_0000 | 0xA480_0018);
     let is_si_write =
         write && matches!(addr, 0xA480_0000 | 0xA480_0004 | 0xA480_0010 | 0xA480_0018);
@@ -661,7 +668,10 @@ fn live_device_mmio_addr(vaddr: u64, write: bool) -> Option<MmioAddr> {
         || is_pi_read
         || is_mi_read
         || is_mi_write
+        || is_dpc_read
+        || is_dpc_write
         || is_vi
+        || is_ai
         || is_si_read
         || is_si_write)
         .then(|| MmioAddr::new(addr))
@@ -700,19 +710,95 @@ pub(crate) fn clear_device_interrupt(source: fn64_runtime::InterruptSource) {
     with_host(|host| host.device_fabric.clear_interrupt(source));
 }
 
-pub(crate) fn start_live_ai_dma(request: AiDmaRequest) -> Result<(), DeviceFault> {
-    if crate::boot_probe_enabled() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static CALLS: AtomicU32 = AtomicU32::new(0);
-        let n = CALLS.fetch_add(1, Ordering::Relaxed);
-        if n < 6 || n.is_multiple_of(2048) {
-            eprintln!(
-                "[boot-probe] start_live_ai_dma #{n} len={:#x} rate={}Hz",
-                request.len, request.sample_rate_hz
-            );
+fn apply_live_ai_write_effect(rdram: *mut u8, effect: fn64_runtime::DeviceMmioWriteEffect) {
+    match effect {
+        fn64_runtime::DeviceMmioWriteEffect::None => {}
+        fn64_runtime::DeviceMmioWriteEffect::AiFrequencyChanged { sample_rate_hz } => {
+            crate::task_dispatch::notify_audio_frequency(sample_rate_hz);
+        }
+        fn64_runtime::DeviceMmioWriteEffect::AiDmaStarted(request) => {
+            if crate::boot_probe_enabled() {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static CALLS: AtomicU32 = AtomicU32::new(0);
+                let n = CALLS.fetch_add(1, Ordering::Relaxed);
+                if n < 6 || n.is_multiple_of(2048) {
+                    eprintln!(
+                        "[boot-probe] live AI DMA #{n} len={:#x} rate={}Hz",
+                        request.len, request.sample_rate_hz
+                    );
+                }
+            }
+            // Host audio is optional. Once a shell/harness registers a bound,
+            // both raw and libultra submissions deliver the exact accepted
+            // fabric request; an absent consumer does not weaken device state.
+            if crate::task_dispatch::AUDIO_RDRAM_LEN.with(Cell::get) != 0 {
+                assert!(
+                    !rdram.is_null(),
+                    "AI DMA reached a registered audio backend without process RDRAM"
+                );
+                unsafe {
+                    crate::task_dispatch::deliver_ai_buffer(
+                        rdram,
+                        request.dram_addr.offset() as usize,
+                        request.len as usize,
+                    )
+                };
+            }
+        }
+        fn64_runtime::DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => {
+            panic!(
+                "AI register write unexpectedly produced DPC transaction token {}",
+                submission.token
+            )
         }
     }
-    with_host(|host| host.device_fabric.start_ai_dma(request))
+}
+
+pub(crate) fn set_live_ai_rates(
+    encoded_dac_rate: u32,
+    encoded_bit_rate: u32,
+) -> Result<(), DeviceFault> {
+    let dac_effect = with_host(|host| {
+        host.device_fabric
+            .write_mmio(MmioAddr::new(0xA450_0010), encoded_dac_rate)
+    })?;
+    let bit_effect = with_host(|host| {
+        host.device_fabric
+            .write_mmio(MmioAddr::new(0xA450_0014), encoded_bit_rate)
+    })?;
+    apply_live_ai_write_effect(std::ptr::null_mut(), dac_effect);
+    apply_live_ai_write_effect(std::ptr::null_mut(), bit_effect);
+    Ok(())
+}
+
+/// Submit one libultra AI range through the same DRAM/LEN register transaction
+/// as raw generated-C MMIO. The returned effect is a notification only: the
+/// fabric has already enqueued the accepted request exactly once.
+///
+/// # Safety
+/// `rdram` must be the process allocation registered for the active guest.
+pub(crate) unsafe fn submit_live_ai_dma(
+    rdram: *mut u8,
+    dram_addr: u32,
+    len: u32,
+) -> Result<(), DeviceFault> {
+    // The public shim reports a full two-slot FIFO without issuing either
+    // register write. Raw MMIO retains its architectural write-through
+    // behavior, but a rejected libultra call must not replace AI_DRAM_ADDR.
+    if with_host(|host| host.device_fabric.ai_status()) & fn64_runtime::AI_STATUS_FULL != 0 {
+        return Err(DeviceFault::AiFull);
+    }
+    let dram_effect = with_host(|host| {
+        host.device_fabric
+            .write_mmio(MmioAddr::new(0xA450_0000), dram_addr)
+    })?;
+    apply_live_ai_write_effect(rdram, dram_effect);
+    let start_effect = with_host(|host| {
+        host.device_fabric
+            .write_mmio(MmioAddr::new(0xA450_0004), len)
+    })?;
+    apply_live_ai_write_effect(rdram, start_effect);
+    Ok(())
 }
 
 pub(crate) fn start_live_si_dma(
@@ -910,12 +996,12 @@ pub(crate) fn queue_live_vi_special_features(commands: u32) {
     });
 }
 
-pub(crate) fn live_ai_status() -> Option<u32> {
-    Some(with_host(|host| host.device_fabric.ai_status()))
+pub(crate) fn live_ai_status() -> u32 {
+    with_host(|host| host.device_fabric.ai_status())
 }
 
-pub(crate) fn live_ai_length() -> Option<u32> {
-    Some(with_host(|host| host.device_fabric.ai_length()))
+pub(crate) fn live_ai_length() -> u32 {
+    with_host(|host| host.device_fabric.ai_length())
 }
 
 pub(crate) fn read_live_rcp_interrupt_mmio(vaddr: u64) -> Option<u32> {
@@ -923,14 +1009,42 @@ pub(crate) fn read_live_rcp_interrupt_mmio(vaddr: u64) -> Option<u32> {
     with_host(|host| {
         let fabric = &mut host.device_fabric;
         match addr {
-            0xA450_0004 => Some(fabric.ai_length()),
-            0xA450_000C => Some(fabric.ai_status()),
             0xA480_0018 => {
                 Some(u32::from(fabric.interrupt_pending(fn64_runtime::InterruptSource::Si)) << 12)
             }
             _ => None,
         }
     })
+}
+
+/// Overlay the authoritative AI/DPC register image onto legacy sparse backing.
+/// Generated C and the block lane use the typed handlers directly; this keeps
+/// old hosts which still mirror the sparse window from publishing stale
+/// shadow values between coroutine resumes.
+///
+/// # Safety
+/// `rdram` must cover `RDRAM_MMIO_WINDOW_END` bytes.
+pub(crate) unsafe fn sync_live_ai_dpc_mmio_into_rdram(rdram: *mut u8) {
+    let registers = [
+        0xA410_0000u64,
+        0xA410_0004,
+        0xA410_0008,
+        0xA410_000C,
+        0xA450_0000,
+        0xA450_0004,
+        0xA450_0008,
+        0xA450_000C,
+        0xA450_0010,
+        0xA450_0014,
+    ];
+    let values = registers.map(|vaddr| {
+        read_live_device_mmio(vaddr)
+            .unwrap_or_else(|| panic!("authoritative AI/DPC register {vaddr:#018X} is unmapped"))
+    });
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    for (vaddr, value) in registers.into_iter().zip(values) {
+        unsafe { storage.write_u32(RdramAddr::from_gpr(vaddr), value) };
+    }
 }
 
 /// Apply interrupt set/acknowledgement side effects for raw RCP register
@@ -973,10 +1087,14 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
     let Some(addr) = live_device_mmio_addr(vaddr, true) else {
         return false;
     };
-    with_host(|host| {
+    let (effect, rdram, rdram_len) = with_host(|host| {
         let is_pi_dma_start = matches!(addr.get(), 0xA460_0008 | 0xA460_000C);
         let is_si_dma_start = matches!(addr.get(), 0xA480_0004 | 0xA480_0010);
         let is_sp_dma_start = matches!(addr.get(), 0xA404_0008 | 0xA404_000C);
+        let is_host_memory_transaction_start = matches!(
+            addr.get(),
+            0xA410_0004 | 0xA460_0008 | 0xA460_000C | 0xA480_0004 | 0xA480_0010
+        );
         if is_pi_dma_start && !host.pending_pi_completions.is_empty() {
             panic!("raw MMIO PI DMA start while the PI channel is busy");
         }
@@ -984,7 +1102,10 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
             panic!("raw MMIO PI DMA start has no installed cartridge ROM");
         }
         let (rdram, rdram_len) = (host.runtime_rdram, host.runtime_rdram_len);
-        if (is_pi_dma_start || is_si_dma_start || is_sp_dma_start)
+        if (is_pi_dma_start
+            || is_si_dma_start
+            || is_sp_dma_start
+            || is_host_memory_transaction_start)
             && (rdram.is_null() || rdram_len == 0)
         {
             panic!(
@@ -1002,9 +1123,9 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
         }
         let write_result = fabric.write_mmio(addr, value);
         if is_si_dma_start && matches!(write_result, Err(DeviceFault::SiBusy)) {
-            return;
+            return (fn64_runtime::DeviceMmioWriteEffect::None, rdram, rdram_len);
         }
-        write_result.unwrap_or_else(|error| panic!("raw MMIO write failed: {error}"));
+        let effect = write_result.unwrap_or_else(|error| panic!("raw MMIO write failed: {error}"));
         if is_pi_dma_start {
             let request = fabric
                 .pending_pi_request()
@@ -1036,8 +1157,40 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
         } else if addr.get() == 0xA460_0010 && value & 1 != 0 {
             host.pending_pi_completions.clear();
         }
+        (effect, rdram, rdram_len)
     });
+    match effect {
+        fn64_runtime::DeviceMmioWriteEffect::None => {}
+        effect @ (fn64_runtime::DeviceMmioWriteEffect::AiFrequencyChanged { .. }
+        | fn64_runtime::DeviceMmioWriteEffect::AiDmaStarted(_)) => {
+            apply_live_ai_write_effect(rdram, effect);
+        }
+        fn64_runtime::DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => {
+            assert!(
+                !rdram.is_null(),
+                "raw DPC submission has no registered RDRAM"
+            );
+            if submission.source == fn64_runtime::DpcSubmissionSource::Rdram {
+                assert!(
+                    submission.end as usize <= rdram_len,
+                    "raw DPC command range ends at {:#010x}, beyond registered RDRAM {rdram_len:#x}",
+                    submission.end
+                );
+            }
+            unsafe { crate::task_dispatch::dispatch_dpc_submission(rdram, submission) };
+        }
+    }
     true
+}
+
+fn require_no_mmio_write_effect(
+    result: Result<fn64_runtime::DeviceMmioWriteEffect, DeviceFault>,
+    context: &'static str,
+) {
+    match result.unwrap_or_else(|error| panic!("{context}: {error}")) {
+        fn64_runtime::DeviceMmioWriteEffect::None => {}
+        effect => panic!("{context}: non-host MMIO latch produced unexpected effect {effect:?}"),
+    }
 }
 
 /// Shared raw word path for typed block execution and the generated-C MMIO
@@ -1105,34 +1258,10 @@ pub(crate) fn write_raw_mmio_word(vaddr: u64, value: u32) -> bool {
         return false;
     }
     observe_live_interrupt_mmio(vaddr, value);
-    let raw_dp_range = crate::ai::MMIO.with(|cell| {
-        let mut mmio = cell.borrow_mut();
-        mmio.write_w(
-            offset - fn64_runtime::RDRAM_MMIO_WINDOW_START,
-            value,
-        );
-        (vaddr as u32 == 0xA410_0004).then(|| {
-            let start = mmio.dp.start;
-            assert!(
-                start.is_multiple_of(8) && value.is_multiple_of(8) && start < value,
-                "raw DPC command range [{start:#010x}, {value:#010x}) must be nonempty and 8-byte aligned"
-            );
-            assert!(
-                mmio.dp.set_next_buffer(start, value),
-                "raw DPC END write while a prior start remains pending"
-            );
-            (start, value)
-        })
+    crate::ai::MMIO.with(|cell| {
+        cell.borrow_mut()
+            .write_w(offset - fn64_runtime::RDRAM_MMIO_WINDOW_START, value);
     });
-    crate::ai::observe_live_ai_mmio_write(vaddr, value);
-    if let Some((start, end)) = raw_dp_range {
-        let (rdram, rdram_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
-        assert!(
-            !rdram.is_null() && end as usize <= rdram_len,
-            "raw DPC command range ends at {end:#010x}, beyond registered RDRAM {rdram_len:#x}"
-        );
-        unsafe { crate::task_dispatch::dispatch_raw_rdp(rdram, start, end) };
-    }
     true
 }
 
@@ -1391,22 +1520,21 @@ fn advance_device_time_step(now: u64) -> u32 {
                                     + u32::try_from(index).expect("VI register index exceeds u32")
                                         * 4,
                             );
-                            host.device_fabric
-                                .write_mmio(addr, value)
-                                .unwrap_or_else(|error| {
-                                    panic!("VI mode register latch failed: {error}")
-                                });
+                            require_no_mmio_write_effect(
+                                host.device_fabric.write_mmio(addr, value),
+                                "VI mode register latch failed",
+                            );
                         }
                         host.active_vi_mode = Some(mode);
                         host.active_vi_x_scale = 1.0;
                         host.active_vi_y_scale = 1.0;
                     }
                     if let Some(control) = host.pending_vi_control.take() {
-                        host.device_fabric
-                            .write_mmio(MmioAddr::new(0xA440_0000), control)
-                            .unwrap_or_else(|error| {
-                                panic!("VI special-feature latch failed: {error}")
-                            });
+                        require_no_mmio_write_effect(
+                            host.device_fabric
+                                .write_mmio(MmioAddr::new(0xA440_0000), control),
+                            "VI special-feature latch failed",
+                        );
                     }
                     if let Some(scale) = host.pending_vi_x_scale.take() {
                         assert!(
@@ -1425,12 +1553,13 @@ fn advance_device_time_step(now: u64) -> u32 {
                     if let Some(mode) = host.active_vi_mode {
                         const FIELD_REGISTER_INDICES: [usize; 5] = [1, 13, 10, 11, 3];
                         let field = host.device_fabric.vi_field() as usize;
-                        host.device_fabric
-                            .write_mmio(
+                        require_no_mmio_write_effect(
+                            host.device_fabric.write_mmio(
                                 MmioAddr::new(0xA440_0030),
                                 scaled_vi_register(mode.registers[12], host.active_vi_x_scale),
-                            )
-                            .unwrap_or_else(|error| panic!("VI X-scale latch failed: {error}"));
+                            ),
+                            "VI X-scale latch failed",
+                        );
                         for (index, mut value) in
                             FIELD_REGISTER_INDICES.into_iter().zip(mode.fields[field])
                         {
@@ -1448,18 +1577,17 @@ fn advance_device_time_step(now: u64) -> u32 {
                                     + u32::try_from(index).expect("VI register index exceeds u32")
                                         * 4,
                             );
-                            host.device_fabric
-                                .write_mmio(addr, value)
-                                .unwrap_or_else(|error| {
-                                    panic!("VI field register latch failed: {error}")
-                                });
+                            require_no_mmio_write_effect(
+                                host.device_fabric.write_mmio(addr, value),
+                                "VI field register latch failed",
+                            );
                         }
                     } else if let Some(framebuffer) = pending_vi_framebuffer {
-                        host.device_fabric
-                            .write_mmio(MmioAddr::new(0xA440_0004), framebuffer)
-                            .unwrap_or_else(|error| {
-                                panic!("VI framebuffer-origin latch failed: {error}")
-                            });
+                        require_no_mmio_write_effect(
+                            host.device_fabric
+                                .write_mmio(MmioAddr::new(0xA440_0004), framebuffer),
+                            "VI framebuffer-origin latch failed",
+                        );
                     }
                     let mut words = [0u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
                     for (index, word) in words.iter_mut().enumerate() {

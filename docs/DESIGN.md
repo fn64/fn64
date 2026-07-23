@@ -276,15 +276,16 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 `Running -> ResumeAuthorized -> ResumeLoaded -> Running`; ordinary completion
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain at least one individual recognized event whose text SHA,
-data length, and data SHA equal the admitted pair. Report schema
-`fn64.release-gate.v22` and the
+data length, and data SHA equal the admitted pair. Current report schema
+`fn64.release-gate.v23` and the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
 
 This mechanism makes a correctly formed production contract launchable; it is
 not representative-ROM evidence by itself. Representative private NTSC
 full-ROM exact-ten series for reference and RT64 LLE/post-VI completed under
 schema v22 and were independently reverified locally on 2026-07-22. Both
-series bind boundary-owned observations and the compiled unsupported-
+series are historical under schema v23 and require regeneration. They bind
+their then-current boundary-owned observations and the compiled unsupported-
 instrumentation identity. A retained public synthetic identified-native XBUS
 series binds the same denominator without acquiring private-ROM authority.
 Their combined incomplete matrix accepted all 30 reports, satisfied 12 of 162
@@ -297,7 +298,7 @@ Report-only matrix v5 verification never awards a ROM-class requirement from
 the report's host-supplied label. Its private-series path accepts only an
 opaque capability produced by jointly revalidating the policy-admitted v3
 contract, exact-ten receipt, retained reports/journals, raw ROM, runner image,
-and bound inputs. It exact-matches the v22 semantic report and ordered run-event
+and bound inputs. It exact-matches the v23 semantic report and ordered run-event
 identities, and retains a canonical `fn64.verified-rom-class-authority.v1`
 inside verified-matrix v18. The retained
 self-hash proves canonical integrity, not signer identity or transferable
@@ -453,7 +454,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v22 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v23 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -465,7 +466,7 @@ a contradictory backend label traps. Neither source can choose the digest or
 execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v22` binds it independently.
+clears it and report schema `fn64.release-gate.v23` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.
@@ -751,12 +752,16 @@ task calls out:
   default one-cycle `FixedPiTiming` is an explicit,
   host-configurable compatibility policy because the allowed public manuals
   define PI domain parameters but not an exact completion formula; it is not a
-  hardware-cycle-accuracy claim. The same fabric now owns AI's two-slot FIFO.
+  hardware-cycle-accuracy claim. The same fabric owns AI's complete guest
+  register latches and two-slot FIFO; shim calls and raw register writes do not
+  retain a second DAC-rate, source-address, or control authority.
   It derives deterministic drain deadlines from stereo-frame count, the
   93.75 MHz CPU clock, and libultra's quantized DAC rate, then raises MI AI and
   returns OS_EVENT_AI only after the current buffer drains. This is guest-time
   ordering, not a claim of hardware-verified AI bus timing. Its DAC divisor
-  uses the same IPL-selected NTSC/PAL/MPAL video clock as VI. SP, SI, VI, PI,
+  uses the same IPL-selected NTSC/PAL/MPAL video clock as VI. Exact AI bus
+  timing, hardware counter edge behavior, and native-C instruction-interior
+  observation remain open. SP, SI, VI, PI,
   AI, and DP pending bits and masks are
   one level-sensitive gate. Typed raw writes apply the acknowledgement commands
   documented by the public `rcp.h` register definitions: SP status bits 3/4,
@@ -888,10 +893,16 @@ task calls out:
   byte, while the generated-code allocation's appended MMIO/non-RDRAM backing is
   never exposed or transactionally cloned. Captured XBUS/LLE command words use
   a private immutable staging suffix at the physical boundary; only the
-  physical prefix is copied back. The synchronous DPC model treats
+  physical prefix is copied back. One fabric-owned DPC register file and typed
+  pending transaction retain START, END, CURRENT, STATUS, source (RDRAM or
+  DMEM), range, and ownership token until the renderer commits or cancels it;
+  raw MMIO, LLE, and shim submissions cannot bypass that state. The synchronous DPC model treats
   `START == END` as the public empty-FIFO initialization and emits only each
   newly exposed `[CURRENT, END)` span, advancing `CURRENT` after consumption;
-  repeated `END` writes cannot replay an already-rendered prefix. Graphics HLE preflight is
+  repeated `END` writes cannot replay an already-rendered prefix. Exact
+  hardware DPC counters and latency, FREEZE/FLUSH interaction, subword register
+  access, native execution paused mid-transaction, and silicon bus behavior
+  remain open. Graphics HLE preflight is
   transactional and content-addressed: selecting an HLE decode mode admits no
   content. Both HLE backends return `NeedsLle` when the task-entry IMEM digest
   is unregistered; the reference renderer additionally decodes admitted tasks
@@ -1220,7 +1231,7 @@ task calls out:
   native pointers and registration order. Mapped-interpreter destination
   observations honestly retain no
   generated artifact and are operational/differential-only, not fixed-cycle
-  release evidence under schema v22; artifact-identified mapped AOT retains its
+  release evidence under schema v23; artifact-identified mapped AOT retains its
   real artifact and is eligible, while compatibility AOT without one is not.
   Refill and invalid fetch faults retain exact EPC/BD, BadVAddr, Context/EntryHi,
   and refill/common vector selection. The legacy whole-function boundary,
@@ -1785,14 +1796,18 @@ domain-separates and hashes PI/SI/AI/raw-SP start plus commit/completion events
 and synchronous `SpTaskAdmitted`, binds each path's serialized observation
 count into the report SHA, and hashes the complete future-affecting state of
 the modeled `DeviceFabric`: its internal memories, queues, event ordering,
-timing policy, and cartridge-save/programming state. It also hashes the
+timing policy, and cartridge-save/programming state. DeviceState v10 extends
+that projection with every AI latch and DPC register plus the complete pending
+DPC transaction/source, so equal visible BUSY bits cannot hide distinct
+DACRATE or START/range futures. It also hashes the
 executor-owned PIF identities/input/rumble and all four retained Controller
 Pak, Transfer Pak, and VRU slots; their complete authoritative storage,
 semantic metadata, mapper/RTC/timing state; high-level VI/retrace state; and
-the ABI manager's pending PI/SI delivery and VI-latch metadata. V9 additionally
-binds the owner-local executor control and complete modeled ABI HostState
-projections described below. V8 and earlier artifacts lack that aggregate and
-are rejected. Pointer identity is excluded while the one-process-RDRAM
+the ABI manager's pending PI/SI delivery and VI-latch metadata. DeviceState v9
+added the owner-local executor control and complete modeled ABI HostState
+projections described below. Retained report schema v22 and DeviceState v9
+artifacts are historical only; they cannot satisfy current v23 verification.
+Pointer identity is excluded while the one-process-RDRAM
 invariant, buffer length, and guest-visible delivery fields are retained.
 MBC3 powered-off persistence keeps this boundary deterministic: the host
 explicitly injects sidecar checkpoint/resume timestamps, restore materializes
