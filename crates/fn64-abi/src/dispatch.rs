@@ -223,11 +223,19 @@ mod tests {
     use super::*;
     use crate::test_support::*;
 
+    // These two markers must have DISTINCT addresses: the code under test keys
+    // `native_destination_by_pointer` on the function pointer. Their bodies are
+    // otherwise near-identical, so under `--release` the linker's
+    // identical-code-folding merged them to one address — making both register
+    // under one pointer and tripping the "one pointer, two destinations"
+    // assert. A distinct `black_box` value per fn keeps them un-foldable.
     unsafe extern "C" fn observed_native_first(_rdram: *mut u8, _ctx: *mut RecompContext) {
+        std::hint::black_box(0xF187u16);
         fn64_c_recompiled_function_enter(observed_native_first);
     }
 
     unsafe extern "C" fn observed_native_second(_rdram: *mut u8, _ctx: *mut RecompContext) {
+        std::hint::black_box(0x5EC0u16);
         fn64_c_recompiled_function_enter(observed_native_second);
     }
 
