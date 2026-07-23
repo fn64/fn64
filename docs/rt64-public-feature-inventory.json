@@ -64,11 +64,11 @@
       "scope": "behavior",
       "status": "closed",
       "controls": ["build_capability", "runtime_setting"],
-      "closure": "Twenty consecutive clean live runs against clean pinned RT64 explicitly select Metal, initialize the backend, submit exact raw-RDP fills, present from nonzero live VI origins through the current physical-RDRAM capability, bind post-VI BGRA8 captures, resize from 4x2 to 8x4 across two distinct worker presents without stale-cache reversion, and recreate at 4x2 with the same active policy identity. Each process also proves a later backend-geometry compatibility present cannot enter release capture.",
+      "closure": "Twenty consecutive clean live runs against clean pinned RT64 explicitly select Metal and initialize the backend. Each process first completes two VI presents before any graphics workload while proving their zero-workload pixels cannot become release evidence, then submits exact raw-RDP fills, presents from nonzero live VI origins through the current physical-RDRAM capability, binds the first post-workload BGRA8 capture to workload 1 and present 3, resizes from 4x2 to 8x4 across two distinct worker presents without stale-cache reversion, and recreates at 4x2 with the same active policy identity. Each process also proves a later backend-geometry compatibility present cannot enter release capture.",
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 13, "needle": "D3D12, Vulkan and Metal" },
         { "kind": "pinned_source", "path": "src/hle/rt64_application.cpp", "line": 168, "needle": "GraphicsAPI::Metal" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_metal_backend_behavior.rs", "line": 234, "needle": "validate_capture(resized, &resized_capture, &identity, policy_sha256)", "claim_id": "backend-metal" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_metal_backend_behavior.rs", "line": 273, "needle": "validate_capture(resized, &resized_capture, &identity, policy_sha256)", "claim_id": "backend-metal" }
       ]
     },
     {
@@ -178,7 +178,7 @@
         { "kind": "official_readme", "path": "README.md", "line": 20, "needle": "60 FPS or above" },
         { "kind": "pinned_source", "path": "src/hle/rt64_workload_queue.cpp", "line": 989, "needle": "generateInterpolatedFrames" },
         { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_hfr_interpolation_behavior.rs", "line": 846, "needle": "fn main()", "claim_id": "hfr-60-plus-interpolation" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/src/ffi.rs", "line": 4157, "needle": "fn cpp_vi_history_uses_context_region_rate_for_stable_factors", "claim_id": "hfr-60-plus-interpolation" },
+        { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/src/ffi.rs", "line": 4165, "needle": "fn cpp_vi_history_uses_context_region_rate_for_stable_factors", "claim_id": "hfr-60-plus-interpolation" },
         { "kind": "fn64_feature_test", "path": "crates/fn64-render-rt64/examples/rt64_region_rate_behavior.rs", "line": 161, "needle": "fn main()", "claim_id": "hfr-60-plus-interpolation" }
       ]
     },
