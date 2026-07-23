@@ -1207,14 +1207,22 @@ impl Rt64Backend {
     pub fn presented_pixels(&mut self) -> Result<Rt64PresentedPixels, RenderError> {
         #[cfg(feature = "rt64")]
         {
-            self.context
+            let result = self
+                .context
                 .as_mut()
                 .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
-                .presented_pixels()
-                .map_err(|reason| RenderError::Backend {
+                .presented_pixels();
+            result.map_err(|reason| {
+                if reason == "RT64 has no completed post-workload present capture" {
+                    return RenderError::NotReady(
+                        "RT64 has no completed post-workload present capture",
+                    );
+                }
+                RenderError::Backend {
                     backend: "rt64-present-capture",
                     reason,
-                })
+                }
+            })
         }
 
         #[cfg(not(feature = "rt64"))]

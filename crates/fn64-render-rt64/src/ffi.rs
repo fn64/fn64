@@ -4077,6 +4077,14 @@ mod tests {
                 "portable present-capture seam lost {required}"
             );
         }
+        assert!(
+            shim.contains(
+                "if (completed.workloadId == 0U) {\n                    // Interleaving closed here: a game's VI thread can present"
+            ) && shim.contains("(diagnostic.workload_before != 0U)")
+                && shim.contains("(diagnostic.workload_after != 0U)")
+                && shim.contains("completed.workloadId > diagnostic.workload_after"),
+            "pre-workload VI capture must remain presentable without becoming release evidence"
+        );
     }
 
     #[test]
