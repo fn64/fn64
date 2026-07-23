@@ -38,36 +38,62 @@ fn expand5(v: u16) -> u8 {
 /// slice at the VI framebuffer offset; if it's shorter than [`FB_BYTES`]
 /// (e.g. a truncated capture near an rdram bound), the missing pixels are
 /// left black rather than reading out of bounds. Returns the number of
-/// source pixels actually converted.
-pub fn rgba5551_to_rgba8888(rdram: RdramView<'_>, start: RdramAddr, dst: &mut [u8]) -> usize {
-    debug_assert_eq!(dst.len(), FB_WIDTH * FB_HEIGHT * 4);
+/// destination pixels actually written.
+///
+/// `src_stride` is the framebuffer's real line width in pixels (VI_WIDTH,
+/// from `fn64_abi::vi_width`). The source advances by `src_stride` per row
+/// while `dst` stays `FB_WIDTH`-wide, so a game whose framebuffer line width
+/// differs from the presented 320 no longer shears/offsets each scanline.
+/// When `src_stride == FB_WIDTH` this is the previous linear behavior exactly.
+pub fn rgba5551_to_rgba8888(
+    rdram: RdramView<'_>,
+    start: RdramAddr,
+    src_stride: usize,
+    dst_width: usize,
+    dst: &mut [u8],
+) -> usize {
+    debug_assert_eq!(dst.len(), dst_width * FB_HEIGHT * 4);
     assert!(
         start.offset().is_multiple_of(4),
         "RGBA5551 framebuffer base must be word-aligned, got {:#x}",
         start.offset()
     );
-    let available = rdram.len().saturating_sub(start.offset() as usize);
-    let pixels = ((available / 4) * 2).min(FB_WIDTH * FB_HEIGHT);
-    for i in 0..pixels {
-        let byte_offset = u32::try_from(i * 2).expect("framebuffer byte offset exceeds u32");
-        let addr = start
-            .checked_add(byte_offset)
-            .expect("framebuffer logical address overflow");
-        let px = rdram.read_u16(addr);
-        let r5 = (px >> 11) & 0x1F;
-        let g5 = (px >> 6) & 0x1F;
-        let b5 = (px >> 1) & 0x1F;
-        let a1 = px & 0x1;
-        let o = i * 4;
-        dst[o] = expand5(r5);
-        dst[o + 1] = expand5(g5);
-        dst[o + 2] = expand5(b5);
-        // N64's 1-bit alpha is coverage, not transparency for a presented
-        // frame -- force opaque so the window never shows through.
-        dst[o + 3] = 255;
-        let _ = a1;
+    let src_stride = src_stride.max(1);
+    // The `^ 2` halfword swizzle in read_u16 touches the whole containing
+    // word, so a trailing sub-word remnant is not a readable pixel. Count
+    // pixels at word granularity, matching the previous `(available/4)*2`.
+    let available_pixels = (rdram.len().saturating_sub(start.offset() as usize) / 4) * 2;
+    // Present the full framebuffer line when the surface is sized to it
+    // (`dst_width == src_stride`); if the surface is narrower, show the left
+    // `dst_width` columns of each row, still at the correct per-row offset.
+    let copy_width = dst_width.min(src_stride);
+    let mut written = 0;
+    for row in 0..FB_HEIGHT {
+        let row_first = row * src_stride;
+        for col in 0..copy_width {
+            let i = row_first + col;
+            if i >= available_pixels {
+                return written; // ran off the rdram-backed region
+            }
+            let byte_offset = u32::try_from(i * 2).expect("framebuffer byte offset exceeds u32");
+            let addr = start
+                .checked_add(byte_offset)
+                .expect("framebuffer logical address overflow");
+            let px = rdram.read_u16(addr);
+            let r5 = (px >> 11) & 0x1F;
+            let g5 = (px >> 6) & 0x1F;
+            let b5 = (px >> 1) & 0x1F;
+            let o = (row * dst_width + col) * 4;
+            dst[o] = expand5(r5);
+            dst[o + 1] = expand5(g5);
+            dst[o + 2] = expand5(b5);
+            // N64's 1-bit alpha is coverage, not transparency for a presented
+            // frame -- force opaque so the window never shows through.
+            dst[o + 3] = 255;
+            written += 1;
+        }
     }
-    pixels
+    written
 }
 
 /// True if every byte in `region` is identical -- a blank/uniform frame the
@@ -110,7 +136,14 @@ mod tests {
     }
 
     fn decode(src: &[u8], dst: &mut [u8]) -> usize {
-        rgba5551_to_rgba8888(RdramView::from_storage(src), RdramAddr::from_offset(0), dst)
+        // Default helper: stride == dst_width == FB_WIDTH (the 320 case).
+        rgba5551_to_rgba8888(
+            RdramView::from_storage(src),
+            RdramAddr::from_offset(0),
+            FB_WIDTH,
+            FB_WIDTH,
+            dst,
+        )
     }
 
     #[test]
@@ -153,6 +186,63 @@ mod tests {
         let mut dst = blank_dst();
         decode(&fb_with(&[0xF800]), &mut dst); // red, A=0
         assert_eq!(dst[3], 255);
+    }
+
+    #[test]
+    fn full_width_surface_presents_the_whole_line_at_its_real_stride() {
+        // WM2000's case: stride == dst_width == 480. Row 1 begins at source
+        // pixel `stride`, and the surface is wide enough to show the whole
+        // line (no crop). Confirm both rows land fully and at the right offset.
+        let width = 480usize;
+        let mut src_px = vec![0u16; width * 2];
+        src_px[0] = 0xF801; // row 0, col 0 = red
+        src_px[width - 1] = 0x07C0; // row 0, last col = green (only visible if full width shown)
+        src_px[width] = 0x003E; // row 1, col 0 = blue (at the real stride)
+        let src = fb_with(&src_px);
+        let mut dst = vec![0u8; width * FB_HEIGHT * 4];
+        rgba5551_to_rgba8888(
+            RdramView::from_storage(&src),
+            RdramAddr::from_offset(0),
+            width, // src_stride
+            width, // dst_width (surface sized to the real width)
+            &mut dst,
+        );
+        assert_eq!(&dst[0..4], &[255, 0, 0, 255], "row 0 col 0 red");
+        let last = (width - 1) * 4;
+        assert_eq!(
+            &dst[last..last + 4],
+            &[0, 255, 0, 255],
+            "row 0 last col green -- full width presented, not cropped to 320"
+        );
+        let row1 = width * 4;
+        assert_eq!(
+            &dst[row1..row1 + 4],
+            &[0, 0, 255, 255],
+            "row 1 col 0 blue -- read from offset `stride`, no shear"
+        );
+    }
+
+    #[test]
+    fn narrow_surface_crops_but_keeps_row_alignment() {
+        // If the surface stays 320 while the source is wider, each row still
+        // reads from its real stride (no shear), just cropped to the left 320.
+        let stride = 480usize;
+        let mut src_px = vec![0u16; stride * 2];
+        src_px[0] = 0xF801; // row 0 red
+        src_px[stride] = 0x003E; // row 1 blue at real stride
+        src_px[320] = 0x07C0; // beyond the 320 crop -- must not appear
+        let src = fb_with(&src_px);
+        let mut dst = vec![0u8; FB_WIDTH * FB_HEIGHT * 4];
+        rgba5551_to_rgba8888(
+            RdramView::from_storage(&src),
+            RdramAddr::from_offset(0),
+            stride,
+            FB_WIDTH, // narrow surface
+            &mut dst,
+        );
+        assert_eq!(&dst[0..4], &[255, 0, 0, 255]);
+        let row1 = FB_WIDTH * 4;
+        assert_eq!(&dst[row1..row1 + 4], &[0, 0, 255, 255]);
     }
 
     #[test]
