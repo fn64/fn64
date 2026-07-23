@@ -592,6 +592,30 @@ watchpoint), plus the lldb script patterns in `/tmp/wm2000_dlwatch.py`
 (RecompContext register watch armed at the Nth call), and
 `/tmp/wm2000_slotwatch.py` (guest stack-slot watch).
 
+### Follow-up (2026-07-23): fn64-shell was not using the mend
+
+The later interactive-shell failure after about 540 VI frames had the same
+observable shape (`func_80121764` entered with `s1 = 0xF0`, then `lw
+0xDC($s1)` trapped at `0x1CC`), but it did not establish a second bank-copy
+parser bug. The WM2000-specific harness above used the forced repair entry
+point; `fn64-shell` still used the default generated-C preparer and therefore
+compiled **zero** successor calls. Its prepared `func_8011F67C` again fell off
+after the call at guest `0x8011FE70`, skipping `func_8011FE78`'s cursor
+write-back, saved-register restores, and `sp += 0x88`. The display-list byte
+left in `s1` differs from the earlier `0xFF`, but the missing epilogue is the
+same.
+
+The shared preparer now exposes a generic structurally admitted path for the
+shell. It enables the existing section-local repair only when the generated
+corpus itself contains a reachable predecessor fall-off whose
+address-contiguous successor restores `ra` plus saved registers, returns
+through `ra`, and advances `sp` without allocating a frame. The NWXE corpus
+passes that gate and receives the same 1,996 repairs as this harness. A normal
+adjacent-function corpus does not. Bank-local names such as `_bank4_text` are
+parsed by the same section-reset successor map and have a dedicated regression;
+the suspected `func_8011FBD0 -> func_8011FE78_bank4_text` pair is not the leak
+because `func_8011FBD0` already executes its own complete restore/return.
+
 ## RESOLVED (2026-07-21, same cycle): rasterizer W-reciprocal trap
 
 With the fall-through mend in place the run next ended at a NAMED
