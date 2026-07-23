@@ -19,7 +19,7 @@ use std::path::PathBuf;
 /// AKI audio ucode text: ROM offset, byte length, and base vram (low bits).
 const AKI_UCODE_ROM_OFF: usize = 0x39510;
 const AKI_UCODE_LEN: usize = 0xC54; // 3156 bytes
-const AKI_UCODE_BASE_VRAM: u32 = 0x8910; // vram 0x80038910
+const AKI_UCODE_BASE_VRAM: u32 = 0x0; // RSP ucode executes at IMEM 0x1000; the DRAM load addr 0x80038910 is NOT the IMEM base
 
 fn main() {
     println!("cargo:rerun-if-env-changed=ROM");
