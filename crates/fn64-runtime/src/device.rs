@@ -445,7 +445,6 @@ pub enum DeviceFault {
     },
     PiBusy,
     AiFull,
-    AiDmaDisabled,
     AiControlWhileBusy {
         current: u32,
         requested: u32,
@@ -502,7 +501,6 @@ impl fmt::Display for DeviceFault {
             }
             Self::PiBusy => write!(f, "PI DMA start while the PI channel is busy"),
             Self::AiFull => write!(f, "AI DMA start while both FIFO slots are occupied"),
-            Self::AiDmaDisabled => write!(f, "AI DMA start while AI_CONTROL.DMA_ENABLE is clear"),
             Self::AiControlWhileBusy { current, requested } => write!(
                 f,
                 "AI_CONTROL transition {current:#x}->{requested:#x} while the AI FIFO is active has no admitted hardware behavior"
@@ -1160,6 +1158,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         let Some(current) = self.current_ai else {
             return 0;
         };
+        if self.ai_control & 1 == 0 {
+            return current.request.len;
+        }
         let duration = current.deadline.get() - current.started_at.get();
         let remaining_cycles = current.deadline.get().saturating_sub(self.now.get());
         let remaining = (u128::from(current.request.len) * u128::from(remaining_cycles))
@@ -1505,9 +1506,6 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// Timing uses the N64 CPU clock and four bytes per stereo 16-bit frame;
     /// the explicit ceiling prevents a nonempty buffer from completing early.
     pub fn start_ai_dma(&mut self, request: AiDmaRequest) -> Result<(), DeviceFault> {
-        if self.ai_control & 1 == 0 {
-            return Err(DeviceFault::AiDmaDisabled);
-        }
         if request.len == 0 {
             return Err(DeviceFault::ZeroLengthAiDma);
         }
@@ -1519,7 +1517,20 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         }
         self.ai_dram_addr = request.dram_addr;
         if self.current_ai.is_none() {
-            self.begin_ai_dma(request, self.now)?;
+            if self.ai_control & 1 != 0 {
+                self.begin_ai_dma(request, self.now)?;
+            } else {
+                // AI_LEN fills the FIFO even while CONTROL disables the DAC.
+                // The zero-duration marker owns the current FIFO slot without
+                // scheduling a completion; the 0->1 CONTROL transition below
+                // replaces it with a timed transfer at that exact guest cycle.
+                self.current_ai = Some(PendingAi {
+                    token: self.next_event_sequence,
+                    request,
+                    started_at: self.now,
+                    deadline: self.now,
+                });
+            }
         } else {
             self.queued_ai = Some(request);
         }
@@ -1975,7 +1986,8 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             }
             AI_CONTROL_REG => {
                 let requested = value & 1;
-                if requested != self.ai_control
+                if self.ai_control == 1
+                    && requested == 0
                     && (self.current_ai.is_some() || self.queued_ai.is_some())
                 {
                     return Err(DeviceFault::AiControlWhileBusy {
@@ -1984,6 +1996,15 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     });
                 }
                 self.ai_control = requested;
+                if requested == 1 {
+                    if let Some(dormant) = self
+                        .current_ai
+                        .filter(|pending| pending.deadline == pending.started_at)
+                    {
+                        self.current_ai = None;
+                        self.begin_ai_dma(dormant.request, self.now)?;
+                    }
+                }
                 return Ok(DeviceMmioWriteEffect::None);
             }
             AI_STATUS_REG => {
@@ -3028,7 +3049,7 @@ mod tests {
     }
 
     #[test]
-    fn ai_control_is_behavioral_and_unknown_busy_transitions_are_loud() {
+    fn ai_control_gates_drain_without_rejecting_fifo_writes() {
         let mut fabric = fabric();
         fabric.configure_tv_type(TvType::Ntsc).unwrap();
         let request = AiDmaRequest {
@@ -3037,21 +3058,39 @@ mod tests {
             sample_rate_hz: TvType::Ntsc.vi_clock_hz(),
         };
 
-        assert_eq!(
-            fabric.start_ai_dma(request),
-            Err(DeviceFault::AiDmaDisabled)
-        );
         fabric.write_mmio(AI_DRAM_ADDR_REG, 0x1000).unwrap();
-        let before_disabled_len = fabric.evidence_snapshot();
+        let ai_events_before = fabric
+            .evidence_snapshot()
+            .scheduled_events
+            .iter()
+            .filter(|event| event.kind == ScheduledDeviceEventKind::Ai)
+            .count();
         assert_eq!(
-            fabric.write_mmio(AI_LEN_REG, 0x80),
-            Err(DeviceFault::AiDmaDisabled)
+            fabric.write_mmio(AI_LEN_REG, 0x80).unwrap(),
+            DeviceMmioWriteEffect::AiDmaStarted(request)
         );
-        assert_eq!(fabric.evidence_snapshot(), before_disabled_len);
-        assert_eq!(fabric.ai_status(), 0);
+        assert_eq!(fabric.ai_status(), AI_STATUS_BUSY);
+        assert_eq!(fabric.ai_length(), 0x80);
+        assert_eq!(
+            fabric
+                .evidence_snapshot()
+                .scheduled_events
+                .iter()
+                .filter(|event| event.kind == ScheduledDeviceEventKind::Ai)
+                .count(),
+            ai_events_before
+        );
         fabric.write_mmio(AI_CONTROL_REG, 1).unwrap();
-        assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED);
-        fabric.start_ai_dma(request).unwrap();
+        assert_eq!(fabric.ai_status(), AI_STATUS_ENABLED | AI_STATUS_BUSY);
+        assert_eq!(
+            fabric
+                .evidence_snapshot()
+                .scheduled_events
+                .iter()
+                .filter(|event| event.kind == ScheduledDeviceEventKind::Ai)
+                .count(),
+            ai_events_before + 1
+        );
         assert_eq!(
             fabric.write_mmio(AI_CONTROL_REG, 0),
             Err(DeviceFault::AiControlWhileBusy {

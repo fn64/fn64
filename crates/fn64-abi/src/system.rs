@@ -56,6 +56,7 @@ pub unsafe extern "C" fn __osInitialize_common_recomp(_rdram: *mut u8, _ctx: *mu
 #[no_mangle]
 pub unsafe extern "C" fn osInitialize_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
     initialize_common();
+    crate::ai::initialize_ai_control();
 }
 
 // ---------------------------------------------------------------------
@@ -290,6 +291,11 @@ mod tests {
         replace.r4 = 0;
         unsafe { __osSetFpcCsr_recomp(std::ptr::null_mut(), &mut replace) };
         assert_eq!(replace.r2, FPCSR_FS as u64 | FPCSR_EV as u64);
+        assert_eq!(
+            with_host(|host| host.device_fabric.ai_control()),
+            1,
+            "osInitialize must establish the AI enable used by raw DRAM/LEN callers"
+        );
     }
 
     /// osGetTime returns a u64 OSTime split $v0:$v1 = HIGH:LOW word (this

@@ -7,6 +7,13 @@ const AI_MAX_BIT_RATE: u32 = 16;
 const AI_CONTROL_REG: u64 = 0xA450_0008;
 const AI_CONTROL_DMA_ON: u32 = 1;
 
+pub(crate) fn initialize_ai_control() {
+    assert!(
+        crate::pi::write_raw_mmio_word(AI_CONTROL_REG, AI_CONTROL_DMA_ON),
+        "osInitialize_recomp: authoritative AI_CONTROL register is unmapped"
+    );
+}
+
 /// `osAiSetFrequency(u32 frequency) -> s32` -- configures the audio DAC
 /// sample rate and returns the TRUE playback rate, or -1 if the frequency is
 /// unusable (`dacRate < AI_MIN_DAC_RATE`). The true DAC rate is stored as
@@ -137,9 +144,9 @@ pub fn ai_length_stats() -> (u64, u32) {
 /// returns -1 without mutating the latched DRAM address.
 ///
 /// The public `rcp.h` AI-control definition makes bit 0 the DMA enable. This
-/// shim performs that public enable transition through the same typed MMIO
-/// path as a raw guest write before it latches DRAM/LEN; fn64 does not invent
-/// an earlier hidden AI-control write during `osInitialize`. The FIFO-full
+/// shim repeats the public enable transition through the same typed MMIO path
+/// before it latches DRAM/LEN. `osInitialize` establishes the initial enable
+/// used by callers which submit through raw DRAM/LEN writes. The FIFO-full
 /// rejection remains side-effect free, including leaving CONTROL unchanged.
 ///
 /// This is also the one correct host-output boundary. A live OoT `M_AUDTASK`
@@ -372,6 +379,25 @@ mod tests {
         assert_eq!(submit.r2, 0);
         assert_eq!(managed.guest.ai_control, AI_CONTROL_DMA_ON);
         assert_eq!(managed, raw);
+    }
+
+    #[test]
+    fn os_initialize_enables_wm2000_style_raw_dram_len_submission() {
+        configure_ntsc();
+        unsafe {
+            crate::system::osInitialize_recomp(std::ptr::null_mut(), &mut ctx_zeroed());
+        }
+        let mut frequency = ctx_with(28_800, 0, 0);
+        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut frequency) };
+
+        assert!(crate::pi::write_raw_mmio_word(0xA450_0000, 0x2_000));
+        assert!(crate::pi::write_raw_mmio_word(0xA450_0004, 0x8a0));
+        assert_eq!(
+            crate::pi::live_ai_status()
+                & (fn64_runtime::AI_STATUS_ENABLED | fn64_runtime::AI_STATUS_BUSY),
+            fn64_runtime::AI_STATUS_ENABLED | fn64_runtime::AI_STATUS_BUSY
+        );
+        assert_eq!(crate::pi::live_ai_length(), 0x8a0);
     }
 
     #[test]
