@@ -121,14 +121,22 @@ fn main() {
         .warnings(false);
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("Cargo must provide OUT_DIR"));
-    let (cxx_sources, jump_snapshot_count, prototype_count) =
-        build_support::prepare_recompiled_cxx_sources(&recompiled_dir, &out_dir);
+    // A generic shell cannot carry a title-name opt-in, but it also cannot
+    // skip a corpus's proven answer-key-split epilogue. The shared preparer
+    // enables its section-local mend only when the generated instruction
+    // shapes prove that split; ordinary adjacent functions remain untouched.
+    let (cxx_sources, jump_snapshot_count, prototype_count, fallthrough_count) =
+        build_support::prepare_recompiled_cxx_sources_with_proven_fallthrough_repair(
+            &recompiled_dir,
+            &out_dir,
+        );
     let c_file_count = cxx_sources.len();
     build.files(cxx_sources);
     println!(
         "cargo:warning=fn64-shell: compiling {c_file_count} RecompiledFuncs/*.c files from {} \
-         ({jump_snapshot_count} C jump snapshots normalized and {prototype_count} missing C \
-         prototypes supplied for C++)",
+         ({jump_snapshot_count} C jump snapshots normalized, {prototype_count} missing C \
+         prototypes supplied for C++, and {fallthrough_count} structurally admitted \
+         fall-through fragments mended)",
         recompiled_dir.display()
     );
     build.compile("fn64_shell_recompiled");
