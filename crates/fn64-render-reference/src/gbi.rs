@@ -4273,8 +4273,9 @@ impl Tmem {
         context: impl FnOnce() -> String,
     ) -> u8 {
         let address = Self::physical_byte(logical, odd_row);
-        assert!(
-            self.valid[address] & mask == mask,
+        assert_eq!(
+            self.valid[address] & mask,
+            mask,
             "{} reads uninitialized TMEM bits at byte {address:#05x}",
             context()
         );
@@ -13737,35 +13738,90 @@ mod tests {
         );
     }
 
-    // On an uninitialized read the context IS evaluated and its text reaches
-    // the panic message, preserving the diagnostic verbatim.
-    #[test]
-    #[should_panic(expected = "diag-marker-42 reads uninitialized TMEM bits at byte")]
-    fn read_byte_context_closure_is_evaluated_and_retained_on_uninit_read() {
-        let storage = Tmem::default(); // nothing written -> all bits invalid
-        let _ = storage.read_byte(0, false, 0xff, || "diag-marker-42".to_string());
+    fn panic_text(f: impl FnOnce()) -> String {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .expect_err("operation did not panic");
+        match payload.downcast::<String>() {
+            Ok(text) => *text,
+            Err(payload) => match payload.downcast::<&'static str>() {
+                Ok(text) => (*text).to_owned(),
+                Err(_) => panic!("panic payload was not text"),
+            },
+        }
     }
 
-    // read_texel's own lazy context still names the tile/texel on an
-    // uninitialized read, exactly as the eager version did.
     #[test]
-    #[should_panic(expected = "tile at TMEM word 0 texel (3, 0) reads uninitialized TMEM bits")]
-    fn read_texel_uninit_read_retains_tile_and_texel_diagnostic() {
+    fn lazy_context_preserves_exact_uninitialized_read_diagnostics() {
         let storage = Tmem::default();
+        assert_eq!(
+            panic_text(|| {
+                let _ = storage.read_byte(0, false, 0xff, || "diag-marker-42".to_owned());
+            }),
+            "assertion `left == right` failed: diag-marker-42 reads uninitialized TMEM bits at byte 0x000\n  left: 0\n right: 255"
+        );
+
         let tile = Tile {
             fmt: G_IM_FMT_RGBA,
             siz: G_IM_SIZ_16B,
             line: 1,
             ..Default::default()
         };
-        let _ = storage.read_texel(tile, 3, 0, G_IM_SIZ_16B);
+        assert_eq!(
+            panic_text(|| {
+                let _ = storage.read_texel(tile, 3, 0, G_IM_SIZ_16B);
+            }),
+            "assertion `left == right` failed: tile at TMEM word 0 texel (3, 0) reads uninitialized TMEM bits at byte 0x006\n  left: 0\n right: 255"
+        );
+        assert_eq!(
+            panic_text(|| {
+                let _ = storage.read_tlut(7, 2);
+            }),
+            "assertion `left == right` failed: TLUT index 7 reads uninitialized TMEM bits at byte 0x838\n  left: 0\n right: 255"
+        );
+
+        let yuv = TmemTexture {
+            storage: std::rc::Rc::new(Tmem::default()),
+            tile: Tile {
+                fmt: G_IM_FMT_YUV,
+                siz: G_IM_SIZ_16B,
+                line: 1,
+                tmem: 3,
+                ..Default::default()
+            },
+            texture_lut: 0,
+        };
+        assert_eq!(
+            panic_text(|| {
+                let _ = yuv.sample(2, 4);
+            }),
+            "assertion `left == right` failed: YUV tile at TMEM word 3 texel (2, 4) reads uninitialized TMEM bits at byte 0x03a\n  left: 0\n right: 255"
+        );
     }
 
-    // Output equivalence: the lazy-context change must not alter any sampled
-    // texel value across the four image sizes (a value-level digest of the
-    // read path, the render-relevant behavior).
     #[test]
     fn lazy_context_preserves_all_read_texel_values() {
+        let mut storage = Tmem::default();
+        let i4 = Tile {
+            fmt: G_IM_FMT_I,
+            siz: G_IM_SIZ_4B,
+            line: 1,
+            ..Default::default()
+        };
+        storage.write_texel(i4, 0, 0, false, G_IM_SIZ_4B, 0x0a);
+        storage.write_texel(i4, 1, 0, false, G_IM_SIZ_4B, 0x05);
+        assert_eq!(storage.read_texel(i4, 0, 0, G_IM_SIZ_4B), 0x0a);
+        assert_eq!(storage.read_texel(i4, 1, 0, G_IM_SIZ_4B), 0x05);
+
+        let mut storage = Tmem::default();
+        let i8 = Tile {
+            fmt: G_IM_FMT_I,
+            siz: G_IM_SIZ_8B,
+            line: 1,
+            ..Default::default()
+        };
+        storage.write_texel(i8, 0, 0, false, G_IM_SIZ_8B, 0xab);
+        assert_eq!(storage.read_texel(i8, 0, 0, G_IM_SIZ_8B), 0xab);
+
         let mut storage = Tmem::default();
         let rgba16 = Tile {
             fmt: G_IM_FMT_RGBA,
