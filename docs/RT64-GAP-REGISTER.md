@@ -120,7 +120,12 @@ accepts bounded raw DPC state/fill/texture ranges from both the shim and MMIO
 entry paths. The RT64 C ABI exposes the matching bounded LLE entry through its
 public `Application::processDisplayLists(..., false)` path, including
 render-to-RAM workload synchronization; task-entry GBI HLE remains gated by an
-explicit exact IMEM digest. Raw Load/Pipe/Tile/Full Sync accepts its unassigned
+explicit exact IMEM digest. fn64's current captured-XBUS/LLE adapter stages
+commands in an RDP-addressable synthetic RDRAM suffix; prefix-only copyback
+does not isolate that suffix from command memory references. Exact RT64 LLE
+captured-DPC release authority remains blocked on a native separate-command-
+buffer entry point with an explicit physical-memory access bound. Raw
+Load/Pipe/Tile/Full Sync accepts its unassigned
 second word per SGI *RDP Command Summary*, while atomic F3DEX2 macro decode
 keeps the stricter reserved-payload check. All eight raw RDP triangle record layouts (`0x08..0x0f`) now have
 bounded widths and typed signed edge/shade/texture/Z coefficient ingestion
@@ -395,7 +400,7 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
   creation and ordinary VI events, then observe exact completed-workload rate
   sequences `[0,0,0,50]` and `[0,0,0,60]` without an Extended override. The
   overlay does not alter the later Extended-GBI refresh-rate override. A
-  schema-v25 full-ROM path now co-binds normalized destination-code TV region,
+  schema-v27 full-ROM path now co-binds normalized destination-code TV region,
   committed device TV state, and renderer create-time configuration. No
   representative private exact-ten PAL/MPAL series has yet been retained;
   physical compositor cadence, field timing, and analog PAL output remain

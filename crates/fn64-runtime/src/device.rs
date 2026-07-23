@@ -1865,6 +1865,26 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         }
     }
 
+    /// Validate a complete synchronous RSP register image without mutation.
+    ///
+    /// A higher-layer transactional adapter may need to perform a fallible
+    /// renderer operation before publishing this state. It must retain
+    /// exclusive ownership of the fabric from this preflight through
+    /// [`Self::commit_complete_rsp_execution_state`]; otherwise a new DPC
+    /// owner could invalidate the successful preflight.
+    pub fn preflight_complete_rsp_execution_state(
+        &self,
+        state: &RspExecutionState,
+    ) -> Result<(), DeviceFault> {
+        if state.pc & !0x0ffc != 0 {
+            return Err(DeviceFault::InvalidRspExecutionPc { pc: state.pc });
+        }
+        if self.pending_dpc.is_some() {
+            return Err(DeviceFault::DpBusy);
+        }
+        Ok(())
+    }
+
     /// Atomically commit registers produced by speculative RSP execution.
     ///
     /// A pending DPC renderer transaction owns its rollback register image, so
@@ -1875,12 +1895,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         &mut self,
         state: RspExecutionState,
     ) -> Result<(), DeviceFault> {
-        if state.pc & !0x0ffc != 0 {
-            return Err(DeviceFault::InvalidRspExecutionPc { pc: state.pc });
-        }
-        if self.pending_dpc.is_some() {
-            return Err(DeviceFault::DpBusy);
-        }
+        self.preflight_complete_rsp_execution_state(&state)?;
 
         self.sp_pc = state.pc;
         self.sp_status = state.sp_status & !(SP_STATUS_DMA_BUSY | SP_STATUS_DMA_FULL);
@@ -2870,6 +2885,33 @@ mod tests {
             assert_eq!(fabric.rsp_execution_state(), before);
             assert_eq!(fabric.snapshot(), before_snapshot);
         }
+    }
+
+    #[test]
+    fn complete_rsp_state_preflight_is_non_mutating() {
+        let mut fabric = fabric();
+        let before = fabric.snapshot();
+        let before_execution = fabric.rsp_execution_state();
+
+        fabric
+            .preflight_complete_rsp_execution_state(&complete_rsp_state())
+            .unwrap();
+
+        assert_eq!(fabric.snapshot(), before);
+        assert_eq!(fabric.rsp_execution_state(), before_execution);
+
+        let pending = fabric
+            .request_dpc_submission(DpcSubmissionSource::Rdram, 0x100, 0x180)
+            .unwrap();
+        let pending_snapshot = fabric.snapshot();
+        let pending_execution = fabric.rsp_execution_state();
+        assert_eq!(
+            fabric.preflight_complete_rsp_execution_state(&complete_rsp_state()),
+            Err(DeviceFault::DpBusy)
+        );
+        assert_eq!(fabric.snapshot(), pending_snapshot);
+        assert_eq!(fabric.rsp_execution_state(), pending_execution);
+        assert_eq!(fabric.pending_dpc_submission(), Some(pending));
     }
 
     #[test]

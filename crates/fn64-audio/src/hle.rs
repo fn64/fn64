@@ -391,7 +391,7 @@ mod tests {
             admission
                 .decode_standard_abi(AbiCommand::new(0x0200_0240, 0x0000_0060))
                 .unwrap()
-                .opcode as u8,
+                .opcode() as u8,
             0x02
         );
     }

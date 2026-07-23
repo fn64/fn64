@@ -153,7 +153,7 @@
       "subsystem": "audio",
       "disposition": "returned_error",
       "path": "crates/fn64-audio/src/lib.rs",
-      "trigger": "refused to fabricate output"
+      "trigger": "instead of fabricating output"
     },
     {
       "operation": "recompiler.cpu.unsupported-instruction",
@@ -182,6 +182,20 @@
       "disposition": "loud_trap",
       "path": "crates/fn64-abi/src/task_dispatch.rs",
       "trigger": "backend rejected unlisted microcode at RDRAM offset"
+    },
+    {
+      "operation": "render.raw-dpc-batch.non-certifying",
+      "subsystem": "render",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-abi/src/task_dispatch.rs",
+      "trigger": "the staged-RDRAM renderer seam is diagnostic-only"
+    },
+    {
+      "operation": "recompiler.verified-audio.executable-write",
+      "subsystem": "recompiler",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-abi/src/task_dispatch.rs",
+      "trigger": "verified audio publication rejected"
     },
     {
       "operation": "render.hle-ucode.needs-lle",

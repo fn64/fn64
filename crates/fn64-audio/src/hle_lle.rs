@@ -25,7 +25,7 @@ use crate::hle_outcome::{
     RspDpcRegisterState, RspVisibleState, RspVisibleStateError,
 };
 use crate::hle_snapshot::AudioLleLaneParts;
-use crate::rsp::runtime::{RspDpSubmission, RspMachine, RspMachineState};
+use crate::rsp::runtime::{RspDmaJournalEntry, RspDpSubmission, RspMachine, RspMachineState};
 use crate::rsp::{run_imem, RspExitReason, DMEM_SIZE};
 
 const INTERPRETER_CHUNK_STEPS: u64 = 1 << 20;
@@ -101,6 +101,7 @@ pub struct SpeculativeAudioLleResult {
     effects: SpeculativeAudioLleEffects,
     rspboot_steps: NonZeroU64,
     ucode_steps: NonZeroU64,
+    dma_journal: Vec<RspDmaJournalEntry>,
 }
 
 /// Fully owned guest-visible mutations from a completed speculative lane.
@@ -174,6 +175,12 @@ impl SpeculativeAudioLleResult {
 
     pub const fn ucode_steps(&self) -> NonZeroU64 {
         self.ucode_steps
+    }
+
+    /// Diagnostic observations only; consuming effects discards this lane's
+    /// journal before anything can become commit authority.
+    pub fn dma_journal(&self) -> &[RspDmaJournalEntry] {
+        &self.dma_journal
     }
 
     pub fn into_rdram_storage(self) -> Vec<u8> {
@@ -371,6 +378,7 @@ fn run_speculative_audio_lle_with_limits(
         .collect::<Result<Vec<_>, _>>()?;
     let machine_state = machine.snapshot_state();
     let storage_write_ranges = machine.take_rdram_writes();
+    let dma_journal = machine.take_dma_journal();
     drop(machine);
 
     persistent_memory
@@ -394,6 +402,7 @@ fn run_speculative_audio_lle_with_limits(
         },
         rspboot_steps,
         ucode_steps,
+        dma_journal,
     })
 }
 

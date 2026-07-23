@@ -378,7 +378,7 @@ mod tests {
             transaction
                 .read_bytes(RdramAddr::from_offset(u32::MAX), 0)
                 .unwrap(),
-            []
+            Vec::<u8>::new()
         );
         transaction
             .write_bytes(RdramAddr::from_offset(u32::MAX), &[])

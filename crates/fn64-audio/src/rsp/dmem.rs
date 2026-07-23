@@ -33,6 +33,9 @@ pub const DMEM_MASK: u32 = 0x0FFF;
 fn trace_write(kind: &str, address: u32, width: usize, value: u32) {
     use std::sync::OnceLock;
 
+    if crate::rsp::recomp::content_safe_diagnostics() {
+        return;
+    }
     static WATCH: OnceLock<Option<std::ops::Range<usize>>> = OnceLock::new();
     let Some(watch) = WATCH
         .get_or_init(|| {

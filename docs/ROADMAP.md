@@ -143,7 +143,7 @@ and scope limits that make an open item meaningful.
   into RT64 so PAL stable-factor workloads derive from 50 Hz rather than the
   pinned upstream 60 Hz constant. Ten fresh live Metal processes prove the
   production-context PAL/MPAL workload sequences `[0,0,0,50]` and
-  `[0,0,0,60]` without an Extended refresh override. Report schema v25 now
+  `[0,0,0,60]` without an Extended refresh override. Report schema v27 now
   co-binds normalized ROM TV region, committed device TV state, and renderer
   create-time TV configuration; representative private PAL/MPAL exact-ten
   evidence remains to be retained. cpal
@@ -731,7 +731,7 @@ and deterministic output traces.
   evidence binds the physical spans/words and each mapped entry's exact
   `BankId`/PA sequence, preflight-expected words, and generated artifact
   identity. Artifact-identified mapped AOT destination observations carry that
-  real artifact and are schema-v25 fixed-cycle eligible; compatibility AOT
+  real artifact and are schema-v27 fixed-cycle eligible; compatibility AOT
   without one and mapped-interpreter observations are not. The latter remain
   operational/differential-only until a successor typed destination schema
   exists. Multiple matches remain loud. Data-side Status.KSU plus UX/SX/KX now

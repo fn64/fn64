@@ -8,10 +8,14 @@ opcode or task shape.
 ## Current boundary
 
 `AudioTaskExecutionPolicy::LleAccuracy` runs rspboot and the live audio image,
-commits the resulting RDRAM/DMEM/IMEM/SP state, and reports measured RSP work to
-the device fabric. `osAiSetNextBuffer` later identifies the PCM range consumed
-by AI. An HLE task therefore cannot be modeled as an immutable RDRAM input that
-returns a `Vec<i16>`: its result is a transactional set of machine effects.
+commits the resulting RDRAM/DMEM/IMEM/SP state, persists the complete scalar
+GPR and VU/accumulator/flag/divider image for the next task, and reports
+measured RSP work to the device fabric. CPU/MMIO-owned semaphore, DMA, and DPC
+latches are overlaid from the live fabric at each new interpreter entry rather
+than restored from a stale duplicate. `osAiSetNextBuffer` later identifies the
+PCM range consumed by AI. An HLE task therefore cannot be modeled as an
+immutable RDRAM input that returns a `Vec<i16>`: its result is a transactional
+set of machine effects.
 
 The HLE foundation has seven independent pieces:
 
@@ -42,6 +46,12 @@ The HLE foundation has seven independent pieces:
   non-cloneable commit authority. The ABI adapter can publish the empty-DPC
   ucode phase once; boot-phase patches are deliberately not part of that
   authority yet.
+
+`AUDIO-ABI-CHARACTERIZATION.md` documents a separate private-input black-box
+harness. It constructs hand-authored tasks, packets, and sentinels around the
+same owned rspboot/LLE kernels and emits content-free canonical evidence. Its
+ordered SP DMA journal is diagnostic-only: it is excluded from architectural
+snapshots, outcome comparison, and commit authority.
 
 The standard ABI decoder is a separate layer. Possessing a valid standard
 packet does not prove that the loaded microcode implements that packet family.
@@ -109,13 +119,33 @@ pre-boot RSP state, initially grant exactly physical `0..8 MiB` DMA authority,
 and trap if the task actually requires a static alias. Direct-IMEM tasks remain
 a loud differential frontier.
 
-The current live adapter accepts only a verified ucode-phase authority with no
-deferred DPC submissions. A nonempty submission set traps before its first live
-mutation because the renderer seam cannot atomically preflight or roll back a
-batch. The adapter also cannot yet persist scalar GPR, VU/accumulator/flag,
-divider, or jump/resume state across task invocations: the device fabric owns
-the exact RSP memories and SP/DPC latches but has no owner for those interpreter
-registers. Both are explicit parity frontiers, not omitted effects.
+The verified ucode-phase adapter does not publish deferred DPC work. The
+available staged-RDRAM batch loses per-CMD_END memory/device timing, interrupt
+and FullSync order, and exposes its synthetic suffix to RDP addressing; it is
+therefore render-only diagnostics. Reference reports `DiagnosticOnly`, RT64
+reports `Unsupported`, and any deferred DPC submission traps before renderer,
+device, or RDRAM mutation. DPC publication remains blocked on a native
+separate-command-buffer seam plus temporal device observations.
+
+For DPC-free phases, the adapter requires typed ownership of the matching
+`InFlight` task address, process-monotonic load generation, and `Running`
+lineage, then rechecks all three atomically at publication. Planned writes overlapping a
+live executable region reject before mutation because native generation
+installation is fallible and no transaction spans it with RDRAM/device state;
+ordinary non-executable audio-data writes may publish through the existing
+post-commit notification seam.
+
+This adapter is still not selected by live audio-task policy. Its authority
+begins after rspboot, so it cannot claim whole-task atomicity or publish
+rspboot's earlier effects. `LleAccuracy` replaces the cross-task owner with the
+exact terminal image after draining DPC submissions. Optimized boot-overlay HLE
+exposes no post-ucode scalar/VU image, so successful completion is explicitly
+labeled `HleCompatibility` and carries the rspboot-entry image with the
+consumed overlay continuation cleared. A renderer failure leaves the owner
+`InFlight`; the next task traps instead of fabricating a reset. Direct-IMEM HLE
+is labeled `HleCompatibilityUnavailable` and likewise cannot silently reuse a
+prior exact snapshot. These HLE labels are bounded residuals, not release
+accuracy claims.
 
 ## Work sequence
 

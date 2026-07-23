@@ -78,7 +78,11 @@ Everything RT64-specific (D3D12/Vulkan/Metal and native HLE execution) lives
 behind that. Backend-neutral content-addressed microcode catalogs, immutable
 ordered task/self-load plans, and raw-DPC FullSync inspection live in
 `fn64-render`, so native and reference backends cannot drift on those handoff
-invariants. `fn64-rt64` (→
+invariants. The same crate owns a source-preserving diagnostic raw-DPC
+transport. It concatenates only same-source contiguous ranges; that grouping
+is a conservative transport heuristic, not a reconstruction of silicon
+START/END state. Its synthetic RDRAM suffix is RDP-visible and replay sees the
+final memory image rather than per-CMD_END temporal state. `fn64-rt64` (→
 `fn64-render-rt64`) already exists as the intended quarantine crate.
 
 ### The shared seam (crate: `fn64-render`)
@@ -96,6 +100,13 @@ pub trait RenderBackend {
         task: &OsTask,
         output_addr: u32,
     ) -> Result<FrameStatus, RenderError>;
+    fn raw_dpc_batch_capability(&self) -> RawDpcBatchCapability;
+    fn process_raw_dpc_batch(
+        &mut self,
+        rdram: &mut [u8],
+        batch: PreflightedRawDpcBatch,
+        output_addr: u32,
+    ) -> Result<RawDpcBatchOutcome, RenderError>;
     fn present(&mut self, request: PresentRequest<'_>) -> Result<(), RenderError>;
     fn resize(&mut self, w: u32, h: u32);
     /// Which microcode GBIs this backend actually implements — a task using an
