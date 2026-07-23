@@ -125,6 +125,17 @@ pub enum DrainDecision {
     AdvanceField,
 }
 
+/// Result of advancing an idle headless host to the next authoritative device
+/// deadline. A quiescent host may have to service several earlier DMA/RCP
+/// completions before the exact VI edge becomes the next event; callers must
+/// not infer a committed field from the control-flow branch that selected the
+/// deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceAdvance {
+    DeviceEvent { through_cycle: u64 },
+    ViFields { retrace_ticks: std::num::NonZeroU32 },
+}
+
 /// Diagnostics-only search for a scheduler quiescence boundary at or after a
 /// requested guest-cycle floor. This does not own a release gate or report
 /// path; callers must use the returned cycle in a separate release run.
@@ -1173,6 +1184,72 @@ impl GuestDrain {
     pub fn begin_field(&mut self) {
         self.ran_idle_thread = false;
     }
+
+    /// Advance a quiescent guest to its next exact device event.
+    ///
+    /// The device fabric owns the VI schedule. In particular, translated
+    /// instruction checkpoints can move the shared clock past a host-owned
+    /// interval accumulator, and another device deadline can coincide with or
+    /// precede the VI edge. Snapshotting [`fn64_abi::next_vi_deadline`] before
+    /// the advance makes the returned `ViFields` an observation of that armed
+    /// edge rather than a prediction from elapsed time.
+    pub fn advance_to_next_device_event(&mut self) -> DeviceAdvance {
+        assert_eq!(
+            self.before_step(fn64_abi::next_runnable_priority()),
+            DrainDecision::AdvanceField,
+            "GuestDrain::advance_to_next_device_event requires a quiescent guest"
+        );
+        let current = fn64_abi::sim_time();
+        let next_vi = fn64_abi::next_vi_deadline()
+            .expect("GuestDrain::advance_to_next_device_event requires an armed VI field");
+        let target = fn64_abi::next_device_deadline()
+            .expect("GuestDrain::advance_to_next_device_event: armed VI has no device deadline");
+        assert!(
+            target <= next_vi,
+            "GuestDrain::advance_to_next_device_event: earliest device deadline {target} skips armed VI edge {next_vi}"
+        );
+
+        // Instruction checkpoints advance executor time before this idle
+        // pump. If the fabric's earliest event is consequently overdue,
+        // commit every event through the already-observed executor cycle;
+        // asking the shared clock to move back to the raw deadline would be
+        // invalid, while advancing only one nominal field would leave older
+        // hardware work uncommitted.
+        let through_cycle = target.max(current);
+        let advance = fn64_abi::advance_virtual_time(through_cycle);
+        match advance.vi_retrace_ticks() {
+            0 => {
+                assert!(
+                    through_cycle < next_vi,
+                    "GuestDrain::advance_to_next_device_event: armed VI edge {next_vi} committed without a reported retrace"
+                );
+                assert_eq!(
+                    fn64_abi::next_vi_deadline(),
+                    Some(next_vi),
+                    "GuestDrain::advance_to_next_device_event: non-VI event rescheduled the armed VI edge"
+                );
+                DeviceAdvance::DeviceEvent { through_cycle }
+            }
+            ticks => {
+                assert!(
+                    next_vi <= through_cycle,
+                    "GuestDrain::advance_to_next_device_event: {ticks} VI retrace(s) reported before armed edge {next_vi} at catch-up cycle {through_cycle}"
+                );
+                let following_vi = fn64_abi::next_vi_deadline().expect(
+                    "GuestDrain::advance_to_next_device_event: committed VI edge was not rescheduled",
+                );
+                assert!(
+                    following_vi > through_cycle,
+                    "GuestDrain::advance_to_next_device_event: committed VI schedule {following_vi} did not advance beyond catch-up cycle {through_cycle}"
+                );
+                self.begin_field();
+                DeviceAdvance::ViFields {
+                    retrace_ticks: std::num::NonZeroU32::new(ticks)
+                        .expect("positive VI retrace branch"),
+                }
+            }
+        }
+    }
 }
 
 const OS_TV_TYPE: fn64_runtime::RdramAddr = fn64_runtime::RdramAddr::from_offset(0x300);
@@ -1556,6 +1633,49 @@ mod tests {
         drain.begin_field();
         assert_eq!(drain.before_step(Some(0)), DrainDecision::Step);
         assert_eq!(drain.before_step(None), DrainDecision::AdvanceField);
+    }
+
+    #[test]
+    fn guest_drain_observes_the_authoritative_vi_deadline() {
+        fn64_abi::load_rom(Vec::new());
+        fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+        install_boundary_render_backend();
+        let scheduled = fn64_abi::next_vi_deadline().expect("VI configured");
+        let mut drain = GuestDrain::default();
+
+        assert_eq!(
+            drain.advance_to_next_device_event(),
+            DeviceAdvance::ViFields {
+                retrace_ticks: std::num::NonZeroU32::new(1).unwrap(),
+            }
+        );
+        assert!(fn64_abi::next_vi_deadline().is_some_and(|next| next > scheduled));
+    }
+
+    #[test]
+    fn guest_drain_catches_up_every_overdue_vi_deadline() {
+        fn64_abi::load_rom(Vec::new());
+        fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
+        install_boundary_render_backend();
+        let first = fn64_abi::next_vi_deadline().expect("VI configured");
+        let interval = fn64_abi::vi_field_interval().expect("VI interval configured");
+        let current = first + interval * 2 + 1;
+        let mut context = fn64_abi::RecompContext::zeroed();
+        context.r4 = current >> 32;
+        context.r5 = current & u64::from(u32::MAX);
+        // SAFETY: osSetTime reads only the integer argument pair and ignores
+        // RDRAM. Moving executor time ahead of the fabric reproduces the
+        // translated-checkpoint catch-up shape this host helper must accept.
+        unsafe { fn64_abi::osSetTime_recomp(std::ptr::null_mut(), &mut context) };
+
+        let mut drain = GuestDrain::default();
+        assert_eq!(
+            drain.advance_to_next_device_event(),
+            DeviceAdvance::ViFields {
+                retrace_ticks: std::num::NonZeroU32::new(3).unwrap(),
+            }
+        );
+        assert!(fn64_abi::next_vi_deadline().is_some_and(|next| next > current));
     }
 
     #[test]

@@ -460,7 +460,6 @@ fn main() {
     }
     let mut last_applied_input: (u16, i8, i8) = (0, 0, 0);
 
-    let mut tick = 0u64;
     let mut steps = 0u64;
     let mut drain = fn64_boot_harness::GuestDrain::default();
     loop {
@@ -493,43 +492,17 @@ fn main() {
             drain.before_step(next_priority) == fn64_boot_harness::DrainDecision::AdvanceField;
         let mut committed_vi_field = false;
         if advanced_field {
-            // Anchor the field cursor to virtual time that has ACTUALLY
-            // elapsed. WM2000's corpus (unlike oot-boot) emits translated
-            // `InstructionCheckpoint` yields that charge real virtual time
-            // per guest step, so `sim_time` races ahead of a free-running
-            // `tick` cursor between field boundaries. Basing the next field
-            // on a stale `tick` alone would compute a `next_field` BELOW
-            // `sim_time`, and `advance_virtual_time(next_field)` then asserts
-            // "device time moved backwards" (pi.rs). Re-anchor to the current
-            // clock every field so the VI cadence tracks elapsed virtual time
-            // and never regresses.
-            let sim_now = fn64_abi::sim_time();
-            tick = tick.max(sim_now);
-            let next_field = tick
-                + fn64_abi::vi_field_interval()
-                    .expect("typed television standard must keep VI armed");
-            // Device completions land between fields: a DMA issued mid-slice
-            // arms its deadline just past sim_time. Jumping a whole field
-            // would deliver EVERY completion a field late and break real
-            // issue-then-poll-next-frame guest pipelines (BOOT-NOTES-WM2000.md
-            // part 7: NWXE's joybus). Service any deadline due before the next
-            // field boundary first.
-            let device_deadline =
-                fn64_abi::next_device_deadline().filter(|deadline| *deadline < next_field);
-            match device_deadline {
-                Some(deadline) => {
-                    // Service the earlier hardware event, but do NOT reset
-                    // the field target: a chattering device (e.g. degenerate
-                    // audio refeed) must never starve the VI tick.
-                    fn64_abi::advance_virtual_time(deadline.max(sim_now));
-                }
-                None => {
-                    tick = next_field;
-                    fn64_abi::advance_virtual_time(tick);
-                    drain.begin_field();
-                    committed_vi_field = true;
-                }
-            }
+            // Device completions land between fields. Advance to the fabric's
+            // exact earliest event and let GuestDrain distinguish an actual
+            // committed VI edge from an earlier DMA/RCP completion. WM2000's
+            // translated instruction checkpoints move virtual time between
+            // host pumps, so reconstructing VI from a separate interval
+            // accumulator can miss a retrace that arrived through the generic
+            // device-deadline branch.
+            committed_vi_field = matches!(
+                drain.advance_to_next_device_event(),
+                fn64_boot_harness::DeviceAdvance::ViFields { .. }
+            );
         } else {
             let stepped = fn64_abi::run_one_step();
             assert!(
