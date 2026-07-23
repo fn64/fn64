@@ -370,7 +370,14 @@ fn render_task(header: &OsTaskHeader) -> fn64_render::OsTask {
         dram_stack_size: header.dram_stack_size,
         output_buff: header.output_buff,
         output_buff_size: header.output_buff_size,
-        data_ptr: header.data_ptr,
+        // The display-list pointer arrives as a guest KSEG0/KSEG1 virtual
+        // address (WM2000's is 0x8038ce30); the renderer backend indexes
+        // physical RDRAM and rt64 ingress rejects any non-physical offset.
+        // Strip the segment bits with the standard KSEG0/1 -> physical map;
+        // ingress then range-checks the 8 MiB window. Already-physical offsets
+        // (e.g. OoT's) pass through unchanged. Only `data_ptr` is masked here
+        // because it is the only address rt64 ingress validates.
+        data_ptr: header.data_ptr & 0x1fff_ffff,
         data_size: header.data_size,
     }
 }
@@ -3194,6 +3201,26 @@ mod tests {
         fn supported_ucodes(&self) -> &[UcodeId] {
             &[]
         }
+    }
+
+    #[test]
+    fn render_task_maps_kseg0_display_list_pointer_to_a_physical_offset() {
+        // Regression: WM2000 submits its display list at a KSEG0 virtual
+        // address (0x8038ce30). Before masking, this reached rt64 ingress raw
+        // and tripped "display-list address 0x8038ce30 is not a physical RDRAM
+        // offset", panicking the shell on its first gfx task.
+        let header = OsTaskHeader {
+            task_type: fn64_runtime::M_GFXTASK,
+            data_ptr: 0x8038_ce30,
+            ..Default::default()
+        };
+        assert_eq!(render_task(&header).data_ptr, 0x0038_ce30);
+        // An already-physical pointer passes through unchanged.
+        let physical = OsTaskHeader {
+            data_ptr: 0x0038_ce30,
+            ..Default::default()
+        };
+        assert_eq!(render_task(&physical).data_ptr, 0x0038_ce30);
     }
 
     #[test]
