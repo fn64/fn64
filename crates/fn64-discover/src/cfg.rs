@@ -584,7 +584,7 @@ pub fn build_cfg_fenced(
                         .filter(|targets| !targets.is_empty())
                     {
                         for &target in targets {
-                            if in_range(target) {
+                            if in_range(target) && !is_delay_slot_va(bank_bytes, va_start, target) {
                                 worklist.push_back(target);
                             }
                         }
@@ -619,7 +619,7 @@ pub fn build_cfg_fenced(
                         .filter(|targets| !targets.is_empty())
                     {
                         for &target in targets {
-                            if in_range(target) {
+                            if in_range(target) && !is_delay_slot_va(bank_bytes, va_start, target) {
                                 worklist.push_back(target);
                                 if via_call && proven_roots_seen.insert(target) {
                                     proven_roots.push(target);
@@ -723,6 +723,22 @@ pub fn build_cfg_fenced(
         indirect_sites,
         proven_roots,
     }
+}
+
+/// A VA is a *delay slot* iff the word immediately before it is a control
+/// instruction that carries one. A control transfer and its delay slot are one
+/// architecturally inseparable unit — hardware cannot branch INTO a delay slot
+/// — so any discovered "target"/leader landing on a delay-slot VA is a CFG
+/// over-approximation (e.g. a computed-jump target set that swept up a
+/// delay-slot address). Admitting it as a block start severs the branch from
+/// its delay slot into two blocks, which the sparse runner emitter (correctly)
+/// rejects — the `boot:0x800f8e90` whole-ROM-recompile blocker. Callers filter
+/// such targets at enqueue time so the pair always stays in one block.
+fn is_delay_slot_va(bank_bytes: &[u8], va_start: u32, va: u32) -> bool {
+    va.checked_sub(4)
+        .and_then(|prev_va| prev_va.checked_sub(va_start))
+        .and_then(|off| read_word(bank_bytes, off as usize))
+        .is_some_and(|word| decode(word).has_delay_slot())
 }
 
 /// Recursive descent can discover a branch target after an earlier scan has
@@ -1020,6 +1036,48 @@ mod tests {
             prefix.terminator,
             BlockTerminator::Fallthrough { next: 0x8000_0010 }
         ));
+    }
+
+    #[test]
+    fn indirect_target_on_a_delay_slot_does_not_sever_the_branch_delay_pair() {
+        // Regression for the boot:0x800f8e90 whole-ROM-recompile blocker. A
+        // computed-jump (jr) resolver over-approximated its target set to
+        // include a delay-slot VA. Admitting that as a block start severs the
+        // branch from its delay slot into two blocks, which the sparse runner
+        // emitter (correctly) rejects. A real target can never be a delay slot
+        // (hardware can't branch into one), so the resolver's delay-slot target
+        // is filtered at enqueue and the pair stays in one block.
+        //
+        // Layout: 0x08 is a branch whose delay slot is 0x0C. A jr at 0x14 has an
+        // exhaustive-indirect target set that (over-approximately) includes 0x0C.
+        let beq_fwd = 0x1000_0001u32; // beq $0,$0,+1
+        let jr_t9 = 0x0320_0008u32; // jr $t9 (computed jump, not $ra)
+        let bytes = asm(&[
+            beq_fwd, // 0x00 beq -> 0x08
+            NOP,     // 0x04 (ds of 0x00)
+            beq_fwd, // 0x08 beq -> 0x10  (its delay slot is 0x0C)
+            NOP,     // 0x0C (ds of 0x08) -- the contested VA an indirect set names
+            NOP,     // 0x10
+            jr_t9,   // 0x14 computed jump
+            NOP,     // 0x18 (ds of 0x14)
+            NOP,     // 0x1C
+        ]);
+        // The jr at 0x14 resolves (over-approximately) to {0x10, 0x0C}. 0x0C is
+        // the delay slot of the branch at 0x08 and must NOT become a block start.
+        let indirect =
+            BTreeMap::from([(0x8000_0014u32, vec![0x8000_0010u32, 0x8000_000Cu32])]);
+        let cfg = build_cfg_with_indirect("boot", &bytes, 0x8000_0000, &[0x8000_0000], &indirect);
+        assert!(
+            cfg.blocks.iter().all(|b| b.start_va != 0x8000_000C),
+            "an indirect target landing on a delay slot (0x0C) was admitted as a block start, \
+             severing the branch/delay pair at 0x08"
+        );
+        for block in &cfg.blocks {
+            assert_ne!(
+                block.end_va, 0x8000_000C,
+                "canonicalization severed a branch/delay pair at the delay-slot VA 0x0C"
+            );
+        }
     }
 
     #[test]
