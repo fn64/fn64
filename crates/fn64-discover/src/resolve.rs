@@ -1548,9 +1548,27 @@ fn reject_unusable_targets(resolutions: &mut [IndirectResolution], va_start: u32
         if resolution.state != IndirectProofState::Exhaustive {
             continue;
         }
+        // ponytail: a jump table is a contiguous in-bank array of code
+        // pointers; every real slot lands in this bank. The `via_call`
+        // exemption below exists for a genuine cross-bank library CALL, whose
+        // target is a *single* address materialized by `lui`/`addiu`
+        // (`Constant`) into a mapped sibling bank -- NOT a table read. When a
+        // `sltiu`-bounded switch's bound is wider than the table's populated
+        // extent, the read walks PAST the real table into zeroed/garbage pages;
+        // those stray words decode as word-aligned "targets" that are outside
+        // every mapping (WM2000/NWXE: 20 such destinations, all
+        // `OutsideAllMappings`). The resolver only knows *this* bank's range, so
+        // it cannot tell "another mapped bank" from "unmapped over-walk garbage"
+        // -- but a JumpTable slot is never a legitimate cross-bank call, so the
+        // exemption must not apply to it. Require every JumpTable slot in-bank
+        // regardless of `via_call`. Dropping the resolution to `Bounded` is
+        // sound (the interpreter covers the site via dynamic_mips); admitting an
+        // unprovable target is not.
+        let allow_cross_bank = resolution.via_call
+            && resolution.kind != Some(IndirectResolutionKind::JumpTable);
         let targets_are_usable = !resolution.targets.is_empty()
             && resolution.targets.iter().all(|target| {
-                target.is_multiple_of(4) && (resolution.via_call || in_bank(*target))
+                target.is_multiple_of(4) && (allow_cross_bank || in_bank(*target))
             });
         if !targets_are_usable {
             resolution.state = IndirectProofState::Bounded;
@@ -2184,6 +2202,114 @@ mod tests {
         for target in &call.targets {
             assert!(closure.cfg.proven_roots.contains(target));
         }
+    }
+
+    /// Regression for the switch-table over-admission bug (WM2000/NWXE).
+    ///
+    /// This is the same `jalr` (`via_call`) bounded code-pointer array as
+    /// `bounded_code_pointer_array_proves_each_call_root`, but the compiler's
+    /// `sltiu` bound (`< 3`) is WIDER than the table's actually-populated
+    /// extent (2 real slots). The resolver reads the third slot, which holds a
+    /// stray page-aligned word (`0x8080_0000`) sitting outside every bank
+    /// mapping -- the exact signature of the 20 NWXE `OutsideAllMappings`
+    /// destinations (a table walked past its real end into zeroed/garbage
+    /// data).
+    ///
+    /// Before the guard: because the site is `via_call`, `reject_unusable_targets`
+    /// skipped the in-bank check and admitted `0x8080_0000` as a concrete
+    /// `Exhaustive` call target, which the scoreboard then classes
+    /// `unsupported/OutsideAllMappings` -- a release blocker. After the guard:
+    /// a JumpTable with an out-of-bank slot is refused wholesale and the site
+    /// falls back to `Bounded`/`Open` (interpreter-covered), never fabricating
+    /// the garbage target. The two in-bank slots are only recovered when the
+    /// whole set is in-bank (see the sibling test), so soundness is preserved
+    /// by dropping, per the wrong==0 discipline.
+    #[test]
+    fn over_walked_jump_table_slot_is_not_admitted() {
+        let sltiu = (0x0bu32 << 26) | (4 << 21) | (1 << 16) | 3; // sltiu $at,$a0,3
+        let beq_default = (0x04u32 << 26) | (1 << 21) | 7;
+        let sll_delay = (4u32 << 16) | (8 << 11) | (2 << 6);
+        let addu = (9u32 << 21) | (8 << 16) | (9 << 11) | 0x21;
+        let lw_t9 = (0x23u32 << 26) | (9 << 21) | (25 << 16) | 0x40;
+        let jalr_t9 = (25u32 << 21) | (31 << 11) | 0x09;
+        let jr_ra = 0x03e0_0008;
+        let mut bytes = asm(&[
+            sltiu,
+            beq_default,
+            sll_delay,
+            0x3c09_8000,
+            addu,
+            lw_t9,
+            jalr_t9,
+            NOP,
+            jr_ra,
+            jr_ra,
+            NOP,
+        ]);
+        bytes.resize(0xa0, 0);
+        // Two real in-bank code pointers...
+        for (offset, target) in [(0x40, 0x8000_0080u32), (0x44, 0x8000_0090)] {
+            bytes[offset..offset + 4].copy_from_slice(&target.to_be_bytes());
+            let target_offset = (target - 0x8000_0000) as usize;
+            bytes[target_offset..target_offset + 4].copy_from_slice(&jr_ra.to_be_bytes());
+            bytes[target_offset + 4..target_offset + 8].copy_from_slice(&NOP.to_be_bytes());
+        }
+        // ...and a third slot the wide bound over-walks into: a page-aligned
+        // out-of-bank word, the NWXE `OutsideAllMappings` signature.
+        let over_walked = 0x8080_0000u32;
+        bytes[0x48..0x4c].copy_from_slice(&over_walked.to_be_bytes());
+
+        let closure = build_cfg_value_set_closed("overwalk", &bytes, 0x8000_0000, &[0x8000_0000]);
+        let call = closure
+            .indirect
+            .iter()
+            .find(|resolution| resolution.site_pc == 0x8000_0018)
+            .unwrap();
+        assert!(call.via_call);
+        // The whole resolution must be refused: not Exhaustive, no fabricated
+        // targets, and the garbage word never seeded as a root or block.
+        assert_ne!(
+            call.state,
+            IndirectProofState::Exhaustive,
+            "an over-walked out-of-bank jump-table slot must not be admitted",
+        );
+        assert!(!closure.cfg.proven_roots.contains(&over_walked));
+        assert!(!closure
+            .cfg
+            .blocks
+            .iter()
+            .any(|block| block.start_va == over_walked));
+        // The over-walked word must appear in no ResolvedIndirect terminator
+        // (that is exactly how the scoreboard would class it OutsideAllMappings).
+        assert!(!closure.cfg.blocks.iter().any(|block| matches!(
+            &block.terminator,
+            BlockTerminator::ResolvedIndirect { targets, .. } if targets.contains(&over_walked)
+        )));
+
+        // Control: the SAME table with an in-bank third slot stays fully
+        // resolved -- the guard drops only over-walk garbage, never a real
+        // in-bank switch.
+        let mut in_bank_bytes = bytes.clone();
+        bytes[0x9c..0xa0].copy_from_slice(&NOP.to_be_bytes()); // ensure 0x9c is a real target
+        in_bank_bytes[0x48..0x4c].copy_from_slice(&0x8000_009cu32.to_be_bytes());
+        in_bank_bytes[0x9c..0xa0].copy_from_slice(&jr_ra.to_be_bytes());
+        let in_bank_closure =
+            build_cfg_value_set_closed("inbank", &in_bank_bytes, 0x8000_0000, &[0x8000_0000]);
+        let in_bank_call = in_bank_closure
+            .indirect
+            .iter()
+            .find(|resolution| resolution.site_pc == 0x8000_0018)
+            .unwrap();
+        assert_eq!(
+            in_bank_call.state,
+            IndirectProofState::Exhaustive,
+            "an entirely in-bank switch table must still resolve",
+        );
+        assert_eq!(in_bank_call.kind, Some(IndirectResolutionKind::JumpTable));
+        assert_eq!(
+            in_bank_call.targets,
+            vec![0x8000_0080, 0x8000_0090, 0x8000_009c]
+        );
     }
 
     #[test]
