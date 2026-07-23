@@ -88,6 +88,18 @@ pub struct PendingResumeEvidenceSnapshot {
     pub resume: Resume,
 }
 
+/// Receipt for the executor's terminal host process-exit transition.
+///
+/// `detached_coroutines` counts started guest stacks that were still
+/// suspended and therefore could not be force-unwound across their generated
+/// C / `extern "C"` frames. Their allocations are intentionally left for the
+/// operating system to reclaim at process exit.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ProcessExitSummary {
+    pub threads: u32,
+    pub detached_coroutines: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutorQueueEvidenceSnapshot {
     pub address: RdramAddr,
@@ -722,6 +734,40 @@ impl Executor {
         self.pending_resume.remove(&id);
         if self.running == Some(id) {
             self.running = None;
+        }
+    }
+
+    /// Make this executor safe to drop at the terminal host process boundary.
+    ///
+    /// This is not guest thread destruction and does not resume guest code.
+    /// The caller must be between scheduling steps (`running == None`) and
+    /// must never use the executor again. Started, unfinished coroutine
+    /// objects are detached so their `Drop` implementation cannot force an
+    /// unwind through generated C and non-unwind ABI frames.
+    pub fn prepare_process_exit(&mut self) -> ProcessExitSummary {
+        assert!(
+            self.running.is_none(),
+            "Executor::prepare_process_exit cannot run while guest thread {:?} owns the run token",
+            self.running
+        );
+        self.validate_control_evidence_invariants()
+            .unwrap_or_else(|error| {
+                panic!("Executor::prepare_process_exit found corrupt scheduler state: {error:?}")
+            });
+        let threads = u32::try_from(self.threads.len())
+            .expect("Executor::prepare_process_exit thread count exceeds u32");
+        let detached_coroutines = self
+            .threads
+            .values_mut()
+            .map(|thread| usize::from(thread.detach_for_process_exit()))
+            .sum::<usize>();
+        self.threads.clear();
+        self.run_queue.clear();
+        self.pending_resume.clear();
+        ProcessExitSummary {
+            threads,
+            detached_coroutines: u32::try_from(detached_coroutines)
+                .expect("Executor::prepare_process_exit detached count exceeds u32"),
         }
     }
 
@@ -2280,5 +2326,15 @@ mod tests {
             returns_next.control_evidence_snapshot(),
             "the next scheduling step exposes the intentionally opaque difference"
         );
+    }
+
+    #[test]
+    fn process_exit_rejects_an_active_run_token_owner() {
+        let mut exec = Executor::new();
+        exec.running = Some(77);
+        let panic =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec.prepare_process_exit()));
+        assert!(panic.is_err());
+        exec.running = None;
     }
 }

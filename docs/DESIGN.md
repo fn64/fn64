@@ -1378,6 +1378,27 @@ thread, stackful coroutines, priority-ordered run queue" shape. Three
 things the implementation surfaced that this doc didn't originally spell
 out, recorded here honestly per `AGENTS.md`'s "mark revisions honestly":
 
+- **Process exit is an explicit terminal executor state, not coroutine
+  unwinding.** A bounded host can legitimately stop while guest threads are
+  suspended inside generated C and an `extern "C"` blocking shim. The public
+  `corosensei::Coroutine` contract force-unwinds a suspended stack from
+  `Drop`; Rust cannot unwind that payload through those non-unwind FFI frames.
+  `fn64_abi::prepare_process_exit` therefore validates that no guest owns the
+  run token, abandons any committed HLE renderer-continuation token without
+  resuming it, drops renderer/audio backends while registered RDRAM is live,
+  normally drops never-started and completed coroutines, and intentionally
+  forgets only started/unfinished coroutine objects for the kernel to reclaim
+  at process termination. It then clears every saved yielder/RDRAM pointer
+  and changes the TLS owner from `Active(Executor)` to
+  `PreparedForProcessExit`; subsequent executor access traps. This is neither
+  guest `osDestroyThread` nor an in-process reset facility. The child-process
+  ABI regressions block inside the real `osRecvMesg_recomp` and stop after a
+  resumable backend returns `Continue`; each seals the runtime, returns
+  through ordinary Rust teardown, and requires exit status zero. Provenance:
+  the public corosensei `Coroutine::drop`/`force_unwind`
+  contract and Rust's non-unwind `extern "C"` ABI rule; no reference-runtime
+  implementation behavior is used.
+
 - **`Yield`/`Resume` needed a `may_block` field, not just two "will
   definitely block" variants.** The original sketch modeled
   `BlockOnRecv`/`BlockOnSend` as always-blocking suspend points, with the

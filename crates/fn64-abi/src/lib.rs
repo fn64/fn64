@@ -1401,6 +1401,11 @@ struct ReentrantCell<T> {
     inner: std::cell::UnsafeCell<T>,
 }
 
+enum ExecutorSlot {
+    Active(Box<Executor>),
+    PreparedForProcessExit,
+}
+
 impl<T> ReentrantCell<T> {
     const fn new(value: T) -> Self {
         ReentrantCell {
@@ -1428,7 +1433,8 @@ thread_local! {
     /// other than `with_executor` (below) -- see that function's doc comment
     /// for the full reentrancy audit, including why `ReentrantCell` (not
     /// `RefCell`) is the right cell type here.
-    static EXECUTOR: ReentrantCell<Executor> = ReentrantCell::new(Executor::new());
+    static EXECUTOR: ReentrantCell<ExecutorSlot> =
+        ReentrantCell::new(ExecutorSlot::Active(Box::new(Executor::new())));
 
     /// Overlay/section registry + PI/ROM state -- see `HostState` doc.
     /// Separate `RefCell` from `EXECUTOR` (not merged into one struct)
@@ -1573,7 +1579,14 @@ thread_local! {
 /// it and this exact function would panic on the nested call this doc
 /// comment describes, with no compile-time signal beforehand.
 fn with_executor<R>(f: impl FnOnce(&mut Executor) -> R) -> R {
-    EXECUTOR.with(|e| e.with(f))
+    EXECUTOR.with(|slot| {
+        slot.with(|slot| match slot {
+            ExecutorSlot::Active(executor) => f(executor),
+            ExecutorSlot::PreparedForProcessExit => {
+                panic!("fn64 executor used after prepare_process_exit detached its guest stacks")
+            }
+        })
+    })
 }
 
 fn with_host<R>(f: impl FnOnce(&mut HostState) -> R) -> R {

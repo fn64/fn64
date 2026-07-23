@@ -846,7 +846,8 @@ mod game {
         // controller wiring reaches fn64_abi, then exits.
         if let Some(key) = std::env::var_os("FN64_INPUT_PROBE") {
             input_probe(&mut shell, &key.to_string_lossy());
-            clean_exit(0);
+            prepare_clean_exit();
+            return;
         }
 
         let event_loop = EventLoop::new().expect("fn64-shell: failed to build winit event loop");
@@ -857,30 +858,25 @@ mod game {
             eprintln!("[fn64-shell] event loop error: {e}");
         }
         println!("[fn64-shell] exited cleanly.");
-        clean_exit(0);
+        prepare_clean_exit();
     }
 
-    /// Exit the process WITHOUT running global/TLS destructors.
+    /// Seal guest coroutine ownership before normal process teardown.
     ///
     /// The one global `fn64_abi` executor holds a booted game's `GameThread`s,
-    /// each wrapping a guest stack woven through the linked C
-    /// `RecompiledFuncs`. `GameThread::drop` panics when run against a thread
-    /// that hasn't cleanly finished, and that Drop fires from the executor's
-    /// thread-local destructor at teardown -> "panic in a function that
-    /// cannot unwind" -> SIGABRT (observed: exit 134 after an otherwise clean
-    /// run/probe). `std::process::exit` does NOT prevent this on macOS, where
-    /// pthread-key TLS destructors still run during `exit()`. `_exit(2)`
-    /// terminates immediately, skipping every atexit handler and TLS
-    /// destructor. A shell has nothing to persist on exit -- the save store is
-    /// flushed on each write, and window/audio OS handles are reclaimed by the
-    /// kernel on process death -- so immediate termination is the correct
-    /// clean shutdown here, not a workaround hiding real cleanup.
-    fn clean_exit(code: i32) -> ! {
+    /// each wrapping a guest stack woven through linked generated code and
+    /// non-unwind ABI frames. The terminal ABI operation detaches only the
+    /// unfinished stacks that cannot be force-unwound, then ordinary Rust/TLS
+    /// teardown remains available to window, audio, and renderer owners.
+    fn prepare_clean_exit() {
         use std::io::Write as _;
+        let exit = fn64_abi::prepare_process_exit();
+        println!(
+            "[fn64-shell] process exit prepared: threads={} detached_coroutines={}",
+            exit.threads, exit.detached_coroutines
+        );
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
-        // Safety: `_exit` is always safe to call; it never returns.
-        unsafe { libc::_exit(code) }
     }
 
     /// Drive the keyboard->controller path once, headlessly, and report what
