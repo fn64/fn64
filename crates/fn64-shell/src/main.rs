@@ -124,8 +124,13 @@ mod game {
         overlay: Overlay,
         last_swap_count: u64,
         /// Scratch RGBA8888 buffer the VI framebuffer unpacks into before
-        /// blitting to the pixels surface -- allocated once, reused per frame.
+        /// blitting to the pixels surface -- reused per frame, reallocated if
+        /// the framebuffer width changes.
         rgba: Vec<u8>,
+        /// Current pixels-surface / scratch width in pixels. Starts at
+        /// FB_WIDTH and is resized to the game's real VI_WIDTH once a mode is
+        /// latched, so the full framebuffer line is presented (not cropped).
+        fb_width: usize,
         /// `Arc<Window>` (not a bare `Window`) so the `SurfaceTexture`
         /// pixels holds can own a `'static` window handle, letting `pixels`
         /// be `Pixels<'static>` -- otherwise pixels 0.15 borrows the window
@@ -362,6 +367,7 @@ mod game {
                 overlay: Overlay::new(),
                 last_swap_count: 0,
                 rgba: vec![0u8; FB_WIDTH * FB_HEIGHT * 4],
+                fb_width: FB_WIDTH,
                 window: None,
                 pixels: None,
                 reported_first_frame: false,
@@ -505,10 +511,26 @@ mod game {
             // width before the first osViSetMode. Prevents non-320-wide modes
             // from presenting sheared/offset.
             let src_stride = fn64_abi::vi_width().map_or(FB_WIDTH, |w| w as usize);
+            // Size the surface + scratch to the real framebuffer width so the
+            // WHOLE line is presented (WM2000 is 480 wide), not cropped to 320.
+            // Resize only on change -- pixels' buffer resize reallocates GPU
+            // storage. wgpu caps texture dimensions; clamp defensively.
+            let target_width = src_stride.clamp(1, 4096);
+            if target_width != self.fb_width {
+                if pixels.resize_buffer(target_width as u32, FB_HEIGHT as u32).is_ok() {
+                    self.fb_width = target_width;
+                    self.rgba = vec![0u8; target_width * FB_HEIGHT * 4];
+                    println!(
+                        "[fn64-shell] resized present surface to {target_width}x{FB_HEIGHT} \
+                         (game VI_WIDTH); window shows the full framebuffer line."
+                    );
+                }
+            }
             framebuffer::rgba5551_to_rgba8888(
                 fn64_runtime::RdramView::from_storage(&self.rdram),
                 fn64_runtime::RdramAddr::from_offset(fb_offset as u32),
                 src_stride,
+                self.fb_width,
                 &mut self.rgba,
             );
             let rgba_hash = framebuffer::rgba_hash(&self.rgba);
