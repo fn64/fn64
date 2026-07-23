@@ -96,7 +96,10 @@ Raw RDP submissions use the same RDRAM rollback/context-destruction boundary.
 Presentation temporarily lends RT64 the live physical-RDRAM allocation and
 the vblank-latched VI image. Native queues are synchronized before the Rust
 borrow returns. Resize and capture paths validate workload/present identity so
-stale output cannot satisfy release evidence.
+stale output cannot satisfy release evidence. VI fields before the first
+graphics workload remain presentable, but their zero-workload readbacks are
+not published as release captures; the first later capture with nonzero
+workload provenance replaces them.
 
 Every native task path validates a complete aligned declared display-list
 range before FFI. A nonzero physical output address must be 64-bit aligned and

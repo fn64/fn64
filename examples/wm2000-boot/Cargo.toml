@@ -15,6 +15,10 @@ license = "MIT OR Apache-2.0"
 publish = false
 description = "Headless boot harness for WM2000 (NWXE) on fn64. Contains zero game content -- see build.rs's module doc for the RECOMPILED_DIR/RECOMP_H_DIR/ROM env-var contract."
 
+[features]
+default = []
+rt64 = ["fn64-render-rt64/rt64"]
+
 [[bin]]
 name = "wm2000-boot"
 path = "src/main.rs"
@@ -28,3 +32,5 @@ fn64-abi = { path = "../../crates/fn64-abi" }
 fn64-boot-harness = { path = "../../crates/fn64-boot-harness" }
 fn64-render = { path = "../../crates/fn64-render" }
 fn64-render-reference = { path = "../../crates/fn64-render-reference" }
+fn64-render-rt64 = { path = "../../crates/fn64-render-rt64" }
+sha2 = "0.10"

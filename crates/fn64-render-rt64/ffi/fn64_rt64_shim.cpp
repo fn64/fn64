@@ -4106,14 +4106,35 @@ extern "C" int fn64_rt64_present(
                 const RT64::Present &completed =
                     context->application->presentQueue->presents[
                         context->application->presentQueue->previousWriteCursor()];
-                if ((completed.presentId != submitted_present) ||
-                    (completed.workloadId == 0U)) {
+                if (completed.presentId != submitted_present) {
                     set_error(error, error_capacity,
                               "RT64 present capture provenance is inconsistent");
                     return 0;
                 }
-                context->present_capture_id = submitted_present;
-                context->present_capture_workload_id = completed.workloadId;
+                if (completed.workloadId == 0U) {
+                    // Interleaving closed here: a game's VI thread can present
+                    // before its graphics thread publishes the first workload.
+                    // Those pixels have no workload provenance, so keep them
+                    // unavailable as release evidence. Zero after either side
+                    // has observed real work would instead erase provenance.
+                    if ((diagnostic.workload_before != 0U) ||
+                        (diagnostic.workload_after != 0U) ||
+                        (context->present_capture_id != 0U) ||
+                        (context->present_capture_workload_id != 0U)) {
+                        set_error(error, error_capacity,
+                                  "RT64 present capture lost workload provenance");
+                        return 0;
+                    }
+                }
+                else {
+                    if (completed.workloadId > diagnostic.workload_after) {
+                        set_error(error, error_capacity,
+                                  "RT64 present capture observed a future workload");
+                        return 0;
+                    }
+                    context->present_capture_id = submitted_present;
+                    context->present_capture_workload_id = completed.workloadId;
+                }
             }
         }
         return 1;
@@ -4192,7 +4213,8 @@ extern "C" int fn64_rt64_read_present_capture(
         }
         if ((context->present_capture_id == 0U) ||
             (context->present_capture_buffer == nullptr)) {
-            set_error(error, error_capacity, "RT64 has no completed present capture");
+            set_error(error, error_capacity,
+                      "RT64 has no completed post-workload present capture");
             return 0;
         }
 

@@ -21,6 +21,35 @@ cargo run
 - `ROM` — your own legally-obtained WM2000 (NWXE) ROM file. Never copied
   anywhere; read once at startup.
 
+The default renderer is the deterministic software reference backend. To run
+the same non-window-driving loop through the native RT64 adapter:
+
+```sh
+FN64_RT64_DIR=/path/to/pinned/rt64 \
+FN64_RENDER=rt64 \
+RECOMPILED_DIR=/path/to/RecompiledFuncs \
+RECOMP_H_DIR=/path/to/N64Recomp/include \
+ROM=/path/to/your/own/wm2000.z64 \
+cargo run --release --features rt64
+```
+
+RT64 owns a hidden SDL/GPU surface; the harness does not create a window or
+drive an event loop. On macOS the process must have WindowServer access and a
+default Metal device, and `Rt64Backend::create` must run on the main thread.
+This binary calls it directly from `main`. An explicit RT64 request fails
+loudly if the feature, display, or GPU is unavailable; it never silently runs
+the reference backend instead.
+
+`WM2000_GRAPHICS_POLICY=hle` uses the content-addressed HLE path with
+transactional LLE fallback. `WM2000_GRAPHICS_POLICY=lle` always executes the
+loaded graphics microcode through fn64's RSP interpreter and sends only its
+raw DPC stream to the selected renderer. The reference lane defaults to HLE
+to preserve its existing diagnostic behavior; RT64 defaults to LLE so the
+native run also exercises fn64's runtime/RSP path. Either default can be
+overridden explicitly. No WM2000 microcode digest is currently admitted by
+either backend's HLE catalog, so `hle` is presently an attempt followed by
+the transactional LLE fallback, not a claim that WM2000 executed in HLE.
+
 ## What it does
 
 1. Loads the ROM, registers every section from the real
@@ -28,12 +57,42 @@ cargo run
    Rust, then marks the always-resident sections loaded.
 2. Boots thread 0 running the real `recomp_entrypoint` symbol and drives
    the executor: `run_one_step` while runnable, `advance_virtual_time`
-   (which fires the armed VI retrace ticker) when idle, up to a bounded
-   step budget — logs periodically so a genuine stall/spin is visible
-   rather than silently indistinguishable from real progress.
-3. On every `osViSwapBuffer`, hashes the framebuffer region and dumps a
-   PNG if non-uniform (`/tmp/fn64-fb-<n>.png`).
+   to the exact earliest device-fabric deadline when idle (or catches the
+   fabric up through current executor time when that deadline is already
+   overdue), up to a bounded step budget. Earlier DMA/RCP completions are
+   serviced without being mistaken for fields; RT64 capture is attempted only
+   when the fabric reports one or more VI retraces actually committed. The
+   harness logs periodically so a genuine stall/spin is visible rather than
+   silently indistinguishable from real progress.
+3. At each committed presentation after one or more `osViSwapBuffer` calls,
+   the reference lane inspects the latest guest-RDRAM framebuffer if
+   non-uniform (`/tmp/fn64-fb-<n>.png`). Multiple swap requests before one
+   retrace correctly collapse to the buffer actually presented by that field.
+   The RT64 lane instead reads the backend's fenced post-VI BGRA8 target,
+   prints its exact SHA-256/workload/present identity, and writes
+   `/tmp/fn64-rt64-post-vi-swap-<n>-present-<id>.png`. It never labels the
+   guest framebuffer address as native RT64 output.
 4. Writes the full `TraceEvent` stream to `/tmp/wm2000-boot-trace.jsonl`.
+5. Seals the terminal executor lifecycle after every assertion and trace write.
+   Started guest coroutines still blocked in generated C are detached without
+   an invalid foreign-frame unwind; renderer/audio owners and ordinary Rust
+   values then receive normal process teardown.
+
+`WM2000_NO_DUMP=1` disables PNG output and normally skips RT64 readback setup.
+`WM2000_NO_TRACE=1` also disables PNGs for throughput measurements. Add
+`WM2000_RT64_CAPTURE=1` to either configuration to retain the fenced post-VI
+readback and exact digest without paying PNG-encoding or file-I/O cost.
+When RT64 readback is enabled, `WM2000_STOP_AT_SWAP=<n>` waits for the first
+committed post-VI capture at or after swap `<n>` before exiting; it does not
+mistake the guest's swap request for a completed native presentation. A step
+budget or steady-idle exit before that capture is a loud failure, not a
+successful partial capture.
+
+This remains an integration/boot harness, not a complete full-ROM release
+certificate: it contains the explicitly documented voice-map virgin-memory
+reproduction in `src/main.rs`. A digest from this harness proves which native
+pixels were produced and whether a bounded run repeats; it does not by itself
+prove hardware pixel correctness or zero unsupported behavior.
 
 ## Step budget (`WM2000_MAX_STEPS`)
 

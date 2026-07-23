@@ -14,12 +14,14 @@
 //!    generated symbol) and drives the executor: `run_one_step` while
 //!    runnable, `advance_virtual_time` (which fires the armed VI retrace
 //!    ticker) when idle, for a bounded number of virtual-time ticks.
-//! 4. On every `osViSwapBuffer_recomp` call (observed via
-//!    `fn64_abi::vi_swap_count()` polling), hashes the pointed-to
-//!    framebuffer region and dumps it as a PNG if non-uniform (Task
-//!    requirement 3).
+//! 4. At each committed presentation after one or more
+//!    `osViSwapBuffer_recomp` calls (observed via
+//!    `fn64_abi::vi_swap_count()` polling), inspects the reference lane's
+//!    guest framebuffer or captures RT64's actual post-VI target. RT64 output
+//!    is SHA-256-bound before optional PNG output.
 //! 5. Emits the trace log to a file and prints a summary ladder.
 
+use sha2::{Digest, Sha256};
 use std::io::Write;
 
 /// Real translated audio ucode stand-in. The GENUINE
@@ -144,13 +146,19 @@ fn main() {
     // framebuffer PNG are gated off together on a perf run (NO_DUMP, or the
     // trace-disabling flag which also signals "I'm measuring, not capturing").
     let dumps_disabled = trace_disabled || std::env::var_os("WM2000_NO_DUMP").is_some();
+    // Native readback is normally enabled with dumps, but certification and
+    // timing probes can retain exact post-VI bytes/digests without PNG I/O.
+    let rt64_capture_requested =
+        !dumps_disabled || std::env::var_os("WM2000_RT64_CAPTURE").is_some();
 
-    // Main's VI pump now delivers real presentations; without a registered
+    // Main's VI pump delivers real presentations; without a registered
     // backend the first retrace trips present_render_backend's loud trap.
-    // The software ReferenceBackend keeps this harness headless.
-    // ponytail: no RT64/env switch like oot-boot until a wm2000 frame exists.
-    {
-        use fn64_render::RenderBackend as _;
+    // `FN64_RENDER=reference|rt64` selects the backend at runtime. RT64 owns
+    // its hidden native surface, so this harness remains non-window-driving;
+    // on macOS `main` also satisfies the adapter's required main-thread
+    // initialization contract without an application event loop.
+    use fn64_render::RenderBackend as _;
+    let create_reference = || -> Box<dyn fn64_render::RenderBackend> {
         // The backend's per-swap surface PNG dump (encode_rgba8/write_png) is
         // real per-frame cost; skip it on a throughput run (gated together
         // with the harness fb dump via `dumps_disabled`).
@@ -163,8 +171,63 @@ fn main() {
         backend
             .create(&fn64_render::RenderConfig::for_tv(320, 240, tv_type))
             .expect("ReferenceBackend create must be infallible for 320x240");
-        fn64_abi::set_render_backend(Box::new(backend), rdram.len());
-    }
+        Box::new(backend)
+    };
+    let requested_renderer =
+        fn64_boot_harness::parse_release_env_value("FN64_RENDER", std::env::var_os("FN64_RENDER"))
+            .unwrap_or_else(|error| panic!("wm2000-boot: {error}"))
+            .unwrap_or_else(|| "reference".to_string())
+            .to_ascii_lowercase();
+    let graphics_policy_name = fn64_boot_harness::parse_release_env_value(
+        "WM2000_GRAPHICS_POLICY",
+        std::env::var_os("WM2000_GRAPHICS_POLICY"),
+    )
+    .unwrap_or_else(|error| panic!("wm2000-boot: {error}"))
+    .unwrap_or_else(|| {
+        if requested_renderer == "rt64" {
+            "lle".to_string()
+        } else {
+            "hle".to_string()
+        }
+    })
+    .to_ascii_lowercase();
+    let graphics_policy = match graphics_policy_name.as_str() {
+        "hle" | "hle-optimized" => fn64_abi::GraphicsTaskExecutionPolicy::HleOptimized,
+        "lle" | "lle-accuracy" => fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy,
+        value => panic!("wm2000-boot: WM2000_GRAPHICS_POLICY must be hle or lle, got {value:?}"),
+    };
+    let (render_backend, active_renderer, capture_rt64_present): (
+        Box<dyn fn64_render::RenderBackend>,
+        &'static str,
+        bool,
+    ) = match requested_renderer.as_str() {
+        "reference" => (create_reference(), "reference", false),
+        "rt64" => {
+            let mut backend = fn64_render_rt64::Rt64Backend::new();
+            backend
+                .create(&fn64_render::RenderConfig::for_tv(320, 240, tv_type))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "wm2000-boot: FN64_RENDER=rt64 requires a working native RT64 adapter; \
+                         create failed: {error}"
+                    )
+                });
+            let capture = rt64_capture_requested;
+            if capture {
+                backend.enable_present_capture().unwrap_or_else(|error| {
+                    panic!("wm2000-boot: RT64 post-VI capture setup failed: {error}")
+                });
+            }
+            (Box::new(backend), "rt64", capture)
+        }
+        value => panic!("wm2000-boot: FN64_RENDER must be reference or rt64, got {value:?}"),
+    };
+    fn64_abi::set_render_backend_with_policy(render_backend, rdram.len(), graphics_policy);
+    println!(
+        "[wm2000-boot] registered {active_renderer} renderer (320x240), graphics policy \
+         {graphics_policy:?}; RT64 post-VI capture={} (WM2000_RT64_CAPTURE overrides dump gates)",
+        capture_rt64_present
+    );
 
     // Typed IPL video standard is the shared VI/AI clock authority. The first
     // field uses nominal NTSC timing; the latched OSViMode H/V registers then
@@ -224,17 +287,28 @@ fn main() {
     // advancing each virtual VI field. This keeps host time independent of a
     // recompiler lane's internal checkpoint density while still bounding a
     // genuinely non-idle spin with MAX_STEPS.
-    const MAX_STEPS: u64 = 2_000_000;
     const LOG_EVERY: u64 = 50_000;
+    let max_steps = std::env::var("WM2000_MAX_STEPS").map_or(20_000_000, |raw| {
+        let parsed = raw
+            .parse::<u64>()
+            .unwrap_or_else(|_| panic!("WM2000_MAX_STEPS must be a positive integer, got {raw:?}"));
+        assert!(
+            parsed > 0,
+            "WM2000_MAX_STEPS must be a positive integer, got {raw:?}"
+        );
+        parsed
+    });
     // How many consecutive "nothing was runnable, and advancing the
     // virtual clock didn't wake anything either" ticks before concluding
     // boot has reached a genuinely idle steady state (not just a thread
     // temporarily blocked waiting for a soon-to-fire timer/retrace).
     const IDLE_TICKS_BEFORE_STOP: u32 = 200;
     let mut last_swap_count = 0u64;
+    let mut last_rt64_capture_swap = 0u64;
     let mut fb_dumps = Vec::new();
     let mut thread0_death_logged = false;
     let mut consecutive_idle_ticks = 0u32;
+    let mut stop_defer_logged = false;
 
     // WM2000_STOP_AT_SWAP=<n>: clean, bounded scripted runs -- stop (with the
     // normal summary + trace + shutdown path) as soon as the VI swap counter
@@ -242,8 +316,14 @@ fn main() {
     // run can end deterministically right after its last press window's
     // outcome has presented, instead of being killed by hand.
     let stop_at_swap = std::env::var("WM2000_STOP_AT_SWAP").ok().map(|raw| {
-        raw.parse::<u64>()
-            .unwrap_or_else(|_| panic!("WM2000_STOP_AT_SWAP must be a positive integer, got {raw:?}"))
+        let parsed = raw.parse::<u64>().unwrap_or_else(|_| {
+            panic!("WM2000_STOP_AT_SWAP must be a positive integer, got {raw:?}")
+        });
+        assert!(
+            parsed > 0,
+            "WM2000_STOP_AT_SWAP must be a positive integer, got {raw:?}"
+        );
+        parsed
     });
 
     // Voice-map virgin-allocation reproduction (2026-07-21, ladder 3 rung):
@@ -348,14 +428,19 @@ fn main() {
                     panic!("WM2000_INPUT_SCRIPT entry {entry:?}: buttons must be hex u16")
                 });
             let stick_x = parts.next().map_or(0, |s| {
-                s.parse::<i8>()
-                    .unwrap_or_else(|_| panic!("WM2000_INPUT_SCRIPT entry {entry:?}: stick_x must be i8"))
+                s.parse::<i8>().unwrap_or_else(|_| {
+                    panic!("WM2000_INPUT_SCRIPT entry {entry:?}: stick_x must be i8")
+                })
             });
             let stick_y = parts.next().map_or(0, |s| {
-                s.parse::<i8>()
-                    .unwrap_or_else(|_| panic!("WM2000_INPUT_SCRIPT entry {entry:?}: stick_y must be i8"))
+                s.parse::<i8>().unwrap_or_else(|_| {
+                    panic!("WM2000_INPUT_SCRIPT entry {entry:?}: stick_y must be i8")
+                })
             });
-            assert!(from < to, "WM2000_INPUT_SCRIPT entry {entry:?}: empty swap range");
+            assert!(
+                from < to,
+                "WM2000_INPUT_SCRIPT entry {entry:?}: empty swap range"
+            );
             input_script.push(InputScriptEntry {
                 from,
                 to,
@@ -375,13 +460,20 @@ fn main() {
     }
     let mut last_applied_input: (u16, i8, i8) = (0, 0, 0);
 
-    let mut tick = 0u64;
     let mut steps = 0u64;
     let mut drain = fn64_boot_harness::GuestDrain::default();
     loop {
-        if steps >= MAX_STEPS {
+        if steps >= max_steps {
+            if let Some(stop) = stop_at_swap.filter(|_| capture_rt64_present) {
+                assert!(
+                    last_rt64_capture_swap >= stop,
+                    "wm2000-boot: step budget {max_steps} exhausted before the requested RT64 \
+                     post-VI capture through swap {stop}; captured through \
+                     {last_rt64_capture_swap}"
+                );
+            }
             println!(
-                "[wm2000-boot] step budget ({MAX_STEPS}) exhausted at sim_time={} -- stopping \
+                "[wm2000-boot] step budget ({max_steps}) exhausted at sim_time={} -- stopping \
                  (this may mean a thread is spinning without truly blocking, or boot just needs \
                  a larger budget)",
                 fn64_abi::sim_time()
@@ -398,43 +490,19 @@ fn main() {
         let next_priority = fn64_abi::next_runnable_priority();
         let advanced_field =
             drain.before_step(next_priority) == fn64_boot_harness::DrainDecision::AdvanceField;
+        let mut committed_vi_field = false;
         if advanced_field {
-            // Anchor the field cursor to virtual time that has ACTUALLY
-            // elapsed. WM2000's corpus (unlike oot-boot) emits translated
-            // `InstructionCheckpoint` yields that charge real virtual time
-            // per guest step, so `sim_time` races ahead of a free-running
-            // `tick` cursor between field boundaries. Basing the next field
-            // on a stale `tick` alone would compute a `next_field` BELOW
-            // `sim_time`, and `advance_virtual_time(next_field)` then asserts
-            // "device time moved backwards" (pi.rs). Re-anchor to the current
-            // clock every field so the VI cadence tracks elapsed virtual time
-            // and never regresses.
-            let sim_now = fn64_abi::sim_time();
-            tick = tick.max(sim_now);
-            let next_field = tick
-                + fn64_abi::vi_field_interval()
-                    .expect("typed television standard must keep VI armed");
-            // Device completions land between fields: a DMA issued mid-slice
-            // arms its deadline just past sim_time. Jumping a whole field
-            // would deliver EVERY completion a field late and break real
-            // issue-then-poll-next-frame guest pipelines (BOOT-NOTES-WM2000.md
-            // part 7: NWXE's joybus). Service any deadline due before the next
-            // field boundary first.
-            let device_deadline = fn64_abi::next_device_deadline()
-                .filter(|deadline| *deadline < next_field);
-            match device_deadline {
-                Some(deadline) => {
-                    // Service the earlier hardware event, but do NOT reset
-                    // the field target: a chattering device (e.g. degenerate
-                    // audio refeed) must never starve the VI tick.
-                    fn64_abi::advance_virtual_time(deadline.max(sim_now));
-                }
-                None => {
-                    tick = next_field;
-                    fn64_abi::advance_virtual_time(tick);
-                    drain.begin_field();
-                }
-            }
+            // Device completions land between fields. Advance to the fabric's
+            // exact earliest event and let GuestDrain distinguish an actual
+            // committed VI edge from an earlier DMA/RCP completion. WM2000's
+            // translated instruction checkpoints move virtual time between
+            // host pumps, so reconstructing VI from a separate interval
+            // accumulator can miss a retrace that arrived through the generic
+            // device-deadline branch.
+            committed_vi_field = matches!(
+                drain.advance_to_next_device_event(),
+                fn64_boot_harness::DeviceAdvance::ViFields { .. }
+            );
         } else {
             let stepped = fn64_abi::run_one_step();
             assert!(
@@ -532,21 +600,54 @@ fn main() {
                     last_applied_input = desired;
                 }
             }
-            if !dumps_disabled {
+            if !dumps_disabled && active_renderer == "reference" {
                 if let Some(fb_offset) = fn64_abi::current_vi_framebuffer() {
                     capture_framebuffer(&rdram, fb_offset, swap_count, &mut fb_dumps);
                 }
             }
             last_swap_count = swap_count;
-            if let Some(stop) = stop_at_swap {
-                if swap_count >= stop {
-                    println!(
-                        "[wm2000-boot] WM2000_STOP_AT_SWAP={stop} reached (swap #{swap_count}, \
-                         step {steps}, sim_time={}) -- stopping",
-                        fn64_abi::sim_time()
-                    );
-                    break;
+        }
+
+        // RT64 renders into its native targets; `current_vi_framebuffer()` is
+        // only the guest RDRAM address and is not the post-VI image. Capture
+        // through the backend-owned fenced readback after the first committed
+        // VI field following each new swap, and bind the diagnostic to both
+        // native workload/present identity and an exact SHA-256.
+        if capture_rt64_present && committed_vi_field && swap_count > last_rt64_capture_swap {
+            match fn64_abi::capture_render_release_frame() {
+                Ok(capture) => {
+                    capture_rt64_frame(capture, swap_count, !dumps_disabled, &mut fb_dumps);
+                    last_rt64_capture_swap = swap_count;
                 }
+                Err(fn64_render::RenderError::NotReady(
+                    "RT64 release capture requested before a completed VI present",
+                )) => {}
+                Err(fn64_render::RenderError::NotReady(
+                    "RT64 has no completed post-workload present capture",
+                )) => {}
+                Err(error) => {
+                    panic!("wm2000-boot: capture RT64 post-VI frame for swap {swap_count}: {error}")
+                }
+            }
+        }
+
+        if let Some(stop) = stop_at_swap.filter(|stop| swap_count >= *stop) {
+            if capture_rt64_present && last_rt64_capture_swap < stop {
+                if !stop_defer_logged {
+                    println!(
+                        "[wm2000-boot] WM2000_STOP_AT_SWAP={stop} reached at swap \
+                         #{swap_count}; waiting for its next committed RT64 post-VI capture"
+                    );
+                    stop_defer_logged = true;
+                }
+            } else {
+                println!(
+                    "[wm2000-boot] WM2000_STOP_AT_SWAP={stop} satisfied (swap #{swap_count}, \
+                     RT64 captured through #{last_rt64_capture_swap}, step {steps}, sim_time={}) \
+                     -- stopping",
+                    fn64_abi::sim_time()
+                );
+                break;
             }
         }
 
@@ -557,6 +658,14 @@ fn main() {
                 consecutive_idle_ticks = 0;
             }
             if consecutive_idle_ticks >= IDLE_TICKS_BEFORE_STOP {
+                if let Some(stop) = stop_at_swap.filter(|_| capture_rt64_present) {
+                    assert!(
+                        last_rt64_capture_swap >= stop,
+                        "wm2000-boot: reached steady idle before the requested RT64 post-VI \
+                         capture through swap {stop}; captured through \
+                         {last_rt64_capture_swap}"
+                    );
+                }
                 println!(
                     "[wm2000-boot] reached a steady idle state ({IDLE_TICKS_BEFORE_STOP} \
                      consecutive ticks with nothing runnable) at sim_time={} steps={steps} -- \
@@ -568,6 +677,14 @@ fn main() {
         } else {
             consecutive_idle_ticks = 0;
         }
+    }
+
+    if let Some(stop) = stop_at_swap.filter(|_| capture_rt64_present) {
+        assert!(
+            last_rt64_capture_swap >= stop,
+            "wm2000-boot: exited without the requested RT64 post-VI capture through swap \
+             {stop}; captured through {last_rt64_capture_swap}"
+        );
     }
 
     let (gfx_count, audio_count) = fn64_abi::task_counts();
@@ -583,8 +700,15 @@ fn main() {
     );
     println!("[wm2000-boot] gfx tasks submitted: {gfx_count}");
     println!("[wm2000-boot] audio tasks submitted: {audio_count}");
+    println!("[wm2000-boot] renderer: {active_renderer}, graphics policy: {graphics_policy:?}");
+    let last_render_error = fn64_abi::last_render_error();
+    println!("[wm2000-boot] last render error: {last_render_error:?}");
+    assert!(
+        last_render_error.is_none(),
+        "wm2000-boot: renderer finished with a recorded error: {last_render_error:?}"
+    );
     println!(
-        "[wm2000-boot] non-uniform framebuffers dumped: {} ({:?})",
+        "[wm2000-boot] frame images dumped: {} ({:?})",
         fb_dumps.len(),
         fb_dumps
     );
@@ -595,6 +719,98 @@ fn main() {
         write_trace_file(&trace, &trace_path);
         println!("[wm2000-boot] trace written to {trace_path}");
     }
+
+    let exit = fn64_abi::prepare_process_exit();
+    println!(
+        "[wm2000-boot] process exit prepared: threads={} detached_coroutines={}",
+        exit.threads, exit.detached_coroutines
+    );
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Dump RT64's exact post-VI BGRA8 readback. This is deliberately separate
+/// from `capture_framebuffer`: native output is not inferred from guest RDRAM.
+fn capture_rt64_frame(
+    capture: fn64_render::RenderReleaseCapture,
+    swap_index: u64,
+    dump_png: bool,
+    dumps: &mut Vec<String>,
+) {
+    assert_eq!(
+        capture.format,
+        fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm,
+        "wm2000-boot: RT64 returned an unsupported post-VI pixel format"
+    );
+    let width = usize::try_from(capture.width).expect("RT64 capture width exceeds usize");
+    let height = usize::try_from(capture.height).expect("RT64 capture height exceeds usize");
+    let row_bytes =
+        usize::try_from(capture.row_bytes).expect("RT64 capture row stride exceeds usize");
+    let visible_row_bytes = width
+        .checked_mul(4)
+        .expect("RT64 capture visible row size overflow");
+    assert!(
+        row_bytes >= visible_row_bytes,
+        "wm2000-boot: RT64 capture row stride {row_bytes} is smaller than {width} BGRA8 pixels"
+    );
+    let expected_len = row_bytes
+        .checked_mul(height)
+        .expect("RT64 capture byte length overflow");
+    assert_eq!(
+        capture.bytes.len(),
+        expected_len,
+        "wm2000-boot: RT64 capture byte length does not match its declared geometry"
+    );
+
+    let frame_sha256 = hex_sha256(&capture.bytes);
+    let settings_sha256 = capture
+        .settings_sha256
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    println!(
+        "[wm2000-rt64] swap #{swap_index}: cycle={} workload={} present={} post_vi={}x{} \
+         row_bytes={} sha256={} settings_sha256={} backend={} source_authoritative={}",
+        capture.guest_cycle,
+        capture.workload_id,
+        capture.present_id,
+        capture.width,
+        capture.height,
+        capture.row_bytes,
+        frame_sha256,
+        settings_sha256,
+        capture.backend_identity,
+        capture.source_authoritative
+    );
+
+    if !dump_png {
+        return;
+    }
+
+    let mut rgba = Vec::with_capacity(
+        width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .expect("RT64 capture RGBA conversion size overflow"),
+    );
+    for row in capture.bytes.chunks_exact(row_bytes) {
+        for bgra in row[..visible_row_bytes].chunks_exact(4) {
+            rgba.extend_from_slice(&[bgra[2], bgra[1], bgra[0], bgra[3]]);
+        }
+    }
+    let dir = std::env::var("WM2000_FB_DUMP_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let path = format!(
+        "{dir}/fn64-rt64-post-vi-swap-{swap_index}-present-{}.png",
+        capture.present_id
+    );
+    write_png(&path, capture.width, capture.height, &rgba)
+        .unwrap_or_else(|error| panic!("wm2000-boot: write RT64 post-VI capture {path}: {error}"));
+    dumps.push(path);
 }
 
 /// Hash the fb region (a fixed-size guess: 320x240 RGBA5551 = 153600 bytes,
