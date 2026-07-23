@@ -501,9 +501,14 @@ mod game {
             };
 
             let blank = framebuffer::is_uniform(region);
+            // Real framebuffer line stride (VI_WIDTH); default to the presented
+            // width before the first osViSetMode. Prevents non-320-wide modes
+            // from presenting sheared/offset.
+            let src_stride = fn64_abi::vi_width().map_or(FB_WIDTH, |w| w as usize);
             framebuffer::rgba5551_to_rgba8888(
                 fn64_runtime::RdramView::from_storage(&self.rdram),
                 fn64_runtime::RdramAddr::from_offset(fb_offset as u32),
+                src_stride,
                 &mut self.rgba,
             );
             let rgba_hash = framebuffer::rgba_hash(&self.rgba);
@@ -541,7 +546,9 @@ mod game {
                     println!(
                         "[fn64-shell] presenting VI framebuffer (swap #{swaps}) -- non-uniform, \
                          rgba_hash={rgba_hash:016x} (hash is a comparison key, not a correctness \
-                         claim)."
+                         claim); vi_width={} (framebuffer line stride, presented at {FB_WIDTH}).",
+                        fn64_abi::vi_width()
+                            .map_or_else(|| format!("unset->{FB_WIDTH}"), |w| w.to_string())
                     );
                 }
                 self.reported_first_frame = true;
