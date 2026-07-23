@@ -990,7 +990,21 @@ mod game {
     /// only reports the wiring status. Enabling the `oot-audio-ucode` feature
     /// flips the message; the actual `set_audio_ucode_fn` call lands here when
     /// a non-cross-pinning ucode crate becomes a real dependency.
-    #[cfg(all(fn64_recomp_rs, feature = "oot-audio"))]
+    // AKI-family audio takes precedence when linked: the aki-audio-ucode
+    // adapter recompiles the AKI audio ucode from the ROM and depends on this
+    // workspace's fn64-audio (no cross-pin), so it works in both the C and rs
+    // lanes. This is what makes WM2000 (and the AKI family) audible.
+    #[cfg(feature = "aki-audio")]
+    fn wire_audio_ucode(rdram_len: usize) {
+        aki_audio_ucode::set_rdram_len(rdram_len);
+        unsafe { fn64_abi::set_audio_ucode_fn(aki_audio_ucode::aki_audio_ucode) };
+        println!(
+            "[fn64-shell] registered recompiled AKI audio ucode as the real M_AUDTASK ucode \
+             function (WM2000/AKI family)"
+        );
+    }
+
+    #[cfg(all(not(feature = "aki-audio"), fn64_recomp_rs, feature = "oot-audio"))]
     fn wire_audio_ucode(rdram_len: usize) {
         // The rs manifest links the recompiled OoT aspMain ucode via the
         // harness-local build adapter (same crate oot-boot's rs lane uses),
@@ -1003,7 +1017,7 @@ mod game {
         );
     }
 
-    #[cfg(not(all(fn64_recomp_rs, feature = "oot-audio")))]
+    #[cfg(not(any(feature = "aki-audio", all(fn64_recomp_rs, feature = "oot-audio"))))]
     fn wire_audio_ucode(_rdram_len: usize) {
         if cfg!(feature = "oot-audio-ucode") {
             println!(
