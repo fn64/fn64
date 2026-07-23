@@ -57,9 +57,13 @@ the transactional LLE fallback, not a claim that WM2000 executed in HLE.
    Rust, then marks the always-resident sections loaded.
 2. Boots thread 0 running the real `recomp_entrypoint` symbol and drives
    the executor: `run_one_step` while runnable, `advance_virtual_time`
-   (which fires the armed VI retrace ticker) when idle, up to a bounded
-   step budget — logs periodically so a genuine stall/spin is visible
-   rather than silently indistinguishable from real progress.
+   to the exact earliest device-fabric deadline when idle (or catches the
+   fabric up through current executor time when that deadline is already
+   overdue), up to a bounded step budget. Earlier DMA/RCP completions are
+   serviced without being mistaken for fields; RT64 capture is attempted only
+   when the fabric reports one or more VI retraces actually committed. The
+   harness logs periodically so a genuine stall/spin is visible rather than
+   silently indistinguishable from real progress.
 3. At each committed presentation after one or more `osViSwapBuffer` calls,
    the reference lane inspects the latest guest-RDRAM framebuffer if
    non-uniform (`/tmp/fn64-fb-<n>.png`). Multiple swap requests before one

@@ -11,17 +11,32 @@ pub fn inject_external_event(event: ExternalEvent) {
     with_executor(|exec| exec.inject_event(event));
 }
 
+/// Device events committed by one host virtual-time advance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VirtualTimeAdvance {
+    vi_retrace_ticks: u32,
+}
+
+impl VirtualTimeAdvance {
+    /// Number of VI retraces the device fabric committed during the advance.
+    pub const fn vi_retrace_ticks(self) -> u32 {
+        self.vi_retrace_ticks
+    }
+}
+
 /// Host-side virtual-clock driver.
 ///
 /// Also samples the VI retrace cadence probe (ROADMAP R5 probe 3): this is the
 /// only place the host advances the guest's virtual clock, so it is the one
-/// seam where wall-clock and fired-tick counts can be correlated. The delta is
-/// read back from the executor rather than predicted, so the probe counts what
-/// actually fired, not what the caller expected to fire.
-pub fn advance_virtual_time(now: u64) {
+/// seam where wall-clock and fired-tick counts can be correlated. The returned
+/// delta comes from committed device notifications rather than a host-side
+/// interval prediction, so callers can distinguish an actual VI edge from an
+/// earlier DMA/RCP deadline.
+pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
     crate::task_dispatch::advance_hle_render_task();
-    crate::pi::advance_device_time(now);
+    let vi_retrace_ticks = crate::pi::advance_device_time(now);
     with_executor(|exec| exec.advance_time(now));
+    VirtualTimeAdvance { vi_retrace_ticks }
 }
 
 /// Next pending device-fabric deadline or immediately runnable HLE renderer
@@ -739,7 +754,7 @@ mod tests {
         });
         crate::vi::arm_vi_retrace(10);
 
-        advance_virtual_time(9);
+        assert_eq!(advance_virtual_time(9).vi_retrace_ticks(), 0);
         assert!(!with_host(|host| host
             .device_fabric
             .interrupt_pending(fn64_runtime::InterruptSource::Vi)));
@@ -755,7 +770,7 @@ mod tests {
             );
         });
 
-        advance_virtual_time(10);
+        assert_eq!(advance_virtual_time(10).vi_retrace_ticks(), 1);
         assert!(with_host(|host| host
             .device_fabric
             .interrupt_pending(fn64_runtime::InterruptSource::Vi)));
@@ -770,5 +785,16 @@ mod tests {
                 fn64_runtime::RecvMesgOutcome::Delivered(0x32)
             );
         });
+    }
+
+    #[test]
+    fn virtual_time_advance_counts_every_overdue_vi_retrace() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+        crate::test_support::install_complete_render_backend(0);
+        crate::vi::arm_vi_retrace(10);
+
+        assert_eq!(advance_virtual_time(35).vi_retrace_ticks(), 3);
+        assert_eq!(crate::next_vi_deadline(), Some(40));
     }
 }

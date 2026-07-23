@@ -1137,7 +1137,8 @@ pub(crate) fn write_raw_mmio_word(vaddr: u64, value: u32) -> bool {
 }
 
 /// Commit due device work before any executor resume is possible.
-pub(crate) fn advance_device_time(now: u64) {
+pub(crate) fn advance_device_time(now: u64) -> u32 {
+    let mut vi_retrace_ticks = 0u32;
     loop {
         let step = with_host(|host| {
             let current = host.device_fabric.now().get();
@@ -1150,18 +1151,21 @@ pub(crate) fn advance_device_time(now: u64) {
                 .filter(|deadline| deadline.get() <= now)
                 .map_or(now, fn64_runtime::Cycles::get)
         });
-        advance_device_time_step(step);
+        vi_retrace_ticks = vi_retrace_ticks
+            .checked_add(advance_device_time_step(step))
+            .expect("VI retrace count overflow during one virtual-time advance");
         if step == now {
             break;
         }
     }
+    vi_retrace_ticks
 }
 
 /// Advance through exactly one due device deadline. Keeping notification
 /// handling at this boundary lets a VI mode latch reschedule the following
 /// field before the fabric advances again, while executor wakeups remain
 /// deferred until the committed event has been converted to owned messages.
-fn advance_device_time_step(now: u64) {
+fn advance_device_time_step(now: u64) -> u32 {
     if crate::boot_probe_enabled() {
         let next = with_host(|host| host.device_fabric.next_deadline().map(|d| d.get()));
         if next.is_some_and(|d| d <= now) {
@@ -1492,6 +1496,7 @@ fn advance_device_time_step(now: u64) {
     for (rom_start, dest_vram) in overlays {
         note_dma_overlay_load(rom_start, dest_vram);
     }
+    let mut committed_vi_ticks = 0u32;
     if !events.is_empty() {
         let (vi_ticks, presentations) = with_executor(|exec| {
             // Interleaving closed here: checkpoint suspend -> PI/SI byte
@@ -1531,11 +1536,13 @@ fn advance_device_time_step(now: u64) {
             }
             (vi_ticks, presentations)
         });
+        committed_vi_ticks = vi_ticks;
         crate::vi::note_retrace_ticks(vi_ticks);
         for presentation in presentations {
             crate::task_dispatch::present_render_backend(presentation);
         }
     }
+    committed_vi_ticks
 }
 
 // ---------------------------------------------------------------------
