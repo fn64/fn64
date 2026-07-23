@@ -4260,12 +4260,24 @@ impl Tmem {
         self.valid[address] |= mask;
     }
 
-    fn read_byte(&self, logical: usize, odd_row: bool, mask: u8, context: &str) -> u8 {
+    /// `context` is a lazy diagnostic evaluated ONLY on the uninitialized-read
+    /// panic path. Passing a closure (not a formatted `&str`) keeps the
+    /// per-texel hot loop from allocating/formatting a context string on every
+    /// valid read -- a live profile showed that eager formatting dominating the
+    /// software rasterizer's texel fetch. `FnOnce` avoids any dynamic dispatch.
+    fn read_byte(
+        &self,
+        logical: usize,
+        odd_row: bool,
+        mask: u8,
+        context: impl FnOnce() -> String,
+    ) -> u8 {
         let address = Self::physical_byte(logical, odd_row);
         assert_eq!(
             self.valid[address] & mask,
             mask,
-            "{context} reads uninitialized TMEM bits at byte {address:#05x}"
+            "{} reads uninitialized TMEM bits at byte {address:#05x}",
+            context()
         );
         self.bytes[address]
     }
@@ -4335,19 +4347,22 @@ impl Tmem {
     fn read_texel(&self, tile: Tile, x: usize, row: usize, size: u8) -> u32 {
         let base = Self::row_base(tile, row);
         let odd_row = (usize::from(tile.ult) / 4 + row) & 1 != 0;
-        let context = format!("tile at TMEM word {} texel ({x}, {row})", tile.tmem);
+        // Lazy diagnostic: only formatted if a read hits uninitialized TMEM.
+        // `tmem`, `x`, `row` are Copy, so a fresh closure per call is free.
+        let tmem = tile.tmem;
+        let ctx = || format!("tile at TMEM word {tmem} texel ({x}, {row})");
         match size {
             G_IM_SIZ_4B => {
                 let high = x.is_multiple_of(2);
                 let mask = if high { 0xf0 } else { 0x0f };
-                let byte = self.read_byte(base + x / 2, odd_row, mask, &context);
+                let byte = self.read_byte(base + x / 2, odd_row, mask, ctx);
                 u32::from(if high { byte >> 4 } else { byte & 0x0f })
             }
-            G_IM_SIZ_8B => u32::from(self.read_byte(base + x, odd_row, 0xff, &context)),
+            G_IM_SIZ_8B => u32::from(self.read_byte(base + x, odd_row, 0xff, ctx)),
             G_IM_SIZ_16B => {
                 let bytes = [
-                    self.read_byte(base + x * 2, odd_row, 0xff, &context),
-                    self.read_byte(base + x * 2 + 1, odd_row, 0xff, &context),
+                    self.read_byte(base + x * 2, odd_row, 0xff, ctx),
+                    self.read_byte(base + x * 2 + 1, odd_row, 0xff, ctx),
                 ];
                 u32::from(u16::from_be_bytes(bytes))
             }
@@ -4358,10 +4373,10 @@ impl Tmem {
                 );
                 let low = (base + x * 2) & (TMEM_HALF_BYTES - 1);
                 u32::from_be_bytes([
-                    self.read_byte(low, odd_row, 0xff, &context),
-                    self.read_byte(low + 1, odd_row, 0xff, &context),
-                    self.read_byte(low + TMEM_HALF_BYTES, odd_row, 0xff, &context),
-                    self.read_byte(low + TMEM_HALF_BYTES + 1, odd_row, 0xff, &context),
+                    self.read_byte(low, odd_row, 0xff, ctx),
+                    self.read_byte(low + 1, odd_row, 0xff, ctx),
+                    self.read_byte(low + TMEM_HALF_BYTES, odd_row, 0xff, ctx),
+                    self.read_byte(low + TMEM_HALF_BYTES + 1, odd_row, 0xff, ctx),
                 ])
             }
             _ => unreachable!("RDP image size is a two-bit field"),
@@ -4387,10 +4402,10 @@ impl Tmem {
             "CI texel index {index} exceeds the 256-entry TLUT"
         );
         let base = TMEM_HALF_BYTES + index * 8;
-        let context = format!("TLUT index {index}");
+        let ctx = || format!("TLUT index {index}");
         let value = u16::from_be_bytes([
-            self.read_byte(base, false, 0xff, &context),
-            self.read_byte(base + 1, false, 0xff, &context),
+            self.read_byte(base, false, 0xff, ctx),
+            self.read_byte(base + 1, false, 0xff, ctx),
         ]);
         match mode {
             2 => rgba5551_to_rgba8888(value),
@@ -4413,14 +4428,13 @@ impl TmemTexture {
             let base = Tmem::row_base(self.tile, y);
             let odd_row = (usize::from(self.tile.ult) / 4 + y) & 1 != 0;
             let pair = x / 2;
-            let context = format!("YUV tile at TMEM word {} texel ({x}, {y})", self.tile.tmem);
+            let tmem = self.tile.tmem;
+            let ctx = || format!("YUV tile at TMEM word {tmem} texel ({x}, {y})");
             let low = base + pair * 2;
             let high = low + TMEM_HALF_BYTES;
-            let u = self.storage.read_byte(low, odd_row, 0xff, &context);
-            let v = self.storage.read_byte(low + 1, odd_row, 0xff, &context);
-            let luma = self
-                .storage
-                .read_byte(high + (x & 1), odd_row, 0xff, &context);
+            let u = self.storage.read_byte(low, odd_row, 0xff, ctx);
+            let v = self.storage.read_byte(low + 1, odd_row, 0xff, ctx);
+            let luma = self.storage.read_byte(high + (x & 1), odd_row, 0xff, ctx);
             return [luma, u, v, 255];
         }
 
@@ -13697,6 +13711,138 @@ mod tests {
         // texels 8..15 occupy the first, as in Manual Figure 13.8.3.
         assert_eq!(&storage.bytes[8..12], &[0x89, 0xab, 0xcd, 0xef]);
         assert_eq!(&storage.bytes[12..16], &[0x01, 0x23, 0x45, 0x67]);
+    }
+
+    // The read_byte diagnostic context is a lazy `FnOnce() -> String`, so on a
+    // valid TMEM read (the per-texel hot path) the context is never formatted.
+    #[test]
+    fn read_byte_context_closure_is_not_evaluated_on_a_valid_read() {
+        let mut storage = Tmem::default();
+        let tile = Tile {
+            fmt: G_IM_FMT_RGBA,
+            siz: G_IM_SIZ_16B,
+            line: 1,
+            ..Default::default()
+        };
+        // Initialize the byte so the read is valid.
+        storage.write_texel(tile, 0, 0, false, G_IM_SIZ_16B, 0x1122);
+        let evaluated = std::cell::Cell::new(false);
+        let byte = storage.read_byte(0, false, 0xff, || {
+            evaluated.set(true);
+            "should-not-be-built".to_string()
+        });
+        assert_eq!(byte, 0x11);
+        assert!(
+            !evaluated.get(),
+            "diagnostic context must not be formatted on a valid read"
+        );
+    }
+
+    fn panic_text(f: impl FnOnce()) -> String {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .expect_err("operation did not panic");
+        match payload.downcast::<String>() {
+            Ok(text) => *text,
+            Err(payload) => match payload.downcast::<&'static str>() {
+                Ok(text) => (*text).to_owned(),
+                Err(_) => panic!("panic payload was not text"),
+            },
+        }
+    }
+
+    #[test]
+    fn lazy_context_preserves_exact_uninitialized_read_diagnostics() {
+        let storage = Tmem::default();
+        assert_eq!(
+            panic_text(|| {
+                let _ = storage.read_byte(0, false, 0xff, || "diag-marker-42".to_owned());
+            }),
+            "assertion `left == right` failed: diag-marker-42 reads uninitialized TMEM bits at byte 0x000\n  left: 0\n right: 255"
+        );
+
+        let tile = Tile {
+            fmt: G_IM_FMT_RGBA,
+            siz: G_IM_SIZ_16B,
+            line: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            panic_text(|| {
+                let _ = storage.read_texel(tile, 3, 0, G_IM_SIZ_16B);
+            }),
+            "assertion `left == right` failed: tile at TMEM word 0 texel (3, 0) reads uninitialized TMEM bits at byte 0x006\n  left: 0\n right: 255"
+        );
+        assert_eq!(
+            panic_text(|| {
+                let _ = storage.read_tlut(7, 2);
+            }),
+            "assertion `left == right` failed: TLUT index 7 reads uninitialized TMEM bits at byte 0x838\n  left: 0\n right: 255"
+        );
+
+        let yuv = TmemTexture {
+            storage: std::rc::Rc::new(Tmem::default()),
+            tile: Tile {
+                fmt: G_IM_FMT_YUV,
+                siz: G_IM_SIZ_16B,
+                line: 1,
+                tmem: 3,
+                ..Default::default()
+            },
+            texture_lut: 0,
+        };
+        assert_eq!(
+            panic_text(|| {
+                let _ = yuv.sample(2, 4);
+            }),
+            "assertion `left == right` failed: YUV tile at TMEM word 3 texel (2, 4) reads uninitialized TMEM bits at byte 0x03a\n  left: 0\n right: 255"
+        );
+    }
+
+    #[test]
+    fn lazy_context_preserves_all_read_texel_values() {
+        let mut storage = Tmem::default();
+        let i4 = Tile {
+            fmt: G_IM_FMT_I,
+            siz: G_IM_SIZ_4B,
+            line: 1,
+            ..Default::default()
+        };
+        storage.write_texel(i4, 0, 0, false, G_IM_SIZ_4B, 0x0a);
+        storage.write_texel(i4, 1, 0, false, G_IM_SIZ_4B, 0x05);
+        assert_eq!(storage.read_texel(i4, 0, 0, G_IM_SIZ_4B), 0x0a);
+        assert_eq!(storage.read_texel(i4, 1, 0, G_IM_SIZ_4B), 0x05);
+
+        let mut storage = Tmem::default();
+        let i8 = Tile {
+            fmt: G_IM_FMT_I,
+            siz: G_IM_SIZ_8B,
+            line: 1,
+            ..Default::default()
+        };
+        storage.write_texel(i8, 0, 0, false, G_IM_SIZ_8B, 0xab);
+        assert_eq!(storage.read_texel(i8, 0, 0, G_IM_SIZ_8B), 0xab);
+
+        let mut storage = Tmem::default();
+        let rgba16 = Tile {
+            fmt: G_IM_FMT_RGBA,
+            siz: G_IM_SIZ_16B,
+            line: 1,
+            ..Default::default()
+        };
+        storage.write_texel(rgba16, 0, 0, false, G_IM_SIZ_16B, 0xBEEF);
+        storage.write_texel(rgba16, 1, 0, false, G_IM_SIZ_16B, 0xF00D);
+        assert_eq!(storage.read_texel(rgba16, 0, 0, G_IM_SIZ_16B), 0xBEEF);
+        assert_eq!(storage.read_texel(rgba16, 1, 0, G_IM_SIZ_16B), 0xF00D);
+
+        let mut storage = Tmem::default();
+        let rgba32 = Tile {
+            fmt: G_IM_FMT_RGBA,
+            siz: G_IM_SIZ_32B,
+            line: 1,
+            ..Default::default()
+        };
+        storage.write_texel(rgba32, 0, 0, false, G_IM_SIZ_32B, 0x0123_4567);
+        assert_eq!(storage.read_texel(rgba32, 0, 0, G_IM_SIZ_32B), 0x0123_4567);
     }
 
     #[test]
