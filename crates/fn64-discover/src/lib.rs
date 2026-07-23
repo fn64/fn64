@@ -145,6 +145,7 @@ pub mod asm_emit;
 pub mod banks;
 pub mod block_pack;
 pub mod block_proof;
+pub mod boundaries;
 pub mod callgraph_match;
 pub mod cfg;
 pub mod cfg_homology;
