@@ -52,25 +52,23 @@ fn oot_reaches_continuous_frame_loop() {
         .output()
         .expect("failed to launch oot-boot");
 
-    // The harness aborts (SIGABRT) on a thread-local-destructor teardown panic
-    // AFTER printing its summary, so we assert on stdout content, not on the
-    // process exit status (which is unreliable until that teardown is fixed).
+    assert!(
+        output.status.success(),
+        "oot-boot did not complete normal process teardown: {}",
+        output.status
+    );
+
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Prefer the summary line; fall back to counting per-swap progress lines
-    // (the harness prints "swap #N" each swap), since a mid-run abort after
-    // the frame loop may cut off before the summary but the swaps are still
-    // proof of depth.
-    let summary_swaps = combined
+    let swaps = combined
         .lines()
         .find_map(|l| l.strip_prefix("[oot-boot] VI swaps observed: "))
-        .and_then(|n| n.trim().parse::<u64>().ok());
-    let counted_swaps = combined.lines().filter(|l| l.contains("swap #")).count() as u64;
-    let swaps = summary_swaps.unwrap_or(counted_swaps);
+        .and_then(|n| n.trim().parse::<u64>().ok())
+        .expect("normally exited oot-boot omitted its VI summary");
 
     if swaps == 0 {
         panic!(

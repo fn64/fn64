@@ -31,7 +31,6 @@ sha2 = "0.10"
 toml = "0.8"
 
 [dependencies]
-libc = "0.2"
 fn64-runtime = { path = "../../crates/fn64-runtime" }
 fn64-abi = { path = "../../crates/fn64-abi", features = ["recomp-rs"] }
 fn64-boot-harness = { path = "../../crates/fn64-boot-harness", features = ["recomp-rs"] }

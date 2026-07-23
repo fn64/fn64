@@ -280,12 +280,37 @@ impl GameThread {
         }
         result
     }
+
+    /// Detach this thread's native stack at the terminal process-exit boundary.
+    ///
+    /// A started, unfinished guest coroutine can be suspended inside generated
+    /// C and an `extern "C"` ABI shim. `corosensei` normally force-unwinds a
+    /// suspended coroutine from `Drop`, but that unwind cannot cross the
+    /// non-unwind FFI frames and aborts the process. At process exit the OS is
+    /// about to reclaim the stack allocation, so intentionally forgetting
+    /// exactly that coroutine is the only operation performed here. Never-
+    /// started and completed coroutines still take their ordinary `Drop` path.
+    ///
+    /// This is crate-private because it is not guest `osDestroyThread`
+    /// behavior and must only be reached through the executor's terminal host
+    /// shutdown operation.
+    pub(crate) fn detach_for_process_exit(&mut self) -> bool {
+        let Some(coroutine) = self.coroutine.take() else {
+            return false;
+        };
+        let suspended = coroutine.started() && !coroutine.done();
+        if suspended {
+            std::mem::forget(coroutine);
+        }
+        self.state = ThreadState::Dead;
+        suspended
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     #[test]
@@ -349,5 +374,54 @@ mod tests {
         let r2 = t.resume(RunToken::issue(), Resume::Delivered(99));
         assert!(matches!(r2, CoroutineResult::Return(())));
         assert_eq!(*received.borrow(), Some(99));
+    }
+
+    #[test]
+    fn process_exit_detaches_only_a_started_suspended_coroutine() {
+        struct DropProbe(Rc<Cell<bool>>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let never_started_dropped = Rc::new(Cell::new(false));
+        let never_started_probe = DropProbe(never_started_dropped.clone());
+        let mut never_started = GameThread::new(1, 10, move |_yielder, _input| {
+            let _probe = never_started_probe;
+        });
+        assert!(!never_started.detach_for_process_exit());
+        assert!(never_started.is_dead());
+        assert!(never_started_dropped.get());
+
+        let completed_dropped = Rc::new(Cell::new(false));
+        let completed_probe = DropProbe(completed_dropped.clone());
+        let mut completed = GameThread::new(2, 10, move |_yielder, _input| {
+            let _probe = completed_probe;
+        });
+        assert!(matches!(
+            completed.resume(RunToken::issue(), Resume::Start),
+            CoroutineResult::Return(())
+        ));
+        assert!(!completed.detach_for_process_exit());
+        assert!(completed_dropped.get());
+
+        let suspended_dropped = Rc::new(Cell::new(false));
+        let suspended_probe = DropProbe(suspended_dropped.clone());
+        let mut suspended = GameThread::new(3, 10, move |yielder, _input| {
+            let _probe = suspended_probe;
+            yielder.suspend(Yield::PauseSelf);
+        });
+        assert_eq!(
+            suspended.resume(RunToken::issue(), Resume::Start),
+            CoroutineResult::Yield(Yield::PauseSelf)
+        );
+        assert!(suspended.detach_for_process_exit());
+        assert!(suspended.is_dead());
+        assert!(
+            !suspended_dropped.get(),
+            "terminal detach must not unwind stack-owned values across foreign frames"
+        );
     }
 }

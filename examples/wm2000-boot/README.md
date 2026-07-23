@@ -73,6 +73,10 @@ the transactional LLE fallback, not a claim that WM2000 executed in HLE.
    `/tmp/fn64-rt64-post-vi-swap-<n>-present-<id>.png`. It never labels the
    guest framebuffer address as native RT64 output.
 4. Writes the full `TraceEvent` stream to `/tmp/wm2000-boot-trace.jsonl`.
+5. Seals the terminal executor lifecycle after every assertion and trace write.
+   Started guest coroutines still blocked in generated C are detached without
+   an invalid foreign-frame unwind; renderer/audio owners and ordinary Rust
+   values then receive normal process teardown.
 
 `WM2000_NO_DUMP=1` disables PNG output and normally skips RT64 readback setup.
 `WM2000_NO_TRACE=1` also disables PNGs for throughput measurements. Add

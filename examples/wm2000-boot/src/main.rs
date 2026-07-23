@@ -719,6 +719,12 @@ fn main() {
         write_trace_file(&trace, &trace_path);
         println!("[wm2000-boot] trace written to {trace_path}");
     }
+
+    let exit = fn64_abi::prepare_process_exit();
+    println!(
+        "[wm2000-boot] process exit prepared: threads={} detached_coroutines={}",
+        exit.threads, exit.detached_coroutines
+    );
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
