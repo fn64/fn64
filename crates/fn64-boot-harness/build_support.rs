@@ -11,7 +11,10 @@
 //! calls as well as `LOOKUP_FUNC` calls; lookup itself is not misreported as
 //! execution. A caller with a proven bad function partition may explicitly
 //! enable address-contiguous fall-through repair from the generated section
-//! tables; ordinary corpora never receive that transform implicitly.
+//! tables. A generic generated-C host may instead request structurally proven
+//! repair: the transform is enabled only when a reachable predecessor fall-off
+//! has an address-contiguous successor whose generated instructions are a
+//! split stack epilogue. Ordinary adjacent functions do not satisfy that gate.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -211,6 +214,16 @@ fn fallthrough_successors(inl_source: &str) -> BTreeMap<String, String> {
 /// metadata proves an address-contiguous successor and whose emitted body can
 /// actually reach its closing brace. Normal functions end in an explicit
 /// generated `return`, `goto`, or `switch_error` and remain untouched.
+fn body_can_fall_through(body: &str) -> bool {
+    body.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("//"))
+        .is_none_or(|line| {
+            line != "return;" && !line.starts_with("goto ") && !line.starts_with("switch_error(")
+        })
+}
+
 fn mend_proven_fallthroughs(
     source: &str,
     successors: &BTreeMap<String, String>,
@@ -232,16 +245,7 @@ fn mend_proven_fallthroughs(
             .unwrap_or_else(|| panic!("{file_name}: {name}: no `;}}` body close found"));
         let body_end = start + close_relative;
         let body = &rest[start..body_end];
-        let can_fall_through = body
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|line| !line.is_empty() && !line.starts_with("//"))
-            .is_none_or(|line| {
-                line != "return;"
-                    && !line.starts_with("goto ")
-                    && !line.starts_with("switch_error(")
-            });
+        let can_fall_through = body_can_fall_through(body);
 
         output.push_str(&rest[..body_end]);
         if can_fall_through {
@@ -259,6 +263,92 @@ fn mend_proven_fallthroughs(
     }
     output.push_str(rest);
     (output, count)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FallthroughRepair {
+    Disabled,
+    StructurallyProven,
+    Forced,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GeneratedFunctionShape {
+    can_fall_through: bool,
+    is_split_stack_epilogue: bool,
+}
+
+fn generated_function_shapes(
+    source: &str,
+    file_name: &str,
+) -> BTreeMap<String, GeneratedFunctionShape> {
+    let mut shapes = BTreeMap::new();
+    let mut rest = source;
+    const FUNCTION_PREFIX: &str = "RECOMP_FUNC void ";
+
+    while let Some(start) = rest.find(FUNCTION_PREFIX) {
+        let after_prefix = &rest[start + FUNCTION_PREFIX.len()..];
+        let name_end = after_prefix
+            .find('(')
+            .unwrap_or_else(|| panic!("{file_name}: malformed RECOMP_FUNC header"));
+        let name = &after_prefix[..name_end];
+        let close_relative = rest[start..]
+            .find("\n;}")
+            .unwrap_or_else(|| panic!("{file_name}: {name}: no `;}}` body close found"));
+        let body_end = start + close_relative;
+        let body = &rest[start..body_end];
+        let can_fall_through = body_can_fall_through(body);
+
+        let restores_ra = body
+            .lines()
+            .any(|line| line.contains(": lw          $ra,") && line.contains("($sp)"));
+        let saved_register_restores = body
+            .lines()
+            .filter(|line| line.contains(": lw          $s") && line.contains("($sp)"))
+            .count();
+        let returns_through_ra = body.lines().any(|line| line.contains(": jr          $ra"));
+        let advances_sp = body
+            .lines()
+            .any(|line| line.contains(": addiu       $sp, $sp, 0x"));
+        let allocates_stack = body
+            .lines()
+            .any(|line| line.contains(": addiu       $sp, $sp, -0x"));
+        let is_split_stack_epilogue = restores_ra
+            && saved_register_restores > 0
+            && returns_through_ra
+            && advances_sp
+            && !allocates_stack;
+
+        assert!(
+            shapes
+                .insert(
+                    name.to_owned(),
+                    GeneratedFunctionShape {
+                        can_fall_through,
+                        is_split_stack_epilogue,
+                    },
+                )
+                .is_none(),
+            "generated function {name} is defined more than once"
+        );
+        rest = &rest[body_end + 3..];
+    }
+
+    shapes
+}
+
+fn corpus_proves_split_epilogue(
+    successors: &BTreeMap<String, String>,
+    shapes: &BTreeMap<String, GeneratedFunctionShape>,
+) -> bool {
+    successors.iter().any(|(predecessor, successor)| {
+        shapes
+            .get(predecessor)
+            .is_some_and(|shape| shape.can_fall_through)
+            && shapes
+                .get(successor)
+                .is_some_and(|shape| shape.is_split_stack_epilogue)
+    })
 }
 
 fn missing_prototype_prelude(names: &BTreeSet<String>) -> String {
@@ -288,9 +378,29 @@ pub fn prepare_recompiled_cxx_sources(
     out_dir: &Path,
 ) -> (Vec<PathBuf>, usize, usize) {
     let (paths, rewrites, prototypes, fallthroughs) =
-        prepare_recompiled_cxx_sources_inner(recompiled_dir, out_dir, false);
+        prepare_recompiled_cxx_sources_inner(recompiled_dir, out_dir, FallthroughRepair::Disabled);
     assert_eq!(fallthroughs, 0);
     (paths, rewrites, prototypes)
+}
+
+/// Prepare generated C while enabling the section-local fall-through mend
+/// only when the generated corpus proves it contains an answer-key-split
+/// stack epilogue.
+///
+/// The proof requires a predecessor body that can reach its close and an
+/// address-contiguous successor in the same generated section that restores
+/// `$ra` plus at least one saved register, returns through `$ra`, and advances
+/// `$sp` without allocating a new frame. This is the generic host path: a
+/// normal pair of adjacent functions cannot opt itself into the wider repair.
+pub fn prepare_recompiled_cxx_sources_with_proven_fallthrough_repair(
+    recompiled_dir: &Path,
+    out_dir: &Path,
+) -> (Vec<PathBuf>, usize, usize, usize) {
+    prepare_recompiled_cxx_sources_inner(
+        recompiled_dir,
+        out_dir,
+        FallthroughRepair::StructurallyProven,
+    )
 }
 
 /// Prepare generated C while repairing address-proven fragments that the
@@ -303,13 +413,13 @@ pub fn prepare_recompiled_cxx_sources_with_fallthrough_repair(
     recompiled_dir: &Path,
     out_dir: &Path,
 ) -> (Vec<PathBuf>, usize, usize, usize) {
-    prepare_recompiled_cxx_sources_inner(recompiled_dir, out_dir, true)
+    prepare_recompiled_cxx_sources_inner(recompiled_dir, out_dir, FallthroughRepair::Forced)
 }
 
 fn prepare_recompiled_cxx_sources_inner(
     recompiled_dir: &Path,
     out_dir: &Path,
-    repair_fallthroughs: bool,
+    repair_fallthroughs: FallthroughRepair,
 ) -> (Vec<PathBuf>, usize, usize, usize) {
     let mut source_paths: Vec<_> = std::fs::read_dir(recompiled_dir)
         .unwrap_or_else(|error| {
@@ -347,7 +457,7 @@ fn prepare_recompiled_cxx_sources_inner(
             funcs_header_path.display()
         )
     });
-    let successors = if repair_fallthroughs {
+    let mut successors = if repair_fallthroughs != FallthroughRepair::Disabled {
         let table_path = recompiled_dir.join("recomp_overlays.inl");
         let tables = std::fs::read_to_string(&table_path).unwrap_or_else(|error| {
             panic!(
@@ -381,6 +491,24 @@ fn prepare_recompiled_cxx_sources_inner(
             (source_path, source)
         })
         .collect();
+    if repair_fallthroughs == FallthroughRepair::StructurallyProven {
+        let mut shapes = BTreeMap::new();
+        for (source_path, source) in &sources {
+            let file_name = source_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("generated C source filename must be valid Unicode");
+            for (name, shape) in generated_function_shapes(source, file_name) {
+                assert!(
+                    shapes.insert(name.clone(), shape).is_none(),
+                    "generated function {name} is defined more than once"
+                );
+            }
+        }
+        if !corpus_proves_split_epilogue(&successors, &shapes) {
+            successors.clear();
+        }
+    }
     called_names.extend(successors.values().cloned());
     let missing_names: BTreeSet<_> = called_names.difference(&declared_names).cloned().collect();
     let prototype_prelude = missing_prototype_prelude(&missing_names);
@@ -604,6 +732,95 @@ mod tests {
             std::fs::read_to_string(input.join("funcs_0.c")).unwrap(),
             original
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generic_host_repairs_a_section_local_bank_split_epilogue() {
+        let root = std::env::temp_dir().join(format!(
+            "fn64-build-support-proven-bank-fallthrough-{}",
+            std::process::id()
+        ));
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::write(input.join("funcs.h"), "").unwrap();
+        std::fs::write(
+            input.join("recomp_overlays.inl"),
+            concat!(
+                "static FuncEntry section_5[] = {\n",
+                "{ .func = func_8011F000_bank4_text, .offset = 0x100, .rom_size = 0x8 },\n",
+                "{ .func = func_8011F008_bank4_text, .offset = 0x108, .rom_size = 0x10 },\n",
+                "};\n",
+            ),
+        )
+        .unwrap();
+        let original = concat!(
+            "RECOMP_FUNC void func_8011F000_bank4_text(uint8_t* rdram, recomp_context* ctx) {\n",
+            "    ctx->r2 = 7;\n",
+            ";}\n",
+            "RECOMP_FUNC void func_8011F008_bank4_text(uint8_t* rdram, recomp_context* ctx) {\n",
+            "    // 0x8011F008: lw          $ra, 0x14($sp)\n",
+            "    ctx->r31 = MEM_W(ctx->r29, 0X14);\n",
+            "    // 0x8011F00C: lw          $s0, 0x10($sp)\n",
+            "    ctx->r16 = MEM_W(ctx->r29, 0X10);\n",
+            "    // 0x8011F010: jr          $ra\n",
+            "    // 0x8011F014: addiu       $sp, $sp, 0x18\n",
+            "    ctx->r29 = ADD32(ctx->r29, 0X18);\n",
+            "    return;\n",
+            ";}\n",
+        );
+        std::fs::write(input.join("funcs_41.c"), original).unwrap();
+
+        let (paths, _, prototype_count, fallthrough_count) =
+            prepare_recompiled_cxx_sources_with_proven_fallthrough_repair(&input, &output);
+        let repaired = std::fs::read_to_string(&paths[0]).unwrap();
+        assert_eq!(prototype_count, 1);
+        assert_eq!(fallthrough_count, 1);
+        assert!(repaired.contains(
+            "ctx->r2 = 7;\n    // fn64: address-proven generated-fragment fall-through.\n    func_8011F008_bank4_text(rdram, ctx);"
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generic_host_does_not_repair_merely_adjacent_normal_functions() {
+        let root = std::env::temp_dir().join(format!(
+            "fn64-build-support-unproven-fallthrough-{}",
+            std::process::id()
+        ));
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::write(input.join("funcs.h"), "").unwrap();
+        std::fs::write(
+            input.join("recomp_overlays.inl"),
+            concat!(
+                "static FuncEntry section_0[] = {\n",
+                "{ .func = func_80001000, .offset = 0x0, .rom_size = 0x8 },\n",
+                "{ .func = func_80001008, .offset = 0x8, .rom_size = 0x8 },\n",
+                "};\n",
+            ),
+        )
+        .unwrap();
+        let original = concat!(
+            "RECOMP_FUNC void func_80001000(uint8_t* rdram, recomp_context* ctx) {\n",
+            "    ctx->r2 = 7;\n",
+            ";}\n",
+            "RECOMP_FUNC void func_80001008(uint8_t* rdram, recomp_context* ctx) {\n",
+            "    return;\n",
+            ";}\n",
+        );
+        std::fs::write(input.join("funcs_0.c"), original).unwrap();
+
+        let (paths, _, prototype_count, fallthrough_count) =
+            prepare_recompiled_cxx_sources_with_proven_fallthrough_repair(&input, &output);
+        let prepared = std::fs::read_to_string(&paths[0]).unwrap();
+        assert_eq!(prototype_count, 0);
+        assert_eq!(fallthrough_count, 0);
+        assert!(!prepared.contains("func_80001008(rdram, ctx);"));
 
         std::fs::remove_dir_all(root).unwrap();
     }
