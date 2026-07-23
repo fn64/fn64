@@ -2095,19 +2095,16 @@ fn require_committed_full_sync_evidence(
     }
 }
 
-/// Dispatch an audio task (`M_AUDTASK`) once, at the point the RSP is kicked.
-/// Two halves, both symmetric with `dispatch_gfx_task`:
-///  1. Run the registered translated audio ucode (`AUDIO_UCODE_FN`,
-///     `set_audio_ucode_fn`) with `(rdram, task_offset)` -- `o` is the OSTask's
-///     rdram OFFSET, which the recompiled ucode's FFI wrapper uses to seed RSP
-///     DMEM[0xFC0] (`osSpTaskLoad` pre-loads the 64-byte OSTask there; aspMain's
-///     first act is `lw 0x18(0xFC0)` = read `ucode_data`). No ucode registered -> the
-///     task is still counted by the caller's `submit_task`, honestly reflecting
-///     "submitted but this process never ran its ucode."
-///  2. Sample delivery happens later at `osAiSetNextBuffer_recomp`, the public
-///     AI DMA boundary where the CPU names the actual finished PCM range. It
-///     cannot happen here: OoT's live task has zero `OSTask.output_buff`
-///     fields and selects output destinations through `A_SAVEBUFF` commands.
+/// Dispatch a translated audio task (`M_AUDTASK`) once, at the point the RSP
+/// is kicked. `o` is the OSTask's RDRAM offset, which the translated ucode's
+/// FFI wrapper uses to seed RSP DMEM[0xFC0]. Missing execution policy and every
+/// callback result other than RSP BREAK trap before completion or an
+/// execution-qualified task trace can be produced.
+///
+/// Sample delivery happens later at `osAiSetNextBuffer_recomp`, the public AI
+/// DMA boundary where the CPU names the actual finished PCM range. It cannot
+/// happen here: OoT's live task has zero `OSTask.output_buff` fields and
+/// selects output destinations through `A_SAVEBUFF` commands.
 ///
 /// This runs only from `osSpTaskStartGo_recomp`, the Load+StartGo path OoT's
 /// audio driver uses (`AudioMgr_HandleRetrace` -> scheduler -> `Sched_RunTask`
@@ -2118,88 +2115,49 @@ fn require_committed_full_sync_evidence(
 /// # Safety
 /// `rdram` valid for the call; `o` a valid task-header offset within it and
 /// `header` the task header read from that offset.
-unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
+unsafe fn dispatch_audio_task(
+    rdram: *mut u8,
+    o: usize,
+    header: &OsTaskHeader,
+    callback: AudioUcodeFn,
+) {
     debug_assert_eq!(header.task_type, M_AUDTASK);
     // Before PHASE_TIMING's thread_local initializer reads the NEW name: a run
     // that set only the old spelling must trap here, not silently proceed.
     assert_no_legacy_env_vars();
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
-    // Debug/perf escape hatch: `FN64_SKIP_AUDIO_UCODE` skips running the
-    // recompiled audio ucode (the per-frame RSP synth, currently unoptimized
-    // and the dominant per-swap cost). The CPU-side audio driver
-    // (AudioThread_UpdateImpl) and this task's completion event still run, so
-    // the audio-reset handshake that unblocks Play_Init still completes -- the
-    // ucode only produces the actual samples. Use it to iterate on the RENDERER
-    // at normal boot speed; a real audio run must NOT set it. No sound when set.
-    // Diagnostic: dump the exact rdram + task offset of one audio task so the
-    // recompiled ucode can be replayed offline against the real command list.
-    // `FN64_DUMP_AUDIO_TASK_INDEX` is one-based and defaults to the first task;
-    // use a later task to capture audible music instead of startup silence.
-    if let Some(path) = std::env::var_os("FN64_DUMP_AUDIO_TASK") {
-        let target_index = std::env::var("FN64_DUMP_AUDIO_TASK_INDEX")
-            .ok()
-            .map(|raw| {
-                raw.parse::<u64>().unwrap_or_else(|_| {
-                    panic!("FN64_DUMP_AUDIO_TASK_INDEX must be a positive integer, got {raw:?}")
-                })
-            })
-            .unwrap_or(1);
-        assert!(
-            target_index != 0,
-            "FN64_DUMP_AUDIO_TASK_INDEX is one-based; got 0"
+    // Phase timing measures the translated audio ucode (the per-frame RSP
+    // synth, currently unoptimized and the dominant per-swap cost).
+    // The shared task dump happens before policy dispatch in
+    // `osSpTaskStartGo_recomp`, so translated and LLE tasks expose the same
+    // immutable input boundary.
+    //
+    // The CPU-side audio driver (AudioThread_UpdateImpl) and this task's
+    // completion event still run, so the audio-reset handshake that unblocks
+    // Play_Init still completes.
+    // Safety: translated registration atomically pairs this callback with its
+    // process-lifetime evidence identity. `o` is the admitted OSTask offset.
+    let reason = if AUDIO_UCODE_TIMING.with(|c| c.get()) {
+        let t = std::time::Instant::now();
+        let reason = unsafe { callback(rdram, o as u32) };
+        let ns = t.elapsed().as_nanos() as u64;
+        AUDIO_UCODE_NS.with(|c| c.set(c.get() + ns));
+        AUDIO_UCODE_CALLS.with(|c| c.set(c.get() + 1));
+        reason
+    } else {
+        unsafe { callback(rdram, o as u32) }
+    };
+    if reason != 0 {
+        fn64_runtime::record_unsupported_event(
+            fn64_runtime::UnsupportedSubsystem::Audio,
+            "audio.translated-ucode.exit-reason",
+            format!("task_offset={o:#010x} exit_reason={reason}"),
+            Some(fn64_runtime::Cycles::new(crate::sim_time())),
+            fn64_runtime::UnsupportedDisposition::LoudTrap,
         );
-        AUDIO_TASK_DUMP.with(|dump| {
-            let mut state = dump.get();
-            state.seen = state.seen.saturating_add(1);
-            if !state.dumped && state.seen == target_index {
-                let mut rdram_len = AUDIO_RDRAM_LEN.with(|cell| cell.get());
-                if rdram_len == 0 {
-                    rdram_len = RDRAM_LEN.with(|cell| cell.get());
-                }
-                // The harness allocation includes a sparse MMIO/non-RDRAM
-                // window hundreds of MiB above physical RDRAM. Audio ucode masks DMA
-                // addresses to the N64's physical RDRAM window, so replay only
-                // needs the real 8 MiB image; dumping the whole host mapping
-                // made one diagnostic task capture 656 MiB.
-                rdram_len = rdram_len.min(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE);
-                if rdram_len > 0 {
-                    let bytes = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
-                    let p = std::path::Path::new(&path);
-                    let _ = std::fs::write(p, bytes);
-                    let meta =
-                        format!("task_offset={o}\nrdram_len={rdram_len}\ntask_index={}\n", state.seen);
-                    let _ = std::fs::write(p.with_extension("meta"), meta);
-                    eprintln!("[fn64-abi] dumped audio task #{} rdram ({rdram_len} B) + task_offset={o} to {path:?}", state.seen);
-                }
-                state.dumped = true;
-            }
-            dump.set(state);
-        });
-    }
-    let skip_ucode = std::env::var_os("FN64_SKIP_AUDIO_UCODE").is_some();
-    if !skip_ucode {
-        AUDIO_UCODE_FN.with(|cell| {
-            if let Some(f) = cell.get() {
-                // Safety: `set_audio_ucode_fn`'s doc comment is the contract --
-                // `f` must be the real translated ucode function. See this
-                // function's doc comment for why `o` (the OSTask rdram offset) is
-                // the second argument, and `AudioUcodeFn`'s doc comment for the
-                // widened meaning.
-                if AUDIO_UCODE_TIMING.with(|c| c.get()) {
-                    let t = std::time::Instant::now();
-                    unsafe {
-                        f(rdram, o as u32);
-                    }
-                    let ns = t.elapsed().as_nanos() as u64;
-                    AUDIO_UCODE_NS.with(|c| c.set(c.get() + ns));
-                    AUDIO_UCODE_CALLS.with(|c| c.set(c.get() + 1));
-                } else {
-                    unsafe {
-                        f(rdram, o as u32);
-                    }
-                }
-            }
-        });
+        panic!(
+            "audio.translated-ucode.exit-reason: task {o:#010x} returned non-BREAK reason {reason}"
+        );
     }
     if let Some(started) = started {
         AUDIO_DISPATCH_NS.with(|total| {
@@ -2211,6 +2169,76 @@ unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
         });
         AUDIO_DISPATCH_CALLS.with(|calls| calls.set(calls.get() + 1));
     }
+}
+
+/// Capture one immutable audio-task input before translated or LLE execution.
+///
+/// The output is private diagnostic material and remains outside git. Keeping
+/// this at the common task-kick boundary makes a capture independent of the
+/// installed execution policy, which is required for later LLE/HLE replay.
+///
+/// # Safety
+/// `rdram` must cover the registered process RDRAM length, and `task_offset`
+/// must name the admitted `OSTask` inside it.
+unsafe fn maybe_dump_audio_task_input(rdram: *mut u8, task_offset: usize) {
+    let Some(path) = std::env::var_os("FN64_DUMP_AUDIO_TASK") else {
+        return;
+    };
+    let target_index = std::env::var("FN64_DUMP_AUDIO_TASK_INDEX")
+        .ok()
+        .map(|raw| {
+            raw.parse::<u64>().unwrap_or_else(|_| {
+                panic!("FN64_DUMP_AUDIO_TASK_INDEX must be a positive integer, got {raw:?}")
+            })
+        })
+        .unwrap_or(1);
+    assert!(
+        target_index != 0,
+        "FN64_DUMP_AUDIO_TASK_INDEX is one-based; got 0"
+    );
+    AUDIO_TASK_DUMP.with(|dump| {
+        let mut state = dump.get();
+        state.seen = state.seen.saturating_add(1);
+        if !state.dumped && state.seen == target_index {
+            let (registered_rdram, registered_len) =
+                with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+            assert_eq!(
+                registered_rdram, rdram,
+                "FN64_DUMP_AUDIO_TASK task pointer does not match registered process RDRAM"
+            );
+            let rdram_len = fn64_runtime::rdram::DEFAULT_RDRAM_SIZE;
+            assert!(
+                registered_len >= rdram_len,
+                "FN64_DUMP_AUDIO_TASK registered process RDRAM is {registered_len:#x} bytes; \
+                 physical capture requires {rdram_len:#x}"
+            );
+            assert!(
+                task_offset
+                    .checked_add(core::mem::size_of::<OsTaskHeader>())
+                    .is_some_and(|end| end <= rdram_len),
+                "FN64_DUMP_AUDIO_TASK task offset {task_offset:#x} is outside physical RDRAM"
+            );
+            let bytes = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
+            let path = std::path::Path::new(&path);
+            std::fs::write(path, bytes).unwrap_or_else(|error| {
+                panic!("write private audio task capture {path:?}: {error}")
+            });
+            let meta = format!(
+                "task_offset={task_offset}\nrdram_len={rdram_len}\ntask_index={}\n",
+                state.seen
+            );
+            let meta_path = path.with_extension("meta");
+            std::fs::write(&meta_path, meta).unwrap_or_else(|error| {
+                panic!("write private audio task metadata {meta_path:?}: {error}")
+            });
+            eprintln!(
+                "[fn64-abi] dumped audio task #{} input ({rdram_len} B, task_offset={task_offset}) to {path:?}",
+                state.seen
+            );
+            state.dumped = true;
+        }
+        dump.set(state);
+    });
 }
 
 /// `osSpTaskYielded(OSTask *task) -> OSYieldResult` observes the public RSP
@@ -3098,10 +3126,11 @@ pub unsafe extern "C" fn osSpTaskLoad_recomp(rdram: *mut u8, ctx: *mut RecompCon
 ///
 /// This crate classifies boot-overlay versus direct-IMEM admission. It either
 /// executes rspboot through its IMEM-DMA handoff or enters the already-loaded
-/// image at PC zero, then runs the selected task effect (audio HLE, or the
-/// graphics policy's HLE/LLE ucode phase) synchronously while the shim owns
-/// the guest. Its externally visible completion is scheduled separately, with
-/// measured pre-ucode work included in SP latency. What a real
+/// image at PC zero, then runs the selected task effect (audio translated/LLE
+/// execution, or the graphics policy's HLE/LLE ucode phase) synchronously
+/// while the shim owns the guest. Its externally visible completion is
+/// scheduled separately, with measured pre-ucode work included in SP latency.
+/// What a real
 /// `osSpTaskStartGo` DOES have that this stub was missing: kicking the RSP
 /// eventually raises the SP-done interrupt (and, for a task that drives the
 /// RDP to a `DPFullSync`, the DP-done interrupt), which libultra delivers
@@ -3140,6 +3169,11 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     let o = task_addr.offset() as usize;
     let header = loaded.header;
     let is_gfx = header.task_type == M_GFXTASK;
+    let audio_policy = (header.task_type == M_AUDTASK)
+        .then(|| require_audio_task_execution_policy(task_addr, &header));
+    if header.task_type == M_AUDTASK {
+        unsafe { maybe_dump_audio_task_input(rdram, o) };
+    }
     let recognition_header = if header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
         with_host(|host| {
             host.rsp_task_lineages

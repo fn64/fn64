@@ -89,7 +89,9 @@ if both buzz, continue upstream at AI decoding/RSP synthesis.
 For task-level RSP replay, set `FN64_DUMP_AUDIO_TASK=/tmp/fn64-task.rdram`.
 By default this captures the first submitted audio task; use one-based
 `FN64_DUMP_AUDIO_TASK_INDEX=N` to capture the task aligned with a later audible
-event. The sidecar records `task_offset`, `task_index`, and `rdram_len`.
+event. Capture occurs at the common task-kick boundary before either translated
+or live-image LLE execution, so both policies expose the same immutable task
+input. The sidecar records `task_offset`, `task_index`, and `rdram_len`.
 Pair it with `FN64_TRACE_AI_BUFFERS=1` when checking whether the AI consumes the
 same RDRAM address/length range the replayed task's `A_SAVEBUFF` commands
 produced.
