@@ -13,12 +13,15 @@ the device fabric. `osAiSetNextBuffer` later identifies the PCM range consumed
 by AI. An HLE task therefore cannot be modeled as an immutable RDRAM input that
 returns a `Vec<i16>`: its result is a transactional set of machine effects.
 
-The HLE foundation has two independent pieces:
+The HLE foundation has three independent pieces:
 
 - `hle.rs` validates and iterates family-neutral 8-byte command framing without
   assigning semantics to an unknown family.
 - `hle_outcome.rs` models the complete candidate task effect and compares it to
   the LLE effect in a stable first-divergence order.
+- `hle_transaction.rs` owns checked 4 KiB DMEM and a logical-byte,
+  copy-on-write RDRAM overlay. It produces canonical patches without mutating
+  the live task input.
 
 The standard ABI decoder is a separate layer. Possessing a valid standard
 packet does not prove that the loaded microcode implements that packet family.
@@ -37,6 +40,14 @@ pole-filter arithmetic. They also do not prove that a game image is stock
 `aspMain`, `n_aspMain`, or a modified derivative. Fn64 will establish those
 details through same-snapshot differential execution against its existing
 clean-room LLE path. No GPL runtime implementation is an input to this work.
+
+The non-DSP commands also retain an evidence frontier. The public patent
+describes SETBUFF/CLEARBUFF counts as 16-bit samples, while the released
+`abi.h` does not name units and its CLEARBUFF, DMEMMOVE, and LOADADPCM macros
+pack wider fields than their C structs name. Exact count units, DMA
+alignment/rounding, zero-count behavior, DMEM wrap, move overlap, segment-table
+initialization/persistence, and codebook/loop-state lifetime therefore remain
+LLE differential questions rather than assumptions.
 
 ## Admission and transaction
 
@@ -64,6 +75,13 @@ divergence is a typed loud frontier. A future optimized production policy may
 fall back transactionally to untouched LLE only when that fallback is explicit
 in the installed per-ROM policy and its evidence records the disposition.
 
+The first differential implementation will materialize only the physical
+8 MiB RDRAM device for each lane. An audio task that requires a sparse
+host/static alias outside physical RDRAM remains a loud frontier until the RSP
+memory owner supports segmented copy-on-write storage. Speculative lanes do not
+notify executable writes, submit DPC work, schedule completion, or touch live
+device state; those effects occur once after comparison.
+
 ## Work sequence
 
 1. **Framing and outcomes** — complete the allocation-free command view,
@@ -87,6 +105,13 @@ Each deterministic behavior claim requires ten consecutive clean runs. A
 runtime synchronization change requires at least twenty and a comment naming
 the closed interleaving. Private ROM-derived captures remain outside git; only
 hand-authored public fixtures and non-content evidence belong in the tree.
+
+The first memory-command differential matrix varies counts around
+`0,1,2,7,8,15,16,17`, all low-three/low-four address alignments, both
+DMEMMOVE overlap directions and exact aliasing, segment zero/nonzero and
+base-plus-offset overflow, repeated SETBUFF with `A_AUX`, partial/oversized
+codebook reloads, and SETLOOP pointer mutation before looped ADPCM. Paired
+tasks establish whether any command state survives a task boundary.
 
 ## Release frontier
 
