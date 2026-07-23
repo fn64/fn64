@@ -22,14 +22,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    FramebufferObservationSource, ObservationEvidenceError, ReleaseCartridgeSave,
-    ReleaseControllerPort, ReleaseEnvironmentEvidence, ReleaseGraphicsApi,
+    FramebufferObservationSource, ObservationEvidenceError, ReleaseAudioTaskExecutionPolicy,
+    ReleaseCartridgeSave, ReleaseControllerPort, ReleaseEnvironmentEvidence, ReleaseGraphicsApi,
     ReleaseGraphicsExecutionPolicy, ReleaseHostPlatform, ReleaseObservationGeometry,
     ReleaseRendererEvidence, ReleaseWindowsFamily, ReleaseWindowsProductType,
     ReleaseWindowsVersionEvidence,
 };
 
-pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v23";
+pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v25";
 
 /// Provenance class declared for a ROM input. The N64 header does not encode
 /// whether otherwise-valid bytes came from a retail cartridge or a public
@@ -1866,11 +1866,28 @@ fn environment_from_frozen(
             replacement_packs_active,
         },
     };
+    let audio_task_execution = match host.audio_task_execution {
+        fn64_abi::AudioTaskExecutionPolicy::Unconfigured => {
+            ReleaseAudioTaskExecutionPolicy::Unconfigured
+        }
+        fn64_abi::AudioTaskExecutionPolicy::Translated { artifact_sha256 } => {
+            ReleaseAudioTaskExecutionPolicy::Translated {
+                artifact_sha256: hex(&artifact_sha256),
+            }
+        }
+        fn64_abi::AudioTaskExecutionPolicy::LleAccuracy => {
+            ReleaseAudioTaskExecutionPolicy::LleAccuracy
+        }
+        fn64_abi::AudioTaskExecutionPolicy::DiagnosticSkip => {
+            ReleaseAudioTaskExecutionPolicy::DiagnosticSkip
+        }
+    };
     Ok(ReleaseEnvironmentEvidence {
         platform,
         windows_version,
         controller_ports,
         cartridge_save,
+        audio_task_execution,
         renderer,
     })
 }
@@ -1944,6 +1961,19 @@ fn validate_environment_evidence(
             }
         }
     }
+    match &environment.audio_task_execution {
+        ReleaseAudioTaskExecutionPolicy::LleAccuracy => {}
+        ReleaseAudioTaskExecutionPolicy::Translated { artifact_sha256 } => {
+            decode_sha256(artifact_sha256).ok_or(GateError::InvalidReportSha256(
+                "environment.audio_task_execution.artifact_sha256",
+            ))?;
+            return Err(GateError::NonAccuracyAudioTaskPolicy);
+        }
+        ReleaseAudioTaskExecutionPolicy::Unconfigured
+        | ReleaseAudioTaskExecutionPolicy::DiagnosticSkip => {
+            return Err(GateError::NonAccuracyAudioTaskPolicy);
+        }
+    }
     if let ReleaseRendererEvidence::Rt64 {
         graphics_api,
         backend_identity,
@@ -2013,6 +2043,7 @@ fn test_release_environment(
             ReleaseControllerPort::Absent,
         ],
         cartridge_save: ReleaseCartridgeSave::NoCartridgeSave,
+        audio_task_execution: ReleaseAudioTaskExecutionPolicy::LleAccuracy,
         renderer,
     }
 }
@@ -2254,7 +2285,7 @@ impl ReleaseGateReport {
         )
     }
 
-    /// Recompute the schema-v23 evidence digest after loading a retained JSON
+    /// Recompute the schema-v25 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {
@@ -2465,6 +2496,7 @@ pub enum GateError {
     UnidentifiedCartridgeSave,
     UnidentifiedRenderBackend,
     NonAccuracyRenderPolicy,
+    NonAccuracyAudioTaskPolicy,
     InvalidWindowsVersionEvidence(&'static str),
     RendererObservationMismatch(&'static str),
     InvalidViBoundary(crate::ViBoundaryError),
@@ -2788,6 +2820,10 @@ impl fmt::Display for GateError {
                 f,
                 "live release evidence requires GraphicsTaskExecutionPolicy::LleAccuracy"
             ),
+            Self::NonAccuracyAudioTaskPolicy => write!(
+                f,
+                "live release evidence requires AudioTaskExecutionPolicy::LleAccuracy"
+            ),
             Self::InvalidWindowsVersionEvidence(detail) => {
                 write!(f, "invalid Windows release identity: {detail}")
             }
@@ -3073,6 +3109,10 @@ fn encode_guest_device_snapshot(out: &mut Vec<u8>, snapshot: DeviceSnapshot) {
         snapshot.dpc_end,
         snapshot.dpc_current,
         snapshot.dpc_status,
+        snapshot.dpc_clock,
+        snapshot.dpc_busy,
+        snapshot.dpc_pipe_busy,
+        snapshot.dpc_tmem_busy,
     ] {
         push_u32(out, value);
     }
@@ -3712,6 +3752,15 @@ fn encode_abi_host(out: &mut Vec<u8>, snapshot: fn64_abi::AbiHostEvidenceSnapsho
             fn64_abi::RspTaskLineagePhaseEvidenceSnapshot::ResumeLoaded => 2,
         });
     }
+    match snapshot.audio_task_execution {
+        fn64_abi::AudioTaskExecutionPolicy::Unconfigured => out.push(0),
+        fn64_abi::AudioTaskExecutionPolicy::Translated { artifact_sha256 } => {
+            out.push(1);
+            out.extend_from_slice(&artifact_sha256);
+        }
+        fn64_abi::AudioTaskExecutionPolicy::LleAccuracy => out.push(2),
+        fn64_abi::AudioTaskExecutionPolicy::DiagnosticSkip => out.push(3),
+    }
     out.push(snapshot.rom_installed as u8);
     match snapshot.installed_rom {
         Some(rom) => {
@@ -3878,7 +3927,7 @@ fn encode_device_snapshot(
     program: crate::ProgramEvidenceSnapshot,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 * 1024 + snapshot.save_bytes.as_ref().map_or(0, Vec::len));
-    out.extend_from_slice(b"fn64.device-evidence.v10\0");
+    out.extend_from_slice(b"fn64.device-evidence.v12\0");
     encode_guest_device_snapshot(&mut out, snapshot.guest);
     push_bytes(&mut out, &snapshot.pi_timing_policy);
 
@@ -4675,6 +4724,17 @@ pub(crate) fn encode_report_evidence(report: &ReleaseGateReport) -> Result<Vec<u
         ReleaseCartridgeSave::Sram32Kib => 3,
         ReleaseCartridgeSave::FlashRam128Kib => 4,
     });
+    match &report.environment.audio_task_execution {
+        ReleaseAudioTaskExecutionPolicy::Unconfigured => out.push(0),
+        ReleaseAudioTaskExecutionPolicy::Translated { artifact_sha256 } => {
+            out.push(1);
+            out.extend_from_slice(&decode_sha256(artifact_sha256).ok_or(
+                GateError::InvalidReportSha256("environment.audio_task_execution.artifact_sha256"),
+            )?);
+        }
+        ReleaseAudioTaskExecutionPolicy::LleAccuracy => out.push(2),
+        ReleaseAudioTaskExecutionPolicy::DiagnosticSkip => out.push(3),
+    }
     match &report.environment.renderer {
         ReleaseRendererEvidence::Reference {
             execution_policy, ..
@@ -4942,6 +5002,10 @@ mod tests {
                 dpc_end: 0x180,
                 dpc_current: 0x180,
                 dpc_status: 0,
+                dpc_clock: 0,
+                dpc_busy: 0,
+                dpc_pipe_busy: 0,
+                dpc_tmem_busy: 0,
                 pending_dpc: None,
                 mi_pending: 8,
                 mi_mask: 8,
@@ -5471,17 +5535,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_v23_fixed_cycle_digest_is_stable_and_complete() {
+    fn schema_v25_fixed_cycle_digest_is_stable_and_complete() {
         assert_eq!(complete_digest(), complete_digest());
         assert_eq!(complete_digest().artifacts.len(), 5);
         assert_eq!(
             complete_digest().root_sha256,
-            "20bbd97ab01691b75a884ecda3bec510a5f1f106509082ab071b14d60859361e"
+            "80693cc62aadeafaaf81c0e54888463b83f48f5be769e9a3fb426d2aa6eae64b"
         );
     }
 
     #[test]
-    fn schema_v23_report_wire_binds_rom_identity_class_and_tv_authorities() {
+    fn schema_v25_report_wire_binds_rom_identity_class_and_tv_authorities() {
         let input = test_rom(b'E');
         let geometry = observations();
         let rom =
@@ -5647,6 +5711,21 @@ mod tests {
             "DPC STATUS register",
             |value: &mut DeviceEvidenceSnapshot| { value.guest.dpc_status ^= 1 }
         );
+        changed!(
+            "DPC CLOCK register",
+            |value: &mut DeviceEvidenceSnapshot| { value.guest.dpc_clock ^= 1 }
+        );
+        changed!(
+            "DPC BUFBUSY register",
+            |value: &mut DeviceEvidenceSnapshot| { value.guest.dpc_busy ^= 1 }
+        );
+        changed!(
+            "DPC PIPEBUSY register",
+            |value: &mut DeviceEvidenceSnapshot| { value.guest.dpc_pipe_busy ^= 1 }
+        );
+        changed!("DPC TMEM register", |value: &mut DeviceEvidenceSnapshot| {
+            value.guest.dpc_tmem_busy ^= 1
+        });
         changed!(
             "guest pending DPC token",
             |value: &mut DeviceEvidenceSnapshot| {
@@ -6123,7 +6202,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v10_wire_binds_executor_and_abi_host_families() {
+    fn device_state_v12_wire_binds_executor_and_abi_host_families() {
         use fn64_runtime::{
             EventRegistrationEvidenceSnapshot, ExecutorQueueEvidenceSnapshot,
             ExecutorRunningEvidenceSnapshot, MesgQueueEvidenceSnapshot,
@@ -6135,6 +6214,14 @@ mod tests {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let host = host_snapshot();
+        let encoded = encode_device_snapshot(
+            device.clone(),
+            executor.clone(),
+            host.clone(),
+            crate::ProgramEvidenceSnapshot::NoProgram,
+        );
+        assert!(encoded.starts_with(b"fn64.device-evidence.v12\0"));
+        assert!(!encoded.starts_with(b"fn64.device-evidence.v11\0"));
         let baseline = sha256_hex(&encode_device_snapshot(
             device.clone(),
             executor.clone(),
@@ -6154,7 +6241,7 @@ mod tests {
                         crate::ProgramEvidenceSnapshot::NoProgram,
                     )),
                     baseline,
-                    "device-state-v9 evidence omitted executor family {}",
+                    "device-state-v12 evidence omitted executor family {}",
                     $name
                 );
             }};
@@ -6254,7 +6341,7 @@ mod tests {
                         crate::ProgramEvidenceSnapshot::NoProgram,
                     )),
                     baseline,
-                    "device-state-v9 evidence omitted ABI HostState family {}",
+                    "device-state-v12 evidence omitted ABI HostState family {}",
                     $name
                 );
             }};
@@ -6438,7 +6525,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v10_wire_distinguishes_rsp_task_lineage_phases() {
+    fn device_state_v12_wire_distinguishes_rsp_task_lineage_phases() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let digest = |phase| {
@@ -6477,7 +6564,38 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v10_wire_distinguishes_native_program_classes_and_identity() {
+    fn device_state_v12_wire_distinguishes_every_audio_execution_policy() {
+        let digest = |policy| {
+            let mut host = host_snapshot();
+            host.audio_task_execution = policy;
+            sha256_hex(&encode_device_snapshot(
+                snapshot(42),
+                executor_snapshot(),
+                host,
+                crate::ProgramEvidenceSnapshot::NoProgram,
+            ))
+        };
+
+        let digests = [
+            digest(fn64_abi::AudioTaskExecutionPolicy::Unconfigured),
+            digest(fn64_abi::AudioTaskExecutionPolicy::Translated {
+                artifact_sha256: [0x11; 32],
+            }),
+            digest(fn64_abi::AudioTaskExecutionPolicy::Translated {
+                artifact_sha256: [0x22; 32],
+            }),
+            digest(fn64_abi::AudioTaskExecutionPolicy::LleAccuracy),
+            digest(fn64_abi::AudioTaskExecutionPolicy::DiagnosticSkip),
+        ];
+        for left in 0..digests.len() {
+            for right in (left + 1)..digests.len() {
+                assert_ne!(digests[left], digests[right]);
+            }
+        }
+    }
+
+    #[test]
+    fn device_state_v12_wire_distinguishes_native_program_classes_and_identity() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let host = host_snapshot();
@@ -6507,7 +6625,7 @@ mod tests {
 
     #[cfg(feature = "recomp-rs")]
     #[test]
-    fn device_state_v10_wire_binds_typed_program_identity_and_dynamic_state() {
+    fn device_state_v12_wire_binds_typed_program_identity_and_dynamic_state() {
         use fn64_abi::recompiled::{
             LiveExecutableRegionEvidenceSnapshot, PendingExecutableWriteEvidenceSnapshot,
             RecompiledProgramEvidenceSnapshot,
@@ -6940,7 +7058,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v23_report_wire_binds_every_release_environment_field() {
+    fn schema_v25_report_wire_binds_every_release_environment_field() {
         let report = ReleaseGateReport::new(
             "environment-wire",
             b"input",
@@ -7263,6 +7381,7 @@ mod tests {
             windows_version: crate::test_release_windows_version(),
             controller_ports: [ReleaseControllerPort::Absent; 4],
             cartridge_save: ReleaseCartridgeSave::NoCartridgeSave,
+            audio_task_execution: ReleaseAudioTaskExecutionPolicy::LleAccuracy,
             renderer: ReleaseRendererEvidence::Rt64 {
                 execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
                 tv_type: ReleaseTvStandard::Ntsc,
@@ -7800,7 +7919,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v23_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
+    fn schema_v25_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
         let geometry = observations();
         let graphics_closure = vec![ClosurePath {
             name: "rsp.graphics-task".to_owned(),

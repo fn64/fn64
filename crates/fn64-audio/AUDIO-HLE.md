@@ -13,7 +13,7 @@ the device fabric. `osAiSetNextBuffer` later identifies the PCM range consumed
 by AI. An HLE task therefore cannot be modeled as an immutable RDRAM input that
 returns a `Vec<i16>`: its result is a transactional set of machine effects.
 
-The HLE foundation has four independent pieces:
+The HLE foundation has seven independent pieces:
 
 - `hle.rs` validates and iterates family-neutral 8-byte command framing without
   assigning semantics to an unknown family.
@@ -28,6 +28,20 @@ The HLE foundation has four independent pieces:
   non-memory state, canonical low-12 SP PC, and rspboot work. HLE receives
   logical transactional access; only a consumed LLE lane exposes native
   backing.
+- `hle_lle.rs` consumes that isolated native lane and executes the loaded
+  image through BREAK without access to the live device fabric, renderer,
+  executable-write notifier, scheduler, interrupts, or timing. It returns
+  complete final RSP state, exact written RDRAM coverage and logical patches,
+  and deferred raw DPC submissions for later comparison and one-time commit.
+- `hle_rspboot.rs` owns physical RDRAM and RSP memory while it executes the
+  boot overlay to the first instruction of the image that overlay installed.
+  It returns the neutral entry snapshot plus exact boot-phase RDRAM patches
+  and ordered IMEM replacements; direct-IMEM and static-alias tasks remain
+  typed loud frontiers.
+- `hle_commit.rs` consumes matching LLE/HLE ucode-phase outcomes into a
+  non-cloneable commit authority. The ABI adapter can publish the empty-DPC
+  ucode phase once; boot-phase patches are deliberately not part of that
+  authority yet.
 
 The standard ABI decoder is a separate layer. Possessing a valid standard
 packet does not prove that the loaded microcode implements that packet family.
@@ -89,12 +103,19 @@ notify executable writes, submit DPC work, schedule completion, or touch live
 device state; those effects occur once after comparison.
 
 The snapshot constructor proves that caller-supplied boundary state is
-internally consistent; it does not prove that rspboot historically produced
-that state. Runtime integration must construct it only from the boot-overlay
-handoff, initially grant exactly physical `0..8 MiB` DMA authority, and trap if
-the task actually requires a static alias. Direct-IMEM tasks remain a loud
-differential frontier. Moving the pure rspboot-to-entry capture behind the
-`fn64-audio` seam is the next step toward making provenance structural.
+internally consistent; provenance is structural only when the pure rspboot
+kernel constructs it. Runtime integration must feed that kernel the complete
+pre-boot RSP state, initially grant exactly physical `0..8 MiB` DMA authority,
+and trap if the task actually requires a static alias. Direct-IMEM tasks remain
+a loud differential frontier.
+
+The current live adapter accepts only a verified ucode-phase authority with no
+deferred DPC submissions. A nonempty submission set traps before its first live
+mutation because the renderer seam cannot atomically preflight or roll back a
+batch. The adapter also cannot yet persist scalar GPR, VU/accumulator/flag,
+divider, or jump/resume state across task invocations: the device fabric owns
+the exact RSP memories and SP/DPC latches but has no owner for those interpreter
+registers. Both are explicit parity frontiers, not omitted effects.
 
 ## Work sequence
 
@@ -103,9 +124,9 @@ differential frontier. Moving the pure rspboot-to-entry capture behind the
    first-divergence comparator.
 2. **Standard wire decoder** — decode all 16 documented packets and reject
    unknown selectors/unsupported flag combinations without mutating state.
-3. **Task-entry snapshot** — capture complete RSP memory/non-memory state and
-   exact physical RDRAM once after rspboot, then fork independently owned LLE
-   and HLE lanes. The owned types are complete; runtime capture wiring is next.
+3. **Task-entry snapshot** — run pure owned rspboot, capture complete RSP
+   memory/non-memory state and exact physical RDRAM at its handoff, then fork
+   independently owned LLE and HLE lanes. Live whole-task wiring is next.
 4. **Memory commands** — implement `SETBUFF`, `LOADBUFF`, `SAVEBUFF`,
    `CLEARBUFF`, `DMEMMOVE`, `SEGMENT`, and `LOADADPCM` with complete preflight
    and overlap/bounds tests.

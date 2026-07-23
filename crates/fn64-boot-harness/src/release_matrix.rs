@@ -2,7 +2,7 @@
 //!
 //! The manifest contains only the immutable project profile and evidence
 //! identities, never ROM bytes, captured output, or caller-authored coverage.
-//! Dynamic evidence requires schema-v23 report series; coverage is derived
+//! Dynamic evidence requires schema-v25 report series; coverage is derived
 //! from each validated report before it is compared with the fixed profile.
 
 use crate::platform_certification::{
@@ -12,8 +12,9 @@ use crate::{
     verify_release_evidence_series, ArtifactDigest, ArtifactKind, CertificationProfileIdentity,
     CertificationRequirementClass, CertificationRequirementRef, ClosurePath, ClosurePathStatus,
     DeterministicDigest, ExecutionDestinationEvidence, ExecutionDestinationSource,
-    FramebufferObservationSource, FullParityV1, ParsedUnsupportedJournal, ReleaseCartridgeSave,
-    ReleaseControllerPort, ReleaseEnvironmentEvidence, ReleaseGateReport, ReleaseGraphicsApi,
+    FramebufferObservationSource, FullParityV1, ParsedUnsupportedJournal,
+    ReleaseCartridgeSave, ReleaseControllerPort, ReleaseEnvironmentEvidence, ReleaseGateReport,
+    ReleaseGraphicsApi,
     ReleaseGraphicsExecutionPolicy, ReleaseHostPlatform, ReleaseMicrocodeFamily,
     ReleaseObservationGeometry, ReleaseRendererEvidence, ReleaseRomClass, ReleaseRomEvidence,
     ReleaseTvRegion, ReleaseWindowsFamily, ReportSeriesError, RspRdpEvidence,
@@ -304,7 +305,7 @@ pub struct ReleaseMatrixScenario {
     /// Stable diagnostic key. Evidence is associated by `report_scenario`, not
     /// by a caller-provided command-line assignment.
     pub id: String,
-    /// Exact scenario string bound by every schema-v23 report in this series.
+    /// Exact scenario string bound by every schema-v25 report in this series.
     pub report_scenario: String,
     /// Exact private-input identity bound by every report; no input bytes are stored.
     pub input_sha256: String,
@@ -385,13 +386,13 @@ pub struct VerifiedMatrixScenario {
     pub environment: ReleaseEnvironmentEvidence,
     pub closure_paths: u64,
     /// Exact destination sequence and canonical unique/count summary retained
-    /// from the verified v23 series.
+    /// from the verified v25 series.
     pub execution_destinations: ExecutionDestinationEvidence,
-    /// Complete schema-v23 RSP/RDP observation stream retained for independent
+    /// Complete schema-v25 RSP/RDP observation stream retained for independent
     /// report reconstruction and coverage derivation.
     pub rsp_rdp: RspRdpEvidence,
     pub unsupported_instrumentation: crate::UnsupportedInstrumentationEvidence,
-    /// Exact canonical closure ledger retained from the verified v23 series.
+    /// Exact canonical closure ledger retained from the verified v25 series.
     /// A count alone cannot prove which feature-specific operation paths ran.
     pub closure: Vec<ClosurePath>,
     pub unsupported_events: u64,
@@ -3428,6 +3429,7 @@ mod tests {
             } else {
                 ReleaseCartridgeSave::Eeprom4k
             },
+            audio_task_execution: crate::ReleaseAudioTaskExecutionPolicy::LleAccuracy,
             renderer: if is_rt64 {
                 ReleaseRendererEvidence::Rt64 {
                     execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
@@ -4907,7 +4909,7 @@ mod tests {
                 assignment.requirement.class() == CertificationRequirementClass::PlatformApiTarget
                     && assignment.requirement.id() == "macos-metal"
             })
-            .expect("the validated v23 report earns its exact platform/API row");
+            .expect("the validated v25 report earns its exact platform/API row");
         assert_eq!(
             platform_assignment.evidence_sha256s,
             [manifest.scenarios[0].declaration_sha256.clone()]

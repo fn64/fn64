@@ -461,6 +461,20 @@ pub enum ReleaseRendererEvidence {
     },
 }
 
+/// Audio-task executor selected before guest task admission.
+///
+/// The translated identity binds the exact host artifact selected by the
+/// owner, but it does not prove that artifact implements the live RSP IMEM
+/// image. Release evidence therefore admits only [`Self::LleAccuracy`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReleaseAudioTaskExecutionPolicy {
+    Unconfigured,
+    Translated { artifact_sha256: String },
+    LleAccuracy,
+    DiagnosticSkip,
+}
+
 impl ReleaseRendererEvidence {
     pub const fn tv_type(&self) -> ReleaseTvStandard {
         match self {
@@ -479,6 +493,7 @@ pub struct ReleaseEnvironmentEvidence {
     pub windows_version: Option<ReleaseWindowsVersionEvidence>,
     pub controller_ports: [ReleaseControllerPort; 4],
     pub cartridge_save: ReleaseCartridgeSave,
+    pub audio_task_execution: ReleaseAudioTaskExecutionPolicy,
     pub renderer: ReleaseRendererEvidence,
 }
 

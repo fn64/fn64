@@ -1082,19 +1082,31 @@ impl<'a> RspMachine<'a> {
     }
 
     fn record_rdram_write(&mut self, start: usize, len: usize) {
-        let end = start
+        let mut merged_start = start;
+        let mut merged_end = start
             .checked_add(len)
             .expect("validated RSP DMA write span overflow");
-        if let Some(last) = self.rdram_writes.last_mut() {
-            if start <= last.1 {
-                last.1 = last.1.max(end);
-                return;
+
+        // DMA descriptors may move backward or revisit an earlier range. Keep
+        // the effect journal canonical here so later JIT invalidation and
+        // speculative outcome extraction cannot lose a non-monotonic write.
+        let first = self
+            .rdram_writes
+            .partition_point(|&(_, existing_end)| existing_end < merged_start);
+        let mut after = first;
+        while let Some(&(existing_start, existing_end)) = self.rdram_writes.get(after) {
+            if existing_start > merged_end {
+                break;
             }
+            merged_start = merged_start.min(existing_start);
+            merged_end = merged_end.max(existing_end);
+            after += 1;
         }
-        self.rdram_writes.push((start, end));
+        self.rdram_writes
+            .splice(first..after, [(merged_start, merged_end)]);
     }
 
-    /// Drain the coalesced RDRAM write spans produced by SP DMA.
+    /// Drain the sorted, disjoint RDRAM write coverage produced by SP DMA.
     pub fn take_rdram_writes(&mut self) -> Vec<(usize, usize)> {
         std::mem::take(&mut self.rdram_writes)
     }
@@ -1409,6 +1421,20 @@ mod tests {
         target.restore_state(complete);
         assert_eq!(target.snapshot_architectural_state(), expected_architecture);
         assert_eq!(target.ctx.steps, source.ctx.steps);
+    }
+
+    #[test]
+    fn rdram_write_journal_canonicalizes_backward_and_bridging_spans() {
+        let mut rdram = vec![0u8; 0x100];
+        let mut machine = RspMachine::new(&mut rdram);
+
+        machine.record_rdram_write(0x80, 8);
+        machine.record_rdram_write(0x20, 8);
+        assert_eq!(machine.rdram_writes, vec![(0x20, 0x28), (0x80, 0x88)]);
+
+        machine.record_rdram_write(0x28, 0x38);
+        machine.record_rdram_write(0x58, 0x28);
+        assert_eq!(machine.take_rdram_writes(), vec![(0x20, 0x88)]);
     }
 
     #[test]
