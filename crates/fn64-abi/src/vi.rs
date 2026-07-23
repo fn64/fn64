@@ -227,6 +227,14 @@ pub fn vi_swap_count() -> u64 {
     with_executor(|exec| exec.vi().swap_count)
 }
 
+/// The framebuffer line width in pixels (VI_WIDTH, latched from the ROM's
+/// `OSViMode.common.width`), or `None` before the first `osViSetMode`. A
+/// windowed presenter must use this as the framebuffer read stride rather
+/// than assuming a fixed width, or non-320-wide modes present sheared/offset.
+pub fn vi_width() -> Option<u32> {
+    with_host(|host| host.device_fabric.vi_width())
+}
+
 /// Install an explicit VI field-duration override for compatibility tests or
 /// embedders without IPL state. Production boot uses `configure_tv_type`,
 /// allowing live VI timing registers to derive the interval.

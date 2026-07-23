@@ -1021,6 +1021,17 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         line * 2 + field
     }
 
+    /// The framebuffer line width in pixels, latched from `OSViMode.common.width`
+    /// into VI_WIDTH (`vi_registers[2]`, a 12-bit field). `None` before the
+    /// first `osViSetMode` (no mode latched), so a presenter can fall back to a
+    /// default rather than a bogus zero-stride. This is the origin's line
+    /// stride the CPU/RSP write into — the correct stride for reading the
+    /// framebuffer, as distinct from the displayed x-scale.
+    pub fn vi_width(&self) -> Option<u32> {
+        let width = self.vi_registers[2] & 0x0fff;
+        (width != 0).then_some(width)
+    }
+
     /// Install an explicit field-duration override for compatibility tests or
     /// embedders without IPL state. This clears the typed television standard;
     /// production boot should call [`Self::configure_tv_type`] instead.
