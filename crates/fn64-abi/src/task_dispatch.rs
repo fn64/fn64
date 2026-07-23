@@ -1272,8 +1272,20 @@ unsafe fn dispatch_lle_task(
                 "[fn64-rsp-dpc] range [{start:#010x}, {end:#010x}) xbus={xbus} words={traced:08x?}"
             );
         }
+        let source = if xbus {
+            fn64_runtime::DpcSubmissionSource::Dmem
+        } else {
+            fn64_runtime::DpcSubmissionSource::Rdram
+        };
+        let submission = with_host(|host| {
+            host.device_fabric
+                .request_dpc_submission(source, start, end)
+        })
+        .unwrap_or_else(|error| panic!("RSP DPC submission rejected: {error}"));
+        let transaction = LiveDpcTransaction::new(submission);
         let (full_sync, observation) =
             unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, xbus) };
+        transaction.commit();
         dpc_observations.push(observation);
         if full_sync == fn64_render::DpFullSyncStatus::Reached {
             dp_full_sync = fn64_render::DpFullSyncStatus::Reached;
@@ -1488,42 +1500,183 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) -> HleBootR
     }
 }
 
-/// Submit one bounded DRAM-backed raw RDP command list to the registered
-/// renderer. DPC state is committed by the caller before this runs; missing
-/// backends and backend failures trap rather than completing nonexistent work.
-pub(crate) unsafe fn dispatch_raw_rdp(rdram: *mut u8, start: u32, end: u32) {
-    let words = {
-        let rdram_slice = unsafe { renderer_rdram_slice(rdram) };
-        let start_usize = start as usize;
-        let end_usize = end as usize;
-        assert!(
-            start_usize < end_usize && start_usize.is_multiple_of(8) && end_usize.is_multiple_of(8),
-            "DRAM DPC range [{start:#010x}, {end:#010x}) must be nonempty and 8-byte aligned"
-        );
-        assert!(
-            end_usize <= rdram_slice.len(),
-            "DRAM DPC range end {end:#010x} exceeds registered RDRAM length {:#x}",
-            rdram_slice.len()
-        );
-        rdram_slice[start_usize..end_usize]
-            .chunks_exact(4)
-            .map(|word| u32::from_ne_bytes(word.try_into().expect("four RDRAM bytes")))
-            .collect::<Vec<_>>()
-    };
-    let result = with_render_backend("dispatch_raw_rdp", |backend| {
-        let rdram_slice = unsafe { renderer_rdram_slice(rdram) };
-        let status = backend.process_rdp_commands(rdram_slice, start, end, render_output_addr())?;
-        Ok(RenderDispatchResult {
-            status,
-            dp_full_sync: backend.last_dp_full_sync(),
-        })
-    });
-    let full_sync = require_committed_full_sync_evidence(result, "dispatch_raw_rdp");
-    record_rsp_rdp_observations(vec![dpc_observation(false, start, end, &words)]);
+/// Own one fabric-issued DPC transaction across renderer execution. A backend
+/// panic unwinds through this guard and cancels the exact token, so a rejected
+/// range cannot remain busy or later advance CURRENT as if it had rendered.
+struct LiveDpcTransaction {
+    token: Option<u64>,
+}
+
+impl LiveDpcTransaction {
+    fn new(submission: fn64_runtime::DpcSubmission) -> Self {
+        with_host(|host| {
+            assert_eq!(
+                host.device_fabric.pending_dpc_submission(),
+                Some(submission),
+                "renderer received DPC transaction which the device fabric does not own"
+            );
+        });
+        Self {
+            token: Some(submission.token),
+        }
+    }
+
+    fn commit(mut self) {
+        let token = self.token.take().expect("DPC transaction committed twice");
+        with_host(|host| host.device_fabric.commit_dpc_submission(token))
+            .unwrap_or_else(|error| panic!("committing rendered DPC transaction: {error}"));
+    }
+}
+
+impl Drop for LiveDpcTransaction {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        with_host(|host| host.device_fabric.cancel_dpc_submission(token))
+            .unwrap_or_else(|error| panic!("cancelling rejected DPC transaction: {error}"));
+    }
+}
+
+fn complete_committed_dpc(
+    transaction: LiveDpcTransaction,
+    full_sync: fn64_render::DpFullSyncStatus,
+    observation: RspRdpObservationKind,
+    operation: &'static str,
+) {
+    transaction.commit();
+    record_rsp_rdp_observations(vec![observation]);
     if full_sync == fn64_render::DpFullSyncStatus::Reached {
         crate::pi::start_live_dp_full_sync()
-            .unwrap_or_else(|error| panic!("dispatch_raw_rdp: DP FullSync completion: {error}"));
+            .unwrap_or_else(|error| panic!("{operation}: DP FullSync completion: {error}"));
     }
+}
+
+fn preflight_raw_dpc_completion(
+    image: &[u8],
+    start: u32,
+    end: u32,
+    operation: &'static str,
+) -> fn64_render::DpFullSyncStatus {
+    let inspected = fn64_render::inspect_raw_rdp_full_sync(image, start, end)
+        .unwrap_or_else(|error| panic!("{operation}: {error}"));
+    if inspected == fn64_render::DpFullSyncStatus::Reached {
+        // Interleaving closed here: a prior FullSync may remain pending while
+        // the guest submits another DPC range. Device advancement and guest
+        // callbacks cannot run during renderer dispatch, so observing an
+        // empty slot here reserves it through the later synchronous commit;
+        // observing an occupied slot rejects before backend or RDRAM mutation.
+        with_host(|host| {
+            host.device_fabric
+                .preflight_dp_full_sync(fn64_runtime::Cycles::new(1))
+        })
+        .unwrap_or_else(|error| panic!("{operation}: DP FullSync completion: {error}"));
+    }
+    inspected
+}
+
+fn require_matching_raw_dpc_completion(
+    inspected: fn64_render::DpFullSyncStatus,
+    rendered: fn64_render::DpFullSyncStatus,
+    operation: &'static str,
+) -> fn64_render::DpFullSyncStatus {
+    assert_eq!(
+        rendered, inspected,
+        "{operation}: renderer FullSync evidence disagrees with the submitted raw RDP command stream"
+    );
+    rendered
+}
+
+/// Submit one fabric-owned CPU DPC transaction to the registered renderer.
+/// DRAM reads the registered physical device; XBUS snapshots persistent DMEM
+/// at the accepted END boundary. Renderer acceptance commits CURRENT before
+/// FullSync can schedule DP completion; rejection cancels the token and
+/// records no observation.
+pub(crate) unsafe fn dispatch_dpc_submission(
+    rdram: *mut u8,
+    submission: fn64_runtime::DpcSubmission,
+) {
+    let start = submission.start;
+    let end = submission.end;
+    let transaction = LiveDpcTransaction::new(submission);
+    let (full_sync, observation, operation) = match submission.source {
+        fn64_runtime::DpcSubmissionSource::Rdram => {
+            let (words, full_sync) = {
+                let real = unsafe { renderer_rdram_slice(rdram) };
+                let start_usize = start as usize;
+                let end_usize = end as usize;
+                assert!(
+                    start_usize < end_usize
+                        && start_usize.is_multiple_of(8)
+                        && end_usize.is_multiple_of(8),
+                    "DRAM DPC range [{start:#010x}, {end:#010x}) must be nonempty and 8-byte aligned"
+                );
+                assert!(
+                    end_usize <= real.len(),
+                    "DRAM DPC range end {end:#010x} exceeds registered RDRAM length {:#x}",
+                    real.len()
+                );
+                let words = real[start_usize..end_usize]
+                    .chunks_exact(4)
+                    .map(|word| u32::from_ne_bytes(word.try_into().expect("four RDRAM bytes")))
+                    .collect::<Vec<_>>();
+                let mut image = real.to_vec();
+                let inspected =
+                    preflight_raw_dpc_completion(&image, start, end, "dispatch_raw_rdp");
+                let result = with_render_backend("dispatch_raw_rdp", |backend| {
+                    let status = backend.process_rdp_commands(
+                        &mut image,
+                        start,
+                        end,
+                        render_output_addr(),
+                    )?;
+                    Ok(RenderDispatchResult {
+                        status,
+                        dp_full_sync: backend.last_dp_full_sync(),
+                    })
+                });
+                let rendered = require_committed_full_sync_evidence(result, "dispatch_raw_rdp");
+                let full_sync =
+                    require_matching_raw_dpc_completion(inspected, rendered, "dispatch_raw_rdp");
+                real.copy_from_slice(&image);
+                (words, full_sync)
+            };
+            (
+                full_sync,
+                dpc_observation(false, start, end, &words),
+                "dispatch_raw_rdp",
+            )
+        }
+        fn64_runtime::DpcSubmissionSource::Dmem => {
+            let dmem = with_host(|host| {
+                *host
+                    .device_fabric
+                    .rsp_memory()
+                    .bank(fn64_runtime::RspMemoryBank::Dmem)
+            });
+            let words = dmem[start as usize..end as usize]
+                .chunks_exact(4)
+                .map(|word| u32::from_be_bytes(word.try_into().expect("four DMEM bytes")))
+                .collect::<Vec<_>>();
+            let (full_sync, observation) =
+                unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true) };
+            (full_sync, observation, "dispatch_raw_rdp_xbus")
+        }
+    };
+    complete_committed_dpc(transaction, full_sync, observation, operation);
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+unsafe fn dispatch_raw_rdp(rdram: *mut u8, start: u32, end: u32) {
+    let submission = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            start,
+            end,
+        )
+    })
+    .unwrap_or_else(|error| panic!("dispatch_raw_rdp: DPC submission rejected: {error}"));
+    unsafe { dispatch_dpc_submission(rdram, submission) };
 }
 
 /// Submit an XBUS DPC range whose command bytes live in persistent RSP DMEM.
@@ -1553,14 +1706,18 @@ unsafe fn dispatch_raw_rdp_xbus(
         .chunks_exact(4)
         .map(|word| u32::from_be_bytes(word.try_into().expect("four DMEM bytes")))
         .collect::<Vec<_>>();
+    let submission = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Dmem,
+            start,
+            end,
+        )
+    })
+    .unwrap_or_else(|error| panic!("dispatch_raw_rdp_xbus: DPC submission rejected: {error}"));
+    let transaction = LiveDpcTransaction::new(submission);
     let (full_sync, observation) =
         unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true) };
-    record_rsp_rdp_observations(vec![observation]);
-    if full_sync == fn64_render::DpFullSyncStatus::Reached {
-        crate::pi::start_live_dp_full_sync().unwrap_or_else(|error| {
-            panic!("dispatch_raw_rdp_xbus: DP FullSync completion: {error}")
-        });
-    }
+    complete_committed_dpc(transaction, full_sync, observation, "dispatch_raw_rdp_xbus");
 }
 
 /// Submit command words already captured at the DPC CMD_END boundary through
@@ -1653,6 +1810,12 @@ unsafe fn dispatch_captured_raw_rdp(
         let offset = staging_start + word_index * 4;
         image[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
     }
+    let inspected = preflight_raw_dpc_completion(
+        &image,
+        staging_start as u32,
+        staged_end as u32,
+        "dispatch_captured_raw_rdp",
+    );
     let result = with_render_backend("dispatch_captured_raw_rdp", |backend| {
         let status = backend.process_rdp_commands(
             &mut image,
@@ -1665,6 +1828,9 @@ unsafe fn dispatch_captured_raw_rdp(
             dp_full_sync: backend.last_dp_full_sync(),
         })
     });
+    let rendered = require_committed_full_sync_evidence(result, "dispatch_captured_raw_rdp");
+    let full_sync =
+        require_matching_raw_dpc_completion(inspected, rendered, "dispatch_captured_raw_rdp");
     if xbus && std::env::var_os("FN64_XBUS_DIFF_TRACE").is_some() {
         let mut offset = 0usize;
         while offset < physical_len {
@@ -1683,7 +1849,6 @@ unsafe fn dispatch_captured_raw_rdp(
         }
     }
     real.copy_from_slice(&image[..physical_len]);
-    let full_sync = require_committed_full_sync_evidence(result, "dispatch_captured_raw_rdp");
     (
         full_sync,
         dpc_observation(xbus, source_start, source_end, words),
@@ -2232,18 +2397,6 @@ thread_local! {
     /// The true AI DAC rate last forwarded by `notify_audio_frequency`
     /// (0 = the game has not set a frequency yet).
     pub(crate) static AUDIO_GUEST_RATE: Cell<u32> = const { Cell::new(0) };
-}
-
-/// Bytes remaining in the current emulated AI DMA -- i.e. what hardware's
-/// `AI_LEN` register counts down as the DAC drains. Host stream prebuffering
-/// is intentionally excluded: exposing the whole cpal ring here made guest
-/// buffer sizing depend on host latency instead of the N64 DMA boundary.
-pub(crate) fn audio_remaining_guest_bytes() -> Option<u32> {
-    AUDIO_BACKEND.with(|cell| {
-        let borrowed = cell.borrow();
-        let backend = borrowed.as_ref()?;
-        backend.current_dma_bytes_remaining()
-    })
 }
 
 /// Register the audio backend `osAiSetNextBuffer_recomp` delivers finished AI
@@ -3055,6 +3208,7 @@ mod tests {
     use crate::test_support::*;
     use fn64_render::{FrameStatus, RenderConfig, RenderError, UcodeId};
     use fn64_runtime::RecvMesgOutcome;
+    use std::rc::Rc;
 
     macro_rules! no_rust_hidden_sidecar {
         () => {
@@ -3814,6 +3968,251 @@ mod tests {
 
         assert!(rejected.is_err());
         assert!(copy_rsp_rdp_observations().is_empty());
+        let snapshot = with_host(|host| host.device_fabric.snapshot());
+        assert_eq!(snapshot.pending_dpc, None);
+        assert_eq!(snapshot.dpc_start, 0);
+        assert_eq!(snapshot.dpc_end, 0);
+        assert_eq!(snapshot.dpc_current, 0);
+        assert_eq!(snapshot.dpc_status, 0);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RawMutationOutcome {
+        Complete,
+        Error,
+        Panic,
+        Yielded,
+    }
+
+    struct MutatingRawBackend {
+        calls: Rc<Cell<u32>>,
+        outcome: RawMutationOutcome,
+        mutation_offset: usize,
+    }
+
+    impl RenderBackend for MutatingRawBackend {
+        fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        no_rust_hidden_sidecar!();
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            _task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            unreachable!("raw DPC regression backend received an HLE task")
+        }
+
+        fn process_rdp_commands(
+            &mut self,
+            rdram: &mut [u8],
+            _start: u32,
+            _end: u32,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            rdram[self.mutation_offset] = call as u8;
+            match self.outcome {
+                RawMutationOutcome::Complete => Ok(FrameStatus::Complete),
+                RawMutationOutcome::Error => Err(RenderError::Backend {
+                    backend: "synthetic-raw",
+                    reason: "mutate-then-error".to_owned(),
+                }),
+                RawMutationOutcome::Panic => panic!("mutating raw backend panic"),
+                RawMutationOutcome::Yielded => Ok(FrameStatus::Yielded),
+            }
+        }
+
+        fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
+            fn64_render::DpFullSyncStatus::Reached
+        }
+
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[UcodeId] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn rejected_raw_renderer_mutations_never_reach_live_rdram() {
+        const START: usize = 0x100;
+        const MUTATION: usize = 0x400;
+
+        for (outcome, expected) in [
+            (RawMutationOutcome::Error, "mutate-then-error"),
+            (RawMutationOutcome::Panic, "mutating raw backend panic"),
+            (
+                RawMutationOutcome::Yielded,
+                "raw RDP submission cannot yield as an RSP task",
+            ),
+        ] {
+            crate::load_rom(Vec::new());
+            let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+            rdram[START..START + 4].copy_from_slice(&0xe900_0000u32.to_ne_bytes());
+            rdram[MUTATION] = 0x5a;
+            let calls = Rc::new(Cell::new(0));
+            set_render_backend(
+                Box::new(MutatingRawBackend {
+                    calls: Rc::clone(&calls),
+                    outcome,
+                    mutation_offset: MUTATION,
+                }),
+                rdram.len(),
+            );
+            let before_rdram = rdram.clone();
+            let before_device = with_host(|host| host.device_fabric.snapshot());
+
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                dispatch_raw_rdp(rdram.as_mut_ptr(), START as u32, (START + 8) as u32)
+            }))
+            .expect_err("mutating raw renderer rejection must remain loud");
+
+            assert!(
+                panic_message(rejected.as_ref()).contains(expected),
+                "{outcome:?} produced unexpected panic: {}",
+                panic_message(rejected.as_ref())
+            );
+            assert_eq!(calls.get(), 1);
+            assert_eq!(rdram, before_rdram, "{outcome:?} leaked renderer bytes");
+            assert_eq!(
+                with_host(|host| host.device_fabric.snapshot()),
+                before_device,
+                "{outcome:?} changed guest-visible DPC state"
+            );
+            assert!(copy_rsp_rdp_observations().is_empty());
+        }
+    }
+
+    #[test]
+    fn mismatched_raw_full_sync_evidence_rejects_before_rdram_or_dpc_commit() {
+        const START: usize = 0x100;
+        const MUTATION: usize = 0x400;
+
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        rdram[MUTATION] = 0x5a;
+        let calls = Rc::new(Cell::new(0));
+        set_render_backend(
+            Box::new(MutatingRawBackend {
+                calls: Rc::clone(&calls),
+                outcome: RawMutationOutcome::Complete,
+                mutation_offset: MUTATION,
+            }),
+            rdram.len(),
+        );
+        let before_rdram = rdram.clone();
+        let before_device = with_host(|host| host.device_fabric.snapshot());
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            dispatch_raw_rdp(rdram.as_mut_ptr(), START as u32, (START + 8) as u32)
+        }))
+        .expect_err("backend FullSync evidence must match the submitted command stream");
+
+        assert!(panic_message(rejected.as_ref()).contains(
+            "renderer FullSync evidence disagrees with the submitted raw RDP command stream"
+        ));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(rdram, before_rdram);
+        assert_eq!(
+            with_host(|host| host.device_fabric.snapshot()),
+            before_device
+        );
+        assert!(copy_rsp_rdp_observations().is_empty());
+    }
+
+    #[test]
+    fn mismatched_captured_full_sync_evidence_rejects_before_rdram_or_dpc_commit() {
+        const MUTATION: usize = 0x400;
+
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        rdram[MUTATION] = 0x5a;
+        let dmem = [0u8; fn64_runtime::RSP_MEMORY_BANK_SIZE];
+        let calls = Rc::new(Cell::new(0));
+        set_render_backend(
+            Box::new(MutatingRawBackend {
+                calls: Rc::clone(&calls),
+                outcome: RawMutationOutcome::Complete,
+                mutation_offset: MUTATION,
+            }),
+            rdram.len(),
+        );
+        let before_rdram = rdram.clone();
+        let before_device = with_host(|host| host.device_fabric.snapshot());
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            dispatch_raw_rdp_xbus(rdram.as_mut_ptr(), &dmem, 0, 8)
+        }))
+        .expect_err("captured FullSync evidence must match the staged command stream");
+
+        assert!(panic_message(rejected.as_ref()).contains(
+            "renderer FullSync evidence disagrees with the submitted raw RDP command stream"
+        ));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(rdram, before_rdram);
+        assert_eq!(
+            with_host(|host| host.device_fabric.snapshot()),
+            before_device
+        );
+        assert!(copy_rsp_rdp_observations().is_empty());
+    }
+
+    #[test]
+    fn second_raw_full_sync_rejects_before_renderer_or_rdram_mutation() {
+        const FIRST: usize = 0x100;
+        const SECOND: usize = 0x108;
+        const MUTATION: usize = 0x400;
+
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        rdram[FIRST..FIRST + 4].copy_from_slice(&0xe900_0000u32.to_ne_bytes());
+        rdram[SECOND..SECOND + 4].copy_from_slice(&0xe900_0000u32.to_ne_bytes());
+        let calls = Rc::new(Cell::new(0));
+        set_render_backend(
+            Box::new(MutatingRawBackend {
+                calls: Rc::clone(&calls),
+                outcome: RawMutationOutcome::Complete,
+                mutation_offset: MUTATION,
+            }),
+            rdram.len(),
+        );
+
+        unsafe { dispatch_raw_rdp(rdram.as_mut_ptr(), FIRST as u32, SECOND as u32) };
+        assert_eq!(calls.get(), 1);
+        let before_rdram = rdram.clone();
+        let before_device = with_host(|host| host.device_fabric.snapshot());
+        let before_observations = copy_rsp_rdp_observations();
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            dispatch_raw_rdp(rdram.as_mut_ptr(), SECOND as u32, (SECOND + 8) as u32)
+        }))
+        .expect_err("a second unserviced raw FullSync must remain loud");
+
+        assert!(panic_message(rejected.as_ref()).contains("graphics task start while DP is busy"));
+        assert_eq!(
+            calls.get(),
+            1,
+            "the occupied DP slot must reject before renderer entry"
+        );
+        assert_eq!(rdram, before_rdram);
+        assert_eq!(
+            with_host(|host| host.device_fabric.snapshot()),
+            before_device
+        );
+        assert_eq!(copy_rsp_rdp_observations(), before_observations);
     }
 
     /// The rename is only honest if the retired spelling is LOUD: an unset var
