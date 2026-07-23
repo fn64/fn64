@@ -458,14 +458,16 @@ road, but the top half misprojects).
   LOD_FRACTION is modeled. The hardware NOISE combiner source consumes the
   typed per-fragment byte instead of substituting black; the exact silicon
   generator remains a hardware-trace frontier.
-- Bounded probes in BOTH lanes use `_exit(0)` after explicitly flushing the
-  summary/trace (2026-07-16; was rs-lane-only, so C-lane probes aborted with
-  exit 134 in TLS teardown after a clean summary and probe exit codes were
-  untrustworthy). Suspended coroutines can be stopped inside an existing
-  `extern "C"` blocking shim, where TLS teardown's forced unwind cannot cross
-  the ABI boundary. This is harness teardown only; execution still uses the
-  same single executor and host thread. Exit 0 is now the probe-success
-  signal for both lanes.
+- Bounded probes in BOTH lanes now call the shared terminal
+  `fn64_abi::prepare_process_exit` boundary and return normally. Suspended
+  coroutines can stop inside an existing `extern "C"` blocking shim, where
+  TLS teardown's forced unwind cannot cross the ABI boundary. The terminal
+  boundary validates scheduler quiescence, detaches only those
+  started/unfinished stacks, abandons any committed renderer continuation
+  without resuming it, clears saved pointers, and leaves normal Rust/TLS
+  teardown available to every other owner. The former `_exit(0)`
+  workaround skipped all destructors; it is no longer used by this harness.
+  Exit 0 is consequently a real teardown-success signal for both lanes.
 - Rs-lane boot now reaches the bounded **250 VI swaps and 250 render tasks**
   in 10/10 consecutive release probes; swap 3 is the first non-uniform guest
   framebuffer. The former `AudioLoad_Dma` unaligned-`SW` frontier was a stale

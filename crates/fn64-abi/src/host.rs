@@ -230,6 +230,44 @@ pub fn run_to_idle() {
     while run_one_step() {}
 }
 
+/// Seal the process-wide runtime for normal host-process teardown.
+///
+/// Recompiled threads commonly finish a bounded run suspended inside an
+/// `extern "C"` blocking shim. Rust TLS destruction would otherwise make
+/// `corosensei` force-unwind those native stacks across a non-unwind FFI
+/// boundary, which aborts after an otherwise successful run. This terminal
+/// operation detaches only started, unfinished guest coroutines, clears every
+/// saved pointer into those stacks, and makes all later executor access trap.
+/// The operating system reclaims the detached stack allocations when the
+/// process exits.
+///
+/// This must be called only from the host between scheduling steps, after all
+/// evidence and guest-visible persistence work is complete. It is not guest
+/// `osDestroyThread` behavior and must never be used to reset or continue a
+/// runtime in the same process.
+pub fn prepare_process_exit() -> fn64_runtime::ProcessExitSummary {
+    crate::task_dispatch::drop_backends_for_process_exit();
+    let summary = EXECUTOR.with(|slot| {
+        slot.with(|slot| {
+            let ExecutorSlot::Active(executor) = slot else {
+                panic!("fn64 prepare_process_exit called more than once");
+            };
+            let summary = executor.prepare_process_exit();
+            *slot = ExecutorSlot::PreparedForProcessExit;
+            summary
+        })
+    });
+    with_host(|host| {
+        host.runtime_rdram = std::ptr::null_mut();
+        host.runtime_rdram_len = 0;
+    });
+    THREAD_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
+    ACTIVE_YIELDER.with(|active| active.set(None));
+    ACTIVE_THREAD_ID.with(|active| active.set(None));
+    ACTIVE_RDRAM.with(|active| active.set(std::ptr::null_mut()));
+    summary
+}
+
 /// Whether thread `id` has finished (its coroutine returned or was never
 /// created) -- the harness's "has boot's thread 0 died" check.
 pub fn is_thread_dead(id: ThreadId) -> bool {

@@ -68,15 +68,6 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
 
-# For `_exit(2)` (immediate process termination): the one global fn64_abi
-# executor holds a booted game's GameThreads, whose Drop panics if run at
-# normal teardown (they wrap guest stacks woven through the linked C
-# RecompiledFuncs). A shell has nothing to persist on exit, so we terminate
-# via `_exit`, which skips ALL destructors (including the macOS pthread-key
-# TLS dtors `std::process::exit` still triggers). Already in the tree
-# transitively; declared direct only to name it. See main.rs `clean_exit`.
-libc = "0.2"
-
 # NOTE: the audio SYNTH (recompiled OoT aspMain ucode, out-of-tree at
 # aki-recomp/games/OOTU/rsp-recomp) is deliberately NOT a dependency here.
 # That crate hard-pins `fn64-audio` to a specific sibling worktree

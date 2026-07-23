@@ -2311,6 +2311,25 @@ pub fn last_render_error() -> Option<String> {
     RENDER_LAST_ERROR.with(|cell| cell.borrow().clone())
 }
 
+/// Drop registered host backends at the terminal process boundary while the
+/// caller's RDRAM allocation is still live.
+///
+/// A bounded host run may stop at the committed boundary represented by an
+/// HLE continuation. Process exit abandons that token before dropping the
+/// renderer that owns its continuation state; it must not resume guest or
+/// renderer work merely to reach a more convenient teardown point.
+pub(crate) fn drop_backends_for_process_exit() {
+    HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take());
+    let render_backend = RENDER_BACKEND.with(|cell| cell.borrow_mut().take());
+    let audio_backend = AUDIO_BACKEND.with(|cell| cell.borrow_mut().take());
+    let audio_stream_dump = AUDIO_PCM_STREAM_DUMP.with(|cell| cell.borrow_mut().take());
+    RDRAM_LEN.with(|cell| cell.set(0));
+    AUDIO_RDRAM_LEN.with(|cell| cell.set(0));
+    drop(audio_stream_dump);
+    drop(audio_backend);
+    drop(render_backend);
+}
+
 /// Capture the registered backend's most recent completed presentation for a
 /// fixed-cycle release report. This deliberately goes through the owned
 /// `RenderBackend` seam: a host neither downcasts the backend nor reaches into
