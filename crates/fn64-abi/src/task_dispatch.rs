@@ -861,6 +861,179 @@ fn commit_rsp_rdram_writes(written: &[(usize, usize)]) {
 #[cfg(not(feature = "recomp-rs"))]
 fn commit_rsp_rdram_writes(_written: &[(usize, usize)]) {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VerifiedAudioUcodeCommitResult {
+    steps: fn64_audio::hle_commit::AudioTaskStepTotals,
+    dp_full_sync: fn64_render::DpFullSyncStatus,
+}
+
+fn verified_rsp_execution_state(
+    machine: &fn64_audio::rsp::runtime::RspMachineState,
+    pc_low12: u32,
+) -> fn64_runtime::RspExecutionState {
+    let state = machine.architectural_state();
+    fn64_runtime::RspExecutionState {
+        pc: pc_low12,
+        sp_status: state.sp_status(),
+        sp_semaphore: state.sp_semaphore(),
+        sp_dma_mem_addr: fn64_runtime::RspMemAddr::from_register(state.dma_mem_address()),
+        sp_dma_dram_addr: RdramAddr::from_offset(state.dma_dram_address() & 0x00ff_ffff),
+        sp_dma_read_length: state.dma_read_length(),
+        sp_dma_write_length: state.dma_write_length(),
+        dpc_start: state.dp_start(),
+        dpc_end: state.dp_end(),
+        dpc_current: state.dp_current(),
+        dpc_status: state.dp_status(),
+        dpc_clock: state.dp_clock(),
+        dpc_busy: state.dp_busy(),
+        dpc_pipe_busy: state.dp_pipe_busy(),
+        dpc_tmem_busy: state.dp_tmem_busy(),
+    }
+}
+
+fn apply_verified_audio_rdram_patches(
+    storage: &mut [u8],
+    patches: &fn64_audio::hle_outcome::CanonicalRdramPatches,
+) -> Vec<(usize, usize)> {
+    assert_eq!(
+        storage.len(),
+        fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        "verified audio commit requires the exact 8 MiB physical RDRAM device"
+    );
+    let mut writes = Vec::with_capacity(patches.as_slice().len());
+    let mut view = fn64_runtime::RdramViewMut::from_storage(storage);
+    for patch in patches.as_slice() {
+        let range = patch.range();
+        let start = range.start() as usize;
+        let end = range.end() as usize;
+        assert!(
+            end <= view.len(),
+            "verified audio RDRAM patch [{start:#x}, {end:#x}) exceeds the physical device"
+        );
+        view.write_logical_bytes(RdramAddr::from_offset(range.start()), patch.bytes());
+        writes.push((start, end));
+    }
+    writes
+}
+
+fn validate_verified_audio_rdram_patches(
+    storage_len: usize,
+    patches: &fn64_audio::hle_outcome::CanonicalRdramPatches,
+) {
+    assert_eq!(
+        storage_len,
+        fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        "verified audio commit requires the exact 8 MiB physical RDRAM device"
+    );
+    for patch in patches.as_slice() {
+        let range = patch.range();
+        assert!(
+            range.end() as usize <= storage_len,
+            "verified audio RDRAM patch [{:#x}, {:#x}) exceeds the physical device",
+            range.start(),
+            range.end()
+        );
+    }
+}
+
+fn commit_verified_rsp_state(
+    memory: fn64_runtime::rsp::RspMemorySnapshot,
+    state: fn64_runtime::RspExecutionState,
+) {
+    with_host(|host| {
+        // One exclusive fabric borrow is the publication boundary. Validate
+        // and commit all SP/DPC registers before the infallible memory
+        // replacement, so no observer can see a replay-generated IMEM
+        // generation or a half-installed RSP image.
+        host.device_fabric
+            .commit_complete_rsp_execution_state(state)
+            .unwrap_or_else(|error| panic!("verified audio RSP-state commit rejected: {error}"));
+        host.device_fabric.rsp_memory_mut().restore(memory);
+    });
+}
+
+fn require_atomic_deferred_audio_dpc_support(
+    submissions: &[fn64_audio::hle_outcome::DeferredDpcSubmission],
+) {
+    assert!(
+        submissions.is_empty(),
+        "verified audio commit cannot publish {} deferred DPC submissions atomically: the renderer seam has no batch preflight/rollback authority",
+        submissions.len()
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn commit_verified_audio_effects(
+    rdram: *mut u8,
+    rdram_patches: fn64_audio::hle_outcome::CanonicalRdramPatches,
+    rsp_memory: fn64_runtime::rsp::RspMemorySnapshot,
+    machine_state: fn64_audio::rsp::runtime::RspMachineState,
+    pc_low12: u32,
+    dpc_submissions: Vec<fn64_audio::hle_outcome::DeferredDpcSubmission>,
+) -> fn64_render::DpFullSyncStatus {
+    // Renderer acceptance is fallible and the current seam cannot roll back
+    // an earlier renderer transaction. Reject the whole verified commit
+    // before its first live mutation instead of publishing a partial task.
+    require_atomic_deferred_audio_dpc_support(&dpc_submissions);
+
+    let (registered, allocation_len) =
+        with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+    assert!(
+        !rdram.is_null()
+            && rdram == registered
+            && allocation_len >= fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        "verified audio commit must target the registered physical RDRAM allocation"
+    );
+    validate_verified_audio_rdram_patches(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE, &rdram_patches);
+
+    // This is the only fallible live transition. Publish it before the
+    // prevalidated, infallible RDRAM/JIT writes so a preexisting DPC owner
+    // rejects without changing any task effect.
+    let execution_state = verified_rsp_execution_state(&machine_state, pc_low12);
+    commit_verified_rsp_state(rsp_memory, execution_state);
+    let writes = {
+        let storage = unsafe {
+            std::slice::from_raw_parts_mut(rdram, fn64_runtime::rdram::DEFAULT_RDRAM_SIZE)
+        };
+        apply_verified_audio_rdram_patches(storage, &rdram_patches)
+    };
+    commit_rsp_rdram_writes(&writes);
+
+    fn64_render::DpFullSyncStatus::NotReached
+}
+
+/// Publish one already-compared audio ucode phase to the live runtime.
+///
+/// The consuming payload is the sole commit authority. PCM ranges are
+/// comparison evidence only; actual samples remain owned by the later AI DMA
+/// boundary. This adapter is intentionally not selected by live task policy
+/// until the HLE catalog and differential lane are admitted together.
+#[allow(dead_code)]
+unsafe fn commit_verified_audio_ucode_phase(
+    rdram: *mut u8,
+    parts: fn64_audio::hle_commit::VerifiedUcodePhaseCommitParts,
+) -> VerifiedAudioUcodeCommitResult {
+    parts.consume_with(
+        |_, _, rdram_patches, _, rsp_memory, machine_state, pc_low12, dpc_submissions, steps| {
+            let dp_full_sync = unsafe {
+                commit_verified_audio_effects(
+                    rdram,
+                    rdram_patches,
+                    rsp_memory,
+                    machine_state,
+                    pc_low12,
+                    dpc_submissions,
+                )
+            };
+
+            VerifiedAudioUcodeCommitResult {
+                steps,
+                dp_full_sync,
+            }
+        },
+    )
+}
+
 fn rsp_visible_rdram_len(allocation_len: usize) -> usize {
     allocation_len.min(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE)
 }
@@ -3639,6 +3812,219 @@ mod tests {
             host.runtime_rdram = rdram.as_mut_ptr();
             host.runtime_rdram_len = rdram.len();
         });
+    }
+
+    #[test]
+    fn verified_audio_patches_use_logical_guest_byte_order() {
+        let patches = fn64_audio::hle_outcome::CanonicalRdramPatches::new(vec![
+            fn64_audio::hle_outcome::RdramPatch::new(1, vec![0x11, 0x22, 0x33, 0x44, 0x55])
+                .unwrap(),
+        ])
+        .unwrap();
+        let mut storage = vec![0; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+
+        let writes = apply_verified_audio_rdram_patches(&mut storage, &patches);
+
+        assert_eq!(writes, vec![(1, 6)]);
+        assert_eq!(&storage[..8], &[0x33, 0x22, 0x11, 0, 0, 0, 0x55, 0x44]);
+        let view = fn64_runtime::RdramView::from_storage(&storage);
+        let mut logical = [0; 5];
+        view.copy_logical_bytes(RdramAddr::from_offset(1), &mut logical);
+        assert_eq!(logical, [0x11, 0x22, 0x33, 0x44, 0x55]);
+    }
+
+    #[test]
+    fn verified_audio_rsp_mapping_covers_every_runtime_register() {
+        let mut storage = vec![0; 0x4000];
+        let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut storage);
+        machine.set_sp_status_raw(
+            fn64_runtime::SP_STATUS_HALT | fn64_runtime::SP_STATUS_BROKE | (1 << 10),
+        );
+        machine.set_dma_dram(0x100);
+        machine.set_dma_mem(0x180);
+        let _ = machine.write_cp0(2, 7);
+        machine.set_dma_dram(0x200);
+        machine.set_dma_mem(0x280);
+        let _ = machine.write_cp0(3, 15);
+        let _ = machine.read_cp0(7);
+        let _ = machine.write_cp0(11, 1 << 1);
+        let _ = machine.write_cp0(8, 0x100);
+        let _ = machine.write_cp0(9, 0x108);
+        let _ = machine.write_cp0(9, 0x110);
+        let complete = machine.snapshot_state();
+        let architectural = complete.architectural_state();
+
+        let mapped = verified_rsp_execution_state(&complete, 0x0abc);
+
+        assert_eq!(mapped.pc, 0x0abc);
+        assert_eq!(mapped.sp_status, architectural.sp_status());
+        assert_eq!(mapped.sp_semaphore, architectural.sp_semaphore());
+        assert_eq!(
+            mapped.sp_dma_mem_addr,
+            fn64_runtime::RspMemAddr::from_register(architectural.dma_mem_address())
+        );
+        assert_eq!(
+            mapped.sp_dma_dram_addr,
+            RdramAddr::from_offset(architectural.dma_dram_address() & 0x00ff_ffff)
+        );
+        assert_eq!(mapped.sp_dma_read_length, architectural.dma_read_length());
+        assert_eq!(mapped.sp_dma_write_length, architectural.dma_write_length());
+        assert_eq!(mapped.dpc_start, architectural.dp_start());
+        assert_eq!(mapped.dpc_end, architectural.dp_end());
+        assert_eq!(mapped.dpc_current, architectural.dp_current());
+        assert_eq!(mapped.dpc_status, architectural.dp_status());
+        assert_eq!(mapped.dpc_clock, architectural.dp_clock());
+        assert_eq!(mapped.dpc_busy, architectural.dp_busy());
+        assert_eq!(mapped.dpc_pipe_busy, architectural.dp_pipe_busy());
+        assert_eq!(mapped.dpc_tmem_busy, architectural.dp_tmem_busy());
+        assert_eq!(mapped.dpc_start, 0x100);
+        assert_eq!(mapped.dpc_end, 0x110);
+        assert_eq!(mapped.dpc_current, 0x110);
+    }
+
+    #[test]
+    fn verified_audio_rsp_memory_restore_preserves_exact_generation() {
+        with_host(|host| *host = HostState::default());
+        let mut expected = fn64_runtime::RspMemory::new();
+        expected
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0x20),
+                &[0x12, 0x34],
+            )
+            .unwrap();
+        expected
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0x30),
+                &[0x56, 0x78],
+            )
+            .unwrap();
+        expected
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Dmem, 0x40),
+                &[0x9a, 0xbc],
+            )
+            .unwrap();
+        let expected_snapshot = expected.snapshot();
+        let state = with_host(|host| host.device_fabric.rsp_execution_state());
+
+        commit_verified_rsp_state(expected_snapshot.clone(), state);
+
+        with_host(|host| {
+            assert_eq!(
+                host.device_fabric.rsp_memory().snapshot(),
+                expected_snapshot
+            );
+            assert_eq!(host.device_fabric.rsp_memory().imem_generation(), 2);
+        });
+    }
+
+    #[test]
+    fn pending_dpc_rejects_rsp_commit_without_mutating_rsp_state() {
+        with_host(|host| *host = HostState::default());
+        let mut live_rdram = vec![0x5a; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        with_host(|host| {
+            host.runtime_rdram = live_rdram.as_mut_ptr();
+            host.runtime_rdram_len = live_rdram.len();
+        });
+        let pending = with_host(|host| {
+            host.device_fabric
+                .request_dpc_submission(fn64_runtime::DpcSubmissionSource::Rdram, 0x100, 0x108)
+                .unwrap()
+        });
+        let before_rdram = live_rdram.clone();
+        let (before_memory, before_registers) = with_host(|host| {
+            (
+                host.device_fabric.rsp_memory().snapshot(),
+                host.device_fabric.rsp_execution_state(),
+            )
+        });
+        let mut replacement = fn64_runtime::RspMemory::new();
+        replacement
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0),
+                &[0xde, 0xad, 0xbe, 0xef],
+            )
+            .unwrap();
+        let mut replacement_registers = before_registers;
+        replacement_registers.pc = 0x080;
+        let mut machine_storage = vec![0; 0x1000];
+        let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut machine_storage);
+        machine.set_sp_status_raw(replacement_registers.sp_status);
+        let machine_state = machine.snapshot_state();
+        let patches = fn64_audio::hle_outcome::CanonicalRdramPatches::new(vec![
+            fn64_audio::hle_outcome::RdramPatch::new(1, vec![1, 2, 3]).unwrap(),
+        ])
+        .unwrap();
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unsafe {
+                commit_verified_audio_effects(
+                    live_rdram.as_mut_ptr(),
+                    patches,
+                    replacement.snapshot(),
+                    machine_state,
+                    replacement_registers.pc,
+                    Vec::new(),
+                )
+            };
+        }));
+
+        assert!(rejected.is_err());
+        assert_eq!(live_rdram, before_rdram);
+        with_host(|host| {
+            assert_eq!(host.device_fabric.rsp_memory().snapshot(), before_memory);
+            assert_eq!(host.device_fabric.rsp_execution_state(), before_registers);
+            host.device_fabric
+                .cancel_dpc_submission(pending.token)
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn deferred_audio_dpc_words_survive_source_mutation() {
+        let captured = vec![0xe900_0000, 0, 0x1122_3344, 0x5566_7788];
+        let deferred = fn64_audio::hle_outcome::DeferredDpcSubmission::from_rdram_words(
+            0x100,
+            0x110,
+            captured.clone(),
+        )
+        .unwrap();
+        let mut later_source = captured;
+
+        later_source.fill(0xa5a5_a5a5);
+
+        assert_eq!(
+            deferred.command_words(),
+            vec![0xe900_0000, 0, 0x1122_3344, 0x5566_7788]
+        );
+        assert_ne!(deferred.command_words(), later_source);
+    }
+
+    #[test]
+    fn deferred_audio_dpc_rejection_precedes_live_mutation() {
+        let deferred = fn64_audio::hle_outcome::DeferredDpcSubmission::from_rdram_words(
+            0x100,
+            0x108,
+            vec![0xe900_0000, 0],
+        )
+        .unwrap();
+        let live = vec![0x5a; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let before = live.clone();
+
+        let rejected = std::panic::catch_unwind(|| {
+            require_atomic_deferred_audio_dpc_support(&[deferred]);
+        });
+
+        assert!(rejected.is_err());
+        assert_eq!(live, before);
+    }
+
+    #[test]
+    fn verified_audio_commit_adapter_consumes_its_authority() {
+        let _signature: unsafe fn(
+            *mut u8,
+            fn64_audio::hle_commit::VerifiedUcodePhaseCommitParts,
+        ) -> VerifiedAudioUcodeCommitResult = commit_verified_audio_ucode_phase;
     }
 
     struct StatusRenderBackend(FrameStatus);

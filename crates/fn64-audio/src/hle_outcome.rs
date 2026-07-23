@@ -285,10 +285,32 @@ pub enum DpcSubmissionSource {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DpcSubmissionError {
-    EmptyOrReversedRange { start: u32, end: u32 },
+    EmptyOrReversedRange {
+        start: u32,
+        end: u32,
+    },
+    UnalignedRange {
+        start: u32,
+        end: u32,
+        alignment: u32,
+    },
+    SourceRangeOutOfBounds {
+        source: DpcSubmissionSource,
+        start: u32,
+        end: u32,
+        upper_bound: u32,
+    },
+    RdramCommandWordCount {
+        expected: usize,
+        actual: usize,
+    },
+    DmemPayloadLength {
+        expected: usize,
+        actual: usize,
+    },
 }
 
-/// Content identity of one ordered DPC submission made by the audio task.
+/// Stable content identity derived from one deferred DPC submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DpcSubmissionIdentity {
     pub source: DpcSubmissionSource,
@@ -297,22 +319,150 @@ pub struct DpcSubmissionIdentity {
     pub command_sha256: Sha256Digest,
 }
 
-impl DpcSubmissionIdentity {
-    pub fn new(
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DeferredDpcCommands {
+    /// Canonical host-independent command words for an RDRAM-backed range.
+    Rdram(Vec<u32>),
+    /// Logical big-endian bytes captured at the XBUS CMD_END boundary.
+    Dmem(Vec<u8>),
+}
+
+/// One ordered DPC effect retained until an accepted lane is committed.
+///
+/// RDRAM-backed submissions retain canonical command words, while XBUS
+/// submissions retain the exact DMEM payload that existed when CMD_END was
+/// accepted. XBUS words and every comparison identity are derived from that
+/// payload, so no second owned representation can disagree with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredDpcSubmission {
+    source: DpcSubmissionSource,
+    start: u32,
+    end: u32,
+    commands: DeferredDpcCommands,
+}
+
+impl DeferredDpcSubmission {
+    const ALIGNMENT: u32 = 8;
+    const RDRAM_ADDRESS_BYTES: u32 = 0x0100_0000;
+
+    fn validate_range(
         source: DpcSubmissionSource,
         start: u32,
         end: u32,
-        command_sha256: Sha256Digest,
-    ) -> Result<Self, DpcSubmissionError> {
+    ) -> Result<usize, DpcSubmissionError> {
         if start >= end {
             return Err(DpcSubmissionError::EmptyOrReversedRange { start, end });
         }
+        if !start.is_multiple_of(Self::ALIGNMENT) || !end.is_multiple_of(Self::ALIGNMENT) {
+            return Err(DpcSubmissionError::UnalignedRange {
+                start,
+                end,
+                alignment: Self::ALIGNMENT,
+            });
+        }
+        let upper_bound = match source {
+            DpcSubmissionSource::Rdram => Self::RDRAM_ADDRESS_BYTES,
+            DpcSubmissionSource::Dmem => RSP_BANK_BYTES as u32,
+        };
+        if end > upper_bound {
+            return Err(DpcSubmissionError::SourceRangeOutOfBounds {
+                source,
+                start,
+                end,
+                upper_bound,
+            });
+        }
+        Ok((end - start) as usize)
+    }
+
+    pub fn from_rdram_words(
+        start: u32,
+        end: u32,
+        command_words: Vec<u32>,
+    ) -> Result<Self, DpcSubmissionError> {
+        let byte_len = Self::validate_range(DpcSubmissionSource::Rdram, start, end)?;
+        let expected = byte_len / core::mem::size_of::<u32>();
+        if command_words.len() != expected {
+            return Err(DpcSubmissionError::RdramCommandWordCount {
+                expected,
+                actual: command_words.len(),
+            });
+        }
         Ok(Self {
-            source,
+            source: DpcSubmissionSource::Rdram,
             start,
             end,
-            command_sha256,
+            commands: DeferredDpcCommands::Rdram(command_words),
         })
+    }
+
+    pub fn from_dmem_payload(
+        start: u32,
+        end: u32,
+        payload: Vec<u8>,
+    ) -> Result<Self, DpcSubmissionError> {
+        let expected = Self::validate_range(DpcSubmissionSource::Dmem, start, end)?;
+        if payload.len() != expected {
+            return Err(DpcSubmissionError::DmemPayloadLength {
+                expected,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            source: DpcSubmissionSource::Dmem,
+            start,
+            end,
+            commands: DeferredDpcCommands::Dmem(payload),
+        })
+    }
+
+    pub const fn source(&self) -> DpcSubmissionSource {
+        self.source
+    }
+
+    pub const fn start(&self) -> u32 {
+        self.start
+    }
+
+    pub const fn end(&self) -> u32 {
+        self.end
+    }
+
+    /// Exact logical XBUS bytes captured at submission time.
+    pub fn xbus_payload(&self) -> Option<&[u8]> {
+        match &self.commands {
+            DeferredDpcCommands::Rdram(_) => None,
+            DeferredDpcCommands::Dmem(payload) => Some(payload),
+        }
+    }
+
+    /// Canonical host-independent command words for deferred rendering.
+    pub fn command_words(&self) -> Vec<u32> {
+        match &self.commands {
+            DeferredDpcCommands::Rdram(words) => words.clone(),
+            DeferredDpcCommands::Dmem(payload) => payload
+                .chunks_exact(core::mem::size_of::<u32>())
+                .map(|word| u32::from_be_bytes(word.try_into().expect("four XBUS bytes")))
+                .collect(),
+        }
+    }
+
+    pub fn identity(&self) -> DpcSubmissionIdentity {
+        let mut hasher = Sha256::new();
+        match &self.commands {
+            DeferredDpcCommands::Rdram(words) => {
+                for word in words {
+                    hasher.update(word.to_be_bytes());
+                }
+            }
+            DeferredDpcCommands::Dmem(payload) => hasher.update(payload),
+        }
+        DpcSubmissionIdentity {
+            source: self.source,
+            start: self.start,
+            end: self.end,
+            command_sha256: Sha256Digest::new(hasher.finalize().into()),
+        }
     }
 }
 
@@ -332,7 +482,7 @@ pub struct RspVisibleState {
     pub sp_semaphore: bool,
     pub dma: RspDmaRegisterState,
     pub dpc: RspDpcRegisterState,
-    pub dpc_submissions: Vec<DpcSubmissionIdentity>,
+    pub dpc_submissions: Vec<DeferredDpcSubmission>,
 }
 
 impl RspVisibleState {
@@ -346,7 +496,7 @@ impl RspVisibleState {
         sp_semaphore: bool,
         dma: RspDmaRegisterState,
         dpc: RspDpcRegisterState,
-        dpc_submissions: Vec<DpcSubmissionIdentity>,
+        dpc_submissions: Vec<DeferredDpcSubmission>,
     ) -> Result<Self, RspVisibleStateError> {
         if sp_pc > 0x0ffc || !sp_pc.is_multiple_of(4) {
             return Err(RspVisibleStateError::InvalidPc(sp_pc));
@@ -777,12 +927,12 @@ pub fn compare_audio_task_outcomes(
         .iter()
         .zip(candidate.rsp.dpc_submissions.iter())
         .enumerate()
-        .find(|(_, (reference, candidate))| reference != candidate)
+        .find(|(_, (reference, candidate))| reference.identity() != candidate.identity())
     {
         return Err(AudioTaskOutcomeMismatch::DpcSubmission {
             index,
-            reference: *reference_submission,
-            candidate: *candidate_submission,
+            reference: reference_submission.identity(),
+            candidate: candidate_submission.identity(),
         });
     }
     if reference.completion_steps != candidate.completion_steps {
@@ -810,6 +960,15 @@ mod tests {
         CanonicalRdramRanges::new(vec![RdramByteRange::new(start, byte_len).unwrap()]).unwrap()
     }
 
+    fn dmem_submission(start: u32, payload: &[u8]) -> DeferredDpcSubmission {
+        DeferredDpcSubmission::from_dmem_payload(
+            start,
+            start + u32::try_from(payload.len()).unwrap(),
+            payload.to_vec(),
+        )
+        .unwrap()
+    }
+
     fn state() -> RspVisibleState {
         RspVisibleState::new(
             [0x11; RSP_BANK_BYTES],
@@ -834,10 +993,10 @@ mod tests {
                 pipe_busy: 0,
                 tmem_busy: 0,
             },
-            vec![
-                DpcSubmissionIdentity::new(DpcSubmissionSource::Dmem, 0x20, 0x28, digest(0xd0))
-                    .unwrap(),
-            ],
+            vec![dmem_submission(
+                0x20,
+                &[0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7],
+            )],
         )
         .unwrap()
     }
@@ -1090,9 +1249,116 @@ mod tests {
             Err(AudioTaskOutcomeMismatch::DpcSubmissionCount { .. })
         ));
         candidate = reference.clone();
-        candidate.rsp.dpc_submissions[0].command_sha256 = digest(0xdd);
+        candidate.rsp.dpc_submissions[0] =
+            dmem_submission(0x20, &[0xd0, 0xd1, 0xd2, 0xdd, 0xd4, 0xd5, 0xd6, 0xd7]);
+        let mismatch = compare_audio_task_outcomes(&reference, &candidate);
         assert!(matches!(
-            compare_audio_task_outcomes(&reference, &candidate),
+            mismatch,
+            Err(AudioTaskOutcomeMismatch::DpcSubmission { index: 0, .. })
+        ));
+        if let Err(AudioTaskOutcomeMismatch::DpcSubmission {
+            reference,
+            candidate,
+            ..
+        }) = mismatch
+        {
+            assert_eq!(reference.source, candidate.source);
+            assert_eq!(
+                (reference.start, reference.end),
+                (candidate.start, candidate.end)
+            );
+            assert_ne!(reference.command_sha256, candidate.command_sha256);
+        }
+    }
+
+    #[test]
+    fn deferred_dpc_submissions_validate_source_specific_content() {
+        let rdram =
+            DeferredDpcSubmission::from_rdram_words(0x100, 0x108, vec![0x1122_3344, 0xaabb_ccdd])
+                .unwrap();
+        assert_eq!(rdram.source(), DpcSubmissionSource::Rdram);
+        assert_eq!((rdram.start(), rdram.end()), (0x100, 0x108));
+        assert_eq!(rdram.xbus_payload(), None);
+        assert_eq!(rdram.command_words(), [0x1122_3344, 0xaabb_ccdd]);
+        assert_eq!(
+            rdram.identity().command_sha256,
+            Sha256Digest::hash(&[0x11, 0x22, 0x33, 0x44, 0xaa, 0xbb, 0xcc, 0xdd])
+        );
+
+        let payload = vec![0x11, 0x22, 0x33, 0x44, 0xaa, 0xbb, 0xcc, 0xdd];
+        let dmem = DeferredDpcSubmission::from_dmem_payload(0x20, 0x28, payload.clone()).unwrap();
+        assert_eq!(dmem.source(), DpcSubmissionSource::Dmem);
+        assert_eq!(dmem.xbus_payload(), Some(payload.as_slice()));
+        assert_eq!(dmem.command_words(), [0x1122_3344, 0xaabb_ccdd]);
+        assert_eq!(dmem.identity().command_sha256, Sha256Digest::hash(&payload));
+
+        assert!(matches!(
+            DeferredDpcSubmission::from_rdram_words(0x104, 0x108, vec![0]),
+            Err(DpcSubmissionError::UnalignedRange { alignment: 8, .. })
+        ));
+        assert!(matches!(
+            DeferredDpcSubmission::from_rdram_words(0x00ff_fff8, 0x0100_0008, vec![0; 4]),
+            Err(DpcSubmissionError::SourceRangeOutOfBounds {
+                source: DpcSubmissionSource::Rdram,
+                upper_bound: 0x0100_0000,
+                ..
+            })
+        ));
+        assert_eq!(
+            DeferredDpcSubmission::from_rdram_words(0x100, 0x108, vec![0]),
+            Err(DpcSubmissionError::RdramCommandWordCount {
+                expected: 2,
+                actual: 1,
+            })
+        );
+        assert!(matches!(
+            DeferredDpcSubmission::from_dmem_payload(0x0ff8, 0x1008, vec![0; 16]),
+            Err(DpcSubmissionError::SourceRangeOutOfBounds {
+                source: DpcSubmissionSource::Dmem,
+                upper_bound: 0x1000,
+                ..
+            })
+        ));
+        assert_eq!(
+            DeferredDpcSubmission::from_dmem_payload(0x20, 0x28, vec![0; 7]),
+            Err(DpcSubmissionError::DmemPayloadLength {
+                expected: 8,
+                actual: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn dpc_comparison_preserves_submission_order_and_rdram_word_identity() {
+        let reference = outcome();
+        let mut candidate = reference.clone();
+        candidate.rsp.dpc_submissions = vec![
+            dmem_submission(0x28, &[8, 9, 10, 11, 12, 13, 14, 15]),
+            reference.rsp.dpc_submissions[0].clone(),
+        ];
+        let mut ordered_reference = reference.clone();
+        ordered_reference
+            .rsp
+            .dpc_submissions
+            .push(dmem_submission(0x28, &[8, 9, 10, 11, 12, 13, 14, 15]));
+        assert!(matches!(
+            compare_audio_task_outcomes(&ordered_reference, &candidate),
+            Err(AudioTaskOutcomeMismatch::DpcSubmission { index: 0, .. })
+        ));
+
+        let mut rdram_reference = reference.clone();
+        rdram_reference.rsp.dpc_submissions = vec![DeferredDpcSubmission::from_rdram_words(
+            0x100,
+            0x108,
+            vec![0x1122_3344, 0x5566_7788],
+        )
+        .unwrap()];
+        let mut rdram_candidate = rdram_reference.clone();
+        rdram_candidate.rsp.dpc_submissions[0] =
+            DeferredDpcSubmission::from_rdram_words(0x100, 0x108, vec![0x1122_3344, 0x5566_7789])
+                .unwrap();
+        assert!(matches!(
+            compare_audio_task_outcomes(&rdram_reference, &rdram_candidate),
             Err(AudioTaskOutcomeMismatch::DpcSubmission { index: 0, .. })
         ));
     }
@@ -1125,7 +1391,7 @@ mod tests {
             Err(RspVisibleStateError::InvalidPc(2))
         ));
         assert!(matches!(
-            DpcSubmissionIdentity::new(DpcSubmissionSource::Rdram, 8, 8, digest(0)),
+            DeferredDpcSubmission::from_rdram_words(8, 8, vec![]),
             Err(DpcSubmissionError::EmptyOrReversedRange { .. })
         ));
     }
