@@ -38,6 +38,7 @@ pub mod emit;
 pub mod execution;
 pub mod fallback;
 pub mod fetch;
+pub mod fpu;
 pub mod interp;
 pub mod module;
 pub mod runtime;

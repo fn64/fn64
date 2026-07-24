@@ -8,6 +8,7 @@ description = "From-scratch Rust MIPS III (VR4300) -> typed-Rust static recompil
 
 [dependencies]
 fn64-recomp = { path = "../fn64-recomp" }
+rustc_apfloat = "0.2.3"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 toml = "0.8"
