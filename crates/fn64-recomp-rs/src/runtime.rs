@@ -1083,6 +1083,314 @@ impl RecompContext {
         }
     }
 
+    /// Fold the IEEE conditions the soft-float shim reported into FCSR and decide
+    /// whether the op traps, returning `true` when an ENABLED exception fired.
+    ///
+    /// The VR4300 (User's Manual section 6.6, "Floating-Point Exceptions")
+    /// distinguishes two outcomes per operation, and the FCSR update differs:
+    ///
+    /// * **Trapped** — any raised condition whose FCSR Enable bit is set. The
+    ///   FPU writes the FCSR **Cause** field (so the handler can read which
+    ///   condition trapped) but leaves the sticky **Flags** field and the
+    ///   destination register **unchanged**, then vectors to the ExcCode-15
+    ///   general exception. The caller must NOT commit the computed result.
+    /// * **Not trapped** — no enabled condition fired. The FPU writes both the
+    ///   Cause field and ORs the sticky Flags bits, and the destination register
+    ///   takes the computed result.
+    ///
+    /// The Cause field is fully rewritten every operation (cleared first, exactly
+    /// as [`RecompContext::round_for_mode`] does for conversions); the sticky
+    /// Flags bits are only OR-ed in on the not-trapped path.
+    #[inline]
+    fn apply_fpu_flags(&mut self, flags: crate::fpu::Flags) -> bool {
+        // Assemble the Cause bits this op signalled. The five IEEE conditions
+        // occupy Cause 16:12 (index 0..4); the Unimplemented Operation (E) bit
+        // is Cause bit 17 (index 5). The full 6-bit Cause field is 17:12.
+        let ieee = u32::from(flags.inexact)
+            | (u32::from(flags.underflow) << 1)
+            | (u32::from(flags.overflow) << 2)
+            | (u32::from(flags.divbyzero) << 3)
+            | (u32::from(flags.invalid) << 4);
+        let cause = ieee | (u32::from(flags.unimplemented) << 5);
+
+        // A trap fires iff any IEEE condition whose Enable bit (FCSR 11:7) is
+        // set was signalled, OR the Unimplemented Operation bit is set. E has
+        // NO Enable bit and is UNMASKABLE — it always vectors to ExcCode 15
+        // (VR4300 User's Manual section 7.5). Enables never gate it.
+        let enables = (self.fcsr >> 7) & 0x1F;
+        let trapped = (ieee & enables != 0) || flags.unimplemented;
+
+        // Cause is rewritten unconditionally (clear the old 17:12 field, install
+        // the freshly signalled conditions) so the handler sees exactly what
+        // this op raised, on both the trapped and untrapped paths.
+        self.fcsr = (self.fcsr & !(0x3F << 12)) | (cause << 12);
+
+        if !trapped {
+            // No exception fired: accumulate the sticky Flag bits (6:2). E has
+            // no sticky Flag bit (only bits 6:2 exist), and it always traps, so
+            // it is never reached here — the IEEE bits are the only sticky ones.
+            self.fcsr |= ieee << 2;
+        }
+        trapped
+    }
+
+    /// Read the two-bit FCSR rounding mode (RM) field.
+    #[inline]
+    fn fcsr_rm(&self) -> u8 {
+        (self.fcsr & 3) as u8
+    }
+
+    // --- COP1 arithmetic routed through the IEEE soft-float shim (`fpu`). ---
+    //
+    // Each reads the operand bits, performs the op under FCSR.RM in `crate::fpu`
+    // (host-independent, IEEE-exact), then folds the returned IEEE flags into
+    // FCSR via `apply_fpu_flags`, which reports whether an ENABLED exception
+    // fired.
+    //
+    // # Result-commit ordering (the enabled-exception rule)
+    //
+    // On an enabled FP exception the VR4300 traps BEFORE writing the destination
+    // register (User's Manual section 6.6): the result is discarded and only the
+    // FCSR Cause field records the condition. So these methods compute first,
+    // fold the flags, and write the destination ONLY when no trap fired. Each
+    // returns `true` when it trapped — the emitted block lane checks that return
+    // and exits to the ExcCode-15 fault handler (exactly as the integer-overflow
+    // lane checks `checked_add` and exits to the IntegerOverflow handler). The
+    // straight-line / whole-function lane instead panics loudly on a trap
+    // (mirroring the `.expect("MIPS ADD integer overflow")` shape), since that
+    // lane has no exception-return ABI yet.
+    //
+    // Note the operand bits are sampled BEFORE the destination is written, so an
+    // in-place `fd == fs`/`fd == ft` op reads the original inputs even on the
+    // committed (non-trapping) path.
+
+    /// ADD.S: `fd = fs + ft` honoring FCSR.RM, with IEEE flags. Returns `true` if
+    /// an enabled exception trapped (destination left unwritten).
+    #[inline]
+    #[must_use]
+    pub fn fpu_add_s(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
+        let (bits, flags) = crate::fpu::add_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_f_bits(fd, bits);
+        false
+    }
+
+    /// SUB.S: `fd = fs - ft`.
+    #[inline]
+    #[must_use]
+    pub fn fpu_sub_s(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
+        let (bits, flags) = crate::fpu::sub_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_f_bits(fd, bits);
+        false
+    }
+
+    /// MUL.S: `fd = fs * ft`.
+    #[inline]
+    #[must_use]
+    pub fn fpu_mul_s(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
+        let (bits, flags) = crate::fpu::mul_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_f_bits(fd, bits);
+        false
+    }
+
+    /// DIV.S: `fd = fs / ft`.
+    #[inline]
+    #[must_use]
+    pub fn fpu_div_s(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
+        let (bits, flags) = crate::fpu::div_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_f_bits(fd, bits);
+        false
+    }
+
+    /// SQRT.S: `fd = sqrt(fs)`, correctly rounded under FCSR.RM.
+    #[inline]
+    #[must_use]
+    pub fn fpu_sqrt_s(&mut self, fd: u8, fs: u8) -> bool {
+        let (bits, flags) = crate::fpu::sqrt_s(self.f_bits(fs), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_f_bits(fd, bits);
+        false
+    }
+
+    /// ABS.S: `fd = |fs|` (sign-bit op; Invalid only on an SNaN operand).
+    #[inline]
+    #[must_use]
+    pub fn fpu_abs_s(&mut self, fd: u8, fs: u8) -> bool {
+        let (bits, flags) = crate::fpu::abs_s(self.f_bits(fs));
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_f_bits(fd, bits);
+        false
+    }
+
+    /// NEG.S: `fd = -fs` (sign-bit op; Invalid only on an SNaN operand).
+    #[inline]
+    #[must_use]
+    pub fn fpu_neg_s(&mut self, fd: u8, fs: u8) -> bool {
+        let (bits, flags) = crate::fpu::neg_s(self.f_bits(fs));
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_f_bits(fd, bits);
+        false
+    }
+
+    /// ADD.D: `fd = fs + ft`.
+    #[inline]
+    #[must_use]
+    pub fn fpu_add_d(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
+        let (bits, flags) = crate::fpu::add_d(self.d_bits(fs), self.d_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_d_bits(fd, bits);
+        false
+    }
+
+    /// SUB.D: `fd = fs - ft`.
+    #[inline]
+    #[must_use]
+    pub fn fpu_sub_d(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
+        let (bits, flags) = crate::fpu::sub_d(self.d_bits(fs), self.d_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_d_bits(fd, bits);
+        false
+    }
+
+    /// MUL.D: `fd = fs * ft`.
+    #[inline]
+    #[must_use]
+    pub fn fpu_mul_d(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
+        let (bits, flags) = crate::fpu::mul_d(self.d_bits(fs), self.d_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_d_bits(fd, bits);
+        false
+    }
+
+    /// DIV.D: `fd = fs / ft`.
+    #[inline]
+    #[must_use]
+    pub fn fpu_div_d(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
+        let (bits, flags) = crate::fpu::div_d(self.d_bits(fs), self.d_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_d_bits(fd, bits);
+        false
+    }
+
+    /// SQRT.D: `fd = sqrt(fs)`, correctly rounded under FCSR.RM.
+    #[inline]
+    #[must_use]
+    pub fn fpu_sqrt_d(&mut self, fd: u8, fs: u8) -> bool {
+        let (bits, flags) = crate::fpu::sqrt_d(self.d_bits(fs), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_d_bits(fd, bits);
+        false
+    }
+
+    /// ABS.D: `fd = |fs|`.
+    #[inline]
+    #[must_use]
+    pub fn fpu_abs_d(&mut self, fd: u8, fs: u8) -> bool {
+        let (bits, flags) = crate::fpu::abs_d(self.d_bits(fs));
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_d_bits(fd, bits);
+        false
+    }
+
+    /// NEG.D: `fd = -fs`.
+    #[inline]
+    #[must_use]
+    pub fn fpu_neg_d(&mut self, fd: u8, fs: u8) -> bool {
+        let (bits, flags) = crate::fpu::neg_d(self.d_bits(fs));
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
+        self.set_d_bits(fd, bits);
+        false
+    }
+
+    // --- FP conditional moves (MOVF/MOVT/MOVZ/MOVN.fmt). ---
+    //
+    // These copy the source FPR to the destination FPR only when a predicate
+    // holds; when it does not, the destination is left UNCHANGED. They are pure
+    // bit copies — no rounding, no IEEE exception, no FCSR effect (VR4300
+    // User's Manual, MOVF/MOVT/MOVZ/MOVN.fmt). The move width follows the format
+    // (single copies 32 bits through the FR-aware single accessor; double copies
+    // 64 bits through the double accessor), so the FR even/odd model applies
+    // uniformly.
+
+    /// `MOVF.S`/`MOVT.S`: `fd = fs` (single) iff `fpu_cond == tf`.
+    #[inline]
+    pub fn fpu_movcf_s(&mut self, fd: u8, fs: u8, tf: bool) {
+        if self.fpu_cond == tf {
+            self.set_f_bits(fd, self.f_bits(fs));
+        }
+    }
+
+    /// `MOVF.D`/`MOVT.D`: `fd = fs` (double) iff `fpu_cond == tf`.
+    #[inline]
+    pub fn fpu_movcf_d(&mut self, fd: u8, fs: u8, tf: bool) {
+        if self.fpu_cond == tf {
+            self.set_d_bits(fd, self.d_bits(fs));
+        }
+    }
+
+    /// `MOVZ.S`: `fd = fs` (single) iff GPR `rt` reads zero (full 64 bits).
+    #[inline]
+    pub fn fpu_movz_s(&mut self, fd: u8, fs: u8, rt: u8) {
+        if self.r(rt) == 0 {
+            self.set_f_bits(fd, self.f_bits(fs));
+        }
+    }
+
+    /// `MOVN.S`: `fd = fs` (single) iff GPR `rt` reads nonzero.
+    #[inline]
+    pub fn fpu_movn_s(&mut self, fd: u8, fs: u8, rt: u8) {
+        if self.r(rt) != 0 {
+            self.set_f_bits(fd, self.f_bits(fs));
+        }
+    }
+
+    /// `MOVZ.D`: `fd = fs` (double) iff GPR `rt` reads zero.
+    #[inline]
+    pub fn fpu_movz_d(&mut self, fd: u8, fs: u8, rt: u8) {
+        if self.r(rt) == 0 {
+            self.set_d_bits(fd, self.d_bits(fs));
+        }
+    }
+
+    /// `MOVN.D`: `fd = fs` (double) iff GPR `rt` reads nonzero.
+    #[inline]
+    pub fn fpu_movn_d(&mut self, fd: u8, fs: u8, rt: u8) {
+        if self.r(rt) != 0 {
+            self.set_d_bits(fd, self.d_bits(fs));
+        }
+    }
+
     /// Evaluate any of the sixteen C.cond.fmt predicates. The low three funct
     /// bits select unordered/equal/less participation; bit 3 selects signaling
     /// behavior. Quiet compares still signal on an SNaN.
@@ -1126,39 +1434,97 @@ impl RecompContext {
     // ================================================================
     // COP1 / FPU register file.
     //
-    // # The FR=0 even/odd pairing (the whole reason these aren't 32 plain f32s)
+    // # The FR bit selects between two register-file organizations
     //
-    // libultra boots every OSThread with the FPU in FR=0 mode: 16 paired
-    // 64-bit FGRs addressed by even register numbers. In that mode a 64-bit
-    // value (a double, or a `ldc1`/`sdc1`/`dmtc1` slot)
-    // lives in an *even* register `$f(2k)`, and the odd register `$f(2k+1)`
-    // is NOT independent — it aliases the HIGH 32 bits of that same 64-bit
-    // slot. A single-precision `$f(2k+1)` therefore reads/writes the top word
-    // of `$f(2k)`. This is exactly the `f_odd[(N-1)*2]` addressing the
-    // recompiled C uses (`fn64-abi::RecompContext::arm_fpr_alias`).
+    // COP0 Status bit 26 (FR) selects how the 32 physical 64-bit FPU registers
+    // are addressed (VR4300 User's Manual section 6.3.1, "Floating-Point
+    // General Registers", and the FR-bit description in the Status register,
+    // section 6.3.1.2 / Table 6-3):
     //
-    // We store the file as 32 `u64` slots and resolve a single-precision index
-    // to (slot, is_high_word). Even N -> (N, low word); odd N -> (N-1, high
-    // word). Double/64-bit ops address the even slot directly. All accessors
-    // move raw *bits* (`f32::from_bits`/`to_bits`), never a lossy cast, so a
-    // `MOV.S`/`MTC1` of a signalling-NaN pattern is preserved bit-exactly.
+    // * **FR=0** (libultra's default; every OSThread boots this way). There are
+    //   16 *logical* 64-bit FGRs addressed by EVEN register numbers only. A
+    //   64-bit value (double / `ldc1`/`sdc1`/`dmtc1`) lives in an even register
+    //   `$f(2k)`; the odd register `$f(2k+1)` is NOT independent — it aliases
+    //   the HIGH 32 bits of that same 64-bit slot, so a single-precision
+    //   `$f(2k+1)` reads/writes the top word of `$f(2k)`. This is exactly the
+    //   `f_odd[(N-1)*2]` addressing the recompiled C uses
+    //   (`fn64-abi::RecompContext::arm_fpr_alias`).
+    //
+    //   A *doubleword* op naming an ODD register in FR=0 is architecturally
+    //   UNDEFINED (the manual specifies doubleword ops take an even register in
+    //   this mode). The VR4300 has no separate physical storage for an odd
+    //   64-bit register here — the register number's low bit does not select an
+    //   independent register — so we model the documented physical addressing:
+    //   the low bit is dropped and the access lands on the even partner
+    //   `$f(idx & !1)`. That is a defined, non-panicking behavior consistent
+    //   with the silicon's register decode (no 17th..32nd physical double
+    //   exists to address in this mode); it is NOT a correctness claim about
+    //   undefined guest code, only a refusal to panic on it.
+    //
+    // * **FR=1**. All 32 registers are INDEPENDENT 64-bit FGRs: any register
+    //   number (even or odd) is a full, separate 64-bit register, and single-
+    //   precision `$fN` is the low 32 bits of its own slot `N` (no high-word
+    //   aliasing between an even/odd pair). This is the mode MIPS III 64-bit
+    //   code and any program that sets Status.FR uses.
+    //
+    // We store the file as 32 `u64` slots. The single/double accessors resolve
+    // the register number to (slot, is_high_word) *as a function of FR*. All
+    // accessors move raw *bits* (`f32::from_bits`/`to_bits`), never a lossy
+    // cast, so a `MOV.S`/`MTC1` of a signalling-NaN pattern is preserved
+    // bit-exactly.
     // ================================================================
 
-    /// The 64-bit slot and whether the low (false) or high (true) 32-bit word
-    /// holds single-precision register `idx` under FR=0.
+    /// Snapshot the raw 32-slot COP1 register file (all bits, mode-independent).
+    /// Used by the differential gate to compare the complete FPU state between
+    /// the block and interpreter lanes without going through the FR-aware
+    /// accessors (which alias in FR=0).
+    pub fn fpr_slots(&self) -> [u64; 32] {
+        self.fpr
+    }
+
+    /// Read COP0 Status.FR (register 12, bit 26): the FPU register-file mode.
+    /// `false` = FR=0 (16 paired 64-bit FGRs, even-addressed); `true` = FR=1
+    /// (32 independent 64-bit FGRs). VR4300 User's Manual section 6.3.1.2.
     #[inline]
-    fn fpr_single_slot(idx: u8) -> (usize, bool) {
-        if idx & 1 == 0 {
+    pub fn fpu_fr(&self) -> bool {
+        self.cop0_status & (1 << 26) != 0
+    }
+
+    /// The 64-bit slot and whether the low (false) or high (true) 32-bit word
+    /// holds single-precision register `idx`, honoring FR.
+    ///
+    /// FR=0: even N -> (N, low word); odd N -> (N-1, high word) — the even/odd
+    /// pairing. FR=1: every N is its own slot's low word (no aliasing).
+    #[inline]
+    fn fpr_single_slot(&self, idx: u8) -> (usize, bool) {
+        // FR=1: every register is its own slot's low word (no aliasing).
+        // FR=0: even N -> (N, low word); odd N -> the even partner's high word.
+        if self.fpu_fr() || idx & 1 == 0 {
             (idx as usize, false)
         } else {
             ((idx - 1) as usize, true)
         }
     }
 
+    /// The 64-bit slot backing doubleword register `idx`, honoring FR.
+    ///
+    /// FR=1: slot `idx` (all 32 independent). FR=0: the even partner
+    /// `idx & !1` — a doubleword op naming an odd register is architecturally
+    /// undefined in FR=0 and maps to the even physical register (see the
+    /// module comment above); it never panics.
+    #[inline]
+    fn fpr_double_slot(&self, idx: u8) -> usize {
+        if self.fpu_fr() {
+            idx as usize
+        } else {
+            (idx & !1) as usize
+        }
+    }
+
     /// Read single-precision FPR `idx` as raw 32 bits.
     #[inline]
     pub fn f_bits(&self, idx: u8) -> u32 {
-        let (slot, high) = Self::fpr_single_slot(idx);
+        let (slot, high) = self.fpr_single_slot(idx);
         if high {
             (self.fpr[slot] >> 32) as u32
         } else {
@@ -1170,7 +1536,7 @@ impl RecompContext {
     /// word of the even slot untouched).
     #[inline]
     pub fn set_f_bits(&mut self, idx: u8, bits: u32) {
-        let (slot, high) = Self::fpr_single_slot(idx);
+        let (slot, high) = self.fpr_single_slot(idx);
         if high {
             self.fpr[slot] = (self.fpr[slot] & 0x0000_0000_FFFF_FFFF) | ((bits as u64) << 32);
         } else {
@@ -1190,19 +1556,18 @@ impl RecompContext {
         self.set_f_bits(idx, val.to_bits());
     }
 
-    /// Read a doubleword (double / `dmtc1` / `ldc1`) FPR `idx` as raw 64 bits.
-    /// Under FR=0 these use even registers; we index the slot directly.
+    /// Read a doubleword (double / `dmtc1` / `ldc1`) FPR `idx` as raw 64 bits,
+    /// resolving the register number through the current FR mode.
     #[inline]
     pub fn d_bits(&self, idx: u8) -> u64 {
-        assert_eq!(idx & 1, 0, "FR=0 doubleword read from odd FPR f{idx}");
-        self.fpr[idx as usize]
+        self.fpr[self.fpr_double_slot(idx)]
     }
 
     /// Write raw 64 bits into doubleword FPR `idx`.
     #[inline]
     pub fn set_d_bits(&mut self, idx: u8, bits: u64) {
-        assert_eq!(idx & 1, 0, "FR=0 doubleword write to odd FPR f{idx}");
-        self.fpr[idx as usize] = bits;
+        let slot = self.fpr_double_slot(idx);
+        self.fpr[slot] = bits;
     }
 
     /// Read double-precision FPR `idx` as an `f64`.

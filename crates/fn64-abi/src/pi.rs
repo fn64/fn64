@@ -1445,6 +1445,7 @@ fn advance_device_time_step(now: u64) -> u32 {
                         overlays.push((
                             completion.dev_addr,
                             completion.dram_addr.offset() | 0x8000_0000,
+                            completion.len,
                         ));
                     }
                     if let Some(queue_addr) = pending.ret_queue {
@@ -1621,8 +1622,8 @@ fn advance_device_time_step(now: u64) -> u32 {
     #[cfg(feature = "recomp-rs")]
     crate::recompiled::process_live_executable_writes_from_host();
 
-    for (rom_start, dest_vram) in overlays {
-        note_dma_overlay_load(rom_start, dest_vram);
+    for (rom_start, dest_vram, len) in overlays {
+        note_dma_overlay_load(rom_start, dest_vram, len);
     }
     let mut committed_vi_ticks = 0u32;
     if !events.is_empty() {

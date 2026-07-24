@@ -136,6 +136,16 @@
 //!   WM2000/NWXE resident-bank function extents mechanically extracted from
 //!   aki-recomp's generated `syms/dump.toml`.
 //!
+//! - [`timing_trace`]: producer-neutral cycle-stamped device-event trace
+//!   interchange for the differential timing oracle, plus the fn64 fabric
+//!   capture tap. A C reference producer emits the same JSONL.
+//! - [`timing_diff`]: the differential timing comparator -- diffs fn64's
+//!   device-event stream against a reference emulator's under a two-tier
+//!   tolerance (zero-tolerance event ORDERING; a per-device cycle-count BAND),
+//!   reporting the first divergence. Never runs an emulator; consumes two
+//!   ingested [`timing_trace`] streams. The acceptance gate for every timing
+//!   refinement item.
+//!
 //! Dynamic indirect observations/callback-field semantics (Phase 6/7) and
 //! assembly verification (Phase 8) are not yet implemented.
 
@@ -183,6 +193,7 @@ pub mod rom;
 pub mod sig_scan;
 pub mod snapshot;
 pub mod spimdisasm_adapter;
+pub mod timing_diff;
 pub mod timing_trace;
 pub mod tool_adapter;
 pub mod tool_claims;
