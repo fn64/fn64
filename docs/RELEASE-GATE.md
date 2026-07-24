@@ -175,7 +175,14 @@ and semaphore, all eight DPC registers, and every ordered queued DPC
 submission with source, range, payload, and canonical words. DeviceState v14
 adds process-monotonic admission generations to the loaded-task token, sorted
 task lineage, next-generation allocator, and unavailable/in-flight owner tags;
-the latter two bind both task offset and generation. DeviceState v15
+the latter two bind a typed interpreter owner. A task owner binds both task
+offset and generation and keeps its original tags (3 and 4) byte-for-byte, so
+every report recorded before ownership became typed stays reproducible. A raw
+`SP_STATUS` clear-halt kick has no `OSTask` and binds only its generation,
+under appended tags 5 and 6; it is deliberately not given a placeholder task
+offset, which would be indistinguishable from a real task at that address.
+Raw kicks emit no `fn64.rsp-rdp-observations.v2` records, because that wire
+types `task_address` as non-optional. DeviceState v15
 additionally requires all four public DPC performance counters to be canonical
 24-bit values before encoding. It does not claim counter increments or STATUS
 counter-clear/transaction interleavings that the runtime does not yet model.

@@ -1198,16 +1198,9 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
         }
         fn64_runtime::DeviceMmioWriteEffect::RspStartRequested { pc } => {
             // A guest kicked the RSP through raw MMIO rather than through the
-            // libultra task shim. The device now reports that edge instead of
-            // silently latching it, but the execution wiring is not landed:
-            // the LLE runner keys its interpreter-ownership lineage on an
-            // OSTask address (`begin_rsp_interpreter_phase`, which panics on a
-            // missing lineage) and a raw kick has no task.
-            //
-            // Fail by name rather than return. Returning would reproduce the
-            // original defect exactly -- the guest would wait forever on an SP
-            // interrupt that never arrives, with no diagnostic.
-            crate::task_dispatch::raw_rsp_start_unsupported(pc);
+            // libultra task shim. Run it on the same LLE interpreter the task
+            // lane uses; ownership is a raw kick rather than a task lineage.
+            unsafe { crate::task_dispatch::dispatch_raw_rsp_start(rdram, pc) };
         }
     }
     true
