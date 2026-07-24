@@ -14,12 +14,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 pub const BLOCK_PACK_SCHEMA_V1: u32 = 1;
+/// V2 adds a per-block `rom_space`, so a pack can carry VROM (DMA-loaded,
+/// possibly compressed) blocks alongside physically-resident ones. A V1 pack
+/// deserializes with `rom_space = Physical`, which is exactly what it meant,
+/// so existing packs stay readable and keep their meaning.
+pub const BLOCK_PACK_SCHEMA_V2: u32 = 2;
+
+fn default_rom_space() -> crate::facts::RomAddressSpace {
+    crate::facts::RomAddressSpace::Physical
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackedBlockV1 {
     pub start_va: u32,
     pub end_va: u32,
+    /// Address space `rom_start`/`rom_end` are expressed in. Absent in V1
+    /// packs, which were physical-only.
+    #[serde(default = "default_rom_space")]
+    pub rom_space: crate::facts::RomAddressSpace,
     pub rom_start: u32,
     pub rom_end: u32,
     pub bytes_sha256: String,
@@ -88,6 +101,13 @@ pub enum BlockPackError {
         rom_end: u32,
     },
     BlockDigestMismatch {
+        bank: String,
+        start_va: u32,
+    },
+    /// A VROM-backed block cannot be re-verified without the file-table facts
+    /// that resolve it. Callers holding a `FactDb` should use
+    /// [`materialize_block_pack_with_facts`].
+    VromRequiresFacts {
         bank: String,
         start_va: u32,
     },
@@ -211,6 +231,7 @@ pub fn emit_block_pack_v1(
             blocks.push(PackedBlockV1 {
                 start_va: geom.start_va,
                 end_va: geom.end_va,
+                rom_space: block.rom_space,
                 rom_start: geom.rom_start,
                 rom_end: geom.rom_end,
                 bytes_sha256: sha256_hex(bytes),
@@ -225,19 +246,35 @@ pub fn emit_block_pack_v1(
     }
     banks.sort_by(|left, right| left.bank.cmp(&right.bank));
     Ok(BlockPackV1 {
-        schema_version: BLOCK_PACK_SCHEMA_V1,
+        schema_version: BLOCK_PACK_SCHEMA_V2,
         normalized_rom_sha256: snapshot.normalized_rom_sha256.clone(),
         banks,
     })
 }
 
+/// Materialize a pack whose blocks are all physically resident. A VROM-backed
+/// block returns [`BlockPackError::VromRequiresFacts`]; use
+/// [`materialize_block_pack_with_facts`] for packs that carry one.
 pub fn materialize_block_pack(
     pack: &BlockPackV1,
     rom: &NormalizedRom,
 ) -> Result<Vec<MaterializedPackedBank>, BlockPackError> {
-    if pack.schema_version != BLOCK_PACK_SCHEMA_V1 {
+    materialize_block_pack_with_facts(pack, rom, None)
+}
+
+/// Materialize a pack, resolving each block in its own address space. `facts`
+/// supplies the proven file-table records a VROM (DMA-loaded, possibly
+/// compressed) block needs; physical blocks never consult it.
+pub fn materialize_block_pack_with_facts(
+    pack: &BlockPackV1,
+    rom: &NormalizedRom,
+    facts: Option<&crate::facts::FactDb>,
+) -> Result<Vec<MaterializedPackedBank>, BlockPackError> {
+    if pack.schema_version != BLOCK_PACK_SCHEMA_V1
+        && pack.schema_version != BLOCK_PACK_SCHEMA_V2
+    {
         return Err(BlockPackError::UnsupportedSchema {
-            expected: BLOCK_PACK_SCHEMA_V1,
+            expected: BLOCK_PACK_SCHEMA_V2,
             actual: pack.schema_version,
         });
     }
@@ -261,9 +298,33 @@ pub fn materialize_block_pack(
         }
         let mut blocks = Vec::with_capacity(bank.blocks.len());
         for block in &bank.blocks {
-            let bytes = rom
-                .bytes
-                .get(block.rom_start as usize..block.rom_end as usize)
+            let resolved;
+            let bytes = match (block.rom_space, facts) {
+                (crate::facts::RomAddressSpace::Physical, _) => rom
+                    .bytes
+                    .get(block.rom_start as usize..block.rom_end as usize),
+                (crate::facts::RomAddressSpace::Virtual, Some(facts)) => {
+                    resolved = crate::banks::materialize_rom_range(
+                        rom,
+                        facts,
+                        crate::facts::RomAddressSpace::Virtual,
+                        block.rom_start,
+                        block.rom_end,
+                    )
+                    .map_err(|_| BlockPackError::RomRangeOutsideImage {
+                        bank: bank.bank.clone(),
+                        rom_start: block.rom_start,
+                        rom_end: block.rom_end,
+                    })?;
+                    Some(resolved.bytes.as_slice())
+                }
+                (crate::facts::RomAddressSpace::Virtual, None) => {
+                    return Err(BlockPackError::VromRequiresFacts {
+                        bank: bank.bank.clone(),
+                        start_va: block.start_va,
+                    });
+                }
+            }
                 .ok_or(BlockPackError::RomRangeOutsideImage {
                     bank: bank.bank.clone(),
                     rom_start: block.rom_start,
@@ -305,7 +366,18 @@ pub fn emit_block_program_source(
     rom: &NormalizedRom,
     config: BlockProgramSourceConfig,
 ) -> Result<String, BlockProgramSourceError> {
-    let mut banks = materialize_block_pack(pack, rom)?;
+    emit_block_program_source_with_facts(pack, rom, None, config)
+}
+
+/// As [`emit_block_program_source`], with the file-table facts a VROM-backed
+/// pack needs to re-verify its blocks.
+pub fn emit_block_program_source_with_facts(
+    pack: &BlockPackV1,
+    rom: &NormalizedRom,
+    facts: Option<&crate::facts::FactDb>,
+    config: BlockProgramSourceConfig,
+) -> Result<String, BlockProgramSourceError> {
+    let mut banks = materialize_block_pack_with_facts(pack, rom, facts)?;
     u32::try_from(banks.len())
         .map_err(|_| BlockProgramSourceError::TooManyBanks { count: banks.len() })?;
     for bank in &mut banks {
@@ -863,6 +935,7 @@ mod tests {
             PackedBlockV1 {
                 start_va,
                 end_va: start_va + 4,
+                rom_space: crate::facts::RomAddressSpace::Physical,
                 rom_start,
                 rom_end: rom_start + 4,
                 bytes_sha256: sha256_hex(&rom.bytes[rom_start as usize..rom_start as usize + 4]),
@@ -942,7 +1015,9 @@ mod tests {
         ));
 
         let mut wrong_schema = pack.clone();
-        wrong_schema.schema_version += 1;
+        // A version newer than any this build supports, so the check stays
+        // meaningful as supported versions are added.
+        wrong_schema.schema_version = BLOCK_PACK_SCHEMA_V2 + 1;
         assert!(matches!(
             materialize_block_pack(&wrong_schema, &rom),
             Err(BlockPackError::UnsupportedSchema { .. })

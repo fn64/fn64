@@ -34,8 +34,8 @@ use fn64_discover::delta_vote::DeltaVoteConfig;
 use fn64_discover::facts::{FunctionEntryEvidence, ProofState};
 use fn64_discover::overlay_regions::SearchConfig;
 use fn64_discover::block_pack::{
-    emit_block_pack_v1, emit_block_program_source, materialize_block_pack, BlockPackV1,
-    BlockProgramSourceConfig,
+    emit_block_pack_v1, emit_block_program_source_with_facts, materialize_block_pack_with_facts,
+    BlockPackV1, BlockProgramSourceConfig,
 };
 use fn64_discover::snapshot::{compose_materialized_banks_v1, MaterializedBankInput};
 use fn64_discover::{
@@ -194,7 +194,7 @@ fn score_rom(spec: &RomSpec, path: &str) -> Result<(), String> {
     // module. This is measurement, not part of the scoreboard, so it never
     // changes the classification below.
     if let Some(out) = std::env::var_os(EMIT_BLOCK_PROGRAM_VAR) {
-        emit_block_program(spec.label, &rom, &snapshots, &out.to_string_lossy())?;
+        emit_block_program(spec.label, &rom, &facts, &snapshots, &out.to_string_lossy())?;
     }
 
     let board = scoreboard(&snapshots);
@@ -250,6 +250,7 @@ fn discover(rom_bytes: &[u8], discovery: Discovery) -> Result<(NormalizedRom, Fa
 fn emit_block_program(
     label: &str,
     rom: &NormalizedRom,
+    facts: &FactDb,
     snapshots: &[fn64_discover::snapshot::ProgramSnapshotV1],
     out_path: &str,
 ) -> Result<(), String> {
@@ -278,7 +279,7 @@ fn emit_block_program(
     }
     pack.banks.sort_by(|left, right| left.bank.cmp(&right.bank));
 
-    let materialized = materialize_block_pack(&pack, rom)
+    let materialized = materialize_block_pack_with_facts(&pack, rom, Some(facts))
         .map_err(|error| format!("materializing whole-ROM BlockPack: {error:?}"))?;
     let blocks: usize = materialized.iter().map(|bank| bank.blocks.len()).sum();
 
@@ -301,9 +302,10 @@ fn emit_block_program(
         .min()
         .ok_or_else(|| "boot bank has no blocks".to_string())?;
 
-    let source = emit_block_program_source(
+    let source = emit_block_program_source_with_facts(
         &pack,
         rom,
+        Some(facts),
         BlockProgramSourceConfig {
             entry: fn64_recomp_rs::ExecutionKey::new(
                 fn64_recomp_rs::BankId::new(entry_bank.bank_id),
