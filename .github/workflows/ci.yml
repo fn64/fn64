@@ -26,25 +26,24 @@ jobs:
     name: cargo nextest (workspace)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       # fn64-audio/fn64-shell link ALSA via cpal/gilrs; the runner image has no
       # libasound headers, so alsa-sys' build.rs panics before any test runs.
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
-      # aki-audio-ucode recompiles the AKI ucode from a licensed WM2000 ROM at
-      # build time (examples/wm2000-boot/audio-ucode/build.rs panics without one).
-      # No ROM can live in CI, so exclude it -- every other workspace crate is
-      # ROM-free. Verified locally: 2166 passed, 0 failed.
-      - run: cargo nextest run --workspace --exclude aki-audio-ucode
+      # The ROM-gated aki-audio-ucode lives in examples/*/audio-ucode, which are
+      # their own workspaces -- `--workspace` never reaches them, so no exclude
+      # is needed (naming it only emitted "excluded package(s) not found").
+      - run: cargo nextest run --workspace
 
   docs:
     name: doc-drift lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       # lint-docs.py shells out to `rg`, which isn't on the runner image.

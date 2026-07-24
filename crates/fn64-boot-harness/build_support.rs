@@ -1,3 +1,10 @@
+// Included via `#[path]` by several build scripts across separate workspaces
+// (fn64-shell, examples/{oot,sm64,wm2000}-boot), each of which uses a
+// different subset of the helpers below. Anything unused by one consumer is
+// still used by another, so dead_code here is a property of the include model
+// rather than genuinely unreachable code.
+#![allow(dead_code)]
+
 //! Build-time preparation shared by every generated-C consumer.
 //!
 //! N64Recomp emits C, while fn64 compiles those translation units as C++ so
