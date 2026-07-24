@@ -1899,3 +1899,260 @@ mod tests {
         assert!(note.contains("too short"));
     }
 }
+
+/// One mechanically recovered DMA-request routine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredRequestDmaCallee {
+    pub callee_va: u32,
+    pub corroborated_sites: usize,
+    pub resolved_sites: usize,
+}
+
+/// What mechanical request-DMA callee recovery admitted and left open.
+#[derive(Debug, Default)]
+pub struct RequestDmaCalleeRecovery {
+    pub admitted: Vec<RecoveredRequestDmaCallee>,
+    pub open: Vec<String>,
+}
+
+/// Recover, from ROM bytes alone, the routine a game uses to DMA a resident
+/// image into RDRAM.
+///
+/// A resident code image is loaded by an explicit `RequestSync(ram, vrom,
+/// size)`-shaped call rather than named by any descriptor table, so its VRAM
+/// destination is invisible to table recovery. Rather than cite that routine's
+/// address, admit it on machine-checkable evidence: a candidate IS the
+/// DMA-request routine when the constant `(vrom, size)` operands recovered at
+/// its direct call sites land exactly on file-table records already proven
+/// from this ROM.
+///
+/// The rule is deliberately unforgiving. A candidate with ANY resolved call
+/// site whose operands name no proven record is rejected outright: a real
+/// loader's arguments describe real files, so one contradiction means the
+/// shape matched something else.
+pub fn recover_request_dma_callees(
+    rom: &NormalizedRom,
+    db: &FactDb,
+    min_corroborated_sites: usize,
+) -> RequestDmaCalleeRecovery {
+    use crate::loaders::VirtualAddress;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut recovery = RequestDmaCalleeRecovery::default();
+    let Some((boot_rom_start, boot_rom_end, boot_va_start)) =
+        db.proven_rom_mappings().iter().find_map(|fact| match fact {
+            Fact::RomMapping {
+                bank,
+                rom_start,
+                rom_end,
+                va_start,
+                ..
+            } if bank == BOOT_BANK => Some((*rom_start, *rom_end, *va_start)),
+            _ => None,
+        })
+    else {
+        recovery
+            .open
+            .push("boot bank not proven; request-dma callee recovery skipped".to_string());
+        return recovery;
+    };
+    let Some(image) = rom
+        .bytes
+        .get(boot_rom_start as usize..boot_rom_end as usize)
+    else {
+        recovery
+            .open
+            .push("boot bank ROM interval is outside the normalized image".to_string());
+        return recovery;
+    };
+    let words: Vec<u32> = image
+        .chunks_exact(4)
+        .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+        .collect();
+
+    // The corroboration set: every (vrom_start, length) a proven file-table
+    // record already describes. Recovered operands must hit one exactly.
+    let mut records: BTreeSet<(u32, u32)> = BTreeSet::new();
+    for (_, fact) in db.proven_vrom_file_mappings() {
+        if let Fact::LoadImageTableRecord {
+            source_start,
+            source_end,
+            ..
+        } = fact
+        {
+            if let Some(len) = source_end.checked_sub(*source_start) {
+                records.insert((*source_start, len));
+            }
+        }
+    }
+    if records.is_empty() {
+        recovery
+            .open
+            .push("no proven file-table records to corroborate against".to_string());
+        return recovery;
+    }
+
+    // Count direct call sites per target so the scan can skip targets with
+    // fewer sites than the rule requires. This is only a bound on work: the
+    // admission evidence is the exact record match below, never the count.
+    let mut sites_per_target: BTreeMap<u32, usize> = BTreeMap::new();
+    for (index, word) in words.iter().enumerate() {
+        if word >> 26 != 0x03 {
+            continue;
+        }
+        let pc = boot_va_start.wrapping_add((index as u32) * 4);
+        let target = (pc & 0xF000_0000) | ((word & 0x03FF_FFFF) << 2);
+        *sites_per_target.entry(target).or_default() += 1;
+    }
+
+    for (callee_va, site_count) in sites_per_target {
+        if site_count < min_corroborated_sites {
+            continue;
+        }
+        // o32 `RequestSync(ram, vrom, size)`: $a0/$a1/$a2.
+        let Ok(slices) = crate::pi_dma::slice_load_request_calls(
+            &words,
+            VirtualAddress::new(boot_va_start),
+            VirtualAddress::new(callee_va),
+            SCAN_RDRAM_LEN,
+            4,
+            5,
+            6,
+        ) else {
+            continue;
+        };
+        let mut corroborated = 0usize;
+        let mut resolved = 0usize;
+        let mut contradicted = false;
+        for slice in &slices {
+            let (Some(device), Some(bytes)) =
+                (slice.device_address.proven(), slice.byte_count.proven())
+            else {
+                continue;
+            };
+            resolved += 1;
+            if records.contains(&(device.get(), bytes.get())) {
+                corroborated += 1;
+            } else {
+                contradicted = true;
+                break;
+            }
+        }
+        if contradicted || corroborated < min_corroborated_sites {
+            continue;
+        }
+        recovery.admitted.push(RecoveredRequestDmaCallee {
+            callee_va,
+            corroborated_sites: corroborated,
+            resolved_sites: resolved,
+        });
+    }
+    if recovery.admitted.is_empty() {
+        recovery
+            .open
+            .push("no callee's call-site operands corroborated against proven file records".to_string());
+    }
+    recovery
+
+}
+
+#[cfg(test)]
+mod request_dma_recovery_tests {
+    use super::*;
+    use crate::rom::normalize;
+
+    /// Place `words` at the start of the IPL3 boot image of a synthetic z64.
+    fn rom_with_boot_words(entry: u32, words: &[u32]) -> NormalizedRom {
+        let mut buf = vec![0u8; BOOT_COPY_ROM_START as usize + BOOT_COPY_SIZE as usize];
+        buf[0..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        buf[8..12].copy_from_slice(&entry.to_be_bytes());
+        buf[0x20..0x24].copy_from_slice(b"TEST");
+        buf[0x3b..0x3f].copy_from_slice(b"CTSE");
+        for (index, word) in words.iter().enumerate() {
+            let offset = BOOT_COPY_ROM_START as usize + index * 4;
+            buf[offset..offset + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        normalize(&buf).expect("valid synthetic z64")
+    }
+
+    /// Boot image that materializes `(ram, vrom, size)` in $a0/$a1/$a2 and
+    /// calls `loader`, mirroring an o32 `RequestSync(ram, vrom, size)` site.
+    fn boot_calling_loader(vrom: u32, size: u32, loader: u32) -> Vec<u32> {
+        vec![
+            0x2405_0000 | (vrom & 0xFFFF),               // addiu $a1, $zero, vrom
+            0x2406_0000 | (size & 0xFFFF),               // addiu $a2, $zero, size
+            0x3C04_8000,                                 // lui   $a0, 0x8000
+            0x0C00_0000 | ((loader & 0x0FFF_FFFF) >> 2), // jal   loader
+            0x0000_0000,                                 // nop
+        ]
+    }
+
+    fn db_with_proven_record(rom: &NormalizedRom, vrom: u32, size: u32) -> FactDb {
+        let mut db = FactDb::new();
+        discover_boot_bank(rom, &mut db);
+        let fact = db.insert(Fact::LoadImageTableRecord {
+            table: "t".to_string(),
+            bank: None,
+            table_space: RomAddressSpace::Physical,
+            table_offset: 0,
+            index: 0,
+            source_space: crate::facts::MappingAddressSpace::VirtualRom,
+            source_start: vrom,
+            source_end: vrom + size,
+            destination_space: crate::facts::MappingAddressSpace::PhysicalRom,
+            destination_start: 0,
+            destination_end: size,
+        });
+        db.conclude(
+            load_image_table_record_subject("t", 0),
+            ProofState::Proven,
+            vec![fact],
+            "test fixture",
+        )
+        .expect("fresh conclusion");
+        db
+    }
+
+    const FIXTURE_VROM: u32 = 0x1060;
+    const FIXTURE_SIZE: u32 = 0x63d0;
+    const FIXTURE_LOADER: u32 = 0x8000_0500;
+
+    #[test]
+    fn request_dma_callee_is_recovered_when_operands_hit_a_proven_record() {
+        let rom = rom_with_boot_words(
+            0x8000_0400,
+            &boot_calling_loader(FIXTURE_VROM, FIXTURE_SIZE, FIXTURE_LOADER),
+        );
+        let db = db_with_proven_record(&rom, FIXTURE_VROM, FIXTURE_SIZE);
+
+        let recovery = recover_request_dma_callees(&rom, &db, 1);
+        assert_eq!(
+            recovery.admitted.len(),
+            1,
+            "exactly the loader should be admitted, got {:?}",
+            recovery.admitted
+        );
+        assert_eq!(recovery.admitted[0].callee_va, FIXTURE_LOADER);
+        assert_eq!(recovery.admitted[0].corroborated_sites, 1);
+    }
+
+    #[test]
+    fn request_dma_callee_is_rejected_when_operands_name_no_proven_record() {
+        // Identical call site, but the proven record describes a different
+        // length. One contradicting site must reject the candidate outright --
+        // this is what stops an arbitrary three-argument call from being
+        // mistaken for a loader.
+        let rom = rom_with_boot_words(
+            0x8000_0400,
+            &boot_calling_loader(FIXTURE_VROM, FIXTURE_SIZE, FIXTURE_LOADER),
+        );
+        let db = db_with_proven_record(&rom, FIXTURE_VROM, FIXTURE_SIZE + 0x10);
+
+        let recovery = recover_request_dma_callees(&rom, &db, 1);
+        assert!(
+            recovery.admitted.is_empty(),
+            "a size that matches no record must not be admitted, got {:?}",
+            recovery.admitted
+        );
+    }
+}

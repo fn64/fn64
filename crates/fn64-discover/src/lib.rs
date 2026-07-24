@@ -365,6 +365,15 @@ pub fn run_discovery_with_recovered_overlay_regions(
 /// as generalized load-image shapes already consumed by Phase 2. No table
 /// location, stride, field offset, record count, or destination address is a
 /// caller-supplied game fact.
+/// One corroborated call site is enough. The evidence is not how often a
+/// routine is called -- a game may load its resident image exactly once from
+/// boot -- but that the constant `(vrom, size)` pair recovered at the site
+/// lands EXACTLY on a file-table record already proven from this ROM. Both
+/// fields must match, so a coincidental hit against the recovered record set
+/// is not a realistic failure mode; a single contradicting site still
+/// rejects the candidate outright.
+const REQUEST_DMA_MIN_SITES: usize = 1;
+
 pub fn run_discovery_with_recovered_vrom_overlay_regions(
     rom_bytes: &[u8],
     input: &RecoveredVromOverlayInput,
@@ -498,7 +507,28 @@ pub fn run_discovery_with_recovered_vrom_and_request_dma(
     let mut db = FactDb::new();
     banks::discover_boot_bank(&rom, &mut db);
     banks::scan_load_image_tables(&rom, &recovered_inputs, &mut db);
-    let request_dma_report = banks::scan_static_request_dma(&rom, request_dma, &mut db);
+    // Mechanically recover the game's DMA-request routine rather than citing
+    // its address: a candidate is admitted only when its call-site (vrom,
+    // size) operands land exactly on file-table records already proven above.
+    // Caller-supplied claims, if any, are unioned in and take no precedence.
+    let callee_recovery = banks::recover_request_dma_callees(&rom, &db, REQUEST_DMA_MIN_SITES);
+    let mut effective: Vec<banks::StaticRequestDmaInput> = request_dma.to_vec();
+    for (index, callee) in callee_recovery.admitted.iter().enumerate() {
+        if effective.iter().any(|c| c.callee_va == callee.callee_va) {
+            continue;
+        }
+        effective.push(banks::StaticRequestDmaInput {
+            name: format!("recovered_request_dma_{index}"),
+            callee_va: callee.callee_va,
+            dram_arg_register: 4,
+            device_arg_register: 5,
+            size_arg_register: 6,
+            size_is_end_address: false,
+            device_space: RomAddressSpace::Virtual,
+            bank_name: banks::BankNamePattern::new("request_dma_", 0, ""),
+        });
+    }
+    let request_dma_report = banks::scan_static_request_dma(&rom, &effective, &mut db);
     harvest::harvest_discovered_candidates(&rom, &mut db)
         .expect("Phase 2 produced a malformed recovered VROM overlay mapping");
     Ok((rom, db, recovery, request_dma_report))
