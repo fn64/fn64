@@ -71,6 +71,21 @@ fn env_path(name: &str) -> std::path::PathBuf {
 /// 0..=153 (RAM 0x80246000..0x8032D560); see this file's module doc.
 const SM64_RESIDENT_SECTIONS: usize = 154;
 
+/// End of the `main` segment's loaded image in RDRAM: `_mainSegmentNoloadStart`
+/// from `build/us/sm64.us.map`. The N64 IPL loads the ENTIRE `.main` segment
+/// (ROM 0x1000..0xf5580) contiguously to RAM 0x80246000..0x8033a580 -- code,
+/// rodata AND initialized `.data` -- before the first instruction. Everything
+/// above this (`.main.noload`, i.e. BSS) is zero-initialized, not ROM-backed.
+///
+/// The recomp section_table only tabulates *code* (functions); it does not
+/// describe the segment's rodata/data. Seeding only the tabulated code sections
+/// leaves initialized globals living in the gaps between/after code sections
+/// (e.g. `gAudioHeapSize` @ 0x80334ffc, `gAudioInitPoolSize` @ 0x80335000) as
+/// zero, which makes `soundAlloc(&gAudioInitPool, ...)` overflow-and-return-NULL
+/// inside `audio_init` -> a null 16-bit store trap. Seeding the full contiguous
+/// image (what hardware does) fixes that at its true source.
+const SM64_MAIN_SEGMENT_NOLOAD_START: u32 = 0x8033_a580;
+
 // The build.rs-generated registrar (from RECOMPILED_DIR, into OUT_DIR): walks
 // SM64's `static_<sec>_<vram>` functions -- called directly by recompiled code
 // but absent from recomp_overlays.inl's section_table -- and hands each to the
@@ -161,6 +176,31 @@ fn main() {
             first.0
         );
     }
+    // Seed the ENTIRE `main` segment contiguously (ROM..RAM), exactly as the N64
+    // IPL does -- not just the tabulated code sections. This carries the
+    // segment's initialized `.rodata`/`.data` (which the recomp section_table
+    // does not describe) into RDRAM, so link-time-constant data globals like
+    // `gAudioHeapSize`/`gAudioInitPoolSize` read their real ROM values instead
+    // of zero. See `SM64_MAIN_SEGMENT_NOLOAD_START`. The per-section seed below
+    // would be redundant with this (contiguous is a superset), but is kept as a
+    // defensive exactness check on the code sections' geometry.
+    let (main_rom_start, main_ram_start) = resident_sections
+        .first()
+        .map(|first| (first.0, first.1))
+        .expect("SM64 main segment has at least one resident section");
+    let main_image_size = SM64_MAIN_SEGMENT_NOLOAD_START
+        .checked_sub(main_ram_start)
+        .expect("main-segment noload start must be above its load address");
+    println!(
+        "[sm64-boot] seeding full main segment: ram {main_ram_start:#010x}..{:#010x} \
+         (rom {main_rom_start:#08x}.., {main_image_size:#x} bytes) -- code+rodata+data",
+        main_ram_start + main_image_size
+    );
+    fn64_boot_harness::seed_resident_sections(
+        &mut rdram,
+        &rom_bytes,
+        &[(main_rom_start, main_ram_start, main_image_size)],
+    );
     fn64_boot_harness::seed_resident_sections(&mut rdram, &rom_bytes, &resident_sections);
 
     // Register SM64's corpus-static functions (called directly but omitted
