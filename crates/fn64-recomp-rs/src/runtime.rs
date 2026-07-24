@@ -814,6 +814,21 @@ impl RecompContext {
         }
     }
 
+    /// Whether COP0 is usable for the current Status. EXL/ERL force kernel
+    /// mode; ordinary KSU=Kernel is always authorized; User and Supervisor
+    /// require CU0. This predicate is shared by emitted-bank and interpreter
+    /// guards so privilege is checked before any COP0-specific effect.
+    pub fn cop0_usable(&self) -> bool {
+        const STATUS_EXL: u32 = 1 << 1;
+        const STATUS_ERL: u32 = 1 << 2;
+        const STATUS_KSU_MASK: u32 = 0b11 << 3;
+        const STATUS_CU0: u32 = 1 << 28;
+
+        self.cop0_status & (STATUS_EXL | STATUS_ERL) != 0
+            || self.cop0_status & STATUS_KSU_MASK == 0
+            || self.cop0_status & STATUS_CU0 != 0
+    }
+
     /// Classify one effective address before translation.
     ///
     /// VR4300 User's Manual chapter 3, Tables 3-2 through 3-4, define the

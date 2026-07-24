@@ -494,9 +494,11 @@ pub fn emit_bank_runner_with_host_calls(bank: &BankInput<'_>, host_calls: &[u32]
                 "                finish!(BlockExit::Checkpoint(ExecutionKey::new(expected_bank, GuestPc::new(pc))));"
             );
             let _ = writeln!(out, "            }}");
+            emit_bank_cop0_guard(&mut out, instr, vram, vram, false, bank.bank, false);
             let _ = writeln!(out, "            executed += 2;");
             emit_bank_control_transfer(&mut out, instr, vram, delay, vram + 4, bank.bank, &domain);
         } else {
+            emit_bank_cop0_guard(&mut out, instr, vram, vram, false, bank.bank, false);
             if !emit_bank_eret(&mut out, instr, bank.bank)
                 && !emit_bank_overflow(&mut out, instr, vram, vram, false, bank.bank, false)
                 && !emit_bank_fpu_trap(&mut out, instr, vram, vram, false, bank.bank, false)
@@ -750,6 +752,7 @@ fn emit_sparse_bank_runner_inner(
         let delay_vram = vram.checked_add(4);
         let delay = delay_vram.and_then(|address| instrs.get(&address).copied());
         if instr.has_delay_slot() && !delay_slots.contains(&vram) && delay.is_none() {
+            emit_bank_cop0_guard(&mut out, instr, vram, vram, false, bank.bank, false);
             emit_data_control_word(&mut out, vram);
         } else if instr.has_delay_slot() && !delay_slots.contains(&vram) {
             let delay_vram = delay_vram.expect("sparse bank delay-slot address exceeds u32");
@@ -762,13 +765,16 @@ fn emit_sparse_bank_runner_inner(
                 "                finish!(BlockExit::Checkpoint(ExecutionKey::new(expected_bank, GuestPc::new(pc))));"
             );
             let _ = writeln!(out, "            }}");
+            emit_bank_cop0_guard(&mut out, instr, vram, vram, false, bank.bank, false);
             let _ = writeln!(out, "            executed += 2;");
             emit_bank_control_transfer(
                 &mut out, instr, vram, delay, delay_vram, bank.bank, &domain,
             );
         } else if instr.has_delay_slot() {
+            emit_bank_cop0_guard(&mut out, instr, vram, vram, false, bank.bank, false);
             emit_data_control_word(&mut out, vram);
         } else {
+            emit_bank_cop0_guard(&mut out, instr, vram, vram, false, bank.bank, false);
             if !emit_bank_eret(&mut out, instr, bank.bank)
                 && !emit_bank_overflow(&mut out, instr, vram, vram, false, bank.bank, false)
                 && !emit_bank_fpu_trap(&mut out, instr, vram, vram, false, bank.bank, false)
@@ -960,6 +966,7 @@ fn emit_bank_control_transfer(
             if delay.has_delay_slot() {
                 emit_data_control_word(out, delay_vram);
             } else {
+                emit_bank_cop0_guard(out, delay, delay_vram, vram, true, bank, true);
                 emit_bank_cop1_guard(out, delay, delay_vram, vram, true, bank, true);
                 if !emit_bank_overflow(out, delay, delay_vram, vram, true, bank, true)
                     && !emit_bank_fpu_trap(out, delay, delay_vram, vram, true, bank, true)
@@ -1370,6 +1377,45 @@ fn emit_fpu_compare(
             );
         }
     }
+}
+
+/// Emit the shared kernel-or-Status.CU0 check before any COP0-visible effect.
+/// A COP0 branch is guarded before its delay slot; a COP0 instruction in
+/// another branch's delay slot retains the branch EPC and sets Cause.BD.
+fn emit_bank_cop0_guard(
+    out: &mut String,
+    instr: Instruction,
+    fault_vram: u32,
+    epc: u32,
+    branch_delay: bool,
+    bank: BankId,
+    already_counted: bool,
+) {
+    if !instr.requires_cop0() {
+        return;
+    }
+    let _ = writeln!(out, "            if !ctx.cop0_usable() {{");
+    if !already_counted {
+        let _ = writeln!(out, "                executed += 1;");
+    }
+    let _ = writeln!(out, "                finish!(BlockExit::Fault(CpuFault {{");
+    let _ = writeln!(out, "                    at: ExecutionKey::new(BankId::new({:#018X}), GuestPc::new({fault_vram:#010X})),", bank.get());
+    let _ = writeln!(out, "                    kind: CpuFaultKind::Exception {{");
+    let _ = writeln!(
+        out,
+        "                        exception: CpuException::CoprocessorUnusable,"
+    );
+    let _ = writeln!(
+        out,
+        "                        epc: GuestPc::new({epc:#010X}),"
+    );
+    let _ = writeln!(out, "                        branch_delay: {branch_delay},");
+    let _ = writeln!(out, "                        instruction_code: 0,");
+    let _ = writeln!(out, "                        bad_vaddr: None,");
+    let _ = writeln!(out, "                        coprocessor: Some(0),");
+    let _ = writeln!(out, "                    }},");
+    let _ = writeln!(out, "                }}));");
+    let _ = writeln!(out, "            }}");
 }
 
 /// Emit the Status.CU1 check before any COP1-visible effect. A branch checks
