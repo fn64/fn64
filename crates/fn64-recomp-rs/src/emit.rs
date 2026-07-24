@@ -2142,40 +2142,28 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
         ),
 
         // --- Single-precision arithmetic ---
-        AddS { fd, fs, ft } => {
-            line(out, format!("ctx.set_f_s({}, ctx.f_s({}) + ctx.f_s({}));", fd, fs, ft))
-        }
-        SubS { fd, fs, ft } => {
-            line(out, format!("ctx.set_f_s({}, ctx.f_s({}) - ctx.f_s({}));", fd, fs, ft))
-        }
-        MulS { fd, fs, ft } => {
-            line(out, format!("ctx.set_f_s({}, ctx.f_s({}) * ctx.f_s({}));", fd, fs, ft))
-        }
-        DivS { fd, fs, ft } => {
-            line(out, format!("ctx.set_f_s({}, ctx.f_s({}) / ctx.f_s({}));", fd, fs, ft))
-        }
-        AbsS { fd, fs } => line(out, format!("ctx.set_f_s({}, ctx.f_s({}).abs());", fd, fs)),
-        NegS { fd, fs } => line(out, format!("ctx.set_f_s({}, -ctx.f_s({}));", fd, fs)),
-        SqrtS { fd, fs } => line(out, format!("ctx.set_f_s({}, ctx.f_s({}).sqrt());", fd, fs)),
+        // Routed through the IEEE soft-float shim so the op honors FCSR.RM and
+        // sets the FCSR Cause/Flag bits (`crate::fpu` via the `ctx.fpu_*`
+        // helpers). The raw-host `+`/`*`/`.sqrt()` path (round-to-nearest,
+        // no flags) is retired.
+        AddS { fd, fs, ft } => line(out, format!("ctx.fpu_add_s({}, {}, {});", fd, fs, ft)),
+        SubS { fd, fs, ft } => line(out, format!("ctx.fpu_sub_s({}, {}, {});", fd, fs, ft)),
+        MulS { fd, fs, ft } => line(out, format!("ctx.fpu_mul_s({}, {}, {});", fd, fs, ft)),
+        DivS { fd, fs, ft } => line(out, format!("ctx.fpu_div_s({}, {}, {});", fd, fs, ft)),
+        AbsS { fd, fs } => line(out, format!("ctx.fpu_abs_s({}, {});", fd, fs)),
+        NegS { fd, fs } => line(out, format!("ctx.fpu_neg_s({}, {});", fd, fs)),
+        SqrtS { fd, fs } => line(out, format!("ctx.fpu_sqrt_s({}, {});", fd, fs)),
         // MOV.S is a bit-exact copy (not an arithmetic op): move the raw word.
         MovS { fd, fs } => line(out, format!("ctx.set_f_bits({}, ctx.f_bits({}));", fd, fs)),
 
-        // --- Double-precision arithmetic ---
-        AddD { fd, fs, ft } => {
-            line(out, format!("ctx.set_f_d({}, ctx.f_d({}) + ctx.f_d({}));", fd, fs, ft))
-        }
-        SubD { fd, fs, ft } => {
-            line(out, format!("ctx.set_f_d({}, ctx.f_d({}) - ctx.f_d({}));", fd, fs, ft))
-        }
-        MulD { fd, fs, ft } => {
-            line(out, format!("ctx.set_f_d({}, ctx.f_d({}) * ctx.f_d({}));", fd, fs, ft))
-        }
-        DivD { fd, fs, ft } => {
-            line(out, format!("ctx.set_f_d({}, ctx.f_d({}) / ctx.f_d({}));", fd, fs, ft))
-        }
-        AbsD { fd, fs } => line(out, format!("ctx.set_f_d({}, ctx.f_d({}).abs());", fd, fs)),
-        NegD { fd, fs } => line(out, format!("ctx.set_f_d({}, -ctx.f_d({}));", fd, fs)),
-        SqrtD { fd, fs } => line(out, format!("ctx.set_f_d({}, ctx.f_d({}).sqrt());", fd, fs)),
+        // --- Double-precision arithmetic (routed through the shim). ---
+        AddD { fd, fs, ft } => line(out, format!("ctx.fpu_add_d({}, {}, {});", fd, fs, ft)),
+        SubD { fd, fs, ft } => line(out, format!("ctx.fpu_sub_d({}, {}, {});", fd, fs, ft)),
+        MulD { fd, fs, ft } => line(out, format!("ctx.fpu_mul_d({}, {}, {});", fd, fs, ft)),
+        DivD { fd, fs, ft } => line(out, format!("ctx.fpu_div_d({}, {}, {});", fd, fs, ft)),
+        AbsD { fd, fs } => line(out, format!("ctx.fpu_abs_d({}, {});", fd, fs)),
+        NegD { fd, fs } => line(out, format!("ctx.fpu_neg_d({}, {});", fd, fs)),
+        SqrtD { fd, fs } => line(out, format!("ctx.fpu_sqrt_d({}, {});", fd, fs)),
         MovD { fd, fs } => line(out, format!("ctx.set_d_bits({}, ctx.d_bits({}));", fd, fs)),
 
         // --- Conversions. Float->float use lossless/rounding `as` casts; the
