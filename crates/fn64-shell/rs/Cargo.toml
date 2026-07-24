@@ -51,5 +51,3 @@ fn64-audio = { path = "../../fn64-audio" }
 # Refreshed symlink to the env-selected out-of-tree emitted crate (Cargo
 # `path` cannot interpolate env vars) -- same bridge as oot-boot/rs.
 oot-recompiled = { path = "recompiled" }
-# The recompiled OoT aspMain ucode, via oot-boot's harness-local build
-# adapter (resolves fn64-audio from THIS tree, no cross-pin).
