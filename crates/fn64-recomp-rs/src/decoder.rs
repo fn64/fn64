@@ -723,6 +723,26 @@ pub enum Instruction {
         fd: Reg,
         fs: Reg,
     },
+    /// `MOVF.S fd, fs, cc` / `MOVT.S fd, fs, cc` — copy fs->fd (single) iff the
+    /// FPU condition flag equals `tf`. `tf` = true for MOVT (move-if-true),
+    /// false for MOVF (move-if-false). No rounding, no IEEE exception.
+    MovcfS {
+        fd: Reg,
+        fs: Reg,
+        tf: bool,
+    },
+    /// `MOVZ.S fd, fs, rt` — copy fs->fd (single) iff GPR `rt` == 0.
+    MovzS {
+        fd: Reg,
+        fs: Reg,
+        rt: Reg,
+    },
+    /// `MOVN.S fd, fs, rt` — copy fs->fd (single) iff GPR `rt` != 0.
+    MovnS {
+        fd: Reg,
+        fs: Reg,
+        rt: Reg,
+    },
 
     // --- Double-precision (fmt = D = 0x11) arithmetic ---
     /// `ADD.D fd, fs, ft`.
@@ -768,6 +788,25 @@ pub enum Instruction {
     MovD {
         fd: Reg,
         fs: Reg,
+    },
+    /// `MOVF.D fd, fs, cc` / `MOVT.D fd, fs, cc` — copy fs->fd (double) iff the
+    /// FPU condition flag equals `tf`. See [`Instruction::MovcfS`].
+    MovcfD {
+        fd: Reg,
+        fs: Reg,
+        tf: bool,
+    },
+    /// `MOVZ.D fd, fs, rt` — copy fs->fd (double) iff GPR `rt` == 0.
+    MovzD {
+        fd: Reg,
+        fs: Reg,
+        rt: Reg,
+    },
+    /// `MOVN.D fd, fs, rt` — copy fs->fd (double) iff GPR `rt` != 0.
+    MovnD {
+        fd: Reg,
+        fs: Reg,
+        rt: Reg,
     },
 
     // --- Conversions. Naming: `Cvt<To><From>`. `W`=32-bit int, `L`=64-bit int,
@@ -2011,6 +2050,23 @@ fn decode_cop1_s(w: u32) -> Instruction {
             fd: fd(w),
             fs: fs(w),
         },
+        // Conditional moves. MOVF/MOVT share funct 0x11; the `tf` bit is bit 16
+        // (the low bit of the ft field). MOVZ=0x12, MOVN=0x13 name a GPR in ft.
+        0x11 => MovcfS {
+            fd: fd(w),
+            fs: fs(w),
+            tf: (w >> 16) & 1 != 0,
+        },
+        0x12 => MovzS {
+            fd: fd(w),
+            fs: fs(w),
+            rt: ft(w),
+        },
+        0x13 => MovnS {
+            fd: fd(w),
+            fs: fs(w),
+            rt: ft(w),
+        },
         0x08 => RoundLS {
             fd: fd(w),
             fs: fs(w),
@@ -2116,6 +2172,21 @@ fn decode_cop1_d(w: u32) -> Instruction {
             fd: fd(w),
             fs: fs(w),
         },
+        0x11 => MovcfD {
+            fd: fd(w),
+            fs: fs(w),
+            tf: (w >> 16) & 1 != 0,
+        },
+        0x12 => MovzD {
+            fd: fd(w),
+            fs: fs(w),
+            rt: ft(w),
+        },
+        0x13 => MovnD {
+            fd: fd(w),
+            fs: fs(w),
+            rt: ft(w),
+        },
         0x08 => RoundLD {
             fd: fd(w),
             fs: fs(w),
@@ -2208,6 +2279,9 @@ impl Instruction {
                 | NegS { .. }
                 | SqrtS { .. }
                 | MovS { .. }
+                | MovcfS { .. }
+                | MovzS { .. }
+                | MovnS { .. }
                 | AddD { .. }
                 | SubD { .. }
                 | MulD { .. }
@@ -2216,6 +2290,9 @@ impl Instruction {
                 | NegD { .. }
                 | SqrtD { .. }
                 | MovD { .. }
+                | MovcfD { .. }
+                | MovzD { .. }
+                | MovnD { .. }
                 | CvtSW { .. }
                 | CvtDW { .. }
                 | CvtSD { .. }

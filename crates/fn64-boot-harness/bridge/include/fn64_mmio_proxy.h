@@ -47,6 +47,21 @@ extern "C" void fn64_c_rdram_write(uint64_t vaddr, uint32_t width,
                                     uint64_t value);
 extern "C" void fn64_c_recompiled_function_enter(recomp_func_t* function);
 
+// Loop back-edge observer. `build_support.rs` injects a `FN64_BACKEDGE();`
+// statement immediately before every backward `goto` in the generated bodies
+// (a `goto` whose target label textually precedes it in the same function --
+// i.e. a loop edge). Real VR4300 hardware preempts any spin with the ~60 Hz
+// VI interrupt; fn64's cooperative executor has none, so a tight guest loop
+// polling ordinary RDRAM (e.g. SM64's `while (gAudioFrameCount < n) {}`) would
+// spin forever inside one scheduling slice, since `resume()` never returns to
+// let virtual time advance and wake the thread that writes the counter. The
+// hook is a cheap counter increment on the hot path and forces one
+// instruction checkpoint only every few thousand edges -- enough for the
+// executor to advance time (firing the pending VI retrace / AI drain) and run
+// other threads before the spinner re-checks its condition.
+extern "C" void fn64_c_backedge(void);
+#define FN64_BACKEDGE() fn64_c_backedge()
+
 static inline bool fn64_is_rcp_mmio_word(gpr address) {
     const uint64_t upper = address >> 32;
     const uint32_t low = static_cast<uint32_t>(address);

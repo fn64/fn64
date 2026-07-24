@@ -931,6 +931,32 @@ fn emitted_bank_runner_compiles_and_executes_from_arbitrary_pcs() {
         vram: 0x8000_D000,
         words: &cop1_words,
     });
+    // An enabled FP exception (FCSR Enable.V set + sqrt(-1) -> Invalid) must
+    // vector to ExcCode 15 WITHOUT writing the destination register. The first
+    // bank raises it straight-line; the second raises it in a branch delay slot
+    // so Cause.BD and EPC (the branch, not the slot) can be checked.
+    let fp_trap_words = [
+        0x4600_1004, // sqrt.s $f0,$f2
+        0x0000_0000, // nop
+    ];
+    let emitted_fp_trap_bank = emit_bank_runner(&BankInput {
+        name: "run_fp_trap_bank",
+        bank: BankId::new(0xEC),
+        vram: 0x8000_E000,
+        words: &fp_trap_words,
+    });
+    let fp_delay_words = [
+        0x1000_0001, // beq   $zero,$zero,+1
+        0x4600_1004, // sqrt.s $f0,$f2 (delay slot)
+        0x0000_0000, // nop
+        0x0000_0000, // nop
+    ];
+    let emitted_fp_delay_bank = emit_bank_runner(&BankInput {
+        name: "run_fp_delay_bank",
+        bank: BankId::new(0xED),
+        vram: 0x8000_F000,
+        words: &fp_delay_words,
+    });
     let exception_handler_words = [
         0x4008_7000, // mfc0  $t0,$14 (EPC)
         0x2508_0004, // addiu $t0,$t0,4
@@ -1004,6 +1030,8 @@ use fn64_recomp_rs::{{
 {emitted_overflow_bank}
 {emitted_address_bank}
 {emitted_cop1_bank}
+{emitted_fp_trap_bank}
+{emitted_fp_delay_bank}
 {emitted_exception_handler}
 {emitted_fetch_handler}
 {emitted_eret_bank}
@@ -1227,6 +1255,110 @@ fn main() {{
             ..
         }})
     ));
+
+    // --- Enabled FP exception (ExcCode 15) in the block lane. ---
+    // COP1 usable (CU1), Enable.V set, $f2 = -1.0, $f0 seeded with a sentinel.
+    let mut fp_ctx = RecompContext::new();
+    fp_ctx.cop0_status = 1 << 29;
+    fp_ctx.write_fcr(31, 1 << 11); // Enable.V (Invalid)
+    fp_ctx.set_f_s(2, -1.0);
+    fp_ctx.set_f_bits(0, 0xDEAD_BEEF);
+    let fp_trap = run_fp_trap_bank(
+        ExecutionKey::new(BankId::new(0xEC), GuestPc::new(0x8000_E000)),
+        InstructionBudget::new(64).unwrap(),
+        &mut fp_ctx,
+        &mut mem,
+    );
+    assert_eq!(fp_trap.instructions, 1);
+    assert_eq!(
+        fp_ctx.f_bits(0),
+        0xDEAD_BEEF,
+        "destination register must NOT be written on an enabled FP trap"
+    );
+    // Cause.V is recorded (bit 16) but the sticky Flag.V (bit 6) is not.
+    let fp_fcsr = fp_ctx.read_fcr(31);
+    assert_ne!(fp_fcsr & (1 << 16), 0, "FCSR Cause.V set on the trapped op");
+    assert_eq!(fp_fcsr & (1 << 6), 0, "FCSR Flag.V NOT set on the trapped op");
+    assert!(matches!(
+        fp_trap.exit,
+        BlockExit::Fault(CpuFault {{
+            at: ExecutionKey {{ pc, .. }},
+            kind: CpuFaultKind::Exception {{
+                exception: CpuException::FloatingPoint,
+                epc,
+                branch_delay: false,
+                instruction_code: 0,
+                bad_vaddr: None,
+                coprocessor: None,
+            }},
+        }}) if pc == GuestPc::new(0x8000_E000) && epc == GuestPc::new(0x8000_E000)
+    ));
+
+    // The same trap in a branch delay slot: Cause.BD set, EPC = the branch.
+    let mut fp_delay_ctx = RecompContext::new();
+    fp_delay_ctx.cop0_status = 1 << 29;
+    fp_delay_ctx.write_fcr(31, 1 << 11);
+    fp_delay_ctx.set_f_s(2, -1.0);
+    fp_delay_ctx.set_f_bits(0, 0xDEAD_BEEF);
+    let fp_delay = run_fp_delay_bank(
+        ExecutionKey::new(BankId::new(0xED), GuestPc::new(0x8000_F000)),
+        InstructionBudget::new(64).unwrap(),
+        &mut fp_delay_ctx,
+        &mut mem,
+    );
+    assert_eq!(fp_delay.instructions, 2);
+    assert_eq!(
+        fp_delay_ctx.f_bits(0),
+        0xDEAD_BEEF,
+        "delay-slot FP trap must not write the destination"
+    );
+    assert!(matches!(
+        fp_delay.exit,
+        BlockExit::Fault(CpuFault {{
+            at: ExecutionKey {{ pc, .. }},
+            kind: CpuFaultKind::Exception {{
+                exception: CpuException::FloatingPoint,
+                epc,
+                branch_delay: true,
+                coprocessor: None,
+                ..
+            }},
+        }}) if pc == GuestPc::new(0x8000_F004) && epc == GuestPc::new(0x8000_F000)
+    ));
+
+    // The disabled path is unchanged: no trap, result committed, sticky Flag set.
+    let mut fp_ok_ctx = RecompContext::new();
+    fp_ok_ctx.cop0_status = 1 << 29;
+    fp_ok_ctx.set_f_s(2, -1.0);
+    fp_ok_ctx.set_f_bits(0, 0xDEAD_BEEF);
+    let fp_ok = run_fp_trap_bank(
+        ExecutionKey::new(BankId::new(0xEC), GuestPc::new(0x8000_E000)),
+        InstructionBudget::new(2).unwrap(),
+        &mut fp_ok_ctx,
+        &mut mem,
+    );
+    assert_eq!(
+        fp_ok_ctx.f_bits(0),
+        0x7FBF_FFFF,
+        "disabled FP exception commits the canonical-NaN result"
+    );
+    let fp_ok_fcsr = fp_ok_ctx.read_fcr(31);
+    assert_ne!(fp_ok_fcsr & (1 << 16), 0, "Cause.V set (disabled)");
+    assert_ne!(fp_ok_fcsr & (1 << 6), 0, "Flag.V set (disabled, committed)");
+    // The disabled op does NOT fault: the block continues past the sqrt.
+    assert!(
+        !matches!(
+            fp_ok.exit,
+            BlockExit::Fault(CpuFault {{
+                kind: CpuFaultKind::Exception {{
+                    exception: CpuException::FloatingPoint,
+                    ..
+                }},
+                ..
+            }})
+        ),
+        "a disabled FP exception must not fault"
+    );
 
     let syscall = run_exception_bank(
         ExecutionKey::new(BankId::new(0xD8), GuestPc::new(0x8000_6000)),
@@ -1463,6 +1595,67 @@ fn main() {{
         BlockExit::Checkpoint(ExecutionKey::new(
             cop1_id,
             GuestPc::new(0x8000_D004),
+        )),
+    );
+
+    // An enabled FP exception drives the SAME installed guest vector: the
+    // dispatcher commits ExcCode-15 CP0 state, enters the handler, and ERET
+    // resumes at the handler-selected EPC. The destination register the trapping
+    // sqrt would have written stays untouched across the whole flow.
+    let fp_id = BankId::new(0xEC);
+    let mut fp_program = BlockProgram::new();
+    register_run_fp_trap_bank(
+        &mut fp_program,
+        CodeBank::new(
+            fp_id,
+            GuestPc::new(0x8000_E000),
+            vec!{fp_trap_words:?},
+        ).unwrap(),
+    ).unwrap();
+    register_run_exception_handler(
+        &mut fp_program,
+        CodeBank::new(
+            handler_id,
+            GuestPc::new(0x8000_0180),
+            vec!{exception_handler_words:?},
+        ).unwrap(),
+    ).unwrap();
+    let mut fp_dispatch_ctx = RecompContext::new();
+    fp_dispatch_ctx.cop0_status = 1 << 29; // CU1 usable
+    fp_dispatch_ctx.write_fcr(31, 1 << 11); // Enable.V
+    fp_dispatch_ctx.set_f_s(2, -1.0);
+    fp_dispatch_ctx.set_f_bits(0, 0xDEAD_BEEF);
+    let mut resolve_fp = |source: BankId, target: GuestPc| {{
+        match (source, target) {{
+            (source, target) if source == fp_id && target == GuestPc::new(0x8000_0180) =>
+                Ok(ExecutionKey::new(handler_id, target)),
+            (source, target) if source == handler_id && target == GuestPc::new(0x8000_E004) =>
+                Ok(ExecutionKey::new(fp_id, target)),
+            _ => panic!("unexpected FP-exception transfer from {{source:?}} to {{target:?}}"),
+        }}
+    }};
+    let fp_dispatched = fp_program.dispatch(
+        ExecutionKey::new(fp_id, GuestPc::new(0x8000_E000)),
+        InstructionBudget::new(5).unwrap(),
+        &mut fp_dispatch_ctx,
+        &mut mem,
+        &mut resolve_fp,
+    ).unwrap();
+    assert_eq!((fp_dispatch_ctx.cop0_cause >> 2) & 0x1F, 15, "ExcCode 15 (FPE)");
+    assert_eq!((fp_dispatch_ctx.cop0_cause >> 28) & 0b11, 0, "Cause.CE not set for FPE");
+    assert_eq!(fp_dispatch_ctx.cop0_epc, 0x8000_E004, "EPC advanced by the handler");
+    assert_eq!(fp_dispatch_ctx.cop0_cause & (1 << 31), 0, "Cause.BD clear (straight-line)");
+    assert_eq!(fp_dispatch_ctx.cop0_status & (1 << 1), 0, "EXL cleared by ERET");
+    assert_eq!(fp_dispatch_ctx.f_bits(0), 0xDEAD_BEEF, "trapping sqrt never wrote $f0");
+    assert_ne!(fp_dispatch_ctx.read_fcr(31) & (1 << 16), 0, "FCSR Cause.V recorded");
+    assert_eq!(fp_dispatch_ctx.read_fcr(31) & (1 << 6), 0, "FCSR Flag.V not sticky on trap");
+    assert_eq!(fp_dispatched.instructions, 5);
+    assert_eq!(fp_dispatched.blocks, 2);
+    assert_eq!(
+        fp_dispatched.exit,
+        BlockExit::Checkpoint(ExecutionKey::new(
+            fp_id,
+            GuestPc::new(0x8000_E004),
         )),
     );
 

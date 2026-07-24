@@ -146,12 +146,35 @@ pub unsafe fn register_section(
         });
         let stable_section_index = u32::try_from(section_index)
             .expect("generated section index exceeds native destination evidence wire");
-        for &(offset, _, function) in funcs {
+        for &(offset, rom_size, function) in funcs {
             let link_vram = ram_addr.checked_add(offset).unwrap_or_else(|| {
                 panic!(
                     "registered function offset {offset:#x} overflows section link base {ram_addr:#010x}"
                 )
             });
+            // A `rom_size == 0` FuncEntry is a HOST SHIM, not recompiled code:
+            // it names one of fn64-abi's own `os*_recomp` override symbols (a
+            // hand-written Rust body with no ROM origin), whereas a real
+            // recompiled body always carries the byte length of the MIPS it was
+            // lowered from (see `recomp_overlays.inl`: `sqrtf_recomp` .rom_size
+            // = 0x10 vs. every `os*_recomp` override .rom_size = 0).
+            //
+            // Host shims are NEVER instrumented with
+            // `fn64_c_recompiled_function_enter` -- that observer is injected
+            // only into generated `RECOMP_FUNC` bodies
+            // (fn64-boot-harness/build_support.rs) -- so a shim's pointer is
+            // never looked up in `native_destination_by_pointer` at run time.
+            // Registering it therefore yields zero observability, and doing so
+            // is the sole source of a legitimate false collision: the optimizer
+            // (identical-code folding) may collapse two distinct zero-body
+            // shims to one code address, mapping one native pointer to two
+            // guest destinations. That fold is correct optimizer behavior, so
+            // we skip shims entirely and keep the strict 1:1 assertion for real
+            // recompiled bodies, where a pointer collision IS a genuine
+            // miscompile that would silently corrupt the execution-order log.
+            if rom_size == 0 {
+                continue;
+            }
             let destination = NativeExecutionDestination {
                 section_index: stable_section_index,
                 function_offset: offset,
@@ -207,15 +230,32 @@ pub fn set_section_unloaded(index: fn64_runtime::SectionIndex) {
 /// Called from the PI/EPI DMA shims so overlays the game DMAs in become
 /// resolvable at their true relocated base -- see
 /// `SectionRegistry::load_section_at_rom_addr`.
-pub fn note_dma_overlay_load(rom_addr: u32, dest_vram: u32) -> Option<fn64_runtime::SectionIndex> {
-    let loaded = with_host(|host| host.sections.load_section_at_rom_addr(rom_addr, dest_vram));
+pub fn note_dma_overlay_load(
+    rom_addr: u32,
+    dest_vram: u32,
+    len: u32,
+) -> Option<fn64_runtime::SectionIndex> {
+    let (loaded, covered) = with_host(|host| {
+        // Exact-match path: an overlay DMA'd whole to some (possibly relocated)
+        // base -- OoT actor/gamestate overlays keyed on the exact section start.
+        let exact = host.sections.load_section_at_rom_addr(rom_addr, dest_vram);
+        // Coverage path: a chunk of a contiguous multi-section segment landing
+        // at its static link VRAM (SM64's chunked engine-segment DMA). Marks
+        // every section this chunk touches at its static base.
+        let covered = host
+            .sections
+            .load_sections_covered_by_dma(rom_addr, dest_vram, len);
+        (exact, covered)
+    });
     if std::env::var("FN64_DEBUG_BOOT").is_ok() {
         eprintln!(
-            "[DEBUG note_dma_overlay_load] rom={rom_addr:#010x} dest={dest_vram:#010x} -> \
-             {loaded:?}"
+            "[DEBUG note_dma_overlay_load] rom={rom_addr:#010x} dest={dest_vram:#010x} \
+             len={len:#x} -> exact={loaded:?} covered={covered:?}"
         );
     }
-    loaded
+    // Prefer the exact-match index for callers that read it; fall back to the
+    // first covered section so a chunked static-image load still reports one.
+    loaded.or_else(|| covered.first().copied())
 }
 
 #[cfg(test)]
@@ -289,6 +329,77 @@ mod tests {
 
         load_rom(Vec::new());
         assert!(copy_native_execution_destinations().is_empty());
+        with_host(|host| *host = HostState::default());
+    }
+
+    // A single host shim body used to model two DISTINCT zero-size shims that
+    // the optimizer (identical-code folding) collapsed to one code address:
+    // registering the SAME native pointer under two different guest
+    // destinations is exactly what `register_section` observes post-fold.
+    // fn64-abi's own `os*_recomp` overrides are never `RECOMP_FUNC` bodies, so
+    // they carry no `fn64_c_recompiled_function_enter` and are never looked up
+    // in `native_destination_by_pointer` -- their registration would only ever
+    // trip the 1:1 assert.
+    unsafe extern "C" fn folded_host_shim(_rdram: *mut u8, _ctx: *mut RecompContext) {}
+
+    #[test]
+    fn folded_zero_size_host_shims_register_without_panicking_and_are_not_mapped() {
+        with_host(|host| *host = HostState::default());
+        load_rom(Vec::new());
+
+        // SM64 sections 66 (osSpTaskYielded_recomp) and 80 (osEepromProbe_recomp)
+        // are distinct single-func rom_size==0 host shims; under --release the
+        // optimizer folds them to one native pointer. Model that: two sections,
+        // same pointer, both rom_size==0. This must not panic.
+        let yielded = unsafe {
+            register_section(0x0020_0000, 0x8032_2D70, 0x10, &[(0x0, 0, folded_host_shim)])
+        };
+        let eeprom = unsafe {
+            register_section(0x0020_1000, 0x8032_4080, 0x10, &[(0x0, 0, folded_host_shim)])
+        };
+        set_section_loaded(yielded);
+        set_section_loaded(eeprom);
+
+        // Both guest VAs still resolve to the shim body through the vram-keyed
+        // section registry (the execution-critical path is untouched)...
+        assert_eq!(
+            get_function(0x8032_2D70u32 as i32) as usize,
+            folded_host_shim as usize
+        );
+        assert_eq!(
+            get_function(0x8032_4080u32 as i32) as usize,
+            folded_host_shim as usize
+        );
+        // ...but the folded shim pointer was deliberately NOT inserted into the
+        // observability map, so the false 1:1 collision never arises.
+        with_host(|host| {
+            assert!(host.native_destination_by_pointer.is_empty());
+        });
+
+        with_host(|host| *host = HostState::default());
+    }
+
+    // A genuine pointer collision between two REAL recompiled bodies
+    // (rom_size != 0) is a miscompile that would silently corrupt the entry
+    // log; the strict 1:1 assertion must still fire for that case.
+    unsafe extern "C" fn collided_recompiled_body(_rdram: *mut u8, _ctx: *mut RecompContext) {}
+
+    #[test]
+    fn genuine_collision_of_two_real_recompiled_bodies_still_asserts() {
+        with_host(|host| *host = HostState::default());
+        load_rom(Vec::new());
+
+        let registration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            // Same native pointer, two distinct real (rom_size != 0)
+            // destinations -> a true miscompile the assert must catch.
+            register_section(0x0030_0000, 0x8040_0000, 0x100, &[(0x0, 4, collided_recompiled_body)]);
+            register_section(0x0031_0000, 0x8041_0000, 0x100, &[(0x0, 4, collided_recompiled_body)]);
+        }));
+        assert!(
+            registration.is_err(),
+            "two real recompiled bodies sharing one native pointer must still trip the 1:1 assert"
+        );
+
         with_host(|host| *host = HostState::default());
     }
 
