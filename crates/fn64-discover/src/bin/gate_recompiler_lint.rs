@@ -130,7 +130,7 @@ fn lint(program: &fn64_discover::boundaries::RecoveredProgram) -> Vec<Finding> {
             ),
         });
     }
-    findings.sort_by(|a, b| (a.bank.clone(), a.va).cmp(&(b.bank.clone(), b.va)));
+    findings.sort_by(|a, b| (&a.bank, a.va).cmp(&(&b.bank, b.va)));
     findings.dedup_by(|x, y| x.bank == y.bank && x.va == y.va);
     findings
 }

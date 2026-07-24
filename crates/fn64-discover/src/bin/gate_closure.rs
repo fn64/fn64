@@ -70,6 +70,7 @@ struct RomSpec {
 /// One proven physically-resident bank the composer can materialize.
 struct PhysicalBank {
     bank: String,
+    rom_space: RomAddressSpace,
     rom_start: u32,
     rom_end: u32,
     va_start: u32,
@@ -147,19 +148,26 @@ fn score_rom(spec: &RomSpec, path: &str) -> Result<(), String> {
     // Materialize every physical bank's bytes and roots; `MaterializedBankInput`
     // borrows both, so they must outlive the composition call. Banks are
     // composed together so cross-bank direct-call authority is available.
-    let mut bank_bytes: Vec<&[u8]> = Vec::with_capacity(physical.len());
+    let mut bank_bytes: Vec<Vec<u8>> = Vec::with_capacity(physical.len());
     let mut bank_roots: Vec<Vec<u32>> = Vec::with_capacity(physical.len());
     for bank in &physical {
-        let bytes = rom
-            .bytes
-            .get(bank.rom_start as usize..bank.rom_end as usize)
-            .ok_or_else(|| {
-                format!(
-                    "{} ROM interval [0x{:x},0x{:x}) is outside the normalized image",
-                    bank.bank, bank.rom_start, bank.rom_end
-                )
-            })?;
-        bank_bytes.push(bytes);
+        // Resolve through the shared range materializer: a physically-resident
+        // bank slices the image, while a VROM (DMA-loaded, possibly compressed)
+        // overlay resolves through its one proven file-table record.
+        let materialized = banks::materialize_rom_range(
+            &rom,
+            &facts,
+            bank.rom_space,
+            bank.rom_start,
+            bank.rom_end,
+        )
+        .map_err(|error| {
+            format!(
+                "{} ROM interval [0x{:x},0x{:x}): {error}",
+                bank.bank, bank.rom_start, bank.rom_end
+            )
+        })?;
+        bank_bytes.push(materialized.bytes);
         bank_roots.push(callable_roots(&facts, bank));
     }
 
@@ -169,7 +177,7 @@ fn score_rom(spec: &RomSpec, path: &str) -> Result<(), String> {
         .map(|(index, bank)| MaterializedBankInput {
             bank: &bank.bank,
             va_start: bank.va_start,
-            bytes: bank_bytes[index],
+            bytes: &bank_bytes[index],
             seed_roots: &bank_roots[index],
         })
         .collect();
@@ -241,20 +249,27 @@ fn physical_banks(facts: &FactDb) -> Result<Vec<PhysicalBank>, String> {
         else {
             unreachable!("proven_rom_mappings returned a non-mapping fact")
         };
-        if *rom_space != RomAddressSpace::Physical {
-            continue;
-        }
-        if rom_end.checked_sub(*rom_start) != va_end.checked_sub(*va_start) {
+        // A DMA-loaded overlay's VA extent may exceed its ROM extent by a
+        // load-time `.bss` tail. Compose only the ROM-backed prefix: bss holds
+        // no instructions, so excluding it loses no executable code.
+        let (Some(rom_extent), Some(va_extent)) = (
+            rom_end.checked_sub(*rom_start),
+            va_end.checked_sub(*va_start),
+        ) else {
+            return Err(format!("bank {bank} has an inverted ROM or VA interval"));
+        };
+        if rom_extent > va_extent {
             return Err(format!(
-                "physical bank {bank} has unequal ROM and VA extents"
+                "bank {bank} carries more ROM bytes ({rom_extent}) than VA extent ({va_extent})"
             ));
         }
         banks.push(PhysicalBank {
             bank: bank.clone(),
+            rom_space: *rom_space,
             rom_start: *rom_start,
             rom_end: *rom_end,
             va_start: *va_start,
-            va_end: *va_end,
+            va_end: va_start.saturating_add(rom_extent),
         });
     }
     banks.sort_by(|left, right| left.bank.cmp(&right.bank));

@@ -145,7 +145,7 @@ pub fn recover_boundaries(rom_bytes: &[u8]) -> Result<RecoveredProgram, String> 
             });
         }
     }
-    boundaries.sort_by(|a, b| (a.bank.clone(), a.entry).cmp(&(b.bank.clone(), b.entry)));
+    boundaries.sort_by(|a, b| (&a.bank, a.entry).cmp(&(&b.bank, b.entry)));
     boundaries.dedup_by(|a, b| a.bank == b.bank && a.entry == b.entry);
 
     Ok(RecoveredProgram {
