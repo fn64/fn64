@@ -48,5 +48,5 @@ jobs:
         with:
           python-version: "3.x"
       # lint-docs.py shells out to `rg`, which isn't on the runner image.
-      - uses: taiki-e/install-action@ripgrep
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: python3 scripts/lint-docs.py
