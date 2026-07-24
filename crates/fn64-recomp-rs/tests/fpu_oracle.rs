@@ -21,7 +21,7 @@
 //! where `TRUNC_W_S(v) == (int32_t)v` (truncate toward zero) and
 //! `CVT_S_W(v) == (float)(int32_t)v`. So `truncf` computes, for a `float` x in
 //! `$f12`, `(float)(int32_t)x` and returns it in `$f0` — a round-toward-zero.
-//! It exercises TRUNC.W.S, CVT.S.W, the FR=0 single-register aliasing
+//! It exercises TRUNC.W.S, CVT.S.W, the physical-FGR FR=0/FR=1 views
 //! (`f12.u32l`/`f12.fl` are the SAME 32-bit word), and a `jr $ra` delay slot.
 //!
 //! [`truncf_oracle`] is that C, hand-transcribed to Rust independently of the
@@ -444,40 +444,87 @@ fn cross_call_executes_to_expected_fpu_state() {
     });
 }
 
-// ============================================================================
-// FR=0 even/odd register-pairing model (the byte-layout property).
-// ============================================================================
-
-/// The whole reason the FPR file isn't 32 plain floats: under FR=0 an odd
-/// single-precision register aliases the HIGH 32-bit word of its even partner.
-/// This mirrors `fn64-abi`'s `f_odd` model. Verify writing an odd single and a
-/// double to the even partner interact exactly as the shared 64-bit slot.
+/// VR4300 User's Manual sections 5.2 and 5.3 define FR as a view selector over
+/// physical FGR state: FR=0 joins adjacent 32-bit FGRs for even doubleword
+/// FPRs, while FR=1 exposes every FGR as an independent 64-bit FPR. Exercise
+/// all 32 physical registers and all 16 FR=0 pairs so a mode transition cannot
+/// accidentally transpose a word or discard the upper halves latent in FR=0.
 #[test]
-fn fr0_odd_single_aliases_even_partner_high_word() {
+fn fr_transitions_preserve_all_physical_fgr_bits_and_pair_views() {
+    const FR: u32 = 1 << 26;
     let mut ctx = RecompContext::new();
-    // Write the even double $f4 = a known 64-bit pattern.
-    ctx.set_d_bits(4, 0x1122_3344_5566_7788);
-    // The even single $f4 reads the LOW word; the odd single $f5 reads the HIGH.
-    assert_eq!(
-        ctx.f_bits(4),
-        0x5566_7788,
-        "even single = low word of the slot"
-    );
-    assert_eq!(
-        ctx.f_bits(5),
-        0x1122_3344,
-        "odd single = high word of the even partner"
-    );
+    ctx.write_cop0(12, FR);
 
-    // Writing the odd single $f5 must land in the HIGH word, leaving the low
-    // word (even single $f4) untouched — the mtc1-to-odd case that was the
-    // OoT-boot SIGSEGV-at-0x40 in fn64-abi.
-    ctx.set_f_bits(5, 0xDEAD_BEEF);
-    assert_eq!(ctx.d_bits(4), 0xDEAD_BEEF_5566_7788);
+    let seeded: [u64; 32] = std::array::from_fn(|idx| {
+        (0xA500_0000u64.wrapping_add(idx as u64) << 32) | 0x5A00_0000u64.wrapping_add(idx as u64)
+    });
+    for (idx, bits) in seeded.into_iter().enumerate() {
+        ctx.set_d_bits(idx as u8, bits);
+    }
+    assert_eq!(ctx.physical_fgr_state().into_words(), seeded);
+
+    ctx.write_cop0(12, 0);
+    for idx in 0u8..32 {
+        assert_eq!(ctx.f_bits(idx), seeded[idx as usize] as u32, "f{idx}");
+    }
+    for even in (0u8..32).step_by(2) {
+        let expected = u64::from(seeded[even as usize] as u32)
+            | (u64::from(seeded[even as usize + 1] as u32) << 32);
+        assert_eq!(ctx.d_bits(even), expected, "FR=0 pair f{even}");
+    }
+
+    let paired: [u64; 16] = std::array::from_fn(|pair| {
+        let even = (pair * 2) as u64;
+        (0xCC00_0001u64.wrapping_add(even) << 32) | 0x3300_0000u64.wrapping_add(even)
+    });
+    for (pair, bits) in paired.into_iter().enumerate() {
+        ctx.set_d_bits((pair * 2) as u8, bits);
+    }
+
+    ctx.write_cop0(12, FR);
+    for (pair, bits) in paired.into_iter().enumerate() {
+        let even = pair * 2;
+        assert_eq!(
+            ctx.d_bits(even as u8),
+            (seeded[even] & 0xFFFF_FFFF_0000_0000) | u64::from(bits as u32),
+            "FR=1 even FGR f{even}"
+        );
+        assert_eq!(
+            ctx.d_bits((even + 1) as u8),
+            (seeded[even + 1] & 0xFFFF_FFFF_0000_0000) | (bits >> 32),
+            "FR=1 odd FGR f{}",
+            even + 1
+        );
+    }
+
+    ctx.set_f_bits(31, 0xDEAD_BEEF);
+    assert_eq!(ctx.d_bits(31) >> 32, seeded[31] >> 32);
+    ctx.write_cop0(12, 0);
+    assert_eq!(ctx.f_bits(31), 0xDEAD_BEEF);
+    assert_eq!(ctx.d_bits(30) >> 32, 0xDEAD_BEEF);
+}
+
+#[test]
+fn fr1_odd_operands_flow_through_compare_and_float_to_fixed() {
+    const FR: u32 = 1 << 26;
+    let mut ctx = RecompContext::new();
+    ctx.cop0_status = FR;
+
+    ctx.set_f_d(1, 1.5);
+    ctx.set_f_d(3, 2.5);
+    ctx.fpu_compare_d(1, 3, 12);
+    assert!(ctx.fpu_cond);
+    let odd_double = ctx.f_d(1);
+    assert_eq!(ctx.fpu_to_i64(odd_double, Some(1)), 1);
+
+    ctx.set_d_bits(5, 0xA5A5_5A5A_0000_0000);
+    ctx.set_f_s(5, -1.5);
+    let odd_single = ctx.f_s(5) as f64;
+    assert_eq!(ctx.fpu_to_i32(odd_single, Some(2)), -1);
     assert_eq!(
-        ctx.f_bits(4),
-        0x5566_7788,
-        "low word preserved by an odd-register write"
+        ctx.d_bits(5) >> 32,
+        0xA5A5_5A5A,
+        "single write preserves upper word"
     );
 }
 
@@ -1194,12 +1241,20 @@ fn fr1_odd_double_is_independent_register() {
 
     ctx.set_d_bits(2, 0xAAAA_AAAA_AAAA_AAAA);
     ctx.set_d_bits(3, 0x5555_5555_5555_5555);
-    assert_eq!(ctx.d_bits(2), 0xAAAA_AAAA_AAAA_AAAA, "$f2 unchanged by $f3 write");
-    assert_eq!(ctx.d_bits(3), 0x5555_5555_5555_5555, "$f3 is its own register");
+    assert_eq!(
+        ctx.d_bits(2),
+        0xAAAA_AAAA_AAAA_AAAA,
+        "$f2 unchanged by $f3 write"
+    );
+    assert_eq!(
+        ctx.d_bits(3),
+        0x5555_5555_5555_5555,
+        "$f3 is its own register"
+    );
 }
 
-/// FR=1: single-precision `$fN` is the low 32 bits of slot N — there is NO
-/// even/odd high-word aliasing. The odd single `$f5` is independent of `$f4`.
+/// FR=1: single-precision `$fN` is the low 32 bits of physical FGR N, just as
+/// in FR=0. The odd single `$f5` is independent of `$f4` in either view.
 #[test]
 fn fr1_odd_single_is_independent_no_aliasing() {
     let mut ctx = RecompContext::new();
@@ -1207,39 +1262,44 @@ fn fr1_odd_single_is_independent_no_aliasing() {
     ctx.set_f_bits(4, 0x1111_1111);
     ctx.set_f_bits(5, 0x2222_2222);
     assert_eq!(ctx.f_bits(4), 0x1111_1111, "FR=1: $f4 own low word");
-    assert_eq!(ctx.f_bits(5), 0x2222_2222, "FR=1: $f5 own low word, not $f4 high");
+    assert_eq!(
+        ctx.f_bits(5),
+        0x2222_2222,
+        "FR=1: $f5 own low word, not $f4 high"
+    );
     // $f4's slot high word is untouched by the $f5 write (no aliasing).
-    assert_eq!(ctx.d_bits(4) >> 32, 0, "FR=1: no write bled into $f4 high word");
+    assert_eq!(
+        ctx.d_bits(4) >> 32,
+        0,
+        "FR=1: no write bled into $f4 high word"
+    );
 }
 
-/// FR=0 even-pairing is preserved after this change: the even/odd single alias
-/// and the even-only double addressing still hold (regression guard).
+/// FR=0 exposes each physical FGR low word as a single and joins adjacent low
+/// words only for an even-indexed doubleword operand.
 #[test]
-fn fr0_pairing_preserved() {
-    let mut ctx = RecompContext::new(); // FR=0.
+fn fr0_singles_are_physical_low_words_and_even_doubles_pair_them() {
+    let mut ctx = RecompContext::new();
     assert!(!ctx.fpu_fr());
-    ctx.set_d_bits(4, 0x1122_3344_5566_7788);
-    assert_eq!(ctx.f_bits(4), 0x5566_7788, "FR=0 even single = low word");
-    assert_eq!(ctx.f_bits(5), 0x1122_3344, "FR=0 odd single = even partner high word");
+    ctx.set_f_bits(4, 0x5566_7788);
+    ctx.set_f_bits(5, 0x1122_3344);
+    assert_eq!(ctx.f_bits(4), 0x5566_7788);
+    assert_eq!(ctx.f_bits(5), 0x1122_3344);
+    assert_eq!(ctx.d_bits(4), 0x1122_3344_5566_7788);
 }
 
-/// The SAME program run under FR=0 vs FR=1 behaves per spec: writing $f2 then
-/// reading $f3 as a double sees the aliased value in FR=0 but garbage/zero (the
-/// independent register) in FR=1.
 #[test]
-fn fr_mode_changes_odd_double_semantics() {
-    let mut fr0 = RecompContext::new();
-    fr0.set_d_bits(2, 0x0102_0304_0506_0708);
-    let fr0_odd = fr0.d_bits(3); // aliases $f2
+#[should_panic(expected = "FR=0 doubleword read from odd FPR f3")]
+fn fr0_odd_double_read_is_loudly_invalid() {
+    let ctx = RecompContext::new();
+    let _ = ctx.d_bits(3);
+}
 
-    let mut fr1 = RecompContext::new();
-    fr1.write_cop0(12, STATUS_FR);
-    fr1.set_d_bits(2, 0x0102_0304_0506_0708);
-    let fr1_odd = fr1.d_bits(3); // independent (still zero)
-
-    assert_eq!(fr0_odd, 0x0102_0304_0506_0708, "FR=0: $f3 aliases $f2");
-    assert_eq!(fr1_odd, 0, "FR=1: $f3 is its own (untouched) register");
-    assert_ne!(fr0_odd, fr1_odd, "the FR bit changes the observable semantics");
+#[test]
+#[should_panic(expected = "FR=0 doubleword write to odd FPR f3")]
+fn fr0_odd_double_write_is_loudly_invalid() {
+    let mut ctx = RecompContext::new();
+    ctx.set_d_bits(3, 0x0102_0304_0506_0708);
 }
 
 // ============================================================================
@@ -1262,7 +1322,11 @@ fn movt_movf_honor_condition_flag() {
     ctx.set_f_bits(0, 0xDEAD_BEEF);
     ctx.fpu_cond = false;
     ctx.fpu_movcf_s(0, 2, true); // MOVT.S: cond==false -> no move
-    assert_eq!(ctx.f_bits(0), 0xDEAD_BEEF, "MOVT.S leaves fd when cond clear");
+    assert_eq!(
+        ctx.f_bits(0),
+        0xDEAD_BEEF,
+        "MOVT.S leaves fd when cond clear"
+    );
 
     // MOVF.S: cond clear -> move.
     ctx.set_f_bits(0, 0xDEAD_BEEF);
@@ -1276,11 +1340,19 @@ fn movt_movf_honor_condition_flag() {
     d.set_d_bits(2, 0x4009_0000_0000_0000); // 3.125
     d.fpu_cond = true;
     d.fpu_movcf_d(0, 2, true);
-    assert_eq!(d.d_bits(0), 0x4009_0000_0000_0000, "MOVT.D moves when cond set");
+    assert_eq!(
+        d.d_bits(0),
+        0x4009_0000_0000_0000,
+        "MOVT.D moves when cond set"
+    );
     d.set_d_bits(0, 0xDEAD_BEEF_DEAD_BEEF);
     d.fpu_cond = false;
     d.fpu_movcf_d(0, 2, true);
-    assert_eq!(d.d_bits(0), 0xDEAD_BEEF_DEAD_BEEF, "MOVT.D no move when cond clear");
+    assert_eq!(
+        d.d_bits(0),
+        0xDEAD_BEEF_DEAD_BEEF,
+        "MOVT.D no move when cond clear"
+    );
 }
 
 /// MOVZ moves when the GPR reads zero; MOVN moves when nonzero. Both S and D.
@@ -1309,10 +1381,18 @@ fn movz_movn_honor_gpr() {
     d.set_d_bits(2, 0x4009_0000_0000_0000);
     d.set_r(8, 0);
     d.fpu_movz_d(0, 2, 8);
-    assert_eq!(d.d_bits(0), 0x4009_0000_0000_0000, "MOVZ.D moves when GPR==0");
+    assert_eq!(
+        d.d_bits(0),
+        0x4009_0000_0000_0000,
+        "MOVZ.D moves when GPR==0"
+    );
     d.set_d_bits(0, 0xDEAD_BEEF_DEAD_BEEF);
     d.fpu_movn_d(0, 2, 8); // GPR still 0 -> no move
-    assert_eq!(d.d_bits(0), 0xDEAD_BEEF_DEAD_BEEF, "MOVN.D no move when GPR==0");
+    assert_eq!(
+        d.d_bits(0),
+        0xDEAD_BEEF_DEAD_BEEF,
+        "MOVN.D no move when GPR==0"
+    );
 }
 
 /// The MOVF/MOVT/MOVZ/MOVN.fmt words decode to the right typed instructions
@@ -1323,14 +1403,42 @@ fn conditional_moves_decode() {
     // Layout: op(0x11)<<26 | fmt<<21 | ft<<16 | fs<<11 | fd<<6 | funct.
     // MOVT.S $f4,$f2,cc0: fmt=S(0x10), tf=1 (ft bit0), funct=0x11.
     let movt_s = (0x11 << 26) | (0x10 << 21) | (0x1 << 16) | (2 << 11) | (4 << 6) | 0x11;
-    assert_eq!(decode(movt_s), MovcfS { fd: 4, fs: 2, tf: true });
+    assert_eq!(
+        decode(movt_s),
+        MovcfS {
+            fd: 4,
+            fs: 2,
+            tf: true
+        }
+    );
     let movf_s = (0x11 << 26) | (0x10 << 21) | (2 << 11) | (4 << 6) | 0x11; // ft=0 => tf=0
-    assert_eq!(decode(movf_s), MovcfS { fd: 4, fs: 2, tf: false });
+    assert_eq!(
+        decode(movf_s),
+        MovcfS {
+            fd: 4,
+            fs: 2,
+            tf: false
+        }
+    );
     // MOVZ.S $f4,$f2,$t0(=8): ft carries the GPR index.
     let movz_s = (0x11 << 26) | (0x10 << 21) | (8 << 16) | (2 << 11) | (4 << 6) | 0x12;
-    assert_eq!(decode(movz_s), MovzS { fd: 4, fs: 2, rt: 8 });
+    assert_eq!(
+        decode(movz_s),
+        MovzS {
+            fd: 4,
+            fs: 2,
+            rt: 8
+        }
+    );
     let movn_d = (0x11 << 26) | (0x11 << 21) | (8 << 16) | (2 << 11) | (4 << 6) | 0x13;
-    assert_eq!(decode(movn_d), MovnD { fd: 4, fs: 2, rt: 8 });
+    assert_eq!(
+        decode(movn_d),
+        MovnD {
+            fd: 4,
+            fs: 2,
+            rt: 8
+        }
+    );
 }
 
 // ============================================================================
@@ -1350,7 +1458,7 @@ const CAUSE_E: u32 = 1 << 17;
 #[test]
 fn denormal_operand_traps_unimplemented_even_with_enables_clear() {
     let mut ctx = RecompContext::new(); // all Enables clear.
-    // Smallest positive single subnormal: exponent 0, mantissa 1.
+                                        // Smallest positive single subnormal: exponent 0, mantissa 1.
     let denorm = 0x0000_0001u32;
     ctx.set_f_bits(2, denorm);
     ctx.set_f_bits(4, 1.0f32.to_bits());
@@ -1358,7 +1466,11 @@ fn denormal_operand_traps_unimplemented_even_with_enables_clear() {
     let trapped = ctx.fpu_add_s(0, 2, 4);
     assert!(trapped, "denormal operand traps (E is unmaskable)");
     assert_ne!(ctx.read_fcr(31) & CAUSE_E, 0, "Cause.E set");
-    assert_eq!(ctx.f_bits(0), 0xDEAD_BEEF, "destination not committed on trap");
+    assert_eq!(
+        ctx.f_bits(0),
+        0xDEAD_BEEF,
+        "destination not committed on trap"
+    );
 }
 
 /// A denormal RESULT (from a normal op that underflows into subnormal range)
@@ -1370,7 +1482,11 @@ fn denormal_result_traps_unimplemented() {
     ctx.set_f_bits(4, 0.5f32.to_bits());
     let trapped = ctx.fpu_mul_s(0, 2, 4); // -> subnormal result
     assert!(trapped, "a subnormal result traps E");
-    assert_ne!(ctx.read_fcr(31) & CAUSE_E, 0, "Cause.E set on denormal result");
+    assert_ne!(
+        ctx.read_fcr(31) & CAUSE_E,
+        0,
+        "Cause.E set on denormal result"
+    );
 }
 
 /// A normal op with normal operands and a normal result does NOT raise E.
@@ -1382,7 +1498,11 @@ fn normal_op_does_not_trap_unimplemented() {
     let trapped = ctx.fpu_add_s(0, 2, 4);
     assert!(!trapped, "normal op does not trap");
     assert_eq!(ctx.read_fcr(31) & CAUSE_E, 0, "Cause.E clear");
-    assert_eq!(ctx.f_bits(0), (1.5f32 + 2.25f32).to_bits(), "result committed");
+    assert_eq!(
+        ctx.f_bits(0),
+        (1.5f32 + 2.25f32).to_bits(),
+        "result committed"
+    );
 }
 
 /// The shim's denormal predicates directly (double precision too).
@@ -1391,7 +1511,10 @@ fn denormal_predicates() {
     assert!(fpu::is_denormal_s(0x0000_0001));
     assert!(fpu::is_denormal_s(0x007F_FFFF));
     assert!(!fpu::is_denormal_s(0), "zero is not a denormal");
-    assert!(!fpu::is_denormal_s(f32::MIN_POSITIVE.to_bits()), "smallest normal is not denormal");
+    assert!(
+        !fpu::is_denormal_s(f32::MIN_POSITIVE.to_bits()),
+        "smallest normal is not denormal"
+    );
     assert!(fpu::is_denormal_d(0x0000_0000_0000_0001));
     assert!(!fpu::is_denormal_d(0), "zero is not a denormal");
     assert!(!fpu::is_denormal_d(f64::MIN_POSITIVE.to_bits()));

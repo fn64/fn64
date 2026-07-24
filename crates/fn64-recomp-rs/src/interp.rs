@@ -42,10 +42,15 @@
 //! precedence and LLbit clear, resolved as an unconditional
 //! [`BlockExit::ResolveTransfer`]).
 //!
-//! Explicitly OUT (each a loud [`StepFault::Unsupported`] naming the opcode, the
-//! same frontier the AOT lane leaves open — see `Still open in U4` in
-//! `docs/UNIVERSAL-RUNTIME-PLAN.md`): the entire COP1/FPU environment, COP2,
-//! 64-bit TLB translation, `SYSCALL`/`BREAK`, and the conditional trap ops.
+//! COP1 transfers, memory operations, branches, arithmetic, conditional moves,
+//! comparisons, and conversions share the AOT lane's softfloat/FCSR helpers;
+//! disabled COP1 use becomes a typed Coprocessor Unusable fault. Their register
+//! accesses use the physical-FGR model: FR=0 singles address each physical low
+//! word, FR=0 doubles require an even register and join adjacent low words, and
+//! FR=1 exposes each full 64-bit FGR. Explicitly OUT are COP2,
+//! `SYSCALL`/`BREAK`, conditional traps, 64-bit instruction admission, typed
+//! integer-overflow exceptions, and the remaining privileged-CPU surface.
+//! Unsupported decoded instructions remain loud [`StepFault::Unsupported`]s.
 //! Canonical 32-bit instruction translation is supplied by the one-unit
 //! [`crate::fetch::run_mapped_bank`] wrapper, which fetches by physical identity
 //! before constructing this interpreter's execution-local virtual view.
@@ -1441,7 +1446,11 @@ fn exec_straight(
 /// (or `None` for CVT.W, which follows FCSR.RM).
 #[inline]
 fn cvt_to_i32(ctx: &mut RecompContext, fd: u8, fs: u8, single: bool, mode: Option<u8>) {
-    let v = if single { ctx.f_s(fs) as f64 } else { ctx.f_d(fs) };
+    let v = if single {
+        ctx.f_s(fs) as f64
+    } else {
+        ctx.f_d(fs)
+    };
     let r = ctx.fpu_to_i32(v, mode);
     ctx.set_f_bits(fd, r as u32);
 }
@@ -1449,7 +1458,11 @@ fn cvt_to_i32(ctx: &mut RecompContext, fd: u8, fs: u8, single: bool, mode: Optio
 /// Float/double -> int64 conversion, identical to the AOT lane's `emit_fpu_i64`.
 #[inline]
 fn cvt_to_i64(ctx: &mut RecompContext, fd: u8, fs: u8, single: bool, mode: Option<u8>) {
-    let v = if single { ctx.f_s(fs) as f64 } else { ctx.f_d(fs) };
+    let v = if single {
+        ctx.f_s(fs) as f64
+    } else {
+        ctx.f_d(fs)
+    };
     let r = ctx.fpu_to_i64(v, mode);
     ctx.set_d_bits(fd, r as u64);
 }

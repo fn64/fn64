@@ -420,23 +420,11 @@ fn oot_os_get_fpc_csr_shape_reads_real_fcr31_state() {
     assert_eq!(ctx.read_fcr(31), (1 << 24) | (1 << 23) | 3);
 }
 
-/// In FR=0 a doubleword op naming an ODD register is architecturally undefined
-/// (VR4300 has no independent odd 64-bit register in this mode). fn64 models the
-/// documented physical addressing — the odd number drops its low bit and lands
-/// on the even partner `$f(idx & !1)` — and never panics. Here `$f3` maps to the
-/// same 64-bit slot as `$f2`.
 #[test]
-fn fr0_odd_double_aliases_even_partner_no_panic() {
-    let mut ctx = RecompContext::new(); // FR=0 by default (Status.FR clear).
-    ctx.set_d_bits(2, 0x0123_4567_89AB_CDEF);
-    assert_eq!(
-        ctx.d_bits(3),
-        0x0123_4567_89AB_CDEF,
-        "FR=0: odd $f3 doubleword aliases even $f2's slot"
-    );
-    // A write through the odd number lands on the even partner too.
-    ctx.set_d_bits(3, 0xDEAD_BEEF_F00D_CAFE);
-    assert_eq!(ctx.d_bits(2), 0xDEAD_BEEF_F00D_CAFE, "FR=0: odd write aliases even");
+#[should_panic(expected = "FR=0 doubleword read from odd FPR f3")]
+fn fr0_odd_double_is_loudly_invalid() {
+    let ctx = RecompContext::new();
+    let _ = ctx.d_bits(3);
 }
 
 #[test]

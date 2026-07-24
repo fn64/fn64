@@ -447,6 +447,31 @@ matching, and the latched IP7 line; live MTC0 Count/Compare writes cross back
 to that authority, including same-value Compare acknowledgement before ERET.
 The exact checkpoint-match/handler/acknowledge/ERET interleaving passed 20
 consecutive clean runs.
+Status.FR is now a lossless view switch over all 32 physical FGRs:
+FR=0 exposes their low words and joins adjacent even/odd low words only for
+even-indexed doubleword operands, while FR=1 exposes each full 64-bit register.
+FR=0 odd doubleword access is loud rather than silently aliased. This
+implements the documented register organization without claiming silicon
+parity.
+
+S/D ADD, SUB, MUL, DIV, SQRT, ABS, and NEG use the host-independent soft-float
+path in both arbitrary-PC lanes. They honor FCSR.RM, report modeled IEEE
+conditions, reject denormal operands/results with unmaskable Cause.E, and
+return FloatingPoint/ExcCode 15 before destination commit when required.
+MOVF/MOVT and MOVZ/MOVN preserve raw S/D bits and predicate destination
+mutation. Float-to-float and fixed-to-float conversion boundaries, complete
+privileged/RI behavior, cache effects, cycle timing, and 64-bit instruction
+identity remain open.
+
+The generated-C ABI bridge preserves the public `recomp_context` layout: FR=1
+maps all 32 C FPR slots directly, while FR=0 even slots carry active pairs and
+otherwise-invalid odd doubleword slots carry latent upper halves. The bridge
+requires `status_reg.FR == mips3_float_mode`, arms `f_odd` for the entry view,
+and admits only the exact registry of FR-stable host shims before exposing the
+raw context pointer. This rejects even a transition which accesses the other
+view and restores the entry mode before return; the exit check remains a
+second invariant before decoding entry-view bytes
+under the wrong layout.
 Every naturally aligned integer, LL/SC, and COP1 memory operation in the bank
 lane now checks its effective address before any register, memory, or
 reservation mutation. Misaligned loads return AdEL/ExcCode 4; stores return

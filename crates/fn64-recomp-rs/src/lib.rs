@@ -78,8 +78,8 @@ pub use runtime::{
     set_unsupported_observer, set_write_observer, take_executable_write_boundary, trap_unsupported,
     DataAccessError, DataAccessKind, FunctionEntryObservationSchema, FunctionEntryObserver,
     GuestWriteBoundary, GuestWriteBoundaryObserver, GuestWriteEvent, HostLookup, HostPause,
-    MmioRead, MmioWrite, Rdram, RecompContext, RecompFunc, TlbEntryRaw, TlbFault, TlbFaultKind,
-    TranslatedDataAddress, TranslatedFunctionIdentity, TranslatedInstructionAddress,
+    MmioRead, MmioWrite, PhysicalFgrState, Rdram, RecompContext, RecompFunc, TlbEntryRaw, TlbFault,
+    TlbFaultKind, TranslatedDataAddress, TranslatedFunctionIdentity, TranslatedInstructionAddress,
     UnsupportedObserver, WriteObserver, FUNCTION_ENTRY_OBSERVATION_SCHEMA, RDRAM_LEN, RDRAM_VBASE,
 };
 

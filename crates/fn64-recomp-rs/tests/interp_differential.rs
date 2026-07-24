@@ -451,8 +451,8 @@ fn programs() -> Vec<Program> {
             budget: 64,
             init_regs: &[
                 (31, 0x8000_9000),
-                (8, 0xC040_0000),  // -3.0f
-                (9, 0x40E0_0000),  // 7.0f
+                (8, 0xC040_0000), // -3.0f
+                (9, 0x40E0_0000), // 7.0f
             ],
             rdram_len: 0,
             init_mem: &[],
@@ -554,9 +554,9 @@ fn programs() -> Vec<Program> {
             budget: 64,
             init_regs: &[
                 (31, 0x8000_9000),
-                (8, 0x4008_0000_0000_0000),  // 3.0
-                (9, 0x401C_0000_0000_0000),  // 7.0
-                (10, 0x2400_0000),           // Status = CU1(1<<29) | FR(1<<26)
+                (8, 0x4008_0000_0000_0000), // 3.0
+                (9, 0x401C_0000_0000_0000), // 7.0
+                (10, 0x2400_0000),          // Status = CU1(1<<29) | FR(1<<26)
             ],
             rdram_len: 0,
             init_mem: &[],
@@ -573,6 +573,33 @@ fn programs() -> Vec<Program> {
             entry: BASE,
             budget: 64,
             init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        // Switching FR changes only the architectural view. The physical upper
+        // words seeded by the harness must survive FR=0 paired writes and both
+        // lanes must expose exactly the same state after repeated transitions.
+        Program {
+            name: "p_fpu_fr_transition",
+            bank: 0x2C,
+            vram: BASE,
+            words: &[
+                0x44A4_0000, // dmtc1 $a0,$f0 in FR=0 paired view
+                0x4086_6000, // mtc0 $a2,Status -> CU1|FR
+                0x4422_0000, // dmfc1 $v0,$f0 in FR=1
+                0x4423_0800, // dmfc1 $v1,$f1 in FR=1
+                0x4087_6000, // mtc0 $a3,Status -> CU1, FR=0
+                0x4408_0800, // mfc1 $t0,$f1 in FR=0
+                0x4086_6000, // mtc0 $a2,Status -> CU1|FR again
+                0x4429_0000, // dmfc1 $t1,$f0 recovers latent upper word
+            ],
+            entry: BASE,
+            budget: 10,
+            init_regs: &[
+                (4, 0x1122_3344_5566_7788),
+                (6, (1 << 29) | (1 << 26)),
+                (7, 1 << 29),
+            ],
             rdram_len: 0,
             init_mem: &[],
         },
@@ -669,29 +696,28 @@ fn interpreter_matches_aot_bank_runner_on_ordinary_programs() {
 use fn64_recomp_rs::{{
     run_bank, BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeCatalog, CodeSpan,
     CpuException, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc,
-    InstructionBudget, ProgramError, Rdram, RecompContext,
+    InstructionBudget, PhysicalFgrState, ProgramError, Rdram, RecompContext,
 }};
 
 {emitted}
 
 type AotRunner = fn(ExecutionKey, InstructionBudget, &mut RecompContext, &mut Rdram) -> BlockRun;
 
-/// A comparable snapshot of all *observable* architectural state. The FPU-
-/// exercising programs make the COP1 register file and FCSR part of the
-/// differential surface, so this snapshots the full 32-slot FPR file and FCR31
-/// alongside the GPRs, HI/LO, COP0 Count/Compare/Random/cond, the FPU cond flag,
-/// and the complete RDRAM image.
+/// A comparable snapshot of the observable architectural state, including the
+/// complete physical FGR image across FR=0/FR=1. The physical snapshot retains
+/// every upper word that is latent in FR=0, so a matching active view cannot
+/// hide state lost by either lane.
 #[derive(PartialEq, Eq, Debug)]
 struct State {{
     gprs: [u64; 32],
     hi: u64,
     lo: u64,
+    fprs: PhysicalFgrState,
     cop0_count: u32,
     cop0_compare: u32,
     cop0_random: u32,
     cop0_cond: bool,
     fpu_cond: bool,
-    fpr: [u64; 32],
     fcr31: u32,
     mem: Vec<u8>,
 }}
@@ -701,18 +727,18 @@ fn snapshot(ctx: &RecompContext, mem: &[u8]) -> State {{
         gprs: ctx.gprs(),
         hi: ctx.hi,
         lo: ctx.lo,
+        fprs: ctx.physical_fgr_state(),
         cop0_count: ctx.cop0_count,
         cop0_compare: ctx.cop0_compare,
         cop0_random: ctx.read_cop0(1),
         cop0_cond: ctx.cop0_cond,
         fpu_cond: ctx.fpu_cond,
-        fpr: ctx.fpr_slots(),
         fcr31: ctx.read_fcr(31),
         mem: mem.to_vec(),
     }}
 }}
 
-fn make_ctx(init_regs: &[(u8, u64)]) -> RecompContext {{
+fn make_ctx(name: &str, init_regs: &[(u8, u64)]) -> RecompContext {{
     let mut ctx = RecompContext::new();
     // Enable COP1 (Status.CU1, bit 29) so the FPU programs run in both lanes;
     // harmless for the integer/control/memory programs. Real N64 code runs with
@@ -720,6 +746,13 @@ fn make_ctx(init_regs: &[(u8, u64)]) -> RecompContext {{
     ctx.write_cop0(12, 1 << 29);
     for &(i, v) in init_regs {{
         ctx.set_r(i, v);
+    }}
+    if name == "p_fpu_fr_transition" {{
+        ctx.replace_physical_fgr_state(PhysicalFgrState::from_words(
+            std::array::from_fn(|idx| {{
+                ((0xA500_0000u64 + idx as u64) << 32) | (0x5A00_0000u64 + idx as u64)
+            }}),
+        ));
     }}
     ctx
 }}
@@ -741,7 +774,7 @@ fn check(
     let budget = InstructionBudget::new(budget).expect("budget >= 2");
 
     // Interpreter lane.
-    let mut interp_ctx = make_ctx(init_regs);
+    let mut interp_ctx = make_ctx(name, init_regs);
     let mut interp_storage = vec![0u8; rdram_len];
     for &(o, v) in init_mem {{
         interp_storage[o] = v;
@@ -758,7 +791,7 @@ fn check(
     let interp_state = snapshot(&interp_ctx, &interp_storage);
 
     // AOT lane, identical initial state.
-    let mut aot_ctx = make_ctx(init_regs);
+    let mut aot_ctx = make_ctx(name, init_regs);
     let mut aot_storage = vec![0u8; rdram_len];
     for &(o, v) in init_mem {{
         aot_storage[o] = v;
