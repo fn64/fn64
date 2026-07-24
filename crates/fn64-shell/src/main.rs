@@ -25,11 +25,10 @@
 //! exits (no window), because there's no game to boot. That keeps
 //! `cargo build --workspace` green with zero game content.
 //!
-//! Run it (OoT, with the perf-friendly audio-ucode skip):
+//! Run it (OoT):
 //! ```text
 //! RECOMPILED_DIR=.../OOTU/RecompiledFuncs \
 //! ROM=.../oot-ntsc-1.0.z64 \
-//! FN64_SKIP_AUDIO_UCODE=1 \
 //! cargo run -p fn64-shell
 //! ```
 
@@ -62,11 +61,9 @@ fn main() {
          \n\
          \x20 RECOMPILED_DIR=.../OOTU/RecompiledFuncs \\\n\
          \x20 ROM=.../oot-ntsc-1.0.z64 \\\n\
-         \x20 FN64_SKIP_AUDIO_UCODE=1 \\\n\
          \x20 cargo run -p fn64-shell\n\
          \n\
-         (Add --features oot-audio-ucode to link the recompiled audio ucode so the wired\n\
-         cpal output stream actually gets samples.)"
+         (Audio tasks execute live IMEM through fn64's clean-room LLE interpreter.)"
     );
     std::process::exit(2);
 }
@@ -378,10 +375,7 @@ mod game {
             // drive VI pacing or guest-visible AI DMA state.
             wire_audio(rdram.len());
 
-            // Audio SYNTH (ucode): optional, behind the feature. Without it,
-            // M_AUDTASK dispatch runs no ucode (silent) but the output path
-            // above is still live.
-            wire_audio_ucode(rdram.len());
+            configure_audio_tasks();
 
             println!("[fn64-shell] booting thread 0 (recomp_entrypoint)...");
             #[cfg(fn64_recomp_rs)]
@@ -576,7 +570,10 @@ mod game {
             // storage. wgpu caps texture dimensions; clamp defensively.
             let target_width = src_stride.clamp(1, 4096);
             if target_width != self.fb_width {
-                if pixels.resize_buffer(target_width as u32, FB_HEIGHT as u32).is_ok() {
+                if pixels
+                    .resize_buffer(target_width as u32, FB_HEIGHT as u32)
+                    .is_ok()
+                {
                     self.fb_width = target_width;
                     self.rgba = vec![0u8; target_width * FB_HEIGHT * 4];
                     println!(
@@ -1041,54 +1038,8 @@ mod game {
         }
     }
 
-    /// The audio SYNTH seam. The cpal OUTPUT path (`wire_audio`) is already
-    /// live; this is where a real recompiled audio ucode would be registered
-    /// via `fn64_abi::set_audio_ucode_fn` so M_AUDTASK dispatch produces the
-    /// samples that output stream drains. No such ucode is linked today (the
-    /// only one available cross-pins `fn64-audio` -- see Cargo.toml), so this
-    /// only reports the wiring status. Enabling the `oot-audio-ucode` feature
-    /// flips the message; the actual `set_audio_ucode_fn` call lands here when
-    /// a non-cross-pinning ucode crate becomes a real dependency.
-    // AKI-family audio takes precedence when linked: the aki-audio-ucode
-    // adapter recompiles the AKI audio ucode from the ROM and depends on this
-    // workspace's fn64-audio (no cross-pin), so it works in both the C and rs
-    // lanes. This is what makes WM2000 (and the AKI family) audible.
-    #[cfg(feature = "aki-audio")]
-    fn wire_audio_ucode(rdram_len: usize) {
-        aki_audio_ucode::set_rdram_len(rdram_len);
-        unsafe { fn64_abi::set_audio_ucode_fn(aki_audio_ucode::aki_audio_ucode) };
-        println!(
-            "[fn64-shell] registered recompiled AKI audio ucode as the real M_AUDTASK ucode \
-             function (WM2000/AKI family)"
-        );
-    }
-
-    #[cfg(all(not(feature = "aki-audio"), fn64_recomp_rs, feature = "oot-audio"))]
-    fn wire_audio_ucode(rdram_len: usize) {
-        // The rs manifest links the recompiled OoT aspMain ucode via the
-        // harness-local build adapter (same crate oot-boot's rs lane uses),
-        // so M_AUDTASK dispatch really synthesizes PCM for the cpal stream.
-        oot_audio_ucode::set_rdram_len(rdram_len);
-        unsafe { fn64_abi::set_audio_ucode_fn(oot_audio_ucode::oot_audio_ucode) };
-        println!(
-            "[fn64-shell] registered recompiled OoT aspMain audio ucode as the real \
-             M_AUDTASK ucode function"
-        );
-    }
-
-    #[cfg(not(any(feature = "aki-audio", all(fn64_recomp_rs, feature = "oot-audio"))))]
-    fn wire_audio_ucode(_rdram_len: usize) {
-        if cfg!(feature = "oot-audio-ucode") {
-            println!(
-                "[fn64-shell] audio-ucode feature ON, but no ucode crate is linked yet (the \
-                 available one cross-pins fn64-audio -- see Cargo.toml). Output path is wired; \
-                 no synth."
-            );
-        } else {
-            println!(
-                "[fn64-shell] no audio ucode linked -- cpal output path is wired but receives no \
-                 samples (silent). The rs manifest (crates/fn64-shell/rs) links the real ucode."
-            );
-        }
+    fn configure_audio_tasks() {
+        fn64_abi::set_audio_task_lle_accuracy();
+        println!("[fn64-shell] registered audio task policy: live-IMEM LLE accuracy");
     }
 }

@@ -3619,10 +3619,7 @@ pub fn last_audio_error() -> Option<String> {
 /// read. The host must separately call [`crate::register_process_rdram`] (or
 /// [`crate::boot_thread0`], which performs that registration) before the
 /// first VI retrace. `rdram_len` must match that allocation's size; a mismatch
-/// is a caller bug. Mirrors
-/// `set_audio_ucode_fn`'s "the shell wires this once at startup" shape,
-/// generalized to a trait object since a graphics backend is stateful
-/// (unlike a single ucode function pointer). This compatibility entry point
+/// is a caller bug. This compatibility entry point
 /// intentionally selects [`GraphicsTaskExecutionPolicy::HleOptimized`]; a
 /// caller making an accuracy claim must use [`set_render_backend_with_policy`]
 /// and opt in explicitly.

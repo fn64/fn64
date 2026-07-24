@@ -2172,9 +2172,9 @@ lives under `N64ModernRuntime`'s GPL-3.0-licensed tree (verified: that repo's
 top-level `COPYING` is GPL-3.0; `librecomp/` is not under the MIT-carved-out
 `N64Recomp/` subdirectory) — a real, load-bearing clean-room blocker, not
 routed around. The audio task-dispatch plumbing now owned by
-`osSpTaskStartGo_recomp` (`set_audio_ucode_fn`) is real and tested against a stand-in function; the
-genuine ucode requires either an MIT-clean RSP interpreter or a forked
-RSPRecomp codegen target, both future work.
+`osSpTaskStartGo_recomp` now executes admitted live audio-task IMEM through
+fn64's clean-room RSP interpreter. Optional translated callbacks carry an exact
+artifact identity but are not release authority for arbitrary live IMEM.
 
 **Wave 4 — `fn64-rt64` bridge (parallelizes against wave 3, converges at
 the RSP task boundary).**
