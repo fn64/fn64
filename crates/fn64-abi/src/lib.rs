@@ -288,6 +288,78 @@ pub(crate) fn charge_guest_device_busy_retry() {
     charge_c_lane_mmio_access();
 }
 
+/// How many generated-C loop back-edges one thread may take within a single
+/// `run_one_step` resume before fn64 forces an instruction checkpoint. Real
+/// VR4300 hardware preempts any spin with the ~60 Hz VI interrupt; fn64's
+/// cooperative executor has no such interrupt, so a tight guest loop that
+/// polls ordinary RDRAM (not MMIO, not a message queue -- e.g. SM64's
+/// `wait_for_audio_frames`: `gAudioFrameCount = 0; while (gAudioFrameCount <
+/// n) {}`, waiting on the sound thread the VI retrace is supposed to wake)
+/// never yields and `resume()` never returns. Back-edge instrumentation
+/// (fn64_mmio_proxy.h's `FN64_BACKEDGE`, injected before every backward
+/// `goto` by `build_support.rs`) makes each loop iteration count one edge and
+/// suspend on the Nth. The threshold is a stall budget, not an exact cycle
+/// count: it must be large enough that ordinary bounded loops (memcpy, table
+/// walks) never pay a checkpoint, yet small enough that a genuine spin yields
+/// well within one host time-slice. 4096 edges is ~one N64 scanline of the
+/// tightest 2-instruction spin.
+const C_LANE_BACKEDGE_CHECKPOINT_THRESHOLD: u32 = 4096;
+
+thread_local! {
+    /// Per-resume back-edge counter. Reset to zero every time the executor
+    /// hands control to a coroutine (see `reset_backedge_budget`), so the
+    /// threshold bounds edges *within one resume*, never across a thread's
+    /// whole lifetime -- a long-running game that legitimately loops billions
+    /// of times over its lifetime still only pays a checkpoint once per
+    /// C_LANE_BACKEDGE_CHECKPOINT_THRESHOLD edges of any single uninterrupted
+    /// spin.
+    static BACKEDGE_BUDGET: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset the per-resume back-edge budget. Called by the coroutine-context
+/// plumbing immediately before each resume so the threshold is measured per
+/// scheduling slice.
+pub(crate) fn reset_backedge_budget() {
+    BACKEDGE_BUDGET.with(|cell| cell.set(0));
+}
+
+/// Generated-C loop back-edge observer. Injected before every backward `goto`
+/// in the recompiled bodies (see `fn64_mmio_proxy.h`'s `FN64_BACKEDGE` macro
+/// and `build_support.rs`'s injection pass). The common path is a single
+/// increment-and-compare; only when a thread has taken
+/// `C_LANE_BACKEDGE_CHECKPOINT_THRESHOLD` back-edges since its last resume
+/// without otherwise yielding does it force one instruction checkpoint,
+/// letting the executor advance virtual time (firing pending VI retraces / AI
+/// drains) and run other threads before this one resumes and re-checks its
+/// poll condition. No coroutine active (host-side diagnostics) => no-op.
+#[no_mangle]
+pub extern "C" fn fn64_c_backedge() {
+    let over_budget = BACKEDGE_BUDGET.with(|cell| {
+        let next = cell.get().wrapping_add(1);
+        if next >= C_LANE_BACKEDGE_CHECKPOINT_THRESHOLD {
+            cell.set(0);
+            true
+        } else {
+            cell.set(next);
+            false
+        }
+    });
+    if over_budget && ACTIVE_YIELDER.with(|cell| cell.get()).is_some() {
+        // Charge the back-edges' worth of guest instructions and yield. The
+        // thread genuinely executed ~threshold loop iterations since its last
+        // checkpoint, so advancing virtual time by that many cycles is the
+        // honest accounting -- and, crucially, it lets the executor reach a
+        // pending device deadline (an audio-frame completion, a VI retrace) in
+        // O(deadline / threshold) resume round-trips instead of one per cycle.
+        // A too-small charge would keep a multi-million-cycle wait (SM64's
+        // `audio_reset_session` note-silence loop waits up to 4 s of audio
+        // frames) crawling forward one checkpoint at a time.
+        suspend_active_coroutine(Yield::InstructionCheckpoint {
+            instructions: C_LANE_BACKEDGE_CHECKPOINT_THRESHOLD,
+        });
+    }
+}
+
 /// Boot diagnostic: log when a thread's `$sp` jumps 16KB regions between
 /// message-queue calls -- catches stack switches/corruption cheaply.
 pub(crate) fn probe_sp_region(site: &str, ctx: &RecompContext) {
@@ -1614,6 +1686,11 @@ pub fn with_active_yielder<R>(
     let previous_yielder = ACTIVE_YIELDER.with(|cell| cell.replace(Some(ptr)));
     let previous_id = ACTIVE_THREAD_ID.with(|cell| cell.replace(Some(thread_id)));
     let previous_rdram = ACTIVE_RDRAM.with(|cell| cell.replace(rdram));
+    // Fresh back-edge stall budget for this scheduling slice: the forced-
+    // checkpoint threshold (`fn64_c_backedge`) bounds a spin *within one
+    // resume*, so it must start from zero on every resume, not accumulate
+    // across a thread's whole lifetime.
+    reset_backedge_budget();
     let result = f();
     ACTIVE_YIELDER.with(|cell| cell.set(previous_yielder));
     ACTIVE_THREAD_ID.with(|cell| cell.set(previous_id));
@@ -1645,6 +1722,11 @@ fn with_rearmed_context<R>(thread_id: ThreadId, f: impl FnOnce() -> R) -> R {
     let previous_yielder = ACTIVE_YIELDER.with(|cell| cell.replace(Some(ptr)));
     let previous_id = ACTIVE_THREAD_ID.with(|cell| cell.replace(Some(thread_id)));
     let previous_rdram = ACTIVE_RDRAM.with(|cell| cell.replace(rdram));
+    // Fresh back-edge stall budget for this scheduling slice: the forced-
+    // checkpoint threshold (`fn64_c_backedge`) bounds a spin *within one
+    // resume*, so it must start from zero on every resume, not accumulate
+    // across a thread's whole lifetime.
+    reset_backedge_budget();
     let result = f();
     ACTIVE_YIELDER.with(|cell| cell.set(previous_yielder));
     ACTIVE_THREAD_ID.with(|cell| cell.set(previous_id));
