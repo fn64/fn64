@@ -739,7 +739,8 @@ mod tests {
                     PackedBlockV1 {
                         start_va: 0x8000_0000,
                         end_va: 0x8000_0010,
-                        rom_start: 0x1000,
+                        rom_space: crate::facts::RomAddressSpace::Physical,
+            rom_start: 0x1000,
                         rom_end: 0x1010,
                         bytes_sha256: "b".repeat(64),
                         terminator: BlockTerminator::Return,
@@ -747,7 +748,8 @@ mod tests {
                     PackedBlockV1 {
                         start_va: 0x8000_0010,
                         end_va: 0x8000_0020,
-                        rom_start: 0x1010,
+                        rom_space: crate::facts::RomAddressSpace::Physical,
+            rom_start: 0x1010,
                         rom_end: 0x1020,
                         bytes_sha256: "c".repeat(64),
                         terminator: BlockTerminator::Fallthrough { next: 0x8000_0020 },
