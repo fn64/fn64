@@ -144,9 +144,12 @@ impl NoDpcSubmissionWholeAudioTaskReference {
 
 /// Sole same-entry HLE lane paired with a whole-task reference.
 ///
-/// The inner lane is never exposed or cloneable through this public seam.
-/// A later concrete family executor inside this crate must consume this owner
-/// before it can produce a candidate outcome.
+/// This wrapper capability is not cloneable or publicly unwrap-able. Its
+/// admitted snapshot remains inspectable and cloneable for diagnostics, and
+/// can fork raw speculative lanes, but those values cannot reconstruct this
+/// paired capability or promote an outcome. A later concrete family executor
+/// inside this crate must consume this owner before it can produce a candidate
+/// outcome.
 ///
 /// ```compile_fail
 /// use fn64_audio::whole_task::WholeAudioTaskHleLane;
@@ -163,6 +166,10 @@ pub struct WholeAudioTaskHleLane {
 impl WholeAudioTaskHleLane {
     pub const fn snapshot(&self) -> &AdmittedAudioHleTaskSnapshot {
         self.lane.snapshot()
+    }
+
+    pub(crate) fn into_inner(self) -> AudioHleLane {
+        self.lane
     }
 }
 
@@ -185,7 +192,7 @@ impl PreparedWholeAudioTaskDifferential {
         &self.reference
     }
 
-    pub fn into_parts(
+    pub(crate) fn into_parts(
         self,
     ) -> (
         WholeAudioTaskHleLane,
@@ -320,6 +327,7 @@ mod tests {
     };
 
     use crate::hle::{AudioHleCatalog, AudioHleCatalogEntry};
+    use crate::hle_executor::{execute_standard_whole_audio_task, StandardAudioHleFrontier};
     use crate::hle_outcome::AudioHleFamily;
     use crate::rsp::runtime::RspMachine;
 
@@ -340,6 +348,24 @@ mod tests {
 
     fn fixture() -> AudioRspbootInput {
         fixture_with_ucode(0x2405_5678, |_| {})
+    }
+
+    fn fixture_with_command(w0: u32, w1: u32) -> AudioRspbootInput {
+        let input = fixture();
+        let mut rdram = input.rdram_storage().to_vec();
+        RdramViewMut::from_storage(&mut rdram).write_logical_bytes(
+            RdramAddr::from_offset(COMMANDS),
+            &[w0.to_be_bytes(), w1.to_be_bytes()].concat(),
+        );
+        AudioRspbootInput::new(
+            input.task_addr(),
+            input.loaded_header(),
+            rdram,
+            input.rsp_memory().clone(),
+            input.initial_pc_low12(),
+            input.initial_machine_state().clone(),
+        )
+        .unwrap()
     }
 
     fn fixture_with_ucode(
@@ -726,6 +752,75 @@ mod tests {
             Err(PrepareWholeAudioTaskError::Admission(
                 AudioHleSnapshotError::MicrocodeIdentityMismatch { .. }
             ))
+        ));
+    }
+
+    #[test]
+    fn consuming_standard_executor_stops_at_dsp_without_mutating_reference_state() {
+        let input = fixture();
+        let prepared = prepare_no_dpc_submission_whole_audio_task(
+            input.clone(),
+            admission(&input),
+            CanonicalRdramRanges::default(),
+        )
+        .unwrap();
+        let attempted = execute_standard_whole_audio_task(prepared);
+
+        assert_eq!(attempted.decoded_commands(), 1);
+        assert!(matches!(
+            attempted.frontier(),
+            StandardAudioHleFrontier::UnsupportedDspSemantics {
+                command_index: 0,
+                opcode: crate::standard_abi::StandardAbiOpcode::SpNoop,
+            }
+        ));
+        assert_eq!(
+            attempted.reference().initial_rdram_storage(),
+            input.rdram_storage()
+        );
+        assert!(attempted
+            .reference()
+            .final_rdram_patches()
+            .as_slice()
+            .is_empty());
+    }
+
+    #[test]
+    fn proven_setbuffer_state_advances_to_typed_completion_frontier() {
+        let input = fixture_with_command(0x0800_0100, 0x0200_0020);
+        let prepared = prepare_no_dpc_submission_whole_audio_task(
+            input.clone(),
+            admission(&input),
+            CanonicalRdramRanges::default(),
+        )
+        .unwrap();
+        let attempted = execute_standard_whole_audio_task(prepared);
+
+        assert_eq!(attempted.decoded_commands(), 1);
+        assert_eq!(
+            attempted.frontier(),
+            &StandardAudioHleFrontier::UnsupportedCompletionSemantics { command_count: 1 }
+        );
+    }
+
+    #[test]
+    fn unknown_standard_opcode_is_a_consuming_typed_frontier() {
+        let input = fixture_with_command(0x1000_0000, 0);
+        let prepared = prepare_no_dpc_submission_whole_audio_task(
+            input.clone(),
+            admission(&input),
+            CanonicalRdramRanges::default(),
+        )
+        .unwrap();
+        let attempted = execute_standard_whole_audio_task(prepared);
+
+        assert_eq!(attempted.decoded_commands(), 0);
+        assert!(matches!(
+            attempted.frontier(),
+            StandardAudioHleFrontier::UnknownOpcode {
+                command_index: 0,
+                source: crate::standard_abi::UnknownStandardAbiOpcode { opcode: 0x10 },
+            }
         ));
     }
 }
