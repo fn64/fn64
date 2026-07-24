@@ -39,7 +39,7 @@ use fn64_discover::block_pack::{
 };
 use fn64_discover::snapshot::{compose_materialized_banks_v1, MaterializedBankInput};
 use fn64_discover::{
-    aki_reference, oot_reference, run_discovery, run_discovery_with_load_image_tables,
+    aki_reference, oot_reference, run_discovery, run_discovery_with_tables_and_request_dma,
     run_discovery_with_recovered_overlay_regions, DescriptorTableInput, Fact, FactDb,
     NormalizedRom, RecoveredOverlayInput, RomAddressSpace,
 };
@@ -59,8 +59,13 @@ const EMIT_BLOCK_PROGRAM_VAR: &str = "FN64_EMIT_BLOCK_PROGRAM";
 enum Discovery {
     /// Boot bank + an AKI-family descriptor table (NW4E).
     Descriptor(Option<DescriptorTableInput>),
-    /// Boot bank + explicitly located load-image tables (OoT).
-    LoadImageTables(Vec<banks::LoadImageTableInput>),
+    /// Boot bank + explicitly located load-image tables, plus the static
+    /// request-DMA claims that recover files (OoT's resident `code`) whose
+    /// VRAM destination no table supplies.
+    LoadImageTables(
+        Vec<banks::LoadImageTableInput>,
+        Vec<banks::StaticRequestDmaInput>,
+    ),
     /// Boot bank + mechanically recovered overlay descriptor table (NWXE).
     RecoveredOverlays(RecoveredOverlayInput),
 }
@@ -232,8 +237,9 @@ fn discover(rom_bytes: &[u8], discovery: Discovery) -> Result<(NormalizedRom, Fa
         Discovery::Descriptor(descriptor) => {
             run_discovery(rom_bytes, descriptor).map_err(|error| error.to_string())
         }
-        Discovery::LoadImageTables(tables) => {
-            run_discovery_with_load_image_tables(rom_bytes, None, &tables)
+        Discovery::LoadImageTables(tables, request_dma) => {
+            run_discovery_with_tables_and_request_dma(rom_bytes, None, &tables, &request_dma)
+                .map(|(rom, facts, _report)| (rom, facts))
                 .map_err(|error| error.to_string())
         }
         Discovery::RecoveredOverlays(input) => {
@@ -606,6 +612,21 @@ fn nwxe_discovery() -> Discovery {
     })
 }
 
+/// OoT's resident `code`/`n64dd` images are loaded by the game's own
+/// `DmaMgr_RequestSync(ram, vrom, size)` call, not by any table, so no
+/// load-image table supplies their VRAM destination. The request-DMA scan
+/// reads that geometry out of the boot image's own instruction bytes; the
+/// callee VA is a cited anchor claim (see the reference TOML's header).
 fn oot_discovery() -> Discovery {
-    Discovery::LoadImageTables(oot_reference::oot_load_image_tables().to_vec())
+    #[derive(Deserialize)]
+    struct RequestDmaFile {
+        request_dma: Vec<banks::StaticRequestDmaInput>,
+    }
+    let text = include_str!("../../reference/oot-ntsc-1.0-request-dma.toml");
+    let file: RequestDmaFile =
+        toml::from_str(text).expect("bundled OoT request-DMA reference must parse");
+    Discovery::LoadImageTables(
+        oot_reference::oot_load_image_tables().to_vec(),
+        file.request_dma,
+    )
 }
