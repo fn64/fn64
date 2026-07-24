@@ -4538,6 +4538,34 @@ pub unsafe extern "C" fn osSpTaskYield_recomp(_rdram: *mut u8, _ctx: *mut Recomp
     crate::pi::write_live_sp_status(fn64_runtime::SP_SET_YIELD);
 }
 
+/// A guest started the RSP by clearing HALT through raw `SP_STATUS` MMIO
+/// rather than through the libultra task shim.
+///
+/// The device reports that edge as
+/// [`fn64_runtime::DeviceMmioWriteEffect::RspStartRequested`] so it is no
+/// longer silently latched, but executing it is not wired yet: the LLE runner
+/// keys interpreter ownership on an OSTask address
+/// ([`begin_rsp_interpreter_phase`] panics on a missing lineage) and a raw kick
+/// has no task to key on.
+///
+/// This fails by name instead of returning. Returning would reproduce the
+/// original defect exactly — the guest waits forever on an SP interrupt that
+/// never arrives, with no diagnostic — which is the failure shape `AGENTS.md`'s
+/// "loud traps, no silent shrugs" rule exists to prevent.
+pub(crate) fn raw_rsp_start_unsupported(pc: u32) -> ! {
+    let reason = "raw SP_STATUS clear-halt started the RSP outside the libultra task lane; \
+                  task-free RSP execution is not wired (the LLE runner requires an OSTask \
+                  lineage)";
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Abi,
+        "abi.rsp.raw-sp-status-start",
+        reason,
+        Some(fn64_runtime::Cycles::new(crate::sim_time())),
+        fn64_runtime::UnsupportedDisposition::LoudTrap,
+    );
+    panic!("{reason}; SP_PC {pc:#06x}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

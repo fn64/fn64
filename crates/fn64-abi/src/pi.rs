@@ -765,6 +765,9 @@ fn apply_live_ai_write_effect(rdram: *mut u8, effect: fn64_runtime::DeviceMmioWr
                 submission.token
             )
         }
+        fn64_runtime::DeviceMmioWriteEffect::RspStartRequested { pc } => {
+            panic!("AI register write unexpectedly started the RSP at {pc:#06x}")
+        }
     }
 }
 
@@ -1192,6 +1195,19 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
                 );
             }
             unsafe { crate::task_dispatch::dispatch_dpc_submission(rdram, submission) };
+        }
+        fn64_runtime::DeviceMmioWriteEffect::RspStartRequested { pc } => {
+            // A guest kicked the RSP through raw MMIO rather than through the
+            // libultra task shim. The device now reports that edge instead of
+            // silently latching it, but the execution wiring is not landed:
+            // the LLE runner keys its interpreter-ownership lineage on an
+            // OSTask address (`begin_rsp_interpreter_phase`, which panics on a
+            // missing lineage) and a raw kick has no task.
+            //
+            // Fail by name rather than return. Returning would reproduce the
+            // original defect exactly -- the guest would wait forever on an SP
+            // interrupt that never arrives, with no diagnostic.
+            crate::task_dispatch::raw_rsp_start_unsupported(pc);
         }
     }
     true
