@@ -1600,7 +1600,7 @@ pub fn decode(w: u32) -> Instruction {
         // rs bit 25 (the "CO" bit) selects the funct-encoded ops (ERET/TLB*).
         0x10 => {
             let fmt = rs(w);
-            if fmt & 0x10 != 0 {
+            let instruction = if fmt & 0x10 != 0 {
                 // CO=1: TLB / ERET, selected by funct (bits 5..0).
                 match funct(w) {
                     0x01 => Tlbr,
@@ -1637,7 +1637,13 @@ pub fn decode(w: u32) -> Instruction {
                     },
                     _ => Unknown { word: w },
                 }
-            }
+            };
+            assert!(
+                matches!(instruction, Unknown { .. }) || instruction.requires_cop0(),
+                "recognized COP0 decode omitted the mandatory authority classification: \
+                 word={w:#010x} instruction={instruction:?}"
+            );
+            instruction
         }
         // COP2 (opcode 0x12): move ops, sub-dispatched on the rs/format field.
         0x12 => match rs(w) {
