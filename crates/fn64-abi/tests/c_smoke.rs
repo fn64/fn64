@@ -155,6 +155,8 @@ fn c_caller_links_and_runs_against_fn64_abi_staticlib() {
             "Foundation",
             "-lobjc",
         ]);
+    } else if cfg!(target_os = "linux") {
+        cxx.arg("-lasound");
     }
     let proxy_compile = cxx
         .output()
