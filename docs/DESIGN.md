@@ -902,7 +902,13 @@ task calls out:
   repeated `END` writes cannot replay an already-rendered prefix. Exact
   hardware DPC counters and latency, FREEZE/FLUSH interaction, subword register
   access, native execution paused mid-transaction, and silicon bus behavior
-  remain open. Graphics HLE preflight is
+  remain open. An additive phase-A scheduling seam can represent future
+  evidence-derived progress without changing that production model: runtime-owned
+  transaction/quantum/cursor types stop at an exact external-work barrier and
+  accept only the matching acknowledgment, while the ABI owns any renderer
+  continuation. Its schedules are explicit inputs used by deterministic synthetic
+  tests; they grant no RDP-cycle, intermediate-CURRENT, counter, FREEZE, or FLUSH
+  authority, and existing backends remain on the atomic path. Graphics HLE preflight is
   transactional and content-addressed: selecting an HLE decode mode admits no
   content. Both HLE backends return `NeedsLle` when the task-entry IMEM digest
   is unregistered; the reference renderer additionally decodes admitted tasks

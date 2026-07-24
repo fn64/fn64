@@ -599,7 +599,11 @@ and deterministic output traces.
   hardware timing traces remain open. CONTROL-disabled raw starts and
   CONTROL changes while a FIFO slot is active fail loudly because the public
   register definition names the enable bit but does not define the latter
-  transition. Exact AI/DPC timing and counters, the hardware AI-interrupt
+  transition. Phase A of scheduled DPC execution is additive and non-production:
+  typed transaction/quantum/cursor ownership, an external-work barrier, exact
+  acknowledgment validation, and an opt-in renderer continuation contract are
+  exercised only by synthetic schedules. Atomic backends and their digests are
+  unchanged. Exact AI/DPC timing and counters, the hardware AI-interrupt
   phase, mid-transfer AI control, FREEZE/FLUSH, subword raw access, native-C
   mid-task visibility, and silicon behavior remain open. SI now has a scheduled 64-byte DRAM/PIF
   engine with persistent
