@@ -8,6 +8,7 @@ description = "Mechanical, zero-LLM N64 ROM function-metadata discovery frontend
 
 [dependencies]
 fn64-recomp-rs = { path = "../fn64-recomp-rs" }
+fn64-runtime = { path = "../fn64-runtime" }
 csv = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
