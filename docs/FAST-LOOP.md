@@ -20,9 +20,8 @@ vs a cold compile. Set it for every job build:
 ```
 export CARGO_TARGET_DIR=/tmp/fn64-shared-target
 ```
-CAVEAT: the fn64-audio lockfile collision (oot-boot's oot-audio-ucode dep pins
-fn64-audio to the main checkout) can still bite worktree oot-boot builds — the
-rs manifest sidesteps it; the shared target does not change that.
+The boot and shell manifests now select live-IMEM LLE without translated-ucode
+dependencies, so their lockfiles do not cross-pin a sibling fn64-audio checkout.
 
 ## The combined fast rs-boot loop
 ```
