@@ -31,7 +31,9 @@ The overlay admits only:
 Validation precedes the texture load. Both the texture prefix and sprite tail
 are copied into initialized, trivially-copyable local public-layout structures
 with `memcpy`; compile-time lifetime, size, and `offsetof` checks guard the
-decoded fields without dereferencing a typed object in byte storage.
+decoded fields without dereferencing a typed object in byte storage. The
+bounded texture load consumes the already-validated physical source address;
+it does not send KSEG inputs back through RT64's segmented resolver.
 Legacy S2DEX wire admission, standalone
 rectangles, sprites, matrix-relative rectangles, scaling, filtering, flips,
 tile/TLUT loads, other formats, and object render-mode corrections retain a
@@ -53,8 +55,9 @@ fresh process it:
 2. runs `G_OBJ_LOADTXTR` alone and proves the guarded target remains all zero;
 3. runs the compound load/draw with an asymmetric 4x2 texture at nonzero screen
    origin, a KSEG0 compound pointer, and a KSEG1 texture pointer, and captures
-   downstream load/workload telemetry; canonical segmented addressing remains
-   exercised by the texture-only control and final recovery workload;
+   downstream load/workload telemetry while segment zero is deliberately
+   poisoned to a nonzero base; canonical segmented addressing remains exercised
+   by the texture-only control and a segment-reset final recovery workload;
 4. independently encodes the equivalent raw RDP texture load, render tile, and
    texture rectangle into a separate guarded target;
 5. requires byte-identical RDRAM targets and byte-identical Metal post-VI BGRA8
@@ -89,7 +92,7 @@ The stable exact outputs are:
 The generated adapter identity for this run is
 `fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1+s2dex-object-rect:v3`,
 with exact adapter-source SHA-256
-`c94e6ee0436295471e5a696ece735793895f552dde9e1fbc3853ea100ceec7b9`.
+`25228837544d1903b3dcafc079d365b7654d942afc29d3f2fbb09d724eddee83`.
 
 On 2026-07-24 in America/New_York the v3 gate passed 10/10 fresh processes on
 the recorded macOS 26.5 arm64 Apple M5 Pro host. Every process retained exact

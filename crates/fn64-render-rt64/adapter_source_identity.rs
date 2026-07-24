@@ -345,6 +345,8 @@ mod tests {
             "(addressClass == 0x80U) || (addressClass == 0xA0U)",
             "uint64_t(state->rsp->segments[addressClass]) + uint64_t(offset)",
             "std::memcpy(&texture, objectBytes, sizeof(texture));",
+            "void doFn64ObjLoadTxtr(",
+            "doFn64ObjLoadTxtr(state, texture, imageAddress);",
             "doFn64ObjLoadTxRect(state, state->rsp->S2D.struct_buffer.data());",
             "fn64_rt64_gbi_s2dex.cpp",
             "TARGET_DIRECTORY rt64",
@@ -365,7 +367,7 @@ mod tests {
             .find("state->fromRDRAM(objectAddress),")
             .expect("exact compound DMA read remains present");
         let mutation = cmake
-            .find("doLoadTxtr(state, &texture);")
+            .find("doFn64ObjLoadTxtr(state, texture, imageAddress);")
             .expect("texture load remains present");
         assert!(
             validation < mutation,
@@ -376,6 +378,7 @@ mod tests {
             "length and pointer validation must precede the compound read"
         );
         assert!(!cmake.contains("readS2DStruct(state, (*dl)->w1, 0x30U);"));
+        assert!(!cmake.contains("doLoadTxtr(state, &texture);"));
         assert_eq!(
             cmake
                 .matches("(uObjTxSprite*)state->rsp->S2D.struct_buffer.data()")
