@@ -764,6 +764,23 @@ impl Interp<'_> {
                 word,
             })
         };
+        // SYSCALL/BREAK and a taken conditional trap. `instruction_code` carries
+        // the architectural code field so a handler can read it back, matching
+        // the AOT lane's trap emission.
+        let trap_exception = |exception, code: u32| StepFault::Cpu {
+            fault: CpuFault {
+                at: self.key(site.pc),
+                kind: CpuFaultKind::Exception {
+                    exception,
+                    epc: GuestPc::new(site.epc),
+                    branch_delay: site.branch_delay,
+                    instruction_code: code,
+                    bad_vaddr: None,
+                    coprocessor: None,
+                },
+            },
+            attempted: if site.branch_delay { 2 } else { 1 },
+        };
         // An enabled/unmaskable FP exception vectors to ExcCode 15, identical to
         // the AOT bank lane's `emit_bank_fpu_trap`: the destination register and
         // sticky Flags are left unwritten (the `ctx.fpu_*` helper already did
@@ -835,6 +852,20 @@ impl Interp<'_> {
                 },
                 retired: 1,
             });
+        }
+
+        // Synchronous trapping instructions: SYSCALL, BREAK, and the twelve
+        // conditional traps. These mirror the AOT lane's trap emission exactly
+        // (same ExcCode, same signed/unsigned comparison width, same code
+        // field), so an interpreted bank and a generated bank raise the
+        // identical architectural exception for the same word. A conditional
+        // trap whose condition is false retires as an ordinary no-op.
+        if let Some((taken, exception, code)) = classify_trap(instr, ctx) {
+            return if taken {
+                Err(trap_exception(exception, code))
+            } else {
+                ok
+            };
         }
 
         // The MMIO seam: after architectural alignment/TLB checks, a word
@@ -979,6 +1010,37 @@ fn branch_condition(instr: &Instruction, ctx: &RecompContext) -> Option<bool> {
         Bc0f { .. } | Bc0fl { .. } => !ctx.cop0_cond,
         _ => return None,
     })
+}
+
+/// Classify SYSCALL/BREAK and the twelve conditional traps, mirroring the AOT
+/// lane's trap emission. Returns `None` when `instr` is not a trapping op, or
+/// `Some((taken, exception, code))` where `taken` is false for a conditional
+/// trap whose condition does not hold (it then retires as a no-op). The
+/// comparison widths are the architectural ones: signed 64-bit for `TGE`/`TLT`
+/// and their immediate forms, unsigned 64-bit for `TGEU`/`TLTU`, and a raw
+/// 64-bit equality for `TEQ`/`TNE`; immediates are sign-extended first.
+fn classify_trap(instr: Instruction, ctx: &RecompContext) -> Option<(bool, CpuException, u32)> {
+    use Instruction::*;
+    let s = |reg| ctx.r(reg) as i64;
+    let u = |reg| ctx.r(reg);
+    let (taken, exception, code) = match instr {
+        Syscall { code } => (true, CpuException::Syscall, code),
+        Break { code } => (true, CpuException::Breakpoint, code),
+        Tge { rs, rt, code } => (s(rs) >= s(rt), CpuException::Trap, u32::from(code)),
+        Tgeu { rs, rt, code } => (u(rs) >= u(rt), CpuException::Trap, u32::from(code)),
+        Tlt { rs, rt, code } => (s(rs) < s(rt), CpuException::Trap, u32::from(code)),
+        Tltu { rs, rt, code } => (u(rs) < u(rt), CpuException::Trap, u32::from(code)),
+        Teq { rs, rt, code } => (u(rs) == u(rt), CpuException::Trap, u32::from(code)),
+        Tne { rs, rt, code } => (u(rs) != u(rt), CpuException::Trap, u32::from(code)),
+        Tgei { rs, imm } => (s(rs) >= i64::from(imm), CpuException::Trap, 0),
+        Tgeiu { rs, imm } => (u(rs) >= i64::from(imm) as u64, CpuException::Trap, 0),
+        Tlti { rs, imm } => (s(rs) < i64::from(imm), CpuException::Trap, 0),
+        Tltiu { rs, imm } => ((u(rs) < i64::from(imm) as u64), CpuException::Trap, 0),
+        Teqi { rs, imm } => (s(rs) == i64::from(imm), CpuException::Trap, 0),
+        Tnei { rs, imm } => (s(rs) != i64::from(imm), CpuException::Trap, 0),
+        _ => return None,
+    };
+    Some((taken, exception, code))
 }
 
 fn aligned_memory_access(instr: Instruction) -> Option<(u8, i16, u64, CpuException)> {
@@ -2248,6 +2310,67 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Raised exception for a one-instruction bank, or `None` when the
+    /// instruction retired without faulting. `jr $ra; nop` terminates the bank.
+    fn trap_exception_of(word: u32, regs: &[(u8, u64)]) -> Option<CpuException> {
+        let catalog = catalog_of(&[word, 0x03E0_0008, 0x0000_0000]);
+        let mut ctx = RecompContext::new();
+        for &(reg, value) in regs {
+            ctx.set_r(reg, value);
+        }
+        let run = run(&catalog, VA, 8, &mut ctx).unwrap();
+        match run.exit {
+            BlockExit::Fault(CpuFault {
+                kind: CpuFaultKind::Exception { exception, .. },
+                ..
+            }) => Some(exception),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn interpreted_break_and_syscall_raise_their_architectural_exceptions() {
+        // break 0 / syscall 0 — the mid-function traps that previously left the
+        // interpreter with no arm at all (a typed UnsupportedOp dead-end).
+        assert_eq!(
+            trap_exception_of(0x0000_000D, &[]),
+            Some(CpuException::Breakpoint)
+        );
+        assert_eq!(
+            trap_exception_of(0x0000_000C, &[]),
+            Some(CpuException::Syscall)
+        );
+    }
+
+    #[test]
+    fn interpreted_conditional_trap_respects_its_condition() {
+        // teq $t0,$t0 always holds -> Trap; tne $t0,$t0 never holds -> the
+        // instruction retires as an ordinary no-op rather than faulting.
+        assert_eq!(
+            trap_exception_of(0x0108_0034, &[]),
+            Some(CpuException::Trap)
+        );
+        assert_eq!(trap_exception_of(0x0108_0036, &[]), None);
+    }
+
+    #[test]
+    fn interpreted_conditional_trap_uses_the_architectural_comparison_width() {
+        // $t0 = -1, $t1 = 1. Signed tlt takes the trap (-1 < 1); unsigned tltu
+        // does not (0xFFFF_FFFF_FFFF_FFFF > 1). Comparing at the wrong width
+        // silently inverts both, so this pins the exact bug class.
+        let regs = [(8u8, u64::MAX), (9u8, 1u64)];
+        assert_eq!(
+            trap_exception_of(0x0109_0032, &regs),
+            Some(CpuException::Trap),
+            "signed tlt must trap for -1 < 1"
+        );
+        assert_eq!(
+            trap_exception_of(0x0109_0033, &regs),
+            None,
+            "unsigned tltu must not trap: -1 reads as u64::MAX"
+        );
     }
 
     fn executable_boundary(
