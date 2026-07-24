@@ -19,6 +19,7 @@ examples/*/target-c
 # Compiled mupen debug/trace drivers (build artifacts, never committed)
 tools/mupen-bfs/mupen_bfs
 tools/mupen-trace/mupen_trace
+tools/mupen-trace/mupen_devtrace
 
 # Python bytecode cache from scripts/*.py (importers, ares trace driver).
 # A transient build artifact -- running any script leaves it and it shows
