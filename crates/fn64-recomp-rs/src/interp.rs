@@ -35,14 +35,17 @@
 //! instruction-budget [`BlockExit::Checkpoint`]s that never split a branch/delay
 //! pair, canonical 32-bit data translation through recorded TLB entries,
 //! precise aligned-memory AdEL/AdES plus TLB refill/invalid/modified faults,
-//! and an access outside owned backing as a typed
-//! [`CpuFaultKind::MemoryFault`] reusing the U4 checked `Rdram` accessors.
+//! an access outside owned backing as a typed [`CpuFaultKind::MemoryFault`]
+//! reusing the U4 checked `Rdram` accessors, and `ERET` (a privileged,
+//! delay-slot-free transfer, handled the same as `emit_bank_eret` in
+//! emit.rs: `RecompContext::exception_return_pc`'s ErrorEPC/ERL-over-EPC/EXL
+//! precedence and LLbit clear, resolved as an unconditional
+//! [`BlockExit::ResolveTransfer`]).
 //!
 //! Explicitly OUT (each a loud [`StepFault::Unsupported`] naming the opcode, the
 //! same frontier the AOT lane leaves open — see `Still open in U4` in
 //! `docs/UNIVERSAL-RUNTIME-PLAN.md`): the entire COP1/FPU environment, COP2,
-//! 64-bit TLB translation, `ERET`, `SYSCALL`/`BREAK`, and the
-//! conditional trap ops.
+//! 64-bit TLB translation, `SYSCALL`/`BREAK`, and the conditional trap ops.
 //! Canonical 32-bit instruction translation is supplied by the one-unit
 //! [`crate::fetch::run_mapped_bank`] wrapper, which fetches by physical identity
 //! before constructing this interpreter's execution-local virtual view.
@@ -365,6 +368,34 @@ impl Interp<'_> {
             };
             let instr = decode(word);
 
+            // ERET is a privileged transfer without a delay slot (mirrors
+            // `emit_bank_eret` in emit.rs exactly, including its ALWAYS
+            // `BlockExit::ResolveTransfer` — never a proven in-bank
+            // `Transfer` — because the target is a runtime EPC/ErrorEPC
+            // value, never a statically provable one): apply the VR4300
+            // ERET state transition (ErrorEPC/ERL precedence over EPC/EXL,
+            // LLbit clear — both inside
+            // `RecompContext::exception_return_pc`) and resolve to the
+            // returned virtual PC. It is handled here, before the
+            // `has_delay_slot()`/`straight()` split, because it is neither a
+            // delay-slot control transfer nor an ordinary fallthrough
+            // instruction.
+            if matches!(instr, Instruction::Eret) {
+                let executed = executed + 1;
+                let target = ctx.exception_return_pc();
+                ctx.advance_cop0_random(1);
+                return Ok(BlockRun::new(
+                    crate::execution::finalize_executable_write_exit(
+                        self.bank,
+                        BlockExit::ResolveTransfer {
+                            source_bank: self.bank,
+                            target_pc: GuestPc::new(target),
+                        },
+                    ),
+                    executed,
+                ));
+            }
+
             if instr.has_delay_slot() {
                 // A control transfer and its delay slot are one indivisible
                 // dispatch unit. Charge/checkpoint identically to the AOT runner:
@@ -399,6 +430,7 @@ impl Interp<'_> {
                     ctx,
                     mem,
                     port,
+                    executed,
                 ) {
                     Ok(Step::Exit { exit, retired }) => {
                         let executed = executed + retired;
@@ -438,6 +470,7 @@ impl Interp<'_> {
                 ctx,
                 mem,
                 port,
+                executed,
             ) {
                 Ok(Step::Fallthrough { next, retired }) => {
                     executed += retired;
@@ -532,6 +565,14 @@ impl Interp<'_> {
     /// typed [`BlockExit`]. `retired` is 2 on a committed branch/delay pair; a
     /// delay-slot [`CpuFault`] surfaces as `Err(StepFault::Cpu)` and the caller
     /// charges 0 (the branch is annulled).
+    ///
+    /// `retired_before` is this turn's retired-instruction count immediately
+    /// before `instr` (the caller's `executed`) — forwarded to the delay
+    /// slot's `straight` call for `MFC0 $9` interior Count visibility (see
+    /// `exec_straight`'s doc comment). The branch/delay pair's own charge is
+    /// still applied only as the lump `retired: 2` this function returns —
+    /// exactly the AOT lane's `executed += 2` timing — so a delay-slot MFC0
+    /// never sees itself or its owning branch as already retired.
     #[allow(clippy::too_many_arguments)]
     fn control_transfer(
         &self,
@@ -544,6 +585,7 @@ impl Interp<'_> {
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
         port: &mut dyn MmioPort,
+        retired_before: u32,
     ) -> Result<Step, StepFault> {
         use Instruction::*;
 
@@ -575,6 +617,7 @@ impl Interp<'_> {
                 ctx,
                 mem,
                 port,
+                retired_before,
             )? {
                 Step::Fallthrough { .. } => Ok(()),
                 Step::Exit { .. } => {
@@ -674,6 +717,11 @@ impl Interp<'_> {
     /// Execute one ordinary (non-control-transfer) instruction against `ctx` and
     /// `mem`. Returns [`Step::Fallthrough`] with `retired == 1` on success.
     /// Semantics mirror `emit_straight` exactly (the AOT lane is the oracle).
+    ///
+    /// `retired_before` is the bank-runner turn's retired-instruction count
+    /// immediately before `instr` — see `exec_straight`'s doc comment; it
+    /// exists only to give an in-block `MFC0 $9` interior Count visibility.
+    #[allow(clippy::too_many_arguments)]
     fn straight(
         &self,
         site: FaultSite,
@@ -682,6 +730,7 @@ impl Interp<'_> {
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
         port: &mut dyn MmioPort,
+        retired_before: u32,
     ) -> Result<Step, StepFault> {
         let next = site.pc.wrapping_add(4);
         let ok = Ok(Step::Fallthrough { next, retired: 1 });
@@ -799,7 +848,7 @@ impl Interp<'_> {
             _ => {}
         }
 
-        exec_straight(instr, ctx, mem, &mem_fault, &unsupported)?;
+        exec_straight(instr, ctx, mem, &mem_fault, &unsupported, retired_before)?;
         ctx.advance_cop0_random(1);
         ok
     }
@@ -885,12 +934,23 @@ fn aligned_memory_access(instr: Instruction) -> Option<(u8, i16, u64, CpuExcepti
 ///
 /// Every arithmetic/logical/shift/memory arm here is the executable twin of an
 /// `emit_straight` arm; the differential test is the proof they agree.
+///
+/// `retired_before` is this bank-runner turn's retired-instruction count
+/// immediately BEFORE `instr` (never including `instr` itself, and never
+/// including an in-flight, not-yet-committed branch/delay pair — see
+/// `Interp::run`'s `executed` accumulator, which is exactly this value at
+/// every call site). `MFC0 $9` (Count) is the only arm that reads it, to
+/// give a mid-block Count read the interior visibility
+/// `RecompContext::read_cop0_count_interior` documents; every other arm
+/// ignores it, matching the AOT lane exactly (see that method's doc comment
+/// for why this cannot double-count against the block-boundary sync).
 fn exec_straight(
     instr: Instruction,
     ctx: &mut RecompContext,
     mem: &mut Rdram<'_>,
     mem_fault: &dyn Fn(DataAccessError) -> StepFault,
     unsupported: &dyn Fn() -> StepFault,
+    retired_before: u32,
 ) -> Result<(), StepFault> {
     use Instruction::*;
 
@@ -1160,7 +1220,13 @@ fn exec_straight(
 
         // --- Modeled COP0/TLB management ---
         Mfc0 { rt, cop0d } => match cop0d {
-            0 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 20 | 30 => {
+            // Count (9): interior visibility — see
+            // `RecompContext::read_cop0_count_interior`'s doc comment for
+            // the exact boundary-sync contract this must not violate.
+            9 => {
+                ctx.set_r32(rt, ctx.read_cop0_count_interior(retired_before) as i32);
+            }
+            0 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 10 | 11 | 12 | 13 | 14 | 18 | 19 | 20 | 30 => {
                 ctx.set_r32(rt, ctx.read_cop0(cop0d) as i32);
             }
             _ => return Err(unsupported()),
@@ -1378,6 +1444,188 @@ mod tests {
         assert_eq!(ctx.cop0_page_mask, 0x0000_6000);
         assert_eq!(ctx.cop0_entry_lo0, 0x0000_0046);
         assert_eq!(ctx.cop0_entry_lo1, 0x0000_0086);
+    }
+
+    #[test]
+    fn mid_block_mfc0_count_sees_interior_retired_delta_without_double_counting_at_the_boundary() {
+        // Three MFC0 $9 reads inside ONE block, at retired-instruction
+        // offsets 0, 5, and 10 (four NOPs between each), then `jr $ra`. Gap 2:
+        // Count is normally synchronized only at block/checkpoint boundaries
+        // (the executor owns it, `RecompContext::synchronize_cop0_timing`
+        // writes it once at block entry); an in-block MFC0 $9 must instead
+        // see Count advanced by (retired instructions since entry) / 2, at
+        // the same half-CPU-rate the executor's `advance_time` uses.
+        let mfc0_count = |rt: u32| 0x4000_4800 | (rt << 16); // mfc0 $rt, $9
+        let words = [
+            mfc0_count(8), // $t0 <- Count @ retired_before = 0
+            0,
+            0,
+            0,
+            0,             // 4 nops
+            mfc0_count(9), // $t1 <- Count @ retired_before = 5
+            0,
+            0,
+            0,
+            0,              // 4 nops
+            mfc0_count(10), // $t2 <- Count @ retired_before = 10
+            0x03E0_0008,    // jr $ra
+            0,              // nop (delay)
+        ];
+        let catalog = catalog_of(&words);
+        let mut ctx = RecompContext::new();
+        ctx.set_r(31, 0x8000_9000);
+        // Simulate the block-entry boundary sync: the live executor's
+        // authoritative Count at the moment this block was dispatched.
+        const ENTRY_COUNT: u32 = 1_000;
+        ctx.synchronize_cop0_timing(ENTRY_COUNT, 0);
+
+        let result = run(&catalog, VA, words.len() as u32, &mut ctx).unwrap();
+        assert_eq!(result.instructions, words.len() as u32);
+
+        // Interior reads: base + retired_before/2, matching the executor's
+        // half-CPU-rate (integer-divided) advance.
+        assert_eq!(
+            ctx.r_u32(8),
+            ENTRY_COUNT,
+            "first mfc0 (retired_before=0) sees the pristine entry Count"
+        );
+        assert_eq!(
+            ctx.r_u32(9),
+            ENTRY_COUNT + 5 / 2,
+            "second mfc0 (retired_before=5) sees +2, not the stale entry value"
+        );
+        assert_eq!(
+            ctx.r_u32(10),
+            ENTRY_COUNT + 10 / 2,
+            "third mfc0 (retired_before=10) sees +5"
+        );
+
+        // The boundary-authority contract: `ctx.cop0_count` itself (the field
+        // the NEXT block-entry sync would overwrite from the executor, and
+        // that this test uses to emulate the executor's own post-block
+        // advance) was NEVER mutated by any interior read above.
+        assert_eq!(
+            ctx.cop0_count, ENTRY_COUNT,
+            "interior MFC0 reads must not write ctx.cop0_count \u{2014} \
+             only the boundary sync may, or the executor's authoritative \
+             advance would double-count these same retired instructions"
+        );
+
+        // Emulate exactly what the live executor does after this block: it
+        // independently computes `retired_total / 2` from the SAME
+        // `result.instructions` this block returned, and that is the whole
+        // and only advance applied at the boundary. Applying it once here
+        // must land on entry + total/2 — not entry + (sum of the three
+        // interior deltas), which would be the double-count this design
+        // avoids.
+        let boundary_advanced = ENTRY_COUNT + result.instructions / 2;
+        assert_eq!(
+            boundary_advanced,
+            ENTRY_COUNT + 13 / 2,
+            "sanity: 13 total retired instructions advance Count by 6"
+        );
+        let sum_of_interior_deltas: u32 = 5 / 2 + 10 / 2; // deliberately re-summing the
+                                                          // three per-read deltas (the
+                                                          // first is +0) to prove the
+                                                          // boundary does NOT do this
+        assert_ne!(
+            boundary_advanced,
+            ENTRY_COUNT + sum_of_interior_deltas,
+            "the boundary must not re-sum the three interior deltas on top \
+             of its own advance"
+        );
+    }
+
+    /// ERET (COP0 function 0x18): `eret`.
+    const ERET: u32 = 0x4200_0018;
+
+    #[test]
+    fn eret_under_erl_prefers_error_epc_clears_erl_and_clears_llbit() {
+        const STATUS_EXL: u32 = 1 << 1;
+        const STATUS_ERL: u32 = 1 << 2;
+
+        let catalog = catalog_of(&[ERET]);
+        let mut ctx = RecompContext::new();
+        ctx.cop0_status = STATUS_EXL | STATUS_ERL;
+        ctx.cop0_epc = 0x8000_1000;
+        ctx.cop0_error_epc = 0xBFC0_0200;
+        ctx.set_ll_reservation(0x8000_0040, 4);
+
+        let result = run(&catalog, VA, 8, &mut ctx).unwrap();
+
+        assert_eq!(
+            result.exit,
+            BlockExit::ResolveTransfer {
+                source_bank: BANK,
+                target_pc: GuestPc::new(0xBFC0_0200),
+            },
+            "ErrorEPC/ERL takes precedence over EPC/EXL, exactly as emit_bank_eret"
+        );
+        assert_eq!(result.instructions, 1, "eret has no delay slot");
+        assert_eq!(ctx.cop0_status & STATUS_ERL, 0, "ERL must clear");
+        assert_ne!(
+            ctx.cop0_status & STATUS_EXL,
+            0,
+            "EXL is untouched under ERL precedence"
+        );
+        assert!(
+            !ctx.take_ll_reservation(0x8000_0040, 4),
+            "eret must clear LLbit"
+        );
+    }
+
+    #[test]
+    fn eret_without_erl_falls_back_to_epc_and_clears_exl() {
+        const STATUS_EXL: u32 = 1 << 1;
+        const STATUS_ERL: u32 = 1 << 2;
+
+        let catalog = catalog_of(&[ERET]);
+        let mut ctx = RecompContext::new();
+        ctx.cop0_status = STATUS_EXL;
+        ctx.cop0_epc = 0x8000_2004;
+        ctx.cop0_error_epc = 0xBFC0_0200;
+        ctx.set_ll_reservation(0x8000_0040, 4);
+
+        let result = run(&catalog, VA, 8, &mut ctx).unwrap();
+
+        assert_eq!(
+            result.exit,
+            BlockExit::ResolveTransfer {
+                source_bank: BANK,
+                target_pc: GuestPc::new(0x8000_2004),
+            },
+            "without ERL, eret returns to EPC"
+        );
+        assert_eq!(result.instructions, 1);
+        assert_eq!(ctx.cop0_status & STATUS_EXL, 0, "EXL must clear");
+        assert_eq!(ctx.cop0_status & STATUS_ERL, 0, "ERL was already clear");
+        assert!(
+            !ctx.take_ll_reservation(0x8000_0040, 4),
+            "eret must clear LLbit"
+        );
+    }
+
+    #[test]
+    fn eret_matches_the_block_lanes_resolve_transfer_shape_even_for_an_in_bank_target() {
+        // The AOT lane (`emit_bank_eret`) always emits an unconditional
+        // `BlockExit::ResolveTransfer`, never a proven in-bank `Transfer`,
+        // because the target is a runtime CP0 value. Pick an EPC that
+        // happens to land inside this very bank and confirm the interpreter
+        // still resolves rather than proving.
+        let catalog = catalog_of(&[ERET, 0x0000_0000]);
+        let mut ctx = RecompContext::new();
+        ctx.cop0_status = 0;
+        ctx.cop0_epc = VA; // in-bank, but must still be ResolveTransfer
+
+        let result = run(&catalog, VA, 8, &mut ctx).unwrap();
+        assert_eq!(
+            result.exit,
+            BlockExit::ResolveTransfer {
+                source_bank: BANK,
+                target_pc: GuestPc::new(VA),
+            }
+        );
+        assert_eq!(result.instructions, 1);
     }
 
     #[test]
