@@ -183,6 +183,7 @@ pub mod rom;
 pub mod sig_scan;
 pub mod snapshot;
 pub mod spimdisasm_adapter;
+pub mod timing_trace;
 pub mod tool_adapter;
 pub mod tool_claims;
 pub mod trace;
