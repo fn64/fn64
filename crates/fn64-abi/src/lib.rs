@@ -1833,6 +1833,10 @@ impl RecompContext {
         unsafe { std::mem::zeroed() }
     }
 
+    // Used only by the recompiled-C adapter path (`call_c` and its
+    // round-trip tests), which compiles under `recomp-rs`; gated to match so a
+    // featureless build does not flag it as dead.
+    #[cfg(feature = "recomp-rs")]
     pub(crate) fn fpr_u64_bits(&self) -> [u64; 32] {
         // Safety: each union contains a valid raw 64-bit pattern regardless
         // of which typed member the generated shim last wrote.
@@ -1874,6 +1878,7 @@ impl RecompContext {
         }
     }
 
+    #[cfg(feature = "recomp-rs")]
     pub(crate) fn set_fpr_u64_bits(&mut self, bits: [u64; 32]) {
         self.f0 = Fpr { u64_bits: bits[0] };
         self.f1 = Fpr { u64_bits: bits[1] };
