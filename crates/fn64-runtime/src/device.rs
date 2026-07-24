@@ -56,6 +56,10 @@ const DPC_START_REG: MmioAddr = MmioAddr::new(0xA410_0000);
 const DPC_END_REG: MmioAddr = MmioAddr::new(0xA410_0004);
 const DPC_CURRENT_REG: MmioAddr = MmioAddr::new(0xA410_0008);
 const DPC_STATUS_REG: MmioAddr = MmioAddr::new(0xA410_000C);
+const DPC_CLOCK_REG: MmioAddr = MmioAddr::new(0xA410_0010);
+const DPC_BUFBUSY_REG: MmioAddr = MmioAddr::new(0xA410_0014);
+const DPC_PIPEBUSY_REG: MmioAddr = MmioAddr::new(0xA410_0018);
+const DPC_TMEM_REG: MmioAddr = MmioAddr::new(0xA410_001C);
 const VI_STATUS_REG: MmioAddr = MmioAddr::new(0xA440_0000);
 const VI_ORIGIN_REG: MmioAddr = MmioAddr::new(0xA440_0004);
 const VI_INTR_REG: MmioAddr = MmioAddr::new(0xA440_000C);
@@ -239,6 +243,32 @@ pub struct DpcSubmission {
     pub source: DpcSubmissionSource,
     pub start: u32,
     pub end: u32,
+}
+
+/// Pointer-free architectural registers produced by one synchronous RSP run.
+///
+/// DPC command transactions are deliberately absent: renderer ownership is
+/// committed separately through DeviceFabric::request_dpc_submission and
+/// DeviceFabric::commit_dpc_submission. The public RSP Programmer's Guide,
+/// chapter 4, defines the SP DMA/status/semaphore registers; the public
+/// rcp.h register map defines the eight DPC registers carried here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RspExecutionState {
+    pub pc: u32,
+    pub sp_status: u32,
+    pub sp_semaphore: bool,
+    pub sp_dma_mem_addr: RspMemAddr,
+    pub sp_dma_dram_addr: RdramAddr,
+    pub sp_dma_read_length: u32,
+    pub sp_dma_write_length: u32,
+    pub dpc_start: u32,
+    pub dpc_end: u32,
+    pub dpc_current: u32,
+    pub dpc_status: u32,
+    pub dpc_clock: u32,
+    pub dpc_busy: u32,
+    pub dpc_pipe_busy: u32,
+    pub dpc_tmem_busy: u32,
 }
 
 /// Host work made necessary by a successfully latched MMIO write.
@@ -487,6 +517,9 @@ pub enum DeviceFault {
     InvalidSpSemaphoreWrite {
         value: u32,
     },
+    InvalidRspExecutionPc {
+        pc: u32,
+    },
     SpTaskNotHalted,
     InvalidSpTaskBootSize {
         size: u32,
@@ -572,6 +605,10 @@ impl fmt::Display for DeviceFault {
                 f,
                 "SP semaphore release requires a zero write, got {value:#010X}"
             ),
+            Self::InvalidRspExecutionPc { pc } => write!(
+                f,
+                "synchronous RSP execution PC must be an aligned canonical low-12 address, got {pc:#010X}"
+            ),
             Self::SpTaskNotHalted => write!(f, "SP task load while the RSP is not halted"),
             Self::InvalidSpTaskBootSize { size } => write!(
                 f,
@@ -630,6 +667,10 @@ struct DpcRegisters {
     end: u32,
     current: u32,
     status: u32,
+    clock: u32,
+    busy: u32,
+    pipe_busy: u32,
+    tmem_busy: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -745,6 +786,10 @@ pub struct DeviceSnapshot {
     pub dpc_end: u32,
     pub dpc_current: u32,
     pub dpc_status: u32,
+    pub dpc_clock: u32,
+    pub dpc_busy: u32,
+    pub dpc_pipe_busy: u32,
+    pub dpc_tmem_busy: u32,
     pub pending_dpc: Option<DpcSubmission>,
     pub mi_pending: u32,
     pub mi_mask: u32,
@@ -865,6 +910,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 end: 0,
                 current: 0,
                 status: 0,
+                clock: 0,
+                busy: 0,
+                pipe_busy: 0,
+                tmem_busy: 0,
             },
             pending_dpc: None,
             si_dram_addr: RdramAddr::from_offset(0),
@@ -957,6 +1006,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             dpc_end: self.dpc.end,
             dpc_current: self.dpc.current,
             dpc_status: self.dpc.status,
+            dpc_clock: self.dpc.clock,
+            dpc_busy: self.dpc.busy,
+            dpc_pipe_busy: self.dpc.pipe_busy,
+            dpc_tmem_busy: self.dpc.tmem_busy,
             pending_dpc: self.pending_dpc.map(|pending| pending.submission),
             mi_pending: self.mi_pending,
             mi_mask: self.mi_mask,
@@ -1787,6 +1840,83 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         self.sp_pc
     }
 
+    /// Snapshot every SP/DPC register owned by synchronous RSP execution.
+    ///
+    /// DMA BUSY/FULL in the SP status are guest-visible values derived from
+    /// the fabric's active and queued DMA slots. No DPC transaction token or
+    /// renderer payload crosses this architectural-state boundary.
+    pub const fn rsp_execution_state(&self) -> RspExecutionState {
+        RspExecutionState {
+            pc: self.sp_pc,
+            sp_status: self.sp_status(),
+            sp_semaphore: self.sp_semaphore,
+            sp_dma_mem_addr: self.sp_mem_addr,
+            sp_dma_dram_addr: self.sp_dram_addr,
+            sp_dma_read_length: self.sp_rd_len,
+            sp_dma_write_length: self.sp_wr_len,
+            dpc_start: self.dpc.start,
+            dpc_end: self.dpc.end,
+            dpc_current: self.dpc.current,
+            dpc_status: self.dpc.status,
+            dpc_clock: self.dpc.clock,
+            dpc_busy: self.dpc.busy,
+            dpc_pipe_busy: self.dpc.pipe_busy,
+            dpc_tmem_busy: self.dpc.tmem_busy,
+        }
+    }
+
+    /// Validate a complete synchronous RSP register image without mutation.
+    ///
+    /// A higher-layer transactional adapter may need to perform a fallible
+    /// renderer operation before publishing this state. It must retain
+    /// exclusive ownership of the fabric from this preflight through
+    /// [`Self::commit_complete_rsp_execution_state`]; otherwise a new DPC
+    /// owner could invalidate the successful preflight.
+    pub fn preflight_complete_rsp_execution_state(
+        &self,
+        state: &RspExecutionState,
+    ) -> Result<(), DeviceFault> {
+        if state.pc & !0x0ffc != 0 {
+            return Err(DeviceFault::InvalidRspExecutionPc { pc: state.pc });
+        }
+        if self.pending_dpc.is_some() {
+            return Err(DeviceFault::DpBusy);
+        }
+        Ok(())
+    }
+
+    /// Atomically commit registers produced by speculative RSP execution.
+    ///
+    /// A pending DPC renderer transaction owns its rollback register image, so
+    /// replacing DPC registers while one is live is rejected. Address latches
+    /// apply the same hardware masks as raw MMIO. SP DMA BUSY/FULL remain
+    /// derived from the fabric queues rather than copied from an interpreter.
+    pub fn commit_complete_rsp_execution_state(
+        &mut self,
+        state: RspExecutionState,
+    ) -> Result<(), DeviceFault> {
+        self.preflight_complete_rsp_execution_state(&state)?;
+
+        self.sp_pc = state.pc;
+        self.sp_status = state.sp_status & !(SP_STATUS_DMA_BUSY | SP_STATUS_DMA_FULL);
+        self.sp_semaphore = state.sp_semaphore;
+        self.sp_mem_addr = state.sp_dma_mem_addr;
+        self.sp_dram_addr = RdramAddr::from_offset(state.sp_dma_dram_addr.offset() & 0x00ff_ffff);
+        self.sp_rd_len = state.sp_dma_read_length;
+        self.sp_wr_len = state.sp_dma_write_length;
+        self.dpc = DpcRegisters {
+            start: state.dpc_start & DPC_ADDR_MASK,
+            end: state.dpc_end & DPC_ADDR_MASK,
+            current: state.dpc_current & DPC_ADDR_MASK,
+            status: state.dpc_status,
+            clock: state.dpc_clock,
+            busy: state.dpc_busy,
+            pipe_busy: state.dpc_pipe_busy,
+            tmem_busy: state.dpc_tmem_busy,
+        };
+        Ok(())
+    }
+
     /// Commit architectural state produced by a synchronous RSP execution.
     /// DMA BUSY/FULL are derived from the fabric's queues and cannot be
     /// overwritten by an interpreter snapshot.
@@ -2024,6 +2154,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             DPC_END_REG => Ok(self.dpc.end),
             DPC_CURRENT_REG => Ok(self.dpc.current),
             DPC_STATUS_REG => Ok(self.dpc.status),
+            DPC_CLOCK_REG => Ok(self.dpc.clock),
+            DPC_BUFBUSY_REG => Ok(self.dpc.busy),
+            DPC_PIPEBUSY_REG => Ok(self.dpc.pipe_busy),
+            DPC_TMEM_REG => Ok(self.dpc.tmem_busy),
             MI_INTR_REG => Ok(self.mi_pending),
             MI_INTR_MASK_REG => Ok(self.mi_mask),
             VI_CURRENT_REG => Ok(self.vi_current()),
@@ -2664,6 +2798,156 @@ mod tests {
             PiDma::new(InMemoryRom::new(rom)),
             TestTiming(Cycles::new(12)),
         )
+    }
+
+    fn complete_rsp_state() -> RspExecutionState {
+        RspExecutionState {
+            pc: 0x0abc,
+            sp_status: SP_STATUS_HALT
+                | SP_STATUS_BROKE
+                | SP_STATUS_DMA_BUSY
+                | SP_STATUS_DMA_FULL
+                | SP_STATUS_SIGNAL_0,
+            sp_semaphore: true,
+            sp_dma_mem_addr: RspMemAddr::from_register(0x1a5b),
+            sp_dma_dram_addr: RdramAddr::from_offset(0x00ab_cdef),
+            sp_dma_read_length: 0x1234_5678,
+            sp_dma_write_length: 0x9abc_def0,
+            dpc_start: 0x0012_3400,
+            dpc_end: 0x0012_3480,
+            dpc_current: 0x0012_3440,
+            dpc_status: DPC_STATUS_FREEZE | DPC_STATUS_CMD_BUSY,
+            dpc_clock: 0x1020_3040,
+            dpc_busy: 0x5060_7080,
+            dpc_pipe_busy: 0x90a0_b0c0,
+            dpc_tmem_busy: 0xd0e0_f000,
+        }
+    }
+
+    #[test]
+    fn complete_rsp_execution_state_commits_every_register_atomically() {
+        let mut fabric = fabric();
+        let state = complete_rsp_state();
+
+        fabric.commit_complete_rsp_execution_state(state).unwrap();
+
+        let expected = RspExecutionState {
+            sp_status: state.sp_status & !(SP_STATUS_DMA_BUSY | SP_STATUS_DMA_FULL),
+            ..state
+        };
+        assert_eq!(fabric.rsp_execution_state(), expected);
+        let guest = fabric.snapshot();
+        assert_eq!(guest.sp_status, expected.sp_status);
+        assert_eq!(guest.sp_mem_addr, expected.sp_dma_mem_addr);
+        assert_eq!(guest.sp_dram_addr, expected.sp_dma_dram_addr);
+        assert_eq!(guest.dpc_start, expected.dpc_start);
+        assert_eq!(guest.dpc_end, expected.dpc_end);
+        assert_eq!(guest.dpc_current, expected.dpc_current);
+        assert_eq!(guest.dpc_status, expected.dpc_status);
+        assert_eq!(guest.dpc_clock, expected.dpc_clock);
+        assert_eq!(guest.dpc_busy, expected.dpc_busy);
+        assert_eq!(guest.dpc_pipe_busy, expected.dpc_pipe_busy);
+        assert_eq!(guest.dpc_tmem_busy, expected.dpc_tmem_busy);
+        let evidence = fabric.evidence_snapshot();
+        assert_eq!(evidence.sp_rd_len, expected.sp_dma_read_length);
+        assert_eq!(evidence.sp_wr_len, expected.sp_dma_write_length);
+        assert_eq!(evidence.sp_pc, expected.pc);
+        assert_eq!(evidence.sp_semaphore, expected.sp_semaphore);
+        assert_eq!(evidence.guest, guest);
+        assert_eq!(fabric.read_mmio(DPC_CLOCK_REG).unwrap(), expected.dpc_clock);
+        assert_eq!(
+            fabric.read_mmio(DPC_BUFBUSY_REG).unwrap(),
+            expected.dpc_busy
+        );
+        assert_eq!(
+            fabric.read_mmio(DPC_PIPEBUSY_REG).unwrap(),
+            expected.dpc_pipe_busy
+        );
+        assert_eq!(
+            fabric.read_mmio(DPC_TMEM_REG).unwrap(),
+            expected.dpc_tmem_busy
+        );
+    }
+
+    #[test]
+    fn invalid_complete_rsp_pc_rejects_without_partial_mutation() {
+        for pc in [2, 0x1000, 0xffff_ffff] {
+            let mut fabric = fabric();
+            let before = fabric.rsp_execution_state();
+            let before_snapshot = fabric.snapshot();
+            let mut state = complete_rsp_state();
+            state.pc = pc;
+
+            assert_eq!(
+                fabric.commit_complete_rsp_execution_state(state),
+                Err(DeviceFault::InvalidRspExecutionPc { pc })
+            );
+            assert_eq!(fabric.rsp_execution_state(), before);
+            assert_eq!(fabric.snapshot(), before_snapshot);
+        }
+    }
+
+    #[test]
+    fn complete_rsp_state_preflight_is_non_mutating() {
+        let mut fabric = fabric();
+        let before = fabric.snapshot();
+        let before_execution = fabric.rsp_execution_state();
+
+        fabric
+            .preflight_complete_rsp_execution_state(&complete_rsp_state())
+            .unwrap();
+
+        assert_eq!(fabric.snapshot(), before);
+        assert_eq!(fabric.rsp_execution_state(), before_execution);
+
+        let pending = fabric
+            .request_dpc_submission(DpcSubmissionSource::Rdram, 0x100, 0x180)
+            .unwrap();
+        let pending_snapshot = fabric.snapshot();
+        let pending_execution = fabric.rsp_execution_state();
+        assert_eq!(
+            fabric.preflight_complete_rsp_execution_state(&complete_rsp_state()),
+            Err(DeviceFault::DpBusy)
+        );
+        assert_eq!(fabric.snapshot(), pending_snapshot);
+        assert_eq!(fabric.rsp_execution_state(), pending_execution);
+        assert_eq!(fabric.pending_dpc_submission(), Some(pending));
+    }
+
+    #[test]
+    fn complete_rsp_state_cannot_replace_a_pending_dpc_transaction() {
+        let mut fabric = fabric();
+        let pending = fabric
+            .request_dpc_submission(DpcSubmissionSource::Rdram, 0x100, 0x180)
+            .unwrap();
+        let before = fabric.rsp_execution_state();
+        let before_snapshot = fabric.snapshot();
+
+        assert_eq!(
+            fabric.commit_complete_rsp_execution_state(complete_rsp_state()),
+            Err(DeviceFault::DpBusy)
+        );
+        assert_eq!(fabric.rsp_execution_state(), before);
+        assert_eq!(fabric.snapshot(), before_snapshot);
+        assert_eq!(fabric.pending_dpc_submission(), Some(pending));
+    }
+
+    #[test]
+    fn complete_rsp_execution_state_applies_raw_register_address_masks() {
+        let mut fabric = fabric();
+        let mut state = complete_rsp_state();
+        state.sp_dma_dram_addr = RdramAddr::from_offset(u32::MAX);
+        state.dpc_start = u32::MAX;
+        state.dpc_end = u32::MAX;
+        state.dpc_current = u32::MAX;
+
+        fabric.commit_complete_rsp_execution_state(state).unwrap();
+
+        let committed = fabric.rsp_execution_state();
+        assert_eq!(committed.sp_dma_dram_addr.offset(), 0x00ff_ffff);
+        assert_eq!(committed.dpc_start, DPC_ADDR_MASK);
+        assert_eq!(committed.dpc_end, DPC_ADDR_MASK);
+        assert_eq!(committed.dpc_current, DPC_ADDR_MASK);
     }
 
     #[test]

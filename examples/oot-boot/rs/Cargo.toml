@@ -10,8 +10,6 @@ description = "Rust-recompiled whole-ROM configuration of the shared OoT boot ha
 [workspace]
 
 [features]
-default = ["oot-audio"]
-oot-audio = ["dep:oot-audio-ucode"]
 rt64 = ["fn64-render-rt64/rt64"]
 
 [[bin]]
@@ -46,4 +44,3 @@ fn64-render = { path = "../../../crates/fn64-render" }
 fn64-render-reference = { path = "../../../crates/fn64-render-reference" }
 fn64-render-rt64 = { path = "../../../crates/fn64-render-rt64" }
 fn64-audio = { path = "../../../crates/fn64-audio" }
-oot-audio-ucode = { path = "../audio-ucode", optional = true }

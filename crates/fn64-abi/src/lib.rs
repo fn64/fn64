@@ -644,6 +644,7 @@ pub struct RspTaskDataIdentityEvidenceSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadedRspTaskEvidenceSnapshot {
     pub task_offset: u32,
+    pub admission_generation: u64,
     pub header: OsTaskHeader,
     pub resumed_data_identity: Option<RspTaskDataIdentityEvidenceSnapshot>,
 }
@@ -660,6 +661,7 @@ pub enum RspTaskLineagePhaseEvidenceSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RspTaskLineageEvidenceSnapshot {
     pub task_offset: u32,
+    pub admission_generation: u64,
     pub original_header: OsTaskHeader,
     pub data_identity: Option<RspTaskDataIdentityEvidenceSnapshot>,
     pub phase: RspTaskLineagePhaseEvidenceSnapshot,
@@ -805,6 +807,9 @@ pub struct AbiHostEvidenceSnapshot {
     pub rsp_boot_images: Vec<RspBootImageEvidenceSnapshot>,
     pub loaded_rsp_task: Option<LoadedRspTaskEvidenceSnapshot>,
     pub rsp_task_lineages: Vec<RspTaskLineageEvidenceSnapshot>,
+    pub next_rsp_task_admission_generation: u64,
+    pub rsp_interpreter_state: task_dispatch::RspInterpreterStateEvidenceSnapshot,
+    pub audio_task_execution: task_dispatch::AudioTaskExecutionPolicy,
     pub rom_installed: bool,
     pub installed_rom: Option<InstalledRomEvidenceSnapshot>,
     pub cartridge_save: CartridgeSaveEvidenceSnapshot,
@@ -885,10 +890,24 @@ struct HostState {
     /// only StartGo path consumes this token; it never rereads mutable guest
     /// task fields after Load returns.
     loaded_rsp_task: Option<task_dispatch::LoadedRspTask>,
+    /// Process-monotonic identity minted after each successful `osSpTaskLoad`
+    /// device admission. Address reuse cannot alias a prior commit authority.
+    next_rsp_task_admission_generation: task_dispatch::RspTaskAdmissionGeneration,
     /// Original task/data identities retained independently of append-only
     /// observation history so a yielded reload cannot inherit evidence from
     /// an unrelated task that reused the same guest address.
     rsp_task_lineages: std::collections::HashMap<u32, task_dispatch::RspTaskLineage>,
+    /// Non-memory RSP interpreter state survives task boundaries on the
+    /// physical core. Keeping it above the device fabric avoids making the
+    /// runtime depend on the audio interpreter while still binding every
+    /// future-visible scalar/VU latch into ABI evidence.
+    rsp_interpreter_state: task_dispatch::RspInterpreterStateEvidenceSnapshot,
+    /// Installed-ROM audio microcode executor selected atomically with any
+    /// translated callback identity. It is reset only when a new ROM is
+    /// installed and is immutable for that ROM session.
+    audio_task_execution: task_dispatch::AudioTaskExecutionPolicy,
+    audio_task_execution_admitted: bool,
+    audio_task_execution_started: bool,
     /// Guest-visible `OSPiHandle*` returned by `osCartRomInit`. The handle
     /// storage is game-owned BSS, so the boot host supplies its link address;
     /// leaving it unset is a loud trap rather than returning a stale `$v0`.
@@ -1001,7 +1020,12 @@ impl Default for HostState {
             runtime_rdram_len: 0,
             rsp_boot_images: std::collections::HashMap::new(),
             loaded_rsp_task: None,
+            next_rsp_task_admission_generation: task_dispatch::RspTaskAdmissionGeneration::first(),
             rsp_task_lineages: std::collections::HashMap::new(),
+            rsp_interpreter_state: task_dispatch::RspInterpreterStateEvidenceSnapshot::Reset,
+            audio_task_execution: task_dispatch::AudioTaskExecutionPolicy::Unconfigured,
+            audio_task_execution_admitted: false,
+            audio_task_execution_started: false,
             cart_rom_handle_vram: None,
             flash_handle_vram: None,
             leo_disk: None,
@@ -1208,7 +1232,14 @@ fn classify_host_evidence_fields(host: &HostState) {
         runtime_rdram_len: _,
         rsp_boot_images: _,
         loaded_rsp_task: _,
+        next_rsp_task_admission_generation: _,
         rsp_task_lineages: _,
+        rsp_interpreter_state: _,
+        audio_task_execution: _,
+        // Configuration guard only; with an immutable installed policy it
+        // cannot change a later guest result independently of that policy.
+        audio_task_execution_admitted: _,
+        audio_task_execution_started: _,
         cart_rom_handle_vram: _,
         flash_handle_vram: _,
         leo_disk: _,
@@ -1343,6 +1374,9 @@ pub fn host_evidence_snapshot() -> AbiHostEvidenceSnapshot {
             rsp_boot_images,
             loaded_rsp_task,
             rsp_task_lineages,
+            next_rsp_task_admission_generation: host.next_rsp_task_admission_generation.get(),
+            rsp_interpreter_state: host.rsp_interpreter_state.clone(),
+            audio_task_execution: host.audio_task_execution,
             rom_installed: host.rom_installed,
             installed_rom: host.installed_rom,
             cartridge_save: host.cartridge_save,

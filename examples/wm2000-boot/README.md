@@ -740,10 +740,6 @@ pointer, and a pervasive native-vs-big-endian `MEM_W` mistranscription)
 were found and fixed along the way, each with a regression test in
 `fn64-abi`/`fn64-runtime`.
 
-The real translated `wm2000_audio_ucode` (RSPRecomp-generated) could not be
-linked in this harness: RSPRecomp's own codegen template unconditionally
-`#include`s `librecomp/rsp.hpp`, which is GPL-3.0-licensed
-(`N64ModernRuntime`'s top-level `COPYING`), disallowed by `AGENTS.md`'s
-clean-room protocol. `stand_in_audio_ucode` in `src/main.rs` exercises the
-real `M_AUDTASK` dispatch plumbing without linking the disallowed
-dependency — it does nothing to rdram, and says so loudly when invoked.
+That historical run used a non-executing audio stand-in. The harness now
+selects `LleAccuracy`, so admitted live audio-task IMEM executes through
+fn64's clean-room RSP interpreter without linking external runtime code.
