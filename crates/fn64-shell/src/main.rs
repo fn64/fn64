@@ -113,6 +113,61 @@ mod game {
             .into()
     }
 
+    /// Per-ROM save file path: `<data_dir>/fn64/saves/<rom-file-stem>.sav`.
+    /// `dirs::data_dir()` is the same platform-data-dir crate `InputConfig`
+    /// already uses for its config file (see input_map.rs); saves use
+    /// `data_dir` rather than `config_dir` because a save is user data, not
+    /// configuration. Falls back to `.fn64/saves` under the current
+    /// directory if the platform has no data dir (e.g. an unusual/headless
+    /// host) -- this function itself never fails, it only picks where
+    /// `save_storage_for_rom` will try to open the file; that call site is
+    /// what actually falls further back (to an in-memory store) if even
+    /// that path can't be opened.
+    fn save_path_for_rom(rom_path: &std::path::Path) -> std::path::PathBuf {
+        let stem = rom_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "rom".to_string());
+        let saves_dir = dirs::data_dir()
+            .map(|dir| dir.join("fn64").join("saves"))
+            .unwrap_or_else(|| std::path::PathBuf::from(".fn64").join("saves"));
+        saves_dir.join(format!("{stem}.sav"))
+    }
+
+    /// Open the real, file-backed save store for `rom_path`, falling back to
+    /// the ephemeral in-memory store (same one oot-boot always uses -- see
+    /// its main.rs comment) on any I/O error, so a read-only filesystem or
+    /// permission issue degrades gracefully instead of aborting boot.
+    fn save_storage_for_rom(rom_path: &std::path::Path) -> Box<dyn fn64_runtime::SaveStorage> {
+        let save_path = save_path_for_rom(rom_path);
+        let open_result = save_path
+            .parent()
+            .map(std::fs::create_dir_all)
+            .unwrap_or(Ok(()))
+            .and_then(|()| {
+                fn64_runtime::FileSaveStorage::open_for_device(
+                    &save_path,
+                    fn64_runtime::SaveType::SramBanked,
+                )
+            });
+        match open_result {
+            Ok(storage) => {
+                println!("[fn64-shell] save file: {}", save_path.display());
+                Box::new(storage)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[fn64-shell] WARNING: could not open save file {} ({e}) -- falling back to \
+                     an IN-MEMORY save store (progress will NOT persist across exit)",
+                    save_path.display()
+                );
+                Box::new(fn64_runtime::InMemorySaveStorage::for_device(
+                    fn64_runtime::SaveType::SramBanked,
+                ))
+            }
+        }
+    }
+
     /// Boot the game and hold everything the window loop touches every frame.
     struct Shell {
         rdram: Vec<u8>,
@@ -187,11 +242,15 @@ mod game {
                 .unwrap_or(0x8000_9EA0);
             fn64_abi::set_cart_rom_handle_vram(cart_handle_vram);
 
-            // Save-backing store (banked SRAM), same as oot-boot -- domain-2
-            // PI DMAs need somewhere to land.
-            fn64_abi::set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
-                fn64_runtime::SaveType::SramBanked,
-            )));
+            // Save-backing store (banked SRAM), same device as oot-boot --
+            // domain-2 PI DMAs need somewhere to land. Unlike oot-boot (which
+            // deliberately stays in-memory -- that harness is a bring-up
+            // tool, not a play session), the interactive shell is where a
+            // player actually leaves the game running and quits, so this
+            // wires the real `FileSaveStorage`, falling back to the same
+            // in-memory store oot-boot uses if the save file can't be opened
+            // (e.g. a read-only filesystem) rather than aborting boot.
+            fn64_abi::set_save(save_storage_for_rom(&rom_path));
 
             #[cfg(not(fn64_recomp_rs))]
             {
