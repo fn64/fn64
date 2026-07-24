@@ -33,6 +33,10 @@ use fn64_discover::closure::{
 use fn64_discover::delta_vote::DeltaVoteConfig;
 use fn64_discover::facts::{FunctionEntryEvidence, ProofState};
 use fn64_discover::overlay_regions::SearchConfig;
+use fn64_discover::block_pack::{
+    emit_block_pack_v1, emit_block_program_source, materialize_block_pack, BlockPackV1,
+    BlockProgramSourceConfig,
+};
 use fn64_discover::snapshot::{compose_materialized_banks_v1, MaterializedBankInput};
 use fn64_discover::{
     aki_reference, oot_reference, run_discovery, run_discovery_with_load_image_tables,
@@ -48,6 +52,7 @@ const NWXE_ROM_VAR: &str = "FN64_DISCOVER_NWXE_ROM";
 const NWXE_DUMP_VAR: &str = "FN64_DISCOVER_NWXE_DUMP";
 const OOT_ROM_VAR: &str = "FN64_DISCOVER_OOT_ROM";
 const OOT_DUMP_VAR: &str = "FN64_DISCOVER_OOT_DUMP";
+const EMIT_BLOCK_PROGRAM_VAR: &str = "FN64_EMIT_BLOCK_PROGRAM";
 
 /// Which discovery composition a ROM uses. All three reuse the crate's own
 /// `run_discovery*` entry points; none reimplements discovery.
@@ -185,6 +190,13 @@ fn score_rom(spec: &RomSpec, path: &str) -> Result<(), String> {
     let snapshots = compose_materialized_banks_v1(&rom, &facts, &inputs)
         .map_err(|error| format!("composing banks: {error}"))?;
 
+    // Opt-in: emit the composed program as a compilable BlockProgram source
+    // module. This is measurement, not part of the scoreboard, so it never
+    // changes the classification below.
+    if let Some(out) = std::env::var_os(EMIT_BLOCK_PROGRAM_VAR) {
+        emit_block_program(spec.label, &rom, &snapshots, &out.to_string_lossy())?;
+    }
+
     let board = scoreboard(&snapshots);
 
     // Held-out grading boundary: every discovery, composition, proof, and
@@ -232,9 +244,93 @@ fn discover(rom_bytes: &[u8], discovery: Discovery) -> Result<(NormalizedRom, Fa
     }
 }
 
-/// Every proven physically-backed ROM mapping, in deterministic bank order.
-/// Snapshot V1 can only byte-verify and compose physical backing; virtual /
-/// compressed overlays (OoT's) are honestly excluded from this measurement.
+/// Emit the composed snapshots as one compilable `BlockProgram` source module
+/// and report its size. The entry is the lowest-VA block of the first composed
+/// bank, which is the boot bank in bank order.
+fn emit_block_program(
+    label: &str,
+    rom: &NormalizedRom,
+    snapshots: &[fn64_discover::snapshot::ProgramSnapshotV1],
+    out_path: &str,
+) -> Result<(), String> {
+    let mut pack = BlockPackV1 {
+        schema_version: fn64_discover::block_pack::BLOCK_PACK_SCHEMA_V1,
+        normalized_rom_sha256: rom.sha256.clone(),
+        banks: Vec::with_capacity(snapshots.len()),
+    };
+    // A composed bank with no proven blocks is an overlay that static closure
+    // never reached. It carries no executable code to emit, so it is counted
+    // and skipped rather than failing the whole program.
+    let mut empty_banks = 0usize;
+    for snapshot in snapshots {
+        match emit_block_pack_v1(snapshot, rom) {
+            Ok(emitted) => pack.banks.extend(emitted.banks),
+            Err(fn64_discover::block_pack::BlockPackError::NoProvenBlocks { .. }) => {
+                empty_banks += 1;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "emitting block pack for {}: {error:?}",
+                    snapshot.banks[0].input.bank
+                ));
+            }
+        }
+    }
+    pack.banks.sort_by(|left, right| left.bank.cmp(&right.bank));
+
+    let materialized = materialize_block_pack(&pack, rom)
+        .map_err(|error| format!("materializing whole-ROM BlockPack: {error:?}"))?;
+    let blocks: usize = materialized.iter().map(|bank| bank.blocks.len()).sum();
+
+    // Entry: the first block of the boot bank (lowest VA across the pack).
+    let entry_bank = pack
+        .banks
+        .iter()
+        .min_by_key(|bank| {
+            bank.blocks
+                .iter()
+                .map(|block| block.start_va)
+                .min()
+                .unwrap_or(u32::MAX)
+        })
+        .ok_or_else(|| "empty block pack".to_string())?;
+    let entry_pc = entry_bank
+        .blocks
+        .iter()
+        .map(|block| block.start_va)
+        .min()
+        .ok_or_else(|| "boot bank has no blocks".to_string())?;
+
+    let source = emit_block_program_source(
+        &pack,
+        rom,
+        BlockProgramSourceConfig {
+            entry: fn64_recomp_rs::ExecutionKey::new(
+                fn64_recomp_rs::BankId::new(entry_bank.bank_id),
+                fn64_recomp_rs::GuestPc::new(entry_pc),
+            ),
+            instruction_budget: fn64_recomp_rs::InstructionBudget::new(1024)
+                .ok_or_else(|| "invalid instruction budget".to_string())?,
+        },
+    )
+    .map_err(|error| format!("emitting block program source: {error:?}"))?;
+
+    std::fs::write(out_path, &source)
+        .map_err(|error| format!("writing {out_path}: {error}"))?;
+    println!(
+        "  emitted {label} BlockProgram: banks={} (+{empty_banks} unreached) blocks={} source_bytes={} entry={}@{:#010x} -> {out_path}",
+        pack.banks.len(),
+        blocks,
+        source.len(),
+        entry_bank.bank,
+        entry_pc,
+    );
+    Ok(())
+}
+
+/// Every proven ROM mapping, in deterministic bank order. Physically-resident
+/// banks slice the image; VROM (DMA-loaded) overlays resolve through their
+/// proven file-table record, so OoT's overlays compose here too.
 fn physical_banks(facts: &FactDb) -> Result<Vec<PhysicalBank>, String> {
     let mut banks = Vec::new();
     for fact in facts.proven_rom_mappings() {
