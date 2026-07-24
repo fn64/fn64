@@ -303,6 +303,14 @@ pub enum DeviceMmioWriteEffect {
     AiFrequencyChanged { sample_rate_hz: u32 },
     AiDmaStarted(AiDmaRequest),
     DpcSubmissionRequested(DpcSubmission),
+    /// A raw `SP_STATUS` write cleared HALT while the RSP was halted, which on
+    /// hardware starts it executing IMEM from `SP_PC`. Reported as an effect so
+    /// a host can run the RSP; the device models registers, not execution.
+    ///
+    /// Only the raw MMIO path produces this. `write_sp_status` is also called
+    /// directly by the libultra `__osSpSetStatus` shim, which does not route
+    /// through `write_mmio` because the HLE task lane kicks the RSP itself.
+    RspStartRequested { pc: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2370,6 +2378,20 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                     self.dpc.clock = DpcCounter24::ZERO;
                 }
                 return Ok(DeviceMmioWriteEffect::None);
+            }
+            SP_STATUS_REG => {
+                // Hardware starts the RSP when a STATUS write clears HALT on a
+                // halted unit; it keeps running if it was already going. Report
+                // only the halted -> running edge so a repeated clear-halt does
+                // not re-enter a running task.
+                let was_halted = self.sp_status & SP_STATUS_HALT != 0;
+                self.write_sp_status(value);
+                let now_halted = self.sp_status & SP_STATUS_HALT != 0;
+                return Ok(if was_halted && !now_halted {
+                    DeviceMmioWriteEffect::RspStartRequested { pc: self.sp_pc() }
+                } else {
+                    DeviceMmioWriteEffect::None
+                });
             }
             _ => {}
         }
@@ -4655,4 +4677,52 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn raw_sp_status_clear_halt_requests_an_rsp_start_on_the_halted_edge() {
+        // Hardware starts the RSP when a STATUS write clears HALT on a halted
+        // unit. The device models registers, not execution, so it reports the
+        // edge as an effect for a host to act on -- rather than latching the
+        // bit and leaving a guest that kicked the RSP through raw MMIO waiting
+        // forever on an SP interrupt nothing will raise.
+        let mut fabric = fabric();
+        fabric.write_mmio(SP_PC_REG, 0x0A8).unwrap();
+
+        // Resets halted, so the first clear-halt is the starting edge.
+        assert_eq!(
+            fabric.write_mmio(SP_STATUS_REG, 1 << 0).unwrap(),
+            DeviceMmioWriteEffect::RspStartRequested { pc: 0x0A8 }
+        );
+
+        // Already running: a repeated clear-halt must NOT re-enter a live task.
+        assert_eq!(
+            fabric.write_mmio(SP_STATUS_REG, 1 << 0).unwrap(),
+            DeviceMmioWriteEffect::None
+        );
+
+        // Halting and clearing again is a fresh edge.
+        assert_eq!(
+            fabric.write_mmio(SP_STATUS_REG, 1 << 1).unwrap(),
+            DeviceMmioWriteEffect::None
+        );
+        assert_eq!(
+            fabric.write_mmio(SP_STATUS_REG, 1 << 0).unwrap(),
+            DeviceMmioWriteEffect::RspStartRequested { pc: 0x0A8 }
+        );
+    }
+
+    #[test]
+    fn sp_status_writes_that_do_not_release_halt_request_no_start() {
+        // Only the halt bit gates execution. Signal/interrupt/single-step
+        // commands must not be mistaken for a kick.
+        let mut fabric = fabric();
+        for command in [1 << 2, 1 << 4, SP_SET_YIELD, SP_SET_YIELDED, 1 << 6] {
+            assert_eq!(
+                fabric.write_mmio(SP_STATUS_REG, command).unwrap(),
+                DeviceMmioWriteEffect::None,
+                "command {command:#x} released halt"
+            );
+        }
+    }
+
 }
