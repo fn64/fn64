@@ -25,6 +25,16 @@ jobs:
   test:
     name: cargo nextest (workspace)
     runs-on: ubuntu-latest
+    # Job-wide, NOT on the cargo step: rust-cache keys and restores before that
+    # step runs, so profile vars scoped to the step change the rustc invocation
+    # afterwards and mismatch every restored fingerprint -- a full cache hit
+    # still recompiled 129 dependencies. Same profile for cache and build.
+    env:
+      # Test binaries are run once and thrown away -- debuginfo is dead weight
+      # in link time and cache size, and CI never opens a debugger.
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -34,6 +44,9 @@ jobs:
           # are exactly the ones you re-push to, so the cache stayed empty and
           # every run rebuilt ~700 crates from scratch (~13 min).
           cache-on-failure: true
+          # Existing entries were saved under the old step-scoped profile and
+          # cannot match the job-wide one; bump to avoid restoring them.
+          prefix-key: v1-rust
       - uses: taiki-e/install-action@nextest
       # fn64-audio/fn64-shell link ALSA via cpal/gilrs; the runner image has no
       # libasound headers, so alsa-sys' build.rs panics before any test runs.
@@ -43,14 +56,8 @@ jobs:
       # is needed (naming it only emitted "excluded package(s) not found").
       #
       # Tests themselves take ~8s; the cost is compiling 86 test binaries, so
-      # the levers are the cache above and cheaper codegen below.
+      # the levers are the cache above and the job-wide profile vars.
       - run: cargo nextest run --workspace
-        env:
-          # Test binaries are run once and thrown away -- debuginfo is dead
-          # weight in link time and cache size, and CI never opens a debugger.
-          CARGO_PROFILE_TEST_DEBUG: "0"
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_INCREMENTAL: "0"
 
   docs:
     name: doc-drift lint
