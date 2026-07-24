@@ -541,13 +541,17 @@ fn print_scoreboard(
         board.unsupported
     );
     println!(
-        "  dynamic_mips={}  (interpreter-fallback covered; reported honestly, not a blocker)",
+        "  dynamic_mips={}  (classified interpreter-coverable, not a release blocker; the\n                    fallback lane itself is still unimplemented -- see DISCOVER-PLAN)",
         board.dynamic_mips
     );
     println!(
         "  reasons={}",
         serde_json::to_string(&board.per_reason).unwrap_or_else(|_| "<error>".to_string())
     );
+    // `open_indirect_site` counts only sites inside blocks this composed
+    // program actually built. It is NOT the ROM's open-indirect frontier --
+    // the D1/D2 measurements report several hundred for the same ROM.
+    println!("  (open_indirect_site counts composed-block sites only, not the ROM's frontier)");
     // The concrete VAs that block release, so the number has an address list
     // the reachability work can chase. Bounded so the gate stays readable.
     let unsupported_vas: Vec<u32> = classified_destinations(snapshots)
