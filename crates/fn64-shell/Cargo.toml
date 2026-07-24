@@ -11,27 +11,9 @@ name = "fn64"
 path = "src/main.rs"
 
 [features]
-# Seam for linking a real out-of-tree audio ucode (the synth that produces
-# samples for the cpal output stream). Currently declares NO dependency --
-# the only ucode crate available (aki-recomp/games/OOTU/rsp-recomp) hard-pins
-# fn64-audio to a sibling worktree, which collides with this workspace's
-# fn64-audio in the lockfile (see [dependencies] note). Enabling this feature
-# today only changes the `wire_audio_ucode` log line; add the `dep:...` here
-# once a ucode crate exists that doesn't cross-pin fn64-audio.
-oot-audio-ucode = []
 # RT64 static backend passthrough (FN64_RENDER=rt64 at runtime needs the
 # backend compiled in). Same shape as oot-boot's feature.
 rt64 = ["fn64-render-rt64/rt64"]
-# Declared empty here so `cfg(feature = "oot-audio")` compiles cleanly in the
-# workspace build; the rs manifest (crates/fn64-shell/rs/Cargo.toml) redefines
-# it as the real `dep:oot-audio-ucode` link.
-oot-audio = []
-# AKI-family audio: links the aki-audio-ucode adapter, which recompiles the AKI
-# audio ucode from the ROM at build time. Unlike oot-audio-ucode this crate
-# depends on THIS workspace's fn64-audio (same path), so there is no lockfile
-# cross-pin -- it can be a real optional dependency here. Works in both the C
-# and rs lanes since it's registered via fn64_abi::set_audio_ucode_fn.
-aki-audio = ["dep:aki-audio-ucode"]
 
 [build-dependencies]
 # Compiles the out-of-tree RecompiledFuncs/*.c plus fn64-boot-harness's shared
@@ -49,10 +31,6 @@ fn64-render-rt64 = { path = "../fn64-render-rt64" }
 # cpal-backed AudioBackend lives here; we register it via
 # fn64_abi::set_audio_backend to wire the audio OUTPUT path.
 fn64-audio = { path = "../fn64-audio" }
-# AKI audio ucode adapter (recompiles the ucode from the ROM at build time).
-# Optional, behind the `aki-audio` feature; depends on the same fn64-audio path
-# as this crate, so no lockfile cross-pin.
-aki-audio-ucode = { path = "../../examples/wm2000-boot/audio-ucode", optional = true }
 
 # Window + live framebuffer present. Both MIT/Apache-2.0 (permissive).
 # `pixels` is a thin wgpu-backed pixel-buffer presenter -- the simplest way
@@ -78,13 +56,6 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
 
-# NOTE: the audio SYNTH (recompiled OoT aspMain ucode, out-of-tree at
-# aki-recomp/games/OOTU/rsp-recomp) is deliberately NOT a dependency here.
-# That crate hard-pins `fn64-audio` to a specific sibling worktree
-# (fn64-audio-wt), which collides with THIS workspace's own fn64-audio in the
-# lockfile. Wiring it as a path dep -- even optional -- forces that collision
-# at resolve time. The shell's deliverable is the audio OUTPUT path (cpal,
-# via fn64-audio::CpalBackend registered with fn64_abi::set_audio_backend),
-# which is fully wired without the ucode. See main.rs `wire_audio_ucode`'s
-# `oot-audio-ucode` feature for the seam to link a real ucode once it no
-# longer cross-pins fn64-audio.
+# Audio tasks execute admitted live IMEM through the ABI's explicit LLE
+# accuracy policy. Optional translated artifacts are not shell features or
+# release authority.

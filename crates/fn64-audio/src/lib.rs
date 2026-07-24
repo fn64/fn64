@@ -44,7 +44,14 @@
 
 pub mod characterize;
 pub mod hle;
-pub mod hle_commit;
+// The former ucode-phase commit candidate compared a reduced visible-state
+// projection and accepted an independently supplied LLE result. Keep its
+// crate-private characterization available to `whole_task`, but expose no
+// activation surface until a paired lane seals complete RSP architectural
+// state from one snapshot.
+#[allow(dead_code)]
+pub(crate) mod hle_commit;
+pub use hle_commit::{AudioTaskStepTotals, PrepareUcodeCommitError};
 pub mod hle_effects;
 pub mod hle_executor;
 pub mod hle_lle;

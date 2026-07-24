@@ -8,9 +8,8 @@
 //!
 //! The module is ROM-derived (recompiled aspMain ucode), so unlike `recomp.h`
 //! it can never be vendored -- it must stay out-of-tree per the
-//! no-game-content rule. To build without it, disable the `oot-audio` feature
-//! (`--no-default-features`); `main.rs` already has a
-//! `cfg(not(feature = "oot-audio"))` path that installs the synth stand-in.
+//! no-game-content rule. This optional translated-artifact experiment is not
+//! linked by the parent harness, which executes admitted live IMEM via LLE.
 
 use std::path::PathBuf;
 
@@ -74,8 +73,7 @@ fn locate() -> PathBuf {
         }
         panic!(
             "OoT audio adapter: FN64_GAME_DIR is set but {} does not exist.\n\
-             Set OOT_ASPMAIN to the generated module's full path, or build with \
-             --no-default-features to use the synth stand-in instead.",
+             Set OOT_ASPMAIN to the generated module's full path.",
             p.display()
         );
     }
@@ -86,8 +84,6 @@ fn locate() -> PathBuf {
          what CAN be vendored).\n\
          Set one of:\n\
          \x20 OOT_ASPMAIN=/path/to/oot_aspmain.rs   (the file itself)\n\
-         \x20 FN64_GAME_DIR=/path/to/game-workspace (then {REL})\n\
-         Or build with --no-default-features to drop the `oot-audio` feature and use the \
-         synth stand-in."
+         \x20 FN64_GAME_DIR=/path/to/game-workspace (then {REL})"
     );
 }

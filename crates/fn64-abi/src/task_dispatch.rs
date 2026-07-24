@@ -1038,21 +1038,17 @@ fn commit_rsp_rdram_writes(written: &[(usize, usize)]) {
 #[cfg(not(feature = "recomp-rs"))]
 fn commit_rsp_rdram_writes(_written: &[(usize, usize)]) {}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct VerifiedAudioUcodeCommitResult {
-    steps: fn64_audio::hle_commit::AudioTaskStepTotals,
-    dp_full_sync: fn64_render::DpFullSyncStatus,
-}
-
 /// Same-task authority required to replace one in-flight interpreter phase.
 /// Construction is confined to the live owner check below; publication
 /// consumes it only after rechecking that ownership under the final HostState
 /// borrow.
+#[cfg(test)]
 struct VerifiedAudioCommitOwner {
     task_addr: RdramAddr,
     admission_generation: RspTaskAdmissionGeneration,
 }
 
+#[cfg(test)]
 fn verified_audio_commit_owner(
     task_addr: RdramAddr,
     admission_generation: NonZeroU64,
@@ -1110,6 +1106,7 @@ fn verified_audio_commit_owner(
     })
 }
 
+#[cfg(test)]
 fn verified_rsp_execution_state(
     machine: &fn64_audio::rsp::runtime::RspMachineState,
     pc_low12: u32,
@@ -1474,6 +1471,7 @@ fn commit_rsp_hle_compatibility(
     });
 }
 
+#[cfg(test)]
 fn apply_verified_audio_rdram_patches(
     storage: &mut [u8],
     patches: &fn64_audio::hle_outcome::CanonicalRdramPatches,
@@ -1499,6 +1497,7 @@ fn apply_verified_audio_rdram_patches(
     writes
 }
 
+#[cfg(test)]
 fn validate_verified_audio_rdram_patches(
     storage_len: usize,
     patches: &fn64_audio::hle_outcome::CanonicalRdramPatches,
@@ -1519,6 +1518,7 @@ fn validate_verified_audio_rdram_patches(
     }
 }
 
+#[cfg(test)]
 fn deferred_audio_dpc_batch(
     submissions: Vec<fn64_audio::hle_outcome::DeferredDpcSubmission>,
 ) -> Option<fn64_render::RawDpcBatch> {
@@ -1554,6 +1554,7 @@ fn deferred_audio_dpc_batch(
     )
 }
 
+#[cfg(test)]
 fn canonical_changed_rdram_ranges(before: &[u8], after: &[u8]) -> Vec<(usize, usize)> {
     assert_eq!(before.len(), after.len());
     let before = fn64_runtime::RdramView::from_storage(before);
@@ -1578,6 +1579,7 @@ fn canonical_changed_rdram_ranges(before: &[u8], after: &[u8]) -> Vec<(usize, us
     ranges
 }
 
+#[cfg(test)]
 fn merge_canonical_rdram_write_ranges(
     mut ranges: Vec<(usize, usize)>,
     additional: Vec<(usize, usize)>,
@@ -1597,6 +1599,7 @@ fn merge_canonical_rdram_write_ranges(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 unsafe fn commit_verified_audio_effects(
     rdram: *mut u8,
     task_addr: RdramAddr,
@@ -1708,50 +1711,6 @@ unsafe fn commit_verified_audio_effects(
     commit_rsp_rdram_writes(&writes);
 
     fn64_render::DpFullSyncStatus::NotReached
-}
-
-/// Publish one already-compared audio ucode phase to the live runtime.
-///
-/// The consuming payload is the sole commit authority. PCM ranges are
-/// comparison evidence only; actual samples remain owned by the later AI DMA
-/// boundary. This adapter is intentionally not selected by live task policy
-/// until the HLE catalog and differential lane are admitted together.
-#[allow(dead_code)]
-unsafe fn commit_verified_audio_ucode_phase(
-    rdram: *mut u8,
-    task_addr: RdramAddr,
-    parts: fn64_audio::hle_commit::VerifiedUcodePhaseCommitParts,
-) -> VerifiedAudioUcodeCommitResult {
-    parts.consume_with(
-        |task_admission_generation,
-         _,
-         _,
-         rdram_patches,
-         _,
-         rsp_memory,
-         machine_state,
-         pc_low12,
-         dpc_submissions,
-         steps| {
-            let dp_full_sync = unsafe {
-                commit_verified_audio_effects(
-                    rdram,
-                    task_addr,
-                    task_admission_generation,
-                    rdram_patches,
-                    rsp_memory,
-                    machine_state,
-                    pc_low12,
-                    dpc_submissions,
-                )
-            };
-
-            VerifiedAudioUcodeCommitResult {
-                steps,
-                dp_full_sync,
-            }
-        },
-    )
 }
 
 fn rsp_visible_rdram_len(allocation_len: usize) -> usize {
@@ -5319,15 +5278,6 @@ mod tests {
             fn64_render::RawDpcSource::Rdram
         );
         assert_eq!(batch.submissions()[0].command_words(), expected_words);
-    }
-
-    #[test]
-    fn verified_audio_commit_adapter_consumes_its_authority() {
-        let _signature: unsafe fn(
-            *mut u8,
-            RdramAddr,
-            fn64_audio::hle_commit::VerifiedUcodePhaseCommitParts,
-        ) -> VerifiedAudioUcodeCommitResult = commit_verified_audio_ucode_phase;
     }
 
     #[test]

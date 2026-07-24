@@ -198,20 +198,6 @@
       "trigger": "backend rejected unlisted microcode at RDRAM offset"
     },
     {
-      "operation": "render.raw-dpc-batch.non-certifying",
-      "subsystem": "render",
-      "disposition": "loud_trap",
-      "path": "crates/fn64-abi/src/task_dispatch.rs",
-      "trigger": "the staged-RDRAM renderer seam is diagnostic-only"
-    },
-    {
-      "operation": "recompiler.verified-audio.executable-write",
-      "subsystem": "recompiler",
-      "disposition": "loud_trap",
-      "path": "crates/fn64-abi/src/task_dispatch.rs",
-      "trigger": "verified audio publication rejected"
-    },
-    {
       "operation": "render.hle-ucode.needs-lle",
       "subsystem": "render",
       "disposition": "needs_lle",
