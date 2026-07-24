@@ -277,7 +277,7 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain at least one individual recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Current report schema
-`fn64.release-gate.v27` also freezes the install-once audio-task execution
+`fn64.release-gate.v28` also freezes the install-once audio-task execution
 policy and admits only execution of the live RSP image through `LleAccuracy`;
 the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
@@ -286,7 +286,7 @@ This mechanism makes a correctly formed production contract launchable; it is
 not representative-ROM evidence by itself. Representative private NTSC
 full-ROM exact-ten series for reference and RT64 LLE/post-VI completed under
 schema v22 and were independently reverified locally on 2026-07-22. Both
-series are historical under schema v27 and require regeneration. They bind
+series are historical under schema v28 and require regeneration. They bind
 their then-current boundary-owned observations and the compiled unsupported-
 instrumentation identity. A retained public synthetic identified-native XBUS
 series binds the same denominator without acquiring private-ROM authority.
@@ -300,7 +300,7 @@ Report-only matrix v5 verification never awards a ROM-class requirement from
 the report's host-supplied label. Its private-series path accepts only an
 opaque capability produced by jointly revalidating the policy-admitted v3
 contract, exact-ten receipt, retained reports/journals, raw ROM, runner image,
-and bound inputs. It exact-matches the v27 semantic report and ordered run-event
+and bound inputs. It exact-matches the v28 semantic report and ordered run-event
 identities, and retains a canonical `fn64.verified-rom-class-authority.v1`
 inside verified-matrix v18. The retained
 self-hash proves canonical integrity, not signer identity or transferable
@@ -456,7 +456,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v27 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v28 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -468,7 +468,7 @@ a contradictory backend label traps. Neither source can choose the digest or
 execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v27` binds it independently.
+clears it and report schema `fn64.release-gate.v28` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.
@@ -1267,7 +1267,7 @@ task calls out:
   native pointers and registration order. Mapped-interpreter destination
   observations honestly retain no
   generated artifact and are operational/differential-only, not fixed-cycle
-  release evidence under schema v27; artifact-identified mapped AOT retains its
+  release evidence under schema v28; artifact-identified mapped AOT retains its
   real artifact and is eligible, while compatibility AOT without one is not.
   Refill and invalid fetch faults retain exact EPC/BD, BadVAddr, Context/EntryHi,
   and refill/common vector selection. The legacy whole-function boundary,
@@ -1842,7 +1842,7 @@ semantic metadata, mapper/RTC/timing state; high-level VI/retrace state; and
 the ABI manager's pending PI/SI delivery and VI-latch metadata. DeviceState v9
 added the owner-local executor control and complete modeled ABI HostState
 projections described below. Retained report schema v22 and DeviceState v9
-artifacts are historical only; they cannot satisfy current v27 verification.
+artifacts are historical only; they cannot satisfy current v28 verification.
 DeviceState v11 binds the audio-task execution policy and translated artifact
 identity. DeviceState v12 additionally binds DPC CLOCK, BUFBUSY, PIPEBUSY, and
 TMEM. DeviceState v13 binds the ABI-owned RSP interpreter continuation:
@@ -1851,6 +1851,10 @@ scalar and vector state, SP/DPC registers, and ordered pending DPC submissions.
 DeviceState v14 additionally binds each loaded/lineage/owner admission
 generation and the next process-monotonic generation so task-address reuse
 cannot alias a prior commit authority.
+DeviceState v15 narrows DPC CLOCK, BUFBUSY, PIPEBUSY, and TMEM to their public
+24-bit domains at the runtime import boundary and rejects a noncanonical value
+at release encoding. It does not claim modeled counter increments or close the
+still-open STATUS counter-clear/transaction interleavings.
 Fixed-cycle report construction admits only
 `AudioTaskExecutionPolicy::LleAccuracy`; translated callbacks cannot prove a
 match to live IMEM, and diagnostic skip is explicitly non-release.

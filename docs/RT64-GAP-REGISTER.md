@@ -416,7 +416,7 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
   creation and ordinary VI events, then observe exact completed-workload rate
   sequences `[0,0,0,50]` and `[0,0,0,60]` without an Extended override. The
   overlay does not alter the later Extended-GBI refresh-rate override. A
-  schema-v27 full-ROM path now co-binds normalized destination-code TV region,
+  schema-v28 full-ROM path now co-binds normalized destination-code TV region,
   committed device TV state, and renderer create-time configuration. No
   representative private exact-ten PAL/MPAL series has yet been retained;
   physical compositor cadence, field timing, and analog PAL output remain

@@ -49,6 +49,7 @@ const AI_DRAM_DOMAIN_END: u32 = 0x0100_0000;
 const AI_DACRATE_MASK: u32 = 0x0000_3fff;
 const AI_BITRATE_MASK: u32 = 0x0000_000f;
 const DPC_ADDR_MASK: u32 = 0x00ff_fff8;
+const DPC_COUNTER_MASK: u32 = 0x00ff_ffff;
 
 const MI_INTR_REG: MmioAddr = MmioAddr::new(0xA430_0008);
 const MI_INTR_MASK_REG: MmioAddr = MmioAddr::new(0xA430_000C);
@@ -661,16 +662,34 @@ struct PendingAi {
     deadline: Cycles,
 }
 
+/// Public DPC performance counters expose a 24-bit modulo domain. The current
+/// model imports counter values but does not fabricate increments or model
+/// STATUS counter-clear commands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DpcCounter24(u32);
+
+impl DpcCounter24 {
+    const ZERO: Self = Self(0);
+
+    const fn from_register(value: u32) -> Self {
+        Self(value & DPC_COUNTER_MASK)
+    }
+
+    const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DpcRegisters {
     start: u32,
     end: u32,
     current: u32,
     status: u32,
-    clock: u32,
-    busy: u32,
-    pipe_busy: u32,
-    tmem_busy: u32,
+    clock: DpcCounter24,
+    busy: DpcCounter24,
+    pipe_busy: DpcCounter24,
+    tmem_busy: DpcCounter24,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -910,10 +929,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 end: 0,
                 current: 0,
                 status: 0,
-                clock: 0,
-                busy: 0,
-                pipe_busy: 0,
-                tmem_busy: 0,
+                clock: DpcCounter24::ZERO,
+                busy: DpcCounter24::ZERO,
+                pipe_busy: DpcCounter24::ZERO,
+                tmem_busy: DpcCounter24::ZERO,
             },
             pending_dpc: None,
             si_dram_addr: RdramAddr::from_offset(0),
@@ -1006,10 +1025,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             dpc_end: self.dpc.end,
             dpc_current: self.dpc.current,
             dpc_status: self.dpc.status,
-            dpc_clock: self.dpc.clock,
-            dpc_busy: self.dpc.busy,
-            dpc_pipe_busy: self.dpc.pipe_busy,
-            dpc_tmem_busy: self.dpc.tmem_busy,
+            dpc_clock: self.dpc.clock.get(),
+            dpc_busy: self.dpc.busy.get(),
+            dpc_pipe_busy: self.dpc.pipe_busy.get(),
+            dpc_tmem_busy: self.dpc.tmem_busy.get(),
             pending_dpc: self.pending_dpc.map(|pending| pending.submission),
             mi_pending: self.mi_pending,
             mi_mask: self.mi_mask,
@@ -1858,10 +1877,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             dpc_end: self.dpc.end,
             dpc_current: self.dpc.current,
             dpc_status: self.dpc.status,
-            dpc_clock: self.dpc.clock,
-            dpc_busy: self.dpc.busy,
-            dpc_pipe_busy: self.dpc.pipe_busy,
-            dpc_tmem_busy: self.dpc.tmem_busy,
+            dpc_clock: self.dpc.clock.get(),
+            dpc_busy: self.dpc.busy.get(),
+            dpc_pipe_busy: self.dpc.pipe_busy.get(),
+            dpc_tmem_busy: self.dpc.tmem_busy.get(),
         }
     }
 
@@ -1909,10 +1928,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             end: state.dpc_end & DPC_ADDR_MASK,
             current: state.dpc_current & DPC_ADDR_MASK,
             status: state.dpc_status,
-            clock: state.dpc_clock,
-            busy: state.dpc_busy,
-            pipe_busy: state.dpc_pipe_busy,
-            tmem_busy: state.dpc_tmem_busy,
+            clock: DpcCounter24::from_register(state.dpc_clock),
+            busy: DpcCounter24::from_register(state.dpc_busy),
+            pipe_busy: DpcCounter24::from_register(state.dpc_pipe_busy),
+            tmem_busy: DpcCounter24::from_register(state.dpc_tmem_busy),
         };
         Ok(())
     }
@@ -2154,10 +2173,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             DPC_END_REG => Ok(self.dpc.end),
             DPC_CURRENT_REG => Ok(self.dpc.current),
             DPC_STATUS_REG => Ok(self.dpc.status),
-            DPC_CLOCK_REG => Ok(self.dpc.clock),
-            DPC_BUFBUSY_REG => Ok(self.dpc.busy),
-            DPC_PIPEBUSY_REG => Ok(self.dpc.pipe_busy),
-            DPC_TMEM_REG => Ok(self.dpc.tmem_busy),
+            DPC_CLOCK_REG => Ok(self.dpc.clock.get()),
+            DPC_BUFBUSY_REG => Ok(self.dpc.busy.get()),
+            DPC_PIPEBUSY_REG => Ok(self.dpc.pipe_busy.get()),
+            DPC_TMEM_REG => Ok(self.dpc.tmem_busy.get()),
             MI_INTR_REG => Ok(self.mi_pending),
             MI_INTR_MASK_REG => Ok(self.mi_mask),
             VI_CURRENT_REG => Ok(self.vi_current()),
@@ -2833,6 +2852,10 @@ mod tests {
 
         let expected = RspExecutionState {
             sp_status: state.sp_status & !(SP_STATUS_DMA_BUSY | SP_STATUS_DMA_FULL),
+            dpc_clock: state.dpc_clock & DPC_COUNTER_MASK,
+            dpc_busy: state.dpc_busy & DPC_COUNTER_MASK,
+            dpc_pipe_busy: state.dpc_pipe_busy & DPC_COUNTER_MASK,
+            dpc_tmem_busy: state.dpc_tmem_busy & DPC_COUNTER_MASK,
             ..state
         };
         assert_eq!(fabric.rsp_execution_state(), expected);
@@ -3375,6 +3398,80 @@ mod tests {
                 & (DPC_STATUS_DMA_BUSY | DPC_STATUS_END_VALID),
             0,
             "status mode commands cannot consume the renderer transaction"
+        );
+    }
+
+    #[test]
+    fn dpc_counter24_boundary_is_shared_by_rsp_mmio_and_snapshot() {
+        let mut fabric = fabric();
+        let mut state = complete_rsp_state();
+        state.dpc_clock = DPC_COUNTER_MASK;
+        state.dpc_busy = DPC_COUNTER_MASK;
+        state.dpc_pipe_busy = DPC_COUNTER_MASK;
+        state.dpc_tmem_busy = DPC_COUNTER_MASK;
+        fabric.commit_complete_rsp_execution_state(state).unwrap();
+
+        let expected = (
+            DPC_COUNTER_MASK,
+            DPC_COUNTER_MASK,
+            DPC_COUNTER_MASK,
+            DPC_COUNTER_MASK,
+        );
+        let rsp = fabric.rsp_execution_state();
+        assert_eq!(
+            (
+                rsp.dpc_clock,
+                rsp.dpc_busy,
+                rsp.dpc_pipe_busy,
+                rsp.dpc_tmem_busy,
+            ),
+            expected
+        );
+        assert_eq!(
+            (
+                fabric.read_mmio(DPC_CLOCK_REG).unwrap(),
+                fabric.read_mmio(DPC_BUFBUSY_REG).unwrap(),
+                fabric.read_mmio(DPC_PIPEBUSY_REG).unwrap(),
+                fabric.read_mmio(DPC_TMEM_REG).unwrap(),
+            ),
+            expected
+        );
+        let snapshot = fabric.snapshot();
+        assert_eq!(
+            (
+                snapshot.dpc_clock,
+                snapshot.dpc_busy,
+                snapshot.dpc_pipe_busy,
+                snapshot.dpc_tmem_busy,
+            ),
+            expected
+        );
+
+        state.dpc_clock = 0x0100_0000;
+        state.dpc_busy = 0x0100_0001;
+        state.dpc_pipe_busy = 0x01ff_ffff;
+        state.dpc_tmem_busy = u32::MAX;
+        fabric.commit_complete_rsp_execution_state(state).unwrap();
+        let canonical = (0, 1, DPC_COUNTER_MASK, DPC_COUNTER_MASK);
+        let snapshot = fabric.snapshot();
+        assert_eq!(
+            (
+                snapshot.dpc_clock,
+                snapshot.dpc_busy,
+                snapshot.dpc_pipe_busy,
+                snapshot.dpc_tmem_busy,
+            ),
+            canonical,
+            "synchronous RSP imports cannot place high bits outside the public counter domain"
+        );
+        assert_eq!(
+            (
+                fabric.read_mmio(DPC_CLOCK_REG).unwrap(),
+                fabric.read_mmio(DPC_BUFBUSY_REG).unwrap(),
+                fabric.read_mmio(DPC_PIPEBUSY_REG).unwrap(),
+                fabric.read_mmio(DPC_TMEM_REG).unwrap(),
+            ),
+            canonical
         );
     }
 
