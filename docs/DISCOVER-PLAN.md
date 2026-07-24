@@ -172,9 +172,15 @@ corroboration or below-floor rules (their tables map fully via delta_vote), so
 `gate_overlay_regions` (`471181f2…`) and `gate_d1_overlays` (`9b0dc15f…`) are
 byte-identical throughout. `gate_d1_oot_overlays` is 10/10 byte-identical
 (`c8fcb6a1…`); `gate_overlay_generalize` (`dec5742e…`). **This proves the
-"port any N64 ROM without per-game hand geometry" thesis on the answer-key
-ROM: automation matches the hand-encoded overlay tables, not approximately but
-exactly.**
+"port any N64 ROM without per-game hand geometry" thesis for the four overlay
+descriptor families: automation matches the hand-encoded overlay tables, not
+approximately but exactly.** It is not yet proven for the ROM as a whole: the
+resident `code`/`n64dd` images have no recovered VRAM mapping (their load
+address comes from a `DmaMgr_RequestSync` call, not a table), which is the
+dominant share of the ~3,700 answer-key functions outside the 72.33% recall
+figure; and `gate_closure` still feeds hand-supplied
+`oot_reference::oot_load_image_tables()` rather than the mechanically
+recovered set.
 
 **Execution-closure scoreboard (`gate_closure`, held-out, 10/10 byte-identical
 `4ff3a44c…`).** The concrete "distance to a recompilable ROM": every reachable
@@ -184,9 +190,14 @@ owner) / `block_aot` (proven reachable code, no source-level owner claimed) /
 `unsupported` (lands outside every known mapping — the release-blocker). Per
 ROM (destinations): NW4E block_aot 22,051 / dynamic_mips 892 / **unsupported
 11**; NWXE exact_aot 349 / block_aot 17,622 / dynamic_mips 2,169 /
-**unsupported 20**; OoT (resident boot bank only — its VROM overlays are
-outside snapshot V1's physical-backing composition) block_aot 287 /
-dynamic_mips 73 / **unsupported 6**. Held-out grading found
+**unsupported 20**; OoT (whole ROM: the resident boot bank plus 468 composed
+VROM overlay banks) exact_aot 1,891 / block_aot 1,314 / dynamic_mips 12,247 /
+**unsupported 8**. OoT's large `dynamic_mips` figure is overlay code that
+closure reaches as a destination but block proof declines to prove
+(`entry_not_authoritative`/`owner_missing`/`partition_ambiguity`); it is
+classified as interpreter-coverable rather than unsupported, but that fallback
+lane is itself still unimplemented — see the roadmap entry below. Held-out
+grading found
 `misclassified_as_code = 0` on all three: no exact_aot/block_aot destination
 lands where the dump says data. The headline: the distance to a full-game
 build is not thousands of destinations but **6–20 per ROM** — each an
