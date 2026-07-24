@@ -373,34 +373,6 @@ impl Interp<'_> {
             };
             let instr = decode(word);
 
-            // ERET is a privileged transfer without a delay slot (mirrors
-            // `emit_bank_eret` in emit.rs exactly, including its ALWAYS
-            // `BlockExit::ResolveTransfer` — never a proven in-bank
-            // `Transfer` — because the target is a runtime EPC/ErrorEPC
-            // value, never a statically provable one): apply the VR4300
-            // ERET state transition (ErrorEPC/ERL precedence over EPC/EXL,
-            // LLbit clear — both inside
-            // `RecompContext::exception_return_pc`) and resolve to the
-            // returned virtual PC. It is handled here, before the
-            // `has_delay_slot()`/`straight()` split, because it is neither a
-            // delay-slot control transfer nor an ordinary fallthrough
-            // instruction.
-            if matches!(instr, Instruction::Eret) {
-                let executed = executed + 1;
-                let target = ctx.exception_return_pc();
-                ctx.advance_cop0_random(1);
-                return Ok(BlockRun::new(
-                    crate::execution::finalize_executable_write_exit(
-                        self.bank,
-                        BlockExit::ResolveTransfer {
-                            source_bank: self.bank,
-                            target_pc: GuestPc::new(target),
-                        },
-                    ),
-                    executed,
-                ));
-            }
-
             if instr.has_delay_slot() {
                 // A control transfer and its delay slot are one indivisible
                 // dispatch unit. Charge/checkpoint identically to the AOT runner:
@@ -508,8 +480,12 @@ impl Interp<'_> {
                         ));
                     }
                 }
-                Ok(Step::Exit { .. }) => {
-                    unreachable!("a straight-line instruction never produces a transfer exit")
+                Ok(Step::Exit { exit, retired }) => {
+                    executed += retired;
+                    return Ok(BlockRun::new(
+                        crate::execution::finalize_executable_write_exit(self.bank, exit),
+                        executed,
+                    ));
                 }
                 Err(StepFault::Cpu { fault, attempted }) => {
                     return Ok(BlockRun::new(BlockExit::Fault(fault), executed + attempted));
@@ -593,6 +569,23 @@ impl Interp<'_> {
         retired_before: u32,
     ) -> Result<Step, StepFault> {
         use Instruction::*;
+
+        if instr.requires_cop0() && !ctx.cop0_usable() {
+            return Err(StepFault::Cpu {
+                fault: CpuFault {
+                    at: self.key(pc),
+                    kind: CpuFaultKind::Exception {
+                        exception: CpuException::CoprocessorUnusable,
+                        epc: GuestPc::new(pc),
+                        branch_delay: false,
+                        instruction_code: 0,
+                        bad_vaddr: None,
+                        coprocessor: Some(0),
+                    },
+                },
+                attempted: 1,
+            });
+        }
 
         let fallthrough = delay_pc.wrapping_add(4);
         let target = branch_target(&instr, pc);
@@ -790,6 +783,23 @@ impl Interp<'_> {
             attempted: if site.branch_delay { 2 } else { 1 },
         };
 
+        if instr.requires_cop0() && !ctx.cop0_usable() {
+            return Err(StepFault::Cpu {
+                fault: CpuFault {
+                    at: self.key(site.pc),
+                    kind: CpuFaultKind::Exception {
+                        exception: CpuException::CoprocessorUnusable,
+                        epc: GuestPc::new(site.epc),
+                        branch_delay: site.branch_delay,
+                        instruction_code: 0,
+                        bad_vaddr: None,
+                        coprocessor: Some(0),
+                    },
+                },
+                attempted: if site.branch_delay { 2 } else { 1 },
+            });
+        }
+
         // Status.CU1 guard: a COP1-visible instruction with coprocessor 1
         // disabled (Status bit 29 clear) is a Coprocessor Unusable exception
         // (ExcCode 11, coprocessor 1), identical to the AOT bank lane's
@@ -809,6 +819,21 @@ impl Interp<'_> {
                     },
                 },
                 attempted: if site.branch_delay { 2 } else { 1 },
+            });
+        }
+
+        // ERET has no delay slot, but it is a transfer rather than ordinary
+        // fallthrough. Its COP0 authority guard above must precede the status
+        // transition and LLbit clear performed by `exception_return_pc`.
+        if matches!(instr, Instruction::Eret) {
+            let target = ctx.exception_return_pc();
+            ctx.advance_cop0_random(1);
+            return Ok(Step::Exit {
+                exit: BlockExit::ResolveTransfer {
+                    source_bank: self.bank,
+                    target_pc: GuestPc::new(target),
+                },
+                retired: 1,
             });
         }
 
@@ -2517,6 +2542,70 @@ mod tests {
             assert_eq!(ctx.d_bits(2), 0x1122_3344_5566_7788);
             assert_eq!(ctx.d_bits(4), 0x99AA_BBCC_DDEE_FF00);
             assert_eq!(ctx.read_fcr(31), 3);
+        }
+    }
+
+    #[test]
+    fn every_decoded_cop0_family_checks_authority_before_shape_or_effect() {
+        for word in [
+            0x4002_4800, // MFC0
+            0x4022_3800, // DMFC0 unsupported register shape
+            0x4084_6000, // MTC0 Status
+            0x40A2_3800, // DMTC0 unsupported register shape
+            0x4100_0001, // BC0F
+            0x4101_0001, // BC0T
+            0x4102_0001, // BC0FL
+            0x4103_0001, // BC0TL
+            0x4200_0001, // TLBR
+            0x4200_0002, // TLBWI
+            0x4200_0006, // TLBWR
+            0x4200_0008, // TLBP
+            0x4200_0018, // ERET
+        ] {
+            let instruction = decode(word);
+            let words = if instruction.has_delay_slot() {
+                vec![word, 0x2404_0007, 0]
+            } else {
+                vec![word]
+            };
+            let catalog = catalog_of(&words);
+            let mut ctx = RecompContext::new();
+            ctx.cop0_status = 2 << 3;
+            ctx.set_r(2, 0x1122_3344_5566_7788);
+            ctx.cop0_epc = 0x8000_2000;
+            ctx.cop0_error_epc = 0x8000_3000;
+            ctx.cop0_index = 7;
+            ctx.cop0_page_mask = 0x6000;
+            ctx.cop0_entry_hi = 0x1234_500A;
+            ctx.set_ll_reservation(0x8000_0040, 4);
+            let random = ctx.read_cop0(1);
+
+            let run = run(&catalog, VA, 4, &mut ctx).unwrap();
+            assert!(matches!(
+                run.exit,
+                BlockExit::Fault(CpuFault {
+                    at,
+                    kind: CpuFaultKind::Exception {
+                        exception: CpuException::CoprocessorUnusable,
+                        epc,
+                        branch_delay: false,
+                        coprocessor: Some(0),
+                        ..
+                    },
+                }) if at == ExecutionKey::new(BANK, GuestPc::new(VA))
+                    && epc == GuestPc::new(VA)
+            ));
+            assert_eq!(run.instructions, 1, "instruction={instruction:?}");
+            assert_eq!(ctx.cop0_status, 2 << 3);
+            assert_eq!(ctx.r(2), 0x1122_3344_5566_7788);
+            assert_eq!(ctx.r(4), 0, "COP0 branch delay executed");
+            assert_eq!(ctx.cop0_epc, 0x8000_2000);
+            assert_eq!(ctx.cop0_error_epc, 0x8000_3000);
+            assert_eq!(ctx.cop0_index, 7);
+            assert_eq!(ctx.cop0_page_mask, 0x6000);
+            assert_eq!(ctx.cop0_entry_hi, 0x1234_500A);
+            assert_eq!(ctx.read_cop0(1), random);
+            assert!(ctx.take_ll_reservation(0x8000_0040, 4));
         }
     }
 

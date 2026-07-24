@@ -500,10 +500,17 @@ Disabled COP1 raises ExcCode 11 with Cause.CE=1 before a register, FPU state,
 memory access, branch delay instruction, or address-alignment check can occur.
 The compile/run gate covers straight execution, a COP1 branch, COP1 in an
 integer delay slot, CU1-enabled execution, CU1-versus-AdEL priority, precise
-FloatingPoint/ExcCode-15 entry, installed handler entry, and ERET. Remaining
-COP0/COP2 behavior, 64-bit instruction admission, instruction-interior and FPU
-pipeline timing, undocumented FPU payload/priority quirks, and the
-whole-function lane's exception-return boundary remain open.
+FloatingPoint/ExcCode-15 entry, installed handler entry, and ERET. Every
+decoded COP0 move, BC0 branch, TLB-management operation, and ERET shares one
+exhaustive kernel-or-Status.CU0 classifier in both arbitrary-PC lanes.
+Unauthorized User/Supervisor execution returns typed Coprocessor Unusable
+with CE=0 before register-shape validation, condition or delay-slot effects,
+Random advancement, TLB mutation, or ERET state changes; kernel CU0=0 and
+User/Supervisor CU0=1 remain authorized. ERET retains ErrorEPC/ERL precedence,
+EPC/EXL fallback, LLbit clearing, and transfer accounting after that guard.
+Reserved-instruction and COP2 behavior, 64-bit instruction admission,
+instruction-interior and FPU pipeline timing, undocumented FPU payload/priority
+quirks, and the whole-function lane's exception-return boundary remain open.
 
 ### U5 — device closure
 

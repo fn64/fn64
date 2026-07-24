@@ -213,8 +213,19 @@ doubleword COP0 register moves remain host-boundary traps. In the arbitrary-PC
 bank lane, ERET selects ErrorEPC/ERL or EPC/EXL, clears the LL reservation, and
 returns a typed resolved transfer; the historical whole-function lane still
 traps because its callable ABI cannot return a transfer. BC0 uses a typed
-condition input, but CACHE does not synthesize Status.CH. Therefore COP0 is
-encoding-complete but not a complete privileged CPU/MMU model.
+condition input, but CACHE does not synthesize Status.CH. Privileged-
+instruction admission is shared and exhaustive across the two arbitrary-PC
+lanes: every decoded MFC0/DMFC0/MTC0/DMTC0, BC0*, TLB management, and ERET
+shape checks kernel-or-Status.CU0 before register-shape validation, condition
+sampling, Random advancement, TLB mutation, LLbit clearing, or a delay-slot
+effect. Unauthorized User/Supervisor execution returns Coprocessor Unusable
+(ExcCode 11) with Cause.CE=0 and precise PC/EPC/BD/accounting; kernel execution
+remains authorized with CU0 clear, while User/Supervisor execution is
+authorized with CU0 set. Authorized but unsupported register shapes remain
+loud. Reserved Instruction behavior is not yet a complete VR4300 model, so
+COP0 is encoding-complete but not a complete privileged CPU/MMU model. These
+boundaries follow the VR4300 User's Manual chapters 3 and 6 already cited
+above; no runtime implementation is an authority for them.
 
 The live block owner synchronizes Count/Compare with the executor at every
 checkpoint. Count retains its once-per-two-cycle phase across split advances;

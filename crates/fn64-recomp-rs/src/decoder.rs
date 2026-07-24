@@ -2253,6 +2253,29 @@ fn decode_cop1_d(w: u32) -> Instruction {
 }
 
 impl Instruction {
+    /// Whether executing this instruction requires kernel mode or Status.CU0.
+    /// Keeping the complete decoded COP0 family here prevents either
+    /// arbitrary-PC lane from accidentally admitting a new shape unguarded.
+    pub const fn requires_cop0(&self) -> bool {
+        use Instruction::*;
+        matches!(
+            self,
+            Mfc0 { .. }
+                | Dmfc0 { .. }
+                | Mtc0 { .. }
+                | Dmtc0 { .. }
+                | Bc0f { .. }
+                | Bc0t { .. }
+                | Bc0fl { .. }
+                | Bc0tl { .. }
+                | Eret
+                | Tlbwi
+                | Tlbwr
+                | Tlbp
+                | Tlbr
+        )
+    }
+
     /// Whether executing this instruction requires Status.CU1. Keeping this
     /// classification beside the decoder makes the block emitter's
     /// coprocessor guard exhaustive across arithmetic, moves, memory, compare,
