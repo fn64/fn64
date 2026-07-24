@@ -128,14 +128,48 @@ def brace_delta(line: str) -> int:
             continue
         if line[index : index + 2] == "//":
             break
-        if char in {'"', "'"}:
+        if char == '"':
             quoted = char
+        elif char == "'":
+            # Rust lifetimes and labels (`'a`, `'_`, `'outer:`) are not
+            # character literals. Treat an apostrophe as quoted syntax only
+            # when the complete one-scalar/escaped character literal is
+            # present on this line; otherwise braces later on the line must
+            # still participate in cfg-item depth tracking.
+            end = rust_char_literal_end(line, index)
+            if end is not None:
+                index = end + 1
+                continue
         elif char == "{":
             delta += 1
         elif char == "}":
             delta -= 1
         index += 1
     return delta
+
+
+def rust_char_literal_end(line: str, start: int) -> int | None:
+    """Return the closing quote for a Rust char literal, not a lifetime."""
+    index = start + 1
+    if index >= len(line):
+        return None
+    if line[index] != "\\":
+        closing = index + 1
+        return closing if closing < len(line) and line[closing] == "'" else None
+
+    index += 1
+    if index >= len(line):
+        return None
+    if line[index] == "u" and index + 1 < len(line) and line[index + 1] == "{":
+        closing_brace = line.find("}", index + 2)
+        if closing_brace < 0:
+            return None
+        closing = closing_brace + 1
+    elif line[index] == "x":
+        closing = index + 3
+    else:
+        closing = index + 1
+    return closing if closing < len(line) and line[closing] == "'" else None
 
 
 def production_lines(text: str) -> list[tuple[int, str]]:
@@ -384,6 +418,18 @@ fn fixture() {
 fn production() {}'''
     )
     assert unrecorded_outcomes(tests_only) == []
+    tests_with_lifetimes = production_lines(
+        '''#[cfg(test)]
+mod tests {
+    fn helper(value: &mut Result<&'_ str, &'static str>) {
+        let brace = '{';
+        panic!("unsupported lifetime fixture: {value:?} {brace}");
+    }
+}
+fn production() {}'''
+    )
+    assert unrecorded_outcomes(tests_with_lifetimes) == []
+    assert tests_with_lifetimes == [(8, "fn production() {}")]
     assert dynamic_operation_prefix("abi.si.voice-command-{command:02x}") == (
         "abi.si.voice-command-"
     )
