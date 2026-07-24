@@ -43,6 +43,14 @@ pub const DPC_STATUS_DMA_BUSY: u32 = 1 << 8;
 pub const DPC_STATUS_END_VALID: u32 = 1 << 9;
 pub const DPC_STATUS_START_VALID: u32 = 1 << 10;
 
+// DPC STATUS counter-clear commands (bits 6..9 of a STATUS write). Each clears
+// exactly one of the four performance counters without touching STATUS mode
+// bits or the other counters.
+pub const DPC_STATUS_CLEAR_TMEM_COUNTER_COMMAND: u32 = 1 << 6;
+pub const DPC_STATUS_CLEAR_PIPE_COUNTER_COMMAND: u32 = 1 << 7;
+pub const DPC_STATUS_CLEAR_CMD_COUNTER_COMMAND: u32 = 1 << 8;
+pub const DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND: u32 = 1 << 9;
+
 const AI_DRAM_ADDR_MASK: u32 = 0x00ff_fff8;
 const AI_LEN_MASK: u32 = 0x0003_fff8;
 const AI_DRAM_DOMAIN_END: u32 = 0x0100_0000;
@@ -135,6 +143,16 @@ fn apply_device_clear_set_pair(
     if command & (1 << set_command_bit) != 0 {
         *state |= state_mask;
     }
+}
+
+/// Apply the three DPC STATUS mode clear/set command pairs (xbus, freeze,
+/// flush) to a status word. Shared between the live STATUS write and the
+/// pending-submission rollback mirror so an interleaved mode command survives
+/// renderer cancellation.
+fn apply_dpc_status_mode_commands(status: &mut u32, command: u32) {
+    apply_device_clear_set_pair(status, command, 0, 1, DPC_STATUS_XBUS_DMEM_DMA);
+    apply_device_clear_set_pair(status, command, 2, 3, DPC_STATUS_FREEZE);
+    apply_device_clear_set_pair(status, command, 4, 5, DPC_STATUS_FLUSH);
 }
 
 /// Guest device time. Host wall-clock units cannot be converted implicitly.
@@ -663,8 +681,8 @@ struct PendingAi {
 }
 
 /// Public DPC performance counters expose a 24-bit modulo domain. The current
-/// model imports counter values but does not fabricate increments or model
-/// STATUS counter-clear commands.
+/// model imports counter values and honors the STATUS counter-clear commands,
+/// but does not fabricate increments.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct DpcCounter24(u32);
 
@@ -1396,7 +1414,15 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 received_token: token,
             });
         }
-        self.dpc = pending.rollback;
+        // Reverse only the admission-owned registers. The four performance
+        // counters and any counter-clear issued during admission are NOT rolled
+        // back: a wholesale `self.dpc = pending.rollback` would resurrect a
+        // cleared counter, and mode-command interleaving is preserved by the
+        // rollback.status mirror maintained in the STATUS write handler.
+        self.dpc.start = pending.rollback.start;
+        self.dpc.end = pending.rollback.end;
+        self.dpc.current = pending.rollback.current;
+        self.dpc.status = pending.rollback.status;
         self.pending_dpc = None;
         Ok(())
     }
@@ -2323,15 +2349,26 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 return Err(DeviceFault::UnmodeledMmioWrite { addr, value });
             }
             DPC_STATUS_REG => {
-                apply_device_clear_set_pair(
-                    &mut self.dpc.status,
-                    value,
-                    0,
-                    1,
-                    DPC_STATUS_XBUS_DMEM_DMA,
-                );
-                apply_device_clear_set_pair(&mut self.dpc.status, value, 2, 3, DPC_STATUS_FREEZE);
-                apply_device_clear_set_pair(&mut self.dpc.status, value, 4, 5, DPC_STATUS_FLUSH);
+                apply_dpc_status_mode_commands(&mut self.dpc.status, value);
+                // Interleaving closed: END admission captured a status rollback,
+                // then the CPU issues a mode command before the renderer cancels.
+                // Mirror the command into the rollback so cancellation reverses
+                // only the admission and does not discard this later command.
+                if let Some(pending) = self.pending_dpc.as_mut() {
+                    apply_dpc_status_mode_commands(&mut pending.rollback.status, value);
+                }
+                if value & DPC_STATUS_CLEAR_TMEM_COUNTER_COMMAND != 0 {
+                    self.dpc.tmem_busy = DpcCounter24::ZERO;
+                }
+                if value & DPC_STATUS_CLEAR_PIPE_COUNTER_COMMAND != 0 {
+                    self.dpc.pipe_busy = DpcCounter24::ZERO;
+                }
+                if value & DPC_STATUS_CLEAR_CMD_COUNTER_COMMAND != 0 {
+                    self.dpc.busy = DpcCounter24::ZERO;
+                }
+                if value & DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND != 0 {
+                    self.dpc.clock = DpcCounter24::ZERO;
+                }
                 return Ok(DeviceMmioWriteEffect::None);
             }
             _ => {}
@@ -4497,5 +4534,125 @@ mod tests {
         let new_deadline = fabric.next_deadline().unwrap();
         assert!(new_deadline < old_deadline);
         assert_eq!(new_deadline, Cycles::new(1));
+    }
+
+    // Seed the four DPC counters to distinct nonzero values (1,2,3,4) with the
+    // renderer idle so counter-clear behavior can be observed in isolation.
+    fn seed_dpc_counters(fabric: &mut DeviceFabric<InMemoryRom, TestTiming>) {
+        fabric
+            .commit_complete_rsp_execution_state(RspExecutionState {
+                dpc_start: 0,
+                dpc_end: 0,
+                dpc_current: 0,
+                dpc_status: 0,
+                dpc_clock: 1,
+                dpc_busy: 2,
+                dpc_pipe_busy: 3,
+                dpc_tmem_busy: 4,
+                ..complete_rsp_state()
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn dpc_status_counter_clear_commands_are_selective() {
+        let cases = [
+            (DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND, (0, 2, 3, 4)),
+            (DPC_STATUS_CLEAR_CMD_COUNTER_COMMAND, (1, 0, 3, 4)),
+            (DPC_STATUS_CLEAR_PIPE_COUNTER_COMMAND, (1, 2, 0, 4)),
+            (DPC_STATUS_CLEAR_TMEM_COUNTER_COMMAND, (1, 2, 3, 0)),
+        ];
+        for (command, (clock, busy, pipe, tmem)) in cases {
+            let mut fabric = fabric();
+            seed_dpc_counters(&mut fabric);
+            let status_before = fabric.read_mmio(DPC_STATUS_REG).unwrap();
+            fabric.write_mmio(DPC_STATUS_REG, command).unwrap();
+            let s = fabric.snapshot();
+            assert_eq!(
+                (s.dpc_clock, s.dpc_busy, s.dpc_pipe_busy, s.dpc_tmem_busy),
+                (clock, busy, pipe, tmem),
+                "command {command:#06x} cleared the wrong counter(s)"
+            );
+            assert_eq!(
+                fabric.read_mmio(DPC_STATUS_REG).unwrap(),
+                status_before,
+                "a counter-clear command must not perturb STATUS mode bits"
+            );
+        }
+    }
+
+    #[test]
+    fn dpc_counter_clears_during_renderer_admission_survive_cancellation() {
+        let mut fabric = fabric();
+        seed_dpc_counters(&mut fabric);
+        let before = fabric.snapshot();
+
+        let submission = fabric
+            .request_dpc_submission(DpcSubmissionSource::Rdram, 0x100, 0x180)
+            .unwrap();
+        // Clear all four counters while the renderer submission is pending.
+        let clear_all = DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND
+            | DPC_STATUS_CLEAR_CMD_COUNTER_COMMAND
+            | DPC_STATUS_CLEAR_PIPE_COUNTER_COMMAND
+            | DPC_STATUS_CLEAR_TMEM_COUNTER_COMMAND;
+        fabric.write_mmio(DPC_STATUS_REG, clear_all).unwrap();
+        fabric.cancel_dpc_submission(submission.token).unwrap();
+
+        let after = fabric.snapshot();
+        // Admission is reversed...
+        assert_eq!(after.dpc_start, before.dpc_start);
+        assert_eq!(after.dpc_end, before.dpc_end);
+        assert_eq!(after.dpc_current, before.dpc_current);
+        assert_eq!(after.dpc_status, before.dpc_status);
+        // ...but the cleared counters are NOT resurrected by the rollback.
+        assert_eq!(
+            (
+                after.dpc_clock,
+                after.dpc_busy,
+                after.dpc_pipe_busy,
+                after.dpc_tmem_busy
+            ),
+            (0, 0, 0, 0),
+            "cancellation must not resurrect counters cleared during admission"
+        );
+    }
+
+    #[test]
+    fn dpc_status_mode_commands_during_renderer_admission_survive_cancellation() {
+        // (initial command, interleaved command, control mask, expected control after)
+        let cases = [
+            (0x01, 0x02, DPC_STATUS_XBUS_DMEM_DMA, DPC_STATUS_XBUS_DMEM_DMA),
+            (0x02, 0x01, DPC_STATUS_XBUS_DMEM_DMA, 0),
+            (0x04, 0x08, DPC_STATUS_FREEZE, DPC_STATUS_FREEZE),
+            (0x08, 0x04, DPC_STATUS_FREEZE, 0),
+            (0x10, 0x20, DPC_STATUS_FLUSH, DPC_STATUS_FLUSH),
+            (0x20, 0x10, DPC_STATUS_FLUSH, 0),
+        ];
+        for (initial, interleaved, control_mask, expected_control) in cases {
+            let mut fabric = fabric();
+            fabric.write_mmio(DPC_STATUS_REG, initial).unwrap();
+            let before = fabric.snapshot();
+
+            let submission = fabric
+                .request_dpc_submission(DpcSubmissionSource::Dmem, 0x100, 0x180)
+                .unwrap();
+            fabric.write_mmio(DPC_STATUS_REG, interleaved).unwrap();
+            fabric.cancel_dpc_submission(submission.token).unwrap();
+
+            let after = fabric.snapshot();
+            assert_eq!(after.dpc_start, before.dpc_start);
+            assert_eq!(after.dpc_end, before.dpc_end);
+            assert_eq!(after.dpc_current, before.dpc_current);
+            assert_eq!(
+                after.dpc_status & control_mask,
+                expected_control,
+                "interleaved mode command {interleaved:#04x} did not survive cancellation"
+            );
+            assert_eq!(
+                after.dpc_status & !control_mask,
+                before.dpc_status & !control_mask,
+                "cancellation moved a status bit outside the interleaved command's mask"
+            );
+        }
     }
 }

@@ -654,8 +654,20 @@ fn live_device_mmio_addr(vaddr: u64, write: bool) -> Option<MmioAddr> {
         );
     let is_mi_read = !write && matches!(addr, 0xA430_0008 | 0xA430_000C);
     let is_mi_write = write && addr == 0xA430_000C;
-    let is_dpc_read =
-        !write && matches!(addr, 0xA410_0000 | 0xA410_0004 | 0xA410_0008 | 0xA410_000C);
+    let is_dpc_read = !write
+        && matches!(
+            addr,
+            0xA410_0000
+                | 0xA410_0004
+                | 0xA410_0008
+                | 0xA410_000C
+                // Performance counters (clock/cmd/pipe/tmem) -- readable so the
+                // STATUS counter-clear commands are observable over raw MMIO.
+                | 0xA410_0010
+                | 0xA410_0014
+                | 0xA410_0018
+                | 0xA410_001C
+        );
     let is_dpc_write = write && matches!(addr, 0xA410_0000 | 0xA410_0004 | 0xA410_000C);
     let is_vi = (0xA440_0000..=0xA440_0034).contains(&addr);
     let is_ai = matches!(
