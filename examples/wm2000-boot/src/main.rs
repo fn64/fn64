@@ -64,7 +64,7 @@ fn linked_native_program_identity() -> fn64_boot_harness::NativeProgramArtifactI
 fn require_diagnostic_voice_map_reproduction(release_mode: bool, chan_ptr: u32, steps: u64) {
     assert!(
         !release_mode,
-        "wm2000-boot: intervention-free release run reached fresh sound-channel array \
+        "wm2000-boot: voice-map-intervention-free release run reached fresh sound-channel array \
          {chan_ptr:#010x} at step {steps}; the diagnostic voice-map virgin-memory reproduction \
          would be required here, so no release report may be written"
     );
@@ -166,7 +166,7 @@ fn main() {
         gate.arm_with_unsupported_journal(&journal_path, &environment.run_event_sha256)
             .unwrap_or_else(|error| panic!("wm2000-boot: arm live release gate: {error}"));
         println!(
-            "[wm2000-boot] intervention-free live release gate armed at guest cycle {}; \
+            "[wm2000-boot] voice-map-intervention-free live release gate armed at guest cycle {}; \
              report={}; unsupported_journal={}",
             environment.guest_cycle,
             environment.report_path.display(),
@@ -570,7 +570,7 @@ fn main() {
                     let report =
                         capture_release_report(gate, boundary, &report_path, rom_class, &rom_bytes);
                     println!(
-                        "[wm2000-boot] RELEASE GATE CLOSED without harness intervention at \
+                        "[wm2000-boot] RELEASE GATE CLOSED without voice-map intervention at \
                          post-advance cycle {tick}: report_sha={} artifact_root={} report={}",
                         report.report_sha256,
                         report.digest.root_sha256,
@@ -782,7 +782,7 @@ fn main() {
     }
     if let Some((gate, report_path, _)) = release_gate.as_ref() {
         panic!(
-            "wm2000-boot: stopped before intervention-free live release gate cycle {}; current \
+            "wm2000-boot: stopped before voice-map-intervention-free live release gate cycle {}; current \
              cycle={}, report was not written to {}",
             gate.guest_cycle(),
             fn64_abi::sim_time(),
@@ -874,14 +874,14 @@ fn capture_release_report(
     .unwrap_or_else(|error| panic!("wm2000-boot: validate RT64 fixed-cycle presentation: {error}"));
     gate.capture_and_write_render_rom_evidence(
         boundary,
-        "wm2000-ntsc-headless-c-rt64-lle-accuracy-intervention-free",
+        "wm2000-ntsc-headless-c-rt64-lle-accuracy-voice-map-intervention-free",
         fn64_boot_harness::ReleaseRomInput::new(rom_class, rom_bytes),
         &render,
         report_path,
     )
     .unwrap_or_else(|error| {
         panic!(
-            "wm2000-boot: intervention-free live release gate failed at post-advance cycle \
+            "wm2000-boot: voice-map-intervention-free live release gate failed at post-advance cycle \
              {observed_cycle}; report path {}: {error}",
             report_path.display()
         )

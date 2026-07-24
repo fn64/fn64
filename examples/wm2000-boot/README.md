@@ -94,7 +94,7 @@ proves which native pixels were produced and whether a bounded run repeats;
 it does not by itself prove hardware pixel correctness or zero unsupported
 behavior.
 
-## Intervention-free schema-v28 release path
+## Voice-map-intervention-free schema-v28 release path
 
 The generic runner-owned release tuple enables the fail-closed RT64/LLE path:
 
@@ -126,8 +126,8 @@ source identity, and requires LLE graphics execution. Most importantly, it
 never writes the diagnostic voice-map zeros. If a fresh channel allocation
 reaches the point where that reproduction would have fired, the process traps
 before report creation and leaves the unsupported journal incomplete. An
-accepted closed report therefore certifies that this harness intervention did
-not occur in the measured execution. It still certifies deterministic executed
+accepted closed report therefore certifies that this voice-map intervention
+did not occur in the measured execution. It still certifies deterministic executed
 closure, not silicon pixel correctness; exact-ten fresh-process evidence and
 independent hardware pixel validation remain separate requirements.
 
