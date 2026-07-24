@@ -190,20 +190,24 @@ pub fn emit_block_pack_v1(
         }
         let mut blocks = Vec::with_capacity(geometry.len());
         for (block, geom) in proven.iter().zip(&geometry) {
-            if block.rom_space != crate::facts::RomAddressSpace::Physical {
-                return Err(BlockPackError::NonPhysicalBacking {
-                    bank: bank.clone(),
-                    start_va: block.start_va,
-                });
-            }
-            let bytes = rom
-                .bytes
-                .get(geom.rom_start as usize..geom.rom_end as usize)
-                .ok_or(BlockPackError::RomRangeOutsideImage {
-                    bank: bank.clone(),
-                    rom_start: geom.rom_start,
-                    rom_end: geom.rom_end,
-                })?;
+            // Resolve the block's backing bytes in its own address space: a
+            // physically-resident block slices the image, a VROM (DMA-loaded)
+            // block resolves through its one proven file-table record. The
+            // digest below is over the resolved bytes either way, so a pack
+            // stays byte-bound regardless of how the bank reaches RDRAM.
+            let resolved = crate::banks::materialize_rom_range(
+                rom,
+                &snapshot.facts,
+                block.rom_space,
+                geom.rom_start,
+                geom.rom_end,
+            )
+            .map_err(|_| BlockPackError::RomRangeOutsideImage {
+                bank: bank.clone(),
+                rom_start: geom.rom_start,
+                rom_end: geom.rom_end,
+            })?;
+            let bytes = resolved.bytes.as_slice();
             blocks.push(PackedBlockV1 {
                 start_va: geom.start_va,
                 end_va: geom.end_va,
