@@ -128,14 +128,48 @@ def brace_delta(line: str) -> int:
             continue
         if line[index : index + 2] == "//":
             break
-        if char in {'"', "'"}:
+        if char == '"':
             quoted = char
+        elif char == "'":
+            # Rust lifetimes and labels (`'a`, `'_`, `'outer:`) are not
+            # character literals. Treat an apostrophe as quoted syntax only
+            # when the complete one-scalar/escaped character literal is
+            # present on this line; otherwise braces later on the line must
+            # still participate in cfg-item depth tracking.
+            end = rust_char_literal_end(line, index)
+            if end is not None:
+                index = end + 1
+                continue
         elif char == "{":
             delta += 1
         elif char == "}":
             delta -= 1
         index += 1
     return delta
+
+
+def rust_char_literal_end(line: str, start: int) -> int | None:
+    """Return the closing quote for a Rust char literal, not a lifetime."""
+    index = start + 1
+    if index >= len(line):
+        return None
+    if line[index] != "\\":
+        closing = index + 1
+        return closing if closing < len(line) and line[closing] == "'" else None
+
+    index += 1
+    if index >= len(line):
+        return None
+    if line[index] == "u" and index + 1 < len(line) and line[index + 1] == "{":
+        closing_brace = line.find("}", index + 2)
+        if closing_brace < 0:
+            return None
+        closing = closing_brace + 1
+    elif line[index] == "x":
+        closing = index + 3
+    else:
+        closing = index + 1
+    return closing if closing < len(line) and line[closing] == "'" else None
 
 
 def production_lines(text: str) -> list[tuple[int, str]]:
@@ -210,8 +244,13 @@ def macro_invocations(lines: list[tuple[int, str]]) -> list[tuple[int, int, str,
                 block_comment_depth = 1
                 index += 2
                 continue
-            if char in {'"', "'"}:
+            if char == '"':
                 quoted = char
+            elif char == "'":
+                end = rust_char_literal_end(text, index)
+                if end is not None:
+                    index = end + 1
+                    continue
             elif char == "(":
                 depth += 1
             elif char == ")":
@@ -280,8 +319,12 @@ def err_form_is_match_pattern(text: str, start: int) -> bool:
                 escaped = True
             elif char == quoted:
                 quoted = None
-        elif char in {'"', "'"}:
+        elif char == '"':
             quoted = char
+        elif char == "'":
+            end = rust_char_literal_end(text, index)
+            if end is not None:
+                index = end
         elif char == "(":
             depth += 1
         elif char == ")":
@@ -384,6 +427,47 @@ fn fixture() {
 fn production() {}'''
     )
     assert unrecorded_outcomes(tests_only) == []
+    tests_with_lifetimes = production_lines(
+        '''#[cfg(test)]
+mod tests {
+    fn helper(value: &mut Result<&'_ str, &'static str>) {
+        let brace = '{';
+        panic!("unsupported lifetime fixture: {value:?} {brace}");
+    }
+}
+fn production() {}'''
+    )
+    assert unrecorded_outcomes(tests_with_lifetimes) == []
+    assert tests_with_lifetimes == [(8, "fn production() {}")]
+    production_lifetime_macro = production_lines(
+        '''fn reject<'a>(value: &'a str) {
+    panic!("unsupported behavior: {}", helper::<'a>(value));
+}'''
+    )
+    assert unrecorded_outcomes(production_lifetime_macro) == [(2, "panic")]
+    production_char_macro = production_lines(
+        '''fn reject(value: char) {
+    panic!("unsupported character: {}", matches!(value, '('));
+}'''
+    )
+    assert unrecorded_outcomes(production_char_macro) == [(2, "panic")]
+    for literal in ["'('", "')'", r"'\''", r"'\\'", r"'\x28'", r"'\u{28}'"]:
+        char_macro = production_lines(
+            f'''fn reject() {{
+    panic!("unsupported character: {{}}", {literal});
+}}'''
+        )
+        assert unrecorded_outcomes(char_macro) == [(2, "panic")], literal
+    typed_lifetime_construction = production_lines(
+        '''fn reject<'a>(value: &'a str) -> Result<(), RenderError> {
+    Err(RenderError::UnsupportedUcode(helper::<'a>(value, ')')))
+}'''
+    )
+    assert unrecorded_typed_unsupported_errors(typed_lifetime_construction) == [
+        (2, "RenderError::UnsupportedUcode")
+    ]
+    typed_lifetime_pattern = "Err(RenderError::UnsupportedUcode(helper::<'a>(')'))) =>"
+    assert err_form_is_match_pattern(typed_lifetime_pattern, 0)
     assert dynamic_operation_prefix("abi.si.voice-command-{command:02x}") == (
         "abi.si.voice-command-"
     )

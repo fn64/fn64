@@ -34,8 +34,8 @@ pub fn set_rdram_len(len: usize) {
 
 /// Run the recompiled AKI audio ucode against one live `OSTask`.
 ///
-/// Signature matches `fn64_abi::AudioUcodeFn` so the harness/shell can register
-/// it via `set_audio_ucode_fn`.
+/// Signature matches `fn64_abi::AudioUcodeFn` for optional translated-policy
+/// experiments. Release/parity harnesses use live-IMEM LLE authority.
 ///
 /// # Safety
 ///

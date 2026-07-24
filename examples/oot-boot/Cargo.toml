@@ -17,8 +17,6 @@ publish = false
 description = "Headless boot harness for The Legend of Zelda: Ocarina of Time (OOTU, NTSC 1.0) on fn64 -- decomp-driven-first recompilation lane. Contains zero game content -- see build.rs's module doc for the RECOMPILED_DIR/RECOMP_H_DIR/ROM env-var contract."
 
 [features]
-default = ["oot-audio"]
-oot-audio = ["dep:oot-audio-ucode"]
 rt64 = ["fn64-render-rt64/rt64"]
 
 [[bin]]
@@ -43,8 +41,3 @@ fn64-render = { path = "../../crates/fn64-render" }
 fn64-render-reference = { path = "../../crates/fn64-render-reference" }
 fn64-render-rt64 = { path = "../../crates/fn64-render-rt64" }
 fn64-audio = { path = "../../crates/fn64-audio" }
-# The recompiled OoT aspMain audio ucode (typed Rust from fn64-audio's
-# clean-room RSP recompiler), kept out of the fn64 tree next to OOTU's other
-# game-derived material. Registered via fn64_abi::set_audio_ucode_fn so
-# M_AUDTASK dispatch really runs it.
-oot-audio-ucode = { path = "audio-ucode", optional = true }

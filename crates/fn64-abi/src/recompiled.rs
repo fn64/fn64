@@ -12,7 +12,7 @@ use fn64_recomp_rs::{
     CallResolution, CodeBank, CpuFault, CpuInterruptLine, ExecutableRegion,
     ExecutionDestinationObservation, ExecutionKey, FunctionEntryObservationSchema,
     GeneratedBankRunner, GenerationError, GuestPc, GuestWriteBoundary, GuestWriteEvent,
-    InstructionBudget, ProgramArtifactIdentity, ProgramIdentityEvidenceSnapshot,
+    InstructionBudget, PhysicalFgrState, ProgramArtifactIdentity, ProgramIdentityEvidenceSnapshot,
     ProgramIdentitySource, Rdram, RecompContext as RsContext, RecompFunc, TransferResolver,
     TranslatedFunctionIdentity,
 };
@@ -22,7 +22,9 @@ use super::{with_active_yielder, with_executor, with_host, RecompContext as CCon
 
 type Lookup = fn(u32) -> RecompFunc;
 type CShim = unsafe extern "C" fn(*mut u8, *mut CContext);
+const STATUS_FR: u32 = 1 << 26;
 const THREAD_RETURN_SENTINEL: u32 = 0xFFFF_FFFC;
+const INITIAL_FPCSR: u32 = crate::system::FPCSR_FS | crate::system::FPCSR_EV;
 pub type ProgramEntryLookup = fn(GuestPc) -> Result<ExecutionKey, CpuFault>;
 pub type ProgramTransferLookup = fn(BankId, GuestPc) -> Result<ExecutionKey, CpuFault>;
 pub type LiveGenerationBuilder = fn(&[u8], u64) -> Result<(CodeBank, GeneratedBankRunner), String>;
@@ -655,6 +657,102 @@ pub(crate) fn process_live_executable_writes_from_host() {
     fn64_recomp_rs::discard_executable_write_boundary();
 }
 
+/// Test-only ownership token for replacing executable-write preflight inputs.
+///
+/// The token is thread-bound because the guarded state lives in thread-local
+/// storage. Nested scopes are supported and restore the immediately preceding
+/// state, including while unwinding from an expected loud trap.
+#[cfg(all(test, feature = "recomp-rs"))]
+#[must_use = "dropping the guard restores the prior executable-write preflight state"]
+pub(crate) struct TestExecutableWritePreflightState {
+    prior_ranges: Vec<(u32, u32)>,
+    prior_pending: Vec<(u32, u32)>,
+    _thread_bound: std::marker::PhantomData<Rc<()>>,
+}
+
+#[cfg(all(test, feature = "recomp-rs"))]
+impl Drop for TestExecutableWritePreflightState {
+    fn drop(&mut self) {
+        EXECUTABLE_WRITE_RANGES.with(|ranges| {
+            PENDING_EXECUTABLE_WRITES.with(|pending| {
+                let mut ranges = ranges.borrow_mut();
+                let mut pending = pending.borrow_mut();
+                *ranges = std::mem::take(&mut self.prior_ranges);
+                *pending = std::mem::take(&mut self.prior_pending);
+            });
+        });
+    }
+}
+
+#[cfg(all(test, feature = "recomp-rs"))]
+pub(crate) fn scoped_test_executable_write_preflight_state(
+    ranges: Vec<(u32, u32)>,
+    pending: Vec<(u32, u32)>,
+) -> TestExecutableWritePreflightState {
+    let (prior_ranges, prior_pending) = EXECUTABLE_WRITE_RANGES.with(|current_ranges| {
+        PENDING_EXECUTABLE_WRITES.with(|current_pending| {
+            let mut current_ranges = current_ranges.borrow_mut();
+            let mut current_pending = current_pending.borrow_mut();
+            (
+                std::mem::replace(&mut *current_ranges, ranges),
+                std::mem::replace(&mut *current_pending, pending),
+            )
+        })
+    });
+    TestExecutableWritePreflightState {
+        prior_ranges,
+        prior_pending,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+/// Reject a planned host publication that would require fallible executable
+/// generation after the guest bytes become visible.
+///
+/// The verified-audio adapter has no transaction spanning RDRAM, device state,
+/// and native-code installation. This read-only check lets ordinary audio-data
+/// writes proceed while forcing executable writes to remain on the interpreter
+/// path until such a transaction exists.
+#[cfg(test)]
+pub(crate) fn preflight_non_executable_host_writes(
+    writes: &[(usize, usize)],
+) -> Result<(), String> {
+    EXECUTABLE_WRITE_RANGES.with(|ranges| {
+        let ranges = ranges.borrow();
+        let pending = PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow().clone());
+        for (start, len) in pending {
+            let end = start.saturating_add(len);
+            if let Some(&(executable_start, executable_end)) = ranges
+                .iter()
+                .find(|&&(executable_start, executable_end)| {
+                    start < executable_end && end > executable_start
+                })
+            {
+                return Err(format!(
+                    "pending host write [{start:#010x}, {end:#010x}) overlaps live executable region [{executable_start:#010x}, {executable_end:#010x}); transactional executable publication is unavailable"
+                ));
+            }
+        }
+        for &(start, end) in writes {
+            let start = u32::try_from(start)
+                .map_err(|_| format!("host write start {start:#x} exceeds physical address space"))?;
+            let end = u32::try_from(end)
+                .map_err(|_| format!("host write end {end:#x} exceeds physical address space"))?;
+            if let Some(&(executable_start, executable_end)) = ranges
+                .iter()
+                .find(|&&(executable_start, executable_end)| {
+                    start < executable_end && end > executable_start
+                })
+            {
+                return Err(format!(
+                    "verified audio write [{start:#010x}, {end:#010x}) overlaps live executable region [{executable_start:#010x}, {executable_end:#010x}); transactional executable publication is unavailable"
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
 fn pause_active_recompiled_thread() {
     super::suspend_active_coroutine(fn64_runtime::Yield::PauseSelf);
 }
@@ -1149,7 +1247,7 @@ pub(super) unsafe fn run_registered_entry(
         // SAFETY: inherited from the caller's shared-allocation contract.
         let bytes = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
         let mut mem = Rdram::new(bytes);
-        let mut ctx = RsContext::new();
+        let mut ctx = new_osthread_context();
         ctx.set_r(4, arg);
         ctx.set_r(29, sp);
         ctx.set_r32(31, THREAD_RETURN_SENTINEL as i32);
@@ -1164,11 +1262,46 @@ pub(super) unsafe fn run_registered_entry(
     // SAFETY: inherited from the caller's shared-allocation contract.
     let bytes = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
     let mut mem = Rdram::new(bytes);
-    let mut ctx = RsContext::new();
+    let mut ctx = new_osthread_context();
     ctx.set_r(4, arg);
     ctx.set_r(29, sp);
     lookup(entry_vram)(&mut ctx, &mut mem);
     true
+}
+
+fn c_fpr_image_from_physical(state: PhysicalFgrState, fr: bool) -> [u64; 32] {
+    let physical = state.into_words();
+    if fr {
+        return physical;
+    }
+
+    // Valid generated FR=0 operations consume each even slot as one active
+    // paired FPR. Direct odd double/64-bit operations are invalid and remain
+    // loud, so the unreachable odd slots can carry both corresponding latent
+    // upper words, making this a reversible 2048-bit permutation.
+    let mut packed = [0u64; 32];
+    for pair in 0..16 {
+        let even = pair * 2;
+        let odd = even + 1;
+        packed[even] = u64::from(physical[even] as u32) | (u64::from(physical[odd] as u32) << 32);
+        packed[odd] = (physical[even] >> 32) | (physical[odd] & 0xFFFF_FFFF_0000_0000);
+    }
+    packed
+}
+
+fn physical_from_c_fpr_image(packed: [u64; 32], fr: bool) -> PhysicalFgrState {
+    if fr {
+        return PhysicalFgrState::from_words(packed);
+    }
+
+    let mut physical = [0u64; 32];
+    for pair in 0..16 {
+        let even = pair * 2;
+        let odd = even + 1;
+        physical[even] = u64::from(packed[even] as u32) | ((packed[odd] as u32 as u64) << 32);
+        physical[odd] = (packed[even] >> 32) | (packed[odd] & 0xFFFF_FFFF_0000_0000);
+    }
+    PhysicalFgrState::from_words(physical)
 }
 
 fn c_from_recompiled(ctx: &RsContext) -> CContext {
@@ -1209,10 +1342,17 @@ fn c_from_recompiled(ctx: &RsContext) -> CContext {
     c.hi = ctx.hi;
     c.lo = ctx.lo;
     c.status_reg = ctx.cop0_status;
+    c.mips3_float_mode = u8::from(ctx.cop0_status & STATUS_FR != 0);
+    c.set_fpr_u64_bits(c_fpr_image_from_physical(
+        ctx.physical_fgr_state(),
+        c.mips3_float_mode == 1,
+    ));
+    c.assert_float_mode_matches_status();
     c
 }
 
 fn copy_c_back(c: &CContext, ctx: &mut RsContext) {
+    c.assert_float_mode_matches_status();
     ctx.set_gprs([
         c.r0, c.r1, c.r2, c.r3, c.r4, c.r5, c.r6, c.r7, c.r8, c.r9, c.r10, c.r11, c.r12, c.r13,
         c.r14, c.r15, c.r16, c.r17, c.r18, c.r19, c.r20, c.r21, c.r22, c.r23, c.r24, c.r25, c.r26,
@@ -1220,40 +1360,171 @@ fn copy_c_back(c: &CContext, ctx: &mut RsContext) {
     ]);
     ctx.hi = c.hi;
     ctx.lo = c.lo;
+    ctx.replace_physical_fgr_state(physical_from_c_fpr_image(
+        c.fpr_u64_bits(),
+        c.mips3_float_mode == 1,
+    ));
     ctx.cop0_status = c.status_reg;
 }
 
+#[cfg(test)]
+fn is_test_c_shim(shim: CShim) -> bool {
+    [
+        tests::no_op_fpr_shim as CShim,
+        tests::write_f5_word_shim as CShim,
+        tests::change_fr_shim as CShim,
+    ]
+    .into_iter()
+    .any(|allowed| std::ptr::fn_addr_eq(allowed, shim))
+}
+
+fn is_admitted_fr_stable_c_shim(shim: CShim) -> bool {
+    is_generated_adapter_c_shim(shim)
+        || [
+            super::__osInitialize_common_recomp as CShim,
+            super::osInitialize_recomp as CShim,
+            super::__osInitialize_msp_recomp as CShim,
+            super::__osInitialize_kmc_recomp as CShim,
+            super::__osInitialize_isv_recomp as CShim,
+        ]
+        .into_iter()
+        .any(|allowed| std::ptr::fn_addr_eq(allowed, shim))
+        || cfg!(test) && {
+            #[cfg(test)]
+            {
+                is_test_c_shim(shim)
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        }
+}
+
 fn call_c(ctx: &mut RsContext, mem: &mut Rdram<'_>, name: &'static str, shim: CShim) {
+    // An exit snapshot cannot observe a shim which changes FR, accesses the
+    // other FPR view, then restores FR. Admit only the closed host-shim set
+    // whose implementations preserve FR for the entire call.
+    assert!(
+        is_admitted_fr_stable_c_shim(shim),
+        "C shim {name} is not in the FR-stable adapter registry"
+    );
     if std::env::var_os("FN64_RECOMP_RS_SHIM_TRACE").is_some() {
         eprintln!("[fn64-recomp-rs-shim] {name}");
     }
     let mut c = c_from_recompiled(ctx);
+    // `f_odd` aliases this stack-local context, so arm it only after the C
+    // image has reached its stable address.
+    c.arm_fpr_alias();
+    let entry_fr = c.mips3_float_mode;
     let rdram = mem.as_mut_slice().as_mut_ptr();
     // SAFETY: `rdram` comes from the live checked Rdram view and `c` is the
     // exact `#[repr(C)]` context the existing ABI shim requires. The shim may
     // suspend/resume this same coroutine, but neither pointer changes while
     // the adapter's stack frame remains live.
     unsafe { shim(rdram, &mut c) };
+    c.assert_float_mode_matches_status();
+    assert_eq!(
+        c.mips3_float_mode, entry_fr,
+        "C shim {name} changed Status.FR across the adapter; its packed FPR image and f_odd alias still describe the entry view"
+    );
     copy_c_back(&c, ctx);
 }
 
+/// Construct the architectural context installed by public `osCreateThread`.
+/// The libultra `osCreateThread` manual's DESCRIPTION section specifies that
+/// every new thread starts with denormal-result flushing and Invalid exceptions
+/// enabled. Keeping this in the context makes coroutine suspension itself the
+/// FCSR save/restore boundary.
+fn new_osthread_context() -> RsContext {
+    let mut ctx = RsContext::new();
+    ctx.write_fcr(31, INITIAL_FPCSR);
+    ctx
+}
+
+fn initialize_typed_fpcsr(
+    ctx: &mut RsContext,
+    mem: &mut Rdram<'_>,
+    name: &'static str,
+    shim: CShim,
+) {
+    call_c(ctx, mem, name, shim);
+    ctx.write_fcr(31, INITIAL_FPCSR);
+}
+
+pub fn os_initialize_common(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+    initialize_typed_fpcsr(
+        ctx,
+        mem,
+        "__osInitialize_common_recomp",
+        super::__osInitialize_common_recomp,
+    );
+}
+
+pub fn os_initialize(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+    initialize_typed_fpcsr(ctx, mem, "osInitialize_recomp", super::osInitialize_recomp);
+}
+
+pub fn os_initialize_msp(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+    initialize_typed_fpcsr(
+        ctx,
+        mem,
+        "__osInitialize_msp_recomp",
+        super::__osInitialize_msp_recomp,
+    );
+}
+
+pub fn os_initialize_kmc(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+    initialize_typed_fpcsr(
+        ctx,
+        mem,
+        "__osInitialize_kmc_recomp",
+        super::__osInitialize_kmc_recomp,
+    );
+}
+
+pub fn os_initialize_isv(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+    initialize_typed_fpcsr(
+        ctx,
+        mem,
+        "__osInitialize_isv_recomp",
+        super::__osInitialize_isv_recomp,
+    );
+}
+
+/// Typed `__osSetFpcCsr`: use the same per-OSThread FCSR authority as emitted
+/// CFC1/CTC1. A write which requests an exception stays loud because a host
+/// call cannot return the arbitrary-PC lane's typed guest transfer.
+pub fn os_set_fpc_csr(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
+    let previous = ctx.read_fcr(31);
+    ctx.write_fcr(31, ctx.r_u32(4));
+    ctx.set_r32(2, previous as i32);
+    if ctx.fcsr_exception_pending() {
+        fn64_recomp_rs::trap_unsupported(
+            "__osSetFpcCsr wrote an enabled FCSR cause through a host-call boundary",
+        );
+    }
+}
+
 macro_rules! c_adapters {
-    ($(($recompiled:ident, $shim:ident)),+ $(,)?) => {$ (
-        pub fn $recompiled(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
-            call_c(ctx, mem, stringify!($shim), super::$shim);
+    ($(($recompiled:ident, $shim:ident)),+ $(,)?) => {
+        fn is_generated_adapter_c_shim(shim: CShim) -> bool {
+            false $(|| std::ptr::fn_addr_eq(shim, super::$shim as CShim))+
         }
-    )+ };
+
+        $(
+            pub fn $recompiled(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+                call_c(ctx, mem, stringify!($shim), super::$shim);
+            }
+        )+
+    };
 }
 
 c_adapters!(
-    (os_initialize_common, __osInitialize_common_recomp),
     (is_prout_sync_printf, is_proutSyncPrintf_recomp),
     (check_hardware_msp, __checkHardware_msp_recomp),
     (check_hardware_kmc, __checkHardware_kmc_recomp),
     (check_hardware_isv, __checkHardware_isv_recomp),
-    (os_initialize_msp, __osInitialize_msp_recomp),
-    (os_initialize_kmc, __osInitialize_kmc_recomp),
-    (os_initialize_isv, __osInitialize_isv_recomp),
     (os_rdb_send, __osRdbSend_recomp),
     (os_create_thread, osCreateThread_recomp),
     (os_start_thread, osStartThread_recomp),
@@ -1302,7 +1573,6 @@ c_adapters!(
     (os_virtual_to_physical, osVirtualToPhysical_recomp),
     (os_create_pi_manager, osCreatePiManager_recomp),
     (os_si_raw_start_dma, __osSiRawStartDma_recomp),
-    (os_initialize, osInitialize_recomp),
     (os_ai_set_frequency, osAiSetFrequency_recomp),
     (os_ai_get_length, osAiGetLength_recomp),
     (os_ai_set_next_buffer, osAiSetNextBuffer_recomp),
@@ -1315,7 +1585,6 @@ c_adapters!(
     (os_get_thread_id, osGetThreadId_recomp),
     (os_get_time, osGetTime_recomp),
     (os_set_count, osSetCount_recomp),
-    (os_set_fpc_csr, __osSetFpcCsr_recomp),
     (os_sp_task_yielded, osSpTaskYielded_recomp),
     (os_create_vi_manager, osCreateViManager_recomp),
     (os_vi_set_event, osViSetEvent_recomp),
@@ -1417,6 +1686,9 @@ mod tests {
     use fn64_recomp_rs::{
         run_bank, BlockRun, CodeBank, CodeCatalog, CpuFaultKind, GeneratedBankRunner,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static TRANSIENT_FR_SHIM_ENTERED: AtomicBool = AtomicBool::new(false);
 
     const LIVE_BANK: BankId = BankId::new(0xA11CE);
     const LIVE_SECOND_BANK: BankId = BankId::new(0xA11CF);
@@ -1476,6 +1748,9 @@ mod tests {
         static REWRITE_B_ENTRIES: std::cell::RefCell<Vec<ExecutionKey>> = const {
             std::cell::RefCell::new(Vec::new())
         };
+        static BOOT_FPCSR_OBSERVATIONS: std::cell::RefCell<Vec<u32>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
     }
 
     fn evidence_callable(_ctx: &mut RsContext, _mem: &mut Rdram<'_>) {}
@@ -1488,6 +1763,12 @@ mod tests {
 
     fn alternate_evidence_lookup(_vram: u32) -> RecompFunc {
         alternate_evidence_callable
+    }
+
+    fn observe_thread0_fpcsr_boot(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+        BOOT_FPCSR_OBSERVATIONS.with(|observed| observed.borrow_mut().push(ctx.read_fcr(31)));
+        os_initialize(ctx, mem);
+        BOOT_FPCSR_OBSERVATIONS.with(|observed| observed.borrow_mut().push(ctx.read_fcr(31)));
     }
 
     fn unused_evidence_builder(
@@ -1830,6 +2111,55 @@ mod tests {
         let live = with_host(|host| host.recompiled_program.clone().unwrap());
         live.executable_regions.borrow_mut()[0].builder_artifact_identity = None;
         let _ = recompiled_program_evidence_snapshot();
+    }
+
+    #[test]
+    fn verified_host_write_preflight_rejects_only_executable_overlap() {
+        let _state = scoped_test_executable_write_preflight_state(vec![(0x100, 0x180)], Vec::new());
+
+        assert_eq!(
+            preflight_non_executable_host_writes(&[(0x80, 0x100)]),
+            Ok(())
+        );
+        let overlap = preflight_non_executable_host_writes(&[(0x17f, 0x181)]).unwrap_err();
+        assert!(overlap.contains("overlaps live executable region"));
+        assert!(overlap.contains("transactional executable publication is unavailable"));
+
+        PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().push((0x120, 4)));
+        let pending = preflight_non_executable_host_writes(&[]).unwrap_err();
+        assert!(pending.contains("pending host write"));
+    }
+
+    #[test]
+    fn executable_write_preflight_test_scope_restores_on_unwind() {
+        let _outer =
+            scoped_test_executable_write_preflight_state(vec![(0x20, 0x40)], vec![(0x24, 4)]);
+
+        let panic = std::panic::catch_unwind(|| {
+            let _inner = scoped_test_executable_write_preflight_state(
+                vec![(0x100, 0x180)],
+                vec![(0x120, 8)],
+            );
+            assert_eq!(
+                EXECUTABLE_WRITE_RANGES.with(|ranges| ranges.borrow().clone()),
+                vec![(0x100, 0x180)]
+            );
+            assert_eq!(
+                PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow().clone()),
+                vec![(0x120, 8)]
+            );
+            panic!("expected test-scope unwind");
+        });
+
+        assert!(panic.is_err());
+        assert_eq!(
+            EXECUTABLE_WRITE_RANGES.with(|ranges| ranges.borrow().clone()),
+            vec![(0x20, 0x40)]
+        );
+        assert_eq!(
+            PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow().clone()),
+            vec![(0x24, 4)]
+        );
     }
 
     #[test]
@@ -2252,6 +2582,234 @@ mod tests {
         assert_eq!(recompiled.r(31), 0xA000_0000_0000_001F);
     }
 
+    pub(super) unsafe extern "C" fn no_op_fpr_shim(_rdram: *mut u8, ctx: *mut CContext) {
+        // Safety: `call_c` supplies its live stack-local C context.
+        let ctx = unsafe { &mut *ctx };
+        ctx.assert_float_mode_matches_status();
+        let expected = if ctx.mips3_float_mode == 0 {
+            // Safety: taking a union field address does not read that field.
+            unsafe { &mut ctx.f0.u32_halves.1 as *mut u32 }
+        } else {
+            // Safety: taking a union field address does not read that field.
+            unsafe { &mut ctx.f1.u32_halves.0 as *mut u32 }
+        };
+        assert_eq!(ctx.f_odd, expected);
+    }
+
+    pub(super) unsafe extern "C" fn write_f5_word_shim(_rdram: *mut u8, ctx: *mut CContext) {
+        // Safety: `call_c` arms `f_odd` for this live context. N64Recomp's
+        // generated odd-register expression for f5 is `(5 - 1) * 2`.
+        unsafe { *(*ctx).f_odd.add(8) = 0xDEAD_BEEF };
+    }
+
+    pub(super) unsafe extern "C" fn change_fr_shim(_rdram: *mut u8, ctx: *mut CContext) {
+        // Safety: `call_c` supplies its live stack-local C context.
+        let ctx = unsafe { &mut *ctx };
+        ctx.status_reg ^= STATUS_FR;
+        ctx.mips3_float_mode ^= 1;
+        ctx.arm_fpr_alias();
+    }
+
+    unsafe extern "C" fn transient_fr_write_shim(_rdram: *mut u8, ctx: *mut CContext) {
+        TRANSIENT_FR_SHIM_ENTERED.store(true, Ordering::SeqCst);
+        // Safety: the regression deliberately models a raw ABI shim which
+        // changes to the other FPR view, accesses it, then restores the entry
+        // mode before returning.
+        let ctx = unsafe { &mut *ctx };
+        let entry_status = ctx.status_reg;
+        let entry_mode = ctx.mips3_float_mode;
+        ctx.status_reg ^= STATUS_FR;
+        ctx.mips3_float_mode ^= 1;
+        ctx.arm_fpr_alias();
+        // Safety: `arm_fpr_alias` made this pointer live for the transient
+        // view. The generated odd-register expression for f5 is `(5-1)*2`.
+        unsafe { *ctx.f_odd.add(8) = 0xA11C_E55E };
+        ctx.status_reg = entry_status;
+        ctx.mips3_float_mode = entry_mode;
+        ctx.arm_fpr_alias();
+    }
+
+    fn patterned_fgr_state(tag: u64) -> PhysicalFgrState {
+        PhysicalFgrState::from_words(std::array::from_fn(|idx| {
+            let high = (tag >> 32) as u32 ^ (0x0101_0000 + idx as u32);
+            let low = tag as u32 ^ (0x0000_0101 + idx as u32);
+            (u64::from(high) << 32) | u64::from(low)
+        }))
+    }
+
+    #[test]
+    fn c_adapter_layout_is_reversible_and_mode_exact() {
+        let physical = patterned_fgr_state(0xA5A5_5A5A_DEAD_BEEF);
+        let words = physical.into_words();
+        for fr in [false, true] {
+            let mut source = RsContext::new();
+            source.cop0_status = if fr { STATUS_FR } else { 0 };
+            source.replace_physical_fgr_state(physical);
+            let c = c_from_recompiled(&source);
+            c.assert_float_mode_matches_status();
+            let image = c.fpr_u64_bits();
+            if fr {
+                assert_eq!(image, words);
+            } else {
+                for pair in 0..16 {
+                    let even = pair * 2;
+                    let odd = even + 1;
+                    assert_eq!(
+                        image[even],
+                        u64::from(words[even] as u32) | (u64::from(words[odd] as u32) << 32)
+                    );
+                    assert_eq!(
+                        image[odd],
+                        (words[even] >> 32) | (words[odd] & 0xFFFF_FFFF_0000_0000)
+                    );
+                }
+            }
+
+            let mut restored = RsContext::new();
+            copy_c_back(&c, &mut restored);
+            assert_eq!(restored.physical_fgr_state(), physical);
+            assert_eq!(restored.cop0_status & STATUS_FR != 0, fr);
+        }
+    }
+
+    #[test]
+    fn c_adapter_noop_preserves_every_physical_fgr_in_both_fr_modes() {
+        for fr in [false, true] {
+            let expected = patterned_fgr_state(if fr {
+                0xA5A5_5A5A_DEAD_BEEF
+            } else {
+                0x1122_3344_5566_7788
+            });
+            let mut ctx = RsContext::new();
+            ctx.cop0_status = if fr { STATUS_FR } else { 0 };
+            ctx.replace_physical_fgr_state(expected);
+            let mut bytes = [];
+            let mut mem = Rdram::new(&mut bytes);
+
+            call_c(&mut ctx, &mut mem, "no_op_fpr_shim", no_op_fpr_shim);
+
+            assert_eq!(ctx.physical_fgr_state(), expected, "FR={fr}");
+            assert_eq!(ctx.cop0_status & STATUS_FR != 0, fr);
+        }
+    }
+
+    #[test]
+    fn c_adapter_f_odd_write_targets_physical_fgr5_in_both_modes() {
+        for fr in [false, true] {
+            let initial = patterned_fgr_state(0x1234_5678_9ABC_DEF0).into_words();
+            let mut ctx = RsContext::new();
+            ctx.cop0_status = if fr { STATUS_FR } else { 0 };
+            ctx.replace_physical_fgr_state(PhysicalFgrState::from_words(initial));
+            let mut bytes = [];
+            call_c(
+                &mut ctx,
+                &mut Rdram::new(&mut bytes),
+                "write_f5_word_shim",
+                write_f5_word_shim,
+            );
+            let mut expected = initial;
+            expected[5] = (expected[5] & 0xFFFF_FFFF_0000_0000) | 0xDEAD_BEEF;
+            assert_eq!(ctx.physical_fgr_state().into_words(), expected, "FR={fr}");
+        }
+    }
+
+    #[test]
+    fn c_adapter_rejects_an_fr_transition_before_decoding_entry_view_bytes() {
+        let expected = patterned_fgr_state(0x0BAD_F00D_CAFE_BABE);
+        let mut ctx = RsContext::new();
+        ctx.replace_physical_fgr_state(expected);
+        let mut bytes = [];
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            call_c(
+                &mut ctx,
+                &mut Rdram::new(&mut bytes),
+                "change_fr_shim",
+                change_fr_shim,
+            );
+        }));
+        assert!(rejected.is_err());
+        assert_eq!(ctx.cop0_status & STATUS_FR, 0);
+        assert_eq!(ctx.physical_fgr_state(), expected);
+    }
+
+    #[test]
+    fn c_adapter_rejects_a_transient_fr_transition_before_the_shim_runs() {
+        TRANSIENT_FR_SHIM_ENTERED.store(false, Ordering::SeqCst);
+        let expected = patterned_fgr_state(0x1357_9BDF_2468_ACE0);
+        let mut ctx = RsContext::new();
+        ctx.replace_physical_fgr_state(expected);
+        let mut bytes = [];
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            call_c(
+                &mut ctx,
+                &mut Rdram::new(&mut bytes),
+                "transient_fr_write_shim",
+                transient_fr_write_shim,
+            );
+        }));
+        let panic = rejected.expect_err("unadmitted transient-FR shim must be rejected");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("registry rejection must use a string panic payload");
+        assert!(
+            message.contains("is not in the FR-stable adapter registry"),
+            "unexpected rejection: {message}"
+        );
+        assert!(!TRANSIENT_FR_SHIM_ENTERED.load(Ordering::SeqCst));
+        assert_eq!(ctx.cop0_status & STATUS_FR, 0);
+        assert_eq!(ctx.physical_fgr_state(), expected);
+    }
+
+    #[test]
+    fn c_adapter_float_helpers_return_through_f0_in_both_fr_modes() {
+        let value = 0xFEDC_BA98_7654_3210u64;
+        for fr in [false, true] {
+            let initial = patterned_fgr_state(0xC001_D00D_A55A_5AA5).into_words();
+
+            let mut float_ctx = RsContext::new();
+            float_ctx.cop0_status = if fr { STATUS_FR } else { 0 };
+            float_ctx.replace_physical_fgr_state(PhysicalFgrState::from_words(initial));
+            float_ctx.set_r(4, value >> 32);
+            float_ctx.set_r(5, value as u32 as u64);
+            let mut float_bytes = [];
+            ull_to_f(&mut float_ctx, &mut Rdram::new(&mut float_bytes));
+            assert_eq!(float_ctx.f_bits(0), (value as f32).to_bits(), "FR={fr}");
+            let mut expected_float = initial;
+            expected_float[0] =
+                (expected_float[0] & 0xFFFF_FFFF_0000_0000) | u64::from((value as f32).to_bits());
+            assert_eq!(
+                float_ctx.physical_fgr_state().into_words(),
+                expected_float,
+                "FR={fr} float result changed non-result state"
+            );
+
+            let mut double_ctx = RsContext::new();
+            double_ctx.cop0_status = if fr { STATUS_FR } else { 0 };
+            double_ctx.replace_physical_fgr_state(PhysicalFgrState::from_words(initial));
+            double_ctx.set_r(4, value >> 32);
+            double_ctx.set_r(5, value as u32 as u64);
+            let mut double_bytes = [];
+            ull_to_d(&mut double_ctx, &mut Rdram::new(&mut double_bytes));
+            let result = (value as f64).to_bits();
+            assert_eq!(double_ctx.d_bits(0), result, "FR={fr}");
+            let mut expected_double = initial;
+            if fr {
+                expected_double[0] = result;
+            } else {
+                expected_double[0] =
+                    (expected_double[0] & 0xFFFF_FFFF_0000_0000) | u64::from(result as u32);
+                expected_double[1] = (expected_double[1] & 0xFFFF_FFFF_0000_0000) | (result >> 32);
+            }
+            assert_eq!(
+                double_ctx.physical_fgr_state().into_words(),
+                expected_double,
+                "FR={fr} double result changed non-result state"
+            );
+        }
+    }
+
     #[test]
     fn live_block_program_owns_thread_dispatch_and_charges_instruction_time() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
@@ -2616,6 +3174,184 @@ mod tests {
     }
 
     #[test]
+    fn typed_fpcsr_setter_and_new_thread_use_the_generated_cop1_authority() {
+        let mut bytes = [0; 4];
+        let mut mem = Rdram::new(&mut bytes);
+        let mut first = new_osthread_context();
+        let mut second = new_osthread_context();
+
+        assert_eq!(first.read_fcr(31), INITIAL_FPCSR);
+        assert_eq!(second.read_fcr(31), INITIAL_FPCSR);
+
+        first.set_r(4, 3);
+        os_set_fpc_csr(&mut first, &mut mem);
+        assert_eq!(first.r_u32(2), INITIAL_FPCSR);
+        assert_eq!(first.read_fcr(31), 3);
+        assert_eq!(second.read_fcr(31), INITIAL_FPCSR);
+
+        second.set_r(4, 2);
+        os_set_fpc_csr(&mut second, &mut mem);
+        assert_eq!(second.r_u32(2), INITIAL_FPCSR);
+        assert_eq!(second.read_fcr(31), 2);
+        assert_eq!(first.read_fcr(31), 3);
+
+        let pending: u32 = (1 << 16) | (1 << 11);
+        first.set_r(4, u64::from(pending));
+        let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            os_set_fpc_csr(&mut first, &mut mem);
+        }));
+        assert!(
+            loud.is_err(),
+            "enabled Cause written by host call must stay loud"
+        );
+        assert_eq!(first.r_u32(2), 3);
+        assert_eq!(first.read_fcr(31), pending);
+        assert_eq!(second.read_fcr(31), 2);
+    }
+
+    /// Public osCreateThread gives each OSThread its own saved FPCSR. This
+    /// drives real executor coroutine suspension and alternates A/B/A/B/A/B;
+    /// the context-local values must survive switches through another thread.
+    #[test]
+    fn alternating_osthread_coroutines_preserve_independent_fpcsr() {
+        const THREAD_A: ThreadId = 0xF5A0;
+        const THREAD_B: ThreadId = 0xF5B0;
+
+        let observed_a = Rc::new(RefCell::new(Vec::new()));
+        let observed_b = Rc::new(RefCell::new(Vec::new()));
+        let observed_a_body = Rc::clone(&observed_a);
+        let observed_b_body = Rc::clone(&observed_b);
+
+        with_executor(|exec| {
+            exec.create_thread(THREAD_A, 5, move |yielder, first_input| {
+                let _ = first_input;
+                let mut ctx = new_osthread_context();
+                ctx.write_fcr(31, 3);
+                observed_a_body.borrow_mut().push(ctx.read_fcr(31));
+                let _ = yielder.suspend(fn64_runtime::Yield::PauseSelf);
+                observed_a_body.borrow_mut().push(ctx.read_fcr(31));
+                ctx.write_fcr(31, 1);
+                let _ = yielder.suspend(fn64_runtime::Yield::PauseSelf);
+                observed_a_body.borrow_mut().push(ctx.read_fcr(31));
+            });
+            exec.create_thread(THREAD_B, 5, move |yielder, first_input| {
+                let _ = first_input;
+                let mut ctx = new_osthread_context();
+                ctx.write_fcr(31, 2);
+                observed_b_body.borrow_mut().push(ctx.read_fcr(31));
+                let _ = yielder.suspend(fn64_runtime::Yield::PauseSelf);
+                observed_b_body.borrow_mut().push(ctx.read_fcr(31));
+                ctx.write_fcr(31, 0);
+                let _ = yielder.suspend(fn64_runtime::Yield::PauseSelf);
+                observed_b_body.borrow_mut().push(ctx.read_fcr(31));
+            });
+            exec.start_thread(THREAD_A);
+            exec.start_thread(THREAD_B);
+        });
+
+        for _ in 0..6 {
+            assert!(crate::run_one_step());
+        }
+
+        assert_eq!(&*observed_a.borrow(), &[3, 3, 1]);
+        assert_eq!(&*observed_b.borrow(), &[2, 2, 0]);
+        with_executor(|exec| {
+            assert!(exec.is_thread_dead(THREAD_A));
+            assert!(exec.is_thread_dead(THREAD_B));
+        });
+    }
+
+    /// Thread 0 is the reset context, not an osCreateThread context. The
+    /// public osInitialize contract performs the observable 0 -> FS|EV
+    /// transition at the real typed boot entry.
+    #[test]
+    fn thread0_boot_path_transitions_fpcsr_only_at_os_initialize() {
+        const THREAD0: ThreadId = 0xF500;
+        crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
+        crate::load_rom_with_fixed_pi_latency(Vec::new(), 1);
+        BOOT_FPCSR_OBSERVATIONS.with(|observed| observed.borrow_mut().clear());
+        let mut bytes = [0u8; 8];
+
+        unsafe {
+            boot_thread0(
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                evidence_lookup,
+                observe_thread0_fpcsr_boot,
+                THREAD0,
+                10,
+            );
+        }
+        crate::run_to_idle();
+
+        BOOT_FPCSR_OBSERVATIONS.with(|observed| {
+            assert_eq!(&*observed.borrow(), &[0, INITIAL_FPCSR]);
+        });
+        assert!(crate::is_thread_dead(THREAD0));
+    }
+
+    #[test]
+    fn typed_os_initialize_replaces_the_current_context_fpcsr() {
+        crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
+        crate::load_rom_with_fixed_pi_latency(Vec::new(), 1);
+        let mut bytes = [0; 4];
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RsContext::new();
+        ctx.write_fcr(31, 3);
+
+        os_initialize(&mut ctx, &mut mem);
+
+        assert_eq!(ctx.read_fcr(31), INITIAL_FPCSR);
+    }
+
+    #[test]
+    fn alternating_osthread_coroutines_preserve_all_physical_fgr_bits() {
+        const THREAD_A: ThreadId = 0xF5C0;
+        const THREAD_B: ThreadId = 0xF5D0;
+        let state_a = patterned_fgr_state(0x1111_2222_3333_4444);
+        let state_b = patterned_fgr_state(0xAAAA_BBBB_CCCC_DDDD);
+        let observed_a = Rc::new(RefCell::new(Vec::new()));
+        let observed_b = Rc::new(RefCell::new(Vec::new()));
+        let observed_a_body = Rc::clone(&observed_a);
+        let observed_b_body = Rc::clone(&observed_b);
+
+        with_executor(|exec| {
+            exec.create_thread(THREAD_A, 5, move |yielder, first_input| {
+                let _ = first_input;
+                let mut ctx = RsContext::new();
+                ctx.cop0_status &= !STATUS_FR;
+                ctx.replace_physical_fgr_state(state_a);
+                observed_a_body.borrow_mut().push(ctx.physical_fgr_state());
+                let _ = yielder.suspend(fn64_runtime::Yield::PauseSelf);
+                observed_a_body.borrow_mut().push(ctx.physical_fgr_state());
+            });
+            exec.create_thread(THREAD_B, 5, move |yielder, first_input| {
+                let _ = first_input;
+                let mut ctx = RsContext::new();
+                ctx.cop0_status |= STATUS_FR;
+                ctx.replace_physical_fgr_state(state_b);
+                observed_b_body.borrow_mut().push(ctx.physical_fgr_state());
+                let _ = yielder.suspend(fn64_runtime::Yield::PauseSelf);
+                observed_b_body.borrow_mut().push(ctx.physical_fgr_state());
+            });
+            exec.start_thread(THREAD_A);
+            exec.start_thread(THREAD_B);
+        });
+
+        assert!(crate::run_one_step());
+        assert!(crate::run_one_step());
+        assert!(crate::run_one_step());
+        assert!(crate::run_one_step());
+
+        assert_eq!(&*observed_a.borrow(), &[state_a, state_a]);
+        assert_eq!(&*observed_b.borrow(), &[state_b, state_b]);
+        with_executor(|exec| {
+            assert!(exec.is_thread_dead(THREAD_A));
+            assert!(exec.is_thread_dead(THREAD_B));
+        });
+    }
+
+    #[test]
     fn typed_interrupt_masks_return_each_contexts_own_previous_value() {
         let mut bytes = [0; 4];
         let mut mem = Rdram::new(&mut bytes);
@@ -2827,7 +3563,7 @@ mod tests {
             mem.load_w(0xFFFF_FFFF_A450_000C) as u32,
             fn64_runtime::AI_STATUS_ENABLED
         );
-        assert_ne!(
+        assert_eq!(
             with_host(|host| host.device_fabric.snapshot().mi_pending)
                 & fn64_runtime::InterruptSource::Ai.bit(),
             0

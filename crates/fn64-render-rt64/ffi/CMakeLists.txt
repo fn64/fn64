@@ -21,6 +21,351 @@ set(PLUME_BUILD_EXAMPLES OFF CACHE BOOL "Do not build plume examples" FORCE)
 # mupen64plus subtree is therefore neither compiled nor linked.
 add_subdirectory("${FN64_RT64_SOURCE_DIR}" rt64-build EXCLUDE_FROM_ALL)
 
+# The pinned S2DEX implementation loads the public uObjTxtr prefix for
+# G_OBJ_LDTX_RECT and then unconditionally asserts instead of drawing the
+# documented uObjSprite tail. Stage one deliberately bounded implementation:
+# axis-aligned, point-filtered RGBA16 block loads at 1:1, with no object-mode
+# corrections or flips. Every broader shape is rejected before the texture
+# load mutates RT64 state. The full-file digest and exact replacement contexts
+# make a pin update a mandatory review.
+set(FN64_RT64_S2DEX_SOURCE
+    "${FN64_RT64_SOURCE_DIR}/src/gbi/rt64_gbi_s2dex.cpp")
+file(SHA256 "${FN64_RT64_S2DEX_SOURCE}" FN64_RT64_S2DEX_SHA256)
+if(NOT FN64_RT64_S2DEX_SHA256 STREQUAL
+   "7c8e779092eb7e2ddc8794694c0c04176a3e29958dc288952d577750673acc3f")
+    message(FATAL_ERROR
+        "RT64 S2DEX source changed; review the fn64 object-rectangle overlay")
+endif()
+file(READ "${FN64_RT64_S2DEX_SOURCE}" FN64_RT64_S2DEX_PATCHED)
+set(FN64_RT64_S2DEX_INCLUDE_ORIGINAL [=[#include "rt64_gbi_rdp.h"
+
+//#define LOG_BGRECT_METHODS]=])
+set(FN64_RT64_S2DEX_INCLUDE_PATCHED [=[#include "rt64_gbi_rdp.h"
+#include "hle/rt64_interpreter.h"
+
+#include <cstddef>
+#include <cstring>
+#include <stdexcept>
+#include <type_traits>
+
+//#define LOG_BGRECT_METHODS]=])
+string(FIND
+    "${FN64_RT64_S2DEX_PATCHED}"
+    "${FN64_RT64_S2DEX_INCLUDE_ORIGINAL}"
+    FN64_RT64_S2DEX_INCLUDE_OFFSET)
+if(FN64_RT64_S2DEX_INCLUDE_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 S2DEX include context changed; review the fn64 object-rectangle overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_S2DEX_INCLUDE_ORIGINAL}"
+    "${FN64_RT64_S2DEX_INCLUDE_PATCHED}"
+    FN64_RT64_S2DEX_PATCHED
+    "${FN64_RT64_S2DEX_PATCHED}")
+set(FN64_RT64_S2DEX_NAMESPACE_ORIGINAL [=[namespace RT64 {
+    namespace GBI_S2DEX {
+        void objRenderMode(State *state, DisplayList **dl) {]=])
+set(FN64_RT64_S2DEX_NAMESPACE_PATCHED [=[namespace RT64 {
+    namespace GBI_S2DEX {
+#pragma pack(push, 1)
+        // RT64 stores the native-word-swapped RDRAM image, so each public
+        // uObjSprite word is declared in its already-swapped host order.
+        struct Fn64ObjSprite {
+            uint16_t scaleW;
+            int16_t objX;
+            uint16_t paddingX;
+            uint16_t imageW;
+            uint16_t scaleH;
+            int16_t objY;
+            uint16_t paddingY;
+            uint16_t imageH;
+            uint16_t imageAdrs;
+            uint16_t imageStride;
+            uint8_t imageFlags;
+            uint8_t imagePal;
+            uint8_t imageSiz;
+            uint8_t imageFmt;
+        };
+#pragma pack(pop)
+
+        static_assert(sizeof(Fn64ObjSprite) == 24);
+        static_assert(offsetof(Fn64ObjSprite, scaleW) == 0);
+        static_assert(offsetof(Fn64ObjSprite, objX) == 2);
+        static_assert(offsetof(Fn64ObjSprite, imageW) == 6);
+        static_assert(offsetof(Fn64ObjSprite, objY) == 10);
+        static_assert(offsetof(Fn64ObjSprite, imageH) == 14);
+        static_assert(offsetof(Fn64ObjSprite, imageStride) == 18);
+        static_assert(offsetof(Fn64ObjSprite, imageFmt) == 23);
+        static_assert(std::is_trivially_copyable_v<uObjTxtr>);
+        static_assert(std::is_trivially_copyable_v<Fn64ObjSprite>);
+
+        [[noreturn]] void rejectFn64ObjLoadTxRect(const char *reason) {
+            throw std::runtime_error(
+                std::string("S2DEX2 G_OBJ_LDTX_RECT unsupported by bounded fn64 slice: ") +
+                reason);
+        }
+
+        uint32_t resolveFn64ObjRdramSpan(
+            State *state,
+            uint32_t segmentedAddress,
+            uint32_t byteCount,
+            const char *segmentReason,
+            const char *alignmentReason,
+            const char *rangeReason)
+        {
+            // Public inputs are a 16-entry segmented address or KSEG0/KSEG1.
+            // RT64's general helper deliberately aliases other upper bytes and
+            // masks DMA alignment/address bits; this bounded path must reject
+            // those aliases before it reads or mutates anything.
+            const uint32_t addressClass = segmentedAddress >> 24;
+            const bool directPhysical =
+                (addressClass == 0x80U) || (addressClass == 0xA0U);
+            if (!directPhysical && (addressClass > 0x0FU)) {
+                rejectFn64ObjLoadTxRect(segmentReason);
+            }
+            const uint32_t offset = segmentedAddress & 0x00FFFFFFU;
+            const uint64_t resolved = directPhysical
+                ? uint64_t(offset)
+                : uint64_t(state->rsp->segments[addressClass]) + uint64_t(offset);
+            if ((resolved & 7U) != 0U) {
+                rejectFn64ObjLoadTxRect(alignmentReason);
+            }
+            if ((resolved > uint64_t(RDRAMSize)) ||
+                (uint64_t(byteCount) > (uint64_t(RDRAMSize) + 1U - resolved))) {
+                rejectFn64ObjLoadTxRect(rangeReason);
+            }
+            return uint32_t(resolved);
+        }
+
+        void doFn64ObjLoadTxtr(
+            State *state,
+            const uObjTxtr &texture,
+            uint32_t imageAddress)
+        {
+            const int32_t previousLoad = state->rsp->S2D.data_02AE;
+            const uint32_t sid = uint8_t(texture.sid);
+            const uint32_t status = state->rsp->S2D.statuses[sid / 4U];
+            if ((status & texture.mask) == texture.flag) {
+                return;
+            }
+            state->rsp->S2D.statuses[sid / 4U] =
+                (status & ~texture.mask) | (texture.flag & texture.mask);
+            state->rsp->S2D.data_02AE = -127;
+            if (previousLoad == -127) {
+                // Public S2DEX would emit a tile sync; RT64 does not need it.
+            }
+
+            const uint32_t textureWords = texture.val1;
+            state->rdp->setTextureImage(
+                G_IM_FMT_RGBA,
+                G_IM_SIZ_16b,
+                textureWords + 1U,
+                imageAddress);
+            const uint32_t typeMask = uint32_t(int32_t(int8_t(texture.type >> 16)));
+            const uint32_t setTileWord =
+                texture.tmem |
+                (((textureWords + 1U) & typeMask) << 7) |
+                (uint32_t(uint8_t(texture.type >> 8)) << 16);
+            state->rdp->setTile(
+                G_TX_LOADTILE,
+                (setTileWord >> 21) & 7U,
+                (setTileWord >> 19) & 3U,
+                (setTileWord >> 9) & 0x1FFU,
+                setTileWord & 0x1FFU,
+                0,
+                G_TX_WRAP | G_TX_NOMIRROR,
+                G_TX_WRAP | G_TX_NOMIRROR,
+                G_TX_NOMASK,
+                G_TX_NOMASK,
+                G_TX_NOLOD,
+                G_TX_NOLOD);
+            if (previousLoad >= 0) {
+                // Public S2DEX would emit a load sync; RT64 does not need it.
+            }
+            const uint32_t loadWord =
+                ((textureWords << 14) | texture.val2) & 0x00FFFFFFU;
+            state->rdp->loadBlock(
+                G_TX_LOADTILE,
+                0,
+                0,
+                (loadWord >> 12) & 0xFFFU,
+                loadWord & 0xFFFU);
+        }
+
+        void doFn64ObjLoadTxRect(State *state, const uint8_t *objectBytes) {
+            uObjTxtr texture{};
+            Fn64ObjSprite sprite{};
+            std::memcpy(&texture, objectBytes, sizeof(texture));
+            std::memcpy(
+                &sprite,
+                objectBytes + sizeof(texture),
+                sizeof(sprite));
+            if ((state->ext.interpreter == nullptr) ||
+                (state->ext.interpreter->hleGBI == nullptr) ||
+                (state->ext.interpreter->hleGBI->ucode != GBIUCode::S2DEX2)) {
+                rejectFn64ObjLoadTxRect("active microcode is not S2DEX2");
+            }
+            if (texture.type != 0x00001033U) {
+                rejectFn64ObjLoadTxRect("texture command is not exact public G_OBJLT_TXTRBLOCK");
+            }
+            const uint32_t sid = texture.sid;
+            if ((sid > 12U) || ((sid & 3U) != 0U)) {
+                rejectFn64ObjLoadTxRect("texture status sid is not public 0, 4, 8, or 12");
+            }
+            if (state->rsp->objRenderMode != 0U) {
+                rejectFn64ObjLoadTxRect("objRenderMode is not zero");
+            }
+            if ((state->rdp->otherMode.textFilt() != G_TF_POINT) ||
+                (state->rdp->otherMode.cycleType() != G_CYC_1CYCLE)) {
+                rejectFn64ObjLoadTxRect("RDP state is not point-filtered one-cycle mode");
+            }
+            if ((state->rdp->otherMode.textLOD() != G_TL_TILE) ||
+                (state->rdp->otherMode.textDetail() != G_TD_CLAMP) ||
+                (state->rdp->otherMode.textLUT() != G_TT_NONE) ||
+                (state->rdp->otherMode.textPersp() != G_TP_NONE)) {
+                rejectFn64ObjLoadTxRect("RDP sampler state is not tile LOD, clamp detail, no TLUT, and no perspective");
+            }
+            if ((sprite.paddingX != 0U) || (sprite.paddingY != 0U)) {
+                rejectFn64ObjLoadTxRect("uObjSprite reserved padding is nonzero");
+            }
+            if ((sprite.scaleW != 1024U) || (sprite.scaleH != 1024U)) {
+                rejectFn64ObjLoadTxRect("scale is not exact 1:1 u5.10");
+            }
+            if ((sprite.imageW == 0U) || (sprite.imageH == 0U) ||
+                ((sprite.imageW & 31U) != 0U) || ((sprite.imageH & 31U) != 0U)) {
+                rejectFn64ObjLoadTxRect("image dimensions are not positive whole texels");
+            }
+            if ((sprite.imageFmt != G_IM_FMT_RGBA) ||
+                (sprite.imageSiz != G_IM_SIZ_16b) || (sprite.imagePal != 0U)) {
+                rejectFn64ObjLoadTxRect("image is not non-paletted RGBA16");
+            }
+            if (sprite.imageFlags != 0U) {
+                rejectFn64ObjLoadTxRect("image flip flags are nonzero");
+            }
+            if ((sprite.imageStride == 0U) || (sprite.imageStride > 0x1FFU) ||
+                (sprite.imageAdrs > 0x1FFU)) {
+                rejectFn64ObjLoadTxRect("TMEM stride or address is outside the RDP tile range");
+            }
+            const uint32_t widthTexels = uint32_t(sprite.imageW) >> 5;
+            const uint32_t heightTexels = uint32_t(sprite.imageH) >> 5;
+            const uint32_t blockWords = uint32_t(texture.val1) + 1U;
+            if ((widthTexels * 2U != uint32_t(sprite.imageStride) * 8U) ||
+                (blockWords != uint32_t(sprite.imageStride) * heightTexels) ||
+                (texture.tmem != sprite.imageAdrs)) {
+                rejectFn64ObjLoadTxRect("block tsize, TMEM origin, and sprite stride/extent disagree");
+            }
+            if (((2048U % sprite.imageStride) != 0U) ||
+                (texture.val2 != (2048U / sprite.imageStride))) {
+                rejectFn64ObjLoadTxRect("block tline does not match the exact sprite stride");
+            }
+            if ((uint32_t(sprite.imageAdrs) + blockWords) > 512U) {
+                rejectFn64ObjLoadTxRect("block load exceeds physical TMEM");
+            }
+            const uint32_t blockBytes = blockWords * 8U;
+            const uint32_t imageAddress = resolveFn64ObjRdramSpan(
+                state,
+                texture.image,
+                blockBytes,
+                "block source uses non-public segment bits",
+                "block source is not public 8-byte aligned",
+                "block source range escapes physical RDRAM");
+            const uint32_t widthQuarter = uint32_t(sprite.imageW) >> 3;
+            const uint32_t heightQuarter = uint32_t(sprite.imageH) >> 3;
+            if ((widthQuarter > 0x1000U) || (heightQuarter > 0x1000U)) {
+                rejectFn64ObjLoadTxRect("image extent exceeds the RDP tile coordinate range");
+            }
+
+            doFn64ObjLoadTxtr(state, texture, imageAddress);
+            RDP *rdp = state->rdp.get();
+            rdp->setTile(
+                G_TX_RENDERTILE, G_IM_FMT_RGBA, G_IM_SIZ_16b,
+                sprite.imageStride, sprite.imageAdrs, 0,
+                G_TX_CLAMP | G_TX_NOMIRROR, G_TX_CLAMP | G_TX_NOMIRROR,
+                G_TX_NOMASK, G_TX_NOMASK, G_TX_NOLOD, G_TX_NOLOD);
+            rdp->setTileSize(
+                G_TX_RENDERTILE, 0, 0,
+                uint16_t(widthQuarter - 4U), uint16_t(heightQuarter - 4U));
+            state->startSpriteCommand(0);
+            rdp->drawTexRect(
+                sprite.objX, sprite.objY,
+                int32_t(sprite.objX) + int32_t(widthQuarter),
+                int32_t(sprite.objY) + int32_t(heightQuarter),
+                G_TX_RENDERTILE, 0, 0,
+                int16_t(sprite.scaleW), int16_t(sprite.scaleH), false);
+            state->endSpriteCommand();
+        }
+
+        void objRenderMode(State *state, DisplayList **dl) {]=])
+string(FIND
+    "${FN64_RT64_S2DEX_PATCHED}"
+    "${FN64_RT64_S2DEX_NAMESPACE_ORIGINAL}"
+    FN64_RT64_S2DEX_NAMESPACE_OFFSET)
+if(FN64_RT64_S2DEX_NAMESPACE_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 S2DEX namespace context changed; review the fn64 object-rectangle overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_S2DEX_NAMESPACE_ORIGINAL}"
+    "${FN64_RT64_S2DEX_NAMESPACE_PATCHED}"
+    FN64_RT64_S2DEX_PATCHED
+    "${FN64_RT64_S2DEX_PATCHED}")
+string(CONCAT FN64_RT64_S2DEX_RECT_ORIGINAL
+    [=[            // Load the struct from rdram
+            readS2DStruct(state, (*dl)->w1, ((*dl)->w0 & 0xFFFFFF) + 1);]=]
+    "\n            \n"
+    [=[            // Execute the texture load
+            const uObjTxSprite* obj = (uObjTxSprite*)state->rsp->S2D.struct_buffer.data();
+            doLoadTxtr(state, &obj->txtr);]=]
+    "\n            \n"
+    [=[            // Execute the rect draw
+            // TODO call doObjRectangle(state, &obj->sprite) when it's implemented
+            assert(false);]=])
+set(FN64_RT64_S2DEX_RECT_PATCHED [=[            // The public compound structure is exactly 48 bytes. Reject a
+            // short DMA before reading a stale sprite tail from the persistent buffer.
+            if (((*dl)->w0 & 0x00FFFFFFU) != 0x2FU) {
+                rejectFn64ObjLoadTxRect("DMA length low24 is not exact public 0x2f");
+            }
+            const uint32_t objectAddress = resolveFn64ObjRdramSpan(
+                state,
+                (*dl)->w1,
+                0x30U,
+                "compound source uses non-public segment bits",
+                "compound source is not public 8-byte aligned",
+                "compound source range escapes physical RDRAM");
+            std::memcpy(
+                state->rsp->S2D.struct_buffer.data(),
+                state->fromRDRAM(objectAddress),
+                0x30U);
+
+            // Validate the public bounded contract before either half mutates
+            // RT64 state, then execute the documented load followed by draw.
+            doFn64ObjLoadTxRect(state, state->rsp->S2D.struct_buffer.data());]=])
+string(FIND
+    "${FN64_RT64_S2DEX_PATCHED}"
+    "${FN64_RT64_S2DEX_RECT_ORIGINAL}"
+    FN64_RT64_S2DEX_RECT_OFFSET)
+if(FN64_RT64_S2DEX_RECT_OFFSET EQUAL -1)
+    message(FATAL_ERROR
+        "RT64 objLoadTxRect context changed; review the fn64 object-rectangle overlay")
+endif()
+string(REPLACE
+    "${FN64_RT64_S2DEX_RECT_ORIGINAL}"
+    "${FN64_RT64_S2DEX_RECT_PATCHED}"
+    FN64_RT64_S2DEX_PATCHED
+    "${FN64_RT64_S2DEX_PATCHED}")
+set(FN64_RT64_S2DEX_PATCHED_SOURCE
+    "${CMAKE_CURRENT_BINARY_DIR}/fn64_rt64_gbi_s2dex.cpp")
+file(WRITE
+    "${FN64_RT64_S2DEX_PATCHED_SOURCE}"
+    "${FN64_RT64_S2DEX_PATCHED}")
+set_source_files_properties(
+    "${FN64_RT64_S2DEX_SOURCE}"
+    TARGET_DIRECTORY rt64
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+target_sources(rt64 PRIVATE "${FN64_RT64_S2DEX_PATCHED_SOURCE}")
+target_include_directories(rt64 PRIVATE
+    "${FN64_RT64_SOURCE_DIR}/src/gbi")
+
 # Compile fn64's bounded post-gamma VI shader as a source-identity overlay.
 # RT64's shader helper functions are defined in the child directory; import
 # their directory-local compiler variables into this caller before invoking

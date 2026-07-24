@@ -3,9 +3,18 @@ use super::*;
 use crate::task_dispatch::AUDIO_OUTPUT_STATS;
 
 const AI_MIN_DAC_RATE: u32 = 132;
+const AI_MAX_DAC_RATE: u32 = 16_384;
 const AI_MAX_BIT_RATE: u32 = 16;
 const AI_CONTROL_REG: u64 = 0xA450_0008;
 const AI_CONTROL_DMA_ON: u32 = 1;
+
+fn rounded_ai_dac_divisor(vi_clock: u32, frequency: u32) -> Option<u32> {
+    if frequency == 0 {
+        return None;
+    }
+    let numerator = u64::from(vi_clock) + u64::from(frequency) / 2;
+    u32::try_from(numerator / u64::from(frequency)).ok()
+}
 
 pub(crate) fn initialize_ai_control() {
     assert!(
@@ -15,8 +24,8 @@ pub(crate) fn initialize_ai_control() {
 }
 
 /// `osAiSetFrequency(u32 frequency) -> s32` -- configures the audio DAC
-/// sample rate and returns the TRUE playback rate, or -1 if the frequency is
-/// unusable (`dacRate < AI_MIN_DAC_RATE`). The true DAC rate is stored as
+/// sample rate and returns the TRUE playback rate, or -1 if the divisor falls
+/// outside fn64's bounded 132..=16384 admission. The true DAC rate is stored as
 /// host state AND forwarded to any registered `AudioBackend` via
 /// `set_frequency`, so the backend's producer-side resample ratio tracks
 /// the game (the host stream itself is opened by the shell/harness at
@@ -26,7 +35,7 @@ pub(crate) fn initialize_ai_control() {
 /// stale/zero $v0 divides by garbage.
 ///
 /// The public AI register contract requires both DACRATE and BITRATE:
-/// `dac_rate = (osViClock/freq + 0.5)`, `dac_rate < 132` returns -1, and the
+/// `dac_rate = round(osViClock/freq)`, with exact integer arithmetic, and the
 /// serial bit-clock divider is `min(dac_rate / 66, 16)`. The registers encode
 /// each divider minus one. `osViClock` is selected from the public
 /// NTSC/PAL/MPAL clock constants by the IPL television type. Single u32 arg
@@ -38,17 +47,18 @@ pub(crate) fn initialize_ai_control() {
 pub unsafe extern "C" fn osAiSetFrequency_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
     let freq = ctx.r4 as u32;
-    AI_FREQUENCY.with(|cell| cell.set(freq));
 
     let vi_clock = crate::vi_clock_hz();
-    let dac_rate = (vi_clock as f32 / freq as f32 + 0.5) as u32;
-    ctx.r2 = if dac_rate < AI_MIN_DAC_RATE {
+    let dac_rate = rounded_ai_dac_divisor(vi_clock, freq);
+    ctx.r2 = if !dac_rate.is_some_and(|rate| (AI_MIN_DAC_RATE..=AI_MAX_DAC_RATE).contains(&rate)) {
         -1i32 as u32 as u64
     } else {
+        let dac_rate = dac_rate.expect("validated AI divisor");
         let true_rate = vi_clock / dac_rate;
         let bit_rate = (dac_rate / 66).min(AI_MAX_BIT_RATE);
         crate::pi::set_live_ai_rates(dac_rate - 1, bit_rate - 1)
             .unwrap_or_else(|error| panic!("osAiSetFrequency_recomp: {error}"));
+        AI_FREQUENCY.with(|cell| cell.set(freq));
         true_rate as u64
     };
 }
@@ -311,11 +321,14 @@ mod tests {
 
         let second_deadline = with_host(|host| host.device_fabric.next_deadline().unwrap().get());
         crate::advance_virtual_time(second_deadline);
-        assert!(crate::pi::cpu_interrupt_pending());
+        assert!(
+            !crate::pi::cpu_interrupt_pending(),
+            "final BUSY 1 -> 0 does not reproduce the documented FULL edge"
+        );
         assert_eq!(crate::pi::live_ai_status(), fn64_runtime::AI_STATUS_ENABLED);
         assert_eq!(
             with_executor(|exec| exec.recv_mesg(99, queue, false)),
-            fn64_runtime::RecvMesgOutcome::Delivered(0xA1)
+            fn64_runtime::RecvMesgOutcome::WouldBlock
         );
     }
 
@@ -550,12 +563,60 @@ mod tests {
         assert_eq!(snapshot.ai_dacrate, 1_520);
         assert_eq!(snapshot.ai_bitrate, 15);
 
-        // An unusably-high frequency drives dacRate below AI_MIN_DAC_RATE
-        // (132) and must return -1: freq 400000 -> dacRate = round(121.7) =
-        // 122 < 132.
-        let mut ctx = ctx_with(400_000, 0, 0);
-        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
-        assert_eq!(ctx.r2, -1i32 as u32 as u64, "dacRate < 132 -> -1");
+        for (frequency, reason) in [
+            (0, "zero frequency has no divisor"),
+            (1, "divisor exceeds the encoded 16384 maximum"),
+            (400_000, "divisor is below the public 132 minimum"),
+        ] {
+            let mut invalid = ctx_with(frequency, 0, 0);
+            unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut invalid) };
+            assert_eq!(invalid.r2, -1i32 as u32 as u64, "{reason}");
+            assert_eq!(
+                with_host(|host| host.device_fabric.snapshot()),
+                snapshot,
+                "invalid frequency must not mutate public AI registers"
+            );
+            assert_eq!(AI_FREQUENCY.with(Cell::get), 32_000);
+        }
+
+        assert_eq!(rounded_ai_dac_divisor(263, 2), Some(AI_MIN_DAC_RATE));
+        assert_eq!(rounded_ai_dac_divisor(262, 2), Some(AI_MIN_DAC_RATE - 1));
+        assert_eq!(rounded_ai_dac_divisor(32_767, 2), Some(AI_MAX_DAC_RATE));
+        assert_eq!(rounded_ai_dac_divisor(32_769, 2), Some(AI_MAX_DAC_RATE + 1));
+    }
+
+    #[test]
+    fn os_ai_set_frequency_integer_rounding_avoids_internal_f32_boundary_drift() {
+        configure_ntsc();
+        let mut ctx = ctx_with(5_834, 0, 0);
+        unsafe { osAiSetFrequency_recomp(std::ptr::null_mut(), &mut ctx) };
+
+        assert_eq!(rounded_ai_dac_divisor(48_681_812, 5_834), Some(8_344));
+        assert_eq!(
+            (48_681_812_f32 / 5_834_f32 + 0.5) as u32,
+            8_345,
+            "internal regression witness for the removed f32 implementation"
+        );
+        assert_eq!(ctx.r2, 5_834);
+        assert_eq!(
+            with_host(|host| host.device_fabric.snapshot().ai_dacrate),
+            8_343
+        );
+    }
+
+    #[test]
+    fn raw_busy_bitrate_write_traps_without_mutating_device_evidence() {
+        configure_ntsc();
+        let mut submit = ctx_with(0xFFFF_FFFF_8000_2000, 0x80, 0);
+        unsafe { osAiSetNextBuffer_recomp(std::ptr::null_mut(), &mut submit) };
+        assert_eq!(submit.r2, 0);
+        let before = crate::device_evidence_snapshot();
+
+        let fault = std::panic::catch_unwind(|| {
+            crate::pi::write_raw_mmio_word(0xA450_0014, 7);
+        });
+        assert!(fault.is_err());
+        assert_eq!(crate::device_evidence_snapshot(), before);
     }
 
     #[test]

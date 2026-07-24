@@ -1973,6 +1973,32 @@ mod tests {
     }
 
     #[test]
+    fn floating_point_exception_enters_general_vector_with_exc_code_15() {
+        let bank = BankId::new(0xF1);
+        let mut ctx = RecompContext::new();
+        let fault = CpuFault {
+            at: ExecutionKey::new(bank, GuestPc::new(0x8000_1804)),
+            kind: CpuFaultKind::Exception {
+                exception: CpuException::FloatingPoint,
+                epc: GuestPc::new(0x8000_1800),
+                branch_delay: true,
+                instruction_code: 0,
+                bad_vaddr: None,
+                coprocessor: None,
+            },
+        };
+
+        assert_eq!(
+            fault.enter_exception(&mut ctx),
+            Some(GuestPc::new(0x8000_0180))
+        );
+        assert_eq!(ctx.cop0_epc, 0x8000_1800);
+        assert_eq!((ctx.cop0_cause >> 2) & 0x1f, 15);
+        assert_ne!(ctx.cop0_cause & (1 << 31), 0);
+        assert_ne!(ctx.cop0_status & (1 << 1), 0);
+    }
+
+    #[test]
     fn nested_exception_preserves_first_epc_bd_and_bev_selects_boot_vector() {
         let bank = BankId::new(8);
         let mut ctx = RecompContext::new();
@@ -2235,26 +2261,29 @@ mod tests {
     #[test]
     fn coprocessor_unusable_exception_records_cause_ce() {
         let bank = BankId::new(11);
-        let mut ctx = RecompContext::new();
-        let fault = CpuFault {
-            at: ExecutionKey::new(bank, GuestPc::new(0x8000_7000)),
-            kind: CpuFaultKind::Exception {
-                exception: CpuException::CoprocessorUnusable,
-                epc: GuestPc::new(0x8000_7000),
-                branch_delay: false,
-                instruction_code: 0,
-                bad_vaddr: None,
-                coprocessor: Some(1),
-            },
-        };
+        for coprocessor in [0, 1] {
+            let mut ctx = RecompContext::new();
+            ctx.cop0_cause = 3 << 28;
+            let fault = CpuFault {
+                at: ExecutionKey::new(bank, GuestPc::new(0x8000_7000)),
+                kind: CpuFaultKind::Exception {
+                    exception: CpuException::CoprocessorUnusable,
+                    epc: GuestPc::new(0x8000_7000),
+                    branch_delay: false,
+                    instruction_code: 0,
+                    bad_vaddr: None,
+                    coprocessor: Some(coprocessor),
+                },
+            };
 
-        assert_eq!(
-            fault.enter_exception(&mut ctx),
-            Some(GuestPc::new(0x8000_0180))
-        );
-        assert_eq!((ctx.cop0_cause >> 2) & 0x1F, 11);
-        assert_eq!((ctx.cop0_cause >> 28) & 0b11, 1);
-        assert_eq!(ctx.cop0_epc, 0x8000_7000);
+            assert_eq!(
+                fault.enter_exception(&mut ctx),
+                Some(GuestPc::new(0x8000_0180))
+            );
+            assert_eq!((ctx.cop0_cause >> 2) & 0x1F, 11);
+            assert_eq!((ctx.cop0_cause >> 28) & 0b11, u32::from(coprocessor));
+            assert_eq!(ctx.cop0_epc, 0x8000_7000);
+        }
     }
 
     #[test]

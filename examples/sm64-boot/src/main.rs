@@ -43,23 +43,6 @@
 
 use std::io::Write;
 
-/// Audio ucode stand-in. No RSPRecomp pass has been run against SM64's audio
-/// microcode in this bring-up, and even if one had been the same clean-room
-/// blocker `examples/wm2000-boot/src/main.rs` documents applies: RSPRecomp's
-/// codegen template unconditionally `#include`s the GPL-3.0-licensed
-/// `librecomp/rsp.hpp`, disallowed by `fn64/AGENTS.md`'s clean-room protocol.
-/// This stand-in exercises the REAL plumbing (`fn64_abi::set_audio_ucode_fn`/
-/// M_AUDTASK dispatch) without linking the disallowed dependency. It does
-/// nothing to rdram, just proves the call happened.
-unsafe extern "C" fn stand_in_audio_ucode(_rdram: *mut u8, ucode_addr: u32) -> u32 {
-    eprintln!(
-        "[sm64-boot] STAND-IN audio ucode invoked for ucode_addr={ucode_addr:#010x} -- NOT a real \
-         translated ucode (no RSPRecomp pass has been run for SM64; see main.rs's doc comment for \
-         the clean-room reason). Plumbing is real; ucode execution is not."
-    );
-    0
-}
-
 fn env_path(name: &str) -> std::path::PathBuf {
     std::env::var(name)
         .unwrap_or_else(|_| panic!("sm64-boot: required environment variable {name} not set"))
@@ -104,8 +87,7 @@ type StaticRegisterCb = unsafe extern "C" fn(
 );
 
 /// Count of corpus-static functions registered this run (diagnostic).
-static STATICS_REGISTERED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static STATICS_REGISTERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Register one corpus-static function as its own single-function section at
 /// its true guest VA (ram_addr + offset), so its native pointer lands in
@@ -213,8 +195,8 @@ fn main() {
         STATICS_REGISTERED.load(std::sync::atomic::Ordering::Relaxed)
     );
 
-    // Real plumbing, stand-in body (see stand_in_audio_ucode's doc comment).
-    unsafe { fn64_abi::set_audio_ucode_fn(stand_in_audio_ucode) };
+    // Execute live task IMEM through fn64's clean-room RSP interpreter.
+    fn64_abi::set_audio_task_lle_accuracy();
 
     // Cart OSPiHandle*: SM64 US only calls osCartRomInit() from the audio DMA
     // path (src/audio/load_sh.c) -- unlikely to be reached in early boot, but
@@ -365,7 +347,10 @@ fn main() {
             to: swap + hold,
             buttons: 0x1000, // BTN_START
         });
-        println!("[sm64-input] scripted: hold START swaps {swap}..{}", swap + hold);
+        println!(
+            "[sm64-input] scripted: hold START swaps {swap}..{}",
+            swap + hold
+        );
     }
     let mut last_applied_buttons = 0u16;
 
@@ -485,7 +470,10 @@ fn main() {
     println!("[sm64-boot] steps run: {steps}");
     println!("[sm64-boot] virtual ticks run: {}", fn64_abi::sim_time());
     println!("[sm64-boot] thread 0 dead: {}", fn64_abi::is_thread_dead(0));
-    println!("[sm64-boot] VI swaps observed: {}", fn64_abi::vi_swap_count());
+    println!(
+        "[sm64-boot] VI swaps observed: {}",
+        fn64_abi::vi_swap_count()
+    );
     println!("[sm64-boot] gfx tasks submitted: {gfx_count}");
     println!("[sm64-boot] audio tasks submitted: {audio_count}");
     println!("[sm64-boot] renderer: {active_renderer}");
@@ -513,12 +501,7 @@ fn main() {
 
 /// Hash the guest framebuffer region pointed at by the latest VI swap and dump
 /// it as a PNG if it is non-uniform (has actual rendered content).
-fn capture_framebuffer(
-    rdram: &[u8],
-    fb_offset: u32,
-    swap_count: u64,
-    fb_dumps: &mut Vec<String>,
-) {
+fn capture_framebuffer(rdram: &[u8], fb_offset: u32, swap_count: u64, fb_dumps: &mut Vec<String>) {
     const W: usize = 320;
     const H: usize = 240;
     const BYTES: usize = W * H * 2; // 16-bit RGBA5551

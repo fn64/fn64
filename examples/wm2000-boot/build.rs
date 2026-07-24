@@ -33,10 +33,14 @@
 //! shrugs."
 
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 
 #[path = "../../crates/fn64-boot-harness/build_support.rs"]
 mod build_support;
+
+#[path = "../../crates/fn64-boot-harness/native_program_identity.rs"]
+mod native_program_identity;
 
 /// Route the game's own linked libultra `osGetTime` (`func_80032570` --
 /// verbatim: `__osDisableInt`; `osGetCount`; 64-bit `base pair (0x800974E8/
@@ -72,8 +76,7 @@ mod build_support;
 /// self-referential entry observer, which is moot once the body is a pure
 /// tail-call into the Rust shim).
 fn patch_osgettime(source: &str) -> (String, usize) {
-    const HEADER: &str =
-        "RECOMP_FUNC void func_80032570(uint8_t* rdram, recomp_context* ctx) {";
+    const HEADER: &str = "RECOMP_FUNC void func_80032570(uint8_t* rdram, recomp_context* ctx) {";
     let Some(start) = source.find(HEADER) else {
         return (source.to_string(), 0);
     };
@@ -139,6 +142,37 @@ fn required_env(name: &str, hint: &str) -> PathBuf {
             );
         }
     }
+}
+
+fn produced_archive_bytes(out_dir: &std::path::Path, stem: &str) -> Vec<u8> {
+    let candidates = [
+        out_dir.join(format!("lib{stem}.a")),
+        out_dir.join(format!("{stem}.lib")),
+        out_dir.join(format!("lib{stem}.lib")),
+    ];
+    let existing: Vec<_> = candidates.iter().filter(|path| path.is_file()).collect();
+    assert_eq!(
+        existing.len(),
+        1,
+        "wm2000-boot build.rs: expected exactly one produced archive for {stem} in {}, found {existing:?}",
+        out_dir.display()
+    );
+    fs::read(existing[0]).unwrap_or_else(|error| {
+        panic!(
+            "wm2000-boot build.rs: read produced native archive {}: {error}",
+            existing[0].display()
+        )
+    })
+}
+
+fn lowercase_hex(bytes: [u8; 32]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn main() {
@@ -252,6 +286,22 @@ fn main() {
         .warnings(false)
         .file(bridge_dir.join("section_bridge.c"));
     bridge_build.compile("wm2000_bridge");
+
+    // Release evidence binds the exact machine-code archives Cargo links.
+    // Logical labels and archive bytes are the complete identity wire; host
+    // paths and pointers never enter it.
+    let program_identity =
+        lowercase_hex(native_program_identity::native_program_archives_sha256([
+            (
+                "generated-code".to_owned(),
+                produced_archive_bytes(&out_dir, "wm2000_recompiled"),
+            ),
+            (
+                "section-bridge".to_owned(),
+                produced_archive_bytes(&out_dir, "wm2000_bridge"),
+            ),
+        ]));
+    println!("cargo:rustc-env=FN64_NATIVE_PROGRAM_ARTIFACT_SHA256={program_identity}");
 
     println!(
         "cargo:rerun-if-changed={}",

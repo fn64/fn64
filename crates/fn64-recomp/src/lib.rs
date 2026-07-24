@@ -10,29 +10,28 @@
 //!
 //! `RecompConfig`/`RspConfig` ([`config`]) are OUR typed representation —
 //! sections, functions, stubs, patches, hooks — never hand-serialized TOML
-//! strings. [`n64recomp`] is the one adapter that knows N64Recomp exists:
-//! it translates a `RecompConfig`/`RspConfig` into N64Recomp's/RSPRecomp's
-//! TOML shape and shells out to the pinned fork's binaries. **This is the
-//! only crate that names N64Recomp** (`docs/DECOUPLING.md`'s explicit
-//! requirement) — every other fn64 crate and the AKI tooling talk to
-//! `Recompiler`, not to N64Recomp directly.
+//! strings. [`load`] reads N64Recomp-format configs (`oot.toml` + symbol
+//! dump) into that typed representation; it is the READ side of the format.
 //!
-//! ## What this crate is NOT (yet)
+//! ## What this crate is now
 //!
-//! This is the seam, not a working end-to-end recompile pipeline swap.
-//! `aki_profile` (Python, `aki-recomp/tools/aki_profile`) keeps owning the
-//! real WM2000/NW4E recompile loop today; this crate is the future home
-//! that pipeline's shell-out logic moves behind, and the eventual swap
-//! point for a from-scratch `fn64-recomp-rs` implementing the same
-//! trait (`docs/DECOUPLING.md` step 5). No full-ROM recompile is attempted
-//! here — see `n64recomp`'s golden serialization test for what IS proven:
-//! a known `RecompConfig`/`RspConfig` round-trips to the exact TOML shape
-//! real AKI-title configs already use.
+//! `fn64-recomp-rs` (the from-scratch, all-Rust VR4300 recompiler,
+//! `docs/DECOUPLING.md` step 5) implements the [`Recompiler`] trait for CPU
+//! code and is the whole-ROM recompile path in tree; see
+//! `docs/RECOMP-RS-COVERAGE.md`. This crate now provides only the shared
+//! seam types (the [`Recompiler`] trait, [`RecompConfig`]/[`RspConfig`],
+//! [`AbiVersion`], [`RecompOutput`]) and the [`load`] reader those consumers
+//! share.
+//!
+//! The former `n64recomp` adapter — which serialized a `RecompConfig` to
+//! N64Recomp/RSPRecomp TOML and shelled out to the pinned fork's binaries —
+//! has been retired: it had no in-tree consumer once `fn64-recomp-rs` became
+//! the recompiler. The pre-generated-C CI oracle lane (compiled by
+//! `fn64-boot-harness`/`fn64-shell` build scripts) is unaffected.
 #![forbid(unsafe_code)]
 
 pub mod config;
 pub mod load;
-pub mod n64recomp;
 
 use std::fmt;
 

@@ -21,7 +21,7 @@
 //! where `TRUNC_W_S(v) == (int32_t)v` (truncate toward zero) and
 //! `CVT_S_W(v) == (float)(int32_t)v`. So `truncf` computes, for a `float` x in
 //! `$f12`, `(float)(int32_t)x` and returns it in `$f0` — a round-toward-zero.
-//! It exercises TRUNC.W.S, CVT.S.W, the FR=0 single-register aliasing
+//! It exercises TRUNC.W.S, CVT.S.W, the physical-FGR FR=0/FR=1 views
 //! (`f12.u32l`/`f12.fl` are the SAME 32-bit word), and a `jr $ra` delay slot.
 //!
 //! [`truncf_oracle`] is that C, hand-transcribed to Rust independently of the
@@ -48,10 +48,84 @@
 //! a small generated-code harness — executes the caller so the emitted
 //! cross-call reaches the callee and produces the expected FPU state.
 
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
 use fn64_recomp_rs::{
     decode, emit_function, fpu, round_ties_even_f32, round_ties_even_f64, FuncInput, Instruction,
     Rdram, RecompContext,
 };
+
+fn current_rlib(deps: &Path) -> PathBuf {
+    std::fs::read_dir(deps)
+        .expect("read target deps directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("libfn64_recomp_rs-") && name.ends_with(".rlib")
+                })
+        })
+        .max_by_key(|path| path.metadata().and_then(|meta| meta.modified()).ok())
+        .expect("fn64_recomp_rs rlib beside integration test")
+}
+
+fn compile_and_run_whole_function(emitted: &str, main_body: &str) -> String {
+    let source = format!(
+        r#"use fn64_recomp_rs::{{Rdram, RecompContext}};
+
+{emitted}
+
+fn main() {{
+{main_body}
+}}
+"#
+    );
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let key = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let process = std::process::id();
+    let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let source_path = out_dir.join(format!("fn64_fpu_whole_{process}_{key}.rs"));
+    let binary_path = out_dir.join(format!("fn64_fpu_whole_{process}_{key}"));
+    std::fs::write(&source_path, source).expect("write whole-function comparison source");
+
+    let deps = std::env::current_exe()
+        .expect("current integration-test executable")
+        .parent()
+        .expect("target deps directory")
+        .to_path_buf();
+    let rlib = current_rlib(&deps);
+    let compile = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .arg("--edition=2021")
+        .arg(&source_path)
+        .arg("--extern")
+        .arg(format!("fn64_recomp_rs={}", rlib.display()))
+        .arg("-L")
+        .arg(format!("dependency={}", deps.display()))
+        .arg("-o")
+        .arg(&binary_path)
+        .output()
+        .expect("invoke rustc for whole-function comparison");
+    assert!(
+        compile.status.success(),
+        "emitted whole function did not compile:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&binary_path)
+        .output()
+        .expect("run emitted whole-function comparison");
+    assert!(
+        run.status.success(),
+        "emitted whole function failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    String::from_utf8_lossy(&run.stdout).into_owned()
+}
 
 // ============================================================================
 // Real-function oracle: `truncf`.
@@ -67,10 +141,10 @@ const TRUNCF_WORDS: [u32; 3] = [
 const TRUNCF_VRAM: u32 = 0x800C_D930;
 
 /// The oracle: hand-transcribed from the N64Recomp C, NOT the emitter.
-/// `TRUNC_W_S(x) = (int32_t)x`, then `CVT_S_W = (float)(int32_t)`. Returns the
-/// bits of `$f0`.
+/// Models the finite in-range values sampled by this legacy C-output oracle.
+/// Exceptional inputs are covered separately by the typed raw-register tests.
 fn truncf_oracle(f12: f32) -> u32 {
-    let truncated: i32 = f12 as i32; // C `(int32_t)float` = truncate toward zero
+    let truncated: i32 = f12 as i32;
     let result: f32 = truncated as f32; // CVT_S_W
     result.to_bits()
 }
@@ -88,13 +162,15 @@ pub fn truncf_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
             0x800CD930 => {
                 // 0x800CD930: TruncWS { fd: 12, fs: 12 }
                 {
-                    let v = ctx.f_s(12) as f64;
-                    let r = ctx.fpu_to_i32(v, Some(1));
+                    let r = ctx.fpu_to_i32_s(12, Some(1));
                     ctx.set_f_bits(12, r as u32);
                 }
                 // 0x800CD934: Jr { rs: 31 }
                 // delay: 0x800CD938: CvtSW { fd: 0, fs: 12 }
-                ctx.set_f_s(0, (ctx.f_bits(12) as i32) as f32);
+                {
+                    let r = ctx.cvt_s_w_bits(12);
+                    ctx.set_f_bits(0, r);
+                }
                 return;
             }
             _ => unreachable!("jumped to unmapped vram {:#X}", pc),
@@ -147,6 +223,222 @@ fn truncf_matches_c_oracle() {
             got, expected
         );
     }
+}
+
+// ============================================================================
+// Whole-function CTC1 enabled-exception boundary.
+// ============================================================================
+
+const CTC1_ENABLED_WORDS: [u32; 3] = [
+    0x44C2_F800, // ctc1 $v0,$fcr31
+    0x03E0_0008, // jr    $ra
+    0x0000_0000, // nop
+];
+const CTC1_ENABLED_VRAM: u32 = 0x8011_0000;
+
+// Pasted verbatim from the emitter and guarded by the golden comparison below.
+// The historical whole-function ABI cannot return a typed CpuFault, so its
+// precise boundary is a named loud trap after the architectural FCSR write.
+#[allow(unused, clippy::all)]
+fn ctc1_enabled_recomp(ctx: &mut RecompContext, _mem: &mut Rdram) {
+    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(
+        0x80110000,
+        "ctc1_enabled_recomp",
+    ));
+    let mut pc: u32 = 0x80110000;
+    'run: loop {
+        match pc {
+            0x80110000 => {
+                // 0x80110000: Ctc1 { rt: 2, fs: 31 }
+                ctx.write_fcr(31, ctx.r_u32(2));
+                if ctx.fcsr_exception_pending() {
+                    fn64_recomp_rs::trap_unsupported(
+                        "enabled FCSR cause written by CTC1 in whole-function lane",
+                    );
+                }
+                // 0x80110004: Jr { rs: 31 }
+                // delay: 0x80110008: Nop
+                // nop
+                return;
+            }
+            _ => unreachable!("jumped to unmapped vram {:#X}", pc),
+        }
+    }
+}
+
+#[test]
+fn whole_function_ctc1_enabled_exception_matches_emitter_and_commits_fcsr_before_trap() {
+    let emitted = emit_function(&FuncInput {
+        name: "ctc1_enabled_recomp",
+        vram: CTC1_ENABLED_VRAM,
+        words: &CTC1_ENABLED_WORDS,
+    });
+    let pasted = include_str!("goldens/ctc1_enabled.rs");
+    let norm = |s: &str| s.trim_end().replace("\r\n", "\n");
+    assert_eq!(
+        norm(&emitted),
+        norm(pasted),
+        "emitter output drifted from goldens/ctc1_enabled.rs"
+    );
+
+    let mut storage = [0u8; 8];
+    let mut mem = Rdram::new(&mut storage);
+    let mut ctx = RecompContext::new();
+    let enabled = 0x0001_0804;
+    ctx.set_r(2, enabled);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctc1_enabled_recomp(&mut ctx, &mut mem);
+    }))
+    .expect_err("enabled CTC1 must remain loud in the whole-function lane");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic");
+    assert!(
+        message.contains("enabled FCSR cause written by CTC1 in whole-function lane"),
+        "unexpected panic: {message}"
+    );
+    assert_eq!(ctx.read_fcr(31), enabled as u32);
+}
+
+#[test]
+fn emitted_whole_function_enabled_compare_is_loud_and_preserves_condition_and_flags() {
+    let emitted = emit_function(&FuncInput {
+        name: "compare_enabled_recomp",
+        vram: 0x8011_0040,
+        words: &[
+            0x4602_0032, // c.eq.s $f0,$f2 -- quiet predicate, SNaN operand
+            0x03E0_0008, // jr $ra
+            0,
+        ],
+    });
+    assert!(
+        emitted.contains("ctx.fpu_compare_s(0, 2, 2);"),
+        "whole-function compare must retain the loud compatibility call"
+    );
+
+    let stdout = compile_and_run_whole_function(
+        &emitted,
+        r#"    const CONDITION: u32 = 1 << 23;
+    const CAUSE_V: u32 = 1 << 16;
+    const ENABLE_V: u32 = 1 << 11;
+    const FLAG_V: u32 = 1 << 6;
+    const FLAG_I: u32 = 1 << 2;
+    let mut storage = [0u8; 8];
+    let mut mem = Rdram::new(&mut storage);
+    let mut ctx = RecompContext::new();
+    ctx.set_f_bits(0, 0x7FC0_0001);
+    ctx.set_f_s(2, 1.0);
+    ctx.write_fcr(31, CONDITION | ENABLE_V | FLAG_I | 3);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compare_enabled_recomp(&mut ctx, &mut mem);
+    }));
+    assert!(panic.is_err(), "enabled whole-function comparison must remain loud");
+    assert_eq!(
+        ctx.read_fcr(31),
+        CONDITION | CAUSE_V | ENABLE_V | FLAG_I | 3
+    );
+    assert_eq!(ctx.read_fcr(31) & FLAG_V, 0);
+    println!("whole-function-compare-loud");"#,
+    );
+    assert_eq!(stdout.trim(), "whole-function-compare-loud");
+}
+
+#[test]
+fn emitted_whole_function_enabled_conversion_is_loud_before_destination_commit() {
+    let emitted = emit_function(&FuncInput {
+        name: "convert_enabled_recomp",
+        vram: 0x8011_0080,
+        words: &[
+            0x4600_0124, // cvt.w.s $f4,$f0
+            0x03E0_0008, // jr $ra
+            0,
+        ],
+    });
+    assert!(emitted.contains("ctx.fpu_to_i32_s(0, None)"));
+
+    let stdout = compile_and_run_whole_function(
+        &emitted,
+        r#"    const CAUSE_I: u32 = 1 << 12;
+    const ENABLE_I: u32 = 1 << 7;
+    const FLAG_I: u32 = 1 << 2;
+    const FLAG_V: u32 = 1 << 6;
+    let mut storage = [0u8; 8];
+    let mut mem = Rdram::new(&mut storage);
+    let mut ctx = RecompContext::new();
+    ctx.set_f_s(0, 1.5);
+    ctx.set_f_bits(4, 0xA5A5_5A5A);
+    ctx.write_fcr(31, ENABLE_I | FLAG_V);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        convert_enabled_recomp(&mut ctx, &mut mem);
+    }));
+    assert!(panic.is_err(), "enabled whole-function conversion must remain loud");
+    assert_eq!(ctx.f_bits(4), 0xA5A5_5A5A);
+    assert_eq!(ctx.read_fcr(31), CAUSE_I | ENABLE_I | FLAG_V);
+    assert_eq!(ctx.read_fcr(31) & FLAG_I, 0);
+    println!("whole-function-conversion-loud");"#,
+    );
+    assert_eq!(stdout.trim(), "whole-function-conversion-loud");
+}
+
+#[test]
+fn emitted_whole_function_fixed_to_float_uses_typed_rounding_and_suppression() {
+    let emitted = emit_function(&FuncInput {
+        name: "fixed_to_float_recomp",
+        vram: 0x8011_00C0,
+        words: &[
+            0x46A0_1121, // cvt.d.l $f4,$f2
+            0x03E0_0008, // jr $ra
+            0,
+        ],
+    });
+    assert!(emitted.contains("ctx.cvt_d_l_bits(2)"));
+    assert!(!emitted.contains(" as f64"));
+
+    let stdout = compile_and_run_whole_function(
+        &emitted,
+        r#"    const CAUSE_I: u32 = 1 << 12;
+    const CAUSE_E: u32 = 1 << 17;
+    const ENABLE_I: u32 = 1 << 7;
+    const FLAG_I: u32 = 1 << 2;
+    let mut storage = [0u8; 8];
+    let mut mem = Rdram::new(&mut storage);
+    let mut ctx = RecompContext::new();
+    ctx.set_d_bits(2, 0x0020_0000_0000_0001);
+    for (mode, expected) in [
+        0x4340_0000_0000_0000,
+        0x4340_0000_0000_0000,
+        0x4340_0000_0000_0001,
+        0x4340_0000_0000_0000,
+    ].into_iter().enumerate() {
+        ctx.write_fcr(31, mode as u32);
+        fixed_to_float_recomp(&mut ctx, &mut mem);
+        assert_eq!(ctx.d_bits(4), expected, "RM={mode}");
+        assert_eq!(ctx.read_fcr(31), mode as u32 | CAUSE_I | FLAG_I);
+    }
+
+    ctx.set_d_bits(4, 0x1122_3344_5566_7788);
+    ctx.write_fcr(31, ENABLE_I);
+    let enabled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixed_to_float_recomp(&mut ctx, &mut mem);
+    }));
+    assert!(enabled.is_err());
+    assert_eq!(ctx.d_bits(4), 0x1122_3344_5566_7788);
+    assert_eq!(ctx.read_fcr(31), CAUSE_I | ENABLE_I);
+
+    ctx.set_d_bits(2, 1 << 55);
+    ctx.set_d_bits(4, 0x8877_6655_4433_2211);
+    ctx.write_fcr(31, FLAG_I);
+    let unimplemented = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixed_to_float_recomp(&mut ctx, &mut mem);
+    }));
+    assert!(unimplemented.is_err());
+    assert_eq!(ctx.d_bits(4), 0x8877_6655_4433_2211);
+    assert_eq!(ctx.read_fcr(31), CAUSE_E | FLAG_I);
+    println!("whole-function-fixed-to-float-typed");"#,
+    );
+    assert_eq!(stdout.trim(), "whole-function-fixed-to-float-typed");
 }
 
 // ============================================================================
@@ -255,7 +547,10 @@ pub fn synth_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
                 // 0x80100000: Mtc1 { rt: 4, fs: 4 }
                 ctx.set_f_bits(4, ctx.r_u32(4));
                 // 0x80100004: CvtSW { fd: 4, fs: 4 }
-                ctx.set_f_s(4, (ctx.f_bits(4) as i32) as f32);
+                {
+                    let r = ctx.cvt_s_w_bits(4);
+                    ctx.set_f_bits(4, r);
+                }
                 // 0x80100008: Lwc1 { ft: 6, base: 5, off: 0 }
                 ctx.set_f_bits(6, mem.load_w(Rdram::eff_addr(ctx.r(5), 0)) as u32);
                 // 0x8010000C: MulS { fd: 8, fs: 4, ft: 6 }
@@ -444,40 +739,85 @@ fn cross_call_executes_to_expected_fpu_state() {
     });
 }
 
-// ============================================================================
-// FR=0 even/odd register-pairing model (the byte-layout property).
-// ============================================================================
-
-/// The whole reason the FPR file isn't 32 plain floats: under FR=0 an odd
-/// single-precision register aliases the HIGH 32-bit word of its even partner.
-/// This mirrors `fn64-abi`'s `f_odd` model. Verify writing an odd single and a
-/// double to the even partner interact exactly as the shared 64-bit slot.
+/// VR4300 User's Manual sections 5.2 and 5.3 define FR as a view selector over
+/// physical FGR state: FR=0 joins adjacent 32-bit FGRs for even doubleword
+/// FPRs, while FR=1 exposes every FGR as an independent 64-bit FPR. Exercise
+/// all 32 physical registers and all 16 FR=0 pairs so a mode transition cannot
+/// accidentally transpose a word or discard the upper halves latent in FR=0.
 #[test]
-fn fr0_odd_single_aliases_even_partner_high_word() {
+fn fr_transitions_preserve_all_physical_fgr_bits_and_pair_views() {
+    const FR: u32 = 1 << 26;
     let mut ctx = RecompContext::new();
-    // Write the even double $f4 = a known 64-bit pattern.
-    ctx.set_d_bits(4, 0x1122_3344_5566_7788);
-    // The even single $f4 reads the LOW word; the odd single $f5 reads the HIGH.
-    assert_eq!(
-        ctx.f_bits(4),
-        0x5566_7788,
-        "even single = low word of the slot"
-    );
-    assert_eq!(
-        ctx.f_bits(5),
-        0x1122_3344,
-        "odd single = high word of the even partner"
-    );
+    ctx.write_cop0(12, FR);
 
-    // Writing the odd single $f5 must land in the HIGH word, leaving the low
-    // word (even single $f4) untouched — the mtc1-to-odd case that was the
-    // OoT-boot SIGSEGV-at-0x40 in fn64-abi.
-    ctx.set_f_bits(5, 0xDEAD_BEEF);
-    assert_eq!(ctx.d_bits(4), 0xDEAD_BEEF_5566_7788);
+    let seeded: [u64; 32] = std::array::from_fn(|idx| {
+        (0xA500_0000u64.wrapping_add(idx as u64) << 32) | 0x5A00_0000u64.wrapping_add(idx as u64)
+    });
+    for (idx, bits) in seeded.into_iter().enumerate() {
+        ctx.set_d_bits(idx as u8, bits);
+    }
+    assert_eq!(ctx.physical_fgr_state().into_words(), seeded);
+
+    ctx.write_cop0(12, 0);
+    for idx in 0u8..32 {
+        assert_eq!(ctx.f_bits(idx), seeded[idx as usize] as u32, "f{idx}");
+    }
+    for even in (0u8..32).step_by(2) {
+        let expected = u64::from(seeded[even as usize] as u32)
+            | (u64::from(seeded[even as usize + 1] as u32) << 32);
+        assert_eq!(ctx.d_bits(even), expected, "FR=0 pair f{even}");
+    }
+
+    let paired: [u64; 16] = std::array::from_fn(|pair| {
+        let even = (pair * 2) as u64;
+        (0xCC00_0001u64.wrapping_add(even) << 32) | 0x3300_0000u64.wrapping_add(even)
+    });
+    for (pair, bits) in paired.into_iter().enumerate() {
+        ctx.set_d_bits((pair * 2) as u8, bits);
+    }
+
+    ctx.write_cop0(12, FR);
+    for (pair, bits) in paired.into_iter().enumerate() {
+        let even = pair * 2;
+        assert_eq!(
+            ctx.d_bits(even as u8),
+            (seeded[even] & 0xFFFF_FFFF_0000_0000) | u64::from(bits as u32),
+            "FR=1 even FGR f{even}"
+        );
+        assert_eq!(
+            ctx.d_bits((even + 1) as u8),
+            (seeded[even + 1] & 0xFFFF_FFFF_0000_0000) | (bits >> 32),
+            "FR=1 odd FGR f{}",
+            even + 1
+        );
+    }
+
+    ctx.set_f_bits(31, 0xDEAD_BEEF);
+    assert_eq!(ctx.d_bits(31) >> 32, seeded[31] >> 32);
+    ctx.write_cop0(12, 0);
+    assert_eq!(ctx.f_bits(31), 0xDEAD_BEEF);
+    assert_eq!(ctx.d_bits(30) >> 32, 0xDEAD_BEEF);
+}
+
+#[test]
+fn fr1_odd_operands_flow_through_compare_and_float_to_fixed() {
+    const FR: u32 = 1 << 26;
+    let mut ctx = RecompContext::new();
+    ctx.cop0_status = FR;
+
+    ctx.set_f_d(1, 1.5);
+    ctx.set_f_d(3, 2.5);
+    ctx.fpu_compare_d(1, 3, 12);
+    assert!(ctx.fpu_cond);
+    assert_eq!(ctx.fpu_to_i64_d(1, Some(1)), 1);
+
+    ctx.set_d_bits(5, 0xA5A5_5A5A_0000_0000);
+    ctx.set_f_s(5, -1.5);
+    assert_eq!(ctx.fpu_to_i32_s(5, Some(2)), -1);
     assert_eq!(
-        ctx.f_bits(4),
-        0x5566_7788,
-        "low word preserved by an odd-register write"
+        ctx.d_bits(5) >> 32,
+        0xA5A5_5A5A,
+        "single write preserves upper word"
     );
 }
 
@@ -725,9 +1065,11 @@ fn cop1_branch_delay_slot_classification() {
 // Closes the whole-ROM gap report's top decoder gap: OoT's `floorf`/`ceilf`/
 // `floor`/`ceil` (@0x800CD8C0..) use `floor.w.{s,d}` (funct 0x0F) and
 // `ceil.w.{s,d}` (funct 0x0E), which the decoder previously returned as
-// `Unknown`. Decode + emit + execute are all validated bit-exactly against a
-// hand-transcribed C oracle (`(int32_t)floorf(x)` / `(int32_t)ceilf(x)`),
-// exactly the way `truncf` above is validated.
+// `Unknown`. Decode + emit + execute are checked against the historical
+// N64Recomp C shape for the finite, in-range sample set, exactly as `truncf`
+// above is checked. That C-cast model is not an authority for NaN,
+// denormal, infinity, or out-of-range behavior; typed raw-register tests own
+// those cases.
 // ============================================================================
 
 /// Decode: the exact real OoT words from the gap report must decode to the new
@@ -768,26 +1110,24 @@ fn floor_ceil_w_emit() {
         };
         emit_function(&input)
     };
-    // Post-merge: FLOOR/CEIL/ROUND.W route through the unified `fpu_to_i32(v,
-    // Some(mode))` runtime helper (floor=3, ceil=2, round-ties-even=0), which
-    // -- unlike the earlier inline `.floor() as i32` -- honors the FCSR mode
-    // and raises the inexact/invalid FP flags per the VR4300. Assert the mode
-    // arg + source-width for each; behavior is bit-checked in
+    // FLOOR/CEIL/ROUND.W route through the raw-register typed helpers with
+    // floor=3, ceil=2, and round-ties-even=0. The S/D suffix preserves source
+    // width and legacy NaN classification before any destination write.
+    // Behavior is bit-checked in
     // `floor_ceil_w_execute_matches_oracle` and the ISA rounding sweep.
-    assert!(emit1(0x4600630F).contains("ctx.fpu_to_i32(v, Some(3))")); // FLOOR.W.S
-    assert!(emit1(0x4600630F).contains("ctx.f_s(12) as f64"));
-    assert!(emit1(0x4600630E).contains("ctx.fpu_to_i32(v, Some(2))")); // CEIL.W.S
-    assert!(emit1(0x4620630F).contains("ctx.fpu_to_i32(v, Some(3))")); // FLOOR.W.D
-    assert!(emit1(0x4620630F).contains("ctx.f_d(12)"));
-    assert!(emit1(0x4620630E).contains("ctx.fpu_to_i32(v, Some(2))")); // CEIL.W.D
-    assert!(emit1(0x4600630C).contains("ctx.fpu_to_i32(v, Some(0))")); // ROUND.W.S
-    assert!(emit1(0x4620630C).contains("ctx.fpu_to_i32(v, Some(0))")); // ROUND.W.D
+    assert!(emit1(0x4600630F).contains("ctx.fpu_to_i32_s(12, Some(3))")); // FLOOR.W.S
+    assert!(emit1(0x4600630E).contains("ctx.fpu_to_i32_s(12, Some(2))")); // CEIL.W.S
+    assert!(emit1(0x4620630F).contains("ctx.fpu_to_i32_d(12, Some(3))")); // FLOOR.W.D
+    assert!(emit1(0x4620630E).contains("ctx.fpu_to_i32_d(12, Some(2))")); // CEIL.W.D
+    assert!(emit1(0x4600630C).contains("ctx.fpu_to_i32_s(12, Some(0))")); // ROUND.W.S
+    assert!(emit1(0x4620630C).contains("ctx.fpu_to_i32_d(12, Some(0))")); // ROUND.W.D
 }
 
 /// Execute-and-oracle: model OoT `floorf`/`ceilf` (`floor.w.s $f0,$f12`;
 /// `jr $ra`; `cvt.s.w $f0,$f0` in delay slot), matching `truncf`'s structure
-/// but rounding toward -inf/+inf. Validated bit-exact against the C oracle
-/// over sign/fractional-boundary inputs.
+/// but rounding toward -inf/+inf. The historical C-shaped oracle covers only
+/// the finite, in-range sign/fractional samples below. It deliberately makes
+/// no exceptional or out-of-range conversion claim.
 #[test]
 fn floor_ceil_w_execute_matches_oracle() {
     // Emitted body for floorf-style: floor.w into $f0, then cvt.s.w back.
@@ -1194,12 +1534,20 @@ fn fr1_odd_double_is_independent_register() {
 
     ctx.set_d_bits(2, 0xAAAA_AAAA_AAAA_AAAA);
     ctx.set_d_bits(3, 0x5555_5555_5555_5555);
-    assert_eq!(ctx.d_bits(2), 0xAAAA_AAAA_AAAA_AAAA, "$f2 unchanged by $f3 write");
-    assert_eq!(ctx.d_bits(3), 0x5555_5555_5555_5555, "$f3 is its own register");
+    assert_eq!(
+        ctx.d_bits(2),
+        0xAAAA_AAAA_AAAA_AAAA,
+        "$f2 unchanged by $f3 write"
+    );
+    assert_eq!(
+        ctx.d_bits(3),
+        0x5555_5555_5555_5555,
+        "$f3 is its own register"
+    );
 }
 
-/// FR=1: single-precision `$fN` is the low 32 bits of slot N — there is NO
-/// even/odd high-word aliasing. The odd single `$f5` is independent of `$f4`.
+/// FR=1: single-precision `$fN` is the low 32 bits of physical FGR N, just as
+/// in FR=0. The odd single `$f5` is independent of `$f4` in either view.
 #[test]
 fn fr1_odd_single_is_independent_no_aliasing() {
     let mut ctx = RecompContext::new();
@@ -1207,39 +1555,44 @@ fn fr1_odd_single_is_independent_no_aliasing() {
     ctx.set_f_bits(4, 0x1111_1111);
     ctx.set_f_bits(5, 0x2222_2222);
     assert_eq!(ctx.f_bits(4), 0x1111_1111, "FR=1: $f4 own low word");
-    assert_eq!(ctx.f_bits(5), 0x2222_2222, "FR=1: $f5 own low word, not $f4 high");
+    assert_eq!(
+        ctx.f_bits(5),
+        0x2222_2222,
+        "FR=1: $f5 own low word, not $f4 high"
+    );
     // $f4's slot high word is untouched by the $f5 write (no aliasing).
-    assert_eq!(ctx.d_bits(4) >> 32, 0, "FR=1: no write bled into $f4 high word");
+    assert_eq!(
+        ctx.d_bits(4) >> 32,
+        0,
+        "FR=1: no write bled into $f4 high word"
+    );
 }
 
-/// FR=0 even-pairing is preserved after this change: the even/odd single alias
-/// and the even-only double addressing still hold (regression guard).
+/// FR=0 exposes each physical FGR low word as a single and joins adjacent low
+/// words only for an even-indexed doubleword operand.
 #[test]
-fn fr0_pairing_preserved() {
-    let mut ctx = RecompContext::new(); // FR=0.
+fn fr0_singles_are_physical_low_words_and_even_doubles_pair_them() {
+    let mut ctx = RecompContext::new();
     assert!(!ctx.fpu_fr());
-    ctx.set_d_bits(4, 0x1122_3344_5566_7788);
-    assert_eq!(ctx.f_bits(4), 0x5566_7788, "FR=0 even single = low word");
-    assert_eq!(ctx.f_bits(5), 0x1122_3344, "FR=0 odd single = even partner high word");
+    ctx.set_f_bits(4, 0x5566_7788);
+    ctx.set_f_bits(5, 0x1122_3344);
+    assert_eq!(ctx.f_bits(4), 0x5566_7788);
+    assert_eq!(ctx.f_bits(5), 0x1122_3344);
+    assert_eq!(ctx.d_bits(4), 0x1122_3344_5566_7788);
 }
 
-/// The SAME program run under FR=0 vs FR=1 behaves per spec: writing $f2 then
-/// reading $f3 as a double sees the aliased value in FR=0 but garbage/zero (the
-/// independent register) in FR=1.
 #[test]
-fn fr_mode_changes_odd_double_semantics() {
-    let mut fr0 = RecompContext::new();
-    fr0.set_d_bits(2, 0x0102_0304_0506_0708);
-    let fr0_odd = fr0.d_bits(3); // aliases $f2
+#[should_panic(expected = "FR=0 doubleword read from odd FPR f3")]
+fn fr0_odd_double_read_is_loudly_invalid() {
+    let ctx = RecompContext::new();
+    let _ = ctx.d_bits(3);
+}
 
-    let mut fr1 = RecompContext::new();
-    fr1.write_cop0(12, STATUS_FR);
-    fr1.set_d_bits(2, 0x0102_0304_0506_0708);
-    let fr1_odd = fr1.d_bits(3); // independent (still zero)
-
-    assert_eq!(fr0_odd, 0x0102_0304_0506_0708, "FR=0: $f3 aliases $f2");
-    assert_eq!(fr1_odd, 0, "FR=1: $f3 is its own (untouched) register");
-    assert_ne!(fr0_odd, fr1_odd, "the FR bit changes the observable semantics");
+#[test]
+#[should_panic(expected = "FR=0 doubleword write to odd FPR f3")]
+fn fr0_odd_double_write_is_loudly_invalid() {
+    let mut ctx = RecompContext::new();
+    ctx.set_d_bits(3, 0x0102_0304_0506_0708);
 }
 
 // ============================================================================
@@ -1262,7 +1615,11 @@ fn movt_movf_honor_condition_flag() {
     ctx.set_f_bits(0, 0xDEAD_BEEF);
     ctx.fpu_cond = false;
     ctx.fpu_movcf_s(0, 2, true); // MOVT.S: cond==false -> no move
-    assert_eq!(ctx.f_bits(0), 0xDEAD_BEEF, "MOVT.S leaves fd when cond clear");
+    assert_eq!(
+        ctx.f_bits(0),
+        0xDEAD_BEEF,
+        "MOVT.S leaves fd when cond clear"
+    );
 
     // MOVF.S: cond clear -> move.
     ctx.set_f_bits(0, 0xDEAD_BEEF);
@@ -1276,11 +1633,19 @@ fn movt_movf_honor_condition_flag() {
     d.set_d_bits(2, 0x4009_0000_0000_0000); // 3.125
     d.fpu_cond = true;
     d.fpu_movcf_d(0, 2, true);
-    assert_eq!(d.d_bits(0), 0x4009_0000_0000_0000, "MOVT.D moves when cond set");
+    assert_eq!(
+        d.d_bits(0),
+        0x4009_0000_0000_0000,
+        "MOVT.D moves when cond set"
+    );
     d.set_d_bits(0, 0xDEAD_BEEF_DEAD_BEEF);
     d.fpu_cond = false;
     d.fpu_movcf_d(0, 2, true);
-    assert_eq!(d.d_bits(0), 0xDEAD_BEEF_DEAD_BEEF, "MOVT.D no move when cond clear");
+    assert_eq!(
+        d.d_bits(0),
+        0xDEAD_BEEF_DEAD_BEEF,
+        "MOVT.D no move when cond clear"
+    );
 }
 
 /// MOVZ moves when the GPR reads zero; MOVN moves when nonzero. Both S and D.
@@ -1309,10 +1674,18 @@ fn movz_movn_honor_gpr() {
     d.set_d_bits(2, 0x4009_0000_0000_0000);
     d.set_r(8, 0);
     d.fpu_movz_d(0, 2, 8);
-    assert_eq!(d.d_bits(0), 0x4009_0000_0000_0000, "MOVZ.D moves when GPR==0");
+    assert_eq!(
+        d.d_bits(0),
+        0x4009_0000_0000_0000,
+        "MOVZ.D moves when GPR==0"
+    );
     d.set_d_bits(0, 0xDEAD_BEEF_DEAD_BEEF);
     d.fpu_movn_d(0, 2, 8); // GPR still 0 -> no move
-    assert_eq!(d.d_bits(0), 0xDEAD_BEEF_DEAD_BEEF, "MOVN.D no move when GPR==0");
+    assert_eq!(
+        d.d_bits(0),
+        0xDEAD_BEEF_DEAD_BEEF,
+        "MOVN.D no move when GPR==0"
+    );
 }
 
 /// The MOVF/MOVT/MOVZ/MOVN.fmt words decode to the right typed instructions
@@ -1323,14 +1696,42 @@ fn conditional_moves_decode() {
     // Layout: op(0x11)<<26 | fmt<<21 | ft<<16 | fs<<11 | fd<<6 | funct.
     // MOVT.S $f4,$f2,cc0: fmt=S(0x10), tf=1 (ft bit0), funct=0x11.
     let movt_s = (0x11 << 26) | (0x10 << 21) | (0x1 << 16) | (2 << 11) | (4 << 6) | 0x11;
-    assert_eq!(decode(movt_s), MovcfS { fd: 4, fs: 2, tf: true });
+    assert_eq!(
+        decode(movt_s),
+        MovcfS {
+            fd: 4,
+            fs: 2,
+            tf: true
+        }
+    );
     let movf_s = (0x11 << 26) | (0x10 << 21) | (2 << 11) | (4 << 6) | 0x11; // ft=0 => tf=0
-    assert_eq!(decode(movf_s), MovcfS { fd: 4, fs: 2, tf: false });
+    assert_eq!(
+        decode(movf_s),
+        MovcfS {
+            fd: 4,
+            fs: 2,
+            tf: false
+        }
+    );
     // MOVZ.S $f4,$f2,$t0(=8): ft carries the GPR index.
     let movz_s = (0x11 << 26) | (0x10 << 21) | (8 << 16) | (2 << 11) | (4 << 6) | 0x12;
-    assert_eq!(decode(movz_s), MovzS { fd: 4, fs: 2, rt: 8 });
+    assert_eq!(
+        decode(movz_s),
+        MovzS {
+            fd: 4,
+            fs: 2,
+            rt: 8
+        }
+    );
     let movn_d = (0x11 << 26) | (0x11 << 21) | (8 << 16) | (2 << 11) | (4 << 6) | 0x13;
-    assert_eq!(decode(movn_d), MovnD { fd: 4, fs: 2, rt: 8 });
+    assert_eq!(
+        decode(movn_d),
+        MovnD {
+            fd: 4,
+            fs: 2,
+            rt: 8
+        }
+    );
 }
 
 // ============================================================================
@@ -1350,7 +1751,7 @@ const CAUSE_E: u32 = 1 << 17;
 #[test]
 fn denormal_operand_traps_unimplemented_even_with_enables_clear() {
     let mut ctx = RecompContext::new(); // all Enables clear.
-    // Smallest positive single subnormal: exponent 0, mantissa 1.
+                                        // Smallest positive single subnormal: exponent 0, mantissa 1.
     let denorm = 0x0000_0001u32;
     ctx.set_f_bits(2, denorm);
     ctx.set_f_bits(4, 1.0f32.to_bits());
@@ -1358,7 +1759,11 @@ fn denormal_operand_traps_unimplemented_even_with_enables_clear() {
     let trapped = ctx.fpu_add_s(0, 2, 4);
     assert!(trapped, "denormal operand traps (E is unmaskable)");
     assert_ne!(ctx.read_fcr(31) & CAUSE_E, 0, "Cause.E set");
-    assert_eq!(ctx.f_bits(0), 0xDEAD_BEEF, "destination not committed on trap");
+    assert_eq!(
+        ctx.f_bits(0),
+        0xDEAD_BEEF,
+        "destination not committed on trap"
+    );
 }
 
 /// A denormal RESULT (from a normal op that underflows into subnormal range)
@@ -1370,7 +1775,11 @@ fn denormal_result_traps_unimplemented() {
     ctx.set_f_bits(4, 0.5f32.to_bits());
     let trapped = ctx.fpu_mul_s(0, 2, 4); // -> subnormal result
     assert!(trapped, "a subnormal result traps E");
-    assert_ne!(ctx.read_fcr(31) & CAUSE_E, 0, "Cause.E set on denormal result");
+    assert_ne!(
+        ctx.read_fcr(31) & CAUSE_E,
+        0,
+        "Cause.E set on denormal result"
+    );
 }
 
 /// A normal op with normal operands and a normal result does NOT raise E.
@@ -1382,7 +1791,11 @@ fn normal_op_does_not_trap_unimplemented() {
     let trapped = ctx.fpu_add_s(0, 2, 4);
     assert!(!trapped, "normal op does not trap");
     assert_eq!(ctx.read_fcr(31) & CAUSE_E, 0, "Cause.E clear");
-    assert_eq!(ctx.f_bits(0), (1.5f32 + 2.25f32).to_bits(), "result committed");
+    assert_eq!(
+        ctx.f_bits(0),
+        (1.5f32 + 2.25f32).to_bits(),
+        "result committed"
+    );
 }
 
 /// The shim's denormal predicates directly (double precision too).
@@ -1391,7 +1804,10 @@ fn denormal_predicates() {
     assert!(fpu::is_denormal_s(0x0000_0001));
     assert!(fpu::is_denormal_s(0x007F_FFFF));
     assert!(!fpu::is_denormal_s(0), "zero is not a denormal");
-    assert!(!fpu::is_denormal_s(f32::MIN_POSITIVE.to_bits()), "smallest normal is not denormal");
+    assert!(
+        !fpu::is_denormal_s(f32::MIN_POSITIVE.to_bits()),
+        "smallest normal is not denormal"
+    );
     assert!(fpu::is_denormal_d(0x0000_0000_0000_0001));
     assert!(!fpu::is_denormal_d(0), "zero is not a denormal");
     assert!(!fpu::is_denormal_d(f64::MIN_POSITIVE.to_bits()));

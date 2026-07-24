@@ -1,4 +1,4 @@
-use std::ffi::{c_char, c_int, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::ptr::NonNull;
 
 #[cfg(test)]
@@ -486,7 +486,7 @@ fn validate_present_capture_metadata(
         value => {
             return Err(format!(
                 "RT64 returned unknown present pixel format {value}"
-            ))
+            ));
         }
     };
     let graphics_api = match metadata.graphics_api {
@@ -496,7 +496,7 @@ fn validate_present_capture_metadata(
         value => {
             return Err(format!(
                 "RT64 returned unknown present graphics API {value}"
-            ))
+            ));
         }
     };
     Ok((host_len, format, graphics_api))
@@ -2074,6 +2074,7 @@ unsafe extern "C" {
         rdram_len: usize,
         display_list: u32,
         output_addr: u32,
+        legacy_wire: u32,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
@@ -3269,6 +3270,17 @@ impl Context {
         display_list: u32,
         output_addr: u32,
     ) -> Result<(), String> {
+        self.process_synthetic_s2dex_wire(rdram, display_list, output_addr, false)
+    }
+
+    #[cfg(feature = "synthetic-s2dex-evidence")]
+    pub(crate) fn process_synthetic_s2dex_wire(
+        &mut self,
+        rdram: &mut [u8],
+        display_list: u32,
+        output_addr: u32,
+        legacy_wire: bool,
+    ) -> Result<(), String> {
         let mut error = [0; ERROR_CAPACITY];
         // SAFETY: the allocation is valid for its passed length and uniquely
         // borrowed throughout the synchronous evidence-only HLE call.
@@ -3279,6 +3291,7 @@ impl Context {
                 rdram.len(),
                 display_list,
                 output_addr,
+                u32::from(legacy_wire),
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -3816,21 +3829,27 @@ mod tests {
             assert_eq!(raw_ucode_identity(typed), (9, detail));
             assert!(validate_f3dzex2_profile(typed, Some(variant)).is_ok());
         }
-        assert!(validate_f3dzex2_profile(
-            TaskAdmissionUcode::F3dzex2(fn64_render::F3dzex2Variant::NoNFifo206H),
-            Some(fn64_render::F3dzex2Variant::NoNFifo208I),
-        )
-        .is_err());
-        assert!(validate_f3dzex2_profile(
-            TaskAdmissionUcode::F3dex2,
-            Some(fn64_render::F3dzex2Variant::NoNFifo208J)
-        )
-        .is_err());
-        assert!(validate_f3dzex2_profile(
-            TaskAdmissionUcode::F3dzex2(fn64_render::F3dzex2Variant::NoNFifo208J),
-            None,
-        )
-        .is_err());
+        assert!(
+            validate_f3dzex2_profile(
+                TaskAdmissionUcode::F3dzex2(fn64_render::F3dzex2Variant::NoNFifo206H),
+                Some(fn64_render::F3dzex2Variant::NoNFifo208I),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_f3dzex2_profile(
+                TaskAdmissionUcode::F3dex2,
+                Some(fn64_render::F3dzex2Variant::NoNFifo208J)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_f3dzex2_profile(
+                TaskAdmissionUcode::F3dzex2(fn64_render::F3dzex2Variant::NoNFifo208J),
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3949,8 +3968,10 @@ mod tests {
             )
         };
         assert_eq!(ok, 0);
-        assert!(error_string(&error, "missing AA-selector diagnostic")
-            .contains("requires an explicit AA selector marker"));
+        assert!(
+            error_string(&error, "missing AA-selector diagnostic")
+                .contains("requires an explicit AA selector marker")
+        );
     }
 
     #[test]
@@ -3988,8 +4009,10 @@ mod tests {
             )
         };
         assert_eq!(ok, 0);
-        assert!(error_string(&error, "missing malformed-VI diagnostic")
-            .contains("invalid width or active window"));
+        assert!(
+            error_string(&error, "missing malformed-VI diagnostic")
+                .contains("invalid width or active window")
+        );
     }
 
     fn present_capture_wire(format: u32) -> RawPresentCapture {
@@ -4097,9 +4120,9 @@ mod tests {
         assert!(cmake.contains("9b3cf39bb15fc0c7d52085566197042f4960cc410b241e38457bb817f2501e5b"));
         assert!(cmake.contains("fn64_rt64_nominal_full_rate(this)"));
         let expected_overlay = if cfg!(feature = "hfr-evidence") {
-            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1+hfr-post-present-call:v1"
+            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1+s2dex-object-rect:v3+hfr-post-present-call:v1"
         } else {
-            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1"
+            "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1+s2dex-object-rect:v3"
         };
         assert_eq!(env!("FN64_RT64_SOURCE_OVERLAY_ID"), expected_overlay);
     }
@@ -4507,21 +4530,27 @@ mod tests {
     fn extended_evidence_wire_rejects_overflow_and_ambiguous_tags() {
         let mut excess = complete_extended_wire();
         excess.group_count = EXTENDED_MAX_GROUPS as u32 + 1;
-        assert!(extended_evidence_from_raw(excess)
-            .unwrap_err()
-            .contains("exceeds capacity"));
+        assert!(
+            extended_evidence_from_raw(excess)
+                .unwrap_err()
+                .contains("exceeds capacity")
+        );
 
         let mut bad_selector = complete_extended_wire();
         bad_selector.groups[0].position_selector = 3;
-        assert!(extended_evidence_from_raw(bad_selector)
-            .unwrap_err()
-            .contains("selector"));
+        assert!(
+            extended_evidence_from_raw(bad_selector)
+                .unwrap_err()
+                .contains("selector")
+        );
 
         let mut bad_fraction = complete_extended_wire();
         bad_fraction.generated_presents[0].interpolation_denominator = 0;
-        assert!(extended_evidence_from_raw(bad_fraction)
-            .unwrap_err()
-            .contains("inconsistent generated-presentation"));
+        assert!(
+            extended_evidence_from_raw(bad_fraction)
+                .unwrap_err()
+                .contains("inconsistent generated-presentation")
+        );
     }
 
     #[cfg(feature = "hfr-evidence")]
@@ -4583,10 +4612,12 @@ mod tests {
             generated_presents: Default::default(),
             ..exact_double_hfr_wire()
         };
-        assert!(hfr_evidence_from_raw(control)
-            .unwrap()
-            .presentations
-            .is_empty());
+        assert!(
+            hfr_evidence_from_raw(control)
+                .unwrap()
+                .presentations
+                .is_empty()
+        );
     }
 
     #[cfg(feature = "hfr-evidence")]

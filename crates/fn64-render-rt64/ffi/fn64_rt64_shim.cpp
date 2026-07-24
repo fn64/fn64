@@ -45,6 +45,7 @@
 #endif
 #if defined(FN64_RT64_SYNTHETIC_S2DEX_EVIDENCE)
 #include "gbi/rt64_gbi_rdp.h"
+#include "gbi/rt64_gbi_s2dex.h"
 #include "gbi/rt64_gbi_s2dex2.h"
 #endif
 #include "common/rt64_filesystem_directory.h"
@@ -5546,6 +5547,7 @@ extern "C" int fn64_rt64_process_synthetic_s2dex2(
     size_t rdram_len,
     uint32_t display_list,
     uint32_t output_addr,
+    uint32_t legacy_wire,
     char *error,
     size_t error_capacity) {
     try {
@@ -5578,12 +5580,24 @@ extern "C" int fn64_rt64_process_synthetic_s2dex2(
 
         RT64::Interpreter *interpreter = context->application->interpreter.get();
         RT64::State *state = context->application->state.get();
+        if (legacy_wire > 1U) {
+            set_error(error, error_capacity,
+                      "synthetic RT64 S2DEX wire-family selector is not boolean");
+            return 0;
+        }
+        const RT64::GBIUCode synthetic_ucode =
+            (legacy_wire != 0U) ? RT64::GBIUCode::S2DEX : RT64::GBIUCode::S2DEX2;
         RT64::GBI &synthetic_gbi = interpreter->gbiManager.gbiCache[
-            static_cast<uint32_t>(RT64::GBIUCode::S2DEX2)];
+            static_cast<uint32_t>(synthetic_ucode)];
         if (synthetic_gbi.ucode == RT64::GBIUCode::Unknown) {
-            synthetic_gbi.ucode = RT64::GBIUCode::S2DEX2;
+            synthetic_gbi.ucode = synthetic_ucode;
             RT64::GBI_RDP::setup(&synthetic_gbi, true);
-            RT64::GBI_S2DEX2::setup(&synthetic_gbi);
+            if (legacy_wire != 0U) {
+                RT64::GBI_S2DEX::setup(&synthetic_gbi);
+            }
+            else {
+                RT64::GBI_S2DEX2::setup(&synthetic_gbi);
+            }
         }
         RT64::GBI *previous_gbi = interpreter->hleGBI;
         struct RestoreSyntheticGbi {

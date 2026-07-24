@@ -32,13 +32,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aki-audio-ucode"
-version = "0.0.0"
-dependencies = [
- "fn64-audio",
-]
-
-[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -721,6 +714,9 @@ version = "0.0.0"
 dependencies = [
  "cpal",
  "fn64-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -728,6 +724,7 @@ name = "fn64-boot-harness"
 version = "0.0.0"
 dependencies = [
  "fn64-abi",
+ "fn64-audio",
  "fn64-recomp-rs",
  "fn64-render",
  "fn64-runtime",
@@ -818,6 +815,7 @@ dependencies = [
  "fn64-render",
  "fn64-render-reference",
  "fn64-runtime",
+ "serde",
  "serde_json",
  "sha2",
 ]
@@ -836,7 +834,6 @@ dependencies = [
 name = "fn64-shell"
 version = "0.0.0"
 dependencies = [
- "aki-audio-ucode",
  "cc",
  "dirs",
  "egui",
