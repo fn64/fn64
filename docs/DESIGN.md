@@ -289,7 +289,11 @@ schema v22 and were independently reverified locally on 2026-07-22. Both
 series are historical under schema v28 and require regeneration. They bind
 their then-current boundary-owned observations and the compiled unsupported-
 instrumentation identity. A retained public synthetic identified-native XBUS
-series binds the same denominator without acquiring private-ROM authority.
+series binds the same denominator without acquiring private-ROM authority. Its
+specialized runner operation exposes only a self-hashed receipt; repository
+acceptance is instead anchored solely by the exact target-named macOS arm64
+semantic fingerprint, including both build-produced archive hashes. Compiler,
+SDK, or target drift fails closed until a separately reviewed golden exists.
 Their combined incomplete matrix accepted all 30 reports, satisfied 12 of 162
 requirements, and retained 150 explicit gaps. Self-hashed receipts are
 retained integrity evidence, not transferable process attestation, and the

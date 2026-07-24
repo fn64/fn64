@@ -13,16 +13,16 @@ use fn64_boot_harness::{
     RspRdpObservationKindEvidence, PRIVATE_RELEASE_SERIES_COUNT,
     REPOSITORY_SYNTHETIC_RELEASE_CYCLE,
 };
+#[cfg(not(feature = "synthetic-native-archive-evidence"))]
+use fn64_boot_harness::{run_private_release_series, verify_private_release_series};
+#[cfg(all(
+    feature = "synthetic-native-archive-evidence",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
 use fn64_boot_harness::{
-    run_private_release_series, verify_private_release_series, PrivateArtifactIdentity,
-    PrivateChildCommand, PrivateEnvironmentEntry, PrivateFileIdentity, PrivateReleaseRunContract,
-    ReleaseRomClass, PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA, REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES,
-    REPOSITORY_SYNTHETIC_RELEASE_MANIFEST_BYTES, REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES,
-};
-#[cfg(feature = "synthetic-native-archive-evidence")]
-use fn64_boot_harness::{
-    verify_release_matrix, verify_repository_synthetic_native_private_release_run_contract,
-    ArtifactDigest, CertificationProfileIdentity, CertificationRequirementClass, ClosurePath,
+    run_synthetic_native_private_release_series, verify_release_matrix, ArtifactDigest,
+    CertificationProfileIdentity, CertificationRequirementClass, ClosurePath,
     ExecutionDestinationEvidence, ReleaseMatrixManifest, ReleaseMatrixScenario,
     ReleaseMatrixVerification, RspRdpEvidence, UnsupportedInstrumentationEvidence,
     RELEASE_MATRIX_SCHEMA, REPOSITORY_SYNTHETIC_NATIVE_RELEASE_SCENARIO,
@@ -31,7 +31,17 @@ use fn64_boot_harness::{
 use fn64_boot_harness::{
     verify_repository_synthetic_private_release_run_contract, REPOSITORY_SYNTHETIC_RELEASE_SCENARIO,
 };
-#[cfg(feature = "synthetic-native-archive-evidence")]
+use fn64_boot_harness::{
+    PrivateArtifactIdentity, PrivateChildCommand, PrivateEnvironmentEntry, PrivateFileIdentity,
+    PrivateReleaseRunContract, ReleaseRomClass, PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA,
+    REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES, REPOSITORY_SYNTHETIC_RELEASE_MANIFEST_BYTES,
+    REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES,
+};
+#[cfg(all(
+    feature = "synthetic-native-archive-evidence",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -46,10 +56,20 @@ use std::{
 const CHILD_ENV: &str = "FN64_TEST_PRIVATE_RELEASE_CHILD";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "synthetic-native-archive-evidence")]
+#[cfg(all(
+    feature = "synthetic-native-archive-evidence",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SyntheticSemanticFingerprint {
+    build_target: String,
+    host_os: String,
+    host_arch: String,
+    generated_archive_sha256: String,
+    bridge_archive_sha256: String,
+    native_program_sha256: String,
     schema: String,
     scenario: String,
     input_sha256: String,
@@ -63,10 +83,25 @@ struct SyntheticSemanticFingerprint {
     report_sha256: String,
 }
 
-#[cfg(feature = "synthetic-native-archive-evidence")]
+#[cfg(all(
+    feature = "synthetic-native-archive-evidence",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
 impl SyntheticSemanticFingerprint {
-    fn from_report(report: &ReleaseGateReport) -> Self {
+    fn from_report(report: &ReleaseGateReport, archives: &[PrivateArtifactIdentity; 2]) -> Self {
+        let ExecutionDestinationSource::NativeArchive { artifact_sha256 } =
+            &report.execution_destinations.source
+        else {
+            panic!("synthetic-native fingerprint requires identified-native execution")
+        };
         Self {
+            build_target: env!("FN64_SYNTHETIC_NATIVE_TARGET").to_owned(),
+            host_os: std::env::consts::OS.to_owned(),
+            host_arch: std::env::consts::ARCH.to_owned(),
+            generated_archive_sha256: archives[0].sha256.clone(),
+            bridge_archive_sha256: archives[1].sha256.clone(),
+            native_program_sha256: artifact_sha256.clone(),
             schema: report.schema.clone(),
             scenario: report.scenario.clone(),
             input_sha256: report.input_sha256.clone(),
@@ -143,7 +178,11 @@ fn synthetic_input_identity(path: &Path) -> PrivateArtifactIdentity {
     }
 }
 
-#[cfg(feature = "synthetic-native-archive-evidence")]
+#[cfg(all(
+    feature = "synthetic-native-archive-evidence",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
 fn embedded_artifact_identity(path: &Path, bytes: &[u8], role: &str) -> PrivateArtifactIdentity {
     PrivateArtifactIdentity {
         role: role.to_owned(),
@@ -281,9 +320,16 @@ fn load_xbus_evidence(
         .collect()
 }
 
-#[cfg(feature = "synthetic-native-archive-evidence")]
+#[cfg(all(
+    feature = "synthetic-native-archive-evidence",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
 #[test]
-fn ten_fresh_native_processes_satisfy_the_xbus_dpc_matrix_requirement() {
+fn ten_fresh_macos_arm64_native_processes_satisfy_the_xbus_dpc_matrix_requirement() {
+    assert_eq!(env!("FN64_SYNTHETIC_NATIVE_TARGET"), "aarch64-apple-darwin");
+    assert_eq!(std::env::consts::OS, "macos");
+    assert_eq!(std::env::consts::ARCH, "aarch64");
     let directory = TestDirectory::new();
     let manifest = directory.0.join("synthetic-manifest.json");
     let readiness = directory.0.join("synthetic-readiness.json");
@@ -336,21 +382,20 @@ fn ten_fresh_native_processes_satisfy_the_xbus_dpc_matrix_requirement() {
         contract_sha256: String::new(),
     };
     contract.contract_sha256 = contract.recompute_contract_sha256().unwrap();
-    let expected_archives = archives;
-    let expected_child = contract.child.clone();
-    let contract = verify_repository_synthetic_native_private_release_run_contract(
-        contract,
-        expected_archives,
-        expected_child,
-    )
-    .unwrap();
+    let caller_bound_archives = archives.clone();
+    let caller_bound_child = contract.child.clone();
     let output = directory.0.join("series");
-    let receipt = run_private_release_series(&contract, &output).unwrap_or_else(|error| {
+    let receipt = run_synthetic_native_private_release_series(
+        contract,
+        caller_bound_archives,
+        caller_bound_child,
+        &output,
+    )
+    .unwrap_or_else(|error| {
         let stdout = fs::read_to_string(output.join("run-01.stdout.log")).unwrap_or_default();
         let stderr = fs::read_to_string(output.join("run-01.stderr.log")).unwrap_or_default();
         panic!("{error}\nchild stdout:\n{stdout}\nchild stderr:\n{stderr}");
     });
-    verify_private_release_series(&contract, &output, &receipt).unwrap();
     assert_eq!(receipt.count, PRIVATE_RELEASE_SERIES_COUNT);
     assert_eq!(
         receipt.report_scenario,
@@ -369,12 +414,12 @@ fn ten_fresh_native_processes_satisfy_the_xbus_dpc_matrix_requirement() {
     let evidence = load_xbus_evidence(&output);
     let semantic_report = &evidence[0].0;
     let expected_fingerprint: SyntheticSemanticFingerprint = serde_json::from_str(include_str!(
-        "fixtures/synthetic_native_v28_fingerprint.json"
+        "fixtures/synthetic_native_v28_aarch64_apple_darwin_fingerprint.json"
     ))
     .unwrap();
     for (report, _) in &evidence {
         assert_eq!(
-            SyntheticSemanticFingerprint::from_report(report),
+            SyntheticSemanticFingerprint::from_report(report, &archives),
             expected_fingerprint
         );
     }
@@ -420,4 +465,16 @@ fn ten_fresh_native_processes_satisfy_the_xbus_dpc_matrix_requirement() {
         requirement.class() == CertificationRequirementClass::RspRdpMechanism
             && requirement.id() == "xbus-dpc"
     }));
+}
+
+#[cfg(all(
+    feature = "synthetic-native-archive-evidence",
+    not(all(target_os = "macos", target_arch = "aarch64"))
+))]
+#[test]
+#[ignore = "no reviewed exact synthetic-native fingerprint exists for this target"]
+fn synthetic_native_exact_fingerprint_gate_is_not_certified_for_this_target() {
+    panic!(
+        "synthetic-native exact fingerprint gate is certified only for aarch64-apple-darwin; target-specific compiler and SDK output requires a separately reviewed golden"
+    );
 }
