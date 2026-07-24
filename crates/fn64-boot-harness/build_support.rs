@@ -265,6 +265,96 @@ fn mend_proven_fallthroughs(
     (output, count)
 }
 
+/// Inject an `FN64_BACKEDGE();` statement before every *backward* `goto` in
+/// each generated function body -- a `goto L_x;` whose target label `L_x:`
+/// appears earlier in the same function, i.e. a loop edge. This gives fn64's
+/// cooperative executor a preemption point inside tight guest loops that poll
+/// ordinary RDRAM (SM64's `while (gAudioFrameCount < n) {}`), which real
+/// VR4300 hardware would preempt with the VI interrupt but fn64 otherwise
+/// cannot: without a checkpoint, such a loop spins forever inside one
+/// `run_one_step` resume and virtual time never advances. See
+/// `fn64_mmio_proxy.h`'s `FN64_BACKEDGE` macro and `fn64-abi`'s
+/// `fn64_c_backedge`. Forward gotos (structured `if`/`switch` control flow)
+/// are left untouched: they cannot form a loop on their own and instrumenting
+/// them would only add cost.
+///
+/// N64Recomp emits every label as `L_<hex-pc>:` and every jump as
+/// `goto L_<hex-pc>;`, both on their own trimmed lines, and label names are
+/// unique within a function (they are the target instruction's VA). The pass
+/// is a two-scan-per-function transform: collect label positions, then emit,
+/// prefixing any `goto` to an already-seen label.
+fn inject_loop_backedges(source: &str) -> (String, usize) {
+    let mut output = String::with_capacity(source.len() + source.len() / 16);
+    let mut injected = 0;
+    let mut rest = source;
+    const FUNCTION_PREFIX: &str = "RECOMP_FUNC void ";
+
+    while let Some(start) = rest.find(FUNCTION_PREFIX) {
+        // Copy everything up to and including this function's opening region up
+        // to its body close, transforming the body in between.
+        let close_relative = rest[start..].find("\n;}").unwrap_or_else(|| {
+            let after_prefix = &rest[start + FUNCTION_PREFIX.len()..];
+            let name = after_prefix
+                .split_once('(')
+                .map_or("<unknown>", |(name, _)| name);
+            panic!("inject_loop_backedges: {name}: no `;}}` body close found");
+        });
+        let body_end = start + close_relative;
+        let function_span = &rest[start..body_end];
+
+        // First scan: which labels are defined, and at what line index, so a
+        // `goto` can tell backward (target already seen) from forward.
+        let mut seen_labels: BTreeSet<&str> = BTreeSet::new();
+
+        output.push_str(&rest[..start]);
+        for segment in function_span.split_inclusive('\n') {
+            let trimmed = segment.trim();
+            // Record a label definition BEFORE emitting, so a `goto` on the
+            // same-named label later in the function counts as backward.
+            if let Some(label) = trimmed
+                .strip_suffix(':')
+                .filter(|candidate| is_generated_label(candidate))
+            {
+                seen_labels.insert(label);
+                output.push_str(segment);
+                continue;
+            }
+            if let Some(target) = trimmed
+                .strip_prefix("goto ")
+                .and_then(|rest| rest.strip_suffix(';'))
+                .filter(|target| is_generated_label(target))
+            {
+                if seen_labels.contains(target) {
+                    // Backward goto: preserve the goto's indentation for the
+                    // injected call so the emitted C stays readable.
+                    let indent_len =
+                        segment.len() - segment.trim_start_matches([' ', '\t']).len();
+                    output.push_str(&segment[..indent_len]);
+                    output.push_str("FN64_BACKEDGE();\n");
+                    output.push_str(segment);
+                    injected += 1;
+                    continue;
+                }
+            }
+            output.push_str(segment);
+        }
+
+        rest = &rest[body_end..];
+    }
+    output.push_str(rest);
+    (output, injected)
+}
+
+/// True for an N64Recomp generated label/target identifier: `L_` followed by
+/// hex digits (the target instruction's VA). Excludes the harness's own
+/// `skip_N`/other structured labels, which are never loop targets the guest
+/// branches back to.
+fn is_generated_label(identifier: &str) -> bool {
+    identifier
+        .strip_prefix("L_")
+        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FallthroughRepair {
     Disabled,
@@ -524,6 +614,7 @@ fn prepare_recompiled_cxx_sources_inner(
             .expect("generated C source filename must be valid Unicode");
         let (normalized, file_fallthrough_count) =
             mend_proven_fallthroughs(&normalized, &successors, file_name);
+        let (normalized, _file_backedge_count) = inject_loop_backedges(&normalized);
         let (prepared, _) = instrument_generated_function_entries(&normalized);
         rewrite_count += file_rewrite_count;
         fallthrough_count += file_fallthrough_count;
@@ -591,6 +682,61 @@ mod tests {
 
         assert_eq!(rewrite_count, 0);
         assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn injects_backedge_only_before_backward_gotos() {
+        // Mirrors SM64's `wait_for_audio_frames`: a backward `goto` (loop) plus
+        // a forward `goto` (structured skip). Only the backward one is a spin
+        // edge that needs a preemption point.
+        let source = concat!(
+            "RECOMP_FUNC void wait_for_audio_frames(uint8_t* rdram, recomp_context* ctx) {\n",
+            "    if (ctx->r1 == 0) {\n",
+            "        goto L_80317940;\n", // forward: label defined later
+            "    }\n",
+            "L_80317934:\n",
+            "    if (ctx->r1 != 0) {\n",
+            "        goto L_80317934;\n", // backward: label defined earlier
+            "    }\n",
+            "L_80317940:\n",
+            "    return;\n",
+            ";}\n",
+        );
+
+        let (injected, count) = inject_loop_backedges(source);
+
+        assert_eq!(count, 1, "exactly one backward goto");
+        // The backward goto gains a preceding FN64_BACKEDGE(); the forward one
+        // is untouched.
+        assert!(injected.contains("        FN64_BACKEDGE();\n        goto L_80317934;\n"));
+        assert!(!injected.contains("FN64_BACKEDGE();\n        goto L_80317940;"));
+        assert_eq!(
+            injected.matches("FN64_BACKEDGE();").count(),
+            1,
+            "no spurious injections"
+        );
+    }
+
+    #[test]
+    fn backedge_labels_are_scoped_per_function() {
+        // A label named identically in two functions must not make a later
+        // function's forward goto look backward because an earlier function
+        // defined that label. (N64Recomp's PC-based labels are actually unique,
+        // but the pass must still reset its seen-label set per function.)
+        let source = concat!(
+            "RECOMP_FUNC void first(uint8_t* rdram, recomp_context* ctx) {\n",
+            "L_100:\n",
+            "    goto L_100;\n", // backward in `first`
+            ";}\n",
+            "RECOMP_FUNC void second(uint8_t* rdram, recomp_context* ctx) {\n",
+            "    goto L_100;\n", // forward in `second` -- label defined below
+            "L_100:\n",
+            "    return;\n",
+            ";}\n",
+        );
+
+        let (_injected, count) = inject_loop_backedges(source);
+        assert_eq!(count, 1, "only `first`'s backward goto is instrumented");
     }
 
     #[test]
