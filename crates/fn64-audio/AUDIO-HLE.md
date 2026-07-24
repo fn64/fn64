@@ -17,7 +17,7 @@ PCM range consumed by AI. An HLE task therefore cannot be modeled as an
 immutable RDRAM input that returns a `Vec<i16>`: its result is a transactional
 set of machine effects.
 
-The HLE foundation has nine independent pieces:
+The HLE foundation has ten independent pieces:
 
 - `hle.rs` validates and iterates family-neutral 8-byte command framing without
   assigning semantics to an unknown family.
@@ -26,6 +26,11 @@ The HLE foundation has nine independent pieces:
 - `hle_transaction.rs` owns checked 4 KiB DMEM and a logical-byte,
   copy-on-write RDRAM overlay. It produces canonical patches without mutating
   the live task input.
+- `hle_executor.rs` consumes the sole standard-family HLE lane paired with its
+  whole-task reference. It decodes only through exact admission, advances only
+  public-contract memory state already proved by `hle_memory.rs`, and returns
+  typed unknown-opcode, memory, DSP, or terminal/work frontiers before any
+  guessed behavior. It owns no live mutation or DPC publication handle.
 - `hle_effects.rs` defines the phase-neutral, content-bound IMEM replacement
   record used by both rspboot and ucode execution. Replacement journals retain
   complete images in DMA installation order without becoming scalar/vector
@@ -55,8 +60,11 @@ The HLE foundation has nine independent pieces:
   deliberately not a commit token: no complete family HLE executor exists yet.
 - `hle_commit.rs` consumes matching LLE/HLE ucode-phase outcomes into a
   non-cloneable commit authority. The ABI adapter can publish the empty-DPC
-  ucode phase once; boot-phase patches are deliberately not part of that
-  authority yet.
+  ucode phase once; boot-phase patches remain outside that authority. No
+  whole-task comparison or commit authority exists until a real family
+  executor can mint a completed-result seal by consuming the exact paired HLE
+  lane. An arbitrary outcome, even one from another matching LLE run, is not
+  same-snapshot provenance.
 
 `AUDIO-ABI-CHARACTERIZATION.md` documents a separate private-input black-box
 harness. It constructs hand-authored tasks, packets, and sentinels around the
@@ -176,7 +184,9 @@ accuracy claims.
    DPC register changes remain part of the compared final RSP state rather than
    being implied absent by that seal. The ABI can now acquire a
    non-cloneable exact-generation pre-boot owner without publishing boot
-   effects. Candidate comparison and atomic publication remain next.
+   effects. Candidate comparison and atomic publication remain next. The
+   standard executor consumes its lane into typed frontiers but cannot produce
+   a completed-result seal or commit authority.
 4. **Memory commands** — implement `SETBUFF`, `LOADBUFF`, `SAVEBUFF`,
    `CLEARBUFF`, `DMEMMOVE`, `SEGMENT`, and `LOADADPCM` with complete preflight
    and overlap/bounds tests.

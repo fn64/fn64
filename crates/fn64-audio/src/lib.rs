@@ -46,6 +46,7 @@ pub mod characterize;
 pub mod hle;
 pub mod hle_commit;
 pub mod hle_effects;
+pub mod hle_executor;
 pub mod hle_lle;
 pub mod hle_memory;
 pub mod hle_outcome;
