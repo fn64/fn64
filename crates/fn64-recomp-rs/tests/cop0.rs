@@ -34,7 +34,8 @@
 //! Decoder and structural emitter tests keep that boundary explicit.
 
 use fn64_recomp_rs::{
-    decode, emit_bank_runner, emit_function, BankId, BankInput, FuncInput, Instruction, Rdram,
+    decode, emit_bank_runner, emit_function, run_bank, BankId, BankInput, BlockExit, CodeBank,
+    CodeCatalog, ExecutionKey, FuncInput, GuestPc, Instruction, InstructionBudget, Rdram,
     RecompContext,
 };
 
@@ -634,5 +635,124 @@ fn tlbp_rejects_the_architecturally_undefined_multiple_match_case() {
     assert_eq!(
         message,
         "TLBP found multiple matching entries; VR4300 behavior is undefined"
+    );
+}
+
+// --- Bank-lane ERET: the AOT `emit_bank_eret` emits `ctx.exception_return_pc()`
+// + `BlockExit::ResolveTransfer`; the interpreter (`run_bank`) must apply the
+// exact same CP0 state transition and produce the exact same exit shape. ---
+
+const ERET_WORD: u32 = 0x4200_0018;
+const ERET_BANK: BankId = BankId::new(0x9001);
+const ERET_VRAM: u32 = 0x8000_1000;
+
+#[test]
+fn bank_lane_emits_eret_as_exception_return_pc_and_resolve_transfer() {
+    // Confirms the AOT bank lane's textual contract this test's interpreter
+    // assertions below are proven equivalent to.
+    let emitted = emit_bank_runner(&BankInput {
+        name: "eret_bank",
+        bank: ERET_BANK,
+        vram: ERET_VRAM,
+        words: &[ERET_WORD],
+    });
+    assert!(emitted.contains("let target = ctx.exception_return_pc();"));
+    assert!(emitted.contains("ctx.advance_cop0_random(1);"));
+    assert!(emitted.contains("BlockExit::ResolveTransfer {"));
+    assert!(emitted.contains(&format!("BankId::new({:#018X})", ERET_BANK.get())));
+    assert!(emitted.contains("target_pc: GuestPc::new(target),"));
+}
+
+/// Build a one-instruction ERET bank catalog for the interpreter lane.
+fn eret_catalog() -> CodeCatalog {
+    let bank = CodeBank::new(ERET_BANK, GuestPc::new(ERET_VRAM), vec![ERET_WORD]).unwrap();
+    let mut catalog = CodeCatalog::new();
+    catalog.register(bank).unwrap();
+    catalog
+}
+
+#[test]
+fn interpreted_eret_prefers_error_epc_over_epc_under_erl_and_clears_llbit() {
+    const STATUS_EXL: u32 = 1 << 1;
+    const STATUS_ERL: u32 = 1 << 2;
+
+    let catalog = eret_catalog();
+    let mut ctx = RecompContext::new();
+    ctx.cop0_status = STATUS_EXL | STATUS_ERL;
+    ctx.cop0_epc = 0x8000_9000;
+    ctx.cop0_error_epc = 0xBFC0_0200;
+    ctx.set_ll_reservation(0x8000_0040, 4);
+
+    let mut storage = vec![0u8; 16];
+    let mut mem = Rdram::new(&mut storage);
+    let run = run_bank(
+        &catalog,
+        ERET_BANK,
+        ExecutionKey::new(ERET_BANK, GuestPc::new(ERET_VRAM)),
+        InstructionBudget::new(8).unwrap(),
+        &mut ctx,
+        &mut mem,
+    )
+    .unwrap();
+
+    assert_eq!(
+        run.exit,
+        BlockExit::ResolveTransfer {
+            source_bank: ERET_BANK,
+            target_pc: GuestPc::new(0xBFC0_0200),
+        },
+        "matches the block lane's exception_return_pc() ErrorEPC/ERL precedence"
+    );
+    assert_eq!(run.instructions, 1, "eret has no delay slot to co-retire");
+    assert_eq!(ctx.cop0_status & STATUS_ERL, 0, "ERL clears on return");
+    assert_ne!(
+        ctx.cop0_status & STATUS_EXL,
+        0,
+        "EXL is untouched when ERL took precedence"
+    );
+    assert!(
+        !ctx.take_ll_reservation(0x8000_0040, 4),
+        "eret must clear the architectural LLbit"
+    );
+}
+
+#[test]
+fn interpreted_eret_falls_back_to_epc_and_clears_exl_when_erl_is_clear() {
+    const STATUS_EXL: u32 = 1 << 1;
+    const STATUS_ERL: u32 = 1 << 2;
+
+    let catalog = eret_catalog();
+    let mut ctx = RecompContext::new();
+    ctx.cop0_status = STATUS_EXL;
+    ctx.cop0_epc = 0x8000_9000;
+    ctx.cop0_error_epc = 0xBFC0_0200;
+    ctx.set_ll_reservation(0x8000_0040, 4);
+
+    let mut storage = vec![0u8; 16];
+    let mut mem = Rdram::new(&mut storage);
+    let run = run_bank(
+        &catalog,
+        ERET_BANK,
+        ExecutionKey::new(ERET_BANK, GuestPc::new(ERET_VRAM)),
+        InstructionBudget::new(8).unwrap(),
+        &mut ctx,
+        &mut mem,
+    )
+    .unwrap();
+
+    assert_eq!(
+        run.exit,
+        BlockExit::ResolveTransfer {
+            source_bank: ERET_BANK,
+            target_pc: GuestPc::new(0x8000_9000),
+        },
+        "without ERL, eret returns to EPC exactly as exception_return_pc()"
+    );
+    assert_eq!(run.instructions, 1);
+    assert_eq!(ctx.cop0_status & STATUS_EXL, 0, "EXL clears on return");
+    assert_eq!(ctx.cop0_status & STATUS_ERL, 0, "ERL was already clear");
+    assert!(
+        !ctx.take_ll_reservation(0x8000_0040, 4),
+        "eret must clear the architectural LLbit"
     );
 }
