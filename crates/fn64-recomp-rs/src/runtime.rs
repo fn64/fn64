@@ -854,6 +854,54 @@ impl RecompContext {
         }
     }
 
+    /// `MFC0 $9` (Count) with in-block interior visibility.
+    ///
+    /// # The boundary-authority contract this must not violate
+    ///
+    /// `self.cop0_count` is refreshed ONLY at block/checkpoint boundaries,
+    /// from the live `fn64-runtime` `Executor`'s authoritative Count
+    /// (`run_block_program`'s `ctx.synchronize_cop0_timing` call in
+    /// `fn64-abi`, BEFORE that block's instructions run). The executor's own
+    /// advance for the instructions THIS block is about to retire happens
+    /// strictly AFTER the block returns, driven by its retired-instruction
+    /// count (`Yield::InstructionCheckpoint` -> `Executor::advance_time`,
+    /// which adds `retired_total / 2` — respecting an odd-cycle carry
+    /// (`cp0_count_phase`) private to the executor). So a plain
+    /// `self.cop0_count` read mid-block sees the value from block ENTRY,
+    /// stale by however many instructions have already retired THIS turn.
+    ///
+    /// This method adds that missing interior delta to the RETURNED value
+    /// only: `retired_since_entry / 2`, at the same half-CPU-rate the
+    /// executor uses. It never mutates `self.cop0_count` — the boundary sync
+    /// remains the sole writer, so the authoritative post-block advance
+    /// (computed independently by the executor from the SAME retired count)
+    /// is applied exactly once, at the boundary, regardless of what this
+    /// method returned meanwhile. No cycle is double-counted because this
+    /// method counts nothing into persistent state; it only offsets a read.
+    ///
+    /// # The one approximation: entry phase
+    ///
+    /// The executor's `cp0_count_phase` (an odd-cycle carry across
+    /// `advance_time` calls) is private executor state never threaded
+    /// through `synchronize_cop0_timing`, so this context has no way to know
+    /// whether the block's true starting phase was 0 or 1. This method
+    /// assumes phase 0 at block entry — the same convention
+    /// `Executor::set_cp0_count` already uses for an explicit COP0 Count
+    /// write — so an in-block read can be up to one Count tick behind the
+    /// (unobservable) silicon-exact value when the real entry phase was 1.
+    /// The BOUNDARY value stays exact either way: the executor computes the
+    /// authoritative post-block Count itself, from its own retained phase,
+    /// independent of this approximation. Threading the true phase through
+    /// would require new cross-crate API surface
+    /// (`Executor::cp0_count_phase()` plus a `synchronize_cop0_timing`
+    /// parameter); `docs/UNIVERSAL-RUNTIME-PLAN.md`'s U4 row already lists
+    /// "instruction-interior timer visibility" as a separately tracked open
+    /// boundary, which this conservative half-fix narrows without closing.
+    #[inline]
+    pub fn read_cop0_count_interior(&self, retired_since_entry: u32) -> u32 {
+        self.cop0_count.wrapping_add(retired_since_entry / 2)
+    }
+
     /// Read one architecturally 64-bit COP0 address register for DMFC0.
     #[inline]
     pub fn read_cop0_64(&self, reg: u8) -> u64 {
