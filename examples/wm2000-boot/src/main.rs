@@ -30,6 +30,46 @@ fn env_path(name: &str) -> std::path::PathBuf {
         .into()
 }
 
+fn validate_release_microcode_pair() {
+    let text_path = env_path(fn64_boot_harness::RELEASE_MICROCODE_TEXT_PATH_ENV);
+    let data_path = env_path(fn64_boot_harness::RELEASE_MICROCODE_DATA_PATH_ENV);
+    let text = std::fs::read(&text_path).unwrap_or_else(|error| {
+        panic!("wm2000-boot: read runner-staged release microcode text: {error}")
+    });
+    let text: [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE] =
+        text.try_into().unwrap_or_else(|text: Vec<u8>| {
+            panic!(
+                "wm2000-boot: runner-staged release microcode text has {} bytes, expected {}",
+                text.len(),
+                fn64_runtime::RSP_MEMORY_BANK_SIZE
+            )
+        });
+    let data = std::fs::read(&data_path).unwrap_or_else(|error| {
+        panic!("wm2000-boot: read runner-staged release microcode data: {error}")
+    });
+    assert!(
+        !data.is_empty() && u32::try_from(data.len()).is_ok(),
+        "wm2000-boot: runner-staged release microcode data must contain 1..=u32::MAX bytes"
+    );
+    let _ = text;
+}
+
+fn linked_native_program_identity() -> fn64_boot_harness::NativeProgramArtifactIdentity {
+    fn64_boot_harness::NativeProgramArtifactIdentity::from_hex(env!(
+        "FN64_NATIVE_PROGRAM_ARTIFACT_SHA256"
+    ))
+    .expect("wm2000-boot build script emitted an invalid native program artifact identity")
+}
+
+fn require_diagnostic_voice_map_reproduction(release_mode: bool, chan_ptr: u32, steps: u64) {
+    assert!(
+        !release_mode,
+        "wm2000-boot: intervention-free release run reached fresh sound-channel array \
+         {chan_ptr:#010x} at step {steps}; the diagnostic voice-map virgin-memory reproduction \
+         would be required here, so no release report may be written"
+    );
+}
+
 fn main() {
     let rom_path = env_path("ROM");
     println!("[wm2000-boot] loading ROM from {}", rom_path.display());
@@ -40,6 +80,8 @@ fn main() {
         )
     });
     println!("[wm2000-boot] ROM size: {} bytes", rom_bytes.len());
+    let release_environment = fn64_boot_harness::release_run_environment_from_process()
+        .unwrap_or_else(|error| panic!("wm2000-boot: {error}"));
     let tv_type = fn64_boot_harness::TvType::Ntsc;
     let mut rdram = fn64_boot_harness::new_rdram(tv_type);
     fn64_boot_harness::seed_ipl3_image(&mut rdram, &rom_bytes);
@@ -114,10 +156,28 @@ fn main() {
     // framebuffer PNG are gated off together on a perf run (NO_DUMP, or the
     // trace-disabling flag which also signals "I'm measuring, not capturing").
     let dumps_disabled = trace_disabled || std::env::var_os("WM2000_NO_DUMP").is_some();
+    let release_mode = release_environment.is_some();
+    if release_mode {
+        validate_release_microcode_pair();
+    }
+    let mut release_gate = release_environment.map(|environment| {
+        let journal_path = environment.journal_path();
+        let mut gate = fn64_boot_harness::LiveReleaseGate::new(environment.guest_cycle);
+        gate.arm_with_unsupported_journal(&journal_path, &environment.run_event_sha256)
+            .unwrap_or_else(|error| panic!("wm2000-boot: arm live release gate: {error}"));
+        println!(
+            "[wm2000-boot] intervention-free live release gate armed at guest cycle {}; \
+             report={}; unsupported_journal={}",
+            environment.guest_cycle,
+            environment.report_path.display(),
+            journal_path.display()
+        );
+        (gate, environment.report_path, environment.rom_class)
+    });
     // Native readback is normally enabled with dumps, but certification and
     // timing probes can retain exact post-VI bytes/digests without PNG I/O.
     let rt64_capture_requested =
-        !dumps_disabled || std::env::var_os("WM2000_RT64_CAPTURE").is_some();
+        release_mode || !dumps_disabled || std::env::var_os("WM2000_RT64_CAPTURE").is_some();
 
     // Main's VI pump delivers real presentations; without a registered
     // backend the first retrace trips present_render_backend's loud trap.
@@ -146,6 +206,10 @@ fn main() {
             .unwrap_or_else(|error| panic!("wm2000-boot: {error}"))
             .unwrap_or_else(|| "reference".to_string())
             .to_ascii_lowercase();
+    assert!(
+        !release_mode || requested_renderer == "rt64",
+        "wm2000-boot: live release evidence requires FN64_RENDER=rt64, got {requested_renderer:?}"
+    );
     let graphics_policy_name = fn64_boot_harness::parse_release_env_value(
         "WM2000_GRAPHICS_POLICY",
         std::env::var_os("WM2000_GRAPHICS_POLICY"),
@@ -164,6 +228,10 @@ fn main() {
         "lle" | "lle-accuracy" => fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy,
         value => panic!("wm2000-boot: WM2000_GRAPHICS_POLICY must be hle or lle, got {value:?}"),
     };
+    assert!(
+        !release_mode || graphics_policy == fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy,
+        "wm2000-boot: live release evidence requires WM2000_GRAPHICS_POLICY=lle"
+    );
     let (render_backend, active_renderer, capture_rt64_present): (
         Box<dyn fn64_render::RenderBackend>,
         &'static str,
@@ -185,6 +253,18 @@ fn main() {
                 backend.enable_present_capture().unwrap_or_else(|error| {
                     panic!("wm2000-boot: RT64 post-VI capture setup failed: {error}")
                 });
+            }
+            if release_mode {
+                #[cfg(feature = "rt64")]
+                let source_identity = fn64_render_rt64::Rt64Backend::release_identity();
+                #[cfg(feature = "rt64")]
+                assert!(
+                    source_identity.is_source_authoritative(),
+                    "wm2000-boot: RT64 release evidence requires a clean Git source identity, got {}",
+                    source_identity.canonical_id()
+                );
+                #[cfg(not(feature = "rt64"))]
+                unreachable!("RT64 create cannot succeed without the example's `rt64` feature");
             }
             (Box::new(backend), "rt64", capture)
         }
@@ -460,17 +540,54 @@ fn main() {
             drain.before_step(next_priority) == fn64_boot_harness::DrainDecision::AdvanceField;
         let mut committed_vi_field = false;
         if advanced_field {
-            // Device completions land between fields. Advance to the fabric's
-            // exact earliest event and let GuestDrain distinguish an actual
-            // committed VI edge from an earlier DMA/RCP completion. WM2000's
-            // translated instruction checkpoints move virtual time between
-            // host pumps, so reconstructing VI from a separate interval
-            // accumulator can miss a retrace that arrived through the generic
-            // device-deadline branch.
-            committed_vi_field = matches!(
-                drain.advance_to_next_device_event(),
-                fn64_boot_harness::DeviceAdvance::ViFields { .. }
-            );
+            if release_gate.is_some() {
+                let before_host_advance = fn64_abi::sim_time();
+                let next_vi = fn64_abi::next_vi_deadline()
+                    .expect("typed television standard must keep a VI edge scheduled");
+                let tick = fn64_boot_harness::select_release_vi_edge(
+                    before_host_advance,
+                    next_vi,
+                    release_gate.as_ref().map(|(gate, _, _)| gate.guest_cycle()),
+                )
+                .unwrap_or_else(|error| panic!("wm2000-boot: {error}"));
+                let boundary = fn64_boot_harness::commit_scheduled_vi_boundary_with_program(
+                    tick,
+                    fn64_boot_harness::ReleaseProgramDescriptor::NativeArchive(
+                        linked_native_program_identity(),
+                    ),
+                )
+                .unwrap_or_else(|error| panic!("wm2000-boot: commit scheduled VI edge: {error}"));
+                committed_vi_field = true;
+                let arrival = fn64_boot_harness::ReleaseCycleArrival::HostAdvanceCommitted;
+                let release_due = release_gate.as_ref().is_some_and(|(gate, _, _)| {
+                    fn64_boot_harness::PresentationReleaseBoundary::new(gate.guest_cycle())
+                        .matches(arrival, tick)
+                });
+                if release_due {
+                    let (gate, report_path, rom_class) = release_gate
+                        .take()
+                        .expect("live release gate disappeared before post-advance capture");
+                    let report =
+                        capture_release_report(gate, boundary, &report_path, rom_class, &rom_bytes);
+                    println!(
+                        "[wm2000-boot] RELEASE GATE CLOSED without harness intervention at \
+                         post-advance cycle {tick}: report_sha={} artifact_root={} report={}",
+                        report.report_sha256,
+                        report.digest.root_sha256,
+                        report_path.display()
+                    );
+                    break;
+                }
+                drain.begin_field();
+            } else {
+                // Diagnostic mode services the exact earliest device event;
+                // release mode instead freezes the complete scheduled VI
+                // boundary above before any guest code can resume.
+                committed_vi_field = matches!(
+                    drain.advance_to_next_device_event(),
+                    fn64_boot_harness::DeviceAdvance::ViFields { .. }
+                );
+            }
         } else {
             let stepped = fn64_abi::run_one_step();
             assert!(
@@ -479,6 +596,14 @@ fn main() {
             );
             drain.record_step(next_priority.expect("guest drain lost runnable priority"));
             steps += 1;
+        }
+        if let Some((gate, _, _)) = release_gate.as_ref() {
+            let observed_cycle = fn64_abi::sim_time();
+            assert!(
+                observed_cycle <= gate.guest_cycle(),
+                "wm2000-boot: release gate cycle {} was skipped; current guest cycle is {observed_cycle}",
+                gate.guest_cycle()
+            );
         }
         // Virgin-allocation reproduction for the AKI voice maps -- see the
         // block comment above `last_chan_array_ptr` for the full story.
@@ -492,6 +617,7 @@ fn main() {
                         < fn64_boot_harness::rdram_len() as u64
                     && chan_ptr.is_multiple_of(4)
                 {
+                    require_diagnostic_voice_map_reproduction(release_mode, chan_ptr, steps);
                     let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
                     for chan in 0..4u32 {
                         let map_guest = chan_ptr + chan * WM2000_CHAN_STRIDE + 4;
@@ -654,6 +780,15 @@ fn main() {
              {stop}; captured through {last_rt64_capture_swap}"
         );
     }
+    if let Some((gate, report_path, _)) = release_gate.as_ref() {
+        panic!(
+            "wm2000-boot: stopped before intervention-free live release gate cycle {}; current \
+             cycle={}, report was not written to {}",
+            gate.guest_cycle(),
+            fn64_abi::sim_time(),
+            report_path.display()
+        );
+    }
 
     let (gfx_count, audio_count) = fn64_abi::task_counts();
     println!("[wm2000-boot] === BOOT SUMMARY ===");
@@ -693,6 +828,64 @@ fn main() {
         "[wm2000-boot] process exit prepared: threads={} detached_coroutines={}",
         exit.threads, exit.detached_coroutines
     );
+}
+
+fn capture_release_report(
+    gate: fn64_boot_harness::LiveReleaseGate,
+    boundary: fn64_boot_harness::CommittedViBoundary,
+    report_path: &std::path::Path,
+    rom_class: fn64_boot_harness::ReleaseRomClass,
+    rom_bytes: &[u8],
+) -> fn64_boot_harness::ReleaseGateReport {
+    use fn64_boot_harness::LiveReleaseGateRenderExt as _;
+
+    let observed_cycle = fn64_abi::sim_time();
+    let capture = fn64_abi::capture_render_release_frame().unwrap_or_else(|error| {
+        panic!("wm2000-boot: capture RT64 fixed-cycle presentation: {error}")
+    });
+    assert_eq!(
+        capture.guest_cycle, observed_cycle,
+        "wm2000-boot: RT64 presentation belongs to guest cycle {}, release gate requires \
+         {observed_cycle}",
+        capture.guest_cycle
+    );
+    assert!(
+        capture.source_authoritative,
+        "wm2000-boot: RT64 fixed-cycle capture has non-authoritative backend identity {}",
+        capture.backend_identity
+    );
+    let format = match capture.format {
+        fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm => {
+            fn64_boot_harness::RenderPixelFormat::Bgra8Unorm
+        }
+    };
+    let render = fn64_boot_harness::LiveRenderEvidence::post_vi_swapchain(
+        capture.guest_cycle,
+        capture.backend_identity,
+        capture.settings_sha256,
+        capture.width,
+        capture.height,
+        capture.row_bytes,
+        format,
+        capture.workload_id.get(),
+        capture.present_id,
+        capture.bytes,
+    )
+    .unwrap_or_else(|error| panic!("wm2000-boot: validate RT64 fixed-cycle presentation: {error}"));
+    gate.capture_and_write_render_rom_evidence(
+        boundary,
+        "wm2000-ntsc-headless-c-rt64-lle-accuracy-intervention-free",
+        fn64_boot_harness::ReleaseRomInput::new(rom_class, rom_bytes),
+        &render,
+        report_path,
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "wm2000-boot: intervention-free live release gate failed at post-advance cycle \
+             {observed_cycle}; report path {}: {error}",
+            report_path.display()
+        )
+    })
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -970,5 +1163,21 @@ fn write_trace_file(trace: &[fn64_runtime::TraceEvent], path: &str) {
     for event in trace {
         let line = format!("{event:?}\n");
         let _ = file.write_all(line.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_diagnostic_voice_map_reproduction;
+
+    #[test]
+    fn diagnostic_mode_allows_the_documented_voice_map_reproduction() {
+        require_diagnostic_voice_map_reproduction(false, 0x8030_0000, 17);
+    }
+
+    #[test]
+    #[should_panic(expected = "no release report may be written")]
+    fn release_mode_refuses_the_voice_map_reproduction() {
+        require_diagnostic_voice_map_reproduction(true, 0x8030_0000, 17);
     }
 }
