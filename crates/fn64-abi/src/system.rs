@@ -26,8 +26,8 @@ thread_local! {
 // Public libultra manuals name these as FPCSR_FS (flush denormals to zero)
 // and FPCSR_EV (enable invalid-operation exceptions). The values are the
 // public R4300 FCSR bit layout, not behavior recovered from a GPL runtime.
-const FPCSR_FS: u32 = 0x0100_0000;
-const FPCSR_EV: u32 = 0x0000_0800;
+pub(crate) const FPCSR_FS: u32 = 0x0100_0000;
+pub(crate) const FPCSR_EV: u32 = 0x0000_0800;
 
 pub(crate) fn initialize_common() {
     FPC_CSR.with(|csr| csr.set(FPCSR_FS | FPCSR_EV));
@@ -171,10 +171,10 @@ pub unsafe extern "C" fn osSetCount_recomp(_rdram: *mut u8, ctx: *mut RecompCont
 
 /// `__osSetFpcCsr(u32 value) -> u32` -- the public internal-routine manual
 /// specifies that it returns the previous MIPS FPU control/status register
-/// before installing the new value. The register is CPU-global state, so one
-/// executor-thread-local cell backs every guest thread. Generated host FP
-/// operations do not yet apply its rounding/exception bits; that behavioral
-/// gap remains explicit even though register reads/writes are now correct.
+/// before installing the new value. Generated-C has no context FCSR, so that
+/// compatibility lane retains the CPU value here. The typed-Rust adapter
+/// bypasses this shim and updates its per-OSThread context directly: the same
+/// authority its generated CFC1/CTC1 and FP operations read.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.

@@ -91,7 +91,13 @@ exact FullSync count have been validated. Any other native error restores
 RDRAM and RSP byte-for-byte, destroys the unrollbackable RT64 context, and
 clears its active release identity; a schema-valid precommit `NeedsLle` must
 also prove that neither memory image changed before the context is retained.
-Raw RDP submissions use the same RDRAM rollback/context-destruction boundary.
+Raw RDP submission through `process_rdp_commands` retains its existing
+rollback/context-destruction boundary. The newer owned raw-DPC batch seam is
+different: its staged RDRAM suffix is RDP-addressable and replay has only the
+final memory image, not the memory/device state at each CMD_END. RT64 therefore
+reports that batch capability as `Unsupported`; it does not expose staged
+replay as an exact runtime path. Support requires a native separate-command-
+buffer entry point carrying temporal DPC/interrupt/FullSync observations.
 
 Presentation temporarily lends RT64 the live physical-RDRAM allocation and
 the vblank-latched VI image. Native queues are synchronized before the Rust

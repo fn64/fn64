@@ -1577,6 +1577,40 @@ impl Rt64Backend {
         }
     }
 
+    /// Process a non-ROM public legacy-S2DEX display list for negative evidence.
+    ///
+    /// This exists to prove bounded S2DEX2 adapter overlays do not accidentally
+    /// broaden the shared upstream handler to the legacy wire family.
+    #[cfg(feature = "synthetic-s2dex-evidence")]
+    pub fn process_synthetic_legacy_s2dex_for_evidence(
+        &mut self,
+        rdram: &mut [u8],
+        display_list: u32,
+        output_addr: u32,
+    ) -> Result<(), RenderError> {
+        #[cfg(feature = "rt64")]
+        {
+            self.context
+                .as_mut()
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
+                .process_synthetic_s2dex_wire(rdram, display_list, output_addr, true)
+                .map_err(|reason| RenderError::Backend {
+                    backend: "rt64-synthetic-legacy-s2dex",
+                    reason,
+                })
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        {
+            let _ = (rdram, display_list, output_addr);
+            Err(RenderError::Backend {
+                backend: "rt64-synthetic-legacy-s2dex",
+                reason: "fn64-render-rt64 was built without the opt-in `rt64` Cargo feature"
+                    .to_string(),
+            })
+        }
+    }
+
     /// Process a hand-authored, non-ROM F3DEX2 display list through RT64's
     /// normal interpreter/workload/render path for Extended-GBI evidence.
     ///
@@ -2503,6 +2537,22 @@ impl RenderBackend for Rt64Backend {
         self.last_dp_full_sync
     }
 
+    fn raw_dpc_batch_capability(&self) -> fn64_render::RawDpcBatchCapability {
+        fn64_render::RawDpcBatchCapability::Unsupported
+    }
+
+    fn process_raw_dpc_batch(
+        &mut self,
+        _rdram: &mut [u8],
+        _batch: fn64_render::PreflightedRawDpcBatch,
+        _output_addr: u32,
+    ) -> Result<fn64_render::RawDpcBatchOutcome, RenderError> {
+        Err(RenderError::Backend {
+            backend: "rt64-raw-dpc-batch",
+            reason: "RT64 raw-DPC batching requires a native separate-command-buffer seam; staged RDRAM replay is diagnostic-only and is not exposed by this backend".to_string(),
+        })
+    }
+
     fn task_chunking(&self) -> fn64_render::RenderTaskChunking {
         // RT64's public task entry is presently one synchronous native call;
         // the adapter cannot manufacture a resumable native stack.
@@ -2829,6 +2879,42 @@ impl RenderBackend for Rt64Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "rt64"))]
+    #[test]
+    fn no_native_build_rejects_preflighted_batch_without_mutation() {
+        let submission = fn64_render::OwnedRawDpcSubmission::from_rdram_words(
+            0x100,
+            0x108,
+            vec![0xe900_0000, 0],
+        )
+        .unwrap();
+        let mut rdram = vec![0x5a; 0x400];
+        let before = rdram.clone();
+        let batch = fn64_render::RawDpcBatch::new(vec![submission])
+            .unwrap()
+            .preflight(rdram.len())
+            .unwrap();
+        let mut backend = Rt64Backend::new();
+
+        let error = backend
+            .process_raw_dpc_batch(&mut rdram, batch, 0)
+            .unwrap_err();
+
+        assert!(matches!(error, RenderError::Backend { .. }));
+        assert!(error
+            .to_string()
+            .contains("native separate-command-buffer seam"));
+        assert_eq!(
+            backend.raw_dpc_batch_capability(),
+            fn64_render::RawDpcBatchCapability::Unsupported
+        );
+        assert_eq!(rdram, before);
+        assert_eq!(
+            backend.last_dp_full_sync(),
+            fn64_render::DpFullSyncStatus::Unidentified
+        );
+    }
 
     #[test]
     fn rt64_process_task_has_no_reference_decoder_paths() {

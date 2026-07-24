@@ -494,9 +494,11 @@ pub fn emit_bank_runner_with_host_calls(bank: &BankInput<'_>, host_calls: &[u32]
                 "                finish!(BlockExit::Checkpoint(ExecutionKey::new(expected_bank, GuestPc::new(pc))));"
             );
             let _ = writeln!(out, "            }}");
+            emit_bank_cop0_guard(&mut out, instr, vram, vram, false, bank.bank, false);
             let _ = writeln!(out, "            executed += 2;");
             emit_bank_control_transfer(&mut out, instr, vram, delay, vram + 4, bank.bank, &domain);
         } else {
+            emit_bank_cop0_guard(&mut out, instr, vram, vram, false, bank.bank, false);
             if !emit_bank_eret(&mut out, instr, bank.bank)
                 && !emit_bank_overflow(&mut out, instr, vram, vram, false, bank.bank, false)
                 && !emit_bank_fpu_trap(&mut out, instr, vram, vram, false, bank.bank, false)
@@ -750,6 +752,7 @@ fn emit_sparse_bank_runner_inner(
         let delay_vram = vram.checked_add(4);
         let delay = delay_vram.and_then(|address| instrs.get(&address).copied());
         if instr.has_delay_slot() && !delay_slots.contains(&vram) && delay.is_none() {
+            emit_bank_cop0_guard(&mut out, instr, vram, vram, false, bank.bank, false);
             emit_data_control_word(&mut out, vram);
         } else if instr.has_delay_slot() && !delay_slots.contains(&vram) {
             let delay_vram = delay_vram.expect("sparse bank delay-slot address exceeds u32");
@@ -762,13 +765,16 @@ fn emit_sparse_bank_runner_inner(
                 "                finish!(BlockExit::Checkpoint(ExecutionKey::new(expected_bank, GuestPc::new(pc))));"
             );
             let _ = writeln!(out, "            }}");
+            emit_bank_cop0_guard(&mut out, instr, vram, vram, false, bank.bank, false);
             let _ = writeln!(out, "            executed += 2;");
             emit_bank_control_transfer(
                 &mut out, instr, vram, delay, delay_vram, bank.bank, &domain,
             );
         } else if instr.has_delay_slot() {
+            emit_bank_cop0_guard(&mut out, instr, vram, vram, false, bank.bank, false);
             emit_data_control_word(&mut out, vram);
         } else {
+            emit_bank_cop0_guard(&mut out, instr, vram, vram, false, bank.bank, false);
             if !emit_bank_eret(&mut out, instr, bank.bank)
                 && !emit_bank_overflow(&mut out, instr, vram, vram, false, bank.bank, false)
                 && !emit_bank_fpu_trap(&mut out, instr, vram, vram, false, bank.bank, false)
@@ -960,6 +966,7 @@ fn emit_bank_control_transfer(
             if delay.has_delay_slot() {
                 emit_data_control_word(out, delay_vram);
             } else {
+                emit_bank_cop0_guard(out, delay, delay_vram, vram, true, bank, true);
                 emit_bank_cop1_guard(out, delay, delay_vram, vram, true, bank, true);
                 if !emit_bank_overflow(out, delay, delay_vram, vram, true, bank, true)
                     && !emit_bank_fpu_trap(out, delay, delay_vram, vram, true, bank, true)
@@ -1240,32 +1247,175 @@ fn ru64(idx: Reg) -> String {
     }
 }
 
-fn emit_fpu_i32(out: &mut String, fd: Reg, fs: Reg, single: bool, mode: Option<u8>) {
-    let value = if single {
-        format!("ctx.f_s({}) as f64", fs)
-    } else {
-        format!("ctx.f_d({})", fs)
-    };
+fn emit_fpu_i32(
+    out: &mut String,
+    mem_fault: MemFault,
+    fd: Reg,
+    fs: Reg,
+    single: bool,
+    mode: Option<u8>,
+) {
+    let suffix = if single { "s" } else { "d" };
     let mode = mode.map_or_else(|| "None".to_string(), |m| format!("Some({})", m));
-    let _ = writeln!(
-        out,
-        "            {{ let v = {}; let r = ctx.fpu_to_i32(v, {}); ctx.set_f_bits({}, r as u32); }}",
-        value, mode, fd
-    );
+    match mem_fault {
+        MemFault::Panic => {
+            let _ = writeln!(out, "            {{ let r = ctx.fpu_to_i32_{suffix}({fs}, {mode}); ctx.set_f_bits({fd}, r as u32); }}");
+        }
+        MemFault::Fault { .. } => {
+            let finish = mem_fault.fpu_exception_finish();
+            let _ = writeln!(out, "            {{ let r = match ctx.try_fpu_to_i32_{suffix}({fs}, {mode}) {{ Ok(value) => value, Err(_) => {{ {finish} }} }}; ctx.set_f_bits({fd}, r as u32); }}");
+        }
+    }
 }
 
-fn emit_fpu_i64(out: &mut String, fd: Reg, fs: Reg, single: bool, mode: Option<u8>) {
-    let value = if single {
-        format!("ctx.f_s({}) as f64", fs)
-    } else {
-        format!("ctx.f_d({})", fs)
-    };
+fn emit_fpu_i64(
+    out: &mut String,
+    mem_fault: MemFault,
+    fd: Reg,
+    fs: Reg,
+    single: bool,
+    mode: Option<u8>,
+) {
+    let suffix = if single { "s" } else { "d" };
     let mode = mode.map_or_else(|| "None".to_string(), |m| format!("Some({})", m));
+    match mem_fault {
+        MemFault::Panic => {
+            let _ = writeln!(out, "            {{ let r = ctx.fpu_to_i64_{suffix}({fs}, {mode}); ctx.set_d_bits({fd}, r as u64); }}");
+        }
+        MemFault::Fault { .. } => {
+            let finish = mem_fault.fpu_exception_finish();
+            let _ = writeln!(out, "            {{ let r = match ctx.try_fpu_to_i64_{suffix}({fs}, {mode}) {{ Ok(value) => value, Err(_) => {{ {finish} }} }}; ctx.set_d_bits({fd}, r as u64); }}");
+        }
+    }
+}
+
+fn emit_fixed_to_float(
+    out: &mut String,
+    mem_fault: MemFault,
+    fd: Reg,
+    fs: Reg,
+    destination: char,
+    source: char,
+) {
+    let destination_lower = destination.to_ascii_lowercase();
+    let source_lower = source.to_ascii_lowercase();
+    let setter = if destination == 'S' {
+        "set_f_bits"
+    } else {
+        "set_d_bits"
+    };
+    match mem_fault {
+        MemFault::Panic => {
+            let _ = writeln!(
+                out,
+                "            {{ let r = ctx.cvt_{destination_lower}_{source_lower}_bits({fs}); ctx.{setter}({fd}, r); }}"
+            );
+        }
+        MemFault::Fault { .. } => {
+            let finish = mem_fault.fpu_exception_finish();
+            let _ = writeln!(
+                out,
+                "            {{ let r = match ctx.try_cvt_{destination_lower}_{source_lower}_bits({fs}) {{ Ok(value) => value, Err(_) => {{ {finish} }} }}; ctx.{setter}({fd}, r); }}"
+            );
+        }
+    }
+}
+
+fn emit_float_to_float(
+    out: &mut String,
+    mem_fault: MemFault,
+    fd: Reg,
+    fs: Reg,
+    destination: char,
+    source: char,
+) {
+    let destination_lower = destination.to_ascii_lowercase();
+    let source_lower = source.to_ascii_lowercase();
+    let setter = if destination == 'S' {
+        "set_f_bits"
+    } else {
+        "set_d_bits"
+    };
+    match mem_fault {
+        MemFault::Panic => {
+            let _ = writeln!(
+                out,
+                "            {{ let r = ctx.cvt_{destination_lower}_{source_lower}_bits({fs}); ctx.{setter}({fd}, r); }}"
+            );
+        }
+        MemFault::Fault { .. } => {
+            let finish = mem_fault.fpu_exception_finish();
+            let _ = writeln!(
+                out,
+                "            {{ let r = match ctx.try_cvt_{destination_lower}_{source_lower}_bits({fs}) {{ Ok(value) => value, Err(_) => {{ {finish} }} }}; ctx.{setter}({fd}, r); }}"
+            );
+        }
+    }
+}
+
+fn emit_fpu_compare(
+    out: &mut String,
+    mem_fault: MemFault,
+    single: bool,
+    fs: Reg,
+    ft: Reg,
+    cond: u8,
+) {
+    let suffix = if single { "s" } else { "d" };
+    match mem_fault {
+        MemFault::Panic => {
+            let _ = writeln!(
+                out,
+                "            ctx.fpu_compare_{suffix}({fs}, {ft}, {cond});"
+            );
+        }
+        MemFault::Fault { .. } => {
+            let finish = mem_fault.fpu_exception_finish();
+            let _ = writeln!(
+                out,
+                "            if ctx.try_fpu_compare_{suffix}({fs}, {ft}, {cond}).is_err() {{ {finish} }}"
+            );
+        }
+    }
+}
+
+/// Emit the shared kernel-or-Status.CU0 check before any COP0-visible effect.
+/// A COP0 branch is guarded before its delay slot; a COP0 instruction in
+/// another branch's delay slot retains the branch EPC and sets Cause.BD.
+fn emit_bank_cop0_guard(
+    out: &mut String,
+    instr: Instruction,
+    fault_vram: u32,
+    epc: u32,
+    branch_delay: bool,
+    bank: BankId,
+    already_counted: bool,
+) {
+    if !instr.requires_cop0() {
+        return;
+    }
+    let _ = writeln!(out, "            if !ctx.cop0_usable() {{");
+    if !already_counted {
+        let _ = writeln!(out, "                executed += 1;");
+    }
+    let _ = writeln!(out, "                finish!(BlockExit::Fault(CpuFault {{");
+    let _ = writeln!(out, "                    at: ExecutionKey::new(BankId::new({:#018X}), GuestPc::new({fault_vram:#010X})),", bank.get());
+    let _ = writeln!(out, "                    kind: CpuFaultKind::Exception {{");
     let _ = writeln!(
         out,
-        "            {{ let v = {}; let r = ctx.fpu_to_i64(v, {}); ctx.set_d_bits({}, r as u64); }}",
-        value, mode, fd
+        "                        exception: CpuException::CoprocessorUnusable,"
     );
+    let _ = writeln!(
+        out,
+        "                        epc: GuestPc::new({epc:#010X}),"
+    );
+    let _ = writeln!(out, "                        branch_delay: {branch_delay},");
+    let _ = writeln!(out, "                        instruction_code: 0,");
+    let _ = writeln!(out, "                        bad_vaddr: None,");
+    let _ = writeln!(out, "                        coprocessor: Some(0),");
+    let _ = writeln!(out, "                    }},");
+    let _ = writeln!(out, "                }}));");
+    let _ = writeln!(out, "            }}");
 }
 
 /// Emit the Status.CU1 check before any COP1-visible effect. A branch checks
@@ -1620,6 +1770,23 @@ impl MemFault {
             } => format!(
                 "let __architectural = __fa.is_architectural_exception(); let __kind = __fa.into_cpu_fault_kind(GuestPc::new({epc:#010X}), {branch_delay}); if __architectural {{ if !{branch_delay} {{ executed += 1; }} return BlockRun::new(BlockExit::Fault(CpuFault {{ at: ExecutionKey::new(expected_bank, GuestPc::new({pc:#010X})), kind: __kind }}), executed); }} return BlockRun::new(BlockExit::Fault(CpuFault {{ at: ExecutionKey::new(expected_bank, GuestPc::new({pc:#010X})), kind: __kind }}), {retired});"
             ),
+        }
+    }
+
+    fn fpu_exception_finish(self) -> String {
+        match self {
+            Self::Panic => "fn64_recomp_rs::trap_unsupported(\"enabled FCSR cause written by CTC1 in whole-function lane\");".to_string(),
+            Self::Fault {
+                pc,
+                epc,
+                branch_delay,
+                ..
+            } => {
+                let count = if branch_delay { "" } else { "executed += 1; " };
+                format!(
+                    "{count}finish!(BlockExit::Fault(CpuFault {{ at: ExecutionKey::new(expected_bank, GuestPc::new({pc:#010X})), kind: CpuFaultKind::Exception {{ exception: CpuException::FloatingPoint, epc: GuestPc::new({epc:#010X}), branch_delay: {branch_delay}, instruction_code: 0, bad_vaddr: None, coprocessor: None }} }}));"
+                )
+            }
         }
     }
 
@@ -2187,7 +2354,14 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
             out,
             format!("{{ let v = ctx.read_fcr({}); ctx.set_r32({}, v as i32); }}", fs, rt),
         ),
-        Ctc1 { rt, fs } => line(out, format!("ctx.write_fcr({}, {});", fs, ru32(rt))),
+        Ctc1 { rt, fs } => {
+            line(out, format!("ctx.write_fcr({}, {});", fs, ru32(rt)));
+            let finish = mem_fault.fpu_exception_finish();
+            line(
+                out,
+                format!("if ctx.fcsr_exception_pending() {{ {finish} }}"),
+            );
+        }
 
         // --- COP1 loads/stores ---
         Lwc1 { ft, base, off } => mem_fault.load(
@@ -2252,57 +2426,49 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
         MovzD { fd, fs, rt } => line(out, format!("ctx.fpu_movz_d({fd}, {fs}, {rt});")),
         MovnD { fd, fs, rt } => line(out, format!("ctx.fpu_movn_d({fd}, {fs}, {rt});")),
 
-        // --- Conversions. Float->float use lossless/rounding `as` casts; the
+        // --- Conversions. Float-to-float and fixed-to-float use shared
+        //     integer-only IEEE encoders and typed FCSR results.
+        //     The
         //     int destinations write the RAW 32/64 bits of the result into the
         //     FPR (an int-in-FPR is stored as its two's-complement bit pattern,
         //     exactly as the C writes `f.u32l = (int32_t)...`). The int source
         //     of CVT.S.W/CVT.D.W reads the FPR single word AS an i32.
 
-        // int32 (fs single word, read as i32) -> float/double
-        CvtSW { fd, fs } => {
-            line(out, format!("ctx.set_f_s({}, (ctx.f_bits({}) as i32) as f32);", fd, fs))
-        }
-        CvtDW { fd, fs } => {
-            line(out, format!("ctx.set_f_d({}, (ctx.f_bits({}) as i32) as f64);", fd, fs))
-        }
-        // int64 (fs 64 bits, read as i64) -> float/double
-        CvtSL { fd, fs } => {
-            line(out, format!("ctx.set_f_s({}, (ctx.d_bits({}) as i64) as f32);", fd, fs))
-        }
-        CvtDL { fd, fs } => {
-            line(out, format!("ctx.set_f_d({}, (ctx.d_bits({}) as i64) as f64);", fd, fs))
-        }
-        // float <-> double
-        CvtDS { fd, fs } => line(out, format!("ctx.set_f_d({}, ctx.f_s({}) as f64);", fd, fs)),
-        CvtSD { fd, fs } => line(out, format!("ctx.set_f_s({}, ctx.f_d({}) as f32);", fd, fs)),
+        CvtSW { fd, fs } => emit_fixed_to_float(out, *mem_fault, fd, fs, 'S', 'W'),
+        CvtDW { fd, fs } => emit_fixed_to_float(out, *mem_fault, fd, fs, 'D', 'W'),
+        CvtSL { fd, fs } => emit_fixed_to_float(out, *mem_fault, fd, fs, 'S', 'L'),
+        CvtDL { fd, fs } => emit_fixed_to_float(out, *mem_fault, fd, fs, 'D', 'L'),
+        CvtDS { fd, fs } => emit_float_to_float(out, *mem_fault, fd, fs, 'D', 'S'),
+        CvtSD { fd, fs } => emit_float_to_float(out, *mem_fault, fd, fs, 'S', 'D'),
 
         // float/double -> int32 (round to nearest, ties to even = FCSR default).
         // Written as raw bits of the i32 into the FPR single word.
-        CvtWS { fd, fs } => emit_fpu_i32(out, fd, fs, true, None),
-        CvtWD { fd, fs } => emit_fpu_i32(out, fd, fs, false, None),
+        CvtWS { fd, fs } => emit_fpu_i32(out, *mem_fault, fd, fs, true, None),
+        CvtWD { fd, fs } => emit_fpu_i32(out, *mem_fault, fd, fs, false, None),
         // float/double -> int64 (round to nearest).
-        CvtLS { fd, fs } => emit_fpu_i64(out, fd, fs, true, None),
-        CvtLD { fd, fs } => emit_fpu_i64(out, fd, fs, false, None),
+        CvtLS { fd, fs } => emit_fpu_i64(out, *mem_fault, fd, fs, true, None),
+        CvtLD { fd, fs } => emit_fpu_i64(out, *mem_fault, fd, fs, false, None),
 
-        // TRUNC.* -> round toward zero. Rust `f32 as i32` is exactly the C
-        // `(int32_t)val` truncation (both saturate/clamp per IEEE-to-int, and
-        // OoT's inputs are in range), matching the recomp.h TRUNC_W_S macro.
-        TruncWS { fd, fs } => emit_fpu_i32(out, fd, fs, true, Some(1)),
-        TruncWD { fd, fs } => emit_fpu_i32(out, fd, fs, false, Some(1)),
-        TruncLS { fd, fs } => emit_fpu_i64(out, fd, fs, true, Some(1)),
-        TruncLD { fd, fs } => emit_fpu_i64(out, fd, fs, false, Some(1)),
-        RoundWS { fd, fs } => emit_fpu_i32(out, fd, fs, true, Some(0)),
-        RoundWD { fd, fs } => emit_fpu_i32(out, fd, fs, false, Some(0)),
-        RoundLS { fd, fs } => emit_fpu_i64(out, fd, fs, true, Some(0)),
-        RoundLD { fd, fs } => emit_fpu_i64(out, fd, fs, false, Some(0)),
-        CeilWS { fd, fs } => emit_fpu_i32(out, fd, fs, true, Some(2)),
-        CeilWD { fd, fs } => emit_fpu_i32(out, fd, fs, false, Some(2)),
-        CeilLS { fd, fs } => emit_fpu_i64(out, fd, fs, true, Some(2)),
-        CeilLD { fd, fs } => emit_fpu_i64(out, fd, fs, false, Some(2)),
-        FloorWS { fd, fs } => emit_fpu_i32(out, fd, fs, true, Some(3)),
-        FloorWD { fd, fs } => emit_fpu_i32(out, fd, fs, false, Some(3)),
-        FloorLS { fd, fs } => emit_fpu_i64(out, fd, fs, true, Some(3)),
-        FloorLD { fd, fs } => emit_fpu_i64(out, fd, fs, false, Some(3)),
+        // TRUNC.* uses the typed raw-register helper with fixed RM=1. The
+        // helper classifies guest operands and raises FCSR exceptions before
+        // the destination is committed; no host-language cast defines the
+        // guest out-of-range or NaN behavior.
+        TruncWS { fd, fs } => emit_fpu_i32(out, *mem_fault, fd, fs, true, Some(1)),
+        TruncWD { fd, fs } => emit_fpu_i32(out, *mem_fault, fd, fs, false, Some(1)),
+        TruncLS { fd, fs } => emit_fpu_i64(out, *mem_fault, fd, fs, true, Some(1)),
+        TruncLD { fd, fs } => emit_fpu_i64(out, *mem_fault, fd, fs, false, Some(1)),
+        RoundWS { fd, fs } => emit_fpu_i32(out, *mem_fault, fd, fs, true, Some(0)),
+        RoundWD { fd, fs } => emit_fpu_i32(out, *mem_fault, fd, fs, false, Some(0)),
+        RoundLS { fd, fs } => emit_fpu_i64(out, *mem_fault, fd, fs, true, Some(0)),
+        RoundLD { fd, fs } => emit_fpu_i64(out, *mem_fault, fd, fs, false, Some(0)),
+        CeilWS { fd, fs } => emit_fpu_i32(out, *mem_fault, fd, fs, true, Some(2)),
+        CeilWD { fd, fs } => emit_fpu_i32(out, *mem_fault, fd, fs, false, Some(2)),
+        CeilLS { fd, fs } => emit_fpu_i64(out, *mem_fault, fd, fs, true, Some(2)),
+        CeilLD { fd, fs } => emit_fpu_i64(out, *mem_fault, fd, fs, false, Some(2)),
+        FloorWS { fd, fs } => emit_fpu_i32(out, *mem_fault, fd, fs, true, Some(3)),
+        FloorWD { fd, fs } => emit_fpu_i32(out, *mem_fault, fd, fs, false, Some(3)),
+        FloorLS { fd, fs } => emit_fpu_i64(out, *mem_fault, fd, fs, true, Some(3)),
+        FloorLD { fd, fs } => emit_fpu_i64(out, *mem_fault, fd, fs, false, Some(3)),
         // (FLOOR/CEIL/ROUND.W.{S,D} are handled by the unified emit_fpu_i32
         // arms above with the mode arg Some(3)/Some(2)/Some(0); the duplicate
         // inline arms from main's driver branch were removed as unreachable on
@@ -2310,30 +2476,14 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
         // superset, and fpu_oracle.rs verifies the emitted behavior matches.)
 
         // --- FP compares: set the condition flag (FCSR bit 23). ---
-        CEqS { fs, ft } => {
-            line(out, format!("ctx.fpu_compare_s({}, {}, 2);", fs, ft))
-        }
-        CLtS { fs, ft } => {
-            line(out, format!("ctx.fpu_compare_s({}, {}, 12);", fs, ft))
-        }
-        CLeS { fs, ft } => {
-            line(out, format!("ctx.fpu_compare_s({}, {}, 14);", fs, ft))
-        }
-        CEqD { fs, ft } => {
-            line(out, format!("ctx.fpu_compare_d({}, {}, 2);", fs, ft))
-        }
-        CLtD { fs, ft } => {
-            line(out, format!("ctx.fpu_compare_d({}, {}, 12);", fs, ft))
-        }
-        CLeD { fs, ft } => {
-            line(out, format!("ctx.fpu_compare_d({}, {}, 14);", fs, ft))
-        }
-        CCondS { fs, ft, cond } => {
-            line(out, format!("ctx.fpu_compare_s({}, {}, {});", fs, ft, cond))
-        }
-        CCondD { fs, ft, cond } => {
-            line(out, format!("ctx.fpu_compare_d({}, {}, {});", fs, ft, cond))
-        }
+        CEqS { fs, ft } => emit_fpu_compare(out, *mem_fault, true, fs, ft, 2),
+        CLtS { fs, ft } => emit_fpu_compare(out, *mem_fault, true, fs, ft, 12),
+        CLeS { fs, ft } => emit_fpu_compare(out, *mem_fault, true, fs, ft, 14),
+        CEqD { fs, ft } => emit_fpu_compare(out, *mem_fault, false, fs, ft, 2),
+        CLtD { fs, ft } => emit_fpu_compare(out, *mem_fault, false, fs, ft, 12),
+        CLeD { fs, ft } => emit_fpu_compare(out, *mem_fault, false, fs, ft, 14),
+        CCondS { fs, ft, cond } => emit_fpu_compare(out, *mem_fault, true, fs, ft, cond),
+        CCondD { fs, ft, cond } => emit_fpu_compare(out, *mem_fault, false, fs, ft, cond),
 
         // --- COP0 system control ---
         //

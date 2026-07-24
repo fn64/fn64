@@ -42,6 +42,7 @@ sha2 = "0.10"
 fn64-abi = { path = "../fn64-abi" }
 fn64-boot-harness = { path = "../fn64-boot-harness" }
 fn64-render-reference = { path = "../fn64-render-reference" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [build-dependencies]
@@ -145,4 +146,8 @@ required-features = ["rt64", "synthetic-f3dex2-evidence"]
 
 [[example]]
 name = "rt64_s2dex_enhancement_behavior"
+required-features = ["rt64", "synthetic-s2dex-evidence"]
+
+[[example]]
+name = "rt64_s2dex_object_rect_behavior"
 required-features = ["rt64", "synthetic-s2dex-evidence"]

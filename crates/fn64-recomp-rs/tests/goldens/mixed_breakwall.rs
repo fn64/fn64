@@ -31,7 +31,7 @@ pub fn bg_breakwall_lava_cover_move(ctx: &mut RecompContext, mem: &mut Rdram) {
             // 0x809016C0: Nop
             // nop
             // 0x809016C4: CvtSW { fd: 6, fs: 4 }
-            ctx.set_f_s(6, (ctx.f_bits(4) as i32) as f32);
+            { let r = ctx.cvt_s_w_bits(4); ctx.set_f_bits(6, r); }
             // 0x809016C8: AddS { fd: 10, fs: 6, ft: 8 }
             if ctx.fpu_add_s(10, 6, 8) { fn64_recomp_rs::trap_unsupported("enabled COP1 exception"); }
             // 0x809016CC: Mfc1 { rt: 5, fs: 10 }

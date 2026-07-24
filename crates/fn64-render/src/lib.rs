@@ -35,6 +35,7 @@
 mod geometry_task_inspection;
 mod microcode;
 mod microcode_identity;
+mod raw_dpc_batch;
 mod rdp_completion;
 mod settings;
 pub mod vi_public_filters;
@@ -54,6 +55,11 @@ pub use microcode::{
 pub use microcode_identity::{
     capture_task_admission_raw_window, identify_f3dzex2, F3dzex2Variant, F3DZEX2_IDENTITY_SOURCE,
     F3DZEX2_RAW_WINDOW_SIZE,
+};
+pub use raw_dpc_batch::{
+    OwnedRawDpcSubmission, PreflightedRawDpcBatch, RawDpcBatch, RawDpcBatchCapability,
+    RawDpcBatchOutcome, RawDpcBatchPreflightError, RawDpcSource, RawDpcStreamGroup,
+    RawDpcSubmissionError, RawDpcSubmissionIdentity,
 };
 pub use rdp_completion::{inspect_raw_rdp_full_sync, raw_rdp_command_width};
 pub use settings::{
@@ -791,6 +797,62 @@ pub enum DpFullSyncStatus {
     Reached,
 }
 
+/// Raw-DPC progress guarantee selected by a renderer.
+///
+/// `Atomic` is the compatibility contract and carries no intermediate device-
+/// timing authority. `Acknowledged` only promises transactional host commit
+/// boundaries; a separate measured runtime policy must schedule them.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum RawDpcProgression {
+    #[default]
+    Atomic,
+    Acknowledged,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RenderRawDpcContinuation(NonZeroU64);
+
+impl RenderRawDpcContinuation {
+    pub const fn new(value: u64) -> Self {
+        Self(NonZeroU64::new(value).expect("raw DPC continuation token must be nonzero"))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RawDpcStep {
+    Start,
+    Resume(RenderRawDpcContinuation),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RawDpcChunkStatus {
+    /// More schedule-owned command range must remain after this commit.
+    Continue(RenderRawDpcContinuation),
+    /// This commit consumed the schedule's final range.
+    Complete,
+}
+
+/// One runtime-issued renderer boundary. The range is an execution quantum,
+/// not a claim about RDP clocks, DMA fetch timing, or silicon command width.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RawDpcQuantum {
+    pub request: fn64_runtime::DpcBackendQuantumRequest,
+    pub output_addr: u32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RawDpcChunkAck {
+    pub transaction: fn64_runtime::DpcTransactionId,
+    pub quantum: fn64_runtime::DpcQuantumId,
+    pub committed_through: fn64_runtime::DpcCursor,
+    pub status: RawDpcChunkStatus,
+    pub full_sync: DpFullSyncStatus,
+}
+
 /// Opaque ownership token for a backend-retained HLE task continuation.
 ///
 /// The backend, not the ABI scheduler, owns the renderer-local continuation
@@ -1099,6 +1161,62 @@ pub trait RenderBackend {
         })
     }
 
+    /// Whether this backend can commit separately scheduled raw-DPC chunks.
+    /// Existing backends remain atomic and retain their historical call path.
+    fn raw_dpc_progression(&self) -> RawDpcProgression {
+        RawDpcProgression::Atomic
+    }
+
+    /// Execute one externally scheduled raw-DPC quantum.
+    ///
+    /// The default is a loud rejection. An acknowledged implementation must
+    /// leave its private continuation unchanged on `Err`; memory is supplied
+    /// as an ABI-owned shadow. Once backend entry occurs, either an `Err` or a
+    /// malformed `Ok` poisons that orchestration transaction and is never
+    /// retried. The ABI publishes a successful memory image only after
+    /// validating transaction, quantum, cursor, identified FullSync evidence,
+    /// and `Continue`/`Complete` against the remaining schedule.
+    fn process_rdp_command_chunk(
+        &mut self,
+        _rdram: &mut [u8],
+        quantum: RawDpcQuantum,
+        _step: RawDpcStep,
+    ) -> Result<RawDpcChunkAck, RenderError> {
+        Err(RenderError::Backend {
+            backend: "raw-dpc-chunk",
+            reason: format!(
+                "registered atomic backend cannot acknowledge DPC transaction {} quantum {}",
+                quantum.request.transaction.get(),
+                quantum.request.quantum.get()
+            ),
+        })
+    }
+
+    /// Availability of the explicitly non-certifying staged-RDRAM diagnostic.
+    /// `DiagnosticOnly` is never authority to publish guest or device state.
+    fn raw_dpc_batch_capability(&self) -> RawDpcBatchCapability {
+        RawDpcBatchCapability::Unsupported
+    }
+
+    /// Consume a completely preflighted batch for render-only diagnostics.
+    ///
+    /// The default is a loud capability failure. Implementations must never
+    /// loop over `process_rdp_commands` unless it owns a complete backend-state
+    /// snapshot: an error after an earlier stream group would otherwise expose
+    /// a partial diagnostic result. This seam does not represent `CMD_END`
+    /// timing, interrupt ordering, or intermediate memory visibility.
+    fn process_raw_dpc_batch(
+        &mut self,
+        _rdram: &mut [u8],
+        _batch: PreflightedRawDpcBatch,
+        _output_addr: u32,
+    ) -> Result<RawDpcBatchOutcome, RenderError> {
+        Err(RenderError::Backend {
+            backend: "raw-dpc-batch",
+            reason: "registered backend does not implement diagnostic raw-DPC batches".to_string(),
+        })
+    }
+
     /// FullSync result of the immediately preceding successful task, raw DPC
     /// submission, or committed task chunk. For a resumable task this result
     /// is cumulative through the returned continuation. Implementations reset
@@ -1352,6 +1470,40 @@ mod tests {
     }
 
     #[test]
+    fn atomic_raw_dpc_backend_rejects_acknowledged_chunks_by_name() {
+        let mut backend = fake(vec![]);
+        let transaction =
+            fn64_runtime::DpcTransactionId::from_submission(fn64_runtime::DpcSubmission {
+                token: 9,
+                source: fn64_runtime::DpcSubmissionSource::Rdram,
+                start: 0x100,
+                end: 0x108,
+            });
+        let request = fn64_runtime::DpcBackendQuantumRequest {
+            transaction,
+            quantum: fn64_runtime::DpcQuantumId::new(1),
+            start: fn64_runtime::DpcCursor::new(fn64_runtime::DpcSubmissionSource::Rdram, 0x100)
+                .unwrap(),
+            end: fn64_runtime::DpcCursor::new(fn64_runtime::DpcSubmissionSource::Rdram, 0x108)
+                .unwrap(),
+        };
+        assert_eq!(backend.raw_dpc_progression(), RawDpcProgression::Atomic);
+        let error = backend
+            .process_rdp_command_chunk(
+                &mut [],
+                RawDpcQuantum {
+                    request,
+                    output_addr: 0,
+                },
+                RawDpcStep::Start,
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("atomic backend cannot acknowledge DPC transaction 9 quantum 1"));
+    }
+
+    #[test]
     fn process_task_before_create_is_not_ready() {
         let mut backend = fake(vec![UcodeId::F3dex2]);
         let mut rdram = vec![0u8; 16];
@@ -1428,6 +1580,36 @@ mod tests {
             events[0].disposition,
             fn64_runtime::UnsupportedDisposition::ReturnedError
         );
+    }
+
+    #[test]
+    fn default_raw_dpc_batch_capability_rejects_without_memory_mutation() {
+        let mut backend = FakeBackend {
+            ready: true,
+            ucodes: vec![],
+            frames_presented: 0,
+        };
+        let mut rdram = vec![0x5a; 0x200];
+        let before = rdram.clone();
+        let submission =
+            OwnedRawDpcSubmission::from_rdram_words(0x100, 0x108, vec![0xe900_0000, 0]).unwrap();
+        let batch = RawDpcBatch::new(vec![submission])
+            .unwrap()
+            .preflight(rdram.len())
+            .unwrap();
+
+        let error = backend
+            .process_raw_dpc_batch(&mut rdram, batch, 0)
+            .unwrap_err();
+
+        assert_eq!(
+            backend.raw_dpc_batch_capability(),
+            RawDpcBatchCapability::Unsupported
+        );
+        assert!(error
+            .to_string()
+            .contains("does not implement diagnostic raw-DPC batches"));
+        assert_eq!(rdram, before);
     }
 
     #[test]

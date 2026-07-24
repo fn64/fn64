@@ -42,7 +42,8 @@ pub use private_input_admission::{
     VerifiedPrivateF3dzex2CharacterizationInput,
 };
 pub use private_release_series::{
-    load_private_release_run_contract, run_private_release_series, verify_private_release_series,
+    load_private_release_run_contract, run_private_release_series,
+    run_synthetic_native_private_release_series, verify_private_release_series,
     verify_private_release_series_with_runner,
     verify_repository_synthetic_private_release_run_contract, PrivateArtifactIdentity,
     PrivateChildCommand, PrivateEnvironmentEntry, PrivateFileIdentity, PrivateReleaseRunContract,
@@ -50,9 +51,10 @@ pub use private_release_series::{
     VerifiedPrivateReleaseRunContract, VerifiedPrivateReleaseSeries,
     PRIVATE_RELEASE_RUN_CONTRACT_SCHEMA, PRIVATE_RELEASE_SERIES_COUNT,
     PRIVATE_RELEASE_SERIES_RECEIPT_SCHEMA, RELEASE_MICROCODE_DATA_PATH_ENV,
-    RELEASE_MICROCODE_TEXT_PATH_ENV, REPOSITORY_SYNTHETIC_RELEASE_CYCLE,
-    REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES, REPOSITORY_SYNTHETIC_RELEASE_MANIFEST_BYTES,
-    REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES, REPOSITORY_SYNTHETIC_RELEASE_SCENARIO,
+    RELEASE_MICROCODE_TEXT_PATH_ENV, REPOSITORY_SYNTHETIC_NATIVE_RELEASE_SCENARIO,
+    REPOSITORY_SYNTHETIC_RELEASE_CYCLE, REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES,
+    REPOSITORY_SYNTHETIC_RELEASE_MANIFEST_BYTES, REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES,
+    REPOSITORY_SYNTHETIC_RELEASE_SCENARIO,
 };
 pub use release_gate::{
     ArtifactDigest, ArtifactKind, ClosureGate, ClosurePath, ClosurePathStatus, DeterministicDigest,
@@ -461,6 +463,20 @@ pub enum ReleaseRendererEvidence {
     },
 }
 
+/// Audio-task executor selected before guest task admission.
+///
+/// The translated identity binds the exact host artifact selected by the
+/// owner, but it does not prove that artifact implements the live RSP IMEM
+/// image. Release evidence therefore admits only [`Self::LleAccuracy`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReleaseAudioTaskExecutionPolicy {
+    Unconfigured,
+    Translated { artifact_sha256: String },
+    LleAccuracy,
+    DiagnosticSkip,
+}
+
 impl ReleaseRendererEvidence {
     pub const fn tv_type(&self) -> ReleaseTvStandard {
         match self {
@@ -479,6 +495,7 @@ pub struct ReleaseEnvironmentEvidence {
     pub windows_version: Option<ReleaseWindowsVersionEvidence>,
     pub controller_ports: [ReleaseControllerPort; 4],
     pub cartridge_save: ReleaseCartridgeSave,
+    pub audio_task_execution: ReleaseAudioTaskExecutionPolicy,
     pub renderer: ReleaseRendererEvidence,
 }
 

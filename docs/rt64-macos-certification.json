@@ -21,100 +21,194 @@
       "id": "backend-lifecycle",
       "category": "backend",
       "example": "rt64_metal_backend_behavior",
-      "features": ["rt64"],
+      "features": [
+        "rt64"
+      ],
       "repeat_bar": 20,
-      "claims": ["backend-metal"],
-      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-22" }
+      "claims": [
+        "backend-metal"
+      ],
+      "recorded": {
+        "status": "pass",
+        "clean_runs": 20,
+        "verified_on": "2026-07-22"
+      }
     },
     {
       "id": "resolution-downsample",
       "category": "resolution",
       "example": "rt64_resolution_downsample_behavior",
-      "features": ["rt64"],
+      "features": [
+        "rt64"
+      ],
       "repeat_bar": 10,
-      "claims": ["high-resolution-renderer", "downsample-to-original-like"],
-      "recorded": { "status": "pass", "clean_runs": 10, "verified_on": "2026-07-19" }
+      "claims": [
+        "high-resolution-renderer",
+        "downsample-to-original-like"
+      ],
+      "recorded": {
+        "status": "pass",
+        "clean_runs": 10,
+        "verified_on": "2026-07-19"
+      }
     },
     {
       "id": "framebuffer-rdram-region",
       "category": "framebuffer",
       "example": "rt64_framebuffer_rdram_region_behavior",
-      "features": ["rt64"],
+      "features": [
+        "rt64"
+      ],
       "repeat_bar": 10,
-      "claims": ["native-renderer-rdram-sync", "framebuffer-detection-region-copy"],
-      "recorded": { "status": "pass", "clean_runs": 10, "verified_on": "2026-07-19" }
+      "claims": [
+        "native-renderer-rdram-sync",
+        "framebuffer-detection-region-copy"
+      ],
+      "recorded": {
+        "status": "pass",
+        "clean_runs": 10,
+        "verified_on": "2026-07-19"
+      }
     },
     {
       "id": "framebuffer-enhancement",
       "category": "framebuffer",
       "example": "rt64_framebuffer_enhancement_behavior",
-      "features": ["rt64"],
+      "features": [
+        "rt64"
+      ],
       "repeat_bar": 10,
-      "claims": ["framebuffer-upscaling", "framebuffer-reinterpretation"],
-      "recorded": { "status": "pass", "clean_runs": 10, "verified_on": "2026-07-19" }
+      "claims": [
+        "framebuffer-upscaling",
+        "framebuffer-reinterpretation"
+      ],
+      "recorded": {
+        "status": "pass",
+        "clean_runs": 10,
+        "verified_on": "2026-07-19"
+      }
     },
     {
       "id": "texture-replacements",
       "category": "textures",
       "example": "rt64_texture_replacement_behavior",
-      "features": ["rt64"],
+      "features": [
+        "rt64"
+      ],
       "repeat_bar": 10,
-      "claims": ["texture-pack-dds", "texture-pack-rice-filenames", "texture-pack-async-streaming"],
-      "recorded": { "status": "pass", "clean_runs": 10, "verified_on": "2026-07-19" }
+      "claims": [
+        "texture-pack-dds",
+        "texture-pack-rice-filenames",
+        "texture-pack-async-streaming"
+      ],
+      "recorded": {
+        "status": "pass",
+        "clean_runs": 10,
+        "verified_on": "2026-07-19"
+      }
     },
     {
       "id": "latency-skip-buffering",
       "category": "latency",
       "example": "rt64_latency_skip_buffering_behavior",
-      "features": ["rt64"],
+      "features": [
+        "rt64"
+      ],
       "repeat_bar": 10,
-      "claims": ["latency-skip-buffering"],
-      "recorded": { "status": "pass", "clean_runs": 10, "verified_on": "2026-07-19" }
+      "claims": [
+        "latency-skip-buffering"
+      ],
+      "recorded": {
+        "status": "pass",
+        "clean_runs": 10,
+        "verified_on": "2026-07-19"
+      }
     },
     {
       "id": "latency-present-early",
       "category": "latency",
       "example": "rt64_latency_present_early_behavior",
-      "features": ["rt64"],
+      "features": [
+        "rt64"
+      ],
       "repeat_bar": 20,
-      "claims": ["latency-present-early"],
-      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-19" }
+      "claims": [
+        "latency-present-early"
+      ],
+      "recorded": {
+        "status": "pass",
+        "clean_runs": 20,
+        "verified_on": "2026-07-19"
+      }
     },
     {
       "id": "deferred-debugger",
       "category": "inspection",
       "example": "rt64_deferred_debugger_behavior",
-      "features": ["rt64"],
+      "features": [
+        "rt64"
+      ],
       "repeat_bar": 20,
-      "claims": ["deferred-frame-history", "debugger-frame-inspection"],
-      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-19" }
+      "claims": [
+        "deferred-frame-history",
+        "debugger-frame-inspection"
+      ],
+      "recorded": {
+        "status": "pass",
+        "clean_runs": 20,
+        "verified_on": "2026-07-19"
+      }
     },
     {
       "id": "ubershader-critical-path",
       "category": "pipelines",
       "example": "rt64_ubershader_pipeline_behavior",
-      "features": ["rt64"],
+      "features": [
+        "rt64"
+      ],
       "repeat_bar": 20,
-      "claims": ["ubershader-no-pipeline-stutter"],
-      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-19" }
+      "claims": [
+        "ubershader-no-pipeline-stutter"
+      ],
+      "recorded": {
+        "status": "pass",
+        "clean_runs": 20,
+        "verified_on": "2026-07-19"
+      }
     },
     {
       "id": "hfr-hle-cooperation",
       "category": "generated-frames",
       "example": "rt64_hfr_interpolation_behavior",
-      "features": ["hfr-evidence"],
+      "features": [
+        "hfr-evidence"
+      ],
       "repeat_bar": 20,
-      "claims": ["hfr-60-plus-interpolation"],
-      "recorded": { "status": "pass", "clean_runs": 20, "verified_on": "2026-07-21" }
+      "claims": [
+        "hfr-60-plus-interpolation"
+      ],
+      "recorded": {
+        "status": "pass",
+        "clean_runs": 20,
+        "verified_on": "2026-07-21"
+      }
     },
     {
       "id": "extended-gbi-cooperation",
       "category": "extended-gbi",
       "example": "rt64_extended_gbi_enhancement_behavior",
-      "features": ["extended-gbi-evidence"],
+      "features": [
+        "extended-gbi-evidence"
+      ],
       "repeat_bar": 10,
-      "claims": ["extended-gbi"],
-      "recorded": { "status": "pass", "clean_runs": 10, "verified_on": "2026-07-20" }
+      "claims": [
+        "extended-gbi"
+      ],
+      "recorded": {
+        "status": "pass",
+        "clean_runs": 10,
+        "verified_on": "2026-07-20"
+      }
     }
   ],
   "blockers": [
@@ -151,8 +245,10 @@
     {
       "id": "full-adapter-rom-coverage",
       "status": "open",
-      "claims": ["base-rendering-accuracy"],
-      "reason": "One historical private NTSC RT64 LLE/post-VI schema-v22 exact-ten series completed and was independently reverified on this Metal host at fixed cycle 722368695 with zero unsupported events. It supplied one full-ROM scenario under the retired schema and requires v23 regeneration, not broad adapter or recognized-HLE coverage. A twenty-phase native Metal gate binds exact nondefault post-VI pixels, causal/restorable gamma and seeded gamma-dither, coverage-gated horizontal divot, and DITHER_FILTER RGBA16 restoration. Divot changes twelve exact componentwise-median pixels and restores exactly. Restoration changes eighteen exact full-coverage pixels, leaves twenty-four non-full controls and six flat full-coverage controls byte-identical, preserves alpha, and restores exactly when disabled. A separate adapter-capture integration test plus eleven-phase gate preserve hardware mode 0 versus compatibility Unspecified across the wire and native callback. Deliberately generated RT64-managed coverage codes 1 through 6 each match an independent per-code Figure-11/Equation-4 CPU oracle at RGB8 [50,45,35], [76,60,53], [102,70,75], [128,87,95], [158,95,109], and [185,113,128]. Modes 2/3 restore exactly; compatibility Unspecified remains replicate; source-lattice divot and AA-before-divot match independent oracles; AA, divot, and their combination each change six projected pixels while retaining distinct exact digests. The context-reuse gate asserts recreated and compatibility identities 1/1 and 1/2, filter workload 2 with presents 3 through 22, and selector workload 3 with presents 23 through 33. The expanded fixture passed the official watchdog-bounded lifecycle runner in 20/20 fresh Darwin 25.5.0 arm64 processes on 2026-07-22. Remaining evidence is limited to clean pinned RT64 on Metal, nearest/progressive synthetic RGBA16, original-aspect projection, deliberately generated managed coverage, and construction-known opaque code-7 controls. Code 0/save, the managed-7/8 versus clamped-8/8 code-7 alias, natural triangle or imported hidden coverage, insufficient neighborhoods, wider filtering/scaling lattices, MSAA/downsample, other APIs, recognized-HLE/full-profile ROM breadth, silicon arithmetic/coverage, and analog output remain uncertified."
+      "claims": [
+        "base-rendering-accuracy"
+      ],
+      "reason": "One historical private NTSC RT64 LLE/post-VI schema-v22 exact-ten series completed and was independently reverified on this Metal host at fixed cycle 722368695 with zero unsupported events. It supplied one full-ROM scenario under the retired schema and requires v28 regeneration, not broad adapter or recognized-HLE coverage. A twenty-phase native Metal gate binds exact nondefault post-VI pixels, causal/restorable gamma and seeded gamma-dither, coverage-gated horizontal divot, and DITHER_FILTER RGBA16 restoration. Divot changes twelve exact componentwise-median pixels and restores exactly. Restoration changes eighteen exact full-coverage pixels, leaves twenty-four non-full controls and six flat full-coverage controls byte-identical, preserves alpha, and restores exactly when disabled. A separate adapter-capture integration test plus eleven-phase gate preserve hardware mode 0 versus compatibility Unspecified across the wire and native callback. Deliberately generated RT64-managed coverage codes 1 through 6 each match an independent per-code Figure-11/Equation-4 CPU oracle at RGB8 [50,45,35], [76,60,53], [102,70,75], [128,87,95], [158,95,109], and [185,113,128]. Modes 2/3 restore exactly; compatibility Unspecified remains replicate; source-lattice divot and AA-before-divot match independent oracles; AA, divot, and their combination each change six projected pixels while retaining distinct exact digests. The context-reuse gate asserts recreated and compatibility identities 1/1 and 1/2, filter workload 2 with presents 3 through 22, and selector workload 3 with presents 23 through 33. The expanded fixture passed the official watchdog-bounded lifecycle runner in 20/20 fresh Darwin 25.5.0 arm64 processes on 2026-07-22. A bounded S2DEX2 G_OBJ_LDTX_RECT v3 gate passed 10/10 fresh Metal processes with ten-second teardown spacing on 2026-07-24 in America/New_York: its texture-only control draws nothing; its fused load/draw and final post-rejection recovery match an independently encoded raw-RDP control at exact RDRAM SHA-256 dd169419... and post-VI SHA-256 394924cd...; exact public family/type/descriptor/DMA/alignment/sampler checks precede mutation; exact workloads 2/3/4, presents 1/2/3, route digest 74388d653ac3227f, and final content digest 28cb374eedfe64b3 are retained; and flip, upper-bit-type, descriptor-mismatch, alignment, short-DMA/stale-tail, bilerp, LOD, detail/sharpen, TLUT, perspective, and legacy-S2DEX negatives reject by name. This focused base-accuracy result is retained in this blocker rather than promoted to the feature-case table because base-rendering-accuracy remains open. Remaining evidence is limited to clean pinned RT64 on Metal, nearest/progressive synthetic RGBA16, original-aspect projection, deliberately generated managed coverage, construction-known opaque code-7 controls, and one bounded S2DEX2 object rectangle. Code 0/save, the managed-7/8 versus clamped-8/8 code-7 alias, natural triangle or imported hidden coverage, insufficient neighborhoods, wider filtering/scaling lattices, MSAA/downsample, other APIs, broader S2DEX commands/modes, recognized-HLE/full-profile ROM breadth, silicon arithmetic/coverage, and analog output remain uncertified."
     },
     {
       "id": "declared-host-range",

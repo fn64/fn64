@@ -3,10 +3,10 @@
 //!
 //! Measured finding (2026-07): the AKI audio ucode (789 instructions) emits
 //! ZERO scalar `trap_unknown` sites, and every VU op it uses is in `dispatch`'s
-//! implemented set. So making WM2000 audible is an INTEGRATION task (emit the
-//! `aki-audio-ucode` crate + wire it in), not an RSP-op-implementation task.
-//! This test locks that in: it fails if a change reintroduces an undecoded
-//! scalar op or a VU op the AKI ucode needs that `dispatch` no longer handles.
+//! implemented set. This test locks that decoder coverage in: it fails if a
+//! change reintroduces an undecoded scalar op or a VU op the AKI ucode needs
+//! that `dispatch` no longer handles. Runtime accuracy uses admitted live IMEM
+//! through LLE; private-ROM end-to-end sound remains separately unverified.
 //!
 //! Env: FN64_WM2000_ROM = path to the WM2000 (.z64). The AKI audio ucode text
 //! is 3156 bytes at ROM 0x39510, vram 0x80038910 (byte-identical across the AKI

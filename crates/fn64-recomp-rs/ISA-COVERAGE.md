@@ -213,8 +213,19 @@ doubleword COP0 register moves remain host-boundary traps. In the arbitrary-PC
 bank lane, ERET selects ErrorEPC/ERL or EPC/EXL, clears the LL reservation, and
 returns a typed resolved transfer; the historical whole-function lane still
 traps because its callable ABI cannot return a transfer. BC0 uses a typed
-condition input, but CACHE does not synthesize Status.CH. Therefore COP0 is
-encoding-complete but not a complete privileged CPU/MMU model.
+condition input, but CACHE does not synthesize Status.CH. Privileged-
+instruction admission is shared and exhaustive across the two arbitrary-PC
+lanes: every decoded MFC0/DMFC0/MTC0/DMTC0, BC0*, TLB management, and ERET
+shape checks kernel-or-Status.CU0 before register-shape validation, condition
+sampling, Random advancement, TLB mutation, LLbit clearing, or a delay-slot
+effect. Unauthorized User/Supervisor execution returns Coprocessor Unusable
+(ExcCode 11) with Cause.CE=0 and precise PC/EPC/BD/accounting; kernel execution
+remains authorized with CU0 clear, while User/Supervisor execution is
+authorized with CU0 set. Authorized but unsupported register shapes remain
+loud. Reserved Instruction behavior is not yet a complete VR4300 model, so
+COP0 is encoding-complete but not a complete privileged CPU/MMU model. These
+boundaries follow the VR4300 User's Manual chapters 3 and 6 already cited
+above; no runtime implementation is an authority for them.
 
 The live block owner synchronizes Count/Compare with the executor at every
 checkpoint. Count retains its once-per-two-cycle phase across split advances;
@@ -226,8 +237,10 @@ Visibility inside an indivisible emitted block remains checkpoint-granular.
 
 | fmt | operation family | decode | runtime |
 |---:|---|:---:|:---:|
-| 00/01/02 | MFC1 / DMFC1 / CFC1 | yes | C |
-| 04/05/06 | MTC1 / DMTC1 / CTC1 | yes | C |
+| 00/01 | MFC1 / DMFC1 | yes | C (AOT + interpreter) |
+| 02 | CFC1 FCR0/FCR31 | yes | C (AOT + interpreter) |
+| 04/05 | MTC1 / DMTC1 | yes | C (AOT + interpreter) |
+| 06 | CTC1 FCR31 | yes | C (AOT + interpreter) |
 | 08 | BC1F/T/FL/TL | yes | C |
 | 10 | S format | all MIPS III functs | P |
 | 11 | D format | all MIPS III functs | P |
@@ -244,17 +257,53 @@ including unordered/signaling invalid behavior.
 FCR0 reports VR4300 implementation `0x0B`; FCR31 preserves FS, condition,
 Cause, Enable, Flag, and RM fields. CVT.W/L and all fixed rounding instructions
 obey RM/fixed direction, return the integer-indefinite value on invalid, set
-Cause and sticky Flag bits, and trap loudly when enabled. FR=0 odd singles
-alias the high word of the preceding even FGR; double/64-bit access to an odd
-FGR traps as a reserved encoding.
+Cause and sticky Flag bits, and trap loudly when enabled.
 
-COP1 remains **partial** because host `f32`/`f64` ADD/SUB/MUL/DIV/SQRT and
-float-to-float/int-to-float conversion do not honor non-nearest FCSR.RM, FS
-flush-to-zero, or reproduce every VR4300 IEEE exception/NaN payload bit. This
-is the principal user-mode blocker to a truthful “complete CPU” claim.
+The physical FGR file follows VR4300 User's Manual sections 5.2 and 5.3:
+FR=0 exposes the low word of each of 32 physical FGRs and joins adjacent
+even/odd low words for an even-indexed doubleword FPR; FR=1 exposes 32
+independent 64-bit FPRs, including odd doubleword operands. Changing Status.FR
+changes only the view and preserves every latent upper word. FR=0
+double/64-bit access to an odd FPR traps loudly as an invalid encoding.
+`PhysicalFgrState` is the view-independent import/export currency for ABI
+bridges, coroutine ownership, and deterministic state snapshots. This models
+the documented register organization; it is not a silicon-parity claim.
 
-The arbitrary-PC lane classifies every COP1 move, memory, arithmetic, compare,
-conversion, and branch instruction in the decoder and checks Status.CU1 before
+S/D ADD, SUB, MUL, DIV, and SQRT use the host-independent soft-float shim,
+honor all four FCSR rounding modes, canonicalize legacy-encoded NaNs, and
+produce the modeled IEEE Cause/Flag conditions. ABS and NEG preserve raw
+non-NaN bits while applying their sign operation and canonicalize NaNs. A
+denormal operand or result raises the unmaskable Unimplemented Operation cause.
+Enabled IEEE conditions and Unimplemented Operation return typed
+FloatingPoint/ExcCode 15 before destination commit in both arbitrary-PC lanes.
+MOVF/MOVT and MOVZ/MOVN copy raw S/D bits only when their condition is true.
+
+CFC1 reads are admitted only for FCR0 and FCR31, and CTC1 writes only FCR31.
+CTC1 first commits the masked FCSR fields, then returns typed
+FloatingPoint/ExcCode 15 when Cause.E is set or an IEEE Cause intersects its
+Enable. Reserved FCR accesses remain named loud traps. The typed ABI owns one
+FCSR per emulated thread; initialization installs the libultra initial value,
+while the reset thread starts from zero.
+
+All sixteen S/D comparison predicates classify raw legacy NaNs and implement
+their quiet/signaling Invalid rules. S/D-to-W/L conversions implement every
+fixed and FCSR-selected rounding form, integer-indefinite Invalid results, and
+typed E/V/I destination suppression. W/L-to-S/D uses an integer-only encoder
+for all four rounding modes, including signed-56 Cause.E admission and enabled
+Inexact suppression. CVT.D.S/CVT.S.D also use raw-bit integer conversion for
+all rounding modes, legacy NaN and denormal precedence, atomic O+I/U+I, FS
+flush rules, and after-rounding tininess. These paths share the same precise
+straight/delay-slot exception boundary in AOT and interpreter execution and
+retain the physical FR=0/FR=1 register view.
+
+COP1 remains **partial as a silicon model**. The implemented arithmetic,
+comparison, conversion, transfer, and FCSR semantics do not establish exact
+instruction latency, pipeline timing, or every undocumented VR4300 NaN payload
+and exception-priority quirk. Those claims require hardware differential
+evidence rather than further host-language replacement.
+
+The arbitrary-PC lanes classify every COP1 move, memory, arithmetic, compare,
+conversion, and branch instruction in the decoder and check Status.CU1 before
 any visible effect. A disabled COP1 produces Coprocessor Unusable (ExcCode 11)
 with Cause.CE=1. COP1 branches fault before their delay instruction; a COP1
 instruction in another branch's delay slot records the branch EPC and sets BD.
@@ -274,7 +323,9 @@ therefore become compile-time errors, never silent no-ops.
 - `tests/isa_completeness.rs`: missing-slot decoder words; all rounding and
   compare functs; all byte offsets for LWL/LWR/SWL/SWR and LDL/LDR/SDL/SDR;
   LL/SC reservation behavior; DIV boundaries; FCSR modes/flags/predicates;
-  FR=0; branch-likely nullification; JALR ordering.
+  exact conversion precision, directed rounding, enabled-exception
+  suppression, NaN/denormal, signed-56, FR=0/FR=1 odd-register, branch-likely
+  nullification, and JALR ordering.
 - OoT `func_80B3C964`: its LWL/LWR/SWL/SWR register/offset shape is constructed
   from public I-format fields and decoder-checked; the same pair semantics are
   exhaustively byte-checked. No game ROM bytes or generated-game output are
@@ -308,12 +359,22 @@ therefore become compile-time errors, never silent no-ops.
   source-lineage/deferred-continuation tests cover the typed negative and
   unresolved exits; the ABI live stale-sentinel gate proves generation A is
   retired before its next instruction and B owns the resume PC.
+- `tests/interp_differential.rs`: compiles generated AOT bank runners and
+  compares them in-process with the dynamic interpreter. Its snapshot binds
+  GPR/HI/LO, all 32 physical 64-bit FGRs, FCR31, selected COP0
+  Count/Compare/Random/condition state, complete RDRAM, `BlockExit`, and
+  instruction count. The FR-transition vector
+  seeds latent upper words and repeatedly switches FR=0/FR=1 so either lane
+  losing physical register state is observable. This differential does not
+  claim the interpreter exception families which remain listed outside its
+  implemented surface.
 
 Bottom line: encoding coverage is complete for the documented MIPS III CPU
 table, with COP2 decoded as architecturally unusable. Execution is complete
 for the ordinary integer, control-flow, aligned/unaligned memory, shift, and
 HI/LO paths OoT can execute. It is not a complete VR4300 CPU model until the
-remaining P items—especially full FPU environment behavior, 64-bit instruction
-PC/catalog identity, translated physical device routing, COP0/COP2 exception behavior, and the
-whole-function lane's exception boundary—are implemented or deliberately moved
-behind a documented host ABI boundary.
+remaining P items—especially silicon-certified FPU timing and edge behavior,
+64-bit instruction PC/catalog identity, translated physical device routing,
+COP0/COP2 exception behavior, and the whole-function lane's exception
+boundary—are implemented or deliberately moved behind a documented host ABI
+boundary.
