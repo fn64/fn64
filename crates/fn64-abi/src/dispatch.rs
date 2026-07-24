@@ -207,15 +207,32 @@ pub fn set_section_unloaded(index: fn64_runtime::SectionIndex) {
 /// Called from the PI/EPI DMA shims so overlays the game DMAs in become
 /// resolvable at their true relocated base -- see
 /// `SectionRegistry::load_section_at_rom_addr`.
-pub fn note_dma_overlay_load(rom_addr: u32, dest_vram: u32) -> Option<fn64_runtime::SectionIndex> {
-    let loaded = with_host(|host| host.sections.load_section_at_rom_addr(rom_addr, dest_vram));
+pub fn note_dma_overlay_load(
+    rom_addr: u32,
+    dest_vram: u32,
+    len: u32,
+) -> Option<fn64_runtime::SectionIndex> {
+    let (loaded, covered) = with_host(|host| {
+        // Exact-match path: an overlay DMA'd whole to some (possibly relocated)
+        // base -- OoT actor/gamestate overlays keyed on the exact section start.
+        let exact = host.sections.load_section_at_rom_addr(rom_addr, dest_vram);
+        // Coverage path: a chunk of a contiguous multi-section segment landing
+        // at its static link VRAM (SM64's chunked engine-segment DMA). Marks
+        // every section this chunk touches at its static base.
+        let covered = host
+            .sections
+            .load_sections_covered_by_dma(rom_addr, dest_vram, len);
+        (exact, covered)
+    });
     if std::env::var("FN64_DEBUG_BOOT").is_ok() {
         eprintln!(
-            "[DEBUG note_dma_overlay_load] rom={rom_addr:#010x} dest={dest_vram:#010x} -> \
-             {loaded:?}"
+            "[DEBUG note_dma_overlay_load] rom={rom_addr:#010x} dest={dest_vram:#010x} \
+             len={len:#x} -> exact={loaded:?} covered={covered:?}"
         );
     }
-    loaded
+    // Prefer the exact-match index for callers that read it; fall back to the
+    // first covered section so a chunked static-image load still reports one.
+    loaded.or_else(|| covered.first().copied())
 }
 
 #[cfg(test)]
