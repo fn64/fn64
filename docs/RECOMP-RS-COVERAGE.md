@@ -76,14 +76,24 @@ That promotion has several pieces, being landed incrementally:
   handler, exactly like the executable-write boundary; previously only
   executable-write faults were vectored and a mid-function `break` panicked the
   driver.
-- **Whole-ROM `BlockProgram` emitter (open).** The emitter
-  `emit_block_program_source` (`crates/fn64-discover/src/block_pack.rs`) is
-  correct but is only driven over single banks / synthetic fixtures for OoT
-  today; a whole-ROM OoT/SM64 pack producer is the long pole.
-- **Interpreter fallback holes (open).** The interpreter
-  (`crates/fn64-recomp-rs/src/interp.rs`) does not yet implement
-  `break`/`syscall`/traps/COP2; it is off the hot path only while every admitted
-  bank runs through its AOT runner.
+- **Whole-ROM snapshot composition (done).** Composition accepted only
+  physically-resident banks, so OoT composed one bank and its 468 DMA-loaded
+  (VROM) overlays were filtered out. Byte-verification now runs through
+  `materialize_rom_range`, and a load-time `.bss` tail is accepted by composing
+  the ROM-backed prefix. OoT now composes **469 banks**, 15460 reachable
+  destinations, `unsupported=8`.
+- **Interpreter trap arms (done).** The interpreter
+  (`crates/fn64-recomp-rs/src/interp.rs`) now raises `break`/`syscall` and the
+  twelve conditional traps as architectural exceptions, matching the AOT lane
+  word-for-word. This stopped being deferrable once a whole-ROM compose showed
+  ~12k destinations (`dynamic_mips` / `mapped_not_proven_code`) reaching the
+  interpreter fallback. COP2 words remain a deliberate loud fault: COP2 is the
+  RSP vector unit, not CPU-accessible on N64, and the AOT lane traps it too.
+- **Whole-ROM `BlockProgram` emitter (open).** `emit_block_program_source`
+  (`crates/fn64-discover/src/block_pack.rs`) is correct but has only been driven
+  over single banks / synthetic fixtures; emitting and compiling a whole-ROM
+  program (~9700 functions for OoT) is the remaining long pole, and its rustc
+  scale is still unmeasured.
 - **Default wiring (open).** `FN64_RS_EXECUTION=block` remains opt-in until the
   above land and both OoT and SM64 boot through the block lane with zero
   gap-panics.
