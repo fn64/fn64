@@ -657,6 +657,102 @@ pub(crate) fn process_live_executable_writes_from_host() {
     fn64_recomp_rs::discard_executable_write_boundary();
 }
 
+/// Test-only ownership token for replacing executable-write preflight inputs.
+///
+/// The token is thread-bound because the guarded state lives in thread-local
+/// storage. Nested scopes are supported and restore the immediately preceding
+/// state, including while unwinding from an expected loud trap.
+#[cfg(all(test, feature = "recomp-rs"))]
+#[must_use = "dropping the guard restores the prior executable-write preflight state"]
+pub(crate) struct TestExecutableWritePreflightState {
+    prior_ranges: Vec<(u32, u32)>,
+    prior_pending: Vec<(u32, u32)>,
+    _thread_bound: std::marker::PhantomData<Rc<()>>,
+}
+
+#[cfg(all(test, feature = "recomp-rs"))]
+impl Drop for TestExecutableWritePreflightState {
+    fn drop(&mut self) {
+        EXECUTABLE_WRITE_RANGES.with(|ranges| {
+            PENDING_EXECUTABLE_WRITES.with(|pending| {
+                let mut ranges = ranges.borrow_mut();
+                let mut pending = pending.borrow_mut();
+                *ranges = std::mem::take(&mut self.prior_ranges);
+                *pending = std::mem::take(&mut self.prior_pending);
+            });
+        });
+    }
+}
+
+#[cfg(all(test, feature = "recomp-rs"))]
+pub(crate) fn scoped_test_executable_write_preflight_state(
+    ranges: Vec<(u32, u32)>,
+    pending: Vec<(u32, u32)>,
+) -> TestExecutableWritePreflightState {
+    let (prior_ranges, prior_pending) = EXECUTABLE_WRITE_RANGES.with(|current_ranges| {
+        PENDING_EXECUTABLE_WRITES.with(|current_pending| {
+            let mut current_ranges = current_ranges.borrow_mut();
+            let mut current_pending = current_pending.borrow_mut();
+            (
+                std::mem::replace(&mut *current_ranges, ranges),
+                std::mem::replace(&mut *current_pending, pending),
+            )
+        })
+    });
+    TestExecutableWritePreflightState {
+        prior_ranges,
+        prior_pending,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+/// Reject a planned host publication that would require fallible executable
+/// generation after the guest bytes become visible.
+///
+/// The verified-audio adapter has no transaction spanning RDRAM, device state,
+/// and native-code installation. This read-only check lets ordinary audio-data
+/// writes proceed while forcing executable writes to remain on the interpreter
+/// path until such a transaction exists.
+#[cfg(test)]
+pub(crate) fn preflight_non_executable_host_writes(
+    writes: &[(usize, usize)],
+) -> Result<(), String> {
+    EXECUTABLE_WRITE_RANGES.with(|ranges| {
+        let ranges = ranges.borrow();
+        let pending = PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow().clone());
+        for (start, len) in pending {
+            let end = start.saturating_add(len);
+            if let Some(&(executable_start, executable_end)) = ranges
+                .iter()
+                .find(|&&(executable_start, executable_end)| {
+                    start < executable_end && end > executable_start
+                })
+            {
+                return Err(format!(
+                    "pending host write [{start:#010x}, {end:#010x}) overlaps live executable region [{executable_start:#010x}, {executable_end:#010x}); transactional executable publication is unavailable"
+                ));
+            }
+        }
+        for &(start, end) in writes {
+            let start = u32::try_from(start)
+                .map_err(|_| format!("host write start {start:#x} exceeds physical address space"))?;
+            let end = u32::try_from(end)
+                .map_err(|_| format!("host write end {end:#x} exceeds physical address space"))?;
+            if let Some(&(executable_start, executable_end)) = ranges
+                .iter()
+                .find(|&&(executable_start, executable_end)| {
+                    start < executable_end && end > executable_start
+                })
+            {
+                return Err(format!(
+                    "verified audio write [{start:#010x}, {end:#010x}) overlaps live executable region [{executable_start:#010x}, {executable_end:#010x}); transactional executable publication is unavailable"
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
 fn pause_active_recompiled_thread() {
     super::suspend_active_coroutine(fn64_runtime::Yield::PauseSelf);
 }
@@ -2015,6 +2111,55 @@ mod tests {
         let live = with_host(|host| host.recompiled_program.clone().unwrap());
         live.executable_regions.borrow_mut()[0].builder_artifact_identity = None;
         let _ = recompiled_program_evidence_snapshot();
+    }
+
+    #[test]
+    fn verified_host_write_preflight_rejects_only_executable_overlap() {
+        let _state = scoped_test_executable_write_preflight_state(vec![(0x100, 0x180)], Vec::new());
+
+        assert_eq!(
+            preflight_non_executable_host_writes(&[(0x80, 0x100)]),
+            Ok(())
+        );
+        let overlap = preflight_non_executable_host_writes(&[(0x17f, 0x181)]).unwrap_err();
+        assert!(overlap.contains("overlaps live executable region"));
+        assert!(overlap.contains("transactional executable publication is unavailable"));
+
+        PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().push((0x120, 4)));
+        let pending = preflight_non_executable_host_writes(&[]).unwrap_err();
+        assert!(pending.contains("pending host write"));
+    }
+
+    #[test]
+    fn executable_write_preflight_test_scope_restores_on_unwind() {
+        let _outer =
+            scoped_test_executable_write_preflight_state(vec![(0x20, 0x40)], vec![(0x24, 4)]);
+
+        let panic = std::panic::catch_unwind(|| {
+            let _inner = scoped_test_executable_write_preflight_state(
+                vec![(0x100, 0x180)],
+                vec![(0x120, 8)],
+            );
+            assert_eq!(
+                EXECUTABLE_WRITE_RANGES.with(|ranges| ranges.borrow().clone()),
+                vec![(0x100, 0x180)]
+            );
+            assert_eq!(
+                PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow().clone()),
+                vec![(0x120, 8)]
+            );
+            panic!("expected test-scope unwind");
+        });
+
+        assert!(panic.is_err());
+        assert_eq!(
+            EXECUTABLE_WRITE_RANGES.with(|ranges| ranges.borrow().clone()),
+            vec![(0x20, 0x40)]
+        );
+        assert_eq!(
+            PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow().clone()),
+            vec![(0x24, 4)]
+        );
     }
 
     #[test]

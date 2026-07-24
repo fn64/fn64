@@ -47,7 +47,7 @@ pub const REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES: &[u8] =
 pub const REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES: &[u8] =
     b"fn64 synthetic non-game release input v1";
 
-const RELEASE_REPORT_SCHEMA: &str = "fn64.release-gate.v23";
+const RELEASE_REPORT_SCHEMA: &str = crate::release_gate::REPORT_SCHEMA;
 const CONTRACT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-run-contract-digest.v3\0";
 const RUN_EVENT_DOMAIN: &[u8] = b"fn64.private-release-run-event.v1\0";
 const RECEIPT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-series-receipt-digest.v1\0";
@@ -2190,6 +2190,11 @@ mod tests {
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
     const FIXTURE_ENV: &str = "FN64_TEST_RELEASE_CHILD";
     const TEMPLATE_ENV: &str = "FN64_TEST_RELEASE_TEMPLATE";
+
+    #[test]
+    fn private_series_tracks_the_current_release_report_schema() {
+        assert_eq!(RELEASE_REPORT_SCHEMA, "fn64.release-gate.v27");
+    }
 
     struct TestDirectory(PathBuf);
 

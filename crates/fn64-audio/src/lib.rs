@@ -21,16 +21,13 @@
 //! buffer, which the VI/AI hardware then streams to the DAC. That is two
 //! separable jobs:
 //!
-//! 1. **Ucode DECODE/EXECUTION** — interpreting the ~72-opcode RSP vector
-//!    instruction set well enough to actually run a real audio ucode
-//!    (ABI-2/ABI-3-family mixing, envelope, ADPCM decode, resampling...).
-//!    This is real, non-trivial DSP emulation logic, and untangling it from
-//!    other open-source N64 audio HLE implementations' GPL-licensed
-//!    interpreters (the ones every public reference implementation this
-//!    project could look at is built from) is an open licensing question —
-//!    **out of scope for this crate until that's resolved**. See
-//!    [`UcodeExecutor`] below: every method traps loudly by name. No
-//!    silent fake audio, no quietly-vendored GPL logic.
+//! 1. **Ucode DECODE/EXECUTION** — [`rsp`] is fn64's clean-room,
+//!    manual-complete scalar/vector RSP interpreter and is the accuracy
+//!    authority for live audio microcode. [`hle`] is the family-neutral
+//!    command-list substrate for a separately admitted optimized path.
+//!    Family-specific HLE execution remains loud until its RDRAM/DMEM output
+//!    matches that LLE authority; no convenient opcode table is guessed from
+//!    a task header.
 //! 2. **Sample DELIVERY** — once *some* source (a real ucode interpreter
 //!    later, a test fixture today) has produced a buffer of finished PCM
 //!    samples, getting those samples to the host's actual sound card. This
@@ -40,11 +37,32 @@
 //!    sibling `fn64-render-rt64` takes on RT64 for its half of the render
 //!    seam).
 //!
-//! `AudioBackend` models half 2. `UcodeExecutor` names half 1 as blocked so
-//! that boundary isn't accidentally erased or forgotten later.
+//! `AudioBackend` models half 2. The older [`UcodeExecutor`] callback remains
+//! only as a compatibility-shaped loud boundary; it is not the live LLE task
+//! path and its immutable-RDRAM/returned-PCM shape is not suitable for HLE.
 #![forbid(unsafe_code)]
 
+pub mod characterize;
+pub mod hle;
+// The former ucode-phase commit candidate compared a reduced visible-state
+// projection and accepted an independently supplied LLE result. Keep its
+// crate-private characterization available to `whole_task`, but expose no
+// activation surface until a paired lane seals complete RSP architectural
+// state from one snapshot.
+#[allow(dead_code)]
+pub(crate) mod hle_commit;
+pub use hle_commit::{AudioTaskStepTotals, PrepareUcodeCommitError};
+pub mod hle_effects;
+pub mod hle_executor;
+pub mod hle_lle;
+pub mod hle_memory;
+pub mod hle_outcome;
+pub mod hle_rspboot;
+pub mod hle_snapshot;
+pub mod hle_transaction;
 pub mod rsp;
+pub mod standard_abi;
+pub mod whole_task;
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -136,9 +154,9 @@ pub trait AudioBackend {
     /// Enqueue one buffer of already-decoded interleaved PCM samples (i16,
     /// matching the N64 AI DMA's own sample format) for playback. Mirrors
     /// `RenderBackend::process_task` taking a raw byte slice: this crate
-    /// does not interpret *how* `samples` was produced (real ucode output,
-    /// silence, a test tone) — that separation is `UcodeExecutor`'s job,
-    /// not this trait's.
+    /// does not interpret *how* `samples` was produced (live RSP task output,
+    /// silence, or a test tone). Live execution is owned by fn64's task
+    /// dispatcher and RSP interpreter, not this delivery trait.
     fn queue_samples(&mut self, samples: &[i16]) -> Result<(), AudioError>;
 
     /// How many queued sample FRAMES (one frame = one sample per channel,
@@ -180,45 +198,34 @@ pub trait AudioBackend {
     }
 }
 
-/// Names the RSP audio-ucode EXECUTION boundary as an explicit, loud stub —
-/// see this module's doc comment section 1. Not a normal trait meant to be
-/// widely implemented today: it exists so the "ucode decode is blocked"
-/// fact is a compiler-visible, testable API surface rather than a comment
-/// that can silently rot or be worked around by accident.
+/// Legacy callback shape retained as a loud compatibility boundary.
 ///
-/// A real implementation (once the GPL-derivation question above is
-/// resolved, or a from-scratch clean-room interpreter is written against
-/// only the public RSP ISA + AI hardware manual, no GPL source in the
-/// loop) replaces `LoudStubUcodeExecutor` wholesale; this trait's shape
-/// does not need to change for that to happen, matching how `AudioBackend`
-/// itself is meant to stay stable underneath a real `CpalBackend`.
+/// Fn64's live audio tasks already execute through the clean-room RSP LLE
+/// path. This older interface cannot represent that behavior: real tasks
+/// mutate RDRAM and persistent RSP state, and the CPU names PCM later at the
+/// AI DMA boundary. New execution code must use the typed task/outcome path
+/// rather than implementing this immutable-input/returned-PCM callback.
 pub trait UcodeExecutor {
     /// Interpret and run one audio-ucode task's RSP program against
     /// `rdram`, starting at `ucode_addr` (rdram-relative, matching
     /// `fn64_render::OsTask::ucode`'s own convention). A real
-    /// implementation would return the decoded PCM sample frames it
-    /// produced, ready for `AudioBackend::queue_samples`.
+    /// This method is unsupported because returning PCM cannot represent the
+    /// complete task effect.
     fn execute_task(&mut self, rdram: &[u8], ucode_addr: u32) -> Result<Vec<i16>, AudioError>;
 }
 
-/// The loud, named stub for `UcodeExecutor`. Every call traps with
-/// `AudioError::Backend { backend: "ucode-executor", .. }` naming exactly
-/// why: RSP audio-ucode execution (the ~72-op vector interpreter) is real,
-/// non-trivial DSP emulation logic and untangling a clean-room
-/// implementation from the GPL-licensed public reference interpreters is
-/// an open licensing question, per this module's doc comment. This is not
-/// a placeholder that quietly returns silence — it is a deliberate,
-/// testable trap so no caller can mistake "no sound" for "ucode ran and
-/// produced silence."
+/// The loud, named implementation for the unsupported legacy callback.
+///
+/// It never fabricates silence or impersonates the live task path.
 #[derive(Default)]
 pub struct LoudStubUcodeExecutor;
 
 impl UcodeExecutor for LoudStubUcodeExecutor {
     fn execute_task(&mut self, _rdram: &[u8], ucode_addr: u32) -> Result<Vec<i16>, AudioError> {
         let reason = format!(
-            "audio ucode execution not yet clean-room implemented (GPL-derivation \
-             question pending, see fn64-audio crate doc); refused to fabricate output \
-             for ucode at rdram offset {ucode_addr:#010x}"
+            "legacy audio ucode callback cannot represent mutable RDRAM/RSP task effects; \
+             use fn64's live-image LLE task path instead of fabricating output for ucode \
+             at rdram offset {ucode_addr:#010x}"
         );
         fn64_runtime::record_unsupported_event(
             fn64_runtime::UnsupportedSubsystem::Audio,
@@ -982,7 +989,7 @@ mod tests {
         match err {
             AudioError::Backend { backend, reason } => {
                 assert_eq!(backend, "ucode-executor");
-                assert!(reason.contains("not yet clean-room implemented"));
+                assert!(reason.contains("cannot represent mutable RDRAM/RSP task effects"));
                 assert!(reason.contains("80012340"));
             }
             other => panic!("expected AudioError::Backend, got {other:?}"),

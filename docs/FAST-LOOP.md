@@ -20,9 +20,8 @@ vs a cold compile. Set it for every job build:
 ```
 export CARGO_TARGET_DIR=/tmp/fn64-shared-target
 ```
-CAVEAT: the fn64-audio lockfile collision (oot-boot's oot-audio-ucode dep pins
-fn64-audio to the main checkout) can still bite worktree oot-boot builds — the
-rs manifest sidesteps it; the shared target does not change that.
+The boot and shell manifests now select live-IMEM LLE without translated-ucode
+dependencies, so their lockfiles do not cross-pin a sibling fn64-audio checkout.
 
 ## The combined fast rs-boot loop
 ```
@@ -89,7 +88,9 @@ if both buzz, continue upstream at AI decoding/RSP synthesis.
 For task-level RSP replay, set `FN64_DUMP_AUDIO_TASK=/tmp/fn64-task.rdram`.
 By default this captures the first submitted audio task; use one-based
 `FN64_DUMP_AUDIO_TASK_INDEX=N` to capture the task aligned with a later audible
-event. The sidecar records `task_offset`, `task_index`, and `rdram_len`.
+event. Capture occurs at the common task-kick boundary before either translated
+or live-image LLE execution, so both policies expose the same immutable task
+input. The sidecar records `task_offset`, `task_index`, and `rdram_len`.
 Pair it with `FN64_TRACE_AI_BUFFERS=1` when checking whether the AI consumes the
 same RDRAM address/length range the replayed task's `A_SAVEBUFF` commands
 produced.

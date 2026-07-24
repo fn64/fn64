@@ -24,38 +24,6 @@
 use sha2::{Digest, Sha256};
 use std::io::Write;
 
-/// Real translated audio ucode stand-in. The GENUINE
-/// `wm2000_audio_ucode` (RSPRecomp-generated, `aki-recomp/games/NWXE/rsp/
-/// wm2000_audio.cpp`) `#include`s `librecomp/rsp.hpp`, which lives under
-/// `N64ModernRuntime`'s GPL-3.0-licensed tree (verified directly: that
-/// repo's top-level `COPYING` is GPL-3.0; `librecomp/rsp.hpp` is NOT under
-/// the MIT-carved-out `N64Recomp/` subdirectory) -- linking it into this
-/// MIT/Apache-2.0 example would violate `fn64/AGENTS.md`'s clean-room
-/// protocol ("Disallowed: reading GPL runtime implementation code... Not
-/// for 'inspiration'"). This is a REAL FINDING, reported honestly rather
-/// than routed around: RSPRecomp's own codegen template (verified in
-/// `N64RecompSource/RSPRecomp/src/rsp_recomp.cpp:1179`) unconditionally
-/// emits `#include "librecomp/rsp.hpp"` into every ucode it generates, so
-/// this is not a per-game choice -- using RSPRecomp's generated C at all
-/// requires the GPL runtime header AS SHIPPED.
-///
-/// Until fn64 has its own MIT-clean RSP interpreter (or a from-scratch fork
-/// of RSPRecomp's codegen template targeting fn64-owned headers), this
-/// stand-in exercises the REAL plumbing this wave built
-/// (`fn64_abi::set_audio_ucode_fn`/`osSpTaskYielded_recomp`'s M_AUDTASK
-/// dispatch) without linking the disallowed dependency. It is clearly
-/// NOT the real ucode -- it does nothing to rdram, just proves the call
-/// happened.
-unsafe extern "C" fn stand_in_audio_ucode(_rdram: *mut u8, ucode_addr: u32) -> u32 {
-    eprintln!(
-        "[wm2000-boot] STAND-IN audio ucode invoked for ucode_addr={ucode_addr:#010x} -- NOT the \
-         real wm2000_audio_ucode (see main.rs's doc comment: the real one requires the GPL-3.0 \
-         librecomp/rsp.hpp header, disallowed by AGENTS.md's clean-room protocol). Plumbing is \
-         real; ucode execution is not."
-    );
-    0
-}
-
 fn env_path(name: &str) -> std::path::PathBuf {
     std::env::var(name)
         .unwrap_or_else(|_| panic!("wm2000-boot: required environment variable {name} not set"))
@@ -115,8 +83,8 @@ fn main() {
         .collect();
     fn64_boot_harness::seed_resident_sections(&mut rdram, &rom_bytes, &resident_sections);
 
-    // Real plumbing, stand-in body (see stand_in_audio_ucode's doc comment).
-    unsafe { fn64_abi::set_audio_ucode_fn(stand_in_audio_ucode) };
+    // Execute live task IMEM through fn64's clean-room RSP interpreter.
+    fn64_abi::set_audio_task_lle_accuracy();
 
     // NWXE's osCartRomInit (func_80022540) returns its OSPiHandle BSS at
     // D_800839A0 (`addiu $v0, $s0, %lo(D_800839A0)`, disasm/asm/1050.s
