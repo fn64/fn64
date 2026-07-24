@@ -49,8 +49,8 @@
 //! cross-call reaches the callee and produces the expected FPU state.
 
 use fn64_recomp_rs::{
-    decode, emit_function, round_ties_even_f32, round_ties_even_f64, FuncInput, Instruction, Rdram,
-    RecompContext,
+    decode, emit_function, fpu, round_ties_even_f32, round_ties_even_f64, FuncInput, Instruction,
+    Rdram, RecompContext,
 };
 
 // ============================================================================
@@ -259,9 +259,9 @@ pub fn synth_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
                 // 0x80100008: Lwc1 { ft: 6, base: 5, off: 0 }
                 ctx.set_f_bits(6, mem.load_w(Rdram::eff_addr(ctx.r(5), 0)) as u32);
                 // 0x8010000C: MulS { fd: 8, fs: 4, ft: 6 }
-                ctx.set_f_s(8, ctx.f_s(4) * ctx.f_s(6));
+                ctx.fpu_mul_s(8, 4, 6);
                 // 0x80100010: AddS { fd: 0, fs: 8, ft: 4 }
-                ctx.set_f_s(0, ctx.f_s(8) + ctx.f_s(4));
+                ctx.fpu_add_s(0, 8, 4);
                 // 0x80100014: CLtS { fs: 0, ft: 6 }
                 ctx.fpu_compare_s(0, 6, 12);
                 // 0x80100018: Bc1t { off: 2 }
@@ -828,4 +828,139 @@ fn floor_ceil_w_execute_matches_oracle() {
         roundf_recomp(&mut ctx, &mut mem);
         assert_eq!(ctx.f_bits(0), round_oracle(x), "round divergence for x={x}");
     }
+}
+
+// ============================================================================
+// Soft-float shim routing: the emitter must route arithmetic through the shim,
+// and the emitted+executed code must honor FCSR.RM and set the IEEE flags.
+//
+// This is THE regression the old raw-host path failed: ADD/SUB/MUL/DIV/SQRT now
+// go through `crate::fpu` so a non-round-to-nearest FCSR mode changes the result
+// and div-by-0 / sqrt(-x) / overflow set the FCSR Cause/Flag bits.
+// ============================================================================
+
+/// The emitter emits the shim call, not a raw host float op, for each arithmetic
+/// arm. Guards against a regression back to the RM-ignoring fast path.
+#[test]
+fn arithmetic_arms_emit_shim_calls() {
+    let emit1 = |word: u32| -> String {
+        emit_function(&FuncInput {
+            name: "t",
+            vram: 0x8000_0000,
+            words: &[word, 0x03E00008, 0],
+        })
+    };
+    // add.s $f0,$f2,$f4 / div.s / sqrt.s / mul.d must all call ctx.fpu_*.
+    assert!(emit1(0x46041000).contains("ctx.fpu_add_s(0, 2, 4);")); // ADD.S
+    assert!(emit1(0x46041001).contains("ctx.fpu_sub_s(0, 2, 4);")); // SUB.S
+    assert!(emit1(0x46062202).contains("ctx.fpu_mul_s(8, 4, 6);")); // MUL.S
+    assert!(emit1(0x46041003).contains("ctx.fpu_div_s(0, 2, 4);")); // DIV.S
+    assert!(emit1(0x46006004).contains("ctx.fpu_sqrt_s(0, 12);")); // SQRT.S
+    assert!(emit1(0x46001005).contains("ctx.fpu_abs_s(0, 2);")); // ABS.S
+    assert!(emit1(0x46001007).contains("ctx.fpu_neg_s(0, 2);")); // NEG.S
+    assert!(emit1(0x46241000).contains("ctx.fpu_add_d(0, 2, 4);")); // ADD.D
+    assert!(emit1(0x46241002).contains("ctx.fpu_mul_d(0, 2, 4);")); // MUL.D
+    assert!(emit1(0x46201004).contains("ctx.fpu_sqrt_d(0, 2);")); // SQRT.D
+                                                                  // MOV.S/MOV.D are bit copies, not arithmetic: still a raw bit move.
+    assert!(emit1(0x46001006).contains("ctx.set_f_bits(0, ctx.f_bits(2));")); // MOV.S
+                                                                              // No raw host float arithmetic operators leak into the emitted arithmetic.
+    let divs = emit1(0x46041003);
+    assert!(
+        !divs.contains("ctx.f_s(2) / ctx.f_s(4)"),
+        "raw host div leaked"
+    );
+}
+
+/// A single-block `div.s $f0,$f2,$f4` function, executed as the pasted emitter
+/// output. With FCSR.RM set to each mode via `write_fcr`, the executed block must
+/// produce exactly the shim's result — proving the emit routing actually calls
+/// the shim AND that the block honors FCSR.RM (the old path always rounded to
+/// nearest and ignored the mode).
+#[test]
+fn emitted_div_block_honors_fcsr_rm_and_matches_shim() {
+    // Pasted emitter body for `div.s $f0, $f2, $f4; jr $ra`.
+    fn div_block(ctx: &mut RecompContext, _mem: &mut Rdram) {
+        ctx.fpu_div_s(0, 2, 4);
+    }
+    let a = 1.0f32;
+    let b = 3.0f32; // 1/3 is inexact — the mode is observable in the last bit.
+    for rm in 0u32..=3 {
+        let mut mem_buf = vec![0u8; 32];
+        let mut mem = Rdram::new(&mut mem_buf);
+        let mut ctx = RecompContext::new();
+        // FCSR = rm in the low two bits (all other fields clear).
+        ctx.write_fcr(31, rm);
+        ctx.set_f_s(2, a);
+        ctx.set_f_s(4, b);
+        div_block(&mut ctx, &mut mem);
+
+        let (want_bits, want_flags) = fpu::div_s(a.to_bits(), b.to_bits(), rm as u8);
+        assert_eq!(
+            ctx.f_bits(0),
+            want_bits,
+            "emitted div.s under RM={rm} must equal the shim result"
+        );
+        // Inexact must be recorded in the FCSR Cause (bit 12) and Flag (bit 2).
+        assert!(want_flags.inexact, "1/3 is inexact");
+        let fcsr = ctx.read_fcr(31);
+        assert_ne!(fcsr & (1 << 12), 0, "Cause.Inexact set under RM={rm}");
+        assert_ne!(fcsr & (1 << 2), 0, "Flag.Inexact set under RM={rm}");
+    }
+
+    // The four modes do not all agree — RM genuinely changes the emitted result.
+    let bits: Vec<u32> = (0u32..=3)
+        .map(|rm| {
+            let mut mem_buf = vec![0u8; 32];
+            let mut mem = Rdram::new(&mut mem_buf);
+            let mut ctx = RecompContext::new();
+            ctx.write_fcr(31, rm);
+            ctx.set_f_s(2, a);
+            ctx.set_f_s(4, b);
+            div_block(&mut ctx, &mut mem);
+            ctx.f_bits(0)
+        })
+        .collect();
+    assert!(
+        bits.iter().collect::<std::collections::BTreeSet<_>>().len() >= 2,
+        "FCSR.RM must change the emitted div result across modes; got {bits:02X?}"
+    );
+}
+
+/// Executed div-by-zero sets FCSR.Z (Cause bit 15 and Flag bit 5), and sqrt(-1)
+/// sets FCSR.V (Cause bit 17 / Flag bit 7) — the flag plumbing the raw path
+/// never produced for arithmetic.
+#[test]
+fn emitted_arith_sets_fcsr_cause_flags() {
+    // div-by-zero -> Z. Z is exception index 3: Cause bit 12+3=15, Flag 2+3=5.
+    let mut mem_buf = vec![0u8; 32];
+    let mut mem = Rdram::new(&mut mem_buf);
+    let mut ctx = RecompContext::new();
+    ctx.set_f_s(2, 1.0);
+    ctx.set_f_s(4, 0.0);
+    // Pasted `div.s $f0,$f2,$f4`.
+    ctx.fpu_div_s(0, 2, 4);
+    let fcsr = ctx.read_fcr(31);
+    assert_ne!(fcsr & (1 << 15), 0, "Cause.DivByZero (Z)");
+    assert_ne!(fcsr & (1 << 5), 0, "Flag.DivByZero (Z)");
+    assert_eq!(ctx.f_bits(0), f32::INFINITY.to_bits(), "1/0 = +inf");
+    let _ = &mut mem;
+
+    // sqrt(-1) -> V. V is exception index 4: Cause bit 16... actually 12+4=16,
+    // Flag 2+4=6.
+    let mut ctx = RecompContext::new();
+    ctx.set_f_s(2, -1.0);
+    // Pasted `sqrt.s $f0,$f2`.
+    ctx.fpu_sqrt_s(0, 2);
+    let fcsr = ctx.read_fcr(31);
+    assert_ne!(fcsr & (1 << 16), 0, "Cause.Invalid (V)");
+    assert_ne!(fcsr & (1 << 6), 0, "Flag.Invalid (V)");
+
+    // A big overflow -> O (index 2: Cause bit 14, Flag bit 4).
+    let mut ctx = RecompContext::new();
+    ctx.set_f_s(2, f32::MAX);
+    ctx.set_f_s(4, f32::MAX);
+    ctx.fpu_mul_s(0, 2, 4);
+    let fcsr = ctx.read_fcr(31);
+    assert_ne!(fcsr & (1 << 14), 0, "Cause.Overflow (O)");
+    assert_ne!(fcsr & (1 << 4), 0, "Flag.Overflow (O)");
 }

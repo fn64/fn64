@@ -1083,6 +1083,159 @@ impl RecompContext {
         }
     }
 
+    /// Clear the FCSR Cause field (rewritten by every arithmetic op, exactly as
+    /// [`RecompContext::round_for_mode`] does for conversions), then raise every
+    /// IEEE condition the soft-float shim reported. Cause + sticky Flag bits are
+    /// set via [`RecompContext::raise_fpu`], which also honors the enabled-
+    /// exception trap (a later sub-step replaces that trap with ExcCode-15
+    /// vectoring; for now the common not-enabled path just accumulates flags).
+    #[inline]
+    fn apply_fpu_flags(&mut self, flags: crate::fpu::Flags) {
+        self.fcsr &= !(0x3F << 12);
+        // Raise in ascending exception index so the Cause/Flag bits land in the
+        // documented order; the set is a plain OR so order is immaterial to the
+        // final FCSR, but this keeps any enabled-exception trap deterministic.
+        if flags.inexact {
+            self.raise_fpu(0);
+        }
+        if flags.underflow {
+            self.raise_fpu(1);
+        }
+        if flags.overflow {
+            self.raise_fpu(2);
+        }
+        if flags.divbyzero {
+            self.raise_fpu(3);
+        }
+        if flags.invalid {
+            self.raise_fpu(4);
+        }
+    }
+
+    /// Read the two-bit FCSR rounding mode (RM) field.
+    #[inline]
+    fn fcsr_rm(&self) -> u8 {
+        (self.fcsr & 3) as u8
+    }
+
+    // --- COP1 arithmetic routed through the IEEE soft-float shim (`fpu`). ---
+    //
+    // Each reads the operand bits, performs the op under FCSR.RM in `crate::fpu`
+    // (host-independent, IEEE-exact), writes the MIPS result bits (canonical NaN
+    // materialized by the shim), then folds the returned IEEE flags into FCSR.
+
+    /// ADD.S: `fd = fs + ft` honoring FCSR.RM, with IEEE flags.
+    #[inline]
+    pub fn fpu_add_s(&mut self, fd: u8, fs: u8, ft: u8) {
+        let (bits, flags) = crate::fpu::add_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        self.set_f_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
+    /// SUB.S: `fd = fs - ft`.
+    #[inline]
+    pub fn fpu_sub_s(&mut self, fd: u8, fs: u8, ft: u8) {
+        let (bits, flags) = crate::fpu::sub_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        self.set_f_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
+    /// MUL.S: `fd = fs * ft`.
+    #[inline]
+    pub fn fpu_mul_s(&mut self, fd: u8, fs: u8, ft: u8) {
+        let (bits, flags) = crate::fpu::mul_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        self.set_f_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
+    /// DIV.S: `fd = fs / ft`.
+    #[inline]
+    pub fn fpu_div_s(&mut self, fd: u8, fs: u8, ft: u8) {
+        let (bits, flags) = crate::fpu::div_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        self.set_f_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
+    /// SQRT.S: `fd = sqrt(fs)`, correctly rounded under FCSR.RM.
+    #[inline]
+    pub fn fpu_sqrt_s(&mut self, fd: u8, fs: u8) {
+        let (bits, flags) = crate::fpu::sqrt_s(self.f_bits(fs), self.fcsr_rm());
+        self.set_f_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
+    /// ABS.S: `fd = |fs|` (sign-bit op; Invalid only on an SNaN operand).
+    #[inline]
+    pub fn fpu_abs_s(&mut self, fd: u8, fs: u8) {
+        let (bits, flags) = crate::fpu::abs_s(self.f_bits(fs));
+        self.set_f_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
+    /// NEG.S: `fd = -fs` (sign-bit op; Invalid only on an SNaN operand).
+    #[inline]
+    pub fn fpu_neg_s(&mut self, fd: u8, fs: u8) {
+        let (bits, flags) = crate::fpu::neg_s(self.f_bits(fs));
+        self.set_f_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
+    /// ADD.D: `fd = fs + ft`.
+    #[inline]
+    pub fn fpu_add_d(&mut self, fd: u8, fs: u8, ft: u8) {
+        let (bits, flags) = crate::fpu::add_d(self.d_bits(fs), self.d_bits(ft), self.fcsr_rm());
+        self.set_d_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
+    /// SUB.D: `fd = fs - ft`.
+    #[inline]
+    pub fn fpu_sub_d(&mut self, fd: u8, fs: u8, ft: u8) {
+        let (bits, flags) = crate::fpu::sub_d(self.d_bits(fs), self.d_bits(ft), self.fcsr_rm());
+        self.set_d_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
+    /// MUL.D: `fd = fs * ft`.
+    #[inline]
+    pub fn fpu_mul_d(&mut self, fd: u8, fs: u8, ft: u8) {
+        let (bits, flags) = crate::fpu::mul_d(self.d_bits(fs), self.d_bits(ft), self.fcsr_rm());
+        self.set_d_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
+    /// DIV.D: `fd = fs / ft`.
+    #[inline]
+    pub fn fpu_div_d(&mut self, fd: u8, fs: u8, ft: u8) {
+        let (bits, flags) = crate::fpu::div_d(self.d_bits(fs), self.d_bits(ft), self.fcsr_rm());
+        self.set_d_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
+    /// SQRT.D: `fd = sqrt(fs)`, correctly rounded under FCSR.RM.
+    #[inline]
+    pub fn fpu_sqrt_d(&mut self, fd: u8, fs: u8) {
+        let (bits, flags) = crate::fpu::sqrt_d(self.d_bits(fs), self.fcsr_rm());
+        self.set_d_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
+    /// ABS.D: `fd = |fs|`.
+    #[inline]
+    pub fn fpu_abs_d(&mut self, fd: u8, fs: u8) {
+        let (bits, flags) = crate::fpu::abs_d(self.d_bits(fs));
+        self.set_d_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
+    /// NEG.D: `fd = -fs`.
+    #[inline]
+    pub fn fpu_neg_d(&mut self, fd: u8, fs: u8) {
+        let (bits, flags) = crate::fpu::neg_d(self.d_bits(fs));
+        self.set_d_bits(fd, bits);
+        self.apply_fpu_flags(flags);
+    }
+
     /// Evaluate any of the sixteen C.cond.fmt predicates. The low three funct
     /// bits select unordered/equal/less participation; bit 3 selects signaling
     /// behavior. Quiet compares still signal on an SNaN.
