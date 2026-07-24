@@ -12,6 +12,57 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The system libraries a bare `cc`/`c++` link against `libfn64_abi.a` must
+/// name, straight from the compiler.
+///
+/// A staticlib archive records no dependency libs of its own: the
+/// `cargo:rustc-link-lib` directives its crates emit apply only when *rustc*
+/// drives the link, so a plain `cc a.c lib.a` has to repeat every transitive
+/// system dep. That set is platform-specific (CoreAudio frameworks on macOS,
+/// ALSA + libm on Linux) and it grows whenever a dependency does -- hardcoding
+/// it per-OS means discovering each addition as a link failure.
+///
+/// `rustc --print native-static-libs` reports exactly that set for the current
+/// target, so ask rather than guess.
+fn native_static_libs() -> Vec<String> {
+    let mut cargo =
+        Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cargo.args(["rustc", "-p", "fn64-abi", "--lib"]);
+    if cfg!(feature = "recomp-rs") {
+        cargo.args(["--features", "recomp-rs"]);
+    }
+    cargo.args(["--", "--print", "native-static-libs"]);
+    let out = cargo
+        .output()
+        .expect("spawn cargo rustc --print native-static-libs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("note: native-static-libs:"))
+        .unwrap_or_else(|| {
+            panic!("rustc did not report native-static-libs:\n{stderr}");
+        });
+    // Deduplicate while preserving order: rustc repeats entries (e.g. -lSystem,
+    // -framework Foundation), and a repeated `-framework` would otherwise pair
+    // with the wrong following token.
+    let mut seen = Vec::new();
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let mut index = 0;
+    while index < tokens.len() {
+        let entry = if tokens[index] == "-framework" && index + 1 < tokens.len() {
+            index += 2;
+            vec![tokens[index - 2].to_string(), tokens[index - 1].to_string()]
+        } else {
+            index += 1;
+            vec![tokens[index - 1].to_string()]
+        };
+        if !seen.contains(&entry) {
+            seen.push(entry);
+        }
+    }
+    seen.into_iter().flatten().collect()
+}
+
 /// Locates the staticlib cargo just built for this crate (`cargo test`
 /// runs this integration test only after the lib target is built, so the
 /// `.a` is guaranteed present in the same profile's `deps` output dir by
@@ -76,30 +127,15 @@ fn c_caller_links_and_runs_against_fn64_abi_staticlib() {
     let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let out_bin = out_dir.join("fn64_abi_c_smoke");
 
+    // fn64-abi statically links fn64-audio's cpal dependency (the real
+    // CpalBackend, see fn64-audio's crate doc), so the link pulls in the host
+    // audio stack and libm on top of plain libc. System libs must follow the
+    // archive on the command line: GNU ld resolves left to right.
+    let native_libs = native_static_libs();
+
     let mut cc = Command::new("cc");
     cc.arg(&smoke_c).arg(&staticlib).arg("-o").arg(&out_bin);
-    // fn64-abi now statically links fn64-audio's cpal dependency (the real
-    // CpalBackend, see fn64-audio's crate doc), which pulls in the platform
-    // audio stack -- a plain `cc a.c lib.a` link needs those named
-    // explicitly, the same way any other consumer of a Rust staticlib with
-    // platform-audio deps would. A staticlib records no dependency libs, so
-    // each host's cpal backend has to be named here.
-    if cfg!(target_os = "macos") {
-        cc.args([
-            "-framework",
-            "CoreAudio",
-            "-framework",
-            "AudioToolbox",
-            "-framework",
-            "CoreFoundation",
-            "-framework",
-            "Foundation",
-            "-lobjc",
-        ]);
-    } else if cfg!(target_os = "linux") {
-        // cpal's ALSA backend: libasound provides snd_pcm_*/snd_hctl_*.
-        cc.arg("-lasound");
-    }
+    cc.args(&native_libs);
     let compile = cc
         .output()
         .expect("failed to invoke cc -- is a C toolchain installed?");
@@ -143,21 +179,7 @@ fn c_caller_links_and_runs_against_fn64_abi_staticlib() {
         .arg(&vendor_include)
         .arg("-o")
         .arg(&proxy_bin);
-    if cfg!(target_os = "macos") {
-        cxx.args([
-            "-framework",
-            "CoreAudio",
-            "-framework",
-            "AudioToolbox",
-            "-framework",
-            "CoreFoundation",
-            "-framework",
-            "Foundation",
-            "-lobjc",
-        ]);
-    } else if cfg!(target_os = "linux") {
-        cxx.arg("-lasound");
-    }
+    cxx.args(&native_libs);
     let proxy_compile = cxx
         .output()
         .expect("failed to invoke C++ compiler for generated-C MMIO proxy smoke");

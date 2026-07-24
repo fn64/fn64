@@ -29,6 +29,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Without this, a failing run saves nothing -- and the runs that fail
+          # are exactly the ones you re-push to, so the cache stayed empty and
+          # every run rebuilt ~700 crates from scratch (~13 min).
+          cache-on-failure: true
       - uses: taiki-e/install-action@nextest
       # fn64-audio/fn64-shell link ALSA via cpal/gilrs; the runner image has no
       # libasound headers, so alsa-sys' build.rs panics before any test runs.
@@ -36,7 +41,16 @@ jobs:
       # The ROM-gated aki-audio-ucode lives in examples/*/audio-ucode, which are
       # their own workspaces -- `--workspace` never reaches them, so no exclude
       # is needed (naming it only emitted "excluded package(s) not found").
+      #
+      # Tests themselves take ~8s; the cost is compiling 86 test binaries, so
+      # the levers are the cache above and cheaper codegen below.
       - run: cargo nextest run --workspace
+        env:
+          # Test binaries are run once and thrown away -- debuginfo is dead
+          # weight in link time and cache size, and CI never opens a debugger.
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_INCREMENTAL: "0"
 
   docs:
     name: doc-drift lint
