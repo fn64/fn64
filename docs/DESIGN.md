@@ -908,7 +908,11 @@ task calls out:
   accept only the matching acknowledgment, while the ABI owns any renderer
   continuation. Its schedules are explicit inputs used by deterministic synthetic
   tests; they grant no RDP-cycle, intermediate-CURRENT, counter, FREEZE, or FLUSH
-  authority, and existing backends remain on the atomic path. Graphics HLE preflight is
+  authority. The production atomic path represents its existing single
+  synchronous backend call as one identity-only acknowledgment through the
+  same validator before shadow publication; this changes no timing, device,
+  interrupt, rollback, or digest authority and does not select chunking.
+  Existing backends remain on the atomic path. Graphics HLE preflight is
   transactional and content-addressed: selecting an HLE decode mode admits no
   content. Both HLE backends return `NeedsLle` when the task-entry IMEM digest
   is unregistered; the reference renderer additionally decodes admitted tasks

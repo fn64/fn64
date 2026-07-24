@@ -148,10 +148,20 @@ validation. `Continue` is valid only while another schedule quantum remains;
 error or malformed success poisons the orchestration transaction instead of
 retrying possibly consumed backend state, and neither its shadow image nor its
 continuation is published. FullSync evidence must be identified and is retained
-cumulatively across valid commits. This is a representational phase-A mechanism: default backends are
-still atomic, no production timing policy selects chunking, and a host chunk
-boundary is not an RDP clock, DMA-fetch, CURRENT, busy-counter, FREEZE, or FLUSH
-claim.
+cumulatively across valid commits. This is a representational phase-A
+mechanism: default backends are still atomic, no production timing policy
+selects chunking, and a host chunk boundary is not an RDP clock, DMA-fetch,
+CURRENT, busy-counter, FREEZE, or FLUSH claim.
+
+Phase B routes the existing production atomic raw-DPC path through that same
+transaction/quantum/cursor acknowledgment validator as one identity-only
+quantum. Its internal zero deadline is a sentinel with no guest-time meaning.
+Atomic backends still receive exactly one `process_rdp_commands` call; the
+validated `Complete` acknowledgment occurs after the existing renderer and
+FullSync checks but before shadow-memory publication. Fabric CURRENT/status,
+rollback, observation ordering, DP interrupt scheduling, counters, and release
+digests retain their prior owners and commit order. No scheduled production
+execution or renderer continuation is enabled by this migration.
 
 `PresentRequest` co-binds `ViPresentation`'s V-blank-latched scanout state with
 a move-only `PhysicalRdramRead` capability for that exact retrace. Integrated
