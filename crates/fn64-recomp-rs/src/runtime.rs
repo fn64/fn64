@@ -1083,33 +1083,46 @@ impl RecompContext {
         }
     }
 
-    /// Clear the FCSR Cause field (rewritten by every arithmetic op, exactly as
-    /// [`RecompContext::round_for_mode`] does for conversions), then raise every
-    /// IEEE condition the soft-float shim reported. Cause + sticky Flag bits are
-    /// set via [`RecompContext::raise_fpu`], which also honors the enabled-
-    /// exception trap (a later sub-step replaces that trap with ExcCode-15
-    /// vectoring; for now the common not-enabled path just accumulates flags).
+    /// Fold the IEEE conditions the soft-float shim reported into FCSR and decide
+    /// whether the op traps, returning `true` when an ENABLED exception fired.
+    ///
+    /// The VR4300 (User's Manual section 6.6, "Floating-Point Exceptions")
+    /// distinguishes two outcomes per operation, and the FCSR update differs:
+    ///
+    /// * **Trapped** — any raised condition whose FCSR Enable bit is set. The
+    ///   FPU writes the FCSR **Cause** field (so the handler can read which
+    ///   condition trapped) but leaves the sticky **Flags** field and the
+    ///   destination register **unchanged**, then vectors to the ExcCode-15
+    ///   general exception. The caller must NOT commit the computed result.
+    /// * **Not trapped** — no enabled condition fired. The FPU writes both the
+    ///   Cause field and ORs the sticky Flags bits, and the destination register
+    ///   takes the computed result.
+    ///
+    /// The Cause field is fully rewritten every operation (cleared first, exactly
+    /// as [`RecompContext::round_for_mode`] does for conversions); the sticky
+    /// Flags bits are only OR-ed in on the not-trapped path.
     #[inline]
-    fn apply_fpu_flags(&mut self, flags: crate::fpu::Flags) {
-        self.fcsr &= !(0x3F << 12);
-        // Raise in ascending exception index so the Cause/Flag bits land in the
-        // documented order; the set is a plain OR so order is immaterial to the
-        // final FCSR, but this keeps any enabled-exception trap deterministic.
-        if flags.inexact {
-            self.raise_fpu(0);
+    fn apply_fpu_flags(&mut self, flags: crate::fpu::Flags) -> bool {
+        // Assemble the Cause bits (FCSR 17:12) this op signalled and the Enable
+        // bits (FCSR 11:7). A trap fires iff any signalled condition is enabled.
+        let cause = u32::from(flags.inexact)
+            | (u32::from(flags.underflow) << 1)
+            | (u32::from(flags.overflow) << 2)
+            | (u32::from(flags.divbyzero) << 3)
+            | (u32::from(flags.invalid) << 4);
+        let enables = (self.fcsr >> 7) & 0x1F;
+        let trapped = cause & enables != 0;
+
+        // Cause is rewritten unconditionally: clear the old field, install the
+        // freshly signalled conditions. This holds on both paths so the handler
+        // sees exactly what this op raised.
+        self.fcsr = (self.fcsr & !(0x3F << 12)) | (cause << 12);
+
+        if !trapped {
+            // No enabled exception: accumulate the sticky Flag bits (6:2) too.
+            self.fcsr |= cause << 2;
         }
-        if flags.underflow {
-            self.raise_fpu(1);
-        }
-        if flags.overflow {
-            self.raise_fpu(2);
-        }
-        if flags.divbyzero {
-            self.raise_fpu(3);
-        }
-        if flags.invalid {
-            self.raise_fpu(4);
-        }
+        trapped
     }
 
     /// Read the two-bit FCSR rounding mode (RM) field.
@@ -1121,119 +1134,194 @@ impl RecompContext {
     // --- COP1 arithmetic routed through the IEEE soft-float shim (`fpu`). ---
     //
     // Each reads the operand bits, performs the op under FCSR.RM in `crate::fpu`
-    // (host-independent, IEEE-exact), writes the MIPS result bits (canonical NaN
-    // materialized by the shim), then folds the returned IEEE flags into FCSR.
+    // (host-independent, IEEE-exact), then folds the returned IEEE flags into
+    // FCSR via `apply_fpu_flags`, which reports whether an ENABLED exception
+    // fired.
+    //
+    // # Result-commit ordering (the enabled-exception rule)
+    //
+    // On an enabled FP exception the VR4300 traps BEFORE writing the destination
+    // register (User's Manual section 6.6): the result is discarded and only the
+    // FCSR Cause field records the condition. So these methods compute first,
+    // fold the flags, and write the destination ONLY when no trap fired. Each
+    // returns `true` when it trapped — the emitted block lane checks that return
+    // and exits to the ExcCode-15 fault handler (exactly as the integer-overflow
+    // lane checks `checked_add` and exits to the IntegerOverflow handler). The
+    // straight-line / whole-function lane instead panics loudly on a trap
+    // (mirroring the `.expect("MIPS ADD integer overflow")` shape), since that
+    // lane has no exception-return ABI yet.
+    //
+    // Note the operand bits are sampled BEFORE the destination is written, so an
+    // in-place `fd == fs`/`fd == ft` op reads the original inputs even on the
+    // committed (non-trapping) path.
 
-    /// ADD.S: `fd = fs + ft` honoring FCSR.RM, with IEEE flags.
+    /// ADD.S: `fd = fs + ft` honoring FCSR.RM, with IEEE flags. Returns `true` if
+    /// an enabled exception trapped (destination left unwritten).
     #[inline]
-    pub fn fpu_add_s(&mut self, fd: u8, fs: u8, ft: u8) {
+    #[must_use]
+    pub fn fpu_add_s(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
         let (bits, flags) = crate::fpu::add_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_f_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// SUB.S: `fd = fs - ft`.
     #[inline]
-    pub fn fpu_sub_s(&mut self, fd: u8, fs: u8, ft: u8) {
+    #[must_use]
+    pub fn fpu_sub_s(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
         let (bits, flags) = crate::fpu::sub_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_f_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// MUL.S: `fd = fs * ft`.
     #[inline]
-    pub fn fpu_mul_s(&mut self, fd: u8, fs: u8, ft: u8) {
+    #[must_use]
+    pub fn fpu_mul_s(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
         let (bits, flags) = crate::fpu::mul_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_f_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// DIV.S: `fd = fs / ft`.
     #[inline]
-    pub fn fpu_div_s(&mut self, fd: u8, fs: u8, ft: u8) {
+    #[must_use]
+    pub fn fpu_div_s(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
         let (bits, flags) = crate::fpu::div_s(self.f_bits(fs), self.f_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_f_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// SQRT.S: `fd = sqrt(fs)`, correctly rounded under FCSR.RM.
     #[inline]
-    pub fn fpu_sqrt_s(&mut self, fd: u8, fs: u8) {
+    #[must_use]
+    pub fn fpu_sqrt_s(&mut self, fd: u8, fs: u8) -> bool {
         let (bits, flags) = crate::fpu::sqrt_s(self.f_bits(fs), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_f_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// ABS.S: `fd = |fs|` (sign-bit op; Invalid only on an SNaN operand).
     #[inline]
-    pub fn fpu_abs_s(&mut self, fd: u8, fs: u8) {
+    #[must_use]
+    pub fn fpu_abs_s(&mut self, fd: u8, fs: u8) -> bool {
         let (bits, flags) = crate::fpu::abs_s(self.f_bits(fs));
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_f_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// NEG.S: `fd = -fs` (sign-bit op; Invalid only on an SNaN operand).
     #[inline]
-    pub fn fpu_neg_s(&mut self, fd: u8, fs: u8) {
+    #[must_use]
+    pub fn fpu_neg_s(&mut self, fd: u8, fs: u8) -> bool {
         let (bits, flags) = crate::fpu::neg_s(self.f_bits(fs));
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_f_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// ADD.D: `fd = fs + ft`.
     #[inline]
-    pub fn fpu_add_d(&mut self, fd: u8, fs: u8, ft: u8) {
+    #[must_use]
+    pub fn fpu_add_d(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
         let (bits, flags) = crate::fpu::add_d(self.d_bits(fs), self.d_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_d_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// SUB.D: `fd = fs - ft`.
     #[inline]
-    pub fn fpu_sub_d(&mut self, fd: u8, fs: u8, ft: u8) {
+    #[must_use]
+    pub fn fpu_sub_d(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
         let (bits, flags) = crate::fpu::sub_d(self.d_bits(fs), self.d_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_d_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// MUL.D: `fd = fs * ft`.
     #[inline]
-    pub fn fpu_mul_d(&mut self, fd: u8, fs: u8, ft: u8) {
+    #[must_use]
+    pub fn fpu_mul_d(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
         let (bits, flags) = crate::fpu::mul_d(self.d_bits(fs), self.d_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_d_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// DIV.D: `fd = fs / ft`.
     #[inline]
-    pub fn fpu_div_d(&mut self, fd: u8, fs: u8, ft: u8) {
+    #[must_use]
+    pub fn fpu_div_d(&mut self, fd: u8, fs: u8, ft: u8) -> bool {
         let (bits, flags) = crate::fpu::div_d(self.d_bits(fs), self.d_bits(ft), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_d_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// SQRT.D: `fd = sqrt(fs)`, correctly rounded under FCSR.RM.
     #[inline]
-    pub fn fpu_sqrt_d(&mut self, fd: u8, fs: u8) {
+    #[must_use]
+    pub fn fpu_sqrt_d(&mut self, fd: u8, fs: u8) -> bool {
         let (bits, flags) = crate::fpu::sqrt_d(self.d_bits(fs), self.fcsr_rm());
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_d_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// ABS.D: `fd = |fs|`.
     #[inline]
-    pub fn fpu_abs_d(&mut self, fd: u8, fs: u8) {
+    #[must_use]
+    pub fn fpu_abs_d(&mut self, fd: u8, fs: u8) -> bool {
         let (bits, flags) = crate::fpu::abs_d(self.d_bits(fs));
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_d_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// NEG.D: `fd = -fs`.
     #[inline]
-    pub fn fpu_neg_d(&mut self, fd: u8, fs: u8) {
+    #[must_use]
+    pub fn fpu_neg_d(&mut self, fd: u8, fs: u8) -> bool {
         let (bits, flags) = crate::fpu::neg_d(self.d_bits(fs));
+        if self.apply_fpu_flags(flags) {
+            return true;
+        }
         self.set_d_bits(fd, bits);
-        self.apply_fpu_flags(flags);
+        false
     }
 
     /// Evaluate any of the sixteen C.cond.fmt predicates. The low three funct
